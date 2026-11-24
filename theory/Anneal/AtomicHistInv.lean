@@ -77,6 +77,10 @@ A specification and verification library for `SeqCst` `Atomic::try_update` /
   CAS), non-transitive relations, non-`hist_inv`-closed closure preconditions,
   one-shot committer double-fire rejection, weak-vs-strong CAS 2-axis
   separation, unbounded contention, and unrealizable `resolve` miracle canary.
+* **§10** `ep2_creusot_try_update_capstone`: safety, transition safety,
+  bounded termination, Streett liveness + enabledness + committer monitor,
+  strong-fairness operational termination, and dual-authority admissibility,
+  all for the one program `tryUpdateLoop`.
 -/
 
 namespace Anneal.AtomicHistInv
@@ -5741,5 +5745,71 @@ theorem unbounded_contention_safe_but_not_live (s₀ : AtomicSt Nat PUnit PUnit)
     fun he => unbounded_contention_refutes_dwp _ s₀ ((dwp_iff_eventually _ _ _ _).2 he)⟩
 
 end FailClosed
+
+/-! ## 10. Episode 2 Capstone -/
+
+section Capstone
+
+variable {Val FState G : Type} {A : AtomicEnv Val FState G} {Rel : Val → Val → Prop}
+  {init : Val} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Val}
+
+/--
+**Episode 2 capstone (`creusot#2386` `Atomic::try_update`)**: under the
+`creusot#2386` preconditions, from any initial state, the single program
+`tryUpdateLoop` simultaneously satisfies
+
+1. `Always` history safety with the exact `creusot#2386` postcondition and its
+   `DWLP` form, under unbounded rely-respecting contention and spurious weak-CAS
+   failures;
+2. transition safety (`AlwaysStep` with `HistStep`: zero-write failed CAS,
+   one-shot committer firing);
+3. `DWP` termination with the contract under bounded contention;
+4. Streett liveness under CAS fairness (`FairInfOften … CasWon`) with
+   non-vacuous CAS enabledness (`InfOften CasAttempt`) and the one-shot committer
+   monitor (`FairBuchiSat`);
+5. operational termination against every strongly fair `EnvStrategy`;
+
+and every `AtomicDualContract` rejects the UB / spec-panic / `Frozen`-write
+steps that would otherwise be abstracted as atomic-cell transitions.
+-/
+theorem ep2_creusot_try_update_capstone (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    {s₀ : AtomicSt Val FState G} (hs : InitSt init f₀ g₀ comm₀ s₀) :
+    (Always (atomicHistWP A) (HistInvSt A Rel init f₀) (CreusotPost A Rel init f₀ g₀ comm₀)
+        (tryUpdateLoop Val) s₀ ∧
+      DWLP (guardInvWP (atomicHistWP A) (HistInvSt A Rel init f₀)) (tryUpdateLoop Val)
+        (fun r s => HistInvSt A Rel init f₀ s ∧ CreusotPost A Rel init f₀ g₀ comm₀ r s) s₀) ∧
+    AlwaysStep (atomicHistWP A) (HistStep A Rel) (CreusotPost A Rel init f₀ g₀ comm₀)
+      (tryUpdateLoop Val) s₀ ∧
+    DWP (atomicBudgetWP A) (tryUpdateLoop Val)
+      (fun r s => HistInvSt A Rel init f₀ s ∧ CreusotPost A Rel init f₀ g₀ comm₀ r s) s₀ ∧
+    (FairInfOften (atomicHistWP A) (fun _ _ _ _ => False) CasWon
+        (CreusotPost A Rel init f₀ g₀ comm₀) (tryUpdateLoop Val) s₀ ∧
+      InfOften (atomicHistWP A) CasAttempt (CreusotPost A Rel init f₀ g₀ comm₀)
+        (tryUpdateLoop Val) s₀ ∧
+      FairBuchiSat (committerSpec A Rel init f₀ g₀ comm₀) (fun _ i o s s' _ => CasWon i o s s')
+        (tryUpdateLoop Val) false s₀) ∧
+    (∀ (σ : EnvStrategy (AtomicCellE Val)) (tr₀ : List (Event (AtomicCellE Val))),
+      (∀ ev : Stream' (Event (AtomicCellE Val)),
+        InfRunWithStrategy σ tr₀ (tryUpdateLoop Val) ev →
+        (∀ k, ∃ n, k ≤ n ∧ CasAttempt (ev n).req (ev n).ans (tr₀ ++ takePrefix ev n)
+          (tr₀ ++ takePrefix ev (n + 1))) →
+        (∀ k, ∃ n, k ≤ n ∧ CasWon (ev n).req (ev n).ans (tr₀ ++ takePrefix ev n)
+          (tr₀ ++ takePrefix ev (n + 1)))) →
+      ∃ tr r, RetWithStrategy σ tr₀ (tryUpdateLoop Val) tr r ∧ TracePost r (tr₀ ++ tr)) ∧
+    (∀ (c : Anneal.Mir.AtomicIntrinsicsDualSpec.AtomicDualContract)
+      (m : Anneal.Mir.AtomicIntrinsicsDualSpec.AtomicMemoryMode),
+      ¬ AdmissibleAtomicStep (Anneal.Mir.AtomicIntrinsicsDualSpec.mrAtomicObserve m 17) ∧
+      ¬ AdmissibleAtomicStep (Anneal.Mir.AtomicIntrinsicsDualSpec.mrAtomicObserve m 18) ∧
+      ¬ AdmissibleAtomicStep (Anneal.Mir.AtomicIntrinsicsDualSpec.mrAtomicObserve m 19) ∧
+      ¬ AdmissibleAtomicStep (c.lm.observe true 27)) :=
+  ⟨⟨tryUpdate_always_safety hpre hs, tryUpdate_dwlp_creusot_spec hpre hs⟩,
+   tryUpdate_alwaysStep_safety hpre hs, (tryUpdate_bounded_spec hpre hs).2,
+   ⟨tryUpdate_fairInfOften hpre hs _, tryUpdate_infOften_attemptCas hpre hs,
+    tryUpdate_fairBuchiSat_committer hpre hs⟩,
+   fun σ tr₀ h_sf => tryUpdate_trace_strongFair_terminates σ tr₀ h_sf,
+   fun c m => let h := admissible_fail_closed c m
+     ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1⟩⟩
+
+end Capstone
 
 end Anneal.AtomicHistInv

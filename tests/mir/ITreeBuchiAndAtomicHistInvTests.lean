@@ -671,6 +671,13 @@ theorem ticketService_concrete_witness (Q : PEmpty.{1} → AtomicSt Nat PUnit PU
   tryUpdate_reactive_service_infOften 0 0 ⟨0, PUnit.unit, .fresh 0, 0, PUnit.unit, 0⟩
     ⟨Nat.le_refl 0, by decide, by simp⟩ Q
 
+/-- The Episode 2 capstone on the concrete counter: bounded-contention `DWP`. -/
+theorem counter_capstone (delta limit b : Nat) :
+    DWP (atomicBudgetWP (counterEnv delta limit)) (tryUpdateLoop Nat)
+      (fun r s => HistInvSt (counterEnv delta limit) (· ≤ ·) 5 0 s ∧
+        CreusotPost (counterEnv delta limit) (· ≤ ·) 5 0 [] (.fresh 5) r s) (counterSt₀ b) :=
+  (ep2_creusot_try_update_capstone (counter_pre delta limit 5 0 []) (counterSt₀_init b)).2.2.1
+
 /-- Counter with bounded contention also satisfies `Always` + Streett + enabledness. -/
 theorem counter_fairness (delta limit b : Nat) :
     FairInfOften (atomicHistWP (counterEnv delta limit)) (fun _ _ _ _ => False) CasWon
@@ -1597,6 +1604,8 @@ run_cmd do
       throwError "audit is vacuous for {nss[i]}: only {counts[i]!} theorems"
   -- Verify all flagship Episode 2 theorems are present and non-trivial.
   let requiredThms : List Name :=
+    [``Anneal.AtomicHistInv.ep2_creusot_try_update_capstone,
+     ``Anneal.ITreeBuchiAndAtomicHistInvTests.counter_capstone] ++
     [ ``Anneal.AtomicHistInv.tryUpdate_always_safety
     , ``Anneal.AtomicHistInv.tryUpdate_dwlp_creusot_spec
     , ``Anneal.AtomicHistInv.tryUpdate_alwaysStep_safety
