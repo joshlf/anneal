@@ -2397,6 +2397,23 @@ theorem exceptErrorWildcardPost_iff (specFn : X → α) (x : X) (r : Except ε �
       errorWildcardPost specFn x (FallibleOutcome.ofExcept r) := by
   cases r <;> exact Iff.rfl
 
+/-- A postcondition whose fault arms are tautologies *is* the wildcard postcondition,
+    however the tautology is spelled: `| .err e => e = e`, `| .err e => P e → True`,
+    `| .err _ => ¬¬True`, `| .ub => 0 = 0`. Every wildcard theorem below therefore
+    applies to it, and a scanner that reports such an arm reports the same defect. -/
+theorem eq_errorWildcardPost_of_tautological_fault_arms {X : Type u} {α : Type v}
+    {ε : Type w} (specFn : X → α) (post : X → FallibleOutcome α ε → Prop)
+    (hOk : ∀ x v, post x (.ok v) ↔ v = specFn x)
+    (hErr : ∀ x e, post x (.err e)) (hUb : ∀ x, post x .ub)
+    (hUnsupported : ∀ x, post x .unsupported) :
+    post = errorWildcardPost specFn := by
+  funext x out
+  cases out with
+  | ok v => exact propext (hOk x v)
+  | err e => exact propext ⟨fun _ => True.intro, fun _ => hErr x e⟩
+  | ub => exact propext ⟨fun _ => True.intro, fun _ => hUb x⟩
+  | unsupported => exact propext ⟨fun _ => True.intro, fun _ => hUnsupported x⟩
+
 /-- **The wildcard passes `PostconditionDichotomy`.** With two distinct values of `α`
     and a satisfiable precondition, the `ok` arm alone supplies an accepted and a
     rejected output. -/

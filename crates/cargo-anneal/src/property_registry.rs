@@ -8128,6 +8128,22 @@ const ELEMENT_CONTAINER_TYPE_NAMES: [&str; 27] = [
     "FnOnce",
 ];
 
+/// Lean monad stacks whose leading arguments are error, state, environment,
+/// or inner-monad types: only the final argument is the value
+/// (`StateT σ m α`, `ReaderT ρ m α`, `ExceptT ε m α`).
+const LEAN_MONAD_STACK_TYPE_NAMES: [&str; 10] = [
+    "ExceptT",
+    "StateT",
+    "StateM",
+    "StateRefT",
+    "ReaderT",
+    "ReaderM",
+    "EStateM",
+    "OptionT",
+    "WriterT",
+    "EIO",
+];
+
 fn is_element_container_type_name(name: &str) -> bool {
     GHOST_COLLECTION_TYPE_NAMES.contains(&name) || ELEMENT_CONTAINER_TYPE_NAMES.contains(&name)
 }
@@ -8337,7 +8353,8 @@ fn fixed_width_type_within(
         // `ExceptT ε m α` do not carry the length.
         let value_args = if head.text == "Except" {
             lean_args.get(1..).unwrap_or(&[])
-        } else if head.text == "ExceptT" {
+        } else if LEAN_MONAD_STACK_TYPE_NAMES.contains(&head.text) {
+            // Only the final argument of a monad stack is the value.
             lean_args.last().map_or(&[][..], std::slice::from_ref)
         } else {
             &lean_args[..]
@@ -9026,7 +9043,71 @@ fn scan_lean_ghost_length_decls(
             }
             depth += bracket_delta(sig_tok);
         }
-        let Some(colon) = colon else { continue };
+        let Some(colon) = colon else {
+            // No result type: `def ghostLen (s : GhostSeq α) := (e : UInt64)`
+            // and `def ghostLen := fun s => (e : UInt64)` state it in the body.
+            if toks.get(sig_end).is_some_and(|assign| assign.is_sym(":="))
+                && !matches!(tok.text, "theorem" | "lemma")
+            {
+                let body_end = lean_command_end(toks, sig_end + 1);
+                let mut body = &toks[sig_end + 1..body_end];
+                let mut binders = signature;
+                while body
+                    .first()
+                    .is_some_and(|head| head.is_word("fun") || head.is_word("λ"))
+                    && let Some(arrow) = body.iter().position(|body_tok| {
+                        body_tok.kind == GuardTokKind::FatArrow || body_tok.is_sym("↦")
+                    })
+                {
+                    if binders.is_empty() {
+                        binders = &body[..arrow];
+                    }
+                    body = &body[arrow + 1..];
+                }
+                // Peel parentheses down to the innermost `(e : T)`.
+                let mut ascribed = None;
+                while body.len() >= 2
+                    && body[0].is_sym("(")
+                    && matching_close(body, 0) == Some(body.len() - 1)
+                {
+                    let inner = &body[1..body.len() - 1];
+                    let mut depth = 0i32;
+                    let mut colon = None;
+                    for (offset, inner_tok) in inner.iter().enumerate() {
+                        if depth == 0 && inner_tok.is_sym(":") {
+                            colon = Some(offset);
+                        }
+                        depth += bracket_delta(inner_tok);
+                    }
+                    if let Some(colon) = colon {
+                        ascribed = Some(&inner[colon + 1..]);
+                        break;
+                    }
+                    body = inner;
+                }
+                if let Some(ascribed_type) = ascribed {
+                    let ghost_context = has_ghost_name_marker(&name)
+                        || mentions_ghost_collection(binders)
+                        || name
+                            .split('.')
+                            .any(|part| GHOST_COLLECTION_TYPE_NAMES.contains(&part));
+                    if ghost_context
+                        && is_ghost_length_name(&name)
+                        && let Some((fixed_width_type, line)) =
+                            lean_fixed_width_result(ascribed_type, false, aliases)
+                    {
+                        out.push(GhostLengthWidthDiagnostic {
+                            source_label: String::from(source_label),
+                            line,
+                            declaration: name,
+                            fixed_width_type,
+                            kind: GhostLengthWidthKind::FixedWidthReturnType,
+                        });
+                    }
+                }
+            }
+            continue;
+        };
         let ty = &signature[colon + 1..];
         // The result type follows the last depth-0 arrow (`→`, `->`) or
         // universal quantifier binder separator (`∀ …, T` / `Π …, T`).
@@ -10448,6 +10529,47 @@ fn extends_to_the_right(tok: &GuardTok<'_>) -> bool {
     }
 }
 
+/// Whether the token at `idx` continues the preceding operand as a function
+/// application or literal suffix (Lean `f = f x`).
+fn continues_as_application(toks: &[GuardTok<'_>], idx: usize) -> bool {
+    let Some(tok) = toks.get(idx) else {
+        return false;
+    };
+    match tok.kind {
+        GuardTokKind::Literal => true,
+        GuardTokKind::Sym => matches!(tok.text, "(" | "[" | "⟨" | "@"),
+        GuardTokKind::Word => {
+            !matches!(tok.text, "as" | "and" | "or" | "then" | "else")
+                && !is_arm_body_terminator(tok, toks.get(idx + 1))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `tok` rules out a benign statement: a call, macro, block, or
+/// control flow may panic, diverge, or return early.
+fn ends_benign_statement(tok: &GuardTok<'_>) -> bool {
+    match tok.kind {
+        GuardTokKind::FatArrow => true,
+        GuardTokKind::Sym => matches!(tok.text, "(" | "[" | "{" | "}" | "!" | "?"),
+        GuardTokKind::Word => matches!(
+            tok.text,
+            "match"
+                | "if"
+                | "else"
+                | "loop"
+                | "while"
+                | "for"
+                | "return"
+                | "break"
+                | "continue"
+                | "unsafe"
+                | "await"
+        ),
+        _ => false,
+    }
+}
+
 /// Consume one trivially-true boolean/Prop atom (`true`, `True`, `trivial`,
 /// `!false`, `¬False`, `Not False`, or a parenthesized/braced trivially-true
 /// expression, optionally preceded by `return`/`by` and followed by `as bool`).
@@ -10489,6 +10611,15 @@ fn consume_trivial_true_atom(toks: &[GuardTok<'_>], start: usize, depth: u32) ->
         } else {
             return None;
         }
+    } else if tok.kind == GuardTokKind::Word
+        && toks
+            .get(idx + 1)
+            .is_some_and(|eq| eq.is_sym("==") || eq.is_sym("="))
+        && toks.get(idx + 2).is_some_and(|rhs| rhs.is_word(tok.text))
+        && !continues_as_application(toks, idx + 3)
+    {
+        // One token compared with itself (`e == e`, `0 = 0`).
+        idx += 3;
     } else {
         return None;
     }
@@ -10571,6 +10702,10 @@ fn expr_is_trivially_true(
     let mut saw_else_before_brace = false;
     let mut in_else_brace = false;
     let mut else_brace_just_closed = false;
+    // Inside a block: the current statement began with `let` and holds no
+    // call, macro, block, or control flow so far.
+    let mut stmt_started = false;
+    let mut stmt_benign = false;
     loop {
         if at_disjunct_start && inner_depth == 0 {
             at_disjunct_start = false;
@@ -10608,8 +10743,31 @@ fn expr_is_trivially_true(
                     return found_trivial.then_some(idx);
                 }
                 if delim == "}" && tok.is_sym(";") {
-                    return (toks.get(idx).is_some_and(|t| t.is_sym("}")) && found_trivial)
-                        .then_some(idx + 1);
+                    if toks.get(idx).is_some_and(|t| t.is_sym("}")) {
+                        return found_trivial.then_some(idx + 1);
+                    }
+                    if stmt_benign {
+                        // `let _ = e;` constrains nothing: the value of the
+                        // block is what follows it.
+                        found_trivial = false;
+                        at_disjunct_start = true;
+                        disjuncts_blocked = false;
+                        prev_closed_brace_at_zero = false;
+                        saw_else_before_brace = false;
+                        in_else_brace = false;
+                        stmt_started = false;
+                        stmt_benign = false;
+                        continue;
+                    }
+                    return None;
+                }
+                if delim == "}" {
+                    if !stmt_started {
+                        stmt_started = true;
+                        stmt_benign = tok.is_word("let");
+                    } else if ends_benign_statement(tok) {
+                        stmt_benign = false;
+                    }
                 }
                 // A tuple or argument list (`(true, x)`) is not a
                 // parenthesized proposition.
@@ -12108,6 +12266,136 @@ fn lean_spec_module_item_paths(source_label: &str, toks: &[GuardTok<'_>]) -> Vec
     Vec::new()
 }
 
+/// Lean commands that extend the syntax or run meta-programs: after one of
+/// them a token-level reading of the module is no longer reliable
+/// (`local notation "True" => False`, `run_cmd …`).
+const LEAN_SYNTAX_EXTENSION_KEYWORDS: [&str; 15] = [
+    "macro",
+    "macro_rules",
+    "syntax",
+    "declare_syntax_cat",
+    "elab",
+    "elab_rules",
+    "run_cmd",
+    "run_elab",
+    "run_meta",
+    "initialize",
+    "builtin_initialize",
+    "binder_predicate",
+    "unif_hint",
+    "declare_simp_like_tactic",
+    "register_builtin_option",
+];
+
+/// Lean mixfix notation commands (`notation "x" => …`, `infixl:65 " + " => …`).
+const LEAN_NOTATION_KEYWORDS: [&str; 6] =
+    ["notation", "infix", "infixl", "infixr", "prefix", "postfix"];
+
+/// Lines of a Lean specification module that make it uninspectable for the
+/// entry-point audit:
+///
+/// * a declaration that shadows a name the audit trusts: `True`
+///   (`def True : Prop := False` inside `namespace Specs.…` wins over the
+///   root `True`) or anything under `Obligations`
+///   (`def Obligations.Demo.main.defaultPre …`, `namespace Obligations.…`),
+///   and a `variable` binder named `True`;
+/// * a syntax extension or meta-program ([`LEAN_SYNTAX_EXTENSION_KEYWORDS`],
+///   [`LEAN_NOTATION_KEYWORDS`], `#eval`).
+fn lean_uninspectable_module_lines(toks: &[GuardTok<'_>]) -> Vec<usize> {
+    let mut lines = Vec::new();
+    for idx in 0..toks.len() {
+        let tok = &toks[idx];
+        if tok.is_sym("#") && toks.get(idx + 1).is_some_and(|next| next.is_word("eval")) {
+            lines.push(tok.line);
+            continue;
+        }
+        if tok.kind != GuardTokKind::Word || (idx > 0 && toks[idx - 1].is_sym(".")) {
+            continue;
+        }
+        let command_position = idx == 0
+            || is_first_on_line(toks, idx)
+            || toks[idx - 1].is_sym("]")
+            || (toks[idx - 1].kind == GuardTokKind::Word
+                && matches!(
+                    toks[idx - 1].text,
+                    "local" | "scoped" | "private" | "protected" | "noncomputable" | "in"
+                ));
+        if !command_position {
+            continue;
+        }
+        if LEAN_SYNTAX_EXTENSION_KEYWORDS.contains(&tok.text) {
+            lines.push(tok.line);
+            continue;
+        }
+        if LEAN_NOTATION_KEYWORDS.contains(&tok.text) {
+            // `notation "x" => …`, `infixl:65 " + " => …`,
+            // `notation (name := n) "x" => …`; a field or binder that merely
+            // has such a name (`prefix : List α`) is followed by a type.
+            let is_command = match toks.get(idx + 1) {
+                Some(next) if next.kind == GuardTokKind::Literal || next.is_sym("(") => true,
+                Some(next) if next.is_sym(":") => toks.get(idx + 2).is_some_and(|prec| {
+                    prec.kind == GuardTokKind::Word
+                        && (prec.text.starts_with(|first: char| first.is_ascii_digit())
+                            || matches!(prec.text, "max" | "min" | "lead" | "arg"))
+                }),
+                _ => false,
+            };
+            if is_command {
+                lines.push(tok.line);
+            }
+            continue;
+        }
+        if matches!(tok.text, "namespace" | "section") {
+            let (name, _) = read_lean_dotted_name(toks, idx + 1);
+            if name.split('.').any(|part| part == "Obligations") {
+                lines.push(tok.line);
+            }
+            continue;
+        }
+        if tok.text == "variable" {
+            // A binder named `True` (`variable (True : Prop)`).
+            let end = lean_command_end(toks, idx + 1);
+            let mut cursor = idx + 1;
+            while cursor < end {
+                if bracket_delta(&toks[cursor]) > 0 {
+                    let mut binder = cursor + 1;
+                    while binder < end && toks[binder].kind == GuardTokKind::Word {
+                        if toks[binder].text == "True" {
+                            lines.push(toks[binder].line);
+                        }
+                        binder += 1;
+                    }
+                }
+                cursor += 1;
+            }
+            continue;
+        }
+        if matches!(
+            tok.text,
+            "def" | "abbrev"
+                | "theorem"
+                | "lemma"
+                | "opaque"
+                | "axiom"
+                | "instance"
+                | "structure"
+                | "class"
+                | "inductive"
+                | "alias"
+                | "example"
+        ) {
+            let (name, _) = read_lean_dotted_name(toks, idx + 1);
+            if !name.is_empty()
+                && (declaration_leaf(&name) == "True"
+                    || name.split('.').any(|part| part == "Obligations"))
+            {
+                lines.push(tok.line);
+            }
+        }
+    }
+    lines
+}
+
 /// Audit an authored Lean `Specs/<Item>.lean` module of a binary entry point.
 ///
 /// Reports every precondition (`def pre` / `abbrev pre` / `opaque pre` /
@@ -12142,6 +12430,12 @@ pub fn audit_lean_spec_entry_point_requires(
         }
     };
     let mut out = Vec::new();
+    // The audit reads names and keywords as written, so it is only sound for
+    // a module that neither redeclares a name it trusts nor extends the
+    // syntax: either one makes the module uninspectable (fail closed).
+    for line in lean_uninspectable_module_lines(&toks) {
+        out.push(diagnostic(line, EntryPointRequiresKind::AuthoredLeanPre));
+    }
     let item_paths = lean_spec_module_item_paths(source_label, &toks);
     let module_defines_pre = (0..toks.len()).any(|idx| {
         toks[idx].kind == GuardTokKind::Word
@@ -14382,6 +14676,54 @@ fn wrapper_len(w: &Wrapper) -> usize { 0 }
     }
 
     #[test]
+    fn ghost_length_scanner_reads_value_slots_and_body_ascriptions() {
+        use GhostLengthWidthKind::FixedWidthReturnType;
+        let found = |text: &str| -> Vec<(usize, String, GhostLengthWidthKind)> {
+            ghost_findings("Specs/Buf.lean", text)
+                .into_iter()
+                .map(|(line, _, ty, kind)| (line, ty, kind))
+                .collect()
+        };
+        let ret = |ty: &str| vec![(1, String::from(ty), FixedWidthReturnType)];
+        // Only the final argument of a monad stack is the value.
+        for (ret_ty, fixed) in [
+            ("StateT Nat Id UInt64", "UInt64"),
+            ("ReaderT Config Id USize", "USize"),
+            ("ExceptT String (StateM Nat) UInt32", "UInt32"),
+        ] {
+            let text = format!("def ghostLen (s : GhostSeq Nat) : {ret_ty} := x");
+            assert_eq!(found(&text), ret(fixed), "{text:?}");
+        }
+        for ret_ty in [
+            "StateM UInt64 Nat",
+            "StateT UInt64 Id Nat",
+            "ReaderT UInt64 Id Nat",
+            "EStateM UInt8 UInt64 Nat",
+            "ExceptT UInt32 (StateM UInt8) Nat",
+        ] {
+            let text = format!("def ghostLen (s : GhostSeq Nat) : {ret_ty} := x");
+            assert_eq!(found(&text), vec![], "{text:?}");
+        }
+        // A definition without a result type states it in its body.
+        for text in [
+            "def ghostLen (s : GhostSeq Nat) := (0 : UInt64)",
+            "def ghostLen := fun (s : GhostSeq Nat) => (0 : UInt64)",
+            "def ghostLen := fun (s : GhostSeq Nat) ↦ ((0 : UInt64))",
+        ] {
+            assert_eq!(found(text), ret("UInt64"), "{text:?}");
+        }
+        for clean in [
+            "def ghostLen (s : GhostSeq Nat) := (0 : Nat)",
+            "def ghostLen (s : GhostSeq Nat) := (s.toList.length : Nat)",
+            "def ghostLenBound (s : GhostSeq Nat) := (s.toList.length < UInt64.size : Prop)",
+            "def bufferLen (b : Buffer) := (0 : UInt64)",
+            "theorem ghost_len_eq (s : GhostSeq Nat) := (rfl : (0 : UInt64) = 0)",
+        ] {
+            assert_eq!(found(clean), vec![], "{clean:?}");
+        }
+    }
+
+    #[test]
     fn ghost_length_scanner_fails_closed_on_malformed_source() {
         for (label, text) in [
             (
@@ -15106,6 +15448,33 @@ fn one() -> Result<u32, E> { Ok(1) }
             "Err(_) => if c { false } else { x == 1 } && true",
             "",
         ),
+        // One token compared with itself is trivially true.
+        ("rust", "Err(e) => e == e", "err_arm_true"),
+        ("lean", "| .err e => e = e", "err_arm_true"),
+        ("lean", "| .err _ => 0 = 0", "err_arm_true"),
+        ("rust", "Err(e) => e == e && x == 1", ""),
+        ("rust", "Err(e) => e == e.clone()", ""),
+        ("rust", "Err(e) => e == f", ""),
+        ("lean", "| .err e => f = f x", ""),
+        ("lean", "| .err e => e = e'", ""),
+        // A `let` statement without a call, macro, or control flow does not
+        // constrain the outcome: the block's value is what follows it.
+        ("rust", "Err(e) => { let _ = e; true }", "err_arm_true"),
+        (
+            "rust",
+            "Err(e) => { let _unused = &e; let code = e.code; true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "Err(e) => { let _ = e; return true; }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(e) => { let _ = e; false }", ""),
+        ("rust", "Err(e) => { let _ = e; x == 1 }", ""),
+        ("rust", "Err(e) => { assert_eq!(*e, E::A); true }", ""),
+        ("rust", "Err(e) => { let ok = check(e); true }", ""),
+        ("rust", "Err(e) => { true; x == 1 }", ""),
     ];
 
     /// The same table is asserted by `scan_error_branch_wildcard` in
@@ -15907,6 +16276,78 @@ end Specs.Demo.main
             lean_spec_module_item_paths("proofs/Specs/Demo/main.lean", &[]),
             vec![String::from("Demo.main")]
         );
+    }
+
+    #[test]
+    fn lean_entry_point_audit_fails_closed_on_shadowing_and_syntax_extensions() {
+        let audit = |text: &str| {
+            audit_lean_spec_entry_point_requires("demo::main", "Specs/Demo/main.lean", text, &[])
+                .into_iter()
+                .map(|d| d.line)
+                .collect::<Vec<_>>()
+        };
+        for (flagged, lines) in [
+            // Inside `namespace Specs.…` a local declaration wins over the
+            // root name the audit trusts.
+            (
+                "namespace Specs.Demo.main\ndef Obligations.Demo.main.defaultPre (args : List Value) : Prop := args.length = 1\ndef pre (args : List Value) : Prop := Obligations.Demo.main.defaultPre args\nend Specs.Demo.main\n",
+                vec![2],
+            ),
+            (
+                "namespace Specs.Demo.main\nnamespace Obligations.Demo.main\ndef rustRequires (args : List Value) : Prop := args.length = 1\nend Obligations.Demo.main\ndef pre (args : List Value) : Prop := Obligations.Demo.main.rustRequires args\nend Specs.Demo.main\n",
+                vec![2],
+            ),
+            (
+                "namespace Specs.Demo.main\ndef True : Prop := False\ndef pre (args : List Value) : Prop := True\nend Specs.Demo.main\n",
+                vec![2],
+            ),
+            (
+                "namespace Specs.Demo.main\nabbrev True := 1 = 2\ninstance : ItemSpec \"demo::main\" where\n  pre := fun _ => True\n  post := post\nend Specs.Demo.main\n",
+                vec![2],
+            ),
+            (
+                "variable (True : Prop)\ndef pre (args : List Value) : Prop := True\n",
+                vec![1],
+            ),
+            // Syntax extensions and meta-programs.
+            (
+                "local notation \"True\" => False\ndef pre (args : List Value) : Prop := True\n",
+                vec![1],
+            ),
+            (
+                "macro \"True\" : term => `(False)\ndef pre (args : List Value) : Prop := True\n",
+                vec![1],
+            ),
+            (
+                "scoped infixl:65 \" ∧ \" => Or\ndef pre (args : List Value) : Prop := True\n",
+                vec![1],
+            ),
+            (
+                "run_cmd Lean.Elab.Command.elabCommand (← `(instance : ItemSpec \"demo::main\" := ⟨fun a => a = [], fun _ _ => True⟩))\n",
+                vec![1],
+            ),
+            ("elab \"mkSpec\" : command => pure ()\nmkSpec\n", vec![1]),
+            (
+                "syntax \"anyArgs\" : term\ndef pre (args : List Value) : Prop := True\n",
+                vec![1],
+            ),
+            (
+                "#eval show Lean.Elab.Command.CommandElabM Unit from pure ()\n",
+                vec![1],
+            ),
+        ] {
+            assert_eq!(audit(flagged), lines, "{flagged:?}");
+        }
+        for clean in [
+            "theorem pre_trivial : True := trivial\ndef pre (args : List Value) : Prop := True\n",
+            "structure Layout where\n  prefix : List Nat\n  infix : Nat\ndef pre (args : List Value) : Prop := True\n",
+            "def post (args : List Value) (ret : Value) : Prop := ret = .unit ∧ True\n",
+            "open Trusted.MirSemantics\nset_option linter.unusedVariables false\nsection\nend\n",
+            "def helper (notation : Nat) (macro : Nat) : Nat := notation + macro\n",
+            "#check (1 : Nat)\n",
+        ] {
+            assert_eq!(audit(clean), vec![], "{clean:?}");
+        }
     }
 
     #[test]

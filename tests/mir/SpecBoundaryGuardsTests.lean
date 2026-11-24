@@ -669,6 +669,27 @@ theorem errorFibreDichotomy_separates :
       ⟨"a", "b", by decide⟩,
     errorWildcardPost_not_errorFibreDichotomy _⟩
 
+/-- Spelling the tautology differently does not change the defect: a reflexive error
+    arm, a double negation, and an implication into `True` all denote the wildcard
+    postcondition, so they inherit its mutant survival. -/
+theorem tautological_error_arms_are_the_wildcard :
+    (fun (x : Nat) (out : FallibleOutcome Nat String) =>
+        match out with
+        | .ok v => v = x + 1
+        | .err e => e = e
+        | .ub => 0 = 0
+        | .unsupported => ¬¬True) = errorWildcardPost (fun x => x + 1) ∧
+      (fun (x : Nat) (out : FallibleOutcome Nat String) =>
+        match out with
+        | .ok v => v = x + 1
+        | .err e => e = "overflow" → True
+        | .ub => True
+        | .unsupported => True) = errorWildcardPost (fun x => x + 1) :=
+  ⟨eq_errorWildcardPost_of_tautological_fault_arms _ _ (fun _ _ => Iff.rfl) (fun _ _ => rfl)
+      (fun _ => rfl) (fun _ h => h True.intro),
+    eq_errorWildcardPost_of_tautological_fault_arms _ _ (fun _ _ => Iff.rfl)
+      (fun _ _ _ => True.intro) (fun _ => True.intro) (fun _ => True.intro)⟩
+
 /-- The guarded contract is dichotomous and forces fault-freedom of `checkedIncr`. -/
 theorem guarded_dichotomy_and_fault_free :
     PostconditionDichotomy incrPre incrGuardedPost ∧
@@ -843,6 +864,7 @@ run_cmd do
         ``Anneal.SpecBoundaryGuards.isEmpty_model_of_fixedSigned,
         ``Anneal.SpecBoundaryGuards.unboundedIntGhostCollectionAxioms_nonempty,
         ``Anneal.SpecBoundaryGuards.ghostLengthTypeGuard_iff_nonempty_model,
+        ``Anneal.SpecBoundaryGuards.eq_errorWildcardPost_of_tautological_fault_arms,
         ``Anneal.SpecBoundaryGuards.errorWildcardPost_postconditionDichotomy,
         ``Anneal.SpecBoundaryGuards.errorWildcardPost_not_errorFibreDichotomy,
         ``Anneal.SpecBoundaryGuards.scalarWildcardCorr_accepts_div_by_zero,

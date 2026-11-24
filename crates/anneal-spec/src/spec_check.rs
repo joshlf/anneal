@@ -5960,6 +5960,47 @@ fn extends_to_the_right(tok: SpecTok<'_>) -> bool {
     )
 }
 
+/// Whether the token at `look` continues the preceding operand as a function
+/// application or literal suffix (Lean `f = f x`), so that the operand is not
+/// complete yet.
+fn continues_as_application(mut look: SpecLexer<'_>) -> Result<bool, SpecScanError> {
+    let Some(tok) = look.next_tok()? else {
+        return Ok(false);
+    };
+    Ok(match tok {
+        SpecTok::Literal | SpecTok::Sym("(" | "[" | "⟨" | "@") => true,
+        SpecTok::Word(word) => {
+            !matches!(word, "as" | "and" | "or" | "then" | "else")
+                && !is_arm_body_terminator(tok, look.next_tok()?)
+        }
+        _ => false,
+    })
+}
+
+/// Whether `tok` rules out a benign statement: a call, macro, block, or
+/// control flow may panic, diverge, or return early, so the statement can
+/// constrain the outcome (`assert!(…);`, `check(e)?;`).
+fn ends_benign_statement(tok: SpecTok<'_>) -> bool {
+    matches!(
+        tok,
+        SpecTok::FatArrow
+            | SpecTok::Sym("(" | "[" | "{" | "}" | "!" | "?")
+            | SpecTok::Word(
+                "match"
+                    | "if"
+                    | "else"
+                    | "loop"
+                    | "while"
+                    | "for"
+                    | "return"
+                    | "break"
+                    | "continue"
+                    | "unsafe"
+                    | "await"
+            )
+    )
+}
+
 /// Consumes one trivially-true boolean/Prop atom (`true`, `True`, `trivial`,
 /// `!false`, `¬False`, `Not False`, or a parenthesized/braced trivially-true
 /// expression, optionally preceded by `return`/`by` and followed by `as bool`).
@@ -5989,6 +6030,17 @@ fn consume_trivial_true_atom(look: &mut SpecLexer<'_>, depth: u32) -> Result<boo
             matches!(next, Some(SpecTok::Word("False")))
                 || (matches!(next, Some(SpecTok::Sym("¬") | SpecTok::Word("Not")))
                     && consume_trivial_true_atom(&mut probe, depth - 1)?)
+        }
+        // One token compared with itself (`e == e`, `0 = 0`).
+        Some(SpecTok::Word(word)) => {
+            let mut eq = probe;
+            let reflexive = matches!(eq.next_tok()?, Some(SpecTok::Sym("==" | "=")))
+                && eq.next_tok()? == Some(SpecTok::Word(word))
+                && !continues_as_application(eq)?;
+            if reflexive {
+                probe = eq;
+            }
+            reflexive
         }
         _ => false,
     };
@@ -6092,6 +6144,10 @@ fn expr_is_trivially_true(
     let mut saw_else_before_brace = false;
     let mut in_else_brace = false;
     let mut else_brace_just_closed = false;
+    // Inside a block: the current statement began with `let` and holds no
+    // call, macro, block, or control flow so far.
+    let mut stmt_started = false;
+    let mut stmt_benign = false;
     loop {
         if at_disjunct_start && inner_depth == 0 {
             at_disjunct_start = false;
@@ -6131,7 +6187,33 @@ fn expr_is_trivially_true(
                     return Ok(found_trivial);
                 }
                 if delim == "}" && tok == SpecTok::Sym(";") {
-                    return Ok(matches!(look.next_tok()?, Some(SpecTok::Sym("}"))) && found_trivial);
+                    let mut after = *look;
+                    if matches!(after.next_tok()?, Some(SpecTok::Sym("}"))) {
+                        *look = after;
+                        return Ok(found_trivial);
+                    }
+                    if stmt_benign {
+                        // `let _ = e;` constrains nothing: the value of the
+                        // block is what follows it.
+                        found_trivial = false;
+                        at_disjunct_start = true;
+                        disjuncts_blocked = false;
+                        prev_closed_brace_at_zero = false;
+                        saw_else_before_brace = false;
+                        in_else_brace = false;
+                        stmt_started = false;
+                        stmt_benign = false;
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                if delim == "}" {
+                    if !stmt_started {
+                        stmt_started = true;
+                        stmt_benign = tok == SpecTok::Word("let");
+                    } else if ends_benign_statement(tok) {
+                        stmt_benign = false;
+                    }
                 }
                 // A tuple or argument list (`(true, x)`) is not a
                 // parenthesized proposition.
@@ -6224,7 +6306,10 @@ fn expr_is_trivially_true(
 /// `true as bool`), a conjunction of trivially-true atoms (`true && true`,
 /// `(true && true)`, `(True ∧ True)`), or a disjunction containing one
 /// (`true || p`, `p || true`, `(p || true)`, `P ∨ True`), and not combined
-/// with a constraining operator.
+/// with a constraining operator. One token compared with itself (`e == e`,
+/// `0 = 0`) is such an atom, and a block whose statements are `let` bindings
+/// without a call, macro, or control flow has the value of its final
+/// expression (`{ let _ = e; true }`).
 fn arm_body_is_trivially_true(mut look: SpecLexer<'_>) -> Result<bool, SpecScanError> {
     expr_is_trivially_true(&mut look, None, MAX_TRIVIAL_EXPR_DEPTH)
 }
@@ -9351,6 +9436,33 @@ mod spec_boundary_guard_tests {
             "Err(_) => if c { false } else { x == 1 } && true",
             "",
         ),
+        // One token compared with itself is trivially true.
+        ("rust", "Err(e) => e == e", "err_arm_true"),
+        ("lean", "| .err e => e = e", "err_arm_true"),
+        ("lean", "| .err _ => 0 = 0", "err_arm_true"),
+        ("rust", "Err(e) => e == e && x == 1", ""),
+        ("rust", "Err(e) => e == e.clone()", ""),
+        ("rust", "Err(e) => e == f", ""),
+        ("lean", "| .err e => f = f x", ""),
+        ("lean", "| .err e => e = e'", ""),
+        // A `let` statement without a call, macro, or control flow does not
+        // constrain the outcome: the block's value is what follows it.
+        ("rust", "Err(e) => { let _ = e; true }", "err_arm_true"),
+        (
+            "rust",
+            "Err(e) => { let _unused = &e; let code = e.code; true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "Err(e) => { let _ = e; return true; }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(e) => { let _ = e; false }", ""),
+        ("rust", "Err(e) => { let _ = e; x == 1 }", ""),
+        ("rust", "Err(e) => { assert_eq!(*e, E::A); true }", ""),
+        ("rust", "Err(e) => { let ok = check(e); true }", ""),
+        ("rust", "Err(e) => { true; x == 1 }", ""),
     ];
 
     #[test]
