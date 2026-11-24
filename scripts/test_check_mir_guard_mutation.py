@@ -5760,5 +5760,86 @@ class GuardMutationEp2B4AdversarialTests(unittest.TestCase):
         self.assertEqual(self._patterns(lean_have_if, "lean"), ["err_arm_true"])
 
 
+class GuardMutationEp2A4ConvergenceTests(unittest.TestCase):
+    """Round 4 A4 final convergence tests closing B4's Shard A bypasses and false positives."""
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        return [
+            f.pattern
+            for f in gmut.detect_postcondition_error_wildcards(source, language=language)
+        ]
+
+    def test_negative_literals_lean_bool_or_typed_paren_let_and_matches_ctor_tautologies(self) -> None:
+        # 1. Negative integer literals, pure literal arithmetic, and Lean `Bool` `||` (`=`)
+        # cannot panic or mutate and MUST still fold to `err_arm_true`!
+        for vacuous_rust in (
+            "Err(e) => (*e == -1) || true",
+            "Err(e) => *e == -1_i32 || true",
+            "Err(e) => *e == -1 || *e != -1",
+            "Err(e) => (1 + 1 == 2) || true",
+            "Err(e) => { let _ = -1; true }",
+            "Err(e) => { let (ok: bool) = true; ok }",
+            "match out { Ok(v) => *v == 1, Err(e) => matches!(Some(e), Some(_)) }",
+            "match out { Ok(v) => *v == 1, Err(e) => matches!((e, 1), (_, 1)) }",
+        ):
+            self.assertEqual(self._patterns(vacuous_rust, "rust"), ["err_arm_true"], vacuous_rust)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(
+                    vacuous_rust, "err", language="rust"
+                )["status"],
+                "SURVIVED",
+                vacuous_rust,
+            )
+
+        for vacuous_lean in (
+            "| .err e => decide (e = .a) || true",
+            "def post : Outcome Nat → Prop\n  | .ok v => v = 1\n  | .err _ => let (a : Prop) := True; a",
+        ):
+            self.assertEqual(self._patterns(vacuous_lean, "lean"), ["err_arm_true"], vacuous_lean)
+
+        # Non-matching constructor or impure call inside `matches!` scrutinee stays constrained (`KILLED`).
+        for sound_rust in (
+            "match out { Ok(v) => *v == 1, Err(e) => matches!(Some(e), None) }",
+            "match out { Ok(v) => *v == 1, Err(e) => matches!(check(e), Some(_)) }",
+            "Err(e) => { let _ = -*e; true }",
+            "Err(e) => (1 / 0 == 0) || true",
+        ):
+            self.assertEqual(self._patterns(sound_rust, "rust"), [], sound_rust)
+
+    def test_matches_parenthesized_and_unary_bool_equality_and_conjunction_with_false(self) -> None:
+        # `matches!(...) == (false)`, `matches!(...) == !true`, `matches!(...) != (true)`,
+        # and `matches!(...) && false` / `false && matches!(...)` all reject `Err(_)`!
+        for sound in (
+            "matches!(out, Err(_)) == (false)",
+            "matches!(out, Err(_)) == !true",
+            "matches!(out, Err(_)) != (true)",
+            "matches!(out, Err(_)) != !false",
+            "(false) == matches!(out, Err(_))",
+            "matches!(out, Err(_)) && false",
+            "false && matches!(out, Err(_))",
+            "matches!(out, Err(_)) && !true",
+        ):
+            self.assertEqual(self._patterns(sound, "rust"), [], sound)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(sound, "err", language="rust")["status"],
+                "KILLED",
+                sound,
+            )
+
+        # Double negation via `!(matches!(...) == (false))` or `!(matches!(...) == !true)` is vacuous!
+        for vacuous in (
+            "!(matches!(out, Err(_)) == (false))",
+            "!(matches!(out, Err(_)) == !true)",
+            "!(matches!(out, Err(_)) != (true))",
+            "!matches!(out, Err(_)) == false",
+        ):
+            self.assertEqual(self._patterns(vacuous, "rust"), ["matches_any_err"], vacuous)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(vacuous, "err", language="rust")["status"],
+                "SURVIVED",
+                vacuous,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

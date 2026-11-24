@@ -542,7 +542,8 @@ def _guard_mutation_step(obj: dict[str, object], step_id: str, source: str) -> t
 def _check_trusted_step(
     obj: dict[str, object], step_id: str, source: str, *, stdout_form: bool = False
 ) -> tuple[Step, str | None]:
-    if stdout_form or "rustcCapture" in obj or "trusted" in obj:
+    is_vacuity_summary = stdout_form or "rustcCapture" in obj or "trusted" in obj
+    if is_vacuity_summary:
         for section in ("trusted", "rustcCapture", "downstream"):
             if not isinstance(obj.get(section), dict):
                 raise _bad(source, f"`check_trusted --audit-vacuity` summary missing `{section}` object")
@@ -586,6 +587,10 @@ def _check_trusted_step(
     if digest is not None and not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
         raise _bad(source, "`sourceSha256` must be 64 lowercase hex characters")
     replay = _opt_bool(obj, "replay", source)
+    if not is_vacuity_summary and (
+        "kernel_declarations" not in step.counts or step.axioms is None or replay is None
+    ):
+        raise _bad(source, "check_trusted report needs `kernelDeclarations`, `axioms` and `replay`")
     explicit_ok = _opt_bool(obj, "ok", source)
     returncode = _opt_int(obj, "returncode", source, minimum=None)
     exit_code = _opt_int(obj, "exit_code", source, minimum=None)
@@ -868,7 +873,7 @@ _VERDICT_TOKEN_RE = re.compile(r"(?<![\w/.-])(PASS(?:ED)?|FAIL(?:ED)?|OK|✅|❌
 _SCOPED_VERDICT_RE = re.compile(
     r"(?i)(?:(?<=\|)|(?<=:))\s*[`*_]*\b(?P<neg>(?:not|never|did\s+not|didn't|does\s+not|doesn't|failed\s+to)\s+)?"
     r"(?P<word>pass(?:ed|ing)?|green|ok|succeed(?:ed)|success|fail(?:ed|ing|ure)?|red|error|timeout)\b[`*_]*\s*"
-    r"(?=\||[.;,()]|$)"
+    r"(?=\||[.;,()\[\]]|\s+(?:[-–—/]|and\b|with\b)|$)"
 )
 _ALL_PASS_RE = re.compile(
     r"(?i)\ball\s+(?:[\w'-]+\s+){0,3}(?:pass(?:ed|es)?|green|succeed(?:ed)?)\b"
@@ -952,7 +957,14 @@ _TABLE_CELL_COMPOUND_LABELS_RE = re.compile(
     + r")+)(?:\s*\([^)\n]*\))?\s*$"
 )
 _LABEL_ITEM_RE = re.compile(r"`([^`\n]+)`|\*\*([^*\n`]+)\*\*|([A-Za-z0-9][A-Za-z0-9_.-]*)")
-_HEADING_PREFIX_RE = re.compile(r"^\s*#{1,6}\s+")
+_HEADING_PREFIX_RE = re.compile(
+    r"(?i)^\s*#{1,6}\s+(?:[0-9]+(?:\.[0-9]+)*[.)]\s+)?(?:(?:step|gate|check|stage|phase)(?:\s+[0-9]+)?\s*[:\-–—]\s*)?"
+)
+_HEADING_TRAILING_HASHES_RE = re.compile(r"\s+#+\s*$")
+_AXIOM_PAREN_NOTE_WORDS: frozenset[str] = frozenset({
+    "standard", "only", "the", "three", "3", "lean", "lean4", "4",
+    "kernel", "foundation", "foundational", "allowed", "default", "all", "axioms", "axiom",
+})
 _HEADING_SINGLE_LABEL_RE = re.compile(
     r"(?i)^(?:`([^`\n]+)`|\*\*([^*\n`]+)\*\*|([A-Za-z0-9][A-Za-z0-9.-]*_[A-Za-z0-9_.-]*))"
     r"(?:\s+(?:verification|results?|summary|report|audit|checks?|gates?|status|output|receipts?))*"
@@ -1229,7 +1241,7 @@ def _line_refs(
         m_hpre = _HEADING_PREFIX_RE.match(line)
         if m_hpre is not None:
             h_lo = m_hpre.end()
-            h_body = line[h_lo:]
+            h_body = _HEADING_TRAILING_HASHES_RE.sub("", line[h_lo:])
             m_hsingle = _HEADING_SINGLE_LABEL_RE.match(h_body)
             if m_hsingle is not None:
                 grp = 1 if m_hsingle.group(1) is not None else (2 if m_hsingle.group(2) is not None else 3)
@@ -1431,7 +1443,7 @@ def _axiom_names(rest: str) -> frozenset[str] | None:
             break
         if chunk.startswith("(") and names and not expect_more:
             # Parenthetical note after a complete list (`axioms: propext, Quot.sound (standard)`),
-            # accepted only when balanced `(...)` reaches the end with no trailing items or axiom names.
+            # accepted only when balanced `(...)` reaches the end and contains solely allowlisted metadata words.
             tail = " ".join(chunks[c_idx:])
             if (
                 tail.endswith((")", ")."))
@@ -1440,10 +1452,12 @@ def _axiom_names(rest: str) -> frozenset[str] | None:
                 and tail.count(")") == 1
             ):
                 inner_note = tail.rstrip(".")[1:-1]
-                if not any(
-                    tok.strip("`'\"*_") in NEVER_ALLOWED_AXIOMS or "." in tok.strip("`'\"*_")
+                note_words = [
+                    tok.strip("`'\"*_.,;:").lower()
                     for tok in inner_note.split()
-                ):
+                    if tok.strip("`'\"*_.,;:")
+                ]
+                if note_words and all(w in _AXIOM_PAREN_NOTE_WORDS for w in note_words):
                     break
             return None
         parts = chunk.split(",")
@@ -1913,12 +1927,15 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
     ignore_line = comment_line = 0
     heading_ctx: list[tuple[str | None, str, bool]] = []
     para_ctx: list[tuple[str | None, str, bool]] = []
+    para_from_list = False
 
     def _audit_line(
         target: str,
         lineno: int,
         in_fence_mode: bool,
         fallback_ctx: Sequence[tuple[str | None, str, bool]],
+        *,
+        force_verdict_scope: bool = False,
     ) -> list[tuple[int, str | None, str, bool, bool]]:
         refs = _line_refs(target, known, in_fence_mode)
         clauses = _clause_spans(target) if not in_fence_mode else [(0, len(target))]
@@ -1932,7 +1949,9 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
             target,
             lineno,
             violations,
-            has_step_context=bool(refs or (fallback_ctx and not is_table_hdr)),
+            has_step_context=bool(
+                force_verdict_scope or refs or (fallback_ctx and not is_table_hdr)
+            ),
         )
         scoped_positions = [
             c_pos for c_pos, c_kind, c_metric, _v, _s in raw_claims
@@ -2001,24 +2020,39 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
                 ignored += 1
                 continue
             line, bq_depth = _strip_blockquote_prefix(line)
+            if para_from_list and line and not line[:1].isspace():
+                para_ctx = []
+                para_from_list = False
             m_fence = _FENCE_OPEN_RE.match(line)
             if m_fence is not None:
                 f_ch, f_len, info = m_fence.group(1)[0], len(m_fence.group(1)), m_fence.group(2)
                 is_inline_tilde = f_ch == "~" and bool(re.search(rf"{re.escape(f_ch)}{{{f_len},}}\s*$", info))
                 if not (f_ch == "`" and "`" in info) and not is_inline_tilde:
+                    fence_ctx = para_ctx or heading_ctx
                     fence_state = (f_ch, f_len, lineno, bq_depth)
                     para_ctx = []
+                    para_from_list = False
                     info_s = info.strip()
-                    if info_s and info_s.upper() in (_PASS_WORDS | _FAIL_WORDS):
-                        _audit_line(f": {info_s}", lineno, False, heading_ctx)
-                    elif info_s and not re.fullmatch(r"[A-Za-z0-9_+#.-]+", info_s):
-                        _audit_line(_strip_strikethrough_outside_code(info), lineno, False, heading_ctx)
+                    if info_s and (
+                        info_s.upper() in (_PASS_WORDS | _FAIL_WORDS)
+                        or not re.fullmatch(r"[A-Za-z0-9_+#.-]+", info_s)
+                    ):
+                        cleaned_info = _strip_strikethrough_outside_code(info_s)
+                        probe_info = (
+                            cleaned_info
+                            if (":" in cleaned_info or "|" in cleaned_info)
+                            else f": {cleaned_info}"
+                        )
+                        _audit_line(
+                            probe_info, lineno, False, fence_ctx, force_verdict_scope=True
+                        )
                     continue
             line = _strip_strikethrough_outside_code(line)
         in_fence = fence_state is not None
         if not line.strip():
             if not in_fence:
                 para_ctx = []
+                para_from_list = False
             continue
         if not in_fence and _HISTORICAL_RE.match(line):
             ignored += 1
@@ -2027,6 +2061,7 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
         is_list_item = not in_fence and bool(_LIST_ITEM_RE.match(line))
         if is_table_row or is_list_item:
             para_ctx = []
+            para_from_list = False
         refs = _audit_line(line, lineno, in_fence, para_ctx or heading_ctx)
         non_sec = [r for r in refs if not r[4]]
         ctx_pool = non_sec if non_sec else refs
@@ -2035,10 +2070,13 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
         if is_heading:
             heading_ctx = distinct
             para_ctx = []
+            para_from_list = False
         elif is_table_row:
             para_ctx = []
+            para_from_list = False
         elif distinct:
             para_ctx = distinct if len(distinct) == 1 else []
+            para_from_list = is_list_item and bool(para_ctx)
     if fence_state is not None:
         violations.append(
             Violation("MALFORMED_CLAIMS", fence_state[2], None,

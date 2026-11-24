@@ -1691,5 +1691,67 @@ class Ep2B4AdversarialTests(GuardHarness):
         self.assertIn("MALFORMED_RECEIPT", self.codes("`trusted_audit`: PASS\n", [padded_nightly]))
 
 
+class Ep2A4ConvergenceTests(GuardHarness):
+    """Final Pass A4 convergence tests closing B4's Shard B edge-case bypasses."""
+
+    def test_axiom_paren_custom_axioms_top_level_and_annotated_fence_verdicts_and_em_dash_verdicts(
+        self,
+    ) -> None:
+        # 1. Single-identifier unauthorized axioms inside `axioms: ... (plus myCustomAxiom)` must NOT
+        # be treated as benign parenthetical metadata!
+        for bad_paren in (
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (plus myCustomAxiom)\n",
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (with extraAxiom)\n",
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (see ???)\n",
+        ):
+            self.assertEqual(self.codes(bad_paren), ["MALFORMED_CLAIM"], bad_paren)
+        # Allowlisted standard foundation parenthetical notes remain accepted.
+        for ok_paren in (
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (standard)\n",
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (3 standard Lean kernel axioms).\n",
+        ):
+            self.assertEqual(self.codes(ok_paren), [], ok_paren)
+
+        # 2. Top-level, `para_ctx`-scoped, and parenthesized fence-opener verdicts (` ```Passed `,
+        # ` ```Passed (all good) `) catch failing steps, while real code fences (` ```rust,ignore `) stay clean!
+        red_cargo = [bundle(cargo_test={"exit_code": 1, "failed_count": 1})]
+        red_unit = [bundle(unit_tests={"returncode": 1, "ok": False, "failed_count": 1})]
+        for prose, recs in (
+            ("- `unit_tests`: rc=0\n```Passed\n```\n", red_cargo),
+            ("`unit_tests`\n```Passed\n```\n", red_unit),
+            ("## cargo_test\n```Passed (all good)\n```\n", red_cargo),
+            ("- `cargo_test`: Passed — all good\n", red_cargo),
+            ("| `cargo_test` | Passed / Green |\n", red_cargo),
+        ):
+            self.assertEqual(self.codes(prose, recs), ["SUPPRESSED_FAILURE"], prose)
+        self.assertEqual(
+            self.codes("`unit_tests`: rc=0, 42 passed\n```rust,ignore\nfn demo() {}\n```\n"),
+            [],
+        )
+
+    def test_atx_closing_hashes_numbered_step_headings_and_empty_check_trusted_shells(self) -> None:
+        # 1. CommonMark ATX closing `#`s, numbered headings (`## 1. ...`), and `Step`/`Gate` heading prefixes
+        # cannot hide fabricated step labels!
+        for prose in (
+            "## `fabricated_step` ##\nrc=0, 42 passed\n",
+            "## 1. `fabricated_step`\nrc=0, 42 passed\n",
+            "## 2.1) `fabricated_step`\nrc=0, 42 passed\n",
+            "## Step 1: `fabricated_step`\nrc=0, 42 passed\n",
+            "## Gate: `fabricated_step`\nrc=0, 42 passed\n",
+        ):
+            self.assertEqual(self.codes(prose), ["MISSING_STEP_RECEIPT"], prose)
+        # Valid numbered / ATX-closed headings bind cleanly to real steps.
+        self.assertEqual(self.codes("## 1. `unit_tests` ##\nrc=0, 42 passed\n"), [])
+
+        # 2. Empty `check_trusted` shell receipts lacking both `--audit-vacuity` summary objects and
+        # `kernelDeclarations` / `axioms` / `replay` fail closed as `MALFORMED_RECEIPT`!
+        for shell in (
+            {"sourceSha256": "ab" * 32},
+            {"claimTheoremsChecked": 0},
+            {"kernelDeclarations": 512, "sourceSha256": "ab" * 32},
+        ):
+            self.assertIn("MALFORMED_RECEIPT", self.codes("`check_trusted`: rc=0\n", [shell]), shell)
+
+
 if __name__ == "__main__":
     unittest.main()

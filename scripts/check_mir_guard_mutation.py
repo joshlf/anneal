@@ -4550,9 +4550,19 @@ def _has_macro_invocation(toks: Sequence[str]) -> bool:
     )
 
 
+_RUST_NON_CALL_KEYWORDS: frozenset[str] = frozenset(
+    {"let", "mut", "ref", "box", "return", "if", "else", "match", "while", "for", "in", "as"}
+)
+
+
 def _has_call_expr(toks: Sequence[str]) -> bool:
     return any(
-        tok == "(" and idx > 0 and (_is_spec_word(toks[idx - 1]) or toks[idx - 1] in (")", "]", ">"))
+        tok == "("
+        and idx > 0
+        and (
+            (_is_spec_word(toks[idx - 1]) and toks[idx - 1] not in _RUST_NON_CALL_KEYWORDS)
+            or toks[idx - 1] in (")", "]", ">")
+        )
         for idx, tok in enumerate(toks)
     )
 
@@ -5171,11 +5181,19 @@ def _split_rust_block_statements(toks: Sequence[str]) -> list[list[str]]:
     return statements
 
 
+_LEAN_EXPR_MARKERS: frozenset[str] = frozenset(
+    {"decide", "True", "False", ":=", "fun", "∀", "forall", "∃", "exists", "¬", "∧", "∨", "→", "↔"}
+)
+
+
 def _has_non_let_assignment(toks: Sequence[str]) -> bool:
-    """Whether `toks` contains any `=` outside an inner `let` header."""
+    """Whether `toks` contains any Rust `=` assignment outside an inner `let` header."""
+    if any(t in _LEAN_EXPR_MARKERS for t in toks):
+        return False
     bdepth = 0
     let_depth: int | None = None
-    for tok in toks:
+    n = len(toks)
+    for idx, tok in enumerate(toks):
         if tok in _SPEC_OPENERS:
             bdepth += 1
         elif tok in _SPEC_CLOSERS:
@@ -5188,21 +5206,38 @@ def _has_non_let_assignment(toks: Sequence[str]) -> bool:
         elif tok == "let":
             let_depth = bdepth
         elif tok == "=":
+            if toks[idx + 1 : idx + 2] == ["."]:
+                # `.ctor` after `=` is Lean dot-constructor equality, never Rust assignment.
+                continue
             if let_depth is None or bdepth != let_depth:
                 return True
             let_depth = None
     return False
 
 
+def _is_pure_small_int_tok(tok: str) -> bool:
+    return tok.isascii() and tok.isdigit() and len(tok) <= 9
+
+
 def _rust_let_rhs_may_panic(rhs: Sequence[str]) -> bool:
     """Whether an unfolded Rust expression may panic (arithmetic, shifts, indexing)."""
     cleaned = _strip_pattern_generics(rhs)
+    n = len(cleaned)
     for idx, tok in enumerate(cleaned):
         prev = cleaned[idx - 1] if idx > 0 else ""
+        nxt = cleaned[idx + 1] if idx + 1 < n else ""
         is_after_val = _is_spec_word(prev) or prev[:1].isdigit() or prev in (")", "]")
-        if tok in ("+", "-", "/", "%"):
+        if tok == "-" and not is_after_val and nxt[:1].isdigit() and cleaned[idx + 2 : idx + 3] != ["."]:
+            # Constant negative numeric literal (`-1`, `-1_i32`).
+            continue
+        if tok in ("+", "-", "*", "/", "%"):
+            if tok == "*" and not is_after_val:
+                continue
+            if _is_pure_small_int_tok(prev) and _is_pure_small_int_tok(nxt):
+                if tok not in ("/", "%") or int(nxt) != 0:
+                    continue
             return True
-        if tok in ("*", "[") and is_after_val:
+        if tok == "[" and is_after_val:
             return True
         if is_after_val and cleaned[idx : idx + 2] in (["<", "<"], [">", ">"]):
             return True
@@ -5245,8 +5280,7 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
                 return None
             if lhs[:1] == ["mut"]:
                 lhs = lhs[1:]
-            lhs = _split_top(lhs, {":"})[0]
-            lhs = _strip_parens(lhs)
+            lhs = _strip_parens(_split_top(_strip_parens(lhs), {":"})[0])
             if len(lhs) != 1 or not (lhs[0] == "_" or _is_spec_word(lhs[0])):
                 # Refutable destructuring (`let Ok(x) = ...` / `let true = ...`).
                 return None
@@ -5297,7 +5331,7 @@ def _strip_lean_let_prefix(toks: Sequence[str], depth: int) -> list[str] | None:
     if eq_split is None or not eq_split[1]:
         return None
     binder_lhs, rhs = eq_split
-    binder_lhs = _strip_parens(_split_top(binder_lhs, {":"})[0])
+    binder_lhs = _strip_parens(_split_top(_strip_parens(binder_lhs), {":"})[0])
     if len(binder_lhs) != 1:
         return None
     binder = _ident_key(binder_lhs[0])
@@ -5572,6 +5606,78 @@ def _strip_closure_return_type(body: Sequence[str]) -> list[str]:
     return list(body)
 
 
+def _has_non_ctor_call_expr(toks: Sequence[str]) -> bool:
+    """Whether `toks` invokes a non-constructor function or method (`f(x)`, `x.m()`, `(f)(x)`)."""
+    cleaned = _strip_pattern_generics(toks)
+    for idx, tok in enumerate(cleaned):
+        if tok != "(" or idx == 0:
+            continue
+        prev = cleaned[idx - 1]
+        if prev in (")", "]", ">"):
+            return True
+        if _is_spec_word(prev) and prev not in _RUST_NON_CALL_KEYWORDS:
+            before_prev = cleaned[idx - 2] if idx >= 2 else ""
+            if before_prev == ".":
+                return True
+            plain = _ident_key(prev)
+            if not plain[:1].isupper():
+                return True
+    return False
+
+
+def _scrutinee_matches_alt(scrutinee: Sequence[str], alt: Sequence[str], depth: int = 0) -> bool:
+    """Whether pure `scrutinee` unconditionally matches Rust pattern alternative `alt`."""
+    if depth > _MAX_SPEC_DEPTH:
+        return False
+    if _alt_is_catch_all(alt):
+        return True
+    scr = list(_strip_pattern_generics(scrutinee))
+    while scr and scr[0] == "(" and _wrapped(scr):
+        scr = scr[1:-1]
+    pat = _strip_pattern_generics(_strip_pattern_wrappers(alt))
+    if not scr or not pat:
+        return False
+    or_parts = _split_top(pat, {"|"})
+    if len(or_parts) > 1:
+        return any(_scrutinee_matches_alt(scr, part, depth + 1) for part in or_parts if part)
+    s_parts = _split_top(scr, {","})
+    p_parts = _split_top(pat, {","})
+    if len(s_parts) > 1 or len(p_parts) > 1:
+        if s_parts and not s_parts[-1]:
+            s_parts = s_parts[:-1]
+        if p_parts and not p_parts[-1]:
+            p_parts = p_parts[:-1]
+        return (
+            len(s_parts) > 1
+            and len(s_parts) == len(p_parts)
+            and all(
+                bool(sp) and bool(pp) and _scrutinee_matches_alt(sp, pp, depth + 1)
+                for sp, pp in zip(s_parts, p_parts)
+            )
+        )
+    if len(scr) == 1 and len(pat) == 1 and scr[0] == pat[0] and (
+        scr[0].isdigit() or scr[0] in ("true", "false")
+    ):
+        return True
+    s_head, s_dot, s_payload = _alt_head(scr)
+    p_head, p_dot, p_payload = _alt_head(pat)
+    if (
+        s_head is not None
+        and s_head == p_head
+        and not s_dot
+        and not p_dot
+        and s_head[:1].isupper()
+        and s_payload
+        and s_payload[0] == "("
+        and _wrapped(s_payload)
+    ):
+        if _payload_is_wildcard(p_payload):
+            return True
+        if p_payload and p_payload[0] == "(" and _wrapped(p_payload):
+            return _scrutinee_matches_alt(s_payload[1:-1], p_payload[1:-1], depth + 1)
+    return False
+
+
 def _eval_rust_matches_macro(toks: Sequence[str], depth: int) -> bool | None:
     """Fold pure `(::? (core|std)::)? matches!(<scrutinee>, <pat> [if <guard>])` when constant."""
     pos = 0
@@ -5592,7 +5698,7 @@ def _eval_rust_matches_macro(toks: Sequence[str], depth: int) -> bool | None:
     if first_comma is None or not first_comma[0] or not first_comma[1]:
         return None
     scrutinee, rhs_pat = first_comma
-    if _rust_part_may_early_exit(scrutinee) or _has_call_expr(scrutinee):
+    if _rust_part_may_early_exit(scrutinee) or _has_non_ctor_call_expr(scrutinee):
         return None
     rhs_list = list(rhs_pat)
     while rhs_list and rhs_list[-1] == ",":
@@ -5610,7 +5716,7 @@ def _eval_rust_matches_macro(toks: Sequence[str], depth: int) -> bool | None:
         if guard_val is False:
             return False
     alts = [alt for alt in _split_top(pat_toks, {"|"}) if alt]
-    if guard_val is True and any(_alt_is_catch_all(alt) for alt in alts):
+    if guard_val is True and any(_scrutinee_matches_alt(scrutinee, alt) for alt in alts):
         return True
     return None
 
@@ -6315,6 +6421,54 @@ def _normalize_lean_layout_lets(
     return out
 
 
+_TIGHTER_THAN_EQ_RIGHT_OPS: frozenset[str] = frozenset(
+    {".", "(", "[", "?", "as", "+", "-", "*", "/", "%", "<", "<=", ">", ">=", "&", "^", "|"}
+)
+_TIGHTER_THAN_EQ_LEFT_OPS: frozenset[str] = frozenset(
+    {".", ")", "]", "?", "as", "+", "-", "*", "/", "%", "<", "<=", ">", ">=", "&", "^", "|"}
+)
+
+
+def _read_bool_atom_right(
+    texts: Sequence[str], partner: dict[int, int], start: int
+) -> tuple[int, bool | None]:
+    """Read a unary/atomic/parenthesized boolean operand starting at `start`."""
+    n = len(texts)
+    cur = start
+    while cur < n and texts[cur] == "!":
+        cur += 1
+    if cur >= n:
+        return start, None
+    if texts[cur] in ("(", "{") and cur in partner:
+        end = partner[cur]
+    elif texts[cur] in ("true", "false"):
+        end = cur
+    else:
+        return start, None
+    if end + 1 < n and texts[end + 1] in _TIGHTER_THAN_EQ_RIGHT_OPS:
+        return start, None
+    return end, _const_truth(texts[start : end + 1])
+
+
+def _read_bool_atom_left(
+    texts: Sequence[str], partner: dict[int, int], end: int
+) -> tuple[int, bool | None]:
+    """Read a unary/atomic/parenthesized boolean operand ending at `end`."""
+    if end < 0:
+        return end, None
+    if texts[end] in (")", "}") and end in partner:
+        lo = partner[end]
+    elif texts[end] in ("true", "false"):
+        lo = end
+    else:
+        return end, None
+    while lo >= 1 and texts[lo - 1] == "!":
+        lo -= 1
+    if lo >= 1 and (texts[lo - 1] in _TIGHTER_THAN_EQ_LEFT_OPS or _is_spec_word(texts[lo - 1])):
+        return end, None
+    return lo, _const_truth(texts[lo : end + 1])
+
+
 def _has_rust_if_guard_before_brace(
     texts: Sequence[str], partner: dict[int, int], open_idx: int
 ) -> bool:
@@ -6445,27 +6599,37 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
                     expr_lo -= 1
                     expr_hi += 1
                     changed_span = True
-                suffix2 = texts[expr_hi + 1 : expr_hi + 3]
-                if suffix2 in (["==", "false"], ["!=", "true"]):
-                    negations += 1
-                    expr_hi += 2
-                    changed_span = True
-                elif suffix2 in (["==", "true"], ["!=", "false"]):
-                    expr_hi += 2
-                    changed_span = True
-                if expr_lo >= 2:
-                    prefix2 = texts[expr_lo - 2 : expr_lo]
-                    if prefix2 in (["false", "=="], ["true", "!="]):
-                        negations += 1
-                        expr_lo -= 2
+                if expr_hi + 2 < count and texts[expr_hi + 1] in ("==", "!="):
+                    eq_op = texts[expr_hi + 1]
+                    r_end, r_val = _read_bool_atom_right(texts, partner, expr_hi + 2)
+                    if r_val is not None:
+                        if (eq_op == "==" and r_val is False) or (eq_op == "!=" and r_val is True):
+                            negations += 1
+                        expr_hi = r_end
                         changed_span = True
-                    elif prefix2 in (["true", "=="], ["false", "!="]):
-                        expr_lo -= 2
+                if expr_lo >= 2 and texts[expr_lo - 1] in ("==", "!="):
+                    eq_op = texts[expr_lo - 1]
+                    l_lo, l_val = _read_bool_atom_left(texts, partner, expr_lo - 2)
+                    if l_val is not None:
+                        if (eq_op == "==" and l_val is False) or (eq_op == "!=" and l_val is True):
+                            negations += 1
+                        expr_lo = l_lo
                         changed_span = True
+            annihilated_false = (
+                expr_hi + 2 < count
+                and texts[expr_hi + 1] == "&&"
+                and _read_bool_atom_right(texts, partner, expr_hi + 2)[1] is False
+            ) or (
+                expr_lo >= 2
+                and texts[expr_lo - 1] == "&&"
+                and _read_bool_atom_left(texts, partner, expr_lo - 2)[1] is False
+            )
             guard_split = _split_first_top(rhs_pat, {"if"})
             pat_tokens = rhs_pat if guard_split is None else guard_split[0]
-            guard_ok = negations % 2 == 0 and (
-                guard_split is None or _const_truth(guard_split[1]) is True
+            guard_ok = (
+                not annihilated_false
+                and negations % 2 == 0
+                and (guard_split is None or _const_truth(guard_split[1]) is True)
             )
             group = (lang, enc, decl_by_enclosing.get(enc, -1) if lean else -1, -1)
             arms.append(
