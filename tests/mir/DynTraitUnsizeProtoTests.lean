@@ -1925,6 +1925,86 @@ theorem mr_virtual_dispatch_enter_agrees_mach_and_machTB :
     exact ⟨⟨s', callee, protTag, vtPtr1, e1, dp1, rfl, hR1, hS1, hC1, hU1⟩,
            ⟨s', callee, protTag, vtPtr2, e2, dp2, rfl, hR2, hS2, hC2, hU2⟩⟩
 
+/-- Campaign #22's first virtual-call site (`eval_vt`, slot `3`, `&dyn` receiver). -/
+def s49Site : ProtoVirtualCallSite :=
+  { traitPred := Fx.traitPred, slotIdx := 3, receiverIsRef := true }
+
+/-- **A4: non-vacuous linked-callee dispatch agreement on `Mach` AND `MachTB`.**
+B4's instance concluded `∀ fnThin, mapGet … = some fnThin → …` for an
+existential `defPath`, which holds vacuously if the method has no bound function
+pointer. Here (1) the entered callee is pinned to `otherEvalVtBody`, (2) the
+decidable side condition `methodsHaveFnPtrs` is discharged for both machines,
+and (3) `MR.virtualCall_enter_agrees_total` yields an EXISTING `fnThin` that
+MiniRust `VTableMethodLookup` returns. -/
+theorem a4_enter_dispatch_total_mach_and_machTB :
+    (match evalVirtualCallProtoOpt vt s49Site s49State driverBody [cp 14, cp 1] (loc 20) (some 4)
+        .continue_ with
+     | .enter _ c _ => strEq c.defPath otherEvalVtBody.defPath
+     | _ => false) = true ∧
+    (∃ (s' : MachineState) (callee : CapturedMir) (protTag : Option Nat)
+       (vtPtr' : ProvenancePtr) (e : ProtoVTableEntry) (defPath : String) (fnThin : Gen.ThinPointer Prov),
+      evalVirtualCallProtoOpt vt s49Site s49State driverBody [cp 14, cp 1] (loc 20) (some 4) .continue_ =
+          .enter s' callee protTag ∧
+      resolveVTablePtr vt Fx.traitPred vtPtr' = .ok e ∧
+      get? e.slots 3 = some (.method defPath) ∧
+      lookupCallee s49State.memory.callees driverBody.layouts defPath [] s49State.memory.traitImpls =
+        some callee ∧
+      mapGet (baseMach bmAllocs fnPtrsBM).fn_ptrs ⟨⟨fnOf defPath⟩⟩ = some fnThin ∧
+      evalUnOpM (.VTableMethodLookup ⟨⟨3⟩⟩)
+          (.Ptr (ThinPointer.widen (vtPtr bmL e) none), .Ptr (.VTablePtr (traitName bmL e.traitPred)))
+          (some (installVTables bmL vt (baseMach bmAllocs fnPtrsBM))) =
+        .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr)) ∧
+    (∃ (s' : MachineState) (callee : CapturedMir) (protTag : Option Nat)
+       (vtPtr' : ProvenancePtr) (e : ProtoVTableEntry) (defPath : String)
+       (fnThin : Gen.ThinPointer Gen.TreeBorrowsProvenance),
+      evalVirtualCallProtoOpt vt s49Site s49State driverBody [cp 14, cp 1] (loc 20) (some 4) .continue_ =
+          .enter s' callee protTag ∧
+      resolveVTablePtr vt Fx.traitPred vtPtr' = .ok e ∧
+      get? e.slots 3 = some (.method defPath) ∧
+      lookupCallee s49State.memory.callees driverBody.layouts defPath [] s49State.memory.traitImpls =
+        some callee ∧
+      mapGet (baseMachTB (tbAllocs .Frozen) fnPtrsTB).fn_ptrs ⟨⟨fnOf defPath⟩⟩ = some fnThin ∧
+      evalUnOpM (.VTableMethodLookup ⟨⟨3⟩⟩)
+          (.Ptr (ThinPointer.widen (vtPtr tbL e) none), .Ptr (.VTablePtr (traitName tbL e.traitPred)))
+          (some (installVTables tbL vt (baseMachTB (tbAllocs .Frozen) fnPtrsTB))) =
+        .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr)) := by
+  have hPin :
+      (match evalVirtualCallProtoOpt vt s49Site s49State driverBody [cp 14, cp 1] (loc 20) (some 4)
+          .continue_ with
+       | .enter _ c _ => strEq c.defPath otherEvalVtBody.defPath
+       | _ => false) = true := by decide +kernel
+  refine ⟨hPin, ?_⟩
+  cases hCall :
+      evalVirtualCallProtoOpt vt s49Site s49State driverBody [cp 14, cp 1] (loc 20) (some 4) .continue_ with
+  | externalCall _ _ _ => rw [hCall] at hPin; cases hPin
+  | ub => rw [hCall] at hPin; cases hPin
+  | unsupported => rw [hCall] at hPin; cases hPin
+  | enter s' callee protTag =>
+    have hWf : wfProtoVTableTable 8 vt = true := by decide +kernel
+    have hFnsBM : methodsHaveFnPtrs bmL (baseMach bmAllocs fnPtrsBM) vt = true := by decide +kernel
+    have hFnsTB : methodsHaveFnPtrs tbL (baseMachTB (tbAllocs .Frozen) fnPtrsTB) vt = true := by
+      decide +kernel
+    obtain ⟨v1, e1, d1, f1, hR1, hS1, hC1, hF1, hU1⟩ :=
+      virtualCall_enter_agrees_total bmL vt (baseMach bmAllocs fnPtrsBM) 8 s49Site
+        s49State driverBody [cp 14, cp 1] (loc 20) (some 4) .continue_ s' callee protTag
+        (bmLayout_provOf_inj _ _) hWf
+        (fun e he => List.all_eq_true.mp
+          (by decide +kernel :
+            vt.entries.all (fun e => inBounds (vtPtr bmL e).addr .Unsigned x86_64.PTR_SIZE) = true)
+          e he)
+        hFnsBM hCall
+    obtain ⟨v2, e2, d2, f2, hR2, hS2, hC2, hF2, hU2⟩ :=
+      virtualCall_enter_agrees_total tbL vt (baseMachTB (tbAllocs .Frozen) fnPtrsTB) 8 s49Site
+        s49State driverBody [cp 14, cp 1] (loc 20) (some 4) .continue_ s' callee protTag
+        (tbLayout_provOf_inj _ _) hWf
+        (fun e he => List.all_eq_true.mp
+          (by decide +kernel :
+            vt.entries.all (fun e => inBounds (vtPtr tbL e).addr .Unsigned x86_64.PTR_SIZE) = true)
+          e he)
+        hFnsTB hCall
+    exact ⟨⟨s', callee, protTag, v1, e1, d1, f1, rfl, hR1, hS1, hC1, hF1, hU1⟩,
+           ⟨s', callee, protTag, v2, e2, d2, f2, rfl, hR2, hS2, hC2, hF2, hU2⟩⟩
+
 end MrTest
 
 /-! ## §4b. Adversarial B1 hardening & falsification suite -/
@@ -2738,8 +2818,11 @@ def divergingAddrEqBody : CapturedMir :=
 
 /-- **B4 regressions.**
 1. Safe `core::mem::size_of_val(&dyn Trait)` returns `4` on a live valid
-   reference, faults UB (`3`) after `StorageDead(rec)`, and faults UB (`3`)
-   after owner overwrite disables `&rec`'s borrow tag.
+   reference and faults UB (`3`) after `StorageDead(rec)`; after an owner
+   overwrite disables `&rec`'s borrow tag, safe `core::mem::align_of_val` STILL
+   returns `4` (A4: Miri's argument value validity and the `!Freeze`
+   `&dyn Trait` fn-entry retag never consult Tree Borrows, so faulting here
+   would be a `false_positive_ub`).
 2. Raw `core::mem::size_of_val_raw(*const dyn Trait)`,
    `core::intrinsics::size_of_val(*const dyn Trait)`, and
    `core::mem::align_of_val_raw(*const dyn Trait)` STILL return `4` after
@@ -2756,8 +2839,9 @@ theorem b4_safe_vs_raw_size_of_val_and_step_edge_hardening :
         some (4, 8) ∧
     tagOf (runMirProto prog (layoutEdgeCallerBody "core::mem::size_of_val" false true false false) 32
       (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::size_of_val" false true false false) [] [])) = 3 ∧
-    tagOf (runMirProto prog (layoutEdgeCallerBody "core::mem::align_of_val" false false true false) 32
-      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::align_of_val" false false true false) [] [])) = 3 ∧
+    scalarOf (runMirProto prog (layoutEdgeCallerBody "core::mem::align_of_val" false false true false) 32
+      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::align_of_val" false false true false) [] [])) =
+        some (4, 8) ∧
     scalarOf (runMirProto prog (layoutEdgeCallerBody "core::mem::size_of_val_raw" true true false false) 32
       (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::size_of_val_raw" true true false false) [] [])) =
         some (4, 8) ∧
@@ -2781,6 +2865,38 @@ theorem b4_safe_vs_raw_size_of_val_and_step_edge_hardening :
       (initMachineStateWithCallees divergingAddrEqBody [] [])) = 3 ∧
     tagOf (runMirProto prog (layoutEdgeCallerBody "core::mem::size_of_val_raw" true false false true) 32
       (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::size_of_val_raw" true false false true) [] [])) = 3 := by
+  decide +kernel
+
+/-! ### A4 regressions (no Tree Borrows false-positive UB in safe
+`size_of_val` / `align_of_val`; dead referents still UB) -/
+
+/-- **A4 regression: TB-disabled `&dyn Trait` in safe `size_of_val` /
+`align_of_val` is NOT UB, and agrees with the raw entrypoints.** After the owner
+overwrite `rec = Receiver { 9 }` disables `&rec`'s tag, all four of
+`core::mem::{size_of_val, align_of_val}` (safe `&dyn`) and
+`core::mem::{size_of_val_raw, align_of_val_raw}` (raw `*const dyn`) return `4`,
+exactly as Miri `-Zmiri-tree-borrows` does; the dead-referent controls
+(`StorageDead(rec)`) still fault UB (`3`) on BOTH safe entrypoints, while the raw
+ones keep returning `4`. B4's version faulted on the disabled tag. -/
+theorem a4_safe_layout_ignores_tb_permissions_but_not_liveness :
+    scalarOf (runMirProto prog (layoutEdgeCallerBody "core::mem::size_of_val" false false true false) 32
+      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::size_of_val" false false true false) [] [])) =
+        some (4, 8) ∧
+    scalarOf (runMirProto prog (layoutEdgeCallerBody "core::mem::align_of_val" false false true false) 32
+      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::align_of_val" false false true false) [] [])) =
+        some (4, 8) ∧
+    scalarOf (runMirProto prog (layoutEdgeCallerBody "core::mem::size_of_val_raw" true false true false) 32
+      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::size_of_val_raw" true false true false) [] [])) =
+        some (4, 8) ∧
+    tagOf (runMirProto prog (layoutEdgeCallerBody "core::mem::size_of_val" false true false false) 32
+      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::size_of_val" false true false false) [] [])) = 3 ∧
+    tagOf (runMirProto prog (layoutEdgeCallerBody "core::mem::align_of_val" false true false false) 32
+      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::align_of_val" false true false false) [] [])) = 3 ∧
+    scalarOf (runMirProto prog (layoutEdgeCallerBody "core::mem::align_of_val_raw" true true false false) 32
+      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::align_of_val_raw" true true false false) [] [])) =
+        some (4, 8) ∧
+    tagOf (runMirProto prog (layoutEdgeCallerBody "core::mem::align_of_val" false false false true) 32
+      (initMachineStateWithCallees (layoutEdgeCallerBody "core::mem::align_of_val" false false false true) [] [])) = 3 := by
   decide +kernel
 
 end B1Hardening
@@ -4126,6 +4242,9 @@ run_cmd do
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.evalUnOpM_dyn_correspondence,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.virtualCall_agrees_with_vtableMethodLookup,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.virtualCall_enter_agrees_with_vtableMethodLookup,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.MR.virtualCall_enter_agrees_total,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.dynRefLayoutOfValProto_valid_eq_raw,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.dynRefLayoutOfValProto_ok_of_refDataValid,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.computeSizeAlignM_eq_dynLayoutProto ]
   let mut choiceFree : Nat := 0
   for d in constructive do

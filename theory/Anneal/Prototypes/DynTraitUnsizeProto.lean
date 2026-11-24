@@ -2656,8 +2656,16 @@ theorem dynLayoutOfValProto_failsClosed
 `core::mem::align_of_val(&dyn Trait)`). Unlike `size_of_val_raw` on
 `*const dyn Trait` (which reads only the vtable word), calling the safe
 `core::mem` entrypoints requires an initialized, valid shared reference
-(`refDataValid` / `refAddrValid`): null, dead, misaligned, out-of-bounds,
-uninhabited, or `.disabled` references fault `.ub`. -/
+(`refDataValidNoTB` / `refAddrValid`): null, dead, misaligned, out-of-bounds,
+or uninhabited references fault `.ub`.
+
+**Tree Borrows permissions are NOT consulted** (A4): Miri validates the
+`&dyn Trait` argument by value validity (`check_ptr_access`: liveness, bounds,
+alignment, non-null), which never reads the borrow tracker, and the fn-entry
+retag of `&dyn Trait` (a `!Freeze` pointee) performs no initial read access, so
+a `.disabled` / `.frozen` tag is NOT UB here (same rule as `&raw const (*r)`,
+`dynRawBorrowProto?`, and MiniRust `checkPtrM` on `MachTB`). Rejecting it would
+be a Campaign-#22-class `false_positive_ub`. -/
 def dynRefLayoutOfValProto
     (vt : ProtoVTableTable) (ptrBytes : Nat) (pred : ProtoTraitPred) (v : Value)
     (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
@@ -2680,7 +2688,7 @@ def dynRefLayoutOfValProto
             | true =>
               let valid :=
                 match wrapDataWord ptrBytes d with
-                | .prov p => refDataValid ptrBytes e false p locals mem localDecls layouts
+                | .prov p => refDataValidNoTB ptrBytes e p locals mem localDecls layouts
                 | .addr bits => refAddrValid ptrBytes e bits
               match valid with
               | true => .ok (e.sizeBytes, e.alignBytes)
@@ -2702,8 +2710,8 @@ theorem dynRefLayoutOfValProto_uninit_ub
 
 /-- **Sharp safe-vs-raw `size_of_val` / `align_of_val` distinction.** On a
 trait-object pointer whose vtable resolves to `e` but whose data pointer fails
-safe-reference validity (null, dead, misaligned, uninhabited, or `.disabled`),
-safe `dynRefLayoutOfValProto` faults `.ub` while raw `dynLayoutOfValProto`
+safe-reference value validity (null, dead, misaligned, out-of-bounds, or
+uninhabited), safe `dynRefLayoutOfValProto` faults `.ub` while raw `dynLayoutOfValProto`
 (`size_of_val_raw`) succeeds with `(e.sizeBytes, e.alignBytes)`. -/
 theorem dynRefLayoutOfValProto_invalid_ref_vs_raw_ok
     (vt : ProtoVTableTable) (ptrBytes : Nat) (pred : ProtoTraitPred) (v : Value)
@@ -2717,7 +2725,7 @@ theorem dynRefLayoutOfValProto_invalid_ref_vs_raw_ok
     (hRes : resolveVTablePtr vt pred vtPtr = .ok e)
     (hInvalid :
       (match wrapDataWord ptrBytes d with
-       | .prov p => refDataValid ptrBytes e false p locals mem localDecls layouts
+       | .prov p => refDataValidNoTB ptrBytes e p locals mem localDecls layouts
        | .addr bits => refAddrValid ptrBytes e bits) = false) :
     dynRefLayoutOfValProto vt ptrBytes pred v locals mem localDecls layouts = .ub ∧
     dynLayoutOfValProto vt ptrBytes pred v = .ok (e.sizeBytes, e.alignBytes) := by
@@ -2734,6 +2742,64 @@ theorem dynRefLayoutOfValProto_invalid_ref_vs_raw_ok
   · unfold dynRefLayoutOfValProto
     simp only [hInit, hPred, hEnv, hDec, hRes, hL, hInvalid]
   · exact (dynLayoutOfValProto_ok vt ptrBytes pred v d vtPtr e hPred hWf hDec hRes).1
+
+/-- **Valid safe `size_of_val(&dyn Trait)` agrees with `size_of_val_raw`.**
+Whenever the data pointer passes safe-reference value validity
+(`refDataValidNoTB`, which ignores Tree Borrows permissions), the safe entrypoint
+returns exactly the raw vtable-read result `(e.sizeBytes, e.alignBytes)`. -/
+theorem dynRefLayoutOfValProto_valid_eq_raw
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (pred : ProtoTraitPred) (v : Value)
+    (d : ProtoDataWord) (vtPtr : ProvenancePtr) (e : ProtoVTableEntry)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hInit : valueListContainsUninit [v] = false)
+    (hPred : pred.failsClosed = false)
+    (hEnv : vtableEnvOk ptrBytes vt mem = true)
+    (hDec : decodeWidePtr? ptrBytes v = some ⟨d, .vtable vtPtr⟩)
+    (hRes : resolveVTablePtr vt pred vtPtr = .ok e)
+    (hValid :
+      (match wrapDataWord ptrBytes d with
+       | .prov p => refDataValidNoTB ptrBytes e p locals mem localDecls layouts
+       | .addr bits => refAddrValid ptrBytes e bits) = true) :
+    dynRefLayoutOfValProto vt ptrBytes pred v locals mem localDecls layouts =
+      .ok (e.sizeBytes, e.alignBytes) ∧
+    dynLayoutOfValProto vt ptrBytes pred v = .ok (e.sizeBytes, e.alignBytes) := by
+  have hWf : wfProtoVTableTable ptrBytes vt = true := by
+    unfold vtableEnvOk at hEnv
+    cases hW : wfProtoVTableTable ptrBytes vt with
+    | true => rfl
+    | false => rw [hW] at hEnv; cases hEnv
+  have hL : entryLayoutOk ptrBytes e = true :=
+    wfProtoVTableEntry_layoutOk
+      (allEntriesWf_lookupByAlloc (wfProtoVTableTable_allEntriesWf hWf)
+        ((resolveVTablePtr_ok_iff vt pred vtPtr e).mp hRes).2.1)
+  refine ⟨?_, ?_⟩
+  · unfold dynRefLayoutOfValProto
+    simp only [hInit, hPred, hEnv, hDec, hRes, hL, hValid]
+  · exact (dynLayoutOfValProto_ok vt ptrBytes pred v d vtPtr e hPred hWf hDec hRes).1
+
+/-- **Safe `size_of_val` is no stricter than full reference validity.** If the
+data pointer passes the full (Tree-Borrows-checked) `refDataValid` for ANY
+access kind, safe `size_of_val(&dyn Trait)` succeeds with the vtable layout.
+(The converse fails on purpose: a `.disabled` tag over a live in-bounds aligned
+referent fails `refDataValid` yet succeeds here; see the A4 regression.) -/
+theorem dynRefLayoutOfValProto_ok_of_refDataValid
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (pred : ProtoTraitPred) (v : Value)
+    (vtPtr : ProvenancePtr) (e : ProtoVTableEntry) (dstMut : Bool) (p : ProvenancePtr)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hInit : valueListContainsUninit [v] = false)
+    (hPred : pred.failsClosed = false)
+    (hEnv : vtableEnvOk ptrBytes vt mem = true)
+    (hDec : decodeWidePtr? ptrBytes v = some ⟨.prov p, .vtable vtPtr⟩)
+    (hRes : resolveVTablePtr vt pred vtPtr = .ok e)
+    (hValid : refDataValid ptrBytes e dstMut p locals mem localDecls layouts = true) :
+    dynRefLayoutOfValProto vt ptrBytes pred v locals mem localDecls layouts =
+      .ok (e.sizeBytes, e.alignBytes) :=
+  (dynRefLayoutOfValProto_valid_eq_raw vt ptrBytes pred v (.prov p) vtPtr e locals mem
+    localDecls layouts hInit hPred hEnv hDec hRes
+    (refDataValidNoTB_of_refDataValid ptrBytes e dstMut p locals mem localDecls layouts
+      hValid)).1
 
 /-! ## §5. Virtual method dispatch and the Tree Borrows receiver protector -/
 
@@ -5784,6 +5850,65 @@ theorem virtualCall_enter_agrees_with_vtableMethodLookup (L : DynLayout M) (vt :
   exact (evalUnOpM_dyn_correspondence L vt m ptrBytes site.slotIdx e defPath
     (ptrAt L 0 0) fnThin (.Raw (.VTablePointer (traitName L e.traitPred))) hProv hWf hLook'
     (hBounds e hMem) rfl hSlot hFn).2.2.2
+
+/-- Every `.method dp` slot of every captured vtable has a MiniRust function
+pointer bound in `m.fn_ptrs` (decidable side condition that makes the
+dispatch-agreement theorem non-vacuous). -/
+def methodsHaveFnPtrs (L : DynLayout M) (m : Gen.Machine M) (vt : ProtoVTableTable) : Bool :=
+  vt.entries.all (fun e => e.slots.all (fun sl =>
+    match sl with
+    | .method dp => (mapGet m.fn_ptrs ⟨⟨L.fnOf dp⟩⟩).isSome
+    | _ => true))
+
+private theorem get?_mem_slot :
+    ∀ (xs : List ProtoVTableSlot) (i : Nat) (x : ProtoVTableSlot), get? xs i = some x → x ∈ xs
+  | [], _, _, h => by cases h
+  | y :: ys, 0, x, h => by
+    have hx : y = x := by simpa [get?] using h
+    subst hx; exact List.mem_cons_self
+  | y :: ys, i + 1, x, h => by
+    have h' : get? ys i = some x := by simpa [get?] using h
+    exact List.mem_cons_of_mem _ (get?_mem_slot ys i x h')
+
+/-- **Total (non-vacuous) linked-callee dispatch agreement with MiniRust
+`VTableMethodLookup`.** Under the decidable side condition
+`methodsHaveFnPtrs`, whenever `evalVirtualCallProtoOpt` enters a linked callee,
+there EXISTS a function pointer `fnThin` bound to the resolved method in
+`m.fn_ptrs`, and MiniRust `VTableMethodLookup` at the call site's slot returns
+exactly it (no universally-quantified escape hatch over `fnThin`). -/
+theorem virtualCall_enter_agrees_total (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes : Nat) (site : ProtoVirtualCallSite) (s : MachineState)
+    (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : Option BasicBlockIdx) (unwind : UnwindAction)
+    (s' : MachineState) (callee : CapturedMir) (protTag : Option Nat)
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true)
+    (hBounds : ∀ e, e ∈ vt.entries → inBounds (vtPtr L e).addr .Unsigned x86_64.PTR_SIZE = true)
+    (hFns : methodsHaveFnPtrs L m vt = true)
+    (h : evalVirtualCallProtoOpt vt site s callerBody argOps destination target unwind =
+      .enter s' callee protTag) :
+    ∃ (vtPtr' : ProvenancePtr) (e : ProtoVTableEntry) (defPath : String)
+      (fnThin : Gen.ThinPointer (Gen.Memory.Provenance M)),
+      resolveVTablePtr vt site.traitPred vtPtr' = .ok e ∧
+      get? e.slots site.slotIdx = some (.method defPath) ∧
+      lookupCallee s.memory.callees callerBody.layouts defPath [] s.memory.traitImpls =
+        some callee ∧
+      mapGet m.fn_ptrs ⟨⟨L.fnOf defPath⟩⟩ = some fnThin ∧
+      evalUnOpM (.VTableMethodLookup ⟨⟨site.slotIdx⟩⟩)
+          (.Ptr (ThinPointer.widen (vtPtr L e) none), .Ptr (.VTablePtr (traitName L e.traitPred)))
+          (some (installVTables L vt m)) =
+        .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr) := by
+  obtain ⟨vtPtr', e, defPath, hRes, hSlot, hCallee, hAll⟩ :=
+    virtualCall_enter_agrees_with_vtableMethodLookup L vt m ptrBytes site s callerBody argOps
+      destination target unwind s' callee protTag hProv hWf hBounds h
+  obtain ⟨_, hLook, _⟩ := (resolveVTablePtr_ok_iff vt site.traitPred vtPtr' e).mp hRes
+  have hMem : e ∈ vt.entries := lookupVTableByAlloc_mem hLook
+  have hSlots := List.all_eq_true.mp hFns e hMem
+  have hSome := List.all_eq_true.mp hSlots (.method defPath)
+    (get?_mem_slot e.slots site.slotIdx _ hSlot)
+  cases hF : mapGet m.fn_ptrs ⟨⟨L.fnOf defPath⟩⟩ with
+  | none => simp only [hF, Option.isSome_none] at hSome; cases hSome
+  | some fnThin => exact ⟨vtPtr', e, defPath, fnThin, hRes, hSlot, hCallee, hF, hAll fnThin hF⟩
 
 end MR
 
