@@ -492,8 +492,10 @@ def _fake_lean_run_source(
         "import json, os, subprocess, sys, time\n"
         "args = sys.argv[1:]\n"
         f"LOG = {os.fspath(log) if log is not None else None!r}\n"
-        "KEYS = ('LEAN_NUM_THREADS', 'ANNEAL_LSP_NO_EVICT', 'ANNEAL_LEAN_RUN_IN_SCOPE', 'XDG_CONFIG_HOME',\n"
-        "        'XDG_RUNTIME_DIR', 'HOME')\n"
+        "KEYS = ('LEAN_NUM_THREADS', 'ANNEAL_LSP_NO_EVICT', 'ANNEAL_LEAN_RUN_IN_SCOPE', 'ANNEAL_LEAN_RUN_ACTIVE',\n"
+        "        'ANNEAL_LEAN_RUN_LEAN_M_MB', 'ANNEAL_LEAN_RUN_SLOTS', 'ANNEAL_LEAN_RUN_MEM_MB',\n"
+        "        'ANNEAL_WORKTREE_CONCURRENCY', 'ANNEAL_LEAN_MEMORY_MAX_MB', 'ANNEAL_LEAN_TIMEOUT_SEC',\n"
+        "        'ANNEAL_OOM_OFFLOAD_CMD', 'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR', 'HOME')\n"
         "unit = os.path.join(os.environ.get('XDG_CONFIG_HOME', '/nonexistent'), 'systemd/user/anneal-workloads.slice')\n"
         "if LOG:\n"
         "    with open(LOG, 'a', encoding='utf-8') as fh:\n"
@@ -2458,9 +2460,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 + grace,
                 name,
             )
-        # Both steps (and the `Trusted` prebuild) name libraries the `examples` Lake root
-        # declares, and the vendored library is the one the stale-`.olean` guard already
-        # treats as independent of `Trusted`.
+        # All three steps (and the `Trusted` prebuild) name libraries the `examples` Lake root
+        # declares, the core wave's `.lean` files exist on disk, and the vendored library is
+        # the one the stale-`.olean` guard already treats as independent of `Trusted`.
         import tomllib
 
         examples_libs = {
@@ -2468,9 +2470,63 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             for lib in tomllib.loads((REPO_ROOT / "examples/lakefile.toml").read_text(encoding="utf-8"))["lean_lib"]
         }
         self.assertTrue({"Trusted", "Miri", "LeanMiriSpec"} <= examples_libs)
+        for mod in ("Translate", "SimLM2_1", "SimLM3_1"):
+            self.assertTrue(
+                (REPO_ROOT / f"lean-miri/lean/LeanMiriSpec/Correspondence/{mod}.lean").is_file(), mod
+            )
         self.assertIn("Miri", suite._TRUSTED_INDEPENDENT_LIBS)
         self.assertNotIn("LeanMiriSpec", suite._TRUSTED_INDEPENDENT_LIBS)
-        # Without a resolvable wrapper both run the bare Lake commands, in the same order.
+        # Without a resolvable wrapper all three run the bare Lake commands, in the same order.
+        with mock.patch.object(suite, "_resolve_anneal_lean_run", return_value=None):
+            bare = [(name, cmd) for name, _c, cmd, _t in suite.build_suite_steps(REPO_ROOT, "nightly")]
+        self.assertEqual([name for name, _cmd in bare], names)
+        bare_by_name = dict(bare)
+        for name, (inner, _budget) in expected.items():
+            self.assertEqual(bare_by_name[name], inner, name)
+
+    def test_minirust_spec_build_is_split_into_core_and_spec_waves(self) -> None:
+        for profile in ("census-only", "quick"):
+            names = [s[0] for s in suite.build_suite_steps(REPO_ROOT, profile)]
+            self.assertNotIn("lake_build_minirust_spec_core", names)
+            self.assertNotIn("lake_build_minirust_spec", names)
+        steps = suite.build_suite_steps(REPO_ROOT, "nightly")
+        names = [s[0] for s in steps]
+        by_name = {name: (cat, cmd, timeout_sec) for name, cat, cmd, timeout_sec in steps}
+        corr_idx = names.index("lake_build_correspondence")
+        self.assertEqual(names[corr_idx + 1], "lake_build_minirust_spec_core")
+        self.assertEqual(names[corr_idx + 2], "lake_build_minirust_spec")
+        self.assertEqual(names[corr_idx + 3], "lake_build_examples_miri_vendor")
+        expected = {
+            "lake_build_minirust_spec_core": (
+                [
+                    "lake",
+                    "build",
+                    "MiniRustSpec.Correspondence.MiniRustEval",
+                    "MiniRustSpec.Correspondence.AnnealEval",
+                ],
+                900,
+            ),
+            "lake_build_minirust_spec": (["lake", "build", "MiniRustSpec"], 1200),
+        }
+        grace = suite.WRAPPER_TIMEOUT_GRACE_SEC
+        for name, (inner, budget) in expected.items():
+            category, cmd, timeout_sec = by_name[name]
+            self.assertEqual(category, "cat2_correspondence_suites", name)
+            self.assertEqual(timeout_sec, budget, name)
+            self.assertTrue(suite._is_lean_run_wrapped(cmd), name)
+            self.assertEqual(suite._lean_run_wrapper_flags(cmd), ("build", budget, True), name)
+            self.assertEqual(self._inner_cmd(cmd), inner, name)
+            self.assertEqual(
+                suite._outer_timeout_sec(cmd, timeout_sec),
+                max(suite.LEAN_RUN_SLOT_WAIT_SEC["build"], budget)
+                + max(suite.LEAN_RUN_OOM_RETRY_WINDOW_SEC, budget)
+                + grace,
+                name,
+            )
+        for mod in ("MiniRustEval", "AnnealEval"):
+            self.assertTrue(
+                (REPO_ROOT / f"minirust/lean/MiniRustSpec/Correspondence/{mod}.lean").is_file(), mod
+            )
         with mock.patch.object(suite, "_resolve_anneal_lean_run", return_value=None):
             bare = [(name, cmd) for name, _c, cmd, _t in suite.build_suite_steps(REPO_ROOT, "nightly")]
         self.assertEqual([name for name, _cmd in bare], names)
@@ -6128,6 +6184,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             repo.mkdir()
             env_wrapper = make_exe(root / "custom/anneal-lean-run")
             path_wrapper = make_exe(root / "bin/anneal-lean-run")
+            home_wrapper = make_exe(root / "home/.local/bin/anneal-lean-run")
+            local_wrapper = make_exe(root / "repo_local/scripts/anneal-lean-run")
             old_cwd = os.getcwd()
             os.chdir(root)
             try:
@@ -6135,10 +6193,16 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     repo, env={"ANNEAL_LEAN_RUN": "custom/anneal-lean-run", "PATH": ""}
                 )
                 from_path = suite._resolve_anneal_lean_run(repo, env={"PATH": "bin"})
+                from_home_env = suite._resolve_anneal_lean_run(repo, env={"PATH": "", "HOME": "home"})
+                from_home_arg = suite._resolve_anneal_lean_run(repo, env={"PATH": ""}, home=Path("home"))
+                from_local = suite._resolve_anneal_lean_run(Path("repo_local"), env={"PATH": ""})
             finally:
                 os.chdir(old_cwd)
             self.assertEqual(from_env, env_wrapper)
             self.assertEqual(from_path, path_wrapper)
+            self.assertEqual(from_home_env, home_wrapper)
+            self.assertEqual(from_home_arg, home_wrapper)
+            self.assertEqual(from_local, local_wrapper)
 
     def test_wrapper_honors_lean_num_threads_probe_and_exec_verdicts(self) -> None:
         # On this host the in-repo wrapper keeps `LEAN_NUM_THREADS=1`, and its `--probe`
@@ -6165,10 +6229,17 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             cases: list[tuple[str, dict[str, Any], bool]] = [
                 ("honest_banner_honoring_exec", {"probe_text": honest}, True),
                 ("no_banner_honoring_exec", {"probe_text": ""}, True),
+                (
+                    "prefixed_var_name_no_false_positive",
+                    {"probe_text": honest + "\n  DEFAULT_LEAN_NUM_THREADS=96"},
+                    True,
+                ),
                 ("probe_clobber", {"probe_text": "Thread Budget (-j) : 3 threads (LEAN_NUM_THREADS=3)"}, False),
                 ("exec_clobber", {"probe_text": honest, "exec_threads": "3"}, False),
                 ("no_banner_exec_clobber", {"probe_text": "", "exec_threads": "3"}, False),
                 ("exec_unsets", {"probe_text": honest, "exec_threads": ""}, False),
+                ("exec_whitespace_wrapped_threads", {"probe_text": honest, "exec_threads": " 1\n"}, False),
+                ("exec_leading_newline", {"probe_text": honest, "exec_stdout": "\n"}, False),
                 (
                     "one_core_banner_exec_clobber",
                     {"probe_text": "Thread Budget (-j) : 1 threads (LEAN_NUM_THREADS=1)", "exec_threads": "3"},
@@ -6178,6 +6249,11 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 ("second_banner_clobbers", {"probe_text": honest + "\n" + honest.replace("=1)", "=8)")}, False),
                 ("stray_threads_mention", {"probe_text": honest + "\n  child env: LEAN_NUM_THREADS=8"}, False),
                 ("banner_spaces_value", {"probe_text": "Thread Budget (-j) : 4 threads (LEAN_NUM_THREADS= 11)"}, False),
+                (
+                    "oversized_probe_stdout_fails_closed",
+                    {"probe_text": ("x" * (suite._WRAPPER_PROBE_MAX_OUTPUT_BYTES + 64)) + "\nLEAN_NUM_THREADS=96"},
+                    False,
+                ),
                 ("probe_nonzero_exit", {"probe_text": honest, "probe_rc": 2}, False),
                 ("exec_nonzero_exit", {"probe_text": honest, "exec_rc": 1}, False),
                 ("exec_stdout_chatter", {"probe_text": honest, "exec_stdout": "[wrapper] scope ok\n"}, False),
@@ -6209,8 +6285,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     self.assertTrue(env[var] and Path(env[var]).name in ("config", "runtime"), (var, env[var]))
                     self.assertNotEqual(env[var], os.environ.get(var))
                     self.assertFalse(Path(env[var]).exists(), "probe temp dirs are removed")
-            # A clobbering `--probe` is rejected before anything is executed through it.
-            self.assertFalse(any(Path(c["argv0"]).parent.name == "probe_clobber" for c in exec_calls))
+            # A clobbering or oversized `--probe` is rejected before anything is executed through it.
+            for rejected_label in ("probe_clobber", "oversized_probe_stdout_fails_closed"):
+                self.assertFalse(any(Path(c["argv0"]).parent.name == rejected_label for c in exec_calls), rejected_label)
 
     def test_wrapper_honors_lean_num_threads_rejects_bypasses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(suite._WRAPPER_THREAD_PROBE_CACHE, clear=True):
@@ -6229,8 +6306,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             for bad in (root / "missing", root / "good", non_exec, dangling, Path("bad\0path")):
                 self.assertFalse(suite._wrapper_honors_lean_num_threads(bad), bad)
             self.assertEqual(spawns(), 0)
-            # Non-positive / NaN timeouts never spawn either.
-            for timeout in (0, -1.0, float("nan")):
+            # Non-positive, non-finite, or boolean timeouts never spawn either.
+            for timeout in (0, -1.0, float("nan"), float("inf"), float("-inf"), True):
                 self.assertFalse(suite._wrapper_honors_lean_num_threads(good, timeout_sec=timeout), timeout)
             self.assertEqual(spawns(), 0)
 
@@ -6266,6 +6343,37 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             )
             self.assertFalse(
                 suite._wrapper_honors_lean_num_threads(sneaky, env={**os.environ, "ANNEAL_LEAN_RUN_IN_SCOPE": "1"})
+            )
+
+            # Ambient operator overrides (`ANNEAL_WORKTREE_CONCURRENCY`, `ANNEAL_LEAN_MEMORY_MAX_MB`,
+            # `ANNEAL_LEAN_TIMEOUT_SEC`, `ANNEAL_OOM_OFFLOAD_CMD`, and outer-scope metadata) are
+            # scrubbed from the probe so they cannot break or side-effect a valid wrapper.
+            hostile_overrides = {
+                "ANNEAL_LEAN_RUN_IN_SCOPE": "1",
+                "ANNEAL_LEAN_RUN_ACTIVE": "1",
+                "ANNEAL_LEAN_RUN_LEAN_M_MB": "64",
+                "ANNEAL_LEAN_RUN_SLOTS": "9",
+                "ANNEAL_LEAN_RUN_MEM_MB": "1",
+                "ANNEAL_WORKTREE_CONCURRENCY": "500",
+                "ANNEAL_LEAN_MEMORY_MAX_MB": "1",
+                "ANNEAL_LEAN_TIMEOUT_SEC": "1",
+                "ANNEAL_OOM_OFFLOAD_CMD": "/bin/false",
+            }
+            before = spawns()
+            scrub_probe = _write_fake_lean_run(root / "scrub/anneal-lean-run", log=log)
+            self.assertTrue(
+                suite._wrapper_honors_lean_num_threads(scrub_probe, env={**os.environ, **hostile_overrides})
+            )
+            scrub_calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()[before:]]
+            self.assertEqual(len(scrub_calls), 2)
+            for call in scrub_calls:
+                for key in hostile_overrides:
+                    self.assertIsNone(call["env"][key], key)
+            # And on the real in-repo wrapper, hostile overrides must not cause headroom/OOM rejection.
+            self.assertTrue(
+                suite._wrapper_honors_lean_num_threads(
+                    REPO_ROOT / "scripts/anneal-lean-run", env={**os.environ, **hostile_overrides}
+                )
             )
 
             # Hung `--probe` or exec check: `False` within the timeout, and the wrapper's
@@ -6304,6 +6412,42 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             for call in new_calls:
                 self.assertEqual(call["slice"], "[Slice]\nMemoryMax=1234M\n")
                 self.assertEqual(call["env"]["HOME"], os.fspath(fake_home))
+
+            # Even when the caller's `HOME` has no (or a stale) `anneal-workloads.slice`,
+            # probing the real in-repo wrapper synthesizes the matching unit from `--probe`
+            # so `ensure_workloads_slice` never invokes `systemctl --user daemon-reload`.
+            real_systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
+            if Path(real_systemctl).is_file():
+                spy_bin = root / "spy_bin"
+                spy_bin.mkdir()
+                spy_log = root / "systemctl_calls.jsonl"
+                spy_systemctl = spy_bin / "systemctl"
+                spy_systemctl.write_text(
+                    f"#!{sys.executable}\n"
+                    "import json, os, sys\n"
+                    f"with open({os.fspath(spy_log)!r}, 'a', encoding='utf-8') as fh:\n"
+                    "    fh.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                    f"os.execv({real_systemctl!r}, [{real_systemctl!r}, *sys.argv[1:]])\n",
+                    encoding="utf-8",
+                )
+                spy_systemctl.chmod(0o755)
+                empty_home = root / "empty_home"
+                empty_home.mkdir()
+                spy_path = os.pathsep.join([os.fspath(spy_bin), os.environ.get("PATH", "/usr/bin:/bin")])
+                for label, extra_env in (
+                    ("empty_home", {"PATH": spy_path, "HOME": os.fspath(empty_home)}),
+                    ("stale_home", {"PATH": spy_path, "HOME": os.fspath(fake_home)}),
+                ):
+                    self.assertTrue(
+                        suite._wrapper_honors_lean_num_threads(REPO_ROOT / "scripts/anneal-lean-run", env=extra_env),
+                        label,
+                    )
+                if spy_log.exists():
+                    sc_calls = [json.loads(line) for line in spy_log.read_text(encoding="utf-8").splitlines()]
+                    self.assertFalse(
+                        any("daemon-reload" in args for args in sc_calls),
+                        f"probe triggered daemon-reload: {sc_calls}",
+                    )
 
     def test_wrapper_honors_lean_num_threads_memo_invalidates_on_any_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(suite._WRAPPER_THREAD_PROBE_CACHE, clear=True):
@@ -6379,7 +6523,14 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(spawns(), first + 6)
             first = spawns()
             # Ambient values the probe overrides or scrubs do not split the cache.
-            for noise in ({"LEAN_NUM_THREADS": "9"}, {"ANNEAL_LEAN_RUN_IN_SCOPE": "1"}, {"XDG_RUNTIME_DIR": "/x"}):
+            for noise in (
+                {"LEAN_NUM_THREADS": "9"},
+                {"ANNEAL_LEAN_RUN_IN_SCOPE": "1"},
+                {"ANNEAL_WORKTREE_CONCURRENCY": "8"},
+                {"ANNEAL_LEAN_MEMORY_MAX_MB": "512"},
+                {"ANNEAL_OOM_OFFLOAD_CMD": "/bin/false"},
+                {"XDG_RUNTIME_DIR": "/x"},
+            ):
                 self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper, env={**os.environ, **noise}), noise)
             self.assertEqual(spawns(), first)
 
@@ -6459,6 +6610,53 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 link_bin / "anneal-lean-run",
             )
             self.assertEqual(log.read_text(encoding="utf-8"), before)
+
+            # A clobbering first `PATH` wrapper falls through to a later honoring `PATH` entry
+            # or an honoring `~/.local/bin/anneal-lean-run` before falling back to `local`, and
+            # an embedded NUL byte in an earlier `PATH` entry does not crash resolution.
+            bad_bin = root / "bad_bin"
+            good_bin = root / "good_bin"
+            _write_fake_lean_run(
+                bad_bin / "anneal-lean-run",
+                log=log,
+                probe_text="Thread Budget (-j) : 3 threads (LEAN_NUM_THREADS=3)",
+            )
+            good_path_wrapper = _write_fake_lean_run(good_bin / "anneal-lean-run", log=log)
+            good_home = root / "good_home"
+            good_home_wrapper = _write_fake_lean_run(good_home / ".local/bin/anneal-lean-run", log=log)
+            self.assertEqual(
+                suite._resolve_anneal_lean_run(
+                    repo,
+                    env={
+                        "PATH": os.pathsep.join(["bad\x00dir", os.fspath(bad_bin), os.fspath(good_bin)]),
+                        "HOME": os.fspath(home),
+                    },
+                ),
+                good_path_wrapper,
+            )
+            self.assertEqual(
+                suite._resolve_anneal_lean_run(
+                    repo,
+                    env={"PATH": os.fspath(bad_bin), "HOME": os.fspath(good_home)},
+                ),
+                good_home_wrapper,
+            )
+            # When `~/.local/bin/anneal-lean-run` is a symlink to an already-rejected `PATH`
+            # wrapper, it is not probed a second time before falling back to `local`.
+            sym_home = root / "sym_home"
+            (sym_home / ".local/bin").mkdir(parents=True)
+            (sym_home / ".local/bin/anneal-lean-run").symlink_to(bad_bin / "anneal-lean-run")
+            suite._WRAPPER_THREAD_PROBE_CACHE.clear()
+            before_lines = len(log.read_text(encoding="utf-8").splitlines())
+            self.assertEqual(
+                suite._resolve_anneal_lean_run(
+                    repo,
+                    env={"PATH": os.fspath(bad_bin), "HOME": os.fspath(sym_home)},
+                ),
+                local,
+            )
+            after_lines = len(log.read_text(encoding="utf-8").splitlines())
+            self.assertEqual(after_lines - before_lines, 1)
 
     def test_nightly_low_ram_waves_run_single_threaded_despite_clobbering_ambient_wrapper(self) -> None:
         # End to end: an ambient fleet wrapper on `PATH` and in `~/.local/bin` that clobbers

@@ -70,6 +70,7 @@ from collections.abc import Mapping
 import datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -5327,25 +5328,62 @@ def _is_executable_file(path: Path) -> bool:
 # the probe environment, and the timeout, so repeated `build_suite_steps()` calls spawn
 # no redundant probe subprocesses while any edit to the wrapper is re-probed.
 _WRAPPER_THREAD_PROBE_CACHE: dict[tuple[Any, ...], bool] = {}
-# Environment the probe never inherits: re-entrancy pass-through (an ambient
-# `ANNEAL_LEAN_RUN_IN_SCOPE=1`, e.g. when the suite itself runs under `anneal-lean-run`,
-# would make any wrapper exec the command untouched and so "honor" the caller's
-# `LEAN_NUM_THREADS`) and the config/runtime dirs the probe replaces with private ones.
+# Environment the probe never inherits: re-entrancy pass-through and outer-scope
+# metadata (an ambient `ANNEAL_LEAN_RUN_IN_SCOPE=1`, e.g. when the suite itself runs
+# under `anneal-lean-run`, would make any wrapper exec the command untouched and so
+# "honor" the caller's `LEAN_NUM_THREADS`), operator resource overrides that could
+# OOM-kill, timeout, reject headroom, or trigger offload hooks on the probe child, and
+# the config/runtime dirs the probe replaces with private ones.
 _WRAPPER_PROBE_SCRUBBED_ENV: frozenset[str] = frozenset(
-    ("ANNEAL_LEAN_RUN_IN_SCOPE", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR")
+    (
+        "ANNEAL_LEAN_RUN_IN_SCOPE",
+        "ANNEAL_LEAN_RUN_ACTIVE",
+        "ANNEAL_LEAN_RUN_LEAN_M_MB",
+        "ANNEAL_LEAN_RUN_SLOTS",
+        "ANNEAL_LEAN_RUN_MEM_MB",
+        "ANNEAL_WORKTREE_CONCURRENCY",
+        "ANNEAL_LEAN_MEMORY_MAX_MB",
+        "ANNEAL_LEAN_TIMEOUT_SEC",
+        "ANNEAL_OOM_OFFLOAD_CMD",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+    )
 )
 # `--probe` text banner: `Thread Budget (-j) : <B> threads (LEAN_NUM_THREADS=<T>)`.
 _WRAPPER_PROBE_THREAD_BANNER_RE = re.compile(
     r"Thread Budget \(-j\)\s*:\s*(\S+)\s+threads?\s*\(LEAN_NUM_THREADS=([^)\n]*)\)"
 )
-# Every `LEAN_NUM_THREADS=<v>` the probe text mentions, banner or not.
-_WRAPPER_PROBE_LEAN_THREADS_RE = re.compile(r"LEAN_NUM_THREADS\s*=\s*([^\s),;]*)")
+# Every standalone `LEAN_NUM_THREADS=<v>` the probe text mentions, banner or not
+# (anchored left so unrelated prefixed names such as `DEFAULT_LEAN_NUM_THREADS=96`
+# never false-positive).
+_WRAPPER_PROBE_LEAN_THREADS_RE = re.compile(
+    r"(?<![A-Za-z0-9_])LEAN_NUM_THREADS\s*=\s*([^\s),;]*)"
+)
+# Slice envelope limits reported by `anneal-lean-run --probe`, used to pre-seed a
+# matching `anneal-workloads.slice` in the probe's private `XDG_CONFIG_HOME` so the
+# exec check's `ensure_workloads_slice` is a no-op and never triggers `daemon-reload`.
+_WRAPPER_PROBE_SLICE_MAX_RE = re.compile(r"\bW_slice_max=(\d+)\s+MiB\b")
+_WRAPPER_PROBE_SLICE_HIGH_RE = re.compile(r"\bW_slice_high=(\d+)\s+MiB\b")
 # Child the execution check runs under the wrapper: prints the `LEAN_NUM_THREADS` it got.
 _WRAPPER_EXEC_THREADS_DUMP = "import os, sys; sys.stdout.write(os.environ.get('LEAN_NUM_THREADS', ''))"
-# Most probe output read back (a sane wrapper prints well under 4 KiB).
+# Most probe output read back (a sane wrapper prints well under 4 KiB). Output exceeding
+# this cap fails closed rather than silently truncating trailing clobber lines.
 _WRAPPER_PROBE_MAX_OUTPUT_BYTES = 1 << 20
 # Most bytes of an existing `anneal-workloads.slice` unit seeded into the probe config.
 _WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES = 64 * 1024
+
+
+def _terminate_probe_proc_group(proc: subprocess.Popen[bytes]) -> None:
+    _signal_process_group(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_process_group(proc.pid, signal.SIGKILL)
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _run_wrapper_probe_cmd(
@@ -5356,13 +5394,14 @@ def _run_wrapper_probe_cmd(
     timeout_sec: float,
 ) -> tuple[int, str] | None:
     """Run one wrapper probe command; return `(returncode, stdout)` or `None` on a
-    timeout or launch failure.
+    timeout, oversized output, or launch failure.
 
     The child gets its own session, `stdin` from `/dev/null`, `stderr` discarded, and
     `stdout` in a regular file under `cwd` rather than a pipe, so a grandchild that
     outlives the wrapper (an `anneal-lean-run` runs its command in a separate process
-    group) can never stall the read. On timeout the wrapper's process group gets `SIGTERM`
-    (which `anneal-lean-run` forwards to the group it created), then `SIGKILL`.
+    group) can never stall the read. On timeout or interruption the wrapper's process
+    group gets `SIGTERM` (which `anneal-lean-run` forwards to the group it created),
+    then `SIGKILL`.
     """
     try:
         with tempfile.TemporaryFile(mode="w+b", dir=os.fspath(cwd)) as out_fh:
@@ -5378,19 +5417,16 @@ def _run_wrapper_probe_cmd(
             try:
                 returncode = proc.wait(timeout=timeout_sec)
             except subprocess.TimeoutExpired:
-                _signal_process_group(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    pass
-                _signal_process_group(proc.pid, signal.SIGKILL)
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    pass
+                _terminate_probe_proc_group(proc)
                 return None
+            except BaseException:
+                if proc.poll() is None:
+                    _terminate_probe_proc_group(proc)
+                raise
             out_fh.seek(0)
-            data = out_fh.read(_WRAPPER_PROBE_MAX_OUTPUT_BYTES)
+            data = out_fh.read(_WRAPPER_PROBE_MAX_OUTPUT_BYTES + 1)
+            if len(data) > _WRAPPER_PROBE_MAX_OUTPUT_BYTES:
+                return None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return returncode, data.decode("utf-8", errors="replace")
@@ -5400,28 +5436,80 @@ def _seed_probe_workloads_slice_unit(env: Mapping[str, str], config_dir: Path) -
     """Copy the caller's existing `anneal-workloads.slice` user unit into the probe's
     private `XDG_CONFIG_HOME`, so a wrapper that reconciles the slice before running a
     command finds it up to date there and does not `systemctl --user daemon-reload`."""
+    candidates: list[Path] = []
     raw_cfg = env.get("XDG_CONFIG_HOME", "").strip()
     if raw_cfg:
-        cfg_base = Path(raw_cfg)
+        candidates.append(Path(raw_cfg))
     else:
         raw_home = env.get("HOME", "").strip()
-        if not raw_home:
+        if raw_home:
+            candidates.append(Path(raw_home) / ".config")
+        else:
+            ambient_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+            if ambient_cfg:
+                candidates.append(Path(ambient_cfg))
+            else:
+                try:
+                    candidates.append(Path.home() / ".config")
+                except (KeyError, RuntimeError):
+                    pass
+    for cfg_base in candidates:
+        src = cfg_base / "systemd" / "user" / "anneal-workloads.slice"
+        try:
+            st = os.stat(src)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > _WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES:
+                continue
+            content = src.read_bytes()
+            dest = config_dir / "systemd" / "user" / "anneal-workloads.slice"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(content)
             return
-        cfg_base = Path(raw_home) / ".config"
-    src = cfg_base / "systemd" / "user" / "anneal-workloads.slice"
+        except (OSError, ValueError):
+            continue
+
+
+def _sync_probe_workloads_slice_from_probe_text(probe_text: str, config_dir: Path) -> None:
+    """Pre-seed a matching `anneal-workloads.slice` from `--probe` envelope numbers when
+    no matching unit was seeded from the caller's config dir, preventing the exec check's
+    `ensure_workloads_slice` from calling `systemctl --user daemon-reload` on a live host."""
+    m_max = _WRAPPER_PROBE_SLICE_MAX_RE.search(probe_text)
+    m_high = _WRAPPER_PROBE_SLICE_HIGH_RE.search(probe_text)
+    if m_max is None or m_high is None:
+        return
+    w_max = int(m_max.group(1))
+    w_high = int(m_high.group(1))
+    if w_max <= 0 or w_high <= 0:
+        return
+    dest = config_dir / "systemd" / "user" / "anneal-workloads.slice"
+    rendered = (
+        "[Unit]\n"
+        "Description=Anneal Bounded Compute & Warm LSP Workloads Slice\n"
+        "\n"
+        "[Slice]\n"
+        "MemoryAccounting=yes\n"
+        f"MemoryHigh={w_high}M\n"
+        f"MemoryMax={w_max}M\n"
+        "MemorySwapMax=0\n"
+        "ManagedOOMMemoryPressure=kill\n"
+        "ManagedOOMMemoryPressureLimit=40%\n"
+    )
     try:
-        st = os.stat(src)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > _WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES:
-            return
-        content = src.read_bytes()
-        dest = config_dir / "systemd" / "user" / "anneal-workloads.slice"
+        if dest.is_file():
+            existing = dest.read_text(encoding="utf-8", errors="replace")
+            if f"MemoryHigh={w_high}M\n" in existing and f"MemoryMax={w_max}M\n" in existing:
+                return
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content)
-    except (OSError, ValueError):
+        dest.write_text(rendered, encoding="utf-8")
+    except OSError:
         return
 
 
-def _probe_wrapper_thread_honoring(abs_path: str, probe_base: Mapping[str, str], env: Mapping[str, str], timeout_sec: float) -> bool:
+def _probe_wrapper_thread_honoring(
+    abs_path: str,
+    probe_base: Mapping[str, str],
+    env: Mapping[str, str],
+    timeout_sec: float,
+) -> bool:
     """Uncached body of `_wrapper_honors_lean_num_threads` (see there)."""
     with tempfile.TemporaryDirectory(prefix="anneal-lean-run-probe-") as tmp:
         tmp_dir = Path(tmp)
@@ -5454,6 +5542,8 @@ def _probe_wrapper_thread_honoring(abs_path: str, probe_base: Mapping[str, str],
         if any(t.strip() != "1" for _b, t in _WRAPPER_PROBE_THREAD_BANNER_RE.findall(probe_text)):
             return False
 
+        _sync_probe_workloads_slice_from_probe_text(probe_text, config_dir)
+
         # A `(LEAN_NUM_THREADS=1)` banner is necessary but not sufficient: on a 1-thread
         # budget a wrapper that prints its budget also prints `1`, a minimal wrapper prints
         # no banner at all, and a wrapper's banner can disagree with what it exports. So
@@ -5464,7 +5554,7 @@ def _probe_wrapper_thread_honoring(abs_path: str, probe_base: Mapping[str, str],
             cwd=work_dir,
             timeout_sec=timeout_sec,
         )
-        return executed is not None and executed[0] == 0 and executed[1].strip() == "1"
+        return executed is not None and executed[0] == 0 and executed[1] == "1"
 
 
 def _wrapper_honors_lean_num_threads(
@@ -5482,43 +5572,82 @@ def _wrapper_honors_lean_num_threads(
     `~/.local/bin/anneal-lean-run` overwrites it with its `<B>`-thread budget, which
     defeats the `LOW_RAM_SINGLE_THREAD_STEPS` policy on a low-RAM host.
 
-    Runs, with `LEAN_NUM_THREADS=1`, `ANNEAL_LSP_NO_EVICT=1`, no
-    `ANNEAL_LEAN_RUN_IN_SCOPE`, and private temporary `XDG_CONFIG_HOME` /
+    Runs, with `LEAN_NUM_THREADS=1`, `ANNEAL_LSP_NO_EVICT=1`, scrubbed outer-scope and
+    resource-override `ANNEAL_*` env vars, and private temporary `XDG_CONFIG_HOME` /
     `XDG_RUNTIME_DIR`, each bounded by `timeout_sec`:
     1. `<wrapper> --mode build --concurrency 1 --probe` (text): a non-zero exit, a
-       timeout, or any reported `LEAN_NUM_THREADS=<T>` with `<T> != 1` -> `False`;
+       timeout, oversized output, or any reported `LEAN_NUM_THREADS=<T>` with `<T> != 1`
+       -> `False`;
     2. `<wrapper> --mode file --no-slot-lock -- <python> -B -c <print LEAN_NUM_THREADS>`
-       (holds no build slot): `True` iff it exits 0 and prints exactly `1`.
+       (holds no build slot): `True` iff it exits 0 and stdout is literally `"1"`.
     A missing, non-regular, or non-executable path is `False` without spawning anything.
     The wrapper always runs by absolute path (a bare relative name would otherwise be
     looked up on `PATH`). Results are memoized in `_WRAPPER_THREAD_PROBE_CACHE`.
     """
-    try:
-        abs_path = os.path.abspath(os.fspath(wrapper_path))
-        st = os.stat(abs_path)
-        if not stat.S_ISREG(st.st_mode) or not os.access(abs_path, os.X_OK):
-            return False
-        with open(abs_path, "rb") as fh:
-            digest = hashlib.sha256(fh.read()).hexdigest()
-        st_after = os.stat(abs_path)
-    except (OSError, ValueError, TypeError):
+    if isinstance(timeout_sec, bool):
         return False
     try:
         timeout = float(timeout_sec)
     except (TypeError, ValueError):
         return False
-    if not timeout > 0:
+    if not math.isfinite(timeout) or timeout <= 0:
+        return False
+    digest: str | None = None
+    torn = False
+    try:
+        abs_path = os.path.abspath(os.fspath(wrapper_path))
+        st = os.stat(abs_path)
+        if not stat.S_ISREG(st.st_mode) or not os.access(abs_path, os.X_OK):
+            return False
+        try:
+            with open(abs_path, "rb") as fh:
+                st_fd = os.fstat(fh.fileno())
+                if not stat.S_ISREG(st_fd.st_mode):
+                    return False
+                digest = hashlib.file_digest(fh, "sha256").hexdigest()
+            st_after = os.stat(abs_path)
+            if (st_fd.st_dev, st_fd.st_ino) != (st.st_dev, st.st_ino):
+                torn = True
+        except PermissionError:
+            # Execute-only binary (e.g. mode 0o111): still probe it, but do not cache
+            # without a content digest.
+            digest = None
+            st_after = st
+            torn = True
+    except (OSError, ValueError, TypeError):
         return False
     env_map: Mapping[str, str] = os.environ if env is None else env
-    probe_base = {k: v for k, v in env_map.items() if k not in _WRAPPER_PROBE_SCRUBBED_ENV}
+    probe_base: dict[str, str] = {}
+    for k, v in env_map.items():
+        if (
+            k in _WRAPPER_PROBE_SCRUBBED_ENV
+            or not isinstance(k, str)
+            or not isinstance(v, str)
+            or "\x00" in k
+        ):
+            continue
+        if "\x00" in v:
+            if k == "PATH":
+                clean_path = os.pathsep.join(p for p in v.split(os.pathsep) if "\x00" not in p)
+                if clean_path:
+                    probe_base[k] = clean_path
+            continue
+        probe_base[k] = v
     probe_base["LEAN_NUM_THREADS"] = "1"
     probe_base["ANNEAL_LSP_NO_EVICT"] = "1"
     env_digest = hashlib.sha256(
         json.dumps(sorted(probe_base.items()), ensure_ascii=True).encode("ascii")
     ).hexdigest()
     identity = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
-    if identity != (st_after.st_dev, st_after.st_ino, st_after.st_mtime_ns, st_after.st_ctime_ns, st_after.st_size):
-        # Rewritten while hashing: probe it, but cache nothing under a torn identity.
+    if torn or identity != (
+        st_after.st_dev,
+        st_after.st_ino,
+        st_after.st_mtime_ns,
+        st_after.st_ctime_ns,
+        st_after.st_size,
+    ):
+        # Unreadable execute-only binary or rewritten while hashing: probe it, but cache
+        # nothing under a missing digest or torn identity.
         return _probe_wrapper_thread_honoring(abs_path, probe_base, env_map, timeout)
     key = (abs_path, *identity, digest, env_digest, timeout)
     cached = _WRAPPER_THREAD_PROBE_CACHE.get(key)
@@ -5527,6 +5656,13 @@ def _wrapper_honors_lean_num_threads(
     result = _probe_wrapper_thread_honoring(abs_path, probe_base, env_map, timeout)
     _WRAPPER_THREAD_PROBE_CACHE[key] = result
     return result
+
+
+def _samefile_safe(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
 
 
 def _resolve_anneal_lean_run(
@@ -5539,42 +5675,56 @@ def _resolve_anneal_lean_run(
        unconditionally (an explicit operator override),
     2. Fleet-managed `anneal-lean-run` on `PATH` or `~/.local/bin/anneal-lean-run`
        (so cron environments with minimal `PATH` still prefer the fleet wrapper),
-       unless the in-repo wrapper exists (and is a different file) and that candidate
-       fails `_wrapper_honors_lean_num_threads`: a wrapper that clobbers a caller's
-       `LEAN_NUM_THREADS=1` is skipped for the in-repo one,
+       skipping any candidate that fails `_wrapper_honors_lean_num_threads` whenever
+       the in-repo wrapper exists as a different executable file: a clobbering `PATH`
+       entry falls through to later honoring `PATH` entries, then `~/.local/bin`, and
+       finally to the in-repo `scripts/anneal-lean-run`,
     3. Fallback to in-repo `repo_root / "scripts/anneal-lean-run"` (executable file).
+
+    Every returned path is anchored with `os.path.abspath` so steps running with
+    `cwd=repo_root` never re-resolve a relative candidate against a different directory.
     """
     env_map: Mapping[str, str] = os.environ if env is None else env
-    local_lean_run = repo_root / "scripts/anneal-lean-run"
+    local_lean_run = Path(os.path.abspath(repo_root / "scripts/anneal-lean-run"))
+    has_local = _is_executable_file(local_lean_run)
 
-    def vetted(candidate: Path) -> Path:
-        # Without an in-repo wrapper there is nothing better to fall back to.
-        if not _is_executable_file(local_lean_run):
-            return candidate
-        try:
-            if os.path.samefile(candidate, local_lean_run):
-                return candidate
-        except (OSError, ValueError):
-            pass
-        if _wrapper_honors_lean_num_threads(candidate, env=env_map):
-            return candidate
-        return Path(os.path.abspath(local_lean_run))
-
-    # Steps run with `cwd=repo_root`, so a relative `ANNEAL_LEAN_RUN` or `PATH` hit is
-    # anchored here, against the directory it was just found executable in.
+    # Steps run with `cwd=repo_root`, so every returned candidate is anchored here,
+    # against the directory it was just found executable in.
     env_lean_run = env_map.get("ANNEAL_LEAN_RUN", "").strip()
     if env_lean_run:
         env_path = Path(env_lean_run)
         if _is_executable_file(env_path):
             return Path(os.path.abspath(env_path))
 
+    rejected: list[Path] = []
+
+    def accept_ambient(candidate: Path) -> Path | None:
+        anchored = Path(os.path.abspath(candidate))
+        # Without an in-repo wrapper there is nothing better to fall back to.
+        if not has_local:
+            return anchored
+        if _samefile_safe(anchored, local_lean_run):
+            return anchored
+        if any(_samefile_safe(anchored, prev) for prev in rejected):
+            return None
+        if _wrapper_honors_lean_num_threads(anchored, env=env_map):
+            return anchored
+        rejected.append(anchored)
+        return None
+
     raw_path = env_map.get("PATH", "")
     if raw_path:
-        path_lean_run = shutil.which("anneal-lean-run", path=raw_path)
-        if path_lean_run:
-            found_path = Path(path_lean_run)
+        seen_dirs: set[str] = set()
+        for entry in raw_path.split(os.pathsep):
+            dir_key = entry or "."
+            if dir_key in seen_dirs:
+                continue
+            seen_dirs.add(dir_key)
+            found_path = Path(dir_key) / "anneal-lean-run"
             if _is_executable_file(found_path):
-                return vetted(Path(os.path.abspath(found_path)))
+                chosen = accept_ambient(found_path)
+                if chosen is not None:
+                    return chosen
 
     home_dir = home
     if home_dir is None:
@@ -5589,9 +5739,11 @@ def _resolve_anneal_lean_run(
     if home_dir is not None:
         user_local = home_dir / ".local/bin/anneal-lean-run"
         if _is_executable_file(user_local):
-            return vetted(user_local)
+            chosen = accept_ambient(user_local)
+            if chosen is not None:
+                return chosen
 
-    if _is_executable_file(local_lean_run):
+    if has_local:
         return local_lean_run
     return None
 
