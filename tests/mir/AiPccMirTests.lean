@@ -567,6 +567,27 @@ info: 'Anneal.AiPcc.verifyMirCutpoints_sound_call' depends on axioms:
 #print axioms verifyMirCutpoints_sound_call
 
 /--
+info: 'Anneal.AiPcc.checkMirCert_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirCert_verificationResult
+
+/--
+info: 'Anneal.AiPcc.canary_stride8_loop_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_stride8_loop_verificationResult
+
+/--
+info: 'Anneal.AiPcc.canary_signed_half_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_signed_half_verificationResult
+
+/--
 info: 'Anneal.AiPcc.checkMirCert_sound' depends on axioms:
 [propext, Quot.sound]
 -/

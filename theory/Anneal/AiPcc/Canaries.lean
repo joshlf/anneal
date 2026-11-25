@@ -44,6 +44,8 @@ Canary suite for the `Anneal.AiPcc` stack. It is not imported by
      widening `IntToInt` cast (returns a value `< 2^32`);
    * a signed `i32` branch `if x >= 0 { x / 2 } else { 0 }` refined through a
      `switchInt` guard on a copy temporary (returns a value in `[0, 2^30)`).
+   The loop and signed canaries are also packaged as trusted
+   `VerificationResult` certificates of concrete `Claim`s.
 3. Positive controls and CFG joins (`switchInt` diamonds, `move` aliasing,
    checked arithmetic with `assert`).
 4. A fail-closed negative suite and a `validRpoSchedule` suite.
@@ -376,6 +378,58 @@ theorem canary_signed_half_pcc_safe (x : Nat) (hx : x < modPow2 32) :
     | ⟨bits, hV, hLe⟩ =>
       exact ⟨bits, hV,
         Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 30) Nat.one_pos)⟩
+
+/-! ## Trusted `VerificationResult` Certificates -/
+
+/-- Audited claim for `stride8LoopBody`: called with no arguments, it is
+UB-free and every normal return is exactly `1024`. -/
+def stride8LoopClaim : Trusted.VerificationResult.Claim where
+  body := stride8LoopBody
+  pre args := args = []
+  post _ ret := ret = .scalar ⟨1024, 8⟩
+
+/-- `VerificationResult stride8LoopClaim`, from the `rfl` certificate. -/
+theorem canary_stride8_loop_verificationResult :
+    Trusted.VerificationResult.VerificationResult stride8LoopClaim :=
+  verifyMirCutpoints_verificationResult (argSlots := []) rfl
+    stride8Loop_cert_ok
+    (fun args hPre => by
+      have hArgs : args = [] := hPre
+      subst hArgs
+      exact entryArgsOk_nil _)
+    (fun _ _ _ hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        exact uint_valDenote_exact rfl hDen)
+
+/-- Audited claim for `signedHalfBody`: for every `i32` argument it is
+UB-free and every normal return is an `i32` with bit pattern `< 2^30`. -/
+def signedHalfClaim : Trusted.VerificationResult.Claim where
+  body := signedHalfBody
+  pre args := ∃ x, x < modPow2 32 ∧ args = [.scalar ⟨x, 4⟩]
+  post _ ret := ∃ bits, ret = .scalar ⟨bits, 4⟩ ∧ bits < modPow2 30
+
+/-- `VerificationResult signedHalfClaim`, from the `rfl` certificate. -/
+theorem canary_signed_half_verificationResult :
+    Trusted.VerificationResult.VerificationResult signedHalfClaim :=
+  verifyMirCutpoints_verificationResult (argSlots := signedHalfArgSlots) rfl
+    signedHalf_cert_ok
+    (fun args hPre => by
+      match hPre with
+      | ⟨x, hx, hArgs⟩ =>
+        subst hArgs
+        exact ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩)
+    (fun _ _ _ hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        match sint_valDenote_ubound (hi := modPow2 30 - 1) rfl hDen with
+        | ⟨bits, hV, hLe⟩ =>
+          exact ⟨bits, hV,
+            Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 30) Nat.one_pos)⟩)
 
 /-! ## Positive Controls and CFG Joins -/
 
