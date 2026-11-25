@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 from pathlib import Path
 import re
@@ -122,7 +123,7 @@ class TestCrossLanguageParityAndHygiene(unittest.TestCase):
             self.assertIn(f'"{g["guard_id"]}"', lean_text)
             self.assertIn(f'"{g["canonical_name"]}"', lean_text)
             self.assertIn(f'"{g["vacuity_class"]}"', lean_text)
-        # All 13 + 10 + 6 violation codes match Lean 1-for-1
+        # All 13 + 11 + 6 violation codes match Lean 1-for-1
         for code in proto.INDUCTIVE_REPLAY_VIOLATION_CODES:
             self.assertIn(f'"{code}"', lean_text)
         for code in proto.SHARD_AUDIT_VIOLATION_CODES:
@@ -130,7 +131,7 @@ class TestCrossLanguageParityAndHygiene(unittest.TestCase):
         for code in proto.PEER_GUARD_VIOLATION_CODES:
             self.assertIn(f'"{code}"', lean_text)
         self.assertEqual(len(proto.INDUCTIVE_REPLAY_VIOLATION_CODES), 13)
-        self.assertEqual(len(proto.SHARD_AUDIT_VIOLATION_CODES), 10)
+        self.assertEqual(len(proto.SHARD_AUDIT_VIOLATION_CODES), 11)
         # Exact ORDER parity: extract each Lean `asStr` table and compare to the Python tuple.
         for ns, codes in (
             ("InductiveReplayViolationCode", proto.INDUCTIVE_REPLAY_VIOLATION_CODES),
@@ -398,17 +399,58 @@ class TestPillar1InductiveReplay(unittest.TestCase):
         ]
         missed_without_kernel = 0
         with tempfile.TemporaryDirectory(prefix="anneal-forged-olean-") as tmp_str:
-            for mutation, target, expected in cases:
+            def _run_case(item: tuple[str, str, str]) -> tuple[str, str, dict, dict]:
+                mutation, target, expected = item
                 out = Path(tmp_str) / f"{mutation}.olean"
                 proto.forge_olean_fixture(REPO_ROOT, mod, target, mutation, out)
                 hard = proto.inspect_live_oleans(REPO_ROOT, [mod], [mod], olean_overrides={mod: str(out)})
-                self.assertIn(expected, {v["code"] for v in hard["violations"]}, (mutation, hard["violations"]))
                 weak = proto.inspect_live_oleans(
                     REPO_ROOT, [mod], [mod], kernel_replay_inductives=False, olean_overrides={mod: str(out)}
                 )
-                if not weak["violations"]:
-                    missed_without_kernel += 1
+                return mutation, expected, hard, weak
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                for mutation, expected, hard, weak in pool.map(_run_case, cases):
+                    self.assertIn(expected, {v["code"] for v in hard["violations"]}, (mutation, hard["violations"]))
+                    if not weak["violations"]:
+                        missed_without_kernel += 1
         self.assertEqual(missed_without_kernel, 5)
+
+    def test_10c_forged_cross_mod_all_dangling_rec_and_open_expr_redteam(self) -> None:
+        """A1: catches cross-module `all` head hijack (bypassed B1's `constOrigin[head]` gate),
+        forged non-`.rec` / dangling recursors (bypassed B1's `n ++ .rec` check), and open
+        expressions (`Expr.bvar 0`) inside stored `.olean` declarations."""
+        mod = "Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"
+        enum_ind = mod + ".PeerSpecGuardClass"
+        struct_ind = mod + ".SimInductVal"
+        cases = [
+            ("cross_mod_all_hijack", enum_ind, "mutual_metadata_mismatch"),
+            ("append_dangling_rec", struct_ind, "recursor_mismatch"),
+            ("forge_open_expr", struct_ind, "disallowed_transitive_axiom"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="anneal-forged-a1-") as tmp_str:
+            def _run(item: tuple[str, str, str]) -> tuple[str, str, dict]:
+                mutation, target, expected = item
+                out = Path(tmp_str) / f"{mutation}.olean"
+                proto.forge_olean_fixture(REPO_ROOT, mod, target, mutation, out)
+                res = proto.inspect_live_oleans(REPO_ROOT, [mod], [mod], olean_overrides={mod: str(out)})
+                return mutation, expected, res
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                for mutation, expected, res in pool.map(_run, cases):
+                    codes = {v["code"] for v in res["violations"]}
+                    self.assertIn(expected, codes, (mutation, res["violations"]))
+                    if mutation == "append_dangling_rec":
+                        self.assertTrue(
+                            any(v["subject"].endswith("rec_forged_1") and v["code"] == "recursor_mismatch"
+                                for v in res["violations"]),
+                            res["violations"],
+                        )
+                    elif mutation == "forge_open_expr":
+                        self.assertTrue(
+                            any(v["detail"] == "open_expr_in_constant" for v in res["violations"]),
+                            res["violations"],
+                        )
 
 
 class TestPillar2ShardedAuditAndOrphanGate(unittest.TestCase):
@@ -543,6 +585,40 @@ class TestPillar2ShardedAuditAndOrphanGate(unittest.TestCase):
         union_ax = sorted(set(s1["axioms_reached"]) | set(s2["axioms_reached"]) | set(s3["axioms_reached"]))
         self.assertEqual(union_ax, mono["axioms_reached"])
 
+    def test_15b_cross_shard_fingerprint_reconciliation_closes_b1_duplicate_gap(self) -> None:
+        """A1: per-shard `constMap` misses conflicting duplicate declarations across shards;
+        `reconcile_cross_shard_fingerprints` catches all cross-shard conflicts while accepting
+        identical duplicates and header/private-body merges."""
+        shard_fps = {
+            "shard_a": [
+                # Conflicting theorem type hash across shards
+                ("M1", "evalRvalue.eq_4", "thm", "", "111", True, "999", ""),
+                # Conflicting def value hash across shards (header + body vs conflicting body)
+                ("M1", "helper.def", "defn", "", "222", False, "0", ""),
+                ("M1", "helper.def", "defn", "", "222", True, "333", ""),
+                # Compatible identical duplicate
+                ("M1", "clean.eq_1", "thm", "u", "444", True, "555", ""),
+                # Conflicting inductive metadata across shards
+                ("M1", "Fake.Ind", "induct", "", "777", False, "0", "ind:0:0:0:false:false:false:Fake.Ind:"),
+            ],
+            "shard_b": [
+                ("M2", "evalRvalue.eq_4", "thm", "", "888", True, "999", ""),
+                ("M2", "helper.def", "defn", "", "222", True, "666", ""),
+                ("M2", "clean.eq_1", "thm", "u", "444", True, "555", ""),
+                ("M2", "Fake.Ind", "induct", "", "777", False, "0", "ind:0:1:0:true:false:false:Fake.Ind:"),
+            ],
+        }
+        recon = proto.reconcile_cross_shard_fingerprints(shard_fps)
+        self.assertFalse(recon["ok"])
+        self.assertEqual(recon["conflicting_subjects"], ["Fake.Ind", "evalRvalue.eq_4", "helper.def"])
+        self.assertTrue(all(v["code"] == "cross_shard_duplicate_conflict" for v in recon["violations"]))
+        # Live fingerprint export on our prototype module self-reconciles cleanly.
+        mod = "Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"
+        live = proto.inspect_live_oleans(REPO_ROOT, [mod], [mod], export_fingerprints=True)
+        fps = live.get("declaration_fingerprints", [])
+        self.assertGreater(len(fps), 100)
+        self.assertTrue(proto.reconcile_cross_shard_fingerprints({"proto": fps})["ok"])
+
     def test_16_cli_orphan_only_with_modules_and_shard_files_detects_orphan(self) -> None:
         with tempfile.TemporaryDirectory(prefix="anneal-test-sh-") as tmp_str:
             tmp = Path(tmp_str)
@@ -660,6 +736,34 @@ class TestPillar3Guard3UnsatisfiableExternEnsures(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(src), [], name)
 
+    def test_20c_guard3_blocks_reflexive_negation_order_and_match_redteam(self) -> None:
+        """A1: catches single-expr brace blocks `{ false }`, double negation `!!false`,
+        negated reflexive tautologies `!(x == x)`, conflicting literal equalities,
+        strict order contradictions (`x < y && x >= y`), and all-unsat `match` arms."""
+        bad = {
+            "brace_block_false": "#[external_spec(for = f, ensures: |_| { false })]\nfn f() -> u32;",
+            "double_neg_false": 'extern "C" { #[ensures(!!false)] fn f() -> u32; }',
+            "negated_reflexive_eq": 'extern "C" { #[ensures(!(x == x))] fn f(x: u32) -> u32; }',
+            "negated_reflexive_le": 'extern "C" { #[ensures(!(ret <= ret))] fn f(x: u32) -> u32; }',
+            "conflicting_lit_eq": 'extern "C" { #[ensures(x == 1 && x == 2)] fn f(x: u32) -> u32; }',
+            "order_lt_ge": 'extern "C" { #[ensures(x < y && x >= y)] fn f(x: u32, y: u32) -> u32; }',
+            "order_asymmetric": 'extern "C" { #[ensures(x < y && y < x)] fn f(x: u32, y: u32) -> u32; }',
+            "eq_vs_bound": 'extern "C" { #[ensures(x == 5 && x < 3)] fn f(x: u32) -> u32; }',
+            "match_all_unsat": 'extern "C" { #[ensures(match x { 0 => { false }, _ => 1 == 2 })] fn f(x: u32) -> u32; }',
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_rust_unsatisfiable_extern_ensures(src)
+                self.assertEqual([h["code"] for h in hits], ["unsatisfiable_extern_ensures"], name)
+        ok = {
+            "match_one_sat": 'extern "C" { #[ensures(match x { 0 => false, _ => ret == x })] fn f(x: u32) -> u32; }',
+            "consistent_order": 'extern "C" { #[ensures(x < y && y <= 10)] fn f(x: u32, y: u32) -> u32; }',
+            "brace_block_true": "#[external_spec(for = f, ensures: |_| { true })]\nfn f() -> u32;",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(src), [], name)
+
 
 class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
     def test_21_catches_fndef_value_bind_coercion_higher_order_and_closure(self) -> None:
@@ -739,6 +843,54 @@ class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
                 self.assertTrue(proto.scan_rust_fndef_ghost_token_coercion(src), name)
         ok = "impl Mint for X { fn go() {} }\nfn main() { let t = Tokens::new(); for x in v { use_it(x); } }"
         self.assertEqual(proto.scan_rust_fndef_ghost_token_coercion(ok), [])
+
+    def test_23c_guard4_turbofish_self_loop_header_and_recursion_redteam(self) -> None:
+        """A1: catches turbofish before `::new` (`Tokens::<()>::new`), `Self::ctor` inside
+        `impl` blocks, struct literals/patterns in `for`/`while let` loop headers, and
+        direct or mutual re-entrant recursion on `main()`."""
+        bad = {
+            "turbofish_type_arg": "fn main() { let f = Tokens::<()>::new; }",
+            "turbofish_both": "fn main() { let f = creusot_std::ghost::Tokens::<()>::new::<u8>; }",
+            "self_method_val": (
+                "struct Auth;\nimpl Auth {\n"
+                "  #[ghost_token_ctor] fn issue() -> Self { Auth }\n"
+                "  fn sneak() { let f = Self::issue; }\n}"
+            ),
+            "self_method_call": (
+                "struct Auth;\nimpl Auth {\n"
+                "  #[ghost_token_ctor] fn issue() -> Self { Auth }\n"
+                "  fn sneak() { let _ = Self::issue(); }\n}"
+            ),
+            "for_header_struct_lit": (
+                "fn main() { for _ in [S { a: 1 }, S { a: 2 }] { let _t = Tokens::new(); } }"
+            ),
+            "while_let_struct_pat": (
+                "fn main() { while let Some(S { x }) = next() { let _t = Tokens::new(); } }"
+            ),
+            "for_struct_pat": (
+                "fn main() { for S { a } in items { let _t = Tokens::new(); } }"
+            ),
+            "direct_recursive_main": (
+                "fn main() { let _t = Tokens::new(); if cond() { main(); } }"
+            ),
+            "mutual_recursive_main": (
+                "fn helper() { main(); }\nfn main() { let _t = Tokens::new(); helper(); }"
+            ),
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_rust_fndef_ghost_token_coercion(src)
+                self.assertTrue(hits, name)
+                self.assertTrue(all(h["code"] == "fndef_ghost_token_coercion" for h in hits), name)
+        ok = {
+            "turbofish_direct_call": "fn main() { let _t = Tokens::<()>::new(); }",
+            "struct_lit_in_other_loop": (
+                "fn main() { let _t = Tokens::new(); for _ in [S { a: 1 }] { use_it(); } }"
+            ),
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_rust_fndef_ghost_token_coercion(src), [], name)
 
 
 class TestPillar3Guard5ExternalTypeDropOmission(unittest.TestCase):
@@ -828,6 +980,42 @@ class TestPillar3Guard5ExternalTypeDropOmission(unittest.TestCase):
             "generic_param": "#[external_type_specification]\nstruct ExOpt<T>(Option<T>);",
             "asserted_no_drop_foreign": "#[external_type_specification]\n#[no_drop_glue]\nstruct ExP(other::Pod);",
             "modeled_foreign": "#[external_type_specification]\n#[models_drop]\nstruct ExM(other::Res);",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_rust_external_type_drop_omission(src), [], name)
+
+    def test_26c_guard5_foreign_ext_body_pub_crate_attrs_and_borrowed_paths_redteam(self) -> None:
+        """A1: catches `#[external_type_specification] #[external_body] #[models_drop]` on
+        foreign types (must emit `external_type_body_with_drop`), handles `pub(crate)` & field
+        attributes on tuple structs without leaking `crate`/`allow`, and handles multi-segment
+        borrowed/fn-ptr field types without false positives."""
+        hits_ext_body = proto.scan_rust_external_type_drop_omission(
+            "#[external_type_specification]\n#[external_body]\n#[models_drop]\n"
+            "struct ExLock(other_crate::FileLock);"
+        )
+        self.assertEqual([h["code"] for h in hits_ext_body], ["external_type_body_with_drop"])
+
+        bad_omission = {
+            "pub_crate_box": "#[external_type_specification]\nstruct ExBox(pub(crate) Box<u8>);",
+            "field_attr_foreign": "#[external_type_specification]\nstruct ExAttr(#[allow(dead_code)] other::Res);",
+        }
+        for name, src in bad_omission.items():
+            with self.subTest(name=name):
+                hits = proto.scan_rust_external_type_drop_omission(src)
+                self.assertEqual([h["code"] for h in hits], ["external_type_drop_omission"], name)
+
+        ok = {
+            "pub_crate_copy": "#[external_type_specification]\nstruct ExCopy(pub(crate) u32);",
+            "field_attr_copy": "#[external_type_specification]\nstruct ExAttrCopy(#[allow(dead_code)] u64);",
+            "borrowed_path_and_fn_ptr": (
+                "#[external_type_specification]\n"
+                "struct ExRef<'a> {\n"
+                "  a: Option<&'a std::vec::Vec<u8>>,\n"
+                "  b: Option<&'a (Box<u8>, String)>,\n"
+                "  c: Option<fn(Vec<u8>) -> Box<u8>>,\n"
+                "}"
+            ),
         }
         for name, src in ok.items():
             with self.subTest(name=name):
@@ -956,7 +1144,10 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
         bad = {
             "hyp_binder": "theorem t (i s : EvalRes Nat) (h : i.assumesHold = true → s.output = i.output) : True := by sorry",
             "forall_binder": "theorem t : ∀ (h : implAssumes s → s.out = 1), False := by sorry",
-            "strict_implicit_binder": "theorem t ⦃h : (implAssumes s → False) → True⦄ : True := by sorry",
+            # A1 fix: B1 missed `⦃` in header depth tracking, inverting polarity inside `⦃...⦄`.
+            # `(implAssumes s → False) → True` has depth-2 (POSITIVE) `implAssumes`;
+            # `((implAssumes s → False) → True) → True` has depth-3 (NEGATIVE) `implAssumes` (moved to `ok`).
+            "strict_implicit_binder": "theorem t ⦃h : implAssumes s → False⦄ : True := by sorry",
             "raw_string_desync": 'def s : String := r#"a \" -/ /- b"#\ntheorem t (i s : EvalRes Nat) : s.output = i.output → i.assumesHold = true := by sorry',
         }
         for name, src in bad.items():
@@ -965,6 +1156,7 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
         ok = {
             "hyp_binder_negative": "theorem t (i s : EvalRes Nat) (h : i.assumesHold = true) : s.output = i.output := by sorry",
             "exists_binder_negative_body": "theorem t : (∃ (h : implAssumes s), True) → False := by sorry",
+            "strict_implicit_binder_depth3_negative": "theorem t ⦃h : (implAssumes s → False) → True⦄ : True := by sorry",
         }
         for name, src in ok.items():
             with self.subTest(name=name):
@@ -975,6 +1167,66 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
         self.assertEqual(proto.scan_lean_invariant_struct_sealing(seal_ok), [])
         seal_raw = 'def s : String := r"structure Victim where private mk ::"\n-- @sealed_invariant\nstructure Victim where\n  val : Nat\n'
         self.assertEqual([h["subject"] for h in proto.scan_lean_invariant_struct_sealing(seal_raw)], ["Victim"])
+
+    def test_30c_guard6a_implicit_anon_binders_ifte_and_prop_def_binders_redteam(self) -> None:
+        """A1: catches positive-polarity assumptions inside `{h : A → P} → Q`, `⦃h : A → P⦄ → Q`,
+        anonymous `[A → P]` instance binders, `if assumes then P else Q` (even inside an
+        antecedent), and `: Prop :=` `def`/`abbrev` hypothesis binders."""
+        bad = {
+            "implicit_arrow_binder": "theorem t : {h : implRes.assumesHold = true → P} → Q := by sorry",
+            "strict_implicit_arrow": "theorem t : ⦃h : implRes.assumesHold = true → P⦄ → Q := by sorry",
+            "anon_inst_arrow": "theorem t : [implRes.assumesHold = true → P] → Q := by sorry",
+            "anon_inst_sig_binder": "theorem t [implRes.assumesHold = true → P] : Q := by sorry",
+            "ifte_in_antecedent": "theorem t : (if implRes.assumesHold = true then P else Q) → R := by sorry",
+            "dite_top_level": "theorem t : if h : implRes.assumesHold = true then P else Q := by sorry",
+            "prop_def_sig_binder": "def bad_def (h : implRes.assumesHold = true → P) : Prop := Q",
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_lean_assumption_polarity(src)
+                self.assertEqual([h["code"] for h in hits], ["assumption_positive_polarity"], name)
+        ok = {
+            "implicit_neg_binder": "theorem t : {h : implRes.assumesHold = true} → Q := by sorry",
+            "anon_inst_neg_binder": "theorem t [implRes.assumesHold = true] : Q := by sorry",
+            "prop_def_neg_binder": "def good_def (h : implRes.assumesHold = true) : Prop := Q",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_assumption_polarity(src), [], name)
+
+    def test_30d_guard6b_dotted_namespace_interleaved_comment_and_keyword_ctor_redteam(self) -> None:
+        """A1: tracks dotted `namespace A.B` + partial `end B` accurately, catches
+        `-- @sealed_invariant` interleaved between `@[ext]` and `structure`, and rejects Lean
+        keywords masquerading as constructor names (`private where ::`)."""
+        dotted_src = """
+        namespace A.B
+        structure InsideB where
+          x : Nat
+        end B
+        structure AfterEndB where
+          x : Nat
+        end A
+        """
+        hits = proto.scan_lean_invariant_struct_sealing(dotted_src, target_structs={"A.AfterEndB"})
+        self.assertEqual([h["subject"] for h in hits], ["A.AfterEndB"])
+
+        interleaved_src = """
+        @[ext]
+        -- @sealed_invariant
+        structure InterleavedBad where
+          val : Nat
+        """
+        hits2 = proto.scan_lean_invariant_struct_sealing(interleaved_src)
+        self.assertEqual([h["subject"] for h in hits2], ["InterleavedBad"])
+
+        kw_ctor_src = """
+        -- @sealed_invariant
+        structure KeywordCtorDecoy where
+          private where ::
+          val : Nat
+        """
+        hits3 = proto.scan_lean_invariant_struct_sealing(kw_ctor_src)
+        self.assertEqual([h["subject"] for h in hits3], ["KeywordCtorDecoy"])
 
     def test_31_live_repo_sweep_zero_false_positives_on_theory_and_anneal_spec(self) -> None:
         res = proto.scan_live_repo_peer_guards(REPO_ROOT)

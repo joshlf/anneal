@@ -84,7 +84,8 @@ theorem shardAuditViolationCode_table_exact :
       ["empty_shard_list", "empty_shard", "duplicate_module_in_shard",
         "overlapping_shards", "unregistered_module_in_shard",
         "uncovered_registered_module", "unregistered_on_disk_orphan",
-        "disallowed_transitive_axiom", "missing_dependency_decl", "module_name_collision"] :=
+        "disallowed_transitive_axiom", "missing_dependency_decl",
+        "module_name_collision", "cross_shard_duplicate_conflict"] :=
   rfl
 
 theorem peerGuardViolationCode_table_exact :
@@ -208,6 +209,26 @@ theorem cleanDiamond_reaches_propext_from_shard1 :
     (TransDep.step (c' := "propext") (rec := diamondM2Left) (by decide) (by decide)
       (TransDep.refl _))
 
+theorem crossShardDuplicateConflict_reconciliation_test :
+    (checkCrossShardFingerprints [["M1"], ["M2"]] crossShardConflictEntries).any
+        (·.code == .crossShardDuplicateConflict) = true ∧
+      MonolithicDuplicateConsistent ["M1", "M2"]
+        [{ modName := "M1", declName := "evalRvalue.eq_4", fingerprint := "fp_v1" },
+         { modName := "M2", declName := "evalRvalue.eq_4", fingerprint := "fp_v1" }] := by
+  refine ⟨by decide, ?_⟩
+  exact (crossShardFingerprintReconciliation_sound
+    ((shardPartitionCheck_iff_valid ["M1", "M2"] ["M1", "M2"] [["M1"], ["M2"]]).mp rfl)).mp rfl
+
+theorem danglingRecursor_and_iffIfte_regressions_test :
+    hasReplayViolation (checkStaticInductiveIntegrity malformedDanglingRecMap) .recursorMismatch = true ∧
+      checkAssumesNegativePolarity (.iff (.atom "outputEq") (.assumes "impl")) = false ∧
+      checkAssumesNegativePolarity
+        (.imp (.ifte (.assumes "impl") (.atom "outputEq") (.not (.atom "impl.assertionFailed")))
+          (.atom "outputEq")) = false :=
+  ⟨danglingRecursor_rejected_statically_and_postReplay.1,
+   checkAssumesNegativePolarity_vectors.2.2.2.2.2.1,
+   checkAssumesNegativePolarity_vectors.2.2.2.2.2.2⟩
+
 /-! ## 4. Pillar 3 — Peer-Verifier Spec Guard Regression Tests -/
 
 theorem guard3_honest_extern_transfer_test :
@@ -307,6 +328,16 @@ theorem guard6b_sealedCap_mkChecked_vectors :
 #guard_msgs in
 #print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.invariantStructSealingGuard_sound
 
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.crossShardFingerprintReconciliation_sound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.crossShardFingerprintReconciliation_sound
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.danglingRecursor_rejected_statically_and_postReplay' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.danglingRecursor_rejected_statically_and_postReplay
+
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
@@ -374,7 +405,11 @@ run_cmd do
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.forgedNatRec_rejected_by_hardened_and_vulnerable,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.lyingDiverging_bypasses_flagOnly_but_rejected_by_guard,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externEnsuresGuard_vacuity_only_from_genuine_divergence,
-        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.caseFoldCollision_rejected_by_checkShardPartition] do
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.caseFoldCollision_rejected_by_checkShardPartition,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.danglingRecursor_rejected_statically_and_postReplay,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardLocalDupCheck_misses_crossShard_conflict,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.crossShardFingerprintReconciliation_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.iffAndIftePolarity_accept_broken_impl] do
     match env.find? flagship with
     | some (.thmInfo _) =>
       unless env.getModuleIdxFor? flagship == some modIdx do

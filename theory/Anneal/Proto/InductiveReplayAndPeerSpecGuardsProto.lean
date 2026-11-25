@@ -319,6 +319,7 @@ inductive ShardAuditViolationCode : Type where
   | disallowedTransitiveAxiom
   | missingDependencyDecl
   | moduleNameCollision
+  | crossShardDuplicateConflict
   deriving DecidableEq, Repr, Inhabited
 
 namespace ShardAuditViolationCode
@@ -334,12 +335,13 @@ def asStr : ShardAuditViolationCode → String
   | .disallowedTransitiveAxiom => "disallowed_transitive_axiom"
   | .missingDependencyDecl => "missing_dependency_decl"
   | .moduleNameCollision => "module_name_collision"
+  | .crossShardDuplicateConflict => "cross_shard_duplicate_conflict"
 
 def all : List ShardAuditViolationCode :=
   [.emptyShardList, .emptyShard, .duplicateModuleInShard, .overlappingShards,
     .unregisteredModuleInShard, .uncoveredRegisteredModule,
     .unregisteredOnDiskOrphan, .disallowedTransitiveAxiom, .missingDependencyDecl,
-    .moduleNameCollision]
+    .moduleNameCollision, .crossShardDuplicateConflict]
 
 def ofStr? (s : String) : Option ShardAuditViolationCode :=
   all.find? (fun c => c.asStr == s)
@@ -353,7 +355,7 @@ theorem asStr_injective {a b : ShardAuditViolationCode} (h : a.asStr = b.asStr) 
   rw [ofStr?_asStr, ofStr?_asStr] at hP
   exact Option.some.inj hP
 
-theorem all_length : all.length = 10 := rfl
+theorem all_length : all.length = 11 := rfl
 
 end ShardAuditViolationCode
 
@@ -602,6 +604,20 @@ def checkStaticInductiveIntegrity (m : SimConstMap) : List InductiveReplayViolat
           else [{ code := .danglingCtorNotListedInInduct, subject := cVal.name, detail := cVal.induct }]
         | _ =>
           [{ code := .danglingCtorNotListedInInduct, subject := cVal.name, detail := cVal.induct }]
+      | .recInfo rVal =>
+        let vEmpty :=
+          if rVal.all.isEmpty then
+            [{ code := .recursorMismatch, subject := rVal.name, detail := "empty_rec_all" }]
+          else []
+        let vPeers := rVal.all.flatMap fun n =>
+          match lookupConst m n with
+          | some (.induct parent) =>
+            if parent.all != rVal.all || parent.numParams != rVal.numParams then
+              [{ code := .recursorMismatch, subject := rVal.name, detail := n }]
+            else []
+          | _ =>
+            [{ code := .recursorMismatch, subject := rVal.name, detail := n }]
+        vEmpty ++ vPeers
       | _ => []
     vKey ++ vBody
   dupKeyViol ++ entryViols
@@ -1063,6 +1079,26 @@ theorem checkInductive_rejects_recursorMismatch :
       .recursorMismatch = true := by
   decide
 
+/-- **Dangling / non-parent recursor rejection (A1)**: a forged `.recInfo` whose `all`
+    references a non-existent inductive is rejected statically BEFORE replay as well as
+    post-replay by `checkPostponedRecursors`. -/
+def malformedDanglingRecMap : SimConstMap :=
+  [("Unit", .induct unitInductVal),
+   ("Unit.unit", .ctor unitCtorVal),
+   ("Unit.rec", .recInfo unitRecVal),
+   ("Ghost.rec_1", .recInfo
+     { name := "Ghost.rec_1", levelParams := ["u"], typeTag := "Ghost.rec.type",
+       all := ["Ghost"], numParams := 0, numIndices := 0, numMotives := 1,
+       numMinors := 0, ruleCtors := [], k := false })]
+
+theorem danglingRecursor_rejected_statically_and_postReplay :
+    hasReplayViolation (checkStaticInductiveIntegrity malformedDanglingRecMap) .recursorMismatch = true ∧
+    hasReplayViolation
+      (checkPostponedRecursors malformedDanglingRecMap
+        (insertKernelOutput [] { inducts := [unitInductVal], ctors := [unitCtorVal], recs := [unitRecVal] }))
+      .recursorMismatch = true := by
+  decide
+
 /-! ### 2.4 Semantic `InductiveReplayWellFormed` & Soundness Theorem -/
 
 /-- Relational well-formedness invariant established by hardened `lean4#16717` replay:
@@ -1096,6 +1132,10 @@ structure InductiveReplayWellFormed (m kernelEnv : SimConstMap) : Prop where
     lookupConst kernelEnv ind.name = some (.induct ind)
   ctor_matches_kernel : ∀ k cVal, (k, .ctor cVal) ∈ m →
     lookupConst kernelEnv cVal.name = some (.ctor cVal)
+  rec_all_valid : ∀ k rVal, (k, .recInfo rVal) ∈ m →
+    rVal.all ≠ [] ∧
+    ∀ n ∈ rVal.all, ∃ parent, lookupConst m n = some (.induct parent) ∧
+      parent.all = rVal.all ∧ parent.numParams = rVal.numParams
   rec_matches_kernel : ∀ k rVal, (k, .recInfo rVal) ∈ m →
     lookupConst kernelEnv rVal.name = some (.recInfo rVal)
 
@@ -1287,6 +1327,20 @@ theorem inductiveReplayWellFormed_sound {m kernelEnv : SimConstMap}
           else [{ code := .danglingCtorNotListedInInduct, subject := cVal.name, detail := cVal.induct }]
         | _ =>
           [{ code := .danglingCtorNotListedInInduct, subject := cVal.name, detail := cVal.induct }]
+      | .recInfo rVal =>
+        let vEmpty :=
+          if rVal.all.isEmpty then
+            [{ code := .recursorMismatch, subject := rVal.name, detail := "empty_rec_all" }]
+          else []
+        let vPeers := rVal.all.flatMap fun n =>
+          match lookupConst m n with
+          | some (.induct parent) =>
+            if parent.all != rVal.all || parent.numParams != rVal.numParams then
+              [{ code := .recursorMismatch, subject := rVal.name, detail := n }]
+            else []
+          | _ =>
+            [{ code := .recursorMismatch, subject := rVal.name, detail := n }]
+        vEmpty ++ vPeers
       | _ => []) = [] := by
     intro p hp
     have hP := (List.flatMap_eq_nil_iff.mp hEntries) p hp
@@ -1345,6 +1399,25 @@ theorem inductiveReplayWellFormed_sound {m kernelEnv : SimConstMap}
           | ctor _ | recInfo _ | defn _ _ | thm _ _ => rw [hL] at hB; cases hB
       induct_matches_kernel := checkPostponedInductives_nil_imp hPostInd
       ctor_matches_kernel := checkPostponedConstructors_nil_imp hPostCtor
+      rec_all_valid := fun k rVal hMem => by
+        have hB := (hEntryNil (k, .recInfo rVal) hMem).2
+        simp only [List.append_eq_nil_iff] at hB
+        obtain ⟨hEmpty, hPeers⟩ := hB
+        refine ⟨?_, ?_⟩
+        · intro hNil; rw [hNil] at hEmpty; cases hEmpty
+        · intro n hn
+          have hP := (List.flatMap_eq_nil_iff.mp hPeers) n hn
+          cases hL : lookupConst m n with
+          | none => rw [hL] at hP; cases hP
+          | some ci =>
+            cases ci with
+            | induct parent =>
+              rw [hL] at hP
+              by_cases hd : (parent.all != rVal.all || parent.numParams != rVal.numParams) = true
+              · simp only [hd, ↓reduceIte] at hP; cases hP
+              · simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hd
+                exact ⟨parent, rfl, hd.1, hd.2⟩
+            | ctor _ | recInfo _ | defn _ _ | thm _ _ => rw [hL] at hP; cases hP
       rec_matches_kernel := checkPostponedRecursors_nil_imp hPostRec }
 
 /-- Corollary: a successful `hardenedInductiveReplay` guarantees `InductiveReplayWellFormed`. -/
@@ -1781,6 +1854,142 @@ theorem orphanModule_rejected_by_checkShardPartition :
       (fun v => v.code == .unregisteredOnDiskOrphan && v.subject == "OrphanBad") = true := by
   decide
 
+/-! ### 3.2 Cross-Shard Duplicate Consistency & Fingerprint Reconciliation (A1)
+
+When lazily-realized reserved declarations (such as `.eq_k` equation lemmas) or forged
+duplicates appear in two different modules belonging to *distinct* shards, shard-local
+checks alone cannot observe the conflict. Exporting each shard's per-declaration canonical
+fingerprint table and reconciling across shards restores exact monolithic completeness. -/
+
+/-- A module-tagged declaration fingerprint entry exported by an audited `.olean` shard. -/
+structure ModDeclFingerprint : Type where
+  modName : String
+  declName : String
+  fingerprint : String
+  deriving DecidableEq, Repr, Inhabited
+
+/-- Monolithic duplicate consistency: any two entries from registered modules sharing
+    `declName` must agree on `fingerprint`. -/
+def MonolithicDuplicateConsistent (registered : List String)
+    (entries : List ModDeclFingerprint) : Prop :=
+  ∀ e₁ ∈ entries, ∀ e₂ ∈ entries,
+    e₁.modName ∈ registered → e₂.modName ∈ registered →
+    e₁.declName = e₂.declName → e₁.fingerprint = e₂.fingerprint
+
+/-- Shard-local duplicate consistency: checks agreement only among entries whose modules
+    reside inside the *same* shard. -/
+def ShardLocalDuplicateConsistent (shard : List String)
+    (entries : List ModDeclFingerprint) : Prop :=
+  ∀ e₁ ∈ entries, ∀ e₂ ∈ entries,
+    e₁.modName ∈ shard → e₂.modName ∈ shard →
+    e₁.declName = e₂.declName → e₁.fingerprint = e₂.fingerprint
+
+/-- Cross-shard fingerprint reconciliation table: checks agreement across EVERY pair of
+    exported shard tables `(s₁, s₂)` in `shards`. -/
+def CrossShardFingerprintReconciled (shards : List (List String))
+    (entries : List ModDeclFingerprint) : Prop :=
+  ∀ s₁ ∈ shards, ∀ s₂ ∈ shards, ∀ e₁ ∈ entries, ∀ e₂ ∈ entries,
+    e₁.modName ∈ s₁ → e₂.modName ∈ s₂ →
+    e₁.declName = e₂.declName → e₁.fingerprint = e₂.fingerprint
+
+/-- Computable cross-shard fingerprint reconciliation check returning
+    `crossShardDuplicateConflict` for every conflicting declaration across shards. -/
+def checkCrossShardFingerprints (shards : List (List String))
+    (entries : List ModDeclFingerprint) : List ShardAuditViolation :=
+  let covered := shards.flatten
+  let active := entries.filter (fun e => covered.contains e.modName)
+  active.flatMap fun e₁ =>
+    if active.any (fun e₂ => e₂.declName == e₁.declName && e₂.fingerprint != e₁.fingerprint) then
+      [{ code := .crossShardDuplicateConflict, subject := e₁.declName }]
+    else []
+
+/-- **Sharding Completeness Hole Witness (closes B1 Open Issue 2)**:
+    Two shards `["M1"]` and `["M2"]` both pass `ShardLocalDuplicateConsistent` even when
+    `M1` and `M2` disagree on `evalRvalue.eq_4`'s fingerprint — violating
+    `MonolithicDuplicateConsistent`. `checkCrossShardFingerprints` catches the conflict! -/
+def crossShardConflictEntries : List ModDeclFingerprint :=
+  [{ modName := "M1", declName := "evalRvalue.eq_4", fingerprint := "fp_v1" },
+   { modName := "M2", declName := "evalRvalue.eq_4", fingerprint := "fp_v2" }]
+
+theorem shardLocalDupCheck_misses_crossShard_conflict :
+    ShardLocalDuplicateConsistent ["M1"] crossShardConflictEntries ∧
+    ShardLocalDuplicateConsistent ["M2"] crossShardConflictEntries ∧
+    ¬ MonolithicDuplicateConsistent ["M1", "M2"] crossShardConflictEntries ∧
+    (checkCrossShardFingerprints [["M1"], ["M2"]] crossShardConflictEntries).any
+      (fun v => v.code == .crossShardDuplicateConflict && v.subject == "evalRvalue.eq_4") = true := by
+  refine ⟨?_, ?_, ?_, by decide⟩
+  · intro e₁ h₁ e₂ h₂ hm₁ hm₂ _
+    simp only [crossShardConflictEntries, List.mem_cons, List.not_mem_nil, or_false] at h₁ h₂
+    rcases h₁ with rfl | rfl <;> rcases h₂ with rfl | rfl
+    · rfl
+    · exact absurd hm₂ (by decide)
+    · exact absurd hm₁ (by decide)
+    · exact absurd hm₁ (by decide)
+  · intro e₁ h₁ e₂ h₂ hm₁ hm₂ _
+    simp only [crossShardConflictEntries, List.mem_cons, List.not_mem_nil, or_false] at h₁ h₂
+    rcases h₁ with rfl | rfl <;> rcases h₂ with rfl | rfl
+    · exact absurd hm₁ (by decide)
+    · exact absurd hm₁ (by decide)
+    · exact absurd hm₂ (by decide)
+    · rfl
+  · intro hMono
+    have hEq := hMono
+      { modName := "M1", declName := "evalRvalue.eq_4", fingerprint := "fp_v1" } (by decide)
+      { modName := "M2", declName := "evalRvalue.eq_4", fingerprint := "fp_v2" } (by decide)
+      (by decide) (by decide) rfl
+    exact absurd hEq (by decide)
+
+/-- **Cross-Shard Fingerprint Reconciliation Soundness & Completeness**:
+    Under `ShardPartitionValid`, `checkCrossShardFingerprints shards entries = []` holds
+    if and only if `MonolithicDuplicateConsistent registered entries` holds globally. -/
+theorem crossShardFingerprintReconciliation_sound
+    {registered onDisk : List String} {shards : List (List String)}
+    {entries : List ModDeclFingerprint}
+    (hPart : ShardPartitionValid registered onDisk shards) :
+    checkCrossShardFingerprints shards entries = [] ↔
+      MonolithicDuplicateConsistent registered entries := by
+  have hCovIff : ∀ m, shards.flatten.contains m = true ↔ m ∈ registered := by
+    intro m
+    rw [List.contains_iff_mem, List.mem_flatten]
+    constructor
+    · rintro ⟨s, hs, hms⟩
+      exact hPart.subset_registered s hs m hms
+    · intro hm
+      exact hPart.covers_registered m hm
+  unfold checkCrossShardFingerprints MonolithicDuplicateConsistent
+  constructor
+  · intro hNil e₁ h₁ e₂ h₂ hm₁ hm₂ hName
+    have hAct₁ : e₁ ∈ entries.filter (fun e => shards.flatten.contains e.modName) :=
+      List.mem_filter.mpr ⟨h₁, (hCovIff e₁.modName).mpr hm₁⟩
+    have hAct₂ : e₂ ∈ entries.filter (fun e => shards.flatten.contains e.modName) :=
+      List.mem_filter.mpr ⟨h₂, (hCovIff e₂.modName).mpr hm₂⟩
+    have hItem := (List.flatMap_eq_nil_iff.mp hNil) e₁ hAct₁
+    by_cases hFp : e₁.fingerprint = e₂.fingerprint
+    · exact hFp
+    · have hAny : (entries.filter (fun e => shards.flatten.contains e.modName)).any
+          (fun e => e.declName == e₁.declName && e.fingerprint != e₁.fingerprint) = true := by
+        rw [List.any_eq_true]
+        refine ⟨e₂, hAct₂, ?_⟩
+        simp only [Bool.and_eq_true, beq_iff_eq, bne_iff_ne, ne_eq]
+        exact ⟨hName.symm, fun h => hFp h.symm⟩
+      simp only [hAny, ↓reduceIte] at hItem
+      cases hItem
+  · intro hMono
+    rw [List.flatMap_eq_nil_iff]
+    intro e₁ hAct₁
+    have ⟨h₁, hC₁⟩ := List.mem_filter.mp hAct₁
+    have hm₁ := (hCovIff e₁.modName).mp hC₁
+    by_cases hAny : (entries.filter (fun e => shards.flatten.contains e.modName)).any
+        (fun e => e.declName == e₁.declName && e.fingerprint != e₁.fingerprint) = true
+    · rw [List.any_eq_true] at hAny
+      obtain ⟨e₂, hAct₂, hCond⟩ := hAny
+      have ⟨h₂, hC₂⟩ := List.mem_filter.mp hAct₂
+      have hm₂ := (hCovIff e₂.modName).mp hC₂
+      simp only [Bool.and_eq_true, beq_iff_eq, bne_iff_ne, ne_eq] at hCond
+      exact absurd (hMono e₂ h₂ e₁ h₁ hm₂ hm₁ hCond.1) hCond.2
+    · rw [Bool.not_eq_true] at hAny
+      simp only [hAny, Bool.false_eq_true, ↓reduceIte]
+
 /-! ## 4. Pillar 3 — Four Peer-Verifier Spec-Boundary Soundness Guards -/
 
 /-! ### 4.1 Guard 3 — Unsatisfiable Extern `ensures` (`creusot#2388`, rank `3`) -/
@@ -2184,7 +2393,8 @@ def Polarity.flip : Polarity → Polarity
   | .pos => .neg
   | .neg => .pos
 
-/-- Propositional formula AST distinguishing assumption atoms from ordinary obligation atoms. -/
+/-- Propositional formula AST distinguishing assumption atoms from ordinary obligation atoms,
+    including biconditionals (`iff`) and conditionals (`ifte`) where both polarities occur. -/
 inductive PropFormula : Type where
   | atom (tag : String)
   | assumes (tag : String)
@@ -2192,10 +2402,13 @@ inductive PropFormula : Type where
   | and (p q : PropFormula)
   | or (p q : PropFormula)
   | imp (p q : PropFormula)
+  | iff (p q : PropFormula)
+  | ifte (c t e : PropFormula)
   deriving DecidableEq, Repr, Inhabited
 
 /-- Recursive polarity checker verifying that every `assumes` occurrence appears
-    strictly in negative polarity (`pol = .neg`). -/
+    strictly in negative polarity (`pol = .neg`). Both `iff` operands and the condition
+    of `ifte` (`(c → t) ∧ (¬c → e)`) sit in BOTH positive and negative polarity! -/
 def assumesOnlyNegative : Polarity → PropFormula → Bool
   | _, .atom _ => true
   | .neg, .assumes _ => true
@@ -2204,6 +2417,12 @@ def assumesOnlyNegative : Polarity → PropFormula → Bool
   | pol, .and p q => assumesOnlyNegative pol p && assumesOnlyNegative pol q
   | pol, .or p q => assumesOnlyNegative pol p && assumesOnlyNegative pol q
   | pol, .imp p q => assumesOnlyNegative pol.flip p && assumesOnlyNegative pol q
+  | _, .iff p q =>
+    assumesOnlyNegative .pos p && assumesOnlyNegative .neg p &&
+      assumesOnlyNegative .pos q && assumesOnlyNegative .neg q
+  | pol, .ifte c t e =>
+    assumesOnlyNegative .pos c && assumesOnlyNegative .neg c &&
+      assumesOnlyNegative pol t && assumesOnlyNegative pol e
 
 /-- Top-level Guard 6a polarity check starting at positive root polarity. -/
 def checkAssumesNegativePolarity (f : PropFormula) : Bool :=
@@ -2222,6 +2441,10 @@ def evalEquivFormula {Val : Type} (specRes implRes : EvalRes Val) : PropFormula 
   | .and p q => evalEquivFormula specRes implRes p ∧ evalEquivFormula specRes implRes q
   | .or p q => evalEquivFormula specRes implRes p ∨ evalEquivFormula specRes implRes q
   | .imp p q => evalEquivFormula specRes implRes p → evalEquivFormula specRes implRes q
+  | .iff p q => evalEquivFormula specRes implRes p ↔ evalEquivFormula specRes implRes q
+  | .ifte c t e =>
+    (evalEquivFormula specRes implRes c → evalEquivFormula specRes implRes t) ∧
+      (¬ evalEquivFormula specRes implRes c → evalEquivFormula specRes implRes e)
 
 /-- Canonical negative-polarity formula AST. -/
 def correctEquivFormula : PropFormula :=
@@ -2270,14 +2493,35 @@ theorem evalEquivFormula_correct_iff {Val : Type} (specRes implRes : EvalRes Val
     exact ⟨by simp [evalEquivFormula, hImplF], hOut⟩
 
 /-- Polarity checker accepts `correctEquivFormula` and rejects all positive-polarity bugs
-    (flipped consequent, positive disjunct, double negation, nested implication). -/
+    (flipped consequent, positive disjunct, double negation, nested implication, `iff`,
+    and conditional `if assumes then ... else ...` even inside an antecedent!). -/
 theorem checkAssumesNegativePolarity_vectors :
     checkAssumesNegativePolarity correctEquivFormula = true ∧
     checkAssumesNegativePolarity flippedConsequentFormula = false ∧
     checkAssumesNegativePolarity positiveDisjunctFormula = false ∧
     checkAssumesNegativePolarity nestedImpPositiveAssumesFormula = false ∧
-    checkAssumesNegativePolarity (.not (.not (.assumes "impl"))) = false := by
+    checkAssumesNegativePolarity (.not (.not (.assumes "impl"))) = false ∧
+    checkAssumesNegativePolarity (.iff (.atom "outputEq") (.assumes "impl")) = false ∧
+    checkAssumesNegativePolarity
+      (.imp (.ifte (.assumes "impl") (.atom "outputEq") (.not (.atom "impl.assertionFailed")))
+        (.atom "outputEq")) = false := by
   decide
+
+/-- **Biconditional & Conditional Polarity Collapse (A1)**: both `outputEq ↔ implAssumes`
+    and `if implAssumes then outputEq else ¬implFailed` accept a broken implementation that
+    crashes with `assertionFailed = true` while `output = spec.output`, refuting
+    `CorrectEquivObligation`! -/
+theorem iffAndIftePolarity_accept_broken_impl :
+    let specRes : EvalRes Nat := { assumesHold := true, assertionFailed := false, output := 42 }
+    let implRes : EvalRes Nat := { assumesHold := true, assertionFailed := true, output := 42 }
+    evalEquivFormula specRes implRes (.iff (.atom "outputEq") (.assumes "impl")) ∧
+      evalEquivFormula specRes implRes
+        (.ifte (.assumes "impl") (.atom "outputEq") (.not (.atom "impl.assertionFailed"))) ∧
+      ¬ CorrectEquivObligation specRes implRes := by
+  refine ⟨⟨fun _ => rfl, fun _ => rfl⟩, ⟨fun _ => rfl, fun hNot => absurd rfl hNot⟩, ?_⟩
+  intro h
+  have hBad := (h ⟨rfl, rfl, rfl⟩).1
+  cases hBad
 
 /-- **Soundness Collapse 6a (Polarity Flip)**: both `flippedConsequentFormula` and
     `positiveDisjunctFormula` vacuously accept a broken implementation that fails
