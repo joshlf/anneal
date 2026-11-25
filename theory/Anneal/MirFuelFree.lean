@@ -11999,6 +11999,135 @@ theorem IsIntrinsicCallFamily.of_eq
   · exact Or.inr (Or.inl ⟨fk, fun s => (h_eq s).trans (hf s)⟩)
   · exact Or.inr (Or.inr fun s => (h_eq s).trans (hu s))
 
+def IsIntrinsicCallFamilyAt
+    (s : MachineState) (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (f : MachineState → MirStepNode) : Prop :=
+  (∃ retVal,
+    ∀ s' : MachineState,
+      s'.memory.borrows = s.memory.borrows →
+      s'.memory.globals = s.memory.globals →
+      s'.memory.callees = s.memory.callees →
+      s'.memory.fnPtrs = s.memory.fnPtrs →
+      s'.memory.nextAllocId = s.memory.nextAllocId →
+      f s' = writeIntrinsicReturn s' locals' destination targetBb retVal) ∨
+  (∃ fk,
+    ∀ s' : MachineState,
+      s'.memory.borrows = s.memory.borrows →
+      s'.memory.globals = s.memory.globals →
+      s'.memory.callees = s.memory.callees →
+      s'.memory.fnPtrs = s.memory.fnPtrs →
+      s'.memory.nextAllocId = s.memory.nextAllocId →
+      f s' = MirStepNode.fail fk) ∨
+  (∀ s' : MachineState,
+    s'.memory.borrows = s.memory.borrows →
+    s'.memory.globals = s.memory.globals →
+    s'.memory.callees = s.memory.callees →
+    s'.memory.fnPtrs = s.memory.fnPtrs →
+    s'.memory.nextAllocId = s.memory.nextAllocId →
+    f s' = MirStepNode.unsupported)
+
+theorem IsIntrinsicCallFamily.at_state
+    {locals' : List LocalSlot} {destination : Place} {targetBb : BasicBlockIdx}
+    {f : MachineState → MirStepNode}
+    (h : IsIntrinsicCallFamily locals' destination targetBb f) (s : MachineState) :
+    IsIntrinsicCallFamilyAt s locals' destination targetBb f := by
+  rcases h with ⟨retVal, hr⟩ | ⟨fk, hf⟩ | hu
+  · exact Or.inl ⟨retVal, fun s' _ _ _ _ _ => hr s'⟩
+  · exact Or.inr (Or.inl ⟨fk, fun s' _ _ _ _ _ => hf s'⟩)
+  · exact Or.inr (Or.inr fun s' _ _ _ _ _ => hu s')
+
+theorem IsIntrinsicCallFamilyAt.of_eq
+    {s : MachineState} {locals' : List LocalSlot} {destination : Place} {targetBb : BasicBlockIdx}
+    {f g : MachineState → MirStepNode}
+    (h_eq : ∀ s', f s' = g s')
+    (h : IsIntrinsicCallFamilyAt s locals' destination targetBb g) :
+    IsIntrinsicCallFamilyAt s locals' destination targetBb f := by
+  rcases h with ⟨retVal, hr⟩ | ⟨fk, hf⟩ | hu
+  · exact Or.inl ⟨retVal, fun s' hb hg hc hf' hn => (h_eq s').trans (hr s' hb hg hc hf' hn)⟩
+  · exact Or.inr (Or.inl ⟨fk, fun s' hb hg hc hf' hn => (h_eq s').trans (hf s' hb hg hc hf' hn)⟩)
+  · exact Or.inr (Or.inr fun s' hb hg hc hf' hn => (h_eq s').trans (hu s' hb hg hc hf' hn))
+
+theorem checkDynVTablePtr_eq_of_mem_fields
+    (currentBody : Option CapturedMir) (m₁ m₂ : Memory)
+    (ptrBytes : Nat) (metaVal : Value) (expectedKey : DefPath)
+    (hb : m₁.borrows = m₂.borrows)
+    (hg : m₁.globals = m₂.globals)
+    (hc : m₁.callees = m₂.callees)
+    (hf : m₁.fnPtrs = m₂.fnPtrs)
+    (hn : m₁.nextAllocId = m₂.nextAllocId) :
+    checkDynVTablePtr currentBody (DynMemView.ofMemory m₁) ptrBytes metaVal expectedKey =
+      checkDynVTablePtr currentBody (DynMemView.ofMemory m₂) ptrBytes metaVal expectedKey := by
+  unfold checkDynVTablePtr dynVTableEnv? DynMemView.ofMemory
+  simp only [hb, hg, hc, hf, hn]
+
+theorem evalDynSizeAlignOfVal_cases_at
+    (s : MachineState) (bodyLayouts : LayoutTable)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (ptrArgVal : Value) (dynKey : DefPath) (isSize : Bool) :
+    IsIntrinsicCallFamilyAt s locals' destination targetBb
+      (fun s' =>
+        evalDynSizeAlignOfVal s' bodyLayouts locals' destination targetBb ptrArgVal dynKey isSize) := by
+  have hStep (dataVal metaVal : Value)
+      (hData :
+        (match dataVal with
+         | .ptr _ sz => Nat.beq sz (layoutPointerBytes bodyLayouts)
+         | .scalar sc => Nat.beq sc.sizeBytes (layoutPointerBytes bodyLayouts)
+         | _ => false) = true) :
+      IsIntrinsicCallFamilyAt s locals' destination targetBb
+        (fun s' =>
+          match checkDynVTablePtr .none (DynMemView.ofMemory s'.memory)
+              (layoutPointerBytes bodyLayouts) metaVal dynKey with
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+          | .ok (entry, _, _) =>
+            let res : Nat := match isSize with | true => entry.sizeBytes | false => entry.alignBytes
+            writeIntrinsicReturn s' locals' destination targetBb
+              (.scalar ⟨res, layoutPointerBytes bodyLayouts⟩)) := by
+    cases hChk :
+        checkDynVTablePtr .none (DynMemView.ofMemory s.memory)
+          (layoutPointerBytes bodyLayouts) metaVal dynKey with
+    | ub =>
+      refine Or.inr (Or.inl ⟨.ub, fun s' hb hg hc hf hn => ?_⟩)
+      dsimp only
+      rw [checkDynVTablePtr_eq_of_mem_fields .none s'.memory s.memory _ _ _ hb hg hc hf hn, hChk]
+    | unsupported =>
+      refine Or.inr (Or.inr fun s' hb hg hc hf hn => ?_)
+      dsimp only
+      rw [checkDynVTablePtr_eq_of_mem_fields .none s'.memory s.memory _ _ _ hb hg hc hf hn, hChk]
+    | ok res =>
+      rcases res with ⟨entry, _, _⟩
+      refine Or.inl ⟨.scalar ⟨(match isSize with | true => entry.sizeBytes | false => entry.alignBytes),
+        layoutPointerBytes bodyLayouts⟩, fun s' hb hg hc hf hn => ?_⟩
+      dsimp only
+      rw [checkDynVTablePtr_eq_of_mem_fields .none s'.memory s.memory _ _ _ hb hg hc hf hn, hChk]
+  cases ptrArgVal with
+  | aggregate varIdx flds =>
+    cases varIdx with
+    | succ _ => exact Or.inr (Or.inl ⟨.ub, fun _ _ _ _ _ _ => rfl⟩)
+    | zero =>
+      rcases flds with _ | ⟨dataVal, _ | ⟨metaVal, _ | _⟩⟩ <;>
+        try exact Or.inr (Or.inl ⟨.ub, fun _ _ _ _ _ _ => rfl⟩)
+      cases dataVal with
+      | ptr p sz =>
+        cases hSz : Nat.beq sz (layoutPointerBytes bodyLayouts) with
+        | false =>
+          refine Or.inr (Or.inl ⟨.ub, fun s' _ _ _ _ _ => ?_⟩)
+          unfold evalDynSizeAlignOfVal; simp only [Nat.zero_eq, hSz]
+        | true =>
+          refine IsIntrinsicCallFamilyAt.of_eq (fun s' => ?_) (hStep (.ptr p sz) metaVal hSz)
+          unfold evalDynSizeAlignOfVal; simp only [Nat.zero_eq, hSz]; rfl
+      | scalar sc =>
+        cases hSz : Nat.beq sc.sizeBytes (layoutPointerBytes bodyLayouts) with
+        | false =>
+          refine Or.inr (Or.inl ⟨.ub, fun s' _ _ _ _ _ => ?_⟩)
+          unfold evalDynSizeAlignOfVal; simp only [Nat.zero_eq, hSz]
+        | true =>
+          refine IsIntrinsicCallFamilyAt.of_eq (fun s' => ?_) (hStep (.scalar sc) metaVal hSz)
+          unfold evalDynSizeAlignOfVal; simp only [Nat.zero_eq, hSz]; rfl
+      | unit | aggregate _ _ | uninit =>
+        exact Or.inr (Or.inl ⟨.ub, fun _ _ _ _ _ _ => rfl⟩)
+  | _ => exact Or.inr (Or.inl ⟨.ub, fun _ _ _ _ _ _ => rfl⟩)
+
 theorem writeIntrinsicScalarResult_cases
     (locals' : List LocalSlot) (destination : Place)
     (targetBb : BasicBlockIdx) (resOpt : Option ScalarInt) :
@@ -12254,13 +12383,8 @@ def sizeOfValOneArg
         writeIntrinsicScalarResult s locals' destination targetBb
           (evalSliceSizeOfVal 1 lenSc)
     | _ => MirStepNode.fail .ub
-  | .some (.dynamic _) =>
-    match ptrArgVal with
-    | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
-      match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
-      | false => MirStepNode.fail .ub
-      | true => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
+  | .some (.dynamic dynKey) =>
+    evalDynSizeAlignOfVal s bodyLayouts locals' destination targetBb ptrArgVal dynKey true
   | .some pointeeTy =>
     match ptrArgVal with
     | .ptr _ ptrSz =>
@@ -12304,6 +12428,7 @@ theorem evalSizeOfVal_oneArg_eq
   | some pt => cases pt <;> rfl
 
 theorem evalSizeOfValIntrinsicCall_cases
+    (s : MachineState)
     (target : ResolvedCallTarget)
     (bodyLocalDecls : List LocalDecl)
     (bodyLayouts : LayoutTable)
@@ -12312,17 +12437,18 @@ theorem evalSizeOfValIntrinsicCall_cases
     (locals' : List LocalSlot)
     (destination : Place)
     (targetBb : BasicBlockIdx) :
-    IsIntrinsicCallFamily locals' destination targetBb
-      (fun s =>
-        evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts
+    IsIntrinsicCallFamilyAt s locals' destination targetBb
+      (fun s' =>
+        evalNonSelectIntrinsicCall .sizeOfVal s' target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb) := by
   rcases argVals with _ | ⟨ptrArgVal, _ | _⟩ <;>
-    try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
-  refine IsIntrinsicCallFamily.of_eq
-    (fun s => evalSizeOfVal_oneArg_eq s target bodyLocalDecls bodyLayouts argOps
+    try exact Or.inr (Or.inl ⟨.ub, fun _ _ _ _ _ _ => rfl⟩)
+  refine IsIntrinsicCallFamilyAt.of_eq
+    (fun s' => evalSizeOfVal_oneArg_eq s' target bodyLocalDecls bodyLayouts argOps
       ptrArgVal locals' destination targetBb) ?_
   cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
   | none =>
+    refine IsIntrinsicCallFamily.at_state ?_ s
     unfold sizeOfValOneArg
     cases isValidIntrinsicPtrArgVal ptrArgVal with
     | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
@@ -12332,6 +12458,7 @@ theorem evalSizeOfValIntrinsicCall_cases
   | some pointeeTy =>
     by_cases h_sl : ∃ elemTy, pointeeTy = .slice elemTy
     · rcases h_sl with ⟨elemTy, rfl⟩
+      refine IsIntrinsicCallFamily.at_state ?_ s
       unfold sizeOfValOneArg
       refine wideSliceIntrinsic_family locals' destination targetBb ptrArgVal
         (fun lenSc s =>
@@ -12349,6 +12476,7 @@ theorem evalSizeOfValIntrinsicCall_cases
           (evalSliceSizeOfVal elemSz lenSc)
     · by_cases h_str : pointeeTy = .str
       · subst h_str
+        refine IsIntrinsicCallFamily.at_state ?_ s
         unfold sizeOfValOneArg
         exact wideSliceIntrinsic_family locals' destination targetBb ptrArgVal
           (fun lenSc s =>
@@ -12358,10 +12486,12 @@ theorem evalSizeOfValIntrinsicCall_cases
             writeIntrinsicScalarResult_cases locals' destination targetBb
               (evalSliceSizeOfVal 1 lenSc)
       · by_cases h_dyn : ∃ preds, pointeeTy = .dynamic preds
-        · rcases h_dyn with ⟨_, rfl⟩
+        · rcases h_dyn with ⟨dynKey, rfl⟩
           unfold sizeOfValOneArg
-          exact wideMetaOnlyIntrinsic_family locals' destination targetBb ptrArgVal
-        · refine IsIntrinsicCallFamily.of_eq (g := fun s =>
+          exact evalDynSizeAlignOfVal_cases_at s bodyLayouts locals' destination targetBb
+            ptrArgVal dynKey true
+        · refine IsIntrinsicCallFamily.at_state ?_ s
+          refine IsIntrinsicCallFamily.of_eq (g := fun s =>
             match ptrArgVal with
             | .ptr _ ptrSz =>
               match Nat.beq ptrSz 8 with
@@ -12439,13 +12569,8 @@ def alignOfValOneArg
           writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
         | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
-  | .some (.dynamic _) =>
-    match ptrArgVal with
-    | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
-      match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
-      | false => MirStepNode.fail .ub
-      | true => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
+  | .some (.dynamic dynKey) =>
+    evalDynSizeAlignOfVal s bodyLayouts locals' destination targetBb ptrArgVal dynKey false
   | .some pointeeTy =>
     match ptrArgVal with
     | .ptr _ ptrSz =>
@@ -12487,6 +12612,7 @@ theorem evalAlignOfVal_oneArg_eq
   | some pt => cases pt <;> rfl
 
 theorem evalAlignOfValIntrinsicCall_cases
+    (s : MachineState)
     (target : ResolvedCallTarget)
     (bodyLocalDecls : List LocalDecl)
     (bodyLayouts : LayoutTable)
@@ -12495,17 +12621,18 @@ theorem evalAlignOfValIntrinsicCall_cases
     (locals' : List LocalSlot)
     (destination : Place)
     (targetBb : BasicBlockIdx) :
-    IsIntrinsicCallFamily locals' destination targetBb
-      (fun s =>
-        evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts
+    IsIntrinsicCallFamilyAt s locals' destination targetBb
+      (fun s' =>
+        evalNonSelectIntrinsicCall .alignOfVal s' target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb) := by
   rcases argVals with _ | ⟨ptrArgVal, _ | _⟩ <;>
-    try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
-  refine IsIntrinsicCallFamily.of_eq
-    (fun s => evalAlignOfVal_oneArg_eq s target bodyLocalDecls bodyLayouts argOps
+    try exact Or.inr (Or.inl ⟨.ub, fun _ _ _ _ _ _ => rfl⟩)
+  refine IsIntrinsicCallFamilyAt.of_eq
+    (fun s' => evalAlignOfVal_oneArg_eq s' target bodyLocalDecls bodyLayouts argOps
       ptrArgVal locals' destination targetBb) ?_
   cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
   | none =>
+    refine IsIntrinsicCallFamily.at_state ?_ s
     unfold alignOfValOneArg
     cases isValidIntrinsicPtrArgVal ptrArgVal with
     | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
@@ -12515,6 +12642,7 @@ theorem evalAlignOfValIntrinsicCall_cases
   | some pointeeTy =>
     by_cases h_sl : ∃ elemTy, pointeeTy = .slice elemTy
     · rcases h_sl with ⟨elemTy, rfl⟩
+      refine IsIntrinsicCallFamily.at_state ?_ s
       unfold alignOfValOneArg
       refine wideSliceIntrinsic_family locals' destination targetBb ptrArgVal
         (fun lenSc s =>
@@ -12544,6 +12672,7 @@ theorem evalAlignOfValIntrinsicCall_cases
           | some _ => exact Or.inl ⟨.scalar ⟨alignBytes, 8⟩, fun _ => rfl⟩
     · by_cases h_str : pointeeTy = .str
       · subst h_str
+        refine IsIntrinsicCallFamily.at_state ?_ s
         unfold alignOfValOneArg
         refine wideSliceIntrinsic_family locals' destination targetBb ptrArgVal
           (fun lenSc s =>
@@ -12556,10 +12685,12 @@ theorem evalAlignOfValIntrinsicCall_cases
         | none => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
         | some _ => exact Or.inl ⟨.scalar ⟨1, 8⟩, fun _ => rfl⟩
       · by_cases h_dyn : ∃ preds, pointeeTy = .dynamic preds
-        · rcases h_dyn with ⟨_, rfl⟩
+        · rcases h_dyn with ⟨dynKey, rfl⟩
           unfold alignOfValOneArg
-          exact wideMetaOnlyIntrinsic_family locals' destination targetBb ptrArgVal
-        · refine IsIntrinsicCallFamily.of_eq (g := fun s =>
+          exact evalDynSizeAlignOfVal_cases_at s bodyLayouts locals' destination targetBb
+            ptrArgVal dynKey false
+        · refine IsIntrinsicCallFamily.at_state ?_ s
+          refine IsIntrinsicCallFamily.of_eq (g := fun s =>
             match ptrArgVal with
             | .ptr _ ptrSz =>
               match Nat.beq ptrSz 8 with
@@ -12598,6 +12729,7 @@ theorem evalAlignOfValIntrinsicCall_cases
                 exact Or.inl ⟨.scalar ⟨alignBytes, 8⟩, fun _ => rfl⟩
 
 theorem evalNonSelectIntrinsicCall_cases
+    (s : MachineState)
     (kind : RustIntrinsicKind)
     (target : ResolvedCallTarget)
     (bodyLocalDecls : List LocalDecl)
@@ -12607,73 +12739,83 @@ theorem evalNonSelectIntrinsicCall_cases
     (locals' : List LocalSlot)
     (destination : Place)
     (targetBb : BasicBlockIdx) :
-    (∃ retVal,
-      ∀ s : MachineState,
-        evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
-          argOps argVals locals' destination targetBb =
-          writeIntrinsicReturn s locals' destination targetBb retVal) ∨
-    (∃ fk, ∀ s : MachineState,
-      evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
-        argOps argVals locals' destination targetBb = MirStepNode.fail fk) ∨
-    (∀ s : MachineState,
-      evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
-        argOps argVals locals' destination targetBb = MirStepNode.unsupported) := by
-  change IsIntrinsicCallFamily locals' destination targetBb
-    (fun s =>
-      evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
-        argOps argVals locals' destination targetBb)
+    IsIntrinsicCallFamilyAt s locals' destination targetBb
+      (fun s' =>
+        evalNonSelectIntrinsicCall kind s' target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
   cases kind with
+  | sizeOfVal =>
+    exact evalSizeOfValIntrinsicCall_cases s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
+  | alignOfVal =>
+    exact evalAlignOfValIntrinsicCall_cases s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
   | ubChecks =>
+    refine IsIntrinsicCallFamily.at_state ?_ s
     cases argVals with
     | nil => exact Or.inl ⟨.scalar ⟨1, 1⟩, fun _ => rfl⟩
     | cons _ _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
   | constEvalSelect =>
-    exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+    exact IsIntrinsicCallFamily.at_state (Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)) s
   | ctlz =>
-    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtlz
+    exact IsIntrinsicCallFamily.at_state
+      (unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtlz) s
   | ctlzNonzero =>
-    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtlzNonzero
+    exact IsIntrinsicCallFamily.at_state
+      (unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtlzNonzero) s
   | cttz =>
-    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCttz
+    exact IsIntrinsicCallFamily.at_state
+      (unaryScalarIntrinsic_family locals' destination targetBb argVals evalCttz) s
   | cttzNonzero =>
-    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCttzNonzero
+    exact IsIntrinsicCallFamily.at_state
+      (unaryScalarIntrinsic_family locals' destination targetBb argVals evalCttzNonzero) s
   | ctpop =>
-    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtpop
+    exact IsIntrinsicCallFamily.at_state
+      (unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtpop) s
   | bswap =>
-    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalBswap
+    exact IsIntrinsicCallFamily.at_state
+      (unaryScalarIntrinsic_family locals' destination targetBb argVals evalBswap) s
   | bitreverse =>
-    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalBitreverse
+    exact IsIntrinsicCallFamily.at_state
+      (unaryScalarIntrinsic_family locals' destination targetBb argVals evalBitreverse) s
   | wrappingAdd =>
-    exact binaryScalarIntrinsic_family locals' destination targetBb argVals
-      (fun lhs rhs s =>
-        writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingAdd lhs rhs))
-      fun lhs rhs =>
-        writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingAdd lhs rhs)
+    exact IsIntrinsicCallFamily.at_state
+      (binaryScalarIntrinsic_family locals' destination targetBb argVals
+        (fun lhs rhs s =>
+          writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingAdd lhs rhs))
+        fun lhs rhs =>
+          writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingAdd lhs rhs)) s
   | wrappingSub =>
-    exact binaryScalarIntrinsic_family locals' destination targetBb argVals
-      (fun lhs rhs s =>
-        writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingSub lhs rhs))
-      fun lhs rhs =>
-        writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingSub lhs rhs)
+    exact IsIntrinsicCallFamily.at_state
+      (binaryScalarIntrinsic_family locals' destination targetBb argVals
+        (fun lhs rhs s =>
+          writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingSub lhs rhs))
+        fun lhs rhs =>
+          writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingSub lhs rhs)) s
   | wrappingMul =>
-    exact binaryScalarIntrinsic_family locals' destination targetBb argVals
-      (fun lhs rhs s =>
-        writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingMul lhs rhs))
-      fun lhs rhs =>
-        writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingMul lhs rhs)
+    exact IsIntrinsicCallFamily.at_state
+      (binaryScalarIntrinsic_family locals' destination targetBb argVals
+        (fun lhs rhs s =>
+          writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingMul lhs rhs))
+        fun lhs rhs =>
+          writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingMul lhs rhs)) s
   | saturatingAdd =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
-      (fun lhs rhs flag => Trusted.Rustc.V2026_06_01.MirSemantics.evalSaturatingAdd lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+        (fun lhs rhs flag => Trusted.Rustc.V2026_06_01.MirSemantics.evalSaturatingAdd lhs rhs flag)) s
   | saturatingSub =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
-      (fun lhs rhs flag => Trusted.Rustc.V2026_06_01.MirSemantics.evalSaturatingSub lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+        (fun lhs rhs flag => Trusted.Rustc.V2026_06_01.MirSemantics.evalSaturatingSub lhs rhs flag)) s
   | uncheckedShl =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps)
-      (fun lhs rhs flag => evalUncheckedShl lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps)
+        (fun lhs rhs flag => evalUncheckedShl lhs rhs flag)) s
   | uncheckedShr =>
+    refine IsIntrinsicCallFamily.at_state ?_ s
     refine binaryScalarIntrinsic_family locals' destination targetBb argVals
       (fun lhs rhs s =>
         match
@@ -12694,40 +12836,41 @@ theorem evalNonSelectIntrinsicCall_cases
         exact writeIntrinsicScalarResult_cases locals' destination targetBb
           (evalUncheckedShr lhs rhs lhsSigned rhsSigned)
   | uncheckedAdd =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
-      (fun lhs rhs flag => evalUncheckedAdd lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+        (fun lhs rhs flag => evalUncheckedAdd lhs rhs flag)) s
   | uncheckedSub =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
-      (fun lhs rhs flag => evalUncheckedSub lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+        (fun lhs rhs flag => evalUncheckedSub lhs rhs flag)) s
   | uncheckedMul =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
-      (fun lhs rhs flag => evalUncheckedMul lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+        (fun lhs rhs flag => evalUncheckedMul lhs rhs flag)) s
   | uncheckedDiv =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
-      (fun lhs rhs flag => evalUncheckedDiv lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+        (fun lhs rhs flag => evalUncheckedDiv lhs rhs flag)) s
   | uncheckedRem =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
-      (fun lhs rhs flag => evalUncheckedRem lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+        (fun lhs rhs flag => evalUncheckedRem lhs rhs flag)) s
   | threeWayCompare =>
-    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
-      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (allowChar := true))
-      (fun lhs rhs flag => evalThreeWayCompare lhs rhs flag)
+    exact IsIntrinsicCallFamily.at_state
+      (optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+        (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (allowChar := true))
+        (fun lhs rhs flag => evalThreeWayCompare lhs rhs flag)) s
   | arithOffset =>
-    exact arithOffsetIntrinsic_family target bodyLocalDecls bodyLayouts
-      argOps argVals locals' destination targetBb
-  | sizeOfVal =>
-    exact evalSizeOfValIntrinsicCall_cases target bodyLocalDecls bodyLayouts
-      argOps argVals locals' destination targetBb
-  | alignOfVal =>
-    exact evalAlignOfValIntrinsicCall_cases target bodyLocalDecls bodyLayouts
-      argOps argVals locals' destination targetBb
+    exact IsIntrinsicCallFamily.at_state
+      (arithOffsetIntrinsic_family target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb) s
   | copyNonOverlapping | writeBytes =>
-    exact Or.inr (Or.inr fun _ => rfl)
+    exact IsIntrinsicCallFamily.at_state (Or.inr (Or.inr fun _ => rfl)) s
 
 theorem writePlaceValue_deref_nil_borrows
     (locals : List LocalSlot) (loc : Local) (tl : List ProjectionElem)

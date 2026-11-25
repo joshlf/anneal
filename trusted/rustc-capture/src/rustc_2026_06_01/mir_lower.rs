@@ -402,14 +402,18 @@ pub fn query_post_cleanup_mir<'tcx>(tcx: TyCtxt<'tcx>, local_def_id: LocalDefId)
 /// >    pub required_consts: Option<Vec<ConstOperand<'tcx>>>,
 /// >```
 ///
+/// Lowers a single `rustc` `Runtime(PostCleanup)` MIR body into an
+/// `IrCapturedMir`, attaching the precomputed crate-level `dyn Trait` metadata
+/// (`dyn_types`, `vtables`, `virtual_methods`) as pure struct fields.
+///
 /// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L206-L271
-pub fn lower_mir_body<'tcx>(
+pub fn lower_mir_body_with_dyn_metadata<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     body: &Body<'tcx>,
     role: IrContractRole,
+    dyn_metadata: &crate::lean_emit::IrDynMetadata,
 ) -> IrCapturedMir {
-    ensure_session_dyn_metadata(tcx, def_id);
     let (generic_params, param_index_map) = collect_generic_type_params(tcx, def_id);
     let type_param_count = generic_params.len();
 
@@ -474,7 +478,22 @@ pub fn lower_mir_body<'tcx>(
         fn_abi,
         layouts,
         allocations,
+        dyn_types: dyn_metadata.dyn_types.clone(),
+        vtables: dyn_metadata.vtables.clone(),
+        virtual_methods: dyn_metadata.virtual_methods.clone(),
     }
+}
+
+/// Lowers a single `rustc` `Runtime(PostCleanup)` MIR body into an
+/// `IrCapturedMir`, computing crate-level `dyn Trait` metadata on demand.
+pub fn lower_mir_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    body: &Body<'tcx>,
+    role: IrContractRole,
+) -> IrCapturedMir {
+    let dyn_metadata = compute_crate_dyn_metadata(tcx, def_id);
+    lower_mir_body_with_dyn_metadata(tcx, def_id, body, role, &dyn_metadata)
 }
 
 /// Collects all generic type parameters (`GenericParamDefKind::Type`) across
@@ -3314,17 +3333,34 @@ pub fn dyn_type_key<'tcx>(
 ///
 /// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/traits.rs#L76-L77
 ///
-/// Modeling choice: the rendering is the session-local `Debug` form of the
-/// erased predicates, compared only among descriptors of one capture session.
-fn dyn_predicate_key<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    preds: &'tcx rustc_middle::ty::List<rustc_middle::ty::PolyExistentialPredicate<'tcx>>,
+/// Modeling choice: rendered deterministically from the canonical `DefPath` of
+/// the principal trait, the lowered `RigidTy` generic arguments, and the sorted
+/// `(assoc_def_path, lowered_ty)` projection bindings (avoiding unstable `Debug`
+/// crate disambiguators). For a simple principal trait with no generic arguments
+/// or projection bindings, this equals the principal's canonical `DefPath`.
+fn dyn_predicate_key_canonical(
+    principal_trait: &Option<String>,
+    type_args: &[crate::lean_emit::IrRigidTy],
+    assoc_bindings: &[(String, crate::lean_emit::IrRigidTy)],
 ) -> String {
-    let parts: Vec<String> = preds
-        .without_auto_traits()
-        .map(|p| format!("{:?}", tcx.erase_and_anonymize_regions(p.skip_binder())))
-        .collect();
-    parts.join(" + ")
+    match principal_trait {
+        Some(p) if type_args.is_empty() && assoc_bindings.is_empty() => p.clone(),
+        Some(p) => {
+            let mut parts = vec![p.clone()];
+            if !type_args.is_empty() {
+                let args: Vec<String> = type_args
+                    .iter()
+                    .map(crate::lean_emit::render_rigid_ty_pub)
+                    .collect();
+                parts.push(format!("<{}>", args.join(", ")));
+            }
+            for (k, v) in assoc_bindings {
+                parts.push(format!("{k}={}", crate::lean_emit::render_rigid_ty_pub(v)));
+            }
+            parts.join(" + ")
+        }
+        None => String::new(),
+    }
 }
 
 /// Returns the `(source pointee, target pointee)` pair of an `Unsize`
@@ -3435,21 +3471,122 @@ pub fn vtable_method_callees<'tcx>(
     concrete: Ty<'tcx>,
     dyn_ty: Ty<'tcx>,
 ) -> Vec<(DefId, Option<rustc_middle::ty::GenericArgsRef<'tcx>>)> {
-    let TyKind::Dynamic(preds, _) = *dyn_ty.kind() else {
+    let TyKind::Dynamic(preds, region) = *dyn_ty.kind() else {
         return Vec::new();
     };
     if !is_vtable_monomorphic(concrete) || !is_vtable_monomorphic(dyn_ty) {
         return Vec::new();
     }
-    vtable_entries_for(tcx, concrete, preds)
-        .into_iter()
-        .filter_map(|e| match e {
-            rustc_middle::ty::VtblEntry::Method(instance) => {
-                Some((instance.def_id(), Some(tcx.erase_and_anonymize_regions(instance.args))))
+    let mut out = Vec::new();
+    let mut visited_keys: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<(&'tcx rustc_middle::ty::List<rustc_middle::ty::PolyExistentialPredicate<'tcx>>, Ty<'tcx>)> =
+        vec![(preds, dyn_ty)];
+    while let Some((cur_preds, cur_dyn_ty)) = stack.pop() {
+        let key = dyn_type_key(tcx, cur_dyn_ty, cur_preds);
+        if !visited_keys.insert(key) {
+            continue;
+        }
+        for e in vtable_entries_for(tcx, concrete, cur_preds) {
+            match e {
+                rustc_middle::ty::VtblEntry::Method(instance) => {
+                    out.push((
+                        instance.def_id(),
+                        Some(tcx.erase_and_anonymize_regions(instance.args)),
+                    ));
+                }
+                rustc_middle::ty::VtblEntry::TraitVPtr(trait_ref) => {
+                    let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref);
+                    let sup_preds = tcx.mk_poly_existential_predicates(&[
+                        rustc_middle::ty::Binder::dummy(
+                            rustc_middle::ty::ExistentialPredicate::Trait(ex),
+                        ),
+                    ]);
+                    let sup_ty = Ty::new_dynamic(tcx, sup_preds, region);
+                    if is_vtable_monomorphic(sup_ty) {
+                        stack.push((sup_preds, sup_ty));
+                    }
+                }
+                _ => {}
             }
-            _ => None,
-        })
-        .collect()
+        }
+    }
+    out
+}
+
+/// Computes the primary supertrait `dyn Super` type whose vtable forms the
+/// prefix of `(concrete, dyn_ty)`'s vtable (if `dyn_ty`'s principal trait has
+/// a primary supertrait).
+///
+/// `rustc` (`compiler/rustc_middle/src/ty/vtable.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) emits `TraitVPtr` only for
+/// non-primary supertraits that have a separate vtable:
+///
+/// > ```text
+/// > /// pointer to a separate supertrait vtable, can be used by trait upcasting coercion
+/// > TraitVPtr(TraitRef<'tcx>),
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L24-L25
+///
+/// Modeling choice: we inspect `tcx.explicit_super_predicates_of(sub_def_id)`
+/// instantiated with `sub_trait_ref.args`, filtering to dyn-compatible non-auto
+/// supertraits that are NOT emitted as `VtblEntry::TraitVPtr` and whose
+/// `tcx.vtable_entries` form an exact prefix of `sub_entries`. Because only
+/// explicit supertraits are considered, unrelated 0-method marker traits are
+/// never selected (Condition `C2`).
+fn primary_super_ty_for<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    concrete: Ty<'tcx>,
+    dyn_ty: Ty<'tcx>,
+) -> Option<Ty<'tcx>> {
+    let TyKind::Dynamic(preds, region) = *dyn_ty.kind() else {
+        return None;
+    };
+    let principal = preds.principal()?;
+    let sub_trait_ref = tcx.erase_and_anonymize_regions(
+        tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, concrete)),
+    );
+    let sub_entries = tcx.vtable_entries(sub_trait_ref);
+    let mut vptr_supers = Vec::new();
+    for e in sub_entries.iter() {
+        if let rustc_middle::ty::VtblEntry::TraitVPtr(tr) = *e {
+            vptr_supers.push(tcx.erase_and_anonymize_regions(tr));
+        }
+    }
+    for unnorm in tcx
+        .explicit_super_predicates_of(sub_trait_ref.def_id)
+        .iter_instantiated_copied(tcx, sub_trait_ref.args)
+    {
+        let (clause, _) = unnorm.skip_norm_wip();
+        let rustc_middle::ty::ClauseKind::Trait(tr_pred) = clause.kind().skip_binder() else {
+            continue;
+        };
+        let sup_ref = tcx.erase_and_anonymize_regions(tr_pred.trait_ref);
+        if sup_ref.def_id == sub_trait_ref.def_id
+            || tcx.trait_is_auto(sup_ref.def_id)
+            || !tcx.is_dyn_compatible(sup_ref.def_id)
+            || sup_ref.self_ty() != concrete
+            || !is_vtable_monomorphic(sup_ref.self_ty())
+        {
+            continue;
+        }
+        if vptr_supers.iter().any(|&v| v == sup_ref) {
+            continue;
+        }
+        let sup_entries = tcx.vtable_entries(sup_ref);
+        if sub_entries.len() >= sup_entries.len() && &sub_entries[..sup_entries.len()] == sup_entries
+        {
+            let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, sup_ref);
+            let sup_preds = tcx.mk_poly_existential_predicates(&[
+                rustc_middle::ty::Binder::dummy(rustc_middle::ty::ExistentialPredicate::Trait(ex)),
+            ]);
+            let sup_ty = Ty::new_dynamic(tcx, sup_preds, region);
+            if is_vtable_monomorphic(sup_ty) {
+                return Some(sup_ty);
+            }
+        }
+    }
+    None
 }
 
 /// Every `(concrete, dyn)` pair reachable from `Rvalue::Cast(Unsize)` in
@@ -3648,7 +3785,7 @@ pub fn compute_crate_dyn_metadata<'tcx>(
         collect_body_vtable_allocs(tcx, body, &mut concrete_pairs);
         collect_body_virtual_calls(tcx, def_id, body, &mut virtual_calls);
     }
-    if concrete_pairs.is_empty() && virtual_calls.is_empty() {
+    if concrete_pairs.is_empty() && upcast_pairs.is_empty() && virtual_calls.is_empty() {
         return IrDynMetadata::default();
     }
 
@@ -3684,6 +3821,9 @@ pub fn compute_crate_dyn_metadata<'tcx>(
             if sub == dyn_ty {
                 queue.push((concrete, sup));
             }
+        }
+        if let Some(sup_ty) = primary_super_ty_for(tcx, concrete, dyn_ty) {
+            queue.push((concrete, sup_ty));
         }
         if let TyKind::Dynamic(preds, region) = *dyn_ty.kind() {
             for entry in vtable_entries_for(tcx, concrete, preds) {
@@ -3723,7 +3863,7 @@ pub fn compute_crate_dyn_metadata<'tcx>(
             preds.auto_traits().map(|d| canonical_def_path(tcx, d)).collect();
         auto_traits.sort();
         auto_traits.dedup();
-        let type_args = principal
+        let type_args: Vec<crate::lean_emit::IrRigidTy> = principal
             .map(|p| p.skip_binder().args.types().map(|t| ctx.lower_rigid_ty(t)).collect())
             .unwrap_or_default();
         let mut assoc_bindings: Vec<(String, crate::lean_emit::IrRigidTy)> = preds
@@ -3731,22 +3871,29 @@ pub fn compute_crate_dyn_metadata<'tcx>(
             .filter_map(|p| {
                 let p = p.skip_binder();
                 let t = p.term.as_type()?;
-                Some((format!("{:?}", p.def_id), ctx.lower_rigid_ty(t)))
+                Some((canonical_def_path(tcx, p.def_id), ctx.lower_rigid_ty(t)))
             })
             .collect();
         assoc_bindings.sort_by(|a, b| a.0.cmp(&b.0));
+        let principal_trait = preds.principal_def_id().map(|d| canonical_def_path(tcx, d));
+        let predicate_key =
+            dyn_predicate_key_canonical(&principal_trait, &type_args, &assoc_bindings);
+        let has_unresolved_existential_binder =
+            preds.iter().any(|p| !p.bound_vars().is_empty()) || preds.has_escaping_bound_vars();
+        let supertrait_outlives_ok = !has_unresolved_existential_binder
+            && !dyn_ty.has_escaping_bound_vars()
+            && !dyn_ty.has_non_region_param();
         dyn_types.insert(
             key.clone(),
             IrDynType {
                 dyn_key: key,
-                predicate_key: dyn_predicate_key(tcx, preds),
-                principal_trait: preds.principal_def_id().map(|d| canonical_def_path(tcx, d)),
+                predicate_key,
+                principal_trait,
                 type_args,
                 assoc_bindings,
                 auto_traits,
-                has_unresolved_existential_binder: preds.iter().any(|p| !p.bound_vars().is_empty())
-                    || preds.has_escaping_bound_vars(),
-                supertrait_outlives_ok: true,
+                has_unresolved_existential_binder,
+                supertrait_outlives_ok,
             },
         );
     };
@@ -3794,6 +3941,14 @@ pub fn compute_crate_dyn_metadata<'tcx>(
                 }
             })
             .collect();
+        let primary_super_vtable_id = primary_super_ty_for(tcx, *concrete, *dyn_ty).and_then(
+            |sup_ty| {
+                let sup_key = dyn_key_of(sup_ty)?;
+                let conc = render_ty(&mut ctx, *concrete);
+                let &sup_id = id_of.get(&(sup_key, conc))?;
+                (sup_id != idx as u64).then_some(sup_id)
+            },
+        );
         vtables.push(IrVTable {
             vtable_id: idx as u64,
             vtable_alloc_id: VTABLE_ALLOC_BASE + idx as u64,
@@ -3802,7 +3957,7 @@ pub fn compute_crate_dyn_metadata<'tcx>(
             size_bytes: layout.size.bytes(),
             align_bytes: layout.align.abi.bytes(),
             is_uninhabited: layout.uninhabited,
-            primary_super_vtable_id: None,
+            primary_super_vtable_id,
             slots,
         });
     }
@@ -3831,29 +3986,5 @@ pub fn compute_crate_dyn_metadata<'tcx>(
         dyn_types: dyn_types.into_values().collect(),
         vtables,
         virtual_methods,
-    }
-}
-
-thread_local! {
-    /// Identity of the capture session whose metadata is currently published
-    /// through `lean_emit::set_session_dyn_metadata`.
-    static DYN_METADATA_SESSION: std::cell::RefCell<Option<(usize, String, u64)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Ensures the crate-level `dyn` metadata of the session owning `tcx` has been
-/// computed and published for `lean_emit` (once per session); `anchor_def_id`
-/// is any item with generics (the body being lowered).
-pub fn ensure_session_dyn_metadata(tcx: TyCtxt<'_>, anchor_def_id: DefId) {
-    let key = (
-        tcx.sess as *const _ as usize,
-        tcx.crate_name(LOCAL_CRATE).as_str().to_owned(),
-        tcx.stable_crate_id(LOCAL_CRATE).as_u64(),
-    );
-    let fresh = DYN_METADATA_SESSION.with(|cell| cell.borrow().as_ref() != Some(&key));
-    if fresh {
-        let md = compute_crate_dyn_metadata(tcx, anchor_def_id);
-        crate::lean_emit::set_session_dyn_metadata(md);
-        DYN_METADATA_SESSION.with(|cell| *cell.borrow_mut() = Some(key));
     }
 }

@@ -2884,13 +2884,6 @@ vtable pointer is validated by `checkDynVTablePtr` against `K` (invalid →
 `.ub`, unavailable environment → `.unsupported`), and the captured layout must
 be well-formed (`wfVTableEntry`, part of `vtableEnvOk`). The result is
 `entry.sizeBytes` / `entry.alignBytes` as a `usize`.
-
-Reachability (Episode 1 status): not yet wired into the `.sizeOfVal` /
-`.alignOfVal` arms of `evalNonSelectIntrinsicCall`, which keep returning
-`.unsupported` for `dyn` pointees: the downstream theorem
-`evalNonSelectIntrinsicCall_cases` (`theory/Anneal/MirFuelFree.lean`) states
-that every intrinsic's outcome is independent of the machine state, whereas a
-vtable lookup reads the caller frames.
 -/
 def evalDynSizeAlignOfVal
     (s : MachineState)
@@ -3150,15 +3143,8 @@ def evalNonSelectIntrinsicCall
             writeIntrinsicScalarResult s locals' destination targetBb
               (evalSliceSizeOfVal 1 lenSc)
         | _ => MirStepNode.fail .ub
-      -- The size of a `dyn Trait` value is read from its vtable, which the
-      -- model does not track; malformed non-wide pointers still fault with `.ub`.
-      | .some (.dynamic _) =>
-        match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
-          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
-          | false => MirStepNode.fail .ub
-          | true => MirStepNode.unsupported
-        | _ => MirStepNode.fail .ub
+      | .some (.dynamic dynKey) =>
+        evalDynSizeAlignOfVal s bodyLayouts locals' destination targetBb ptrArgVal dynKey true
       | .some pointeeTy =>
         match ptrArgVal with
         | .ptr _ ptrSz =>
@@ -3221,15 +3207,8 @@ def evalNonSelectIntrinsicCall
               writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
             | .none => MirStepNode.fail .ub
         | _ => MirStepNode.fail .ub
-      -- The alignment of a `dyn Trait` value is read from its vtable, which the
-      -- model does not track; malformed non-wide pointers still fault with `.ub`.
-      | .some (.dynamic _) =>
-        match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
-          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
-          | false => MirStepNode.fail .ub
-          | true => MirStepNode.unsupported
-        | _ => MirStepNode.fail .ub
+      | .some (.dynamic dynKey) =>
+        evalDynSizeAlignOfVal s bodyLayouts locals' destination targetBb ptrArgVal dynKey false
       | .some pointeeTy =>
         match ptrArgVal with
         | .ptr _ ptrSz =>
@@ -4683,21 +4662,90 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
               s.memory.rootUnwindCeiling
               (externalTargetCanUnwind target (operandTy bodyLocalDecls bodyLayouts func)))
 
+/-- `core::mem::size_of_val` (re-exported as `std::mem::size_of_val`). -/
+@[reducible]
+def isMemSizeOfValDefPath (p : DefPath) : Bool :=
+  Bool.or (stringEq p "core::mem::size_of_val") (stringEq p "std::mem::size_of_val")
+
+/-- `core::mem::align_of_val` (re-exported as `std::mem::align_of_val`). -/
+@[reducible]
+def isMemAlignOfValDefPath (p : DefPath) : Bool :=
+  Bool.or (stringEq p "core::mem::align_of_val") (stringEq p "std::mem::align_of_val")
+
+/--
+Safe `core::mem::size_of_val` / `core::mem::align_of_val` on `&dyn K` when
+uninlined (Condition `C5`): validates the vtable pointer and safe-reference
+value validity *without* Tree Borrows permissions (`refDataValidNoTB`: live,
+non-null, aligned, inhabited, in-bounds — no TB read on `!Freeze` `&dyn Trait`),
+faulting `.ub` on `.uninit` operands or diverging call sites (`targetBbOpt = .none`).
+
+Reference (`core::mem::size_of_val`, Rust 1.98.0 standard library):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.size_of_val.html>
+
+> "Returns the size of the pointed-to value in bytes."
+-/
+def evalSafeDynSizeAlignOfValCall
+    (s : MachineState)
+    (currentBody : Option CapturedMir)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBbOpt : Option BasicBlockIdx)
+    (dynKey : DefPath)
+    (isSize : Bool) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match argVals with
+  | .aggregate 0 (dataVal :: metaVal :: .nil) :: .nil =>
+    match targetBbOpt with
+    | .none => MirStepNode.fail .ub
+    | .some targetBb =>
+      let mv := DynMemView.ofMemory s.memory
+      match checkDynVTablePtr currentBody mv ptrBytes metaVal dynKey with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok (entry, _, _) =>
+        match dynRefDataValid locals' mv bodyLocalDecls bodyLayouts ptrBytes dataVal entry false false with
+        | false => MirStepNode.fail .ub
+        | true =>
+          let res : Nat :=
+            match isSize with
+            | true => entry.sizeBytes
+            | false => entry.alignBytes
+          writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨res, ptrBytes⟩)
+  | _ => MirStepNode.fail .ub
+
 /-- `core::ptr::addr_eq` (re-exported as `std::ptr::addr_eq`). -/
 @[reducible]
 def isAddrEqDefPath (p : DefPath) : Bool :=
   Bool.or (stringEq p "core::ptr::addr_eq") (stringEq p "std::ptr::addr_eq")
 
-/-- Data (address) word of a thin or wide raw-pointer argument value. -/
+/-- `true` iff `v` is a `ptrBytes`-wide initialized pointer or scalar word. -/
 @[reducible]
-def ptrArgDataWord? : Value → Option Value
-  | .ptr p sz => .some (.ptr p sz)
-  | .scalar sc => .some (.scalar sc)
-  | .aggregate 0 (dataVal :: _ :: .nil) =>
-    match dataVal with
-    | .ptr _ _ => .some dataVal
-    | .scalar _ => .some dataVal
-    | _ => .none
+def isPtrSizedWord (ptrBytes : Nat) : Value → Bool
+  | .ptr _ sz => Nat.beq sz ptrBytes
+  | .scalar sc => Nat.beq sc.sizeBytes ptrBytes
+  | _ => false
+
+/-- Data (address) word of a thin or wide raw-pointer argument value of pointer
+width `ptrBytes`, rejecting uninitialized or mis-sized data or metadata words
+(`kani#5172`). -/
+@[reducible]
+def ptrArgDataWord? (ptrBytes : Nat) : Value → Option Value
+  | .ptr p sz =>
+    match Nat.beq sz ptrBytes with
+    | true => .some (.ptr p sz)
+    | false => .none
+  | .scalar sc =>
+    match Nat.beq sc.sizeBytes ptrBytes with
+    | true => .some (.scalar sc)
+    | false => .none
+  | .aggregate 0 (dataVal :: metaVal :: .nil) =>
+    match Bool.and (isPtrSizedWord ptrBytes dataVal) (isPtrSizedWord ptrBytes metaVal) with
+    | true => .some dataVal
+    | false => .none
   | _ => .none
 
 /--
@@ -4744,7 +4792,7 @@ def evalAddrEqCall
   let ptrBytes := layoutPointerBytes bodyLayouts
   match argVals with
   | pVal :: qVal :: .nil =>
-    match ptrArgDataWord? pVal, ptrArgDataWord? qVal with
+    match ptrArgDataWord? ptrBytes pVal, ptrArgDataWord? ptrBytes qVal with
     | .some pw, .some qw =>
       match targetBbOpt with
       | .none => MirStepNode.fail .ub
@@ -5066,7 +5114,7 @@ def evalVirtualCall
       match classifyDynReceiver? recvTy.kind with
       | .none => MirStepNode.unsupported
       | .some (kind, recvKey) =>
-        match stringEq recvKey vm.dynKey with
+        match dynKeysCompatible (collectMemoryDynTypes currentBody s.memory) recvKey vm.dynKey with
         | false => MirStepNode.unsupported
         | true =>
           match unpackDynReceiver? kind recvVal with
@@ -5137,25 +5185,19 @@ def evalVirtualCall
 
 /--
 `dyn`-aware handling of a direct call that has no linked body
-(`lookupCallee = .none`): `core::ptr::addr_eq` (`evalAddrEqCall`) and calls
-whose `(target.defPath, Self = dyn K)` has a captured `InstanceKind::Virtual`
-record (`evalVirtualCall`). Every other call returns `.none` and keeps the
-pre-existing semantics (intrinsics, panics, external calls).
+(`lookupCallee = .none`): `core::ptr::addr_eq` (`evalAddrEqCall`), uninlined
+safe `core::mem::{size_of_val, align_of_val}` on `&dyn K`
+(`evalSafeDynSizeAlignOfValCall`), and calls whose `(target.defPath, Self = dyn K)`
+has a captured `InstanceKind::Virtual` record (`evalVirtualCall`). Every other
+call returns `.none` and keeps the pre-existing semantics (intrinsics, panics,
+external calls).
 
 Justification: a call is dispatched through the vtable exactly when rustc
 resolved it to `InstanceKind::Virtual` (see `CapturedVirtualMethod`); the
-`Self` type of a trait method call is its first generic argument.
-
-Reachability (Episode 1 status): this hook is intended to run in
-`evalTerminator`'s `.call` arms when `lookupCallee` finds no linked body, before
-the intrinsic / external-call fallbacks. It is **not yet wired**: the
-downstream characterization theorems
-`Anneal.Rustc.V2026_06_01.evalTerminatorSymTree_call_extCall` and
-`evalTerminatorSymTree_diverging_extCall` (`theory/Anneal/Rustc/V2026_06_01/SymbolicEval.lean`)
-state that every unlinked, non-intrinsic direct call is a `MirCallE` external
-call, which a vtable dispatch necessarily contradicts. Until those theorems
-gain the hypothesis `evalDynCallHook? .. = .none`, virtual calls keep the
-pre-existing external-call semantics (on the trait method's `DefPath`).
+`Self` type of a trait method call is its first generic argument. Wired into
+both normal and diverging `.call` arms of `evalTerminator` (and
+`evalCallTerminator`) after `lookupCallee` / intrinsic / panic resolution and
+before falling back to `MirStepNode.extCall`.
 -/
 def evalDynCallHook?
     (s : MachineState)
@@ -5177,18 +5219,36 @@ def evalDynCallHook?
     | true =>
       .some (evalAddrEqCall s bodyLocalDecls bodyLayouts argVals locals' destination targetBbOpt)
     | false =>
-      match target.typeArgs with
-      | .dynamic dynKey :: _ =>
-        match
-          lookupVirtualMethod (collectMemoryVirtualMethods currentBody s.memory) target.defPath
-            dynKey
-        with
-        | .some vm =>
+      match isMemSizeOfValDefPath target.defPath with
+      | true =>
+        match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+        | .some (.dynamic dynKey) =>
           .some
-            (evalVirtualCall s currentBody vm bodyLocalDecls bodyLayouts argOps argVals locals'
-              destination targetBbOpt unwind)
-        | .none => .none
-      | _ => .none
+            (evalSafeDynSizeAlignOfValCall s currentBody bodyLocalDecls bodyLayouts argVals locals'
+              destination targetBbOpt dynKey true)
+        | _ => .none
+      | false =>
+        match isMemAlignOfValDefPath target.defPath with
+        | true =>
+          match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+          | .some (.dynamic dynKey) =>
+            .some
+              (evalSafeDynSizeAlignOfValCall s currentBody bodyLocalDecls bodyLayouts argVals locals'
+                destination targetBbOpt dynKey false)
+          | _ => .none
+        | false =>
+          match target.typeArgs with
+          | .dynamic dynKey :: _ =>
+            match
+              lookupVirtualMethod (collectMemoryVirtualMethods currentBody s.memory) target.defPath
+                dynKey
+            with
+            | .some vm =>
+              .some
+                (evalVirtualCall s currentBody vm bodyLocalDecls bodyLayouts argOps argVals locals'
+                  destination targetBbOpt unwind)
+            | .none => .none
+          | _ => .none
 
 /--
 Evaluate basic-block `Terminator` `term` in `s`, producing the next
@@ -5670,9 +5730,15 @@ def evalTerminator
               with
               | .some stepNode => stepNode
               | .none =>
-                MirStepNode.extCall
-                  { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                  (resumeExternalCall s locals' destination targetBb unwind)
+                match
+                  evalDynCallHook? s currentBody target bodyLocalDecls bodyLayouts argOps argVals
+                    locals' destination (.some targetBb) unwind
+                with
+                | .some stepNode => stepNode
+                | .none =>
+                  MirStepNode.extCall
+                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                    (resumeExternalCall s locals' destination targetBb unwind)
   -- Diverging call (`target == Option.none`, return type `!`):
   | .call func argOps destination .none unwind =>
     let bodyLocalDecls := bodyLocalDeclsOf currentBody
@@ -5744,9 +5810,15 @@ def evalTerminator
                   | .halted out => MirStepNode.retOutcome out
                   | .faulted fk => MirStepNode.fail fk
                 | false =>
-                  MirStepNode.extCall
-                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                    (resumeExternalDivergingCall s locals' unwind)
+                  match
+                    evalDynCallHook? s currentBody target bodyLocalDecls bodyLayouts argOps argVals
+                      locals' destination .none unwind
+                  with
+                  | .some stepNode => stepNode
+                  | .none =>
+                    MirStepNode.extCall
+                      { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                      (resumeExternalDivergingCall s locals' unwind)
           | true =>
             MirStepNode.extCall
               { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }

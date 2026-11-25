@@ -30,8 +30,8 @@ use crate::manifest::{
 };
 use crate::rustc_2026_06_01::mir_lower::{
     CrateContractIndex, ItemClassification, canonical_def_path, collect_referenced_callees,
-    def_id_sort_key, lower_mir_body, query_post_cleanup_mir, should_capture_mir_item,
-    should_capture_non_local_callee,
+    compute_crate_dyn_metadata, def_id_sort_key, lower_mir_body_with_dyn_metadata,
+    query_post_cleanup_mir, should_capture_mir_item, should_capture_non_local_callee,
 };
 
 /// Default pass-through callbacks used when `anneal-rustc-capture` is invoked
@@ -337,6 +337,10 @@ fn capture_crate_unit<'tcx>(
     }
 
     let crate_pascal = to_pascal_case(&crate_name);
+    let dyn_metadata = candidates
+        .first()
+        .map(|c| compute_crate_dyn_metadata(tcx, c.local_def_id.to_def_id()))
+        .unwrap_or_default();
     let mut unit_targets = Vec::with_capacity(candidates.len());
     let mut emitted_non_local: BTreeSet<(u32, u32)> = BTreeSet::new();
     let mut visited_worklist_substs: BTreeMap<
@@ -376,11 +380,12 @@ fn capture_crate_unit<'tcx>(
             }
         }
 
-        let mut ir_captured = lower_mir_body(
+        let mut ir_captured = lower_mir_body_with_dyn_metadata(
             tcx,
             def_id,
             body,
             candidate.classification.contract_role.clone(),
+            &dyn_metadata,
         );
         ir_captured.def_path = candidate.def_path.clone();
         for ti in &mut ir_captured.trait_impls {
@@ -481,7 +486,13 @@ fn capture_crate_unit<'tcx>(
                 .or_default();
             let item_stem = disambiguate_identifier(&raw_stem, crate_used_stems, crate_next_suffix);
 
-            let mut ir_captured = lower_mir_body(tcx, callee_def_id, body, IrContractRole::Subject);
+            let mut ir_captured = lower_mir_body_with_dyn_metadata(
+                tcx,
+                callee_def_id,
+                body,
+                IrContractRole::Subject,
+                &dyn_metadata,
+            );
             ir_captured.def_path = def_path.clone();
             for ti in &mut ir_captured.trait_impls {
                 ti.impl_path = def_path.clone();

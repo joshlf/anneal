@@ -1700,7 +1700,12 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
             args := argVals
             memory := m }
           (.panicked panicMem) →
-        panicMem.callStack = []) :
+        panicMem.callStack = [])
+    (h_not_dyn_hook :
+      isAddrEqDefPath defPath = false ∧
+      isMemSizeOfValDefPath defPath = false ∧
+      isMemAlignOfValDefPath defPath = false ∧
+      notDynFirstTypeArg typeArgs = true := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
@@ -1758,6 +1763,22 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
       dsimp only
       have h_not_unw : isUnwindingPanicDefPath defPath = false := h_not_unwind
       rw [h_not_unw]
+      dsimp only
+      have h_dh :
+          evalDynCallHook? { frame := { blockIdx := ps.bb, stmtIdx := ps.stmtIdx, locals := ps.env }, memory := m }
+            (some body)
+            { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+            body.localDecls body.layouts argOps vals env' destination .none unwind = none := by
+        rcases h_not_dyn_hook with ⟨h1, h2, h3, h4⟩
+        unfold evalDynCallHook?
+        dsimp only
+        rw [h1, h2, h3]
+        cases h_ta : typeArgs with
+        | nil => rfl
+        | cons t ts =>
+          rw [h_ta] at h4
+          cases t <;> simp at h4 ⊢ <;> rfl
+      rw [h_dh]
       dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP, MirCallContract.toCallContract]
       rcases h_sub _ (h_contract_pre m hm) with ⟨h_cpre, h_cpost_imp⟩
       refine ⟨h_cpre, fun ans hp_sup => ?_⟩

@@ -35,13 +35,13 @@ use std::str::FromStr;
 use anneal_rustc_capture::lean_emit::{
     IrAbiPassMode, IrAggregateKind, IrAlign, IrArgAbi, IrBackendRepr, IrBasicBlockData, IrBinOp,
     IrBorrowKind, IrCallConv, IrCapturedAllocation, IrCapturedMir, IrCastKind, IrConstOperand,
-    IrConstScalar, IrConstValue, IrContractRole, IrFieldsShape, IrFloatTy, IrFnAbi,
+    IrConstScalar, IrConstValue, IrContractRole, IrDynType, IrFieldsShape, IrFloatTy, IrFnAbi,
     IrGenericParamDef, IrIntTy, IrLayoutTable, IrLocalDecl, IrMirPhaseTag, IrMutability,
     IrNonDivergingIntrinsic, IrNullOp, IrOperand, IrPlace, IrPrimitiveKind, IrProjectionElem,
     IrProvenancePtr, IrRetagKind, IrRigidTy, IrRvalue, IrSafety, IrScalarInt, IrScalarLayout,
     IrSize, IrStatement, IrStatementKind, IrSwitchTargets, IrTerminator, IrTerminatorKind,
-    IrTraitImplEntry, IrTraitRef, IrTy, IrTypeLayout, IrUintTy, IrUnOp, IrUnwindAction,
-    IrVariantsShape, IrWrappingRange,
+    IrTraitImplEntry, IrTraitRef, IrTy, IrTypeLayout, IrUintTy, IrUnOp, IrUnwindAction, IrVTable,
+    IrVTableSlot, IrVariantsShape, IrVirtualMethod, IrWrappingRange,
 };
 
 use crate::obligations::{AuthoredItemModules, SubjectObligationBundle};
@@ -5677,6 +5677,210 @@ impl<'a> LeanMirParser<'a> {
         })
     }
 
+    fn parse_assoc_binding(&mut self) -> Result<(String, IrRigidTy), CensusError> {
+        self.expect_tok(&MirTok::LParen, "CapturedDynType.assocBindings entry")?;
+        let name = self.expect_str("CapturedDynType.assocBindings name")?;
+        self.expect_tok(&MirTok::Comma, "CapturedDynType.assocBindings comma")?;
+        let ty = self.parse_rigid_ty()?;
+        self.expect_tok(&MirTok::RParen, "CapturedDynType.assocBindings rparen")?;
+        Ok((name, ty))
+    }
+
+    fn parse_dyn_type(&mut self) -> Result<IrDynType, CensusError> {
+        let mut dyn_key = None;
+        let mut predicate_key = String::new();
+        let mut principal_trait = None;
+        let mut type_args = Vec::new();
+        let mut assoc_bindings = Vec::new();
+        let mut auto_traits = Vec::new();
+        let mut has_unresolved_existential_binder = false;
+        let mut supertrait_outlives_ok = true;
+        self.parse_struct_fields("CapturedDynType", |p, f| match f {
+            "dynKey" => {
+                dyn_key = Some(p.expect_str("CapturedDynType.dynKey")?);
+                Ok(())
+            }
+            "predicateKey" => {
+                predicate_key = p.expect_str("CapturedDynType.predicateKey")?;
+                Ok(())
+            }
+            "principalTrait?" => {
+                principal_trait =
+                    p.parse_option("CapturedDynType.principalTrait?", |p2| {
+                        p2.expect_str("CapturedDynType.principalTrait? value")
+                    })?;
+                Ok(())
+            }
+            "typeArgs" => {
+                type_args = p.parse_list("CapturedDynType.typeArgs", Self::parse_rigid_ty)?;
+                Ok(())
+            }
+            "assocBindings" => {
+                assoc_bindings =
+                    p.parse_list("CapturedDynType.assocBindings", Self::parse_assoc_binding)?;
+                Ok(())
+            }
+            "autoTraits" => {
+                auto_traits = p.parse_list("CapturedDynType.autoTraits", |p2| {
+                    p2.expect_str("CapturedDynType.autoTraits elem")
+                })?;
+                Ok(())
+            }
+            "hasUnresolvedExistentialBinder" => {
+                has_unresolved_existential_binder =
+                    p.parse_bool("CapturedDynType.hasUnresolvedExistentialBinder")?;
+                Ok(())
+            }
+            "supertraitOutlivesOk" => {
+                supertrait_outlives_ok = p.parse_bool("CapturedDynType.supertraitOutlivesOk")?;
+                Ok(())
+            }
+            other => Err(CensusError::new(format!(
+                "unknown CapturedDynType field `{other}`"
+            ))),
+        })?;
+        Ok(IrDynType {
+            dyn_key: dyn_key.ok_or_else(|| CensusError::new("CapturedDynType missing `dynKey`"))?,
+            predicate_key,
+            principal_trait,
+            type_args,
+            assoc_bindings,
+            auto_traits,
+            has_unresolved_existential_binder,
+            supertrait_outlives_ok,
+        })
+    }
+
+    fn parse_vtable_slot(&mut self) -> Result<IrVTableSlot, CensusError> {
+        self.parse_paren_or_bare(|p| {
+            let head = p.expect_ident("CapturedVTableSlot")?;
+            match ctor_leaf(head, Some("CapturedVTableSlot"))? {
+                "dropInPlace" => {
+                    let drop_fn = p.parse_option("CapturedVTableSlot.dropInPlace", |p2| {
+                        p2.expect_str("CapturedVTableSlot.dropInPlace fn")
+                    })?;
+                    Ok(IrVTableSlot::DropInPlace(drop_fn))
+                }
+                "size" => Ok(IrVTableSlot::Size),
+                "align" => Ok(IrVTableSlot::Align),
+                "vacant" => Ok(IrVTableSlot::Vacant),
+                "method" => {
+                    let def_path = p.expect_str("CapturedVTableSlot.method defPath")?;
+                    let args = p.parse_list("CapturedVTableSlot.method args", Self::parse_rigid_ty)?;
+                    Ok(IrVTableSlot::Method(def_path, args))
+                }
+                "traitVPtr" => {
+                    let id = p.expect_u64("CapturedVTableSlot.traitVPtr id")?;
+                    Ok(IrVTableSlot::TraitVPtr(id))
+                }
+                other => Err(CensusError::new(format!(
+                    "unknown CapturedVTableSlot constructor `{other}`"
+                ))),
+            }
+        })
+    }
+
+    fn parse_vtable(&mut self) -> Result<IrVTable, CensusError> {
+        let mut vtable_id = None;
+        let mut vtable_alloc_id = None;
+        let mut concrete_ty = None;
+        let mut dyn_key = None;
+        let mut size_bytes = 0u64;
+        let mut align_bytes = 1u64;
+        let mut is_uninhabited = false;
+        let mut primary_super_vtable_id = None;
+        let mut slots = Vec::new();
+        self.parse_struct_fields("CapturedVTable", |p, f| match f {
+            "vtableId" => {
+                vtable_id = Some(p.expect_u64("CapturedVTable.vtableId")?);
+                Ok(())
+            }
+            "vtableAllocId" => {
+                vtable_alloc_id = Some(p.expect_u64("CapturedVTable.vtableAllocId")?);
+                Ok(())
+            }
+            "concreteTy" => {
+                concrete_ty = Some(p.parse_rigid_ty()?);
+                Ok(())
+            }
+            "dynKey" => {
+                dyn_key = Some(p.expect_str("CapturedVTable.dynKey")?);
+                Ok(())
+            }
+            "sizeBytes" => {
+                size_bytes = p.expect_u64("CapturedVTable.sizeBytes")?;
+                Ok(())
+            }
+            "alignBytes" => {
+                align_bytes = p.expect_u64("CapturedVTable.alignBytes")?;
+                Ok(())
+            }
+            "isUninhabited" => {
+                is_uninhabited = p.parse_bool("CapturedVTable.isUninhabited")?;
+                Ok(())
+            }
+            "primarySuperVTableId?" => {
+                primary_super_vtable_id =
+                    p.parse_option("CapturedVTable.primarySuperVTableId?", |p2| {
+                        p2.expect_u64("CapturedVTable.primarySuperVTableId? value")
+                    })?;
+                Ok(())
+            }
+            "slots" => {
+                slots = p.parse_list("CapturedVTable.slots", Self::parse_vtable_slot)?;
+                Ok(())
+            }
+            other => Err(CensusError::new(format!(
+                "unknown CapturedVTable field `{other}`"
+            ))),
+        })?;
+        Ok(IrVTable {
+            vtable_id: vtable_id
+                .ok_or_else(|| CensusError::new("CapturedVTable missing `vtableId`"))?,
+            vtable_alloc_id: vtable_alloc_id
+                .ok_or_else(|| CensusError::new("CapturedVTable missing `vtableAllocId`"))?,
+            concrete_ty: concrete_ty
+                .ok_or_else(|| CensusError::new("CapturedVTable missing `concreteTy`"))?,
+            dyn_key: dyn_key.ok_or_else(|| CensusError::new("CapturedVTable missing `dynKey`"))?,
+            size_bytes,
+            align_bytes,
+            is_uninhabited,
+            primary_super_vtable_id,
+            slots,
+        })
+    }
+
+    fn parse_virtual_method(&mut self) -> Result<IrVirtualMethod, CensusError> {
+        let mut method_def_path = None;
+        let mut dyn_key = None;
+        let mut slot_idx = None;
+        self.parse_struct_fields("CapturedVirtualMethod", |p, f| match f {
+            "methodDefPath" => {
+                method_def_path = Some(p.expect_str("CapturedVirtualMethod.methodDefPath")?);
+                Ok(())
+            }
+            "dynKey" => {
+                dyn_key = Some(p.expect_str("CapturedVirtualMethod.dynKey")?);
+                Ok(())
+            }
+            "slotIdx" => {
+                slot_idx = Some(p.expect_u64("CapturedVirtualMethod.slotIdx")?);
+                Ok(())
+            }
+            other => Err(CensusError::new(format!(
+                "unknown CapturedVirtualMethod field `{other}`"
+            ))),
+        })?;
+        Ok(IrVirtualMethod {
+            method_def_path: method_def_path
+                .ok_or_else(|| CensusError::new("CapturedVirtualMethod missing `methodDefPath`"))?,
+            dyn_key: dyn_key
+                .ok_or_else(|| CensusError::new("CapturedVirtualMethod missing `dynKey`"))?,
+            slot_idx: slot_idx
+                .ok_or_else(|| CensusError::new("CapturedVirtualMethod missing `slotIdx`"))?,
+        })
+    }
+
     fn parse_captured_mir(
         &mut self,
         module_layouts: Option<&IrLayoutTable>,
@@ -5713,6 +5917,9 @@ impl<'a> LeanMirParser<'a> {
             entries: Vec::new(),
         });
         let mut allocations = Vec::new();
+        let mut dyn_types = Vec::new();
+        let mut vtables = Vec::new();
+        let mut virtual_methods = Vec::new();
 
         self.parse_struct_fields("CapturedMir", |p, f| match f {
             "defPath" => {
@@ -5784,6 +5991,19 @@ impl<'a> LeanMirParser<'a> {
                 )?;
                 Ok(())
             }
+            "dynTypes" => {
+                dyn_types = p.parse_list("CapturedMir.dynTypes", Self::parse_dyn_type)?;
+                Ok(())
+            }
+            "vtables" => {
+                vtables = p.parse_list("CapturedMir.vtables", Self::parse_vtable)?;
+                Ok(())
+            }
+            "virtualMethods" => {
+                virtual_methods =
+                    p.parse_list("CapturedMir.virtualMethods", Self::parse_virtual_method)?;
+                Ok(())
+            }
             other => Err(CensusError::new(format!(
                 "unknown CapturedMir field `{other}`"
             ))),
@@ -5807,6 +6027,9 @@ impl<'a> LeanMirParser<'a> {
             fn_abi,
             layouts,
             allocations,
+            dyn_types,
+            vtables,
+            virtual_methods,
         })
     }
 }
@@ -6194,6 +6417,9 @@ fn build_probe_mir_body(probe: FalseProofMutationProbe) -> IrCapturedMir {
             },
             layouts,
             allocations: Vec::new(),
+            dyn_types: Vec::new(),
+            vtables: Vec::new(),
+            virtual_methods: Vec::new(),
         },
         FalseProofMutationProbe::SwitchBreakStripProbe => IrCapturedMir {
             def_path: String::from("probes::switch_break_strip"),
@@ -6305,6 +6531,9 @@ fn build_probe_mir_body(probe: FalseProofMutationProbe) -> IrCapturedMir {
             },
             layouts,
             allocations: Vec::new(),
+            dyn_types: Vec::new(),
+            vtables: Vec::new(),
+            virtual_methods: Vec::new(),
         },
         FalseProofMutationProbe::LoopUpdateOverflowProbe => IrCapturedMir {
             def_path: String::from("probes::loop_update_overflow"),
@@ -6417,6 +6646,9 @@ fn build_probe_mir_body(probe: FalseProofMutationProbe) -> IrCapturedMir {
             },
             layouts,
             allocations: Vec::new(),
+            dyn_types: Vec::new(),
+            vtables: Vec::new(),
+            virtual_methods: Vec::new(),
         },
         FalseProofMutationProbe::DerefAliasProbe => IrCapturedMir {
             def_path: String::from("probes::deref_alias"),
@@ -6485,6 +6717,9 @@ fn build_probe_mir_body(probe: FalseProofMutationProbe) -> IrCapturedMir {
             },
             layouts,
             allocations: Vec::new(),
+            dyn_types: Vec::new(),
+            vtables: Vec::new(),
+            virtual_methods: Vec::new(),
         },
     }
 }
@@ -6777,6 +7012,9 @@ mod tests {
                 entries: vec![scalar_u32_layout(), ptr_layout(), unit_layout()],
             },
             allocations: Vec::new(),
+            dyn_types: Vec::new(),
+            vtables: Vec::new(),
+            virtual_methods: Vec::new(),
         };
 
         let ir_census = FaultSiteCensus::from_ir_captured_mir(&mir);

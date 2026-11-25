@@ -761,6 +761,12 @@ pub struct IrCapturedMir {
     pub layouts: IrLayoutTable,
     /// Referenced global/constant memory allocations.
     pub allocations: Vec<IrCapturedAllocation>,
+    /// Captured existential-predicate descriptors for `dyn Trait` types in the crate.
+    pub dyn_types: Vec<IrDynType>,
+    /// Captured `(concrete, dyn Trait)` vtables reachable in the crate.
+    pub vtables: Vec<IrVTable>,
+    /// Captured `InstanceKind::Virtual` call targets in the crate.
+    pub virtual_methods: Vec<IrVirtualMethod>,
 }
 
 /// Renders the standard file header for a generated `Mir/<Item>.lean` module.
@@ -2001,26 +2007,6 @@ impl IrDynMetadata {
     }
 }
 
-thread_local! {
-    /// Crate-level `dyn` metadata of the capture session running on this
-    /// thread. `IrCapturedMir` is constructed by struct literal in downstream
-    /// crates, so the session tables travel beside it rather than as new
-    /// fields; `mir_lower::lower_mir_body` (re)computes them once per session
-    /// before the first body of the session is emitted.
-    static SESSION_DYN_METADATA: std::cell::RefCell<IrDynMetadata> =
-        std::cell::RefCell::new(IrDynMetadata::default());
-}
-
-/// Replace the current session's crate-level `dyn` metadata.
-pub fn set_session_dyn_metadata(md: IrDynMetadata) {
-    SESSION_DYN_METADATA.with(|cell| *cell.borrow_mut() = md);
-}
-
-/// Snapshot of the current session's crate-level `dyn` metadata.
-pub fn session_dyn_metadata() -> IrDynMetadata {
-    SESSION_DYN_METADATA.with(|cell| cell.borrow().clone())
-}
-
 fn render_vtable_slot(s: &IrVTableSlot) -> String {
     match s {
         IrVTableSlot::DropInPlace(None) => String::from("(CapturedVTableSlot.dropInPlace Option.none)"),
@@ -2092,22 +2078,33 @@ fn render_virtual_method(m: &IrVirtualMethod) -> String {
 }
 
 /// Render the `dynTypes` / `vtables` / `virtualMethods` `CapturedMir` fields of
-/// `md` (omitting empty lists, which default to `.nil` in Lean).
-pub fn render_dyn_metadata_fields(md: &IrDynMetadata) -> String {
+/// `dyn_types`, `vtables`, and `virtual_methods` (omitting empty lists, which
+/// default to `.nil` in Lean).
+pub fn render_dyn_metadata_fields_slices(
+    dyn_types: &[IrDynType],
+    vtables: &[IrVTable],
+    virtual_methods: &[IrVirtualMethod],
+) -> String {
     let mut out = String::new();
-    if !md.dyn_types.is_empty() {
-        out.push_str(&format!("    dynTypes := {},\n", render_list(&md.dyn_types, render_dyn_type)));
+    if !dyn_types.is_empty() {
+        out.push_str(&format!("    dynTypes := {},\n", render_list(dyn_types, render_dyn_type)));
     }
-    if !md.vtables.is_empty() {
-        out.push_str(&format!("    vtables := {},\n", render_list(&md.vtables, render_vtable)));
+    if !vtables.is_empty() {
+        out.push_str(&format!("    vtables := {},\n", render_list(vtables, render_vtable)));
     }
-    if !md.virtual_methods.is_empty() {
+    if !virtual_methods.is_empty() {
         out.push_str(&format!(
             "    virtualMethods := {},\n",
-            render_list(&md.virtual_methods, render_virtual_method)
+            render_list(virtual_methods, render_virtual_method)
         ));
     }
     out
+}
+
+/// Render the `dynTypes` / `vtables` / `virtualMethods` `CapturedMir` fields of
+/// `md` (omitting empty lists, which default to `.nil` in Lean).
+pub fn render_dyn_metadata_fields(md: &IrDynMetadata) -> String {
+    render_dyn_metadata_fields_slices(&md.dyn_types, &md.vtables, &md.virtual_methods)
 }
 
 fn render_captured_mir(mir: &IrCapturedMir) -> String {
@@ -2124,7 +2121,11 @@ fn render_captured_mir(mir: &IrCapturedMir) -> String {
     if !mir.trait_impls.is_empty() {
         out.push_str(&format!("    traitImpls := {},\n", render_list(&mir.trait_impls, render_trait_impl_entry)));
     }
-    out.push_str(&render_dyn_metadata_fields(&session_dyn_metadata()));
+    out.push_str(&render_dyn_metadata_fields_slices(
+        &mir.dyn_types,
+        &mir.vtables,
+        &mir.virtual_methods,
+    ));
     out.push_str(&format!("    argCount := {},\n", mir.arg_count));
     out.push_str(&format!("    localDecls := {},\n", render_list(&mir.local_decls, render_local_decl)));
     out.push_str(&format!("    basicBlocks := {},\n", render_list(&mir.basic_blocks, render_basic_block_data)));
@@ -2213,6 +2214,9 @@ mod tests {
                 entries: vec![u32_layout],
             },
             allocations: vec![],
+            dyn_types: vec![],
+            vtables: vec![],
+            virtual_methods: vec![],
         };
 
         let code = emit_mir_lean_module("Mir.Demo.answer", &mir);
@@ -2323,6 +2327,9 @@ mod tests {
                 entries: vec![param_placeholder, tuple_layout],
             },
             allocations: vec![],
+            dyn_types: vec![],
+            vtables: vec![],
+            virtual_methods: vec![],
         };
 
         let code = emit_mir_lean_module("Mir.Demo.Wrapper_T_as_MyTrait_method", &mir);
@@ -2375,8 +2382,5 @@ mod tests {
         assert!(out.contains("vtableAllocId := 16384, concreteTy := (RigidTy.uint UintTy.u32)"));
         assert!(out.contains("(CapturedVTableSlot.method \"demo::<u32 as Tr>::m\" List.nil)"));
         assert!(out.contains("virtualMethods := (List.cons { methodDefPath := \"demo::Tr::m\", dynKey := \"demo::Tr\", slotIdx := 3 } List.nil)"));
-        // No session metadata is attached outside a capture session.
-        set_session_dyn_metadata(IrDynMetadata::default());
-        assert!(session_dyn_metadata().is_empty());
     }
 }

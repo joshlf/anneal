@@ -1623,16 +1623,16 @@ The vtable environment is harvested from the `CapturedMir.dynTypes` / `vtables`
 pointers are `Value.aggregate 0 [dataWord, .ptr vtPtr ptrBytes]`.
 
 Modeling choice (which bodies are consulted):
-- `Rvalue`-level `dyn` evaluation (`Places.lean`) reads only the
-  `SavedCallerFrame.callerBody`s on `Memory.callStack`, never
-  `Memory.callees`, `Memory.activeCallee`, or `Memory.traitImpls`, exactly like
-  every other `Rvalue` evaluator (whose results are invariant under replacing
-  the callee context). `rustc-capture` attaches the same crate-level tables to
-  every captured body, so any caller frame exposes the complete environment; an
-  `Rvalue` evaluated in the modular root frame (empty `callStack`) sees an empty
-  environment and every `dyn` operation there is `.unsupported`.
-- Call-level lookups (`Terminators.lean`) may additionally read
-  `Memory.callees`.
+- `Rvalue`-level `dyn` evaluation (`Places.lean`) reads `Memory.callees` (never
+  `Memory.callStack` or `Memory.activeCallee`), matching `evalReifyFnPointer`.
+  `rustc-capture` attaches the identical crate-level tables to every captured
+  body, so root-frame (`callStack = []`), nested-frame, and raw-pointer
+  (`borrows = []`) `dyn` operations all see the complete crate environment
+  whenever any callee is linked (and single-body tests register the root body
+  via `withBodyDynMetadata`), while `Rvalue` evaluation remains invariant under
+  `Memory.pushBaseStack`.
+- Call-level lookups (`Terminators.lean`) additionally consult `currentBody`
+  ahead of `Memory.callees`.
 -/
 
 /--
@@ -1704,6 +1704,13 @@ def capturedVTableSlotListBEq : List CapturedVTableSlot → List CapturedVTableS
   | a :: as, b :: bs => Bool.and (capturedVTableSlotBEq a b) (capturedVTableSlotListBEq as bs)
   | _, _ => false
 
+/-- Structural equality of `Option Nat`. -/
+@[reducible]
+def optNatBEq : Option Nat → Option Nat → Bool
+  | .none, .none => true
+  | .some a, .some b => Nat.beq a b
+  | _, _ => false
+
 /-- Structural equality of `CapturedVTable` records. -/
 @[reducible]
 def capturedVTableBEq (a b : CapturedVTable) : Bool :=
@@ -1714,7 +1721,17 @@ def capturedVTableBEq (a b : CapturedVTable) : Bool :=
           (Bool.and (Nat.beq a.sizeBytes b.sizeBytes)
             (Bool.and (Nat.beq a.alignBytes b.alignBytes)
               (Bool.and (Bool.not (Bool.xor a.isUninhabited b.isUninhabited))
-                (capturedVTableSlotListBEq a.slots b.slots)))))))
+                (Bool.and (optNatBEq a.primarySuperVTableId? b.primarySuperVTableId?)
+                  (capturedVTableSlotListBEq a.slots b.slots))))))))
+
+/-- Look up the vtable with dense identifier `vtableId`. -/
+@[reducible]
+def lookupVTableById : List CapturedVTable → Nat → Option CapturedVTable
+  | .nil, _ => .none
+  | v :: vs, vtableId =>
+    match Nat.beq v.vtableId vtableId with
+    | true => .some v
+    | false => lookupVTableById vs vtableId
 
 /-- Look up the vtable with synthetic allocation identifier `allocId`. -/
 @[reducible]
@@ -1780,11 +1797,10 @@ def collectBodyVTables (currentBody : Option CapturedMir) (bodies : List Capture
     List CapturedVTable :=
   (dynSourceBodies currentBody bodies).foldl (fun acc b => dedupVTablesInto acc b.vtables) .nil
 
-/-- `collectBodyVTables` over the caller bodies of `mem.callStack` followed by
-`mem.callees` (call-level lookups only). -/
+/-- `collectBodyVTables` over `currentBody` followed by `mem.callees`. -/
 def collectMemoryVTables (currentBody : Option CapturedMir := .none) (mem : Memory) :
     List CapturedVTable :=
-  collectBodyVTables currentBody (callerBodiesOf mem.callStack ++ mem.callees)
+  collectBodyVTables currentBody mem.callees
 
 /-- Deduplicated `CapturedDynType` table visible from `(currentBody, bodies)`. -/
 def collectBodyDynTypes (currentBody : Option CapturedMir) (bodies : List CapturedMir) :
@@ -1813,17 +1829,15 @@ def collectBodyVirtualMethods (currentBody : Option CapturedMir) (bodies : List 
     .nil
 
 
-/-- `collectBodyDynTypes` over the caller bodies of `mem.callStack` followed by
-`mem.callees` (call-level lookups only). -/
+/-- `collectBodyDynTypes` over `currentBody` followed by `mem.callees`. -/
 def collectMemoryDynTypes (currentBody : Option CapturedMir := .none) (mem : Memory) :
     List CapturedDynType :=
-  collectBodyDynTypes currentBody (callerBodiesOf mem.callStack ++ mem.callees)
+  collectBodyDynTypes currentBody mem.callees
 
-/-- `collectBodyVirtualMethods` over the caller bodies of `mem.callStack` followed by
-`mem.callees` (call-level lookups only). -/
+/-- `collectBodyVirtualMethods` over `currentBody` followed by `mem.callees`. -/
 def collectMemoryVirtualMethods (currentBody : Option CapturedMir := .none) (mem : Memory) :
     List CapturedVirtualMethod :=
-  collectBodyVirtualMethods currentBody (callerBodiesOf mem.callStack ++ mem.callees)
+  collectBodyVirtualMethods currentBody mem.callees
 
 /-- `true` iff every captured body visible from `(currentBody, bodies)` carries
 a vtable table consistent with the deduplicated table `vts`. -/
@@ -1888,6 +1902,44 @@ def vtableAllocIdsUnique : List CapturedVTable → Bool
        | .none => true)
       (vtableAllocIdsUnique vs)
 
+/-- `true` iff the `vtableId`s of `vs` are pairwise distinct. -/
+def vtableIdsUnique : List CapturedVTable → Bool
+  | .nil => true
+  | v :: vs =>
+    Bool.and
+      (match lookupVTableById vs v.vtableId with
+       | .some _ => false
+       | .none => true)
+      (vtableIdsUnique vs)
+
+/-- `true` iff `targetId` names a distinct vtable in `vts` with identical concrete
+type and layout to `v`. -/
+def vtableSuperLinkOk (vts : List CapturedVTable) (v : CapturedVTable) (targetId : Nat) : Bool :=
+  match Nat.beq targetId v.vtableId with
+  | true => false
+  | false =>
+    match lookupVTableById vts targetId with
+    | .none => false
+    | .some tgt =>
+      Bool.and (rigidTyEq tgt.concreteTy v.concreteTy)
+        (Bool.and (Nat.beq tgt.sizeBytes v.sizeBytes)
+          (Bool.and (Nat.beq tgt.alignBytes v.alignBytes)
+            (Bool.not (Bool.xor tgt.isUninhabited v.isUninhabited))))
+
+/-- `true` iff every supertrait link (`primarySuperVTableId?` and `.traitVPtr`
+slots) of `v` targets a distinct same-concrete-type vtable in `vts`. -/
+def vtableSuperLinksOk (vts : List CapturedVTable) (v : CapturedVTable) : Bool :=
+  let primOk : Bool :=
+    match v.primarySuperVTableId? with
+    | .none => true
+    | .some supId => vtableSuperLinkOk vts v supId
+  let slotsOk : Bool :=
+    v.slots.all (fun s =>
+      match s with
+      | .traitVPtr supId => vtableSuperLinkOk vts v supId
+      | _ => true)
+  Bool.and primOk slotsOk
+
 /-- `true` iff `allocId` is the `allocId` of some captured global allocation. -/
 def isGlobalAllocIdIn : List CapturedAllocation → AllocId → Bool
   | .nil, _ => false
@@ -1900,14 +1952,16 @@ Modeled property: every vtable pointer designates a vtable allocation that is
 disjoint from data allocations (globals, stack locals) and function-pointer
 allocations, so a metadata word can be resolved to exactly one vtable.
 
-Checks, for every `v ∈ vts`: `wfVTableEntry ptrBytes v`; `vtableAllocId` is
-non-zero, in `[vtableAllocBase, vtableAllocBase + vtableAllocSpan)`, strictly
-below the stack-local page base of `ptrBytes` (`32768` on 32-bit, `1048576` on
-64-bit), not below `mem.nextAllocId`, not the `allocId` of any global, and not a
-registered function pointer; and the identifiers are pairwise distinct. The
-memory components are passed individually (`Memory.nextAllocId`,
-`Memory.globals`, `Memory.fnPtrs`) so the invariant never depends on frame
-bookkeeping.
+Checks, for every `v ∈ vts`: `wfVTableEntry ptrBytes v`; `vtableSuperLinksOk vts v`
+(every `primarySuperVTableId?` and `.traitVPtr` target is a distinct same-layout
+vtable in `vts`); `vtableAllocId` is non-zero, in
+`[vtableAllocBase, vtableAllocBase + vtableAllocSpan)`, strictly below the
+stack-local page base of `ptrBytes` (`32768` on 32-bit, `1048576` on 64-bit),
+not below `mem.nextAllocId`, not the `allocId` of any global, and not a
+registered function pointer; and both `vtableId` and `vtableAllocId` are
+pairwise distinct. The memory components are passed individually
+(`Memory.nextAllocId`, `Memory.globals`, `Memory.fnPtrs`) so the invariant never
+depends on frame bookkeeping.
 
 Reference: see `vtableAllocBase` and `CapturedVTable`.
 
@@ -1921,24 +1975,25 @@ def vtableEnvOk (ptrBytes : Nat) (vts : List CapturedVTable) (nextAllocId : Allo
     | true => 1048576
     | false => 32768
   Bool.and (vtableAllocIdsUnique vts)
-    (vts.all (fun v =>
-      Bool.and (wfVTableEntry ptrBytes v)
-        (Bool.and (Nat.ble vtableAllocBase v.vtableAllocId)
-          (Bool.and (Nat.blt v.vtableAllocId (Nat.add vtableAllocBase vtableAllocSpan))
-            (Bool.and (Nat.blt v.vtableAllocId stackBase)
-              (Bool.and (Nat.ble nextAllocId v.vtableAllocId)
-                (Bool.and (Bool.not (isGlobalAllocIdIn globals v.vtableAllocId))
-                  (match lookupFnPtr fnPtrs v.vtableAllocId with
-                   | .some _ => false
-                   | .none => true))))))))
+    (Bool.and (vtableIdsUnique vts)
+      (vts.all (fun v =>
+        Bool.and (wfVTableEntry ptrBytes v)
+          (Bool.and (vtableSuperLinksOk vts v)
+            (Bool.and (Nat.ble vtableAllocBase v.vtableAllocId)
+              (Bool.and (Nat.blt v.vtableAllocId (Nat.add vtableAllocBase vtableAllocSpan))
+                (Bool.and (Nat.blt v.vtableAllocId stackBase)
+                  (Bool.and (Nat.ble nextAllocId v.vtableAllocId)
+                    (Bool.and (Bool.not (isGlobalAllocIdIn globals v.vtableAllocId))
+                      (match lookupFnPtr fnPtrs v.vtableAllocId with
+                       | .some _ => false
+                       | .none => true))))))))))
 
 /--
 Register `body` in `mem.callees` (appended, so existing callees keep priority)
 unless a callee with the same `defPath` is already linked, making `body`'s dyn
-metadata tables visible to the call-level lookups (`collectMemoryVTables`,
-`collectMemoryVirtualMethods`) when `body` executes as the modular root
-(single-body unit and correspondence tests). `Rvalue`-level `dyn` evaluation
-reads caller frames only and is unaffected.
+metadata tables visible to both `Rvalue`-level (`Places.lean`) and call-level
+(`Terminators.lean`) lookups when `body` executes as the modular root without
+other linked callees (single-body unit and correspondence tests).
 
 Modeling note: this is an environment-construction helper with no Rust
 counterpart; it changes only which captured tables are visible.
@@ -1947,6 +2002,14 @@ def withBodyDynMetadata (body : CapturedMir) (mem : Memory) : Memory :=
   match mem.callees.any (fun c => stringEq c.defPath body.defPath) with
   | true => mem
   | false => { mem with callees := mem.callees ++ body :: .nil }
+
+/-- Predicate key (predicates without auto traits) of `k`, defaulting to `k`
+when no `CapturedDynType` descriptor is recorded (simple principal trait). -/
+@[reducible]
+def dynPredicateKeyOf (dts : List CapturedDynType) (k : DefPath) : DefPath :=
+  match lookupDynType dts k with
+  | .some d => d.predicateKey
+  | .none => k
 
 /--
 Whether trait-object types `a` and `b` have the same predicate list up to auto
@@ -1964,18 +2027,69 @@ Reference (`compiler/rustc_const_eval/src/interpret/traits.rs` at commit
 > // FIXME: we are skipping auto traits for now, but might revisit this in the future.
 > let mut sorted_vtable: Vec<_> = vtable_dyn_type.without_auto_traits().collect();"
 
-Justification: equal keys are trivially compatible; otherwise the captured
-`predicateKey`s (predicate lists without auto traits) must agree. Missing
-descriptors make distinct keys incompatible, which callers treat as `.ub` only
-after the vtable pointer itself has been resolved.
+Justification: equal keys are trivially compatible; otherwise the canonical
+predicate keys without auto traits (`dynPredicateKeyOf`) must agree (treating an
+undescribed simple principal key `k` as its own predicate key, which equals the
+canonical `predicateKey` of `dyn k + AutoTraits`).
 -/
 def dynKeysCompatible (dts : List CapturedDynType) (a b : DefPath) : Bool :=
-  match stringEq a b with
-  | true => true
-  | false =>
-    match lookupDynType dts a, lookupDynType dts b with
-    | .some da, .some db => stringEq da.predicateKey db.predicateKey
-    | _, _ => false
+  Bool.or (stringEq a b) (stringEq (dynPredicateKeyOf dts a) (dynPredicateKeyOf dts b))
+
+/-- Direct supertrait `vtableId`s of `v`: its `primarySuperVTableId?` (if any)
+followed by all `.traitVPtr supId` slots. -/
+def vtableDirectSuperIds (v : CapturedVTable) : List Nat :=
+  let slotIds : List Nat :=
+    v.slots.foldr
+      (fun s acc =>
+        match s with
+        | .traitVPtr supId => supId :: acc
+        | _ => acc)
+      .nil
+  match v.primarySuperVTableId? with
+  | .some pId => pId :: slotIds
+  | .none => slotIds
+
+/-- Bounded reachability of a supertrait vtable whose `dynKey` is predicate-key
+compatible with `dstKey`, traversing only `primarySuperVTableId?` and
+`.traitVPtr` links (rejecting unrelated 0-method marker traits, Condition `C2`). -/
+def vtableReachesSuperKeyAux
+    (vts : List CapturedVTable)
+    (dts : List CapturedDynType)
+    (dstKey : DefPath) :
+    Nat → List Nat → Bool
+  | 0, _ => false
+  | _ + 1, .nil => false
+  | fuel + 1, curId :: rest =>
+    match lookupVTableById vts curId with
+    | .none => vtableReachesSuperKeyAux vts dts dstKey fuel rest
+    | .some cur =>
+      match dynKeysCompatible dts cur.dynKey dstKey with
+      | true => true
+      | false =>
+        vtableReachesSuperKeyAux vts dts dstKey fuel (vtableDirectSuperIds cur ++ rest)
+
+/--
+Resolve the target vtable for a `dyn Sub -> dyn Super` unsizing coercion from
+`srcEntry` to `dstKey` (Condition `C2`):
+- If `dynKeysCompatible dts srcEntry.dynKey dstKey` (auto-trait dropping only),
+  looks up `(srcEntry.concreteTy, dstKey)`.
+- Otherwise requires a supertrait vtable compatible with `dstKey` to be
+  reachable from `srcEntry` via `primarySuperVTableId?` or `.traitVPtr` slots
+  (rejecting unrelated 0-method marker traits), and returns the captured
+  `(srcEntry.concreteTy, dstKey)` vtable.
+-/
+def resolveUpcastVTable?
+    (vts : List CapturedVTable)
+    (dts : List CapturedDynType)
+    (srcEntry : CapturedVTable)
+    (dstKey : DefPath) :
+    Option CapturedVTable :=
+  let reachable : Bool :=
+    Bool.or (dynKeysCompatible dts srcEntry.dynKey dstKey)
+      (vtableReachesSuperKeyAux vts dts dstKey (Nat.add (length vts) 1) (vtableDirectSuperIds srcEntry))
+  match reachable with
+  | false => .none
+  | true => lookupVTableFor vts srcEntry.concreteTy dstKey
 
 /--
 `true` iff the descriptor of `dynKey` (if captured) marks the type as fully

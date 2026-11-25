@@ -15593,14 +15593,11 @@ def dynUnsizeTarget? : RigidTy → Option DynUnsizeTarget
 /--
 The `Memory` components a `dyn` rvalue consults, passed as a projection of the
 machine memory so that `dyn` evaluation never depends on the frame bookkeeping
-fields (`activeCallee`, `rootUnwindCeiling`) or on fields it does not read.
-Call sites build it field-by-field from `Memory`, passing `callStack := []` and
-`callerBodies := []` when `borrows = []`: the call stack is only consulted to
-resolve the target frame of a stack borrow (and by `evalOperand`, whose result
-does not depend on the call stack when there are no borrows), and without any
-borrow no reference-typed `dyn` value can be validated, so a `dyn` rvalue over
-an empty borrow table conservatively sees an empty vtable environment
-(`.unsupported`).
+fields (`activeCallee`, `rootUnwindCeiling`, or `callStack` bodies).
+`dynBodies` is drawn from `Memory.callees` (analogous to `evalReifyFnPointer`),
+so root-frame (`callStack = []`), nested-frame, and raw-pointer
+(`borrows = []`) `dyn` operations all see the crate's vtable tables while
+remaining invariant under `Memory.pushBaseStack`.
 -/
 structure DynMemView : Type where
   /-- `Memory.borrows`. -/
@@ -15609,11 +15606,11 @@ structure DynMemView : Type where
   globals : List CapturedAllocation
   /-- `Memory.callerLocals`. -/
   callerLocals : List LocalSlot
-  /-- `Memory.callStack`. -/
+  /-- `Memory.callStack` (consulted only to resolve stack borrow frames when
+      `borrows` is non-empty). -/
   callStack : List SavedCallerFrame
-  /-- Caller bodies of `Memory.callStack` (`callerBodiesOf`), the source of the
-      `Rvalue`-level vtable environment. -/
-  callerBodies : List CapturedMir
+  /-- Linked bodies (`Memory.callees`), the source of the vtable environment. -/
+  dynBodies : List CapturedMir
   /-- `Memory.fnPtrs`. -/
   fnPtrs : List FnPtrEntry
   /-- `Memory.nextAllocId`. -/
@@ -15627,7 +15624,7 @@ structure DynMemView : Type where
 @[reducible]
 def DynMemView.ofMemory (m : Memory) : DynMemView :=
   { borrows := m.borrows, globals := m.globals, callerLocals := m.callerLocals,
-    callStack := m.callStack, callerBodies := callerBodiesOf m.callStack, fnPtrs := m.fnPtrs,
+    callStack := m.callStack, dynBodies := m.callees, fnPtrs := m.fnPtrs,
     nextAllocId := m.nextAllocId, activeProtectors := m.activeProtectors,
     nextTag := m.nextTag }
 
@@ -15651,22 +15648,22 @@ inductive DynCheck (α : Type) : Type where
   | unsupported : DynCheck α
 
 /--
-The vtable environment visible from `(currentBody, mv.callerBodies)`
+The vtable environment visible from `(currentBody, mv.dynBodies)`
 (`collectBodyVTables`, `collectBodyDynTypes`) when it is non-empty,
 consistent across every captured body, and satisfies `vtableEnvOk ptrBytes`;
 `.none` otherwise (fail closed).
 -/
 def dynVTableEnv? (currentBody : Option CapturedMir) (mv : DynMemView) (ptrBytes : Nat) :
     Option (List CapturedVTable × List CapturedDynType) :=
-  let vts := collectBodyVTables currentBody mv.callerBodies
+  let vts := collectBodyVTables currentBody mv.dynBodies
   match vts with
   | .nil => .none
   | _ :: _ =>
     match
-      Bool.and (bodyVTablesConsistent currentBody mv.callerBodies vts)
+      Bool.and (bodyVTablesConsistent currentBody mv.dynBodies vts)
         (vtableEnvOk ptrBytes vts mv.nextAllocId mv.globals mv.fnPtrs)
     with
-    | true => .some (vts, collectBodyDynTypes currentBody mv.callerBodies)
+    | true => .some (vts, collectBodyDynTypes currentBody mv.dynBodies)
     | false => .none
 
 /--
@@ -15791,17 +15788,20 @@ Checks performed on `dataVal` against `entry.sizeBytes` / `entry.alignBytes` /
   and designate a zero-sized pointee;
 - a stack-borrow data pointer must have a live, non-deallocated target, an
   offset that is a multiple of `alignBytes`, and
-  `offsetBytes + sizeBytes <= ptrAllocByteBound?`; when `checkTB` its tag must
-  not be `.disabled` and, for `isMut`, not `.frozen`;
+  `offsetBytes + sizeBytes <= ptrAllocByteBound?`; when `checkTB` its tag and
+  every ancestor in its Tree Borrows parent chain (`treeBorrowAncestorsChildAccessUB`)
+  must permit a read (or write for `isMut`), rejecting `.disabled` tags/ancestors
+  and `.frozen` tags/ancestors for `&mut`;
 - a global data pointer must be aligned, in bounds, and (for `isMut`) mutable;
-- any other provenance is accepted only for a zero-sized pointee.
+- an unbacked pointer (`allocId = 0`) must satisfy modular non-null
+  (`wrapScalarBits offsetBytes (scalarModulus ptrBytes) != 0`), alignment, and
+  zero-sized pointee; any other non-borrow/non-global provenance requires a
+  zero-sized pointee and aligned `offsetBytes`.
 
 Modeling choices: `checkTB = false` (`refDataValidNoTB`) is used where the
 interpreter performs no Tree Borrows access (`&raw const (*r)`, safe
 `size_of_val(&dyn)`), matching Miri's value-validity check that consults
-liveness, bounds, alignment, and nullness but not aliasing permissions. Ancestor
-permissions are not walked: an access through a disabled ancestor is detected
-when the reference is later used.
+liveness, bounds, alignment, and nullness but not aliasing permissions.
 -/
 def dynRefDataValid
     (locals : List LocalSlot)
@@ -15835,14 +15835,21 @@ def dynRefDataValid
       | true =>
         match lookupBorrow mv.borrows p.tag with
         | .some be =>
+          let ancAccess : TreeBorrowAccessKind :=
+            match isMut with
+            | true => .write
+            | false => .read
           let permOk : Bool :=
             match checkTB with
             | false => true
             | true =>
-              match be.perm, isMut with
-              | .disabled, _ => false
-              | .frozen, true => false
-              | _, _ => true
+              let selfOk : Bool :=
+                match be.perm, isMut with
+                | .disabled, _ => false
+                | .frozen, true => false
+                | _, _ => true
+              Bool.and selfOk
+                (Bool.not (treeBorrowAncestorsChildAccessUB ancAccess mv.borrows be.parentTag))
           let liveOk : Bool :=
             match be.allocDead with
             | true => false
@@ -15875,8 +15882,13 @@ def dynRefDataValid
                 (Bool.and (Nat.beq (Nat.mod p.offsetBytes align) 0)
                   (Nat.ble (Nat.add p.offsetBytes entry.sizeBytes) (length alloc.bytes))))
           | .none =>
-            Bool.and (Nat.beq entry.sizeBytes 0)
-              (Bool.not (Bool.and (Nat.beq p.allocId 0) (Nat.beq p.offsetBytes 0)))
+            match Nat.beq p.allocId 0 with
+            | true =>
+              let addr := wrapScalarBits p.offsetBytes (scalarModulus ptrBytes)
+              Bool.and (Nat.beq entry.sizeBytes 0)
+                (Bool.and (Bool.not (Nat.beq addr 0)) (Nat.beq (Nat.mod addr align) 0))
+            | false =>
+              Bool.and (Nat.beq entry.sizeBytes 0) (Nat.beq (Nat.mod p.offsetBytes align) 0)
     | _ => false
 
 /--
@@ -15918,7 +15930,7 @@ def evalThinToDynUnsize
   let shapeOk : Bool :=
     match dataVal with
     | .ptr _ sz => Nat.beq sz ptrBytes
-    | .scalar sc => Bool.and (Bool.not isRef) (Nat.beq sc.sizeBytes ptrBytes)
+    | .scalar sc => Nat.beq sc.sizeBytes ptrBytes
     | _ => false
   match shapeOk with
   | false => .ub
@@ -15989,29 +16001,37 @@ def evalDynToDynUnsize
   let ptrBytes := layoutPointerBytes layouts
   match fatVal with
   | .aggregate 0 (dataVal :: metaVal :: .nil) =>
-    match stringEq srcKey dstKey with
-    | true => .ok fatVal
-    | false =>
-      match checkDynVTablePtr .none mv ptrBytes metaVal srcKey with
-      | .ub => .ub
-      | .unsupported => .unsupported
-      | .ok (entry, vts, dts) =>
-        let autosOk : Bool :=
-          match lookupDynType dts srcKey, lookupDynType dts dstKey with
-          | .some ds, .some dd => defPathsSubset dd.autoTraits ds.autoTraits
-          | _, .none => true
-          | .none, .some dd =>
-            match dd.autoTraits with
-            | .nil => true
-            | _ :: _ => false
-        match Bool.and autosOk (dynTypeModeled dts dstKey) with
-        | false => .unsupported
-        | true =>
-          match lookupVTableFor vts entry.concreteTy dstKey with
-          | .none => .unsupported
-          | .some dstEntry =>
-            .ok (.aggregate 0
-              (dataVal :: .ptr { allocId := dstEntry.vtableAllocId, offsetBytes := 0 } ptrBytes :: .nil))
+    let dataShapeOk : Bool :=
+      match dataVal with
+      | .ptr _ sz => Nat.beq sz ptrBytes
+      | .scalar sc => Nat.beq sc.sizeBytes ptrBytes
+      | _ => false
+    match dataShapeOk with
+    | false => .ub
+    | true =>
+      match stringEq srcKey dstKey with
+      | true => .ok fatVal
+      | false =>
+        match checkDynVTablePtr .none mv ptrBytes metaVal srcKey with
+        | .ub => .ub
+        | .unsupported => .unsupported
+        | .ok (entry, vts, dts) =>
+          let autosOk : Bool :=
+            match lookupDynType dts srcKey, lookupDynType dts dstKey with
+            | .some ds, .some dd => defPathsSubset dd.autoTraits ds.autoTraits
+            | _, .none => true
+            | .none, .some dd =>
+              match dd.autoTraits with
+              | .nil => true
+              | _ :: _ => false
+          match Bool.and autosOk (dynTypeModeled dts dstKey) with
+          | false => .unsupported
+          | true =>
+            match resolveUpcastVTable? vts dts entry dstKey with
+            | .none => .unsupported
+            | .some dstEntry =>
+              .ok (.aggregate 0
+                (dataVal :: .ptr { allocId := dstEntry.vtableAllocId, offsetBytes := 0 } ptrBytes :: .nil))
   | _ => .ub
 
 /-- Mutability of an unsizing source `src` is compatible with target `dst`
@@ -16113,20 +16133,19 @@ def evalDynUnsizeCore
     | .ub => .ub
     | .unsupported => .unsupported
     | .ok v locals' =>
-      match operandTy localDecls layouts op, v with
-      | .some { kind := .adt pinPath (innerTy :: .nil), .. }, .aggregate 0 (innerVal :: .nil) =>
+      match operandTy localDecls layouts op with
+      | .some { kind := .adt pinPath (innerTy :: .nil), .. } =>
         match isPinDefPath pinPath, innerTy with
         | true, .ref _ _ =>
-          match unsizePtrLike locals' innerVal innerTy true m k with
-          | .ok r => .ok (.aggregate 0 (r :: .nil), locals')
-          | .ub => .ub
-          | .unsupported => .unsupported
+          match v with
+          | .aggregate 0 (innerVal :: .nil) =>
+            match unsizePtrLike locals' innerVal innerTy true m k with
+            | .ok r => .ok (.aggregate 0 (r :: .nil), locals')
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | _ => .ub
         | _, _ => .unsupported
-      | .some { kind := .adt pinPath (_ :: .nil), .. }, _ =>
-        match isPinDefPath pinPath with
-        | true => .ub
-        | false => .unsupported
-      | _, _ => .unsupported
+      | _ => .unsupported
 
 /--
 Trait-object targets (`dynUnsizeTarget? targetTy.kind = .some tgt`: `&[mut] dyn K`,
@@ -16159,8 +16178,7 @@ def evalUnsizeCoercion
       evalDynUnsizeCore locals op tgt
         { borrows := mem.borrows, globals := mem.globals, callerLocals := mem.callerLocals,
           callStack := (match mem.borrows with | .nil => .nil | _ :: _ => mem.callStack),
-          callerBodies :=
-            (match mem.borrows with | .nil => .nil | _ :: _ => callerBodiesOf mem.callStack),
+          dynBodies := mem.callees,
           fnPtrs := mem.fnPtrs,
           nextAllocId := mem.nextAllocId, activeProtectors := mem.activeProtectors,
           nextTag := mem.nextTag }
@@ -19867,13 +19885,12 @@ def evalDynFatPtrDerefBorrow
   | .nil =>
     match dynPlaceLocalKind? localDecls place.local_ with
     | .none => .unsupported
-    | .some (isRefLocal, localMut, dynKey) =>
+    | .some (_, localMut, dynKey) =>
       let illTyped : Bool :=
-        Bool.and isRefLocal
-          (Bool.and isMut
-            (match localMut with
-             | .not => true
-             | .mut => false))
+        Bool.and isMut
+          (match localMut with
+           | .not => true
+           | .mut => false)
       match illTyped with
       | true => .unsupported
       | false =>
@@ -19987,13 +20004,25 @@ def evalDynFatPtrDerefRaw
       | .not, .mut => .unsupported
       | _, _ =>
         match isRefLocal with
-        | false => .ok (.aggregate 0 (dataVal :: metaVal :: .nil))
+        | false =>
+          let wordOk (v : Value) : Bool :=
+            match v with
+            | .ptr _ sz => Nat.beq sz ptrBytes
+            | .scalar sc => Nat.beq sc.sizeBytes ptrBytes
+            | _ => false
+          match Bool.and (wordOk dataVal) (wordOk metaVal) with
+          | true => .ok (.aggregate 0 (dataVal :: metaVal :: .nil))
+          | false => .ub
         | true =>
           match checkDynVTablePtr .none mv ptrBytes metaVal dynKey with
           | .ub => .ub
           | .unsupported => .unsupported
           | .ok (entry, _, _) =>
-            match dynRefDataValid locals mv localDecls layouts ptrBytes dataVal entry false false with
+            let localIsMut : Bool :=
+              match localMut with
+              | .mut => true
+              | .not => false
+            match dynRefDataValid locals mv localDecls layouts ptrBytes dataVal entry localIsMut false with
             | true => .ok (.aggregate 0 (dataVal :: metaVal :: .nil))
             | false => .ub
 
@@ -20206,97 +20235,102 @@ def evalRvalueRefDeref
               false
               accessedTyOpt
         | .none => .ub
-  | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
-    let sliceAlignTyOpt : Option Ty :=
-      match pointeeTyOpt, restProj with
-      | .some pt, _ => .some pt
-      | .none, .nil => accessedTyOpt
-      | .none, _ :: _ => .none
-    let sliceTargetAlignOk : Bool :=
-      match lookupBorrow mem.borrows parentPtr.tag with
-      | .some parentEntry =>
-        match activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal with
-        | .some (.init rootVal) =>
-          checkTargetPlaceAlign
-            localDecls
-            layouts
-            sliceAlignTyOpt
-            parentEntry
-            parentPtr
-            (.some rootVal)
-        | .some _ => true
-        | .none =>
-          match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
-          | .some (.init rootVal) =>
-            let (targetDecls, targetLayouts) :=
-              foreignFrameDeclsAndLayouts
-                mem.callStack
+  | .some (.init (.aggregate 0 (dataVal :: metaVal :: .nil))) =>
+    match dynPlaceLocalKind? localDecls place.local_ with
+    | .some _ =>
+      match
+        evalDynFatPtrDerefBorrow locals borrowKind place restProj
+          { borrows := mem.borrows, globals := mem.globals, callerLocals := mem.callerLocals,
+            callStack := (match mem.borrows with | .nil => .nil | _ :: _ => mem.callStack),
+            dynBodies := mem.callees,
+            fnPtrs := mem.fnPtrs,
+            nextAllocId := mem.nextAllocId, activeProtectors := mem.activeProtectors,
+            nextTag := mem.nextTag }
+          localDecls layouts dataVal metaVal
+      with
+      | .ok (v, .none) => .ok v locals mem
+      | .ok (v, .some (child, borrowsAfterRead, nextTag')) =>
+        .ok v locals { mem with borrows := child :: borrowsAfterRead, nextTag := nextTag' }
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .none =>
+      match dataVal, metaVal with
+      | .ptr parentPtr ptrSz, .scalar lenSc =>
+        let sliceAlignTyOpt : Option Ty :=
+          match pointeeTyOpt, restProj with
+          | .some pt, _ => .some pt
+          | .none, .nil => accessedTyOpt
+          | .none, _ :: _ => .none
+        let sliceTargetAlignOk : Bool :=
+          match lookupBorrow mem.borrows parentPtr.tag with
+          | .some parentEntry =>
+            match activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal with
+            | .some (.init rootVal) =>
+              checkTargetPlaceAlign
+                localDecls
                 layouts
-                parentEntry.targetFrameDepth
-                parentEntry.targetLocal
-            checkTargetPlaceAlign
-              targetDecls
-              layouts
-              sliceAlignTyOpt
-              parentEntry
-              parentPtr
-              (.some rootVal)
-              targetLayouts
-              localDecls
-          | _ => true
-      | .none =>
-        match lookupGlobalAlloc mem.globals parentPtr.allocId with
-        | .some alloc =>
-          checkGlobalAllocAlign
-            localDecls
+                sliceAlignTyOpt
+                parentEntry
+                parentPtr
+                (.some rootVal)
+            | .some _ => true
+            | .none =>
+              match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
+              | .some (.init rootVal) =>
+                let (targetDecls, targetLayouts) :=
+                  foreignFrameDeclsAndLayouts
+                    mem.callStack
+                    layouts
+                    parentEntry.targetFrameDepth
+                    parentEntry.targetLocal
+                checkTargetPlaceAlign
+                  targetDecls
+                  layouts
+                  sliceAlignTyOpt
+                  parentEntry
+                  parentPtr
+                  (.some rootVal)
+                  targetLayouts
+                  localDecls
+              | _ => true
+          | .none =>
+            match lookupGlobalAlloc mem.globals parentPtr.allocId with
+            | .some alloc =>
+              checkGlobalAllocAlign
+                localDecls
+                layouts
+                sliceAlignTyOpt
+                alloc
+                parentPtr.offsetBytes
+            | .none => true
+        match
+          Bool.and
+            (checkDerefAlign localDecls layouts sliceAlignTyOpt parentPtr.offsetBytes)
+            sliceTargetAlignOk
+        with
+        | false => .ub
+        | true =>
+          let isMut :=
+            match borrowKind with
+            | .shared => false
+            | .mut _ => true
+          evalSliceFatPtrDerefBorrow
+            locals
+            mem
+            parentPtr
+            ptrSz
+            lenSc
+            restProj
+            perm
+            isMut
+            pointeeTyOpt
             layouts
-            sliceAlignTyOpt
-            alloc
-            parentPtr.offsetBytes
-        | .none => true
-    match
-      Bool.and
-        (checkDerefAlign localDecls layouts sliceAlignTyOpt parentPtr.offsetBytes)
-        sliceTargetAlignOk
-    with
-    | false => .ub
-    | true =>
-      let isMut :=
-        match borrowKind with
-        | .shared => false
-        | .mut _ => true
-      evalSliceFatPtrDerefBorrow
-        locals
-        mem
-        parentPtr
-        ptrSz
-        lenSc
-        restProj
-        perm
-        isMut
-        pointeeTyOpt
-        layouts
-        true
-        localDecls
-        accessedTyOpt
-        true
-  | .some (.init (.aggregate 0 (dataVal :: .ptr vtPtr vtSz :: .nil))) =>
-    match
-      evalDynFatPtrDerefBorrow locals borrowKind place restProj
-        { borrows := mem.borrows, globals := mem.globals, callerLocals := mem.callerLocals,
-          callStack := (match mem.borrows with | .nil => .nil | _ :: _ => mem.callStack),
-          callerBodies :=
-            (match mem.borrows with | .nil => .nil | _ :: _ => callerBodiesOf mem.callStack),
-          fnPtrs := mem.fnPtrs,
-          nextAllocId := mem.nextAllocId, activeProtectors := mem.activeProtectors,
-          nextTag := mem.nextTag }
-        localDecls layouts dataVal (.ptr vtPtr vtSz)
-    with
-    | .ok (v, .none) => .ok v locals mem
-    | .ok (v, .some (child, borrowsAfterRead, nextTag')) =>
-      .ok v locals { mem with borrows := child :: borrowsAfterRead, nextTag := nextTag' }
-    | .ub => .ub
-    | .unsupported => .unsupported
+            true
+            localDecls
+            accessedTyOpt
+            true
+      | _, .ptr _ _ => .unsupported
+      | _, _ => .ub
   | _ => .ub
 
 /--
@@ -20713,159 +20747,164 @@ def evalRvalueRawPtr
             with
             | .some 0 => .ok (.scalar ⟨baseBits, ptrBytes⟩) locals mem
             | _ => .ub
-    | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
-      match
-        Bool.and
-          (Nat.beq ptrSz ptrBytes)
-          (Nat.beq lenSc.sizeBytes ptrBytes)
-      with
-      | false => .ub
-      | true =>
-        match cleanRest, isRawPtrLocal with
-        | .nil, true =>
-          let lenBits := wrapScalarBits lenSc.bits (scalarModulus ptrBytes)
-          .ok
-            (.aggregate 0
-              (.ptr parentPtr ptrSz :: .scalar ⟨lenBits, ptrBytes⟩ :: .nil))
-            locals
-            mem
-        | _, true =>
-          let rawPerm :=
-            match lookupBorrow mem.borrows parentPtr.tag with
-            | .some pe => pe.perm
-            | .none => perm
-          evalSliceFatPtrDerefBorrow
-            locals
-            mem
-            parentPtr
-            ptrSz
-            lenSc
-            restProj
-            rawPerm
-            false
-            pointeeTyOpt
-            layouts
-            false
-        | _, false =>
-          let sliceAlignTyOpt : Option Ty :=
-            match pointeeTyOpt, restProj with
-            | .some pt, _ => .some pt
-            | .none, .nil => accessedTyOpt
-            | .none, _ :: _ => .none
-          let sliceTargetAlignOk : Bool :=
-            match lookupBorrow mem.borrows parentPtr.tag with
-            | .some parentEntry =>
-              match activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal with
-              | .some (.init rootVal) =>
-                checkTargetPlaceAlign
-                  localDecls
-                  layouts
-                  sliceAlignTyOpt
-                  parentEntry
-                  parentPtr
-                  (.some rootVal)
-              | .some _ => true
-              | .none =>
-                match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
-                | .some (.init rootVal) =>
-                  let (targetDecls, targetLayouts) :=
-                    foreignFrameDeclsAndLayouts
-                      mem.callStack
-                      layouts
-                      parentEntry.targetFrameDepth
-                      parentEntry.targetLocal
-                  checkTargetPlaceAlign
-                    targetDecls
-                    layouts
-                    sliceAlignTyOpt
-                    parentEntry
-                    parentPtr
-                    (.some rootVal)
-                    targetLayouts
-                    localDecls
-                | _ => true
-            | .none =>
-              match lookupGlobalAlloc mem.globals parentPtr.allocId with
-              | .some alloc =>
-                checkGlobalAllocAlign
-                  localDecls
-                  layouts
-                  sliceAlignTyOpt
-                  alloc
-                  parentPtr.offsetBytes
-              | .none => true
-          let safeRefSliceAlignOk : Bool :=
-            match isRefLocal with
-            | false => true
-            | true =>
-              Bool.and
-                (checkDerefAlign localDecls layouts sliceAlignTyOpt parentPtr.offsetBytes)
-                sliceTargetAlignOk
-          match safeRefSliceAlignOk with
-          | false => .ub
-          | true =>
-            let isMut :=
-              match mutability with
-              | .not => false
-              | .mut => true
-            evalSliceFatPtrDerefBorrow
-              locals
-              mem
-              parentPtr
-              ptrSz
-              lenSc
-              restProj
-              perm
-              isMut
-              pointeeTyOpt
-              layouts
-              true
-              localDecls
-    | .some (.init (.aggregate 0 (.scalar addrSc :: .scalar lenSc :: .nil))) =>
-      match isRefLocal with
-      | true => .ub
-      | false =>
-        match cleanRest with
-        | .nil =>
+    | .some (.init (.aggregate 0 (dataVal :: metaVal :: .nil))) =>
+      match dynPlaceLocalKind? localDecls place.local_ with
+      | .some _ =>
+        match
+          evalDynFatPtrDerefRaw locals mutability place restProj
+            { borrows := mem.borrows, globals := mem.globals, callerLocals := mem.callerLocals,
+              callStack := (match mem.borrows with | .nil => .nil | _ :: _ => mem.callStack),
+              dynBodies := mem.callees,
+              fnPtrs := mem.fnPtrs,
+              nextAllocId := mem.nextAllocId, activeProtectors := mem.activeProtectors,
+              nextTag := mem.nextTag }
+            localDecls layouts dataVal metaVal
+        with
+        | .ok v => .ok v locals mem
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none =>
+        match dataVal, metaVal with
+        | .ptr parentPtr ptrSz, .scalar lenSc =>
           match
             Bool.and
-              (Nat.beq addrSc.sizeBytes ptrBytes)
+              (Nat.beq ptrSz ptrBytes)
               (Nat.beq lenSc.sizeBytes ptrBytes)
           with
-          | true =>
-            let modPtr := scalarModulus ptrBytes
-            .ok
-              (.aggregate 0
-                (.scalar ⟨wrapScalarBits addrSc.bits modPtr, ptrBytes⟩ ::
-                  .scalar ⟨wrapScalarBits lenSc.bits modPtr, ptrBytes⟩ :: .nil))
-              locals
-              mem
           | false => .ub
-        | _ :: _ =>
-          evalScalarSliceFatPtrDerefRaw
-            locals
-            mem
-            addrSc
-            lenSc
-            restProj
-            pointeeTyOpt
-            localDecls
-            layouts
-    | .some (.init (.aggregate 0 (dataVal :: .ptr vtPtr vtSz :: .nil))) =>
-      match
-        evalDynFatPtrDerefRaw locals mutability place restProj
-          { borrows := mem.borrows, globals := mem.globals, callerLocals := mem.callerLocals,
-            callStack := (match mem.borrows with | .nil => .nil | _ :: _ => mem.callStack),
-            callerBodies :=
-              (match mem.borrows with | .nil => .nil | _ :: _ => callerBodiesOf mem.callStack),
-            fnPtrs := mem.fnPtrs,
-            nextAllocId := mem.nextAllocId, activeProtectors := mem.activeProtectors,
-            nextTag := mem.nextTag }
-          localDecls layouts dataVal (.ptr vtPtr vtSz)
-      with
-      | .ok v => .ok v locals mem
-      | .ub => .ub
-      | .unsupported => .unsupported
+          | true =>
+            match cleanRest, isRawPtrLocal with
+            | .nil, true =>
+              let lenBits := wrapScalarBits lenSc.bits (scalarModulus ptrBytes)
+              .ok
+                (.aggregate 0
+                  (.ptr parentPtr ptrSz :: .scalar ⟨lenBits, ptrBytes⟩ :: .nil))
+                locals
+                mem
+            | _, true =>
+              let rawPerm :=
+                match lookupBorrow mem.borrows parentPtr.tag with
+                | .some pe => pe.perm
+                | .none => perm
+              evalSliceFatPtrDerefBorrow
+                locals
+                mem
+                parentPtr
+                ptrSz
+                lenSc
+                restProj
+                rawPerm
+                false
+                pointeeTyOpt
+                layouts
+                false
+            | _, false =>
+              let sliceAlignTyOpt : Option Ty :=
+                match pointeeTyOpt, restProj with
+                | .some pt, _ => .some pt
+                | .none, .nil => accessedTyOpt
+                | .none, _ :: _ => .none
+              let sliceTargetAlignOk : Bool :=
+                match lookupBorrow mem.borrows parentPtr.tag with
+                | .some parentEntry =>
+                  match activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal with
+                  | .some (.init rootVal) =>
+                    checkTargetPlaceAlign
+                      localDecls
+                      layouts
+                      sliceAlignTyOpt
+                      parentEntry
+                      parentPtr
+                      (.some rootVal)
+                  | .some _ => true
+                  | .none =>
+                    match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
+                    | .some (.init rootVal) =>
+                      let (targetDecls, targetLayouts) :=
+                        foreignFrameDeclsAndLayouts
+                          mem.callStack
+                          layouts
+                          parentEntry.targetFrameDepth
+                          parentEntry.targetLocal
+                      checkTargetPlaceAlign
+                        targetDecls
+                        layouts
+                        sliceAlignTyOpt
+                        parentEntry
+                        parentPtr
+                        (.some rootVal)
+                        targetLayouts
+                        localDecls
+                    | _ => true
+                | .none =>
+                  match lookupGlobalAlloc mem.globals parentPtr.allocId with
+                  | .some alloc =>
+                    checkGlobalAllocAlign
+                      localDecls
+                      layouts
+                      sliceAlignTyOpt
+                      alloc
+                      parentPtr.offsetBytes
+                  | .none => true
+              let safeRefSliceAlignOk : Bool :=
+                match isRefLocal with
+                | false => true
+                | true =>
+                  Bool.and
+                    (checkDerefAlign localDecls layouts sliceAlignTyOpt parentPtr.offsetBytes)
+                    sliceTargetAlignOk
+              match safeRefSliceAlignOk with
+              | false => .ub
+              | true =>
+                let isMut :=
+                  match mutability with
+                  | .not => false
+                  | .mut => true
+                evalSliceFatPtrDerefBorrow
+                  locals
+                  mem
+                  parentPtr
+                  ptrSz
+                  lenSc
+                  restProj
+                  perm
+                  isMut
+                  pointeeTyOpt
+                  layouts
+                  true
+                  localDecls
+        | .scalar addrSc, .scalar lenSc =>
+          match isRefLocal with
+          | true => .ub
+          | false =>
+            match cleanRest with
+            | .nil =>
+              match
+                Bool.and
+                  (Nat.beq addrSc.sizeBytes ptrBytes)
+                  (Nat.beq lenSc.sizeBytes ptrBytes)
+              with
+              | true =>
+                let modPtr := scalarModulus ptrBytes
+                .ok
+                  (.aggregate 0
+                    (.scalar ⟨wrapScalarBits addrSc.bits modPtr, ptrBytes⟩ ::
+                      .scalar ⟨wrapScalarBits lenSc.bits modPtr, ptrBytes⟩ :: .nil))
+                  locals
+                  mem
+              | false => .ub
+            | _ :: _ =>
+              evalScalarSliceFatPtrDerefRaw
+                locals
+                mem
+                addrSc
+                lenSc
+                restProj
+                pointeeTyOpt
+                localDecls
+                layouts
+        | _, .ptr _ _ => .unsupported
+        | _, _ => .ub
     | _ => .ub
   | _ =>
     match get? locals place.local_ with

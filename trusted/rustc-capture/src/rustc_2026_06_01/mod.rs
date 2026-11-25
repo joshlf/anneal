@@ -2127,6 +2127,15 @@ pub trait Shape {
 pub trait Named: Shape {
     fn name_len(&self) -> u32;
 }
+pub trait Tag {
+    fn tag(&self) -> u32;
+}
+pub trait Dual: Shape + Tag {
+    fn dual_sum(&self) -> u32;
+}
+pub trait Hrtb<'a> {
+    fn peek(&self, x: &'a u32) -> u32;
+}
 pub struct Sq(pub u32);
 pub struct Rect(pub u32, pub u32);
 impl Shape for Sq {
@@ -2140,6 +2149,15 @@ impl Shape for Rect {
 impl Named for Sq {
     fn name_len(&self) -> u32 { 2 }
 }
+impl Tag for Sq {
+    fn tag(&self) -> u32 { 7 }
+}
+impl Dual for Sq {
+    fn dual_sum(&self) -> u32 { self.0 + 7 }
+}
+impl<'a> Hrtb<'a> for Sq {
+    fn peek(&self, x: &'a u32) -> u32 { self.0 + *x }
+}
 pub fn use_dyn(x: u32) -> u32 {
     let s = Sq(x);
     let r = Rect(x, 2);
@@ -2147,7 +2165,12 @@ pub fn use_dyn(x: u32) -> u32 {
     let b: &dyn Shape = &r;
     let n: &dyn Named = &s;
     let up: &dyn Shape = n;
-    a.area() + b.area() + n.name_len() + up.area()
+    let d: &dyn Dual = &s;
+    let up_tag: &dyn Tag = d;
+    a.area() + b.area() + n.name_len() + up.area() + up_tag.tag()
+}
+pub fn use_hrtb(s: &Sq) -> &dyn for<'a> Hrtb<'a> {
+    s
 }
 pub fn use_raw(p: *const Sq) -> *const dyn Shape {
     p as *const dyn Shape
@@ -2212,6 +2235,26 @@ pub fn use_any(x: &u32) -> &dyn core::any::Any {
         assert!(t.contains(
             "concreteTy := (RigidTy.adt \"demo_dyn::Sq\" List.nil), dynKey := \"demo_dyn::Named\""
         ));
+        // Primary supertrait (`Named: Shape`) populates `primarySuperVTableId? := (Option.some _)`,
+        // and secondary supertrait (`Dual: Shape + Tag`) emits `CapturedVTableSlot.traitVPtr`.
+        assert!(
+            t.contains("primarySuperVTableId? := (Option.some "),
+            "expected primarySuperVTableId? for Named: Shape in:\n{t}"
+        );
+        assert!(
+            t.contains("(CapturedVTableSlot.traitVPtr "),
+            "expected traitVPtr slot for secondary supertrait Tag in:\n{t}"
+        );
+        // `charon#1640`: HRTB existential binder marks `hasUnresolvedExistentialBinder := true`.
+        assert!(
+            t.contains("hasUnresolvedExistentialBinder := true"),
+            "expected hasUnresolvedExistentialBinder := true for dyn for<'a> Hrtb<'a> in:\n{t}"
+        );
+        // Canonical predicateKey for `dyn Shape + Send` equals `"demo_dyn::Shape"` (no Debug hashes).
+        assert!(
+            t.contains("predicateKey := \"demo_dyn::Shape\""),
+            "expected canonical predicateKey in:\n{t}"
+        );
         assert!(t.contains("vtableId := 0, vtableAllocId := 16384"));
         // Header slots and the concrete `Shape::area` method of `Sq`.
         assert!(t.contains(

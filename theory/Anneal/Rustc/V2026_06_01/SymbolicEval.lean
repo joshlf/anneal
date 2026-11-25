@@ -5416,7 +5416,11 @@ theorem evalTerminatorSymTree_call_extCall
     (h_intrinsic :
       evalDirectRustIntrinsic?
         s (some currentBody) resolvedTarget currentBody.localDecls
-        currentBody.layouts argOps argVals locals' destination targetBb unwind = .none) :
+        currentBody.layouts argOps argVals locals' destination targetBb unwind = .none)
+    (h_dyn :
+      evalDynCallHook?
+        s (some currentBody) resolvedTarget currentBody.localDecls
+        currentBody.layouts argOps argVals locals' destination (.some targetBb) unwind = .none) :
     evalTerminatorSymTree
       s
       { kind := .call func argOps destination (.some targetBb) unwind, span := span }
@@ -5432,7 +5436,7 @@ theorem evalTerminatorSymTree_call_extCall
   dsimp only []
   rw [h_callee]
   dsimp only []
-  rw [h_exactDiv, h_indirect, h_intrinsic]
+  rw [h_exactDiv, h_indirect, h_intrinsic, h_dyn]
 /--
 `evalTerminatorSymTree` for a normal inlined call (`target = .some targetBb`)
 resolved via `CalleeCtx`.
@@ -5726,7 +5730,11 @@ theorem evalTerminatorSymTree_diverging_extCall
       .none)
     (h_not_unreach : isUnreachableCallTarget resolvedTarget.defPath = false)
     (h_not_abort : isAbortingPanicDefPath resolvedTarget.defPath = false)
-    (h_not_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false) :
+    (h_not_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false)
+    (h_dyn :
+      evalDynCallHook?
+        s (some currentBody) resolvedTarget currentBody.localDecls
+        currentBody.layouts argOps argVals locals' destination .none unwind = .none) :
     evalTerminatorSymTree
       s
       { kind := .call func argOps destination .none unwind, span := span }
@@ -5747,7 +5755,7 @@ theorem evalTerminatorSymTree_diverging_extCall
   dsimp only []
   cases resolvedTarget.isIndirect
   · dsimp only []
-    rw [h_not_unreach, h_not_abort, h_not_unwind]
+    rw [h_not_unreach, h_not_abort, h_not_unwind, h_dyn]
   · rfl
 
 /--
@@ -6294,7 +6302,7 @@ def evalMirDiffExecBounded
   match fuel with
   | 0 => .outOfFuel
   | fuel' + 1 =>
-    match stepMirStatePeriodic fuel' body st with
+    match stepMirStateStrict body st with
     | .ret (.normal (retVal, mem)) => .normal retVal mem
     | .ret .panic => .panic
     | .ret .abort => .abort
@@ -6355,7 +6363,7 @@ def probeMirDiffExecBounded
   match fuel with
   | 0 => (.outOfFuel, activeMirSpan body st)
   | fuel' + 1 =>
-    match stepMirStatePeriodic fuel' body st with
+    match stepMirStateStrict body st with
     | .ret (.normal (retVal, mem)) =>
       ((MirDiffVerdict.normal retVal mem).toTagWithBody body, "none")
     | .ret .panic => (.panic, activeMirSpan body st)
@@ -6390,7 +6398,7 @@ theorem probeMirDiffExecBounded_fst_eq_toTagWithBody
   | zero => rfl
   | succ fuel' ih =>
     unfold probeMirDiffExecBounded evalMirDiffExecBounded
-    rw [stepMirStatePeriodic_eq]
+    rw [stepMirStateStrict_eq]
     cases h_step : stepMirState body st with
     | ret out =>
       cases out with
@@ -7381,7 +7389,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalUnit
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
-    rw [stepMirStatePeriodic_eq] at h_ok
+    rw [stepMirStateStrict_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -7436,7 +7444,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
-    rw [stepMirStatePeriodic_eq] at h_ok
+    rw [stepMirStateStrict_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -7780,7 +7788,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_toTagWithBody_normalScalar
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
-    rw [stepMirStatePeriodic_eq] at h_ok
+    rw [stepMirStateStrict_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
