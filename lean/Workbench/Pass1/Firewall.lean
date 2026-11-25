@@ -32,6 +32,14 @@ Two complementary mechanisms are provided:
    a concrete `def myCut (k : Nat) (s : State) : Prop` `@[irreducible]` *after*
    proving its `seal`/`open`/`step` lemmas) removes the expanded `Prop` AST
    from the tactic goal completely.
+
+3. **Goal-Directed `ite` Branch Eliminators (`ite_*_imp`, `ite_eq_*_imp`):**
+   Elaborating an applied hypothesis `have h' := elim h` (or `rw [...] at h`)
+   when `h : if P then T else F` forces Lean's elaborator to put `h`'s type in
+   WHNF, evaluating expensive symbolic guards `P` (e.g., `15s+` on nested type
+   normalization or `checkVal` evaluators). Using `revert h; refine
+   ite_absurd_left_imp ... ?_; intro h` unifies `@ite` structurally against the
+   goal without reducing `P`.
 -/
 
 namespace Workbench.Pass1.Firewall
@@ -90,5 +98,62 @@ theorem finish_cut {σ : Type u} {cutAt : Nat → σ → Prop}
     (hDone : cutAt stage st → post)
     (hCut : IndexedCut cutAt stage st) : post :=
   hDone hCut.runCut
+
+/-! ## 3. Goal-Directed `ite` Branch Eliminators (No Guard WHNF Reduction) -/
+
+/-- Goal-directed case split on `@ite Prop P inst T F` in the goal head. Use via
+`revert h; refine ite_elim_imp ?_ ?_` when `P` is expensive to reduce so Lean
+matches `@ite` structurally without forcing WHNF on `P`. -/
+theorem ite_elim_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hT : P → T → G) (hF : ¬ P → F → G) : @ite Prop P inst T F → G :=
+  @Decidable.casesOn P (fun d => @ite Prop P d T F → G) inst hF hT
+
+theorem ite_true_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hP : P) (hT : T → G) : @ite Prop P inst T F → G :=
+  ite_elim_imp (fun _ h => hT h) (fun hNP _ => False.elim (hNP hP))
+
+theorem ite_false_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hNP : ¬ P) (hF : F → G) : @ite Prop P inst T F → G :=
+  ite_elim_imp (fun hP _ => False.elim (hNP hP)) (fun _ h => hF h)
+
+/-- Eliminate `@ite Prop P inst T F → G` when the `then`-branch `T` is absurd,
+without reducing the guard `P`. -/
+theorem ite_absurd_left_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hAbs : T → False) (hF : F → G) : @ite Prop P inst T F → G :=
+  ite_elim_imp (fun _ h => False.elim (hAbs h)) (fun _ h => hF h)
+
+/-- Eliminate `@ite Prop P inst T F → G` when the `else`-branch `F` is absurd,
+without reducing the guard `P`. -/
+theorem ite_absurd_right_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hT : T → G) (hAbs : F → False) : @ite Prop P inst T F → G :=
+  ite_elim_imp (fun _ h => hT h) (fun _ h => False.elim (hAbs h))
+
+/-- Value-level counterpart of `ite_elim_imp` for `@ite α P inst t f = r → G`,
+useful for `Except` / `StepResult` / `Option` branch hypotheses. -/
+theorem ite_eq_elim_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop}
+    (hT : P → t = r → G) (hF : ¬ P → f = r → G) :
+    @ite α P inst t f = r → G :=
+  @Decidable.casesOn P (fun d => @ite α P d t f = r → G) inst hF hT
+
+theorem ite_eq_true_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop} (hP : P) (hT : t = r → G) :
+    @ite α P inst t f = r → G :=
+  ite_eq_elim_imp (fun _ h => hT h) (fun hNP _ => False.elim (hNP hP))
+
+theorem ite_eq_false_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop} (hNP : ¬ P) (hF : f = r → G) :
+    @ite α P inst t f = r → G :=
+  ite_eq_elim_imp (fun hP _ => False.elim (hNP hP)) (fun _ h => hF h)
+
+theorem ite_eq_absurd_left_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop} (hNe : t ≠ r) (hF : f = r → G) :
+    @ite α P inst t f = r → G :=
+  ite_eq_elim_imp (fun _ h => False.elim (hNe h)) (fun _ h => hF h)
+
+theorem ite_eq_absurd_right_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop} (hT : t = r → G) (hNe : f ≠ r) :
+    @ite α P inst t f = r → G :=
+  ite_eq_elim_imp (fun _ h => hT h) (fun _ h => False.elim (hNe h))
 
 end Workbench.Pass1.Firewall

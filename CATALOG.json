@@ -503,11 +503,11 @@
       "path": "lean/Workbench/Pass1/Firewall.lean",
       "badge": "pass1_portable",
       "summary": "Pass-1-portable (`prelude` + `Init.Core`, zero axioms, zero `._unsafe_rec`) barriers that stop Lean's kernel `whnf` and tactic `rw` / `simp` traversals from penetrating huge symbolic weakest-precondition or MIR state ASTs. Two complementary mechanisms are provided:",
-      "line_count": 94,
+      "line_count": 159,
       "imports": [
         "Init.Core"
       ],
-      "declaration_count": 11,
+      "declaration_count": 21,
       "declarations": [
         {
           "kind": "structure",
@@ -552,6 +552,46 @@
         {
           "kind": "theorem",
           "name": "finish_cut"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_elim_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_true_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_false_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_absurd_left_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_absurd_right_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_eq_elim_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_eq_true_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_eq_false_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_eq_absurd_left_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_eq_absurd_right_imp"
         }
       ]
     },
