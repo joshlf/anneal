@@ -448,6 +448,28 @@ class ReconciliationTests(unittest.TestCase):
             os.utime(olean, (stamp + 100, stamp + 100))
             trace.unlink()
             self.assertIsNone(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"))
+            # Wrong Module.name in trace: rejected.
+            trace.write_text(json.dumps({"inputs": [[str(source.resolve()), "0123"], ["Module.name: Bar", "4567"]]}))
+            self.assertIsNone(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"))
+            # Matching Module.name: accepted.
+            trace.write_text(json.dumps({"inputs": [[str(source.resolve()), "0123"], ["Module.name: Foo", "4567"]]}))
+            self.assertEqual(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"), olean)
+            # Substring-only match inside an unrelated nested field: rejected.
+            trace.write_text(json.dumps({"inputs": [["note", str(source.resolve())]]}))
+            self.assertIsNone(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"))
+            # Symlink olean: rejected.
+            real_olean = build / "Real.olean"
+            olean.rename(real_olean)
+            olean.symlink_to(real_olean)
+            trace.write_text(json.dumps({"inputs": [[str(source.resolve()), "0123"]]}))
+            self.assertIsNone(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"))
+
+    def test_declaration_names_hash_distinguishes_equal_count_different_sets(self):
+        r_a = sta.reconcile({"s": [("A", self.oleans["A"])]})
+        r_c = sta.reconcile({"s": [("C", self.oleans["C"])]})
+        self.assertNotEqual(r_a["declarationNamesHash"], r_c["declarationNamesHash"])
+        r_a2 = sta.reconcile({"s": [("A", self.oleans["A"])]})
+        self.assertEqual(r_a["declarationNamesHash"], r_a2["declarationNamesHash"])
 
     def test_same_shard_conflict_and_bijective_numeric_dotted_names_detected(self):
         # Two conflicting modules in the SAME shard must still be detected.
@@ -577,7 +599,9 @@ class PeerGuardScannerTests(unittest.TestCase):
                   "def R.width (r : R) : Nat := r.hi - r.lo\n"
                   "def shadow (mk : Nat → Nat) : Nat := mk 0\n"
                   "open R in\n/-- @smart_constructor -/\ndef R.makeOpen (a : Nat) : R := mk a a (Nat.le_refl a)\n"
-                  "def unrelatedAfterOpenIn : Nat := mk 0\n")
+                  "def unrelatedAfterOpenIn : Nat := mk 0\n"
+                  "section\nopen R\n/-- @smart_constructor -/\ndef R.makeSec (a : Nat) : R := mk a a (Nat.le_refl a)\nend\n"
+                  "def unrelatedAfterSection : Nat := mk 0\n")
 
     def test_6b_unsealed_and_inhabited_rejected(self):
         self.assert_violation("/-- @invariant -/\nstructure R where\n  mk ::\n  lo : Nat\n", "6b", "private")
@@ -618,9 +642,18 @@ class PeerGuardScannerTests(unittest.TestCase):
                               "6b", "raw constructor")
         self.assert_violation(head + "open R\ndef leak (n : Nat) : R := let x := mk n; let mk := 0; x\n",
                               "6b", "raw constructor")
-        # Anonymous constructor and structure literal bypasses
+        # Anonymous constructor, structure literal, nested-paren, instance, and `.mk` dot-notation bypasses
         self.assert_violation(head + "def leak (n : Nat) : R := ⟨n⟩\n", "6b", "raw constructor")
+        self.assert_violation(head + "def leak (n : Nat) : R := id (⟨n⟩)\n", "6b", "raw constructor")
         self.assert_violation(head + "def leak (n : Nat) : R := { lo := n }\n", "6b", "raw constructor")
+        self.assert_violation(head + "def leak (n : Nat) : R := let r := ({ lo := n }); r\n", "6b", "raw constructor")
+        self.assert_violation(head + "def leak (n : Nat) : Nat × R := (0, { lo := n })\n", "6b", "raw constructor")
+        self.assert_violation(head + "def leak (n : Nat) : R := .mk n\n", "6b", "raw constructor")
+        self.assert_violation(head + "def leak (n : Nat) : Option R := some (.mk n)\n", "6b", "raw constructor")
+        self.assert_violation(head + "class Maker (α : Type) where make : Nat → α\n"
+                              "instance : Maker R where make n := ⟨n⟩\n", "6b", "raw constructor")
+        self.assert_violation(head + "class Maker (α : Type) where make : Nat → α\n"
+                              "instance : Maker R where make n := .mk n\n", "6b", "raw constructor")
         # Namespace-qualified `@invariant` structure accessed from outside namespace
         ns_head = "namespace Foo\n/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\nend Foo\n\n"
         self.assert_violation(ns_head + "def leak (n : Nat) : Foo.R := Foo.R.mk n\n", "6b", "raw constructor")

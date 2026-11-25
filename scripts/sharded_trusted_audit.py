@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import importlib.util
 import json
 import os
@@ -184,14 +185,42 @@ def run_shard(checkout: Path, modules: list[str], cache_dir: Path | None) -> dic
             "axioms": axioms.group(1) if axioms else None, "stderr": proc.stderr.strip()[-2000:]}
 
 
-def run_shards(checkout: Path = REPO_ROOT, cache_dir: Path | None = None, jobs: int = 4) -> list[dict]:
-    """Parallel downstream shards after the orphan gate."""
+def run_shards(checkout: Path = REPO_ROOT, cache_dir: Path | None = None, jobs: int = 4) -> dict:
+    """Parallel downstream shards after the orphan gate, followed by exact cross-shard reconciliation."""
     manifest = plan_shards(checkout)
-    orphan_gate(checkout, manifest)
+    orphan = orphan_gate(checkout, manifest)
     shards = [s for s in manifest["shards"] if s["kind"] == "downstream"]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        results = list(pool.map(lambda s: {"name": s["name"], **run_shard(checkout, s["modules"], cache_dir)}, shards))
-    return results
+    with tempfile.TemporaryDirectory(prefix="anneal-run-shards-") as keep_tmp:
+        keep_root = Path(keep_tmp)
+
+        def _exec(shard: dict) -> tuple[dict, dict]:
+            start = time.monotonic()
+            targets = ct.resolve_exact_modules(",".join(shard["modules"]))
+            report = audit_report(checkout, cache_dir, targets, keep=(shard["modules"], keep_root / shard["name"]))
+            return shard, {
+                "name": shard["name"],
+                "modules": shard["modules"],
+                "targets": len(targets),
+                "seconds": round(time.monotonic() - start, 2),
+                "axioms": report["axioms"],
+                "trustedDeclarations": report["kernelDeclarations"],
+                "inductiveConstants": report["downstream"]["inductiveReplay"]["inductiveConstants"],
+                "returncode": 0,
+            }
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+            pairs = list(pool.map(_exec, shards))
+        results = [item for _, item in pairs]
+        ref = results[0]
+        for item in results[1:]:
+            if item["axioms"] != ref["axioms"] or item["trustedDeclarations"] != ref["trustedDeclarations"]:
+                raise Failure(1, "run-shards", f"shard {item['name']} disagrees on Trusted boundary")
+        downstream_shards = {s["name"]: [(m, keep_root / s["name"] / f"{m}.olean") for m in s["modules"]]
+                             for s in shards}
+        reconciliation = reconcile(downstream_shards)
+        if reconciliation["conflicts"]:
+            raise Failure(1, "reconcile", f"cross-shard constant conflicts: {reconciliation['conflicts'][:5]}")
+    return {"orphan": orphan, "shards": results, "reconciliation": reconciliation}
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +352,9 @@ def reconcile(shard_modules: dict[str, list[tuple[str, Path]]], lean: Path = LEA
                 key = json.dumps(header[0], separators=(",", ":"))
                 owners.setdefault(key, set()).add((shard, str(header[2])))
         candidates = [json.loads(k) for k, s in sorted(owners.items()) if len(s) >= 2]
-        result = {"headers": counts, "declarations": len(owners), "candidates": len(candidates), "conflicts": []}
+        names_hash = hashlib.sha256("\n".join(sorted(owners)).encode("utf-8")).hexdigest()
+        result = {"headers": counts, "declarations": len(owners), "declarationNamesHash": names_hash,
+                  "candidates": len(candidates), "conflicts": []}
         if candidates:
             request.write_text(json.dumps({"modules": rows, "candidates": candidates}))
             out = tmp_path / "compare.json"
@@ -334,16 +365,27 @@ def reconcile(shard_modules: dict[str, list[tuple[str, Path]]], lean: Path = LEA
 
 def fresh_lake_olean(checkout: Path, module: str, rel: str) -> Path | None:
     """The Lake `.olean` of `module` only if it was built from *this* checkout's source and
-    is not older than it (a `.lake` copied from another checkout, or a stale build, is
-    evidence about different bytes and must not be reconciled)."""
+    is not older than it (a `.lake` copied from another checkout, a symlink, a trace from
+    another module, or a stale build is evidence about different bytes and must not be reconciled)."""
+    if not rel:
+        return None
     olean, source = lake_olean(checkout, module), checkout / rel
     trace = olean.with_suffix(".trace")
     try:
-        if not (olean.is_file() and trace.is_file() and source.is_file()):
+        if (olean.is_symlink() or trace.is_symlink() or source.is_symlink()
+                or not (olean.is_file() and trace.is_file() and source.is_file())):
             return None
-        inputs = json.dumps(json.loads(trace.read_text()).get("inputs", []))
-        if json.dumps(str(source.resolve())) not in inputs or olean.stat().st_mtime < source.stat().st_mtime:
+        raw_inputs = json.loads(trace.read_text()).get("inputs")
+        if not isinstance(raw_inputs, list):
             return None
+        src_str = str(source.resolve())
+        has_source = any(isinstance(item, list) and len(item) == 2 and item[0] == src_str for item in raw_inputs)
+        if not has_source or olean.stat().st_mtime < source.stat().st_mtime:
+            return None
+        for item in raw_inputs:
+            if isinstance(item, list) and len(item) == 2 and isinstance(item[0], str) and item[0].startswith("Module.name: "):
+                if item[0] != f"Module.name: {module}":
+                    return None
     except (OSError, ValueError):
         return None
     return olean
@@ -401,11 +443,8 @@ def verify_equivalence(checkout: Path = REPO_ROOT, cache_dir: Path | None = None
     """Sharded audits vs the monolithic `check_trusted.py --fast` audit."""
     manifest = plan_shards(checkout)
     orphan = orphan_gate(checkout, manifest)
-    keep_root = Path(tempfile.mkdtemp(prefix="anneal-equivalence-"))
-    try:
-        return _verify_equivalence(checkout, cache_dir, manifest, orphan, keep_root)
-    finally:
-        shutil.rmtree(keep_root, ignore_errors=True)
+    with tempfile.TemporaryDirectory(prefix="anneal-equivalence-") as keep_tmp:
+        return _verify_equivalence(checkout, cache_dir, manifest, orphan, Path(keep_tmp))
 
 
 def _verify_equivalence(checkout: Path, cache_dir: Path | None, manifest: dict, orphan: dict, keep_root: Path) -> dict:
@@ -441,16 +480,23 @@ def _verify_equivalence(checkout: Path, cache_dir: Path | None, manifest: dict, 
         raise Failure(1, "equivalence", "sharded claim/test-axiom counts differ from monolithic")
     # Exact cross-shard reconciliation over the artifacts the shards actually audited (each
     # shard contributes the modules it owns, so the shards partition the downstream modules),
-    # and declaration-set parity with the monolithic audit's artifacts.
+    # plus exact declaration-set and structural `constInfoCompat` parity with monolithic.
     downstream_shards = {s["name"]: [(m, keep_root / s["name"] / f"{m}.olean") for m in s["modules"]]
                          for s in manifest["shards"] if s["kind"] == "downstream"}
+    mono_mods = [(m, keep_root / "mono" / f"{m}.olean") for m in all_downstream]
     sharded = reconcile(downstream_shards)
-    monolithic = reconcile({"mono": [(m, keep_root / "mono" / f"{m}.olean") for m in all_downstream]})
+    monolithic = reconcile({"mono": mono_mods})
     if sharded["conflicts"]:
         raise Failure(1, "equivalence", f"cross-shard constant conflicts: {sharded['conflicts'][:5]}")
-    if sharded["declarations"] != monolithic["declarations"] or sum(sharded["headers"].values()) != sum(
-            monolithic["headers"].values()):
+    if monolithic["conflicts"]:
+        raise Failure(1, "equivalence", f"monolithic constant conflicts: {monolithic['conflicts'][:5]}")
+    if (sharded["declarations"] != monolithic["declarations"]
+            or sharded["declarationNamesHash"] != monolithic["declarationNamesHash"]
+            or sum(sharded["headers"].values()) != sum(monolithic["headers"].values())):
         raise Failure(1, "equivalence", "sharded downstream declaration set differs from monolithic")
+    cross = reconcile({**downstream_shards, "mono": mono_mods})
+    if cross["conflicts"] or cross["declarations"] != monolithic["declarations"]:
+        raise Failure(1, "equivalence", f"sharded vs monolithic constant mismatch: {cross['conflicts'][:5]}")
     lake = reconcile_lake(checkout, manifest, required=False)
     if lake["conflicts"]:
         raise Failure(1, "equivalence", f"cross-shard Lake constant conflicts: {lake['conflicts'][:5]}")
@@ -951,12 +997,56 @@ def _return_type_heads(sig: list) -> set[str]:
     return {head, head.split(".")[-1]}
 
 
-def _has_struct_literal_or_anon_ctor(body: list, return_is_sealed: bool, sealed_types: set[str]) -> int | None:
+def _codomain_mentions_sealed(sig: list, sealed_types: set[str]) -> bool:
+    """Whether the return type (after top-level `:`) mentions any sealed structure or alias."""
+    i, colon = 0, None
+    while i < len(sig):
+        if sig[i][0] in OPEN:
+            i = _group_end(sig, i)
+            continue
+        if sig[i][0] == ":":
+            colon = i
+            break
+        i += 1
+    if colon is None:
+        return False
+    return any(tok[0] in sealed_types or tok[0].split(".")[-1] in sealed_types for tok in sig[colon + 1:])
+
+
+def _has_struct_literal_or_anon_ctor(body: list, return_is_sealed: bool, codomain_mentions_sealed: bool,
+                                     is_instance: bool, sealed_types: set[str], sealed_fields: set[str]) -> int | None:
     """Return line number if `body` constructs a sealed structure via `⟨...⟩` or `{ ... := ... }`."""
+    allow_anon_default = return_is_sealed or (is_instance and codomain_mentions_sealed)
+
     def check_slice(toks: list, allow_return: bool) -> int | None:
         i = 0
         while i < len(toks):
             t, line = toks[i][0], toks[i][1]
+            # Track `let x : R := <rhs>` so `<rhs>` inherits sealed target type.
+            if t == "let" and i + 1 < len(toks):
+                eq = None
+                j = i + 2
+                while j < len(toks):
+                    if toks[j][0] == ":=":
+                        eq = j
+                        break
+                    j = _group_end(toks, j) if toks[j][0] in OPEN else j + 1
+                if eq is not None:
+                    let_ty_sealed = any(
+                        tok[0] in sealed_types or tok[0].split(".")[-1] in sealed_types for tok in toks[i + 2:eq]
+                    )
+                    end_rhs, k = len(toks), eq + 1
+                    while k < len(toks):
+                        tk, ln = toks[k][0], toks[k][1]
+                        if tk in (";", "in") or (k > eq + 1 and ln > toks[k - 1][1]):
+                            end_rhs = k
+                            break
+                        k = _group_end(toks, k) if tk in OPEN else k + 1
+                    sub = check_slice(toks[eq + 1:end_rhs], allow_return or let_ty_sealed)
+                    if sub is not None:
+                        return sub
+                    i = end_rhs + (1 if end_rhs < len(toks) and toks[end_rhs][0] in (";", "in") else 0)
+                    continue
             if t == "⟨":
                 end = _group_end(toks, i)
                 if allow_return:
@@ -976,19 +1066,26 @@ def _has_struct_literal_or_anon_ctor(body: list, return_is_sealed: bool, sealed_
                 inner = toks[i + 1:end - 1]
                 # Structure literal `{ field := val }` or `{ x with field := val }`
                 is_struct_lit = False
+                assigned_fields: set[str] = set()
                 k = 0
                 explicit_ty = None
                 while k < len(inner):
                     if inner[k][0] in OPEN:
                         k = _group_end(inner, k)
                         continue
-                    if inner[k][0] in (":=", "with"):
+                    if inner[k][0] == ":=":
+                        is_struct_lit = True
+                        if k > 0 and re.fullmatch(r"[A-Za-z_][\w']*", inner[k - 1][0]):
+                            assigned_fields.add(inner[k - 1][0])
+                    elif inner[k][0] == "with":
                         is_struct_lit = True
                     elif inner[k][0] == ":" and k + 1 < len(inner):
                         explicit_ty = inner[k + 1][0]
                     k += 1
                 if is_struct_lit:
                     if allow_return:
+                        return line
+                    if codomain_mentions_sealed and (assigned_fields & sealed_fields):
                         return line
                     if explicit_ty and (explicit_ty in sealed_types or explicit_ty.split(".")[-1] in sealed_types):
                         return line
@@ -1003,29 +1100,30 @@ def _has_struct_literal_or_anon_ctor(body: list, return_is_sealed: bool, sealed_
                 continue
             if t in OPEN:
                 end = _group_end(toks, i)
-                # Preserve `allow_return` if parens wrap the whole expression or `(expr : R)`
-                sub_allow = allow_return and (i == 0 and end == len(toks))
-                sub = check_slice(toks[i + 1:end - 1], sub_allow)
+                # Preserve `allow_return` across parens (`id (⟨n⟩)`, `let r := ({ lo := n })`).
+                sub = check_slice(toks[i + 1:end - 1], allow_return)
                 if sub is not None:
                     return sub
                 i = end
                 continue
             i += 1
         return None
-    return check_slice(body, return_is_sealed)
+    return check_slice(body, allow_anon_default)
 
 
 def scan_sealing(path: str, text: str) -> None:
     """Guard 6b over one file: `@invariant` structures need `private <ctor> ::`, no
     `Inhabited` derivation or instance, no `extends` carrier, and no public declaration
     (other than an `@smart_constructor`) that reaches the raw constructor (directly, via
-    `abbrev` type/constructor aliases, via `private` helpers, or via `⟨...⟩`/`{...}`)."""
+    dot-notation `.ctor`, via `abbrev` type/constructor aliases, via `private` helpers,
+    or via `⟨...⟩`/`{...}`)."""
     clean = strip_lean_comments(text)
     toks = _tokenize_rich(text)
 
     def scope_at(limit: int, decl_start: int | None = None) -> tuple[list[str], set[str], dict[str, str], set[str]]:
         """Namespace stack, opened namespaces, `open ... renaming` map, and explicit open ids."""
-        frames: list[list[str]] = []
+        # Each frame stores `(kind, name_parts, saved_opened, saved_renamed, saved_explicit)`.
+        frames: list[tuple[str, list[str], set[str], dict[str, str], set[str]]] = []
         opened: set[str] = set()
         renamed: dict[str, str] = {}
         explicit_ids: set[str] = set()
@@ -1044,18 +1142,24 @@ def scan_sealing(path: str, text: str) -> None:
                 i += 1
                 continue
             if t == "namespace" and i + 1 < limit:
-                frames.append(toks[i + 1][0].split("."))
+                frames.append(("namespace", toks[i + 1][0].split("."), set(opened), dict(renamed), set(explicit_ids)))
                 i += 2
+                continue
+            if t == "section":
+                sec_name = (toks[i + 1][0].split(".") if i + 1 < limit and toks[i + 1][0] not in _SCOPE_STOPS
+                            and toks[i + 1][1] == toks[i][1] else [])
+                frames.append(("section", sec_name, set(opened), dict(renamed), set(explicit_ids)))
+                i += 2 if sec_name else 1
                 continue
             if t == "end":
                 if frames:
                     if i + 1 < limit and toks[i + 1][0] not in _SCOPE_STOPS and toks[i + 1][1] == toks[i][1]:
                         end_parts = toks[i + 1][0].split(".")
-                        if frames[-1] == end_parts:
-                            frames.pop()
+                        if frames[-1][1] == end_parts:
+                            _, _, opened, renamed, explicit_ids = frames.pop()
                         i += 2
                         continue
-                    frames.pop()
+                    _, _, opened, renamed, explicit_ids = frames.pop()
                 i += 1
                 continue
             if t == "open":
@@ -1133,11 +1237,12 @@ def scan_sealing(path: str, text: str) -> None:
                 i = j
                 continue
             i += 1
-        ns_flat = [seg for frame in frames for seg in frame]
+        ns_flat = [seg for kind_f, parts, _, _, _ in frames if kind_f == "namespace" for seg in parts]
         return ns_flat, opened, renamed, explicit_ids
 
     # Map character offset -> token index for namespace lookup of `@invariant` structures.
     sealed: dict[str, str] = {}
+    sealed_fields: set[str] = set()
     for match in re.finditer(r"\b(structure|class)\s+([A-Za-z_][\w.']*)", clean):
         if not _doc_tag(text, match.start(), "@invariant"):
             continue
@@ -1154,6 +1259,8 @@ def scan_sealing(path: str, text: str) -> None:
         if re.search(r"\bderiving\b[\s\S]*?\bInhabited\b", decl):
             raise GuardViolation("6b", f"invariant structure {full_name} derives Inhabited", path, line)
         sealed[full_name] = ctor.group(2)
+        for fm in re.finditer(r"^\s+([A-Za-z_][\w']*)\s*:(?!:)", decl[ctor.end():], re.MULTILINE):
+            sealed_fields.add(fm.group(1))
     if not sealed:
         return
 
@@ -1194,17 +1301,21 @@ def scan_sealing(path: str, text: str) -> None:
             raise GuardViolation("6b", f"carrier structure {match.group(1)} extends an invariant structure", path,
                                  clean.count("\n", 0, match.start()) + 1)
 
-    def body_reaches_sealed(body: list, sig: list, scope_info, ctor_aliases: set[str],
+    def body_reaches_sealed(kw: str, body: list, sig: list, scope_info, ctor_aliases: set[str],
                             private_fwd: set[str]) -> int | None:
         ns_flat, opened, renamed, explicit_ids = scope_info
         sealed_ctors = set(sealed.values())
+        ret_is_sealed = bool(_return_type_heads(sig) & all_sealed_types)
+        cod_mentions_sealed = ret_is_sealed or _codomain_mentions_sealed(sig, all_sealed_types)
         direct_ctors: set[str] = set()
         for alias_ty, full in type_names.items():
             ctor = sealed[full]
             direct_ctors.add(f"{alias_ty}.{ctor}")
             direct_ctors.add(f"{full}.{ctor}")
 
-        def token_hits(t: str, bound: set[str]) -> bool:
+        def token_hits(t: str, bound: set[str], prev_tok: str | None) -> bool:
+            if prev_tok == "." and t in sealed_ctors and cod_mentions_sealed:
+                return True
             if t in bound:
                 return False
             last = t.split(".")[-1]
@@ -1233,6 +1344,7 @@ def scan_sealing(path: str, text: str) -> None:
             i = 0
             while i < len(toks_slice):
                 t, line = toks_slice[i][0], toks_slice[i][1]
+                prev_tok = toks_slice[i - 1][0] if i > 0 else None
                 if t in ("fun", "λ"):
                     j = i + 1
                     while j < len(toks_slice) and toks_slice[j][0] not in ("=>", "↦"):
@@ -1281,7 +1393,7 @@ def scan_sealing(path: str, text: str) -> None:
                         return hit
                     i = end_g
                     continue
-                if token_hits(t, local_bound):
+                if token_hits(t, local_bound, prev_tok):
                     return line
                 i += 1
             return None
@@ -1289,8 +1401,9 @@ def scan_sealing(path: str, text: str) -> None:
         hit = walk(body, _sig_bound_names(sig))
         if hit is not None:
             return hit
-        ret_is_sealed = bool(_return_type_heads(sig) & all_sealed_types)
-        return _has_struct_literal_or_anon_ctor(body, ret_is_sealed, all_sealed_types)
+        return _has_struct_literal_or_anon_ctor(
+            body, ret_is_sealed, cod_mentions_sealed, kw == "instance", all_sealed_types, sealed_fields
+        )
 
     # Pass 2: fixed-point collection of `ctor_aliases` (`abbrev`) and `private_forwarders`.
     ctor_aliases: set[str] = set()
@@ -1306,12 +1419,12 @@ def scan_sealing(path: str, text: str) -> None:
             full_name = ".".join(ns_flat + [name]) if ns_flat else name
             is_priv = _is_private_decl(toks, start)
             if kw == "abbrev" and name not in ctor_aliases:
-                if body_reaches_sealed(body, sig, scope_info, ctor_aliases, private_forwarders) is not None:
+                if body_reaches_sealed(kw, body, sig, scope_info, ctor_aliases, private_forwarders) is not None:
                     ctor_aliases.add(name)
                     ctor_aliases.add(full_name)
                     changed = True
             if is_priv and name not in private_forwarders:
-                if body_reaches_sealed(body, sig, scope_info, ctor_aliases, private_forwarders) is not None:
+                if body_reaches_sealed(kw, body, sig, scope_info, ctor_aliases, private_forwarders) is not None:
                     private_forwarders.add(name)
                     private_forwarders.add(full_name)
                     changed = True
@@ -1331,7 +1444,7 @@ def scan_sealing(path: str, text: str) -> None:
         if _doc_tag(text, kw_offset, "@smart_constructor"):
             continue
         scope_info = scope_at(start, start)
-        hit_line = body_reaches_sealed(body, sig, scope_info, ctor_aliases, private_forwarders)
+        hit_line = body_reaches_sealed(kw, body, sig, scope_info, ctor_aliases, private_forwarders)
         if hit_line is not None:
             raise GuardViolation("6b", f"public declaration {name or kw} reaches a sealed raw constructor",
                                  path, hit_line)
@@ -1391,13 +1504,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.plan:
             print(json.dumps(plan_shards(REPO_ROOT), indent=2, sort_keys=True))
         elif args.run_shards:
-            results = run_shards(REPO_ROOT, args.cache_dir, args.jobs)
-            print(json.dumps(results, indent=2))
-            failed = [r for r in results if r["returncode"] != 0]
-            if failed:
-                return max(r["returncode"] for r in failed if r["returncode"] in (1, 2)) if all(
-                    r["returncode"] in (1, 2) for r in failed) else 2
-            print(f"PASS: {len(results)} downstream shards")
+            summary = run_shards(REPO_ROOT, args.cache_dir, args.jobs)
+            print(json.dumps(summary, indent=2, sort_keys=True))
+            print(f"PASS: {len(summary['shards'])} downstream shards reconciled")
         elif args.reconcile:
             result = reconcile_lake(REPO_ROOT)
             if result["conflicts"]:
