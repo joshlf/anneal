@@ -31,12 +31,16 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 
 Connects the reduced-product value domain `AbsVal` (`InitDom` x `Tnum` x
 `WrappedInterval` x `StridedCong`) to the ground operational semantics
-`Trusted.Rustc.V2026_06_01.MirSemantics` over unsigned integer (`UintTy`),
-boolean, and unit locals.
+`Trusted.Rustc.V2026_06_01.MirSemantics` over unsigned (`UintTy`) and signed
+(`IntTy`) integer, boolean, unit, and `(u, bool)` checked-arithmetic locals.
 
 * Section 1 relates `ScalarInt` arithmetic (`scalarModulus`,
-  `wrapScalarBits`, `evalScalarBinOp` at `isSigned = false`, `boolToScalar`)
-  to the `Nat`-level operations used by the `AbsVal` transfer theorems.
+  `wrapScalarBits`, `evalScalarBinOp`, `evalUnaryNot`, `boolToScalar`) to the
+  `Nat`-level operations used by the `AbsVal` transfer theorems. Signed values
+  are tracked by their two's-complement bit pattern at the width of the
+  unsigned twin type (`intTwin`): sign-agnostic operators
+  (`binOpSignAgnostic`) evaluate identically at `isSigned = true`, and signed
+  ordered comparisons coincide with unsigned ones on non-negative operands.
 * Section 2 defines relational comparison guards (`RelGuard`), abstract
   booleans (`BoolAbs`), abstract local slots (`MirAbsSlot`) and frames
   (`MirAbsEnv`), their concretizations against `List LocalSlot`, the
@@ -106,6 +110,37 @@ theorem uintBytes_mul_eight (u : UintTy) :
 theorem intCastTargetBytes_uint (u : UintTy) :
     intCastTargetBytes (.uint u) = some (uintBytes u) := by
   cases u <;> rfl
+
+/-- Unsigned type of the same width as a signed type (`isize ↦ usize`). Signed
+values are tracked by their two's-complement bit pattern at this width. -/
+def intTwin : IntTy → UintTy
+  | .i8 => .u8
+  | .i16 => .u16
+  | .i32 => .u32
+  | .i64 => .u64
+  | .i128 => .u128
+  | .isize => .usize
+
+/-- Structural equality on `IntTy`. -/
+def intTyBeq : IntTy → IntTy → Bool
+  | .i8, .i8 => true
+  | .i16, .i16 => true
+  | .i32, .i32 => true
+  | .i64, .i64 => true
+  | .i128, .i128 => true
+  | .isize, .isize => true
+  | _, _ => false
+
+theorem intTyBeq_refl (i : IntTy) : intTyBeq i i = true := by
+  cases i <;> rfl
+
+theorem intTy_eq_of_beq {i1 i2 : IntTy} (h : intTyBeq i1 i2 = true) :
+    i1 = i2 := by
+  cases i1 <;> cases i2 <;> first | rfl | nomatch h
+
+theorem intCastTargetBytes_int (i : IntTy) :
+    intCastTargetBytes (.int i) = some (uintBytes (intTwin i)) := by
+  cases i <;> rfl
 
 theorem modPow2_uintWidth_mono {u1 u2 : UintTy}
     (h : Nat.ble (uintWidth u1) (uintWidth u2) = true) :
@@ -526,6 +561,156 @@ theorem evalScalarBinOp_bool_ge (c1 c2 : Bool) :
     evalScalarBinOp .ge (boolToScalar c1) (boolToScalar c2) locals mem false =
       .ok (.scalar (boolToScalar (c1 || !c2))) locals mem := by
   cases c1 <;> cases c2 <;> rfl
+
+/-- `BinOp`s whose `evalScalarBinOp` result does not depend on `isSigned`
+(two's-complement wrapping arithmetic, bitwise operations, equality, and
+left shifts). -/
+def binOpSignAgnostic : BinOp → Bool
+  | .add | .sub | .mul | .bitAnd | .bitOr | .bitXor | .eq | .ne
+  | .shl | .shlUnchecked => true
+  | _ => false
+
+/-- Sign-agnostic operators evaluate identically at `isSigned = true`. -/
+theorem evalScalarBinOp_signAgnostic {op : BinOp}
+    (h : binOpSignAgnostic op = true) (lhs rhs : ScalarInt) :
+    evalScalarBinOp op lhs rhs locals mem true =
+      evalScalarBinOp op lhs rhs locals mem false := by
+  cases op <;> simp only [binOpSignAgnostic, reduceCtorEq] at h <;>
+    simp only [evalScalarBinOp]
+
+/-- Signed relational operators (`lt`, `le`, `gt`, `ge`). -/
+def binOpIsOrdCmp : BinOp → Bool
+  | .lt | .le | .gt | .ge => true
+  | _ => false
+
+theorem isSignedNegative_of_lt_half {x : Nat}
+    (hx : x < modPow2 (uintWidth u) / 2) :
+    isSignedNegative x (uintBytes u) = false := by
+  have hM : x < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hx (Nat.div_le_self _ 2)
+  simp only [isSignedNegative, uintBytes_beq_zero]
+  rw [wrapScalarBits_of_lt_uint hM, scalarModulus_uintBytes]
+  cases h : Nat.ble (modPow2 (uintWidth u) / 2) x with
+  | false => rfl
+  | true => exact False.elim (Nat.not_le_of_gt hx (Nat.le_of_ble_eq_true h))
+
+theorem signedLt_of_nonneg {x y : Nat}
+    (hx : x < modPow2 (uintWidth u) / 2) (hy : y < modPow2 (uintWidth u) / 2) :
+    signedLt x y (uintBytes u) = !(Nat.ble y x) := by
+  have hxM : x < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hx (Nat.div_le_self _ 2)
+  have hyM : y < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hy (Nat.div_le_self _ 2)
+  simp only [signedLt]
+  rw [wrapScalarBits_of_lt_uint hxM, wrapScalarBits_of_lt_uint hyM,
+    isSignedNegative_of_lt_half hx, isSignedNegative_of_lt_half hy]
+
+/-- On non-negative operands (below the signed half-range), signed ordered
+comparisons coincide with unsigned ones. -/
+theorem evalScalarBinOp_ordCmp_nonneg {op : BinOp}
+    (hop : binOpIsOrdCmp op = true) {x y : Nat}
+    (hx : x < modPow2 (uintWidth u) / 2) (hy : y < modPow2 (uintWidth u) / 2) :
+    evalScalarBinOp op ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem true =
+      evalScalarBinOp op ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem false := by
+  cases op <;> simp only [binOpIsOrdCmp, reduceCtorEq] at hop <;>
+    simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl, signedLe,
+      signedLt_of_nonneg hx hy, signedLt_of_nonneg hy hx, Bool.not_not]
+
+/-- Signed ordered comparisons always produce a `bool` scalar. -/
+theorem evalScalarBinOp_ordCmp_bool {op : BinOp}
+    (hop : binOpIsOrdCmp op = true) {x y : Nat} :
+    ∃ c, evalScalarBinOp op ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem true =
+      .ok (.scalar (boolToScalar c)) locals mem := by
+  cases op <;> simp only [binOpIsOrdCmp, reduceCtorEq] at hop <;>
+    simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl] <;>
+    exact ⟨_, rfl⟩
+
+theorem two_pow_uintBytes (u : UintTy) :
+    2 ^ (8 * uintBytes u) = modPow2 (uintWidth u) := by
+  cases u <;> rfl
+
+/-- Signed arithmetic `.shr` stays within the bit width. -/
+theorem evalScalarBinOp_sint_shr {u2 : UintTy} :
+    ∃ bits, bits < modPow2 (uintWidth u) ∧
+      evalScalarBinOp .shr ⟨a, uintBytes u⟩ ⟨b, uintBytes u2⟩ locals mem true =
+        .ok (.scalar ⟨bits, uintBytes u⟩) locals mem := by
+  simp only [evalScalarBinOp, uintBytes_beq_zero, uintBytes_mul_eight]
+  refine ⟨_, ?_, rfl⟩
+  rw [← two_pow_uintBytes]
+  exact Anneal.Scalars.arithmeticShrBits_lt_two_pow _ _ _
+
+/-- Signed arithmetic `.shrUnchecked` with an in-range shift amount. -/
+theorem evalScalarBinOp_sint_shrUnchecked {u2 : UintTy}
+    (hb : b < uintWidth u) :
+    ∃ bits, bits < modPow2 (uintWidth u) ∧
+      evalScalarBinOp .shrUnchecked ⟨a, uintBytes u⟩ ⟨b, uintBytes u2⟩ locals
+        mem true = .ok (.scalar ⟨bits, uintBytes u⟩) locals mem := by
+  have hB : Nat.ble (uintWidth u) b = false := by
+    cases h : Nat.ble (uintWidth u) b with
+    | false => rfl
+    | true => exact False.elim (Nat.not_le_of_gt hb (Nat.le_of_ble_eq_true h))
+  simp only [evalScalarBinOp, uintBytes_beq_zero, uintBytes_mul_eight, hB]
+  refine ⟨_, ?_, rfl⟩
+  rw [← two_pow_uintBytes]
+  exact Anneal.Scalars.arithmeticShrBits_lt_two_pow _ _ _
+
+/-- Signed bitwise `UnOp.not` (`evalUnaryNot` at an `.int` operand type). -/
+theorem evalUnaryNot_int {ty : Ty} {i2 : IntTy} (hTy : ty.kind = .int i2)
+    (ha : a < modPow2 (uintWidth u)) :
+    evalUnaryNot ⟨a, uintBytes u⟩ (some ty) locals mem =
+      .ok (.scalar ⟨modPow2 (uintWidth u) - 1 - a, uintBytes u⟩)
+        locals mem := by
+  cases ty with
+  | mk kind idx =>
+    simp only at hTy
+    subst hTy
+    simp only [evalUnaryNot, uintBytes_beq_zero]
+    rw [wrapScalarBits_of_lt_uint ha, scalarModulus_uintBytes]
+    rfl
+
+theorem uintBytes_ble_eq_width (u1 u2 : UintTy) :
+    Nat.ble (uintBytes u1) (uintBytes u2) =
+      Nat.ble (uintWidth u1) (uintWidth u2) := by
+  cases u1 <;> cases u2 <;> rfl
+
+/-- Sign extension of a non-negative bit pattern to a wider type is the
+identity. -/
+theorem signExtendBits_nonneg {u2 : UintTy}
+    (hx : a < modPow2 (uintWidth u) / 2)
+    (hW : Nat.ble (uintBytes u2) (uintBytes u) = false) :
+    signExtendBits a (uintBytes u) (uintBytes u2) = a := by
+  have hM : a < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hx (Nat.div_le_self _ 2)
+  simp only [signExtendBits, hW]
+  rw [wrapScalarBits_of_lt_uint hM, isSignedNegative_of_lt_half hx]
+
+theorem signExtendBits_lt_uint (u1 u2 : UintTy) (x : Nat) :
+    signExtendBits x (uintBytes u1) (uintBytes u2) < modPow2 (uintWidth u2) := by
+  have hPos1 := modPow2_pos (uintWidth u1)
+  have hPos2 := modPow2_pos (uintWidth u2)
+  have hcLt : wrapScalarBits x (modPow2 (uintWidth u1)) < modPow2 (uintWidth u1) := by
+    rw [Anneal.Scalars.wrapScalarBits_eq_mod_modulus]
+    exact nat_mod_lt _ hPos1
+  simp only [signExtendBits]
+  rw [scalarModulus_uintBytes, scalarModulus_uintBytes]
+  cases hB : Nat.ble (uintBytes u2) (uintBytes u1) with
+  | true =>
+    simp only
+    rw [Anneal.Scalars.wrapScalarBits_eq_mod_modulus]
+    exact nat_mod_lt _ hPos2
+  | false =>
+    simp only
+    rw [uintBytes_ble_eq_width] at hB
+    have hW : uintWidth u1 < uintWidth u2 :=
+      Nat.lt_of_not_le (fun h => by rw [Nat.ble_eq_true_of_le h] at hB; nomatch hB)
+    have hMono := modPow2_mono (Nat.le_of_lt hW)
+    cases isSignedNegative (wrapScalarBits x (modPow2 (uintWidth u1)))
+        (uintBytes u1) with
+    | false => exact Nat.lt_of_lt_of_le hcLt hMono
+    | true =>
+      have h := Nat.add_lt_add_left hcLt (modPow2 (uintWidth u2) - modPow2 (uintWidth u1))
+      rw [Nat.sub_add_cancel hMono] at h
+      exact h
 
 end ScalarOps
 
@@ -1598,7 +1783,8 @@ locals, `.unit isInit` a `()` local, and `.uintBoolPair` a `(u, bool)` checked
 arithmetic tuple (`*WithOverflow`). `.uintCopy u a src` is a `.uint u a` slot
 that, when initialized, additionally holds the same bit pattern as local `src`
 (recorded by `_t = copy _src`, so that comparisons on the temporary `_t`
-synthesize `RelGuard`s on `_src`). -/
+synthesize `RelGuard`s on `_src`). `.sint i a` is a signed local tracked by
+its bit pattern at width `uintWidth (intTwin i)`. -/
 inductive MirAbsSlot where
   | top
   | dead
@@ -1607,6 +1793,7 @@ inductive MirAbsSlot where
   | unit (isInit : Bool)
   | uintBoolPair (u : UintTy) (a : AbsVal) (ov : BoolAbs)
   | uintCopy (u : UintTy) (a : AbsVal) (src : Nat)
+  | sint (i : IntTy) (a : AbsVal)
 
 /-- Abstract MIR local frame, one `MirAbsSlot` per `LocalDecl`. -/
 abbrev MirAbsEnv := List MirAbsSlot
@@ -1662,6 +1849,17 @@ def MirAbsSlot.denote (ty : Ty) (locals : List LocalSlot) (slot : MirAbsSlot)
         sc.sizeBytes = uintBytes u ∧ a.denote (uintWidth u) (some sc.bits) ∧
         localUintNat? locals src u = some sc.bits
       | _ => False
+  | .sint i a =>
+    ty.kind = .int i ∧
+    match cs with
+    | .dead => False
+    | .uninit => a.denote (uintWidth (intTwin i)) none
+    | .init v =>
+      match v with
+      | .scalar sc =>
+        sc.sizeBytes = uintBytes (intTwin i) ∧
+        a.denote (uintWidth (intTwin i)) (some sc.bits)
+      | _ => False
 
 /-- Forgetting the copy alias of a `.uintCopy` slot is sound. -/
 theorem uintCopy_denote_uint {ty : Ty} {locals : List LocalSlot} {u : UintTy}
@@ -1685,6 +1883,7 @@ def uninitSlotFor (ty : Ty) : MirAbsSlot :=
   | .bool => .bool .uninit
   | .tuple [] => .unit false
   | .tuple [.uint u, .bool] => .uintBoolPair u (AbsVal.uninit (uintWidth u)) .uninit
+  | .int i => .sint i (AbsVal.uninit (uintWidth (intTwin i)))
   | _ => .top
 
 theorem uninitSlotFor_denote (ty : Ty) (locals : List LocalSlot) :
@@ -1699,6 +1898,8 @@ theorem uninitSlotFor_denote (ty : Ty) (locals : List LocalSlot) :
     exact ⟨h, rfl⟩
   · rename_i u h
     exact ⟨h, absVal_uninit_sound_none, True.intro⟩
+  · rename_i i h
+    exact ⟨h, absVal_uninit_sound_none⟩
   · exact True.intro
 
 /-- `slot` guarantees the concrete local is live (not `.dead`). -/
@@ -1714,6 +1915,7 @@ def MirAbsSlot.isInit : MirAbsSlot → Bool
   | .unit i => i
   | .uintBoolPair _ a ov => a.isInit && ov.isInit
   | .uintCopy _ a _ => a.isInit
+  | .sint _ a => a.isInit
   | _ => false
 
 /-- `slot` is unreachable (empty concretization). -/
@@ -1722,6 +1924,7 @@ def MirAbsSlot.isBot : MirAbsSlot → Bool
   | .bool ba => ba.isBot
   | .uintBoolPair _ a ov => a.isBot || ov.isBot
   | .uintCopy _ a _ => a.isBot
+  | .sint _ a => a.isBot
   | _ => false
 
 theorem mirAbsSlot_not_isBot {ty : Ty} {locals : List LocalSlot}
@@ -1751,6 +1954,14 @@ theorem mirAbsSlot_not_isBot {ty : Ty} {locals : List LocalSlot}
       cases v with
       | scalar sc => exact absVal_not_isBot hBot h'.2.2
       | _ => exact h'.2
+  | sint i a =>
+    cases cs with
+    | dead => exact h.2
+    | uninit => exact absVal_not_isBot hBot h.2
+    | init v =>
+      cases v with
+      | scalar sc => exact absVal_not_isBot hBot h.2.2
+      | _ => exact h.2
   | uintBoolPair u a ov =>
     cases hA : a.isBot with
     | true =>
@@ -1808,6 +2019,7 @@ def MirAbsSlot.toUninit : MirAbsSlot → MirAbsSlot
   | .unit _ => .unit false
   | .uintBoolPair u _ _ => .uintBoolPair u (AbsVal.uninit (uintWidth u)) .uninit
   | .uintCopy u _ _ => .uint u (AbsVal.uninit (uintWidth u))
+  | .sint i _ => .sint i (AbsVal.uninit (uintWidth (intTwin i)))
   | _ => .top
 
 theorem mirAbsSlot_toUninit_denote {ty : Ty} {locals : List LocalSlot}
@@ -1820,6 +2032,7 @@ theorem mirAbsSlot_toUninit_denote {ty : Ty} {locals : List LocalSlot}
   | unit _ => exact ⟨h.1, rfl⟩
   | uintBoolPair u _ _ => exact ⟨h.1, absVal_uninit_sound_none, True.intro⟩
   | uintCopy u _ _ => exact ⟨h.1, absVal_uninit_sound_none⟩
+  | sint i _ => exact ⟨h.1, absVal_uninit_sound_none⟩
 
 theorem mirAbsSlot_live {ty : Ty} {locals : List LocalSlot} {s : MirAbsSlot}
     {cs : LocalSlot} (hLive : s.isLive = true) (h : s.denote ty locals cs) :
@@ -1834,6 +2047,7 @@ theorem mirAbsSlot_live {ty : Ty} {locals : List LocalSlot} {s : MirAbsSlot}
   | unit _ => exact h.2
   | uintBoolPair _ _ _ => exact h.2
   | uintCopy _ _ _ => exact h.2
+  | sint _ _ => exact h.2
 
 /-- An initialized slot denotes an initialized concrete local. -/
 theorem mirAbsSlot_init {ty : Ty} {locals : List LocalSlot} {s : MirAbsSlot}
@@ -1921,6 +2135,16 @@ theorem mirAbsSlot_init {ty : Ty} {locals : List LocalSlot} {s : MirAbsSlot}
       cases v with
       | scalar sc => exact ⟨.scalar sc, rfl, rfl⟩
       | _ => exact False.elim h.2
+  | sint i a =>
+    cases cs with
+    | dead => exact False.elim h.2
+    | uninit =>
+      cases absVal_init_of_isInit hInit h.2 with
+      | intro _ hx => nomatch hx.1
+    | init v =>
+      cases v with
+      | scalar sc => exact ⟨.scalar sc, rfl, rfl⟩
+      | _ => exact False.elim h.2
 
 /-- Extract the concrete scalar of an initialized `.uint` slot. -/
 theorem uint_slot_extract {ty : Ty} {locals : List LocalSlot} {u : UintTy}
@@ -1997,6 +2221,7 @@ theorem mirAbsSlot_valDenote_of_denote {ty : Ty} {locals : List LocalSlot}
   | unit _ => exact hDen
   | bool ba => exact ⟨hDen.1, boolAbs_valDenote_of_denote hNoG hDen.2⟩
   | uintCopy _ _ _ => nomatch hNoG
+  | sint _ _ => exact hDen
   | uintBoolPair u a ov =>
     refine ⟨hDen.1, ?_⟩
     cases v with
@@ -2040,6 +2265,7 @@ theorem mirAbsSlot_clearGuardIf_update {ty : Ty}
   | dead => exact h
   | uint _ _ => exact h
   | unit _ => exact h
+  | sint _ _ => exact h
   | bool ba =>
     refine ⟨h.1, ?_⟩
     cases cs with
@@ -2166,6 +2392,8 @@ def MirAbsSlot.le (a b : MirAbsSlot) : Bool :=
       uintTyBeq u1 u2 && AbsVal.le (uintWidth u1) a1 a2
     | .uintCopy u1 a1 s1, .uintCopy u2 a2 s2 =>
       (uintTyBeq u1 u2 && Nat.beq s1 s2) && AbsVal.le (uintWidth u1) a1 a2
+    | .sint i1 a1, .sint i2 a2 =>
+      intTyBeq i1 i2 && AbsVal.le (uintWidth (intTwin i1)) a1 a2
     | _, _ => false
 
 /-- Soundness of `MirAbsSlot.le`. -/
@@ -2226,6 +2454,21 @@ theorem mirAbsSlot_le_sound {ty : Ty} {locals : List LocalSlot}
         | init v =>
           cases v with
           | scalar sc => exact ⟨ha.2.1, absVal_le_sound hA ha.2.2.1, ha.2.2.2⟩
+          | _ => exact ha.2
+      | _ => nomatch hLe
+    | sint i2 a2 =>
+      cases a with
+      | sint i1 a1 =>
+        have hi := intTy_eq_of_beq (bool_and_true_left hLe)
+        have hA := bool_and_true_right hLe
+        subst hi
+        refine ⟨ha.1, ?_⟩
+        cases cs with
+        | dead => exact ha.2
+        | uninit => exact absVal_le_sound hA ha.2
+        | init v =>
+          cases v with
+          | scalar sc => exact ⟨ha.2.1, absVal_le_sound hA ha.2.2⟩
           | _ => exact ha.2
       | _ => nomatch hLe
     | bool b2 =>
@@ -2421,6 +2664,10 @@ def MirAbsSlot.join (a b : MirAbsSlot) : MirAbsSlot :=
       | false => uintJoinSlot u1 a1 u2 a2
     | .uintCopy u1 a1 _, .uint u2 a2 => uintJoinSlot u1 a1 u2 a2
     | .uint u1 a1, .uintCopy u2 a2 _ => uintJoinSlot u1 a1 u2 a2
+    | .sint i1 a1, .sint i2 a2 =>
+      match intTyBeq i1 i2 with
+      | true => .sint i1 (AbsVal.join (uintWidth (intTwin i1)) a1 a2)
+      | false => .top
     | _, _ => .top
 
 theorem mirAbsSlot_join_sound_left {ty : Ty} {locals : List LocalSlot}
@@ -2478,6 +2725,25 @@ theorem mirAbsSlot_join_sound_left {ty : Ty} {locals : List LocalSlot}
                     ha.2.2.2⟩
                 | _ => exact ha.2
         | uint u2 a2 => exact uintJoinSlot_sound_left (uintCopy_denote_uint ha)
+        | _ => exact True.intro
+      | sint i1 a1 =>
+        cases b with
+        | sint i2 a2 =>
+          simp only
+          cases intTyBeq i1 i2 with
+          | false => exact True.intro
+          | true =>
+            refine ⟨ha.1, ?_⟩
+            cases cs with
+            | dead => exact ha.2
+            | uninit =>
+              exact absVal_join_sound_left (uintWidth_valid (intTwin i1)) a1 a2 ha.2
+            | init v =>
+              cases v with
+              | scalar sc =>
+                exact ⟨ha.2.1,
+                  absVal_join_sound_left (uintWidth_valid (intTwin i1)) a1 a2 ha.2.2⟩
+              | _ => exact ha.2
         | _ => exact True.intro
       | bool b1 =>
         cases b with
@@ -2600,6 +2866,27 @@ theorem mirAbsSlot_join_sound_right {ty : Ty} {locals : List LocalSlot}
                     hb.2.2.2⟩
                 | _ => exact hb.2
         | uint u1 a1 => exact uintJoinSlot_sound_right (uintCopy_denote_uint hb)
+        | _ => exact True.intro
+      | sint i2 a2 =>
+        cases a with
+        | sint i1 a1 =>
+          simp only
+          cases hI : intTyBeq i1 i2 with
+          | false => exact True.intro
+          | true =>
+            have hi := intTy_eq_of_beq hI
+            subst hi
+            refine ⟨hb.1, ?_⟩
+            cases cs with
+            | dead => exact hb.2
+            | uninit =>
+              exact absVal_join_sound_right (uintWidth_valid (intTwin i1)) a1 a2 hb.2
+            | init v =>
+              cases v with
+              | scalar sc =>
+                exact ⟨hb.2.1,
+                  absVal_join_sound_right (uintWidth_valid (intTwin i1)) a1 a2 hb.2.2⟩
+              | _ => exact hb.2
         | _ => exact True.intro
       | bool b2 =>
         cases a with
@@ -2978,7 +3265,7 @@ theorem refineUintSlot_sound {decls : List LocalDecl} {env : MirAbsEnv}
               exact hDen.2.2.2
           exact ⟨hDen.1, hsc.2.1, hRef a sc.bits hInit hsc.2.2 hLocR,
             hDen.2.2.2⟩
-    | top | dead | bool _ | unit _ | uintBoolPair _ _ _ => exact hDen
+    | top | dead | bool _ | unit _ | uintBoolPair _ _ _ | sint _ _ => exact hDen
 
 /-- Concrete scalar of local `r` behind an initialized `.uint` or `.uintCopy`
 slot. -/
@@ -3035,7 +3322,8 @@ theorem env_uintAbsVal?_extract {decls : List LocalDecl} {env : MirAbsEnv}
                 rw [hcs.2.1, hsc.1]
               exact ⟨hInit, sc, d, hL, hcs.1, hcs.2.2.1, hsc.2.1, hsc.2.2,
                 localUintNat?_of_get? hL hsc.2.1⟩
-        | top | dead | bool _ | unit _ | uintBoolPair _ _ _ => nomatch hGet
+        | top | dead | bool _ | unit _ | uintBoolPair _ _ _ | sint _ _ =>
+          nomatch hGet
 
 /-- Concrete scalar of local `r` behind an initialized `.uint` slot. -/
 theorem env_uint_extract {decls : List LocalDecl} {env : MirAbsEnv}
