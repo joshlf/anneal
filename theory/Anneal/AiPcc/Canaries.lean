@@ -44,8 +44,9 @@ Canary suite for the `Anneal.AiPcc` stack. It is not imported by
      widening `IntToInt` cast (returns a value `< 2^32`);
    * a signed `i32` branch `if x >= 0 { x / 2 } else { 0 }` refined through a
      `switchInt` guard on a copy temporary (returns a value in `[0, 2^30)`).
-   The loop and signed canaries are also packaged as trusted
-   `VerificationResult` certificates of concrete `Claim`s.
+   The canaries are also packaged as trusted `VerificationResult`,
+   `StatefulVerificationResult`, and `TraceVerificationResult` certificates
+   of concrete claims.
 3. Positive controls and CFG joins (`switchInt` diamonds, `move` aliasing,
    checked arithmetic with `assert`).
 4. A fail-closed negative suite and a `validRpoSchedule` suite.
@@ -468,6 +469,42 @@ theorem canary_bitmask_div_cast_statefulVerificationResult :
         | ⟨bits, hV, hLe⟩ =>
           exact ⟨bits, hV,
             Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 32) Nat.one_pos)⟩)
+
+/-- Audited trace claim for `signedHalfBody`: from any root-entry memory and
+any `i32` input, every completed execution (whatever its `switchInt` trace)
+ends in a normal return of an `i32` with bit pattern `< 2^30`; in particular
+it never panics or aborts. -/
+def signedHalfTraceClaim : Trusted.VerificationResult.TraceClaim where
+  body := signedHalfBody
+  pre args mem :=
+    mem.callStack = [] ∧ mem.activeCallee = none ∧
+    mem.activeProtectors = [] ∧
+    ∃ x, x < modPow2 32 ∧ args = [.scalar ⟨x, 4⟩]
+  post _ _ _ out :=
+    ∃ bits mem', out = .normal (.scalar ⟨bits, 4⟩, mem') ∧ bits < modPow2 30
+
+/-- `TraceVerificationResult signedHalfTraceClaim`, from the `rfl`
+certificate. -/
+theorem canary_signed_half_traceVerificationResult :
+    Trusted.VerificationResult.TraceVerificationResult signedHalfTraceClaim :=
+  verifyMirCutpoints_traceVerificationResult (argSlots := signedHalfArgSlots)
+    signedHalf_cert_ok
+    (fun args _ hPre => by
+      match hPre with
+      | ⟨hCS, hCallee, hProt, x, hx, hArgs⟩ =>
+        subst hArgs
+        exact ⟨hCS, hCallee, hProt,
+          ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩⟩)
+    (fun _ _ _ _ mem' _ hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        match sint_valDenote_ubound (hi := modPow2 30 - 1) rfl hDen with
+        | ⟨bits, hV, hLe⟩ =>
+          subst hV
+          exact ⟨bits, mem', rfl,
+            Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 30) Nat.one_pos)⟩)
 
 /-! ## Positive Controls and CFG Joins -/
 

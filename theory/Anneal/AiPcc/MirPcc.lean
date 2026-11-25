@@ -1015,7 +1015,7 @@ theorem verifyMirCutpoints_sound_call {body : CapturedMir}
         (mirRetPost body retInv) (initMachineState body args)) :=
   checkMirCert_sound_call (bool_and_true_right hVer) hArgs
 
-/-! ## 8. Trusted Verification Certificates (`VerificationResult` & `StatefulVerificationResult`) -/
+/-! ## 8. Trusted Verification Certificates -/
 
 /-- `initMachineStateWithCallees body args callees` starts at a root frame
 with `initLocals body args`, regardless of whether `callees` is empty. -/
@@ -1430,5 +1430,76 @@ theorem verifyMirCutpoints_statefulVerificationResult
       c.post args mem retVal mem') :
     Trusted.VerificationResult.StatefulVerificationResult c :=
   checkMirCert_statefulVerificationResult (bool_and_true_right hVer) hPre hPost
+
+/-- A `checkMirCert` certificate yields a trusted `TraceVerificationResult`
+for any `TraceClaim` whose precondition establishes a root-entry `Memory` and
+the argument slots, and whose postcondition holds of every normal return
+described by `retInv` (whatever the observed `switchInt` trace). Every
+reachable outcome is a normal return: certified bodies never panic or
+abort. -/
+theorem checkMirCert_traceVerificationResult
+    {c : Trusted.VerificationResult.TraceClaim} {argSlots : List MirAbsSlot}
+    {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)}
+    (hChk : checkMirCert c.body (entryEnv c.body.localDecls argSlots) retInv
+      invs = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧
+      entryArgsOk (c.body.localDecls.drop 1) argSlots args)
+    (hPost : ∀ args mem tr retVal mem', c.pre args mem →
+      (∃ d, get? c.body.localDecls 0 = some d ∧
+        retInv.valDenote d.ty retVal) →
+      c.post args mem tr (.normal (retVal, mem'))) :
+    Trusted.VerificationResult.TraceVerificationResult c := by
+  have hPhase := bool_and_true_left hChk
+  have hAll := bool_and_true_right (bool_and_true_right
+    (bool_and_true_right (bool_and_true_right hChk)))
+  refine ⟨?_⟩
+  intro args mem hDef
+  have hP := hPre args mem hDef
+  have hRoot := initMachineStateWithMemoryAndCallees_root c.body args mem
+    c.callees hP.1 hP.2.1 hP.2.2.1
+  have hEntry : mirAbsEnvDenote c.body.localDecls
+      (entryEnv c.body.localDecls argSlots)
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        c.body args mem c.callees).frame.locals := by
+    rw [hRoot.2]
+    exact entryEnv_sound hP.2.2.2
+  have hSound := checkMirCert_sound hChk hRoot.1 hEntry
+  refine ⟨hSound.2.2.1, ?_⟩
+  intro outPair hOut
+  have hRR : ReachesRet
+      (Trusted.VerificationResult.mirStatefulTreeWithCallees c.body args mem
+        c.callees)
+      outPair.1 outPair.2 := by
+    have h := hOut
+    simp only [Trusted.VerificationResult.MirStatefulExecPartialWithCallees,
+      ITree.toPartial] at h
+    exact h
+  match reachesRet_normal_of_mirPccInv (retInv := retInv) hPhase hAll
+      (mirPccInv_start hChk hRoot.1 hEntry) hRR with
+  | ⟨retVal, mem', hEq, hRet⟩ =>
+    show c.post args mem outPair.1 outPair.2
+    rw [hEq]
+    exact hPost args mem outPair.1 retVal mem' hDef (hSound.2.1 retVal hRet)
+
+/-- `checkMirCert_traceVerificationResult` for a `verifyMirCutpoints`
+certificate. -/
+theorem verifyMirCutpoints_traceVerificationResult
+    {c : Trusted.VerificationResult.TraceClaim} {argSlots : List MirAbsSlot}
+    {retInv : MirAbsSlot} {cutpoints : List (Nat × MirAbsEnv)}
+    {rpoOrder : List Nat}
+    (hVer : verifyMirCutpoints c.body (entryEnv c.body.localDecls argSlots)
+      retInv cutpoints rpoOrder = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧
+      entryArgsOk (c.body.localDecls.drop 1) argSlots args)
+    (hPost : ∀ args mem tr retVal mem', c.pre args mem →
+      (∃ d, get? c.body.localDecls 0 = some d ∧
+        retInv.valDenote d.ty retVal) →
+      c.post args mem tr (.normal (retVal, mem'))) :
+    Trusted.VerificationResult.TraceVerificationResult c :=
+  checkMirCert_traceVerificationResult (bool_and_true_right hVer) hPre hPost
 
 end Anneal.AiPcc

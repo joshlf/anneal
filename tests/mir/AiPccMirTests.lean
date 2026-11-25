@@ -712,6 +712,20 @@ info: 'Anneal.AiPcc.canary_signed_half_verificationResult' depends on axioms:
 #print axioms canary_signed_half_verificationResult
 
 /--
+info: 'Anneal.AiPcc.checkMirCert_traceVerificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirCert_traceVerificationResult
+
+/--
+info: 'Anneal.AiPcc.canary_signed_half_traceVerificationResult' depends on
+axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_signed_half_traceVerificationResult
+
+/--
 info: 'Anneal.AiPcc.checkMirCert_sound' depends on axioms:
 [propext, Quot.sound]
 -/
