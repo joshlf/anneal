@@ -1125,6 +1125,25 @@ theorem nonzero_well_formed_ptr_proto_copies :
         emptyLayoutTable (.ptr ⟨1, 0⟩ 8) (.ptr ⟨4, 0⟩ 8) 1 stW.frame.locals) = 42 := by
   decide +kernel
 
+/-- **Terminator path inherits the fix (A3)**: on a well-formed non-zero call,
+the prototype call path equals the legacy `evalCopyNonOverlappingCall`, proved
+through `evalCopyNonOverlappingCallProto_congr_legacy` +
+`evalCopyNonOverlappingWithCountProto_nonzero` (not by evaluation). -/
+theorem call_proto_eq_legacy_nonzero :
+    evalCopyNonOverlappingCallProto .rejectNull stW declsW emptyLayoutTable
+        [cp 2, cp 3, constUsize 1] [.ptr ⟨1, 0⟩ 8, .ptr ⟨4, 0⟩ 8, .scalar ⟨1, 8⟩]
+        stW.frame.locals (loc 0) 1 =
+      evalCopyNonOverlappingCall stW declsW emptyLayoutTable
+        [cp 2, cp 3, constUsize 1] [.ptr ⟨1, 0⟩ 8, .ptr ⟨4, 0⟩ 8, .scalar ⟨1, 8⟩]
+        stW.frame.locals (loc 0) 1 :=
+  evalCopyNonOverlappingCallProto_congr_legacy _ _ _ _ _ _ _ _ _
+    (by intro c h; cases h; decide)
+    (by
+      intro s0 d0 c0 sv dv c h1 h2
+      cases h1; cases h2
+      exact evalCopyNonOverlappingWithCountProto_nonzero _ _ _ _ _ _ _ _ 1 8 8 _
+        (by decide +kernel) (by decide) (by decide) rfl)
+
 /-- **Shape-first order** (`Intrinsics.copyWith` reads both pointers before any
 alignment check): `src` with unknown alignment (`&raw mut u8_local as *mut u64`)
 and a non-pointer `dst` is `.ub` (B1: `.unsupported`). -/
@@ -1896,6 +1915,135 @@ info: port audit problems: []; constructor-set differences: [Value: only V2026_0
 #guard_msgs in
 #zc_port_audit
 
+
+/-! ## 13c. Machine-checked semantic-drift audit (A3)
+
+`#zc_port_audit` proves that every `V2026_06_01` constant the patch references
+*exists* in `V2026_08_01` with an identical type signature. It does not prove
+the two snapshots *behave* the same. This audit:
+1. computes the transitive closure of the patch's direct `Trusted` dependencies
+   inside `Trusted.Rustc.V2026_06_01`. It stops at the legacy
+   `evalCopyNonOverlappingWithCount`, which the TCB renames in place and keeps
+   snapshot-specific by design;
+2. compares the **source text** of each declaration with its `V2026_08_01`
+   counterpart. It starts at the declaration name, so docstrings are ignored,
+   and normalises the snapshot prefix. Inductive types and their auxiliaries
+   are already covered by the constructor/field diffs above;
+3. reports which **direct** helpers of the patch transitively reach a
+   source-different declaration. Those helpers can behave differently on
+   `V2026_08_01`, so the `V2026_08_01` patch must be re-validated against them.
+The audit reads `trusted/lean/**` relative to the worktree root, which is the
+working directory of every Section-4 receipt command. -/
+
+open Lean Elab Command in
+/-- Transitive closure of `roots` through `Trusted.Rustc.V2026_06_01` and
+`Anneal.Proto.ZeroCountCopyAlign` constants, stopping at `stop`. -/
+partial def zcClosure (env : Environment) (roots : List Name) (stop : NameSet) : NameSet :=
+  Id.run do
+    let protoPfx : Name := `Anneal.Proto.ZeroCountCopyAlign
+    let trustedPfx : Name := `Trusted.Rustc.V2026_06_01
+    let mut seen : NameSet := {}
+    let mut out : NameSet := {}
+    let mut todo := roots
+    let mut fuel := 200000
+    while fuel > 0 do
+      match todo with
+      | [] => break
+      | n :: rest =>
+        todo := rest
+        if seen.contains n || stop.contains n then continue
+        seen := seen.insert n
+        fuel := fuel - 1
+        let isT := trustedPfx.isPrefixOf n
+        if isT then out := out.insert n
+        if isT || (protoPfx.isPrefixOf n && !(n.getString!.startsWith "_sparseCasesOn")) then
+          match env.find? n with
+          | some (.defnInfo d) =>
+            todo := d.value.getUsedConstants.toList ++ d.type.getUsedConstants.toList ++ todo
+          | some ci => todo := ci.type.getUsedConstants.toList ++ todo
+          | none => pure ()
+    return out
+
+open Lean in
+/-- Whether `n` is an inductive type, constructor, recursor, or auxiliary of an
+inductive (covered by the constructor/field audits). -/
+def zcIsTypeAux (env : Environment) (n : Name) : Bool :=
+  match env.find? n with
+  | some (.inductInfo _) | some (.ctorInfo _) | some (.recInfo _) => true
+  | _ =>
+    match env.find? n.getPrefix with
+    | some (.inductInfo _) => true
+    | _ => false
+
+open Lean in
+def zcSrcLines (cache : IO.Ref (Std.HashMap Name (Array String))) (m : Name) :
+    IO (Array String) := do
+  match (← cache.get).get? m with
+  | some ls => pure ls
+  | none =>
+    let t ← IO.FS.readFile
+      (System.FilePath.mk ("trusted/lean/" ++ (m.toString.replace "." "/") ++ ".lean"))
+    let ls := (t.splitOn "\n").toArray
+    cache.modify (·.insert m ls)
+    pure ls
+
+open Lean in
+/-- Whether `n`'s declaration source (from its name to its end, with the
+snapshot prefix normalised) differs from its `V2026_08_01` counterpart, or the
+counterpart is missing. -/
+def zcSrcDiffers (env : Environment) (cache : IO.Ref (Std.HashMap Name (Array String)))
+    (n : Name) : CoreM Bool := do
+  if zcIsTypeAux env n then return false
+  let n' := toV0801 n
+  match ← findDeclarationRanges? n, ← findDeclarationRanges? n' with
+  | some r, some r' =>
+    match env.getModuleIdxFor? n, env.getModuleIdxFor? n' with
+    | some i, some i' =>
+      let ls ← zcSrcLines cache env.header.moduleNames[i.toNat]!
+      let ls' ← zcSrcLines cache env.header.moduleNames[i'.toNat]!
+      let a := (ls.extract (r.selectionRange.pos.line - 1) r.range.endPos.line).toList.map
+        (fun l => (l.replace "V2026_06_01" "VX").trimAsciiEnd.toString)
+      let b := (ls'.extract (r'.selectionRange.pos.line - 1) r'.range.endPos.line).toList.map
+        (fun l => (l.replace "V2026_08_01" "VX").trimAsciiEnd.toString)
+      pure (a != b)
+    | _, _ => pure false
+  | some _, none => pure true
+  | _, _ => pure false
+
+open Lean Elab Command in
+elab "#zc_semantic_drift_audit" : command => do
+  let env ← getEnv
+  let stop : NameSet :=
+    ({} : NameSet).insert ``Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingWithCount
+  let direct := protoTrustedDeps env
+    [``Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingProto,
+     ``Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto]
+  let cache ← IO.mkRef ({} : Std.HashMap Name (Array String))
+  let short := fun (n : Name) => n.toString.replace "Trusted.Rustc.V2026_06_01.MirSemantics." ""
+  let all := zcClosure env direct.toList stop
+  let mut differing : NameSet := {}
+  for c in all.toList do
+    if ← liftCoreM (zcSrcDiffers env cache c) then differing := differing.insert c
+  let mut affected : Array String := #[]
+  for d in direct.toList do
+    if stop.contains d then continue
+    match env.find? d with
+    | some (.defnInfo _) =>
+      let cl := zcClosure env [d] stop
+      if cl.toList.any differing.contains then affected := affected.push (short d)
+    | _ => pure ()
+  if all.size < 500 then throwError "suspiciously small closure ({all.size})"
+  let diffs := (differing.toList.map short).toArray.qsort (· < ·)
+  let aff := String.intercalate ", " (affected.qsort (· < ·)).toList
+  let dif := String.intercalate ", " diffs.toList
+  logInfo m!"{s!"semantic drift: affected direct helpers [{aff}]; source-different transitive declarations [{dif}]"}"
+
+/--
+info: semantic drift: affected direct helpers [borrowPlaceByteOffset?, copyPointeeSizesConflict, evalOperand]; source-different transitive declarations [decodeAtBorrowTargetOffset?, decodeValueFromBytes, encodeByLayoutIdxAux, encodeUnionFieldsWith, encodeUntypedValueToBytes, encodeValueToBytes, evalOperand, evalStackThinPtrTypedDerefRead, findDiscriminantVariantIdx?, inferValueByteSizeAux, inferValueCReprStep, layoutValidForResolvedAdt, mergeUnionTypedSlotsAux, readContainerProjectedValue, readProjectedValue, readProjectedValueUnionAware, resolveEnumDiscriminantForVariant, resolveEnumVariantIdxByTag, resolveStackThinPtrFieldOffsetProj?, resolveStackThinPtrTargetProjWithResidual?, tyByteAlignAux, tyByteSizeAndAlignAux, tyExactByteAlignAux, unionLayoutFreeOccupiedSlotCount, unionNonUnitNonZstTypedSlotCount, unionNonUnitTypedSlotCount, valueContainsUninit, valueContainsUnit, valueListContainsUninit]
+-/
+#guard_msgs in
+#zc_semantic_drift_audit
+
 /-! ## 14. Generic refinement / equivalence corollaries -/
 
 /-- Concrete instance of the soundness refinement on the fixture. -/
@@ -2251,5 +2399,15 @@ theorem zeroCountCopyAlignProto_bundle :
 -/
 #guard_msgs in
 #print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b3_end_to_end_mixed_stack_global_refines_miri
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingCallProto_congr_legacy' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingCallProto_congr_legacy
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.call_proto_eq_legacy_nonzero' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.call_proto_eq_legacy_nonzero
 
 end Anneal.Proto.ZeroCountCopyAlign.Tests

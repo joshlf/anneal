@@ -2457,6 +2457,44 @@ theorem stepMirFnProto_rejectNull_refines
     exact evalCopyNonOverlappingProto_rejectNull_refines s s' src dst count cb.localDecls cb.layouts
       h
 
+/-- **Terminator path inherits the fix (A3)**: on a well-formed `usize` count
+(`countScalarWellFormed`), `evalCopyNonOverlappingCallProto` differs from the
+legacy `Terminators.evalCopyNonOverlappingCall` **only** through the
+`WithCount` evaluator. Whenever the two `WithCount` evaluators agree on the
+call's arguments, the two call paths agree. So patching
+`evalCopyNonOverlappingWithCount` in place is enough to patch the direct-call
+path, with no edit to `Terminators.lean`. -/
+theorem evalCopyNonOverlappingCallProto_congr_legacy
+    (policy : ZeroCountNullPolicy) (s : MachineState) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (hcount : ∀ c, argVals.getLast? = some (.scalar c) → c.bits < scalarModulus (layoutPointerBytes bodyLayouts))
+    (hwith : ∀ srcOp dstOp cOp srcVal dstVal c,
+      argOps = [srcOp, dstOp, cOp] → argVals = [srcVal, dstVal, .scalar c] →
+      evalCopyNonOverlappingWithCountProto policy s srcOp dstOp bodyLocalDecls bodyLayouts srcVal
+          dstVal c.bits locals' =
+        evalCopyNonOverlappingWithCount s srcOp dstOp bodyLocalDecls bodyLayouts srcVal dstVal
+          c.bits locals') :
+    evalCopyNonOverlappingCallProto policy s bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb =
+      evalCopyNonOverlappingCall s bodyLocalDecls bodyLayouts argOps argVals locals' destination
+        targetBb := by
+  unfold evalCopyNonOverlappingCallProto evalCopyNonOverlappingCall
+  split
+  · rename_i srcOp dstOp cOp srcVal dstVal c
+    have hlt : c.bits < scalarModulus (layoutPointerBytes bodyLayouts) := hcount c rfl
+    dsimp only
+    unfold countScalarWellFormed
+    rw [blt_true_of_lt hlt, Bool.and_true]
+    cases Nat.beq c.sizeBytes (layoutPointerBytes bodyLayouts)
+    · rfl
+    · dsimp only
+      rw [hwith srcOp dstOp cOp srcVal dstVal c rfl rfl]
+  · rename_i hnot
+    split
+    · exact (hnot _ _ _ _ _ _ rfl rfl).elim
+    · rfl
+
 /-- **Soundness refinement** lifted to terminator-level `evalCopyNonOverlappingCallProto`. -/
 theorem evalCopyNonOverlappingCallProto_rejectNull_refines
     (s s' : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
