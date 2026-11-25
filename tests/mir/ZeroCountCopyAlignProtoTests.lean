@@ -1488,6 +1488,205 @@ theorem lower_align_u32_32bit :
       copyTyAlign? [] layouts32 (tyNL u32K) = some 4 := by
   decide +kernel
 
+/-! ### B3: exact-vs-lower-bound root alignment (no false `.ub` on lower bounds),
+`O(1)` large offsets (no `divModBytesAux`), sub-aligned global `.ub`, layout
+validation hardening, and unified all-placements Miri refinement -/
+
+def u128K : RigidTy := .uint .u128
+
+/-- Captured 64-bit `u128` layout (`x86_64`/`aarch64`: size 16, align 16). -/
+def u128Layout64 : TypeLayout :=
+  { size := { bytes := 16 }, align := { bytes := 16 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def b3Layouts64 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [unitLayout0, u128Layout64] }
+
+/-- Locals: `_0 : ()`, `_1 : (u128, u128)` (no tuple layout, no standalone `u128`
+local), `_2 : *const u128`, `_3 : *mut u128`. -/
+def b3Decls64 : List LocalDecl :=
+  [declNL unitK, declNL (.tuple [u128K, u128K]),
+   declNL (rawConstK u128K), declNL (rawMutK u128K)]
+
+/-- Tag `1`: `&raw mut _1.0` where `.field 0` carries `u128Layout64` (`layoutIdx := 1`). -/
+def b3State64 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit, .uninit, .uninit] }
+    memory := { emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1,
+                    targetProjection := [.field 0 { kind := u128K, layoutIdx := 1 }],
+                    perm := .unique }],
+      nextTag := 2 } }
+
+/-- Root `(u128, u128)` has conservative lower bound `.atLeast 8`, while the
+projected field carries authoritative `.exact 16`. -/
+theorem b3_x64_u128_tuple_bound_is_atLeast8 :
+    copyTyAlignBound? b3Decls64 b3Layouts64 (tyNL (.tuple [u128K, u128K])) = some (.atLeast 8) ∧
+      copyTyAlignBound? b3Decls64 b3Layouts64 { kind := u128K, layoutIdx := 1 } = some (.exact 16) := by
+  decide +kernel
+
+/-- **False-UB fix (B3)**: on 64-bit `x86_64`, `&raw mut x.0` for
+`x : (u128, u128)` is 16-aligned and UB-free. A2 treated the conservative lower
+bound `8` on `rootDecl` as exact and falsely returned `MirStepNode.fail .ub`;
+B3 distinguishes `.atLeast 8` from `.exact 8` and fails closed (`.unsupported`). -/
+theorem b3_x64_u128_tuple_field_not_false_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull b3State64 (cp 2) (cp 3) b3Decls64 b3Layouts64
+        (.ptr ⟨1, 0⟩ 8) (danglingScalar 16) 0 b3State64.frame.locals = MirStepNode.unsupported := by
+  kernel_rfl
+
+/-- ... yet an offset not divisible by the lower bound `8` (`+3`) is genuinely
+misaligned on every 64-bit target (`s390x` align 8 and `x86_64` align 16) → `.ub`. -/
+theorem b3_x64_u128_tuple_field_odd_offset_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull b3State64 (cp 2) (cp 3) b3Decls64 b3Layouts64
+        (.ptr ⟨1, 3⟩ 8) (danglingScalar 16) 0 b3State64.frame.locals = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- Captured 32-bit `u32` layout (`armv7`/`i686`/`wasm32`: size 4, align 4). -/
+def u32Layout32 : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def b3Layouts32 : LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true, entries := [unitLayout0, u32Layout32] }
+
+def b3Decls32 : List LocalDecl :=
+  [declNL unitK, declNL (.tuple [u32K, u32K]),
+   declNL (rawConstK u32K), declNL (rawMutK u32K)]
+
+def b3State32 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit, .uninit, .uninit] }
+    memory := { emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1,
+                    targetProjection := [.field 0 { kind := u32K, layoutIdx := 1 }],
+                    perm := .unique }],
+      nextTag := 2 } }
+
+/-- **False-UB fix (B3, 32-bit)**: on `armv7`/`i686`/`wasm32`, `&raw mut x.0`
+for `x : (u32, u32)` with field layout `u32(4, 4)` has root bound `.atLeast 2`
+(`m68k`); B3 fails closed (`.unsupported`) instead of A2's false `.ub`. -/
+theorem b3_target32_u32_tuple_field_not_false_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull b3State32 (cp 2) (cp 3) b3Decls32 b3Layouts32
+        (.ptr ⟨1, 0⟩ 4) (.scalar ⟨4, 4⟩) 0 b3State32.frame.locals = MirStepNode.unsupported := by
+  kernel_rfl
+
+/-- ... while odd offset `+1` is misaligned on every 32-bit target (incl. `m68k`) → `.ub`. -/
+theorem b3_target32_u32_tuple_field_odd_offset_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull b3State32 (cp 2) (cp 3) b3Decls32 b3Layouts32
+        (.ptr ⟨1, 1⟩ 4) (.scalar ⟨4, 4⟩) 0 b3State32.frame.locals = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- **`O(1)` large offset (B3)**: removing the redundant `divModBytesAux`-linear
+`checkTargetPlaceAlignWalk` call lets `offsetBytes = 10_000_000_000` (10^10)
+decide alignment instantaneously in the kernel without unary recursion. -/
+theorem b3_large_offset_10bn_aligned_noop :
+    proto .rejectNull u64K u64K (stackPtr 10000000000) (stackPtr 0) 0 = noop := by kernel_rfl
+
+theorem b3_large_offset_10bn_plus3_misaligned_ub :
+    proto .rejectNull u64K u64K (stackPtr 10000000003) (stackPtr 0) 0 = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- **Sub-aligned global `.ub` (B3)**: global allocation `11` (`align = 4`) at
+offset `1` copied as `u64` (`elemAlign = 8`) is misaligned for every 4-aligned
+placement (`(4k + 1) % 4 = 1 ≠ 0`, hence never `0 mod 8`) → `.ub`; offset `0`
+remains fail-closed `.unsupported`. -/
+def globalAlign4 : CapturedAllocation :=
+  { allocId := 11, bytes := List.replicate 16 (some 0), relocations := [],
+    align := { bytes := 4 }, mutability := .not }
+
+def stGlobal4 : MachineState :=
+  { st with memory := { st.memory with globals := globalAlign4 :: st.memory.globals } }
+
+theorem b3_global_align4_offset1_u64_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull stGlobal4 (cp 2) (cp 3) (declsFor u64K u64K)
+        emptyLayoutTable (.ptr ⟨11, 1⟩ 8) (danglingScalar 8) 0 stGlobal4.frame.locals =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem b3_global_align4_offset0_u64_unsupported :
+    evalCopyNonOverlappingWithCountProto .rejectNull stGlobal4 (cp 2) (cp 3) (declsFor u64K u64K)
+        emptyLayoutTable (.ptr ⟨11, 0⟩ 8) (danglingScalar 8) 0 stGlobal4.frame.locals =
+      MirStepNode.unsupported := by
+  kernel_rfl
+
+/-- **Corrupted layout rejection (B3)**: `[u8; 0]` with `size = 8` (`≠ stride * 0`)
+and `*const [u8]` with `align = 16` (`> ptrBytes`) are rejected by
+`copyLayoutMatchesRigidTy?` and fall back cleanly to structural sizes/alignments. -/
+def corruptArr0Layout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory,
+    fields := .array { bytes := 1 } 0, variants := .single 0, isUninhabited := false }
+
+def corruptWidePtrLayout : TypeLayout :=
+  { size := { bytes := 16 }, align := { bytes := 16 },
+    backendRepr := .scalarPair (.union (.pointer 0)) (.union (.int 8 false)),
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1],
+    variants := .single 0, isUninhabited := false }
+
+def corruptB3Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [unitLayout0, corruptArr0Layout, corruptWidePtrLayout] }
+
+theorem b3_corrupt_array0_nonzero_size_rejected :
+    copyTySizeAndAlign? [] corruptB3Layouts
+        { kind := .array u8K 0, layoutIdx := 1 } = some (0, 1) := by
+  decide +kernel
+
+theorem b3_corrupt_wide_ptr_align16_rejected :
+    copyTySizeAndAlign? [] corruptB3Layouts
+        { kind := rawConstK (.slice u8K), layoutIdx := 2 } = some (16, 8) := by
+  decide +kernel
+
+/-- **Negative placement soundness witness (B3, stack)**: `stackBorrowAlignKnown_sound.2`
+produces an explicit non-null 1-aligned stack placement witnessing misalignment
+for `&raw mut packed.b` (`adtState` tag `2`). -/
+theorem b3_packed_field_ub_witness_placement :
+    ∃ base, 0 < base ∧ base % 1 = 0 ∧ (base + (1 + 0)) % 8 ≠ 0 :=
+  (stackBorrowAlignKnown_sound adtState adtDecls adtLayouts 8 ⟨2, 0⟩
+    { tag := 2, targetLocal := 4, targetProjection := [.field 1 (tyNL u64K)], perm := .unique }
+    1 rfl).2 (by decide +kernel) 1 (fun b hb => by
+      have hrb : stackRootAlignBound? adtState adtDecls adtLayouts
+          { tag := 2, targetLocal := 4, targetProjection := [.field 1 (tyNL u64K)],
+            perm := .unique } = some (.exact 1) := by decide +kernel
+      rw [hrb] at hb
+      cases hb
+      rfl)
+
+/-- **Negative placement soundness witness (B3, unbacked)**: `unbackedAlignKnown_sound.2`
+proves that offset `3` on `u64` (`elemAlign = 8`) has a valid non-null misaligned
+placement for **every** hypothetical allocation alignment `actualRa ≥ 1`. -/
+theorem b3_unbacked_offset3_ub_witness_placement :
+    ∀ actualRa, 1 ≤ actualRa →
+      ∃ base, 0 < base ∧ base % actualRa = 0 ∧ (base + 3) % 8 ≠ 0 :=
+  (unbackedAlignKnown_sound 8 ⟨20, 3⟩ rfl).2 rfl
+
+/-- **End-to-end mixed stack + global `.ptr` refinement against `lean-miri` (B3)**:
+instantiates `evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements`
+on a mixed live stack (`tag 1`, `_1 : u64`) + live global (`alloc 9`, `align 8`,
+offset `8`) zero-count copy: for **every** 8-aligned stack placement `sBase` and
+**every** 8-aligned global placement `gBase`, `miriCopyWithRef` returns `.noop`. -/
+theorem b3_end_to_end_mixed_stack_global_refines_miri :
+    ∀ sBase gBase, sBase % 8 = 0 → gBase % 8 = 0 →
+      miriCopyWithRef 8 0 8 8 (sBase + (0 + 0)) (gBase + 8) = .noop := by
+  intro sBase gBase hs hg
+  have hstep : proto .rejectNull u64K u64K (stackPtr 0) (globalPtr 9 8) 0 = noop := by kernel_rfl
+  have href := evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements
+    .rejectNull st (advanceStmt st st.frame.locals) (cp 2) (cp 3) (declsFor u64K u64K)
+    emptyLayoutTable (stackPtr 0) (globalPtr 9 8) 0 8 8 st.frame.locals
+    (by decide +kernel) rfl hstep
+  apply href.2 (sBase + (0 + 0)) (gBase + 8)
+  · refine ⟨rfl, ?_⟩
+    change ∃ actualRa base,
+      (∀ b, stackRootAlignBound? st (declsFor u64K u64K) emptyLayoutTable
+          { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique } = some b →
+        b.satisfies actualRa) ∧
+      base % actualRa = 0 ∧ sBase + (0 + 0) = base + (0 + 0)
+    refine ⟨8, sBase, fun b hb => ?_, hs, rfl⟩
+    have hrb : stackRootAlignBound? st (declsFor u64K u64K) emptyLayoutTable
+        { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique } =
+        some (.exact 8) := by decide +kernel
+    rw [hrb] at hb
+    cases hb
+    rfl
+  · exact ⟨rfl, ⟨gBase, hg, rfl⟩⟩
+
 /-! ## 12. Terminator-level call path inherits the fix -/
 
 /-- `evalCopyNonOverlappingCallProto` with a misaligned dangling `src` faults
@@ -1762,7 +1961,14 @@ theorem zeroCountCopyAlignProto_bundle :
     (∀ ld ly src dst sz al,
       resolveCopyElemLayout ld ly src dst = .ok sz al →
       isPowTwoAlign al = true ∧ 1 ≤ al) ∧
-    (∀ fuel ty, copyIsUnsizedRigidTy fuel ty = isUnsizedRigidTy fuel ty) :=
+    (∀ fuel ty, copyIsUnsizedRigidTy fuel ty = isUnsizedRigidTy fuel ty) ∧
+    (∀ policy s s' src dst ld ly sv dv c sz al l3,
+      resolveCopyElemLayout ld ly src dst = .ok sz al →
+      c * sz = 0 →
+      evalCopyNonOverlappingWithCountProto policy s src dst ld ly sv dv c l3 = MirStepNode.step s' →
+      s' = advanceStmt s l3 ∧
+        ∀ sa da, ConcretePtrAddr s ld ly sv sa → ConcretePtrAddr s ld ly dv da →
+          miriCopyWithRef (layoutPointerBytes ly) c sz al sa da = .noop) :=
   ⟨evalCopyNonOverlappingWithCountProto_rejectNull_refines,
     stepMirFnProto_rejectNull_refines,
     evalCopyNonOverlappingCallProto_rejectNull_refines,
@@ -1770,7 +1976,8 @@ theorem zeroCountCopyAlignProto_bundle :
     evalCopyNonOverlappingWithCountProto_scalar_allowRaw_eq_corePtr,
     evalCopyNonOverlappingWithCountProto_scalar_rejectNull_eq_corePtrStrict,
     resolveCopyElemLayout_align_pow2,
-    copyIsUnsizedRigidTy_eq⟩
+    copyIsUnsizedRigidTy_eq,
+    evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements⟩
 
 /-! ## 15. Standard-axioms audit -/
 
@@ -1994,5 +2201,55 @@ theorem zeroCountCopyAlignProto_bundle :
 -/
 #guard_msgs in
 #print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.target32_align4_over_usize_local_unsupported
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.unbackedAlignKnown_sound' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.unbackedAlignKnown_sound
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.copyTyAlignBound?_pow2' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.copyTyAlignBound?_pow2
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.checkZeroCountCopyPtr_ok_concrete_aligned' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.checkZeroCountCopyPtr_ok_concrete_aligned
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b3_x64_u128_tuple_field_not_false_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b3_x64_u128_tuple_field_not_false_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b3_target32_u32_tuple_field_not_false_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b3_target32_u32_tuple_field_not_false_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b3_large_offset_10bn_aligned_noop' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b3_large_offset_10bn_aligned_noop
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b3_global_align4_offset1_u64_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b3_global_align4_offset1_u64_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b3_packed_field_ub_witness_placement' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b3_packed_field_ub_witness_placement
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b3_end_to_end_mixed_stack_global_refines_miri' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b3_end_to_end_mixed_stack_global_refines_miri
 
 end Anneal.Proto.ZeroCountCopyAlign.Tests
