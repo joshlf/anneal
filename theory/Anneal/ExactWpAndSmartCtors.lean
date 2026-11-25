@@ -1879,6 +1879,246 @@ theorem bitprism_scalar_ub_subtree_not_erased :
     (SmartScalarExpr.bin .mul ub (.const 0)).eval (fun _ => 0) = 0 := by
   refine ⟨rfl, rfl, rfl, rfl, rfl⟩
 
+/-- Whenever strict `evalE` succeeds with `some v`, total `eval` agrees with `v`. -/
+theorem evalE_eq_some_implies_eval {sz : Nat} (env : Nat → Nat) :
+    ∀ (e : SmartScalarExpr sz) (v : Nat), e.evalE env = some v → e.eval env = v
+  | .const _, _, h => by simp only [SmartScalarExpr.evalE, SmartScalarExpr.eval, Option.some.injEq] at h ⊢; exact h
+  | .var _, _, h => by simp only [SmartScalarExpr.evalE, SmartScalarExpr.eval, Option.some.injEq] at h ⊢; exact h
+  | .bin op l r, v, h => by
+    simp only [SmartScalarExpr.evalE] at h
+    cases hl : l.evalE env with
+    | none => rw [hl] at h; cases h
+    | some a =>
+      cases hr : r.evalE env with
+      | none => rw [hl, hr] at h; cases h
+      | some b =>
+        rw [hl, hr] at h
+        dsimp only at h
+        have hLa := evalE_eq_some_implies_eval env l a hl
+        have hRb := evalE_eq_some_implies_eval env r b hr
+        simp only [SmartScalarExpr.eval, hLa, hRb]
+        cases hOp : evalScalarBinOp op ⟨a, sz⟩ ⟨b, sz⟩ [] emptyMemory false with
+        | ub => rw [hOp] at h; cases h
+        | unsupported => rw [hOp] at h; cases h
+        | ok val _ _ =>
+          rw [hOp] at h
+          cases val with
+          | scalar sc =>
+            simp only [Option.some.injEq] at h
+            exact h
+          | _ => cases h
+
+/-- Helper: every total-operator `evalScalarBinOp` result has `sc.bits < scalarModulus sz`. -/
+private theorem total_op_bits_lt {sz : Nat} (hSz : sz ≠ 0) (op : BinOp)
+    (hOp : isTotalSmartOp op = true) (a b : Nat)
+    (sc : ScalarInt) (locs : List LocalSlot) (mem : Memory)
+    (h : evalScalarBinOp op ⟨a, sz⟩ ⟨b, sz⟩ [] emptyMemory false = .ok (.scalar sc) locs mem) :
+    sc.bits < scalarModulus sz := by
+  have hModPos : 0 < scalarModulus sz := by
+    rw [scalarModulus_eq_two_pow]; exact Nat.pow_pos (by decide)
+  have hNz := nat_beq_zero_false hSz
+  cases op <;> simp only [isTotalSmartOp, Bool.false_eq_true] at hOp <;>
+    simp only [evalScalarBinOp, hNz, Nat.beq_refl] at h
+  · cases h; rw [wrapScalarBits_eq_mod]; exact Nat.mod_lt _ hModPos
+  · split at h <;> (cases h; rw [wrapScalarBits_eq_mod]; exact Nat.mod_lt _ hModPos)
+  · cases h; rw [wrapScalarBits_eq_mod]; exact Nat.mod_lt _ hModPos
+  · cases h
+    rw [nat_mul_eq, scalarModulus_eq_two_pow]
+    exact bitwiseXorBits_lt (sz * 8) a b
+  · cases h
+    rw [nat_mul_eq, scalarModulus_eq_two_pow]
+    exact bitwiseAndBits_lt (sz * 8) a b
+  · cases h
+    rw [nat_mul_eq, scalarModulus_eq_two_pow]
+    exact bitwiseOrBits_lt (sz * 8) a b
+  · cases h; unfold shiftLeftBits; rw [wrapScalarBits_eq_mod]; exact Nat.mod_lt _ hModPos
+  · cases h; rw [wrapScalarBits_eq_mod]; exact Nat.mod_lt _ hModPos
+
+/-- Every `ubFree` `SmartScalarExpr` evaluates strictly below `scalarModulus sz` (making canonical
+preconditions 100% automatic on all `ubFree` trees). -/
+theorem ubFree_eval_lt {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat) :
+    ∀ e : SmartScalarExpr sz, e.ubFree = true → e.eval env < scalarModulus sz
+  | .const b, _ => by
+    have hModPos : 0 < scalarModulus sz := by
+      rw [scalarModulus_eq_two_pow]; exact Nat.pow_pos (by decide)
+    simp only [SmartScalarExpr.eval, wrapScalarBits_eq_mod]
+    exact Nat.mod_lt _ hModPos
+  | .var id, _ => by
+    have hModPos : 0 < scalarModulus sz := by
+      rw [scalarModulus_eq_two_pow]; exact Nat.pow_pos (by decide)
+    simp only [SmartScalarExpr.eval, wrapScalarBits_eq_mod]
+    exact Nat.mod_lt _ hModPos
+  | .bin op l r, h => by
+    have hOp : isTotalSmartOp op = true := by
+      cases op <;> simp_all [SmartScalarExpr.ubFree, isTotalSmartOp]
+    simp only [SmartScalarExpr.eval]
+    obtain ⟨c, hc⟩ := total_op_ok hSz op hOp (l.eval env) (r.eval env)
+    rw [hc]
+    exact total_op_bits_lt hSz op hOp (l.eval env) (r.eval env) ⟨c, sz⟩ [] emptyMemory hc
+
+/-- Generic lifter from total `eval` equivalence + strict UB non-erasure + definedness preservation
+to **full strict-semantics equality** `smart.evalE env = (.bin op l r).evalE env`! -/
+private theorem evalE_eq_raw_of_eval_and_ub {sz : Nat} (hSz : sz ≠ 0) {op : BinOp}
+    (hOp : isTotalSmartOp op = true) (env : Nat → Nat)
+    (l r smart : SmartScalarExpr sz)
+    (hEval : smart.eval env = (SmartScalarExpr.bin op l r).eval env)
+    (hUb : (SmartScalarExpr.bin op l r).evalE env = none → smart.evalE env = none)
+    (hSome : (∃ a, l.evalE env = some a) → (∃ b, r.evalE env = some b) →
+      (smart.evalE env).isSome = true) :
+    smart.evalE env = (SmartScalarExpr.bin op l r).evalE env := by
+  cases hRaw : (SmartScalarExpr.bin op l r).evalE env with
+  | none => exact hUb hRaw
+  | some v =>
+    have hL : ∃ a, l.evalE env = some a := by
+      cases hl : l.evalE env with
+      | some a => exact ⟨a, rfl⟩
+      | none =>
+        have hN := (bin_total_evalE_none_iff hSz hOp l r env).mpr (Or.inl hl)
+        rw [hN] at hRaw; cases hRaw
+    have hR : ∃ b, r.evalE env = some b := by
+      cases hr : r.evalE env with
+      | some b => exact ⟨b, rfl⟩
+      | none =>
+        have hN := (bin_total_evalE_none_iff hSz hOp l r env).mpr (Or.inr hr)
+        rw [hN] at hRaw; cases hRaw
+    have hSmartSome := hSome hL hR
+    cases hSm : smart.evalE env with
+    | none => rw [hSm] at hSmartSome; cases hSmartSome
+    | some v' =>
+      have h1 := evalE_eq_some_implies_eval env smart v' hSm
+      have h2 := evalE_eq_some_implies_eval env (.bin op l r) v hRaw
+      exact congrArg some (h1.symm.trans (hEval.trans h2))
+
+private theorem bin_total_evalE_isSome {sz : Nat} (hSz : sz ≠ 0) {op : BinOp}
+    (hOp : isTotalSmartOp op = true) (l r : SmartScalarExpr sz) (env : Nat → Nat)
+    (hL : ∃ a, l.evalE env = some a) (hR : ∃ b, r.evalE env = some b) :
+    ((SmartScalarExpr.bin op l r).evalE env).isSome = true := by
+  rcases hL with ⟨a, ha⟩
+  rcases hR with ⟨b, hb⟩
+  obtain ⟨c, hc⟩ := total_op_ok hSz op hOp a b
+  simp only [SmartScalarExpr.evalE, ha, hb, hc, Option.isSome_some]
+
+/-- **Full strict-semantics (`evalE`) equivalence for all 8 scalar `Bitprism` constructors**
+(holding on BOTH defined AND faulting expressions — certifying simultaneously that UB is never
+erased and defined values agree exactly!). -/
+theorem mkAddSmart_evalE_eq_raw {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat)
+    (l r : SmartScalarExpr sz)
+    (hL : l.eval env < scalarModulus sz) (hR : r.eval env < scalarModulus sz) :
+    (mkAddSmart l r).evalE env = (SmartScalarExpr.bin .add l r).evalE env :=
+  evalE_eq_raw_of_eval_and_ub hSz (op := .add) rfl env l r (mkAddSmart l r)
+    (mkAddSmart_eq_raw hSz env l r hL hR) (mkAddSmart_never_erases_ub hSz env l r)
+    (fun hLe hRe => by
+      unfold mkAddSmart
+      repeat' split
+      all_goals first
+        | exact Option.isSome_some
+        | (rcases hLe with ⟨_, h⟩; rw [h]; rfl)
+        | (rcases hRe with ⟨_, h⟩; rw [h]; rfl)
+        | exact bin_total_evalE_isSome hSz (op := .add) rfl _ _ env hLe hRe)
+
+theorem mkSubSmart_evalE_eq_raw {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat)
+    (l r : SmartScalarExpr sz) (hL : l.eval env < scalarModulus sz) :
+    (mkSubSmart l r).evalE env = (SmartScalarExpr.bin .sub l r).evalE env :=
+  evalE_eq_raw_of_eval_and_ub hSz (op := .sub) rfl env l r (mkSubSmart l r)
+    (mkSubSmart_eq_raw hSz env l r hL) (mkSubSmart_never_erases_ub hSz env l r)
+    (fun hLe hRe => by
+      unfold mkSubSmart
+      repeat' split
+      all_goals first
+        | exact Option.isSome_some
+        | (dsimp only; split <;> exact Option.isSome_some)
+        | (rcases hLe with ⟨_, h⟩; rw [h]; rfl)
+        | (rcases hRe with ⟨_, h⟩; rw [h]; rfl)
+        | exact bin_total_evalE_isSome hSz (op := .sub) rfl _ _ env hLe hRe)
+
+theorem mkMulSmart_evalE_eq_raw {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat)
+    (l r : SmartScalarExpr sz)
+    (hL : l.eval env < scalarModulus sz) (hR : r.eval env < scalarModulus sz) :
+    (mkMulSmart l r).evalE env = (SmartScalarExpr.bin .mul l r).evalE env :=
+  evalE_eq_raw_of_eval_and_ub hSz (op := .mul) rfl env l r (mkMulSmart l r)
+    (mkMulSmart_eq_raw hSz env l r hL hR) (mkMulSmart_never_erases_ub hSz env l r)
+    (fun hLe hRe => by
+      unfold mkMulSmart
+      repeat' split
+      all_goals first
+        | exact Option.isSome_some
+        | (rcases hLe with ⟨_, h⟩; rw [h]; rfl)
+        | (rcases hRe with ⟨_, h⟩; rw [h]; rfl)
+        | exact bin_total_evalE_isSome hSz (op := .mul) rfl _ _ env hLe hRe)
+
+theorem mkBitAndSmart_evalE_eq_raw {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat)
+    (l r : SmartScalarExpr sz)
+    (hL : l.eval env < scalarModulus sz) (hR : r.eval env < scalarModulus sz) :
+    (mkBitAndSmart l r).evalE env = (SmartScalarExpr.bin .bitAnd l r).evalE env :=
+  evalE_eq_raw_of_eval_and_ub hSz (op := .bitAnd) rfl env l r (mkBitAndSmart l r)
+    (mkBitAndSmart_eq_raw hSz env l r hL hR) (mkBitAndSmart_never_erases_ub hSz env l r)
+    (fun hLe hRe => by
+      unfold mkBitAndSmart
+      repeat' split
+      all_goals first
+        | exact Option.isSome_some
+        | (rcases hLe with ⟨_, h⟩; rw [h]; rfl)
+        | (rcases hRe with ⟨_, h⟩; rw [h]; rfl)
+        | exact bin_total_evalE_isSome hSz (op := .bitAnd) rfl _ _ env hLe hRe)
+
+theorem mkBitOrSmart_evalE_eq_raw {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat)
+    (l r : SmartScalarExpr sz)
+    (hL : l.eval env < scalarModulus sz) (hR : r.eval env < scalarModulus sz) :
+    (mkBitOrSmart l r).evalE env = (SmartScalarExpr.bin .bitOr l r).evalE env :=
+  evalE_eq_raw_of_eval_and_ub hSz (op := .bitOr) rfl env l r (mkBitOrSmart l r)
+    (mkBitOrSmart_eq_raw hSz env l r hL hR) (mkBitOrSmart_never_erases_ub hSz env l r)
+    (fun hLe hRe => by
+      unfold mkBitOrSmart
+      repeat' split
+      all_goals first
+        | exact Option.isSome_some
+        | (rcases hLe with ⟨_, h⟩; rw [h]; rfl)
+        | (rcases hRe with ⟨_, h⟩; rw [h]; rfl)
+        | exact bin_total_evalE_isSome hSz (op := .bitOr) rfl _ _ env hLe hRe)
+
+theorem mkBitXorSmart_evalE_eq_raw {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat)
+    (l r : SmartScalarExpr sz)
+    (hL : l.eval env < scalarModulus sz) (hR : r.eval env < scalarModulus sz) :
+    (mkBitXorSmart l r).evalE env = (SmartScalarExpr.bin .bitXor l r).evalE env :=
+  evalE_eq_raw_of_eval_and_ub hSz (op := .bitXor) rfl env l r (mkBitXorSmart l r)
+    (mkBitXorSmart_eq_raw hSz env l r hL hR) (mkBitXorSmart_never_erases_ub hSz env l r)
+    (fun hLe hRe => by
+      unfold mkBitXorSmart
+      repeat' split
+      all_goals first
+        | exact Option.isSome_some
+        | (rcases hLe with ⟨_, h⟩; rw [h]; rfl)
+        | (rcases hRe with ⟨_, h⟩; rw [h]; rfl)
+        | exact bin_total_evalE_isSome hSz (op := .bitXor) rfl _ _ env hLe hRe)
+
+theorem mkShlSmart_evalE_eq_raw {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat)
+    (l r : SmartScalarExpr sz) (hL : l.eval env < scalarModulus sz) :
+    (mkShlSmart l r).evalE env = (SmartScalarExpr.bin .shl l r).evalE env :=
+  evalE_eq_raw_of_eval_and_ub hSz (op := .shl) rfl env l r (mkShlSmart l r)
+    (mkShlSmart_eq_raw hSz env l r hL) (mkShlSmart_never_erases_ub hSz env l r)
+    (fun hLe hRe => by
+      unfold mkShlSmart
+      repeat' split
+      all_goals first
+        | exact Option.isSome_some
+        | (rcases hLe with ⟨_, h⟩; rw [h]; rfl)
+        | (rcases hRe with ⟨_, h⟩; rw [h]; rfl)
+        | exact bin_total_evalE_isSome hSz (op := .shl) rfl _ _ env hLe hRe)
+
+theorem mkShrSmart_evalE_eq_raw {sz : Nat} (hSz : sz ≠ 0) (env : Nat → Nat)
+    (l r : SmartScalarExpr sz) (hL : l.eval env < scalarModulus sz) :
+    (mkShrSmart l r).evalE env = (SmartScalarExpr.bin .shr l r).evalE env :=
+  evalE_eq_raw_of_eval_and_ub hSz (op := .shr) rfl env l r (mkShrSmart l r)
+    (mkShrSmart_eq_raw hSz env l r hL) (mkShrSmart_never_erases_ub hSz env l r)
+    (fun hLe hRe => by
+      unfold mkShrSmart
+      repeat' split
+      all_goals first
+        | exact Option.isSome_some
+        | (rcases hLe with ⟨_, h⟩; rw [h]; rfl)
+        | (rcases hRe with ⟨_, h⟩; rw [h]; rfl)
+        | exact bin_total_evalE_isSome hSz (op := .shr) rfl _ _ env hLe hRe)
+
 /-- Nested `O(1)` smart-constructor collapse witness: `((((x + 0) * 1) | 0) & allOnes) ^ 0 = x`. -/
 theorem bitprism_nested_collapse_o1 (x : Nat) :
     mkBitXorSmart
@@ -4998,6 +5238,11 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
     (type_of% @mkMulSmart_never_erases_ub) ∧ (type_of% @mkBitAndSmart_never_erases_ub) ∧
     (type_of% @mkBitOrSmart_never_erases_ub) ∧ (type_of% @mkBitXorSmart_never_erases_ub) ∧
     (type_of% @mkShlSmart_never_erases_ub) ∧ (type_of% @mkShrSmart_never_erases_ub) ∧
+    (type_of% @mkAddSmart_evalE_eq_raw) ∧ (type_of% @mkSubSmart_evalE_eq_raw) ∧
+    (type_of% @mkMulSmart_evalE_eq_raw) ∧ (type_of% @mkBitAndSmart_evalE_eq_raw) ∧
+    (type_of% @mkBitOrSmart_evalE_eq_raw) ∧ (type_of% @mkBitXorSmart_evalE_eq_raw) ∧
+    (type_of% @mkShlSmart_evalE_eq_raw) ∧ (type_of% @mkShrSmart_evalE_eq_raw) ∧
+    (type_of% @ubFree_eval_lt) ∧
     (type_of% @mkAddSmartRvalue_zero_right_eq_raw) ∧
     (type_of% @mkSubSmartRvalue_zero_right_eq_raw) ∧
     (type_of% @mkBitAndSmartRvalue_zero_left_eq_raw) ∧
@@ -5045,6 +5290,9 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
    @mkAddSmart_never_erases_ub, @mkSubSmart_never_erases_ub, @mkMulSmart_never_erases_ub,
    @mkBitAndSmart_never_erases_ub, @mkBitOrSmart_never_erases_ub, @mkBitXorSmart_never_erases_ub,
    @mkShlSmart_never_erases_ub, @mkShrSmart_never_erases_ub,
+   @mkAddSmart_evalE_eq_raw, @mkSubSmart_evalE_eq_raw, @mkMulSmart_evalE_eq_raw,
+   @mkBitAndSmart_evalE_eq_raw, @mkBitOrSmart_evalE_eq_raw, @mkBitXorSmart_evalE_eq_raw,
+   @mkShlSmart_evalE_eq_raw, @mkShrSmart_evalE_eq_raw, @ubFree_eval_lt,
    @mkAddSmartRvalue_zero_right_eq_raw, @mkSubSmartRvalue_zero_right_eq_raw,
    @mkBitAndSmartRvalue_zero_left_eq_raw, @mkBitAndSmartRvalue_zero_right_eq_raw,
    @mkMulSmartRvalue_zero_left_eq_raw, @mkMulSmartRvalue_zero_right_eq_raw,

@@ -379,9 +379,17 @@ theorem core_ep2_bitprism_scalar_strict_non_erasure (env : Nat → Nat) (l r : S
     ((SmartScalarExpr.bin .mul l r).evalE env = none → (mkMulSmart l r).evalE env = none) ∧
     ((SmartScalarExpr.bin .bitAnd l r).evalE env = none → (mkBitAndSmart l r).evalE env = none) ∧
     ((SmartScalarExpr.bin .sub l r).evalE env = none → (mkSubSmart l r).evalE env = none) ∧
-    (type_of% @bitprism_scalar_ub_subtree_not_erased) :=
+    (type_of% @bitprism_scalar_ub_subtree_not_erased) ∧
+    (type_of% @mkAddSmart_evalE_eq_raw) ∧ (type_of% @mkSubSmart_evalE_eq_raw) ∧
+    (type_of% @mkMulSmart_evalE_eq_raw) ∧ (type_of% @mkBitAndSmart_evalE_eq_raw) ∧
+    (type_of% @mkBitOrSmart_evalE_eq_raw) ∧ (type_of% @mkBitXorSmart_evalE_eq_raw) ∧
+    (type_of% @mkShlSmart_evalE_eq_raw) ∧ (type_of% @mkShrSmart_evalE_eq_raw) ∧
+    (type_of% @ubFree_eval_lt) :=
   ⟨mkMulSmart_never_erases_ub (by decide) env l r, mkBitAndSmart_never_erases_ub (by decide) env l r,
-   mkSubSmart_never_erases_ub (by decide) env l r, bitprism_scalar_ub_subtree_not_erased⟩
+   mkSubSmart_never_erases_ub (by decide) env l r, bitprism_scalar_ub_subtree_not_erased,
+   @mkAddSmart_evalE_eq_raw, @mkSubSmart_evalE_eq_raw, @mkMulSmart_evalE_eq_raw,
+   @mkBitAndSmart_evalE_eq_raw, @mkBitOrSmart_evalE_eq_raw, @mkBitXorSmart_evalE_eq_raw,
+   @mkShlSmart_evalE_eq_raw, @mkShrSmart_evalE_eq_raw, @ubFree_eval_lt⟩
 
 /-- Critical UB non-erasure negative refutations (`0 & dead`, `0 & uninit`, `uninit * 0`,
 `addUnchecked` overflow) proving operand-definedness and overflow-mode preconditions are strictly
@@ -1100,6 +1108,21 @@ run_cmd do
     let _ := borTagTy
     let _ := mfTy
 
+    -- Ep2 Scalar Bitprism strict `evalE` UB-erasure forgery (`(255 +unchecked 1) * 0` claiming `some 0` instead of `none`):
+    let envZero := Expr.lam `x natTy (mkNatLit 0) .default
+    let scConst255 := mkApp2 (mkConst (ep2CoreNs ++ `SmartScalarExpr.const)) (mkNatLit 1) (mkNatLit 255)
+    let scConst1 := mkApp2 (mkConst (ep2CoreNs ++ `SmartScalarExpr.const)) (mkNatLit 1) (mkNatLit 1)
+    let scConst0 := mkApp2 (mkConst (ep2CoreNs ++ `SmartScalarExpr.const)) (mkNatLit 1) (mkNatLit 0)
+    let scUbNode := mkApp4 (mkConst (ep2CoreNs ++ `SmartScalarExpr.bin)) (mkNatLit 1)
+      (mkConst `Trusted.Rustc.V2026_06_01.MirAst.BinOp.addUnchecked) scConst255 scConst1
+    let scSmartMul := mkApp3 (mkConst (ep2CoreNs ++ `mkMulSmart)) (mkNatLit 1) scUbNode scConst0
+    let scEvalE := mkApp3 (mkConst (ep2CoreNs ++ `SmartScalarExpr.evalE)) (mkNatLit 1) envZero scSmartMul
+    let someZeroNat := mkApp2 (mkConst ``Option.some [0]) natTy (mkNatLit 0)
+    let scUbBaseTy := mkApp3 (mkConst ``Eq [1]) optNatTy scEvalE noneNat
+    let scUbBasePf := mkApp2 (mkConst ``Eq.refl [1]) optNatTy noneNat
+    let scUbForgeTy := mkApp3 (mkConst ``Eq [1]) optNatTy scEvalE someZeroNat
+    let scUbForgePf := mkApp2 (mkConst ``Eq.refl [1]) optNatTy someZeroNat
+
     let extraForged : List (String × Option Declaration × Declaration) :=
       [ ("ill-typed 0 = 1 sanity control", none,
           thm "zeroEqOne" (mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit 0) (mkNatLit 1))
@@ -1172,7 +1195,10 @@ run_cmd do
           thm "symProtMissForgedOk" symProtForgeTy (mkConst ``True.intro)),
         ("Ep2 forged veil_frame disjointness for storageLive clobbering frameLocals",
           some (thm "veilLiveDisjBaseFalse" (eqFalse disjExpr) reflFalse),
-          thm "veilLiveDisjForgedTrue" (eqTrue disjExpr) reflTrue) ]
+          thm "veilLiveDisjForgedTrue" (eqTrue disjExpr) reflTrue),
+        ("Ep2 forged scalar Bitprism evalE UB erasure ((255 +unchecked 1) * 0 = some 0)",
+          some (thm "scUbMulBaseNone" scUbBaseTy scUbBasePf),
+          thm "scUbMulForgedSome0" scUbForgeTy scUbForgePf) ]
     for (what, baseOpt, d) in extraForged do
       if let some baseDecl := baseOpt then
         if let some err ← acceptsMsg baseDecl then
@@ -1343,9 +1369,9 @@ run_cmd do
     { fileName := "<ep2-cross-frame-exactwp-cross-root>", fileMap := default,
       options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 54 && rejectedCount = 34 do
+  unless addedCount = 54 && rejectedCount = 35 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
-  logInfo m!"cross-frame/exact-wp cross-root kernel closure: added {addedCount} declarations, rejected {rejectedCount} forged controls (14 two-sided boolean + 20 baseline-paired value/Prop), verified Std.Do-free ExactWpAndSmartCtors, reached all 6 modules + MiniRust+Miri+MemoryLemmas+Trusted, axioms {crAxioms}"
+  logInfo m!"cross-frame/exact-wp cross-root kernel closure: added {addedCount} declarations, rejected {rejectedCount} forged controls (14 two-sided boolean + 21 baseline-paired value/Prop), verified Std.Do-free ExactWpAndSmartCtors, reached all 6 modules + MiniRust+Miri+MemoryLemmas+Trusted, axioms {crAxioms}"
 
 /-! ## §3. Test Module Axiom Audit -/
 
