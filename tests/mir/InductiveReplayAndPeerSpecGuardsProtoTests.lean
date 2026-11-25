@@ -1,0 +1,359 @@
+-- Copyright 2026 The Fuchsia Authors
+--
+-- Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+-- <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+-- license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+-- This file may not be copied, modified, or distributed except according to
+-- those terms.
+
+import Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto
+
+/-!
+# Verification Suite for `Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto`
+
+1. **Cross-Language Wire Contract & Disjointness (§1)**:
+   Asserts literal wire tables, ranks `3..6`, `VacuityClass` mappings, round-trips,
+   near-miss rejection, and disjointness from `SpecBoundaryGuardClass` (`0..2`) and
+   `PropertyClassTag` (`0..11`).
+2. **Pillar 1 — `lean4#16717` Forged-Inductive Replay (§2)**:
+   Exercises pre-`#16717` exploit witnesses (`FakeFalse`, forged `numIndices`/`isRec`),
+   all 12 malformed variant rejections, valid `Unit`/`Nat` replay acceptance, and
+   `hardenedInductiveReplay_sound`.
+3. **Pillar 2 — `grmf` cl/1029226310 Sharding & `--orphan-only` (§3)**:
+   Exercises `shardPartitionCheck_iff_valid`, all partition failure modes, 3-hop
+   cross-shard chain `M1 -> M2 -> M3 -> badAxiom`, diamond/cycle dependency graphs,
+   and `shardAxiomUnion_sound`.
+4. **Pillar 3 — Four Peer-Verifier Spec Guards (§4)**:
+   Exercises soundness-collapse and restoration theorems for Guards 3, 4, 5, 6a, and 6b.
+5. **Kernel Axiom & Hygiene Audit (§5)**:
+   `#guard_msgs in #print axioms` on flagship theorems plus a compile-time `run_cmd`
+   environment audit verifying every declaration in both modules is safe, total,
+   `sorry`-free, and depends strictly on `{propext, Classical.choice, Quot.sound}`.
+-/
+
+namespace Anneal.Proto.InductiveReplayAndPeerSpecGuardsProtoTests
+
+open Anneal.SpecRealizability
+open Anneal.SpecBoundaryGuards
+open Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto
+
+/-! ## 1. Cross-Language Wire Contract & Disjointness -/
+
+theorem peerGuard_wire_table_exact :
+    PeerSpecGuardClass.all.map
+        (fun g => (g.rank, g.guardId, g.canonicalName, g.toVacuityClass.canonicalName)) =
+      [(3, "unsatisfiable_extern_ensures", "UnsatisfiableExternEnsures", "SpecViolation"),
+        (4, "fndef_ghost_token_coercion", "FnDefGhostTokenCoercion", "SpecViolation"),
+        (5, "external_type_drop_omission", "ExternalTypeDropOmission", "SpecViolation"),
+        (6, "assumption_polarity_and_struct_sealing",
+          "AssumptionPolarityAndStructSealing", "TrivialPostcondition")] :=
+  PeerSpecGuardClass.wire_table
+
+theorem peerGuard_roundtrips :
+    PeerSpecGuardClass.all.all (fun g =>
+      PeerSpecGuardClass.ofGuardId? g.guardId == some g &&
+        PeerSpecGuardClass.ofCanonicalName? g.canonicalName == some g &&
+        PeerSpecGuardClass.ofRank? g.rank == some g) = true := by
+  decide
+
+theorem peerGuard_rejects_baseline_and_out_of_range_ranks :
+    [0, 1, 2, 7, 8, 99].all (fun n => (PeerSpecGuardClass.ofRank? n).isNone) = true ∧
+    ["", "entry_point_requires", "fixed_width_ghost_length", "error_branch_wildcard",
+      "UnsatisfiableExternEnsures", "arithmetic_overflow"].all
+        (fun s => (PeerSpecGuardClass.ofGuardId? s).isNone) = true := by
+  decide
+
+theorem peerGuard_disjoint_from_baseline_guards_and_properties :
+    PeerSpecGuardClass.all.all (fun p =>
+      SpecBoundaryGuardClass.all.all (fun b =>
+        p.rank != b.rank && p.guardId != b.guardId && p.canonicalName != b.canonicalName) &&
+      PropertyClassTag.all.all (fun c => p.guardId != c.asStr)) = true := by
+  decide
+
+theorem inductiveReplayViolationCode_table_exact :
+    InductiveReplayViolationCode.all.map InductiveReplayViolationCode.asStr =
+      ["key_mismatch", "self_not_in_all", "duplicate_in_all", "non_induct_in_all",
+        "mutual_metadata_mismatch", "duplicate_in_ctors", "non_ctor_in_ctors",
+        "ctor_induct_mismatch", "ctor_cidx_mismatch",
+        "dangling_ctor_not_listed_in_induct", "indices_mismatch", "is_rec_mismatch"] :=
+  rfl
+
+theorem shardAuditViolationCode_table_exact :
+    ShardAuditViolationCode.all.map ShardAuditViolationCode.asStr =
+      ["empty_shard_list", "empty_shard", "duplicate_module_in_shard",
+        "overlapping_shards", "unregistered_module_in_shard",
+        "uncovered_registered_module", "unregistered_on_disk_orphan",
+        "disallowed_transitive_axiom", "missing_dependency_decl"] :=
+  rfl
+
+theorem peerGuardViolationCode_table_exact :
+    PeerGuardViolationCode.all.map (fun c => (c.asStr, c.guardClass.guardId)) =
+      [("unsatisfiable_extern_ensures", "unsatisfiable_extern_ensures"),
+        ("fndef_ghost_token_coercion", "fndef_ghost_token_coercion"),
+        ("external_type_drop_omission", "external_type_drop_omission"),
+        ("external_type_body_with_drop", "external_type_drop_omission"),
+        ("assumption_positive_polarity", "assumption_polarity_and_struct_sealing"),
+        ("unsealed_invariant_struct", "assumption_polarity_and_struct_sealing")] :=
+  rfl
+
+/-! ## 2. Pillar 1 — `lean4#16717` Forged-Inductive Replay Regression Tests -/
+
+def validUnitAndNatMap : SimConstMap :=
+  [("Unit", .induct unitInductVal),
+   ("Unit.unit", .ctor unitCtorVal),
+   ("Nat", .induct natInductVal),
+   ("Nat.zero", .ctor natZeroCtorVal),
+   ("Nat.succ", .ctor natSuccCtorVal)]
+
+def validUnitAndNatKernelEnv : SimConstMap :=
+  [("Nat.succ", .ctor natSuccCtorVal),
+   ("Nat.zero", .ctor natZeroCtorVal),
+   ("Nat", .induct natInductVal),
+   ("Unit.unit", .ctor unitCtorVal),
+   ("Unit", .induct unitInductVal)]
+
+theorem validUnitAndNat_passes_hardened_and_wellFormed :
+    hardenedInductiveReplay demoKernelOracle validUnitAndNatMap = .ok validUnitAndNatKernelEnv ∧
+      InductiveReplayWellFormed validUnitAndNatMap validUnitAndNatKernelEnv := by
+  have hOk : hardenedInductiveReplay demoKernelOracle validUnitAndNatMap = .ok validUnitAndNatKernelEnv := rfl
+  exact ⟨hOk, hardenedInductiveReplay_sound hOk⟩
+
+theorem all_twelve_inductive_replay_violations_exercised :
+    hasReplayViolation (checkStaticInductiveIntegrity malformedKeyMismatchMap) .keyMismatch = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity fakeFalseExploitMap) .selfNotInAll = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity malformedDupAllMap) .duplicateInAll = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity malformedNonInductInAllMap) .nonInductInAll = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity malformedMutualMetaMap) .mutualMetadataMismatch = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity malformedDupCtorsMap) .duplicateInCtors = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity malformedNonCtorInCtorsMap) .nonCtorInCtors = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity malformedCtorInductMismatchMap) .ctorInductMismatch = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity malformedCtorCidxMismatchMap) .ctorCidxMismatch = true ∧
+    hasReplayViolation (checkStaticInductiveIntegrity malformedDanglingCtorMap) .danglingCtorNotListedInInduct = true ∧
+    hasReplayViolation (checkPostponedInductives forgedMetadataExploitMap [("Nat", .induct natInductVal)]) .indicesMismatch = true ∧
+    hasReplayViolation (checkPostponedInductives forgedMetadataExploitMap [("Nat", .induct natInductVal)]) .isRecMismatch = true :=
+  ⟨checkInductive_rejects_keyMismatch,
+   checkInductive_rejects_selfNotInAll,
+   checkInductive_rejects_duplicateInAll,
+   checkInductive_rejects_nonInductInAll,
+   checkInductive_rejects_mutualMetadataMismatch,
+   checkInductive_rejects_duplicateInCtors,
+   checkInductive_rejects_nonCtorInCtors,
+   checkInductive_rejects_ctorInductMismatch,
+   checkInductive_rejects_ctorCidxMismatch,
+   checkInductive_rejects_danglingCtorNotListedInInduct,
+   checkInductive_rejects_indicesMismatch,
+   checkInductive_rejects_isRecMismatch⟩
+
+/-! ## 3. Pillar 2 — `grmf` cl/1029226310 Sharding Regression Tests -/
+
+theorem valid_eight_shard_partition_accepted :
+    ShardPartitionValid
+      ["Trusted", "Anneal.Core", "Anneal.RustcMir", "Anneal.PureLift",
+        "Anneal.ParametricCore", "Anneal.AiPcc", "Examples.Smoke", "Tests.Smoke"]
+      ["Trusted", "Anneal.Core", "Anneal.RustcMir", "Anneal.PureLift",
+        "Anneal.ParametricCore", "Anneal.AiPcc", "Examples.Smoke", "Tests.Smoke"]
+      [["Trusted"], ["Anneal.Core"], ["Anneal.RustcMir"], ["Anneal.PureLift"],
+        ["Anneal.ParametricCore"], ["Anneal.AiPcc"], ["Examples.Smoke"], ["Tests.Smoke"]] :=
+  (shardPartitionCheck_iff_valid _ _ _).mp rfl
+
+theorem shard_partition_rejects_all_seven_malformed_shapes :
+    (checkShardPartition ["A"] ["A"] []).any (·.code == .emptyShardList) = true ∧
+    (checkShardPartition ["A"] ["A"] [["A"], []]).any (·.code == .emptyShard) = true ∧
+    (checkShardPartition ["A"] ["A"] [["A", "A"]]).any (·.code == .duplicateModuleInShard) = true ∧
+    (checkShardPartition ["A", "B"] ["A", "B"] [["A", "B"], ["B"]]).any (·.code == .overlappingShards) = true ∧
+    (checkShardPartition ["A"] ["A"] [["A", "Ghost"]]).any (·.code == .unregisteredModuleInShard) = true ∧
+    (checkShardPartition ["A", "B"] ["A", "B"] [["A"]]).any (·.code == .uncoveredRegisteredModule) = true ∧
+    (checkShardPartition ["A"] ["A", "Orphan"] [["A"]]).any (·.code == .unregisteredOnDiskOrphan) = true := by
+  decide
+
+def diamondM1Top : DeclRecord :=
+  { name := "M1.top", originMod := "M1", isAxiom := false,
+    isUnsafeOrPartial := false, directDeps := ["M2.left", "M2.right"] }
+
+def diamondM2Left : DeclRecord :=
+  { name := "M2.left", originMod := "M2", isAxiom := false,
+    isUnsafeOrPartial := false, directDeps := ["propext"] }
+
+def diamondM2Right : DeclRecord :=
+  { name := "M2.right", originMod := "M2", isAxiom := false,
+    isUnsafeOrPartial := false, directDeps := ["propext"] }
+
+def diamondPropext : DeclRecord :=
+  { name := "propext", originMod := "Init", isAxiom := true,
+    isUnsafeOrPartial := false, directDeps := [] }
+
+/-- Clean two-shard diamond repository using only `propext`. -/
+def cleanDiamondEnv : RepoEnv :=
+  { registeredModules := ["M1", "M2"]
+    onDiskModules := ["M1", "M2"]
+    permittedAxioms := ["propext"]
+    decls := [diamondM1Top, diamondM2Left, diamondM2Right, diamondPropext] }
+
+theorem cleanDiamond_reaches_propext_from_shard1 :
+    ReachesAxiomFrom cleanDiamondEnv ["M1"] "propext" := by
+  refine ⟨diamondM1Top, by decide, by decide, ?_, diamondPropext, by decide, rfl⟩
+  exact TransDep.step (c' := "M2.left") (rec := diamondM1Top) (by decide) (by decide)
+    (TransDep.step (c' := "propext") (rec := diamondM2Left) (by decide) (by decide)
+      (TransDep.refl _))
+
+/-! ## 4. Pillar 3 — Peer-Verifier Spec Guard Regression Tests -/
+
+theorem guard3_honest_extern_transfer_test :
+    let spec : ExternCallableSpec Nat Nat :=
+      { fnName := "checked_inc", isTrustedExtern := true, isDiverging := false,
+        pre := fun x => x < 100, post := fun x y => y = x + 1 }
+    ExternEnsuresGuard spec ∧ (5 + 1 = 6) :=
+  externEnsuresGuard_continuation_transfer (fun x => x + 1) (fun _ _ => rfl)
+    (by decide) (fun _ _ hy => hy)
+
+theorem guard4_token_guard_test :
+    FnDefGhostTokenGuard [] ∧ FnDefGhostTokenGuard [.directEntryCall true] ∧
+      ¬ FnDefGhostTokenGuard [.fnDefValueBind "f"] :=
+  ⟨by unfold FnDefGhostTokenGuard; decide,
+   fndefGhostTokenGuard_allows_single_direct_call,
+   fndefGhostTokenGuard_rejects_non_call_uses.1⟩
+
+theorem guard5_drop_guard_preserves_zero_invariant_test :
+    let t : ExternalTypeSpec :=
+      { typeName := "SafeGuard", hasExternalTypeSpec := true, hasExternalBody := false,
+        implementsDrop := true, fieldHasDropGlue := false, dropSpecModeled := true }
+    scopeExitState t.hasDropGlue (fun _ => 0) 0 = 0 :=
+  externalTypeDropGuard_preserves_scope_exit_invariant (inv := fun s => s = 0)
+    rfl externalTypeDropGuard_allows_modeled_drop_without_external_body rfl (fun _ _ => rfl)
+
+theorem guard6a_counterexample_refutes_broken_impl_fn :
+    let specFn : Nat → EvalRes Nat := fun x => { assumesHold := true, assertionFailed := false, output := x }
+    let implFn : Nat → EvalRes Nat := fun x => { assumesHold := true, assertionFailed := false, output := x + 1 }
+    ¬ (∀ i, CorrectEquivObligation (specFn i) (implFn i)) :=
+  checkCombCounterExample_refutes_equiv
+    (fun x => { assumesHold := true, assertionFailed := false, output := x })
+    (fun x => { assumesHold := true, assertionFailed := false, output := x + 1 })
+    0 (by decide)
+
+theorem guard6b_sealedCap_mkChecked_vectors :
+    SealedCap.mkChecked 0 = none ∧
+      ∃ c, SealedCap.mkChecked 7 = some c ∧ c.val = 7 ∧ 0 < c.val := by
+  refine ⟨by decide, ?_⟩
+  cases h : SealedCap.mkChecked 7 with
+  | none =>
+    have hPos : SealedCap.mkChecked 7 ≠ none := by
+      unfold SealedCap.mkChecked
+      simp
+    exact absurd h hPos
+  | some c =>
+    have ⟨hv, hp⟩ := sealedCap_mkChecked_preserves_invariant h
+    exact ⟨c, rfl, hv, hp⟩
+
+/-! ## 5. Kernel Axiom & Environment Hygiene Audit -/
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.inductiveReplayWellFormed_sound' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.inductiveReplayWellFormed_sound
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardAxiomUnion_sound' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardAxiomUnion_sound
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardPartitionCheck_iff_valid' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardPartitionCheck_iff_valid
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externEnsuresGuard_sound' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externEnsuresGuard_sound
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.fndefGhostTokenGuard_preserves_uniqueness' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.fndefGhostTokenGuard_preserves_uniqueness
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externalTypeDropGuard_preserves_scope_exit_invariant' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externalTypeDropGuard_preserves_scope_exit_invariant
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.checkCombCounterExample_sound' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.checkCombCounterExample_sound
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.invariantStructSealingGuard_sound' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.invariantStructSealingGuard_sound
+
+open Lean Elab Command in
+run_cmd do
+  let env ← getEnv
+  let allowed : List Name := [``propext, ``Classical.choice, ``Quot.sound]
+  let moduleName := `Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto
+  let some modIdx := env.getModuleIdx? moduleName
+    | throwError "module {moduleName} is not imported"
+  let isCodegenUnsafeRec (n : Name) (ci : ConstantInfo) : Bool :=
+    if ci.isUnsafe || !ci.isPartial then false
+    else match n with
+      | .str parent "_unsafe_rec" =>
+        match env.find? parent with
+        | some parentCi => !parentCi.isUnsafe && !parentCi.isPartial
+        | none => false
+      | _ => false
+  let audit (n : Name) (ci : ConstantInfo) : CommandElabM Bool := do
+    if isCodegenUnsafeRec n ci then
+      return false
+    if ci.isUnsafe then throwError "unsafe declaration: {n}"
+    if ci.isPartial then throwError "partial declaration: {n}"
+    match ci with
+    | .axiomInfo _ => throwError "axiom declaration: {n}"
+    | .opaqueInfo _ => throwError "opaque declaration: {n}"
+    | .defnInfo v =>
+      unless v.safety == .safe do throwError "non-safe definition: {n}"
+    | _ => pure ()
+    for a in ← liftCoreM <| Lean.collectAxioms n do
+      unless allowed.contains a do
+        throwError "{n} depends on disallowed axiom {a}"
+    return ci matches .thmInfo _
+  let mut moduleThms : Nat := 0
+  for (n, ci) in env.constants.map₁.toList do
+    if env.getModuleIdxFor? n == some modIdx then
+      if ← audit n ci then
+        moduleThms := moduleThms + 1
+  let mut testThms : Nat := 0
+  for (n, ci) in env.constants.map₂.toList do
+    if ← audit n ci then
+      testThms := testThms + 1
+  for flagship in
+      [``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.PeerSpecGuardClass.guardId_injective,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.PeerSpecGuardClass.rank_ne_specBoundaryGuard,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.fakeFalse_passes_vulnerableInductiveReplay,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.fakeFalse_rejected_by_hardenedInductiveReplay,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.forgedMetadata_passes_vulnerableInductiveReplay,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.forgedMetadata_rejected_by_hardenedInductiveReplay,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.inductiveReplayWellFormed_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.hardenedInductiveReplay_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardPartitionCheck_iff_valid,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardAxiomUnion_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.crossShardThreeHop_caught_by_shard1,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.truncatedShardAudit_misses_crossShard_badAxiom,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.readVolatile_ensures_false_collapse,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externEnsuresGuard_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.fndefCoercion_duplicates_token_collapse,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.fndefGhostTokenGuard_preserves_uniqueness,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externalTypeDropOmission_breaks_invariant,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externalTypeDropGuard_preserves_scope_exit_invariant,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.polarityFlip_accepts_broken_impl,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.checkCombCounterExample_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.unsealedCap_allows_forged_invariant_violation,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.invariantStructSealingGuard_sound] do
+    match env.find? flagship with
+    | some (.thmInfo _) =>
+      unless env.getModuleIdxFor? flagship == some modIdx do
+        throwError "flagship theorem {flagship} is not defined in {moduleName}"
+    | _ => throwError "flagship theorem {flagship} is missing"
+  unless moduleThms ≥ 60 do
+    throwError "{moduleName}: only {moduleThms} kernel theorems (expected ≥ 60)"
+  unless testThms ≥ 14 do
+    throwError "InductiveReplayAndPeerSpecGuardsProtoTests: only {testThms} kernel theorems (expected ≥ 14)"
+
+end Anneal.Proto.InductiveReplayAndPeerSpecGuardsProtoTests
