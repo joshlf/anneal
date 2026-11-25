@@ -500,7 +500,7 @@ def _fake_lean_run_source(
         "KEYS = ('LEAN_NUM_THREADS', 'ANNEAL_LSP_NO_EVICT', 'ANNEAL_LEAN_RUN_IN_SCOPE', 'ANNEAL_LEAN_RUN_ACTIVE',\n"
         "        'ANNEAL_LEAN_RUN_LEAN_M_MB', 'ANNEAL_LEAN_RUN_SLOTS', 'ANNEAL_LEAN_RUN_MEM_MB',\n"
         "        'ANNEAL_WORKTREE_CONCURRENCY', 'ANNEAL_LEAN_MEMORY_MAX_MB', 'ANNEAL_LEAN_TIMEOUT_SEC',\n"
-        "        'ANNEAL_OOM_OFFLOAD_CMD', 'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR', 'HOME')\n"
+        "        'ANNEAL_OOM_OFFLOAD_CMD', 'ANNEAL_LSP_SOCKET', 'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR', 'HOME')\n"
         "unit = os.path.join(os.environ.get('XDG_CONFIG_HOME', '/nonexistent'), 'systemd/user/anneal-workloads.slice')\n"
         "if LOG:\n"
         "    with open(LOG, 'a', encoding='utf-8') as fh:\n"
@@ -6313,6 +6313,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 self.assertEqual(env["LEAN_NUM_THREADS"], "1")
                 self.assertEqual(env["ANNEAL_LSP_NO_EVICT"], "1")
                 self.assertIsNone(env["ANNEAL_LEAN_RUN_IN_SCOPE"])
+                self.assertEqual(Path(env["ANNEAL_LSP_SOCKET"]).parent, Path(env["XDG_RUNTIME_DIR"]))
+                self.assertNotEqual(env["ANNEAL_LSP_SOCKET"], "/tmp/anneal-lean-lsp.sock")
                 for var in ("XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"):
                     self.assertTrue(env[var] and Path(env[var]).name in ("config", "runtime"), (var, env[var]))
                     self.assertNotEqual(env[var], os.environ.get(var))
@@ -6491,15 +6493,53 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             spy.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(spy_log))}\nexit 0\n', encoding="utf-8")
             spy.chmod(0o755)
 
-            # The shim swallows `daemon-reload` and forwards everything else, argv intact.
+            # The shim swallows `daemon-reload`, `daemon-reexec`, and `anneal-lsp-daemon-*` kills,
+            # and forwards everything else (read-only queries and transient scope kills) argv intact.
             probe_env = {"PATH": os.pathsep.join([os.fspath(spy_bin), "/usr/bin", "/bin"])}
             suite._install_probe_systemctl_shim(probe_env, root / "shim")
             self.assertEqual(probe_env["PATH"].split(os.pathsep)[0], os.fspath(root / "shim"))
             self.assertEqual(shutil.which("systemctl", path=probe_env["PATH"]), os.fspath(root / "shim/systemctl"))
-            for argv in (["--user", "daemon-reload"], ["daemon-reload"], ["--user", "show", "-p", "Version", "--value"]):
+            for argv in (
+                ["--user", "daemon-reload"],
+                ["daemon-reload"],
+                ["--user", "daemon-reexec"],
+                ["--user", "kill", "-s", "SIGKILL", "anneal-lsp-daemon-123.scope"],
+                ["--user", "show", "-p", "Version", "--value"],
+                ["--user", "kill", "-s", "SIGTERM", "anneal-run-999.scope"],
+            ):
                 res = subprocess.run(["systemctl", *argv], env=probe_env, capture_output=True, check=False, timeout=10)
                 self.assertEqual(res.returncode, 0, argv)
-            self.assertEqual(spy_log.read_text(encoding="utf-8").splitlines(), ["--user show -p Version --value"])
+            self.assertEqual(
+                spy_log.read_text(encoding="utf-8").splitlines(),
+                ["--user show -p Version --value", "--user kill -s SIGTERM anneal-run-999.scope"],
+            )
+
+            # When `PATH` is unset (`env={}` / `env={"HOME": ...}`), the shim preserves `os.defpath`
+            # behind `shim_dir` so `#!/usr/bin/env python3` wrappers (including the real in-repo
+            # `scripts/anneal-lean-run`) still resolve `python3` and pass cleanly.
+            unset_path_env: dict[str, str] = {}
+            suite._install_probe_systemctl_shim(unset_path_env, root / "shim_defpath")
+            if "PATH" in unset_path_env:
+                self.assertEqual(
+                    unset_path_env["PATH"],
+                    os.pathsep.join([os.fspath(root / "shim_defpath"), os.defpath]),
+                )
+            real_in_repo = REPO_ROOT / "scripts/anneal-lean-run"
+            self.assertTrue(suite._wrapper_honors_lean_num_threads(real_in_repo, env={}))
+            self.assertTrue(
+                suite._wrapper_honors_lean_num_threads(real_in_repo, env={"HOME": os.fspath(Path.home())})
+            )
+            # And `_resolve_anneal_lean_run` with unset `PATH` keeps an honoring `#!/usr/bin/env python3`
+            # `~/.local/bin/anneal-lean-run` copy instead of falsely rejecting it.
+            real_home = root / "real_home"
+            real_home_wrapper = real_home / ".local/bin/anneal-lean-run"
+            real_home_wrapper.parent.mkdir(parents=True)
+            shutil.copy2(real_in_repo, real_home_wrapper)
+            real_home_wrapper.chmod(0o755)
+            self.assertEqual(
+                suite._resolve_anneal_lean_run(REPO_ROOT, env={"HOME": os.fspath(real_home)}),
+                real_home_wrapper,
+            )
 
             # End to end on the real wrapper: a live unit whose `MemoryHigh` / `MemoryMax` match
             # but whose text does not (an operator comment, another wrapper's template) would
@@ -6629,6 +6669,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 {"ANNEAL_WORKTREE_CONCURRENCY": "8"},
                 {"ANNEAL_LEAN_MEMORY_MAX_MB": "512"},
                 {"ANNEAL_OOM_OFFLOAD_CMD": "/bin/false"},
+                {"ANNEAL_LSP_SOCKET": "/tmp/custom-lsp.sock"},
                 {"XDG_RUNTIME_DIR": "/x"},
             ):
                 self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper, env={**os.environ, **noise}), noise)

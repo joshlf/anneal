@@ -5346,6 +5346,7 @@ _WRAPPER_PROBE_SCRUBBED_ENV: frozenset[str] = frozenset(
         "ANNEAL_LEAN_MEMORY_MAX_MB",
         "ANNEAL_LEAN_TIMEOUT_SEC",
         "ANNEAL_OOM_OFFLOAD_CMD",
+        "ANNEAL_LSP_SOCKET",
         "XDG_CONFIG_HOME",
         "XDG_RUNTIME_DIR",
     )
@@ -5370,14 +5371,17 @@ _WRAPPER_EXEC_CHECK_FLAGS: tuple[tuple[str, ...], ...] = (
     ("--mode", "file", "--no-slot-lock"),
     ("--mode", "build", "--concurrency", "1", "--no-slot-lock"),
 )
-# `systemctl` shim placed first on the probe's `PATH`: forwards every call to the real
-# `systemctl` but swallows `daemon-reload`, so a wrapper that reconciles its
-# `anneal-workloads.slice` unit inside the private `XDG_CONFIG_HOME` (whatever template
-# it renders) can never reload the live user manager from a capability probe.
+# `systemctl` shim placed first on the probe's `PATH`: forwards read-only queries and
+# transient probe-scope kills to the real `systemctl`, but swallows `daemon-reload`,
+# `daemon-reexec`, and `anneal-lsp-daemon-*` kills so a capability probe (even against
+# an older wrapper that ignores `ANNEAL_LSP_NO_EVICT`) can never reload the live user
+# manager or evict live warm LSP daemons.
 _WRAPPER_PROBE_SYSTEMCTL_SHIM = (
     "#!/bin/sh\n"
     'for arg in "$@"; do\n'
-    '  [ "$arg" = daemon-reload ] && exit 0\n'
+    '  case "$arg" in\n'
+    "    daemon-reload|daemon-reexec|anneal-lsp-daemon-*) exit 0 ;;\n"
+    "  esac\n"
     "done\n"
     'exec {real} "$@"\n'
 )
@@ -5391,7 +5395,9 @@ _WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES = 64 * 1024
 def _terminate_probe_proc_group(proc: subprocess.Popen[bytes]) -> None:
     _signal_process_group(proc.pid, signal.SIGTERM)
     try:
-        proc.wait(timeout=1.0)
+        # Exceed `anneal-lean-run`'s 2.0 s `_kill_systemd_scope` grace window so a
+        # timed-out wrapper can finish `SIGKILL`ing any transient systemd scope it opened.
+        proc.wait(timeout=2.5)
     except subprocess.TimeoutExpired:
         pass
     _signal_process_group(proc.pid, signal.SIGKILL)
@@ -5485,12 +5491,16 @@ def _seed_probe_workloads_slice_unit(env: Mapping[str, str], config_dir: Path) -
 
 def _install_probe_systemctl_shim(probe_env: dict[str, str], shim_dir: Path) -> None:
     """Prepend `shim_dir` (holding the `_WRAPPER_PROBE_SYSTEMCTL_SHIM` `systemctl`) to
-    `probe_env["PATH"]`. The real `systemctl` is the one `probe_env` would have found
-    (else `/usr/bin/systemctl`); with none at all, no shim is installed and the wrapper
-    finds no `systemctl` either."""
-    raw_path = probe_env.get("PATH", "")
-    real = shutil.which("systemctl", path=raw_path) if raw_path else None
-    if real is None and Path("/usr/bin/systemctl").is_file():
+    `probe_env["PATH"]`. When `PATH` was unset in `probe_env`, preserve POSIX `os.defpath`
+    behind `shim_dir` so `#!/usr/bin/env python3` wrappers still resolve standard tools.
+    The real `systemctl` is the one `base_path` would have found (else executable
+    `/usr/bin/systemctl`); with none at all, no shim is installed."""
+    base_path = probe_env["PATH"] if "PATH" in probe_env else os.defpath
+    try:
+        real = shutil.which("systemctl", path=base_path) if base_path else None
+    except (OSError, ValueError):
+        real = None
+    if real is None and _is_executable_file(Path("/usr/bin/systemctl")):
         real = "/usr/bin/systemctl"
     if real is None:
         return
@@ -5501,7 +5511,7 @@ def _install_probe_systemctl_shim(probe_env: dict[str, str], shim_dir: Path) -> 
         shim.chmod(0o700)
     except OSError:
         return
-    probe_env["PATH"] = os.pathsep.join([os.fspath(shim_dir), raw_path]) if raw_path else os.fspath(shim_dir)
+    probe_env["PATH"] = os.pathsep.join([os.fspath(shim_dir), base_path]) if base_path else os.fspath(shim_dir)
 
 
 def _probe_wrapper_thread_honoring(
@@ -5522,6 +5532,7 @@ def _probe_wrapper_thread_honoring(
         _seed_probe_workloads_slice_unit(env, config_dir)
         probe_env = {
             **probe_base,
+            "ANNEAL_LSP_SOCKET": os.fspath(runtime_dir / "no-lsp.sock"),
             "XDG_CONFIG_HOME": os.fspath(config_dir),
             "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
         }
@@ -5575,10 +5586,11 @@ def _wrapper_honors_lean_num_threads(
     `~/.local/bin/anneal-lean-run` overwrites it with its `<B>`-thread budget, which
     defeats the `LOW_RAM_SINGLE_THREAD_STEPS` policy on a low-RAM host.
 
-    Runs, with `LEAN_NUM_THREADS=1`, `ANNEAL_LSP_NO_EVICT=1`, scrubbed outer-scope and
-    resource-override `ANNEAL_*` env vars, private temporary `XDG_CONFIG_HOME` /
-    `XDG_RUNTIME_DIR`, and a `PATH`-first `systemctl` shim that swallows `daemon-reload`,
-    each bounded by `timeout_sec`:
+    Runs, with `LEAN_NUM_THREADS=1`, `ANNEAL_LSP_NO_EVICT=1`, an isolated non-existent
+    `ANNEAL_LSP_SOCKET`, scrubbed outer-scope and resource-override `ANNEAL_*` env vars,
+    private temporary `XDG_CONFIG_HOME` / `XDG_RUNTIME_DIR`, and a `PATH`-first
+    `systemctl` shim that swallows `daemon-reload`, `daemon-reexec`, and
+    `anneal-lsp-daemon-*` kills, each bounded by `timeout_sec`:
     1. `<wrapper> --mode build --concurrency 1 --probe` (text): a non-zero exit, a
        timeout, oversized output, or any reported `LEAN_NUM_THREADS=<T>` with `<T> != 1`
        -> `False`;
