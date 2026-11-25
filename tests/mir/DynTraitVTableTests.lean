@@ -232,6 +232,20 @@ theorem dv_mr_deep_theorems_used :
   have _ := @dv_v1_ref_validity_vs_raw_trusted_witness
   have _ := @dv_v2_autoTrait_boundary_trusted_witness
   have _ := @dv_v3_pin_receiver_rewrap_trusted_witness
+  have _ := @dv_vtableEnvOk_universal
+  have _ := @dv_vtableEnvOk_universal_nonvacuous
+  have _ := @dv_dynRefDataValid_scalar_32bit_universal
+  have _ := @dv_v1_uninhabited_ub_universal_M
+  have _ := @dv_v1_uninhabited_and_32bit_nonvacuous
+  have _ := @dv_v2_evalDynToDynUnsize_universal
+  have _ := @dv_v2_evalDynToDynUnsize_universal_nonvacuous
+  have _ := @dv_dynRefDataValid_checkTB_false_perm_irrel
+  have _ := @dv_checkDynVTablePtr_perm_irrel
+  have _ := @dv_v4_evalSafeDynSizeAlignOfValCall_tb_irrel_universal
+  have _ := @dv_v4_evalSafeDynSizeAlignOfValCall_nonvacuous
+  have _ := @dv_v4_evalAddrEqCall_meta_irrel_universal
+  have _ := @dv_v4_evalAddrEqCall_nonvacuous
+  have _ := @dv_v3_linked_pin_receiver_protector_witness
   have _ := @dv_variant_outcomes_distinct
   have _ := @dvTrustedObserve_table
   have _ := @dvMrObserveClass_table
@@ -510,8 +524,44 @@ run_cmd do
         (mkApp2 (mkConst ``Eq.refl [1]) ty lhs)
       added := added.push lockName
       lockCount := lockCount + 1
-    unless lockCount = 33 do
-      throwError "cross-root: expected 33 fixture locks, got {lockCount}"
+    -- 3b. Per-key fixture locks: prove by `Eq.refl` that Authority 0 (`dvTrustedFixture`) and
+    -- Authority 2 (`dvLmFixture`) execute the EXACT SAME `CapturedMir` body on all 15 non-c16
+    -- keys, and explicitly pin the c16 key (`(2, 3)`: Trusted runs callee-level
+    -- `dvV3ProtectedPokeMir`, bridged to caller-level `dvV3PokeCallerMir` by
+    -- `dv_v3_c16_callee_entry_matches_corpus_state`, while LM runs `dvV3PokeCallerMir` and
+    -- ALSO witnesses `dvV3ProtectedPokeMir` in `dv_c16_witnesses`).
+    let caseCtors : List (Name × Nat) :=
+      [(`okPrimary, 0), (`okSecondary, 1), (`ubFault, 2), (`modeCase, 3)]
+    let variantPairs : List (Name × Nat) :=
+      [(`thinUnsize, 0), (`dynUpcastAndNop, 1), (`virtualDispatchAndProtector, 2),
+       (`dynLayoutRawBorrowAndAddrEq, 3)]
+    for (vc, vi) in variantPairs do
+      let vConst := mkConst (mrNs ++ `DynVtVariant ++ vc)
+      for (cc, ci) in caseCtors do
+        let cConst := mkConst (mrNs ++ `DynVtCase ++ cc)
+        let mrFix := mkApp2 (mkConst (mrNs ++ `dvTrustedFixture)) vConst cConst
+        let lmFix := mkApp2 (mkConst (lmNs ++ `dvLmFixture)) (mkNatLit vi) (mkNatLit ci)
+        if vi == 2 && ci == 3 then
+          let lockMr := ns ++ `keyLock ++ `c16Trusted
+          addThm lockMr (mkApp3 (mkConst ``Eq [1]) capMirTy mrFix
+              (mkConst (mrNs ++ `dvV3ProtectedPokeMir)))
+            (mkApp2 (mkConst ``Eq.refl [1]) capMirTy mrFix)
+          added := added.push lockMr
+          lockCount := lockCount + 1
+          let lockLm := ns ++ `keyLock ++ `c16Lm
+          addThm lockLm (mkApp3 (mkConst ``Eq [1]) capMirTy lmFix
+              (mkConst (lmNs ++ `dvV3PokeCallerMir)))
+            (mkApp2 (mkConst ``Eq.refl [1]) capMirTy lmFix)
+          added := added.push lockLm
+          lockCount := lockCount + 1
+        else
+          let lockName := ns ++ `keyLock ++ vc ++ cc
+          addThm lockName (mkApp3 (mkConst ``Eq [1]) capMirTy mrFix lmFix)
+            (mkApp2 (mkConst ``Eq.refl [1]) capMirTy mrFix)
+          added := added.push lockName
+          lockCount := lockCount + 1
+    unless lockCount = 50 do
+      throwError "cross-root: expected 50 fixture locks (33 named + 17 per-key), got {lockCount}"
 
     -- 4. Negative controls on scratch copies of the environment: the Lean kernel MUST reject
     -- every forged theorem, mode-inverted / variant-swapped authority, colliding or
@@ -581,7 +631,29 @@ run_cmd do
         ("forged LeanMiri verdict: wrong-trait receiver vtable dispatches", .thmDecl {
           name := ns ++ `forged.lmWrongVTableDispatches, levelParams := [],
           type := mkApp3 (mkConst ``Eq [1]) lmObsTy (lmObserveAt false 2 2) (lmU32 2),
-          value := mkApp2 (mkConst ``Eq.refl [1]) lmObsTy (lmU32 2) }) ]
+          value := mkApp2 (mkConst ``Eq.refl [1]) lmObsTy (lmU32 2) }),
+        ("swapped per-key fixture lock (thinUnsize.okPrimary != thinUnsize.okSecondary)", .thmDecl {
+          name := ns ++ `forged.swappedKeyLock, levelParams := [],
+          type := mkApp3 (mkConst ``Eq [1]) capMirTy
+            (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
+              (mkConst (mrNs ++ `DynVtVariant ++ `thinUnsize))
+              (mkConst (mrNs ++ `DynVtCase ++ `okPrimary)))
+            (mkApp2 (mkConst (lmNs ++ `dvLmFixture)) (mkNatLit 0) (mkNatLit 1)),
+          value := mkApp2 (mkConst ``Eq.refl [1]) capMirTy
+            (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
+              (mkConst (mrNs ++ `DynVtVariant ++ `thinUnsize))
+              (mkConst (mrNs ++ `DynVtCase ++ `okPrimary))) }),
+        ("forged c16 key fixture identity (ProtectedPoke != PokeCaller)", .thmDecl {
+          name := ns ++ `forged.c16FixtureConflation, levelParams := [],
+          type := mkApp3 (mkConst ``Eq [1]) capMirTy
+            (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
+              (mkConst (mrNs ++ `DynVtVariant ++ `virtualDispatchAndProtector))
+              (mkConst (mrNs ++ `DynVtCase ++ `modeCase)))
+            (mkApp2 (mkConst (lmNs ++ `dvLmFixture)) (mkNatLit 2) (mkNatLit 3)),
+          value := mkApp2 (mkConst ``Eq.refl [1]) capMirTy
+            (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
+              (mkConst (mrNs ++ `DynVtVariant ++ `virtualDispatchAndProtector))
+              (mkConst (mrNs ++ `DynVtCase ++ `modeCase))) }) ]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
@@ -654,7 +726,11 @@ run_cmd do
         lmNs ++ `dv_vtable_check_agreement_realizable,
         lmNs ++ `dv_getMethod_realizable,
         lmNs ++ `dv_extra_witnesses,
-        lmNs ++ `dv_c16_witnesses ]
+        lmNs ++ `dv_c16_witnesses,
+        lmNs ++ `dv_kani5216_uninhabited_witness,
+        lmNs ++ `dv_c2_tb_unsize_and_raw_mut_witness,
+        lmNs ++ `dv_c3_and_raw_intrinsics_witness,
+        lmNs ++ `dv_pin_adt_unsize_and_dispatch_from_dyn_witness ]
     for n in lmDeepThms do
       let some (.thmInfo v) := env.find? n
         | throwError "cross-root: required LM theorem {n} missing"
@@ -747,7 +823,7 @@ run_cmd do
     { fileName := "<dv-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 68 && bundleCount = 5 && lockCount = 33 && rejectedCount = 12 do
+  unless addedCount = 85 && bundleCount = 5 && lockCount = 50 && rejectedCount = 14 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount})"
   logInfo m!"dv cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
@@ -765,18 +841,25 @@ field-for-field) for `UintTy`, `IntTy`, `FloatTy`, `Mutability`, `Safety`, `Call
 `RigidTy`, `CapturedVTableSlot`, `CapturedVTable`, `CapturedDynType`, `ScalarInt`,
 `ProvenancePtr`, `Value`, `DynUnsizeTarget`, `DynReceiverKind`, and `DynCheck`.
 
-Universal commuting theorems (∀ inputs of the 08 dialect): `wfVTableEntry_hom`,
-`resolveUpcastVTable?_hom`, `dynUnsizeTarget?_hom`, `classifyDynReceiver?_hom`,
-`narrowDynReceiver_hom`, plus the supporting lemmas (`rigidTyEqAux_hom_both`, the lookup lemmas,
-`dynVTableEnv?_hom`, `checkDynVTablePtr_hom`, ...).
+Universal commuting & injectivity theorems (∀ inputs of the 08 dialect):
+`homTy_injective`, `homSlot_injective`, `homVTable_injective`, `homValue_injective`,
+`wfVTableEntry_hom`, `resolveUpcastVTable?_hom`, `dynUnsizeTarget?_hom`,
+`classifyDynReceiver?_hom`, `narrowDynReceiver_hom`, `dynRefDataValid_scalar_hom`
+(arbitrary pointer width, including 32-bit and `kani#5216` uninhabited checks), plus the
+supporting lemmas (`rigidTyEqAux_hom_both`, the lookup lemmas, `OptBodyRel`-generalized
+`dynVTableEnv?_opt_hom` and `checkDynVTablePtr_opt_hom` covering both `currentBody = .none`
+and `currentBody = .some _`, and `evalThinToDynUnsize_raw_hom`).
 
 Relational theorems: `evalDynSizeAlignOfVal_hom` (under `DynMemRel` + equal pointer width) and
 `evalAddrEqCall_hom` (under `AddrRel` + equal pointer width) state that both dialects take the
 SAME `DynStepClass` (`.ub` / `.unsupported` / intrinsic return of the same scalar). Every
-relation and hypothesis is realized by a concrete witness (`wState_dynMemRel`,
-`wBare_dynMemRel`, `wLayouts_ptrBytes`, `wState_addrRel`, `addrRel_of_no_borrows`), and every
+relation and hypothesis is realized by concrete witnesses (`wState_dynMemRel`,
+`wBare_dynMemRel`, `wBody_optBodyRel`, `wLayouts_ptrBytes`, `wState_addrRel`,
+`addrRel_of_no_borrows`, `addrRel_of_root_borrows`, `wBorrowState_addrRel`), and every
 outcome class is realized in both dialects (`evalDynSizeAlignOfVal_witness_*`,
-`evalAddrEqCall_witness_*`, `witness_written_values`).
+`evalAddrEqCall_witness_*`, `checkDynVTablePtr_opt_witness`,
+`evalThinToDynUnsize_raw_witness_32bit_64bit`,
+`dynRefDataValid_scalar_witness_32bit_uninhabited`, `witness_written_values`).
 
 Scope and dialect differences (none of them is a divergence on the `dyn` fragment):
 - `V2026_06_01.MirSemantics.Value` has the extra constructor `.uninit`, outside the image of
@@ -787,9 +870,9 @@ Scope and dialect differences (none of them is a divergence on the `dyn` fragmen
   width hypothesis instead of a `LayoutTable` embedding.
 - `evalAddrEqCall` resolves data words with the non-`dyn` resolver `ptrAddress?` (frame locals,
   borrow base addresses, `LocalDecl` layouts); its agreement is the hypothesis `AddrRel`, proven
-  only for empty borrow tables (`addrRel_of_no_borrows`), not for arbitrary borrow states.
-- `checkDynVTablePtr_hom` covers the intrinsic path (`currentBody = .none`); the virtual-call path
-  (`currentBody = .some _`) is out of scope.
+  for empty borrow tables (`addrRel_of_no_borrows`) and arbitrary non-empty root-local borrow
+  tables (`addrRel_of_root_borrows`, realized by `wBorrowState_addrRel` with two distinct tags
+  aliasing the same local `_1`), leaving only non-empty sub-place projection chains out of scope.
 - `V2026_08_01` additionally defines `initProtectedReborrowPerm` (function-entry Tree Borrows
   retag), which is not consulted by any `dyn` operation.
 -/
@@ -906,6 +989,116 @@ def homDRK : Trusted.Rustc.V2026_08_01.MirSemantics.DynReceiverKind → Trusted.
   | .ref m => .ref (homMut m)
   | .raw m => .raw (homMut m)
   | .pinRef m => .pinRef (homMut m)
+
+/-! ## Injectivity of the structural embeddings (no dialect-08 terms are collapsed) -/
+
+theorem homUint_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.UintTy} (h : homUint a = homUint b) : a = b := by
+  cases a <;> cases b <;> cases h <;> rfl
+
+theorem homInt_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.IntTy} (h : homInt a = homInt b) : a = b := by
+  cases a <;> cases b <;> cases h <;> rfl
+
+theorem homFloat_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.FloatTy} (h : homFloat a = homFloat b) : a = b := by
+  cases a <;> cases b <;> cases h <;> rfl
+
+theorem homMut_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.Mutability} (h : homMut a = homMut b) : a = b := by
+  cases a <;> cases b <;> cases h <;> rfl
+
+theorem homSafety_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.Safety} (h : homSafety a = homSafety b) : a = b := by
+  cases a <;> cases b <;> cases h <;> rfl
+
+theorem homCallConv_injective {a b : Trusted.Rustc.V2026_08_01.Layout.CallConv} (h : homCallConv a = homCallConv b) : a = b := by
+  cases a <;> cases b <;> cases h <;> rfl
+
+mutual
+/-- `homTy` is injective: no distinct `V2026_08_01.MirAst.RigidTy` values collapse. -/
+theorem homTy_injective : ∀ {a b : Trusted.Rustc.V2026_08_01.MirAst.RigidTy}, homTy a = homTy b → a = b
+  | a, b, h => by
+    cases a <;> cases b <;> simp [homTy] at h
+    all_goals try rfl
+    · rcases h with ⟨h1, h2⟩; rw [h1, h2]
+    · rcases h with ⟨h1, h2⟩; rw [h1, homTys_injective h2]
+    · rw [homInt_injective h]
+    · rw [homUint_injective h]
+    · rw [homFloat_injective h]
+    · rw [homTys_injective h]
+    · rcases h with ⟨h1, h2⟩; rw [homTy_injective h1, h2]
+    · rw [homTy_injective h]
+    · rcases h with ⟨h1, h2⟩; rw [homMut_injective h1, homTy_injective h2]
+    · rcases h with ⟨h1, h2⟩; rw [homMut_injective h1, homTy_injective h2]
+    · rcases h with ⟨h1, h2⟩; rw [h1, homTys_injective h2]
+    · rcases h with ⟨h1, h2⟩; rw [h1, homTys_injective h2]
+    · rcases h with ⟨h1, h2, h3, h4⟩
+      rw [homTys_injective h1, homTy_injective h2, homSafety_injective h3, homCallConv_injective h4]
+    · rcases h with ⟨h1, h2⟩; rw [h1, homTys_injective h2]
+    · rw [h]
+    · rw [h]
+    · rw [h]
+
+theorem homTys_injective : ∀ {as bs : List Trusted.Rustc.V2026_08_01.MirAst.RigidTy}, homTys as = homTys bs → as = bs
+  | [], [], _ => rfl
+  | a :: as, b :: bs, h => by
+    simp [homTys] at h
+    rcases h with ⟨h1, h2⟩
+    rw [homTy_injective h1, homTys_injective h2]
+  | [], _ :: _, h => by simp [homTys] at h
+  | _ :: _, [], h => by simp [homTys] at h
+end
+
+/-- `homSlot` is injective. -/
+theorem homSlot_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.CapturedVTableSlot}
+    (h : homSlot a = homSlot b) : a = b := by
+  cases a <;> cases b <;> simp [homSlot] at h
+  all_goals try rfl
+  · rw [h]
+  · rcases h with ⟨h1, h2⟩; rw [h1, homTys_injective h2]
+  · rw [h]
+
+private theorem list_map_injective {α β : Type} {f : α → β} (hf : ∀ {x y}, f x = f y → x = y) :
+    ∀ {xs ys : List α}, xs.map f = ys.map f → xs = ys
+  | [], [], _ => rfl
+  | x :: xs, y :: ys, h => by
+    simp at h
+    rcases h with ⟨h1, h2⟩
+    rw [hf h1, list_map_injective hf h2]
+  | [], _ :: _, h => by simp at h
+  | _ :: _, [], h => by simp at h
+
+/-- `homVTable` is injective. -/
+theorem homVTable_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable}
+    (h : homVTable a = homVTable b) : a = b := by
+  cases a; cases b
+  simp [homVTable] at h
+  rcases h with ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10⟩
+  rw [h1, h2, homTy_injective h3, h4, h5, h6, h7, h8, h9, list_map_injective homSlot_injective h10]
+
+theorem homScalar_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.ScalarInt}
+    (h : homScalar a = homScalar b) : a = b := by
+  cases a; cases b; cases h; rfl
+
+theorem homPtr_injective {a b : Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr}
+    (h : homPtr a = homPtr b) : a = b := by
+  cases a; cases b; cases h; rfl
+
+mutual
+/-- `homValue` is injective. -/
+theorem homValue_injective : ∀ {a b : Trusted.Rustc.V2026_08_01.MirSemantics.Value}, homValue a = homValue b → a = b
+  | a, b, h => by
+    cases a <;> cases b <;> simp [homValue] at h
+    all_goals try rfl
+    · rw [homScalar_injective h]
+    · rcases h with ⟨h1, h2⟩; rw [homPtr_injective h1, h2]
+    · rcases h with ⟨h1, h2⟩; rw [h1, homValues_injective h2]
+
+theorem homValues_injective : ∀ {as bs : List Trusted.Rustc.V2026_08_01.MirSemantics.Value}, homValues as = homValues bs → as = bs
+  | [], [], _ => rfl
+  | a :: as, b :: bs, h => by
+    simp [homValues] at h
+    rcases h with ⟨h1, h2⟩
+    rw [homValue_injective h1, homValues_injective h2]
+  | [], _ :: _, h => by simp [homValues] at h
+  | _ :: _, [], h => by simp [homValues] at h
+end
 
 /-! ## Basic commuting lemmas -/
 
@@ -1263,15 +1456,52 @@ structure BodiesRel (bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) (b
   vtables : bs6.map (·.vtables) = bs8.map (fun b => b.vtables.map homVTable)
   dynTypes : bs6.map (·.dynTypes) = bs8.map (fun b => b.dynTypes.map homDynType)
 
-/-- `collectBodyVTables .none` as a fold over the projected vtable tables (dialect 06). -/
-theorem collectBodyVTables_eq6 (bs : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
-    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyVTables .none bs = List.foldl Trusted.Rustc.V2026_06_01.MirSemantics.dedupVTablesInto [] (bs.map (·.vtables)) := by
-  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyVTables, Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies, List.foldl_map]
+/-- Dyn-relevant relation between two optional current bodies (`.none` for the intrinsic path
+or `.some b6 / .some b8` for the virtual-call and safe `size_of_val` paths). -/
+inductive OptBodyRel :
+    Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir →
+    Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir → Prop where
+  | none : OptBodyRel .none .none
+  | some (b6 : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+         (b8 : Trusted.Rustc.V2026_08_01.MirAst.CapturedMir)
+         (hvt : b6.vtables = b8.vtables.map homVTable)
+         (hdt : b6.dynTypes = b8.dynTypes.map homDynType) :
+         OptBodyRel (.some b6) (.some b8)
 
-/-- `collectBodyVTables .none` as a fold over the projected vtable tables (dialect 08). -/
-theorem collectBodyVTables_eq8 (bs : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir) :
-    Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables .none bs = List.foldl Trusted.Rustc.V2026_08_01.MirSemantics.dedupVTablesInto [] (bs.map (·.vtables)) := by
-  simp only [Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables, Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies, List.foldl_map]
+theorem dynSourceBodies_rel
+    {cb6 : Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {cb8 : Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (hcb : OptBodyRel cb6 cb8)
+    {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (hbs : BodiesRel bs6 bs8) :
+    BodiesRel
+      (Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies cb6 bs6)
+      (Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies cb8 bs8) := by
+  cases hcb with
+  | none => exact hbs
+  | some b6 b8 hvt hdt =>
+    refine ⟨?_, ?_⟩
+    · simp only [Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies,
+        Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies, List.map_cons, hvt, hbs.vtables]
+    · simp only [Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies,
+        Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies, List.map_cons, hdt, hbs.dynTypes]
+
+/-- `collectBodyVTables` as a fold over the projected vtable tables (dialect 06). -/
+theorem collectBodyVTables_eq6 (cb : Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+    (bs : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyVTables cb bs =
+      List.foldl Trusted.Rustc.V2026_06_01.MirSemantics.dedupVTablesInto []
+        ((Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies cb bs).map (·.vtables)) := by
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyVTables, List.foldl_map]
+
+/-- `collectBodyVTables` as a fold over the projected vtable tables (dialect 08). -/
+theorem collectBodyVTables_eq8 (cb : Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir)
+    (bs : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables cb bs =
+      List.foldl Trusted.Rustc.V2026_08_01.MirSemantics.dedupVTablesInto []
+        ((Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies cb bs).map (·.vtables)) := by
+  simp only [Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables, List.foldl_map]
 
 theorem foldl_dedup_hom (L : List (List Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable)) (acc : List Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable) :
     List.foldl Trusted.Rustc.V2026_06_01.MirSemantics.dedupVTablesInto (acc.map homVTable) (L.map (fun vs => vs.map homVTable)) =
@@ -1280,12 +1510,25 @@ theorem foldl_dedup_hom (L : List (List Trusted.Rustc.V2026_08_01.MirAst.Capture
   | nil => rfl
   | cons vs L ih => simp only [List.map_cons, List.foldl_cons, dedupVTablesInto_hom, ih]
 
+theorem collectBodyVTables_opt_hom
+    {cb6 : Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {cb8 : Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (hcb : OptBodyRel cb6 cb8)
+    {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (h : BodiesRel bs6 bs8) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyVTables cb6 bs6 =
+      (Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables cb8 bs8).map homVTable := by
+  have hSrc := dynSourceBodies_rel hcb h
+  rw [collectBodyVTables_eq6, collectBodyVTables_eq8, hSrc.vtables]
+  have := foldl_dedup_hom
+    ((Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies cb8 bs8).map (·.vtables)) []
+  simpa only [List.map_map, Function.comp_def, List.map_nil] using this
+
 theorem collectBodyVTables_hom {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
     (h : BodiesRel bs6 bs8) :
-    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyVTables .none bs6 = (Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables .none bs8).map homVTable := by
-  rw [collectBodyVTables_eq6, collectBodyVTables_eq8, h.vtables]
-  have := foldl_dedup_hom (bs8.map (·.vtables)) []
-  simpa only [List.map_map, Function.comp_def, List.map_nil] using this
+    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyVTables .none bs6 = (Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables .none bs8).map homVTable :=
+  collectBodyVTables_opt_hom .none h
 
 /-- `List.all` congruence for pointwise-equal predicates. -/
 theorem all_congr' {α : Type} (l : List α) (f g : α → Bool) (h : ∀ x, f x = g x) :
@@ -1308,14 +1551,20 @@ def dtInsert8 (acc ds : List Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType) :
     | .some _ => acc'
     | .none => acc' ++ d :: .nil) acc
 
-theorem collectBodyDynTypes_eq6 (bs : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
-    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyDynTypes .none bs = List.foldl dtInsert6 [] (bs.map (·.dynTypes)) := by
-  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyDynTypes, Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies, List.foldl_map]
+theorem collectBodyDynTypes_eq6 (cb : Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+    (bs : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyDynTypes cb bs =
+      List.foldl dtInsert6 []
+        ((Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies cb bs).map (·.dynTypes)) := by
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyDynTypes, List.foldl_map]
   rfl
 
-theorem collectBodyDynTypes_eq8 (bs : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir) :
-    Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyDynTypes .none bs = List.foldl dtInsert8 [] (bs.map (·.dynTypes)) := by
-  simp only [Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyDynTypes, Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies, List.foldl_map]
+theorem collectBodyDynTypes_eq8 (cb : Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir)
+    (bs : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyDynTypes cb bs =
+      List.foldl dtInsert8 []
+        ((Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies cb bs).map (·.dynTypes)) := by
+  simp only [Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyDynTypes, List.foldl_map]
   rfl
 
 theorem dtInsert_hom (acc ds : List Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType) :
@@ -1332,10 +1581,17 @@ theorem dtInsert_hom (acc ds : List Trusted.Rustc.V2026_08_01.MirAst.CapturedDyn
       simpa only [Option.map_none] using this
     | some _ => simpa only [Option.map_some] using ih acc
 
-theorem collectBodyDynTypes_hom {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+theorem collectBodyDynTypes_opt_hom
+    {cb6 : Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {cb8 : Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (hcb : OptBodyRel cb6 cb8)
+    {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
     (h : BodiesRel bs6 bs8) :
-    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyDynTypes .none bs6 = (Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyDynTypes .none bs8).map homDynType := by
-  rw [collectBodyDynTypes_eq6, collectBodyDynTypes_eq8, h.dynTypes]
+    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyDynTypes cb6 bs6 =
+      (Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyDynTypes cb8 bs8).map homDynType := by
+  have hSrc := dynSourceBodies_rel hcb h
+  rw [collectBodyDynTypes_eq6, collectBodyDynTypes_eq8, hSrc.dynTypes]
   have key : ∀ (L : List (List Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType)) (acc : List Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType),
       List.foldl dtInsert6 (acc.map homDynType) (L.map (fun ds => ds.map homDynType)) =
         (List.foldl dtInsert8 acc L).map homDynType := by
@@ -1343,24 +1599,45 @@ theorem collectBodyDynTypes_hom {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.Cap
     induction L with
     | nil => intro acc; rfl
     | cons ds L ih => intro acc; simp only [List.map_cons, List.foldl_cons, dtInsert_hom, ih]
-  have := key (bs8.map (·.dynTypes)) []
+  have := key ((Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies cb8 bs8).map (·.dynTypes)) []
   simpa only [List.map_map, Function.comp_def, List.map_nil] using this
 
-theorem bodyVTablesConsistent_hom {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+theorem collectBodyDynTypes_hom {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (h : BodiesRel bs6 bs8) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.collectBodyDynTypes .none bs6 = (Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyDynTypes .none bs8).map homDynType :=
+  collectBodyDynTypes_opt_hom .none h
+
+theorem bodyVTablesConsistent_opt_hom
+    {cb6 : Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {cb8 : Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (hcb : OptBodyRel cb6 cb8)
+    {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
     (h : BodiesRel bs6 bs8) (vts : List Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable) :
-    Trusted.Rustc.V2026_06_01.MirSemantics.bodyVTablesConsistent .none bs6 (vts.map homVTable) = Trusted.Rustc.V2026_08_01.MirSemantics.bodyVTablesConsistent .none bs8 vts := by
-  have e6 : bs6.all (fun b => Trusted.Rustc.V2026_06_01.MirSemantics.vtablesAgreeWith (vts.map homVTable) b.vtables) =
-      (bs6.map (·.vtables)).all (Trusted.Rustc.V2026_06_01.MirSemantics.vtablesAgreeWith (vts.map homVTable)) := by
+    Trusted.Rustc.V2026_06_01.MirSemantics.bodyVTablesConsistent cb6 bs6 (vts.map homVTable) =
+      Trusted.Rustc.V2026_08_01.MirSemantics.bodyVTablesConsistent cb8 bs8 vts := by
+  have hSrc := dynSourceBodies_rel hcb h
+  have e6 : (Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies cb6 bs6).all
+      (fun b => Trusted.Rustc.V2026_06_01.MirSemantics.vtablesAgreeWith (vts.map homVTable) b.vtables) =
+      ((Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies cb6 bs6).map (·.vtables)).all
+        (Trusted.Rustc.V2026_06_01.MirSemantics.vtablesAgreeWith (vts.map homVTable)) := by
     simp only [List.all_map, Function.comp_def]
-  have e8 : bs8.all (fun b => Trusted.Rustc.V2026_08_01.MirSemantics.vtablesAgreeWith vts b.vtables) =
-      (bs8.map (·.vtables)).all (Trusted.Rustc.V2026_08_01.MirSemantics.vtablesAgreeWith vts) := by
+  have e8 : (Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies cb8 bs8).all
+      (fun b => Trusted.Rustc.V2026_08_01.MirSemantics.vtablesAgreeWith vts b.vtables) =
+      ((Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies cb8 bs8).map (·.vtables)).all
+        (Trusted.Rustc.V2026_08_01.MirSemantics.vtablesAgreeWith vts) := by
     simp only [List.all_map, Function.comp_def]
-  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.bodyVTablesConsistent, Trusted.Rustc.V2026_08_01.MirSemantics.bodyVTablesConsistent, Trusted.Rustc.V2026_06_01.MirSemantics.dynSourceBodies,
-    Trusted.Rustc.V2026_08_01.MirSemantics.dynSourceBodies]
-  rw [e6, e8, h.vtables, List.all_map, List.all_map]
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.bodyVTablesConsistent,
+    Trusted.Rustc.V2026_08_01.MirSemantics.bodyVTablesConsistent]
+  rw [e6, e8, hSrc.vtables, List.all_map, List.all_map]
   apply all_congr'
   intro b
   simp only [Function.comp_apply, vtablesAgreeWith_hom]
+
+theorem bodyVTablesConsistent_hom {bs6 : List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {bs8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (h : BodiesRel bs6 bs8) (vts : List Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.bodyVTablesConsistent .none bs6 (vts.map homVTable) = Trusted.Rustc.V2026_08_01.MirSemantics.bodyVTablesConsistent .none bs8 vts :=
+  bodyVTablesConsistent_opt_hom .none h vts
 
 theorem vtableAllocIdsUnique_hom (vs : List Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable) :
     Trusted.Rustc.V2026_06_01.MirSemantics.vtableAllocIdsUnique (vs.map homVTable) = Trusted.Rustc.V2026_08_01.MirSemantics.vtableAllocIdsUnique vs := by
@@ -1431,25 +1708,38 @@ structure DynViewRel (mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView) (
   fnPtrs : ∀ a, (Trusted.Rustc.V2026_06_01.MirSemantics.lookupFnPtr mv6.fnPtrs a).isSome = (Trusted.Rustc.V2026_08_01.MirSemantics.lookupFnPtr mv8.fnPtrs a).isSome
   borrows : ∀ t, (Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow mv6.borrows t).isSome = (Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow mv8.borrows t).isSome
 
-theorem dynVTableEnv?_hom {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView} {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView} (h : DynViewRel mv6 mv8)
-    (ptrBytes : Nat) :
-    Trusted.Rustc.V2026_06_01.MirSemantics.dynVTableEnv? .none mv6 ptrBytes =
-      (Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv? .none mv8 ptrBytes).map
+theorem dynVTableEnv?_opt_hom
+    {cb6 : Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {cb8 : Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (hcb : OptBodyRel cb6 cb8)
+    {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView}
+    {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView}
+    (h : DynViewRel mv6 mv8) (ptrBytes : Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.dynVTableEnv? cb6 mv6 ptrBytes =
+      (Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv? cb8 mv8 ptrBytes).map
         (fun e => (e.1.map homVTable, e.2.map homDynType)) := by
-  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.dynVTableEnv?, Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv?, collectBodyVTables_hom h.bodies]
-  cases hv : Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables .none mv8.dynBodies with
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.dynVTableEnv?,
+    Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv?, collectBodyVTables_opt_hom hcb h.bodies]
+  cases hv : Trusted.Rustc.V2026_08_01.MirSemantics.collectBodyVTables cb8 mv8.dynBodies with
   | nil => rfl
   | cons v vs =>
-    have hc := bodyVTablesConsistent_hom h.bodies (v :: vs)
+    have hc := bodyVTablesConsistent_opt_hom hcb h.bodies (v :: vs)
     have he := vtableEnvOk_hom ptrBytes (v :: vs) mv8.nextAllocId mv6.globals mv8.globals
       mv6.fnPtrs mv8.fnPtrs h.globals h.fnPtrs
     simp only [List.map_cons] at hc he
     simp only [List.map_cons, h.nextAllocId]
     rw [hc, he]
-    cases Bool.and (Trusted.Rustc.V2026_08_01.MirSemantics.bodyVTablesConsistent .none mv8.dynBodies (v :: vs))
+    cases Bool.and (Trusted.Rustc.V2026_08_01.MirSemantics.bodyVTablesConsistent cb8 mv8.dynBodies (v :: vs))
         (Trusted.Rustc.V2026_08_01.MirSemantics.vtableEnvOk ptrBytes (v :: vs) mv8.nextAllocId mv8.globals mv8.fnPtrs) with
     | false => rfl
-    | true => simp only [Option.map_some, List.map_cons, collectBodyDynTypes_hom h.bodies]
+    | true => simp only [Option.map_some, List.map_cons, collectBodyDynTypes_opt_hom hcb h.bodies]
+
+theorem dynVTableEnv?_hom {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView} {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView} (h : DynViewRel mv6 mv8)
+    (ptrBytes : Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.dynVTableEnv? .none mv6 ptrBytes =
+      (Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv? .none mv8 ptrBytes).map
+        (fun e => (e.1.map homVTable, e.2.map homDynType)) :=
+  dynVTableEnv?_opt_hom .none h ptrBytes
 
 theorem homPtr_allocId (p : Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr) : (homPtr p).allocId = p.allocId := rfl
 theorem homPtr_offsetBytes (p : Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr) : (homPtr p).offsetBytes = p.offsetBytes := rfl
@@ -1464,18 +1754,26 @@ def homDynCheck :
   | .ub => .ub
   | .unsupported => .unsupported
 
-/-- `checkDynVTablePtr` (no current body, i.e. the intrinsic path) commutes with the embedding
-under `DynViewRel`, for every metadata value and expected key. -/
-theorem checkDynVTablePtr_hom {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView} {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView} (h : DynViewRel mv6 mv8)
+/-- `checkDynVTablePtr` commutes with the embedding for ANY optional current body
+(`OptBodyRel cb6 cb8`: both `.none` for intrinsics and `.some _` for virtual calls / safe
+`size_of_val`), under `DynViewRel`, for every pointer width, metadata value, and expected key. -/
+theorem checkDynVTablePtr_opt_hom
+    {cb6 : Option Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {cb8 : Option Trusted.Rustc.V2026_08_01.MirAst.CapturedMir}
+    (hcb : OptBodyRel cb6 cb8)
+    {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView}
+    {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView}
+    (h : DynViewRel mv6 mv8)
     (ptrBytes : Nat) (v : Trusted.Rustc.V2026_08_01.MirSemantics.Value) (k : String) :
-    Trusted.Rustc.V2026_06_01.MirSemantics.checkDynVTablePtr .none mv6 ptrBytes (homValue v) k =
-      homDynCheck (Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr .none mv8 ptrBytes v k) := by
+    Trusted.Rustc.V2026_06_01.MirSemantics.checkDynVTablePtr cb6 mv6 ptrBytes (homValue v) k =
+      homDynCheck (Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr cb8 mv8 ptrBytes v k) := by
   cases v with
   | ptr p n =>
-    simp only [homValue, Trusted.Rustc.V2026_06_01.MirSemantics.checkDynVTablePtr, Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr, dynVTableEnv?_hom h]
+    simp only [homValue, Trusted.Rustc.V2026_06_01.MirSemantics.checkDynVTablePtr,
+      Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr, dynVTableEnv?_opt_hom hcb h]
     cases Nat.beq n ptrBytes
     · rfl
-    · cases Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv? .none mv8 ptrBytes with
+    · cases Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv? cb8 mv8 ptrBytes with
       | none => rfl
       | some e =>
         obtain ⟨vts, dts⟩ := e
@@ -1514,6 +1812,101 @@ theorem checkDynVTablePtr_hom {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynM
               | rfl
               | (split <;> rename_i hc <;> simp only [hc, homDynCheck])
   | _ => rfl
+
+/-- `checkDynVTablePtr` (intrinsic path `currentBody = .none`) as a specialization of
+`checkDynVTablePtr_opt_hom`. -/
+theorem checkDynVTablePtr_hom {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView} {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView} (h : DynViewRel mv6 mv8)
+    (ptrBytes : Nat) (v : Trusted.Rustc.V2026_08_01.MirSemantics.Value) (k : String) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.checkDynVTablePtr .none mv6 ptrBytes (homValue v) k =
+      homDynCheck (Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr .none mv8 ptrBytes v k) :=
+  checkDynVTablePtr_opt_hom .none h ptrBytes v k
+
+/-- `DynCheck Value` embedding for unsizing results. -/
+def homDynCheckVal :
+    Trusted.Rustc.V2026_08_01.MirSemantics.DynCheck Trusted.Rustc.V2026_08_01.MirSemantics.Value →
+      Trusted.Rustc.V2026_06_01.MirSemantics.DynCheck Trusted.Rustc.V2026_06_01.MirSemantics.Value
+  | .ok v => .ok (homValue v)
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- **C7** Raw `T -> dyn K` unsizing (`evalThinToDynUnsize ... isRef := false`) commutes with the
+embedding across ALL pointer widths (32-bit, 64-bit, etc.) under `DynViewRel`. -/
+theorem evalThinToDynUnsize_raw_hom
+    (l6 : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (l8 : List Trusted.Rustc.V2026_08_01.MirSemantics.LocalSlot)
+    {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView}
+    {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView}
+    (h : DynViewRel mv6 mv8)
+    (ld6 : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
+    (ld8 : List Trusted.Rustc.V2026_08_01.MirAst.LocalDecl)
+    (La : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (Lb : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (hL : Trusted.Rustc.V2026_06_01.MirSemantics.layoutPointerBytes La =
+      Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb)
+    (dataVal : Trusted.Rustc.V2026_08_01.MirSemantics.Value)
+    (srcPointee : Trusted.Rustc.V2026_08_01.MirAst.RigidTy)
+    (dynKey : String) (isMut : Bool) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize
+        l6 mv6 ld6 La (homValue dataVal) (homTy srcPointee) dynKey false isMut =
+      homDynCheckVal (Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize
+        l8 mv8 ld8 Lb dataVal srcPointee dynKey false isMut) := by
+  have hTail : ∀ (v : Trusted.Rustc.V2026_08_01.MirSemantics.Value) (ok : Bool),
+      (match ok with
+        | false => Trusted.Rustc.V2026_06_01.MirSemantics.DynCheck.ub
+        | true =>
+          match Trusted.Rustc.V2026_06_01.MirSemantics.dynVTableEnv? .none mv6
+              (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb) with
+          | .none => .unsupported
+          | .some (vts, dts) =>
+            match Trusted.Rustc.V2026_06_01.MirSemantics.dynTypeModeled dts dynKey with
+            | false => .unsupported
+            | true =>
+              match Trusted.Rustc.V2026_06_01.MirSemantics.lookupVTableFor vts (homTy srcPointee) dynKey with
+              | .none => .unsupported
+              | .some entry =>
+                .ok (.aggregate 0 (homValue v ::
+                  .ptr { allocId := entry.vtableAllocId, offsetBytes := 0 }
+                    (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb) :: .nil))) =
+      homDynCheckVal (match ok with
+        | false => Trusted.Rustc.V2026_08_01.MirSemantics.DynCheck.ub
+        | true =>
+          match Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv? .none mv8
+              (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb) with
+          | .none => .unsupported
+          | .some (vts, dts) =>
+            match Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dynKey with
+            | false => .unsupported
+            | true =>
+              match Trusted.Rustc.V2026_08_01.MirSemantics.lookupVTableFor vts srcPointee dynKey with
+              | .none => .unsupported
+              | .some entry =>
+                .ok (.aggregate 0 (v ::
+                  .ptr { allocId := entry.vtableAllocId, offsetBytes := 0 }
+                    (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb) :: .nil))) := by
+    intro v ok
+    cases ok
+    · rfl
+    · simp only [dynVTableEnv?_hom h]
+      cases Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv? .none mv8
+          (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb) with
+      | none => rfl
+      | some e =>
+        obtain ⟨vts, dts⟩ := e
+        simp only [Option.map_some, dynTypeModeled_hom]
+        cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dynKey
+        · rfl
+        · simp only [lookupVTableFor_hom]
+          cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupVTableFor vts srcPointee dynKey with
+          | none => rfl
+          | some entry => rfl
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize
+  simp only [hL]
+  cases dataVal with
+  | unit => rfl
+  | aggregate _ _ => rfl
+  | ptr p sz => exact hTail (.ptr p sz) (Nat.beq sz (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb))
+  | scalar sc => exact hTail (.scalar sc) (Nat.beq sc.sizeBytes (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb))
 
 /-! ## C7 relational commuting theorems: `evalDynSizeAlignOfVal`, `evalAddrEqCall` -/
 
@@ -1722,15 +2115,102 @@ theorem evalAddrEqCall_hom (s6 : Trusted.Rustc.V2026_06_01.MirSemantics.MachineS
                   by simp only [hb]; rfl⟩
   · exact ⟨.ub, rfl, rfl⟩
 
+/-- **C7** Scalar/dangling-ZST & `kani#5216` uninhabited reference validity
+(`dynRefDataValid` on any scalar address) commutes identically across dialects at EVERY
+pointer width `ptrBytes` (32-bit, 64-bit, etc.). -/
+theorem dynRefDataValid_scalar_hom
+    (l6 : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView)
+    (ld6 : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
+    (La : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (l8 : List Trusted.Rustc.V2026_08_01.MirSemantics.LocalSlot)
+    (mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView)
+    (ld8 : List Trusted.Rustc.V2026_08_01.MirAst.LocalDecl)
+    (Lb : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (ptrBytes : Nat) (sc : Trusted.Rustc.V2026_08_01.MirAst.ScalarInt)
+    (entry : Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable)
+    (isMut checkTB : Bool) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.dynRefDataValid l6 mv6 ld6 La ptrBytes
+        (.scalar (homScalar sc)) (homVTable entry) isMut checkTB =
+      Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid l8 mv8 ld8 Lb ptrBytes
+        (.scalar sc) entry isMut checkTB := by
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.dynRefDataValid
+    Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid
+  simp only [homVTable_isUninhabited, homVTable_alignBytes, homVTable_sizeBytes, homScalar,
+    scalarModulus_hom, wrapScalarBits_hom]
+  rfl
+
+theorem stackLocalAddrPageBase_hom (pb : Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.stackLocalAddrPageBase pb =
+      Trusted.Rustc.V2026_08_01.MirSemantics.stackLocalAddrPageBase pb := by
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.stackLocalAddrPageBase
+    Trusted.Rustc.V2026_08_01.MirSemantics.stackLocalAddrPageBase
+  cases Nat.ble 8 pb <;> rfl
+
+/-- Correspondence of two non-empty root-local borrow tables (every tracked tag points to the
+same `targetLocal` with empty `targetProjection`, matching `&x` / `&mut x` stack borrows). -/
+def RootBorrowsRel
+    (bs6 : List Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry)
+    (bs8 : List Trusted.Rustc.V2026_08_01.MirSemantics.BorrowEntry) : Prop :=
+  (∀ tag,
+    (Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow bs6 tag).map (·.targetLocal) =
+      (Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow bs8 tag).map (·.targetLocal)) ∧
+  (∀ tag b6, Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow bs6 tag = .some b6 →
+    b6.targetProjection = []) ∧
+  (∀ tag b8, Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow bs8 tag = .some b8 →
+    b8.targetProjection = [])
+
+/-- Realizability of `AddrRel` for arbitrary non-empty root-local borrow tables (covering
+distinct borrow tags aliasing the same stack local). -/
+theorem addrRel_of_root_borrows
+    (l6 : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (m6 : Trusted.Rustc.V2026_06_01.MirSemantics.Memory)
+    (ld6 : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
+    (La : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (l8 : List Trusted.Rustc.V2026_08_01.MirSemantics.LocalSlot)
+    (m8 : Trusted.Rustc.V2026_08_01.MirSemantics.Memory)
+    (ld8 : List Trusted.Rustc.V2026_08_01.MirAst.LocalDecl)
+    (Lb : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (pb : Nat) (hrb : RootBorrowsRel m6.borrows m8.borrows) :
+    AddrRel l6 m6 ld6 La l8 m8 ld8 Lb pb := by
+  obtain ⟨hLoc, hProj6, hProj8⟩ := hrb
+  intro p
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.ptrAddress?
+    Trusted.Rustc.V2026_08_01.MirSemantics.ptrAddress?
+  have ht := hLoc (Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr.tag p)
+  simp only [homPtr_tag, homPtr_allocId, homPtr_offsetBytes]
+  cases hb6 : Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow m6.borrows
+      (Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr.tag p) with
+  | none =>
+    cases hb8 : Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow m8.borrows
+        (Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr.tag p) with
+    | none => rfl
+    | some b8 => simp [hb6, hb8] at ht
+  | some b6 =>
+    cases hb8 : Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow m8.borrows
+        (Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr.tag p) with
+    | none => simp [hb6, hb8] at ht
+    | some b8 =>
+      simp only [hb6, hb8, Option.map_some, Option.some.injEq] at ht
+      have hp6 := hProj6 _ _ hb6
+      have hp8 := hProj8 _ _ hb8
+      unfold Trusted.Rustc.V2026_06_01.MirSemantics.borrowBaseAddress?
+        Trusted.Rustc.V2026_08_01.MirSemantics.borrowBaseAddress?
+        Trusted.Rustc.V2026_06_01.MirSemantics.borrowPlaceByteOffset?
+        Trusted.Rustc.V2026_08_01.MirSemantics.borrowPlaceByteOffset?
+      simp only [hp6, hp8, ht, stackLocalAddrPageBase_hom]
+      rfl
+
 /-- Realizability of `AddrRel`: with empty borrow tables both resolvers compute the synthetic
 address `allocId * 65536 + offsetBytes` of every pointer. -/
 theorem addrRel_of_no_borrows (l6 : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot) (m6 : Trusted.Rustc.V2026_06_01.MirSemantics.Memory) (ld6 : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
     (La : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (l8 : List Trusted.Rustc.V2026_08_01.MirSemantics.LocalSlot) (m8 : Trusted.Rustc.V2026_08_01.MirSemantics.Memory) (ld8 : List Trusted.Rustc.V2026_08_01.MirAst.LocalDecl)
     (Lb : Trusted.Rustc.V2026_08_01.Layout.LayoutTable) (pb : Nat) (h6 : m6.borrows = []) (h8 : m8.borrows = []) :
-    AddrRel l6 m6 ld6 La l8 m8 ld8 Lb pb := by
-  intro p
-  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.ptrAddress?, Trusted.Rustc.V2026_08_01.MirSemantics.ptrAddress?, h6, h8]
-  rfl
+    AddrRel l6 m6 ld6 La l8 m8 ld8 Lb pb :=
+  addrRel_of_root_borrows l6 m6 ld6 La l8 m8 ld8 Lb pb
+    ⟨fun _ => by simp [h6, h8, Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow, Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow],
+     fun _ _ h => by simp [h6, Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow] at h,
+     fun _ _ h => by simp [h8, Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow] at h⟩
 
 /-! ## Realizability witnesses (every relation / hypothesis is inhabited) and non-vacuity of
 every outcome class -/
@@ -1913,6 +2393,143 @@ theorem evalAddrEqCall_witness_ub :
         [.ptr { allocId := 1, offsetBytes := 0 } 4, wDynRef 16384 0] [.uninit] wPlace8 (.some 1) =
         DynStepClass.run8 .ub wState8 [.uninit] wPlace8 1 :=
   ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Realizability of `OptBodyRel` on `.some` bodies (`wBody6` and `wBody8`). -/
+theorem wBody_optBodyRel : OptBodyRel (.some wBody6) (.some wBody8) :=
+  .some wBody6 wBody8 rfl rfl
+
+/-- Non-vacuity of `checkDynVTablePtr_opt_hom` on `currentBody = .some _` (virtual-call / safe
+`size_of_val` path): `wBare6`/`wBare8` have empty `callees`, so ONLY `currentBody` supplies the
+vtable, and both dialects return `.ok` with the same entry. -/
+theorem checkDynVTablePtr_opt_witness :
+    Trusted.Rustc.V2026_06_01.MirSemantics.checkDynVTablePtr (.some wBody6)
+        (Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView.ofMemory wBare6.memory) 8
+        (homValue (.ptr { allocId := 16384, offsetBytes := 0 } 8)) "Tr" =
+      .ok (homVTable wVTable8, [homVTable wVTable8], []) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr (.some wBody8)
+        (Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView.ofMemory wBare8.memory) 8
+        (.ptr { allocId := 16384, offsetBytes := 0 } 8) "Tr" =
+      .ok (wVTable8, [wVTable8], []) :=
+  ⟨rfl, rfl⟩
+
+/-- Witness 32-bit layout tables (`pointerBits := 32`) in both dialects. -/
+def wLayouts32_6 : Trusted.Rustc.V2026_06_01.Layout.LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true, entries := [wTyLayout6] }
+
+def wLayouts32_8 : Trusted.Rustc.V2026_08_01.Layout.LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true, entries := [wTyLayout8] }
+
+/-- Witness uninhabited ZST vtable (`! : dyn Tr`, `kani#5216`). -/
+def wVTableUninhab8 : Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable :=
+  { vtableId := 1, vtableAllocId := 16385, concreteTy := .never, dynKey := "Tr",
+    sizeBytes := 0, alignBytes := 1, isUninhabited := true,
+    slots := [.dropInPlace .none, .size, .align] }
+
+/-- Witness inhabited ZST vtable (`() : dyn Tr`, size 0, align 1). -/
+def wVTableZst8 : Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable :=
+  { vtableId := 2, vtableAllocId := 16386, concreteTy := .tuple [], dynKey := "Tr",
+    sizeBytes := 0, alignBytes := 1, isUninhabited := false,
+    slots := [.dropInPlace .none, .size, .align] }
+
+/-- Non-vacuity of `evalThinToDynUnsize_raw_hom` at both 32-bit and 64-bit pointer widths. -/
+theorem evalThinToDynUnsize_raw_witness_32bit_64bit :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize []
+        (Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView.ofMemory wState6.memory) [] wLayouts32_6
+        (homValue (.scalar ⟨0, 4⟩)) (homTy (.uint .u32)) "Tr" false false =
+      homDynCheckVal (Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize []
+        (Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView.ofMemory wState8.memory) [] wLayouts32_8
+        (.scalar ⟨0, 4⟩) (.uint .u32) "Tr" false false) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize []
+        (Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView.ofMemory wState8.memory) [] wLayouts32_8
+        (.scalar ⟨0, 4⟩) (.uint .u32) "Tr" false false =
+      .ok (.aggregate 0 [.scalar ⟨0, 4⟩, .ptr { allocId := 16384, offsetBytes := 0 } 4]) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize []
+        (Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView.ofMemory wState6.memory) [] wLayouts6
+        (homValue (.scalar ⟨0, 8⟩)) (homTy (.uint .u32)) "Tr" false false =
+      .ok (.aggregate 0 [.scalar ⟨0, 8⟩, .ptr { allocId := 16384, offsetBytes := 0 } 8]) :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- Non-vacuity of `dynRefDataValid_scalar_hom`: 32-bit wrapped `2^32` null fails (`false`),
+aligned non-null `4` succeeds (`true`) on ZST, and uninhabited `!` (`kani#5216`) fails (`false`)
+in BOTH dialects. -/
+theorem dynRefDataValid_scalar_witness_32bit_uninhabited :
+    Trusted.Rustc.V2026_06_01.MirSemantics.dynRefDataValid []
+        (Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView.ofMemory wState6.memory) [] wLayouts32_6 4
+        (.scalar (homScalar ⟨4294967296, 4⟩)) (homVTable wVTableZst8) false true = false ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid []
+        (Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView.ofMemory wState8.memory) [] wLayouts32_8 4
+        (.scalar ⟨4294967296, 4⟩) wVTableZst8 false true = false ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.dynRefDataValid []
+        (Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView.ofMemory wState6.memory) [] wLayouts32_6 4
+        (.scalar (homScalar ⟨4, 4⟩)) (homVTable wVTableZst8) false true = true ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid []
+        (Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView.ofMemory wState8.memory) [] wLayouts32_8 4
+        (.scalar ⟨4, 4⟩) wVTableZst8 false true = true ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.dynRefDataValid []
+        (Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView.ofMemory wState6.memory) [] wLayouts32_6 4
+        (.scalar (homScalar ⟨4, 4⟩)) (homVTable wVTableUninhab8) false true = false ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid []
+        (Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView.ofMemory wState8.memory) [] wLayouts32_8 4
+        (.scalar ⟨4, 4⟩) wVTableUninhab8 false true = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Non-empty root-local borrow states in both dialects: TWO distinct borrow tags (`1` and `2`)
+both aliasing stack local `_1` (empty `targetProjection`). -/
+def wBorrowState6 : Trusted.Rustc.V2026_06_01.MirSemantics.MachineState :=
+  { wState6 with
+    memory := { wState6.memory with
+      borrows :=
+        [ { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
+          { tag := 2, targetLocal := 1, targetProjection := [], perm := .frozen } ] } }
+
+def wBorrowState8 : Trusted.Rustc.V2026_08_01.MirSemantics.MachineState :=
+  { wState8 with
+    memory := { wState8.memory with
+      borrows :=
+        [ { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
+          { tag := 2, targetLocal := 1, targetProjection := [], perm := .frozen } ] } }
+
+/-- Realizability of `addrRel_of_root_borrows` on non-empty multi-tag borrow states. -/
+theorem wBorrowState_addrRel :
+    AddrRel [] wBorrowState6.memory [] wLayouts6 [] wBorrowState8.memory [] wLayouts8 8 := by
+  apply addrRel_of_root_borrows
+  refine ⟨?_, ?_, ?_⟩
+  · intro tag
+    simp only [wBorrowState6, wBorrowState8, Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow,
+      Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow]
+    cases Nat.beq 1 tag <;> cases Nat.beq 2 tag <;> rfl
+  · intro tag b6 h
+    simp only [wBorrowState6, Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow] at h
+    cases h1 : Nat.beq 1 tag
+    · simp only [h1] at h
+      cases h2 : Nat.beq 2 tag
+      · simp [h2] at h
+      · simp only [h2, Option.some.injEq] at h; rw [← h]
+    · simp only [h1, Option.some.injEq] at h; rw [← h]
+  · intro tag b8 h
+    simp only [wBorrowState8, Trusted.Rustc.V2026_08_01.MirSemantics.lookupBorrow] at h
+    cases h1 : Nat.beq 1 tag
+    · simp only [h1] at h
+      cases h2 : Nat.beq 2 tag
+      · simp [h2] at h
+      · simp only [h2, Option.some.injEq] at h; rw [← h]
+    · simp only [h1, Option.some.injEq] at h; rw [← h]
+
+/-- Non-vacuity of `evalAddrEqCall_hom` with NON-EMPTY borrow tables (`rust#166144`): two wide
+pointers carrying DIFFERENT borrow tags (`1` vs `2`) to the SAME stack local `_1` AND DIFFERENT
+vtable pointers (`16384` vs `16385`) compare equal (`1`) in BOTH dialects. -/
+theorem evalAddrEqCall_witness_nonempty_borrows :
+    let p1 : Trusted.Rustc.V2026_08_01.MirSemantics.Value :=
+      .aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .ptr { allocId := 16384, offsetBytes := 0 } 8]
+    let p2 : Trusted.Rustc.V2026_08_01.MirSemantics.Value :=
+      .aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8, .ptr { allocId := 16385, offsetBytes := 0 } 8]
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalAddrEqCall wBorrowState6 [] wLayouts6
+        (homValues [p1, p2]) [.uninit] wPlace6 (.some 1) =
+      DynStepClass.run6 (.write 1 1) wBorrowState6 [.uninit] wPlace6 1 ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalAddrEqCall wBorrowState8 [] wLayouts8
+        [p1, p2] [.uninit] wPlace8 (.some 1) =
+      DynStepClass.run8 (.write 1 1) wBorrowState8 [.uninit] wPlace8 1 :=
+  ⟨rfl, rfl⟩
 
 end Anneal.Mir.DynTraitVTableTests.Hom
 
@@ -3564,24 +4181,47 @@ run_cmd do
           throwError "C8 audit failure: {n} uses axiom {a}"
       c8Count := c8Count + 1
   let c7Required : List Name :=
-    [ `wfVTableEntry_hom, `resolveUpcastVTable?_hom, `dynUnsizeTarget?_hom,
-      `classifyDynReceiver?_hom, `narrowDynReceiver_hom, `dynVTableEnv?_hom,
-      `checkDynVTablePtr_hom, `evalDynSizeAlignOfVal_hom, `evalAddrEqCall_hom,
-      `wState_dynMemRel, `wBare_dynMemRel, `wState_addrRel, `witness_written_values,
+    [ `homUint_injective, `homInt_injective, `homFloat_injective, `homMut_injective,
+      `homSafety_injective, `homCallConv_injective, `homTy_injective, `homTys_injective,
+      `homSlot_injective, `homVTable_injective, `homScalar_injective, `homPtr_injective,
+      `homValue_injective, `homValues_injective,
+      `wfVTableEntry_hom, `resolveUpcastVTable?_hom, `dynUnsizeTarget?_hom,
+      `classifyDynReceiver?_hom, `narrowDynReceiver_hom,
+      `dynVTableEnv?_opt_hom, `dynVTableEnv?_hom,
+      `checkDynVTablePtr_opt_hom, `checkDynVTablePtr_hom,
+      `evalThinToDynUnsize_raw_hom, `dynRefDataValid_scalar_hom,
+      `evalDynSizeAlignOfVal_hom, `evalAddrEqCall_hom,
+      `addrRel_of_root_borrows, `addrRel_of_no_borrows,
+      `wState_dynMemRel, `wBare_dynMemRel, `wBody_optBodyRel, `wState_addrRel,
+      `wBorrowState_addrRel, `witness_written_values, `checkDynVTablePtr_opt_witness,
+      `evalThinToDynUnsize_raw_witness_32bit_64bit,
+      `dynRefDataValid_scalar_witness_32bit_uninhabited,
       `evalDynSizeAlignOfVal_witness_write, `evalDynSizeAlignOfVal_witness_ub,
       `evalDynSizeAlignOfVal_witness_unsupported, `evalAddrEqCall_witness_write,
-      `evalAddrEqCall_witness_ub ]
+      `evalAddrEqCall_witness_ub, `evalAddrEqCall_witness_nonempty_borrows ]
   for t in c7Required do
     let some (.thmInfo _) := env.find? (c7 ++ t) | throwError "C7 audit: {c7 ++ t} missing"
     for a in ← liftCoreM <| Lean.collectAxioms (c7 ++ t) do
       unless a == ``propext || a == ``Quot.sound do
         throwError "C7 audit failure: {c7 ++ t} uses axiom {a}"
+  let rec isTrivialProp : Expr → Bool
+    | .forallE _ _ body _ => isTrivialProp body
+    | .letE _ _ _ body _ => isTrivialProp body
+    | e =>
+      if e.isConstOf ``True then true
+      else if e.isAppOfArity ``Eq 3 then e.appFn!.appArg! == e.appArg!
+      else if e.isAppOfArity ``Iff 2 then e.appFn!.appArg! == e.appArg!
+      else false
   let mut moduleCount : Nat := 0
-  for (c, _) in env.constants.map₂.toList do
+  for (c, ci) in env.constants.map₂.toList do
     let axs ← liftCoreM <| Lean.collectAxioms c
     for a in axs do
       if a == ``sorryAx then throwError "test audit failure: {c} uses sorryAx"
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "test audit failure: {c} uses non-standard axiom {a}"
+    if !c.isInternal then
+      if let .thmInfo v := ci then
+        if isTrivialProp v.type then
+          throwError "test audit failure: {c} is a trivial theorem"
     moduleCount := moduleCount + 1
-  logInfo m!"dv constructive audit: verified {constructiveDecls.length} bundle declarations in [propext, Quot.sound] (0 Classical.choice, 0 sorryAx, 0 ofReduceBool), {c8Count} C8 theorems and {c7Required.length} C7 theorems in [propext, Quot.sound], {moduleCount} module declarations in standard axioms"
+  logInfo m!"dv constructive audit: verified {constructiveDecls.length} bundle declarations in [propext, Quot.sound] (0 Classical.choice, 0 sorryAx, 0 ofReduceBool), {c8Count} C8 theorems and {c7Required.length} C7 theorems in [propext, Quot.sound], {moduleCount} module declarations in standard axioms (0 trivial)"

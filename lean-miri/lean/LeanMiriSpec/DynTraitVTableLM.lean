@@ -677,19 +677,27 @@ def dvDynamicLayoutHooks (vts : List CapturedVTable) :
 
 /-- Validity of a trait-object wide pointer `imm` of type `*dyn K` / `&dyn K`
 (trait id `keyIdx`): the metadata must be a vtable for `K` (vendored
-`VTable.getPtrVTableTypeRead`); for a safe reference the data pointer must
-additionally be dereferenceable for the dynamic size (vendored
-`DynamicLayout.sizeAndAlignFromMeta` + `Memory.checkPtrAccess`), non-null and
-aligned (Miri `check_safe_pointer`; no Tree Borrows permission is read). -/
+`VTable.getPtrVTableTypeRead`); for a safe reference the concrete type must be
+inhabited (`kani#5216`), the data pointer must be dereferenceable for the
+dynamic size (vendored `DynamicLayout.sizeAndAlignFromMeta` +
+`Memory.checkPtrAccess`), non-null and aligned (Miri `check_safe_pointer`).
+When `checkTB = true` (reference unsizing and virtual-call entry under Tree
+Borrows), a vendored Tree Borrows permission check (`npApplyTreeBorrowsReadAt`
+for shared, `npApplyTreeBorrowsWriteAt` for mutable) is also performed; safe
+`size_of_val(&dyn)` and `&raw const (*r)` pass `checkTB = false` (`C5`). -/
 def dvValidateDynPtr (vts : List CapturedVTable) (isRef : Bool) (keyIdx : Nat)
-    (imm : Miri.Interpreter.Immediate AnnealProv) : Miri.Interpreter.RvalueM AnnealStepState Unit := do
+    (imm : Miri.Interpreter.Immediate AnnealProv) (checkTB : Bool := false)
+    (isMut : Bool := false) : Miri.Interpreter.RvalueM AnnealStepState Unit := do
   let .scalarPair dataSc metaSc := imm
     | throw (.undefinedBehavior "invalid wide pointer value for a trait object")
   let vptr ← match metaSc.toPointer annealTargetDataLayout with
     | .ok p => pure p
     | .error e => throw (Miri.Interpreter.ScalarOps.scalarError e)
-  let _ ← Miri.Interpreter.VTable.getPtrVTableTypeRead (dvVTableReadHooks vts) () vptr (some keyIdx)
+  let concreteTy ← Miri.Interpreter.VTable.getPtrVTableTypeRead (dvVTableReadHooks vts) () vptr (some keyIdx)
   if isRef then
+    let concreteLay ← (dvVTableReadHooks vts).layoutOf () concreteTy
+    if concreteLay.layout.uninhabited then
+      throw (.undefinedBehavior "uninhabited reference to a trait object")
     let dataPtr ← match dataSc.toPointer annealTargetDataLayout with
       | .ok p => pure p
       | .error e => throw (Miri.Interpreter.ScalarOps.scalarError e)
@@ -703,7 +711,16 @@ def dvValidateDynPtr (vts : List CapturedVTable) (isRef : Bool) (keyIdx : Nat)
     | .ok () =>
       if dataPtr.offset.bytes == 0 then throw (.undefinedBehavior "null reference to a trait object")
       match dataPtr.offset.isAligned align with
-      | .ok true => pure ()
+      | .ok true =>
+        if checkTB then
+          let st' ← get
+          let tbRes :=
+            if isMut then npApplyTreeBorrowsWriteAt dataPtr.provenance dataPtr.offset.bytes size st'
+            else npApplyTreeBorrowsReadAt dataPtr.provenance dataPtr.offset.bytes size st'
+          match tbRes with
+          | .ok st'' => set st''
+          | .error e => throw e
+        else pure ()
       | .ok false => throw (.undefinedBehavior "misaligned reference to a trait object")
       | .error _ => throw (.invalidProgram "invalid alignment")
 
@@ -810,16 +827,25 @@ def dvActiveUnsizeTails? (currentBody : CapturedMir) (st : AnnealStepState) :
     | _, _ => none
   | _ => none
 
-/-- The trait-object key and reference-ness of the active statement's
-destination (`&dyn K` / `*dyn K` target of a cast). -/
-def dvActiveDynTarget? (currentBody : CapturedMir) (st : AnnealStepState) : Option (Bool × DefPath) :=
+/-- The reference-ness, mutability, and trait-object key of the active statement's
+destination (`&[mut] dyn K` / `*[const|mut] dyn K` target of a cast). -/
+def dvActiveDynTarget? (currentBody : CapturedMir) (st : AnnealStepState) :
+    Option (Bool × Bool × DefPath) :=
   match dvActiveSite? currentBody st with
   | some (some { kind := .assign _ (.cast _ _ targetTy), .. }, _) =>
     match targetTy.kind with
-    | .ref _ (.dynamic k) => some (true, k)
-    | .rawPtr _ (.dynamic k) => some (false, k)
+    | .ref .not (.dynamic k) => some (true, false, k)
+    | .ref .mut (.dynamic k) => some (true, true, k)
+    | .rawPtr .not (.dynamic k) => some (false, false, k)
+    | .rawPtr .mut (.dynamic k) => some (false, true, k)
     | _ => none
   | _ => none
+
+/-- Whether the active statement is a mutable raw borrow (`&raw mut _`). -/
+def dvActiveRawBorrowIsMut (currentBody : CapturedMir) (st : AnnealStepState) : Bool :=
+  match dvActiveSite? currentBody st with
+  | some (some { kind := .assign _ (.rawPtr .mut _), .. }, _) => true
+  | _ => false
 
 /-- The trait-object key of the active cast's `*dyn K` / `&dyn K` operand. -/
 def dvActiveCastSrcKey? (currentBody : CapturedMir) (st : AnnealStepState) : Option DefPath :=
@@ -850,6 +876,7 @@ def annealCastHooksDynTraitVTable (currentBody : CapturedMir) (fnPtrs : List FnP
         | some i => pure (.dynamic i)
         | none =>
           match dvConcreteOfTyId? vts tyId with
+          | some .never | some (.adt _ _) => pure (.adt 0)
           | some cty => base.typeInfo c (encodeTyIdOverlay { kind := cty, layoutIdx := 0 })
           | none => base.typeInfo c tyId
     lockstepTails := fun _ _ _ => do
@@ -874,7 +901,7 @@ def annealCastHooksDynTraitVTable (currentBody : CapturedMir) (fnPtrs : List FnP
     validatePlace := fun c dest r b => do
       if dest.layout.ty == wideRawDynPtrTyId || dest.layout.ty == wideSafeDynRefTyId then
         let st ← get
-        let some (isRef, k) := dvActiveDynTarget? currentBody st
+        let some (isRef, isMut, k) := dvActiveDynTarget? currentBody st
           | throw (.unsupported "dyn validity outside a dyn cast")
         let some frame := st.stack.currentFrame? | throw (.stack .emptyStack)
         let op : Miri.Interpreter.Operand AnnealProv ←
@@ -887,18 +914,21 @@ def annealCastHooksDynTraitVTable (currentBody : CapturedMir) (fnPtrs : List FnP
           | .memory mp => pure (.indirect mp)
           | .local _ _ (some _) _ => throw (.unsupported "projected dyn validity")
         let imm ← annealReadImmediateOverlay ⟨op, dest.layout⟩
-        dvValidateDynPtr vts isRef (dvKeyIdx vts k) imm.imm
+        dvValidateDynPtr vts isRef (dvKeyIdx vts k) imm.imm (treeBorrows && isRef) isMut
       else base.validatePlace c dest r b }
 
-/-- The trait-object key of `(*_k)` when `_k` is a `&dyn K` (`true`) or
-`*dyn K` (`false`) local of `currentBody`. -/
-def dvDerefDynPlace? (currentBody : CapturedMir) (p : Miri.MIR.Place) : Option (Bool × DefPath) :=
+/-- `(isRef, isMutSrc, dynKey)` of `(*_k)` when `_k` is a `&[mut] dyn K` or
+`*[const|mut] dyn K` local of `currentBody`. -/
+def dvDerefDynPlace? (currentBody : CapturedMir) (p : Miri.MIR.Place) :
+    Option (Bool × Bool × DefPath) :=
   if p.projection.toList == [.Deref] then
     match get? currentBody.localDecls p.localId with
     | some d =>
       match d.ty.kind with
-      | .ref _ (.dynamic k) => some (true, k)
-      | .rawPtr _ (.dynamic k) => some (false, k)
+      | .ref .not (.dynamic k) => some (true, false, k)
+      | .ref .mut (.dynamic k) => some (true, true, k)
+      | .rawPtr .not (.dynamic k) => some (false, false, k)
+      | .rawPtr .mut (.dynamic k) => some (false, true, k)
       | _ => none
     | none => none
   else none
@@ -925,8 +955,10 @@ def annealRvalueHooksDynTraitVTable (currentBody : CapturedMir) (fnPtrs : List F
   { base with
     evalPlace := fun c p skip => do
       match dvDerefDynPlace? currentBody p with
-      | some (isRef, k) =>
+      | some (isRef, isMutSrc, k) =>
         let st ← get
+        if dvActiveRawBorrowIsMut currentBody st && !isMutSrc then
+          throw (.unsupported "mutable raw borrow of immutable dyn pointer")
         let some frame := st.stack.currentFrame? | throw (.stack .emptyStack)
         let op ← match frame.getLocalOperand p.localId with
           | .ok o => pure o
@@ -935,7 +967,7 @@ def annealRvalueHooksDynTraitVTable (currentBody : CapturedMir) (fnPtrs : List F
         let lay := (lookupLocalDeclLayout currentBody.localDecls currentBody.layouts p.localId).getD
           (translateTyOverlay dvU32Ty)
         let imm ← annealReadImmediateOverlay ⟨op, lay⟩
-        if isRef then dvValidateDynPtr vts true (dvKeyIdx vts k) imm.imm
+        if isRef then dvValidateDynPtr vts true (dvKeyIdx vts k) imm.imm false false
         match imm.imm with
         | .scalarPair d m =>
           match d.toPointer annealTargetDataLayout with
@@ -1073,12 +1105,13 @@ def dvValidateThinRef (sc : Miri.Memory.Scalar AnnealProv) (lay : Miri.Interpret
     | .ok false => throw (.undefinedBehavior "misaligned reference argument")
     | .error _ => throw (.invalidProgram "invalid alignment")
 
-/-- Function-entry retag of a shared receiver reborrow under Tree Borrows:
-inserts into the vendored `BorrowTree` a child of `parent` with the fresh tag
-`child`, `Frozen` and accessed on every tracked location (the receiver pointee
-is the whole allocation in the corpus), under the parent node. `none` when
-`parent` is not tracked. -/
-def dvRetagFrozenChild (tree : Miri.TreeBorrows.BorrowTree) (parent child : Miri.Memory.BorTag) :
+/-- Function-entry retag of a receiver reborrow under Tree Borrows: inserts into
+the vendored `BorrowTree` a child of `parent` with the fresh tag `child`,
+initial permission `perm` (`Frozen` for `&Self`, `ReservedFrz false` for
+`&mut Self`) and accessed on every tracked location, under the parent node.
+`none` when `parent` is not tracked. -/
+def dvRetagChild (tree : Miri.TreeBorrows.BorrowTree) (parent child : Miri.Memory.BorTag)
+    (perm : Miri.TreeBorrows.Permission := .Frozen) :
     Option Miri.TreeBorrows.BorrowTree :=
   match tree.tagMapping.get parent with
   | none => none
@@ -1089,20 +1122,25 @@ def dvRetagFrozenChild (tree : Miri.TreeBorrows.BorrowTree) (parent child : Miri
       let cIdx : Miri.TreeBorrows.UniIndex := ⟨UInt32.ofNat tree.nodes.data.size⟩
       let nodes := (tree.nodes.insert pIdx { pNode with children := pNode.children.push cIdx }).insert
         cIdx { tag := child, parent := some pIdx, children := #[],
-               defaultInitialPermission := .Frozen, defaultInitialSifa := .None }
+               defaultInitialPermission := perm, defaultInitialSifa := .None }
       let locations := { tree.locations with
         entries := tree.locations.entries.map fun seg =>
-          { seg with data := { seg.data with perms := seg.data.perms.insert cIdx ⟨.Frozen, true, .None⟩ } } }
+          { seg with data := { seg.data with perms := seg.data.perms.insert cIdx ⟨perm, true, .None⟩ } } }
       some { tree with
         tagMapping := { tree.tagMapping with mapping := tree.tagMapping.mapping.push (child, cIdx) },
         nodes, locations }
 
-/-- Under Tree Borrows, the callee's function-entry retag of a `&Self`
-receiver (Miri `FnEntry` retag of a reference argument): a fresh `Frozen` child
-tag of the receiver's tag, protected by a `StrongProtector` (the active call
-protector); the receiver pointer carries the new tag. Untracked receivers are
-unchanged. -/
-def dvRetagReceiver (sc : Miri.Memory.Scalar AnnealProv) :
+/-- Backwards-compatible alias for `dvRetagChild` with `.Frozen`. -/
+abbrev dvRetagFrozenChild (tree : Miri.TreeBorrows.BorrowTree) (parent child : Miri.Memory.BorTag) :
+    Option Miri.TreeBorrows.BorrowTree :=
+  dvRetagChild tree parent child .Frozen
+
+/-- Under Tree Borrows, the callee's function-entry retag of a `&Self` /
+`&mut Self` receiver (Miri `FnEntry` retag of a reference argument): a fresh
+child tag (`Frozen` for shared, `ReservedFrz false` for mutable) of the
+receiver's tag, protected by a `StrongProtector` (the active call protector);
+the receiver pointer carries the new tag. Untracked receivers are unchanged. -/
+def dvRetagReceiver (sc : Miri.Memory.Scalar AnnealProv) (isMut : Bool := false) :
     Miri.Interpreter.RvalueM AnnealStepState (Miri.Memory.Scalar AnnealProv) := do
   let st ← get
   match sc.toPointer annealTargetDataLayout with
@@ -1119,7 +1157,8 @@ def dvRetagReceiver (sc : Miri.Memory.Scalar AnnealProv) :
               tree.tagMapping.mapping.foldl (fun m e => max m e.1.value) 0 + 1
             if h : fresh ≠ 0 then
               let child : Miri.Memory.BorTag := ⟨fresh, h⟩
-              match dvRetagFrozenChild tree tag child with
+              let perm : Miri.TreeBorrows.Permission := if isMut then .ReservedFrz false else .Frozen
+              match dvRetagChild tree tag child perm with
               | some tree' =>
                 set { st with machine := { (updateAllocMachine st.machine lIdx aid la.kind
                         (la.allocation.setExtra (some tree'))) with
@@ -1142,11 +1181,14 @@ def dvCallerAbi (argImms : List (Miri.Interpreter.RvalueImmTy AnnealProv))
     cVariadic := false, fixedCount := UInt32.ofNat argImms.length, conv := .Rust, canUnwind := true }
 
 /-- Virtual method call (`InstanceKind::Virtual(def, slot)`): evaluate the
-arguments, resolve the receiver and the concrete instance through vendored
-`VirtualCalls.resolveVirtual` (receiver unwrapping, `VTable.getPtrVTableType`
-with `checkForType`, `entries[slot]` method selection, instance assertion,
-thin receiver), validate the callee's `&Self` receiver, and push the linked
-concrete callee frame (`annealPushCalleeFrameLM4_1`). -/
+arguments (`kani#5172` uninit check first), resolve the receiver and the
+concrete instance through vendored `VirtualCalls.resolveVirtual` (receiver
+unwrapping, `VTable.getPtrVTableType` with `checkForType`, `entries[slot]`
+method selection, instance assertion, thin receiver), validate safe-reference
+receivers (including `kani#5216` inhabitedness and Tree Borrows permissions)
+**before** looking up the linked callee (`C3`), and push the linked concrete
+callee frame (`annealPushCalleeFrameLM4_1`) with function-entry receiver
+protector retag (`C4`). -/
 def dvEvalVirtualCall (currentBody : CapturedMir) (callees : List CapturedMir) (treeBorrows : Bool)
     (m : CapturedVirtualMethod) (mIdx : Nat) (recvKey : DefPath) (args : List Operand)
     (dest : Miri.MIR.Place) (target : Option Miri.MIR.BasicBlockId) (unwind : Miri.MIR.UnwindAction)
@@ -1168,6 +1210,17 @@ def dvEvalVirtualCall (currentBody : CapturedMir) (callees : List CapturedMir) (
       (dvVirtualBase + mIdx) m.slotIdx (dvCallerAbi argImms retLay) fnArgs
     let some path := dvMethodOfInstance? vts inst
       | throw (.invalidProgram "virtual dispatch selected a non-method instance")
+    -- Pre-lookup safe-reference receiver gate (C3): validate dereferenceability,
+    -- alignment, non-null, inhabitedness (`kani#5216`), and Tree Borrows parent
+    -- permissions *before* checking whether `calleeBody` is linked.
+    match args.head?, argImms.head? with
+    | some recvOp, some recvWide =>
+      match operandTy currentBody.localDecls currentBody.layouts recvOp with
+      | some { kind := .ref mutb (.dynamic _), .. } =>
+        let isMutRecv : Bool := match mutb with | .mut => true | .not => false
+        dvValidateDynPtr vts true recvIdx recvWide.imm treeBorrows isMutRecv
+      | _ => pure ()
+    | _, _ => pure ()
     let some calleeBody := findCallee? callees path
       | throw (.unsupported "unlinked concrete virtual callee")
     let some recvArg := fnArgs'[0]? | throw (.invalidProgram "virtual receiver disappeared")
@@ -1179,11 +1232,12 @@ def dvEvalVirtualCall (currentBody : CapturedMir) (callees : List CapturedMir) (
     let recv ← match (paramTy?.map (·.kind) : Option RigidTy), recvImm.imm with
       | some (RigidTy.ref .not pointee), .scalar sc =>
         dvValidateThinRef sc (translateTyOverlay { kind := pointee, layoutIdx := 0 } calleeBody.layouts)
-        if treeBorrows then pure (Miri.Interpreter.Immediate.scalar (← dvRetagReceiver sc))
+        if treeBorrows then pure (Miri.Interpreter.Immediate.scalar (← dvRetagReceiver sc false))
         else pure recvImm.imm
-      | some (RigidTy.ref _ pointee), .scalar sc =>
+      | some (RigidTy.ref .mut pointee), .scalar sc =>
         dvValidateThinRef sc (translateTyOverlay { kind := pointee, layoutIdx := 0 } calleeBody.layouts)
-        pure recvImm.imm
+        if treeBorrows then pure (Miri.Interpreter.Immediate.scalar (← dvRetagReceiver sc true))
+        else pure recvImm.imm
       | _, _ => pure recvImm.imm
     pure (calleeBody, ⟨recv, paramLay⟩ :: argImms.drop 1)
   match Miri.Interpreter.runRvalue action state with
@@ -1197,21 +1251,21 @@ def dvUsizeScalar (n : Nat) : Miri.Memory.Scalar AnnealProv :=
   | .ok s => s
   | .error _ => Miri.Memory.Scalar.fromPointer annealTargetDataLayout ⟨.ZERO, .wildcard⟩
 
-/-- Safe `core::mem::{size_of_val, align_of_val}(val: &dyn K)`: function-entry
-validity of `val` (`dvValidateDynPtr`, no Tree Borrows read), then the
-intrinsic `size_of_val` / `min_align_of_val` = vendored
-`DynamicLayout.sizeAndAlignFromMeta` (vtable size/alignment via
-`VTable.getSizeAndAlignRead`); the result is written to the destination and
-control continues at `target`. -/
+/-- Dynamic `size_of_val` / `align_of_val` on `&dyn K` (`isRef = true`, safe
+`core::mem`: validates reference without Tree Borrows read, `C5`) or
+`*const dyn K` (`isRef = false`, raw `core::intrinsics`: validates vtable
+metadata only), reading size/alignment through vendored
+`DynamicLayout.sizeAndAlignFromMeta` (`VTable.getSizeAndAlignRead`). -/
 def dvEvalSizeAlignOfVal (currentBody : CapturedMir) (isAlign : Bool) (recvKey : DefPath)
     (args : List Operand) (dest : Miri.MIR.Place) (target : Option Miri.MIR.BasicBlockId)
-    (state : AnnealStepState) : Miri.Interpreter.StepResult AnnealStepState Unit :=
+    (state : AnnealStepState) (isRef : Bool := true) :
+    Miri.Interpreter.StepResult AnnealStepState Unit :=
   let vts := currentBody.vtables
   let action : Miri.Interpreter.RvalueM AnnealStepState Unit := do
     let argImms ← annealEvalCallArgsLM4_1 currentBody.localDecls currentBody.layouts
       (args.map translateOperand)
     let some a := argImms.head? | throw (.invalidProgram "size_of_val without an argument")
-    dvValidateDynPtr vts true (dvKeyIdx vts recvKey) a.imm
+    dvValidateDynPtr vts isRef (dvKeyIdx vts recvKey) a.imm false false
     let .scalarPair _ metaSc := a.imm | throw (.invalidProgram "thin size_of_val argument")
     let some (size, align) ← Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta
         (dvDynamicLayoutHooks vts) () 4 (.metadata metaSc) (dvDynLayout (dvDynTailTyId vts recvKey))
@@ -1252,9 +1306,14 @@ def dvEvalDynCall (currentBody : CapturedMir) (callees : List CapturedMir) (tree
       | some (m, i) => dvEvalVirtualCall currentBody callees treeBorrows m i k args dest target unwind state
       | none =>
         if stringEq path "core::mem::size_of_val" then
-          dvEvalSizeAlignOfVal currentBody false k args dest target state
+          dvEvalSizeAlignOfVal currentBody false k args dest target state true
         else if stringEq path "core::mem::align_of_val" then
-          dvEvalSizeAlignOfVal currentBody true k args dest target state
+          dvEvalSizeAlignOfVal currentBody true k args dest target state true
+        else if stringEq path "core::intrinsics::size_of_val" then
+          dvEvalSizeAlignOfVal currentBody false k args dest target state false
+        else if stringEq path "core::intrinsics::align_of_val" ||
+            stringEq path "core::intrinsics::min_align_of_val" then
+          dvEvalSizeAlignOfVal currentBody true k args dest target state false
         else
           match findCallee? callees path with
           | some cb => dvEvalLinkedInstanceCall currentBody cb args dest target unwind state
@@ -2436,6 +2495,29 @@ def dvLmRun (root : CapturedMir) (callees : List CapturedMir) (treeBorrows : Boo
     (st : AnnealStepState) : DynVtLmObs :=
   dvToObs (runMiriSteps (annealStepHooksDynTraitVTableFor root callees treeBorrows) dvLmFuel st)
 
+/-- The `CapturedMir` fixture executed by `dvLmObserve` for each
+`(variantIdx, caseIdx)` key (locked per-key against `MiniRustSpec`'s
+`dvTrustedFixture` in the cross-root kernel bridge). -/
+def dvLmFixture (variantIdx caseIdx : Nat) : CapturedMir :=
+  match variantIdx, caseIdx with
+  | 0, 0 => dvV1RefUnsizeMir
+  | 0, 1 => dvV1RawUnsizeMir
+  | 0, 2 => dvV1RefArgUnsizeMir
+  | 0, 3 => dvV1MutUnsizeMir
+  | 1, 0 => dvV2UpcastSuperMir
+  | 1, 1 => dvV2UpcastSideMir
+  | 1, 2 => dvV2NopRefMir
+  | 1, 3 => dvV2NopRawMir
+  | 2, 0 => dvV3CallU32Mir
+  | 2, 1 => dvV3CallU64Mir
+  | 2, 2 => dvV3ArgCallMir
+  | 2, 3 => dvV3PokeCallerMir
+  | 3, 0 => dvV4SizeSafeMir
+  | 3, 1 => dvV4AddrEqMir
+  | 3, 2 => dvV4SizeSafeMir
+  | 3, 3 => dvV4WideEqMir
+  | _, _ => dvV1RefUnsizeMir
+
 /-- Direct vendored `Miri.Interpreter.Step.step` observation for every
 `(treeBorrows, variantIdx, caseIdx)` key (`variantIdx, caseIdx ∈ 0..3`). -/
 def dvLmObserve (treeBorrows : Bool) (variantIdx : Nat) (caseIdx : Nat) : DynVtLmObs :=
@@ -2687,6 +2769,234 @@ theorem dv_c16_witnesses :
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel⟩
 
+/-! ### B1 Hardening Witnesses: `kani#5216` Uninhabited, `C2` TB Unsize & `&raw mut` Gate, `C3` Pre-Unlinked Gate, Raw Intrinsics, and Vendored `Cast.unsizeInto` `.adt` / `DispatchFromDyn` -/
+
+/-- Uninhabited concrete type (`!`) vtable for `dyn Tr` (`kani#5216`). -/
+def dvUninhabitedVTables : List CapturedVTable :=
+  [ { vtableId := 0, vtableAllocId := 16384, concreteTy := .never, dynKey := dvTrKey,
+      sizeBytes := 0, alignBytes := 1, isUninhabited := true,
+      slots := [.dropInPlace none, .size, .align] } ]
+
+/-- `fn(p: P) -> D { p as D }` with the uninhabited `(Never, dyn Tr)` vtable table. -/
+def dvNeverUnsizeMir (srcTy dstTy : Ty) : CapturedMir :=
+  { dvV1ArgUnsizeMir srcTy dstTy with vtables := dvUninhabitedVTables }
+
+/-- **`kani#5216` uninhabited concrete type behind `&dyn Trait` (LM authority)**:
+unsizing a live, aligned `&!` to `&dyn Tr` faults `.ub` in BOTH modes
+(`dvValidateDynPtr` rejects `concreteLay.layout.uninhabited = true`), whereas
+raw `*const ! -> *const dyn Tr` succeeds in BOTH modes. -/
+theorem dv_kani5216_uninhabited_witness (tb : Bool) :
+    let refMir := dvNeverUnsizeMir { kind := .ref .not .never, layoutIdx := 0 } (dvRefDynTy dvTrKey)
+    let rawMir := dvNeverUnsizeMir { kind := .rawPtr .not .never, layoutIdx := 0 } (dvRawConstDynTy dvTrKey)
+    let mach := dvMachine dvUninhabitedVTables (dvLiveU32 dvAid1 7 none)
+      #[⟨dvAid1, annealStackBaseAddr dvAid1⟩]
+    let stRef := dvMkState refMir #[dvUninit (dvRefDynTy dvTrKey),
+      dvImmLocal (.scalar (dvPtrScalar dvAid1 (annealStackBaseAddr dvAid1)))
+        { kind := .ref .not .never, layoutIdx := 0 }] mach
+    let stRaw := dvMkState rawMir #[dvUninit (dvRawConstDynTy dvTrKey),
+      dvImmLocal (.scalar (dvPtrScalar dvAid1 (annealStackBaseAddr dvAid1)))
+        { kind := .rawPtr .not .never, layoutIdx := 0 }] mach
+    dvLmRun refMir [] tb stRef = .ub ∧
+    dvLmRun rawMir [] tb stRaw = .widePtr 1 0 16384 := by
+  cases tb <;> exact ⟨by decide +kernel, by decide +kernel⟩
+
+/-- Initial state for unsizing a thin reference/pointer `_1` pointing to live
+local `_2 : u32 = 7` under Tree Borrows tree `tree` and tag `tag`. -/
+def dvStThinPointeeTb (body : CapturedMir) (srcTy : Ty) (tree : Miri.TreeBorrows.BorrowTree)
+    (tag : Miri.Memory.BorTag) : AnnealStepState :=
+  dvMkState body
+    #[dvUninit ((body.localDecls.head?.map (·.ty)).getD dvU32Ty),
+      dvImmLocal (.scalar (dvPtrScalar dvAid1 (annealStackBaseAddr dvAid1) tag)) srcTy,
+      dvIndirectLocal dvAid1]
+    (dvMachine dvVTables (dvLiveU32 dvAid1 7 (some tree)) #[⟨dvAid1, annealStackBaseAddr dvAid1⟩]
+      (some (dvRecvBorrowState false)))
+
+/-- **`C2` Tree Borrows reference-unsizing gate & `&raw mut` mutability gate (LM)**:
+1. Under `treeBorrows = true`, unsizing a `Disabled`-tagged `&u32 -> &dyn Tr`
+   and a `Frozen`-tagged `&mut u32 -> &mut dyn Tr` both fault `.ub` through
+   vendored `Miri.TreeBorrows`, whereas raw `*const u32 -> *const dyn Tr` with
+   the same `Disabled` tag succeeds in BOTH modes;
+2. `&raw mut (*r)` on an immutable `&dyn Tr` or `*const dyn Tr` fails closed
+   (`.unsupported`), while `&raw mut (*r)` on `&mut dyn Tr` succeeds. -/
+theorem dv_c2_tb_unsize_and_raw_mut_witness :
+    let refMir := dvMkBody "dv::v1_ref_tb" [dvDecl (dvRefDynTy dvTrKey), dvDecl dvRefU32Ty, dvDecl dvU32Ty] 1
+      [dvBb [dvSt (.assign (dvLoc 0) (.cast (.pointerCoercion "Unsize") (.copy (dvLoc 1)) (dvRefDynTy dvTrKey)))] .return_]
+    let mutMir := dvMkBody "dv::v1_mut_tb" [dvDecl (dvRefMutDynTy dvTrKey), dvDecl dvRefMutU32Ty, dvDecl dvU32Ty] 1
+      [dvBb [dvSt (.assign (dvLoc 0) (.cast (.pointerCoercion "Unsize") (.copy (dvLoc 1)) (dvRefMutDynTy dvTrKey)))] .return_]
+    let rawMir := dvMkBody "dv::v1_raw_tb" [dvDecl (dvRawConstDynTy dvTrKey), dvDecl dvRawConstU32Ty, dvDecl dvU32Ty] 1
+      [dvBb [dvSt (.assign (dvLoc 0) (.cast (.pointerCoercion "Unsize") (.copy (dvLoc 1)) (dvRawConstDynTy dvTrKey)))] .return_]
+    let rawMutShared := dvV4RawBorrowMir .mut (dvRefDynTy dvTrKey) (dvRawMutDynTy dvTrKey)
+    let rawMutConst := dvV4RawBorrowMir .mut (dvRawConstDynTy dvTrKey) (dvRawMutDynTy dvTrKey)
+    let rawMutMut := dvV4RawBorrowMir .mut (dvRefMutDynTy dvTrKey) (dvRawMutDynTy dvTrKey)
+    dvLmRun refMir [] true (dvStThinPointeeTb refMir dvRefU32Ty dvDisabledTree retagChildTag) = .ub ∧
+    dvLmRun mutMir [] true (dvStThinPointeeTb mutMir dvRefMutU32Ty dvRecvTree retagChildTag) = .ub ∧
+    dvLmRun rawMir [] false (dvStThinPointeeTb rawMir dvRawConstU32Ty dvDisabledTree retagChildTag) = .widePtr 1 0 16384 ∧
+    dvLmRun rawMir [] true (dvStThinPointeeTb rawMir dvRawConstU32Ty dvDisabledTree retagChildTag) = .widePtr 1 0 16384 ∧
+    dvLmRun rawMutShared [] false (dvStPointee rawMutShared 16384) = .unsupported ∧
+    dvLmRun rawMutConst [] false (dvStRawDyn rawMutConst 0 [(16384, dvTrKey)]) = .unsupported ∧
+    dvLmRun rawMutMut [] false
+      (dvMkState rawMutMut #[dvUninit (dvRawMutDynTy dvTrKey),
+        dvImmLocal (dvWideImm (dvPtrScalar dvAid1 (annealStackBaseAddr dvAid1)) 16384) (dvRefMutDynTy dvTrKey),
+        dvIndirectLocal dvAid1]
+        (dvMachine dvVTables (dvLiveU32 dvAid1 7 none) #[⟨dvAid1, annealStackBaseAddr dvAid1⟩])) = .widePtr 1 0 16384 := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- **`C3` pre-unlinked validity gate, `Disabled` virtual receiver TB gate, &
+raw `core::intrinsics::{size_of_val, align_of_val}` (LM)**:
+1. With NO callees linked (`callees := []`), a virtual call on a dead/dangling
+   `&dyn Tr` receiver faults `.ub` (never `.unsupported`, `C3`), while a live
+   receiver fails closed `.unsupported`;
+2. Under `treeBorrows = true`, calling `r.get(5)` on a `Disabled`-tagged
+   `&dyn Tr` receiver faults `.ub` (parent Tree Borrows read checked before
+   retag);
+3. Raw `core::intrinsics::{size_of_val, align_of_val}` on `*const dyn Tr`
+   return `8` / `8` for `u64` and `4` / `4` for `u32`. -/
+theorem dv_c3_and_raw_intrinsics_witness :
+    let intrSz64 := dvV4IntrLayoutMir dvU64Ty dvRefU64Ty "core::intrinsics::size_of_val"
+    let intrAl64 := dvV4IntrLayoutMir dvU64Ty dvRefU64Ty "core::intrinsics::align_of_val"
+    let intrSz32 := dvV4IntrLayoutMir dvU32Ty dvRefU32Ty "core::intrinsics::size_of_val"
+    let intrAl32 := dvV4IntrLayoutMir dvU32Ty dvRefU32Ty "core::intrinsics::align_of_val"
+    let stIntr64 (b : CapturedMir) := dvMkState b
+      #[dvUninit dvUsizeTy, dvIndirectLocal dvAid1 .one dvU64Ty, dvUninit dvRefU64Ty,
+        dvUninit (dvRefDynTy dvTrKey), dvUninit (dvRawConstDynTy dvTrKey)]
+      (dvMachine dvVTables (dvLiveUInt dvAid1 64 8 none) #[⟨dvAid1, annealStackBaseAddr dvAid1⟩])
+    let stIntr32 (b : CapturedMir) := dvMkState b
+      #[dvUninit dvUsizeTy, dvIndirectLocal dvAid1 .one dvU32Ty, dvUninit dvRefU32Ty,
+        dvUninit (dvRefDynTy dvTrKey), dvUninit (dvRawConstDynTy dvTrKey)]
+      (dvMachine dvVTables (dvLiveU32 dvAid1 7 none) #[⟨dvAid1, annealStackBaseAddr dvAid1⟩])
+    dvLmRun dvV3ArgCallMir [] false (dvStPointee dvV3ArgCallMir 16384 (live := false)) = .ub ∧
+    dvLmRun dvV3ArgCallMir [] false (dvStPointee dvV3ArgCallMir 16384 (live := true)) = .unsupported ∧
+    dvLmRun dvV3ArgCallMir dvCallees true
+      (dvStPointee dvV3ArgCallMir 16384 (some dvDisabledTree) retagChildTag
+        (bt := some (dvRecvBorrowState false))) = .ub ∧
+    dvLmRun intrSz64 [] false (stIntr64 intrSz64) = .usizeVal 8 ∧
+    dvLmRun intrAl64 [] false (stIntr64 intrAl64) = .usizeVal 8 ∧
+    dvLmRun intrSz32 [] false (stIntr32 intrSz32) = .usizeVal 4 ∧
+    dvLmRun intrAl32 [] false (stIntr32 intrAl32) = .usizeVal 4 := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- Synthetic `TyId`s for exercising vendored `Cast.unsizeInto`'s `.adt` structural
+field-traversal arm and `VirtualCalls.resolveVirtual`'s `DispatchFromDyn` `.other`
+unwrapping arm directly on `Pin<&mut T>` / `Pin<&mut dyn Tr>` and negative ADTs. -/
+def dvPinThinTyId : Miri.MIR.TyId := 500001
+def dvPinDynTyId : Miri.MIR.TyId := 500002
+def dvPairThinTyId : Miri.MIR.TyId := 500003
+def dvPairDynTyId : Miri.MIR.TyId := 500004
+def dvBoxDynTyId : Miri.MIR.TyId := 500005
+
+def dvThinRefU32Layout : Miri.ABI.TyAndLayout Miri.MIR.TyId :=
+  translateTyOverlay dvRefMutU32Ty emptyLayoutTable
+
+def dvWideRefDynLayout : Miri.ABI.TyAndLayout Miri.MIR.TyId :=
+  translateTyOverlay (dvRefMutDynTy dvTrKey) emptyLayoutTable
+
+def dvAdtLayout (tyId : Miri.MIR.TyId) (fieldCount : Nat) (sz : UInt64) :
+    Miri.ABI.TyAndLayout Miri.MIR.TyId :=
+  let offs : Array Miri.ABI.Size :=
+    ((List.range fieldCount).map fun i => Miri.ABI.Size.ofBytes (UInt64.ofNat (i * 8))).toArray
+  let ord : Array Nat := (List.range fieldCount).toArray
+  { ty := tyId
+    layout := { zstLayoutData with
+      size := Miri.ABI.Size.ofBytes sz, align := ⟨Miri.ABI.Align.EIGHT⟩,
+      unadjustedAbiAlign := Miri.ABI.Align.EIGHT,
+      fields := .Arbitrary offs ord } }
+
+/-- `CastHooks` extending `annealCastHooksDynTraitVTable` with 1-field `Pin`
+(ADT 1), 2-field `Pair` (ADT 2), and mismatched `Box` (ADT 3) layouts to
+exercise vendored `Miri.Interpreter.Cast.unsizeInto`'s `.adt` branch directly. -/
+def dvAdtUnsizeCastHooks :
+    Miri.Interpreter.CastHooks AnnealProv AnnealStepState Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  let base := annealCastHooksDynTraitVTable dvV1RefUnsizeMir
+  { base with
+    typeInfo := fun c tyId =>
+      if tyId == dvPinThinTyId || tyId == dvPinDynTyId then pure (.adt 1)
+      else if tyId == dvPairThinTyId || tyId == dvPairDynTyId then pure (.adt 2)
+      else if tyId == dvBoxDynTyId then pure (.adt 3)
+      else base.typeInfo c tyId
+    lockstepTails := fun _ _ _ => pure (dvConcreteTyId dvVTables (.uint .u32), dvDynTailTyId dvVTables dvTrKey)
+    fieldLayout := fun _ target _ =>
+      if target.ty == dvPinDynTyId || target.ty == dvPairDynTyId then pure dvWideRefDynLayout
+      else throw (.invalidProgram "unexpected ADT field layout")
+    projectRead := fun _ src _ => pure ⟨src.op, dvThinRefU32Layout⟩
+    projectWrite := fun _ dest _ => pure { dest with layout := dvWideRefDynLayout } }
+
+/-- **`Cast.unsizeInto` `.adt` structural unsizing & `VirtualCalls.resolveVirtual`
+`DispatchFromDyn` receiver unwrapping witnesses (vendored `Miri.Interpreter`)**:
+1. Positive 1-field transparent ADT (`Pin<&mut u32> -> Pin<&mut dyn Tr>`) runs
+   vendored `Miri.Interpreter.Cast.unsizeInto`'s `.adt` arm and writes the wide
+   pointer `(data, 16384)` into `_0`;
+2. Negative 2-field ADT (`Pair<&mut u32, &mut u32> -> Pair<&mut dyn Tr, &mut dyn Tr>`)
+   is rejected by vendored `Cast.unsizeInto` with
+   `"unsize_into: more than one field to cast"`;
+3. Negative mismatched ADT (`Pin<&mut u32> -> Box<dyn Tr>`) is rejected by
+   vendored `Cast.unsizeInto` with
+   `"unsizing requires identical ADT definitions"`;
+4. Positive `DispatchFromDyn` receiver (`Pin<&mut dyn Tr>`) runs vendored
+   `Miri.Interpreter.VirtualCalls.resolveVirtual`'s `.other` (`nonOneZstField` +
+   `projectField`) arm and resolves `Tr::get` to `dv::<u32 as Tr>::get` with the
+   narrowed thin pointer. -/
+theorem dv_pin_adt_unsize_and_dispatch_from_dyn_witness :
+    let st0 := dvStThinLocal dvV1RefUnsizeMir 7 4 dvU32Ty dvRefU32Ty
+    let srcPtr := dvPtrScalar dvAid1 (annealStackBaseAddr dvAid1)
+    let destPin : Miri.Interpreter.RuntimePlace AnnealProv :=
+      { ref := .local 0 0 none (.ofAllocationToken 0), layout := dvAdtLayout dvPinDynTyId 1 16 }
+    let rPin := Miri.Interpreter.Cast.unsizeInto dvAdtUnsizeCastHooks () 4
+      ⟨.immediate (.scalar srcPtr), dvAdtLayout dvPinThinTyId 1 8⟩
+      (dvAdtLayout dvPinDynTyId 1 16) destPin st0
+    let pinOk : Bool := match rPin with
+      | .ok () st1 =>
+        match st1.stack.currentFrame?.bind (fun f => (f.getLocalOperand 0).toOption) with
+        | some (.immediate (.scalarPair d v)) =>
+          dvDecodePtr st1.machine d == some (1, 0) && dvDecodePtr st1.machine v == some (16384, 0)
+        | _ => false
+      | .error _ _ => false
+    let rPair := Miri.Interpreter.Cast.unsizeInto dvAdtUnsizeCastHooks () 4
+      ⟨.immediate (.scalar srcPtr), dvAdtLayout dvPairThinTyId 2 16⟩
+      (dvAdtLayout dvPairDynTyId 2 32)
+      { ref := .local 0 0 none (.ofAllocationToken 0), layout := dvAdtLayout dvPairDynTyId 2 32 } st0
+    let pairMsg : Option String := match rPair with
+      | .error (.invalidProgram msg) _ => some msg
+      | _ => none
+    let rMismatch := Miri.Interpreter.Cast.unsizeInto dvAdtUnsizeCastHooks () 4
+      ⟨.immediate (.scalar srcPtr), dvAdtLayout dvPinThinTyId 1 8⟩
+      (dvAdtLayout dvBoxDynTyId 1 16)
+      { ref := .local 0 0 none (.ofAllocationToken 0), layout := dvAdtLayout dvBoxDynTyId 1 16 } st0
+    let mismatchMsg : Option String := match rMismatch with
+      | .error (.invalidProgram msg) _ => some msg
+      | _ => none
+    let pinWideImm := dvWideImm srcPtr 16384
+    let baseVh := dvVirtualHooks dvVTables dvVirtualMethods (dvKeyIdx dvVTables dvTrKey)
+    let pinVh : Miri.Interpreter.VirtualCalls.Hooks AnnealProv AnnealStepState Unit Unit :=
+      { baseVh with
+        compiler := { baseVh.compiler with
+          classifyReceiver := fun ty =>
+            if ty == dvPinDynTyId then pure .other else baseVh.compiler.classifyReceiver ty
+          fieldLayout := fun lay idx =>
+            if lay.ty == dvPinDynTyId && idx == 0 then pure dvWideRefDynLayout
+            else baseVh.compiler.fieldLayout lay idx }
+        projectField := fun _ op idx =>
+          if op.layout.ty == dvPinDynTyId && idx == 0 then pure ⟨.immediate pinWideImm, dvWideRefDynLayout⟩
+          else throw (.unsupported "unexpected pin projectField") }
+    let pinFnArg : Miri.Interpreter.FnArg AnnealProv :=
+      .Copy ⟨.immediate pinWideImm, dvAdtLayout dvPinDynTyId 1 16⟩
+    let virtInst : Miri.Interpreter.CallInstance :=
+      { kind := .Virtual dvVirtualBase 3, args := #[.Type (dvDynTailTyId dvVTables dvTrKey)] }
+    let rDisp := Miri.Interpreter.VirtualCalls.resolveVirtual pinVh () 4 virtInst dvVirtualBase 3
+      (dvCallerAbi [⟨pinWideImm, dvAdtLayout dvPinDynTyId 1 16⟩] (translateTyOverlay dvU32Ty))
+      #[pinFnArg] st0
+    let dispOk : Bool := match rDisp with
+      | .ok (inst, _, args') _ =>
+        dvMethodOfInstance? dvVTables inst == some "dv::<u32 as Tr>::get" && args'.size == 1
+      | .error _ _ => false
+    pinOk = true ∧
+    pairMsg = some "unsize_into: more than one field to cast" ∧
+    mismatchMsg = some "unsizing requires identical ADT definitions" ∧
+    dispOk = true := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+
 /-! ## §7. Documented Cross-Authority Divergences & Modeling Notes
 
 Cross-authority divergences of `PROTOTYPE_REPORT.md` §5, as they surface on this
@@ -2699,16 +3009,20 @@ authority:
    `Stop.specPanic`.
 2. **No Tree Borrows read on safe `size_of_val(&dyn)` / `&raw const (*r)`**: the
    function-entry validity of `val : &dyn K` and the safe-reference check of a
-   raw borrow (`dvValidateDynPtr`, `refDataValidNoTB`) check liveness, bounds,
-   non-null and alignment only; a `Disabled` tag succeeds (keys `(3, 0)`,
-   `dv_extra_witnesses`), whereas reference unsizing and the virtual receiver's
-   function-entry retag do interact with Tree Borrows (`dvRetagReceiver`).
+   raw borrow (`dvValidateDynPtr ... checkTB := false`, `refDataValidNoTB`) check
+   liveness, bounds, non-null, inhabitedness, and alignment only; a `Disabled`
+   tag succeeds (keys `(3, 0)`, `dv_extra_witnesses`), whereas reference unsizing
+   (`dv_c2_tb_unsize_and_raw_mut_witness`) and virtual-call entry
+   (`dv_c3_and_raw_intrinsics_witness`, `dv_c16_witnesses`) enforce vendored
+   Tree Borrows permissions (`npApplyTreeBorrowsReadAt` / `npApplyTreeBorrowsWriteAt`)
+   and receiver protectors (`dvRetagReceiver`).
 3. **`&raw const (*r)` on a dead pointee**: this authority follows the
    `checkSafeRefDerefOk` convention adopted by the TCB (UB, `dv_extra_witnesses`);
    real Miri's place projection does not validate `r` before an access.
-4. **Uninhabited concrete types** (`kani#5216`): the captured
-   `isUninhabited` flag is carried into the concrete layout
-   (`dvConcreteLayout`); no corpus key exercises it.
+4. **Uninhabited concrete types** (`kani#5216`): `dvValidateDynPtr` enforces
+   `concreteLay.layout.uninhabited = false` on safe references, rejecting
+   `&! -> &dyn Trait` as `.ub` while accepting `*const ! -> *const dyn Trait`
+   (`dv_kani5216_uninhabited_witness`).
 5. **`Classical.choice`** enters only through vendored
    `Miri.Memory.MemoryState.empty` (the initial machine), never through a law.
 
@@ -2722,10 +3036,12 @@ Further modeling notes and known gaps of this authority:
   `.unsupported`).
 * The virtual receiver's Tree Borrows retag marks the whole receiver
   allocation (the corpus pointee) and its protector is not released on return.
-* `Pin<&mut T> -> Pin<&mut dyn Tr>` (`dvV1PinUnsizeMir`) is not executed: §0
-  captures no layout for `core::pin::Pin` (`layoutIdx 0`, empty layout table),
-  so the base translation cannot build the `Pin` aggregate; `Box` / other
-  `CoerceUnsized` targets fail closed (`C1`).
+* Direct `Cast.unsizeInto` `.adt` structural unsizing (`Pin<&mut u32> -> Pin<&mut dyn Tr>`,
+  negative 2-field `Pair`, negative mismatched `Pin -> Box`) and
+  `VirtualCalls.resolveVirtual` `DispatchFromDyn` receiver unwrapping are
+  verified directly through vendored `Miri.Interpreter` (`dv_pin_adt_unsize_and_dispatch_from_dyn_witness`);
+  full-body `dvV1PinUnsizeMir` does not run through the base translator because
+  §0 uses `emptyLayoutTable`.
 * The Tree Borrows write of a bare-dereference destination
   (`dvTreeBorrowsDerefWrite`) reuses `npApplyTreeBorrowsWriteAt`, whose UB message
   names `unwrapUnsafeBinder` places; the outcome class is what is observed.
