@@ -97,6 +97,24 @@ example : selfComparisonCheck cleanModule = true := by decide
 
 def fMissingName : ModuleData := { cleanModule with constNames := [1, 2, 3] }
 def fKeyMismatch : ModuleData := { cleanModule with constNames := [1, 3, 2, 4] }
+def fDuplicateConstName : ModuleData :=
+  { constNames := [1, 2, 3, 4, 2],
+    constants := cleanModule.constants ++ [.ctorInfo fixtureCtor0] }
+def fCrossInductRecRule : ModuleData :=
+  let otherInduct : InductMeta :=
+    { fixtureInduct with name := 10, all := [10], ctors := [11] }
+  let otherCtor : CtorMeta :=
+    { fixtureCtor0 with name := 11, type := .const 10, induct := 10, cidx := 0 }
+  let crossRec : RecMeta :=
+    { fixtureRec with
+        name := 12, all := [1],
+        rules := [{ ctor := 11, nfields := 0, rhs := .lam (.sort 0) (.bvar 0) }] }
+  { constNames := [1, 2, 3, 4, 10, 11, 12],
+    constants := cleanModule.constants ++
+      [.inductInfo otherInduct, .ctorInfo otherCtor, .recInfo crossRec] }
+def fDupRecAll : ModuleData :=
+  { constNames := [1, 2, 3, 4, 13],
+    constants := cleanModule.constants ++ [.recInfo { fixtureRec with name := 13, all := [1, 1] }] }
 def fOpenExpr : ModuleData :=
   { constNames := [1, 2, 3, 4],
     constants := [.inductInfo fixtureInduct, .ctorInfo { fixtureCtor0 with type := .fvar 0 },
@@ -137,6 +155,12 @@ example : fMissingName.constants = cleanModule.constants := rfl
 
 example : .missingConstNameEntry ∈ inductiveReplayViolations fMissingName cleanKenv := by decide
 example : .keyMismatch ∈ inductiveReplayViolations fKeyMismatch cleanKenv := by decide
+example : .duplicateConstName ∈ inductiveReplayViolations fDuplicateConstName cleanKenv := by decide
+example : .danglingRecursor ∈ inductiveReplayViolations fCrossInductRecRule cleanKenv := by decide
+example : .danglingRecursor ∈ inductiveReplayViolations fDupRecAll cleanKenv := by decide
+example : ForgedInductiveClass.all.length = 18 := rfl
+example : cleanModule.constNames = cleanModule.constants.map RConstInfo.name :=
+  inductiveReplayWellFormed_constNames_eq cleanModule_wellFormed
 example : .constantHasOpenExpr ∈ inductiveReplayViolations fOpenExpr cleanKenv := by decide
 example : .constantHasOpenExpr ∈ inductiveReplayViolations fLooseBVar cleanKenv := by decide
 example : .selfNotInAll ∈ inductiveReplayViolations forgedModule cleanKenv := by decide
@@ -250,6 +274,11 @@ example : monoAxioms rWorld 20 ∧ ∃ s ∈ [rShardA, rShardB], shardAxioms rWo
 
 example : ¬ CrossShardReconciled ceShards := naiveReconciliation_breaks_axiom_union.2.2.2.1
 example : NaiveReconciled ceShards := naiveReconciliation_breaks_axiom_union.2.2.1
+example : HashReconciled hceShards ∧ ¬ CrossShardReconciled hceShards :=
+  ⟨hashReconciliation_breaks_axiom_union.2.2.1, hashReconciliation_breaks_axiom_union.2.2.2.1⟩
+example : monoAxioms hceWorld 17 ∧ ¬ ∃ s ∈ hceShards, shardAxioms hceWorld s 17 :=
+  ⟨hashReconciliation_breaks_axiom_union.2.2.2.2.1,
+    hashReconciliation_breaks_axiom_union.2.2.2.2.2⟩
 
 /-! ## 4. Pillar 3 -/
 
@@ -296,6 +325,10 @@ example : ¬ FnDefGhostTokenGuard (.repeatCtx .closure 1 (.seq .skip .mintCall))
   fun h => absurd h.no_repeat_mint (by decide)
 example : ¬ UniqueAuthority (TokStmt.repeatCtx .forKw 2 .mintCall).mintedTokens :=
   repeatMint_soundness_collapse .forKw
+example : (evalTok fnDefDupProg ([], 0)).2 = 2 := by decide
+example : (evalTok (.seq (.callVar 0) (.bindFnDef 0)) ([], 0)).2 = 0 := by decide
+example : UniqueAuthority (List.range (evalTok (.seq .mintCall .skip) ([], 0)).2) :=
+  evalTok_unique_authority ⟨rfl, rfl, by decide⟩
 
 /-! ### Guard 5 -/
 
@@ -306,6 +339,8 @@ def dropSpec (externalBody hasDropImpl opaqueField modelsDrop noDropGlue : Bool)
 
 example : ¬ ExternalTypeDropGuard (dropSpec true true false true false) :=
   externalBody_rejected_even_with_modelsDrop rfl rfl
+example : ¬ ExternalTypeDropGuard (dropSpec true false true true false) :=
+  externalBody_rejected_for_opaque_field_even_with_modelsDrop rfl rfl rfl
 example : ¬ ExternalTypeDropGuard (dropSpec false false true false false) :=
   opaqueField_rejected_without_mitigation rfl rfl rfl
 example : ExternalTypeDropGuard (dropSpec false true true true false) :=
@@ -337,6 +372,8 @@ example : ¬ AssumptionPolarityGuard (.imp (.ite .assumesHold .tt .ff) (.atom 0)
 
 /-- Inlining is bounded: nine bindings fail closed. -/
 example : inlineLetAliases? (List.replicate 9 (0, .tt)) (.atom 0) = none := rfl
+example : ¬ LetAssumptionPolarityGuard (List.replicate 9 (0, .tt)) (.atom 0) :=
+  letAlias_depthExceeded_rejected (by decide)
 example : inlineLetAliases? (List.replicate 8 (0, .tt)) (.atom 0) = some .tt := by decide
 /-- A two-level alias chain is fully inlined before the polarity check. -/
 example : ¬ LetAssumptionPolarityGuard [(0, .assumesHold), (1, .not (.not (.atom 0)))]
@@ -404,6 +441,14 @@ example : ClientReach (effectiveExports { evenDecl with ctorPrivate := false } [
     ¬ ∀ v ∈ [3], (fun n : Nat => n % 2 = 0) v :=
   publicMk_soundness_collapse { evenDecl with ctorPrivate := false } [] rfl 3
     (by show ¬ (3 % 2 = 0); decide)
+
+def evenBadStep : PublicExport Nat :=
+  { kind := .transform, build := fun _ => none, step := fun n => some (n + 1) }
+
+example : ClientReach (effectiveExports evenDecl [evenSmart, evenBadStep]) [7, 6] ∧
+    ¬ ∀ v ∈ [7, 6], evenDecl.inv v :=
+  leakyTransform_soundness_collapse evenDecl [evenSmart, evenBadStep] evenSmart evenBadStep
+    (by simp) (by simp) 3 6 7 rfl rfl (by show ¬ (7 % 2 = 0); decide)
 
 /-! ## 5. Axiom pins -/
 
@@ -502,3 +547,19 @@ open Anneal.InductiveReplayAndPeerSpecGuards
 /-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.PeerSpecGuardClass.wire_table' does not depend on any axioms -/
 #guard_msgs (whitespace := lax) in
 #print axioms PeerSpecGuardClass.wire_table
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.inductiveReplayWellFormed_constNames_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms inductiveReplayWellFormed_constNames_eq
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.hashReconciliation_breaks_axiom_union' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms hashReconciliation_breaks_axiom_union
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.evalTok_unique_authority' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTok_unique_authority
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.leakyTransform_soundness_collapse' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms leakyTransform_soundness_collapse

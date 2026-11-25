@@ -595,8 +595,14 @@ def ctorListedInParent (env : Env) (C : CtorMeta) : Bool :=
   | some (.inductInfo I) => decide (C.name ∈ I.ctors)
   | _ => false
 
+def recRuleAnchored (env : Env) (all : List ConstName) (r : RecRule) : Bool :=
+  match lookup env r.ctor with
+  | some (.ctorInfo C) => decide (C.induct ∈ all)
+  | _ => false
+
 def recAnchored (env : Env) (R : RecMeta) : Bool :=
-  !R.all.isEmpty && R.all.all (isInductIn env) && R.rules.all (fun r => isCtorIn env r.ctor)
+  !R.all.isEmpty && decide R.all.Nodup && R.all.all (isInductIn env) &&
+    R.rules.all (recRuleAnchored env R.all)
 
 /-- Check `p` on every stored `.inductInfo`. -/
 def forallInduct (env : Env) (p : InductMeta → Bool) : Bool :=
@@ -833,6 +839,28 @@ theorem inductiveReplayWellFormed_block_anchored {md : ModuleData} {kenv : Env}
   · exact of_decide_eq_true (forallInduct_eq_true.mp (h .duplicateInAll) I hI)
   · exact of_decide_eq_true (forallInduct_eq_true.mp (h .duplicateInCtors) I hI)
 
+theorem list_eq_map_of_zip_all :
+    ∀ (ns : List ConstName) (cs : List RConstInfo),
+      ns.length = cs.length →
+      (ns.zip cs).all (fun p => p.1 == p.2.name) = true →
+      ns = cs.map RConstInfo.name
+  | [], [], _, _ => rfl
+  | _ :: _, [], hLen, _ => by cases hLen
+  | [], _ :: _, hLen, _ => by cases hLen
+  | n :: ns, c :: cs, hLen, hAll => by
+    simp only [List.zip_cons_cons, List.all_cons, Bool.and_eq_true, beq_iff_eq] at hAll
+    simp only [List.length_cons, Nat.add_right_cancel_iff] at hLen
+    rw [hAll.1, list_eq_map_of_zip_all ns cs hLen hAll.2]
+    rfl
+
+/-- Restoration: a well-formed module's `constNames` table is exact (no missing entries
+    and no key/constant name drift). -/
+theorem inductiveReplayWellFormed_constNames_eq {md : ModuleData} {kenv : Env}
+    (h : InductiveReplayWellFormed md kenv) :
+    md.constNames = md.constants.map RConstInfo.name :=
+  list_eq_map_of_zip_all md.constNames md.constants
+    (eq_of_beq (h .missingConstNameEntry)) (h .keyMismatch)
+
 /-! ### 2.1 Pre-replay self-comparison is tautological -/
 
 /-- The tautological check: compare each stored entry against the environment built from
@@ -906,10 +934,12 @@ def pinnedReplayEnv (md : ModuleData) : Env :=
 
 /-! ### 2.3 Every forged-inductive class is rejected with its exact code -/
 
-/-- The forged-inductive classes a binary `.olean` forgery can exhibit. -/
+/-- The forged-inductive classes a binary `.olean` forgery can exhibit (in bijection with
+    `InductiveReplayViolationCode`). -/
 inductive ForgedInductiveClass : Type where
   | missingConstNameEntry
   | keyMismatch
+  | duplicateConstName
   | openExpression
   | selfNotInAll
   | emptyAll
@@ -931,6 +961,7 @@ inductive ForgedInductiveClass : Type where
 def ForgedInductiveClass.code : ForgedInductiveClass → InductiveReplayViolationCode
   | .missingConstNameEntry => .missingConstNameEntry
   | .keyMismatch => .keyMismatch
+  | .duplicateConstName => .duplicateConstName
   | .openExpression => .constantHasOpenExpr
   | .selfNotInAll => .selfNotInAll
   | .emptyAll => .emptyAll
@@ -947,10 +978,26 @@ def ForgedInductiveClass.code : ForgedInductiveClass → InductiveReplayViolatio
   | .postReplayCtorDrift => .postReplayCtorMismatch
   | .postReplayRecDrift => .recursorMismatch
 
+def ForgedInductiveClass.all : List ForgedInductiveClass :=
+  [.missingConstNameEntry, .keyMismatch, .duplicateConstName, .openExpression,
+    .selfNotInAll, .emptyAll, .duplicateInAll, .nonInductInAll, .mutualMetadataMismatch,
+    .duplicateInCtors, .nonCtorInCtors, .wrongParentCtor, .wrongCidxCtor,
+    .danglingCtorInfo, .danglingRecInfo, .postReplayInductDrift, .postReplayCtorDrift,
+    .postReplayRecDrift]
+
+theorem ForgedInductiveClass.all_map_code :
+    ForgedInductiveClass.all.map ForgedInductiveClass.code = InductiveReplayViolationCode.all :=
+  rfl
+
+theorem ForgedInductiveClass.code_injective {a b : ForgedInductiveClass}
+    (h : a.code = b.code) : a = b := by
+  cases a <;> cases b <;> first | rfl | cases h
+
 /-- Semantic (Prop-level) description of each forgery class. -/
 def Exhibits : ForgedInductiveClass → ModuleData → Env → Prop
   | .missingConstNameEntry, md, _ => md.constNames.length ≠ md.constants.length
   | .keyMismatch, md, _ => ∃ p ∈ md.constNames.zip md.constants, p.1 ≠ p.2.name
+  | .duplicateConstName, md, _ => ¬ (md.constants.map RConstInfo.name).Nodup
   | .openExpression, md, _ => ∃ c ∈ md.constants, ∃ e ∈ c.exprs, e.isClosed = false
   | .selfNotInAll, md, _ => ∃ I, .inductInfo I ∈ md.constants ∧ I.name ∉ I.all
   | .emptyAll, md, _ => ∃ I, .inductInfo I ∈ md.constants ∧ I.all = []
@@ -979,8 +1026,9 @@ def Exhibits : ForgedInductiveClass → ModuleData → Env → Prop
       ∀ I, lookup md.constants C.induct = some (.inductInfo I) → C.name ∉ I.ctors
   | .danglingRecInfo, md, _ =>
     ∃ R, .recInfo R ∈ md.constants ∧
-      (R.all = [] ∨ (∃ n ∈ R.all, ∀ I, lookup md.constants n ≠ some (.inductInfo I)) ∨
-        ∃ r ∈ R.rules, ∀ C, lookup md.constants r.ctor ≠ some (.ctorInfo C))
+      (R.all = [] ∨ ¬ R.all.Nodup ∨
+        (∃ n ∈ R.all, ∀ I, lookup md.constants n ≠ some (.inductInfo I)) ∨
+        ∃ r ∈ R.rules, ∀ C, lookup md.constants r.ctor = some (.ctorInfo C) → C.induct ∉ R.all)
   | .postReplayInductDrift, md, kenv =>
     ∃ I, .inductInfo I ∈ md.constants ∧ lookup kenv I.name ≠ some (.inductInfo I)
   | .postReplayCtorDrift, md, kenv =>
@@ -1038,6 +1086,8 @@ theorem codeCheck_eq_false_of_exhibits {md : ModuleData} {kenv : Env}
   | keyMismatch =>
     obtain ⟨p, hp, hNe⟩ := h
     exact all_eq_false_of_mem hp (by simpa using hNe)
+  | duplicateConstName =>
+    exact decide_eq_false h
   | openExpression =>
     obtain ⟨c, hc, e, he, hOpen⟩ := h
     exact all_eq_false_of_mem hc (all_eq_false_of_mem he hOpen)
@@ -1095,11 +1145,18 @@ theorem codeCheck_eq_false_of_exhibits {md : ModuleData} {kenv : Env}
     obtain ⟨R, hR, hBad⟩ := h
     refine forallRec_eq_false hR ?_
     unfold recAnchored
-    rcases hBad with hNil | ⟨n, hn, hNone⟩ | ⟨r, hr, hNone⟩
+    rcases hBad with hNil | hDup | ⟨n, hn, hNone⟩ | ⟨r, hr, hBadRule⟩
     · simp [hNil]
+    · simp [decide_eq_false hDup]
     · rw [all_eq_false_of_mem hn (isInductIn_eq_false hNone)]
       simp
-    · rw [all_eq_false_of_mem hr (isCtorIn_eq_false hNone)]
+    · have hRule : recRuleAnchored md.constants R.all r = false := by
+        unfold recRuleAnchored
+        split
+        · rename_i C hC
+          exact decide_eq_false (hBadRule C hC)
+        · rfl
+      rw [all_eq_false_of_mem hr hRule]
       simp
   | postReplayInductDrift =>
     obtain ⟨I, hI, hNe⟩ := h
@@ -1537,6 +1594,68 @@ theorem orphanModule_breaks_axiom_union :
     have hClaim : Reach W.monoEnv W.roots ceClaim := .root (by decide) (by decide)
     exact .step hClaim (by decide) (by decide)
 
+/-- Fingerprint reconciliation: same-name constants across shards are `hashCompat`. -/
+def HashReconciled (shards : List AuditShard) : Prop :=
+  ∀ s₁ ∈ shards, ∀ s₂ ∈ shards, ∀ d₁ ∈ s₁.env, ∀ d₂ ∈ s₂.env,
+    d₁.name = d₂.name → hashCompat d₁ d₂ = true
+
+instance (shards : List AuditShard) : Decidable (HashReconciled shards) :=
+  inferInstanceAs (Decidable (∀ s₁ ∈ shards, ∀ s₂ ∈ shards, ∀ d₁ ∈ s₁.env, ∀ d₂ ∈ s₂.env,
+    d₁.name = d₂.name → hashCompat d₁ d₂ = true))
+
+/-- Two definitions with colliding `hash64` values (`7 * 31 + 9 = 226 = 17 * 13 + 5`):
+    `hcePureDefn` is axiom-free while `hceAxiomDefn` references axiom `17`. -/
+def hcePureDefn : RConstInfo := .defnInfo 7 0 (.const 1) (.natLit 7)
+def hceAxiomDefn : RConstInfo := .defnInfo 7 0 (.const 1) (.const 17)
+def hceHiddenAxiom : RConstInfo := .axiomInfo 17 0 (.sort 0)
+
+def hceWorld : ModuleWorld :=
+  { modules := [0, 1],
+    declsOf := fun m =>
+      if m = 0 then [ceClaim, hcePureDefn]
+      else if m = 1 then [hceAxiomDefn, hceHiddenAxiom]
+      else [] }
+
+def hceShardA : AuditShard := { modules := [0], env := [ceClaim, hcePureDefn] }
+def hceShardB : AuditShard := { modules := [1], env := [hceAxiomDefn, hceHiddenAxiom] }
+def hceShards : List AuditShard := [hceShardA, hceShardB]
+
+theorem hceWorld_monoAxiom : monoAxioms hceWorld 17 := by
+  refine ⟨hceHiddenAxiom, ?_, rfl, rfl⟩
+  have hClaim : Reach hceWorld.monoEnv hceWorld.roots ceClaim := .root (by decide) (by decide)
+  have hDefn : Reach hceWorld.monoEnv hceWorld.roots hceAxiomDefn :=
+    .step hClaim (by decide) (by decide)
+  exact .step hDefn (by decide) (by decide)
+
+theorem hceShards_no_shardAxiom : ¬ ∃ s ∈ hceShards, shardAxioms hceWorld s 17 := by
+  rintro ⟨s, hs, d, hReach, hAx, _⟩
+  simp only [hceShards, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with rfl | rfl
+  · have hd := hReach.mem_env
+    simp only [hceShardA, List.mem_cons, List.not_mem_nil, or_false] at hd
+    rcases hd with rfl | rfl <;> exact absurd hAx (by decide)
+  · have hNil : AuditShard.roots hceWorld hceShardB = [] := by decide
+    rw [hNil] at hReach
+    exact hReach.false_of_nil_roots
+
+/-- **Hash-based reconciliation breaks axiom-union parity.** Two `.defnInfo` entries of
+    the same name collide under `hash64` (`natLit 7` vs `const 17`); `HashReconciled`
+    accepts them, yet the monolithic audit reaches axiom `17` while no shard does. -/
+theorem hashReconciliation_breaks_axiom_union :
+    OrphanFreePartition hceWorld hceShards ∧ (∀ s ∈ hceShards, ShardLocalClosure hceWorld s) ∧
+      HashReconciled hceShards ∧ ¬ CrossShardReconciled hceShards ∧
+      monoAxioms hceWorld 17 ∧ ¬ ∃ s ∈ hceShards, shardAxioms hceWorld s 17 := by
+  refine ⟨⟨by decide, by decide⟩, ?_, by decide, ?_, hceWorld_monoAxiom, hceShards_no_shardAxiom⟩
+  · intro s hs
+    simp only [hceShards, List.mem_cons, List.not_mem_nil, or_false] at hs
+    rcases hs with rfl | rfl
+    · exact ⟨by decide, by decide, by decide⟩
+    · exact ⟨by decide, by decide, by decide⟩
+  · intro h
+    have := h hceShardA (by simp [hceShards]) hceShardB (by simp [hceShards]) hcePureDefn
+      (by decide) hceAxiomDefn (by decide) rfl
+    cases this
+
 /-! ## 4. Pillar 3 — Peer-Verifier Spec-Boundary Guards -/
 
 /-! ### 4.1 Guard 3 — unsatisfiable extern `ensures` (`creusot#2388`) -/
@@ -1767,6 +1886,84 @@ theorem fnDefGhostTokenGuard_unique_authority {p : TokStmt} (h : FnDefGhostToken
   have := List.mem_range.mp ht'
   omega
 
+/-- Flow-sensitive stateful execution of `TokStmt`: threads bound `FnDef` variables and
+    the minted-token count in execution order. -/
+def evalTokLoop (step : List Nat × Nat → List Nat × Nat) : Nat → List Nat × Nat → List Nat × Nat
+  | 0, st => st
+  | n + 1, st => evalTokLoop step n (step st)
+
+def evalTok : TokStmt → List Nat × Nat → List Nat × Nat
+  | .skip, st => st
+  | .mintCall, (fns, c) => (fns, c + 1)
+  | .bindFnDef x, (fns, c) => (x :: fns, c)
+  | .callVar x, (fns, c) => (fns, if x ∈ fns then c + 1 else c)
+  | .seq a b, st => evalTok b (evalTok a st)
+  | .repeatCtx _ n b, st => evalTokLoop (evalTok b) n st
+
+theorem evalTokLoop_snd_eq {step : List Nat × Nat → List Nat × Nat}
+    (hStep : ∀ st, (step st).2 = st.2) :
+    ∀ n st, (evalTokLoop step n st).2 = st.2
+  | 0, _ => rfl
+  | n + 1, st => by
+    simp only [evalTokLoop]
+    rw [evalTokLoop_snd_eq hStep n (step st), hStep st]
+
+theorem evalTokLoop_snd_ge {step : List Nat × Nat → List Nat × Nat}
+    (hStep : ∀ st, st.2 ≤ (step st).2) :
+    ∀ n st, st.2 ≤ (evalTokLoop step n st).2
+  | 0, _ => Nat.le_refl _
+  | n + 1, st => Nat.le_trans (hStep st) (evalTokLoop_snd_ge hStep n (step st))
+
+theorem evalTok_snd_ge : ∀ (p : TokStmt) (st : List Nat × Nat), st.2 ≤ (evalTok p st).2
+  | .skip, _ => Nat.le_refl _
+  | .mintCall, _ => Nat.le_succ _
+  | .bindFnDef _, _ => Nat.le_refl _
+  | .callVar x, (fns, c) => by
+    simp only [evalTok]
+    split <;> omega
+  | .seq a b, st => Nat.le_trans (evalTok_snd_ge a st) (evalTok_snd_ge b (evalTok a st))
+  | .repeatCtx _ n b, st => evalTokLoop_snd_ge (evalTok_snd_ge b) n st
+
+theorem evalTok_snd_le_mintSites :
+    ∀ (p : TokStmt) (st : List Nat × Nat),
+      p.noFnDefCoercion = true → p.mintFreeRepeats = true →
+      (evalTok p st).2 ≤ st.2 + p.mintSites
+  | .skip, _, _, _ => Nat.le_refl _
+  | .mintCall, _, _, _ => Nat.le_refl _
+  | .bindFnDef _, _, h, _ => by cases h
+  | .callVar _, _, h, _ => by cases h
+  | .seq a b, st, hNo, hRep => by
+    simp only [TokStmt.noFnDefCoercion, Bool.and_eq_true] at hNo
+    simp only [TokStmt.mintFreeRepeats, Bool.and_eq_true] at hRep
+    have ha := evalTok_snd_le_mintSites a st hNo.1 hRep.1
+    have hb := evalTok_snd_le_mintSites b (evalTok a st) hNo.2 hRep.2
+    simp only [evalTok, TokStmt.mintSites]
+    omega
+  | .repeatCtx _ n b, st, hNo, hRep => by
+    simp only [TokStmt.noFnDefCoercion] at hNo
+    simp only [TokStmt.mintFreeRepeats, Bool.and_eq_true, beq_iff_eq] at hRep
+    have hStep : ∀ s, (evalTok b s).2 = s.2 := by
+      intro s
+      have hLe := evalTok_snd_le_mintSites b s hNo hRep.2
+      have hGe := evalTok_snd_ge b s
+      omega
+    simp only [evalTok, TokStmt.mintSites, hRep.1, Nat.add_zero]
+    rw [evalTokLoop_snd_eq hStep n st]
+    exact Nat.le_refl _
+
+/-- **Flow-sensitive restoration**: under `FnDefGhostTokenGuard`, stateful execution
+    from an empty environment preserves linear token uniqueness. -/
+theorem evalTok_unique_authority {p : TokStmt} (h : FnDefGhostTokenGuard p) :
+    UniqueAuthority (List.range (evalTok p ([], 0)).2) := by
+  have hLe := evalTok_snd_le_mintSites p ([], 0) h.no_coercion h.no_repeat_mint
+  have hOne : (evalTok p ([], 0)).2 ≤ 1 := by
+    have := h.single_site
+    omega
+  intro t ht t' ht'
+  have := List.mem_range.mp ht
+  have := List.mem_range.mp ht'
+  omega
+
 /-- The guard admits the single direct call and rejects each bypass. -/
 theorem fnDefGhostTokenGuard_verdicts :
     FnDefGhostTokenGuard .mintCall ∧ ¬ FnDefGhostTokenGuard fnDefDupProg ∧
@@ -1899,6 +2096,16 @@ theorem externalBody_rejected_even_with_modelsDrop {s : ExternalTypeDropSpec}
     (hBody : s.externalBody = true) (hImpl : s.hasDropImpl = true) : ¬ ExternalTypeDropGuard s := by
   intro hG
   have := hG.no_external_body (by simp [ExternalTypeDropSpec.dropMayExist, hImpl])
+  rw [hBody] at this
+  cases this
+
+/-- `external_body` is also rejected on an opaque foreign field without `no_drop_glue`,
+    even when `models_drop` is claimed. -/
+theorem externalBody_rejected_for_opaque_field_even_with_modelsDrop {s : ExternalTypeDropSpec}
+    (hBody : s.externalBody = true) (hOpaque : s.opaqueForeignField = true)
+    (hGlue : s.noDropGlue = false) : ¬ ExternalTypeDropGuard s := by
+  intro hG
+  have := hG.no_external_body (by simp [ExternalTypeDropSpec.dropMayExist, hOpaque, hGlue])
   rw [hBody] at this
   cases this
 
@@ -2254,6 +2461,15 @@ theorem letAssumptionPolarityGuard_sound {bs : List (Nat × PropFormula)} {f : P
     exact assumptionsPolarityGuard_sound hPol ρ hVerified A
   · cases hg
 
+/-- **Fail-closed depth bound**: any `let`-alias chain exceeding `maxLetAliasDepth`
+    is rejected regardless of its body. -/
+theorem letAlias_depthExceeded_rejected {bs : List (Nat × PropFormula)} {f : PropFormula}
+    (hDeep : maxLetAliasDepth < bs.length) : ¬ LetAssumptionPolarityGuard bs f := by
+  rintro ⟨g, hg, _⟩
+  unfold inlineLetAliases? at hg
+  have hNotLe : ¬ bs.length ≤ maxLetAliasDepth := by omega
+  simp [hNotLe] at hg
+
 /-- **An alias hides a positive assumption**: `let h := assumesHold; h` passes the guard
     on its body alone, is rejected after inlining, and collapses. -/
 theorem letAlias_hides_positive_assumption :
@@ -2373,6 +2589,24 @@ theorem leakyExport_soundness_collapse {V : Type} (d : StructDecl V) (exps : Lis
     · exact he
     · exact List.mem_cons_of_mem _ he
   exact .build e r bad hMem hb .nil
+
+/-- **Collapse**: a non-invariant-preserving transform export breaks the invariant even
+    when all constructors start from valid values. -/
+theorem leakyTransform_soundness_collapse {V : Type} (d : StructDecl V)
+    (exps : List (PublicExport V)) (eBuild eStep : PublicExport V)
+    (heBuild : eBuild ∈ exps) (heStep : eStep ∈ exps) (r good bad : V)
+    (hb : eBuild.build r = some good) (hs : eStep.step good = some bad)
+    (hBad : ¬ d.inv bad) :
+    ClientReach (effectiveExports d exps) [bad, good] ∧ ¬ ∀ v ∈ [bad, good], d.inv v := by
+  have memEff : ∀ e ∈ exps, e ∈ effectiveExports d exps := by
+    intro e he
+    unfold effectiveExports
+    split
+    · exact he
+    · exact List.mem_cons_of_mem _ he
+  refine ⟨?_, fun h => hBad (h bad (List.mem_cons_self ..))⟩
+  exact .step eStep good bad (memEff eStep heStep) (List.mem_singleton.mpr rfl) hs
+    (.build eBuild r good (memEff eBuild heBuild) hb .nil)
 
 /-- Every leaking export kind is rejected by the guard. -/
 theorem leakKind_rejected {V : Type} {d : StructDecl V} {exps : List (PublicExport V)}

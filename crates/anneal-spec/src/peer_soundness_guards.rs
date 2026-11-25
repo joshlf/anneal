@@ -764,7 +764,15 @@ impl<'a> Lexer<'a> {
     }
 
     fn char_literal_end(&self, q: usize, start: usize) -> Result<usize, PeerScanError> {
-        let mut i = q + 2;
+        if q + 2 >= self.end {
+            return Err(PeerScanError::new(
+                PeerScanErrorKind::MalformedCharOrLifetime,
+                start,
+            ));
+        }
+        // Byte `q + 2` is the escaped byte itself (e.g. `'` in `'\''`), so the
+        // closing quote cannot appear before `q + 3`.
+        let mut i = q + 3;
         let limit = core::cmp::min(self.end, q + 2 + MAX_CHAR_ESCAPE_BYTES);
         while i < limit {
             if self.src.as_bytes()[i] == b'\'' {
@@ -1168,20 +1176,53 @@ fn path_last_ident<'a>(r: Lexer<'a>) -> Result<Option<&'a str>, PeerScanError> {
 
 const MAX_EVAL_DEPTH: usize = 32;
 
+const INT_SUFFIXES: [&str; 12] = [
+    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+];
+
 fn parse_int(text: &str) -> Option<u128> {
+    if text.contains('.') {
+        return None;
+    }
+    let (radix, digits) = if let Some(rest) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        (16u128, rest)
+    } else if let Some(rest) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
+        (8u128, rest)
+    } else if let Some(rest) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+        (2u128, rest)
+    } else {
+        (10u128, text)
+    };
     let mut v: u128 = 0;
     let mut any = false;
-    for ch in text.chars() {
-        match ch {
-            '0'..='9' => {
-                v = v.checked_mul(10)?.checked_add(ch as u128 - '0' as u128)?;
-                any = true;
-            }
-            '_' => {}
-            _ => break,
+    let mut tail_idx = digits.len();
+    for (idx, ch) in digits.char_indices() {
+        if ch == '_' {
+            continue;
+        }
+        let d = match ch {
+            '0'..='9' => Some(ch as u128 - '0' as u128),
+            'a'..='f' if radix == 16 => Some(ch as u128 - 'a' as u128 + 10),
+            'A'..='F' if radix == 16 => Some(ch as u128 - 'A' as u128 + 10),
+            _ => None,
+        };
+        if let Some(d) = d.filter(|&d| d < radix) {
+            v = v.checked_mul(radix)?.checked_add(d)?;
+            any = true;
+        } else {
+            tail_idx = idx;
+            break;
         }
     }
-    if any { Some(v) } else { None }
+    if !any {
+        return None;
+    }
+    let suffix = &digits[tail_idx..];
+    if suffix.is_empty() || INT_SUFFIXES.contains(&suffix) {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 /// Constant truth value of a clause body, when it is one.
@@ -1194,6 +1235,23 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
     }
     if let Some(inner) = whole_group(r, "{")? {
         return const_bool(inner, depth + 1);
+    }
+    if let Some((l, rr, _)) = split_first_top(r, &["<==>", "↔", "<->"], &[])? {
+        let a = const_bool(l, depth + 1)?;
+        let b = const_bool(rr, depth + 1)?;
+        return Ok(match (a, b) {
+            (Some(x), Some(y)) => Some(x == y),
+            _ => None,
+        });
+    }
+    if let Some((l, rr, _)) = split_first_top(r, &["==>", "→"], &[])? {
+        let a = const_bool(l, depth + 1)?;
+        let b = const_bool(rr, depth + 1)?;
+        return Ok(match (a, b) {
+            (Some(false), _) | (_, Some(true)) => Some(true),
+            (Some(true), Some(false)) => Some(false),
+            _ => None,
+        });
     }
     if let Some((l, rr, _)) = split_first_top(r, &["||", "∨"], &[])? {
         let a = const_bool(l, depth + 1)?;
@@ -1213,10 +1271,47 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
             _ => None,
         });
     }
+    if let Some((l, rr, op)) = split_first_top(r, &["==", "!="], &[])? {
+        if let (Some(a), Some(b)) = (const_bool(l, depth + 1)?, const_bool(rr, depth + 1)?) {
+            return Ok(Some(if op.text == "==" { a == b } else { a != b }));
+        }
+    }
     let mut c = r;
     let Some(t0) = c.next()? else { return Ok(None) };
     if t0.is_punct("!") || t0.is_punct("¬") || t0.is_kw("not") {
         return Ok(const_bool(r.range(c.pos, r.end), depth + 1)?.map(|b| !b));
+    }
+    if t0.is_kw("if") {
+        let cond_start = c.pos;
+        let mut open = None;
+        while let Some(t) = c.next()? {
+            if t.is_punct("{") {
+                open = Some(t);
+                break;
+            }
+            if t.is_open() {
+                skip_group(&mut c, &t)?;
+            }
+        }
+        if let Some(open) = open {
+            let then_start = c.pos;
+            let close = skip_group(&mut c, &open)?;
+            let cond = const_bool(r.range(cond_start, open.start), depth + 1)?;
+            if c.next_is_kw("else")? {
+                c.next()?;
+                let else_r = r.range(c.pos, r.end);
+                let then_r = r.range(then_start, close);
+                return match cond {
+                    Some(true) => const_bool(then_r, depth + 1),
+                    Some(false) => const_bool(else_r, depth + 1),
+                    None => match (const_bool(then_r, depth + 1)?, const_bool(else_r, depth + 1)?) {
+                        (Some(a), Some(b)) if a == b => Ok(Some(a)),
+                        _ => Ok(None),
+                    },
+                };
+            }
+        }
+        return Ok(None);
     }
     let rest_empty = c.is_empty()?;
     if (t0.is_kw("false") || t0.is_kw("False")) && rest_empty {
@@ -1507,6 +1602,17 @@ fn classify_spec_args<'a>(
                 "requires" | "pre" => {
                     handle_clause(ClauseKind::Requires, value, in_cfg, flags, visitor)?;
                 }
+                "trusted" | "assumed" => {
+                    if const_bool(value, 0)? != Some(false) {
+                        flags.trusted_like = true;
+                    }
+                }
+                "external_body" => {
+                    if const_bool(value, 0)? != Some(false) {
+                        flags.trusted_like = true;
+                        flags.external_body = true;
+                    }
+                }
                 s if is_diverging_name(s) => {
                     if const_bool(value, 0)? != Some(false) {
                         flags.diverging_claim = true;
@@ -1616,11 +1722,23 @@ fn classify_meta<'a>(
             }
         }
         "trusted" | "assumed" | "external" | "external_fn_specification" => {
-            flags.trusted_like = true;
+            let explicit_false = match value {
+                Some(v) => const_bool(v, 0)? == Some(false),
+                None => false,
+            };
+            if !explicit_false {
+                flags.trusted_like = true;
+            }
         }
         "external_body" => {
-            flags.trusted_like = true;
-            flags.external_body = true;
+            let explicit_false = match value {
+                Some(v) => const_bool(v, 0)? == Some(false),
+                None => false,
+            };
+            if !explicit_false {
+                flags.trusted_like = true;
+                flags.external_body = true;
+            }
         }
         "ensures" | "post" | "maintains" => {
             if let Some(a) = args {
@@ -1738,26 +1856,58 @@ struct FnSig<'a> {
     rest: Lexer<'a>,
 }
 
-fn type_is_uninhabited(r: Lexer<'_>) -> Result<bool, PeerScanError> {
+/// Returns whether the source locally defines `Infallible` (so bare `Infallible`
+/// must not be assumed uninhabited).
+fn shadows_infallible(src: &str) -> Result<bool, PeerScanError> {
+    let mut lx = Lexer::new(src, SourceDialect::Rust);
+    while let Some(t) = lx.next()? {
+        if t.is_kw("struct") || t.is_kw("type") || t.is_kw("union") || t.is_kw("enum") {
+            if let Some(name) = lx.peek()? {
+                if name.is_ident() && name.text == "Infallible" {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn type_is_uninhabited(r: Lexer<'_>, infallible_shadowed: bool) -> Result<bool, PeerScanError> {
     let mut c = r;
     match c.next()? {
         Some(t) if t.is_punct("!") => c.is_empty(),
         Some(t) if t.is_ident() || t.is_punct("::") => {
-            let mut last = if t.is_ident() { Some(t.text) } else { None };
+            let mut segs: [&str; 4] = [""; 4];
+            let mut len = 0usize;
+            if t.is_ident() {
+                segs[0] = t.text;
+                len = 1;
+            }
             while let Some(n) = c.next()? {
                 if n.is_ident() {
-                    last = Some(n.text);
+                    if len == segs.len() {
+                        return Ok(false);
+                    }
+                    segs[len] = n.text;
+                    len += 1;
                 } else if !n.is_punct("::") {
                     return Ok(false);
                 }
             }
-            Ok(last == Some("Infallible"))
+            Ok(match &segs[..len] {
+                ["Infallible"] => !infallible_shadowed,
+                ["core", "convert", "Infallible"] | ["std", "convert", "Infallible"] => true,
+                _ => false,
+            })
         }
         _ => Ok(false),
     }
 }
 
-fn scan_fn_signature<'a>(after_fn: Lexer<'a>) -> Result<Option<FnSig<'a>>, PeerScanError> {
+fn scan_fn_signature<'a>(
+    after_fn: Lexer<'a>,
+    infallible_shadowed: bool,
+) -> Result<Option<FnSig<'a>>, PeerScanError> {
     let mut c = after_fn;
     let Some(name) = c.next()? else {
         return Ok(None);
@@ -1797,7 +1947,7 @@ fn scan_fn_signature<'a>(after_fn: Lexer<'a>) -> Result<Option<FnSig<'a>>, PeerS
                 skip_group(&mut c, &t)?;
             }
         }
-        ret_uninhabited = type_is_uninhabited(after_fn.range(start, end))?;
+        ret_uninhabited = type_is_uninhabited(after_fn.range(start, end), infallible_shadowed)?;
     }
     while let Some(t) = c.peek()? {
         if t.is_punct("{") || t.is_punct(";") {
@@ -1813,6 +1963,27 @@ fn scan_fn_signature<'a>(after_fn: Lexer<'a>) -> Result<Option<FnSig<'a>>, PeerS
         ret_uninhabited,
         rest: c,
     }))
+}
+
+/// Advances `lx` past an `impl`/`trait`/`mod` header (skipping generics,
+/// parens/brackets, and `where` bounds) to its opening `{` or terminating `;`,
+/// without consuming `{` or `;`.
+fn skip_item_header_to_brace(lx: &mut Lexer<'_>) -> Result<(), PeerScanError> {
+    let mut angle = 0usize;
+    while let Some(t) = lx.peek()? {
+        if angle == 0 && (t.is_punct("{") || t.is_punct(";")) {
+            return Ok(());
+        }
+        lx.next()?;
+        if t.is_punct("<") {
+            angle += 1;
+        } else if t.is_punct(">") {
+            angle = angle.saturating_sub(1);
+        } else if t.is_open() {
+            skip_group(lx, &t)?;
+        }
+    }
+    Ok(())
 }
 
 /// One structure field.
@@ -1845,15 +2016,29 @@ fn parse_struct_item<'a>(after_kw: Lexer<'a>) -> Result<Option<StructItem<'a>>, 
         let at = lt.map_or(c.pos, |t| t.start);
         skip_angles(&mut c, at)?;
     }
+    let mut in_where = false;
+    let mut angle = 0usize;
     while let Some(t) = c.next()? {
-        if t.is_punct(";") {
+        if angle == 0 && t.is_punct(";") {
             return Ok(Some(StructItem {
                 name: name.text,
                 body: None,
                 tuple: false,
             }));
         }
-        if t.is_punct("(") || t.is_punct("{") {
+        if angle == 0 && t.is_kw("where") {
+            in_where = true;
+            continue;
+        }
+        if t.is_punct("<") {
+            angle += 1;
+            continue;
+        }
+        if t.is_punct(">") {
+            angle = angle.saturating_sub(1);
+            continue;
+        }
+        if angle == 0 && ((!in_where && t.is_punct("(")) || t.is_punct("{")) {
             let s = c.pos;
             let close = skip_group(&mut c, &t)?;
             return Ok(Some(StructItem {
@@ -1861,6 +2046,9 @@ fn parse_struct_item<'a>(after_kw: Lexer<'a>) -> Result<Option<StructItem<'a>>, 
                 body: Some(after_kw.range(s, close)),
                 tuple: t.is_punct("("),
             }));
+        }
+        if t.is_open() {
+            skip_group(&mut c, &t)?;
         }
     }
     Ok(None)
@@ -1927,7 +2115,11 @@ const PRIMITIVE_TYPES: [&str; 17] = [
 
 /// Whether a field type provably has no drop glue (primitives, references,
 /// raw pointers, `PhantomData`, and tuples / arrays of those).
-fn type_is_transparent(r: Lexer<'_>, depth: usize) -> Result<bool, PeerScanError> {
+fn type_is_transparent(
+    r: Lexer<'_>,
+    drops: &PairTable<'_, MAX_DROP_TYPES>,
+    depth: usize,
+) -> Result<bool, PeerScanError> {
     if depth > MAX_EVAL_DEPTH {
         return Ok(false);
     }
@@ -1939,7 +2131,7 @@ fn type_is_transparent(r: Lexer<'_>, depth: usize) -> Result<bool, PeerScanError
     if let Some(inner) = whole_group(r, "(")? {
         let mut parts = TopSplit::new(inner, true);
         while let Some(p) = parts.next_part()? {
-            if !type_is_transparent(p, depth + 1)? {
+            if !type_is_transparent(p, drops, depth + 1)? {
                 return Ok(false);
             }
         }
@@ -1950,19 +2142,33 @@ fn type_is_transparent(r: Lexer<'_>, depth: usize) -> Result<bool, PeerScanError
             Some((l, _, _)) => l,
             None => inner,
         };
-        return type_is_transparent(elem, depth + 1);
+        return type_is_transparent(elem, drops, depth + 1);
     }
-    let mut last: Option<&str> = None;
+    let mut segs: [&str; 4] = [""; 4];
+    let mut len = 0usize;
+    let mut saw_angle = false;
     while let Some(n) = c.next()? {
         if n.is_ident() {
-            last = Some(n.text);
+            if len == segs.len() {
+                return Ok(false);
+            }
+            segs[len] = n.text;
+            len += 1;
         } else if n.is_punct("<") {
-            return Ok(last == Some("PhantomData"));
+            saw_angle = true;
+            break;
         } else if !n.is_punct("::") {
             return Ok(false);
         }
     }
-    Ok(matches!(last, Some(l) if PRIMITIVE_TYPES.contains(&l)))
+    if saw_angle {
+        return Ok(match &segs[..len] {
+            ["PhantomData"] => !drops.contains_first("PhantomData"),
+            ["core", "marker", "PhantomData"] | ["std", "marker", "PhantomData"] => true,
+            _ => false,
+        });
+    }
+    Ok(len == 1 && PRIMITIVE_TYPES.contains(&segs[0]))
 }
 
 /// Fixed-capacity table of name pairs.
@@ -2066,6 +2272,7 @@ pub fn check_extern_ensures_false(
 
 /// Source scanner of Guard 3 over Rust source.
 pub fn check_extern_ensures_false_source(src: &str) -> GResult<()> {
+    let infallible_shadowed = shadows_infallible(src)?;
     let mut lx = Lexer::new(src, SourceDialect::Rust);
     let mut st = DelimStack::new();
     let mut pending = AttrFlags::default();
@@ -2116,7 +2323,7 @@ pub fn check_extern_ensures_false_source(src: &str) -> GResult<()> {
         }
         match t.text {
             "fn" => {
-                if let Some(sig) = scan_fn_signature(lx)? {
+                if let Some(sig) = scan_fn_signature(lx, infallible_shadowed)? {
                     let trusted = pending.trusted_like || trusted_depth.is_some();
                     if pending.diverging_claim && !sig.ret_uninhabited {
                         return violation(PeerViolationReason::LyingDivergence, sig.name.start);
@@ -2138,6 +2345,7 @@ pub fn check_extern_ensures_false_source(src: &str) -> GResult<()> {
             "impl" | "mod" | "trait" => {
                 if pending.trusted_like {
                     scope_pending = true;
+                    skip_item_header_to_brace(&mut lx)?;
                 }
                 pending = AttrFlags::default();
             }
@@ -2364,7 +2572,7 @@ fn parse_use_tree<'a>(
         }
         if t.is_punct("*") {
             lx.next()?;
-            if let Some(o) = cur {
+            if let Some(o) = cur.or(prev) {
                 *changed |= tables.glob_import(o, t.start)?;
             }
             return Ok(());
@@ -2433,7 +2641,9 @@ fn collect_ghost_ctors<'a>(src: &'a str, tables: &mut GhostTables<'a>) -> GResul
             if matches!(impl_scope, Some((_, d)) if st.depth() < d) {
                 impl_scope = None;
             }
-            pending_ctor = false;
+            if t.is_punct("}") {
+                pending_ctor = false;
+            }
             continue;
         }
         if t.is_punct(";") {
@@ -2510,6 +2720,8 @@ enum CtxKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CtxPhase {
+    /// Skipping a `for <pat> in` or `while let <pat> =` pattern before `Header`.
+    WaitFor(&'static str),
     /// Waiting for the body `{` at `depth` (the header itself counts).
     Header,
     /// Inside a braced body opened at `depth`.
@@ -2523,6 +2735,9 @@ struct Ctx {
     kind: CtxKind,
     phase: CtxPhase,
     depth: usize,
+    /// Whether `}` followed immediately by `{` transitions back to `Header`
+    /// (for `while { cond } { body }` and `for _ in { iter } { body }`).
+    allow_cond_block: bool,
 }
 
 const MAX_CTX: usize = 128;
@@ -2539,6 +2754,7 @@ impl CtxStack {
                 kind: CtxKind::FnOther,
                 phase: CtxPhase::Body,
                 depth: 0,
+                allow_cond_block: false,
             }; MAX_CTX],
             len: 0,
         }
@@ -2549,12 +2765,18 @@ impl CtxStack {
         kind: CtxKind,
         phase: CtxPhase,
         depth: usize,
+        allow_cond_block: bool,
         at: usize,
     ) -> Result<(), PeerScanError> {
         if self.len == MAX_CTX {
             return Err(PeerScanError::new(PeerScanErrorKind::NestingTooDeep, at));
         }
-        self.items[self.len] = Ctx { kind, phase, depth };
+        self.items[self.len] = Ctx {
+            kind,
+            phase,
+            depth,
+            allow_cond_block,
+        };
         self.len += 1;
         Ok(())
     }
@@ -2576,12 +2798,35 @@ impl CtxStack {
         }
     }
 
+    /// Transitions `WaitFor(target)` to `Header` when `target` is seen at `depth`.
+    fn on_token(&mut self, depth: usize, tok: &Tok<'_>) {
+        if let Some(top) = self.top() {
+            if let CtxPhase::WaitFor(target) = top.phase {
+                if top.depth == depth
+                    && ((tok.kind == TokKind::Ident && !tok.raw && tok.text == target)
+                        || (tok.kind == TokKind::Punct && tok.text == target))
+                {
+                    self.items[self.len - 1].phase = CtxPhase::Header;
+                }
+            }
+        }
+    }
+
     /// Delimiter depth dropped to `depth_after`.
-    fn on_close(&mut self, depth_after: usize) {
+    fn on_close(&mut self, depth_after: usize, next_is_lbrace: bool) {
         while let Some(top) = self.top() {
+            if top.phase == CtxPhase::Body
+                && depth_after == top.depth
+                && top.allow_cond_block
+                && next_is_lbrace
+            {
+                self.items[self.len - 1].phase = CtxPhase::Header;
+                self.items[self.len - 1].allow_cond_block = false;
+                break;
+            }
             let closed = match top.phase {
                 CtxPhase::Body => depth_after <= top.depth,
-                CtxPhase::Expr | CtxPhase::Header => depth_after < top.depth,
+                CtxPhase::Expr | CtxPhase::Header | CtxPhase::WaitFor(_) => depth_after < top.depth,
             };
             if !closed {
                 break;
@@ -2625,7 +2870,7 @@ fn starts_expression(prev: Option<Tok<'_>>) -> bool {
             (p.kind == TokKind::Punct
                 && matches!(
                     p.text,
-                    "(" | "[" | "{" | "," | ";" | "=" | "=>" | ":" | "+=" | "!"
+                    "(" | "[" | "{" | "," | ";" | "=" | "=>" | ":" | "+=" | "!" | "&" | "&&" | "*"
                 ))
                 || p.is_kw("move")
                 || p.is_kw("async")
@@ -2721,13 +2966,15 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
         }
         if t.is_close() {
             st.feed(&t)?;
-            ctx.on_close(st.depth());
+            let next_lbrace = t.is_punct("}") && lx.next_is_punct("{")?;
+            ctx.on_close(st.depth(), next_lbrace);
             if matches!(impl_scope, Some((_, d)) if st.depth() < d) {
                 impl_scope = None;
             }
             prev = Some(t);
             continue;
         }
+        ctx.on_token(st.depth(), &t);
         if t.is_punct(",") || t.is_punct(";") {
             ctx.on_separator(st.depth(), t.is_punct(";"));
             if t.is_punct(";") {
@@ -2756,11 +3003,15 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                 }
             }
             if lx.next_is_punct("->")? {
+                lx.next()?;
                 while let Some(n) = lx.peek()? {
                     if n.is_punct("{") {
                         break;
                     }
                     lx.next()?;
+                    if n.is_open() {
+                        skip_group(&mut lx, &n)?;
+                    }
                 }
             }
             let phase = if lx.next_is_punct("{")? {
@@ -2768,7 +3019,7 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
             } else {
                 CtxPhase::Expr
             };
-            ctx.push(CtxKind::Repeat, phase, st.depth(), t.start)?;
+            ctx.push(CtxKind::Repeat, phase, st.depth(), false, t.start)?;
             prev = Some(t);
             continue;
         }
@@ -2778,23 +3029,37 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                     if let Some(name) = lx.peek()? {
                         if name.is_ident() {
                             lx.next()?;
-                            let kind = if name.text == "main" {
+                            let kind = if name.text == "main" && st.depth() == 0 {
                                 CtxKind::FnMain
                             } else {
                                 CtxKind::FnOther
                             };
-                            ctx.push(kind, CtxPhase::Header, st.depth(), t.start)?;
+                            ctx.push(kind, CtxPhase::Header, st.depth(), false, t.start)?;
                             prev = Some(name);
                             continue;
                         }
                     }
                 }
-                "loop" | "while" => {
-                    ctx.push(CtxKind::Repeat, CtxPhase::Header, st.depth(), t.start)?;
+                "loop" => {
+                    ctx.push(CtxKind::Repeat, CtxPhase::Header, st.depth(), false, t.start)?;
+                }
+                "while" => {
+                    let phase = if lx.next_is_kw("let")? {
+                        CtxPhase::WaitFor("=")
+                    } else {
+                        CtxPhase::Header
+                    };
+                    ctx.push(CtxKind::Repeat, phase, st.depth(), true, t.start)?;
                 }
                 "for" => {
                     if !in_impl_header && !lx.next_is_punct("<")? {
-                        ctx.push(CtxKind::Repeat, CtxPhase::Header, st.depth(), t.start)?;
+                        ctx.push(
+                            CtxKind::Repeat,
+                            CtxPhase::WaitFor("in"),
+                            st.depth(),
+                            true,
+                            t.start,
+                        )?;
                     }
                 }
                 "async" => {
@@ -2803,7 +3068,7 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                         c.next()?;
                     }
                     if c.next_is_punct("{")? {
-                        ctx.push(CtxKind::Repeat, CtxPhase::Header, st.depth(), t.start)?;
+                        ctx.push(CtxKind::Repeat, CtxPhase::Header, st.depth(), false, t.start)?;
                     }
                 }
                 "impl" => {
@@ -2874,9 +3139,19 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                 }
             }
             if let (true, Some(ty)) = (closed, ty) {
-                if tables.is_ctor_type(ty) && c.eat_punct("::")? {
+                let is_self = ty == "Self";
+                if (is_self || tables.is_ctor_type(ty)) && c.eat_punct("::")? {
                     if let Some(m) = c.next()? {
-                        if m.is_ident() && tables.is_ctor_method(ty, m.text) {
+                        let is_ref = if is_self {
+                            m.is_ident()
+                                && match impl_scope {
+                                    Some((scope_ty, _)) => tables.is_ctor_method(scope_ty, m.text),
+                                    None => tables.any_ctor_method(m.text),
+                                }
+                        } else {
+                            m.is_ident() && tables.is_ctor_method(ty, m.text)
+                        };
+                        if is_ref {
                             reference = Some((t.start, c));
                         }
                     }
@@ -3035,26 +3310,42 @@ pub fn check_external_type_drop_omission_source(src: &str) -> GResult<()> {
                 if t.is_kw("enum") {
                     let mut c = body;
                     while let Some(n) = c.next()? {
+                        if n.is_punct("#") {
+                            if take_attribute(&mut c)?.is_some() {
+                                continue;
+                            }
+                        }
                         if n.is_punct("(") || n.is_punct("{") {
                             opaque = true;
-                            break;
-                        }
-                    }
-                    let mut c = body;
-                    while let Some(n) = c.next()? {
-                        if n.is_ident() && drops.contains_first(n.text) {
-                            field_drop = true;
+                            let s = c.pos;
+                            let close = skip_group(&mut c, &n)?;
+                            for_each_field(
+                                body.range(s, close),
+                                n.is_punct("("),
+                                &mut |field| {
+                                    if !type_is_transparent(field.ty, &drops, 0)? {
+                                        let mut f = field.ty;
+                                        while let Some(tok) = f.next()? {
+                                            if tok.is_ident() && drops.contains_first(tok.text) {
+                                                field_drop = true;
+                                            }
+                                        }
+                                    }
+                                    Ok(())
+                                },
+                            )?;
                         }
                     }
                 } else {
                     for_each_field(body, item.tuple, &mut |field| {
-                        if !type_is_transparent(field.ty, 0)? {
+                        let transparent = type_is_transparent(field.ty, &drops, 0)?;
+                        if !transparent {
                             opaque = true;
-                        }
-                        let mut c = field.ty;
-                        while let Some(n) = c.next()? {
-                            if n.is_ident() && drops.contains_first(n.text) {
-                                field_drop = true;
+                            let mut c = field.ty;
+                            while let Some(n) = c.next()? {
+                                if n.is_ident() && drops.contains_first(n.text) {
+                                    field_drop = true;
+                                }
                             }
                         }
                         Ok(())
@@ -3135,8 +3426,14 @@ pub const MAX_LET_ALIAS_DEPTH: usize = 8;
 
 const ASSUMPTION_ATOMS: [&str; 2] = ["assumes_hold", "assumesHold"];
 
-const BINDER_STOPS: [&str; 10] = [
+const LEAN_BINDER_STOPS: [&str; 10] = [
     "if", "let", "fun", "λ", "match", "∀", "∃", "forall", "exists", "Π",
+];
+
+/// In Rust, `if cond { .. } else { .. }` has braced branches, so it never
+/// absorbs a trailing top-level `==>` / `<==>` / `&&` / `||`.
+const RUST_BINDER_STOPS: [&str; 9] = [
+    "let", "fun", "λ", "match", "∀", "∃", "forall", "exists", "Π",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3237,6 +3534,10 @@ impl<'a> PolarityAnalyzer<'a> {
         if first.is_kw("let") {
             return self.analyze_let(r, cx);
         }
+        let stops: &[&str] = match r.dialect {
+            SourceDialect::Rust => &RUST_BINDER_STOPS,
+            SourceDialect::Lean => &LEAN_BINDER_STOPS,
+        };
         let iff: &[&str] = &["<==>", "↔", "<->", "iff"];
         let imp: &[&str] = match r.dialect {
             SourceDialect::Rust => &["==>"],
@@ -3244,7 +3545,7 @@ impl<'a> PolarityAnalyzer<'a> {
         };
         let or: &[&str] = &["||", "∨"];
         let and: &[&str] = &["&&", "∧"];
-        if let Some((l, rr, _)) = split_first_top(r, iff, &BINDER_STOPS)? {
+        if let Some((l, rr, _)) = split_first_top(r, iff, stops)? {
             let both = PCtx {
                 sign: Sign::Both(PeerViolationReason::AssumptionInIff),
                 ..cx
@@ -3252,7 +3553,7 @@ impl<'a> PolarityAnalyzer<'a> {
             self.analyze(l, both)?;
             return self.analyze(rr, both);
         }
-        if let Some((l, rr, _)) = split_first_top(r, imp, &BINDER_STOPS)? {
+        if let Some((l, rr, _)) = split_first_top(r, imp, stops)? {
             self.analyze(
                 l,
                 PCtx {
@@ -3264,7 +3565,7 @@ impl<'a> PolarityAnalyzer<'a> {
             return self.analyze(rr, cx);
         }
         for ops in [or, and] {
-            if let Some((l, rr, _)) = split_first_top(r, ops, &BINDER_STOPS)? {
+            if let Some((l, rr, _)) = split_first_top(r, ops, stops)? {
                 self.analyze(l, cx)?;
                 return self.analyze(rr, cx);
             }
@@ -3285,17 +3586,32 @@ impl<'a> PolarityAnalyzer<'a> {
         }
         if first.is_punct("∀")
             || first.is_kw("forall")
+            || first.is_kw("Π")
             || first.is_punct("∃")
             || first.is_kw("exists")
         {
-            let universal = first.is_punct("∀") || first.is_kw("forall");
+            let universal = first.is_punct("∀") || first.is_kw("forall") || first.is_kw("Π");
             return self.analyze_quantifier(r.range(c.pos, r.end), cx, universal);
         }
-        if let Some(inner) = whole_group(r, "(")? {
-            return self.analyze(inner, cx);
-        }
-        if let Some(inner) = whole_group(r, "{")? {
-            return self.analyze(inner, cx);
+        for open in ["(", "{", "⦃"] {
+            if let Some(inner) = whole_group(r, open)? {
+                if r.dialect == SourceDialect::Lean {
+                    if let Some((lhs, ty, _)) = split_first_top(inner, &[":"], stops)? {
+                        let mut lc = lhs;
+                        let is_binder_name = match lc.next()? {
+                            Some(n) if n.is_ident() && lc.is_empty()? => {
+                                !ASSUMPTION_ATOMS.contains(&n.text)
+                                    && self.lookup(n.text, self.aliases.len).is_none()
+                            }
+                            _ => false,
+                        };
+                        if is_binder_name {
+                            return self.analyze(ty, cx);
+                        }
+                    }
+                }
+                return self.analyze(inner, cx);
+            }
         }
         self.analyze_leaf(r, cx)
     }
@@ -3641,7 +3957,8 @@ const LEAN_DECL_KEYWORDS: [&str; 9] = [
 ];
 
 /// Source scanner of Guard 6a over Lean declarations: binders are negative
-/// and the declared type is positive.
+/// and the declared type (and unannotated `def`/`abbrev` or equation-style
+/// right-hand sides) is positive.
 pub fn check_assumption_polarity_lean_source(src: &str) -> GResult<()> {
     let mut lx = Lexer::new(src, SourceDialect::Lean);
     let mut st = DelimStack::new();
@@ -3661,20 +3978,26 @@ pub fn check_assumption_polarity_lean_source(src: &str) -> GResult<()> {
             continue;
         }
         let is_variable = t.text == "variable";
+        let is_def_like = matches!(t.text, "def" | "abbrev");
         let mut c = lx;
-        let sig_start = c.pos;
         let mut sig_end = c.end;
         let mut colon: Option<Tok<'_>> = None;
+        let mut saw_match = false;
+        let mut stopped_at: Option<Tok<'_>> = None;
         loop {
             let save = c;
             let Some(n) = c.next()? else { break };
+            if n.is_kw("match") {
+                saw_match = true;
+            }
             if n.is_punct(":=")
                 || n.is_kw("where")
-                || n.is_punct("|")
+                || (n.is_punct("|") && !saw_match)
                 || (n.is_ident() && LEAN_DECL_KEYWORDS.contains(&n.text))
                 || (is_variable && !n.is_open())
             {
                 sig_end = n.start;
+                stopped_at = Some(n);
                 c = save;
                 break;
             }
@@ -3695,7 +4018,67 @@ pub fn check_assumption_polarity_lean_source(src: &str) -> GResult<()> {
             let mut an = PolarityAnalyzer::new(SourceDialect::Lean);
             an.analyze(lx.range(col.end, sig_end), pos_cx)?;
         }
-        let _ = sig_start;
+        // Unannotated `def`/`abbrev := body` or equation-style `def ... | p => rhs`.
+        if is_def_like {
+            match stopped_at {
+                Some(tok) if tok.is_punct(":=") && colon.is_none() => {
+                    c.next()?;
+                    let body_start = c.pos;
+                    let mut body_end = c.end;
+                    loop {
+                        let save = c;
+                        let Some(n) = c.next()? else { break };
+                        if n.is_ident() && LEAN_DECL_KEYWORDS.contains(&n.text) {
+                            body_end = n.start;
+                            c = save;
+                            break;
+                        }
+                        if n.is_open() {
+                            skip_group(&mut c, &n)?;
+                        }
+                    }
+                    let mut an = PolarityAnalyzer::new(SourceDialect::Lean);
+                    an.analyze(lx.range(body_start, body_end), pos_cx)?;
+                }
+                Some(tok) if tok.is_punct("|") => {
+                    while let Some(bar) = c.peek()? {
+                        if !bar.is_punct("|") {
+                            break;
+                        }
+                        c.next()?;
+                        let mut arrow_end = None;
+                        while let Some(n) = c.next()? {
+                            if n.is_punct("=>") {
+                                arrow_end = Some(n.end);
+                                break;
+                            }
+                            if n.is_open() {
+                                skip_group(&mut c, &n)?;
+                            }
+                        }
+                        let Some(rhs_start) = arrow_end else { break };
+                        let mut rhs_end = c.end;
+                        loop {
+                            let save = c;
+                            let Some(n) = c.next()? else { break };
+                            if n.is_punct("|")
+                                || (n.is_ident() && LEAN_DECL_KEYWORDS.contains(&n.text))
+                            {
+                                rhs_end = n.start;
+                                c = save;
+                                break;
+                            }
+                            if n.is_open() {
+                                skip_group(&mut c, &n)?;
+                            }
+                        }
+                        let mut an = PolarityAnalyzer::new(SourceDialect::Lean);
+                        an.analyze(lx.range(rhs_start, rhs_end), pos_cx)?;
+                    }
+                }
+                _ => {}
+            }
+        }
         lx = c;
     }
     st.finish(src.len())?;
@@ -3747,24 +4130,192 @@ pub fn check_struct_sealing(
 
 const MAX_INVARIANT_STRUCTS: usize = 32;
 
+fn inv_entry_kind<'a>(
+    invs: &PairTable<'a, MAX_INVARIANT_STRUCTS>,
+    name: &str,
+) -> Option<&'a str> {
+    invs.entries()
+        .iter()
+        .find(|&&(n, _)| n == name)
+        .map(|&(_, k)| k)
+}
+
+fn collect_inv_use_aliases<'a>(
+    lx: &mut Lexer<'a>,
+    invs: &mut PairTable<'a, MAX_INVARIANT_STRUCTS>,
+    depth: usize,
+    changed: &mut bool,
+) -> GResult<()> {
+    if depth > MAX_META_DEPTH {
+        return Err(PeerScanError::new(PeerScanErrorKind::NestingTooDeep, lx.pos).into());
+    }
+    let mut cur: Option<&'a str> = None;
+    loop {
+        let Some(t) = lx.peek()? else { return Ok(()) };
+        if t.is_punct("::") {
+            lx.next()?;
+            continue;
+        }
+        if t.is_punct("{") {
+            lx.next()?;
+            loop {
+                let Some(n) = lx.peek()? else {
+                    return Err(PeerScanError::new(
+                        PeerScanErrorKind::UnbalancedDelimiter,
+                        t.start,
+                    )
+                    .into());
+                };
+                if n.is_punct("}") {
+                    lx.next()?;
+                    return Ok(());
+                }
+                if n.is_punct(",") {
+                    lx.next()?;
+                    continue;
+                }
+                let before = lx.pos;
+                collect_inv_use_aliases(lx, invs, depth + 1, changed)?;
+                if lx.pos == before {
+                    lx.next()?;
+                }
+            }
+        }
+        if t.is_ident() {
+            lx.next()?;
+            if !(t.text == "self" && !t.raw) {
+                cur = Some(t.text);
+            }
+            if lx.next_is_punct("::")? {
+                continue;
+            }
+            let Some(item) = cur else { return Ok(()) };
+            if lx.next_is_kw("as")? {
+                lx.next()?;
+                if let Some(a) = lx.next()? {
+                    if a.is_ident() && a.text != "_" {
+                        if let Some(kind) = inv_entry_kind(invs, item) {
+                            *changed |= invs.push(a.text, kind, a.start)?;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        return Ok(());
+    }
+}
+
+fn collect_inv_aliases<'a>(
+    src: &'a str,
+    invs: &mut PairTable<'a, MAX_INVARIANT_STRUCTS>,
+) -> GResult<bool> {
+    let mut lx = Lexer::new(src, SourceDialect::Rust);
+    let mut changed = false;
+    while let Some(t) = lx.next()? {
+        if t.is_punct("#") {
+            take_attribute(&mut lx)?;
+            continue;
+        }
+        if t.is_kw("use") {
+            collect_inv_use_aliases(&mut lx, invs, 0, &mut changed)?;
+        } else if t.is_kw("type") {
+            let mut c = lx;
+            let Some(alias) = c.next()? else { continue };
+            if !alias.is_ident() {
+                continue;
+            }
+            if c.next_is_punct("<")? {
+                let lt = c.next()?;
+                let at = lt.map_or(c.pos, |x| x.start);
+                skip_angles(&mut c, at)?;
+            }
+            if !c.eat_punct("=")? {
+                continue;
+            }
+            let start = c.pos;
+            let mut end = c.end;
+            while let Some(n) = c.next()? {
+                if n.is_punct(";") {
+                    end = n.start;
+                    break;
+                }
+            }
+            if let Some(target) = path_last_ident(lx.range(start, end))? {
+                if alias.text != target {
+                    if let Some(kind) = inv_entry_kind(invs, target) {
+                        changed |= invs.push(alias.text, kind, alias.start)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(changed)
+}
+
 fn body_constructs_raw<'a>(
     body: Lexer<'a>,
     invs: &PairTable<'a, MAX_INVARIANT_STRUCTS>,
-    self_is_inv: bool,
+    self_kind: Option<&'a str>,
 ) -> Result<Option<usize>, PeerScanError> {
     let mut c = body;
     let mut prev: Option<Tok<'a>> = None;
     while let Some(t) = c.next()? {
-        let named =
-            t.is_ident() && (invs.contains_first(t.text) || (self_is_inv && t.is_kw("Self")));
+        let kind = if t.is_ident() {
+            if let Some(k) = inv_entry_kind(invs, t.text) {
+                Some(k)
+            } else if t.is_kw("Self") {
+                self_kind
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let pattern_ctx = matches!(prev, Some(p) if p.is_kw("let") || p.is_punct("|"));
-        if named && !pattern_ctx {
-            let mut probe = c;
-            if let Some(open) = probe.next()? {
-                if open.is_punct("{") || open.is_punct("(") {
-                    skip_group(&mut probe, &open)?;
-                    if !probe.next_is_punct("=>")? && !probe.next_is_punct("=")? {
-                        return Ok(Some(t.start));
+        if let Some(k) = kind {
+            if !pattern_ctx {
+                let mut probe = c;
+                let mut had_turbofish = false;
+                if probe.eat_punct("::")? && probe.next_is_punct("<")? {
+                    let lt = probe.next()?;
+                    let at = lt.map_or(probe.pos, |x| x.start);
+                    skip_angles(&mut probe, at)?;
+                    had_turbofish = true;
+                } else {
+                    probe = c;
+                }
+                if let Some(open) = probe.next()? {
+                    if open.is_punct("{") || open.is_punct("(") {
+                        skip_group(&mut probe, &open)?;
+                        if !probe.next_is_punct("=>")? && !probe.next_is_punct("=")? {
+                            return Ok(Some(t.start));
+                        }
+                    }
+                }
+                // A tuple struct's name is also a value-namespace constructor
+                // function (`let mk = Positive;`, `xs.map(Positive)`, `Positive::<T>`).
+                if k == "T" {
+                    let type_ctx = matches!(
+                        prev,
+                        Some(p)
+                            if p.is_punct(":")
+                                || p.is_punct("->")
+                                || p.is_punct("<")
+                                || p.is_kw("as")
+                                || p.is_kw("impl")
+                                || p.is_kw("for")
+                                || p.is_kw("where")
+                                || p.is_kw("struct")
+                                || p.is_kw("type")
+                    );
+                    let method_path = !had_turbofish && c.next_is_punct("::")?;
+                    let is_generic_type_arg = c.next_is_punct("<")?;
+                    let is_pattern_eq = c.next_is_punct("=>")?;
+                    if !type_ctx && !method_path && !is_generic_type_arg && !is_pattern_eq {
+                        if had_turbofish || starts_expression(prev) {
+                            return Ok(Some(t.start));
+                        }
                     }
                 }
             }
@@ -3803,7 +4354,7 @@ pub fn check_struct_sealing_source(src: &str) -> GResult<()> {
                 let Some(item) = parse_struct_item(lx)? else {
                     continue;
                 };
-                invs.push(item.name, "", t.start)?;
+                invs.push(item.name, if item.tuple { "T" } else { "N" }, t.start)?;
                 if flags.derive_default {
                     return violation(PeerViolationReason::InvariantDeriveDefault, t.start);
                 }
@@ -3821,8 +4372,14 @@ pub fn check_struct_sealing_source(src: &str) -> GResult<()> {
     if invs.len == 0 {
         return Ok(());
     }
-    // Pass 2 (iterated): `impl Default`, public raw constructors, and public
-    // functions forwarding to private raw-constructing helpers (transitively).
+    for _ in 0..MAX_INVARIANT_STRUCTS {
+        if !collect_inv_aliases(src, &mut invs)? {
+            break;
+        }
+    }
+    // Pass 2 (iterated): `impl Default`, public raw constructors, private
+    // tainted `const`/`static` values, and public functions forwarding to
+    // private raw-constructing helpers (transitively).
     let mut tainted: PairTable<'_, MAX_TAINTED_HELPERS> = PairTable::new();
     for _ in 0..=MAX_TAINTED_HELPERS {
         if !sealing_pass(src, &invs, &mut tainted)? {
@@ -3834,16 +4391,40 @@ pub fn check_struct_sealing_source(src: &str) -> GResult<()> {
 
 const MAX_TAINTED_HELPERS: usize = 32;
 
-/// Whether `body` calls a tainted helper (`raw(..)`, `Self::raw(..)`, `self.raw(..)`).
+/// Whether `body` calls or coerces a tainted helper (`raw(..)`,
+/// `Self::raw::<T>(..)`, `Self::raw`) or references a tainted `const`/`static`.
 fn body_calls_tainted<'a>(
     body: Lexer<'a>,
     tainted: &PairTable<'a, MAX_TAINTED_HELPERS>,
 ) -> Result<Option<usize>, PeerScanError> {
     let mut c = body;
+    let mut prev: Option<Tok<'a>> = None;
     while let Some(t) = c.next()? {
-        if t.is_ident() && tainted.contains_first(t.text) && c.next_is_punct("(")? {
-            return Ok(Some(t.start));
+        if t.is_ident() {
+            if let Some(&(_, kind)) = tainted.entries().iter().find(|&&(n, _)| n == t.text) {
+                let mut probe = c;
+                if probe.eat_punct("::")? && probe.next_is_punct("<")? {
+                    let lt = probe.next()?;
+                    let at = lt.map_or(probe.pos, |x| x.start);
+                    skip_angles(&mut probe, at)?;
+                } else {
+                    probe = c;
+                }
+                if probe.next_is_punct("(")? {
+                    return Ok(Some(t.start));
+                }
+                let def_pos = matches!(prev, Some(p) if p.is_kw("fn") || p.is_kw("let") || p.is_kw("const") || p.is_kw("static"));
+                if !def_pos {
+                    if kind == "V"
+                        || matches!(prev, Some(p) if p.is_punct("::"))
+                        || starts_expression(prev)
+                    {
+                        return Ok(Some(t.start));
+                    }
+                }
+            }
         }
+        prev = Some(t);
     }
     Ok(None)
 }
@@ -3913,9 +4494,13 @@ fn sealing_pass<'a>(
             }
             in_impl_header = true;
             impl_pending = h;
+            skip_item_header_to_brace(&mut lx)?;
             continue;
         }
-        let self_is_inv = matches!(impl_scope, Some((h, _)) if invs.contains_first(h.self_ty));
+        let self_kind = match impl_scope {
+            Some((h, _)) => inv_entry_kind(invs, h.self_ty),
+            None => None,
+        };
         let trait_impl = matches!(impl_scope, Some((h, _)) if h.trait_last.is_some());
         if t.is_kw("fn") {
             let public = pending_pub || trait_impl;
@@ -3925,7 +4510,7 @@ fn sealing_pass<'a>(
             if gated {
                 continue;
             }
-            let Some(sig) = scan_fn_signature(lx)? else {
+            let Some(sig) = scan_fn_signature(lx, false)? else {
                 continue;
             };
             let mut c = sig.rest;
@@ -3936,7 +4521,7 @@ fn sealing_pass<'a>(
             let s = c.pos;
             let close = skip_group(&mut c, &open)?;
             let body = lx.range(s, close);
-            let hit = match body_constructs_raw(body, invs, self_is_inv)? {
+            let hit = match body_constructs_raw(body, invs, self_kind)? {
                 Some(at) => Some(at),
                 None => body_calls_tainted(body, tainted)?,
             };
@@ -3944,18 +4529,24 @@ fn sealing_pass<'a>(
                 if public {
                     return violation(PeerViolationReason::InvariantRawPublicConstructor, at);
                 }
-                changed |= tainted.push(sig.name.text, "", sig.name.start)?;
+                changed |= tainted.push(sig.name.text, "F", sig.name.start)?;
             }
             continue;
         }
-        if (t.is_kw("const") || t.is_kw("static")) && pending_pub && !lx.next_is_kw("fn")? {
+        if (t.is_kw("const") || t.is_kw("static")) && !lx.next_is_kw("fn")? {
+            let public = pending_pub;
             let gated = pending.smart_constructor;
             pending = AttrFlags::default();
             pending_pub = false;
             let mut c = lx;
-            let start = c.pos;
+            let item_name = c.next()?;
+            let mut eq_pos = None;
             let mut end = c.end;
             while let Some(n) = c.next()? {
+                if n.is_punct("=") && eq_pos.is_none() {
+                    eq_pos = Some(n.end);
+                    continue;
+                }
                 if n.is_punct(";") {
                     end = n.start;
                     break;
@@ -3965,13 +4556,23 @@ fn sealing_pass<'a>(
                 }
             }
             if !gated {
-                let init = lx.range(start, end);
-                let hit = match body_constructs_raw(init, invs, self_is_inv)? {
-                    Some(at) => Some(at),
-                    None => body_calls_tainted(init, tainted)?,
-                };
-                if let Some(at) = hit {
-                    return violation(PeerViolationReason::InvariantRawPublicConstructor, at);
+                if let Some(init_start) = eq_pos {
+                    let init = lx.range(init_start, end);
+                    let hit = match body_constructs_raw(init, invs, self_kind)? {
+                        Some(at) => Some(at),
+                        None => body_calls_tainted(init, tainted)?,
+                    };
+                    if let Some(at) = hit {
+                        if public {
+                            return violation(
+                                PeerViolationReason::InvariantRawPublicConstructor,
+                                at,
+                            );
+                        }
+                        if let Some(n) = item_name.filter(|n| n.is_ident()) {
+                            changed |= tainted.push(n.text, "V", n.start)?;
+                        }
+                    }
                 }
             }
         }
@@ -5189,6 +5790,256 @@ mod tests {
         assert_eq!(
             err.violation().map(|x| x.guard()),
             Some(PeerSpecGuardClass::UnsatisfiableExternEnsures)
+        );
+    }
+
+    // --- Pass B1 red-team regression tests ------------------------------------
+
+    #[test]
+    fn lexer_handles_escaped_quotes_and_backslashes() {
+        let src = r#"
+            const Q: char = '\'';
+            const BS: char = '\\';
+            const BQ: u8 = b'\'';
+            const BBS: u8 = b'\\';
+            const U: char = '\u{10FFFF}';
+            #[trusted] #[ensures(false)] fn read_after_quotes() -> u8;
+        "#;
+        assert_eq!(g3(src), Some(R::EnsuresFalseOnReturningFn));
+    }
+
+    #[test]
+    fn g3_catches_colon_bool_qualifiers_and_hex_float_requires_bypass() {
+        // `anneal_spec` colon syntax `trusted: true`, `assumed: true`, `external_body: true`.
+        assert_eq!(
+            g3("#[spec(trusted: true, ensures: |r| false)] fn f() -> u8 { 0 }"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[spec(assumed: true, ensures: false)] fn f() -> u8 { 0 }"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[spec(external_body: true, ensures: false)] fn f() -> u8 { 0 }"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[spec(trusted: false, ensures: false)] fn f() -> u8 { loop {} }"),
+            None
+        );
+        // Hex / binary / float literals in `requires` must never falsely fold to `false`.
+        assert_eq!(
+            g3("#[trusted] #[requires(0x0 != 0x1)] #[ensures(false)] fn read() -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[trusted] #[requires(0b0 != 0b1)] #[ensures(false)] fn read() -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[trusted] #[requires(1.0 != 1.5)] #[ensures(false)] fn read() -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        // Genuine hex contradiction in `ensures` is caught.
+        assert_eq!(
+            g3("#[trusted] #[ensures(0x0 == 0x1)] fn read() -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        // Constant implication / iff / bool equality / if-const false clauses.
+        for clause in [
+            "true ==> false",
+            "true <==> false",
+            "true == false",
+            "false != false",
+            "if true { false } else { true }",
+        ] {
+            let src = std::format!("#[trusted] #[ensures({clause})] fn read() -> u8;");
+            assert_eq!(g3(&src), Some(R::EnsuresFalseOnReturningFn), "{clause}");
+        }
+    }
+
+    #[test]
+    fn g3_rejects_const_generic_scope_escape_and_shadowed_infallible() {
+        // `{ 1 }` inside `impl<...>` must not prematurely close `#[extern_spec]` scope.
+        let src = "#[extern_spec] impl<T: Trait<{ 1 }>> Foo<T> { #[ensures(false)] fn read() -> u8; }";
+        assert_eq!(g3(src), Some(R::EnsuresFalseOnReturningFn));
+        // Local `struct Infallible(u8)` must not spoof `core::convert::Infallible`.
+        let shadowed = "struct Infallible(u8); #[trusted] #[ensures(false)] fn read() -> Infallible;";
+        assert_eq!(g3(shadowed), Some(R::EnsuresFalseOnReturningFn));
+        let shadowed_type = "type Infallible = u8; #[trusted] #[ensures(false)] fn read() -> Infallible;";
+        assert_eq!(g3(shadowed_type), Some(R::EnsuresFalseOnReturningFn));
+        let qualified = "struct Infallible(u8); #[trusted] #[ensures(false)] fn abort() -> core::convert::Infallible;";
+        assert_eq!(g3(qualified), None);
+    }
+
+    #[test]
+    fn g4_catches_b1_red_team_bypasses() {
+        // UFCS `<Self as Trait>::new` and `<Self>::new` inside `impl Tokens`.
+        assert_eq!(
+            g4("impl Tokens { fn leak() { let f = <Self as Mint>::new; } }"),
+            Some(R::FnDefValueCoercion)
+        );
+        assert_eq!(
+            g4("impl Tokens { fn leak() { <Self>::new(); } }"),
+            Some(R::MintOutsideMain)
+        );
+        // Closure behind `&` / `&&`.
+        assert_eq!(
+            g4("fn main() { let f: &dyn Fn() -> Tokens = &|| Tokens::new(); f(); f(); }"),
+            Some(R::MintInRepeatingContext)
+        );
+        assert_eq!(
+            g4("fn main() { let f = &&|_| Tokens::new(); }"),
+            Some(R::MintInRepeatingContext)
+        );
+        // `while let Pat { a }` / `for Pat { a } in` / `while { cond } { body }`.
+        assert_eq!(
+            g4("fn main() { while let Foo { a } = next() { Tokens::new(); } }"),
+            Some(R::MintInRepeatingContext)
+        );
+        assert_eq!(
+            g4("fn main() { for Foo { a } in iter { Tokens::new(); } }"),
+            Some(R::MintInRepeatingContext)
+        );
+        assert_eq!(
+            g4("fn main() { while { cond() } { Tokens::new(); } }"),
+            Some(R::MintInRepeatingContext)
+        );
+        // Closure return type containing `[T; { 1 }]` must not desync delimiters.
+        assert_eq!(
+            g4("fn main() { let f = || -> [Tokens; { 1 }] { [Tokens::new()] }; }"),
+            Some(R::MintInRepeatingContext)
+        );
+        // `use crate::Tokens::{*};` braced glob import.
+        assert_eq!(
+            g4("use crate::Tokens::{*}; fn main() { let f = new; }"),
+            Some(R::FnDefValueCoercion)
+        );
+        // `fn main` inside `impl` / `mod` is NOT the crate entry point.
+        assert_eq!(
+            g4("struct S; impl S { pub fn main(&self) { let _t = Tokens::new(); } } fn c(s: &S) { s.main(); s.main(); }"),
+            Some(R::MintOutsideMain)
+        );
+        assert_eq!(
+            g4("mod sub { pub fn main() { let _t = Tokens::new(); } }"),
+            Some(R::MintOutsideMain)
+        );
+        // `#[ghost_token_ctor] pub(crate) fn issue()` must survive `)` in `pub(crate)`.
+        let pub_crate = "impl Vault { #[ghost_token_ctor] pub(crate) fn issue() -> Self { Vault } } fn main() { let f = Vault::issue; }";
+        assert_eq!(
+            reason(check_fndef_ghost_token_coercion_source(pub_crate, &[])),
+            Some(R::FnDefValueCoercion)
+        );
+    }
+
+    #[test]
+    fn g5_catches_where_fn_bound_and_handles_transparent_refs_to_drop_types() {
+        // `where T: Fn(u8)` must not be mistaken for a tuple struct body!
+        let where_fn = "#[verifier::external_type_specification] #[verifier::external_body] pub struct Ex<T> where T: Fn(u8) { f: std::fs::File }";
+        assert_eq!(g5(where_fn), Some(R::ExternalBodyWithDrop));
+        // Transparent reference/pointer to a `Drop` type does not itself run `Drop`.
+        let ref_to_drop = "struct Guard; impl Drop for Guard { fn drop(&mut self) {} } #[verifier::external_type_specification] #[no_drop_glue] struct ExRef<'a>(&'a Guard);";
+        assert_eq!(g5(ref_to_drop), None);
+        // Local `struct PhantomData` with `Drop` is NOT transparent.
+        let fake_phantom = "struct PhantomData<T>(T); impl<T> Drop for PhantomData<T> { fn drop(&mut self) {} } #[verifier::external_type_specification] #[verifier::external_body] struct ExP<T>(PhantomData<T>);";
+        assert_eq!(g5(fake_phantom), Some(R::ExternalBodyWithDrop));
+        // Fieldless enum with `#[allow(...)]` on a variant has no payload fields.
+        let fieldless_enum = "#[verifier::external_type_specification] #[verifier::external_body] enum ExTag { #[allow(dead_code)] A, B }";
+        assert_eq!(g5(fieldless_enum), None);
+    }
+
+    #[test]
+    fn g6a_catches_if_before_implication_and_lean_match_and_abbrev() {
+        use Polarity::*;
+        use SourceDialect::{Lean, Rust};
+        // `if cond { !assumes_hold } else { true } ==> Q` puts `!assumes_hold` in antecedent.
+        assert_eq!(
+            expr("if cond { !assumes_hold } else { true } ==> Q", Rust, Positive),
+            Some(R::AssumptionNegatedAntecedent)
+        );
+        // Lean dependent arrow `(h : assumesHold) → P` is clean; negated is rejected.
+        assert_eq!(expr("(h : assumesHold) → P", Lean, Positive), None);
+        assert_eq!(
+            expr("(h : ¬ assumesHold) → P", Lean, Positive),
+            Some(R::AssumptionNegatedAntecedent)
+        );
+        assert_eq!(expr("Π (h : assumesHold), P", Lean, Positive), None);
+        assert_eq!(
+            expr("Π (h : ¬ assumesHold), P", Lean, Positive),
+            Some(R::AssumptionNegatedAntecedent)
+        );
+        // `match ... with | 0 => assumesHold` inside a theorem type must not truncate at `|`.
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source(
+                "theorem t (x : Nat) : match x with | 0 => assumesHold | _ => True := trivial"
+            )),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        // Unannotated `abbrev` and equation-style `def` bodies are checked.
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source("abbrev Bad := assumesHold")),
+            Some(R::AssumptionPositive)
+        );
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source(
+                "def f : Nat → Prop | 0 => assumesHold | _ => True"
+            )),
+            Some(R::AssumptionPositive)
+        );
+    }
+
+    #[test]
+    fn g6b_catches_aliases_turbofish_tuple_fn_coercion_const_taint_and_where_bounds() {
+        // `where T: Fn(u32)` must not hide `{ pub x: T }`.
+        assert_eq!(
+            g6b("#[invariant(self.x > 0)] pub struct R<T> where T: Fn(u32) { pub x: T }"),
+            Some(R::InvariantPubField)
+        );
+        // Type alias & `use ... as` alias leaks.
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); type P = Pos; pub fn leak() -> P { P(0) }"),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); type P = Pos; impl Default for P { fn default() -> Self { Self(0) } }"),
+            Some(R::InvariantDefaultImpl)
+        );
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); use self::Pos as P; impl P { pub fn leak() -> Self { Self(0) } }"),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // Turbofish raw construction.
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos<T>(u32, core::marker::PhantomData<T>); pub fn leak<T>() -> Pos<T> { Pos::<T>(0, core::marker::PhantomData) }"),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // Tuple-struct constructor coerced as a function value.
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); pub fn leak() -> fn(u32) -> Pos { Pos }"),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); pub fn leak(x: u32) -> Pos { let mk = Pos; mk(x) }"),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // Tainted private helper called via turbofish or coerced as a fn value.
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); impl Pos { fn raw<T>(x: u32) -> Self { Self(x) } pub fn leak(x: u32) -> Self { Self::raw::<()>(x) } }"),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); impl Pos { fn raw(x: u32) -> Self { Self(x) } pub fn leak() -> fn(u32) -> Self { Self::raw } }"),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // Private `const` holding a raw construction leaked by a public fn.
+        assert_eq!(
+            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); const BAD: Pos = Pos(0); pub fn leak() -> Pos { BAD }"),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // Const generic `{ 1 }` inside `impl` header must not drop `self_kind`.
+        assert_eq!(
+            g6b("#[invariant(self.lo <= self.hi)] pub struct R<T> { lo: u32, hi: u32, _m: core::marker::PhantomData<T> } impl<T: Trait<{ 1 }>> R<T> { pub fn leak() -> Self { Self { lo: 1, hi: 0, _m: core::marker::PhantomData } } }"),
+            Some(R::InvariantRawPublicConstructor)
         );
     }
 }
