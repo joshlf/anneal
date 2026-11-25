@@ -619,6 +619,37 @@ class TestPillar2ShardedAuditAndOrphanGate(unittest.TestCase):
         self.assertGreater(len(fps), 100)
         self.assertTrue(proto.reconcile_cross_shard_fingerprints({"proto": fps})["ok"])
 
+    def test_15c_hash_fingerprint_collision_missed_but_exact_reconciliation_catches(self) -> None:
+        """B2: A1's cross-shard reconciliation compared 64-bit `Expr.hash` fingerprints. Lean's
+        `Nat` literal hash truncates to UInt64, so a cross-shard duplicate whose value differs
+        only by `+2^64` in a literal has IDENTICAL fingerprints: hash reconciliation reports 0
+        conflicts while the monolithic loader rejects it. Exact structural reconciliation
+        restores parity."""
+        mod = "Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"
+        dup = "Fake.CrossShardDup"
+        target = mod + ".PeerSpecGuardClass.rank"
+        with tempfile.TemporaryDirectory(prefix="anneal-collide-") as tmp_str:
+            forged = Path(tmp_str) / "dup.olean"
+            proto.forge_olean_fixture(REPO_ROOT, mod, target, "collide_nat_literal", forged)
+            ov = {dup: str(forged)}
+            a = proto.inspect_live_oleans(REPO_ROOT, [mod], [mod], kernel_replay_inductives=False, export_fingerprints=True)
+            b = proto.inspect_live_oleans(
+                REPO_ROOT, [dup], [dup], kernel_replay_inductives=False, export_fingerprints=True, olean_overrides=ov
+            )
+            fps = {"A": a["declaration_fingerprints"], "B": b["declaration_fingerprints"]}
+            hashed = proto.reconcile_cross_shard_fingerprints(fps)
+            self.assertNotIn(target, hashed["conflicting_subjects"])
+            exact = proto.exact_reconcile_cross_module_duplicates(REPO_ROOT, fps, olean_overrides=ov)
+            self.assertEqual([v["subject"] for v in exact["violations"]], [target])
+            self.assertGreater(exact["pairs_compared"], 1000)
+            mono = proto.inspect_live_oleans(
+                REPO_ROOT, [mod, dup], [mod, dup], kernel_replay_inductives=False, olean_overrides=ov
+            )
+            self.assertIn(
+                ("stale_sibling_duplicate", target),
+                {(v["code"], v["subject"]) for v in mono["violations"]},
+            )
+
     def test_16_cli_orphan_only_with_modules_and_shard_files_detects_orphan(self) -> None:
         with tempfile.TemporaryDirectory(prefix="anneal-test-sh-") as tmp_str:
             tmp = Path(tmp_str)
@@ -763,6 +794,17 @@ class TestPillar3Guard3UnsatisfiableExternEnsures(unittest.TestCase):
         for name, src in ok.items():
             with self.subTest(name=name):
                 self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(src), [], name)
+
+
+    def test_20d_cfg_gated_requires_false_never_exempts(self) -> None:
+        """B2: A1 honored a cfg-gated `requires(false)` as an exemption; under the verifier's
+        cfg it may be OFF, leaving `ensures(false)` active (fail-open)."""
+        bad = 'extern "C" { #[cfg_attr(never_set, requires(false))] #[ensures(false)] fn f(x: u32) -> u32; }'
+        self.assertEqual(len(proto.scan_rust_unsatisfiable_extern_ensures(bad)), 1)
+        bad2 = '#[cfg_attr(x, external_spec(for = a::b, requires: false))]\n#[external_spec(for = a::b, ensures: |_| false)]\nfn g() -> u32;'
+        self.assertEqual(len(proto.scan_rust_unsatisfiable_extern_ensures(bad2)), 1)
+        ok = 'extern "C" { #[requires(false)] #[cfg_attr(creusot, ensures(false))] fn f(x: u32) -> u32; }'
+        self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(ok), [])
 
 
 class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
@@ -1022,6 +1064,22 @@ class TestPillar3Guard5ExternalTypeDropOmission(unittest.TestCase):
                 self.assertEqual(proto.scan_rust_external_type_drop_omission(src), [], name)
 
 
+    def test_26d_cfg_gated_drop_exemptions_and_old_verifier_syntax(self) -> None:
+        """B2: cfg-gated `models_drop`/`no_drop_glue` exempted findings (fail-open), and the
+        old Verus `#[verifier(external_type_specification)]` form was not recognized."""
+        drop = "struct D; impl Drop for D { fn drop(&mut self) {} }\n"
+        cases = {
+            "cfg_models_drop": drop + "#[external_type_specification]\n#[cfg_attr(never, models_drop)]\nstruct E(D);",
+            "cfg_no_drop_glue_foreign": "#[external_type_specification]\n#[cfg_attr(never, no_drop_glue)]\nstruct E(o::F);",
+            "old_verifier_syntax": drop + "#[verifier(external_type_specification)]\nstruct E(D);",
+        }
+        for name, src in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(len(proto.scan_rust_external_type_drop_omission(src)), 1, name)
+        ok = drop + "#[external_type_specification]\n#[models_drop]\nstruct E(D);"
+        self.assertEqual(proto.scan_rust_external_type_drop_omission(ok), [])
+
+
 class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
     def test_27_catches_positive_polarity_flipped_disjunct_nested_imp_and_double_neg(self) -> None:
         lean_src = """
@@ -1227,6 +1285,19 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
         """
         hits3 = proto.scan_lean_invariant_struct_sealing(kw_ctor_src)
         self.assertEqual([h["subject"] for h in hits3], ["KeywordCtorDecoy"])
+
+    def test_30e_variable_binders_and_examples_redteam(self) -> None:
+        """B2: section `variable (h : A → P)` hypotheses (auto-included in theorems that use
+        them) and anonymous `example` statements bypassed Guard 6a."""
+        bad = {
+            "variable_binder": "section\nvariable (s : St) (h : implAssumes s → s.out = 1)\ntheorem t : False := by sorry\nend",
+            "example_stmt": "example (i s : EvalRes Nat) : s.output = i.output → i.assumesHold = true := by sorry",
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                self.assertTrue(proto.scan_lean_assumption_polarity(src), name)
+        ok = "variable (s : St) (h : implAssumes s)\nexample : implAssumes s → True := fun _ => trivial"
+        self.assertEqual(proto.scan_lean_assumption_polarity(ok), [])
 
     def test_31_live_repo_sweep_zero_false_positives_on_theory_and_anneal_spec(self) -> None:
         res = proto.scan_live_repo_peer_guards(REPO_ROOT)

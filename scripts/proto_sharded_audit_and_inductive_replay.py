@@ -728,7 +728,10 @@ def main (args : List String) : IO UInt32 := do
           let (hasVal, valHash) := match ci.value? (allowOpaque := true) with
             | some v => ("1", toString v.hash)
             | none => ("0", "0")
-          fh.putStrLn s!"{modName}\t{ci.name}\t{ciKindStr ci}\t{lvlStr}\t{ci.type.hash}\t{hasVal}\t{valHash}\t{ciMetaTag ci}"
+          -- JSON-lines (B2): names may contain tabs/newlines via `«...»`; a TSV split would
+          -- silently DROP such records from cross-shard reconciliation.
+          fh.putStrLn (toJson #[modName.toString, ci.name.toString, ciKindStr ci, lvlStr,
+            toString ci.type.hash, hasVal, valHash, ciMetaTag ci]).compress
         if kName != ci.name then
           viols := viols.push (mkViol "key_mismatch" kName.toString ci.name.toString)
         match ci with
@@ -1044,22 +1047,167 @@ def inspect_live_oleans(
                     raw = raw.rstrip("\n")
                     if not raw:
                         continue
-                    parts = raw.split("\t")
-                    if len(parts) == 8:
-                        fps.append(
-                            (
-                                parts[0],
-                                parts[1],
-                                parts[2],
-                                parts[3],
-                                parts[4],
-                                parts[5] == "1",
-                                parts[6],
-                                parts[7],
-                            )
+                    parts = json.loads(raw)
+                    if not (isinstance(parts, list) and len(parts) == 8):
+                        raise RuntimeError(f"malformed fingerprint record: {raw[:200]!r}")
+                    fps.append(
+                        (
+                            parts[0],
+                            parts[1],
+                            parts[2],
+                            parts[3],
+                            parts[4],
+                            parts[5] == "1",
+                            parts[6],
+                            parts[7],
                         )
+                    )
             result["declaration_fingerprints"] = fps
         return result
+
+
+_EXACT_DUP_RECONCILER_LEAN = r'''
+import Lean
+
+open Lean
+
+/-- Exact (structural) cross-module duplicate reconciliation: load ONLY the `.olean` parts of
+    the involved modules and compare every duplicated declaration with the SAME predicate
+    the monolithic loader applies (never a lossy hash). -/
+def main (args : List String) : IO UInt32 := do
+  let some path := args.head? | return 2
+  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile path)
+  let names ← IO.ofExcept <| j.getObjValAs? (Array (Array String)) "names"
+  let overridePairs := (j.getObjValAs? (Array (Array String)) "olean_overrides").toOption.getD #[]
+  let overrides : Std.HashMap Name String := overridePairs.foldl (fun acc pr =>
+    if pr.size == 2 then acc.insert pr[0]!.toName pr[1]! else acc) {}
+  initSearchPath (← Lean.findSysroot) (System.SearchPath.parse ((← IO.getEnv "LEAN_PATH").getD ""))
+  let mut wantedMods : NameSet := {}
+  let mut wantedNames : NameSet := {}
+  for row in names do
+    if row.size >= 1 then
+      wantedNames := wantedNames.insert row[0]!.toName
+      for m in row[1:] do
+        wantedMods := wantedMods.insert m.toName
+  let mut table : Std.HashMap (Name × Name) ConstantInfo := {}
+  for m in wantedMods.toList do
+    let paths ← match overrides[m]? with
+      | some op => pure #[System.FilePath.mk op]
+      | none => do
+        let base ← Lean.findOLean m
+        let mut ps : Array System.FilePath := #[base]
+        for suf in [".server", ".private"] do
+          let q := System.FilePath.mk (base.toString ++ suf)
+          if ← q.pathExists then ps := ps.push q
+        pure ps
+    let parts ← Lean.readModuleDataParts paths
+    for (mdata, _) in parts do
+      for ci in mdata.constants do
+        if wantedNames.contains ci.name then
+          match table[(m, ci.name)]? with
+          | some prev =>
+            if (prev.value? true).isNone && (ci.value? true).isSome then
+              table := table.insert (m, ci.name) ci
+          | none => table := table.insert (m, ci.name) ci
+  let compat (a b : ConstantInfo) : Bool :=
+    a.levelParams == b.levelParams &&
+      (match a, b with
+       | .thmInfo _, .thmInfo _ => a.type.eqv b.type
+       | _, _ =>
+         a.type == b.type &&
+         (a.value? true == b.value? true || a.value? true == none || b.value? true == none))
+  let mut conflicts : Array Json := #[]
+  let mut compared : Nat := 0
+  for row in names do
+    if row.size >= 3 then
+      let n := row[0]!.toName
+      let mods := row[1:].toArray.map String.toName
+      for i in [:mods.size] do
+        for k in [i+1:mods.size] do
+          match table[(mods[i]!, n)]?, table[(mods[k]!, n)]? with
+          | some a, some b =>
+            compared := compared + 1
+            if !compat a b then
+              conflicts := conflicts.push (toJson #[n.toString, mods[i]!.toString, mods[k]!.toString])
+          | _, _ =>
+            conflicts := conflicts.push (toJson #[n.toString, mods[i]!.toString, mods[k]!.toString, "missing"])
+  IO.println (Json.mkObj [("pairs_compared", toJson compared), ("conflicts", .arr conflicts)]).compress
+  return 0
+'''
+
+
+def exact_reconcile_cross_module_duplicates(
+    repo_root: Path,
+    shard_fingerprints: dict[str, list[tuple[str, str, str, str, str, bool, str, str]]],
+    olean_overrides: dict[str, str] | None = None,
+    timeout_sec: int = 600,
+) -> dict[str, Any]:
+    """Exact cross-shard duplicate reconciliation (B2).
+
+    The fingerprint table is used ONLY to select candidates: every declaration name that
+    occurs in two or more DISTINCT modules belonging to DIFFERENT shards, regardless of
+    whether their `Expr.hash` fingerprints agree (64-bit hashes collide, e.g. `Nat`
+    literals `k` and `k + 2^64`). Each candidate pair is then compared structurally in Lean
+    with the monolithic loader's compatibility predicate.
+    """
+    shard_of_mod: dict[str, str] = {}
+    mods_of_name: dict[str, set[str]] = {}
+    for shard_name, recs in shard_fingerprints.items():
+        for rec in recs:
+            shard_of_mod.setdefault(rec[0], shard_name)
+            mods_of_name.setdefault(rec[1], set()).add(rec[0])
+    rows: list[list[str]] = []
+    for name in sorted(mods_of_name):
+        mods = sorted(mods_of_name[name])
+        if len(mods) >= 2 and len({shard_of_mod[m] for m in mods}) >= 2:
+            rows.append([name] + mods)
+    if not rows:
+        return {"ok": True, "candidate_names": 0, "pairs_compared": 0, "violations": []}
+    runner = _find_anneal_lean_run(repo_root)
+    with tempfile.TemporaryDirectory(prefix="anneal-exact-dup-") as tmp_str:
+        tmp = Path(tmp_str)
+        script = tmp / "exact_dup.lean"
+        req = tmp / "req.json"
+        script.write_text(_EXACT_DUP_RECONCILER_LEAN, encoding="utf-8")
+        req.write_text(
+            json.dumps(
+                {
+                    "names": rows,
+                    "olean_overrides": [[m, str(pth)] for m, pth in sorted((olean_overrides or {}).items())],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [runner, "--mode", "file", "--", "lake", "env", "lean", "--run", str(script), str(req)],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"exact duplicate reconciler failed: {proc.stderr.strip()} {proc.stdout.strip()}")
+        out = json.loads([ln for ln in proc.stdout.splitlines() if ln.strip()][-1])
+    violations: list[dict[str, str]] = []
+    for c in out["conflicts"]:
+        name, ma, mb = c[0], c[1], c[2]
+        if shard_of_mod.get(ma) != shard_of_mod.get(mb):
+            violations.append(
+                {
+                    "code": "cross_shard_duplicate_conflict",
+                    "subject": name,
+                    "detail": f"exact:{shard_of_mod.get(ma)}:{ma}!={shard_of_mod.get(mb)}:{mb}"
+                    + (":missing" if len(c) > 3 else ""),
+                }
+            )
+    return {
+        "ok": not violations,
+        "candidate_names": len(rows),
+        "pairs_compared": out["pairs_compared"],
+        "violations": violations,
+    }
 
 
 def reconcile_cross_shard_fingerprints(
@@ -1180,6 +1328,13 @@ def main (args : List String) : IO UInt32 := do
       | .defnInfo v =>
         if v.name == target && mutation == "forge_open_expr" then
           ci' := .defnInfo { v with value := .bvar 0 }; hit := true
+        else if v.name == target && mutation == "collide_nat_literal" then
+          -- `Expr.hash` truncates `Nat` literal hashes to `UInt64`: `k` and `k + 2^64` collide.
+          ci' := .defnInfo { v with value := v.value.replace fun e =>
+            match e with
+            | .lit (.natVal k) => some (.lit (.natVal (k + 18446744073709551616)))
+            | _ => none }
+          hit := true
       | .thmInfo v =>
         if v.name == target && mutation == "forge_open_expr" then
           ci' := .thmInfo { v with value := .bvar 0 }; hit := true
@@ -1199,6 +1354,7 @@ def main (args : List String) : IO UInt32 := do
 '''
 
 FORGE_MUTATIONS: tuple[str, ...] = (
+    "collide_nat_literal",
     "flip_is_rec",
     "bump_num_indices",
     "drop_self_from_all",
@@ -1837,6 +1993,9 @@ def run_live_benchmark(
             shard_fps[shard_name] = res.pop("declaration_fingerprints", [])
             per_shard[shard_name] = res
     recon = reconcile_cross_shard_fingerprints(shard_fps)
+    # B2: hash fingerprints are a lossy pre-filter only; the authoritative cross-shard
+    # duplicate verdict comes from exact structural comparison in Lean.
+    exact_recon = exact_reconcile_cross_module_duplicates(repo_root, shard_fps)
     sharded_wall_sec = round(time.perf_counter() - t0, 4)
 
     union_axioms = sorted(
@@ -1848,8 +2007,10 @@ def run_live_benchmark(
         for v in per_shard[name].get("violations", [])
     ]
     sharded_reconciled_violations = sharded_violations + [
-        {"shard": "_reconciliation", **v} for v in recon["cross_shard_only_violations"]
+        {"shard": "_reconciliation", **v} for v in exact_recon["violations"]
     ]
+    hash_conflicts = set(recon["conflicting_subjects"])
+    exact_conflicts = {v["subject"] for v in exact_recon["violations"]}
     sharded_decls = sum(r["declarations_checked"] for r in per_shard.values())
     sharded_inducts = sum(r["inductives_checked"] for r in per_shard.values())
     sharded_ctors = sum(r["ctors_checked"] for r in per_shard.values())
@@ -1866,7 +2027,6 @@ def run_live_benchmark(
     mono_dup_subjects = sorted({v.get("subject", "") for v in mono_res["violations"] if v.get("code") in dup_codes})
     sharded_dup_subjects = sorted(
         {v.get("subject", "") for v in sharded_reconciled_violations if v.get("code") in dup_codes}
-        | set(recon["conflicting_subjects"])
     )
     mono_missing_subjects = sorted({v.get("subject", "") for v in mono_res["violations"] if v.get("code") == "missing_dependency_decl"})
     sharded_missing_subjects = sorted({v.get("subject", "") for v in sharded_reconciled_violations if v.get("code") == "missing_dependency_decl"})
@@ -1911,6 +2071,10 @@ def run_live_benchmark(
                 "duplicate_declarations_seen": recon["duplicate_declarations_seen"],
                 "conflicting_subject_count": len(recon["conflicting_subjects"]),
                 "cross_shard_only_conflict_count": len(recon["cross_shard_only_violations"]),
+                "exact_candidate_names": exact_recon["candidate_names"],
+                "exact_pairs_compared": exact_recon["pairs_compared"],
+                "exact_conflict_count": len(exact_recon["violations"]),
+                "hash_missed_exact_conflicts": sorted(exact_conflicts - hash_conflicts),
             },
             "inductive_violation_count": len(sharded_ind_viols),
             "dependency_violation_count": len(sharded_dep_viols),
@@ -2185,6 +2349,22 @@ def _find_matching_delim(tokens: list[Token], open_idx: int, open_ch: str, close
     return len(tokens) - 1
 
 
+class _CondAttrToks(list):  # type: ignore[type-arg]
+    """Attribute token list that only applies under a `cfg_attr` predicate.
+
+    Guards treat such attributes asymmetrically: contracts that WEAKEN soundness
+    (`ensures`, `external_body`, ctor markers) are honored (fail closed), but attributes that
+    would EXEMPT a finding (`requires(false)`, `models_drop`, `no_drop_glue`) are ignored,
+    because the cfg under which the verifier runs may not enable them.
+    """
+
+    conditional = True
+
+
+def _attr_is_conditional(attr_toks: list[Token]) -> bool:
+    return bool(getattr(attr_toks, "conditional", False))
+
+
 def _expand_cfg_attr(attr_toks: list[Token], line: int, depth: int = 0) -> list[tuple[list[Token], int]]:
     """Expand `cfg_attr(pred, a1, a2, ...)` into `[a1, a2, ...]` (recursively).
 
@@ -2199,7 +2379,8 @@ def _expand_cfg_attr(attr_toks: list[Token], line: int, depth: int = 0) -> list[
     out: list[tuple[list[Token], int]] = []
     for part in _split_top_level_tokens(args, ",")[1:]:
         if part:
-            out.extend(_expand_cfg_attr(part, line, depth + 1))
+            for sub, ln in _expand_cfg_attr(part, line, depth + 1):
+                out.append((_CondAttrToks(sub), ln))
     return out
 
 
@@ -2784,20 +2965,24 @@ def scan_rust_unsatisfiable_extern_ensures(
                     is_external_spec_attr = True
                     attr_line = ln
                     rq, en = _extract_contract_clauses(args)
-                    req_clauses.extend(rq)
+                    if not _attr_is_conditional(attr_toks):
+                        req_clauses.extend(rq)
                     ens_clauses.extend(en)
                 elif leaf in ("ensures", "requires"):
                     is_spec_attr = True
                     if leaf == "ensures":
                         ens_clauses.append(args)
-                    else:
+                    elif not _attr_is_conditional(attr_toks):
+                        # A cfg-gated `requires(false)` may be OFF under the verifier's cfg:
+                        # never let it exempt an unsatisfiable `ensures` (fail closed).
                         req_clauses.append(args)
                 elif leaf in ("spec", "embed_spec", "trusted"):
                     is_spec_attr = True
                     if leaf == "trusted":
                         is_trusted_body = True
                     rq, en = _extract_contract_clauses(args)
-                    req_clauses.extend(rq)
+                    if not _attr_is_conditional(attr_toks):
+                        req_clauses.extend(rq)
                     ens_clauses.extend(en)
                 elif leaf == "external_body" or (
                     leaf == "verifier" and any(t.text == "external_body" for t in args)
@@ -3716,6 +3901,11 @@ def scan_rust_external_type_drop_omission(
                 for attr_toks, ln in attrs:
                     path, args = _attr_path_and_args(attr_toks)
                     leaf = path.split("::")[-1] if path else ""
+                    cond = _attr_is_conditional(attr_toks)
+                    # Old-style Verus `#[verifier(external_type_specification)]`.
+                    if leaf == "verifier" and any(t.text == "external_type_specification" for t in args):
+                        has_ext_type = True
+                        attr_line = ln
                     if leaf == "external_type_specification":
                         has_ext_type = True
                         attr_line = ln
@@ -3724,18 +3914,21 @@ def scan_rust_external_type_drop_omission(
                                 segs, _, _ = _parse_rust_path_at(item, 2)
                                 if segs:
                                     explicit_for_targets.add(segs[-1])
-                            if any(t.text in ("models_drop", "drop_modeled") for t in item):
+                            if not cond and any(t.text in ("models_drop", "drop_modeled") for t in item):
                                 drop_modeled = True
                             if any(t.text == "external_body" for t in item):
                                 has_ext_body = True
                     elif leaf == "external_body":
                         has_ext_body = True
                     elif leaf in ("drop_spec", "models_drop", "anneal_drop_modeled"):
-                        drop_modeled = True
+                        # cfg-gated exemptions are ignored (fail closed).
+                        if not cond:
+                            drop_modeled = True
                     elif leaf in ("has_drop_glue", "implements_drop"):
                         explicit_drop = True
                     elif leaf == "no_drop_glue":
-                        asserted_no_drop = True
+                        if not cond:
+                            asserted_no_drop = True
                     elif leaf == "verifier" and any(t.text == "external_body" for t in args):
                         has_ext_body = True
 
@@ -4348,6 +4541,7 @@ _LEAN_TOP_COMMANDS: frozenset[str] = frozenset(
         "attribute",
         "deriving",
         "mutual",
+        "example",
     }
 )
 
@@ -4369,11 +4563,42 @@ def scan_lean_assumption_polarity(
         if j >= n:
             break
         kw = tokens[j].text
-        if kw in ("theorem", "lemma", "def", "abbrev") and j + 1 < n and tokens[j + 1].kind == "IDENT":
-            decl_name = tokens[j + 1].text
+        # `variable (h : A → P)` binders become hypotheses of every theorem in scope that
+        # uses them, so their types are checked in NEGATIVE polarity like signature binders.
+        if kw == "variable":
+            k = j + 1
+            depth = 0
+            while k < n:
+                t = tokens[k].text
+                if t in ("(", "[", "{", "⦃"):
+                    depth += 1
+                elif t in (")", "]", "}", "⦄"):
+                    depth = max(0, depth - 1)
+                elif depth == 0 and (t in _LEAN_TOP_COMMANDS or t == "@[") and k > j:
+                    break
+                k += 1
+            var_bad: list[Token] = []
+            for ty in _lean_binder_types(tokens[j + 1 : k]):
+                var_bad.extend(_check_lean_prop_polarity(ty, "neg"))
+            if var_bad:
+                findings.append(
+                    _make_peer_finding(
+                        "assumption_positive_polarity",
+                        f"variable@L{tokens[j].line}",
+                        var_bad[0].line or tokens[j].line,
+                        f"assumption `{var_bad[0].text}` appears in positive polarity inside a `variable` hypothesis binder",
+                        file_path=file_path,
+                    )
+                )
+            i = max(k, start_i + 1)
+            continue
+        is_example = kw == "example"
+        if (kw in ("theorem", "lemma", "def", "abbrev") and j + 1 < n and tokens[j + 1].kind == "IDENT") or is_example:
+            decl_name = f"example@L{tokens[j].line}" if is_example else tokens[j + 1].text
             decl_line = tokens[j].line
+            sig_start = j + 1 if is_example else j + 2
             # Find depth-0 `:` (signature start) and `:=` / `where` (body start)
-            k = j + 2
+            k = sig_start
             depth = 0
             colon_idx = -1
             assign_idx = -1
@@ -4389,7 +4614,7 @@ def scan_lean_assumption_polarity(
                     elif t in (":=", "where"):
                         assign_idx = k
                         break
-                    elif t in _LEAN_TOP_COMMANDS and k > j + 2:
+                    elif t in _LEAN_TOP_COMMANDS and k > sig_start:
                         break
                 k += 1
 
@@ -4411,12 +4636,12 @@ def scan_lean_assumption_polarity(
             # Inspect statement (for theorem/lemma) or Prop body + binders (for `: Prop :=` def/abbrev)
             target_slices: list[list[Token]] = []
             binder_bad: list[Token] = []
-            if kw in ("theorem", "lemma") and colon_idx != -1:
+            if kw in ("theorem", "lemma", "example") and colon_idx != -1:
                 stmt_end = assign_idx if assign_idx != -1 else k
                 target_slices.append(tokens[colon_idx + 1 : stmt_end])
                 # Signature binders `(h : T)` are hypotheses: `theorem t (h : T) : B` is
                 # `T → B`, so each binder type is checked in NEGATIVE polarity.
-                for ty in _lean_binder_types(tokens[j + 2 : colon_idx]):
+                for ty in _lean_binder_types(tokens[sig_start : colon_idx]):
                     binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
             elif kw in ("def", "abbrev") and colon_idx != -1 and assign_idx != -1:
                 ret_slice = tokens[colon_idx + 1 : assign_idx]

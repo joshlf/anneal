@@ -1990,6 +1990,73 @@ theorem crossShardFingerprintReconciliation_sound
     · rw [Bool.not_eq_true] at hAny
       simp only [hAny, Bool.false_eq_true, ↓reduceIte]
 
+/-! ### 3.3 Lossy Digests Break Cross-Shard Reconciliation (B2)
+
+`checkCrossShardFingerprints` is exact ONLY when the exported fingerprint is an injective
+encoding of the compared `ConstantInfo` payload. A non-injective digest (e.g. Lean 4.34.1
+`Expr.hash`, whose `Nat` literal hash truncates to `UInt64`, so `5` and `5 + 2^64` collide)
+lets two shards ship conflicting duplicates that a monolithic load rejects. -/
+
+/-- Module-tagged declaration with its exact (abstractly serialized) payload. -/
+structure ModDeclPayload : Type where
+  modName : String
+  declName : String
+  payload : List Nat
+  deriving DecidableEq, Repr, Inhabited
+
+/-- Exact monolithic duplicate consistency over payloads (what loading compares). -/
+def ExactDuplicateConsistent (registered : List String)
+    (entries : List ModDeclPayload) : Prop :=
+  ∀ e₁ ∈ entries, ∀ e₂ ∈ entries,
+    e₁.modName ∈ registered → e₂.modName ∈ registered →
+    e₁.declName = e₂.declName → e₁.payload = e₂.payload
+
+/-- Export each payload through a digest function. -/
+def digestEntries (digest : List Nat → String) (entries : List ModDeclPayload) :
+    List ModDeclFingerprint :=
+  entries.map fun e => { modName := e.modName, declName := e.declName, fingerprint := digest e.payload }
+
+/-- **Lossy-digest unsoundness**: ANY digest collision between distinct payloads yields a
+    two-shard repository that cross-shard reconciliation accepts but monolithic exact
+    duplicate consistency rejects. -/
+theorem lossyDigest_reconciliation_misses_conflict (digest : List Nat → String)
+    {p q : List Nat} (hne : p ≠ q) (hcol : digest p = digest q) :
+    checkCrossShardFingerprints [["M1"], ["M2"]]
+        (digestEntries digest [⟨"M1", "d", p⟩, ⟨"M2", "d", q⟩]) = [] ∧
+      ¬ ExactDuplicateConsistent ["M1", "M2"] [⟨"M1", "d", p⟩, ⟨"M2", "d", q⟩] := by
+  refine ⟨?_, ?_⟩
+  · simp [checkCrossShardFingerprints, digestEntries, hcol]
+  · intro h
+    exact hne (h ⟨"M1", "d", p⟩ (by simp) ⟨"M2", "d", q⟩ (by simp) (by simp) (by simp) rfl)
+
+/-- The `UInt64` truncation underlying Lean's `Nat` literal hash collides on `5` vs
+    `5 + 2^64`. -/
+theorem uint64NatTruncation_collides :
+    (5 : Nat) % 18446744073709551616 = (5 + 18446744073709551616) % 18446744073709551616 ∧
+      (5 : Nat) ≠ 5 + 18446744073709551616 := by
+  decide
+
+/-- **Exact reconciliation soundness**: with an INJECTIVE digest (exact structural
+    comparison), cross-shard reconciliation coincides with monolithic exact duplicate
+    consistency under a valid partition. -/
+theorem injectiveDigest_reconciliation_exact {registered onDisk : List String}
+    {shards : List (List String)} {entries : List ModDeclPayload}
+    (digest : List Nat → String) (hInj : ∀ p q, digest p = digest q → p = q)
+    (hPart : ShardPartitionValid registered onDisk shards) :
+    checkCrossShardFingerprints shards (digestEntries digest entries) = [] ↔
+      ExactDuplicateConsistent registered entries := by
+  rw [crossShardFingerprintReconciliation_sound hPart]
+  unfold MonolithicDuplicateConsistent ExactDuplicateConsistent digestEntries
+  constructor
+  · intro h e₁ h₁ e₂ h₂ hm₁ hm₂ hn
+    exact hInj _ _ (h _ (List.mem_map.mpr ⟨e₁, h₁, rfl⟩) _ (List.mem_map.mpr ⟨e₂, h₂, rfl⟩)
+      hm₁ hm₂ hn)
+  · intro h f₁ hf₁ f₂ hf₂ hm₁ hm₂ hn
+    obtain ⟨e₁, h₁, rfl⟩ := List.mem_map.mp hf₁
+    obtain ⟨e₂, h₂, rfl⟩ := List.mem_map.mp hf₂
+    simp only at hm₁ hm₂ hn ⊢
+    rw [h e₁ h₁ e₂ h₂ hm₁ hm₂ hn]
+
 /-! ## 4. Pillar 3 — Four Peer-Verifier Spec-Boundary Soundness Guards -/
 
 /-! ### 4.1 Guard 3 — Unsatisfiable Extern `ensures` (`creusot#2388`, rank `3`) -/
@@ -2258,6 +2325,144 @@ theorem fndefGhostTokenGuard_preserves_uniqueness {uses : List GhostTokenCtorUse
     | cons _ _ =>
       simp only [List.length_cons] at hLen
       omega
+
+/-! #### 4.2.1 Operational Ghost-Token Program Model (B2)
+
+The table `GhostTokenCtorUse.maxRuntimeCalls` above is a stipulated multiplicity. The
+model below derives issuance counts from an operational semantics: a bound `FnDef` value
+(`let f = Tokens::new`) is `Copy` and can be invoked arbitrarily often, and loops repeat
+their body. -/
+
+/-- Tiny program language over one one-shot ghost-token constructor. -/
+inductive TokProg : Type where
+  | skip
+  /-- Direct call `Tokens::new()`. -/
+  | callCtor
+  /-- `let f = Tokens::new` / `fn()` coercion / closure capture (binds a reusable value). -/
+  | bindCtorValue
+  /-- `f()` on the bound constructor value. -/
+  | invokeBound
+  | seq (a b : TokProg)
+  /-- Body executed exactly `n` times. -/
+  | loop (n : Nat) (body : TokProg)
+  deriving DecidableEq, Repr, Inhabited
+
+/-- Iterate a state transformer `n` times, summing issuance counts. -/
+def iterRun (f : Bool → Nat × Bool) : Nat → Bool → Nat × Bool
+  | 0, b => (0, b)
+  | k + 1, b =>
+    let r₁ := f b
+    let r₂ := iterRun f k r₁.2
+    (r₁.1 + r₂.1, r₂.2)
+
+/-- Operational semantics: `(tokens issued, ctor value bound?)`. -/
+def TokProg.run : TokProg → Bool → Nat × Bool
+  | .skip, b => (0, b)
+  | .callCtor, b => (1, b)
+  | .bindCtorValue, _ => (0, true)
+  | .invokeBound, b => (if b then 1 else 0, b)
+  | .seq p q, b =>
+    let r₁ := p.run b
+    let r₂ := q.run r₁.2
+    (r₁.1 + r₂.1, r₂.2)
+  | .loop n body, b => iterRun body.run n b
+
+/-- Number of syntactic direct call sites. -/
+def TokProg.callSites : TokProg → Nat
+  | .callCtor => 1
+  | .seq p q => p.callSites + q.callSites
+  | .loop _ body => body.callSites
+  | _ => 0
+
+/-- Whether any non-call `FnDef` value use (bind / invoke) occurs. -/
+def TokProg.hasValueUse : TokProg → Bool
+  | .bindCtorValue => true
+  | .invokeBound => true
+  | .seq p q => p.hasValueUse || q.hasValueUse
+  | .loop _ body => body.hasValueUse
+  | _ => false
+
+/-- Whether a direct call site sits under a loop. -/
+def TokProg.callUnderLoop : TokProg → Bool
+  | .seq p q => p.callUnderLoop || q.callUnderLoop
+  | .loop _ body => body.callSites != 0
+  | _ => false
+
+/-- Executable Guard 4 over programs (mirrors the Python single-entry authority check). -/
+def tokProgGuard (p : TokProg) : Bool :=
+  !p.hasValueUse && !p.callUnderLoop && p.callSites ≤ 1
+
+private theorem iterRun_zero {f : Bool → Nat × Bool} (hf : ∀ b, f b = (0, b)) :
+    ∀ n b, iterRun f n b = (0, b) := by
+  intro n
+  induction n with
+  | zero => intro b; rfl
+  | succ k ih => intro b; simp [iterRun, hf, ih]
+
+private theorem TokProg.callUnderLoop_of_noCalls :
+    ∀ p : TokProg, p.callSites = 0 → p.callUnderLoop = false := by
+  intro p
+  induction p with
+  | seq a c iha ihc =>
+    intro h
+    simp only [TokProg.callSites] at h
+    simp only [TokProg.callUnderLoop, Bool.or_eq_false_iff]
+    exact ⟨iha (by omega), ihc (by omega)⟩
+  | loop n body _ =>
+    intro h
+    simp only [TokProg.callSites] at h
+    simp [TokProg.callUnderLoop, h]
+  | _ => intro _; rfl
+
+private theorem TokProg.run_noValue_bound {p : TokProg}
+    (hV : p.hasValueUse = false) (hL : p.callUnderLoop = false) :
+    ∀ b, (p.run b).1 ≤ p.callSites ∧ (p.run b).2 = b := by
+  induction p with
+  | skip => intro b; simp [TokProg.run, TokProg.callSites]
+  | callCtor => intro b; simp [TokProg.run, TokProg.callSites]
+  | bindCtorValue => simp [TokProg.hasValueUse] at hV
+  | invokeBound => simp [TokProg.hasValueUse] at hV
+  | seq a c iha ihc =>
+    simp only [TokProg.hasValueUse, Bool.or_eq_false_iff] at hV
+    simp only [TokProg.callUnderLoop, Bool.or_eq_false_iff] at hL
+    intro b
+    obtain ⟨ha1, ha2⟩ := iha hV.1 hL.1 b
+    obtain ⟨hc1, hc2⟩ := ihc hV.2 hL.2 (a.run b).2
+    simp only [TokProg.run, TokProg.callSites]
+    exact ⟨by omega, by rw [hc2, ha2]⟩
+  | loop n body ih =>
+    simp only [TokProg.hasValueUse] at hV
+    simp only [TokProg.callUnderLoop, bne_eq_false_iff_eq] at hL
+    have hBody : ∀ b, body.run b = (0, b) := by
+      intro b
+      obtain ⟨h1, h2⟩ := ih hV (TokProg.callUnderLoop_of_noCalls body hL) b
+      have h0 : (body.run b).1 = 0 := by omega
+      exact Prod.ext h0 h2
+    intro b
+    simp [TokProg.run, iterRun_zero hBody, TokProg.callSites]
+
+/-- **Operational Guard 4 Soundness**: every program accepted by `tokProgGuard` issues at
+    most ONE token, for every loop bound. -/
+theorem tokProgGuard_sound {p : TokProg} (hG : tokProgGuard p = true) :
+    TokenUniquenessHolds (p.run false).1 := by
+  unfold tokProgGuard at hG
+  simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq] at hG
+  obtain ⟨⟨hV, hL⟩, hC⟩ := hG
+  have := (TokProg.run_noValue_bound hV hL false).1
+  unfold TokenUniquenessHolds
+  omega
+
+/-- **Operational Collapse**: `let f = Tokens::new; f(); f()` and a direct call in a
+    2-iteration loop both issue TWO tokens, and both are rejected by `tokProgGuard`. -/
+theorem tokProg_valueUse_and_loop_duplicate_tokens :
+    (TokProg.seq .bindCtorValue (.seq .invokeBound .invokeBound)).run false = (2, true) ∧
+    (TokProg.loop 2 .callCtor).run false = (2, false) ∧
+    tokProgGuard (.seq .bindCtorValue (.seq .invokeBound .invokeBound)) = false ∧
+    tokProgGuard (.loop 2 .callCtor) = false ∧
+    tokProgGuard (.seq .callCtor .callCtor) = false ∧
+    tokProgGuard (.seq .skip (.loop 5 .skip)) = true ∧
+    tokProgGuard .callCtor = true := by
+  decide
 
 /-! ### 4.3 Guard 5 — External-Type `Drop` Omission (`verus#3514`, rank `5`) -/
 
@@ -2570,6 +2775,119 @@ theorem checkCombCounterExample_refutes_equiv {Input Val : Type} [DecidableEq Va
     ¬ (∀ i, CorrectEquivObligation (specFn i) (implFn i)) := by
   intro hAll
   exact (checkCombCounterExample_sound (specFn cex) (implFn cex)).mp hCex (hAll cex)
+
+/-! #### 4.4.1b Semantic Soundness of the Polarity Check (B2)
+
+`checkAssumesNegativePolarity` was previously justified only by test vectors. The theorem
+below gives its semantic meaning: if every `assumes` atom is in negative polarity, the
+obligation is ANTITONE in the assumption valuation, so it is hardest exactly when all
+assumptions hold. An implementation therefore can never discharge it by *making* its
+assumptions hold (the `Verifrag` positive-polarity bug). -/
+
+/-- Valuation semantics: `va` interprets obligation atoms, `vs` interprets assumptions. -/
+def evalPF (va vs : String → Prop) : PropFormula → Prop
+  | .atom t => va t
+  | .assumes t => vs t
+  | .not p => ¬ evalPF va vs p
+  | .and p q => evalPF va vs p ∧ evalPF va vs q
+  | .or p q => evalPF va vs p ∨ evalPF va vs q
+  | .imp p q => evalPF va vs p → evalPF va vs q
+  | .iff p q => (evalPF va vs p ↔ evalPF va vs q)
+  | .ifte c t e => (evalPF va vs c → evalPF va vs t) ∧ (¬ evalPF va vs c → evalPF va vs e)
+
+/-- Polarity monotonicity: positive-root formulas are antitone and negative-root formulas
+    are monotone in the assumption valuation. -/
+theorem assumesOnlyNegative_monotone (va : String → Prop) {vs₁ vs₂ : String → Prop}
+    (hle : ∀ t, vs₁ t → vs₂ t) :
+    ∀ (f : PropFormula) (pol : Polarity), assumesOnlyNegative pol f = true →
+      (pol = .pos → evalPF va vs₂ f → evalPF va vs₁ f) ∧
+      (pol = .neg → evalPF va vs₁ f → evalPF va vs₂ f) := by
+  intro f
+  induction f with
+  | atom t => intro pol _; exact ⟨fun _ h => h, fun _ h => h⟩
+  | assumes t =>
+    intro pol h
+    cases pol with
+    | pos => simp [assumesOnlyNegative] at h
+    | neg => exact ⟨(fun hp => nomatch hp), fun _ h₁ => hle t h₁⟩
+  | not p ih =>
+    intro pol h
+    cases pol with
+    | pos =>
+      have hp := (ih .neg (by simpa [assumesOnlyNegative, Polarity.flip] using h)).2 rfl
+      exact ⟨fun _ hn h₁ => hn (hp h₁), (fun hc => nomatch hc)⟩
+    | neg =>
+      have hp := (ih .pos (by simpa [assumesOnlyNegative, Polarity.flip] using h)).1 rfl
+      exact ⟨(fun hc => nomatch hc), fun _ hn h₂ => hn (hp h₂)⟩
+  | and p q ihp ihq =>
+    intro pol h
+    simp only [assumesOnlyNegative, Bool.and_eq_true] at h
+    have hp := ihp pol h.1
+    have hq := ihq pol h.2
+    exact ⟨fun e ⟨a, b⟩ => ⟨hp.1 e a, hq.1 e b⟩, fun e ⟨a, b⟩ => ⟨hp.2 e a, hq.2 e b⟩⟩
+  | or p q ihp ihq =>
+    intro pol h
+    simp only [assumesOnlyNegative, Bool.and_eq_true] at h
+    have hp := ihp pol h.1
+    have hq := ihq pol h.2
+    exact ⟨fun e hor => hor.elim (fun a => Or.inl (hp.1 e a)) (fun b => Or.inr (hq.1 e b)),
+      fun e hor => hor.elim (fun a => Or.inl (hp.2 e a)) (fun b => Or.inr (hq.2 e b))⟩
+  | imp p q ihp ihq =>
+    intro pol h
+    cases pol with
+    | pos =>
+      simp only [assumesOnlyNegative, Polarity.flip, Bool.and_eq_true] at h
+      have hp := (ihp .neg h.1).2 rfl
+      have hq := (ihq .pos h.2).1 rfl
+      exact ⟨fun _ himp a => hq (himp (hp a)), (fun hc => nomatch hc)⟩
+    | neg =>
+      simp only [assumesOnlyNegative, Polarity.flip, Bool.and_eq_true] at h
+      have hp := (ihp .pos h.1).1 rfl
+      have hq := (ihq .neg h.2).2 rfl
+      exact ⟨(fun hc => nomatch hc), fun _ himp a => hq (himp (hp a))⟩
+  | iff p q ihp ihq =>
+    intro pol h
+    simp only [assumesOnlyNegative, Bool.and_eq_true] at h
+    have hp₁ := (ihp .pos h.1.1.1).1 rfl
+    have hp₂ := (ihp .neg h.1.1.2).2 rfl
+    have hq₁ := (ihq .pos h.1.2).1 rfl
+    have hq₂ := (ihq .neg h.2).2 rfl
+    have hP : evalPF va vs₁ p ↔ evalPF va vs₂ p := ⟨hp₂, hp₁⟩
+    have hQ : evalPF va vs₁ q ↔ evalPF va vs₂ q := ⟨hq₂, hq₁⟩
+    exact ⟨fun _ hi => hP.trans (hi.trans hQ.symm), fun _ hi => hP.symm.trans (hi.trans hQ)⟩
+  | ifte c t e ihc iht ihe =>
+    intro pol h
+    simp only [assumesOnlyNegative, Bool.and_eq_true] at h
+    have hc₁ := (ihc .pos h.1.1.1).1 rfl
+    have hc₂ := (ihc .neg h.1.1.2).2 rfl
+    have ht := iht pol h.1.2
+    have he := ihe pol h.2
+    exact ⟨fun hpol ⟨h1, h2⟩ =>
+        ⟨fun c₁ => ht.1 hpol (h1 (hc₂ c₁)), fun nc₁ => he.1 hpol (h2 (fun c₂ => nc₁ (hc₁ c₂)))⟩,
+      fun hpol ⟨h1, h2⟩ =>
+        ⟨fun c₂ => ht.2 hpol (h1 (hc₁ c₂)), fun nc₂ => he.2 hpol (h2 (fun c₁ => nc₂ (hc₂ c₁)))⟩⟩
+
+/-- **Guard 6a Semantic Soundness**: if `checkAssumesNegativePolarity f = true`, then
+    proving `f` under all-assumptions-hold proves `f` under EVERY assumption valuation —
+    the obligation can never become easier by establishing assumptions. -/
+theorem checkAssumesNegativePolarity_sound (va : String → Prop) {f : PropFormula}
+    (h : checkAssumesNegativePolarity f = true)
+    (hAll : evalPF va (fun _ => True) f) :
+    ∀ vs, evalPF va vs f :=
+  fun _ => (assumesOnlyNegative_monotone va (fun _ _ => trivial) f .pos h).1 rfl hAll
+
+/-- **Guard 6a Semantic Collapse**: the flipped-consequent formula holds when every
+    assumption holds, yet fails when assumptions fail: positive polarity lets
+    "establishing the assumptions" discharge the obligation. -/
+theorem flippedConsequent_violates_antitonicity :
+    let va : String → Prop := fun t => t = "outputEq"
+    evalPF va (fun _ => True) flippedConsequentFormula ∧
+      ¬ evalPF va (fun _ => False) flippedConsequentFormula := by
+  refine ⟨fun _ => ⟨trivial, trivial⟩, ?_⟩
+  intro h
+  have hAnt : ¬ ("impl.assertionFailed" = "outputEq") ∧ ("outputEq" = "outputEq") :=
+    ⟨by decide, rfl⟩
+  exact (h hAnt).1
 
 /-! #### 4.4.2 Part 6b: Invariant-Struct `private mk ::` Sealing (`Samite` cl/1029680381) -/
 

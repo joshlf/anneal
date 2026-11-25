@@ -338,6 +338,46 @@ theorem guard6b_sealedCap_mkChecked_vectors :
 #guard_msgs in
 #print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.danglingRecursor_rejected_statically_and_postReplay
 
+
+/-! ## 6. B2 Regression Tests: Lossy Digests, Operational Guard 4, Semantic Guard 6a -/
+
+/-- A concrete UInt64-truncating digest collides on `[5]` vs `[5 + 2^64]`, so hash-based
+    cross-shard reconciliation accepts a conflicting duplicate. -/
+def truncDigest (p : List Nat) : String :=
+  if p.map (· % 18446744073709551616) = [5] then "h5" else "other"
+
+theorem b2_truncDigest_hides_conflict :
+    checkCrossShardFingerprints [["M1"], ["M2"]]
+        (digestEntries truncDigest [⟨"M1", "d", [5]⟩, ⟨"M2", "d", [5 + 18446744073709551616]⟩]) = [] ∧
+      ¬ ExactDuplicateConsistent ["M1", "M2"]
+        [⟨"M1", "d", [5]⟩, ⟨"M2", "d", [5 + 18446744073709551616]⟩] :=
+  lossyDigest_reconciliation_misses_conflict truncDigest (by decide) (by decide)
+
+theorem b2_tokProg_guard_vectors :
+    tokProgGuard (.seq .callCtor (.loop 3 .skip)) = true ∧
+      TokenUniquenessHolds ((TokProg.seq .callCtor (.loop 3 .skip)).run false).1 ∧
+      tokProgGuard (.loop 1 .callCtor) = false := by
+  refine ⟨by decide, tokProgGuard_sound (by decide), by decide⟩
+
+theorem b2_correctEquiv_semantically_antitone (va : String → Prop)
+    (h : evalPF va (fun _ => True) correctEquivFormula) :
+    ∀ vs, evalPF va vs correctEquivFormula :=
+  checkAssumesNegativePolarity_sound va (by decide) h
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.checkAssumesNegativePolarity_sound' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.checkAssumesNegativePolarity_sound
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.tokProgGuard_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.tokProgGuard_sound
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.injectiveDigest_reconciliation_exact' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.injectiveDigest_reconciliation_exact
+
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
@@ -406,6 +446,14 @@ run_cmd do
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.lyingDiverging_bypasses_flagOnly_but_rejected_by_guard,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.externEnsuresGuard_vacuity_only_from_genuine_divergence,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.caseFoldCollision_rejected_by_checkShardPartition,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.lossyDigest_reconciliation_misses_conflict,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.uint64NatTruncation_collides,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.injectiveDigest_reconciliation_exact,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.tokProgGuard_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.tokProg_valueUse_and_loop_duplicate_tokens,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.assumesOnlyNegative_monotone,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.checkAssumesNegativePolarity_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.flippedConsequent_violates_antitonicity,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.danglingRecursor_rejected_statically_and_postReplay,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardLocalDupCheck_misses_crossShard_conflict,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.crossShardFingerprintReconciliation_sound,
