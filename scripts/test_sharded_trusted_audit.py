@@ -727,6 +727,29 @@ class PeerGuardScannerTests(unittest.TestCase):
         self.assertGreater(summary["files"], 50)
 
 
+    def test_a4_expected_type_constructions_in_sealed_context_rejected(self):
+        head = "/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n\n"
+        consumer = "def use (r : R) : Nat := r.lo\n"
+        for leak in ("def leak (n : Nat) : Nat := R.lo (.mk n)\n",       # projection argument
+                     "def leak (n : Nat) : Nat := R.lo \u27e8n\u27e9\n",
+                     "def leak (n : Nat) : Nat := R.lo { lo := n }\n",
+                     consumer + "def leak (n : Nat) : Nat := use (.mk n)\n",  # same-file consumer argument
+                     consumer + "def leak (n : Nat) : Nat := use \u27e8n\u27e9\n",
+                     "theorem bad : \u2203 r : R, r.lo = 5 := \u27e8\u27e85\u27e9, rfl\u27e9\n",  # existential witness
+                     "def leak (n : Nat) : Option R := some \u27e8n\u27e9\n",     # container element
+                     "instance : Coe Nat R := \u27e8fun n => \u27e8n\u27e9\u27e9\n"):
+            with self.subTest(leak=leak):
+                self.assert_violation(head + leak, "6b", "sealed raw constructor")
+        two = "/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n  hi : Nat\n\n"
+        scan_text(two + "def f (r : R) : Nat := (r).lo\ndef w (r : R) : Nat \u00d7 Nat := \u27e8r.lo, r.hi\u27e9\n"
+                  "/-- @smart_constructor -/\ndef R.make (n : Nat) : R := R.mk n n\n"
+                  "def g (n : Nat) : Nat := R.lo (R.make n)\n")
+        # Guard 6a: parenthesized / `Sort`-valued `where` auxiliaries have their RHS checked too.
+        self.assert_violation("theorem t : True := trivial\nwhere aux : (Prop) := True \u2227 assumesHold\n", "6a")
+        self.assert_violation("theorem t : True := trivial\nwhere aux : Sort 0 := True \u2227 assumesHold\n", "6a")
+        scan_text("theorem t : True := trivial\nwhere aux : Prop := assumesHold \u2192 True\n")
+
+
 class ExactModulesEndToEndTests(unittest.TestCase):
     """`run(targets=resolve_exact_modules(...))` audits exactly the closure: a policy violation in an
     unselected module is never compiled, and the same violation inside the closure fails closed."""

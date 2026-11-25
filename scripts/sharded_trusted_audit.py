@@ -1100,10 +1100,10 @@ def _where_aux_items(body: list) -> list[tuple[list, list]]:
                     break
                 end = _group_end(body, end) if te in OPEN else end + 1
             aux_sig = body[start:end]
-            # If the auxiliary is a Prop-valued `def` (`where aux : Prop := ...`), also collect its RHS.
+            # If the auxiliary is Prop/Sort/Type-valued (`where aux : (Prop) := ...`, `: Nat → Sort 0`), also collect its RHS.
             rhs = []
             ret_tokens = [tok[0] for tok in body[i + 1:end]]
-            if end < n and body[end][0] == ":=" and ret_tokens and ret_tokens[-1] == "Prop":
+            if end < n and body[end][0] == ":=" and any(x in ("Prop", "Sort", "Type") for x in ret_tokens):
                 r = end + 1
                 while r < n and body[r][0] not in (":", ":="):
                     r = _group_end(body, r) if body[r][0] in OPEN else r + 1
@@ -1464,6 +1464,7 @@ def scan_sealing(path: str, text: str) -> None:
     clean_norm = clean.replace("\u00ab", " ").replace("\u00bb", " ")
     sealed: dict[str, str] = {}
     sealed_fields: set[str] = set()
+    sealed_arity: dict[str, int] = {}
     for match in re.finditer(r"\b(structure|class)\s+([A-Za-z_][\w.']*)", clean_norm):
         if not _doc_tag(text, match.start(), "@invariant"):
             continue
@@ -1482,8 +1483,11 @@ def scan_sealing(path: str, text: str) -> None:
         if re.search(r"\bderiving\b[\s\S]*?\bInhabited\b", decl):
             raise GuardViolation("6b", f"invariant structure {full_name} derives Inhabited", path, line)
         sealed[full_name] = ctor.group(2)
+        arity = 0
         for fm in re.finditer(r"^\s+([A-Za-z_][\w']*)\s*:(?!:)", decl[ctor.end():], re.MULTILINE):
             sealed_fields.add(fm.group(1))
+            arity += 1
+        sealed_arity[full_name] = max(1, arity)
     if not sealed:
         return
 
@@ -1655,9 +1659,50 @@ def scan_sealing(path: str, text: str) -> None:
         hit = walk(body, _sig_bound_names(sig), cod_mentions_sealed)
         if hit is not None:
             return hit
-        return _has_struct_literal_or_anon_ctor(
+        hit = _has_struct_literal_or_anon_ctor(
             body, ret_is_sealed, cod_mentions_sealed, kw == "instance", all_sealed_types, sealed_fields
         )
+        if hit is not None or not mentions_sealed(sig + body):
+            return hit
+        # Sealed context: Lean's expected type can make `⟨..⟩`, leading-dot `.mk ..`, or
+        # `{ f := .. }` construct a sealed structure anywhere (projection / consumer arguments,
+        # `∃ r : R`, `Option R`, ...), which the scanner cannot infer, so reject them all.
+        scan = body
+        if (body and body[0][0] == "⟨" and _group_end(body, 0) == len(body)
+                and ((kw == "instance" and not ret_is_sealed) or not cod_mentions_sealed)):
+            scan = body[1:-1]  # the outer `⟨..⟩` builds the (non-sealed) declared codomain / class
+        for i, (t, line, off) in enumerate(scan):
+            if t == "⟨":
+                end, depth, comps = _group_end(scan, i), 0, 1
+                for tok in scan[i + 1:end - 1]:
+                    depth += 1 if tok[0] in OPEN else -1 if tok[0] in CLOSE else 0
+                    comps += 1 if depth == 0 and tok[0] == "," else 0
+                if comps >= min_arity:
+                    return line
+            elif t == "." and i + 1 < len(scan) and scan[i + 1][0] in sealed_ctors_all and not (
+                    i > 0 and scan[i - 1][2] + len(scan[i - 1][0]) == off
+                    and (scan[i - 1][0] in CLOSE or re.fullmatch(r"[\w.'!?]+", scan[i - 1][0]))):
+                return line  # leading-dot constructor (not an adjacent projection `x).mk`)
+            elif t == "{":
+                inner = scan[i + 1:_group_end(scan, i) - 1]
+                if any(inner[k][0] == ":=" and k > 0 and inner[k - 1][0] in sealed_fields for k in range(len(inner))):
+                    return line
+        return None
+
+    sealed_ctors_all = set(sealed.values())
+    min_arity = min(sealed_arity.values())
+    sealed_consumers = {name for _kw, name, sig, _body, _start in decls if name and any(
+        tok[0] in all_sealed_types or tok[0].split(".")[-1] in all_sealed_types for tok in sig)}
+
+    def mentions_sealed(tokens: list) -> bool:
+        """Whether `tokens` mention a sealed type, a sealed-type-qualified name (`R.lo`), or a
+        same-file declaration whose signature mentions a sealed type."""
+        for tok in tokens:
+            parts = tok[0].split(".")
+            if (tok[0] in all_sealed_types or any(p in all_sealed_types for p in parts)
+                    or tok[0] in sealed_consumers or parts[-1] in sealed_consumers):
+                return True
+        return False
 
     # Pass 2: fixed-point collection of `ctor_aliases` (`abbrev`) and `private_forwarders`.
     ctor_aliases: set[str] = set()
