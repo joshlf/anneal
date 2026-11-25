@@ -15306,6 +15306,93 @@ theorem evalDynToDynUnsize_nop_and_alignment_witness :
       (true, true, false, true, true, true) := by
   rfl
 
+/--
+Kernel-checked companion witness for the equal-key NOP path of
+`evalDynToDynUnsize` (same environment as
+`evalDynToDynUnsize_nop_and_alignment_witness`):
+1. a genuine `Sub` vtable with a live, aligned reference is accepted (`.ok`);
+2. a raw NOP cast keeps a dangling data word (`.ok`: raw pointers carry no
+   dereferenceability invariant);
+3. a reference NOP cast over a dangling data word is `.ub`;
+4. a genuine vtable of a *different* trait (`Sub`'s vtable presented as
+   `dyn Sup`) is `.ub` even on the NOP path.
+
+Reference (`compiler/rustc_const_eval/src/interpret/validity.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/validity.rs#L582-L589>
+
+> "// Make sure it is a genuine vtable pointer for the right trait.
+> try_validation!(
+>     self.ecx.get_ptr_vtable_ty(vtable, Some(data)),
+>     self.path,
+>     Ub(DanglingIntPointer{ .. } | InvalidVTablePointer(..)) =>
+>         format!("encountered {vtable}, but expected a vtable pointer"),
+>     Ub(InvalidVTableTrait { vtable_dyn_type, expected_dyn_type }) =>
+>         InvalidMetaWrongTrait { expected_dyn_type, vtable_dyn_type },"
+-/
+theorem evalDynToDynUnsize_nop_validity_positive_and_wrong_trait_witness :
+    (let layByte32 : TypeLayout :=
+       { size := { bytes := 32 }, align := { bytes := 1 }, backendRepr := .memory,
+         fields := .array { bytes := 1 } 32, variants := .single 0, isUninhabited := false }
+     let layA16 : TypeLayout :=
+       { size := { bytes := 16 }, align := { bytes := 16 }, backendRepr := .memory,
+         fields := .arbitrary ({ bytes := 0 } :: .nil) (0 :: .nil),
+         variants := .single 0, isUninhabited := false }
+     let layUnit : TypeLayout :=
+       { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+         fields := .primitive, variants := .single 0, isUninhabited := false }
+     let layouts : LayoutTable :=
+       { pointerBits := 64, isLittleEndian := true,
+         entries := layUnit :: layByte32 :: layA16 :: .nil }
+     let localDecls : List LocalDecl :=
+       { mutability := .not, ty := { kind := .array (.uint .u8) 32, layoutIdx := 1 }, debugName := .none } ::
+       { mutability := .not, ty := { kind := .adt "A16" .nil, layoutIdx := 2 }, debugName := .none } ::
+       { mutability := .not, ty := { kind := .adt "A16" .nil, layoutIdx := 2 }, debugName := .none } :: .nil
+     let locals : List LocalSlot := .init .unit :: .init .unit :: .dead :: .nil
+     let hdrSlots : List CapturedVTableSlot := .dropInPlace .none :: .size :: .align :: .nil
+     let vtSub : CapturedVTable :=
+       { vtableId := 0, vtableAllocId := vtableAllocBase, concreteTy := .adt "A16" .nil,
+         dynKey := "Sub", sizeBytes := 16, alignBytes := 16,
+         primarySuperVTableId? := .some 1, slots := hdrSlots }
+     let vtSup : CapturedVTable :=
+       { vtableId := 1, vtableAllocId := Nat.add vtableAllocBase 1, concreteTy := .adt "A16" .nil,
+         dynKey := "Sup", sizeBytes := 16, alignBytes := 16,
+         primarySuperVTableId? := .none, slots := hdrSlots }
+     let body : CapturedMir :=
+       { defPath := "witness", phase := .runtimePostCleanup, role := .subject,
+         argCount := 0, localDecls := .nil, basicBlocks := .nil,
+         fnAbi := { args := .nil, ret := { layout := layUnit, mode := .ignore },
+                    conv := .rust, canUnwind := false },
+         layouts := layouts, allocations := .nil,
+         vtables := vtSub :: vtSup :: .nil }
+     let borrows : List BorrowEntry :=
+       { tag := 1, targetLocal := 0, targetProjection := .nil, perm := .active } ::
+       { tag := 2, targetLocal := 1, targetProjection := .nil, perm := .active } ::
+       { tag := 3, targetLocal := 2, targetProjection := .nil, perm := .active } :: .nil
+     let mv : DynMemView :=
+       { borrows := borrows, globals := .nil, callerLocals := .nil, callStack := .nil,
+         dynBodies := body :: .nil, fnPtrs := .nil, nextAllocId := 100,
+         activeProtectors := .nil, nextTag := 10 }
+     let dataAligned : Value := .ptr { allocId := 2, offsetBytes := 0 } 8
+     let dataDangling : Value := .ptr { allocId := 3, offsetBytes := 0 } 8
+     let subVt : Value := .ptr { allocId := vtSub.vtableAllocId, offsetBytes := 0 } 8
+     let isUb : DynCheck Value → Bool
+       | .ub => true
+       | _ => false
+     let isOk : DynCheck Value → Bool
+       | .ok _ => true
+       | _ => false
+     (isOk (evalDynToDynUnsize locals mv localDecls layouts
+              (.aggregate 0 (dataAligned :: subVt :: .nil)) "Sub" "Sub" true false),
+      isOk (evalDynToDynUnsize locals mv localDecls layouts
+              (.aggregate 0 (dataDangling :: subVt :: .nil)) "Sub" "Sub" false false),
+      isUb (evalDynToDynUnsize locals mv localDecls layouts
+              (.aggregate 0 (dataDangling :: subVt :: .nil)) "Sub" "Sub" true false),
+      isUb (evalDynToDynUnsize locals mv localDecls layouts
+              (.aggregate 0 (dataAligned :: subVt :: .nil)) "Sup" "Sup" false false))) =
+      (true, true, true, true) := by
+  rfl
+
 /-- Mutability of an unsizing source `src` is compatible with target `dst`
 (`&mut`/`*mut` may weaken to `&`/`*const`, never the reverse). -/
 @[reducible]
