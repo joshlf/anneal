@@ -2803,6 +2803,10 @@ theorem prim {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kind) 
   · exact Or.inr (Or.inr (Or.inl ⟨it, hk⟩))
   · exact Or.inr (Or.inr (Or.inr ⟨ut, hk⟩))
 
+theorem isFloatTy_false {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kind) :
+    isFloatTy ty = false := by
+  rcases h with ⟨it, hk⟩ | ⟨ut, hk⟩ <;> simp [isFloatTy, hk]
+
 theorem ne_bool {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kind) :
     ty.kind ≠ .bool := by
   rcases h with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] <;> nofun
@@ -3955,6 +3959,25 @@ inductive WellTypedScalarBinOp (layouts : LayoutTable) (localDecls : List LocalD
       dstTy.kind = .bool →
       WellTypedScalarBinOp layouts localDecls bop lhsTy rhsTy dstTy
 
+theorem WellTypedScalarUnOp.src_isFloatTy_false {uop : MirAst.UnOp} {srcTy dstTy : Ty}
+    (h : WellTypedScalarUnOp uop srcTy dstTy) :
+    isFloatTy srcTy = false := by
+  cases h with
+  | intNot _ _ _ hi _ => exact hi.isFloatTy_false
+  | boolNot _ _ hb _ => simp [isFloatTy, hb]
+  | intNeg _ _ _ hi _ _ => exact hi.isFloatTy_false
+
+theorem WellTypedScalarBinOp.operands_isFloatTy_false {layouts : LayoutTable}
+    {localDecls : List LocalDecl} {bop : MirAst.BinOp} {lhsTy rhsTy dstTy : Ty}
+    (h : WellTypedScalarBinOp layouts localDecls bop lhsTy rhsTy dstTy) :
+    isFloatTy lhsTy = false ∧ isFloatTy rhsTy = false := by
+  cases h with
+  | intArithOrBitwise _ _ hl hr _ => exact ⟨hl.isFloatTy_false, hr.isFloatTy_false⟩
+  | intCmp _ _ hl hr _ => exact ⟨hl.isFloatTy_false, hr.isFloatTy_false⟩
+  | intWithOverflow _ _ hl hr _ _ => exact ⟨hl.isFloatTy_false, hr.isFloatTy_false⟩
+  | intShift _ _ _ hl hr _ => exact ⟨hl.isFloatTy_false, hr.isFloatTy_false⟩
+  | boolBitwise _ hl hr _ => exact ⟨by simp [isFloatTy, hl], by simp [isFloatTy, hr]⟩
+
 /-- Syntactic well-typedness of a scalar `MirAst.Rvalue` producing `dstTy`. -/
 inductive WellTypedScalarRvalue
     (body : CapturedMir)
@@ -5075,7 +5098,11 @@ theorem step_assign_scalar_simulation_ext
               .ok v' locals₁ s.memory := by
             cases uop with
             | not => unfold evalRvalue; dsimp only; rw [hstack, hbor, hcaller, ha_op]; exact ha_uop
-            | neg => unfold evalRvalue; dsimp only; rw [hstack, hbor, hcaller, ha_op]; exact ha_uop
+            | neg =>
+              have hnf : isFloatOptTy (operandTy body.localDecls body.layouts op) = false := by
+                rw [hop.operandTy_eq]; simp [isFloatOptTy, huop.src_isFloatTy_false]
+              unfold evalRvalue; dsimp only; rw [hstack, hbor, hcaller, ha_op]; dsimp only
+              rw [hnf]; exact ha_uop
             | ptrMetadata => cases huop
           rw [hrv_ok]
           dsimp only
@@ -5224,6 +5251,10 @@ theorem step_assign_scalar_simulation_ext
             | boolBitwise h =>
               simp [IsNonOvfArithOrBitwiseBinOp, IsBitwiseBinOp, IsCmpBinOp,
                 IsWithOverflowBinOp, IsShiftBinOp] at h
+          have hnf_l : isFloatOptTy (operandTy body.localDecls body.layouts lhsOp) = false := by
+            rw [hlhsOp.operandTy_eq]; simp [isFloatOptTy, hbop.operands_isFloatTy_false.1]
+          have hnf_r : isFloatOptTy (operandTy body.localDecls body.layouts rhsOp) = false := by
+            rw [hrhsOp.operandTy_eq]; simp [isFloatOptTy, hbop.operands_isFloatTy_false.2]
           cases hbin_sim with
           | ub msg =>
             have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
@@ -5233,7 +5264,7 @@ theorem step_assign_scalar_simulation_ext
               dsimp only
               rw [ha_rhs]
               dsimp only
-              cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [ha_bin])
+              cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hnf_l, hnf_r]; dsimp only [Bool.or]; rw [ha_bin])
             have hm_err : Miri.Interpreter.Step.evalStatement
                 (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
                 (m₂, .error (.undefinedBehavior msg)) := by
@@ -5262,7 +5293,7 @@ theorem step_assign_scalar_simulation_ext
                 dsimp only
                 rw [ha_rhs]
                 dsimp only
-                cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [ha_bin])
+                cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hnf_l, hnf_r]; dsimp only [Bool.or]; rw [ha_bin])
               rw [hrv_ok]
               dsimp only
               rw [hprot, hbor]

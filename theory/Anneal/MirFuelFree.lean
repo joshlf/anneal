@@ -6071,6 +6071,49 @@ theorem evalUnaryNot_eq_withMem
   unfold evalUnaryNot
   repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
 
+theorem evalFloatUnaryNeg_eq_withMem
+    (sc : ScalarInt) (optTy : Option Ty) (locals : List LocalSlot)
+    (mem : Memory) :
+    evalFloatUnaryNeg sc optTy locals mem =
+      RvalueEvalResult.withMem mem
+        (evalFloatUnaryNeg sc optTy locals emptyMemory) := by
+  unfold evalFloatUnaryNeg
+  repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
+
+theorem evalFloatScalarBinOp_eq_withMem
+    (op : BinOp) (lhs rhs : ScalarInt) (lhsTy? rhsTy? : Option Ty)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals mem =
+      RvalueEvalResult.withMem mem
+        (evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals emptyMemory) := by
+  unfold evalFloatScalarBinOp
+  cases lhsTy? with
+  | none => rfl
+  | some lTy =>
+    cases rhsTy? with
+    | none => rfl
+    | some rTy =>
+      dsimp only
+      cases ieeeFormatOfTy? lTy with
+      | none => rfl
+      | some fL =>
+        cases ieeeFormatOfTy? rTy with
+        | none => rfl
+        | some fR =>
+          dsimp only
+          cases
+            Bool.and
+              (match fL, fR with
+               | .binary32, .binary32 => true
+               | .binary64, .binary64 => true
+               | _, _ => false)
+              (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth))
+          with
+          | false => rfl
+          | true =>
+            dsimp only
+            cases evalFloatBinOp op fL lhs.bits rhs.bits <;> rfl
+
 private def evalByteCastBody
     (op : Operand) (targetTy : Ty) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (v : Value) (locals' : List LocalSlot) (mem : Memory) : RvalueEvalResult :=
@@ -6548,7 +6591,11 @@ private theorem evalRvalue_binaryOp_pure_eq_withMem
         | scalar rhsSc =>
           cases op with
           | offset => exact absurd h_op (by decide)
-          | _ => exact evalScalarBinOp_eq_withMem _ lhsSc rhsSc locals₂ mem _
+          | _ =>
+            cases Bool.or (isFloatOptTy (operandTy localDecls layouts lhs))
+                (isFloatOptTy (operandTy localDecls layouts rhs)) with
+            | true => exact evalFloatScalarBinOp_eq_withMem _ lhsSc rhsSc _ _ locals₂ mem
+            | false => exact evalScalarBinOp_eq_withMem _ lhsSc rhsSc locals₂ mem _
         | ptr ptrVal sz =>
           rcases h_bor_or_np with h_borrows | h_np
           · cases isPtrRelationalBinOp op localDecls layouts lhs rhs with
@@ -6769,7 +6816,9 @@ theorem evalRvalue_pure_eq_withMem_core
       dsimp only [evalRvalue]
       rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
       rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-      repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
+      repeat' (first
+        | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
+        | exact evalFloatUnaryNeg_eq_withMem .. | split)
     | ptrMetadata =>
       dsimp only [evalRvalue, evalUnaryPtrMetadata]
       rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
@@ -10165,6 +10214,30 @@ theorem evalUnaryNot_pushBaseStack
       evalUnaryNot_eq_withMem _ _ _ mem]
   cases evalUnaryNot sc optTy locals emptyMemory <;> rfl
 
+theorem evalFloatUnaryNeg_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (sc : ScalarInt) (optTy : Option Ty) (locals : List LocalSlot)
+    (mem : Memory) :
+    evalFloatUnaryNeg sc optTy locals
+        (Memory.pushBaseStack calleeBody baseStack mem) =
+      RvalueEvalResult.pushBaseStack calleeBody baseStack
+        (evalFloatUnaryNeg sc optTy locals mem) := by
+  rw [evalFloatUnaryNeg_eq_withMem _ _ _ (Memory.pushBaseStack calleeBody baseStack mem),
+      evalFloatUnaryNeg_eq_withMem _ _ _ mem]
+  cases evalFloatUnaryNeg sc optTy locals emptyMemory <;> rfl
+
+theorem evalFloatScalarBinOp_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (op : BinOp) (lhs rhs : ScalarInt) (lhsTy? rhsTy? : Option Ty)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals
+        (Memory.pushBaseStack calleeBody baseStack mem) =
+      RvalueEvalResult.pushBaseStack calleeBody baseStack
+        (evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals mem) := by
+  rw [evalFloatScalarBinOp_eq_withMem _ _ _ _ _ _ (Memory.pushBaseStack calleeBody baseStack mem),
+      evalFloatScalarBinOp_eq_withMem _ _ _ _ _ _ mem]
+  cases evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals emptyMemory <;> rfl
+
 theorem evalRvalueRefDeref_pushBaseStack
     (calleeBody : CapturedMir)
     (locals : List LocalSlot) (borrowKind : BorrowKind) (place : Place)
@@ -10421,8 +10494,14 @@ theorem evalRvalue_pushBaseStack
               exact evalScalarPtrOffsetBinOp_pushBaseStack calleeBody []
                 locals₂ mem localDecls layouts lhsOp lhsSc rhsSc
             | _ =>
-              exact evalScalarBinOp_pushBaseStack calleeBody []
-                _ lhsSc rhsSc locals₂ mem _
+              cases Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                  (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+              | true =>
+                exact evalFloatScalarBinOp_pushBaseStack calleeBody []
+                  _ lhsSc rhsSc _ _ locals₂ mem
+              | false =>
+                exact evalScalarBinOp_pushBaseStack calleeBody []
+                  _ lhsSc rhsSc locals₂ mem _
           | ptr ptrVal sz =>
             cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
             | false => rfl
@@ -10494,7 +10573,9 @@ theorem evalRvalue_pushBaseStack
         | _ => rfl
     | neg =>
       dsimp only [evalRvalue, Memory.pushBaseStack]
-      repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
+      repeat' (first
+        | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
+        | exact evalFloatUnaryNeg_pushBaseStack calleeBody [] .. | split)
     | ptrMetadata =>
       dsimp only [evalRvalue, evalUnaryPtrMetadata, Memory.pushBaseStack]
       repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)

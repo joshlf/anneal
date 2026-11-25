@@ -5463,6 +5463,18 @@ private theorem evalWrapUnsafeBinder_preserves_tables (locals : List LocalSlot) 
     dsimp only
     repeat' (first | exact trivial | split)
 
+private theorem evalFloatUnaryNeg_preserves_tables (sc : ScalarInt) (optTy : Option Ty)
+    (locals : List LocalSlot) (mem : Memory) :
+    RvaluePreservesTables mem (evalFloatUnaryNeg sc optTy locals mem) := by
+  unfold evalFloatUnaryNeg; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalFloatScalarBinOp_preserves_tables (op : BinOp) (lhs rhs : ScalarInt)
+    (lhsTy? rhsTy? : Option Ty) (locals : List LocalSlot) (mem : Memory) :
+    RvaluePreservesTables mem (evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals mem) := by
+  unfold evalFloatScalarBinOp; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
 /-- Every `Rvalue` evaluation preserves `mem.callees` and `mem.traitImpls`. -/
 theorem evalRvalue_preserves_tables (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
@@ -5472,7 +5484,9 @@ theorem evalRvalue_preserves_tables (locals : List LocalSlot) (rv : Rvalue) (mem
     | exact trivial
     | exact ⟨rfl, rfl⟩
     | exact evalUnaryNot_preserves_tables _ _ _ _
+    | exact evalFloatUnaryNeg_preserves_tables _ _ _ _
     | exact evalScalarBinOp_preserves_tables _ _ _ _ _ _
+    | exact evalFloatScalarBinOp_preserves_tables _ _ _ _ _ _ _
     | exact evalByteCast_preserves_tables _ _ _ _ _ _
     | exact evalUnsafeFnPointer_preserves_tables _ _ _ _ _ _
     | exact evalUnsizeCoercion_preserves_tables _ _ _ _ _ _

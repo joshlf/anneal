@@ -1414,9 +1414,16 @@ def evalSymRvalueConcrete
     | .some (.concrete (.scalar lhs), slots₁) =>
       match evalSymOperand slots₁ rhsOp borrows localDecls layouts with
       | .some (.concrete (.scalar rhs), slots₂) =>
-        match evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
-        | .some v => .some (.concrete v, slots₂, borrows, nextTag)
-        | .none => .none
+        match
+          Bool.or
+            (isFloatOptTy (operandTy localDecls layouts lhsOp))
+            (isFloatOptTy (operandTy localDecls layouts rhsOp))
+        with
+        | true => .none
+        | false =>
+          match evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
+          | .some v => .some (.concrete v, slots₂, borrows, nextTag)
+          | .none => .none
       | _ => .none
     | _ => .none
   | .aggregate .tuple ops =>
@@ -1971,24 +1978,33 @@ theorem evalSymRvalueConcrete_sound
                     dsimp only at h
                     rw [evalSymOperand_sound args slots1 rhsOp mem.borrows mem.globals layouts (.concrete (.scalar rhs)) slots2 hRhs]
                     dsimp only [concretizeSymReadResult]
-                    cases hBin : evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
-                    | none =>
-                      rw [hBin] at h
+                    cases hFl : Bool.or
+                        (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                        (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+                    | true =>
+                      rw [hFl] at h
                       nomatch h
-                    | some resVal =>
-                      rw [hBin] at h
-                      injection h with hTup
-                      injection hTup with hV hRest1
-                      injection hRest1 with hS hRest2
-                      injection hRest2 with hB hT
-                      subst hV; subst hS; subst hB; subst hT
-                      cases op with
-                      | offset =>
-                        unfold evalSymScalarBinOp at hBin
-                        repeat' split at hBin
-                        all_goals contradiction
-                      | _ =>
-                        exact evalSymScalarBinOp_sound _ lhs rhs (concretizeSymSlots args slots2) mem (operandIsSigned localDecls lhsOp layouts) resVal hBin
+                    | false =>
+                      rw [hFl] at h
+                      cases hBin : evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
+                      | none =>
+                        rw [hBin] at h
+                        nomatch h
+                      | some resVal =>
+                        rw [hBin] at h
+                        injection h with hTup
+                        injection hTup with hV hRest1
+                        injection hRest1 with hS hRest2
+                        injection hRest2 with hB hT
+                        subst hV; subst hS; subst hB; subst hT
+                        cases op with
+                        | offset =>
+                          unfold evalSymScalarBinOp at hBin
+                          repeat' split at hBin
+                          all_goals contradiction
+                        | _ =>
+                          dsimp only
+                          exact evalSymScalarBinOp_sound _ lhs rhs (concretizeSymSlots args slots2) mem (operandIsSigned localDecls lhsOp layouts) resVal hBin
   | aggregate aggKind ops =>
     cases aggKind with
     | tuple =>
@@ -3170,18 +3186,25 @@ def symExtractPinEqStmt
     match isPtrOrUntypedOperand localDecls layouts lhsOp with
     | true => .none
     | false =>
-      match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
-      | .some (sv₁, slots₁) =>
-        match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
-        | .some (sv₂, slots₂) =>
-          match sv₁, sv₂ with
-          | .symArg idx, .concrete (.scalar sc) =>
-            symFinishPinEq st dstLoc slots₂ idx sc
-          | .concrete (.scalar sc), .symArg idx =>
-            symFinishPinEq st dstLoc slots₂ idx sc
-          | _, _ => .none
+      match
+        Bool.or
+          (isFloatOptTy (operandTy localDecls layouts lhsOp))
+          (isFloatOptTy (operandTy localDecls layouts rhsOp))
+      with
+      | true => .none
+      | false =>
+        match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
+        | .some (sv₁, slots₁) =>
+          match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
+          | .some (sv₂, slots₂) =>
+            match sv₁, sv₂ with
+            | .symArg idx, .concrete (.scalar sc) =>
+              symFinishPinEq st dstLoc slots₂ idx sc
+            | .concrete (.scalar sc), .symArg idx =>
+              symFinishPinEq st dstLoc slots₂ idx sc
+            | _, _ => .none
+          | .none => .none
         | .none => .none
-      | .none => .none
   | _ => .none
 
 /-- Extract a symbolic equality pin from the current statement of `body` at `st`. -/
@@ -3464,6 +3487,17 @@ theorem symExtractPinEq_branch_sound
                       | true => rw [h] at hExt; nomatch hExt
                     rw [hPtrTy] at hExt
                     dsimp only at hExt
+                    have hFl :
+                        Bool.or
+                          (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                          (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) = false := by
+                      cases h : Bool.or
+                          (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                          (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+                      | false => rfl
+                      | true => rw [h] at hExt; nomatch hExt
+                    rw [hFl] at hExt
+                    dsimp only at hExt
                     rw [evalStmt_assign_nil_eq] at hHold
                     dsimp only [evalRvalue] at hHold
                     cases hLhs : evalSymOperand st.slots lhsOp st.borrows body.localDecls body.layouts with
@@ -3524,6 +3558,7 @@ theorem symExtractPinEq_branch_sound
                                         rw [hPtrTy] at hHold
                                         exact False.elim hHold
                                       | scalar actualSc =>
+                                        rw [hFl] at hHold
                                         dsimp only [evalScalarBinOp] at hHold
                                         cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
                                         | true =>
@@ -3590,6 +3625,7 @@ theorem symExtractPinEq_branch_sound
                                         rw [hPtrTy] at hHold
                                         exact False.elim hHold
                                       | scalar actualSc =>
+                                        rw [hFl] at hHold
                                         dsimp only [evalScalarBinOp] at hHold
                                         rw [symFinishPinEq_expSz0_false hExt] at hHold
                                         dsimp only at hHold
@@ -6021,15 +6057,18 @@ def symExtractDerefSlicePinEq
       | .some stmt1, .some stmt2 =>
         match symMatchDerefSymArgLoad body st stmt1, stmt2.kind with
         | .some (idx, uKind, tmpLoc, borrows₁),
-          .assign ⟨eqDstLoc, .nil⟩ (.binaryOp .eq (.move ⟨tmpLoc2, .nil⟩) (.constant { val := .scalar (.int expectedSc), .. })) =>
+          .assign ⟨eqDstLoc, .nil⟩ (.binaryOp .eq (.move ⟨tmpLoc2, .nil⟩) (.constant { ty := cTy2, val := .scalar (.int expectedSc) })) =>
           match
             Nat.beq tmpLoc tmpLoc2,
             Nat.beq (uintBytesOfKind uKind) expectedSc.sizeBytes,
             Nat.beq expectedSc.sizeBytes 0,
             isPtrOrUntypedOperand body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩),
+            Bool.or
+              (isFloatOptTy (operandTy body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩)))
+              (isFloatOptTy (operandTy body.localDecls body.layouts (.constant { ty := cTy2, val := .scalar (.int expectedSc) }))),
             set? st.slots tmpLoc (.concrete .uninit)
           with
-          | true, true, false, false, .some slotsAfterMove =>
+          | true, true, false, false, false, .some slotsAfterMove =>
             match get? slotsAfterMove eqDstLoc with
             | .none => .none
             | .some (.concrete .dead) => .none
@@ -6054,7 +6093,7 @@ def symExtractDerefSlicePinEq
                 }
                 .some (idx, expectedSc, stTrue, stFalse)
               | _, _ => .none
-          | _, _, _, _, _ => .none
+          | _, _, _, _, _, _ => .none
         | _, _ => .none
       | _, _ => .none
 
@@ -6144,6 +6183,16 @@ theorem symExtractDerefSlicePinEq_branch_sound
                                             | true => rw [hPtrOp] at hExt; nomatch hExt
                                             | false =>
                                               rw [hPtrOp] at hExt
+                                              have hFl :
+                                                  Bool.or
+                                                    (isFloatOptTy (operandTy body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩)))
+                                                    (isFloatOptTy (operandTy body.localDecls body.layouts (.constant { ty := cTy2, val := .scalar (.int sc0) }))) = false := by
+                                                cases h : Bool.or
+                                                    (isFloatOptTy (operandTy body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩)))
+                                                    (isFloatOptTy (operandTy body.localDecls body.layouts (.constant { ty := cTy2, val := .scalar (.int sc0) }))) with
+                                                | false => rfl
+                                                | true => rw [h] at hExt; nomatch hExt
+                                              rw [hFl] at hExt
                                               cases hSetMove : set? st.slots tmpLoc (.concrete .uninit) with
                                               | none => rw [hSetMove] at hExt; nomatch hExt
                                               | some slotsAfterMove =>
@@ -6225,7 +6274,9 @@ theorem symExtractDerefSlicePinEq_branch_sound
                                                           rw [evalSymOperand_sound args st1.slots (.move ⟨tmpLoc, .nil⟩) borrows₁ body.allocations body.layouts (.concrete (.scalar actualSc)) slotsAfterMove hLhsOp] at hHold
                                                           dsimp only [concretizeSymReadResult] at hHold
                                                           rw [evalSymOperand_sound args slotsAfterMove (.constant { ty := cTy2, val := .scalar (.int sc0) }) borrows₁ body.allocations body.layouts (.concrete (.scalar sc0)) slotsAfterMove hRhsOp] at hHold
-                                                          dsimp only [concretizeSymReadResult, evalScalarBinOp] at hHold
+                                                          dsimp only [concretizeSymReadResult] at hHold
+                                                          rw [hFl] at hHold
+                                                          dsimp only [evalScalarBinOp] at hHold
                                                           have hActSzEq : actualSc.sizeBytes = sc0.sizeBytes :=
                                                             Eq.trans
                                                               (extractValueScalarSlice0?_sizeBytes v (uintBytesOfKind uKind) actualSc hSlice)
@@ -6647,6 +6698,17 @@ theorem symExtractPinEq_expSz0_false
                     | true => rw [hPtr] at hExt; nomatch hExt
                     | false =>
                       rw [hPtr] at hExt
+                      dsimp only at hExt
+                      have hFl :
+                          Bool.or
+                            (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                            (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) = false := by
+                        cases h : Bool.or
+                            (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                            (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+                        | false => rfl
+                        | true => rw [h] at hExt; nomatch hExt
+                      rw [hFl] at hExt
                       dsimp only at hExt
                       cases hLhs : evalSymOperand st.slots lhsOp st.borrows body.localDecls body.layouts with
                       | none => rw [hLhs] at hExt; nomatch hExt
@@ -8296,25 +8358,32 @@ def symExtractUpperBound1Stmt
       isPtrOrUntypedOperand localDecls layouts lhsOp
     with
     | true, false, false =>
-      match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
-      | .some (sv₁, slots₁) =>
-        match sv₁ with
-        | .symArg .zero =>
-          match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
-          | .some (sv₂, slots₂) =>
-            match sv₂ with
-            | .concrete (.scalar sc) =>
-              let tightSc : ScalarInt := {
-                bits := tightUnsignedUpperBoundBits op sc.bits
-                sizeBytes := sc.sizeBytes
-              }
-              match symFinishPinEq st dstLoc slots₂ 0 tightSc with
-              | .some (_, scOut, _, stFalse) => .some (scOut, stFalse)
-              | .none => .none
-            | _ => .none
-          | .none => .none
-        | _ => .none
-      | .none => .none
+      match
+        Bool.or
+          (isFloatOptTy (operandTy localDecls layouts lhsOp))
+          (isFloatOptTy (operandTy localDecls layouts rhsOp))
+      with
+      | true => .none
+      | false =>
+        match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
+        | .some (sv₁, slots₁) =>
+          match sv₁ with
+          | .symArg .zero =>
+            match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
+            | .some (sv₂, slots₂) =>
+              match sv₂ with
+              | .concrete (.scalar sc) =>
+                let tightSc : ScalarInt := {
+                  bits := tightUnsignedUpperBoundBits op sc.bits
+                  sizeBytes := sc.sizeBytes
+                }
+                match symFinishPinEq st dstLoc slots₂ 0 tightSc with
+                | .some (_, scOut, _, stFalse) => .some (scOut, stFalse)
+                | .none => .none
+              | _ => .none
+            | .none => .none
+          | _ => .none
+        | .none => .none
     | _, _, _ => .none
   | _ => .none
 
@@ -8400,6 +8469,17 @@ theorem symExtractUpperBound1_sound
                         | false => rfl
                         | true => rw [h] at hExt; nomatch hExt
                       rw [hPtrTy] at hExt
+                      dsimp only at hExt
+                      have hFl :
+                          Bool.or
+                            (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                            (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) = false := by
+                        cases h : Bool.or
+                            (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                            (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+                        | false => rfl
+                        | true => rw [h] at hExt; nomatch hExt
+                      rw [hFl] at hExt
                       dsimp only at hExt
                       rw [evalStmt_assign_nil_eq] at hHold
                       dsimp only [evalRvalue] at hHold
@@ -8489,6 +8569,8 @@ theorem symExtractUpperBound1_sound
                                                   have hNotOff : op = .le ∨ op = .lt ∨ op = .eq := by
                                                     cases op <;> simp_all [isUnsignedUpperBoundOp]
                                                   rcases hNotOff with rfl | rfl | rfl <;> (
+                                                    dsimp only at hHold
+                                                    rw [hFl] at hHold
                                                     dsimp only at hHold
                                                     rw [hSig] at hHold
                                                     cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
@@ -10298,11 +10380,18 @@ def symExtractEnsuresUpperBound1Stmt
               Nat.beq sc.sizeBytes 0
             with
             | true, false, false =>
-              let tightSc : ScalarInt := {
-                bits := tightUnsignedUpperBoundBits op sc.bits
-                sizeBytes := sc.sizeBytes
-              }
-              symFinishEnsTrue st dstLoc slots₂ tightSc
+              match
+                Bool.or
+                  (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                  (isFloatOptTy (operandTy localDecls layouts rhsOp))
+              with
+              | true => .none
+              | false =>
+                let tightSc : ScalarInt := {
+                  bits := tightUnsignedUpperBoundBits op sc.bits
+                  sizeBytes := sc.sizeBytes
+                }
+                symFinishEnsTrue st dstLoc slots₂ tightSc
             | _, _, _ => .none
           | _ => .none
         | .none => .none
@@ -10430,6 +10519,17 @@ theorem symExtractEnsuresUpperBound1_sound
                                         | false =>
                                           rw [hSz0] at hExt
                                           dsimp only at hExt
+                                          have hFl :
+                                              Bool.or
+                                                (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                                                (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) = false := by
+                                            cases h : Bool.or
+                                                (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                                                (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+                                            | false => rfl
+                                            | true => rw [h] at hExt; nomatch hExt
+                                          rw [hFl] at hExt
+                                          dsimp only at hExt
                                           let tightSc : ScalarInt := {
                                             bits := tightUnsignedUpperBoundBits op sc0.bits
                                             sizeBytes := sc0.sizeBytes
@@ -10459,6 +10559,8 @@ theorem symExtractEnsuresUpperBound1_sound
                                           have hNotOff : op = .le ∨ op = .lt ∨ op = .eq := by
                                             cases op <;> simp_all [isUnsignedUpperBoundOp]
                                           rcases hNotOff with rfl | rfl | rfl <;> (
+                                            dsimp only
+                                            rw [hFl]
                                             dsimp only
                                             rw [hSig]
                                             rw [evalScalarBinOp_unsignedUpperBound_eq

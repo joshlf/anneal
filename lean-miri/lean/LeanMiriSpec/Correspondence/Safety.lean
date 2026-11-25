@@ -3701,6 +3701,10 @@ theorem step_assign_lm1_2_simulation_ext
             ⟨imm₂, translateTy rhsTy body.layouts⟩
           assertRvalueLayoutPub result.layout (translateTy dstDecl.ty body.layouts)
           pure result.imm) m₂ = mBin at hbin_sim
+        have hnf_l : isFloatOptTy (operandTy body.localDecls body.layouts lhsOp) = false := by
+          rw [hlhsOp.operandTy_eq]; simp [isFloatOptTy, isFloatTy, hlhs]
+        have hnf_r : isFloatOptTy (operandTy body.localDecls body.layouts rhsOp) = false := by
+          rw [hrhsOp.operandTy_eq]; simp [isFloatOptTy, isFloatTy, hrhs]
         cases hbin_sim with
         | ub msg =>
           have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
@@ -3712,6 +3716,7 @@ theorem step_assign_lm1_2_simulation_ext
               dsimp only
               rw [ha_rhs]
               dsimp only
+              rw [hnf_l, hnf_r]; dsimp only [Bool.or]
               rw [ha_bin])
           have hm_err : Miri.Interpreter.Step.evalStatement
               (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
@@ -3743,6 +3748,7 @@ theorem step_assign_lm1_2_simulation_ext
                 dsimp only
                 rw [ha_rhs]
                 dsimp only
+                rw [hnf_l, hnf_r]; dsimp only [Bool.or]
                 exact ha_bin)
             rw [hrv_ok]
             dsimp only

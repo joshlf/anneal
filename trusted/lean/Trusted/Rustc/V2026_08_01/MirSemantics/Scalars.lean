@@ -1141,8 +1141,9 @@ def evalScalarBinOp
         | _ => .unsupported
 
 /--
-Target byte width for integer cast targets (`CastKind.intToInt`) on a 64-bit
-target (`usize` and `isize` have byte width `8`).
+Target byte width for integer cast targets (`CastKind.intToInt`), parameterized
+by target pointer width `ptrBytes` (defaulting to `8` bytes for 64-bit targets,
+or `4` bytes for 32-bit targets for `usize` and `isize`).
 
 Reference (The Rust Reference, "Type cast expressions — Numeric cast"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
@@ -1152,20 +1153,28 @@ Reference (The Rust Reference, "Type cast expressions — Numeric cast"):
 >
 > "Casting from a larger integer to a smaller integer (e.g. u32 -> u8) will
 > truncate"
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
+
+> "The size of this primitive is how many bytes it takes to reference any
+> location in memory. For example, on a 32 bit target, this is 4 bytes and on a
+> 64 bit target, this is 8 bytes."
 -/
-def intCastTargetBytes : RigidTy → Option Nat
+def intCastTargetBytes (ty : RigidTy) (ptrBytes : Nat := 8) : Option Nat :=
+  match ty with
   | .uint .u8 => .some 1
   | .uint .u16 => .some 2
   | .uint .u32 => .some 4
   | .uint .u64 => .some 8
   | .uint .u128 => .some 16
-  | .uint .usize => .some 8
+  | .uint .usize => .some ptrBytes
   | .int .i8 => .some 1
   | .int .i16 => .some 2
   | .int .i32 => .some 4
   | .int .i64 => .some 8
   | .int .i128 => .some 16
-  | .int .isize => .some 8
+  | .int .isize => .some ptrBytes
   | _ => .none
 
 /--
@@ -2501,5 +2510,556 @@ def evalFloatToFloatRoundTiesToEven (src dst : IeeeFormat) (bits : Nat) : Nat :=
         quiet * 2 ^ (dst.fractionBits - src.fractionBits)
       else quiet / 2 ^ (src.fractionBits - dst.fractionBits)
     encodeBits dst neg (2 ^ dst.exponentBits - 1) (Nat.lor payload' (2 ^ (dst.fractionBits - 1)))
+
+/-!
+## Pure IEEE-754 `binary32` / `binary64` arithmetic, comparisons, negation, and NaN relations
+
+Every definition below computes over exact bit patterns (`Nat`) and exact
+rationals (`Int` / `Nat`) with zero host `Float`, zero `extern`, and zero
+`Classical.choice`. Finite binary operations (`add`, `sub`, `mul`, `div`, `rem`)
+round once with IEEE 754-2008 `roundTiesToEven` (`roundRatioTiesToEven`),
+matching Rust 1.98.0 and pinned `rustc_apfloat` / Miri `FloatBits`.
+-/
+
+/--
+`true` iff `bits` decodes to a NaN in IEEE-754 format `f` (all-ones biased
+exponent and nonzero fraction field).
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+-/
+def isNaNBits (f : IeeeFormat) (bits : Nat) : Bool :=
+  match decodeBits f bits with
+  | .nan _ _ _ => true
+  | _ => false
+
+/--
+`true` iff `bits` decodes to a quiet NaN (QNaN: NaN with quiet bit `1`) in
+IEEE-754 format `f`.
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "a quiet/signaling bit. Rust assumes that the quiet/signaling bit being set to
+> 1 indicates a quiet NaN (QNaN), and a value of 0 indicates a signaling NaN
+> (SNaN)."
+-/
+def isQuietNaNBits (f : IeeeFormat) (bits : Nat) : Bool :=
+  match decodeBits f bits with
+  | .nan _ quiet _ => quiet
+  | _ => false
+
+/--
+`true` iff `bits` decodes to a signaling NaN (SNaN: NaN with quiet bit `0` and
+nonzero lower payload) in IEEE-754 format `f`.
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "a quiet/signaling bit. Rust assumes that the quiet/signaling bit being set to
+> 1 indicates a quiet NaN (QNaN), and a value of 0 indicates a signaling NaN
+> (SNaN)."
+-/
+def isSignalingNaNBits (f : IeeeFormat) (bits : Nat) : Bool :=
+  match decodeBits f bits with
+  | .nan _ quiet _ => Bool.not quiet
+  | _ => false
+
+/--
+Bitwise IEEE-754 unary negation (`UnOp.neg` on `f32` / `f64`): flips the sign
+bit of the canonical `f.width`-bit pattern while preserving the exponent,
+quiet/signaling bit, and full NaN payload verbatim.
+
+Reference (The Rust Reference, "Negation operators"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#negation-operators>
+
+> "* Negation `-`: Signed integer, Floating-point (`std::ops::Neg`)"
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "The rules for NaN values differ between arithmetic and non-arithmetic (or
+> “bitwise”) operations. The non-arithmetic operations are unary -, abs,
+> copysign, signum, {to,from}_bits, {to,from}_{be,le,ne}_bytes and
+> is_sign_{positive,negative}. These operations are guaranteed to exactly
+> preserve the bit pattern of their input except for possibly changing the sign
+> bit."
+-/
+def evalFloatNeg (f : IeeeFormat) (bits : Nat) : Nat :=
+  let b := bits % 2 ^ f.width
+  let sign := 2 ^ (f.width - 1)
+  if sign ≤ b then b - sign else b + sign
+
+/--
+Bitwise IEEE-754 absolute value (`f32::abs` / `f64::abs`): clears the sign bit
+while preserving the exponent, quiet/signaling bit, and full NaN payload
+verbatim.
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "The non-arithmetic operations are unary -, abs, copysign, signum,
+> {to,from}_bits, {to,from}_{be,le,ne}_bytes and is_sign_{positive,negative}.
+> These operations are guaranteed to exactly preserve the bit pattern of their
+> input except for possibly changing the sign bit."
+-/
+def evalFloatAbs (f : IeeeFormat) (bits : Nat) : Nat :=
+  bits % 2 ^ (f.width - 1)
+
+/-- Signed integer numerator `(-1)^neg * n` for exact rational arithmetic. -/
+def signedNum (neg : Bool) (n : Nat) : Int :=
+  if neg then -((n : Int)) else (n : Int)
+
+/--
+IEEE-754 partial ordering of two `f`-format bit patterns: any NaN operand yields
+`.none` (unordered); `-0.0` and `+0.0` compare `.some .eq`; signed infinities
+compare below/above all finite values; finite rationals compare by exact cross
+multiplication.
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+
+Reference (The Rust Reference, "Comparison operators"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#comparison-operators>
+
+> "Comparison operators are defined for primitive integer, floating-point, bool,
+> and char types, as well as for pointers and function pointers."
+-/
+def evalFloatPartialCompare (f : IeeeFormat) (lhsBits rhsBits : Nat) : Option Ordering :=
+  let l := decodeBits f (lhsBits % 2 ^ f.width)
+  let r := decodeBits f (rhsBits % 2 ^ f.width)
+  match l, r with
+  | .nan _ _ _, _ | _, .nan _ _ _ => .none
+  | .inf ln, .inf rn =>
+    .some
+      (match ln, rn with
+       | true, true => .eq
+       | false, false => .eq
+       | true, false => .lt
+       | false, true => .gt)
+  | .inf ln, _ => .some (if ln then .lt else .gt)
+  | _, .inf rn => .some (if rn then .gt else .lt)
+  | .zero _, .zero _ => .some .eq
+  | .zero _, .finite rn rnum _ =>
+    .some (if rnum = 0 then .eq else if rn then .gt else .lt)
+  | .finite ln lnum _, .zero _ =>
+    .some (if lnum = 0 then .eq else if ln then .lt else .gt)
+  | .finite ln lnum lden, .finite rn rnum rden =>
+    let lv := signedNum ln lnum * (rden : Int)
+    let rv := signedNum rn rnum * (lden : Int)
+    .some (if lv < rv then .lt else if lv = rv then .eq else .gt)
+
+/--
+IEEE-754 boolean comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) on `f32` / `f64`
+bit patterns derived from `evalFloatPartialCompare`. Returns `.none` for
+non-comparison `BinOp`s (and for `BinOp.cmp`, which MIR does not emit for
+floating-point types because `f32`/`f64` do not implement `Ord`). When either
+operand is NaN, `.ne` yields `.some true` and every other comparison yields
+`.some false`.
+
+Reference (The Rust Reference, "Comparison operators"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#comparison-operators>
+
+> "Comparison operators are defined for primitive integer, floating-point, bool,
+> and char types, as well as for pointers and function pointers."
+-/
+def evalFloatCmp (op : BinOp) (f : IeeeFormat) (lhsBits rhsBits : Nat) : Option Bool :=
+  let order := evalFloatPartialCompare f lhsBits rhsBits
+  match op with
+  | .eq => .some (match order with | .some .eq => true | _ => false)
+  | .ne => .some (match order with | .some .eq => false | _ => true)
+  | .lt => .some (match order with | .some .lt => true | _ => false)
+  | .le => .some (match order with | .some .lt => true | .some .eq => true | _ => false)
+  | .gt => .some (match order with | .some .gt => true | _ => false)
+  | .ge => .some (match order with | .some .gt => true | .some .eq => true | _ => false)
+  | _ => .none
+
+/-- Flip the sign bit of a decoded `FloatKind` (used for `sub x y = add x (-y)`). -/
+def negateFloatKind : FloatKind → FloatKind
+  | .zero neg => .zero (Bool.not neg)
+  | .finite neg n d => .finite (Bool.not neg) n d
+  | .inf neg => .inf (Bool.not neg)
+  | .nan neg q p => .nan (Bool.not neg) q p
+
+/--
+Exact IEEE-754 addition of two decoded values in format `f` under
+`roundTiesToEven` (IEEE 754-2008 §6.3 signed-zero rule: `-0.0 + -0.0 = -0.0`,
+and exact cancellation of opposite-sign nonzero operands yields `+0.0`).
+Non-finite NaN outcomes return the deterministic `preferredNaNBits f`; full
+nondeterministic NaN admissibility is modeled by `nanChoices` and
+`EvalFloatBinOpRel`.
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+
+Reference (The Rust Reference, "Numeric cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
+
+> "*** as defined in IEEE 754-2008 §4.3.1: pick the nearest floating point
+> number, preferring the one with an even least significant digit if exactly
+> halfway between two floating point numbers."
+-/
+def exactSumFloat (f : IeeeFormat) (lhs rhs : FloatKind) : Nat :=
+  match lhs, rhs with
+  | .nan _ _ _, _ | _, .nan _ _ _ => preferredNaNBits f
+  | .inf ln, .inf rn =>
+    if Bool.xor ln rn then preferredNaNBits f else infBits f ln
+  | .inf ln, _ => infBits f ln
+  | _, .inf rn => infBits f rn
+  | .zero ln, .zero rn => zeroBits f (Bool.and ln rn)
+  | .zero ln, .finite rn rnum rden =>
+    let sign := if rnum = 0 then Bool.and ln rn else rn
+    roundRatioTiesToEven f sign rnum rden
+  | .finite ln lnum lden, .zero rn =>
+    let sign := if lnum = 0 then Bool.and ln rn else ln
+    roundRatioTiesToEven f sign lnum lden
+  | .finite ln lnum lden, .finite rn rnum rden =>
+    let n : Int := signedNum ln lnum * (rden : Int) + signedNum rn rnum * (lden : Int)
+    let sign : Bool :=
+      if n = 0 then Bool.and (Nat.beq lnum 0) (Bool.and (Nat.beq rnum 0) (Bool.and ln rn))
+      else decide (n < 0)
+    roundRatioTiesToEven f sign n.natAbs (lden * rden)
+
+/--
+Deterministic base result of IEEE-754 binary arithmetic (`add`, `sub`, `mul`,
+`div`, `rem`) on `f32` / `f64` bit patterns under `roundTiesToEven`, matching
+`Miri.Interpreter.FloatBits.arithmetic`. Returns `.none` for non-arithmetic
+`BinOp`s.
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1621-L1650>
+
+> "pub enum BinOp {
+>     /// The `+` operator (addition)
+>     Add,
+>     ...
+>     /// The `-` operator (subtraction)
+>     Sub,
+>     ...
+>     /// The `*` operator (multiplication)
+>     Mul,
+>     ...
+>     /// The `/` operator (division)
+>     Div,
+>     /// The `%` operator (modulus)
+>     Rem,"
+
+Modeling choice: whenever an arithmetic operation produces a NaN,
+`evalFloatArithBase` deterministically returns `preferredNaNBits f`. Rust leaves
+the sign, quiet bit, and payload of an arithmetic NaN non-deterministic; the
+relational specification `EvalFloatBinOpRel` with `.nondeterministic` captures
+the admissible NaN choices (`nanChoices`).
+-/
+def evalFloatArithBase (op : BinOp) (f : IeeeFormat) (lhsBits rhsBits : Nat) : Option Nat :=
+  let lb := lhsBits % 2 ^ f.width
+  let rb := rhsBits % 2 ^ f.width
+  let l := decodeBits f lb
+  let r := decodeBits f rb
+  match op with
+  | .add => .some (exactSumFloat f l r)
+  | .sub => .some (exactSumFloat f l (negateFloatKind r))
+  | .mul =>
+    .some
+      (match l, r with
+       | .nan _ _ _, _ | _, .nan _ _ _ => preferredNaNBits f
+       | .inf _, .zero _ | .zero _, .inf _ => preferredNaNBits f
+       | .inf ln, .finite rn rnum _ =>
+         if rnum = 0 then preferredNaNBits f else infBits f (Bool.xor ln rn)
+       | .finite ln lnum _, .inf rn =>
+         if lnum = 0 then preferredNaNBits f else infBits f (Bool.xor ln rn)
+       | .inf ln, .inf rn => infBits f (Bool.xor ln rn)
+       | .zero ln, .zero rn => zeroBits f (Bool.xor ln rn)
+       | .zero ln, .finite rn _ _ => zeroBits f (Bool.xor ln rn)
+       | .finite ln _ _, .zero rn => zeroBits f (Bool.xor ln rn)
+       | .finite ln lnum lden, .finite rn rnum rden =>
+         roundRatioTiesToEven f (Bool.xor ln rn) (lnum * rnum) (lden * rden))
+  | .div =>
+    .some
+      (match l, r with
+       | .nan _ _ _, _ | _, .nan _ _ _ => preferredNaNBits f
+       | .inf _, .inf _ | .zero _, .zero _ => preferredNaNBits f
+       | .inf ln, .zero rn => infBits f (Bool.xor ln rn)
+       | .inf ln, .finite rn _ _ => infBits f (Bool.xor ln rn)
+       | .zero ln, .inf rn => zeroBits f (Bool.xor ln rn)
+       | .zero ln, .finite rn rnum _ =>
+         if rnum = 0 then preferredNaNBits f else zeroBits f (Bool.xor ln rn)
+       | .finite ln lnum _, .zero rn =>
+         if lnum = 0 then preferredNaNBits f else infBits f (Bool.xor ln rn)
+       | .finite ln _ _, .inf rn => zeroBits f (Bool.xor ln rn)
+       | .finite ln lnum lden, .finite rn rnum rden =>
+         if rnum = 0 then
+           if lnum = 0 then preferredNaNBits f else infBits f (Bool.xor ln rn)
+         else
+           roundRatioTiesToEven f (Bool.xor ln rn) (lnum * rden) (lden * rnum))
+  | .rem =>
+    .some
+      (match l, r with
+       | .nan _ _ _, _ | _, .nan _ _ _ | .inf _, _ | _, .zero _ => preferredNaNBits f
+       | .zero _, .inf _ | .finite _ _ _, .inf _ => lb
+       | .zero ln, .finite _ rnum _ =>
+         if rnum = 0 then preferredNaNBits f else zeroBits f ln
+       | .finite ln lnum lden, .finite _ rnum rden =>
+         if rnum = 0 then preferredNaNBits f
+         else
+           let q := (lnum * rden) / (lden * rnum)
+           let rem := lnum * rden - q * (lden * rnum)
+           roundRatioTiesToEven f ln rem (lden * rden))
+  | _ => .none
+
+/--
+NaN result selection mode for relational floating-point semantics
+(`EvalFloatBinOpRel` and `EvalRvalueFloatRel`):
+- `.deterministic`: selects only `preferredNaNBits target` (matching Miri with
+  `-Zmiri-deterministic-floats` and `evalFloatArithBase`).
+- `.nondeterministic`: permits any NaN bit pattern generated by `nanChoices`
+  (preferred NaN, quieted input NaNs, and unchanged signaling input NaNs with
+  either sign, matching Rust's portable NaN rules and Miri's `generate_nan`).
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "The following rules apply when a NaN value is returned from an arithmetic
+> operation:
+> - The result has a non-deterministic sign.
+> - The quiet bit and payload are non-deterministically chosen from the
+>   following set of options:
+>   - Preferred NaN: The quiet bit is set and the payload is all-zero.
+>   - Quieting NaN propagation: The quiet bit is set and the payload is copied
+>     from any input operand that is a NaN.
+>   - Unchanged NaN propagation: The quiet bit and payload are copied from any
+>     input operand that is a NaN."
+
+Modeling note: target-specific "extra" NaN payloads documented in `core` are not
+enumerated by `nanChoices` (matching Miri's `operator.rs::generate_nan`).
+-/
+inductive FloatArithMode : Type where
+  /-- Deterministic preferred-NaN mode. -/
+  | deterministic : FloatArithMode
+  /-- Nondeterministic NaN sign/payload selection mode (`nanChoices`). -/
+  | nondeterministic : FloatArithMode
+deriving DecidableEq
+
+/-- Quieted NaN candidates converted to `target` from each NaN element of `inputs`. -/
+def nanChoicesQuieted (target : IeeeFormat) : List (IeeeFormat × Nat) → List Nat
+  | .nil => .nil
+  | inp :: rest =>
+    let src := inp.1
+    let b := inp.2 % 2 ^ src.width
+    let tail := nanChoicesQuieted target rest
+    if isNaNBits src b then evalFloatToFloatRoundTiesToEven src target b :: tail
+    else tail
+
+/-- Unchanged signaling NaN candidates converted to `target` when their lower
+payload remains nonzero (clearing the quiet bit never produces infinity). -/
+def nanChoicesSignaling (target : IeeeFormat) : List (IeeeFormat × Nat) → List Nat
+  | .nil => .nil
+  | inp :: rest =>
+    let src := inp.1
+    let b := inp.2 % 2 ^ src.width
+    let tail := nanChoicesSignaling target rest
+    if isSignalingNaNBits src b then
+      let conv := evalFloatToFloatRoundTiesToEven src target b
+      let c := unpackBits target conv
+      let lower := c.fraction % 2 ^ (target.fractionBits - 1)
+      if lower = 0 then tail
+      else encodeBits target c.neg (2 ^ target.exponentBits - 1) lower :: tail
+    else tail
+
+/-- Expand each candidate NaN into `[cand, -cand]` (independent sign choice). -/
+def expandNanSigns (target : IeeeFormat) : List Nat → List Nat
+  | .nil => .nil
+  | cand :: rest => cand :: evalFloatNeg target cand :: expandNanSigns target rest
+
+/--
+Ordered list of admissible NaN bit patterns for an arithmetic operation (or
+float-to-float cast) targeting format `target` with inputs `inputs`, matching
+`Miri.Interpreter.FloatBits.nanChoices` element-for-element:
+- `.deterministic`: `[preferredNaNBits target]`;
+- `.nondeterministic`: `preferredNaNBits target` followed by quieted input NaNs
+  and nonzero-lower-payload unchanged signaling input NaNs, each paired with its
+  sign-flipped counterpart.
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "- Preferred NaN: The quiet bit is set and the payload is all-zero.
+> - Quieting NaN propagation: The quiet bit is set and the payload is copied
+>   from any input operand that is a NaN. If the inputs and outputs do not have
+>   the same payload size (i.e., for as casts), then
+>   - If the output is smaller than the input, low-order bits of the payload get
+>     dropped.
+>   - If the output is larger than the input, the payload gets filled up with 0s
+>     in the low-order bits.
+> - Unchanged NaN propagation: The quiet bit and payload are copied from any
+>   input operand that is a NaN. If the inputs and outputs do not have the same
+>   size (i.e., for as casts), the same rules as for “quieting NaN propagation”
+>   apply, with one caveat: if the output is smaller than the input, dropping
+>   the low-order bits may result in a payload of 0; a payload of 0 is not
+>   possible with a signaling NaN (the all-0 significand encodes an infinity) so
+>   unchanged NaN propagation cannot occur with some inputs."
+
+Modeling choice: excludes target-specific "extra" NaN payloads, matching Miri's
+`generate_nan`.
+-/
+def nanChoices (target : IeeeFormat) (inputs : List (IeeeFormat × Nat))
+    (mode : FloatArithMode) : List Nat :=
+  match mode with
+  | .deterministic => [preferredNaNBits target]
+  | .nondeterministic =>
+    let candidates :=
+      preferredNaNBits target ::
+        (nanChoicesQuieted target inputs ++ nanChoicesSignaling target inputs)
+    expandNanSigns target candidates
+
+/-- Boolean list membership test on `Nat` using `Nat.beq`. -/
+def natListMem (x : Nat) : List Nat → Bool
+  | .nil => false
+  | y :: ys => Bool.or (Nat.beq x y) (natListMem x ys)
+
+/--
+Decidable check that `bits % 2 ^ f.width` is an admissible quiet NaN in
+`nanChoices f inputs .nondeterministic` (preferred or quieted input NaN with
+either sign).
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "In particular, if all input NaNs are quiet (or if there are no input NaNs),
+> then the output NaN is definitely quiet. Signaling NaN outputs can only occur
+> if they are provided as an input"
+-/
+def isAdmissibleQuietNaN
+    (f : IeeeFormat)
+    (inputs : List (IeeeFormat × Nat))
+    (bits : Nat) : Bool :=
+  let b := bits % 2 ^ f.width
+  Bool.and (isQuietNaNBits f b) (natListMem b (nanChoices f inputs .nondeterministic))
+
+/--
+Deterministic executable evaluator for `f32` / `f64` binary operations:
+dispatches comparisons (`eq`, `ne`, `lt`, `le`, `gt`, `ge`) to `evalFloatCmp`
+returning a `bool` scalar, and arithmetic (`add`, `sub`, `mul`, `div`, `rem`) to
+`evalFloatArithBase` returning a scalar of width `f.byteWidth`. Returns `.none`
+for unsupported `BinOp`s.
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+
+Modeling choice: when an arithmetic operation yields NaN, `evalFloatBinOp`
+returns `preferredNaNBits f` (realizing `EvalFloatBinOpRel .deterministic`).
+-/
+def evalFloatBinOp (op : BinOp) (f : IeeeFormat) (lhsBits rhsBits : Nat) : Option ScalarInt :=
+  match evalFloatCmp op f lhsBits rhsBits with
+  | .some b => .some (boolToScalar b)
+  | .none =>
+    match evalFloatArithBase op f lhsBits rhsBits with
+    | .some bits => .some ⟨bits, f.byteWidth⟩
+    | .none => .none
+
+/--
+Relational specification of IEEE-754 `f32` / `f64` binary operations parameterized
+by `mode : FloatArithMode`:
+- Comparisons (`eq`, `ne`, `lt`, `le`, `gt`, `ge`) are deterministic and
+  mode-independent (`evalFloatCmp`).
+- Finite and infinite arithmetic outcomes (`add`, `sub`, `mul`, `div`, `rem`)
+  are uniquely determined by `evalFloatArithBase` (`roundTiesToEven`).
+- NaN arithmetic outcomes may be any `cand ∈ nanChoices f [(f, lhsBits % 2^f.width),
+  (f, rhsBits % 2^f.width)] mode`.
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "The following rules apply when a NaN value is returned from an arithmetic
+> operation:
+> - The result has a non-deterministic sign.
+> - The quiet bit and payload are non-deterministically chosen from the
+>   following set of options"
+
+Modeling note: `.deterministic` picks only `preferredNaNBits f` (matching
+`evalFloatBinOp`), whereas `.nondeterministic` admits preferred, quieted, and
+nonzero-payload signaling NaNs with either sign (excluding target-specific extra
+NaNs).
+-/
+def EvalFloatBinOpRel
+    (mode : FloatArithMode)
+    (op : BinOp)
+    (f : IeeeFormat)
+    (lhsBits rhsBits : Nat)
+    (out : ScalarInt) : Prop :=
+  match evalFloatCmp op f lhsBits rhsBits with
+  | .some b => out = boolToScalar b
+  | .none =>
+    match evalFloatArithBase op f lhsBits rhsBits with
+    | .some baseBits =>
+      if isNaNBits f baseBits = true then
+        ∃ cand,
+          cand ∈ nanChoices f [(f, lhsBits % 2 ^ f.width), (f, rhsBits % 2 ^ f.width)] mode ∧
+          out = ⟨cand, f.byteWidth⟩
+      else
+        out = ⟨baseBits, f.byteWidth⟩
+    | .none => False
+
+/--
+Policy parameterizing how byte-level transmutation and typed scalar decoding
+handle bytes carrying pointer provenance when decoded at non-pointer scalar
+types (integers, floats, `bool`, `char`, and non-pointer scalar/enum layouts):
+- `.strictUcg630Ub` (default): treats decoding provenance-carrying bytes into a
+  non-pointer scalar as undefined behavior (`.none` / `.ub`), matching the
+  conservative UCG #630 position and Rust's `const`-context rule.
+- `.stripProvenance`: discards byte provenance on non-pointer scalar decodes and
+  reads only the abstract byte values, matching MiniRust and runtime-stripping
+  semantics (`reference#1752`).
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation. (And even outside const, such transmutation is
+> touching on many unspecified aspects of the Rust memory model and should be
+> avoided. See below for alternatives.)"
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value. Producing a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+
+Modeling choice: because Rust 1.98.0 leaves non-`const` pointer-to-integer
+transmutation unspecified ("touching on many unspecified aspects of the Rust
+memory model"), the TCB parameterizes this boundary explicitly rather than
+hard-coding a single unguaranteed assumption. `.strictUcg630Ub` is the sound
+default (refining `.stripProvenance`), and neither policy ever permits forging
+reference (`.ref`) or function-pointer (`.fnPtr`) provenance.
+-/
+inductive Ptr2IntTransmutePolicy : Type where
+  /-- Reject provenance-carrying bytes on non-pointer scalar decode (default, conservative UB). -/
+  | strictUcg630Ub : Ptr2IntTransmutePolicy
+  /-- Discard provenance on non-pointer scalar decode (MiniRust / stripping semantics). -/
+  | stripProvenance : Ptr2IntTransmutePolicy
+deriving DecidableEq
 
 end Trusted.Rustc.V2026_08_01.MirSemantics
