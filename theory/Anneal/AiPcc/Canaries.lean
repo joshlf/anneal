@@ -44,6 +44,7 @@ Canary suite for the `Anneal.AiPcc` stack. It is not imported by
      widening `IntToInt` cast (returns a value `< 2^32`);
    * a signed `i32` branch `if x >= 0 { x / 2 } else { 0 }` refined through a
      `switchInt` guard on a copy temporary (returns a value in `[0, 2^30)`).
+   * a diverging `loop {}` that is safe and provably never returns.
    The canaries are also packaged as trusted `VerificationResult`,
    `StatefulVerificationResult`, and `TraceVerificationResult` certificates
    of concrete claims.
@@ -379,6 +380,34 @@ theorem canary_signed_half_pcc_safe (x : Nat) (hx : x < modPow2 32) :
     | ⟨bits, hV, hLe⟩ =>
       exact ⟨bits, hV,
         Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 30) Nat.one_pos)⟩
+
+/-! ## Canary 4: A Diverging Loop Is Safe and Never Returns -/
+
+/-- `fn spin() -> u8 { loop {} }`: a single self-looping block. -/
+def spinLoopBody : CapturedMir :=
+  canaryBody "ai_pcc::spin_loop" 0 [canaryUintTy .u8] [canaryBlock [] (.goto 0)]
+
+/-- Loop-header invariant of `spinLoopBody` (block `0` is the cutpoint). -/
+def spinLoopCutpoints : List (Nat × MirAbsEnv) :=
+  [(0, entryEnv spinLoopBody.localDecls [])]
+
+/-- Single-pass certificate check of `spinLoopBody` with the unsatisfiable
+return postcondition `.dead`, by `rfl`. -/
+theorem spinLoop_cert_ok :
+    verifyMirCutpoints spinLoopBody (entryEnv spinLoopBody.localDecls [])
+      .dead spinLoopCutpoints [0] = true := rfl
+
+/-- Unbounded-iteration soundness without termination: the diverging body is
+`SafeFrom` and UB-free, and the unsatisfiable postcondition proves that it
+never returns. -/
+theorem canary_spin_loop_safe_never_returns :
+    SafeFrom spinLoopBody (initMachineState spinLoopBody []) ∧
+    MirNoUBTree (mirCallTree spinLoopBody []) ∧
+    ∀ v, ¬ ReturnsFrom spinLoopBody (initMachineState spinLoopBody []) v := by
+  have h := verifyMirCutpoints_sound_call spinLoop_cert_ok (entryArgsOk_nil _)
+  refine ⟨h.1, h.2.2.1, fun v hRet => ?_⟩
+  match h.2.1 v hRet with
+  | ⟨_, _, hDen⟩ => nomatch hDen
 
 /-! ## Trusted `VerificationResult` Certificates -/
 

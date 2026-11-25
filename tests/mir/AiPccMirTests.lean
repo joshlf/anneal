@@ -732,6 +732,13 @@ axioms: [propext, Quot.sound]
 #print axioms canary_signed_half_traceVerificationResult
 
 /--
+info: 'Anneal.AiPcc.canary_spin_loop_safe_never_returns' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_spin_loop_safe_never_returns
+
+/--
 info: 'Anneal.AiPcc.checkMirCert_sound' depends on axioms:
 [propext, Quot.sound]
 -/
