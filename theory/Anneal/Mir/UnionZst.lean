@@ -39,9 +39,12 @@ Stated and proved directly against `Trusted.Rustc.V2026_06_01.MirSemantics.readP
   `MirLowerError::InactiveUnionField` (`readUnion_zeroByte_subProj`, `readUnion_zeroByte_subProj_iff`,
   `kani5159_inhabitedLeaf_through_uninhabitedContainer_subProj_unsupported`,
   `readUnion_posLeaf_subProj`, `readUnion_zeroByte_fieldRoot`,
-  `readUnion_uninhabited_nonEmpty_fallthrough_unsupported`, with non-vacuity witnesses on every
+  `readUnion_uninhabited_nonEmpty_fallthrough_unsupported`,
+  `readUnion_uninhabited_nonEmpty_noOffset_unsupported`, with non-vacuity witnesses on every
   `tyByteSize rFieldTy` arm in `kani5159_witness_nonStatic_fallthrough`,
-  `kani5159_v2026_08_01_nonStatic_fallthrough_parity`, and
+  `kani5159_witness_noOffset_fallthrough`,
+  `kani5159_v2026_08_01_nonStatic_fallthrough_parity`,
+  `kani5159_v2026_08_01_noOffset_fallthrough_parity`, and
   `kani5159_v2026_08_01_nonEmpty_fallthrough_parity`).
 - A 0-byte field or sub-place occupies no storage, so an inhabited one not passing through an
   uninhabited container reads its unique value even from all-`.uninit` storage (`kani#5176`:
@@ -1070,6 +1073,111 @@ theorem readUnion_uninhabited_nonEmpty_fallthrough_unsupported
     (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
     (try cases l.fieldLayouts) <;> simp only [] <;>
     rw [hRes] <;> simp only [] <;> rw [hBounds] <;> simp only [] <;>
+    (cases tyByteSize localDecls layouts _ with
+     | none =>
+       simp only [hUninh]
+       cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
+       | none => rfl
+       | some leafTy => simp only [hNotUninhLeaf leafTy hL]
+     | some sz =>
+       cases sz with
+       | zero =>
+         simp only [hUninh]
+         cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
+         | none => rfl
+         | some leafTy => simp only [hNotUninhLeaf leafTy hL]
+       | succ szPred =>
+         dsimp only
+         cases hk : fieldTy.kind <;>
+           first
+           | (exfalso; unfold tyIsUninhabited at hUninh; (try dsimp only at hUninh);
+              (try rw [hTk] at hUninh); rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+           | ((try rw [hk] at hUninh); simp only [hUninh]
+              cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
+              | none => rfl
+              | some leafTy =>
+                (try rw [← hk] at hL)
+                simp only [hNotUninhLeaf leafTy hL]))
+
+set_option maxHeartbeats 800000 in
+/-- **Non-empty sub-projection fallthrough guard, statically bounded but offset-less (any field
+size).** Companion to `readUnion_uninhabited_nonEmpty_fallthrough_unsupported` covering the other
+way `directSubReadOpt` can be `.none`: the sub-projection `p :: ps` through an uninhabited union
+field passes `checkStaticSubProjBounds` but `projectionChainByteOffset?` yields no offset. If the
+loaded leaf is not uninhabited, the read still fails closed with `.unsupported` (never `.ub`). -/
+theorem readUnion_uninhabited_nonEmpty_noOffset_unsupported
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (hUninh : tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = true)
+    (p : ProjectionElem) (ps idxResolved : List ProjectionElem)
+    (hRes : resolveUnionSubProjIndices locals (p :: ps) = some idxResolved)
+    (hBounds : checkStaticSubProjBounds localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+      (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = true)
+    (hOff : projectionChainByteOffset? layouts (some (unionFieldReadTy localDecls layouts l idx fieldTy))
+      none none 0 localDecls (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) =
+        none)
+    (hNotUninhLeaf : ∀ leafTy,
+      resolveProjectedTyResolved localDecls layouts
+        (unionFieldReadTy localDecls layouts l idx fieldTy)
+        (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = some leafTy →
+      tyIsUninhabited layouts leafTy = false) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        (.field idx fieldTy :: p :: ps) = .unsupported := by
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
+  unfold readProjectedValueUnionAware
+  dsimp only
+  rw [hKind, hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  rw [hBle]
+  simp only []
+  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
+  unfold unionFieldReadTy at hTk hUninh hBounds hOff hNotUninhLeaf
+  cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    simp only [hu] at hTk hUninh hBounds hOff hNotUninhLeaf ⊢
+  · rcases hSlot with hS | hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;>
+    rcases hImg with hC | ⟨img, hEnc⟩ <;>
+    (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
+    (try cases l.fieldLayouts) <;> simp only [] <;>
+    rw [hRes] <;> simp only [] <;> rw [hBounds] <;> simp only [] <;> rw [hOff] <;> simp only [] <;>
+    (cases tyByteSize localDecls layouts fieldTy with
+     | none =>
+       simp only [hUninh]
+       cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
+       | none => rfl
+       | some leafTy => simp only [hNotUninhLeaf leafTy hL]
+     | some sz =>
+       cases sz with
+       | zero =>
+         simp only [hUninh]
+         cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
+         | none => rfl
+         | some leafTy => simp only [hNotUninhLeaf leafTy hL]
+       | succ szPred =>
+         dsimp only
+         cases hk : fieldTy.kind <;>
+           first
+           | (exfalso; unfold tyIsUninhabited at hUninh; rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+           | (simp only [hUninh]
+              cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
+              | none => rfl
+              | some leafTy => simp only [hNotUninhLeaf leafTy hL]))
+  · cases hg : get? l.fieldLayouts idx <;>
+      simp only [hg] at hTk hUninh hBounds hOff hNotUninhLeaf ⊢ <;>
+    rcases hSlot with hS | hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk]) <;>
+    rcases hImg with hC | ⟨img, hEnc⟩ <;>
+    (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
+    (try cases l.fieldLayouts) <;> simp only [] <;>
+    rw [hRes] <;> simp only [] <;> rw [hBounds] <;> simp only [] <;> rw [hOff] <;> simp only [] <;>
     (cases tyByteSize localDecls layouts _ with
      | none =>
        simp only [hUninh]
@@ -2695,6 +2803,65 @@ theorem kani5159_witness_nonStatic_fallthrough :
         obtain rfl := Option.some.inj (h.symm.trans (rfl : _ = some wU32Ty))
         rfl)
 
+/-! Statically bounded but offset-less fallthrough witness: `union UN { n: (Infallible, [S; 2]),
+x: u32 }`, where the user ADT `S` has no captured layout. `n.1[1]` passes
+`checkStaticSubProjBounds`, but `projectionChainByteOffset?` cannot size `S`, so
+`directSubReadOpt = .none` and the read takes the field-root fallthrough (here on the
+`tyByteSize rFieldTy = none` arm). -/
+
+/-- `(Infallible, [S; 2])`: an uninhabited tuple whose `[S; 2]` field has no captured layout
+(field layout index `99` is out of range). -/
+def wNestLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨0⟩] [0, 1],
+    variants := .single 0, isUninhabited := true, fieldLayouts := [3, 99] }
+
+/-- `UN`: a 4-byte union of `n : (Infallible, [S; 2])` (layout `14`) and `x : u32` (layout `0`). -/
+def wUNLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .union 2, variants := .single 0,
+    isUninhabited := false, fieldLayouts := [14, 0] }
+
+/-- `wLayouts` extended with `(Infallible, [S; 2])` (`14`) and `UN` (`15`). -/
+def wLayoutsN : LayoutTable :=
+  { wLayouts with entries := wLayouts.entries ++ [wNestLayout, wUNLayout] }
+
+def wSK : RigidTy := .adt "S" []
+def wSArrTy : Ty := { kind := .array wSK 2, layoutIdx := 99 }
+def wNestTy : Ty := { kind := .tuple [wInfK, .array wSK 2], layoutIdx := 14 }
+def wUNTy : Ty := { kind := .adt "UN" [], layoutIdx := 15 }
+def wDeclsN : List LocalDecl := [{ mutability := .mut, ty := wUNTy, debugName := none }]
+
+/-- `UN { x: 7 }`. -/
+def wUNVal : Value := .aggregate 0 [.unit, .scalar ⟨7, 4⟩]
+
+/-- **Statically bounded, offset-less fallthrough (non-vacuity of
+`readUnion_uninhabited_nonEmpty_noOffset_unsupported`).** `n.1[1] : S` passes
+`checkStaticSubProjBounds` but has no `projectionChainByteOffset?`; its leaf `S` is not known to be
+uninhabited, so the read through the uninhabited `n` fails closed with `.unsupported` (`≠ .ub`),
+while the uninhabited leaf `n.0 : Infallible` faults with `.ub`. -/
+theorem kani5159_witness_noOffset_fallthrough :
+    checkStaticSubProjBounds wDeclsN wLayoutsN wNestTy [.field 1 wSArrTy, .constantIndex 1 2 false] =
+      true ∧
+    projectionChainByteOffset? wLayoutsN (some wNestTy) none none 0 wDeclsN
+      [.field 1 wSArrTy, .constantIndex 1 2 false] = none ∧
+    tyByteSize wDeclsN wLayoutsN wNestTy = none ∧
+    readProjectedValueUnionAware [] wDeclsN wLayoutsN wUNVal wUNTy [.field 1 wU32Ty] =
+      .ok (.scalar ⟨7, 4⟩) ∧
+    readProjectedValueUnionAware [] wDeclsN wLayoutsN wUNVal wUNTy
+        [.field 0 wNestTy, .field 1 wSArrTy, .constantIndex 1 2 false] = .unsupported ∧
+    readProjectedValueUnionAware [] wDeclsN wLayoutsN wUNVal wUNTy
+        [.field 0 wNestTy, .field 1 wSArrTy, .constantIndex 1 2 false] ≠ .ub ∧
+    readProjectedValueUnionAware [] wDeclsN wLayoutsN wUNVal wUNTy
+        [.field 0 wNestTy, .field 0 wInfTy] = .ub := by
+  refine ⟨rfl, rfl, rfl, rfl, ?_, (by intro h; cases h), rfl⟩
+  exact readUnion_uninhabited_nonEmpty_noOffset_unsupported [] wDeclsN wLayoutsN wUNTy wNestTy _ 0 2
+    wUNLayout "UN" [] rfl rfl rfl (by decide) (Or.inl rfl)
+    (Or.inr (Or.inr ⟨rfl, (by intro h; cases h), (by intro p a h; cases h)⟩)) rfl
+    (.field 1 wSArrTy) [.constantIndex 1 2 false] [.field 1 wSArrTy, .constantIndex 1 2 false]
+    rfl rfl rfl
+    (fun leafTy h => by
+      obtain rfl := Option.some.inj (h.symm.trans (rfl : _ = some ({ kind := wSK, layoutIdx := 16 } : Ty)))
+      rfl)
+
 end V2026_06_01
 
 /-! ### Section 6f: `V2026_08_01` Dialect Parity Witnesses -/
@@ -2825,9 +2992,13 @@ sub-projection on an uninhabited union field fails closed with `.unsupported` (n
 theorem kani5159_v2026_08_01_nonEmpty_fallthrough_parity :
     readProjectedValueUnionAware [] wDecls08 wLayouts08 wUVal08 wUTy08
         [.field 4 wPairTy08, .downcast none 0, .field 1 wUnitTy08] = .unsupported ∧
+    readProjectedValueUnionAware [] wDecls08 wLayouts08 wUVal08 wUTy08
+        [.field 4 wPairTy08, .downcast none 0, .field 1 wUnitTy08] ≠ .ub ∧
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
-        [.field 4 wPairTy, .downcast none 0, .field 1 wUnitTy] = .unsupported :=
-  ⟨rfl, rfl⟩
+        [.field 4 wPairTy, .downcast none 0, .field 1 wUnitTy] = .unsupported ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 4 wPairTy, .downcast none 0, .field 1 wUnitTy] ≠ .ub :=
+  ⟨rfl, (by intro h; cases h), rfl, (by intro h; cases h)⟩
 
 def wW0Ty08 : Ty := { kind := .adt "W0" [], layoutIdx := 14 }
 def wW4Ty08 : Ty := { kind := .adt "W4" [], layoutIdx := 15 }
@@ -2869,6 +3040,35 @@ theorem kani5159_v2026_08_01_nonStatic_fallthrough_parity :
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
         wUWTy [.field 1 wW4Ty, .downcast (some "A") 0, .field 1 wU32Ty] = .unsupported :=
   ⟨rfl, (by intro h; cases h), rfl, rfl, (by intro h; cases h), rfl, rfl, rfl⟩
+
+def wSArrTy08 : Ty := { kind := .array (.adt "S" []) 2, layoutIdx := 99 }
+def wNestTy08 : Ty := { kind := .tuple [wInfK08, .array (.adt "S" []) 2], layoutIdx := 14 }
+def wUNTy08 : Ty := { kind := .adt "UN" [], layoutIdx := 15 }
+def wDeclsN08 : List LocalDecl := [{ mutability := .mut, ty := wUNTy08, debugName := none }]
+def wUNVal08 : Value := .aggregate 0 [.unit, .scalar ⟨7, 4⟩]
+
+/-- `wLayouts08` extended with `V2026_08_01` copies of `(Infallible, [S; 2])` (`14`) and `UN`
+(`15`) (see `kani5159_witness_noOffset_fallthrough`). -/
+def wLayoutsN08 : LayoutTable :=
+  { wLayouts08 with
+    entries := wLayouts08.entries ++ [
+      { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨0⟩] [0, 1],
+        variants := .single 0, isUninhabited := true, fieldLayouts := [3, 99] },
+      { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .union 2, variants := .single 0,
+        isUninhabited := false, fieldLayouts := [14, 0] }] }
+
+/-- **Dialect parity (`V2026_08_01`) for the statically bounded, offset-less fallthrough.**
+Mirrors `kani5159_witness_noOffset_fallthrough` in both dialects. -/
+theorem kani5159_v2026_08_01_noOffset_fallthrough_parity :
+    readProjectedValueUnionAware [] wDeclsN08 wLayoutsN08 wUNVal08 wUNTy08
+        [.field 0 wNestTy08, .field 1 wSArrTy08, .constantIndex 1 2 false] = .unsupported ∧
+    readProjectedValueUnionAware [] wDeclsN08 wLayoutsN08 wUNVal08 wUNTy08
+        [.field 0 wNestTy08, .field 1 wSArrTy08, .constantIndex 1 2 false] ≠ .ub ∧
+    readProjectedValueUnionAware [] wDeclsN08 wLayoutsN08 wUNVal08 wUNTy08
+        [.field 0 wNestTy08, .field 0 wInfTy08] = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsN wLayoutsN wUNVal
+        wUNTy [.field 0 wNestTy, .field 1 wSArrTy, .constantIndex 1 2 false] = .unsupported :=
+  ⟨rfl, (by intro h; cases h), rfl, rfl⟩
 
 end V2026_08_01Parity
 

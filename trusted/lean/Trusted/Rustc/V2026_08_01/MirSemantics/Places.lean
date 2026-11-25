@@ -8531,12 +8531,16 @@ at reference type here (this keeps thin-reference decoding in
 is absent from `layouts` and `ty.kind` is an opaque custom ADT,
 `tyIsUninhabited` returns `false` (leaving custom uninhabited ADTs without
 captured layout metadata undetected here rather than over-claiming UB). That
-`false` result does not synthesize an unsound 0-byte value in
-`readProjectedValueUnionAware`: for `.adt` types without a `layouts` entry,
-`tyByteSize` returns `.none` (selecting fail-closed `.unsupported`); for
-`&T` / `&mut T`, `tyByteSize` is pointer-sized (`4` or `8` bytes) and goes
-through byte decoding rather than 0-byte synthesis; and for `bool`, `char`,
-integers, floats, and raw pointers, the type is inhabited and positive-sized.
+`false` result does not let `readProjectedValueUnionAware` synthesize a 0-byte
+value of an uninhabited type: for `.adt` / `.closure` types without a
+`layouts` entry, `tyByteSize` is either `.none` (selecting fail-closed
+`.unsupported`) or a positive array stride from `findArrayElemStrideAndAlign?`
+(which requires `stride ≥ 1`), never `.some 0`, so such a read goes through
+byte decoding rather than 0-byte synthesis; for `&T` / `&mut T`,
+`rigidTyKindByteSize` gives a positive size (`8` bytes for thin and `16` for
+wide references) and the read likewise decodes bytes; and `bool`, `char`,
+integers, floats, and raw pointers are inhabited by the quoted validity rules,
+so `false` is exact for them.
 -/
 @[reducible]
 def tyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
