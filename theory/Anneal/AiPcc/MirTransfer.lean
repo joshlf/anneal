@@ -45,11 +45,12 @@ certificate passes if a reachable block uses it):
   `.field 1` projections on initialized `(u, bool)` checked-arithmetic tuples;
 * signed (`IntTy`) constants, locals, copy aliases, casts, sign-agnostic
   arithmetic, mixed-width/mixed-signedness shifts (exact `shr` on
-  non-negative values), `UnOp.not` / `UnOp.neg`, ordered comparisons (exact
-  on same-sign or opposite-sign operands plus `RelGuard` synthesis on sign
-  tests against `0` and `-1`), checked (`*WithOverflow` `(i, bool)` tuples),
+  non-negative or exact values), `UnOp.not` / `UnOp.neg`, ordered
+  comparisons (exact on same-sign or opposite-sign operands plus `RelGuard`
+  synthesis on sign tests against `0` and `-1`), checked (`*WithOverflow`
+  `(i, bool)` tuples),
   unchecked (`*Unchecked`), and UB-free `div` / `rem` (exact on non-negative
-  operands);
+  or exact operands);
 * unsigned wrapping, checked (`*WithOverflow`), unchecked (overflow-free), and
   `div` / `rem` (nonzero divisor) arithmetic, bitwise operations, shifts,
   boolean binary operations, comparisons recording `RelGuard`s, `UnOp.not` /
@@ -4218,9 +4219,49 @@ def binOpIsShift : BinOp → Bool
   | .shl | .shr | .shlUnchecked | .shrUnchecked => true
   | _ => false
 
+/-- Exact abstract result of an arithmetic right shift of the signed bit
+pattern `c` (of type `i`) by an in-range amount `k`. -/
+def sintShrConst (i : IntTy) (c k : Nat) : AbsVal :=
+  AbsVal.const (uintWidth (intTwin i))
+    (arithmeticShrBits c (uintBytes (intTwin i)) k)
+
+theorem sintShrConst_sound (i : IntTy) (c k : Nat) :
+    (sintShrConst i c k).denote (uintWidth (intTwin i))
+      (some (arithmeticShrBits c (uintBytes (intTwin i)) k)) := by
+  have hLt : arithmeticShrBits c (uintBytes (intTwin i)) k <
+      modPow2 (uintWidth (intTwin i)) := by
+    rw [← two_pow_uintBytes]
+    exact Anneal.Scalars.arithmeticShrBits_lt_two_pow _ _ _
+  have h := absVal_const_sound (c := arithmeticShrBits c (uintBytes (intTwin i)) k)
+    (uintWidth_valid (intTwin i))
+  have hEq : Nat.mod (arithmeticShrBits c (uintBytes (intTwin i)) k)
+      (modPow2 (uintWidth (intTwin i))) =
+      arithmeticShrBits c (uintBytes (intTwin i)) k := Nat.mod_eq_of_lt hLt
+  simp only [wrapVal, hEq] at h
+  exact h
+
+/-- Signed `.shr` evaluates to an arithmetic shift by the wrapped amount. -/
+theorem evalScalarBinOp_sint_shr_eq {u u2 : UintTy} {a b : Nat}
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .shr ⟨a, uintBytes u⟩ ⟨b, uintBytes u2⟩ locals mem true =
+      .ok (.scalar ⟨arithmeticShrBits a (uintBytes u)
+        (Nat.mod b (uintWidth u)), uintBytes u⟩) locals mem := by
+  simp only [evalScalarBinOp, uintBytes_beq_zero, uintBytes_mul_eight]
+
+/-- Signed `.shrUnchecked` by an in-range amount is an arithmetic shift. -/
+theorem evalScalarBinOp_sint_shrUnchecked_eq {u u2 : UintTy} {a b : Nat}
+    (locals : List LocalSlot) (mem : Memory)
+    (hb : Nat.ble (uintWidth u) b = false) :
+    evalScalarBinOp .shrUnchecked ⟨a, uintBytes u⟩ ⟨b, uintBytes u2⟩ locals mem
+        true =
+      .ok (.scalar ⟨arithmeticShrBits a (uintBytes u) b, uintBytes u⟩)
+        locals mem := by
+  simp only [evalScalarBinOp, uintBytes_beq_zero, uintBytes_mul_eight, hb]
+
 /-- Signed-LHS shift transfer supporting arbitrary RHS integer width `u2`
 (both unsigned and signed RHS). Left shifts and non-negative right shifts
-reuse `binOpUintAbs` on the unsigned twin. -/
+reuse `binOpUintAbs` on the unsigned twin; right shifts of other exact
+operands fold to the exact arithmetic shift (`sintShrConst`). -/
 def shiftSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (u2 : UintTy)
     (a2 : AbsVal) : Option MirAbsVal :=
   let u1 := intTwin i
@@ -4232,15 +4273,26 @@ def shiftSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (u2 : UintTy)
   | .shr =>
     match sintNonneg i a1 with
     | true => retypeSintResult i (binOpUintAbs .shr u1 a1 none u2 a2 none)
-    | false => some (mkSintVal i (AbsVal.topInit w1))
+    | false =>
+      match a1.exactVal? w1, a2.exactVal? w2 with
+      | some c1, some c2 =>
+        some (mkSintVal i
+          (sintShrConst i c1 (Nat.mod c2 w1)))
+      | _, _ => some (mkSintVal i (AbsVal.topInit w1))
   | .shrUnchecked =>
     match sintNonneg i a1 with
     | true =>
       retypeSintResult i (binOpUintAbs .shrUnchecked u1 a1 none u2 a2 none)
     | false =>
-      match AbsVal.shiftInBounds w1 w2 a2 with
-      | true => some (mkSintVal i (AbsVal.topInit w1))
-      | false => none
+      match a1.exactVal? w1, a2.exactVal? w2 with
+      | some c1, some c2 =>
+        match Nat.ble w1 c2 with
+        | false => some (mkSintVal i (sintShrConst i c1 c2))
+        | true => none
+      | _, _ =>
+        match AbsVal.shiftInBounds w1 w2 a2 with
+        | true => some (mkSintVal i (AbsVal.topInit w1))
+        | false => none
   | _ => none
 
 theorem shiftSintAbs_not_offset {op : BinOp} {i : IntTy} {a1 : AbsVal}
@@ -4299,11 +4351,29 @@ theorem shiftSintAbs_sound {op : BinOp} {i : IntTy} {a1 : AbsVal}
             (sintNonneg_sound hNN hx)]
           exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
     | false =>
-      rw [hNN] at h; injection h with h; subst h
-      cases evalScalarBinOp_sint_shr locals mem (u := intTwin i) (a := x)
-          (b := y) (u2 := u2) with
-      | intro bits hb =>
-        exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+      rw [hNN] at h
+      cases hE1 : a1.exactVal? (uintWidth (intTwin i)) with
+      | some c1 =>
+        cases hE2 : a2.exactVal? (uintWidth u2) with
+        | some c2 =>
+          rw [hE1, hE2] at h; injection h with h; subst h
+          have h1 := (absVal_exactVal?_sound hE1 hx).1
+          have h2 := (absVal_exactVal?_sound hE2 hy).1
+          injection h1 with h1; injection h2 with h2; subst h1; subst h2
+          exact ⟨_, evalScalarBinOp_sint_shr_eq locals mem,
+            mkSintVal_denote (sintShrConst_sound _ _ _)⟩
+        | none =>
+          rw [hE1, hE2] at h; injection h with h; subst h
+          cases evalScalarBinOp_sint_shr locals mem (u := intTwin i) (a := x)
+              (b := y) (u2 := u2) with
+          | intro bits hb =>
+            exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+      | none =>
+        rw [hE1] at h; injection h with h; subst h
+        cases evalScalarBinOp_sint_shr locals mem (u := intTwin i) (a := x)
+            (b := y) (u2 := u2) with
+        | intro bits hb =>
+          exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
   | shrUnchecked =>
     simp only [shiftSintAbs] at h
     cases hNN : sintNonneg i a1 with
@@ -4321,26 +4391,185 @@ theorem shiftSintAbs_sound {op : BinOp} {i : IntTy} {a1 : AbsVal}
           exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
     | false =>
       rw [hNN] at h
-      cases hS : AbsVal.shiftInBounds (uintWidth (intTwin i))
-          (uintWidth u2) a2 with
-      | false => rw [hS] at h; nomatch h
-      | true =>
-        rw [hS] at h; injection h with h; subst h
-        cases absVal_shiftInBounds_sound hS hy with
-        | intro y' hy' =>
-          injection hy'.1 with hyEq; subst hyEq
-          cases evalScalarBinOp_sint_shrUnchecked locals mem (u := intTwin i)
-              (a := x) (u2 := u2) hy'.2.1 with
-          | intro bits hb =>
-            exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+      have hFallback :
+          (match AbsVal.shiftInBounds (uintWidth (intTwin i)) (uintWidth u2)
+              a2 with
+            | true => some (mkSintVal i
+                (AbsVal.topInit (uintWidth (intTwin i))))
+            | false => none) = some av →
+          ∃ v, evalScalarBinOp .shrUnchecked ⟨x, uintBytes (intTwin i)⟩
+              ⟨y, uintBytes u2⟩ locals mem true = .ok v locals mem ∧
+            av.denote locals v := by
+        intro h
+        cases hS : AbsVal.shiftInBounds (uintWidth (intTwin i))
+            (uintWidth u2) a2 with
+        | false => rw [hS] at h; nomatch h
+        | true =>
+          rw [hS] at h; injection h with h; subst h
+          cases absVal_shiftInBounds_sound hS hy with
+          | intro y' hy' =>
+            injection hy'.1 with hyEq; subst hyEq
+            cases evalScalarBinOp_sint_shrUnchecked locals mem
+                (u := intTwin i) (a := x) (u2 := u2) hy'.2.1 with
+            | intro bits hb =>
+              exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+      cases hE1 : a1.exactVal? (uintWidth (intTwin i)) with
+      | some c1 =>
+        cases hE2 : a2.exactVal? (uintWidth u2) with
+        | some c2 =>
+          rw [hE1, hE2] at h
+          dsimp only at h
+          cases hB : Nat.ble (uintWidth (intTwin i)) c2 with
+          | true => rw [hB] at h; nomatch h
+          | false =>
+            rw [hB] at h; injection h with h; subst h
+            have h1 := (absVal_exactVal?_sound hE1 hx).1
+            have h2 := (absVal_exactVal?_sound hE2 hy).1
+            injection h1 with h1; injection h2 with h2; subst h1; subst h2
+            exact ⟨_, evalScalarBinOp_sint_shrUnchecked_eq locals mem hB,
+              mkSintVal_denote (sintShrConst_sound _ _ _)⟩
+        | none => rw [hE1, hE2] at h; exact hFallback h
+      | none => rw [hE1] at h; exact hFallback h
   | _ => nomatch h
+
+/-- Signed `evalSignedDiv` either always faults or always returns the same
+scalar, independently of the threaded locals and memory. -/
+theorem evalSignedDiv_cases (a b sz : Nat) :
+    (∀ (l : List LocalSlot) (m : Memory), evalSignedDiv a b sz l m = .ub) ∨
+      ∃ r, ∀ (l : List LocalSlot) (m : Memory),
+        evalSignedDiv a b sz l m = .ok (.scalar ⟨r, sz⟩) l m := by
+  cases h : Bool.and
+      (Nat.beq (wrapScalarBits a (scalarModulus sz))
+        (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)))
+      (Nat.beq (wrapScalarBits b (scalarModulus sz))
+        (Nat.sub (scalarModulus sz) 1)) with
+  | true => exact Or.inl (fun _ _ => by simp only [evalSignedDiv, h])
+  | false =>
+    refine Or.inr ⟨?r, fun l m => ?h⟩
+    case h =>
+      simp only [evalSignedDiv, h]
+      rfl
+
+/-- Frame independence of `evalSignedRem` (see `evalSignedDiv_cases`). -/
+theorem evalSignedRem_cases (a b sz : Nat) :
+    (∀ (l : List LocalSlot) (m : Memory), evalSignedRem a b sz l m = .ub) ∨
+      ∃ r, ∀ (l : List LocalSlot) (m : Memory),
+        evalSignedRem a b sz l m = .ok (.scalar ⟨r, sz⟩) l m := by
+  cases h : Bool.and
+      (Nat.beq (wrapScalarBits a (scalarModulus sz))
+        (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)))
+      (Nat.beq (wrapScalarBits b (scalarModulus sz))
+        (Nat.sub (scalarModulus sz) 1)) with
+  | true => exact Or.inl (fun _ _ => by simp only [evalSignedRem, h])
+  | false =>
+    refine Or.inr ⟨?r, fun l m => ?h⟩
+    case h =>
+      simp only [evalSignedRem, h]
+      rfl
+
+/-- A signed `div` / `rem` result computed in the empty frame is the result
+in every frame. -/
+theorem evalScalarBinOp_sint_divrem_frame {op : BinOp} {u : UintTy} {a b : Nat}
+    {sc : ScalarInt} {l : List LocalSlot} {m : Memory}
+    (hop : op = .div ∨ op = .rem)
+    (h : evalScalarBinOp op ⟨a, uintBytes u⟩ ⟨b, uintBytes u⟩ [] {} true =
+      .ok (.scalar sc) l m) :
+    ∃ r, sc = ⟨r, uintBytes u⟩ ∧ ∀ (locals : List LocalSlot) (mem : Memory),
+      evalScalarBinOp op ⟨a, uintBytes u⟩ ⟨b, uintBytes u⟩ locals mem true =
+        .ok (.scalar ⟨r, uintBytes u⟩) locals mem := by
+  have hCases : ∀ (f : Nat → Nat → Nat → List LocalSlot → Memory →
+      RvalueEvalResult),
+      ((∀ l m, f a b (uintBytes u) l m = .ub) ∨
+        ∃ r, ∀ l m, f a b (uintBytes u) l m =
+          .ok (.scalar ⟨r, uintBytes u⟩) l m) →
+      (∀ locals mem, evalScalarBinOp op ⟨a, uintBytes u⟩ ⟨b, uintBytes u⟩
+        locals mem true =
+          match Nat.beq b 0 with
+          | true => .ub
+          | false => f a b (uintBytes u) locals mem) →
+      ∃ r, sc = ⟨r, uintBytes u⟩ ∧ ∀ (locals : List LocalSlot) (mem : Memory),
+        evalScalarBinOp op ⟨a, uintBytes u⟩ ⟨b, uintBytes u⟩ locals mem true =
+          .ok (.scalar ⟨r, uintBytes u⟩) locals mem := by
+    intro f hf hEq
+    rw [hEq] at h
+    cases hb : Nat.beq b 0 with
+    | true => rw [hb] at h; nomatch h
+    | false =>
+      rw [hb] at h
+      cases hf with
+      | inl hU => rw [hU] at h; nomatch h
+      | inr hR =>
+        cases hR with
+        | intro r hR =>
+          rw [hR] at h
+          injection h with h1
+          injection h1 with h1
+          refine ⟨r, h1.symm, fun locals mem => ?_⟩
+          rw [hEq, hb]
+          exact hR locals mem
+  cases hop with
+  | inl hop =>
+    subst hop
+    refine hCases evalSignedDiv (evalSignedDiv_cases a b (uintBytes u)) ?_
+    intro locals mem
+    simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+    cases Nat.beq b 0 <;> rfl
+  | inr hop =>
+    subst hop
+    refine hCases evalSignedRem (evalSignedRem_cases a b (uintBytes u)) ?_
+    intro locals mem
+    simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+    cases Nat.beq b 0 <;> rfl
+
+
+/-- Exact signed `div` / `rem` of two exact operands, evaluated with the
+ground `evalScalarBinOp` (whose result is frame-independent). -/
+def sintDivRemConst? (op : BinOp) (i : IntTy) (a1 a2 : AbsVal) : Option Nat :=
+  match a1.exactVal? (uintWidth (intTwin i)),
+      a2.exactVal? (uintWidth (intTwin i)) with
+  | some c1, some c2 =>
+    match evalScalarBinOp op ⟨c1, uintBytes (intTwin i)⟩
+        ⟨c2, uintBytes (intTwin i)⟩ [] {} true with
+    | .ok (.scalar sc) _ _ => some sc.bits
+    | _ => none
+  | _, _ => none
+
+theorem sintDivRemConst?_sound {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
+    {x y r : Nat} (hop : op = .div ∨ op = .rem)
+    (h : sintDivRemConst? op i a1 a2 = some r)
+    (hx : a1.denote (uintWidth (intTwin i)) (some x))
+    (hy : a2.denote (uintWidth (intTwin i)) (some y))
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp op ⟨x, uintBytes (intTwin i)⟩ ⟨y, uintBytes (intTwin i)⟩
+      locals mem true = .ok (.scalar ⟨r, uintBytes (intTwin i)⟩) locals mem := by
+  unfold sintDivRemConst? at h
+  cases hE1 : a1.exactVal? (uintWidth (intTwin i)) with
+  | none => rw [hE1] at h; nomatch h
+  | some c1 =>
+    cases hE2 : a2.exactVal? (uintWidth (intTwin i)) with
+    | none => rw [hE1, hE2] at h; nomatch h
+    | some c2 =>
+      rw [hE1, hE2] at h
+      dsimp only at h
+      have h1 := (absVal_exactVal?_sound hE1 hx).1
+      have h2 := (absVal_exactVal?_sound hE2 hy).1
+      injection h1 with h1; injection h2 with h2; subst h1; subst h2
+      split at h
+      · rename_i sc l m hEv
+        injection h with h
+        subst h
+        cases evalScalarBinOp_sint_divrem_frame hop hEv with
+        | intro r' hr =>
+          rw [hr.1]
+          exact hr.2 locals mem
+      · nomatch h
 
 /-- Abstract signed `BinOp` transfer on operands of equal type `i`, tracked by
 two's-complement bit pattern: covers sign-agnostic operators (via the unsigned
 transfer), ordered comparisons (sign tests against `0` and `-1` with `RelGuard`
 synthesis, same-sign unsigned reuse, and opposite-sign exact folding), checked
 (`*WithOverflow`), unchecked (`*Unchecked`), safe `div` / `rem` (exact when
-non-negative), and shifts (`shiftSintAbs`). -/
+non-negative or when both operands are exact), and shifts (`shiftSintAbs`). -/
 def binOpSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (srcL : Option Nat)
     (a2 : AbsVal) (srcR : Option Nat) : Option MirAbsVal :=
   let u := intTwin i
@@ -4403,14 +4632,20 @@ def binOpSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (srcL : Option Nat)
         | true =>
           match sintNonneg i a1 && sintNonneg i a2 with
           | true => some (mkSintVal i (divUintAbs w a1 a2))
-          | false => some (mkSintVal i (AbsVal.topInit w))
+          | false =>
+            match sintDivRemConst? .div i a1 a2 with
+            | some r => some (mkSintVal i (AbsVal.const w r))
+            | none => some (mkSintVal i (AbsVal.topInit w))
       | .rem =>
         match nonzeroDivSafe w a2 && sintNotMinDivNegOne i a1 a2 with
         | false => none
         | true =>
           match sintNonneg i a1 && sintNonneg i a2 with
           | true => some (mkSintVal i (remUintAbs w a1 a2))
-          | false => some (mkSintVal i (AbsVal.topInit w))
+          | false =>
+            match sintDivRemConst? .rem i a1 a2 with
+            | some r => some (mkSintVal i (AbsVal.const w r))
+            | none => some (mkSintVal i (AbsVal.topInit w))
       | _ => none
 
 theorem binOpSintAbs_not_offset {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
@@ -4631,11 +4866,23 @@ theorem binOpSintAbs_sound {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
               (sintNonneg_sound (bool_and_true_right hNN) hy) hyNe,
               mkSintVal_denote hDiv⟩
           | false =>
-            rw [hNN] at h; injection h with h; subst h
+            rw [hNN] at h
             cases evalScalarBinOp_sint_div_safe locals mem
                 (absVal_some_elim hx).1 (absVal_some_elim hy).1 hyNe hNoMin with
             | intro bits hb =>
-              exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+              cases hC : sintDivRemConst? .div i a1 a2 with
+              | none =>
+                rw [hC] at h; injection h with h; subst h
+                exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+              | some r =>
+                rw [hC] at h; injection h with h; subst h
+                have hEv := sintDivRemConst?_sound (Or.inl rfl) hC hx hy locals mem
+                have hbr : bits = r := by rw [hb.2] at hEv; cases hEv; rfl
+                subst hbr
+                have hK := absVal_const_sound (c := bits)
+                  (uintWidth_valid (intTwin i))
+                rw [wrapVal_of_lt hb.1] at hK
+                exact ⟨_, hb.2, mkSintVal_denote hK⟩
       case rem =>
         cases hOk : (nonzeroDivSafe (uintWidth (intTwin i)) a2 &&
             sintNotMinDivNegOne i a1 a2) with
@@ -4658,11 +4905,23 @@ theorem binOpSintAbs_sound {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
               (sintNonneg_sound (bool_and_true_right hNN) hy) hyNe,
               mkSintVal_denote hRem⟩
           | false =>
-            rw [hNN] at h; injection h with h; subst h
+            rw [hNN] at h
             cases evalScalarBinOp_sint_rem_safe locals mem
                 (absVal_some_elim hx).1 (absVal_some_elim hy).1 hyNe hNoMin with
             | intro bits hb =>
-              exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+              cases hC : sintDivRemConst? .rem i a1 a2 with
+              | none =>
+                rw [hC] at h; injection h with h; subst h
+                exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+              | some r =>
+                rw [hC] at h; injection h with h; subst h
+                have hEv := sintDivRemConst?_sound (Or.inr rfl) hC hx hy locals mem
+                have hbr : bits = r := by rw [hb.2] at hEv; cases hEv; rfl
+                subst hbr
+                have hK := absVal_const_sound (c := bits)
+                  (uintWidth_valid (intTwin i))
+                rw [wrapVal_of_lt hb.1] at hK
+                exact ⟨_, hb.2, mkSintVal_denote hK⟩
 
 /-- Signed-source integer cast transfer: narrowing or same-width casts wrap
 the bit pattern (`castUintAbs` on the twin type); widening casts sign-extend,
