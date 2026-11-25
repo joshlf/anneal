@@ -5648,11 +5648,17 @@ def _wrapper_honors_lean_num_threads(
         if not stat.S_ISREG(st.st_mode) or not os.access(abs_path, os.X_OK):
             return False
         try:
-            with open(abs_path, "rb") as fh:
-                st_fd = os.fstat(fh.fileno())
+            fd = os.open(abs_path, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                st_fd = os.fstat(fd)
                 if not stat.S_ISREG(st_fd.st_mode):
                     return False
-                digest = hashlib.file_digest(fh, "sha256").hexdigest()
+                with os.fdopen(fd, "rb") as fh:
+                    fd = -1
+                    digest = hashlib.file_digest(fh, "sha256").hexdigest()
+            finally:
+                if fd >= 0:
+                    os.close(fd)
             st_after = os.stat(abs_path)
             if (st_fd.st_dev, st_fd.st_ino) != (st.st_dev, st.st_ino):
                 torn = True

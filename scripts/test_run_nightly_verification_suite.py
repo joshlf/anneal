@@ -6448,8 +6448,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 self.assertEqual(call["env"]["HOME"], os.fspath(fake_home))
 
             # Even when the caller's `HOME` has no (or a stale) `anneal-workloads.slice`,
-            # probing the real in-repo wrapper synthesizes the matching unit from `--probe`
-            # so `ensure_workloads_slice` never invokes `systemctl --user daemon-reload`.
+            # the probe's `systemctl` shim swallows `daemon-reload` so probing the real
+            # in-repo wrapper never reloads the live user manager.
             real_systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
             if Path(real_systemctl).is_file():
                 spy_bin = root / "spy_bin"
@@ -6559,14 +6559,20 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 self.assertEqual(res.returncode, 0, argv)
             self.assertEqual(spy_log.read_text(encoding="utf-8").splitlines(), [" ".join(a) for a in forwarded])
             # As a wrapper issues it (`subprocess.run([systemctl_bin, ...])` naming its own pid),
-            # the scope kill reaches `systemctl`; the same call naming another pid does not.
+            # the scope kill reaches `systemctl`; the same call naming another pid (even if the
+            # caller tries to spoof `PPID` in the environment) does not.
             spy_log.unlink()
             caller = root / "caller.py"
             caller.write_text(
                 "import os, shutil, subprocess\n"
                 "bin_ = shutil.which('systemctl')\n"
-                "for pid in (os.getpid(), os.getpid() + 1):\n"
-                "    subprocess.run([bin_, '--user', 'kill', '-s', 'SIGKILL', f'anneal-run-{pid}-42.scope'], check=True)\n"
+                "other = os.getpid() + 1\n"
+                "for pid, env in (\n"
+                "    (os.getpid(), os.environ),\n"
+                "    (other, os.environ),\n"
+                "    (other, {**os.environ, 'PPID': str(other)}),\n"
+                "):\n"
+                "    subprocess.run([bin_, '--user', 'kill', '-s', 'SIGKILL', f'anneal-run-{pid}-42.scope'], env=env, check=True)\n"
                 "print(os.getpid())\n",
                 encoding="utf-8",
             )
