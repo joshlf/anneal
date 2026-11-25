@@ -34,7 +34,10 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
   exact closed-form rational overflow threshold (`maxFiniteBits`, `maxFiniteVal`,
   `overflowThreshold = (2^(fb+2) - 1) * 2^(bias - fb - 1)`,
   `roundRatioTiesToEven_eq_inf_iff`, `roundRatioTiesToEven_lt_inf_isFinite`,
-  `roundRatioTiesToEven_eq_maxFiniteBits`, and boundary witnesses);
+  `roundRatioTiesToEven_eq_maxFiniteBits`, boundary witnesses, the operation-level
+  overflow threshold for finite `add` / `sub` / `mul` / `div`
+  (`evalFloatArithBase_*_finite_overflow_iff`), and `f32` / `f64`
+  `MAX + ulp(MAX) / 2` overflow-tie witnesses);
 - **§4**: `FloatArithMode` inclusion (`EvalFloatBinOpRel.det_imp_nondet`,
   `EvalRvalueFloatRel.det_imp_nondet`, `evalFloatBinOp` realizes `.deterministic`),
   `nanChoices` membership / width / NaN / quietness / `4`-vs-`6` sNaN structure,
@@ -76,7 +79,18 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
   (including the concrete NaN `floatToFloat` separation witness), and
   unconditional subtraction-as-negated-addition laws across `evalFloatBinOp`,
   `EvalFloatBinOpRel`, `evalFloatScalarBinOp`, `evalRvalue`, and
-  `EvalRvalueFloatRel`;
+  `EvalRvalueFloatRel`, and the Episode 2 readiness laws at ANY `FloatArithMode`
+  and ANY `Ptr2IntTransmutePolicy`: mode-invariant supportedness / totality /
+  well-formedness of `EvalFloatBinOpRel` (`isFloatBinOp`), policy irrelevance
+  outside byte casts and mode irrelevance outside float arithmetic, mode
+  invariance and `evalRvalue`-exactness of every `.ub` / `.unsupported` outcome,
+  totality, the executable `evalRvalueDet` characterizing `.deterministic` mode
+  exactly, generic-mode float `.binaryOp` and NaN `.cast .floatToFloat`
+  dispatchers, relation-level and decoder-level `Ptr2IntTransmutePolicy`
+  refinement / exact split / provenance-necessity bridges for every (composite)
+  type, and concrete witnesses (float operands and NaN choices read from locals,
+  pointer-to-integer and array / tuple / struct-with-padding / union / float
+  policy separation, `{to,from}_bits`);
 - **§8**: `#guard_msgs in #print axioms` bundles pinning every public theorem to
   `[propext, Quot.sound]`.
 -/
@@ -2305,6 +2319,137 @@ theorem roundRatioTiesToEven_overflow_boundary (f : IeeeFormat) (neg : Bool) :
   · exact roundRatioTiesToEven_eq_maxFiniteBits f neg _ 1 Nat.one_pos (by omega) (by omega)
   · exact roundRatioTiesToEven_eq_maxFiniteBits f neg _ 2 (by decide) (by omega) (by omega)
   · exact roundRatioTiesToEven_eq_maxFiniteBits f neg _ 1 Nat.one_pos (by omega) (by omega)
+
+/-! ### Operation-level overflow threshold (`add`, `sub`, `mul`, `div`) -/
+
+/-- **Operation-level overflow threshold for finite `add`**: the sum of two finite operands
+overflows to the correctly signed infinity IF AND ONLY IF the magnitude of the exact rational
+sum is `≥ overflowThreshold f` (`MAX + 2^(MAX_EXP − MANTISSA_DIGITS − 1)`). -/
+theorem evalFloatArithBase_add_finite_overflow_iff (f : IeeeFormat) (a b : Nat)
+    (ln rn : Bool) (lnum lden rnum rden : Nat)
+    (ha : decodeBits f (a % 2 ^ f.width) = .finite ln lnum lden)
+    (hb : decodeBits f (b % 2 ^ f.width) = .finite rn rnum rden) :
+    let n : Int := signedNum ln lnum * (rden : Int) + signedNum rn rnum * (lden : Int)
+    let sign : Bool := if n = 0 then false else decide (n < 0)
+    evalFloatArithBase .add f a b = .some (infBits f sign) ↔
+      (lden * rden) * overflowThreshold f ≤ n.natAbs := by
+  have hd : 0 < lden * rden :=
+    Nat.mul_pos (decodeBits_finite_den_pos f _ ln lnum lden ha)
+      (decodeBits_finite_den_pos f _ rn rnum rden hb)
+  have hfin := evalFloatArithBase_add_finite f a b ln rn lnum lden rnum rden ha hb
+  dsimp only at hfin ⊢
+  rw [hfin]
+  constructor
+  · intro h
+    injection h with h
+    exact (roundRatioTiesToEven_eq_inf_iff f _ _ _ hd).mp h
+  · intro h
+    rw [(roundRatioTiesToEven_eq_inf_iff f _ _ _ hd).mpr h]
+
+/-- **Operation-level overflow threshold for finite `sub`** (`a - b` regarded as `a + (-b)`). -/
+theorem evalFloatArithBase_sub_finite_overflow_iff (f : IeeeFormat) (a b : Nat)
+    (ln rn : Bool) (lnum lden rnum rden : Nat)
+    (ha : decodeBits f (a % 2 ^ f.width) = .finite ln lnum lden)
+    (hb : decodeBits f (b % 2 ^ f.width) = .finite rn rnum rden) :
+    let n : Int := signedNum ln lnum * (rden : Int) + signedNum (Bool.not rn) rnum * (lden : Int)
+    let sign : Bool := if n = 0 then false else decide (n < 0)
+    evalFloatArithBase .sub f a b = .some (infBits f sign) ↔
+      (lden * rden) * overflowThreshold f ≤ n.natAbs := by
+  have hd : 0 < lden * rden :=
+    Nat.mul_pos (decodeBits_finite_den_pos f _ ln lnum lden ha)
+      (decodeBits_finite_den_pos f _ rn rnum rden hb)
+  have hfin := evalFloatArithBase_sub_finite f a b ln rn lnum lden rnum rden ha hb
+  dsimp only at hfin ⊢
+  rw [hfin]
+  constructor
+  · intro h
+    injection h with h
+    exact (roundRatioTiesToEven_eq_inf_iff f _ _ _ hd).mp h
+  · intro h
+    rw [(roundRatioTiesToEven_eq_inf_iff f _ _ _ hd).mpr h]
+
+/-- **Operation-level overflow threshold for finite `mul`**: the product of two finite operands
+overflows to the XOR-signed infinity IF AND ONLY IF the exact rational product is
+`≥ overflowThreshold f`. -/
+theorem evalFloatArithBase_mul_finite_overflow_iff (f : IeeeFormat) (a b : Nat)
+    (ln rn : Bool) (lnum lden rnum rden : Nat)
+    (ha : decodeBits f (a % 2 ^ f.width) = .finite ln lnum lden)
+    (hb : decodeBits f (b % 2 ^ f.width) = .finite rn rnum rden) :
+    evalFloatArithBase .mul f a b = .some (infBits f (Bool.xor ln rn)) ↔
+      (lden * rden) * overflowThreshold f ≤ lnum * rnum := by
+  have hd : 0 < lden * rden :=
+    Nat.mul_pos (decodeBits_finite_den_pos f _ ln lnum lden ha)
+      (decodeBits_finite_den_pos f _ rn rnum rden hb)
+  rw [evalFloatArithBase_mul_finite f a b ln rn lnum lden rnum rden ha hb]
+  constructor
+  · intro h
+    injection h with h
+    exact (roundRatioTiesToEven_eq_inf_iff f _ _ _ hd).mp h
+  · intro h
+    rw [(roundRatioTiesToEven_eq_inf_iff f _ _ _ hd).mpr h]
+
+/-- **Operation-level overflow threshold for finite `div`**: the quotient of two finite
+operands overflows to the XOR-signed infinity IF AND ONLY IF the exact rational quotient is
+`≥ overflowThreshold f`. -/
+theorem evalFloatArithBase_div_finite_overflow_iff (f : IeeeFormat) (a b : Nat)
+    (ln rn : Bool) (lnum lden rnum rden : Nat)
+    (ha : decodeBits f (a % 2 ^ f.width) = .finite ln lnum lden)
+    (hb : decodeBits f (b % 2 ^ f.width) = .finite rn rnum rden) :
+    evalFloatArithBase .div f a b = .some (infBits f (Bool.xor ln rn)) ↔
+      (lden * rnum) * overflowThreshold f ≤ lnum * rden := by
+  have hd : 0 < lden * rnum :=
+    Nat.mul_pos (decodeBits_finite_den_pos f _ ln lnum lden ha)
+      (decodeBits_finite_num_pos f _ rn rnum rden hb)
+  rw [evalFloatArithBase_div_finite f a b ln rn lnum lden rnum rden ha hb]
+  constructor
+  · intro h
+    injection h with h
+    exact (roundRatioTiesToEven_eq_inf_iff f _ _ _ hd).mp h
+  · intro h
+    rw [(roundRatioTiesToEven_eq_inf_iff f _ _ _ hd).mpr h]
+
+/-- **Operation-level `roundTiesToEven` overflow-tie witnesses** (`f32` and `f64`, both signs):
+`MAX + ulp(MAX) / 2` lies EXACTLY halfway between `MAX` (odd all-ones significand) and
+`2 ^ (bias + 1)`, so ties-to-even carries out and overflows to `±∞`, whereas adding the
+predecessor of `ulp(MAX) / 2` leaves `±MAX` unchanged. The operands are `maxFiniteBits`
+(`0x7F7FFFFF` / `0x7FEFFFFFFFFFFFFF`) and the half-ulp `2 ^ (bias − fb − 1)`
+(`2^103 = 0x73000000` / `2^970 = 0x7C90000000000000`), i.e. the exact sum is
+`overflowThreshold f`. -/
+theorem evalFloatBinOp_overflow_tie_witness :
+    evalFloatBinOp .add .binary32 0x7F7FFFFF 0x73000000 = .some ⟨0x7F800000, 4⟩ ∧
+    evalFloatBinOp .add .binary32 0x7F7FFFFF 0x72FFFFFF = .some ⟨0x7F7FFFFF, 4⟩ ∧
+    evalFloatBinOp .sub .binary32 0xFF7FFFFF 0x73000000 = .some ⟨0xFF800000, 4⟩ ∧
+    evalFloatBinOp .sub .binary32 0xFF7FFFFF 0x72FFFFFF = .some ⟨0xFF7FFFFF, 4⟩ ∧
+    evalFloatBinOp .add .binary64 0x7FEFFFFFFFFFFFFF 0x7C90000000000000 =
+      .some ⟨0x7FF0000000000000, 8⟩ ∧
+    evalFloatBinOp .add .binary64 0x7FEFFFFFFFFFFFFF 0x7C8FFFFFFFFFFFFF =
+      .some ⟨0x7FEFFFFFFFFFFFFF, 8⟩ ∧
+    evalFloatBinOp .sub .binary64 0xFFEFFFFFFFFFFFFF 0x7C90000000000000 =
+      .some ⟨0xFFF0000000000000, 8⟩ ∧
+    evalFloatBinOp .sub .binary64 0xFFEFFFFFFFFFFFFF 0x7C8FFFFFFFFFFFFF =
+      .some ⟨0xFFEFFFFFFFFFFFFF, 8⟩ ∧
+    maxFiniteBits .binary32 false = 0x7F7FFFFF ∧
+    maxFiniteBits .binary64 false = 0x7FEFFFFFFFFFFFFF ∧
+    decodeBits .binary32 0x73000000 =
+      .finite false (2 ^ (IeeeFormat.binary32.bias - IeeeFormat.binary32.fractionBits - 1)) 1 ∧
+    decodeBits .binary64 0x7C90000000000000 =
+      .finite false (2 ^ (IeeeFormat.binary64.bias - IeeeFormat.binary64.fractionBits - 1)) 1 := by
+  have hbin : ∀ (op : BinOp) (f : IeeeFormat) (a b bits : Nat),
+      evalFloatCmp op f a b = .none → evalFloatArithBase op f a b = .some bits →
+      evalFloatBinOp op f a b = .some ⟨bits, f.byteWidth⟩ := by
+    intro op f a b bits hcmp h
+    unfold evalFloatBinOp
+    rw [hcmp, h]
+  refine ⟨
+    hbin .add .binary32 0x7F7FFFFF 0x73000000 0x7F800000 rfl (by decide +kernel),
+    hbin .add .binary32 0x7F7FFFFF 0x72FFFFFF 0x7F7FFFFF rfl (by decide +kernel),
+    hbin .sub .binary32 0xFF7FFFFF 0x73000000 0xFF800000 rfl (by decide +kernel),
+    hbin .sub .binary32 0xFF7FFFFF 0x72FFFFFF 0xFF7FFFFF rfl (by decide +kernel),
+    hbin .add .binary64 0x7FEFFFFFFFFFFFFF 0x7C90000000000000 0x7FF0000000000000 rfl (by decide +kernel),
+    hbin .add .binary64 0x7FEFFFFFFFFFFFFF 0x7C8FFFFFFFFFFFFF 0x7FEFFFFFFFFFFFFF rfl (by decide +kernel),
+    hbin .sub .binary64 0xFFEFFFFFFFFFFFFF 0x7C90000000000000 0xFFF0000000000000 rfl (by decide +kernel),
+    hbin .sub .binary64 0xFFEFFFFFFFFFFFFF 0x7C8FFFFFFFFFFFFF 0xFFEFFFFFFFFFFFFF rfl (by decide +kernel),
+    ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-! ## §4. `FloatArithMode` inclusion, `nanChoices` structure, & relational sign symmetry -/
 
@@ -10228,6 +10373,1307 @@ theorem EvalRvalueFloatRel_sub_iff_add_neg_float
             · rintro ⟨outSc, hrel, hres⟩
               exact ⟨outSc, (EvalFloatBinOpRel.sub_iff_add_neg mode _ _ _ _).mpr hrel, hres⟩
 
+/-! ### Episode 2 readiness: supportedness, `.ub` / `.unsupported` exactness, and mode / policy invariance
+
+Laws that Episode 2's `FloatArithLM` / `FloatArithMR` step simulations apply directly to
+`EvalRvalueFloatRel` at ANY `FloatArithMode` and ANY `Ptr2IntTransmutePolicy` (in particular the
+Miri / MiniRust default `.nondeterministic` + `.stripProvenance`):
+- `EvalFloatBinOpRel` is non-empty exactly on the eleven float `BinOp`s (`isFloatBinOp`),
+  independently of `mode`, format, and operands;
+- `policy` is irrelevant outside `.cast .transmute` / `.cast .subtype`, and `mode` is irrelevant
+  outside `.binaryOp` / `.cast .floatToFloat`;
+- every non-`.ok` outcome (`.ub`, `.unsupported`) admitted by the relation is mode-invariant and,
+  outside byte casts, coincides EXACTLY with the executable `evalRvalue` outcome;
+- generic-mode dispatchers for float `.binaryOp` and NaN-input `.cast .floatToFloat`.
+-/
+
+/-- `true` exactly on the eleven `BinOp`s given IEEE-754 semantics by `evalFloatBinOp`:
+arithmetic `add`, `sub`, `mul`, `div`, `rem` and comparisons `eq`, `ne`, `lt`, `le`, `gt`, `ge`. -/
+def isFloatBinOp : BinOp → Bool
+  | .add | .sub | .mul | .div | .rem | .eq | .ne | .lt | .le | .gt | .ge => true
+  | _ => false
+
+/-- **Closed-form supportedness of `evalFloatBinOp`**: it returns `.none` exactly on the
+non-float `BinOp`s, independently of the format and of both operands (in particular float
+division and remainder by zero, NaN operands, and overflow are never `.none`). -/
+theorem evalFloatBinOp_eq_none_iff (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    evalFloatBinOp op f a b = .none ↔ isFloatBinOp op = false := by
+  cases op <;>
+    first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (nomatch h), fun h => (nomatch h)⟩
+
+/-- **Mode-invariant emptiness of `EvalFloatBinOpRel`**: in BOTH `.deterministic` and
+`.nondeterministic` modes the relation admits no output IF AND ONLY IF the executable
+`evalFloatBinOp` returns `.none`. -/
+theorem EvalFloatBinOpRel_none_iff (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) :
+    (∀ out, ¬ EvalFloatBinOpRel mode op f a b out) ↔ evalFloatBinOp op f a b = .none := by
+  constructor
+  · intro h
+    cases hbin : evalFloatBinOp op f a b with
+    | none => rfl
+    | some out =>
+      have hdet := (evalFloatBinOp_iff_rel_det op f a b out).mp hbin
+      cases mode with
+      | deterministic => exact absurd hdet (h out)
+      | nondeterministic =>
+        exact absurd (EvalFloatBinOpRel.det_imp_nondet op f a b out hdet) (h out)
+  · intro hnone out hrel
+    unfold evalFloatBinOp at hnone
+    unfold EvalFloatBinOpRel at hrel
+    cases hcmp : evalFloatCmp op f a b with
+    | some c => rw [hcmp] at hnone; cases hnone
+    | none =>
+      rw [hcmp] at hnone hrel
+      dsimp only at hnone hrel
+      cases harith : evalFloatArithBase op f a b with
+      | some bits => rw [harith] at hnone; cases hnone
+      | none => rw [harith] at hrel; exact hrel
+
+/-- **Mode-invariant totality of `EvalFloatBinOpRel`**: in BOTH modes, for EVERY format and
+EVERY pair of operand bit patterns, some output is admitted IF AND ONLY IF `op` is one of the
+eleven float `BinOp`s. -/
+theorem EvalFloatBinOpRel_exists_iff (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) :
+    (∃ out, EvalFloatBinOpRel mode op f a b out) ↔ isFloatBinOp op = true := by
+  constructor
+  · rintro ⟨out, hrel⟩
+    cases hop : isFloatBinOp op with
+    | true => rfl
+    | false =>
+      exact absurd hrel
+        ((EvalFloatBinOpRel_none_iff mode op f a b).mpr
+          ((evalFloatBinOp_eq_none_iff op f a b).mpr hop) out)
+  · intro hop
+    cases hbin : evalFloatBinOp op f a b with
+    | none =>
+      have hfalse := (evalFloatBinOp_eq_none_iff op f a b).mp hbin
+      rw [hop] at hfalse
+      cases hfalse
+    | some out =>
+      have hdet := (evalFloatBinOp_iff_rel_det op f a b out).mp hbin
+      cases mode with
+      | deterministic => exact ⟨out, hdet⟩
+      | nondeterministic => exact ⟨out, EvalFloatBinOpRel.det_imp_nondet op f a b out hdet⟩
+
+/-- **Well-formedness of every admitted `EvalFloatBinOpRel` output (both modes)**: the output
+is either the `bool` scalar of a comparison, or an arithmetic scalar of width `f.byteWidth`
+with a canonical bit pattern (`< 2 ^ f.width`), including every `.nondeterministic` NaN choice. -/
+theorem EvalFloatBinOpRel_out_wf (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) (h : EvalFloatBinOpRel mode op f a b out) :
+    (∃ c, evalFloatCmp op f a b = .some c ∧ out = boolToScalar c) ∨
+    (evalFloatCmp op f a b = .none ∧ out.sizeBytes = f.byteWidth ∧ out.bits < 2 ^ f.width) := by
+  unfold EvalFloatBinOpRel at h
+  cases hcmp : evalFloatCmp op f a b with
+  | some c => rw [hcmp] at h; exact Or.inl ⟨c, rfl, h⟩
+  | none =>
+    rw [hcmp] at h
+    dsimp only at h
+    cases harith : evalFloatArithBase op f a b with
+    | none => rw [harith] at h; exact False.elim h
+    | some baseBits =>
+      rw [harith] at h
+      dsimp only at h
+      by_cases hnan : isNaNBits f baseBits = true
+      · rw [if_pos' hnan] at h
+        rcases h with ⟨cand, hmem, hout⟩
+        rw [hout]
+        exact Or.inr ⟨rfl, rfl, (mem_nanChoices_props f _ mode cand hmem).1⟩
+      · rw [if_neg' hnan] at h
+        rw [h]
+        exact Or.inr ⟨rfl, rfl, evalFloatArithBase_lt op f a b baseBits harith⟩
+
+/-- **Policy irrelevance outside byte casts**: for every `rv` other than `.cast .transmute` and
+`.cast .subtype`, `EvalRvalueFloatRel` does not depend on the `Ptr2IntTransmutePolicy`. -/
+theorem EvalRvalueFloatRel_policy_irrelevant
+    (mode : FloatArithMode) (policy₁ policy₂ : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hNotTransmute : ∀ op targetTy, rv ≠ .cast .transmute op targetTy)
+    (hNotSubtype : ∀ op targetTy, rv ≠ .cast .subtype op targetTy) :
+    EvalRvalueFloatRel mode policy₁ locals rv mem localDecls layouts res ↔
+      EvalRvalueFloatRel mode policy₂ locals rv mem localDecls layouts res := by
+  cases rv with
+  | cast kind op targetTy =>
+    cases kind with
+    | transmute => exact absurd rfl (hNotTransmute op targetTy)
+    | subtype => exact absurd rfl (hNotSubtype op targetTy)
+    | _ => exact Iff.rfl
+  | _ => exact Iff.rfl
+
+/-- **Byte-cast dispatcher (both modes, any policy)**: on `.cast .transmute` and
+`.cast .subtype`, `EvalRvalueFloatRel` is exactly `evalByteCast` at `policy`. -/
+theorem EvalRvalueFloatRel_byteCast_iff
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (kind : CastKind) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hkind : kind = .transmute ∨ kind = .subtype) :
+    EvalRvalueFloatRel mode policy locals (.cast kind op targetTy) mem localDecls layouts res ↔
+      res = evalByteCast locals op targetTy mem localDecls layouts policy := by
+  rcases hkind with rfl | rfl <;> exact Iff.rfl
+
+/-- **Mode irrelevance outside float arithmetic**: for every `rv` other than `.binaryOp` and
+`.cast .floatToFloat` (in particular for the bitwise, NaN-payload-preserving `.unaryOp .neg`
+and for byte casts), `EvalRvalueFloatRel` does not depend on the `FloatArithMode`. -/
+theorem EvalRvalueFloatRel_mode_irrelevant
+    (mode₁ mode₂ : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hNotBin : ∀ op lhsOp rhsOp, rv ≠ .binaryOp op lhsOp rhsOp)
+    (hNotF2F : ∀ op targetTy, rv ≠ .cast .floatToFloat op targetTy) :
+    EvalRvalueFloatRel mode₁ policy locals rv mem localDecls layouts res ↔
+      EvalRvalueFloatRel mode₂ policy locals rv mem localDecls layouts res := by
+  cases rv with
+  | binaryOp op lhsOp rhsOp => exact absurd rfl (hNotBin op lhsOp rhsOp)
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat => exact absurd rfl (hNotF2F op targetTy)
+    | _ => exact Iff.rfl
+  | _ => exact Iff.rfl
+
+/-- **`.unaryOp .neg` dispatcher (both modes, any policy, EVERY result)**: on unary negation
+(float or integer), `EvalRvalueFloatRel` is exactly `evalRvalue`, including its `.ub` and
+`.unsupported` outcomes (generalizing `evalRvalue_ok_realizes_EvalRvalueFloatRel_unaryNeg`
+from `.ok` results to all results). -/
+theorem EvalRvalueFloatRel_unaryNeg_iff
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult) :
+    EvalRvalueFloatRel mode policy locals (.unaryOp .neg op) mem localDecls layouts res ↔
+      res = evalRvalue locals (.unaryOp .neg op) mem localDecls layouts :=
+  Iff.rfl
+
+/-- **Mode invariance of every non-`.ok` outcome**: for EVERY `rv` and EVERY policy, a result
+that is not `.ok` (`.ub` or `.unsupported`) is admitted by `EvalRvalueFloatRel` in one
+`FloatArithMode` IF AND ONLY IF it is admitted in the other (the mode only ever selects among
+`.ok` NaN candidates). -/
+theorem EvalRvalueFloatRel_mode_irrelevant_of_not_ok
+    (mode₁ mode₂ : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hres : ∀ v l m, res ≠ .ok v l m) :
+    EvalRvalueFloatRel mode₁ policy locals rv mem localDecls layouts res ↔
+      EvalRvalueFloatRel mode₂ policy locals rv mem localDecls layouts res := by
+  unfold EvalRvalueFloatRel
+  cases rv with
+  | binaryOp op lhsOp rhsOp =>
+    dsimp only
+    have hnon_offset : ∀ (op' : BinOp) (lhs rhs : ScalarInt) (locals₂ : List LocalSlot),
+        (match Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+            (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+         | true =>
+           match operandTy localDecls layouts lhsOp, operandTy localDecls layouts rhsOp with
+           | .some lTy, .some rTy =>
+             match ieeeFormatOfTy? lTy, ieeeFormatOfTy? rTy with
+             | .some fL, .some fR =>
+               match Bool.and
+                   (match fL, fR with | .binary32, .binary32 => true | .binary64, .binary64 => true | _, _ => false)
+                   (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth)) with
+               | true =>
+                 match evalFloatBinOp op' fL lhs.bits rhs.bits with
+                 | .some _ =>
+                   ∃ outSc,
+                     EvalFloatBinOpRel mode₁ op' fL lhs.bits rhs.bits outSc ∧
+                     res = .ok (.scalar outSc) locals₂ mem
+                 | .none => res = .unsupported
+               | false => res = .unsupported
+             | _, _ => res = .unsupported
+           | _, _ => res = .unsupported
+         | false => res = evalScalarBinOp op' lhs rhs locals₂ mem (operandIsSigned localDecls lhsOp layouts)) ↔
+        (match Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+            (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+         | true =>
+           match operandTy localDecls layouts lhsOp, operandTy localDecls layouts rhsOp with
+           | .some lTy, .some rTy =>
+             match ieeeFormatOfTy? lTy, ieeeFormatOfTy? rTy with
+             | .some fL, .some fR =>
+               match Bool.and
+                   (match fL, fR with | .binary32, .binary32 => true | .binary64, .binary64 => true | _, _ => false)
+                   (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth)) with
+               | true =>
+                 match evalFloatBinOp op' fL lhs.bits rhs.bits with
+                 | .some _ =>
+                   ∃ outSc,
+                     EvalFloatBinOpRel mode₂ op' fL lhs.bits rhs.bits outSc ∧
+                     res = .ok (.scalar outSc) locals₂ mem
+                 | .none => res = .unsupported
+               | false => res = .unsupported
+             | _, _ => res = .unsupported
+           | _, _ => res = .unsupported
+         | false => res = evalScalarBinOp op' lhs rhs locals₂ mem (operandIsSigned localDecls lhsOp layouts)) := by
+      intro op' lhs rhs locals₂
+      cases Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+          (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+      | false => exact Iff.rfl
+      | true =>
+        dsimp only
+        cases operandTy localDecls layouts lhsOp with
+        | none => exact Iff.rfl
+        | some lTy =>
+          cases operandTy localDecls layouts rhsOp with
+          | none => exact Iff.rfl
+          | some rTy =>
+            dsimp only
+            cases ieeeFormatOfTy? lTy with
+            | none => exact Iff.rfl
+            | some fL =>
+              cases ieeeFormatOfTy? rTy with
+              | none => exact Iff.rfl
+              | some fR =>
+                dsimp only
+                cases Bool.and
+                    (match fL, fR with | .binary32, .binary32 => true | .binary64, .binary64 => true | _, _ => false)
+                    (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth)) with
+                | false => exact Iff.rfl
+                | true =>
+                  dsimp only
+                  cases evalFloatBinOp op' fL lhs.bits rhs.bits with
+                  | none => exact Iff.rfl
+                  | some _ =>
+                    dsimp only
+                    exact ⟨fun ⟨_, _, h⟩ => absurd h (hres _ _ _), fun ⟨_, _, h⟩ => absurd h (hres _ _ _)⟩
+    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+    | ub => exact Iff.rfl
+    | unsupported => exact Iff.rfl
+    | ok lhsVal locals₁ =>
+      dsimp only
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+      | ub => exact Iff.rfl
+      | unsupported => exact Iff.rfl
+      | ok rhsVal locals₂ =>
+        dsimp only
+        cases lhsVal with
+        | scalar lhs =>
+          cases rhsVal with
+          | scalar rhs =>
+            dsimp only
+            cases hop : op with
+            | offset => exact Iff.rfl
+            | _ => dsimp only; rw [← hop]; exact hnon_offset op lhs rhs locals₂
+          | _ => exact Iff.rfl
+        | _ => exact Iff.rfl
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat =>
+      dsimp only
+      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+      | ub => exact Iff.rfl
+      | unsupported => exact Iff.rfl
+      | ok v locals' =>
+        dsimp only
+        cases operandTy localDecls layouts op with
+        | none => exact Iff.rfl
+        | some srcTy =>
+          cases v with
+          | scalar sc =>
+            dsimp only
+            cases ieeeFormatOfTy? srcTy with
+            | none => exact Iff.rfl
+            | some src =>
+              cases ieeeFormatOfTy? targetTy with
+              | none => exact Iff.rfl
+              | some dst =>
+                dsimp only
+                cases Nat.beq sc.sizeBytes src.byteWidth with
+                | false => exact Iff.rfl
+                | true =>
+                  dsimp only
+                  by_cases hnan : isNaNBits src sc.bits = true
+                  · rw [if_pos' hnan, if_pos' hnan]
+                    exact ⟨fun ⟨_, _, h⟩ => absurd h (hres _ _ _), fun ⟨_, _, h⟩ => absurd h (hres _ _ _)⟩
+                  · rw [if_neg' hnan, if_neg' hnan]
+          | _ => exact Iff.rfl
+    | _ => exact Iff.rfl
+  | _ => exact Iff.rfl
+
+/-- **`.ub` mode invariance**: `EvalRvalueFloatRel` admits `.ub` in `.deterministic` mode IF
+AND ONLY IF it admits `.ub` in `.nondeterministic` mode (for EVERY `rv` and EVERY policy). -/
+theorem EvalRvalueFloatRel_ub_iff
+    (policy : Ptr2IntTransmutePolicy) (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    EvalRvalueFloatRel .deterministic policy locals rv mem localDecls layouts .ub ↔
+      EvalRvalueFloatRel .nondeterministic policy locals rv mem localDecls layouts .ub :=
+  EvalRvalueFloatRel_mode_irrelevant_of_not_ok .deterministic .nondeterministic policy locals rv
+    mem localDecls layouts .ub (fun _ _ _ h => nomatch h)
+
+/-- **`.unsupported` mode invariance**: `EvalRvalueFloatRel` admits `.unsupported` in
+`.deterministic` mode IF AND ONLY IF it admits `.unsupported` in `.nondeterministic` mode
+(for EVERY `rv` and EVERY policy). -/
+theorem EvalRvalueFloatRel_unsupported_iff
+    (policy : Ptr2IntTransmutePolicy) (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    EvalRvalueFloatRel .deterministic policy locals rv mem localDecls layouts .unsupported ↔
+      EvalRvalueFloatRel .nondeterministic policy locals rv mem localDecls layouts .unsupported :=
+  EvalRvalueFloatRel_mode_irrelevant_of_not_ok .deterministic .nondeterministic policy locals rv
+    mem localDecls layouts .unsupported (fun _ _ _ h => nomatch h)
+
+private theorem EvalRvalueFloatRel_floatToFloat_not_ok_iff_evalRvalue
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hres : ∀ v l m, res ≠ .ok v l m) :
+    EvalRvalueFloatRel mode policy locals (.cast .floatToFloat op targetTy) mem localDecls layouts res ↔
+      res = evalRvalue locals (.cast .floatToFloat op targetTy) mem localDecls layouts := by
+  unfold EvalRvalueFloatRel evalRvalue evalFloatCastRvalue evalFloatCast
+  dsimp only
+  cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+  | ub => exact Iff.rfl
+  | unsupported => exact Iff.rfl
+  | ok v locals' =>
+    dsimp only
+    cases operandTy localDecls layouts op with
+    | none => exact Iff.rfl
+    | some srcTy =>
+      cases v with
+      | scalar sc =>
+        dsimp only
+        cases ieeeFormatOfTy? srcTy with
+        | none => exact Iff.rfl
+        | some src =>
+          cases ieeeFormatOfTy? targetTy with
+          | none => exact Iff.rfl
+          | some dst =>
+            dsimp only
+            cases Nat.beq sc.sizeBytes src.byteWidth with
+            | false => exact Iff.rfl
+            | true =>
+              dsimp only
+              by_cases hnan : isNaNBits src sc.bits = true
+              · rw [if_pos' hnan]
+                exact ⟨fun ⟨_, _, h⟩ => absurd h (hres _ _ _), fun h => absurd h (hres _ _ _)⟩
+              · rw [if_neg' hnan]
+      | _ => exact Iff.rfl
+
+/-- **Exactness of every non-`.ok` outcome against the executable `evalRvalue`**: for every
+`rv` other than `.cast .transmute` / `.cast .subtype`, in BOTH modes and at ANY policy, a
+non-`.ok` result (`.ub` or `.unsupported`) is admitted by `EvalRvalueFloatRel` IF AND ONLY IF
+it is exactly the `evalRvalue` result. Unlike `EvalRvalueFloatRel_det_iff_evalRvalue`, this
+also covers `.nondeterministic` mode, `.stripProvenance`, and `.cast .floatToFloat`. -/
+theorem EvalRvalueFloatRel_not_ok_iff_evalRvalue
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hres : ∀ v l m, res ≠ .ok v l m)
+    (hNotTransmute : ∀ op targetTy, rv ≠ .cast .transmute op targetTy)
+    (hNotSubtype : ∀ op targetTy, rv ≠ .cast .subtype op targetTy) :
+    EvalRvalueFloatRel mode policy locals rv mem localDecls layouts res ↔
+      res = evalRvalue locals rv mem localDecls layouts := by
+  cases rv with
+  | binaryOp op lhsOp rhsOp =>
+    exact (EvalRvalueFloatRel_mode_irrelevant_of_not_ok mode .deterministic policy locals
+        (.binaryOp op lhsOp rhsOp) mem localDecls layouts res hres).trans
+      (EvalRvalueFloatRel_det_binaryOp_iff policy locals op lhsOp rhsOp mem localDecls layouts res)
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat =>
+      exact EvalRvalueFloatRel_floatToFloat_not_ok_iff_evalRvalue mode policy locals op targetTy
+        mem localDecls layouts res hres
+    | transmute => exact absurd rfl (hNotTransmute op targetTy)
+    | subtype => exact absurd rfl (hNotSubtype op targetTy)
+    | _ => exact Iff.rfl
+  | _ => exact Iff.rfl
+
+/-- **`.ub` exactness**: outside byte casts, `EvalRvalueFloatRel` admits `.ub` (in either mode,
+at any policy) IF AND ONLY IF `evalRvalue` returns `.ub`. -/
+theorem EvalRvalueFloatRel_ub_iff_evalRvalue
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hNotTransmute : ∀ op targetTy, rv ≠ .cast .transmute op targetTy)
+    (hNotSubtype : ∀ op targetTy, rv ≠ .cast .subtype op targetTy) :
+    EvalRvalueFloatRel mode policy locals rv mem localDecls layouts .ub ↔
+      evalRvalue locals rv mem localDecls layouts = .ub :=
+  (EvalRvalueFloatRel_not_ok_iff_evalRvalue mode policy locals rv mem localDecls layouts .ub
+    (fun _ _ _ h => nomatch h) hNotTransmute hNotSubtype).trans ⟨Eq.symm, Eq.symm⟩
+
+/-- **`.unsupported` exactness**: outside byte casts, `EvalRvalueFloatRel` admits
+`.unsupported` (in either mode, at any policy) IF AND ONLY IF `evalRvalue` returns
+`.unsupported`. -/
+theorem EvalRvalueFloatRel_unsupported_iff_evalRvalue
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hNotTransmute : ∀ op targetTy, rv ≠ .cast .transmute op targetTy)
+    (hNotSubtype : ∀ op targetTy, rv ≠ .cast .subtype op targetTy) :
+    EvalRvalueFloatRel mode policy locals rv mem localDecls layouts .unsupported ↔
+      evalRvalue locals rv mem localDecls layouts = .unsupported :=
+  (EvalRvalueFloatRel_not_ok_iff_evalRvalue mode policy locals rv mem localDecls layouts .unsupported
+    (fun _ _ _ h => nomatch h) hNotTransmute hNotSubtype).trans ⟨Eq.symm, Eq.symm⟩
+
+/-- **Universal `.nondeterministic` realization at ANY policy**: for every `rv` other than
+`.cast .transmute` / `.cast .subtype`, the executable `evalRvalue` result satisfies
+`EvalRvalueFloatRel .nondeterministic policy` for EVERY `policy` (generalizing
+`evalRvalue_realizes_EvalRvalueFloatRel_nondet` beyond `.strictUcg630Ub`, as required by the
+Miri / MiniRust default `.stripProvenance`). -/
+theorem evalRvalue_realizes_EvalRvalueFloatRel_nondet_of_not_byteCast
+    (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hNotTransmute : ∀ op targetTy, rv ≠ .cast .transmute op targetTy)
+    (hNotSubtype : ∀ op targetTy, rv ≠ .cast .subtype op targetTy) :
+    EvalRvalueFloatRel .nondeterministic policy locals rv mem localDecls layouts
+      (evalRvalue locals rv mem localDecls layouts) :=
+  (EvalRvalueFloatRel_policy_irrelevant .nondeterministic .strictUcg630Ub policy locals rv mem
+    localDecls layouts _ hNotTransmute hNotSubtype).mp
+    (evalRvalue_realizes_EvalRvalueFloatRel_nondet locals rv mem localDecls layouts)
+
+/-- **`.deterministic` exactness at ANY policy**: for every `rv` other than
+`.cast .floatToFloat`, `.cast .transmute`, and `.cast .subtype`,
+`EvalRvalueFloatRel .deterministic policy` coincides exactly with `evalRvalue` for EVERY
+`policy` (generalizing `EvalRvalueFloatRel_det_iff_evalRvalue` beyond `.strictUcg630Ub`). -/
+theorem EvalRvalueFloatRel_det_iff_evalRvalue_of_not_byteCast
+    (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hNotF2F : ∀ op targetTy, rv ≠ .cast .floatToFloat op targetTy)
+    (hNotTransmute : ∀ op targetTy, rv ≠ .cast .transmute op targetTy)
+    (hNotSubtype : ∀ op targetTy, rv ≠ .cast .subtype op targetTy) :
+    EvalRvalueFloatRel .deterministic policy locals rv mem localDecls layouts res ↔
+      res = evalRvalue locals rv mem localDecls layouts :=
+  (EvalRvalueFloatRel_policy_irrelevant .deterministic policy .strictUcg630Ub locals rv mem
+    localDecls layouts res hNotTransmute hNotSubtype).trans
+    (EvalRvalueFloatRel_det_iff_evalRvalue locals rv mem localDecls layouts res hNotF2F)
+
+/-- **Totality (non-vacuity) of `EvalRvalueFloatRel`**: for EVERY mode, policy, state, and
+`rv`, the relation admits at least one result, so simulation statements quantifying over
+admitted results are never vacuous. -/
+theorem EvalRvalueFloatRel_total
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∃ res, EvalRvalueFloatRel mode policy locals rv mem localDecls layouts res := by
+  cases rv with
+  | binaryOp op lhsOp rhsOp =>
+    have hdet := (EvalRvalueFloatRel_det_binaryOp_iff policy locals op lhsOp rhsOp mem localDecls
+      layouts _).mpr rfl
+    cases mode with
+    | deterministic => exact ⟨_, hdet⟩
+    | nondeterministic =>
+      exact ⟨_, EvalRvalueFloatRel.det_imp_nondet policy locals (.binaryOp op lhsOp rhsOp) mem
+        localDecls layouts _ hdet⟩
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat =>
+      unfold EvalRvalueFloatRel
+      dsimp only
+      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+      | ub => exact ⟨_, rfl⟩
+      | unsupported => exact ⟨_, rfl⟩
+      | ok v locals' =>
+        dsimp only
+        cases operandTy localDecls layouts op with
+        | none => exact ⟨_, rfl⟩
+        | some srcTy =>
+          cases v with
+          | scalar sc =>
+            dsimp only
+            cases ieeeFormatOfTy? srcTy with
+            | none => exact ⟨_, rfl⟩
+            | some src =>
+              cases ieeeFormatOfTy? targetTy with
+              | none => exact ⟨_, rfl⟩
+              | some dst =>
+                dsimp only
+                cases Nat.beq sc.sizeBytes src.byteWidth with
+                | false => exact ⟨_, rfl⟩
+                | true =>
+                  dsimp only
+                  by_cases hnan : isNaNBits src sc.bits = true
+                  · exact ⟨.ok (.scalar ⟨preferredNaNBits dst, dst.byteWidth⟩) locals' mem, by
+                      rw [if_pos' hnan]
+                      exact ⟨preferredNaNBits dst, preferredNaNBits_mem_nanChoices dst _ mode, rfl⟩⟩
+                  · exact ⟨.ok (.scalar ⟨evalFloatToFloatRoundTiesToEven src dst sc.bits, dst.byteWidth⟩)
+                      locals' mem, by rw [if_neg' hnan]⟩
+          | _ => exact ⟨_, rfl⟩
+    | _ => exact ⟨_, rfl⟩
+  | _ => exact ⟨_, rfl⟩
+
+/-- Executable evaluator realizing `EvalRvalueFloatRel .deterministic policy` EXACTLY for
+every `rv` (`EvalRvalueFloatRel_det_iff_evalRvalueDet`). It coincides with `evalRvalue` except
+that (1) `.cast .transmute` / `.cast .subtype` use `evalByteCast` at `policy` (rather than the
+fixed `.strictUcg630Ub`), and (2) a NaN source of `.cast .floatToFloat` yields
+`preferredNaNBits dst` (Miri's deterministic-float mode) instead of `evalRvalue`'s quieting
+conversion. -/
+def evalRvalueDet
+    (policy : Ptr2IntTransmutePolicy) (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) : RvalueEvalResult :=
+  match rv with
+  | .cast .floatToFloat op targetTy =>
+    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+    | .ub => .ub
+    | .unsupported => .unsupported
+    | .ok v locals' =>
+      match operandTy localDecls layouts op, v with
+      | .some srcTy, .scalar sc =>
+        match ieeeFormatOfTy? srcTy, ieeeFormatOfTy? targetTy with
+        | .some src, .some dst =>
+          match Nat.beq sc.sizeBytes src.byteWidth with
+          | true =>
+            match isNaNBits src sc.bits with
+            | true => .ok (.scalar ⟨preferredNaNBits dst, dst.byteWidth⟩) locals' mem
+            | false =>
+              .ok (.scalar ⟨evalFloatToFloatRoundTiesToEven src dst sc.bits, dst.byteWidth⟩) locals' mem
+          | false => .unsupported
+        | _, _ => .unsupported
+      | _, _ => .unsupported
+  | .cast .transmute op targetTy => evalByteCast locals op targetTy mem localDecls layouts policy
+  | .cast .subtype op targetTy => evalByteCast locals op targetTy mem localDecls layouts policy
+  | _ => evalRvalue locals rv mem localDecls layouts
+
+/-- **Exact executable characterization of `.deterministic` mode** (EVERY `rv`, EVERY policy):
+`EvalRvalueFloatRel .deterministic policy` admits `res` IF AND ONLY IF
+`res = evalRvalueDet policy ...`. Unlike `EvalRvalueFloatRel_det_iff_evalRvalue`, there is no
+side condition: NaN-input `.cast .floatToFloat` and `.stripProvenance` byte casts are covered. -/
+theorem EvalRvalueFloatRel_det_iff_evalRvalueDet
+    (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult) :
+    EvalRvalueFloatRel .deterministic policy locals rv mem localDecls layouts res ↔
+      res = evalRvalueDet policy locals rv mem localDecls layouts := by
+  cases rv with
+  | binaryOp op lhsOp rhsOp =>
+    exact EvalRvalueFloatRel_det_binaryOp_iff policy locals op lhsOp rhsOp mem localDecls layouts res
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat =>
+      unfold EvalRvalueFloatRel evalRvalueDet
+      dsimp only
+      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+      | ub => exact Iff.rfl
+      | unsupported => exact Iff.rfl
+      | ok v locals' =>
+        dsimp only
+        cases operandTy localDecls layouts op with
+        | none => exact Iff.rfl
+        | some srcTy =>
+          cases v with
+          | scalar sc =>
+            dsimp only
+            cases ieeeFormatOfTy? srcTy with
+            | none => exact Iff.rfl
+            | some src =>
+              cases ieeeFormatOfTy? targetTy with
+              | none => exact Iff.rfl
+              | some dst =>
+                dsimp only
+                cases Nat.beq sc.sizeBytes src.byteWidth with
+                | false => exact Iff.rfl
+                | true =>
+                  dsimp only
+                  cases isNaNBits src sc.bits with
+                  | true =>
+                    dsimp only
+                    rw [if_pos' rfl]
+                    unfold nanChoices
+                    constructor
+                    · rintro ⟨cand, hc, hr⟩
+                      rcases List.mem_cons.mp hc with rfl | hnil
+                      · exact hr
+                      · cases hnil
+                    · intro h
+                      exact ⟨preferredNaNBits dst, List.mem_cons_self, h⟩
+                  | false =>
+                    dsimp only
+                    rw [if_neg' Bool.false_ne_true]
+          | _ => exact Iff.rfl
+    | _ => exact Iff.rfl
+  | _ => exact Iff.rfl
+
+/-- **Functionality of `.deterministic` mode**: for EVERY policy, state, and `rv`,
+`EvalRvalueFloatRel .deterministic` admits at most one result (together with
+`EvalRvalueFloatRel_total`, exactly one: `evalRvalueDet`). -/
+theorem EvalRvalueFloatRel_det_functional
+    (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res₁ res₂ : RvalueEvalResult)
+    (h₁ : EvalRvalueFloatRel .deterministic policy locals rv mem localDecls layouts res₁)
+    (h₂ : EvalRvalueFloatRel .deterministic policy locals rv mem localDecls layouts res₂) :
+    res₁ = res₂ :=
+  ((EvalRvalueFloatRel_det_iff_evalRvalueDet policy locals rv mem localDecls layouts res₁).mp h₁).trans
+    ((EvalRvalueFloatRel_det_iff_evalRvalueDet policy locals rv mem localDecls layouts res₂).mp h₂).symm
+
+/-- `evalRvalueDet .strictUcg630Ub` coincides with `evalRvalue` on every `rv` other than
+`.cast .floatToFloat` (where the two differ exactly on NaN sources, see
+`evalRvalue_floatToFloat_nan_rel_separation_witness`). -/
+theorem evalRvalueDet_strict_eq_evalRvalue
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hNotF2F : ∀ op targetTy, rv ≠ .cast .floatToFloat op targetTy) :
+    evalRvalueDet .strictUcg630Ub locals rv mem localDecls layouts =
+      evalRvalue locals rv mem localDecls layouts := by
+  cases rv with
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat => exact absurd rfl (hNotF2F op targetTy)
+    | _ => rfl
+  | _ => rfl
+
+/-- `evalRvalueDet policy` does not depend on `policy` outside byte casts, where it coincides
+with `evalRvalue` on every `rv` other than `.cast .floatToFloat`. -/
+theorem evalRvalueDet_eq_evalRvalue_of_not_byteCast
+    (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hNotF2F : ∀ op targetTy, rv ≠ .cast .floatToFloat op targetTy)
+    (hNotTransmute : ∀ op targetTy, rv ≠ .cast .transmute op targetTy)
+    (hNotSubtype : ∀ op targetTy, rv ≠ .cast .subtype op targetTy) :
+    evalRvalueDet policy locals rv mem localDecls layouts =
+      evalRvalue locals rv mem localDecls layouts := by
+  cases rv with
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat => exact absurd rfl (hNotF2F op targetTy)
+    | transmute => exact absurd rfl (hNotTransmute op targetTy)
+    | subtype => exact absurd rfl (hNotSubtype op targetTy)
+    | _ => rfl
+  | _ => rfl
+
+/-- **Generic-mode float `.binaryOp` dispatcher** (BOTH modes, ANY policy): when both operands
+evaluate to scalars of the same modeled IEEE-754 format `f` (read through `evalOperand` from
+constants, locals, caller locals, globals, or memory, with `locals₂` threading any moves),
+`EvalRvalueFloatRel` admits EXACTLY the `.ok` results carrying an `EvalFloatBinOpRel mode`
+output, or `.unsupported` when `op` is not a float `BinOp`. Float binary operations never
+admit `.ub`. -/
+theorem EvalRvalueFloatRel_binaryOp_float_iff
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand)
+    (lhs rhs : ScalarInt) (lTy rTy : Ty) (f : IeeeFormat)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hnotOff : op ≠ .offset)
+    (hl : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar lhs) locals₁)
+    (hr : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar rhs) locals₂)
+    (hlTy : operandTy localDecls layouts lhsOp = .some lTy)
+    (hrTy : operandTy localDecls layouts rhsOp = .some rTy)
+    (hlf : ieeeFormatOfTy? lTy = .some f)
+    (hrf : ieeeFormatOfTy? rTy = .some f)
+    (hlsz : lhs.sizeBytes = f.byteWidth)
+    (hrsz : rhs.sizeBytes = f.byteWidth) :
+    EvalRvalueFloatRel mode policy locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts res ↔
+      ((∃ outSc, EvalFloatBinOpRel mode op f lhs.bits rhs.bits outSc ∧
+          res = .ok (.scalar outSc) locals₂ mem) ∨
+        (isFloatBinOp op = false ∧ res = .unsupported)) := by
+  have hfloatL : isFloatOptTy (.some lTy) = true := by
+    unfold isFloatOptTy isFloatTy
+    unfold ieeeFormatOfTy? at hlf
+    cases hlk : lTy.kind with
+    | float _ => dsimp only; rw [hlk]
+    | _ => rw [hlk] at hlf; cases hlf
+  have hcore : ∀ op' : BinOp,
+      (match evalFloatBinOp op' f lhs.bits rhs.bits with
+       | .some _ =>
+         ∃ outSc, EvalFloatBinOpRel mode op' f lhs.bits rhs.bits outSc ∧
+           res = .ok (.scalar outSc) locals₂ mem
+       | .none => res = .unsupported) ↔
+      ((∃ outSc, EvalFloatBinOpRel mode op' f lhs.bits rhs.bits outSc ∧
+          res = .ok (.scalar outSc) locals₂ mem) ∨
+        (isFloatBinOp op' = false ∧ res = .unsupported)) := by
+    intro op'
+    cases hbin : evalFloatBinOp op' f lhs.bits rhs.bits with
+    | none =>
+      dsimp only
+      have hnone := (evalFloatBinOp_eq_none_iff op' f lhs.bits rhs.bits).mp hbin
+      constructor
+      · intro h; exact Or.inr ⟨hnone, h⟩
+      · rintro (⟨outSc, hrel, _⟩ | ⟨_, h⟩)
+        · exact absurd hrel ((EvalFloatBinOpRel_none_iff mode op' f lhs.bits rhs.bits).mpr hbin outSc)
+        · exact h
+    | some x =>
+      dsimp only
+      constructor
+      · intro h; exact Or.inl h
+      · rintro (h | ⟨hf, _⟩)
+        · exact h
+        · have hnone := (evalFloatBinOp_eq_none_iff op' f lhs.bits rhs.bits).mpr hf
+          rw [hbin] at hnone
+          cases hnone
+  have hfmt : ∀ op' : BinOp,
+      (match Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+          (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+       | true =>
+         match operandTy localDecls layouts lhsOp, operandTy localDecls layouts rhsOp with
+         | .some lTy, .some rTy =>
+           match ieeeFormatOfTy? lTy, ieeeFormatOfTy? rTy with
+           | .some fL, .some fR =>
+             match Bool.and
+                 (match fL, fR with | .binary32, .binary32 => true | .binary64, .binary64 => true | _, _ => false)
+                 (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth)) with
+             | true =>
+               match evalFloatBinOp op' fL lhs.bits rhs.bits with
+               | .some _ =>
+                 ∃ outSc,
+                   EvalFloatBinOpRel mode op' fL lhs.bits rhs.bits outSc ∧
+                   res = .ok (.scalar outSc) locals₂ mem
+               | .none => res = .unsupported
+             | false => res = .unsupported
+           | _, _ => res = .unsupported
+         | _, _ => res = .unsupported
+       | false => res = evalScalarBinOp op' lhs rhs locals₂ mem (operandIsSigned localDecls lhsOp layouts)) ↔
+      ((∃ outSc, EvalFloatBinOpRel mode op' f lhs.bits rhs.bits outSc ∧
+          res = .ok (.scalar outSc) locals₂ mem) ∨
+        (isFloatBinOp op' = false ∧ res = .unsupported)) := by
+    intro op'
+    rw [hlTy, hrTy, hfloatL, Bool.true_or]
+    dsimp only
+    rw [hlf, hrf]
+    dsimp only
+    rw [hlsz, hrsz, Nat.beq_refl]
+    cases f with
+    | binary32 => exact hcore op'
+    | binary64 => exact hcore op'
+  unfold EvalRvalueFloatRel
+  dsimp only
+  rw [hl]
+  dsimp only
+  rw [hr]
+  dsimp only
+  cases hop : op with
+  | offset => exact absurd hop hnotOff
+  | _ => dsimp only; rw [← hop]; exact hfmt op
+
+/-- **Generic-mode NaN-input `.cast .floatToFloat` dispatcher** (BOTH modes, ANY policy): on a
+NaN source scalar of modeled format `src` cast to modeled format `dst`, `EvalRvalueFloatRel`
+admits EXACTLY the `.ok` results carrying a candidate of
+`nanChoices dst [(src, sc.bits % 2 ^ src.width)] mode` (complementing the non-NaN law
+`EvalRvalueFloatRel_floatToFloat_of_not_nan`). -/
+theorem EvalRvalueFloatRel_floatToFloat_nan_iff
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy srcTy : Ty)
+    (sc : ScalarInt) (src dst : IeeeFormat)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar sc) locals')
+    (hty : operandTy localDecls layouts op = .some srcTy)
+    (hsrc : ieeeFormatOfTy? srcTy = .some src)
+    (hdst : ieeeFormatOfTy? targetTy = .some dst)
+    (hsz : sc.sizeBytes = src.byteWidth)
+    (hnan : isNaNBits src sc.bits = true) :
+    EvalRvalueFloatRel mode policy locals (.cast .floatToFloat op targetTy) mem localDecls layouts res ↔
+      ∃ cand,
+        cand ∈ nanChoices dst [(src, sc.bits % 2 ^ src.width)] mode ∧
+        res = .ok (.scalar ⟨cand, dst.byteWidth⟩) locals' mem := by
+  unfold EvalRvalueFloatRel
+  dsimp only
+  rw [hop]
+  dsimp only
+  rw [hty]
+  dsimp only
+  rw [hsrc, hdst]
+  dsimp only
+  rw [hsz, Nat.beq_refl]
+  dsimp only
+  rw [if_pos' hnan]
+
+/-! ### `Ptr2IntTransmutePolicy` at the `EvalRvalueFloatRel` level & type-generic composite bridges
+
+The laws below hold uniformly for EVERY target type (scalars, floats, structs, tuples, arrays,
+niche and tagged enums, unions): they are stated over arbitrary `Ty` / `Operand` and lift the
+§5 refinement, exact split, and provenance-free equivalence to the decoders and to
+`EvalRvalueFloatRel` itself. -/
+
+/-- **Decoder-level exact split (`decodeTypedValueFromBytes`, every type)**: either both
+policies decode identically, or `.strictUcg630Ub` rejects (`.none`). -/
+theorem decodeTypedValueFromBytes_strip_eq_strict_or_strict_none
+    (fuel : Nat) (layouts : LayoutTable) (ty : Ty) (bytes : List AbstractByte) :
+    decodeTypedValueFromBytes fuel layouts ty bytes .stripProvenance =
+      decodeTypedValueFromBytes fuel layouts ty bytes .strictUcg630Ub ∨
+    decodeTypedValueFromBytes fuel layouts ty bytes .strictUcg630Ub = .none := by
+  cases h : decodeTypedValueFromBytes fuel layouts ty bytes .strictUcg630Ub with
+  | none => exact Or.inr rfl
+  | some v =>
+    exact Or.inl
+      (decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance fuel layouts ty bytes v h)
+
+/-- **Decoder-level exact split (`decodeTypedValueRichWithPolicy`, every type)**. -/
+theorem decodeTypedValueRichWithPolicy_strip_eq_strict_or_strict_none
+    (fuel : Nat) (layouts : LayoutTable) (richSpecs : List (DefPath × RichAdtSpec))
+    (ty : Ty) (bytes : List AbstractByte) :
+    decodeTypedValueRichWithPolicy fuel layouts richSpecs ty bytes .stripProvenance =
+      decodeTypedValueRichWithPolicy fuel layouts richSpecs ty bytes .strictUcg630Ub ∨
+    decodeTypedValueRichWithPolicy fuel layouts richSpecs ty bytes .strictUcg630Ub = .none := by
+  cases h : decodeTypedValueRichWithPolicy fuel layouts richSpecs ty bytes .strictUcg630Ub with
+  | none => exact Or.inr rfl
+  | some v =>
+    exact Or.inl
+      (decodeTypedValueRichWithPolicy_strictUcg630Ub_refines_stripProvenance fuel layouts richSpecs
+        ty bytes v h)
+
+/-- **Policies can only differ on provenance-carrying bytes (`decodeTypedValueFromBytes`, every
+type)**: whenever the two policies decode `bytes` differently, some byte of `bytes` carries
+pointer provenance. -/
+theorem decodeTypedValueFromBytes_policy_differs_imp_haveProv
+    (fuel : Nat) (layouts : LayoutTable) (ty : Ty) (bytes : List AbstractByte)
+    (h : decodeTypedValueFromBytes fuel layouts ty bytes .strictUcg630Ub ≠
+      decodeTypedValueFromBytes fuel layouts ty bytes .stripProvenance) :
+    abstractBytesHaveProv bytes = true := by
+  cases hp : abstractBytesHaveProv bytes with
+  | true => rfl
+  | false => exact absurd (decodeTypedValueFromBytes_eq_of_provFree fuel layouts ty bytes hp) h
+
+/-- **Policies can only differ on provenance-carrying bytes (`decodeTypedValueRichWithPolicy`,
+every type)**. -/
+theorem decodeTypedValueRichWithPolicy_policy_differs_imp_haveProv
+    (fuel : Nat) (layouts : LayoutTable) (richSpecs : List (DefPath × RichAdtSpec))
+    (ty : Ty) (bytes : List AbstractByte)
+    (h : decodeTypedValueRichWithPolicy fuel layouts richSpecs ty bytes .strictUcg630Ub ≠
+      decodeTypedValueRichWithPolicy fuel layouts richSpecs ty bytes .stripProvenance) :
+    abstractBytesHaveProv bytes = true := by
+  cases hp : abstractBytesHaveProv bytes with
+  | true => rfl
+  | false =>
+    exact absurd (decodeTypedValueRichWithPolicy_eq_of_provFree fuel layouts richSpecs ty bytes hp) h
+
+/-- **`evalByteCast` policies differ only as `.strictUcg630Ub = .ub` on a provenance-carrying
+source (every source and target type)**: whenever the two policies evaluate a byte cast
+differently, `.strictUcg630Ub` returns `.ub` and the evaluated source value carries pointer
+provenance (`valueHasProv v = true`). -/
+theorem evalByteCast_policy_differs_imp
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (v : Value)
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok v locals')
+    (h : evalByteCast locals op targetTy mem localDecls layouts .strictUcg630Ub ≠
+      evalByteCast locals op targetTy mem localDecls layouts .stripProvenance) :
+    evalByteCast locals op targetTy mem localDecls layouts .strictUcg630Ub = .ub ∧
+    valueHasProv v = true := by
+  constructor
+  · rcases evalByteCast_strip_eq_strict_or_strict_ub locals op targetTy mem localDecls layouts with
+      heq | hub
+    · exact absurd heq.symm h
+    · exact hub
+  · cases hp : valueHasProv v with
+    | true => rfl
+    | false =>
+      exact absurd
+        (evalByteCast_eq_of_provFree locals locals' op targetTy mem localDecls layouts v hop hp) h
+
+/-- **Relation-level refinement on byte casts (both modes)**: every `.ok` result admitted by
+`EvalRvalueFloatRel mode .strictUcg630Ub` on `.cast .transmute` / `.cast .subtype` is admitted
+identically by `EvalRvalueFloatRel mode .stripProvenance`. -/
+theorem EvalRvalueFloatRel_byteCast_strict_refines_strip
+    (mode : FloatArithMode) (locals locals' : List LocalSlot) (kind : CastKind) (op : Operand)
+    (targetTy : Ty) (mem mem' : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (v : Value) (hkind : kind = .transmute ∨ kind = .subtype)
+    (h : EvalRvalueFloatRel mode .strictUcg630Ub locals (.cast kind op targetTy) mem localDecls layouts
+      (.ok v locals' mem')) :
+    EvalRvalueFloatRel mode .stripProvenance locals (.cast kind op targetTy) mem localDecls layouts
+      (.ok v locals' mem') := by
+  have hs := (EvalRvalueFloatRel_byteCast_iff mode .strictUcg630Ub locals kind op targetTy mem
+    localDecls layouts _ hkind).mp h
+  exact (EvalRvalueFloatRel_byteCast_iff mode .stripProvenance locals kind op targetTy mem
+    localDecls layouts _ hkind).mpr
+    (evalByteCast_strictUcg630Ub_refines_stripProvenance locals locals' op targetTy mem mem'
+      localDecls layouts v hs.symm).symm
+
+/-- **Relation-level exact split on byte casts (both modes)**: every result admitted by
+`EvalRvalueFloatRel mode .stripProvenance` on `.cast .transmute` / `.cast .subtype` is either
+admitted identically under `.strictUcg630Ub`, or `.strictUcg630Ub` admits `.ub`. -/
+theorem EvalRvalueFloatRel_byteCast_strip_split
+    (mode : FloatArithMode) (locals : List LocalSlot) (kind : CastKind) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (res : RvalueEvalResult) (hkind : kind = .transmute ∨ kind = .subtype)
+    (h : EvalRvalueFloatRel mode .stripProvenance locals (.cast kind op targetTy) mem localDecls layouts res) :
+    EvalRvalueFloatRel mode .strictUcg630Ub locals (.cast kind op targetTy) mem localDecls layouts res ∨
+    EvalRvalueFloatRel mode .strictUcg630Ub locals (.cast kind op targetTy) mem localDecls layouts .ub := by
+  have hs := (EvalRvalueFloatRel_byteCast_iff mode .stripProvenance locals kind op targetTy mem
+    localDecls layouts _ hkind).mp h
+  rcases evalByteCast_strip_eq_strict_or_strict_ub locals op targetTy mem localDecls layouts with
+    heq | hub
+  · exact Or.inl ((EvalRvalueFloatRel_byteCast_iff mode .strictUcg630Ub locals kind op targetTy mem
+      localDecls layouts _ hkind).mpr (hs.trans heq))
+  · exact Or.inr ((EvalRvalueFloatRel_byteCast_iff mode .strictUcg630Ub locals kind op targetTy mem
+      localDecls layouts _ hkind).mpr hub.symm)
+
+/-- **Relation-level provenance-free equivalence on byte casts (both modes)**: when the source
+operand evaluates to a provenance-free `Value`, `EvalRvalueFloatRel` on `.cast .transmute` /
+`.cast .subtype` does not depend on the `Ptr2IntTransmutePolicy` (for every source and target
+type, including composites). -/
+theorem EvalRvalueFloatRel_byteCast_policy_irrelevant_of_provFree
+    (mode : FloatArithMode) (policy₁ policy₂ : Ptr2IntTransmutePolicy)
+    (locals locals' : List LocalSlot) (kind : CastKind) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (v : Value) (res : RvalueEvalResult) (hkind : kind = .transmute ∨ kind = .subtype)
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok v locals')
+    (hv : valueHasProv v = false) :
+    EvalRvalueFloatRel mode policy₁ locals (.cast kind op targetTy) mem localDecls layouts res ↔
+      EvalRvalueFloatRel mode policy₂ locals (.cast kind op targetTy) mem localDecls layouts res := by
+  have heq := evalByteCast_eq_of_provFree locals locals' op targetTy mem localDecls layouts v hop hv
+  have hall : evalByteCast locals op targetTy mem localDecls layouts policy₁ =
+      evalByteCast locals op targetTy mem localDecls layouts policy₂ := by
+    cases policy₁ <;> cases policy₂
+    · rfl
+    · exact heq
+    · exact heq.symm
+    · rfl
+  exact (EvalRvalueFloatRel_byteCast_iff mode policy₁ locals kind op targetTy mem localDecls
+      layouts res hkind).trans
+    (Iff.trans ⟨fun h => h.trans hall, fun h => h.trans hall.symm⟩
+      (EvalRvalueFloatRel_byteCast_iff mode policy₂ locals kind op targetTy mem localDecls
+        layouts res hkind).symm)
+
+/-! ### Concrete Episode 2 witnesses: operands from locals, NaN choices, & `Ptr2IntTransmutePolicy` separation -/
+
+/-- `copy _i` operand for concrete witnesses. -/
+private abbrev b2Copy (i : Nat) : Operand := .copy ⟨i, .nil⟩
+
+/-- `move _i` operand for concrete witnesses. -/
+private abbrev b2Move (i : Nat) : Operand := .move ⟨i, .nil⟩
+
+/-- Two `f32` local declarations (`_0 : f32`, `_1 : f32`). -/
+private abbrev b2F32Decls : List LocalDecl := [⟨.not, f32Ty, .none⟩, ⟨.not, f32Ty, .none⟩]
+
+/-- Primitive scalar `TypeLayout` of `bytes` bytes for concrete witnesses. -/
+private def b2PrimLayout (bytes : Nat) (pk : PrimitiveKind) (maxVal : Nat) : TypeLayout :=
+  { size := ⟨bytes⟩, align := ⟨bytes⟩, backendRepr := .scalar (.initialized pk ⟨0, maxVal⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- 16-byte two-field aggregate `TypeLayout` (fields at byte offsets `0` and `8`) whose fields
+have layout indices `fl0` and `fl1`. -/
+private def b2PairLayout (fl0 fl1 : Nat) : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [fl0, fl1] }
+
+/-- 64-bit `LayoutTable` for concrete witnesses: `0 ↦ ()`, `1 ↦ f32`, `2 ↦ f64`, `3 ↦ u64`,
+`4 ↦ *const u8`, `5 ↦ u8`, `6 ↦ (*const u8, u64)`, `7 ↦ (u64, u64)`,
+`8 ↦ struct S { a: u8, b: u64 }` (7 padding bytes at offsets `1..8`),
+`9 ↦ struct P { p: *const u8, q: *const u8 }`, `10 ↦ union U { p: *const u8, n: u64 }`. -/
+private def b2Layouts : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries :=
+      [ { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .arbitrary [] [],
+          variants := .single 0, isUninhabited := false },
+        b2PrimLayout 4 (.float 32) 0xFFFFFFFF,
+        b2PrimLayout 8 (.float 64) 0xFFFFFFFFFFFFFFFF,
+        b2PrimLayout 8 (.int 64 false) 0xFFFFFFFFFFFFFFFF,
+        b2PrimLayout 8 (.pointer 0) 0xFFFFFFFFFFFFFFFF,
+        b2PrimLayout 1 (.int 8 false) 0xFF,
+        b2PairLayout 4 3,
+        b2PairLayout 3 3,
+        b2PairLayout 5 3,
+        b2PairLayout 4 4,
+        { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory, fields := .union 2,
+          variants := .single 0, isUninhabited := false, fieldLayouts := [4, 3] } ] }
+
+private abbrev b2U32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+private abbrev b2UsizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+private abbrev b2PtrTy : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
+private abbrev b2PtrArrTy : Ty := { kind := .array (.rawPtr .not (.uint .u8)) 2, layoutIdx := 0 }
+private abbrev b2UsizeArrTy : Ty := { kind := .array (.uint .usize) 2, layoutIdx := 0 }
+private abbrev b2F32T : Ty := { kind := .float .f32, layoutIdx := 1 }
+private abbrev b2F64T : Ty := { kind := .float .f64, layoutIdx := 2 }
+private abbrev b2U64T : Ty := { kind := .uint .u64, layoutIdx := 3 }
+private abbrev b2PtrT : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 4 }
+private abbrev b2PtrU64TupT : Ty :=
+  { kind := .tuple [.rawPtr .not (.uint .u8), .uint .u64], layoutIdx := 6 }
+private abbrev b2U64PairTupT : Ty := { kind := .tuple [.uint .u64, .uint .u64], layoutIdx := 7 }
+private abbrev b2PadStructT : Ty := { kind := .adt "S" .nil, layoutIdx := 8 }
+private abbrev b2PtrPairStructT : Ty := { kind := .adt "P" .nil, layoutIdx := 9 }
+private abbrev b2UnionT : Ty := { kind := .adt "U" .nil, layoutIdx := 10 }
+
+/-- Pointer value `(alloc 7) + 0x1000` for concrete witnesses. -/
+private abbrev b2PtrA : Value := .ptr { allocId := 7, offsetBytes := 0x1000 } 8
+
+/-- **Float operands read from locals through `evalOperand`** (not only typed constants):
+with `localDecls` resolving `_0, _1 : f32`, `evalRvalue` evaluates `1.0 + 2.0 = 3.0`
+(threading the `move` of `_1` into the resulting locals), `-(1.0) = -1.0`, and `1.0 < 2.0`
+with IEEE-754 semantics.
+
+**Hazard pin (documented type-directed dispatch)**: with `localDecls := .nil` the same locals
+are NOT recognized as floats and follow the INTEGER path (`0x3F800000 + 0x40000000 =
+0x7F800000`, two's-complement negation `0xC0800000`). Episode 2 simulations must therefore
+supply `localDecls` resolving the static type of every float operand. -/
+theorem evalRvalue_float_operands_from_locals_witness :
+    let locals : List LocalSlot := [.init (.scalar ⟨0x3F800000, 4⟩), .init (.scalar ⟨0x40000000, 4⟩)]
+    evalRvalue locals (.binaryOp .add (b2Copy 0) (b2Move 1)) emptyMemory b2F32Decls emptyLayoutTable =
+      .ok (.scalar ⟨0x40400000, 4⟩) [.init (.scalar ⟨0x3F800000, 4⟩), .uninit] emptyMemory ∧
+    evalRvalue locals (.unaryOp .neg (b2Copy 0)) emptyMemory b2F32Decls emptyLayoutTable =
+      .ok (.scalar ⟨0xBF800000, 4⟩) locals emptyMemory ∧
+    evalRvalue locals (.binaryOp .lt (b2Copy 0) (b2Copy 1)) emptyMemory b2F32Decls emptyLayoutTable =
+      .ok (.scalar (boolToScalar true)) locals emptyMemory ∧
+    evalRvalue locals (.binaryOp .add (b2Copy 0) (b2Copy 1)) emptyMemory .nil emptyLayoutTable =
+      .ok (.scalar ⟨0x7F800000, 4⟩) locals emptyMemory ∧
+    evalRvalue locals (.unaryOp .neg (b2Copy 0)) emptyMemory .nil emptyLayoutTable =
+      .ok (.scalar ⟨0xC0800000, 4⟩) locals emptyMemory := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **NaN operands read from locals: exact admissible result sets in both modes** (at any
+policy). For `_0 + move _1` with `_0 = sNaN 0x7FA00001_f32` and `_1 = 1.0_f32`:
+- `evalRvalue` returns the preferred NaN `0x7FC00000` and marks `_1` as moved-out;
+- `EvalRvalueFloatRel .nondeterministic` admits `.ok` EXACTLY for the six NaNs
+  `±preferred`, `±quieted input (0x7FE00001)`, `±unchanged signaling input (0x7FA00001)`;
+- `EvalRvalueFloatRel .deterministic` admits `.ok` EXACTLY for the preferred NaN;
+- neither mode admits `.ub` or `.unsupported`. -/
+theorem EvalRvalueFloatRel_nan_operands_from_locals_witness :
+    let locals : List LocalSlot := [.init (.scalar ⟨0x7FA00001, 4⟩), .init (.scalar ⟨0x3F800000, 4⟩)]
+    let locals₂ : List LocalSlot := [.init (.scalar ⟨0x7FA00001, 4⟩), .uninit]
+    let rv : Rvalue := .binaryOp .add (b2Copy 0) (b2Move 1)
+    evalRvalue locals rv emptyMemory b2F32Decls emptyLayoutTable =
+      .ok (.scalar ⟨0x7FC00000, 4⟩) locals₂ emptyMemory ∧
+    (∀ policy bits,
+      EvalRvalueFloatRel .nondeterministic policy locals rv emptyMemory b2F32Decls emptyLayoutTable
+          (.ok (.scalar ⟨bits, 4⟩) locals₂ emptyMemory) ↔
+        bits ∈ [0x7FC00000, 0xFFC00000, 0x7FE00001, 0xFFE00001, 0x7FA00001, 0xFFA00001]) ∧
+    (∀ policy bits,
+      EvalRvalueFloatRel .deterministic policy locals rv emptyMemory b2F32Decls emptyLayoutTable
+          (.ok (.scalar ⟨bits, 4⟩) locals₂ emptyMemory) ↔
+        bits = 0x7FC00000) ∧
+    (∀ mode policy,
+      ¬ EvalRvalueFloatRel mode policy locals rv emptyMemory b2F32Decls emptyLayoutTable .ub ∧
+      ¬ EvalRvalueFloatRel mode policy locals rv emptyMemory b2F32Decls emptyLayoutTable .unsupported) := by
+  dsimp only
+  have hdisp := fun (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy) (res : RvalueEvalResult) =>
+    EvalRvalueFloatRel_binaryOp_float_iff mode policy
+      [.init (.scalar ⟨0x7FA00001, 4⟩), .init (.scalar ⟨0x3F800000, 4⟩)]
+      [.init (.scalar ⟨0x7FA00001, 4⟩), .init (.scalar ⟨0x3F800000, 4⟩)]
+      [.init (.scalar ⟨0x7FA00001, 4⟩), .uninit]
+      .add (b2Copy 0) (b2Move 1) ⟨0x7FA00001, 4⟩ ⟨0x3F800000, 4⟩ f32Ty f32Ty .binary32
+      emptyMemory b2F32Decls emptyLayoutTable res (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl
+  have hcmp : evalFloatCmp .add .binary32 0x7FA00001 0x3F800000 = .none := rfl
+  have harith : evalFloatArithBase .add .binary32 0x7FA00001 0x3F800000 = .some 0x7FC00000 := by
+    decide +kernel
+  have hnanb : isNaNBits .binary32 0x7FC00000 = true := by decide +kernel
+  have hchN : nanChoices .binary32
+      [(.binary32, 0x7FA00001 % 2 ^ IeeeFormat.binary32.width),
+       (.binary32, 0x3F800000 % 2 ^ IeeeFormat.binary32.width)] .nondeterministic =
+      [0x7FC00000, 0xFFC00000, 0x7FE00001, 0xFFE00001, 0x7FA00001, 0xFFA00001] := by decide +kernel
+  have hchD : nanChoices .binary32
+      [(.binary32, 0x7FA00001 % 2 ^ IeeeFormat.binary32.width),
+       (.binary32, 0x3F800000 % 2 ^ IeeeFormat.binary32.width)] .deterministic =
+      [0x7FC00000] := by decide +kernel
+  have hrel : ∀ (mode : FloatArithMode) (out : ScalarInt),
+      EvalFloatBinOpRel mode .add .binary32 0x7FA00001 0x3F800000 out ↔
+        ∃ cand,
+          cand ∈ nanChoices .binary32
+            [(.binary32, 0x7FA00001 % 2 ^ IeeeFormat.binary32.width),
+             (.binary32, 0x3F800000 % 2 ^ IeeeFormat.binary32.width)] mode ∧
+          out = ⟨cand, IeeeFormat.binary32.byteWidth⟩ := by
+    intro mode out
+    unfold EvalFloatBinOpRel
+    rw [hcmp]
+    dsimp only
+    rw [harith]
+    dsimp only
+    rw [if_pos' hnanb]
+  have hrelN : ∀ out : ScalarInt,
+      EvalFloatBinOpRel .nondeterministic .add .binary32 0x7FA00001 0x3F800000 out ↔
+        ∃ cand, cand ∈ [0x7FC00000, 0xFFC00000, 0x7FE00001, 0xFFE00001, 0x7FA00001, 0xFFA00001] ∧
+          out = ⟨cand, IeeeFormat.binary32.byteWidth⟩ := by
+    intro out
+    rw [← hchN]
+    exact hrel .nondeterministic out
+  have hrelD : ∀ out : ScalarInt,
+      EvalFloatBinOpRel .deterministic .add .binary32 0x7FA00001 0x3F800000 out ↔
+        ∃ cand, cand ∈ [0x7FC00000] ∧ out = ⟨cand, IeeeFormat.binary32.byteWidth⟩ := by
+    intro out
+    rw [← hchD]
+    exact hrel .deterministic out
+  refine ⟨rfl, ?_, ?_, ?_⟩
+  · intro policy bits
+    refine (hdisp .nondeterministic policy _).trans ⟨?_, ?_⟩
+    · rintro (⟨outSc, hrel, hres⟩ | ⟨hf, _⟩)
+      · obtain ⟨cand, hmem, hout⟩ := (hrelN outSc).mp hrel
+        injection hres with hval _ _
+        injection hval with hsc
+        rw [← hsc] at hout
+        injection hout with hb _
+        rw [hb]
+        exact hmem
+      · cases hf
+    · intro hmem
+      exact Or.inl ⟨⟨bits, 4⟩, (hrelN _).mpr ⟨bits, hmem, rfl⟩, rfl⟩
+  · intro policy bits
+    refine (hdisp .deterministic policy _).trans ⟨?_, ?_⟩
+    · rintro (⟨outSc, hrel, hres⟩ | ⟨hf, _⟩)
+      · obtain ⟨cand, hmem, hout⟩ := (hrelD outSc).mp hrel
+        injection hres with hval _ _
+        injection hval with hsc
+        rw [← hsc] at hout
+        injection hout with hb _
+        rcases List.mem_cons.mp hmem with rfl | hnil
+        · exact hb
+        · cases hnil
+      · cases hf
+    · intro hb
+      exact Or.inl ⟨⟨bits, 4⟩, (hrelD _).mpr ⟨bits, by rw [hb]; exact List.mem_cons_self, rfl⟩, rfl⟩
+  · intro mode policy
+    constructor
+    · intro h
+      rcases (hdisp mode policy .ub).mp h with ⟨_, _, hres⟩ | ⟨hf, _⟩
+      · cases hres
+      · cases hf
+    · intro h
+      rcases (hdisp mode policy .unsupported).mp h with ⟨_, _, hres⟩ | ⟨hf, _⟩
+      · cases hres
+      · cases hf
+
+/-- **Pointer-to-integer transmute: policy separation at every level** (`*const u8 → usize`
+on a pointer with provenance):
+- `evalRvalue` (always `.strictUcg630Ub`) and `evalByteCast .strictUcg630Ub` return `.ub`;
+- `evalByteCast .stripProvenance` returns the provenance-less address `0x1000`;
+- in BOTH modes, `EvalRvalueFloatRel _ .strictUcg630Ub` admits exactly `.ub` and
+  `EvalRvalueFloatRel _ .stripProvenance` admits exactly `.ok 0x1000`;
+- consequently the `evalRvalue` result does NOT satisfy `EvalRvalueFloatRel _ .stripProvenance`:
+  the byte-cast side conditions of `evalRvalue_realizes_EvalRvalueFloatRel_nondet_of_not_byteCast`
+  and `EvalRvalueFloatRel_policy_irrelevant` are necessary, and the policy parameter is
+  semantically meaningful (the §5 refinement is strict). -/
+theorem transmute_ptr_to_usize_policy_separation_witness :
+    let locals : List LocalSlot := [.init b2PtrA]
+    let decls : List LocalDecl := [⟨.not, b2PtrTy, .none⟩]
+    let rv : Rvalue := .cast .transmute (b2Copy 0) b2UsizeTy
+    evalRvalue locals rv emptyMemory decls emptyLayoutTable = .ub ∧
+    evalByteCast locals (b2Copy 0) b2UsizeTy emptyMemory decls emptyLayoutTable .strictUcg630Ub = .ub ∧
+    evalByteCast locals (b2Copy 0) b2UsizeTy emptyMemory decls emptyLayoutTable .stripProvenance =
+      .ok (.scalar ⟨0x1000, 8⟩) locals emptyMemory ∧
+    (∀ mode res,
+      EvalRvalueFloatRel mode .strictUcg630Ub locals rv emptyMemory decls emptyLayoutTable res ↔
+        res = .ub) ∧
+    (∀ mode res,
+      EvalRvalueFloatRel mode .stripProvenance locals rv emptyMemory decls emptyLayoutTable res ↔
+        res = .ok (.scalar ⟨0x1000, 8⟩) locals emptyMemory) ∧
+    (∀ mode,
+      ¬ EvalRvalueFloatRel mode .stripProvenance locals rv emptyMemory decls emptyLayoutTable
+        (evalRvalue locals rv emptyMemory decls emptyLayoutTable)) := by
+  dsimp only
+  refine ⟨rfl, rfl, rfl, fun _ _ => Iff.rfl, fun _ _ => Iff.rfl, ?_⟩
+  intro mode h
+  have h' : evalRvalue [.init b2PtrA] (.cast .transmute (b2Copy 0) b2UsizeTy) emptyMemory
+      [⟨.not, b2PtrTy, .none⟩] emptyLayoutTable =
+      evalByteCast [.init b2PtrA] (b2Copy 0) b2UsizeTy emptyMemory [⟨.not, b2PtrTy, .none⟩]
+        emptyLayoutTable .stripProvenance := h
+  have hub : evalRvalue [.init b2PtrA] (.cast .transmute (b2Copy 0) b2UsizeTy) emptyMemory
+      [⟨.not, b2PtrTy, .none⟩] emptyLayoutTable = .ub := rfl
+  have hok : evalByteCast [.init b2PtrA] (b2Copy 0) b2UsizeTy emptyMemory [⟨.not, b2PtrTy, .none⟩]
+      emptyLayoutTable .stripProvenance = .ok (.scalar ⟨0x1000, 8⟩) [.init b2PtrA] emptyMemory := rfl
+  rw [hub, hok] at h'
+  cases h'
+
+/-- **Composite `Ptr2IntTransmutePolicy` separation witnesses** (`evalByteCast`, concrete
+compiler-style layouts):
+1. array `[*const u8; 2] → [usize; 2]`: `.strictUcg630Ub` is `.ub`, `.stripProvenance` yields
+   both provenance-less addresses, and the identity cast `[*const u8; 2] → [*const u8; 2]`
+   preserves both pointers under `.strictUcg630Ub`;
+2. tuple `(*const u8, u64) → (u64, u64)`: `.ub` vs. `(0x1000, 42)`, while the identity tuple
+   cast preserves the pointer field under `.strictUcg630Ub`;
+3. struct `P { p, q : *const u8 } → S { a: u8, b: u64 }` (pointer bytes land in the `u8` field,
+   in padding, and in the `u64` field): `.ub` vs. `(0x11, 0x2000)`;
+4. float target `*const u8 → f64`: `.ub` vs. the provenance-less bit pattern `0x1000`;
+5. union target `*const u8 → union U { p: *const u8, n: u64 }`: policy-independent and never
+   `.ub` (the raw byte image keeps its provenance);
+6. union source `U → u64`: `.ub` vs. `0x1000`, while `U → *const u8` preserves the pointer
+   under `.strictUcg630Ub`. -/
+theorem evalByteCast_composite_policy_separation_witness :
+    let ptrB : Value := .ptr { allocId := 9, offsetBytes := 0x2000 } 8
+    let arrLocals : List LocalSlot := [.init (.aggregate 0 [b2PtrA, ptrB])]
+    let arrDecls : List LocalDecl := [⟨.not, b2PtrArrTy, .none⟩]
+    let tupLocals : List LocalSlot := [.init (.aggregate 0 [b2PtrA, .scalar ⟨42, 8⟩])]
+    let tupDecls : List LocalDecl := [⟨.not, b2PtrU64TupT, .none⟩]
+    let structLocals : List LocalSlot :=
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0x1011 } 8, ptrB])]
+    let structDecls : List LocalDecl := [⟨.not, b2PtrPairStructT, .none⟩]
+    let ptrLocals : List LocalSlot := [.init b2PtrA]
+    let ptrDecls : List LocalDecl := [⟨.not, b2PtrT, .none⟩]
+    let unionLocals : List LocalSlot := [.init (.aggregate 0 [b2PtrA, b2PtrA])]
+    let unionDecls : List LocalDecl := [⟨.not, b2UnionT, .none⟩]
+    -- (1) arrays
+    evalByteCast arrLocals (b2Copy 0) b2UsizeArrTy emptyMemory arrDecls emptyLayoutTable .strictUcg630Ub = .ub ∧
+    evalByteCast arrLocals (b2Copy 0) b2UsizeArrTy emptyMemory arrDecls emptyLayoutTable .stripProvenance =
+      .ok (.aggregate 0 [.scalar ⟨0x1000, 8⟩, .scalar ⟨0x2000, 8⟩]) arrLocals emptyMemory ∧
+    evalByteCast arrLocals (b2Copy 0) b2PtrArrTy emptyMemory arrDecls emptyLayoutTable .strictUcg630Ub =
+      .ok (.aggregate 0 [b2PtrA, ptrB]) arrLocals emptyMemory ∧
+    -- (2) tuples
+    evalByteCast tupLocals (b2Copy 0) b2U64PairTupT emptyMemory tupDecls b2Layouts .strictUcg630Ub = .ub ∧
+    evalByteCast tupLocals (b2Copy 0) b2U64PairTupT emptyMemory tupDecls b2Layouts .stripProvenance =
+      .ok (.aggregate 0 [.scalar ⟨0x1000, 8⟩, .scalar ⟨42, 8⟩]) tupLocals emptyMemory ∧
+    evalByteCast tupLocals (b2Copy 0) b2PtrU64TupT emptyMemory tupDecls b2Layouts .strictUcg630Ub =
+      .ok (.aggregate 0 [b2PtrA, .scalar ⟨42, 8⟩]) tupLocals emptyMemory ∧
+    -- (3) structs with padding
+    evalByteCast structLocals (b2Copy 0) b2PadStructT emptyMemory structDecls b2Layouts .strictUcg630Ub = .ub ∧
+    evalByteCast structLocals (b2Copy 0) b2PadStructT emptyMemory structDecls b2Layouts .stripProvenance =
+      .ok (.aggregate 0 [.scalar ⟨0x11, 1⟩, .scalar ⟨0x2000, 8⟩]) structLocals emptyMemory ∧
+    -- (4) float target
+    evalByteCast ptrLocals (b2Copy 0) b2F64T emptyMemory ptrDecls b2Layouts .strictUcg630Ub = .ub ∧
+    evalByteCast ptrLocals (b2Copy 0) b2F64T emptyMemory ptrDecls b2Layouts .stripProvenance =
+      .ok (.scalar ⟨0x1000, 8⟩) ptrLocals emptyMemory ∧
+    -- (5) union target
+    (∃ v,
+      evalByteCast ptrLocals (b2Copy 0) b2UnionT emptyMemory ptrDecls b2Layouts .strictUcg630Ub =
+        .ok v ptrLocals emptyMemory ∧
+      evalByteCast ptrLocals (b2Copy 0) b2UnionT emptyMemory ptrDecls b2Layouts .stripProvenance =
+        .ok v ptrLocals emptyMemory) ∧
+    -- (6) union source
+    evalByteCast unionLocals (b2Copy 0) b2U64T emptyMemory unionDecls b2Layouts .strictUcg630Ub = .ub ∧
+    evalByteCast unionLocals (b2Copy 0) b2U64T emptyMemory unionDecls b2Layouts .stripProvenance =
+      .ok (.scalar ⟨0x1000, 8⟩) unionLocals emptyMemory ∧
+    evalByteCast unionLocals (b2Copy 0) b2PtrT emptyMemory unionDecls b2Layouts .strictUcg630Ub =
+      .ok b2PtrA unionLocals emptyMemory := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl⟩, rfl, rfl, rfl⟩
+
+/-- **Provenance in padding vs. provenance in a field** (`decodeTypedValueFromBytes` at
+`struct S { a: u8, b: u64 }`, 7 padding bytes at offsets `1..8`):
+- pointer provenance (and even `.uninit` bytes) confined to PADDING is never read, so
+  `.strictUcg630Ub` and `.stripProvenance` both decode `(0x11, 42)` although
+  `abstractBytesHaveProv` holds for the whole image;
+- pointer provenance on the `u8` FIELD byte is rejected by `.strictUcg630Ub` and stripped by
+  `.stripProvenance`.
+In particular the converse of `decodeTypedValueFromBytes_policy_differs_imp_haveProv` fails. -/
+theorem decodeTypedValueFromBytes_padding_vs_field_provenance_witness :
+    let tail : List AbstractByte :=
+      [.init 42 .none, .init 0 .none, .init 0 .none, .init 0 .none,
+       .init 0 .none, .init 0 .none, .init 0 .none, .init 0 .none]
+    let paddingProv : List AbstractByte :=
+      .init 0x11 .none ::
+        .init 0 (.some (7, 7)) :: .init 0 (.some (7, 7)) :: .init 0 (.some (7, 7)) ::
+        .uninit :: .uninit :: .uninit :: .uninit :: tail
+    let fieldProv : List AbstractByte :=
+      .init 0x11 (.some (7, 7)) ::
+        .uninit :: .uninit :: .uninit :: .uninit :: .uninit :: .uninit :: .uninit :: tail
+    let decoded : Value := .aggregate 0 [.scalar ⟨0x11, 1⟩, .scalar ⟨42, 8⟩]
+    abstractBytesHaveProv paddingProv = true ∧
+    decodeTypedValueFromBytes defaultCodecFuel b2Layouts b2PadStructT paddingProv .strictUcg630Ub =
+      .some decoded ∧
+    decodeTypedValueFromBytes defaultCodecFuel b2Layouts b2PadStructT paddingProv .stripProvenance =
+      .some decoded ∧
+    decodeTypedValueFromBytes defaultCodecFuel b2Layouts b2PadStructT fieldProv .strictUcg630Ub =
+      .none ∧
+    decodeTypedValueFromBytes defaultCodecFuel b2Layouts b2PadStructT fieldProv .stripProvenance =
+      .some decoded := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **`{to,from}_bits` byte casts preserve float bit patterns verbatim** (documented bitwise
+operations): with a compiler-supplied `f32` layout, `transmute::<u32, f32>` and
+`transmute::<f32, u32>` on the signaling NaN `0x7FA00001` return the unchanged bit pattern
+(no quieting, no NaN choice), and `EvalRvalueFloatRel` admits EXACTLY that result in both
+modes and under both policies.
+
+**Fail-closed pin**: without a layout entry for the float type (`emptyLayoutTable`), float
+byte casts are `.unsupported` (never a wrong value), so Episode 2 simulations of
+`{to,from}_bits` must supply the float `TypeLayout`. -/
+theorem transmute_float_bits_witness :
+    let locals : List LocalSlot := [.init (.scalar ⟨0x7FA00001, 4⟩)]
+    let res : RvalueEvalResult := .ok (.scalar ⟨0x7FA00001, 4⟩) locals emptyMemory
+    evalRvalue locals (.cast .transmute (b2Copy 0) b2F32T) emptyMemory [⟨.not, b2U32Ty, .none⟩] b2Layouts = res ∧
+    evalRvalue locals (.cast .transmute (b2Copy 0) b2U32Ty) emptyMemory [⟨.not, b2F32T, .none⟩] b2Layouts = res ∧
+    (∀ mode policy r,
+      EvalRvalueFloatRel mode policy locals (.cast .transmute (b2Copy 0) b2F32T) emptyMemory
+          [⟨.not, b2U32Ty, .none⟩] b2Layouts r ↔ r = res) ∧
+    (∀ mode policy r,
+      EvalRvalueFloatRel mode policy locals (.cast .transmute (b2Copy 0) b2U32Ty) emptyMemory
+          [⟨.not, b2F32T, .none⟩] b2Layouts r ↔ r = res) ∧
+    evalRvalue locals (.cast .transmute (b2Copy 0) f32Ty) emptyMemory [⟨.not, b2U32Ty, .none⟩]
+      emptyLayoutTable = .unsupported ∧
+    evalRvalue locals (.cast .transmute (b2Copy 0) b2U32Ty) emptyMemory [⟨.not, f32Ty, .none⟩]
+      emptyLayoutTable = .unsupported := by
+  dsimp only
+  refine ⟨rfl, rfl, ?_, ?_, rfl, rfl⟩
+  · intro mode policy r
+    cases policy <;> exact Iff.rfl
+  · intro mode policy r
+    cases policy <;> exact Iff.rfl
+
 /-! ## §8. Axiom guards
 
 Every public theorem of this file is pinned to `[propext, Quot.sound]` (zero
@@ -10392,7 +11838,16 @@ def axiomAudit_scalars :=
   And.intro (@evalFloatArithBase_add_zero_sign) <|
   And.intro (@evalFloatArithBase_sub_zero_sign) <|
   And.intro (@evalFloatBinOp_sub_eq_add_neg) <|
-  @EvalFloatBinOpRel.sub_iff_add_neg
+  And.intro (@EvalFloatBinOpRel.sub_iff_add_neg) <|
+  And.intro (@evalFloatArithBase_add_finite_overflow_iff) <|
+  And.intro (@evalFloatArithBase_sub_finite_overflow_iff) <|
+  And.intro (@evalFloatArithBase_mul_finite_overflow_iff) <|
+  And.intro (@evalFloatArithBase_div_finite_overflow_iff) <|
+  And.intro (@evalFloatBinOp_overflow_tie_witness) <|
+  And.intro (@evalFloatBinOp_eq_none_iff) <|
+  And.intro (@EvalFloatBinOpRel_none_iff) <|
+  And.intro (@EvalFloatBinOpRel_exists_iff) <|
+  @EvalFloatBinOpRel_out_wf
 
 /--
 info: 'Anneal.Mir.IeeeFloatArith.axiomAudit_scalars'
@@ -10475,7 +11930,40 @@ def axiomAudit_places :=
   And.intro (@evalFloatScalarBinOp_sub_eq_add_neg) <|
   And.intro (@evalFloatScalarBinOp_sub_eq_add_neg_bits) <|
   And.intro (@evalRvalue_sub_eq_add_neg_float) <|
-  @EvalRvalueFloatRel_sub_iff_add_neg_float
+  And.intro (@EvalRvalueFloatRel_sub_iff_add_neg_float) <|
+  And.intro (@EvalRvalueFloatRel_policy_irrelevant) <|
+  And.intro (@EvalRvalueFloatRel_byteCast_iff) <|
+  And.intro (@EvalRvalueFloatRel_mode_irrelevant) <|
+  And.intro (@EvalRvalueFloatRel_unaryNeg_iff) <|
+  And.intro (@EvalRvalueFloatRel_mode_irrelevant_of_not_ok) <|
+  And.intro (@EvalRvalueFloatRel_ub_iff) <|
+  And.intro (@EvalRvalueFloatRel_unsupported_iff) <|
+  And.intro (@EvalRvalueFloatRel_not_ok_iff_evalRvalue) <|
+  And.intro (@EvalRvalueFloatRel_ub_iff_evalRvalue) <|
+  And.intro (@EvalRvalueFloatRel_unsupported_iff_evalRvalue) <|
+  And.intro (@evalRvalue_realizes_EvalRvalueFloatRel_nondet_of_not_byteCast) <|
+  And.intro (@EvalRvalueFloatRel_det_iff_evalRvalue_of_not_byteCast) <|
+  And.intro (@EvalRvalueFloatRel_total) <|
+  And.intro (@EvalRvalueFloatRel_det_iff_evalRvalueDet) <|
+  And.intro (@EvalRvalueFloatRel_det_functional) <|
+  And.intro (@evalRvalueDet_strict_eq_evalRvalue) <|
+  And.intro (@evalRvalueDet_eq_evalRvalue_of_not_byteCast) <|
+  And.intro (@EvalRvalueFloatRel_binaryOp_float_iff) <|
+  And.intro (@EvalRvalueFloatRel_floatToFloat_nan_iff) <|
+  And.intro (@decodeTypedValueFromBytes_strip_eq_strict_or_strict_none) <|
+  And.intro (@decodeTypedValueRichWithPolicy_strip_eq_strict_or_strict_none) <|
+  And.intro (@decodeTypedValueFromBytes_policy_differs_imp_haveProv) <|
+  And.intro (@decodeTypedValueRichWithPolicy_policy_differs_imp_haveProv) <|
+  And.intro (@evalByteCast_policy_differs_imp) <|
+  And.intro (@EvalRvalueFloatRel_byteCast_strict_refines_strip) <|
+  And.intro (@EvalRvalueFloatRel_byteCast_strip_split) <|
+  And.intro (@EvalRvalueFloatRel_byteCast_policy_irrelevant_of_provFree) <|
+  And.intro (@evalRvalue_float_operands_from_locals_witness) <|
+  And.intro (@EvalRvalueFloatRel_nan_operands_from_locals_witness) <|
+  And.intro (@transmute_ptr_to_usize_policy_separation_witness) <|
+  And.intro (@evalByteCast_composite_policy_separation_witness) <|
+  And.intro (@decodeTypedValueFromBytes_padding_vs_field_provenance_witness) <|
+  @transmute_float_bits_witness
 
 /--
 info: 'Anneal.Mir.IeeeFloatArith.axiomAudit_places'
