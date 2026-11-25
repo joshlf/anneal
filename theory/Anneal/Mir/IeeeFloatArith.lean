@@ -44,9 +44,28 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
   targets, policy independence on `.rawPtr`/`.ref`/`.fnPtr`/union targets,
   32-bit `usize`/`isize` & unresolved-slot-0 tuple/ref witnesses, and struct &
   enum `.ref`/`.fnPtr` no-forgery (`evalByteCastRichWithPolicy`);
-- **§6**: `V2026_06_01` <-> `V2026_08_01` dialect parity theorems for
-  `evalFloatNeg`, `evalFloatCmp`, `evalFloatArithBase`, `nanChoices`,
-  `evalFloatBinOp`, `decodeTypedValueFromBytes`, and `evalByteCast`.
+- **§6**: `V2026_06_01` <-> `V2026_08_01` dialect parity over explicit
+  constructor-preserving translation maps (`fmt08`, `binOp08`, `mode08`,
+  `floatKind08`, `scalarInt08`, `policy08`, `abstractByte08`): `evalFloatNeg`,
+  `evalFloatAbs`, `decodeBits`, `roundRatioTiesToEven`, `evalFloatPartialCompare`,
+  `evalFloatCmp`, `evalFloatArithBase`, `evalFloatToFloatRoundTiesToEven`,
+  `nanChoices` (element-for-element), `evalFloatBinOp`, `EvalFloatBinOpRel`
+  (`↔`), and the `Ptr2IntTransmutePolicy` byte gate (`policyRejectsProv`,
+  `stripAbstractBytesProv`). Parity of the layout-table-driven decoders
+  (`decodeTypedValueFromBytes`, `evalByteCast`) is NOT proved here: their
+  `Value` / `LayoutTable` / `Memory` types are dialect-specific
+  (`V2026_08_01.Value` has no `.uninit`) and require full structural
+  translations;
+- **§7**: IEEE 754-2008 special-case table over both formats and all signs (NaN
+  infectiousness, signed-zero sums, exact cancellation `x + (-x) = +0`, invalid
+  operations, `finite / ±0 = ±∞` with XOR sign, `x % ±0 = NaN`, `±∞ % y = NaN`,
+  `finite % ±∞ = finite`, `±0 % finite = ±0`), the documented signed-zero rule
+  for arbitrary zero-valued sums and differences, the no-NaN-input `nanChoices`
+  closed form (`[preferred, -preferred]`), and admissibility of `evalRvalue`'s
+  quieting `floatToFloat` NaN in `.nondeterministic` (but not `.deterministic`)
+  mode;
+- **§8**: `#guard_msgs in #print axioms` bundles pinning every public theorem to
+  `[propext, Quot.sound]`.
 -/
 
 namespace Anneal.Mir.IeeeFloatArith
@@ -58,6 +77,14 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open Anneal.Mir.IeeeFloatCast
 
 /-! ## §0. Constructive helpers -/
+
+/-- Opaque wrapper that hides a proposition from `omega`. `omega` case-splits on
+hypotheses containing `→` / `↔` through `Classical.em`, which silently adds
+`Classical.choice` to the proof term; wrapping such a hypothesis in `Hold` keeps
+the surrounding `omega` calls constructive (`[propext, Quot.sound]`). -/
+private structure Hold (P : Prop) : Prop where
+  /-- The wrapped proof. -/
+  val : P
 
 private theorem nat_mul_le_mul_right_iff {a b c : Nat} (hc : 0 < c) :
     a * c ≤ b * c ↔ a ≤ b := by
@@ -1724,6 +1751,10 @@ theorem roundRatioTiesToEven_neg (f : IeeeFormat) (neg : Bool) (n d : Nat) (hd :
     generalize hexp : max (ratioExponent n d) f.minExponent = exponent at hcons ⊢
     generalize hsc : powScale n d ((f.fractionBits : Int) - exponent) = scaled at hcons ⊢
     generalize hsig : roundQuotientTiesToEven scaled.1 scaled.2 = sig at hcons ⊢
+    -- Keep the implication half of `hcons` out of `omega`'s reach (see `Hold`).
+    have hsig_le : sig ≤ 2 ^ (f.fractionBits + 1) := hcons.1
+    have hsub_min : Hold (sig < 2 ^ f.fractionBits → exponent = f.minExponent) := ⟨hcons.2⟩
+    clear hcons
     have hmin_le : f.minExponent ≤ exponent := by
       rw [← hexp]; omega
     by_cases hov1 : exponent > f.maxExponent
@@ -1750,7 +1781,7 @@ theorem roundRatioTiesToEven_neg (f : IeeeFormat) (neg : Bool) (n d : Nat) (hd :
           exact (evalFloatNeg_encodeBits f neg _ 0 hE (Nat.two_pow_pos _)).symm
       · simp only [hcarry, decide_false, Bool.false_eq_true, ↓reduceIte, if_neg' hov1]
         by_cases hsub : sig < 2 ^ f.fractionBits
-        · have heqMin : exponent = f.minExponent := hcons.2 hsub
+        · have heqMin : exponent = f.minExponent := hsub_min.val hsub
           rw [if_pos' hsub, if_pos' hsub, if_pos' heqMin, if_pos' heqMin]
           exact (evalFloatNeg_encodeBits f neg 0 sig (Nat.two_pow_pos _) hsub).symm
         · rw [if_neg' hsub, if_neg' hsub]
@@ -7621,3 +7652,1025 @@ theorem evalByteCastRichWithPolicy_enum_no_forge_ref_and_fnPtr
         rw [hbeq]
         dsimp only
         rw [hfield_none bs payFields hbs hpay]
+
+/-! ## §6. `V2026_06_01` <-> `V2026_08_01` dialect parity
+
+The two dialects declare distinct (textually mirrored) inductive types and
+evaluators, so parity is not definitional: `Trusted.Rustc.V2026_08_01` constants
+are related to their `V2026_06_01` counterparts through the explicit
+constructor-preserving translation maps below (`fmt08`, `binOp08`, `mode08`,
+`floatKind08`, `scalarInt08`, `policy08`, `abstractByte08`). Every theorem in
+this section is an unconditional equation (or `↔`) over ALL inputs, stated
+directly over the `Trusted` ground definitions of both dialects.
+-/
+
+section DialectParity
+
+open Trusted.Rustc
+
+/-- Dialect translation of `IeeeFormat` (`V2026_06_01 → V2026_08_01`). -/
+def fmt08 : IeeeFormat → V2026_08_01.MirSemantics.IeeeFormat
+  | .binary32 => .binary32
+  | .binary64 => .binary64
+
+/-- Dialect translation of `FloatArithMode` (`V2026_06_01 → V2026_08_01`). -/
+def mode08 : FloatArithMode → V2026_08_01.MirSemantics.FloatArithMode
+  | .deterministic => .deterministic
+  | .nondeterministic => .nondeterministic
+
+/-- Dialect translation of `Ptr2IntTransmutePolicy` (`V2026_06_01 → V2026_08_01`). -/
+def policy08 : Ptr2IntTransmutePolicy → V2026_08_01.MirSemantics.Ptr2IntTransmutePolicy
+  | .strictUcg630Ub => .strictUcg630Ub
+  | .stripProvenance => .stripProvenance
+
+/-- Dialect translation of `FloatKind` (`V2026_06_01 → V2026_08_01`). -/
+def floatKind08 : FloatKind → V2026_08_01.MirSemantics.FloatKind
+  | .zero neg => .zero neg
+  | .finite neg n d => .finite neg n d
+  | .inf neg => .inf neg
+  | .nan neg q p => .nan neg q p
+
+/-- Dialect translation of `ScalarInt` (`V2026_06_01 → V2026_08_01`). -/
+def scalarInt08 (s : ScalarInt) : V2026_08_01.MirAst.ScalarInt :=
+  ⟨s.bits, s.sizeBytes⟩
+
+/-- Dialect translation of `AbstractByte` (`V2026_06_01 → V2026_08_01`). -/
+def abstractByte08 : AbstractByte → V2026_08_01.MirSemantics.AbstractByte
+  | .uninit => .uninit
+  | .init b prov => .init b prov
+
+/-- Dialect translation of a `nanChoices` input (`V2026_06_01 → V2026_08_01`). -/
+def nanInput08 (inp : IeeeFormat × Nat) : V2026_08_01.MirSemantics.IeeeFormat × Nat :=
+  (fmt08 inp.1, inp.2)
+
+/-- Dialect translation of `BinOp` (`V2026_06_01 → V2026_08_01`). -/
+def binOp08 : BinOp → V2026_08_01.MirAst.BinOp
+  | .add => .add
+  | .addUnchecked => .addUnchecked
+  | .addWithOverflow => .addWithOverflow
+  | .sub => .sub
+  | .subUnchecked => .subUnchecked
+  | .subWithOverflow => .subWithOverflow
+  | .mul => .mul
+  | .mulUnchecked => .mulUnchecked
+  | .mulWithOverflow => .mulWithOverflow
+  | .div => .div
+  | .rem => .rem
+  | .bitXor => .bitXor
+  | .bitAnd => .bitAnd
+  | .bitOr => .bitOr
+  | .shl => .shl
+  | .shlUnchecked => .shlUnchecked
+  | .shr => .shr
+  | .shrUnchecked => .shrUnchecked
+  | .eq => .eq
+  | .lt => .lt
+  | .le => .le
+  | .ne => .ne
+  | .ge => .ge
+  | .gt => .gt
+  | .cmp => .cmp
+  | .offset => .offset
+
+theorem scalarInt08_injective (s t : ScalarInt) (h : scalarInt08 s = scalarInt08 t) : s = t := by
+  cases s; cases t
+  unfold scalarInt08 at h
+  injection h with h1 h2
+  subst h1; subst h2; rfl
+
+/-- Format parameters agree across dialects. -/
+theorem fmt08_params (f : IeeeFormat) :
+    (fmt08 f).width = f.width ∧ (fmt08 f).exponentBits = f.exponentBits ∧
+    (fmt08 f).fractionBits = f.fractionBits ∧ (fmt08 f).bias = f.bias ∧
+    (fmt08 f).byteWidth = f.byteWidth ∧ (fmt08 f).minExponent = f.minExponent ∧
+    (fmt08 f).maxExponent = f.maxExponent := by
+  cases f <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Bit-pattern constructors agree across dialects. -/
+theorem bitPatterns_parity (f : IeeeFormat) (neg : Bool) (e fr : Nat) :
+    V2026_08_01.MirSemantics.zeroBits (fmt08 f) neg = zeroBits f neg ∧
+    V2026_08_01.MirSemantics.infBits (fmt08 f) neg = infBits f neg ∧
+    V2026_08_01.MirSemantics.preferredNaNBits (fmt08 f) = preferredNaNBits f ∧
+    V2026_08_01.MirSemantics.encodeBits (fmt08 f) neg e fr = encodeBits f neg e fr := by
+  cases f <;> exact ⟨rfl, rfl, rfl, rfl⟩
+
+/-- `evalFloatNeg` (bitwise `UnOp.neg`) agrees across dialects on ALL bit patterns. -/
+theorem evalFloatNeg_parity (f : IeeeFormat) (bits : Nat) :
+    V2026_08_01.MirSemantics.evalFloatNeg (fmt08 f) bits = evalFloatNeg f bits := by
+  cases f <;> rfl
+
+/-- `evalFloatAbs` agrees across dialects on ALL bit patterns. -/
+theorem evalFloatAbs_parity (f : IeeeFormat) (bits : Nat) :
+    V2026_08_01.MirSemantics.evalFloatAbs (fmt08 f) bits = evalFloatAbs f bits := by
+  cases f <;> rfl
+
+/-- `roundRatioTiesToEven` agrees across dialects on ALL rationals. -/
+theorem roundRatioTiesToEven_parity (f : IeeeFormat) (neg : Bool) (n d : Nat) :
+    V2026_08_01.MirSemantics.roundRatioTiesToEven (fmt08 f) neg n d =
+      roundRatioTiesToEven f neg n d := by
+  cases f <;> rfl
+
+/-- `decodeBits` agrees across dialects (modulo `floatKind08`) on ALL bit patterns. -/
+theorem decodeBits_parity (f : IeeeFormat) (bits : Nat) :
+    V2026_08_01.MirSemantics.decodeBits (fmt08 f) bits = floatKind08 (decodeBits f bits) := by
+  cases f <;> simp only [decodeBits, apply_ite floatKind08] <;> rfl
+
+/-- NaN classification predicates agree across dialects on ALL bit patterns. -/
+theorem isNaNBits_parity (f : IeeeFormat) (bits : Nat) :
+    V2026_08_01.MirSemantics.isNaNBits (fmt08 f) bits = isNaNBits f bits ∧
+    V2026_08_01.MirSemantics.isQuietNaNBits (fmt08 f) bits = isQuietNaNBits f bits ∧
+    V2026_08_01.MirSemantics.isSignalingNaNBits (fmt08 f) bits = isSignalingNaNBits f bits := by
+  unfold V2026_08_01.MirSemantics.isNaNBits V2026_08_01.MirSemantics.isQuietNaNBits
+    V2026_08_01.MirSemantics.isSignalingNaNBits isNaNBits isQuietNaNBits isSignalingNaNBits
+  rw [decodeBits_parity]
+  cases decodeBits f bits <;> exact ⟨rfl, rfl, rfl⟩
+
+/-- `evalFloatPartialCompare` (IEEE-754 partial order) agrees across dialects on
+ALL operand bit patterns. -/
+theorem evalFloatPartialCompare_parity (f : IeeeFormat) (a b : Nat) :
+    V2026_08_01.MirSemantics.evalFloatPartialCompare (fmt08 f) a b =
+      evalFloatPartialCompare f a b := by
+  unfold V2026_08_01.MirSemantics.evalFloatPartialCompare evalFloatPartialCompare
+  rw [(fmt08_params f).1, decodeBits_parity, decodeBits_parity]
+  cases decodeBits f (a % 2 ^ f.width) <;> cases decodeBits f (b % 2 ^ f.width) <;> rfl
+
+/-- `evalFloatCmp` (`==`, `!=`, `<`, `<=`, `>`, `>=`) agrees across dialects for
+EVERY `BinOp` and ALL operand bit patterns. -/
+theorem evalFloatCmp_parity (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    V2026_08_01.MirSemantics.evalFloatCmp (binOp08 op) (fmt08 f) a b = evalFloatCmp op f a b := by
+  unfold V2026_08_01.MirSemantics.evalFloatCmp evalFloatCmp
+  rw [evalFloatPartialCompare_parity]
+  cases op <;> rfl
+
+/-- `exactSumFloat` agrees across dialects on ALL decoded operand pairs. -/
+theorem exactSumFloat_parity (f : IeeeFormat) (l r : FloatKind) :
+    V2026_08_01.MirSemantics.exactSumFloat (fmt08 f) (floatKind08 l) (floatKind08 r) =
+      exactSumFloat f l r := by
+  cases f <;> cases l <;> cases r <;> rfl
+
+/-- `negateFloatKind` commutes with the dialect translation. -/
+theorem negateFloatKind_parity (k : FloatKind) :
+    V2026_08_01.MirSemantics.negateFloatKind (floatKind08 k) = floatKind08 (negateFloatKind k) := by
+  cases k <;> rfl
+
+/-- `evalFloatArithBase` (`add`, `sub`, `mul`, `div`, `rem` under `roundTiesToEven`
+with the deterministic preferred NaN) agrees across dialects for EVERY `BinOp`
+and ALL operand bit patterns. -/
+theorem evalFloatArithBase_parity (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    V2026_08_01.MirSemantics.evalFloatArithBase (binOp08 op) (fmt08 f) a b =
+      evalFloatArithBase op f a b := by
+  unfold V2026_08_01.MirSemantics.evalFloatArithBase evalFloatArithBase
+  dsimp only
+  rw [(fmt08_params f).1, decodeBits_parity, decodeBits_parity]
+  generalize decodeBits f (a % 2 ^ f.width) = l
+  generalize decodeBits f (b % 2 ^ f.width) = r
+  cases op
+  case add => exact congrArg some (exactSumFloat_parity f l r)
+  case sub =>
+    show some (V2026_08_01.MirSemantics.exactSumFloat (fmt08 f) (floatKind08 l)
+      (V2026_08_01.MirSemantics.negateFloatKind (floatKind08 r))) = _
+    rw [negateFloatKind_parity, exactSumFloat_parity]
+  case mul => cases f <;> cases l <;> cases r <;> rfl
+  case div => cases f <;> cases l <;> cases r <;> rfl
+  case rem => cases f <;> cases l <;> cases r <;> rfl
+  all_goals rfl
+
+/-- `evalFloatToFloatRoundTiesToEven` (`CastKind.floatToFloat`) agrees across
+dialects for every source/target format pair and ALL bit patterns. -/
+theorem evalFloatToFloatRoundTiesToEven_parity (src dst : IeeeFormat) (bits : Nat) :
+    V2026_08_01.MirSemantics.evalFloatToFloatRoundTiesToEven (fmt08 src) (fmt08 dst) bits =
+      evalFloatToFloatRoundTiesToEven src dst bits := by
+  unfold V2026_08_01.MirSemantics.evalFloatToFloatRoundTiesToEven evalFloatToFloatRoundTiesToEven
+  rw [decodeBits_parity]
+  cases decodeBits src bits <;> cases src <;> cases dst <;> rfl
+
+/-- `unpackBits` field projections agree across dialects on ALL bit patterns. -/
+theorem unpackBits_parity (f : IeeeFormat) (bits : Nat) :
+    (V2026_08_01.MirSemantics.unpackBits (fmt08 f) bits).neg = (unpackBits f bits).neg ∧
+    (V2026_08_01.MirSemantics.unpackBits (fmt08 f) bits).exponent = (unpackBits f bits).exponent ∧
+    (V2026_08_01.MirSemantics.unpackBits (fmt08 f) bits).fraction = (unpackBits f bits).fraction := by
+  cases f <;> exact ⟨rfl, rfl, rfl⟩
+
+/-- Quieted NaN candidate lists agree across dialects (element-for-element, in order). -/
+theorem nanChoicesQuieted_parity (t : IeeeFormat) (inputs : List (IeeeFormat × Nat)) :
+    V2026_08_01.MirSemantics.nanChoicesQuieted (fmt08 t) (inputs.map nanInput08) =
+      nanChoicesQuieted t inputs := by
+  induction inputs with
+  | nil => rfl
+  | cons inp rest ih =>
+    show V2026_08_01.MirSemantics.nanChoicesQuieted (fmt08 t)
+      (nanInput08 inp :: rest.map nanInput08) = nanChoicesQuieted t (inp :: rest)
+    unfold V2026_08_01.MirSemantics.nanChoicesQuieted nanChoicesQuieted
+    dsimp only [nanInput08]
+    rw [ih, (fmt08_params inp.1).1, (isNaNBits_parity inp.1 _).1,
+      evalFloatToFloatRoundTiesToEven_parity]
+
+/-- Unchanged-signaling NaN candidate lists agree across dialects (element-for-element,
+in order). -/
+theorem nanChoicesSignaling_parity (t : IeeeFormat) (inputs : List (IeeeFormat × Nat)) :
+    V2026_08_01.MirSemantics.nanChoicesSignaling (fmt08 t) (inputs.map nanInput08) =
+      nanChoicesSignaling t inputs := by
+  induction inputs with
+  | nil => rfl
+  | cons inp rest ih =>
+    show V2026_08_01.MirSemantics.nanChoicesSignaling (fmt08 t)
+      (nanInput08 inp :: rest.map nanInput08) = nanChoicesSignaling t (inp :: rest)
+    unfold V2026_08_01.MirSemantics.nanChoicesSignaling nanChoicesSignaling
+    dsimp only [nanInput08]
+    rw [ih, (fmt08_params inp.1).1, (isNaNBits_parity inp.1 _).2.2,
+      evalFloatToFloatRoundTiesToEven_parity, (unpackBits_parity t _).1,
+      (unpackBits_parity t _).2.2, (fmt08_params t).2.2.1, (fmt08_params t).2.1,
+      (bitPatterns_parity t _ _ _).2.2.2]
+
+/-- Sign expansion of NaN candidates agrees across dialects. -/
+theorem expandNanSigns_parity (t : IeeeFormat) (cs : List Nat) :
+    V2026_08_01.MirSemantics.expandNanSigns (fmt08 t) cs = expandNanSigns t cs := by
+  induction cs with
+  | nil => rfl
+  | cons c rest ih =>
+    unfold V2026_08_01.MirSemantics.expandNanSigns expandNanSigns
+    rw [ih, evalFloatNeg_parity]
+
+/-- **`nanChoices` parity**: the ordered admissible-NaN candidate list agrees
+across dialects element-for-element for EVERY target format, input list, and
+`FloatArithMode`. -/
+theorem nanChoices_parity (t : IeeeFormat) (inputs : List (IeeeFormat × Nat))
+    (mode : FloatArithMode) :
+    V2026_08_01.MirSemantics.nanChoices (fmt08 t) (inputs.map nanInput08) (mode08 mode) =
+      nanChoices t inputs mode := by
+  cases mode with
+  | deterministic =>
+    show [V2026_08_01.MirSemantics.preferredNaNBits (fmt08 t)] = [preferredNaNBits t]
+    rw [(bitPatterns_parity t false 0 0).2.2.1]
+  | nondeterministic =>
+    show V2026_08_01.MirSemantics.expandNanSigns (fmt08 t)
+        (V2026_08_01.MirSemantics.preferredNaNBits (fmt08 t) ::
+          (V2026_08_01.MirSemantics.nanChoicesQuieted (fmt08 t) (inputs.map nanInput08) ++
+            V2026_08_01.MirSemantics.nanChoicesSignaling (fmt08 t) (inputs.map nanInput08))) =
+      expandNanSigns t
+        (preferredNaNBits t :: (nanChoicesQuieted t inputs ++ nanChoicesSignaling t inputs))
+    rw [expandNanSigns_parity, (bitPatterns_parity t false 0 0).2.2.1, nanChoicesQuieted_parity,
+      nanChoicesSignaling_parity]
+
+/-- `natListMem` agrees across dialects. -/
+theorem natListMem_parity (x : Nat) (xs : List Nat) :
+    V2026_08_01.MirSemantics.natListMem x xs = natListMem x xs := by
+  induction xs with
+  | nil => rfl
+  | cons y ys ih =>
+    unfold V2026_08_01.MirSemantics.natListMem natListMem
+    rw [ih]
+
+/-- `isAdmissibleQuietNaN` agrees across dialects. -/
+theorem isAdmissibleQuietNaN_parity (f : IeeeFormat) (inputs : List (IeeeFormat × Nat))
+    (bits : Nat) :
+    V2026_08_01.MirSemantics.isAdmissibleQuietNaN (fmt08 f) (inputs.map nanInput08) bits =
+      isAdmissibleQuietNaN f inputs bits := by
+  unfold V2026_08_01.MirSemantics.isAdmissibleQuietNaN isAdmissibleQuietNaN
+  dsimp only
+  rw [(fmt08_params f).1, (isNaNBits_parity f _).2.1, natListMem_parity]
+  exact congrArg (fun l => Bool.and (isQuietNaNBits f (bits % 2 ^ f.width))
+    (natListMem (bits % 2 ^ f.width) l)) (nanChoices_parity f inputs .nondeterministic)
+
+/-- `scalarInt08` reflects equality with an anonymous-constructor scalar. -/
+theorem scalarInt08_eq_mk_iff (s : ScalarInt) (bits sz : Nat) :
+    scalarInt08 s = ⟨bits, sz⟩ ↔ s = ⟨bits, sz⟩ := by
+  cases s with
+  | mk sb ss =>
+    constructor
+    · intro h
+      unfold scalarInt08 at h
+      injection h with h1 h2
+      subst h1; subst h2; rfl
+    · intro h
+      injection h with h1 h2
+      subst h1; subst h2; rfl
+
+/-- **`evalFloatBinOp` parity**: the deterministic executable float binary-operation
+evaluator agrees across dialects (modulo `scalarInt08`) for EVERY `BinOp`, format,
+and operand bit patterns. -/
+theorem evalFloatBinOp_parity (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    V2026_08_01.MirSemantics.evalFloatBinOp (binOp08 op) (fmt08 f) a b =
+      Option.map scalarInt08 (evalFloatBinOp op f a b) := by
+  unfold V2026_08_01.MirSemantics.evalFloatBinOp evalFloatBinOp
+  rw [evalFloatCmp_parity, evalFloatArithBase_parity, (fmt08_params f).2.2.2.2.1]
+  cases evalFloatCmp op f a b with
+  | some c => cases c <;> rfl
+  | none => cases evalFloatArithBase op f a b <;> rfl
+
+/-- **`EvalFloatBinOpRel` parity**: the mode-parametric relational specification
+(including the full `.nondeterministic` NaN admissibility set) agrees across dialects
+for EVERY mode, `BinOp`, format, operand bit patterns, and output scalar. -/
+theorem EvalFloatBinOpRel_parity (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) :
+    V2026_08_01.MirSemantics.EvalFloatBinOpRel (mode08 mode) (binOp08 op) (fmt08 f) a b
+        (scalarInt08 out) ↔
+      EvalFloatBinOpRel mode op f a b out := by
+  unfold V2026_08_01.MirSemantics.EvalFloatBinOpRel EvalFloatBinOpRel
+  rw [evalFloatCmp_parity, evalFloatArithBase_parity]
+  cases evalFloatCmp op f a b with
+  | some c =>
+    cases c
+    · exact scalarInt08_eq_mk_iff out 0 1
+    · exact scalarInt08_eq_mk_iff out 1 1
+  | none =>
+    cases evalFloatArithBase op f a b with
+    | none => exact Iff.rfl
+    | some baseBits =>
+      dsimp only
+      rw [(isNaNBits_parity f baseBits).1, (fmt08_params f).1, (fmt08_params f).2.2.2.2.1]
+      have hch :
+          V2026_08_01.MirSemantics.nanChoices (fmt08 f)
+              [(fmt08 f, a % 2 ^ f.width), (fmt08 f, b % 2 ^ f.width)] (mode08 mode) =
+            nanChoices f [(f, a % 2 ^ f.width), (f, b % 2 ^ f.width)] mode :=
+        nanChoices_parity f [(f, a % 2 ^ f.width), (f, b % 2 ^ f.width)] mode
+      rw [hch]
+      by_cases hnan : isNaNBits f baseBits = true
+      · rw [if_pos' hnan, if_pos' hnan]
+        constructor
+        · rintro ⟨cand, hmem, hout⟩
+          exact ⟨cand, hmem, (scalarInt08_eq_mk_iff out cand f.byteWidth).mp hout⟩
+        · rintro ⟨cand, hmem, hout⟩
+          exact ⟨cand, hmem, (scalarInt08_eq_mk_iff out cand f.byteWidth).mpr hout⟩
+      · rw [if_neg' hnan, if_neg' hnan]
+        exact scalarInt08_eq_mk_iff out baseBits f.byteWidth
+
+/-- `abstractBytesHaveProv` agrees across dialects on ALL byte sequences. -/
+theorem abstractBytesHaveProv_parity (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.abstractBytesHaveProv (bs.map abstractByte08) =
+      abstractBytesHaveProv bs := by
+  induction bs with
+  | nil => rfl
+  | cons b rest ih =>
+    cases b with
+    | uninit => exact ih
+    | init byte prov =>
+      cases prov with
+      | none => exact ih
+      | some _ => rfl
+
+/-- **`policyRejectsProv` parity**: the `Ptr2IntTransmutePolicy` provenance gate
+agrees across dialects for BOTH policies on ALL byte sequences. -/
+theorem policyRejectsProv_parity (policy : Ptr2IntTransmutePolicy) (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.policyRejectsProv (policy08 policy) (bs.map abstractByte08) =
+      policyRejectsProv policy bs := by
+  cases policy with
+  | strictUcg630Ub => exact abstractBytesHaveProv_parity bs
+  | stripProvenance => rfl
+
+/-- `stripAbstractBytesProv` commutes with the dialect translation. -/
+theorem stripAbstractBytesProv_parity (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.stripAbstractBytesProv (bs.map abstractByte08) =
+      (stripAbstractBytesProv bs).map abstractByte08 := by
+  induction bs with
+  | nil => rfl
+  | cons b rest ih =>
+    show V2026_08_01.MirSemantics.stripAbstractByteProv (abstractByte08 b) ::
+        V2026_08_01.MirSemantics.stripAbstractBytesProv (rest.map abstractByte08) =
+      abstractByte08 (stripAbstractByteProv b) :: (stripAbstractBytesProv rest).map abstractByte08
+    rw [ih]
+    cases b <;> rfl
+
+end DialectParity
+
+/-! ## §7. IEEE 754-2008 special-case table, documented signed-zero rule, & no-NaN-input `nanChoices`
+
+Universally quantified (over both formats and all sign combinations) closed
+forms for the special cases of `evalFloatArithBase`: NaN infectiousness, signed
+zero sums (`(-0) + (-0) = -0`, `(+0) + (-0) = +0`, `(-0) - (+0) = -0`,
+`(-0) - (-0) = +0`), exact cancellation (`x + (-x) = +0`, `x - x = +0`), invalid
+operations (`0 * ∞`, `∞ - ∞`, `0 / 0`, `∞ / ∞`, `x % 0`, `∞ % y`), division of a
+finite nonzero value by a signed zero (`±∞` with XOR sign, never `.ub`),
+`finite % ±∞ = finite`, and `±0 % finite = ±0` with the dividend's sign.
+-/
+
+/-- **NaN operands are infectious** for every arithmetic `BinOp`: the
+deterministic base evaluator returns exactly `preferredNaNBits f`. -/
+theorem evalFloatArithBase_of_nan (f : IeeeFormat) (a b : Nat)
+    (h : isNaNBits f a = true ∨ isNaNBits f b = true) :
+    evalFloatArithBase .add f a b = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .sub f a b = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .mul f a b = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .div f a b = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .rem f a b = .some (preferredNaNBits f) := by
+  unfold evalFloatArithBase
+  dsimp only
+  rw [decodeBits_mod, decodeBits_mod]
+  rcases h with h | h
+  · obtain ⟨neg, q, p, hd⟩ := (isNaNBits_eq_true_iff f a).mp h
+    rw [hd]
+    cases decodeBits f b <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+  · obtain ⟨neg, q, p, hd⟩ := (isNaNBits_eq_true_iff f b).mp h
+    rw [hd]
+    cases decodeBits f a <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Signed-zero sums** (IEEE 754-2008 §6.3 under `roundTiesToEven`):
+`(±0) + (±0)` is `-0` iff both operands are `-0`, and `(±0) - (±0)` is `-0` iff
+the minuend is `-0` and the subtrahend is `+0`. In particular
+`(-0) + (-0) = -0`, `(+0) + (-0) = +0`, `(-0) - (+0) = -0`, `(-0) - (-0) = +0`. -/
+theorem evalFloatArithBase_signed_zero_sums (f : IeeeFormat) (s t : Bool) :
+    evalFloatArithBase .add f (zeroBits f s) (zeroBits f t) =
+      .some (zeroBits f (Bool.and s t)) ∧
+    evalFloatArithBase .sub f (zeroBits f s) (zeroBits f t) =
+      .some (zeroBits f (Bool.and s (Bool.not t))) := by
+  cases f <;> cases s <;> cases t <;> exact ⟨rfl, rfl⟩
+
+/-- **Exact cancellation yields `+0`** (IEEE 754-2008 §6.3 under `roundTiesToEven`):
+for EVERY finite nonzero `x` (either sign, normal or subnormal),
+`x + (-x) = +0.0` and `x - x = +0.0`. -/
+theorem evalFloatArithBase_cancel_finite (f : IeeeFormat) (a : Nat) (neg : Bool) (n d : Nat)
+    (ha : decodeBits f a = .finite neg n d) :
+    evalFloatArithBase .add f a (evalFloatNeg f a) = .some (zeroBits f false) ∧
+    evalFloatArithBase .sub f a a = .some (zeroBits f false) := by
+  have hn : 0 < n := decodeBits_finite_num_pos f a neg n d ha
+  have hd : 0 < d := decodeBits_finite_den_pos f a neg n d ha
+  have hsum : exactSumFloat f (.finite neg n d) (.finite (Bool.not neg) n d) = zeroBits f false := by
+    have h0 : signedNum neg n * (d : Int) + signedNum (Bool.not neg) n * (d : Int) = 0 := by
+      rw [signedNum_not, Int.neg_mul, Int.add_right_neg]
+    have hbeq : Nat.beq n 0 = false := by
+      cases n with
+      | zero => exact absurd hn (Nat.lt_irrefl 0)
+      | succ k => rfl
+    unfold exactSumFloat
+    dsimp only
+    rw [h0, if_pos' rfl, hbeq]
+    exact roundRatioTiesToEven_zero f _ (d * d) (Nat.mul_pos hd hd)
+  refine ⟨?_, ?_⟩
+  · unfold evalFloatArithBase
+    dsimp only
+    rw [decodeBits_mod, decodeBits_mod, decodeBits_evalFloatNeg, ha]
+    exact congrArg some hsum
+  · unfold evalFloatArithBase
+    dsimp only
+    rw [decodeBits_mod, ha]
+    exact congrArg some hsum
+
+/-- **Invalid operations produce NaN** (IEEE 754-2008 §7.2): `0 * ∞`, `∞ * 0`,
+`∞ + (-∞)`, `∞ - ∞`, `0 / 0`, and `∞ / ∞` return `preferredNaNBits f` for EVERY
+sign combination. -/
+theorem evalFloatArithBase_invalid_operations (f : IeeeFormat) (s t : Bool) :
+    evalFloatArithBase .mul f (zeroBits f s) (infBits f t) = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .mul f (infBits f s) (zeroBits f t) = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .add f (infBits f s) (infBits f (Bool.not s)) = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .sub f (infBits f s) (infBits f s) = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .div f (zeroBits f s) (zeroBits f t) = .some (preferredNaNBits f) ∧
+    evalFloatArithBase .div f (infBits f s) (infBits f t) = .some (preferredNaNBits f) := by
+  cases f <;> cases s <;> cases t <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Infinity arithmetic**: same-signed infinities add to that infinity,
+opposite-signed infinities subtract to the minuend, and `∞ * ∞`, `∞ / 0` carry
+the XOR sign. -/
+theorem evalFloatArithBase_inf_valid_operations (f : IeeeFormat) (s t : Bool) :
+    evalFloatArithBase .add f (infBits f s) (infBits f s) = .some (infBits f s) ∧
+    evalFloatArithBase .sub f (infBits f s) (infBits f (Bool.not s)) = .some (infBits f s) ∧
+    evalFloatArithBase .mul f (infBits f s) (infBits f t) = .some (infBits f (Bool.xor s t)) ∧
+    evalFloatArithBase .div f (infBits f s) (zeroBits f t) = .some (infBits f (Bool.xor s t)) ∧
+    evalFloatArithBase .div f (zeroBits f s) (infBits f t) = .some (zeroBits f (Bool.xor s t)) := by
+  cases f <;> cases s <;> cases t <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Finite nonzero `/ ±0.0 = ±∞` with XOR sign** (IEEE 754-2008 §7.3
+`divideByZero`; never `.none` / `.ub`, unlike integer division by zero): e.g.
+`(-1.0) / (-0.0) = +∞` and `1.0 / (-0.0) = -∞`. -/
+theorem evalFloatArithBase_div_finite_by_zero (f : IeeeFormat) (a : Nat) (neg : Bool) (n d : Nat)
+    (s : Bool) (ha : decodeBits f a = .finite neg n d) :
+    evalFloatArithBase .div f a (zeroBits f s) = .some (infBits f (Bool.xor neg s)) := by
+  have hn : 0 < n := decodeBits_finite_num_pos f a neg n d ha
+  unfold evalFloatArithBase
+  dsimp only
+  rw [decodeBits_mod, decodeBits_mod, ha, decodeBits_zeroBits]
+  show some (if n = 0 then preferredNaNBits f else infBits f (Bool.xor neg s)) = _
+  rw [if_neg' (Nat.ne_of_gt hn)]
+
+/-- **`x % ±0.0 = NaN`** for EVERY dividend `x` (never `.none` / `.ub`, unlike
+integer remainder by zero). -/
+theorem evalFloatArithBase_rem_by_zero (f : IeeeFormat) (a : Nat) (s : Bool) :
+    evalFloatArithBase .rem f a (zeroBits f s) = .some (preferredNaNBits f) := by
+  unfold evalFloatArithBase
+  dsimp only
+  rw [decodeBits_mod, decodeBits_mod, decodeBits_zeroBits]
+  cases decodeBits f a <;> rfl
+
+/-- **`±∞ % y = NaN`** for EVERY divisor `y`. -/
+theorem evalFloatArithBase_rem_inf_dividend (f : IeeeFormat) (s : Bool) (b : Nat) :
+    evalFloatArithBase .rem f (infBits f s) b = .some (preferredNaNBits f) := by
+  unfold evalFloatArithBase
+  dsimp only
+  rw [decodeBits_mod, decodeBits_mod, decodeBits_infBits]
+  cases decodeBits f b <;> rfl
+
+/-- **`finite % ±∞ = finite`**: for every zero or finite nonzero dividend `x`
+(either sign, including subnormals), `x % ±∞` returns the canonical bit pattern
+of `x` unchanged. -/
+theorem evalFloatArithBase_rem_by_inf (f : IeeeFormat) (a : Nat) (s : Bool)
+    (hnan : isNaNBits f a = false) (hinf : ∀ t, decodeBits f a ≠ .inf t) :
+    evalFloatArithBase .rem f a (infBits f s) = .some (a % 2 ^ f.width) := by
+  unfold evalFloatArithBase
+  dsimp only
+  rw [decodeBits_mod, decodeBits_mod, decodeBits_infBits]
+  unfold isNaNBits at hnan
+  cases hk : decodeBits f a with
+  | zero neg => rfl
+  | finite neg n d => rfl
+  | inf neg => exact absurd hk (hinf neg)
+  | nan neg q p => rw [hk] at hnan; cases hnan
+
+/-- **`±0.0 % y = ±0.0`** for every finite nonzero divisor `y`: the result keeps
+the DIVIDEND's sign, independent of the divisor's sign. -/
+theorem evalFloatArithBase_rem_zero_dividend (f : IeeeFormat) (s : Bool) (b : Nat)
+    (rn : Bool) (rnum rden : Nat) (hb : decodeBits f b = .finite rn rnum rden) :
+    evalFloatArithBase .rem f (zeroBits f s) b = .some (zeroBits f s) := by
+  have hn : 0 < rnum := decodeBits_finite_num_pos f b rn rnum rden hb
+  unfold evalFloatArithBase
+  dsimp only
+  rw [decodeBits_mod, decodeBits_mod, hb, decodeBits_zeroBits]
+  show some (if rnum = 0 then preferredNaNBits f else zeroBits f s) = _
+  rw [if_neg' (Nat.ne_of_gt hn)]
+
+/-- A non-NaN bit pattern is not a signaling NaN. -/
+theorem isSignalingNaNBits_eq_false_of_not_nan (f : IeeeFormat) (bits : Nat)
+    (h : isNaNBits f bits = false) : isSignalingNaNBits f bits = false := by
+  unfold isNaNBits at h
+  unfold isSignalingNaNBits
+  cases hk : decodeBits f bits with
+  | zero neg => rfl
+  | finite neg n d => rfl
+  | inf neg => rfl
+  | nan neg q p => rw [hk] at h; cases h
+
+/-- With no NaN inputs, no quieted-propagation candidate exists. -/
+theorem nanChoicesQuieted_of_no_nan (t : IeeeFormat) (inputs : List (IeeeFormat × Nat))
+    (h : ∀ inp, inp ∈ inputs → isNaNBits inp.1 inp.2 = false) :
+    nanChoicesQuieted t inputs = [] := by
+  induction inputs with
+  | nil => rfl
+  | cons inp rest ih =>
+    have hmod : isNaNBits inp.1 (inp.2 % 2 ^ inp.1.width) = false := by
+      unfold isNaNBits
+      rw [decodeBits_mod]
+      exact h inp List.mem_cons_self
+    unfold nanChoicesQuieted
+    dsimp only
+    rw [hmod, if_neg' Bool.false_ne_true]
+    exact ih (fun i hi => h i (List.mem_cons_of_mem _ hi))
+
+/-- With no NaN inputs, no unchanged-signaling-propagation candidate exists. -/
+theorem nanChoicesSignaling_of_no_nan (t : IeeeFormat) (inputs : List (IeeeFormat × Nat))
+    (h : ∀ inp, inp ∈ inputs → isNaNBits inp.1 inp.2 = false) :
+    nanChoicesSignaling t inputs = [] := by
+  induction inputs with
+  | nil => rfl
+  | cons inp rest ih =>
+    have hmod : isNaNBits inp.1 (inp.2 % 2 ^ inp.1.width) = false := by
+      unfold isNaNBits
+      rw [decodeBits_mod]
+      exact h inp List.mem_cons_self
+    unfold nanChoicesSignaling
+    dsimp only
+    rw [isSignalingNaNBits_eq_false_of_not_nan inp.1 _ hmod, if_neg' Bool.false_ne_true]
+    exact ih (fun i hi => h i (List.mem_cons_of_mem _ hi))
+
+/-- **No NaN inputs ⇒ only the preferred NaN (either sign)**: when no input is
+NaN (the invalid-operation cases `0 * ∞`, `∞ - ∞`, `0 / 0`, `∞ / ∞`, `x % 0`,
+`∞ % y`), the `.nondeterministic` candidate list is exactly
+`[preferredNaNBits, -preferredNaNBits]`, formalizing the `core` guarantee that
+"if all input NaNs are preferred (or if there are no input NaNs) and the target
+does not have any “extra” NaN payloads, then the output NaN is guaranteed to be
+preferred." -/
+theorem nanChoices_nondet_of_no_nan (t : IeeeFormat) (inputs : List (IeeeFormat × Nat))
+    (h : ∀ inp, inp ∈ inputs → isNaNBits inp.1 inp.2 = false) :
+    nanChoices t inputs .nondeterministic =
+      [preferredNaNBits t, evalFloatNeg t (preferredNaNBits t)] := by
+  show expandNanSigns t
+      (preferredNaNBits t :: (nanChoicesQuieted t inputs ++ nanChoicesSignaling t inputs)) = _
+  rw [nanChoicesQuieted_of_no_nan t inputs h, nanChoicesSignaling_of_no_nan t inputs h]
+  rfl
+
+/-- **Relational invalid-operation law**: whenever neither operand is NaN but
+the base result is NaN (an IEEE 754-2008 §7.2 invalid operation), the
+`.nondeterministic` relation admits EXACTLY the preferred NaN with either sign. -/
+theorem EvalFloatBinOpRel.nondet_invalid_operation_iff (op : BinOp) (f : IeeeFormat)
+    (a b baseBits : Nat) (out : ScalarInt)
+    (hcmp : evalFloatCmp op f a b = .none)
+    (hbase : evalFloatArithBase op f a b = .some baseBits)
+    (hnan : isNaNBits f baseBits = true)
+    (ha : isNaNBits f a = false) (hb : isNaNBits f b = false) :
+    EvalFloatBinOpRel .nondeterministic op f a b out ↔
+      (out = ⟨preferredNaNBits f, f.byteWidth⟩ ∨
+       out = ⟨evalFloatNeg f (preferredNaNBits f), f.byteWidth⟩) := by
+  have hmodA : isNaNBits f (a % 2 ^ f.width) = false := by
+    unfold isNaNBits; rw [decodeBits_mod]; exact ha
+  have hmodB : isNaNBits f (b % 2 ^ f.width) = false := by
+    unfold isNaNBits; rw [decodeBits_mod]; exact hb
+  have hch : nanChoices f [(f, a % 2 ^ f.width), (f, b % 2 ^ f.width)] .nondeterministic =
+      [preferredNaNBits f, evalFloatNeg f (preferredNaNBits f)] := by
+    apply nanChoices_nondet_of_no_nan
+    intro inp hinp
+    rcases List.mem_cons.mp hinp with rfl | hinp
+    · exact hmodA
+    · rcases List.mem_cons.mp hinp with rfl | hinp
+      · exact hmodB
+      · cases hinp
+  unfold EvalFloatBinOpRel
+  rw [hcmp, hbase]
+  dsimp only
+  rw [if_pos' hnan, hch]
+  constructor
+  · rintro ⟨cand, hmem, hout⟩
+    rcases List.mem_cons.mp hmem with rfl | hmem
+    · exact Or.inl hout
+    · rcases List.mem_cons.mp hmem with rfl | hmem
+      · exact Or.inr hout
+      · cases hmem
+  · rintro (hout | hout)
+    · exact ⟨_, List.mem_cons_self, hout⟩
+    · exact ⟨_, List.mem_cons_of_mem _ List.mem_cons_self, hout⟩
+
+/-- **`evalRvalue`'s NaN `floatToFloat` result is `.nondeterministic`-admissible**:
+for a NaN input, the executable quieting conversion
+`evalFloatToFloatRoundTiesToEven src dst bits` is a member of the cast candidate
+list `nanChoices dst [(src, bits % 2 ^ src.width)] .nondeterministic` used by
+`EvalRvalueFloatRel` on `.cast .floatToFloat`. -/
+theorem evalFloatToFloat_nan_mem_nanChoices_nondet (src dst : IeeeFormat) (bits : Nat)
+    (hnan : isNaNBits src bits = true) :
+    evalFloatToFloatRoundTiesToEven src dst bits ∈
+      nanChoices dst [(src, bits % 2 ^ src.width)] .nondeterministic := by
+  have hmod : isNaNBits src (bits % 2 ^ src.width % 2 ^ src.width) = true := by
+    unfold isNaNBits
+    rw [decodeBits_mod, decodeBits_mod]
+    exact hnan
+  have hconv : evalFloatToFloatRoundTiesToEven src dst (bits % 2 ^ src.width % 2 ^ src.width) =
+      evalFloatToFloatRoundTiesToEven src dst bits := by
+    unfold evalFloatToFloatRoundTiesToEven
+    rw [decodeBits_mod, decodeBits_mod]
+  have hq : evalFloatToFloatRoundTiesToEven src dst bits ∈
+      nanChoicesQuieted dst [(src, bits % 2 ^ src.width)] := by
+    unfold nanChoicesQuieted
+    dsimp only
+    rw [hmod, if_pos' rfl, hconv]
+    exact List.mem_cons_self
+  show evalFloatToFloatRoundTiesToEven src dst bits ∈
+    expandNanSigns dst (preferredNaNBits dst ::
+      (nanChoicesQuieted dst [(src, bits % 2 ^ src.width)] ++
+        nanChoicesSignaling dst [(src, bits % 2 ^ src.width)]))
+  exact (mem_expandNanSigns_iff dst _ _).mpr
+    ⟨_, List.mem_cons_of_mem _ (List.mem_append_left _ hq), Or.inl rfl⟩
+
+/-- **`.deterministic` NaN `floatToFloat` discrepancy witness**: for the quiet NaN
+`0x7FC00001_f32` (nonzero payload), the executable quieting conversion to `f64` is
+`0x7FF8000020000000`, which is NOT the single `.deterministic` candidate
+`preferredNaNBits .binary64 = 0x7FF8000000000000`. Hence `evalRvalue` realizes
+`EvalRvalueFloatRel` on NaN `floatToFloat` casts in `.nondeterministic` mode only. -/
+theorem evalFloatToFloat_nan_not_mem_nanChoices_det_witness :
+    isNaNBits .binary32 0x7FC00001 = true ∧
+    evalFloatToFloatRoundTiesToEven .binary32 .binary64 0x7FC00001 = 0x7FF8000020000000 ∧
+    nanChoices .binary64 [(.binary32, 0x7FC00001)] .deterministic = [0x7FF8000000000000] ∧
+    evalFloatToFloatRoundTiesToEven .binary32 .binary64 0x7FC00001 ∉
+      nanChoices .binary64 [(.binary32, 0x7FC00001)] .deterministic := by
+  refine ⟨rfl, rfl, rfl, ?_⟩
+  decide +kernel
+
+/-- `zeroBits` determines its sign argument. -/
+theorem zeroBits_injective (f : IeeeFormat) (s t : Bool) (h : zeroBits f s = zeroBits f t) :
+    s = t := by
+  cases f <;> cases s <;> cases t <;> first | rfl | exact absurd h (by decide)
+
+/-- `sub a b` is definitionally the base sum `add a (-b)` on ALL bit patterns
+("Subtraction a - b is regarded as a sum a + (-b)"). -/
+theorem evalFloatArithBase_sub_eq_add_neg (f : IeeeFormat) (a b : Nat) :
+    evalFloatArithBase .sub f a b = evalFloatArithBase .add f a (evalFloatNeg f b) := by
+  unfold evalFloatArithBase
+  dsimp only
+  simp only [decodeBits_mod, decodeBits_evalFloatNeg]
+
+/-- Double negation of the right operand does not change the base sum. -/
+theorem evalFloatArithBase_add_neg_neg (f : IeeeFormat) (a b : Nat) :
+    evalFloatArithBase .add f a (evalFloatNeg f (evalFloatNeg f b)) =
+      evalFloatArithBase .add f a b := by
+  unfold evalFloatArithBase
+  dsimp only
+  simp only [decodeBits_mod, decodeBits_evalFloatNeg, negateFloatKind_involutive]
+
+/-- **Documented signed-zero rule for sums** (`core` `f32` documentation: "If the
+result of a sum exactly equals zero, the outcome is +0.0 unless both arguments
+were negative, then it is -0.0"): whenever `a + b` of two zero-or-finite operands
+with sign bits `sa`, `sb` is a zero, that zero's sign bit is exactly `sa && sb`. -/
+theorem evalFloatArithBase_add_zero_sign (f : IeeeFormat) (a b : Nat) (sa sb s : Bool)
+    (ha : decodeBits f a = .zero sa ∨ ∃ n d, decodeBits f a = .finite sa n d)
+    (hb : decodeBits f b = .zero sb ∨ ∃ n d, decodeBits f b = .finite sb n d)
+    (h : evalFloatArithBase .add f a b = .some (zeroBits f s)) :
+    s = Bool.and sa sb := by
+  -- `a + b = ±0` forces `a == -b` (gradual underflow: no nonzero sum rounds to zero).
+  have haFin : isNaNBits f a = false ∧ ∀ t, decodeBits f a ≠ .inf t := by
+    unfold isNaNBits
+    rcases ha with ha | ⟨n, d, ha⟩ <;> rw [ha] <;>
+      exact ⟨rfl, fun t ht => by cases ht⟩
+  have hnbFin : isNaNBits f (evalFloatNeg f b) = false ∧
+      ∀ t, decodeBits f (evalFloatNeg f b) ≠ .inf t := by
+    unfold isNaNBits
+    rw [decodeBits_evalFloatNeg]
+    rcases hb with hb | ⟨n, d, hb⟩ <;> rw [hb] <;>
+      exact ⟨rfl, fun t ht => by cases ht⟩
+  have hsub : evalFloatArithBase .sub f a (evalFloatNeg f b) = .some (zeroBits f s) := by
+    rw [evalFloatArithBase_sub_eq_add_neg, evalFloatArithBase_add_neg_neg]
+    exact h
+  have hcmp : evalFloatCmp .eq f a (evalFloatNeg f b) = .some true :=
+    (gradual_underflow_sub_zero_iff f a (evalFloatNeg f b) haFin hnbFin).mp ⟨s, hsub⟩
+  unfold evalFloatCmp evalFloatPartialCompare at hcmp
+  dsimp only at hcmp
+  rw [decodeBits_mod, decodeBits_mod, decodeBits_evalFloatNeg] at hcmp
+  rcases ha with ha | ⟨ln, ld, ha⟩
+  · rcases hb with hb | ⟨rn, rd, hb⟩
+    · -- (±0) + (±0)
+      unfold evalFloatArithBase at h
+      dsimp only at h
+      rw [decodeBits_mod, decodeBits_mod, ha, hb] at h
+      have hz : zeroBits f (Bool.and sa sb) = zeroBits f s := Option.some.inj h
+      exact (zeroBits_injective f _ _ hz).symm
+    · -- (±0) + finite nonzero is never a zero
+      have hrn : 0 < rn := decodeBits_finite_num_pos f b sb rn rd hb
+      rw [ha, hb] at hcmp
+      dsimp only [negateFloatKind] at hcmp
+      rw [if_neg' (Nat.ne_of_gt hrn)] at hcmp
+      cases sb <;> cases hcmp
+  · have hln : 0 < ln := decodeBits_finite_num_pos f a sa ln ld ha
+    rcases hb with hb | ⟨rn, rd, hb⟩
+    · -- finite nonzero + (±0) is never a zero
+      rw [ha, hb] at hcmp
+      dsimp only [negateFloatKind] at hcmp
+      rw [if_neg' (Nat.ne_of_gt hln)] at hcmp
+      cases sa <;> cases hcmp
+    · -- finite + finite: exact cancellation, operands of opposite sign
+      have hrn : 0 < rn := decodeBits_finite_num_pos f b sb rn rd hb
+      have hld : 0 < ld := decodeBits_finite_den_pos f a sa ln ld ha
+      have hrd : 0 < rd := decodeBits_finite_den_pos f b sb rn rd hb
+      rw [ha, hb] at hcmp
+      dsimp only [negateFloatKind] at hcmp
+      have heq : signedNum sa ln * (rd : Int) = signedNum (Bool.not sb) rn * (ld : Int) := by
+        by_cases hlt : signedNum sa ln * (rd : Int) < signedNum (Bool.not sb) rn * (ld : Int)
+        · rw [if_pos' hlt] at hcmp; cases hcmp
+        · rw [if_neg' hlt] at hcmp
+          by_cases he : signedNum sa ln * (rd : Int) = signedNum (Bool.not sb) rn * (ld : Int)
+          · exact he
+          · rw [if_neg' he] at hcmp; cases hcmp
+      have hn0 : signedNum sa ln * (rd : Int) + signedNum sb rn * (ld : Int) = 0 := by
+        rw [heq, signedNum_not, Int.neg_mul, Int.add_left_neg]
+      have hadd := evalFloatArithBase_add_finite f a b sa sb ln ld rn rd
+        (by rw [decodeBits_mod]; exact ha) (by rw [decodeBits_mod]; exact hb)
+      dsimp only at hadd
+      rw [hn0, if_pos' rfl, h] at hadd
+      have hz : zeroBits f s = zeroBits f false := by
+        have := Option.some.inj hadd
+        rw [this]
+        exact roundRatioTiesToEven_zero f false (ld * rd) (Nat.mul_pos hld hrd)
+      have hs : s = false := zeroBits_injective f _ _ hz
+      -- both operands negative would make the exact sum strictly negative
+      have hP : (0 : Int) < (ln : Int) * (rd : Int) :=
+        Int.mul_pos (Int.natCast_pos.mpr hln) (Int.natCast_pos.mpr hrd)
+      have hQ : (0 : Int) < (rn : Int) * (ld : Int) :=
+        Int.mul_pos (Int.natCast_pos.mpr hrn) (Int.natCast_pos.mpr hld)
+      rw [hs]
+      cases sa
+      · rfl
+      · cases sb
+        · rfl
+        · exfalso
+          have hn0' : -((ln : Int) * (rd : Int)) + -((rn : Int) * (ld : Int)) = 0 := by
+            have := hn0
+            unfold signedNum at this
+            rw [if_pos' rfl, if_pos' rfl, Int.neg_mul, Int.neg_mul] at this
+            exact this
+          omega
+
+/-- **Documented signed-zero rule for differences** ("Subtraction a - b is regarded
+as a sum a + (-b)"): whenever `a - b` of two zero-or-finite operands with sign bits
+`sa`, `sb` is a zero, that zero's sign bit is exactly `sa && !sb`. -/
+theorem evalFloatArithBase_sub_zero_sign (f : IeeeFormat) (a b : Nat) (sa sb s : Bool)
+    (ha : decodeBits f a = .zero sa ∨ ∃ n d, decodeBits f a = .finite sa n d)
+    (hb : decodeBits f b = .zero sb ∨ ∃ n d, decodeBits f b = .finite sb n d)
+    (h : evalFloatArithBase .sub f a b = .some (zeroBits f s)) :
+    s = Bool.and sa (Bool.not sb) := by
+  have hnb : decodeBits f (evalFloatNeg f b) = .zero (Bool.not sb) ∨
+      ∃ n d, decodeBits f (evalFloatNeg f b) = .finite (Bool.not sb) n d := by
+    rw [decodeBits_evalFloatNeg]
+    rcases hb with hb | ⟨n, d, hb⟩
+    · exact Or.inl (by rw [hb]; rfl)
+    · exact Or.inr ⟨n, d, by rw [hb]; rfl⟩
+  rw [evalFloatArithBase_sub_eq_add_neg] at h
+  exact evalFloatArithBase_add_zero_sign f a (evalFloatNeg f b) sa (Bool.not sb) s ha hnb h
+
+/-! ## §8. Axiom guards
+
+Every public theorem of this file is pinned to `[propext, Quot.sound]` (zero
+`Classical.choice`, `sorryAx`, `Lean.ofReduceBool`, `Lean.trustCompiler`).
+
+The exact `#print axioms` output of an individual theorem varies between
+"does not depend on any axioms", `[propext]`, and `[propext, Quot.sound]`, so
+each bundle below instead conjoins ALL audited theorems of its group with the
+anchor `Anneal.Mir.IeeeFloatCast.pack_unpack_f32` (itself guarded as exactly
+`[propext, Quot.sound]` in `IeeeFloatCast.lean`). The bundle's axiom set is then
+exactly `[propext, Quot.sound]` if and only if no audited theorem (nor any lemma
+it uses) depends on any other axiom; `#guard_msgs` fails the build otherwise. In
+particular this catches `omega` silently adding `Classical.choice` when an
+`→` / `↔` hypothesis is in scope (see `Hold`).
+-/
+
+section AxiomGuards
+
+set_option linter.defProp false in
+/-- Axiom-audit bundle for the `Scalars`-level theory: every public theorem of §0, §2, §3, §4 (except `EvalRvalueFloatRel.det_imp_nondet`), §6, and §7. -/
+def axiomAudit_scalars :=
+  And.intro (@pack_unpack_f32) <|
+  And.intro (@unpackBits_mod) <|
+  And.intro (@decodeBits_mod) <|
+  And.intro (@decodeBits_finite_num_pos) <|
+  And.intro (@isNaNBits_eq_true_iff) <|
+  And.intro (@isNaNBits_zeroBits) <|
+  And.intro (@isNaNBits_infBits) <|
+  And.intro (@isNaNBits_preferredNaNBits) <|
+  And.intro (@isQuietNaNBits_preferredNaNBits) <|
+  And.intro (@isNaNBits_roundRatioTiesToEven) <|
+  And.intro (@roundRatioTiesToEven_zero) <|
+  And.intro (@signedNum_not) <|
+  And.intro (@signedNum_neg_iff) <|
+  And.intro (@evalFloatNeg_lt) <|
+  And.intro (@evalFloatNeg_mod) <|
+  And.intro (@evalFloatNeg_involutive) <|
+  And.intro (@evalFloatNeg_ne_self) <|
+  And.intro (@evalFloatAbs_lt) <|
+  And.intro (@evalFloatAbs_idempotent) <|
+  And.intro (@evalFloatAbs_evalFloatNeg) <|
+  And.intro (@unpackBits_evalFloatNeg) <|
+  And.intro (@evalFloatNeg_encodeBits) <|
+  And.intro (@evalFloatNeg_zeroBits) <|
+  And.intro (@evalFloatNeg_infBits) <|
+  And.intro (@decodeBits_evalFloatNeg) <|
+  And.intro (@negateFloatKind_involutive) <|
+  And.intro (@isNaNBits_evalFloatNeg) <|
+  And.intro (@isQuietNaNBits_evalFloatNeg) <|
+  And.intro (@isSignalingNaNBits_evalFloatNeg) <|
+  And.intro (@evalFloatNeg_preserves_nan_payload) <|
+  And.intro (@evalFloatPartialCompare_none_iff) <|
+  And.intro (@evalFloatPartialCompare_nan_left) <|
+  And.intro (@evalFloatPartialCompare_nan_right) <|
+  And.intro (@evalFloatCmp_of_nan) <|
+  And.intro (@evalFloatCmp_ne_eq_not_eq) <|
+  And.intro (@evalFloatCmp_signed_zeros_eq) <|
+  And.intro (@evalFloatCmp_trichotomy) <|
+  And.intro (@evalFloatPartialCompare_refl) <|
+  And.intro (@evalFloatCmp_eq_refl) <|
+  And.intro (@evalFloatPartialCompare_swap) <|
+  And.intro (@evalFloatCmp_eq_symm) <|
+  And.intro (@evalFloatCmp_lt_gt_symm) <|
+  And.intro (@evalFloatCmp_le_ge_symm) <|
+  And.intro (@EvalFloatBinOpRel_cmp_mode_independent) <|
+  And.intro (@decodeBits_finite_grid) <|
+  And.intro (@roundRatioTiesToEven_exact_grid) <|
+  And.intro (@evalFloatArithBase_add_finite) <|
+  And.intro (@evalFloatArithBase_sub_finite) <|
+  And.intro (@evalFloatArithBase_mul_finite) <|
+  And.intro (@evalFloatArithBase_div_finite) <|
+  And.intro (@evalFloatArithBase_mul_correctly_rounded) <|
+  And.intro (@evalFloatArithBase_div_correctly_rounded) <|
+  And.intro (@sterbenz_sub_exact) <|
+  And.intro (@exact_add_same_sign_grid) <|
+  And.intro (@gradual_underflow_sub_zero_iff) <|
+  And.intro (@decodeBits_oneBits) <|
+  And.intro (@evalFloatArithBase_mul_oneBits) <|
+  And.intro (@evalFloatArithBase_rem_finite_exact) <|
+  And.intro (@evalFloatArithBase_rem_finite_eq_zero_iff) <|
+  And.intro (@roundRatioTiesToEven_neg) <|
+  And.intro (@evalFloatToFloatRoundTiesToEven_evalFloatNeg) <|
+  And.intro (@mem_expandNanSigns_iff) <|
+  And.intro (@mem_expandNanSigns_evalFloatNeg) <|
+  And.intro (@mem_nanChoicesQuieted_props) <|
+  And.intro (@mem_nanChoicesSignaling_props) <|
+  And.intro (@preferredNaNBits_mem_nanChoices) <|
+  And.intro (@mem_nanChoices_props) <|
+  And.intro (@natListMem_eq_true_iff) <|
+  And.intro (@nanChoices_all_quiet_of_no_snan) <|
+  And.intro (@nanChoices_4_qnan_vs_6_snan_witness) <|
+  And.intro (@nanChoices_sub_vs_add_neg_order_witness) <|
+  And.intro (@EvalFloatBinOpRel.det_imp_nondet) <|
+  And.intro (@evalFloatArithBase_nan_eq_preferred) <|
+  And.intro (@evalFloatBinOp_iff_rel_det) <|
+  And.intro (@mem_nanChoices_nondet_neg_left) <|
+  And.intro (@mem_nanChoices_nondet_neg_right) <|
+  And.intro (@mem_nanChoices_nondet_evalFloatNeg) <|
+  And.intro (@evalFloatArithBase_rem_neg_right) <|
+  And.intro (@EvalFloatBinOpRel.rem_neg_right) <|
+  And.intro (@EvalFloatBinOpRel.det_mul_zero_inf_sign_symmetry_counterexample) <|
+  And.intro (@EvalFloatBinOpRel.nondet_mul_div_rem_neg_left) <|
+  And.intro (@EvalFloatBinOpRel.nondet_mul_div_neg_right) <|
+  And.intro (@EvalFloatBinOpRel.nondet_add_neg_both_iff) <|
+  And.intro (@EvalFloatBinOpRel.nondet_sub_iff_add_neg) <|
+  And.intro (@EvalFloatBinOpRel.nondet_sub_neg_both_iff) <|
+  And.intro (@scalarInt08_injective) <|
+  And.intro (@fmt08_params) <|
+  And.intro (@bitPatterns_parity) <|
+  And.intro (@evalFloatNeg_parity) <|
+  And.intro (@evalFloatAbs_parity) <|
+  And.intro (@roundRatioTiesToEven_parity) <|
+  And.intro (@decodeBits_parity) <|
+  And.intro (@isNaNBits_parity) <|
+  And.intro (@evalFloatPartialCompare_parity) <|
+  And.intro (@evalFloatCmp_parity) <|
+  And.intro (@exactSumFloat_parity) <|
+  And.intro (@negateFloatKind_parity) <|
+  And.intro (@evalFloatArithBase_parity) <|
+  And.intro (@evalFloatToFloatRoundTiesToEven_parity) <|
+  And.intro (@unpackBits_parity) <|
+  And.intro (@nanChoicesQuieted_parity) <|
+  And.intro (@nanChoicesSignaling_parity) <|
+  And.intro (@expandNanSigns_parity) <|
+  And.intro (@nanChoices_parity) <|
+  And.intro (@natListMem_parity) <|
+  And.intro (@isAdmissibleQuietNaN_parity) <|
+  And.intro (@scalarInt08_eq_mk_iff) <|
+  And.intro (@evalFloatBinOp_parity) <|
+  And.intro (@EvalFloatBinOpRel_parity) <|
+  And.intro (@abstractBytesHaveProv_parity) <|
+  And.intro (@policyRejectsProv_parity) <|
+  And.intro (@stripAbstractBytesProv_parity) <|
+  And.intro (@evalFloatArithBase_of_nan) <|
+  And.intro (@evalFloatArithBase_signed_zero_sums) <|
+  And.intro (@evalFloatArithBase_cancel_finite) <|
+  And.intro (@evalFloatArithBase_invalid_operations) <|
+  And.intro (@evalFloatArithBase_inf_valid_operations) <|
+  And.intro (@evalFloatArithBase_div_finite_by_zero) <|
+  And.intro (@evalFloatArithBase_rem_by_zero) <|
+  And.intro (@evalFloatArithBase_rem_inf_dividend) <|
+  And.intro (@evalFloatArithBase_rem_by_inf) <|
+  And.intro (@evalFloatArithBase_rem_zero_dividend) <|
+  And.intro (@isSignalingNaNBits_eq_false_of_not_nan) <|
+  And.intro (@nanChoicesQuieted_of_no_nan) <|
+  And.intro (@nanChoicesSignaling_of_no_nan) <|
+  And.intro (@nanChoices_nondet_of_no_nan) <|
+  And.intro (@EvalFloatBinOpRel.nondet_invalid_operation_iff) <|
+  And.intro (@evalFloatToFloat_nan_mem_nanChoices_nondet) <|
+  And.intro (@evalFloatToFloat_nan_not_mem_nanChoices_det_witness) <|
+  And.intro (@zeroBits_injective) <|
+  And.intro (@evalFloatArithBase_sub_eq_add_neg) <|
+  And.intro (@evalFloatArithBase_add_neg_neg) <|
+  And.intro (@evalFloatArithBase_add_zero_sign) <|
+  @evalFloatArithBase_sub_zero_sign
+
+/--
+info: 'Anneal.Mir.IeeeFloatArith.axiomAudit_scalars'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms axiomAudit_scalars
+
+set_option linter.defProp false in
+/-- Axiom-audit bundle for the `Places`-level theory: every public theorem of §1 and §5, plus `EvalRvalueFloatRel.det_imp_nondet`. -/
+def axiomAudit_places :=
+  And.intro (@pack_unpack_f32) <|
+  And.intro (@finding1_neg_one_f32) <|
+  And.intro (@finding1_add_one_one_f32) <|
+  And.intro (@finding1_cmp_zero_and_nan_f32) <|
+  And.intro (@finding1_f16_f128_fail_closed) <|
+  And.intro (@EvalRvalueFloatRel.det_imp_nondet) <|
+  And.intro (@length_stripAbstractBytesProv) <|
+  And.intro (@abstractBytesHaveProv_stripAbstractBytesProv) <|
+  And.intro (@takeAbstractBytes_stripAbstractBytesProv) <|
+  And.intro (@dropAbstractBytes_stripAbstractBytesProv) <|
+  And.intro (@sliceAbstractBytes_stripAbstractBytesProv) <|
+  And.intro (@decodeLittleEndianBytes_stripAbstractBytesProv) <|
+  And.intro (@decodeScalarBytes_stripAbstractBytesProv) <|
+  And.intro (@abstractBytesHaveProv_takeAbstractBytes_false) <|
+  And.intro (@abstractBytesHaveProv_dropAbstractBytes_false) <|
+  And.intro (@abstractBytesHaveProv_sliceAbstractBytes_false) <|
+  And.intro (@decodeScalarLayoutBytesNoForge_strict_imp_strip) <|
+  And.intro (@decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance) <|
+  And.intro (@decodeTypedValueRichWithPolicy_strictUcg630Ub_refines_stripProvenance) <|
+  And.intro (@evalByteCast_strictUcg630Ub_refines_stripProvenance) <|
+  And.intro (@evalByteCast_strip_eq_strict_or_strict_ub) <|
+  And.intro (@evalByteCastRichWithPolicy_strip_eq_strict_or_strict_ub) <|
+  And.intro (@evalByteCastRichWithPolicy_strictUcg630Ub_refines_stripProvenance) <|
+  And.intro (@decodeScalarLayoutBytesNoForge_eq_of_provFree) <|
+  And.intro (@decodeTypedValueFromBytes_eq_of_provFree) <|
+  And.intro (@decodeTypedValueRichWithPolicy_eq_of_provFree) <|
+  And.intro (@abstractBytesHaveProv_encodeByteCastSourceBytes) <|
+  And.intro (@evalByteCast_eq_of_provFree) <|
+  And.intro (@evalByteCastRichWithPolicy_eq_of_provFree) <|
+  And.intro (@decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv) <|
+  And.intro (@decodeTypedValueFromBytes_prim_strip_eq_strict_stripProv) <|
+  And.intro (@decodeTypedValueFromBytes_adt_multiple_strip_eq_strict_stripProv) <|
+  And.intro (@decodeTypedValueFromBytes_policy_independent_ptr_and_union) <|
+  And.intro (@decodeTypedValueRichWithPolicy_policy_independent_ptr) <|
+  And.intro (@decodeTypedValueFromBytes_32bit_usize_isize_witness) <|
+  And.intro (@unresolved_slot0_tuple_and_custom_dst_witnesses) <|
+  And.intro (@evalByteCastRichWithPolicy_struct_ref_no_forge) <|
+  And.intro (@evalByteCastRichWithPolicy_struct_fnPtr_no_forge) <|
+  @evalByteCastRichWithPolicy_enum_no_forge_ref_and_fnPtr
+
+/--
+info: 'Anneal.Mir.IeeeFloatArith.axiomAudit_places'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms axiomAudit_places
+
+end AxiomGuards
+
+end Anneal.Mir.IeeeFloatArith

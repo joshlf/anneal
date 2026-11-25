@@ -7837,7 +7837,7 @@ Reference (`core::mem::transmute` documentation, Rust 1.98.0):
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "Producing an invalid value. Producing a value happens any time a value is
+> "Producing an invalid value. “Producing” a value happens any time a value is
 > assigned to or read from a place, passed to a function/primitive operation or
 > returned from a function/primitive operation."
 -/
@@ -7912,6 +7912,59 @@ Target-width-aware byte size of a layout-less `RigidTy` `k` for
 `layoutPointerBytes layouts` for `usize`/`isize` and thin/wide pointers as well
 as IEEE-754 float widths (`f16`/`f32`/`f64`/`f128`) without reading
 `layouts.entries[0]`.
+
+Reference (The Rust Reference, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "The size of most primitives is given in this table.
+>
+> Type            size_of::<Type>()
+> bool            1
+> u8 / i8         1
+> u16 / i16       2
+> u32 / i32       4
+> u64 / i64       8
+> u128 / i128     16
+> usize / isize   See below
+> f32             4
+> f64             8
+> char            4"
+>
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers and references have the same layout. Mutability of the pointer or
+> reference does not change the layout."
+>
+> "Pointers to sized types have the same size and alignment as usize."
+>
+> "Pointers to unsized types are sized. The size and alignment of a pointer to
+> an unsized type are each guaranteed to be greater than or equal to those of a
+> pointer to a sized type."
+>
+> (Note) "Though you should not rely on this, all pointers to DSTs are currently
+> twice the size of the size of usize and have the same alignment."
+
+Correspondence: `usize` / `isize` and pointers to sized types take
+`layoutPointerBytes layouts` bytes ("the same size and alignment as usize"),
+`f32` / `f64` take the tabulated `4` / `8` bytes, and every other kind defers
+to `rigidTyKindByteSize` / `tupleFieldsByteSize`.
+
+Modeling choices (not documented guarantees): (1) the `2 * ptrBytes` size of
+`.slice` / `.str` / `.dynamic` pointers follows the quoted non-normative Note
+(current `rustc` behavior), which the Reference asks programs not to rely on;
+the guarantee is only "greater than or equal to". (2) `f16` (2 bytes) and
+`f128` (16 bytes) do not appear in the quoted table and use their IEEE 754
+interchange widths. (3) Function pointers are assigned `ptrBytes`; the quoted
+sections do not state a function-pointer size. (4) Pointers to any other
+unsized pointee (custom-DST structs) are sized as thin here;
+`decodePtrBytesRichNoForge` / `richTyByteSize` consult the compiler-supplied
+layout instead. (5) Tuple sizes from `tupleFieldsByteSize` ignore padding and
+are used only when no compiler layout is available.
 -/
 @[reducible]
 def decodeTypedKindByteSize (layouts : LayoutTable) (k : RigidTy) : Option Nat :=
@@ -8129,7 +8182,7 @@ provenance handling:
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "Producing an invalid value. Producing a value happens any time a value is
+> "Producing an invalid value. “Producing” a value happens any time a value is
 > assigned to or read from a place, passed to a function/primitive operation or
 > returned from a function/primitive operation."
 
@@ -8454,11 +8507,6 @@ carrying explicit source-level field `Ty`s alongside byte offsets so struct and
 enum byte decodes enforce full Rust validity invariants — in particular
 unconditional `.ref` and `.fnPtr` no-forgery under every `Ptr2IntTransmutePolicy`.
 
-Modeling note (`agent_docs/trusted-rust.md`): `rustc_abi::LayoutData` represents
-`*const T`, `&T`, and `fn()` identically via `Primitive::Pointer`; `RichAdtSpec`
-supplies the field `Ty`s and niche encoding metadata needed to enforce reference
-and function-pointer provenance validity inside composite ADTs.
-
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
 
@@ -8468,16 +8516,45 @@ Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1173-L1200>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1964-L2001>
 
-> "pub enum TagEncoding<VariantIdx> {
->     Direct,
->     Niche {
+> "pub enum TagEncoding<VariantIdx: Idx> {
+>     /// The tag directly stores the discriminant, but possibly with a smaller layout
+>     /// (so converting the tag to the discriminant can require sign extension).
+>     Direct,"
+>
+> "    /// Niche (values invalid for a type) encoding the discriminant."
+>
+> "    /// For example, `Option<(usize, &T)>`  is represented such that the tag for
+>     /// `None` is the null pointer in the second tuple field, and
+>     /// `Some` is the identity function (with a non-null reference)
+>     /// and has no additional tag, i.e. the reference being non-null uniquely identifies this variant."
+>
+> "    Niche {
 >         untagged_variant: VariantIdx,
+>         /// This range *may* contain `untagged_variant` or uninhabited variants;
+>         /// these are then just \"dead values\" and not used to encode anything.
 >         niche_variants: RangeInclusive<VariantIdx>,
+>         /// This is inbounds of the type of the niche field
+>         /// (not sign-extended, i.e., all bits beyond the niche field size are 0).
 >         niche_start: u128,
 >     },
 > }"
+
+Modeling note (`agent_docs/trusted-rust.md`): `rustc_abi::LayoutData` represents
+`*const T`, `&T`, and `fn()` identically via `Primitive::Pointer`; `RichAdtSpec`
+supplies the field `Ty`s and niche encoding metadata needed to enforce reference
+and function-pointer provenance validity inside composite ADTs.
+
+Modeling choices and unsupported cases: a `RichAdtSpec` is a caller-supplied
+model-side description; nothing in this file checks that it agrees with the
+compiler's `LayoutData` for the ADT, so every result obtained through it is
+conditional on that agreement (a supplied compiler fact). `.taggedEnum` models
+`TagEncoding::Direct` with an unsigned tag compared by exact value (no sign
+extension of a narrower tag). `.nichePointerEnum` and `.nicheScalarEnum` model
+only the two-variant special case of `TagEncoding::Niche` with a single niche
+value (the null pointer, respectively one scalar `nicheValue`); general
+`niche_variants` ranges with `niche_start` wrapping arithmetic are not modeled.
 -/
 inductive RichAdtSpec : Type where
   /-- Single-variant struct with explicit `(fieldOffset, fieldBytes, fieldTy)` triples. -/
@@ -8584,6 +8661,35 @@ Reference (The Rust Reference, "Dynamically Sized Types"):
 > "Most types have a fixed size that is known at compile time and implement the
 > trait `Sized`. A type with a size that is known only at run-time is called a
 > dynamically sized type (DST) or, informally, an unsized type."
+
+Reference (The Rust Reference, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers and references have the same layout. Mutability of the pointer or
+> reference does not change the layout."
+>
+> "Pointers to sized types have the same size and alignment as usize."
+>
+> "Pointers to unsized types are sized. The size and alignment of a pointer to
+> an unsized type are each guaranteed to be greater than or equal to those of a
+> pointer to a sized type."
+>
+> (Note) "Though you should not rely on this, all pointers to DSTs are currently
+> twice the size of the size of usize and have the same alignment."
+
+Correspondence: `layoutIdx` is the layout of the POINTER type itself. A pointer
+to a sized pointee occupies `ptrBytes` bytes ("the same size and alignment as
+usize"); a pointer to an unsized pointee is "greater than or equal to" that.
+
+Modeling choices and supplied compiler facts (not documented guarantees): the
+wide-pointer size `2 * ptrBytes` follows the quoted non-normative Note (current
+`rustc` behavior). For a pointee that is not syntactically `.slice` / `.str` /
+`.dynamic`, wideness is taken from the compiler-supplied `TypeLayout` at
+`layoutIdx` (size `2 * ptrBytes` with a `.scalarPair` backend representation);
+the metadata half is decoded as a vtable pointer when its scalar layout is a
+pointer and as a provenance-free length otherwise. An unresolved `layoutIdx`
+(`0` or out of range) is treated as thin, so a wide custom-DST pointer whose
+layout index was not resolved is rejected (fail closed) rather than decoded.
 -/
 def decodePtrBytesRichNoForge
     (isRef : Bool)
@@ -14402,7 +14508,7 @@ source and destination layout sizes do not match.
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "Producing an invalid value. Producing a value happens any time a value is
+> "Producing an invalid value. “Producing” a value happens any time a value is
 > assigned to or read from a place, passed to a function/primitive operation or
 > returned from a function/primitive operation."
 
@@ -14480,6 +14586,50 @@ honoring explicit `RichAdtSpec` total sizes, resolved custom-DST `2 * ptrBytes`
 `layoutPointerBytes layouts` for `usize`/`isize`/`fnPtr`/references/raw pointers,
 and IEEE-754 float widths (`f16`/`f32`/`f64`/`f128`), falling back to
 `tyByteSize`.
+
+Reference (The Rust Reference, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "The size of most primitives is given in this table.
+>
+> Type            size_of::<Type>()
+> bool            1
+> u8 / i8         1
+> u16 / i16       2
+> u32 / i32       4
+> u64 / i64       8
+> u128 / i128     16
+> usize / isize   See below
+> f32             4
+> f64             8
+> char            4"
+>
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers and references have the same layout. Mutability of the pointer or
+> reference does not change the layout."
+>
+> "Pointers to sized types have the same size and alignment as usize."
+>
+> "Pointers to unsized types are sized. The size and alignment of a pointer to
+> an unsized type are each guaranteed to be greater than or equal to those of a
+> pointer to a sized type."
+>
+> (Note) "Though you should not rely on this, all pointers to DSTs are currently
+> twice the size of the size of usize and have the same alignment."
+
+Modeling choices and supplied facts (not documented guarantees): ADT sizes come
+from the caller-supplied `RichAdtSpec` (`totalBytes`) when one is registered;
+wide pointers use `2 * ptrBytes` per the quoted non-normative Note, with
+custom-DST wideness read from the compiler-supplied `TypeLayout` exactly as in
+`decodePtrBytesRichNoForge`; `f16` / `f128` use their IEEE 754 interchange
+widths and function pointers use `ptrBytes`, neither of which is stated by the
+quoted sections.
 -/
 def richTyByteSize
     (localDecls : List LocalDecl)
@@ -14529,7 +14679,7 @@ enforced identically across dialects.
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "Producing an invalid value. Producing a value happens any time a value is
+> "Producing an invalid value. “Producing” a value happens any time a value is
 > assigned to or read from a place, passed to a function/primitive operation or
 > returned from a function/primitive operation."
 
@@ -21947,7 +22097,14 @@ quiet/signaling bit, and full NaN payload verbatim. Fails closed with
 Reference (The Rust Reference, "Negation operators"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#negation-operators>
 
-> "* Negation `-`: Signed integer, Floating-point (`std::ops::Neg`)"
+> "This table summarizes the behavior of them on primitive types and which
+> traits are used to overload these operators for other types. Remember that
+> signed integers are always represented using two’s complement."
+>
+> "Symbol  Integer    bool  Floating Point  Overloading Trait
+> -       Negation*        Negation        std::ops::Neg"
+>
+> "* Only for signed integer types."
 
 Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
 <https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
@@ -21958,6 +22115,12 @@ Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
 > is_sign_{positive,negative}. These operations are guaranteed to exactly
 > preserve the bit pattern of their input except for possibly changing the sign
 > bit."
+
+Correspondence: float negation is the documented bitwise sign flip, so the
+result is deterministic (no `FloatArithMode` choice) and never `.ub`.
+Modeling choices: `f16` / `f128` and scalar/type width mismatches return
+`.unsupported` (fail closed) rather than a value; `locals` and `mem` are
+returned unchanged.
 -/
 def evalFloatUnaryNeg
     (sc : ScalarInt)
@@ -21991,16 +22154,51 @@ Reference (The Rust Reference, "Numeric types"):
 > "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
 > f64, respectively."
 
+Reference (`core` documentation, "Primitive Type f32"; superscripts rendered
+with `^`):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html>
+
+> "When a primitive operation (addition, subtraction, multiplication, or
+> division) is performed on this type, the result is rounded according to the
+> roundTiesToEven direction defined in IEEE 754-2008. That means:
+> - The result is the representable value closest to the true value, if there
+>   is a unique closest representable value.
+> - If the true value is exactly half-way between two representable values,
+>   the result is the one with an even least-significant binary digit.
+> - If the true value’s magnitude is ≥ f32::MAX + 2^(f32::MAX_EXP −
+>   f32::MANTISSA_DIGITS − 1), the result is ∞ or −∞ (preserving the true
+>   value’s sign).
+> - If the result of a sum exactly equals zero, the outcome is +0.0 unless
+>   both arguments were negative, then it is -0.0. Subtraction a - b is
+>   regarded as a sum a + (-b)."
+
 Reference (The Rust Reference, "Comparison operators"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#comparison-operators>
 
-> "Comparison operators are defined for primitive integer, floating-point, bool,
-> and char types, as well as for pointers and function pointers."
+> "Comparison operators are also defined both for primitive types and many
+> types in the standard library."
 
-Modeling choice: when an arithmetic operation produces NaN, `evalFloatScalarBinOp`
-returns the deterministic preferred quiet NaN (`preferredNaNBits f`); use
-`EvalRvalueFloatRel` with `FloatArithMode.nondeterministic` for Rust's full
-nondeterministic NaN admissibility relation.
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1643-L1657>
+
+> "/// Floating-point division by zero is safe, and does not need guards."
+>
+> "/// Floating-point remainder by zero is safe, and does not need guards."
+
+Correspondence: this is a type-directed dispatcher; the numerical semantics and
+their documentation are those of `evalFloatBinOp` / `evalFloatArithBase` /
+`evalFloatCmp`. No float binary operation is ever `.ub` (division and remainder
+by zero are "safe").
+
+Modeling choices: when an arithmetic operation produces NaN,
+`evalFloatScalarBinOp` returns the deterministic preferred quiet NaN
+(`preferredNaNBits f`); use `EvalRvalueFloatRel` with
+`FloatArithMode.nondeterministic` for Rust's non-deterministic NaN admissibility
+relation. `f16` / `f128`, mixed float/non-float or mixed-format operands,
+untyped operands (`.none`), width mismatches, and non-float `BinOp`s (bitwise,
+shifts, checked/unchecked integer variants, `cmp`, `offset`) return
+`.unsupported` (fail closed) rather than falling through to integer arithmetic.
 -/
 def evalFloatScalarBinOp
     (op : BinOp)
@@ -23058,7 +23256,7 @@ by `validateLoadedValue` against the operand's own type).
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "Producing an invalid value. Producing a value happens any time a value is
+> "Producing an invalid value. “Producing” a value happens any time a value is
 > assigned to or read from a place, passed to a function/primitive operation or
 > returned from a function/primitive operation."
 -/
@@ -23761,7 +23959,30 @@ Reference (`core::mem::transmute` documentation, Rust 1.98.0):
 Modeling choice: `.deterministic` picks `preferredNaNBits` for NaN outputs;
 `.nondeterministic` admits all `nanChoices` candidates (`preferredNaNBits`,
 quieted input NaNs, and nonzero-payload unchanged signaling input NaNs with
-either sign), excluding target-specific extra NaNs.
+either sign), excluding target-specific extra NaNs (see the scope restriction
+on `nanChoices`: on targets with “extra” NaN payloads this relation
+under-approximates the documented outcome set).
+
+Relationship to the executable `evalRvalue` (modeling choices, not Rust
+guarantees):
+- On float `.binaryOp`, `evalRvalue` returns the `evalFloatBinOp` result, which
+  `EvalFloatBinOpRel` admits in both modes (the preferred NaN is always a
+  candidate).
+- On a NaN-input `.cast .floatToFloat`, `evalRvalue` returns the quieting
+  conversion `evalFloatToFloatRoundTiesToEven src dst sc.bits`. That value is
+  one of the `.nondeterministic` candidates, but in general it is NOT the
+  single `.deterministic` candidate `preferredNaNBits dst` (for example for a
+  NaN with a nonzero payload or a negative sign). `.deterministic` follows
+  Miri's deterministic-float mode here, so on such casts `evalRvalue`
+  realizes this relation in `.nondeterministic` mode only.
+- Float dispatch is type-directed in both `evalRvalue` and this relation: an
+  operand whose `operandTy` is `.none` (for example a local without a
+  `LocalDecl` under the default `localDecls := .nil`) is not recognized as
+  floating-point and follows the integer `evalScalarBinOp` path. Float
+  semantics therefore require `localDecls` (or typed constants) that resolve
+  the type of every float operand.
+- `policy` affects only `.cast .transmute` / `.cast .subtype`; `evalRvalue`
+  itself always uses the default `.strictUcg630Ub`.
 -/
 def EvalRvalueFloatRel
     (mode : FloatArithMode)
