@@ -51,13 +51,13 @@ into a fresh kernel environment via `Lean.importModules` in §2.
      = vendored protected foreign write `Miri.TreeBorrows.performAccess`.
    - Closed **Master 6-Module Workstream Capstone** uniting Episode 1 + Episode 2 across all 6
      workstream modules.
-   - **30 kernel-rejected negative forgery controls** (all boolean controls verified two-sided:
+   - **32 kernel-rejected negative forgery controls** (all boolean controls verified two-sided:
      `accepts (= false)` AND `rejects (= true)`; all value/Prop controls paired with accepted
      baselines), covering Ep1 observer/translator/mode/divergence/codec forgeries, permission-swap
      forgeries, Ep2 unsound `ExactWP` postconditions & cleanup-state erasure on error, clobbered
-     `veil_frame` field overlaps, `Bitprism` uninit/dead-local erasure claims across `bitAnd`/
-     `bitOr`/`mul`, Tree Borrows / `releaseProtector` committed-prefix forgeries, and LE/BE endian
-     confusion.
+     `veil_frame` field overlaps, `Bitprism` uninit/dead-local erasure & width-mismatched constant
+     pair claims across `add`/`bitAnd`/`bitOr`/`mul`, Tree Borrows / `releaseProtector`
+     committed-prefix forgeries, and LE/BE endian confusion.
    - Transitive import-isolation audit of `Anneal.ExactWpAndSmartCtors` (ZERO `Std.Do.*`,
      `Std.Tactic.Do.*`, `Std.WP.*`, `Lean.*`, `Miri.*`, `LeanMiriSpec.*`, `MiniRustSpec.*`),
      choice-free constructive audits, transitive constant reachability (`reachFrom`) across all
@@ -297,6 +297,12 @@ theorem lm_ep2_le_vs_be_disjoint_memory_frame :
     (type_of% @allocWriteUninit_disjoint_readScalar_frame_eq) ∧
     (type_of% @allocWriteBytes_disjoint_readScalar_frame_eq) ∧
     (type_of% @allocCopy_disjoint_readScalar_frame_eq) ∧
+    (type_of% @allocWriteScalar_disjoint_readScalar_ptr_frame_eq) ∧
+    (type_of% @allocWriteScalar_disjoint_readScalar_ptr_frame_exactWP) ∧
+    (type_of% @allocWriteUninit_disjoint_readScalar_ptr_frame_eq) ∧
+    (type_of% @allocWriteUninit_disjoint_readScalar_ptr_frame_exactWP) ∧
+    (type_of% @allocWriteBytes_disjoint_readScalar_ptr_frame_eq) ∧
+    (type_of% @allocCopy_disjoint_readScalar_ptr_frame_eq) ∧
     (type_of% @allocReadScalar_uninit_exactWP) ∧
     (type_of% @allocMapExtra_preserves_readScalar_exactWP) ∧
     (type_of% @allocWithExtra_preserves_readScalar_exactWP) :=
@@ -309,23 +315,32 @@ theorem lm_ep2_le_vs_be_disjoint_memory_frame :
    @allocCopy_disjoint_readScalar_frame_exactWP,
    @allocWriteScalar_disjoint_readScalar_frame_eq, @allocWriteUninit_disjoint_readScalar_frame_eq,
    @allocWriteBytes_disjoint_readScalar_frame_eq, @allocCopy_disjoint_readScalar_frame_eq,
+   @allocWriteScalar_disjoint_readScalar_ptr_frame_eq,
+   @allocWriteScalar_disjoint_readScalar_ptr_frame_exactWP,
+   @allocWriteUninit_disjoint_readScalar_ptr_frame_eq,
+   @allocWriteUninit_disjoint_readScalar_ptr_frame_exactWP,
+   @allocWriteBytes_disjoint_readScalar_ptr_frame_eq,
+   @allocCopy_disjoint_readScalar_ptr_frame_eq,
    @allocReadScalar_uninit_exactWP,
    @allocMapExtra_preserves_readScalar_exactWP,
    @allocWithExtra_preserves_readScalar_exactWP⟩
 
-/-- `Std.Do`-free `TreeBorrowsWP` & `ProtectorReleaseWP`: bidirectional `↔` exactness plus real
-2-segment 16-byte `BorrowTree` witnesses proving committed segment-0 state mutations survive inside
-`result.tree` when segment 1 faults on a protected node! -/
+/-- `Std.Do`-free `TreeBorrowsWP` & `ProtectorReleaseWP`: bidirectional `↔` exactness, genuine
+inductive per-segment `protectorReleaseSymbolicPre_iff`, plus real 2-segment 16-byte `BorrowTree`
+witnesses proving committed segment-0 state mutations survive inside `result.tree` when segment 1
+faults on a protected node! -/
 theorem lm_ep2_tree_borrows_and_protector_committed_prefix_on_error :
     (type_of% @tbAccessExactWP_iff) ∧
     (type_of% @tbDeallocExactWP_iff) ∧
     (type_of% @tbDealloc_accessFailure_retains_tree) ∧
     (type_of% @protectorReleaseExactWP_iff) ∧
+    (type_of% @protectorReleaseSymbolicPre_iff) ∧
     (type_of% @protectorRelease_missingTag_exactWP) ∧
     (type_of% @tb_access_committed_prefix_on_error_witness) ∧
     (type_of% @protector_release_committed_prefix_on_error_witness) :=
   ⟨@tbAccessExactWP_iff, @tbDeallocExactWP_iff, @tbDealloc_accessFailure_retains_tree,
-   @protectorReleaseExactWP_iff, @protectorRelease_missingTag_exactWP,
+   @protectorReleaseExactWP_iff, @protectorReleaseSymbolicPre_iff,
+   @protectorRelease_missingTag_exactWP,
    @tb_access_committed_prefix_on_error_witness,
    @protector_release_committed_prefix_on_error_witness⟩
 
@@ -374,6 +389,8 @@ theorem core_ep2_bitprism_negative_ub_non_erasure :
     (type_of% @mkSmartRvalue_never_erases_ub) ∧
     (type_of% @bitprism_const_annihilators_fire) ∧
     (type_of% @bitprism_const_width_mismatch_preserves_unsupported) ∧
+    (type_of% @bitprism_identity_preconditions_necessary) ∧
+    (type_of% @mkAddSmartRvalue_ok_of_raw_ok) ∧
     (type_of% @mkMemWriteFrame_eq_raw) ∧
     (type_of% @mkMemWriteFrame_dead_slot_preserves_failure) :=
   ⟨@bitAnd_zero_dead_local_preserves_ub, @bitAnd_zero_uninit_local_preserves_ub,
@@ -384,6 +401,7 @@ theorem core_ep2_bitprism_negative_ub_non_erasure :
    @mkMulSmartRvalue_zero_right_eq_raw, @mkBitOrSmartRvalue_allOnes_left_eq_raw,
    @mkBitOrSmartRvalue_allOnes_right_eq_raw, @mkSmartRvalue_never_erases_ub,
    @bitprism_const_annihilators_fire, @bitprism_const_width_mismatch_preserves_unsupported,
+   @bitprism_identity_preconditions_necessary, @mkAddSmartRvalue_ok_of_raw_ok,
    @mkMemWriteFrame_eq_raw, @mkMemWriteFrame_dead_slot_preserves_failure⟩
 
 /-- Downstream test of the `anneal_veil_frame` tactic preserving a 3-field compound invariant
@@ -726,8 +744,8 @@ run_cmd do
               permEqName, miriAllName, permMrName, permCheckName, permCertName, masterName] do
       added := added.push n
 
-    -- 9. Negative forgery controls on scratch copies (30 total: 14 two-sided boolean forgeries +
-    --    16 value/Prop/type-level forgeries paired with accepted baselines).
+    -- 9. Negative forgery controls on scratch copies (32 total: 14 two-sided boolean forgeries +
+    --    18 value/Prop/type-level forgeries paired with accepted baselines).
     let saved ← getEnv
     let acceptsMsg (d : Declaration) : CoreM (Option String) := do
       let r ← try addDecl d; pure none catch e => pure (some (← e.toMessageData.toString))
@@ -909,6 +927,25 @@ run_cmd do
     let bpMulBaseTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvSmartMulZero locsUninit) rvUb
     let bpMulForgeTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvSmartMulZero locsUninit) (mkRvOkZero locsUninit)
 
+    -- Ep2 Bitprism width-mismatched constant-pair forgeries (`0_u32 + 5_u8` and `allOnes_u32 | 0_u8`
+    -- claiming `.ok` instead of `.unsupported`):
+    let rvUnsup := mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.RvalueEvalResult.unsupported
+    let rvUnsupPf := mkApp2 (mkConst ``Eq.refl [1]) rvResTy rvUnsup
+    let scFiveU8 := mkApp2 (mkConst `Trusted.Rustc.V2026_06_01.MirAst.ScalarInt.mk) (mkNatLit 5) (mkNatLit 1)
+    let scZeroU8 := mkApp2 (mkConst `Trusted.Rustc.V2026_06_01.MirAst.ScalarInt.mk) (mkNatLit 0) (mkNatLit 1)
+    let opFiveU8 := mkApp2 (mkConst (ep2CoreNs ++ `mkConstScalarOp)) (mkConst (ep2CoreNs ++ `cU8Ty)) scFiveU8
+    let opZeroU8 := mkApp2 (mkConst (ep2CoreNs ++ `mkConstScalarOp)) (mkConst (ep2CoreNs ++ `cU8Ty)) scZeroU8
+    let rvAddMismatch := mkApp2 (mkConst (ep2CoreNs ++ `mkAddSmartRvalue)) opZero opFiveU8
+    let rvOrMismatch := mkApp3 (mkConst (ep2CoreNs ++ `mkBitOrSmartRvalue))
+      (mkConst (ep2CoreNs ++ `cU32Ty)) opAllOnes opZeroU8
+    let bpAddMisBaseTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvAddMismatch slotNil) rvUnsup
+    let bpAddMisForgeTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvAddMismatch slotNil)
+      (mkApp3 (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.RvalueEvalResult.ok)
+        (mkApp (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.Value.scalar) scFiveU8) slotNil emptyMem)
+    let bpOrMisBaseTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvOrMismatch slotNil) rvUnsup
+    let bpOrMisForgeTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvOrMismatch slotNil)
+      (mkRvOkAllOnes slotNil)
+
     -- Ep2 `bodyAssertCleanupResume` committed-cleanup-state-on-error forgery (claiming `_0 = none`
     -- on error instead of committed `some 99`):
     let bodyClean := mkConst (ep2LmNs ++ `bodyAssertCleanupResume)
@@ -1027,6 +1064,12 @@ run_cmd do
         ("Ep2 forged Bitprism mul uninit erasure (uninit * 0 = .ok 0)",
           some (thm "bpMulBaseUb" bpMulBaseTy bpDeadBasePf),
           thm "bpMulForgedOk" bpMulForgeTy bpDeadBasePf),
+        ("Ep2 forged Bitprism width-mismatched 0_u32 + 5_u8 = .ok 5_u8",
+          some (thm "bpAddMisBaseUnsup" bpAddMisBaseTy rvUnsupPf),
+          thm "bpAddMisForgedOk" bpAddMisForgeTy rvUnsupPf),
+        ("Ep2 forged Bitprism width-mismatched allOnes_u32 | 0_u8 = .ok allOnes",
+          some (thm "bpOrMisBaseUnsup" bpOrMisBaseTy rvUnsupPf),
+          thm "bpOrMisForgedOk" bpOrMisForgeTy rvUnsupPf),
         ("Ep2 forged cleanup-unwind discards committed `_0 = 99` on error",
           some (thm "wpCleanBase99" wpCleanBaseTy wpCleanBasePf),
           thm "wpCleanForgedNone" wpCleanForgeTy wpCleanForgePf),
@@ -1209,9 +1252,9 @@ run_cmd do
     { fileName := "<ep2-cross-frame-exactwp-cross-root>", fileMap := default,
       options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 54 && rejectedCount = 30 do
+  unless addedCount = 54 && rejectedCount = 32 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
-  logInfo m!"cross-frame/exact-wp cross-root kernel closure: added {addedCount} declarations, rejected {rejectedCount} forged controls (14 two-sided boolean + 16 baseline-paired value/Prop), verified Std.Do-free ExactWpAndSmartCtors, reached all 6 modules + MiniRust+Miri+MemoryLemmas+Trusted, axioms {crAxioms}"
+  logInfo m!"cross-frame/exact-wp cross-root kernel closure: added {addedCount} declarations, rejected {rejectedCount} forged controls (14 two-sided boolean + 18 baseline-paired value/Prop), verified Std.Do-free ExactWpAndSmartCtors, reached all 6 modules + MiniRust+Miri+MemoryLemmas+Trusted, axioms {crAxioms}"
 
 /-! ## §3. Test Module Axiom Audit -/
 

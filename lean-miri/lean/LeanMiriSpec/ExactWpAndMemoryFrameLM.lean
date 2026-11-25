@@ -1148,6 +1148,408 @@ theorem allocCopy_disjoint_readScalar_frame_eq [DecidableEq P] [PointerProvenanc
     hReadAfter.trans hReadBefore.symm
   exact ⟨updated, hCopy, hReadEq⟩
 
+/-! ### §1.3b. Universal Endian (`.little` AND `.big`) Disjoint POINTER-Read (`readProvenance = true`) Framing -/
+
+/-- **Universal Endian (`.little` AND `.big`) Disjoint Pointer-Read Frame Equation for `writeScalar`**:
+writing ANY scalar/pointer to `wRange` preserves EVERY disjoint pointer-sized read (`readProvenance = true`),
+including both its target-endian address bytes AND its preserved provenance `ptr.provenance`! -/
+theorem allocWriteScalar_disjoint_readScalar_ptr_frame_eq [DecidableEq P] [PointerProvenance P]
+    (layout : TargetDataLayout) (allocation : Allocation P E)
+    (wRange qRange : AllocRange) (qFin : Size) (value : Scalar P)
+    (converted : ScalarBitsOrPointer P) (cleared nextProvenance : ProvenanceMap P)
+    (ptr : Pointer P)
+    (storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (mutable : allocation.mutability = .Mut)
+    (maskLength : allocation.initializationMask.len = allocation.byteSize)
+    (maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
+    (wNonzero : wRange.size.bytes ≠ 0)
+    (wWidth : wRange.size.bytes.toNat ≤ 16)
+    (wBound : wRange.start.bytes.toNat + wRange.size.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (conversion : value.toBitsOrPtrInternal wRange.size = .ok converted)
+    (clear : ∀ fullBytes : Array UInt8,
+      allocation.getBytesUnchecked (allocRange Size.ZERO allocation.byteSize) = .ok fullBytes →
+      allocation.provenanceMap.clear wRange fullBytes
+        (Size.fromBits layout.pointerWidth.bits) = .ok () cleared)
+    (insert : match converted with
+      | .bits _ => nextProvenance = cleared
+      | .pointer wp =>
+          wRange.size = Size.fromBits layout.pointerWidth.bits ∧
+            cleared.insertPtr wRange.start wp.provenance
+              (Size.fromBits layout.pointerWidth.bits) = .ok () nextProvenance)
+    (qEnd : qRange.endExclusive = .ok qFin)
+    (qNonempty : qRange.start.bytes.toNat < qFin.bytes.toNat)
+    (qBound : qFin.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (hDisjoint : wRange.start.bytes.toNat + wRange.size.bytes.toNat ≤ qRange.start.bytes.toNat ∨
+      qFin.bytes.toNat ≤ wRange.start.bytes.toNat)
+    (qInit : allocation.initializationMask.isRangeInitialized qRange = .ok (.ok ()))
+    (qPtrSz : qRange.size = Size.fromBits layout.pointerWidth.bits)
+    (qLimit : qRange.size.bytes.toNat ≤ 16)
+    (qOffBound : ptr.offset.bytes.toNat < 2 ^ (8 * qRange.size.bytes.toNat))
+    (qProvBefore : allocation.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qProvAfter : nextProvenance.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qSlice : allocation.getBytesUnchecked qRange =
+      .ok (Array.ofFn (fun i : Fin qRange.size.bytes.toNat =>
+        UInt8.ofNat ((ptr.offset.bytes.toNat / 2 ^ (8 *
+          (if layout.endian == .little then i.1 else qRange.size.bytes.toNat - i.1 - 1))) % 256)))) :
+    ∃ updated : Allocation P E,
+      Allocation.writeScalar layout wRange value allocation = .ok () updated ∧
+      updated.readScalar layout qRange true = .ok (Scalar.fromPointer layout ptr) ∧
+      updated.readScalar layout qRange true = allocation.readScalar layout qRange true := by
+  obtain ⟨updated, hWrite, _, _, _, _, _, _, _, _, hSetMask, _, hProvEq, _, _, hDisjBytes⟩ :=
+    Allocation.writeScalar_spec layout allocation wRange value converted cleared nextProvenance
+      storage mutable maskLength maskValid wNonzero wWidth wBound conversion clear insert
+  obtain ⟨wEnd, wFinNat⟩ := endExclusive_of_bound wRange allocation.byteSize wBound
+  have hInitFrame : updated.initializationMask.isRangeInitialized qRange = .ok (.ok ()) := by
+    rw [InitMask.WriteProof.isRangeInitialized_frame allocation.initializationMask
+      updated.initializationMask wRange qRange
+      (Size.ofBytes (wRange.start.bytes + wRange.size.bytes)) qFin true
+      maskValid wEnd qEnd
+      (by have : 0 < wRange.size.bytes.toNat := Nat.pos_of_ne_zero (fun h0 =>
+            wNonzero (UInt64.toNat_inj.mp h0)); omega)
+      qNonempty
+      (by rw [maskLength, wFinNat]; exact wBound)
+      (by rw [maskLength]; exact qBound)
+      (by rw [wFinNat]; exact hDisjoint)
+      hSetMask]
+    exact qInit
+  have hBytesEq :=
+    (hDisjBytes qRange qFin qEnd (Nat.le_of_lt qNonempty) qBound hDisjoint).trans qSlice
+  have hReadBefore :=
+    Allocation.readScalar_ptr_roundtrip allocation layout qRange ptr qInit qPtrSz qLimit qOffBound
+      qProvBefore qSlice
+  have hProvUpdated : updated.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance) := by
+    rw [hProvEq]; exact qProvAfter
+  have hReadAfter :=
+    Allocation.readScalar_ptr_roundtrip updated layout qRange ptr hInitFrame qPtrSz qLimit qOffBound
+      hProvUpdated hBytesEq
+  exact ⟨updated, hWrite, hReadAfter, hReadAfter.trans hReadBefore.symm⟩
+
+/-- **Universal Endian (`.little` AND `.big`) Disjoint Pointer-Read `AnnealExactWP` Framing for `writeScalar`**. -/
+theorem allocWriteScalar_disjoint_readScalar_ptr_frame_exactWP [DecidableEq P] [PointerProvenance P]
+    (layout : TargetDataLayout) (allocation : Allocation P E)
+    (wRange qRange : AllocRange) (qFin : Size) (value : Scalar P)
+    (converted : ScalarBitsOrPointer P) (cleared nextProvenance : ProvenanceMap P)
+    (ptr : Pointer P)
+    (post : Scalar P → Allocation P E → Prop) (onError : AllocError → Allocation P E → Prop)
+    (storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (mutable : allocation.mutability = .Mut)
+    (maskLength : allocation.initializationMask.len = allocation.byteSize)
+    (maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
+    (wNonzero : wRange.size.bytes ≠ 0)
+    (wWidth : wRange.size.bytes.toNat ≤ 16)
+    (wBound : wRange.start.bytes.toNat + wRange.size.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (conversion : value.toBitsOrPtrInternal wRange.size = .ok converted)
+    (clear : ∀ fullBytes : Array UInt8,
+      allocation.getBytesUnchecked (allocRange Size.ZERO allocation.byteSize) = .ok fullBytes →
+      allocation.provenanceMap.clear wRange fullBytes
+        (Size.fromBits layout.pointerWidth.bits) = .ok () cleared)
+    (insert : match converted with
+      | .bits _ => nextProvenance = cleared
+      | .pointer wp =>
+          wRange.size = Size.fromBits layout.pointerWidth.bits ∧
+            cleared.insertPtr wRange.start wp.provenance
+              (Size.fromBits layout.pointerWidth.bits) = .ok () nextProvenance)
+    (qEnd : qRange.endExclusive = .ok qFin)
+    (qNonempty : qRange.start.bytes.toNat < qFin.bytes.toNat)
+    (qBound : qFin.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (hDisjoint : wRange.start.bytes.toNat + wRange.size.bytes.toNat ≤ qRange.start.bytes.toNat ∨
+      qFin.bytes.toNat ≤ wRange.start.bytes.toNat)
+    (qInit : allocation.initializationMask.isRangeInitialized qRange = .ok (.ok ()))
+    (qPtrSz : qRange.size = Size.fromBits layout.pointerWidth.bits)
+    (qLimit : qRange.size.bytes.toNat ≤ 16)
+    (qOffBound : ptr.offset.bytes.toNat < 2 ^ (8 * qRange.size.bytes.toNat))
+    (qProvBefore : allocation.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qProvAfter : nextProvenance.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qSlice : allocation.getBytesUnchecked qRange =
+      .ok (Array.ofFn (fun i : Fin qRange.size.bytes.toNat =>
+        UInt8.ofNat ((ptr.offset.bytes.toNat / 2 ^ (8 *
+          (if layout.endian == .little then i.1 else qRange.size.bytes.toNat - i.1 - 1))) % 256))))
+    (hPost : ∀ updated : Allocation P E,
+      Allocation.writeScalar layout wRange value allocation = .ok () updated →
+      post (Scalar.fromPointer layout ptr) updated) :
+    AnnealExactWP
+      (ExactAction.seq (allocWriteScalarAction layout wRange value)
+        (allocReadScalarAction layout qRange true))
+      post onError allocation := by
+  obtain ⟨updated, hWrite, hReadPtr, _⟩ :=
+    allocWriteScalar_disjoint_readScalar_ptr_frame_eq layout allocation wRange qRange qFin value
+      converted cleared nextProvenance ptr storage mutable maskLength maskValid wNonzero wWidth
+      wBound conversion clear insert qEnd qNonempty qBound hDisjoint qInit qPtrSz qLimit qOffBound
+      qProvBefore qProvAfter qSlice
+  rw [exactWP_seq, allocWriteScalarExactWP_iff, hWrite]
+  dsimp only
+  rw [allocReadScalarExactWP_iff, hReadPtr]
+  exact hPost updated hWrite
+
+/-- **Universal Endian (`.little` AND `.big`) Disjoint Pointer-Read Frame Equation for `writeUninit`**:
+marking disjoint `wRange` uninitialized preserves `readScalar layout qRange true = .ok (Scalar.fromPointer layout ptr)`. -/
+theorem allocWriteUninit_disjoint_readScalar_ptr_frame_eq [DecidableEq P] [PointerProvenance P]
+    (layout : TargetDataLayout) (allocation : Allocation P E)
+    (wRange qRange : AllocRange) (qFin : Size)
+    (nextProvenance : ProvenanceMap P) (ptr : Pointer P)
+    (wNonzero : wRange.size.bytes ≠ 0)
+    (storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (mutable : allocation.mutability = .Mut)
+    (maskLength : allocation.initializationMask.len = allocation.byteSize)
+    (maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
+    (wBound : wRange.start.bytes.toNat + wRange.size.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (clear : ∀ fullBytes : Array UInt8,
+      allocation.getBytesUnchecked (allocRange Size.ZERO allocation.byteSize) = .ok fullBytes →
+      allocation.provenanceMap.clear wRange fullBytes
+        (Size.fromBits layout.pointerWidth.bits) = .ok () nextProvenance)
+    (qEnd : qRange.endExclusive = .ok qFin)
+    (qNonempty : qRange.start.bytes.toNat < qFin.bytes.toNat)
+    (qBound : qFin.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (hDisjoint : wRange.start.bytes.toNat + wRange.size.bytes.toNat ≤ qRange.start.bytes.toNat ∨
+      qFin.bytes.toNat ≤ wRange.start.bytes.toNat)
+    (qInit : allocation.initializationMask.isRangeInitialized qRange = .ok (.ok ()))
+    (qPtrSz : qRange.size = Size.fromBits layout.pointerWidth.bits)
+    (qLimit : qRange.size.bytes.toNat ≤ 16)
+    (qOffBound : ptr.offset.bytes.toNat < 2 ^ (8 * qRange.size.bytes.toNat))
+    (qProvBefore : allocation.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qProvAfter : nextProvenance.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qSlice : allocation.getBytesUnchecked qRange =
+      .ok (Array.ofFn (fun i : Fin qRange.size.bytes.toNat =>
+        UInt8.ofNat ((ptr.offset.bytes.toNat / 2 ^ (8 *
+          (if layout.endian == .little then i.1 else qRange.size.bytes.toNat - i.1 - 1))) % 256)))) :
+    ∃ updated : Allocation P E,
+      Allocation.writeUninit wRange (Size.fromBits layout.pointerWidth.bits) allocation = .ok () updated ∧
+      updated.readScalar layout qRange true = .ok (Scalar.fromPointer layout ptr) ∧
+      updated.readScalar layout qRange true = allocation.readScalar layout qRange true := by
+  obtain ⟨updated, hWrite, _, _, _, _, _, _, _, _, hSetMask, hProvEq, hBytesUnchanged⟩ :=
+    Allocation.writeUninit_spec wRange (Size.fromBits layout.pointerWidth.bits) allocation
+      nextProvenance wNonzero storage mutable maskLength maskValid wBound clear
+  obtain ⟨wEnd, wFinNat⟩ := endExclusive_of_bound wRange allocation.byteSize wBound
+  have hInitFrame : updated.initializationMask.isRangeInitialized qRange = .ok (.ok ()) := by
+    rw [InitMask.WriteProof.isRangeInitialized_frame allocation.initializationMask
+      updated.initializationMask wRange qRange
+      (Size.ofBytes (wRange.start.bytes + wRange.size.bytes)) qFin false
+      maskValid wEnd qEnd
+      (by have : 0 < wRange.size.bytes.toNat := Nat.pos_of_ne_zero (fun h0 =>
+            wNonzero (UInt64.toNat_inj.mp h0)); omega)
+      qNonempty
+      (by rw [maskLength, wFinNat]; exact wBound)
+      (by rw [maskLength]; exact qBound)
+      (by rw [wFinNat]; exact hDisjoint)
+      hSetMask]
+    exact qInit
+  have hBytesEq := (hBytesUnchanged qRange).trans qSlice
+  have hReadBefore :=
+    Allocation.readScalar_ptr_roundtrip allocation layout qRange ptr qInit qPtrSz qLimit qOffBound
+      qProvBefore qSlice
+  have hProvUpdated : updated.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance) := by
+    rw [hProvEq]; exact qProvAfter
+  have hReadAfter :=
+    Allocation.readScalar_ptr_roundtrip updated layout qRange ptr hInitFrame qPtrSz qLimit qOffBound
+      hProvUpdated hBytesEq
+  exact ⟨updated, hWrite, hReadAfter, hReadAfter.trans hReadBefore.symm⟩
+
+/-- **Universal Endian (`.little` AND `.big`) Disjoint Pointer-Read `AnnealExactWP` Framing for `writeUninit`**. -/
+theorem allocWriteUninit_disjoint_readScalar_ptr_frame_exactWP [DecidableEq P] [PointerProvenance P]
+    (layout : TargetDataLayout) (allocation : Allocation P E)
+    (wRange qRange : AllocRange) (qFin : Size)
+    (nextProvenance : ProvenanceMap P) (ptr : Pointer P)
+    (post : Scalar P → Allocation P E → Prop) (onError : AllocError → Allocation P E → Prop)
+    (wNonzero : wRange.size.bytes ≠ 0)
+    (storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (mutable : allocation.mutability = .Mut)
+    (maskLength : allocation.initializationMask.len = allocation.byteSize)
+    (maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
+    (wBound : wRange.start.bytes.toNat + wRange.size.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (clear : ∀ fullBytes : Array UInt8,
+      allocation.getBytesUnchecked (allocRange Size.ZERO allocation.byteSize) = .ok fullBytes →
+      allocation.provenanceMap.clear wRange fullBytes
+        (Size.fromBits layout.pointerWidth.bits) = .ok () nextProvenance)
+    (qEnd : qRange.endExclusive = .ok qFin)
+    (qNonempty : qRange.start.bytes.toNat < qFin.bytes.toNat)
+    (qBound : qFin.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (hDisjoint : wRange.start.bytes.toNat + wRange.size.bytes.toNat ≤ qRange.start.bytes.toNat ∨
+      qFin.bytes.toNat ≤ wRange.start.bytes.toNat)
+    (qInit : allocation.initializationMask.isRangeInitialized qRange = .ok (.ok ()))
+    (qPtrSz : qRange.size = Size.fromBits layout.pointerWidth.bits)
+    (qLimit : qRange.size.bytes.toNat ≤ 16)
+    (qOffBound : ptr.offset.bytes.toNat < 2 ^ (8 * qRange.size.bytes.toNat))
+    (qProvBefore : allocation.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qProvAfter : nextProvenance.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qSlice : allocation.getBytesUnchecked qRange =
+      .ok (Array.ofFn (fun i : Fin qRange.size.bytes.toNat =>
+        UInt8.ofNat ((ptr.offset.bytes.toNat / 2 ^ (8 *
+          (if layout.endian == .little then i.1 else qRange.size.bytes.toNat - i.1 - 1))) % 256))))
+    (hPost : ∀ updated : Allocation P E,
+      Allocation.writeUninit wRange (Size.fromBits layout.pointerWidth.bits) allocation = .ok () updated →
+      post (Scalar.fromPointer layout ptr) updated) :
+    AnnealExactWP
+      (ExactAction.seq (allocWriteUninitAction wRange (Size.fromBits layout.pointerWidth.bits))
+        (allocReadScalarAction layout qRange true))
+      post onError allocation := by
+  obtain ⟨updated, hWrite, hReadPtr, _⟩ :=
+    allocWriteUninit_disjoint_readScalar_ptr_frame_eq layout allocation wRange qRange qFin
+      nextProvenance ptr wNonzero storage mutable maskLength maskValid wBound clear qEnd qNonempty
+      qBound hDisjoint qInit qPtrSz qLimit qOffBound qProvBefore qProvAfter qSlice
+  rw [exactWP_seq, allocWriteUninitExactWP_iff, hWrite]
+  dsimp only
+  rw [allocReadScalarExactWP_iff, hReadPtr]
+  exact hPost updated hWrite
+
+/-- **Universal Endian (`.little` AND `.big`) Disjoint Pointer-Read Frame Equation for `writeBytes`**. -/
+theorem allocWriteBytes_disjoint_readScalar_ptr_frame_eq [DecidableEq P] [PointerProvenance P]
+    (layout : TargetDataLayout) (allocation : Allocation P E)
+    (wStart : Size) (wBytes : Array UInt8) (qRange : AllocRange) (qFin : Size)
+    (nextProvenance : ProvenanceMap P) (ptr : Pointer P)
+    (hNonempty : 0 < wBytes.size)
+    (storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (mutable : allocation.mutability = .Mut)
+    (maskLength : allocation.initializationMask.len = allocation.byteSize)
+    (maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
+    (wBound : wStart.bytes.toNat + wBytes.size ≤ allocation.byteSize.bytes.toNat)
+    (clear : ∀ fullBytes : Array UInt8,
+      allocation.getBytesUnchecked (allocRange Size.ZERO allocation.byteSize) = .ok fullBytes →
+      allocation.provenanceMap.clear
+        (allocRange wStart (Size.ofBytes (UInt64.ofNat wBytes.size))) fullBytes
+        (Size.fromBits layout.pointerWidth.bits) = .ok () nextProvenance)
+    (qEnd : qRange.endExclusive = .ok qFin)
+    (qNonempty : qRange.start.bytes.toNat < qFin.bytes.toNat)
+    (qBound : qFin.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (hDisjoint : wStart.bytes.toNat + wBytes.size ≤ qRange.start.bytes.toNat ∨
+      qFin.bytes.toNat ≤ wStart.bytes.toNat)
+    (qInit : allocation.initializationMask.isRangeInitialized qRange = .ok (.ok ()))
+    (qPtrSz : qRange.size = Size.fromBits layout.pointerWidth.bits)
+    (qLimit : qRange.size.bytes.toNat ≤ 16)
+    (qOffBound : ptr.offset.bytes.toNat < 2 ^ (8 * qRange.size.bytes.toNat))
+    (qProvBefore : allocation.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qProvAfter : nextProvenance.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qSlice : allocation.getBytesUnchecked qRange =
+      .ok (Array.ofFn (fun i : Fin qRange.size.bytes.toNat =>
+        UInt8.ofNat ((ptr.offset.bytes.toNat / 2 ^ (8 *
+          (if layout.endian == .little then i.1 else qRange.size.bytes.toNat - i.1 - 1))) % 256)))) :
+    ∃ updated : Allocation P E,
+      Allocation.writeBytes wStart wBytes (Size.fromBits layout.pointerWidth.bits) allocation = .ok () updated ∧
+      updated.readScalar layout qRange true = .ok (Scalar.fromPointer layout ptr) ∧
+      updated.readScalar layout qRange true = allocation.readScalar layout qRange true := by
+  obtain ⟨updated, hWrite, _, _, _, _, _, _, _, _, hSetMask, _, hProvEq, _, hDisjBytes⟩ :=
+    Allocation.writeBytes_spec wStart (Size.fromBits layout.pointerWidth.bits) wBytes allocation
+      nextProvenance hNonempty storage mutable maskLength maskValid wBound clear
+  let wRange : AllocRange := allocRange wStart (Size.ofBytes (UInt64.ofNat wBytes.size))
+  have hWStart : wRange.start = wStart := rfl
+  have hBytesLt : wBytes.size < 2 ^ 64 := by
+    have := allocation.byteSize.bytes.toNat_lt; omega
+  have hWSizeNat : wRange.size.bytes.toNat = wBytes.size := by
+    simp [wRange, allocRange, Size.ofBytes, UInt64.toNat_ofNat', Nat.mod_eq_of_lt hBytesLt]
+  obtain ⟨wEnd, wFinNat⟩ := endExclusive_of_bound wRange allocation.byteSize (by
+    rw [hWStart, hWSizeNat]; exact wBound)
+  rw [hWStart, hWSizeNat] at wFinNat
+  have hInitFrame : updated.initializationMask.isRangeInitialized qRange = .ok (.ok ()) := by
+    rw [InitMask.WriteProof.isRangeInitialized_frame allocation.initializationMask
+      updated.initializationMask wRange qRange
+      (Size.ofBytes (wRange.start.bytes + wRange.size.bytes)) qFin true
+      maskValid wEnd qEnd
+      (by rw [hWStart, wFinNat]; omega) qNonempty
+      (by rw [maskLength, hWStart, wFinNat]; exact wBound)
+      (by rw [maskLength]; exact qBound)
+      (by rw [hWStart, wFinNat]; exact hDisjoint)
+      hSetMask]
+    exact qInit
+  have hBytesEq :=
+    (hDisjBytes qRange qFin qEnd (Nat.le_of_lt qNonempty) qBound hDisjoint).trans qSlice
+  have hReadBefore :=
+    Allocation.readScalar_ptr_roundtrip allocation layout qRange ptr qInit qPtrSz qLimit qOffBound
+      qProvBefore qSlice
+  have hProvUpdated : updated.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance) := by
+    rw [hProvEq]; exact qProvAfter
+  have hReadAfter :=
+    Allocation.readScalar_ptr_roundtrip updated layout qRange ptr hInitFrame qPtrSz qLimit qOffBound
+      hProvUpdated hBytesEq
+  exact ⟨updated, hWrite, hReadAfter, hReadAfter.trans hReadBefore.symm⟩
+
+/-- **Universal Endian (`.little` AND `.big`) Disjoint Pointer-Read Frame Equation for `Allocation.copy`**. -/
+theorem allocCopy_disjoint_readScalar_ptr_frame_eq [DecidableEq P] [PointerProvenance P]
+    (layout : TargetDataLayout) (source state : Allocation P E)
+    (sourceRange qRange : AllocRange) (srcFinish destStart qFin : Size)
+    (sameAllocation nonoverlapping : Bool)
+    (srcBytes : Array UInt8) (provCopy : ProvenanceCopy P)
+    (clearedProv finalProv : ProvenanceMap P) (ptr : Pointer P)
+    (srcStorage : source.len = source.byteSize.bytes.toNat)
+    (srcEnd : sourceRange.endExclusive = .ok srcFinish)
+    (srcNonzero : sourceRange.size.bytes ≠ 0)
+    (srcMaskLen : source.initializationMask.len = source.byteSize)
+    (srcMaskWF : InitMask.WriteProof.WellFormed source.initializationMask)
+    (srcInit : source.initializationMask.isRangeInitialized sourceRange = .ok (.ok ()))
+    (srcSlice : source.getBytesUnchecked sourceRange = .ok srcBytes)
+    (srcInBounds : srcFinish.bytes.toNat ≤ source.byteSize.bytes.toNat)
+    (h_prepProv : ∀ srcFull : Array UInt8,
+      source.getBytesUnchecked (allocRange Size.ZERO source.byteSize) = .ok srcFull →
+      source.provenanceMap.prepareCopy sourceRange srcFull
+        (Size.fromBits layout.pointerWidth.bits) = .ok provCopy)
+    (h_disjSame : sameAllocation = true → nonoverlapping = true →
+      srcFinish.bytes.toNat ≤ destStart.bytes.toNat ∨
+        destStart.bytes.toNat + sourceRange.size.bytes.toNat ≤ sourceRange.start.bytes.toNat)
+    (destStorage : state.len = state.byteSize.bytes.toNat)
+    (destMut : state.mutability = .Mut)
+    (destMaskLen : state.initializationMask.len = state.byteSize)
+    (destMaskWF : InitMask.WriteProof.WellFormed state.initializationMask)
+    (destInBounds : destStart.bytes.toNat + sourceRange.size.bytes.toNat ≤ state.byteSize.bytes.toNat)
+    (h_clearProv : ∀ stFull : Array UInt8,
+      state.getBytesUnchecked (allocRange Size.ZERO state.byteSize) = .ok stFull →
+      state.provenanceMap.clear (allocRange destStart sourceRange.size) stFull
+        (Size.fromBits layout.pointerWidth.bits) = .ok () clearedProv)
+    (h_applyProv : clearedProv.applyCopy provCopy
+      (allocRange destStart sourceRange.size) 1 = .ok () finalProv)
+    (qEnd : qRange.endExclusive = .ok qFin)
+    (qNonempty : qRange.start.bytes.toNat < qFin.bytes.toNat)
+    (qBound : qFin.bytes.toNat ≤ state.byteSize.bytes.toNat)
+    (hDisjoint : destStart.bytes.toNat + sourceRange.size.bytes.toNat ≤ qRange.start.bytes.toNat ∨
+      qFin.bytes.toNat ≤ destStart.bytes.toNat)
+    (qInit : state.initializationMask.isRangeInitialized qRange = .ok (.ok ()))
+    (qPtrSz : qRange.size = Size.fromBits layout.pointerWidth.bits)
+    (qLimit : qRange.size.bytes.toNat ≤ 16)
+    (qOffBound : ptr.offset.bytes.toNat < 2 ^ (8 * qRange.size.bytes.toNat))
+    (qProvBefore : state.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qProvAfter : finalProv.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
+    (qSlice : state.getBytesUnchecked qRange =
+      .ok (Array.ofFn (fun i : Fin qRange.size.bytes.toNat =>
+        UInt8.ofNat ((ptr.offset.bytes.toNat / 2 ^ (8 *
+          (if layout.endian == .little then i.1 else qRange.size.bytes.toNat - i.1 - 1))) % 256)))) :
+    ∃ updated : Allocation P E,
+      Allocation.copy source sourceRange destStart (Size.fromBits layout.pointerWidth.bits)
+        sameAllocation nonoverlapping state = .ok () updated ∧
+      updated.readScalar layout qRange true = .ok (Scalar.fromPointer layout ptr) ∧
+      updated.readScalar layout qRange true = state.readScalar layout qRange true := by
+  obtain ⟨updated, hCopy, _, _, _, _, _, _, _, _, _, _, hInitFrameIff, hProvEq, _, hDisjBytes⟩ :=
+    Allocation.copy_initialized_spec source state sourceRange srcFinish destStart
+      (Size.fromBits layout.pointerWidth.bits) sameAllocation nonoverlapping srcBytes provCopy
+      clearedProv finalProv srcStorage srcEnd srcNonzero srcMaskLen srcMaskWF srcInit srcSlice
+      srcInBounds h_prepProv h_disjSame destStorage destMut destMaskLen destMaskWF destInBounds
+      h_clearProv h_applyProv
+  have hInitFrame : updated.initializationMask.isRangeInitialized qRange = .ok (.ok ()) :=
+    (hInitFrameIff qRange qFin qEnd qNonempty qBound hDisjoint).mpr qInit
+  have hBytesEq :=
+    (hDisjBytes qRange qFin qEnd (Nat.le_of_lt qNonempty) qBound hDisjoint).trans qSlice
+  have hReadBefore :=
+    Allocation.readScalar_ptr_roundtrip state layout qRange ptr qInit qPtrSz qLimit qOffBound
+      qProvBefore qSlice
+  have hProvUpdated : updated.provenanceMap.readPtr qRange.start
+      (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance) := by
+    rw [hProvEq]; exact qProvAfter
+  have hReadAfter :=
+    Allocation.readScalar_ptr_roundtrip updated layout qRange ptr hInitFrame qPtrSz qLimit qOffBound
+      hProvUpdated hBytesEq
+  exact ⟨updated, hCopy, hReadAfter, hReadAfter.trans hReadBefore.symm⟩
+
 /-! ### §1.4. Concrete Little-Endian & Big-Endian Disjoint Byte-Range & Uninit Witnesses -/
 
 def layoutLE64 : TargetDataLayout := ⟨.little, .w64⟩
@@ -1483,6 +1885,117 @@ theorem protectorRelease_missingTag_exactWP (tag : BorTag) (tags : ProtectedTags
   rw [protectorReleaseExactWP_iff]
   unfold protectorReleasePre
   rw [hMiss]
+
+/-- Predicate characterizing segments skipped during `BorrowTree.releaseProtector`
+(either absent permission for `source`, `associatedAccess = none`, or `accessed = false`). -/
+def protectorReleaseSegmentSkipped (source : UniIndex)
+    (segment : RangeMapSegment LocationTree) : Prop :=
+  match segment.data.perms.get source with
+  | none => True
+  | some state =>
+    match state.permission.associatedAccess with
+    | none => True
+    | some _ => state.accessed = false
+
+/-- Inductive per-segment scan precondition for `BorrowTree.releaseProtector` (`Std.Do`-free
+structural induction over `List.range' 0 tree.locations.entries.size` ending in
+`updateExposureForProtectorRelease`, covering `.RangeMapFailure`, `.ExposureUpdateFailure`,
+and `.Released`). -/
+def protectorReleaseSkipScanPre (tag : BorTag)
+    (post : Unit → BorrowTree → Prop)
+    (onError : BorrowTree.ProtectorReleaseStatus → BorrowTree → Prop) :
+    List Nat → BorrowTree → Prop
+  | [], tree =>
+    let exposure := tree.updateExposureForProtectorRelease tag
+    match exposure.outcome with
+    | .error err => onError (.ExposureUpdateFailure err) exposure.tree
+    | .ok () => post () exposure.tree
+  | position :: rest, tree =>
+    match tree.locations.index position with
+    | .error err => onError (.RangeMapFailure err) tree
+    | .ok _ => protectorReleaseSkipScanPre tag post onError rest tree
+
+/-- Full symbolic per-segment precondition for `BorrowTree.releaseProtector` on trees whose
+segments are skipped for `tag` (`Std.Do`-free mirror of `lean-miri#93`
+`ProtectorReleaseWP.releasePre`, strictly generalizing `TreeState.lean`'s unexposed-absent
+`release` lemma to arbitrary `associatedAccess = none`, `accessed = false`, `.RangeMapFailure`,
+and `.ExposureUpdateFailure` outcomes). -/
+def protectorReleaseSymbolicPre (tag : BorTag)
+    (post : Unit → BorrowTree → Prop)
+    (onError : BorrowTree.ProtectorReleaseStatus → BorrowTree → Prop)
+    (tree : BorrowTree) : Prop :=
+  match tree.indexOfTag tag with
+  | none => onError (.MissingTag tag) tree
+  | some _ =>
+    protectorReleaseSkipScanPre tag post onError
+      (List.range' 0 tree.locations.entries.size) tree
+
+/-- **Genuine inductive per-segment bidirectional `↔` theorem `protectorReleaseSymbolicPre_iff`**
+proved by structural induction on `List.range' 0 tree.locations.entries.size` directly over
+unmodified `Miri.TreeBorrows.BorrowTree.releaseProtector` (handling `.MissingTag`,
+`.RangeMapFailure`, absent/`associatedAccess = none`/`accessed = false` segment skips,
+`.ExposureUpdateFailure`, and `.Released`). Combined with the concrete 2-segment accessed-prefix
+witness `protector_release_committed_prefix_on_error_witness` below, this covers both universal
+segment-skipping induction and accessed-segment committed-prefix error states! -/
+theorem protectorReleaseSymbolicPre_iff (tag : BorTag) (tags : ProtectedTags)
+    (post : Unit → BorrowTree → Prop)
+    (onError : BorrowTree.ProtectorReleaseStatus → BorrowTree → Prop)
+    (tree : BorrowTree)
+    (hSkipped : ∀ source, tree.indexOfTag tag = some source →
+      ∀ pos ∈ List.range' 0 tree.locations.entries.size,
+      ∀ seg, tree.locations.index pos = .ok seg →
+        protectorReleaseSegmentSkipped source seg) :
+    AnnealExactWP (protectorReleaseAction tag tags) post onError tree ↔
+      protectorReleaseSymbolicPre tag post onError tree := by
+  unfold AnnealExactWP protectorReleaseAction protectorReleaseSymbolicPre BorrowTree.releaseProtector
+  simp only [Id.run]
+  cases hIdx : tree.indexOfTag tag with
+  | none =>
+    simp only [pure, Pure.pure]
+  | some source =>
+    have hSk := hSkipped source hIdx
+    simp only [Std.Legacy.Range.forIn_eq_forIn_range']
+    have hSize : ([:tree.locations.entries.size] : Std.Legacy.Range).size =
+        tree.locations.entries.size := by
+      simp [Std.Legacy.Range.size]
+    simp only [hSize]
+    clear hIdx hSize hSkipped
+    revert hSk
+    induction List.range' 0 tree.locations.entries.size with
+    | nil =>
+      intro _
+      simp only [protectorReleaseSkipScanPre, List.forIn_nil, bind, Bind.bind, pure, Pure.pure]
+      cases (tree.updateExposureForProtectorRelease tag).outcome with
+      | error _ => simp only
+      | ok u => cases u; simp only
+    | cons position rest ih =>
+      intro hSk
+      simp only [protectorReleaseSkipScanPre, List.forIn_cons, bind, Bind.bind, pure, Pure.pure]
+      cases hLoc : tree.locations.index position with
+      | error _ => simp only
+      | ok segment =>
+        dsimp only
+        have hSeg := hSk position List.mem_cons_self segment hLoc
+        have hRest : ∀ pos ∈ rest, ∀ seg, tree.locations.index pos = .ok seg →
+            protectorReleaseSegmentSkipped source seg :=
+          fun pos hp => hSk pos (List.mem_cons_of_mem position hp)
+        unfold protectorReleaseSegmentSkipped at hSeg
+        cases hPerm : segment.data.perms.get source with
+        | none =>
+          dsimp only
+          exact ih hRest
+        | some state =>
+          dsimp only
+          simp only [hPerm] at hSeg
+          cases hAssoc : state.permission.associatedAccess with
+          | none =>
+            dsimp only
+            exact ih hRest
+          | some _ =>
+            dsimp only
+            simp only [hAssoc] at hSeg
+            simp only [hSeg, Bool.false_eq_true, ↓reduceIte]
+            exact ih hRest
 
 /-- Multi-access sequence over `BorrowTree` instantiating `Anneal.ExactWpAndSmartCtors.TreeBorrowsFrameWP`. -/
 def tbAccessStepSpec (spec : ProvenanceExtra × Size × Size × AccessKind × ProtectedTags × Tree.ChildrenVisitMode) :
@@ -2179,11 +2692,18 @@ theorem ep2_lean_miri_exact_wp_and_memory_frame_capstone :
     (type_of% @allocWriteUninit_disjoint_readScalar_frame_eq) ∧
     (type_of% @allocWriteBytes_disjoint_readScalar_frame_eq) ∧
     (type_of% @allocCopy_disjoint_readScalar_frame_eq) ∧
+    (type_of% @allocWriteScalar_disjoint_readScalar_ptr_frame_eq) ∧
+    (type_of% @allocWriteScalar_disjoint_readScalar_ptr_frame_exactWP) ∧
+    (type_of% @allocWriteUninit_disjoint_readScalar_ptr_frame_eq) ∧
+    (type_of% @allocWriteUninit_disjoint_readScalar_ptr_frame_exactWP) ∧
+    (type_of% @allocWriteBytes_disjoint_readScalar_ptr_frame_eq) ∧
+    (type_of% @allocCopy_disjoint_readScalar_ptr_frame_eq) ∧
     (type_of% @allocEndian_le_vs_be_disjoint_frame_witness) ∧
     (type_of% @tbAccessExactWP_iff) ∧
     (type_of% @tbDeallocExactWP_iff) ∧
     (type_of% @tbDealloc_accessFailure_retains_tree) ∧
     (type_of% @protectorReleaseExactWP_iff) ∧
+    (type_of% @protectorReleaseSymbolicPre_iff) ∧
     (type_of% @protectorRelease_missingTag_exactWP) ∧
     (type_of% @tb_access_committed_prefix_on_error_witness) ∧
     (type_of% @protector_release_committed_prefix_on_error_witness) ∧
@@ -2207,9 +2727,16 @@ theorem ep2_lean_miri_exact_wp_and_memory_frame_capstone :
    @allocCopy_disjoint_readScalar_frame_exactWP,
    @allocWriteScalar_disjoint_readScalar_frame_eq, @allocWriteUninit_disjoint_readScalar_frame_eq,
    @allocWriteBytes_disjoint_readScalar_frame_eq, @allocCopy_disjoint_readScalar_frame_eq,
+   @allocWriteScalar_disjoint_readScalar_ptr_frame_eq,
+   @allocWriteScalar_disjoint_readScalar_ptr_frame_exactWP,
+   @allocWriteUninit_disjoint_readScalar_ptr_frame_eq,
+   @allocWriteUninit_disjoint_readScalar_ptr_frame_exactWP,
+   @allocWriteBytes_disjoint_readScalar_ptr_frame_eq,
+   @allocCopy_disjoint_readScalar_ptr_frame_eq,
    @allocEndian_le_vs_be_disjoint_frame_witness,
    @tbAccessExactWP_iff, @tbDeallocExactWP_iff, @tbDealloc_accessFailure_retains_tree,
-   @protectorReleaseExactWP_iff, @protectorRelease_missingTag_exactWP,
+   @protectorReleaseExactWP_iff, @protectorReleaseSymbolicPre_iff,
+   @protectorRelease_missingTag_exactWP,
    @tb_access_committed_prefix_on_error_witness,
    @protector_release_committed_prefix_on_error_witness,
    @miriStepExactWP_iff, @miriAllowedStepExactWP_iff, @miriBodyExactWP_iff,
