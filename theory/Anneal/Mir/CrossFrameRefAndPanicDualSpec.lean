@@ -1552,6 +1552,321 @@ theorem trustedCrossFramePanicObserve_matches_expected (idx : Nat) :
     rw [trustedCrossFramePanicObserve_out_of_range idx hge,
         trustedExpected_out_of_range idx hge]
 
+/-- Iterate unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn` for exactly `n`
+running steps, returning the live intermediate `MachineState` (or `none` if execution halts or
+faults before `n` steps). -/
+def runTrustedTrace (body : CapturedMir) : Nat → MachineState → Option MachineState
+  | 0, s => some s
+  | n + 1, s =>
+    match stepMirFn body s with
+    | .tau (.running s') => runTrustedTrace body n s'
+    | _ => none
+
+/-- Read an initialized `u32` scalar from local `loc` of the root frame (bottom of `callStack`,
+or the current frame when `callStack = []`). -/
+def readRootLocalU32 (s : MachineState) (loc : Nat) : Option Nat :=
+  let rootLocals : List LocalSlot := match s.memory.callStack.getLast? with
+    | some bottom => bottom.frame.locals
+    | none => s.frame.locals
+  match get? rootLocals loc with
+  | .some (.init (.scalar sc)) => some sc.bits
+  | _ => none
+
+/-- Causal protector-release contrast for Case `21` on unmodified `Trusted.MirSemantics`
+(mirroring MiniRust's `mrProg21PrematureWrite`): identical to `mirCase21` except `caller` also
+passes its parent raw pointer `_2` to `callee`, and `callee` writes `65` through that parent raw
+pointer BEFORE unwinding while `callee`'s `FnEntry` protector is still active -> `.ub`. -/
+def mirCase21PrematureWrite : CapturedMir × List CapturedMir :=
+  let callee := mkBody "ep1::c21_premature_callee"
+    [decl tyUnit, decl tyMutRefU32, decl tyRawMutU32] 2
+    [bb [st (.retag .fnEntry (pl 1)),
+         st (.assign (plDeref 1) (.use (cU32Op 55))),
+         st (.assign (plDeref 2) (.use (cU32Op 65)))]
+        (.assert (cBoolOp false) true 1 .continue_),
+     bb [st (.assign (pl 0) (.aggregate .tuple []))] .return_]
+  let caller := mkBody "ep1::c21_premature_caller"
+    [decl tyUnit, decl tyMutRefU32, decl tyRawMutU32, decl tyMutRefU32, decl tyUnit] 1
+    [bb [st (.retag .fnEntry (pl 1)),
+         st (.assign (pl 2) (.rawPtr .mut (plDeref 1))),
+         st (.assign (pl 3) (.ref (.mut false) (plDeref 2)))]
+        (.call (cFnOp "ep1::c21_premature_callee") [opCopy 3, opCopy 2] (pl 4) (some 1) (.cleanup 2)),
+     bb [st (.assign (pl 0) (.aggregate .tuple []))] .return_,
+     bb [st (.assign (plDeref 2) (.binaryOp .add (opDeref 2) (cU32Op 10)))] .unwindResume true]
+  let main := mkBody "ep1::c21_premature_main"
+    [decl tyObsTuple, decl tyU32, decl tyMutRefU32, decl tyUnit] 0
+    [bb [st (.assign (pl 1) (.use (cU32Op 10))),
+         st (.assign (pl 2) (.ref (.mut false) (pl 1)))]
+        (.call (cFnOp "ep1::c21_premature_caller") [opCopy 2] (pl 3) (some 1) (.cleanup 2)),
+     bb [packObs 0 (cU32Op 0) (opCopy 1)] .return_,
+     bb [packObs 1 (opCopy 1) (opCopy 1)] .return_ true]
+  (main, [caller, callee])
+
+/-- Decidable checker for a 2-frame unwind protector-release trace (`step 15 → step 16 → step 18`)
+over any `body : CapturedMir` and initial `sInit : MachineState`. -/
+def case21TraceCheck (body : CapturedMir) (sInit : MachineState) : Bool :=
+  match runTrustedTrace body 15 sInit with
+  | some s15 =>
+    match stepMirFn body s15 with
+    | .tau (.running s16) =>
+      match runTrustedTrace body 2 s16 with
+      | some s18 =>
+        match s15.memory.borrows.find? (fun e => e.protector == some 2),
+              s15.memory.borrows.find? (fun e => e.protector == some 1) with
+        | some eCallee, some eCaller =>
+          decide (s15.memory.callStack.length = 2) &&
+          decide (s15.memory.activeProtectors = [2, 1]) &&
+          decide (eCallee.protector = some 2) &&
+          decide (eCaller.protector = some 1) &&
+          isBorrowProtected s15.memory.activeProtectors eCallee &&
+          isBorrowProtected s15.memory.activeProtectors eCaller &&
+          decide (readRootLocalU32 s15 1 = some 55) &&
+          decide (s16.frame.blockIdx = 2) &&
+          decide (s16.memory.callStack.length = 1) &&
+          decide (s16.memory.activeProtectors = [1]) &&
+          !isBorrowProtected s16.memory.activeProtectors eCallee &&
+          isBorrowProtected s16.memory.activeProtectors eCaller &&
+          decide (readRootLocalU32 s16 1 = some 55) &&
+          decide (s18.frame.blockIdx = 2) &&
+          decide (s18.memory.callStack.isEmpty) &&
+          decide (s18.memory.activeProtectors = []) &&
+          !isBorrowProtected s18.memory.activeProtectors eCallee &&
+          !isBorrowProtected s18.memory.activeProtectors eCaller &&
+          decide (readRootLocalU32 s18 1 = some 65)
+        | _, _ => false
+      | none => false
+    | _ => false
+  | none => false
+
+private theorem case21TraceCheck_sound (body : CapturedMir) (sInit : MachineState)
+    (hCheck : case21TraceCheck body sInit = true) :
+    ∃ s15 s16 s18 eCallee eCaller,
+      runTrustedTrace body 15 sInit = some s15 ∧
+      stepMirFn body s15 = .tau (.running s16) ∧
+      runTrustedTrace body 2 s16 = some s18 ∧
+      s15.memory.callStack.length = 2 ∧
+      s15.memory.activeProtectors = [2, 1] ∧
+      eCallee ∈ s15.memory.borrows ∧
+      eCaller ∈ s15.memory.borrows ∧
+      eCallee.protector = some 2 ∧
+      eCaller.protector = some 1 ∧
+      isBorrowProtected s15.memory.activeProtectors eCallee = true ∧
+      isBorrowProtected s15.memory.activeProtectors eCaller = true ∧
+      readRootLocalU32 s15 1 = some 55 ∧
+      s16.frame.blockIdx = 2 ∧
+      s16.memory.callStack.length = 1 ∧
+      s16.memory.activeProtectors = [1] ∧
+      isBorrowProtected s16.memory.activeProtectors eCallee = false ∧
+      isBorrowProtected s16.memory.activeProtectors eCaller = true ∧
+      readRootLocalU32 s16 1 = some 55 ∧
+      s18.frame.blockIdx = 2 ∧
+      s18.memory.callStack = [] ∧
+      s18.memory.activeProtectors = [] ∧
+      isBorrowProtected s18.memory.activeProtectors eCallee = false ∧
+      isBorrowProtected s18.memory.activeProtectors eCaller = false ∧
+      readRootLocalU32 s18 1 = some 65 := by
+  unfold case21TraceCheck at hCheck
+  cases h15 : runTrustedTrace body 15 sInit with
+  | none => rw [h15] at hCheck; cases hCheck
+  | some s15 =>
+    rw [h15] at hCheck; dsimp only at hCheck
+    cases h16 : stepMirFn body s15 with
+    | tau st16 =>
+      cases st16 with
+      | running s16 =>
+        rw [h16] at hCheck; dsimp only at hCheck
+        cases h18 : runTrustedTrace body 2 s16 with
+        | none => rw [h18] at hCheck; cases hCheck
+        | some s18 =>
+          rw [h18] at hCheck; dsimp only at hCheck
+          cases hEC : s15.memory.borrows.find? (fun e => e.protector == some 2) with
+          | none => rw [hEC] at hCheck; cases hCheck
+          | some eCallee =>
+            cases hER : s15.memory.borrows.find? (fun e => e.protector == some 1) with
+            | none => rw [hEC, hER] at hCheck; cases hCheck
+            | some eCaller =>
+              rw [hEC, hER] at hCheck; dsimp only at hCheck
+              simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq,
+                List.isEmpty_iff] at hCheck
+              obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩,
+                h11⟩, h12⟩, h13⟩, h14⟩, h15'⟩, h16'⟩, h17⟩, h18'⟩, h19⟩ := hCheck
+              exact ⟨s15, s16, s18, eCallee, eCaller, rfl, h16, h18,
+                h1, h2, List.mem_of_find?_eq_some hEC, List.mem_of_find?_eq_some hER,
+                h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15', h16', h17, h18', h19⟩
+      | halted _ => rw [h16] at hCheck; cases hCheck
+      | faulted _ => rw [h16] at hCheck; cases hCheck
+    | ret _ => rw [h16] at hCheck; cases hCheck
+    | vis _ _ => rw [h16] at hCheck; cases hCheck
+
+/-- **Live multi-step `stepMirFn` unwind protector-release trace on Case `21`** (non-tautological
+execution theorem directly on unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`):
+1. At step `15` (inside `ep1::c21_callee`, right after `.retag .fnEntry` and `*r = 55`, before
+   failing `assert(..., .continue_)`): `callStack.length = 2`, `activeProtectors = [2, 1]`,
+   real borrow entries `eCallee` (`protector = some 2`) and `eCaller` (`protector = some 1`) in
+   `memory.borrows` are BOTH protected (`isBorrowProtected = true`), and root `_1 = 55`.
+2. Immediately after the single unwind step `15 → 16` landing in `ep1::c21_caller` cleanup `bb2`:
+   `frame.blockIdx = 2`, `callStack.length = 1`, `activeProtectors = [1]` (callee protector `2`
+   stripped!), `isBorrowProtected s16.memory.activeProtectors eCallee = false`, while
+   `isBorrowProtected s16.memory.activeProtectors eCaller = true` (strict LIFO!), and root `_1 = 55`.
+3. Immediately after caller cleanup writes `65` and `unwindResume`s into `ep1::c21_main` catch
+   `bb2` (step `18`): `frame.blockIdx = 2`, `callStack = []`, `activeProtectors = []` (both
+   protectors released!), BOTH `eCallee` and `eCaller` are unprotected, and root `_1 = 65`! -/
+theorem trusted_case21_live_unwind_protector_release_trace :
+    let sInit := initMachineStateWithCallees mirCase21.1 [] mirCase21.2
+    ∃ s15 s16 s18 eCallee eCaller,
+      runTrustedTrace mirCase21.1 15 sInit = some s15 ∧
+      stepMirFn mirCase21.1 s15 = .tau (.running s16) ∧
+      runTrustedTrace mirCase21.1 2 s16 = some s18 ∧
+      -- Step 15 (callee before panic): both protectors active, partial writeback 55 visible
+      s15.memory.callStack.length = 2 ∧
+      s15.memory.activeProtectors = [2, 1] ∧
+      eCallee ∈ s15.memory.borrows ∧
+      eCaller ∈ s15.memory.borrows ∧
+      eCallee.protector = some 2 ∧
+      eCaller.protector = some 1 ∧
+      isBorrowProtected s15.memory.activeProtectors eCallee = true ∧
+      isBorrowProtected s15.memory.activeProtectors eCaller = true ∧
+      readRootLocalU32 s15 1 = some 55 ∧
+      -- Step 16 (caller cleanup bb2 after unwind): callee protector 2 released, caller 1 preserved!
+      s16.frame.blockIdx = 2 ∧
+      s16.memory.callStack.length = 1 ∧
+      s16.memory.activeProtectors = [1] ∧
+      isBorrowProtected s16.memory.activeProtectors eCallee = false ∧
+      isBorrowProtected s16.memory.activeProtectors eCaller = true ∧
+      readRootLocalU32 s16 1 = some 55 ∧
+      -- Step 18 (main catch bb2 after caller unwindResume): all protectors released, root = 65!
+      s18.frame.blockIdx = 2 ∧
+      s18.memory.callStack = [] ∧
+      s18.memory.activeProtectors = [] ∧
+      isBorrowProtected s18.memory.activeProtectors eCallee = false ∧
+      isBorrowProtected s18.memory.activeProtectors eCaller = false ∧
+      readRootLocalU32 s18 1 = some 65 :=
+  case21TraceCheck_sound mirCase21.1
+    (initMachineStateWithCallees mirCase21.1 [] mirCase21.2) (by kernel_rfl)
+
+/-- Decidable checker for a 3-frame LIFO `.continue_` unwind trace (`step 13 → step 14`)
+over any `body : CapturedMir` and initial `sInit : MachineState`. -/
+def case23TraceCheck (body : CapturedMir) (sInit : MachineState) : Bool :=
+  match runTrustedTrace body 13 sInit with
+  | some s13 =>
+    match stepMirFn body s13 with
+    | .tau (.running s14) =>
+      match s13.memory.borrows.find? (fun e => e.protector == some 2),
+            s13.memory.borrows.find? (fun e => e.protector == some 1) with
+      | some eLeaf, some eMid =>
+        decide (s13.memory.callStack.length = 2) &&
+        decide (s13.memory.activeProtectors = [2, 1]) &&
+        decide (eLeaf.protector = some 2) &&
+        decide (eMid.protector = some 1) &&
+        isBorrowProtected s13.memory.activeProtectors eLeaf &&
+        isBorrowProtected s13.memory.activeProtectors eMid &&
+        decide (readRootLocalU32 s13 1 = some 3) &&
+        decide (s14.frame.blockIdx = 2) &&
+        decide (s14.memory.callStack.isEmpty) &&
+        decide (s14.memory.activeProtectors = []) &&
+        !isBorrowProtected s14.memory.activeProtectors eLeaf &&
+        !isBorrowProtected s14.memory.activeProtectors eMid &&
+        decide (readRootLocalU32 s14 1 = some 3)
+      | _, _ => false
+    | _ => false
+  | none => false
+
+private theorem case23TraceCheck_sound (body : CapturedMir) (sInit : MachineState)
+    (hCheck : case23TraceCheck body sInit = true) :
+    ∃ s13 s14 eLeaf eMid,
+      runTrustedTrace body 13 sInit = some s13 ∧
+      stepMirFn body s13 = .tau (.running s14) ∧
+      s13.memory.callStack.length = 2 ∧
+      s13.memory.activeProtectors = [2, 1] ∧
+      eLeaf ∈ s13.memory.borrows ∧
+      eMid ∈ s13.memory.borrows ∧
+      eLeaf.protector = some 2 ∧
+      eMid.protector = some 1 ∧
+      isBorrowProtected s13.memory.activeProtectors eLeaf = true ∧
+      isBorrowProtected s13.memory.activeProtectors eMid = true ∧
+      readRootLocalU32 s13 1 = some 3 ∧
+      s14.frame.blockIdx = 2 ∧
+      s14.memory.callStack = [] ∧
+      s14.memory.activeProtectors = [] ∧
+      isBorrowProtected s14.memory.activeProtectors eLeaf = false ∧
+      isBorrowProtected s14.memory.activeProtectors eMid = false ∧
+      readRootLocalU32 s14 1 = some 3 := by
+  unfold case23TraceCheck at hCheck
+  cases h13 : runTrustedTrace body 13 sInit with
+  | none => rw [h13] at hCheck; cases hCheck
+  | some s13 =>
+    rw [h13] at hCheck; dsimp only at hCheck
+    cases h14 : stepMirFn body s13 with
+    | tau st14 =>
+      cases st14 with
+      | running s14 =>
+        rw [h14] at hCheck; dsimp only at hCheck
+        cases hEL : s13.memory.borrows.find? (fun e => e.protector == some 2) with
+        | none => rw [hEL] at hCheck; cases hCheck
+        | some eLeaf =>
+          cases hEM : s13.memory.borrows.find? (fun e => e.protector == some 1) with
+          | none => rw [hEL, hEM] at hCheck; cases hCheck
+          | some eMid =>
+            rw [hEL, hEM] at hCheck; dsimp only at hCheck
+            simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq,
+              List.isEmpty_iff] at hCheck
+            obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩,
+              h11⟩, h12⟩, h13'⟩ := hCheck
+            exact ⟨s13, s14, eLeaf, eMid, rfl, h14,
+              h1, h2, List.mem_of_find?_eq_some hEL, List.mem_of_find?_eq_some hEM,
+              h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13'⟩
+      | halted _ => rw [h14] at hCheck; cases hCheck
+      | faulted _ => rw [h14] at hCheck; cases hCheck
+    | ret _ => rw [h14] at hCheck; cases hCheck
+    | vis _ _ => rw [h14] at hCheck; cases hCheck
+
+/-- **Live 3-frame LIFO `.continue_` unwind trace on Case `23`** (`main → mid → leaf`) directly
+on unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`:
+- At step `13` (inside `ep1::c23_leaf`, right before failing `assert(..., .continue_)`):
+  `callStack.length = 2`, `activeProtectors = [2, 1]`, real borrow entries `eLeaf` and `eMid` in
+  `memory.borrows` are BOTH protected, and root `_1 = 3`.
+- Immediately after the single multi-frame unwind step `13 → 14` popping `leaf` AND skipping `mid`
+  (`.continue_`) into `ep1::c23_main` cleanup `bb2`: `frame.blockIdx = 2`, `callStack = []`,
+  `activeProtectors = []`, BOTH `eLeaf` and `eMid` are unprotected (`isBorrowProtected = false`),
+  and root `_1 = 3` (pre-panic partial `&mut` writeback preserved across 2 popped frames!). -/
+theorem trusted_case23_three_frame_lifo_unwind_trace :
+    let sInit := initMachineStateWithCallees mirCase23.1 [] mirCase23.2
+    ∃ s13 s14 eLeaf eMid,
+      runTrustedTrace mirCase23.1 13 sInit = some s13 ∧
+      stepMirFn mirCase23.1 s13 = .tau (.running s14) ∧
+      s13.memory.callStack.length = 2 ∧
+      s13.memory.activeProtectors = [2, 1] ∧
+      eLeaf ∈ s13.memory.borrows ∧
+      eMid ∈ s13.memory.borrows ∧
+      eLeaf.protector = some 2 ∧
+      eMid.protector = some 1 ∧
+      isBorrowProtected s13.memory.activeProtectors eLeaf = true ∧
+      isBorrowProtected s13.memory.activeProtectors eMid = true ∧
+      readRootLocalU32 s13 1 = some 3 ∧
+      s14.frame.blockIdx = 2 ∧
+      s14.memory.callStack = [] ∧
+      s14.memory.activeProtectors = [] ∧
+      isBorrowProtected s14.memory.activeProtectors eLeaf = false ∧
+      isBorrowProtected s14.memory.activeProtectors eMid = false ∧
+      readRootLocalU32 s14 1 = some 3 :=
+  case23TraceCheck_sound mirCase23.1
+    (initMachineStateWithCallees mirCase23.1 [] mirCase23.2) (by kernel_rfl)
+
+/-- **Causal unwind protector-release contrast across BOTH `Trusted.MirSemantics` and `MiniRust`**:
+attempting the parent write BEFORE callee unwind releases the `FnEntry` protector faults with `.ub`
+on BOTH unmodified `Trusted.MirSemantics.stepMirFn` (`mirCase21PrematureWrite`) and MiniRust
+`MachTB` (`mrProg21PrematureWrite`), whereas performing the exact same parent write AFTER callee
+unwind in Case `21` succeeds on BOTH (`.okCleanupRecovered 65 65`). -/
+theorem trusted_case21_premature_parent_write_ub_contrast :
+    runTrustedObs mirCase21PrematureWrite.1 mirCase21PrematureWrite.2 true 120 = .ub ∧
+    trustedCrossFramePanicObserve 21 = .okCleanupRecovered 65 65 ∧
+    ofMrObs (MiniRustSpec.CrossFrameRefAndPanicMR.runProgramObsM (M := MiniRustSpec.Interp.TBM)
+      ({ implicit_writes := true } : MiniRustSpec.Gen.TreeBorrowsParams)
+      MiniRustSpec.CrossFrameRefAndPanicMR.mrProg21PrematureWrite 120) = .ub := by
+  refine ⟨?_, ?_, ?_⟩
+  · kernel_rfl
+  · rw [trustedCrossFramePanicObserve_matches_expected]; rfl
+  · rw [MiniRustSpec.CrossFrameRefAndPanicMR.mr_case21_premature_parent_write_ub_contrast.2.1]; rfl
+
 /-- **Total 3-way exact agreement & exact root-ceiling divergence `↔` theorem** (for ALL `idx : Nat`):
 1. For every `idx ≠ 27` (`0..26` and `≥ 28`), unmodified `Trusted.MirSemantics.stepMirFn`,
    MiniRust `MachTB`, and LeanMiri (`treeBorrows = true`) agree identically.
@@ -1969,6 +2284,9 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       (type_of% @trusted_unwind_continue_chain_root_boundary) ∧
       (type_of% @trustedCrossFramePanicObserve_table) ∧
       (type_of% @trustedCrossFramePanicObserve_out_of_range) ∧
+      (type_of% @trusted_case21_live_unwind_protector_release_trace) ∧
+      (type_of% @trusted_case23_three_frame_lifo_unwind_trace) ∧
+      (type_of% @trusted_case21_premature_parent_write_ub_contrast) ∧
       (type_of% (contract_three_way_and_root_ceiling_exact c))) ∧
     ((type_of% (crossFramePanicDualBundle_projections c)) ∧
       (type_of% (mrLmModeStepRel_not_mode_invariant c))) ∧
@@ -1987,6 +2305,9 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       @hasFrameDeallocProtectorConflict_iff, @trusted_unwind_continue_chain_to_cleanup,
       @trusted_unwind_releases_callee_protector, @trusted_unwind_continue_chain_root_boundary,
       @trustedCrossFramePanicObserve_table, @trustedCrossFramePanicObserve_out_of_range,
+      @trusted_case21_live_unwind_protector_release_trace,
+      @trusted_case23_three_frame_lifo_unwind_trace,
+      @trusted_case21_premature_parent_write_ub_contrast,
       contract_three_way_and_root_ceiling_exact c⟩,
     ⟨crossFramePanicDualBundle_projections c, mrLmModeStepRel_not_mode_invariant c⟩,
     ⟨canonical_cells_nondegenerate, bundle_unsupported_iff_abort c,
@@ -2049,6 +2370,14 @@ run_cmd do
       (ns ++ `trusted_unwind_releases_callee_protector,
         `Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowProtected),
       (ns ++ `trustedCrossFramePanicObserve_table,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `trusted_case21_live_unwind_protector_release_trace,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `trusted_case21_live_unwind_protector_release_trace,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowProtected),
+      (ns ++ `trusted_case23_three_frame_lifo_unwind_trace,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `trusted_case21_premature_parent_write_ub_contrast,
         `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mkCrossFramePanicDualBundle,
         `Anneal.DualCorrespondenceBundle.DualCorrespondenceBundle),

@@ -410,6 +410,48 @@ theorem evalResumeUnwindM_dispatch {M : Type} [Memory M] [MemoryOps M]
     unfold evalResumeUnwindM
     simp only [hTid, hLast, hSet, hDealloc, hEnd, hAct, pure, Except.pure, bind, Except.bind, ub]
 
+/-- **Universal `Terminator::StartUnwind` & `Terminator::StopUnwind` LIFO & empty-stack UB laws**
+across EVERY memory model `M` (`Mach` & `MachTB`):
+1. `StartUnwind` pushes `payload.thin_pointer` onto `t.unwind_payloads` and jumps to `unwindBb`;
+2. `StopUnwind` on a thread whose payload stack is `ps ++ [p]` pops `p` (restoring exact `ps`)
+   and jumps to `catchBb`;
+3. `StopUnwind` on an empty payload stack (`t.unwind_payloads = []`) unconditionally faults with
+   `Stop.ub "StopUnwind: the payload stack is empty"`. -/
+theorem evalTerminatorM_start_stop_unwind_lifo {M : Type} [Memory M] [MemoryOps M]
+    (m m1 : Machine M) (payloadExpr : ValueExpr)
+    (payload : Pointer (Memory.Provenance M)) (unwindBb catchBb : BbName) :
+    (∀ (t : Thread M) (threads' : List (Thread M)),
+      evalValueM m payloadExpr = .ok ((.Ptr payload, .Ptr (.Raw .None)), m1) →
+      activeThreadM m1 = .ok t →
+      listSet m1.threads m1.active_thread
+        { t with unwind_payloads := t.unwind_payloads ++ [payload.thin_pointer] } "mutate_at" =
+        .ok threads' →
+      evalTerminatorM m (.StartUnwind payloadExpr unwindBb) =
+        jumpToBlockM { m1 with threads := threads' } unwindBb) ∧
+    (∀ (t : Thread M) (ps : List (ThinPointer (Memory.Provenance M)))
+       (p : ThinPointer (Memory.Provenance M)) (threads' : List (Thread M)),
+      activeThreadM m = .ok t →
+      t.unwind_payloads = ps ++ [p] →
+      listSet m.threads m.active_thread { t with unwind_payloads := ps } "mutate_at" = .ok threads' →
+      evalTerminatorM m (.StopUnwind catchBb) =
+        jumpToBlockM { m with threads := threads' } catchBb) ∧
+    (∀ (t : Thread M),
+      activeThreadM m = .ok t →
+      t.unwind_payloads = [] →
+      evalTerminatorM m (.StopUnwind catchBb) =
+        .error (.ub "StopUnwind: the payload stack is empty")) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro t threads' hVal hTid hSet
+    unfold evalTerminatorM mutateActiveThreadM
+    simp only [hVal, hTid, hSet, pure, Except.pure, bind, Except.bind]
+  · intro t ps p threads' hTid hPay hSet
+    unfold evalTerminatorM mutateActiveThreadM
+    simp only [hTid, hPay, List.getLast?_concat, List.dropLast_concat, hSet, pure, Except.pure,
+      bind, Except.bind]
+  · intro t hTid hEmpty
+    unfold evalTerminatorM mutateActiveThreadM
+    simp only [hTid, hEmpty, List.getLast?_nil, bind, Except.bind, ub]
+
 /-- **Universal Tree Borrows protected foreign-write UB ↔ `prevents_deallocation` law**:
 for EVERY `p : PermissionProt`, a foreign write (`Permission.transition (.Prot p) .Write .Foreign`)
 faults with UB if and only if `PermissionProt.prevents_deallocation p = true` (`Unique`,
@@ -1737,6 +1779,83 @@ theorem mr_root_unwind_boundary_vs_catch_harness :
       mrProgRootUnwindCaught 120 = .unwound 77 := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
+/-- **`MachTB.wfLive` preservation on `mrProgRootUnwindCaught`**: executing the outer-catch-harness
+root-unwind program preserves the live-allocation Tree Borrows invariant at every fuel bound. -/
+theorem mrProgRootUnwindCaught_tb_wfLive (m0 : MachTB)
+    (hBoot : bootProgramM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams)
+      mrProgRootUnwindCaught = .ok m0)
+    (fuel : Nat) :
+    match runToStopM fuel m0 with
+    | .ok mEnd => MachTB.wfLive mEnd
+    | .error (_, mStop) => MachTB.wfLive mStop :=
+  runToStopM_tb_wfLive fuel
+    (bootProgramM_tb_wfLive ({ implicit_writes := true } : TreeBorrowsParams)
+      mrProgRootUnwindCaught m0 hBoot)
+
+/-- **Causal protector-release contrast for Case `21` (`mrProg21PrematureWrite`)**:
+identical to `mrProg21` except `caller` also passes its parent raw pointer (`locId 2`) to `callee`,
+and `callee` attempts the parent write BEFORE `ResumeUnwind` (`ConcurrentMemory.end_call`) has
+released `callee`'s `FnEntry` strong protector. Under `MachTB` this faults with Tree Borrows
+foreign-write protector UB, whereas under `mrProg21` the exact same parent write in `caller`'s
+cleanup block AFTER `ResumeUnwind` succeeds — proving `ResumeUnwind`'s protector release is
+causally necessary! -/
+def mrProg21PrematureWrite : Program :=
+  let callee := mkFn [(locId 0, u32Ty), (locId 1, mutRefU32Ty), (locId 2, rawThinTy)]
+    [locId 1, locId 2] (locId 0)
+    [(bbId 0, ⟨[
+      .Validate (.Local (locId 1)) true,
+      .Assign (.Deref (.Load (.Local (locId 1))) u32Ty) (cU32 55),
+      .Assign (.Deref (.Load (.Local (locId 2))) u32Ty) (cU32 65)
+    ], .StartUnwind cNullRaw (bbId 1), .Regular⟩),
+     (bbId 1, ⟨[], .ResumeUnwind, .Cleanup⟩)]
+  let caller := mkFn [(locId 0, u32Ty), (locId 1, mutRefU32Ty), (locId 2, rawThinTy), (locId 3, u32Ty)]
+    [locId 1] (locId 0)
+    [(bbId 0, ⟨[
+      .Validate (.Local (locId 1)) true,
+      .StorageLive (locId 2),
+      .StorageLive (locId 3),
+      .Assign (.Local (locId 2)) (.AddrOf (.Deref (.Load (.Local (locId 1))) u32Ty) (.Raw .None))
+    ], .Call (cFn 2) .Rust
+         [.ByValue (.AddrOf (.Deref (.Load (.Local (locId 2))) u32Ty) mutRefU32PtrTy),
+          .ByValue (.Load (.Local (locId 2)))]
+         (.Local (locId 3)) (some (bbId 1)) (some (bbId 2)), .Regular⟩),
+     (bbId 1, ⟨[.Assign (.Local (locId 0)) (.Load (.Local (locId 3)))], .Return, .Regular⟩),
+     (bbId 2, ⟨[
+      .Assign (.Deref (.Load (.Local (locId 2))) u32Ty)
+        (.BinOp (.Int .Add) (.Load (.Deref (.Load (.Local (locId 2))) u32Ty)) (cU32 10))
+    ], .ResumeUnwind, .Cleanup⟩)]
+  let main := mkFn
+    [(locId 0, u32Ty), (locId 1, u32Ty), (locId 2, u32Ty), (locId 3, u32Ty), (locId 4, u32Ty)]
+    [] (locId 0)
+    [(bbId 0, ⟨[
+      .StorageLive (locId 3),
+      .StorageLive (locId 4),
+      .Assign (.Local (locId 3)) (cU32 10)
+    ], .Call (cFn 1) .Rust [.ByValue (.AddrOf (.Local (locId 3)) mutRefU32PtrTy)]
+         (.Local (locId 4)) (some (bbId 1)) (some (bbId 2)), .Regular⟩),
+     (bbId 1, ⟨finishStmts 0 (.Load (.Local (locId 4))) (.Load (.Local (locId 3))),
+               exitTerm, .Regular⟩),
+     (bbId 2, ⟨[], .StopUnwind (bbId 3), .Catch⟩),
+     (bbId 3, ⟨finishStmts 1 (.Load (.Local (locId 3))) (.Load (.Local (locId 3))),
+               exitTerm, .Regular⟩)]
+  mkProg [(fnId 0, main), (fnId 1, caller), (fnId 2, callee)]
+
+/-- **Causal unwind protector-release contrast on `MachTB` vs `Mach`**:
+- Premature parent write before `ResumeUnwind` fails on `MachTB` with exact Tree Borrows protector
+  UB (`"Tree Borrows: foreign read of protected Unique reference"`) while succeeding on `Mach`
+  (`.okCleanupRecovered 75 75`).
+- The same parent write AFTER `ResumeUnwind` (`mrProg21`) succeeds on `MachTB`
+  (`.okCleanupRecovered 65 65`). -/
+theorem mr_case21_premature_parent_write_ub_contrast :
+    runProgramObsM (M := BM) () mrProg21PrematureWrite 120 = .okCleanupRecovered 75 75 ∧
+    runProgramObsM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams)
+      mrProg21PrematureWrite 120 = .ub ∧
+    runStopMsgTB mrProg21PrematureWrite =
+      some "Tree Borrows: foreign read of protected Unique reference" ∧
+    runProgramObsM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams)
+      mrProg21 120 = .okCleanupRecovered 65 65 := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
 end CanonicalMrPrograms
 
 /-! ## §5. Episode 1 MiniRust Capstone & Silent Axiom / Import-Isolation Audit -/
@@ -1752,6 +1871,7 @@ theorem ep1_minirust_cross_frame_panic_capstone :
     (type_of% @evalTerminatorM_switch_assert) ∧
     (type_of% @evalTerminatorM_abort) ∧
     (type_of% @evalResumeUnwindM_dispatch) ∧
+    (type_of% @evalTerminatorM_start_stop_unwind_lifo) ∧
     (type_of% @tbm_perm_prot_foreign_write_ub_iff_prevents_dealloc) ∧
     (type_of% @tbm_perm_unprotect_enables_foreign_write) ∧
     (type_of% @tbm_perm_frozen_local_write_ub_universal) ∧
@@ -1771,10 +1891,13 @@ theorem ep1_minirust_cross_frame_panic_capstone :
     (type_of% @mrCrossFramePanicObserve_mode_sensitivity) ∧
     (type_of% @mrCanonicalProg_tb_wfLive) ∧
     (type_of% @mr_tb_exact_ub_diagnostics) ∧
-    (type_of% @mr_root_unwind_boundary_vs_catch_harness) :=
+    (type_of% @mr_root_unwind_boundary_vs_catch_harness) ∧
+    (type_of% @mrProgRootUnwindCaught_tb_wfLive) ∧
+    (type_of% @mr_case21_premature_parent_write_ub_contrast) :=
   ⟨@bootProgramM_tb_wfLive, @runToStopM_tb_wfLive, @evalPtrOffsetM_wrapping_eq,
    @evalPtrOffsetM_inbounds_eq, @ptrOffsetWrappingM_roundtrip, @evalTerminatorM_unreachable_ub,
    @evalTerminatorM_switch_assert, @evalTerminatorM_abort, @evalResumeUnwindM_dispatch,
+   @evalTerminatorM_start_stop_unwind_lifo,
    @tbm_perm_prot_foreign_write_ub_iff_prevents_dealloc,
    @tbm_perm_unprotect_enables_foreign_write, @tbm_perm_frozen_local_write_ub_universal,
    @tbm_node_protector_and_frozen_laws, @trusted_evalTerminator_unreachable_ub,
@@ -1785,7 +1908,8 @@ theorem ep1_minirust_cross_frame_panic_capstone :
    @trusted_restoreCallerProtectors_releases, @mrCrossFramePanicObserve_table,
    @mrCrossFramePanicObserve_out_of_range, @mrCrossFramePanicObserve_mode_sensitivity,
    @mrCanonicalProg_tb_wfLive, @mr_tb_exact_ub_diagnostics,
-   @mr_root_unwind_boundary_vs_catch_harness⟩
+   @mr_root_unwind_boundary_vs_catch_harness, @mrProgRootUnwindCaught_tb_wfLive,
+   @mr_case21_premature_parent_write_ub_contrast⟩
 
 section AxiomAudit
 open Lean Elab Command
