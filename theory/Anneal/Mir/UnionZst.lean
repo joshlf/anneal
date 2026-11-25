@@ -39,6 +39,7 @@ Stated and proved directly against `Trusted.Rustc.V2026_06_01.MirSemantics.readP
   `MirLowerError::InactiveUnionField` (`readUnion_zeroByte_subProj`, `readUnion_zeroByte_subProj_iff`,
   `kani5159_inhabitedLeaf_through_uninhabitedContainer_subProj_unsupported`,
   `readUnion_posLeaf_subProj`, `readUnion_zeroByte_fieldRoot`,
+  `readUnion_uninhabited_nonEmpty_unsupported`,
   `readUnion_uninhabited_nonEmpty_fallthrough_unsupported`,
   `readUnion_uninhabited_nonEmpty_noOffset_unsupported`, with non-vacuity witnesses on every
   `tyByteSize rFieldTy` arm in `kani5159_witness_nonStatic_fallthrough`,
@@ -997,12 +998,203 @@ theorem readUnion_zeroByte_fieldRoot
            simp only [] <;> rw [hSz] <;> simp only [] <;>
            (cases tyIsUninhabited layouts _ <;> rfl))
 
-set_option maxHeartbeats 800000 in
+set_option maxHeartbeats 1200000 in
+/-- **Unconditional non-empty sub-projection guard through an uninhabited union field (any
+bounds, offset, leaf-resolution, or field-size outcome).** Whenever a non-empty sub-projection
+`p :: ps` through an uninhabited union field `rFieldTy` has resolved indices
+(`resolveUnionSubProjIndices = some idxResolved`) and does not resolve to an uninhabited leaf,
+`readProjectedValueUnionAware` fails closed with `.unsupported` (never `.ub`), unconditionally
+across all four outcomes of `directSubReadOpt` (`checkStaticSubProjBounds = false`,
+`projectionChainByteOffset? = none`, `resolveProjectedTyResolved = none`, and the direct
+`.some .unsupported` guard) and all arms of `tyByteSize rFieldTy`. -/
+theorem readUnion_uninhabited_nonEmpty_unsupported
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (hUninh : tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = true)
+    (p : ProjectionElem) (ps idxResolved : List ProjectionElem)
+    (hRes : resolveUnionSubProjIndices locals (p :: ps) = some idxResolved)
+    (hNotUninhLeaf : ∀ leafTy,
+      resolveProjectedTyResolved localDecls layouts
+        (unionFieldReadTy localDecls layouts l idx fieldTy)
+        (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = some leafTy →
+      tyIsUninhabited layouts leafTy = false) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        (.field idx fieldTy :: p :: ps) = .unsupported := by
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
+  unfold readProjectedValueUnionAware
+  dsimp only
+  rw [hKind, hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  rw [hBle]
+  simp only []
+  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
+  unfold unionFieldReadTy at hTk hUninh hNotUninhLeaf
+  cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    simp only [hu] at hTk hUninh hNotUninhLeaf ⊢
+  · rcases hSlot with hS | hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;>
+    rcases hImg with hC | ⟨img, hEnc⟩ <;>
+    (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
+    (try cases l.fieldLayouts) <;> simp only [] <;>
+    rw [hRes] <;> simp only [] <;>
+    (cases checkStaticSubProjBounds localDecls layouts fieldTy _ with
+     | true =>
+       dsimp only
+       cases projectionChainByteOffset? layouts (some fieldTy) none none 0 localDecls _ <;>
+       cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ <;>
+       simp only []
+       · cases tyByteSize localDecls layouts fieldTy with
+         | none => simp only [hUninh]
+         | some sz =>
+           cases sz with
+           | zero => simp only [hUninh]
+           | succ szPred =>
+             dsimp only
+             cases hk : fieldTy.kind <;>
+               first
+               | (exfalso; unfold tyIsUninhabited at hUninh; rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+               | simp only [hUninh]
+       · cases tyByteSize localDecls layouts fieldTy with
+         | none => simp only [hUninh, hNotUninhLeaf _ hL]
+         | some sz =>
+           cases sz with
+           | zero => simp only [hUninh, hNotUninhLeaf _ hL]
+           | succ szPred =>
+             dsimp only
+             cases hk : fieldTy.kind <;>
+               first
+               | (exfalso; unfold tyIsUninhabited at hUninh; rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+               | simp only [hUninh, hNotUninhLeaf _ hL]
+       · cases tyByteSize localDecls layouts fieldTy with
+         | none => simp only [hUninh]
+         | some sz =>
+           cases sz with
+           | zero => simp only [hUninh]
+           | succ szPred =>
+             dsimp only
+             cases hk : fieldTy.kind <;>
+               first
+               | (exfalso; unfold tyIsUninhabited at hUninh; rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+               | simp only [hUninh]
+       · simp only [hNotUninhLeaf _ hL, hUninh, Bool.true_or]
+     | false =>
+       dsimp only
+       cases tyByteSize localDecls layouts fieldTy with
+       | none =>
+         simp only [hUninh]
+         cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
+         | none => rfl
+         | some leafTy => simp only [hNotUninhLeaf leafTy hL]
+       | some sz =>
+         cases sz with
+         | zero =>
+           simp only [hUninh]
+           cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
+           | none => rfl
+           | some leafTy => simp only [hNotUninhLeaf leafTy hL]
+         | succ szPred =>
+           dsimp only
+           cases hk : fieldTy.kind <;>
+             first
+             | (exfalso; unfold tyIsUninhabited at hUninh; rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+             | (simp only [hUninh]
+                cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
+                | none => rfl
+                | some leafTy => simp only [hNotUninhLeaf leafTy hL]))
+  · cases hg : get? l.fieldLayouts idx <;>
+      simp only [hg] at hTk hUninh hNotUninhLeaf ⊢ <;>
+    rcases hSlot with hS | hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk]) <;>
+    rcases hImg with hC | ⟨img, hEnc⟩ <;>
+    (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
+    (try cases l.fieldLayouts) <;> simp only [] <;>
+    rw [hRes] <;> simp only [] <;>
+    (cases checkStaticSubProjBounds localDecls layouts _ _ with
+     | true =>
+       dsimp only
+       cases projectionChainByteOffset? layouts (some _) none none 0 localDecls _ <;>
+       cases hL : resolveProjectedTyResolved localDecls layouts _ _ <;>
+       simp only []
+       · cases tyByteSize localDecls layouts _ with
+         | none => simp only [hUninh]
+         | some sz =>
+           cases sz with
+           | zero => simp only [hUninh]
+           | succ szPred =>
+             dsimp only
+             cases hk : fieldTy.kind <;>
+               first
+               | rfl
+               | (exfalso; unfold tyIsUninhabited at hUninh; (try dsimp only at hUninh);
+                  (try rw [hTk] at hUninh); rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+               | ((try rw [hk] at hUninh); simp only [hUninh])
+       · cases tyByteSize localDecls layouts _ with
+         | none => simp only [hUninh, hNotUninhLeaf _ hL]
+         | some sz =>
+           cases sz with
+           | zero => simp only [hUninh, hNotUninhLeaf _ hL]
+           | succ szPred =>
+             dsimp only
+             cases hk : fieldTy.kind <;>
+               first
+               | (exfalso; unfold tyIsUninhabited at hUninh; (try dsimp only at hUninh);
+                  (try rw [hTk] at hUninh); rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+               | ((try rw [hk] at hUninh); simp only [hUninh, hNotUninhLeaf _ hL])
+       · cases tyByteSize localDecls layouts _ with
+         | none => simp only [hUninh]
+         | some sz =>
+           cases sz with
+           | zero => simp only [hUninh]
+           | succ szPred =>
+             dsimp only
+             cases hk : fieldTy.kind <;>
+               first
+               | rfl
+               | (exfalso; unfold tyIsUninhabited at hUninh; (try dsimp only at hUninh);
+                  (try rw [hTk] at hUninh); rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+               | ((try rw [hk] at hUninh); simp only [hUninh])
+       · simp only [hNotUninhLeaf _ hL, hUninh, Bool.true_or]
+     | false =>
+       dsimp only
+       cases tyByteSize localDecls layouts _ with
+       | none =>
+         simp only [hUninh]
+         cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
+         | none => rfl
+         | some leafTy => simp only [hNotUninhLeaf leafTy hL]
+       | some sz =>
+         cases sz with
+         | zero =>
+           simp only [hUninh]
+           cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
+           | none => rfl
+           | some leafTy => simp only [hNotUninhLeaf leafTy hL]
+         | succ szPred =>
+           dsimp only
+           cases hk : fieldTy.kind <;>
+             first
+             | (exfalso; unfold tyIsUninhabited at hUninh; (try dsimp only at hUninh);
+                (try rw [hTk] at hUninh); rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
+             | ((try rw [hk] at hUninh); simp only [hUninh]
+                cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
+                | none => rfl
+                | some leafTy =>
+                  (try rw [← hk] at hL)
+                  simp only [hNotUninhLeaf leafTy hL]))
+
 /-- **Non-empty sub-projection fallthrough guard (any field size).** Whenever a non-empty
 sub-projection `p :: ps` through an uninhabited union field `rFieldTy` is not statically bounded
 (`checkStaticSubProjBounds = false`) and does not resolve to an uninhabited leaf,
 `readProjectedValueUnionAware` fails closed with `.unsupported` (never `.ub`), regardless of
-`tyByteSize rFieldTy`. -/
+`tyByteSize rFieldTy`. Corollary of `readUnion_uninhabited_nonEmpty_unsupported`. -/
 theorem readUnion_uninhabited_nonEmpty_fallthrough_unsupported
     (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
@@ -1017,7 +1209,7 @@ theorem readUnion_uninhabited_nonEmpty_fallthrough_unsupported
     (hUninh : tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = true)
     (p : ProjectionElem) (ps idxResolved : List ProjectionElem)
     (hRes : resolveUnionSubProjIndices locals (p :: ps) = some idxResolved)
-    (hBounds : checkStaticSubProjBounds localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+    (_hBounds : checkStaticSubProjBounds localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
       (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = false)
     (hNotUninhLeaf : ∀ leafTy,
       resolveProjectedTyResolved localDecls layouts
@@ -1025,86 +1217,16 @@ theorem readUnion_uninhabited_nonEmpty_fallthrough_unsupported
         (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = some leafTy →
       tyIsUninhabited layouts leafTy = false) :
     readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
-        (.field idx fieldTy :: p :: ps) = .unsupported := by
-  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
-  unfold readProjectedValueUnionAware
-  dsimp only
-  rw [hKind, hLookup]
-  dsimp only
-  rw [hFields]
-  dsimp only
-  rw [hBle]
-  simp only []
-  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
-  unfold unionFieldReadTy at hTk hUninh hBounds hNotUninhLeaf
-  cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
-    simp only [hu] at hTk hUninh hBounds hNotUninhLeaf ⊢
-  · rcases hSlot with hS | hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;>
-    rcases hImg with hC | ⟨img, hEnc⟩ <;>
-    (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
-    (try cases l.fieldLayouts) <;> simp only [] <;>
-    rw [hRes] <;> simp only [] <;> rw [hBounds] <;> simp only [] <;>
-    (cases tyByteSize localDecls layouts fieldTy with
-     | none =>
-       simp only [hUninh]
-       cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
-       | none => rfl
-       | some leafTy => simp only [hNotUninhLeaf leafTy hL]
-     | some sz =>
-       cases sz with
-       | zero =>
-         simp only [hUninh]
-         cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
-         | none => rfl
-         | some leafTy => simp only [hNotUninhLeaf leafTy hL]
-       | succ szPred =>
-         dsimp only
-         cases hk : fieldTy.kind <;>
-           first
-           | (exfalso; unfold tyIsUninhabited at hUninh; rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
-           | (simp only [hUninh]
-              cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
-              | none => rfl
-              | some leafTy => simp only [hNotUninhLeaf leafTy hL]))
-  · cases hg : get? l.fieldLayouts idx <;>
-      simp only [hg] at hTk hUninh hBounds hNotUninhLeaf ⊢ <;>
-    rcases hSlot with hS | hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk]) <;>
-    rcases hImg with hC | ⟨img, hEnc⟩ <;>
-    (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
-    (try cases l.fieldLayouts) <;> simp only [] <;>
-    rw [hRes] <;> simp only [] <;> rw [hBounds] <;> simp only [] <;>
-    (cases tyByteSize localDecls layouts _ with
-     | none =>
-       simp only [hUninh]
-       cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
-       | none => rfl
-       | some leafTy => simp only [hNotUninhLeaf leafTy hL]
-     | some sz =>
-       cases sz with
-       | zero =>
-         simp only [hUninh]
-         cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
-         | none => rfl
-         | some leafTy => simp only [hNotUninhLeaf leafTy hL]
-       | succ szPred =>
-         dsimp only
-         cases hk : fieldTy.kind <;>
-           first
-           | (exfalso; unfold tyIsUninhabited at hUninh; (try dsimp only at hUninh);
-              (try rw [hTk] at hUninh); rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
-           | ((try rw [hk] at hUninh); simp only [hUninh]
-              cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
-              | none => rfl
-              | some leafTy =>
-                (try rw [← hk] at hL)
-                simp only [hNotUninhLeaf leafTy hL]))
+        (.field idx fieldTy :: p :: ps) = .unsupported :=
+  readUnion_uninhabited_nonEmpty_unsupported locals localDecls layouts baseTy fieldTy fields idx count
+    l d args hKind hLookup hFields hIdx hImg hSlot hUninh p ps idxResolved hRes hNotUninhLeaf
 
-set_option maxHeartbeats 800000 in
 /-- **Non-empty sub-projection fallthrough guard, statically bounded but offset-less (any field
 size).** Companion to `readUnion_uninhabited_nonEmpty_fallthrough_unsupported` covering the other
 way `directSubReadOpt` can be `.none`: the sub-projection `p :: ps` through an uninhabited union
 field passes `checkStaticSubProjBounds` but `projectionChainByteOffset?` yields no offset. If the
-loaded leaf is not uninhabited, the read still fails closed with `.unsupported` (never `.ub`). -/
+loaded leaf is not uninhabited, the read still fails closed with `.unsupported` (never `.ub`).
+Corollary of `readUnion_uninhabited_nonEmpty_unsupported`. -/
 theorem readUnion_uninhabited_nonEmpty_noOffset_unsupported
     (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
@@ -1119,9 +1241,9 @@ theorem readUnion_uninhabited_nonEmpty_noOffset_unsupported
     (hUninh : tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = true)
     (p : ProjectionElem) (ps idxResolved : List ProjectionElem)
     (hRes : resolveUnionSubProjIndices locals (p :: ps) = some idxResolved)
-    (hBounds : checkStaticSubProjBounds localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+    (_hBounds : checkStaticSubProjBounds localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
       (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = true)
-    (hOff : projectionChainByteOffset? layouts (some (unionFieldReadTy localDecls layouts l idx fieldTy))
+    (_hOff : projectionChainByteOffset? layouts (some (unionFieldReadTy localDecls layouts l idx fieldTy))
       none none 0 localDecls (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) =
         none)
     (hNotUninhLeaf : ∀ leafTy,
@@ -1130,79 +1252,9 @@ theorem readUnion_uninhabited_nonEmpty_noOffset_unsupported
         (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = some leafTy →
       tyIsUninhabited layouts leafTy = false) :
     readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
-        (.field idx fieldTy :: p :: ps) = .unsupported := by
-  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
-  unfold readProjectedValueUnionAware
-  dsimp only
-  rw [hKind, hLookup]
-  dsimp only
-  rw [hFields]
-  dsimp only
-  rw [hBle]
-  simp only []
-  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
-  unfold unionFieldReadTy at hTk hUninh hBounds hOff hNotUninhLeaf
-  cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
-    simp only [hu] at hTk hUninh hBounds hOff hNotUninhLeaf ⊢
-  · rcases hSlot with hS | hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;>
-    rcases hImg with hC | ⟨img, hEnc⟩ <;>
-    (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
-    (try cases l.fieldLayouts) <;> simp only [] <;>
-    rw [hRes] <;> simp only [] <;> rw [hBounds] <;> simp only [] <;> rw [hOff] <;> simp only [] <;>
-    (cases tyByteSize localDecls layouts fieldTy with
-     | none =>
-       simp only [hUninh]
-       cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
-       | none => rfl
-       | some leafTy => simp only [hNotUninhLeaf leafTy hL]
-     | some sz =>
-       cases sz with
-       | zero =>
-         simp only [hUninh]
-         cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
-         | none => rfl
-         | some leafTy => simp only [hNotUninhLeaf leafTy hL]
-       | succ szPred =>
-         dsimp only
-         cases hk : fieldTy.kind <;>
-           first
-           | (exfalso; unfold tyIsUninhabited at hUninh; rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
-           | (simp only [hUninh]
-              cases hL : resolveProjectedTyResolved localDecls layouts fieldTy _ with
-              | none => rfl
-              | some leafTy => simp only [hNotUninhLeaf leafTy hL]))
-  · cases hg : get? l.fieldLayouts idx <;>
-      simp only [hg] at hTk hUninh hBounds hOff hNotUninhLeaf ⊢ <;>
-    rcases hSlot with hS | hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk]) <;>
-    rcases hImg with hC | ⟨img, hEnc⟩ <;>
-    (try rw [hC]) <;> (try rw [hEnc]) <;> (try cases unionNeedsConsistencyCheck count fields) <;>
-    (try cases l.fieldLayouts) <;> simp only [] <;>
-    rw [hRes] <;> simp only [] <;> rw [hBounds] <;> simp only [] <;> rw [hOff] <;> simp only [] <;>
-    (cases tyByteSize localDecls layouts _ with
-     | none =>
-       simp only [hUninh]
-       cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
-       | none => rfl
-       | some leafTy => simp only [hNotUninhLeaf leafTy hL]
-     | some sz =>
-       cases sz with
-       | zero =>
-         simp only [hUninh]
-         cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
-         | none => rfl
-         | some leafTy => simp only [hNotUninhLeaf leafTy hL]
-       | succ szPred =>
-         dsimp only
-         cases hk : fieldTy.kind <;>
-           first
-           | (exfalso; unfold tyIsUninhabited at hUninh; (try dsimp only at hUninh);
-              (try rw [hTk] at hUninh); rw [hk] at hUninh; exact Bool.false_ne_true hUninh)
-           | ((try rw [hk] at hUninh); simp only [hUninh]
-              cases hL : resolveProjectedTyResolved localDecls layouts _ _ with
-              | none => rfl
-              | some leafTy =>
-                (try rw [← hk] at hL)
-                simp only [hNotUninhLeaf leafTy hL]))
+        (.field idx fieldTy :: p :: ps) = .unsupported :=
+  readUnion_uninhabited_nonEmpty_unsupported locals localDecls layouts baseTy fieldTy fields idx count
+    l d args hKind hLookup hFields hIdx hImg hSlot hUninh p ps idxResolved hRes hNotUninhLeaf
 
 /-- **`kani#5159`, field root, two-sided (`.ub`).** Under the hypotheses of
 `readUnion_zeroByte_root`, the read faults with `.ub` iff the field is uninhabited. -/
@@ -3038,8 +3090,13 @@ theorem kani5159_v2026_08_01_nonStatic_fallthrough_parity :
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
         wUWTy [.field 0 wW0Ty, .downcast (some "A") 0, .field 1 wUnitTy] = .unsupported ∧
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
-        wUWTy [.field 1 wW4Ty, .downcast (some "A") 0, .field 1 wU32Ty] = .unsupported :=
-  ⟨rfl, (by intro h; cases h), rfl, rfl, (by intro h; cases h), rfl, rfl, rfl⟩
+        wUWTy [.field 0 wW0Ty, .downcast (some "A") 0, .field 1 wUnitTy] ≠ .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
+        wUWTy [.field 1 wW4Ty, .downcast (some "A") 0, .field 1 wU32Ty] = .unsupported ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
+        wUWTy [.field 1 wW4Ty, .downcast (some "A") 0, .field 1 wU32Ty] ≠ .ub :=
+  ⟨rfl, (by intro h; cases h), rfl, rfl, (by intro h; cases h), rfl, rfl, (by intro h; cases h),
+    rfl, (by intro h; cases h)⟩
 
 def wSArrTy08 : Ty := { kind := .array (.adt "S" []) 2, layoutIdx := 99 }
 def wNestTy08 : Ty := { kind := .tuple [wInfK08, .array (.adt "S" []) 2], layoutIdx := 14 }
@@ -3067,8 +3124,10 @@ theorem kani5159_v2026_08_01_noOffset_fallthrough_parity :
     readProjectedValueUnionAware [] wDeclsN08 wLayoutsN08 wUNVal08 wUNTy08
         [.field 0 wNestTy08, .field 0 wInfTy08] = .ub ∧
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsN wLayoutsN wUNVal
-        wUNTy [.field 0 wNestTy, .field 1 wSArrTy, .constantIndex 1 2 false] = .unsupported :=
-  ⟨rfl, (by intro h; cases h), rfl, rfl⟩
+        wUNTy [.field 0 wNestTy, .field 1 wSArrTy, .constantIndex 1 2 false] = .unsupported ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsN wLayoutsN wUNVal
+        wUNTy [.field 0 wNestTy, .field 1 wSArrTy, .constantIndex 1 2 false] ≠ .ub :=
+  ⟨rfl, (by intro h; cases h), rfl, rfl, (by intro h; cases h)⟩
 
 end V2026_08_01Parity
 

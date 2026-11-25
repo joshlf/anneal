@@ -8852,11 +8852,13 @@ union byte-reinterpretation semantics in `Runtime(PostCleanup)` MIR (Rust
 - **Inhabited leaf reads through uninhabited intermediate containers**
   (`tyIsUninhabited layouts leafTy = false`, while either
   `tyIsUninhabited layouts rFieldTy = true` or
-  `subProjTouchesUninhabited localDecls layouts rFieldTy normRest = true`; or a
-  non-empty `rest = _ :: _` fallthrough when `tyIsUninhabited layouts rFieldTy = true`):
-  fail closed with `.unsupported` (NEVER `.ub`), because Rust/Miri/MiniRust
-  place projections compute byte offsets without validating intermediate
-  container types and only check validity of the loaded leaf type.
+  `subProjTouchesUninhabited localDecls layouts rFieldTy normRest = true`; or
+  any non-empty `rest = _ :: _` fallthrough where `directSubReadOpt = .none` and
+  `tyIsUninhabited layouts rFieldTy = true` without an uninhabited leaf):
+  fail closed with `.unsupported` (NEVER `.ub`), because loading an inhabited
+  leaf produces only a value of the leaf type (`r-undefined.invalid`) and
+  Anneal chooses not to claim `.ok` or false-positive `.ub` through an
+  uninhabited container.
 - An inhabited 0-byte read (at the field root or at a statically bounded
   sub-place not passing through an uninhabited container) reads no storage and
   yields the leaf's unique value decoded from zero bytes.
@@ -8909,16 +8911,19 @@ The 1.98.0 Reference does not say whether computing a place through an
 uninhabited intermediate type is UB (Miri and MiniRust treat it as non-UB;
 that is interpreter behavior, not a Reference premise), so returning
 `.unsupported` there is a fail-closed modeling choice that claims neither
-`.ok` nor `.ub`. A non-static `rest = _ :: _` through an uninhabited field
-returns `.ub` only when `resolveProjectedTyResolved` resolves the loaded leaf
-itself to an uninhabited type (again a leaf read).
+`.ok` nor `.ub`. Any `rest = _ :: _` fallthrough where `directSubReadOpt = .none`
+(e.g., non-static bounds, missing byte offset, or unresolved leaf type) through
+an uninhabited field returns `.ub` only when `resolveProjectedTyResolved`
+resolves the loaded leaf itself to an uninhabited type (again a leaf read; an
+uninitialized `.index` local already faults with `.ub` in `directSubReadOpt`).
 
 Guarantees vs. modeling choices: `.ub` on uninhabited leaf loads relies on
 documented Rust validity guarantees plus compiler-captured layout facts
 (`TypeLayout.isUninhabited`). Returning `.unsupported` on inhabited-leaf reads
-through uninhabited containers (or on non-static `rest = _ :: _` fallthroughs
-through an uninhabited field) is Anneal's fail-closed modeling boundary; such
-reads remain unmodeled rather than returning `.ok` or false-positive `.ub`.
+through uninhabited containers (or on `rest = _ :: _` fallthroughs where
+`directSubReadOpt = .none` through an uninhabited field) is Anneal's fail-closed
+modeling boundary; such reads remain unmodeled rather than returning `.ok` or
+false-positive `.ub`.
 -/
 def readProjectedValueUnionAware
     (locals : List LocalSlot)
