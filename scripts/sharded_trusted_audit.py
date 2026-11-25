@@ -211,6 +211,8 @@ def run_shards(checkout: Path = REPO_ROOT, cache_dir: Path | None = None, jobs: 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
             pairs = list(pool.map(_exec, shards))
         results = [item for _, item in pairs]
+        if not results:
+            raise Failure(2, "run-shards", "no downstream shards")
         ref = results[0]
         for item in results[1:]:
             if item["axioms"] != ref["axioms"] or item["trustedDeclarations"] != ref["trustedDeclarations"]:
@@ -581,29 +583,49 @@ def _tokenize_rich(text: str) -> list[tuple[str, int, int]]:
         line += clean.count("\n", last, match.start())
         last = match.start()
         token = match.group(0)
-        # `«assumesHold»` and `_root_.assumesHold` are the same constant as `assumesHold`.
-        name = token.replace("\u00ab", "").replace("\u00bb", "")
-        name = name[len("_root_."):] if name.startswith("_root_.") else name
-        namespace, _, leaf = name.rpartition(".")
-        if leaf in ASSUMPTION_ATOMS:
-            # `.assumesHold` (dot notation) and `Other.assumesHold` name different constants.
-            dotted = bool(tokens) and tokens[-1][0] == "."
-            token = name if namespace in ATOM_NAMESPACES and not dotted else f"{name}\u2020"
+        if match.lastgroup == "id":
+            # Canonicalize guillemets (`«foo»`) and `_root_.` across both Guards 6a and 6b.
+            name = token.replace("\u00ab", "").replace("\u00bb", "")
+            name = name[len("_root_."):] if name.startswith("_root_.") else name
+            namespace, _, leaf = name.rpartition(".")
+            if leaf in ASSUMPTION_ATOMS:
+                # `.assumesHold` (dot notation) and `Other.assumesHold` name different constants.
+                dotted = bool(tokens) and tokens[-1][0] == "."
+                token = name if namespace in ATOM_NAMESPACES and not dotted else f"{name}\u2020"
+            else:
+                token = name
         tokens.append((token, line, match.start()))
-    # `open Verifrag renaming assumesHold → ok`: later uses of `ok` are the atom.
-    aliases: set[str] = set()
-    for k, (t, line, _off) in enumerate(tokens):
-        if t == "renaming":
+    # `open Verifrag renaming assumesHold → ok` (single- or multi-line): later uses of `ok` are the atom.
+    stops = DECL_KEYWORDS | COMMAND_STOPS | _DECL_MODIFIERS | {"@", "in"}
+    renames: dict[str, int] = {}
+    depth = 0
+    for k, (t, _line, _off) in enumerate(tokens):
+        if t in OPEN:
+            depth += 1
+            continue
+        if t in CLOSE:
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0 and t == "renaming":
             j = k + 1
-            while j + 2 < len(tokens) and tokens[j][1] == line:
-                if tokens[j + 1][0] in ("→", "->") and _is_atom(tokens[j][0]):
-                    aliases.add(tokens[j + 2][0])
+            while j + 2 < len(tokens) and tokens[j][0] not in stops:
+                if tokens[j][0] == ",":
+                    j += 1
+                    continue
+                if tokens[j + 1][0] in ("→", "->"):
+                    if _is_atom(tokens[j][0]):
+                        alias = tokens[j + 2][0]
+                        renames.setdefault(alias, j + 3)
                     j += 3
                 else:
                     j += 1
-    if aliases:
-        tokens = [(ASSUMPTION_ATOMS[0] if t in aliases and (k == 0 or tokens[k - 1][0] != ".") else t, line, off)
-                  for k, (t, line, off) in enumerate(tokens)]
+    if renames:
+        tokens = [
+            (ASSUMPTION_ATOMS[0]
+             if t in renames and k >= renames[t] and (k == 0 or tokens[k - 1][0] != ".")
+             else t, ln, off)
+            for k, (t, ln, off) in enumerate(tokens)
+        ]
     return tokens
 
 
@@ -914,20 +936,59 @@ def assumption_helpers(files: dict[str, list]) -> set[str]:
     return helpers
 
 
+def _command_span(toks: list, start: int) -> list:
+    """Tokens belonging to the top-level command at `start`, tracking nested delimiters."""
+    out = []
+    inner_depth = 0
+    j = start + 1
+    while j < len(toks):
+        tj = toks[j][0]
+        if tj in OPEN:
+            inner_depth += 1
+        elif tj in CLOSE:
+            inner_depth = max(0, inner_depth - 1)
+        elif inner_depth == 0 and (tj in DECL_KEYWORDS or tj in COMMAND_STOPS):
+            break
+        out.append(toks[j])
+        j += 1
+    return out
+
+
 def scan_polarity(path: str, toks: list, helpers: set[str]) -> None:
     """Guard 6a over one file: binders negative, declared types positive; helper bodies are
     positive propositions and every use of a helper elsewhere is an unclean leaf."""
+    # Collect `open ... renaming <helper> → <alias>` aliases (single- or multi-line).
+    local_helpers = set(helpers)
+    stops = DECL_KEYWORDS | COMMAND_STOPS | _DECL_MODIFIERS | {"@", "in"}
     depth = 0
-    for k, (t, line) in enumerate(toks):
-        depth += 1 if t in OPEN else -1 if t in CLOSE else 0
-        if depth == 0 and t in NOTATION_COMMANDS:
+    for k, tok in enumerate(toks):
+        t = tok[0]
+        if t in OPEN:
+            depth += 1
+            continue
+        if t in CLOSE:
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0 and t == "renaming":
             j = k + 1
-            while j < len(toks) and toks[j][0] not in DECL_KEYWORDS and toks[j][0] not in COMMAND_STOPS:
-                if _is_atom(toks[j][0]) or toks[j][0] in helpers or toks[j][0].split(".")[-1] in helpers:
-                    raise GuardViolation("6a", "assumption atom hidden behind notation or macro", path, toks[j][1])
-                j += 1
+            while j + 2 < len(toks) and toks[j][0] not in stops:
+                if toks[j][0] == ",":
+                    j += 1
+                    continue
+                if toks[j + 1][0] in ("→", "->"):
+                    src_name = toks[j][0]
+                    if src_name in local_helpers or src_name.split(".")[-1] in local_helpers:
+                        local_helpers.add(toks[j + 2][0])
+                    j += 3
+                else:
+                    j += 1
+        elif depth == 0 and (t in NOTATION_COMMANDS or t == "export"):
+            for st in _command_span(toks, k):
+                if _is_atom(st[0]) or st[0] in local_helpers or st[0].split(".")[-1] in local_helpers:
+                    kind_msg = "re-exported via export" if t == "export" else "hidden behind notation or macro"
+                    raise GuardViolation("6a", f"assumption atom {kind_msg}", path, st[1])
     for kw, name, sig, body, _start in _declarations(toks):
-        others = helpers - {name}
+        others = local_helpers - {name}
         scanner = PolarityScanner(path, others)
         if not any(_is_atom(tok[0]) or scanner._is_helper(tok[0]) for tok in sig + body):
             continue
@@ -1272,18 +1333,22 @@ def scan_sealing(path: str, text: str) -> None:
         return ns_flat, opened, renamed, explicit_ids
 
     # Map character offset -> token index for namespace lookup of `@invariant` structures.
+    # Strip guillemets while preserving character offsets 1-for-1 so `«R»` / `«mk»` / `«Inhabited»` match cleanly.
+    clean_norm = clean.replace("\u00ab", " ").replace("\u00bb", " ")
     sealed: dict[str, str] = {}
     sealed_fields: set[str] = set()
-    for match in re.finditer(r"\b(structure|class)\s+([A-Za-z_][\w.']*)", clean):
+    for match in re.finditer(r"\b(structure|class)\s+([A-Za-z_][\w.']*)", clean_norm):
         if not _doc_tag(text, match.start(), "@invariant"):
             continue
         raw_name = match.group(2)
+        if raw_name.startswith("_root_."):
+            raw_name = raw_name[len("_root_."):]
         tok_idx = next((idx for idx, (_, _, off) in enumerate(toks) if off >= match.start()), len(toks))
         ns_flat, _, _, _ = scope_at(tok_idx)
         full_name = ".".join(ns_flat + [raw_name]) if ns_flat else raw_name
         line = clean.count("\n", 0, match.start()) + 1
-        body_end = re.search(r"\n(?=\S)(?!deriving\b)", clean[match.end():])
-        decl = clean[match.start(): match.end() + (body_end.start() if body_end else len(clean))]
+        body_end = re.search(r"\n(?=\S)(?!deriving\b)", clean_norm[match.end():])
+        decl = clean_norm[match.start(): match.end() + (body_end.start() if body_end else len(clean_norm))]
         ctor = re.search(r"\bwhere\s+(private\s+)?([A-Za-z_][\w']*)\s*::", decl)
         if ctor is None or not ctor.group(1):
             raise GuardViolation("6b", f"invariant structure {full_name} lacks `private <ctor> ::`", path, line)
@@ -1320,12 +1385,12 @@ def scan_sealing(path: str, text: str) -> None:
                     changed = True
 
     all_sealed_types = set(type_names)
-    for match in re.finditer(r"\bderiving\s+instance\b[\s\S]*?\bInhabited\b[\s\S]*?\bfor\b([^\n;]*)", clean):
+    for match in re.finditer(r"\bderiving\s+instance\b[\s\S]*?\bInhabited\b[\s\S]*?\bfor\b([^\n;]*)", clean_norm):
         if any(re.search(rf"\b{re.escape(s)}\b", match.group(1)) for s in all_sealed_types):
             raise GuardViolation("6b", "standalone Inhabited derivation of an invariant structure", path,
                                  clean.count("\n", 0, match.start()) + 1)
 
-    for match in re.finditer(r"\b(?:structure|class)\s+([A-Za-z_][\w.']*)(?:[^\n]|\n[ \t]+)*?\bextends\b([^\n]*)", clean):
+    for match in re.finditer(r"\b(?:structure|class)\s+([A-Za-z_][\w.']*)(?:[^\n]|\n[ \t]+)*?\bextends\b([^\n]*)", clean_norm):
         if any(re.search(rf"\b{re.escape(s)}\b", match.group(2)) for s in all_sealed_types) and not _doc_tag(
             text, match.start(), "@invariant"
         ):
@@ -1460,7 +1525,31 @@ def scan_sealing(path: str, text: str) -> None:
                     private_forwarders.add(full_name)
                     changed = True
 
-    # Pass 3: enforce sealing on every public non-`@smart_constructor` declaration.
+    # Pass 3: reject `notation`/`macro`/`export` commands exposing a sealed raw constructor.
+    depth = 0
+    for k, tok in enumerate(toks):
+        t = tok[0]
+        if t in OPEN:
+            depth += 1
+            continue
+        if t in CLOSE:
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0 and (t in NOTATION_COMMANDS or t == "export"):
+            span = _command_span(toks, k)
+            if t == "export":
+                # `export R (mk)` re-exports sealed raw constructor into an enclosing namespace.
+                if span and (span[0][0] in all_sealed_types or span[0][0].split(".")[-1] in all_sealed_types):
+                    sealed_ctors = set(sealed.values())
+                    for st in span[1:]:
+                        if st[0] in sealed_ctors:
+                            raise GuardViolation("6b", "sealed raw constructor re-exported via export", path, st[1])
+            else:
+                hit_line = body_reaches_sealed(t, span, [], scope_at(k, k), ctor_aliases, private_forwarders)
+                if hit_line is not None:
+                    raise GuardViolation("6b", "sealed raw constructor exposed behind notation or macro", path, hit_line)
+
+    # Pass 4: enforce sealing on every public non-`@smart_constructor` declaration.
     for kw, name, sig, body, start in decls:
         if kw not in ("def", "abbrev", "instance", "theorem", "opaque") or not body:
             continue

@@ -664,10 +664,28 @@ class PeerGuardScannerTests(unittest.TestCase):
         self.assert_violation("theorem t : True \u2227 Verifrag.\u00abassumesHold\u00bb := sorry\n", "6a", "positive")
         self.assert_violation("open Verifrag renaming assumesHold \u2192 ok\ntheorem t : True \u2227 ok := sorry\n",
                               "6a", "positive")
-        scan_text("open Verifrag renaming assumesHold \u2192 ok\ntheorem t : ok \u2192 True := fun _ => trivial\n")
+        self.assert_violation("open Verifrag renaming\n  assumesHold \u2192 \u00abok\u00bb\ntheorem t : True \u2227 ok := sorry\n",
+                              "6a", "positive")
+        scan_text("theorem earlier (ok : Prop) : ok \u2192 ok := id\n"
+                  "open Verifrag renaming assumesHold \u2192 ok\ntheorem t : ok \u2192 True := fun _ => trivial\n")
+        self.assert_violation("namespace Foo\ndef h : Prop := assumesHold \u2192 True\nend Foo\n"
+                              "open Foo renaming\n  h \u2192 g\ntheorem t : True \u2227 g := sorry\n", "6a")
         self.assert_violation("local notation \"AH\" => assumesHold\ntheorem t : AH := sorry\n", "6a", "notation")
         self.assert_violation("macro \"AH\" : term => `(assumesHold)\ntheorem t : AH := sorry\n", "6a", "notation")
+        self.assert_violation("macro \"AH\" : term => `(open Verifrag in assumesHold)\n", "6a", "notation")
+        self.assert_violation("namespace Evil\nexport Verifrag (assumesHold)\nend Evil\n", "6a", "export")
         self.assert_violation("def h : Prop := assumesHold \u2192 True\nnotation \"H\" => h\n", "6a", "notation")
+
+    def test_6b_spelling_notation_and_export_bypasses_rejected(self):
+        head = "/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n\n"
+        self.assert_violation(head + "def leak (n : Nat) : R := R.\u00abmk\u00bb n\n", "6b", "raw constructor")
+        self.assert_violation(head + "def leak (n : Nat) : R := \u00abR\u00bb.mk n\n", "6b", "raw constructor")
+        self.assert_violation(head + "def leak (n : Nat) : R := _root_.R.mk n\n", "6b", "raw constructor")
+        self.assert_violation("/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n"
+                              "deriving \u00abInhabited\u00bb\n", "6b", "Inhabited")
+        self.assert_violation(head + "local notation \"FORGE\" => R.mk\n", "6b", "notation")
+        self.assert_violation(head + "macro \"FORGE\" n:term : term => `(R.mk $n)\n", "6b", "notation")
+        self.assert_violation(head + "namespace Evil\nexport R (mk)\nend Evil\n", "6b", "export")
 
     def test_live_theory_has_zero_false_positives(self):
         summary = sta.scan_peer_guards([REPO / "theory/Anneal"])
