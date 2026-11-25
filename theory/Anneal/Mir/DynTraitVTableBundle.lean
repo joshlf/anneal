@@ -37,7 +37,19 @@ Design:
 - **Authority 0 (Anneal Trusted MIR)**: `dvAnnealEval` runs `runTrustedVerdict`,
   which executes `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn` (through
   `MiniRustSpec.DynTraitVTableMR.dvRunTrusted`) on the concrete `CapturedMir`
-  fixture of every key (zero shadow evaluators).
+  fixture of every key (zero shadow evaluators). Because Trusted MIR always
+  enforces Tree Borrows receiver protectors (no non-TB mode switch), on the
+  Crubit `c16` key `(.virtualDispatchAndProtector, .modeCase)`:
+  * `.protectedTB` executes the full virtual-call caller `dvV3PokeCallerMir`
+    (definitionally identical to Authority 2's `dvLmFixture 2 3`);
+  * `.basic` executes the unprotected callee `dvV3ProtectedPokeMir` with
+    `activeProtectors = []`.
+  `dv_v3_c16_trusted_same_body_flip_and_caller_equiv` certifies both the true
+  same-body flip on `dvV3ProtectedPokeMir` (`activeProtectors = []` vs. `[1]`)
+  and the 5-step caller-to-callee equivalence with `dvV3PokeCallerMir`, while
+  Authorities 1 (`MiniRustSpec`) and 2 (`LeanMiriSpec`) each flip on the exact
+  same full caller program under `BasicMemory`/`treeBorrows = false` vs.
+  `TreeBorrowsMemory`/`treeBorrows = true`.
 - **Authority 1 (MiniRust)**: `mrAuthority` observes
   `MiniRustSpec.DynTraitVTableMR.dvMrObserveClass`, the class (index in the
   duplicate-free dictionary `dvMrObsDict`) of the raw return bytes produced by
@@ -230,7 +242,12 @@ def runTrustedVerdict (body : CapturedMir) (fuel : Nat) (s : MachineState) :
 /-- Direct Trusted Anneal execution for EVERY `(mode, variant, case)` key. Zero
 shadow evaluators: every key invokes `runTrustedVerdict` ->
 `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn` on the actual `CapturedMir`
-fixture (`dvTrustedFixture`) from its initial state (`dvTrustedInit`). -/
+fixture (`dvTrustedFixture`) from its initial state (`dvTrustedInit`). On the
+Crubit `c16` key `(.virtualDispatchAndProtector, .modeCase)`, `.protectedTB`
+runs `dvV3PokeCallerMir` while `.basic` runs `dvV3ProtectedPokeMir` with
+`activeProtectors = []` (Trusted has no non-TB mode switch; same-body flip and
+5-step caller equivalence are certified by
+`dv_v3_c16_trusted_same_body_flip_and_caller_equiv`). -/
 def dvAnnealEval (mode : DynVtMode) (v : DynVtVariant) (c : DynVtCase)
     (_ch : Unit) : Option (Corpus.Verdict DynTraitVTableObs) :=
   runTrustedVerdict (dvTrustedFixture (dvModeProtected mode) v c) dvTrustedFuel

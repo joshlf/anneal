@@ -224,6 +224,7 @@ theorem dv_mr_deep_theorems_used :
   have _ := @dv_v3_trusted_dispatch_gates_witness
   have _ := @dv_v3_nonMethod_slot_ub_vs_minirust_specPanic
   have _ := @dv_v3_c16_callee_entry_matches_corpus_state
+  have _ := @dv_v3_c16_trusted_same_body_flip_and_caller_equiv
   have _ := @dv_v3_virtualDispatch_three_way_witness
   have _ := @dv_v1_thinUnsize_three_way_witness
   have _ := @dv_v1_failClosed_boundary_witness
@@ -777,7 +778,9 @@ run_cmd do
         lmNs ++ `dvGetMethod_nonMethod_ub,
         lmNs ++ `dvRegistryReserve_eq_lookupVTableFor,
         lmNs ++ `dvGetPointer_eq,
+        lmNs ++ `dvPtrCouples_iff_dvDecodePtr,
         lmNs ++ `dvUnsizeIntoPointer_thin_agrees_trusted,
+        lmNs ++ `dvUnsizeIntoPointer_dynToDyn_agrees_trusted,
         lmNs ++ `dvResolveVirtual_agrees_trusted,
         lmNs ++ `dvLmObserve_v1_thinUnsize_table,
         lmNs ++ `dvLmObserve_v2_dynUpcastAndNop_table,
@@ -794,6 +797,7 @@ run_cmd do
         lmNs ++ `dv_vtable_check_agreement_realizable,
         lmNs ++ `dv_getMethod_realizable,
         lmNs ++ `dv_unsize_agrees_realizable,
+        lmNs ++ `dv_dynToDyn_agrees_realizable,
         lmNs ++ `dv_resolveVirtual_agrees_realizable,
         lmNs ++ `dv_extra_witnesses,
         lmNs ++ `dv_c16_witnesses,
@@ -923,11 +927,14 @@ field-for-field) for `UintTy`, `IntTy`, `FloatTy`, `Mutability`, `Safety`, `Call
 Universal commuting & injectivity theorems (∀ inputs of the 08 dialect):
 `homTy_injective`, `homSlot_injective`, `homVTable_injective`, `homValue_injective`,
 `wfVTableEntry_hom`, `resolveUpcastVTable?_hom`, `dynUnsizeTarget?_hom`,
-`classifyDynReceiver?_hom`, `narrowDynReceiver_hom`, `dynRefDataValid_scalar_hom`
+`classifyDynReceiver?_hom`, `narrowDynReceiver_hom`, `unpackDynReceiver?_hom`,
+`dynRefDataValid_scalar_hom`
 (arbitrary pointer width, including 32-bit and `kani#5216` uninhabited checks), plus the
 supporting lemmas (`rigidTyEqAux_hom_both`, the lookup lemmas, `OptBodyRel`-generalized
 `dynVTableEnv?_opt_hom` and `checkDynVTablePtr_opt_hom` covering both `currentBody = .none`
-and `currentBody = .some _`, and `evalThinToDynUnsize_raw_hom`).
+and `currentBody = .some _`, `evalThinToDynUnsize_raw_hom`, `defPathsSubset_hom`, and
+`evalDynToDynUnsize_raw_hom` covering NOP, primary/secondary `TraitVPtr` upcasting, and
+auto-trait subset checks).
 
 Relational theorems: `evalDynSizeAlignOfVal_hom` (under `DynMemRel` + equal pointer width) and
 `evalAddrEqCall_hom` (under `AddrRel` + equal pointer width) state that both dialects take the
@@ -1275,6 +1282,8 @@ theorem homVTable_slots (v : Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable) : 
 theorem homDynType_dynKey (d : Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType) : (homDynType d).dynKey = d.dynKey := rfl
 theorem homDynType_predicateKey (d : Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType) :
     (homDynType d).predicateKey = d.predicateKey := rfl
+theorem homDynType_autoTraits (d : Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType) :
+    (homDynType d).autoTraits = d.autoTraits := rfl
 theorem homDynType_hasUnresolvedExistentialBinder (d : Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType) :
     (homDynType d).hasUnresolvedExistentialBinder = d.hasUnresolvedExistentialBinder := rfl
 theorem homDynType_supertraitOutlivesOk (d : Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType) :
@@ -1349,6 +1358,57 @@ theorem classifyDynReceiver?_hom (t : Trusted.Rustc.V2026_08_01.MirAst.RigidTy) 
 theorem narrowDynReceiver_hom (k : Trusted.Rustc.V2026_08_01.MirSemantics.DynReceiverKind) (v : Trusted.Rustc.V2026_08_01.MirSemantics.Value) :
     Trusted.Rustc.V2026_06_01.MirSemantics.narrowDynReceiver (homDRK k) (homValue v) = homValue (Trusted.Rustc.V2026_08_01.MirSemantics.narrowDynReceiver k v) := by
   cases k <;> rfl
+
+/-- `DynCheck (Value × Value)` embedding for `unpackDynReceiver?`. -/
+def homDynCheckPair :
+    Trusted.Rustc.V2026_08_01.MirSemantics.DynCheck
+        (Trusted.Rustc.V2026_08_01.MirSemantics.Value × Trusted.Rustc.V2026_08_01.MirSemantics.Value) →
+      Trusted.Rustc.V2026_06_01.MirSemantics.DynCheck
+        (Trusted.Rustc.V2026_06_01.MirSemantics.Value × Trusted.Rustc.V2026_06_01.MirSemantics.Value)
+  | .ok (d, m) => .ok (homValue d, homValue m)
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- **C7** `unpackDynReceiver?` commutes with the embedding for EVERY `DynReceiverKind`
+(`.ref`, `.raw`, `.pinRef`) and EVERY value of the 08 dialect (including nested `Pin`
+aggregates, malformed `.pinRef` values returning `.unsupported`, and malformed `.ref`/`.raw`
+values returning `.ub`). -/
+theorem unpackDynReceiver?_hom (k : Trusted.Rustc.V2026_08_01.MirSemantics.DynReceiverKind)
+    (v : Trusted.Rustc.V2026_08_01.MirSemantics.Value) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.unpackDynReceiver? (homDRK k) (homValue v) =
+      homDynCheckPair (Trusted.Rustc.V2026_08_01.MirSemantics.unpackDynReceiver? k v) := by
+  cases k with
+  | ref _ | raw _ =>
+    rcases v with _ | _ | _ | ⟨i, fs⟩
+    · rfl
+    · rfl
+    · rfl
+    · rcases i with _ | i
+      · rcases fs with _ | ⟨d, _ | ⟨m, _ | ⟨x, rest⟩⟩⟩ <;> rfl
+      · rfl
+  | pinRef _ =>
+    rcases v with _ | _ | _ | ⟨i, fs⟩
+    · rfl
+    · rfl
+    · rfl
+    · rcases i with _ | i
+      · rcases fs with _ | ⟨inner, _ | ⟨y, rest⟩⟩
+        · rfl
+        · rcases inner with _ | _ | _ | ⟨j, gs⟩
+          · rfl
+          · rfl
+          · rfl
+          · rcases j with _ | j
+            · rcases gs with _ | ⟨d, _ | ⟨m, _ | ⟨x, rest'⟩⟩⟩ <;> rfl
+            · rfl
+        · rcases inner with _ | _ | _ | ⟨j, gs⟩
+          · rfl
+          · rfl
+          · rfl
+          · rcases j with _ | j
+            · rcases gs with _ | ⟨d, _ | ⟨m, _ | ⟨x, rest'⟩⟩⟩ <;> rfl
+            · rfl
+      · rfl
 
 /-- The only `Trusted.Rustc.V2026_06_01.MirSemantics.Value` constructor outside the embedding's image is `.uninit`. -/
 theorem homValue_ne_uninit (v : Trusted.Rustc.V2026_08_01.MirSemantics.Value) : homValue v ≠ Trusted.Rustc.V2026_06_01.MirSemantics.Value.uninit := by
@@ -1987,6 +2047,134 @@ theorem evalThinToDynUnsize_raw_hom
   | ptr p sz => exact hTail (.ptr p sz) (Nat.beq sz (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb))
   | scalar sc => exact hTail (.scalar sc) (Nat.beq sc.sizeBytes (Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb))
 
+/-- **C7** Auto-trait subset check (`defPathsSubset`) agrees identically across dialects. -/
+theorem defPathsSubset_hom (xs ys : List Trusted.Rustc.V2026_08_01.MirAst.DefPath) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.defPathsSubset xs ys =
+      Trusted.Rustc.V2026_08_01.MirSemantics.defPathsSubset xs ys := by
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.defPathsSubset
+    Trusted.Rustc.V2026_08_01.MirSemantics.defPathsSubset
+  simp only [stringEq_hom]
+
+/-- **C7** Raw `dyn Src -> dyn Dst` unsizing & trait upcasting (`evalDynToDynUnsize ... isRef :=
+false`) commutes with the embedding across ALL pointer widths (32-bit, 64-bit, etc.), ALL vtable
+and `dyn`-type graphs (`DynViewRel`), equal-key NOP, primary-prefix and `TraitVPtr` supertrait
+upcasting, auto-trait subset checks, and `.ub` / `.unsupported` faults. -/
+theorem evalDynToDynUnsize_raw_hom
+    (l6 : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (l8 : List Trusted.Rustc.V2026_08_01.MirSemantics.LocalSlot)
+    {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView}
+    {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView}
+    (h : DynViewRel mv6 mv8)
+    (ld6 : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
+    (ld8 : List Trusted.Rustc.V2026_08_01.MirAst.LocalDecl)
+    (La : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (Lb : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (hL : Trusted.Rustc.V2026_06_01.MirSemantics.layoutPointerBytes La =
+      Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb)
+    (fatVal : Trusted.Rustc.V2026_08_01.MirSemantics.Value)
+    (srcKey dstKey : String) (isMut : Bool) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize
+        l6 mv6 ld6 La (homValue fatVal) srcKey dstKey false isMut =
+      homDynCheckVal (Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize
+        l8 mv8 ld8 Lb fatVal srcKey dstKey false isMut) := by
+  rcases fatVal with _ | _ | _ | ⟨i, fs⟩
+  · rfl
+  · rfl
+  · rfl
+  · rcases i with _ | i
+    · rcases fs with _ | ⟨dv, _ | ⟨mv, _ | ⟨x, rest⟩⟩⟩
+      · rfl
+      · rfl
+      · rcases dv with _ | sc | ⟨p, sz⟩ | ⟨j, gs⟩
+        · rfl
+        · simp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize,
+            Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize, hL, homValue, homValues,
+            homScalar, stringEq_hom, checkDynVTablePtr_hom h]
+          generalize Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb = pb
+          cases Nat.beq sc.sizeBytes pb
+          · rfl
+          · cases Trusted.Rustc.V2026_08_01.MirSemantics.stringEq srcKey dstKey
+            · cases Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr .none mv8 pb mv srcKey with
+              | ub => rfl
+              | unsupported => rfl
+              | ok w =>
+                obtain ⟨entry, vts, dts⟩ := w
+                simp only [homDynCheck, lookupDynType_hom, dynTypeModeled_hom, resolveUpcastVTable?_hom]
+                cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts srcKey with
+                | none =>
+                  cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts dstKey with
+                  | none =>
+                    cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+                    · rfl
+                    · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey <;> rfl
+                  | some dd =>
+                    simp only [Option.map_none, Option.map_some, homDynType_autoTraits]
+                    cases dd.autoTraits with
+                    | nil =>
+                      cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+                      · rfl
+                      · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey <;> rfl
+                    | cons _ _ => rfl
+                | some ds =>
+                  cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts dstKey with
+                  | none =>
+                    cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+                    · rfl
+                    · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey <;> rfl
+                  | some dd =>
+                    simp only [Option.map_some, homDynType_autoTraits, defPathsSubset_hom]
+                    cases Trusted.Rustc.V2026_08_01.MirSemantics.defPathsSubset dd.autoTraits ds.autoTraits
+                    · rfl
+                    · cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+                      · rfl
+                      · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey <;> rfl
+            · cases Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr .none mv8 pb mv srcKey <;> rfl
+        · simp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize,
+            Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize, hL, homValue, homValues,
+            homPtr, stringEq_hom, checkDynVTablePtr_hom h]
+          generalize Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb = pb
+          cases Nat.beq sz pb
+          · rfl
+          · cases Trusted.Rustc.V2026_08_01.MirSemantics.stringEq srcKey dstKey
+            · cases Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr .none mv8 pb mv srcKey with
+              | ub => rfl
+              | unsupported => rfl
+              | ok w =>
+                obtain ⟨entry, vts, dts⟩ := w
+                simp only [homDynCheck, lookupDynType_hom, dynTypeModeled_hom, resolveUpcastVTable?_hom]
+                cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts srcKey with
+                | none =>
+                  cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts dstKey with
+                  | none =>
+                    cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+                    · rfl
+                    · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey <;> rfl
+                  | some dd =>
+                    simp only [Option.map_none, Option.map_some, homDynType_autoTraits]
+                    cases dd.autoTraits with
+                    | nil =>
+                      cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+                      · rfl
+                      · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey <;> rfl
+                    | cons _ _ => rfl
+                | some ds =>
+                  cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts dstKey with
+                  | none =>
+                    cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+                    · rfl
+                    · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey <;> rfl
+                  | some dd =>
+                    simp only [Option.map_some, homDynType_autoTraits, defPathsSubset_hom]
+                    cases Trusted.Rustc.V2026_08_01.MirSemantics.defPathsSubset dd.autoTraits ds.autoTraits
+                    · rfl
+                    · cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+                      · rfl
+                      · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey <;> rfl
+            · cases Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr .none mv8 pb mv srcKey <;> rfl
+        · rfl
+      · rfl
+    · rfl
+
 /-! ## C7 relational commuting theorems: `evalDynSizeAlignOfVal`, `evalAddrEqCall` -/
 
 /-- Dialect-neutral outcome class of a `dyn` intrinsic step: `.ub`, `.unsupported`, or the
@@ -2609,6 +2797,107 @@ theorem evalAddrEqCall_witness_nonempty_borrows :
         [p1, p2] [.uninit] wPlace8 (.some 1) =
       DynStepClass.run8 (.write 1 1) wBorrowState8 [.uninit] wPlace8 1 :=
   ⟨rfl, rfl⟩
+
+/-- Non-vacuity of `unpackDynReceiver?_hom` across all 3 receiver kinds (`.ref`, `.raw`,
+nested `.pinRef`) plus `.pinRef` non-aggregate `.unsupported` and `.raw` scalar `.ub` in BOTH
+dialects. -/
+theorem unpackDynReceiver?_witness :
+    let d : Trusted.Rustc.V2026_08_01.MirSemantics.Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+    let m : Trusted.Rustc.V2026_08_01.MirSemantics.Value := .ptr { allocId := 16384, offsetBytes := 0 } 8
+    let fat : Trusted.Rustc.V2026_08_01.MirSemantics.Value := .aggregate 0 [d, m]
+    let pinned : Trusted.Rustc.V2026_08_01.MirSemantics.Value := .aggregate 0 [fat]
+    Trusted.Rustc.V2026_06_01.MirSemantics.unpackDynReceiver? (homDRK (.ref .not)) (homValue fat) =
+      .ok (homValue d, homValue m) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.unpackDynReceiver? (.ref .not) fat = .ok (d, m) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.unpackDynReceiver? (homDRK (.raw .mut)) (homValue fat) =
+      .ok (homValue d, homValue m) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.unpackDynReceiver? (.raw .mut) fat = .ok (d, m) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.unpackDynReceiver? (homDRK (.pinRef .mut)) (homValue pinned) =
+      .ok (homValue d, homValue m) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.unpackDynReceiver? (.pinRef .mut) pinned = .ok (d, m) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.unpackDynReceiver? (homDRK (.pinRef .mut)) (homValue fat) =
+      .unsupported ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.unpackDynReceiver? (.pinRef .mut) fat = .unsupported ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.unpackDynReceiver? (homDRK (.raw .not)) (homValue d) = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.unpackDynReceiver? (.raw .not) d = .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Witness multi-supertrait + auto-trait environment (`Sub : Sup + Side + Send`, plus `SupSync :
+Send + Sync`) for `evalDynToDynUnsize_raw_hom`. -/
+def wUpVTables8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedVTable :=
+  [ { vtableId := 10, vtableAllocId := 16390, concreteTy := .uint .u32, dynKey := "Sub",
+      sizeBytes := 4, alignBytes := 4, primarySuperVTableId? := .some 11,
+      slots := [.dropInPlace .none, .size, .align, .traitVPtr 12] },
+    { vtableId := 11, vtableAllocId := 16391, concreteTy := .uint .u32, dynKey := "Sup",
+      sizeBytes := 4, alignBytes := 4, slots := [.dropInPlace .none, .size, .align] },
+    { vtableId := 12, vtableAllocId := 16392, concreteTy := .uint .u32, dynKey := "Side",
+      sizeBytes := 4, alignBytes := 4, slots := [.dropInPlace .none, .size, .align] } ]
+
+def wUpDynTypes8 : List Trusted.Rustc.V2026_08_01.MirAst.CapturedDynType :=
+  [ { dynKey := "Sub", predicateKey := "Sub", principalTrait? := .some "Sub",
+      typeArgs := [], assocBindings := [], autoTraits := ["Send"],
+      hasUnresolvedExistentialBinder := false, supertraitOutlivesOk := true },
+    { dynKey := "Sup", predicateKey := "Sup", principalTrait? := .some "Sup",
+      typeArgs := [], assocBindings := [], autoTraits := ["Send"],
+      hasUnresolvedExistentialBinder := false, supertraitOutlivesOk := true },
+    { dynKey := "Side", predicateKey := "Side", principalTrait? := .some "Side",
+      typeArgs := [], assocBindings := [], autoTraits := [],
+      hasUnresolvedExistentialBinder := false, supertraitOutlivesOk := true },
+    { dynKey := "SupSync", predicateKey := "SupSync", principalTrait? := .some "Sup",
+      typeArgs := [], assocBindings := [], autoTraits := ["Send", "Sync"],
+      hasUnresolvedExistentialBinder := false, supertraitOutlivesOk := true } ]
+
+def wUpBody8 : Trusted.Rustc.V2026_08_01.MirAst.CapturedMir :=
+  { wBody8 with vtables := wUpVTables8, dynTypes := wUpDynTypes8 }
+
+def wUpBody6 : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  { wBody6 with vtables := wUpVTables8.map homVTable, dynTypes := wUpDynTypes8.map homDynType }
+
+def wUpState8 : Trusted.Rustc.V2026_08_01.MirSemantics.MachineState :=
+  Trusted.Rustc.V2026_08_01.MirSemantics.initMachineStateWithCallees wUpBody8 [] [wUpBody8]
+
+def wUpState6 : Trusted.Rustc.V2026_06_01.MirSemantics.MachineState :=
+  Trusted.Rustc.V2026_06_01.MirSemantics.initMachineStateWithCallees wUpBody6 [] [wUpBody6]
+
+/-- Realizability of `DynMemRel` on the multi-supertrait + auto-trait environment. -/
+theorem wUpState_dynMemRel : DynMemRel wUpState6.memory wUpState8.memory :=
+  ⟨⟨rfl, rfl⟩, rfl, fun _ => rfl, fun _ => rfl, fun _ => rfl⟩
+
+/-- Non-vacuity of `evalDynToDynUnsize_raw_hom` across all 5 outcome branches in BOTH dialects:
+equal-key NOP (`16390 -> 16390`), primary supertrait upcast (`Sub -> Sup`: `16390 -> 16391`),
+secondary `TraitVPtr` upcast (`Sub -> Side`: `16390 -> 16392`), auto-trait violation
+(`Sub [Send] -> SupSync [Send, Sync]`: `.unsupported`), and wrong-trait vtable on NOP
+(`16391` with expected `"Sub"`: `.ub`). -/
+theorem evalDynToDynUnsize_raw_witness :
+    let mv6 := Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView.ofMemory wUpState6.memory
+    let mv8 := Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView.ofMemory wUpState8.memory
+    let subPtr : Trusted.Rustc.V2026_08_01.MirSemantics.Value :=
+      .aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8, .ptr { allocId := 16390, offsetBytes := 0 } 8]
+    let supPtr : Trusted.Rustc.V2026_08_01.MirSemantics.Value :=
+      .aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8, .ptr { allocId := 16391, offsetBytes := 0 } 8]
+    let sidePtr : Trusted.Rustc.V2026_08_01.MirSemantics.Value :=
+      .aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8, .ptr { allocId := 16392, offsetBytes := 0 } 8]
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize [] mv6 [] wLayouts6 (homValue subPtr) "Sub" "Sub" false false =
+      .ok (homValue subPtr) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts8 subPtr "Sub" "Sub" false false =
+      .ok subPtr ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize [] mv6 [] wLayouts6 (homValue subPtr) "Sub" "Sup" false false =
+      .ok (homValue supPtr) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts8 subPtr "Sub" "Sup" false false =
+      .ok supPtr ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize [] mv6 [] wLayouts6 (homValue subPtr) "Sub" "Side" false false =
+      .ok (homValue sidePtr) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts8 subPtr "Sub" "Side" false false =
+      .ok sidePtr ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize [] mv6 [] wLayouts6 (homValue subPtr) "Sub" "SupSync" false false =
+      .unsupported ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts8 subPtr "Sub" "SupSync" false false =
+      .unsupported ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize [] mv6 [] wLayouts6 (homValue supPtr) "Sub" "Sub" false false =
+      .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts8 supPtr "Sub" "Sub" false false =
+      .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.Mir.DynTraitVTableTests.Hom
 
@@ -4265,14 +4554,17 @@ run_cmd do
       `homSlot_injective, `homVTable_injective, `homScalar_injective, `homPtr_injective,
       `homValue_injective, `homValues_injective,
       `wfVTableEntry_hom, `resolveUpcastVTable?_hom, `dynUnsizeTarget?_hom,
-      `classifyDynReceiver?_hom, `narrowDynReceiver_hom,
+      `classifyDynReceiver?_hom, `narrowDynReceiver_hom, `unpackDynReceiver?_hom,
       `dynVTableEnv?_opt_hom, `dynVTableEnv?_hom,
       `checkDynVTablePtr_opt_hom, `checkDynVTablePtr_hom,
-      `evalThinToDynUnsize_raw_hom, `dynRefDataValid_scalar_hom,
+      `evalThinToDynUnsize_raw_hom, `defPathsSubset_hom, `evalDynToDynUnsize_raw_hom,
+      `dynRefDataValid_scalar_hom,
       `evalDynSizeAlignOfVal_hom, `evalAddrEqCall_hom,
       `addrRel_of_root_borrows, `addrRel_of_no_borrows,
       `wState_dynMemRel, `wBare_dynMemRel, `wBody_optBodyRel, `wState_addrRel,
-      `wBorrowState_addrRel, `witness_written_values, `checkDynVTablePtr_opt_witness,
+      `wBorrowState_addrRel, `wUpState_dynMemRel,
+      `witness_written_values, `checkDynVTablePtr_opt_witness,
+      `unpackDynReceiver?_witness, `evalDynToDynUnsize_raw_witness,
       `evalThinToDynUnsize_raw_witness_32bit_64bit,
       `dynRefDataValid_scalar_witness_32bit_uninhabited,
       `evalDynSizeAlignOfVal_witness_write, `evalDynSizeAlignOfVal_witness_ub,
