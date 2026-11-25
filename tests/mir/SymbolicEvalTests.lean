@@ -5127,7 +5127,7 @@ theorem s17_strictMemory_normalizes (body : CapturedMir) (x : Nat) (defPath : De
         nextTag := Nat.add 2 1
         borrows := [s17ThunkedBorrow]
         callees := [body]
-        activeCallee := .some { body with argCount := 0 }
+        activeCallee := .some body
         callStack :=
           narrowCallStackForTailCallee
             [ { callerBody := { body with argCount := 1 }
@@ -5152,7 +5152,7 @@ theorem s17_strictMemory_normalizes (body : CapturedMir) (x : Nat) (defPath : De
               targetProjection := [.subslice 2 4 false], rangeOffset := 4, rangeLen := 4
               targetFrameDepth := 1 } ]
         callees := [body]
-        activeCallee := .some { body with argCount := 0 }
+        activeCallee := .some body
         callStack :=
           [ { callerBody := { body with argCount := 1 }
               frame :=
@@ -5173,18 +5173,21 @@ theorem s17_strictMemory_normalizes (body : CapturedMir) (x : Nat) (defPath : De
 
 /-- Public API visibility check for all key `Lower` spine-normalizer `_eq` theorems. -/
 theorem s17_public_eq_theorems
-    (pe : ProjectionElem) (p : Place) (u : UnwindAction) (sf : SavedCallerFrame)
-    (cs : List SavedCallerFrame) (fp : FnPtrEntry) (m : Memory) (argCount : Nat)
-    (s : MachineState) :
+    (pe : ProjectionElem) (p : Place) (u : UnwindAction) (b : CapturedMir)
+    (ob : Option CapturedMir) (sf : SavedCallerFrame) (cs : List SavedCallerFrame)
+    (fp : FnPtrEntry) (m : Memory) (argCount : Nat) (s : MachineState) :
     strictProjectionElem pe = .some pe ∧
     strictPlace p = .some p ∧
     strictUnwindAction u = .some u ∧
+    strictCapturedMirHead b = .some b ∧
+    strictOptCapturedMirHead ob = .some ob ∧
     strictSavedCallerFrame sf = .some sf ∧
     strictCallStack cs = .some cs ∧
     strictFnPtrEntry fp = .some fp ∧
     strictMemory m = .some m ∧
     strictMachineState argCount s = .some s :=
   ⟨strictProjectionElem_eq pe, strictPlace_eq p, strictUnwindAction_eq u,
+   strictCapturedMirHead_eq b, strictOptCapturedMirHead_eq ob,
    strictSavedCallerFrame_eq sf, strictCallStack_eq cs, strictFnPtrEntry_eq fp,
    strictMemory_eq m, strictMachineState_eq argCount s⟩
 
@@ -5264,6 +5267,19 @@ theorem s17SymLoopPred_holds (x : Nat) :
       [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] :=
   mirBoolPredicateHoldsWithCallees_of_checkBounded 128 _ _ _
 
+/-- Complementary odd-fuel parity check for the looped fixtures (both closed and
+open-term with symbolic `x`), ensuring neither `stepMirStatePeriodic` parity
+regresses across multi-iteration `activeCallee` restores. -/
+theorem s17LoopCaller_oddFuel :
+    checkMirRustPinnedSpecOptWithCallees 97 64 s17LoopCallerMir s17Callees
+      (.some s17LoopEnsMir) [.scalar ⟨10, 4⟩] = true :=
+  rfl
+
+theorem s17SymLoopPred_holds_oddFuel (x : Nat) :
+    MirBoolPredicateHoldsWithCallees s17SymLoopPredMir s17Callees
+      [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] :=
+  mirBoolPredicateHoldsWithCallees_of_checkBounded 129 _ _ _
+
 /-- Refutation canary for `s17SymLoopPred_holds`: `y = 11` yields `107 ≠ 106`. -/
 theorem s17SymLoopPred_refutes (x : Nat) :
     checkMirBoolWithCalleesBounded 128 s17SymLoopPredMir s17Callees
@@ -5280,12 +5296,12 @@ def s17SlotBits : Nat → List LocalSlot → Nat
 
 /-- Executable trace of exactly the `stepMirStatePeriodic` schedule used by every
 closed-term checker: at each even-`fuel'` (normalizing) tick on a running state
-whose `Memory.callStack` has depth exactly `2` (`root -> mid` suspended while
-`leaf` runs, or `root` + `mid` suspended), record `(2, bits of local `slot` in the
-bottom-most suspended root caller frame)`. A `(2, v)` entry with `v` differing
-from the caller's pre-call value certifies that a normalization tick ran at
-`callStack` depth `2` *after* a cross-frame `&mut` write landed in the suspended
-root caller's frame (two frames up from the writer). -/
+whose `Memory.callStack` has depth exactly `2` (`[mid, root]` suspended while
+`leaf` runs), record `(2, bits of local `slot` in the bottom-most suspended root
+caller frame)`. A `(2, v)` entry with `v` differing from the caller's pre-call
+value certifies that a normalization tick ran at `callStack` depth `2` *after* a
+cross-frame `&mut` write landed in the suspended root caller's frame (two frames
+up from the writer). -/
 def s17PeriodicTrace (body : CapturedMir) (slot : Nat) :
     Nat → MirExecState → List (Nat × Nat) → List (Nat × Nat)
   | 0, _, acc => acc.reverse
@@ -5311,17 +5327,27 @@ def s17PeriodicTrace (body : CapturedMir) (slot : Nat) :
       | .vis (.inr (.inl _)) k => s17PeriodicTrace body slot fuel' (k PUnit.unit) acc
       | _ => acc.reverse
 
+/-- `s17PinMir` at `dischargeRustEqU32FuelFree`'s exact fuel (`16`): depth-`2`
+normalization ticks fire at entry to `s17_leaf` (`10`) and after `s17_leaf`'s
+cross-frame `&mut` write (`40`). -/
+theorem s17Pin_periodicTrace :
+    s17PeriodicTrace s17PinMir 2 16
+        (.running (initMachineStateWithCallees s17PinMir [.scalar ⟨10, 4⟩] s17FastCallees)) [] =
+      [(2, 10), (2, 40)] :=
+  rfl
+
 /-- Two `s17_mid` calls: depth-`2` normalization ticks observe the suspended
-root caller's `acc` after the first leaf write (`40`), after the first `mid`
-write (`42`, still at depth `2` before the pop is normalized), and after the
-second leaf write (`72`). -/
+root caller's `acc` after the first `s17_leaf` write (`40`), upon entering the
+second `s17_leaf` call after the first `s17_mid` returned (`42`), and after the
+second `s17_leaf` write (`72`). -/
 theorem s17Caller_periodicTrace :
     s17PeriodicTrace s17CallerMir 2 64
         (.running (initMachineStateWithCallees s17CallerMir [.scalar ⟨10, 4⟩] s17Callees)) [] =
       [(2, 40), (2, 42), (2, 72)] :=
   rfl
 
-/-- Three looped `s17_mid` calls: depth-`2` ticks at `40`, `72`, and `104`. -/
+/-- Three looped `s17_mid` calls: depth-`2` ticks observe iter 0 pre/post leaf
+(`10`, `40`), iter 1 post leaf (`72`), and iter 2 pre/post leaf (`74`, `104`). -/
 theorem s17LoopCaller_periodicTrace :
     s17PeriodicTrace s17LoopCallerMir 2 96
         (.running (initMachineStateWithCallees s17LoopCallerMir [.scalar ⟨10, 4⟩] s17Callees)) [] =
