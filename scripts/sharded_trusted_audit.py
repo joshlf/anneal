@@ -332,24 +332,45 @@ def reconcile(shard_modules: dict[str, list[tuple[str, Path]]], lean: Path = LEA
     return result
 
 
-def reconcile_lake(checkout: Path = REPO_ROOT, manifest: dict | None = None) -> dict:
-    """Reconcile every compiled Lake shard of the plan (uncompiled modules are reported)."""
+def fresh_lake_olean(checkout: Path, module: str, rel: str) -> Path | None:
+    """The Lake `.olean` of `module` only if it was built from *this* checkout's source and
+    is not older than it (a `.lake` copied from another checkout, or a stale build, is
+    evidence about different bytes and must not be reconciled)."""
+    olean, source = lake_olean(checkout, module), checkout / rel
+    trace = olean.with_suffix(".trace")
+    try:
+        if not (olean.is_file() and trace.is_file() and source.is_file()):
+            return None
+        inputs = json.dumps(json.loads(trace.read_text()).get("inputs", []))
+        if json.dumps(str(source.resolve())) not in inputs or olean.stat().st_mtime < source.stat().st_mtime:
+            return None
+    except (OSError, ValueError):
+        return None
+    return olean
+
+
+def reconcile_lake(checkout: Path = REPO_ROOT, manifest: dict | None = None, *, required: bool = True) -> dict:
+    """Reconcile every fresh compiled Lake shard of the plan (absent, foreign, or stale
+    builds are counted, never trusted)."""
     manifest = plan_shards(checkout) if manifest is None else manifest
+    paths = ct.lake_modules(checkout)
     shard_modules: dict[str, list[tuple[str, Path]]] = {}
-    missing = 0
+    unusable = 0
     for shard in manifest["shards"]:
         if shard["kind"] != "lake":
             continue
         for module in shard["modules"]:
-            path = lake_olean(checkout, module)
-            if path.is_file():
+            path = fresh_lake_olean(checkout, module, paths.get(module, ""))
+            if path is not None:
                 shard_modules.setdefault(shard["name"], []).append((module, path))
             else:
-                missing += 1
+                unusable += 1
     if not shard_modules:
-        raise Failure(2, "reconcile", "no compiled Lake modules to reconcile; run `lake build` first")
+        if required:
+            raise Failure(2, "reconcile", "no fresh Lake builds of this checkout to reconcile; run `lake build` first")
+        return {"headers": {}, "declarations": 0, "candidates": 0, "conflicts": [], "unbuiltOrStaleModules": unusable}
     result = reconcile(shard_modules)
-    result["uncompiledModules"] = missing
+    result["unbuiltOrStaleModules"] = unusable
     return result
 
 
@@ -357,11 +378,20 @@ def reconcile_lake(checkout: Path = REPO_ROOT, manifest: dict | None = None) -> 
 # Equivalence with the monolithic audit
 # ---------------------------------------------------------------------------
 
-def audit_report(checkout: Path, cache_dir: Path | None, targets=None) -> dict:
-    """In-process `check_trusted.Checker(--fast).run`, cleaning its stage afterwards."""
+def audit_report(checkout: Path, cache_dir: Path | None, targets=None, keep: tuple[list[str], Path] | None = None) -> dict:
+    """In-process `check_trusted.Checker(--fast).run`, cleaning its stage afterwards.
+
+    `keep = (modules, directory)` copies the freshly compiled, audited `.olean` of each
+    listed downstream module into `directory` before the stage is removed."""
     checker = ct.Checker(checkout, fast=True, cache_dir=cache_dir)
     try:
-        return checker.run(check_downstream=True, targets=targets)
+        report = checker.run(check_downstream=True, targets=targets)
+        if keep is not None:
+            keep[1].mkdir(parents=True, exist_ok=True)
+            for module in keep[0]:
+                olean = Path(checker.artifacts[module][0][0])
+                shutil.copyfile(olean, keep[1] / f"{module}.olean")
+        return report
     finally:
         ct.make_tree_writable(checker.stage)
         shutil.rmtree(checker.stage, ignore_errors=True)
@@ -371,7 +401,16 @@ def verify_equivalence(checkout: Path = REPO_ROOT, cache_dir: Path | None = None
     """Sharded audits vs the monolithic `check_trusted.py --fast` audit."""
     manifest = plan_shards(checkout)
     orphan = orphan_gate(checkout, manifest)
-    mono = audit_report(checkout, cache_dir)
+    keep_root = Path(tempfile.mkdtemp(prefix="anneal-equivalence-"))
+    try:
+        return _verify_equivalence(checkout, cache_dir, manifest, orphan, keep_root)
+    finally:
+        shutil.rmtree(keep_root, ignore_errors=True)
+
+
+def _verify_equivalence(checkout: Path, cache_dir: Path | None, manifest: dict, orphan: dict, keep_root: Path) -> dict:
+    all_downstream = [t[0] for t in ct.DOWNSTREAM_TARGETS]
+    mono = audit_report(checkout, cache_dir, keep=(all_downstream, keep_root / "mono"))
     trusted_keys = ("kernelDeclarations", "axioms", "graph", "inductiveReplay")
     mono_down = mono["downstream"]
     covered: set[str] = set()
@@ -379,7 +418,7 @@ def verify_equivalence(checkout: Path = REPO_ROOT, cache_dir: Path | None = None
     shards = []
     for shard in (s for s in manifest["shards"] if s["kind"] == "downstream"):
         targets = ct.resolve_exact_modules(",".join(shard["modules"]))
-        report = audit_report(checkout, cache_dir, targets)
+        report = audit_report(checkout, cache_dir, targets, keep=(shard["modules"], keep_root / shard["name"]))
         for key in trusted_keys:
             if report[key] != mono[key]:
                 raise Failure(1, "equivalence", f"shard {shard['name']} disagrees on Trusted {key}")
@@ -400,13 +439,25 @@ def verify_equivalence(checkout: Path = REPO_ROOT, cache_dir: Path | None = None
         raise Failure(1, "equivalence", "sharded downstream coverage differs from monolithic")
     if (claims, test_axioms) != (mono_down["claimTheoremsChecked"], mono_down["localTestAxioms"]):
         raise Failure(1, "equivalence", "sharded claim/test-axiom counts differ from monolithic")
-    reconciliation = reconcile_lake(checkout, manifest)
-    if reconciliation["conflicts"]:
-        raise Failure(1, "equivalence", f"cross-shard constant conflicts: {reconciliation['conflicts'][:5]}")
+    # Exact cross-shard reconciliation over the artifacts the shards actually audited (each
+    # shard contributes the modules it owns, so the shards partition the downstream modules),
+    # and declaration-set parity with the monolithic audit's artifacts.
+    downstream_shards = {s["name"]: [(m, keep_root / s["name"] / f"{m}.olean") for m in s["modules"]]
+                         for s in manifest["shards"] if s["kind"] == "downstream"}
+    sharded = reconcile(downstream_shards)
+    monolithic = reconcile({"mono": [(m, keep_root / "mono" / f"{m}.olean") for m in all_downstream]})
+    if sharded["conflicts"]:
+        raise Failure(1, "equivalence", f"cross-shard constant conflicts: {sharded['conflicts'][:5]}")
+    if sharded["declarations"] != monolithic["declarations"] or sum(sharded["headers"].values()) != sum(
+            monolithic["headers"].values()):
+        raise Failure(1, "equivalence", "sharded downstream declaration set differs from monolithic")
+    lake = reconcile_lake(checkout, manifest, required=False)
+    if lake["conflicts"]:
+        raise Failure(1, "equivalence", f"cross-shard Lake constant conflicts: {lake['conflicts'][:5]}")
     return {"orphan": orphan, "axioms": mono["axioms"], "trustedDeclarations": mono["kernelDeclarations"],
             "downstreamModules": len(covered), "claimTheoremsChecked": claims, "localTestAxioms": test_axioms,
-            "shards": shards, "reconciliation": reconciliation,
-            "violation_subject_parity_with_monolithic": True}
+            "shards": shards, "downstreamReconciliation": sharded, "downstreamDeclarations": monolithic["declarations"],
+            "lakeReconciliation": lake, "violation_subject_parity_with_monolithic": True}
 
 
 # ---------------------------------------------------------------------------

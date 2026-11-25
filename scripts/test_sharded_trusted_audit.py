@@ -418,9 +418,36 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(result["declarations"], result["headers"]["s1"] + result["headers"]["s2"])
 
     def test_live_lake_reconciliation_has_no_conflicts(self):
-        if not any(sta.lake_olean(REPO, m).is_file() for m in ct.lake_modules(REPO)):
-            self.skipTest("no compiled Lake modules")
-        self.assertEqual(sta.reconcile_lake(REPO)["conflicts"], [])
+        result = sta.reconcile_lake(REPO, required=False)
+        self.assertEqual(result["conflicts"], [])
+        self.assertLessEqual(result["unbuiltOrStaleModules"], len(ct.lake_modules(REPO)))
+
+    def test_foreign_or_stale_lake_builds_are_never_reconciled(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            source = root / "src/Foo.lean"
+            source.write_text("def x := 1\n")
+            build = root / ".lake/build/lib/lean"
+            build.mkdir(parents=True)
+            olean, trace = build / "Foo.olean", build / "Foo.trace"
+            olean.write_bytes(b"olean")
+            # Built from this checkout: usable.
+            trace.write_text(json.dumps({"inputs": [[str(source.resolve()), "0123"]]}))
+            self.assertEqual(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"), olean)
+            # Built from a different checkout (a copied `.lake`): rejected.
+            trace.write_text(json.dumps({"inputs": [["/elsewhere/src/Foo.lean", "0123"]]}))
+            self.assertIsNone(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"))
+            # Built from this checkout but older than the source: rejected.
+            trace.write_text(json.dumps({"inputs": [[str(source.resolve()), "0123"]]}))
+            stamp = source.stat().st_mtime
+            os.utime(olean, (stamp - 100, stamp - 100))
+            self.assertIsNone(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"))
+            # Missing trace: rejected.
+            os.utime(olean, (stamp + 100, stamp + 100))
+            trace.unlink()
+            self.assertIsNone(sta.fresh_lake_olean(root, "Foo", "src/Foo.lean"))
 
     def test_same_shard_conflict_and_bijective_numeric_dotted_names_detected(self):
         # Two conflicting modules in the SAME shard must still be detected.
