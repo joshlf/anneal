@@ -477,6 +477,20 @@ def lmAuthorityOfCheck (obs : Bool → Nat → CrossFramePanicObs)
 structure CrossFramePanicDualContract : Type where
   lm : CrossFramePanicLmAuthority
 
+/-- **Interface satisfiability witness** (NOT the LeanMiri closure — that is Episode 2's
+cross-root `run_cmd` instantiation from `LeanMiriSpec.CrossFrameRefAndPanicLM`): the
+`CrossFramePanicLmAuthority` obligations are jointly satisfiable by a REAL kernel-executed
+observer (MiniRust's own `Mach`/`MachTB` table), so every `∀ c : CrossFramePanicDualContract`
+theorem in this module (including the capstone and `mkCrossFramePanicDualBundle`) quantifies
+over a provably INHABITED type and can never hold vacuously. -/
+def mrBackedLmAuthority : CrossFramePanicLmAuthority where
+  observe := fun tb idx => mrObserve (CrossFramePanicMode.ofLmTreeBorrows tb) idx
+  matchesExpected := fun _ idx _ => mrObserve_matches_expected _ idx
+  outOfRange := fun _ idx h => mrObserve_out_of_range _ idx h
+
+theorem crossFramePanicDualContract_nonempty : Nonempty CrossFramePanicDualContract :=
+  ⟨⟨mrBackedLmAuthority⟩⟩
+
 theorem CrossFramePanicDualContract.lm_matches_all (c : CrossFramePanicDualContract)
     (m : CrossFramePanicMode) (idx : Nat) :
     c.lm.observe m.toLmTreeBorrows idx = authorityExpected m idx := by
@@ -2292,7 +2306,8 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       (type_of% (mrLmModeStepRel_not_mode_invariant c))) ∧
     ((type_of% @canonical_cells_nondegenerate) ∧
       (type_of% (bundle_unsupported_iff_abort c)) ∧
-      (type_of% @root_ceiling_divergence_reconciled_by_catch_harness)) :=
+      (type_of% @root_ceiling_divergence_reconciled_by_catch_harness) ∧
+      (type_of% @crossFramePanicDualContract_nonempty)) :=
   ⟨⟨crossFramePanicOutcomeCodec_tight, crossFramePanicOutcomeCodec_rejects_malformed,
       crossFrameNormalRetCodec_tight, ofMrObs_toMrObs, toMrObs_ofMrObs,
       mirToUnwindAction4_left_inv, mirToUnwindAction4_right_inv⟩,
@@ -2311,7 +2326,14 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       contract_three_way_and_root_ceiling_exact c⟩,
     ⟨crossFramePanicDualBundle_projections c, mrLmModeStepRel_not_mode_invariant c⟩,
     ⟨canonical_cells_nondegenerate, bundle_unsupported_iff_abort c,
-      root_ceiling_divergence_reconciled_by_catch_harness⟩⟩
+      root_ceiling_divergence_reconciled_by_catch_harness, crossFramePanicDualContract_nonempty⟩⟩
+
+/-- **Non-vacuous instantiation of the Episode 1 capstone** at the inhabited interface witness
+`mrBackedLmAuthority` (every `∀ c` conjunct of the capstone is thereby exhibited at a concrete,
+kernel-executed contract rather than holding over an empty type). -/
+theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone_nonvacuous :
+    type_of% (ep1_cross_frame_ref_and_panic_dual_authority_capstone ⟨mrBackedLmAuthority⟩) :=
+  ep1_cross_frame_ref_and_panic_dual_authority_capstone ⟨mrBackedLmAuthority⟩
 
 section AxiomAudit
 open Lean Elab Command

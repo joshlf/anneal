@@ -1136,7 +1136,8 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
   -- Case 16: `TerminatorKind.unreachable` via vendored `ControlFlow.evalTerminator`.
   | 16 => do
     lmUnreachableCheck
-    .ok (.okVal 0 0)
+    -- Fail-closed: reaching here would mean vendored `Unreachable` did NOT fault.
+    .ok .invalidOrUnsupported
   -- Case 17: callee `FnEntry` + write 15, vendored `Unwind.pushPayload`, failing
   -- `assert(.., unwind: .Cleanup bb2)` (vendored `assertPanic` -> `unwindToBlock`), cleanup
   -- mutates `*r = 115`, callee `UnwindResume` (vendored `returnFromCurrentFrame` pops + tears down
@@ -1292,7 +1293,8 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let st ← lmStoreU32 st px 77
     let _st ← lmStartUnwind st
     lmRootUnwindCheck
-    .ok (.okVal 0 0)
+    -- Fail-closed: reaching here would mean the root-frame unwind did NOT fault.
+    .ok .invalidOrUnsupported
   | _ => .ok .invalidOrUnsupported
 
 /-- Frozen vendored `Miri` observer (`tb = false` vs `tb = true`), fail-closed
@@ -1351,6 +1353,56 @@ theorem lm_root_unwind_boundary_vs_catch_harness :
     lmRootUnwindCaught false = .ok (.unwound 77) ∧
     lmRootUnwindCaught true = .ok (.unwound 77) := by
   rw [lmCaseU.eq_src, lmRootUnwindCaughtU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **Causal protector-release contrast for Case `21` (LeanMiri mirror of MiniRust
+`mrProg21PrematureWrite` and Trusted `mirCase21PrematureWrite`)**: identical to `lmCase 21`
+except the parent write `65` through the caller's tag `pc` happens INSIDE the callee frame,
+BEFORE vendored `UnwindResume` → `cleanupFrame` (`lmExitCall` → `BorrowTree.releaseProtector`)
+has released the callee's `FnEntry` protector on `pr`. -/
+def lmCase21PrematureWrite (tb : Bool) : Except LmExecFailure LmCrossFramePanicObs := do
+  let st := lmInit tb
+  let (px, st) ← lmAllocStack st 4 align4
+  let st ← lmStoreU32 st px 10
+  let st := lmEnterCall st
+  let (pc, st) ← lmRetagRef st px .Mutable .FnEntry
+  let st := lmEnterCall st
+  let (pr, st) ← lmRetagRef st pc .Mutable .FnEntry
+  let st ← lmStoreU32 st pr 55
+  let st ← lmStoreU32 st pc 65
+  let st ← lmStartUnwind st
+  let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+  lmCfExpect o .unwinding
+  let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Cleanup 2) st
+  lmCfExpect o (.atBlock 2)
+  let (v, st) ← lmLoadU32 st pc
+  let st ← lmStoreU32 st pc (v + 10)
+  let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+  lmCfExpect o (.atBlock 2)
+  let st ← lmCatchUnwind st
+  let (vFinal, _) ← lmLoadU32 st px
+  .ok (.okCleanupRecovered vFinal vFinal)
+
+unroll_loops lmCase21PrematureWriteU := lmCase21PrematureWrite fuel 0 with lmAllocStackU,
+  lmStoreU32U, lmLoadU32U, lmRetagRefU, lmExitCallU
+
+/-- **Causal unwind protector-release contrast on vendored `Miri` (tri-authority symmetric with
+MiniRust `mr_case21_premature_parent_write_ub_contrast` and Trusted
+`trusted_case21_premature_parent_write_ub_contrast`)**:
+- `treeBorrows = false`: the premature parent write is harmless → `.okCleanupRecovered 75 75`;
+- `treeBorrows = true`: the premature parent write while the callee's `FnEntry` protector is
+  still active faults with a vendored `BorrowTree` protected-access failure (`.treeAccess`), i.e.
+  `.ub`;
+- the SAME parent write performed AFTER vendored `UnwindResume` released the protector
+  (`lmCase true 21`) succeeds → `.okCleanupRecovered 65 65`. -/
+theorem lm_case21_premature_parent_write_ub_contrast :
+    lmCase21PrematureWrite false = .ok (.okCleanupRecovered 75 75) ∧
+    observeLm (lmCase21PrematureWrite true) = .ub ∧
+    (match lmCase21PrematureWrite true with
+      | .error (.treeAccess _) => true
+      | _ => false) = true ∧
+    lmCase true 21 = .ok (.okCleanupRecovered 65 65) := by
+  rw [lmCase21PrematureWriteU.eq_src, lmCaseU.eq_src]
   refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- Frozen expected LeanMiri table for `treeBorrows = false`. -/
@@ -2169,6 +2221,7 @@ theorem ep1_lean_miri_cross_frame_panic_capstone :
     (type_of% @lm_controlFlow_root_unwind_ub) ∧
     (type_of% @lm_cf_assert_four_way) ∧
     (type_of% @lm_root_unwind_boundary_vs_catch_harness) ∧
+    (type_of% @lm_case21_premature_parent_write_ub_contrast) ∧
     (type_of% @lm_cf_return_and_unwind_pop_laws) ∧
     (type_of% @lm_unwind_payload_lifo_and_afterStackPop_laws) ∧
     (type_of% @lm_locationState_protector_and_frozen_laws) ∧
@@ -2179,7 +2232,7 @@ theorem ep1_lean_miri_cross_frame_panic_capstone :
    @lmCrossFramePanicObserve_mode_sensitivity, @lm_tb_exact_failure_diagnostics,
    @lm_ptr_wrappingSignedOffset_roundtrip, @lm_controlFlow_unreachable_ub,
    @lm_controlFlow_unwindToBlock_laws, @lm_controlFlow_root_unwind_ub, @lm_cf_assert_four_way,
-   @lm_root_unwind_boundary_vs_catch_harness,
+   @lm_root_unwind_boundary_vs_catch_harness, @lm_case21_premature_parent_write_ub_contrast,
    @lm_cf_return_and_unwind_pop_laws, @lm_unwind_payload_lifo_and_afterStackPop_laws,
    @lm_locationState_protector_and_frozen_laws,
    @lm_globalState_endCall_lifo_preservation, @lm_multiframe_lifo_protector_release_witness,
