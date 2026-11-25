@@ -452,6 +452,33 @@ class TestPillar1InductiveReplay(unittest.TestCase):
                             res["violations"],
                         )
 
+    def test_10d_truncated_const_names_handled_without_panic_and_pkg_srcdir_redteam(self) -> None:
+        """A3: forged `.olean` with `constNames.size < constants.size` must fail cleanly with
+        `key_mismatch` (`constNames_size_mismatch` / `missing_constName_entry`) instead of
+        panicking on `data.constNames[idx]!`, and `load_lake_lean_libs` must inherit top-level
+        package `srcDir`."""
+        mod = "Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"
+        with tempfile.TemporaryDirectory(prefix="anneal-trunc-names-a3-") as tmp_str:
+            out = Path(tmp_str) / "truncate_const_names.olean"
+            proto.forge_olean_fixture(REPO_ROOT, mod, mod, "truncate_const_names", out)
+            res = proto.inspect_live_oleans(REPO_ROOT, [mod], [mod], olean_overrides={mod: str(out)})
+            codes = {v["code"] for v in res["violations"]}
+            details = {v["detail"] for v in res["violations"]}
+            self.assertIn("key_mismatch", codes, res["violations"])
+            self.assertIn("missing_constName_entry", details, res["violations"])
+
+            # Verify package-level `srcDir` inheritance in `load_lake_lean_libs`
+            pkg_root = Path(tmp_str) / "fake_pkg"
+            pkg_root.mkdir()
+            (pkg_root / "lakefile.toml").write_text(
+                'name = "demo"\nsrcDir = "lean"\n\n'
+                '[[lean_lib]]\nname = "A"\n\n'
+                '[[lean_lib]]\nname = "B"\nsrcDir = "sub"\n',
+                encoding="utf-8",
+            )
+            libs = {l["name"]: l["src_dir"] for l in proto.load_lake_lean_libs(pkg_root)}
+            self.assertEqual(libs, {"A": "lean", "B": "lean/sub"})
+
 
 class TestPillar2ShardedAuditAndOrphanGate(unittest.TestCase):
     def test_11_eight_shard_planner_covers_all_discovered_modules_nonempty_disjoint(self) -> None:
@@ -1030,6 +1057,37 @@ class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
         ok = "fn main() { let _t = Tokens::new(); let cfg = S { main: 1 }; let _ = cfg.main; }"
         self.assertEqual(proto.scan_rust_fndef_ghost_token_coercion(ok), [])
 
+    def test_23e_guard4_alias_split_double_call_and_main_alias_redteam(self) -> None:
+        """A3: catches double token issuance split across surface aliases (`Tokens::new()` +
+        `T::new()` or `mk_tok()`) via canonical root tracking, and catches `main` re-entrancy /
+        value escape through a `use self::main as run` alias."""
+        bad = {
+            "type_alias_split_double_call": (
+                "use creusot_std::ghost::Tokens as T;\n"
+                "fn main() { let _a = Tokens::new(); let _b = T::new(); }"
+            ),
+            "fn_alias_split_double_call": (
+                "use creusot_std::ghost::Tokens::new as mk_tok;\n"
+                "fn main() { let _a = Tokens::new(); let _b = mk_tok(); }"
+            ),
+            "main_alias_reentry": (
+                "use self::main as run;\n"
+                "fn main() { let _t = Tokens::new(); if cond() { run(); } }"
+            ),
+            "main_alias_higher_order": (
+                "use self::main as run;\n"
+                "fn helper() { call_twice(run); }\n"
+                "fn main() { let _t = Tokens::new(); }"
+            ),
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_rust_fndef_ghost_token_coercion(src)
+                self.assertTrue(hits, name)
+                self.assertTrue(all(h["code"] == "fndef_ghost_token_coercion" for h in hits), name)
+        ok = "use creusot_std::ghost::Tokens as T;\nfn main() { let _a = T::new(); }"
+        self.assertEqual(proto.scan_rust_fndef_ghost_token_coercion(ok), [])
+
 
 class TestPillar3Guard5ExternalTypeDropOmission(unittest.TestCase):
     def test_24_catches_direct_drop_and_transitive_drop_glue(self) -> None:
@@ -1533,6 +1591,102 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
         }.items():
             with self.subTest(name=name):
                 self.assertEqual(proto.scan_lean_assumption_polarity(pre + stmt + " := by sorry"), [], name)
+
+    def test_30j_guard6a_equation_def_match_and_clean_structured_args_redteam(self) -> None:
+        """A3: catches equation-style `def ... : ... → Prop | pat => ...` (no `:=`) and `match`
+        scrutinee/arm assumption leaks, while eliminating B3's false positives on clean
+        parenthesized projections `(spec.eval x).assumesHold = true → P`, structured calls
+        `implAssumes (mkState x) → P`, and `match` arms containing `→`."""
+        bad = {
+            "eq_style_def_pos": "def bad : EvalRes Nat → Prop\n  | i => i.assumesHold = true",
+            "match_scrutinee_assumes": (
+                "theorem t (i s : EvalRes Nat) : match i.assumesHold with\n"
+                "  | true => True | false => i.output = s.output := by sorry"
+            ),
+            "match_arm_pos": (
+                "theorem t (b : Bool) (i : EvalRes Nat) : match b with\n"
+                "  | true => i.assumesHold = true | false => Q → R := by sorry"
+            ),
+            "assumes_semantics_ignored_on_theorem": (
+                "-- @assumes_semantics\n"
+                "theorem sneaky (i : EvalRes Nat) : i.assumesHold = true := by sorry"
+            ),
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_lean_assumption_polarity(src)
+                self.assertEqual([h["code"] for h in hits], ["assumption_positive_polarity"], name)
+        ok = {
+            "clean_paren_proj": (
+                "theorem ok1 (spec impl : Spec) (x : Nat) : "
+                "(spec.eval x).assumesHold = true → (impl.eval x).output = (spec.eval x).output := by sorry"
+            ),
+            "clean_structured_arg": (
+                "theorem ok2 (s : St) (x : Nat) : implAssumes (mkState x) → ok s x := by sorry"
+            ),
+            "clean_match_arrows": (
+                "theorem ok3 (b : Bool) (i s : EvalRes Nat) : match b with\n"
+                "  | true => i.assumesHold = true → i.output = s.output\n"
+                "  | false => i.output = s.output := by sorry"
+            ),
+            "clean_eq_style_def": "def ok_eq : EvalRes Nat → Prop\n  | i => i.assumesHold = true → i.output = 0",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_assumption_polarity(src), [], name)
+
+    def test_30k_guard6b_private_helper_transitive_leak_alias_where_carrier_and_eq_def_redteam(self) -> None:
+        """A3: catches transitive `private` helper forwarding (1-hop & 2-hop, annotated &
+        unannotated), same-file type aliases (`abbrev Alias := V` + standalone `deriving instance`),
+        Lean 4 `def ... : V where val := v` struct-where syntax, equation-style `def ... | v => ⟨v⟩`,
+        and carrier structs (`structure Wrap where inner : V; def leak v : Wrap := ⟨⟨v⟩⟩`), while
+        permitting unforwarded private helpers, legitimate wrappers `def wrap (v : V) : Wrap := ⟨v⟩`,
+        and reviewed `-- @smart_constructor` functions (even with interleaved `@[inline]`)."""
+        hdr = "-- @sealed_invariant\nstructure V where\n  private mk ::\n  val : Nat\n"
+        bad = {
+            "priv_1hop_forward": "private def helper (v : Nat) : V := ⟨v⟩\ndef leak (v : Nat) : V := helper v",
+            "priv_2hop_chain": (
+                "private def h1 (v : Nat) : V := ⟨v⟩\n"
+                "private def h2 (v : Nat) : V := h1 v\n"
+                "def leak (v : Nat) : V := h2 v"
+            ),
+            "priv_unannotated_forward": "private def helper (v : Nat) : V := ⟨v⟩\ndef leak v := helper v",
+            "type_alias_escape": "abbrev Alias := V\ndef leak (v : Nat) : Alias := ⟨v⟩",
+            "alias_standalone_deriving": "abbrev Alias := V\nderiving instance Inhabited for Alias",
+            "struct_where_syntax": "def leak (v : Nat) : V where\n  val := v",
+            "eq_style_def_leak": "def leak : Nat → V\n  | v => ⟨v⟩",
+            "carrier_struct_nested_ctor": "structure Wrap where\n  inner : V\ndef leak (v : Nat) : Wrap := ⟨⟨v⟩⟩",
+            "carrier_struct_priv_helper": (
+                "structure Wrap where\n  inner : V\n"
+                "private def helper (v : Nat) : V := ⟨v⟩\n"
+                "def leak (v : Nat) : Wrap := ⟨helper v⟩"
+            ),
+        }
+        for name, body in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_lean_invariant_struct_sealing(hdr + body + "\n")
+                self.assertTrue(hits, name)
+                self.assertTrue(all(h["code"] == "unsealed_invariant_struct" for h in hits), (name, hits))
+        ok = {
+            "unforwarded_priv_helper": "private def helper (v : Nat) : V := ⟨v⟩\ndef read (x : V) : Nat := x.val",
+            "priv_helper_consumed_internally": (
+                "private def helper (v : Nat) : V := ⟨v⟩\n"
+                "def harmless (v : Nat) : Nat := (helper v).val"
+            ),
+            "legit_wrapper_from_valid_v": (
+                "structure Wrap where\n  inner : V\n"
+                "def wrap (v : V) : Wrap := ⟨v⟩"
+            ),
+            "interleaved_attr_smart_ctor": (
+                "private def helper (v : Nat) : V := ⟨v⟩\n"
+                "@[inline]\n"
+                "-- @smart_constructor\n"
+                "def mkChecked (v : Nat) : Option V := if 0 < v then some (helper v) else none"
+            ),
+        }
+        for name, body in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_invariant_struct_sealing(hdr + body + "\n"), [], name)
 
     def test_31_live_repo_sweep_zero_false_positives_on_theory_and_anneal_spec(self) -> None:
         res = proto.scan_live_repo_peer_guards(REPO_ROOT)

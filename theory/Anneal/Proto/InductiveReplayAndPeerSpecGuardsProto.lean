@@ -2542,6 +2542,34 @@ theorem tokProg_valueUse_and_loop_duplicate_tokens :
     tokProgGuard .callCtor = true := by
   decide
 
+/-- Surface-name direct-call tracker (pre-A3 bug): only rejects duplicate surface strings,
+    missing `Tokens::new()` followed by `T::new()` when `use ...::Tokens as T`. -/
+def surfaceSiteGuard (calls : List String) : Bool :=
+  hasNoDupStrings calls
+
+/-- Canonicalized direct-call tracker (A3): maps every surface alias back to its root
+    constructor identity via `canon` before enforcing uniqueness (`≤ 1` call per ctor). -/
+def canonicalSiteGuard (canon : String → String) (calls : List String) : Bool :=
+  hasNoDupStrings (calls.map canon)
+
+/-- **Alias-Split Double-Issuance Collapse & Restoration (A3)**: `surfaceSiteGuard` accepts
+    `["Tokens::new", "T::new"]` (2 runtime issuances of the same ghost-token constructor!),
+    whereas `canonicalSiteGuard` rejects it and guarantees every canonical constructor is
+    called at most once! -/
+theorem aliasCanonicalization_catches_aliased_double_issuance :
+    let canon : String → String := fun s =>
+      if s == "T::new" || s == "mk_tok" then "Tokens::new" else s
+    surfaceSiteGuard ["Tokens::new", "T::new"] = true ∧
+      canonicalSiteGuard canon ["Tokens::new", "T::new"] = false ∧
+      canonicalSiteGuard canon ["Tokens::new", "mk_tok"] = false ∧
+      canonicalSiteGuard canon ["Tokens::new"] = true := by
+  decide
+
+theorem canonicalSiteGuard_sound {canon : String → String} {calls : List String}
+    (hG : canonicalSiteGuard canon calls = true) :
+    (calls.map canon).Nodup :=
+  (hasNoDupStrings_eq_true_iff (calls.map canon)).mp hG
+
 /-! ### 4.3 Guard 5 — External-Type `Drop` Omission (`verus#3514`, rank `5`) -/
 
 /-- Specification metadata for an external Rust type declaration. -/
@@ -2711,7 +2739,8 @@ def assumesOnlyNegative : Polarity → PropFormula → Bool
 def checkAssumesNegativePolarity (f : PropFormula) : Bool :=
   assumesOnlyNegative .pos f
 
-/-- Semantic interpretation of equivalence formulas over `(specRes, implRes)`. -/
+/-- Semantic interpretation of equivalence formulas over `(specRes, implRes)`.
+    -- @assumes_semantics (meta-level PropFormula interpreter defining `.assumes` denotation) -/
 def evalEquivFormula {Val : Type} (specRes implRes : EvalRes Val) : PropFormula → Prop
   | .atom "spec.assertionFailed" => specRes.assertionFailed = true
   | .atom "impl.assertionFailed" => implRes.assertionFailed = true
@@ -3087,6 +3116,9 @@ inductive PublicExportKind : Type where
   /-- Public same-file METHOD rebuilding a struct from an existing one through the private
       constructor (e.g. `def V.decr (x : V) : V := ⟨x.val - 1⟩`) (B3). -/
   | transform (f : Nat → Nat)
+  /-- Public same-file forwarder calling a `private` helper that constructs `S`
+      (e.g. `private def h v := ⟨v⟩; def leak v := h v`) without mentioning `mk` directly (A3). -/
+  | callPrivateHelper (helperIdx : Nat)
 
 /-- Module-boundary specification for an invariant-bearing Lean `structure`. -/
 structure StructModule : Type where
@@ -3094,6 +3126,7 @@ structure StructModule : Type where
   derivesInhabited : Bool
   inv : Nat → Bool
   exports : List PublicExportKind
+  privateHelpers : List (Nat → Option Nat) := []
 
 /-- External client expression language over a `StructModule`. -/
 inductive ClientExpr : Type where
@@ -3120,6 +3153,10 @@ def ClientExpr.eval (m : StructModule) : ClientExpr → Option Nat
     | some .uncheckedLeak => some arg
     | some (.defaultInstance d) => some d
     | some (.transform _) => none
+    | some (.callPrivateHelper hIdx) =>
+      match m.privateHelpers[hIdx]? with
+      | some hFn => hFn arg
+      | none => none
     | none => none
   | .choose cond lhs rhs => if cond then lhs.eval m else rhs.eval m
   | .callMethod idx arg =>
@@ -3127,19 +3164,23 @@ def ClientExpr.eval (m : StructModule) : ClientExpr → Option Nat
     | some (.transform f) => (arg.eval m).map f
     | _ => none
 
-/-- Soundness obligation for a same-file public constructor export. -/
-def ExportPreservesInv (inv : Nat → Bool) : PublicExportKind → Prop
+/-- Soundness obligation for a same-file public export (including private-helper forwarders). -/
+def ExportPreservesInv (inv : Nat → Bool) (privHelpers : List (Nat → Option Nat) := []) :
+    PublicExportKind → Prop
   | .checkedCtor g => ∀ n, g n = true → inv n = true
   | .uncheckedLeak => False
   | .defaultInstance d => inv d = true
   | .transform f => ∀ n, inv n = true → inv (f n) = true
+  | .callPrivateHelper hIdx =>
+    ∀ hFn, privHelpers[hIdx]? = some hFn → ∀ arg v, hFn arg = some v → inv v = true
 
-/-- **Module-Boundary Sealing Guard (A2)**: requires `private mk ::`, forbids `deriving Inhabited`,
-    and requires every same-file public export to establish the struct invariant `m.inv`. -/
+/-- **Module-Boundary Sealing Guard (A2 + B3 + A3)**: requires `private mk ::`, forbids
+    `deriving Inhabited`, and requires every same-file public export (direct constructor,
+    method transform, or private-helper forwarder) to establish/preserve `m.inv`. -/
 def ModuleSealingGuard (m : StructModule) : Prop :=
   m.ctorPrivate = true ∧
     m.derivesInhabited = false ∧
-    ∀ ex ∈ m.exports, ExportPreservesInv m.inv ex
+    ∀ ex ∈ m.exports, ExportPreservesInv m.inv m.privateHelpers ex
 
 /-- **Operational Leak Collapse (A2)**: even when `private mk ::` is enabled (`ctorPrivate = true`),
     EITHER `deriving Inhabited` OR a same-file public wrapper `def V.mk' v := ⟨v⟩` allows an
@@ -3205,6 +3246,13 @@ theorem moduleSealingGuard_preserves_client_invariant {m : StructModule}
         exact hEx
       | transform _ =>
         cases hEval
+      | callPrivateHelper hIdx =>
+        simp only at hEval
+        cases hPriv : m.privateHelpers[hIdx]? with
+        | none => rw [hPriv] at hEval; cases hEval
+        | some hFn =>
+          rw [hPriv] at hEval
+          exact hEx hFn hPriv arg v hEval
   | choose cond lhs rhs ihL ihR =>
     intro v hEval
     cases cond with
@@ -3227,7 +3275,26 @@ theorem moduleSealingGuard_preserves_client_invariant {m : StructModule}
           simp only [Option.map_some, Option.some.injEq] at hEval
           subst hEval
           exact hEx w (ih hArg)
-      | checkedCtor _ | uncheckedLeak | defaultInstance _ => cases hEval
+      | checkedCtor _ | uncheckedLeak | defaultInstance _ | callPrivateHelper _ => cases hEval
+
+/-- **Private-Helper Transitive Leak Collapse (A3)**: even when `private mk ::` is enabled
+    and NO public declaration mentions `mk` or `⟨...⟩` directly, forwarding an unchecked
+    same-file `private` helper (`private def helper v := ⟨v⟩; def leak v := helper v`) lets
+    external clients forge `0 ∉ inv`. `ModuleSealingGuard` rejects it. -/
+theorem privateHelper_leaked_by_public_forwarder_collapse :
+    let posInv : Nat → Bool := fun n => decide (0 < n)
+    let modWithPrivLeak : StructModule :=
+      { ctorPrivate := true, derivesInhabited := false, inv := posInv,
+        privateHelpers := [fun n => some n],
+        exports := [.callPrivateHelper 0] }
+    (ClientExpr.callExport 0 0).eval modWithPrivLeak = some 0 ∧
+      posInv 0 = false ∧
+      ¬ ModuleSealingGuard modWithPrivLeak := by
+  refine ⟨rfl, rfl, ?_⟩
+  intro h
+  have hEx := h.2.2 (.callPrivateHelper 0) (by simp)
+  have hBad := hEx (fun n => some n) rfl 0 0 rfl
+  cases hBad
 
 /-- **Method-Leak Collapse (B3)**: a module whose ONLY constructor export is a sound checked
     smart constructor still lets clients forge `0` through an unchecked same-file method

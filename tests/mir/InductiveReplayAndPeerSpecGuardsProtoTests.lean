@@ -435,6 +435,40 @@ theorem b3_method_preserving_module_sound :
 #guard_msgs in
 #print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant
 
+/-! ## 8. A3 Regression Tests: Private-Helper Forwarders & Alias-Split Guard 4 -/
+
+theorem a3_checked_privateHelper_forwarder_sound :
+    let posInv : Nat → Bool := fun n => decide (0 < n)
+    let safePriv : Nat → Option Nat := fun n => if posInv n then some n else none
+    let m : StructModule :=
+      { ctorPrivate := true, derivesInhabited := false, inv := posInv,
+        privateHelpers := [safePriv],
+        exports := [.callPrivateHelper 0] }
+    ∀ e : ClientExpr, ∀ v, e.eval m = some v → posInv v = true := by
+  intro posInv safePriv m e v h
+  refine moduleSealingGuard_preserves_client_invariant ⟨rfl, rfl, ?_⟩ e h
+  intro ex hex
+  simp only [m, List.mem_cons, List.not_mem_nil, or_false] at hex
+  rcases hex with rfl
+  intro hFn hGet arg out hOut
+  simp only [m, List.getElem?_cons_zero, Option.some.injEq] at hGet
+  subst hGet
+  simp only [safePriv] at hOut
+  by_cases hp : posInv arg = true
+  · simp only [hp, ↓reduceIte, Option.some.injEq] at hOut
+    subst hOut
+    exact hp
+  · simp only [hp] at hOut
+    cases hOut
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.privateHelper_leaked_by_public_forwarder_collapse' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.privateHelper_leaked_by_public_forwarder_collapse
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.canonicalSiteGuard_sound' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.canonicalSiteGuard_sound
+
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
@@ -520,7 +554,10 @@ run_cmd do
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.strictConstCompat_iff_eq_nonThm,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.boolNegAssumes_antecedent_violates_antitonicity,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.publicLeakOrDerivingInhabited_forges_invalid_value,
-        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant] do
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.privateHelper_leaked_by_public_forwarder_collapse,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.aliasCanonicalization_catches_aliased_double_issuance,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.canonicalSiteGuard_sound] do
     match env.find? flagship with
     | some (.thmInfo _) =>
       unless env.getModuleIdxFor? flagship == some modIdx do

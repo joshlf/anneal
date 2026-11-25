@@ -748,7 +748,6 @@ def main (args : List String) : IO UInt32 := do
       checkedModSet := checkedModSet.insert modName
       for idx in [:data.constants.size] do
         let ci := data.constants[idx]!
-        let kName := data.constNames[idx]!
         declsChecked := declsChecked + 1
         roots := roots.push ci.name
         if let some fh := fpHandle? then
@@ -760,8 +759,12 @@ def main (args : List String) : IO UInt32 := do
           -- `Name.num`, `«a.b»`, tabs, and newlines without lossy `String.toName`.
           fh.putStrLn (toJson #[modName.toString, ci.name.toString, ciKindStr ci, lvlStr,
             toString ci.type.hash, hasVal, valHash, ciMetaTag ci, encodeNameKey ci.name]).compress
-        if kName != ci.name then
-          viols := viols.push (mkViol "key_mismatch" kName.toString ci.name.toString)
+        match data.constNames[idx]? with
+        | some kName =>
+          if kName != ci.name then
+            viols := viols.push (mkViol "key_mismatch" kName.toString ci.name.toString)
+        | none =>
+          viols := viols.push (mkViol "key_mismatch" ci.name.toString "missing_constName_entry")
         match ci with
         | .inductInfo ind =>
           inductsChecked := inductsChecked + 1
@@ -1407,6 +1410,9 @@ def main (args : List String) : IO UInt32 := do
           ci' := .thmInfo { v with value := .bvar 0 }; hit := true
       | _ => pure ()
       consts := consts.push ci'
+    if mutation == "truncate_const_names" && constNames.size > 0 then
+      constNames := constNames.pop
+      hit := true
     if let some (fn, fci) := extraRec then
       constNames := constNames.push fn
       consts := consts.push fci
@@ -1423,6 +1429,7 @@ def main (args : List String) : IO UInt32 := do
 FORGE_MUTATIONS: tuple[str, ...] = (
     "collide_nat_literal",
     "replace_defn_with_axiom",
+    "truncate_const_names",
     "flip_is_rec",
     "bump_num_indices",
     "drop_self_from_all",
@@ -1571,15 +1578,21 @@ def load_lake_lean_libs(repo_root: Path) -> list[dict[str, Any]]:
     if not lakefile.is_file():
         return []
     data = tomllib.loads(lakefile.read_text(encoding="utf-8"))
+    pkg_src = str(data.get("srcDir", "")).strip("/")
     libs: list[dict[str, Any]] = []
     for lib in data.get("lean_lib", []):
         name = str(lib["name"])
         roots = [str(r) for r in lib.get("roots", [name])]
         globs = [str(g) for g in lib.get("globs", roots)]
+        lib_src = str(lib.get("srcDir", "")).strip("/")
+        if pkg_src and lib_src:
+            eff_src = f"{pkg_src}/{lib_src}"
+        else:
+            eff_src = lib_src or pkg_src or "."
         libs.append(
             {
                 "name": name,
-                "src_dir": str(lib.get("srcDir", ".")).strip("/") or ".",
+                "src_dir": eff_src,
                 "roots": roots,
                 "globs": globs,
             }
@@ -3468,25 +3481,39 @@ def scan_rust_fndef_ghost_token_coercion(
                 continue
         i += 1
 
-    # Expand aliases to a fixed point: a `use`/`type` alias of a ctor TYPE (`Tokens`,
-    # `#[ghost_token_ctor]` impl types) aliases every ctor fn on it; an alias of a ctor FN
-    # path aliases the fn itself.
+    # Expand aliases to a fixed point while preserving CANONICAL root constructor identity (A3):
+    # `Tokens::new()` followed by `T::new()` (via `use ...::Tokens as T`) or `mk_tok()`
+    # (via `use ...::Tokens::new as mk_tok`) must collide under the same canonical key!
+    canonical_ctor: dict[tuple[str, ...], tuple[str, ...]] = {s: s for s in ctor_suffixes}
     expanded_suffixes = set(ctor_suffixes)
     changed = True
     while changed:
         changed = False
         for alias, target in path_aliases.items():
             for suf in list(expanded_suffixes):
+                root = canonical_ctor[suf]
                 if len(suf) >= 2 and target[-1:] == suf[-2:-1]:
                     cand = (alias, suf[-1])
                     if cand not in expanded_suffixes:
                         expanded_suffixes.add(cand)
+                        canonical_ctor[cand] = root
                         changed = True
                 if len(target) >= len(suf) and target[-len(suf):] == suf:
                     cand1 = (alias,)
                     if cand1 not in expanded_suffixes:
                         expanded_suffixes.add(cand1)
+                        canonical_ctor[cand1] = root
                         changed = True
+
+    # Expand aliases of single-entry authority functions (`use self::main as run;`) to fixed point.
+    authority_aliases: dict[str, str] = {a: a for a in GHOST_TOKEN_AUTHORITY_FNS}
+    changed = True
+    while changed:
+        changed = False
+        for alias, target in path_aliases.items():
+            if target and target[-1] in authority_aliases and alias not in authority_aliases:
+                authority_aliases[alias] = authority_aliases[target[-1]]
+                changed = True
 
     def matched_suffix(segs: list[str]) -> tuple[str, ...] | None:
         t_segs = tuple(segs)
@@ -3622,20 +3649,21 @@ def scan_rust_fndef_ghost_token_coercion(
                 impl_ty = enclosing_impl_type(i)
                 if impl_ty is not None:
                     segs = [impl_ty] + segs[1:]
-            # Track calls AND FnDef value references to single-entry authority functions (`main`)
+            # Track calls AND FnDef value references to single-entry authority functions (`main` & aliases)
             if (
                 segs
-                and segs[-1] in GHOST_TOKEN_AUTHORITY_FNS
+                and segs[-1] in authority_aliases
                 and (i == 0 or tokens[i - 1].text not in (".", "mod", "struct", "enum", "trait", "type", "fn"))
                 and not (next_i < n and tokens[next_i].text == ":")
             ):
-                authority_calls.append((segs[-1], i, "::".join(segs)))
+                authority_calls.append((authority_aliases[segs[-1]], i, "::".join(segs)))
             if matches_ctor(segs):
                 is_direct_call = next_i < n and tokens[next_i].text == "("
                 path_str = "::".join(segs)
                 if is_direct_call and not closure_end_stack:
                     suf = matched_suffix(segs) or tuple(segs)
-                    direct_calls.append(("::".join(suf), i, path_str))
+                    canon = canonical_ctor.get(suf, suf)
+                    direct_calls.append(("::".join(canon), i, path_str))
                 if not is_direct_call:
                     findings.append(
                         _make_peer_finding(
@@ -4278,7 +4306,7 @@ def _lex_lean_tokens_impl(text: str) -> tuple[list[Token], list[CommentSpan]]:
     n = len(text)
     i = 0
     line = 1
-    two_char_ops = {"::", ":=", "->", "/\\", "\\/", "!=", "==", "<=", ">=", "&&", "||", "@["}
+    two_char_ops = {"::", ":=", "->", "=>", "/\\", "\\/", "!=", "==", "<=", ">=", "&&", "||", "@["}
     unicode_ops = {"→", "↔", "∧", "∨", "¬", "∀", "∃", "≠", "≤", "≥"}
 
     while i < n:
@@ -4576,6 +4604,44 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
                     bad_binders.extend(_check_lean_prop_polarity(ty, binder_pol))
                 return bad_binders + _check_lean_prop_polarity(toks[idx + 1 :], pol)
 
+    # Pattern match `match scrut with | pat => arm1 | pat2 => arm2` (A3):
+    # branching on an assumption puts it in BOTH polarities (fail closed); each arm body is
+    # checked in `pol` so arrows inside arm 1 do not split across arm 2!
+    if toks[0].text == "match":
+        depth = 0
+        with_idx = -1
+        for idx in range(1, len(toks)):
+            t = toks[idx].text
+            if t in ("(", "[", "{", "⦃"):
+                depth += 1
+            elif t in (")", "]", "}", "⦄"):
+                depth = max(0, depth - 1)
+            elif depth == 0 and t == "with":
+                with_idx = idx
+                break
+        if with_idx != -1:
+            scrut = toks[1:with_idx]
+            scrut_assumes = [t for t in scrut if _is_assumes_token(t)]
+            if scrut_assumes:
+                return [scrut_assumes[0]]
+            bad_arms: list[Token] = []
+            for arm in _split_top_level_tokens(toks[with_idx + 1 :], "|"):
+                if not arm:
+                    continue
+                d_arm = 0
+                fat_arrow = -1
+                for idx_a, ta in enumerate(arm):
+                    if ta.text in ("(", "[", "{", "⦃"):
+                        d_arm += 1
+                    elif ta.text in (")", "]", "}", "⦄"):
+                        d_arm = max(0, d_arm - 1)
+                    elif d_arm == 0 and ta.text == "=>":
+                        fat_arrow = idx_a
+                        break
+                if fat_arrow != -1 and fat_arrow + 1 < len(arm):
+                    bad_arms.extend(_check_lean_prop_polarity(arm[fat_arrow + 1 :], pol))
+            return bad_arms
+
     # Conditional `if [h :] cond then t else e` (`(c → t) ∧ (¬c → e)`): condition is in BOTH polarities!
     if toks[0].text == "if":
         depth = 0
@@ -4701,23 +4767,60 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
                 do_flip = flip_on_true if lhs_s[0].text == "true" else flip_on_false
                 return _check_lean_prop_polarity(rhs_s, _flip_pol(pol) if do_flip else pol)
 
-    # Leaf / atomic expression. FAIL CLOSED (B3): an assumption atom is only polarity-
-    # transparent in a *clean* leaf: the atom itself (`i.assumesHold`), optionally applied to
-    # plain arguments (`implAssumes s`). Any other Bool-level context (`= !true`, `== false`,
-    # `.not`, `xor a b`, `P (implAssumes s)`, arithmetic, ...) has unknown polarity and is
-    # flagged in EITHER polarity instead of being enumerated case by case.
+    # Leaf / atomic expression. FAIL CLOSED (B3 + A3): an assumption atom is only polarity-
+    # transparent in a *clean* leaf:
+    #   (1) head-applied assumes: `i.assumesHold`, `implAssumes s`, `implAssumes (mkState x)`,
+    #   (2) projected assumes on a clean receiver: `(spec.eval x).assumesHold`.
+    # Any other Bool-level context (`= !true`, `== false`, `.not`, `xor a b`, `P (implAssumes s)`,
+    # arithmetic, ...) has unknown polarity and fails closed in EITHER polarity.
+    def _is_clean_assumes_leaf(core: list[Token]) -> bool:
+        if not core:
+            return False
+        # Form (1): `assumesIdent arg1 arg2 ...` where each arg is IDENT/NUMBER or clean `(...)`
+        if _is_assumes_token(core[0]):
+            k = 1
+            while k < len(core):
+                if core[k].text == "(":
+                    cl = _find_matching_delim(core, k, "(", ")")
+                    if any(_is_assumes_token(t) for t in core[k + 1 : cl]):
+                        return False
+                    k = cl + 1
+                elif core[k].kind in ("IDENT", "NUMBER") and not _is_assumes_token(core[k]):
+                    k += 1
+                else:
+                    return False
+            return True
+        # Form (2): `<clean_receiver> . assumesLeaf` (e.g. `(spec.eval x).assumesHold`)
+        if (
+            len(core) >= 3
+            and core[-2].text == "."
+            and _is_assumes_token(core[-1])
+            and "." not in core[-1].text
+        ):
+            recv = core[:-2]
+            k = 0
+            while k < len(recv):
+                if recv[k].text == "(":
+                    cl = _find_matching_delim(recv, k, "(", ")")
+                    if any(_is_assumes_token(t) for t in recv[k + 1 : cl]):
+                        return False
+                    k = cl + 1
+                elif recv[k].kind in ("IDENT", "NUMBER") and not _is_assumes_token(recv[k]):
+                    k += 1
+                elif recv[k].text == ".":
+                    k += 1
+                else:
+                    return False
+            return True
+        return False
+
     live_assumes = [
         k for k, t in enumerate(toks)
         if _is_assumes_token(t) and not (k + 1 < len(toks) and toks[k + 1].text == ":=")
     ]
     if live_assumes:
         core = _strip_outer_parens(toks)
-        clean = (
-            bool(core)
-            and _is_assumes_token(core[0])
-            and all(t.kind in ("IDENT", "NUMBER") and not _is_assumes_token(t) for t in core[1:])
-        )
-        if not clean:
+        if not _is_clean_assumes_leaf(core):
             return [toks[live_assumes[0]]]
     bad = []
     i = 0
@@ -4774,7 +4877,7 @@ def scan_lean_assumption_polarity(
     file_path: str | None = None,
 ) -> list[dict[str, Any]]:
     """Guard 6a (`Verifrag` cl/1029131309): audit Lean equivalence obligations for positive-polarity assumptions."""
-    tokens, _ = lex_lean_tokens(text)
+    tokens, comments = lex_lean_tokens(text)
     findings: list[dict[str, Any]] = []
     n = len(tokens)
     i = 0
@@ -4898,22 +5001,63 @@ def scan_lean_assumption_polarity(
                 # `T → B`, so each binder type is checked in NEGATIVE polarity.
                 for ty in _lean_binder_types(tokens[sig_start : colon_idx]):
                     binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
-            elif kw in ("def", "abbrev") and assign_idx != -1:
-                if colon_idx != -1:
-                    ret_slice = tokens[colon_idx + 1 : assign_idx]
-                    if any(t.text == "Prop" for t in ret_slice):
-                        target_slices.append(tokens[assign_idx + 1 : body_end])
+            elif kw in ("def", "abbrev"):
+                lead_comments = _comments_immediately_before(
+                    comments, tokens[start_i - 1].end if start_i > 0 else 0, tokens[j].start
+                )
+                # Explicit reviewer-audited allowlist for meta-level AST interpreters defining
+                # `.assumes` denotation (`-- @assumes_semantics`); strictly NEVER honored on
+                # `theorem`/`lemma`/`example`/`instance`/`variable`.
+                if kw == "def" and any("@assumes_semantics" in c.text for c in lead_comments):
+                    i = max(body_end, start_i + 1)
+                    continue
+                if assign_idx != -1:
+                    if colon_idx != -1:
+                        ret_slice = tokens[colon_idx + 1 : assign_idx]
+                        if any(t.text == "Prop" for t in ret_slice):
+                            target_slices.append(tokens[assign_idx + 1 : body_end])
+                            for ty in _lean_binder_types(tokens[sig_start : colon_idx]):
+                                binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
+                    else:
+                        # Unannotated `def equiv (s i : EvalRes Nat) := ... → i.assumesHold = true`
+                        body_slice = tokens[assign_idx + 1 : body_end]
+                        if any(_is_assumes_token(t) for t in body_slice) and any(
+                            t.text in _PROP_CONN for t in body_slice
+                        ):
+                            target_slices.append(body_slice)
+                            for ty in _lean_binder_types(tokens[sig_start : assign_idx]):
+                                binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
+                elif colon_idx != -1:
+                    # Equation-style `def bad : EvalRes Nat → Prop | i => i.assumesHold = true` (A3)
+                    eq_slice = tokens[colon_idx + 1 : body_end]
+                    d_eq = 0
+                    pipe_rel = -1
+                    for idx_e, te in enumerate(eq_slice):
+                        if te.text in ("(", "[", "{", "⦃"):
+                            d_eq += 1
+                        elif te.text in (")", "]", "}", "⦄"):
+                            d_eq = max(0, d_eq - 1)
+                        elif d_eq == 0 and te.text == "|":
+                            pipe_rel = idx_e
+                            break
+                    if pipe_rel != -1 and any(t.text == "Prop" for t in eq_slice[:pipe_rel]):
                         for ty in _lean_binder_types(tokens[sig_start : colon_idx]):
                             binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
-                else:
-                    # Unannotated `def equiv (s i : EvalRes Nat) := ... → i.assumesHold = true`
-                    body_slice = tokens[assign_idx + 1 : body_end]
-                    if any(_is_assumes_token(t) for t in body_slice) and any(
-                        t.text in _PROP_CONN for t in body_slice
-                    ):
-                        target_slices.append(body_slice)
-                        for ty in _lean_binder_types(tokens[sig_start : assign_idx]):
-                            binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
+                        for arm in _split_top_level_tokens(eq_slice[pipe_rel:], "|"):
+                            if not arm:
+                                continue
+                            d_a = 0
+                            fa = -1
+                            for idx_a, ta in enumerate(arm):
+                                if ta.text in ("(", "[", "{", "⦃"):
+                                    d_a += 1
+                                elif ta.text in (")", "]", "}", "⦄"):
+                                    d_a = max(0, d_a - 1)
+                                elif d_a == 0 and ta.text == "=>":
+                                    fa = idx_a
+                                    break
+                            if fa != -1 and fa + 1 < len(arm):
+                                target_slices.append(arm[fa + 1 :])
             if binder_bad:
                 findings.append(
                     _make_peer_finding(
@@ -5189,10 +5333,17 @@ def scan_lean_invariant_struct_sealing(
 
         i = max(j + 1, start_i + 1)
 
-    # Pass 2 (A2, closing B2 OPEN issue): audit same-file public constructor leaks on every
-    # sealed invariant-bearing structure (`def V.mk' v := ⟨v⟩`, `instance : Inhabited V := ⟨⟨0⟩⟩`,
-    # standalone `deriving instance Inhabited for V`).
+    # Pass 2 (A2 + B3 + A3): audit same-file public constructor leaks on every sealed
+    # invariant-bearing structure, including:
+    # - standalone `deriving instance Inhabited for V` (including via type aliases)
+    # - `def leak (v : Nat) : V where val := v` (Lean 4 struct-instance `where` syntax)
+    # - equation-style `def leak : Nat → V | v => ⟨v⟩` (no `:=` token)
+    # - type-alias & carrier-struct escaping (`abbrev Alias := V`, `structure Wrap where inner : V`)
+    # - transitive `private` helper leaks (`private def h v := ⟨v⟩; def leak v := h v`)
     if sealed_targets:
+        file_decls: list[dict[str, Any]] = []
+        file_carriers: list[dict[str, Any]] = []
+        standalone_derivings: list[tuple[int, set[str], set[str]]] = []
         i = 0
         while i < n:
             start_i = i
@@ -5202,7 +5353,7 @@ def scan_lean_invariant_struct_sealing(
             mods = {tokens[m].text for m in range(start_i, j)}
             kw = tokens[j].text
 
-            # Standalone `deriving instance Inhabited for V`
+            # Standalone `deriving instance Inhabited for V` (checked after Step 2a resolves aliases)
             if kw == "deriving" and j + 2 < n and tokens[j + 1].text == "instance":
                 k = j + 2
                 while k < n and tokens[k].text not in _LEAN_TOP_COMMANDS and tokens[k].text != "@[":
@@ -5212,23 +5363,44 @@ def scan_lean_invariant_struct_sealing(
                 if for_idx != -1:
                     cls_names = {t.text.split(".")[-1] for t in clause[:for_idx] if t.kind == "IDENT"}
                     tgt_names = {t.text for t in clause[for_idx + 1 :] if t.kind == "IDENT"}
-                    if "Inhabited" in cls_names:
-                        for st in sealed_targets:
-                            s_names = {st["qual_name"], st["raw_name"], st["short_leaf"]}
-                            if s_names & tgt_names or any(tn.split(".")[-1] == st["short_leaf"] for tn in tgt_names):
-                                findings.append(
-                                    _make_peer_finding(
-                                        "unsealed_invariant_struct",
-                                        st["qual_name"],
-                                        tokens[j].line,
-                                        "standalone `deriving instance Inhabited` synthesizes a public `default` constructor",
-                                        file_path=file_path,
-                                    )
-                                )
+                    standalone_derivings.append((tokens[j].line, cls_names, tgt_names))
                 i = max(k, start_i + 1)
                 continue
 
-            if kw in ("def", "abbrev", "instance") and "private" not in mods:
+            # Record same-file `structure`/`inductive` types as potential carriers of sealed `S`
+            if kw in ("structure", "inductive") and j + 1 < n and tokens[j + 1].kind == "IDENT":
+                cname = tokens[j + 1].text
+                k = j + 2
+                depth = 0
+                while k < n:
+                    t = tokens[k].text
+                    if t in ("(", "[", "{", "⦃", "@["):
+                        depth += 1
+                    elif t in (")", "]", "}", "⦄"):
+                        depth = max(0, depth - 1)
+                    elif depth == 0 and (
+                        t in _LEAN_TOP_COMMANDS
+                        or t == "@["
+                        or (
+                            t in _MOD_KWS
+                            and _skip_lean_attrs_and_mods(tokens, k) < n
+                            and tokens[_skip_lean_attrs_and_mods(tokens, k)].text in _LEAN_TOP_COMMANDS
+                        )
+                    ):
+                        break
+                    k += 1
+                file_carriers.append(
+                    {
+                        "name": cname,
+                        "short_name": cname.split(".")[-1],
+                        "start": j,
+                        "body_toks": tokens[j + 2 : k],
+                    }
+                )
+                i = max(k, start_i + 1)
+                continue
+
+            if kw in ("def", "abbrev", "instance"):
                 is_inst = kw == "instance"
                 if is_inst:
                     decl_name = (
@@ -5248,6 +5420,7 @@ def scan_lean_invariant_struct_sealing(
                 depth = 0
                 colon_idx = -1
                 assign_idx = -1
+                pipe_idx = -1
                 while k < n:
                     t = tokens[k].text
                     if t in ("(", "[", "{", "⦃", "@["):
@@ -5260,11 +5433,15 @@ def scan_lean_invariant_struct_sealing(
                         elif t in (":=", "where"):
                             assign_idx = k
                             break
+                        elif t == "|" and colon_idx != -1 and pipe_idx == -1:
+                            pipe_idx = k
+                            break
                         elif t in _LEAN_TOP_COMMANDS and k > sig_start:
                             break
                     k += 1
 
-                body_end = (assign_idx + 1) if assign_idx != -1 else k
+                split_idx = assign_idx if assign_idx != -1 else pipe_idx
+                body_end = (split_idx + 1) if split_idx != -1 else k
                 depth = 0
                 while body_end < n:
                     t = tokens[body_end].text
@@ -5284,63 +5461,194 @@ def scan_lean_invariant_struct_sealing(
                         break
                     body_end += 1
 
-                if assign_idx != -1:
-                    sig_toks = tokens[sig_start : (colon_idx if colon_idx != -1 else assign_idx)]
-                    ret_toks = tokens[colon_idx + 1 : assign_idx] if colon_idx != -1 else []
-                    body_toks = tokens[assign_idx + 1 : body_end]
-
-
-                    # FAIL CLOSED (B3): proof-ish tokens (`=`, `by`, `if h :`) in a signature or
-                    # body say nothing about WHICH payload is constrained, so they never exempt a
-                    # same-file public construction. Only an explicitly reviewed smart
-                    # constructor (`-- @smart_constructor` immediately before it) is exempt.
-                    lead = _comments_immediately_before(
-                        comments, tokens[start_i - 1].end if start_i > 0 else 0, tokens[start_i].start
+                if split_idx != -1:
+                    param_toks = tokens[sig_start : (colon_idx if colon_idx != -1 else split_idx)]
+                    ret_toks = tokens[colon_idx + 1 : split_idx] if colon_idx != -1 else []
+                    body_toks = tokens[(assign_idx + 1 if assign_idx != -1 else pipe_idx) : body_end]
+                    is_where_ctor = (
+                        not is_inst and assign_idx != -1 and tokens[assign_idx].text == "where"
                     )
-                    is_smart_ctor = any("@smart_constructor" in c.text for c in lead)
-                    for st in sealed_targets:
-                        if j < st["decl_end"]:
-                            continue
-                        s_names = {st["qual_name"], st["raw_name"], st["short_leaf"]}
-                        ctor = st["ctor_name"]
-
-                        def _is_s(tok: Token) -> bool:
-                            return tok.text in s_names or tok.text.split(".")[-1] == st["short_leaf"]
-
-                        explicit_ctors = {f"{sn}.{ctor}" for sn in s_names}
-                        explicit_ref = any(t.text in explicit_ctors for t in body_toks) or any(
-                            body_toks[idx].text == "." and idx + 1 < len(body_toks) and body_toks[idx + 1].text == ctor
-                            for idx in range(len(body_toks))
-                        ) or any(t.text == f".{ctor}" for t in body_toks)
-                        anon_or_struct = any(t.text in ("⟨", "{") for t in body_toks)
-                        if not (explicit_ref or anon_or_struct):
-                            continue
-                        # Where can a constructed `S` escape? Through the declared result type
-                        # (`S`, `Option S`, `S × T`, `Nat → S`), an instance whose class type
-                        # mentions `S` (`Inhabited S`, `Coe Nat S`, ...), or an unannotated body
-                        # that ascribes `S`.
-                        escapes = (
-                            explicit_ref
-                            or any(_is_s(t) for t in ret_toks)
-                            or (colon_idx == -1 and any(_is_s(t) for t in body_toks))
-                        )
-                        if not escapes or is_smart_ctor:
-                            continue
-                        what = "instance" if is_inst else kw
-                        findings.append(
-                            _make_peer_finding(
-                                "unsealed_invariant_struct",
-                                st["qual_name"],
-                                tokens[j].line,
-                                f"public same-file `{what} {decl_name}` constructs sealed `{st['short_leaf']}` "
-                                f"directly (bypassing `private {ctor} ::`); fail closed unless reviewed as "
-                                "`-- @smart_constructor`",
-                                file_path=file_path,
-                            )
-                        )
+                    lead = _comments_immediately_before(
+                        comments, tokens[start_i - 1].end if start_i > 0 else 0, tokens[j].start
+                    )
+                    file_decls.append(
+                        {
+                            "kw": kw,
+                            "is_inst": is_inst,
+                            "is_private": "private" in mods,
+                            "decl_name": decl_name,
+                            "short_name": decl_name.split(".")[-1],
+                            "line": tokens[j].line,
+                            "start": j,
+                            "colon_idx": colon_idx,
+                            "param_toks": param_toks,
+                            "ret_toks": ret_toks,
+                            "body_toks": body_toks,
+                            "is_where_ctor": is_where_ctor,
+                            "is_smart_ctor": any("@smart_constructor" in c.text for c in lead),
+                        }
+                    )
                 i = max(body_end, start_i + 1)
                 continue
             i = max(j + 1, start_i + 1)
+
+        for st in sealed_targets:
+            ctor = st["ctor_name"]
+            # Step 2a: expand same-file type aliases (`abbrev Alias := V`, `def Alias : Type := V`)
+            s_names = {st["qual_name"], st["raw_name"], st["short_leaf"]}
+            s_leaves = {st["short_leaf"]}
+            changed = True
+            while changed:
+                changed = False
+                for d in file_decls:
+                    if d["is_inst"] or d["start"] < st["decl_end"]:
+                        continue
+                    is_type_def = (d["colon_idx"] == -1 and d["kw"] == "abbrev") or any(
+                        t.text in ("Type", "Sort") or t.text.startswith("Type") for t in d["ret_toks"]
+                    )
+                    if is_type_def and any(
+                        t.text in s_names or t.text.split(".")[-1] in s_leaves for t in d["body_toks"]
+                    ):
+                        if d["decl_name"] not in s_names:
+                            s_names.add(d["decl_name"])
+                            s_leaves.add(d["short_name"])
+                            changed = True
+
+            # Also expand same-file carrier types (`structure Wrapper where inner : V`,
+            # `inductive Box | mk (x : V)`) that can smuggle a forged `V` out of the module.
+            carrier_names: set[str] = set()
+            carrier_leaves: set[str] = set()
+            changed = True
+            while changed:
+                changed = False
+                for c in file_carriers:
+                    if c["start"] < st["decl_end"] or c["name"] in s_names or c["name"] in carrier_names:
+                        continue
+                    if any(
+                        t.text in s_names
+                        or t.text.split(".")[-1] in s_leaves
+                        or t.text in carrier_names
+                        or t.text.split(".")[-1] in carrier_leaves
+                        for t in c["body_toks"]
+                    ):
+                        carrier_names.add(c["name"])
+                        carrier_leaves.add(c["short_name"])
+                        changed = True
+
+            # Check standalone `deriving instance Inhabited for V` (or alias of `V`)
+            for dline, cls_names, tgt_names in standalone_derivings:
+                if "Inhabited" in cls_names and (
+                    (s_names & tgt_names) or any(tn.split(".")[-1] in s_leaves for tn in tgt_names)
+                ):
+                    findings.append(
+                        _make_peer_finding(
+                            "unsealed_invariant_struct",
+                            st["qual_name"],
+                            dline,
+                            "standalone `deriving instance Inhabited` synthesizes a public `default` constructor",
+                            file_path=file_path,
+                        )
+                    )
+
+            def _is_s_or_alias(tok: Token) -> bool:
+                return tok.text in s_names or tok.text.split(".")[-1] in s_leaves
+
+            def _is_carrier(tok: Token) -> bool:
+                return tok.text in carrier_names or tok.text.split(".")[-1] in carrier_leaves
+
+            explicit_ctors = {f"{sn}.{ctor}" for sn in s_names}
+
+            def _direct_ctor_flags(d: dict[str, Any]) -> tuple[bool, bool, int]:
+                body_toks = d["body_toks"]
+                exp_ref = (
+                    any(t.text in explicit_ctors for t in body_toks)
+                    or any(
+                        body_toks[idx].text == "."
+                        and idx + 1 < len(body_toks)
+                        and body_toks[idx + 1].text == ctor
+                        for idx in range(len(body_toks))
+                    )
+                    or any(t.text == f".{ctor}" for t in body_toks)
+                )
+                anon_count = sum(1 for t in body_toks if t.text in ("⟨", "{"))
+                if d["is_where_ctor"]:
+                    anon_count += 1
+                return exp_ref, anon_count > 0, anon_count
+
+            # Step 2b: transitive taint over same-file `private` helpers constructing `S`
+            tainted_priv: set[str] = set()
+            tainted_priv_leaves: set[str] = set()
+            changed = True
+            while changed:
+                changed = False
+                for d in file_decls:
+                    if not d["is_private"] or d["is_smart_ctor"] or d["start"] < st["decl_end"]:
+                        continue
+                    exp_ref, anon, anon_count = _direct_ctor_flags(d)
+                    calls_tainted = any(
+                        t.text in tainted_priv or t.text.split(".")[-1] in tainted_priv_leaves
+                        for t in d["body_toks"]
+                    )
+                    ret_s = any(_is_s_or_alias(t) for t in d["ret_toks"])
+                    ret_car = any(_is_carrier(t) for t in d["ret_toks"])
+                    params_s = any(_is_s_or_alias(t) or _is_carrier(t) for t in d["param_toks"])
+                    constructs_s = (
+                        exp_ref
+                        or calls_tainted
+                        or (
+                            anon
+                            and (
+                                ret_s
+                                or (ret_car and (anon_count >= 2 or not params_s))
+                                or (d["colon_idx"] == -1 and any(_is_s_or_alias(t) for t in d["body_toks"]))
+                            )
+                        )
+                    )
+                    if constructs_s and d["decl_name"] not in tainted_priv:
+                        tainted_priv.add(d["decl_name"])
+                        tainted_priv_leaves.add(d["short_name"])
+                        changed = True
+
+            # Step 2c: flag any non-private declaration that directly constructs OR transitively
+            # forwards a tainted private helper into an escaping position (unless reviewed).
+            for d in file_decls:
+                if d["is_private"] or d["is_smart_ctor"] or d["start"] < st["decl_end"]:
+                    continue
+                exp_ref, anon, anon_count = _direct_ctor_flags(d)
+                calls_tainted = any(
+                    t.text in tainted_priv or t.text.split(".")[-1] in tainted_priv_leaves
+                    for t in d["body_toks"]
+                )
+                if not (exp_ref or anon or calls_tainted):
+                    continue
+                ret_mentions_s = any(_is_s_or_alias(t) for t in d["ret_toks"])
+                ret_mentions_car = any(_is_carrier(t) for t in d["ret_toks"])
+                params_mentions_s = any(_is_s_or_alias(t) or _is_carrier(t) for t in d["param_toks"])
+                unannotated_escapes = d["colon_idx"] == -1 and (
+                    calls_tainted or any(_is_s_or_alias(t) for t in d["body_toks"])
+                )
+                carrier_escapes = ret_mentions_car and (
+                    calls_tainted or exp_ref or anon_count >= 2 or (anon and not params_mentions_s)
+                )
+                escapes = exp_ref or ret_mentions_s or unannotated_escapes or carrier_escapes
+                if not escapes:
+                    continue
+                what = "instance" if d["is_inst"] else d["kw"]
+                via = (
+                    "transitively via an unreviewed `private` helper"
+                    if calls_tainted and not (exp_ref or anon)
+                    else f"directly (bypassing `private {ctor} ::`)"
+                )
+                findings.append(
+                    _make_peer_finding(
+                        "unsealed_invariant_struct",
+                        st["qual_name"],
+                        d["line"],
+                        f"public same-file `{what} {d['decl_name']}` constructs sealed `{st['short_leaf']}` "
+                        f"{via}; fail closed unless reviewed as `-- @smart_constructor`",
+                        file_path=file_path,
+                    )
+                )
 
     return findings
 
