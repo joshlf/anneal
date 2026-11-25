@@ -20,26 +20,27 @@ Establishes dual-authority correspondence between Anneal's trusted MIR semantics
 (`Miri.Interpreter.{Float,FloatOps,ScalarOps,Rvalue,Step,Cast}` and `Miri.Memory.Allocation`
 under runtime `Provenance` vs. CTFE `CtfeProvenance`):
 
-* **Part 1 — Engine-Level `FloatBits` Correspondence (`f32` & `f64`)**: `floatBits_negate_eq`,
-  `floatBits_partialCompare_eq`, `floatBits_comparison_eq`, `floatBits_exactSum_eq`,
-  `floatBits_arithmetic_eq` (mapping `.sub` directly to `.Sub` *before* `adjustNaN`), and
-  `floatBits_nanChoices_{list,binary,binary_bits,binary_toNat}_eq`.
-* **Part 2 — `FloatOps.{unary, binary}` & Conservative Step-Hook Overlay**:
-  `floatOps_unary_neg_eq`, `floatOps_binary_cmp_eq`, `floatOps_binary_arith_deterministic_eq`,
-  nondeterministic soundness (`floatOps_binary_arith_any_chooseNaN_rel`) + completeness
-  (`floatOps_binary_arith_completeness`), fail-closed errors (`floatOps_unary_nonNeg_err`,
-  `floatOps_binary_unsupported_err`, `floatOps_f16_f128_unsupported`), and conservative overlay
-  `annealStepHooksFloatArith`.
-* **Part 3 — Real `Step.step` vs. `stepMirFn` / `EvalRvalueFloatRel` Step Simulations**:
-  immediate-local and memory-backed (`LocalRel.indirect`) simulations over `StateRelLM3_1` /
-  `StepRelLM3_1` for unary negation, comparisons (`-> bool`), deterministic and nondeterministic
-  arithmetic (soundness + completeness), uninit UB lockstep, and `f16`/`f128` + invalid-`BinOp`
+* **Part 1 — Engine-Level `FloatBits` Correspondence (`f32` & `f64`)**: `floatBits_negate_eq`, `floatBits_partialCompare_eq`,
+  `floatBits_comparison_eq`, `floatBits_exactSum_eq`, `floatBits_arithmetic_eq` (mapping `.sub` directly to `.Sub` *before*
+  `adjustNaN`), and `floatBits_nanChoices_{list,binary,binary_bits,binary_toNat}_eq`.
+* **Part 2 — `FloatOps.{unary, binary}` & Conservative Step-Hook Overlay**: `floatOps_unary_neg_eq`, `floatOps_binary_cmp_eq`,
+  `floatOps_binary_arith_deterministic_eq`, nondeterministic soundness (`floatOps_binary_arith_any_chooseNaN_rel`), index-exact
+  completeness (`floatOps_binary_arith_pure_index_exact`, `floatOps_binary_arith_completeness`), the valid default binary selector
+  `annealChooseBinaryNaN` (`annealChooseQuietedNaN = pure 2` is NOT valid on the two-candidate `∞ - ∞` list), fail-closed errors
+  (`floatOps_unary_nonNeg_err`, `floatOps_binary_unsupported_err`, `floatOps_f16_f128_unsupported`), and `annealStepHooksFloatArith`.
+* **Part 3 — Real `Step.step` vs. `stepMirFn` / `EvalRvalueFloatRel` Step Simulations**: immediate-local and memory-backed
+  (`LocalRel.indirect`) simulations over `StateRelLM3_1` / `StepRelLM3_1` for unary negation, comparisons (`-> bool`), deterministic
+  and nondeterministic arithmetic (soundness + index-exact completeness), uninit UB lockstep, and `f16`/`f128` + invalid-`BinOp`
   fail-closed boundaries.
-* **Part 4 — `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) & Shared Witnesses `W1–W6`**:
-  runtime `Provenance` (`offsetIsAddr = true`, strip) vs. `CtfeProvenance` (`offsetIsAddr = false`,
-  `.readPointerAsInt`), provenance-free `{to,from}_bits` agreement, uninit + no-forgery `usize -> &u8`
-  UB under both policies, concrete witnesses `w1_lm_finite_subnormal_overflow` ..
-  `w6_lm_no_forge_ref_uninit`, and complete standard-axiom guards.
+* **Part 4 — `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) & Shared Witnesses `W1–W7`**: runtime `Provenance`
+  (`offsetIsAddr = true`, strip) vs. `CtfeProvenance` (`offsetIsAddr = false`, `.readPointerAsInt`), provenance-free `{to,from}_bits`
+  agreement, uninit + no-forgery `usize -> &u8` UB under both policies, the pinned `miriTransmuteScalarCheck` policy arms (raw-pointer
+  destinations keep provenance under BOTH policies), witnesses `w1_lm_*` .. `w7_lm_*`, and complete standard-axiom guards.
+
+`miri#5643` ordering: for `.sub`, BOTH authorities build the NaN candidate list from the ORIGINAL operands (`Trusted`'s
+`EvalFloatBinOpRel` uses `nanChoices f [(f, lhs), (f, rhs)]`; vendored `FloatOps.binary` calls `adjustNaN` on `[leftBits, rightBits]`
+for all five operators). Only `exactSumFloat` / `FloatBits.arithmetic` negate the rhs internally; negating it before `nanChoices`
+would give the same candidate SET in a different ORDER (`w3_lm_nan_choices_and_sub_order`, `w7_lm_f64_and_sub_index_exact`).
 -/
 
 namespace LeanMiriSpec.FloatArithLM
@@ -53,7 +54,6 @@ open Anneal.Mir.IeeeFloatArith
 open LeanMiriSpec.Correspondence
 
 /-! ## Part 1. Engine-Level `Miri.Interpreter.FloatBits` Correspondence (`f32` & `f64`) -/
-
 local macro "miriExactSum" : term => `(miri_private% Miri.Interpreter.Float Miri.Interpreter.FloatBits.exactSum)
 local macro "miriSignedNumerator" : term => `(miri_private% Miri.Interpreter.Float Miri.Interpreter.FloatBits.signedNumerator)
 local macro "miriEncode" : term => `(miri_private% Miri.Interpreter.Float Miri.Interpreter.FloatBits.encode)
@@ -66,7 +66,6 @@ local macro "miriScalarOpsToScalar" : term => `(miri_private% Miri.Interpreter.S
 local macro "miriScalarOpsAssertSameType" : term => `(miri_private% Miri.Interpreter.ScalarOps Miri.Interpreter.ScalarOps.assertSameType)
 
 /-! ### 1.1 Bitwise unary negation (`FloatBits.negate` vs. `evalFloatNeg`) -/
-
 private theorem unpackBits_neg_eq_decide (f : IeeeFormat) (bits : Nat) (h : bits < 2 ^ f.width) :
     (unpackBits f bits).neg = decide (2 ^ (f.width - 1) ≤ bits) := by
   have hsplit : 2 ^ f.width = 2 * 2 ^ (f.width - 1) := by cases f <;> decide
@@ -104,7 +103,6 @@ theorem floatBits_negate_eq (f : IeeeFormat) (bits : Nat) (h : bits < 2 ^ f.widt
   by_cases hle : 2 ^ (f.width - 1) ≤ bits <;> simp [hle]
 
 /-! ### 1.2 Partial ordering and 6-operator comparisons -/
-
 private theorem int_compare_eq_if (x y : Int) :
     compare x y = (if x < y then Ordering.lt else if x = y then Ordering.eq else Ordering.gt) := rfl
 
@@ -213,7 +211,6 @@ theorem floatBits_comparison_eq (op : MirAst.BinOp) (f : IeeeFormat) (a b : Nat)
   all_goals cases evalFloatPartialCompare f a b with | none => rfl | some ord => cases ord <;> rfl
 
 /-! ### 1.3 Exact sum and 5-operator arithmetic (`Add`, `Sub`, `Mul`, `Div`, `Rem`) -/
-
 private theorem miriExactSum_eq (f : Miri.Interpreter.FloatFormat)
     (l r : Miri.Interpreter.FloatDecoded) :
     miriExactSum f l r =
@@ -266,8 +263,7 @@ private theorem roundRatio_zero_eq_zeroBits (f : IeeeFormat) (neg : Bool) (d : N
 /-- **Exact-sum equivalence**: vendored `FloatBits.exactSum` agrees identically with `exactSumFloat`
 on all decoded `FloatKind` values with positive finite numerators/denominators. -/
 theorem floatBits_exactSum_eq (f : IeeeFormat) (lk rk : FloatKind)
-    (hl : ∀ neg n d, lk = .finite neg n d → 0 < n ∧ 0 < d)
-    (hr : ∀ neg n d, rk = .finite neg n d → 0 < n ∧ 0 < d) :
+    (hl : ∀ neg n d, lk = .finite neg n d → 0 < n ∧ 0 < d) (hr : ∀ neg n d, rk = .finite neg n d → 0 < n ∧ 0 < d) :
     miriExactSum (ieeeFormatToMiri f) (floatKindToMiriDecoded f lk) (floatKindToMiriDecoded f rk) =
       .ok ⟨ieeeFormatToMiri f, BitVec.ofNat 128 (exactSumFloat f lk rk)⟩ := by
   have hzden_pos : 0 < (powScale 0 1 (f.minExponent - (f.fractionBits : Int))).2 :=
@@ -497,7 +493,6 @@ theorem floatBits_arithmetic_eq (op : MirAst.BinOp) (f : IeeeFormat) (a b : Nat)
   | _ => rfl
 
 /-! ### 1.4 Ordered `FloatBits.nanChoices` correspondence (general list & binary) -/
-
 private def nanCollectBody (target : Miri.Interpreter.FloatFormat) (input : Miri.Interpreter.FloatBits)
     (acc : List Miri.Interpreter.FloatBits × List Miri.Interpreter.FloatBits) :
     Except Miri.Interpreter.FloatError
@@ -557,8 +552,7 @@ private def miriNanSigFn (dst : IeeeFormat) (fb : Miri.Interpreter.FloatBits) :
   | none => none
 
 private theorem nanChoices_collect_eq (target : Miri.Interpreter.FloatFormat)
-    (quietFn sigFn : Miri.Interpreter.FloatBits → Option Miri.Interpreter.FloatBits)
-    (inputs accQ accS : List Miri.Interpreter.FloatBits)
+    (quietFn sigFn : Miri.Interpreter.FloatBits → Option Miri.Interpreter.FloatBits) (inputs accQ accS : List Miri.Interpreter.FloatBits)
     (hstep : ∀ x ∈ inputs, ∀ q s, nanCollectBody target x (q, s) =
       .ok (ForInStep.yield
         (match quietFn x with | none => q | some c => q ++ [c],
@@ -586,10 +580,8 @@ private theorem nanChoices_sign_eq (negFn : Miri.Interpreter.FloatBits → Miri.
     rw [ih (acc ++ [c, negFn c]) (fun y hy => hneg y (List.mem_cons_of_mem _ hy)), List.append_assoc]
 
 private theorem miri_nanChoices_nondet_decomp (target : Miri.Interpreter.FloatFormat)
-    (inputs : List Miri.Interpreter.FloatBits)
-    (quietFn sigFn : Miri.Interpreter.FloatBits → Option Miri.Interpreter.FloatBits)
-    (negFn : Miri.Interpreter.FloatBits → Miri.Interpreter.FloatBits)
-    (hstep : ∀ x ∈ inputs, ∀ q s, nanCollectBody target x (q, s) =
+    (inputs : List Miri.Interpreter.FloatBits) (quietFn sigFn : Miri.Interpreter.FloatBits → Option Miri.Interpreter.FloatBits)
+    (negFn : Miri.Interpreter.FloatBits → Miri.Interpreter.FloatBits) (hstep : ∀ x ∈ inputs, ∀ q s, nanCollectBody target x (q, s) =
       .ok (ForInStep.yield
         (match quietFn x with | none => q | some c => q ++ [c],
          match sigFn x with | none => s | some c => s ++ [c])))
@@ -797,7 +789,6 @@ theorem floatBits_nanChoices_binary_toNat_eq (f : IeeeFormat) (a b : Nat)
   exact bitVec128_toNat_of_lt_width (mem_nanChoices_props f [(f, a), (f, b)] _ bits hmem).1
 
 /-! ## Part 2. `Miri.Interpreter.FloatOps.{unary, binary}` & Conservative Step-Hook Overlay -/
-
 /-- Valid state-preserving NaN selector for binary float arithmetic (`cs.length ≥ 2` holds
 unconditionally in nondeterministic mode by `nanChoices_length_bounds`). -/
 def ValidBinaryChooseNaN
@@ -810,13 +801,33 @@ theorem validBinaryChooseNaN_pure (i : Nat) (hi : i < 2) :
     ValidBinaryChooseNaN (fun _ _ => pure i) :=
   fun _ _ hlen => ⟨i, by omega, rfl⟩
 
+/-- Default binary-arithmetic NaN selector, valid on EVERY nonempty candidate list: index `2` (the quieted first
+NaN input, agreeing with `annealChooseQuietedNaN` on every list of length `≥ 3`) when it exists, else index `0`
+(preferred NaN). -/
+def annealChooseBinaryNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat :=
+  fun _ cs => pure (if 2 < cs.length then 2 else 0)
+
+theorem annealChooseBinaryNaN_valid : ValidBinaryChooseNaN annealChooseBinaryNaN :=
+  fun _ cs hlen => ⟨if 2 < cs.length then 2 else 0, by split <;> omega, rfl⟩
+
+/-- **Round-1 finding (repaired default)**: the float-cast refinement witness `annealChooseQuietedNaN` (`pure 2`) is
+NOT a valid binary selector. NaN-producing arithmetic on non-NaN operands (`∞ - ∞`, `0 * ∞`, `0 / 0`, `x % 0`) has
+exactly the two candidates `[pref, -pref]`, so index `2` makes `FloatOps.adjustNaN` throw
+`invalid floating NaN choice index` where `Trusted` succeeds; the `*FloatArith` overlays below therefore default to
+`annealChooseBinaryNaN`. -/
+theorem annealChooseQuietedNaN_not_validBinary (st : AnnealStepState) (c : Miri.Interpreter.FloatBits) :
+    ¬ ValidBinaryChooseNaN annealChooseQuietedNaN := by
+  intro h
+  obtain ⟨idx, hlt, hsel⟩ := h st [c, c] (Nat.le_refl 2)
+  have h2 : (2 : Nat) = idx := by injection hsel
+  have hlt' : idx < 2 := hlt
+  omega
+
 /-- **`FloatOps.unary` on `.Neg` correspondence**: agrees bit-for-bit with `evalFloatNeg` across
 all canonical `f32`/`f64` bit patterns with **zero NaN adjustment** (preserving sNaN/qNaN payloads). -/
 theorem floatOps_unary_neg_eq (layouts : LayoutTable) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {ty : Ty} {f : IeeeFormat} (hf : ieeeFormatOfTy? ty = some f)
-    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} (hrel : ScalarRel sc msc)
-    (hsz : sc.sizeBytes = f.byteWidth) :
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {ty : Ty} {f : IeeeFormat} (hf : ieeeFormatOfTy? ty = some f)
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} (hrel : ScalarRel sc msc) (hsz : sc.sizeBytes = f.byteWidth) :
     ∃ msc', ScalarRel ⟨evalFloatNeg f sc.bits, f.byteWidth⟩ msc' ∧
       Miri.Interpreter.FloatOps.unary (annealFloatOpsHooks nondet chooseNaN) () .Neg
           ⟨.scalar (.fromScalarInt msc), translateTy ty layouts⟩ =
@@ -838,8 +849,7 @@ theorem floatOps_unary_neg_eq (layouts : LayoutTable) (nondet : Bool)
 
 /-- `FloatOps.unary` rejects non-`.Neg` unary operators with `.invalidProgram`. -/
 theorem floatOps_unary_nonNeg_err (layouts : LayoutTable) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {ty : Ty} {f : IeeeFormat} (hf : ieeeFormatOfTy? ty = some f)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {ty : Ty} {f : IeeeFormat} (hf : ieeeFormatOfTy? ty = some f)
     {op : Miri.MIR.UnOp} (hne : op ≠ .Neg) (msc : Miri.Memory.ScalarInt) (st : AnnealStepState) :
     Miri.Interpreter.FloatOps.unary (annealFloatOpsHooks nondet chooseNaN) () op
         ⟨.scalar (.fromScalarInt msc), translateTy ty layouts⟩ st =
@@ -850,8 +860,7 @@ theorem floatOps_unary_nonNeg_err (layouts : LayoutTable) (nondet : Bool)
     pure_bind, hbne, ↓reduceIte]; rfl
 
 private theorem floatOps_adjustNaN_not_nan (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    (f : IeeeFormat) (baseBits : Nat) (hblt : baseBits < 2 ^ f.width)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) (f : IeeeFormat) (baseBits : Nat) (hblt : baseBits < 2 ^ f.width)
     (hnan : isNaNBits f baseBits = false) (inputs : List Miri.Interpreter.FloatBits) :
     Miri.Interpreter.FloatOps.adjustNaN (annealFloatOpsHooks nondet chooseNaN) ()
         ⟨ieeeFormatToMiri f, BitVec.ofNat 128 baseBits⟩ inputs =
@@ -860,12 +869,9 @@ private theorem floatOps_adjustNaN_not_nan (nondet : Bool)
   simp [floatBits_isNaN_eq f baseBits hblt, hnan, floatOps_engine_ok, pure_bind]
 
 private theorem floatOps_binary_arith_red (layouts : LayoutTable) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {op : MirAst.BinOp} (harith : isFloatArithBinOp op = true)
-    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
-    {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
-    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc)
-    (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {op : MirAst.BinOp} (harith : isFloatArithBinOp op = true)
+    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f) {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
+    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc) (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth)
     {baseBits : Nat} (hbase : evalFloatArithBase op f lSc.bits rSc.bits = .some baseBits) :
     Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks nondet chooseNaN) () (translateBinOp op)
         ⟨.scalar (.fromScalarInt lMsc), translateTy lTy layouts⟩
@@ -894,12 +900,9 @@ private theorem floatOps_binary_arith_red (layouts : LayoutTable) (nondet : Bool
 /-- **`FloatOps.binary` comparison correspondence** (`Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`):
 produces `Scalar.fromBool` matching `evalFloatCmp`, independently of `nondet` and `chooseNaN`. -/
 theorem floatOps_binary_cmp_eq (layouts : LayoutTable) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {op : MirAst.BinOp} (hcmp : isFloatCmpBinOp op = true)
-    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
-    {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
-    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc)
-    (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) :
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {op : MirAst.BinOp} (hcmp : isFloatCmpBinOp op = true)
+    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f) {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
+    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc) (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) :
     ∃ res, evalFloatCmp op f lSc.bits rSc.bits = .some res ∧
       ScalarRel (boolToScalar res) (Miri.Memory.ScalarInt.ofBool res) ∧
       Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks nondet chooseNaN) () (translateBinOp op)
@@ -926,12 +929,9 @@ theorem floatOps_binary_cmp_eq (layouts : LayoutTable) (nondet : Bool)
 /-- **`FloatOps.binary` deterministic arithmetic correspondence** (`floatNondeterministic := false`):
 matches `evalFloatBinOp` (`evalFloatArithBase`) bit-for-bit across `add`/`sub`/`mul`/`div`/`rem`. -/
 theorem floatOps_binary_arith_deterministic_eq (layouts : LayoutTable)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {op : MirAst.BinOp} (harith : isFloatArithBinOp op = true)
-    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
-    {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
-    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc)
-    (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) :
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {op : MirAst.BinOp} (harith : isFloatArithBinOp op = true)
+    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f) {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
+    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc) (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) :
     ∃ baseBits msc',
       evalFloatArithBase op f lSc.bits rSc.bits = .some baseBits ∧
       evalFloatBinOp op f lSc.bits rSc.bits = .some ⟨baseBits, f.byteWidth⟩ ∧
@@ -969,10 +969,8 @@ selector, `FloatOps.binary` (`floatNondeterministic := true`) produces an `outSc
 theorem floatOps_binary_arith_any_chooseNaN_rel (layouts : LayoutTable)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
     (hvalid : ValidBinaryChooseNaN chooseNaN) {op : MirAst.BinOp} (harith : isFloatArithBinOp op = true)
-    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
-    {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
-    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc)
-    (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) (st : AnnealStepState) :
+    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f) {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
+    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc) (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) (st : AnnealStepState) :
     ∃ outSc msc', EvalFloatBinOpRel .nondeterministic op f lSc.bits rSc.bits outSc ∧ ScalarRel outSc msc' ∧
       Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks true chooseNaN) () (translateBinOp op)
           ⟨.scalar (.fromScalarInt lMsc), translateTy lTy layouts⟩
@@ -1031,64 +1029,84 @@ theorem floatOps_binary_arith_any_chooseNaN_rel (layouts : LayoutTable)
     rw [congrFun hbin_red st, EStateM.bind_eq_ok hadj_st,
       congrFun (floatOps_scalarResult_eq f hlf layouts candBits hfrom) st]; rfl
 
-/-- **Nondeterministic `FloatOps.binary` COMPLETENESS (converse of soundness)**: for EVERY `outSc`
-admitted by `EvalFloatBinOpRel .nondeterministic`, there EXISTS a constant index `idx` such that
-`chooseNaN := fun _ _ => pure idx` makes `FloatOps.binary` return a `ScalarRel`-related `msc'`. -/
-theorem floatOps_binary_arith_completeness (layouts : LayoutTable)
-    {op : MirAst.BinOp} (harith : isFloatArithBinOp op = true)
-    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
-    {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
-    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc)
-    (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth)
-    {outSc : MirAst.ScalarInt} (hout : EvalFloatBinOpRel .nondeterministic op f lSc.bits rSc.bits outSc) :
-    ∃ idx msc', ScalarRel outSc msc' ∧
+/-- **Index-exact nondeterministic `FloatOps.binary` correspondence** (sharpens completeness): under the constant
+selector `fun _ _ => pure idx`, `FloatOps.binary` returns EXACTLY the `idx`-th element of `Trusted`'s ordered
+`nanChoices f [(f, lhs), (f, rhs)]` when the base result is NaN, and `baseBits` for EVERY `idx` otherwise. For `.sub`
+the list is built from the ORIGINAL (un-negated) rhs in BOTH authorities (`miri#5643`): vendored `FloatOps.binary`
+passes `[leftBits, rightBits]` to `adjustNaN` for all five arithmetic operators. -/
+theorem floatOps_binary_arith_pure_index_exact (layouts : LayoutTable) (idx : Nat)
+    {op : MirAst.BinOp} (harith : isFloatArithBinOp op = true) {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
+    {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt} (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc)
+    (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) {baseBits outBits : Nat} (hbase : evalFloatArithBase op f lSc.bits rSc.bits = .some baseBits)
+    (hsel : (isNaNBits f baseBits = true ∧ (nanChoices f [(f, lSc.bits), (f, rSc.bits)] .nondeterministic)[idx]? = some outBits) ∨
+      (isNaNBits f baseBits = false ∧ outBits = baseBits)) :
+    ∃ msc', ScalarRel ⟨outBits, f.byteWidth⟩ msc' ∧
       Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks true (fun _ _ => pure idx)) () (translateBinOp op)
           ⟨.scalar (.fromScalarInt lMsc), translateTy lTy layouts⟩
           ⟨.scalar (.fromScalarInt rMsc), translateTy rTy layouts⟩ =
         pure ⟨.scalar (.fromScalarInt msc'), translateTy lTy layouts⟩ := by
   have ha : lSc.bits < 2 ^ f.width := by have := hlrel.canonical; rwa [hlsz, scalarModulus_byteWidth] at this
   have hb : rSc.bits < 2 ^ f.width := by have := hrrel.canonical; rwa [hrsz, scalarModulus_byteWidth] at this
-  obtain ⟨baseBits, hbase, hcase⟩ :=
-    (EvalFloatBinOpRel_arith_iff .nondeterministic op f lSc.bits rSc.bits outSc harith).mp hout
   have hblt := evalFloatArithBase_lt op f lSc.bits rSc.bits baseBits hbase
-  rcases hcase with ⟨hnan, cand, hcand_mem, rfl⟩ | ⟨hnan, rfl⟩
-  · obtain ⟨idx, hidx_lt, hidx_eq⟩ := List.getElem_of_mem hcand_mem
-    have hcand_lt := (mem_nanChoices_props f [(f, lSc.bits), (f, rSc.bits)] .nondeterministic cand hcand_mem).1
+  rcases hsel with ⟨hnan, hcand⟩ | ⟨hnan, hout⟩
+  · have hcand_lt := (mem_nanChoices_props f [(f, lSc.bits), (f, rSc.bits)] .nondeterministic outBits (List.mem_of_getElem? hcand)).1
     obtain ⟨msc', hfrom, hrel'⟩ := scalar_fromUInt_translateSizeBytes_spec (validScalarBytes_byteWidth f)
-      (caseVal := cand) (by rw [scalarModulus_byteWidth]; exact hcand_lt)
+      (caseVal := outBits) (by rw [scalarModulus_byteWidth]; exact hcand_lt)
     rw [translateSizeBytes_byteWidth] at hfrom
     have hcs_eq := floatBits_nanChoices_binary_eq f lSc.bits rSc.bits ha hb true
     simp only [↓reduceIte] at hcs_eq
     have hget : ((nanChoices f [(f, lSc.bits), (f, rSc.bits)] .nondeterministic).map
         fun bits => (⟨ieeeFormatToMiri f, BitVec.ofNat 128 bits⟩ : Miri.Interpreter.FloatBits))[idx]? =
-        some ⟨ieeeFormatToMiri f, BitVec.ofNat 128 cand⟩ := by
-      simp [List.getElem?_map, List.getElem?_eq_getElem hidx_lt, hidx_eq]
-    refine ⟨idx, msc', hrel', ?_⟩
+        some ⟨ieeeFormatToMiri f, BitVec.ofNat 128 outBits⟩ := by
+      simp [List.getElem?_map, hcand]
+    refine ⟨msc', hrel', ?_⟩
     rw [floatOps_binary_arith_red layouts true (fun _ _ => pure idx) harith hlf hrf hlrel hrrel hlsz hrsz hbase]
     have hadj : Miri.Interpreter.FloatOps.adjustNaN (annealFloatOpsHooks true (fun _ _ => pure idx)) ()
         ⟨ieeeFormatToMiri f, BitVec.ofNat 128 baseBits⟩
         [⟨ieeeFormatToMiri f, BitVec.ofNat 128 lSc.bits⟩, ⟨ieeeFormatToMiri f, BitVec.ofNat 128 rSc.bits⟩] =
-        pure ⟨ieeeFormatToMiri f, BitVec.ofNat 128 cand⟩ := by
+        pure ⟨ieeeFormatToMiri f, BitVec.ofNat 128 outBits⟩ := by
       unfold Miri.Interpreter.FloatOps.adjustNaN
       simp only [floatBits_isNaN_eq f baseBits hblt, hnan, annealFloatOpsHooks, hcs_eq,
         floatOps_engine_ok, pure_bind, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hget]
-    rw [hadj, pure_bind, floatOps_scalarResult_eq f hlf layouts cand hfrom]
-  · obtain ⟨msc', hfrom, hrel'⟩ := scalar_fromUInt_translateSizeBytes_spec (validScalarBytes_byteWidth f)
+    rw [hadj, pure_bind, floatOps_scalarResult_eq f hlf layouts outBits hfrom]
+  · rw [hout]
+    obtain ⟨msc', hfrom, hrel'⟩ := scalar_fromUInt_translateSizeBytes_spec (validScalarBytes_byteWidth f)
       (caseVal := baseBits) (by rw [scalarModulus_byteWidth]; exact hblt)
-    rw [translateSizeBytes_byteWidth] at hfrom; refine ⟨0, msc', hrel', ?_⟩
-    rw [floatOps_binary_arith_red layouts true (fun _ _ => pure 0) harith hlf hrf hlrel hrrel hlsz hrsz hbase,
-      floatOps_adjustNaN_not_nan true (fun _ _ => pure 0) f baseBits hblt hnan,
+    rw [translateSizeBytes_byteWidth] at hfrom; refine ⟨msc', hrel', ?_⟩
+    rw [floatOps_binary_arith_red layouts true (fun _ _ => pure idx) harith hlf hrf hlrel hrrel hlsz hrsz hbase,
+      floatOps_adjustNaN_not_nan true (fun _ _ => pure idx) f baseBits hblt hnan,
       pure_bind, floatOps_scalarResult_eq f hlf layouts baseBits hfrom]
+
+/-- **Nondeterministic `FloatOps.binary` COMPLETENESS (converse of soundness)**: for EVERY `outSc`
+admitted by `EvalFloatBinOpRel .nondeterministic`, there EXISTS a constant index `idx` such that
+`chooseNaN := fun _ _ => pure idx` makes `FloatOps.binary` return a `ScalarRel`-related `msc'`
+(corollary of `floatOps_binary_arith_pure_index_exact`). -/
+theorem floatOps_binary_arith_completeness (layouts : LayoutTable)
+    {op : MirAst.BinOp} (harith : isFloatArithBinOp op = true) {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
+    {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt} (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc)
+    (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) {outSc : MirAst.ScalarInt} (hout : EvalFloatBinOpRel .nondeterministic op f lSc.bits rSc.bits outSc) :
+    ∃ idx msc', ScalarRel outSc msc' ∧
+      Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks true (fun _ _ => pure idx)) () (translateBinOp op)
+          ⟨.scalar (.fromScalarInt lMsc), translateTy lTy layouts⟩
+          ⟨.scalar (.fromScalarInt rMsc), translateTy rTy layouts⟩ =
+        pure ⟨.scalar (.fromScalarInt msc'), translateTy lTy layouts⟩ := by
+  obtain ⟨baseBits, hbase, hcase⟩ :=
+    (EvalFloatBinOpRel_arith_iff .nondeterministic op f lSc.bits rSc.bits outSc harith).mp hout
+  rcases hcase with ⟨hnan, cand, hcand_mem, rfl⟩ | ⟨hnan, rfl⟩
+  · obtain ⟨idx, hidx_lt, hidx_eq⟩ := List.getElem_of_mem hcand_mem
+    obtain ⟨msc', hrel', h⟩ := floatOps_binary_arith_pure_index_exact layouts idx harith hlf hrf hlrel hrrel hlsz hrsz
+      (outBits := cand) hbase (Or.inl ⟨hnan, by rw [List.getElem?_eq_getElem hidx_lt, hidx_eq]⟩)
+    exact ⟨idx, msc', hrel', h⟩
+  · obtain ⟨msc', hrel', h⟩ := floatOps_binary_arith_pure_index_exact layouts 0 harith hlf hrf hlrel hrrel hlsz hrsz
+      (outBits := baseBits) hbase (Or.inr ⟨hnan, rfl⟩)
+    exact ⟨0, msc', hrel', h⟩
 
 /-- `FloatOps.binary` rejects every non-float `BinOp` (`bitXor`, `shl`, `cmp`, etc.) with
 `.invalidProgram`, matching `Trusted`'s `evalFloatBinOp = .none`. -/
 theorem floatOps_binary_unsupported_err (layouts : LayoutTable) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {op : MirAst.BinOp} (hnot : isFloatBinOp op = false)
-    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
-    {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
-    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc)
-    (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) (st : AnnealStepState) :
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {op : MirAst.BinOp} (hnot : isFloatBinOp op = false)
+    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f) {lSc rSc : MirAst.ScalarInt} {lMsc rMsc : Miri.Memory.ScalarInt}
+    (hlrel : ScalarRel lSc lMsc) (hrrel : ScalarRel rSc rMsc) (hlsz : lSc.sizeBytes = f.byteWidth) (hrsz : rSc.sizeBytes = f.byteWidth) (st : AnnealStepState) :
     Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks nondet chooseNaN) () (translateBinOp op)
         ⟨.scalar (.fromScalarInt lMsc), translateTy lTy layouts⟩
         ⟨.scalar (.fromScalarInt rMsc), translateTy rTy layouts⟩ st =
@@ -1108,8 +1126,7 @@ theorem floatOps_binary_unsupported_err (layouts : LayoutTable) (nondet : Bool)
 /-- `f16` (`TyId = 30`) and `f128` (`TyId = 33`) fail closed with `StepError.unsupported` in
 `FloatOps.unary` and `FloatOps.binary`, matching `ieeeFormatOfTy? = none`. -/
 theorem floatOps_f16_f128_unsupported (layouts : LayoutTable) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {ty : Ty} (h16 : ty.kind = .float .f16 ∨ ty.kind = .float .f128)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {ty : Ty} (h16 : ty.kind = .float .f16 ∨ ty.kind = .float .f128)
     (msc₁ msc₂ : Miri.Memory.ScalarInt) (op : Miri.MIR.BinOp) (st : AnnealStepState) :
     (∃ msg, Miri.Interpreter.FloatOps.unary (annealFloatOpsHooks nondet chooseNaN) () .Neg
         ⟨.scalar (.fromScalarInt msc₁), translateTy ty layouts⟩ st = .error (.unsupported msg) st) ∧
@@ -1151,13 +1168,12 @@ theorem floatOps_f16_f128_unsupported (layouts : LayoutTable) (nondet : Bool)
     rw [hrb _ _ rfl]; rfl
 
 /-! ### 2.1 Conservative `ScalarOpsHooks` / `RvalueHooks` / `StepHooks` Overlay -/
-
 /-- `ScalarOpsHooks` overlay over `annealScalarOpsHooks` dispatching float unary/binary ops
 through `Miri.Interpreter.FloatOps.{unary, binary}` while leaving all non-float ops untouched. -/
 def annealScalarOpsHooksFloatArith (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) (nondet : Bool := true)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
-      Miri.Interpreter.RvalueM AnnealStepState Nat := annealChooseQuietedNaN) :
+      Miri.Interpreter.RvalueM AnnealStepState Nat := annealChooseBinaryNaN) :
     Miri.Interpreter.ScalarOpsHooks AnnealProv AnnealStepState Unit :=
   { annealScalarOpsHooks localDecls layouts with
     floatBinary := fun c op l r => Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks nondet chooseNaN) c op l r
@@ -1168,7 +1184,7 @@ def annealScalarOpsHooksFloatArith (localDecls : List LocalDecl := .nil)
 def annealRvalueHooksFloatArith (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) (nondet : Bool := true)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
-      Miri.Interpreter.RvalueM AnnealStepState Nat := annealChooseQuietedNaN) :
+      Miri.Interpreter.RvalueM AnnealStepState Nat := annealChooseBinaryNaN) :
     Miri.Interpreter.RvalueHooks AnnealProv AnnealStepState Unit (Miri.Interpreter.RuntimePlace AnnealProv) :=
   { annealRvalueHooksFloat localDecls layouts nondet chooseNaN with
     binaryOp := fun c op l r => Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooksFloatArith localDecls layouts nondet chooseNaN) c op l r
@@ -1183,7 +1199,7 @@ float dispatch via `annealRvalueHooksFloatArith`. -/
 def annealStepHooksFloatArith (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) (nondet : Bool := true)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
-      Miri.Interpreter.RvalueM AnnealStepState Nat := annealChooseQuietedNaN) :
+      Miri.Interpreter.RvalueM AnnealStepState Nat := annealChooseBinaryNaN) :
     Miri.Interpreter.StepHooks AnnealProv Miri.Interpreter.LocalLayout Unit AnnealMachine Unit
       (Miri.Interpreter.RuntimePlace AnnealProv) :=
   let base := annealStepHooksFloat localDecls layouts nondet chooseNaN
@@ -1197,10 +1213,8 @@ def annealStepHooksFloatArith (localDecls : List LocalDecl := .nil)
 
 /-- **Non-float `ScalarOps.binary` conservative extension**. -/
 theorem scalarOps_binary_floatArith_eq_base (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    (op : Miri.MIR.BinOp) (left right : Miri.Interpreter.RvalueImmTy AnnealProv)
-    (hnotf : classifyEncodedTyId left.layout.ty ≠ .ok .floating) :
+    (nondet : Bool) (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (op : Miri.MIR.BinOp) (left right : Miri.Interpreter.RvalueImmTy AnnealProv) (hnotf : classifyEncodedTyId left.layout.ty ≠ .ok .floating) :
     Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooksFloatArith localDecls layouts nondet chooseNaN) () op left right =
       Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooks localDecls layouts) () op left right := by
   have hcls : ∀ tyId,
@@ -1231,9 +1245,7 @@ theorem scalarOps_binary_floatArith_eq_base (localDecls : List LocalDecl) (layou
 
 /-- **Non-float `ScalarOps.unary` conservative extension**. -/
 theorem scalarOps_unary_floatArith_eq_base (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    (op : Miri.MIR.UnOp) (value : Miri.Interpreter.RvalueImmTy AnnealProv)
+    (nondet : Bool) (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) (op : Miri.MIR.UnOp) (value : Miri.Interpreter.RvalueImmTy AnnealProv)
     (hnotf : classifyEncodedTyId value.layout.ty ≠ .ok .floating) :
     Miri.Interpreter.ScalarOps.unary (annealScalarOpsHooksFloatArith localDecls layouts nondet chooseNaN) () op value =
       Miri.Interpreter.ScalarOps.unary (annealScalarOpsHooks localDecls layouts) () op value := by
@@ -1266,8 +1278,7 @@ def BodyFreeOfFloatArith (body : Miri.MIR.Body) : Prop :=
 
 /-- **Statement-level conservative extension** over `annealStepHooksFloat`. -/
 theorem evalStatement_floatArith_eq_base_of_stmtFree {localDecls : List LocalDecl}
-    {layouts : LayoutTable} {nondet : Bool}
-    {chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat}
+    {layouts : LayoutTable} {nondet : Bool} {chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat}
     {stmt : Miri.MIR.Statement} (hfree : stmtFreeOfFloatArith stmt) (choice : Unit) (state : AnnealStepState) :
     Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith localDecls layouts nondet chooseNaN) choice stmt state =
       Miri.Interpreter.Step.evalStatement (annealStepHooksFloat localDecls layouts nondet chooseNaN) choice stmt state := by
@@ -1280,9 +1291,7 @@ theorem evalStatement_floatArith_eq_base_of_stmtFree {localDecls : List LocalDec
 
 /-- **Conservative extension of `Step.step`** on bodies free of `UnaryOp`/`BinaryOp` assignments. -/
 theorem step_floatArith_eq_base_of_floatArithFree {localDecls : List LocalDecl}
-    {layouts : LayoutTable} {nondet : Bool}
-    {chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat}
-    {state : AnnealStepState}
+    {layouts : LayoutTable} {nondet : Bool} {chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat} {state : AnnealStepState}
     (hfree : ∀ frame, state.stack.currentFrame? = some frame → BodyFreeOfFloatArith frame.body) (choice : Unit) :
     Miri.Interpreter.Step.step (annealStepHooksFloatArith localDecls layouts nondet chooseNaN) choice state =
       Miri.Interpreter.Step.step (annealStepHooksFloat localDecls layouts nondet chooseNaN) choice state := by
@@ -1310,10 +1319,8 @@ theorem step_floatArith_eq_base_of_floatArithFree {localDecls : List LocalDecl}
 
 /-- **Terminator-level conservative extension** over `annealStepHooks`. -/
 theorem step_floatArith_eq_annealStepHooks_at_terminator {body : CapturedMir} {s : MachineState}
-    {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap) (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {bb : BasicBlockData} (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx = none) :
     Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) () m =
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m := by
@@ -1324,9 +1331,7 @@ theorem step_floatArith_eq_annealStepHooks_at_terminator {body : CapturedMir} {s
   rw [translateBasicBlockData_statements_getElem?, hstmt]; rfl
 
 /-! ## Part 3. Real `Miri.Interpreter.Step.step` vs. `Trusted` (`stepMirFn` / `EvalRvalueFloatRel`) Step Simulations -/
-
 /-! ### 3.1 Shared `evalStatement` unfolding and operand / destination helpers -/
-
 private theorem classifyEncodedTyId_floatTyIdOf (f : IeeeFormat) :
     classifyEncodedTyId (floatTyIdOf f) = .ok .floating := by cases f <;> rfl
 
@@ -1337,8 +1342,7 @@ private theorem translateOperand_move_unproj (idx : Local) :
     translateOperand (.move ⟨idx, .nil⟩) = .Move ⟨idx, #[]⟩ := rfl
 
 private theorem evalStatement_assign_unaryNeg_floatArith_eq (ld : List LocalDecl) (ly : LayoutTable)
-    (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (nondet : Bool) (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
     (dstIdx : Local) (op : MirAst.Operand) (span : String) (m : AnnealStepState) :
     Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith ld ly nondet chooseNaN) ()
       (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg op), span⟩) m =
@@ -1355,8 +1359,7 @@ private theorem evalStatement_assign_unaryNeg_floatArith_eq (ld : List LocalDecl
   simp only [↓reduceIte]; apply runRvalue_eq_of_eq; rw [evalRvalueIntoPlace_unaryOp_def]; rfl
 
 private theorem evalStatement_assign_binaryOp_floatArith_eq (ld : List LocalDecl) (ly : LayoutTable)
-    (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (nondet : Bool) (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
     (dstIdx : Local) (bop : MirAst.BinOp) (lhsOp rhsOp : MirAst.Operand) (span : String) (m : AnnealStepState) :
     Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith ld ly nondet chooseNaN) ()
       (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop lhsOp rhsOp), span⟩) m =
@@ -1375,10 +1378,8 @@ private theorem evalStatement_assign_binaryOp_floatArith_eq (ld : List LocalDecl
   simp only [↓reduceIte]; apply runRvalue_eq_of_eq; rw [evalRvalueIntoPlace_binaryOp_def]; rfl
 
 private theorem scalarOps_unary_floatNeg_eq (ld : List LocalDecl) (ly : LayoutTable) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {ty : Ty} {f : IeeeFormat} (hf : ieeeFormatOfTy? ty = some f)
-    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} (hrel : ScalarRel sc msc)
-    (hsz : sc.sizeBytes = f.byteWidth) :
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {ty : Ty} {f : IeeeFormat} (hf : ieeeFormatOfTy? ty = some f)
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} (hrel : ScalarRel sc msc) (hsz : sc.sizeBytes = f.byteWidth) :
     ∃ msc', ScalarRel ⟨evalFloatNeg f sc.bits, f.byteWidth⟩ msc' ∧
       Miri.Interpreter.ScalarOps.unary (annealScalarOpsHooksFloatArith ld ly nondet chooseNaN) () .Neg
           ⟨.scalar (.fromScalarInt msc), translateTy ty ly⟩ =
@@ -1396,8 +1397,7 @@ private theorem scalarOps_unary_floatNeg_eq (ld : List LocalDecl) (ly : LayoutTa
 
 private theorem scalarOps_binary_float_eq (ld : List LocalDecl) (ly : LayoutTable) (nondet : Bool)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f)
-    (op : Miri.MIR.BinOp) (lImm rImm : Miri.Interpreter.Immediate AnnealProv) :
+    {lTy rTy : Ty} {f : IeeeFormat} (hlf : ieeeFormatOfTy? lTy = some f) (hrf : ieeeFormatOfTy? rTy = some f) (op : Miri.MIR.BinOp) (lImm rImm : Miri.Interpreter.Immediate AnnealProv) :
     Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooksFloatArith ld ly nondet chooseNaN) () op
         ⟨lImm, translateTy lTy ly⟩ ⟨rImm, translateTy rTy ly⟩ =
       Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks nondet chooseNaN) () op
@@ -1416,8 +1416,7 @@ private theorem scalarOps_binary_float_eq (ld : List LocalDecl) (ly : LayoutTabl
   rw [hsame, pure_bind]; rfl
 
 private theorem bool_dst_localRel {mach : AnnealMachine} {allocMap : List AllocMapEntry}
-    {dstDecl : LocalDecl} {layouts : LayoutTable} (hdst_bool : dstDecl.ty.kind = .bool)
-    (b : Bool) (cachedLay : Option Miri.Interpreter.LocalLayout)
+    {dstDecl : LocalDecl} {layouts : LayoutTable} (hdst_bool : dstDecl.ty.kind = .bool) (b : Bool) (cachedLay : Option Miri.Interpreter.LocalLayout)
     (hc : ∀ l, cachedLay = some l → l = translateTy dstDecl.ty layouts) :
     LocalRelLM3_1 mach allocMap dstDecl layouts (.init (.scalar (boolToScalar b)))
       ⟨.live (.immediate (.scalar (.fromBool b))), cachedLay⟩ := by
@@ -1434,10 +1433,8 @@ private theorem isFloatOptTy_some_of_ieee {ty : Ty} {f : IeeeFormat} (hf : ieeeF
   rcases ieeeFormatOfTy?_kind hf with ⟨hk, _⟩ | ⟨hk, _⟩ <;> simp [isFloatOptTy, isFloatTy, hk]
 
 private theorem annealEvalOperand_constant_float_ok {body : CapturedMir} {m : AnnealStepState}
-    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit} (hframes : m.stack.frames = #[tf])
-    {c : ConstOperand} {f : IeeeFormat} (hf : ieeeFormatOfTy? c.ty = some f)
-    {sc : MirAst.ScalarInt} (hval : c.val = .scalar (.int sc))
-    (hsz : sc.sizeBytes = f.byteWidth) (hcan : sc.bits < scalarModulus sc.sizeBytes)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit} (hframes : m.stack.frames = #[tf]) {c : ConstOperand} {f : IeeeFormat} (hf : ieeeFormatOfTy? c.ty = some f)
+    {sc : MirAst.ScalarInt} (hval : c.val = .scalar (.int sc)) (hsz : sc.sizeBytes = f.byteWidth) (hcan : sc.bits < scalarModulus sc.sizeBytes)
     (known : Option Miri.Interpreter.LocalLayout) :
     ∃ msc, ScalarRel sc msc ∧
       annealEvalOperand body.localDecls body.layouts (translateOperand (.constant c)) known m =
@@ -1453,40 +1450,30 @@ private theorem annealEvalOperand_constant_float_ok {body : CapturedMir} {m : An
       layoutOfEncodedTyId_floatCastScalar (Or.inl ⟨f, hf⟩) body.layouts]
 
 private theorem evalOperand_copy_scalar_ok {locals : List LocalSlot} {mem : Memory}
-    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {sc : MirAst.ScalarInt}
-    (hslot : get? locals idx = some (.init (.scalar sc))) :
+    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {sc : MirAst.ScalarInt} (hslot : get? locals idx = some (.init (.scalar sc))) :
     evalOperand locals (.copy ⟨idx, .nil⟩) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack =
       .ok (.scalar sc) locals := by unfold evalOperand readProjectedValue; dsimp only []; rw [hslot]
 
 private theorem evalOperand_move_scalar_ok {locals : List LocalSlot} {mem : Memory}
-    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {sc : MirAst.ScalarInt}
-    (hslot : get? locals idx = some (.init (.scalar sc))) :
+    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {sc : MirAst.ScalarInt} (hslot : get? locals idx = some (.init (.scalar sc))) :
     evalOperand locals (.move ⟨idx, .nil⟩) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack =
       .ok (.scalar sc) (locals.set idx .uninit) := by
   obtain ⟨hlt, _⟩ := List.getElem?_eq_some_iff.mp (by rw [← get?_eq_getElem?]; exact hslot)
   unfold evalOperand readProjectedValue; dsimp only []; rw [hslot, set?_eq_some_set hlt]
 
 private theorem evalOperand_const_scalar_ok {locals : List LocalSlot} {mem : Memory}
-    {ld : List LocalDecl} {ly : LayoutTable} {c : ConstOperand} {sc : MirAst.ScalarInt}
-    (hval : c.val = .scalar (.int sc)) :
+    {ld : List LocalDecl} {ly : LayoutTable} {c : ConstOperand} {sc : MirAst.ScalarInt} (hval : c.val = .scalar (.int sc)) :
     evalOperand locals (.constant c) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack =
       .ok (.scalar sc) locals := by unfold evalOperand; dsimp only; rw [hval]; rfl
 
 /-- Shared initialized copy/copy binary float evaluation, polymorphic over `(nondet, chooseNaN)`
 so both soundness and completeness reuse the exact same `(lMsc, rMsc)` witnesses. -/
 private theorem binary_copy_copy_float_init_eval
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap)
-    {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String}
-    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
-    (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
-    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
-    (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
-    {lSc rSc : MirAst.ScalarInt}
-    (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc)))
-    (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc)))
-    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap)
+    {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String} {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl) (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
+    (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f) {lSc rSc : MirAst.ScalarInt}
+    (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc))) (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc))) (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
       IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame lhsIdx ∧ IsImmediateFrameLocal topFrame rhsIdx) :
     ∃ (tf tfc : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (lMsc rMsc : Miri.Memory.ScalarInt),
@@ -1561,19 +1548,13 @@ private theorem binary_copy_copy_float_init_eval
 /-- Shared copy/copy binary float dispatch: closes `.dead`/`.uninit` operands as lockstep `.ub`,
 or delegates initialized operands to `binary_copy_copy_float_init_eval`. -/
 private theorem binary_copy_copy_float_setup
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
-    (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String}
-    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
+    (nondet : Bool) (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String} (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩)
-    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
-    (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
-    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
-    (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
+    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl) (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
     (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
       IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame lhsIdx ∧ IsImmediateFrameLocal topFrame rhsIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
@@ -1665,15 +1646,10 @@ private theorem binary_copy_copy_float_setup
 
 /-- Shared const/const binary float setup. -/
 private theorem binary_const_const_float_eval
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {dstIdx : Local} {bop : MirAst.BinOp} {c₁ c₂ : ConstOperand} {span : String}
-    {dstDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
-    (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f)
-    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂))
-    (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap) (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {dstIdx : Local} {bop : MirAst.BinOp} {c₁ c₂ : ConstOperand} {span : String}
+    {dstDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f)
+    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂)) (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
     (hcan₁ : sc₁.bits < scalarModulus sc₁.sizeBytes) (hcan₂ : sc₂.bits < scalarModulus sc₂.sizeBytes) :
     ∃ (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (hlt_d : dstIdx < tf.locals.size) (msc₁ msc₂ : Miri.Memory.ScalarInt),
@@ -1704,17 +1680,13 @@ private theorem binary_const_const_float_eval
     scalarOps_binary_float_eq _ _ _ _ hf₁ hf₂]
 
 /-! ### 3.2 Real `Step.step` simulations for `Rvalue.unaryOp .neg` (copy / move / constant / indirect) -/
-
 /-- **Copy-operand unary negation real-step simulation** (`_d = -copy _s`, immediate locals). -/
 theorem step_float_unaryNeg_copy_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
-    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩)
-    {dstDecl srcDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb) (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩)
+    {dstDecl srcDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
     (hf_src : ieeeFormatOfTy? srcDecl.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
     (himm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame srcIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
@@ -1788,12 +1760,9 @@ theorem step_float_unaryNeg_copy_simulation
 theorem step_float_unaryNeg_move_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
-    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.move ⟨srcIdx, .nil⟩)), span⟩)
-    {dstDecl srcDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb) (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.move ⟨srcIdx, .nil⟩)), span⟩)
+    {dstDecl srcDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
     (hf_src : ieeeFormatOfTy? srcDecl.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
     (himm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame srcIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
@@ -1872,15 +1841,10 @@ theorem step_float_unaryNeg_move_simulation
 theorem step_float_unaryNeg_constant_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx : Local} {c : ConstOperand} {span : String}
-    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.constant c)), span⟩)
-    {dstDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
-    (hf_c : ieeeFormatOfTy? c.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
-    {sc : MirAst.ScalarInt} (hval : c.val = .scalar (.int sc))
-    (hsz : sc.sizeBytes = f.byteWidth) (hcan : sc.bits < scalarModulus sc.sizeBytes)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {bb : BasicBlockData} {dstIdx : Local} {c : ConstOperand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb) (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.constant c)), span⟩)
+    {dstDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hf_c : ieeeFormatOfTy? c.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
+    {sc : MirAst.ScalarInt} (hval : c.val = .scalar (.int sc)) (hsz : sc.sizeBytes = f.byteWidth) (hcan : sc.bits < scalarModulus sc.sizeBytes)
     (himm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) () m) := by
@@ -1915,23 +1879,17 @@ theorem step_float_unaryNeg_constant_simulation
 theorem step_float_unaryNeg_copy_indirect_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
-    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩)
-    {dstDecl srcDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
-    (hf_src : ieeeFormatOfTy? srcDecl.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
-    {srcAllocId dstAllocId : Miri.Memory.AllocId}
-    {srcLocalAlloc dstLocalAlloc : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind}
-    (hsid_lt : srcAllocId.value.toNat < 2 ^ 32)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb) (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩)
+    {dstDecl srcDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
+    (hf_src : ieeeFormatOfTy? srcDecl.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) {srcAllocId dstAllocId : Miri.Memory.AllocId}
+    {srcLocalAlloc dstLocalAlloc : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind} (hsid_lt : srcAllocId.value.toNat < 2 ^ 32)
     (hsbase : m.machine.lookupBaseAddr srcAllocId = some (annealStackBaseAddr srcAllocId))
     (hsfind : m.machine.memory.live.find? (fun x => x.1 == srcAllocId) = some (srcAllocId, srcLocalAlloc))
     (hsuniq : ∀ la₁ la₂, (srcAllocId, la₁) ∈ m.machine.memory.live.toList → (srcAllocId, la₂) ∈ m.machine.memory.live.toList → la₁ = la₂)
     (hsshape : StackScalarAllocShape (translateTy srcDecl.ty body.layouts).layout.size srcLocalAlloc.allocation)
     (hind_src : ∀ topFrame, m.stack.frames = #[topFrame] → ∃ lay, topFrame.locals[srcIdx]? = some ⟨.live (.indirect (stackAllocPlace srcAllocId)), lay⟩)
-    (hsc_src : ∀ v, get? s.frame.locals srcIdx = some (.init v) → ∃ sc, v = .scalar sc)
-    (hdid_lt : dstAllocId.value.toNat < 2 ^ 32)
+    (hsc_src : ∀ v, get? s.frame.locals srcIdx = some (.init v) → ∃ sc, v = .scalar sc) (hdid_lt : dstAllocId.value.toNat < 2 ^ 32)
     (hdbase : m.machine.lookupBaseAddr dstAllocId = some (annealStackBaseAddr dstAllocId))
     (hdfind : m.machine.memory.live.find? (fun x => x.1 == dstAllocId) = some (dstAllocId, dstLocalAlloc))
     (hdshape : StackScalarAllocShape (translateTy dstDecl.ty body.layouts).layout.size dstLocalAlloc.allocation)
@@ -2027,21 +1985,16 @@ theorem step_float_unaryNeg_copy_indirect_simulation
       hdid_lt hdbase hdfind hdshape hrel' hdst_sz hrv_a hm_write
 
 /-! ### 3.3 Real `Step.step` simulations for `Rvalue.binaryOp` comparisons (`eq`..`ge` -> `bool`) -/
-
 /-- **Copy/copy float comparison real-step simulation** (`_d = Op(copy _l, copy _r) -> bool`). -/
 theorem step_float_cmp_copy_copy_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p) (nondet : Bool)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String}
-    (hbop : isFloatCmpBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String} (hbop : isFloatCmpBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩)
-    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
-    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
-    (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
-    (hdst_bool : dstDecl.ty.kind = .bool)
-    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl) (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
+    (hdst_bool : dstDecl.ty.kind = .bool) (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
       IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame lhsIdx ∧ IsImmediateFrameLocal topFrame rhsIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) () m) := by
@@ -2080,12 +2033,9 @@ theorem step_float_cmp_const_const_simulation
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
     {bb : BasicBlockData} {dstIdx : Local} {bop : MirAst.BinOp} {c₁ c₂ : ConstOperand} {span : String}
     (hbop : isFloatCmpBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.constant c₁) (.constant c₂)), span⟩)
-    {dstDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
-    (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f) (hdst_bool : dstDecl.ty.kind = .bool)
-    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂))
-    (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.constant c₁) (.constant c₂)), span⟩) {dstDecl : LocalDecl} {f : IeeeFormat}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f) (hdst_bool : dstDecl.ty.kind = .bool)
+    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂)) (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
     (hcan₁ : sc₁.bits < scalarModulus sc₁.sizeBytes) (hcan₂ : sc₂.bits < scalarModulus sc₂.sizeBytes)
     (himm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
@@ -2116,21 +2066,15 @@ theorem step_float_cmp_const_const_simulation
     hdecl_dst ((himm tf hframes).cache_layout hlt_d _) hrv_a hm_write (bool_dst_localRel hdst_bool res)
 
 /-! ### 3.4 Real `Step.step` simulations for `Rvalue.binaryOp` arithmetic (deterministic & nondeterministic) -/
-
 /-- **Deterministic copy/copy float arithmetic real-step simulation** (`floatNondeterministic = false`). -/
 theorem step_float_arith_copy_copy_deterministic_simulation
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String}
-    (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String} (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩)
-    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
-    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
-    (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
-    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
-    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl) (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
+    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
       IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame lhsIdx ∧ IsImmediateFrameLocal topFrame rhsIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts false chooseNaN) () m) := by
@@ -2166,17 +2110,13 @@ theorem step_float_arith_copy_copy_deterministic_simulation
 
 /-- **Deterministic constant/constant float arithmetic real-step simulation**. -/
 theorem step_float_arith_const_const_deterministic_simulation
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
     {bb : BasicBlockData} {dstIdx : Local} {bop : MirAst.BinOp} {c₁ c₂ : ConstOperand} {span : String}
     (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.constant c₁) (.constant c₂)), span⟩)
-    {dstDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
-    (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
-    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂))
-    (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.constant c₁) (.constant c₂)), span⟩) {dstDecl : LocalDecl} {f : IeeeFormat}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
+    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂)) (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
     (hcan₁ : sc₁.bits < scalarModulus sc₁.sizeBytes) (hcan₂ : sc₂.bits < scalarModulus sc₂.sizeBytes)
     (himm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
@@ -2211,22 +2151,15 @@ theorem step_float_arith_const_const_deterministic_simulation
 
 /-- **Deterministic move/copy float arithmetic real-step simulation** (`lhsIdx ≠ rhsIdx`). -/
 theorem step_float_arith_move_copy_deterministic_simulation
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String}
-    (hbop : isFloatArithBinOp bop = true) (hlr_ne : lhsIdx ≠ rhsIdx)
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String} (hbop : isFloatArithBinOp bop = true) (hlr_ne : lhsIdx ≠ rhsIdx)
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.move ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩)
-    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
-    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
-    (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
-    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
-    {lSc rSc : MirAst.ScalarInt}
-    (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc)))
-    (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc)))
-    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl) (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
+    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) {lSc rSc : MirAst.ScalarInt} (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc)))
+    (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc))) (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
       IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame lhsIdx ∧ IsImmediateFrameLocal topFrame rhsIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts false chooseNaN) () m) := by
@@ -2307,21 +2240,15 @@ theorem step_float_arith_move_copy_deterministic_simulation
 
 /-- **Deterministic indirect-destination float arithmetic real-step simulation**. -/
 theorem step_float_arith_const_const_indirect_dst_deterministic_simulation
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
     {bb : BasicBlockData} {dstIdx : Local} {bop : MirAst.BinOp} {c₁ c₂ : ConstOperand} {span : String}
     (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.constant c₁) (.constant c₂)), span⟩)
-    {dstDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
-    (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
-    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂))
-    (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
-    (hcan₁ : sc₁.bits < scalarModulus sc₁.sizeBytes) (hcan₂ : sc₂.bits < scalarModulus sc₂.sizeBytes)
-    {dstAllocId : Miri.Memory.AllocId}
-    {dstLocalAlloc : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind}
-    (hdid_lt : dstAllocId.value.toNat < 2 ^ 32)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.constant c₁) (.constant c₂)), span⟩) {dstDecl : LocalDecl} {f : IeeeFormat}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
+    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂)) (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
+    (hcan₁ : sc₁.bits < scalarModulus sc₁.sizeBytes) (hcan₂ : sc₂.bits < scalarModulus sc₂.sizeBytes) {dstAllocId : Miri.Memory.AllocId}
+    {dstLocalAlloc : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind} (hdid_lt : dstAllocId.value.toNat < 2 ^ 32)
     (hdbase : m.machine.lookupBaseAddr dstAllocId = some (annealStackBaseAddr dstAllocId))
     (hdfind : m.machine.memory.live.find? (fun x => x.1 == dstAllocId) = some (dstAllocId, dstLocalAlloc))
     (hdshape : StackScalarAllocShape (translateTy dstDecl.ty body.layouts).layout.size dstLocalAlloc.allocation)
@@ -2364,22 +2291,14 @@ theorem step_float_arith_const_const_indirect_dst_deterministic_simulation
 `Step.step` steps into a `StepRelLM3_1`-related successor storing an `outSc` admitted by
 `EvalRvalueFloatRel .nondeterministic policy` (for EVERY `policy`). -/
 theorem step_float_arith_copy_copy_nondet_soundness
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    (hvalid : ValidBinaryChooseNaN chooseNaN)
-    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String}
-    (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) (hvalid : ValidBinaryChooseNaN chooseNaN)
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String} (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩)
-    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
-    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
-    (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
-    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) (hlive_dst : get? s.frame.locals dstIdx ≠ some .dead)
-    {lSc rSc : MirAst.ScalarInt}
-    (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc)))
-    (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc)))
-    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl) (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
+    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) (hlive_dst : get? s.frame.locals dstIdx ≠ some .dead) {lSc rSc : MirAst.ScalarInt}
+    (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc))) (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc))) (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
       IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame lhsIdx ∧ IsImmediateFrameLocal topFrame rhsIdx) :
     ∃ outSc,
       (∀ policy, EvalRvalueFloatRel .nondeterministic policy s.frame.locals
@@ -2426,48 +2345,33 @@ theorem step_float_arith_copy_copy_nondet_soundness
     (operandTy_copy_local hdecl_lhs) (operandTy_copy_local hdecl_rhs)
     hf_lhs hf_rhs hlbw hrbw).mpr (Or.inl ⟨outSc, hrel_t, rfl⟩)
 
-/-- **Nondeterministic float arithmetic real-step COMPLETENESS (converse)**: for EVERY `outSc`
-admitted by `EvalRvalueFloatRel .nondeterministic policy`, there EXISTS a constant index `idx`
-realizing that exact `outSc` in `Miri.Interpreter.Step.step`. -/
-theorem step_float_arith_copy_copy_nondet_completeness
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (hstate : StateRelLM3_1 body s m allocMap)
-    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String}
-    (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+/-- **Index-exact nondeterministic real-step correspondence** (sharpens completeness): under the constant selector
+`fun _ _ => pure idx`, real `Step.step` stores EXACTLY the `idx`-th element of `Trusted`'s ordered
+`nanChoices f [(f, lhs), (f, rhs)]` (ORIGINAL un-negated rhs, also for `.sub`) when the base result is NaN, and
+`baseBits` for EVERY `idx` otherwise. -/
+theorem step_float_arith_copy_copy_nondet_index_exact
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String} (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩)
-    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
-    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
-    (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
-    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) (hlive_dst : get? s.frame.locals dstIdx ≠ some .dead)
-    {lSc rSc outSc : MirAst.ScalarInt} (policy : Ptr2IntTransmutePolicy)
-    (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc)))
-    (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc)))
-    (hrel_rv : EvalRvalueFloatRel .nondeterministic policy s.frame.locals
-      (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩))
-      s.memory body.localDecls body.layouts (.ok (.scalar outSc) s.frame.locals s.memory))
+    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl) (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
+    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) (hlive_dst : get? s.frame.locals dstIdx ≠ some .dead) {lSc rSc : MirAst.ScalarInt} (idx : Nat) {baseBits outBits : Nat}
+    (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc))) (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc)))
+    (hbase : evalFloatArithBase bop f lSc.bits rSc.bits = .some baseBits)
+    (hsel : (isNaNBits f baseBits = true ∧ (nanChoices f [(f, lSc.bits), (f, rSc.bits)] .nondeterministic)[idx]? = some outBits) ∨
+      (isNaNBits f baseBits = false ∧ outBits = baseBits))
     (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
       IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame lhsIdx ∧ IsImmediateFrameLocal topFrame rhsIdx) :
-    ∃ idx : Nat,
-      StepRelLM3_1 body m allocMap
-        (MirStepNode.step (advanceStmt s (s.frame.locals.set dstIdx (.init (.scalar outSc))) s.memory))
-        (Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts true (fun _ _ => pure idx)) () m) := by
+    StepRelLM3_1 body m allocMap
+      (MirStepNode.step (advanceStmt s (s.frame.locals.set dstIdx (.init (.scalar ⟨outBits, f.byteWidth⟩))) s.memory))
+      (Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts true (fun _ _ => pure idx)) () m) := by
   have hnot_off : bop ≠ .offset := by intro h; subst h; cases hbop
   obtain ⟨tf, tfc, lMsc, rMsc, hframes, hbody, hloc, hstate_c, himm_dc, hlrel, hrrel, hlbw, hrbw, hm_eval⟩ :=
     binary_copy_copy_float_init_eval hstate (bop := bop) (span := span) hdecl_dst hdecl_lhs hdecl_rhs hf_lhs hf_rhs hslot_l hslot_r himm
-  have hrel_bin : EvalFloatBinOpRel .nondeterministic bop f lSc.bits rSc.bits outSc := by
-    rcases (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy
-      s.frame.locals s.frame.locals s.frame.locals bop _ _ lSc rSc lhsDecl.ty rhsDecl.ty f
-      s.memory body.localDecls body.layouts _ hnot_off
-      (evalOperand_copy_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r)
-      (operandTy_copy_local hdecl_lhs) (operandTy_copy_local hdecl_rhs)
-      hf_lhs hf_rhs hlbw hrbw).mp hrel_rv with ⟨outSc', hrel', hok⟩ | ⟨_, huns⟩
-    · injection hok with hv _ _; injection hv with hsc; rw [hsc]; exact hrel'
-    · cases huns
-  obtain ⟨idx, msc', hrel', hfb⟩ := floatOps_binary_arith_completeness body.layouts hbop hf_lhs hf_rhs hlrel hrrel hlbw hrbw hrel_bin
+  obtain ⟨msc', hrel', hfb⟩ :=
+    floatOps_binary_arith_pure_index_exact body.layouts idx hbop hf_lhs hf_rhs hlrel hrrel hlbw hrbw hbase hsel
   have hdstT : translateTy lhsDecl.ty body.layouts = translateTy dstDecl.ty body.layouts := by
     rw [translateTy_of_ieeeFormatOfTy? hf_lhs, translateTy_of_ieeeFormatOfTy? hf_dst]
-  obtain ⟨baseBits, hbase⟩ := (evalFloatArithBase_isSome_iff bop f lSc.bits rSc.bits).mpr hbop
   have hbin : evalFloatBinOp bop f lSc.bits rSc.bits = .some ⟨baseBits, f.byteWidth⟩ := by
     unfold evalFloatBinOp; rw [evalFloatCmp_of_arith bop f _ _ hbop, hbase]
   have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)) s.memory
@@ -2483,28 +2387,63 @@ theorem step_float_arith_copy_copy_nondet_completeness
         ⟨.local 0 dstIdx none tf.localsIdentity, translateTy dstDecl.ty body.layouts⟩) { m with stack := ⟨#[tfc]⟩ } := by
     rw [hm_eval true (fun _ _ => pure idx)]; unfold Miri.Interpreter.runRvalue
     rw [hfb, pure_bind, EStateM.bind_eq_ok (assertRvalueLayoutPub_eq_ok _ _ hdstT _)]
-  have hout_sz : outSc.sizeBytes = f.byteWidth := by
-    rcases (EvalFloatBinOpRel_arith_iff .nondeterministic bop f lSc.bits rSc.bits outSc hbop).mp hrel_bin with
-      ⟨_, _, ⟨_, _, _, rfl⟩ | ⟨_, rfl⟩⟩ <;> rfl
-  have hdst_sz : (translateTy dstDecl.ty body.layouts).layout.size = translateSizeBytes outSc.sizeBytes := by
-    rw [hout_sz, translateTy_of_ieeeFormatOfTy? hf_dst, translateSizeBytes_byteWidth, floatLayoutData_size]
-  exact ⟨idx, (finish_write_immediate_split_hooks _ hframes hbody hloc hstate_c rfl hbb hstmt
-    hdecl_dst himm_dc hlive_dst hrv_a hm_write (floatCast_dst_localRel (Or.inl ⟨f, hf_dst⟩) hrel' hdst_sz)).2⟩
+  have hdst_sz : (translateTy dstDecl.ty body.layouts).layout.size = translateSizeBytes f.byteWidth := by
+    rw [translateTy_of_ieeeFormatOfTy? hf_dst, translateSizeBytes_byteWidth, floatLayoutData_size]
+  exact (finish_write_immediate_split_hooks _ hframes hbody hloc hstate_c rfl hbb hstmt
+    hdecl_dst himm_dc hlive_dst hrv_a hm_write (floatCast_dst_localRel (Or.inl ⟨f, hf_dst⟩) hrel' hdst_sz)).2
+
+/-- **Nondeterministic float arithmetic real-step COMPLETENESS (converse)**: for EVERY `outSc`
+admitted by `EvalRvalueFloatRel .nondeterministic policy`, there EXISTS a constant index `idx`
+realizing that exact `outSc` in `Miri.Interpreter.Step.step` (corollary of
+`step_float_arith_copy_copy_nondet_index_exact`). -/
+theorem step_float_arith_copy_copy_nondet_completeness
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {bop : MirAst.BinOp} {span : String} (hbop : isFloatArithBinOp bop = true) (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩)
+    {dstDecl lhsDecl rhsDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl) (hf_lhs : ieeeFormatOfTy? lhsDecl.ty = some f) (hf_rhs : ieeeFormatOfTy? rhsDecl.ty = some f)
+    (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) (hlive_dst : get? s.frame.locals dstIdx ≠ some .dead) {lSc rSc outSc : MirAst.ScalarInt} (policy : Ptr2IntTransmutePolicy)
+    (hslot_l : get? s.frame.locals lhsIdx = some (.init (.scalar lSc))) (hslot_r : get? s.frame.locals rhsIdx = some (.init (.scalar rSc)))
+    (hrel_rv : EvalRvalueFloatRel .nondeterministic policy s.frame.locals
+      (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩))
+      s.memory body.localDecls body.layouts (.ok (.scalar outSc) s.frame.locals s.memory))
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame lhsIdx ∧ IsImmediateFrameLocal topFrame rhsIdx) :
+    ∃ idx : Nat,
+      StepRelLM3_1 body m allocMap
+        (MirStepNode.step (advanceStmt s (s.frame.locals.set dstIdx (.init (.scalar outSc))) s.memory))
+        (Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts true (fun _ _ => pure idx)) () m) := by
+  have hnot_off : bop ≠ .offset := by intro h; subst h; cases hbop
+  obtain ⟨_, _, _, _, _, _, _, _, _, _, _, hlbw, hrbw, _⟩ :=
+    binary_copy_copy_float_init_eval hstate (bop := bop) (span := span) hdecl_dst hdecl_lhs hdecl_rhs hf_lhs hf_rhs hslot_l hslot_r himm
+  have hrel_bin : EvalFloatBinOpRel .nondeterministic bop f lSc.bits rSc.bits outSc := by
+    rcases (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy
+      s.frame.locals s.frame.locals s.frame.locals bop _ _ lSc rSc lhsDecl.ty rhsDecl.ty f
+      s.memory body.localDecls body.layouts _ hnot_off
+      (evalOperand_copy_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r)
+      (operandTy_copy_local hdecl_lhs) (operandTy_copy_local hdecl_rhs)
+      hf_lhs hf_rhs hlbw hrbw).mp hrel_rv with ⟨outSc', hrel', hok⟩ | ⟨_, huns⟩
+    · injection hok with hv _ _; injection hv with hsc; rw [hsc]; exact hrel'
+    · cases huns
+  obtain ⟨baseBits, hbase, hcase⟩ :=
+    (EvalFloatBinOpRel_arith_iff .nondeterministic bop f lSc.bits rSc.bits outSc hbop).mp hrel_bin
+  rcases hcase with ⟨hnan, cand, hcand_mem, rfl⟩ | ⟨hnan, rfl⟩
+  · obtain ⟨idx, hidx_lt, hidx_eq⟩ := List.getElem_of_mem hcand_mem
+    exact ⟨idx, step_float_arith_copy_copy_nondet_index_exact hstate hbop hbb hstmt hdecl_dst hdecl_lhs hdecl_rhs
+      hf_lhs hf_rhs hf_dst hlive_dst idx (outBits := cand) hslot_l hslot_r hbase
+      (Or.inl ⟨hnan, by rw [List.getElem?_eq_getElem hidx_lt, hidx_eq]⟩) himm⟩
+  · exact ⟨0, step_float_arith_copy_copy_nondet_index_exact hstate hbop hbb hstmt hdecl_dst hdecl_lhs hdecl_rhs
+      hf_lhs hf_rhs hf_dst hlive_dst 0 (outBits := baseBits) hslot_l hslot_r hbase (Or.inr ⟨hnan, rfl⟩) himm⟩
 
 /-! ### 3.5 Fail-closed and UB boundaries (`uninit`, `f16`/`f128`, invalid float `BinOp`) -/
-
 /-- **Uninitialized float local UB lockstep**. -/
 theorem step_float_uninit_unaryNeg_ub_lockstep
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
-    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩)
-    {dstDecl srcDecl : LocalDecl} {f : IeeeFormat}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
-    (hf_src : ieeeFormatOfTy? srcDecl.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f)
-    (huninit : get? s.frame.locals srcIdx = some .uninit)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb) (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩)
+    {dstDecl srcDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
+    (hf_src : ieeeFormatOfTy? srcDecl.ty = some f) (hf_dst : ieeeFormatOfTy? dstDecl.ty = some f) (huninit : get? s.frame.locals srcIdx = some .uninit)
     (himm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame srcIdx) :
     stepMirFn body s = .fail .ub ∧
       ∃ m' msg, Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) () m =
@@ -2522,16 +2461,11 @@ theorem step_float_uninit_unaryNeg_ub_lockstep
 theorem step_float_f16_f128_fail_closed
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p) (nondet : Bool)
-    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
-    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩)
-    {dstDecl srcDecl : LocalDecl}
-    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
-    (h16 : srcDecl.ty.kind = .float .f16 ∨ srcDecl.ty.kind = .float .f128)
-    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
-    (hslot_s : get? s.frame.locals srcIdx = some (.init (.scalar sc)))
-    (himm_s : ∀ topFrame, m.stack.frames = #[topFrame] →
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat) {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb) (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩)
+    {dstDecl srcDecl : LocalDecl} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
+    (h16 : srcDecl.ty.kind = .float .f16 ∨ srcDecl.ty.kind = .float .f128) {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hslot_s : get? s.frame.locals srcIdx = some (.init (.scalar sc))) (himm_s : ∀ topFrame, m.stack.frames = #[topFrame] →
       ∃ lay, topFrame.locals[srcIdx]? = some ⟨.live (.immediate (.scalar (.fromScalarInt msc))), lay⟩) :
     stepMirFn body s = .fail .unsupported ∧
       ∃ m' msg, Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) () m =
@@ -2595,14 +2529,10 @@ theorem step_float_invalid_binOp_fail_closed
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap) (hphase : ∀ p, body.phase ≠ .other p) (nondet : Bool)
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
-    {bb : BasicBlockData} {dstIdx : Local} {bop : MirAst.BinOp} {c₁ c₂ : ConstOperand} {span : String}
-    (hnot : isFloatBinOp bop = false) (hnot_off : bop ≠ .offset)
-    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
-    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.constant c₁) (.constant c₂)), span⟩)
-    {dstDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
-    (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f)
-    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂))
-    (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
+    {bb : BasicBlockData} {dstIdx : Local} {bop : MirAst.BinOp} {c₁ c₂ : ConstOperand} {span : String} (hnot : isFloatBinOp bop = false) (hnot_off : bop ≠ .offset)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb) (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.constant c₁) (.constant c₂)), span⟩)
+    {dstDecl : LocalDecl} {f : IeeeFormat} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl) (hf₁ : ieeeFormatOfTy? c₁.ty = some f) (hf₂ : ieeeFormatOfTy? c₂.ty = some f)
+    {sc₁ sc₂ : MirAst.ScalarInt} (hv₁ : c₁.val = .scalar (.int sc₁)) (hv₂ : c₂.val = .scalar (.int sc₂)) (hsz₁ : sc₁.sizeBytes = f.byteWidth) (hsz₂ : sc₂.sizeBytes = f.byteWidth)
     (hcan₁ : sc₁.bits < scalarModulus sc₁.sizeBytes) (hcan₂ : sc₂.bits < scalarModulus sc₂.sizeBytes) :
     stepMirFn body s = .fail .unsupported ∧
       ∃ m', Miri.Interpreter.Step.step (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) () m =
@@ -2628,19 +2558,13 @@ theorem step_float_invalid_binOp_fail_closed
   rw [miri_step_at_statement_error _ hframes hbody hloc hbb hstmt hm_err]; exact ⟨ha, _, rfl⟩
 
 /-! ## Part 4. `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) & Shared Witnesses `W1–W6` -/
-
 /-! ### 4.1 Vendored `Miri.Memory.Allocation.readScalar` provenance-stripping vs. CTFE rejection -/
-
 /-- **Runtime Miri provenance stripping (`offsetIsAddr = true`)**: under `Miri.Memory.Provenance`,
 `Allocation.readScalar ... false` unconditionally strips provenance (`Ptr2IntTransmutePolicy.stripProvenance`). -/
 theorem alloc_readScalar_strip_runtime {Extra : Type}
-    (alloc : Miri.Memory.Allocation Miri.Memory.Provenance Extra)
-    (layout : Miri.ABI.TargetDataLayout) (range : Miri.Memory.AllocRange)
-    {bytes : Array UInt8} {bits : Miri.ABI.U128} {sc : Miri.Memory.Scalar Miri.Memory.Provenance}
-    (hinit : alloc.initializationMask.isRangeInitialized range = .ok (.ok ()))
-    (hbytes : alloc.getBytesUnchecked range = .ok bytes)
-    (hread : miriReadTargetUInt layout bytes = .ok bits)
-    (hfrom : Miri.Memory.Scalar.fromUInt bits range.size = .ok sc) :
+    (alloc : Miri.Memory.Allocation Miri.Memory.Provenance Extra) (layout : Miri.ABI.TargetDataLayout) (range : Miri.Memory.AllocRange)
+    {bytes : Array UInt8} {bits : Miri.ABI.U128} {sc : Miri.Memory.Scalar Miri.Memory.Provenance} (hinit : alloc.initializationMask.isRangeInitialized range = .ok (.ok ()))
+    (hbytes : alloc.getBytesUnchecked range = .ok bytes) (hread : miriReadTargetUInt layout bytes = .ok bits) (hfrom : Miri.Memory.Scalar.fromUInt bits range.size = .ok sc) :
     alloc.readScalar layout range false = .ok sc := by
   unfold Miri.Memory.Allocation.readScalar
   have hi : (alloc.initializationMask.isRangeInitialized range).mapError Miri.Memory.AllocError.memory = .ok (.ok ()) := by rw [hinit]; rfl
@@ -2656,12 +2580,8 @@ theorem alloc_readScalar_strip_runtime {Extra : Type}
 `Miri.Memory.CtfeProvenance`, `Allocation.readScalar ... false` rejects provenance-carrying ranges
 with `.error (.readPointerAsInt none)` (`Ptr2IntTransmutePolicy.strictUcg630Ub`). -/
 theorem alloc_readScalar_ctfe_rejects_prov {Extra : Type}
-    (alloc : Miri.Memory.Allocation Miri.Memory.CtfeProvenance Extra)
-    (layout : Miri.ABI.TargetDataLayout) (range : Miri.Memory.AllocRange)
-    {bytes : Array UInt8} {bits : Miri.ABI.U128}
-    (hinit : alloc.initializationMask.isRangeInitialized range = .ok (.ok ()))
-    (hbytes : alloc.getBytesUnchecked range = .ok bytes)
-    (hread : miriReadTargetUInt layout bytes = .ok bits)
+    (alloc : Miri.Memory.Allocation Miri.Memory.CtfeProvenance Extra) (layout : Miri.ABI.TargetDataLayout) (range : Miri.Memory.AllocRange) {bytes : Array UInt8} {bits : Miri.ABI.U128}
+    (hinit : alloc.initializationMask.isRangeInitialized range = .ok (.ok ())) (hbytes : alloc.getBytesUnchecked range = .ok bytes) (hread : miriReadTargetUInt layout bytes = .ok bits)
     (hnonempty : alloc.provenanceMap.rangeEmpty range (Miri.ABI.Size.fromBits layout.pointerWidth.bits) = .ok false) :
     alloc.readScalar layout range false = .error (Miri.Memory.AllocError.readPointerAsInt none) := by
   unfold Miri.Memory.Allocation.readScalar
@@ -2681,14 +2601,10 @@ theorem alloc_readScalar_ctfe_rejects_prov {Extra : Type}
 /-- **Provenance-free agreement (`f32 <-> u32`, `f64 <-> u64` `{to,from}_bits`)**: whenever
 `provenanceMap.rangeEmpty = .ok true`, CTFE `readScalar` agrees with runtime `Provenance`. -/
 theorem alloc_readScalar_ctfe_provFree_ok {Extra : Type}
-    (alloc : Miri.Memory.Allocation Miri.Memory.CtfeProvenance Extra)
-    (layout : Miri.ABI.TargetDataLayout) (range : Miri.Memory.AllocRange)
-    {bytes : Array UInt8} {bits : Miri.ABI.U128} {sc : Miri.Memory.Scalar Miri.Memory.CtfeProvenance}
-    (hinit : alloc.initializationMask.isRangeInitialized range = .ok (.ok ()))
-    (hbytes : alloc.getBytesUnchecked range = .ok bytes)
-    (hread : miriReadTargetUInt layout bytes = .ok bits)
-    (hempty : alloc.provenanceMap.rangeEmpty range (Miri.ABI.Size.fromBits layout.pointerWidth.bits) = .ok true)
-    (hfrom : Miri.Memory.Scalar.fromUInt bits range.size = .ok sc) :
+    (alloc : Miri.Memory.Allocation Miri.Memory.CtfeProvenance Extra) (layout : Miri.ABI.TargetDataLayout) (range : Miri.Memory.AllocRange)
+    {bytes : Array UInt8} {bits : Miri.ABI.U128} {sc : Miri.Memory.Scalar Miri.Memory.CtfeProvenance} (hinit : alloc.initializationMask.isRangeInitialized range = .ok (.ok ()))
+    (hbytes : alloc.getBytesUnchecked range = .ok bytes) (hread : miriReadTargetUInt layout bytes = .ok bits)
+    (hempty : alloc.provenanceMap.rangeEmpty range (Miri.ABI.Size.fromBits layout.pointerWidth.bits) = .ok true) (hfrom : Miri.Memory.Scalar.fromUInt bits range.size = .ok sc) :
     alloc.readScalar layout range false = .ok sc := by
   unfold Miri.Memory.Allocation.readScalar
   have hi : (alloc.initializationMask.isRangeInitialized range).mapError Miri.Memory.AllocError.memory = .ok (.ok ()) := by rw [hinit]; rfl
@@ -2707,8 +2623,7 @@ theorem alloc_readScalar_ctfe_provFree_ok {Extra : Type}
 /-- **Shared uninitialized-bytes UB under EVERY `PointerProvenance`**. -/
 theorem alloc_readScalar_uninit_both
     {Prov Extra : Type} [DecidableEq Prov] [Miri.Memory.PointerProvenance Prov]
-    (alloc : Miri.Memory.Allocation Prov Extra)
-    (layout : Miri.ABI.TargetDataLayout) (range bad : Miri.Memory.AllocRange) (readProv : Bool)
+    (alloc : Miri.Memory.Allocation Prov Extra) (layout : Miri.ABI.TargetDataLayout) (range bad : Miri.Memory.AllocRange) (readProv : Bool)
     (huninit : alloc.initializationMask.isRangeInitialized range = .ok (.error bad)) :
     alloc.readScalar layout range readProv =
       .error (Miri.Memory.AllocError.invalidUninitBytes (some ⟨range, bad⟩)) := by
@@ -2742,8 +2657,10 @@ theorem alloc_readScalar_uninit_both
   rw [hi]; rfl
 
 /-! ### 4.2 Vendored `Cast.cast .Transmute` no-forgery (`usize -> &u8`) and uninit UB -/
-
-/-- Policy-aware scalar transmute validator for `CastHooks.copyAllowTransmute`. -/
+/-- Policy-aware scalar transmute validator for `CastHooks.copyAllowTransmute`. A pointer scalar transmuted to a
+raw-pointer destination (`classifyEncodedTyId = .pointer`: TyIds `40`, `60..82`, `90`) keeps its provenance under BOTH
+policies, exactly like `Trusted`'s `evalByteCast` on `*const T -> *const U`; the `Ptr2IntTransmutePolicy` flip applies
+only to non-pointer destinations (round-1 repair: such destinations previously fell into the ptr-to-int arms). -/
 def miriTransmuteScalarCheck (policy : Ptr2IntTransmutePolicy)
     (destLay : Miri.Interpreter.LocalLayout) (sc : Miri.Memory.Scalar AnnealProv) :
     Except Miri.Interpreter.StepError (Miri.Memory.Scalar AnnealProv) :=
@@ -2758,6 +2675,7 @@ def miriTransmuteScalarCheck (policy : Ptr2IntTransmutePolicy)
   | _ =>
     if !annealValidateScalarForTyId destLay.ty sc then
       .error (.undefinedBehavior "transmute produced invalid scalar value")
+    else if sc.isPointer && (match classifyEncodedTyId destLay.ty with | .ok .pointer => true | _ => false) then .ok sc
     else
       match sc.isPointer, policy with
       | true, .strictUcg630Ub =>
@@ -2786,6 +2704,25 @@ def annealCastHooksTransmutePolicy (layouts : LayoutTable) (policy : Ptr2IntTran
         | .ok sc' => annealWriteImmediate (.scalar sc') dest
         | .error err => throw err
       | .scalarPair _ _ => throw (.unsupported "scalarPair transmute") }
+
+/-- **Pinned policy arms of `miriTransmuteScalarCheck`** on a pointer scalar `sc`: an integer destination (`usize`,
+TyId `25`) is `.undefinedBehavior` under `.strictUcg630Ub` and yields the provenance-stripped address under
+`.stripProvenance` (the vendored `Allocation.readScalar` verdicts `alloc_readScalar_ctfe_rejects_prov` /
+`alloc_readScalar_strip_runtime`), while a raw-pointer destination (`*const u8`, TyId `70`) keeps `sc` under BOTH. -/
+theorem miriTransmuteScalarCheck_ptr_policy_arms (lay : Miri.ABI.LayoutData)
+    (sc : Miri.Memory.Scalar AnnealProv) (hptr : sc.isPointer = true) :
+    miriTransmuteScalarCheck .strictUcg630Ub ⟨25, lay⟩ sc =
+      .error (.undefinedBehavior "transmute of pointer provenance into non-pointer scalar (ucg#630)") ∧
+    (∀ p, sc.toPointer annealTargetDataLayout = .ok p →
+      miriTransmuteScalarCheck .stripProvenance ⟨25, lay⟩ sc =
+        match Miri.Memory.Scalar.fromUInt (BitVec.ofNat 128 p.offset.bytes.toNat) lay.size with
+        | .ok stripped => .ok stripped
+        | .error _ => .error (.undefinedBehavior "transmute stripped scalar width mismatch")) ∧
+    (∀ policy, miriTransmuteScalarCheck policy ⟨70, lay⟩ sc = .ok sc) := by
+  refine ⟨?_, fun p hp => ?_, fun policy => ?_⟩
+  · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr]
+  · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr, hp]
+  · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr]
 
 private theorem scalar_fromScalarInt_toPointer_none (msc : Miri.Memory.ScalarInt)
     (hmsc_sz : msc.size = Miri.ABI.Size.ofBytes 8) (hmsc_lt : msc.data.toNat < 2 ^ 64) :
@@ -2830,10 +2767,8 @@ theorem miri_transmute_ref_no_forge_ub (layouts : LayoutTable) (policy : Ptr2Int
 
 /-- **Uninit transmute UB under BOTH policies**. -/
 theorem miri_transmute_uninit_ub (layouts : LayoutTable) (policy : Ptr2IntTransmutePolicy)
-    (srcTy dstTy : Ty) (hsrc_sz : (translateTy srcTy layouts).layout.isSized = true)
-    (hdst_sz : (translateTy dstTy layouts).layout.isSized = true)
-    (hsize_eq : (translateTy srcTy layouts).layout.size = (translateTy dstTy layouts).layout.size)
-    (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) (st : AnnealStepState) :
+    (srcTy dstTy : Ty) (hsrc_sz : (translateTy srcTy layouts).layout.isSized = true) (hdst_sz : (translateTy dstTy layouts).layout.isSized = true)
+    (hsize_eq : (translateTy srcTy layouts).layout.size = (translateTy dstTy layouts).layout.size) (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) (st : AnnealStepState) :
     Miri.Interpreter.Cast.cast (annealCastHooksTransmutePolicy layouts policy) () 16
         ⟨.immediate .uninit, translateTy srcTy layouts⟩
         .Transmute (encodeTyId dstTy) ⟨destRef, translateTy dstTy layouts⟩ st =
@@ -2845,7 +2780,6 @@ theorem miri_transmute_uninit_ub (layouts : LayoutTable) (policy : Ptr2IntTransm
     Bool.not_true, Bool.or_self, ↓reduceIte, pure_bind, annealReadImmediate_uninit_eq]; rfl
 
 /-! ### 4.3 Concrete Kernel-Checked Shared Witnesses `W1–W6` -/
-
 section Witnesses
 
 open LeanMiriSpec.Correspondence.Witness
@@ -2934,8 +2868,7 @@ private theorem fa_stateRel_2f32 (name : String) (stmt : StatementKind)
   | _ + 2 => simp [faMkBody, get?] at hdecl
 
 private theorem fa_stateRel_3f32 (name : String) (stmt : StatementKind)
-    (sc1 sc2 : MirAst.ScalarInt) (msc1 msc2 : Miri.Memory.ScalarInt)
-    (hrel1 : ScalarRel sc1 msc1) (hrel2 : ScalarRel sc2 msc2) (hsz1 : sc1.sizeBytes = 4) (hsz2 : sc2.sizeBytes = 4) :
+    (sc1 sc2 : MirAst.ScalarInt) (msc1 msc2 : Miri.Memory.ScalarInt) (hrel1 : ScalarRel sc1 msc1) (hrel2 : ScalarRel sc2 msc2) (hsz1 : sc1.sizeBytes = 4) (hsz2 : sc2.sizeBytes = 4) :
     let body := faMkBody name [⟨.mut, faF32Ty, none⟩, ⟨.not, faF32Ty, none⟩, ⟨.not, faF32Ty, none⟩] faF32Ty stmt
     StateRelLM3_1 body (faMkState body [.uninit, .init (.scalar sc1), .init (.scalar sc2)])
       (faMkMiri body faF32Ty #[⟨.live (.immediate .uninit), none⟩,
@@ -2990,7 +2923,7 @@ theorem w1_lm_finite_subnormal_overflow :
   have hstep := step_float_arith_const_const_deterministic_simulation
     (fa_stateRel_1uninit "w1::add" faF32Ty
       (.assign (local_ 0) (.binaryOp .add (.constant (faF32Const 0x3F800000)) (.constant (faF32Const 0x40000000)))))
-    (fun _ h => nomatch h) annealChooseQuietedNaN
+    (fun _ h => nomatch h) annealChooseBinaryNaN
     (bop := .add) rfl rfl rfl rfl (f := .binary32) rfl rfl rfl rfl rfl rfl rfl
     (by decide) (by decide) (fa_all_imm_1 _ _ .uninit none)
   have hadd_ev : evalFloatArithBase .add .binary32 0x3F800000 0x40000000 = .some 0x40400000 := by decide +kernel
@@ -3047,7 +2980,7 @@ theorem w2_lm_cmp_and_snan_neg :
   have hcmp := step_float_cmp_const_const_simulation
     (fa_stateRel_1uninit "w2::cmp" faBoolTy
       (.assign (local_ 0) (.binaryOp .eq (.constant (faF32Const 0x80000000)) (.constant (faF32Const 0x00000000)))))
-    (fun _ h => nomatch h) true annealChooseQuietedNaN
+    (fun _ h => nomatch h) true annealChooseBinaryNaN
     (bop := .eq) rfl rfl rfl rfl (f := .binary32) rfl rfl rfl rfl rfl rfl rfl
     (by decide) (by decide) (fa_all_imm_1 _ _ .uninit none)
   have hcmp_ev : evalFloatCmp .eq .binary32 0x80000000 0x00000000 = .some true := by decide +kernel
@@ -3064,7 +2997,7 @@ theorem w2_lm_cmp_and_snan_neg :
     ⟨Or.inr (Or.inr (Or.inl rfl)), by decide, rfl, rfl⟩
   have hneg := step_float_unaryNeg_copy_simulation
     (fa_stateRel_2f32 "w2::neg" (.assign (local_ 0) (.unaryOp .neg (.copy (local_ 1)))) ⟨0x7FA00001, 4⟩ _ hsnan_rel rfl)
-    (fun _ h => nomatch h) true annealChooseQuietedNaN
+    (fun _ h => nomatch h) true annealChooseBinaryNaN
     rfl rfl rfl rfl (f := .binary32) rfl rfl (by
       intro tf h; injection h with h₁; injection h₁ with h₂; subst h₂
       exact ⟨(fun mls hm mp hmp => by simp [faMkFrame] at hm; subst hm; cases hmp),
@@ -3204,7 +3137,7 @@ theorem w4_lm_uninit_divzero_and_f16_boundary :
       have hm : mls = ⟨.live (.immediate .uninit), none⟩ := by simpa [faMkFrame] using hmls.symm
       subst hs hm; exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
     | _ + 2 => simp [bodyUn, faMkBody, get?] at hdecl
-  have hun := step_float_uninit_unaryNeg_ub_lockstep hsr_un (fun _ h => nomatch h) true annealChooseQuietedNaN
+  have hun := step_float_uninit_unaryNeg_ub_lockstep hsr_un (fun _ h => nomatch h) true annealChooseBinaryNaN
     rfl rfl rfl rfl (f := .binary32) rfl rfl rfl (by
       intro tf h; injection h with h₁; injection h₁ with h₂; subst h₂
       exact ⟨(fun mls hm mp hmp => by simp [faMkFrame] at hm; subst hm; cases hmp),
@@ -3212,7 +3145,7 @@ theorem w4_lm_uninit_divzero_and_f16_boundary :
   have hdiv := step_float_arith_const_const_deterministic_simulation
     (fa_stateRel_1uninit "w4::div0" faF32Ty
       (.assign (local_ 0) (.binaryOp .div (.constant (faF32Const 0x3F800000)) (.constant (faF32Const 0x00000000)))))
-    (fun _ h => nomatch h) annealChooseQuietedNaN
+    (fun _ h => nomatch h) annealChooseBinaryNaN
     (bop := .div) rfl rfl rfl rfl (f := .binary32) rfl rfl rfl rfl rfl rfl rfl
     (by decide) (by decide) (fa_all_imm_1 _ _ .uninit none)
   have hdiv_ev : evalFloatArithBase .div .binary32 0x3F800000 0x00000000 = .some 0x7F800000 := by decide +kernel
@@ -3228,7 +3161,7 @@ theorem w4_lm_uninit_divzero_and_f16_boundary :
   have hxor := step_float_invalid_binOp_fail_closed
     (fa_stateRel_1uninit "w4::xor" faF32Ty
       (.assign (local_ 0) (.binaryOp .bitXor (.constant (faF32Const 0x3F800000)) (.constant (faF32Const 0x40000000)))))
-    (fun _ h => nomatch h) true annealChooseQuietedNaN
+    (fun _ h => nomatch h) true annealChooseBinaryNaN
     (bop := .bitXor) rfl (fun h => nomatch h) rfl rfl rfl (f := .binary32) rfl rfl rfl rfl rfl rfl
     (by decide) (by decide)
   have hf16 := (floatOps_f16_f128_unsupported emptyLayoutTable true annealChooseQuietedNaN
@@ -3342,10 +3275,74 @@ theorem w6_lm_no_forge_ref_uninit (st : AnnealStepState) (destRef : Miri.Interpr
       miri_transmute_uninit_ub emptyLayoutTable policy faUsizeTy faUsizeTy rfl rfl rfl destRef st⟩,
     by with_unfolding_all rfl, by with_unfolding_all rfl⟩
 
+/-- **`W7` Witness (round-1 hardening)**: `binary64` engine parity (`FloatBits.{arithmetic, negate, comparison,
+nanChoices}`), index-exact `.Sub` NaN-candidate order at real `FloatOps.binary` (index `2` is the UN-NEGATED quieted
+rhs `0x7FC0002A`, index `3` its negation), `∞ - ∞` under the default `annealChooseBinaryNaN` selector, and the pinned
+`miriTransmuteScalarCheck` policy arms on a real provenance-carrying pointer scalar. -/
+theorem w7_lm_f64_and_sub_index_exact (st : AnnealStepState) (lay : Miri.ABI.LayoutData) :
+    Miri.Interpreter.FloatBits.arithmetic .Add ⟨.binary64, BitVec.ofNat 128 0x1⟩ ⟨.binary64, BitVec.ofNat 128 0x1⟩ =
+      .ok ⟨.binary64, BitVec.ofNat 128 0x2⟩ ∧
+    Miri.Interpreter.FloatBits.arithmetic .Sub ⟨.binary64, BitVec.ofNat 128 0x4008000000000000⟩ ⟨.binary64, BitVec.ofNat 128 0x3FF0000000000000⟩ =
+      .ok ⟨.binary64, BitVec.ofNat 128 0x4000000000000000⟩ ∧
+    Miri.Interpreter.FloatBits.negate ⟨.binary64, BitVec.ofNat 128 0x7FF4000000000001⟩ = .ok ⟨.binary64, BitVec.ofNat 128 0xFFF4000000000001⟩ ∧
+    Miri.Interpreter.FloatBits.comparison .Eq ⟨.binary64, BitVec.ofNat 128 0x8000000000000000⟩ ⟨.binary64, BitVec.ofNat 128 0x0⟩ = .ok true ∧
+    (Miri.Interpreter.FloatBits.nanChoices .binary64
+      [⟨.binary64, BitVec.ofNat 128 0x7FF4000000000001⟩, ⟨.binary64, BitVec.ofNat 128 0x3FF0000000000000⟩] true).map
+        (List.map fun fb => fb.bits.toNat) =
+      .ok [0x7FF8000000000000, 0xFFF8000000000000, 0x7FFC000000000001, 0xFFFC000000000001, 0x7FF4000000000001, 0xFFF4000000000001] ∧
+    (∃ msc', ScalarRel ⟨0x7FC0002A, 4⟩ msc' ∧
+      Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks true (fun _ _ => pure 2)) () .Sub
+          ⟨.scalar (.fromScalarInt (.ofUInt32 0x3F800000)), translateTy faF32Ty emptyLayoutTable⟩ ⟨.scalar (.fromScalarInt (.ofUInt32 0x7FC0002A)), translateTy faF32Ty emptyLayoutTable⟩ =
+        pure ⟨.scalar (.fromScalarInt msc'), translateTy faF32Ty emptyLayoutTable⟩) ∧
+    (∃ msc', ScalarRel ⟨0xFFC0002A, 4⟩ msc' ∧
+      Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks true (fun _ _ => pure 3)) () .Sub
+          ⟨.scalar (.fromScalarInt (.ofUInt32 0x3F800000)), translateTy faF32Ty emptyLayoutTable⟩ ⟨.scalar (.fromScalarInt (.ofUInt32 0x7FC0002A)), translateTy faF32Ty emptyLayoutTable⟩ =
+        pure ⟨.scalar (.fromScalarInt msc'), translateTy faF32Ty emptyLayoutTable⟩) ∧
+    (∃ outSc msc', EvalFloatBinOpRel .nondeterministic .sub .binary32 0x7F800000 0x7F800000 outSc ∧ ScalarRel outSc msc' ∧
+      Miri.Interpreter.FloatOps.binary (annealFloatOpsHooks true annealChooseBinaryNaN) () .Sub
+          ⟨.scalar (.fromScalarInt (.ofUInt32 0x7F800000)), translateTy faF32Ty emptyLayoutTable⟩ ⟨.scalar (.fromScalarInt (.ofUInt32 0x7F800000)), translateTy faF32Ty emptyLayoutTable⟩ st =
+        .ok ⟨.scalar (.fromScalarInt msc'), translateTy faF32Ty emptyLayoutTable⟩ st) ∧
+    (∃ ptrSc : Miri.Memory.Scalar AnnealProv, ptrSc.isPointer = true ∧
+      ptrSc.toPointer annealTargetDataLayout = .ok ⟨Miri.ABI.Size.ofBytes 0x1000, some (.concrete ⟨1, by decide⟩ .one)⟩ ∧
+      miriTransmuteScalarCheck .strictUcg630Ub ⟨25, lay⟩ ptrSc =
+        .error (.undefinedBehavior "transmute of pointer provenance into non-pointer scalar (ucg#630)") ∧
+      (∀ policy, miriTransmuteScalarCheck policy ⟨70, lay⟩ ptrSc = .ok ptrSc)) := by
+  have h1 : evalFloatArithBase .add .binary64 0x1 0x1 = .some 0x2 := by decide +kernel
+  have h2 : evalFloatArithBase .sub .binary64 0x4008000000000000 0x3FF0000000000000 = .some 0x4000000000000000 := by decide +kernel
+  have hm1 := floatBits_arithmetic_eq .add .binary64 0x1 0x1 (by decide) (by decide); rw [h1] at hm1
+  have hm2 := floatBits_arithmetic_eq .sub .binary64 0x4008000000000000 0x3FF0000000000000 (by decide) (by decide); rw [h2] at hm2
+  have hneg := floatBits_negate_eq .binary64 0x7FF4000000000001 (by decide)
+  have hnegv : evalFloatNeg .binary64 0x7FF4000000000001 = 0xFFF4000000000001 := by decide +kernel
+  rw [hnegv] at hneg
+  have hcmp := floatBits_comparison_eq .eq .binary64 0x8000000000000000 0x0 (by decide) (by decide)
+  have hcmpv : evalFloatCmp .eq .binary64 0x8000000000000000 0x0 = .some true := by decide +kernel
+  rw [hcmpv] at hcmp
+  have hnc := floatBits_nanChoices_binary_toNat_eq .binary64 0x7FF4000000000001 0x3FF0000000000000 (by decide) (by decide) true
+  have hncv : nanChoices .binary64 [(.binary64, 0x7FF4000000000001), (.binary64, 0x3FF0000000000000)] .nondeterministic =
+      [0x7FF8000000000000, 0xFFF8000000000000, 0x7FFC000000000001, 0xFFFC000000000001, 0x7FF4000000000001, 0xFFF4000000000001] := by
+    decide +kernel
+  simp only [↓reduceIte] at hnc; rw [hncv] at hnc
+  have hone : ScalarRel ⟨0x3F800000, 4⟩ (Miri.Memory.ScalarInt.ofUInt32 0x3F800000) := ⟨Or.inr (Or.inr (Or.inl rfl)), by decide, rfl, rfl⟩
+  have hq : ScalarRel ⟨0x7FC0002A, 4⟩ (Miri.Memory.ScalarInt.ofUInt32 0x7FC0002A) := ⟨Or.inr (Or.inr (Or.inl rfl)), by decide, rfl, rfl⟩
+  have hinf : ScalarRel ⟨0x7F800000, 4⟩ (Miri.Memory.ScalarInt.ofUInt32 0x7F800000) := ⟨Or.inr (Or.inr (Or.inl rfl)), by decide, rfl, rfl⟩
+  have hsb : evalFloatArithBase .sub .binary32 0x3F800000 0x7FC0002A = .some 0x7FC00000 := by decide +kernel
+  have hsn : isNaNBits .binary32 0x7FC00000 = true := by decide +kernel
+  have hs2 : (nanChoices .binary32 [(.binary32, 0x3F800000), (.binary32, 0x7FC0002A)] .nondeterministic)[2]? = some 0x7FC0002A := by decide +kernel
+  have hs3 : (nanChoices .binary32 [(.binary32, 0x3F800000), (.binary32, 0x7FC0002A)] .nondeterministic)[3]? = some 0xFFC0002A := by decide +kernel
+  have hsub2 := floatOps_binary_arith_pure_index_exact emptyLayoutTable 2 (op := .sub) rfl (lTy := faF32Ty) (rTy := faF32Ty)
+    (f := .binary32) rfl rfl hone hq rfl rfl (baseBits := 0x7FC00000) (outBits := 0x7FC0002A) hsb (Or.inl ⟨hsn, hs2⟩)
+  have hsub3 := floatOps_binary_arith_pure_index_exact emptyLayoutTable 3 (op := .sub) rfl (lTy := faF32Ty) (rTy := faF32Ty)
+    (f := .binary32) rfl rfl hone hq rfl rfl (baseBits := 0x7FC00000) (outBits := 0xFFC0002A) hsb (Or.inl ⟨hsn, hs3⟩)
+  have hdef := floatOps_binary_arith_any_chooseNaN_rel emptyLayoutTable annealChooseBinaryNaN annealChooseBinaryNaN_valid
+    (op := .sub) rfl (lTy := faF32Ty) (rTy := faF32Ty) (f := .binary32) rfl rfl hinf hinf rfl rfl st
+  have hp := miriTransmuteScalarCheck_ptr_policy_arms lay
+    (Miri.Memory.Scalar.fromPointer annealTargetDataLayout ⟨Miri.ABI.Size.ofBytes 0x1000, .concrete ⟨1, by decide⟩ .one⟩) rfl
+  refine ⟨hm1, hm2, hneg, hcmp, hnc, hsub2, hsub3, hdef, ?_⟩
+  exact ⟨_, rfl, by with_unfolding_all rfl, hp.1, hp.2.2⟩
+
 end Witnesses
 
 /-! ### 4.4 Complete Module Axiom Audit (EVERY Public Theorem Pinned to Standard Axioms) -/
-
 section AxiomAudit
 
 set_option linter.defProp false in
@@ -3376,7 +3373,10 @@ def axiomAudit_floatArithLM :=
   And.intro (@miri_transmute_uninit_ub) <| And.intro (@w1_lm_finite_subnormal_overflow) <|
   And.intro (@w2_lm_cmp_and_snan_neg) <| And.intro (@w3_lm_nan_choices_and_sub_order) <|
   And.intro (@w4_lm_uninit_divzero_and_f16_boundary) <| And.intro (@w5_lm_ptr2int_policy_flip) <|
-  @w6_lm_no_forge_ref_uninit
+  And.intro (@w6_lm_no_forge_ref_uninit) <| And.intro (@annealChooseBinaryNaN_valid) <|
+  And.intro (@annealChooseQuietedNaN_not_validBinary) <| And.intro (@floatOps_binary_arith_pure_index_exact) <|
+  And.intro (@step_float_arith_copy_copy_nondet_index_exact) <| And.intro (@miriTransmuteScalarCheck_ptr_policy_arms) <|
+  @w7_lm_f64_and_sub_index_exact
 
 /--
 info: 'LeanMiriSpec.FloatArithLM.axiomAudit_floatArithLM' depends on axioms: [propext, Classical.choice, Quot.sound]

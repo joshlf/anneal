@@ -753,7 +753,12 @@ statement of a float-constant unary or binary op (on either operand side, includ
 comparison ops `eq..ge` — **even when `b` declares ZERO float locals**!), then `translateFn b`,
 `translateFnWithIntrinsics b`, `inFragment b`, `inFragmentWithIntrinsics b`, and (for any program
 `entry :: callees` containing `b`) `progInFragment entry callees` and
-`progInFragmentWithIntrinsics entry callees` ALL fail closed (`none` / `false`). -/
+`progInFragmentWithIntrinsics entry callees` ALL fail closed (`none` / `false`).
+Scope (round-1 audit): (a)/(b) cover float-TYPED locals and float CONSTANT operands. Float operands
+reached only through a pointer dereference (`*p < *q` with `p, q : *const f32`: no float local, no
+float constant) are rejected by `translatePlace` (`derefPointeeTy`) / `relOperandsOk`; this is
+kernel-checked on concrete bodies, with an integer-pointee differential control, by
+`w10_mr_projected_float_operand_gates` in `tests/mir/FloatArithAndUcg630Tests.lean`. -/
 theorem fa_no_fragment_admits_float_arith_or_cmp (entry : CapturedMir)
     (callees : List CapturedMir) (b : CapturedMir) (hb : b ∈ entry :: callees)
     (h : (∃ d ∈ b.localDecls, ∃ (ft : FloatTy) (idx : Nat), d.ty = ⟨.float ft, idx⟩) ∨
@@ -1786,7 +1791,9 @@ theorem fa_bridge_evalFloatBinOpRel_carriers (mode : FloatArithMode) (op : BinOp
 outcome** (both `.deterministic` and `.nondeterministic`, including every `nanChoices` candidate):
 for `f32` (`f = .binary32`) the MiniRust 32-bit carrier runs via `Interp.steps` to Anneal's exact
 4-byte image in `retAlloc`; for `f64` (`f = .binary64`) the MiniRust 64-bit carrier runs via
-`Interp.steps` under `fcCtx8` to Anneal's exact 8-byte image in `fcRetAlloc8`. -/
+`Interp.steps` under `fcCtx8` to Anneal's exact 8-byte image in `fcRetAlloc8`. `TreeBorrowsMemory`
+(`Interp.stepsTB` + `MachTB.wfLive`) runs on every `binary64` `nanChoices` outcome of a concrete sNaN
+addition are kernel-checked by `w11_mr_*` in `tests/mir/FloatArithAndUcg630Tests.lean`. -/
 theorem fa_bridge_evalFloatBinOpRel_mach_steps (mode : FloatArithMode) (op : BinOp)
     (a b : Nat) (outSc : ScalarInt) (hop : isFloatArithBinOp op = true) :
     (EvalFloatBinOpRel mode op .binary32 a b outSc →
@@ -3395,8 +3402,7 @@ set_option linter.defProp false in
 def axiomAudit_choiceFree :=
   And.intro (@Anneal.Mir.IeeeFloatCast.pack_unpack_f32) <|
   -- §1 Fail-closed translation & Anneal boundary
-  And.intro (@fa_operandType_float_operand) <|
-  And.intro (@fa_operandIntType_float_operand) <|
+  And.intro (@fa_operandType_float_operand) <| And.intro (@fa_operandIntType_float_operand) <|
   And.intro (@fa_translateRvalue_unaryOp_float) <|
   And.intro (@fa_translateRvalue_binaryOp_float_const) <|
   And.intro (@fa_translateRvalue_binaryOp_arith_float) <|
@@ -3407,45 +3413,29 @@ def axiomAudit_choiceFree :=
   And.intro (@fa_no_float_local_cmp_two_sided_boundary) <|
   And.intro (@fa_anneal_float_ops_and_fail_closed_boundary) <|
   -- §2 Bitwise UnOp.neg <-> XOR, symbolic Anneal pipelines, Bool & EvalFloatBinOpRel carriers
-  And.intro (@fa_evalFloatNeg_eq_natXor_f32) <|
-  And.intro (@fa_evalFloatNeg_eq_natXor_f64) <|
-  And.intro (@fa_bitwiseXorBits_two_pow) <|
-  And.intro (@fa_evalFloatNeg_eq_bitwiseXorBits_f32) <|
-  And.intro (@fa_evalFloatNeg_eq_bitwiseXorBits_f64) <|
-  And.intro (@fa_intBitXor_nat) <|
-  And.intro (@fa_mrM_evalBinOpM_negXor) <|
-  And.intro (@fa_run_f32_neg_bits_raw) <|
-  And.intro (@fa_run_f64_neg_bits_raw) <|
-  And.intro (@fa_sym_f32_neg_bits) <|
-  And.intro (@fa_sym_f64_neg_bits) <|
-  And.intro (@fa_negXorU32_translate) <|
-  And.intro (@fa_negXorU32_inFragment) <|
-  And.intro (@fa_negXorU32_ctxOk) <|
-  And.intro (@fa_negXorU32_argsOk) <|
-  And.intro (@fa_run_negXorU32_raw) <|
-  And.intro (@fa_negXorU64_translate) <|
-  And.intro (@fa_negXorU64_inFragment) <|
-  And.intro (@fa_negXorU64_ctxOk) <|
-  And.intro (@fa_negXorU64_argsOk) <|
-  And.intro (@fa_run_negXorU64_raw) <|
-  And.intro (@fa_mrM_bool_codec) <|
-  And.intro (@fa_bridge_floatCmp) <|
-  And.intro (@fa_bridge_nanChoices_carriers) <|
+  And.intro (@fa_evalFloatNeg_eq_natXor_f32) <| And.intro (@fa_evalFloatNeg_eq_natXor_f64) <|
+  And.intro (@fa_bitwiseXorBits_two_pow) <| And.intro (@fa_evalFloatNeg_eq_bitwiseXorBits_f32) <|
+  And.intro (@fa_evalFloatNeg_eq_bitwiseXorBits_f64) <| And.intro (@fa_intBitXor_nat) <|
+  And.intro (@fa_mrM_evalBinOpM_negXor) <| And.intro (@fa_run_f32_neg_bits_raw) <|
+  And.intro (@fa_run_f64_neg_bits_raw) <| And.intro (@fa_sym_f32_neg_bits) <|
+  And.intro (@fa_sym_f64_neg_bits) <| And.intro (@fa_negXorU32_translate) <|
+  And.intro (@fa_negXorU32_inFragment) <| And.intro (@fa_negXorU32_ctxOk) <|
+  And.intro (@fa_negXorU32_argsOk) <| And.intro (@fa_run_negXorU32_raw) <|
+  And.intro (@fa_negXorU64_translate) <| And.intro (@fa_negXorU64_inFragment) <|
+  And.intro (@fa_negXorU64_ctxOk) <| And.intro (@fa_negXorU64_argsOk) <|
+  And.intro (@fa_run_negXorU64_raw) <| And.intro (@fa_mrM_bool_codec) <|
+  And.intro (@fa_bridge_floatCmp) <| And.intro (@fa_bridge_nanChoices_carriers) <|
   And.intro (@fa_bridge_evalFloatBinOpRel_carriers) <|
   -- §3 Ptr2IntTransmutePolicy & composite / no-forgery / uninit / size-mismatch correspondence
-  And.intro (@fa_evalByteCast_eq) <|
-  And.intro (@fa_evalByteCast_of_encode) <|
-  And.intro (@fa_mrM_transmute_ptr_strip) <|
-  And.intro (@fa_decodeTyped_ptr_bytes_policy_flip) <|
+  And.intro (@fa_evalByteCast_eq) <| And.intro (@fa_evalByteCast_of_encode) <|
+  And.intro (@fa_mrM_transmute_ptr_strip) <| And.intro (@fa_decodeTyped_ptr_bytes_policy_flip) <|
   And.intro (@fa_ptr2int_policy_flip_scalar_correspondence) <|
   And.intro (@fa_mrM_transmute_ptr_tuple_selective) <|
   And.intro (@fa_composite_tuple_struct_policy_correspondence) <|
   And.intro (@fa_provFree_policy_equivalence_correspondence) <|
   And.intro (@fa_mrM_transmute_u64_to_refU8_ub) <|
-  And.intro (@fa_shared_ub_no_forge_both_policies) <|
-  And.intro (@fa_ptrToU64_translate) <|
-  And.intro (@fa_usizeToRefU8_translate) <|
-  And.intro (@fa_uninitTransmuteU64_translate) <|
+  And.intro (@fa_shared_ub_no_forge_both_policies) <| And.intro (@fa_ptrToU64_translate) <|
+  And.intro (@fa_usizeToRefU8_translate) <| And.intro (@fa_uninitTransmuteU64_translate) <|
   And.intro (@fa_intDivZero_translate) <|
   -- §4 Choice-free concrete witnesses W1 & W4
   And.intro (@w1_mr_finite_subnormal_overflow) <|
