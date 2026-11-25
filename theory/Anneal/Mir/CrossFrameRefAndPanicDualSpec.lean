@@ -372,8 +372,9 @@ private theorem range_map_cell {α : Type} {f : Nat → α} {xs : List α} {n : 
 /-- Real MiniRust (`Mach` & `MachTB`) matches `authorityExpected` on EVERY `idx : Nat`. -/
 theorem mrObserve_matches_expected (m : CrossFramePanicMode) (idx : Nat) :
     mrObserve m idx = authorityExpected m idx := by
-  by_cases hlt : idx < canonicalCaseCount
-  · have hBasicList : mrExpectedBasicList.map ofMrObs =
+  match Nat.lt_or_ge idx canonicalCaseCount with
+  | .inl hlt =>
+    have hBasicList : mrExpectedBasicList.map ofMrObs =
         (List.range canonicalCaseCount).map (authorityExpected .basic) := by decide
     have hTbList : mrExpectedTbList.map ofMrObs =
         (List.range canonicalCaseCount).map (authorityExpected .treeBorrows) := by decide
@@ -400,7 +401,7 @@ theorem mrObserve_matches_expected (m : CrossFramePanicMode) (idx : Nat) :
       have hCell := congrArg (fun l => l[idx]?) hM
       simp only [List.getElem?_map, List.getElem?_range hlt, Option.map_some] at hCell
       exact Option.some.inj hCell
-  · have hge : canonicalCaseCount ≤ idx := Nat.le_of_not_lt hlt
+  | .inr hge =>
     rw [authorityExpected_out_of_range m idx hge]
     unfold mrObserve
     rw [mrCrossFramePanicObserve_out_of_range m.toLmTreeBorrows idx hge]
@@ -494,11 +495,12 @@ theorem crossFramePanicDualContract_nonempty : Nonempty CrossFramePanicDualContr
 theorem CrossFramePanicDualContract.lm_matches_all (c : CrossFramePanicDualContract)
     (m : CrossFramePanicMode) (idx : Nat) :
     c.lm.observe m.toLmTreeBorrows idx = authorityExpected m idx := by
-  by_cases hlt : idx < canonicalCaseCount
-  · have h := c.lm.matchesExpected m.toLmTreeBorrows idx hlt
+  match Nat.lt_or_ge idx canonicalCaseCount with
+  | .inl hlt =>
+    have h := c.lm.matchesExpected m.toLmTreeBorrows idx hlt
     rw [CrossFramePanicMode.of_toLmTreeBorrows] at h
     exact h
-  · have hge : canonicalCaseCount ≤ idx := Nat.le_of_not_lt hlt
+  | .inr hge =>
     rw [c.lm.outOfRange m.toLmTreeBorrows idx hge, authorityExpected_out_of_range m idx hge]
 
 /-- **Total MiniRust ↔ LeanMiri exact equality across ALL modes and ALL `idx : Nat`**
@@ -1558,11 +1560,12 @@ theorem trustedCrossFramePanicObserve_out_of_range (idx : Nat)
 /-- Real `stepMirFn` observer equals `trustedExpected` on EVERY `idx : Nat`. -/
 theorem trustedCrossFramePanicObserve_matches_expected (idx : Nat) :
     trustedCrossFramePanicObserve idx = trustedExpected idx := by
-  by_cases hlt : idx < canonicalCaseCount
-  · have hCell := congrArg (fun l => l[idx]?) trustedCrossFramePanicObserve_table
+  match Nat.lt_or_ge idx canonicalCaseCount with
+  | .inl hlt =>
+    have hCell := congrArg (fun l => l[idx]?) trustedCrossFramePanicObserve_table
     simp only [List.getElem?_map, List.getElem?_range hlt, Option.map_some] at hCell
     exact Option.some.inj hCell
-  · have hge : canonicalCaseCount ≤ idx := Nat.le_of_not_lt hlt
+  | .inr hge =>
     rw [trustedCrossFramePanicObserve_out_of_range idx hge,
         trustedExpected_out_of_range idx hge]
 
@@ -1864,6 +1867,155 @@ theorem trusted_case23_three_frame_lifo_unwind_trace :
       readRootLocalU32 s14 1 = some 3 :=
   case23TraceCheck_sound mirCase23.1
     (initMachineStateWithCallees mirCase23.1 [] mirCase23.2) (by kernel_rfl)
+
+/-- Boolean test for `TreeBorrowPerm.disabled`. -/
+def isDisabledPerm : TreeBorrowPerm → Bool
+  | .disabled => true
+  | _ => false
+
+theorem isDisabledPerm_eq_true_iff (p : TreeBorrowPerm) :
+    isDisabledPerm p = true ↔ p = .disabled := by
+  cases p <;> simp [isDisabledPerm]
+
+/-- Decidable checker for Case `10` callee stack-local teardown (`disableFrameBorrows`) and
+immediate caller UAR deref fault on unmodified `stepMirFn` (`step 6 → step 7 → fault`). -/
+def case10TeardownCheck (body : CapturedMir) (sInit : MachineState) : Bool :=
+  match runTrustedTrace body 6 sInit with
+  | some s6 =>
+    match stepMirFn body s6 with
+    | .tau (.running s7) =>
+      let isFaultUb := match stepMirFn body s7 with
+        | .vis (.inl (.fail .ub)) _ => true
+        | .tau (.faulted .ub) => true
+        | _ => false
+      match s6.memory.borrows, s7.memory.borrows with
+      | [eBefore], [eAfter] =>
+        decide (s6.memory.callStack.length = 1) &&
+        decide (eBefore.targetFrameDepth = 1) &&
+        decide (eBefore.targetLocal = 1) &&
+        !eBefore.allocDead &&
+        !isDisabledPerm eBefore.perm &&
+        decide (s7.memory.callStack.isEmpty) &&
+        decide (eAfter.targetFrameDepth = 1) &&
+        decide (eAfter.targetLocal = 1) &&
+        eAfter.allocDead &&
+        isDisabledPerm eAfter.perm &&
+        isFaultUb
+      | _, _ => false
+    | _ => false
+  | none => false
+
+private theorem case10TeardownCheck_sound (body : CapturedMir) (sInit : MachineState)
+    (hCheck : case10TeardownCheck body sInit = true) :
+    ∃ s6 s7 eBefore eAfter,
+      runTrustedTrace body 6 sInit = some s6 ∧
+      stepMirFn body s6 = .tau (.running s7) ∧
+      s6.memory.callStack.length = 1 ∧
+      s6.memory.borrows = [eBefore] ∧
+      eBefore.targetFrameDepth = 1 ∧
+      eBefore.targetLocal = 1 ∧
+      eBefore.allocDead = false ∧
+      eBefore.perm ≠ .disabled ∧
+      s7.memory.callStack = [] ∧
+      s7.memory.borrows = [eAfter] ∧
+      eAfter.targetFrameDepth = 1 ∧
+      eAfter.targetLocal = 1 ∧
+      eAfter.allocDead = true ∧
+      eAfter.perm = .disabled ∧
+      (match stepMirFn body s7 with
+       | .vis (.inl (.fail .ub)) _ => True
+       | .tau (.faulted .ub) => True
+       | _ => False) := by
+  unfold case10TeardownCheck at hCheck
+  cases h6 : runTrustedTrace body 6 sInit with
+  | none => rw [h6] at hCheck; cases hCheck
+  | some s6 =>
+    rw [h6] at hCheck; dsimp only at hCheck
+    cases h7 : stepMirFn body s6 with
+    | tau st7 =>
+      cases st7 with
+      | running s7 =>
+        rw [h7] at hCheck; dsimp only at hCheck
+        cases hB6 : s6.memory.borrows with
+        | nil => rw [hB6] at hCheck; cases hCheck
+        | cons eBefore t6 =>
+          cases t6 with
+          | cons _ _ => rw [hB6] at hCheck; cases hCheck
+          | nil =>
+            cases hB7 : s7.memory.borrows with
+            | nil => rw [hB6, hB7] at hCheck; cases hCheck
+            | cons eAfter t7 =>
+              cases t7 with
+              | cons _ _ => rw [hB6, hB7] at hCheck; cases hCheck
+              | nil =>
+                rw [hB6, hB7] at hCheck; dsimp only at hCheck
+                simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq,
+                  List.isEmpty_iff] at hCheck
+                obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6'⟩, h7'⟩, h8⟩, h9⟩, h10⟩, h11⟩ := hCheck
+                have hNeDis : eBefore.perm ≠ .disabled := by
+                  intro hEq
+                  have ht := (isDisabledPerm_eq_true_iff eBefore.perm).mpr hEq
+                  rw [ht] at h5; cases h5
+                have hDis : eAfter.perm = .disabled := (isDisabledPerm_eq_true_iff eAfter.perm).mp h10
+                have hUb : match stepMirFn body s7 with
+                    | .vis (.inl (.fail .ub)) _ => True
+                    | .tau (.faulted .ub) => True
+                    | _ => False := by
+                  cases hs : stepMirFn body s7 with
+                  | tau st =>
+                    cases st with
+                    | faulted fk =>
+                      cases fk with
+                      | ub => trivial
+                      | _ => rw [hs] at h11; cases h11
+                    | _ => rw [hs] at h11; cases h11
+                  | vis e _ =>
+                    cases e with
+                    | inl f =>
+                      cases f with
+                      | fail fk =>
+                        cases fk with
+                        | ub => trivial
+                        | _ => rw [hs] at h11; cases h11
+                    | inr _ => rw [hs] at h11; cases h11
+                  | ret _ => rw [hs] at h11; cases h11
+                exact ⟨s6, s7, eBefore, eAfter, rfl, h7, h1, hB6, h2, h3, h4, hNeDis,
+                  h6', hB7, h7', h8, h9, hDis, hUb⟩
+      | halted _ => rw [h7] at hCheck; cases hCheck
+      | faulted _ => rw [h7] at hCheck; cases hCheck
+    | ret _ => rw [h7] at hCheck; cases hCheck
+    | vis _ _ => rw [h7] at hCheck; cases hCheck
+
+/-- **Live callee stack-local teardown (`disableFrameBorrows`) & UAR trace on Case `10`** directly
+on unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`:
+- At step `6` (inside `ep1::c10_callee` right before `.return_`), the borrow targeting callee local
+  `(depth = 1, local = 1)` is LIVE (`allocDead = false`, `perm ≠ .disabled`).
+- Immediately after callee's `.return_` step (`6 → 7`), `disableFrameBorrows` marks THAT EXACT
+  borrow `allocDead = true` and `perm = .disabled`.
+- The immediately following deref step in `ep1::c10_main` faults with `.ub`! -/
+theorem trusted_case10_live_callee_teardown_disable_trace :
+    let sInit := initMachineStateWithCallees mirCase10.1 [] mirCase10.2
+    ∃ s6 s7 eBefore eAfter,
+      runTrustedTrace mirCase10.1 6 sInit = some s6 ∧
+      stepMirFn mirCase10.1 s6 = .tau (.running s7) ∧
+      s6.memory.callStack.length = 1 ∧
+      s6.memory.borrows = [eBefore] ∧
+      eBefore.targetFrameDepth = 1 ∧
+      eBefore.targetLocal = 1 ∧
+      eBefore.allocDead = false ∧
+      eBefore.perm ≠ .disabled ∧
+      s7.memory.callStack = [] ∧
+      s7.memory.borrows = [eAfter] ∧
+      eAfter.targetFrameDepth = 1 ∧
+      eAfter.targetLocal = 1 ∧
+      eAfter.allocDead = true ∧
+      eAfter.perm = .disabled ∧
+      (match stepMirFn mirCase10.1 s7 with
+       | .vis (.inl (.fail .ub)) _ => True
+       | .tau (.faulted .ub) => True
+       | _ => False) :=
+  case10TeardownCheck_sound mirCase10.1
+    (initMachineStateWithCallees mirCase10.1 [] mirCase10.2) (by kernel_rfl)
 
 /-- **Causal unwind protector-release contrast across BOTH `Trusted.MirSemantics` and `MiniRust`**:
 attempting the parent write BEFORE callee unwind releases the `FnEntry` protector faults with `.ub`
@@ -2298,6 +2450,7 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       (type_of% @trusted_unwind_continue_chain_root_boundary) ∧
       (type_of% @trustedCrossFramePanicObserve_table) ∧
       (type_of% @trustedCrossFramePanicObserve_out_of_range) ∧
+      (type_of% @trusted_case10_live_callee_teardown_disable_trace) ∧
       (type_of% @trusted_case21_live_unwind_protector_release_trace) ∧
       (type_of% @trusted_case23_three_frame_lifo_unwind_trace) ∧
       (type_of% @trusted_case21_premature_parent_write_ub_contrast) ∧
@@ -2320,6 +2473,7 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       @hasFrameDeallocProtectorConflict_iff, @trusted_unwind_continue_chain_to_cleanup,
       @trusted_unwind_releases_callee_protector, @trusted_unwind_continue_chain_root_boundary,
       @trustedCrossFramePanicObserve_table, @trustedCrossFramePanicObserve_out_of_range,
+      @trusted_case10_live_callee_teardown_disable_trace,
       @trusted_case21_live_unwind_protector_release_trace,
       @trusted_case23_three_frame_lifo_unwind_trace,
       @trusted_case21_premature_parent_write_ub_contrast,
@@ -2363,7 +2517,8 @@ run_cmd do
       ns ++ `CrossFramePanicMode.of_toLmTreeBorrows, ns ++ `CrossFramePanicMode.to_ofLmTreeBorrows,
       ns ++ `mirToUnwindAction4_left_inv, ns ++ `mirToUnwindAction4_right_inv,
       ns ++ `unwindAction4Codec,
-      ns ++ `lmAuthorityCheck_sound, ns ++ `lmAuthorityOfCheck ]
+      ns ++ `lmAuthorityCheck_sound, ns ++ `lmAuthorityOfCheck,
+      ns ++ `mrBackedLmAuthority, ns ++ `crossFramePanicDualContract_nonempty ]
   for c in constructiveDecls do
     unless env.contains c do throwError "constructive audit: {c} missing"
     for a in ← liftCoreM <| Lean.collectAxioms c do
@@ -2392,6 +2547,8 @@ run_cmd do
       (ns ++ `trusted_unwind_releases_callee_protector,
         `Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowProtected),
       (ns ++ `trustedCrossFramePanicObserve_table,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `trusted_case10_live_callee_teardown_disable_trace,
         `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `trusted_case21_live_unwind_protector_release_trace,
         `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),

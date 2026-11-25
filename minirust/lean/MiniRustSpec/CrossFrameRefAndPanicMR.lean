@@ -1729,6 +1729,8 @@ theorem mr_tb_exact_ub_diagnostics :
       some "dereferencing pointer outside the bounds of its allocation" ∧
     runStopMsgTB mrProg12 =
       some "dereferencing pointer outside the bounds of its allocation" ∧
+    runStopMsgTB mrProg13 =
+      some "dereferencing pointer outside the bounds of its allocation" ∧
     runStopMsgTB mrProg16 =
       some "reached unreachable code" ∧
     runStopMsgTB mrProg20 =
@@ -1737,7 +1739,25 @@ theorem mr_tb_exact_ub_diagnostics :
       some "unwinding from a function where the caller did not specify an unwind_block" ∧
     runStopMsgTB mrProgRootUnwind =
       some "the function at the bottom of the stack must not unwind" := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- Check whether `prog` on `MachTB` stops specifically with `Stop.abort` (distinguishing
+deterministic `Abort` from UB, spec panic, or fuel exhaustion). -/
+def runStopsWithAbortTB (prog : Program) (fuel : Nat := 120) : Bool :=
+  match bootProgramM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams) prog with
+  | .ok m0 =>
+    match runToStopM fuel m0 with
+    | .error (.abort, _) => true
+    | _ => false
+  | .error _ => false
+
+/-- Exact `Stop.abort` diagnostics on `MachTB` for ALL four abort scenarios (`18`, `19`, `22`, `24`). -/
+theorem mr_tb_exact_abort_diagnostics :
+    runStopsWithAbortTB mrProg18 = true ∧
+    runStopsWithAbortTB mrProg19 = true ∧
+    runStopsWithAbortTB mrProg22 = true ∧
+    runStopsWithAbortTB mrProg24 = true := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- **Root-unwind body wrapped in an outer catch harness** (the "unless wrapped in an outer
 catch harness" clause of the root-frame boundary): the SAME panicking body as
@@ -1856,6 +1876,19 @@ theorem mr_case21_premature_parent_write_ub_contrast :
       mrProg21 120 = .okCleanupRecovered 65 65 := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
+/-- **`MachTB.wfLive` preservation on `mrProg21PrematureWrite`**: even the premature-write
+protector-UB contrast program preserves the live-allocation Tree Borrows invariant up to UB. -/
+theorem mrProg21PrematureWrite_tb_wfLive (m0 : MachTB)
+    (hBoot : bootProgramM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams)
+      mrProg21PrematureWrite = .ok m0)
+    (fuel : Nat) :
+    match runToStopM fuel m0 with
+    | .ok mEnd => MachTB.wfLive mEnd
+    | .error (_, mStop) => MachTB.wfLive mStop :=
+  runToStopM_tb_wfLive fuel
+    (bootProgramM_tb_wfLive ({ implicit_writes := true } : TreeBorrowsParams)
+      mrProg21PrematureWrite m0 hBoot)
+
 end CanonicalMrPrograms
 
 /-! ## §5. Episode 1 MiniRust Capstone & Silent Axiom / Import-Isolation Audit -/
@@ -1891,9 +1924,11 @@ theorem ep1_minirust_cross_frame_panic_capstone :
     (type_of% @mrCrossFramePanicObserve_mode_sensitivity) ∧
     (type_of% @mrCanonicalProg_tb_wfLive) ∧
     (type_of% @mr_tb_exact_ub_diagnostics) ∧
+    (type_of% @mr_tb_exact_abort_diagnostics) ∧
     (type_of% @mr_root_unwind_boundary_vs_catch_harness) ∧
     (type_of% @mrProgRootUnwindCaught_tb_wfLive) ∧
-    (type_of% @mr_case21_premature_parent_write_ub_contrast) :=
+    (type_of% @mr_case21_premature_parent_write_ub_contrast) ∧
+    (type_of% @mrProg21PrematureWrite_tb_wfLive) :=
   ⟨@bootProgramM_tb_wfLive, @runToStopM_tb_wfLive, @evalPtrOffsetM_wrapping_eq,
    @evalPtrOffsetM_inbounds_eq, @ptrOffsetWrappingM_roundtrip, @evalTerminatorM_unreachable_ub,
    @evalTerminatorM_switch_assert, @evalTerminatorM_abort, @evalResumeUnwindM_dispatch,
@@ -1907,9 +1942,9 @@ theorem ep1_minirust_cross_frame_panic_capstone :
    @trusted_evalBinOpOffset_oob_none, @trusted_evalArithOffset_roundtrip,
    @trusted_restoreCallerProtectors_releases, @mrCrossFramePanicObserve_table,
    @mrCrossFramePanicObserve_out_of_range, @mrCrossFramePanicObserve_mode_sensitivity,
-   @mrCanonicalProg_tb_wfLive, @mr_tb_exact_ub_diagnostics,
+   @mrCanonicalProg_tb_wfLive, @mr_tb_exact_ub_diagnostics, @mr_tb_exact_abort_diagnostics,
    @mr_root_unwind_boundary_vs_catch_harness, @mrProgRootUnwindCaught_tb_wfLive,
-   @mr_case21_premature_parent_write_ub_contrast⟩
+   @mr_case21_premature_parent_write_ub_contrast, @mrProg21PrematureWrite_tb_wfLive⟩
 
 section AxiomAudit
 open Lean Elab Command

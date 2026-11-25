@@ -688,118 +688,40 @@ def lmMirUnitLayout : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
   { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory,
     fields := .arbitrary [] [], variants := .single 0, isUninhabited := false }
 
+/-- Minimal `CapturedMir` builder for frames lowered through `LeanMiriSpec.Correspondence.translateBody`. -/
+def lmMirBodyOfBlocks (defPath : String)
+    (blocks : List Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData) :
+    Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  { defPath := defPath
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 0
+    localDecls := [{ mutability := .mut, ty := ⟨.tuple [], 0⟩, debugName := none }]
+    basicBlocks := blocks
+    fnAbi := { args := [], ret := { layout := lmMirUnitLayout, mode := .direct },
+               conv := .rust, canUnwind := true }
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [] }
+    allocations := [] }
+
 /-- Real `CapturedMir` body for bare root-frame unwind (`bb0`: cleanup `unwindResume`),
 lowered directly through `LeanMiriSpec.Correspondence.translateBody`. -/
 def lmRootUnwindMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
-  { defPath := "ep1::lm_root_unwind"
-    phase := .runtimePostCleanup
-    role := .subject
-    argCount := 0
-    localDecls := [{ mutability := .mut, ty := ⟨.tuple [], 0⟩, debugName := none }]
-    basicBlocks :=
-      [{ statements := [], terminator := { kind := .unwindResume, span := "ep1.rs" },
-         isCleanup := true }]
-    fnAbi := { args := [], ret := { layout := lmMirUnitLayout, mode := .direct },
-               conv := .rust, canUnwind := true }
-    layouts := { pointerBits := 64, isLittleEndian := true, entries := [] }
-    allocations := [] }
+  lmMirBodyOfBlocks "ep1::lm_root_unwind"
+    [{ statements := [], terminator := { kind := .unwindResume, span := "ep1.rs" },
+       isCleanup := true }]
 
-/-- Root-frame unwind check directly invoking vendored
-`Miri.Interpreter.ControlFlow.returnFromCurrentFrame` on a 1-frame stack whose body is lowered
-from `lmRootUnwindMirBody` via `LeanMiriSpec.Correspondence.translateBody`:
-returns `.error (.controlFlow (.undefinedBehavior "unwinding past the topmost stack frame"))`. -/
-def lmRootUnwindCheck : Except LmExecFailure Unit :=
-  let rootFrame : Miri.Interpreter.Frame Provenance Unit Unit :=
-    { body := LeanMiriSpec.Correspondence.translateBody lmRootUnwindMirBody
-      bodyIdentity := .ofCanonicalIndex 0
-      functionInstance := { kind := .Item 0, args := #[] }
-      extra := ()
-      returnContinuation := .stop false
-      returnPlace := .frameLocal 0 0 none ⟨0, zstLayoutData⟩ (.ofAllocationToken 0)
-      localsIdentity := .ofAllocationToken 0
-      locals := #[⟨.dead, none⟩]
-      vaList := #[]
-      trackCallerArg := none
-      location := .mir ⟨0, 0⟩ }
-  let st : Miri.Interpreter.StepState Provenance Unit Unit Unit :=
-    { stack := ⟨#[rootFrame]⟩, machine := () }
-  let hooks : Miri.Interpreter.ControlHooks Provenance Unit Unit Unit Unit Unit :=
-    { bodySpan := fun _ => .ok ⟨0⟩
-      returnOperand := fun _ s => (s, .ok ())
-      popFrame := fun _ s => (s, .error (.stack .emptyStack))
-      copyReturn := fun _ _ _ s => (s, .ok ())
-      cleanupFrame := fun _ _ _ s => (s, .ok .normal)
-      unwindTerminate := fun _ _ s => (s, .error (.termination (.abort "unwindTerminate"))) }
-  match Miri.Interpreter.ControlFlow.returnFromCurrentFrame hooks () true st with
-  | (_, .ok ()) => .ok ()
-  | (_, .error e) => .error (.controlFlow e)
+/-- Real `CapturedMir` body for `TerminatorKind.unreachable`, lowered through `translateBody`. -/
+def lmUnreachableMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_unreachable"
+    [{ statements := [], terminator := { kind := .unreachable, span := "ep1.rs" },
+       isCleanup := false }]
 
-/-- `TerminatorKind.unreachable` check directly invoking vendored
-`Miri.Interpreter.ControlFlow.evalTerminator`. -/
-def lmUnreachableCheck : Except LmExecFailure Unit :=
-  let hooks : Miri.Interpreter.TerminatorHooks Provenance Unit Unit Unit Unit Unit Unit :=
-    { bodySpan := fun _ => .ok ⟨0⟩
-      returnOperand := fun _ s => (s, .ok ())
-      popFrame := fun _ s => (s, .error (.stack .emptyStack))
-      copyReturn := fun _ _ _ s => (s, .ok ())
-      cleanupFrame := fun _ _ _ s => (s, .ok .normal)
-      unwindTerminate := fun _ _ s => (s, .error (.termination (.abort "unwindTerminate")))
-      evalDiscriminant := fun _ _ s => (s, .ok ())
-      compareSwitchCase := fun _ _ _ s => (s, .ok false)
-      call := fun _ _ s => (s, .ok ())
-      tailCall := fun _ _ s => (s, .ok ())
-      drop := fun _ _ _ _ s => (s, .ok ())
-      ignoreOptionalOverflowChecks := fun _ => false
-      readAssertCondition := fun _ _ s => (s, .ok true)
-      assertPanic := fun _ _ _ s => (s, .ok ()) }
-  let st : Miri.Interpreter.StepState Provenance Unit Unit Unit :=
-    { stack := ⟨#[]⟩, machine := () }
-  match Miri.Interpreter.ControlFlow.evalTerminator hooks ()
-      { sourceInfo := { span := ⟨0⟩, scope := 0 }, kind := .Unreachable } st with
-  | (_, .ok ()) => .ok ()
-  | (_, .error e) => .error (.controlFlow e)
-
-/-! ### Vendored `Miri.Interpreter.ControlFlow` driver over the multi-frame harness state
-
-Every `TerminatorKind.assert` / `UnwindAction` / `UnwindResume` / `UnwindTerminate` decision in
-scenarios `14..25` is taken by the REAL vendored `Miri.Interpreter.ControlFlow.evalTerminator`
-(`Assert` → `goToBlock` / `assertPanic`, `UnwindResume` → `returnFromCurrentFrame (unwinding := true)`
-→ `popFrame` → `cleanupFrame` → `unwindToBlock`, `UnwindTerminate` → `unwindTerminate`), running
-over `StepState` whose machine component is the harness `LmState`. The `cleanupFrame` hook executes
-the callee frame teardown (`lmExitCall`: stack-local deallocation via vendored
-`MemoryLifecycle.deallocatePtrWith` + `FnEntry` protector release via vendored
-`BorrowTree.releaseProtector` / `GlobalState.endCall`) exactly where pinned Miri runs
-`pop_stack_frame` / `after_stack_pop`, i.e. AFTER the frame pop and BEFORE the caller's unwind
-continuation is followed. `assertPanic` follows the asserting frame's `UnwindAction` through the
-vendored `unwindToBlock` (the net control effect of Miri's `assert_panic` → `start_panic` call
-unwinding back into the asserting frame). -/
-
-/-- Canonical harness `SourceInfo`. -/
-def lmSrc : Miri.MIR.SourceInfo := { span := ⟨0⟩, scope := 0 }
-
-/-- Canonical `CapturedMir` body lowered via `LeanMiriSpec.Correspondence.translateBody`
-for every driver frame: `bb0` (regular entry, `.return_`), `bb1` (regular return target,
-`.return_`), and `bb2` (`isCleanup = true` landing pad executing `.unwindResume`). -/
-def lmCfMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
-  { defPath := "ep1::lm_cf_frame"
-    phase := .runtimePostCleanup
-    role := .subject
-    argCount := 0
-    localDecls := [{ mutability := .mut, ty := ⟨.tuple [], 0⟩, debugName := none }]
-    basicBlocks :=
-      [{ statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
-       { statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
-       { statements := [], terminator := { kind := .unwindResume, span := "ep1.rs" }, isCleanup := true }]
-    fnAbi := { args := [], ret := { layout := lmMirUnitLayout, mode := .direct },
-               conv := .rust, canUnwind := true }
-    layouts := { pointerBits := 64, isLittleEndian := true, entries := [] }
-    allocations := [] }
-
-/-- A vendored `Miri.Interpreter.Frame` whose `body` is genuinely lowered from `lmCfMirBody` via
-`LeanMiriSpec.Correspondence.translateBody` (not a synthetic hand-built `Miri.MIR.Body`). -/
-def lmCfFrame (loc : Miri.Interpreter.FrameLocation) (ret : Miri.Interpreter.ReturnContinuation) :
+/-- Build a vendored `Miri.Interpreter.Frame` whose `body` is genuinely lowered from a
+`CapturedMir` via `LeanMiriSpec.Correspondence.translateBody`. -/
+def lmCfFrameOf (cm : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+    (loc : Miri.Interpreter.FrameLocation) (ret : Miri.Interpreter.ReturnContinuation) :
     Miri.Interpreter.Frame Provenance Unit Unit :=
-  { body := LeanMiriSpec.Correspondence.translateBody lmCfMirBody
+  { body := LeanMiriSpec.Correspondence.translateBody cm
     bodyIdentity := .ofCanonicalIndex 0
     functionInstance := { kind := .Item 0, args := #[] }
     extra := ()
@@ -810,6 +732,46 @@ def lmCfFrame (loc : Miri.Interpreter.FrameLocation) (ret : Miri.Interpreter.Ret
     vaList := #[]
     trackCallerArg := none
     location := loc }
+
+/-- Canonical `CapturedMir` body lowered via `LeanMiriSpec.Correspondence.translateBody`
+for call/return/unwindResume driver frames (`bb0` `.return_`, `bb1` `.return_`,
+`bb2` cleanup `.unwindResume`). -/
+def lmCfMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_cf_frame"
+    [{ statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .unwindResume, span := "ep1.rs" }, isCleanup := true }]
+
+/-- Real `CapturedMir` body for `TerminatorKind.assert`, lowered through `translateBody`. -/
+def lmAssertMirBody (expected : Bool)
+    (u : Trusted.Rustc.V2026_06_01.MirAst.UnwindAction) :
+    Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_assert"
+    [{ statements := [],
+       terminator := { kind := .assert (.copy ⟨1, []⟩) expected 1 u, span := "ep1.rs" },
+       isCleanup := false },
+     { statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .unwindResume, span := "ep1.rs" }, isCleanup := true }]
+
+/-- Real `CapturedMir` body for cleanup `TerminatorKind.unwindTerminate`, lowered through
+`translateBody`. -/
+def lmUnwindTerminateMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_unwind_terminate"
+    [{ statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .unwindTerminate, span := "ep1.rs" }, isCleanup := true }]
+
+/-- Map `Miri.MIR.UnwindAction` into `MirAst.UnwindAction` for `translateBody` lowering. -/
+def lmUnwindActionToMir : Miri.MIR.UnwindAction → Trusted.Rustc.V2026_06_01.MirAst.UnwindAction
+  | .Continue => .continue_
+  | .Unreachable => .unreachable
+  | .Terminate _ => .terminate
+  | .Cleanup bb => .cleanup bb
+
+/-- A vendored `Miri.Interpreter.Frame` lowered from `lmCfMirBody` via `translateBody`. -/
+def lmCfFrame (loc : Miri.Interpreter.FrameLocation) (ret : Miri.Interpreter.ReturnContinuation) :
+    Miri.Interpreter.Frame Provenance Unit Unit :=
+  lmCfFrameOf lmCfMirBody loc ret
 
 /-- Vendored `ControlHooks` over the harness machine `LmState`; `cleanupFrame` runs the
 supplied frame-exit operation (instantiated with `lmExitCall`), stashing typed failures in
@@ -847,21 +809,40 @@ def lmCfTermHooks (exitCall : LmState → Except LmExecFailure LmState) (cond : 
     assertPanic := fun _ _ unwind s =>
       Miri.Interpreter.ControlFlow.unwindToBlock (lmCfControlHooks exitCall) () unwind s }
 
-/-- Control location reached by the active frame after a vendored `ControlFlow` transition. -/
+/-- Vendored `Miri.Interpreter.StepHooks` executing every driver transition through the REAL
+vendored `Miri.Interpreter.Step.step` driver (fetching each terminator from the `translateBody`-
+lowered `Miri.MIR.Body`, or taking the `.unwinding _` branch directly into
+`ControlFlow.returnFromCurrentFrame`). -/
+def lmCfStepHooks (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool) :
+    Miri.Interpreter.StepHooks Provenance Unit Unit LmState Unit Unit :=
+  { assign := fun _ _ _ s => (s, .error (.unsupported "harness: Assign"))
+    evalPlace := fun _ _ _ s => (s, .error (.unsupported "harness: evalPlace"))
+    writeDiscriminant := fun _ _ _ s => (s, .error (.unsupported "harness: SetDiscriminant"))
+    storageLive := fun _ _ s => (s, .error (.unsupported "harness: StorageLive"))
+    storageDead := fun _ _ s => (s, .error (.unsupported "harness: StorageDead"))
+    intrinsic := fun _ _ s => (s, .error (.unsupported "harness: Intrinsic"))
+    incrementConstEvalCounter := fun _ s => (s, .ok ())
+    returnFromCurrentFrame := fun _ unwinding s =>
+      Miri.Interpreter.ControlFlow.returnFromCurrentFrame (lmCfControlHooks exitCall) () unwinding s
+    beforeTerminator := fun _ s => (s, .ok ())
+    terminator := fun _ term s =>
+      Miri.Interpreter.ControlFlow.evalTerminator (lmCfTermHooks exitCall cond) () term s }
+
+/-- Control location reached by the active frame after a vendored `Miri.Interpreter.Step.step`. -/
 inductive LmCfOutcome where
   | atBlock (bb : Nat)
   | unwinding
   deriving DecidableEq, Repr
 
-/-- Run ONE terminator through vendored `Miri.Interpreter.ControlFlow.evalTerminator` on the
+/-- Run ONE step through REAL vendored `Miri.Interpreter.Step.step` on the `translateBody`-lowered
 driver stack `frames` with machine `st`, returning the resulting active-frame location. -/
 def lmCfRun (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool)
-    (frames : Array (Miri.Interpreter.Frame Provenance Unit Unit)) (st : LmState)
-    (kind : Miri.MIR.TerminatorKind) : Except LmExecFailure (LmCfOutcome × LmState) :=
-  match Miri.Interpreter.ControlFlow.evalTerminator (lmCfTermHooks exitCall cond) ()
-      { sourceInfo := lmSrc, kind := kind } { stack := ⟨frames⟩, machine := st } with
+    (frames : Array (Miri.Interpreter.Frame Provenance Unit Unit)) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  match Miri.Interpreter.Step.step (lmCfStepHooks exitCall cond) ()
+      { stack := ⟨frames⟩, machine := st } with
   | (s, .error e) => .error (s.machine.ctx.pending.getD (.controlFlow e))
-  | (s, .ok ()) =>
+  | (s, .ok _) =>
     match s.stack.currentFrame? with
     | none => .error (.controlFlow (.stack .emptyStack))
     | some fr =>
@@ -869,38 +850,56 @@ def lmCfRun (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool)
       | .mir loc => .ok (.atBlock loc.block, s.machine)
       | .unwinding _ => .ok (.unwinding, s.machine)
 
-/-- Callee normal `TerminatorKind.Return` from a non-cleanup block (`bb0`) whose call edge in the
-caller carries normal return target `bb1`: vendored `returnFromCurrentFrame (unwinding := false)`
-pops the callee, runs `copyReturn`, runs `cleanupFrame` (stack-local deallocation + `FnEntry`
-protector release via `exitCall`), and jumps the caller to `bb1` (`.atBlock 1`). -/
+/-- Root-frame unwind check directly invoking vendored `Miri.Interpreter.Step.step` on a 1-frame
+stack lowered from `lmRootUnwindMirBody` via `translateBody`:
+returns `.error (.controlFlow (.undefinedBehavior "unwinding past the topmost stack frame"))`. -/
+def lmRootUnwindCheck : Except LmExecFailure Unit :=
+  match lmCfRun (fun s => .ok s) true
+      #[lmCfFrameOf lmRootUnwindMirBody (.mir ⟨0, 0⟩) (.stop false)] (lmInit false) with
+  | .ok _ => .ok ()
+  | .error e => .error e
+
+/-- `TerminatorKind.unreachable` check directly invoking vendored `Miri.Interpreter.Step.step` on
+a frame lowered from `lmUnreachableMirBody` via `translateBody`. -/
+def lmUnreachableCheck : Except LmExecFailure Unit :=
+  match lmCfRun (fun s => .ok s) true
+      #[lmCfFrameOf lmUnreachableMirBody (.mir ⟨0, 0⟩) (.stop false)] (lmInit false) with
+  | .ok _ => .ok ()
+  | .error e => .error e
+
+/-- Callee normal `TerminatorKind.Return` executed via vendored `Miri.Interpreter.Step.step` from
+a `translateBody`-lowered `lmCfMirBody` non-cleanup block (`bb0`): pops callee, runs `copyReturn`,
+runs `cleanupFrame` (`exitCall`: stack-local deallocation + `FnEntry` protector release), and
+jumps caller to `bb1` (`.atBlock 1`). -/
 def lmCfReturn (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
     Except LmExecFailure (LmCfOutcome × LmState) :=
   lmCfRun exitCall true
     #[lmCfFrame (.mir ⟨0, 0⟩) (.stop false), lmCfFrame (.mir ⟨0, 0⟩) (.goto (some 1) .Continue)] st
-    .Return
 
-/-- `TerminatorKind.assert(cond == expected, target = bb1, unwind)` in the active frame. -/
+/-- `TerminatorKind.assert(cond == expected, target = bb1, unwind)` executed via vendored
+`Miri.Interpreter.Step.step` on a `translateBody`-lowered `lmAssertMirBody` frame. -/
 def lmCfAssert (exitCall : LmState → Except LmExecFailure LmState) (cond expected : Bool)
     (unwind : Miri.MIR.UnwindAction) (st : LmState) :
     Except LmExecFailure (LmCfOutcome × LmState) :=
-  lmCfRun exitCall cond #[lmCfFrame (.mir ⟨0, 0⟩) (.stop false)] st
-    (.Assert (.Copy ⟨1, #[]⟩) expected .NullPointerDereference 1 unwind)
+  lmCfRun exitCall cond
+    #[lmCfFrameOf (lmAssertMirBody expected (lmUnwindActionToMir unwind)) (.mir ⟨0, 0⟩) (.stop false)]
+    st
 
-/-- Callee `UnwindResume` from location `calleeLoc` (a cleanup block or an `.unwinding`
-location) whose call edge in the caller carries `unwind`: vendored `returnFromCurrentFrame`
-pops the callee, runs `cleanupFrame` (frame teardown + protector release), then follows
-`unwindToBlock unwind` in the caller. -/
+/-- Callee `UnwindResume` executed via vendored `Miri.Interpreter.Step.step` from location
+`calleeLoc` (a `translateBody`-lowered cleanup block or an `.unwinding` location) whose call edge
+in the caller carries `unwind`. -/
 def lmCfUnwindResume (exitCall : LmState → Except LmExecFailure LmState)
     (calleeLoc : Miri.Interpreter.FrameLocation) (unwind : Miri.MIR.UnwindAction) (st : LmState) :
     Except LmExecFailure (LmCfOutcome × LmState) :=
   lmCfRun exitCall true
     #[lmCfFrame (.mir ⟨0, 0⟩) (.stop false), lmCfFrame calleeLoc (.goto (some 1) unwind)] st
-    .UnwindResume
 
-/-- `TerminatorKind.unwindTerminate` executed from the active frame's cleanup block. -/
+/-- `TerminatorKind.unwindTerminate` executed via vendored `Miri.Interpreter.Step.step` from the
+cleanup block of a `translateBody`-lowered `lmUnwindTerminateMirBody` frame. -/
 def lmCfUnwindTerminate (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
     Except LmExecFailure (LmCfOutcome × LmState) :=
-  lmCfRun exitCall true #[lmCfFrame (.mir ⟨2, 0⟩) (.stop false)] st (.UnwindTerminate .InCleanup)
+  lmCfRun exitCall true
+    #[lmCfFrameOf lmUnwindTerminateMirBody (.mir ⟨2, 0⟩) (.stop false)] st
 
 /-- Fail-closed expectation on the vendored control-flow location (mismatch ⇒ `invalidProgram`
 ⇒ `.invalidOrUnsupported`, never a silent pass). -/
@@ -1081,8 +1080,9 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let st ← lmStoreU32 st py 55
     let (o, st) ← lmCfReturn lmExitCall st
     lmCfExpect o (.atBlock 1)
-    let (v, _) ← lmLoadU32 st py
-    .ok (.okVal v v)
+    let _ ← lmLoadU32 st py
+    -- Fail-closed: reaching here would mean the dangling deref did NOT fault.
+    .ok .invalidOrUnsupported
   -- Case 11: in-bounds `ptrOffsetInbounds` past end (+12 on 8-byte array) -> `.ub` in BOTH modes.
   | 11 => do
     let st := lmInit tb
@@ -1090,9 +1090,8 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let st := lmEnterCall st
     let (pr, st) ← lmRetagRef st pa .Mutable .FnEntry
     let _ ← lmPtrOffsetInbounds st pr 12
-    let (o, _) ← lmCfReturn lmExitCall st
-    lmCfExpect o (.atBlock 1)
-    .ok (.okVal 0 0)
+    -- Fail-closed: reaching here would mean OOB `ptrOffsetInbounds` (+12) did NOT fault.
+    .ok .invalidOrUnsupported
   -- Case 12: in-bounds `ptrOffsetInbounds` before start (-4) -> `.ub` in BOTH modes.
   | 12 => do
     let st := lmInit tb
@@ -1100,9 +1099,8 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let st := lmEnterCall st
     let (pr, st) ← lmRetagRef st pa .Mutable .FnEntry
     let _ ← lmPtrOffsetInbounds st pr (-4)
-    let (o, _) ← lmCfReturn lmExitCall st
-    lmCfExpect o (.atBlock 1)
-    .ok (.okVal 0 0)
+    -- Fail-closed: reaching here would mean OOB `ptrOffsetInbounds` (-4) did NOT fault.
+    .ok .invalidOrUnsupported
   -- Case 13: wrapping offset(+400) OOB followed by deref -> `.ub` in BOTH modes.
   | 13 => do
     let st := lmInit tb
@@ -1111,8 +1109,9 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let st := lmEnterCall st
     let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
     let q ← lmPtrOffsetWrapping pr 400
-    let (v, _) ← lmLoadU32 st q
-    .ok (.okVal v v)
+    let _ ← lmLoadU32 st q
+    -- Fail-closed: reaching here would mean OOB deref after wrapping offset did NOT fault.
+    .ok .invalidOrUnsupported
   -- Case 14: `TerminatorKind.assert(cond == true)` passes: the condition `1` is stored to and
   -- loaded from vendored `Miri` memory, and vendored `ControlFlow.evalTerminator (.Assert ..)`
   -- must jump to `target = bb1`.
@@ -1398,9 +1397,8 @@ MiniRust `mr_case21_premature_parent_write_ub_contrast` and Trusted
 theorem lm_case21_premature_parent_write_ub_contrast :
     lmCase21PrematureWrite false = .ok (.okCleanupRecovered 75 75) ∧
     observeLm (lmCase21PrematureWrite true) = .ub ∧
-    (match lmCase21PrematureWrite true with
-      | .error (.treeAccess _) => true
-      | _ => false) = true ∧
+    lmCase21PrematureWrite true =
+      .error (.treeAccess (.AccessFailure ⟨0, 4⟩ (.TransitionError 2 (.ProtectedDisabled .Unique)))) ∧
     lmCase true 21 = .ok (.okCleanupRecovered 65 65) := by
   rw [lmCase21PrematureWriteU.eq_src, lmCaseU.eq_src]
   refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
@@ -1504,6 +1502,8 @@ theorem lm_tb_exact_failure_diagnostics :
       (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 12 .inboundsPointerArithmetic))) ∧
     lmCase true 12 = .error (.pointerOffset (.access
       (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 (-4) .inboundsPointerArithmetic))) ∧
+    lmCase true 13 = .error (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨4⟩ 400 4 .memoryAccess)) ∧
     lmCase true 16 = .error (.controlFlow (.undefinedBehavior "Unreachable")) ∧
     lmCase true 27 = .error (.controlFlow
       (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
@@ -1521,7 +1521,7 @@ theorem lm_tb_exact_failure_diagnostics :
     lmCase true 25 = .error (.controlFlow
       (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
   rw [lmCaseU.eq_src]
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- Exact LeanMiri Tree Borrows mode-sensitivity `↔` theorem: Cases `8` and `9` flip between
 `treeBorrows = false` and `treeBorrows = true`, and every other canonical case agrees. -/
@@ -1662,13 +1662,10 @@ theorem lm_cf_assert_four_way (exitCall : LmState → Except LmExecFailure LmSta
       .error (.controlFlow
         (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · cases b <;> cases u <;> rfl
   · cases b <;> rfl
   · cases b <;> rfl
-  · cases b <;> rfl
-  · cases b
-    · show Except.error (st.ctx.pending.getD (.controlFlow
-          (.termination (.abort "panic in a function that cannot unwind")))) = _
-      rw [hP]; rfl
+  · cases b <;> cases r <;>
     · show Except.error (st.ctx.pending.getD (.controlFlow
           (.termination (.abort "panic in a function that cannot unwind")))) = _
       rw [hP]; rfl
@@ -1714,112 +1711,85 @@ theorem lm_cf_return_and_unwind_pop_laws (exitCall : LmState → Except LmExecFa
       (#[f0, f1] : Array _).pop = #[f0] := fun _ _ => rfl
   have hSize2 : ∀ (f0 f1 : Miri.Interpreter.Frame Provenance Unit Unit),
       (#[f0, f1] : Array _).size = 2 := fun _ _ => rfl
+  have hBb0 : (LeanMiriSpec.Correspondence.translateBody lmCfMirBody).basicBlocks[0]? =
+      some { statements := #[]
+             terminator := ⟨LeanMiriSpec.Correspondence.defaultSourceInfo, .Return⟩
+             cleanup := false } := rfl
+  have hBb2 : (LeanMiriSpec.Correspondence.translateBody lmCfMirBody).basicBlocks[2]? =
+      some { statements := #[]
+             terminator := ⟨LeanMiriSpec.Correspondence.defaultSourceInfo, .UnwindResume⟩
+             cleanup := true } := rfl
+  have hStmt0 : (#[] : Array Miri.MIR.Statement)[0]? = none := rfl
   refine ⟨?_, ?_, ?_⟩
   · intro st' hOk hP
     refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
-    · dsimp only [lmCfReturn, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfReturn, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2, hBb0, hStmt0]
       rw [hOk]
       rfl
-    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2, hBb2, hStmt0]
       rw [hOk]
       rfl
-    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
       rw [hOk]
       rfl
-    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
       rw [hOk]
       rfl
-    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
       rw [hOk]
       change Except.error (st'.ctx.pending.getD (.controlFlow
         (.termination (.abort "panic in a function that cannot unwind")))) = _
       rw [hP]; rfl
-    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
       rw [hOk]
       change Except.error (st'.ctx.pending.getD (.controlFlow
         (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) = _
       rw [hP]; rfl
   · intro e hErr
     refine ⟨?_, ?_, ?_⟩
-    · dsimp only [lmCfReturn, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfReturn, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2, hBb0, hStmt0]
       rw [hErr]
       rfl
-    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2, hBb2, hStmt0]
       rw [hErr]
       rfl
-    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfTermHooks, lmCfControlHooks,
-        Miri.Interpreter.ControlFlow.evalTerminator,
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
         Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
-        Miri.Interpreter.Stack.currentFrame?, Id.run]
-      rw [hBack2, hSize2, hPop2]
-      dsimp only [lmCfFrame, lmCfMirBody, LeanMiriSpec.Correspondence.translateBody,
-        LeanMiriSpec.Correspondence.translateBasicBlockData,
-        LeanMiriSpec.Correspondence.translateTerminator,
-        LeanMiriSpec.Correspondence.translateTerminatorKind]
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
       rw [hErr]
       rfl
   · intro hP
@@ -2250,7 +2220,8 @@ run_cmd do
   let ns := `LeanMiriSpec.CrossFrameRefAndPanicLM
   -- 2. Bridge-reality audit: confirm our LM theorems transitively reach real vendored Miri & Trusted constants.
   let bridgeReq : List (Lean.Name × Lean.Name) :=
-    [ (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.ControlFlow.evalTerminator),
+    [ (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.Step.step),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.ControlFlow.evalTerminator),
       (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.ControlFlow.returnFromCurrentFrame),
       (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.ControlFlow.unwindToBlock),
       (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.Unwind.pushPayload),
