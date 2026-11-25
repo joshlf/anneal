@@ -52,7 +52,16 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      UB under BOTH policies) separation, `const/const` nondeterministic `Inf - Inf` / `sNaN + 1.0`
      index-exact `EvalRvalueFloatRel` correspondence (paired with `w8_lm_*` & `step_float_arith_const_const_nondet_*`),
      and general projected-place float rejection (`fa_projected_float_place_rejection` &
-     `fa_no_fragment_admits_projected_float_op`) across deref `*p` and tuple/struct field `_s.0`.
+     `fa_no_fragment_admits_projected_float_op`) across deref `*p` and tuple/struct field `_s.0`;
+   - Round-2 hardening (`W13`): IEEE-754 `%` dividend sign incl. exactly-zero remainders (`-2.0 % 2.0 = -0.0`, NOT
+     `+0.0`, on `f32` & `f64`; paired with vendored Miri via `w9_lm_rem_dividend_sign_and_zero_remainder` and with
+     kernel positive/negative controls), mixed `copy` / `move` / `const` operand shapes (`evalRvalue` and
+     index-exact nondeterministic `EvalRvalueFloatRel`), `Ptr2IntTransmutePolicy` on niche `Option<&u8>` (`None`
+     agrees under BOTH policies, `Some(&u8)` flips) and on MIXED / provenance-free pointer arrays, reverse
+     no-forgery through the niche, a pinned `Trusted` layout-only-decoder FINDING on direct-tagged enums with
+     reference payloads, and the exact TWO-SIDED `translateRvalue` truth for projected float operands
+     (`fa_translateRvalue_binaryOp_two_sided`: comparisons and float-on-the-RIGHT arithmetic are type-erased
+     `some`; ONLY the `statementOk*` / `inFragment*` gates reject them).
 2. **Cross-Root Dual-Authority Kernel Bridge (`run_cmd`)**:
    Loads BOTH `.lake/build/lib/lean` (`Anneal.Mir.IeeeFloatArith`, `MiniRustSpec.FloatArithMR`)
    and `examples/.lake/build/lib/lean` (`LeanMiriSpec.FloatArithLM`) into a fresh Lean kernel
@@ -61,7 +70,7 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      `unifiedFloatArithAndUcg630DualBundle` conjoining all `W1`–`W6` MR/LM witnesses plus
      general correspondence/step-simulation theorems from both authorities and the
      `V2026_06_01` <-> `V2026_08_01` dialect-parity theorems;
-   - 10 well-typed negative controls verified to be REJECTED by the Lean kernel, 9 of them paired
+   - 12 well-typed negative controls verified to be REJECTED by the Lean kernel, 11 of them paired
      with a positive control (the TRUE right-hand side for the same left-hand side is ACCEPTED), so
      a rejection is never an artifact of a stuck or failing kernel reduction;
    - Structural inspection of the MiniRust `Gen.Type` / `Gen.Value` / operator inductives (no float
@@ -712,7 +721,394 @@ theorem w12_a1_rawPtr_vs_ref_fnPtr_const_nondet_and_projected_float_rejection :
     ⟨hfcmp.1, hfcmp.2.1, hfcmp.2.2.1, hfcmp.2.2.2.1⟩,
     ⟨hfneg.1, hfneg.2.1, hfneg.2.2.1, hfneg.2.2.2.1, hfnegTr.2.1, hfnegTr.2.2⟩⟩
 
+/-- `[_0: bool, _1: (f32, u32), _2: (f32, u32), _3: u32]`. -/
+private def tFieldDecls : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl :=
+  [boolDecl, tTupleF32U32Decl, tTupleF32U32Decl, fcDecl fcU32Ty]
+/-- `copy (_j.0)` at field type `f32`. -/
+private abbrev tF0 (j : Nat) : Trusted.Rustc.V2026_06_01.MirAst.Operand := .copy ⟨j, [.field 0 fcF32Ty]⟩
+/-- `_3 = Rem(copy _3, copy (_1.0))`: projected float on the RIGHT of an integer-typed left operand. -/
+private def tFieldRhsRemStmt : Trusted.Rustc.V2026_06_01.MirAst.Statement :=
+  mkStmt (.assign (local_ 3) (.binaryOp .rem (.copy ⟨3, []⟩) (tF0 1)))
+/-- `_0 = Eq(copy _3, copy (_1.0))`: projected float on the RIGHT of a comparison. -/
+private def tFieldRhsEqStmt : Trusted.Rustc.V2026_06_01.MirAst.Statement :=
+  mkStmt (.assign (local_ 0) (.binaryOp .eq (.copy ⟨3, []⟩) (tF0 1)))
+/-- `_0 = Lt(copy (_1.0), copy (_2.0))`: projected floats on BOTH sides of a comparison. -/
+private def tFieldBothLtStmt : Trusted.Rustc.V2026_06_01.MirAst.Statement :=
+  mkStmt (.assign (local_ 0) (.binaryOp .lt (tF0 1) (tF0 2)))
+/-- Body whose only statement is `tFieldRhsRemStmt`. -/
+private def tFieldRhsRemBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  faBody2 "w13::field_f32_rhs_rem" tFieldDecls [.assign (local_ 3) (.binaryOp .rem (.copy ⟨3, []⟩) (tF0 1))]
+
+/-- **`W13` Witness (round-2: the exact TWO-SIDED `translateRvalue` truth for projected float operands)**:
+`fa_projected_float_place_rejection` proves `translateRvalue = none` only for unary ops and for float arithmetic
+with the projected float on the LEFT. On a field-projected float operand `_s.0` (which `translateOperand` ADMITS):
+1. EVERY comparison is type-erased to `some (.BinOp (.Rel _) ..)` with the float on the LEFT, RIGHT, or BOTH sides;
+2. float arithmetic is `none` with the float on the LEFT (or on both sides), but
+3. it is type-erased to `some (.BinOp (.Int _) ..)` with the float on the RIGHT of an integer-typed left operand
+   (`fa_translateRvalue_binaryOp_two_sided`), and `translateStatement` SUCCEEDS on all three type-erased shapes;
+4. the ONLY gates rejecting those shapes are the statement predicates — the general rejection theorem instantiated
+   on the RIGHT operand (`Or.inr rfl`) — and hence the whole-function `inFragment*` / `progInFragment*` gates;
+5. integer differential control: the same statement shape over an integer right operand is admitted, and
+   `translateLocals` independently rejects the `(f32, u32)` locals. -/
+theorem w13_mr_projected_float_two_sided_translateRvalue_truth :
+    translateRvalue fcLayouts tFieldDecls none (.binaryOp .eq (tF0 1) (.copy ⟨3, []⟩)) =
+      some (.BinOp (.Rel .Eq) (.Load (.Field (.Local (localName 1)) 0)) (.Load (.Local (localName 3)))) ∧
+    translateRvalue fcLayouts tFieldDecls none (.binaryOp .eq (.copy ⟨3, []⟩) (tF0 1)) =
+      some (.BinOp (.Rel .Eq) (.Load (.Local (localName 3))) (.Load (.Field (.Local (localName 1)) 0))) ∧
+    translateRvalue fcLayouts tFieldDecls none (.binaryOp .lt (tF0 1) (tF0 2)) =
+      some (.BinOp (.Rel .Lt) (.Load (.Field (.Local (localName 1)) 0)) (.Load (.Field (.Local (localName 2)) 0))) ∧
+    translateRvalue fcLayouts tFieldDecls none (.binaryOp .add (tF0 1) (.copy ⟨3, []⟩)) = none ∧
+    translateRvalue fcLayouts tFieldDecls none (.binaryOp .add (tF0 1) (tF0 2)) = none ∧
+    translateRvalue fcLayouts tFieldDecls none (.binaryOp .add (.copy ⟨3, []⟩) (tF0 1)) =
+      some (.BinOp (.Int .Add) (.Load (.Local (localName 3))) (.Load (.Field (.Local (localName 1)) 0))) ∧
+    translateRvalue fcLayouts tFieldDecls none (.binaryOp .rem (.copy ⟨3, []⟩) (tF0 1)) =
+      some (.BinOp (.Int .Rem) (.Load (.Local (localName 3))) (.Load (.Field (.Local (localName 1)) 0))) ∧
+    (translateStatement tFieldDecls tFieldRhsRemStmt fcLayouts).isSome = true ∧
+    (translateStatement tFieldDecls tFieldRhsEqStmt fcLayouts).isSome = true ∧
+    (translateStatement tFieldDecls tFieldBothLtStmt fcLayouts).isSome = true ∧
+    statementOk tFieldDecls tFieldRhsRemStmt fcLayouts = false ∧
+    statementOkWithIntrinsics tFieldDecls tFieldRhsRemStmt fcLayouts = false ∧
+    statementOk tFieldDecls tFieldRhsEqStmt fcLayouts = false ∧
+    statementOkWithIntrinsics tFieldDecls tFieldRhsEqStmt fcLayouts = false ∧
+    statementOk tFieldDecls tFieldBothLtStmt fcLayouts = false ∧
+    (inFragment tFieldRhsRemBody = false ∧ inFragmentWithIntrinsics tFieldRhsRemBody = false ∧
+      progInFragment tFieldRhsRemBody [] = false ∧ progInFragmentWithIntrinsics tFieldRhsRemBody [] = false) ∧
+    statementOk tFieldDecls (mkStmt (.assign (local_ 3) (.binaryOp .rem (.copy ⟨3, []⟩) (.copy ⟨3, []⟩)))) fcLayouts = true ∧
+    (translateLocals fcLayouts 0 tFieldDecls).isNone = true := by
+  have htwo := fa_translateRvalue_binaryOp_two_sided fcLayouts tFieldDecls none .rem (.copy ⟨3, []⟩) (tF0 1)
+  have hrej := (fa_projected_float_place_rejection fcLayouts tFieldDecls ⟨1, [.field 0 fcF32Ty]⟩ fcF32Ty .f32 (tF0 1) rfl rfl
+    (Or.inl rfl)).2.2.2.2.2.2.2.2.2.2
+  have hrem := hrej (local_ 3) (.binaryOp .rem (.copy ⟨3, []⟩) (tF0 1)) "witness" (Or.inr ⟨.rem, _, _, rfl, Or.inr rfl⟩)
+  have heq := hrej (local_ 0) (.binaryOp .eq (.copy ⟨3, []⟩) (tF0 1)) "witness" (Or.inr ⟨.eq, _, _, rfl, Or.inr rfl⟩)
+  have hlt := hrej (local_ 0) (.binaryOp .lt (tF0 1) (tF0 2)) "witness" (Or.inr ⟨.lt, _, _, rfl, Or.inl rfl⟩)
+  have hbody := fa_no_fragment_admits_projected_float_op tFieldRhsRemBody [] tFieldRhsRemBody
+    (List.mem_cons_self ..) _ (List.mem_cons_self ..) (local_ 3) _ "witness" (List.mem_cons_self ..)
+    ⟨1, [.field 0 fcF32Ty]⟩ fcF32Ty .f32 (tF0 1) rfl rfl (Or.inl rfl) (Or.inr ⟨.rem, _, _, rfl, Or.inr rfl⟩)
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, htwo.2.1 _ _ _ _ rfl rfl rfl rfl rfl,
+    by decide +kernel, by decide +kernel, by decide +kernel, hrem.1, hrem.2.2.2, heq.1, heq.2.2.2, hlt.1,
+    ⟨hbody.1, hbody.2.1, hbody.2.2.1, hbody.2.2.2.1⟩, by decide +kernel, by decide +kernel⟩
+
 end MiniRustRound1
+
+/-! ### §1.3 Round-2 Hardening: `%` Dividend Sign, Mixed Operand Shapes, Niche `Option<&u8>`, Mixed Pointer Arrays -/
+
+/-- A single initialized `f32` local `_0` holding `bits`. -/
+private abbrev tF32Slot (bits : Nat) : List LocalSlot := [.init (.scalar ⟨bits, 4⟩)]
+/-- Declarations of the single mutable `f32` local `_0`. -/
+private abbrev tF32Decls : List LocalDecl := [⟨.mut, tF32Ty, .none⟩]
+
+/-- **`W13` Witness (round-2: IEEE-754 `%` dividend sign & mixed `copy` / `move` / `const` operand shapes)**:
+1. `rem` keeps the DIVIDEND's sign, including on an exactly-zero remainder — `(lhs, rhs, result)` bit triples for
+   `-2.0 % 2.0 = -0.0` (NOT `+0.0`), `2.0 % -2.0 = +0.0`, `-5.0 % 2.0 = -1.0`, `5.0 % -2.0 = 1.0`, `-1.0 % 2.0 = -1.0`,
+   `-0.5 % 1.0 = -0.5`, subnormal `-3ε % 2ε = -ε`, `-MAX % ε = -0.0`, `-2.0 % +∞ = -2.0`, `-0.0 % 2.0 = -0.0`, and the NaN
+   cases `-2.0 % -0.0` / `-∞ % 2.0` on `f32`, with the matching `f64` triples (paired bit-for-bit with vendored Miri by
+   `FloatArithLM.w9_lm_rem_dividend_sign_and_zero_remainder` and with kernel positive/negative controls in §2); and
+   `EvalFloatBinOpRel` admits `-0.0` and REFUTES `+0.0` for `-2.0 % 2.0` in BOTH modes on `f32` and `f64`;
+2. mixed operand shapes on the executable `evalRvalue`: `copy/const` and `const/copy` (order-sensitive `sub`:
+   `2.0 - 1.0 = 1.0` vs. `1.0 - 2.0 = -1.0`; `rem`: `-2.0 % 2.0 = -0.0` vs. `2.0 % -2.0 = +0.0`), `move/const` and
+   `const/move` (`1.0 / -0.0 = -∞`, `-0.0 < 1.0`; the moved-from local is deinitialized), and an uninitialized
+   `copy` / `move` operand next to a constant on EITHER side is `.ub`;
+3. the relational `EvalRvalueFloatRel` on mixed shapes: index-exact nondeterministic NaN candidates for
+   `copy sNaN + const 1.0` and for `const 1.0 - copy qNaN(0x7FC0002A)` (UN-NEGATED rhs candidate order), and
+   `copy -2.0 % const 2.0` has EXACTLY ONE outcome (`-0.0`) under every mode and policy. -/
+theorem w13_rem_dividend_sign_and_mixed_operand_shapes :
+    (∀ p ∈ [(0xC0000000, 0x40000000, 0x80000000), (0x40000000, 0xC0000000, 0x00000000), (0xC0A00000, 0x40000000, 0xBF800000),
+        (0x40A00000, 0xC0000000, 0x3F800000), (0xBF800000, 0x40000000, 0xBF800000), (0xBF000000, 0x3F800000, 0xBF000000),
+        (0x80000003, 0x00000002, 0x80000001), (0xFF7FFFFF, 0x00000001, 0x80000000), (0xC0000000, 0x7F800000, 0xC0000000),
+        (0x80000000, 0x40000000, 0x80000000), (0xC0000000, 0x80000000, 0x7FC00000), (0xFF800000, 0x40000000, 0x7FC00000)],
+      evalFloatArithBase .rem .binary32 p.1 p.2.1 = .some p.2.2) ∧
+    (∀ p ∈ [(0xC000000000000000, 0x4000000000000000, 0x8000000000000000), (0x4000000000000000, 0xC000000000000000, 0),
+        (0xC014000000000000, 0x4000000000000000, 0xBFF0000000000000), (0xBFF0000000000000, 0x4000000000000000, 0xBFF0000000000000),
+        (0xBFE0000000000000, 0x3FF0000000000000, 0xBFE0000000000000), (0x8000000000000003, 0x0000000000000002, 0x8000000000000001),
+        (0xFFEFFFFFFFFFFFFF, 0x0000000000000001, 0x8000000000000000), (0xC000000000000000, 0xFFF0000000000000, 0xC000000000000000),
+        (0xC000000000000000, 0x8000000000000000, 0x7FF8000000000000)],
+      evalFloatArithBase .rem .binary64 p.1 p.2.1 = .some p.2.2) ∧
+    (∀ mode, EvalFloatBinOpRel mode .rem .binary32 0xC0000000 0x40000000 ⟨0x80000000, 4⟩ ∧
+      ¬ EvalFloatBinOpRel mode .rem .binary32 0xC0000000 0x40000000 ⟨0x00000000, 4⟩ ∧
+      EvalFloatBinOpRel mode .rem .binary64 0xC000000000000000 0x4000000000000000 ⟨0x8000000000000000, 8⟩ ∧
+      ¬ EvalFloatBinOpRel mode .rem .binary64 0xC000000000000000 0x4000000000000000 ⟨0, 8⟩) ∧
+    -- mixed `copy/const`, `const/copy`, `move/const`, `const/move` operand shapes (order-sensitive `sub` / `rem` / `div`)
+    evalRvalue (tF32Slot 0x40000000) (.binaryOp .add (.copy ⟨0, .nil⟩) (mkFConst tF32Ty 0x3F800000 4)) emptyMemory tF32Decls
+        emptyLayoutTable = .ok (.scalar ⟨0x40400000, 4⟩) (tF32Slot 0x40000000) emptyMemory ∧
+    evalRvalue (tF32Slot 0x40000000) (.binaryOp .sub (.copy ⟨0, .nil⟩) (mkFConst tF32Ty 0x3F800000 4)) emptyMemory tF32Decls
+        emptyLayoutTable = .ok (.scalar ⟨0x3F800000, 4⟩) (tF32Slot 0x40000000) emptyMemory ∧
+    evalRvalue (tF32Slot 0x40000000) (.binaryOp .sub (mkFConst tF32Ty 0x3F800000 4) (.copy ⟨0, .nil⟩)) emptyMemory tF32Decls
+        emptyLayoutTable = .ok (.scalar ⟨0xBF800000, 4⟩) (tF32Slot 0x40000000) emptyMemory ∧
+    evalRvalue (tF32Slot 0xC0000000) (.binaryOp .rem (.copy ⟨0, .nil⟩) (mkFConst tF32Ty 0x40000000 4)) emptyMemory tF32Decls
+        emptyLayoutTable = .ok (.scalar ⟨0x80000000, 4⟩) (tF32Slot 0xC0000000) emptyMemory ∧
+    evalRvalue (tF32Slot 0xC0000000) (.binaryOp .rem (mkFConst tF32Ty 0x40000000 4) (.copy ⟨0, .nil⟩)) emptyMemory tF32Decls
+        emptyLayoutTable = .ok (.scalar ⟨0x00000000, 4⟩) (tF32Slot 0xC0000000) emptyMemory ∧
+    evalRvalue (tF32Slot 0x3F800000) (.binaryOp .div (.move ⟨0, .nil⟩) (mkFConst tF32Ty 0x80000000 4)) emptyMemory tF32Decls
+        emptyLayoutTable = .ok (.scalar ⟨0xFF800000, 4⟩) [.uninit] emptyMemory ∧
+    evalRvalue (tF32Slot 0x3F800000) (.binaryOp .lt (mkFConst tF32Ty 0x80000000 4) (.move ⟨0, .nil⟩)) emptyMemory tF32Decls
+        emptyLayoutTable = .ok (.scalar ⟨1, 1⟩) [.uninit] emptyMemory ∧
+    evalRvalue [.uninit] (.binaryOp .add (.copy ⟨0, .nil⟩) (mkFConst tF32Ty 0x3F800000 4)) emptyMemory tF32Decls emptyLayoutTable = .ub ∧
+    evalRvalue [.uninit] (.binaryOp .add (mkFConst tF32Ty 0x3F800000 4) (.copy ⟨0, .nil⟩)) emptyMemory tF32Decls emptyLayoutTable = .ub ∧
+    evalRvalue [.uninit] (.binaryOp .eq (mkFConst tF32Ty 0x3F800000 4) (.move ⟨0, .nil⟩)) emptyMemory tF32Decls emptyLayoutTable = .ub ∧
+    -- nondeterministic NaN selection through a MIXED operand shape: index-exact candidates, un-negated rhs order for `.sub`
+    (∀ policy (idx : Nat) cand,
+      (nanChoices .binary32 [(.binary32, 0x7FA00001), (.binary32, 0x3F800000)] .nondeterministic)[idx]? = some cand →
+      EvalRvalueFloatRel .nondeterministic policy (tF32Slot 0x7FA00001)
+        (.binaryOp .add (.copy ⟨0, .nil⟩) (mkFConst tF32Ty 0x3F800000 4))
+        emptyMemory tF32Decls emptyLayoutTable (.ok (.scalar ⟨cand, 4⟩) (tF32Slot 0x7FA00001) emptyMemory)) ∧
+    (∀ policy (idx : Nat) cand,
+      ([0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A] : List Nat)[idx]? = some cand →
+      EvalRvalueFloatRel .nondeterministic policy (tF32Slot 0x7FC0002A)
+        (.binaryOp .sub (mkFConst tF32Ty 0x3F800000 4) (.copy ⟨0, .nil⟩))
+        emptyMemory tF32Decls emptyLayoutTable (.ok (.scalar ⟨cand, 4⟩) (tF32Slot 0x7FC0002A) emptyMemory)) ∧
+    (∀ mode policy res,
+      EvalRvalueFloatRel mode policy (tF32Slot 0xC0000000) (.binaryOp .rem (.copy ⟨0, .nil⟩) (mkFConst tF32Ty 0x40000000 4))
+        emptyMemory tF32Decls emptyLayoutTable res ↔ res = .ok (.scalar ⟨0x80000000, 4⟩) (tF32Slot 0xC0000000) emptyMemory) := by
+  have hrem32 : evalFloatArithBase .rem .binary32 0xC0000000 0x40000000 = .some 0x80000000 := by decide +kernel
+  have hrem64 : evalFloatArithBase .rem .binary64 0xC000000000000000 0x4000000000000000 = .some 0x8000000000000000 := by decide +kernel
+  have hpos32 : ∀ mode, EvalFloatBinOpRel mode .rem .binary32 0xC0000000 0x40000000 ⟨0x80000000, 4⟩ := fun mode =>
+    (EvalFloatBinOpRel_arith_iff mode .rem .binary32 0xC0000000 0x40000000 ⟨0x80000000, 4⟩ rfl).mpr
+      ⟨0x80000000, hrem32, Or.inr ⟨by decide +kernel, rfl⟩⟩
+  have honly32 : ∀ mode out, EvalFloatBinOpRel mode .rem .binary32 0xC0000000 0x40000000 out → out = ⟨0x80000000, 4⟩ := fun mode out h => by
+    obtain ⟨base, hb, hc⟩ := (EvalFloatBinOpRel_arith_iff mode .rem .binary32 0xC0000000 0x40000000 out rfl).mp h
+    have hbase : base = 0x80000000 := Option.some.inj (hb.symm.trans hrem32)
+    subst hbase
+    rcases hc with ⟨hn, _⟩ | ⟨_, ho⟩
+    · exact absurd hn (by decide +kernel)
+    · exact ho
+  have honly64 : ∀ mode out, EvalFloatBinOpRel mode .rem .binary64 0xC000000000000000 0x4000000000000000 out → out = ⟨0x8000000000000000, 8⟩ := fun mode out h => by
+    obtain ⟨base, hb, hc⟩ := (EvalFloatBinOpRel_arith_iff mode .rem .binary64 0xC000000000000000 0x4000000000000000 out rfl).mp h
+    have hbase : base = 0x8000000000000000 := Option.some.inj (hb.symm.trans hrem64)
+    subst hbase
+    rcases hc with ⟨hn, _⟩ | ⟨_, ho⟩
+    · exact absurd hn (by decide +kernel)
+    · exact ho
+  refine ⟨by decide +kernel, by decide +kernel, fun mode => ⟨hpos32 mode, fun h => ?_, ?_, fun h => ?_⟩,
+    rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun policy idx cand hget => ?_, fun policy idx cand hget => ?_, fun mode policy res => ?_⟩
+  · exact absurd (congrArg ScalarInt.bits (honly32 mode _ h)) (by decide)
+  · exact (EvalFloatBinOpRel_arith_iff mode .rem .binary64 0xC000000000000000 0x4000000000000000 ⟨0x8000000000000000, 8⟩ rfl).mpr
+      ⟨0x8000000000000000, hrem64, Or.inr ⟨by decide +kernel, rfl⟩⟩
+  · exact absurd (congrArg ScalarInt.bits (honly64 mode _ h)) (by decide)
+  · exact (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy _ _ _ .add _ _
+        ⟨0x7FA00001, 4⟩ ⟨0x3F800000, 4⟩ tF32Ty tF32Ty .binary32 emptyMemory _ emptyLayoutTable _
+        (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl).mpr
+      (Or.inl ⟨⟨cand, 4⟩,
+        (EvalFloatBinOpRel_arith_iff .nondeterministic .add .binary32 0x7FA00001 0x3F800000 ⟨cand, 4⟩ rfl).mpr
+          ⟨0x7FC00000, by decide +kernel, Or.inl ⟨by decide +kernel, cand, List.mem_of_getElem? hget, rfl⟩⟩, rfl⟩)
+  · have hlist : nanChoices .binary32 [(.binary32, 0x3F800000), (.binary32, 0x7FC0002A)] .nondeterministic =
+        [0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A] := by decide +kernel
+    exact (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy _ _ _ .sub _ _
+        ⟨0x3F800000, 4⟩ ⟨0x7FC0002A, 4⟩ tF32Ty tF32Ty .binary32 emptyMemory _ emptyLayoutTable _
+        (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl).mpr
+      (Or.inl ⟨⟨cand, 4⟩,
+        (EvalFloatBinOpRel_arith_iff .nondeterministic .sub .binary32 0x3F800000 0x7FC0002A ⟨cand, 4⟩ rfl).mpr
+          ⟨0x7FC00000, by decide +kernel, Or.inl ⟨by decide +kernel, cand, by rw [hlist]; exact List.mem_of_getElem? hget, rfl⟩⟩, rfl⟩)
+  · rw [EvalRvalueFloatRel_binaryOp_float_iff mode policy _ _ _ .rem _ _
+        ⟨0xC0000000, 4⟩ ⟨0x40000000, 4⟩ tF32Ty tF32Ty .binary32 emptyMemory _ emptyLayoutTable res
+        (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl]
+    constructor
+    · rintro (⟨outSc, hrel, rfl⟩ | ⟨hf, _⟩)
+      · rw [honly32 mode outSc hrel]
+      · exact absurd hf (by decide)
+    · rintro rfl
+      exact Or.inl ⟨_, hpos32 mode, rfl⟩
+
+/-- 64-bit table for enum transmutes (hand-written to mirror `rustc`'s `LayoutData`): entry `1` is
+the NICHE layout of `Option<&u8>` (`Scalar(Pointer)` with the full wrapping range `(..=0) | (1..)`,
+pointer tag at field `0`, variant `0 = None` field-less, variant `1 = Some(&u8)` with its field at
+offset `0`); entry `2` is `usize`; entry `3` is `[usize; 2]`; entry `4` is the DIRECT-tagged
+`#[repr(u64)] enum Tagged { A, B(&u8) }` (`u64` tag at offset `0`, payload at offset `8`). -/
+private def tNicheEnumLayouts : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries :=
+      [ { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .arbitrary [] [],
+          variants := .single 0, isUninhabited := false },
+        { size := ⟨8⟩, align := ⟨8⟩,
+          backendRepr := .scalar (.initialized (.pointer 0) ⟨1, 0⟩),
+          fields := .arbitrary [⟨0⟩] [0],
+          variants := .multiple (.initialized (.pointer 0) ⟨1, 0⟩) 0
+            [.arbitrary [] [], .arbitrary [⟨0⟩] [0]],
+          isUninhabited := false },
+        { size := ⟨8⟩, align := ⟨8⟩,
+          backendRepr := .scalar (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+          fields := .primitive, variants := .single 0, isUninhabited := false },
+        { size := ⟨16⟩, align := ⟨8⟩, backendRepr := .memory, fields := .array ⟨8⟩ 2,
+          variants := .single 0, isUninhabited := false, fieldLayouts := [2] },
+        { size := ⟨16⟩, align := ⟨8⟩,
+          backendRepr := .scalarPair (.initialized (.int 64 false) ⟨0, 1⟩) (.union (.pointer 0)),
+          fields := .arbitrary [⟨0⟩] [0],
+          variants := .multiple (.initialized (.int 64 false) ⟨0, 1⟩) 0
+            [.arbitrary [] [], .arbitrary [⟨8⟩] [0]],
+          isUninhabited := false } ] }
+
+/-- `Option<&u8>` at the niche entry `1` of `tNicheEnumLayouts`. -/
+private abbrev tOptRefU8Ty : Ty :=
+  { kind := .adt "core::option::Option" [.ref .not (.uint .u8)], layoutIdx := 1 }
+/-- `Option<&u8>` with NO layout entry (used with `emptyLayoutTable`). -/
+private abbrev tOptRefU8NoLayoutTy : Ty :=
+  { kind := .adt "core::option::Option" [.ref .not (.uint .u8)], layoutIdx := 0 }
+/-- `[usize; 2]` at entry `3` of `tNicheEnumLayouts`. -/
+private abbrev tUsizeArr2NicheTy : Ty := { kind := .array (.uint .usize) 2, layoutIdx := 3 }
+/-- Direct-tagged `enum Tagged { A, B(&u8) }` at entry `4` of `tNicheEnumLayouts`. -/
+private abbrev tTaggedRefU8Ty : Ty := { kind := .adt "Tagged" [], layoutIdx := 4 }
+/-- `[&u8; 2]` at the pointer-array entry `3` of `tPtrArrayLayouts`. -/
+private abbrev tRefArr2Ty : Ty := { kind := .array (.ref .not (.uint .u8)) 2, layoutIdx := 3 }
+/-- Caller-supplied `RichAdtSpec`s: null-pointer niche `Option<&u8>` and direct-tagged `Tagged`. -/
+private abbrev tOptRefU8Specs : List (DefPath × RichAdtSpec) :=
+  [("core::option::Option", .nichePointerEnum 8 0 8 0 .nil 1 [(0, 8, tRefU8Ty)]),
+   ("Tagged", .taggedEnum 16 0 8 [(0, 0, .nil), (1, 1, [(8, 8, tRefU8Ty)])])]
+
+/-- **`W13` Witness (`Ptr2IntTransmutePolicy` on niche `Option<&u8>`, mixed pointer arrays, and the
+reverse no-forgery direction)**:
+1. (a) niche `Option<&u8> -> usize`: `None` is byte-identical to `0usize` (zero provenance), so BOTH
+   policies agree on `0`; `Some(&u8)` is byte-identical to `&u8`, so `.strictUcg630Ub` faults `.ub`
+   while `.stripProvenance` yields the raw address — identically on the layout-only `evalByteCast`
+   and on `evalByteCastRichWithPolicy` + `RichAdtSpec.nichePointerEnum`. Pointer destinations are
+   policy-independent, and an `Option<&u8>` source without a layout entry fails closed
+   `.unsupported`;
+2. (b) beyond `W9` (both elements provenance-carrying): a MIXED `[*const u8; 2]` with one
+   provenance-free element still faults under `.strictUcg630Ub` (either position) and strips only
+   the provenance-carrying element under `.stripProvenance`; a provenance-FREE `[*const u8; 2]`
+   agrees under BOTH policies in both directions; `[usize; 2] -> [&u8; 2]` and mixed
+   `[*const u8; 2] -> [&u8; 2]` are `.ub` under BOTH policies;
+3. (c) reverse `usize -> Option<&u8>`: the layout-only `evalByteCast` fails closed `.ub` for `0`, for
+   a nonzero integer and even for the identity transmute (sound, but `0 -> None` is a false-positive
+   UB), whereas the `RichAdtSpec.nichePointerEnum` decoder accepts `0` as `None`, rejects every
+   nonzero integer and round-trips a genuine `Some(&u8)` — under BOTH policies;
+4. the DIRECT-tagged `enum Tagged { A, B(&u8) }` finding is pinned separately by
+   `w13_finding_direct_tagged_ref_payload_missed_ub_layout_only_decoder` below. -/
+theorem w13_ptr2int_niche_option_and_array_policy :
+    let p : ProvenancePtr := { allocId := 7, offsetBytes := 0x1000 }
+    let q : ProvenancePtr := { allocId := 9, offsetBytes := 0x2000 }
+    let optNone : Value := .aggregate 0 []
+    let optSome : Value := .aggregate 1 [.ptr p 8]
+    let optDecls : List LocalDecl := [⟨.not, tOptRefU8Ty, .none⟩]
+    let usizeDecls : List LocalDecl := [⟨.not, tUsizeTy, .none⟩]
+    let ptrArrDecls : List LocalDecl := [⟨.not, tPtrArr2Ty, .none⟩]
+    let usizeArrDecls : List LocalDecl := [⟨.not, tUsizeArr2Ty, .none⟩]
+    let mixedA : Value := .aggregate 0 [.ptr p 8, .scalar ⟨0x10, 8⟩]
+    let mixedB : Value := .aggregate 0 [.scalar ⟨0, 8⟩, .ptr q 8]
+    let freeArr : Value := .aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨0x10, 8⟩]
+    let intArr : Value := .aggregate 0 [.scalar ⟨0x1000, 8⟩, .scalar ⟨0x10, 8⟩]
+    -- (a.0) Byte images: `None` = image of `0usize` (no provenance); `Some(&x)` = image of `&x`
+    (encodeByteCastSourceBytes tNicheEnumLayouts tOptRefU8Ty optNone =
+        encodeByteCastSourceBytes tNicheEnumLayouts tUsizeTy (.scalar ⟨0, 8⟩) ∧
+      (encodeByteCastSourceBytes tNicheEnumLayouts tOptRefU8Ty optNone).map abstractBytesHaveProv =
+        .some false ∧
+      encodeByteCastSourceBytes tNicheEnumLayouts tOptRefU8Ty optSome =
+        encodeByteCastSourceBytes tNicheEnumLayouts tRefU8Ty (.ptr p 8) ∧
+      (encodeByteCastSourceBytes tNicheEnumLayouts tOptRefU8Ty optSome).map abstractBytesHaveProv =
+        .some true) ∧
+    -- (a.1) niche `Option<&u8> -> usize`: `None` agrees under BOTH policies (both decoders)
+    (∀ policy,
+      evalByteCast [.init optNone] (.copy ⟨0, .nil⟩) tUsizeTy emptyMemory optDecls
+          tNicheEnumLayouts policy = .ok (.scalar ⟨0, 8⟩) [.init optNone] emptyMemory ∧
+      evalByteCastRichWithPolicy [.init optNone] (.copy ⟨0, .nil⟩) tUsizeTy emptyMemory optDecls
+          tNicheEnumLayouts tOptRefU8Specs policy =
+        .ok (.scalar ⟨0, 8⟩) [.init optNone] emptyMemory) ∧
+    -- (a.2) niche `Option<&u8> -> usize`: `Some(&u8)` flips exactly like `*const u8 -> usize`
+    evalByteCast [.init optSome] (.copy ⟨0, .nil⟩) tUsizeTy emptyMemory optDecls
+        tNicheEnumLayouts .strictUcg630Ub = .ub ∧
+    evalByteCast [.init optSome] (.copy ⟨0, .nil⟩) tUsizeTy emptyMemory optDecls
+        tNicheEnumLayouts .stripProvenance =
+      .ok (.scalar ⟨0x1000, 8⟩) [.init optSome] emptyMemory ∧
+    evalByteCastRichWithPolicy [.init optSome] (.copy ⟨0, .nil⟩) tUsizeTy emptyMemory optDecls
+        tNicheEnumLayouts tOptRefU8Specs .strictUcg630Ub = .ub ∧
+    evalByteCastRichWithPolicy [.init optSome] (.copy ⟨0, .nil⟩) tUsizeTy emptyMemory optDecls
+        tNicheEnumLayouts tOptRefU8Specs .stripProvenance =
+      .ok (.scalar ⟨0x1000, 8⟩) [.init optSome] emptyMemory ∧
+    -- (a.3) pointer destinations are policy-independent (`Some` keeps provenance; `None` is a null
+    -- raw pointer but an invalid `&u8`); an `Option<&u8>` source with NO layout entry fails closed
+    (∀ policy,
+      evalByteCast [.init optSome] (.copy ⟨0, .nil⟩) tPtrU8Ty emptyMemory optDecls
+          tNicheEnumLayouts policy = .ok (.ptr p 8) [.init optSome] emptyMemory ∧
+      evalByteCast [.init optNone] (.copy ⟨0, .nil⟩) tPtrU8Ty emptyMemory optDecls
+          tNicheEnumLayouts policy = .ok (.scalar ⟨0, 8⟩) [.init optNone] emptyMemory ∧
+      evalByteCast [.init optSome] (.copy ⟨0, .nil⟩) tRefU8Ty emptyMemory optDecls
+          tNicheEnumLayouts policy = .ok (.ptr p 8) [.init optSome] emptyMemory ∧
+      evalByteCast [.init optNone] (.copy ⟨0, .nil⟩) tRefU8Ty emptyMemory optDecls
+          tNicheEnumLayouts policy = .ub ∧
+      evalByteCast [.init optSome] (.copy ⟨0, .nil⟩) tUsizeTy emptyMemory
+          [⟨.not, tOptRefU8NoLayoutTy, .none⟩] emptyLayoutTable policy = .unsupported ∧
+      evalByteCast [.init optNone] (.copy ⟨0, .nil⟩) tUsizeTy emptyMemory
+          [⟨.not, tOptRefU8NoLayoutTy, .none⟩] emptyLayoutTable policy = .unsupported) ∧
+    -- (b.1) MIXED `[*const u8; 2] -> [usize; 2]`: one provenance-carrying element suffices for
+    -- `.strictUcg630Ub` to fault (either position); `.stripProvenance` strips only that element
+    evalByteCast [.init mixedA] (.copy ⟨0, .nil⟩) tUsizeArr2Ty emptyMemory ptrArrDecls
+        tPtrArrayLayouts .strictUcg630Ub = .ub ∧
+    evalByteCast [.init mixedA] (.copy ⟨0, .nil⟩) tUsizeArr2Ty emptyMemory ptrArrDecls
+        tPtrArrayLayouts .stripProvenance =
+      .ok (.aggregate 0 [.scalar ⟨0x1000, 8⟩, .scalar ⟨0x10, 8⟩]) [.init mixedA] emptyMemory ∧
+    evalByteCast [.init mixedB] (.copy ⟨0, .nil⟩) tUsizeArr2Ty emptyMemory ptrArrDecls
+        tPtrArrayLayouts .strictUcg630Ub = .ub ∧
+    evalByteCast [.init mixedB] (.copy ⟨0, .nil⟩) tUsizeArr2Ty emptyMemory ptrArrDecls
+        tPtrArrayLayouts .stripProvenance =
+      .ok (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨0x2000, 8⟩]) [.init mixedB] emptyMemory ∧
+    -- (b.2) provenance-FREE `[*const u8; 2]` (null, `0x10`): BOTH policies agree in both directions;
+    -- `[usize; 2] -> [&u8; 2]` and mixed `[*const u8; 2] -> [&u8; 2]` never forge a reference
+    (∀ policy,
+      evalByteCast [.init freeArr] (.copy ⟨0, .nil⟩) tUsizeArr2Ty emptyMemory ptrArrDecls
+          tPtrArrayLayouts policy = .ok freeArr [.init freeArr] emptyMemory ∧
+      evalByteCast [.init freeArr] (.copy ⟨0, .nil⟩) tPtrArr2Ty emptyMemory usizeArrDecls
+          tPtrArrayLayouts policy = .ok freeArr [.init freeArr] emptyMemory ∧
+      evalByteCast [.init intArr] (.copy ⟨0, .nil⟩) tRefArr2Ty emptyMemory usizeArrDecls
+          tPtrArrayLayouts policy = .ub ∧
+      evalByteCast [.init mixedA] (.copy ⟨0, .nil⟩) tRefArr2Ty emptyMemory ptrArrDecls
+          tPtrArrayLayouts policy = .ub) ∧
+    -- (c.1) reverse `usize -> Option<&u8>`, layout-only decoder: FAIL-CLOSED `.ub` for `0`, for a
+    -- nonzero integer, and even for the identity `Option<&u8> -> Option<&u8>` (a pointer-tagged
+    -- `.multiple` layout is never decoded): no forgery, but `0 -> None` is a false-positive UB
+    (∀ policy,
+      evalByteCast [.init (.scalar ⟨0, 8⟩)] (.copy ⟨0, .nil⟩) tOptRefU8Ty emptyMemory usizeDecls
+          tNicheEnumLayouts policy = .ub ∧
+      evalByteCast [.init (.scalar ⟨0x1000, 8⟩)] (.copy ⟨0, .nil⟩) tOptRefU8Ty emptyMemory
+          usizeDecls tNicheEnumLayouts policy = .ub ∧
+      evalByteCast [.init optSome] (.copy ⟨0, .nil⟩) tOptRefU8Ty emptyMemory optDecls
+          tNicheEnumLayouts policy = .ub) ∧
+    -- (c.2) reverse `usize -> Option<&u8>`, `RichAdtSpec.nichePointerEnum` decoder: `0` is a valid
+    -- `None`, every nonzero integer is `.ub` (no `Some(&u8)` forged through the niche), and a
+    -- genuine `Some(&u8)` round-trips with its provenance — all under BOTH policies
+    (∀ policy,
+      evalByteCastRichWithPolicy [.init (.scalar ⟨0, 8⟩)] (.copy ⟨0, .nil⟩) tOptRefU8Ty
+          emptyMemory usizeDecls tNicheEnumLayouts tOptRefU8Specs policy =
+        .ok optNone [.init (.scalar ⟨0, 8⟩)] emptyMemory ∧
+      evalByteCastRichWithPolicy [.init (.scalar ⟨1, 8⟩)] (.copy ⟨0, .nil⟩) tOptRefU8Ty
+          emptyMemory usizeDecls tNicheEnumLayouts tOptRefU8Specs policy = .ub ∧
+      evalByteCastRichWithPolicy [.init (.scalar ⟨0x1000, 8⟩)] (.copy ⟨0, .nil⟩) tOptRefU8Ty
+          emptyMemory usizeDecls tNicheEnumLayouts tOptRefU8Specs policy = .ub ∧
+      evalByteCastRichWithPolicy [.init optSome] (.copy ⟨0, .nil⟩) tOptRefU8Ty emptyMemory
+          optDecls tNicheEnumLayouts tOptRefU8Specs policy =
+        .ok optSome [.init optSome] emptyMemory) := by
+  dsimp only
+  exact ⟨⟨rfl, rfl, rfl, rfl⟩,
+    fun policy => by cases policy <;> exact ⟨rfl, rfl⟩,
+    rfl, rfl, rfl, rfl,
+    fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩,
+    rfl, rfl, rfl, rfl,
+    fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl, rfl⟩,
+    fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl⟩,
+    fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl, rfl⟩⟩
+
+/-- **Round-2 FINDING, pinned as a tripwire (`Trusted` layout-only decoder; `trusted/lean` is outside this episode's
+editable files)**: for the DIRECT-tagged `#[repr(u64)] enum Tagged { A, B(&u8) }` the layout-only `evalByteCast` —
+the decoder that the operative `evalRvalue (.cast .transmute ..)` calls — ACCEPTS `[1usize, 0x1000] -> Tagged::B`
+under BOTH policies, leaving the `&u8` payload as the provenance-free scalar `0x1000`. No `Value.ptr` is fabricated
+and the two policies agree, but Rust's reference-validity UB at the transmute is MISSED (`TypeLayout` carries no
+per-variant field types); only the `RichAdtSpec.taggedEnum` decoder (`evalByteCastRichWithPolicy`) rejects it. An
+out-of-range tag is `.ub` on the layout-only decoder. When that decoder is hardened, the two `.ok` conjuncts below
+MUST flip to `.ub`. -/
+theorem w13_finding_direct_tagged_ref_payload_missed_ub_layout_only_decoder :
+    let tagged : Value := .aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨0x1000, 8⟩]
+    let badTag : Value := .aggregate 0 [.scalar ⟨2, 8⟩, .scalar ⟨0x1000, 8⟩]
+    (∀ policy,
+      evalByteCast [.init tagged] (.copy ⟨0, .nil⟩) tTaggedRefU8Ty emptyMemory
+          [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts policy =
+        .ok (.aggregate 1 [.scalar ⟨0x1000, 8⟩]) [.init tagged] emptyMemory ∧
+      evalByteCastRichWithPolicy [.init tagged] (.copy ⟨0, .nil⟩) tTaggedRefU8Ty emptyMemory
+          [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts tOptRefU8Specs policy = .ub ∧
+      evalByteCast [.init badTag] (.copy ⟨0, .nil⟩) tTaggedRefU8Ty emptyMemory
+          [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts policy = .ub) ∧
+    evalRvalue [.init tagged] (.cast .transmute (.copy ⟨0, .nil⟩) tTaggedRefU8Ty) emptyMemory
+        [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts =
+      .ok (.aggregate 1 [.scalar ⟨0x1000, 8⟩]) [.init tagged] emptyMemory := by
+  dsimp only
+  exact ⟨fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl⟩, rfl⟩
 
 /-! ## §2. Cross-Root Dual-Authority Kernel Bridge (`IeeeFloatArith` + `FloatArithMR` + `FloatArithLM`) -/
 
@@ -799,11 +1195,14 @@ run_cmd do
         lmNs ++ `step_float_uninit_binaryOp_ub_lockstep,
         lmNs ++ `miri_transmute_int_to_rawPtr_ok,
         lmNs ++ `miri_transmute_fnPtr_no_forge_ub,
-        lmNs ++ `w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop ]
+        lmNs ++ `w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop,
+        -- Round-2 (`B2`): `%` dividend-sign / exactly-zero-remainder agreement of BOTH engines.
+        lmNs ++ `w9_lm_rem_dividend_sign_and_zero_remainder ]
     let generalMrThms : List Name :=
       [ mrNs ++ `fa_no_fragment_admits_float_arith_or_cmp,
         mrNs ++ `fa_projected_float_place_rejection,
         mrNs ++ `fa_no_fragment_admits_projected_float_op,
+        mrNs ++ `fa_translateRvalue_binaryOp_two_sided,
         mrNs ++ `fa_sym_mr_negXor_f32_lockstep,
         mrNs ++ `fa_sym_mr_negXor_f64_lockstep,
         mrNs ++ `fa_bridge_evalFloatBinOpRel_mach_steps,
@@ -866,6 +1265,10 @@ run_cmd do
       (mkApp (mkConst ``List.nil [0]) abTy)
     let mkPol (p : Name) : Expr :=
       mkApp2 (mkConst (tSem ++ `policyRejectsProv)) (mkConst (tSem ++ p)) provBytes
+    let optNatTy := mkApp (mkConst ``Option [0]) natTy
+    let someNat (n : Nat) : Expr := mkApp2 (mkConst ``Option.some [0]) natTy (mkNatLit n)
+    let mkRem (f : Expr) (a b : Nat) : Expr :=
+      mkApp4 (mkConst (tSem ++ `evalFloatArithBase)) (mkConst (tAst ++ `BinOp.rem)) f (mkNatLit a) (mkNatLit b)
     -- (description, type, LHS, TRUE RHS, FORGED RHS)
     let controls : List (String × Expr × Expr × Expr × Expr) :=
       [ ("f32 qNaN == qNaN", optBoolTy, mkCmp f32 0x7FC00000 0x7FC00000, someFalse, someTrue),
@@ -889,7 +1292,12 @@ run_cmd do
         ("strictUcg630Ub rejects a provenance byte", boolTy,
           mkPol `Ptr2IntTransmutePolicy.strictUcg630Ub, boolTrue, boolFalse),
         ("stripProvenance admits a provenance byte", boolTy,
-          mkPol `Ptr2IntTransmutePolicy.stripProvenance, boolFalse, boolTrue) ]
+          mkPol `Ptr2IntTransmutePolicy.stripProvenance, boolFalse, boolTrue),
+        -- Round-2 (`B2`): an exactly-zero remainder keeps the DIVIDEND's sign (`-0.0`, never `+0.0`).
+        ("f32 -2.0 % 2.0 is -0.0 (dividend sign on an exactly-zero remainder)", optNatTy,
+          mkRem f32 0xC0000000 0x40000000, someNat 0x80000000, someNat 0),
+        ("f64 -2.0 % 2.0 is -0.0 (dividend sign on an exactly-zero remainder)", optNatTy,
+          mkRem f64 0xC000000000000000 0x4000000000000000, someNat 0x8000000000000000, someNat 0) ]
 
     let saved ← getEnv
     let mkEqDecl (name : Name) (ty lhs rhs : Expr) : Declaration := .thmDecl {
@@ -1145,7 +1553,11 @@ run_cmd do
         `Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
         `MiniRustSpec.FloatArithMR.fa_no_fragment_admits_projected_float_op,
         `LeanMiriSpec.FloatArithLM.miri_transmute_int_to_rawPtr_ok,
-        `LeanMiriSpec.FloatArithLM.step_float_arith_const_const_nondet_index_exact ]
+        `LeanMiriSpec.FloatArithLM.step_float_arith_const_const_nondet_index_exact,
+        -- Round-2 (`B2`): two-sided `translateRvalue` truth and the dual-engine `%` sign witness.
+        `MiniRustSpec.Correspondence.translateRvalue,
+        `MiniRustSpec.FloatArithMR.fa_translateRvalue_binaryOp_two_sided,
+        `LeanMiriSpec.FloatArithLM.w9_lm_rem_dividend_sign_and_zero_remainder ]
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: unifiedFloatArithAndUcg630DualBundle does not reach {req}"
@@ -1158,8 +1570,8 @@ run_cmd do
   let ((addedCount, rejectedCount, acceptedCount, ieeeThms, mrThms, lmThms, mrPublic, lmPublic,
       reachedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount == 7 && rejectedCount == 10 && acceptedCount == 9 && ieeeThms ≥ 300 &&
-      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 64 && lmPublic ≥ 63 && reachedCount == 40 do
+  unless addedCount == 7 && rejectedCount == 12 && acceptedCount == 11 && ieeeThms ≥ 300 &&
+      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 65 && lmPublic ≥ 64 && reachedCount == 43 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount}, accepted={acceptedCount}, ieee={ieeeThms}, mr={mrThms}, lm={lmThms}, mrPublic={mrPublic}, lmPublic={lmPublic}, reached={reachedCount})"
   logInfo m!"ep2 float-arith cross-root kernel bridge: added {addedCount} dual theorems, rejected {rejectedCount} forged controls (paired with {acceptedCount} accepted positive controls), audited {ieeeThms} constructive IeeeFloatArith + {mrThms} MR + {lmThms} LM theorems (0 host Float, 0 MiniRustSpec imports in LM, {mrPublic} MR + {lmPublic} LM public theorems all covered by axiomAudit bundles, MiniRust Gen.Type has no float constructor), reached all {reachedCount} Trusted(06+08)+MiniRust+Miri constants, axioms {crAxioms}"
 

@@ -319,7 +319,6 @@ private theorem fa_wfLive_of_stepsTB_isOk (m : Mach) (n : Nat)
   cases hs : Interp.stepsTB n (liftMachToTB m) with
   | error e => simp [hs, Except.isOk, Except.toBool] at h
   | ok m' => exact ⟨liftMachToTB m, m', rfl, hs, TbWitness.liftMachToTB_stepsTB_wfLive hs⟩
-
 /-! ## §1. Two-Sided Fail-Closed Translation Boundary for Float Unary & Binary Ops -/
 /-- Whether `op` is either a floating-point constant or a `copy`/`move` of an unprojected
 floating-point local in `decls`. -/
@@ -421,6 +420,28 @@ theorem fa_translateRvalue_relOp_local_negative_control (layouts : LayoutTable)
     (decls : List LocalDecl) (targetTy : Option Ty) (i j : Nat) :
     translateRvalue layouts decls targetTy (.binaryOp .eq (.copy ⟨i, []⟩) (.copy ⟨j, []⟩)) =
       some (.BinOp (.Rel .Eq) (.Load (.Local (localName i))) (.Load (.Local (localName j)))) := rfl
+/-- **Two-sided `translateRvalue` truth on TRANSLATABLE operands (`B2`)**: `translateRvalue` inspects ONLY `operandType l`.
+For operands that `translateOperand` admits (field-projected `_s.0` / variable-index `_a[i]` float places): (1) EVERY
+comparison `eq..ge` is type-erased (`some (.BinOp (.Rel rel) el er)`) with the float on EITHER side; (2) a float-arithmetic
+op with the float on the RIGHT of an `Int`-typed left operand is type-erased (`some (.BinOp (.Int iop) el er)`); (3) it is
+`none` whenever the LEFT operand has no MiniRust scalar type (every well-typed float arithmetic op). Shapes (1)/(2) are
+therefore rejected ONLY by the `statementOk*` gates (`fa_projected_float_place_rejection`), never by `translateRvalue`. -/
+theorem fa_translateRvalue_binaryOp_two_sided (layouts : LayoutTable) (decls : List LocalDecl) (targetTy : Option Ty)
+    (bop : MirAst.BinOp) (l r : Operand) :
+    (∀ el er rel, translateOperand decls l = some el → translateOperand decls r = some er → translateRelOp bop = some rel →
+      translateRvalue layouts decls targetTy (.binaryOp bop l r) = some (.BinOp (.Rel rel) el er)) ∧
+    (∀ el er iop it, translateOperand decls l = some el → translateOperand decls r = some er → isFloatArithBinOp bop = true →
+      translateBinOp bop = some iop → operandType layouts decls l = some (.Int it) →
+      translateRvalue layouts decls targetTy (.binaryOp bop l r) = some (.BinOp (.Int iop) el er)) ∧
+    (isFloatArithBinOp bop = true → operandType layouts decls l = none →
+      translateRvalue layouts decls targetTy (.binaryOp bop l r) = none) := by
+  have hrel : isFloatArithBinOp bop = true → translateRelOp bop = none := fun hb => by cases bop <;> first | rfl | simp [isFloatArithBinOp] at hb
+  refine ⟨fun el er rel hl hr hr' => by simp [translateRvalue, hl, hr, hr'],
+    fun el er iop it hl hr hb hiop hty => by simp [translateRvalue, hl, hr, hrel hb, hiop, hty], fun hb hty => ?_⟩
+  have hbin : (translateBinOp bop).isSome = true := by cases bop <;> first | rfl | simp [isFloatArithBinOp] at hb
+  obtain ⟨iop, hiop⟩ := Option.isSome_iff_exists.mp hbin
+  simp only [translateRvalue, bind, Option.bind]
+  cases translateOperand decls l with | none => rfl | some _ => cases translateOperand decls r with | none => rfl | some _ => simp [hrel hb, hiop, hty]
 /-- **`translateStatement` fails closed** on every assignment of a float unary op, every
 assignment of a binary op with a float constant on either side (including comparisons `eq..ge`!),
 and every assignment of an arithmetic binary op with a float local on the left. -/
@@ -770,7 +791,6 @@ theorem fa_no_fragment_admits_float_arith_or_cmp (entry : CapturedMir)
     obtain ⟨hsOk, _, _, hswi⟩ := fa_statementOk_all_preds_float_op_eq_false b.layouts b.localDecls dst rv span hrvF
     obtain ⟨hinF, hinFWI, hprog, hprogWI⟩ := fa_progInFragment_of_stmt_false entry callees b hb bb hbb _ hs hsOk hswi
     exact ⟨hfn, hfnWI, hinF, hinFWI, hprog, hprogWI⟩
-
 /-! ### §1.0b General Projected-Place Float Rejection (F5 Closure) -/
 private theorem fa_resolveFieldPath_none_of_float (layouts : LayoutTable) :
     ∀ (rest : List ProjectionElem) (spec : TupleSpec) (curTy : Ty) (idx : Nat)
@@ -944,8 +964,9 @@ private theorem fa_operandOkB_float_place_copy (layouts : LayoutTable) (decls : 
 1. `placeIntType`, `operandType`, `operandIntType` return `none` and `placeOk` returns `false`;
 2. `translatePlace` / `translateOperand` return `none` on deref (`*p`) and constant-index (`_a[k]`)
    float places (even when `translateLocals` admits `*const f32`!);
-3. `translateRvalue` & `translateStatement` fail closed (`none`) on every unary op and every
-   float-arithmetic binary op (and on ALL binary ops including comparisons for `*p` / `_a[k]`);
+3. `translateRvalue` & `translateStatement` fail closed (`none`) on every unary op and every float-arithmetic binary op with
+   `op` on the LEFT (and on ALL binary ops incl. comparisons for `*p` / `_a[k]`); float-on-the-RIGHT arithmetic and `_s.0` /
+   `_a[i]` comparisons are type-erased `some` (`fa_translateRvalue_binaryOp_two_sided`) and rejected ONLY by item 4;
 4. ALL four statement predicates (`statementOk`, `progStatementOk`, `provCastStmtOk`,
    `statementOkWithIntrinsics`) return `false` for EVERY unary OR binary op (including `eq..ge`,
    `cmp`, `offset`) with `op` on EITHER operand side! -/
@@ -1272,7 +1293,6 @@ theorem fa_anneal_float_ops_and_fail_closed_boundary :
       (intro _ _ h; cases h)
   · refine (EvalRvalueFloatRel_ub_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;>
       (intro _ _ h; cases h)
-
 /-! ## §2. IEEE-754 Bit-Carrier Bridges Across `BasicMemory` (`Mach`) & `TreeBorrowsMemory` (`MachTB` + `wfLive`) -/
 private theorem fa_nat_xor_two_pow (k : Nat) :
     ∀ b : Nat, b < 2 ^ (k + 1) →
@@ -1985,7 +2005,6 @@ theorem fa_bridge_evalFloatBinOpRel_mach_steps (mode : FloatArithMode) (op : Bin
     · rw [evalFloatCmp_of_arith op .binary64 a b hop] at hc; cases hc
     · obtain ⟨fn, n, m', hfn, hs, _, ha⟩ := fc_sym_mr_carrier64_steps outSc.bits hlt
       exact ⟨hsz, fn, n, m', hfn, hs, ha⟩
-
 /-! ## §3. Mode-Parametric `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) Correspondence Across `Mach` & `MachTB` -/
 /-- Policy-parametric step-level reduction of `evalByteCast`. -/
 theorem fa_evalByteCast_eq
@@ -3132,7 +3151,6 @@ theorem fa_no_forge_ref_and_uninit_live_mach_and_machTB_wfLive :
         (initMachineState faUninitTransmuteU64Body [.scalar ⟨0, 8⟩]).frame.locals
         faUninitTransmuteU64Fn.start)
       2 (by decide +kernel)
-
 /-! ## §4. Shared Concrete Episode 2 Witnesses `W1–W6` & Complete `#guard_msgs` Axiom Audit -/
 /-- **`W1` — Finite, Subnormal, Overflow-Tie, and Signed-Zero Carrier Witness** (choice-free):
 - Exact `f32`/`f64` subnormal addition (`0x00000001 + 0x00000001 = 0x00000002`, matching
@@ -3418,7 +3436,6 @@ theorem w6_mr_no_forge_ref_uninit :
 /-! ### §4.1 Complete `#guard_msgs` Axiom Audit (100% of Public Theorems)
 `axiomAudit_choiceFree` pins every non-machine public theorem to `[propext, Quot.sound]`;
 `axiomAudit_machine` pins every machine/simulation public theorem to `[propext, Classical.choice, Quot.sound]`. -/
-
 section AxiomGuards
 set_option linter.defProp false in
 /-- Complete choice-free axiom-audit bundle covering every non-machine public theorem in §1–§4. -/
@@ -3428,6 +3445,7 @@ def axiomAudit_choiceFree :=
   And.intro (@fa_operandType_float_operand) <| And.intro (@fa_operandIntType_float_operand) <|
   And.intro (@fa_translateRvalue_unaryOp_float) <| And.intro (@fa_translateRvalue_binaryOp_float_const) <|
   And.intro (@fa_translateRvalue_binaryOp_arith_float) <| And.intro (@fa_translateRvalue_relOp_local_negative_control) <|
+  And.intro (@fa_translateRvalue_binaryOp_two_sided) <|
   And.intro (@fa_translateStatement_float_unary_or_binary) <| And.intro (@fa_statementOk_all_preds_float_op_eq_false) <|
   And.intro (@fa_no_fragment_admits_float_arith_or_cmp) <| And.intro (@fa_projected_float_place_rejection) <|
   And.intro (@fa_no_fragment_admits_projected_float_op) <| And.intro (@fa_no_float_local_cmp_two_sided_boundary) <|
@@ -3461,7 +3479,6 @@ info: 'MiniRustSpec.FloatArithMR.axiomAudit_choiceFree' depends on axioms: [prop
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms axiomAudit_choiceFree
-
 set_option linter.defProp false in
 /-- Complete machine-level axiom-audit bundle covering every public theorem invoking `mirCall_ret`
 or `TbWitness.liftMachToTB_stepsTB_wfLive`. -/
@@ -3476,7 +3493,5 @@ info: 'MiniRustSpec.FloatArithMR.axiomAudit_machine' depends on axioms: [propext
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms axiomAudit_machine
-
 end AxiomGuards
-
 end MiniRustSpec.FloatArithMR

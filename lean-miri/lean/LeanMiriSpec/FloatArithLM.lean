@@ -33,11 +33,12 @@ under runtime `Provenance` vs. CTFE `CtfeProvenance`):
   (`LocalRel.indirect`) simulations over `StateRelLM3_1` / `StepRelLM3_1` for unary negation, comparisons (`-> bool`), deterministic
   and nondeterministic (`copy/copy` & `const/const`) arithmetic (soundness + index-exact completeness), exact-message uninit unary &
   binary UB lockstep, and exact-message `f16`/`f128` + invalid-`BinOp` fail-closed boundaries.
-* **Part 4 — `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) & Shared Witnesses `W1–W8`**: runtime `Provenance`
+* **Part 4 — `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) & Shared Witnesses `W1–W9`**: runtime `Provenance`
   (`offsetIsAddr = true`, strip) vs. `CtfeProvenance` (`offsetIsAddr = false`, `.readPointerAsInt`), provenance-free `{to,from}_bits`
-  agreement, explicit raw-pointer (`usize -> *const T`, `*const T -> *const U`) vs. safe-ref / `fn()` (`usize -> &T` / `fn()` UB) and
-  uninit UB under both policies (`miriTransmuteScalarCheck`, `miri_transmute_int_to_rawPtr_ok`, `miri_transmute_{ref,fnPtr}_no_forge_ub`),
-  witnesses `w1_lm_*` .. `w8_lm_*`, and complete standard-axiom guards.
+  agreement, a `Cast.cast`-level-ONLY transmute model (Anneal-authored `copyAllowTransmute` = `miriTransmuteScalarCheck`; NOT wired into
+  `annealStepHooksFloatArith`, whose `annealCastHooks{,Float}` keep `copyAllowTransmute := throw (.unsupported "copyAllowTransmute in cast")`):
+  `usize -> *const T` passes vs. `usize -> &T` / `fn()` & uninit UB under both policies (`miri_transmute_{int_to_rawPtr_ok,ref_no_forge_ub,
+  fnPtr_no_forge_ub}`), witnesses `w1_lm_*` .. `w9_lm_*` (`W9`: `%` dividend-sign / exact-zero-remainder), and standard-axiom guards.
 
 `miri#5643` ordering: for `.sub`, BOTH authorities build the NaN candidate list from the ORIGINAL operands (`Trusted`'s
 `EvalFloatBinOpRel` uses `nanChoices f [(f, lhs), (f, rhs)]`; vendored `FloatOps.binary` calls `adjustNaN` on `[leftBits, rightBits]`
@@ -693,7 +694,6 @@ theorem floatBits_nanChoices_binary_toNat_eq (f : IeeeFormat) (a b : Nat)
   congr 1
   refine (List.map_congr_left (g := id) fun bits hmem => ?_).trans (List.map_id _)
   exact bitVec128_toNat_of_lt_width (mem_nanChoices_props f [(f, a), (f, b)] _ bits hmem).1
-
 /-! ## Part 2. `Miri.Interpreter.FloatOps.{unary, binary}` & Conservative Step-Hook Overlay -/
 /-- Valid state-preserving NaN selector for binary float arithmetic (`cs.length ≥ 2` holds
 unconditionally in nondeterministic mode by `nanChoices_length_bounds`). -/
@@ -1197,7 +1197,6 @@ theorem step_floatArith_eq_annealStepHooks_at_terminator {body : CapturedMir} {s
   dsimp only [Id.run]; rw [hfr.location_eq, hfr.body_eq]; dsimp only
   rw [translateBody_basicBlocks_getElem?, hbb]; dsimp only [Option.map]
   rw [translateBasicBlockData_statements_getElem?, hstmt]; rfl
-
 /-! ## Part 3. Real `Miri.Interpreter.Step.step` vs. `Trusted` (`stepMirFn` / `EvalRvalueFloatRel`) Step Simulations -/
 /-! ### 3.1 Shared `evalStatement` unfolding and operand / destination helpers -/
 private theorem classifyEncodedTyId_floatTyIdOf (f : IeeeFormat) :
@@ -2508,8 +2507,7 @@ theorem step_float_invalid_binOp_fail_closed
         .error (.invalidProgram "invalid floating binary operation")) := by
     rw [hm_eval]; unfold Miri.Interpreter.runRvalue; rw [EStateM.bind_eq_error hfb_err]
   rw [miri_step_at_statement_error _ hframes hbody hloc hbb hstmt hm_err]; exact ⟨ha, _, rfl⟩
-
-/-! ## Part 4. `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) & Shared Witnesses `W1–W6` -/
+/-! ## Part 4. `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) & Shared Witnesses `W1–W9` -/
 /-! ### 4.1 Vendored `Miri.Memory.Allocation.readScalar` provenance-stripping vs. CTFE rejection -/
 /-- **Runtime Miri provenance stripping (`offsetIsAddr = true`)**: under `Miri.Memory.Provenance`,
 `Allocation.readScalar ... false` unconditionally strips provenance (`Ptr2IntTransmutePolicy.stripProvenance`). -/
@@ -2604,12 +2602,12 @@ theorem alloc_readScalar_uninit_both
         else throw (Miri.Memory.AllocError.readPointerAsInt none)) =
     .error (Miri.Memory.AllocError.invalidUninitBytes (some ⟨range, bad⟩))
   rw [hi]; rfl
-/-! ### 4.2 Vendored `Cast.cast .Transmute` no-forgery (`usize -> &u8`) and uninit UB -/
-/-- Policy-aware scalar transmute validator for `CastHooks.copyAllowTransmute`:
-- `&T`/`&mut T` (`41`) and `fn()` (`42`) require genuine non-null pointer provenance & matching size under BOTH policies;
-- raw pointers (`*const T`/`*mut T`, `encodeRawPtrTyId` in `{40, 60..82}`) accept BOTH provenance-carrying pointers AND
-  provenance-free integer scalars (detached provenance, e.g. `usize -> *const u8`) of matching size under BOTH policies;
-- non-pointer scalars (`usize`, `f64`, etc.) enforce `Ptr2IntTransmutePolicy` on pointer provenance. -/
+/-! ### 4.2 `Cast.cast .Transmute` under an Anneal-authored `copyAllowTransmute` (NOT step-wired): no-forgery (`usize -> &u8`) & uninit UB -/
+/-- Policy-aware scalar transmute validator for `CastHooks.copyAllowTransmute` (an Anneal-authored model, NOT vendored Miri validity):
+- `&T`/`&mut T` (`41`) and `fn()` (`42`) require non-null pointer provenance & matching size under BOTH policies, and ONLY that: no
+  alignment / dereferenceability / is-a-function check (as permissive as `Trusted`'s `decodePtrBytesNoForge true`);
+- raw pointers (`encodeRawPtrTyId` in `{40, 60..82}`) accept provenance-carrying pointers AND provenance-free integers under BOTH policies;
+- primitive non-pointer scalars (`usize`, `f64`, ...) enforce `Ptr2IntTransmutePolicy` on pointer provenance. Non-primitive `TyId`s (ADT `100 + i`, arrays, `()`) fail closed (`.unsupported`). -/
 def miriTransmuteScalarCheck (policy : Ptr2IntTransmutePolicy)
     (destLay : Miri.Interpreter.LocalLayout) (sc : Miri.Memory.Scalar AnnealProv) :
     Except Miri.Interpreter.StepError (Miri.Memory.Scalar AnnealProv) :=
@@ -2625,6 +2623,8 @@ def miriTransmuteScalarCheck (policy : Ptr2IntTransmutePolicy)
   | _ =>
     if !annealValidateScalarForTyId destLay.ty sc then
       .error (.undefinedBehavior "transmute produced invalid scalar value")
+    else if (match classifyEncodedTyId destLay.ty with | .ok _ => false | .error _ => true) then
+      .error (.unsupported "transmute into non-primitive TyId (ADT/array/ZST)")
     else if sc.isPointer && (match classifyEncodedTyId destLay.ty with | .ok .pointer => true | _ => false) then
       if sc.size == destLay.layout.size then .ok sc
       else .error (.undefinedBehavior "transmute scalar size mismatch")
@@ -2633,6 +2633,7 @@ def miriTransmuteScalarCheck (policy : Ptr2IntTransmutePolicy)
       | true, .strictUcg630Ub =>
         .error (.undefinedBehavior "transmute of pointer provenance into non-pointer scalar (ucg#630)")
       | true, .stripProvenance =>
+        if sc.size != destLay.layout.size then .error (.undefinedBehavior "transmute scalar size mismatch") else
         match sc.toPointer annealTargetDataLayout with
         | .ok p =>
           match Miri.Memory.Scalar.fromUInt (BitVec.ofNat 128 p.offset.bytes.toNat) destLay.layout.size with
@@ -2642,7 +2643,7 @@ def miriTransmuteScalarCheck (policy : Ptr2IntTransmutePolicy)
       | false, _ =>
         if sc.size == destLay.layout.size then .ok sc
         else .error (.undefinedBehavior "transmute scalar size mismatch")
-/-- `CastHooks` overlay enforcing `miriTransmuteScalarCheck` inside `copyAllowTransmute`. -/
+/-- `CastHooks` overlay enforcing `miriTransmuteScalarCheck` inside `copyAllowTransmute`. `Cast.cast`-level ONLY: no `RvalueHooks` / `StepHooks` uses it. -/
 def annealCastHooksTransmutePolicy (layouts : LayoutTable) (policy : Ptr2IntTransmutePolicy) :
     Miri.Interpreter.CastHooks AnnealProv AnnealStepState Unit (Miri.Interpreter.RuntimePlace AnnealProv) :=
   { annealCastHooksFloat layouts with
@@ -2687,12 +2688,15 @@ theorem miriTransmuteScalarCheck_ptr_policy_arms (lay : Miri.ABI.LayoutData)
     (∀ policy (pt : RigidTy), miriTransmuteScalarCheck policy ⟨encodeRawPtrTyId pt, lay⟩ sc = .ok sc) ∧
     (∀ policy p, sc.toPointer annealTargetDataLayout = .ok p →
       p.provenance.isNone = false → (p.offset == Miri.ABI.Size.ZERO) = false →
-      miriTransmuteScalarCheck policy ⟨41, lay⟩ sc = .ok sc ∧ miriTransmuteScalarCheck policy ⟨42, lay⟩ sc = .ok sc) := by
-  refine ⟨?_, ?_, fun p hp => ⟨?_, ?_⟩, fun policy pt => ?_, fun policy p hp hprov hnz => ⟨?_, ?_⟩⟩
+      miriTransmuteScalarCheck policy ⟨41, lay⟩ sc = .ok sc ∧ miriTransmuteScalarCheck policy ⟨42, lay⟩ sc = .ok sc) ∧
+    (∀ policy p, sc.toPointer annealTargetDataLayout = .ok p → (p.offset == Miri.ABI.Size.ZERO) = true →
+      miriTransmuteScalarCheck policy ⟨41, lay⟩ sc = .error (.undefinedBehavior "transmute forged reference/fn-pointer without provenance") ∧
+      miriTransmuteScalarCheck policy ⟨42, lay⟩ sc = .error (.undefinedBehavior "transmute forged reference/fn-pointer without provenance")) := by
+  refine ⟨?_, ?_, fun p hp => ⟨?_, ?_⟩, fun policy pt => ?_, fun policy p hp hprov hnz => ⟨?_, ?_⟩, fun policy p hp hz => ⟨?_, ?_⟩⟩
   · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr]
   · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr]
-  · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr, hp]
-  · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr, hp]
+  · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr, hp, hsz]
+  · simp [miriTransmuteScalarCheck, annealValidateScalarForTyId, classifyEncodedTyId, hptr, hp, hsz]
   · obtain ⟨h41, h42, hval, hcls⟩ := encodeRawPtrTyId_spec pt
     unfold miriTransmuteScalarCheck; split
     · next h => exact absurd h h41
@@ -2700,9 +2704,10 @@ theorem miriTransmuteScalarCheck_ptr_policy_arms (lay : Miri.ABI.LayoutData)
     · simp [hval, hcls, hptr, hsz]
   · simp [miriTransmuteScalarCheck, hp, hprov, hnz, hsz]
   · simp [miriTransmuteScalarCheck, hp, hprov, hnz, hsz]
-/-- **Valid integer-to-raw-pointer transmute (`usize -> *const T` / `*mut T`) under BOTH policies**:
-unlike `&T` (`41`) and `fn()` (`42`), raw-pointer destinations accept provenance-free 8-byte integer scalars
-(including null `0` and non-null `0x1000`) as detached provenance under BOTH policies (`decodePtrBytesNoForge false`). -/
+  all_goals simp [miriTransmuteScalarCheck, hp, hz]
+/-- **Integer-to-raw-pointer transmute (`usize -> *const T` / `*mut T`) passes the check under BOTH policies**: unlike `&T` (`41`)
+and `fn()` (`42`), raw-pointer destinations accept provenance-free 8-byte integer scalars (including null) as detached provenance, so
+`Cast.cast` REDUCES TO the destination write `annealWriteImmediate` (whose success depends on `destRef`); cf. `decodePtrBytesNoForge false`. -/
 theorem miri_transmute_int_to_rawPtr_ok (layouts : LayoutTable) (policy : Ptr2IntTransmutePolicy)
     (mutbl : MirAst.Mutability) (pt : RigidTy) (msc : Miri.Memory.ScalarInt)
     (hmsc_sz : msc.size = Miri.ABI.Size.ofBytes 8) (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) (st : AnnealStepState) :
@@ -2718,14 +2723,14 @@ theorem miri_transmute_int_to_rawPtr_ok (layouts : LayoutTable) (policy : Ptr2In
   have hty_raw : translateTy { kind := .rawPtr mutbl pt, layoutIdx := 0 } layouts = ⟨encodeRawPtrTyId pt, pointerLayoutData false⟩ := rfl
   have henc_raw : encodeTyId { kind := .rawPtr mutbl pt, layoutIdx := 0 } = encodeRawPtrTyId pt := rfl
   have hchk : miriTransmuteScalarCheck policy ⟨encodeRawPtrTyId pt, pointerLayoutData false⟩ (.fromScalarInt msc) = .ok (.fromScalarInt msc) := by
-    obtain ⟨h41, h42, hval, _⟩ := encodeRawPtrTyId_spec pt
+    obtain ⟨h41, h42, hval, hcls⟩ := encodeRawPtrTyId_spec pt
     have hisp : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).isPointer = false := rfl
     have hscsz : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).size = (pointerLayoutData false).size := by
       change msc.size = Miri.ABI.Size.ofBytes 8; exact hmsc_sz
     unfold miriTransmuteScalarCheck; split
     · next h => exact absurd h h41
     · next h => exact absurd h h42
-    · simp [hval, hisp, hscsz]
+    · simp [hval, hcls, hisp, hscsz]
   refine ⟨by rw [hty_raw]; exact hchk, ?_⟩
   have hsz1 : (scalarLayoutData 8 false).isSized = true := rfl
   have hsz2 : (pointerLayoutData false).isSized = true := rfl
@@ -2807,10 +2812,9 @@ theorem miri_transmute_uninit_ub (layouts : LayoutTable) (policy : Ptr2IntTransm
   have henc : encodeTyId dstTy = (translateTy dstTy layouts).ty := rfl
   simp only [annealCastHooksTransmutePolicy, annealCastHooksFloat, annealCastHooks, hsrc_sz, hdst_sz, hsize_eq, henc, beq_self_eq_true, bne_self_eq_false, Bool.false_eq_true,
     Bool.not_true, Bool.or_self, ↓reduceIte, pure_bind, annealReadImmediate_uninit_eq]; rfl
-/-! ### 4.3 Concrete Kernel-Checked Shared Witnesses `W1–W6` -/
+/-! ### 4.3 Concrete Kernel-Checked Shared Witnesses `W1–W9` -/
 section Witnesses
 open LeanMiriSpec.Correspondence.Witness
-
 private def faF32Ty : Ty := { kind := .float .f32, layoutIdx := 0 }
 private def faF16Ty : Ty := { kind := .float .f16, layoutIdx := 0 }
 private def faBoolTy : Ty := { kind := .bool, layoutIdx := 0 }
@@ -3352,14 +3356,14 @@ theorem w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop (st : AnnealStepState)
     let bodyUnBin := faMkBody "w8::uninit_bin" [⟨.mut, faF32Ty, none⟩, ⟨.not, faF32Ty, none⟩, ⟨.not, faF32Ty, none⟩] faF32Ty (.assign (local_ 0) (.binaryOp .add (.copy (local_ 1)) (.copy (local_ 2))))
     let sUnBin := faMkState bodyUnBin [.uninit, .init (.scalar ⟨0x3F800000, 4⟩), .uninit]
     let mUnBin := faMkMiri bodyUnBin faF32Ty #[⟨.live (.immediate .uninit), none⟩, ⟨.live (.immediate (.scalar (.fromScalarInt (.ofUInt32 0x3F800000)))), some (translateTy faF32Ty)⟩, ⟨.live (.immediate .uninit), none⟩]
-    (∀ idx bits, (nanChoices .binary32 [(.binary32, 0x7FA00001), (.binary32, 0x3F800000)] .nondeterministic)[idx]? = some bits →
+    (∀ (idx bits : Nat), (nanChoices .binary32 [(.binary32, 0x7FA00001), (.binary32, 0x3F800000)] .nondeterministic)[idx]? = some bits →
       StepRelLM3_1 bodySnan mSnan [] (MirStepNode.step (advanceStmt sSnan (sSnan.frame.locals.set 0 (.init (.scalar ⟨bits, 4⟩))) sSnan.memory))
         (Miri.Interpreter.Step.step (annealStepHooksFloatArith bodySnan.localDecls bodySnan.layouts true (fun _ _ => pure idx)) () mSnan)) ∧
     (∃ outSc, (∀ policy, EvalRvalueFloatRel .nondeterministic policy sInf.frame.locals (.binaryOp .sub (.constant (faF32Const 0x7F800000)) (.constant (faF32Const 0x7F800000)))
         sInf.memory bodyInf.localDecls bodyInf.layouts (.ok (.scalar outSc) sInf.frame.locals sInf.memory)) ∧
       StepRelLM3_1 bodyInf mInf [] (MirStepNode.step (advanceStmt sInf (sInf.frame.locals.set 0 (.init (.scalar outSc))) sInf.memory))
         (Miri.Interpreter.Step.step (annealStepHooksFloatArith bodyInf.localDecls bodyInf.layouts true annealChooseBinaryNaN) () mInf)) ∧
-    (∀ idx bits, (nanChoices .binary32 [(.binary32, 0x7F800000), (.binary32, 0x7F800000)] .nondeterministic)[idx]? = some bits →
+    (∀ (idx bits : Nat), (nanChoices .binary32 [(.binary32, 0x7F800000), (.binary32, 0x7F800000)] .nondeterministic)[idx]? = some bits →
       StepRelLM3_1 bodyInf mInf [] (MirStepNode.step (advanceStmt sInf (sInf.frame.locals.set 0 (.init (.scalar ⟨bits, 4⟩))) sInf.memory))
         (Miri.Interpreter.Step.step (annealStepHooksFloatArith bodyInf.localDecls bodyInf.layouts true (fun _ _ => pure idx)) () mInf)) ∧
     (∀ policy,
@@ -3407,6 +3411,25 @@ theorem w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop (st : AnnealStepState)
       intro tf h; injection h with h₁; injection h₁ with h₂; subst h₂
       exact ⟨(fun mls hm mp hmp => by simp [faMkFrame] at hm; subst hm; cases hmp), (fun mls hm mp hmp => by simp [faMkFrame] at hm; subst hm; cases hmp), (fun mls hm mp hmp => by simp [faMkFrame] at hm; subst hm; cases hmp)⟩)⟩
 
+/-- **`W9` Witness (`B2`: `%` keeps the DIVIDEND's sign, including on an exactly-zero remainder)**: direct kernel evaluation of BOTH
+engines (independent of `floatBits_arithmetic_eq`) on `(lhs, rhs, result)` bit triples — `-2.0 % 2.0 = -0.0` (NOT `+0.0`),
+`2.0 % -2.0 = +0.0`, `-5.0 % 2.0 = -1.0`, `5.0 % -2.0 = 1.0`, `-0.5 % 1.0 = -0.5`, subnormal `-3ε % 2ε = -ε`, `-MAX % ε = -0.0`,
+`-2.0 % +∞ = -2.0`, `-0.0 % 2.0 = -0.0`, and the NaN cases `-2.0 % -0.0` / `-∞ % 2.0` — on `f32` AND `f64`: vendored
+`FloatBits.arithmetic .Rem` and `Trusted` `evalFloatArithBase .rem` agree bit-for-bit. -/
+theorem w9_lm_rem_dividend_sign_and_zero_remainder :
+    (∀ p ∈ [(0xC0000000, 0x40000000, 0x80000000), (0x40000000, 0xC0000000, 0x00000000), (0xC0A00000, 0x40000000, 0xBF800000),
+        (0x40A00000, 0xC0000000, 0x3F800000), (0xBF000000, 0x3F800000, 0xBF000000), (0x80000003, 0x00000002, 0x80000001),
+        (0xFF7FFFFF, 0x00000001, 0x80000000), (0xC0000000, 0x7F800000, 0xC0000000), (0x80000000, 0x40000000, 0x80000000),
+        (0xC0000000, 0x80000000, 0x7FC00000), (0xFF800000, 0x40000000, 0x7FC00000)],
+      Miri.Interpreter.FloatBits.arithmetic .Rem ⟨.binary32, BitVec.ofNat 128 p.1⟩ ⟨.binary32, BitVec.ofNat 128 p.2.1⟩ =
+        .ok ⟨.binary32, BitVec.ofNat 128 p.2.2⟩ ∧ evalFloatArithBase .rem .binary32 p.1 p.2.1 = .some p.2.2) ∧
+    (∀ p ∈ [(0xC000000000000000, 0x4000000000000000, 0x8000000000000000), (0x4000000000000000, 0xC000000000000000, 0),
+        (0xC014000000000000, 0x4000000000000000, 0xBFF0000000000000), (0xBFE0000000000000, 0x3FF0000000000000, 0xBFE0000000000000),
+        (0x8000000000000003, 0x0000000000000002, 0x8000000000000001), (0xFFEFFFFFFFFFFFFF, 0x0000000000000001, 0x8000000000000000),
+        (0xC000000000000000, 0xFFF0000000000000, 0xC000000000000000), (0xC000000000000000, 0x8000000000000000, 0x7FF8000000000000)],
+      Miri.Interpreter.FloatBits.arithmetic .Rem ⟨.binary64, BitVec.ofNat 128 p.1⟩ ⟨.binary64, BitVec.ofNat 128 p.2.1⟩ =
+        .ok ⟨.binary64, BitVec.ofNat 128 p.2.2⟩ ∧ evalFloatArithBase .rem .binary64 p.1 p.2.1 = .some p.2.2) := by
+  decide +kernel
 end Witnesses
 /-! ### 4.4 Complete Module Axiom Audit (EVERY Public Theorem Pinned to Standard Axioms) -/
 section AxiomAudit
@@ -3443,7 +3466,8 @@ def axiomAudit_floatArithLM :=
   And.intro (@step_float_arith_const_const_nondet_soundness) <| And.intro (@step_float_arith_const_const_nondet_index_exact) <|
   And.intro (@step_float_uninit_binaryOp_ub_lockstep) <| And.intro (@miriTransmuteScalarCheck_ptr_policy_arms) <|
   And.intro (@miri_transmute_int_to_rawPtr_ok) <| And.intro (@miri_transmute_fnPtr_no_forge_ub) <|
-  And.intro (@w7_lm_f64_and_sub_index_exact) <| @w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop
+  And.intro (@w7_lm_f64_and_sub_index_exact) <| And.intro (@w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop) <|
+  @w9_lm_rem_dividend_sign_and_zero_remainder
 /--
 info: 'LeanMiriSpec.FloatArithLM.axiomAudit_floatArithLM' depends on axioms: [propext, Classical.choice, Quot.sound]
 -/
