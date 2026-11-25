@@ -724,6 +724,8 @@ inductive RelGuard where
   | ugeReg (lhs rhs : Nat) (u : UintTy)
   | ueqConst (reg : Nat) (u : UintTy) (val : Nat)
   | uneConst (reg : Nat) (u : UintTy) (val : Nat)
+  | ueqReg (lhs rhs : Nat) (u : UintTy)
+  | uneReg (lhs rhs : Nat) (u : UintTy)
 
 /-- Structural equality on `RelGuard`. -/
 def RelGuard.beq : RelGuard → RelGuard → Bool
@@ -740,6 +742,10 @@ def RelGuard.beq : RelGuard → RelGuard → Bool
     Nat.beq r1 r2 && uintTyBeq u1 u2 && Nat.beq v1 v2
   | .uneConst r1 u1 v1, .uneConst r2 u2 v2 =>
     Nat.beq r1 r2 && uintTyBeq u1 u2 && Nat.beq v1 v2
+  | .ueqReg l1 r1 u1, .ueqReg l2 r2 u2 =>
+    Nat.beq l1 l2 && Nat.beq r1 r2 && uintTyBeq u1 u2
+  | .uneReg l1 r1 u1, .uneReg l2 r2 u2 =>
+    Nat.beq l1 l2 && Nat.beq r1 r2 && uintTyBeq u1 u2
   | _, _ => false
 
 /-- Soundness of `RelGuard.beq`. -/
@@ -768,6 +774,8 @@ def RelGuard.negate : RelGuard → RelGuard
   | .ugeReg l r u => .ultReg l r u
   | .ueqConst r u v => .uneConst r u v
   | .uneConst r u v => .ueqConst r u v
+  | .ueqReg l r u => .uneReg l r u
+  | .uneReg l r u => .ueqReg l r u
 
 /-- True iff `g` references local `id`. -/
 def RelGuard.mentions (id : Nat) : RelGuard → Bool
@@ -778,6 +786,8 @@ def RelGuard.mentions (id : Nat) : RelGuard → Bool
   | .ugeReg l r _ => Nat.beq l id || Nat.beq r id
   | .ueqConst r _ _ => Nat.beq r id
   | .uneConst r _ _ => Nat.beq r id
+  | .ueqReg l r _ => Nat.beq l id || Nat.beq r id
+  | .uneReg l r _ => Nat.beq l id || Nat.beq r id
 
 /-- Unsigned bit pattern of a scalar `Value` at byte width `uintBytes u`. -/
 def uintValNat? (u : UintTy) : Value → Option Nat
@@ -822,6 +832,12 @@ def RelGuard.denote (locals : List LocalSlot) (g : RelGuard) (b : Bool) :
     ∀ x, localUintNat? locals r u = some x → (b = true ↔ x = val)
   | .uneConst r u val =>
     ∀ x, localUintNat? locals r u = some x → (b = true ↔ x ≠ val)
+  | .ueqReg l r u =>
+    ∀ x y, localUintNat? locals l u = some x →
+      localUintNat? locals r u = some y → (b = true ↔ x = y)
+  | .uneReg l r u =>
+    ∀ x y, localUintNat? locals l u = some x →
+      localUintNat? locals r u = some y → (b = true ↔ x ≠ y)
 
 /-- Soundness of `RelGuard.negate`. -/
 theorem relGuard_negate_sound {locals : List LocalSlot} {g : RelGuard}
@@ -895,6 +911,29 @@ theorem relGuard_negate_sound {locals : List LocalSlot} {g : RelGuard}
         | true => exact Nat.eq_of_beq_eq_true hB
         | false => exact False.elim (nomatch (hIff.mpr (nat_ne_of_beq_false hB)))
       exact ⟨(fun _ => hEq), (fun _ => rfl)⟩
+  | ueqReg l r u =>
+    intro x y hx hy
+    have hIff := h x y hx hy
+    cases b with
+    | true =>
+      have hEq := hIff.mp rfl
+      exact ⟨(fun hF => nomatch hF), (fun hNe => False.elim (hNe hEq))⟩
+    | false =>
+      have hNe : x ≠ y := fun hEq => nomatch (hIff.mpr hEq)
+      exact ⟨(fun _ => hNe), (fun _ => rfl)⟩
+  | uneReg l r u =>
+    intro x y hx hy
+    have hIff := h x y hx hy
+    cases b with
+    | true =>
+      have hNe := hIff.mp rfl
+      exact ⟨(fun hF => nomatch hF), (fun hEq => False.elim (hNe hEq))⟩
+    | false =>
+      have hEq : x = y := by
+        cases hB : Nat.beq x y with
+        | true => exact Nat.eq_of_beq_eq_true hB
+        | false => exact False.elim (nomatch (hIff.mpr (nat_ne_of_beq_false hB)))
+      exact ⟨(fun _ => hEq), (fun _ => rfl)⟩
 
 /-- Writing local `id` leaves `localUintNat?` of every other local intact. -/
 theorem localUintNat?_set?_ne {locals locals' : List LocalSlot} {id r : Nat}
@@ -946,6 +985,18 @@ theorem relGuard_preserved_on_update {locals locals' : List LocalSlot}
     intro x hx
     rw [hLocEq r u hNoMent] at hx
     exact hDen x hx
+  | ueqReg l r u =>
+    intro x y hx hy
+    simp only [RelGuard.mentions] at hNoMent
+    rw [hLocEq l u (bool_or_false_left hNoMent)] at hx
+    rw [hLocEq r u (bool_or_false_right hNoMent)] at hy
+    exact hDen x y hx hy
+  | uneReg l r u =>
+    intro x y hx hy
+    simp only [RelGuard.mentions] at hNoMent
+    rw [hLocEq l u (bool_or_false_left hNoMent)] at hx
+    rw [hLocEq r u (bool_or_false_right hNoMent)] at hy
+    exact hDen x y hx hy
 
 /-! ## 4. Abstract Booleans (`BoolAbs`) -/
 
@@ -1500,6 +1551,38 @@ theorem absVal_refineUneConst_sound {w x v : Nat} {a : AbsVal}
                 (Nat.le_of_lt_succ (Nat.lt_of_le_of_ne
                   (absVal_ubound?_sound hHi ha) hNe))
             | false => exact ha
+
+/-- Reduced-product meet of two initialized `AbsVal`s (returns `AbsVal.bot`
+when the components are disjoint). -/
+def AbsVal.meetInit (w : Nat) (a b : AbsVal) : AbsVal :=
+  match validWidth w && a.isInit && b.isInit with
+  | false => AbsVal.bot
+  | true =>
+    match Tnum.meet a.tnum b.tnum with
+    | none => AbsVal.bot
+    | some tn =>
+      reduceAbsVal w
+        ⟨.init, tn, WrappedInterval.meet (modPow2 w) a.wi b.wi,
+          StridedCong.meet a.sc b.sc⟩
+
+/-- Soundness of `AbsVal.meetInit`. -/
+theorem absVal_meetInit_sound {w x : Nat} {a b : AbsVal}
+    (hw : validWidth w = true) (hai : a.isInit = true) (hbi : b.isInit = true)
+    (ha : a.denote w (some x)) (hb : b.denote w (some x)) :
+    (AbsVal.meetInit w a b).denote w (some x) := by
+  have haE := absVal_some_elim ha
+  have hbE := absVal_some_elim hb
+  unfold AbsVal.meetInit
+  rw [hw, hai, hbi]
+  cases hT : Tnum.meet a.tnum b.tnum with
+  | none =>
+    exact False.elim (tnum_meet_none_impossible haE.2.1 hbE.2.1 hT)
+  | some tn =>
+    simp only
+    apply reduceAbsVal_sound hw
+    exact ⟨⟨x, rfl, haE.1⟩, tnum_meet_sound haE.2.1 hbE.2.1 hT,
+      wrappedInterval_meet_sound (modPow2_pos w) haE.2.2.1 hbE.2.2.1,
+      stridedCong_meet_sound haE.2.2.2 hbE.2.2.2⟩
 
 /-! ## 5. Abstract Local Slots (`MirAbsSlot`) and Frames (`MirAbsEnv`) -/
 
@@ -2689,47 +2772,75 @@ theorem setMirAbsSlot_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
 
 /-! ## 7. Branch Guard Refinement (`refineEnvByGuard`) -/
 
-/-- Replace an initialized `.uint u` slot `a` at local `r` by `f a`. -/
+/-- Extract the initialized `AbsVal` of a `.uint u` or `.uintCopy u` slot. -/
+def MirAbsSlot.uintAbsVal? (u : UintTy) : MirAbsSlot → Option AbsVal
+  | .uint u' a =>
+    match uintTyBeq u u' && a.isInit with
+    | true => some a
+    | false => none
+  | .uintCopy u' a _ =>
+    match uintTyBeq u u' && a.isInit with
+    | true => some a
+    | false => none
+  | _ => none
+
+/-- Extract the initialized `AbsVal` at local `r` in `env` for type `u`
+(covering both `.uint` and `.uintCopy` slots). -/
+def envUintAbsVal? (env : MirAbsEnv) (r : Nat) (u : UintTy) : Option AbsVal :=
+  match get? env r with
+  | some s => s.uintAbsVal? u
+  | none => none
+
+/-- Refine a single slot at index `i` under a constraint on local `r` of type
+`u`: updates index `r` itself (`.uint` or `.uintCopy`) and every live
+`.uintCopy` alias whose source root is `r`. -/
+def refineUintSlotEntry (r : Nat) (u : UintTy) (f : AbsVal → AbsVal)
+    (i : Nat) (s : MirAbsSlot) : MirAbsSlot :=
+  match s with
+  | .uint u' a =>
+    match Nat.beq i r && uintTyBeq u u' && a.isInit with
+    | true => .uint u (f a)
+    | false => s
+  | .uintCopy u' a src =>
+    match (Nat.beq i r || Nat.beq src r) && uintTyBeq u u' && a.isInit with
+    | true => .uintCopy u (f a) src
+    | false => s
+  | _ => s
+
+private def refineUintSlotAux (r : Nat) (u : UintTy) (f : AbsVal → AbsVal)
+    (idx : Nat) : MirAbsEnv → MirAbsEnv
+  | [] => []
+  | s :: rest =>
+    refineUintSlotEntry r u f idx s :: refineUintSlotAux r u f (idx + 1) rest
+
+/-- Replace every initialized `.uint u` / `.uintCopy u` slot at local `r` and
+every initialized `.uintCopy u` alias whose root is `r` by `f a`. -/
 def refineUintSlot (env : MirAbsEnv) (r : Nat) (u : UintTy)
     (f : AbsVal → AbsVal) : MirAbsEnv :=
-  match get? env r with
-  | some (.uint u' a) =>
-    match uintTyBeq u u' && a.isInit with
-    | true =>
-      match set? env r (.uint u (f a)) with
-      | some env' => env'
-      | none => env
-    | false => env
-  | some (.uintCopy u' a src) =>
-    match uintTyBeq u u' && a.isInit with
-    | true =>
-      match set? env r (.uintCopy u (f a) src) with
-      | some env' => env'
-      | none => env
-    | false => env
-  | _ => env
+  refineUintSlotAux r u f 0 env
 
-/-- In-place slot refinement at local `r` without modifying `locals`. -/
-theorem refineSingleSlot_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
-    {locals : List LocalSlot} {r : Nat} {newSlot : MirAbsSlot}
-    (hEnv : mirAbsEnvDenote decls env locals)
-    (hSet : set? env r newSlot = some env')
-    (hRef : ∀ d cs, get? decls r = some d → get? locals r = some cs →
-      newSlot.denote d.ty locals cs) :
-    mirAbsEnvDenote decls env' locals := by
-  refine ⟨Eq.trans (length_set? hSet) hEnv.1, hEnv.2.1, ?_⟩
-  intro i d s cs hD hS hCs
-  cases hEq : Nat.beq r i with
-  | true =>
-    have hI := Nat.eq_of_beq_eq_true hEq
-    subst hI
-    rw [get?_set?_same hSet] at hS
-    injection hS with hs
-    subst hs
-    exact hRef d cs hD hCs
-  | false =>
-    rw [get?_set?_ne hSet (nat_ne_of_beq_false hEq)] at hS
-    exact hEnv.2.2 i d s cs hD hS hCs
+private theorem length_refineUintSlotAux (r : Nat) (u : UintTy)
+    (f : AbsVal → AbsVal) :
+    ∀ (idx : Nat) (env : MirAbsEnv),
+      length (refineUintSlotAux r u f idx env) = length env
+  | _, [] => rfl
+  | idx, _ :: rest => congrArg Nat.succ (length_refineUintSlotAux r u f (idx + 1) rest)
+
+private theorem get?_refineUintSlotAux (r : Nat) (u : UintTy)
+    (f : AbsVal → AbsVal) :
+    ∀ (idx : Nat) (env : MirAbsEnv) (i : Nat),
+      get? (refineUintSlotAux r u f idx env) i =
+        (get? env i).map (refineUintSlotEntry r u f (idx + i))
+  | _, [], _ => rfl
+  | idx, s :: rest, 0 => by
+    simp only [refineUintSlotAux, get?, List.getElem?_cons_zero, Option.map,
+      Nat.add_zero]
+  | idx, s :: rest, i + 1 => by
+    have h := get?_refineUintSlotAux r u f (idx + 1) rest i
+    have hAdd : idx + 1 + i = idx + (i + 1) := by
+      rw [Nat.add_assoc, Nat.add_comm 1 i]
+    rw [hAdd] at h
+    exact h
 
 /-- Soundness of `refineUintSlot` under a pointwise refinement hypothesis. -/
 theorem refineUintSlot_sound {decls : List LocalDecl} {env : MirAbsEnv}
@@ -2739,59 +2850,142 @@ theorem refineUintSlot_sound {decls : List LocalDecl} {env : MirAbsEnv}
       a.denote (uintWidth u) (some x) → localUintNat? locals r u = some x →
       (f a).denote (uintWidth u) (some x)) :
     mirAbsEnvDenote decls (refineUintSlot env r u f) locals := by
-  unfold refineUintSlot
-  cases hGet : get? env r with
-  | none => exact hEnv
+  refine ⟨Eq.trans (length_refineUintSlotAux r u f 0 env) hEnv.1, hEnv.2.1, ?_⟩
+  intro i d s' cs hD hS' hCs
+  unfold refineUintSlot at hS'
+  rw [get?_refineUintSlotAux, Nat.zero_add] at hS'
+  cases hGet : get? env i with
+  | none => rw [hGet] at hS'; nomatch hS'
   | some s =>
+    rw [hGet] at hS'
+    injection hS' with hEqS
+    subst hEqS
+    have hDen := hEnv.2.2 i d s cs hD hGet hCs
     cases s with
     | uint u' a =>
-      simp only
-      cases hC : (uintTyBeq u u' && a.isInit) with
-      | false => exact hEnv
+      simp only [refineUintSlotEntry]
+      cases hC : (Nat.beq i r && uintTyBeq u u' && a.isInit) with
+      | false => exact hDen
       | true =>
-        have hu := uintTy_eq_of_beq (bool_and_true_left hC)
-        have hInit := bool_and_true_right hC
-        subst hu
         simp only
-        cases hSet : set? env r (.uint u (f a)) with
-        | none => exact hEnv
-        | some env' =>
-          simp only
-          apply refineSingleSlot_sound hEnv hSet
-          intro d cs hD hCs
-          have hDen := hEnv.2.2 r d (.uint u a) cs hD hGet hCs
-          cases uint_slot_extract hInit hDen with
-          | intro sc hsc =>
-            rw [hsc.1]
-            rw [hsc.1] at hCs
-            exact ⟨hDen.1, hsc.2.1, hRef a sc.bits hInit hsc.2.2
-              (localUintNat?_of_get? hCs hsc.2.1)⟩
+        have h12 := bool_and_true_left hC
+        have hiR := Nat.eq_of_beq_eq_true (bool_and_true_left h12)
+        have hu := uintTy_eq_of_beq (bool_and_true_right h12)
+        have hInit := bool_and_true_right hC
+        subst hiR
+        subst hu
+        cases uint_slot_extract hInit hDen with
+        | intro sc hsc =>
+          rw [hsc.1] at hCs ⊢
+          exact ⟨hDen.1, hsc.2.1, hRef a sc.bits hInit hsc.2.2
+            (localUintNat?_of_get? hCs hsc.2.1)⟩
     | uintCopy u' a src =>
-      simp only
-      cases hC : (uintTyBeq u u' && a.isInit) with
-      | false => exact hEnv
+      simp only [refineUintSlotEntry]
+      cases hC : ((Nat.beq i r || Nat.beq src r) && uintTyBeq u u' && a.isInit) with
+      | false => exact hDen
       | true =>
-        have hu := uintTy_eq_of_beq (bool_and_true_left hC)
+        simp only
+        have h12 := bool_and_true_left hC
+        have hOr := bool_and_true_left h12
+        have hu := uintTy_eq_of_beq (bool_and_true_right h12)
         have hInit := bool_and_true_right hC
         subst hu
-        simp only
-        cases hSet : set? env r (.uintCopy u (f a) src) with
-        | none => exact hEnv
-        | some env' =>
-          simp only
-          apply refineSingleSlot_sound hEnv hSet
-          intro d cs hD hCs
-          have hDen := hEnv.2.2 r d (.uintCopy u a src) cs hD hGet hCs
-          cases uint_slot_extract hInit (uintCopy_denote_uint hDen) with
-          | intro sc hsc =>
-            rw [hsc.1] at hDen hCs ⊢
-            exact ⟨hDen.1, hsc.2.1, hRef a sc.bits hInit hsc.2.2
-              (localUintNat?_of_get? hCs hsc.2.1), hDen.2.2.2⟩
-    | _ => exact hEnv
+        cases uint_slot_extract hInit (uintCopy_denote_uint hDen) with
+        | intro sc hsc =>
+          rw [hsc.1] at hDen hCs ⊢
+          have hLocR : localUintNat? locals r u = some sc.bits := by
+            cases hIR : Nat.beq i r with
+            | true =>
+              have hiR := Nat.eq_of_beq_eq_true hIR
+              subst hiR
+              exact localUintNat?_of_get? hCs hsc.2.1
+            | false =>
+              rw [hIR, Bool.false_or] at hOr
+              have hSrcR := Nat.eq_of_beq_eq_true hOr
+              subst hSrcR
+              exact hDen.2.2.2
+          exact ⟨hDen.1, hsc.2.1, hRef a sc.bits hInit hsc.2.2 hLocR,
+            hDen.2.2.2⟩
+    | top | dead | bool _ | unit _ | uintBoolPair _ _ _ => exact hDen
+
+/-- Concrete scalar of local `r` behind an initialized `.uint` or `.uintCopy`
+slot. -/
+theorem env_uintAbsVal?_extract {decls : List LocalDecl} {env : MirAbsEnv}
+    {locals : List LocalSlot} {r : Nat} {u : UintTy} {a : AbsVal}
+    (hEnv : mirAbsEnvDenote decls env locals)
+    (hGet : envUintAbsVal? env r u = some a) :
+    a.isInit = true ∧
+    ∃ sc d, get? locals r = some (.init (.scalar sc)) ∧
+      get? decls r = some d ∧ d.ty.kind = .uint u ∧
+      sc.sizeBytes = uintBytes u ∧ a.denote (uintWidth u) (some sc.bits) ∧
+      localUintNat? locals r u = some sc.bits := by
+  unfold envUintAbsVal? at hGet
+  cases hS : get? env r with
+  | none => rw [hS] at hGet; nomatch hGet
+  | some s =>
+    rw [hS] at hGet
+    cases mirAbsEnv_lookup hEnv hS with
+    | intro d hd =>
+      cases hd with
+      | intro cs hcs =>
+        cases s with
+        | uint u' a' =>
+          simp only [MirAbsSlot.uintAbsVal?] at hGet
+          cases hC : (uintTyBeq u u' && a'.isInit) with
+          | false => rw [hC] at hGet; nomatch hGet
+          | true =>
+            rw [hC] at hGet
+            injection hGet with hEqA
+            subst hEqA
+            have hu := uintTy_eq_of_beq (bool_and_true_left hC)
+            have hInit := bool_and_true_right hC
+            subst hu
+            cases uint_slot_extract hInit hcs.2.2 with
+            | intro sc hsc =>
+              have hL : get? locals r = some (.init (.scalar sc)) := by
+                rw [hcs.2.1, hsc.1]
+              exact ⟨hInit, sc, d, hL, hcs.1, hcs.2.2.1, hsc.2.1, hsc.2.2,
+                localUintNat?_of_get? hL hsc.2.1⟩
+        | uintCopy u' a' src =>
+          simp only [MirAbsSlot.uintAbsVal?] at hGet
+          cases hC : (uintTyBeq u u' && a'.isInit) with
+          | false => rw [hC] at hGet; nomatch hGet
+          | true =>
+            rw [hC] at hGet
+            injection hGet with hEqA
+            subst hEqA
+            have hu := uintTy_eq_of_beq (bool_and_true_left hC)
+            have hInit := bool_and_true_right hC
+            subst hu
+            cases uint_slot_extract hInit (uintCopy_denote_uint hcs.2.2) with
+            | intro sc hsc =>
+              have hL : get? locals r = some (.init (.scalar sc)) := by
+                rw [hcs.2.1, hsc.1]
+              exact ⟨hInit, sc, d, hL, hcs.1, hcs.2.2.1, hsc.2.1, hsc.2.2,
+                localUintNat?_of_get? hL hsc.2.1⟩
+        | top | dead | bool _ | unit _ | uintBoolPair _ _ _ => nomatch hGet
+
+/-- Concrete scalar of local `r` behind an initialized `.uint` slot. -/
+theorem env_uint_extract {decls : List LocalDecl} {env : MirAbsEnv}
+    {locals : List LocalSlot} {r : Nat} {u : UintTy} {a : AbsVal}
+    (hEnv : mirAbsEnvDenote decls env locals)
+    (hGet : get? env r = some (.uint u a)) (hInit : a.isInit = true) :
+    ∃ sc d, get? locals r = some (.init (.scalar sc)) ∧
+      get? decls r = some d ∧ d.ty.kind = .uint u ∧
+      sc.sizeBytes = uintBytes u ∧ a.denote (uintWidth u) (some sc.bits) ∧
+      localUintNat? locals r u = some sc.bits := by
+  have hU : envUintAbsVal? env r u = some a := by
+    simp only [envUintAbsVal?, hGet, MirAbsSlot.uintAbsVal?, uintTyBeq_refl,
+      hInit]
+    rfl
+  exact (env_uintAbsVal?_extract hEnv hU).2
 
 /-- Refine `env` using `RelGuard` `g` assuming boolean outcome `branchVal`.
-Register-register guards refine both operands symmetrically; `.uneConst`
-refines interval endpoints (`v = 0`, `v = lo`, `v = hi`, `v = 2^w - 1`). -/
+Register-register guards refine both operands symmetrically (across both
+`.uint` and `.uintCopy` slots, propagating refinements to copy aliases),
+`.ueqReg` meets both operands via `AbsVal.meetInit`, self-contradictions
+(`l < l`, `l ≠ l`) yield `AbsVal.bot`, and `.uneConst` refines interval
+endpoints (`v = 0`, `v = lo`, `v = hi`, `v = 2^w - 1`). -/
 def refineEnvByGuard (env : MirAbsEnv) (g : RelGuard) (branchVal : Bool) :
     MirAbsEnv :=
   let eff :=
@@ -2805,65 +2999,70 @@ def refineEnvByGuard (env : MirAbsEnv) (g : RelGuard) (branchVal : Bool) :
   | .ugtConst r u bound =>
     refineUintSlot env r u (fun a => AbsVal.refineUgtConst (uintWidth u) a bound)
   | .ultReg l r u =>
-    let env₁ :=
-      match get? env r with
-      | some (.uint u' ar) =>
-        match uintTyBeq u u' && ar.isInit with
-        | true =>
+    match Nat.beq l r with
+    | true => refineUintSlot env l u (fun _ => AbsVal.bot)
+    | false =>
+      let env₁ :=
+        match envUintAbsVal? env r u with
+        | some ar =>
           refineUintSlot env l u
             (fun al => AbsVal.refineBltReg (uintWidth u) al ar)
-        | false => env
-      | _ => env
-    match get? env l with
-    | some (.uint u' al) =>
-      match uintTyBeq u u' && al.isInit, al.lbound? with
-      | true, some loL =>
-        refineUintSlot env₁ r u
-          (fun ar => AbsVal.refineUgtConst (uintWidth u) ar loL)
-      | _, _ => env₁
-    | _ => env₁
+        | none => env
+      match envUintAbsVal? env₁ l u with
+      | some al =>
+        match al.lbound? with
+        | some loL =>
+          refineUintSlot env₁ r u
+            (fun ar => AbsVal.refineUgtConst (uintWidth u) ar loL)
+        | none => env₁
+      | none => env₁
   | .ugeReg l r u =>
     let env₁ :=
-      match get? env r with
-      | some (.uint u' ar) =>
-        match uintTyBeq u u' && ar.isInit with
-        | true =>
-          refineUintSlot env l u
-            (fun al => AbsVal.refineBgeReg (uintWidth u) al ar)
-        | false => env
-      | _ => env
-    match get? env l with
-    | some (.uint u' al) =>
-      match uintTyBeq u u' && al.isInit, al.ubound? with
-      | true, some hiL =>
+      match envUintAbsVal? env r u with
+      | some ar =>
+        refineUintSlot env l u
+          (fun al => AbsVal.refineBgeReg (uintWidth u) al ar)
+      | none => env
+    match envUintAbsVal? env₁ l u with
+    | some al =>
+      match al.ubound? with
+      | some hiL =>
         refineUintSlot env₁ r u
           (fun ar => AbsVal.refineUleConst (uintWidth u) ar hiL)
-      | _, _ => env₁
-    | _ => env₁
+      | none => env₁
+    | none => env₁
   | .ueqConst r u val =>
     refineUintSlot env r u (fun a => AbsVal.refineEqConst (uintWidth u) a val)
   | .uneConst r u val =>
     refineUintSlot env r u (fun a => AbsVal.refineUneConst (uintWidth u) a val)
-
-/-- Concrete scalar of local `r` behind an initialized `.uint` slot. -/
-theorem env_uint_extract {decls : List LocalDecl} {env : MirAbsEnv}
-    {locals : List LocalSlot} {r : Nat} {u : UintTy} {a : AbsVal}
-    (hEnv : mirAbsEnvDenote decls env locals)
-    (hGet : get? env r = some (.uint u a)) (hInit : a.isInit = true) :
-    ∃ sc d, get? locals r = some (.init (.scalar sc)) ∧
-      get? decls r = some d ∧ d.ty.kind = .uint u ∧
-      sc.sizeBytes = uintBytes u ∧ a.denote (uintWidth u) (some sc.bits) ∧
-      localUintNat? locals r u = some sc.bits := by
-  cases mirAbsEnv_lookup hEnv hGet with
-  | intro d hd =>
-    cases hd with
-    | intro cs hcs =>
-      cases uint_slot_extract hInit hcs.2.2 with
-      | intro sc hsc =>
-        have hL : get? locals r = some (.init (.scalar sc)) := by
-          rw [hcs.2.1, hsc.1]
-        exact ⟨sc, d, hL, hcs.1, hcs.2.2.1, hsc.2.1, hsc.2.2,
-          localUintNat?_of_get? hL hsc.2.1⟩
+  | .ueqReg l r u =>
+    match envUintAbsVal? env l u, envUintAbsVal? env r u with
+    | some al, some ar =>
+      let m := AbsVal.meetInit (uintWidth u) al ar
+      let env₁ := refineUintSlot env l u (fun _ => m)
+      refineUintSlot env₁ r u (fun _ => m)
+    | _, _ => env
+  | .uneReg l r u =>
+    match Nat.beq l r with
+    | true => refineUintSlot env l u (fun _ => AbsVal.bot)
+    | false =>
+      let env₁ :=
+        match envUintAbsVal? env r u with
+        | some ar =>
+          match ar.exactVal? (uintWidth u) with
+          | some v =>
+            refineUintSlot env l u
+              (fun al => AbsVal.refineUneConst (uintWidth u) al v)
+          | none => env
+        | none => env
+      match envUintAbsVal? env₁ l u with
+      | some al =>
+        match al.exactVal? (uintWidth u) with
+        | some v =>
+          refineUintSlot env₁ r u
+            (fun ar => AbsVal.refineUneConst (uintWidth u) ar v)
+        | none => env₁
+      | none => env₁
 
 /-- Soundness of `refineEnvByGuard`. -/
 theorem refineEnvByGuard_sound {decls : List LocalDecl} {env : MirAbsEnv}
@@ -2903,130 +3102,229 @@ theorem refineEnvByGuard_sound {decls : List LocalDecl} {env : MirAbsEnv}
     exact absVal_refineEqConst_sound (uintWidth_valid u) ha hInit
       ((hEff x hx).mp rfl)
   | ultReg l r u =>
-    have hEnv1 : mirAbsEnvDenote decls
-        (match get? env r with
-         | some (.uint u' ar) =>
-           match uintTyBeq u u' && ar.isInit with
-           | true =>
-             refineUintSlot env l u
-               (fun al => AbsVal.refineBltReg (uintWidth u) al ar)
-           | false => env
-         | _ => env) locals := by
-      cases hGet : get? env r with
-      | none => exact hEnv
-      | some s =>
-        cases s with
-        | uint u' ar =>
-          simp only
-          cases hC : (uintTyBeq u u' && ar.isInit) with
-          | false => exact hEnv
-          | true =>
-            have hu := uintTy_eq_of_beq (bool_and_true_left hC)
-            have hInitR := bool_and_true_right hC
-            subst hu
-            simp only
-            cases env_uint_extract hEnv hGet hInitR with
-            | intro scR hR =>
-              cases hR with
-              | intro dR hR =>
-                apply refineUintSlot_sound hEnv
-                intro al x hInitL hal hx
-                exact absVal_refineBltReg_sound (uintWidth_valid u) hal
-                  hR.2.2.2.2.1 hInitL hInitR
-                  ((hEff x scR.bits hx hR.2.2.2.2.2).mp rfl)
-        | _ => exact hEnv
-    simp only
-    cases hGetL : get? env l with
-    | none => exact hEnv1
-    | some sL =>
-      cases sL with
-      | uint u' al =>
-        simp only
-        cases hCL : (uintTyBeq u u' && al.isInit) with
-        | false => exact hEnv1
-        | true =>
-          have hu := uintTy_eq_of_beq (bool_and_true_left hCL)
-          have hInitL := bool_and_true_right hCL
-          subst hu
-          cases hLo : al.lbound? with
-          | none => exact hEnv1
-          | some loL =>
-            simp only
-            cases env_uint_extract hEnv hGetL hInitL with
-            | intro scL hL =>
-              cases hL with
-              | intro dL hL =>
-                apply refineUintSlot_sound hEnv1
-                intro ar y hInitR har hy
-                have hLoLe : loL ≤ scL.bits :=
-                  absVal_lbound?_sound hLo hL.2.2.2.2.1
-                have hLt : scL.bits < y :=
-                  (hEff scL.bits y hL.2.2.2.2.2 hy).mp rfl
-                exact absVal_refineUgtConst_sound (uintWidth_valid u) har hInitR
-                  (Nat.lt_of_le_of_lt hLoLe hLt)
-      | _ => exact hEnv1
+    dsimp only
+    cases hEqLR : Nat.beq l r with
+    | true =>
+      have hLR := Nat.eq_of_beq_eq_true hEqLR
+      subst hLR
+      apply refineUintSlot_sound hEnv
+      intro a x _ _ hx
+      exact False.elim (Nat.lt_irrefl x ((hEff x x hx hx).mp rfl))
+    | false =>
+      dsimp only
+      let env₁ :=
+        match envUintAbsVal? env r u with
+        | some ar =>
+          refineUintSlot env l u
+            (fun al => AbsVal.refineBltReg (uintWidth u) al ar)
+        | none => env
+      have hEnv1 : mirAbsEnvDenote decls env₁ locals := by
+        dsimp only [env₁]
+        cases hGet : envUintAbsVal? env r u with
+        | none => exact hEnv
+        | some ar =>
+          have hEx := env_uintAbsVal?_extract hEnv hGet
+          cases hEx.2 with
+          | intro scR hR =>
+            cases hR with
+            | intro dR hR =>
+              apply refineUintSlot_sound hEnv
+              intro al x hInitL hal hx
+              exact absVal_refineBltReg_sound (uintWidth_valid u) hal
+                hR.2.2.2.2.1 hInitL hEx.1
+                ((hEff x scR.bits hx hR.2.2.2.2.2).mp rfl)
+      change mirAbsEnvDenote decls
+        (match envUintAbsVal? env₁ l u with
+         | some al =>
+           match al.lbound? with
+           | some loL =>
+             refineUintSlot env₁ r u
+               (fun ar => AbsVal.refineUgtConst (uintWidth u) ar loL)
+           | none => env₁
+         | none => env₁) locals
+      cases hGetL : envUintAbsVal? env₁ l u with
+      | none => exact hEnv1
+      | some al =>
+        dsimp only
+        cases hLo : al.lbound? with
+        | none => exact hEnv1
+        | some loL =>
+          have hEx := env_uintAbsVal?_extract hEnv1 hGetL
+          cases hEx.2 with
+          | intro scL hL =>
+            cases hL with
+            | intro dL hL =>
+              apply refineUintSlot_sound hEnv1
+              intro ar y hInitR har hy
+              have hLoLe : loL ≤ scL.bits :=
+                absVal_lbound?_sound hLo hL.2.2.2.2.1
+              have hLt : scL.bits < y :=
+                (hEff scL.bits y hL.2.2.2.2.2 hy).mp rfl
+              exact absVal_refineUgtConst_sound (uintWidth_valid u) har hInitR
+                (Nat.lt_of_le_of_lt hLoLe hLt)
   | ugeReg l r u =>
-    have hEnv1 : mirAbsEnvDenote decls
-        (match get? env r with
-         | some (.uint u' ar) =>
-           match uintTyBeq u u' && ar.isInit with
-           | true =>
-             refineUintSlot env l u
-               (fun al => AbsVal.refineBgeReg (uintWidth u) al ar)
-           | false => env
-         | _ => env) locals := by
-      cases hGet : get? env r with
+    dsimp only
+    let env₁ :=
+      match envUintAbsVal? env r u with
+      | some ar =>
+        refineUintSlot env l u
+          (fun al => AbsVal.refineBgeReg (uintWidth u) al ar)
+      | none => env
+    have hEnv1 : mirAbsEnvDenote decls env₁ locals := by
+      dsimp only [env₁]
+      cases hGet : envUintAbsVal? env r u with
       | none => exact hEnv
-      | some s =>
-        cases s with
-        | uint u' ar =>
-          simp only
-          cases hC : (uintTyBeq u u' && ar.isInit) with
-          | false => exact hEnv
-          | true =>
-            have hu := uintTy_eq_of_beq (bool_and_true_left hC)
-            have hInitR := bool_and_true_right hC
-            subst hu
-            simp only
-            cases env_uint_extract hEnv hGet hInitR with
+      | some ar =>
+        have hEx := env_uintAbsVal?_extract hEnv hGet
+        cases hEx.2 with
+        | intro scR hR =>
+          cases hR with
+          | intro dR hR =>
+            apply refineUintSlot_sound hEnv
+            intro al x hInitL hal hx
+            exact absVal_refineBgeReg_sound (uintWidth_valid u) hal
+              hR.2.2.2.2.1 hInitL hEx.1
+              ((hEff x scR.bits hx hR.2.2.2.2.2).mp rfl)
+    change mirAbsEnvDenote decls
+      (match envUintAbsVal? env₁ l u with
+       | some al =>
+         match al.ubound? with
+         | some hiL =>
+           refineUintSlot env₁ r u
+             (fun ar => AbsVal.refineUleConst (uintWidth u) ar hiL)
+         | none => env₁
+       | none => env₁) locals
+    cases hGetL : envUintAbsVal? env₁ l u with
+    | none => exact hEnv1
+    | some al =>
+      dsimp only
+      cases hHi : al.ubound? with
+      | none => exact hEnv1
+      | some hiL =>
+        have hEx := env_uintAbsVal?_extract hEnv1 hGetL
+        cases hEx.2 with
+        | intro scL hL =>
+          cases hL with
+          | intro dL hL =>
+            apply refineUintSlot_sound hEnv1
+            intro ar y hInitR har hy
+            have hHiLe : scL.bits ≤ hiL :=
+              absVal_ubound?_sound hHi hL.2.2.2.2.1
+            have hGe : y ≤ scL.bits :=
+              (hEff scL.bits y hL.2.2.2.2.2 hy).mp rfl
+            exact absVal_refineUleConst_sound (uintWidth_valid u) har hInitR
+              (Nat.le_trans hGe hHiLe)
+  | ueqReg l r u =>
+    dsimp only
+    cases hGetL : envUintAbsVal? env l u with
+    | none => exact hEnv
+    | some al =>
+      cases hGetR : envUintAbsVal? env r u with
+      | none => exact hEnv
+      | some ar =>
+        have hExL := env_uintAbsVal?_extract hEnv hGetL
+        have hExR := env_uintAbsVal?_extract hEnv hGetR
+        cases hExL.2 with
+        | intro scL hL =>
+          cases hL with
+          | intro dL hL =>
+            cases hExR.2 with
             | intro scR hR =>
               cases hR with
               | intro dR hR =>
+                have hEqBits : scL.bits = scR.bits :=
+                  (hEff scL.bits scR.bits hL.2.2.2.2.2 hR.2.2.2.2.2).mp rfl
+                have hMeetL : (AbsVal.meetInit (uintWidth u) al ar).denote
+                    (uintWidth u) (some scL.bits) := by
+                  apply absVal_meetInit_sound (uintWidth_valid u) hExL.1 hExR.1
+                    hL.2.2.2.2.1
+                  rw [hEqBits]
+                  exact hR.2.2.2.2.1
+                have hEnv1 : mirAbsEnvDenote decls
+                    (refineUintSlot env l u
+                      (fun _ => AbsVal.meetInit (uintWidth u) al ar)) locals := by
+                  apply refineUintSlot_sound hEnv
+                  intro _ x _ _ hx
+                  rw [hL.2.2.2.2.2] at hx
+                  injection hx with hx
+                  subst hx
+                  exact hMeetL
+                apply refineUintSlot_sound hEnv1
+                intro _ y _ _ hy
+                rw [hR.2.2.2.2.2] at hy
+                injection hy with hy
+                subst hy
+                rw [← hEqBits]
+                exact hMeetL
+  | uneReg l r u =>
+    dsimp only
+    cases hEqLR : Nat.beq l r with
+    | true =>
+      have hLR := Nat.eq_of_beq_eq_true hEqLR
+      subst hLR
+      apply refineUintSlot_sound hEnv
+      intro a x _ _ hx
+      exact False.elim ((hEff x x hx hx).mp rfl rfl)
+    | false =>
+      dsimp only
+      let env₁ :=
+        match envUintAbsVal? env r u with
+        | some ar =>
+          match ar.exactVal? (uintWidth u) with
+          | some v =>
+            refineUintSlot env l u
+              (fun al => AbsVal.refineUneConst (uintWidth u) al v)
+          | none => env
+        | none => env
+      have hEnv1 : mirAbsEnvDenote decls env₁ locals := by
+        dsimp only [env₁]
+        cases hGet : envUintAbsVal? env r u with
+        | none => exact hEnv
+        | some ar =>
+          dsimp only
+          cases hExV : ar.exactVal? (uintWidth u) with
+          | none => exact hEnv
+          | some v =>
+            have hEx := env_uintAbsVal?_extract hEnv hGet
+            cases hEx.2 with
+            | intro scR hR =>
+              cases hR with
+              | intro dR hR =>
+                have hvEq := (absVal_exactVal?_sound hExV hR.2.2.2.2.1).1
+                injection hvEq with hvEq
+                subst hvEq
                 apply refineUintSlot_sound hEnv
                 intro al x hInitL hal hx
-                exact absVal_refineBgeReg_sound (uintWidth_valid u) hal
-                  hR.2.2.2.2.1 hInitL hInitR
+                exact absVal_refineUneConst_sound (uintWidth_valid u) hal hInitL
                   ((hEff x scR.bits hx hR.2.2.2.2.2).mp rfl)
-        | _ => exact hEnv
-    simp only
-    cases hGetL : get? env l with
-    | none => exact hEnv1
-    | some sL =>
-      cases sL with
-      | uint u' al =>
-        simp only
-        cases hCL : (uintTyBeq u u' && al.isInit) with
-        | false => exact hEnv1
-        | true =>
-          have hu := uintTy_eq_of_beq (bool_and_true_left hCL)
-          have hInitL := bool_and_true_right hCL
-          subst hu
-          cases hHi : al.ubound? with
-          | none => exact hEnv1
-          | some hiL =>
-            simp only
-            cases env_uint_extract hEnv hGetL hInitL with
-            | intro scL hL =>
-              cases hL with
-              | intro dL hL =>
-                apply refineUintSlot_sound hEnv1
-                intro ar y hInitR har hy
-                have hHiLe : scL.bits ≤ hiL :=
-                  absVal_ubound?_sound hHi hL.2.2.2.2.1
-                have hGe : y ≤ scL.bits :=
-                  (hEff scL.bits y hL.2.2.2.2.2 hy).mp rfl
-                exact absVal_refineUleConst_sound (uintWidth_valid u) har hInitR
-                  (Nat.le_trans hGe hHiLe)
-      | _ => exact hEnv1
+      change mirAbsEnvDenote decls
+        (match envUintAbsVal? env₁ l u with
+         | some al =>
+           match al.exactVal? (uintWidth u) with
+           | some v =>
+             refineUintSlot env₁ r u
+               (fun ar => AbsVal.refineUneConst (uintWidth u) ar v)
+           | none => env₁
+         | none => env₁) locals
+      cases hGetL : envUintAbsVal? env₁ l u with
+      | none => exact hEnv1
+      | some al =>
+        dsimp only
+        cases hExV : al.exactVal? (uintWidth u) with
+        | none => exact hEnv1
+        | some v =>
+          have hEx := env_uintAbsVal?_extract hEnv1 hGetL
+          cases hEx.2 with
+          | intro scL hL =>
+            cases hL with
+            | intro dL hL =>
+              have hvEq := (absVal_exactVal?_sound hExV hL.2.2.2.2.1).1
+              injection hvEq with hvEq
+              subst hvEq
+              apply refineUintSlot_sound hEnv1
+              intro ar y hInitR har hy
+              have hNe := (hEff scL.bits y hL.2.2.2.2.2 hy).mp rfl
+              exact absVal_refineUneConst_sound (uintWidth_valid u) har hInitR
+                (fun h => hNe h.symm)
 
 end Anneal.AiPcc
