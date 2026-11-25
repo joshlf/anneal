@@ -5371,44 +5371,92 @@ _WRAPPER_EXEC_CHECK_FLAGS: tuple[tuple[str, ...], ...] = (
     ("--mode", "file", "--no-slot-lock"),
     ("--mode", "build", "--concurrency", "1", "--no-slot-lock"),
 )
-# `systemctl` shim placed first on the probe's `PATH`, an allowlist rather than a
-# denylist: it forwards to the real `systemctl` only read-only queries (`show`, `status`,
-# `is-*`, `cat`, `list-*`, or no verb at all, e.g. `--version`) and `kill`s whose every
-# unit is a concrete (glob-free) `anneal-run-*.scope`, i.e. a transient scope the probed
-# wrapper itself opened. Every other call (`daemon-reload`, `daemon-reexec`, `start` /
-# `stop` / `restart` of any unit, `kill` of `anneal-lsp-daemon-*` or of a glob such as
-# `anneal-run-*.scope` that would hit every live build, `set-environment`, ...) exits 0
-# without effect, so a capability probe can never reload the live user manager, touch
-# its units, or evict warm LSP daemons, whatever the wrapper (or a newer one) tries.
+# `systemctl` shim placed first on the probe's `PATH`, a strict single-pass allowlist:
+# every option (and its arity) is validated against an explicit table so option-value
+# desyncs (e.g. `--user -p show daemon-reload`, `--user -H show stop ...`, or
+# `--user kill -s -s evil.scope anneal-run-1.scope`) can never smuggle a mutating verb or
+# target past the shim. Forwards to the real `systemctl` only:
+# - `--version` / `--user --version` with no verb or other options,
+# - `--user` read-only queries (`show`, `status`, `is-*`, `cat`, `list-*`) with read-only
+#   options only, and
+# - `--user kill` (seen once, with signal / `--kill-whom` options only) targeting one or
+#   more concrete `anneal-run-<digits/dashes>.scope` transient units (no globs or other
+#   unit names).
+# Every other call exits 0 without effect.
 _WRAPPER_PROBE_SYSTEMCTL_SHIM = (
     "#!/bin/sh\n"
+    "user=0\n"
+    "ver=0\n"
     'verb=""\n'
+    'expect=""\n'
+    "end_opts=0\n"
+    "units=0\n"
+    "saw_ro_opt=0\n"
+    "saw_kill_opt=0\n"
     'for arg in "$@"; do\n'
-    '  case "$arg" in\n'
-    "    -*) ;;\n"
-    '    *) verb="$arg"; break ;;\n'
-    "  esac\n"
+    '  if [ -n "$expect" ]; then\n'
+    '    case "$expect" in\n'
+    '      sig) case "$arg" in ""|-*|*[!A-Za-z0-9_+-]*) exit 0 ;; esac ;;\n'
+    '      whom) case "$arg" in main|control|all) ;; *) exit 0 ;; esac ;;\n'
+    "    esac\n"
+    '    expect=""\n'
+    "    continue\n"
+    "  fi\n"
+    '  if [ "$end_opts" -eq 0 ]; then\n'
+    '    case "$arg" in\n'
+    '      --) [ -z "$verb" ] && exit 0; end_opts=1; continue ;;\n'
+    "      --user) user=1; continue ;;\n"
+    "      --version) ver=1; continue ;;\n"
+    "      --no-pager|--no-legend|--quiet|-q|--plain|--full|-l|--value|--all|-a|--failed)\n"
+    "        saw_ro_opt=1; continue ;;\n"
+    "      -p|--property|-t|--type|--state|-o|--output|-n|--lines)\n"
+    '        saw_ro_opt=1; expect="ro"; continue ;;\n'
+    "      --property=*|--type=*|--state=*|--output=*|--lines=*)\n"
+    "        saw_ro_opt=1; continue ;;\n"
+    "      -s|--signal)\n"
+    '        saw_kill_opt=1; expect="sig"; continue ;;\n'
+    "      --signal=*)\n"
+    "        saw_kill_opt=1\n"
+    '        case "${{arg#--signal=}}" in ""|-*|*[!A-Za-z0-9_+-]*) exit 0 ;; esac\n'
+    "        continue ;;\n"
+    "      --kill-whom)\n"
+    '        saw_kill_opt=1; expect="whom"; continue ;;\n'
+    "      --kill-whom=*)\n"
+    "        saw_kill_opt=1\n"
+    '        case "${{arg#--kill-whom=}}" in main|control|all) ;; *) exit 0 ;; esac\n'
+    "        continue ;;\n"
+    "      -*) exit 0 ;;\n"
+    "    esac\n"
+    "  fi\n"
+    '  if [ -z "$verb" ]; then\n'
+    '    verb="$arg"\n'
+    "    continue\n"
+    "  fi\n"
+    '  if [ "$verb" = "kill" ]; then\n'
+    '    case "$arg" in\n'
+    "      anneal-run-[0-9]*.scope)\n"
+    '        mid="${{arg#anneal-run-}}"\n'
+    '        mid="${{mid%.scope}}"\n'
+    '        case "$mid" in\n'
+    '          ""|*[!0-9-]*|*-) exit 0 ;;\n'
+    "          *) units=$((units + 1)) ;;\n"
+    "        esac ;;\n"
+    "      *) exit 0 ;;\n"
+    "    esac\n"
+    "  fi\n"
     "done\n"
+    '[ -n "$expect" ] && exit 0\n'
+    'if [ -z "$verb" ]; then\n'
+    '  [ "$ver" -eq 1 ] && [ "$saw_ro_opt" -eq 0 ] && [ "$saw_kill_opt" -eq 0 ] && [ "$end_opts" -eq 0 ] && exec {real} "$@"\n'
+    "  exit 0\n"
+    "fi\n"
+    '[ "$user" -eq 1 ] || exit 0\n'
+    '[ "$ver" -eq 0 ] || exit 0\n'
     'case "$verb" in\n'
-    '  ""|show|status|is-active|is-enabled|is-failed|is-system-running|cat|list-units|list-unit-files)\n'
-    '    exec {real} "$@" ;;\n'
+    "  show|status|is-active|is-enabled|is-failed|is-system-running|cat|list-units|list-unit-files)\n"
+    '    [ "$saw_kill_opt" -eq 0 ] && exec {real} "$@" ;;\n'
     "  kill)\n"
-    "    units=0\n"
-    "    prev=\"\"\n"
-    '    for arg in "$@"; do\n'
-    '      if [ "$prev" = "-s" ] || [ "$prev" = "--signal" ] || [ "$prev" = "--kill-whom" ]; then\n'
-    '        prev="$arg"; continue\n'
-    "      fi\n"
-    '      prev="$arg"\n'
-    '      case "$arg" in\n'
-    "        *[*?[]*) exit 0 ;;\n"
-    "        --user|kill|-s|--signal|--signal=*|--kill-whom|--kill-whom=*) ;;\n"
-    "        anneal-run-*.scope) units=$((units + 1)) ;;\n"
-    "        *) exit 0 ;;\n"
-    "      esac\n"
-    "    done\n"
-    '    [ "$units" -gt 0 ] && exec {real} "$@"\n'
-    "    exit 0 ;;\n"
+    '    [ "$saw_ro_opt" -eq 0 ] && [ "$units" -gt 0 ] && exec {real} "$@" ;;\n'
     "esac\n"
     "exit 0\n"
 )
@@ -5503,17 +5551,29 @@ def _seed_probe_workloads_slice_unit(env: Mapping[str, str], config_dir: Path) -
                     pass
     for cfg_base in candidates:
         src = cfg_base / "systemd" / "user" / "anneal-workloads.slice"
+        fd: int | None = None
         try:
-            st = os.stat(src)
+            fd = os.open(os.fspath(src), os.O_RDONLY | os.O_NONBLOCK)
+            st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_size > _WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES:
                 continue
-            content = src.read_bytes()
+            with os.fdopen(fd, "rb") as fh:
+                fd = None
+                content = fh.read(_WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES + 1)
+            if len(content) > _WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES:
+                continue
             dest = config_dir / "systemd" / "user" / "anneal-workloads.slice"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(content)
             return
         except (OSError, ValueError):
             continue
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def _install_probe_systemctl_shim(probe_env: dict[str, str], shim_dir: Path) -> None:
@@ -5521,7 +5581,8 @@ def _install_probe_systemctl_shim(probe_env: dict[str, str], shim_dir: Path) -> 
     `probe_env["PATH"]`. When `PATH` was unset in `probe_env`, preserve POSIX `os.defpath`
     behind `shim_dir` so `#!/usr/bin/env python3` wrappers still resolve standard tools.
     The real `systemctl` is the one `base_path` would have found (else executable
-    `/usr/bin/systemctl`); with none at all, no shim is installed."""
+    `/usr/bin/systemctl`); with none at all (or if `shim_dir/systemctl` is already first
+    on `PATH`), no shim is rewritten."""
     base_path = probe_env["PATH"] if "PATH" in probe_env else os.defpath
     try:
         real = shutil.which("systemctl", path=base_path) if base_path else None
@@ -5531,9 +5592,11 @@ def _install_probe_systemctl_shim(probe_env: dict[str, str], shim_dir: Path) -> 
         real = "/usr/bin/systemctl"
     if real is None:
         return
+    shim = shim_dir / "systemctl"
+    if _samefile_safe(Path(real), shim):
+        return
     try:
         shim_dir.mkdir(mode=0o700, exist_ok=True)
-        shim = shim_dir / "systemctl"
         shim.write_text(_WRAPPER_PROBE_SYSTEMCTL_SHIM.format(real=shlex.quote(os.path.abspath(real))), encoding="utf-8")
         shim.chmod(0o700)
     except OSError:

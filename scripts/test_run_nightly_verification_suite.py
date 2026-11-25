@@ -6493,10 +6493,16 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             spy.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(spy_log))}\nexit 0\n', encoding="utf-8")
             spy.chmod(0o755)
 
-            # The shim is an allowlist: read-only queries and kills of concrete `anneal-run-*.scope`
-            # units reach the real `systemctl`, argv intact; every other call is a no-op exit 0.
+            # The shim is a strict single-pass allowlist: `--version`, `--user` read-only queries,
+            # and `--user kill` of concrete `anneal-run-<digits>.scope` units reach the real
+            # `systemctl`, argv intact; option-value desyncs, repeated `kill`, missing `--user`,
+            # globs, and every mutating call are no-op exit 0. Also verify idempotency (a second
+            # install into the same `shim_dir` does not overwrite the shim with a self-exec loop).
             probe_env = {"PATH": os.pathsep.join([os.fspath(spy_bin), "/usr/bin", "/bin"])}
             suite._install_probe_systemctl_shim(probe_env, root / "shim")
+            shim_before = (root / "shim/systemctl").read_text(encoding="utf-8")
+            suite._install_probe_systemctl_shim(probe_env, root / "shim")
+            self.assertEqual((root / "shim/systemctl").read_text(encoding="utf-8"), shim_before)
             self.assertEqual(probe_env["PATH"].split(os.pathsep)[0], os.fspath(root / "shim"))
             self.assertEqual(shutil.which("systemctl", path=probe_env["PATH"]), os.fspath(root / "shim/systemctl"))
             for argv in (
@@ -6513,14 +6519,34 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 ["--user", "set-environment", "LEAN_NUM_THREADS=3"],
                 ["--user", "reset-failed"],
                 ["--user", "enable", "--now", "x.service"],
-                # Kills of anything but concrete `anneal-run-*.scope` units.
+                # Option-value desync bypasses (`-p`/`-s`/`-H` + `show` before a mutating verb).
+                ["--user", "-p", "show", "daemon-reload"],
+                ["--user", "-s", "show", "kill", "anneal-lsp-daemon-1.scope"],
+                ["--user", "-H", "show", "stop", "anneal-workloads.slice"],
+                ["--user", "-pshow", "daemon-reload"],
+                ["--user", "--", "show"],
+                ["--user", "show", "-p"],
+                ["--user", "show", "-s", "SIGKILL"],
+                ["--user", "--version", "stop", "evil.service"],
+                # Kills of anything but `--user` + concrete `anneal-run-<digits>.scope` units.
                 ["--user", "kill", "-s", "SIGKILL", "anneal-run-*.scope"],
+                ["--user", "kill", "-s", "SIGKILL", "anneal-run-1*.scope"],
+                ["--user", "kill", "-s", "SIGKILL", "anneal-run-.scope"],
+                ["--user", "kill", "-s", "SIGKILL", "anneal-run-1-.scope"],
                 ["--user", "kill", "-s", "SIGKILL", "anneal-run-1.scope", "anneal-lsp-daemon-1.scope"],
                 ["--user", "kill", "-s", "SIGKILL", "user@1000.service"],
                 ["--user", "kill", "--signal=SIGKILL"],
+                ["--user", "kill", "--signal=", "anneal-run-1.scope"],
                 ["--user", "kill", "-s", "anneal-run-1.scope"],
+                ["--user", "kill", "-s", "-s", "anneal-lsp-daemon-1.scope", "anneal-run-1.scope"],
+                ["--user", "kill", "kill", "anneal-run-1.scope"],
+                ["--user", "kill", "-p", "Version", "-s", "SIGKILL", "anneal-run-1.scope"],
+                ["kill", "-s", "SIGKILL", "anneal-run-1.scope"],
+                ["show", "-p", "Version", "--value"],
                 ["--user", "--version"],
-                ["--user", "kill", "--signal=SIGKILL", "anneal-run-2-3.scope"],
+                ["--version"],
+                ["--user", "kill", "--signal=SIGKILL", "--kill-whom=all", "anneal-run-2-3.scope"],
+                ["--user", "kill", "-s", "SIGKILL", "--", "anneal-run-42.scope"],
             ):
                 res = subprocess.run(["systemctl", *argv], env=probe_env, capture_output=True, check=False, timeout=10)
                 self.assertEqual(res.returncode, 0, argv)
@@ -6530,7 +6556,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "--user show -p Version --value",
                     "--user kill -s SIGTERM anneal-run-999.scope",
                     "--user --version",
-                    "--user kill --signal=SIGKILL anneal-run-2-3.scope",
+                    "--version",
+                    "--user kill --signal=SIGKILL --kill-whom=all anneal-run-2-3.scope",
+                    "--user kill -s SIGKILL -- anneal-run-42.scope",
                 ],
             )
 
