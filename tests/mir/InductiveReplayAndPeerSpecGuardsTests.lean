@@ -158,7 +158,7 @@ example : .keyMismatch ∈ inductiveReplayViolations fKeyMismatch cleanKenv := b
 example : .duplicateConstName ∈ inductiveReplayViolations fDuplicateConstName cleanKenv := by decide
 example : .danglingRecursor ∈ inductiveReplayViolations fCrossInductRecRule cleanKenv := by decide
 example : .danglingRecursor ∈ inductiveReplayViolations fDupRecAll cleanKenv := by decide
-example : ForgedInductiveClass.all.length = 18 := rfl
+example : ForgedInductiveClass.all.length = 19 := rfl
 example : cleanModule.constNames = cleanModule.constants.map RConstInfo.name :=
   inductiveReplayWellFormed_constNames_eq cleanModule_wellFormed
 example : .constantHasOpenExpr ∈ inductiveReplayViolations fOpenExpr cleanKenv := by decide
@@ -227,7 +227,31 @@ example : InductiveReplayViolationCode.all.map InductiveReplayViolationCode.wire
       "mutual_metadata_mismatch", "duplicate_in_ctors", "non_ctor_in_ctors",
       "ctor_induct_mismatch", "ctor_cidx_mismatch", "dangling_ctor_not_listed_in_induct",
       "dangling_recursor", "post_replay_induct_mismatch", "post_replay_ctor_mismatch",
-      "recursor_mismatch"] := rfl
+      "recursor_mismatch", "kernel_constant_dropped"] := rfl
+
+/-- A forgery that drops the recursor the kernel regenerates, or replaces it by a
+    definition of the same name, is rejected by the reverse post-replay sweep. -/
+def fDroppedRec : ModuleData :=
+  { constNames := [1, 2, 3],
+    constants := [.inductInfo fixtureInduct, .ctorInfo fixtureCtor0, .ctorInfo fixtureCtor1] }
+def fReplacedRec : ModuleData :=
+  { constNames := [1, 2, 3, 4],
+    constants := [.inductInfo fixtureInduct, .ctorInfo fixtureCtor0, .ctorInfo fixtureCtor1,
+      .defnInfo 4 1 fixtureRec.type (.lam (.sort 0) (.bvar 0))] }
+
+example : selfComparisonCheck fDroppedRec = true ∧ selfComparisonCheck fReplacedRec = true := by
+  decide
+example : inductiveReplayViolations fDroppedRec cleanModule.constants = [.kernelConstantDropped] := by
+  decide
+example : inductiveReplayViolations fReplacedRec cleanModule.constants =
+    [.kernelConstantDropped] := by decide
+example : inductiveReplayViolations cleanModule cleanModule.constants = [] := by decide
+example : ¬ InductiveReplayWellFormed fDroppedRec cleanModule.constants :=
+  (inductiveReplayWellFormed_rejects (cls := .droppedKernelConstant)
+    ⟨.recInfo fixtureRec, by decide, rfl, fun d hd => by cases hd⟩).1
+example : lookup cleanModule.constants 4 = some (.recInfo fixtureRec) :=
+  inductiveReplayWellFormed_kernel_exact (md := cleanModule) (kenv := cleanModule.constants)
+    (by decide) (by decide) (.recInfo fixtureRec) (by decide) rfl
 
 /-! ## 3. Pillar 2 -/
 
@@ -463,6 +487,10 @@ open Anneal.InductiveReplayAndPeerSpecGuards
 /-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.inductiveReplayWellFormed_kernel_agreement' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms inductiveReplayWellFormed_kernel_agreement
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.inductiveReplayWellFormed_kernel_exact' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms inductiveReplayWellFormed_kernel_exact
 
 /-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.selfComparison_tautological' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs (whitespace := lax) in

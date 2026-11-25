@@ -303,6 +303,9 @@ pub enum PeerViolationReason {
     MultipleMintSites,
     /// Guard 4: `main` mints a token and is referenced (re-entered or aliased).
     ReentrantMain,
+    /// Guard 4: the constructor type is passed as an explicit generic argument
+    /// to a function (`mk::<Tokens>()`), so a generic body may mint it.
+    GenericConstructorDispatch,
     /// Guard 5: `external_body` on an external type whose `Drop` may exist.
     ExternalBodyWithDrop,
     /// Guard 5: a `Drop` impl without an unconditional `models_drop`.
@@ -328,6 +331,10 @@ pub enum PeerViolationReason {
     InvariantDeriveDefault,
     /// Guard 6b: an invariant-bearing structure implements `Default`.
     InvariantDefaultImpl,
+    /// Guard 6b: an invariant-bearing structure derives or implements a trait
+    /// that builds values from untrusted data or bytes without checking the
+    /// invariant (`Deserialize`, `FromBytes`, `Pod`, `Arbitrary`, ...).
+    InvariantUncheckedConstructorTrait,
     /// Guard 6b: a public function constructs the raw structure without a
     /// `#[smart_constructor]` invariant gate.
     InvariantRawPublicConstructor,
@@ -344,7 +351,8 @@ impl PeerViolationReason {
             | Self::MintInRepeatingContext
             | Self::MintOutsideMain
             | Self::MultipleMintSites
-            | Self::ReentrantMain => PeerSpecGuardClass::FnDefGhostTokenCoercion,
+            | Self::ReentrantMain
+            | Self::GenericConstructorDispatch => PeerSpecGuardClass::FnDefGhostTokenCoercion,
             Self::ExternalBodyWithDrop
             | Self::UnmodeledDropImpl
             | Self::UnmodeledOpaqueField
@@ -363,6 +371,7 @@ impl PeerViolationReason {
             Self::MintOutsideMain => "mint_outside_main",
             Self::MultipleMintSites => "multiple_mint_sites",
             Self::ReentrantMain => "reentrant_main",
+            Self::GenericConstructorDispatch => "generic_constructor_dispatch",
             Self::ExternalBodyWithDrop => "external_body_with_drop",
             Self::UnmodeledDropImpl => "unmodeled_drop_impl",
             Self::UnmodeledOpaqueField => "unmodeled_opaque_field",
@@ -374,6 +383,7 @@ impl PeerViolationReason {
             Self::AssumptionUncleanLeaf => "assumption_unclean_leaf",
             Self::InvariantPubField => "invariant_pub_field",
             Self::InvariantDeriveDefault => "invariant_derive_default",
+            Self::InvariantUncheckedConstructorTrait => "invariant_unchecked_constructor_trait",
             Self::InvariantDefaultImpl => "invariant_default_impl",
             Self::InvariantRawPublicConstructor => "invariant_raw_public_constructor",
         }
@@ -1184,15 +1194,16 @@ fn parse_int(text: &str) -> Option<u128> {
     if text.contains('.') {
         return None;
     }
-    let (radix, digits) = if let Some(rest) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        (16u128, rest)
-    } else if let Some(rest) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
-        (8u128, rest)
-    } else if let Some(rest) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
-        (2u128, rest)
-    } else {
-        (10u128, text)
-    };
+    let (radix, digits) =
+        if let Some(rest) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            (16u128, rest)
+        } else if let Some(rest) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
+            (8u128, rest)
+        } else if let Some(rest) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+            (2u128, rest)
+        } else {
+            (10u128, text)
+        };
     let mut v: u128 = 0;
     let mut any = false;
     let mut tail_idx = digits.len();
@@ -1304,7 +1315,10 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
                 return match cond {
                     Some(true) => const_bool(then_r, depth + 1),
                     Some(false) => const_bool(else_r, depth + 1),
-                    None => match (const_bool(then_r, depth + 1)?, const_bool(else_r, depth + 1)?) {
+                    None => match (
+                        const_bool(then_r, depth + 1)?,
+                        const_bool(else_r, depth + 1)?,
+                    ) {
                         (Some(a), Some(b)) if a == b => Ok(Some(a)),
                         _ => Ok(None),
                     },
@@ -1459,6 +1473,7 @@ struct AttrFlags {
     has_drop_impl: bool,
     invariant: bool,
     derive_default: bool,
+    derive_unchecked: bool,
     requires_false: bool,
     models_drop: bool,
     no_drop_glue: bool,
@@ -1476,6 +1491,7 @@ impl AttrFlags {
         self.has_drop_impl |= o.has_drop_impl;
         self.invariant |= o.invariant;
         self.derive_default |= o.derive_default;
+        self.derive_unchecked |= o.derive_unchecked;
         self.requires_false |= o.requires_false;
         self.models_drop |= o.models_drop;
         self.no_drop_glue |= o.no_drop_glue;
@@ -1769,8 +1785,12 @@ fn classify_meta<'a>(
             if let Some(a) = args {
                 let mut parts = TopSplit::new(a, false);
                 while let Some(p) = parts.next_part()? {
-                    if path_last_ident(p)? == Some("Default") {
-                        flags.derive_default = true;
+                    match path_last_ident(p)? {
+                        Some("Default") => flags.derive_default = true,
+                        Some(d) if UNCHECKED_CONSTRUCTOR_TRAITS.contains(&d) => {
+                            flags.derive_unchecked = true;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1780,6 +1800,34 @@ fn classify_meta<'a>(
     }
     Ok(())
 }
+
+/// Traits whose derives or impls build values without running a constructor
+/// (deserialization, byte reinterpretation, fuzzing).
+const UNCHECKED_CONSTRUCTOR_TRAITS: [&str; 12] = [
+    "Deserialize",
+    "Arbitrary",
+    "FromBytes",
+    "FromZeros",
+    "FromZeroes",
+    "TryFromBytes",
+    "AnyBitPattern",
+    "Pod",
+    "Zeroable",
+    "CheckedBitPattern",
+    "FromBits",
+    "FromRaw",
+];
+
+/// Calls that materialize a value from raw bits, bypassing constructors.
+const RAW_MATERIALIZERS: [&str; 7] = [
+    "transmute",
+    "transmute_copy",
+    "zeroed",
+    "assume_init",
+    "assume_init_read",
+    "read_unaligned",
+    "from_raw_parts",
+];
 
 fn classify_attribute<'a>(
     content: Lexer<'a>,
@@ -1852,6 +1900,8 @@ fn parse_impl_header<'a>(after_impl: Lexer<'a>) -> Result<Option<ImplHeader<'a>>
 struct FnSig<'a> {
     name: Tok<'a>,
     ret_uninhabited: bool,
+    /// Verus-style signature clauses (`requires ..`, `ensures ..`), if any.
+    clauses: Option<Lexer<'a>>,
     /// Lexer positioned at the body `{` or the terminating `;`.
     rest: Lexer<'a>,
 }
@@ -1873,6 +1923,16 @@ fn shadows_infallible(src: &str) -> Result<bool, PeerScanError> {
 }
 
 fn type_is_uninhabited(r: Lexer<'_>, infallible_shadowed: bool) -> Result<bool, PeerScanError> {
+    // Verus named return `(r: T)`.
+    if let Some(inner) = whole_group(r, "(")? {
+        let mut c = inner;
+        if let (Some(n), true) = (c.next()?, c.next_is_punct(":")?) {
+            if n.is_ident() {
+                c.next()?;
+                return type_is_uninhabited(inner.range(c.pos, inner.end), infallible_shadowed);
+            }
+        }
+    }
     let mut c = r;
     match c.next()? {
         Some(t) if t.is_punct("!") => c.is_empty(),
@@ -1902,6 +1962,62 @@ fn type_is_uninhabited(r: Lexer<'_>, infallible_shadowed: bool) -> Result<bool, 
         }
         _ => Ok(false),
     }
+}
+
+/// Verus signature-clause keywords.
+const SIG_CLAUSE_KEYWORDS: [&str; 7] = [
+    "requires",
+    "ensures",
+    "recommends",
+    "decreases",
+    "opens_invariants",
+    "no_unwind",
+    "returns",
+];
+
+/// Visits each comma-separated expression of the `requires` / `ensures`
+/// signature clauses (`ensures false, r > 0`).
+fn for_each_sig_clause<'a>(
+    clauses: Lexer<'a>,
+    f: &mut dyn FnMut(ClauseKind, Lexer<'a>) -> GResult<()>,
+) -> GResult<()> {
+    let mut c = clauses;
+    let mut kind: Option<ClauseKind> = None;
+    let mut seg_start = c.pos;
+    loop {
+        let before = c.pos;
+        let t = c.next()?;
+        let boundary = match t {
+            None => true,
+            Some(t) => {
+                t.is_punct(",") || (t.is_ident() && !t.raw && SIG_CLAUSE_KEYWORDS.contains(&t.text))
+            }
+        };
+        if boundary {
+            if let Some(k) = kind {
+                let seg = clauses.range(seg_start, before);
+                if !seg.is_empty()? {
+                    f(k, seg)?;
+                }
+            }
+            let Some(t) = t else { break };
+            if t.is_ident() {
+                kind = match t.text {
+                    "ensures" | "returns" => Some(ClauseKind::Ensures),
+                    "requires" => Some(ClauseKind::Requires),
+                    _ => None,
+                };
+            }
+            seg_start = c.pos;
+            continue;
+        }
+        if let Some(t) = t {
+            if t.is_open() {
+                skip_group(&mut c, &t)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn scan_fn_signature<'a>(
@@ -1934,7 +2050,12 @@ fn scan_fn_signature<'a>(
         loop {
             let save = c;
             let Some(t) = c.next()? else { break };
-            if angle == 0 && (t.is_punct("{") || t.is_punct(";") || t.is_kw("where")) {
+            if angle == 0
+                && (t.is_punct("{")
+                    || t.is_punct(";")
+                    || t.is_kw("where")
+                    || (t.is_ident() && !t.raw && SIG_CLAUSE_KEYWORDS.contains(&t.text)))
+            {
                 end = t.start;
                 c = save;
                 break;
@@ -1949,9 +2070,14 @@ fn scan_fn_signature<'a>(
         }
         ret_uninhabited = type_is_uninhabited(after_fn.range(start, end), infallible_shadowed)?;
     }
+    let mut clause_start: Option<usize> = None;
     while let Some(t) = c.peek()? {
         if t.is_punct("{") || t.is_punct(";") {
             break;
+        }
+        if clause_start.is_none() && t.is_ident() && !t.raw && SIG_CLAUSE_KEYWORDS.contains(&t.text)
+        {
+            clause_start = Some(t.start);
         }
         c.next()?;
         if t.is_open() {
@@ -1961,6 +2087,7 @@ fn scan_fn_signature<'a>(
     Ok(Some(FnSig {
         name,
         ret_uninhabited,
+        clauses: clause_start.map(|s| after_fn.range(s, c.pos)),
         rest: c,
     }))
 }
@@ -2324,6 +2451,16 @@ pub fn check_extern_ensures_false_source(src: &str) -> GResult<()> {
         match t.text {
             "fn" => {
                 if let Some(sig) = scan_fn_signature(lx, infallible_shadowed)? {
+                    if let Some(clauses) = sig.clauses {
+                        for_each_sig_clause(clauses, &mut |kind, seg| {
+                            let unsat = clause_is_unsatisfiable(seg, 0)?;
+                            match kind {
+                                ClauseKind::Ensures => pending.ensures_false |= unsat,
+                                ClauseKind::Requires => pending.requires_false |= unsat,
+                            }
+                            Ok(())
+                        })?;
+                    }
                     let trusted = pending.trusted_like || trusted_depth.is_some();
                     if pending.diverging_claim && !sig.ret_uninhabited {
                         return violation(PeerViolationReason::LyingDivergence, sig.name.start);
@@ -2403,6 +2540,8 @@ pub struct GhostTokenUsageDescriptor {
     pub call_sites_outside_main: usize,
     /// `main` is re-entered or aliased.
     pub main_reentrant: bool,
+    /// The constructor type is an explicit generic argument of a function call.
+    pub generic_dispatches: usize,
 }
 
 /// Descriptor check of Guard 4 (`FnDefGhostTokenGuard`).
@@ -2424,6 +2563,9 @@ pub fn check_fndef_ghost_token_coercion(
     }
     if desc.call_sites > 0 && desc.main_reentrant {
         return Err(descriptor_violation(R::ReentrantMain));
+    }
+    if desc.generic_dispatches > 0 {
+        return Err(descriptor_violation(R::GenericConstructorDispatch));
     }
     Ok(())
 }
@@ -3041,7 +3183,13 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                     }
                 }
                 "loop" => {
-                    ctx.push(CtxKind::Repeat, CtxPhase::Header, st.depth(), false, t.start)?;
+                    ctx.push(
+                        CtxKind::Repeat,
+                        CtxPhase::Header,
+                        st.depth(),
+                        false,
+                        t.start,
+                    )?;
                 }
                 "while" => {
                     let phase = if lx.next_is_kw("let")? {
@@ -3068,7 +3216,13 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                         c.next()?;
                     }
                     if c.next_is_punct("{")? {
-                        ctx.push(CtxKind::Repeat, CtxPhase::Header, st.depth(), false, t.start)?;
+                        ctx.push(
+                            CtxKind::Repeat,
+                            CtxPhase::Header,
+                            st.depth(),
+                            false,
+                            t.start,
+                        )?;
                     }
                 }
                 "impl" => {
@@ -3081,6 +3235,28 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                     }
                 }
                 _ => {}
+            }
+        }
+        // A constructor type passed as a turbofish argument of a call
+        // (`mk::<Tokens>()`) lets a generic body (`T::new()`) mint it.
+        if t.is_ident() && !tables.is_ctor_type(t.text) && !t.is_kw("Self") {
+            let mut c = lx;
+            if c.eat_punct("::")? && c.next_is_punct("<")? {
+                let args_start = c.pos;
+                let lt = c.next()?;
+                let at = lt.map_or(c.pos, |x| x.start);
+                skip_angles(&mut c, at)?;
+                if c.next_is_punct("(")? {
+                    let mut a = lx.range(args_start, c.pos);
+                    while let Some(n) = a.next()? {
+                        if n.is_ident() && tables.is_ctor_type(n.text) {
+                            return violation(
+                                PeerViolationReason::GenericConstructorDispatch,
+                                n.start,
+                            );
+                        }
+                    }
+                }
             }
         }
         // Constructor references.
@@ -3112,7 +3288,9 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                     }
                 }
             }
-        } else if t.is_punct("<") {
+        } else if t.is_punct("<")
+            && !matches!(prev, Some(p) if p.is_punct("::") || p.is_ident() || p.is_punct(">"))
+        {
             let mut c = lx;
             let mut angle = 1usize;
             let mut ty: Option<&'a str> = None;
@@ -3319,21 +3497,17 @@ pub fn check_external_type_drop_omission_source(src: &str) -> GResult<()> {
                             opaque = true;
                             let s = c.pos;
                             let close = skip_group(&mut c, &n)?;
-                            for_each_field(
-                                body.range(s, close),
-                                n.is_punct("("),
-                                &mut |field| {
-                                    if !type_is_transparent(field.ty, &drops, 0)? {
-                                        let mut f = field.ty;
-                                        while let Some(tok) = f.next()? {
-                                            if tok.is_ident() && drops.contains_first(tok.text) {
-                                                field_drop = true;
-                                            }
+                            for_each_field(body.range(s, close), n.is_punct("("), &mut |field| {
+                                if !type_is_transparent(field.ty, &drops, 0)? {
+                                    let mut f = field.ty;
+                                    while let Some(tok) = f.next()? {
+                                        if tok.is_ident() && drops.contains_first(tok.text) {
+                                            field_drop = true;
                                         }
                                     }
-                                    Ok(())
-                                },
-                            )?;
+                                }
+                                Ok(())
+                            })?;
                         }
                     }
                 } else {
@@ -3946,6 +4120,15 @@ pub fn check_assumption_polarity_source(src: &str) -> GResult<()> {
                 continue;
             }
         }
+        if t.is_kw("fn") {
+            if let Some(sig) = scan_fn_signature(lx, false)? {
+                if let Some(clauses) = sig.clauses {
+                    for_each_sig_clause(clauses, &mut |kind, seg| {
+                        PolarityVisitor.visit_clause(kind, seg)
+                    })?;
+                }
+            }
+        }
         st.feed(&t)?;
     }
     st.finish(src.len())?;
@@ -4100,6 +4283,9 @@ pub struct StructSealingDescriptor {
     pub derives_default: bool,
     /// `impl Default` exists.
     pub default_impl: bool,
+    /// An unchecked constructor trait (`Deserialize`, `FromBytes`, `Pod`, ...)
+    /// is derived or implemented.
+    pub unchecked_constructor_trait: bool,
     /// A public function builds the raw structure without a
     /// `#[smart_constructor]` gate.
     pub raw_public_constructor: bool,
@@ -4122,6 +4308,9 @@ pub fn check_struct_sealing(
     if desc.default_impl {
         return Err(descriptor_violation(R::InvariantDefaultImpl));
     }
+    if desc.unchecked_constructor_trait {
+        return Err(descriptor_violation(R::InvariantUncheckedConstructorTrait));
+    }
     if desc.raw_public_constructor {
         return Err(descriptor_violation(R::InvariantRawPublicConstructor));
     }
@@ -4130,10 +4319,7 @@ pub fn check_struct_sealing(
 
 const MAX_INVARIANT_STRUCTS: usize = 32;
 
-fn inv_entry_kind<'a>(
-    invs: &PairTable<'a, MAX_INVARIANT_STRUCTS>,
-    name: &str,
-) -> Option<&'a str> {
+fn inv_entry_kind<'a>(invs: &PairTable<'a, MAX_INVARIANT_STRUCTS>, name: &str) -> Option<&'a str> {
     invs.entries()
         .iter()
         .find(|&&(n, _)| n == name)
@@ -4358,6 +4544,12 @@ pub fn check_struct_sealing_source(src: &str) -> GResult<()> {
                 if flags.derive_default {
                     return violation(PeerViolationReason::InvariantDeriveDefault, t.start);
                 }
+                if flags.derive_unchecked {
+                    return violation(
+                        PeerViolationReason::InvariantUncheckedConstructorTrait,
+                        t.start,
+                    );
+                }
                 if let Some(body) = item.body {
                     for_each_field(body, item.tuple, &mut |field| {
                         if field.is_pub {
@@ -4491,6 +4683,14 @@ fn sealing_pass<'a>(
                 if h.trait_last == Some("Default") && invs.contains_first(h.self_ty) {
                     return violation(PeerViolationReason::InvariantDefaultImpl, t.start);
                 }
+                if matches!(h.trait_last, Some(tr) if UNCHECKED_CONSTRUCTOR_TRAITS.contains(&tr))
+                    && invs.contains_first(h.self_ty)
+                {
+                    return violation(
+                        PeerViolationReason::InvariantUncheckedConstructorTrait,
+                        t.start,
+                    );
+                }
             }
             in_impl_header = true;
             impl_pending = h;
@@ -4521,9 +4721,32 @@ fn sealing_pass<'a>(
             let s = c.pos;
             let close = skip_group(&mut c, &open)?;
             let body = lx.range(s, close);
+            // A function whose impl or signature names the invariant type and whose
+            // body materializes raw bits (`transmute`, `zeroed`, ...) is a raw
+            // constructor too.
+            let mut names_inv = self_kind.is_some();
+            {
+                let mut sc = lx.range(lx.pos, open.start);
+                while let Some(n) = sc.next()? {
+                    names_inv |= n.is_ident() && invs.contains_first(n.text);
+                }
+            }
+            let mut materializes = None;
+            if names_inv {
+                let mut bc = body;
+                while let Some(n) = bc.next()? {
+                    if n.is_ident() && RAW_MATERIALIZERS.contains(&n.text) {
+                        materializes = Some(n.start);
+                        break;
+                    }
+                }
+            }
             let hit = match body_constructs_raw(body, invs, self_kind)? {
                 Some(at) => Some(at),
-                None => body_calls_tainted(body, tainted)?,
+                None => match materializes {
+                    Some(at) => Some(at),
+                    None => body_calls_tainted(body, tainted)?,
+                },
             };
             if let Some(at) = hit {
                 if public {
@@ -5762,6 +5985,88 @@ mod tests {
         assert_eq!(g6a("#[requires(x > 0, assumes_hold)] fn f(x: u8) {}"), None);
     }
 
+    #[test]
+    fn a1_verus_signature_clauses_are_scanned() {
+        let src = "verus! { #[verifier::external_body] pub fn read(p: *const u8) -> (r: u8) ensures false, { unimplemented!() } }";
+        assert_eq!(g3(src), Some(R::EnsuresFalseOnReturningFn));
+        let src =
+            "#[verifier::external_body] fn read() -> (r: u8) requires x > 0 ensures r > 0, false;";
+        assert_eq!(g3(src), Some(R::EnsuresFalseOnReturningFn));
+        assert_eq!(
+            g3("#[verifier::external_body] fn halt() -> (r: !) ensures false;"),
+            None
+        );
+        assert_eq!(
+            g3("#[verifier::external_body] fn read() -> (r: u8) requires false ensures false;"),
+            None
+        );
+        assert_eq!(
+            g3("#[verifier::external_body] fn read() -> (r: u8) ensures r > 0;"),
+            None
+        );
+        assert_eq!(
+            g6a("fn f(x: u8) -> (r: u8) requires assumes_hold ensures r > x { x }"),
+            None
+        );
+        assert_eq!(
+            g6a("fn f(x: u8) -> (r: u8) ensures r > x, assumes_hold { x }"),
+            Some(R::AssumptionPositive)
+        );
+        assert_eq!(
+            g6a("fn f(x: u8) -> (r: u8) requires !assumes_hold { x }"),
+            Some(R::AssumptionPositive)
+        );
+    }
+
+    #[test]
+    fn a1_g6b_unchecked_constructor_traits_and_raw_materializers() {
+        let inv = "#[invariant(self.0 > 0)] pub struct P(u32);";
+        for extra in [
+            "#[derive(serde::Deserialize)] #[invariant(self.0 > 0)] pub struct Q(u32);",
+            "#[invariant(self.0 > 0)] #[cfg_attr(feature = \"z\", derive(zerocopy::FromBytes))] pub struct Q(u32);",
+            "#[derive(Clone, bytemuck::Pod, bytemuck::Zeroable)] #[invariant(self.0 > 0)] pub struct Q(u32);",
+        ] {
+            assert_eq!(
+                g6b(extra),
+                Some(R::InvariantUncheckedConstructorTrait),
+                "{extra}"
+            );
+        }
+        let manual = std::format!("{inv} unsafe impl bytemuck::Zeroable for P {{}}");
+        assert_eq!(g6b(&manual), Some(R::InvariantUncheckedConstructorTrait));
+        let t = std::format!(
+            "{inv} impl P {{ pub fn zero() -> Self {{ unsafe {{ core::mem::zeroed() }} }} }}"
+        );
+        assert_eq!(g6b(&t), Some(R::InvariantRawPublicConstructor));
+        let t = std::format!(
+            "{inv} pub fn forge(x: u32) -> P {{ unsafe {{ core::mem::transmute(x) }} }}"
+        );
+        assert_eq!(g6b(&t), Some(R::InvariantRawPublicConstructor));
+        let t = std::format!(
+            "{inv} fn helper() -> P {{ unsafe {{ core::mem::transmute(0u32) }} }} pub fn mk() -> P {{ helper() }}"
+        );
+        assert_eq!(g6b(&t), Some(R::InvariantRawPublicConstructor));
+        let ok = std::format!(
+            "{inv} pub fn bits(f: f32) -> u32 {{ unsafe {{ core::mem::transmute(f) }} }}"
+        );
+        assert_eq!(g6b(&ok), None);
+        assert_eq!(
+            g6b(
+                "#[derive(Clone, Copy, PartialEq, Debug, Hash)] #[invariant(self.0 > 0)] pub struct Q(u32);"
+            ),
+            None
+        );
+        assert_eq!(
+            check_struct_sealing(&StructSealingDescriptor {
+                has_invariant: true,
+                unchecked_constructor_trait: true,
+                ..Default::default()
+            })
+            .map_err(|v| v.reason),
+            Err(R::InvariantUncheckedConstructorTrait)
+        );
+    }
+
     // --- Combined -------------------------------------------------------------
 
     #[test]
@@ -5861,12 +6166,15 @@ mod tests {
     #[test]
     fn g3_rejects_const_generic_scope_escape_and_shadowed_infallible() {
         // `{ 1 }` inside `impl<...>` must not prematurely close `#[extern_spec]` scope.
-        let src = "#[extern_spec] impl<T: Trait<{ 1 }>> Foo<T> { #[ensures(false)] fn read() -> u8; }";
+        let src =
+            "#[extern_spec] impl<T: Trait<{ 1 }>> Foo<T> { #[ensures(false)] fn read() -> u8; }";
         assert_eq!(g3(src), Some(R::EnsuresFalseOnReturningFn));
         // Local `struct Infallible(u8)` must not spoof `core::convert::Infallible`.
-        let shadowed = "struct Infallible(u8); #[trusted] #[ensures(false)] fn read() -> Infallible;";
+        let shadowed =
+            "struct Infallible(u8); #[trusted] #[ensures(false)] fn read() -> Infallible;";
         assert_eq!(g3(shadowed), Some(R::EnsuresFalseOnReturningFn));
-        let shadowed_type = "type Infallible = u8; #[trusted] #[ensures(false)] fn read() -> Infallible;";
+        let shadowed_type =
+            "type Infallible = u8; #[trusted] #[ensures(false)] fn read() -> Infallible;";
         assert_eq!(g3(shadowed_type), Some(R::EnsuresFalseOnReturningFn));
         let qualified = "struct Infallible(u8); #[trusted] #[ensures(false)] fn abort() -> core::convert::Infallible;";
         assert_eq!(g3(qualified), None);
@@ -5917,7 +6225,9 @@ mod tests {
         );
         // `fn main` inside `impl` / `mod` is NOT the crate entry point.
         assert_eq!(
-            g4("struct S; impl S { pub fn main(&self) { let _t = Tokens::new(); } } fn c(s: &S) { s.main(); s.main(); }"),
+            g4(
+                "struct S; impl S { pub fn main(&self) { let _t = Tokens::new(); } } fn c(s: &S) { s.main(); s.main(); }"
+            ),
             Some(R::MintOutsideMain)
         );
         assert_eq!(
@@ -5954,7 +6264,11 @@ mod tests {
         use SourceDialect::{Lean, Rust};
         // `if cond { !assumes_hold } else { true } ==> Q` puts `!assumes_hold` in antecedent.
         assert_eq!(
-            expr("if cond { !assumes_hold } else { true } ==> Q", Rust, Positive),
+            expr(
+                "if cond { !assumes_hold } else { true } ==> Q",
+                Rust,
+                Positive
+            ),
             Some(R::AssumptionNegatedAntecedent)
         );
         // Lean dependent arrow `(h : assumesHold) → P` is clean; negated is rejected.
@@ -5977,7 +6291,9 @@ mod tests {
         );
         // Unannotated `abbrev` and equation-style `def` bodies are checked.
         assert_eq!(
-            reason(check_assumption_polarity_lean_source("abbrev Bad := assumesHold")),
+            reason(check_assumption_polarity_lean_source(
+                "abbrev Bad := assumesHold"
+            )),
             Some(R::AssumptionPositive)
         );
         assert_eq!(
@@ -5997,49 +6313,89 @@ mod tests {
         );
         // Type alias & `use ... as` alias leaks.
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); type P = Pos; pub fn leak() -> P { P(0) }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos(u32); type P = Pos; pub fn leak() -> P { P(0) }"
+            ),
             Some(R::InvariantRawPublicConstructor)
         );
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); type P = Pos; impl Default for P { fn default() -> Self { Self(0) } }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos(u32); type P = Pos; impl Default for P { fn default() -> Self { Self(0) } }"
+            ),
             Some(R::InvariantDefaultImpl)
         );
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); use self::Pos as P; impl P { pub fn leak() -> Self { Self(0) } }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos(u32); use self::Pos as P; impl P { pub fn leak() -> Self { Self(0) } }"
+            ),
             Some(R::InvariantRawPublicConstructor)
         );
         // Turbofish raw construction.
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos<T>(u32, core::marker::PhantomData<T>); pub fn leak<T>() -> Pos<T> { Pos::<T>(0, core::marker::PhantomData) }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos<T>(u32, core::marker::PhantomData<T>); pub fn leak<T>() -> Pos<T> { Pos::<T>(0, core::marker::PhantomData) }"
+            ),
             Some(R::InvariantRawPublicConstructor)
         );
         // Tuple-struct constructor coerced as a function value.
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); pub fn leak() -> fn(u32) -> Pos { Pos }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos(u32); pub fn leak() -> fn(u32) -> Pos { Pos }"
+            ),
             Some(R::InvariantRawPublicConstructor)
         );
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); pub fn leak(x: u32) -> Pos { let mk = Pos; mk(x) }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos(u32); pub fn leak(x: u32) -> Pos { let mk = Pos; mk(x) }"
+            ),
             Some(R::InvariantRawPublicConstructor)
         );
         // Tainted private helper called via turbofish or coerced as a fn value.
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); impl Pos { fn raw<T>(x: u32) -> Self { Self(x) } pub fn leak(x: u32) -> Self { Self::raw::<()>(x) } }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos(u32); impl Pos { fn raw<T>(x: u32) -> Self { Self(x) } pub fn leak(x: u32) -> Self { Self::raw::<()>(x) } }"
+            ),
             Some(R::InvariantRawPublicConstructor)
         );
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); impl Pos { fn raw(x: u32) -> Self { Self(x) } pub fn leak() -> fn(u32) -> Self { Self::raw } }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos(u32); impl Pos { fn raw(x: u32) -> Self { Self(x) } pub fn leak() -> fn(u32) -> Self { Self::raw } }"
+            ),
             Some(R::InvariantRawPublicConstructor)
         );
         // Private `const` holding a raw construction leaked by a public fn.
         assert_eq!(
-            g6b("#[invariant(self.0 > 0)] pub struct Pos(u32); const BAD: Pos = Pos(0); pub fn leak() -> Pos { BAD }"),
+            g6b(
+                "#[invariant(self.0 > 0)] pub struct Pos(u32); const BAD: Pos = Pos(0); pub fn leak() -> Pos { BAD }"
+            ),
             Some(R::InvariantRawPublicConstructor)
         );
         // Const generic `{ 1 }` inside `impl` header must not drop `self_kind`.
         assert_eq!(
-            g6b("#[invariant(self.lo <= self.hi)] pub struct R<T> { lo: u32, hi: u32, _m: core::marker::PhantomData<T> } impl<T: Trait<{ 1 }>> R<T> { pub fn leak() -> Self { Self { lo: 1, hi: 0, _m: core::marker::PhantomData } } }"),
+            g6b(
+                "#[invariant(self.lo <= self.hi)] pub struct R<T> { lo: u32, hi: u32, _m: core::marker::PhantomData<T> } impl<T: Trait<{ 1 }>> R<T> { pub fn leak() -> Self { Self { lo: 1, hi: 0, _m: core::marker::PhantomData } } }"
+            ),
             Some(R::InvariantRawPublicConstructor)
+        );
+    }
+
+    #[test]
+    fn a1_g4_generic_constructor_dispatch() {
+        assert_eq!(
+            g4("fn mk<T: Mint>() -> T { T::new() } fn main() { mk::<Tokens>(); mk::<Tokens>(); }"),
+            Some(R::GenericConstructorDispatch)
+        );
+        assert_eq!(
+            g4("fn main() { let v = Vec::<Tokens>::new(); let _t = Tokens::new(); }"),
+            None
+        );
+        assert_eq!(
+            check_fndef_ghost_token_coercion(&GhostTokenUsageDescriptor {
+                generic_dispatches: 1,
+                ..Default::default()
+            })
+            .map_err(|v| v.reason),
+            Err(R::GenericConstructorDispatch)
         );
     }
 }

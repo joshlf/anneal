@@ -604,6 +604,13 @@ def recAnchored (env : Env) (R : RecMeta) : Bool :=
   !R.all.isEmpty && decide R.all.Nodup && R.all.all (isInductIn env) &&
     R.rules.all (recRuleAnchored env R.all)
 
+/-- The stored constant named `n` exists and is an inductive, constructor, or recursor
+    (a kernel-generated constant may be neither dropped nor replaced by another kind). -/
+def storedFamilyAt (env : Env) (n : ConstName) : Bool :=
+  match lookup env n with
+  | some d => d.isInductFamily
+  | none => false
+
 /-- Check `p` on every stored `.inductInfo`. -/
 def forallInduct (env : Env) (p : InductMeta → Bool) : Bool :=
   env.all (fun c => match c with
@@ -672,6 +679,7 @@ inductive InductiveReplayViolationCode : Type where
   | postReplayInductMismatch
   | postReplayCtorMismatch
   | recursorMismatch
+  | kernelConstantDropped
   deriving DecidableEq, Repr, Inhabited
 
 namespace InductiveReplayViolationCode
@@ -695,23 +703,25 @@ def wireId : InductiveReplayViolationCode → String
   | .postReplayInductMismatch => "post_replay_induct_mismatch"
   | .postReplayCtorMismatch => "post_replay_ctor_mismatch"
   | .recursorMismatch => "recursor_mismatch"
+  | .kernelConstantDropped => "kernel_constant_dropped"
 
 def all : List InductiveReplayViolationCode :=
   [.missingConstNameEntry, .keyMismatch, .duplicateConstName, .constantHasOpenExpr,
     .selfNotInAll, .emptyAll, .duplicateInAll, .nonInductInAll, .mutualMetadataMismatch,
     .duplicateInCtors, .nonCtorInCtors, .ctorInductMismatch, .ctorCidxMismatch,
     .danglingCtorNotListedInInduct, .danglingRecursor, .postReplayInductMismatch,
-    .postReplayCtorMismatch, .recursorMismatch]
+    .postReplayCtorMismatch, .recursorMismatch, .kernelConstantDropped]
 
 /-- Codes checked against the kernel-generated environment after replay. -/
 def isPostReplay : InductiveReplayViolationCode → Bool
-  | .postReplayInductMismatch | .postReplayCtorMismatch | .recursorMismatch => true
+  | .postReplayInductMismatch | .postReplayCtorMismatch | .recursorMismatch
+  | .kernelConstantDropped => true
   | _ => false
 
 theorem mem_all (c : InductiveReplayViolationCode) : c ∈ all := by
   cases c <;> decide
 
-theorem all_length : all.length = 18 := rfl
+theorem all_length : all.length = 19 := rfl
 
 theorem all_nodup : all.Nodup := by decide
 
@@ -752,6 +762,8 @@ def codeCheck : InductiveReplayViolationCode → ModuleData → Env → Bool
     forallCtor md.constants (fun C => lookup kenv C.name == some (.ctorInfo C))
   | .recursorMismatch, md, kenv =>
     forallRec md.constants (fun R => lookup kenv R.name == some (.recInfo R))
+  | .kernelConstantDropped, md, kenv =>
+    kenv.all (fun c => !c.isInductFamily || storedFamilyAt md.constants c.name)
 
 /-- Pre-replay structural invariants plus post-replay agreement of every stored
     inductive, constructor, and recursor with the kernel-generated environment. -/
@@ -955,6 +967,7 @@ inductive ForgedInductiveClass : Type where
   | postReplayInductDrift
   | postReplayCtorDrift
   | postReplayRecDrift
+  | droppedKernelConstant
   deriving DecidableEq, Repr
 
 /-- The diagnostic code each forgery class is reported under. -/
@@ -977,13 +990,14 @@ def ForgedInductiveClass.code : ForgedInductiveClass → InductiveReplayViolatio
   | .postReplayInductDrift => .postReplayInductMismatch
   | .postReplayCtorDrift => .postReplayCtorMismatch
   | .postReplayRecDrift => .recursorMismatch
+  | .droppedKernelConstant => .kernelConstantDropped
 
 def ForgedInductiveClass.all : List ForgedInductiveClass :=
   [.missingConstNameEntry, .keyMismatch, .duplicateConstName, .openExpression,
     .selfNotInAll, .emptyAll, .duplicateInAll, .nonInductInAll, .mutualMetadataMismatch,
     .duplicateInCtors, .nonCtorInCtors, .wrongParentCtor, .wrongCidxCtor,
     .danglingCtorInfo, .danglingRecInfo, .postReplayInductDrift, .postReplayCtorDrift,
-    .postReplayRecDrift]
+    .postReplayRecDrift, .droppedKernelConstant]
 
 theorem ForgedInductiveClass.all_map_code :
     ForgedInductiveClass.all.map ForgedInductiveClass.code = InductiveReplayViolationCode.all :=
@@ -1035,6 +1049,9 @@ def Exhibits : ForgedInductiveClass → ModuleData → Env → Prop
     ∃ C, .ctorInfo C ∈ md.constants ∧ lookup kenv C.name ≠ some (.ctorInfo C)
   | .postReplayRecDrift, md, kenv =>
     ∃ R, .recInfo R ∈ md.constants ∧ lookup kenv R.name ≠ some (.recInfo R)
+  | .droppedKernelConstant, md, kenv =>
+    ∃ c ∈ kenv, c.isInductFamily = true ∧
+      ∀ d, lookup md.constants c.name = some d → d.isInductFamily = false
 
 theorem isInductIn_eq_false {env : Env} {n : ConstName}
     (h : ∀ J, lookup env n ≠ some (.inductInfo J)) : isInductIn env n = false := by
@@ -1167,6 +1184,16 @@ theorem codeCheck_eq_false_of_exhibits {md : ModuleData} {kenv : Env}
   | postReplayRecDrift =>
     obtain ⟨R, hR, hNe⟩ := h
     exact forallRec_eq_false hR (beq_some_eq_false hNe)
+  | droppedKernelConstant =>
+    obtain ⟨c, hc, hFam, hNot⟩ := h
+    refine all_eq_false_of_mem hc ?_
+    have hAt : storedFamilyAt md.constants c.name = false := by
+      unfold storedFamilyAt
+      split
+      · rename_i d hd
+        exact hNot d hd
+      · rfl
+    simp [hFam, hAt]
 
 /-- **`InductiveReplayWellFormed` rejects every forged-inductive class**, and reports
     the class's exact diagnostic code. -/
@@ -1177,6 +1204,30 @@ theorem inductiveReplayWellFormed_rejects {md : ModuleData} {kenv : Env}
   refine ⟨fun hWF => ?_, mem_inductiveReplayViolations.mpr hFalse⟩
   rw [hWF cls.code] at hFalse
   cases hFalse
+
+theorem lookup_some_mem {env : Env} {n : ConstName} {d : RConstInfo}
+    (h : lookup env n = some d) : d ∈ env ∧ d.name = n := by
+  unfold lookup at h
+  have hFound := List.find?_some h
+  exact ⟨List.mem_of_find?_eq_some h, eq_of_beq hFound⟩
+
+/-- **Two-sided restoration.** In a well-formed module whose kernel environment has
+    distinct names, every kernel-generated inductive, constructor, and recursor is stored
+    exactly: nothing is dropped, replaced by another kind, or drifted. -/
+theorem inductiveReplayWellFormed_kernel_exact {md : ModuleData} {kenv : Env}
+    (h : InductiveReplayWellFormed md kenv) (hNodup : (kenv.map RConstInfo.name).Nodup) :
+    ∀ c ∈ kenv, c.isInductFamily = true → lookup md.constants c.name = some c := by
+  intro c hc hFam
+  have hAll := List.all_eq_true.mp (h .kernelConstantDropped) c hc
+  simp only [hFam, Bool.not_true, Bool.false_or] at hAll
+  unfold storedFamilyAt at hAll
+  split at hAll
+  · rename_i d hd
+    obtain ⟨hdMem, hdName⟩ := lookup_some_mem hd
+    have hK := inductiveReplayWellFormed_kernel_agreement h d hdMem hAll
+    rw [hdName, lookup_self_of_nodup kenv hNodup c hc] at hK
+    rw [hd, hK]
+  · cases hAll
 
 /-- An inductive-family constant the kernel never regenerated is rejected by the
     unconditional post-replay sweep. -/
@@ -1346,6 +1397,9 @@ def strictConstCompat : RConstInfo → RConstInfo → Bool
   | .ctorInfo C, .ctorInfo C' => C == C'
   | .recInfo R, .recInfo R' => R == R'
   | _, _ => false
+
+/-- `constInfoCompat`: the name the reconciler uses for `strictConstCompat`. -/
+abbrev constInfoCompat : RConstInfo → RConstInfo → Bool := strictConstCompat
 
 theorem strictConstCompat_iff_eq (a b : RConstInfo) : strictConstCompat a b = true ↔ a = b := by
   cases a <;> cases b <;> simp [strictConstCompat, and_assoc]
@@ -2496,6 +2550,9 @@ inductive PublicExportKind : Type where
   | privateForwarder
   | unqualifiedMk
   | openRenaming
+  /-- A derived or hand-written unchecked builder (deserialization, byte
+      reinterpretation, fuzzing) that never runs a smart constructor. -/
+  | uncheckedTraitBuilder
   | smartConstructor
   | transform
   deriving DecidableEq, Repr
@@ -2619,7 +2676,8 @@ theorem leakKind_rejected {V : Type} {d : StructDecl V} {exps : List (PublicExpo
 
 theorem leakKinds_unsealed :
     [PublicExportKind.directMk, .derivingInhabited, .abbrevAlias, .carrierWrap,
-      .privateForwarder, .unqualifiedMk, .openRenaming].all (fun k => !k.isSealedKind) = true :=
+      .privateForwarder, .unqualifiedMk, .openRenaming, .uncheckedTraitBuilder].all
+      (fun k => !k.isSealedKind) = true :=
   rfl
 
 end Anneal.InductiveReplayAndPeerSpecGuards
