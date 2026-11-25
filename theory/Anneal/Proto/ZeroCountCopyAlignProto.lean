@@ -212,12 +212,16 @@ def copyRoundUpToAlign (bytes alignBytes : Nat) : Nat :=
   | true => bytes
   | false => Nat.add bytes (Nat.sub alignBytes (Nat.mod bytes alignBytes))
 
-/-- Extract validated `(size, align)` from a `TypeLayout`, enforcing both Rust's
-power-of-two alignment invariant and `size % align == 0` (`Size.isMultipleOfAlign`,
-B2). -/
+/-- Extract validated `(size, align)` from a `TypeLayout`, rejecting
+uninstantiated parametric placeholder slots (`TypeLayout.isParamPlaceholder`,
+B4) and enforcing Rust's power-of-two alignment invariant and
+`size % align == 0` (`Size.isMultipleOfAlign`, B2). -/
 @[reducible]
 def validatedLayoutSizeAlign? (l : TypeLayout) : Option (Nat × Nat) :=
-  match Bool.and (isPowTwoAlign l.align.bytes) (Size.isMultipleOfAlign l.size l.align) with
+  match
+    Bool.and (Bool.not (TypeLayout.isParamPlaceholder l))
+      (Bool.and (isPowTwoAlign l.align.bytes) (Size.isMultipleOfAlign l.size l.align))
+  with
   | true => .some (l.size.bytes, l.align.bytes)
   | false => .none
 
@@ -251,17 +255,60 @@ def isWidePtrBackendRepr : BackendRepr → Bool
   | .scalarPair (.union (.pointer _)) _ => true
   | _ => false
 
-/-- Validate that a `TypeLayout` `l` is structurally compatible with `kind` on a
-`ptrBytes`-byte target (B2): prevents synthetic `layoutIdx := 0` entries (such
-as `entries[0] = unitLayout`) or mismatched primitive layout indices from
-hijacking primitives, pointers, or arrays. When `isAuth = true` (extracted from
-an authoritative `ptrLayout.fieldLayouts` entry), a `#[repr(transparent)]` ADT
-at `layoutIdx = 0` is also accepted. -/
+/-- Fuel-bounded list check: whether any `LayoutIdx` in `fls` resolves to a
+placeholder layout in `layouts`. -/
+@[reducible]
+def copyAnyFieldLayoutHasPlaceholder
+    (recLayout : TypeLayout → Bool) (layouts : LayoutTable) :
+    List LayoutIdx → Bool
+  | .nil => false
+  | idx :: rest =>
+    match LayoutTable.lookup layouts idx with
+    | .some fl =>
+      match recLayout fl with
+      | true => true
+      | false => copyAnyFieldLayoutHasPlaceholder recLayout layouts rest
+    | .none => copyAnyFieldLayoutHasPlaceholder recLayout layouts rest
+
+/-- Whether `l` is an uninstantiated generic placeholder slot
+(`TypeLayout.isParamPlaceholder l = true`, emitted by `rustc-capture` for
+`ty::Param`) or a non-pointer compound layout (`[T; n]`, `(T, u8)`,
+`Wrapper<T>`, `MaybeUninit<T>`, closure — lowered with synthetic `size = 0,
+align = 1` before `LayoutTable.appendParamLayouts`) whose `fieldLayouts`
+transitively reference a placeholder slot (B4). Stops at thin/wide pointer
+representations so recursive concrete structs (`struct Node { next: *mut Node }`)
+never cycle and concrete pointer layouts are preserved. -/
+@[reducible]
+def copyLayoutHasPlaceholder (layouts : LayoutTable) : Nat → TypeLayout → Bool
+  | .zero, _ => false
+  | .succ fuel', l =>
+    match TypeLayout.isParamPlaceholder l with
+    | true => true
+    | false =>
+      match Bool.or (isThinPtrBackendRepr l.backendRepr) (isWidePtrBackendRepr l.backendRepr) with
+      | true => false
+      | false =>
+        copyAnyFieldLayoutHasPlaceholder (copyLayoutHasPlaceholder layouts fuel') layouts
+          l.fieldLayouts
+
+/-- Validate that a `TypeLayout` `l` is concrete (not an uninstantiated
+parametric placeholder, B4) and structurally compatible with `kind` on a
+`ptrBytes`-byte target (B2/B3): prevents synthetic `layoutIdx := 0` entries (such
+as `entries[0] = unitLayout`), mismatched primitive layout indices, corrupted
+array/wide-pointer entries, or pre-monomorphization `size = 0, align = 1`
+generic compound layouts from hijacking primitives, pointers, arrays, tuples,
+or ADTs. When `isAuth = true` (extracted from an authoritative
+`ptrLayout.fieldLayouts` entry), a concrete `#[repr(transparent)]` ADT at
+`layoutIdx = 0` is also accepted. -/
 @[reducible]
 def copyLayoutMatchesRigidTy?
-    (ptrBytes : Nat) (isAuth : Bool) (layoutIdx : Nat) (kind : RigidTy) (l : TypeLayout) :
+    (layouts : LayoutTable) (ptrBytes : Nat) (isAuth : Bool) (layoutIdx : Nat) (kind : RigidTy)
+    (l : TypeLayout) :
     Bool :=
-  match Bool.and (isPowTwoAlign l.align.bytes) (Size.isMultipleOfAlign l.size l.align) with
+  match
+    Bool.and (Bool.not (copyLayoutHasPlaceholder layouts 8 l))
+      (Bool.and (isPowTwoAlign l.align.bytes) (Size.isMultipleOfAlign l.size l.align))
+  with
   | false => false
   | true =>
     match kind with
@@ -342,7 +389,7 @@ def copyFindDeclLayout?
         | true =>
           match LayoutTable.lookup layouts decl.ty.layoutIdx with
           | .some l =>
-            match copyLayoutMatchesRigidTy? ptrBytes false decl.ty.layoutIdx ty l with
+            match copyLayoutMatchesRigidTy? layouts ptrBytes false decl.ty.layoutIdx ty l with
             | true => .some l
             | false => go rest
           | .none => go rest
@@ -525,7 +572,7 @@ def directTyLayout? (layouts : LayoutTable) (ty : Ty) : Option TypeLayout :=
     match LayoutTable.lookup layouts ty.layoutIdx with
     | .none => .none
     | .some l =>
-      match copyLayoutMatchesRigidTy? (layoutPointerBytes layouts) false ty.layoutIdx ty.kind l with
+      match copyLayoutMatchesRigidTy? layouts (layoutPointerBytes layouts) false ty.layoutIdx ty.kind l with
       | true => .some l
       | false => .none
 
@@ -552,7 +599,7 @@ def copyTySizeAndAlign?
   | false =>
     match authLayoutOpt with
     | .some l =>
-      match copyLayoutMatchesRigidTy? ptrBytes true ty.layoutIdx ty.kind l with
+      match copyLayoutMatchesRigidTy? layouts ptrBytes true ty.layoutIdx ty.kind l with
       | true => validatedLayoutSizeAlign? l
       | false => .none
     | .none =>
@@ -1060,11 +1107,11 @@ def resolveSinglePointeeLayout
   (catches `bdCopyZeroScalars` and `copy_nonoverlapping(ptr, 8_u64, 0)` even with
   `localDecls = []`); unnormalized `.alias` / `.param` / non-`Box` ADT operand
   types are `.unknown` (A1), never `.ub`;
-* both operands have pointees:
-  - if `copyPointeeSizesConflict` → `.unsupported`;
-  - if both are unsized and `rigidTyEq` → `.ub`;
-  - if `rigidTyEq`: resolve both; if one side has an authoritative layout and
-    they disagree → `.unsupported`, else return the resolved layout;
+* both operands have pointees (B4: drops redundant `copyPointeeSizesConflict`,
+  eliminating both `V2026_08_01` semantic drift via `tyByteSizeAndAlignAux` and
+  `unitLayout` false conflicts when `localDecls = []`):
+  - if `rigidTyEq`: resolve both; if both resolve and disagree → `.unsupported`,
+    if either is unsized → `.ub`, else return whichever side resolved;
   - if not `rigidTyEq`: require both to resolve to `.ok` with equal
     `(elemSize, elemAlign)`, else `.unsupported`;
 * one operand known, one `.unknown` (missing decl) → resolve the known one;
@@ -1081,33 +1128,30 @@ def resolveCopyElemLayout
   | .pointee sp sAuth, .unknown => resolveSinglePointeeLayout localDecls layouts sp sAuth
   | .unknown, .pointee dp dAuth => resolveSinglePointeeLayout localDecls layouts dp dAuth
   | .pointee sp sAuth, .pointee dp dAuth =>
-    match copyPointeeSizesConflict localDecls layouts (.some sp) (.some dp) with
-    | true => .unsupported
+    match rigidTyEq sp.kind dp.kind with
+    | true =>
+      let rS := resolveSinglePointeeLayout localDecls layouts sp sAuth
+      let rD := resolveSinglePointeeLayout localDecls layouts dp dAuth
+      match rS, rD with
+      | .ok sSz sAl, .ok dSz dAl =>
+        match Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) with
+        | true => .ok sSz sAl
+        | false => .unsupported
+      | .ok sSz sAl, .unsupported => .ok sSz sAl
+      | .unsupported, .ok dSz dAl => .ok dSz dAl
+      | .ub, _ => .ub
+      | _, .ub => .ub
+      | .unsupported, .unsupported => .unsupported
     | false =>
-      match rigidTyEq sp.kind dp.kind with
-      | true =>
-        let rS := resolveSinglePointeeLayout localDecls layouts sp sAuth
-        let rD := resolveSinglePointeeLayout localDecls layouts dp dAuth
-        match rS, rD with
-        | .ok sSz sAl, .ok dSz dAl =>
-          match Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) with
-          | true => .ok sSz sAl
-          | false => .unsupported
-        | .ok sSz sAl, .unsupported => .ok sSz sAl
-        | .unsupported, .ok dSz dAl => .ok dSz dAl
-        | .ub, _ => .ub
-        | _, .ub => .ub
-        | .unsupported, .unsupported => .unsupported
-      | false =>
-        match
-          resolveSinglePointeeLayout localDecls layouts sp sAuth,
-          resolveSinglePointeeLayout localDecls layouts dp dAuth
-        with
-        | .ok sSz sAl, .ok dSz dAl =>
-          match Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) with
-          | true => .ok sSz sAl
-          | false => .unsupported
-        | _, _ => .unsupported
+      match
+        resolveSinglePointeeLayout localDecls layouts sp sAuth,
+        resolveSinglePointeeLayout localDecls layouts dp dAuth
+      with
+      | .ok sSz sAl, .ok dSz dAl =>
+        match Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) with
+        | true => .ok sSz sAl
+        | false => .unsupported
+      | _, _ => .unsupported
 
 /-! ## 5. Prototype evaluators -/
 
@@ -1402,44 +1446,41 @@ theorem resolveCopyElemLayout_align_pow2
   · exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ h
   · cases h
   · rename_i sp sAuth dp dAuth
-    cases hc : copyPointeeSizesConflict localDecls layouts (.some sp) (.some dp) <;>
-      rw [hc] at h <;> dsimp only at h
-    · cases heq : rigidTyEq sp.kind dp.kind <;> rw [heq] at h <;> dsimp only at h
-      · cases hRS : resolveSinglePointeeLayout localDecls layouts sp sAuth with
-        | ub => rw [hRS] at h; cases h
-        | unsupported => rw [hRS] at h; cases h
-        | ok sSz sAl =>
-          cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
-          | ub => rw [hRS, hRD] at h; cases h
-          | unsupported => rw [hRS, hRD] at h; cases h
-          | ok dSz dAl =>
-            rw [hRS, hRD] at h; dsimp only at h
-            cases hEq : Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) <;> rw [hEq] at h
-            · cases h
-            · cases h
-              exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRS
-      · cases hRS : resolveSinglePointeeLayout localDecls layouts sp sAuth with
-        | ub => rw [hRS] at h; cases h
-        | unsupported =>
-          cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
-          | ub => rw [hRS, hRD] at h; cases h
-          | unsupported => rw [hRS, hRD] at h; cases h
-          | ok dSz dAl =>
-            rw [hRS, hRD] at h; cases h
-            exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRD
-        | ok sSz sAl =>
-          cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
-          | ub => rw [hRS, hRD] at h; cases h
-          | unsupported =>
-            rw [hRS, hRD] at h; cases h
+    cases heq : rigidTyEq sp.kind dp.kind <;> rw [heq] at h <;> dsimp only at h
+    · cases hRS : resolveSinglePointeeLayout localDecls layouts sp sAuth with
+      | ub => rw [hRS] at h; cases h
+      | unsupported => rw [hRS] at h; cases h
+      | ok sSz sAl =>
+        cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
+        | ub => rw [hRS, hRD] at h; cases h
+        | unsupported => rw [hRS, hRD] at h; cases h
+        | ok dSz dAl =>
+          rw [hRS, hRD] at h; dsimp only at h
+          cases hEq : Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) <;> rw [hEq] at h
+          · cases h
+          · cases h
             exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRS
-          | ok dSz dAl =>
-            rw [hRS, hRD] at h; dsimp only at h
-            cases hEq : Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) <;> rw [hEq] at h
-            · cases h
-            · cases h
-              exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRS
-    · cases h
+    · cases hRS : resolveSinglePointeeLayout localDecls layouts sp sAuth with
+      | ub => rw [hRS] at h; cases h
+      | unsupported =>
+        cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
+        | ub => rw [hRS, hRD] at h; cases h
+        | unsupported => rw [hRS, hRD] at h; cases h
+        | ok dSz dAl =>
+          rw [hRS, hRD] at h; cases h
+          exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRD
+      | ok sSz sAl =>
+        cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
+        | ub => rw [hRS, hRD] at h; cases h
+        | unsupported =>
+          rw [hRS, hRD] at h; cases h
+          exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRS
+        | ok dSz dAl =>
+          rw [hRS, hRD] at h; dsimp only at h
+          cases hEq : Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) <;> rw [hEq] at h
+          · cases h
+          · cases h
+            exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRS
 
 /-- For a live stack borrow (`entry.allocDead = false`), the canonical address
 recorded in `zeroPtrView` agrees identically with `Trusted`'s `ptrAddress?`. -/
@@ -2029,12 +2070,14 @@ private theorem validatedLayoutSizeAlign?_pow2 {l : TypeLayout} {sz al : Nat}
     (h : validatedLayoutSizeAlign? l = some (sz, al)) :
     isPowTwoAlign al = true ∧ 1 ≤ al := by
   unfold validatedLayoutSizeAlign? at h
-  cases hp : isPowTwoAlign l.align.bytes <;> rw [hp] at h
+  cases hph : TypeLayout.isParamPlaceholder l <;> rw [hph] at h
+  · cases hp : isPowTwoAlign l.align.bytes <;> rw [hp] at h
+    · cases h
+    · cases hm : Size.isMultipleOfAlign l.size l.align <;> rw [hm] at h
+      · cases h
+      · cases h
+        exact ⟨hp, isPowTwoAlign_pos hp⟩
   · cases h
-  · cases hm : Size.isMultipleOfAlign l.size l.align <;> rw [hm] at h
-    · cases h
-    · cases h
-      exact ⟨hp, isPowTwoAlign_pos hp⟩
 
 private theorem PlaceAlignBound.max_pow2 {a b : PlaceAlignBound}
     (ha : isPowTwoAlign a.val = true) (hb : isPowTwoAlign b.val = true) :
@@ -3117,5 +3160,47 @@ theorem evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placemen
     have hsa' : Nat.mod srcAddr elemAlign = 0 := hsa
     have hda' : Nat.mod dstAddr elemAlign = 0 := hda
     rw [hsa', hda']
+
+/-- **Terminator-level all-placements refinement against `lean-miri` (B4)**:
+lifts `evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements`
+directly through `evalCopyNonOverlappingCallProto` (`finishMemIntrinsicCall`),
+proving that any stepping zero-byte direct call has a well-formed count scalar
+and satisfies `miriCopyWithRef = .noop` across every valid concrete placement
+of both pointer operands. -/
+theorem evalCopyNonOverlappingCallProto_zero_step_refines_miri_all_placements
+    (policy : ZeroCountNullPolicy) (s s' : MachineState)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (srcOp dstOp cOp : Operand) (srcVal dstVal : Value) (countSc : ScalarInt)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (elemSize elemAlign : Nat)
+    (hl : resolveCopyElemLayout bodyLocalDecls bodyLayouts srcOp dstOp = .ok elemSize elemAlign)
+    (hz : countSc.bits * elemSize = 0)
+    (hstep : evalCopyNonOverlappingCallProto policy s bodyLocalDecls bodyLayouts
+        [srcOp, dstOp, cOp] [srcVal, dstVal, .scalar countSc] locals' destination targetBb =
+        MirStepNode.step s') :
+    countScalarWellFormed (layoutPointerBytes bodyLayouts) countSc = true ∧
+      ∀ srcAddr dstAddr,
+        ConcretePtrAddr s bodyLocalDecls bodyLayouts srcVal srcAddr →
+        ConcretePtrAddr s bodyLocalDecls bodyLayouts dstVal dstAddr →
+        miriCopyWithRef (layoutPointerBytes bodyLayouts) countSc.bits elemSize elemAlign
+          srcAddr dstAddr = .noop := by
+  unfold evalCopyNonOverlappingCallProto at hstep
+  dsimp only at hstep
+  cases hwf : countScalarWellFormed (layoutPointerBytes bodyLayouts) countSc <;> rw [hwf] at hstep
+  · exact absurd hstep (fail_ne_step _ _)
+  · dsimp only at hstep
+    cases hMid : evalCopyNonOverlappingWithCountProto policy s srcOp dstOp bodyLocalDecls
+        bodyLayouts srcVal dstVal countSc.bits locals' with
+    | tau res =>
+      cases res with
+      | running sMid =>
+        have href := evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements
+          policy s sMid srcOp dstOp bodyLocalDecls bodyLayouts srcVal dstVal countSc.bits
+          elemSize elemAlign locals' hl hz hMid
+        exact ⟨rfl, href.2⟩
+      | halted _ => rw [hMid] at hstep; unfold finishMemIntrinsicCall at hstep; cases hstep
+      | faulted _ => rw [hMid] at hstep; unfold finishMemIntrinsicCall at hstep; cases hstep
+    | vis _ _ => rw [hMid] at hstep; unfold finishMemIntrinsicCall at hstep; cases hstep
+    | ret _ => rw [hMid] at hstep; unfold finishMemIntrinsicCall at hstep; cases hstep
 
 end Anneal.Proto.ZeroCountCopyAlign

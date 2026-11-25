@@ -1706,6 +1706,222 @@ theorem b3_end_to_end_mixed_stack_global_refines_miri :
     rfl
   · exact ⟨rfl, ⟨gBase, hg, rfl⟩⟩
 
+/-! ### B4: uninstantiated parametric placeholder soundness (`rustc-capture`
+`placeholder_param_layout` / `lower_parametric_compound_layout`), concrete
+monomorphization via `LayoutTable.appendParamLayouts`, cyclic concrete structs,
+`copyPointeeSizesConflict` removal (`unitLayout` false-conflict fix), and
+terminator-level all-placements Miri refinement -/
+
+def paramTK : RigidTy := .param 0 "T"
+def wrapperTK : RigidTy := .adt "proto::Wrapper" [paramTK]
+def maybeUninitTK : RigidTy := .adt "core::mem::MaybeUninit" [paramTK]
+def nodeK : RigidTy := .adt "proto::Node" []
+
+/-- Exact `placeholder_param_layout()` emitted by `rustc-capture`
+(`layout_lower.rs:993`) for `ty::Param` (`TypeLayout.isParamPlaceholder = true`). -/
+def paramPlaceholderLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def u8LayoutB4 : TypeLayout :=
+  { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- Exact `lower_parametric_compound_layout` outputs (`layout_lower.rs:280-370`)
+for `Wrapper<T>`, `[T; 4]`, `(T, u8)`, and `union MaybeUninit<T>`, all referencing
+placeholder slot `0` via `fieldLayouts` with synthetic `size = 0, align = 1`. -/
+def wrapperParamLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [0] }
+
+def arrayParamLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .array { bytes := 0 } 4, variants := .single 0,
+    isUninhabited := false, fieldLayouts := [0] }
+
+def tupleParamLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 0 }] [0, 1], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [0, 1] }
+
+def maybeUninitParamLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .union 2, variants := .single 0,
+    isUninhabited := false, fieldLayouts := [2, 0] }
+
+/-- Pointer layout pointing to `Wrapper<T>` (index `3`) or directly to placeholder `0`. -/
+def ptrToWrapperParamLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 },
+    backendRepr := .scalar (.union (.pointer 0)),
+    fields := .primitive, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [3] }
+
+def ptrToPlaceholderLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 },
+    backendRepr := .scalar (.union (.pointer 0)),
+    fields := .primitive, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [0] }
+
+/-- Entries: `0 = placeholder T`, `1 = u8`, `2 = ()`, `3 = Wrapper<T>`,
+`4 = [T; 4]`, `5 = (T, u8)`, `6 = MaybeUninit<T>`, `7 = *const Wrapper<T>`,
+`8 = *const TransparentPlaceholder`. -/
+def paramLayoutsTable : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [paramPlaceholderLayout, u8LayoutB4, unitLayout0, wrapperParamLayout,
+                arrayParamLayout, tupleParamLayout, maybeUninitParamLayout,
+                ptrToWrapperParamLayout, ptrToPlaceholderLayout] }
+
+def declWithIdx (k : RigidTy) (idx : Nat) : LocalDecl :=
+  { mutability := .mut, ty := { kind := k, layoutIdx := idx }, debugName := none }
+
+/-- Generic body decls with pre-monomorphization parametric layouts:
+`_1 : Wrapper<T>` (idx 3), `_2 : *const Wrapper<T>` (idx 7), `_3 : *mut Wrapper<T>` (idx 7),
+`_4 : [T; 4]` (idx 4), `_5 : *const [T; 4]`, `_6 : (T, u8)` (idx 5), `_7 : *const (T, u8)`,
+`_8 : MaybeUninit<T>` (idx 6), `_9 : *const MaybeUninit<T>`,
+`_10 : *const Wrapper<T>` with `fieldLayouts = [0]` (direct `placeholder_param_layout`). -/
+def paramDecls : List LocalDecl :=
+  [declWithIdx unitK 2,
+   declWithIdx wrapperTK 3,
+   declWithIdx (rawConstK wrapperTK) 7,
+   declWithIdx (rawMutK wrapperTK) 7,
+   declWithIdx (.array paramTK 4) 4,
+   declNL (rawConstK (.array paramTK 4)),
+   declWithIdx (.tuple [paramTK, u8K]) 5,
+   declNL (rawConstK (.tuple [paramTK, u8K])),
+   declWithIdx maybeUninitTK 6,
+   declNL (rawConstK maybeUninitTK),
+   declWithIdx (rawConstK wrapperTK) 8]
+
+/-- **Soundness (B4)**: pre-monomorphization `Wrapper<T>` (synthetic `size = 0,
+align = 1` with `fieldLayouts = [0]` pointing to `placeholder_param_layout`) MUST
+be `.unsupported` (A3 resolved it to `.ok 0 1` and stepped on `count = 5`, addr `1`!). -/
+theorem b4_param_wrapper_not_zst :
+    resolveCopyElemLayout paramDecls paramLayoutsTable (cp 2) (cp 3) = .unsupported ∧
+      evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (cp 3) paramDecls
+          paramLayoutsTable (danglingScalar 1) (danglingScalar 1) 5 st.frame.locals =
+        MirStepNode.fail .ub ∧
+      evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (cp 3) paramDecls
+          paramLayoutsTable (danglingScalar 1) (danglingScalar 1) 0 st.frame.locals =
+        MirStepNode.unsupported := by
+  exact ⟨by decide +kernel, by kernel_rfl, by kernel_rfl⟩
+
+/-- **Soundness (B4)**: pre-monomorphization `[T; 4]`, `(T, u8)`, `MaybeUninit<T>`,
+and a direct `placeholder_param_layout` `#[repr(transparent)]` wrapper all stay
+fail-closed `.unsupported` (never `.ok 0 1` ZST!). -/
+theorem b4_param_compounds_all_unsupported :
+    resolveCopyElemLayout paramDecls paramLayoutsTable (cp 5) (cp 5) = .unsupported ∧
+      resolveCopyElemLayout paramDecls paramLayoutsTable (cp 7) (cp 7) = .unsupported ∧
+      resolveCopyElemLayout paramDecls paramLayoutsTable (cp 9) (cp 9) = .unsupported ∧
+      resolveCopyElemLayout paramDecls paramLayoutsTable (cp 10) (cp 10) = .unsupported := by
+  decide +kernel
+
+/-- **Monomorphization round-trip (B4)**: once `LayoutTable.appendParamLayouts`
+instantiates `T = u64`, `Wrapper<T>` recomputes to concrete `(8, 8)`, resolves
+to `.ok 8 8`, rejects misaligned `4` as `.ub`, and steps cleanly on `8`. -/
+def monoU64Layouts : LayoutTable :=
+  LayoutTable.appendParamLayouts paramLayoutsTable [u64Layout]
+
+theorem b4_param_wrapper_after_appendParamLayouts_u64_resolves :
+    resolveCopyElemLayout paramDecls monoU64Layouts (cp 2) (cp 3) = .ok 8 8 ∧
+      evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (cp 3) paramDecls
+          monoU64Layouts (danglingScalar 4) (danglingScalar 8) 0 st.frame.locals =
+        MirStepNode.fail .ub ∧
+      evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (cp 3) paramDecls
+          monoU64Layouts (danglingScalar 8) (danglingScalar 8) 0 st.frame.locals = noop := by
+  exact ⟨by decide +kernel, by kernel_rfl, by kernel_rfl⟩
+
+/-- **Cyclic concrete struct (B4)**: `struct Node { next: *mut Node }` has cyclic
+`fieldLayouts` (`Node` ↔ `*mut Node`); because `copyLayoutHasPlaceholder` stops
+at thin/wide pointer representations, `Node` resolves cleanly to `.ok 8 8`. -/
+def nodeLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [2] }
+
+def ptrNodeLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 },
+    backendRepr := .scalar (.union (.pointer 0)),
+    fields := .primitive, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1] }
+
+def cyclicNodeLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [unitLayout0, nodeLayout, ptrNodeLayout] }
+
+def cyclicNodeDecls : List LocalDecl :=
+  [declWithIdx unitK 0, declWithIdx nodeK 1,
+   declWithIdx (rawConstK nodeK) 2, declWithIdx (rawMutK nodeK) 2]
+
+theorem b4_recursive_concrete_node_no_cycle :
+    copyLayoutHasPlaceholder cyclicNodeLayouts 8 nodeLayout = false ∧
+      resolveCopyElemLayout cyclicNodeDecls cyclicNodeLayouts (cp 2) (cp 3) = .ok 8 8 := by
+  decide +kernel
+
+/-- **False-conflict fix + drift elimination (B4)**: removing the redundant
+`copyPointeeSizesConflict` call fixes the `localDecls = []` + `entries[0] = unitLayout0`
+false conflict on constant pointer operands of the same ADT type (`src` with
+`ptrLayout.fieldLayouts = [1]` for `ReprC`, `dst` without `ptrLayout` — A3 returned
+`.unsupported` because `tyByteSize` hijacked `dp` to `unitLayout0` size `0`!),
+while distinct mismatched constant pointers (`*const u8` vs `*mut u64`) still
+return `.unsupported`. -/
+def ptrToReprC1Layout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 },
+    backendRepr := .scalar (.union (.pointer 0)),
+    fields := .primitive, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1] }
+
+def b4ConstPairLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [unitLayout0, reprCLayout, ptrToReprC1Layout] }
+
+def constPtrOp (k : RigidTy) (lIdx : Nat) : Operand :=
+  .constant { ty := { kind := k, layoutIdx := lIdx }, val := .scalar (.int ⟨8, 8⟩) }
+
+theorem b4_const_pair_ptr_no_unitLayout_false_conflict :
+    resolveCopyElemLayout [] b4ConstPairLayouts
+        (constPtrOp (rawConstK reprCK) 2) (constPtrOp (rawMutK reprCK) 99) = .ok 16 8 ∧
+      resolveCopyElemLayout [] b4ConstPairLayouts
+        (constPtrOp (rawConstK u8K) 99) (constPtrOp (rawMutK u64K) 99) = .unsupported := by
+  decide +kernel
+
+/-- **Terminator-level all-placements Miri refinement witness (B4)**: instantiates
+`evalCopyNonOverlappingCallProto_zero_step_refines_miri_all_placements` on a
+mixed live stack + live global zero-count direct call. -/
+theorem b4_call_mixed_stack_global_refines_miri :
+    ∀ sBase gBase, sBase % 8 = 0 → gBase % 8 = 0 →
+      miriCopyWithRef 8 0 8 8 (sBase + (0 + 0)) (gBase + 8) = .noop := by
+  intro sBase gBase hs hg
+  have hstep :
+      evalCopyNonOverlappingCallProto .rejectNull st (declsFor u64K u64K) emptyLayoutTable
+          [cp 2, cp 3, constUsize 0] [stackPtr 0, globalPtr 9 8, .scalar ⟨0, 8⟩]
+          st.frame.locals (loc 0) 1 =
+        MirStepNode.step
+          { frame := { blockIdx := 1, stmtIdx := 0,
+                       locals := [.init .unit, .init (.scalar ⟨42, 8⟩), .uninit, .uninit,
+                                  .init (.scalar ⟨7, 1⟩)] }
+            memory := st.memory } := by
+    kernel_rfl
+  have href := evalCopyNonOverlappingCallProto_zero_step_refines_miri_all_placements
+    .rejectNull st _ (declsFor u64K u64K) emptyLayoutTable (cp 2) (cp 3) (constUsize 0)
+    (stackPtr 0) (globalPtr 9 8) ⟨0, 8⟩ st.frame.locals (loc 0) 1 8 8
+    (by decide +kernel) rfl hstep
+  apply href.2 (sBase + (0 + 0)) (gBase + 8)
+  · refine ⟨rfl, ?_⟩
+    change ∃ actualRa base,
+      (∀ b, stackRootAlignBound? st (declsFor u64K u64K) emptyLayoutTable
+          { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique } = some b →
+        b.satisfies actualRa) ∧
+      base % actualRa = 0 ∧ sBase + (0 + 0) = base + (0 + 0)
+    refine ⟨8, sBase, fun b hb => ?_, hs, rfl⟩
+    have hrb : stackRootAlignBound? st (declsFor u64K u64K) emptyLayoutTable
+        { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique } =
+        some (.exact 8) := by decide +kernel
+    rw [hrb] at hb
+    cases hb
+    rfl
+  · exact ⟨rfl, ⟨gBase, hg, rfl⟩⟩
+
 /-! ## 12. Terminator-level call path inherits the fix -/
 
 /-- `evalCopyNonOverlappingCallProto` with a misaligned dangling `src` faults
@@ -2039,7 +2255,7 @@ elab "#zc_semantic_drift_audit" : command => do
   logInfo m!"{s!"semantic drift: affected direct helpers [{aff}]; source-different transitive declarations [{dif}]"}"
 
 /--
-info: semantic drift: affected direct helpers [borrowPlaceByteOffset?, copyPointeeSizesConflict, evalOperand]; source-different transitive declarations [decodeAtBorrowTargetOffset?, decodeValueFromBytes, encodeByLayoutIdxAux, encodeUnionFieldsWith, encodeUntypedValueToBytes, encodeValueToBytes, evalOperand, evalStackThinPtrTypedDerefRead, findDiscriminantVariantIdx?, inferValueByteSizeAux, inferValueCReprStep, layoutValidForResolvedAdt, mergeUnionTypedSlotsAux, readContainerProjectedValue, readProjectedValue, readProjectedValueUnionAware, resolveEnumDiscriminantForVariant, resolveEnumVariantIdxByTag, resolveStackThinPtrFieldOffsetProj?, resolveStackThinPtrTargetProjWithResidual?, tyByteAlignAux, tyByteSizeAndAlignAux, tyExactByteAlignAux, unionLayoutFreeOccupiedSlotCount, unionNonUnitNonZstTypedSlotCount, unionNonUnitTypedSlotCount, valueContainsUninit, valueContainsUnit, valueListContainsUninit]
+info: semantic drift: affected direct helpers [borrowPlaceByteOffset?, evalOperand]; source-different transitive declarations [decodeAtBorrowTargetOffset?, decodeValueFromBytes, encodeByLayoutIdxAux, encodeUnionFieldsWith, encodeUntypedValueToBytes, encodeValueToBytes, evalOperand, evalStackThinPtrTypedDerefRead, findDiscriminantVariantIdx?, inferValueByteSizeAux, inferValueCReprStep, layoutValidForResolvedAdt, mergeUnionTypedSlotsAux, readContainerProjectedValue, readProjectedValue, readProjectedValueUnionAware, resolveEnumDiscriminantForVariant, resolveEnumVariantIdxByTag, resolveStackThinPtrFieldOffsetProj?, resolveStackThinPtrTargetProjWithResidual?, tyByteAlignAux, tyByteSizeAndAlignAux, tyExactByteAlignAux, unionLayoutFreeOccupiedSlotCount, unionNonUnitNonZstTypedSlotCount, unionNonUnitTypedSlotCount, valueContainsUninit, valueContainsUnit, valueListContainsUninit]
 -/
 #guard_msgs in
 #zc_semantic_drift_audit
@@ -2116,7 +2332,15 @@ theorem zeroCountCopyAlignProto_bundle :
       evalCopyNonOverlappingWithCountProto policy s src dst ld ly sv dv c l3 = MirStepNode.step s' →
       s' = advanceStmt s l3 ∧
         ∀ sa da, ConcretePtrAddr s ld ly sv sa → ConcretePtrAddr s ld ly dv da →
-          miriCopyWithRef (layoutPointerBytes ly) c sz al sa da = .noop) :=
+          miriCopyWithRef (layoutPointerBytes ly) c sz al sa da = .noop) ∧
+    (∀ policy s s' ld ly srcOp dstOp cOp sv dv c l' dst bb sz al,
+      resolveCopyElemLayout ld ly srcOp dstOp = .ok sz al →
+      c.bits * sz = 0 →
+      evalCopyNonOverlappingCallProto policy s ld ly [srcOp, dstOp, cOp] [sv, dv, .scalar c]
+          l' dst bb = MirStepNode.step s' →
+      countScalarWellFormed (layoutPointerBytes ly) c = true ∧
+        ∀ sa da, ConcretePtrAddr s ld ly sv sa → ConcretePtrAddr s ld ly dv da →
+          miriCopyWithRef (layoutPointerBytes ly) c.bits sz al sa da = .noop) :=
   ⟨evalCopyNonOverlappingWithCountProto_rejectNull_refines,
     stepMirFnProto_rejectNull_refines,
     evalCopyNonOverlappingCallProto_rejectNull_refines,
@@ -2125,7 +2349,8 @@ theorem zeroCountCopyAlignProto_bundle :
     evalCopyNonOverlappingWithCountProto_scalar_rejectNull_eq_corePtrStrict,
     resolveCopyElemLayout_align_pow2,
     copyIsUnsizedRigidTy_eq,
-    evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements⟩
+    evalCopyNonOverlappingWithCountProto_zero_step_refines_miri_all_placements,
+    evalCopyNonOverlappingCallProto_zero_step_refines_miri_all_placements⟩
 
 /-! ## 15. Standard-axioms audit -/
 
@@ -2409,5 +2634,35 @@ theorem zeroCountCopyAlignProto_bundle :
 -/
 #guard_msgs in
 #print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.call_proto_eq_legacy_nonzero
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingCallProto_zero_step_refines_miri_all_placements' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingCallProto_zero_step_refines_miri_all_placements
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b4_param_wrapper_not_zst' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b4_param_wrapper_not_zst
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b4_param_wrapper_after_appendParamLayouts_u64_resolves' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b4_param_wrapper_after_appendParamLayouts_u64_resolves
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b4_recursive_concrete_node_no_cycle' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b4_recursive_concrete_node_no_cycle
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b4_const_pair_ptr_no_unitLayout_false_conflict' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b4_const_pair_ptr_no_unitLayout_false_conflict
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.b4_call_mixed_stack_global_refines_miri' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b4_call_mixed_stack_global_refines_miri
 
 end Anneal.Proto.ZeroCountCopyAlign.Tests
