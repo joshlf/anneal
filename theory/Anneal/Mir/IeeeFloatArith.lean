@@ -29,8 +29,12 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
 - **§3**: Single-rounding `roundTiesToEven` characterizations (`add`, `sub`,
   `mul`, `div`), exact grid representability (`roundRatioTiesToEven_exact_grid`),
   Sterbenz's exact subtraction (`y / 2 ≤ x ∧ x ≤ 2 * y`), exact addition,
-  gradual underflow (`a - b = ±0 ↔ a == b`), `1.0` multiplicative identity, and
-  exact Euclidean `rem` (`|a % b| < |b|`, `rem = ±0 ↔ divisibility`);
+  gradual underflow (`a - b = ±0 ↔ a == b`), `1.0` multiplicative identity,
+  exact Euclidean `rem` (`|a % b| < |b|`, `rem = ±0 ↔ divisibility`), and the
+  exact closed-form rational overflow threshold (`maxFiniteBits`, `maxFiniteVal`,
+  `overflowThreshold = (2^(fb+2) - 1) * 2^(bias - fb - 1)`,
+  `roundRatioTiesToEven_eq_inf_iff`, `roundRatioTiesToEven_lt_inf_isFinite`,
+  `roundRatioTiesToEven_eq_maxFiniteBits`, and boundary witnesses);
 - **§4**: `FloatArithMode` inclusion (`EvalFloatBinOpRel.det_imp_nondet`,
   `EvalRvalueFloatRel.det_imp_nondet`, `evalFloatBinOp` realizes `.deterministic`),
   `nanChoices` membership / width / NaN / quietness / `4`-vs-`6` sNaN structure,
@@ -46,24 +50,33 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
   enum `.ref`/`.fnPtr` no-forgery (`evalByteCastRichWithPolicy`);
 - **§6**: `V2026_06_01` <-> `V2026_08_01` dialect parity over explicit
   constructor-preserving translation maps (`fmt08`, `binOp08`, `mode08`,
-  `floatKind08`, `scalarInt08`, `policy08`, `abstractByte08`): `evalFloatNeg`,
-  `evalFloatAbs`, `decodeBits`, `roundRatioTiesToEven`, `evalFloatPartialCompare`,
-  `evalFloatCmp`, `evalFloatArithBase`, `evalFloatToFloatRoundTiesToEven`,
-  `nanChoices` (element-for-element), `evalFloatBinOp`, `EvalFloatBinOpRel`
-  (`↔`), and the `Ptr2IntTransmutePolicy` byte gate (`policyRejectsProv`,
-  `stripAbstractBytesProv`). Parity of the layout-table-driven decoders
+  `floatKind08`, `scalarInt08`, `policy08`, `abstractByte08`, `floatTy08`,
+  `tyFloat08`, `wrappingRange08`, `primitiveKind08`, `scalarLayout08`, and the
+  total injective value embedding `value06` / `rvalueResWith06`): `Scalars`-level
+  `evalFloatNeg`, `evalFloatAbs`, `decodeBits`, `roundRatioTiesToEven`,
+  `evalFloatPartialCompare`, `evalFloatCmp`, `evalFloatArithBase`,
+  `evalFloatToFloatRoundTiesToEven`, `nanChoices` (element-for-element),
+  `evalFloatBinOp`, `EvalFloatBinOpRel` (`↔`), and `Places`-level
+  `policyRejectsProv`, `stripAbstractBytesProv`, `ieeeFormatOfTy?`, `isFloatTy`,
+  `isFloatOptTy`, `evalFloatUnaryNeg`, `evalFloatScalarBinOp`,
+  `decodeLittleEndianBytes`, `decodeScalarBytes`, `abstractBytesUniformProv`,
+  `scalarLayoutByteWidth`, `wrappingRangeContains`, `isValidCharCode`, and
+  `decodeScalarLayoutBytesNoForge`. Parity of the layout-table-driven decoders
   (`decodeTypedValueFromBytes`, `evalByteCast`) is NOT proved here: their
-  `Value` / `LayoutTable` / `Memory` types are dialect-specific
-  (`V2026_08_01.Value` has no `.uninit`) and require full structural
-  translations;
+  `LayoutTable` / `Memory` types are dialect-specific (`V2026_08_01.Value` has
+  no `.uninit`) and require full `LayoutTable`/`Memory` structural translations;
 - **§7**: IEEE 754-2008 special-case table over both formats and all signs (NaN
   infectiousness, signed-zero sums, exact cancellation `x + (-x) = +0`, invalid
   operations, `finite / ±0 = ±∞` with XOR sign, `x % ±0 = NaN`, `±∞ % y = NaN`,
   `finite % ±∞ = finite`, `±0 % finite = ±0`), the documented signed-zero rule
   for arbitrary zero-valued sums and differences, the no-NaN-input `nanChoices`
-  closed form (`[preferred, -preferred]`), and admissibility of `evalRvalue`'s
+  closed form (`[preferred, -preferred]`), admissibility of `evalRvalue`'s
   quieting `floatToFloat` NaN in `.nondeterministic` (but not `.deterministic`)
-  mode;
+  mode, `evalRvalue`-level realization & dispatcher laws for `EvalRvalueFloatRel`
+  (including the concrete NaN `floatToFloat` separation witness), and
+  unconditional subtraction-as-negated-addition laws across `evalFloatBinOp`,
+  `EvalFloatBinOpRel`, `evalFloatScalarBinOp`, `evalRvalue`, and
+  `EvalRvalueFloatRel`;
 - **§8**: `#guard_msgs in #print axioms` bundles pinning every public theorem to
   `[propext, Quot.sound]`.
 -/
@@ -1732,6 +1745,566 @@ theorem evalFloatArithBase_rem_finite_eq_zero_iff (f : IeeeFormat) (a b : Nat)
       rw [hrem_eq, hmod0]
     rw [if_pos' hrem0] at hexact
     rw [hexact]
+
+/-! ### Closed-form finite rational overflow threshold (`roundTiesToEven`) -/
+
+/-- Bit pattern of the largest finite magnitude in format `f` (`f32::MAX` / `f64::MAX`
+for `neg = false`, `f32::MIN` / `f64::MIN` for `neg = true`): exponent `2^eb - 2`,
+all-ones fraction `2^fb - 1`. -/
+def maxFiniteBits (f : IeeeFormat) (neg : Bool) : Nat :=
+  encodeBits f neg (2 ^ f.exponentBits - 2) (2 ^ f.fractionBits - 1)
+
+/-- Exact natural-number magnitude of `maxFiniteBits f neg`:
+`(2^(fb + 1) - 1) * 2^(bias - fb)` (`(2 - 2^-fb) * 2^bias`). -/
+def maxFiniteVal (f : IeeeFormat) : Nat :=
+  (2 ^ (f.fractionBits + 1) - 1) * 2 ^ (f.bias - f.fractionBits)
+
+/-- Exact `roundTiesToEven` overflow threshold in `Nat`:
+`MAX + (1/2) ulp(MAX) = (2^(fb + 2) - 1) * 2^(bias - fb - 1) = 2^(bias + 1) - 2^(bias - fb - 1)`,
+matching `core`'s documented `f32::MAX + 2^(f32::MAX_EXP - f32::MANTISSA_DIGITS - 1)`
+(and identically for `f64`). Because `f.fractionBits + 1 ≤ f.bias` for both
+`binary32` (`24 ≤ 127`) and `binary64` (`53 ≤ 1023`), the threshold is an exact `Nat`. -/
+def overflowThreshold (f : IeeeFormat) : Nat :=
+  (2 ^ (f.fractionBits + 2) - 1) * 2 ^ (f.bias - f.fractionBits - 1)
+
+private theorem format_overflow_params (f : IeeeFormat) :
+    f.minExponent < f.maxExponent ∧
+    f.fractionBits + 1 ≤ f.bias ∧
+    2 ^ f.exponentBits - 2 = 2 * f.bias ∧
+    (f.fractionBits : Int) - f.maxExponent = Int.negSucc (f.bias - f.fractionBits - 1) ∧
+    f.bias - f.fractionBits = (f.bias - f.fractionBits - 1) + 1 := by
+  cases f <;> refine ⟨by decide, by decide, by decide, by decide, by decide⟩
+
+/-- Equivalent closed forms and binade bounds for `overflowThreshold f`:
+`MAX + 2^(bias - fb - 1) = 2^(bias + 1) - 2^(bias - fb - 1) ∈ (2^bias, 2^(bias + 1))`. -/
+theorem overflowThreshold_eq (f : IeeeFormat) :
+    overflowThreshold f = maxFiniteVal f + 2 ^ (f.bias - f.fractionBits - 1) ∧
+    overflowThreshold f = 2 ^ (f.bias + 1) - 2 ^ (f.bias - f.fractionBits - 1) ∧
+    2 ^ f.bias < overflowThreshold f ∧
+    overflowThreshold f < 2 ^ (f.bias + 1) := by
+  have hp := format_overflow_params f
+  have hsh : f.bias - f.fractionBits = (f.bias - f.fractionBits - 1) + 1 := hp.2.2.2.2
+  have h1 : 1 ≤ 2 ^ (f.fractionBits + 1) := Nat.one_le_two_pow
+  have h2 : 2 ^ (f.fractionBits + 2) = 2 * 2 ^ (f.fractionBits + 1) := by
+    rw [show f.fractionBits + 2 = (f.fractionBits + 1) + 1 by omega, Nat.pow_succ, Nat.mul_comm]
+  have h2s : 2 ^ (f.bias - f.fractionBits) = 2 * 2 ^ (f.bias - f.fractionBits - 1) := by
+    calc 2 ^ (f.bias - f.fractionBits)
+      _ = 2 ^ ((f.bias - f.fractionBits - 1) + 1) := congrArg (2 ^ ·) hsh
+      _ = 2 ^ (f.bias - f.fractionBits - 1) * 2 := Nat.pow_succ _ _
+      _ = 2 * 2 ^ (f.bias - f.fractionBits - 1) := Nat.mul_comm _ _
+  have hsum_exp : (f.fractionBits + 2) + (f.bias - f.fractionBits - 1) = f.bias + 1 := by
+    have := hp.2.1; omega
+  have heq1 : overflowThreshold f = maxFiniteVal f + 2 ^ (f.bias - f.fractionBits - 1) := by
+    unfold overflowThreshold maxFiniteVal
+    rw [h2, h2s, ← Nat.mul_assoc,
+      show (2 ^ (f.fractionBits + 1) - 1) * 2 = 2 * 2 ^ (f.fractionBits + 1) - 2 by omega]
+    rw [show 2 * 2 ^ (f.fractionBits + 1) - 1 = (2 * 2 ^ (f.fractionBits + 1) - 2) + 1 by omega,
+      Nat.add_mul, Nat.one_mul]
+  have heq2 : overflowThreshold f = 2 ^ (f.bias + 1) - 2 ^ (f.bias - f.fractionBits - 1) := by
+    unfold overflowThreshold
+    rw [Nat.sub_mul, Nat.one_mul, pow_mul_pow, hsum_exp]
+  have hlt1 : 2 ^ f.bias < overflowThreshold f := by
+    have hlt_pow : 2 ^ (f.bias - f.fractionBits - 1) < 2 ^ f.bias := by
+      have hsub_lt : f.bias - f.fractionBits - 1 < f.bias := by
+        have := hp.2.1; omega
+      have hle : 2 ^ ((f.bias - f.fractionBits - 1) + 1) ≤ 2 ^ f.bias := two_pow_le_two_pow hsub_lt
+      rw [Nat.pow_succ] at hle
+      have := Nat.two_pow_pos (f.bias - f.fractionBits - 1)
+      omega
+    have h2b : 2 ^ (f.bias + 1) = 2 * 2 ^ f.bias := by rw [Nat.pow_succ, Nat.mul_comm]
+    rw [heq2, h2b]
+    omega
+  have hlt2 : overflowThreshold f < 2 ^ (f.bias + 1) := by
+    have hpos : 0 < 2 ^ (f.bias - f.fractionBits - 1) := Nat.two_pow_pos _
+    have h2b : 2 ^ f.bias < 2 ^ (f.bias + 1) := by
+      rw [Nat.pow_succ]; have := Nat.two_pow_pos f.bias; omega
+    rw [heq2]
+    omega
+  exact ⟨heq1, heq2, hlt1, hlt2⟩
+
+/-- `maxFiniteBits f neg` immediately precedes `infBits f neg`, lies within `2 ^ f.width`,
+and decodes to `.finite neg (maxFiniteVal f) 1`. -/
+theorem maxFiniteBits_props (f : IeeeFormat) (neg : Bool) :
+    maxFiniteBits f neg + 1 = infBits f neg ∧
+    maxFiniteBits f neg < 2 ^ f.width ∧
+    decodeBits f (maxFiniteBits f neg) = .finite neg (maxFiniteVal f) 1 := by
+  have hE : 2 ^ f.exponentBits - 2 < 2 ^ f.exponentBits := by cases f <;> decide
+  have hF : 2 ^ f.fractionBits - 1 < 2 ^ f.fractionBits := by cases f <;> decide
+  have hsucc : maxFiniteBits f neg + 1 = infBits f neg := by
+    unfold maxFiniteBits infBits encodeBits
+    have hEge : 2 ≤ 2 ^ f.exponentBits := by cases f <;> decide
+    have hFpos : 1 ≤ 2 ^ f.fractionBits := Nat.one_le_two_pow
+    have h1 : (2 ^ f.exponentBits - 1) * 2 ^ f.fractionBits =
+        (2 ^ f.exponentBits - 2) * 2 ^ f.fractionBits + 2 ^ f.fractionBits := by
+      rw [show 2 ^ f.exponentBits - 1 = (2 ^ f.exponentBits - 2) + 1 by omega,
+        Nat.add_mul, Nat.one_mul]
+    rw [h1]
+    omega
+  have hlt : maxFiniteBits f neg < 2 ^ f.width := encodeBits_lt f neg _ _ hE hF
+  have hdec : decodeBits f (maxFiniteBits f neg) = .finite neg (maxFiniteVal f) 1 := by
+    unfold maxFiniteBits
+    rw [decodeBits_encodeBits f neg _ _ hE hF]
+    have hne1 : ¬ (2 ^ f.exponentBits - 2 = 2 ^ f.exponentBits - 1) := by cases f <;> decide
+    have hne0 : ¬ (2 ^ f.exponentBits - 2 = 0) := by cases f <;> decide
+    rw [if_neg' hne1, if_neg' hne0]
+    have hp := format_overflow_params f
+    have hsig : 2 ^ f.fractionBits + (2 ^ f.fractionBits - 1) = 2 ^ (f.fractionBits + 1) - 1 := by
+      rw [Nat.pow_succ]; have := Nat.two_pow_pos f.fractionBits; omega
+    have hexp : (((2 ^ f.exponentBits - 2 : Nat) : Int) - (f.bias : Int) - (f.fractionBits : Int)) =
+        ((f.bias - f.fractionBits : Nat) : Int) := by
+      have h2b := hp.2.2.1
+      have hfb := hp.2.1
+      omega
+    rw [hsig, hexp]
+    rfl
+  exact ⟨hsucc, hlt, hdec⟩
+
+/-- Every finite decoded value in format `f` has magnitude `≤ maxFiniteVal f`
+(`n ≤ maxFiniteVal f * d`). -/
+theorem decodeBits_finite_le_maxFiniteVal (f : IeeeFormat) (bits : Nat) (neg : Bool) (n d : Nat)
+    (h : decodeBits f bits = .finite neg n d) :
+    n ≤ maxFiniteVal f * d := by
+  obtain ⟨S, t, hn, hd, _, hSlt, _, htHi⟩ := decodeBits_finite_grid f bits neg n d h
+  have hSle : S ≤ 2 ^ (f.fractionBits + 1) - 1 := by omega
+  have hfb := (format_overflow_params f).2.1
+  rw [hn, hd]
+  cases t with
+  | ofNat k =>
+    simp only [powScale, Nat.mul_one]
+    have hkle : k ≤ f.bias - f.fractionBits := by
+      have hk : (k : Int) ≤ (f.bias : Int) - (f.fractionBits : Int) := htHi
+      omega
+    exact Nat.mul_le_mul hSle (two_pow_le_two_pow hkle)
+  | negSucc k =>
+    simp only [powScale, Nat.one_mul]
+    have h1 : 1 ≤ 2 ^ (f.bias - f.fractionBits) * 2 ^ (k + 1) :=
+      Nat.mul_le_mul Nat.one_le_two_pow Nat.one_le_two_pow
+    have hmul := Nat.mul_le_mul hSle h1
+    rw [Nat.mul_one, ← Nat.mul_assoc] at hmul
+    exact hmul
+
+private theorem powScale_neg_ofNat (n d k : Nat) :
+    powScale n d (-(k : Int)) = (n, d * 2 ^ k) := by
+  cases k with
+  | zero => simp [powScale]
+  | succ m => rfl
+
+private theorem roundQuotientTiesToEven_eq_even_top_iff (n D M : Nat)
+    (hD : 0 < D) (hMpos : 2 ≤ M) (hMeven : M % 2 = 0) (hlt : n < M * D) :
+    roundQuotientTiesToEven n D = M ↔ (2 * M - 1) * D ≤ 2 * n := by
+  have hdm := Nat.div_add_mod n D
+  have hrlt := Nat.mod_lt n hD
+  have hqlt : n / D < M := (Nat.div_lt_iff_lt_mul hD).mpr hlt
+  have hM1odd : (M - 1) % 2 = 1 := by omega
+  have h2m : (2 * M - 1) * D = 2 * ((M - 1) * D) + D := by
+    have h1 : 2 * M - 1 = 2 * (M - 1) + 1 := by omega
+    rw [h1, Nat.add_mul, Nat.one_mul, Nat.mul_assoc]
+  unfold roundQuotientTiesToEven
+  dsimp only
+  constructor
+  · intro heq
+    by_cases hc : n % D * 2 > D ∨ (n % D * 2 = D ∧ (n / D) % 2 = 1)
+    · rw [if_pos' hc] at heq
+      have hq : n / D = M - 1 := by omega
+      have hr : D ≤ n % D * 2 := by
+        rcases hc with hgt | ⟨he, _⟩ <;> omega
+      have hn_eq : n = (M - 1) * D + n % D := by
+        have hdm' := hdm
+        rw [hq, Nat.mul_comm] at hdm'
+        exact hdm'.symm
+      rw [hn_eq, h2m]
+      omega
+    · rw [if_neg' hc] at heq
+      omega
+  · intro hge
+    have hq_ge : M - 1 ≤ n / D := by
+      cases Nat.lt_or_ge (n / D) (M - 1) with
+      | inr hle => exact hle
+      | inl hltq =>
+        have hle2 : n / D + 1 ≤ M - 1 := by omega
+        have hstep : (n / D + 1) * D ≤ (M - 1) * D := Nat.mul_le_mul_right D hle2
+        have hnlt : n < (n / D + 1) * D := by
+          rw [Nat.add_mul, Nat.one_mul, Nat.mul_comm (n / D) D]; omega
+        have hltm : 2 * n < 2 * ((M - 1) * D) := by omega
+        omega
+    have hq : n / D = M - 1 := by omega
+    have hn_eq : n = (M - 1) * D + n % D := by
+      have hdm' := hdm
+      rw [hq, Nat.mul_comm] at hdm'
+      exact hdm'.symm
+    have hr : D ≤ n % D * 2 := by rw [hn_eq, h2m] at hge; omega
+    have hc : n % D * 2 > D ∨ (n % D * 2 = D ∧ (n / D) % 2 = 1) := by
+      by_cases hgt : n % D * 2 > D
+      · exact Or.inl hgt
+      · exact Or.inr ⟨by omega, by rw [hq]; exact hM1odd⟩
+    rw [if_pos' hc, hq]
+    omega
+
+/-- **Exact closed-form rational overflow threshold (`roundTiesToEven`)**:
+for every `f`, `neg`, and rational `n / d` (`0 < d`), `roundRatioTiesToEven f neg n d`
+overflows to `infBits f neg` IF AND ONLY IF `n / d ≥ overflowThreshold f`
+(`d * overflowThreshold f ≤ n`). -/
+theorem roundRatioTiesToEven_eq_inf_iff (f : IeeeFormat) (neg : Bool) (n d : Nat) (hd : 0 < d) :
+    roundRatioTiesToEven f neg n d = infBits f neg ↔ d * overflowThreshold f ≤ n := by
+  have hT := overflowThreshold_eq f
+  have hTpos : 0 < overflowThreshold f := by
+    have := Nat.two_pow_pos f.bias; omega
+  by_cases hn0 : n = 0
+  · subst hn0
+    rw [roundRatioTiesToEven_zero f neg d hd]
+    have hne : zeroBits f neg ≠ infBits f neg := by cases f <;> cases neg <;> decide
+    have hprod : 0 < d * overflowThreshold f := Nat.mul_pos hd hTpos
+    exact ⟨fun h => absurd h hne, fun h => by omega⟩
+  · have hn : 0 < n := Nat.pos_of_ne_zero hn0
+    have hov := (roundRatioTiesToEven_overflow_iff f neg n d hn hd).1
+    rw [hov]
+    have hp := format_overflow_params f
+    have hmin_lt_max : f.minExponent < f.maxExponent := hp.1
+    have hbd := powScale_neg_ratioExponent_bounds n d hn hd
+    generalize he : ratioExponent n d = e at hbd ⊢
+    by_cases hgt : f.maxExponent < e
+    · have hmax_gt : f.maxExponent < max e f.minExponent := by omega
+      have he_pos : 0 ≤ e := by simp only [IeeeFormat.maxExponent] at hgt; omega
+      have hto : ((e.toNat : Nat) : Int) = e := Int.toNat_of_nonneg he_pos
+      have hge_exp : f.bias + 1 ≤ e.toNat := by simp only [IeeeFormat.maxExponent] at hgt; omega
+      have hlo : d * 2 ^ e.toNat ≤ n := by
+        have h1 := hbd.1
+        rw [← hto, powScale_neg_ofNat] at h1
+        exact h1
+      have hge_T : d * overflowThreshold f ≤ n := by
+        have h1 : overflowThreshold f ≤ 2 ^ e.toNat :=
+          Nat.le_trans (Nat.le_of_lt hT.2.2.2) (two_pow_le_two_pow hge_exp)
+        exact Nat.le_trans (Nat.mul_le_mul_left d h1) hlo
+      exact ⟨fun _ => hge_T, fun _ => Or.inl hmax_gt⟩
+    · by_cases heq : e = f.maxExponent
+      · have hmax_eq : max e f.minExponent = f.maxExponent := by omega
+        rw [hmax_eq]
+        have hlo_hi : d * 2 ^ f.bias ≤ n ∧ n < 2 * (d * 2 ^ f.bias) := by
+          have h1 := hbd.1
+          have h2 := hbd.2
+          rw [heq] at h1 h2
+          simp only [IeeeFormat.maxExponent] at h1 h2
+          rw [powScale_neg_ofNat] at h1 h2
+          exact ⟨h1, h2⟩
+        have hsc_eq : powScale n d ((f.fractionBits : Int) - f.maxExponent) =
+            (n, d * 2 ^ (f.bias - f.fractionBits)) := by
+          rw [hp.2.2.2.1]
+          simp only [powScale, ← hp.2.2.2.2]
+        rw [hsc_eq]
+        dsimp only
+        let D : Nat := d * 2 ^ (f.bias - f.fractionBits)
+        let M : Nat := 2 ^ (f.fractionBits + 1)
+        have hDpos : 0 < D := Nat.mul_pos hd (Nat.two_pow_pos _)
+        have hMpos : 2 ≤ M := by cases f <;> decide
+        have hMeven : M % 2 = 0 := by cases f <;> decide
+        have hMD : M * D = 2 * (d * 2 ^ f.bias) := by
+          have hexp_sum : (f.fractionBits + 1) + (f.bias - f.fractionBits) = f.bias + 1 := by
+            have := hp.2.1; omega
+          calc M * D
+            _ = d * (2 ^ (f.fractionBits + 1) * 2 ^ (f.bias - f.fractionBits)) := by
+              simp only [M, D]; rw [Nat.mul_left_comm]
+            _ = d * 2 ^ (f.bias + 1) := by rw [pow_mul_pow, hexp_sum]
+            _ = 2 * (d * 2 ^ f.bias) := by
+              rw [Nat.pow_succ, Nat.mul_comm (2 ^ f.bias) 2, Nat.mul_left_comm]
+        have hnlt : n < M * D := by rw [hMD]; exact hlo_hi.2
+        have hrq := roundQuotientTiesToEven_eq_even_top_iff n D M hDpos hMpos hMeven hnlt
+        have h2M : 2 * M - 1 = 2 ^ (f.fractionBits + 2) - 1 := by
+          have hpow2 : 2 * M = 2 ^ (f.fractionBits + 2) := by
+            show 2 * 2 ^ (f.fractionBits + 1) = 2 ^ (f.fractionBits + 2)
+            rw [show f.fractionBits + 2 = (f.fractionBits + 1) + 1 by omega,
+              Nat.pow_succ 2 (f.fractionBits + 1), Nat.mul_comm]
+          rw [hpow2]
+        have hD2 : D = 2 * (d * 2 ^ (f.bias - f.fractionBits - 1)) := by
+          calc D
+            _ = d * 2 ^ ((f.bias - f.fractionBits - 1) + 1) := by
+              simp only [D]; exact congrArg (fun k => d * 2 ^ k) hp.2.2.2.2
+            _ = d * (2 ^ (f.bias - f.fractionBits - 1) * 2) := by rw [Nat.pow_succ]
+            _ = 2 * (d * 2 ^ (f.bias - f.fractionBits - 1)) := by
+              rw [Nat.mul_comm _ 2, Nat.mul_left_comm]
+        have hrhs_eq : (2 * M - 1) * D = 2 * (d * overflowThreshold f) := by
+          unfold overflowThreshold
+          rw [h2M, hD2, Nat.mul_left_comm, Nat.mul_left_comm d]
+        constructor
+        · intro h
+          rcases h with h1 | ⟨_, h2⟩
+          · exact absurd h1 (Int.lt_irrefl _)
+          · have h2n : 2 * (d * overflowThreshold f) ≤ 2 * n := by
+              rw [← hrhs_eq]; exact hrq.mp h2
+            omega
+        · intro hle
+          right
+          refine ⟨rfl, hrq.mpr ?_⟩
+          rw [hrhs_eq]
+          omega
+      · have hlt_e : e < f.maxExponent := by omega
+        have hmax_lt : max e f.minExponent < f.maxExponent := by omega
+        have hn_lt_2b : n < d * 2 ^ f.bias := by
+          by_cases he0 : 0 ≤ e
+          · have hto : ((e.toNat : Nat) : Int) = e := Int.toNat_of_nonneg he0
+            have hhi := hbd.2
+            rw [← hto, powScale_neg_ofNat] at hhi
+            have hle_b : e.toNat + 1 ≤ f.bias := by simp only [IeeeFormat.maxExponent] at hlt_e; omega
+            have hmul : 2 * (d * 2 ^ e.toNat) = d * 2 ^ (e.toNat + 1) := by
+              rw [Nat.pow_succ, Nat.mul_comm (2 ^ e.toNat) 2, Nat.mul_left_comm]
+            have hstep : d * 2 ^ (e.toNat + 1) ≤ d * 2 ^ f.bias :=
+              Nat.mul_le_mul_left d (two_pow_le_two_pow hle_b)
+            omega
+          · have hneg : ∃ k : Nat, -e = Int.ofNat (k + 1) := by
+              cases e with
+              | ofNat m => exact absurd (Int.natCast_nonneg m) he0
+              | negSucc m => exact ⟨m, rfl⟩
+            rcases hneg with ⟨k, hk⟩
+            have hhi := hbd.2
+            rw [hk] at hhi
+            simp only [powScale] at hhi
+            have h2le : 2 ≤ 2 ^ (k + 1) := two_pow_le_two_pow (Nat.succ_le_succ (Nat.zero_le k))
+            have h2n : 2 * n ≤ n * 2 ^ (k + 1) := by
+              rw [Nat.mul_comm 2 n]; exact Nat.mul_le_mul_left n h2le
+            have h1le : 1 ≤ 2 ^ f.bias := Nat.one_le_two_pow
+            have hdle : d ≤ d * 2 ^ f.bias := by
+              have := Nat.mul_le_mul_left d h1le; rwa [Nat.mul_one] at this
+            omega
+        have hn_lt_T : n < d * overflowThreshold f := by
+          have hstep : d * 2 ^ f.bias < d * overflowThreshold f := by
+            rw [Nat.mul_comm d (2 ^ f.bias), Nat.mul_comm d (overflowThreshold f)]
+            exact (nat_mul_lt_mul_right_iff hd).mpr hT.2.2.1
+          omega
+        constructor
+        · intro h
+          rcases h with h1 | ⟨h2, _⟩ <;> omega
+        · intro hle; omega
+
+/-- Decoded form of `roundRatioTiesToEven_eq_inf_iff`: `decodeBits` yields `.inf neg`
+IF AND ONLY IF `d * overflowThreshold f ≤ n`. -/
+theorem decodeBits_roundRatioTiesToEven_eq_inf_iff (f : IeeeFormat) (neg : Bool) (n d : Nat)
+    (hd : 0 < d) :
+    decodeBits f (roundRatioTiesToEven f neg n d) = .inf neg ↔ d * overflowThreshold f ≤ n := by
+  by_cases hn0 : n = 0
+  · subst hn0
+    rw [roundRatioTiesToEven_zero f neg d hd, decodeBits_zeroBits]
+    have hTpos : 0 < overflowThreshold f := by
+      have := (overflowThreshold_eq f).2.2.1
+      have := Nat.two_pow_pos f.bias; omega
+    have hprod : 0 < d * overflowThreshold f := Nat.mul_pos hd hTpos
+    constructor
+    · intro h; cases h
+    · intro h; omega
+  · have hn : 0 < n := Nat.pos_of_ne_zero hn0
+    rw [(roundRatioTiesToEven_overflow_iff f neg n d hn hd).2]
+    exact roundRatioTiesToEven_eq_inf_iff f neg n d hd
+
+private theorem bits_le_maxFiniteBits_of_zero_or_finite (f : IeeeFormat) (neg : Bool) (bits : Nat)
+    (hlt : bits < 2 ^ f.width)
+    (h : decodeBits f bits = .zero neg ∨ ∃ n' d', decodeBits f bits = .finite neg n' d') :
+    bits ≤ maxFiniteBits f neg := by
+  have henc := encodeBits_unpackBits f bits hlt
+  have hEl := unpackBits_exponent_lt f bits
+  have hFl := unpackBits_fraction_lt f bits
+  have hfields : (unpackBits f bits).neg = neg ∧
+      (unpackBits f bits).exponent ≤ 2 ^ f.exponentBits - 2 := by
+    unfold decodeBits at h
+    dsimp only at h
+    split at h
+    · split at h
+      · rcases h with h | ⟨_, _, h⟩ <;> cases h
+      · rcases h with h | ⟨_, _, h⟩ <;> cases h
+    · rename_i hEne
+      split at h
+      · split at h
+        · rcases h with h | ⟨_, _, h⟩
+          · injection h with hneg; exact ⟨hneg, by omega⟩
+          · cases h
+        · rcases h with h | ⟨_, _, h⟩
+          · cases h
+          · injection h with hneg _ _; exact ⟨hneg, by omega⟩
+      · rcases h with h | ⟨_, _, h⟩
+        · cases h
+        · injection h with hneg _ _; exact ⟨hneg, by omega⟩
+  rw [← henc]
+  unfold maxFiniteBits encodeBits
+  rw [hfields.1]
+  have hmul : (unpackBits f bits).exponent * 2 ^ f.fractionBits ≤
+      (2 ^ f.exponentBits - 2) * 2 ^ f.fractionBits :=
+    Nat.mul_le_mul_right _ hfields.2
+  omega
+
+/-- **Strict-sub-threshold finiteness**: whenever `n < d * overflowThreshold f` (`0 < d`),
+`roundRatioTiesToEven f neg n d` never overflows: its bit pattern satisfies
+`≤ maxFiniteBits f neg` and decodes to either `.zero neg` or `.finite neg n' d'`
+with `n' / d' ≤ maxFiniteVal f`. -/
+theorem roundRatioTiesToEven_lt_inf_isFinite (f : IeeeFormat) (neg : Bool) (n d : Nat)
+    (hd : 0 < d) (hlt : n < d * overflowThreshold f) :
+    roundRatioTiesToEven f neg n d ≤ maxFiniteBits f neg ∧
+    (decodeBits f (roundRatioTiesToEven f neg n d) = .zero neg ∨
+      ∃ n' d',
+        decodeBits f (roundRatioTiesToEven f neg n d) = .finite neg n' d' ∧
+        0 < n' ∧ 0 < d' ∧ n' ≤ maxFiniteVal f * d') := by
+  have hbits_lt := roundRatioTiesToEven_lt f neg n d hd
+  by_cases hn0 : n = 0
+  · subst hn0
+    rw [roundRatioTiesToEven_zero f neg d hd]
+    have hz : decodeBits f (zeroBits f neg) = .zero neg := decodeBits_zeroBits f neg
+    refine ⟨bits_le_maxFiniteBits_of_zero_or_finite f neg _ (by
+      rw [← roundRatioTiesToEven_zero f neg d hd]; exact hbits_lt) (Or.inl hz), Or.inl hz⟩
+  · have hn : 0 < n := Nat.pos_of_ne_zero hn0
+    have hnot_inf : decodeBits f (roundRatioTiesToEven f neg n d) ≠ .inf neg := by
+      intro hinf
+      have hge := (decodeBits_roundRatioTiesToEven_eq_inf_iff f neg n d hd).mp hinf
+      omega
+    have hsame := (roundRatioTiesToEven_float_half_ulp f neg n d hn hd).2.2 hnot_inf
+    have hzf : decodeBits f (roundRatioTiesToEven f neg n d) = .zero neg ∨
+        ∃ n' d', decodeBits f (roundRatioTiesToEven f neg n d) = .finite neg n' d' := by
+      cases hdec : decodeBits f (roundRatioTiesToEven f neg n d) with
+      | zero s =>
+        rw [hdec] at hsame
+        split at hsame
+        · exact Or.inl (by unfold floatKindSameValue at hsame; rw [hsame])
+        · exact False.elim hsame
+      | finite s n' d' =>
+        rw [hdec] at hsame
+        split at hsame
+        · exact False.elim hsame
+        · exact Or.inr ⟨n', d', by unfold floatKindSameValue at hsame; rw [hsame.1]⟩
+      | inf s =>
+        rw [hdec] at hsame
+        split at hsame <;> exact False.elim hsame
+      | nan s q p =>
+        rw [hdec] at hsame
+        split at hsame <;> exact False.elim hsame
+    refine ⟨bits_le_maxFiniteBits_of_zero_or_finite f neg _ hbits_lt hzf, ?_⟩
+    rcases hzf with hz | ⟨n', d', hf⟩
+    · exact Or.inl hz
+    · exact Or.inr ⟨n', d', hf,
+        decodeBits_finite_num_pos f _ neg n' d' hf,
+        decodeBits_finite_den_pos f _ neg n' d' hf,
+        decodeBits_finite_le_maxFiniteVal f _ neg n' d' hf⟩
+
+/-- Every rational in the top half-ulp interval `[maxFiniteVal f, overflowThreshold f)`
+rounds to `maxFiniteBits f neg` under `roundTiesToEven`. -/
+theorem roundRatioTiesToEven_eq_maxFiniteBits (f : IeeeFormat) (neg : Bool) (n d : Nat)
+    (hd : 0 < d) (hlo : d * maxFiniteVal f ≤ n) (hhi : n < d * overflowThreshold f) :
+    roundRatioTiesToEven f neg n d = maxFiniteBits f neg := by
+  have hp := format_overflow_params f
+  have hT := overflowThreshold_eq f
+  have hmaxV_ge : 2 ^ f.bias ≤ maxFiniteVal f := by
+    have h1 : 2 ^ f.fractionBits ≤ 2 ^ (f.fractionBits + 1) - 1 := by
+      rw [Nat.pow_succ]; have := Nat.two_pow_pos f.fractionBits; omega
+    have hsum : f.fractionBits + (f.bias - f.fractionBits) = f.bias := by
+      have := hp.2.1; omega
+    calc 2 ^ f.bias
+      _ = 2 ^ f.fractionBits * 2 ^ (f.bias - f.fractionBits) := by rw [pow_mul_pow, hsum]
+      _ ≤ (2 ^ (f.fractionBits + 1) - 1) * 2 ^ (f.bias - f.fractionBits) :=
+        Nat.mul_le_mul_right _ h1
+  have hn_pos : 0 < n := by
+    have := Nat.mul_le_mul_left d hmaxV_ge
+    have := Nat.mul_pos hd (Nat.two_pow_pos f.bias)
+    omega
+  have hdn_lo : d * 2 ^ f.bias ≤ n := Nat.le_trans (Nat.mul_le_mul_left d hmaxV_ge) hlo
+  have hdn_hi : n < 2 * (d * 2 ^ f.bias) := by
+    have h2b : 2 * (d * 2 ^ f.bias) = d * 2 ^ (f.bias + 1) := by
+      rw [Nat.pow_succ, Nat.mul_comm (2 ^ f.bias) 2, Nat.mul_left_comm]
+    have hlt2 : d * overflowThreshold f < d * 2 ^ (f.bias + 1) := by
+      rw [Nat.mul_comm d (overflowThreshold f), Nat.mul_comm d (2 ^ (f.bias + 1))]
+      exact (nat_mul_lt_mul_right_iff hd).mpr hT.2.2.2
+    omega
+  have he : ratioExponent n d = f.maxExponent := by
+    apply (ratioExponent_eq_iff_powScale_bounds n d f.maxExponent hn_pos hd).mpr
+    simp only [IeeeFormat.maxExponent]
+    rw [powScale_neg_ofNat]
+    exact ⟨hdn_lo, hdn_hi⟩
+  let D : Nat := d * 2 ^ (f.bias - f.fractionBits)
+  let M : Nat := 2 ^ (f.fractionBits + 1)
+  have hDpos : 0 < D := Nat.mul_pos hd (Nat.two_pow_pos _)
+  have hMpos : 2 ≤ M := by cases f <;> decide
+  have hMeven : M % 2 = 0 := by cases f <;> decide
+  have hMD : M * D = 2 * (d * 2 ^ f.bias) := by
+    have hexp_sum : (f.fractionBits + 1) + (f.bias - f.fractionBits) = f.bias + 1 := by
+      have := hp.2.1; omega
+    calc M * D
+      _ = d * (2 ^ (f.fractionBits + 1) * 2 ^ (f.bias - f.fractionBits)) := by
+        simp only [M, D]; rw [Nat.mul_left_comm]
+      _ = d * 2 ^ (f.bias + 1) := by rw [pow_mul_pow, hexp_sum]
+      _ = 2 * (d * 2 ^ f.bias) := by
+        rw [Nat.pow_succ, Nat.mul_comm (2 ^ f.bias) 2, Nat.mul_left_comm]
+  have hloD : (M - 1) * D ≤ n := by
+    have heq : (M - 1) * D = d * maxFiniteVal f := by
+      simp only [M, D, maxFiniteVal]; rw [Nat.mul_left_comm]
+    rw [heq]; exact hlo
+  have hhiD : n < M * D := by rw [hMD]; exact hdn_hi
+  have hq : n / D = M - 1 := by
+    have h1 : M - 1 ≤ n / D := (Nat.le_div_iff_mul_le hDpos).mpr hloD
+    have h2 : n / D < M := (Nat.div_lt_iff_lt_mul hDpos).mpr hhiD
+    omega
+  have hnot_top : roundQuotientTiesToEven n D ≠ M := by
+    intro htop
+    have hge := (roundQuotientTiesToEven_eq_even_top_iff n D M hDpos hMpos hMeven hhiD).mp htop
+    have h2M : 2 * M - 1 = 2 ^ (f.fractionBits + 2) - 1 := by
+      have hpow2 : 2 * M = 2 ^ (f.fractionBits + 2) := by
+        show 2 * 2 ^ (f.fractionBits + 1) = 2 ^ (f.fractionBits + 2)
+        rw [show f.fractionBits + 2 = (f.fractionBits + 1) + 1 by omega,
+          Nat.pow_succ 2 (f.fractionBits + 1), Nat.mul_comm]
+      rw [hpow2]
+    have hD2 : D = 2 * (d * 2 ^ (f.bias - f.fractionBits - 1)) := by
+      calc D
+        _ = d * 2 ^ ((f.bias - f.fractionBits - 1) + 1) := by
+          simp only [D]; exact congrArg (fun k => d * 2 ^ k) hp.2.2.2.2
+        _ = d * (2 ^ (f.bias - f.fractionBits - 1) * 2) := by rw [Nat.pow_succ]
+        _ = 2 * (d * 2 ^ (f.bias - f.fractionBits - 1)) := by
+          rw [Nat.mul_comm _ 2, Nat.mul_left_comm]
+    have hrhs_eq : (2 * M - 1) * D = 2 * (d * overflowThreshold f) := by
+      unfold overflowThreshold
+      rw [h2M, hD2, Nat.mul_left_comm, Nat.mul_left_comm d]
+    rw [hrhs_eq] at hge
+    omega
+  have hsig_eq : roundQuotientTiesToEven n D = M - 1 := by
+    unfold roundQuotientTiesToEven at hnot_top ⊢
+    dsimp only at hnot_top ⊢
+    rw [hq] at hnot_top ⊢
+    split at hnot_top
+    · exfalso; apply hnot_top; omega
+    · rename_i hc; rw [if_neg' hc]
+  have hsc_eq : powScale n d ((f.fractionBits : Int) - f.maxExponent) = (n, D) := by
+    rw [hp.2.2.2.1]; simp only [powScale, ← hp.2.2.2.2, D]
+  have hmax_eq : max (ratioExponent n d) f.minExponent = f.maxExponent := by
+    rw [he]; have := hp.1; omega
+  unfold roundRatioTiesToEven
+  rw [if_neg' (Nat.ne_of_gt hd), if_neg' (Nat.ne_of_gt hn_pos)]
+  dsimp only
+  rw [hmax_eq, if_neg' (by omega : ¬ (f.maxExponent > f.maxExponent)), hsc_eq]
+  dsimp only
+  rw [hsig_eq]
+  have hncarry : ¬ (2 ^ (f.fractionBits + 1) ≤ M - 1) := by
+    have := Nat.two_pow_pos (f.fractionBits + 1); simp only [M]; omega
+  have hnsub : ¬ (M - 1 < 2 ^ f.fractionBits) := by
+    simp only [M]; rw [Nat.pow_succ]; have := Nat.two_pow_pos f.fractionBits; omega
+  simp only [hncarry, decide_false, Bool.false_eq_true, ↓reduceIte,
+    if_neg' (by omega : ¬ (f.maxExponent > f.maxExponent)), if_neg' hnsub]
+  have hEeq : (f.maxExponent + (f.bias : Int)).toNat = 2 ^ f.exponentBits - 2 := by
+    have h2b := hp.2.2.1
+    simp only [IeeeFormat.maxExponent]; omega
+  have hFeq : M - 1 - 2 ^ f.fractionBits = 2 ^ f.fractionBits - 1 := by
+    simp only [M]; rw [Nat.pow_succ]; have := Nat.two_pow_pos f.fractionBits; omega
+  rw [hEeq, hFeq]
+  rfl
+
+/-- Sharpness of `overflowThreshold f` on both formats and both signs:
+- at `overflowThreshold f`, `roundRatioTiesToEven` yields `infBits f neg` (ties to even
+  carries out of the odd all-ones significand `2^(fb + 1) - 1`);
+- at `overflowThreshold f - 1`, `overflowThreshold f - 1/2`, and `maxFiniteVal f`,
+  `roundRatioTiesToEven` yields `maxFiniteBits f neg`. -/
+theorem roundRatioTiesToEven_overflow_boundary (f : IeeeFormat) (neg : Bool) :
+    roundRatioTiesToEven f neg (overflowThreshold f) 1 = infBits f neg ∧
+    roundRatioTiesToEven f neg (overflowThreshold f - 1) 1 = maxFiniteBits f neg ∧
+    roundRatioTiesToEven f neg (2 * overflowThreshold f - 1) 2 = maxFiniteBits f neg ∧
+    roundRatioTiesToEven f neg (maxFiniteVal f) 1 = maxFiniteBits f neg := by
+  have hT := overflowThreshold_eq f
+  have hpos : 0 < 2 ^ (f.bias - f.fractionBits - 1) := Nat.two_pow_pos _
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · exact (roundRatioTiesToEven_eq_inf_iff f neg _ 1 Nat.one_pos).mpr
+      (by rw [Nat.one_mul]; exact Nat.le_refl _)
+  · exact roundRatioTiesToEven_eq_maxFiniteBits f neg _ 1 Nat.one_pos (by omega) (by omega)
+  · exact roundRatioTiesToEven_eq_maxFiniteBits f neg _ 2 (by decide) (by omega) (by omega)
+  · exact roundRatioTiesToEven_eq_maxFiniteBits f neg _ 1 Nat.one_pos (by omega) (by omega)
 
 /-! ## §4. `FloatArithMode` inclusion, `nanChoices` structure, & relational sign symmetry -/
 
@@ -8031,6 +8604,594 @@ theorem stripAbstractBytesProv_parity (bs : List AbstractByte) :
     rw [ih]
     cases b <;> rfl
 
+/-! ### `Places`-level dialect parity (`evalFloatUnaryNeg`, `evalFloatScalarBinOp`, `decodeScalarLayoutBytesNoForge`) -/
+
+/-- Dialect translation of `FloatTy` (`V2026_06_01 → V2026_08_01`). -/
+def floatTy08 : FloatTy → V2026_08_01.MirAst.FloatTy
+  | .f16 => .f16
+  | .f32 => .f32
+  | .f64 => .f64
+  | .f128 => .f128
+
+/-- Float-preserving dialect projection of `Ty` (`V2026_06_01 → V2026_08_01`): preserves
+every `.float w` kind verbatim and maps non-float kinds to `.bool`. -/
+def tyFloat08 (ty : Ty) : V2026_08_01.MirAst.Ty :=
+  { kind := match ty.kind with
+      | .float w => .float (floatTy08 w)
+      | _ => .bool
+    layoutIdx := ty.layoutIdx }
+
+/-- Dialect translation of `WrappingRange` (`V2026_06_01 → V2026_08_01`). -/
+def wrappingRange08 (r : WrappingRange) : V2026_08_01.Layout.WrappingRange :=
+  { start := r.start, end_ := r.end_ }
+
+/-- Dialect translation of `PrimitiveKind` (`V2026_06_01 → V2026_08_01`). -/
+def primitiveKind08 : PrimitiveKind → V2026_08_01.Layout.PrimitiveKind
+  | .int bits signed => .int bits signed
+  | .float bits => .float bits
+  | .pointer a => .pointer a
+
+/-- Dialect translation of `ScalarLayout` (`V2026_06_01 → V2026_08_01`). -/
+def scalarLayout08 : ScalarLayout → V2026_08_01.Layout.ScalarLayout
+  | .initialized pk vr => .initialized (primitiveKind08 pk) (wrappingRange08 vr)
+  | .union pk => .union (primitiveKind08 pk)
+
+/-- Reverse dialect translation of `ScalarInt` (`V2026_08_01 → V2026_06_01`). -/
+def scalarInt06 (s : V2026_08_01.MirAst.ScalarInt) : ScalarInt :=
+  ⟨s.bits, s.sizeBytes⟩
+
+/-- Reverse dialect translation of `ProvenancePtr` (`V2026_08_01 → V2026_06_01`). -/
+def provenancePtr06 (p : V2026_08_01.MirAst.ProvenancePtr) : ProvenancePtr :=
+  { allocId := p.allocId, offsetBytes := p.offsetBytes }
+
+mutual
+  /-- Total injective embedding of `V2026_08_01.MirSemantics.Value` into
+  `V2026_06_01.MirSemantics.Value` (`V2026_08_01.Value` has no `.uninit` constructor). -/
+  def value06 : V2026_08_01.MirSemantics.Value → Value
+    | .unit => .unit
+    | .scalar s => .scalar (scalarInt06 s)
+    | .ptr p sz => .ptr (provenancePtr06 p) sz
+    | .aggregate v fs => .aggregate v (valueList06 fs)
+
+  /-- Elementwise embedding of `List V2026_08_01.MirSemantics.Value`. -/
+  def valueList06 : List V2026_08_01.MirSemantics.Value → List Value
+    | .nil => .nil
+    | x :: xs => value06 x :: valueList06 xs
+end
+
+/-- Map a `V2026_08_01` `RvalueEvalResult` back to `V2026_06_01` at fixed state
+`(locals06, mem06)`, preserving `.ok`/`.ub`/`.unsupported` and embedding the value
+losslessly via `value06`. -/
+def rvalueResWith06 (locals06 : List LocalSlot) (mem06 : Memory) :
+    V2026_08_01.MirSemantics.RvalueEvalResult → RvalueEvalResult
+  | .ok v _ _ => .ok (value06 v) locals06 mem06
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+private theorem length_map_abstractByte08 (bs : List AbstractByte) :
+    length (bs.map abstractByte08) = length bs := by
+  unfold length
+  exact List.length_map abstractByte08
+
+/-- `scalarInt06` is the left inverse of `scalarInt08`. -/
+theorem scalarInt06_scalarInt08 (s : ScalarInt) : scalarInt06 (scalarInt08 s) = s := by
+  cases s; rfl
+
+mutual
+  /-- `value06` is injective on all `V2026_08_01.MirSemantics.Value`s, so parity
+  statements transported through `Option.map value06` / `rvalueResWith06` are lossless. -/
+  theorem value06_injective : ∀ (v₁ v₂ : V2026_08_01.MirSemantics.Value),
+      value06 v₁ = value06 v₂ → v₁ = v₂
+    | .unit, .unit, _ => rfl
+    | .scalar ⟨b₁, s₁⟩, .scalar ⟨b₂, s₂⟩, h => by
+      unfold value06 scalarInt06 at h
+      injection h with hs; injection hs with h1 h2; subst h1; subst h2; rfl
+    | .ptr ⟨a₁, o₁⟩ sz₁, .ptr ⟨a₂, o₂⟩ sz₂, h => by
+      unfold value06 provenancePtr06 at h
+      injection h with hp hsz; injection hp with h1 h2; subst h1; subst h2; subst hsz; rfl
+    | .aggregate v₁ fs₁, .aggregate v₂ fs₂, h => by
+      unfold value06 at h
+      injection h with hv hfs
+      rw [hv, valueList06_injective fs₁ fs₂ hfs]
+    | .unit, .scalar _, h | .unit, .ptr _ _, h | .unit, .aggregate _ _, h
+    | .scalar _, .unit, h | .scalar _, .ptr _ _, h | .scalar _, .aggregate _ _, h
+    | .ptr _ _, .unit, h | .ptr _ _, .scalar _, h | .ptr _ _, .aggregate _ _, h
+    | .aggregate _ _, .unit, h | .aggregate _ _, .scalar _, h | .aggregate _ _, .ptr _ _, h => by
+      cases h
+
+  /-- `valueList06` is injective on all lists of `V2026_08_01.MirSemantics.Value`. -/
+  theorem valueList06_injective : ∀ (xs ys : List V2026_08_01.MirSemantics.Value),
+      valueList06 xs = valueList06 ys → xs = ys
+    | .nil, .nil, _ => rfl
+    | x :: xs, y :: ys, h => by
+      unfold valueList06 at h
+      injection h with hxy hrest
+      rw [value06_injective x y hxy, valueList06_injective xs ys hrest]
+    | .nil, _ :: _, h | _ :: _, .nil, h => by cases h
+end
+
+/-- `ieeeFormatOfTy?` agrees across dialects under `tyFloat08`. -/
+theorem ieeeFormatOfTy?_parity (ty : Ty) :
+    V2026_08_01.MirSemantics.ieeeFormatOfTy? (tyFloat08 ty) =
+      Option.map fmt08 (ieeeFormatOfTy? ty) := by
+  unfold V2026_08_01.MirSemantics.ieeeFormatOfTy? ieeeFormatOfTy? tyFloat08
+  cases ty.kind with
+  | float w => cases w <;> rfl
+  | _ => rfl
+
+/-- `isFloatTy` agrees across dialects under `tyFloat08`. -/
+theorem isFloatTy_parity (ty : Ty) :
+    V2026_08_01.MirSemantics.isFloatTy (tyFloat08 ty) = isFloatTy ty := by
+  unfold V2026_08_01.MirSemantics.isFloatTy isFloatTy tyFloat08
+  cases ty.kind <;> rfl
+
+/-- `isFloatOptTy` agrees across dialects under `Option.map tyFloat08`. -/
+theorem isFloatOptTy_parity (ty? : Option Ty) :
+    V2026_08_01.MirSemantics.isFloatOptTy (Option.map tyFloat08 ty?) = isFloatOptTy ty? := by
+  cases ty? with
+  | none => rfl
+  | some ty => exact isFloatTy_parity ty
+
+/-- **`evalFloatUnaryNeg` parity (format-general)**: whenever `opTy06?` and `opTy08?`
+resolve to the same modeled `IeeeFormat`, `V2026_08_01.evalFloatUnaryNeg` agrees
+with `V2026_06_01.evalFloatUnaryNeg` and leaves `(locals08, mem08)` unchanged. -/
+theorem evalFloatUnaryNeg_parity_of_fmt
+    (sc : ScalarInt) (opTy06? : Option Ty) (opTy08? : Option V2026_08_01.MirAst.Ty)
+    (locals06 : List LocalSlot) (mem06 : Memory)
+    (locals08 : List V2026_08_01.MirSemantics.LocalSlot) (mem08 : V2026_08_01.MirSemantics.Memory)
+    (hfmt : Option.bind opTy08? V2026_08_01.MirSemantics.ieeeFormatOfTy? =
+      Option.map fmt08 (Option.bind opTy06? ieeeFormatOfTy?)) :
+    rvalueResWith06 locals06 mem06
+      (V2026_08_01.MirSemantics.evalFloatUnaryNeg (scalarInt08 sc) opTy08? locals08 mem08) =
+      evalFloatUnaryNeg sc opTy06? locals06 mem06 ∧
+    (∀ v l' m',
+      V2026_08_01.MirSemantics.evalFloatUnaryNeg (scalarInt08 sc) opTy08? locals08 mem08 = .ok v l' m' →
+        l' = locals08 ∧ m' = mem08) := by
+  have h1 : V2026_08_01.MirSemantics.evalFloatUnaryNeg (scalarInt08 sc) opTy08? locals08 mem08 =
+      match Option.bind opTy08? V2026_08_01.MirSemantics.ieeeFormatOfTy? with
+      | .some f =>
+        match Nat.beq sc.sizeBytes f.byteWidth with
+        | true => .ok (.scalar ⟨V2026_08_01.MirSemantics.evalFloatNeg f sc.bits, f.byteWidth⟩) locals08 mem08
+        | false => .unsupported
+      | .none => .unsupported := by
+    cases opTy08? <;> rfl
+  have h2 : evalFloatUnaryNeg sc opTy06? locals06 mem06 =
+      match Option.bind opTy06? ieeeFormatOfTy? with
+      | .some f =>
+        match Nat.beq sc.sizeBytes f.byteWidth with
+        | true => .ok (.scalar ⟨evalFloatNeg f sc.bits, f.byteWidth⟩) locals06 mem06
+        | false => .unsupported
+      | .none => .unsupported := by
+    cases opTy06? <;> rfl
+  rw [h1, h2, hfmt]
+  cases Option.bind opTy06? ieeeFormatOfTy? with
+  | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+  | some f =>
+    dsimp only [Option.map]
+    rw [(fmt08_params f).2.2.2.2.1, evalFloatNeg_parity]
+    cases Nat.beq sc.sizeBytes f.byteWidth with
+    | false => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+    | true => exact ⟨rfl, fun _ _ _ h => by injection h with _ hl hm; exact ⟨hl.symm, hm.symm⟩⟩
+
+/-- **`evalFloatUnaryNeg` parity** under `tyFloat08`. -/
+theorem evalFloatUnaryNeg_parity
+    (sc : ScalarInt) (opTy? : Option Ty)
+    (locals06 : List LocalSlot) (mem06 : Memory)
+    (locals08 : List V2026_08_01.MirSemantics.LocalSlot) (mem08 : V2026_08_01.MirSemantics.Memory) :
+    rvalueResWith06 locals06 mem06
+      (V2026_08_01.MirSemantics.evalFloatUnaryNeg (scalarInt08 sc) (Option.map tyFloat08 opTy?) locals08 mem08) =
+      evalFloatUnaryNeg sc opTy? locals06 mem06 ∧
+    (∀ v l' m',
+      V2026_08_01.MirSemantics.evalFloatUnaryNeg (scalarInt08 sc) (Option.map tyFloat08 opTy?) locals08 mem08 = .ok v l' m' →
+        l' = locals08 ∧ m' = mem08) := by
+  apply evalFloatUnaryNeg_parity_of_fmt
+  cases opTy? with
+  | none => rfl
+  | some ty => exact ieeeFormatOfTy?_parity ty
+
+/-- **`evalFloatScalarBinOp` parity (format-general)**: whenever `lhsTy06?`/`lhsTy08?`
+and `rhsTy06?`/`rhsTy08?` agree on their modeled `IeeeFormat`, `V2026_08_01.evalFloatScalarBinOp`
+agrees with `V2026_06_01.evalFloatScalarBinOp` for every `BinOp` and leaves
+`(locals08, mem08)` unchanged. -/
+theorem evalFloatScalarBinOp_parity_of_fmt
+    (op : BinOp) (lhs rhs : ScalarInt)
+    (lhsTy06? rhsTy06? : Option Ty)
+    (lhsTy08? rhsTy08? : Option V2026_08_01.MirAst.Ty)
+    (locals06 : List LocalSlot) (mem06 : Memory)
+    (locals08 : List V2026_08_01.MirSemantics.LocalSlot) (mem08 : V2026_08_01.MirSemantics.Memory)
+    (hfmtL : Option.bind lhsTy08? V2026_08_01.MirSemantics.ieeeFormatOfTy? =
+      Option.map fmt08 (Option.bind lhsTy06? ieeeFormatOfTy?))
+    (hfmtR : Option.bind rhsTy08? V2026_08_01.MirSemantics.ieeeFormatOfTy? =
+      Option.map fmt08 (Option.bind rhsTy06? ieeeFormatOfTy?)) :
+    rvalueResWith06 locals06 mem06
+      (V2026_08_01.MirSemantics.evalFloatScalarBinOp (binOp08 op) (scalarInt08 lhs) (scalarInt08 rhs)
+        lhsTy08? rhsTy08? locals08 mem08) =
+      evalFloatScalarBinOp op lhs rhs lhsTy06? rhsTy06? locals06 mem06 ∧
+    (∀ v l' m',
+      V2026_08_01.MirSemantics.evalFloatScalarBinOp (binOp08 op) (scalarInt08 lhs) (scalarInt08 rhs)
+        lhsTy08? rhsTy08? locals08 mem08 = .ok v l' m' →
+        l' = locals08 ∧ m' = mem08) := by
+  have h1 : V2026_08_01.MirSemantics.evalFloatScalarBinOp (binOp08 op) (scalarInt08 lhs) (scalarInt08 rhs)
+        lhsTy08? rhsTy08? locals08 mem08 =
+      match Option.bind lhsTy08? V2026_08_01.MirSemantics.ieeeFormatOfTy?,
+          Option.bind rhsTy08? V2026_08_01.MirSemantics.ieeeFormatOfTy? with
+      | .some fL, .some fR =>
+        let sameFmt : Bool :=
+          match fL, fR with | .binary32, .binary32 => true | .binary64, .binary64 => true | _, _ => false
+        match Bool.and sameFmt
+            (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth)) with
+        | true =>
+          match V2026_08_01.MirSemantics.evalFloatBinOp (binOp08 op) fL lhs.bits rhs.bits with
+          | .some outSc => .ok (.scalar outSc) locals08 mem08
+          | .none => .unsupported
+        | false => .unsupported
+      | _, _ => .unsupported := by
+    cases lhsTy08? with
+    | none => rfl
+    | some lTy =>
+      cases rhsTy08? with
+      | none =>
+        unfold V2026_08_01.MirSemantics.evalFloatScalarBinOp; dsimp only [Option.bind]
+        cases V2026_08_01.MirSemantics.ieeeFormatOfTy? lTy <;> rfl
+      | some rTy => rfl
+  have h2 : evalFloatScalarBinOp op lhs rhs lhsTy06? rhsTy06? locals06 mem06 =
+      match Option.bind lhsTy06? ieeeFormatOfTy?, Option.bind rhsTy06? ieeeFormatOfTy? with
+      | .some fL, .some fR =>
+        let sameFmt : Bool :=
+          match fL, fR with | .binary32, .binary32 => true | .binary64, .binary64 => true | _, _ => false
+        match Bool.and sameFmt
+            (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth)) with
+        | true =>
+          match evalFloatBinOp op fL lhs.bits rhs.bits with
+          | .some outSc => .ok (.scalar outSc) locals06 mem06
+          | .none => .unsupported
+        | false => .unsupported
+      | _, _ => .unsupported := by
+    cases lhsTy06? with
+    | none => rfl
+    | some lTy =>
+      cases rhsTy06? with
+      | none =>
+        unfold evalFloatScalarBinOp; dsimp only [Option.bind]
+        cases ieeeFormatOfTy? lTy <;> rfl
+      | some rTy => rfl
+  rw [h1, h2, hfmtL, hfmtR]
+  cases Option.bind lhsTy06? ieeeFormatOfTy? with
+  | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+  | some fL =>
+    cases Option.bind rhsTy06? ieeeFormatOfTy? with
+    | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+    | some fR =>
+      dsimp only [Option.map]
+      cases fL <;> cases fR
+      · rw [evalFloatBinOp_parity]
+        dsimp only [fmt08, V2026_08_01.MirSemantics.IeeeFormat.byteWidth, IeeeFormat.byteWidth,
+          Bool.true_and]
+        cases Bool.and (Nat.beq lhs.sizeBytes 4) (Nat.beq rhs.sizeBytes 4) with
+        | false => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+        | true =>
+          cases evalFloatBinOp op .binary32 lhs.bits rhs.bits with
+          | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+          | some outSc =>
+            dsimp only [Option.map]
+            refine ⟨?_, fun _ _ _ h => by injection h with _ hl hm; exact ⟨hl.symm, hm.symm⟩⟩
+            show RvalueEvalResult.ok (Value.scalar (scalarInt06 (scalarInt08 outSc))) locals06 mem06 = _
+            rw [scalarInt06_scalarInt08]; rfl
+      · exact ⟨rfl, fun _ _ _ h => by cases h⟩
+      · exact ⟨rfl, fun _ _ _ h => by cases h⟩
+      · rw [evalFloatBinOp_parity]
+        dsimp only [fmt08, V2026_08_01.MirSemantics.IeeeFormat.byteWidth, IeeeFormat.byteWidth,
+          Bool.true_and]
+        cases Bool.and (Nat.beq lhs.sizeBytes 8) (Nat.beq rhs.sizeBytes 8) with
+        | false => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+        | true =>
+          cases evalFloatBinOp op .binary64 lhs.bits rhs.bits with
+          | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+          | some outSc =>
+            dsimp only [Option.map]
+            refine ⟨?_, fun _ _ _ h => by injection h with _ hl hm; exact ⟨hl.symm, hm.symm⟩⟩
+            show RvalueEvalResult.ok (Value.scalar (scalarInt06 (scalarInt08 outSc))) locals06 mem06 = _
+            rw [scalarInt06_scalarInt08]; rfl
+
+/-- **`evalFloatScalarBinOp` parity** under `tyFloat08`. -/
+theorem evalFloatScalarBinOp_parity
+    (op : BinOp) (lhs rhs : ScalarInt) (lhsTy? rhsTy? : Option Ty)
+    (locals06 : List LocalSlot) (mem06 : Memory)
+    (locals08 : List V2026_08_01.MirSemantics.LocalSlot) (mem08 : V2026_08_01.MirSemantics.Memory) :
+    rvalueResWith06 locals06 mem06
+      (V2026_08_01.MirSemantics.evalFloatScalarBinOp (binOp08 op) (scalarInt08 lhs) (scalarInt08 rhs)
+        (Option.map tyFloat08 lhsTy?) (Option.map tyFloat08 rhsTy?) locals08 mem08) =
+      evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals06 mem06 ∧
+    (∀ v l' m',
+      V2026_08_01.MirSemantics.evalFloatScalarBinOp (binOp08 op) (scalarInt08 lhs) (scalarInt08 rhs)
+        (Option.map tyFloat08 lhsTy?) (Option.map tyFloat08 rhsTy?) locals08 mem08 = .ok v l' m' →
+        l' = locals08 ∧ m' = mem08) := by
+  apply evalFloatScalarBinOp_parity_of_fmt
+  · cases lhsTy? with | none => rfl | some ty => exact ieeeFormatOfTy?_parity ty
+  · cases rhsTy? with | none => rfl | some ty => exact ieeeFormatOfTy?_parity ty
+
+private theorem mergeByteProvenance_parity (p₁ p₂ : Option (Nat × Nat)) :
+    V2026_08_01.MirSemantics.mergeByteProvenance p₁ p₂ = mergeByteProvenance p₁ p₂ := by
+  cases p₂ with
+  | none => rfl
+  | some _ => cases p₁ <;> rfl
+
+/-- `decodeLittleEndianBytes` agrees across dialects on all byte sequences. -/
+theorem decodeLittleEndianBytes_parity (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.decodeLittleEndianBytes (bs.map abstractByte08) =
+      decodeLittleEndianBytes bs := by
+  induction bs with
+  | nil => rfl
+  | cons b rest ih =>
+    cases b with
+    | uninit => rfl
+    | init byte prov =>
+      unfold V2026_08_01.MirSemantics.decodeLittleEndianBytes decodeLittleEndianBytes
+      dsimp only [List.map, abstractByte08]
+      rewrite [ih]
+      cases decodeLittleEndianBytes rest with
+      | none => rfl
+      | some res =>
+        rcases res with ⟨highBits, restProv⟩
+        exact congrArg
+          (fun p => Option.some (Nat.add byte.toBitVec.toNat (Nat.mul 256 highBits), p))
+          (mergeByteProvenance_parity prov restProv)
+
+/-- `decodeScalarBytes` agrees across dialects on all byte sequences. -/
+theorem decodeScalarBytes_parity (bs : List AbstractByte) (signed : Bool) :
+    V2026_08_01.MirSemantics.decodeScalarBytes (bs.map abstractByte08) signed =
+      Option.map (fun p => (scalarInt08 p.1, p.2)) (decodeScalarBytes bs signed) := by
+  unfold V2026_08_01.MirSemantics.decodeScalarBytes decodeScalarBytes
+  dsimp only
+  rw [length_map_abstractByte08, decodeLittleEndianBytes_parity]
+  cases Nat.beq (length bs) 0 with
+  | true => rfl
+  | false =>
+    cases decodeLittleEndianBytes bs with
+    | none => rfl
+    | some res => rcases res with ⟨bits, prov⟩; rfl
+
+/-- `abstractBytesAllProvAux` agrees across dialects on all byte sequences. -/
+theorem abstractBytesAllProvAux_parity (allocId tag : Nat) (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.abstractBytesAllProvAux allocId tag (bs.map abstractByte08) =
+      abstractBytesAllProvAux allocId tag bs := by
+  induction bs with
+  | nil => rfl
+  | cons b rest ih =>
+    cases b with
+    | uninit => rfl
+    | init _ prov =>
+      cases prov with
+      | none => rfl
+      | some p =>
+        rcases p with ⟨a, t⟩
+        show Bool.and (Bool.and (Nat.beq a allocId) (Nat.beq t tag))
+            (V2026_08_01.MirSemantics.abstractBytesAllProvAux allocId tag (rest.map abstractByte08)) = _
+        rw [ih]; rfl
+
+/-- `abstractBytesUniformProv` agrees across dialects on all byte sequences. -/
+theorem abstractBytesUniformProv_parity (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.abstractBytesUniformProv (bs.map abstractByte08) =
+      abstractBytesUniformProv bs := by
+  cases bs with
+  | nil => rfl
+  | cons b rest =>
+    cases b with
+    | uninit => rfl
+    | init _ prov =>
+      cases prov with
+      | none => rfl
+      | some p => rcases p with ⟨a, t⟩; exact abstractBytesAllProvAux_parity a t rest
+
+/-- `primitiveKindByteWidth` agrees across dialects. -/
+theorem primitiveKindByteWidth_parity (pk : PrimitiveKind) :
+    V2026_08_01.MirSemantics.primitiveKindByteWidth (primitiveKind08 pk) =
+      primitiveKindByteWidth pk := by
+  cases pk <;> rfl
+
+/-- `scalarLayoutByteWidth` agrees across dialects. -/
+theorem scalarLayoutByteWidth_parity (sl : ScalarLayout) :
+    V2026_08_01.MirSemantics.scalarLayoutByteWidth (scalarLayout08 sl) =
+      scalarLayoutByteWidth sl := by
+  cases sl with
+  | initialized pk _ => exact primitiveKindByteWidth_parity pk
+  | union pk => exact primitiveKindByteWidth_parity pk
+
+/-- `wrappingRangeContains` agrees across dialects. -/
+theorem wrappingRangeContains_parity (vr : WrappingRange) (v : Nat) :
+    V2026_08_01.MirSemantics.wrappingRangeContains (wrappingRange08 vr) v =
+      wrappingRangeContains vr v := by
+  cases vr; rfl
+
+/-- `isValidCharCode` agrees across dialects. -/
+theorem isValidCharCode_parity (code : Nat) :
+    V2026_08_01.MirSemantics.isValidCharCode code = isValidCharCode code := rfl
+
+/-- **`decodeScalarLayoutBytesNoForge` parity**: the UCG-630 policy-parametric scalar
+byte decoder agrees across dialects for EVERY `ScalarLayout`, byte sequence, and
+`Ptr2IntTransmutePolicy` (transported losslessly through injective `value06`). -/
+theorem decodeScalarLayoutBytesNoForge_parity
+    (sl : ScalarLayout) (bs : List AbstractByte) (policy : Ptr2IntTransmutePolicy) :
+    Option.map value06
+      (V2026_08_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (scalarLayout08 sl) (bs.map abstractByte08) (policy08 policy)) =
+      decodeScalarLayoutBytesNoForge sl bs policy := by
+  unfold V2026_08_01.MirSemantics.decodeScalarLayoutBytesNoForge decodeScalarLayoutBytesNoForge
+  rw [scalarLayoutByteWidth_parity, length_map_abstractByte08]
+  cases scalarLayoutByteWidth sl with
+  | none => rfl
+  | some sz =>
+    dsimp only
+    cases Nat.beq (length bs) sz with
+    | false => dsimp only; rfl
+    | true =>
+      dsimp only
+      have hdec_init : ∀ vr : WrappingRange,
+          Option.map value06
+            (match V2026_08_01.MirSemantics.decodeScalarBytes (bs.map abstractByte08) false with
+             | .none => .none
+             | .some (sv, _) =>
+               match V2026_08_01.MirSemantics.wrappingRangeContains (wrappingRange08 vr) sv.bits with
+               | false => .none
+               | true =>
+                 match Bool.and (Nat.beq sv.sizeBytes 4)
+                     (Bool.and (Nat.beq (wrappingRange08 vr).start 0) (Nat.beq (wrappingRange08 vr).end_ 0x10FFFF)) with
+                 | true =>
+                   match V2026_08_01.MirSemantics.isValidCharCode sv.bits with
+                   | true => .some (.scalar sv)
+                   | false => .none
+                 | false => .some (.scalar sv)) =
+            (match decodeScalarBytes bs false with
+             | .none => .none
+             | .some (sv, _) =>
+               match wrappingRangeContains vr sv.bits with
+               | false => .none
+               | true =>
+                 match Bool.and (Nat.beq sv.sizeBytes 4)
+                     (Bool.and (Nat.beq vr.start 0) (Nat.beq vr.end_ 0x10FFFF)) with
+                 | true =>
+                   match isValidCharCode sv.bits with
+                   | true => .some (.scalar sv)
+                   | false => .none
+                 | false => .some (.scalar sv)) := by
+        intro vr
+        rw [decodeScalarBytes_parity]
+        cases decodeScalarBytes bs false with
+        | none => rfl
+        | some res =>
+          rcases res with ⟨sv, _⟩
+          dsimp only [Option.map, scalarInt08]
+          rw [wrappingRangeContains_parity]
+          cases wrappingRangeContains vr sv.bits with
+          | false => rfl
+          | true =>
+            dsimp only [wrappingRange08]
+            cases Bool.and (Nat.beq sv.sizeBytes 4)
+                (Bool.and (Nat.beq vr.start 0) (Nat.beq vr.end_ 0x10FFFF)) with
+            | false =>
+              show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
+              rw [scalarInt06_scalarInt08]
+            | true =>
+              rw [isValidCharCode_parity]
+              cases isValidCharCode sv.bits with
+              | false => rfl
+              | true =>
+                show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
+                rw [scalarInt06_scalarInt08]
+      have hdec_union :
+          Option.map value06
+            (match V2026_08_01.MirSemantics.decodeScalarBytes (bs.map abstractByte08) false with
+             | .some (sv, _) => .some (.scalar sv)
+             | .none => .none) =
+            (match decodeScalarBytes bs false with
+             | .some (sv, _) => .some (.scalar sv)
+             | .none => .none) := by
+        rw [decodeScalarBytes_parity]
+        cases decodeScalarBytes bs false with
+        | none => rfl
+        | some res =>
+          rcases res with ⟨sv, _⟩
+          dsimp only [Option.map]
+          show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
+          rw [scalarInt06_scalarInt08]
+      cases sl with
+      | initialized pk vr =>
+        cases pk with
+        | pointer _ =>
+          dsimp only [scalarLayout08, primitiveKind08]
+          rw [decodeScalarBytes_parity, abstractBytesUniformProv_parity]
+          cases decodeScalarBytes bs false with
+          | none => rfl
+          | some res =>
+            rcases res with ⟨sv, prov⟩
+            dsimp only [Option.map, scalarInt08]
+            cases abstractBytesUniformProv bs with
+            | true =>
+              cases prov with
+              | some p => rcases p with ⟨allocId, _⟩; rfl
+              | none =>
+                rw [wrappingRangeContains_parity]
+                cases wrappingRangeContains vr sv.bits with
+                | true =>
+                  show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
+                  rw [scalarInt06_scalarInt08]
+                | false => rfl
+            | false =>
+              rw [wrappingRangeContains_parity]
+              cases wrappingRangeContains vr sv.bits with
+              | true =>
+                show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
+                rw [scalarInt06_scalarInt08]
+              | false => rfl
+        | int _ _ =>
+          dsimp only [scalarLayout08, primitiveKind08]
+          cases policy with
+          | strictUcg630Ub =>
+            dsimp only [policy08]
+            rw [abstractBytesHaveProv_parity]
+            cases abstractBytesHaveProv bs with
+            | true => rfl
+            | false => exact hdec_init vr
+          | stripProvenance =>
+            dsimp only [policy08]
+            exact hdec_init vr
+        | float _ =>
+          dsimp only [scalarLayout08, primitiveKind08]
+          cases policy with
+          | strictUcg630Ub =>
+            dsimp only [policy08]
+            rw [abstractBytesHaveProv_parity]
+            cases abstractBytesHaveProv bs with
+            | true => rfl
+            | false => exact hdec_init vr
+          | stripProvenance =>
+            dsimp only [policy08]
+            exact hdec_init vr
+      | union pk =>
+        cases pk with
+        | pointer _ =>
+          dsimp only [scalarLayout08, primitiveKind08]
+          rw [decodeScalarBytes_parity, abstractBytesUniformProv_parity]
+          cases decodeScalarBytes bs false with
+          | none => rfl
+          | some res =>
+            rcases res with ⟨sv, prov⟩
+            dsimp only [Option.map, scalarInt08]
+            cases abstractBytesUniformProv bs with
+            | true =>
+              cases prov with
+              | some p => rcases p with ⟨allocId, _⟩; rfl
+              | none =>
+                show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
+                rw [scalarInt06_scalarInt08]
+            | false =>
+              show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
+              rw [scalarInt06_scalarInt08]
+        | int _ _ =>
+          dsimp only [scalarLayout08, primitiveKind08]
+          cases policy with
+          | strictUcg630Ub =>
+            dsimp only [policy08]
+            rw [abstractBytesHaveProv_parity]
+            cases abstractBytesHaveProv bs with
+            | true => rfl
+            | false => exact hdec_union
+          | stripProvenance =>
+            dsimp only [policy08]
+            exact hdec_union
+        | float _ =>
+          dsimp only [scalarLayout08, primitiveKind08]
+          cases policy with
+          | strictUcg630Ub =>
+            dsimp only [policy08]
+            rw [abstractBytesHaveProv_parity]
+            cases abstractBytesHaveProv bs with
+            | true => rfl
+            | false => exact hdec_union
+          | stripProvenance =>
+            dsimp only [policy08]
+            exact hdec_union
+
 end DialectParity
 
 /-! ## §7. IEEE 754-2008 special-case table, documented signed-zero rule, & no-NaN-input `nanChoices`
@@ -8458,6 +9619,615 @@ theorem evalFloatArithBase_sub_zero_sign (f : IeeeFormat) (a b : Nat) (sa sb s :
   rw [evalFloatArithBase_sub_eq_add_neg] at h
   exact evalFloatArithBase_add_zero_sign f a (evalFloatNeg f b) sa (Bool.not sb) s ha hnb h
 
+/-! ### `evalRvalue`-level realization, dispatcher laws, & subtraction-as-negated-addition -/
+
+/-- `evalFloatBinOp .sub` coincides unconditionally with `evalFloatBinOp .add` on the
+negated right operand (including on NaN inputs, because deterministic `evalFloatArithBase`
+always returns `preferredNaNBits f` on any NaN). -/
+theorem evalFloatBinOp_sub_eq_add_neg (f : IeeeFormat) (a b : Nat) :
+    evalFloatBinOp .sub f a b = evalFloatBinOp .add f a (evalFloatNeg f b) := by
+  have hsub : evalFloatCmp .sub f a b = .none := rfl
+  have hadd : evalFloatCmp .add f a (evalFloatNeg f b) = .none := rfl
+  unfold evalFloatBinOp
+  rw [hsub, hadd, evalFloatArithBase_sub_eq_add_neg]
+
+/-- Mode-parametric subtraction-as-negated-addition for `EvalFloatBinOpRel`: holds
+unconditionally in BOTH `.deterministic` and `.nondeterministic` modes. -/
+theorem EvalFloatBinOpRel.sub_iff_add_neg (mode : FloatArithMode) (f : IeeeFormat) (a b : Nat)
+    (out : ScalarInt) :
+    EvalFloatBinOpRel mode .sub f a b out ↔
+      EvalFloatBinOpRel mode .add f a (evalFloatNeg f b) out := by
+  cases mode with
+  | deterministic =>
+    rw [← evalFloatBinOp_iff_rel_det, ← evalFloatBinOp_iff_rel_det, evalFloatBinOp_sub_eq_add_neg]
+  | nondeterministic =>
+    exact EvalFloatBinOpRel.nondet_sub_iff_add_neg f a b out
+
+private theorem evalFloatScalarBinOp_rel_det_iff
+    (op : BinOp) (lhs rhs : ScalarInt) (lhsTy? rhsTy? : Option Ty)
+    (locals : List LocalSlot) (mem : Memory) (res : RvalueEvalResult) :
+    (match lhsTy?, rhsTy? with
+     | .some lTy, .some rTy =>
+       match ieeeFormatOfTy? lTy, ieeeFormatOfTy? rTy with
+       | .some fL, .some fR =>
+         match Bool.and
+             (match fL, fR with | .binary32, .binary32 => true | .binary64, .binary64 => true | _, _ => false)
+             (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth)) with
+         | true =>
+           match evalFloatBinOp op fL lhs.bits rhs.bits with
+           | .some _ =>
+             ∃ outSc, EvalFloatBinOpRel .deterministic op fL lhs.bits rhs.bits outSc ∧
+               res = .ok (.scalar outSc) locals mem
+           | .none => res = .unsupported
+         | false => res = .unsupported
+       | _, _ => res = .unsupported
+     | _, _ => res = .unsupported) ↔
+      res = evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals mem := by
+  unfold evalFloatScalarBinOp
+  cases lhsTy? with
+  | none => exact Iff.rfl
+  | some lTy =>
+    cases rhsTy? with
+    | none => exact Iff.rfl
+    | some rTy =>
+      dsimp only
+      cases ieeeFormatOfTy? lTy with
+      | none => exact Iff.rfl
+      | some fL =>
+        cases ieeeFormatOfTy? rTy with
+        | none => exact Iff.rfl
+        | some fR =>
+          have hdiag (f : IeeeFormat) :
+              (match evalFloatBinOp op f lhs.bits rhs.bits with
+               | .some _ =>
+                 ∃ outSc, EvalFloatBinOpRel .deterministic op f lhs.bits rhs.bits outSc ∧
+                   res = .ok (.scalar outSc) locals mem
+               | .none => res = .unsupported) ↔
+                res = match evalFloatBinOp op f lhs.bits rhs.bits with
+                  | .some outSc => .ok (.scalar outSc) locals mem
+                  | .none => .unsupported := by
+            cases hbin : evalFloatBinOp op f lhs.bits rhs.bits with
+            | none => exact Iff.rfl
+            | some outSc =>
+              dsimp only
+              constructor
+              · rintro ⟨outSc', hrel, hres⟩
+                have heq : evalFloatBinOp op f lhs.bits rhs.bits = .some outSc' :=
+                  (evalFloatBinOp_iff_rel_det op f lhs.bits rhs.bits outSc').mpr hrel
+                rw [hbin] at heq
+                injection heq with hsc
+                rw [hres, hsc]
+              · intro hres
+                exact ⟨outSc, (evalFloatBinOp_iff_rel_det op f lhs.bits rhs.bits outSc).mp hbin, hres⟩
+          cases fL <;> cases fR <;> dsimp only
+          · cases Bool.and (Nat.beq lhs.sizeBytes IeeeFormat.binary32.byteWidth)
+                (Nat.beq rhs.sizeBytes IeeeFormat.binary32.byteWidth) with
+            | false => exact Iff.rfl
+            | true => exact hdiag .binary32
+          · exact Iff.rfl
+          · exact Iff.rfl
+          · cases Bool.and (Nat.beq lhs.sizeBytes IeeeFormat.binary64.byteWidth)
+                (Nat.beq rhs.sizeBytes IeeeFormat.binary64.byteWidth) with
+            | false => exact Iff.rfl
+            | true => exact hdiag .binary64
+
+/-- On every `Rvalue.binaryOp` (at any `Ptr2IntTransmutePolicy`), `EvalRvalueFloatRel .deterministic`
+is equivalent to `res = evalRvalue ...`. -/
+theorem EvalRvalueFloatRel_det_binaryOp_iff
+    (policy : Ptr2IntTransmutePolicy) (locals : List LocalSlot)
+    (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult) :
+    EvalRvalueFloatRel .deterministic policy locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts res ↔
+      res = evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts := by
+  have hnon_offset : ∀ (op' : BinOp) (lhs rhs : ScalarInt) (locals₂ : List LocalSlot),
+      (match Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+          (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+       | true =>
+         match operandTy localDecls layouts lhsOp, operandTy localDecls layouts rhsOp with
+         | .some lTy, .some rTy =>
+           match ieeeFormatOfTy? lTy, ieeeFormatOfTy? rTy with
+           | .some fL, .some fR =>
+             match Bool.and
+                 (match fL, fR with | .binary32, .binary32 => true | .binary64, .binary64 => true | _, _ => false)
+                 (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth)) with
+             | true =>
+               match evalFloatBinOp op' fL lhs.bits rhs.bits with
+               | .some _ =>
+                 ∃ outSc, EvalFloatBinOpRel .deterministic op' fL lhs.bits rhs.bits outSc ∧
+                   res = .ok (.scalar outSc) locals₂ mem
+               | .none => res = .unsupported
+             | false => res = .unsupported
+           | _, _ => res = .unsupported
+         | _, _ => res = .unsupported
+       | false => res = evalScalarBinOp op' lhs rhs locals₂ mem (operandIsSigned localDecls lhsOp layouts)) ↔
+      res =
+        match Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+            (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+        | true => evalFloatScalarBinOp op' lhs rhs (operandTy localDecls layouts lhsOp)
+            (operandTy localDecls layouts rhsOp) locals₂ mem
+        | false => evalScalarBinOp op' lhs rhs locals₂ mem (operandIsSigned localDecls lhsOp layouts) := by
+    intro op' lhs rhs locals₂
+    cases Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+        (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+    | false => exact Iff.rfl
+    | true => exact evalFloatScalarBinOp_rel_det_iff op' lhs rhs _ _ locals₂ mem res
+  unfold EvalRvalueFloatRel
+  dsimp only
+  cases hl : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+  | ub => unfold evalRvalue; dsimp only; rw [hl]
+  | unsupported => unfold evalRvalue; dsimp only; rw [hl]
+  | ok lhsVal locals₁ =>
+    dsimp only
+    cases hr : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+    | ub => unfold evalRvalue; dsimp only; rw [hl]; dsimp only; rw [hr]
+    | unsupported => unfold evalRvalue; dsimp only; rw [hl]; dsimp only; rw [hr]
+    | ok rhsVal locals₂ =>
+      dsimp only
+      cases lhsVal with
+      | scalar lhs =>
+        cases rhsVal with
+        | scalar rhs =>
+          dsimp only
+          have heval_sc :
+              evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts =
+                match op with
+                | .offset => evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs
+                | _ =>
+                  let lhsTy := operandTy localDecls layouts lhsOp
+                  let rhsTy := operandTy localDecls layouts rhsOp
+                  match Bool.or (isFloatOptTy lhsTy) (isFloatOptTy rhsTy) with
+                  | true => evalFloatScalarBinOp op lhs rhs lhsTy rhsTy locals₂ mem
+                  | false =>
+                    let isSigned := operandIsSigned localDecls lhsOp layouts
+                    evalScalarBinOp op lhs rhs locals₂ mem isSigned := by
+            unfold evalRvalue; dsimp only; rw [hl]; dsimp only; rewrite [hr]; cases op <;> rfl
+          rw [heval_sc]
+          have hop := hnon_offset op lhs rhs locals₂
+          cases op with
+          | offset => exact Iff.rfl
+          | _ => exact hop
+        | _ => exact Iff.rfl
+      | _ => exact Iff.rfl
+
+/-- For every `rv` other than `.cast .floatToFloat`, `EvalRvalueFloatRel .deterministic .strictUcg630Ub`
+coincides exactly with `evalRvalue`. -/
+theorem EvalRvalueFloatRel_det_iff_evalRvalue
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hNotF2F : ∀ op targetTy, rv ≠ .cast .floatToFloat op targetTy) :
+    EvalRvalueFloatRel .deterministic .strictUcg630Ub locals rv mem localDecls layouts res ↔
+      res = evalRvalue locals rv mem localDecls layouts := by
+  cases rv with
+  | binaryOp op lhsOp rhsOp =>
+    exact EvalRvalueFloatRel_det_binaryOp_iff .strictUcg630Ub locals op lhsOp rhsOp mem localDecls layouts res
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat => exact absurd rfl (hNotF2F op targetTy)
+    | _ => exact Iff.rfl
+  | _ => exact Iff.rfl
+
+/-- On `.cast .floatToFloat` with a non-NaN source scalar, `EvalRvalueFloatRel` agrees
+exactly with `evalRvalue` in BOTH `.deterministic` and `.nondeterministic` modes (at any
+`Ptr2IntTransmutePolicy`). -/
+theorem EvalRvalueFloatRel_floatToFloat_of_not_nan
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy srcTy : Ty)
+    (sc : ScalarInt) (src : IeeeFormat)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar sc) locals')
+    (hty : operandTy localDecls layouts op = .some srcTy)
+    (hfmt : ieeeFormatOfTy? srcTy = .some src)
+    (hnotNan : isNaNBits src sc.bits = false) :
+    EvalRvalueFloatRel mode policy locals (.cast .floatToFloat op targetTy) mem localDecls layouts res ↔
+      res = evalRvalue locals (.cast .floatToFloat op targetTy) mem localDecls layouts := by
+  unfold EvalRvalueFloatRel evalRvalue evalFloatCastRvalue evalFloatCast
+  dsimp only
+  rw [hop]
+  dsimp only
+  rw [hty]
+  dsimp only
+  rw [hfmt]
+  cases ieeeFormatOfTy? targetTy with
+  | none => exact Iff.rfl
+  | some dst =>
+    dsimp only
+    cases Nat.beq sc.sizeBytes src.byteWidth with
+    | false => exact Iff.rfl
+    | true =>
+      dsimp only
+      rw [if_neg' (by rw [hnotNan]; exact Bool.false_ne_true)]
+
+/-- **Universal `.nondeterministic` realization**: for EVERY `rv : Rvalue` (including
+float `.unaryOp .neg`, float `.binaryOp`, NaN-input `.cast .floatToFloat`, `.cast .transmute`,
+and every fallback arm), the executable `evalRvalue` result satisfies
+`EvalRvalueFloatRel .nondeterministic .strictUcg630Ub`. -/
+theorem evalRvalue_realizes_EvalRvalueFloatRel_nondet
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    EvalRvalueFloatRel .nondeterministic .strictUcg630Ub locals rv mem localDecls layouts
+      (evalRvalue locals rv mem localDecls layouts) := by
+  cases rv with
+  | binaryOp op lhsOp rhsOp =>
+    exact EvalRvalueFloatRel.det_imp_nondet .strictUcg630Ub locals (.binaryOp op lhsOp rhsOp)
+      mem localDecls layouts _
+      ((EvalRvalueFloatRel_det_binaryOp_iff .strictUcg630Ub locals op lhsOp rhsOp mem localDecls layouts _).mpr rfl)
+  | cast kind op targetTy =>
+    cases kind with
+    | floatToFloat =>
+      unfold EvalRvalueFloatRel evalRvalue evalFloatCastRvalue evalFloatCast
+      dsimp only
+      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+      | ub => rfl
+      | unsupported => rfl
+      | ok v locals' =>
+        dsimp only
+        cases operandTy localDecls layouts op with
+        | none => rfl
+        | some srcTy =>
+          cases v with
+          | scalar sc =>
+            dsimp only
+            cases ieeeFormatOfTy? srcTy with
+            | none => rfl
+            | some src =>
+              cases ieeeFormatOfTy? targetTy with
+              | none => rfl
+              | some dst =>
+                dsimp only
+                cases Nat.beq sc.sizeBytes src.byteWidth with
+                | false => rfl
+                | true =>
+                  dsimp only
+                  by_cases hnan : isNaNBits src sc.bits = true
+                  · rw [if_pos' hnan]
+                    exact ⟨evalFloatToFloatRoundTiesToEven src dst sc.bits,
+                      evalFloatToFloat_nan_mem_nanChoices_nondet src dst sc.bits hnan, rfl⟩
+                  · rw [if_neg' hnan]
+          | _ => rfl
+    | _ => rfl
+  | _ => rfl
+
+/-- Any `.ok` result of `evalRvalue` on `.unaryOp .neg` realizes `EvalRvalueFloatRel` in
+BOTH `.deterministic` and `.nondeterministic` modes (at any `Ptr2IntTransmutePolicy`). -/
+theorem evalRvalue_ok_realizes_EvalRvalueFloatRel_unaryNeg
+    (policy : Ptr2IntTransmutePolicy) (locals locals' : List LocalSlot)
+    (op : Operand) (val : Value) (mem mem' : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (heval : evalRvalue locals (.unaryOp .neg op) mem localDecls layouts = .ok val locals' mem') :
+    EvalRvalueFloatRel .deterministic policy locals (.unaryOp .neg op) mem localDecls layouts (.ok val locals' mem') ∧
+    EvalRvalueFloatRel .nondeterministic policy locals (.unaryOp .neg op) mem localDecls layouts (.ok val locals' mem') :=
+  ⟨heval.symm, heval.symm⟩
+
+/-- Any `.ok` result of `evalRvalue` on `.binaryOp` realizes `EvalRvalueFloatRel` in
+BOTH `.deterministic` and `.nondeterministic` modes (at any `Ptr2IntTransmutePolicy`). -/
+theorem evalRvalue_ok_realizes_EvalRvalueFloatRel_binaryOp
+    (policy : Ptr2IntTransmutePolicy) (locals locals' : List LocalSlot)
+    (binOp : BinOp) (lhsOp rhsOp : Operand) (val : Value) (mem mem' : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (heval : evalRvalue locals (.binaryOp binOp lhsOp rhsOp) mem localDecls layouts = .ok val locals' mem') :
+    EvalRvalueFloatRel .deterministic policy locals (.binaryOp binOp lhsOp rhsOp) mem localDecls layouts (.ok val locals' mem') ∧
+    EvalRvalueFloatRel .nondeterministic policy locals (.binaryOp binOp lhsOp rhsOp) mem localDecls layouts (.ok val locals' mem') := by
+  have hdet := (EvalRvalueFloatRel_det_binaryOp_iff policy locals binOp lhsOp rhsOp mem localDecls layouts _).mpr heval.symm
+  exact ⟨hdet, EvalRvalueFloatRel.det_imp_nondet policy locals (.binaryOp binOp lhsOp rhsOp) mem localDecls layouts _ hdet⟩
+
+/-- Any `.ok` result of `evalRvalue` realizes `EvalRvalueFloatRel .nondeterministic .strictUcg630Ub`
+unconditionally, and also realizes `.deterministic` whenever `rv` is not `.cast .floatToFloat`. -/
+theorem evalRvalue_ok_realizes_EvalRvalueFloatRel
+    (locals locals' : List LocalSlot) (rv : Rvalue) (val : Value) (mem mem' : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (heval : evalRvalue locals rv mem localDecls layouts = .ok val locals' mem') :
+    EvalRvalueFloatRel .nondeterministic .strictUcg630Ub locals rv mem localDecls layouts (.ok val locals' mem') ∧
+    ((∀ op targetTy, rv ≠ .cast .floatToFloat op targetTy) →
+      EvalRvalueFloatRel .deterministic .strictUcg630Ub locals rv mem localDecls layouts (.ok val locals' mem')) := by
+  refine ⟨by rw [← heval]; exact evalRvalue_realizes_EvalRvalueFloatRel_nondet locals rv mem localDecls layouts, ?_⟩
+  intro hnot
+  exact (EvalRvalueFloatRel_det_iff_evalRvalue locals rv mem localDecls layouts _ hnot).mpr heval.symm
+
+/-- **`evalRvalue`-level NaN `floatToFloat` separation witness**: casting `0x7FC00001_f32`
+to `f64` evaluates via `evalRvalue` to `0x7FF8000020000000`, which IS admitted by
+`EvalRvalueFloatRel .nondeterministic` and is NOT admitted by `EvalRvalueFloatRel .deterministic`,
+proving that the `rv ≠ .cast .floatToFloat` side condition in `EvalRvalueFloatRel_det_iff_evalRvalue`
+is necessary. -/
+theorem evalRvalue_floatToFloat_nan_rel_separation_witness :
+    let f64Ty : Ty := { kind := .float .f64, layoutIdx := 0 }
+    let op := mkFloatConstOp f32Ty 0x7FC00001 4
+    let rv : Rvalue := .cast .floatToFloat op f64Ty
+    let res : RvalueEvalResult := .ok (.scalar ⟨0x7FF8000020000000, 8⟩) .nil emptyMemory
+    evalRvalue .nil rv emptyMemory .nil emptyLayoutTable = res ∧
+    EvalRvalueFloatRel .nondeterministic .strictUcg630Ub .nil rv emptyMemory .nil emptyLayoutTable res ∧
+    ¬ EvalRvalueFloatRel .deterministic .strictUcg630Ub .nil rv emptyMemory .nil emptyLayoutTable res := by
+  dsimp only
+  have heval :
+      evalRvalue .nil (.cast .floatToFloat (mkFloatConstOp f32Ty 0x7FC00001 4)
+        { kind := .float .f64, layoutIdx := 0 }) emptyMemory .nil emptyLayoutTable =
+        .ok (.scalar ⟨0x7FF8000020000000, 8⟩) .nil emptyMemory := rfl
+  refine ⟨heval, ?_, ?_⟩
+  · rw [← heval]
+    exact evalRvalue_realizes_EvalRvalueFloatRel_nondet .nil _ emptyMemory .nil emptyLayoutTable
+  · intro hdet
+    unfold EvalRvalueFloatRel at hdet
+    dsimp only at hdet
+    have hop :
+        evalOperand .nil (mkFloatConstOp f32Ty 0x7FC00001 4)
+          emptyMemory.borrows emptyMemory.globals emptyLayoutTable
+          emptyMemory.callerLocals .nil emptyMemory.callStack =
+        .ok (.scalar ⟨0x7FC00001, 4⟩) .nil := rfl
+    have hfmtSrc : ieeeFormatOfTy? f32Ty = .some .binary32 := rfl
+    have hfmtDst : ieeeFormatOfTy? { kind := .float .f64, layoutIdx := 0 } = .some .binary64 := rfl
+    have hsz : Nat.beq 4 IeeeFormat.binary32.byteWidth = true := rfl
+    have hnan : isNaNBits .binary32 0x7FC00001 = true := rfl
+    have hmod : 0x7FC00001 % 2 ^ IeeeFormat.binary32.width = 0x7FC00001 := rfl
+    have hch : nanChoices .binary64 [(.binary32, 0x7FC00001)] .deterministic = [0x7FF8000000000000] := rfl
+    rw [hop] at hdet
+    dsimp only at hdet
+    rw [hfmtSrc, hfmtDst] at hdet
+    dsimp only at hdet
+    rw [hsz] at hdet
+    dsimp only at hdet
+    rw [if_pos' hnan, hmod, hch] at hdet
+    rcases hdet with ⟨cand, hmem, hres⟩
+    rcases List.mem_cons.mp hmem with rfl | hnil
+    · injection hres with hval _ _
+      injection hval with hsc
+      injection hsc with hbits _
+      exact absurd hbits (by decide)
+    · cases hnil
+
+/-- Dispatcher law for `evalRvalue` on `.unaryOp .neg` over a float scalar operand. -/
+theorem evalRvalue_unaryOp_neg_float
+    (locals locals' : List LocalSlot) (op : Operand) (sc : ScalarInt)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar sc) locals')
+    (hfloat : isFloatOptTy (operandTy localDecls layouts op) = true) :
+    evalRvalue locals (.unaryOp .neg op) mem localDecls layouts =
+      evalFloatUnaryNeg sc (operandTy localDecls layouts op) locals' mem := by
+  unfold evalRvalue
+  dsimp only
+  rw [hop]
+  dsimp only
+  rw [hfloat]
+
+/-- Dispatcher law for `evalRvalue` on any non-`.offset` `.binaryOp` over scalar operands
+when at least one operand has a floating-point static type. -/
+theorem evalRvalue_binaryOp_float
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand)
+    (lhs rhs : ScalarInt) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hnotOff : op ≠ .offset)
+    (hl : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar lhs) locals₁)
+    (hr : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar rhs) locals₂)
+    (hfloat : Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+        (isFloatOptTy (operandTy localDecls layouts rhsOp)) = true) :
+    evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts =
+      evalFloatScalarBinOp op lhs rhs (operandTy localDecls layouts lhsOp)
+        (operandTy localDecls layouts rhsOp) locals₂ mem := by
+  unfold evalRvalue
+  dsimp only
+  rw [hl]
+  dsimp only
+  rw [hr]
+  dsimp only
+  cases op with
+  | offset => exact absurd rfl hnotOff
+  | _ => dsimp only; rw [hfloat]
+
+/-- **`evalFloatScalarBinOp` subtraction-as-negated-addition**: whenever `evalFloatUnaryNeg`
+negates `rhs` to `rhsNeg`, `evalFloatScalarBinOp .sub lhs rhs` equals
+`evalFloatScalarBinOp .add lhs rhsNeg` unconditionally (for all bit patterns including NaNs). -/
+theorem evalFloatScalarBinOp_sub_eq_add_neg
+    (lhs rhs rhsNeg : ScalarInt) (lhsTy? rhsTy? : Option Ty)
+    (locals : List LocalSlot) (mem : Memory)
+    (hneg : evalFloatUnaryNeg rhs rhsTy? locals mem = .ok (.scalar rhsNeg) locals mem) :
+    evalFloatScalarBinOp .sub lhs rhs lhsTy? rhsTy? locals mem =
+      evalFloatScalarBinOp .add lhs rhsNeg lhsTy? rhsTy? locals mem := by
+  unfold evalFloatUnaryNeg at hneg
+  cases hrty : rhsTy? with
+  | none => rw [hrty] at hneg; cases hneg
+  | some rTy =>
+    rw [hrty] at hneg
+    dsimp only at hneg
+    cases hrf : ieeeFormatOfTy? rTy with
+    | none => rw [hrf] at hneg; cases hneg
+    | some fR =>
+      rw [hrf] at hneg
+      dsimp only at hneg
+      cases hsz : Nat.beq rhs.sizeBytes fR.byteWidth with
+      | false => rw [hsz] at hneg; cases hneg
+      | true =>
+        rw [hsz] at hneg
+        dsimp only at hneg
+        injection hneg with hval _ _
+        injection hval with hsc
+        rw [← hsc]
+        unfold evalFloatScalarBinOp
+        cases lhsTy? with
+        | none => rfl
+        | some lTy =>
+          dsimp only
+          rw [hrf]
+          cases ieeeFormatOfTy? lTy with
+          | none => rfl
+          | some fL =>
+            dsimp only
+            cases fL <;> cases fR <;> dsimp only
+            · have hsz_eq : Nat.beq IeeeFormat.binary32.byteWidth IeeeFormat.binary32.byteWidth = true := rfl
+              rw [hsz, hsz_eq]
+              cases Nat.beq lhs.sizeBytes IeeeFormat.binary32.byteWidth with
+              | false => rfl
+              | true => rw [evalFloatBinOp_sub_eq_add_neg]
+            · rfl
+            · rfl
+            · have hsz_eq : Nat.beq IeeeFormat.binary64.byteWidth IeeeFormat.binary64.byteWidth = true := rfl
+              rw [hsz, hsz_eq]
+              cases Nat.beq lhs.sizeBytes IeeeFormat.binary64.byteWidth with
+              | false => rfl
+              | true => rw [evalFloatBinOp_sub_eq_add_neg]
+
+/-- Direct bit-level form of `evalFloatScalarBinOp_sub_eq_add_neg` using `evalFloatNeg`
+on the RHS scalar bits. -/
+theorem evalFloatScalarBinOp_sub_eq_add_neg_bits
+    (lhs rhs : ScalarInt) (lhsTy? : Option Ty) (rTy : Ty) (f : IeeeFormat)
+    (locals : List LocalSlot) (mem : Memory)
+    (hrf : ieeeFormatOfTy? rTy = .some f) (hsz : rhs.sizeBytes = f.byteWidth) :
+    evalFloatScalarBinOp .sub lhs rhs lhsTy? (.some rTy) locals mem =
+      evalFloatScalarBinOp .add lhs ⟨evalFloatNeg f rhs.bits, rhs.sizeBytes⟩ lhsTy? (.some rTy) locals mem := by
+  have hneg : evalFloatUnaryNeg rhs (.some rTy) locals mem =
+      .ok (.scalar ⟨evalFloatNeg f rhs.bits, rhs.sizeBytes⟩) locals mem := by
+    unfold evalFloatUnaryNeg
+    dsimp only
+    rw [hrf]
+    dsimp only
+    rw [hsz, Nat.beq_refl]
+  exact evalFloatScalarBinOp_sub_eq_add_neg lhs rhs _ lhsTy? (.some rTy) locals mem hneg
+
+/-- **`evalRvalue` subtraction-as-negated-addition**: evaluating `lhsOp - rhsOp` coincides
+with evaluating `lhsOp + negRhsOp` whenever `negRhsOp` has the same float type as `rhsOp`
+and evaluates to its `evalFloatUnaryNeg` negation. -/
+theorem evalRvalue_sub_eq_add_neg_float
+    (locals locals₁ locals₂ : List LocalSlot)
+    (lhsOp rhsOp negRhsOp : Operand)
+    (lhs rhs rhsNeg : ScalarInt)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hl : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar lhs) locals₁)
+    (hr : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar rhs) locals₂)
+    (hrn : evalOperand locals₁ negRhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar rhsNeg) locals₂)
+    (hty : operandTy localDecls layouts negRhsOp = operandTy localDecls layouts rhsOp)
+    (hneg : evalFloatUnaryNeg rhs (operandTy localDecls layouts rhsOp) locals₂ mem =
+      .ok (.scalar rhsNeg) locals₂ mem) :
+    evalRvalue locals (.binaryOp .sub lhsOp rhsOp) mem localDecls layouts =
+      evalRvalue locals (.binaryOp .add lhsOp negRhsOp) mem localDecls layouts := by
+  have hfloatR : isFloatOptTy (operandTy localDecls layouts rhsOp) = true := by
+    unfold evalFloatUnaryNeg at hneg
+    cases hrty : operandTy localDecls layouts rhsOp with
+    | none => rw [hrty] at hneg; cases hneg
+    | some rTy =>
+      rw [hrty] at hneg
+      dsimp only at hneg
+      unfold isFloatOptTy isFloatTy
+      cases hrf : ieeeFormatOfTy? rTy with
+      | none => rw [hrf] at hneg; cases hneg
+      | some _ =>
+        unfold ieeeFormatOfTy? at hrf
+        cases hrk : rTy.kind with
+        | float _ => dsimp only; rw [hrk]
+        | _ => rw [hrk] at hrf; cases hrf
+  rw [evalRvalue_binaryOp_float locals locals₁ locals₂ .sub lhsOp rhsOp lhs rhs mem localDecls layouts
+        (fun h => nomatch h) hl hr (by rw [hfloatR, Bool.or_true]),
+      evalRvalue_binaryOp_float locals locals₁ locals₂ .add lhsOp negRhsOp lhs rhsNeg mem localDecls layouts
+        (fun h => nomatch h) hl hrn (by rw [hty, hfloatR, Bool.or_true]),
+      hty]
+  exact evalFloatScalarBinOp_sub_eq_add_neg lhs rhs rhsNeg _ _ locals₂ mem hneg
+
+/-- **`EvalRvalueFloatRel` subtraction-as-negated-addition (both modes)**:
+`EvalRvalueFloatRel mode policy` admits the exact same result set for `lhsOp - rhsOp` and
+`lhsOp + negRhsOp` in BOTH `.deterministic` and `.nondeterministic` modes (at any
+`Ptr2IntTransmutePolicy`). -/
+theorem EvalRvalueFloatRel_sub_iff_add_neg_float
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals locals₁ locals₂ : List LocalSlot)
+    (lhsOp rhsOp negRhsOp : Operand)
+    (lhs rhs rhsNeg : ScalarInt)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (res : RvalueEvalResult)
+    (hl : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar lhs) locals₁)
+    (hr : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar rhs) locals₂)
+    (hrn : evalOperand locals₁ negRhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar rhsNeg) locals₂)
+    (hty : operandTy localDecls layouts negRhsOp = operandTy localDecls layouts rhsOp)
+    (hneg : evalFloatUnaryNeg rhs (operandTy localDecls layouts rhsOp) locals₂ mem =
+      .ok (.scalar rhsNeg) locals₂ mem) :
+    EvalRvalueFloatRel mode policy locals (.binaryOp .sub lhsOp rhsOp) mem localDecls layouts res ↔
+      EvalRvalueFloatRel mode policy locals (.binaryOp .add lhsOp negRhsOp) mem localDecls layouts res := by
+  have hrfmt : ∃ rTy fR,
+      operandTy localDecls layouts rhsOp = .some rTy ∧
+      ieeeFormatOfTy? rTy = .some fR ∧
+      Nat.beq rhs.sizeBytes fR.byteWidth = true ∧
+      rhsNeg = ⟨evalFloatNeg fR rhs.bits, fR.byteWidth⟩ := by
+    unfold evalFloatUnaryNeg at hneg
+    cases hrty : operandTy localDecls layouts rhsOp with
+    | none => rw [hrty] at hneg; cases hneg
+    | some rTy =>
+      rw [hrty] at hneg
+      dsimp only at hneg
+      cases hrf : ieeeFormatOfTy? rTy with
+      | none => rw [hrf] at hneg; cases hneg
+      | some fR =>
+        rw [hrf] at hneg
+        dsimp only at hneg
+        cases hsz : Nat.beq rhs.sizeBytes fR.byteWidth with
+        | false => rw [hsz] at hneg; cases hneg
+        | true =>
+          rw [hsz] at hneg
+          dsimp only at hneg
+          injection hneg with hval _ _
+          injection hval with hsc
+          exact ⟨rTy, fR, rfl, hrf, hsz, hsc.symm⟩
+  obtain ⟨rTy, fR, hrTy, hrf, hszR, hrNeg⟩ := hrfmt
+  have hfloatR : isFloatOptTy (.some rTy) = true := by
+    unfold isFloatOptTy isFloatTy
+    unfold ieeeFormatOfTy? at hrf
+    cases hrk : rTy.kind with
+    | float _ => dsimp only; rw [hrk]
+    | _ => rw [hrk] at hrf; cases hrf
+  unfold EvalRvalueFloatRel
+  dsimp only
+  rw [hl]
+  dsimp only
+  rw [hr, hrn]
+  dsimp only
+  rw [hty, hrTy]
+  rw [hfloatR, Bool.or_true]
+  dsimp only
+  rw [hrNeg]
+  cases operandTy localDecls layouts lhsOp with
+  | none => exact Iff.rfl
+  | some lTy =>
+    dsimp only
+    rw [hrf]
+    cases ieeeFormatOfTy? lTy with
+    | none => exact Iff.rfl
+    | some fL =>
+      dsimp only
+      cases fL <;> cases fR <;> dsimp only
+      · have hsz_eq : Nat.beq IeeeFormat.binary32.byteWidth IeeeFormat.binary32.byteWidth = true := rfl
+        rw [hszR, hsz_eq]
+        cases Nat.beq lhs.sizeBytes IeeeFormat.binary32.byteWidth with
+        | false => exact Iff.rfl
+        | true =>
+          rw [evalFloatBinOp_sub_eq_add_neg]
+          cases evalFloatBinOp .add .binary32 lhs.bits (evalFloatNeg .binary32 rhs.bits) with
+          | none => exact Iff.rfl
+          | some _ =>
+            constructor
+            · rintro ⟨outSc, hrel, hres⟩
+              exact ⟨outSc, (EvalFloatBinOpRel.sub_iff_add_neg mode _ _ _ _).mp hrel, hres⟩
+            · rintro ⟨outSc, hrel, hres⟩
+              exact ⟨outSc, (EvalFloatBinOpRel.sub_iff_add_neg mode _ _ _ _).mpr hrel, hres⟩
+      · exact Iff.rfl
+      · exact Iff.rfl
+      · have hsz_eq : Nat.beq IeeeFormat.binary64.byteWidth IeeeFormat.binary64.byteWidth = true := rfl
+        rw [hszR, hsz_eq]
+        cases Nat.beq lhs.sizeBytes IeeeFormat.binary64.byteWidth with
+        | false => exact Iff.rfl
+        | true =>
+          rw [evalFloatBinOp_sub_eq_add_neg]
+          cases evalFloatBinOp .add .binary64 lhs.bits (evalFloatNeg .binary64 rhs.bits) with
+          | none => exact Iff.rfl
+          | some _ =>
+            constructor
+            · rintro ⟨outSc, hrel, hres⟩
+              exact ⟨outSc, (EvalFloatBinOpRel.sub_iff_add_neg mode _ _ _ _).mp hrel, hres⟩
+            · rintro ⟨outSc, hrel, hres⟩
+              exact ⟨outSc, (EvalFloatBinOpRel.sub_iff_add_neg mode _ _ _ _).mpr hrel, hres⟩
+
 /-! ## §8. Axiom guards
 
 Every public theorem of this file is pinned to `[propext, Quot.sound]` (zero
@@ -8477,7 +10247,7 @@ particular this catches `omega` silently adding `Classical.choice` when an
 section AxiomGuards
 
 set_option linter.defProp false in
-/-- Axiom-audit bundle for the `Scalars`-level theory: every public theorem of §0, §2, §3, §4 (except `EvalRvalueFloatRel.det_imp_nondet`), §6, and §7. -/
+/-- Axiom-audit bundle for the `Scalars`-level theory: every public `Scalars`-level theorem of §0, §2, §3, §4, §6, and §7. -/
 def axiomAudit_scalars :=
   And.intro (@pack_unpack_f32) <|
   And.intro (@unpackBits_mod) <|
@@ -8538,6 +10308,14 @@ def axiomAudit_scalars :=
   And.intro (@evalFloatArithBase_mul_oneBits) <|
   And.intro (@evalFloatArithBase_rem_finite_exact) <|
   And.intro (@evalFloatArithBase_rem_finite_eq_zero_iff) <|
+  And.intro (@overflowThreshold_eq) <|
+  And.intro (@maxFiniteBits_props) <|
+  And.intro (@decodeBits_finite_le_maxFiniteVal) <|
+  And.intro (@roundRatioTiesToEven_eq_inf_iff) <|
+  And.intro (@decodeBits_roundRatioTiesToEven_eq_inf_iff) <|
+  And.intro (@roundRatioTiesToEven_lt_inf_isFinite) <|
+  And.intro (@roundRatioTiesToEven_eq_maxFiniteBits) <|
+  And.intro (@roundRatioTiesToEven_overflow_boundary) <|
   And.intro (@roundRatioTiesToEven_neg) <|
   And.intro (@evalFloatToFloatRoundTiesToEven_evalFloatNeg) <|
   And.intro (@mem_expandNanSigns_iff) <|
@@ -8612,7 +10390,9 @@ def axiomAudit_scalars :=
   And.intro (@evalFloatArithBase_sub_eq_add_neg) <|
   And.intro (@evalFloatArithBase_add_neg_neg) <|
   And.intro (@evalFloatArithBase_add_zero_sign) <|
-  @evalFloatArithBase_sub_zero_sign
+  And.intro (@evalFloatArithBase_sub_zero_sign) <|
+  And.intro (@evalFloatBinOp_sub_eq_add_neg) <|
+  @EvalFloatBinOpRel.sub_iff_add_neg
 
 /--
 info: 'Anneal.Mir.IeeeFloatArith.axiomAudit_scalars'
@@ -8622,7 +10402,7 @@ depends on axioms: [propext, Quot.sound]
 #print axioms axiomAudit_scalars
 
 set_option linter.defProp false in
-/-- Axiom-audit bundle for the `Places`-level theory: every public theorem of §1 and §5, plus `EvalRvalueFloatRel.det_imp_nondet`. -/
+/-- Axiom-audit bundle for the `Places`-level theory: every public `Places`-level theorem of §1, §4, §5, §6, and §7. -/
 def axiomAudit_places :=
   And.intro (@pack_unpack_f32) <|
   And.intro (@finding1_neg_one_f32) <|
@@ -8662,7 +10442,40 @@ def axiomAudit_places :=
   And.intro (@unresolved_slot0_tuple_and_custom_dst_witnesses) <|
   And.intro (@evalByteCastRichWithPolicy_struct_ref_no_forge) <|
   And.intro (@evalByteCastRichWithPolicy_struct_fnPtr_no_forge) <|
-  @evalByteCastRichWithPolicy_enum_no_forge_ref_and_fnPtr
+  And.intro (@evalByteCastRichWithPolicy_enum_no_forge_ref_and_fnPtr) <|
+  And.intro (@scalarInt06_scalarInt08) <|
+  And.intro (@value06_injective) <|
+  And.intro (@valueList06_injective) <|
+  And.intro (@ieeeFormatOfTy?_parity) <|
+  And.intro (@isFloatTy_parity) <|
+  And.intro (@isFloatOptTy_parity) <|
+  And.intro (@evalFloatUnaryNeg_parity_of_fmt) <|
+  And.intro (@evalFloatUnaryNeg_parity) <|
+  And.intro (@evalFloatScalarBinOp_parity_of_fmt) <|
+  And.intro (@evalFloatScalarBinOp_parity) <|
+  And.intro (@decodeLittleEndianBytes_parity) <|
+  And.intro (@decodeScalarBytes_parity) <|
+  And.intro (@abstractBytesAllProvAux_parity) <|
+  And.intro (@abstractBytesUniformProv_parity) <|
+  And.intro (@primitiveKindByteWidth_parity) <|
+  And.intro (@scalarLayoutByteWidth_parity) <|
+  And.intro (@wrappingRangeContains_parity) <|
+  And.intro (@isValidCharCode_parity) <|
+  And.intro (@decodeScalarLayoutBytesNoForge_parity) <|
+  And.intro (@EvalRvalueFloatRel_det_binaryOp_iff) <|
+  And.intro (@EvalRvalueFloatRel_det_iff_evalRvalue) <|
+  And.intro (@EvalRvalueFloatRel_floatToFloat_of_not_nan) <|
+  And.intro (@evalRvalue_realizes_EvalRvalueFloatRel_nondet) <|
+  And.intro (@evalRvalue_ok_realizes_EvalRvalueFloatRel_unaryNeg) <|
+  And.intro (@evalRvalue_ok_realizes_EvalRvalueFloatRel_binaryOp) <|
+  And.intro (@evalRvalue_ok_realizes_EvalRvalueFloatRel) <|
+  And.intro (@evalRvalue_floatToFloat_nan_rel_separation_witness) <|
+  And.intro (@evalRvalue_unaryOp_neg_float) <|
+  And.intro (@evalRvalue_binaryOp_float) <|
+  And.intro (@evalFloatScalarBinOp_sub_eq_add_neg) <|
+  And.intro (@evalFloatScalarBinOp_sub_eq_add_neg_bits) <|
+  And.intro (@evalRvalue_sub_eq_add_neg_float) <|
+  @EvalRvalueFloatRel_sub_iff_add_neg_float
 
 /--
 info: 'Anneal.Mir.IeeeFloatArith.axiomAudit_places'
