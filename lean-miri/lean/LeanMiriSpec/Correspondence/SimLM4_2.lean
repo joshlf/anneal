@@ -511,9 +511,15 @@ theorem call_intrinsic_rotate_stage1_boundary
         (m', .error (.undefinedBehavior msg)))) := by
   obtain ⟨tf₀, hframes₀, _, _, _, hcal, hstack, _, _, _, _, _⟩ := id hstate
   have hk : k.stage1Unmodeled = true := by rcases hrot with ⟨rfl, _⟩ | ⟨rfl, _⟩ <;> rfl
+  have hNoDyn : ∀ dk, ty.kind ≠ .dynamic dk := by
+    intro dk h
+    cases hint with
+    | int _ hk' => rw [h] at hk'; cases hk'
+    | uint _ hk' => rw [h] at hk'; cases hk'
   have hstep := stepMirFn_stage1_unmodeled_intrinsic_extCall hcal hphase hbb hstmt_none hstmt_len
     hk hterm hc hcallee
     (operandsHaveLeadingOpaqueCastMove_two_of_wellTyped (hop₁ tf₀ hframes₀) (hop₂ tf₀ hframes₀))
+    hNoDyn
   rw [hstack] at hstep
   refine ⟨hstep, ?_⟩
   rcases call_intrinsic_rotate_simulation hstate hphase hbb hstmt_none hstmt_len hrot hterm hint

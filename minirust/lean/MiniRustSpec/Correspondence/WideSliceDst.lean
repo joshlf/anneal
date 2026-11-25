@@ -840,6 +840,34 @@ theorem takeValues_eq_take : ∀ (n : Nat) (xs : List MirSemantics.Value), takeV
   | _ + 1, [] => rfl
   | k + 1, x :: xs => congrArg (x :: ·) (takeValues_eq_take k xs)
 
+/-- A local whose `*`-projection has slice type is not a `dyn Trait` pointer
+local: `dynPlaceLocalKind?` (the `dyn Trait` reborrow dispatch of
+`evalRvalueRefDeref` / `evalRvalueRawPtr` on wide pointer values) is `none`, so
+the slice wide-pointer path is taken. -/
+theorem dynPlaceLocalKind?_eq_none_of_deref_slice
+    {localDecls : List LocalDecl} {sIdx : Local} {elem : RigidTy} {lIdx : LayoutIdx}
+    (hTy : placeTy localDecls emptyLayoutTable ⟨sIdx, [.deref]⟩ =
+      some { kind := .slice elem, layoutIdx := lIdx }) :
+    dynPlaceLocalKind? localDecls sIdx = none := by
+  unfold dynPlaceLocalKind?
+  unfold placeTy at hTy
+  dsimp only at hTy
+  cases hg : get? localDecls sIdx with
+  | none => rfl
+  | some d =>
+    rw [hg] at hTy
+    rcases d with ⟨mut_, ⟨k, lidx⟩, dn⟩
+    cases k with
+    | ref _ inner =>
+      cases inner with
+      | dynamic _ => simp [resolveProjectedTy, pointeeTyOf] at hTy
+      | _ => rfl
+    | rawPtr _ inner =>
+      cases inner with
+      | dynamic _ => simp [resolveProjectedTy, pointeeTyOf] at hTy
+      | _ => rfl
+    | _ => rfl
+
 /-- **Symbolic Anneal borrow-backed `Rvalue.len (*s)` and `.frozen` mutable-reborrow UB
 (`evalRvalue_len_and_frozen_mut_reborrow_wide_slice`)**:
 1. When `sIdx` holds a borrow-backed wide slice pointer (`lookupBorrow mem.borrows p.tag = some entry`,
@@ -903,11 +931,13 @@ theorem evalRvalue_len_and_frozen_mut_reborrow_wide_slice
         hBle, Nat.beq_refl, Bool.and_self, Bool.false_and, Bool.and_false]
   · intro hFrozen hSlSlot
     have hPtr8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
+    have hNoDyn : dynPlaceLocalKind? localDecls sIdx = none :=
+      dynPlaceLocalKind?_eq_none_of_deref_slice hTy
     unfold annealWidePtrVal at hSlSlot
     unfold evalRvalue evalRvalueRefDeref
     dsimp (config := { zeta := true }) only
     rw [hSlSlot]
-    simp only []
+    simp only [hNoDyn]
     generalize Bool.and _ _ = g
     cases g
     · rfl
@@ -1179,6 +1209,7 @@ theorem checkPtr_sliceRef_null_and_zeroByte_reborrow_divergence
     (localsNullProv localsSc localsDangMut : List LocalSlot)
     (localDecls : List LocalDecl) (sIdx : Local)
     (hLen : len < scalarModulus 8)
+    (hNoDyn : dynPlaceLocalKind? localDecls sIdx = none)
     (hNullProvSlot :
       get? localsNullProv sIdx = some (.init (annealWidePtrVal { allocId := 0, offsetBytes := 0 } 0 8)))
     (hScSlot :
@@ -1254,7 +1285,7 @@ theorem checkPtr_sliceRef_null_and_zeroByte_reborrow_divergence
     unfold evalRvalue evalRvalueRefDeref
     dsimp (config := { zeta := true }) only
     rw [hNullProvSlot]
-    simp only []
+    simp only [hNoDyn]
     generalize Bool.and _ _ = g
     cases g
     · rfl
@@ -1265,13 +1296,13 @@ theorem checkPtr_sliceRef_null_and_zeroByte_reborrow_divergence
     unfold evalRvalue evalRvalueRefDeref
     dsimp (config := { zeta := true }) only
     rw [hScSlot]
-    rfl
+    simp only [hNoDyn]
   · have hPtr8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
     unfold annealWidePtrVal at hDangMutSlot
     unfold evalRvalue evalRvalueRefDeref
     dsimp (config := { zeta := true }) only
     rw [hDangMutSlot]
-    simp only []
+    simp only [hNoDyn]
     generalize Bool.and _ _ = g
     cases g
     · rfl

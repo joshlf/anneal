@@ -23454,7 +23454,10 @@ example {s : MachineState} {body : CapturedMir} {term : Terminator}
     (hc : c.ty.kind = .fnDef defPath typeArgs)
     (hcallee : lookupCallee s.memory.callees body.layouts defPath typeArgs
       s.memory.traitImpls = none)
-    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false)
+    (hNotDynPath : isAddrEqDefPath defPath = false ∧ isMemSizeOfValDefPath defPath = false ∧
+      isMemAlignOfValDefPath defPath = false)
+    (hNoDyn : ∀ k rest, typeArgs ≠ .dynamic k :: rest) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -23464,7 +23467,7 @@ example {s : MachineState} {body : CapturedMir} {term : Terminator}
           (resumeExternalCall s locals' destination targetBb unwind)
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported :=
-  evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc
+  evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc hNotDynPath hNoDyn
 
 example {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
@@ -23481,7 +23484,8 @@ example {body : CapturedMir} {s : MachineState}
     (hc : c.ty.kind = .fnDef k.defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts k.defPath [argKind]
       s.memory.traitImpls = none)
-    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false)
+    (hNoDyn : ∀ dk, argKind ≠ .dynamic dk) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -23492,7 +23496,7 @@ example {body : CapturedMir} {s : MachineState}
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported :=
   stepMirFn_stage1_unmodeled_intrinsic_extCall hcal hphase hbb hstmt_none hstmt_len hk hterm hc
-    hcallee hnc
+    hcallee hnc hNoDyn
 
 example {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
@@ -23510,7 +23514,8 @@ example {body : CapturedMir} {s : MachineState}
     (hc : c.ty.kind = .fnDef defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts defPath [argKind]
       s.memory.traitImpls = none)
-    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false)
+    (hNoDyn : ∀ dk, argKind ≠ .dynamic dk) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -23521,7 +23526,7 @@ example {body : CapturedMir} {s : MachineState}
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported :=
   stepMirFn_stage1_std_offset_alias_extCall hcal hphase hbb hstmt_none hstmt_len halias hterm hc
-    hcallee hnc
+    hcallee hnc hNoDyn
 
 example (k : Stage1ExtraIntrinsic) :
     classifyRustIntrinsic? k.defPath = some k.toRustIntrinsicKind ∧
@@ -24021,6 +24026,7 @@ open LeanMiriSpec.Correspondence in
   evalTerminator_stage1_wrappingAdd_call
   AnnealIntrinsic.stage1Unmodeled
   AnnealIntrinsic.stage1Unmodeled_classify
+  AnnealIntrinsic.stage1Unmodeled_notDynPath
   AnnealIntrinsic.stage1Modeled
   AnnealIntrinsic.stage1Modeled_classify
   stage1_std_offset_aliases_unclassified

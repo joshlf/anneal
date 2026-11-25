@@ -2037,7 +2037,12 @@ Stage-1 executes inline with its own `evalWriteBytesCall`.) -/
 /-- **Stage-1 external-call boundary**: Stage-1 `evalTerminator` on an unlinked
 direct call whose `DefPath` is neither `exact_div` nor recognized by
 `classifyRustIntrinsic?` evaluates the arguments and emits
-`MirStepNode.extCall` (or reports the arguments' undefined behavior). -/
+`MirStepNode.extCall` (or reports the arguments' undefined behavior).
+
+The call must also lie outside Stage-1's `dyn` call hook (`evalDynCallHook?`):
+the callee is not `core::ptr::addr_eq` / `core::mem::{size_of_val,
+align_of_val}` (`hNotDynPath`), and its first type argument is not a trait
+object (`hNoDyn`), so no `InstanceKind::Virtual` dispatch applies. -/
 theorem evalTerminator_stage1_unclassified_call_extCall
     {s : MachineState} {body : CapturedMir} {term : Terminator}
     {c : ConstOperand} {argOps : List MirAst.Operand} {destination : Place}
@@ -2049,7 +2054,10 @@ theorem evalTerminator_stage1_unclassified_call_extCall
     (hc : c.ty.kind = .fnDef defPath typeArgs)
     (hcallee : lookupCallee s.memory.callees body.layouts defPath typeArgs
       s.memory.traitImpls = none)
-    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false)
+    (hNotDynPath : isAddrEqDefPath defPath = false ∧ isMemSizeOfValDefPath defPath = false ∧
+      isMemAlignOfValDefPath defPath = false)
+    (hNoDyn : ∀ k rest, typeArgs ≠ .dynamic k :: rest) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -2071,6 +2079,19 @@ theorem evalTerminator_stage1_unclassified_call_extCall
     rw [hexact]
     dsimp only [evalDirectRustIntrinsic?]
     rw [hcls]
+    dsimp only
+    have hhook : evalDynCallHook? s (some body) { defPath := defPath, typeArgs := typeArgs }
+        (bodyLocalDeclsOf (some body)) body.layouts argOps vs locals' destination (some targetBb)
+        unwind = none := by
+      unfold evalDynCallHook?
+      cases typeArgs with
+      | nil => simp only [hNotDynPath.1, hNotDynPath.2.1, hNotDynPath.2.2]
+      | cons t rest =>
+        cases t
+        all_goals first
+          | exact absurd rfl (hNoDyn _ rest)
+          | simp only [hNotDynPath.1, hNotDynPath.2.1, hNotDynPath.2.2]
+    rw [hhook]
   | ub => rfl
   | unsupported => rfl
 
@@ -2086,6 +2107,14 @@ theorem AnnealIntrinsic.stage1Unmodeled_classify {k : AnnealIntrinsic}
     classifyRustIntrinsic? k.defPath = none ∧
       stringEq k.defPath "core::intrinsics::exact_div" = false := by
   cases k <;> first | exact absurd hk (by decide) | exact ⟨rfl, rfl⟩
+
+/-- No `stage1Unmodeled` intrinsic is one of the paths of Stage-1's `dyn` call
+hook (`addr_eq`, `size_of_val`, `align_of_val`). -/
+theorem AnnealIntrinsic.stage1Unmodeled_notDynPath {k : AnnealIntrinsic}
+    (hk : k.stage1Unmodeled = true) :
+    isAddrEqDefPath k.defPath = false ∧ isMemSizeOfValDefPath k.defPath = false ∧
+      isMemAlignOfValDefPath k.defPath = false := by
+  cases k <;> first | exact absurd hk (by decide) | exact ⟨rfl, rfl, rfl⟩
 
 /-- Stage-1 `classifyRustIntrinsic?` recognizes neither `std::intrinsics::*` offset
 alias that `AnnealIntrinsic.ofDefPath?` maps to `arith_offset` /
@@ -2120,7 +2149,8 @@ theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
     (hc : c.ty.kind = .fnDef k.defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts k.defPath [argKind]
       s.memory.traitImpls = none)
-    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false)
+    (hNoDyn : ∀ dk, argKind ≠ .dynamic dk) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -2135,6 +2165,8 @@ theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
   obtain ⟨hcls, hexact⟩ := AnnealIntrinsic.stage1Unmodeled_classify hk
   exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc
+    (AnnealIntrinsic.stage1Unmodeled_notDynPath hk)
+    (fun dk rest h => by injection h with h1 _; exact hNoDyn dk h1)
 
 /-- The 12 `AnnealIntrinsic`s that Stage-1 `evalTerminator` evaluates inline
 (`exact_div`, `arith_offset`, `ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
@@ -2173,7 +2205,8 @@ theorem stepMirFn_stage1_std_offset_alias_extCall
     (hc : c.ty.kind = .fnDef defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts defPath [argKind]
       s.memory.traitImpls = none)
-    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false)
+    (hNoDyn : ∀ dk, argKind ≠ .dynamic dk) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -2189,8 +2222,10 @@ theorem stepMirFn_stage1_std_offset_alias_extCall
   rcases halias with rfl | rfl
   · obtain ⟨⟨hcls, hexact⟩, _⟩ := stage1_std_offset_aliases_unclassified
     exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc
+      ⟨rfl, rfl, rfl⟩ (fun dk rest h => by injection h with h1 _; exact hNoDyn dk h1)
   · obtain ⟨_, ⟨hcls, hexact⟩⟩ := stage1_std_offset_aliases_unclassified
     exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc
+      ⟨rfl, rfl, rfl⟩ (fun dk rest h => by injection h with h1 _; exact hNoDyn dk h1)
 
 /-! ## 3. `rotate_left` / `rotate_right`
 

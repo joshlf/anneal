@@ -31079,14 +31079,20 @@ out-of-range or negative signed `unchecked_shl` / `unchecked_shr` count, a signe
 `unchecked_*` overflow, `INT_MIN / -1`, an oversized `size_of_val`, a malformed argument list, or
 an unresolvable signedness / layout), Trusted does not execute the call either: it faults with
 `.ub` or is `.unsupported`. With `evalLIntrinsicValue_refines_evalNonSelectIntrinsicCall` this pins
-Anneal's value intrinsics to Trusted's on every input. -/
+Anneal's value intrinsics to Trusted's on every input.
+
+`hNoDyn` excludes `size_of_val` / `align_of_val` on a `dyn Trait` pointee: Anneal does not model
+trait objects (`evalLIntrinsicValue` is `none` there), whereas Trusted reads the size / alignment
+from the vtable (`evalDynSizeAlignOfVal`) and may succeed. -/
 theorem evalLIntrinsicValue_none_trusted_fault
     {op : LIntrinsicOp} {kind : RustIntrinsicKind} {s : MachineState}
     {target : ResolvedCallTarget} {localDecls : List LocalDecl} {layouts : LayoutTable}
     {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
     {destination : Place} {targetBb : BasicBlockIdx}
     (hKind : op.toRustIntrinsicKind? = some kind)
-    (hEval : evalLIntrinsicValue op target.typeArgs localDecls layouts argOps argVals true = none) :
+    (hEval : evalLIntrinsicValue op target.typeArgs localDecls layouts argOps argVals true = none)
+    (hNoDyn : (op = .sizeOfVal ∨ op = .alignOfVal) →
+      ∀ k, resolveIntrinsicPointeeTy? target localDecls layouts argOps ≠ some (.dynamic k)) :
     evalNonSelectIntrinsicCall kind s target localDecls layouts argOps argVals locals'
         destination targetBb = .fail .ub ∨
       evalNonSelectIntrinsicCall kind s target localDecls layouts argOps argVals locals'
@@ -31124,6 +31130,8 @@ theorem evalLIntrinsicValue_none_trusted_fault
     try simp only [intrinsicUnresolvedLayoutStep, intrinsicMissingPointeeStep,
       intrinsicWidePointeeStep]
     repeat' (first | (left; rfl) | (right; rfl) | split)
+    all_goals first | (exfalso; exact hNoDyn (by simp) _ ‹_›) | skip
+    all_goals clear hNoDyn
     all_goals simp_all [writeIntrinsicScalarResult, writeIntrinsicReturn]
     all_goals exfalso; omega
 
@@ -31159,7 +31167,8 @@ direct call of a `DefPath` that Trusted dispatches inline as the value intrinsic
 (`trustedSupportsIntrinsicDefPath`, i.e. `exact_div` or one of `classifyRustIntrinsic?`'s
 intrinsics) whose arguments evaluate (`hArgsEval`) but which `evalLIntrinsicValue` rejects
 (`hNone`), Anneal's step fails and Trusted's `evalTerminator` faults with `.ub` or is
-`.unsupported`; it never continues to the return block. -/
+`.unsupported`; it never continues to the return block. `hNoDyn` excludes `size_of_val` /
+`align_of_val` on a `dyn Trait` pointee (see `evalLIntrinsicValue_none_trusted_fault`). -/
 theorem evalLoweredTerminator_call_value_intrinsic_fault_parity
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb targetBb : Nat} {b : LBlock}
     {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
@@ -31178,6 +31187,9 @@ theorem evalLoweredTerminator_call_value_intrinsic_fault_parity
     (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
     (hArgsEval : evalOperandsState env.layouts env.globals slots args = some (avs, slotsAfterArgs))
     (hNone : evalLIntrinsicValue op typeArgs env.localDecls env.layouts args avs true = none)
+    (hNoDyn : (op = .sizeOfVal ∨ op = .alignOfVal) →
+      ∀ k, resolveIntrinsicPointeeTy? { defPath := defPath, typeArgs := typeArgs, isIndirect := false }
+        env.localDecls env.layouts args ≠ some (.dynamic k))
     (span : String) :
     evalLoweredTerminator env body bb slots unwinding = none ∧
       (evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = .fail .ub ∨
@@ -31215,7 +31227,7 @@ theorem evalLoweredTerminator_call_value_intrinsic_fault_parity
             (length args) decls lays =
             .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
       fun _ _ => rfl
-    rw [← hDecls] at hNone
+    rw [← hDecls] at hNone hNoDyn
     rcases hVal with rfl | ⟨kind, hKind⟩
     · obtain ⟨hExPath, _⟩ := hSupp
       have hSign :
@@ -31251,6 +31263,7 @@ theorem evalLoweredTerminator_call_value_intrinsic_fault_parity
         hLayouts, hCorr.globals, hTOps, hNoCallee, isDirectExactDivTarget, hNotEx, hDir]
       exact evalLIntrinsicValue_none_trusted_fault
         (target := { defPath := defPath, typeArgs := typeArgs, isIndirect := false }) hKind hNone
+        hNoDyn
 
 /-- An `init`-only Anneal frame below a Trusted frame pins the Trusted frame exactly. -/
 theorem slotsRefine_below_init_eq : ∀ (vs : List Value) (ts : List LocalSlot),
@@ -31511,7 +31524,8 @@ theorem witness_signed_shift_overflow_ub_parity :
       (avs := [.scalar ⟨0xFFFFFFF8, 4⟩, .scalar ⟨0xFFFFFFFF, 4⟩]) (slotsAfterArgs := [.uninit])
       rfl rfl rfl rfl (trustedSupportsIntrinsicDefPath_of_check (by decide))
       (Or.inr ⟨.uncheckedShr, rfl⟩) rfl rfl hCorr (ep2b1_consts_nonDeref _ rfl)
-      (by with_unfolding_all rfl) (by with_unfolding_all rfl) ""
+      (by with_unfolding_all rfl) (by with_unfolding_all rfl)
+      (by rintro (h | h) <;> nomatch h) ""
 
 /-! ### Section 5g: `[adv ep2-A1]` Exact `.ub` Fault Parity (`IntrinsicResolvedInBody`), Target-Presence Boundary, `Ordering` ADT Encoding, Call-Form Memory-Intrinsic CFG Witness, Projected/`PartialShell` Call Destinations, and Wide-Pointer / `char` / `BodyCorr` UB Witnesses
 
@@ -31836,9 +31850,24 @@ theorem evalLoweredTerminator_call_resolved_value_intrinsic_ub_parity
       evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = .fail .ub := by
   have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
     trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
+  have hNoDyn : (op = .sizeOfVal ∨ op = .alignOfVal) →
+      ∀ k, resolveIntrinsicPointeeTy? { defPath := defPath, typeArgs := typeArgs, isIndirect := false }
+        env.localDecls env.layouts args ≠ some (.dynamic k) := by
+    intro hOp k hk
+    rw [resolveIntrinsicPointeeTy?_defPath_irrel _
+      { defPath := "", typeArgs := typeArgs, isIndirect := false } _ _ _ rfl] at hk
+    rcases hOp with rfl | rfl <;>
+      (dsimp only [IntrinsicResolvedInBody] at hRes
+       obtain ⟨pt, hPtEq, hPtRes⟩ := hRes
+       rw [hk, Option.some.injEq] at hPtEq
+       subst hPtEq
+       first
+       | exact hPtRes
+       | simp [SizeOfValPointeeResolved, AlignOfValPointeeResolved] at hPtRes)
   have hAnnealNone : evalLoweredTerminator env body bb slots unwinding = none :=
     (evalLoweredTerminator_call_value_intrinsic_fault_parity hb hT hCallTgt hUb hSupp hVal
-      hLayouts hDecls hCorr hArgsND hArgsEval hNone span).1
+      hLayouts hDecls hCorr hArgsND hArgsEval hNone hNoDyn span).1
+  clear hNoDyn
   refine ⟨hAnnealNone, ?_⟩
   obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines_callStack args slots
     slotsAfterArgs s.frame.locals avs s.memory.borrows env.globals env.layouts
@@ -31945,13 +31974,46 @@ private theorem valueIntrinsic_not_trustedDiverging {defPath : DefPath} {op : LI
     rw [hNone] at hLower
     nomatch hLower
 
+set_option maxRecDepth 100000 in
+/-- None of the adapter's literal intrinsic `DefPath`s is one of the safe wrapper paths that
+`evalDynCallHook?` intercepts by name (`addr_eq`, `size_of_val`, `align_of_val`; kernel-checked). -/
+private theorem adapterLiteralDefPaths_not_dynHookPath :
+    adapterLiteralDefPaths_V2026_06_01.all
+        (fun p => !isAddrEqDefPath p && !isMemSizeOfValDefPath p && !isMemAlignOfValDefPath p) =
+      true := by
+  decide +kernel
+
+/-- **`evalDynCallHook?` declines lowered intrinsics (`evalDynCallHook?_eq_none_of_lowerIntrinsicKind`)**:
+on a direct call of a `DefPath` that `lowerIntrinsicKind_V2026_06_01` lowers to an intrinsic, whose
+type arguments do not start with a `dyn Trait` (`hNoDyn`, which rules out virtual dispatch), Trusted's
+`dyn` call hook returns `none`. -/
+theorem evalDynCallHook?_eq_none_of_lowerIntrinsicKind {defPath : DefPath} {op : LIntrinsicOp}
+    {typeArgs : List RigidTy} (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op)
+    (hNoDyn : ∀ k rest, typeArgs ≠ .dynamic k :: rest)
+    (s : MachineState) (cb : Option CapturedMir) (decls : List LocalDecl) (lays : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot) (dest : Place)
+    (tbb : Option BasicBlockIdx) (u : UnwindAction) :
+    evalDynCallHook? s cb { defPath := defPath, typeArgs := typeArgs, isIndirect := false } decls
+      lays argOps argVals locals' dest tbb u = none := by
+  have hMem : defPath ∈ adapterLiteralDefPaths_V2026_06_01 := by
+    refine Classical.byContradiction fun hNot => ?_
+    rw [(lowerIntrinsicKind_V2026_06_01_off_literals hNot).1] at hLower
+    nomatch hLower
+  have h := List.all_eq_true.mp adapterLiteralDefPaths_not_dynHookPath defPath hMem
+  simp only [Bool.and_eq_true, Bool.not_eq_eq_eq_not, Bool.not_true] at h
+  obtain ⟨⟨hA, hS⟩, hAl⟩ := h
+  unfold evalDynCallHook?
+  simp only [hA, hS, hAl]
+
 /-- **Target-presence boundary Part 1 (`evalLoweredTerminator_call_nonReturning_with_target_extCall`)**:
 a hand-built non-diverging (`target = some targetBb`) direct call to `unreachable_unchecked`,
 `abort`, or `panicUnwind` is rejected fail-closed by `evalLoweredTerminator` (`= none`), whereas
 `Trusted`'s `evalTerminator` dispatches none of those paths inline on a `target = some _` call and
 falls through to `MirStepNode.extCall`. (Call-form `copy_nonoverlapping` / `write_bytes` are
 dispatched inline by `Trusted` since Episode 1 of `ws-repatriate-leaked-ground-semantics-to-tcb`;
-see `evalTerminator_call_copyNonOverlapping_eq` and `evalTerminator_call_writeBytes_eq`.) -/
+see `evalTerminator_call_copyNonOverlapping_eq` and `evalTerminator_call_writeBytes_eq`.)
+`hNoDyn` (type arguments not headed by a `dyn Trait`) rules out Trusted's virtual dispatch through
+`evalDynCallHook?` (`evalDynCallHook?_eq_none_of_lowerIntrinsicKind`). -/
 theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb targetBb : Nat} {b : LBlock}
     {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
@@ -31963,6 +32025,7 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
     (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
     (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op)
     (hKind : op = .unreachableUnchecked ∨ op = .abort ∨ op = .panicUnwind)
+    (hNoDyn : ∀ k rest, typeArgs ≠ .dynamic k :: rest)
     (hLayouts : cm.layouts = env.layouts)
     (hCorr : StateCorr env bb slots s)
     (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
@@ -32021,13 +32084,15 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
         hLayouts, hCorr.globals, hTOpsCS, hNoCallee, isDirectExactDivTarget, hNotEx,
-        evalDirectRustIntrinsic?, hNotRust]⟩
+        evalDirectRustIntrinsic?, hNotRust, evalDynCallHook?_eq_none_of_lowerIntrinsicKind hLower hNoDyn]⟩
 
 /-- **Target-presence boundary Part 2 (`evalLoweredTerminator_call_value_without_target_extCall`)**:
 a hand-built diverging (`target = none`) direct call to any of the 25 value-returning intrinsics is
 rejected fail-closed by `evalLoweredTerminator` (`= none`), whereas `Trusted`'s `evalTerminator`
 dispatches value intrinsics only on `target = some _` calls and falls through to
-`MirStepNode.extCall` with `resumeExternalDivergingCall`. -/
+`MirStepNode.extCall` with `resumeExternalDivergingCall`.
+`hNoDyn` (type arguments not headed by a `dyn Trait`) rules out Trusted's virtual dispatch through
+`evalDynCallHook?` (`evalDynCallHook?_eq_none_of_lowerIntrinsicKind`). -/
 theorem evalLoweredTerminator_call_value_without_target_extCall
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
     {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
@@ -32039,6 +32104,7 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
     (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
     (hSupp : trustedSupportsIntrinsicDefPath defPath op)
     (hVal : op = .exactDiv ∨ ∃ kind, op.toRustIntrinsicKind? = some kind)
+    (hNoDyn : ∀ k rest, typeArgs ≠ .dynamic k :: rest)
     (hLayouts : cm.layouts = env.layouts)
     (hCorr : StateCorr env bb slots s)
     (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
@@ -32100,7 +32166,8 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
       fun _ _ => rfl
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-        hLayouts, hCorr.globals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
+        hLayouts, hCorr.globals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan,
+        evalDynCallHook?_eq_none_of_lowerIntrinsicKind hLower hNoDyn]⟩
 
 /-- **Target-presence boundary for call-form memory intrinsics
 (`evalLoweredTerminator_call_memIntrinsic_without_target_extCall`)**:
@@ -32108,7 +32175,9 @@ a hand-built diverging (`target = none`) direct call to `core::intrinsics::copy_
 `core::intrinsics::write_bytes` is rejected fail-closed (`= none`) by `evalLoweredTerminator` for
 **every** `env.memIntrinsic` callback, while `Trusted`'s `evalTerminator` dispatches memory
 intrinsics inline only on `target = some _` calls and falls through to `MirStepNode.extCall` with
-`resumeExternalDivergingCall`. -/
+`resumeExternalDivergingCall`.
+`hNoDyn` (type arguments not headed by a `dyn Trait`) rules out Trusted's virtual dispatch through
+`evalDynCallHook?` (`evalDynCallHook?_eq_none_of_lowerIntrinsicKind`). -/
 theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
     {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
@@ -32120,6 +32189,7 @@ theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
     (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
     (hSupp : trustedSupportsIntrinsicDefPath defPath op)
     (hMem : op = .copyNonOverlapping ∨ op = .writeBytes)
+    (hNoDyn : ∀ k rest, typeArgs ≠ .dynamic k :: rest)
     (hLayouts : cm.layouts = env.layouts)
     (hSlots : SlotsRefine SlotBelow slots s.frame.locals)
     (hGlobals : s.memory.globals = env.globals)
@@ -32181,7 +32251,8 @@ theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
       fun _ _ => rfl
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-        hLayouts, hGlobals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
+        hLayouts, hGlobals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan,
+        evalDynCallHook?_eq_none_of_lowerIntrinsicKind hLower hNoDyn]⟩
 
 /-! #### 5g.2: `three_way_compare` `Ordering` ADT Encoding (`orderingVariant?`, `intrinsic.rs:108-136`) -/
 

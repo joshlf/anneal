@@ -7133,6 +7133,7 @@ example
     (localsNullProv localsSc localsDangMut : List LocalSlot)
     (localDecls : List MirAst.LocalDecl) (sIdx : Local)
     (hLen : len < scalarModulus 8)
+    (hNoDyn : dynPlaceLocalKind? localDecls sIdx = none)
     (hNullProvSlot :
       Trusted.Sequence.get? localsNullProv sIdx =
         some (.init (annealWidePtrVal { allocId := 0, offsetBytes := 0 } 0 8)))
@@ -7159,7 +7160,7 @@ example
   checkPtr_sliceRef_null_and_zeroByte_reborrow_divergence
     thin prov mutbl elemSz elemAlign addr len freeze m pDang
     localsNullProv localsSc localsDangMut localDecls sIdx
-    hLen hNullProvSlot hScSlot hDangMutSlot
+    hLen hNoDyn hNullProvSlot hScSlot hDangMutSlot
 
 example
     (locals : List LocalSlot) (mem : MirSemantics.Memory)

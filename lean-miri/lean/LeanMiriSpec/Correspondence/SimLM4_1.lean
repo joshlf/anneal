@@ -7988,10 +7988,19 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
                 | .halted out => .retOutcome out
                 | .faulted fk => .fail fk
               | false =>
-                .extCall
-                  { defPath := defPath, typeArgs := extractCalleeTypeArgs func,
-                    args := [], memory := s.memory }
-                  (resumeExternalDivergingCall s s.frame.locals unwind) := by
+                match
+                  evalDynCallHook? s (some (activeMirBody rootBody s))
+                    { defPath := defPath, typeArgs := extractCalleeTypeArgs func }
+                    (bodyLocalDeclsOf (some (activeMirBody rootBody s)))
+                    (activeMirBody rootBody s).layouts [] []
+                    s.frame.locals destination none unwind
+                with
+                | some stepNode => stepNode
+                | none =>
+                  .extCall
+                    { defPath := defPath, typeArgs := extractCalleeTypeArgs func,
+                      args := [], memory := s.memory }
+                    (resumeExternalDivergingCall s s.frame.locals unwind) := by
         rw [stepMirFn_activeMirBody_eq rootBody s hphase]
         have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
