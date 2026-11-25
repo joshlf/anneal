@@ -46,7 +46,13 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      that NEITHER authority negates the rhs before `nanChoices` for `.sub` (`W8`); pointer-destination,
      array-composite, and pointer-width scope of `Ptr2IntTransmutePolicy` (`W9`); MiniRust rejection
      of float operands reached only through pointer dereferences (`W10`); and `binary64`
-     `EvalFloatBinOpRel` outcomes on `MachTB` + `MachTB.wfLive` (`W11`).
+     `EvalFloatBinOpRel` outcomes on `MachTB` + `MachTB.wfLive` (`W11`);
+   - Round-1 counter-audit (`W12`): explicit raw-pointer (`usize -> *const u8` / `*mut u16`, valid
+     detached provenance under BOTH policies) vs. safe-reference / `fn()` (`usize -> &u8` / `fn()`,
+     UB under BOTH policies) separation, `const/const` nondeterministic `Inf - Inf` / `sNaN + 1.0`
+     index-exact `EvalRvalueFloatRel` correspondence (paired with `w8_lm_*` & `step_float_arith_const_const_nondet_*`),
+     and general projected-place float rejection (`fa_projected_float_place_rejection` &
+     `fa_no_fragment_admits_projected_float_op`) across deref `*p` and tuple/struct field `_s.0`.
 2. **Cross-Root Dual-Authority Kernel Bridge (`run_cmd`)**:
    Loads BOTH `.lake/build/lib/lean` (`Anneal.Mir.IeeeFloatArith`, `MiniRustSpec.FloatArithMR`)
    and `examples/.lake/build/lib/lean` (`LeanMiriSpec.FloatArithLM`) into a fresh Lean kernel
@@ -613,6 +619,99 @@ theorem w11_mr_f64_nan_candidate_machTB_wfLive :
       fcCarrier64Fn.start)
     3 (by decide +kernel)
 
+private abbrev tFnPtrTy : Trusted.Rustc.V2026_06_01.MirAst.Ty :=
+  { kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }
+
+/-- `(f32, u32)` composite local whose field `.0` has type `f32` (not a top-level float local). -/
+private def tTupleF32U32Decl : Trusted.Rustc.V2026_06_01.MirAst.LocalDecl :=
+  { mutability := .mut, ty := { kind := .tuple [.float .f32, .uint .u32], layoutIdx := 0 }, debugName := none }
+
+/-- `fn f(s1: (f32, u32), s2: (f32, u32)) -> bool { s1.0 < s2.0 }`: projected float comparison. -/
+private def tFieldFloatCmpBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  faBody2 "w12::field_f32_lt" [boolDecl, tTupleF32U32Decl, tTupleF32U32Decl]
+    [.assign (local_ 0) (.binaryOp .lt (.copy ⟨1, [.field 0 fcF32Ty]⟩) (.copy ⟨2, [.field 0 fcF32Ty]⟩))]
+
+/-- `fn f(s1: (f32, u32), s2: (f32, u32)) -> f32 { -(s1.0) }`: projected float unary negation. -/
+private def tFieldFloatNegBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  faBody2 "w12::field_f32_neg" [fcDecl fcF32Ty, tTupleF32U32Decl, tTupleF32U32Decl]
+    [.assign (local_ 0) (.unaryOp .neg (.copy ⟨1, [.field 0 fcF32Ty]⟩))]
+
+/-- **`W12` Witness (round-1 counter-audit)**:
+1. `usize -> *const u8` (non-null `0x1000` & null `0`) and `usize -> *mut u16` (`0x2000`) succeed
+   with detached provenance under BOTH `Ptr2IntTransmutePolicy` values (`decodePtrBytesNoForge false`),
+   contrasting sharply with `usize -> &u8` and `usize -> fn()` faulting `.ub` under BOTH policies
+   (`decodePtrBytesNoForge true`), matching `FloatArithLM.miri_transmute_int_to_rawPtr_ok` &
+   `miri_transmute_fnPtr_no_forge_ub`;
+2. `const/const` nondeterministic `Inf - Inf` (`[0x7FC00000, 0xFFC00000]`) and `sNaN + 1.0`
+   (all 6 candidates) index-exact `EvalRvalueFloatRel` correspondence, paired with
+   `FloatArithLM.step_float_arith_const_const_nondet_{soundness,index_exact}` & `w8_lm_*`;
+3. General projected-place float rejection (`fa_projected_float_place_rejection` &
+   `fa_no_fragment_admits_projected_float_op`, closing `F5`) instantiated on BOTH pointer dereference
+   `*p < *q` (`tDerefFloatCmpBody`, zero float locals, all 6 MiniRust gates fail) AND tuple/struct
+   field projection `_s.0 < _s.1` / `-(_s.0)` (`tFieldFloatCmpBody`, `tFieldFloatNegBody`). -/
+theorem w12_a1_rawPtr_vs_ref_fnPtr_const_nondet_and_projected_float_rejection :
+    (∀ policy,
+      evalByteCast [.init (.scalar ⟨0x1000, 8⟩)] (.copy ⟨0, .nil⟩) tPtrU8Ty emptyMemory
+          [⟨.not, tUsizeTy, .none⟩] emptyLayoutTable policy =
+        .ok (.scalar ⟨0x1000, 8⟩) [.init (.scalar ⟨0x1000, 8⟩)] emptyMemory ∧
+      evalByteCast [.init (.scalar ⟨0, 8⟩)] (.copy ⟨0, .nil⟩) tPtrU8Ty emptyMemory
+          [⟨.not, tUsizeTy, .none⟩] emptyLayoutTable policy =
+        .ok (.scalar ⟨0, 8⟩) [.init (.scalar ⟨0, 8⟩)] emptyMemory ∧
+      evalByteCast [.init (.scalar ⟨0x2000, 8⟩)] (.copy ⟨0, .nil⟩) tPtrMutU16Ty emptyMemory
+          [⟨.not, tUsizeTy, .none⟩] emptyLayoutTable policy =
+        .ok (.scalar ⟨0x2000, 8⟩) [.init (.scalar ⟨0x2000, 8⟩)] emptyMemory ∧
+      evalByteCast [.init (.scalar ⟨0x1000, 8⟩)] (.copy ⟨0, .nil⟩) tRefU8Ty emptyMemory
+          [⟨.not, tUsizeTy, .none⟩] emptyLayoutTable policy = .ub ∧
+      evalByteCast [.init (.scalar ⟨0x1000, 8⟩)] (.copy ⟨0, .nil⟩) tFnPtrTy emptyMemory
+          [⟨.not, tUsizeTy, .none⟩] emptyLayoutTable policy = .ub) ∧
+    (∀ policy (idx : Nat) cand,
+      (nanChoices .binary32 [(.binary32, 0x7F800000), (.binary32, 0x7F800000)] .nondeterministic)[idx]? = some cand →
+      EvalRvalueFloatRel .nondeterministic policy .nil
+        (.binaryOp .sub (mkFConst tF32Ty 0x7F800000 4) (mkFConst tF32Ty 0x7F800000 4))
+        emptyMemory [] emptyLayoutTable (.ok (.scalar ⟨cand, 4⟩) .nil emptyMemory)) ∧
+    (∀ policy (idx : Nat) cand,
+      (nanChoices .binary32 [(.binary32, 0x7FA00001), (.binary32, 0x3F800000)] .nondeterministic)[idx]? = some cand →
+      EvalRvalueFloatRel .nondeterministic policy .nil
+        (.binaryOp .add (mkFConst tF32Ty 0x7FA00001 4) (mkFConst tF32Ty 0x3F800000 4))
+        emptyMemory [] emptyLayoutTable (.ok (.scalar ⟨cand, 4⟩) .nil emptyMemory)) ∧
+    (inFragment tDerefFloatCmpBody = false ∧ inFragmentWithIntrinsics tDerefFloatCmpBody = false ∧
+      progInFragment tDerefFloatCmpBody [] = false ∧ progInFragmentWithIntrinsics tDerefFloatCmpBody [] = false ∧
+      translateFn tDerefFloatCmpBody = none ∧ translateFnWithIntrinsics tDerefFloatCmpBody = none) ∧
+    (inFragment tFieldFloatCmpBody = false ∧ inFragmentWithIntrinsics tFieldFloatCmpBody = false ∧
+      progInFragment tFieldFloatCmpBody [] = false ∧ progInFragmentWithIntrinsics tFieldFloatCmpBody [] = false) ∧
+    (inFragment tFieldFloatNegBody = false ∧ inFragmentWithIntrinsics tFieldFloatNegBody = false ∧
+      progInFragment tFieldFloatNegBody [] = false ∧ progInFragmentWithIntrinsics tFieldFloatNegBody [] = false ∧
+      translateFn tFieldFloatNegBody = none ∧ translateFnWithIntrinsics tFieldFloatNegBody = none) := by
+  have hderef := fa_no_fragment_admits_projected_float_op tDerefFloatCmpBody [] tDerefFloatCmpBody
+    (List.mem_cons_self ..) _ (List.mem_cons_self ..) (local_ 0) _ "witness" (List.mem_cons_self ..)
+    ⟨1, [.deref]⟩ ⟨.float .f32, 0⟩ .f32 (.copy ⟨1, [.deref]⟩) rfl rfl (Or.inl rfl) (Or.inr ⟨.lt, _, _, rfl, Or.inl rfl⟩)
+  have hderefTr := hderef.2.2.2.2 (Or.inr (Or.inr (Or.inl ⟨1, rfl⟩)))
+  have hfcmp := fa_no_fragment_admits_projected_float_op tFieldFloatCmpBody [] tFieldFloatCmpBody
+    (List.mem_cons_self ..) _ (List.mem_cons_self ..) (local_ 0) _ "witness" (List.mem_cons_self ..)
+    ⟨1, [.field 0 fcF32Ty]⟩ fcF32Ty .f32 (.copy ⟨1, [.field 0 fcF32Ty]⟩) rfl rfl (Or.inl rfl) (Or.inr ⟨.lt, _, _, rfl, Or.inl rfl⟩)
+  have hfneg := fa_no_fragment_admits_projected_float_op tFieldFloatNegBody [] tFieldFloatNegBody
+    (List.mem_cons_self ..) _ (List.mem_cons_self ..) (local_ 0) _ "witness" (List.mem_cons_self ..)
+    ⟨1, [.field 0 fcF32Ty]⟩ fcF32Ty .f32 (.copy ⟨1, [.field 0 fcF32Ty]⟩) rfl rfl (Or.inl rfl) (Or.inl ⟨.neg, rfl⟩)
+  have hfnegTr := hfneg.2.2.2.2 (Or.inl ⟨.neg, rfl⟩)
+  exact ⟨fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩,
+    fun policy idx cand hget =>
+      (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy .nil .nil .nil .sub _ _
+          ⟨0x7F800000, 4⟩ ⟨0x7F800000, 4⟩ tF32Ty tF32Ty .binary32 emptyMemory [] emptyLayoutTable _
+          (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl).mpr
+        (Or.inl ⟨⟨cand, 4⟩,
+          (EvalFloatBinOpRel_arith_iff .nondeterministic .sub .binary32 0x7F800000 0x7F800000 ⟨cand, 4⟩ rfl).mpr
+            ⟨0x7FC00000, by decide +kernel, Or.inl ⟨by decide +kernel, cand, List.mem_of_getElem? hget, rfl⟩⟩, rfl⟩),
+    fun policy idx cand hget =>
+      (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy .nil .nil .nil .add _ _
+          ⟨0x7FA00001, 4⟩ ⟨0x3F800000, 4⟩ tF32Ty tF32Ty .binary32 emptyMemory [] emptyLayoutTable _
+          (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl).mpr
+        (Or.inl ⟨⟨cand, 4⟩,
+          (EvalFloatBinOpRel_arith_iff .nondeterministic .add .binary32 0x7FA00001 0x3F800000 ⟨cand, 4⟩ rfl).mpr
+            ⟨0x7FC00000, by decide +kernel, Or.inl ⟨by decide +kernel, cand, List.mem_of_getElem? hget, rfl⟩⟩, rfl⟩),
+    ⟨hderef.1, hderef.2.1, hderef.2.2.1, hderef.2.2.2.1, hderefTr.2.1, hderefTr.2.2⟩,
+    ⟨hfcmp.1, hfcmp.2.1, hfcmp.2.2.1, hfcmp.2.2.2.1⟩,
+    ⟨hfneg.1, hfneg.2.1, hfneg.2.2.1, hfneg.2.2.2.1, hfnegTr.2.1, hfnegTr.2.2⟩⟩
+
 end MiniRustRound1
 
 /-! ## §2. Cross-Root Dual-Authority Kernel Bridge (`IeeeFloatArith` + `FloatArithMR` + `FloatArithLM`) -/
@@ -690,9 +789,21 @@ run_cmd do
         lmNs ++ `floatOps_binary_arith_pure_index_exact,
         lmNs ++ `step_float_arith_copy_copy_nondet_index_exact,
         lmNs ++ `miriTransmuteScalarCheck_ptr_policy_arms,
-        lmNs ++ `w7_lm_f64_and_sub_index_exact ]
+        lmNs ++ `w7_lm_f64_and_sub_index_exact,
+        -- Round-1 counter-audit (`A1`): nonempty NaN selector, `const/const` nondet step
+        -- soundness + index-exact correspondence, uninit binop UB lockstep, raw-ptr vs `fn()`
+        -- transmute arms, and `W8`.
+        lmNs ++ `annealChooseBinaryNaN_valid_nonempty,
+        lmNs ++ `step_float_arith_const_const_nondet_soundness,
+        lmNs ++ `step_float_arith_const_const_nondet_index_exact,
+        lmNs ++ `step_float_uninit_binaryOp_ub_lockstep,
+        lmNs ++ `miri_transmute_int_to_rawPtr_ok,
+        lmNs ++ `miri_transmute_fnPtr_no_forge_ub,
+        lmNs ++ `w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop ]
     let generalMrThms : List Name :=
       [ mrNs ++ `fa_no_fragment_admits_float_arith_or_cmp,
+        mrNs ++ `fa_projected_float_place_rejection,
+        mrNs ++ `fa_no_fragment_admits_projected_float_op,
         mrNs ++ `fa_sym_mr_negXor_f32_lockstep,
         mrNs ++ `fa_sym_mr_negXor_f64_lockstep,
         mrNs ++ `fa_bridge_evalFloatBinOpRel_mach_steps,
@@ -1027,7 +1138,14 @@ run_cmd do
         `Miri.Memory.CtfeProvenance.fromAllocId,
         `Miri.Interpreter.FloatOps.adjustNaN,
         `LeanMiriSpec.FloatArithLM.miriTransmuteScalarCheck,
-        `LeanMiriSpec.FloatArithLM.annealChooseBinaryNaN ]
+        `LeanMiriSpec.FloatArithLM.annealChooseBinaryNaN,
+        -- Round-1 counter-audit (`A1`): projected-place typing, raw-ptr vs safe-ref decoder, and
+        -- `const/const` nondet + projected-place rejection theorems.
+        `Trusted.Rustc.V2026_06_01.MirSemantics.placeTy,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
+        `MiniRustSpec.FloatArithMR.fa_no_fragment_admits_projected_float_op,
+        `LeanMiriSpec.FloatArithLM.miri_transmute_int_to_rawPtr_ok,
+        `LeanMiriSpec.FloatArithLM.step_float_arith_const_const_nondet_index_exact ]
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: unifiedFloatArithAndUcg630DualBundle does not reach {req}"
@@ -1041,7 +1159,7 @@ run_cmd do
       reachedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
   unless addedCount == 7 && rejectedCount == 10 && acceptedCount == 9 && ieeeThms ≥ 300 &&
-      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 62 && lmPublic ≥ 56 && reachedCount == 35 do
+      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 64 && lmPublic ≥ 63 && reachedCount == 40 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount}, accepted={acceptedCount}, ieee={ieeeThms}, mr={mrThms}, lm={lmThms}, mrPublic={mrPublic}, lmPublic={lmPublic}, reached={reachedCount})"
   logInfo m!"ep2 float-arith cross-root kernel bridge: added {addedCount} dual theorems, rejected {rejectedCount} forged controls (paired with {acceptedCount} accepted positive controls), audited {ieeeThms} constructive IeeeFloatArith + {mrThms} MR + {lmThms} LM theorems (0 host Float, 0 MiniRustSpec imports in LM, {mrPublic} MR + {lmPublic} LM public theorems all covered by axiomAudit bundles, MiniRust Gen.Type has no float constructor), reached all {reachedCount} Trusted(06+08)+MiniRust+Miri constants, axioms {crAxioms}"
 

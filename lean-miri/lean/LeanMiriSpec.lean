@@ -489,15 +489,23 @@ import LeanMiriSpec.Audit
 * `LeanMiriSpec.FloatArithLM`: IEEE-754 floating-point arithmetic (`add`, `sub`,
   `mul`, `div`, `rem`), bitwise negation (`neg`, preserving sNaN/qNaN payloads),
   comparisons (`eq`, `ne`, `lt`, `le`, `gt`, `ge`), ordered `nanChoices`
-  correspondence (`f32`/`f64`, deterministic and nondeterministic modes),
-  exact `FloatOps.{unary, binary}` soundness and completeness, conservative
-  step-hook overlay (`annealStepHooksFloatArith`), real `Miri.Interpreter.Step.step`
-  vs. `stepMirFn` / `EvalRvalueFloatRel` simulations (immediate and indirect
-  locals, uninit UB lockstep, `f16`/`f128` and invalid-`BinOp` fail-closed
-  boundaries), `Ptr2IntTransmutePolicy` (`ucg#630` CTFE rejection vs.
-  `reference#1752` runtime provenance-stripping, provenance-free `{to,from}_bits`
-  agreement, no-forgery `usize -> &u8` and uninit UB), and concrete witnesses
-  `w1_lm_finite_subnormal_overflow` .. `w6_lm_no_forge_ref_uninit`.
+  correspondence (`f32`/`f64`, deterministic and nondeterministic modes, with
+  both authorities passing the original un-negated rhs for `.sub`),
+  `FloatOps.{unary, binary}` soundness and index-exact completeness
+  (`floatOps_binary_arith_pure_index_exact`), the nonempty-valid default binary
+  selector `annealChooseBinaryNaN` (contrasting with `annealChooseQuietedNaN`,
+  which fails on 2-element `∞ - ∞` lists), conservative step-hook overlay
+  (`annealStepHooksFloatArith`), real `Miri.Interpreter.Step.step` vs.
+  `stepMirFn` / `EvalRvalueFloatRel` simulations (immediate and indirect locals,
+  nondeterministic `copy/copy` AND `const/const` soundness + index-exact
+  completeness, exact-message uninit unary & binary UB lockstep, and
+  exact-message `f16`/`f128` + invalid-`BinOp` fail-closed boundaries),
+  `Ptr2IntTransmutePolicy` (`ucg#630` CTFE rejection vs. `reference#1752`
+  runtime provenance-stripping, provenance-free `{to,from}_bits` agreement,
+  explicit raw-pointer `usize -> *const T` / `*const T -> *const U` acceptance
+  vs. no-forgery `usize -> &T` / `usize -> fn()` and uninit UB under both
+  policies via `miriTransmuteScalarCheck`), and concrete witnesses
+  `w1_lm_finite_subnormal_overflow` .. `w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
