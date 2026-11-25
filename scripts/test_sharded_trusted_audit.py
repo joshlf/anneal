@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -687,9 +688,83 @@ class PeerGuardScannerTests(unittest.TestCase):
         self.assert_violation(head + "macro \"FORGE\" n:term : term => `(R.mk $n)\n", "6b", "notation")
         self.assert_violation(head + "namespace Evil\nexport R (mk)\nend Evil\n", "6b", "export")
 
+    def test_a3_where_instance_structure_inductive_and_export_bypasses_rejected(self):
+        # `where` auxiliaries are separate public declarations with their own statements.
+        self.assert_violation("theorem t : True := aux\nwhere aux : True \u2227 assumesHold := sorry\n", "6a", "positive")
+        scan_text("theorem t : True := aux\nwhere aux : assumesHold \u2192 True := fun _ => trivial\n")
+        # Instance bodies define class fields (`C.p` unfolds to the atom).
+        self.assert_violation("class C where p : Prop\ninstance : C := \u27e8assumesHold\u27e9\n", "6a", "positive")
+        self.assert_violation("class C where p : Prop\ninstance : C where p := assumesHold\n", "6a")
+        # Structure fields / defaults and inductive constructor arguments are eliminator conclusions.
+        self.assert_violation("structure S where\n  h : assumesHold\n", "6a", "structure field")
+        self.assert_violation("structure S where\n  p : Prop := assumesHold\n", "6a", "structure field")
+        self.assert_violation("inductive I : Prop where\n  | mk : True \u2227 assumesHold \u2192 I\n", "6a", "constructor")
+        self.assert_violation("def h : Prop := assumesHold \u2192 True\nstructure S where\n  x : h\n", "6a")
+        scan_text("structure S where\n  assumesHold : Bool\ninductive F | assumesHold | tt\n")
+        # 6b: `show R from \u27e8..\u27e9` and namespace-qualified / forwarder `export`.
+        head = "/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n\n"
+        self.assert_violation(head + "def leak (n : Nat) : Nat := (show R from \u27e8n\u27e9).lo\n", "6b")
+        self.assert_violation("namespace Ns\n" + head + "end Ns\nnamespace Evil\nexport Ns (R.mk)\nend Evil\n", "6b", "export")
+        self.assert_violation(head + "private def fwd (n : Nat) : R := R.mk n\nnamespace Evil\nexport _root_ (fwd)\nend Evil\n",
+                              "6b", "export")
+
     def test_live_theory_has_zero_false_positives(self):
         summary = sta.scan_peer_guards([REPO / "theory/Anneal"])
         self.assertGreater(summary["files"], 50)
+
+
+class ExactModulesEndToEndTests(unittest.TestCase):
+    """`run(targets=resolve_exact_modules(...))` audits exactly the closure: a policy violation in an
+    unselected module is never compiled, and the same violation inside the closure fails closed."""
+
+    TARGETS = [("Anneal", "theory/Anneal.lean", ["Trusted"], "theory"),
+               ("Good", "theory/Good.lean", ["Anneal"], "theory"),
+               ("Bad", "tests/Bad.lean", ["Anneal"], "claim")]
+
+    def _checkout(self, tmp: Path) -> Path:
+        root = tmp / "checkout"
+        (root / "trusted/audit").mkdir(parents=True)
+        (root / "trusted/lean").mkdir(parents=True)
+        (root / "theory").mkdir()
+        (root / "tests").mkdir()
+        for name in ("foundation-lock.json", "lean-toolchain"):
+            shutil.copyfile(REPO / "trusted/lean" / name, root / "trusted/lean" / name)
+        for name in ("check_trusted.py", "TrustedBoundary.lean"):
+            shutil.copyfile(REPO / "trusted/audit" / name, root / "trusted/audit" / name)
+        (root / "trusted/lean/Trusted.lean").write_text("prelude\nimport Init.Core\ndef TrustedClaim : Prop := True\n")
+        (root / "theory/Anneal.lean").write_text(
+            "prelude\nimport Trusted\nnamespace Anneal\ndef UntrustedProp : Prop := True\n"
+            "theorem witness : TrustedClaim := True.intro\nend Anneal\n")
+        (root / "theory/Good.lean").write_text("prelude\nimport Anneal\ntheorem good : TrustedClaim := Anneal.witness\n")
+        # A claim whose statement leaks an untrusted theory definition (statement-origin policy).
+        (root / "tests/Bad.lean").write_text(
+            "prelude\nimport Anneal\ndef forged : Prop := Anneal.UntrustedProp\ntheorem bad : forged := True.intro\n")
+        return root
+
+    def _run(self, root: Path, spec: str | None, temp_parent: Path):
+        checker = ct.Checker(root, fast=True, temp_parent=temp_parent)
+        try:
+            targets = None if spec is None else ct.resolve_exact_modules(spec, self.TARGETS)
+            with unittest.mock.patch.object(ct, "DOWNSTREAM_TARGETS", self.TARGETS):
+                return checker.run(check_downstream=True, targets=targets), set(checker.artifacts)
+        finally:
+            ct.make_tree_writable(checker.stage)
+            shutil.rmtree(checker.stage, ignore_errors=True)
+
+    @unittest.skipUnless(lean_available(), "pinned Lean toolchain unavailable")
+    def test_exact_modules_audits_only_the_closure_and_fails_closed_inside_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._checkout(Path(tmp))
+            report, built = self._run(root, "Good", Path(tmp))
+            self.assertIn("Good", built)
+            self.assertIn("Anneal", built)
+            self.assertNotIn("Bad", built)
+            self.assertIn("inductiveConstants", report["downstream"]["inductiveReplay"])
+            for spec in ("Bad", "Good,Bad", None):
+                with self.subTest(spec=spec), self.assertRaises(ct.Failure) as ctx:
+                    self._run(root, spec, Path(tmp))
+                self.assertEqual((ctx.exception.code, ctx.exception.phase), (1, "downstream-audit"), str(ctx.exception))
+                self.assertIn("Anneal.UntrustedProp", str(ctx.exception))
 
 
 class CheckTrustedBudgetTests(unittest.TestCase):

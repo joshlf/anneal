@@ -929,7 +929,7 @@ def assumption_helpers(files: dict[str, list]) -> set[str]:
         changed = False
         for toks in files.values():
             for kw, name, _sig, body, _start in _declarations(toks):
-                if kw in ("def", "abbrev", "opaque") and name and name not in helpers:
+                if kw in ("def", "abbrev", "opaque", "instance") and name and name not in helpers:
                     if any(_is_atom(tok[0]) or tok[0] in helpers or tok[0].split(".")[-1] in helpers for tok in body):
                         helpers.add(name)
                         changed = True
@@ -992,23 +992,69 @@ def scan_polarity(path: str, toks: list, helpers: set[str]) -> None:
         scanner = PolarityScanner(path, others)
         if not any(_is_atom(tok[0]) or scanner._is_helper(tok[0]) for tok in sig + body):
             continue
-        i, colon = 0, None
-        while i < len(sig):
-            t = sig[i][0]
-            if t in OPEN:
-                end = _group_end(sig, i)
-                group = sig[i + 1:end - 1]
-                scanner._analyze_binder_group(group, "neg", True, 0)
-                i = end
-                continue
-            if t == ":" and colon is None:
-                colon = i
-                break
-            i += 1
-        if colon is not None:
-            scanner.analyze(sig[colon + 1:], "pos")
-        if kw in ("def", "abbrev", "opaque") and any(_is_atom(tok[0]) or scanner._is_helper(tok[0]) for tok in body):
+        _analyze_signature(scanner, sig)
+        if kw in ("def", "abbrev", "opaque", "instance") and any(
+                _is_atom(tok[0]) or scanner._is_helper(tok[0]) for tok in body):
             PolarityScanner(path, others).analyze(body, "pos")
+        # `where` auxiliaries (`theorem t : T := aux where aux : X := p`) are separate public
+        # declarations `t.aux`: every top-level `binders : X` in the tail is a declared type.
+        for aux_sig in _where_aux_signatures(body):
+            _analyze_signature(PolarityScanner(path, others), aux_sig)
+    # `structure` / `class` fields and `inductive` constructor arguments are conclusions of the
+    # projections / eliminators, so the atom (or a helper) may not appear in them at all.
+    for k, tok in enumerate(toks):
+        if tok[0] in ("structure", "class", "inductive") and (k == 0 or toks[k - 1][0] != "."):
+            span = _command_span(toks, k)
+            for m, st in enumerate(span):
+                field_name = (m > 0 and span[m - 1][0] == "|") or (m + 1 < len(span) and span[m + 1][0] == ":"
+                                                                   and (m == 0 or span[m - 1][1] < st[1]))
+                if not field_name and (_is_atom(st[0]) or st[0] in local_helpers
+                                       or st[0].split(".")[-1] in local_helpers):
+                    raise GuardViolation("6a", "assumption atom inside a structure field or inductive constructor",
+                                         path, st[1])
+
+
+def _analyze_signature(scanner, sig: list) -> None:
+    """Binder groups before the top-level `:` are negative; the declared type is positive."""
+    i, colon = 0, None
+    while i < len(sig):
+        t = sig[i][0]
+        if t in OPEN:
+            end = _group_end(sig, i)
+            scanner._analyze_binder_group(sig[i + 1:end - 1], "neg", True, 0)
+            i = end
+            continue
+        if t == ":" and colon is None:
+            colon = i
+            break
+        i += 1
+    if colon is not None:
+        scanner.analyze(sig[colon + 1:], "pos")
+
+
+def _where_aux_signatures(body: list) -> list:
+    """Signatures `name binders : type` of the auxiliaries following a top-level `where`."""
+    sigs, i, n = [], 0, len(body)
+    while i < n and body[i][0] != "where":
+        i = _group_end(body, i) if body[i][0] in OPEN else i + 1
+    i += 1
+    while i < n:
+        if body[i][0] in OPEN:
+            i = _group_end(body, i)
+            continue
+        if body[i][0] == ":":
+            start = i
+            # Back up over binder groups / names on the same logical declaration head.
+            while start > 0 and body[start - 1][0] not in (":=", "|", "where") and body[start - 1][1] == body[i][1]:
+                start -= 1
+            end = i + 1
+            while end < n and body[end][0] not in (":=", "|"):
+                end = _group_end(body, end) if body[end][0] in OPEN else end + 1
+            sigs.append(body[start:end])
+            i = end
+            continue
+        i += 1
+    return sigs
 
 
 def _doc_tag(text: str, end: int, tag: str) -> bool:
@@ -1139,6 +1185,12 @@ def _has_struct_literal_or_anon_ctor(body: list, return_is_sealed: bool, codomai
                         return sub
                     i = end_rhs + (1 if end_rhs < len(toks) and toks[end_rhs][0] in (";", "in") else 0)
                     continue
+            # `show R from ⟨..⟩` / `show R by exact ⟨..⟩` gives the following term a sealed expected type.
+            if t == "show" and i + 1 < len(toks) and (
+                    toks[i + 1][0] in sealed_types or toks[i + 1][0].split(".")[-1] in sealed_types):
+                sub = check_slice(toks[i + 2:], True)
+                if sub is not None:
+                    return sub
             if t == "⟨":
                 end = _group_end(toks, i)
                 if allow_return:
@@ -1538,12 +1590,18 @@ def scan_sealing(path: str, text: str) -> None:
         if depth == 0 and (t in NOTATION_COMMANDS or t == "export"):
             span = _command_span(toks, k)
             if t == "export":
-                # `export R (mk)` re-exports sealed raw constructor into an enclosing namespace.
-                if span and (span[0][0] in all_sealed_types or span[0][0].split(".")[-1] in all_sealed_types):
-                    sealed_ctors = set(sealed.values())
-                    for st in span[1:]:
-                        if st[0] in sealed_ctors:
-                            raise GuardViolation("6b", "sealed raw constructor re-exported via export", path, st[1])
+                # `export R (mk)`, `export Ns (R.mk)` and `export Ns (fwd)` alias a sealed raw constructor
+                # (or a private forwarder to it) into an enclosing namespace.
+                head = span[0][0] if span else ""
+                head_sealed = head in all_sealed_types or head.split(".")[-1] in all_sealed_types
+                sealed_ctors = set(sealed.values())
+                for st in span[1:]:
+                    parts = st[0].split(".")
+                    if ((head_sealed and st[0] in sealed_ctors)
+                            or (len(parts) >= 2 and parts[-1] in sealed_ctors and parts[-2] in all_sealed_types)
+                            or parts[-1] in ctor_aliases or parts[-1] in private_forwarders
+                            or st[0] in private_forwarders):
+                        raise GuardViolation("6b", "sealed raw constructor re-exported via export", path, st[1])
             else:
                 hit_line = body_reaches_sealed(t, span, [], scope_at(k, k), ctor_aliases, private_forwarders)
                 if hit_line is not None:
