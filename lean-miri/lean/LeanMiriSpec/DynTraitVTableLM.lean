@@ -2938,7 +2938,15 @@ for EVERY captured vtable table `vts`, virtual-method table `vms`, trait key
      with narrowed `args'[0]?` coupled to `dp` AND Trusted `evalVirtualCall` steps
      to `MirStepNode.step s2` (the protected callee entry frame);
    - If `protectDynReceiverOnEntry … = none`, Trusted `evalVirtualCall` faults
-     `MirStepNode.fail .ub`. -/
+     `MirStepNode.fail .ub`.
+
+Scope: conjuncts 3 and the protector arms of 4 constrain Trusted ONLY. Vendored
+`resolveVirtual` performs neither the reference-validity check nor the
+function-entry retag; on Authority 2 those live in the overlay call leaf
+`dvEvalVirtualCall` (`dvValidateDynPtr`, `dvRetagReceiver`). This law makes no
+universal claim about them. Their ordering before callee linking is certified
+concretely, in both modes, by `dv_c3_gate_precedes_linking_both_modes`, and the
+protector by `dv_c16_witnesses`. -/
 theorem dvResolveVirtual_safeRef_agrees_trusted
     (vts : List CapturedVTable) (vms : List CapturedVirtualMethod) (k : DefPath)
     (v : CapturedVTable) (ty : Miri.MIR.TyId)
@@ -3944,6 +3952,26 @@ theorem dv_c3_and_raw_intrinsics_witness :
     dvLmRun intrAl32 [] false (stIntr32 intrAl32) = .usizeVal 4 := by
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- **Condition `C3` on Authority 2, both modes**: in the overlay call leaf, the
+receiver checks precede callee linking. With NO concrete method body linked
+(`callees := []`), a virtual call whose `&dyn Tr` receiver is dangling (dead
+pointee), whose metadata is a wrong-trait vtable (`(u32, Alt)` used as
+`dyn Tr`), or which selects the non-method header slot `1` or the out-of-bounds
+slot `9` faults `.ub` in both `treeBorrows` modes, while the valid receiver
+reaches the linking step and fails closed (`.unsupported`, unlinked concrete
+callee). This is the Authority 2 counterpart of the Trusted-only conjunct 3 of
+`dvResolveVirtual_safeRef_agrees_trusted`. -/
+theorem dv_c3_gate_precedes_linking_both_modes (tb : Bool) :
+    dvLmRun dvV3ArgCallMir [] tb (dvStPointee dvV3ArgCallMir 16384 (live := false)) = .ub ∧
+    dvLmRun dvV3ArgCallMir [] tb (dvStPointee dvV3ArgCallMir 16386 (live := true)) = .ub ∧
+    dvLmRun dvV3CallHdrMir [] tb (dvStCall dvV3CallHdrMir 7 4 dvU32Ty dvRefU32Ty) = .ub ∧
+    dvLmRun dvV3CallOobMir [] tb (dvStCall dvV3CallOobMir 7 4 dvU32Ty dvRefU32Ty) = .ub ∧
+    dvLmRun dvV3ArgCallMir [] tb (dvStPointee dvV3ArgCallMir 16384 (live := true)) =
+      .unsupported := by
+  cases tb <;>
+    exact ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+      by decide +kernel⟩
 
 /-- Synthetic `TyId`s for exercising vendored `Cast.unsizeInto`'s `.adt` structural
 field-traversal arm and `VirtualCalls.resolveVirtual`'s `DispatchFromDyn` `.other`

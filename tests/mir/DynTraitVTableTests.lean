@@ -792,6 +792,7 @@ run_cmd do
         lmNs ++ `dvLmObserve_c16_mode_sensitivity,
         lmNs ++ `dvLmObserve_out_of_range,
         lmNs ++ `dvLmObserve_eq_run,
+        lmNs ++ `dv_c3_gate_precedes_linking_both_modes,
         lmNs ++ `dvLmInit_c16,
         lmNs ++ `dv_table_hypotheses_realizable,
         lmNs ++ `dv_table_laws_instances,
