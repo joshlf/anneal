@@ -167,14 +167,20 @@ def _host_runtime_bases() -> frozenset[Path]:
 
 
 def _redirect_host_runtime_base(runtime_base: Path | str | None) -> Path:
-    """Map a live host runtime base (`/run/user/<uid>` or `/tmp`, also via symlinks) to
-    the module-scoped isolated `XDG_RUNTIME_DIR`; pass any other base through unchanged."""
+    """Map a live host runtime base (`/run/user/<uid>` or `/tmp`, also via symlinks or
+    symlinked `anneal-build-slots-<uid>` subdirs) to the module-scoped isolated
+    `XDG_RUNTIME_DIR`; pass any other base through unchanged."""
+    uid = os.getuid()
     eff = Path(runtime_base) if runtime_base is not None else alr.resolve_runtime_base()[0]
+    host_bases = _host_runtime_bases()
+    slot_subdir = f"anneal-build-slots-{uid}"
+    host_slot_dirs = {b / slot_subdir for b in host_bases}
     try:
         resolved = eff.resolve()
+        resolved_slot = (resolved / slot_subdir).resolve()
     except OSError:
         return eff
-    if resolved in _host_runtime_bases():
+    if resolved in host_bases or resolved_slot in host_slot_dirs:
         if _XDG_RUNTIME_TMPDIR is None:
             raise AssertionError(f"host runtime base {eff} touched outside module setup")
         return Path(_XDG_RUNTIME_TMPDIR.name)
@@ -223,18 +229,24 @@ spec = importlib.util.spec_from_loader(name, loader)
 mod = importlib.util.module_from_spec(spec)
 sys.modules[name] = mod
 loader.exec_module(mod)
+uid = os.getuid()
 host = set()
-for base in (pathlib.Path(f"/run/user/{os.getuid()}"), pathlib.Path("/tmp")):
+for base in (pathlib.Path(f"/run/user/{uid}"), pathlib.Path("/tmp")):
     try:
         host.add(base.resolve())
     except OSError:
         pass
-if not iso.is_dir() or iso.resolve() in host:
+slot_subdir = f"anneal-build-slots-{uid}"
+host_slot_dirs = {b / slot_subdir for b in host}
+if not iso.is_dir() or iso.resolve() in host or (iso.resolve() / slot_subdir).resolve() in host_slot_dirs:
     sys.exit(f"anneal-lean-run test shim: refusing non-isolated runtime base {iso}")
 def redirect(base):
     eff = pathlib.Path(base) if base is not None else mod.resolve_runtime_base()[0]
     try:
-        return iso if eff.resolve() in host else eff
+        resolved = eff.resolve()
+        if resolved in host or (resolved / slot_subdir).resolve() in host_slot_dirs:
+            return iso
+        return eff
     except OSError:
         return eff
 orig_count = mod.count_active_build_slots
@@ -466,12 +478,44 @@ SYNTHETIC_HOSTS: tuple[tuple[str, int | None, bool, int], ...] = (
 # regime the machine running the tests may not have.
 # argv: <script> <host root> <cgroup root name> [anneal-lean-run args...]
 _SYNTHETIC_HOST_CLI_SHIM = f"""\
-import functools, importlib.machinery, importlib.util, pathlib, sys
+import functools, importlib.machinery, importlib.util, os, pathlib, sys
 script, root, cg_name = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]
-loader = importlib.machinery.SourceFileLoader("anneal_lean_run_synthetic", script)
-spec = importlib.util.spec_from_loader("anneal_lean_run_synthetic", loader)
+name = "anneal_lean_run_synthetic"
+loader = importlib.machinery.SourceFileLoader(name, script)
+spec = importlib.util.spec_from_loader(name, loader)
 mod = importlib.util.module_from_spec(spec)
+sys.modules[name] = mod
 loader.exec_module(mod)
+uid = os.getuid()
+host = set()
+for base in (pathlib.Path(f"/run/user/{{uid}}"), pathlib.Path("/tmp")):
+    try:
+        host.add(base.resolve())
+    except OSError:
+        pass
+slot_subdir = f"anneal-build-slots-{{uid}}"
+host_slot_dirs = {{b / slot_subdir for b in host}}
+def redirect(base):
+    eff = pathlib.Path(base) if base is not None else root
+    try:
+        resolved = eff.resolve()
+        if resolved in host or (resolved / slot_subdir).resolve() in host_slot_dirs:
+            return root
+        return eff
+    except OSError:
+        return eff
+orig_count = mod.count_active_build_slots
+orig_acquire = mod.acquire_build_slot
+orig_stamp = mod.stamp_last_oom
+orig_evict = mod._evict_lsp_workers
+mod.count_active_build_slots = lambda runtime_base, uid=None: orig_count(redirect(runtime_base), uid=uid)
+mod.acquire_build_slot = lambda max_slots, timeout_sec, enabled, *, runtime_base=None, **kw: orig_acquire(max_slots, timeout_sec, enabled, runtime_base=redirect(runtime_base), **kw)
+mod.stamp_last_oom = lambda runtime_base, *args, **kw: orig_stamp(redirect(runtime_base), *args, **kw)
+def _evict_lsp_workers(env_info, *, sock_path=None, **kw):
+    if sock_path is None and "ANNEAL_LSP_SOCKET" not in os.environ:
+        sock_path = root / "anneal-lean-lsp.sock"
+    return orig_evict(env_info, sock_path=sock_path, **kw)
+mod._evict_lsp_workers = _evict_lsp_workers
 mod.probe_host_envelope = functools.partial(
     mod.probe_host_envelope,
     meminfo_path=root / "meminfo",
@@ -2146,27 +2190,37 @@ class TestCliSubprocess(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         """Execute `scripts/anneal-lean-run` directly via its `#!/usr/bin/env python3`
         shebang (exercising the executable bit and shebang), with `python3` on `PATH`
-        resolving to a wrapper that applies `_ISOLATED_CLI_SHIM` against the child's
-        per-invocation `XDG_RUNTIME_DIR`."""
+        applying `_ISOLATED_CLI_SHIM` strictly for `SCRIPT_PATH` using `_run_isolated`'s
+        private `rt_dir` and restoring `PATH` so child `python3` commands run normally."""
         with tempfile.TemporaryDirectory(prefix="anneal-cli-bin-") as bin_tmp:
             bin_dir = Path(bin_tmp)
             shim_file = bin_dir / "anneal_lean_run_isolated_cli.py"
             shim_file.write_text(_ISOLATED_CLI_SHIM, encoding="utf-8")
             wrapper = bin_dir / "python3"
-            wrapper.write_text(
-                "#!/bin/sh\n"
-                'script="$1"; shift\n'
-                f'exec {shlex.quote(sys.executable)} -B {shlex.quote(str(shim_file))} '
-                '"$script" "$XDG_RUNTIME_DIR" "$@"\n',
-                encoding="utf-8",
+            base_path = (
+                env_extra["PATH"]
+                if env_extra is not None and "PATH" in env_extra
+                else os.environ.get("PATH", "")
             )
-            wrapper.chmod(0o700)
-            path_env = os.pathsep.join(
-                p for p in (str(bin_dir), os.environ.get("PATH", "")) if p
-            )
-            return self._run_isolated(
-                [str(SCRIPT_PATH), *args], {"PATH": path_env, **(env_extra or {})}
-            )
+            path_env = os.pathsep.join(p for p in (str(bin_dir), base_path) if p)
+            merged_env = {**(env_extra or {}), "PATH": path_env}
+
+            def _prepare_argv(rt_dir: Path) -> list[str]:
+                wrapper.write_text(
+                    "#!/bin/sh\n"
+                    f'if [ "$1" = {shlex.quote(str(SCRIPT_PATH))} ]; then\n'
+                    '  script="$1"; shift\n'
+                    f"  PATH={shlex.quote(base_path)}; export PATH\n"
+                    f"  exec {shlex.quote(sys.executable)} -B {shlex.quote(str(shim_file))} "
+                    f'"$script" {shlex.quote(str(rt_dir))} "$@"\n'
+                    "fi\n"
+                    f'exec {shlex.quote(sys.executable)} "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o700)
+                return [str(SCRIPT_PATH), *args]
+
+            return self._run_isolated(_prepare_argv, merged_env)
 
     def _synthetic_cli(
         self,
@@ -3087,22 +3141,28 @@ class TestCliSubprocess(unittest.TestCase):
         `XDG_RUNTIME_DIR`: probes, `--exclusive` slot locking, and exit-137 OOM memos all
         land in the per-invocation `anneal-cli-rt-*` directory instead."""
         uid = os.getuid()
-        markers = (f"anneal-build-slots-{uid}", f"anneal-last-oom-{uid}")
+        markers = (f"anneal-build-slots-{uid}", f"anneal-last-oom-{uid}", "anneal-lean-lsp.sock")
         host_bases = sorted(str(b) for b in _host_runtime_bases())
         audit_code = (
             "import json, os, sys\n"
             "_LOG = os.environ.get('ALR_TEST_AUDIT_LOG')\n"
             f"_MARKERS = {markers!r}\n"
             "def _hook(event, args):\n"
-            "    if not _LOG or event not in ('open', 'os.mkdir'):\n"
+            "    if not _LOG:\n"
             "        return\n"
-            "    path = args[0]\n"
+            "    if event in ('open', 'os.mkdir'):\n"
+            "        path = args[0]\n"
+            "        flags = args[2] if event == 'open' and len(args) > 2 else None\n"
+            "    elif event == 'socket.connect':\n"
+            "        path = args[1] if len(args) > 1 else None\n"
+            "        flags = None\n"
+            "    else:\n"
+            "        return\n"
             "    if not isinstance(path, (str, bytes, os.PathLike)):\n"
             "        return\n"
             "    path = os.path.abspath(os.fsdecode(path))\n"
             "    if not any(m in path for m in _MARKERS):\n"
             "        return\n"
-            "    flags = args[2] if event == 'open' and len(args) > 2 else None\n"
             "    with open(_LOG, 'a', encoding='utf-8') as fh:\n"
             "        fh.write(json.dumps({'event': event, 'path': path, 'flags': flags,\n"
             "                             'pid': os.getpid()}) + '\\n')\n"
@@ -3125,6 +3185,49 @@ class TestCliSubprocess(unittest.TestCase):
                     "cgroup_avail_mib",
                     self._probe_json(self._direct_cli("--print-limits", "--json", env_extra=env)),
                 )
+                # `_direct_cli` still isolates to its private `rt_dir` even when `env_extra`
+                # overrides `XDG_RUNTIME_DIR` to `/tmp`, and restores `PATH` so child `python3`
+                # invocations are never hijacked by the shebang wrapper.
+                direct_override = self._probe_json(
+                    self._direct_cli(
+                        "--print-limits",
+                        "--json",
+                        env_extra={**env, "XDG_RUNTIME_DIR": "/tmp"},
+                    )
+                )
+                self.assertIn("cgroup_avail_mib", direct_override)
+                direct_py = self._direct_cli(
+                    "--mode",
+                    "file",
+                    "--no-slot-lock",
+                    "--concurrency",
+                    "1",
+                    "--",
+                    "python3",
+                    "-c",
+                    "print('direct-child-ok')",
+                    env_extra=env,
+                )
+                self.assertEqual(direct_py.returncode, 0, direct_py.stderr)
+                self.assertEqual(direct_py.stdout.strip(), "direct-child-ok")
+            # `_synthetic_cli` in build mode on a capped host also stays completely off the
+            # default host LSP socket (`/tmp/anneal-lean-lsp.sock`) and host slot/OOM paths.
+            with tempfile.TemporaryDirectory(prefix="anneal-synth-audit-") as synth_tmp:
+                synth_root = Path(synth_tmp)
+                _write_synthetic_host_base(synth_root)
+                _write_synthetic_cgroup_root(synth_root, "cg_capped_1", 12288)
+                synth_build = self._synthetic_cli(
+                    synth_root,
+                    "cg_capped_1",
+                    "--mode",
+                    "build",
+                    "--concurrency",
+                    "1",
+                    "--",
+                    "true",
+                    env_extra=env,
+                )
+                self.assertEqual(synth_build.returncode, 0, synth_build.stderr)
             excl = self._cli(
                 "--mode", "file", "--exclusive", "--concurrency", "1",
                 "--", sys.executable, "-c", "pass",

@@ -7964,8 +7964,22 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 custom_rt = root / "custom_rt"
                 custom_rt.mkdir()
                 os.chmod(custom_rt, 0o700)
-                with mock.patch.object(
-                    suite.tempfile, "TemporaryDirectory", side_effect=AssertionError("should not allocate")
+                with (
+                    mock.patch.object(
+                        suite.tempfile,
+                        "TemporaryDirectory",
+                        side_effect=AssertionError("should not allocate"),
+                    ),
+                    mock.patch.object(
+                        suite.tempfile,
+                        "mkdtemp",
+                        side_effect=AssertionError("should not allocate"),
+                    ),
+                    mock.patch.object(
+                        suite,
+                        "_private_runtime_dir",
+                        side_effect=AssertionError("should not allocate"),
+                    ),
                 ):
                     ovr_res = suite._run_step(
                         "scripts_python_unit_tests_core",
@@ -8089,14 +8103,36 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         caught by `run_suite`) cannot abort the whole nightly run during cleanup."""
         with tempfile.TemporaryDirectory(prefix="anneal-rmtree-test-") as tmp:
             root = Path(tmp)
-            # Child-locked subdirectories (`0o000` / `0o500`) are still removed.
-            locked = root / "locked"
+            # Child-locked root (`0o000`) and nested subdirectories (`0o000` / `0o500`) are
+            # removed without ever calling `os.chmod` on `path.parent` (outside `path`),
+            # and symlinks inside a locked dir are unlinked without touching their target.
+            parent_box = root / "parent-box"
+            parent_box.mkdir()
+            os.chmod(parent_box, 0o750)
+            external_target = root / "external-target"
+            external_target.mkdir()
+            (external_target / "keep.txt").write_text("keep", encoding="utf-8")
+
+            locked = parent_box / "locked"
             (locked / "inner").mkdir(parents=True)
             (locked / "inner" / "f").write_text("x", encoding="utf-8")
+            (locked / "ext_link").symlink_to(external_target)
             os.chmod(locked / "inner", 0o000)
-            os.chmod(locked, 0o500)
-            self.assertTrue(suite._rmtree_private_dir(locked))
+            os.chmod(locked, 0o000)
+
+            real_chmod = os.chmod
+            chmod_paths: list[str] = []
+
+            def spy_chmod(p: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+                chmod_paths.append(os.path.normpath(os.fsdecode(p)))
+                real_chmod(p, mode, *args, **kwargs)
+
+            with mock.patch.object(suite.os, "chmod", side_effect=spy_chmod):
+                self.assertTrue(suite._rmtree_private_dir(locked))
             self.assertFalse(locked.exists())
+            self.assertEqual(stat.S_IMODE(parent_box.stat().st_mode), 0o750)
+            self.assertNotIn(os.path.normpath(os.fspath(parent_box)), chmod_paths)
+            self.assertTrue((external_target / "keep.txt").is_file())
 
             # Transient failure (e.g. `ENOTEMPTY` while a descendant writes) is retried.
             racy = root / "racy"
@@ -8195,38 +8231,74 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(chosen, chosen_again)
             self.assertTrue(chosen.startswith(primary + "-"), chosen)
 
-            # `_run_step` pre-creates the missing leaf `0700` even under umask `002`.
+            # `_run_step` pre-creates a missing disjoint leaf `0700` even under umask `002`
+            # (both `--cache-dir <path>` and `--cache-dir=<path>`), while refusing to create
+            # any `--cache-dir` inside `cwd` (preserving `check_trusted.py`'s fail-closed check).
             new_cache = root / "fresh-cache"
+            eq_cache = root / "fresh-cache-eq"
+            inside_cache = checkout / "evil-inside-cache"
             old_umask = os.umask(0o002)
             try:
                 res = suite._run_step(
                     "check_trusted_fast",
                     "cat1_trusted_boundary",
                     [sys.executable, "-c", "pass", "--cache-dir", os.fspath(new_cache)],
-                    cwd=root,
+                    cwd=checkout,
+                    timeout_sec=30,
+                )
+                res_eq = suite._run_step(
+                    "check_trusted_fast",
+                    "cat1_trusted_boundary",
+                    [sys.executable, "-c", "pass", f"--cache-dir={os.fspath(eq_cache)}"],
+                    cwd=checkout,
+                    timeout_sec=30,
+                )
+                res_in = suite._run_step(
+                    "check_trusted_fast",
+                    "cat1_trusted_boundary",
+                    [sys.executable, "-c", "pass", "--cache-dir", os.fspath(inside_cache)],
+                    cwd=checkout,
+                    timeout_sec=30,
+                )
+                res_rel = suite._run_step(
+                    "check_trusted_fast",
+                    "cat1_trusted_boundary",
+                    [sys.executable, "-c", "pass", "--cache-dir", "relative-inside"],
+                    cwd=checkout,
                     timeout_sec=30,
                 )
             finally:
                 os.umask(old_umask)
             self.assertEqual(res["status"], "PASS", res)
-            self.assertTrue(new_cache.is_dir())
-            self.assertEqual(stat.S_IMODE(new_cache.stat().st_mode), 0o700)
-            self.assertTrue(real_disjoint(new_cache, checkout.resolve(), uid))
+            self.assertEqual(res_eq["status"], "PASS", res_eq)
+            self.assertEqual(res_in["status"], "PASS", res_in)
+            self.assertEqual(res_rel["status"], "PASS", res_rel)
+            for created in (new_cache, eq_cache):
+                self.assertTrue(created.is_dir(), created)
+                self.assertEqual(stat.S_IMODE(created.stat().st_mode), 0o700, created)
+                self.assertTrue(real_disjoint(created, checkout.resolve(), uid), created)
+            self.assertFalse(inside_cache.exists(), "must never pre-create cache dir inside checkout")
+            self.assertFalse(
+                (checkout / "relative-inside").exists(),
+                "must never pre-create relative cache dir inside checkout",
+            )
 
             # Existing dirs are never re-permissioned; other steps never create dirs.
             existing = root / "existing-cache"
             existing.mkdir()
             os.chmod(existing, 0o755)
-            suite._ensure_private_check_trusted_cache_dir(["x", "--cache-dir", os.fspath(existing)])
+            suite._ensure_private_check_trusted_cache_dir(
+                ["x", "--cache-dir", os.fspath(existing)], cwd=checkout
+            )
             self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o755)
-            suite._ensure_private_check_trusted_cache_dir(["x", "--cache-dir"])
-            suite._ensure_private_check_trusted_cache_dir(["x"])
+            suite._ensure_private_check_trusted_cache_dir(["x", "--cache-dir"], cwd=checkout)
+            suite._ensure_private_check_trusted_cache_dir(["x"], cwd=checkout)
             untouched = root / "not-for-other-steps"
             res_other = suite._run_step(
                 "lake_build_core_theory",
                 "cat2",
                 [sys.executable, "-c", "pass", "--cache-dir", os.fspath(untouched)],
-                cwd=root,
+                cwd=checkout,
                 timeout_sec=30,
             )
             self.assertEqual(res_other["status"], "PASS", res_other)
@@ -8235,15 +8307,18 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
     def test_anneal_difftest_discovery_honors_manifest_test_targets_and_autotests(
         self,
     ) -> None:
-        """Explicit `[[test]]` targets are never orphaned, `autotests = false` disables
-        `tests/` auto-discovery, and the real manifest + `tests/` stay fully covered."""
+        """Explicit `[[test]]` targets are never orphaned, claimed `tests/` paths are not
+        double-counted under their file stem, `autotests = false` disables `tests/`
+        auto-discovery (even when only Miri is declared), and the real manifest + `tests/`
+        stay fully covered."""
         real = suite.anneal_difftest_non_miri_test_targets(REPO_ROOT)
-        autotests, explicit = suite._anneal_difftest_manifest_test_targets(REPO_ROOT)
+        autotests, explicit, claimed = suite._anneal_difftest_manifest_test_targets(REPO_ROOT)
         stems = {
             p.stem
             for p in (REPO_ROOT / "crates/anneal-difftest/tests").glob("*.rs")
         }
         self.assertTrue(autotests)
+        self.assertEqual(claimed, set())
         self.assertEqual(
             set(real) | {suite.ANNEAL_DIFFTEST_MIRI_TEST_TARGET},
             (stems | explicit),
@@ -8252,7 +8327,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             crate = Path(tmp) / "crates/anneal-difftest"
             (crate / "tests").mkdir(parents=True)
             (crate / "tests/auto_one.rs").write_text("", encoding="utf-8")
-            (crate / "tests/miri_difftest_oracle.rs").write_text("", encoding="utf-8")
+            (crate / "tests/renamed_src.rs").write_text("", encoding="utf-8")
+            (crate / "tests/miri_custom_file.rs").write_text("", encoding="utf-8")
             manifest = crate / "Cargo.toml"
             manifest.write_text(
                 textwrap.dedent(
@@ -8265,15 +8341,21 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     path = "other/explicit_extra.rs"
 
                     [[test]]
+                    name = "renamed_target"
+                    path = "tests/renamed_src.rs"
+
+                    [[test]]
                     name = "miri_difftest_oracle"
-                    path = "tests/miri_difftest_oracle.rs"
+                    path = "./tests/miri_custom_file.rs"
                     """
                 ),
                 encoding="utf-8",
             )
+            # `renamed_src.rs` and `miri_custom_file.rs` are claimed by explicit `[[test]]`
+            # entries, so Cargo will not auto-discover `renamed_src` or `miri_custom_file`.
             self.assertEqual(
                 suite.anneal_difftest_non_miri_test_targets(Path(tmp)),
-                ["auto_one", "explicit_extra"],
+                ["auto_one", "explicit_extra", "renamed_target"],
             )
             manifest.write_text(
                 manifest.read_text(encoding="utf-8").replace(
@@ -8282,19 +8364,41 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(
-                suite.anneal_difftest_non_miri_test_targets(Path(tmp)), ["explicit_extra"]
+                suite.anneal_difftest_non_miri_test_targets(Path(tmp)),
+                ["explicit_extra", "renamed_target"],
             )
             nightly = {
                 name: cmd for name, _c, cmd, _t in suite.build_suite_steps(Path(tmp), "nightly")
             }
             inner = self._inner_cmd(nightly["domain_integration_tests_anneal_difftest_unit_and_itree"])
             self.assertIn("explicit_extra", inner)
+            self.assertIn("renamed_target", inner)
             self.assertNotIn("auto_one", inner)
+            self.assertNotIn("renamed_src", inner)
+            self.assertNotIn("miri_custom_file", inner)
             self.assertNotIn(suite.ANNEAL_DIFFTEST_MIRI_TEST_TARGET, inner)
+            # `autotests = false` with only `miri_difftest_oracle` declared -> empty non-Miri list
+            # (never fabricates 6 nonexistent fallback targets).
+            manifest.write_text(
+                textwrap.dedent(
+                    """\
+                    [package]
+                    name = "anneal-difftest"
+                    autotests = false
+
+                    [[test]]
+                    name = "miri_difftest_oracle"
+                    path = "tests/miri_custom_file.rs"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(suite.anneal_difftest_non_miri_test_targets(Path(tmp)), [])
             # Unparsable manifest: plain auto-discovery.
             manifest.write_text("[[test\n", encoding="utf-8")
             self.assertEqual(
-                suite.anneal_difftest_non_miri_test_targets(Path(tmp)), ["auto_one"]
+                suite.anneal_difftest_non_miri_test_targets(Path(tmp)),
+                ["auto_one", "miri_custom_file", "renamed_src"],
             )
 
 
