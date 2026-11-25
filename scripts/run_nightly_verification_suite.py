@@ -67,7 +67,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 import contextlib
 import datetime
 import hashlib
@@ -5073,20 +5073,53 @@ def scripts_campaign_and_guard_test_files(repo_root: Path) -> list[str]:
     return ordered
 
 
-def anneal_difftest_non_miri_test_targets(repo_root: Path) -> list[str]:
-    """Discover all non-Miri Cargo integration test targets under `crates/anneal-difftest/tests`.
+def _anneal_difftest_manifest_test_targets(repo_root: Path) -> tuple[bool, set[str]]:
+    """`(autotests, explicit [[test]] names)` from `crates/anneal-difftest/Cargo.toml`.
 
-    Matches Cargo's target auto-discovery (`tests/<name>.rs` and `tests/<name>/main.rs`),
+    Defaults to `(True, set())` when the manifest is absent or unparsable, so synthetic
+    repos keep pure `tests/` auto-discovery.
+    """
+    manifest = repo_root / "crates/anneal-difftest/Cargo.toml"
+    try:
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return True, set()
+    package = data.get("package")
+    autotests = not (isinstance(package, dict) and package.get("autotests") is False)
+    explicit: set[str] = set()
+    tests = data.get("test")
+    if isinstance(tests, list):
+        for entry in tests:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if isinstance(name, str):
+                explicit.add(name)
+    return autotests, explicit
+
+
+def anneal_difftest_non_miri_test_targets(repo_root: Path) -> list[str]:
+    """Discover all non-Miri Cargo integration test targets of `crates/anneal-difftest`.
+
+    Matches Cargo's target auto-discovery (`tests/<name>.rs` and `tests/<name>/main.rs`,
+    honoring `[package] autotests = false`) plus explicit `[[test]]` manifest targets,
     skipping `miri_difftest_oracle` (run in its own dedicated step), helper module
     subdirectories without `main.rs`, symlinks, hidden files, and unsafe names. Falls back
-    to `_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK` when the directory is absent, empty, or
-    unreadable (e.g. synthetic temp repos in unit tests).
+    to `_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK` when nothing is found (e.g. synthetic
+    temp repos in unit tests).
     """
+    autotests, explicit = _anneal_difftest_manifest_test_targets(repo_root)
+    discovered: set[str] = {
+        name
+        for name in explicit
+        if name != ANNEAL_DIFFTEST_MIRI_TEST_TARGET and _CARGO_TEST_TARGET_NAME_RE.fullmatch(name)
+    }
+
+    def _result() -> list[str]:
+        return sorted(discovered) if discovered else list(_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK)
+
     tests_dir = repo_root / "crates/anneal-difftest/tests"
     try:
-        if tests_dir.is_symlink() or not tests_dir.is_dir():
-            return list(_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK)
-        discovered: set[str] = set()
+        if not autotests or tests_dir.is_symlink() or not tests_dir.is_dir():
+            return _result()
         with os.scandir(tests_dir) as it:
             for entry in it:
                 name = entry.name
@@ -5113,13 +5146,20 @@ def anneal_difftest_non_miri_test_targets(repo_root: Path) -> list[str]:
                     and _CARGO_TEST_TARGET_NAME_RE.fullmatch(target)
                 ):
                     discovered.add(target)
-        return sorted(discovered) if discovered else list(_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK)
     except OSError:
-        return list(_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK)
+        # Unreadable mid-scan: never shrink below the known target set.
+        discovered.update(_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK)
+    return _result()
 
 
 def _is_disjoint_cache_dir(candidate: Path, checkout: Path, uid: int) -> bool:
-    """Return True iff `candidate` resolves strictly disjoint from `checkout` and is safe to use."""
+    """Return True iff `candidate` resolves strictly disjoint from `checkout` and is safe to use.
+
+    An existing candidate must be a real (non-symlink) directory owned by `uid` that no other
+    user can write: `check_trusted.py --fast` reuses cached inspector binaries and replay
+    results from it, so a group/world-writable cache on a shared multi-UID host would let
+    another account plant poisoned entries.
+    """
     try:
         resolved = candidate.resolve()
     except OSError:
@@ -5132,7 +5172,11 @@ def _is_disjoint_cache_dir(candidate: Path, checkout: Path, uid: int) -> bool:
         return True
     except OSError:
         return False
-    return stat.S_ISDIR(st.st_mode) and st.st_uid == uid
+    return (
+        stat.S_ISDIR(st.st_mode)
+        and st.st_uid == uid
+        and not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+    )
 
 
 def _dir_is_writable(path: Path) -> bool:
@@ -5182,6 +5226,26 @@ def resolve_check_trusted_cache_dir(repo_root: Path) -> str:
         if _is_disjoint_cache_dir(candidate, checkout, uid):
             return os.fspath(candidate)
     return os.fspath(Path("/var/tmp") / suffixed_name)
+
+
+def _ensure_private_check_trusted_cache_dir(cmd: list[str]) -> None:
+    """Pre-create a missing `--cache-dir` leaf as `0700` before `check_trusted_fast` runs.
+
+    `check_trusted.py` would otherwise `mkdir` it under the ambient umask (`0775` under
+    umask `002`), which `_is_disjoint_cache_dir` then rejects as group-writable, drifting
+    every later run onto fallback siblings. Best-effort: failures are left for
+    `check_trusted.py`'s own fail-closed admission.
+    """
+    try:
+        idx = len(cmd) - 1 - cmd[::-1].index("--cache-dir")
+    except ValueError:
+        return
+    if idx + 1 >= len(cmd):
+        return
+    try:
+        Path(cmd[idx + 1]).mkdir(mode=0o700)
+    except OSError:
+        pass
 
 # Sentinel distinguishing "caller omitted `effective_ram_mib`" from an explicit
 # `None` (representing an unreadable `/proc` / cgroup probe).
@@ -6947,6 +7011,73 @@ def _as_text(data: str | bytes | None) -> str:
     return data
 
 
+def _rmtree_private_dir(path: Path, attempts: int = 3) -> bool:
+    """Best-effort, never-raising removal of a private step directory; True iff removed.
+
+    Restores owner `rwx` on directories a child left unreadable / unwritable and retries
+    briefly when an escaped descendant of a timed-out step is still creating entries
+    (`ENOTEMPTY`), so a cleanup race can never abort the whole suite run from `_run_step`.
+    """
+
+    def _restore_owner_rwx(target: str) -> None:
+        for p in (os.path.dirname(target), target):
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    os.chmod(p, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+                except OSError:
+                    pass
+
+    retried: set[str] = set()
+
+    def _onerror(func: Any, target: str, exc: Any) -> None:
+        # Mirrors `tempfile.TemporaryDirectory`'s cleanup: `exc` is the exception
+        # (`onexc`, 3.12+) or an `exc_info` tuple (`onerror`).
+        err = exc if isinstance(exc, BaseException) else exc[1]
+        if isinstance(err, FileNotFoundError):
+            return
+        if not isinstance(err, PermissionError) or target in retried:
+            raise err
+        retried.add(target)
+        _restore_owner_rwx(target)
+        try:
+            os.unlink(target)
+        except FileNotFoundError:
+            pass
+        except (IsADirectoryError, PermissionError):
+            shutil.rmtree(target, **rmtree_kw)
+
+    rmtree_kw: dict[str, Any] = (
+        {"onexc": _onerror} if sys.version_info >= (3, 12) else {"onerror": _onerror}
+    )
+    for attempt in range(max(1, attempts)):
+        try:
+            shutil.rmtree(path, **rmtree_kw)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if attempt + 1 < attempts:
+                time.sleep(0.05 * (attempt + 1))
+            continue
+        if not os.path.lexists(path):
+            return True
+    return not os.path.lexists(path)
+
+
+@contextlib.contextmanager
+def _private_runtime_dir(prefix: str) -> Iterator[Path]:
+    """Yield a fresh `0700` directory that is always removed on exit (never raising)."""
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        os.chmod(path, 0o700)
+        yield path
+    finally:
+        _rmtree_private_dir(path)
+
+
 def _run_step(
     name: str,
     category: str,
@@ -6973,11 +7104,7 @@ def _run_step(
     with contextlib.ExitStack() as stack:
         isolated_rt: Path | None = None
         if need_isolated_py_rt:
-            py_rt_dir = stack.enter_context(
-                tempfile.TemporaryDirectory(prefix="anneal-suite-py-rt-")
-            )
-            os.chmod(py_rt_dir, 0o700)
-            isolated_rt = Path(py_rt_dir)
+            isolated_rt = stack.enter_context(_private_runtime_dir("anneal-suite-py-rt-"))
         env = _build_step_env(
             name,
             env_overrides=env_overrides,
@@ -6986,6 +7113,8 @@ def _run_step(
             isolated_runtime_dir=isolated_rt,
         )
         outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
+        if name == "check_trusted_fast":
+            _ensure_private_check_trusted_cache_dir(cmd)
         timed_out = False
         try:
             proc = subprocess.Popen(

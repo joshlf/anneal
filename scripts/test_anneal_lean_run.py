@@ -21,11 +21,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Iterator, MutableMapping
+from typing import Any, Callable, Iterator, MutableMapping
 import unittest
 from unittest import mock
 
@@ -72,7 +73,14 @@ _ENV_PATCHER: Any = None
 _GUARDED_EXEC_FUNCTIONS: tuple[str, ...] = ("execv", "execve", "execvp", "execvpe")
 _EXEC_GUARDS: list[Any] = []
 _ORIG_ACQUIRE_BUILD_SLOT = alr.acquire_build_slot
+_ORIG_COUNT_ACTIVE_BUILD_SLOTS = alr.count_active_build_slots
+_ORIG_STAMP_LAST_OOM = alr.stamp_last_oom
+_ORIG_EVICT_LSP_WORKERS = alr._evict_lsp_workers
 _SLOT_LOCK_GUARD: Any = None
+# Module-wide redirects of `count_active_build_slots` / `stamp_last_oom` /
+# `_evict_lsp_workers` away from live host state (started in `setUpModule`, stopped in
+# `tearDownModule`).
+_HOST_RUNTIME_GUARDS: list[Any] = []
 _XDG_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
 _XDG_RUNTIME_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
 # Text of the `anneal-workloads.slice` unit `ensure_workloads_slice` reconciles on this
@@ -145,6 +153,111 @@ def _guarded_acquire_build_slot(
         poll_interval=poll_interval,
     ) as slots:
         yield slots
+
+
+def _host_runtime_bases() -> frozenset[Path]:
+    """Resolved live host runtime bases `resolve_runtime_base()` can return."""
+    bases: set[Path] = set()
+    for base in (Path(f"/run/user/{os.getuid()}"), Path("/tmp")):
+        try:
+            bases.add(base.resolve())
+        except OSError:
+            pass
+    return frozenset(bases)
+
+
+def _redirect_host_runtime_base(runtime_base: Path | str | None) -> Path:
+    """Map a live host runtime base (`/run/user/<uid>` or `/tmp`, also via symlinks) to
+    the module-scoped isolated `XDG_RUNTIME_DIR`; pass any other base through unchanged."""
+    eff = Path(runtime_base) if runtime_base is not None else alr.resolve_runtime_base()[0]
+    try:
+        resolved = eff.resolve()
+    except OSError:
+        return eff
+    if resolved in _host_runtime_bases():
+        if _XDG_RUNTIME_TMPDIR is None:
+            raise AssertionError(f"host runtime base {eff} touched outside module setup")
+        return Path(_XDG_RUNTIME_TMPDIR.name)
+    return eff
+
+
+def _isolated_count_active_build_slots(
+    runtime_base: Path, uid: int | None = None
+) -> int:
+    # `probe_host_envelope` counts held slots under `resolve_runtime_base()` (always
+    # `/run/user/<uid>` when it exists, regardless of `XDG_RUNTIME_DIR`): never take even a
+    # transient `LOCK_SH` on live host slot locks, and keep probes independent of host load.
+    return _ORIG_COUNT_ACTIVE_BUILD_SLOTS(_redirect_host_runtime_base(runtime_base), uid=uid)
+
+
+def _isolated_stamp_last_oom(runtime_base: Path, *args: Any, **kwargs: Any) -> Path:
+    # Never rewrite the live host `anneal-last-oom-<uid>.json` OOM-budget memo.
+    return _ORIG_STAMP_LAST_OOM(_redirect_host_runtime_base(runtime_base), *args, **kwargs)
+
+
+def _isolated_evict_lsp_workers(
+    env_info: dict[str, Any], *, sock_path: Path | None = None, **kwargs: Any
+) -> bool:
+    # Build-mode runs evict warm LSP workers through the default host socket
+    # (`/tmp/anneal-lean-lsp.sock`) whenever headroom is short: never restart the live
+    # host daemon's workers from a test unless one opts in via `sock_path` / `ANNEAL_LSP_SOCKET`.
+    if sock_path is None and "ANNEAL_LSP_SOCKET" not in os.environ:
+        if _XDG_RUNTIME_TMPDIR is None:
+            raise AssertionError("host LSP eviction attempted outside module setup")
+        sock_path = Path(_XDG_RUNTIME_TMPDIR.name) / "anneal-lean-lsp.sock"
+    return _ORIG_EVICT_LSP_WORKERS(env_info, sock_path=sock_path, **kwargs)
+
+
+# Child-side twin of the module guards for real `scripts/anneal-lean-run` CLI subprocesses
+# (`TestCliSubprocess._cli`): loads the script exactly as `__main__` would run it (same
+# `sys.argv[0]`, same `main()` entry), but redirects build-slot counting / locking and OOM
+# memos from the live host runtime base to the per-invocation isolated directory `argv[2]`,
+# and points default-socket LSP eviction there too (a missing socket: a no-op).
+# Everything else (`resolve_runtime_base`, `systemd-run --user` scopes) stays live.
+_ISOLATED_CLI_SHIM = """\
+import importlib.machinery, importlib.util, os, pathlib, sys
+script, iso = sys.argv[1], pathlib.Path(sys.argv[2])
+name = "anneal_lean_run_isolated_cli"
+loader = importlib.machinery.SourceFileLoader(name, script)
+spec = importlib.util.spec_from_loader(name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[name] = mod
+loader.exec_module(mod)
+host = set()
+for base in (pathlib.Path(f"/run/user/{os.getuid()}"), pathlib.Path("/tmp")):
+    try:
+        host.add(base.resolve())
+    except OSError:
+        pass
+if not iso.is_dir() or iso.resolve() in host:
+    sys.exit(f"anneal-lean-run test shim: refusing non-isolated runtime base {iso}")
+def redirect(base):
+    eff = pathlib.Path(base) if base is not None else mod.resolve_runtime_base()[0]
+    try:
+        return iso if eff.resolve() in host else eff
+    except OSError:
+        return eff
+orig_count = mod.count_active_build_slots
+orig_acquire = mod.acquire_build_slot
+orig_stamp = mod.stamp_last_oom
+def count_active_build_slots(runtime_base, uid=None):
+    return orig_count(redirect(runtime_base), uid=uid)
+def acquire_build_slot(max_slots, timeout_sec, enabled, *, runtime_base=None, **kw):
+    return orig_acquire(max_slots, timeout_sec, enabled, runtime_base=redirect(runtime_base), **kw)
+def stamp_last_oom(runtime_base, *args, **kw):
+    return orig_stamp(redirect(runtime_base), *args, **kw)
+orig_evict = mod._evict_lsp_workers
+def _evict_lsp_workers(env_info, *, sock_path=None, **kw):
+    if sock_path is None and "ANNEAL_LSP_SOCKET" not in os.environ:
+        sock_path = iso / "anneal-lean-lsp.sock"
+    return orig_evict(env_info, sock_path=sock_path, **kw)
+mod.count_active_build_slots = count_active_build_slots
+mod.acquire_build_slot = acquire_build_slot
+mod.stamp_last_oom = stamp_last_oom
+mod._evict_lsp_workers = _evict_lsp_workers
+sys.argv = [script, *sys.argv[3:]]
+sys.exit(mod.main())
+"""
 
 
 def _forbid_in_process_exec(file: str, args: Any, *rest: Any) -> None:
@@ -250,6 +363,17 @@ def setUpModule() -> None:
             alr, "acquire_build_slot", side_effect=_guarded_acquire_build_slot
         )
         _SLOT_LOCK_GUARD.start()
+        # `resolve_runtime_base()` always prefers a live `/run/user/<uid>` over
+        # `XDG_RUNTIME_DIR`, so env isolation alone cannot keep probes off host slot locks:
+        # redirect slot counting and OOM memos to the module-scoped runtime dir as well.
+        for attr, replacement in (
+            ("count_active_build_slots", _isolated_count_active_build_slots),
+            ("stamp_last_oom", _isolated_stamp_last_oom),
+            ("_evict_lsp_workers", _isolated_evict_lsp_workers),
+        ):
+            runtime_guard = mock.patch.object(alr, attr, side_effect=replacement)
+            runtime_guard.start()
+            _HOST_RUNTIME_GUARDS.append(runtime_guard)
         # In-process `alr.main([... "--", cmd])` runs reconcile the unit under this module-wide
         # `XDG_CONFIG_HOME`; seed it so they never reload the live user manager either.
         _SLICE_UNIT_SEED = _render_live_workloads_slice_unit()
@@ -262,9 +386,13 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     global _ENV_PATCHER, _SLOT_LOCK_GUARD, _XDG_TMPDIR, _XDG_RUNTIME_TMPDIR, _SLICE_UNIT_SEED
     try:
-        if _SLOT_LOCK_GUARD is not None:
-            _SLOT_LOCK_GUARD.stop()
-            _SLOT_LOCK_GUARD = None
+        try:
+            while _HOST_RUNTIME_GUARDS:
+                _HOST_RUNTIME_GUARDS.pop().stop()
+        finally:
+            if _SLOT_LOCK_GUARD is not None:
+                _SLOT_LOCK_GUARD.stop()
+                _SLOT_LOCK_GUARD = None
     finally:
         try:
             while _EXEC_GUARDS:
@@ -1970,17 +2098,23 @@ class TestCliSubprocess(unittest.TestCase):
     Every subprocess is isolated from the invoking host: ambient `ANNEAL_LEAN_*` /
     `ANNEAL_WORKTREE_*` / `ANNEAL_LSP_*` / `ANNEAL_OOM_*` variables are scrubbed,
     `XDG_CONFIG_HOME` is a fresh empty directory, and `XDG_RUNTIME_DIR` is a fresh
-    `0700` directory unless `env_extra` provides an explicit override.
+    `0700` directory unless `env_extra` provides an explicit override. Because
+    `resolve_runtime_base()` prefers a live `/run/user/<uid>` over `XDG_RUNTIME_DIR`,
+    `_cli` additionally runs the script through `_ISOLATED_CLI_SHIM`, which pins build-slot
+    counting / locking and OOM memos to that fresh per-invocation directory.
     """
 
     def _run_isolated(
-        self, argv: list[str], env_extra: dict[str, str] | None = None
+        self,
+        argv: list[str] | Callable[[Path], list[str]],
+        env_extra: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        """Run `argv` (or `argv(rt_dir)`, given the fresh per-invocation runtime dir)."""
         with tempfile.TemporaryDirectory(prefix="anneal-cli-xdg-") as xdg_dir, \
              tempfile.TemporaryDirectory(prefix="anneal-cli-rt-") as rt_dir:
             os.chmod(rt_dir, 0o700)
             return subprocess.run(
-                argv,
+                argv(Path(rt_dir)) if callable(argv) else argv,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -1994,7 +2128,45 @@ class TestCliSubprocess(unittest.TestCase):
     def _cli(
         self, *args: str, env_extra: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        return self._run_isolated([sys.executable, str(SCRIPT_PATH), *args], env_extra)
+        return self._run_isolated(
+            lambda rt_dir: [
+                sys.executable,
+                "-B",
+                "-c",
+                _ISOLATED_CLI_SHIM,
+                str(SCRIPT_PATH),
+                str(rt_dir),
+                *args,
+            ],
+            env_extra,
+        )
+
+    def _direct_cli(
+        self, *args: str, env_extra: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute `scripts/anneal-lean-run` directly via its `#!/usr/bin/env python3`
+        shebang (exercising the executable bit and shebang), with `python3` on `PATH`
+        resolving to a wrapper that applies `_ISOLATED_CLI_SHIM` against the child's
+        per-invocation `XDG_RUNTIME_DIR`."""
+        with tempfile.TemporaryDirectory(prefix="anneal-cli-bin-") as bin_tmp:
+            bin_dir = Path(bin_tmp)
+            shim_file = bin_dir / "anneal_lean_run_isolated_cli.py"
+            shim_file.write_text(_ISOLATED_CLI_SHIM, encoding="utf-8")
+            wrapper = bin_dir / "python3"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                'script="$1"; shift\n'
+                f'exec {shlex.quote(sys.executable)} -B {shlex.quote(str(shim_file))} '
+                '"$script" "$XDG_RUNTIME_DIR" "$@"\n',
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o700)
+            path_env = os.pathsep.join(
+                p for p in (str(bin_dir), os.environ.get("PATH", "")) if p
+            )
+            return self._run_isolated(
+                [str(SCRIPT_PATH), *args], {"PATH": path_env, **(env_extra or {})}
+            )
 
     def _synthetic_cli(
         self,
@@ -2038,7 +2210,7 @@ class TestCliSubprocess(unittest.TestCase):
 
     def test_cli_backward_compatible_probe_and_execution(self) -> None:
         if os.access(SCRIPT_PATH, os.X_OK):
-            direct = self._run_isolated([str(SCRIPT_PATH), "--print-limits", "--json"])
+            direct = self._direct_cli("--print-limits", "--json")
             self.assertIn("cgroup_avail_mib", self._probe_json(direct))
 
         probe = self._cli("--probe")
@@ -2395,9 +2567,7 @@ class TestCliSubprocess(unittest.TestCase):
                 live = self._probe_json(self._cli("--probe", "--json"))
                 direct = (
                     self._probe_json(
-                        self._run_isolated(
-                            [str(SCRIPT_PATH), "--print-limits", "--json"]
-                        )
+                        self._direct_cli("--print-limits", "--json")
                     )
                     if os.access(SCRIPT_PATH, os.X_OK)
                     else None
@@ -2865,19 +3035,19 @@ class TestCliSubprocess(unittest.TestCase):
                     pass
 
         real_open = os.open
-        write_flags = os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_TRUNC | os.O_APPEND
+        # Any open at all (including the read-only `LOCK_SH` probes of
+        # `count_active_build_slots`) of a host slot lock is a host build-slot touch.
         host_slot_writes: list[str] = []
 
         def spy_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
-            if flags & write_flags:
-                try:
-                    resolved = Path(os.fsdecode(path)).resolve()
-                except OSError:
-                    resolved = None
-                if resolved is not None and any(
-                    resolved == d or d in resolved.parents for d in forbidden_slot_dirs
-                ):
-                    host_slot_writes.append(str(resolved))
+            try:
+                resolved = Path(os.fsdecode(path)).resolve()
+            except (OSError, TypeError):
+                resolved = None
+            if resolved is not None and any(
+                resolved == d or d in resolved.parents for d in forbidden_slot_dirs
+            ):
+                host_slot_writes.append(str(resolved))
             return real_open(path, flags, *args, **kwargs)
 
         with mock.patch("os.open", side_effect=spy_open):
@@ -2907,6 +3077,176 @@ class TestCliSubprocess(unittest.TestCase):
             synth_lock = root / f"anneal-build-slots-{uid}" / "slot-1.lock"
             self.assertTrue(synth_lock.is_file(), f"expected synthetic lock at {synth_lock}")
             self.assertNotIn(synth_lock.parent.resolve(), forbidden_slot_dirs)
+
+    def test_cli_subprocesses_confine_slot_locks_and_oom_memos_to_isolated_runtime_dir(
+        self,
+    ) -> None:
+        """Real CLI subprocesses (`_cli` and shebang `_direct_cli`) never open anything under
+        the live host `/run/user/<uid>` or `/tmp` slot / OOM-memo paths, even though
+        `resolve_runtime_base()` prefers `/run/user/<uid>` over the isolated
+        `XDG_RUNTIME_DIR`: probes, `--exclusive` slot locking, and exit-137 OOM memos all
+        land in the per-invocation `anneal-cli-rt-*` directory instead."""
+        uid = os.getuid()
+        markers = (f"anneal-build-slots-{uid}", f"anneal-last-oom-{uid}")
+        host_bases = sorted(str(b) for b in _host_runtime_bases())
+        audit_code = (
+            "import json, os, sys\n"
+            "_LOG = os.environ.get('ALR_TEST_AUDIT_LOG')\n"
+            f"_MARKERS = {markers!r}\n"
+            "def _hook(event, args):\n"
+            "    if not _LOG or event not in ('open', 'os.mkdir'):\n"
+            "        return\n"
+            "    path = args[0]\n"
+            "    if not isinstance(path, (str, bytes, os.PathLike)):\n"
+            "        return\n"
+            "    path = os.path.abspath(os.fsdecode(path))\n"
+            "    if not any(m in path for m in _MARKERS):\n"
+            "        return\n"
+            "    flags = args[2] if event == 'open' and len(args) > 2 else None\n"
+            "    with open(_LOG, 'a', encoding='utf-8') as fh:\n"
+            "        fh.write(json.dumps({'event': event, 'path': path, 'flags': flags,\n"
+            "                             'pid': os.getpid()}) + '\\n')\n"
+            "sys.addaudithook(_hook)\n"
+        )
+        with tempfile.TemporaryDirectory(prefix="anneal-cli-audit-") as audit_tmp, \
+             tempfile.TemporaryDirectory(prefix="anneal-cli-audit-xdg-") as run_xdg:
+            audit_dir = Path(audit_tmp)
+            (audit_dir / "sitecustomize.py").write_text(audit_code, encoding="utf-8")
+            log_path = audit_dir / "touches.jsonl"
+            _seed_workloads_slice_unit(Path(run_xdg))
+            env = {
+                "PYTHONPATH": str(audit_dir),
+                "ALR_TEST_AUDIT_LOG": str(log_path),
+                "XDG_CONFIG_HOME": run_xdg,
+            }
+            self._probe_json(self._cli("--probe", "--json", env_extra=env))
+            if os.access(SCRIPT_PATH, os.X_OK):
+                self.assertIn(
+                    "cgroup_avail_mib",
+                    self._probe_json(self._direct_cli("--print-limits", "--json", env_extra=env)),
+                )
+            excl = self._cli(
+                "--mode", "file", "--exclusive", "--concurrency", "1",
+                "--", sys.executable, "-c", "pass",
+                env_extra=env,
+            )
+            self.assertEqual(excl.returncode, 0, excl.stderr)
+            oom = self._cli(
+                "--mode", "file", "--no-slot-lock", "--no-oom-retry", "--concurrency", "1",
+                "--", "sh", "-c", "exit 137",
+                env_extra=env,
+            )
+            self.assertEqual(oom.returncode, 137, oom.stderr)
+            touches = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ] if log_path.exists() else []
+
+        # A host touch is any path directly under a live host runtime base whose first
+        # component is a slot / OOM-memo marker (`/tmp/anneal-cli-rt-*/...` is isolated).
+        host_touches = [
+            t for t in touches
+            if any(
+                t["path"].startswith(b + os.sep)
+                and t["path"][len(b) + 1:].startswith(markers)
+                for b in host_bases
+            )
+        ]
+        self.assertEqual(host_touches, [], "CLI subprocess touched live host slot/OOM state")
+        rt_touches = [
+            t for t in touches
+            if any(part.startswith("anneal-cli-rt-") for part in Path(t["path"]).parts)
+        ]
+        # Positive controls: the redirected paths really were exercised.
+        self.assertTrue(
+            any(
+                t["event"] == "open"
+                and t["path"].endswith(f"anneal-build-slots-{uid}{os.sep}slot-1.lock")
+                and isinstance(t["flags"], int)
+                and t["flags"] & os.O_CREAT
+                for t in rt_touches
+            ),
+            touches,
+        )
+        self.assertTrue(any(f"anneal-last-oom-{uid}" in t["path"] for t in rt_touches), touches)
+
+    def test_in_process_probes_redirect_host_slot_counts_oom_memos_and_lsp_eviction(
+        self,
+    ) -> None:
+        """Module guards keep in-process `probe_host_envelope` / `count_active_build_slots`
+        / `stamp_last_oom` / default-socket `_evict_lsp_workers` off live host state, while
+        explicitly isolated bases and sockets pass through unchanged."""
+        uid = os.getuid()
+        self.assertIsNotNone(_XDG_RUNTIME_TMPDIR)
+        assert _XDG_RUNTIME_TMPDIR is not None
+        mod_rt = Path(_XDG_RUNTIME_TMPDIR.name)
+        host_bases = _host_runtime_bases()
+        host_slot_dirs = {b / f"anneal-build-slots-{uid}" for b in host_bases}
+        opened: list[Path] = []
+        real_open = os.open
+
+        def spy_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            try:
+                opened.append(Path(os.fsdecode(path)).resolve())
+            except (OSError, TypeError):
+                pass
+            return real_open(path, flags, *args, **kwargs)
+
+        mod_slot_dir = mod_rt / f"anneal-build-slots-{uid}"
+        mod_slot_dir.mkdir(exist_ok=True)
+        lock_fd = os.open(str(mod_slot_dir / "slot-1.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch("os.open", side_effect=spy_open):
+                alr.probe_host_envelope()
+                # Positive control: counting the host base sees the isolated held lock.
+                for base in (Path(f"/run/user/{uid}"), Path("/tmp")):
+                    self.assertEqual(alr.count_active_build_slots(base), 1, base)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            for lock_file in mod_slot_dir.glob("slot-*.lock"):
+                lock_file.unlink()
+            mod_slot_dir.rmdir()
+        self.assertEqual(
+            [p for p in opened if any(p == d or d in p.parents for d in host_slot_dirs)], []
+        )
+
+        with tempfile.TemporaryDirectory(prefix="anneal-own-rt-") as own_tmp:
+            own_rt = Path(own_tmp)
+            self.assertEqual(alr.count_active_build_slots(own_rt), 0)
+            for base in (Path(f"/run/user/{uid}"), Path("/tmp")):
+                stamped = alr.stamp_last_oom(base, "build", "oom", 1.5)
+                self.assertEqual(stamped.parent.resolve(), mod_rt.resolve(), base)
+                stamped.unlink()
+                for lock_file in mod_rt.glob("anneal-last-oom-*.lock"):
+                    lock_file.unlink()
+            own_stamp = alr.stamp_last_oom(own_rt, "build", "oom", 1.5)
+            self.assertEqual(own_stamp.parent.resolve(), own_rt.resolve())
+
+        seen_socks: list[Path | None] = []
+
+        def fake_orig_evict(
+            _env_info: dict[str, Any], *, sock_path: Path | None = None, **_kw: Any
+        ) -> bool:
+            seen_socks.append(sock_path)
+            return False
+
+        with mock.patch.object(
+            sys.modules[__name__], "_ORIG_EVICT_LSP_WORKERS", side_effect=fake_orig_evict
+        ):
+            with mock.patch.dict(os.environ):
+                os.environ.pop("ANNEAL_LSP_SOCKET", None)
+                self.assertFalse(alr._evict_lsp_workers({}))
+            explicit = Path("/nonexistent/explicit.sock")
+            self.assertFalse(alr._evict_lsp_workers({}, sock_path=explicit))
+            with mock.patch.dict(os.environ, {"ANNEAL_LSP_SOCKET": "/nonexistent/env.sock"}):
+                self.assertFalse(alr._evict_lsp_workers({}))
+        self.assertEqual(
+            seen_socks, [mod_rt / "anneal-lean-lsp.sock", explicit, None]
+        )
+        self.assertNotIn(Path("/tmp/anneal-lean-lsp.sock"), seen_socks)
 
 
 class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):

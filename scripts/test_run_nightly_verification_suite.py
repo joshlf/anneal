@@ -7775,10 +7775,10 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             core_files = core_cmd[4:]
             camp_files = camp_cmd[4:]
             self.assertEqual(set(core_files) & set(camp_files), set())
+            # Every `test_*.py` entry counts (symlinks and non-regular entries too): discovery
+            # skips those, so adding one must fail here loudly instead of being orphaned.
             repo_test_files = sorted(
-                f"scripts/{p.name}"
-                for p in (REPO_ROOT / "scripts").glob("test_*.py")
-                if p.is_file() and not p.is_symlink()
+                f"scripts/{p.name}" for p in (REPO_ROOT / "scripts").glob("test_*.py")
             )
             self.assertEqual(sorted([*core_files, *camp_files]), repo_test_files)
 
@@ -8080,6 +8080,221 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             regular_file.write_text("x", encoding="utf-8")
             self.assertFalse(
                 suite._is_disjoint_cache_dir(regular_file, tmp_checkout.resolve(), uid)
+            )
+
+
+    def test_private_runtime_dir_cleanup_never_raises_or_aborts_run_step(self) -> None:
+        """`_rmtree_private_dir` restores owner perms, retries transient `ENOTEMPTY` races
+        from escaped descendants, and never raises, so `_run_step` (whose exceptions are not
+        caught by `run_suite`) cannot abort the whole nightly run during cleanup."""
+        with tempfile.TemporaryDirectory(prefix="anneal-rmtree-test-") as tmp:
+            root = Path(tmp)
+            # Child-locked subdirectories (`0o000` / `0o500`) are still removed.
+            locked = root / "locked"
+            (locked / "inner").mkdir(parents=True)
+            (locked / "inner" / "f").write_text("x", encoding="utf-8")
+            os.chmod(locked / "inner", 0o000)
+            os.chmod(locked, 0o500)
+            self.assertTrue(suite._rmtree_private_dir(locked))
+            self.assertFalse(locked.exists())
+
+            # Transient failure (e.g. `ENOTEMPTY` while a descendant writes) is retried.
+            racy = root / "racy"
+            racy.mkdir()
+            real_rmtree = shutil.rmtree
+            calls: list[int] = []
+
+            def flaky_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+                calls.append(1)
+                if len(calls) == 1:
+                    raise OSError(39, "Directory not empty")
+                real_rmtree(path, *args, **kwargs)
+
+            with mock.patch.object(suite.shutil, "rmtree", side_effect=flaky_rmtree):
+                self.assertTrue(suite._rmtree_private_dir(racy))
+            self.assertEqual(len(calls), 2)
+            self.assertFalse(racy.exists())
+
+            # Missing directory: success, no exception.
+            self.assertTrue(suite._rmtree_private_dir(root / "never-created"))
+
+            # Persistent failure: reports False but never raises.
+            stuck = root / "stuck"
+            stuck.mkdir()
+            with mock.patch.object(
+                suite.shutil, "rmtree", side_effect=OSError(16, "Device or resource busy")
+            ), mock.patch.object(suite.time, "sleep"):
+                self.assertFalse(suite._rmtree_private_dir(stuck))
+            self.assertTrue(stuck.exists())
+
+            # `_run_step` still returns a step result when cleanup keeps failing, and the
+            # private dir is a fresh `0700` `anneal-suite-py-rt-*` directory.
+            seen: list[Path] = []
+            real_private = suite._rmtree_private_dir
+
+            def failing_cleanup(path: Path, attempts: int = 3) -> bool:
+                seen.append(path)
+                return False
+
+            with mock.patch.object(suite, "_rmtree_private_dir", side_effect=failing_cleanup):
+                res = suite._run_step(
+                    "scripts_python_unit_tests_core",
+                    "cat7_python_and_ci_tests",
+                    [
+                        sys.executable,
+                        "-c",
+                        "import os, stat, sys; p = os.environ['XDG_RUNTIME_DIR']; "
+                        "sys.exit(0 if stat.S_IMODE(os.stat(p).st_mode) == 0o700 else 3)",
+                    ],
+                    cwd=root,
+                    timeout_sec=30,
+                )
+            self.assertEqual(res["status"], "PASS", res)
+            self.assertEqual(len(seen), 1)
+            self.assertTrue(seen[0].name.startswith("anneal-suite-py-rt-"), seen[0])
+            self.assertTrue(real_private(seen[0]))
+            self.assertFalse(seen[0].exists())
+
+    def test_check_trusted_cache_dir_rejects_shared_writable_dirs_and_precreates_0700(
+        self,
+    ) -> None:
+        """Existing group/world-writable cache candidates (cache poisoning on multi-UID
+        hosts) are rejected, and `_run_step` pre-creates a missing `--cache-dir` leaf as
+        `0700` regardless of umask so later runs never drift onto fallback siblings."""
+        uid = os.getuid()
+        with tempfile.TemporaryDirectory(prefix="anneal-ct-perm-") as tmp:
+            root = Path(tmp)
+            checkout = root / "repo"
+            checkout.mkdir()
+            for mode, ok in ((0o700, True), (0o755, True), (0o775, False), (0o757, False), (0o777, False)):
+                cand = root / f"cache-{mode:o}"
+                cand.mkdir()
+                os.chmod(cand, mode)
+                self.assertEqual(
+                    suite._is_disjoint_cache_dir(cand, checkout.resolve(), uid), ok, oct(mode)
+                )
+            self.assertTrue(
+                suite._is_disjoint_cache_dir(root / "absent", checkout.resolve(), uid)
+            )
+
+            # The resolver consults `_is_disjoint_cache_dir` for the primary first and moves
+            # on deterministically when it is rejected (e.g. found shared-writable).
+            primary = f"/tmp/anneal-trusted-cache-nightly-{uid}"
+            candidates_seen: list[str] = []
+            real_disjoint = suite._is_disjoint_cache_dir
+
+            def reject_primary(candidate: Path, co: Path, u: int) -> bool:
+                candidates_seen.append(os.fspath(candidate))
+                return os.fspath(candidate) != primary and real_disjoint(candidate, co, u)
+
+            with mock.patch.object(suite, "_is_disjoint_cache_dir", side_effect=reject_primary):
+                chosen = suite.resolve_check_trusted_cache_dir(checkout)
+                chosen_again = suite.resolve_check_trusted_cache_dir(checkout)
+            self.assertEqual(candidates_seen[0], primary)
+            self.assertNotEqual(chosen, primary)
+            self.assertEqual(chosen, chosen_again)
+            self.assertTrue(chosen.startswith(primary + "-"), chosen)
+
+            # `_run_step` pre-creates the missing leaf `0700` even under umask `002`.
+            new_cache = root / "fresh-cache"
+            old_umask = os.umask(0o002)
+            try:
+                res = suite._run_step(
+                    "check_trusted_fast",
+                    "cat1_trusted_boundary",
+                    [sys.executable, "-c", "pass", "--cache-dir", os.fspath(new_cache)],
+                    cwd=root,
+                    timeout_sec=30,
+                )
+            finally:
+                os.umask(old_umask)
+            self.assertEqual(res["status"], "PASS", res)
+            self.assertTrue(new_cache.is_dir())
+            self.assertEqual(stat.S_IMODE(new_cache.stat().st_mode), 0o700)
+            self.assertTrue(real_disjoint(new_cache, checkout.resolve(), uid))
+
+            # Existing dirs are never re-permissioned; other steps never create dirs.
+            existing = root / "existing-cache"
+            existing.mkdir()
+            os.chmod(existing, 0o755)
+            suite._ensure_private_check_trusted_cache_dir(["x", "--cache-dir", os.fspath(existing)])
+            self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o755)
+            suite._ensure_private_check_trusted_cache_dir(["x", "--cache-dir"])
+            suite._ensure_private_check_trusted_cache_dir(["x"])
+            untouched = root / "not-for-other-steps"
+            res_other = suite._run_step(
+                "lake_build_core_theory",
+                "cat2",
+                [sys.executable, "-c", "pass", "--cache-dir", os.fspath(untouched)],
+                cwd=root,
+                timeout_sec=30,
+            )
+            self.assertEqual(res_other["status"], "PASS", res_other)
+            self.assertFalse(untouched.exists())
+
+    def test_anneal_difftest_discovery_honors_manifest_test_targets_and_autotests(
+        self,
+    ) -> None:
+        """Explicit `[[test]]` targets are never orphaned, `autotests = false` disables
+        `tests/` auto-discovery, and the real manifest + `tests/` stay fully covered."""
+        real = suite.anneal_difftest_non_miri_test_targets(REPO_ROOT)
+        autotests, explicit = suite._anneal_difftest_manifest_test_targets(REPO_ROOT)
+        stems = {
+            p.stem
+            for p in (REPO_ROOT / "crates/anneal-difftest/tests").glob("*.rs")
+        }
+        self.assertTrue(autotests)
+        self.assertEqual(
+            set(real) | {suite.ANNEAL_DIFFTEST_MIRI_TEST_TARGET},
+            (stems | explicit),
+        )
+        with tempfile.TemporaryDirectory(prefix="anneal-difftest-manifest-") as tmp:
+            crate = Path(tmp) / "crates/anneal-difftest"
+            (crate / "tests").mkdir(parents=True)
+            (crate / "tests/auto_one.rs").write_text("", encoding="utf-8")
+            (crate / "tests/miri_difftest_oracle.rs").write_text("", encoding="utf-8")
+            manifest = crate / "Cargo.toml"
+            manifest.write_text(
+                textwrap.dedent(
+                    """\
+                    [package]
+                    name = "anneal-difftest"
+
+                    [[test]]
+                    name = "explicit_extra"
+                    path = "other/explicit_extra.rs"
+
+                    [[test]]
+                    name = "miri_difftest_oracle"
+                    path = "tests/miri_difftest_oracle.rs"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                suite.anneal_difftest_non_miri_test_targets(Path(tmp)),
+                ["auto_one", "explicit_extra"],
+            )
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace(
+                    'name = "anneal-difftest"\n', 'name = "anneal-difftest"\nautotests = false\n'
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                suite.anneal_difftest_non_miri_test_targets(Path(tmp)), ["explicit_extra"]
+            )
+            nightly = {
+                name: cmd for name, _c, cmd, _t in suite.build_suite_steps(Path(tmp), "nightly")
+            }
+            inner = self._inner_cmd(nightly["domain_integration_tests_anneal_difftest_unit_and_itree"])
+            self.assertIn("explicit_extra", inner)
+            self.assertNotIn("auto_one", inner)
+            self.assertNotIn(suite.ANNEAL_DIFFTEST_MIRI_TEST_TARGET, inner)
+            # Unparsable manifest: plain auto-discovery.
+            manifest.write_text("[[test\n", encoding="utf-8")
+            self.assertEqual(
+                suite.anneal_difftest_non_miri_test_targets(Path(tmp)), ["auto_one"]
             )
 
 
