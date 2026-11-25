@@ -825,6 +825,23 @@ class CheckTrustedBudgetTests(unittest.TestCase):
         self.assertNotIn("sharded_trusted_audit", text)
         self.assertIn("INDUCTIVE_REPLAY_SOURCE", text)
 
+    def test_orphan_only_enforces_base_snapshot_and_audit_vacuity_exclusion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_snap = Path(tmp) / "bad_snap"
+            (bad_snap / "trusted/lean").mkdir(parents=True)
+            res = subprocess.run(
+                [sys.executable, "-B", str(REPO / "trusted/audit/check_trusted.py"),
+                 "--orphan-only", "--base-snapshot", str(bad_snap)],
+                cwd=REPO, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            for combo in (["--orphan-only", "--audit-vacuity"], ["--exact-modules", "Smoke", "--audit-vacuity"]):
+                r2 = subprocess.run(
+                    [sys.executable, "-B", str(REPO / "trusted/audit/check_trusted.py"), *combo],
+                    cwd=REPO, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(r2.returncode, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

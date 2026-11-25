@@ -8134,15 +8134,22 @@ def main() -> int:
         base_snapshot = Path(os.environ["ANNEAL_TRUSTED_BASE_SNAPSHOT"])
     if args.orphan_only or args.exact_modules is not None:
         try:
-            if args.orphan_only and args.exact_modules is not None:
-                raise Failure(1, "orphan-check", "--orphan-only and --exact-modules are mutually exclusive")
+            if args.orphan_only and (args.exact_modules is not None or args.audit_vacuity):
+                raise Failure(1, "orphan-check", "--orphan-only cannot combine with --exact-modules or --audit-vacuity")
             if args.orphan_only:
+                if base_snapshot is not None:
+                    verify_base_snapshot(checkout, base_snapshot, tuple(args.expected_tcb_drift))
                 print(f"PASS: shard partition complete; {json.dumps(orphan_check(checkout, args.shard_manifest))}")
                 return 0
+            if args.audit_vacuity:
+                raise Failure(1, "exact-modules", "--exact-modules cannot combine with --audit-vacuity")
             exact_targets = resolve_exact_modules(args.exact_modules)
         except Failure as error:
             print(f"Trusted check failed ({error.phase}): {error}", file=sys.stderr)
             return error.code
+        except OSError as error:
+            print(f"Trusted check failed (orphan-check): {error}", file=sys.stderr)
+            return 2
     if args.audit_vacuity:
         try:
             if base_snapshot is not None:
