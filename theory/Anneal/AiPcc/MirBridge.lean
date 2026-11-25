@@ -896,6 +896,13 @@ theorem relGuard_negate_sound {locals : List LocalSlot} {g : RelGuard}
         | false => exact False.elim (nomatch (hIff.mpr (nat_ne_of_beq_false hB)))
       exact ⟨(fun _ => hEq), (fun _ => rfl)⟩
 
+/-- Writing local `id` leaves `localUintNat?` of every other local intact. -/
+theorem localUintNat?_set?_ne {locals locals' : List LocalSlot} {id r : Nat}
+    {newCs : LocalSlot} (u : UintTy) (hSet : set? locals id newCs = some locals')
+    (hNe : id ≠ r) : localUintNat? locals' r u = localUintNat? locals r u := by
+  unfold localUintNat?
+  rw [get?_set?_ne hSet hNe]
+
 /-- A guard not mentioning `id` is preserved by any write to local `id`. -/
 theorem relGuard_preserved_on_update {locals locals' : List LocalSlot}
     {id : Nat} {newCs : LocalSlot} {g : RelGuard} {b : Bool}
@@ -1499,7 +1506,10 @@ theorem absVal_refineUneConst_sound {w x v : Nat} {a : AbsVal}
 /-- Abstract local slot. `.top` describes any concrete slot (used for locals
 of unsupported type), `.dead` a storage-dead local, `.uint` / `.bool` scalar
 locals, `.unit isInit` a `()` local, and `.uintBoolPair` a `(u, bool)` checked
-arithmetic tuple (`*WithOverflow`). -/
+arithmetic tuple (`*WithOverflow`). `.uintCopy u a src` is a `.uint u a` slot
+that, when initialized, additionally holds the same bit pattern as local `src`
+(recorded by `_t = copy _src`, so that comparisons on the temporary `_t`
+synthesize `RelGuard`s on `_src`). -/
 inductive MirAbsSlot where
   | top
   | dead
@@ -1507,6 +1517,7 @@ inductive MirAbsSlot where
   | bool (b : BoolAbs)
   | unit (isInit : Bool)
   | uintBoolPair (u : UintTy) (a : AbsVal) (ov : BoolAbs)
+  | uintCopy (u : UintTy) (a : AbsVal) (src : Nat)
 
 /-- Abstract MIR local frame, one `MirAbsSlot` per `LocalDecl`. -/
 abbrev MirAbsEnv := List MirAbsSlot
@@ -1551,6 +1562,31 @@ def MirAbsSlot.denote (ty : Ty) (locals : List LocalSlot) (slot : MirAbsSlot)
         sc.sizeBytes = uintBytes u ∧ a.denote (uintWidth u) (some sc.bits) ∧
         ov.denote locals (some vb)
       | _ => False
+  | .uintCopy u a src =>
+    ty.kind = .uint u ∧
+    match cs with
+    | .dead => False
+    | .uninit => a.denote (uintWidth u) none
+    | .init v =>
+      match v with
+      | .scalar sc =>
+        sc.sizeBytes = uintBytes u ∧ a.denote (uintWidth u) (some sc.bits) ∧
+        localUintNat? locals src u = some sc.bits
+      | _ => False
+
+/-- Forgetting the copy alias of a `.uintCopy` slot is sound. -/
+theorem uintCopy_denote_uint {ty : Ty} {locals : List LocalSlot} {u : UintTy}
+    {a : AbsVal} {src : Nat} {cs : LocalSlot}
+    (h : (MirAbsSlot.uintCopy u a src).denote ty locals cs) :
+    (MirAbsSlot.uint u a).denote ty locals cs := by
+  refine ⟨h.1, ?_⟩
+  cases cs with
+  | dead => exact h.2
+  | uninit => exact h.2
+  | init v =>
+    cases v with
+    | scalar sc => exact ⟨h.2.1, h.2.2.1⟩
+    | _ => exact h.2
 
 /-- Live-but-uninitialized abstract slot for a local of declared type `ty`
 (the abstract counterpart of `StorageLive` / `Deinit`). -/
@@ -1588,6 +1624,7 @@ def MirAbsSlot.isInit : MirAbsSlot → Bool
   | .bool ba => ba.isInit
   | .unit i => i
   | .uintBoolPair _ a ov => a.isInit && ov.isInit
+  | .uintCopy _ a _ => a.isInit
   | _ => false
 
 /-- `slot` is unreachable (empty concretization). -/
@@ -1595,6 +1632,7 @@ def MirAbsSlot.isBot : MirAbsSlot → Bool
   | .uint _ a => a.isBot
   | .bool ba => ba.isBot
   | .uintBoolPair _ a ov => a.isBot || ov.isBot
+  | .uintCopy _ a _ => a.isBot
   | _ => false
 
 theorem mirAbsSlot_not_isBot {ty : Ty} {locals : List LocalSlot}
@@ -1615,6 +1653,15 @@ theorem mirAbsSlot_not_isBot {ty : Ty} {locals : List LocalSlot}
     | dead => exact h.2
     | uninit => exact boolAbs_not_isBot hBot h.2
     | init v => exact boolAbs_not_isBot hBot h.2
+  | uintCopy u a src =>
+    have h' := uintCopy_denote_uint h
+    cases cs with
+    | dead => exact h'.2
+    | uninit => exact absVal_not_isBot hBot h'.2
+    | init v =>
+      cases v with
+      | scalar sc => exact absVal_not_isBot hBot h'.2.2
+      | _ => exact h'.2
   | uintBoolPair u a ov =>
     cases hA : a.isBot with
     | true =>
@@ -1671,6 +1718,7 @@ def MirAbsSlot.toUninit : MirAbsSlot → MirAbsSlot
   | .bool _ => .bool .uninit
   | .unit _ => .unit false
   | .uintBoolPair u _ _ => .uintBoolPair u (AbsVal.uninit (uintWidth u)) .uninit
+  | .uintCopy u _ _ => .uint u (AbsVal.uninit (uintWidth u))
   | _ => .top
 
 theorem mirAbsSlot_toUninit_denote {ty : Ty} {locals : List LocalSlot}
@@ -1682,6 +1730,7 @@ theorem mirAbsSlot_toUninit_denote {ty : Ty} {locals : List LocalSlot}
   | bool _ => exact ⟨h.1, True.intro⟩
   | unit _ => exact ⟨h.1, rfl⟩
   | uintBoolPair u _ _ => exact ⟨h.1, absVal_uninit_sound_none, True.intro⟩
+  | uintCopy u _ _ => exact ⟨h.1, absVal_uninit_sound_none⟩
 
 theorem mirAbsSlot_live {ty : Ty} {locals : List LocalSlot} {s : MirAbsSlot}
     {cs : LocalSlot} (hLive : s.isLive = true) (h : s.denote ty locals cs) :
@@ -1695,6 +1744,7 @@ theorem mirAbsSlot_live {ty : Ty} {locals : List LocalSlot} {s : MirAbsSlot}
   | bool _ => exact h.2
   | unit _ => exact h.2
   | uintBoolPair _ _ _ => exact h.2
+  | uintCopy _ _ _ => exact h.2
 
 /-- An initialized slot denotes an initialized concrete local. -/
 theorem mirAbsSlot_init {ty : Ty} {locals : List LocalSlot} {s : MirAbsSlot}
@@ -1772,6 +1822,16 @@ theorem mirAbsSlot_init {ty : Ty} {locals : List LocalSlot} {s : MirAbsSlot}
                     exact ⟨_, rfl, rfl⟩
             | _ => exact False.elim h.2
       | _ => exact False.elim h.2
+  | uintCopy u a src =>
+    cases cs with
+    | dead => exact False.elim h.2
+    | uninit =>
+      cases absVal_init_of_isInit hInit h.2 with
+      | intro _ hx => nomatch hx.1
+    | init v =>
+      cases v with
+      | scalar sc => exact ⟨.scalar sc, rfl, rfl⟩
+      | _ => exact False.elim h.2
 
 /-- Extract the concrete scalar of an initialized `.uint` slot. -/
 theorem uint_slot_extract {ty : Ty} {locals : List LocalSlot} {u : UintTy}
@@ -1829,6 +1889,7 @@ postcondition slots, which describe a returned `Value` after frame exit). -/
 def MirAbsSlot.noRelGuard : MirAbsSlot → Bool
   | .bool ba => ba.noRelGuard
   | .uintBoolPair _ _ ov => ov.noRelGuard
+  | .uintCopy _ _ _ => false
   | _ => true
 
 /-- Frame-independent value denotation of a slot at declared type `ty`. -/
@@ -1846,6 +1907,7 @@ theorem mirAbsSlot_valDenote_of_denote {ty : Ty} {locals : List LocalSlot}
   | uint _ _ => exact hDen
   | unit _ => exact hDen
   | bool ba => exact ⟨hDen.1, boolAbs_valDenote_of_denote hNoG hDen.2⟩
+  | uintCopy _ _ _ => nomatch hNoG
   | uintBoolPair u a ov =>
     refine ⟨hDen.1, ?_⟩
     cases v with
@@ -1873,6 +1935,10 @@ theorem mirAbsSlot_valDenote_of_denote {ty : Ty} {locals : List LocalSlot}
 def MirAbsSlot.clearGuardIf (id : Nat) : MirAbsSlot → MirAbsSlot
   | .bool ba => .bool (ba.clearGuardIf id)
   | .uintBoolPair u a ov => .uintBoolPair u a (ov.clearGuardIf id)
+  | .uintCopy u a src =>
+    match Nat.beq src id with
+    | true => .uint u a
+    | false => .uintCopy u a src
   | s => s
 
 theorem mirAbsSlot_clearGuardIf_update {ty : Ty}
@@ -1891,6 +1957,25 @@ theorem mirAbsSlot_clearGuardIf_update {ty : Ty}
     | dead => exact h.2
     | uninit => exact boolAbs_clearGuardIf_denote_update hSet h.2
     | init v => exact boolAbs_clearGuardIf_denote_update hSet h.2
+  | uintCopy u a src =>
+    cases hS : Nat.beq src id with
+    | true =>
+      simp only [MirAbsSlot.clearGuardIf, hS]
+      have h' := uintCopy_denote_uint h
+      exact h'
+    | false =>
+      simp only [MirAbsSlot.clearGuardIf, hS]
+      refine ⟨h.1, ?_⟩
+      cases cs with
+      | dead => exact h.2
+      | uninit => exact h.2
+      | init v =>
+        cases v with
+        | scalar sc =>
+          refine ⟨h.2.1, h.2.2.1, ?_⟩
+          rw [localUintNat?_set?_ne u hSet (fun hE => nat_ne_of_beq_false hS hE.symm)]
+          exact h.2.2.2
+        | _ => exact h.2
   | uintBoolPair u a ov =>
     refine ⟨h.1, ?_⟩
     cases cs with
@@ -1988,6 +2073,10 @@ def MirAbsSlot.le (a b : MirAbsSlot) : Bool :=
     | .unit i1, .unit i2 => !i2 || i1
     | .uintBoolPair u1 a1 ov1, .uintBoolPair u2 a2 ov2 =>
       uintTyBeq u1 u2 && AbsVal.le (uintWidth u1) a1 a2 && BoolAbs.le ov1 ov2
+    | .uintCopy u1 a1 _, .uint u2 a2 =>
+      uintTyBeq u1 u2 && AbsVal.le (uintWidth u1) a1 a2
+    | .uintCopy u1 a1 s1, .uintCopy u2 a2 s2 =>
+      (uintTyBeq u1 u2 && Nat.beq s1 s2) && AbsVal.le (uintWidth u1) a1 a2
     | _, _ => false
 
 /-- Soundness of `MirAbsSlot.le`. -/
@@ -2018,6 +2107,36 @@ theorem mirAbsSlot_le_sound {ty : Ty} {locals : List LocalSlot}
         | init v =>
           cases v with
           | scalar sc => exact ⟨ha.2.1, absVal_le_sound hA ha.2.2⟩
+          | _ => exact ha.2
+      | uintCopy u1 a1 s1 =>
+        have hu := uintTy_eq_of_beq (bool_and_true_left hLe)
+        have hA := bool_and_true_right hLe
+        subst hu
+        refine ⟨ha.1, ?_⟩
+        cases cs with
+        | dead => exact ha.2
+        | uninit => exact absVal_le_sound hA ha.2
+        | init v =>
+          cases v with
+          | scalar sc => exact ⟨ha.2.1, absVal_le_sound hA ha.2.2.1⟩
+          | _ => exact ha.2
+      | _ => nomatch hLe
+    | uintCopy u2 a2 s2 =>
+      cases a with
+      | uintCopy u1 a1 s1 =>
+        have h12 := bool_and_true_left hLe
+        have hu := uintTy_eq_of_beq (bool_and_true_left h12)
+        have hs := Nat.eq_of_beq_eq_true (bool_and_true_right h12)
+        have hA := bool_and_true_right hLe
+        subst hu
+        subst hs
+        refine ⟨ha.1, ?_⟩
+        cases cs with
+        | dead => exact ha.2
+        | uninit => exact absVal_le_sound hA ha.2
+        | init v =>
+          cases v with
+          | scalar sc => exact ⟨ha.2.1, absVal_le_sound hA ha.2.2.1, ha.2.2.2⟩
           | _ => exact ha.2
       | _ => nomatch hLe
     | bool b2 =>
@@ -2119,6 +2238,51 @@ theorem mirAbsEnvLe_sound {decls : List LocalDecl} {e1 e2 : MirAbsEnv}
     exact mirAbsSlot_le_sound (mirAbsEnvLe_get hLe hs1 h2)
       (h1.2.2 i d s1 cs hD hs1 hCs)
 
+/-- Join of two plain unsigned slots (`.top` on a type mismatch). -/
+def uintJoinSlot (u1 : UintTy) (a1 : AbsVal) (u2 : UintTy) (a2 : AbsVal) :
+    MirAbsSlot :=
+  match uintTyBeq u1 u2 with
+  | true => .uint u1 (AbsVal.join (uintWidth u1) a1 a2)
+  | false => .top
+
+theorem uintJoinSlot_sound_left {ty : Ty} {locals : List LocalSlot}
+    {u1 u2 : UintTy} {a1 a2 : AbsVal} {cs : LocalSlot}
+    (ha : (MirAbsSlot.uint u1 a1).denote ty locals cs) :
+    (uintJoinSlot u1 a1 u2 a2).denote ty locals cs := by
+  unfold uintJoinSlot
+  cases uintTyBeq u1 u2 with
+  | false => exact True.intro
+  | true =>
+    refine ⟨ha.1, ?_⟩
+    cases cs with
+    | dead => exact ha.2
+    | uninit => exact absVal_join_sound_left (uintWidth_valid u1) a1 a2 ha.2
+    | init v =>
+      cases v with
+      | scalar sc =>
+        exact ⟨ha.2.1, absVal_join_sound_left (uintWidth_valid u1) a1 a2 ha.2.2⟩
+      | _ => exact ha.2
+
+theorem uintJoinSlot_sound_right {ty : Ty} {locals : List LocalSlot}
+    {u1 u2 : UintTy} {a1 a2 : AbsVal} {cs : LocalSlot}
+    (hb : (MirAbsSlot.uint u2 a2).denote ty locals cs) :
+    (uintJoinSlot u1 a1 u2 a2).denote ty locals cs := by
+  unfold uintJoinSlot
+  cases hU : uintTyBeq u1 u2 with
+  | false => exact True.intro
+  | true =>
+    have hu := uintTy_eq_of_beq hU
+    subst hu
+    refine ⟨hb.1, ?_⟩
+    cases cs with
+    | dead => exact hb.2
+    | uninit => exact absVal_join_sound_right (uintWidth_valid u1) a1 a2 hb.2
+    | init v =>
+      cases v with
+      | scalar sc =>
+        exact ⟨hb.2.1, absVal_join_sound_right (uintWidth_valid u1) a1 a2 hb.2.2⟩
+      | _ => exact hb.2
+
 /-- Pointwise join on `MirAbsSlot` (unreachable slots act as bottom;
 incompatible live tags join to `.top`). -/
 def MirAbsSlot.join (a b : MirAbsSlot) : MirAbsSlot :=
@@ -2140,6 +2304,15 @@ def MirAbsSlot.join (a b : MirAbsSlot) : MirAbsSlot :=
         .uintBoolPair u1 (AbsVal.join (uintWidth u1) a1 a2)
           (BoolAbs.join ov1 ov2)
       | false => .top
+    | .uintCopy u1 a1 s1, .uintCopy u2 a2 s2 =>
+      match Nat.beq s1 s2 with
+      | true =>
+        match uintTyBeq u1 u2 with
+        | true => .uintCopy u1 (AbsVal.join (uintWidth u1) a1 a2) s1
+        | false => .top
+      | false => uintJoinSlot u1 a1 u2 a2
+    | .uintCopy u1 a1 _, .uint u2 a2 => uintJoinSlot u1 a1 u2 a2
+    | .uint u1 a1, .uintCopy u2 a2 _ => uintJoinSlot u1 a1 u2 a2
     | _, _ => .top
 
 theorem mirAbsSlot_join_sound_left {ty : Ty} {locals : List LocalSlot}
@@ -2171,6 +2344,32 @@ theorem mirAbsSlot_join_sound_left {ty : Ty} {locals : List LocalSlot}
               | scalar sc =>
                 exact ⟨ha.2.1, absVal_join_sound_left (uintWidth_valid u1) a1 a2 ha.2.2⟩
               | _ => exact ha.2
+        | uintCopy u2 a2 s2 => exact uintJoinSlot_sound_left ha
+        | _ => exact True.intro
+      | uintCopy u1 a1 s1 =>
+        cases b with
+        | uintCopy u2 a2 s2 =>
+          simp only
+          cases hS : Nat.beq s1 s2 with
+          | false => exact uintJoinSlot_sound_left (uintCopy_denote_uint ha)
+          | true =>
+            simp only
+            cases uintTyBeq u1 u2 with
+            | false => exact True.intro
+            | true =>
+              refine ⟨ha.1, ?_⟩
+              cases cs with
+              | dead => exact ha.2
+              | uninit =>
+                exact absVal_join_sound_left (uintWidth_valid u1) a1 a2 ha.2
+              | init v =>
+                cases v with
+                | scalar sc =>
+                  exact ⟨ha.2.1,
+                    absVal_join_sound_left (uintWidth_valid u1) a1 a2 ha.2.2.1,
+                    ha.2.2.2⟩
+                | _ => exact ha.2
+        | uint u2 a2 => exact uintJoinSlot_sound_left (uintCopy_denote_uint ha)
         | _ => exact True.intro
       | bool b1 =>
         cases b with
@@ -2263,6 +2462,36 @@ theorem mirAbsSlot_join_sound_right {ty : Ty} {locals : List LocalSlot}
               | scalar sc =>
                 exact ⟨hb.2.1, absVal_join_sound_right (uintWidth_valid u1) a1 a2 hb.2.2⟩
               | _ => exact hb.2
+        | uintCopy u1 a1 s1 => exact uintJoinSlot_sound_right hb
+        | _ => exact True.intro
+      | uintCopy u2 a2 s2 =>
+        cases a with
+        | uintCopy u1 a1 s1 =>
+          simp only
+          cases hS : Nat.beq s1 s2 with
+          | false => exact uintJoinSlot_sound_right (uintCopy_denote_uint hb)
+          | true =>
+            have hs := Nat.eq_of_beq_eq_true hS
+            subst hs
+            simp only
+            cases hU : uintTyBeq u1 u2 with
+            | false => exact True.intro
+            | true =>
+              have hu := uintTy_eq_of_beq hU
+              subst hu
+              refine ⟨hb.1, ?_⟩
+              cases cs with
+              | dead => exact hb.2
+              | uninit =>
+                exact absVal_join_sound_right (uintWidth_valid u1) a1 a2 hb.2
+              | init v =>
+                cases v with
+                | scalar sc =>
+                  exact ⟨hb.2.1,
+                    absVal_join_sound_right (uintWidth_valid u1) a1 a2 hb.2.2.1,
+                    hb.2.2.2⟩
+                | _ => exact hb.2
+        | uint u1 a1 => exact uintJoinSlot_sound_right (uintCopy_denote_uint hb)
         | _ => exact True.intro
       | bool b2 =>
         cases a with
@@ -2471,6 +2700,13 @@ def refineUintSlot (env : MirAbsEnv) (r : Nat) (u : UintTy)
       | some env' => env'
       | none => env
     | false => env
+  | some (.uintCopy u' a src) =>
+    match uintTyBeq u u' && a.isInit with
+    | true =>
+      match set? env r (.uintCopy u (f a) src) with
+      | some env' => env'
+      | none => env
+    | false => env
   | _ => env
 
 /-- In-place slot refinement at local `r` without modifying `locals`. -/
@@ -2530,6 +2766,27 @@ theorem refineUintSlot_sound {decls : List LocalDecl} {env : MirAbsEnv}
             rw [hsc.1] at hCs
             exact ⟨hDen.1, hsc.2.1, hRef a sc.bits hInit hsc.2.2
               (localUintNat?_of_get? hCs hsc.2.1)⟩
+    | uintCopy u' a src =>
+      simp only
+      cases hC : (uintTyBeq u u' && a.isInit) with
+      | false => exact hEnv
+      | true =>
+        have hu := uintTy_eq_of_beq (bool_and_true_left hC)
+        have hInit := bool_and_true_right hC
+        subst hu
+        simp only
+        cases hSet : set? env r (.uintCopy u (f a) src) with
+        | none => exact hEnv
+        | some env' =>
+          simp only
+          apply refineSingleSlot_sound hEnv hSet
+          intro d cs hD hCs
+          have hDen := hEnv.2.2 r d (.uintCopy u a src) cs hD hGet hCs
+          cases uint_slot_extract hInit (uintCopy_denote_uint hDen) with
+          | intro sc hsc =>
+            rw [hsc.1] at hDen hCs ⊢
+            exact ⟨hDen.1, hsc.2.1, hRef a sc.bits hInit hsc.2.2
+              (localUintNat?_of_get? hCs hsc.2.1), hDen.2.2.2⟩
     | _ => exact hEnv
 
 /-- Refine `env` using `RelGuard` `g` assuming boolean outcome `branchVal`.

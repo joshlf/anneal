@@ -54,6 +54,13 @@ certificate passes if a reachable block uses it):
   refinement, and unreachable-branch elimination), `assert` (certified to
   pass), `drop` of live unprojected locals, and root-frame `return`.
 
+Unoptimized `Runtime(PostCleanup)` MIR routes comparison operands through
+temporaries (`_3 = copy _1; _4 = Lt(move _3, ..)`). An assignment
+`_t = copy _src` therefore records the copy alias `.uintCopy u a src`, and
+reading `_t` (by `Copy` or `Move`) reports `_src` as the source local, so the
+synthesized `RelGuard` constrains `_src` itself; writes to `_src` drop the
+alias (`setMirAbsSlot`).
+
 The statement and terminator theorems assume the root-frame invariants
 `activeProtectors = []` (and `callStack = []` for `return`), which every
 supported step preserves.
@@ -69,9 +76,11 @@ inductive MirAbsVal where
   | unit
   | uintBoolPair (u : UintTy) (a : AbsVal) (ov : BoolAbs)
 
-/-- Abstract slot stored by an assignment of `av`. -/
+/-- Abstract slot stored by an assignment of `av` (a value copied from local
+`r` records the copy alias `.uintCopy u a r`). -/
 def MirAbsVal.toSlot : MirAbsVal → MirAbsSlot
-  | .uint u a _ => .uint u a
+  | .uint u a none => .uint u a
+  | .uint u a (some r) => .uintCopy u a r
   | .bool b => .bool b
   | .unit => .unit true
   | .uintBoolPair u a ov => .uintBoolPair u a ov
@@ -164,7 +173,10 @@ theorem mirAbsVal_toSlot_denote {ty : Ty} {locals : List LocalSlot}
   cases av with
   | uint u a src =>
     cases v with
-    | scalar sc => exact ⟨hk, h.2.1, h.2.2.1⟩
+    | scalar sc =>
+      cases src with
+      | none => exact ⟨hk, h.2.1, h.2.2.1⟩
+      | some r => exact ⟨hk, h.2.1, h.2.2.1, h.2.2.2⟩
     | _ => exact False.elim h.2
   | bool b => exact ⟨hk, h⟩
   | unit => exact ⟨hk, h⟩
@@ -340,7 +352,8 @@ def evalPairFieldAbs (env : MirAbsEnv) (l idx : Nat) (fty : Ty) :
 locals (including `(u, bool)` pairs), and `.field 0` / `.field 1` projections
 on initialized `(u, bool)` checked-arithmetic tuples. An unprojected `Move`
 leaves the source slot uninitialized (clearing every guard mentioning it),
-mirroring `evalOperand`'s `set? .. .uninit`. -/
+mirroring `evalOperand`'s `set? .. .uninit`. Reading a `.uintCopy u a src`
+slot reports the alias root `src` as the source local. -/
 def evalOperandAbs (env : MirAbsEnv) : Operand → Option (MirAbsVal × MirAbsEnv)
   | .copy p =>
     match p.projection with
@@ -349,6 +362,10 @@ def evalOperandAbs (env : MirAbsEnv) : Operand → Option (MirAbsVal × MirAbsEn
       | some (.uint u a) =>
         match a.isInit with
         | true => some (.uint u a (some p.local_), env)
+        | false => none
+      | some (.uintCopy u a src) =>
+        match a.isInit with
+        | true => some (.uint u a (some src), env)
         | false => none
       | some (.bool ba) =>
         match ba.isInit with
@@ -370,6 +387,14 @@ def evalOperandAbs (env : MirAbsEnv) : Operand → Option (MirAbsVal × MirAbsEn
         match a.isInit,
             setMirAbsSlot p.local_ (.uint u (AbsVal.uninit (uintWidth u))) env with
         | true, some env' => some (.uint u a none, env')
+        | _, _ => none
+      | some (.uintCopy u a src) =>
+        match a.isInit,
+            setMirAbsSlot p.local_ (.uint u (AbsVal.uninit (uintWidth u))) env with
+        | true, some env' =>
+          match Nat.beq src p.local_ with
+          | true => some (.uint u a none, env')
+          | false => some (.uint u a (some src), env')
         | _, _ => none
       | some (.bool ba) =>
         match ba.isInit, setMirAbsSlot p.local_ (.bool .uninit) env with
@@ -567,6 +592,29 @@ theorem evalOperandAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                         localUintNat?_of_get? hL hsc.2.1⟩
                     · intro layouts
                       exact ⟨d.ty, (operandTy_local hcs.1).1, hcs.2.2.1⟩
+              | uintCopy u a src =>
+                simp only at hAbs
+                cases hI : a.isInit with
+                | false => rw [hI] at hAbs; nomatch hAbs
+                | true =>
+                  rw [hI] at hAbs
+                  injection hAbs with hAbs
+                  injection hAbs with hAv hE
+                  subst hAv
+                  subst hE
+                  cases uint_slot_extract hI (uintCopy_denote_uint hcs.2.2) with
+                  | intro sc hsc =>
+                    have hL : get? locals l = some (.init (.scalar sc)) := by
+                      rw [hcs.2.1, hsc.1]
+                    have hDen := hcs.2.2
+                    rw [hsc.1] at hDen
+                    refine ⟨.scalar sc, locals, ?_, ?_, hEnv, fun _ => rfl,
+                      hNoMove rfl, ?_⟩
+                    · intro borrows globals layouts callerLocals cdecls callStack _
+                      simp only [evalOperand, hL, readProjectedValue]
+                    · exact ⟨hI, hsc.2.1, hsc.2.2, hDen.2.2.2⟩
+                    · intro layouts
+                      exact ⟨d.ty, (operandTy_local hcs.1).1, hcs.2.2.1⟩
               | bool ba =>
                 simp only at hAbs
                 cases hI : ba.isInit with
@@ -717,6 +765,54 @@ theorem evalOperandAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                             ⟨hcs.2.2.1, absVal_uninit_sound_none⟩
                         · intro layouts
                           exact ⟨d.ty, (operandTy_local hcs.1).2, hcs.2.2.1⟩
+                | uintCopy u a src =>
+                  simp only at hAbs
+                  cases hI : a.isInit with
+                  | false => rw [hI] at hAbs; nomatch hAbs
+                  | true =>
+                    cases hSA : setMirAbsSlot l
+                        (.uint u (AbsVal.uninit (uintWidth u))) env with
+                    | none => rw [hI, hSA] at hAbs; nomatch hAbs
+                    | some envM =>
+                      rw [hI, hSA] at hAbs
+                      cases uint_slot_extract hI (uintCopy_denote_uint hcs.2.2) with
+                      | intro sc hsc =>
+                        have hL : get? locals l = some (.init (.scalar sc)) := by
+                          rw [hcs.2.1, hsc.1]
+                        have hDen := hcs.2.2
+                        rw [hsc.1] at hDen
+                        have hEnvM := setMirAbsSlot_sound hEnv hcs.1 hSA hSetC
+                          ⟨hcs.2.2.1, absVal_uninit_sound_none⟩
+                        have hTyM : ∀ layouts, ∃ ty,
+                            operandTy decls layouts (.move ⟨l, []⟩) = some ty ∧
+                            (MirAbsVal.uint u a none).kindOk ty.kind :=
+                          fun _ => ⟨d.ty, (operandTy_local hcs.1).2, hcs.2.2.1⟩
+                        cases hB : Nat.beq src l with
+                        | true =>
+                          simp only [hB] at hAbs
+                          injection hAbs with hAbs
+                          injection hAbs with hAv hE
+                          subst hAv
+                          subst hE
+                          refine ⟨.scalar sc, locals', ?_, ⟨hI, hsc.2.1, hsc.2.2,
+                            True.intro⟩, hEnvM, hMvNone, hMvSome, hTyM⟩
+                          intro borrows globals layouts callerLocals cdecls callStack _
+                          simp only [evalOperand, hL, readProjectedValue, hSetC]
+                        | false =>
+                          simp only [hB] at hAbs
+                          injection hAbs with hAbs
+                          injection hAbs with hAv hE
+                          subst hAv
+                          subst hE
+                          refine ⟨.scalar sc, locals', ?_, ⟨hI, hsc.2.1, hsc.2.2,
+                            ?_⟩, hEnvM, hMvNone, hMvSome, hTyM⟩
+                          · intro borrows globals layouts callerLocals cdecls
+                              callStack _
+                            simp only [evalOperand, hL, readProjectedValue, hSetC]
+                          · show localUintNat? locals' src u = some sc.bits
+                            rw [localUintNat?_set?_ne u hSetC
+                              (fun hE => nat_ne_of_beq_false hB hE.symm)]
+                            exact hDen.2.2.2
                 | bool ba =>
                   simp only at hAbs
                   cases hI : ba.isInit with
