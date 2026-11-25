@@ -14783,7 +14783,11 @@ vtable range, or a captured vtable of an incompatible trait object. An
 unavailable or ill-formed environment (`dynVTableEnv? = .none`), an unmodeled
 trait object (`dynTypeModeled = false`), a pointer into an unknown allocation
 outside the reserved range, and a captured vtable whose identifier collides with
-a live borrow tag all return `.unsupported`.
+a live borrow tag all return `.unsupported`. A key mismatch against a vtable
+whose own trait object is unmodeled (`dynTypeModeled dts entry.dynKey = false`,
+e.g. a `for<'a>` existential binder that the interpreter would normalize with
+`normalize_erasing_late_bound_regions` before comparing) is also
+`.unsupported` rather than `.ub`.
 -/
 def checkDynVTablePtr
     (currentBody : Option CapturedMir)
@@ -14813,7 +14817,10 @@ def checkDynVTablePtr
               | true =>
                 match dynKeysCompatible dts entry.dynKey expectedKey with
                 | true => .ok (entry, vts, dts)
-                | false => .ub
+                | false =>
+                  match dynTypeModeled dts entry.dynKey with
+                  | true => .ub
+                  | false => .unsupported
           | .none =>
             let provablyNotVTable : Bool :=
               Bool.or (Nat.beq vt.allocId 0)

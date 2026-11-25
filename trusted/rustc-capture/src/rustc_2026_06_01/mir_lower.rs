@@ -3329,38 +3329,51 @@ pub fn dyn_type_key<'tcx>(
 /// > ```text
 /// > // FIXME: we are skipping auto traits for now, but might revisit this in the future.
 /// > let mut sorted_vtable: Vec<_> = vtable_dyn_type.without_auto_traits().collect();
+/// > let mut sorted_expected: Vec<_> = expected_dyn_type.without_auto_traits().collect();
+/// > ...
+/// > for (a_pred, b_pred) in std::iter::zip(sorted_vtable, sorted_expected) {
+/// >     let a_pred = self.tcx.normalize_erasing_late_bound_regions(self.typing_env, a_pred);
+/// >     let b_pred = self.tcx.normalize_erasing_late_bound_regions(self.typing_env, b_pred);
+/// >
+/// >     if a_pred != b_pred {
+/// >         throw_ub!(InvalidVTableTrait { vtable_dyn_type, expected_dyn_type });
+/// >     }
+/// > }
 /// > ```
 ///
-/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/traits.rs#L76-L77
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/traits.rs#L76-L100
 ///
-/// Modeling choice: rendered deterministically from the canonical `DefPath` of
-/// the principal trait, the lowered `RigidTy` generic arguments, and the sorted
-/// `(assoc_def_path, lowered_ty)` projection bindings (avoiding unstable `Debug`
-/// crate disambiguators). For a simple principal trait with no generic arguments
-/// or projection bindings, this equals the principal's canonical `DefPath`.
-fn dyn_predicate_key_canonical(
-    principal_trait: &Option<String>,
-    type_args: &[crate::lean_emit::IrRigidTy],
-    assoc_bindings: &[(String, crate::lean_emit::IrRigidTy)],
+/// Justification (implication direction): two trait objects whose predicate
+/// lists without auto traits are equal (every generic argument of the
+/// principal, including const arguments, and every projection term) render to
+/// the same key, and distinct lists render to distinct keys, so the Lean-side
+/// `dynKeysCompatible` accepts a vtable only if the interpreter's check would.
+///
+/// Modeling choice: the key is `dyn_type_key` of the trait object rebuilt from
+/// `preds.without_auto_traits()` (same region): the principal's canonical
+/// `DefPath` for a simple principal trait (so `dyn Tr + Send` and an
+/// undescribed `dyn Tr` agree), and otherwise the region-erased `Display`
+/// rendering, which keeps const generic arguments (`dyn Tr<3>` vs `dyn Tr<4>`),
+/// non-type projection terms, and `for<..>` binders distinct. A trait object
+/// with only auto traits keys as the empty string. Late-bound regions are not
+/// normalized: `dyn for<'a> Tr<fn(&'a u8)>` and `dyn Tr<fn(&'static u8)>` key
+/// differently even though the interpreter accepts one's vtable for the other.
+/// Such binder-carrying types are marked `has_unresolved_existential_binder`,
+/// and the Lean side (`checkDynVTablePtr`, `dynTypeModeled`) treats a key
+/// mismatch against such a vtable as unsupported rather than UB (fail-closed).
+fn dyn_predicate_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    preds: &'tcx rustc_middle::ty::List<rustc_middle::ty::PolyExistentialPredicate<'tcx>>,
+    region: rustc_middle::ty::Region<'tcx>,
 ) -> String {
-    match principal_trait {
-        Some(p) if type_args.is_empty() && assoc_bindings.is_empty() => p.clone(),
-        Some(p) => {
-            let mut parts = vec![p.clone()];
-            if !type_args.is_empty() {
-                let args: Vec<String> = type_args
-                    .iter()
-                    .map(crate::lean_emit::render_rigid_ty_pub)
-                    .collect();
-                parts.push(format!("<{}>", args.join(", ")));
-            }
-            for (k, v) in assoc_bindings {
-                parts.push(format!("{k}={}", crate::lean_emit::render_rigid_ty_pub(v)));
-            }
-            parts.join(" + ")
-        }
-        None => String::new(),
+    let without_autos: Vec<rustc_middle::ty::PolyExistentialPredicate<'tcx>> =
+        preds.without_auto_traits().collect();
+    if without_autos.is_empty() {
+        return String::new();
     }
+    let no_auto_preds = tcx.mk_poly_existential_predicates(&without_autos);
+    let no_auto_ty = Ty::new_dynamic(tcx, no_auto_preds, region);
+    dyn_type_key(tcx, no_auto_ty, no_auto_preds)
 }
 
 /// Returns the `(source pointee, target pointee)` pair of an `Unsize`
@@ -3851,7 +3864,7 @@ pub fn compute_crate_dyn_metadata<'tcx>(
     let mut dyn_types: BTreeMap<String, IrDynType> = BTreeMap::new();
     let mut record_dyn = |ctx: &mut MirLowerCtx<'tcx>, dyn_ty: Ty<'tcx>| {
         use rustc_middle::ty::TypeVisitableExt;
-        let TyKind::Dynamic(preds, _) = *dyn_ty.kind() else {
+        let TyKind::Dynamic(preds, region) = *dyn_ty.kind() else {
             return;
         };
         let key = dyn_type_key(tcx, dyn_ty, preds);
@@ -3876,8 +3889,7 @@ pub fn compute_crate_dyn_metadata<'tcx>(
             .collect();
         assoc_bindings.sort_by(|a, b| a.0.cmp(&b.0));
         let principal_trait = preds.principal_def_id().map(|d| canonical_def_path(tcx, d));
-        let predicate_key =
-            dyn_predicate_key_canonical(&principal_trait, &type_args, &assoc_bindings);
+        let predicate_key = dyn_predicate_key(tcx, preds, region);
         let has_unresolved_existential_binder =
             preds.iter().any(|p| !p.bound_vars().is_empty()) || preds.has_escaping_bound_vars();
         let supertrait_outlives_ok = !has_unresolved_existential_binder

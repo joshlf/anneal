@@ -1897,8 +1897,24 @@ def vtableIdsUnique : List CapturedVTable → Bool
        | .none => true)
       (vtableIdsUnique vs)
 
-/-- `true` iff `targetId` names a distinct vtable in `vts` with identical concrete
-type and layout to `v`. -/
+/--
+`true` iff `targetId` names a distinct vtable in `vts` with identical concrete
+type and layout to `v`: a supertrait vtable of `(T, dyn Sub)` describes the
+same concrete type `T`.
+
+Reference (`compiler/rustc_middle/src/ty/vtable.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L24-L25>
+
+> "/// pointer to a separate supertrait vtable, can be used by trait upcasting coercion
+> TraitVPtr(TraitRef<'tcx>),"
+
+Justification: the `TraitRef` of a `TraitVPtr` entry has the vtable's own
+concrete type as `Self`, so its target vtable must have the same concrete type
+(hence the same size, alignment, and inhabitedness). Modeling choice: a link
+that violates this is a capture inconsistency and makes `vtableEnvOk` fail, so
+every `dyn` operation fails closed with `.unsupported`.
+-/
 def vtableSuperLinkOk (vts : List CapturedVTable) (v : CapturedVTable) (targetId : Nat) : Bool :=
   match Nat.beq targetId v.vtableId with
   | true => false
@@ -1911,8 +1927,12 @@ def vtableSuperLinkOk (vts : List CapturedVTable) (v : CapturedVTable) (targetId
           (Bool.and (Nat.beq tgt.alignBytes v.alignBytes)
             (Bool.not (Bool.xor tgt.isUninhabited v.isUninhabited))))
 
-/-- `true` iff every supertrait link (`primarySuperVTableId?` and `.traitVPtr`
-slots) of `v` targets a distinct same-concrete-type vtable in `vts`. -/
+/--
+`true` iff every supertrait link (`primarySuperVTableId?` and `.traitVPtr`
+slots) of `v` targets a distinct same-concrete-type vtable in `vts`
+(`vtableSuperLinkOk`; see there for the `rustc` citation and the fail-closed
+modeling choice).
+-/
 def vtableSuperLinksOk (vts : List CapturedVTable) (v : CapturedVTable) : Bool :=
   let primOk : Bool :=
     match v.primarySuperVTableId? with
@@ -1988,8 +2008,26 @@ def withBodyDynMetadata (body : CapturedMir) (mem : Memory) : Memory :=
   | true => mem
   | false => { mem with callees := mem.callees ++ body :: .nil }
 
-/-- Predicate key (predicates without auto traits) of `k`, defaulting to `k`
-when no `CapturedDynType` descriptor is recorded (simple principal trait). -/
+/--
+Predicate key (the trait object's predicate list without auto traits) of the
+trait-object key `k`, defaulting to `k` itself when no `CapturedDynType`
+descriptor is recorded.
+
+Reference (`compiler/rustc_const_eval/src/interpret/traits.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/traits.rs#L76-L78>
+
+> "// FIXME: we are skipping auto traits for now, but might revisit this in the future.
+> let mut sorted_vtable: Vec<_> = vtable_dyn_type.without_auto_traits().collect();
+> let mut sorted_expected: Vec<_> = expected_dyn_type.without_auto_traits().collect();"
+
+Justification: `rustc-capture` (`dyn_predicate_key`) renders `predicateKey` as
+the trait-object key of the type rebuilt from `without_auto_traits()` (keeping
+every principal generic argument, including const arguments, and every
+projection term). A key without a descriptor has no auto traits, so its
+predicate list is the type itself and its predicate key is `k`; the fallback is
+therefore exact, not an approximation.
+-/
 @[reducible]
 def dynPredicateKeyOf (dts : List CapturedDynType) (k : DefPath) : DefPath :=
   match lookupDynType dts k with
@@ -2012,16 +2050,33 @@ Reference (`compiler/rustc_const_eval/src/interpret/traits.rs` at commit
 > // FIXME: we are skipping auto traits for now, but might revisit this in the future.
 > let mut sorted_vtable: Vec<_> = vtable_dyn_type.without_auto_traits().collect();"
 
-Justification: equal keys are trivially compatible; otherwise the canonical
-predicate keys without auto traits (`dynPredicateKeyOf`) must agree (treating an
-undescribed simple principal key `k` as its own predicate key, which equals the
-canonical `predicateKey` of `dyn k + AutoTraits`).
+Justification: equal keys are trivially compatible; otherwise the predicate
+keys without auto traits (`dynPredicateKeyOf`) must agree. Because those keys
+retain const generic arguments and projection terms, `dyn Tr<3>` and
+`dyn Tr<4>` are incompatible exactly as in the interpreter's predicate-equality
+check. Modeling choice: late-bound regions are not normalized (`rustc-capture`
+renders `for<..>` binders verbatim), so the relation can only be stricter than
+the interpreter's on such types, which are in addition marked
+`hasUnresolvedExistentialBinder` and fail closed (`.unsupported`).
 -/
 def dynKeysCompatible (dts : List CapturedDynType) (a b : DefPath) : Bool :=
   Bool.or (stringEq a b) (stringEq (dynPredicateKeyOf dts a) (dynPredicateKeyOf dts b))
 
-/-- Direct supertrait `vtableId`s of `v`: its `primarySuperVTableId?` (if any)
-followed by all `.traitVPtr supId` slots. -/
+/--
+Direct supertrait `vtableId`s of `v`: its `primarySuperVTableId?` (if any)
+followed by all `.traitVPtr supId` slots.
+
+Reference (`compiler/rustc_middle/src/ty/vtable.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L24-L25>
+
+> "/// pointer to a separate supertrait vtable, can be used by trait upcasting coercion
+> TraitVPtr(TraitRef<'tcx>),"
+
+Modeling choice: the primary supertrait, whose vtable is a prefix of `v` and so
+has no `TraitVPtr` entry, is recorded separately by `rustc-capture` as
+`primarySuperVTableId?`.
+-/
 def vtableDirectSuperIds (v : CapturedVTable) : List Nat :=
   let slotIds : List Nat :=
     v.slots.foldr
@@ -2034,24 +2089,58 @@ def vtableDirectSuperIds (v : CapturedVTable) : List Nat :=
   | .some pId => pId :: slotIds
   | .none => slotIds
 
-/-- Bounded reachability of a supertrait vtable whose `dynKey` is predicate-key
+/--
+Worklist reachability of a supertrait vtable whose `dynKey` is predicate-key
 compatible with `dstKey`, traversing only `primarySuperVTableId?` and
-`.traitVPtr` links (rejecting unrelated 0-method marker traits, Condition `C2`). -/
+`.traitVPtr` links (`vtableDirectSuperIds`) and expanding every `vtableId` at
+most once (`visited`).
+
+Reference (The Rust Reference 1.98.0, "Type coercions — Unsized coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#r-coerce.unsize.trait-upcast>
+
+> "dyn T to dyn U, when U is one of T’s supertraits."
+
+Reference (The Rust Reference 1.98.0, "Traits — Supertraits"):
+<https://doc.rust-lang.org/1.98.0/reference/items/traits.html#r-items.traits.supertraits.decl>
+
+> "Supertraits are declared by trait bounds on the Self type of a trait and
+> transitively the supertraits of the traits declared in those trait bounds."
+
+Justification: the supertraits of `T` are the transitive closure of its
+declared supertrait bounds, and `rustc-capture` records one link per direct
+supertrait with a vtable (`TraitVPtr` or the primary prefix), so a well-typed
+upcast target is reachable. Modeling choice: an unrelated trait (for example a
+0-method marker trait that happens to share a vtable prefix) is not reachable,
+and the caller then fails closed with `.unsupported` (Condition `C2`). The fuel
+(`resolveUpcastVTable?`) bounds the number of worklist pops by the initial
+worklist length plus the total number of links, which suffices because each
+`vtableId` is expanded at most once; exhausting it returns `false`
+(fail-closed).
+-/
 def vtableReachesSuperKeyAux
     (vts : List CapturedVTable)
     (dts : List CapturedDynType)
     (dstKey : DefPath) :
-    Nat → List Nat → Bool
-  | 0, _ => false
-  | _ + 1, .nil => false
-  | fuel + 1, curId :: rest =>
-    match lookupVTableById vts curId with
-    | .none => vtableReachesSuperKeyAux vts dts dstKey fuel rest
-    | .some cur =>
-      match dynKeysCompatible dts cur.dynKey dstKey with
-      | true => true
-      | false =>
-        vtableReachesSuperKeyAux vts dts dstKey fuel (vtableDirectSuperIds cur ++ rest)
+    Nat → List Nat → List Nat → Bool
+  | 0, _, _ => false
+  | _ + 1, .nil, _ => false
+  | fuel + 1, curId :: rest, visited =>
+    match visited.any (fun v => Nat.beq v curId) with
+    | true => vtableReachesSuperKeyAux vts dts dstKey fuel rest visited
+    | false =>
+      match lookupVTableById vts curId with
+      | .none => vtableReachesSuperKeyAux vts dts dstKey fuel rest (curId :: visited)
+      | .some cur =>
+        match dynKeysCompatible dts cur.dynKey dstKey with
+        | true => true
+        | false =>
+          vtableReachesSuperKeyAux vts dts dstKey fuel (vtableDirectSuperIds cur ++ rest)
+            (curId :: visited)
+
+/-- Total number of supertrait links (`vtableDirectSuperIds`) in `vts`, the
+worklist-growth bound used as fuel by `resolveUpcastVTable?`. -/
+def vtableSuperLinkCount (vts : List CapturedVTable) : Nat :=
+  vts.foldl (fun acc v => Nat.add acc (length (vtableDirectSuperIds v))) 0
 
 /--
 Resolve the target vtable for a `dyn Sub -> dyn Super` unsizing coercion from
@@ -2062,6 +2151,29 @@ Resolve the target vtable for a `dyn Sub -> dyn Super` unsizing coercion from
   reachable from `srcEntry` via `primarySuperVTableId?` or `.traitVPtr` slots
   (rejecting unrelated 0-method marker traits), and returns the captured
   `(srcEntry.concreteTy, dstKey)` vtable.
+
+Reference (`compiler/rustc_const_eval/src/interpret/cast.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/cast.rs#L397-L401>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/cast.rs#L435-L437>
+
+> "// Take apart the old pointer, and find the dynamic type.
+> let (old_data, old_vptr) = val.to_scalar_pair();
+> let old_data = old_data.to_pointer(self)?;
+> let old_vptr = old_vptr.to_pointer(self)?;
+> let ty = self.get_ptr_vtable_ty(old_vptr, Some(data_a))?;"
+>
+> "// Get the destination trait vtable and return that.
+> let new_vptr = self.get_vtable_ptr(ty, data_b)?;
+> self.write_immediate(Immediate::new_dyn_trait(old_data, new_vptr, self), dest)"
+
+Justification: the interpreter recovers the concrete type `ty` from the
+(already validated) source vtable and installs the vtable of `(ty, data_b)`;
+the model returns the captured vtable of `(srcEntry.concreteTy, dstKey)`, the
+same pair. The reachability requirement only restricts (never widens) the
+accepted targets to the type-system-admissible ones. Unsupported: a target
+vtable that is not captured or not reachable yields `.none`, which callers map
+to `.unsupported` (never `.ub`).
 -/
 def resolveUpcastVTable?
     (vts : List CapturedVTable)
@@ -2071,10 +2183,48 @@ def resolveUpcastVTable?
     Option CapturedVTable :=
   let reachable : Bool :=
     Bool.or (dynKeysCompatible dts srcEntry.dynKey dstKey)
-      (vtableReachesSuperKeyAux vts dts dstKey (Nat.add (length vts) 1) (vtableDirectSuperIds srcEntry))
+      (vtableReachesSuperKeyAux vts dts dstKey
+        (Nat.add (Nat.add (length (vtableDirectSuperIds srcEntry)) (vtableSuperLinkCount vts)) 1)
+        (vtableDirectSuperIds srcEntry) .nil)
   match reachable with
   | false => .none
   | true => lookupVTableFor vts srcEntry.concreteTy dstKey
+
+/--
+Regression witnesses for `resolveUpcastVTable?` (Condition `C2`) on the
+supertrait diamond `trait D: B + C`, `trait B: A`, `trait C: A` with an
+unrelated marker trait `M`, all for one concrete type: `dyn D -> dyn A` is
+resolved through the primary chain, `dyn C -> dyn A` through its own primary
+link, and `dyn D -> dyn M` (not a supertrait) is rejected (`.none`, which
+callers map to `.unsupported`).
+
+Reference (The Rust Reference 1.98.0, "Type coercions — Unsized coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#r-coerce.unsize.trait-upcast>
+
+> "dyn T to dyn U, when U is one of T’s supertraits."
+-/
+def upcastDiamondWitnessVTables : List CapturedVTable :=
+  let mk (id : Nat) (k : DefPath) (prim : Option Nat) (slots : List CapturedVTableSlot) :
+      CapturedVTable :=
+    { vtableId := id, vtableAllocId := Nat.add vtableAllocBase id, concreteTy := .uint .u32,
+      dynKey := k, sizeBytes := 4, alignBytes := 4, primarySuperVTableId? := prim,
+      slots := slots }
+  mk 0 "D" (.some 1) (.dropInPlace .none :: .size :: .align :: .traitVPtr 2 :: .nil) ::
+  mk 1 "B" (.some 3) .nil ::
+  mk 2 "C" (.some 3) .nil ::
+  mk 3 "A" .none .nil ::
+  mk 4 "M" .none .nil :: .nil
+
+theorem resolveUpcastVTable?_diamond_witness :
+    (match upcastDiamondWitnessVTables with
+     | d :: _ :: c :: _ =>
+       ((resolveUpcastVTable? upcastDiamondWitnessVTables .nil d "A").map (·.vtableId),
+        (resolveUpcastVTable? upcastDiamondWitnessVTables .nil c "A").map (·.vtableId),
+        (resolveUpcastVTable? upcastDiamondWitnessVTables .nil d "M").map (·.vtableId),
+        (resolveUpcastVTable? upcastDiamondWitnessVTables .nil c "B").map (·.vtableId))
+     | _ => (.none, .none, .none, .none)) =
+      (.some 3, .some 3, .none, .none) := by
+  decide
 
 /--
 `true` iff the descriptor of `dynKey` (if captured) marks the type as fully

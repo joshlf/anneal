@@ -4662,12 +4662,41 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
               s.memory.rootUnwindCeiling
               (externalTargetCanUnwind target (operandTy bodyLocalDecls bodyLayouts func)))
 
-/-- `core::mem::size_of_val` (re-exported as `std::mem::size_of_val`). -/
+/--
+`true` iff `p` is the `DefPath` of `core::mem::size_of_val` (re-exported as
+`std::mem::size_of_val` by `pub use core::mem;` in `library/std/src/lib.rs`).
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L401-L404>
+
+> "pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
+>     // SAFETY: `val` is a reference, so it's a valid raw pointer
+>     unsafe { intrinsics::size_of_val(val) }
+> }"
+
+Modeling choice: only these two paths are recognized; any other path (for
+example a user function of the same name in another module) is not.
+-/
 @[reducible]
 def isMemSizeOfValDefPath (p : DefPath) : Bool :=
   Bool.or (stringEq p "core::mem::size_of_val") (stringEq p "std::mem::size_of_val")
 
-/-- `core::mem::align_of_val` (re-exported as `std::mem::align_of_val`). -/
+/--
+`true` iff `p` is the `DefPath` of `core::mem::align_of_val` (re-exported as
+`std::mem::align_of_val` by `pub use core::mem;` in `library/std/src/lib.rs`).
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L548-L551>
+
+> "pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
+>     // SAFETY: val is a reference, so it's a valid raw pointer
+>     unsafe { intrinsics::align_of_val(val) }
+> }"
+
+Modeling choice: only these two paths are recognized.
+-/
 @[reducible]
 def isMemAlignOfValDefPath (p : DefPath) : Bool :=
   Bool.or (stringEq p "core::mem::align_of_val") (stringEq p "std::mem::align_of_val")
@@ -4683,6 +4712,29 @@ Reference (`core::mem::size_of_val`, Rust 1.98.0 standard library):
 <https://doc.rust-lang.org/1.98.0/core/mem/fn.size_of_val.html>
 
 > "Returns the size of the pointed-to value in bytes."
+>
+> "This is usually the same as size_of::<T>(). However, when T has no
+> statically-known size, e.g., a slice [T] or a trait object, then size_of_val
+> can be used to get the dynamically-known size."
+
+Reference (`core::mem::align_of_val`, Rust 1.98.0 standard library):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.align_of_val.html>
+
+> "Returns the ABI-required minimum alignment of the type of the value that val
+> points to, in bytes. This function is identical to align_of::<T>() whenever
+> T: Sized, but also supports determining the alignment required by a dyn Trait
+> value, which is the alignment of the underlying concrete type."
+
+Justification: both library bodies (see `isMemSizeOfValDefPath` /
+`isMemAlignOfValDefPath`) pass the reference to the intrinsic, which reads only
+the vtable (`evalDynSizeAlignOfVal`); the argument is a safe `&dyn K`, so the
+reference itself must be valid when passed (`dynRefDataValid` with
+`checkTB = false`: live, non-null, aligned, inhabited, in bounds). Modeling
+choices: no Tree Borrows access is performed, since `dyn K` is not known to be
+`Freeze` and the shared function-entry retag of a `!Freeze` pointee performs no
+read; an argument list that is not a single wide pointer (including `.uninit`
+words) is `.ub`; a diverging call site (`targetBbOpt = .none`) is `.ub` because
+the function returns. Unsupported: an unavailable vtable environment.
 -/
 def evalSafeDynSizeAlignOfValCall
     (s : MachineState)
@@ -4722,16 +4774,42 @@ def evalSafeDynSizeAlignOfValCall
 def isAddrEqDefPath (p : DefPath) : Bool :=
   Bool.or (stringEq p "core::ptr::addr_eq") (stringEq p "std::ptr::addr_eq")
 
-/-- `true` iff `v` is a `ptrBytes`-wide initialized pointer or scalar word. -/
+/--
+`true` iff `v` is a `ptrBytes`-wide initialized pointer or scalar word (the
+shape of one component of a thin or wide raw pointer at pointer width
+`ptrBytes`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "An integer (i*/u*), floating point value (f*), or raw pointer must be initialized, i.e., must not be obtained from uninitialized memory."
+
+Modeling choice: `.uninit`, aggregate, or wrong-width words are rejected.
+-/
 @[reducible]
 def isPtrSizedWord (ptrBytes : Nat) : Value → Bool
   | .ptr _ sz => Nat.beq sz ptrBytes
   | .scalar sc => Nat.beq sc.sizeBytes ptrBytes
   | _ => false
 
-/-- Data (address) word of a thin or wide raw-pointer argument value of pointer
+/--
+Data (address) word of a thin or wide raw-pointer argument value of pointer
 width `ptrBytes`, rejecting uninitialized or mis-sized data or metadata words
-(`kani#5172`). -/
+(`kani#5172`); `.none` on a malformed argument.
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2489-L2491>
+
+> "pub fn addr_eq<T: PointeeSized, U: PointeeSized>(p: *const T, q: *const U) -> bool {
+>     (p as *const ()) == (q as *const ())
+> }"
+
+Justification: the cast to `*const ()` keeps only the data (address) word,
+while passing the argument already requires every word of the raw pointer to
+be initialized (`isPtrSizedWord`). Modeling choice: a malformed argument is
+mapped to `.ub` by `evalAddrEqCall`.
+-/
 @[reducible]
 def ptrArgDataWord? (ptrBytes : Nat) : Value → Option Value
   | .ptr p sz =>

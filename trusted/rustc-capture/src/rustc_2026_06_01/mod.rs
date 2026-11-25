@@ -2181,6 +2181,20 @@ pub fn use_send(s: &Sq) -> &(dyn Shape + Send) {
 pub fn use_any(x: &u32) -> &dyn core::any::Any {
     x
 }
+pub trait Cn<const N: usize> {
+    fn cn(&self) -> usize;
+}
+impl Cn<3> for Sq {
+    fn cn(&self) -> usize { 3 }
+}
+impl Cn<4> for Sq {
+    fn cn(&self) -> usize { 4 }
+}
+pub fn use_cn(s: &Sq) -> usize {
+    let a: &(dyn Cn<3> + Send) = s;
+    let b: &(dyn Cn<4> + Send) = s;
+    a.cn() + b.cn()
+}
 "#;
         fs::write(&src_path, sample_rust.as_bytes()).expect("write sample rust source");
         let args = vec![
@@ -2255,6 +2269,33 @@ pub fn use_any(x: &u32) -> &dyn core::any::Any {
             t.contains("predicateKey := \"demo_dyn::Shape\""),
             "expected canonical predicateKey in:\n{t}"
         );
+        // The predicate key keeps const generic arguments: `dyn Cn<3> + Send` and
+        // `dyn Cn<4> + Send` have distinct predicate lists (the interpreter's
+        // `check_vtable_for_type` rejects one's vtable for the other), so their
+        // `predicateKey`s must differ and must equal the keys of `dyn Cn<3>` /
+        // `dyn Cn<4>` without the auto trait.
+        let dyn_descr: Vec<(String, String)> = t
+            .split("{ dynKey := \"")
+            .skip(1)
+            .filter_map(|chunk| {
+                let key = chunk.split('"').next()?.to_owned();
+                let after = chunk.split("predicateKey := \"").nth(1)?;
+                Some((key, after.split('"').next()?.to_owned()))
+            })
+            .collect();
+        let pred_of = |needle: &str| -> String {
+            dyn_descr
+                .iter()
+                .find(|(k, _)| k.contains(needle))
+                .unwrap_or_else(|| panic!("missing dyn type {needle} in {dyn_descr:?}"))
+                .1
+                .clone()
+        };
+        let p3 = pred_of("Cn<3");
+        let p4 = pred_of("Cn<4");
+        assert_ne!(p3, p4, "const generic args collapsed in predicateKey: {dyn_descr:?}");
+        assert!(p3.contains("Cn<3") && !p3.contains("Send"), "bad predicateKey {p3}");
+        assert!(p4.contains("Cn<4") && !p4.contains("Send"), "bad predicateKey {p4}");
         assert!(t.contains("vtableId := 0, vtableAllocId := 16384"));
         // Header slots and the concrete `Shape::area` method of `Sq`.
         assert!(t.contains(
@@ -2272,7 +2313,9 @@ pub fn use_any(x: &u32) -> &dyn core::any::Any {
         assert!(use_send.contains("(RigidTy.dynamic \"dyn Shape + core::marker::Send\")"));
         assert!(t.contains("dynKey := \"dyn Shape + core::marker::Send\""));
         // Every captured body of the session carries the identical tables (C7 determinism).
-        for def_id in ["demo_dyn::use_raw", "demo_dyn::use_send", "demo_dyn::use_any"] {
+        for def_id in
+            ["demo_dyn::use_raw", "demo_dyn::use_send", "demo_dyn::use_any", "demo_dyn::use_cn"]
+        {
             assert_eq!(tables(&lean_of(def_id)), t, "tables differ for {def_id}");
         }
         // `core::any::Any::type_id` of `u32` is reachable only through the vtable
