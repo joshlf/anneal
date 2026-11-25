@@ -349,6 +349,14 @@ def importEnv (j : Json) (roots : Array Name) : IO Environment := do
     (loadExts := false) (level := .private) (arts := arts)).setExporting false
 def nodup (l : List Name) : Bool := l.eraseDups.length == l.length
 def family : ConstantInfo → Bool | .inductInfo _ | .ctorInfo _ | .recInfo _ => true | _ => false
+def qk : QuotKind → Nat | .type => 0 | .ctor => 1 | .lift => 2 | .ind => 3
+def compat : ConstantInfo → ConstantInfo → Bool
+  | .axiomInfo a, .axiomInfo b => a.name == b.name && a.levelParams == b.levelParams && a.type == b.type && a.isUnsafe == b.isUnsafe
+  | .defnInfo a, .defnInfo b => a.name == b.name && a.levelParams == b.levelParams && a.type == b.type && a.value == b.value && a.safety == b.safety
+  | .thmInfo a, .thmInfo b => a.name == b.name && a.levelParams == b.levelParams && a.type == b.type
+  | .opaqueInfo a, .opaqueInfo b => a.name == b.name && a.levelParams == b.levelParams && a.type == b.type && a.value == b.value && a.isUnsafe == b.isUnsafe
+  | .quotInfo a, .quotInfo b => a.name == b.name && a.levelParams == b.levelParams && a.type == b.type && qk a.kind == qk b.kind
+  | _, _ => false
 def same : ConstantInfo → ConstantInfo → Bool
   | .inductInfo a, .inductInfo b => a.name == b.name && a.levelParams == b.levelParams &&
     a.type == b.type && a.numParams == b.numParams && a.numIndices == b.numIndices &&
@@ -360,40 +368,47 @@ def same : ConstantInfo → ConstantInfo → Bool
 def run (j : Json) : IO Json := do
   initSearchPath (← field (α := String) j "sysroot")
   let targets := (← field (α := Array String) j "targets").map String.toName
-  let env ← importEnv j ((← field (α := Array String) j "roots").map String.toName)
+  let env ← try importEnv j ((← field (α := Array String) j "roots").map String.toName)
+    catch e =>
+      if (e.toString.splitOn "already contains").length > 1 then
+        fail s!"conflicting duplicate target constant: {e}"
+      else throw e
   let mut st : Std.HashMap Name ConstantInfo := {}
+  let mut seenTargets : Std.HashSet Name := {}
   for m in env.header.modules, d in env.header.moduleData do
     if !targets.contains m.module then continue
+    seenTargets := seenTargets.insert m.module
     unless d.constNames == d.constants.map (·.name) do fail s!"missing_constName_entry {m.module}"
+    let mut modSeen : Std.HashSet Name := {}
     for ci in d.constants do
+      if modSeen.contains ci.name then fail s!"duplicate constant {ci.name} in {m.module}"
+      modSeen := modSeen.insert ci.name
       let rhs := match ci with | .recInfo r => r.rules.map (·.rhs) | _ => []
       unless (ci.type :: rhs ++ (ci.value? true).toList).all fun e =>
           !(e.hasFVar || e.hasMVar || e.hasLooseBVars) do fail s!"open expression in {ci.name}"
       if let some o := st[ci.name]? then  -- reserved auxiliaries realized by sibling modules
-        let thm := match o, ci with | .thmInfo _, .thmInfo _ => true | _, _ => false
-        unless !family ci && o.type == ci.type && o.levelParams == ci.levelParams &&
-            (thm || o.value? true == ci.value? true) do
-          fail s!"conflicting duplicate target constant {ci.name}"
+        unless compat o ci do fail s!"conflicting duplicate target constant {ci.name}"
       else st := st.insert ci.name ci
+  unless targets.all seenTargets.contains do fail "missing target module in imported environment"
   for (_, ci) in st do
     match ci with
     | .inductInfo I =>
-      unless I.all.contains I.name && nodup I.all && nodup I.ctors do fail s!"malformed all/ctors of {I.name}"
+      unless !I.isUnsafe && I.all.contains I.name && nodup I.all && nodup I.ctors do fail s!"malformed all/ctors of {I.name}"
       for n in I.all do
         let some (.inductInfo J) := st[n]? | fail s!"non-inductive {n} in all of {I.name}"
         unless J.all == I.all && J.numParams == I.numParams && J.levelParams == I.levelParams &&
-          J.isRec == I.isRec do fail s!"mutual metadata mismatch {I.name}/{n}"
+          J.isRec == I.isRec && J.isUnsafe == I.isUnsafe do fail s!"mutual metadata mismatch {I.name}/{n}"
       let mut i := 0
       for c in I.ctors do
         let some (.ctorInfo C) := st[c]? | fail s!"non-constructor {c} in ctors of {I.name}"
-        unless C.induct == I.name && C.cidx == i && C.numParams == I.numParams &&
+        unless !C.isUnsafe && C.induct == I.name && C.cidx == i && C.numParams == I.numParams &&
           C.levelParams == I.levelParams do fail s!"constructor metadata mismatch {c}"
         i := i + 1
     | .ctorInfo C =>
       let some (.inductInfo I) := st[C.induct]? | fail s!"dangling constructor {C.name}"
-      unless I.ctors.contains C.name do fail s!"dangling constructor {C.name}"
+      unless !C.isUnsafe && I.ctors.contains C.name do fail s!"dangling constructor {C.name}"
     | .recInfo R =>
-      unless !R.all.isEmpty && nodup R.all && R.all.all (fun n => match st[n]? with
+      unless !R.isUnsafe && !R.all.isEmpty && nodup R.all && R.all.all (fun n => match st[n]? with
           | some (.inductInfo _) => true | _ => false) do fail s!"dangling recursor {R.name}"
       for r in R.rules do
         match st[r.ctor]?, env.find? r.ctor with
@@ -414,20 +429,21 @@ def run (j : Json) : IO Json := do
       | .inductInfo I => I.all ++ I.ctors | .ctorInfo C => [C.induct] | .recInfo R => R.all | _ => []).toArray
   let base ← importEnv j (env.header.modules.filterMap fun m =>
     if targets.contains m.module then none else some m.module)
+  for (n, ci) in st do
+    if let some bc := base.find? n then
+      unless compat bc ci do fail s!"target constant {n} conflicts with base"
   let k ← try base.toKernelEnv.replay picked
     catch e => fail s!"kernel replay rejected target inductives: {e}"
   let mut fam := 0
   for (n, ci) in picked do
     if !family ci then continue
     fam := fam + 1
-    let some kc := k.find? n | fail s!"kernel never regenerated {n}"
+    let some kc := k.constants.map₂.find? n | fail s!"kernel never regenerated {n}"
     unless same ci kc do fail s!"post-replay metadata mismatch {n}"
-    if let .inductInfo I := kc then
-      let nested := if I.all.head? == some n then (List.range I.numNested).map (s!"rec_{·+1}") else []
-      for g in I.ctors ++ (("rec" :: nested).map (Name.str n ·)) do
-        if let some gc := k.find? g then
-          let some sc := st[g]? | fail s!"kernel constant {g} dropped from module data"
-          unless same sc gc do fail s!"kernel constant {g} replaced in module data"
+  for (g, gc) in k.constants.map₂ do
+    if !family gc then continue
+    let some sc := st[g]? | fail s!"kernel constant {g} dropped from module data"
+    unless same sc gc do fail s!"kernel constant {g} replaced in module data"
   return Json.mkObj [("inductiveConstants", toJson fam), ("replayedConstants", toJson picked.size)]
 def main (args : List String) : IO UInt32 := do
   let [req, out] := args | IO.eprintln "expected request and result files"; return 2
@@ -464,15 +480,23 @@ def resolve_exact_modules(spec: str, targets=None) -> list:
 
 def lake_modules(checkout: Path) -> dict[str, str]:
     """Every on-disk `.lean` module under the `[[lean_lib]]` roots of `lakefile.toml`."""
+    try:
+        doc = tomllib.loads((checkout / "lakefile.toml").read_text())
+    except (OSError, ValueError) as error:
+        raise Failure(1, "orphan-check", f"unreadable lakefile.toml: {error}") from error
+    pkg_src = doc.get("srcDir", ".")
     found: dict[str, str] = {}
-    for lib in tomllib.loads((checkout / "lakefile.toml").read_text()).get("lean_lib", []):
-        src = checkout / lib.get("srcDir", ".")
+    for lib in doc.get("lean_lib", []):
+        src = checkout / lib.get("srcDir", pkg_src)
         for root in lib.get("roots", [lib["name"]]):
             base = src / root.replace(".", "/")
-            files = [base.with_suffix(".lean")] if base.with_suffix(".lean").is_file() else []
+            files = [base.with_suffix(".lean")] if base.with_suffix(".lean").exists() or base.with_suffix(".lean").is_symlink() else []
             files += sorted(base.rglob("*.lean")) if base.is_dir() else []
             for f in files:
-                found[".".join(f.relative_to(src).with_suffix("").parts)] = f.relative_to(checkout).as_posix()
+                regular(f, "orphan-check")
+                mod, rel = ".".join(f.relative_to(src).with_suffix("").parts), f.relative_to(checkout).as_posix()
+                if found.setdefault(mod, rel) != rel:
+                    raise Failure(1, "orphan-check", f"duplicate lakefile module {mod}: {found[mod]} vs {rel}")
     return found
 
 
@@ -487,9 +511,14 @@ def orphan_check(checkout: Path, manifest: Path | None = None, targets=None) -> 
     shards = spec.get("shards") if isinstance(spec, dict) else None
     if not isinstance(shards, list) or not shards:
         raise Failure(1, phase, "shard manifest has no shards")
+    lakefile_flag = spec.get("lakefile_check", False)
+    if not isinstance(lakefile_flag, bool):
+        raise Failure(1, phase, f"malformed lakefile_check flag: {lakefile_flag!r}")
     universe = {t[0]: t[1] for t in targets}
-    if spec.get("lakefile_check") is True:
-        universe.update(lake_modules(checkout))
+    if lakefile_flag:
+        for mod, rel in lake_modules(checkout).items():
+            if universe.setdefault(mod, rel) != rel:
+                raise Failure(1, phase, f"module path conflict for {mod}: {universe[mod]} vs {rel}")
     missing = sorted(m for m, rel in universe.items() if not (checkout / rel).is_file())
     folded: dict[str, str] = {}
     for module in sorted(universe):
@@ -500,6 +529,8 @@ def orphan_check(checkout: Path, manifest: Path | None = None, targets=None) -> 
         modules = shard.get("modules") if isinstance(shard, dict) else None
         if not isinstance(modules, list) or not modules or not all(isinstance(m, str) for m in modules):
             raise Failure(1, phase, f"empty or malformed shard: {shard!r}")
+        if len(set(modules)) != len(modules):
+            raise Failure(1, phase, f"duplicate module in shard {shard.get('name')}")
         if unknown := sorted(set(modules) - set(universe)):
             raise Failure(1, phase, f"unknown module(s) in shard {shard.get('name')}: {unknown[:5]}")
         covered.update(modules)
@@ -8103,6 +8134,8 @@ def main() -> int:
         base_snapshot = Path(os.environ["ANNEAL_TRUSTED_BASE_SNAPSHOT"])
     if args.orphan_only or args.exact_modules is not None:
         try:
+            if args.orphan_only and args.exact_modules is not None:
+                raise Failure(1, "orphan-check", "--orphan-only and --exact-modules are mutually exclusive")
             if args.orphan_only:
                 print(f"PASS: shard partition complete; {json.dumps(orphan_check(checkout, args.shard_manifest))}")
                 return 0

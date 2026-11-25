@@ -119,6 +119,32 @@ class OrphanGateTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 1)
             self.assertIn("orphan-check", proc.stderr)
 
+    def test_duplicate_in_shard_bad_flag_and_mutually_exclusive_cli_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._fixture(Path(tmp))
+            dup = self._manifest(root, [{"name": "a", "modules": ["Foo", "Foo", "Foo.A"]}])
+            with self.assertRaisesRegex(ct.Failure, "duplicate module"):
+                ct.orphan_check(root, dup, [])
+            bad_flag = root / "bad_flag.json"
+            bad_flag.write_text(json.dumps({"lakefile_check": "true", "shards": [{"name": "a", "modules": ["Foo"]}]}))
+            with self.assertRaisesRegex(ct.Failure, "malformed lakefile_check"):
+                ct.orphan_check(root, bad_flag, [])
+            proc = subprocess.run([sys.executable, "-B", str(REPO / "trusted/audit/check_trusted.py"),
+                                   "--orphan-only", "--exact-modules", "Anneal.Memory"],
+                                  capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 1)
+
+    def test_lakefile_package_srcdir_and_symlink_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg/Foo").mkdir(parents=True)
+            (root / "lakefile.toml").write_text('name = "X"\nsrcDir = "pkg"\n[[lean_lib]]\nname = "Foo"\n')
+            (root / "pkg/Foo.lean").write_text("")
+            self.assertEqual(ct.lake_modules(root), {"Foo": "pkg/Foo.lean"})
+            (root / "pkg/Foo/Link.lean").symlink_to(root / "pkg/Foo.lean")
+            with self.assertRaises(ct.Failure):
+                ct.lake_modules(root)
+
 
 class ExactModulesTests(unittest.TestCase):
     def test_transitive_closure(self):
@@ -194,6 +220,24 @@ def main (args : List String) : IO Unit := do
     | "rec_minors" => cs.map fun c => match c with
       | .recInfo r => if r.name == `Forge.Color.rec then .recInfo { r with numMinors := 3 } else c
       | _ => c
+    | "in_module_duplicate" =>
+      match cs.find? (·.name == `Forge.Color.red) with
+      | some c => cs.push c
+      | none => cs
+    | "replaced_rec_with_axiom" => cs.map fun c => match c with
+      | .recInfo r => if r.name == `Forge.Color.rec then
+          .axiomInfo { name := r.name, levelParams := r.levelParams, type := r.type, isUnsafe := false }
+        else c
+      | _ => c
+    | "unsafe_inductive" => cs.map fun c => match c with
+      | .inductInfo v => if v.name == C then .inductInfo { v with isUnsafe := true } else c
+      | .ctorInfo v => if v.induct == C then .ctorInfo { v with isUnsafe := true } else c
+      | .recInfo r => if r.all.contains C then .recInfo { r with isUnsafe := true } else c
+      | _ => c
+    | "extra_forged_recursor" =>
+      match cs.find? (·.name == `Forge.Color.rec) with
+      | some (.recInfo r) => cs.push (.recInfo { r with name := `Forge.Color.fakeRec })
+      | _ => cs
     | _ => cs
   let names := cs.map (·.name)
   let names := if mode == "missing_constname" then names.pop else names
@@ -202,7 +246,8 @@ def main (args : List String) : IO Unit := do
 
 FORGERY_MODES = ("self_not_in_all", "empty_all", "non_induct_in_all", "non_ctor_in_ctors", "num_indices",
                  "num_params", "is_rec", "is_reflexive", "dangling_ctor", "dangling_rec", "dropped_rec", "ctor_cidx",
-                 "rec_minors", "missing_constname")
+                 "rec_minors", "missing_constname", "in_module_duplicate", "replaced_rec_with_axiom",
+                 "unsafe_inductive", "extra_forged_recursor")
 
 
 @unittest.skipUnless(lean_available(), "pinned Lean toolchain not installed")
@@ -302,6 +347,32 @@ class InductiveReplayForgeryTests(unittest.TestCase):
             message = str(ctx.exception)
             self.assertTrue("post-replay" in message or "kernel replay rejected" in message, f"{mode}: {message}")
 
+    def test_in_module_duplicate_replaced_rec_unsafe_and_extra_rec_rejected(self):
+        self.assert_rejected("in_module_duplicate", "duplicate")
+        self.assert_rejected("replaced_rec_with_axiom", "replaced in module data")
+        self.assert_rejected("unsafe_inductive")
+        self.assert_rejected("extra_forged_recursor", "Forge.Color.fakeRec")
+
+    def test_cross_module_inductive_axiom_kind_conflation_rejected(self):
+        # Module Forge defines `inductive Forge.Color`; sibling module ForgeSib defines
+        # `axiom Forge.Color : Type` with identical type/levelParams (both `value? true = none`).
+        root = Path(self.tmp.name)
+        sib_src = root / "ForgeSib.lean"
+        sib_src.write_text("namespace Forge\naxiom Color : Type\nend Forge\n")
+        sib_olean = root / "ForgeSib.olean"
+        subprocess.run([str(LEAN), "-o", str(sib_olean), str(sib_src)], cwd=root, check=True, capture_output=True)
+        self.checker.artifacts["Forge"] = [[str(self.forged["clean"])], []]
+        self.checker.artifacts["ForgeSib"] = [[str(sib_olean)], []]
+        try:
+            with self.assertRaises(ct.Failure) as ctx:
+                self.checker.inspect("inductive-replay-downstream", targets=["Forge", "ForgeSib"],
+                                     roots=["Forge", "ForgeSib"])
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("conflicting duplicate target constant", str(ctx.exception))
+        finally:
+            self.checker.artifacts.pop("Forge", None)
+            self.checker.artifacts.pop("ForgeSib", None)
+
 
 RECONCILE_A = "namespace Shared\ndef lit : Nat := 3\naxiom conflated : Nat\ntheorem same : True := trivial\nend Shared\n"
 RECONCILE_B = ("namespace Shared\ndef lit : Nat := 18446744073709551619\ndef conflated : Nat := 0\n"
@@ -350,6 +421,36 @@ class ReconciliationTests(unittest.TestCase):
         if not any(sta.lake_olean(REPO, m).is_file() for m in ct.lake_modules(REPO)):
             self.skipTest("no compiled Lake modules")
         self.assertEqual(sta.reconcile_lake(REPO)["conflicts"], [])
+
+    def test_same_shard_conflict_and_bijective_numeric_dotted_names_detected(self):
+        # Two conflicting modules in the SAME shard must still be detected.
+        same_shard = sta.reconcile({"s1": [("A", self.oleans["A"]), ("B", self.oleans["B"])]})
+        self.assertIn("Shared.lit", {c[0] for c in same_shard["conflicts"]})
+        # Synthesize two `.olean`s with conflicting `Name.num` and dotted `Name.str` constants
+        # where naive `Name.toString` / `String.toName` roundtrip loses the distinction.
+        root = Path(self.tmp.name)
+        synth = root / "SynthNames.lean"
+        synth.write_text(r"""import Lean
+open Lean
+def mkConst (n : Name) (v : Nat) : ConstantInfo :=
+  .defnInfo { name := n, levelParams := [], type := .const `Nat [],
+              value := .lit (.natVal v), hints := .opaque, safety := .safe }
+def main (args : List String) : IO Unit := do
+  let [inp, out1, out2] := args | throw (IO.userError "bad args")
+  let (d, _) ← readModuleData inp
+  let nNum : Name := .num (.str .anonymous "Shared") 1
+  let nDot : Name := .str (.str .anonymous "Shared") "a.b"
+  let cs1 := #[mkConst nNum 1, mkConst nDot 1]
+  let cs2 := #[mkConst nNum 2, mkConst nDot 2]
+  saveModuleData out1 `N1 { d with constants := cs1, constNames := cs1.map (·.name) }
+  saveModuleData out2 `N2 { d with constants := cs2, constNames := cs2.map (·.name) }
+""")
+        n1, n2 = root / "N1.olean", root / "N2.olean"
+        subprocess.run([str(LEAN), "--run", str(synth), str(self.oleans["C"]), str(n1), str(n2)],
+                       cwd=root, check=True, capture_output=True)
+        res = sta.reconcile({"s1": [("N1", n1)], "s2": [("N2", n2)]})
+        self.assertEqual(res["candidates"], 2)
+        self.assertEqual(len(res["conflicts"]), 2)
 
 
 class PlannerTests(unittest.TestCase):
@@ -415,11 +516,41 @@ class PeerGuardScannerTests(unittest.TestCase):
         scan_text("inductive F | assumesHold | tt\ndef e : F → Prop | .assumesHold => True | .tt => False\n"
                   "theorem x : e F.assumesHold := trivial\n")
 
+    def test_6a_red_team_bypasses_match_nested_if_pi_let_and_multifile(self):
+        # `match` inside theorem statement must NOT truncate `sig` at `|`!
+        self.assert_violation(
+            "theorem evil (x : Nat) : match x with | 0 => assumesHold | _ => True := trivial\n", "6a")
+        # Keyword inside parens must NOT truncate declaration bounds!
+        self.assert_violation("theorem evil (end : Nat) : assumesHold := sorry\n", "6a", "positive")
+        # Nested unparenthesized `if` must match inner/outer `else` properly!
+        self.assert_violation("theorem evil : if a then if b then True else assumesHold else True := sorry\n",
+                              "6a", "positive")
+        # `Π` and dependent arrow `(h : assumesHold) → P`
+        scan_text("theorem ok1 : Π (h : assumesHold), True := fun _ => trivial\n"
+                  "theorem ok2 : (h : assumesHold) → True := fun _ => trivial\n"
+                  "theorem ok3 : let p := assumesHold in p → True := fun _ => trivial\n")
+        self.assert_violation("theorem bad1 : Π (h : ¬ assumesHold), True := sorry\n", "6a", "antecedent")
+        self.assert_violation("theorem bad2 : (h : ¬ assumesHold) → True := sorry\n", "6a", "antecedent")
+        self.assert_violation("theorem bad3 : let p : assumesHold := h; True := sorry\n", "6a", "type annotation")
+        self.assert_violation("theorem bad4 : let p := assumesHold in True ∧ p := sorry\n", "6a", "positive")
+        # Multi-file transitive helper chain (FileA -> FileB -> FileC with namespace prefix)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "A.lean").write_text("namespace Foo\ndef h1 : Prop := ¬ assumesHold\nend Foo\n")
+            (root / "B.lean").write_text("namespace Foo\ndef h2 : Prop := h1\nend Foo\n")
+            (root / "C.lean").write_text("theorem leak : Foo.h2 → True := sorry\n")
+            with self.assertRaises(sta.GuardViolation) as ctx:
+                sta.scan_peer_guards([root], root)
+            self.assertEqual(ctx.exception.guard, "6a")
+
     def test_6b_sealed_structure_with_smart_constructor_passes(self):
         scan_text("/-- @invariant lo ≤ hi -/\nstructure R where\n  private mk ::\n  lo : Nat\n  hi : Nat\n  h : lo ≤ hi\n\n"
-                  "/-- @smart_constructor -/\ndef R.make (a : Nat) : R := R.mk a a (Nat.le_refl a)\n"
+                  "private def rawHelper (a : Nat) : R := R.mk a a (Nat.le_refl a)\n"
+                  "/-- @smart_constructor -/\ndef R.make (a : Nat) : R := rawHelper a\n"
                   "def R.width (r : R) : Nat := r.hi - r.lo\n"
-                  "def shadow (mk : Nat → Nat) : Nat := mk 0\n")
+                  "def shadow (mk : Nat → Nat) : Nat := mk 0\n"
+                  "open R in\n/-- @smart_constructor -/\ndef R.makeOpen (a : Nat) : R := mk a a (Nat.le_refl a)\n"
+                  "def unrelatedAfterOpenIn : Nat := mk 0\n")
 
     def test_6b_unsealed_and_inhabited_rejected(self):
         self.assert_violation("/-- @invariant -/\nstructure R where\n  mk ::\n  lo : Nat\n", "6b", "private")
@@ -430,6 +561,10 @@ class PeerGuardScannerTests(unittest.TestCase):
                               "deriving instance Inhabited for R\n", "6b", "Inhabited")
         self.assert_violation("/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n\n"
                               "instance : Inhabited R := ⟨R.mk 0⟩\n", "6b", "Inhabited")
+        self.assert_violation("/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\nderiving\n  Inhabited\n",
+                              "6b", "Inhabited")
+        self.assert_violation("/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n\n"
+                              "deriving instance\n  Inhabited\n  for R\n", "6b", "Inhabited")
 
     def test_6b_constructor_leaks_rejected(self):
         head = "/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n\n"
@@ -438,9 +573,30 @@ class PeerGuardScannerTests(unittest.TestCase):
         self.assert_violation(head + "open R in\ndef leak (n : Nat) : R := mk n\n", "6b", "raw constructor")
         self.assert_violation(head + "open R renaming mk → build\ndef leak (n : Nat) : R := build n\n", "6b",
                               "raw constructor")
+        self.assert_violation(head + "open R renaming\n  mk → build\ndef leak (n : Nat) : R := build n\n", "6b",
+                              "raw constructor")
         self.assert_violation(head + "abbrev Build := R.mk\ndef leak (n : Nat) : R := Build n\n", "6b",
                               "raw constructor")
+        self.assert_violation(head + "abbrev RAlias := R\ndef leak (n : Nat) : R := RAlias.mk n\n", "6b",
+                              "raw constructor")
+        self.assert_violation(head + "abbrev RAlias := R\nderiving instance Inhabited for RAlias\n", "6b", "Inhabited")
+        self.assert_violation(head + "abbrev RAlias := R\nclass Carrier extends RAlias where\n  extra : Nat\n", "6b",
+                              "carrier")
         self.assert_violation(head + "structure Carrier extends R where\n  extra : Nat\n", "6b", "carrier")
+        # Private helper transitive forwarding to non-@smart_constructor public def
+        self.assert_violation(head + "private def rawH (n : Nat) : R := R.mk n\ndef leak (n : Nat) : R := rawH n\n",
+                              "6b", "raw constructor")
+        # Lexical shadowing bypasses: inner `fun mk` or later `let mk` must NOT hide unshadowed `mk`!
+        self.assert_violation(head + "open R\ndef leak (n : Nat) : R := let _ := (fun mk => mk) 0; mk n\n",
+                              "6b", "raw constructor")
+        self.assert_violation(head + "open R\ndef leak (n : Nat) : R := let x := mk n; let mk := 0; x\n",
+                              "6b", "raw constructor")
+        # Anonymous constructor and structure literal bypasses
+        self.assert_violation(head + "def leak (n : Nat) : R := ⟨n⟩\n", "6b", "raw constructor")
+        self.assert_violation(head + "def leak (n : Nat) : R := { lo := n }\n", "6b", "raw constructor")
+        # Namespace-qualified `@invariant` structure accessed from outside namespace
+        ns_head = "namespace Foo\n/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\nend Foo\n\n"
+        self.assert_violation(ns_head + "def leak (n : Nat) : Foo.R := Foo.R.mk n\n", "6b", "raw constructor")
 
     def test_live_theory_has_zero_false_positives(self):
         summary = sta.scan_peer_guards([REPO / "theory/Anneal"])

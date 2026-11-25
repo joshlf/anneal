@@ -208,6 +208,20 @@ def aux : ConstantInfo → Int × Int
   | .inductInfo v => (v.numParams, v.numIndices) | .ctorInfo v => (v.numParams, v.cidx)
   | .recInfo v => (v.numParams, v.numMinors) | _ => (-1, -1)
 def qk : QuotKind → Nat | .type => 0 | .ctor => 1 | .lift => 2 | .ind => 3
+def encodeNameAux : Name → List Json → List Json
+  | .anonymous, acc => acc
+  | .str p s, acc => encodeNameAux p (Json.arr #[toJson "s", toJson s] :: acc)
+  | .num p k, acc => encodeNameAux p (Json.arr #[toJson "n", toJson k] :: acc)
+def encodeName (n : Name) : Json := Json.arr (encodeNameAux n []).toArray
+def decodeName (j : Json) : Except String Name := do
+  let arr ← j.getArr?
+  arr.foldlM (init := .anonymous) fun p item => do
+    let pair ← item.getArr?
+    if pair.size != 2 then throw "bad encoded name segment"
+    let tag ← pair[0]!.getStr?
+    if tag == "s" then return .str p (← pair[1]!.getStr?)
+    else if tag == "n" then return .num p (← pair[1]!.getNat?)
+    else throw "bad encoded name tag"
 /-- Exact structural compatibility: identical constructor tag, universe parameters, type,
     value (theorems: proof irrelevance), and every inductive/constructor/recursor field. -/
 def constInfoCompat : ConstantInfo → ConstantInfo → Bool
@@ -238,14 +252,20 @@ def main (args : List String) : IO UInt32 := do
       let (d, _) ← readModuleData p
       unless d.constNames == d.constants.map (·.name) do
         throw <| IO.userError s!"policy:invalid inventory {m}"
+      let mut modSeen : Std.HashSet Name := {}
       for ci in d.constants do
+        if modSeen.contains ci.name then
+          throw <| IO.userError s!"policy:duplicate constant {ci.name} in {m}"
+        modSeen := modSeen.insert ci.name
         let (a1, a2) := aux ci
-        h.putStrLn (toJson [toJson ci.name.toString, toJson (kind ci), toJson m,
+        h.putStrLn (toJson [encodeName ci.name, toJson (kind ci), toJson m,
           toJson ci.levelParams.length, toJson ci.type.hash.toNat,
           toJson ((ci.value? true).map (·.hash.toNat)), toJson ci.isUnsafe, toJson a1, toJson a2]).compress
     return 0
-  let cands : NameSet := (← IO.ofExcept <| j.getObjValAs? (Array String) "candidates").foldl
-    (fun s n => s.insert n.toName) {}
+  let candJson ← IO.ofExcept <| j.getObjValAs? (Array Json) "candidates"
+  let mut cands : NameSet := {}
+  for cj in candJson do
+    cands := cands.insert (← IO.ofExcept <| decodeName cj)
   let mut seen : Std.HashMap Name (String × String × ConstantInfo) := {}
   let mut conflicts : Array Json := #[]
   for (shard, m, p) in mods do
@@ -267,10 +287,10 @@ def lake_olean(checkout: Path, module: str) -> Path:
 
 
 def reconcile(shard_modules: dict[str, list[tuple[str, Path]]], lean: Path = LEAN) -> dict:
-    """Header export per shard, cross-shard candidate detection, exact structural comparison.
+    """Header export per shard, multi-module/cross-shard candidate detection, exact structural comparison.
 
     `shard_modules` maps shard name to `(module, olean path)` pairs. Returns the header
-    counts, the candidate names realized in two or more shards, and every conflict.
+    counts, the candidate names realized in two or more module occurrences, and every conflict.
     """
     rows = [[shard, [module, str(path)]] for shard, mods in sorted(shard_modules.items()) for module, path in mods]
     with tempfile.TemporaryDirectory(prefix="anneal-reconcile-") as tmp:
@@ -290,7 +310,7 @@ def reconcile(shard_modules: dict[str, list[tuple[str, Path]]], lean: Path = LEA
                 raise Failure(1 if "policy:" in detail else 2, "reconcile", f"Lean {mode} exited {proc.returncode}: {detail}")
 
         lean_run("headers", headers_dir)
-        owners: dict[str, set[str]] = {}
+        owners: dict[str, set[tuple[str, str]]] = {}
         counts: dict[str, int] = {}
         for shard in shard_modules:
             path = headers_dir / (shard.replace("/", "__") + ".jsonl")
@@ -298,10 +318,11 @@ def reconcile(shard_modules: dict[str, list[tuple[str, Path]]], lean: Path = LEA
             counts[shard] = len(lines)
             for line in lines:
                 header = json.loads(line)
-                if not (isinstance(header, list) and len(header) == 9):
+                if not (isinstance(header, list) and len(header) == 9 and isinstance(header[0], list)):
                     raise Failure(2, "reconcile", f"malformed declaration header in {shard}")
-                owners.setdefault(header[0], set()).add(shard)
-        candidates = sorted(n for n, s in owners.items() if len(s) >= 2)
+                key = json.dumps(header[0], separators=(",", ":"))
+                owners.setdefault(key, set()).add((shard, str(header[2])))
+        candidates = [json.loads(k) for k, s in sorted(owners.items()) if len(s) >= 2]
         result = {"headers": counts, "declarations": len(owners), "candidates": len(candidates), "conflicts": []}
         if candidates:
             request.write_text(json.dumps({"modules": rows, "candidates": candidates}))
@@ -451,8 +472,8 @@ def strip_lean_comments(text: str) -> str:
     return "".join(out)
 
 
-def tokenize(text: str) -> list[tuple[str, int]]:
-    """`(token, line)` pairs of comment-stripped Lean source."""
+def _tokenize_rich(text: str) -> list[tuple[str, int, int]]:
+    """`(token, line, offset)` triples of comment-stripped Lean source."""
     clean = strip_lean_comments(text)
     tokens, line, last = [], 1, 0
     for match in _TOKEN.finditer(clean):
@@ -463,8 +484,13 @@ def tokenize(text: str) -> list[tuple[str, int]]:
         # `.assumesHold` (dot notation) and `Other.assumesHold` name different constants.
         if leaf in ASSUMPTION_ATOMS and (namespace not in ATOM_NAMESPACES or (tokens and tokens[-1][0] == ".")):
             token = f"{token}\u2020"
-        tokens.append((token, line))
+        tokens.append((token, line, match.start()))
     return tokens
+
+
+def tokenize(text: str) -> list[tuple[str, int]]:
+    """`(token, line)` pairs of comment-stripped Lean source."""
+    return [(t, l) for t, l, _ in _tokenize_rich(text)]
 
 
 def _is_atom(token: str) -> bool:
@@ -503,11 +529,15 @@ class PolarityScanner:
     def __init__(self, path: str, helpers: set[str] | None = None):
         self.path, self.helpers, self.aliases = path, set(helpers or ()), []
 
+    def _is_helper(self, token: str) -> bool:
+        return token in self.helpers or token.split(".")[-1] in self.helpers
+
     def _mentions(self, toks: list, limit: int, depth: int = 0) -> bool:
         if depth > MAX_LET_ALIAS_DEPTH:
             raise GuardViolation("6a", "let-alias chain exceeds depth 8", self.path, toks[0][1] if toks else 0)
-        for t, _ in toks:
-            if _is_atom(t) or t in self.helpers:
+        for tok in toks:
+            t = tok[0]
+            if _is_atom(t) or self._is_helper(t):
                 return True
             for i in range(min(limit, len(self.aliases)) - 1, -1, -1):
                 if self.aliases[i][0] == t:
@@ -525,6 +555,22 @@ class PolarityScanner:
             reason = sign[1]
         raise GuardViolation("6a", reason, self.path, line)
 
+    def _analyze_binder_group(self, group: list, sign, antecedent: bool, inline: int) -> None:
+        colon = None
+        i = 0
+        while i < len(group):
+            t = group[i][0]
+            if t == ":":
+                colon = i
+                break
+            i = _group_end(group, i) if t in OPEN else i + 1
+        if colon is not None:
+            if self._mentions(group[:colon], len(self.aliases)):
+                raise GuardViolation("6a", "assumesHold in an unclean binder", self.path, group[0][1])
+            self.analyze(group[colon + 1:], sign, antecedent, inline)
+        elif self._mentions(group, len(self.aliases)):
+            raise GuardViolation("6a", "assumesHold in an unclean binder", self.path, group[0][1])
+
     def analyze(self, toks: list, sign="pos", antecedent: bool = False, inline: int = 0) -> None:
         if not toks:
             return
@@ -538,7 +584,23 @@ class PolarityScanner:
             return
         if (s := _split(toks, {"→", "->", "==>"})) is not None:
             flipped = {"pos": "neg", "neg": "pos"}.get(sign, sign) if isinstance(sign, str) else sign
-            self.analyze(s[0], flipped, True, inline)
+            lhs = s[0]
+            if lhs and lhs[0][0] in ("(", "{", "[") and _group_end(lhs, 0) == len(lhs):
+                inner = lhs[1:-1]
+                # Dependent arrow `(h : assumesHold) → P`
+                k = 0
+                has_colon = False
+                while k < len(inner):
+                    if inner[k][0] == ":":
+                        has_colon = True
+                        break
+                    k = _group_end(inner, k) if inner[k][0] in OPEN else k + 1
+                if has_colon:
+                    self._analyze_binder_group(inner, flipped, True, inline)
+                else:
+                    self.analyze(inner, flipped, True, inline)
+            else:
+                self.analyze(lhs, flipped, True, inline)
             return self.analyze(s[1], sign, antecedent, inline)
         for ops in ({"∨", "||"}, {"∧", "&&"}):
             if (s := _split(toks, ops)) is not None:
@@ -548,24 +610,31 @@ class PolarityScanner:
             flipped = {"pos": "neg", "neg": "pos"}.get(sign, sign) if isinstance(sign, str) else sign
             return self.analyze(toks[1:], flipped, antecedent, inline)
         if head == "if":
-            depth, then_i, else_i = 0, None, None
-            for i, (t, _) in enumerate(toks[1:], start=1):
+            depth, if_depth, then_i, else_i = 0, 0, None, None
+            for i in range(1, len(toks)):
+                t = toks[i][0]
                 if t in OPEN:
                     depth += 1
                 elif t in CLOSE:
                     depth -= 1
-                elif depth == 0 and t == "then" and then_i is None:
-                    then_i = i
-                elif depth == 0 and t == "else" and then_i is not None:
-                    else_i = i
-                    break
+                elif depth == 0:
+                    if t == "if":
+                        if_depth += 1
+                    elif t == "then" and if_depth == 0 and then_i is None:
+                        then_i = i
+                    elif t == "else":
+                        if if_depth > 0:
+                            if_depth -= 1
+                        elif then_i is not None:
+                            else_i = i
+                            break
             if then_i is None:
                 return self._leaf(toks, sign, antecedent, inline)
             self.analyze(toks[1:then_i], both("assumesHold in an if condition"), antecedent, inline)
             self.analyze(toks[then_i + 1:else_i], sign, antecedent, inline)
             return self.analyze(toks[else_i + 1:] if else_i else [], sign, antecedent, inline)
-        if head in ("∀", "∃", "forall", "exists"):
-            universal = head in ("∀", "forall")
+        if head in ("∀", "∃", "forall", "exists", "Π"):
+            universal = head in ("∀", "forall", "Π")
             comma = None
             i = 1
             while i < len(toks):
@@ -586,11 +655,7 @@ class PolarityScanner:
                 else:
                     i += 1
             for group in groups or [binders]:
-                colon = next((k for k, (t, _) in enumerate(group) if t == ":"), None)
-                if colon is not None:
-                    self.analyze(group[colon + 1:], binder_sign, antecedent or universal, inline)
-                elif self._mentions(group, len(self.aliases)):
-                    raise GuardViolation("6a", "assumesHold in an unclean binder", self.path, group[0][1])
+                self._analyze_binder_group(group, binder_sign, antecedent or universal, inline)
             return self.analyze(toks[comma + 1:], sign, antecedent, inline)
         if head in OPEN and _group_end(toks, 0) == len(toks):
             return self.analyze(toks[1:-1], sign, antecedent, inline)
@@ -600,17 +665,26 @@ class PolarityScanner:
         if len(toks) < 2 or not re.match(r"[A-Za-z_]", toks[1][0]):
             return self._leaf(toks, sign, antecedent, inline)
         name = toks[1][0]
-        eq = next((i for i, (t, _) in enumerate(toks) if t == ":="), None)
+        eq = None
+        i = 2
+        while i < len(toks):
+            if toks[i][0] == ":=":
+                eq = i
+                break
+            i = _group_end(toks, i) if toks[i][0] in OPEN else i + 1
         if eq is None:
             return self._leaf(toks, sign, antecedent, inline)
+        if self._mentions(toks[2:eq], len(self.aliases)):
+            raise GuardViolation("6a", "assumesHold in a let type annotation", self.path, toks[2][1])
         end, i = len(toks), eq + 1
         while i < len(toks):
-            t, line = toks[i]
-            if t == ";" or (i > eq + 1 and line > toks[i - 1][1]):
+            t, line = toks[i][0], toks[i][1]
+            if t in (";", "in") or (i > eq + 1 and line > toks[i - 1][1]):
                 end = i
                 break
             i = _group_end(toks, i) if t in OPEN else i + 1
-        value, body = toks[eq + 1:end], toks[end + (1 if end < len(toks) and toks[end][0] == ";" else 0):]
+        skip = 1 if end < len(toks) and toks[end][0] in (";", "in") else 0
+        value, body = toks[eq + 1:end], toks[end + skip:]
         if not body:
             return self._leaf(value, sign, antecedent, inline)
         if len(self.aliases) >= MAX_LET_ALIAS_DEPTH:
@@ -640,10 +714,48 @@ class PolarityScanner:
         raise GuardViolation("6a", "assumesHold inside an unclean Boolean/application leaf", self.path, toks[0][1])
 
 
+_DECL_MODIFIERS = {"private", "protected", "noncomputable", "partial", "unsafe", "local", "scoped"}
+
+
+def _is_private_decl(toks: list, start: int) -> bool:
+    """Whether `toks[start]` is preceded by a `private` visibility modifier."""
+    j = start - 1
+    while j >= 0:
+        t = toks[j][0]
+        if t == "private":
+            return True
+        if t in _DECL_MODIFIERS:
+            j -= 1
+            continue
+        if t == "]":
+            depth = 1
+            j -= 1
+            while j >= 0 and depth > 0:
+                if toks[j][0] == "]":
+                    depth += 1
+                elif toks[j][0] == "[":
+                    depth -= 1
+                j -= 1
+            if j >= 0 and toks[j][0] == "@":
+                j -= 1
+                continue
+            return False
+        break
+    return False
+
+
 def _declarations(toks: list):
-    """`(keyword, name, signature tokens, body tokens)` for each top-level declaration."""
+    """`(keyword, name, signature tokens, body tokens, start_idx)` for each top-level declaration."""
     n = len(toks)
-    bounds = [k for k, (t, _) in enumerate(toks) if t in DECL_KEYWORDS or t in COMMAND_STOPS]
+    bounds, depth = [], 0
+    for k, tok in enumerate(toks):
+        t = tok[0]
+        if t in OPEN:
+            depth += 1
+        elif t in CLOSE:
+            depth = max(0, depth - 1)
+        elif depth == 0 and (t in DECL_KEYWORDS or t in COMMAND_STOPS):
+            bounds.append(k)
     for index, start in enumerate(bounds):
         if toks[start][0] not in DECL_KEYWORDS:
             continue
@@ -651,14 +763,16 @@ def _declarations(toks: list):
         kw = toks[start][0]
         rest = toks[start + 1:end]
         name = rest[0][0] if rest and kw not in ("example", "variable") and re.match(r"[A-Za-z_«]", rest[0][0]) else ""
-        split, lets, i = None, 0, 0
+        split, lets, in_match, i = None, 0, False, 0
         while i < len(rest):
             t = rest[i][0]
             if t == "let":
                 lets += 1
             elif t == ":=" and lets:
                 lets -= 1  # a `let x := v` binding inside the statement
-            elif t in (":=", "where", "|"):
+            elif t == "match":
+                in_match = True
+            elif t in (":=", "where") or (t == "|" and not in_match):
                 split = i
                 break
             i = _group_end(rest, i) if t in OPEN else i + 1
@@ -667,7 +781,7 @@ def _declarations(toks: list):
 
 
 def assumption_helpers(files: dict[str, list]) -> set[str]:
-    """`def` / `abbrev` names whose bodies (transitively) mention the assumption atom."""
+    """`def` / `abbrev` / `opaque` names whose bodies (transitively) mention the assumption atom."""
     helpers: set[str] = set()
     changed = True
     while changed:
@@ -675,7 +789,7 @@ def assumption_helpers(files: dict[str, list]) -> set[str]:
         for toks in files.values():
             for kw, name, _sig, body, _start in _declarations(toks):
                 if kw in ("def", "abbrev", "opaque") and name and name not in helpers:
-                    if any(_is_atom(t) or t in helpers or t.split(".")[-1] in helpers for t, _ in body):
+                    if any(_is_atom(tok[0]) or tok[0] in helpers or tok[0].split(".")[-1] in helpers for tok in body):
                         helpers.add(name)
                         changed = True
     return helpers
@@ -686,20 +800,16 @@ def scan_polarity(path: str, toks: list, helpers: set[str]) -> None:
     positive propositions and every use of a helper elsewhere is an unclean leaf."""
     for kw, name, sig, body, _start in _declarations(toks):
         others = helpers - {name}
-        if not any(_is_atom(t) or t in others for t, _ in sig + body):
-            continue
         scanner = PolarityScanner(path, others)
+        if not any(_is_atom(tok[0]) or scanner._is_helper(tok[0]) for tok in sig + body):
+            continue
         i, colon = 0, None
         while i < len(sig):
             t = sig[i][0]
             if t in OPEN:
                 end = _group_end(sig, i)
                 group = sig[i + 1:end - 1]
-                c = next((k for k, (g, _) in enumerate(group) if g == ":"), None)
-                if c is not None:
-                    scanner.analyze(group[c + 1:], "neg", True)
-                elif scanner._mentions(group, 0):
-                    raise GuardViolation("6a", "assumesHold in an unclean binder", path, group[0][1])
+                scanner._analyze_binder_group(group, "neg", True, 0)
                 i = end
                 continue
             if t == ":" and colon is None:
@@ -708,8 +818,8 @@ def scan_polarity(path: str, toks: list, helpers: set[str]) -> None:
             i += 1
         if colon is not None:
             scanner.analyze(sig[colon + 1:], "pos")
-        if kw in ("def", "abbrev") and any(_is_atom(t) for t, _ in body):
-            PolarityScanner(path, helpers - {name}).analyze(body, "pos")
+        if kw in ("def", "abbrev", "opaque") and any(_is_atom(tok[0]) or scanner._is_helper(tok[0]) for tok in body):
+            PolarityScanner(path, others).analyze(body, "pos")
 
 
 def _doc_tag(text: str, end: int, tag: str) -> bool:
@@ -717,7 +827,8 @@ def _doc_tag(text: str, end: int, tag: str) -> bool:
     `private` / `protected` modifiers) carries `tag`."""
     prefix = text[max(0, end - 4096):end]
     while True:
-        trimmed = re.sub(r"(?:@\[[^\]]*\]|\bprivate|\bprotected|\bnoncomputable)\s*$", "", prefix.rstrip())
+        trimmed = re.sub(r"(?:@\[[^\]]*\]|\bprivate|\bprotected|\bnoncomputable|\bpartial|\bunsafe|\blocal|\bscoped)\s*$",
+                         "", prefix.rstrip())
         if trimmed == prefix.rstrip():
             prefix = trimmed
             break
@@ -728,102 +839,451 @@ def _doc_tag(text: str, end: int, tag: str) -> bool:
     return start >= 0 and re.search(rf"{re.escape(tag)}\b", prefix[start:]) is not None
 
 
+_SCOPE_STOPS = DECL_KEYWORDS | COMMAND_STOPS | _DECL_MODIFIERS | {"@"}
+
+
+def _sig_bound_names(sig: list) -> set[str]:
+    """Parameter names introduced by binders in a declaration signature."""
+    names: set[str] = set()
+    i = 0
+    while i < len(sig):
+        t = sig[i][0]
+        if t in ("(", "{", "[", "⦃"):
+            end = _group_end(sig, i)
+            inner = sig[i + 1:end - 1]
+            for tok in inner:
+                if tok[0] == ":":
+                    break
+                if re.fullmatch(r"[A-Za-z_][\w']*", tok[0]):
+                    names.add(tok[0])
+            i = end
+            continue
+        if t == ":":
+            break
+        i += 1
+    return names
+
+
+def _return_type_heads(sig: list) -> set[str]:
+    """Candidate head type names of a declaration's codomain (after top-level `:` and arrows)."""
+    i, colon = 0, None
+    while i < len(sig):
+        if sig[i][0] in OPEN:
+            i = _group_end(sig, i)
+            continue
+        if sig[i][0] == ":":
+            colon = i
+            break
+        i += 1
+    if colon is None:
+        return set()
+    ret = sig[colon + 1:]
+    # Peel top-level arrows `A → B` and binders `∀ ..., B` to reach the final codomain.
+    while ret:
+        split_at = None
+        k = 0
+        while k < len(ret):
+            if ret[k][0] in OPEN:
+                k = _group_end(ret, k)
+                continue
+            if ret[k][0] in ("→", "->", ","):
+                split_at = k
+            k += 1
+        if split_at is None:
+            break
+        ret = ret[split_at + 1:]
+    while ret and ret[0][0] in OPEN and _group_end(ret, 0) == len(ret):
+        ret = ret[1:-1]
+    if not ret:
+        return set()
+    head = ret[0][0]
+    return {head, head.split(".")[-1]}
+
+
+def _has_struct_literal_or_anon_ctor(body: list, return_is_sealed: bool, sealed_types: set[str]) -> int | None:
+    """Return line number if `body` constructs a sealed structure via `⟨...⟩` or `{ ... := ... }`."""
+    def check_slice(toks: list, allow_return: bool) -> int | None:
+        i = 0
+        while i < len(toks):
+            t, line = toks[i][0], toks[i][1]
+            if t == "⟨":
+                end = _group_end(toks, i)
+                if allow_return:
+                    return line
+                # Explicit type ascription `(⟨...⟩ : R)` inside parent group
+                if end < len(toks) and toks[end][0] == ":" and end + 1 < len(toks):
+                    ty = toks[end + 1][0]
+                    if ty in sealed_types or ty.split(".")[-1] in sealed_types:
+                        return line
+                sub = check_slice(toks[i + 1:end - 1], False)
+                if sub is not None:
+                    return sub
+                i = end
+                continue
+            if t == "{":
+                end = _group_end(toks, i)
+                inner = toks[i + 1:end - 1]
+                # Structure literal `{ field := val }` or `{ x with field := val }`
+                is_struct_lit = False
+                k = 0
+                explicit_ty = None
+                while k < len(inner):
+                    if inner[k][0] in OPEN:
+                        k = _group_end(inner, k)
+                        continue
+                    if inner[k][0] in (":=", "with"):
+                        is_struct_lit = True
+                    elif inner[k][0] == ":" and k + 1 < len(inner):
+                        explicit_ty = inner[k + 1][0]
+                    k += 1
+                if is_struct_lit:
+                    if allow_return:
+                        return line
+                    if explicit_ty and (explicit_ty in sealed_types or explicit_ty.split(".")[-1] in sealed_types):
+                        return line
+                    if end < len(toks) and toks[end][0] == ":" and end + 1 < len(toks):
+                        ty = toks[end + 1][0]
+                        if ty in sealed_types or ty.split(".")[-1] in sealed_types:
+                            return line
+                sub = check_slice(inner, False)
+                if sub is not None:
+                    return sub
+                i = end
+                continue
+            if t in OPEN:
+                end = _group_end(toks, i)
+                # Preserve `allow_return` if parens wrap the whole expression or `(expr : R)`
+                sub_allow = allow_return and (i == 0 and end == len(toks))
+                sub = check_slice(toks[i + 1:end - 1], sub_allow)
+                if sub is not None:
+                    return sub
+                i = end
+                continue
+            i += 1
+        return None
+    return check_slice(body, return_is_sealed)
+
+
 def scan_sealing(path: str, text: str) -> None:
     """Guard 6b over one file: `@invariant` structures need `private <ctor> ::`, no
     `Inhabited` derivation or instance, no `extends` carrier, and no public declaration
-    (other than an `@smart_constructor`) that reaches the raw constructor."""
+    (other than an `@smart_constructor`) that reaches the raw constructor (directly, via
+    `abbrev` type/constructor aliases, via `private` helpers, or via `⟨...⟩`/`{...}`)."""
     clean = strip_lean_comments(text)
+    toks = _tokenize_rich(text)
+
+    def scope_at(limit: int, decl_start: int | None = None) -> tuple[list[str], set[str], dict[str, str], set[str]]:
+        """Namespace stack, opened namespaces, `open ... renaming` map, and explicit open ids."""
+        frames: list[list[str]] = []
+        opened: set[str] = set()
+        renamed: dict[str, str] = {}
+        explicit_ids: set[str] = set()
+        i, depth = 0, 0
+        while i < limit:
+            t = toks[i][0]
+            if t in OPEN:
+                depth += 1
+                i += 1
+                continue
+            if t in CLOSE:
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth > 0:
+                i += 1
+                continue
+            if t == "namespace" and i + 1 < limit:
+                frames.append(toks[i + 1][0].split("."))
+                i += 2
+                continue
+            if t == "end":
+                if frames:
+                    if i + 1 < limit and toks[i + 1][0] not in _SCOPE_STOPS and toks[i + 1][1] == toks[i][1]:
+                        end_parts = toks[i + 1][0].split(".")
+                        if frames[-1] == end_parts:
+                            frames.pop()
+                        i += 2
+                        continue
+                    frames.pop()
+                i += 1
+                continue
+            if t == "open":
+                j = i + 1
+                cur_opened: set[str] = set()
+                cur_renamed: dict[str, str] = {}
+                cur_explicit: set[str] = set()
+                saw_in = False
+                in_idx = None
+                while j < limit:
+                    tj = toks[j][0]
+                    if tj == "scoped":
+                        j += 1
+                        continue
+                    if tj == "in":
+                        saw_in = True
+                        in_idx = j
+                        j += 1
+                        break
+                    if tj in _SCOPE_STOPS:
+                        break
+                    if tj == "renaming":
+                        k = j + 1
+                        while k + 2 < limit and toks[k][0] not in _SCOPE_STOPS and toks[k][0] != "in":
+                            if toks[k][0] == ",":
+                                k += 1
+                                continue
+                            if toks[k + 1][0] in ("→", "->"):
+                                cur_renamed[toks[k + 2][0]] = toks[k][0]
+                                k += 3
+                            else:
+                                k += 1
+                        j = k
+                        continue
+                    if tj == "(":
+                        end_p = _group_end(toks, j)
+                        for p in range(j + 1, min(end_p - 1, limit)):
+                            if re.fullmatch(r"[A-Za-z_][\w']*", toks[p][0]):
+                                cur_explicit.add(toks[p][0])
+                        j = end_p
+                        continue
+                    cur_opened.add(tj)
+                    cur_opened.add(tj.split(".")[-1])
+                    j += 1
+                if saw_in:
+                    # `open ... in` scopes ONLY the immediately following declaration.
+                    if decl_start is not None and in_idx is not None:
+                        between = [toks[m][0] for m in range(in_idx + 1, decl_start)]
+                        # Allow modifiers and @[...] attributes between `in` and decl keyword.
+                        k = 0
+                        ok = True
+                        while k < len(between):
+                            if between[k] in _DECL_MODIFIERS:
+                                k += 1
+                            elif between[k] == "@" and k + 1 < len(between) and between[k + 1] == "[":
+                                k += 2
+                                d = 1
+                                while k < len(between) and d > 0:
+                                    if between[k] == "[":
+                                        d += 1
+                                    elif between[k] == "]":
+                                        d -= 1
+                                    k += 1
+                            else:
+                                ok = False
+                                break
+                        if ok:
+                            opened |= cur_opened
+                            renamed.update(cur_renamed)
+                            explicit_ids |= cur_explicit
+                else:
+                    opened |= cur_opened
+                    renamed.update(cur_renamed)
+                    explicit_ids |= cur_explicit
+                i = j
+                continue
+            i += 1
+        ns_flat = [seg for frame in frames for seg in frame]
+        return ns_flat, opened, renamed, explicit_ids
+
+    # Map character offset -> token index for namespace lookup of `@invariant` structures.
     sealed: dict[str, str] = {}
     for match in re.finditer(r"\b(structure|class)\s+([A-Za-z_][\w.']*)", clean):
         if not _doc_tag(text, match.start(), "@invariant"):
             continue
-        name = match.group(2)
+        raw_name = match.group(2)
+        tok_idx = next((idx for idx, (_, _, off) in enumerate(toks) if off >= match.start()), len(toks))
+        ns_flat, _, _, _ = scope_at(tok_idx)
+        full_name = ".".join(ns_flat + [raw_name]) if ns_flat else raw_name
         line = clean.count("\n", 0, match.start()) + 1
         body_end = re.search(r"\n(?=\S)(?!deriving\b)", clean[match.end():])
         decl = clean[match.start(): match.end() + (body_end.start() if body_end else len(clean))]
-        ctor = re.search(r"\b(private\s+)?([A-Za-z_][\w']*)\s*::", decl)
+        ctor = re.search(r"\bwhere\s+(private\s+)?([A-Za-z_][\w']*)\s*::", decl)
         if ctor is None or not ctor.group(1):
-            raise GuardViolation("6b", f"invariant structure {name} lacks `private <ctor> ::`", path, line)
-        if re.search(r"\bderiving\b[^\n]*\bInhabited\b", decl):
-            raise GuardViolation("6b", f"invariant structure {name} derives Inhabited", path, line)
-        sealed[name] = ctor.group(2)
+            raise GuardViolation("6b", f"invariant structure {full_name} lacks `private <ctor> ::`", path, line)
+        if re.search(r"\bderiving\b[\s\S]*?\bInhabited\b", decl):
+            raise GuardViolation("6b", f"invariant structure {full_name} derives Inhabited", path, line)
+        sealed[full_name] = ctor.group(2)
     if not sealed:
         return
-    short = {n.split(".")[-1]: n for n in sealed}
-    for match in re.finditer(r"\bderiving\s+instance\b[^\n]*\bInhabited\b[^\n]*\bfor\b([^\n]*)", clean):
-        if any(re.search(rf"\b{re.escape(s)}\b", match.group(1)) for s in short):
+
+    # Map every short/qualified name of a sealed structure to its canonical full name.
+    type_names: dict[str, str] = {}
+    for full in sealed:
+        type_names[full] = full
+        type_names[full.split(".")[-1]] = full
+
+    decls = list(_declarations(toks))
+    # Pass 1: collect transitive `abbrev` type aliases (e.g. `abbrev RAlias := R`).
+    changed = True
+    while changed:
+        changed = False
+        for kw, name, _sig, body, start in decls:
+            if kw != "abbrev" or not name or name in type_names or not body:
+                continue
+            ns_flat, _, _, _ = scope_at(start, start)
+            full_alias = ".".join(ns_flat + [name]) if ns_flat else name
+            if len(body) >= 1 and (body[0][0] in type_names or body[0][0].split(".")[-1] in type_names):
+                # Exclude constructor aliases `R.mk`
+                target = type_names.get(body[0][0]) or type_names.get(body[0][0].split(".")[-1])
+                if target is not None and not any(tok[0] in ("→", "->", "×") for tok in body):
+                    type_names[name] = target
+                    type_names[full_alias] = target
+                    changed = True
+
+    all_sealed_types = set(type_names)
+    for match in re.finditer(r"\bderiving\s+instance\b[\s\S]*?\bInhabited\b[\s\S]*?\bfor\b([^\n;]*)", clean):
+        if any(re.search(rf"\b{re.escape(s)}\b", match.group(1)) for s in all_sealed_types):
             raise GuardViolation("6b", "standalone Inhabited derivation of an invariant structure", path,
                                  clean.count("\n", 0, match.start()) + 1)
-    toks = tokenize(text)
-    abbrevs: dict[str, str] = {}
 
-    def scope_at(limit: int) -> tuple[list[str], set[str], dict[str, str]]:
-        """Namespace stack, opened namespaces, and `open ... renaming` map before token `limit`."""
-        namespaces: list[str] = []
-        opened: set[str] = set()
-        renamed: dict[str, str] = {}
-        i = 0
-        while i < limit:
-            t = toks[i][0]
-            if t == "namespace" and i + 1 < len(toks):
-                namespaces.append(toks[i + 1][0])
-            elif t == "end" and namespaces and i + 1 < len(toks) and toks[i + 1][0] == namespaces[-1]:
-                namespaces.pop()
-            elif t == "open":
-                j = i + 1
-                while j < len(toks) and toks[j][1] == toks[i][1]:
-                    if toks[j][0] == "renaming":
-                        k = j + 1
-                        while k + 2 < len(toks) and toks[k][1] == toks[i][1]:
-                            if toks[k + 1][0] == "→" or toks[k + 1][0] == "->":
-                                renamed[toks[k + 2][0]] = toks[k][0]
-                                k += 3
-                            else:
-                                k += 1
-                        break
-                    opened.add(toks[j][0].split(".")[-1])
-                    j += 1
-            i += 1
-        return namespaces, opened, renamed
-
-    lines = text.split("\n")
-    for kw, name, sig, body, start in _declarations(toks):
-        if kw not in ("def", "abbrev", "instance", "theorem", "opaque") or not body:
-            continue
-        namespaces, opened, renamed = scope_at(start)
-        start_line = (sig[0][1] if sig else body[0][1])
-        line_start = sum(len(x) + 1 for x in lines[: max(0, start_line - 1)])
-        kw_at = text.find(kw, line_start)
-        smart = _doc_tag(text, kw_at if kw_at >= 0 else line_start, "@smart_constructor")
-        sig_text = " ".join(t for t, _ in sig)
-        if kw == "instance" and "Inhabited" in sig_text and any(re.search(rf"\b{re.escape(s)}\b", sig_text) for s in short):
-            raise GuardViolation("6b", "Inhabited instance of an invariant structure", path, start_line)
-        if kw == "abbrev":
-            for s, full in short.items():
-                if any(t in (f"{s}.{sealed[full]}", f"{full}.{sealed[full]}") for t, _ in body):
-                    abbrevs[name] = full
-        if smart:
-            continue
-        bound = {sig[k + 1][0] for k in range(len(sig) - 1) if sig[k][0] in ("(", "{", "[")}
-        bound |= {body[k + 1][0] for k in range(len(body) - 1) if body[k][0] in ("fun", "λ", "let")}
-        for t, line in body:
-            last = t.split(".")[-1]
-            hit = False
-            for s, full in short.items():
-                ctor = sealed[full]
-                if t in (f"{s}.{ctor}", f"{full}.{ctor}") or t in abbrevs:
-                    hit = True
-                elif t == ctor and t not in bound and (s in opened or any(ns.split(".")[-1] == s for ns in namespaces)):
-                    hit = True
-                elif t in renamed and renamed[t] == ctor and t not in bound:
-                    hit = True
-            if hit or (last != t and last in renamed and renamed[last] in sealed.values() and t not in bound):
-                raise GuardViolation("6b", f"public declaration {name or kw} reaches a sealed raw constructor",
-                                     path, line)
-    for match in re.finditer(r"\bstructure\s+([A-Za-z_][\w.']*)[^\n]*\bextends\b([^\n]*)", clean):
-        if any(re.search(rf"\b{re.escape(s)}\b", match.group(2)) for s in short) and not _doc_tag(text, match.start(), "@invariant"):
+    for match in re.finditer(r"\b(?:structure|class)\s+([A-Za-z_][\w.']*)(?:[^\n]|\n[ \t]+)*?\bextends\b([^\n]*)", clean):
+        if any(re.search(rf"\b{re.escape(s)}\b", match.group(2)) for s in all_sealed_types) and not _doc_tag(
+            text, match.start(), "@invariant"
+        ):
             raise GuardViolation("6b", f"carrier structure {match.group(1)} extends an invariant structure", path,
                                  clean.count("\n", 0, match.start()) + 1)
+
+    def body_reaches_sealed(body: list, sig: list, scope_info, ctor_aliases: set[str],
+                            private_fwd: set[str]) -> int | None:
+        ns_flat, opened, renamed, explicit_ids = scope_info
+        sealed_ctors = set(sealed.values())
+        direct_ctors: set[str] = set()
+        for alias_ty, full in type_names.items():
+            ctor = sealed[full]
+            direct_ctors.add(f"{alias_ty}.{ctor}")
+            direct_ctors.add(f"{full}.{ctor}")
+
+        def token_hits(t: str, bound: set[str]) -> bool:
+            if t in bound:
+                return False
+            last = t.split(".")[-1]
+            if t in direct_ctors or t in ctor_aliases or last in ctor_aliases:
+                return True
+            if t in private_fwd or last in private_fwd:
+                return True
+            # Qualified `Ns.R.mk` matching a sealed `(full, ctor)` suffix
+            for alias_ty, full in type_names.items():
+                ctor = sealed[full]
+                if t.endswith(f".{alias_ty}.{ctor}") or t.endswith(f".{full}.{ctor}"):
+                    return True
+                if t == ctor:
+                    short_ty = full.split(".")[-1]
+                    if (alias_ty in opened or full in opened or short_ty in opened
+                            or short_ty in ns_flat or ctor in explicit_ids):
+                        return True
+                if t in renamed and renamed[t] == ctor:
+                    return True
+            if last != t and last in renamed and renamed[last] in sealed_ctors:
+                return True
+            return False
+
+        def walk(toks_slice: list, bound: set[str]) -> int | None:
+            local_bound = set(bound)
+            i = 0
+            while i < len(toks_slice):
+                t, line = toks_slice[i][0], toks_slice[i][1]
+                if t in ("fun", "λ"):
+                    j = i + 1
+                    while j < len(toks_slice) and toks_slice[j][0] not in ("=>", "↦"):
+                        if toks_slice[j][0] in OPEN:
+                            end_g = _group_end(toks_slice, j)
+                            for tok in toks_slice[j + 1:end_g - 1]:
+                                if tok[0] == ":":
+                                    break
+                                if re.fullmatch(r"[A-Za-z_][\w']*", tok[0]):
+                                    local_bound.add(tok[0])
+                            j = end_g
+                        else:
+                            if re.fullmatch(r"[A-Za-z_][\w']*", toks_slice[j][0]):
+                                local_bound.add(toks_slice[j][0])
+                            j += 1
+                    i = j + 1
+                    continue
+                if t == "let" and i + 1 < len(toks_slice) and re.fullmatch(r"[A-Za-z_][\w']*", toks_slice[i + 1][0]):
+                    let_name = toks_slice[i + 1][0]
+                    eq = None
+                    j = i + 2
+                    while j < len(toks_slice):
+                        if toks_slice[j][0] == ":=":
+                            eq = j
+                            break
+                        j = _group_end(toks_slice, j) if toks_slice[j][0] in OPEN else j + 1
+                    if eq is not None:
+                        end_rhs, k = len(toks_slice), eq + 1
+                        while k < len(toks_slice):
+                            tk, ln = toks_slice[k][0], toks_slice[k][1]
+                            if tk in (";", "in") or (k > eq + 1 and ln > toks_slice[k - 1][1]):
+                                end_rhs = k
+                                break
+                            k = _group_end(toks_slice, k) if tk in OPEN else k + 1
+                        # Check RHS BEFORE adding `let_name` to `local_bound`.
+                        hit = walk(toks_slice[eq + 1:end_rhs], local_bound)
+                        if hit is not None:
+                            return hit
+                        local_bound.add(let_name)
+                        i = end_rhs + (1 if end_rhs < len(toks_slice) and toks_slice[end_rhs][0] in (";", "in") else 0)
+                        continue
+                if t in OPEN:
+                    end_g = _group_end(toks_slice, i)
+                    hit = walk(toks_slice[i + 1:end_g - 1], local_bound)
+                    if hit is not None:
+                        return hit
+                    i = end_g
+                    continue
+                if token_hits(t, local_bound):
+                    return line
+                i += 1
+            return None
+
+        hit = walk(body, _sig_bound_names(sig))
+        if hit is not None:
+            return hit
+        ret_is_sealed = bool(_return_type_heads(sig) & all_sealed_types)
+        return _has_struct_literal_or_anon_ctor(body, ret_is_sealed, all_sealed_types)
+
+    # Pass 2: fixed-point collection of `ctor_aliases` (`abbrev`) and `private_forwarders`.
+    ctor_aliases: set[str] = set()
+    private_forwarders: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for kw, name, sig, body, start in decls:
+            if kw not in ("def", "abbrev", "instance", "theorem", "opaque") or not body or not name:
+                continue
+            scope_info = scope_at(start, start)
+            ns_flat = scope_info[0]
+            full_name = ".".join(ns_flat + [name]) if ns_flat else name
+            is_priv = _is_private_decl(toks, start)
+            if kw == "abbrev" and name not in ctor_aliases:
+                if body_reaches_sealed(body, sig, scope_info, ctor_aliases, private_forwarders) is not None:
+                    ctor_aliases.add(name)
+                    ctor_aliases.add(full_name)
+                    changed = True
+            if is_priv and name not in private_forwarders:
+                if body_reaches_sealed(body, sig, scope_info, ctor_aliases, private_forwarders) is not None:
+                    private_forwarders.add(name)
+                    private_forwarders.add(full_name)
+                    changed = True
+
+    # Pass 3: enforce sealing on every public non-`@smart_constructor` declaration.
+    for kw, name, sig, body, start in decls:
+        if kw not in ("def", "abbrev", "instance", "theorem", "opaque") or not body:
+            continue
+        start_line, kw_offset = toks[start][1], toks[start][2]
+        sig_text = " ".join(tok[0] for tok in sig)
+        if kw == "instance" and "Inhabited" in sig_text and any(
+            re.search(rf"\b{re.escape(s)}\b", sig_text) for s in all_sealed_types
+        ):
+            raise GuardViolation("6b", "Inhabited instance of an invariant structure", path, start_line)
+        if _is_private_decl(toks, start):
+            continue
+        if _doc_tag(text, kw_offset, "@smart_constructor"):
+            continue
+        scope_info = scope_at(start, start)
+        hit_line = body_reaches_sealed(body, sig, scope_info, ctor_aliases, private_forwarders)
+        if hit_line is not None:
+            raise GuardViolation("6b", f"public declaration {name or kw} reaches a sealed raw constructor",
+                                 path, hit_line)
 
 
 def scan_peer_guards(paths: list[Path], root: Path = REPO_ROOT) -> dict:
@@ -832,13 +1292,21 @@ def scan_peer_guards(paths: list[Path], root: Path = REPO_ROOT) -> dict:
     for p in paths:
         files += sorted(p.rglob("*.lean")) if p.is_dir() else [p]
     texts = {str(f.relative_to(root) if f.is_relative_to(root) else f): f.read_text(encoding="utf-8") for f in files}
-    # Only files that mention the atom can define helpers; only files that mention the atom
-    # or a helper need the polarity scan; only `@invariant` files need the sealing scan.
+    # Fixed-point expansion so multi-file transitive helper chains (FileA -> FileB -> FileC)
+    # are always discovered and checked.
     tokens = {label: tokenize(text) for label, text in texts.items() if any(a in text for a in ASSUMPTION_ATOMS)}
-    helpers = assumption_helpers(tokens)
+    helpers: set[str] = set()
+    while True:
+        new_helpers = assumption_helpers(tokens)
+        added_files = False
+        for label, text in texts.items():
+            if label not in tokens and any(h.split(".")[-1] in text for h in new_helpers):
+                tokens[label] = tokenize(text)
+                added_files = True
+        if new_helpers == helpers and not added_files:
+            break
+        helpers = new_helpers
     for label, text in texts.items():
-        if label not in tokens and any(h.split(".")[-1] in text for h in helpers):
-            tokens[label] = tokenize(text)
         if label in tokens:
             scan_polarity(label, tokens[label], helpers)
         if "@invariant" in text:
