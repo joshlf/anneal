@@ -5132,7 +5132,7 @@ def populateSinglePtrParamMemory
   | .ref mutbl pointee | .rawPtr mutbl pointee =>
     match mem with
     | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
       match isWidePointee pointee with
       | false =>
         match argVal with
@@ -5194,7 +5194,7 @@ def populateSinglePtrParamMemory
                         relocations := []
                         align := { bytes := 8 }
                         mutability := mutbl } :: globals
-                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs, exposedAllocIds⟩
+                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
           else
             mem
         | _ => mem
@@ -5264,7 +5264,7 @@ def populateSinglePtrParamMemory
                         relocations := []
                         align := { bytes := 8 }
                         mutability := mutbl } :: globals
-                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs, exposedAllocIds⟩
+                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
           else
             mem
         | _, _ => mem
@@ -5463,11 +5463,11 @@ def decodeRawByteTrace
         rawTrace.initMem
     with
     | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
       some {
         args := args
         initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
         inlinedCallees := rawTrace.inlinedCallees
         events := events
         outcome := outcome
@@ -6586,11 +6586,11 @@ def diagnoseRawByteTraceBounded
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
           diagnoseObservedTraceBounded fuel checkBranches rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome
@@ -6649,11 +6649,11 @@ def diagnoseRawByteTraceWithCalleesBounded
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
           diagnoseObservedTraceWithCalleesBounded fuel checkBranches rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome
@@ -7530,11 +7530,11 @@ def diagnoseRawByteTraceBoundedFast
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
           diagnoseObservedTraceBoundedFast fuel checkBranches rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome
@@ -7576,11 +7576,11 @@ def diagnoseRawByteTraceWithCalleesBoundedFast
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
           diagnoseObservedTraceWithCalleesBoundedFast fuel checkBranches rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome
@@ -10003,11 +10003,11 @@ def diagnoseRawByteTraceFull (rootBody : CapturedMir) (calleeSigs : List Capture
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
           diagnoseFullObservedTrace rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome
@@ -10036,11 +10036,11 @@ def diagnoseRawByteTraceFullFast (rootBody : CapturedMir) (calleeSigs : List Cap
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
           diagnoseFullObservedTraceFast rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome
@@ -10093,11 +10093,11 @@ def diagnoseRawByteTraceWithCalleesFull (rootBody : CapturedMir)
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
           diagnoseFullObservedTraceWithCallees rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome
@@ -10128,11 +10128,11 @@ def diagnoseRawByteTraceWithCalleesFullFast (rootBody : CapturedMir)
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩ =>
           diagnoseFullObservedTraceWithCalleesFast rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome

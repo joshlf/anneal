@@ -2296,14 +2296,16 @@ pub fn early_ret_ep2_live(b_static: &'static [u8], flag: bool) -> u32 {
 /// 1 of a `PaddedU8U32` through `(&raw const s) as *const u8` and
 /// `offset(base, 1isize)` (`model-checking/kani#5183`) compiles, faults in Miri on
 /// the uninitialized byte, and agrees with Anneal's strict UB at the same read;
-/// its `Pass` multi-element `copy_nonoverlapping` template (whole-array pointer
-/// casts) compiles and agrees on the returned value. The template's former
-/// element sub-place form (`&raw const __cp_src[0]`) stays a negative control: a
-/// kernel-confirmed `wrong_value` divergence (Anneal copies only the first
-/// element), so this test fails once `trusted/` fixes it and the restriction can
-/// be lifted.
+/// its `Pass` multi-element `copy_nonoverlapping` template copies between
+/// *element* sub-places (`&raw const __cp_src[0]`, `&raw mut __cp_dst[0]`),
+/// compiles, and agrees on the returned value. That form was a kernel-confirmed
+/// `wrong_value` divergence (Anneal copied only the first element) until
+/// `trusted/` copied `count * size_of::<T>()` bytes for a sub-place
+/// `copy_nonoverlapping`; the former negative control
+/// `neg_ctrl_raw_ptr_elem_subplace_copy__b0_c2` now pins the fixed value: Miri and
+/// Anneal both return `22 ^ 99 = 117`, with no finding.
 #[test]
-fn raw_ptr_offset_padding_read_and_whole_array_copy_templates_agree_with_miri() {
+fn raw_ptr_offset_padding_read_and_elem_subplace_copy_templates_agree_with_miri() {
     let dir = unique_temp_dir("raw_ptr_pad_templates");
     let root = repo_root();
     let padding = template_candidate(
@@ -2326,12 +2328,16 @@ fn raw_ptr_offset_padding_read_and_whole_array_copy_templates_agree_with_miri() 
         1,
         &RawPtrOffsetMutator,
         MutationMode::Pass,
-        "let __src_p: *const u32 = (&raw const __cp_src) as *const u32;",
+        "let __src_p: *const u32 = &raw const __cp_src[0];",
         &[],
     );
     assert!(
         copy.fn_source
-            .contains("copy_nonoverlapping(__src_p, __dst_p, 2usize);"),
+            .contains("let __dst_p: *mut u32 = &raw mut __cp_dst[0];")
+            && copy
+                .fn_source
+                .contains("copy_nonoverlapping(__src_p, __dst_p, 2usize);")
+            && !copy.fn_source.contains("as *const u32"),
         "{}",
         copy.fn_source
     );
@@ -2389,47 +2395,49 @@ fn raw_ptr_offset_padding_read_and_whole_array_copy_templates_agree_with_miri() 
         pad.anneal
     );
 
+    // The template's two source elements are drawn from fixed tables, so the copied
+    // pair is never `[x, 0]`-indistinguishable: the returned `src[0] ^ src[1]`
+    // differs from the first-element truncation `src[0]`.
     let cp = item("ep2_template__b0_c1");
     assert!(
         matches!(cp.verdict, ComparisonVerdict::Agree)
-            && matches!(cp.miri, MiriOutcome::PassScalar { size_bytes: 4, .. }),
-        "the whole-array copy template must return normally and agree: verdict={:?} \
+            && matches!(
+                (&cp.miri, &cp.anneal),
+                (
+                    MiriOutcome::PassScalar { bits: miri_bits, size_bytes: 4 },
+                    AnnealOutcome::PassScalar { bits: anneal_bits, size_bytes: 4 },
+                ) if miri_bits == anneal_bits
+            ),
+        "the element sub-place copy template must return normally and agree: verdict={:?} \
          miri={:?} anneal={:?}",
         cp.verdict,
         cp.miri,
         cp.anneal
     );
 
-    let gap = item(neg_name);
+    let fixed = item(neg_name);
     assert!(
-        matches!(
-            gap.verdict,
-            ComparisonVerdict::Diverge(DivergenceKind::WrongValue { .. })
-        ) && gap.miri
-            == MiriOutcome::PassScalar {
-                bits: 117,
-                size_bytes: 4,
-            }
-            && gap.anneal
-                == AnnealOutcome::PassScalar {
-                    bits: 22,
+        matches!(fixed.verdict, ComparisonVerdict::Agree)
+            && fixed.miri
+                == MiriOutcome::PassScalar {
+                    bits: 117,
                     size_bytes: 4,
                 }
-            && gap.kernel_confirmed,
-        "the element sub-place copy gap changed (fixed?): verdict={:?} miri={:?} anneal={:?} \
-         kernel_confirmed={}; lift the `RawPtrOffsetMutator` copy-template restriction and \
-         update `probe_gap_subplace_multi_elem_copy` in `miri_eval.rs`",
-        gap.verdict,
-        gap.miri,
-        gap.anneal,
-        gap.kernel_confirmed
+            && fixed.anneal
+                == AnnealOutcome::PassScalar {
+                    bits: 117,
+                    size_bytes: 4,
+                },
+        "the element sub-place copy regressed: Miri and Anneal must both copy both elements \
+         of `[22, 99]` and return 117 (a first-element truncation returns 22): verdict={:?} \
+         miri={:?} anneal={:?}; see `probe_gap_subplace_multi_elem_copy` in `miri_eval.rs`",
+        fixed.verdict,
+        fixed.miri,
+        fixed.anneal
     );
-    assert_eq!(report.agree_count, 2, "{:#?}", report.findings);
-    assert_eq!(report.diverge_count, 1, "{:#?}", report.findings);
-    assert_eq!(
-        report.findings.iter().map(|f| f.divergence_class.as_str()).collect::<Vec<_>>(),
-        vec!["wrong_value"]
-    );
+    assert_eq!(report.agree_count, 3, "{:#?}", report.findings);
+    assert_eq!(report.diverge_count, 0, "{:#?}", report.findings);
+    assert!(report.findings.is_empty(), "{:#?}", report.findings);
 }
 
 /// Seed whose unmutated program diverges (`missed_ub`) independently of any
@@ -3683,11 +3691,11 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
     let mut conservative_gaps = 0usize;
     let mut location_gaps = 0usize;
 
-    // Same-tag disjoint copies across `copyViaBytes` (`&raw mut arr[0]` / `&raw mut
-    // pair.a`), `sameContainer` (`(&raw mut arr) as *mut u8` on `[u8; 8]`),
-    // whole-struct casts, and both forward (`src < dst`) and backward (`dst < src`)
-    // directions: Miri returns the copied value; Anneal reports UB at the
-    // `copy_nonoverlapping` or, once fixed, agrees.
+    // Same-tag disjoint copies across `copySliceElements` (`&raw mut arr[0]` on
+    // `[u32; 4]`, `(&raw mut arr) as *mut u8` on `[u8; 8]`), `copyBytesSubplace`
+    // (`&raw mut pair.a` and whole-struct casts), and both forward (`src < dst`)
+    // and backward (`dst < src`) directions: Miri returns the copied value; Anneal
+    // reports UB at the `copy_nonoverlapping` or, once fixed, agrees.
     let probe_header = |probe: &str| format!("pub fn {probe}() -> u32 {{");
     for (name, header, bits, copy) in [
         (
@@ -3809,9 +3817,9 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
         }
     }
 
-    // True same-tag overlaps on both `[u32; 4]` (`copyViaBytes`) and `[u8; 8]`
-    // (`sameContainer`) must stay UB at the copy in both Miri and Anneal, so the
-    // pins above cannot hold because Anneal stopped checking overlap.
+    // True same-tag overlaps on both `[u32; 4]` and `[u8; 8]` (`copySliceElements`)
+    // must stay UB at the copy in both Miri and Anneal, so the pins above cannot
+    // hold because Anneal stopped checking overlap.
     for (ctrl_name, copy_stmt) in [
         (
             "c16_same_tag_overlap_control",

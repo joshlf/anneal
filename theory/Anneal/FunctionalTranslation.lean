@@ -710,14 +710,15 @@ def inspectBinarySwitch
           match bb.terminator.kind with
           | .switchInt discr { branches := [(matchVal, elseBb)], otherwise := thenBb } =>
             match
-              evalOperand
+              evalOperandWithBodyCast
                 s.frame.locals
                 discr
                 s.memory.borrows
                 s.memory.globals
                 currentBody.layouts
                 s.memory.callerLocals
-                (callStack := s.memory.callStack)
+                currentBody.localDecls
+                s.memory.callStack
             with
             | .ok (.scalar sc) locals' =>
               let cond := !(Nat.beq sc.bits matchVal)
@@ -774,16 +775,17 @@ theorem stepMirFn_of_inspectBinarySwitch
                   dsimp only at h
                   unfold evalTerminator
                   rw [h_tk]
-                  dsimp only
+                  dsimp only [bodyLocalDeclsOf]
                   cases h_op :
-                      evalOperand
+                      evalOperandWithBodyCast
                         s.frame.locals
                         discr
                         s.memory.borrows
                         s.memory.globals
                         (s.memory.activeCallee.getD body).layouts
                         s.memory.callerLocals
-                        (callStack := s.memory.callStack) with
+                        (s.memory.activeCallee.getD body).localDecls
+                        s.memory.callStack with
                   | ub => rw [h_op] at h; nomatch h
                   | unsupported => rw [h_op] at h; nomatch h
                   | ok v locals' =>

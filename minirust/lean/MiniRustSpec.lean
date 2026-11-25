@@ -20,6 +20,12 @@ import MiniRustSpec.Correspondence.AnnealEval
 import MiniRustSpec.Correspondence.Simulation
 import MiniRustSpec.Correspondence.Run
 import MiniRustSpec.Correspondence.Witness
+import MiniRustSpec.Correspondence.PointersCore
+import MiniRustSpec.Correspondence.PointersLattice
+import MiniRustSpec.Correspondence.PointersMachineCodec
+import MiniRustSpec.Correspondence.PointersMachineExpr
+import MiniRustSpec.Correspondence.PointersMachineStep
+import MiniRustSpec.Correspondence.PointersMachine
 import MiniRustSpec.Correspondence.Pointers
 import MiniRustSpec.Correspondence.PointerStep
 import MiniRustSpec.Correspondence.PointerWitness
@@ -46,6 +52,9 @@ import MiniRustSpec.Audit
 * `MiniRustSpec.Correspondence.*`: the correspondence between Anneal's MIR
   semantics (`Trusted.Rustc.V2026_06_01`) and that interpretation, with
   non-vacuity witnesses (`Correspondence.Witness`); `Correspondence.Pointers`
+  (with its submodules `Correspondence.PointersCore`, `Correspondence.PointersLattice`,
+  `Correspondence.PointersMachineCodec`, `Correspondence.PointersMachineExpr`,
+  `Correspondence.PointersMachineStep`, and `Correspondence.PointersMachine`)
   and `Correspondence.PointerStep` relate the two semantics on the raw pointer
   and reference statements the fragment admits (`&raw`, `&`, `&mut`,
   reborrowing `&*_p` / `&mut *_p` / `&raw *_p`, pointer copies, and reads and

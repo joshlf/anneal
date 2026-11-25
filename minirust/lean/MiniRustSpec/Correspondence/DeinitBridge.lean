@@ -395,6 +395,8 @@ theorem subplace_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_typed_refines_upToTag
   let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_fnEntry_refines_upToTag
   let _ := @Anneal.Mir.AdtAndControl.witness_trusted_retag_ref_anneal
+  let _ := @Anneal.Mir.AdtAndControl.evalOperandWithBodyCast_eq_evalOperand_nil_of_ok
+  let _ := @Anneal.Mir.AdtAndControl.evalOperandsWithBodyCast_eq_evalOperands_nil_of_ok
   trivial
 
 /-! ## Lowered inline intrinsics (`LIntrinsicOp`) and `MiniRustSpec.Interp` correspondence

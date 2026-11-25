@@ -387,16 +387,17 @@ import LeanMiriSpec.Audit
   lockstep simulation (`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit`,
   `step_intrinsic_copyNonOverlapping_stage1_simulation`,
   `step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap`), Stage-1
-  distinct-local multi-element `copyViaBytes` evaluation
-  (`evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq`,
+  distinct-local full-byte multi-element `evalCopySubplaceMulti` / `copyBytesSubplace`
+  evaluation (`evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq`,
   `stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq`,
   `stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq`,
   `stepMirFn_copyNonOverlapping_stage1_full_bytes_distinct_int_eq_lm4_2`,
+  `copyStage1FullBytesNextAllocMap`,
   `step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`), Stage-1
   uninitialized-source and Tree Borrows divergences
   (`step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence`,
   `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), Stage-1
-  provenance preservation across `evalCopySingleDirect` and byte-codec `copyViaBytes`
+  provenance preservation across `evalCopySingleDirect` and the byte codec
   (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`,
   `encodeUntypedValueToBytes_ptr_decode_roundtrip`) plus the `TyId 80` boundary
   (`step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported`: `encodeRawPtrTyId`
@@ -411,13 +412,15 @@ import LeanMiriSpec.Audit
   (`core::intrinsics::wrapping_offset` and `std::intrinsics::*`, which
   `rustc-capture` never emits and Stage-1 routes to `MirStepNode.extCall`).
 * `LeanMiriSpec.Correspondence.WitLM4_2`: concrete Stage-1 lockstep (including
-  full-byte multi-element `copyViaBytes`), Stage-1 boundary (`extCall`,
-  `Stage1ExtraIntrinsic`, and 5-step lockstep `TyId 80` pointer-valued
+  distinct-local out-of-bounds UB via `copyAccessFitsAlloc?` and full-byte
+  multi-element `copyBytesSubplace`), Stage-1 boundary (`extCall`,
+  `Stage1ExtraIntrinsic`, multi-byte partial scalar `copy_nonoverlapping`
+  `MirStepNode.unsupported`, and 5-step lockstep `TyId 80` pointer-valued
   `copy_nonoverlapping` on initialized pointer operands), and Stage-1 divergence
-  witnesses for `LM-4.2` (Stage-1 `Trusted` accepts zero-count misaligned and
-  out-of-bounds `copy_nonoverlapping`, rejects same-tag disjoint copies, stores
-  ill-sized values on cross-type copies, clobbers the whole destination on partial
-  distinct-local copies in 5-step lockstep, and rejects provenance-free `.scalar`
+  witnesses for `LM-4.2` (Stage-1 `Trusted` accepts zero-count misaligned
+  `copy_nonoverlapping`, rejects same-tag disjoint copies, stores ill-sized values
+  on cross-type copies, clobbers the whole destination on `count = 1` cross-width
+  copies in 5-step lockstep, and rejects provenance-free `.scalar`
   pointers in `arith_offset`).
 * `LeanMiriSpec.Correspondence.Safety`: whole-program `Miri.OperationalSafety.System`
   semantics of `lean-miri`'s `RunLoop` (`miriSystem`), the step-closed simulation

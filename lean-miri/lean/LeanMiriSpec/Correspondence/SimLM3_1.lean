@@ -21985,6 +21985,7 @@ theorem step_terminator_switchInt_lm3_1_simulation
   unfold evalTerminator
   rw [hterm, hstate.callStack_nil, hm_term]
   dsimp only []
+  rw [(hdiscr topFrame hframes).evalOperandWithBodyCast_eq]
   rcases evalOperand_scalar_lm3_1_simulation hstate hframes (hdiscr topFrame hframes) hprim none with
     ⟨m', msg, ha_ub, hm_ub⟩ |
     ⟨sc, msc, tf', ha_ok, hm_ok, hstate', himm, _, _⟩
@@ -22088,6 +22089,7 @@ theorem step_terminator_assert_lm3_1_simulation
   unfold evalTerminator
   rw [hterm, hstate.callStack_nil, hm_term]
   dsimp only [Miri.Interpreter.ControlFlow.evalTerminator]
+  rw [(hop topFrame hframes).evalOperandWithBodyCast_eq]
   rcases evalOperand_scalar_lm3_1_simulation hstate hframes (hop topFrame hframes)
       (Or.inl hbool) none with
     ⟨m', msg, ha_ub, hm_ub⟩ |

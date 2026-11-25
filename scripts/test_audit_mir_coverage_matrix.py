@@ -88,6 +88,9 @@ MANIFEST_LINES = (
     "-- @mir-variant-coverage ProjectionElem.opaqueCast trusted=opaque_trusted_read "
     "minirust=opaque_minirust leanmiri=opaque_leanmiri_guard positive=opaque_positive "
     "negative=opaque_negative",
+    "-- @mir-variant-coverage NonDivergingIntrinsic.copyNonOverlapping trusted=copy_trusted_resolve "
+    "minirust=copy_minirust_reject leanmiri=copy_leanmiri_order positive=copy_positive "
+    "negative=copy_negative",
 )
 
 # Synthetic stand-in for the correspondence test: satisfies every textual check of (c)/(e).
@@ -134,6 +137,14 @@ theorem opaque_leanmiri_guard : opaqueCastProj < 4 := by decide
 theorem opaque_positive : opaqueCastProj > 2 := by decide
 theorem opaque_negative : opaqueCastProj ≠ 5 := by decide
 
+def copyNonOverlappingStmt : Nat := 5
+
+theorem copy_trusted_resolve : copyNonOverlappingStmt = 5 := rfl
+theorem copy_minirust_reject : copyNonOverlappingStmt ≠ 0 := by decide
+theorem copy_leanmiri_order : copyNonOverlappingStmt < 6 := by decide
+theorem copy_positive : copyNonOverlappingStmt > 4 := by decide
+theorem copy_negative : copyNonOverlappingStmt ≠ 7 := by decide
+
 def banner : String := "strings may say sorry, admit, axiom or native_decide"
 def braceChar : Char := '"'
 
@@ -145,6 +156,8 @@ run_cmd do
   let manifest : List Name := [`cec_trusted_step, `cec_minirust_skip, `cec_leanmiri_noop,
     `cec_positive, `cec_negative, `tail_trusted_frame, `tail_minirust_translate,
     `tail_leanmiri_root, `tail_positive, `tail_negative_arity, `tail_negative_root,
+    `copy_trusted_resolve, `copy_minirust_reject, `copy_leanmiri_order, `copy_positive,
+    `copy_negative,
     `opaque_trusted_read, `opaque_minirust, `opaque_leanmiri_guard, `opaque_positive,
     `opaque_negative]
   for short in manifest do

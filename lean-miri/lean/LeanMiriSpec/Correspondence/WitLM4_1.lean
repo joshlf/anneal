@@ -2500,7 +2500,7 @@ theorem wit_lm4_1_unwindResume_root_panic_vs_ub_divergence :
       (fun _ h => nomatch h) (fun _ h => nomatch h)
       (BorrowTrackerStackRel.of_none _ _ _)
       (BorrowsFrameStackValid.of_empty rfl rfl)
-  exact step_terminator_unwindResume_root_panic_vs_ub_divergence hstate rfl
+  exact step_terminator_unwindResume_root_panic_vs_ub_divergence hstate rfl rfl
     (fun _ h => nomatch h)
     (bb := { statements := [], terminator := mkTerm .unwindResume, isCleanup := true })
     rfl rfl rfl rfl rfl
@@ -2827,7 +2827,7 @@ theorem wit_lm4_1_multiFrame_continue_unwind_and_assert_terminate :
         · cases h
         · rcases List.mem_singleton.mp h1 with rfl; cases h
     have hsim3 :=
-      (step_terminator_unwindResume_multiFrame_simulation hstate3 hwf3
+      (step_terminator_unwindResume_multiFrame_simulation hstate3 hwf3 rfl
         (fun _ h => nomatch h)
         (bb := { statements := [], terminator := mkTerm .unwindResume, isCleanup := true })
         rfl rfl rfl rfl rfl).1 _ rfl

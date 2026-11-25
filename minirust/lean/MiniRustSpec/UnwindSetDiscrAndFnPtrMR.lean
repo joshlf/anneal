@@ -28,7 +28,9 @@ Operational correspondence between Anneal's trusted MIR semantics
    steps (across all four terminal outcomes), `.unreachable` UB, `.terminate`
    abort, and explicit root-frame divergence
    `unwindResume_root_panic_vs_ub_divergence` (Trusted `.halted .panic` vs.
-   MiniRust `BottomOfStack` UB), plus composed
+   MiniRust `BottomOfStack` UB while `Memory.rootUnwindCeiling = true`; once a
+   non-unwinding tail callee cleared the ceiling both fault with UB,
+   `unwindResume_root_cleared_ceiling_ub_agreement`), plus composed
    `StartUnwind -> ResumeUnwind^k -> StopUnwind` on `Mach` and `MachTB`.
 3. **`C3` (`TerminatorKind.unwindTerminate`)**: lockstep `.abort` simulation
    against `buildAbort` (`IntrinsicOp.Abort`, `Stop.abort`) on `Mach` and
@@ -1268,6 +1270,13 @@ def unwindContinueChainMem : List SavedCallerFrame → List SavedCallerFrame →
     unwindContinueChainMem rest tail
       { mem with
         callStack := rest ++ tail, activeCallee := .some caller.callerBody, activeProtectors := restoreCallerProtectors caller }
+/-- Popping `UnwindAction.continue_` caller frames never changes the root unwind ceiling
+(`Memory.rootUnwindCeiling`, `DIV-LM-TAILCALL-NOUNWIND-UNWIND`). -/
+theorem unwindContinueChainMem_rootUnwindCeiling : ∀ (conts tail : List SavedCallerFrame) (mem : MirSemantics.Memory),
+      (unwindContinueChainMem conts tail mem).rootUnwindCeiling = mem.rootUnwindCeiling
+  | [], _, _ => rfl
+  | _ :: rest, tail, mem => by
+    rw [unwindContinueChainMem]; exact unwindContinueChainMem_rootUnwindCeiling rest tail _
 /-- **C2b Exact Closed-Form `.continue_` Multi-Frame Big-Step Law & Coupled
 `1 : k + 1` MiniRust Step Induction (`Mach` & `MachTB`)**. -/
 theorem trusted_unwindFromCallStack_continue_chain : ∀ (conts : List SavedCallerFrame) (tail : List SavedCallerFrame) (mem : MirSemantics.Memory),
@@ -1465,7 +1474,8 @@ theorem unwindResume_continue_chain_fault_and_root_terminals {M : Type} [Gen.Mem
       curFrameM { mCaller with mem := { mCaller.mem with accesses := [] } } = .ok fr →
       mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk → fr.next_stmt = (blk.statements.length : Int) → blk.terminator = buildAbort →
       MirSemantics.evalTerminator s { kind := .unwindResume, span := span } curBody = MirStepNode.retOutcome .abort ∧ stepsM (conts.length + 2) m = .error .abort) ∧
-    (∀ t fr fr1 blk threads' cm1 cm2, s.memory.callStack = conts → mK.threads.any (fun th => decide (th.state = .Enabled)) = true →
+    (∀ t fr fr1 blk threads' cm1 cm2, s.memory.callStack = conts → s.memory.rootUnwindCeiling = true →
+      mK.threads.any (fun th => decide (th.state = .Enabled)) = true →
       pickActiveThreadM { mK with mem := { mK.mem with accesses := [] } } = .ok mK.active_thread →
       activeThreadM { mK with mem := { mK.mem with accesses := [] } } = .ok t → t.stack.getLast? = some fr →
       mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk → fr.next_stmt = (blk.statements.length : Int) → blk.terminator = .ResumeUnwind →
@@ -1500,7 +1510,7 @@ theorem unwindResume_continue_chain_fault_and_root_terminals {M : Type} [Gen.Mem
     refine ⟨?_, by rw [show conts.length + 2 = (conts.length + 1) + 1 from rfl, stepsM_add (conts.length + 1) 1 m mCaller hK1]
                    simp only [stepsM, hErr, bind, Except.bind]⟩
     simp only [MirSemantics.evalTerminator, hStk, trusted_unwindFromCallStack_continue_chain conts (caller :: rest) s.memory hCont, unwindFromCallStack, hTerm]
-  · intro t fr fr1 blk threads' cm1 cm2 hStk hEn hPick hTid hLast hBlk hStmt hTerm hSet hDe hEnd hBot
+  · intro t fr fr1 blk threads' cm1 cm2 hStk hCeil hEn hPick hTid hLast hBlk hStmt hTerm hSet hDe hEnd hBot
     have hCur : curFrameM { mK with mem := { mK.mem with accesses := [] } } = .ok fr := by
       unfold curFrameM; simp only [hTid, hLast, bind, Except.bind, pure, Except.pure]
     have hErr : stepM mK = .error (.ub "the function at the bottom of the stack must not unwind") := by
@@ -1508,7 +1518,8 @@ theorem unwindResume_continue_chain_fault_and_root_terminals {M : Type} [Gen.Mem
       rw [hTerm]; unfold evalTerminatorM evalResumeUnwindM; simp only [hTid, hLast, hSet, hDe, hEnd, hBot, pure, Except.pure, bind, Except.bind, ub]
     refine ⟨?_, by rw [stepsM_add conts.length 1 m mK hChain.to_stepsM]; simp only [stepsM, hErr, bind, Except.bind]⟩
     have hApp : conts = conts ++ [] := (List.append_nil conts).symm
-    simp only [MirSemantics.evalTerminator, hStk]; rw [hApp, trusted_unwindFromCallStack_continue_chain conts [] s.memory hCont]; rfl
+    simp only [MirSemantics.evalTerminator, hStk]; rw [hApp, trusted_unwindFromCallStack_continue_chain conts [] s.memory hCont]
+    simp only [unwindFromCallStack, unwindContinueChainMem_rootUnwindCeiling, hCeil]
 /-- **C2 Universal Polymorphic `StartUnwind -> ResumeUnwind^k -> StopUnwind`
 Lifecycle & Empty-Payload UB Law (`minirust_unwind_payload_lifecycle_M`)**:
 Across EVERY `Machine M` (`Mach` & `MachTB`): (1) `StartUnwind` pushes
@@ -1651,12 +1662,16 @@ theorem trusted_unwindResume_terminate_abort (s : MachineState) (caller : SavedC
   simp only [MirSemantics.evalTerminator, hStack, unwindFromCallStack, hAction]
 /-- **C2e Root-Frame Explicit Divergence
 (`unwindResume_root_panic_vs_ub_divergence`)**: At the root frame (`callStack
-= []` in Trusted; `stack_pop_action = .BottomOfStack` in MiniRust), Trusted
-terminates with `MirStepNode.retOutcome .panic`, whereas MiniRust faults with
+= []` in Trusted; `stack_pop_action = .BottomOfStack` in MiniRust) whose root
+unwind ceiling is intact (`Memory.rootUnwindCeiling = true`, the value in every
+initial state and in every state that no non-unwinding tail callee replaced the
+root activation of), Trusted terminates with `MirStepNode.retOutcome .panic`,
+whereas MiniRust faults with
 `"the function at the bottom of the stack must not unwind"` across both
 `Mach` and `MachTB`. -/
 theorem unwindResume_root_panic_vs_ub_divergence {M : Type} [Gen.Memory M] [MemoryOps M]
-    (s : MachineState) (span : String) (curBody : Option CapturedMir) (hRoot : s.memory.callStack = []) (m : Machine M) (t : Gen.Thread M) (fr fr1 : StackFrame M)
+    (s : MachineState) (span : String) (curBody : Option CapturedMir) (hRoot : s.memory.callStack = [])
+    (hCeil : s.memory.rootUnwindCeiling = true) (m : Machine M) (t : Gen.Thread M) (fr fr1 : StackFrame M)
     (threads' : List (Gen.Thread M)) (cm1 cm2 : Gen.ConcurrentMemory M) (ht : activeThreadM m = .ok t) (hlast : t.stack.getLast? = some fr)
     (hset : listSet m.threads m.active_thread { t with stack := t.stack.dropLast } "pop" = .ok threads')
     (hdealloc : deallocAllM fr.locals.entries.length fr m.mem = .ok (fr1, cm1))
@@ -1664,7 +1679,28 @@ theorem unwindResume_root_panic_vs_ub_divergence {M : Type} [Gen.Memory M] [Memo
     MirSemantics.evalTerminator s { kind := .unwindResume, span := span } curBody = MirStepNode.retOutcome .panic ∧ evalResumeUnwindM m =
       .error (.ub "the function at the bottom of the stack must not unwind") := by
   constructor
-  · simp only [MirSemantics.evalTerminator, hRoot, unwindFromCallStack]
+  · simp only [MirSemantics.evalTerminator, hRoot, unwindFromCallStack, hCeil]
+  · unfold evalResumeUnwindM
+    simp only [ht, hlast, hset, hdealloc, hend, hbot, pure, Except.pure, bind, Except.bind, ub]
+/-- **C2e′ Root-Frame Agreement Below a Cleared Root Unwind Ceiling
+(`unwindResume_root_cleared_ceiling_ub_agreement`)**: once a
+`TerminatorKind.tailCall` replaced the root activation by a callee whose ABI
+cannot unwind (`Memory.rootUnwindCeiling = false`,
+`DIV-LM-TAILCALL-NOUNWIND-UNWIND`), a root-frame `unwindResume` faults with
+`MirStepNode.fail .ub` in Trusted, in agreement with MiniRust's
+`"the function at the bottom of the stack must not unwind"` UB across both
+`Mach` and `MachTB`. -/
+theorem unwindResume_root_cleared_ceiling_ub_agreement {M : Type} [Gen.Memory M] [MemoryOps M]
+    (s : MachineState) (span : String) (curBody : Option CapturedMir) (hRoot : s.memory.callStack = [])
+    (hCeil : s.memory.rootUnwindCeiling = false) (m : Machine M) (t : Gen.Thread M) (fr fr1 : StackFrame M)
+    (threads' : List (Gen.Thread M)) (cm1 cm2 : Gen.ConcurrentMemory M) (ht : activeThreadM m = .ok t) (hlast : t.stack.getLast? = some fr)
+    (hset : listSet m.threads m.active_thread { t with stack := t.stack.dropLast } "pop" = .ok threads')
+    (hdealloc : deallocAllM fr.locals.entries.length fr m.mem = .ok (fr1, cm1))
+    (hend : ConcurrentMemory.end_call cm1 fr1.extra = .ok cm2) (hbot : fr1.stack_pop_action = .BottomOfStack) :
+    MirSemantics.evalTerminator s { kind := .unwindResume, span := span } curBody = MirStepNode.fail .ub ∧ evalResumeUnwindM m =
+      .error (.ub "the function at the bottom of the stack must not unwind") := by
+  constructor
+  · simp only [MirSemantics.evalTerminator, hRoot, unwindFromCallStack, hCeil]
   · unfold evalResumeUnwindM
     simp only [ht, hlast, hset, hdealloc, hend, hbot, pure, Except.pure, bind, Except.bind, ub]
 /-- **C2 MiniRust Polymorphic `BackToCaller` Law (`Mach` & `MachTB`)**: When

@@ -128,6 +128,24 @@ private theorem evalOperand_move_nil_any
         localDecls callStack =
       evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
 
+private theorem evalOperandWithBodyCast_copy_nil_any
+    (locals : List LocalSlot) (idx : Local) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandWithBodyCast locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals
+        localDecls callStack =
+      evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
+
+private theorem evalOperandWithBodyCast_move_nil_any
+    (locals : List LocalSlot) (idx : Local) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandWithBodyCast locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals
+        localDecls callStack =
+      evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
+
 /-! ## 1. Multi-Frame `stepMirFn`, `Step.step`, and Stack Array Helpers -/
 
 /-- Unfold `stepMirFn rootBody s` at arbitrary stack depth in terms of
@@ -4046,19 +4064,13 @@ theorem returnFromCurrentFrame_unwind_root_ub
   simp only [Id.run, Bind.bind, Pure.pure, bne_self_eq_false, Bool.true_and,
     Bool.false_eq_true, ↓reduceIte, hcleanup, hsize]
 
-/-- **Divergence (`step_terminator_unwindResume_root_panic_vs_ub_divergence`)**:
-executing `TerminatorKind.unwindResume` in a cleanup block of the *root* frame
-(`s.memory.callStack = []`) under `MultiFrameStateRel rootBody s m`:
-1. Stage-1 `Trusted` halts with a panic outcome
-   (`unwindFromCallStack [] _ = .halted .panic`, `Terminators.lean:633`, so
-   `stepMirFn rootBody s = MirStepNode.retOutcome .panic`);
-2. `lean-miri` faults with undefined behavior, because
-   `ControlFlow.returnFromCurrentFrame` refuses to unwind a single-frame stack
-   (`.undefinedBehavior "unwinding past the topmost stack frame"`).
-This complements `step_terminator_unwindResume_callee_simulation`, which covers
-non-root callee frames whose saved caller catches (`.cleanup`) or forbids
-(`.unreachable`) the unwind. -/
-theorem step_terminator_unwindResume_root_panic_vs_ub_divergence
+/-- Root-frame `TerminatorKind.unwindResume` under `MultiFrameStateRel rootBody s m`
+(`s.memory.callStack = []`), for either value of the root unwind ceiling
+(`Memory.rootUnwindCeiling`, `DIV-LM-TAILCALL-NOUNWIND-UNWIND`): Stage-1 `Trusted` halts with a
+panic outcome while the ceiling is intact and faults with undefined behavior once a
+non-unwinding tail callee cleared it (`unwindFromCallStack [] _`), whereas `lean-miri` always
+faults (`ControlFlow.returnFromCurrentFrame` refuses to unwind a single-frame stack). -/
+private theorem step_terminator_unwindResume_root_core
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : MultiFrameStateRel rootBody s m)
     (hstack : s.memory.callStack = .nil)
@@ -4070,7 +4082,10 @@ theorem step_terminator_unwindResume_root_panic_vs_ub_divergence
     (hcleanup : bb.isCleanup = true)
     (hterm : bb.terminator.kind = .unwindResume)
     (fnPtrs : List FnPtrEntry := .nil) :
-    stepMirFn rootBody s = MirStepNode.retOutcome .panic ∧
+    stepMirFn rootBody s =
+      (match s.memory.rootUnwindCeiling with
+       | true => MirStepNode.retOutcome .panic
+       | false => MirStepNode.fail .ub) ∧
     (Miri.Interpreter.Step.step
       (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
         fnPtrs)
@@ -4102,7 +4117,7 @@ theorem step_terminator_unwindResume_root_panic_vs_ub_divergence
       simp only [hbb', hstmt_none, hbeq_len, ↓reduceIte]
       unfold evalTerminator
       rw [hterm, hstack]
-      rfl
+      cases hceil : s.memory.rootUnwindCeiling <;> simp only [unwindFromCallStack, hceil]
     · rw [miri_step_at_terminator_multiFrame hback (by rw [hact_body]; exact hframe.body_eq)
         hframe.location_eq hbb' hstmt_none]
       unfold translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
@@ -4111,6 +4126,79 @@ theorem step_terminator_unwindResume_root_panic_vs_ub_divergence
       rw [returnFromCurrentFrame_unwind_root_ub _ hframes hframe.body_eq hframe.location_eq hbb
         hcleanup]
       rfl
+
+/-- **Divergence (`step_terminator_unwindResume_root_panic_vs_ub_divergence`)**:
+executing `TerminatorKind.unwindResume` in a cleanup block of the *root* frame
+(`s.memory.callStack = []`) under `MultiFrameStateRel rootBody s m`, while the root unwind
+ceiling is intact (`s.memory.rootUnwindCeiling = true`: the value in every initial state, and
+in every state whose root activation was not replaced, via `TerminatorKind.tailCall`, by a
+callee that cannot unwind):
+1. Stage-1 `Trusted` halts with a panic outcome
+   (`unwindFromCallStack [] _ = .halted .panic`, so
+   `stepMirFn rootBody s = MirStepNode.retOutcome .panic`);
+2. `lean-miri` faults with undefined behavior, because
+   `ControlFlow.returnFromCurrentFrame` refuses to unwind a single-frame stack
+   (`.undefinedBehavior "unwinding past the topmost stack frame"`).
+This complements `step_terminator_unwindResume_callee_simulation`, which covers
+non-root callee frames whose saved caller catches (`.cleanup`) or forbids
+(`.unreachable`) the unwind, and
+`step_terminator_unwindResume_root_cleared_ceiling_ub_agreement`, which covers the root frame
+below a cleared ceiling. -/
+theorem step_terminator_unwindResume_root_panic_vs_ub_divergence
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = .nil)
+    (hceil : s.memory.rootUnwindCeiling = true)
+    (hphase : ∀ p, rootBody.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? rootBody.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume)
+    (fnPtrs : List FnPtrEntry := .nil) :
+    stepMirFn rootBody s = MirStepNode.retOutcome .panic ∧
+    (Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+        fnPtrs)
+      () m).2 =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
+  have h := step_terminator_unwindResume_root_core hstate hstack hphase hbb hstmt_none hstmt_len
+    hcleanup hterm fnPtrs
+  rw [hceil] at h
+  exact h
+
+/-- **Agreement (`step_terminator_unwindResume_root_cleared_ceiling_ub_agreement`)**:
+executing `TerminatorKind.unwindResume` in a cleanup block of the *root* frame
+(`s.memory.callStack = []`) under `MultiFrameStateRel rootBody s m` once the root unwind
+ceiling has been cleared (`s.memory.rootUnwindCeiling = false`: a `TerminatorKind.tailCall`
+replaced the root activation by a callee whose ABI cannot unwind,
+`DIV-LM-TAILCALL-NOUNWIND-UNWIND`): both machines fault with undefined behavior, Stage-1
+`Trusted` with `MirStepNode.fail .ub` (`unwindFromCallStack [] _ = .faulted .ub`) and
+`lean-miri` with `.undefinedBehavior "unwinding past the topmost stack frame"`. -/
+theorem step_terminator_unwindResume_root_cleared_ceiling_ub_agreement
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = .nil)
+    (hceil : s.memory.rootUnwindCeiling = false)
+    (hphase : ∀ p, rootBody.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? rootBody.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume)
+    (fnPtrs : List FnPtrEntry := .nil) :
+    stepMirFn rootBody s = MirStepNode.fail .ub ∧
+    (Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+        fnPtrs)
+      () m).2 =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
+  have h := step_terminator_unwindResume_root_core hstate hstack hphase hbb hstmt_none hstmt_len
+    hcleanup hterm fnPtrs
+  rw [hceil] at h
+  exact h
 
 /-! ## 5. `Terminator.Call` Simulation at Arbitrary Stack Depth (`step_terminator_call_simulation`) -/
 
@@ -4217,7 +4305,7 @@ theorem step_terminator_call_unreachable_unchecked_ub_simulation
       rw [hterm, htk]
       dsimp only [Id.run]
       rw [hcall, hfunc]
-      dsimp only [evalOperands]
+      dsimp only [evalOperandsWithBodyCast, evalOperands]
       rw [hcallee_none, hunreach]
       exact StepRelMultiFrame.ub _ _
 
@@ -4553,6 +4641,31 @@ theorem WellTypedCallArgs.evalOperands_any
       rw [ih locals']
     | ub => rfl
     | unsupported => rfl
+
+theorem WellTypedCallArgs.evalOperandsWithBodyCast_any
+    {callerBody calleeBody : CapturedMir}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {ops : List MirAst.Operand} {decls : List LocalDecl}
+    (h : WellTypedCallArgs callerBody calleeBody tf ops decls)
+    (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandsWithBodyCast locals ops borrows globals layouts callerLocals localDecls callStack =
+      evalOperands locals ops borrows globals layouts callerLocals := by
+  have hnc : operandsHaveLeadingOpaqueCastMove ops = false := by
+    induction h with
+    | nil _ => rfl
+    | cons op restOps argDecl restDecls hop _ ih =>
+      have hop_nc : operandIsLeadingOpaqueCastMove op = false := by
+        cases hop with
+        | scalarOp _ _ _ hsc _ _ => cases hsc <;> rfl
+        | moveLocal _ _ _ _ _ _ _ _ => rfl
+      unfold operandsHaveLeadingOpaqueCastMove
+      rw [hop_nc]
+      exact ih
+  rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
+  exact h.evalOperands_any locals borrows globals layouts callerLocals [] callStack
 
 /-- Pointwise relation between evaluated Anneal argument values `argVals`,
 `lean-miri` argument immediates `argImms`, and the callee's post-`_0`
@@ -5755,7 +5868,7 @@ theorem step_terminator_call_simulation
         dsimp only [Id.run]
         rw [hfunc]
         dsimp only []
-        rw [(hwt_args callerMf hback).evalOperands_any, ha_ops, hcall]
+        rw [(hwt_args callerMf hback).evalOperandsWithBodyCast_any, ha_ops, hcall]
         exact StepRelMultiFrame.ub _ _
       | ok argVals locals' callerMf' calleeMf argImms
           hid_eq hrc_eq hrp_eq hloc_sub hd_fn hfr_caller'
@@ -5815,7 +5928,7 @@ theorem step_terminator_call_simulation
         dsimp only [Id.run]
         rw [hfunc]
         dsimp only []
-        rw [(hwt_args callerMf hback).evalOperands_any, ha_ops]
+        rw [(hwt_args callerMf hback).evalOperandsWithBodyCast_any, ha_ops]
         dsimp only []
         rw [htypeArgs,
           lookupCallee_nil_eq_of_findCallee_some _ _ _ _ hcallee htparam,
@@ -6049,7 +6162,7 @@ theorem step_terminator_call_diverging_simulation
         dsimp only [Id.run]
         rw [hfunc]
         dsimp only []
-        rw [(hwt_args callerMf hback).evalOperands_any, ha_ops, hcall]
+        rw [(hwt_args callerMf hback).evalOperandsWithBodyCast_any, ha_ops, hcall]
         exact StepRelMultiFrame.ub _ _
       | ok argVals locals' callerMf' calleeMf argImms
           hid_eq hrc_eq hrp_eq hloc_sub hd_fn hfr_caller'
@@ -6109,7 +6222,7 @@ theorem step_terminator_call_diverging_simulation
         dsimp only [Id.run]
         rw [hfunc]
         dsimp only []
-        rw [(hwt_args callerMf hback).evalOperands_any, ha_ops]
+        rw [(hwt_args callerMf hback).evalOperandsWithBodyCast_any, ha_ops]
         dsimp only []
         rw [htypeArgs,
           lookupCallee_nil_eq_of_findCallee_some _ _ _ _ hcallee htparam,
@@ -6909,7 +7022,11 @@ theorem step_unwinding_state_single_frame
 
 /-- **Arbitrary-Depth Multi-Frame Unwinding Simulation (`unwindFromCallStack_miri_multiStep_simulation`)**:
 From any `UnwindingStateRel rootBody s m` state (`topFrame.location = .unwinding span`)
-satisfying `UnwindChainWf rootBody s m`, Stage-1 `unwindFromCallStack s.memory.callStack s.memory`
+satisfying `UnwindChainWf rootBody s m` whose root unwind ceiling is intact
+(`s.memory.rootUnwindCeiling = true`, so that an unwind escaping the root frame halts with
+`.halted .panic`; below a cleared ceiling Stage-1 faults at the root instead, see
+`step_terminator_unwindResume_root_cleared_ceiling_ub_agreement`), Stage-1
+`unwindFromCallStack s.memory.callStack s.memory`
 corresponds across arbitrary `.continue_` call depth to a multi-step
 `MiriUnwindSteps rootBody` execution of `Miri.Interpreter.Step.step`:
 1. `.running s'`: for some `1 ≤ k ≤ s.memory.callStack.length`,
@@ -6926,7 +7043,8 @@ corresponds across arbitrary `.continue_` call depth to a multi-step
 theorem unwindFromCallStack_miri_multiStep_simulation
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hunw : UnwindingStateRel rootBody s m)
-    (hwf : UnwindChainWf rootBody s m) :
+    (hwf : UnwindChainWf rootBody s m)
+    (hceil : s.memory.rootUnwindCeiling = true) :
     (∀ s', unwindFromCallStack s.memory.callStack s.memory = .running s' →
       ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
         s'.memory.activeProtectors =
@@ -6949,10 +7067,10 @@ theorem unwindFromCallStack_miri_multiStep_simulation
   | nil =>
     have hstep := (step_unwinding_state_single_frame hunw hwf).1 hcs
     refine ⟨?_, ?_, ?_, ?_⟩
-    · intro _ h; simp [unwindFromCallStack] at h
-    · intro h; simp [unwindFromCallStack] at h
+    · intro _ h; simp [unwindFromCallStack, hceil] at h
+    · intro h; simp [unwindFromCallStack, hceil] at h
     · intro _; exact ⟨m, .single s m m _ hstep⟩
-    · intro h; simp [unwindFromCallStack] at h
+    · intro h; simp [unwindFromCallStack, hceil] at h
   | cons cf restStack ih =>
     have hne : s.memory.callStack ≠ [] := by rw [hcs]; exact List.cons_ne_nil _ _
     have hframe_step := (step_unwinding_state_single_frame hunw hwf).2 cf restStack hcs
@@ -7001,7 +7119,7 @@ theorem unwindFromCallStack_miri_multiStep_simulation
               callStack := restStack
               activeCallee := some cf.callerBody
               activeProtectors := restoreCallerProtectors cf } }
-      have hih := ih hunw₁ hwf₁ (s := s₁) rfl
+      have hih := ih hunw₁ hwf₁ (s := s₁) hceil rfl
       simp only [unwindFromCallStack, hru]
       refine ⟨?_, ?_, ?_, ?_⟩
       · intro s' hs'
@@ -7023,8 +7141,9 @@ theorem unwindFromCallStack_miri_multiStep_simulation
 
 /-- **Theorem 6 (`step_terminator_unwindResume_multiFrame_simulation`)**:
 Full arbitrary-depth `TerminatorKind.unwindResume` simulation from any cleanup
-basic block (`bb.isCleanup = true`) under `MultiFrameStateRel rootBody s m` and
-`UnwindChainWf rootBody s m`, covering `UnwindAction.continue_` chains of
+basic block (`bb.isCleanup = true`) under `MultiFrameStateRel rootBody s m`,
+`UnwindChainWf rootBody s m`, and an intact root unwind ceiling
+(`s.memory.rootUnwindCeiling = true`), covering `UnwindAction.continue_` chains of
 arbitrary length `k ≥ 1` as well as `.cleanup`, `.unreachable`, `.terminate`,
 and root unwinding:
 * When `stepMirFn rootBody s = .step s'`, there exist `1 ≤ k ≤ s.memory.callStack.length`
@@ -7043,6 +7162,7 @@ theorem step_terminator_unwindResume_multiFrame_simulation
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : MultiFrameStateRel rootBody s m)
     (hwf : UnwindChainWf rootBody s m)
+    (hceil : s.memory.rootUnwindCeiling = true)
     (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
     {bb : BasicBlockData}
     (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
@@ -7088,13 +7208,15 @@ theorem step_terminator_unwindResume_multiFrame_simulation
       have hback_r : m.stack.frames.back? = some rootMf := by rw [hframes]; rfl
       have h_eq : rootMf = topFrame := Option.some.inj (hback_r.symm.trans hback)
       subst h_eq
+      have hunw_root : unwindFromCallStack [] s.memory = .halted .panic := by
+        simp only [unwindFromCallStack, hceil]
       have ha_step : stepMirFn rootBody s = .retOutcome .panic := by
         rw [stepMirFn_activeMirBody_eq rootBody s hphase]
         have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
         unfold evalTerminator
-        rw [hterm, hstack]
-        rfl
+        rw [hterm, hstack, hunw_root]
+        try rfl
       have hm_step :
           Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m =
             (m, .error (.undefinedBehavior "unwinding past the topmost stack frame")) := by
@@ -7382,7 +7504,7 @@ theorem step_terminator_unwindResume_multiFrame_simulation
             exact hwf.stack_decl0 cf' (by rw [hstack]; exact List.mem_cons_of_mem _ hcf')
           · intro cf' hcf'
             exact hwf.stack_live0 cf' (by rw [hstack]; exact List.mem_cons_of_mem _ hcf')
-        have htail := unwindFromCallStack_miri_multiStep_simulation hunw₁ hwf₁
+        have htail := unwindFromCallStack_miri_multiStep_simulation hunw₁ hwf₁ hceil
         rw [ha_term_eq]
         simp only [unwindFromCallStack, hru]
         refine ⟨?_, ?_, ?_, ?_⟩
@@ -7599,7 +7721,7 @@ theorem step_terminator_assert_local_simulation
           unfold evalTerminator Miri.Interpreter.ControlFlow.evalTerminator
           rw [hterm, htk_assert]
           dsimp only [Id.run]
-          rw [evalOperand_copy_nil_any, heval_a]
+          rw [evalOperandWithBodyCast_copy_nil_any, heval_a]
           simp only [hread_err, miriFinishStep, Except.map]
           exact StepRelMultiFrame.ub _ _
         | immediate _ imm _ _ hval =>
@@ -7624,7 +7746,7 @@ theorem step_terminator_assert_local_simulation
             unfold evalTerminator Miri.Interpreter.ControlFlow.evalTerminator
             rw [hterm, htk_assert]
             dsimp only [Id.run]
-            rw [evalOperand_copy_nil_any, heval_a]
+            rw [evalOperandWithBodyCast_copy_nil_any, heval_a]
             simp only [hread_err, miriFinishStep, Except.map]
             exact StepRelMultiFrame.ub _ _
           · subst hv
@@ -7682,7 +7804,7 @@ theorem step_terminator_assert_local_simulation
               unfold evalTerminator
               rw [hterm]
               dsimp only []
-              rw [evalOperand_copy_nil_any, heval_a]
+              rw [evalOperandWithBodyCast_copy_nil_any, heval_a]
               cases b <;> rfl
             rw [ha_step_eq, ha_ok, hm_step_eq]
             unfold Miri.Interpreter.ControlFlow.evalTerminator
@@ -7793,7 +7915,7 @@ theorem step_terminator_assert_local_simulation
                   .ok (.scalar (boolToScalar b)) s.frame.locals := by
                 unfold evalOperand; dsimp only []; rw [hsc]; rfl
               dsimp only []
-              rw [evalOperand_copy_nil_any, heval_a]
+              rw [evalOperandWithBodyCast_copy_nil_any, heval_a]
               cases expected <;> cases b <;> (try exact False.elim (hne_exp rfl)) <;> rfl
             · rw [hm_step_eq]
               unfold Miri.Interpreter.ControlFlow.evalTerminator
@@ -7878,7 +8000,7 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
         unfold resolveCallTarget
         dsimp only []
         rw [hfunc]
-        dsimp only [evalOperands]
+        dsimp only [evalOperandsWithBodyCast, evalOperands]
         rw [hcallee_none, hnot_unreach]
         rfl
       have htk :
@@ -8014,7 +8136,7 @@ theorem step_terminator_call_fnDef_local_simulation
         rw [hterm, htk]
         unfold resolveCallTarget
         dsimp only [Id.run, extractCalleeDefPath?]
-        rw [evalOperand_copy_nil_any, heval_f, hcall_m]
+        rw [evalOperandWithBodyCast_copy_nil_any, heval_f, hcall_m]
         exact StepRelMultiFrame.ub _ _
       | immediate _ imm_f _ _ hval_f =>
         have hslot_init : slot_f = .init .unit := by
@@ -8150,13 +8272,13 @@ theorem step_terminator_call_fnDef_local_simulation
                 (activeMirBody rootBody s).layouts s.memory.callerLocals =
               .ok .unit s.frame.locals := by
             unfold evalOperand; dsimp only []; rw [hslot_f]; rfl
-          rw [evalOperand_copy_nil_any, heval_f, hop_ty]
+          rw [evalOperandWithBodyCast_copy_nil_any, heval_f, hop_ty]
           have hextr : extractFnItemTarget? (some fnDecl.ty) = some (defPath, []) := by
             cases hty_mk : fnDecl.ty with
             | mk k lidx =>
               rw [hty_mk] at hfn_ty; dsimp only at hfn_ty; subst hfn_ty; rfl
           rw [hextr]
-          dsimp only [evalOperands]
+          dsimp only [evalOperandsWithBodyCast, evalOperands]
           rw [lookupCallee_nil_eq_of_findCallee_some _ _ _ _ hcallee htparam, hcall_m]
           dsimp only [checkCalleeTargetCompatible, pushCalleeFrame]
           have hsize_ne :
@@ -8332,7 +8454,7 @@ theorem step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
         rw [hterm, htk]
         unfold resolveCallTarget
         dsimp only [Id.run, extractCalleeDefPath?]
-        rw [evalOperand_copy_nil_any, heval_f, hcall_m]
+        rw [evalOperandWithBodyCast_copy_nil_any, heval_f, hcall_m]
         exact StepRelMultiFrame.ub _ _
       | immediate _ imm_f _ _ hval_f =>
         rcases hval_f with ⟨rfl, rfl⟩ | ⟨v, rfl, himmRel⟩
@@ -8366,7 +8488,7 @@ theorem step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
           rw [hterm, htk]
           unfold resolveCallTarget
           dsimp only [Id.run, extractCalleeDefPath?]
-          rw [evalOperand_copy_nil_any, heval_f, hcall_m]
+          rw [evalOperandWithBodyCast_copy_nil_any, heval_f, hcall_m]
           exact StepRelMultiFrame.ub _ _
         · have hsz8 :
               (translateTy fnDecl.ty (activeMirBody rootBody s).layouts).layout.size =
@@ -8425,7 +8547,7 @@ theorem step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
                   (activeMirBody rootBody s).layouts s.memory.callerLocals =
                 .ok (.scalar sc) s.frame.locals := by
               unfold evalOperand; dsimp only []; rw [hslot_f]; rfl
-            rw [evalOperand_copy_nil_any, heval_a, hcall_m]
+            rw [evalOperandWithBodyCast_copy_nil_any, heval_a, hcall_m]
             exact StepRelMultiFrame.ub _ _
 
 /-- Pre-state relation (`IndirectFnPtrMovePre`) for a provenance-bearing indirect
@@ -8694,7 +8816,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
     rw [hterm, htk]
     unfold resolveCallTarget
     dsimp only [Id.run, extractCalleeDefPath?]
-    rw [evalOperand_move_nil_any, hmove_a]
+    rw [evalOperandWithBodyCast_move_nil_any, hmove_a]
     dsimp only []
     rw [hbeq_off, hcall_m]
     exact StepRelMultiFrame.ub _ _
@@ -8740,7 +8862,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
     rw [hterm, htk]
     unfold resolveCallTarget
     dsimp only [Id.run, extractCalleeDefPath?]
-    rw [evalOperand_move_nil_any, hmove_a]
+    rw [evalOperandWithBodyCast_move_nil_any, hmove_a]
     dsimp only []
     rw [hoff0, hpre.not_borrow]
     dsimp only [Nat.beq, Bool.and]
@@ -8790,7 +8912,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
     rw [hterm, htk]
     unfold resolveCallTarget
     dsimp only [Id.run, extractCalleeDefPath?, bodyLocalDeclsOf, length, List.length]
-    rw [evalOperand_move_nil_any, hmove_a]
+    rw [evalOperandWithBodyCast_move_nil_any, hmove_a]
     dsimp only []
     rw [hoff0, hpre.not_borrow]
     dsimp only [Nat.beq, Bool.and]
@@ -8902,12 +9024,12 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
       rw [hterm, htk]
       unfold resolveCallTarget
       dsimp only [Id.run, extractCalleeDefPath?, bodyLocalDeclsOf, length, List.length]
-      rw [evalOperand_move_nil_any, hmove_a]
+      rw [evalOperandWithBodyCast_move_nil_any, hmove_a]
       dsimp only []
       rw [hoff0, hpre.not_borrow]
       dsimp only [Nat.beq, Bool.and]
       rw [hlookup_some, hop_ty]; dsimp only []; rw [habi_a]
-      dsimp only [evalOperands, length]
+      dsimp only [evalOperandsWithBodyCast, evalOperands, length]
       rw [htargs_nil,
         lookupCallee_nil_eq_of_findCallee_some _ _ _ _ hcallee htparam]
       dsimp only [List.length]
@@ -9106,7 +9228,7 @@ theorem step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence
         .ok (.ptr ptrVal 8) (s.frame.locals.set fnIdx .uninit) := by
       unfold evalOperand readProjectedValue; dsimp only []; rw [hpre.fn_slot]; dsimp only []
       rw [set?_eq_some_set hpre.fn_lt_af .uninit]
-    rw [evalOperand_move_nil_any, hmove_a]
+    rw [evalOperandWithBodyCast_move_nil_any, hmove_a]
     dsimp only []
     rw [hoff0, hpre.not_borrow]
     dsimp only [Nat.beq, Bool.and]
@@ -9338,7 +9460,7 @@ theorem step_terminator_call_indirect_layoutCompat_fnPtr_divergence
         .ok (.ptr ptrVal 8) (s.frame.locals.set fnIdx .uninit) := by
       unfold evalOperand readProjectedValue; dsimp only []; rw [hpre.fn_slot]; dsimp only []
       rw [set?_eq_some_set hpre.fn_lt_af .uninit]
-    rw [evalOperand_move_nil_any, hmove_a]
+    rw [evalOperandWithBodyCast_move_nil_any, hmove_a]
     dsimp only []
     rw [hoff0, hpre.not_borrow]
     dsimp only [Nat.beq, Bool.and]
@@ -10040,7 +10162,7 @@ theorem step_terminator_call_linked_panic_unwind_simulation
         unfold resolveCallTarget
         dsimp only []
         rw [hfunc, htypeArgs]
-        dsimp only [evalOperands]
+        dsimp only [evalOperandsWithBodyCast, evalOperands]
         rw [lookupCallee_nil_eq_of_findCallee_some _ _ _ _ hcallee htparam]
         rfl
       let s₁ :=
@@ -10370,7 +10492,7 @@ theorem step_terminator_assert_failed_directUnwind_simulation
                 .ok (.scalar (boolToScalar b)) s.frame.locals := by
               unfold evalOperand; dsimp only []; rw [hsc]; rfl
             dsimp only []
-            rw [evalOperand_copy_nil_any, heval_a]
+            rw [evalOperandWithBodyCast_copy_nil_any, heval_a]
             cases expected <;> cases b <;> (try exact False.elim (hne_exp rfl)) <;> rfl
           have hfr_cached := hframe.cache_local_layout hdecl hlt_mf
           have hdisj_orig : MultiFrameAllocDisjoint ⟨restMfs.reverse ++ [topFrame]⟩ := by

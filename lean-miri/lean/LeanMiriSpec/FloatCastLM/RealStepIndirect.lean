@@ -787,7 +787,7 @@ theorem step_cast_float_move_anyLocal_simulation_mode
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
           .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]
+        unfold evalOperand; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]; rfl
       rw [hop]; dsimp only []; rw [operandTy_move_local hdecl_src, hev]
     have hm_write : Miri.Interpreter.Step.evalStatement
         (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()
@@ -1845,7 +1845,7 @@ theorem step_cast_float_move_indirect_float_simulation_mode
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows
           s.memory.globals body.layouts s.memory.callerLocals body.localDecls
           s.memory.callStack = .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hslot_s, hss, set?_eq_some_set hlt_af_s]
+        unfold evalOperand; dsimp only []; rw [hslot_s, hss, set?_eq_some_set hlt_af_s]; rfl
       rw [hop]; dsimp only []; rw [operandTy_move_local hdecl_src, hev]
     have hm_write : Miri.Interpreter.Step.evalStatement
         (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()
@@ -2760,7 +2760,7 @@ theorem step_cast_float_move_indirect_dst_simulation_mode
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
           .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]
+        unfold evalOperand; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]; rfl
       rw [hop]; dsimp only []; rw [operandTy_move_local hdecl_src, hev]
     have hm_write : Miri.Interpreter.Step.evalStatement
         (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()

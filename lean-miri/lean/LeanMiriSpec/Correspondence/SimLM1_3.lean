@@ -101,7 +101,7 @@ theorem step_terminator_assert_simulation
   dsimp only at hterm
   subst hterm
   dsimp only [m_res, a_res, evalTerminator]
-  rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq]
+  rw [hbor, hcaller, hop.evalOperandWithBodyCast_eq, evalOperand_borrows_nil_callStack_eq]
   dsimp only [Miri.Interpreter.ControlFlow.evalTerminator, translateTerminator, translateTerminatorKind]
   have hread := readAssertCondition_simulation hframes hframe hbor hcaller cond condTy hbool hop
   rcases hread with ⟨sc, m', locals', h_a, h_m, hsc_bool, tf', htf'⟩ | ⟨h_a, m', msg, h_m⟩

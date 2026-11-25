@@ -550,7 +550,7 @@ private theorem safeSliceSum_h_body
     rw [runMirTauToBlock_succ, safeSliceSum_bb2_len_step, List.length_map] <;>
     repeat' first
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, safeSliceSumMkState, safeSliceSumBody,
-          encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
+          locPlace, encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
           readProjectedValue_index, valueContainsUninit_scalar, valueContainsUninit_aggregate,
           valueListContainsUninit_nil, valueListContainsUninit_cons,
@@ -561,6 +561,9 @@ private theorem safeSliceSum_h_body
           List.length, List.set, BEq.beq, get?, set?, length, emptyMemory,
           invalidateConflictingBorrows, validateLoadedValue, resolveProjectedTy, elemTyOf,
           prefixSum_succ]
+      | rw [evalOperandWithBodyCast_copy]
+      | rw [evalOperandWithBodyCast_move_nil]
+      | rw [evalOperandWithBodyCast_constant]
       | rw [evalScalarBinOp_lt_usize_of_lt h_i_lt_len]
       | rw [get?_map_u32 h_i_lt_len]
       | rw [evalScalarBinOp_addWithOverflow_u32 h_add_u32]
@@ -1700,7 +1703,8 @@ theorem tailCaller_run_false (env : MirCallEnv) (x fuel : Nat) :
     runMirWithGap env [] tailCallerBody (fuel + 2) (callerArgs (false, x)) =
       (((env (extHelperReq x)).mapFault (fun _ => .ub)).mapGap
           (·.sealOutOfFuel "test::ext_helper")).bind (fun ans =>
-        runMirStepsWithGap env tailCallerBody fuel (resumeExternalTailCall ans)) :=
+        runMirStepsWithGap env tailCallerBody fuel
+          (resumeExternalTailCallWithAbi true (.some true) ans)) :=
   (runGapSteps_succ_of_next (mirSiteGapStep env tailCallerBody)
       (s := mirSiteOfExec tailCallerBody (.running (initMachineStateWithCallees tailCallerBody
         (callerArgs (false, x)) [])))
@@ -1708,7 +1712,7 @@ theorem tailCaller_run_false (env : MirCallEnv) (x fuel : Nat) :
       rfl (fuel + 1)).trans
     (runMirStepsWithGap_of_root_extCall (env := env) (body := tailCallerBody)
       (s := tailCallerAtCall tailCallerBody x) (req := extHelperReq x)
-      (k := resumeExternalTailCall) rfl rfl rfl fuel)
+      (k := resumeExternalTailCallWithAbi true (.some true)) rfl rfl rfl fuel)
 
 /-- Call-handler law on the refactored caller: the same request and `bind`. -/
 theorem tailCallerRefactored_run_false (env : MirCallEnv) (x fuel : Nat) :
@@ -1716,7 +1720,7 @@ theorem tailCallerRefactored_run_false (env : MirCallEnv) (x fuel : Nat) :
       (((env (extHelperReq x)).mapFault (fun _ => .ub)).mapGap
           (·.sealOutOfFuel "test::ext_helper")).bind (fun ans =>
         runMirStepsWithGap env tailCallerRefactoredBody fuel
-          (resumeExternalTailCall ans)) :=
+          (resumeExternalTailCallWithAbi true (.some true) ans)) :=
   (runGapSteps_succ_of_next (mirSiteGapStep env tailCallerRefactoredBody)
       (s := mirSiteOfExec tailCallerRefactoredBody
         (.running (initMachineStateWithCallees tailCallerRefactoredBody
@@ -1726,7 +1730,7 @@ theorem tailCallerRefactored_run_false (env : MirCallEnv) (x fuel : Nat) :
       (fuel + 1)).trans
     (runMirStepsWithGap_of_root_extCall (env := env) (body := tailCallerRefactoredBody)
       (s := tailCallerAtCall tailCallerRefactoredBody x) (req := extHelperReq x)
-      (k := resumeExternalTailCall) rfl rfl rfl fuel)
+      (k := resumeExternalTailCallWithAbi true (.some true)) rfl rfl rfl fuel)
 
 /--
 For **every** helper summary `f` (returning, panicking, aborting, UB, or hitting
@@ -1850,9 +1854,11 @@ theorem tailCallerRefactored_contextEquiv_any_env (env : MirCallEnv)
       change StepNodeRelWith (mirGapHandle env) (mirGapHandle env) R (· = ·) (· = ·)
         (mirSiteOfState tailCallerBody t₁) (mirSiteOfState tailCallerRefactoredBody t₂)
         (.vis (.inr (.inr (.call (extHelperReq x))))
-          (fun ans => mirNextSiteState tailCallerBody t₁ (resumeExternalTailCall ans)))
+          (fun ans => mirNextSiteState tailCallerBody t₁
+            (resumeExternalTailCallWithAbi true (.some true) ans)))
         (.vis (.inr (.inr (.call (extHelperReq x))))
-          (fun ans => mirNextSiteState tailCallerRefactoredBody t₂ (resumeExternalTailCall ans)))
+          (fun ans => mirNextSiteState tailCallerRefactoredBody t₂
+            (resumeExternalTailCallWithAbi true (.some true) ans)))
       refine StepNodeRelWith.vis (· = ·)
         (GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _) ?_
       rintro ans _ ho₁ _ rfl
@@ -1860,18 +1866,22 @@ theorem tailCallerRefactored_contextEquiv_any_env (env : MirCallEnv)
       cases ans with
       | returned v mem =>
         have hcs := hStackRet x v mem he
-        refine Or.inr ⟨.normal (v, mem), ?_, ?_⟩
-        · dsimp only [mirNextSiteState, t₁, mirSiteOfExec, resumeExternalTailCall]
+        refine Or.inr ⟨.normal (v, { mem with rootUnwindCeiling := true }), ?_, ?_⟩
+        · dsimp only [mirNextSiteState, t₁, mirSiteOfExec, resumeExternalTailCallWithAbi,
+            resumeExternalTailCall]
           rw [hcs]
-        · dsimp only [mirNextSiteState, t₂, mirSiteOfExec, resumeExternalTailCall]
+        · dsimp only [mirNextSiteState, t₂, mirSiteOfExec, resumeExternalTailCallWithAbi,
+            resumeExternalTailCall]
           rw [hcs]
       | panicked mem =>
         have hcs := hStackPanic x mem he
         refine Or.inr ⟨.panic, ?_, ?_⟩
-        · dsimp only [mirNextSiteState, t₁, mirSiteOfExec, resumeExternalTailCall]
+        · dsimp only [mirNextSiteState, t₁, mirSiteOfExec, resumeExternalTailCallWithAbi,
+            resumeExternalTailCall]
           rw [hcs]
           rfl
-        · dsimp only [mirNextSiteState, t₂, mirSiteOfExec, resumeExternalTailCall]
+        · dsimp only [mirNextSiteState, t₂, mirSiteOfExec, resumeExternalTailCallWithAbi,
+            resumeExternalTailCall]
           rw [hcs]
           rfl
       | aborted =>
@@ -3458,6 +3468,7 @@ def buggyRestoreFrameEnv : MirCallEnv :=
     else
       .gap (.unresolved req.defPath))
 
+set_option maxHeartbeats 400000 in
 /--
 Standalone caller-borrow preservation canary (`ofStatefulOutcome` vs `ofStandaloneBody`):
 1. `buggyRestoreFrameEnv` satisfies `PreservesCallFrame`, YET because
@@ -5661,7 +5672,8 @@ private theorem extSpecCallPair_steps_aux
     (x : Nat) (memInit : Memory) (_hx : x < scalarModulus 4)
     (hAct : memInit.activeCallee = none) (hStk : memInit.callStack = [])
     (hCal : memInit.callees = [maskBitHelperBody]) (hBor : memInit.borrows = [])
-    (hProt : memInit.activeProtectors = []) :
+    (hProt : memInit.activeProtectors = [])
+    (hCeil : memInit.rootUnwindCeiling = true) :
     let st10 := mirSiteOfExec extSpecBaseCallerBody (.running {
       frame := {
         blockIdx := 0, stmtIdx := 0,
@@ -5698,13 +5710,14 @@ private theorem extSpecCallPair_steps_aux
           stepMirSiteState extSpecRefactoredCallerBody (.running t2) =
             .ret (.normal (.scalar ⟨y % 2, 4⟩, mem2'))) := by
   rcases memInit with ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
-  dsimp only at hAct hStk hCal hBor hProt
-  subst hAct hStk hCal hBor hProt
+    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds,
+    rootUnwindCeiling⟩
+  dsimp only at hAct hStk hCal hBor hProt hCeil
+  subst hAct hStk hCal hBor hProt hCeil
   let m0 : Memory :=
     { nextAllocId, globals, borrows := [], nextTag, callees := [maskBitHelperBody],
       traitImpls, callStack := [], activeCallee := none, activeProtectors := [],
-      nextProtector, callerLocals, fnPtrs, exposedAllocIds }
+      nextProtector, callerLocals, fnPtrs, exposedAllocIds, rootUnwindCeiling := true }
   let xVal : Value := .scalar ⟨x, 4⟩
   let xMasked : Nat := wrapScalarBits (x % 256) (scalarModulus 4)
   let xMaskVal : Value := .scalar ⟨xMasked, 4⟩
@@ -5775,24 +5788,25 @@ private theorem extSpecCallPair_steps_aux
   refine ⟨.running s1_3, .running s2_5, req, k1, k2,
     hr1, hr2, rfl, rfl, rfl, hCall1, hCall2, rfl, rfl, ?_, ?_⟩
   · intro memAfter hAct' hStk'
-    rcases memAfter with ⟨na', g', b', nt', cal', ti', cs', ac', ap', np', cl', fp', ea'⟩
+    rcases memAfter with ⟨na', g', b', nt', cal', ti', cs', ac', ap', np', cl', fp', ea', ruc'⟩
     dsimp only at hAct' hStk'; subst hAct' hStk'
     exact ⟨rfl, rfl⟩
   · intro y memAfter hAct' hStk' hCal' hProt'
-    rcases memAfter with ⟨na', g', b', nt', cal', ti', cs', ac', ap', np', cl', fp', ea'⟩
+    rcases memAfter with ⟨na', g', b', nt', cal', ti', cs', ac', ap', np', cl', fp', ea', ruc'⟩
     dsimp only at hAct' hStk' hCal' hProt'
     subst hAct' hStk' hCal' hProt'
     let mA0 : Memory :=
       { nextAllocId := na', globals := g', borrows := b', nextTag := nt',
         callees := [maskBitHelperBody], traitImpls := ti', callStack := [],
         activeCallee := none, activeProtectors := [], nextProtector := np',
-        callerLocals := cl', fnPtrs := fp', exposedAllocIds := ea' }
+        callerLocals := cl', fnPtrs := fp', exposedAllocIds := ea',
+        rootUnwindCeiling := ruc' }
     let yVal : Value := .scalar ⟨y, 4⟩
     let yBit : Nat := wrapScalarBits (y % 2) (scalarModulus 4)
     let yBitVal : Value := .scalar ⟨yBit, 4⟩
     -- Base caller post-call states (calls `mask_bit` and returns `yBit`)
-    let bor1a := (invalidateDirectDestWriteBorrows mA0 s1_3.frame.locals (locPlace 3)).borrows
-    let m1a : Memory := { mA0 with borrows := bor1a }
+    let bor1a := (invalidateDirectDestWriteBorrows { mA0 with rootUnwindCeiling := true } s1_3.frame.locals (locPlace 3)).borrows
+    let m1a : Memory := { mA0 with borrows := bor1a, rootUnwindCeiling := true }
     let l1a : List LocalSlot := [.uninit, .init xVal, .init xMaskVal, .init yVal]
     let st1a : MachineState := { frame := { blockIdx := 1, stmtIdx := 0, locals := l1a }, memory := m1a }
     let st1b : MachineState :=
@@ -5869,8 +5883,8 @@ private theorem extSpecCallPair_steps_aux
          | false => MirStepNode.retNormal yBitVal mem1') = _
       rw [hFrameNil]; rfl
     -- Refactored caller post-call states (inlined `y % 2` via `_4`)
-    let bor2a := (invalidateDirectDestWriteBorrows mA0 s2_5.frame.locals (locPlace 3)).borrows
-    let m2a : Memory := { mA0 with borrows := bor2a }
+    let bor2a := (invalidateDirectDestWriteBorrows { mA0 with rootUnwindCeiling := true } s2_5.frame.locals (locPlace 3)).borrows
+    let m2a : Memory := { mA0 with borrows := bor2a, rootUnwindCeiling := true }
     let l2a : List LocalSlot := [.uninit, .init xVal, .init xMaskVal, .init yVal, .init xMaskVal]
     let st2a : MachineState := { frame := { blockIdx := 1, stmtIdx := 0, locals := l2a }, memory := m2a }
     let m2b : Memory := { m2a with borrows := invalidateConflictingBorrows m2a.borrows 4 .none 0 }
@@ -5927,7 +5941,7 @@ theorem externalSpecCallContract_nondet_modular_transfer :
       fun args mem =>
         (∃ x : Nat, x < scalarModulus 4 ∧ args = [.scalar ⟨x, 4⟩]) ∧
         mem.activeCallee = none ∧ mem.callStack = [] ∧
-        mem.borrows = [] ∧ mem.activeProtectors = []
+        mem.borrows = [] ∧ mem.activeProtectors = [] ∧ mem.rootUnwindCeiling = true
     let extPost : List Value → Memory → Value → Memory → Prop :=
       fun _ _ ret _ => ∃ k : Nat, k < 2 ∧ ret = .scalar ⟨k, 4⟩
     (∀ req : MirCallReq, extNondetSpecContract.pre req →
@@ -5943,7 +5957,7 @@ theorem externalSpecCallContract_nondet_modular_transfer :
     fun args mem =>
       (∃ x : Nat, x < scalarModulus 4 ∧ args = [.scalar ⟨x, 4⟩]) ∧
       mem.activeCallee = none ∧ mem.callStack = [] ∧
-      mem.borrows = [] ∧ mem.activeProtectors = []
+      mem.borrows = [] ∧ mem.activeProtectors = [] ∧ mem.rootUnwindCeiling = true
   let extPost : List Value → Memory → Value → Memory → Prop :=
     fun _ _ ret _ => ∃ k : Nat, k < 2 ∧ ret = .scalar ⟨k, 4⟩
   have hNoUniq : ∀ req : MirCallReq, extNondetSpecContract.pre req →
@@ -6004,11 +6018,11 @@ theorem externalSpecCallContract_nondet_modular_transfer :
         pre := extPre, post := extPost, callees := [maskBitHelperBody] } := by
     constructor
     intro h hHolds args mem hPre
-    rcases hPre with ⟨⟨x, hx, rfl⟩, hAct, hStk, hBor, hProt⟩
+    rcases hPre with ⟨⟨x, hx, rfl⟩, hAct, hStk, hBor, hProt, hCeil⟩
     let memInit := { mem with callees := [maskBitHelperBody], traitImpls := [] }
     obtain ⟨st11, st21, req, k1, k2, hr1, hr2, hDefP, hReqArgs, hReqMem, hCall1, hCall2,
         hk1Ab, hk2Ab, hkPanic, hkRet⟩ :=
-      extSpecCallPair_steps_aux x memInit hx hAct hStk rfl hBor hProt
+      extSpecCallPair_steps_aux x memInit hx hAct hStk rfl hBor hProt hCeil
     have hReqPre : extNondetSpecContract.pre req := by
       refine ⟨hDefP, ?_, ?_, trivial⟩
       · rw [hReqArgs]; rfl
@@ -6096,11 +6110,11 @@ theorem externalSpecCallContract_nondet_modular_transfer :
       ?_ (fun _ _ v₁ _ v₂ _ _ hrv hp => by obtain ⟨k, hk, rfl⟩ := hp; exact ⟨k, hk, hrv.symm⟩)
       hBaseCert
     intro h hHolds args mem hPre
-    rcases hPre with ⟨⟨x, hx, rfl⟩, hAct, hStk, hBor, hProt⟩
+    rcases hPre with ⟨⟨x, hx, rfl⟩, hAct, hStk, hBor, hProt, hCeil⟩
     let memInit := { mem with callees := [maskBitHelperBody], traitImpls := [] }
     obtain ⟨st11, st21, req, k1, k2, hr1, hr2, hDefP, hReqArgs, hReqMem, hCall1, hCall2,
         hk1Ab, hk2Ab, hkPanic, hkRet⟩ :=
-      extSpecCallPair_steps_aux x memInit hx hAct hStk rfl hBor hProt
+      extSpecCallPair_steps_aux x memInit hx hAct hStk rfl hBor hProt hCeil
     have hReqPre : extNondetSpecContract.pre req := by
       refine ⟨hDefP, ?_, ?_, trivial⟩
       · rw [hReqArgs]; rfl

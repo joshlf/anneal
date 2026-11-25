@@ -208,7 +208,7 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
   between same-typed scalar locals (`step_intrinsic_copyNonOverlapping_stage1_simulation`;
   from-entry `MiriDiffWitnesses.w6_copy_nonoverlapping_disjoint_returns` and
   `MiriDiffWitnesses.w6_copy_nonoverlapping_overlap_ub`)
-  and full-local multi-element `copyViaBytes` copies between distinct integer
+  and full-local multi-element `copyBytesSubplace` copies between distinct integer
   locals of equal width
   (`step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`;
   from-entry `MiriDiffWitnesses.w6_copy_nonoverlapping_full_bytes_returns`),
@@ -3070,7 +3070,7 @@ theorem switchInt_step_cases
       unfold evalTerminator
       rw [hterm]
       dsimp only
-      rw [hbor, hcaller, hstack, ha_op]
+      rw [(hdiscr topFrame hframes).evalOperandWithBodyCast_eq, hbor, hcaller, hstack, ha_op]
     have hdisc : (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant ()
         (translateOperand discr) m = (m', .error (.undefinedBehavior msg)) := by
       rw [hdisc_eq]; unfold Miri.Interpreter.runRvalue; rw [hm_op]
@@ -3117,7 +3117,7 @@ theorem switchInt_step_cases
       unfold evalTerminator
       rw [hterm]
       dsimp only
-      rw [hbor, hcaller, hstack, ha_op]
+      rw [(hdiscr topFrame hframes).evalOperandWithBodyCast_eq, hbor, hcaller, hstack, ha_op]
     have hM := miri_step_terminator_eq hframes hframe.body_eq hframe.location_eq hbb hstmt_none
       (m' := { m with stack := ⟨#[{ topFrame' with
         location := .mir ⟨lookupSwitchTarget sc.bits targets.branches targets.otherwise, 0⟩ }]⟩ })
@@ -3324,7 +3324,7 @@ theorem assert_unreachable_step_cases
         unfold evalTerminator
         rw [hterm]
         dsimp only
-        rw [hbor, hcaller, hstack, h_a]
+        rw [(hcond topFrame hframes).evalOperandWithBodyCast_eq, hbor, hcaller, hstack, h_a]
         dsimp only
         split
         · rfl
@@ -3349,7 +3349,7 @@ theorem assert_unreachable_step_cases
         unfold evalTerminator
         rw [hterm]
         dsimp only
-        rw [hbor, hcaller, hstack, h_a]
+        rw [(hcond topFrame hframes).evalOperandWithBodyCast_eq, hbor, hcaller, hstack, h_a]
         dsimp only
         split
         · next h_contra =>
@@ -3368,7 +3368,7 @@ theorem assert_unreachable_step_cases
       unfold evalTerminator
       rw [hterm]
       dsimp only
-      rw [hbor, hcaller, hstack, h_a]
+      rw [(hcond topFrame hframes).evalOperandWithBodyCast_eq, hbor, hcaller, hstack, h_a]
     exact Or.inl ⟨m', msg, hA.trans hA', hM'⟩
 
 /-- **(b)** `Assert cond expected target unreachable` step simulation on a

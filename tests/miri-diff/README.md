@@ -206,19 +206,21 @@ Category 10 adds 2 tests:
 | Multi-element `copy_nonoverlapping` through whole-array pointer casts | `pass_copy_nonoverlapping_multi_elem_array_pair` (`[22, 99]` copied as 2 `u32` elements through `(&raw const src) as *const u32`, returning `22 ^ 99 = 117`) |
 | Raw-pointer reads of uninitialized struct padding (`model-checking/kani#5183`) | `ub_raw_ptr_read_uninit_struct_padding_kani5183` (byte offset `1` of `PaddedU8U32` read as `u8` through `(&raw const s) as *const u8` and `offset(base, 1isize)`) |
 
-Category 10 leaves out one construct on which Anneal currently disagrees with
-Miri: a multi-element `copy_nonoverlapping` between *element* sub-places,
-`copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)`. Anneal
-copies only the first element through the `.constantIndex` sub-place pointer
-(`wrong_value`, `value_mismatch`; Anneal returns `22` where Miri returns `117`
-for `[22, 99]`), whereas the whole-array casts of
-`pass_copy_nonoverlapping_multi_elem_array_pair` copy both elements and agree.
+Category 10 uses whole-array pointer casts for its multi-element
+`copy_nonoverlapping` seed. The *element* sub-place form,
+`copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)`, used to be a
+construct on which Anneal disagreed with Miri: Anneal copied only the first
+element through the `.constantIndex` sub-place pointer (`wrong_value`,
+`value_mismatch`; Anneal returned `22` where Miri returns `117` for
+`[22, 99]`). `Trusted.Rustc.V2026_06_01.MirSemantics.Statements` now copies
+`count * size_of::<T>()` bytes for a sub-place copy (`evalCopySubplaceMulti`),
+so both forms copy both elements and agree with Miri.
 `semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` pins
-the element sub-place form (`probe_gap_subplace_multi_elem_copy`,
-kernel-confirmed) as a ratchet that fails once the gap is fixed, and the
-`subplace_multi_elem_copy_truncation` semantic mutant of
-`--self-check-mutants` replays a semantics that truncates the agreeing
-whole-array copy to one element (killed as `wrong_value`).
+the element sub-place form (`probe_gap_subplace_multi_elem_copy`) as a resolved
+gap that must agree with Miri on `117`, `RawPtrOffsetMutator`'s `Pass` copy
+template generates that form, and the `subplace_multi_elem_copy_truncation`
+semantic mutant of `--self-check-mutants` replays a semantics that truncates
+the whole-array copy to one element (killed as `wrong_value`).
 
 `miri-difftest` confirms each divergence in the Lean kernel with
 `lean -M 4096`. When the batched confirmation fails, every divergence is
@@ -251,14 +253,14 @@ statement) or agreement with Miri:
   `ub_copy_nonoverlapping_partial_overlap_array` with `offset(p, 1isize)`
   perturbed to `offset(p, 2isize)`).
   `pass_copy_nonoverlapping_same_tag_disjoint_array_halves` (Miri `30`, `&raw
-  mut arr[0]` on `[u32; 4]`, exercising `Statements.lean`'s `copyViaBytes`
+  mut arr[0]` on `[u32; 4]`, exercising `Statements.lean`'s `copySliceElements`
   same-tag guard),
   `pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves` (Miri
   `285803779`, `(&raw mut arr) as *mut u8` on `[u8; 8]`, directly entering
-  `Statements.lean`'s `sameContainer` array-slice branch and hitting `Nat.beq
-  srcPtr.tag dstPtr.tag`), and
+  `Statements.lean`'s `copySliceElements` array-slice branch and hitting `Nat.beq
+  srcEp.ptr.tag dstEp.ptr.tag`), and
   `pass_copy_nonoverlapping_same_tag_disjoint_struct_fields` (Miri `44`, `&raw
-  mut pair.a` on `PairU32`) copy between disjoint parts of one local through two
+  mut pair.a` on `PairU32`, hitting `copyBytesSubplace`'s same-tag guard) copy between disjoint parts of one local through two
   pointers that share one tag. Both forward (`src < dst`) and backward (`dst <
   src`) disjoint copies, plus whole-struct `(&raw mut pair) as *mut u32`, report
   UB at the `copy_nonoverlapping` (`false_positive_ub`,

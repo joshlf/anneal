@@ -3804,7 +3804,9 @@ theorem evalProjection_nested_field_read_at_local
               | .ub => .ub
               | .unsupported => .unsupported
           | _ => .ub := by
-      cases isMove <;> cases p0 <;> (try exact False.elim (hp0_nd rfl)) <;>
+      obtain ⟨fidx, fty, hp0⟩ := hchain.head_field
+      subst hp0
+      cases isMove <;>
         (simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
          unfold evalOperand; dsimp only; cases get? af.locals idx with
           | none => rfl
@@ -5885,7 +5887,9 @@ theorem evalProjection_nested_substruct_read_at_local
               | .ub => .ub
               | .unsupported => .unsupported
           | _ => .ub := by
-      cases isMove <;> cases p0 <;> (try exact False.elim (hp0_nd rfl)) <;>
+      obtain ⟨fidx, fty, hp0⟩ := hchain.head_field
+      subst hp0
+      cases isMove <;>
         (simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
          unfold evalOperand; dsimp only; cases get? af.locals idx with
           | none => rfl
@@ -6912,7 +6916,9 @@ theorem evalProjection_nested_scalar_wrap_read_at_local
               | .ub => .ub
               | .unsupported => .unsupported
           | _ => .ub := by
-      cases isMove <;> cases p0 <;> (try exact False.elim (hp0_nd rfl)) <;>
+      obtain ⟨fidx, fty, hp0⟩ := hchain.head_field
+      subst hp0
+      cases isMove <;>
         (simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
          unfold evalOperand; dsimp only; cases get? af.locals idx with
           | none => rfl

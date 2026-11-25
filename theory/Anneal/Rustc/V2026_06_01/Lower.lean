@@ -2505,14 +2505,15 @@ def strictMemory (m : Memory) : Option Memory :=
     | .some cal, .some ti, .some cs, .some ac =>
       match strictList m.activeProtectors, strictBits 32 m.nextProtector, strictSlotsAt 0 0 m.callerLocals with
       | .some ap, .some np, .some cl =>
-        match strictList m.fnPtrs, strictList m.exposedAllocIds with
-        | .some fp, .some ea =>
+        match strictList m.fnPtrs, strictList m.exposedAllocIds, strictBool m.rootUnwindCeiling with
+        | .some fp, .some ea, .some ruc =>
           .some
             { nextAllocId := naid, globals := glob, borrows := bor, nextTag := nt,
               callees := cal, traitImpls := ti, callStack := cs, activeCallee := ac,
               activeProtectors := ap, nextProtector := np, callerLocals := cl,
-              fnPtrs := fp, exposedAllocIds := ea }
-        | _, _ => .none
+              fnPtrs := fp, exposedAllocIds := ea,
+              rootUnwindCeiling := ruc }
+        | _, _, _ => .none
       | _, _, _ => .none
     | _, _, _, _ => .none
   | _, _, _, _ => .none
@@ -2523,7 +2524,8 @@ private theorem strictMemory_eq (m : Memory) : strictMemory m = .some m := by
   dsimp only
   rw [strictBits_eq, strictList_eq, strictBorrows_eq, strictBits_eq,
       strictList_eq, strictList_eq, strictList_eq, strictOpt_eq,
-      strictList_eq, strictBits_eq, strictSlotsAt_eq, strictList_eq, strictList_eq]
+      strictList_eq, strictBits_eq, strictSlotsAt_eq, strictList_eq, strictList_eq,
+      strictBool_eq]
 
 @[reducible]
 def strictMachineState (argCount : Nat) (s : MachineState) : Option MachineState :=

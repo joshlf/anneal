@@ -302,7 +302,7 @@ theorem assert_pairFlag_step_cases
           { s with frame := { blockIdx := target, stmtIdx := 0, locals := s.frame.locals } } := by
       unfold evalTerminator
       rw [hterm]
-      dsimp only
+      dsimp only [evalOperandWithBodyCast, stripLeadingOpaqueCast]
       rw [hbor, hcaller, hstack, h_a']
       dsimp only
       split
@@ -326,7 +326,7 @@ theorem assert_pairFlag_step_cases
     have hA' : evalTerminator s bb.terminator (some body) = MirStepNode.fail .ub := by
       unfold evalTerminator
       rw [hterm]
-      dsimp only
+      dsimp only [evalOperandWithBodyCast, stripLeadingOpaqueCast]
       rw [hbor, hcaller, hstack, h_a']
       dsimp only
       split

@@ -3163,6 +3163,24 @@ inductive WellTypedScalarOperand
       IsImmediateFrameLocal topFrame idx →
       WellTypedScalarOperand body topFrame (.copy ⟨idx, .nil⟩) decl.ty
 
+/-- A well-typed scalar operand (a constant or a copied bare local) is never a move of a place
+that starts with `ProjectionElem.opaqueCast`, so a terminator (`TerminatorKind.switchInt`,
+`TerminatorKind.assert`, `TerminatorKind.call`) evaluates it with erased declarations, exactly
+as before the cast-chain root dispatch of `evalOperandWithBodyCast`
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`). -/
+theorem WellTypedScalarOperand.evalOperandWithBodyCast_eq
+    {body : CapturedMir}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {op : MirAst.Operand} {ty : Ty}
+    (hop : WellTypedScalarOperand body tf op ty)
+    (locals : List LocalSlot) (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot) (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandWithBodyCast locals op borrows globals layouts callerLocals bodyLocalDecls
+        callStack =
+      evalOperand locals op borrows globals layouts callerLocals (callStack := callStack) := by
+  cases hop <;> rfl
+
 theorem WellTypedScalarOperand.mono_immediate
     {body : CapturedMir}
     {tf tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
@@ -5508,7 +5526,8 @@ theorem step_terminator_goto_return_simulation
           traitImpls := s.memory.traitImpls, callStack := s.memory.callStack,
           activeCallee := s.memory.activeCallee, activeProtectors := s.memory.activeProtectors,
           nextProtector := s.memory.nextProtector, callerLocals := s.memory.callerLocals,
-          fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds } = s.memory := by
+          fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds,
+          rootUnwindCeiling := s.memory.rootUnwindCeiling } = s.memory := by
       cases hm : s.memory; rw [hm] at hbor; dsimp at hbor; subst hbor; rfl
     unfold evalTerminator translateTerminator
       Miri.Interpreter.ControlFlow.evalTerminator

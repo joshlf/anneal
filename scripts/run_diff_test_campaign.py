@@ -4731,8 +4731,11 @@ def campaign_exit_for_miri_summary(summary: dict[str, Any]) -> tuple[int, str, s
 # omitted" mutant would be equivalent to the current engine there and could never be
 # killed; the same Rust test pins them as known engine gaps instead (as it pins the
 # sub-place `&raw mut x.0` form of `move_triggers_tb_write`, a live
-# `false_positive_ub`, and the element sub-place form of
-# `subplace_multi_elem_copy_truncation`, a live `wrong_value`).
+# `false_positive_ub`). The element sub-place form of
+# `subplace_multi_elem_copy_truncation` was such a gap (`wrong_value`) until
+# `Trusted.Rustc.V2026_06_01.MirSemantics.Statements` copied every element of a
+# sub-place `copy_nonoverlapping`; the Rust test now pins it as a resolved gap that
+# must agree with Miri.
 #
 # A variant that needs a different program than its mutant's probe carries its own
 # `probe` (`id`, `probe_rust_source`, `reference_miri_outcome`,
@@ -5146,10 +5149,12 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         # whole-array pointer casts (`(&raw const src) as *const u32`), so Miri and the
         # live engine both return `22 ^ 99 = 117`. A semantics that copies only the
         # first element of a multi-element copy leaves `dst[1] == 0` and returns `22`.
-        # The live engine still truncates the element sub-place form
+        # The live engine used to truncate the element sub-place form
         # `copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)` that way
-        # (`wrong_value`, kernel-confirmed), so that form cannot be a probe: the same
-        # Rust test pins it as a known engine gap (`probe_gap_subplace_multi_elem_copy`).
+        # (`wrong_value`, kernel-confirmed) until `evalCopySubplaceMulti` copied
+        # `count * size_of::<T>()` bytes; the same Rust test now pins that form as a
+        # resolved gap on which Miri and the engine agree on `117`
+        # (`probe_gap_subplace_multi_elem_copy`).
         "id": "subplace_multi_elem_copy_truncation",
         "name": "subplace_multi_elem_copy_truncation",
         "bug_class": "copy_nonoverlapping_multi_element_truncation",

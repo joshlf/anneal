@@ -26,8 +26,10 @@ that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
    `minimize` produces a `bool` constant fixed by the compilation session.
 2. `StatementKind::Intrinsic(CopyNonOverlapping)`: Anneal executes it, while
    `minimize` aborts translation. With `count = 0` Anneal never checks that
-   `src` and `dst` are pointers, and a two-element `u32` copy between two
-   4-byte locals returns normally with no UB (`bdCopy2_noUB`).
+   `src` and `dst` are pointers (`bdCopyZeroScalars_step`), `count = 1` copies
+   between the two 4-byte `u32` locals (`bdCopy1_anneal_ret`), and an
+   out-of-bounds `count = 2` (`8` bytes across 4-byte locals) faults with UB
+   (`bdCopy2_anneal_ub`, `bdCopy2_not_noUB`).
 3. `BinOp::Offset`: Anneal scales the signed count by `size_of::<T>()` and
    enforces in-bounds byte arithmetic (`bdOffset1_anneal_ret`,
    `bdOffsetNeg1_anneal_ub`, `bdOffsetNeg1_not_noUB`), matching `minimize`'s
@@ -295,18 +297,19 @@ theorem bdCopy1_anneal_ret :
       (.normal (.scalar ⟨7, 4⟩, mem)) :=
   runA_exists_mem_sound (bdCopyBody 1) 30 _ _ _ (by kernel_rfl)
 
-/-- `count = 2`: the copy covers `2 * size_of::<u32>() = 8` bytes, but `_1`
-and `_0` are 4-byte locals, and the `copy_nonoverlapping` safety contract
-requires `src` to be valid for reads and `dst` for writes of all 8 bytes.
-Anneal nevertheless returns `7`, the same result as for `count = 1`. -/
-theorem bdCopy2_anneal_ret :
-    ∃ mem, ReachesRet (mirCallTree (bdCopyBody 2) [.scalar ⟨7, 4⟩]) []
-      (.normal (.scalar ⟨7, 4⟩, mem)) :=
-  runA_exists_mem_sound (bdCopyBody 2) 30 _ _ _ (by kernel_rfl)
+/-- `count = 2`: the copy requests `2 * size_of::<u32>() = 8` bytes, exceeding
+the 4-byte bounds of `_1` and `_0`; post-Episode-1 `copyBytesSubplace` enforces
+exact sub-place window bounds and faults with UB. -/
+theorem bdCopy2_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree (bdCopyBody 2) [.scalar ⟨7, 4⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound (bdCopyBody 2) 30 _ (by kernel_rfl)
 
-/-- Anneal certifies the `count = 2` run free of UB. -/
-theorem bdCopy2_noUB : MirNoUBTree (mirCallTree (bdCopyBody 2) [.scalar ⟨7, 4⟩]) :=
-  runA_isSome_noUB (bdCopyBody 2) 30 _ (by kernel_rfl)
+/-- `bdCopyBody 2` is not UB-free in Anneal. -/
+theorem bdCopy2_not_noUB : ¬ MirNoUBTree (mirCallTree (bdCopyBody 2) [.scalar ⟨7, 4⟩]) := by
+  obtain ⟨tr, u, hr, hf⟩ := bdCopy2_anneal_ub
+  exact fun hsafe => hsafe tr u hr hf
 
 /-- A `copy_nonoverlapping` with `count = 0` and two non-pointer operands. -/
 def bdCopyZeroScalars : MirAst.Statement :=

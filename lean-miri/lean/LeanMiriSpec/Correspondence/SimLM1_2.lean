@@ -981,6 +981,7 @@ theorem step_terminator_switchInt_simulation
   rw [hterm]
   dsimp only
   rw [hbor, hcaller, hstack, hm_term]
+  rw [(hdiscr topFrame hframes).evalOperandWithBodyCast_eq]
   generalize ha_op : evalOperand s.frame.locals discr .nil s.memory.globals body.layouts .nil = aOp
     at hop_sim
   generalize hm_op : (annealEvalOperand body.localDecls body.layouts (translateOperand discr) none >>=

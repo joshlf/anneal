@@ -5541,8 +5541,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcVSB16' does not depend on any
 #print axioms wfcVSB16
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW1_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW1_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW1_anneal_run
@@ -5583,8 +5582,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW1_convert_table' depends on 
 #print axioms wfcW1_convert_table
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW2_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW2_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW2_anneal_run
@@ -5674,8 +5672,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW2_nanChoices_exact' depends 
 #print axioms wfcW2_nanChoices_exact
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW3_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW3_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW3_anneal_run
@@ -5716,8 +5713,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW3_saturation_cliffs' depends
 #print axioms wfcW3_saturation_cliffs
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW4_anneal_run
@@ -5814,8 +5810,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcCast_deterministic_and_f16_f1
 #print axioms wfcCast_deterministic_and_f16_f128_boundary
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5U_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5U_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5U_anneal_run
@@ -5828,8 +5823,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_uninit_source_ub' depends 
 #print axioms wfcW5_uninit_source_ub
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5M_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5M_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5M_anneal_run
@@ -5856,8 +5850,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_allImm_entry2' depends on ax
 #print axioms wfc_allImm_entry2
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5D_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5D_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5D_anneal_run
@@ -5870,8 +5863,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_dead_source_ub' depends on
 #print axioms wfcW5_dead_source_ub
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5H_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5H_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5H_anneal_run
@@ -5884,8 +5876,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_f16_f128_fail_closed' depe
 #print axioms wfcW5_f16_f128_fail_closed
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5UninitF16F128_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5UninitF16F128_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5UninitF16F128_anneal_run
@@ -5905,8 +5896,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_bool_char_boundary' depend
 #print axioms wfcW5_bool_char_boundary
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5PromU_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5PromU_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5PromU_anneal_run
@@ -5919,8 +5909,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_promoted_uninit_ub' depend
 #print axioms wfcW5_promoted_uninit_ub
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5PromDead_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5PromDead_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5PromDead_anneal_run
@@ -5933,8 +5922,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_rawPtr_dead_and_promoted_d
 #print axioms wfcW5_rawPtr_dead_and_promoted_dead_ub
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5Prom_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5Prom_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5Prom_anneal_run
@@ -5975,8 +5963,7 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5Ind_stateRel_init' depends 
 #print axioms wfcW5Ind_stateRel_init
 
 /--
-info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5Ind_anneal_run' depends on axioms:
-  [propext, Quot.sound]
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5Ind_anneal_run' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5Ind_anneal_run
