@@ -2290,29 +2290,35 @@ counters such as `StackFrame.stmtIdx`, `Memory.nextTag`, or
 thunks whose *syntax* still mentions the previous state `s`. When `s` contains a
 free variable (an unused symbolic caller parameter `x`), `Meta.whnf` refuses to
 evaluate `Nat.div` / `Nat.mod` on such terms (`hasFVar`), stalling `by rfl`.
-`strictBits` therefore first peels up to eight `Nat.succ` layers structurally
-(each `match` forces `whnf` and rebinds the closed sub-numeral), and only then
-hands the closed remainder to `strictBitsCore`.
+Matching `k` first preserves `strictBits 0 x = .some x` definitionally on open
+`x`, and for `k = .succ _` `strictBits` peels up to eight `Nat.succ` layers
+structurally (covering up to seven stacked increments over an fvar-bearing
+state projection and rebinding the closed sub-numeral) before handing the
+closed remainder to `strictBitsCore`.
 -/
 @[reducible]
-def strictBits (k n : Nat) : Option Nat :=
-  match n with
-  | .zero => .some .zero
-  | .succ .zero => .some 1
-  | .succ (.succ .zero) => .some 2
-  | .succ (.succ (.succ .zero)) => .some 3
-  | .succ (.succ (.succ (.succ .zero))) => .some 4
-  | .succ (.succ (.succ (.succ (.succ .zero)))) => .some 5
-  | .succ (.succ (.succ (.succ (.succ (.succ .zero))))) => .some 6
-  | .succ (.succ (.succ (.succ (.succ (.succ (.succ .zero)))))) => .some 7
-  | .succ (.succ (.succ (.succ (.succ (.succ (.succ (.succ m))))))) =>
-    strictBitsCore k (.succ (.succ (.succ (.succ (.succ (.succ (.succ (.succ m))))))))
+def strictBits : Nat → Nat → Option Nat
+  | .zero, n => .some n
+  | .succ k, n =>
+    match n with
+    | .zero => .some .zero
+    | .succ .zero => .some 1
+    | .succ (.succ .zero) => .some 2
+    | .succ (.succ (.succ .zero)) => .some 3
+    | .succ (.succ (.succ (.succ .zero))) => .some 4
+    | .succ (.succ (.succ (.succ (.succ .zero)))) => .some 5
+    | .succ (.succ (.succ (.succ (.succ (.succ .zero))))) => .some 6
+    | .succ (.succ (.succ (.succ (.succ (.succ (.succ .zero)))))) => .some 7
+    | .succ (.succ (.succ (.succ (.succ (.succ (.succ (.succ m))))))) =>
+      strictBitsCore (.succ k) (.succ (.succ (.succ (.succ (.succ (.succ (.succ (.succ m))))))))
 
-theorem strictBits_eq (k n : Nat) : strictBits k n = .some n := by
-  rcases n with _ | _ | _ | _ | _ | _ | _ | _ | m
-  all_goals first
-    | rfl
-    | exact strictBitsCore_eq k _
+theorem strictBits_eq : ∀ (k n : Nat), strictBits k n = .some n
+  | .zero, _ => rfl
+  | .succ k, n => by
+    rcases n with _ | _ | _ | _ | _ | _ | _ | _ | m
+    all_goals first
+      | rfl
+      | exact strictBitsCore_eq (.succ k) _
 
 @[reducible]
 def strictOpt {α : Type} : Option α → Option (Option α)
@@ -2635,34 +2641,79 @@ theorem strictFrame_eq (argCount : Nat) (f : StackFrame) :
   rw [strictBits_eq, strictBits_eq, strictSlotsAt_eq]
 
 /--
+Force the outer `CapturedMir.mk` constructor head in O(1) without traversing
+any static MIR payloads (`basicBlocks`, `localDecls`, `layouts`, `allocations`,
+`fnAbi`, etc.).
+
+Call-by-name `whnf` leak prevention: when an inline callee returns, `MirSemantics`
+sets `Memory.activeCallee := .some sf.callerBody`. Leaving `sf.callerBody` or
+`m.activeCallee` unforced keeps a projection thunk `SavedCallerFrame.callerBody s_prev`
+that retains the entire prior `MachineState`, causing exponential blowup across
+multi-iteration inline-call loops (`loop -> mid -> leaf`). Matching the outer
+`CapturedMir.mk` constructor collapses that projection immediately to the static
+body record while leaving every field payload untouched.
+-/
+@[reducible]
+def strictCapturedMirHead (b : CapturedMir) : Option CapturedMir :=
+  CapturedMir.casesOn (motive := fun _ => Option CapturedMir) b
+    (fun defPath phase role argCount localDecls basicBlocks fnAbi layouts allocations
+        typeParamCount genericParams traitImpls =>
+      .some (.mk defPath phase role argCount localDecls basicBlocks fnAbi layouts allocations
+        typeParamCount genericParams traitImpls))
+
+theorem strictCapturedMirHead_eq (b : CapturedMir) : strictCapturedMirHead b = .some b :=
+  rfl
+
+/-- Spine-normalize `Option CapturedMir` by forcing the outer `CapturedMir.mk`
+constructor head on `.some b` without traversing static payloads. -/
+@[reducible]
+def strictOptCapturedMirHead : Option CapturedMir → Option (Option CapturedMir)
+  | .none => .some .none
+  | .some b =>
+    match strictCapturedMirHead b with
+    | .some b' => .some (.some b')
+    | .none => .none
+
+theorem strictOptCapturedMirHead_eq :
+    ∀ (o : Option CapturedMir), strictOptCapturedMirHead o = .some o
+  | .none => rfl
+  | .some _ => rfl
+
+/--
 Spine-normalize a suspended caller frame on `Memory.callStack`.
 
-The caller `StackFrame` is normalized with `strictFrame sf.callerBody.argCount`
+The caller `StackFrame` is normalized with `strictFrame cb'.argCount`
 (NOT `strictFrame 0`), matching `stepMirStateStrict`'s `callee.argCount` /
 `body.argCount` invariant: caller parameter slots `1 ≤ idx ≤ argCount` are left
 untouched so open-term calls with unused symbolic caller parameters never stall
-on `strictBits 128 x` in WHNF while the caller frame is suspended. The static
-`callerBody` is preserved verbatim.
+on `strictBits 128 x` in WHNF while the caller frame is suspended. The outer
+`CapturedMir.mk` head of `sf.callerBody` is forced in O(1) via
+`strictCapturedMirHead` to prevent `SavedCallerFrame.callerBody` projection
+thunks from retaining prior `MachineState`s across repeated inline calls, while
+preserving all static body fields verbatim.
 -/
 @[reducible]
 def strictSavedCallerFrame (sf : SavedCallerFrame) : Option SavedCallerFrame :=
-  match strictFrame sf.callerBody.argCount sf.frame, strictPlace sf.destination,
-      strictBits 16 sf.returnTarget, strictOptNat sf.callerProtector with
-  | .some fr', .some dest', .some rt', .some cp' =>
-    match mapStrictList (strictBits 32) sf.calleeProtectors,
-        strictUnwindAction sf.returnUnwind, strictBool sf.isDiverging with
-    | .some cps', .some ru', .some div' =>
-      .some
-        { callerBody := sf.callerBody
-          frame := fr'
-          destination := dest'
-          returnTarget := rt'
-          callerProtector := cp'
-          calleeProtectors := cps'
-          returnUnwind := ru'
-          isDiverging := div' }
-    | _, _, _ => .none
-  | _, _, _, _ => .none
+  match strictCapturedMirHead sf.callerBody with
+  | .none => .none
+  | .some cb' =>
+    match strictFrame cb'.argCount sf.frame, strictPlace sf.destination,
+        strictBits 16 sf.returnTarget, strictOptNat sf.callerProtector with
+    | .some fr', .some dest', .some rt', .some cp' =>
+      match mapStrictList (strictBits 32) sf.calleeProtectors,
+          strictUnwindAction sf.returnUnwind, strictBool sf.isDiverging with
+      | .some cps', .some ru', .some div' =>
+        .some
+          { callerBody := cb'
+            frame := fr'
+            destination := dest'
+            returnTarget := rt'
+            callerProtector := cp'
+            calleeProtectors := cps'
+            returnUnwind := ru'
+            isDiverging := div' }
+      | _, _, _ => .none
+    | _, _, _, _ => .none
 
 theorem strictSavedCallerFrame_eq (sf : SavedCallerFrame) :
     strictSavedCallerFrame sf = .some sf := by
@@ -2709,7 +2760,8 @@ theorem strictFnPtrEntry_eq (e : FnPtrEntry) : strictFnPtrEntry e = .some e := b
 def strictMemory (m : Memory) : Option Memory :=
   match strictBits 32 m.nextAllocId, strictList m.globals, strictBorrows m.borrows, strictBits 32 m.nextTag with
   | .some naid, .some glob, .some bor, .some nt =>
-    match strictList m.callees, strictList m.traitImpls, strictCallStack m.callStack, strictOpt m.activeCallee with
+    match strictList m.callees, strictList m.traitImpls, strictCallStack m.callStack,
+        strictOptCapturedMirHead m.activeCallee with
     | .some cal, .some ti, .some cs, .some ac =>
       match mapStrictList (strictBits 32) m.activeProtectors, strictBits 32 m.nextProtector,
           strictSlotsAt 0 0 m.callerLocals with
@@ -2733,7 +2785,7 @@ theorem strictMemory_eq (m : Memory) : strictMemory m = .some m := by
   unfold strictMemory
   dsimp only
   rw [strictBits_eq, strictList_eq, strictBorrows_eq, strictBits_eq,
-      strictList_eq, strictList_eq, strictCallStack_eq, strictOpt_eq,
+      strictList_eq, strictList_eq, strictCallStack_eq, strictOptCapturedMirHead_eq,
       mapStrictList_eq (strictBits 32) (strictBits_eq 32), strictBits_eq, strictSlotsAt_eq,
       mapStrictList_eq strictFnPtrEntry strictFnPtrEntry_eq,
       mapStrictList_eq (strictBits 64) (strictBits_eq 64),

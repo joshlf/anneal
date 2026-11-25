@@ -10749,14 +10749,18 @@ def symOptEnsuresUpperPost (optEnsBody : Option CapturedMir) : Value → Memory 
   | .none => fun _ _ => True
 
 /-- Check whether `optEnsBody` is either `.none` or a valid 2-argument unsigned
-upper-bound `ensures` companion. -/
+upper-bound `ensures` companion. Forces `peekMirUpperBound ensBody` once via
+`strictScalarInt` so call-by-name `whnf` does not re-scan `ensBody` across the
+symbolic upper-bound loop. -/
 def checkOptMirEnsuresUpperBound1
     (specFuel : Nat)
     (optEnsBody : Option CapturedMir) :
     Bool :=
   match optEnsBody with
   | .some ensBody =>
-    checkMirEnsuresUpperBound1 specFuel ensBody (peekMirUpperBound ensBody)
+    match strictScalarInt (peekMirUpperBound ensBody) with
+    | .none => false
+    | .some boundSc => checkMirEnsuresUpperBound1 specFuel ensBody boundSc
   | .none => true
 
 theorem optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
@@ -10772,6 +10776,8 @@ theorem optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
   | none => exact True.intro
   | some ensBody =>
     dsimp only [checkOptMirEnsuresUpperBound1] at h_ens_check
+    rw [strictScalarInt_eq] at h_ens_check
+    dsimp only at h_ens_check
     dsimp only [symOptEnsuresUpperPost] at h_post
     cases retVal with
     | uninit | unit | ptr _ _ | aggregate _ _ => exact False.elim h_post
@@ -10784,17 +10790,21 @@ theorem optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
         specFuel ensBody (peekMirUpperBound ensBody) v0 rBits h_ens_check hBle hV0
 
 /-- Closed-term checker that `reqBody` and `optEnsBody` are valid 1-argument
-unsigned upper-bound companions for `subjectBody`. -/
+unsigned upper-bound companions for `subjectBody`. Forces `peekMirUpperBound reqBody`
+once via `strictScalarInt` before passing it into `checkMirUpperBound1ForSubject`. -/
 def checkMirAutoSymRange1Bound
     (specFuel : Nat)
     (subjectBody reqBody : CapturedMir)
     (optEnsBody : Option CapturedMir) :
     Bool :=
-  Bool.and
-    (Bool.and
-      (Nat.beq subjectBody.argCount 1)
-      (checkMirUpperBound1ForSubject specFuel subjectBody reqBody (peekMirUpperBound reqBody)))
-    (checkOptMirEnsuresUpperBound1 specFuel optEnsBody)
+  match strictScalarInt (peekMirUpperBound reqBody) with
+  | .none => false
+  | .some boundSc =>
+    Bool.and
+      (Bool.and
+        (Nat.beq subjectBody.argCount 1)
+        (checkMirUpperBound1ForSubject specFuel subjectBody reqBody boundSc))
+      (checkOptMirEnsuresUpperBound1 specFuel optEnsBody)
 
 /-- One-call bound-independent symbolic range discharge combinator for
 1-argument unsigned `Claim`s with an inequality precondition
@@ -10860,6 +10870,8 @@ theorem dischargeRustSymRange1Auto
   refine verifyMirNoPanicSym c subjectFuel (fun args hp => ?_)
   rcases h_pre args hp with ⟨⟨h_len_body, h_req⟩, h_typed⟩
   dsimp only [checkMirAutoSymRange1Bound] at h_bound
+  rw [strictScalarInt_eq] at h_bound
+  dsimp only at h_bound
   cases hArg1 : Nat.beq c.body.argCount 1 with
   | false =>
     rw [hArg1] at h_bound
@@ -10958,6 +10970,8 @@ theorem dischargeRustTotalSymRange1Auto
   rcases h_pre args mem hp with ⟨⟨⟨h_len_body, h_req⟩, h_mem⟩, h_typed⟩
   subst h_mem
   dsimp only [checkMirAutoSymRange1Bound] at h_bound
+  rw [strictScalarInt_eq] at h_bound
+  dsimp only at h_bound
   cases hArg1 : Nat.beq c.body.argCount 1 with
   | false =>
     rw [hArg1] at h_bound
@@ -12249,12 +12263,15 @@ def checkMirRustEqScalar1SpecWithCallees
     (callees : List CapturedMir)
     (expectedSc : ScalarInt) :
     Bool :=
-  Bool.or
-    (checkMirRustEqScalar1IdentityBranch subjectFuel specFuel reqBody subjectBody ensBody callees expectedSc)
-    (Bool.and
-      (checkOptMirRequiresPinsScalarsForSubject specFuel subjectBody (.some reqBody) [expectedSc])
-      (checkMirRustPinnedSpecOptWithSpecCallees
-        subjectFuel specFuel subjectBody callees callees (.some ensBody) [.scalar expectedSc]))
+  match strictScalarInt expectedSc with
+  | .none => false
+  | .some sc =>
+    Bool.or
+      (checkMirRustEqScalar1IdentityBranch subjectFuel specFuel reqBody subjectBody ensBody callees sc)
+      (Bool.and
+        (checkOptMirRequiresPinsScalarsForSubject specFuel subjectBody (.some reqBody) [sc])
+        (checkMirRustPinnedSpecOptWithSpecCallees
+          subjectFuel specFuel subjectBody callees callees (.some ensBody) [.scalar sc]))
 
 end PinChecker
 
@@ -12320,6 +12337,8 @@ theorem dischargeRustEqScalar1
   rcases h_pre args hp with ⟨⟨h_len, h_req⟩, h_typed⟩
   let expectedSc : ScalarInt := { bits := constVal, sizeBytes := width }
   dsimp only [checkMirRustEqScalar1SpecWithCallees] at h_check
+  rw [strictScalarInt_eq] at h_check
+  dsimp only at h_check
   cases hBranch1 :
       checkMirRustEqScalar1IdentityBranch subjectFuel specFuel reqBody c.body ensBody c.callees expectedSc with
   | true =>
