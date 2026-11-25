@@ -15834,6 +15834,13 @@ Modeling choices: `checkTB = false` (`refDataValidNoTB`) is used where the
 interpreter performs no Tree Borrows access (`&raw const (*r)`, safe
 `size_of_val(&dyn)`), matching Miri's value-validity check that consults
 liveness, bounds, alignment, and nullness but not aliasing permissions.
+Known conservative deviation (mandated by Condition `C2`): with `checkTB` and
+`isMut`, a `.frozen` tag or ancestor (and an immutable global) is rejected as
+`.ub`, whereas under Tree Borrows a `&mut` function-entry retag performs only a
+read (yielding `Reserved`), so Miri faults such a `&mut dyn` only on its first
+write. A program that unsizes a frozen `&mut T` to `&mut dyn K` and never writes
+through it is therefore `.ub` here but accepted by Miri; this matches the
+pre-existing non-`dyn` `&mut` reference checks in this file.
 -/
 def dynRefDataValid
     (locals : List LocalSlot)
@@ -16044,8 +16051,36 @@ Reference (`compiler/rustc_const_eval/src/interpret/cast.rs` at commit
 > let new_vptr = self.get_vtable_ptr(ty, data_b)?;
 > self.write_immediate(Immediate::new_dyn_trait(old_data, new_vptr, self), dest)"
 
+Reference (`compiler/rustc_const_eval/src/interpret/place.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/place.rs#L624-L633>
+
+> "self.write_immediate_no_validate(src, dest)?;
+>
+> if M::enforce_validity(self, dest.layout()) {
+>     // Data got changed, better make sure it matches the type!
+>     // Also needed to reset padding.
+>     self.validate_operand("
+
+Reference (`compiler/rustc_const_eval/src/interpret/validity.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/validity.rs#L580-L584>
+
+> "ty::Dynamic(data, _) => {
+>     let vtable = meta.unwrap_meta().to_pointer(self.ecx)?;
+>     // Make sure it is a genuine vtable pointer for the right trait.
+>     try_validation!(
+>         self.ecx.get_ptr_vtable_ty(vtable, Some(data)),"
+
 Justification: equal keys copy the value unchanged (the interpreter's NOP-cast
-path, which performs no vtable check). Otherwise the source vtable pointer is
+path). That path still ends in `write_immediate`, whose validity check (enabled
+by Miri's default `-Zmiri-enforce-validity`) requires the metadata of every
+wide pointer, raw or reference, to be a genuine vtable of the right trait
+(`checkDynVTablePtr` against `J`), and a reference to be dereferenceable and
+aligned (`dynRefDataValid` against the source vtable entry, with the same Tree
+Borrows gate as every other safe `&[mut] dyn` production, Condition `C2`); the
+NOP path therefore validates exactly like the upcast path minus the vtable
+switch. Otherwise the source vtable pointer is
 validated first (`checkDynVTablePtr` against `J`: invalid pointers are `.ub`),
 then the auto traits of `K` must be a subset of those of `J` (an apparently
 added auto trait may be implied by a supertrait the capture does not record, so
@@ -16079,7 +16114,17 @@ def evalDynToDynUnsize
     | false => .ub
     | true =>
       match stringEq srcKey dstKey with
-      | true => .ok fatVal
+      | true =>
+        match checkDynVTablePtr .none mv ptrBytes metaVal srcKey with
+        | .ub => .ub
+        | .unsupported => .unsupported
+        | .ok (srcEntry, _, _) =>
+          match isRef with
+          | false => .ok fatVal
+          | true =>
+            match dynRefDataValid locals' mv localDecls layouts ptrBytes dataVal srcEntry isMut true with
+            | true => .ok fatVal
+            | false => .ub
       | false =>
         match checkDynVTablePtr .none mv ptrBytes metaVal srcKey with
         | .ub => .ub
