@@ -1922,6 +1922,94 @@ theorem b4_call_mixed_stack_global_refines_miri :
     rfl
   · exact ⟨rfl, ⟨gBase, hg, rfl⟩⟩
 
+
+/-! ### A4: placeholder detection must fail closed at depth (fuel) and on
+`rustc-capture`'s depth-16 truncation
+
+`rustc-capture` interns field layouts recursively up to depth 16
+(`layout_lower.rs:155,265`, `intern_field_tys`: `if depth < 16 { … } else { Vec::new() }`).
+So (1) a generic `T` can sit 9–16 levels below an element type. B4's
+`copyLayoutHasPlaceholder layouts 8` returned `false` (accept) when its fuel ran
+out. And (2) at depth ≥ 16 a parametric compound is emitted with its synthetic
+`size = 0, align = 1` layout but **empty** `fieldLayouts`, so no placeholder is
+reachable at all. In both cases B4 resolved the pre-monomorphization element to
+an align-1 ZST and stepped a misaligned `count = 5` copy as a no-op. -/
+
+/-- `[…[T; 1]…; 1]` nested `n` times. -/
+def nestArrT : Nat → RigidTy
+  | 0 => paramTK
+  | n + 1 => .array (nestArrT n) 1
+
+/-- Parametric `[X; 1]` layout (`lower_parametric_compound_layout`, array arm)
+whose element layout is entry `child`. -/
+def arrParamLayoutAt (child : Nat) : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .array { bytes := 0 } 1, variants := .single 0,
+    isUninhabited := false, fieldLayouts := [child] }
+
+/-- Entries: `0 = placeholder T`, `i = [entry (i-1); 1]` for `i = 1..9`. -/
+def deepParamLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := paramPlaceholderLayout :: (List.range 9).map arrParamLayoutAt }
+
+/-- Locals: `_0 : ()`, `_1 : nestArrT 9` (layout `9`), `_2 : *const nestArrT 9`,
+`_3 : *mut nestArrT 9`. -/
+def deepParamDecls : List LocalDecl :=
+  [declNL unitK, declWithIdx (nestArrT 9) 9, declNL (rawConstK (nestArrT 9)),
+   declNL (rawMutK (nestArrT 9))]
+
+/-- **Soundness (A4), fuel**: `T` nine levels deep is still a placeholder. -/
+theorem a4_deep_param_nesting_not_zst :
+    resolveCopyElemLayout deepParamDecls deepParamLayouts (cp 2) (cp 3) = .unsupported ∧
+      evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (cp 3) deepParamDecls
+          deepParamLayouts (danglingScalar 1) (danglingScalar 1) 0 st.frame.locals =
+        MirStepNode.unsupported := by
+  exact ⟨by decide +kernel, by kernel_rfl⟩
+
+/-- `rustc-capture` output for `Wrapper<…>` at depth ≥ 16: synthetic
+`size = 0, align = 1`, one field, but `fieldLayouts = []` (truncated). -/
+def truncatedWrapperLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [] }
+
+/-- `rustc-capture` output for a generic multi-variant enum (`Option<T>`-like) at
+depth ≥ 16: synthetic `size = 1, align = 1` tag-only layout with a non-empty
+payload variant but `fieldLayouts = []`. -/
+def truncatedEnumLayout : TypeLayout :=
+  { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0],
+    variants := .multiple (.initialized (.int 8 false) { start := 0, end_ := 1 }) 0
+      [.arbitrary [] [], .arbitrary [{ bytes := 0 }] [0]],
+    isUninhabited := false, fieldLayouts := [] }
+
+def truncWrapperK : RigidTy := .adt "proto::Deep" [paramTK]
+def truncEnumK : RigidTy := .adt "core::option::Option" [paramTK]
+
+def truncLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [paramPlaceholderLayout, truncatedWrapperLayout, truncatedEnumLayout] }
+
+def truncDecls : List LocalDecl :=
+  [declNL unitK, declWithIdx truncWrapperK 1, declNL (rawConstK truncWrapperK),
+   declNL (rawMutK truncWrapperK), declWithIdx truncEnumK 2, declNL (rawConstK truncEnumK),
+   declNL (rawMutK truncEnumK)]
+
+/-- **Soundness (A4), truncation**: a depth-truncated parametric `Wrapper<…T…>`
+(`size = 0`, one field, no `fieldLayouts`) is not a concrete ZST. -/
+theorem a4_truncated_param_wrapper_not_zst :
+    resolveCopyElemLayout truncDecls truncLayouts (cp 2) (cp 3) = .unsupported ∧
+      evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (cp 3) truncDecls truncLayouts
+          (danglingScalar 1) (danglingScalar 1) 0 st.frame.locals = MirStepNode.unsupported := by
+  exact ⟨by decide +kernel, by kernel_rfl⟩
+
+/-- **Soundness (A4), truncation**: a depth-truncated generic enum is not a
+concrete `(1, 1)` type. -/
+theorem a4_truncated_param_enum_unresolved :
+    resolveCopyElemLayout truncDecls truncLayouts (cp 5) (cp 6) = .unsupported := by
+  decide +kernel
+
+
 /-! ## 12. Terminator-level call path inherits the fix -/
 
 /-- `evalCopyNonOverlappingCallProto` with a misaligned dangling `src` faults
@@ -2664,5 +2752,20 @@ theorem zeroCountCopyAlignProto_bundle :
 -/
 #guard_msgs in
 #print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.b4_call_mixed_stack_global_refines_miri
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.a4_deep_param_nesting_not_zst' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.a4_deep_param_nesting_not_zst
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.a4_truncated_param_wrapper_not_zst' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.a4_truncated_param_wrapper_not_zst
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.a4_truncated_param_enum_unresolved' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.a4_truncated_param_enum_unresolved
 
 end Anneal.Proto.ZeroCountCopyAlign.Tests

@@ -270,6 +270,37 @@ def copyAnyFieldLayoutHasPlaceholder
       | false => copyAnyFieldLayoutHasPlaceholder recLayout layouts rest
     | .none => copyAnyFieldLayoutHasPlaceholder recLayout layouts rest
 
+/-- Whether a `FieldsShape` has at least one field. -/
+@[reducible]
+def copyFieldsShapeHasFields : FieldsShape → Bool
+  | .primitive => false
+  | .union count => Bool.not (Nat.beq count 0)
+  | .array _ count => Bool.not (Nat.beq count 0)
+  | .arbitrary offsets _ =>
+    match offsets with
+    | .nil => false
+    | _ :: _ => true
+
+/-- Whether `l` may be a **depth-truncated** `lower_parametric_compound_layout`
+output (A4). `rustc-capture` interns field layouts only up to depth 16
+(`layout_lower.rs:155,265`). Deeper parametric compounds keep their synthetic
+template (`align = 1`, and `size = 0`, or `size = 1` for a multi-variant enum
+tag) but get **empty** `fieldLayouts`, so no placeholder is reachable. Such a
+layout, i.e. one that has fields but no field layouts and matches the template,
+is treated as possibly parametric (fail closed; for a concrete type at depth
+≥ 16 this only costs precision). -/
+@[reducible]
+def copyLayoutTruncatedParametric (l : TypeLayout) : Bool :=
+  match l.fieldLayouts with
+  | _ :: _ => false
+  | .nil =>
+    Bool.and (Nat.beq l.align.bytes 1)
+      (Bool.or
+        (Bool.and (Nat.beq l.size.bytes 0) (copyFieldsShapeHasFields l.fields))
+        (match l.variants with
+         | .multiple _ _ vs => Bool.and (Nat.ble l.size.bytes 1) (vs.any copyFieldsShapeHasFields)
+         | _ => false))
+
 /-- Whether `l` is an uninstantiated generic placeholder slot
 (`TypeLayout.isParamPlaceholder l = true`, emitted by `rustc-capture` for
 `ty::Param`) or a non-pointer compound layout (`[T; n]`, `(T, u8)`,
@@ -280,7 +311,9 @@ representations so recursive concrete structs (`struct Node { next: *mut Node }`
 never cycle and concrete pointer layouts are preserved. -/
 @[reducible]
 def copyLayoutHasPlaceholder (layouts : LayoutTable) : Nat → TypeLayout → Bool
-  | .zero, _ => false
+  -- A4: fuel exhaustion is fail-**closed** (`rustc-capture` nests field layouts
+  -- up to depth 16, deeper than B4's fuel of 8, which then accepted).
+  | .zero, _ => true
   | .succ fuel', l =>
     match TypeLayout.isParamPlaceholder l with
     | true => true
@@ -288,8 +321,11 @@ def copyLayoutHasPlaceholder (layouts : LayoutTable) : Nat → TypeLayout → Bo
       match Bool.or (isThinPtrBackendRepr l.backendRepr) (isWidePtrBackendRepr l.backendRepr) with
       | true => false
       | false =>
-        copyAnyFieldLayoutHasPlaceholder (copyLayoutHasPlaceholder layouts fuel') layouts
-          l.fieldLayouts
+        match copyLayoutTruncatedParametric l with
+        | true => true
+        | false =>
+          copyAnyFieldLayoutHasPlaceholder (copyLayoutHasPlaceholder layouts fuel') layouts
+            l.fieldLayouts
 
 /-- Validate that a `TypeLayout` `l` is concrete (not an uninstantiated
 parametric placeholder, B4) and structurally compatible with `kind` on a
@@ -306,7 +342,7 @@ def copyLayoutMatchesRigidTy?
     (l : TypeLayout) :
     Bool :=
   match
-    Bool.and (Bool.not (copyLayoutHasPlaceholder layouts 8 l))
+    Bool.and (Bool.not (copyLayoutHasPlaceholder layouts 32 l))
       (Bool.and (isPowTwoAlign l.align.bytes) (Size.isMultipleOfAlign l.size l.align))
   with
   | false => false
