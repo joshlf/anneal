@@ -54,11 +54,18 @@ its CFG, with no fixed-point iteration in the kernel:
      `wpOutcome` convergence proof into a fault-free `wpUntilOk` /
      `wpStateOk` proof with the certified postcondition.
 
-   `checkMirCert_verificationResult` packages these facts as the trusted,
-   audited `Trusted.VerificationResult.VerificationResult` of a callee-free
-   `Claim` (UB-freedom plus the claim's postcondition on every normal
-   return), so a certificate checked by `rfl` is a top-level verification
-   result.
+   Section 8 packages these facts as trusted, audited certificates of
+   `Trusted.VerificationResult` claims with arbitrary linked `callees`:
+   `checkMirCert_verificationResult` (`Claim`),
+   `checkMirCert_statefulVerificationResult` (`StatefulClaim`), and
+   `checkMirCert_traceVerificationResult` (`TraceClaim`). Their
+   postcondition obligations may assume that every completed execution is a
+   normal return (never a panic or an abort), that its trace consists only of
+   `MirObsE` observations (`TraceObsOnly`: no fault and no external call),
+   and that the final memory agrees with the entry memory outside `borrows`
+   (`MirMemFrame`). With a termination proof, `productive_of_mirPccInv` also
+   gives `Productive`. A certificate checked by `rfl` is therefore a
+   top-level verification result.
 2. `verifyMirCutpoints` validates that `rpoOrder` is a duplicate-free,
    full-coverage reverse-postorder schedule modulo the Bourdoncle
    `cutpoints`, materializes the acyclic block invariants in one forward pass,
@@ -93,6 +100,7 @@ def stepStmtsTo (decls : List LocalDecl) (env : MirAbsEnv)
       | none => none
 termination_by structural idx
 
+/-- Indexing one past the end of a list is out of bounds. -/
 theorem get?_length_eq_none {α : Type} :
     ∀ (xs : List α), get? xs (length xs) = none
   | [] => rfl
@@ -168,6 +176,8 @@ def checkEdgesAgainstCert (bbs : List BasicBlockData)
      | some _, some (some invT) => mirAbsEnvLe e invT
      | _, _ => false) && checkEdgesAgainstCert bbs invs rest
 
+/-- Every edge accepted by `checkEdgesAgainstCert` lands on an existing
+block whose certified invariant includes the edge environment. -/
 theorem checkEdgesAgainstCert_mem {bbs : List BasicBlockData}
     {invs : List (Option MirAbsEnv)} :
     ∀ {edges : List (Nat × MirAbsEnv)} {target : Nat} {envT : MirAbsEnv},
@@ -224,6 +234,7 @@ def checkAllBlocksCert (decls : List LocalDecl) (retInv : MirAbsSlot)
       checkAllBlocksCert decls retInv bbsAll invs bbs os
   | _, _ => false
 
+/-- `checkAllBlocksCert` checks the certificate of every aligned block. -/
 theorem checkAllBlocksCert_get {decls : List LocalDecl} {retInv : MirAbsSlot}
     {bbsAll : List BasicBlockData} {invs : List (Option MirAbsEnv)} :
     ∀ {bbs : List BasicBlockData} {os : List (Option MirAbsEnv)} {i : Nat}
@@ -380,6 +391,7 @@ def MirRootStart (s : MachineState) : Prop :=
     s.memory.activeProtectors = [] ∧ s.frame.blockIdx = 0 ∧
     s.frame.stmtIdx = 0
 
+/-- A step node is never a normal-return node. -/
 theorem emitStep_ne_retNormal {obs : MirObs} {s' : MachineState}
     {retVal : Value} {mem : Memory} :
     MirStepNode.emitStep obs s' ≠ MirStepNode.retNormal retVal mem := by
@@ -397,10 +409,12 @@ def emitStepNext? : MirStepNode → Option MachineState
     | _ => none
   | _ => none
 
+/-- `emitStepNext?` recovers the successor of a step node. -/
 theorem emitStepNext?_emitStep (obs : MirObs) (s' : MachineState) :
     emitStepNext? (MirStepNode.emitStep obs s') = some s' := by
   cases obs <;> rfl
 
+/-- Step nodes determine their successor state. -/
 theorem emitStep_inj {o1 o2 : MirObs} {s1 s2 : MachineState}
     (h : MirStepNode.emitStep o1 s1 = MirStepNode.emitStep o2 s2) :
     s1 = s2 := by
@@ -408,6 +422,7 @@ theorem emitStep_inj {o1 o2 : MirObs} {s1 s2 : MachineState}
   rw [emitStepNext?_emitStep, emitStepNext?_emitStep] at h'
   injection h'
 
+/-- Normal-return nodes determine their returned value. -/
 theorem retNormal_inj {v1 v2 : Value} {m1 m2 : Memory}
     (h : MirStepNode.retNormal v1 m1 = MirStepNode.retNormal v2 m2) :
     v1 = v2 := by
