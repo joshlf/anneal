@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -464,6 +465,9 @@ pub fn dyn_dispatch(x: &u32) -> u32 {
 
 
 _FAKE_LEAN_RUN_HONEST_BANNER = "Thread Budget (-j) : 4 threads (LEAN_NUM_THREADS=1)"
+# Wrapper invocations one uncached probe of an honoring fake wrapper makes: the text
+# `--probe` plus one execution check per mode.
+_FAKE_PROBE_SPAWNS = 1 + len(suite._WRAPPER_EXEC_CHECK_FLAGS)
 
 
 def _fake_lean_run_source(
@@ -473,6 +477,7 @@ def _fake_lean_run_source(
     probe_rc: int = 0,
     probe_sleep: float = 0,
     exec_threads: str | None = None,
+    exec_threads_mode: str | None = None,
     exec_rc: int = 0,
     exec_stdout: str = "",
     exec_sleep: float = 0,
@@ -519,7 +524,8 @@ def _fake_lean_run_source(
         f"    sys.exit({exec_rc!r})\n"
         "cmd = args[args.index('--') + 1:]\n"
         "env = dict(os.environ)\n"
-        f"if not in_scope and {exec_threads!r} is not None:\n"
+        f"mode_hit = {exec_threads_mode!r} is None or ('--mode', {exec_threads_mode!r}) in zip(args, args[1:])\n"
+        f"if not in_scope and mode_hit and {exec_threads!r} is not None:\n"
         f"    env['LEAN_NUM_THREADS'] = {exec_threads!r}\n"
         f"sys.stdout.write({exec_stdout!r})\n"
         "sys.stdout.flush()\n"
@@ -6257,6 +6263,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 ("probe_nonzero_exit", {"probe_text": honest, "probe_rc": 2}, False),
                 ("exec_nonzero_exit", {"probe_text": honest, "exec_rc": 1}, False),
                 ("exec_stdout_chatter", {"probe_text": honest, "exec_stdout": "[wrapper] scope ok\n"}, False),
+                # Honest in one mode, clobbering in the other: the suite's steps run in `build`.
+                ("build_mode_only_clobber", {"probe_text": honest, "exec_threads": "3", "exec_threads_mode": "build"}, False),
+                ("file_mode_only_clobber", {"probe_text": honest, "exec_threads": "3", "exec_threads_mode": "file"}, False),
             ]
             for label, kwargs, expected in cases:
                 wrapper = _write_fake_lean_run(root / label / "anneal-lean-run", log=log, **kwargs)
@@ -6271,11 +6280,34 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             for call in probe_calls:
                 self.assertEqual(call["args"], ["--mode", "build", "--concurrency", "1", "--probe"])
             self.assertTrue(exec_calls)
-            for call in exec_calls:
-                self.assertEqual(
-                    call["args"],
+            exec_argvs = [
+                [*flags, "--", sys.executable, "-B", "-c", suite._WRAPPER_EXEC_THREADS_DUMP]
+                for flags in suite._WRAPPER_EXEC_CHECK_FLAGS
+            ]
+            self.assertEqual(
+                exec_argvs,
+                [
                     ["--mode", "file", "--no-slot-lock", "--", sys.executable, "-B", "-c", suite._WRAPPER_EXEC_THREADS_DUMP],
-                )
+                    [
+                        "--mode",
+                        "build",
+                        "--concurrency",
+                        "1",
+                        "--no-slot-lock",
+                        "--",
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        suite._WRAPPER_EXEC_THREADS_DUMP,
+                    ],
+                ],
+            )
+            for call in exec_calls:
+                self.assertIn(call["args"], exec_argvs)
+            # An honoring wrapper is executed in both modes; the `build` check is never skipped.
+            for label in ("honest_banner_honoring_exec", "no_banner_honoring_exec", "file_mode_only_clobber"):
+                modes = [c["args"][1] for c in exec_calls if Path(c["argv0"]).parent.name == label]
+                self.assertEqual(sorted(modes), ["build", "file"] if label != "file_mode_only_clobber" else ["file"], label)
             for call in calls:
                 env = call["env"]
                 self.assertEqual(env["LEAN_NUM_THREADS"], "1")
@@ -6365,7 +6397,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 suite._wrapper_honors_lean_num_threads(scrub_probe, env={**os.environ, **hostile_overrides})
             )
             scrub_calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()[before:]]
-            self.assertEqual(len(scrub_calls), 2)
+            self.assertEqual(len(scrub_calls), _FAKE_PROBE_SPAWNS)
             for call in scrub_calls:
                 for key in hostile_overrides:
                     self.assertIsNone(call["env"][key], key)
@@ -6408,7 +6440,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 )
             )
             new_calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()[before:]]
-            self.assertEqual(len(new_calls), 2)
+            self.assertEqual(len(new_calls), _FAKE_PROBE_SPAWNS)
             for call in new_calls:
                 self.assertEqual(call["slice"], "[Slice]\nMemoryMax=1234M\n")
                 self.assertEqual(call["env"]["HOME"], os.fspath(fake_home))
@@ -6449,6 +6481,73 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                         f"probe triggered daemon-reload: {sc_calls}",
                     )
 
+    def test_wrapper_probe_never_reloads_systemd_and_caches_execute_only_wrappers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(suite._WRAPPER_THREAD_PROBE_CACHE, clear=True):
+            root = Path(tmp).resolve()
+            spy_log = root / "systemctl_calls.txt"
+            spy_bin = root / "spy_bin"
+            spy_bin.mkdir()
+            spy = spy_bin / "systemctl"
+            spy.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(spy_log))}\nexit 0\n', encoding="utf-8")
+            spy.chmod(0o755)
+
+            # The shim swallows `daemon-reload` and forwards everything else, argv intact.
+            probe_env = {"PATH": os.pathsep.join([os.fspath(spy_bin), "/usr/bin", "/bin"])}
+            suite._install_probe_systemctl_shim(probe_env, root / "shim")
+            self.assertEqual(probe_env["PATH"].split(os.pathsep)[0], os.fspath(root / "shim"))
+            self.assertEqual(shutil.which("systemctl", path=probe_env["PATH"]), os.fspath(root / "shim/systemctl"))
+            for argv in (["--user", "daemon-reload"], ["daemon-reload"], ["--user", "show", "-p", "Version", "--value"]):
+                res = subprocess.run(["systemctl", *argv], env=probe_env, capture_output=True, check=False, timeout=10)
+                self.assertEqual(res.returncode, 0, argv)
+            self.assertEqual(spy_log.read_text(encoding="utf-8").splitlines(), ["--user show -p Version --value"])
+
+            # End to end on the real wrapper: a live unit whose `MemoryHigh` / `MemoryMax` match
+            # but whose text does not (an operator comment, another wrapper's template) would
+            # make `ensure_workloads_slice` rewrite it and reload the user manager.
+            spy_log.unlink()
+            live_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip() or os.fspath(Path.home() / ".config")
+            live_unit = Path(live_cfg) / "systemd/user/anneal-workloads.slice"
+            home = root / "home"
+            unit = home / ".config/systemd/user/anneal-workloads.slice"
+            unit.parent.mkdir(parents=True)
+            unit.write_text(
+                (live_unit.read_text(encoding="utf-8") if live_unit.is_file() else "[Slice]\nMemoryMax=1M\n")
+                + "# operator note\n",
+                encoding="utf-8",
+            )
+            real_systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
+            if Path(real_systemctl).is_file():
+                forward = spy_bin / "systemctl"
+                forward.write_text(
+                    f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(spy_log))}\n'
+                    f'[ "$*" = "--user daemon-reload" ] && exit 0\nexec {shlex.quote(real_systemctl)} "$@"\n',
+                    encoding="utf-8",
+                )
+                env = {
+                    **os.environ,
+                    "HOME": os.fspath(home),
+                    "PATH": os.pathsep.join([os.fspath(spy_bin), os.environ.get("PATH", "/usr/bin:/bin")]),
+                }
+                env.pop("XDG_CONFIG_HOME", None)
+                self.assertTrue(suite._wrapper_honors_lean_num_threads(REPO_ROOT / "scripts/anneal-lean-run", env=env))
+                calls = spy_log.read_text(encoding="utf-8").splitlines() if spy_log.exists() else []
+                self.assertFalse([c for c in calls if "daemon-reload" in c], calls)
+
+            # An execute-only (unreadable) wrapper has no content digest but is still memoized on
+            # its identity, so repeated `build_suite_steps()` calls do not re-probe it.
+            if os.geteuid() != 0:
+                exec_only = _write_fake_lean_run(root / "xonly/anneal-lean-run")
+                exec_only.chmod(0o111)
+                with mock.patch.object(suite, "_probe_wrapper_thread_honoring", return_value=True) as body:
+                    for _ in range(3):
+                        self.assertTrue(suite._wrapper_honors_lean_num_threads(exec_only))
+                    self.assertEqual(body.call_count, 1)
+                    time.sleep(0.05)  # past one coarse kernel timestamp tick
+                    exec_only.chmod(0o755)
+                    exec_only.chmod(0o111)  # `st_ctime_ns` moves: re-probed
+                    self.assertTrue(suite._wrapper_honors_lean_num_threads(exec_only))
+                    self.assertEqual(body.call_count, 2)
+
     def test_wrapper_honors_lean_num_threads_memo_invalidates_on_any_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(suite._WRAPPER_THREAD_PROBE_CACHE, clear=True):
             root = Path(tmp).resolve()
@@ -6470,7 +6569,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             wrapper.chmod(0o755)
             self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper))
             first = spawns()
-            self.assertEqual(first, 2)
+            self.assertEqual(first, _FAKE_PROBE_SPAWNS)
             # Repeated calls (as from repeated `build_suite_steps()`) spawn nothing.
             for _ in range(3):
                 self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper))
@@ -6487,6 +6586,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 (st.st_ino, st.st_size, st.st_mtime_ns),
             )
             self.assertFalse(suite._wrapper_honors_lean_num_threads(wrapper))
+            # `--probe` plus the first (`file`-mode) execution check, which already fails.
             self.assertEqual(spawns(), first + 2)
             first = spawns()
             # Even an identical `os.stat` (as on a filesystem with coarse timestamps) cannot
@@ -6502,7 +6602,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             wrapper.write_text(padded(honest_src), encoding="utf-8")
             with mock.patch.object(suite.os, "stat", side_effect=frozen_stat):
                 self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper))
-            self.assertEqual(spawns(), first + 2)
+            self.assertEqual(spawns(), first + _FAKE_PROBE_SPAWNS)
             wrapper.write_text(padded(clobbering_src), encoding="utf-8")
             first = spawns()
 
@@ -6510,17 +6610,17 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             replacement = _write_fake_lean_run(root / "bin/.anneal-lean-run.new", log=log)
             os.replace(replacement, wrapper)
             self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper))
-            self.assertEqual(spawns(), first + 2)
+            self.assertEqual(spawns(), first + _FAKE_PROBE_SPAWNS)
             first = spawns()
 
             # Touching the mtime alone re-probes; a different probe environment or timeout too.
             os.utime(wrapper, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
             self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper))
-            self.assertEqual(spawns(), first + 2)
+            self.assertEqual(spawns(), first + _FAKE_PROBE_SPAWNS)
             self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper, env={**os.environ, "ANNEAL_X": "1"}))
-            self.assertEqual(spawns(), first + 4)
+            self.assertEqual(spawns(), first + 2 * _FAKE_PROBE_SPAWNS)
             self.assertTrue(suite._wrapper_honors_lean_num_threads(wrapper, timeout_sec=6.0))
-            self.assertEqual(spawns(), first + 6)
+            self.assertEqual(spawns(), first + 3 * _FAKE_PROBE_SPAWNS)
             first = spawns()
             # Ambient values the probe overrides or scrubs do not split the cache.
             for noise in (

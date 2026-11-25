@@ -74,6 +74,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -5359,13 +5360,27 @@ _WRAPPER_PROBE_THREAD_BANNER_RE = re.compile(
 _WRAPPER_PROBE_LEAN_THREADS_RE = re.compile(
     r"(?<![A-Za-z0-9_])LEAN_NUM_THREADS\s*=\s*([^\s),;]*)"
 )
-# Slice envelope limits reported by `anneal-lean-run --probe`, used to pre-seed a
-# matching `anneal-workloads.slice` in the probe's private `XDG_CONFIG_HOME` so the
-# exec check's `ensure_workloads_slice` is a no-op and never triggers `daemon-reload`.
-_WRAPPER_PROBE_SLICE_MAX_RE = re.compile(r"\bW_slice_max=(\d+)\s+MiB\b")
-_WRAPPER_PROBE_SLICE_HIGH_RE = re.compile(r"\bW_slice_high=(\d+)\s+MiB\b")
-# Child the execution check runs under the wrapper: prints the `LEAN_NUM_THREADS` it got.
+# Child the execution checks run under the wrapper: prints the `LEAN_NUM_THREADS` it got.
 _WRAPPER_EXEC_THREADS_DUMP = "import os, sys; sys.stdout.write(os.environ.get('LEAN_NUM_THREADS', ''))"
+# Wrapper flags of the execution checks, one per mode, both slot-free: the brief-mandated
+# `file`-mode check, and the `build` mode (at the `--concurrency 1` every wrapped suite
+# step uses) that all `LOW_RAM_SINGLE_THREAD_STEPS` actually run in, so a wrapper that
+# keeps the caller's thread count in one mode but clobbers it in the other is rejected.
+_WRAPPER_EXEC_CHECK_FLAGS: tuple[tuple[str, ...], ...] = (
+    ("--mode", "file", "--no-slot-lock"),
+    ("--mode", "build", "--concurrency", "1", "--no-slot-lock"),
+)
+# `systemctl` shim placed first on the probe's `PATH`: forwards every call to the real
+# `systemctl` but swallows `daemon-reload`, so a wrapper that reconciles its
+# `anneal-workloads.slice` unit inside the private `XDG_CONFIG_HOME` (whatever template
+# it renders) can never reload the live user manager from a capability probe.
+_WRAPPER_PROBE_SYSTEMCTL_SHIM = (
+    "#!/bin/sh\n"
+    'for arg in "$@"; do\n'
+    '  [ "$arg" = daemon-reload ] && exit 0\n'
+    "done\n"
+    'exec {real} "$@"\n'
+)
 # Most probe output read back (a sane wrapper prints well under 4 KiB). Output exceeding
 # this cap fails closed rather than silently truncating trailing clobber lines.
 _WRAPPER_PROBE_MAX_OUTPUT_BYTES = 1 << 20
@@ -5468,40 +5483,25 @@ def _seed_probe_workloads_slice_unit(env: Mapping[str, str], config_dir: Path) -
             continue
 
 
-def _sync_probe_workloads_slice_from_probe_text(probe_text: str, config_dir: Path) -> None:
-    """Pre-seed a matching `anneal-workloads.slice` from `--probe` envelope numbers when
-    no matching unit was seeded from the caller's config dir, preventing the exec check's
-    `ensure_workloads_slice` from calling `systemctl --user daemon-reload` on a live host."""
-    m_max = _WRAPPER_PROBE_SLICE_MAX_RE.search(probe_text)
-    m_high = _WRAPPER_PROBE_SLICE_HIGH_RE.search(probe_text)
-    if m_max is None or m_high is None:
+def _install_probe_systemctl_shim(probe_env: dict[str, str], shim_dir: Path) -> None:
+    """Prepend `shim_dir` (holding the `_WRAPPER_PROBE_SYSTEMCTL_SHIM` `systemctl`) to
+    `probe_env["PATH"]`. The real `systemctl` is the one `probe_env` would have found
+    (else `/usr/bin/systemctl`); with none at all, no shim is installed and the wrapper
+    finds no `systemctl` either."""
+    raw_path = probe_env.get("PATH", "")
+    real = shutil.which("systemctl", path=raw_path) if raw_path else None
+    if real is None and Path("/usr/bin/systemctl").is_file():
+        real = "/usr/bin/systemctl"
+    if real is None:
         return
-    w_max = int(m_max.group(1))
-    w_high = int(m_high.group(1))
-    if w_max <= 0 or w_high <= 0:
-        return
-    dest = config_dir / "systemd" / "user" / "anneal-workloads.slice"
-    rendered = (
-        "[Unit]\n"
-        "Description=Anneal Bounded Compute & Warm LSP Workloads Slice\n"
-        "\n"
-        "[Slice]\n"
-        "MemoryAccounting=yes\n"
-        f"MemoryHigh={w_high}M\n"
-        f"MemoryMax={w_max}M\n"
-        "MemorySwapMax=0\n"
-        "ManagedOOMMemoryPressure=kill\n"
-        "ManagedOOMMemoryPressureLimit=40%\n"
-    )
     try:
-        if dest.is_file():
-            existing = dest.read_text(encoding="utf-8", errors="replace")
-            if f"MemoryHigh={w_high}M\n" in existing and f"MemoryMax={w_max}M\n" in existing:
-                return
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(rendered, encoding="utf-8")
+        shim_dir.mkdir(mode=0o700, exist_ok=True)
+        shim = shim_dir / "systemctl"
+        shim.write_text(_WRAPPER_PROBE_SYSTEMCTL_SHIM.format(real=shlex.quote(os.path.abspath(real))), encoding="utf-8")
+        shim.chmod(0o700)
     except OSError:
         return
+    probe_env["PATH"] = os.pathsep.join([os.fspath(shim_dir), raw_path]) if raw_path else os.fspath(shim_dir)
 
 
 def _probe_wrapper_thread_honoring(
@@ -5525,6 +5525,7 @@ def _probe_wrapper_thread_honoring(
             "XDG_CONFIG_HOME": os.fspath(config_dir),
             "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
         }
+        _install_probe_systemctl_shim(probe_env, tmp_dir / "shim-bin")
 
         probed = _run_wrapper_probe_cmd(
             [abs_path, "--mode", "build", "--concurrency", "1", "--probe"],
@@ -5542,19 +5543,21 @@ def _probe_wrapper_thread_honoring(
         if any(t.strip() != "1" for _b, t in _WRAPPER_PROBE_THREAD_BANNER_RE.findall(probe_text)):
             return False
 
-        _sync_probe_workloads_slice_from_probe_text(probe_text, config_dir)
-
         # A `(LEAN_NUM_THREADS=1)` banner is necessary but not sufficient: on a 1-thread
         # budget a wrapper that prints its budget also prints `1`, a minimal wrapper prints
         # no banner at all, and a wrapper's banner can disagree with what it exports. So
-        # the verdict is always what a real command run through the wrapper sees.
-        executed = _run_wrapper_probe_cmd(
-            [abs_path, "--mode", "file", "--no-slot-lock", "--", sys.executable, "-B", "-c", _WRAPPER_EXEC_THREADS_DUMP],
-            env=probe_env,
-            cwd=work_dir,
-            timeout_sec=timeout_sec,
-        )
-        return executed is not None and executed[0] == 0 and executed[1] == "1"
+        # the verdict is always what a real command run through the wrapper sees, in
+        # both modes (`_WRAPPER_EXEC_CHECK_FLAGS`).
+        for flags in _WRAPPER_EXEC_CHECK_FLAGS:
+            executed = _run_wrapper_probe_cmd(
+                [abs_path, *flags, "--", sys.executable, "-B", "-c", _WRAPPER_EXEC_THREADS_DUMP],
+                env=probe_env,
+                cwd=work_dir,
+                timeout_sec=timeout_sec,
+            )
+            if executed is None or executed[0] != 0 or executed[1] != "1":
+                return False
+        return True
 
 
 def _wrapper_honors_lean_num_threads(
@@ -5573,13 +5576,15 @@ def _wrapper_honors_lean_num_threads(
     defeats the `LOW_RAM_SINGLE_THREAD_STEPS` policy on a low-RAM host.
 
     Runs, with `LEAN_NUM_THREADS=1`, `ANNEAL_LSP_NO_EVICT=1`, scrubbed outer-scope and
-    resource-override `ANNEAL_*` env vars, and private temporary `XDG_CONFIG_HOME` /
-    `XDG_RUNTIME_DIR`, each bounded by `timeout_sec`:
+    resource-override `ANNEAL_*` env vars, private temporary `XDG_CONFIG_HOME` /
+    `XDG_RUNTIME_DIR`, and a `PATH`-first `systemctl` shim that swallows `daemon-reload`,
+    each bounded by `timeout_sec`:
     1. `<wrapper> --mode build --concurrency 1 --probe` (text): a non-zero exit, a
        timeout, oversized output, or any reported `LEAN_NUM_THREADS=<T>` with `<T> != 1`
        -> `False`;
     2. `<wrapper> --mode file --no-slot-lock -- <python> -B -c <print LEAN_NUM_THREADS>`
-       (holds no build slot): `True` iff it exits 0 and stdout is literally `"1"`.
+       and `<wrapper> --mode build --concurrency 1 --no-slot-lock -- <same>` (neither
+       holds a build slot): `True` iff both exit 0 and print literally `"1"`.
     A missing, non-regular, or non-executable path is `False` without spawning anything.
     The wrapper always runs by absolute path (a bare relative name would otherwise be
     looked up on `PATH`). Results are memoized in `_WRAPPER_THREAD_PROBE_CACHE`.
@@ -5609,11 +5614,10 @@ def _wrapper_honors_lean_num_threads(
             if (st_fd.st_dev, st_fd.st_ino) != (st.st_dev, st.st_ino):
                 torn = True
         except PermissionError:
-            # Execute-only binary (e.g. mode 0o111): still probe it, but do not cache
-            # without a content digest.
+            # Execute-only binary (e.g. mode 0o111): no content digest, so it is cached on
+            # its identity and timestamps alone (any rewrite still changes `st_ctime_ns`).
             digest = None
-            st_after = st
-            torn = True
+            st_after = os.stat(abs_path)
     except (OSError, ValueError, TypeError):
         return False
     env_map: Mapping[str, str] = os.environ if env is None else env
@@ -5646,8 +5650,8 @@ def _wrapper_honors_lean_num_threads(
         st_after.st_ctime_ns,
         st_after.st_size,
     ):
-        # Unreadable execute-only binary or rewritten while hashing: probe it, but cache
-        # nothing under a missing digest or torn identity.
+        # Rewritten (or replaced) while hashing: probe it, but cache nothing under a torn
+        # identity.
         return _probe_wrapper_thread_honoring(abs_path, probe_base, env_map, timeout)
     key = (abs_path, *identity, digest, env_digest, timeout)
     cached = _WRAPPER_THREAD_PROBE_CACHE.get(key)
