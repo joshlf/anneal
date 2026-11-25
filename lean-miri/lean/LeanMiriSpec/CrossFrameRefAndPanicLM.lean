@@ -1291,6 +1291,40 @@ unroll_loops lmCaseU := lmCase fuel 0 with lmAllocStackU, lmStoreU32U, lmLoadU32
   lmPtrOffsetInboundsU, lmRetagRefU, lmExitCallU
 unroll_loops lmCrossFramePanicObserveU := lmCrossFramePanicObserve fuel 0 with lmCaseU
 
+/-- **Root-unwind body wrapped in an outer catch harness** (LeanMiri mirror of MiniRust
+`mrProgRootUnwindCaught`): the same panicking body as Cases `26`/`27` (write `77`, unwind out of
+a cleanup block), but executed one frame above the root with an `FnEntry`-protected `&mut x`;
+vendored `UnwindResume` pops it into the harness's `.Cleanup bb2` catch pad and vendored
+`Unwind.popPayload` catches -> `.unwound 77`. -/
+def lmRootUnwindCaught (tb : Bool) : Except LmExecFailure LmCrossFramePanicObs := do
+  let st := lmInit tb
+  let (px, st) ← lmAllocStack st 4 align4
+  let st ← lmStoreU32 st px 0
+  let st := lmEnterCall st
+  let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+  let st ← lmStoreU32 st pr 77
+  let st ← lmStartUnwind st
+  let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+  lmCfExpect o (.atBlock 2)
+  let st ← lmCatchUnwind st
+  let (v, _) ← lmLoadU32 st px
+  .ok (.unwound v)
+
+unroll_loops lmRootUnwindCaughtU := lmRootUnwindCaught fuel 0 with lmAllocStackU, lmStoreU32U,
+  lmLoadU32U, lmRetagRefU, lmExitCallU
+
+/-- **Exact LeanMiri root-frame unwind boundary vs. catch-harness characterization** (both
+`treeBorrows` modes): the bare root unwind (Cases `26`/`27`, vendored `returnFromCurrentFrame`
+on a 1-frame stack) is `.ub`, while the identical panicking body wrapped in an outer catch
+harness is `.unwound 77` — matching Trusted's `rootUnwindCeiling = true` Case `27` verdict and
+MiniRust's `mr_root_unwind_boundary_vs_catch_harness`. -/
+theorem lm_root_unwind_boundary_vs_catch_harness :
+    observeLm (lmCase false 27) = .ub ∧ observeLm (lmCase true 27) = .ub ∧
+    lmRootUnwindCaught false = .ok (.unwound 77) ∧
+    lmRootUnwindCaught true = .ok (.unwound 77) := by
+  rw [lmCaseU.eq_src, lmRootUnwindCaughtU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
 /-- Frozen expected LeanMiri table for `treeBorrows = false`. -/
 def lmExpectedBasicList : List LmCrossFramePanicObs :=
   [.okVal 42 42,
@@ -2028,6 +2062,7 @@ theorem ep1_lean_miri_cross_frame_panic_capstone :
     (type_of% @lm_controlFlow_unwindToBlock_laws) ∧
     (type_of% @lm_controlFlow_root_unwind_ub) ∧
     (type_of% @lm_cf_assert_four_way) ∧
+    (type_of% @lm_root_unwind_boundary_vs_catch_harness) ∧
     (type_of% @lm_cf_return_and_unwind_pop_laws) ∧
     (type_of% @lm_unwind_payload_lifo_and_afterStackPop_laws) ∧
     (type_of% @lm_globalState_endCall_lifo_preservation) ∧
@@ -2037,6 +2072,7 @@ theorem ep1_lean_miri_cross_frame_panic_capstone :
    @lmCrossFramePanicObserve_mode_sensitivity, @lm_tb_exact_failure_diagnostics,
    @lm_ptr_wrappingSignedOffset_roundtrip, @lm_controlFlow_unreachable_ub,
    @lm_controlFlow_unwindToBlock_laws, @lm_controlFlow_root_unwind_ub, @lm_cf_assert_four_way,
+   @lm_root_unwind_boundary_vs_catch_harness,
    @lm_cf_return_and_unwind_pop_laws, @lm_unwind_payload_lifo_and_afterStackPop_laws,
    @lm_globalState_endCall_lifo_preservation, @lm_multiframe_lifo_protector_release_witness,
    @lm_stepMirFn_miri_lockstep_simulations⟩

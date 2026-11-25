@@ -1697,6 +1697,46 @@ theorem mr_tb_exact_ub_diagnostics :
       some "the function at the bottom of the stack must not unwind" := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
+/-- **Root-unwind body wrapped in an outer catch harness** (the "unless wrapped in an outer
+catch harness" clause of the root-frame boundary): the SAME panicking body as
+`mrProgRootUnwind` (write `77`, `StartUnwind` → `ResumeUnwind`), but executed one frame above
+`.BottomOfStack` (`FnEntry`-protected `&mut x` argument instead of a root local), with the
+harness catching via `StopUnwind` and reporting `.unwound x`. -/
+def mrProgRootUnwindCaught : Program :=
+  let body := mkFn [(locId 0, u32Ty), (locId 1, mutRefU32Ty)] [locId 1] (locId 0)
+    [(bbId 0, ⟨[
+      .Validate (.Local (locId 1)) true,
+      .Assign (.Deref (.Load (.Local (locId 1))) u32Ty) (cU32 77)
+    ], .StartUnwind cNullRaw (bbId 1), .Regular⟩),
+     (bbId 1, ⟨[], .ResumeUnwind, .Cleanup⟩)]
+  let main := mkFn
+    [(locId 0, u32Ty), (locId 1, u32Ty), (locId 2, u32Ty), (locId 3, u32Ty), (locId 4, u32Ty)]
+    [] (locId 0)
+    [(bbId 0, ⟨[
+      .StorageLive (locId 3),
+      .StorageLive (locId 4),
+      .Assign (.Local (locId 3)) (cU32 0)
+    ], .Call (cFn 1) .Rust [.ByValue (.AddrOf (.Local (locId 3)) mutRefU32PtrTy)]
+         (.Local (locId 4)) (some (bbId 1)) (some (bbId 2)), .Regular⟩),
+     (bbId 1, ⟨finishStmts 0 (.Load (.Local (locId 4))) (.Load (.Local (locId 3))),
+               exitTerm, .Regular⟩),
+     (bbId 2, ⟨[], .StopUnwind (bbId 3), .Catch⟩),
+     (bbId 3, ⟨finishStmts 2 (cU32 0) (.Load (.Local (locId 3))), exitTerm, .Regular⟩)]
+  mkProg [(fnId 0, main), (fnId 1, body)]
+
+/-- **Exact MiniRust root-frame unwind boundary `↔` catch-harness characterization** on BOTH
+`Mach` and `MachTB`: the bare root unwind (Cases `26`/`27`) faults with `BottomOfStack` UB,
+while the identical panicking body wrapped in an outer catch harness is observed as
+`.unwound 77` — exactly Trusted's `rootUnwindCeiling = true` Case `27` observation. -/
+theorem mr_root_unwind_boundary_vs_catch_harness :
+    runProgramObsM (M := BM) () mrProgRootUnwind 120 = .ub ∧
+    runProgramObsM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams)
+      mrProgRootUnwind 120 = .ub ∧
+    runProgramObsM (M := BM) () mrProgRootUnwindCaught 120 = .unwound 77 ∧
+    runProgramObsM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams)
+      mrProgRootUnwindCaught 120 = .unwound 77 := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
 end CanonicalMrPrograms
 
 /-! ## §5. Episode 1 MiniRust Capstone & Silent Axiom / Import-Isolation Audit -/
@@ -1730,7 +1770,8 @@ theorem ep1_minirust_cross_frame_panic_capstone :
     (type_of% @mrCrossFramePanicObserve_out_of_range) ∧
     (type_of% @mrCrossFramePanicObserve_mode_sensitivity) ∧
     (type_of% @mrCanonicalProg_tb_wfLive) ∧
-    (type_of% @mr_tb_exact_ub_diagnostics) :=
+    (type_of% @mr_tb_exact_ub_diagnostics) ∧
+    (type_of% @mr_root_unwind_boundary_vs_catch_harness) :=
   ⟨@bootProgramM_tb_wfLive, @runToStopM_tb_wfLive, @evalPtrOffsetM_wrapping_eq,
    @evalPtrOffsetM_inbounds_eq, @ptrOffsetWrappingM_roundtrip, @evalTerminatorM_unreachable_ub,
    @evalTerminatorM_switch_assert, @evalTerminatorM_abort, @evalResumeUnwindM_dispatch,
@@ -1743,7 +1784,8 @@ theorem ep1_minirust_cross_frame_panic_capstone :
    @trusted_evalBinOpOffset_oob_none, @trusted_evalArithOffset_roundtrip,
    @trusted_restoreCallerProtectors_releases, @mrCrossFramePanicObserve_table,
    @mrCrossFramePanicObserve_out_of_range, @mrCrossFramePanicObserve_mode_sensitivity,
-   @mrCanonicalProg_tb_wfLive, @mr_tb_exact_ub_diagnostics⟩
+   @mrCanonicalProg_tb_wfLive, @mr_tb_exact_ub_diagnostics,
+   @mr_root_unwind_boundary_vs_catch_harness⟩
 
 section AxiomAudit
 open Lean Elab Command

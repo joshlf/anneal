@@ -347,6 +347,21 @@ theorem trustedExpected_ne_authority_iff (idx : Nat) :
       · rfl
     exact ⟨fun hN => absurd hEq hN, fun h27 => absurd h27 hNe⟩
 
+/-- **Canonical-table non-degeneracy guard**: NO canonical cell (`idx < 28`) of either authority
+table or of the Trusted table is a fail-closed `.invalidOrUnsupported` or `.specPanic`
+observation, so every one of the `28 × 3` canonical verdicts is a genuine semantic outcome
+(normal / cleanup-recovered / unwound / abort / UB), never a vacuous "both sides unsupported"
+agreement. -/
+theorem canonical_cells_nondegenerate :
+    ∀ idx, idx < canonicalCaseCount →
+      authorityExpected .basic idx ≠ .invalidOrUnsupported ∧
+      authorityExpected .basic idx ≠ .specPanic ∧
+      authorityExpected .treeBorrows idx ≠ .invalidOrUnsupported ∧
+      authorityExpected .treeBorrows idx ≠ .specPanic ∧
+      trustedExpected idx ≠ .invalidOrUnsupported ∧
+      trustedExpected idx ≠ .specPanic := by
+  decide
+
 private theorem range_map_cell {α : Type} {f : Nat → α} {xs : List α} {n : Nat}
     (h : (List.range n).map f = xs) (i : Nat) (hi : i < n) :
     some (f i) = xs[i]? := by
@@ -1580,6 +1595,32 @@ theorem contract_three_way_and_root_ceiling_exact (c : CrossFramePanicDualContra
 
 end TrustedAndUnwindBridge
 
+/-- **Root-ceiling divergence reconciliation via an outer catch harness**: the single Case `27`
+divergence is EXACTLY the "MiniRust hits `BottomOfStack` UB unless wrapped in an outer catch
+harness" boundary. Trusted's `rootUnwindCeiling = true` observation of the bare root unwind
+(`.unwound 77`) coincides on BOTH `Mach` and `MachTB` with MiniRust executing the same panicking
+body wrapped in a `StopUnwind` catch harness (`mrProgRootUnwindCaught`), while the unwrapped
+MiniRust root unwind is `.ub` (= Trusted with `rootUnwindCeiling = false`, Case `26`). -/
+theorem root_ceiling_divergence_reconciled_by_catch_harness :
+    trustedCrossFramePanicObserve 27 =
+      ofMrObs (MiniRustSpec.CrossFrameRefAndPanicMR.runProgramObsM (M := MiniRustSpec.Interp.BM) ()
+        MiniRustSpec.CrossFrameRefAndPanicMR.mrProgRootUnwindCaught 120) ∧
+    trustedCrossFramePanicObserve 27 =
+      ofMrObs (MiniRustSpec.CrossFrameRefAndPanicMR.runProgramObsM (M := MiniRustSpec.Interp.TBM)
+        ({ implicit_writes := true } : MiniRustSpec.Gen.TreeBorrowsParams)
+        MiniRustSpec.CrossFrameRefAndPanicMR.mrProgRootUnwindCaught 120) ∧
+    trustedCrossFramePanicObserve 26 =
+      ofMrObs (MiniRustSpec.CrossFrameRefAndPanicMR.runProgramObsM (M := MiniRustSpec.Interp.BM) ()
+        MiniRustSpec.CrossFrameRefAndPanicMR.mrProgRootUnwind 120) ∧
+    trustedCrossFramePanicObserve 26 =
+      ofMrObs (MiniRustSpec.CrossFrameRefAndPanicMR.runProgramObsM (M := MiniRustSpec.Interp.TBM)
+        ({ implicit_writes := true } : MiniRustSpec.Gen.TreeBorrowsParams)
+        MiniRustSpec.CrossFrameRefAndPanicMR.mrProgRootUnwind 120) := by
+  have hMr := MiniRustSpec.CrossFrameRefAndPanicMR.mr_root_unwind_boundary_vs_catch_harness
+  rw [trustedCrossFramePanicObserve_matches_expected, trustedCrossFramePanicObserve_matches_expected,
+    hMr.1, hMr.2.1, hMr.2.2.1, hMr.2.2.2]
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
 /-! ## §6. Genuine `Anneal.DualCorrespondenceBundle.DualCorrespondenceBundle` Instantiation & Mode-Sensitivity Guard -/
 
 /-- Lift `CrossFramePanicObs` into `DualCorrespondenceBundle.ExecOutcome4` following
@@ -1593,6 +1634,37 @@ def obsToExecOutcome4 : CrossFramePanicObs → ExecOutcome4 CrossFrameNormalRet 
   | .abort => .fault .unsupported
   | .specPanic => .fault .unsupported
   | .invalidOrUnsupported => .fault .unsupported
+
+/-- The `ExecOutcome4` lift is lossy exactly at `.fault .unsupported` (the repository-wide
+`abort ↦ unsupported` convention of `ExecOutcome4.ofMirOutcome`). -/
+theorem obsToExecOutcome4_unsupported_iff (o : CrossFramePanicObs) :
+    obsToExecOutcome4 o = .fault .unsupported ↔
+      o = .abort ∨ o = .specPanic ∨ o = .invalidOrUnsupported := by
+  cases o <;> simp [obsToExecOutcome4]
+
+/-- **Bundle abort faithfulness on every canonical cell**: because no canonical cell is
+`.specPanic` / `.invalidOrUnsupported` (`canonical_cells_nondegenerate`), a bundle-level
+`.fault .unsupported` verdict of the Trusted evaluator, the MiniRust `MachTB` evaluator, or ANY
+certified LeanMiri authority on `idx < 28` means EXACTLY a deterministic `.abort` — the lossy
+`ExecOutcome4` lift cannot hide an unsupported/invalid cell behind an abort. -/
+theorem bundle_unsupported_iff_abort (c : CrossFramePanicDualContract) (idx : Nat)
+    (hi : idx < canonicalCaseCount) :
+    (obsToExecOutcome4 (trustedCrossFramePanicObserve idx) = .fault .unsupported ↔
+      trustedCrossFramePanicObserve idx = .abort) ∧
+    (obsToExecOutcome4 (mrObserve .treeBorrows idx) = .fault .unsupported ↔
+      mrObserve .treeBorrows idx = .abort) ∧
+    (obsToExecOutcome4 (c.lm.observe true idx) = .fault .unsupported ↔
+      c.lm.observe true idx = .abort) := by
+  obtain ⟨_, _, hTbI, hTbS, hTrI, hTrS⟩ := canonical_cells_nondegenerate idx hi
+  rw [trustedCrossFramePanicObserve_matches_expected, contract_lm_tb_eq,
+    mrObserve_matches_expected, obsToExecOutcome4_unsupported_iff,
+    obsToExecOutcome4_unsupported_iff]
+  refine ⟨?_, ?_, ?_⟩ <;>
+    first
+    | exact ⟨fun h => h.elim id (fun h' => h'.elim (fun e => absurd e hTrS)
+        (fun e => absurd e hTrI)), Or.inl⟩
+    | exact ⟨fun h => h.elim id (fun h' => h'.elim (fun e => absurd e hTbS)
+        (fun e => absurd e hTbI)), Or.inl⟩
 
 /-- Three-way agreement support gate: every scenario `idx ≠ 27` (covering all 27 agreement
 scenarios `0..26` plus all out-of-range fail-closed indices `≥ 28`, excluding strictly the
@@ -1899,7 +1971,10 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       (type_of% @trustedCrossFramePanicObserve_out_of_range) ∧
       (type_of% (contract_three_way_and_root_ceiling_exact c))) ∧
     ((type_of% (crossFramePanicDualBundle_projections c)) ∧
-      (type_of% (mrLmModeStepRel_not_mode_invariant c))) :=
+      (type_of% (mrLmModeStepRel_not_mode_invariant c))) ∧
+    ((type_of% @canonical_cells_nondegenerate) ∧
+      (type_of% (bundle_unsupported_iff_abort c)) ∧
+      (type_of% @root_ceiling_divergence_reconciled_by_catch_harness)) :=
   ⟨⟨crossFramePanicOutcomeCodec_tight, crossFramePanicOutcomeCodec_rejects_malformed,
       crossFrameNormalRetCodec_tight, ofMrObs_toMrObs, toMrObs_ofMrObs,
       mirToUnwindAction4_left_inv, mirToUnwindAction4_right_inv⟩,
@@ -1913,7 +1988,9 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       @trusted_unwind_releases_callee_protector, @trusted_unwind_continue_chain_root_boundary,
       @trustedCrossFramePanicObserve_table, @trustedCrossFramePanicObserve_out_of_range,
       contract_three_way_and_root_ceiling_exact c⟩,
-    ⟨crossFramePanicDualBundle_projections c, mrLmModeStepRel_not_mode_invariant c⟩⟩
+    ⟨crossFramePanicDualBundle_projections c, mrLmModeStepRel_not_mode_invariant c⟩,
+    ⟨canonical_cells_nondegenerate, bundle_unsupported_iff_abort c,
+      root_ceiling_divergence_reconciled_by_catch_harness⟩⟩
 
 section AxiomAudit
 open Lean Elab Command
