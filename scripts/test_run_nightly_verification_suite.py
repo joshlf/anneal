@@ -6493,8 +6493,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             spy.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(spy_log))}\nexit 0\n', encoding="utf-8")
             spy.chmod(0o755)
 
-            # The shim swallows `daemon-reload`, `daemon-reexec`, and `anneal-lsp-daemon-*` kills,
-            # and forwards everything else (read-only queries and transient scope kills) argv intact.
+            # The shim is an allowlist: read-only queries and kills of concrete `anneal-run-*.scope`
+            # units reach the real `systemctl`, argv intact; every other call is a no-op exit 0.
             probe_env = {"PATH": os.pathsep.join([os.fspath(spy_bin), "/usr/bin", "/bin"])}
             suite._install_probe_systemctl_shim(probe_env, root / "shim")
             self.assertEqual(probe_env["PATH"].split(os.pathsep)[0], os.fspath(root / "shim"))
@@ -6506,12 +6506,32 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 ["--user", "kill", "-s", "SIGKILL", "anneal-lsp-daemon-123.scope"],
                 ["--user", "show", "-p", "Version", "--value"],
                 ["--user", "kill", "-s", "SIGTERM", "anneal-run-999.scope"],
+                # Mutating verbs a denylist would miss.
+                ["--user", "restart", "anneal-lean-lsp.service"],
+                ["--user", "stop", "anneal-workloads.slice"],
+                ["--user", "start", "evil.service"],
+                ["--user", "set-environment", "LEAN_NUM_THREADS=3"],
+                ["--user", "reset-failed"],
+                ["--user", "enable", "--now", "x.service"],
+                # Kills of anything but concrete `anneal-run-*.scope` units.
+                ["--user", "kill", "-s", "SIGKILL", "anneal-run-*.scope"],
+                ["--user", "kill", "-s", "SIGKILL", "anneal-run-1.scope", "anneal-lsp-daemon-1.scope"],
+                ["--user", "kill", "-s", "SIGKILL", "user@1000.service"],
+                ["--user", "kill", "--signal=SIGKILL"],
+                ["--user", "kill", "-s", "anneal-run-1.scope"],
+                ["--user", "--version"],
+                ["--user", "kill", "--signal=SIGKILL", "anneal-run-2-3.scope"],
             ):
                 res = subprocess.run(["systemctl", *argv], env=probe_env, capture_output=True, check=False, timeout=10)
                 self.assertEqual(res.returncode, 0, argv)
             self.assertEqual(
                 spy_log.read_text(encoding="utf-8").splitlines(),
-                ["--user show -p Version --value", "--user kill -s SIGTERM anneal-run-999.scope"],
+                [
+                    "--user show -p Version --value",
+                    "--user kill -s SIGTERM anneal-run-999.scope",
+                    "--user --version",
+                    "--user kill --signal=SIGKILL anneal-run-2-3.scope",
+                ],
             )
 
             # When `PATH` is unset (`env={}` / `env={"HOME": ...}`), the shim preserves `os.defpath`

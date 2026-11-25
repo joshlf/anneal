@@ -5371,19 +5371,46 @@ _WRAPPER_EXEC_CHECK_FLAGS: tuple[tuple[str, ...], ...] = (
     ("--mode", "file", "--no-slot-lock"),
     ("--mode", "build", "--concurrency", "1", "--no-slot-lock"),
 )
-# `systemctl` shim placed first on the probe's `PATH`: forwards read-only queries and
-# transient probe-scope kills to the real `systemctl`, but swallows `daemon-reload`,
-# `daemon-reexec`, and `anneal-lsp-daemon-*` kills so a capability probe (even against
-# an older wrapper that ignores `ANNEAL_LSP_NO_EVICT`) can never reload the live user
-# manager or evict live warm LSP daemons.
+# `systemctl` shim placed first on the probe's `PATH`, an allowlist rather than a
+# denylist: it forwards to the real `systemctl` only read-only queries (`show`, `status`,
+# `is-*`, `cat`, `list-*`, or no verb at all, e.g. `--version`) and `kill`s whose every
+# unit is a concrete (glob-free) `anneal-run-*.scope`, i.e. a transient scope the probed
+# wrapper itself opened. Every other call (`daemon-reload`, `daemon-reexec`, `start` /
+# `stop` / `restart` of any unit, `kill` of `anneal-lsp-daemon-*` or of a glob such as
+# `anneal-run-*.scope` that would hit every live build, `set-environment`, ...) exits 0
+# without effect, so a capability probe can never reload the live user manager, touch
+# its units, or evict warm LSP daemons, whatever the wrapper (or a newer one) tries.
 _WRAPPER_PROBE_SYSTEMCTL_SHIM = (
     "#!/bin/sh\n"
+    'verb=""\n'
     'for arg in "$@"; do\n'
     '  case "$arg" in\n'
-    "    daemon-reload|daemon-reexec|anneal-lsp-daemon-*) exit 0 ;;\n"
+    "    -*) ;;\n"
+    '    *) verb="$arg"; break ;;\n'
     "  esac\n"
     "done\n"
-    'exec {real} "$@"\n'
+    'case "$verb" in\n'
+    '  ""|show|status|is-active|is-enabled|is-failed|is-system-running|cat|list-units|list-unit-files)\n'
+    '    exec {real} "$@" ;;\n'
+    "  kill)\n"
+    "    units=0\n"
+    "    prev=\"\"\n"
+    '    for arg in "$@"; do\n'
+    '      if [ "$prev" = "-s" ] || [ "$prev" = "--signal" ] || [ "$prev" = "--kill-whom" ]; then\n'
+    '        prev="$arg"; continue\n'
+    "      fi\n"
+    '      prev="$arg"\n'
+    '      case "$arg" in\n'
+    "        *[*?[]*) exit 0 ;;\n"
+    "        --user|kill|-s|--signal|--signal=*|--kill-whom|--kill-whom=*) ;;\n"
+    "        anneal-run-*.scope) units=$((units + 1)) ;;\n"
+    "        *) exit 0 ;;\n"
+    "      esac\n"
+    "    done\n"
+    '    [ "$units" -gt 0 ] && exec {real} "$@"\n'
+    "    exit 0 ;;\n"
+    "esac\n"
+    "exit 0\n"
 )
 # Most probe output read back (a sane wrapper prints well under 4 KiB). Output exceeding
 # this cap fails closed rather than silently truncating trailing clobber lines.
@@ -5589,8 +5616,8 @@ def _wrapper_honors_lean_num_threads(
     Runs, with `LEAN_NUM_THREADS=1`, `ANNEAL_LSP_NO_EVICT=1`, an isolated non-existent
     `ANNEAL_LSP_SOCKET`, scrubbed outer-scope and resource-override `ANNEAL_*` env vars,
     private temporary `XDG_CONFIG_HOME` / `XDG_RUNTIME_DIR`, and a `PATH`-first
-    `systemctl` shim that swallows `daemon-reload`, `daemon-reexec`, and
-    `anneal-lsp-daemon-*` kills, each bounded by `timeout_sec`:
+    allowlisting `systemctl` shim (`_WRAPPER_PROBE_SYSTEMCTL_SHIM`: read-only queries and
+    kills of the wrapper's own `anneal-run-*.scope`s only), each bounded by `timeout_sec`:
     1. `<wrapper> --mode build --concurrency 1 --probe` (text): a non-zero exit, a
        timeout, oversized output, or any reported `LEAN_NUM_THREADS=<T>` with `<T> != 1`
        -> `False`;
