@@ -59,6 +59,7 @@ import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
 import LeanMiriSpec.UnwindSetDiscrAndFnPtrLM
+import LeanMiriSpec.FloatArithLM
 import LeanMiriSpec.Audit
 
 /-!
@@ -485,6 +486,18 @@ import LeanMiriSpec.Audit
   `unwrapUnsafeBinder`, and `AggregateKind.closure`; the Trusted strict checks
   the overlay does not enforce, and both sides' binder-read validity verdicts,
   are pinned by `w_ep2_strictCheck_and_validity`.
+* `LeanMiriSpec.FloatArithLM`: IEEE-754 floating-point arithmetic (`add`, `sub`,
+  `mul`, `div`, `rem`), bitwise negation (`neg`, preserving sNaN/qNaN payloads),
+  comparisons (`eq`, `ne`, `lt`, `le`, `gt`, `ge`), ordered `nanChoices`
+  correspondence (`f32`/`f64`, deterministic and nondeterministic modes),
+  exact `FloatOps.{unary, binary}` soundness and completeness, conservative
+  step-hook overlay (`annealStepHooksFloatArith`), real `Miri.Interpreter.Step.step`
+  vs. `stepMirFn` / `EvalRvalueFloatRel` simulations (immediate and indirect
+  locals, uninit UB lockstep, `f16`/`f128` and invalid-`BinOp` fail-closed
+  boundaries), `Ptr2IntTransmutePolicy` (`ucg#630` CTFE rejection vs.
+  `reference#1752` runtime provenance-stripping, provenance-free `{to,from}_bits`
+  agreement, no-forgery `usize -> &u8` and uninit UB), and concrete witnesses
+  `w1_lm_finite_subnormal_overflow` .. `w6_lm_no_forge_ref_uninit`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
