@@ -178,8 +178,11 @@ Reference (`compiler/rustc_middle/src/ty/vtable.rs` at commit
 > }"
 
 Modeling choices (not `rustc` guarantees): `.dropInPlace` additionally records
-the canonical `DefPath` of the concrete `drop_in_place` glue or ADT destructor
-when one is captured (`.none` for types without drop glue); `.method` records
+the canonical `DefPath` of the concrete type's drop glue
+(`Instance::resolve_drop_glue`, i.e. the `drop_glue` lang item
+`core::ptr::drop_glue` that `core::ptr::drop_in_place` calls, at
+`CapturedVTable.concreteTy`; never the ADT's `Drop::drop` method, which is only
+part of the glue) when the type needs dropping (`.none` otherwise); `.method` records
 the resolved `InstanceKind::Item` as its canonical `DefPath` plus erased
 monomorphic type generic arguments when it has no const generic arguments;
 `.unmodeledMethod` represents a valid `VtblEntry::Method(instance)` slot whose

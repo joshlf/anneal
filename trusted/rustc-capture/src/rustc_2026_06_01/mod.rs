@@ -2545,13 +2545,16 @@ pub fn exercise(h: &HasDrop) -> u32 {
             "HrSub must set supertraitOutlivesOk := false, got:\n{hrsub_desc}"
         );
 
-        // 6. Concrete `Drop` impl records `HasDrop`'s destructor in `dropInPlace`.
+        // 6. A type with a `Drop` impl records its drop *glue*
+        // (`core::ptr::drop_glue`, `Instance::resolve_drop_glue`), not the
+        // `Drop::drop` method, in `dropInPlace`.
         assert!(
-            diamond_chunk.contains("CapturedVTableSlot.dropInPlace (Option.some \"dyn_edges::<HasDrop as core::ops::drop::Drop>::drop\")")
-                || (diamond_chunk.contains("CapturedVTableSlot.dropInPlace (Option.some \"")
-                    && diamond_chunk.contains("HasDrop")
-                    && diamond_chunk.contains("drop\"")),
-            "expected concrete HasDrop destructor DefPath in dropInPlace, got:\n{diamond_chunk}"
+            diamond_chunk.contains("CapturedVTableSlot.dropInPlace (Option.some \"core::ptr::drop_glue\")"),
+            "expected drop glue DefPath in dropInPlace, got:\n{diamond_chunk}"
+        );
+        assert!(
+            !diamond_chunk.contains("as core::ops::drop::Drop>::drop"),
+            "dropInPlace must not record the Drop::drop method:\n{diamond_chunk}"
         );
 
         let _ = fs::remove_dir_all(&temp_root);

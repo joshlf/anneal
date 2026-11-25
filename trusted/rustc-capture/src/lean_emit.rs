@@ -1870,8 +1870,11 @@ pub const VTABLE_ALLOC_SPAN: u64 = 16384;
 /// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L13-L26
 ///
 /// Modeling choices: `DropInPlace` carries the canonical path of the concrete
-/// ADT destructor or `drop_in_place` glue when the concrete type needs
-/// dropping (`None` otherwise); `Method` carries the resolved
+/// type's drop glue instance (`Instance::resolve_drop_glue`, i.e. the
+/// `drop_glue` lang item `core::ptr::drop_glue` called by
+/// `core::ptr::drop_in_place`, instantiated at the vtable's concrete type) when
+/// the concrete type needs dropping (`None` otherwise), never the ADT's
+/// `Drop::drop` method, which runs only part of the glue; `Method` carries the resolved
 /// `InstanceKind::Item`'s canonical `DefId` path and erased type generic
 /// arguments when it has no const generic arguments; `UnmodeledMethod` marks a
 /// valid `VtblEntry::Method(instance)` whose `Instance` is a compiler shim or

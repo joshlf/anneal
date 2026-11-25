@@ -4088,16 +4088,26 @@ pub fn compute_crate_dyn_metadata<'tcx>(
         let slots = vtable_entries_for(tcx, *concrete, preds)
             .into_iter()
             .map(|e| match e {
+                // `rustc` (`compiler/rustc_middle/src/ty/vtable.rs` at commit
+                // `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, L123-L131) fills
+                // this slot with the drop *glue* of the concrete type, not
+                // with its `Drop::drop` method:
+                //
+                // > if ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()) {
+                // >     let instance = ty::Instance::resolve_drop_glue(tcx, ty);
+                //
+                // The glue (the `drop_glue` lang item `core::ptr::drop_glue::<T>`
+                // that `core::ptr::drop_in_place` calls, library/core/src/ptr/mod.rs
+                // L823-L825: "Helper function for `drop_in_place`. The compiler
+                // replaces this by the actual drop glue.") runs `Drop::drop` (if
+                // any) and then drops every field, so we record the glue
+                // instance's canonical `DefPath`; the concrete type is
+                // `CapturedVTable.concreteTy`.
                 rustc_middle::ty::VtblEntry::MetadataDropInPlace => {
-                    let drop_path = if !concrete.needs_drop(tcx, typing_env) {
-                        None
-                    } else if let TyKind::Adt(adt_def, _) = *concrete.kind()
-                        && let Some(dtor) = tcx.adt_destructor(adt_def.did())
-                    {
-                        Some(canonical_def_path(tcx, dtor.did))
-                    } else {
-                        Some(String::from("core::ptr::drop_in_place"))
-                    };
+                    let drop_path = concrete.needs_drop(tcx, typing_env).then(|| {
+                        let glue = rustc_middle::ty::Instance::resolve_drop_glue(tcx, *concrete);
+                        canonical_def_path(tcx, glue.def_id())
+                    });
                     IrVTableSlot::DropInPlace(drop_path)
                 }
                 rustc_middle::ty::VtblEntry::MetadataSize => IrVTableSlot::Size,
