@@ -571,6 +571,7 @@ theorem checkMirCert_totalVerificationResult
         (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
           c.body args mem c.callees))
     (hPost : ∀ args mem retVal mem', c.pre args mem →
+      MirMemFrame mem' mem →
       (∃ d, get? c.body.localDecls 0 = some d ∧
         retInv.valDenote d.ty retVal) →
       c.post args mem retVal mem') :
@@ -587,7 +588,7 @@ theorem checkMirCert_totalVerificationResult
       (entryEnv c.body.localDecls argSlots)
       (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
         c.body args mem c.callees).frame.locals := by
-    rw [hRoot.2]
+    rw [hRoot.2.1]
     exact entryEnv_sound hP.2.2.2
   have hInv0 := mirPccInv_start hChk hRoot.1 hEntry
   have hSound := checkMirCert_sound hChk hRoot.1 hEntry
@@ -605,17 +606,19 @@ theorem checkMirCert_totalVerificationResult
   intro tr out hRR
   match reachesRet_normal_of_mirPccInv (retInv := retInv) hPhase hAll hInv0 hRR
     with
-  | ⟨retVal, mem', hEq, hRet⟩ =>
+  | ⟨retVal, mem', hEq, _, hFrame, hRet⟩ =>
     exact ⟨retVal, mem', hEq,
-      hPost args mem retVal mem' hDef (hSound.2.1 retVal hRet)⟩
+      hPost args mem retVal mem' hDef (hFrame.trans hRoot.2.2)
+        (hSound.2.1 retVal hRet)⟩
 
 /-- Total-correctness claim for `checkedIncBody` on `x = 200` and default
-empty memory: UB-free, productive, non-diverging, and returning a `u8` in
-`[1, 128]`. -/
+empty memory: UB-free, productive, non-diverging, preserving `MirMemFrame`,
+and returning a `u8` in `[1, 128]`. -/
 def checkedIncTotalClaim : Trusted.VerificationResult.TotalClaim where
   body := checkedIncBody
   pre args mem := args = checkedIncArgs ∧ mem = {}
-  post _ _ ret _ := ∃ b, ret = .scalar ⟨b, 1⟩ ∧ 1 ≤ b ∧ b ≤ 128
+  post _ mem ret mem' :=
+    MirMemFrame mem' mem ∧ ∃ b, ret = .scalar ⟨b, 1⟩ ∧ 1 ≤ b ∧ b ≤ 128
 
 /-- End-to-end `TotalVerificationResult checkedIncTotalClaim` from the `rfl`
 certificate and fuel-bounded `detStops` termination proof. -/
@@ -636,7 +639,7 @@ theorem checkedInc_totalVerificationResult :
         subst hArgs
         subst hMem
         exact wpOutcome_of_detStops _ _ 32 _ checkedInc_detStops)
-    (fun _ _ retVal _ _ hRet => by
+    (fun _ _ retVal _ _ hFrame hRet => by
       match hRet with
       | ⟨d, hD, hDen⟩ =>
         injection hD with hD
@@ -648,7 +651,7 @@ theorem checkedInc_totalVerificationResult :
           | mk bits sz =>
             have hSz : sz = 1 := h2.1
             subst hSz
-            exact ⟨bits, rfl, absVal_lbound?_sound (lo := 1) rfl h2.2,
+            exact ⟨hFrame, bits, rfl, absVal_lbound?_sound (lo := 1) rfl h2.2,
               absVal_ubound?_sound (hi := 128) rfl h2.2⟩
         | _ => exact False.elim h2)
 

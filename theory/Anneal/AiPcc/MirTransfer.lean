@@ -6470,9 +6470,28 @@ theorem env_live_lookup {decls : List LocalDecl} {env : MirAbsEnv}
     | intro cs hcs =>
       exact ⟨d, cs, hcs.1, hcs.2.1, mirAbsSlot_live hLive hcs.2.2, hcs.2.2⟩
 
+/-- Non-borrow memory fields preserved by every AI-PCC-supported statement and
+terminator (supported scalar/control steps only update `borrows`). -/
+def MirMemFrame (m₁ m₂ : Memory) : Prop :=
+  m₁.nextAllocId = m₂.nextAllocId ∧
+  m₁.globals = m₂.globals ∧
+  m₁.nextTag = m₂.nextTag ∧
+  m₁.callStack = m₂.callStack ∧
+  m₁.activeCallee = m₂.activeCallee ∧
+  m₁.activeProtectors = m₂.activeProtectors
+
+theorem MirMemFrame.refl (m : Memory) : MirMemFrame m m :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem MirMemFrame.trans {m₁ m₂ m₃ : Memory}
+    (h₁ : MirMemFrame m₁ m₂) (h₂ : MirMemFrame m₂ m₃) : MirMemFrame m₁ m₃ :=
+  ⟨h₁.1.trans h₂.1, h₁.2.1.trans h₂.2.1, h₁.2.2.1.trans h₂.2.2.1,
+   h₁.2.2.2.1.trans h₂.2.2.2.1, h₁.2.2.2.2.1.trans h₂.2.2.2.2.1,
+   h₁.2.2.2.2.2.trans h₂.2.2.2.2.2⟩
+
 /-- One-step soundness of `stepStmtAbs` against `evalStmt` from a frame with
 no active function-entry protectors. The successor frame advances `stmtIdx`,
-and `callStack`, `activeCallee`, and `activeProtectors` are preserved. -/
+and `MirMemFrame` is preserved. -/
 theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
     {env env' : MirAbsEnv} {s : MachineState} {stmt : Statement}
     (hEnv : mirAbsEnvDenote decls env s.frame.locals)
@@ -6480,9 +6499,7 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
     (hStep : stepStmtAbs decls env stmt = some env') :
     ∃ locals' mem',
       evalStmt s stmt decls layouts = MirStepNode.step (advanceStmt s locals' mem') ∧
-      mem'.callStack = s.memory.callStack ∧
-      mem'.activeCallee = s.memory.activeCallee ∧
-      mem'.activeProtectors = s.memory.activeProtectors ∧
+      MirMemFrame mem' s.memory ∧
       mirAbsEnvDenote decls env' locals' := by
   cases stmt with
   | mk kind span =>
@@ -6490,19 +6507,19 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
     | nop =>
       injection hStep with hStep
       subst hStep
-      exact ⟨s.frame.locals, s.memory, rfl, rfl, rfl, rfl, hEnv⟩
+      exact ⟨s.frame.locals, s.memory, rfl, MirMemFrame.refl _, hEnv⟩
     | coverage =>
       injection hStep with hStep
       subst hStep
-      exact ⟨s.frame.locals, s.memory, rfl, rfl, rfl, rfl, hEnv⟩
+      exact ⟨s.frame.locals, s.memory, rfl, MirMemFrame.refl _, hEnv⟩
     | constEvalCounter =>
       injection hStep with hStep
       subst hStep
-      exact ⟨s.frame.locals, s.memory, rfl, rfl, rfl, rfl, hEnv⟩
+      exact ⟨s.frame.locals, s.memory, rfl, MirMemFrame.refl _, hEnv⟩
     | backwardIncompatibleDropHint _ =>
       injection hStep with hStep
       subst hStep
-      exact ⟨s.frame.locals, s.memory, rfl, rfl, rfl, rfl, hEnv⟩
+      exact ⟨s.frame.locals, s.memory, rfl, MirMemFrame.refl _, hEnv⟩
     | placeMention p =>
       cases p with
       | mk l proj =>
@@ -6524,7 +6541,7 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
               | intro d hd =>
                 cases hd with
                 | intro cs hcs =>
-                  refine ⟨s.frame.locals, s.memory, ?_, rfl, rfl, rfl, hEnv⟩
+                  refine ⟨s.frame.locals, s.memory, ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, hEnv⟩
                   cases cs with
                   | dead => exact absurd rfl hcs.2.2.1
                   | uninit =>
@@ -6554,7 +6571,7 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
               cases hv.2.2.2.2.2 layouts with
               | intro ty hty =>
                 have hPl : placeTy decls layouts p = some ty := hty.1
-                refine ⟨s.frame.locals, s.memory, ?_, rfl, rfl, rfl, hEnv⟩
+                refine ⟨s.frame.locals, s.memory, ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, hEnv⟩
                 cases ty with
                 | mk k lIdx =>
                   cases av with
@@ -6616,7 +6633,7 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
               | intro locals' hSetC =>
                 refine ⟨locals', { s.memory with
                   borrows := disableLocalBorrows s.memory.borrows l
-                    (length s.memory.callStack) }, ?_, rfl, rfl, rfl, ?_⟩
+                    (length s.memory.callStack) }, ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ?_⟩
                 · simp only [evalStmt, hcs.2.1, hSetC, hProt]
                 · exact setMirAbsSlot_sound hEnv hD hStep hSetC
                     (uninitSlotFor_denote d.ty s.frame.locals)
@@ -6634,7 +6651,7 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
             | intro locals' hSetC =>
               refine ⟨locals', { s.memory with
                 borrows := disableLocalBorrows s.memory.borrows l
-                  (length s.memory.callStack) }, ?_, rfl, rfl, rfl, ?_⟩
+                  (length s.memory.callStack) }, ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ?_⟩
               · simp only [evalStmt, hcs.2.1, hSetC, hProt]
               · exact setMirAbsSlot_sound hEnv hcs.1 hStep hSetC rfl
     | deinit p =>
@@ -6663,7 +6680,8 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
                     | intro locals' hSetC =>
                       refine ⟨locals', { s.memory with
                         borrows := invalidateConflictingBorrows s.memory.borrows l
-                          .none (length s.memory.callStack) }, ?_, rfl, rfl, rfl, ?_⟩
+                          .none (length s.memory.callStack) }, ?_,
+                        ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ?_⟩
                       · cases cs with
                         | dead => exact absurd rfl hcs.2.2.1
                         | uninit => simp only [evalStmt, hcs.2.1, hSetC, hProt]
@@ -6702,7 +6720,7 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
                           s.memory.callerLocals decls s.memory.callStack
                           (Or.inl rfl)
                         rw [hb.1] at hEv
-                        refine ⟨locals', s.memory, ?_, rfl, rfl, rfl,
+                        refine ⟨locals', s.memory, ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩,
                           refineEnvByGuard_sound hv.2.2.1 hb.2.2⟩
                         simp only [evalStmt, hEv, boolToScalar]
                         rfl
@@ -6750,7 +6768,7 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
                                   borrows := invalidateConflictingBorrows
                                     s.memory.borrows l .none
                                     (length s.memory.callStack) },
-                                  ?_, rfl, rfl, rfl, ?_⟩
+                                  ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ?_⟩
                                 · cases cs with
                                   | dead => exact absurd rfl hcs.2.2.1
                                   | uninit =>
@@ -7110,6 +7128,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
     | .ret retSlot =>
       ∃ retVal mem' d, get? decls 0 = some d ∧
         evalTerminator s term cb = MirStepNode.retNormal retVal mem' ∧
+        MirMemFrame mem' s.memory ∧
         retSlot.denote d.ty s.frame.locals (.init retVal)
     | .edges succs =>
       ∃ target envT obs locals' mem', List.Mem (target, envT) succs ∧
@@ -7117,9 +7136,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
           MirStepNode.emitStep obs
             { frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
               memory := mem' } ∧
-        mem'.callStack = s.memory.callStack ∧
-        mem'.activeCallee = s.memory.activeCallee ∧
-        mem'.activeProtectors = s.memory.activeProtectors ∧
+        MirMemFrame mem' s.memory ∧
         mirAbsEnvDenote decls envT locals' := by
   cases term with
   | mk kind span =>
@@ -7128,7 +7145,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
       injection hTerm with hTerm
       subst hTerm
       exact ⟨target, env, .silent, s.frame.locals, s.memory, List.Mem.head _,
-        rfl, rfl, rfl, rfl, hEnv⟩
+        rfl, MirMemFrame.refl _, hEnv⟩
     | return_ =>
       simp only [stepTermAbs] at hTerm
       cases hS : get? env 0 with
@@ -7152,7 +7169,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                 refine ⟨v, { s.memory with
                   borrows := disableFrameBorrows s.memory.borrows
                     (length s.memory.callStack) (length s.frame.locals) },
-                  d, hcs.1, ?_, ?_⟩
+                  d, hcs.1, ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ?_⟩
                 · simp only [evalTerminator, hL, hProt, hStack,
                     hasFrameDeallocProtectorConflict, hv.2]
                 · rw [← hv.1]
@@ -7189,7 +7206,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                           borrows := invalidateConflictingBorrows
                             s.memory.borrows l .none
                             (length s.memory.callStack) },
-                        List.Mem.head _, ?_, rfl, rfl, rfl, ?_⟩
+                        List.Mem.head _, ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ?_⟩
                       · cases cs with
                         | dead => exact absurd rfl hcs.2.2.1
                         | uninit =>
@@ -7251,7 +7268,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                       have hRef := refineEnvByGuard_sound hv.2.2.1 hb.2.2
                       exact ⟨_, _, _, locals', s.memory,
                         filterFeasibleEdges_mem (List.Mem.head _) hRef,
-                        hEv, rfl, rfl, rfl, hRef⟩
+                        hEv, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, hRef⟩
                     | top g =>
                       injection hB with hB
                       subst hB
@@ -7260,12 +7277,12 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                       | false =>
                         exact ⟨_, _, _, locals', s.memory,
                           filterFeasibleEdges_mem (List.Mem.head _) hRef,
-                          hEv, rfl, rfl, rfl, hRef⟩
+                          hEv, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, hRef⟩
                       | true =>
                         exact ⟨_, _, _, locals', s.memory,
                           filterFeasibleEdges_mem
                             (List.Mem.tail _ (List.Mem.head _)) hRef,
-                          hEv, rfl, rfl, rfl, hRef⟩
+                          hEv, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, hRef⟩
                     | bot => nomatch hB
                     | uninit => nomatch hB
               | uint u a src? =>
@@ -7285,7 +7302,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                       targets.branches targets.otherwise with
                   | intro envT hT =>
                     refine ⟨_, envT, .event sc.bits, locals', s.memory, hT.1,
-                      ?_, rfl, rfl, rfl, hT.2⟩
+                      ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, hT.2⟩
                     simp only [evalTerminator]
                     rw [hEvalT]
                 | _ => exact False.elim hDen.2
@@ -7306,7 +7323,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                       targets.branches targets.otherwise with
                   | intro envT hT =>
                     refine ⟨_, envT, .event sc.bits, locals', s.memory, hT.1,
-                      ?_, rfl, rfl, rfl, hT.2⟩
+                      ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, hT.2⟩
                     simp only [evalTerminator]
                     rw [hEvalT]
                 | _ => exact False.elim hDen.2
@@ -7353,7 +7370,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                       have hRef := refineEnvByGuard_sound hv.2.2.1 hb.2.2
                       refine ⟨target, _, .silent, locals', s.memory,
                         filterFeasibleEdges_mem (List.Mem.head _) hRef,
-                        ?_, rfl, rfl, rfl, hRef⟩
+                        ?_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, hRef⟩
                       simp only [evalTerminator]
                       rw [hEvalT, hb.1]
                       cases b <;> rfl
@@ -7413,9 +7430,7 @@ theorem stepMirFn_stmt_sound {body : CapturedMir} {s : MachineState}
     (hStep : stepStmtAbs body.localDecls env stmt = some env') :
     ∃ locals' mem',
       stepMirFn body s = MirStepNode.step (advanceStmt s locals' mem') ∧
-      mem'.callStack = s.memory.callStack ∧
-      mem'.activeCallee = s.memory.activeCallee ∧
-      mem'.activeProtectors = s.memory.activeProtectors ∧
+      MirMemFrame mem' s.memory ∧
       mirAbsEnvDenote body.localDecls env' locals' := by
   rw [stepMirFn_root hPhase hCallee, hBb]
   simp only [hSt]
@@ -7438,6 +7453,7 @@ theorem stepMirFn_term_sound {body : CapturedMir} {s : MachineState}
     | .ret retSlot =>
       ∃ retVal mem' d, get? body.localDecls 0 = some d ∧
         stepMirFn body s = MirStepNode.retNormal retVal mem' ∧
+        MirMemFrame mem' s.memory ∧
         retSlot.denote d.ty s.frame.locals (.init retVal)
     | .edges succs =>
       ∃ target envT obs locals' mem', List.Mem (target, envT) succs ∧
@@ -7445,9 +7461,7 @@ theorem stepMirFn_term_sound {body : CapturedMir} {s : MachineState}
           MirStepNode.emitStep obs
             { frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
               memory := mem' } ∧
-        mem'.callStack = s.memory.callStack ∧
-        mem'.activeCallee = s.memory.activeCallee ∧
-        mem'.activeProtectors = s.memory.activeProtectors ∧
+        MirMemFrame mem' s.memory ∧
         mirAbsEnvDenote body.localDecls envT locals' := by
   have hNone : get? bb.statements s.frame.stmtIdx = none := by
     rw [hEnd]

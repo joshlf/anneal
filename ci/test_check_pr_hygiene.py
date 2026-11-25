@@ -1287,10 +1287,14 @@ class StandaloneLayoutTests(StandaloneRepoTestCase):
                          ["lean-miri/vendor/Miri/X.lean"])
 
     def test_rename_into_scope_and_trusted_checked(self):
-        # Renaming a headerless vendored file into Anneal scope must still
-        # fail the Fuchsia license header check, and renaming a file with an
-        # unpinned upstream link into `trusted/lean/` must fail citations.
-        self.write("lean-miri/vendor/Miri/Raw.lean", "def raw := 1\n")
+        # Renaming a vendored file into Anneal scope must fail header, wrap,
+        # and review-round-id checks on its existing lines, and renaming a
+        # file with an unpinned upstream link into `trusted/lean/` must fail
+        # citations.
+        self.write(
+            "lean-miri/vendor/Miri/Raw.lean",
+            "-- " + " ".join(["word"] * 20) + "\n-- See G2-R1.\ndef raw := 1\n",
+        )
         self.write("theory/Link.lean",
                    HEADER_LEAN + "\n-- https://doc.rust-lang.org/std/\n")
         base_with_files = self.commit("Seed vendor and theory files")
@@ -1305,6 +1309,8 @@ class StandaloneLayoutTests(StandaloneRepoTestCase):
         found = {(f["check"], f["path"]) for f in report["findings"]}
         self.assertEqual(found, {
             ("header", "theory/Raw.lean"),
+            ("wrap", "theory/Raw.lean"),
+            ("review-round-id", "theory/Raw.lean"),
             ("trusted-citation", "trusted/lean/Link.lean"),
         })
 

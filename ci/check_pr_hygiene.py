@@ -1731,7 +1731,11 @@ def check(
             raise GitError(f"cannot read {head[:12]}:{f.path}")
         if entered_scope and needs_header(f.path, layout):
             report.findings += header_findings(f.path, content, max_year)
-        wrap_errs, wrap_warns = wrap_findings(f.path, content, f.added,
+        wrap_lines = (
+            set(range(1, len(content.split("\n")) + 1))
+            if entered_scope else f.added
+        )
+        wrap_errs, wrap_warns = wrap_findings(f.path, content, wrap_lines,
                                               layout)
         report.findings += wrap_errs
         report.warnings += wrap_warns

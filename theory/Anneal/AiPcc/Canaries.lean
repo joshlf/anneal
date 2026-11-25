@@ -435,7 +435,9 @@ theorem canary_signed_half_verificationResult :
             Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 30) Nat.one_pos)⟩)
 
 /-- Audited stateful claim for `bitmaskDivCastBody`: from any root-entry
-memory and any `u32` inputs, execution is UB-free and returns `< 2^32`. -/
+memory and any `u32` inputs, execution is UB-free, preserves global
+allocations and allocation/tag counters (`MirMemFrame`), and returns
+`< 2^32`. -/
 def bitmaskDivCastStatefulClaim :
     Trusted.VerificationResult.StatefulClaim where
   body := bitmaskDivCastBody
@@ -444,7 +446,9 @@ def bitmaskDivCastStatefulClaim :
     mem.activeProtectors = [] ∧
     ∃ a b, a < modPow2 32 ∧ b < modPow2 32 ∧
       args = [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]
-  post _ _ ret _ := ∃ bits, ret = .scalar ⟨bits, 8⟩ ∧ bits < modPow2 32
+  post _ mem ret mem' :=
+    mem'.globals = mem.globals ∧ mem'.nextAllocId = mem.nextAllocId ∧
+    ∃ bits, ret = .scalar ⟨bits, 8⟩ ∧ bits < modPow2 32
 
 /-- `StatefulVerificationResult bitmaskDivCastStatefulClaim`, from the `rfl`
 certificate. -/
@@ -460,28 +464,32 @@ theorem canary_bitmask_div_cast_statefulVerificationResult :
         exact ⟨hCS, hCal, hProt,
           ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound ha⟩,
            rfl, ⟨rfl, rfl, absVal_topInit_sound hb⟩, True.intro⟩⟩)
-    (fun _ _ _ _ _ hRet => by
+    (fun _ _ _ _ _ hFrame hRet => by
       match hRet with
       | ⟨d, hD, hDen⟩ =>
         injection hD with hD
         subst hD
         match uint_valDenote_ubound (hi := modPow2 32 - 1) rfl hDen with
         | ⟨bits, hV, hLe⟩ =>
-          exact ⟨bits, hV,
+          exact ⟨hFrame.2.1, hFrame.1, bits, hV,
             Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 32) Nat.one_pos)⟩)
 
 /-- Audited trace claim for `signedHalfBody`: from any root-entry memory and
-any `i32` input, every completed execution (whatever its `switchInt` trace)
-ends in a normal return of an `i32` with bit pattern `< 2^30`; in particular
-it never panics or aborts. -/
+any `i32` input, every completed execution emits only `MirObsE` events (no
+external calls), preserves `MirMemFrame`, and ends in a normal return of an
+`i32` with bit pattern `< 2^30` (never panicking or aborting). -/
 def signedHalfTraceClaim : Trusted.VerificationResult.TraceClaim where
   body := signedHalfBody
   pre args mem :=
     mem.callStack = [] ∧ mem.activeCallee = none ∧
     mem.activeProtectors = [] ∧
     ∃ x, x < modPow2 32 ∧ args = [.scalar ⟨x, 4⟩]
-  post _ _ _ out :=
-    ∃ bits mem', out = .normal (.scalar ⟨bits, 4⟩, mem') ∧ bits < modPow2 30
+  post _ mem tr out :=
+    TraceObsOnly tr ∧
+    ∃ bits mem',
+      out = .normal (.scalar ⟨bits, 4⟩, mem') ∧
+      MirMemFrame mem' mem ∧
+      bits < modPow2 30
 
 /-- `TraceVerificationResult signedHalfTraceClaim`, from the `rfl`
 certificate. -/
@@ -495,7 +503,7 @@ theorem canary_signed_half_traceVerificationResult :
         subst hArgs
         exact ⟨hCS, hCallee, hProt,
           ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩⟩)
-    (fun _ _ _ _ mem' _ hRet => by
+    (fun _ _ _ _ mem' _ hTr hFrame hRet => by
       match hRet with
       | ⟨d, hD, hDen⟩ =>
         injection hD with hD
@@ -503,7 +511,7 @@ theorem canary_signed_half_traceVerificationResult :
         match sint_valDenote_ubound (hi := modPow2 30 - 1) rfl hDen with
         | ⟨bits, hV, hLe⟩ =>
           subst hV
-          exact ⟨bits, mem', rfl,
+          exact ⟨hTr, bits, mem', rfl, hFrame,
             Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 30) Nat.one_pos)⟩)
 
 /-! ## Positive Controls and CFG Joins -/

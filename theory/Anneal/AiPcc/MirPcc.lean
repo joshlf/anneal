@@ -277,8 +277,9 @@ def MirPccInv (body : CapturedMir) (invs : List (Option MirAbsEnv))
       mirAbsEnvDenote body.localDecls curEnv s.frame.locals
 
 /-- One certified step from an invariant state: `stepMirFn` either steps
-(silently or with a `switchInt` event) to another invariant state, or returns
-normally with a value described by `retInv`. -/
+(silently or with a `switchInt` event) to another invariant state preserving
+`MirMemFrame`, or returns normally with a value described by `retInv` and a
+memory preserving `MirMemFrame`. -/
 theorem mirPccInv_step {body : CapturedMir} {retInv : MirAbsSlot}
     {invs : List (Option MirAbsEnv)} {s : MachineState}
     (hPhase : mirPhaseSupported body.phase = true)
@@ -286,8 +287,10 @@ theorem mirPccInv_step {body : CapturedMir} {retInv : MirAbsSlot}
       body.basicBlocks invs = true)
     (hInv : MirPccInv body invs s) :
     (∃ obs s', stepMirFn body s = MirStepNode.emitStep obs s' ∧
+      MirMemFrame s'.memory s.memory ∧
       MirPccInv body invs s') ∨
     (∃ retVal mem' d, stepMirFn body s = MirStepNode.retNormal retVal mem' ∧
+      MirMemFrame mem' s.memory ∧
       get? body.localDecls 0 = some d ∧
       retInv.denote d.ty s.frame.locals (.init retVal)) := by
   match hInv with
@@ -309,10 +312,11 @@ theorem mirPccInv_step {body : CapturedMir} {retInv : MirAbsSlot}
           | intro locals' h =>
             cases h with
             | intro mem' h =>
-              refine Or.inl ⟨.silent, advanceStmt s locals' mem', h.1, ?_⟩
-              exact ⟨h.2.1.trans hCS, h.2.2.1.trans hCallee,
-                h.2.2.2.1.trans hProt, bb, entryEnv, nextEnv, hBb, hInvB,
-                Nat.succ_le_of_lt hLt, hNext.2, h.2.2.2.2⟩
+              have hF := h.2.1
+              refine Or.inl ⟨.silent, advanceStmt s locals' mem', h.1, hF, ?_⟩
+              exact ⟨hF.2.2.2.1.trans hCS, hF.2.2.2.2.1.trans hCallee,
+                hF.2.2.2.2.2.trans hProt, bb, entryEnv, nextEnv, hBb, hInvB,
+                Nat.succ_le_of_lt hLt, hNext.2, h.2.2⟩
     | inr hEq =>
       have hCur : curEnv = exitEnv :=
         stepStmtsTo_length_eq hStmts (by rw [← hEq]; exact hTo)
@@ -330,19 +334,18 @@ theorem mirPccInv_step {body : CapturedMir} {retInv : MirAbsSlot}
             | intro mem' hTS =>
               cases hTS with
               | intro d hTS =>
-                exact Or.inr ⟨retVal, mem', d, hTS.2.1, hTS.1,
-                  mirAbsSlot_le_sound hBlk hTS.2.2⟩
+                exact Or.inr ⟨retVal, mem', d, hTS.2.1, hTS.2.2.1, hTS.1,
+                  mirAbsSlot_le_sound hBlk hTS.2.2.2⟩
         | edges succs =>
           match hTS with
-          | ⟨target, envT, obs, locals', mem', hMem, hStep, hCS', hCallee',
-              hProt', hDenT⟩ =>
+          | ⟨target, envT, obs, locals', mem', hMem, hStep, hF, hDenT⟩ =>
             cases checkEdgesAgainstCert_mem hBlk hMem with
             | intro bbT h =>
               cases h with
               | intro invT h =>
-                refine Or.inl ⟨obs, _, hStep, ?_⟩
-                exact ⟨hCS'.trans hCS, hCallee'.trans hCallee,
-                  hProt'.trans hProt, bbT, invT, invT, h.1, h.2.1,
+                refine Or.inl ⟨obs, _, hStep, hF, ?_⟩
+                exact ⟨hF.2.2.2.1.trans hCS, hF.2.2.2.2.1.trans hCallee,
+                  hF.2.2.2.2.2.trans hProt, bbT, invT, invT, h.1, h.2.1,
                   Nat.zero_le _, rfl, mirAbsEnvLe_sound h.2.2 hDenT⟩
 
 /-- Reflexive-transitive closure of the non-faulting `stepMirFn`
@@ -459,13 +462,13 @@ theorem mirPccInv_reach {body : CapturedMir} {entryEnv : MirAbsEnv}
     cases mirPccInv_step (retInv := retInv) hPhase hAll ih with
     | inl h =>
       match h with
-      | ⟨obs', s'', hStep', hInv'⟩ =>
+      | ⟨obs', s'', hStep', _, hInv'⟩ =>
         rw [hStep] at hStep'
         rw [emitStep_inj hStep']
         exact hInv'
     | inr h =>
       match h with
-      | ⟨_, _, _, hRet, _, _⟩ =>
+      | ⟨_, _, _, hRet, _, _, _⟩ =>
         rw [hStep] at hRet
         exact False.elim (emitStep_ne_retNormal hRet)
 
@@ -556,7 +559,7 @@ theorem mirNoUBTree_of_mirPccInv {body : CapturedMir} {retInv : MirAbsSlot}
       cases mirPccInv_step (retInv := retInv) hPhase hAll hP with
       | inl h =>
         match h with
-        | ⟨obs, s', hStep, hInv'⟩ =>
+        | ⟨obs, s', hStep, _, hInv'⟩ =>
           have hS' : stepMirFn body s = .tau es' := hS
           rw [hStep] at hS'
           cases obs with
@@ -564,7 +567,7 @@ theorem mirNoUBTree_of_mirPccInv {body : CapturedMir} {retInv : MirAbsSlot}
           | event _ => nomatch hS'
       | inr h =>
         match h with
-        | ⟨_, _, _, hRet, _, _⟩ =>
+        | ⟨_, _, _, hRet, _, _, _⟩ =>
           have hS' : stepMirFn body s = .tau es' := hS
           rw [hRet] at hS'
           nomatch hS'
@@ -576,7 +579,7 @@ theorem mirNoUBTree_of_mirPccInv {body : CapturedMir} {retInv : MirAbsSlot}
       cases mirPccInv_step (retInv := retInv) hPhase hAll hP with
       | inl h =>
         match h with
-        | ⟨obs, s', hStep, hInv'⟩ =>
+        | ⟨obs, s', hStep, _, hInv'⟩ =>
           have hS' : stepMirFn body s = .vis i k := hS
           rw [hStep] at hS'
           cases obs with
@@ -586,7 +589,7 @@ theorem mirNoUBTree_of_mirPccInv {body : CapturedMir} {retInv : MirAbsSlot}
             exact ⟨fun hF => hF, fun _ => hInv'⟩
       | inr h =>
         match h with
-        | ⟨_, _, _, hRet, _, _⟩ =>
+        | ⟨_, _, _, hRet, _, _, _⟩ =>
           have hS' : stepMirFn body s = .vis i k := hS
           rw [hRet] at hS'
           nomatch hS'
@@ -641,7 +644,7 @@ theorem mirPccInv_stepWp {body : CapturedMir} {retInv : MirAbsSlot}
   cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
   | inl h =>
     match h with
-    | ⟨obs, s', hStep, hInv'⟩ =>
+    | ⟨obs, s', hStep, _, hInv'⟩ =>
       show (mirNodeOutcome (stepMirFn body s)).wp _ _ _
       rw [hStep]
       cases obs with
@@ -649,7 +652,7 @@ theorem mirPccInv_stepWp {body : CapturedMir} {retInv : MirAbsSlot}
       | event _ => exact hInv'
   | inr h =>
     match h with
-    | ⟨retVal, mem', d, hRet, hD, hDen⟩ =>
+    | ⟨retVal, mem', d, hRet, _, hD, hDen⟩ =>
       show (mirNodeOutcome (stepMirFn body s)).wp _ _ _
       rw [hRet]
       exact ⟨d, hD, mirAbsSlot_valDenote_of_denote hNoG hDen⟩
@@ -739,10 +742,10 @@ theorem checkMirCert_sound {body : CapturedMir} {entryEnv : MirAbsEnv}
         (mirPccInv_reach hChk hStart hEntry hR) with
     | inl h =>
       match h with
-      | ⟨obs, s', hStep, _⟩ => exact Or.inl ⟨obs, s', hStep⟩
+      | ⟨obs, s', hStep, _, _⟩ => exact Or.inl ⟨obs, s', hStep⟩
     | inr h =>
       match h with
-      | ⟨retVal, mem', _, hRet, _, _⟩ => exact Or.inr ⟨retVal, mem', hRet⟩
+      | ⟨retVal, mem', _, hRet, _, _, _⟩ => exact Or.inr ⟨retVal, mem', hRet⟩
   · intro retVal hRet
     match hRet with
     | ⟨s, mem, hR, hStepRet⟩ =>
@@ -750,12 +753,12 @@ theorem checkMirCert_sound {body : CapturedMir} {entryEnv : MirAbsEnv}
           (mirPccInv_reach hChk hStart hEntry hR) with
       | inl h =>
         match h with
-        | ⟨_, _, hStep, _⟩ =>
+        | ⟨_, _, hStep, _, _⟩ =>
           rw [hStep] at hStepRet
           exact False.elim (emitStep_ne_retNormal hStepRet)
       | inr h =>
         match h with
-        | ⟨retVal', mem', d, hRet', hD, hDen⟩ =>
+        | ⟨retVal', mem', d, hRet', _, hD, hDen⟩ =>
           rw [hRet'] at hStepRet
           have hV := retNormal_inj hStepRet
           subst hV
@@ -1033,9 +1036,17 @@ theorem initMachineStateWithCallees_root (body : CapturedMir)
   | cons _ _ =>
     exact ⟨⟨rfl, rfl, rfl, rfl, rfl⟩, rfl⟩
 
+/-- Every event in `tr` is an internal `MirObsE` observation (never a fault
+or an unresolved `MirCallE` external call). -/
+def TraceObsOnly : List (Event MirEffect) → Prop
+  | [] => True
+  | e :: rest =>
+    (∃ obs, e = ⟨.inr (.inl (.emit obs)), PUnit.unit⟩) ∧ TraceObsOnly rest
+
 /-- `initMachineStateWithMemoryAndCallees body args mem callees` starts at a
-root frame with `initLocals body args` whenever `mem` has an empty call stack,
-no active callee, and no active protectors, for arbitrary `callees`. -/
+root frame with `initLocals body args` and preserves `MirMemFrame` against
+`mem` whenever `mem` has an empty call stack, no active callee, and no active
+protectors, for arbitrary `callees`. -/
 theorem initMachineStateWithMemoryAndCallees_root (body : CapturedMir)
     (args : List Value) (mem : Memory) (callees : List CapturedMir)
     (hCS : mem.callStack = []) (hCallee : mem.activeCallee = none)
@@ -1044,14 +1055,20 @@ theorem initMachineStateWithMemoryAndCallees_root (body : CapturedMir)
       (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
         body args mem callees) ∧
     (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
-        body args mem callees).frame.locals = initLocals body args := by
+        body args mem callees).frame.locals = initLocals body args ∧
+    MirMemFrame
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        body args mem callees).memory mem := by
   cases callees with
-  | nil => exact ⟨⟨hCS, hCallee, hProt, rfl, rfl⟩, rfl⟩
-  | cons _ _ => exact ⟨⟨hCS, hCallee, hProt, rfl, rfl⟩, rfl⟩
+  | nil => exact ⟨⟨hCS, hCallee, hProt, rfl, rfl⟩, rfl, MirMemFrame.refl mem⟩
+  | cons _ _ =>
+    exact ⟨⟨hCS, hCallee, hProt, rfl, rfl⟩, rfl,
+      ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩⟩
 
 /-- Every return outcome observed in the interaction tree of an invariant
-state is a normal return (`MirOutcome.normal`) witnessed by `ReturnsFrom`
-(ruling out `.panic` and `.abort`). -/
+state is a normal return (`MirOutcome.normal`, ruling out `.panic` and
+`.abort`) along an observation-only trace (`TraceObsOnly tr`), preserving
+`MirMemFrame mem' s0.memory` and witnessed by `ReturnsFrom`. -/
 theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
     {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)} {s0 : MachineState}
     {tr : List (Event MirEffect)} {out : MirOutcome}
@@ -1060,21 +1077,28 @@ theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
       body.basicBlocks invs = true)
     (h0 : MirPccInv body invs s0)
     (hR : ReachesRet (mirTree body s0) tr out) :
-    ∃ retVal mem', out = .normal (retVal, mem') ∧ ReturnsFrom body s0 retVal := by
+    ∃ retVal mem',
+      out = .normal (retVal, mem') ∧
+      TraceObsOnly tr ∧
+      MirMemFrame mem' s0.memory ∧
+      ReturnsFrom body s0 retVal := by
   have hQ : ∀ (t : ITree MirEffect MirOutcome) tr' (u : ITree MirEffect MirOutcome),
       Reaches t tr' u →
-      (∃ s, MirReach body s0 s ∧ MirPccInv body invs s ∧
+      (∃ s, MirReach body s0 s ∧ MirMemFrame s.memory s0.memory ∧
+        MirPccInv body invs s ∧
         t = ITree.cofix (stepMirState body) (.running s)) →
-      ∃ s, MirReach body s0 s ∧ MirPccInv body invs s ∧
+      TraceObsOnly tr' ∧
+      ∃ s, MirReach body s0 s ∧ MirMemFrame s.memory s0.memory ∧
+        MirPccInv body invs s ∧
         u = ITree.cofix (stepMirState body) (.running s) := by
     intro t tr' u hReach
     induction hReach with
-    | refl => exact fun h => h
+    | refl => exact fun h => ⟨True.intro, h⟩
     | tau hObs _ ih =>
       intro h
       apply ih
       match h with
-      | ⟨s, hRs, hInv, hEq⟩ =>
+      | ⟨s, hRs, hFs, hInv, hEq⟩ =>
         subst hEq
         rw [ITree.observe_cofix] at hObs
         have hObs' : (stepMirFn body s).map (ITree.cofix (stepMirState body)) =
@@ -1082,23 +1106,22 @@ theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
         cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
         | inl hS =>
           match hS with
-          | ⟨obs, s', hStep, hInv'⟩ =>
+          | ⟨obs, s', hStep, hF', hInv'⟩ =>
             rw [hStep] at hObs'
             cases obs with
             | silent =>
               injection hObs' with hT
-              exact ⟨s', .step .silent hRs hStep, hInv', hT.symm⟩
+              exact ⟨s', .step .silent hRs hStep, hF'.trans hFs, hInv', hT.symm⟩
             | event _ => nomatch hObs'
         | inr hS =>
           match hS with
-          | ⟨_, _, _, hRet, _, _⟩ =>
+          | ⟨_, _, _, hRet, _, _, _⟩ =>
             rw [hRet] at hObs'
             nomatch hObs'
     | vis hObs _ o _ ih =>
       intro h
-      apply ih
       match h with
-      | ⟨s, hRs, hInv, hEq⟩ =>
+      | ⟨s, hRs, hFs, hInv, hEq⟩ =>
         subst hEq
         rw [ITree.observe_cofix] at hObs
         have hObs' : (stepMirFn body s).map (ITree.cofix (stepMirState body)) =
@@ -1106,22 +1129,26 @@ theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
         cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
         | inl hS =>
           match hS with
-          | ⟨obs, s', hStep, hInv'⟩ =>
+          | ⟨obs, s', hStep, hF', hInv'⟩ =>
             rw [hStep] at hObs'
             cases obs with
             | silent => nomatch hObs'
             | event _ =>
               cases hObs'
-              exact ⟨s', .step _ hRs hStep, hInv', rfl⟩
+              cases o with
+              | unit =>
+                have hNext := ih ⟨s', .step _ hRs hStep, hF'.trans hFs, hInv',
+                  rfl⟩
+                exact ⟨⟨⟨_, rfl⟩, hNext.1⟩, hNext.2⟩
         | inr hS =>
           match hS with
-          | ⟨_, _, _, hRet, _, _⟩ =>
+          | ⟨_, _, _, hRet, _, _, _⟩ =>
             rw [hRet] at hObs'
             nomatch hObs'
   match hR with
   | ⟨u, hReach, hObs⟩ =>
-    match hQ _ tr u hReach ⟨s0, .refl, h0, rfl⟩ with
-    | ⟨s, hRs, hInv, hEq⟩ =>
+    match hQ _ tr u hReach ⟨s0, .refl, MirMemFrame.refl s0.memory, h0, rfl⟩ with
+    | ⟨hTr, s, hRs, hFs, hInv, hEq⟩ =>
       subst hEq
       rw [ITree.observe_cofix] at hObs
       have hObs' : (stepMirFn body s).map (ITree.cofix (stepMirState body)) =
@@ -1129,17 +1156,18 @@ theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
       cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
       | inl hS =>
         match hS with
-        | ⟨obs, s', hStep, _⟩ =>
+        | ⟨obs, s', hStep, _, _⟩ =>
           rw [hStep] at hObs'
           cases obs with
           | silent => nomatch hObs'
           | event _ => nomatch hObs'
       | inr hS =>
         match hS with
-        | ⟨retVal', mem', _, hRet, _, _⟩ =>
+        | ⟨retVal', mem', _, hRet, hF', _, _⟩ =>
           rw [hRet] at hObs'
           injection hObs' with hOut
-          exact ⟨retVal', mem', hOut.symm, s, mem', hRs, hRet⟩
+          exact ⟨retVal', mem', hOut.symm, hTr, hF'.trans hFs,
+            s, mem', hRs, hRet⟩
 
 /-- Every normal return observed in the interaction tree of an invariant
 state is a `ReturnsFrom` return of the concrete transition system. -/
@@ -1153,7 +1181,7 @@ theorem returnsFrom_of_reachesRet {body : CapturedMir} {retInv : MirAbsSlot}
     (hR : ReachesRet (mirTree body s0) tr (.normal (retVal, mem))) :
     ReturnsFrom body s0 retVal := by
   match reachesRet_normal_of_mirPccInv hPhase hAll h0 hR with
-  | ⟨retVal', _, hEq, hRet⟩ =>
+  | ⟨retVal', _, hEq, _, _, hRet⟩ =>
     injection hEq with hPair
     injection hPair with hV
     subst hV
@@ -1179,7 +1207,7 @@ theorem stabilizes_of_mirPccInv {body : CapturedMir} {retInv : MirAbsSlot}
   cases mirPccInv_step (retInv := retInv) hPhase hAll hInv' with
   | inl h =>
     match h with
-    | ⟨obs, s'', hStep, hInv''⟩ =>
+    | ⟨obs, s'', hStep, _, hInv''⟩ =>
       cases obs with
       | silent =>
         have hC : MirPccInv body invs s'' →
@@ -1205,7 +1233,7 @@ theorem stabilizes_of_mirPccInv {body : CapturedMir} {retInv : MirAbsSlot}
         nomatch hw'
   | inr h =>
     match h with
-    | ⟨retVal, mem', _, hRet, _, _⟩ =>
+    | ⟨retVal, mem', _, hRet, _, _, _⟩ =>
       have hObs : (mirTree body s').observe = .ret (.normal (retVal, mem')) := by
         show (ITree.cofix (stepMirState body) (.running s')).observe = _
         rw [ITree.observe_cofix]
@@ -1252,7 +1280,7 @@ theorem productive_of_mirPccInv {body : CapturedMir}
         cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
         | inl hS =>
           match hS with
-          | ⟨obs, s', hStep, hInv'⟩ =>
+          | ⟨obs, s', hStep, _, hInv'⟩ =>
             rw [hStep] at hObs'
             cases obs with
             | silent =>
@@ -1266,7 +1294,7 @@ theorem productive_of_mirPccInv {body : CapturedMir}
             | event _ => nomatch hObs'
         | inr hS =>
           match hS with
-          | ⟨_, _, _, hRet, _, _⟩ => rw [hRet] at hObs'; nomatch hObs'
+          | ⟨_, _, _, hRet, _, _, _⟩ => rw [hRet] at hObs'; nomatch hObs'
     | vis hObs _ o _ ih =>
       intro h
       apply ih
@@ -1281,7 +1309,7 @@ theorem productive_of_mirPccInv {body : CapturedMir}
         cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
         | inl hS =>
           match hS with
-          | ⟨obs, s', hStep, hInv'⟩ =>
+          | ⟨obs, s', hStep, _, hInv'⟩ =>
             rw [hStep] at hObs'
             cases obs with
             | silent => nomatch hObs'
@@ -1295,7 +1323,7 @@ theorem productive_of_mirPccInv {body : CapturedMir}
               exact ⟨s', hInv', hTerm', rfl⟩
         | inr hS =>
           match hS with
-          | ⟨_, _, _, hRet, _, _⟩ => rw [hRet] at hObs'; nomatch hObs'
+          | ⟨_, _, _, hRet, _, _, _⟩ => rw [hRet] at hObs'; nomatch hObs'
   intro tr u hR
   match hQ _ tr u hR ⟨s0, hInv0, hTerm0, rfl⟩ with
   | ⟨s', hInv', hTerm', hEq⟩ =>
@@ -1367,7 +1395,8 @@ theorem verifyMirCutpoints_verificationResult
 /-- A `checkMirCert` certificate yields a trusted `StatefulVerificationResult`
 for any `StatefulClaim` (with arbitrary `c.callees`) whose precondition
 establishes a root-entry `Memory` (`callStack = []`, `activeCallee = none`,
-`activeProtectors = []`) and the argument slots `argSlots`. -/
+`activeProtectors = []`) and the argument slots `argSlots`, providing both
+`retInv.valDenote` and `MirMemFrame mem' mem` to `hPost`. -/
 theorem checkMirCert_statefulVerificationResult
     {c : Trusted.VerificationResult.StatefulClaim} {argSlots : List MirAbsSlot}
     {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)}
@@ -1378,6 +1407,7 @@ theorem checkMirCert_statefulVerificationResult
       mem.activeProtectors = [] ∧
       entryArgsOk (c.body.localDecls.drop 1) argSlots args)
     (hPost : ∀ args mem retVal mem', c.pre args mem →
+      MirMemFrame mem' mem →
       (∃ d, get? c.body.localDecls 0 = some d ∧
         retInv.valDenote d.ty retVal) →
       c.post args mem retVal mem') :
@@ -1394,7 +1424,7 @@ theorem checkMirCert_statefulVerificationResult
       (entryEnv c.body.localDecls argSlots)
       (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
         c.body args mem c.callees).frame.locals := by
-    rw [hRoot.2]
+    rw [hRoot.2.1]
     exact entryEnv_sound hP.2.2.2
   have hSound := checkMirCert_sound hChk hRoot.1 hEntry
   refine ⟨hSound.2.2.1, ?_⟩
@@ -1408,9 +1438,15 @@ theorem checkMirCert_statefulVerificationResult
       ITree.toPartial] at h
     rw [hEq] at h
     exact h
-  have hRet := returnsFrom_of_reachesRet (retInv := retInv) hPhase hAll
-    (mirPccInv_start hChk hRoot.1 hEntry) hRR
-  exact hPost args mem retVal mem' hDef (hSound.2.1 retVal hRet)
+  match reachesRet_normal_of_mirPccInv (retInv := retInv) hPhase hAll
+      (mirPccInv_start hChk hRoot.1 hEntry) hRR with
+  | ⟨retVal', mem'', hNorm, _, hFrame, hRet⟩ =>
+    injection hNorm with hPair
+    injection hPair with hV hM
+    subst hV
+    subst hM
+    exact hPost args mem retVal mem' hDef (hFrame.trans hRoot.2.2)
+      (hSound.2.1 retVal hRet)
 
 /-- `checkMirCert_statefulVerificationResult` for a `verifyMirCutpoints`
 certificate. -/
@@ -1425,6 +1461,7 @@ theorem verifyMirCutpoints_statefulVerificationResult
       mem.activeProtectors = [] ∧
       entryArgsOk (c.body.localDecls.drop 1) argSlots args)
     (hPost : ∀ args mem retVal mem', c.pre args mem →
+      MirMemFrame mem' mem →
       (∃ d, get? c.body.localDecls 0 = some d ∧
         retInv.valDenote d.ty retVal) →
       c.post args mem retVal mem') :
@@ -1433,10 +1470,10 @@ theorem verifyMirCutpoints_statefulVerificationResult
 
 /-- A `checkMirCert` certificate yields a trusted `TraceVerificationResult`
 for any `TraceClaim` whose precondition establishes a root-entry `Memory` and
-the argument slots, and whose postcondition holds of every normal return
-described by `retInv` (whatever the observed `switchInt` trace). Every
-reachable outcome is a normal return: certified bodies never panic or
-abort. -/
+the argument slots, and whose postcondition follows from `TraceObsOnly tr`,
+`MirMemFrame mem' mem`, and `retInv.valDenote`. Every reachable outcome is a
+normal return along an observation-only trace (no panics, aborts, or external
+calls). -/
 theorem checkMirCert_traceVerificationResult
     {c : Trusted.VerificationResult.TraceClaim} {argSlots : List MirAbsSlot}
     {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)}
@@ -1447,6 +1484,8 @@ theorem checkMirCert_traceVerificationResult
       mem.activeProtectors = [] ∧
       entryArgsOk (c.body.localDecls.drop 1) argSlots args)
     (hPost : ∀ args mem tr retVal mem', c.pre args mem →
+      TraceObsOnly tr →
+      MirMemFrame mem' mem →
       (∃ d, get? c.body.localDecls 0 = some d ∧
         retInv.valDenote d.ty retVal) →
       c.post args mem tr (.normal (retVal, mem'))) :
@@ -1463,7 +1502,7 @@ theorem checkMirCert_traceVerificationResult
       (entryEnv c.body.localDecls argSlots)
       (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
         c.body args mem c.callees).frame.locals := by
-    rw [hRoot.2]
+    rw [hRoot.2.1]
     exact entryEnv_sound hP.2.2.2
   have hSound := checkMirCert_sound hChk hRoot.1 hEntry
   refine ⟨hSound.2.2.1, ?_⟩
@@ -1478,10 +1517,11 @@ theorem checkMirCert_traceVerificationResult
     exact h
   match reachesRet_normal_of_mirPccInv (retInv := retInv) hPhase hAll
       (mirPccInv_start hChk hRoot.1 hEntry) hRR with
-  | ⟨retVal, mem', hEq, hRet⟩ =>
+  | ⟨retVal, mem', hEq, hTr, hFrame, hRet⟩ =>
     show c.post args mem outPair.1 outPair.2
     rw [hEq]
-    exact hPost args mem outPair.1 retVal mem' hDef (hSound.2.1 retVal hRet)
+    exact hPost args mem outPair.1 retVal mem' hDef hTr
+      (hFrame.trans hRoot.2.2) (hSound.2.1 retVal hRet)
 
 /-- `checkMirCert_traceVerificationResult` for a `verifyMirCutpoints`
 certificate. -/
@@ -1496,6 +1536,8 @@ theorem verifyMirCutpoints_traceVerificationResult
       mem.activeProtectors = [] ∧
       entryArgsOk (c.body.localDecls.drop 1) argSlots args)
     (hPost : ∀ args mem tr retVal mem', c.pre args mem →
+      TraceObsOnly tr →
+      MirMemFrame mem' mem →
       (∃ d, get? c.body.localDecls 0 = some d ∧
         retInv.valDenote d.ty retVal) →
       c.post args mem tr (.normal (retVal, mem'))) :
