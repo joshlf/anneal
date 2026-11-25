@@ -2377,6 +2377,9 @@ pub trait AssocSuper {
 pub trait AssocSub: AssocSuper<Out = u32> {
     fn extra(&self) -> u32;
 }
+pub trait AssocLeaf: AssocSub {
+    fn leaf(&self) -> u32;
+}
 
 pub trait GenCn<const N: usize> {
     fn val(&self) -> usize;
@@ -2403,6 +2406,7 @@ impl AssocSuper for HasDrop {
     fn out(&self) -> u32 { self.0 }
 }
 impl AssocSub for HasDrop { fn extra(&self) -> u32 { self.0 + 3 } }
+impl AssocLeaf for HasDrop { fn leaf(&self) -> u32 { self.0 + 4 } }
 impl<const N: usize> GenCn<N> for HasDrop {
     fn val(&self) -> usize { N }
 }
@@ -2419,12 +2423,14 @@ pub fn exercise(h: &HasDrop) -> u32 {
     let tm: &dyn TwoMarkers = h;
     let _m1: &dyn M1 = tm;
     let _m2: &dyn M2 = tm;
-    let asub: &dyn AssocSub = h;
+    let aleaf: &dyn AssocLeaf = h;
+    let asub: &dyn AssocSub = aleaf;
     let asup: &dyn AssocSuper<Out = u32> = asub;
+    let asup2: &dyn AssocSuper<Out = u32> = aleaf;
     let gc3: &dyn GenCn<3> = h;
     let gc4: &dyn GenCn<4> = h;
     let _hr: &dyn HrSub = h;
-    b.b() + m.m() + s.s() + asup.out() + (gc3.val() + gc4.val()) as u32
+    b.b() + m.m() + s.s() + asup.out() + asup2.out() + (gc3.val() + gc4.val()) as u32
 }
 "#;
         fs::write(&src_path, sample_rust.as_bytes()).expect("write dyn_edges.rs");
@@ -2519,9 +2525,15 @@ pub fn exercise(h: &HasDrop) -> u32 {
             "TwoMarkers extraSuperVTableIds must contain M2 ({m2_id}), got:\n{tm_chunk}"
         );
 
-        // 3. AssocSub: AssocSuper<Out = u32> links primarySuperVTableId? to AssocSuper<Out = u32>.
+        // 3. AssocLeaf: AssocSub, AssocSub: AssocSuper<Out = u32> links the full
+        // primary supertrait chain `AssocLeaf -> AssocSub -> AssocSuper<Out = u32>`.
         let (asup_id, _) = parse_vt("dyn AssocSuper<Out = u32>");
-        let (_, asub_chunk) = parse_vt("dyn AssocSub");
+        let (asub_id, asub_chunk) = parse_vt("dyn AssocSub");
+        let (_, aleaf_chunk) = parse_vt("dyn AssocLeaf");
+        assert!(
+            aleaf_chunk.contains(&format!("primarySuperVTableId? := (Option.some {asub_id})")),
+            "AssocLeaf primarySuperVTableId? must point to AssocSub ({asub_id}), got:\n{aleaf_chunk}"
+        );
         assert!(
             asub_chunk.contains(&format!("primarySuperVTableId? := (Option.some {asup_id})")),
             "AssocSub primarySuperVTableId? must point to AssocSuper<Out = u32> ({asup_id}), got:\n{asub_chunk}"

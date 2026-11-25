@@ -13900,7 +13900,13 @@ def resolveCalleeBodyAndArgs?
     -- lookup so a trait's default method body or a trait-impl entry can never
     -- shadow vtable dispatch in `evalDynCallHook?`. Non-virtual calls with
     -- `Self = dyn Other` (e.g. `impl Foo for dyn Bar`) are absent from
-    -- `virtualMethods` and resolve normally.
+    -- `virtualMethods` and resolve normally. Consulting `callees` alone
+    -- (`Option.none` for `currentBody`) is complete: when `callees = []`
+    -- `resolveCalleeBodyAndArgs?` already returns `.none`; when `callees ≠ []`
+    -- every captured crate body carries the identical `virtualMethods` table
+    -- (Condition `C7`), and `lookupCallee` additionally rejects trait default
+    -- bodies (`typeParamCount ≥ 1`) because `RigidTy.computeLayout` returns
+    -- `.none` on `.dynamic _`.
     let shadowedByVirtual : Bool :=
       match firstArg with
       | .dynamic dynKey =>
@@ -14883,13 +14889,17 @@ Checks performed on `dataVal` against `entry.sizeBytes` / `entry.alignBytes` /
 - a provenance-less `.scalar` data word must wrap to a non-zero address modulo
   `2^(8*ptrBytes)` (so the 32-bit wrapped address `2^32` is null), be aligned,
   and designate a zero-sized pointee;
-- a stack-borrow data pointer must have a live, non-deallocated target, an
-  offset that is a multiple of `alignBytes`, and
-  `offsetBytes + sizeBytes <= ptrAllocByteBound?`; when `checkTB` its tag and
-  every ancestor in its Tree Borrows parent chain (`treeBorrowAncestorsChildAccessUB`)
-  must permit a read (or write for `isMut`), rejecting `.disabled` tags/ancestors
-  and `.frozen` tags/ancestors for `&mut`;
-- a global data pointer must be aligned, in bounds, and (for `isMut`) mutable;
+- a stack-borrow data pointer must have a live, non-deallocated target, a
+  target local whose enclosing base alignment is at least `alignBytes` with an
+  aligned projected offset (`checkTargetPlaceAlignWalk`, falling back to
+  `offsetBytes % alignBytes == 0` only when the local's layout is unavailable),
+  and `offsetBytes + sizeBytes <= ptrAllocByteBound?`; when `checkTB` its tag
+  and every ancestor in its Tree Borrows parent chain
+  (`treeBorrowAncestorsChildAccessUB`) must permit a read (or write for `isMut`),
+  rejecting `.disabled` tags/ancestors and `.frozen` tags/ancestors for `&mut`;
+- a global data pointer must have `alloc.align.bytes >= alignBytes` (and
+  divisible by `alignBytes`), aligned `offsetBytes`, in bounds, and (for `isMut`)
+  mutable;
 - an unbacked pointer (`allocId = 0`) must satisfy modular non-null
   (`wrapScalarBits offsetBytes (scalarModulus ptrBytes) != 0`), alignment, and
   zero-sized pointee; any other non-borrow/non-global provenance requires a
@@ -14960,13 +14970,42 @@ def dynRefDataValid
                 | .some (.init _) => true
                 | .some .uninit => true
                 | _ => false
+          let stackAlignOk : Bool :=
+            match Nat.ble align 1 with
+            | true => true
+            | false =>
+              let checkWithDecl (tDecls : List LocalDecl) (tLayouts : LayoutTable)
+                  (rootValOpt : Option Value) : Bool :=
+                match get? tDecls be.targetLocal with
+                | .some decl =>
+                  match tyExactByteAlign? tDecls tLayouts decl.ty with
+                  | .some _ =>
+                    checkTargetPlaceAlignWalk tDecls tLayouts align p.offsetBytes
+                      (.some decl.ty) rootValOpt .none be.targetProjection
+                  | .none => Nat.beq (Nat.mod p.offsetBytes align) 0
+                | .none => Nat.beq (Nat.mod p.offsetBytes align) 0
+              match activeFrameSlot? locals mv.callStack be.targetFrameDepth be.targetLocal with
+              | .some (.init rootVal) => checkWithDecl localDecls layouts (.some rootVal)
+              | .some .uninit => checkWithDecl localDecls layouts .none
+              | .some .dead => false
+              | .none =>
+                match foreignFrameSlot? mv.callStack mv.callerLocals be.targetFrameDepth be.targetLocal with
+                | .some slot =>
+                  let rootValOpt :=
+                    match slot with
+                    | .init v => .some v
+                    | _ => .none
+                  let (tDecls, tLayouts) :=
+                    foreignFrameDeclsAndLayouts mv.callStack layouts be.targetFrameDepth be.targetLocal
+                  checkWithDecl tDecls tLayouts rootValOpt
+                | .none => false
           let boundOk : Bool :=
             match ptrAllocByteBound? locals mv.boundMemory localDecls layouts p with
             | .some bound => Nat.ble (Nat.add p.offsetBytes entry.sizeBytes) bound
             | .none => true
           Bool.and permOk
             (Bool.and liveOk
-              (Bool.and (Nat.beq (Nat.mod p.offsetBytes align) 0) boundOk))
+              (Bool.and stackAlignOk boundOk))
         | .none =>
           match lookupGlobalAlloc mv.globals p.allocId with
           | .some alloc =>
@@ -14975,9 +15014,10 @@ def dynRefDataValid
               | true, .not => false
               | _, _ => true
             Bool.and mutOk
-              (Bool.and (Nat.beq (Nat.mod alloc.align.bytes align) 0)
-                (Bool.and (Nat.beq (Nat.mod p.offsetBytes align) 0)
-                  (Nat.ble (Nat.add p.offsetBytes entry.sizeBytes) (length alloc.bytes))))
+              (Bool.and (Nat.ble align alloc.align.bytes)
+                (Bool.and (Nat.beq (Nat.mod alloc.align.bytes align) 0)
+                  (Bool.and (Nat.beq (Nat.mod p.offsetBytes align) 0)
+                    (Nat.ble (Nat.add p.offsetBytes entry.sizeBytes) (length alloc.bytes)))))
           | .none =>
             match Nat.beq p.allocId 0 with
             | true =>
@@ -15085,15 +15125,22 @@ validated first (`checkDynVTablePtr` against `J`: invalid pointers are `.ub`),
 then the auto traits of `K` must be a subset of those of `J` (an apparently
 added auto trait may be implied by a supertrait the capture does not record, so
 a violation is `.unsupported`, never `.ub`), and the destination vtable is the
-captured vtable of `(entry.concreteTy, K)` (`.unsupported` if uncaptured). The
-data word is preserved; the reference validity of the data word was established
-when the `dyn J` reference was produced.
+captured vtable of `(entry.concreteTy, K)` (`.unsupported` if uncaptured). Raw
+targets (`isRef = false`) preserve the data word without dereferenceability,
+alignment, or Tree Borrows checks (Condition `C2`), whereas reference targets
+(`isRef = true`, including `Pin<&[mut] dyn>`) additionally validate the data
+word against `dstEntry` (`dynRefDataValid`, catching dangling, misaligned, or
+Tree-Borrows-disabled references at the upcast site).
 -/
 def evalDynToDynUnsize
+    (locals' : List LocalSlot)
     (mv : DynMemView)
+    (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (fatVal : Value)
-    (srcKey dstKey : DefPath) :
+    (srcKey dstKey : DefPath)
+    (isRef : Bool)
+    (isMut : Bool) :
     DynCheck Value :=
   let ptrBytes := layoutPointerBytes layouts
   match fatVal with
@@ -15127,8 +15174,15 @@ def evalDynToDynUnsize
             match resolveUpcastVTable? vts dts entry dstKey with
             | .none => .unsupported
             | .some dstEntry =>
-              .ok (.aggregate 0
-                (dataVal :: .ptr { allocId := dstEntry.vtableAllocId, offsetBytes := 0 } ptrBytes :: .nil))
+              let outVal : Value :=
+                .aggregate 0
+                  (dataVal :: .ptr { allocId := dstEntry.vtableAllocId, offsetBytes := 0 } ptrBytes :: .nil)
+              match isRef with
+              | false => .ok outVal
+              | true =>
+                match dynRefDataValid locals' mv localDecls layouts ptrBytes dataVal dstEntry isMut true with
+                | true => .ok outVal
+                | false => .ub
   | _ => .ub
 
 /-- Mutability of an unsizing source `src` is compatible with target `dst`
@@ -15192,13 +15246,15 @@ def evalDynUnsizeCore
       match Bool.and (dynUnsizeMutOk sm dstMut) (Bool.or srcIsRef (Bool.not dstIsRef)) with
       | false => .unsupported
       | true =>
+        let dstIsMut : Bool :=
+          match dstMut with
+          | .mut => true
+          | .not => false
         match p with
-        | .dynamic srcKey => evalDynToDynUnsize mv layouts v srcKey dstKey
+        | .dynamic srcKey =>
+          evalDynToDynUnsize locals' mv localDecls layouts v srcKey dstKey dstIsRef dstIsMut
         | _ =>
-          evalThinToDynUnsize locals' mv localDecls layouts v p dstKey dstIsRef
-            (match dstMut with
-             | .mut => true
-             | .not => false)
+          evalThinToDynUnsize locals' mv localDecls layouts v p dstKey dstIsRef dstIsMut
   match tgt with
   | .unmodeled => .unsupported
   | .ref m k =>
