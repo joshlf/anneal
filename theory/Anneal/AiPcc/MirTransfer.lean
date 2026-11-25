@@ -6480,9 +6480,11 @@ def MirMemFrame (m₁ m₂ : Memory) : Prop :=
   m₁.activeCallee = m₂.activeCallee ∧
   m₁.activeProtectors = m₂.activeProtectors
 
+/-- `MirMemFrame` is reflexive. -/
 theorem MirMemFrame.refl (m : Memory) : MirMemFrame m m :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-- `MirMemFrame` is transitive. -/
 theorem MirMemFrame.trans {m₁ m₂ m₃ : Memory}
     (h₁ : MirMemFrame m₁ m₂) (h₂ : MirMemFrame m₂ m₃) : MirMemFrame m₁ m₃ :=
   ⟨h₁.1.trans h₂.1, h₁.2.1.trans h₂.2.1, h₁.2.2.1.trans h₂.2.2.1,

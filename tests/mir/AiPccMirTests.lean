@@ -23,14 +23,17 @@ with the canary helpers of `Anneal.AiPcc.Canaries`:
    `u8` arithmetic, a `switchInt` guard refinement, a stride-4 `u32` loop with
    one Bourdoncle cutpoint, a widening `IntToInt` cast, and checked `i32`
    addition.
-2. An `Anneal.ParametricCore` end-to-end use: a fuel-bounded run of the
-   deterministic step function proves `wpOutcome` at a concrete start state,
-   and the fourth conjunct of `checkMirCert_sound` upgrades it to fault-free
-   `wpStateOk` with the certified return postcondition.
-3. `#print axioms` guards: the soundness theorems and the canaries depend
-   only on `propext` and `Quot.sound`.
+2. `Anneal.ParametricCore` and `V2026Bridge` end-to-end transport: a
+   fuel-bounded run of the deterministic step function proves `wpOutcome` at a
+   concrete start state, `checkMirCert_sound_call` upgrades it to fault-free
+   `wpStateOk` with the certified return postcondition, and `V2026Bridge`
+   transports `wpStateOk` / `wpUntilOk` into `MirWpConverges`,
+   `MirStepsConverges`, `DWP`, and `TotalVerificationResult` (with
+   `MirMemFrame`).
+3. `#print axioms` guards: the soundness theorems, trusted certificate
+   bridges, and canaries depend only on `propext` and `Quot.sound`.
 4. Fail-closed refutations (`= false` by `rfl`) of unsound bodies,
-   certificates, and schedules.
+   certificates (including length mismatches), and schedules.
 -/
 
 namespace Anneal.AiPccMirTests

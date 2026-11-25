@@ -1080,34 +1080,32 @@ theorem initMachineStateWithMemoryAndCallees_root (body : CapturedMir)
     exact ⟨⟨hCS, hCallee, hProt, rfl, rfl⟩, rfl,
       ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩⟩
 
-/-- Every return outcome observed in the interaction tree of an invariant
-state is a normal return (`MirOutcome.normal`, ruling out `.panic` and
-`.abort`) along an observation-only trace (`TraceObsOnly tr`), preserving
-`MirMemFrame mem' s0.memory` and witnessed by `ReturnsFrom`. -/
-theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
-    {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)} {s0 : MachineState}
-    {tr : List (Event MirEffect)} {out : MirOutcome}
+/-- Every finite interaction-tree prefix `Reaches (mirTree body s0) tr u` from
+an invariant state emits only `MirObsE` observations (`TraceObsOnly tr`) and
+lands at a reachable invariant state whose memory satisfies
+`MirMemFrame s.memory s0.memory`. -/
+theorem reaches_of_mirPccInv {body : CapturedMir} {retInv : MirAbsSlot}
+    {invs : List (Option MirAbsEnv)} {s0 : MachineState}
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
     (hPhase : mirPhaseSupported body.phase = true)
     (hAll : checkAllBlocksCert body.localDecls retInv body.basicBlocks invs
       body.basicBlocks invs = true)
     (h0 : MirPccInv body invs s0)
-    (hR : ReachesRet (mirTree body s0) tr out) :
-    ∃ retVal mem',
-      out = .normal (retVal, mem') ∧
-      TraceObsOnly tr ∧
-      MirMemFrame mem' s0.memory ∧
-      ReturnsFrom body s0 retVal := by
-  have hQ : ∀ (t : ITree MirEffect MirOutcome) tr' (u : ITree MirEffect MirOutcome),
-      Reaches t tr' u →
+    (hReach : Reaches (mirTree body s0) tr u) :
+    TraceObsOnly tr ∧
+    ∃ s, MirReach body s0 s ∧ MirMemFrame s.memory s0.memory ∧
+      MirPccInv body invs s ∧ u = mirTree body s := by
+  have hQ : ∀ (t : ITree MirEffect MirOutcome) tr' (u' : ITree MirEffect MirOutcome),
+      Reaches t tr' u' →
       (∃ s, MirReach body s0 s ∧ MirMemFrame s.memory s0.memory ∧
         MirPccInv body invs s ∧
         t = ITree.cofix (stepMirState body) (.running s)) →
       TraceObsOnly tr' ∧
       ∃ s, MirReach body s0 s ∧ MirMemFrame s.memory s0.memory ∧
         MirPccInv body invs s ∧
-        u = ITree.cofix (stepMirState body) (.running s) := by
-    intro t tr' u hReach
-    induction hReach with
+        u' = ITree.cofix (stepMirState body) (.running s) := by
+    intro t tr' u' hR
+    induction hR with
     | refl => exact fun h => ⟨True.intro, h⟩
     | tau hObs _ ih =>
       intro h
@@ -1160,12 +1158,31 @@ theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
           | ⟨_, _, _, hRet, _, _, _⟩ =>
             rw [hRet] at hObs'
             nomatch hObs'
+  exact hQ _ tr u hReach ⟨s0, .refl, MirMemFrame.refl s0.memory, h0, rfl⟩
+
+/-- Every return outcome observed in the interaction tree of an invariant
+state is a normal return (`MirOutcome.normal`, ruling out `.panic` and
+`.abort`) along an observation-only trace (`TraceObsOnly tr`), preserving
+`MirMemFrame mem' s0.memory` and witnessed by `ReturnsFrom`. -/
+theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
+    {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)} {s0 : MachineState}
+    {tr : List (Event MirEffect)} {out : MirOutcome}
+    (hPhase : mirPhaseSupported body.phase = true)
+    (hAll : checkAllBlocksCert body.localDecls retInv body.basicBlocks invs
+      body.basicBlocks invs = true)
+    (h0 : MirPccInv body invs s0)
+    (hR : ReachesRet (mirTree body s0) tr out) :
+    ∃ retVal mem',
+      out = .normal (retVal, mem') ∧
+      TraceObsOnly tr ∧
+      MirMemFrame mem' s0.memory ∧
+      ReturnsFrom body s0 retVal := by
   match hR with
   | ⟨u, hReach, hObs⟩ =>
-    match hQ _ tr u hReach ⟨s0, .refl, MirMemFrame.refl s0.memory, h0, rfl⟩ with
+    match reaches_of_mirPccInv hPhase hAll h0 hReach with
     | ⟨hTr, s, hRs, hFs, hInv, hEq⟩ =>
       subst hEq
-      rw [ITree.observe_cofix] at hObs
+      rw [mirTree, ITree.observe_cofix] at hObs
       have hObs' : (stepMirFn body s).map (ITree.cofix (stepMirState body)) =
           .ret out := hObs
       cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
