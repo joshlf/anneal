@@ -1120,22 +1120,22 @@ theorem evalTailCallTerminator_protector_ub (s : MachineState) (func : Operand)
     (argOps : List Operand) (body : CapturedMir) (target : ResolvedCallTarget)
     (l₁ : List LocalSlot) (argVals : List Value) (l₂ : List LocalSlot)
     (hr : resolveCallTarget s func (length argOps) body.localDecls body.layouts = .ok target l₁)
-    (ha : evalOperands l₁ argOps s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals l₂)
+    (ha : evalOperandsWithBodyCast l₁ argOps s.memory.borrows s.memory.globals body.layouts
+      s.memory.callerLocals body.localDecls s.memory.callStack = .ok argVals l₂)
     (hc : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
       (length s.memory.callStack) (length s.frame.locals) = true) :
     evalTailCallTerminator s func argOps (some body) = MirStepNode.fail .ub := by
   simp only [evalTailCallTerminator, bodyLocalDeclsOf, hr, ha, hc]
 
 /-- **Tail call without a protector conflict steps directly into `enterTailCalleeFrame`**
-after disabling the outgoing frame's borrows (`disableFrameBorrows`): universal positive
-counterpart to `evalTailCallTerminator_protector_ub`. -/
+after disabling the outgoing frame's borrows (`disableFrameBorrows`) and applying
+`tailCalleeEntryMemory`: universal positive counterpart to `evalTailCallTerminator_protector_ub`. -/
 theorem evalTailCallTerminator_no_conflict_steps (s : MachineState) (func : Operand)
     (argOps : List Operand) (body calleeBody : CapturedMir) (target : ResolvedCallTarget)
     (l₁ : List LocalSlot) (argVals : List Value) (l₂ : List LocalSlot)
     (hr : resolveCallTarget s func (length argOps) body.localDecls body.layouts = .ok target l₁)
-    (ha : evalOperands l₁ argOps s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals l₂)
+    (ha : evalOperandsWithBodyCast l₁ argOps s.memory.borrows s.memory.globals body.layouts
+      s.memory.callerLocals body.localDecls s.memory.callStack = .ok argVals l₂)
     (hc : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
       (length s.memory.callStack) (length s.frame.locals) = false)
     (hlookup : lookupCallee s.memory.callees body.layouts target.defPath target.typeArgs
@@ -1144,9 +1144,13 @@ theorem evalTailCallTerminator_no_conflict_steps (s : MachineState) (func : Oper
     evalTailCallTerminator s func argOps (some body) =
       MirStepNode.step
         (enterTailCalleeFrame
-          { s.memory with
-            borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
-              (length s.frame.locals) }
+          (tailCalleeEntryMemory
+            s.memory.callStack
+            { s.memory with
+              borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+                (length s.frame.locals) }
+            (length s.frame.locals)
+            (length (initLocals calleeBody argVals)))
           calleeBody argVals) := by
   simp only [evalTailCallTerminator, bodyLocalDeclsOf, hr, ha, hc, hlookup, hcompat]
 
