@@ -109,7 +109,8 @@ _HOST_AUDIT_CORE = """\
 import os, socket as _socket
 
 _UID = os.getuid()
-_MARKERS = (f"anneal-build-slots-{_UID}", f"anneal-last-oom-{_UID}")
+_SLOT_DIR_NAME = f"anneal-build-slots-{_UID}"
+_OOM_PREFIX = f"anneal-last-oom-{_UID}."
 _BASES = []
 for _b in (f"/run/user/{_UID}", "/tmp"):
     for _v in {_b, os.path.realpath(_b)}:
@@ -130,9 +131,21 @@ def _host_state_path(raw):
         path = os.path.abspath(os.fsdecode(raw))
     except (TypeError, ValueError):
         return None
-    for cand in (path, os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))):
+    cands = (
+        path,
+        os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path)),
+        os.path.realpath(path),
+    )
+    for cand in cands:
         for base in _BASES:
-            if cand.startswith(base + os.sep) and cand[len(base) + 1:].startswith(_MARKERS):
+            if not cand.startswith(base + os.sep):
+                continue
+            rel = cand[len(base) + 1:]
+            if (
+                rel == _SLOT_DIR_NAME
+                or rel.startswith(_SLOT_DIR_NAME + os.sep)
+                or rel.startswith(_OOM_PREFIX)
+            ):
                 return cand
     return None
 
@@ -161,16 +174,19 @@ import importlib.machinery as _ilm, importlib.util as _ilu, json as _json, sys a
 
 ALR_HOST_STATE_AUDIT = True
 _LOG = os.environ.get("ALR_HOST_AUDIT_LOG")
+_IN_HOOK = False
 
 
 def _alr_host_audit_hook(event, args):
-    if not _LOG:
+    global _IN_HOOK
+    if not _LOG or _IN_HOOK:
         return
     hit = classify_host_state_event(event, args)
     if hit is None:
         return
     hit["pid"] = os.getpid()
     hit["argv"] = list(_sys.argv[:8])
+    _IN_HOOK = True
     try:
         fd = os.open(_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
@@ -179,6 +195,8 @@ def _alr_host_audit_hook(event, args):
             os.close(fd)
     except OSError:
         pass
+    finally:
+        _IN_HOOK = False
 
 
 _sys.addaudithook(_alr_host_audit_hook)
@@ -220,9 +238,13 @@ def _collect_host_audit_violations() -> list[dict[str, Any]]:
     found = list(_HOST_AUDIT_SINK)
     log_path = _host_audit_log_path()
     if log_path is not None and log_path.exists():
-        for line in log_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
                 found.append(json.loads(line))
+            except ValueError:
+                found.append({"event": "corrupt_audit_line", "raw": line})
     return found
 
 
@@ -244,13 +266,16 @@ def _isolated_cli_env(
         env.pop("XDG_RUNTIME_DIR", None)
     log_path = _host_audit_log_path()
     if log_path is not None:
-        assert _HOST_AUDIT_TMPDIR is not None
-        env["PYTHONPATH"] = os.pathsep.join(
-            p for p in (_HOST_AUDIT_TMPDIR.name, env.get("PYTHONPATH", "")) if p
-        )
         env[_HOST_AUDIT_ENV_LOG] = str(log_path)
     if env_extra:
         env.update(env_extra)
+    # Prepend the auditing `sitecustomize` directory AFTER `env_extra` so an explicit
+    # `env_extra={"PYTHONPATH": ...}` chains cleanly behind it instead of disabling it.
+    if log_path is not None:
+        assert _HOST_AUDIT_TMPDIR is not None
+        existing_pp = env.get("PYTHONPATH", "")
+        parts = [p for p in existing_pp.split(os.pathsep) if p and p != _HOST_AUDIT_TMPDIR.name]
+        env["PYTHONPATH"] = os.pathsep.join([_HOST_AUDIT_TMPDIR.name, *parts])
     return env
 
 
@@ -3543,6 +3568,8 @@ class TestCliSubprocess(unittest.TestCase):
         for event, args in (
             ("open", (f"/tmp/anneal-cli-rt-abc/{slots}/slot-1.lock", None, os.O_CREAT)),
             ("open", (f"/tmp/anneal-test-xdg-rt-abc/anneal-last-oom-{uid}.json", None, 0)),
+            ("open", (f"/tmp/anneal-build-slots-{uid}0/slot-1.lock", None, 0)),
+            ("open", (f"/tmp/anneal-last-oom-{uid}0.json", None, 0)),
             ("open", (f"/run/user/{uid}/bus", None, 0)),
             ("os.mkdir", (f"/tmp/not-{slots}", 0o777, -1)),
             ("socket.connect", (None, "/tmp/anneal-cli-rt-abc/anneal-lean-lsp.sock")),
@@ -3555,6 +3582,10 @@ class TestCliSubprocess(unittest.TestCase):
             link = Path(link_tmp) / "rt"
             link.symlink_to("/tmp")
             self.assertIsNotNone(classify("open", (str(link / slots / "slot-1.lock"), None, 0)))
+            # Direct leaf symlink pointing to a host lock file / slot dir is caught too.
+            leaf_link = Path(link_tmp) / "direct-lock"
+            leaf_link.symlink_to(f"/tmp/{slots}/slot-1.lock")
+            self.assertIsNotNone(classify("open", (str(leaf_link), None, 0)))
 
         # In-process hook: live, routed into the sink (restored afterwards).
         self.assertTrue(_HOST_AUDIT_ACTIVE)
@@ -3567,25 +3598,32 @@ class TestCliSubprocess(unittest.TestCase):
         finally:
             _HOST_AUDIT_SINK[:] = saved
 
-        # Subprocesses: the auditing `sitecustomize` loads (and chains), and a real touch is
-        # logged to the configured log (here a scratch log, not the module log).
+        # Subprocesses: the auditing `sitecustomize` loads (and chains to custom
+        # `env_extra["PYTHONPATH"]` without being overwritten) and logs a real touch.
         with tempfile.TemporaryDirectory(prefix="anneal-audit-child-") as child_tmp:
             scratch_log = Path(child_tmp) / "child.jsonl"
+            extra_pp = Path(child_tmp) / "extra_pp"
+            extra_pp.mkdir()
+            (extra_pp / "sitecustomize.py").write_text(
+                "import os; os.environ['ALR_CHAINED_CUSTOM_SC'] = '1'\n",
+                encoding="utf-8",
+            )
             res = self._run_isolated(
                 [
                     sys.executable,
                     "-c",
-                    "import os, sitecustomize, sys\n"
-                    "print(getattr(sitecustomize, 'ALR_HOST_STATE_AUDIT', False))\n"
+                    "import json, os, sitecustomize\n"
+                    "print(json.dumps({'audit': getattr(sitecustomize, 'ALR_HOST_STATE_AUDIT', False), "
+                    "'chained': os.environ.get('ALR_CHAINED_CUSTOM_SC')}))\n"
                     "try:\n"
                     f"    os.open({probe_path!r}, os.O_RDONLY)\n"
                     "except OSError:\n"
                     "    pass\n",
                 ],
-                {_HOST_AUDIT_ENV_LOG: str(scratch_log)},
+                {"PYTHONPATH": str(extra_pp), _HOST_AUDIT_ENV_LOG: str(scratch_log)},
             )
             self.assertEqual(res.returncode, 0, res.stderr)
-            self.assertEqual(res.stdout.strip(), "True")
+            self.assertEqual(json.loads(res.stdout), {"audit": True, "chained": "1"})
             logged = [json.loads(x) for x in scratch_log.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([(h["event"], h["path"]) for h in logged], [("open", probe_path)])
 

@@ -5259,7 +5259,9 @@ def resolve_check_trusted_cache_dir(repo_root: Path) -> str:
 
 
 def _ensure_private_check_trusted_cache_dir(
-    cmd: list[str], cwd: Path | None = None
+    cmd: list[str],
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> None:
     """Pre-create a missing `--cache-dir` leaf as `0700` before `check_trusted_fast` runs.
 
@@ -5269,7 +5271,7 @@ def _ensure_private_check_trusted_cache_dir(
     `cwd` (preserving `check_trusted.py`'s fail-closed admission check). Best-effort:
     failures are left for `check_trusted.py`'s own fail-closed admission.
     """
-    inner = cmd[cmd.index("--") + 1 :] if _is_lean_run_wrapped(cmd) and "--" in cmd else cmd
+    inner = cmd[cmd.index("--") + 1 :] if _is_lean_run_wrapped(cmd, env) and "--" in cmd else cmd
     raw_cache: str | None = None
     i = 0
     while i < len(inner):
@@ -7180,7 +7182,7 @@ def _run_step(
         )
         outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
         if name == "check_trusted_fast":
-            _ensure_private_check_trusted_cache_dir(cmd, cwd=cwd)
+            _ensure_private_check_trusted_cache_dir(cmd, cwd=cwd, env=env)
         timed_out = False
         try:
             proc = subprocess.Popen(

@@ -8267,13 +8267,46 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     cwd=checkout,
                     timeout_sec=30,
                 )
+                # Renamed wrapper via `env_overrides={"ANNEAL_LEAN_RUN": ...}` still resolves
+                # the inner `--cache-dir` past `--` and pre-creates it `0700`.
+                renamed_wrapper = root / "custom-lean-run"
+                renamed_wrapper.write_text(
+                    f"#!{sys.executable}\nimport os, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "cmd = args[args.index('--') + 1:]\n"
+                    "os.execvp(cmd[0], cmd)\n",
+                    encoding="utf-8",
+                )
+                renamed_wrapper.chmod(0o755)
+                wrapped_cache = root / "fresh-cache-renamed-wrapper"
+                res_wrapped = suite._run_step(
+                    "check_trusted_fast",
+                    "cat1_trusted_boundary",
+                    [
+                        os.fspath(renamed_wrapper),
+                        "--mode",
+                        "build",
+                        "--timeout",
+                        "30",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "pass",
+                        "--cache-dir",
+                        os.fspath(wrapped_cache),
+                    ],
+                    cwd=checkout,
+                    timeout_sec=30,
+                    env_overrides={"ANNEAL_LEAN_RUN": os.fspath(renamed_wrapper)},
+                )
             finally:
                 os.umask(old_umask)
             self.assertEqual(res["status"], "PASS", res)
             self.assertEqual(res_eq["status"], "PASS", res_eq)
             self.assertEqual(res_in["status"], "PASS", res_in)
             self.assertEqual(res_rel["status"], "PASS", res_rel)
-            for created in (new_cache, eq_cache):
+            self.assertEqual(res_wrapped["status"], "PASS", res_wrapped)
+            for created in (new_cache, eq_cache, wrapped_cache):
                 self.assertTrue(created.is_dir(), created)
                 self.assertEqual(stat.S_IMODE(created.stat().st_mode), 0o700, created)
                 self.assertTrue(real_disjoint(created, checkout.resolve(), uid), created)
