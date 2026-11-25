@@ -81,6 +81,14 @@ _SLOT_LOCK_GUARD: Any = None
 # `_evict_lsp_workers` away from live host state (started in `setUpModule`, stopped in
 # `tearDownModule`).
 _HOST_RUNTIME_GUARDS: list[Any] = []
+# Module-wide host-state audit: every in-process audit event and every `_isolated_cli_env`
+# subprocess (through a `sitecustomize` on `PYTHONPATH`) that touches live host build-slot
+# locks, OOM memos, or the default host LSP socket is recorded and fails `tearDownModule`.
+_HOST_AUDIT_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
+_HOST_AUDIT_ACTIVE = False
+_HOST_AUDIT_HOOKED = False
+_HOST_AUDIT_SINK: list[dict[str, Any]] = []
+_HOST_AUDIT_ENV_LOG = "ALR_HOST_AUDIT_LOG"
 _XDG_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
 _XDG_RUNTIME_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
 # Text of the `anneal-workloads.slice` unit `ensure_workloads_slice` reconciles on this
@@ -92,6 +100,130 @@ def _scrub_ambient_anneal_env(env: MutableMapping[str, str]) -> None:
     for key in list(env):
         if key.startswith(_AMBIENT_ANNEAL_ENV_PREFIXES):
             env.pop(key, None)
+
+
+# Shared by the in-process audit hook and the child `sitecustomize`: classify one audit
+# event as a live host-state touch (`dict`) or not (`None`). Paths are checked lexically
+# and through `realpath`, so symlinks into `/run/user/<uid>` or `/tmp` are caught too.
+_HOST_AUDIT_CORE = """\
+import os, socket as _socket
+
+_UID = os.getuid()
+_MARKERS = (f"anneal-build-slots-{_UID}", f"anneal-last-oom-{_UID}")
+_BASES = []
+for _b in (f"/run/user/{_UID}", "/tmp"):
+    for _v in {_b, os.path.realpath(_b)}:
+        if _v not in _BASES:
+            _BASES.append(_v)
+_LSP_SOCKS = {"/tmp/anneal-lean-lsp.sock", os.path.realpath("/tmp/anneal-lean-lsp.sock")}
+_PATH_EVENTS = {
+    "open": (0,), "os.mkdir": (0,), "os.scandir": (0,), "os.listdir": (0,),
+    "os.remove": (0,), "os.rmdir": (0,), "os.rename": (0, 1), "os.chmod": (0,),
+    "os.truncate": (0,), "os.utime": (0,), "shutil.rmtree": (0,),
+}
+
+
+def _host_state_path(raw):
+    if not isinstance(raw, (str, bytes, os.PathLike)):
+        return None
+    try:
+        path = os.path.abspath(os.fsdecode(raw))
+    except (TypeError, ValueError):
+        return None
+    for cand in (path, os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))):
+        for base in _BASES:
+            if cand.startswith(base + os.sep) and cand[len(base) + 1:].startswith(_MARKERS):
+                return cand
+    return None
+
+
+def classify_host_state_event(event, args):
+    idxs = _PATH_EVENTS.get(event)
+    if idxs is not None:
+        for i in idxs:
+            if i < len(args):
+                hit = _host_state_path(args[i])
+                if hit is not None:
+                    return {"event": event, "path": hit}
+        return None
+    if event == "socket.connect" and len(args) > 1 and isinstance(args[1], (str, bytes)):
+        try:
+            addr = os.path.abspath(os.fsdecode(args[1]))
+        except (TypeError, ValueError):
+            return None
+        if addr in _LSP_SOCKS or os.path.realpath(addr) in _LSP_SOCKS:
+            return {"event": event, "path": addr}
+    return None
+"""
+
+_HOST_AUDIT_SITECUSTOMIZE = _HOST_AUDIT_CORE + """
+import importlib.machinery as _ilm, importlib.util as _ilu, json as _json, sys as _sys
+
+ALR_HOST_STATE_AUDIT = True
+_LOG = os.environ.get("ALR_HOST_AUDIT_LOG")
+
+
+def _alr_host_audit_hook(event, args):
+    if not _LOG:
+        return
+    hit = classify_host_state_event(event, args)
+    if hit is None:
+        return
+    hit["pid"] = os.getpid()
+    hit["argv"] = list(_sys.argv[:8])
+    try:
+        fd = os.open(_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (_json.dumps(hit) + "\\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+_sys.addaudithook(_alr_host_audit_hook)
+
+# Chain to the next `sitecustomize` on `sys.path` (e.g. the distro's) so behavior is
+# otherwise unchanged.
+_here = os.path.dirname(os.path.abspath(__file__))
+_rest = [p for p in _sys.path if os.path.abspath(p or os.curdir) != _here]
+_spec = _ilm.PathFinder.find_spec("sitecustomize", _rest)
+if _spec is not None and _spec.loader is not None:
+    _mod = _ilu.module_from_spec(_spec)
+    try:
+        _spec.loader.exec_module(_mod)
+    except Exception:
+        pass
+"""
+
+_HOST_AUDIT_NS: dict[str, Any] = {}
+exec(compile(_HOST_AUDIT_CORE, "<alr-host-audit-core>", "exec"), _HOST_AUDIT_NS)
+_classify_host_state_event = _HOST_AUDIT_NS["classify_host_state_event"]
+
+
+def _in_process_host_audit_hook(event: str, args: tuple[Any, ...]) -> None:
+    # Audit hooks cannot be removed; this one is inert outside this module's lifetime.
+    if not _HOST_AUDIT_ACTIVE:
+        return
+    hit = _classify_host_state_event(event, args)
+    if hit is not None:
+        _HOST_AUDIT_SINK.append(hit)
+
+
+def _host_audit_log_path() -> Path | None:
+    if _HOST_AUDIT_TMPDIR is None:
+        return None
+    return Path(_HOST_AUDIT_TMPDIR.name) / "violations.jsonl"
+
+
+def _collect_host_audit_violations() -> list[dict[str, Any]]:
+    found = list(_HOST_AUDIT_SINK)
+    log_path = _host_audit_log_path()
+    if log_path is not None and log_path.exists():
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                found.append(json.loads(line))
+    return found
 
 
 def _isolated_cli_env(
@@ -110,6 +242,13 @@ def _isolated_cli_env(
         env["XDG_RUNTIME_DIR"] = _XDG_RUNTIME_TMPDIR.name
     else:
         env.pop("XDG_RUNTIME_DIR", None)
+    log_path = _host_audit_log_path()
+    if log_path is not None:
+        assert _HOST_AUDIT_TMPDIR is not None
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (_HOST_AUDIT_TMPDIR.name, env.get("PYTHONPATH", "")) if p
+        )
+        env[_HOST_AUDIT_ENV_LOG] = str(log_path)
     if env_extra:
         env.update(env_extra)
     return env
@@ -346,7 +485,17 @@ def _file_identity(path: Path) -> tuple[int, int, str]:
 
 def setUpModule() -> None:
     global _ENV_PATCHER, _SLOT_LOCK_GUARD, _XDG_TMPDIR, _XDG_RUNTIME_TMPDIR, _SLICE_UNIT_SEED
+    global _HOST_AUDIT_TMPDIR, _HOST_AUDIT_ACTIVE, _HOST_AUDIT_HOOKED
     try:
+        _HOST_AUDIT_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-host-audit-")
+        (Path(_HOST_AUDIT_TMPDIR.name) / "sitecustomize.py").write_text(
+            _HOST_AUDIT_SITECUSTOMIZE, encoding="utf-8"
+        )
+        _HOST_AUDIT_SINK.clear()
+        if not _HOST_AUDIT_HOOKED:
+            sys.addaudithook(_in_process_host_audit_hook)
+            _HOST_AUDIT_HOOKED = True
+        _HOST_AUDIT_ACTIVE = True
         _XDG_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-")
         _XDG_RUNTIME_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-rt-")
         os.chmod(_XDG_RUNTIME_TMPDIR.name, 0o700)
@@ -396,6 +545,27 @@ def setUpModule() -> None:
 
 
 def tearDownModule() -> None:
+    global _HOST_AUDIT_TMPDIR, _HOST_AUDIT_ACTIVE
+    _HOST_AUDIT_ACTIVE = False
+    violations: list[dict[str, Any]] = []
+    try:
+        violations = _collect_host_audit_violations()
+    finally:
+        try:
+            _teardown_module_state()
+        finally:
+            _HOST_AUDIT_SINK.clear()
+            if _HOST_AUDIT_TMPDIR is not None:
+                _HOST_AUDIT_TMPDIR.cleanup()
+                _HOST_AUDIT_TMPDIR = None
+    if violations:
+        raise AssertionError(
+            "tests touched live host build-slot / OOM-memo / LSP-socket state: "
+            + json.dumps(violations[:20])
+        )
+
+
+def _teardown_module_state() -> None:
     global _ENV_PATCHER, _SLOT_LOCK_GUARD, _XDG_TMPDIR, _XDG_RUNTIME_TMPDIR, _SLICE_UNIT_SEED
     try:
         try:
@@ -3351,6 +3521,74 @@ class TestCliSubprocess(unittest.TestCase):
         )
         self.assertNotIn(Path("/tmp/anneal-lean-lsp.sock"), seen_socks)
 
+    def test_module_host_state_audit_detects_and_isolates_violations(self) -> None:
+        """The module-wide host-state audit (`tearDownModule` fails on any hit) is live:
+        its classifier flags live host slot / OOM-memo paths (directly or via symlinked
+        parents) and the default host LSP socket while passing isolated paths; the
+        in-process hook records into its sink; and `_isolated_cli_env` subprocesses load
+        the auditing `sitecustomize` (chaining the distro one) and log real touches."""
+        uid = os.getuid()
+        slots = f"anneal-build-slots-{uid}"
+        classify = _classify_host_state_event
+        for event, args in (
+            ("open", (f"/run/user/{uid}/{slots}/slot-1.lock", None, os.O_RDONLY)),
+            ("open", (f"/tmp/{slots}/slot-2.lock", "rb", 0)),
+            ("os.mkdir", (f"/tmp/{slots}", 0o777, -1)),
+            ("os.scandir", (f"/run/user/{uid}/{slots}",)),
+            ("open", (f"/run/user/{uid}/anneal-last-oom-{uid}.json", None, os.O_RDWR)),
+            ("os.rename", ("/x/elsewhere", f"/run/user/{uid}/anneal-last-oom-{uid}.json", -1, -1)),
+            ("socket.connect", (None, "/tmp/anneal-lean-lsp.sock")),
+        ):
+            self.assertIsNotNone(classify(event, args), (event, args))
+        for event, args in (
+            ("open", (f"/tmp/anneal-cli-rt-abc/{slots}/slot-1.lock", None, os.O_CREAT)),
+            ("open", (f"/tmp/anneal-test-xdg-rt-abc/anneal-last-oom-{uid}.json", None, 0)),
+            ("open", (f"/run/user/{uid}/bus", None, 0)),
+            ("os.mkdir", (f"/tmp/not-{slots}", 0o777, -1)),
+            ("socket.connect", (None, "/tmp/anneal-cli-rt-abc/anneal-lean-lsp.sock")),
+            ("socket.connect", (None, ("127.0.0.1", 80))),
+            ("open", (3, None, 0)),
+            ("exec", ("/bin/true",)),
+        ):
+            self.assertIsNone(classify(event, args), (event, args))
+        with tempfile.TemporaryDirectory(prefix="anneal-audit-link-") as link_tmp:
+            link = Path(link_tmp) / "rt"
+            link.symlink_to("/tmp")
+            self.assertIsNotNone(classify("open", (str(link / slots / "slot-1.lock"), None, 0)))
+
+        # In-process hook: live, routed into the sink (restored afterwards).
+        self.assertTrue(_HOST_AUDIT_ACTIVE)
+        saved = list(_HOST_AUDIT_SINK)
+        probe_path = f"/tmp/{slots}/alr-audit-probe-never-created"
+        try:
+            with self.assertRaises(OSError):
+                os.open(probe_path, os.O_RDONLY)
+            self.assertEqual(_HOST_AUDIT_SINK[len(saved):], [{"event": "open", "path": probe_path}])
+        finally:
+            _HOST_AUDIT_SINK[:] = saved
+
+        # Subprocesses: the auditing `sitecustomize` loads (and chains), and a real touch is
+        # logged to the configured log (here a scratch log, not the module log).
+        with tempfile.TemporaryDirectory(prefix="anneal-audit-child-") as child_tmp:
+            scratch_log = Path(child_tmp) / "child.jsonl"
+            res = self._run_isolated(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, sitecustomize, sys\n"
+                    "print(getattr(sitecustomize, 'ALR_HOST_STATE_AUDIT', False))\n"
+                    "try:\n"
+                    f"    os.open({probe_path!r}, os.O_RDONLY)\n"
+                    "except OSError:\n"
+                    "    pass\n",
+                ],
+                {_HOST_AUDIT_ENV_LOG: str(scratch_log)},
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "True")
+            logged = [json.loads(x) for x in scratch_log.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([(h["event"], h["path"]) for h in logged], [("open", probe_path)])
+
 
 class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
     """Tests v2 `anneal-workloads.slice`, `--exclusive`, re-entrancy, and OOM retry guards."""
@@ -3434,7 +3672,20 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                     },
                 )
                 res = subprocess.run(
-                    [sys.executable, str(SCRIPT_PATH), "--mode", "build", "--", sys.executable, "-c", "print('ok')"],
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        _ISOLATED_CLI_SHIM,
+                        str(SCRIPT_PATH),
+                        str(rt),
+                        "--mode",
+                        "build",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "print('ok')",
+                    ],
                     env=env_in,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
