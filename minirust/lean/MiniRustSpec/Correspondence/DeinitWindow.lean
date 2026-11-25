@@ -1705,6 +1705,19 @@ private theorem evalScalarBinOp_agrees (op : MirAst.BinOp) (lhs rhs : ScalarInt)
   have hself := evalScalarBinOp_locals op lhs rhs l0 l0 m b
   cases h : MirSemantics.evalScalarBinOp op lhs rhs l0 m b <;> simp_all [rvWithLocals]
 
+private theorem evalFloatScalarBinOp_agrees (op : MirAst.BinOp) (lhs rhs : ScalarInt)
+    (lhsTy? rhsTy? : Option MirAst.Ty) (l0 lH : List LocalSlot) (m : Memory) :
+    (∀ v l' m', MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? l0 m = .ok v l' m' →
+      l' = l0 ∧ MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? lH m = .ok v lH m') ∧
+    (MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? l0 m = .ub →
+      MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? lH m = .ub) ∧
+    (MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? l0 m = .unsupported →
+      MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? lH m = .unsupported) := by
+  rw [evalFloatScalarBinOp_locals op lhs rhs lhsTy? rhsTy? l0 lH m]
+  have hself := evalFloatScalarBinOp_locals op lhs rhs lhsTy? rhsTy? l0 l0 m
+  cases h : MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? l0 m <;>
+    simp_all [rvWithLocals]
+
 private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
     {decls : List LocalDecl} {l0 : List LocalSlot} {t q : Nat} {dq : LocalDecl}
     {it : Gen.IntType} {op : MirAst.BinOp} {iop : Gen.IntBinOp} {c : ConstOperand}
@@ -1784,9 +1797,19 @@ private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
         simp only [evalOperand, MirSemantics.evalConstValue] at hR0
         (repeat' split at hR0) <;> simp_all <;> exact ⟨_, hR0.symm⟩
       obtain ⟨rhsSc, rfl⟩ := hvRSc
+      dsimp only
       cases op <;> (try exact absurd rfl hnotOff) <;>
-        exact evalScalarBinOp_agrees _ lhsSc rhsSc l0 (l0.set t (.init vH)) m
-          (MirSemantics.operandIsSigned decls (.copy ⟨q, []⟩) layouts)
+        cases Bool.or
+            (MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts (.copy ⟨q, []⟩)))
+            (MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts (.constant c))) with
+        | false =>
+          exact evalScalarBinOp_agrees _ lhsSc rhsSc l0 (l0.set t (.init vH)) m
+            (MirSemantics.operandIsSigned decls (.copy ⟨q, []⟩) layouts)
+        | true =>
+          exact evalFloatScalarBinOp_agrees _ lhsSc rhsSc
+            (MirSemantics.operandTy decls layouts (.copy ⟨q, []⟩))
+            (MirSemantics.operandTy decls layouts (.constant c))
+            l0 (l0.set t (.init vH)) m
     · simp [hopR.2.1 hR0]
     · simp [hopR.2.2 hR0]
   · simp [hopL.2.1 hL0]
