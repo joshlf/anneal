@@ -5655,8 +5655,8 @@ open MiniRustSpec.Correspondence in
   bdUbChecks_rejected
   bdCopy0_anneal_ret
   bdCopy1_anneal_ret
-  bdCopy2_anneal_ret
-  bdCopy2_noUB
+  bdCopy2_anneal_ub
+  bdCopy2_not_noUB
   bdCopyZeroScalars_step
   bdCopy_translateStatement
   bdCopy_rejected

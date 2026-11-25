@@ -3189,8 +3189,9 @@ class SemanticMutantDifferentialTest(unittest.TestCase):
         # The probe copies `[22, 99]` through whole-array pointer casts, on which the
         # live engine agrees with Miri (`117`); the mutant keeps only the first
         # element (`22`). The Rust test pins the element sub-place twins of the probe
-        # (identical but for the copy statement, and the source pair) as live
-        # `wrong_value` gaps on which the engine already returns the first element.
+        # (identical but for the copy statement, and the source pair) as resolved
+        # gaps: the engine used to return the first element there (`wrong_value`) and
+        # must now agree with Miri on `src[0] ^ src[1]`.
         mutant = next(
             m
             for m in campaign.SEEDED_SEMANTIC_MUTANTS
@@ -3239,14 +3240,23 @@ class SemanticMutantDifferentialTest(unittest.TestCase):
                 "probe_gap_subplace_multi_elem_copy", "probe_gap_subplace_multi_elem_copy_88_66"
             ).replace("[22u32, 99u32]", "[88u32, 66u32]"),
         )
-        # The live pins: Miri `src[0] ^ src[1]`, the engine `src[0]`.
+        # The live pins: Miri and the engine agree on `src[0] ^ src[1]`; the second
+        # number is the former first-element truncation `src[0]`, kept only for the
+        # regression message. The pinned verdict is `Agree` with the Miri value.
         miri_eval_src = MIRI_EVAL_RS.read_text(encoding="utf-8")
-        for name, miri_bits, anneal_bits in (
+        for name, miri_bits, former_truncated_bits in (
             ("probe_gap_subplace_multi_elem_copy", 22 ^ 99, 22),
             ("probe_gap_subplace_multi_elem_copy_88_66", 88 ^ 66, 88),
         ):
             with self.subTest(gap=name):
-                self.assertIn(f'("{name}", {miri_bits}u128, {anneal_bits}u128),', miri_eval_src)
+                self.assertIn(
+                    f'("{name}", {miri_bits}u128, {former_truncated_bits}u128),', miri_eval_src
+                )
+        pin_start = miri_eval_src.index("for (name, miri_bits, former_truncated_bits) in [")
+        pin_block = miri_eval_src[pin_start : miri_eval_src.index("let no_provenance", pin_start)]
+        self.assertIn("item.verdict == ComparisonVerdict::Agree", pin_block)
+        self.assertEqual(pin_block.count("bits: miri_bits,"), 2, pin_block)
+        self.assertNotIn("DivergenceKind::WrongValue", pin_block)
 
     def test_simulation_and_normalization_crashes_count_as_survival(self) -> None:
         base = dict(campaign.SEEDED_SEMANTIC_MUTANTS[0])
@@ -6966,7 +6976,7 @@ class SemanticMutantProbeSourceTest(unittest.TestCase):
         # The probe's inline `copy_nonoverlapping` statement copies `count = 2`
         # elements between whole-array pointer casts (`&raw const src` /
         # `&raw mut dst`, `PtrToPtr`), never between element sub-places
-        # (`&raw const src[_]`, the known engine gap).
+        # (`&raw const src[_]`, pinned separately as a resolved engine gap).
         body = _mir_fn_body(
             self._mir("subplace_multi_elem_copy_truncation"),
             "probe_subplace_multi_elem_copy_truncation",

@@ -1126,6 +1126,12 @@ def compute_stage_b_empirical_corpora(
 # - `step_binOp_offset_usize_wrap_divergence` (`SimLM3_1.lean`) — pre-existing
 #   `BinOp.Offset` unsigned `usize` rhs >= 2^63 wrap-around on non-disabled pointers
 #   (where `lean-miri` raises `"PointerArithOverflow"` UB while Anneal wraps).
+# - `wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence` (`WitLM4_2.lean`) —
+#   pre-existing: a `copy_nonoverlapping` with `count = 0` steps in Anneal without the
+#   alignment check that `lean-miri` (`Intrinsics.copyWith`) runs "including for
+#   zero-length copies". The multi-element / offset sub-place repair
+#   (`resolveCopySubplaceMulti`, `count >= 1`) checks alignment before the zero-size
+#   case; the `count = 0` fast path is outside that repair.
 
 # Episode 2 correspondence file closing `constEvalCounter` / `tailCall` / `opaqueCast`.
 UNTESTED_VARIANT_TEST_FILE = "tests/mir/MirUntestedVariantCorrespondenceTests.lean"
@@ -1245,7 +1251,9 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "summary": "Anneal assigns local i base address (1048576 + i) * 65536 vs. lean-miri allocId.value * 2^32; exact relation proved in step_rawPtr_cmp_ptr_ptr_exact.",
     },
     # Episode 2 (`tests/mir/MirUntestedVariantCorrespondenceTests.lean`): divergences found while
-    # closing `tailCall` / `opaqueCast`, each witnessed by a kernel-audited manifest theorem.
+    # closing `tailCall` / `opaqueCast`. Every actionable one is resolved: its witness was
+    # replaced by the kernel-audited, statement-pinned `*_simulation` manifest theorem named
+    # as its `resolution_symbol`; the two modeling choices keep their manifest witnesses.
     {
         "id": "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
         "authority": "LeanMiriSpec",
@@ -1258,7 +1266,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "When the call-site or callee ABI cannot unwind, rewrite the inherited saved caller's returnUnwind to .unreachable in enterTailCalleeFrame (Miri initStackFrame, Call.lean:261-264), so tailCall_leanMiri_nounwind_callee's `↔ u = ur` collapses to unconditional shape agreement.",
-        "summary": "A tail call into a non-unwinding (e.g. extern \"C\") callee keeps the tail-caller's inherited unwind action in Anneal, whereas Miri forces it to Unreachable: an UnwindResume out of the callee is UB in Miri for every inherited action but resumes the caller's cleanup block, aborts, or keeps unwinding in Anneal (two-sided verdict table: tailCall_leanMiri_unwind_verdicts).",
+        "summary": "A tail call into a non-unwinding (e.g. extern \"C\") callee kept the tail-caller's inherited unwind action in Anneal, whereas Miri forces it to Unreachable: an UnwindResume out of the callee is UB in Miri for every inherited action but resumed the caller's cleanup block, aborted, or kept unwinding in Anneal. Resolved once enterTailCalleeFrame narrowed the inherited action for a callee whose FnAbi cannot unwind (narrowCallStackForTailCallee under a saved caller, Memory.rootUnwindCeiling at the modular root): the stack shapes stay related for every inherited action and an unwind out of the callee is UB in both (tailCall_leanMiri_nounwind_callee_simulation; two-sided verdict table: tailCall_leanMiri_unwind_verdicts).",
     },
     {
         "id": "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
@@ -1272,7 +1280,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Strip leading/bare ProjectionElem.opaqueCast before the root-vs-projected dispatch in evalOperand (.move), writePlaceValue, evalStmt (.assign / .deinit / .setDiscriminant), and uninitFieldWriteShell?, so (_l as T) and (_l as T).f behave like their post-borrowck erasures _l and _l.f.",
-        "summary": "A bare (_l as T) place takes Trusted's projected path while its erasure _l takes the root path, and uninitFieldWriteShell? returns none on a leading .opaqueCast: move keeps _l initialized, writes/assignments to an uninitialized _l (including (_l as T).f = v) and SetDiscriminant((_l as T), vIdx) on an uninitialized enum fault with UB, and Deinit((_l as T)) leaves _l as LocalSlot.init Value.uninit where Deinit(_l) stores LocalSlot.uninit. Latent: MirPhase::Runtime forbids OpaqueCast.",
+        "summary": "A bare (_l as T) place took Trusted's projected path while its erasure _l takes the root path, and uninitFieldWriteShell? returned none on a leading .opaqueCast: move kept _l initialized, writes/assignments to an uninitialized _l (including (_l as T).f = v) and SetDiscriminant((_l as T), vIdx) on an uninitialized enum faulted with UB, and Deinit((_l as T)) left _l as LocalSlot.init Value.uninit where Deinit(_l) stores LocalSlot.uninit. Latent: MirPhase::Runtime forbids OpaqueCast. Resolved once the root-vs-projected dispatch looked below the leading cast chain (stripLeadingOpaqueCast) and the field shell and typed steps were keyed on the cast type (eraseLeadingOpaqueCastDecls): a pure cast chain (_l as T1 as ... as Tn) moves, writes, assigns, de-initializes, and sets the discriminant of the whole local exactly like _l (opaqueCast_trusted_root_dispatch_simulation).",
     },
     {
         "id": "MODEL-LM-TAILCALL-MODULAR-ROOT",
@@ -1282,8 +1290,8 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "witness_symbol": "tailCall_leanMiri_root_stop_diverges",
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
-        "switch_to_pass_criterion": "Intentional modular-root model (Anneal's root frame is the modularly verified function with an external caller); nested and modular-root lockstep is proved in tailCall_leanMiri_shape_lockstep, and 1-frame modular-root UnwindResume (.panic vs Miri's topmost-frame UB) is characterized in tailCall_leanMiri_modular_root_unwind.",
-        "summary": "At a whole-program root (ReturnContinuation.stop) Miri raises invalidProgram (rustc bug!(\"can't tailcall as root\")) and at a 1-frame stack UnwindResume is UB (\"unwinding past the topmost stack frame\"), whereas Anneal's modular root tail call steps into the callee and unwinds to .panic.",
+        "switch_to_pass_criterion": "Intentional modular-root model (Anneal's root frame is the modularly verified function with an external caller); nested and modular-root lockstep is proved in tailCall_leanMiri_shape_lockstep, and 1-frame modular-root UnwindResume out of a tail callee that may unwind (.panic vs Miri's topmost-frame UB) is characterized in tailCall_leanMiri_modular_root_unwind.",
+        "summary": "At a whole-program root (ReturnContinuation.stop) Miri raises invalidProgram (rustc bug!(\"can't tailcall as root\")) and at a 1-frame stack UnwindResume is UB (\"unwinding past the topmost stack frame\"), whereas Anneal's modular root tail call steps into the callee and, when the callee may unwind, lets its unwind escape to the unmodeled caller (.panic). An unwind out of a root tail callee that cannot unwind is UB in both (Memory.rootUnwindCeiling, DIV-LM-TAILCALL-NOUNWIND-UNWIND).",
     },
     {
         "id": "MODEL-LM-TAILCALL-DIRECT-ARITY-STEP",
@@ -1322,7 +1330,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "Keep caller-owned referents (Memory.callerLocals) addressable after a root tail call into a callee with more locals, e.g. by giving caller referents a frame identity distinct from the root frame's (targetFrameDepth, targetLocal) pairs, so the witness's *p reads the caller's 42 instead of the tail-callee's own _2.",
-        "summary": "A modular-root tail call into a callee with more locals than the tail-caller makes the callee's own local shadow a caller-owned referent: a pointer argument into the caller (callerLocals slot 2 = 42, borrow at (0, 2)) is read through activeFrameSlot? as the callee's _2 = 137, whereas Miri reads the live caller allocation (42).",
+        "summary": "A modular-root tail call into a callee with more locals than the tail-caller made the callee's own local shadow a caller-owned referent: a pointer argument into the caller (callerLocals slot 2 = 42, borrow at (0, 2)) was read through activeFrameSlot? as the callee's _2 = 137, whereas Miri reads the live caller allocation (42). Resolved once evalTailCallTerminator relocated the live caller-owned referents past the wider callee frame (relocateRootCallerReferents after the frame teardown; dead borrows of the popped frame are not relocated): the witness's borrow moves to slot 3 and *p reads the caller's 42 (tailCall_witness_root_caller_referent_simulation).",
     },
 ]
 

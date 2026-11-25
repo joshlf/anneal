@@ -772,7 +772,9 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   For pointer/target intrinsics and polymorphism outside the fragment:
   `Rvalue::NullaryOp(UbChecks)` evaluates to `true` in Anneal
   (`bdUbChecks_anneal_ret`) and is a session-fixed `bool` constant in `minimize`; `CopyNonOverlapping` aborts
-  `minimize` (`span_bug!`) while Anneal executes it (`bdCopy2_noUB`); Anneal's
+  `minimize` (`span_bug!`) while Anneal executes it (`bdCopy1_anneal_ret`; a copy of
+  two `u32`s out of a one-`u32` local is out of bounds and UB, `bdCopy2_anneal_ub`,
+  `bdCopy2_not_noUB`); Anneal's
   `BinOp::Offset` scales the signed count by `size_of::<T>()` and enforces
   in-bounds byte arithmetic (`bdOffset1_anneal_ret`, `bdOffsetNeg1_anneal_ub`,
   `bdOffsetNeg1_not_noUB`); unmonomorphized `RigidTy.param`, `RigidTy.alias`, and

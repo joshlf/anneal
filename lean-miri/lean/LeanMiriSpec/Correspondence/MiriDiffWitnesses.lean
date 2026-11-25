@@ -284,7 +284,7 @@ theorem w6_copy_nonoverlapping_disjoint_returns :
         (.refl _)))))
     hmret rfl (by change (annealControlHooks.returnOperand () m₄).2 = _; rw [hop])
 
-/-- Entry-to-return MIR body for Stage-1 multi-element `copyViaBytes`:
+/-- Entry-to-return MIR body for Stage-1 multi-element `copyBytesSubplace`:
 `StorageLive(_1.._5); _1 = 0x0102030405060708_u64; _2 = 0_u64;
 _3 = &raw const _1; _4 = &raw mut _2; _5 = _3 as *const u8; _6 = _4 as *mut u8;
 copy_nonoverlapping::<u8>(copy _5, copy _6, 8_usize); _0 = copy (*_4); return`. -/
@@ -357,7 +357,7 @@ private theorem retCopyFullBytes_prefix_miri :
       (miriEntryState retCopyFullBytesEntryBody) =
       .running retCopyFullBytesPreMiri := by kernel_rfl
 
-/-- **Stage-1 multi-element `copyViaBytes` lockstep return from entry**
+/-- **Stage-1 multi-element `copyBytesSubplace` lockstep return from entry**
 (`retCopyFullBytesEntryBody`): from `initMachineState` / `miriEntryState`, both
 machines copy all `8` bytes of `_1 = 0x0102030405060708_u64` into `_2 : u64` as
 `copy_nonoverlapping::<u8>(..., 8_usize)` (`step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`),
@@ -528,7 +528,7 @@ theorem w6_copy_nonoverlapping_full_bytes_returns :
     rfl rfl rfl (.uint .u64 rfl) rfl (.uint .u64 rfl)
     rfl rfl rfl (by decide)
   rw [hs₅] at hsim₅
-  have hmap_eq : copyNextAllocMap s₄.frame.locals [e₂, e₁] 6
+  have hmap_eq : copyStage1FullBytesNextAllocMap s₄.frame.locals [e₂, e₁] 5 6
       (.constant (WitnessLM4_2.constInt WitnessLM4_2.usizeK 8 8)) 1 = [e₂, e₁] := rfl
   rw [hmap_eq] at hsim₅
   obtain ⟨m₅, hm₅, hrel₅⟩ := hsim₅.step_of_anneal_step rfl

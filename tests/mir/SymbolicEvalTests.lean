@@ -2243,7 +2243,8 @@ theorem externalSpecSliceCaller_verified :
         traitImpls := []
         callStack := []
         activeCallee := .none
-        activeProtectors := [] }
+        activeProtectors := []
+        rootUnwindCeiling := true }
     let mem₁ : Memory :=
       { mem₀ with
         borrows :=
@@ -4584,7 +4585,7 @@ theorem frameReturnConst_namedExternalSpecContract_verified :
           args = [] ∧ mem.callStack = [] ∧ mem.activeCallee = .none ∧ mem.activeProtectors = []
         post := fun _ _ retVal _ => retVal = .scalar { bits := 7, sizeBytes := 4 } } := by
   refine verifyExternalSpecContractMirSym frameReturnExtContract frameReturnConstMir _ _ 3 ?_
-  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨rfl, rfl, rfl, rfl⟩
+  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨rfl, rfl, rfl, rfl⟩
   rintro retVal mem' h_out
   cases h_out
   rfl
@@ -4680,7 +4681,7 @@ theorem extCallA_externalSpecContract_verified :
         pre := extCallerPre
         post := fun _ _ retVal _ => retVal = .scalar { bits := 7, sizeBytes := 4 } } := by
   refine verifyExternalSpecContractMirSym extAContract extCallAMir _ _ 4 ?_
-  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨⟨x, hx, rfl⟩, rfl, rfl, rfl, rfl, rfl⟩
+  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨⟨x, hx, rfl⟩, rfl, rfl, rfl, rfl, rfl⟩
   (conv => whnf)
   refine ⟨⟨rfl, rfl, ⟨⟨x, hx, rfl⟩, trivial⟩, trivial⟩, ?_⟩
   rintro (⟨retVal, memAfter⟩ | memAfter | _) h_post
@@ -4705,7 +4706,7 @@ theorem extCallBOfA_externalSpecContractPair_verified :
         post := fun _ _ retVal _ => retVal = .scalar { bits := 9, sizeBytes := 4 } } := by
   refine verifyExternalSpecContractPairWithCalleesMirSym extAContract extBContract
     extCallBOfAMir [] _ _ 6 ?_
-  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨⟨x, hx, rfl⟩, rfl, rfl, rfl, rfl, rfl⟩
+  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨⟨x, hx, rfl⟩, rfl, rfl, rfl, rfl, rfl⟩
   (conv => whnf)
   refine ⟨Or.inl ⟨rfl, rfl, ⟨⟨x, hx, rfl⟩, trivial⟩, trivial⟩, ?_⟩
   rintro (⟨v, memA⟩ | memA | _) ⟨_, h_a, _⟩

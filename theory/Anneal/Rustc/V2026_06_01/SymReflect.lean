@@ -560,6 +560,28 @@ theorem evalSymPlaceCopy_sound_copy
                 nomatch h
 
 
+private theorem evalSymPlaceCopy_not_opaqueCast
+    {slots : List SymSlot} {loc : Local} {pHead : ProjectionElem}
+    {pTail : List ProjectionElem} {borrows : List BorrowEntry}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {sv : SymVal}
+    (h : evalSymPlaceCopy slots ⟨loc, pHead :: pTail⟩ borrows localDecls layouts = .some sv) :
+    ∀ castTy, pHead ≠ .opaqueCast castTy := by
+  intro castTy hEq
+  subst hEq
+  dsimp only [evalSymPlaceCopy] at h
+  cases hUnion : placeTouchesUnion localDecls layouts ⟨loc, .opaqueCast castTy :: pTail⟩ with
+  | true => rw [hUnion] at h; nomatch h
+  | false =>
+    rw [hUnion] at h
+    dsimp only at h
+    cases hGet : get? slots loc with
+    | none => rw [hGet] at h; nomatch h
+    | some slot =>
+      rw [hGet] at h
+      cases slot with
+      | symArg _ | symPair0 _ _ => nomatch h
+      | concrete cSlot => cases cSlot <;> nomatch h
+
 theorem evalOperand_move_cons_eq_copy
     (locals : List LocalSlot)
     (loc : Local)
@@ -570,12 +592,14 @@ theorem evalOperand_move_cons_eq_copy
     (layouts : LayoutTable)
     {callerLocals : List LocalSlot}
     {localDecls : List LocalDecl}
-    {callStack : List SavedCallerFrame} :
+    {callStack : List SavedCallerFrame}
+    (hNotCast : ∀ castTy, pHead ≠ .opaqueCast castTy) :
     evalOperand locals (.move ⟨loc, pHead :: pTail⟩) borrows globals layouts callerLocals localDecls
         callStack =
       evalOperand locals (.copy ⟨loc, pHead :: pTail⟩) borrows globals layouts callerLocals localDecls
         callStack := by
-  cases pHead <;> rfl
+  cases pHead
+  all_goals first | rfl | exact False.elim (hNotCast _ rfl)
 
 /-- Evaluate an `Operand` over symbolic slots `slots`. -/
 def evalSymOperand
@@ -736,7 +760,6 @@ theorem evalSymOperand_sound
                   rw [hU, set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
       | cons pHead pTail =>
         dsimp only [evalSymOperand] at h
-        rw [evalOperand_move_cons_eq_copy]
         cases hCopy : evalSymPlaceCopy slots ⟨loc, pHead :: pTail⟩ borrows localDecls layouts with
         | none =>
           rw [hCopy] at h
@@ -747,6 +770,7 @@ theorem evalSymOperand_sound
           injection hPair with hSv hSlots
           subst hSv
           subst hSlots
+          rw [evalOperand_move_cons_eq_copy _ _ _ _ _ _ _ (evalSymPlaceCopy_not_opaqueCast hCopy)]
           exact evalSymPlaceCopy_sound_copy
             args slots ⟨loc, pHead :: pTail⟩ borrows globals layouts sv0 hCopy
   | constant c =>
@@ -2667,7 +2691,21 @@ theorem symStepTermConcrete_sound
               injection h with hEq
               subst hEq
               refine Or.inr ⟨.event sc.bits, ?_⟩
-              rw [evalSymOperand_sound
+              have hNoCast : operandIsLeadingOpaqueCastMove discr = false := by
+                cases discr with
+                | copy _ | constant _ => rfl
+                | move p =>
+                  rcases p with ⟨loc, _ | ⟨pHead, pTail⟩⟩
+                  · rfl
+                  · cases pHead with
+                    | opaqueCast castTy =>
+                      dsimp only [evalSymOperand] at hOp
+                      cases hC : evalSymPlaceCopy st.slots ⟨loc, .opaqueCast castTy :: pTail⟩ st.borrows .nil body.layouts with
+                      | none => rw [hC] at hOp; nomatch hOp
+                      | some _ => exact False.elim (evalSymPlaceCopy_not_opaqueCast hC castTy rfl)
+                    | _ => rfl
+              unfold evalOperandWithBodyCast
+              rw [hNoCast, evalSymOperand_sound
                 args st.slots discr st.borrows body.allocations body.layouts
                 (.concrete (.scalar sc)) slots' hOp]
               rfl
@@ -2688,6 +2726,19 @@ theorem symStepTermConcrete_sound
             cases v with
             | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
             | scalar sc =>
+              have hNoCast : operandIsLeadingOpaqueCastMove cond = false := by
+                cases cond with
+                | copy _ | constant _ => rfl
+                | move p =>
+                  rcases p with ⟨loc, _ | ⟨pHead, pTail⟩⟩
+                  · rfl
+                  · cases pHead with
+                    | opaqueCast castTy =>
+                      dsimp only [evalSymOperand] at hOp
+                      cases hC : evalSymPlaceCopy st.slots ⟨loc, .opaqueCast castTy :: pTail⟩ st.borrows .nil body.layouts with
+                      | none => rw [hC] at hOp; nomatch hOp
+                      | some _ => exact False.elim (evalSymPlaceCopy_not_opaqueCast hC castTy rfl)
+                    | _ => rfl
               cases expected with
               | false =>
                 dsimp only at h
@@ -2700,7 +2751,8 @@ theorem symStepTermConcrete_sound
                   injection h with hEq
                   subst hEq
                   refine Or.inl ?_
-                  rw [evalSymOperand_sound
+                  unfold evalOperandWithBodyCast
+                  rw [hNoCast, evalSymOperand_sound
                     args st.slots cond st.borrows body.allocations body.layouts
                     (.concrete (.scalar sc)) slots' hOp]
                   dsimp only [concretizeSymReadResult]
@@ -2716,7 +2768,8 @@ theorem symStepTermConcrete_sound
                   injection h with hEq
                   subst hEq
                   refine Or.inl ?_
-                  rw [evalSymOperand_sound
+                  unfold evalOperandWithBodyCast
+                  rw [hNoCast, evalSymOperand_sound
                     args st.slots cond st.borrows body.allocations body.layouts
                     (.concrete (.scalar sc)) slots' hOp]
                   dsimp only [concretizeSymReadResult]
@@ -7711,7 +7764,8 @@ theorem dischargeRustPinnedContractAuto
         | exact Or.inr h.2)
     (h_check :
       checkMirAutoPinnedSpecWithCallees
-        subjectFuel specFuel c.body c.callees optReqBody optEnsBody = true := by rfl)
+        subjectFuel specFuel c.body c.callees optReqBody optEnsBody = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (ret : Value),
         OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
@@ -7790,7 +7844,8 @@ theorem dischargeRustTotalPinnedContractAuto
         | exact Or.inr h.2)
     (h_check :
       checkMirAutoPinnedSpecWithCallees
-        subjectFuel specFuel c.body c.callees optReqBody optEnsBody = true := by rfl)
+        subjectFuel specFuel c.body c.callees optReqBody optEnsBody = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
@@ -8009,7 +8064,8 @@ theorem dischargeRustPinnedContractWithSpecCalleesAuto
     (h_check :
       checkMirAutoPinnedSpecWithSpecCallees
         subjectFuel specFuel c.body c.callees specCallees
-        optReqBody optEnsBody = true := by rfl)
+        optReqBody optEnsBody = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (ret : Value),
         OptMirBoolPredicateHoldsWithCallees
@@ -8093,7 +8149,8 @@ theorem dischargeRustTotalPinnedContractWithSpecCalleesAuto
     (h_check :
       checkMirAutoPinnedSpecWithSpecCallees
         subjectFuel specFuel c.body c.callees specCallees
-        optReqBody optEnsBody = true := by rfl)
+        optReqBody optEnsBody = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHoldsWithCallees
@@ -9031,7 +9088,8 @@ theorem dischargeRustBoundedRange1Auto
         | exact Or.inr h.2)
     (h_check :
       checkMirAutoBoundedRange1SpecWithCallees
-        subjectFuel specFuel c.body c.callees reqBody optEnsBody = true := by rfl)
+        subjectFuel specFuel c.body c.callees reqBody optEnsBody = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (ret : Value),
         OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
@@ -9123,7 +9181,8 @@ theorem dischargeRustTotalBoundedRange1Auto
         | exact Or.inr h.2)
     (h_check :
       checkMirAutoBoundedRange1SpecWithCallees
-        subjectFuel specFuel c.body c.callees reqBody optEnsBody = true := by rfl)
+        subjectFuel specFuel c.body c.callees reqBody optEnsBody = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
@@ -9248,7 +9307,8 @@ theorem dischargeRustBoundedRange1WithSpecCalleesAuto
         | exact Or.inr h.2)
     (h_check :
       checkMirAutoBoundedRange1SpecWithSpecCallees
-        subjectFuel specFuel c.body c.callees specCallees reqBody optEnsBody = true := by rfl)
+        subjectFuel specFuel c.body c.callees specCallees reqBody optEnsBody = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (ret : Value),
         OptMirBoolPredicateHoldsWithCallees
@@ -9344,7 +9404,8 @@ theorem dischargeRustTotalBoundedRange1WithSpecCalleesAuto
         | exact Or.inr h.2)
     (h_check :
       checkMirAutoBoundedRange1SpecWithSpecCallees
-        subjectFuel specFuel c.body c.callees specCallees reqBody optEnsBody = true := by rfl)
+        subjectFuel specFuel c.body c.callees specCallees reqBody optEnsBody = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHoldsWithCallees
@@ -10695,7 +10756,8 @@ theorem dischargeRustSymRange1Auto
         | exact Or.inr (Or.inr ⟨_, h.2⟩)
         | exact Or.inr h.2)
     (h_bound :
-      checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by rfl)
+      checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by
+        first | decide +kernel | rfl)
     (h_sym :
       ∀ (b : Nat),
         b ≤ peekMirUpperBoundBits reqBody →
@@ -10791,7 +10853,8 @@ theorem dischargeRustTotalSymRange1Auto
         | exact Or.inl h.2
         | exact Or.inr h.2)
     (h_bound :
-      checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by rfl)
+      checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by
+        first | decide +kernel | rfl)
     (h_sym :
       ∀ (b : Nat),
         b ≤ peekMirUpperBoundBits reqBody →
@@ -11500,7 +11563,8 @@ theorem dischargeRustModularContractAuto
     (h_check :
       checkMirAutoModularPinnedSpec
         subjectFuel specFuel subjectBody optSubjectReqBody optSubjectEnsBody
-        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody callees = true := by rfl)
+        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody callees = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optSubjectEnsBody (args ++ [ret]) →
@@ -11669,7 +11733,8 @@ theorem dischargeRustModularBoundedRange1Auto
     (h_check :
       checkMirAutoModularBoundedRange1Spec
         subjectFuel specFuel subjectBody subjectReqBody optSubjectEnsBody
-        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody callees = true := by rfl)
+        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody callees = true := by
+          first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optSubjectEnsBody (args ++ [ret]) →
@@ -12142,7 +12207,7 @@ theorem dischargeRustEqScalar1
         ensBody
         c.callees
         { bits := constVal, sizeBytes := width } =
-        true := by rfl)
+        true := by first | decide +kernel | rfl)
     (h_post :
       ∀ (args : List Value) (ret : Value),
         MirBoolPredicateHoldsWithCallees
@@ -12288,7 +12353,7 @@ theorem dischargeRustEqScalar2
         c.body
         (.some reqBody)
         [ { bits := c1, sizeBytes := w1 }
-        , { bits := c2, sizeBytes := w2 } ] = true := by rfl)
+        , { bits := c2, sizeBytes := w2 } ] = true := by first | decide +kernel | rfl)
     (h_check :
       checkMirRustPinnedSpecWithCallees
         subjectFuel
@@ -12298,7 +12363,7 @@ theorem dischargeRustEqScalar2
         c.callees
         [ .scalar { bits := c1, sizeBytes := w1 }
         , .scalar { bits := c2, sizeBytes := w2 } ] =
-        true := by rfl)
+        true := by first | decide +kernel | rfl)
     (h_post :
       ∀ ret : Value,
         MirBoolPredicateHoldsWithCallees
@@ -12579,7 +12644,8 @@ theorem dischargeRustEqScalar1FuelFree
         | exact Or.inr h.2)
     (h_check :
       checkMirRustEqScalar1SpecWithCallees 16 64 reqBody c.body ensBody c.callees
-        { bits := constVal, sizeBytes := width } = true := by rfl)
+        { bits := constVal, sizeBytes := width } = true := by
+          first | decide +kernel | rfl)
     (h_post : ∀ (args : List Value) (ret : Value),
       MirBoolPredicateHoldsWithCallees ensBody c.callees
         (args ++ [ret]) →
@@ -12620,11 +12686,12 @@ theorem dischargeRustEqScalar2FuelFree
     (h_pins :
       checkOptMirRequiresPinsScalarsForSubject 64 c.body (.some reqBody)
         [{ bits := c1, sizeBytes := w1 }, { bits := c2, sizeBytes := w2 }] =
-        true := by rfl)
+        true := by first | decide +kernel | rfl)
     (h_check :
       checkMirRustPinnedSpecWithCallees 16 64 c.body ensBody c.callees
         [.scalar { bits := c1, sizeBytes := w1 },
-         .scalar { bits := c2, sizeBytes := w2 }] = true := by rfl)
+         .scalar { bits := c2, sizeBytes := w2 }] = true := by
+          first | decide +kernel | rfl)
     (h_post : ∀ ret : Value,
       MirBoolPredicateHoldsWithCallees ensBody c.callees
         ([.scalar { bits := c1, sizeBytes := w1 },
@@ -12674,7 +12741,7 @@ theorem dischargeStatefulEqFuelFree
 /-- Fuel-free boolean companion predicate checker (`rfl`-discharged). -/
 theorem mirBoolPredicateHolds_of_wp_fuelFree
     (specBody : CapturedMir) (args : List Value)
-    (h : checkMirBoolBounded 128 specBody args = true := by rfl) :
+    (h : checkMirBoolBounded 128 specBody args = true := by first | decide +kernel | rfl) :
     MirBoolPredicateHolds specBody args :=
   mirBoolPredicateHolds_of_checkBounded 128 specBody args h
 

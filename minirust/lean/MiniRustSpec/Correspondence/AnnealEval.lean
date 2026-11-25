@@ -6077,6 +6077,50 @@ theorem simpleProj_nonDeref {projs : List ProjectionElem} (hs : simpleProj projs
   subst hr
   cases rest <;> simp [simpleProj, allFields] at hs
 
+/-- A `simpleProj` projection never starts with `ProjectionElem.opaqueCast`
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`: fragment places are field chains or a single
+index, so the cast-chain root dispatch of `Trusted` never applies to them). -/
+theorem simpleProj_head_not_opaqueCast {hd : ProjectionElem} {tl : List ProjectionElem}
+    (hs : simpleProj (hd :: tl) = true) : ∀ ty, hd ≠ .opaqueCast ty := by
+  intro ty hr
+  subst hr
+  cases tl <;> simp [simpleProj, allFields] at hs
+
+/-- A fragment operand is never a move of a place that starts with
+`ProjectionElem.opaqueCast`, so a terminator evaluates it with erased
+declarations (`evalOperandWithBodyCast_eq_evalOperand`). -/
+theorem operandIsLeadingOpaqueCastMove_of_simpleOp {op : Operand} (h : simpleOp op = true) :
+    operandIsLeadingOpaqueCastMove op = false := by
+  match op, h with
+  | .constant _, _ => rfl
+  | .copy _, _ => rfl
+  | .move ⟨_, []⟩, _ => rfl
+  | .move ⟨_, hd :: tl⟩, h =>
+    have hsp : simpleProj (hd :: tl) = true := h
+    cases hd with
+    | opaqueCast ty => exact False.elim (simpleProj_head_not_opaqueCast hsp ty rfl)
+    | _ => rfl
+
+/-- Fragment call arguments (`callArgsOk`) never contain a move of a place that
+starts with `ProjectionElem.opaqueCast` (`Operand::Move` arguments are root
+locals), so `TerminatorKind.call` evaluates them with erased declarations
+(`evalOperandsWithBodyCast_eq_evalOperands`). -/
+theorem operandsHaveLeadingOpaqueCastMove_of_callArgsOk {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} :
+    ∀ (pds : List LocalDecl) (ops : List Operand),
+      callArgsOk layouts decls pds ops = true → operandsHaveLeadingOpaqueCastMove ops = false
+  | [], [], _ => rfl
+  | pd :: pds, op :: ops, h => by
+    simp only [callArgsOk, Bool.and_eq_true] at h
+    have hop : operandIsLeadingOpaqueCastMove op = false := by
+      match op, h.1 with
+      | .constant _, _ => rfl
+      | .copy _, _ => rfl
+      | .move ⟨_, []⟩, _ => rfl
+      | .move ⟨_, _ :: _⟩, h1 => simp [callArgOk] at h1
+    have hrest := operandsHaveLeadingOpaqueCastMove_of_callArgsOk pds ops h.2
+    simp only [operandsHaveLeadingOpaqueCastMove, hop, hrest]
+
 theorem readProjectedValue_allFields_frame (L L' : List LocalSlot) (v : Value)
     (projs : List ProjectionElem) (hf : allFields projs = true) :
     readProjectedValue L' v projs = readProjectedValue L v projs := by
@@ -6354,6 +6398,7 @@ theorem evalOperand_move (locals : List LocalSlot) (op : Operand) (hs : simpleOp
           evalOperand locals (.copy ⟨j, hd :: tl⟩) borrows globals layouts callerLocals decls callStack := by
         cases hd with
         | deref => exact False.elim (hnd tl rfl)
+        | opaqueCast ty => exact False.elim (simpleProj_head_not_opaqueCast hsp ty rfl)
         | _ => rfl
       have hpost : opPost locals (.move ⟨j, hd :: tl⟩) = locals := rfl
       rw [hmv_eq, hpost]
@@ -7515,14 +7560,21 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
             | rfl
             | exact evalPlaceDiscriminant_locals _ locals mem ⟨j, []⟩ decls layouts
     | cons hd tl =>
-      dsimp only
-      cases hc : evalOperand locals (.copy ⟨j, hd :: tl⟩) mem.borrows mem.globals layouts
-          mem.callerLocals decls mem.callStack with
-      | ok v L1 =>
-        rw [opResult_locals hcopy hc]
-        exact evalPlaceDiscriminant_locals v locals mem ⟨j, hd :: tl⟩ decls layouts
-      | ub => rfl
-      | unsupported => rfl
+      have hsp : simpleProj (hd :: tl) = true := hs
+      generalize hE : evalOperand locals (.copy ⟨j, hd :: tl⟩) mem.borrows mem.globals layouts
+          mem.callerLocals decls mem.callStack = r
+      have hcopy' : r = opWithLocals r locals := by rw [← hE]; exact hcopy
+      cases hd with
+      | opaqueCast ty => exact False.elim (simpleProj_head_not_opaqueCast hsp ty rfl)
+      | _ =>
+        dsimp only
+        cases r with
+        | ok v L1 =>
+          have hL : L1 = locals := opResult_locals hcopy' rfl
+          subst hL
+          exact evalPlaceDiscriminant_locals v _ mem _ decls layouts
+        | ub => rfl
+        | unsupported => rfl
   | .unaryOp .not op, _, _ =>
     obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl]
@@ -8370,12 +8422,19 @@ theorem evalTerminator_call_anneal {s : MachineState} {callerBody calleeBody : C
   have hlookup := lookupCallee_of_monoCallee? hfind callerBody.layouts s.memory.traitImpls
   obtain ⟨hOk, hUb⟩ := evalCallOperands_spec hslots hn hdecls hargsOk htrArgs
     s.memory.borrows s.memory.globals callerBody.layouts s.memory.callerLocals
+  have hErased :
+      evalOperandsWithBodyCast s.frame.locals argOps s.memory.borrows s.memory.globals
+          callerBody.layouts s.memory.callerLocals callerBody.localDecls s.memory.callStack =
+        evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
+          callerBody.layouts s.memory.callerLocals (callStack := s.memory.callStack) :=
+    evalOperandsWithBodyCast_eq_evalOperands argOps _ _ _ _ _ _ _
+      (operandsHaveLeadingOpaqueCastMove_of_callArgsOk paramDecls argOps hargsOk)
   refine ⟨fun argVals locals' hev => ?_, fun hnone => ?_⟩
   · obtain ⟨heval, hvslen, hvsOk, hlen, hslots'⟩ := hOk argVals locals' hev
-    exact ⟨by simp [MirSemantics.evalTerminator, hextr', heval, hlookup,
-        MirSemantics.checkCalleeTargetCompatible, MirStepNode.step],
+    exact ⟨by simp [MirSemantics.evalTerminator, MirSemantics.bodyLocalDeclsOf, hextr', hErased,
+        heval, hlookup, MirSemantics.checkCalleeTargetCompatible, MirStepNode.step],
       hvslen, hvsOk, hlen, hslots'⟩
-  · simp [MirSemantics.evalTerminator, hextr', hUb hnone]
+  · simp [MirSemantics.evalTerminator, MirSemantics.bodyLocalDeclsOf, hextr', hErased, hUb hnone]
 
 theorem writeReturnDestination_callDest {callerBody : CapturedMir} {callerCtx : Ctx}
     {callerActual callerView : List LocalSlot} {callerLm : Map Gen.LocalName Ptr}

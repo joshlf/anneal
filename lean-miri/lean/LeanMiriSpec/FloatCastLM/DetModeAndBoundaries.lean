@@ -849,7 +849,7 @@ theorem step_cast_floatToFloat_move_nanChoice_simulation
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows
           s.memory.globals body.layouts s.memory.callerLocals body.localDecls
           s.memory.callStack = .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hinit_src, set?_eq_some_set hlt_af_s]
+        unfold evalOperand; dsimp only []; rw [hinit_src, set?_eq_some_set hlt_af_s]; rfl
       rw [hop]
       dsimp only []
       rw [operandTy_move_local hdecl_src]
@@ -1305,7 +1305,7 @@ theorem step_cast_floatToFloat_move_pure_index_simulation
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
           .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hinit_src, set?_eq_some_set hlt_af_s]
+        unfold evalOperand; dsimp only []; rw [hinit_src, set?_eq_some_set hlt_af_s]; rfl
       rw [hop]; dsimp only []; rw [operandTy_move_local hdecl_src]
       simp only [evalFloatCast, hsrc, hdst, hsz]; cases src <;> rfl
     have hm_write : Miri.Interpreter.Step.evalStatement
@@ -2069,7 +2069,8 @@ theorem step_cast_f16_f128_source_fail_closed
     (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
     (hf : srcDecl.ty.kind = .float .f16 ∨ srcDecl.ty.kind = .float .f128)
     (hdst_enc : translateTy dstDecl.ty body.layouts = translateTy castTy body.layouts)
-    {v : Value} (hinit : get? s.frame.locals srcIdx = some (.init v)) :
+    {v : Value} (hinit : get? s.frame.locals srcIdx = some (.init v))
+    (hno_uninit : valueContainsUninit v = false := by rfl) :
     stepMirFn body s = MirStepNode.unsupported ∧
       ∃ m' msg,
         Miri.Interpreter.Step.step
@@ -2125,7 +2126,7 @@ theorem step_cast_f16_f128_source_fail_closed
       cases kind <;> first | rfl | cases hk
     dsimp only []; rw [hrv_eq]
     unfold evalFloatCastRvalue evalOperand readProjectedValue
-    dsimp only []; rw [hinit]; dsimp only []
+    dsimp only []; rw [hinit]; dsimp only []; rw [hno_uninit]; dsimp only []
     rw [operandTy_copy_local hdecl_src,
       (evalFloatCast_f16_f128_none kind castTy body.layouts v hf).1]
   exact ⟨ha_unsup, _, msg,
@@ -2540,7 +2541,7 @@ theorem step_cast_f16_f128_move_source_boundary
     (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
     (hf : srcDecl.ty.kind = .float .f16 ∨ srcDecl.ty.kind = .float .f128)
     (hdst_enc : translateTy dstDecl.ty body.layouts = translateTy castTy body.layouts) :
-    ((∃ v, get? s.frame.locals srcIdx = some (.init v)) →
+    ((∃ v, get? s.frame.locals srcIdx = some (.init v) ∧ valueContainsUninit v = false) →
       stepMirFn body s = MirStepNode.unsupported ∧
         ∃ m' msg,
           Miri.Interpreter.Step.step
@@ -2576,7 +2577,7 @@ theorem step_cast_f16_f128_move_source_boundary
   have hlt_sb : srcIdx < tfb.locals.size := by rw [cacheFrameLocalLayout_size]; exact hlt_sa
   have hm_stmt := evalStatement_assign_floatCast_eq body.localDecls body.layouts nondet
     chooseNaN ⟨dstIdx, .nil⟩ kind hk (.move ⟨srcIdx, .nil⟩) castTy span m
-  refine ⟨fun ⟨v, hinit⟩ => ?_, fun huninit => ?_, fun hdead => ?_⟩
+  refine ⟨fun ⟨v, hinit, hno_uninit⟩ => ?_, fun huninit => ?_, fun hdead => ?_⟩
   · rw [hinit] at hslot_s; injection hslot_s with hs_eq; subst hs_eq
     have hlive_s : ∃ opVal, mls_s.value = .live opVal := by
       cases hloc_s with
@@ -2612,8 +2613,8 @@ theorem step_cast_f16_f128_move_source_boundary
           body.localDecls body.layouts =
           evalFloatCastRvalue s.frame.locals kind (.move ⟨srcIdx, .nil⟩) castTy s.memory
             body.localDecls body.layouts := by cases kind <;> first | rfl | cases hk
-      dsimp only []; rw [hrv_eq]; unfold evalFloatCastRvalue evalOperand
-      dsimp only []; rw [hinit, set?_eq_some_set hlt_af_s]; dsimp only []
+      dsimp only []; rw [hrv_eq]; unfold evalFloatCastRvalue evalOperand readProjectedValue
+      dsimp only []; rw [hinit]; dsimp only []; rw [hno_uninit, set?_eq_some_set hlt_af_s]; dsimp only []
       rw [operandTy_move_local hdecl_src,
         (evalFloatCast_f16_f128_none kind castTy body.layouts v hf).1]
     exact ⟨ha_unsup, _, msg,
@@ -2784,7 +2785,7 @@ theorem step_cast_f16_f128_move_target_boundary
       have ha_unsup : stepMirFn body s = MirStepNode.unsupported := by
         rw [stepMirFn_eq_of_not_other body s hcal hphase]
         simp only [hbb, hstmt]; unfold evalStmt
-        dsimp only []; rw [hrv_eq]; unfold evalFloatCastRvalue evalOperand
+        dsimp only []; rw [hrv_eq]; unfold evalFloatCastRvalue evalOperand readProjectedValue valueContainsUninit
         dsimp only []; rw [hinit, set?_eq_some_set hlt_af_s]; dsimp only []
         rw [operandTy_move_local hdecl_src,
           (evalFloatCast_f16_f128_none kind srcDecl.ty body.layouts (.scalar sc) hf).2]

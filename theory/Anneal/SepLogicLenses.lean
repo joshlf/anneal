@@ -4238,7 +4238,7 @@ theorem mirWpConverges_assert_of_lens
     (hCallee : m.activeCallee = .none)
     (hStack : m.callStack = [])
     (hEval :
-      evalOperand env cond m.borrows m.globals body.layouts m.callerLocals =
+      evalOperandWithBodyCast env cond m.borrows m.globals body.layouts m.callerLocals body.localDecls =
         .ok (.scalar sc) env')
     (hBit : sc.bits = assertBit expected)
     (hNext :
@@ -4266,7 +4266,7 @@ theorem mirWpConverges_assert_of_lens
   rw [h_t] at hTerm
   dsimp only at hTerm
   subst hTerm
-  dsimp only [evalTerminator]
+  dsimp only [evalTerminator, bodyLocalDeclsOf]
   rw [hStack, hEval]
   dsimp only
   rw [hBit]
@@ -4287,7 +4287,7 @@ theorem mirWpConverges_switchInt_of_lens
     (hCallee : m.activeCallee = .none)
     (hStack : m.callStack = [])
     (hEval :
-      evalOperand env discr m.borrows m.globals body.layouts m.callerLocals =
+      evalOperandWithBodyCast env discr m.borrows m.globals body.layouts m.callerLocals body.localDecls =
         .ok (.scalar sc) env')
     (hTarget : lookupSwitchTarget sc.bits targets.branches targets.otherwise = target)
     (hNext :
@@ -4315,7 +4315,7 @@ theorem mirWpConverges_switchInt_of_lens
   rw [h_t] at hTerm
   dsimp only at hTerm
   subst hTerm
-  dsimp only [evalTerminator]
+  dsimp only [evalTerminator, bodyLocalDeclsOf]
   rw [hStack, hEval]
   dsimp only
   rw [hTarget]
@@ -4480,6 +4480,17 @@ theorem LiftLensStmts.length_eq
   | nil => rfl
   | cons hFirst _ ih => exact ih.trans hFirst.length_eq
 
+private theorem LiftLensOperandAny.not_leadingOpaqueCastMove
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+    {op : Operand} {v : Value}
+    (h : LiftLensOperandAny localDecls layouts env entries op v env') :
+    operandIsLeadingOpaqueCastMove op = false := by
+  cases h with
+  | pure hOp => cases hOp <;> rfl
+  | deref hD => cases hD <;> rfl
+  | deref_field hDF => cases hDF <;> rfl
+
 /--
 Control-flow soundness of `LiftLensBlock` by induction on the derivation: each
 block's statements step through `mirWpConverges_of_liftLensStmts`, and its
@@ -4532,7 +4543,8 @@ theorem mirWpConverges_of_liftLensBlock
       (fun m' hInv' hFrame' hKeys' => ?_)
     rcases hCond.evalOperand_eq hInv' with ⟨hEval, hLen₂⟩
     exact mirWpConverges_assert_of_lens hPhase hBb hTerm
-      hInv'.activeCallee_none hInv'.callStack_nil hEval hBit
+      hInv'.activeCallee_none hInv'.callStack_nil
+      (by unfold evalOperandWithBodyCast; rw [hCond.not_leadingOpaqueCastMove]; exact hEval) hBit
       (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
         (fun m_final hInvF hFrameF =>
           hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
@@ -4544,7 +4556,8 @@ theorem mirWpConverges_of_liftLensBlock
       (fun m' hInv' hFrame' hKeys' => ?_)
     rcases hDiscr.evalOperand_eq hInv' with ⟨hEval, hLen₂⟩
     exact mirWpConverges_switchInt_of_lens hPhase hBb hTerm
-      hInv'.activeCallee_none hInv'.callStack_nil hEval hTarget
+      hInv'.activeCallee_none hInv'.callStack_nil
+      (by unfold evalOperandWithBodyCast; rw [hDiscr.not_leadingOpaqueCastMove]; exact hEval) hTarget
       (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
         (fun m_final hInvF hFrameF =>
           hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
@@ -9947,7 +9960,8 @@ theorem mirWpConverges_of_liftLensBlock_subplace
       (fun m' hInv' hFrame' hKeys' => by
         rcases hCond.evalOperand_eq_subplace hInv' with ⟨hEval, _⟩
         exact mirWpConverges_assert_of_lens hPhase hBb hTerm
-          hInv'.activeCallee_none hInv'.callStack_nil hEval hBit
+          hInv'.activeCallee_none hInv'.callStack_nil
+          (by unfold evalOperandWithBodyCast; rw [hCond.not_leadingOpaqueCastMove]; exact hEval) hBit
           (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
             (fun m_final hInvF hFrameF =>
               hPost m_final (by rw [← hLen₁, ← hLen₂]; exact hInvF) hFrameF)))
@@ -9961,7 +9975,8 @@ theorem mirWpConverges_of_liftLensBlock_subplace
         rcases hDiscr.evalOperand_eq_subplace hInv' with
           ⟨hEval, _⟩
         exact mirWpConverges_switchInt_of_lens hPhase hBb hTerm
-          hInv'.activeCallee_none hInv'.callStack_nil hEval hTarget
+          hInv'.activeCallee_none hInv'.callStack_nil
+          (by unfold evalOperandWithBodyCast; rw [hDiscr.not_leadingOpaqueCastMove]; exact hEval) hTarget
           (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
             (fun m_final hInvF hFrameF =>
               hPost m_final (by rw [← hLen₁, ← hLen₂]; exact hInvF) hFrameF)))
@@ -27342,8 +27357,8 @@ theorem evalIntrinsic_sizeOfValRaw_slice {α : Type} {n : Nat} {c : ByteLensCode
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok fatVal locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -27370,8 +27385,8 @@ theorem evalIntrinsic_sizeOfValRaw_slice {α : Type} {n : Nat} {c : ByteLensCode
       (∀ e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
       ActiveTypedSliceMutBorrow c s'.memory.borrows tag wide elems bytes) := by
   intro s'
-  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+  have hArg' : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (WidePtrVal.toValue 8 wide) locals' := by
     rw [← hDst.fat_eq]
     exact hArg
@@ -27401,8 +27416,8 @@ theorem evalIntrinsic_sizeOfValRaw_str
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok fatVal locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -27422,8 +27437,8 @@ theorem evalIntrinsic_sizeOfValRaw_str
     ((∀ e, lookupBorrow s.memory.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) →
       UnsizedStrDstAt 8 s'.memory wide fatVal utf8Bytes bytes) := by
   intro s'
-  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+  have hArg' : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (WidePtrVal.toValue 8 wide) locals' := by
     rw [← hDst.fat_eq]
     exact hArg
@@ -27454,8 +27469,8 @@ theorem evalIntrinsic_alignOfValRaw_slice {α : Type} {n : Nat} {c : ByteLensCod
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok fatVal locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -27483,8 +27498,8 @@ theorem evalIntrinsic_alignOfValRaw_slice {α : Type} {n : Nat} {c : ByteLensCod
       (∀ e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
       ActiveTypedSliceMutBorrow c s'.memory.borrows tag wide elems bytes) := by
   intro s'
-  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+  have hArg' : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (WidePtrVal.toValue 8 wide) locals' := by
     rw [← hDst.fat_eq]
     exact hArg
@@ -27511,8 +27526,8 @@ theorem evalIntrinsic_alignOfValRaw_str
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok fatVal locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -27532,8 +27547,8 @@ theorem evalIntrinsic_alignOfValRaw_str
     ((∀ e, lookupBorrow s.memory.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) →
       UnsizedStrDstAt 8 s'.memory wide fatVal utf8Bytes bytes) := by
   intro s'
-  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+  have hArg' : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (WidePtrVal.toValue 8 wide) locals' := by
     rw [← hDst.fat_eq]
     exact hArg
@@ -27560,8 +27575,8 @@ theorem evalIntrinsic_sizeOfValRaw_slice_wide {α : Type} {n : Nat} {c : ByteLen
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok fatVal locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -27583,8 +27598,8 @@ theorem evalIntrinsic_sizeOfValRaw_slice_wide {α : Type} {n : Nat} {c : ByteLen
     ((∀ e, lookupBorrow s.memory.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) →
       UnsizedSliceDstAt c 8 (.slice elemTy) s'.memory wide fatVal elems bytes) := by
   intro s'
-  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+  have hArg' : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (WidePtrVal.toValue 8 wide) locals' := by
     rw [← hDst.fat_eq]
     exact hArg

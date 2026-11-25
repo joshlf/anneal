@@ -377,16 +377,28 @@ RESOLVED_DIVERGENCE_IDS = frozenset(
         # Episode 2: fixed by the frame-depth-aware tail-call teardown (`disableFrameBorrows`
         # before `enterTailCalleeFrame` in `evalTailCallTerminator`).
         "DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL",
+        # Episode 2: fixed by narrowing the inherited unwind action of a non-unwinding tail
+        # callee (`narrowCallStackForTailCallee`, `Memory.rootUnwindCeiling`).
+        "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
+        # Episode 2: fixed by dispatching below the leading cast chain
+        # (`stripLeadingOpaqueCast`, `eraseLeadingOpaqueCastDecls`).
+        "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
+        # Episode 2: fixed by relocating the root's caller-owned referents past a wider tail
+        # callee (`relocateRootCallerReferents`).
+        "DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW",
     }
 )
-# Episode 2 divergences that are still live (open actionable Anneal bugs).
-OPEN_DIVERGENCE_IDS = frozenset(
+# The Episode 2 divergences of `tests/mir/MirUntestedVariantCorrespondenceTests.lean` whose
+# witnesses were flipped to `*_simulation` theorems by the tail-call / opaque-cast repairs.
+EPISODE2_FLIPPED_DIVERGENCE_IDS = frozenset(
     {
         "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
         "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
         "DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW",
     }
 )
+# Divergences that are still live (open actionable Anneal bugs): none.
+OPEN_DIVERGENCE_IDS: frozenset[str] = frozenset()
 ACTIONABLE_DIVERGENCE_COUNT = len(RESOLVED_DIVERGENCE_IDS) + len(OPEN_DIVERGENCE_IDS)
 
 # A meaningful, hole-free statement for synthetic resolution theorems and their statement
@@ -504,7 +516,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         mr = stage_a["minirust_authority"]
         self.assertEqual(mr["spec_files"], 27)
         self.assertEqual(mr["shallow_types_translated"], 100)
-        self.assertEqual(mr["interp_anchored_items"], 114)
+        self.assertEqual(mr["interp_anchored_items"], 115)
         self.assertGreater(mr["audited_declarations"], 500)
         # `interp_anchored_items` counts the well-formed `tokenSha256` pins of
         # `MiniRustSpec/Anchors.lean`. Recount them independently of the suite: a malformed
@@ -1299,7 +1311,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable - 6)
 
     def test_episode2_divergences_tracked_with_live_witnesses(self) -> None:
-        divs = suite.discover_correspondence_divergences(REPO_ROOT)
+        divs = suite.discover_correspondence_divergences(REPO_ROOT, include_statements=True)
         actionable = {d["id"]: d for d in divs["actionable_anneal_bugs"]}
         resolved = {d["id"]: d for d in divs["resolved_correspondence_divergences"]}
         modeling = {d["id"]: d for d in divs["intentional_modeling_choices"]}
@@ -1308,101 +1320,254 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             for item in suite.TRACKED_CORRESPONDENCE_DIVERGENCES
             if item["file"] == suite.UNTESTED_VARIANT_TEST_FILE
         }
+        episode2_actionable = {
+            i: item for i, item in episode2.items() if item["category"] == "actionable_anneal_bug"
+        }
         self.assertEqual(
-            {i for i, item in episode2.items() if item["category"] == "actionable_anneal_bug"},
-            {
-                "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
-                "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
-                "DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL",
-                "DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW",
-            },
+            set(episode2_actionable),
+            EPISODE2_FLIPPED_DIVERGENCE_IDS | {"DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL"},
         )
-        for div_id, item in episode2.items():
-            if item["category"] != "actionable_anneal_bug":
-                continue
-            # Resolved in the file itself, in its namespace, and statement-pinned there.
-            self.assertEqual(item["resolution_namespace"], suite.UNTESTED_VARIANT_NAMESPACE)
-            self.assertEqual(item["resolution_pin_file"], suite.UNTESTED_VARIANT_TEST_FILE)
-            if div_id in OPEN_DIVERGENCE_IDS:
-                self.assertEqual(actionable[div_id]["status"], "open")
-                self.assertTrue(actionable[div_id]["live_in_source"])
-            else:
+        # Every Episode 2 actionable divergence is resolved in the live tree: its witness is
+        # gone, and its `*_simulation` theorem is declared once in the file's namespace, is
+        # non-vacuous and hole-free, and is statement-pinned there. No open divergence is left.
+        self.assertEqual(OPEN_DIVERGENCE_IDS, frozenset())
+        self.assertEqual(divs["actionable_anneal_bugs_count"], 0)
+        self.assertEqual(actionable, {})
+        text = (REPO_ROOT / suite.UNTESTED_VARIANT_TEST_FILE).read_text(encoding="utf-8")
+        ns_end = f"end {suite.UNTESTED_VARIANT_NAMESPACE}"
+        self.assertEqual(text.count(ns_end), 1)
+        for div_id, item in episode2_actionable.items():
+            with self.subTest(divergence=div_id):
+                self.assertEqual(item["resolution_namespace"], suite.UNTESTED_VARIANT_NAMESPACE)
+                self.assertEqual(item["resolution_pin_file"], suite.UNTESTED_VARIANT_TEST_FILE)
                 self.assertIn(div_id, RESOLVED_DIVERGENCE_IDS)
-                self.assertEqual(resolved[div_id]["status"], "resolved")
-                self.assertTrue(resolved[div_id]["resolution_statement_pinned"])
+                record = resolved[div_id]
+                self.assertEqual(record["status"], "resolved")
+                self.assertFalse(record["live_in_source"])
+                self.assertTrue(record["resolution_live_in_source"])
+                self.assertTrue(record["resolution_valid"])
+                self.assertEqual(record["resolution_problems"], [])
+                self.assertTrue(record["resolution_statement_pinned"])
+                self.assertEqual(record["resolution_pin_problems"], [])
+                self.assertEqual(record["witness_statements"], [])
+                self.assertEqual(len(record["resolution_statements"]), 1)
+                resolution, witness = item["resolution_symbol"], item["witness_symbol"]
+                self.assertTrue(resolution.endswith("_simulation"))
+                self.assertEqual(
+                    len(re.findall(rf"(?m)^theorem {re.escape(resolution)}(?![\w'!?])", text)), 1
+                )
+                self.assertIsNone(
+                    re.search(
+                        rf"(?m)^\s*(?:private\s+)?(?:theorem|lemma|def|abbrev)\s+"
+                        rf"{re.escape(witness)}(?![\w'!?])",
+                        text,
+                    )
+                )
         for div_id in ("MODEL-LM-TAILCALL-MODULAR-ROOT", "MODEL-LM-TAILCALL-DIRECT-ARITY-STEP"):
             self.assertIn(div_id, modeling)
             self.assertTrue(modeling[div_id]["live_in_source"])
 
-        # Switch-to-pass is fail-closed: once Trusted is fixed, the witness theorem must be
-        # replaced by the registered `resolution_symbol`, declared in the file's namespace and
-        # statement-pinned there; a bare rename, a decoy namespace, or a missing pin does not
-        # resolve the entry.
-        text = (REPO_ROOT / suite.UNTESTED_VARIANT_TEST_FILE).read_text(encoding="utf-8")
-        ns_end = f"end {suite.UNTESTED_VARIANT_NAMESPACE}"
-        self.assertEqual(text.count(ns_end), 1)
-        witness = "theorem opaqueCast_trusted_root_dispatch_divergence"
-        self.assertEqual(text.count(witness), 1)
+        # Switch-to-pass is fail-closed, checked on a synthetic copy of the file in which
+        # `DIV-TR-OPAQUECAST-ROOT-DISPATCH` is still open (a live witness with a divergence
+        # statement) next to the other resolved Episode 2 entries: the witness theorem must
+        # be replaced by the registered `resolution_symbol`, declared in the file's namespace
+        # and statement-pinned there; a bare rename, a decoy namespace, or a missing pin does
+        # not resolve the entry.
+        opaque_id = "DIV-TR-OPAQUECAST-ROOT-DISPATCH"
+        witness = episode2[opaque_id]["witness_symbol"]
+        resolution = episode2[opaque_id]["resolution_symbol"]
+        self.assertEqual(
+            (witness, resolution),
+            (
+                "opaqueCast_trusted_root_dispatch_divergence",
+                "opaqueCast_trusted_root_dispatch_simulation",
+            ),
+        )
+        other_lines: list[str] = []
+        for div_id, item in episode2.items():
+            if div_id == opaque_id:
+                continue
+            if item["category"] == "actionable_anneal_bug":
+                other_lines.append(f"theorem {item['resolution_symbol']} : {SYNTH_STMT} := rfl")
+                other_lines.append(f"example : {SYNTH_STMT} := {item['resolution_symbol']}")
+            else:
+                other_lines.append(
+                    f"theorem {item['witness_symbol']} : {SYNTH_DIVERGENCE_STMT} := rfl"
+                )
+        witness_decl = f"theorem {witness} : {SYNTH_DIVERGENCE_STMT} := rfl"
+        ns_end_line = f"{ns_end}\n"
+
+        def synth_text(opaque_block: str) -> str:
+            return "\n".join(
+                [f"namespace {suite.UNTESTED_VARIANT_NAMESPACE}", *other_lines, opaque_block]
+            ) + f"\n{ns_end_line}"
+
+        open_text = synth_text(witness_decl)
+        self.assertEqual(open_text.count(witness_decl), 1)
+
+        def write_tree(root: Path, body: str) -> None:
+            target = root / suite.UNTESTED_VARIANT_TEST_FILE
+            target.parent.mkdir(parents=True)
+            target.write_text(body, encoding="utf-8")
 
         def status_after(new_text: str) -> str:
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                target = root / suite.UNTESTED_VARIANT_TEST_FILE
-                target.parent.mkdir(parents=True)
-                target.write_text(new_text, encoding="utf-8")
+                write_tree(root, new_text)
                 fixed = suite.discover_correspondence_divergences(root)
                 by_id = {
                     d["id"]: d
                     for d in fixed["actionable_anneal_bugs"] + fixed["resolved_correspondence_divergences"]
                 }
-                for div_id in OPEN_DIVERGENCE_IDS - {"DIV-TR-OPAQUECAST-ROOT-DISPATCH"}:
-                    self.assertEqual(by_id[div_id]["status"], "open")
-                return by_id["DIV-TR-OPAQUECAST-ROOT-DISPATCH"]["status"]
+                for div_id in set(episode2_actionable) - {opaque_id}:
+                    self.assertEqual(by_id[div_id]["status"], "resolved")
+                for div_id in set(episode2) - set(episode2_actionable):
+                    self.assertNotIn(div_id, by_id)
+                return by_id[opaque_id]["status"]
 
-        renamed = text.replace(witness, "theorem opaqueCast_trusted_root_dispatch_simulation")
-        pin = f"example : {SYNTH_STMT} := opaqueCast_trusted_root_dispatch_simulation\n"
+        self.assertEqual(status_after(open_text), "open")
+        renamed = open_text.replace(f"theorem {witness}", f"theorem {resolution}")
+        pin = f"example : {SYNTH_DIVERGENCE_STMT} := {resolution}\n"
         self.assertEqual(
-            status_after(text.replace(witness, "theorem opaqueCast_trusted_root_dispatch_erasure_commutes")),
+            status_after(
+                open_text.replace(
+                    f"theorem {witness}", "theorem opaqueCast_trusted_root_dispatch_erasure_commutes"
+                )
+            ),
             "resolution_missing",
         )
         self.assertEqual(status_after(renamed), "resolution_unpinned")
         self.assertEqual(
-            status_after(renamed.replace(ns_end, f"namespace Scratch\n{pin}end Scratch\n{ns_end}")),
+            status_after(
+                renamed.replace(ns_end_line, f"namespace Scratch\n{pin}end Scratch\n{ns_end_line}")
+            ),
             "resolution_unpinned",
         )
-        self.assertEqual(status_after(renamed.replace(ns_end, f"{pin}{ns_end}")), "resolved")
-        # The single-tree scan cannot tell that bare rename from a fix, but the
-        # flip-direction audit against the unrenamed baseline can: the "simulation"
-        # theorem restates the divergence witness (`polarity_not_flipped`).
-        with tempfile.TemporaryDirectory() as base_tmp, tempfile.TemporaryDirectory() as cur_tmp:
-            base_root, cur_root = Path(base_tmp), Path(cur_tmp)
-            for root, body in (
-                (base_root, text),
-                (cur_root, renamed.replace(ns_end, f"{pin}{ns_end}")),
-            ):
-                target = root / suite.UNTESTED_VARIANT_TEST_FILE
-                target.parent.mkdir(parents=True)
-                target.write_text(body, encoding="utf-8")
-            audit = suite.audit_flip_direction_transitions(base_root, cur_root)
-            self.assertFalse(audit["passed"])
-            self.assertEqual(
-                audit["transitions"],
-                [{"id": "DIV-TR-OPAQUECAST-ROOT-DISPATCH", "from": "open", "to": "resolved"}],
-            )
-            self.assertEqual(
-                [(v["id"], v["reason"]) for v in audit["violations"]],
-                [("DIV-TR-OPAQUECAST-ROOT-DISPATCH", "polarity_not_flipped")],
-            )
+        renamed_pinned = renamed.replace(ns_end_line, f"{pin}{ns_end_line}")
+        self.assertEqual(status_after(renamed_pinned), "resolved")
+        flipped_pinned = synth_text(
+            f"theorem {resolution} : {SYNTH_STMT} := rfl\nexample : {SYNTH_STMT} := {resolution}"
+        )
+        self.assertEqual(status_after(flipped_pinned), "resolved")
+        # The single-tree scan cannot tell the bare rename from a fix, but the flip-direction
+        # audit against the open baseline can: the renamed "simulation" theorem restates the
+        # divergence witness (`polarity_not_flipped`), whereas a theorem with a flipped
+        # statement passes.
+        for current_text, expected_violations in (
+            (renamed_pinned, [(opaque_id, "polarity_not_flipped")]),
+            (flipped_pinned, []),
+        ):
+            with tempfile.TemporaryDirectory() as base_tmp, tempfile.TemporaryDirectory() as cur_tmp:
+                base_root, cur_root = Path(base_tmp), Path(cur_tmp)
+                write_tree(base_root, open_text)
+                write_tree(cur_root, current_text)
+                audit = suite.audit_flip_direction_transitions(base_root, cur_root)
+                self.assertEqual(
+                    audit["transitions"], [{"id": opaque_id, "from": "open", "to": "resolved"}]
+                )
+                self.assertEqual(
+                    [(v["id"], v["reason"]) for v in audit["violations"]], expected_violations
+                )
+                self.assertEqual(audit["passed"], not expected_violations)
         decoy = (
             "namespace Scratch\n"
-            "theorem opaqueCast_trusted_root_dispatch_simulation : 0 = 0 := rfl\n"
+            f"theorem {resolution} : 0 = 0 := rfl\n"
             "end Scratch\n"
             "theorem opaqueCast_trusted_root_dispatch_erasure_commutes"
         )
         self.assertEqual(
-            status_after(text.replace(witness, decoy).replace(ns_end, f"{pin}{ns_end}")),
+            status_after(
+                open_text.replace(f"theorem {witness}", decoy).replace(
+                    ns_end_line, f"{pin}{ns_end_line}"
+                )
+            ),
             "resolution_missing",
         )
+
+    def test_episode2_flips_pass_the_flip_direction_audit_on_the_live_tree(self) -> None:
+        """The three Episode 2 flips of the live tree, audited against baselines derived
+        from it: a baseline in which each witness is still open with a divergence statement
+        (the flips pass), and baselines in which a live `*_simulation` theorem is merely its
+        old witness under a new name (each is rejected as `polarity_not_flipped`)."""
+        items = {
+            item["id"]: item
+            for item in suite.TRACKED_CORRESPONDENCE_DIVERGENCES
+            if item["id"] in EPISODE2_FLIPPED_DIVERGENCE_IDS
+        }
+        self.assertEqual(set(items), EPISODE2_FLIPPED_DIVERGENCE_IDS)
+        rel = suite.UNTESTED_VARIANT_TEST_FILE
+        live_text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        ns_end = f"end {suite.UNTESTED_VARIANT_NAMESPACE}"
+        self.assertEqual(live_text.count(ns_end), 1)
+
+        def copy_tracked_tree(dest: Path, untested_variant_text: str) -> None:
+            for tracked in suite.flip_direction_tracked_files():
+                src = REPO_ROOT / tracked
+                if src.is_file():
+                    dst = dest / tracked
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(src, dst)
+            (dest / rel).write_text(untested_variant_text, encoding="utf-8")
+
+        def rename_theorem(body: str, old: str, new: str) -> str:
+            renamed, count = re.subn(
+                rf"(?m)^theorem {re.escape(old)}(?![\w'!?])", f"theorem {new}", body
+            )
+            self.assertEqual(count, 1, old)
+            return renamed
+
+        # 1. Every witness open in the baseline, with a divergence statement that the live
+        #    resolution theorem does not restate: three clean `open -> resolved` flips.
+        open_baseline = live_text
+        for item in items.values():
+            open_baseline = rename_theorem(
+                open_baseline, item["resolution_symbol"], f"{item['resolution_symbol']}_pre_flip"
+            )
+        open_baseline = open_baseline.replace(
+            ns_end,
+            "".join(
+                f"theorem {item['witness_symbol']} : {SYNTH_DIVERGENCE_STMT} := rfl\n"
+                for item in items.values()
+            )
+            + ns_end,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            copy_tracked_tree(base, open_baseline)
+            base_divs = suite.discover_correspondence_divergences(base)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in base_divs["actionable_anneal_bugs"]),
+                sorted((div_id, "open") for div_id in EPISODE2_FLIPPED_DIVERGENCE_IDS),
+            )
+            audit = suite.audit_flip_direction_transitions(base, REPO_ROOT)
+        self.assertTrue(audit["passed"], audit["violations"])
+        self.assertEqual(audit["violations"], [])
+        self.assertEqual(
+            sorted((t["id"], t["from"], t["to"]) for t in audit["transitions"]),
+            sorted((div_id, "open", "resolved") for div_id in EPISODE2_FLIPPED_DIVERGENCE_IDS),
+        )
+        self.assertEqual(
+            (audit["baseline_actionable_count"], audit["current_actionable_count"]), (3, 0)
+        )
+
+        # 2. A baseline in which one live `*_simulation` theorem carried its witness's name
+        #    (same statement): that flip is a rename, not a polarity flip.
+        for div_id, item in sorted(items.items()):
+            with self.subTest(renamed=div_id), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                copy_tracked_tree(
+                    base,
+                    rename_theorem(live_text, item["resolution_symbol"], item["witness_symbol"]),
+                )
+                audit = suite.audit_flip_direction_transitions(base, REPO_ROOT)
+                self.assertFalse(audit["passed"])
+                self.assertEqual(
+                    audit["transitions"], [{"id": div_id, "from": "open", "to": "resolved"}]
+                )
+                self.assertEqual(
+                    [(v["id"], v["reason"]) for v in audit["violations"]],
+                    [(div_id, "polarity_not_flipped")],
+                )
 
     def _actionable_items(self) -> list[dict[str, str]]:
         return [

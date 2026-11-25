@@ -3180,17 +3180,21 @@ impl MiriAstMutator for RawPtrOffsetMutator {
                             let #probe_ident: u32 = (__wb_dst & 0xFFu32) ^ __wb_src.b;
                         }
                     }
-                    // Copy both elements through whole-array pointer casts. A
-                    // multi-element copy between *element* sub-places
-                    // (`&raw const __cp_src[0]`) is a known engine gap (Anneal
-                    // copies only the first element, `wrong_value`), pinned by
-                    // `probe_gap_subplace_multi_elem_copy` in `miri_eval.rs`.
+                    // Copy both elements between *element* sub-places
+                    // (`&raw const __cp_src[0]`, `&raw mut __cp_dst[0]`): the copy
+                    // transfers `count * size_of::<u32>()` bytes starting at the
+                    // pointed-to element. Anneal used to copy only the first
+                    // element on this form (`wrong_value`); it now agrees with
+                    // Miri (`probe_gap_subplace_multi_elem_copy` in `miri_eval.rs`
+                    // pins the resolved gap), and the whole-array pointer-cast
+                    // form stays covered by the `subplace_multi_elem_copy_truncation`
+                    // probe and `pass_copy_nonoverlapping_multi_elem_array_pair`.
                     _ => syn::parse_quote! {
                         let __cp_src: [u32; 2] = [#c_a, #c_b];
                         let mut __cp_dst: [u32; 2] = [0u32, 0u32];
                         unsafe {
-                            let __src_p: *const u32 = (&raw const __cp_src) as *const u32;
-                            let __dst_p: *mut u32 = (&raw mut __cp_dst) as *mut u32;
+                            let __src_p: *const u32 = &raw const __cp_src[0];
+                            let __dst_p: *mut u32 = &raw mut __cp_dst[0];
                             copy_nonoverlapping(__src_p, __dst_p, 2usize);
                         }
                         let #probe_ident: u32 = __cp_dst[0] ^ __cp_dst[1];
@@ -9000,9 +9004,10 @@ pub fn unsuffixed_off() -> u32 {
             "family 3 must emit both reads: padding {padding_hits}, unaligned {unaligned_hits}"
         );
         // Other modes never emit the padding read, and the `Pass` multi-element
-        // copy template copies through whole-array pointer casts, never between
-        // element sub-places (the pinned `wrong_value` engine gap).
-        let mut whole_array_copies = 0usize;
+        // copy template copies between element sub-places (`&raw const
+        // __cp_src[0]`, `&raw mut __cp_dst[0]`; a resolved `wrong_value` engine
+        // gap), never through whole-array pointer casts.
+        let mut elem_subplace_copies = 0usize;
         for s in 0..64u64 {
             for mode in [
                 MutationMode::Pass,
@@ -9016,18 +9021,24 @@ pub fn unsuffixed_off() -> u32 {
                 let out = prettyplease::unparse(&f);
                 assert!(!out.contains("__raw_pad_"), "{mode:?} emitted the padding read:\n{out}");
                 if out.contains("copy_nonoverlapping(__src_p, __dst_p, 2usize)") {
-                    whole_array_copies += 1;
+                    elem_subplace_copies += 1;
                     assert!(
-                        out.contains("let __src_p: *const u32 = (&raw const __cp_src) as *const u32;")
-                            && out.contains("let __dst_p: *mut u32 = (&raw mut __cp_dst) as *mut u32;")
-                            && !out.contains("__cp_src[0]")
-                            && !out.contains("&raw mut __cp_dst["),
-                        "{mode:?} copy template must use whole-array pointer casts:\n{out}"
+                        out.contains("let __src_p: *const u32 = &raw const __cp_src[0];")
+                            && out.contains("let __dst_p: *mut u32 = &raw mut __cp_dst[0];")
+                            && !out.contains("(&raw const __cp_src) as *const u32")
+                            && !out.contains("(&raw mut __cp_dst) as *mut u32")
+                            && out.contains("__cp_dst[0] ^ __cp_dst[1]"),
+                        "{mode:?} copy template must copy between element sub-places:\n{out}"
+                    );
+                    let standalone = build_standalone_candidate_source(&out);
+                    assert!(
+                        syn::parse_file(&standalone).is_ok(),
+                        "{mode:?} copy-template candidate failed syn::parse_file:\n{standalone}"
                     );
                 }
             }
         }
-        assert!(whole_array_copies > 0, "the `Pass` copy template never fired");
+        assert!(elem_subplace_copies > 0, "the `Pass` copy template never fired");
 
         // 2. Generated candidates carrying the padding read replay byte for byte
         //    from their recorded passes, and replaying the `Ub` pass alone from its

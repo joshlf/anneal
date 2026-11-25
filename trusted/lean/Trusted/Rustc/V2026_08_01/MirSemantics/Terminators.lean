@@ -286,7 +286,10 @@ Resolve the target function `(defPath, typeArgs, fnSig)` of a direct or indirect
 
 - When `extractCalleeDefPath? func` is `.some defPath`, resolves directly without
   mutating `s.frame.locals`.
-- Otherwise evaluates `func` via `evalOperand`:
+- Otherwise evaluates `func` via `evalOperandWithBodyCast` (`evalOperand` with
+  erased declarations, except that a moved place starting with
+  `ProjectionElem.opaqueCast` is evaluated with `bodyLocalDecls`,
+  `DIV-TR-OPAQUECAST-ROOT-DISPATCH`):
   - If `func` evaluates to `.ptr ptrVal 8` at `offsetBytes == 0`, not aliasing any
     stack borrow in `s.memory.borrows`, and registered in `s.memory.fnPtrs` with
     compatible signature and arity (`fnEntryCompatibleWithCallSite`), resolves to
@@ -328,14 +331,15 @@ def resolveCallTarget
       s.frame.locals
   | .none =>
     match
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         func
         s.memory.borrows
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack)
+        bodyLocalDecls
+        s.memory.callStack
     with
     | .ub => .ub
     | .unsupported => .unsupported
@@ -586,6 +590,26 @@ uninitialized local writes into its default field shell
 `evalPlaceWrite` and `invalidateDerefWriteBorrowsWithLayouts`, or
 `foreignFrameDerefWrite` when it targets another frame.
 
+A destination that is a pure `ProjectionElem.opaqueCast` chain
+(`(_l as OpaqueTy) = call …`, `DIV-TR-OPAQUECAST-ROOT-DISPATCH`) names the whole
+local: it takes the whole-local write (allowed on a live `.uninit` `_l`) after
+validating `retVal` against the cast type `placeTyResolved localDecls layouts dst`
+when `localDecls` is non-empty. A cast chain followed by further projections
+(`(_l as OpaqueTy).f`) takes the projected arm with local `dst.local_`
+re-declared at the cast type (`eraseLeadingOpaqueCastDecls`, `uninitFieldWriteShell?`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification for the cast arm: the cast "changes the place's type to the given
+one, and makes no other changes", so the return value is assigned to the local
+itself, "as if assigned via `dest = move _0`", at the cast type.
+
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L819>
@@ -606,8 +630,8 @@ def writeReturnDestination
     (layouts : LayoutTable) :
     FrameWriteResult :=
   let depth := length mem.callStack
-  match dst.projection with
-  | .nil =>
+  match dst.projection, stripLeadingOpaqueCast dst.projection with
+  | .nil, _ =>
     match get? callerLocals dst.local_ with
     | .some .dead => .ub
     | .some _ =>
@@ -631,7 +655,7 @@ def writeReturnDestination
               borrows := invalidateConflictingBorrows mem.borrows dst.local_ .none depth }
         | .none => .ub
     | .none => .ub
-  | .deref :: restProj =>
+  | .deref :: restProj, _ =>
     match
       evalPlaceWrite
         callerLocals
@@ -672,9 +696,42 @@ def writeReturnDestination
                 mem.callStack }
     | .ub => foreignFrameDerefWrite callerLocals mem dst restProj retVal localDecls layouts
     | .unsupported => .unsupported
-  | proj :: rest =>
+  | .opaqueCast _ :: _, .nil =>
+    let tyValid :=
+      match localDecls with
+      | .nil => true
+      | _ :: _ => validateValueForTy? layouts (placeTyResolved localDecls layouts dst) retVal
+    match tyValid with
+    | false => .ub
+    | true =>
+        match get? callerLocals dst.local_ with
+        | .some .dead => .ub
+        | .some _ =>
+          match
+            hasProtectedWriteConflict
+              mem.borrows
+              mem.activeProtectors
+              dst.local_
+              .none
+              .nil
+              0
+              0
+              depth
+          with
+          | true => .ub
+          | false =>
+            match set? callerLocals dst.local_ (.init retVal) with
+            | .some locals' =>
+              .ok locals'
+                { mem with
+                  borrows := invalidateConflictingBorrows mem.borrows dst.local_ .none depth }
+            | .none => .ub
+        | .none => .ub
+  | proj :: rest, _ =>
+    let decls' :=
+      eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ (proj :: rest)
     let resolvedLocalProj :=
-      resolveBorrowWriteLocalProj localDecls layouts callerLocals dst.local_ (proj :: rest)
+      resolveBorrowWriteLocalProj decls' layouts callerLocals dst.local_ (proj :: rest)
     match
       hasProtectedWriteConflict
         mem.borrows
@@ -699,7 +756,7 @@ def writeReturnDestination
         match
           writeProjectedForLocal
             callerLocals
-            localDecls
+            decls'
             layouts
             dst.local_
             rootVal
@@ -830,8 +887,91 @@ def pushDivergingCalleeFrame
   }
 
 /--
+Narrow the unwind action of the caller frame that a tail callee returns into
+(`DIV-LM-TAILCALL-NOUNWIND-UNWIND`).
+
+Modeled property and scope (`Runtime` MIR at `rustc` commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`): `stk` is `Memory.callStack` when a
+`TerminatorKind.tailCall` replaces the active frame, whose head (when present)
+is the `SavedCallerFrame` holding the return continuation inherited by the tail
+callee, and `canUnwind` is the callee's `FnAbi::can_unwind`
+(`CapturedMir.fnAbi.canUnwind`). When the callee cannot unwind, the inherited
+`returnUnwind` becomes `UnwindAction.unreachable`, so `unwindFromCallStack`
+faults with `.faulted .ub` when an unwind reaches that caller frame. For
+`canUnwind = true` the result is `stk` itself (definitionally), and with an
+empty `stk` (the modular root, whose continuation is not represented) the
+narrowing is recorded in `Memory.rootUnwindCeiling` by `enterTailCalleeFrame`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function imported
+> or transmuted as a "C" function or function pointer)."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L826-L835>
+
+> "/// Semantically tail calls consists of two actions:
+> /// - pop of the current stack frame
+> /// - a call to the `func`, with the return address of the **current** caller
+> ///   - so that a `return` inside `func` returns to the caller of the caller
+> ///     of the function that is currently being executed
+> ///
+> /// Note that in difference with [`Call`] this is missing
+> /// - `destination` (because it's always the return place)
+> /// - `target` (because it's always taken from the current stack frame)
+> /// - `unwind` (because it's always taken from the current stack frame)"
+
+Reference (`compiler/rustc_const_eval/src/interpret/call.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/call.rs#L391-L399>
+
+> "if !callee_fn_abi.can_unwind {
+>     // The callee cannot unwind, so force the `Unreachable` unwind handling.
+>     match &mut cont {
+>         ReturnContinuation::Stop { .. } => {}
+>         ReturnContinuation::Goto { unwind, .. } => {
+>             *unwind = mir::UnwindAction::Unreachable;
+>         }
+>     }
+> }"
+
+Justification: the tail callee's frame takes its `unwind` action "from the
+current stack frame", i.e. from the `SavedCallerFrame` at the head of `stk`, and
+the quoted interpreter passage replaces it by `Unreachable` when the callee's
+ABI cannot unwind; unwinding into that caller is then "unwinding past a stack
+frame that does not allow unwinding", which the Reference lists as undefined
+behavior. Only the head is narrowed: deeper frames keep the unwind actions of
+their own pending calls.
+
+Modeling assumptions: the narrowing overwrites the head's `returnUnwind` in
+place, which is sound because the replaced activation was the only frame that
+could return or unwind through it; the interpreter passage is supplied compiler
+behavior rather than a stable-documentation guarantee.
+-/
+@[reducible]
+def narrowCallStackForTailCallee
+    (stk : List SavedCallerFrame)
+    (canUnwind : Bool) :
+    List SavedCallerFrame :=
+  match canUnwind with
+  | true => stk
+  | false =>
+    match stk with
+    | .nil => .nil
+    | top :: rest => { top with returnUnwind := .unreachable } :: rest
+
+/--
 Enter `calleeBody` at basic block `0` for a `TerminatorKind.tailCall` without
-pushing a caller frame onto `mem.callStack`.
+pushing a caller frame onto `mem.callStack`, narrowing the inherited unwind
+action when `calleeBody` cannot unwind (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`):
+`callStack := narrowCallStackForTailCallee mem.callStack calleeBody.fnAbi.canUnwind`
+and, at the modular root (`mem.callStack = .nil`),
+`rootUnwindCeiling := mem.rootUnwindCeiling && calleeBody.fnAbi.canUnwind`
+(`enterTailCalleeFrame_rootUnwindCeiling`). For an unwinding callee
+(`calleeBody.fnAbi.canUnwind = true`) both fields are definitionally unchanged.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -842,6 +982,50 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 >     args: Box<[Spanned<Operand<'tcx>>]>,
 >     fn_span: Span,
 > },"
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function imported
+> or transmuted as a "C" function or function pointer)."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L826-L835>
+
+> "/// Semantically tail calls consists of two actions:
+> /// - pop of the current stack frame
+> /// - a call to the `func`, with the return address of the **current** caller
+> ///   - so that a `return` inside `func` returns to the caller of the caller
+> ///     of the function that is currently being executed
+> ///
+> /// Note that in difference with [`Call`] this is missing
+> /// - `destination` (because it's always the return place)
+> /// - `target` (because it's always taken from the current stack frame)
+> /// - `unwind` (because it's always taken from the current stack frame)"
+
+Reference (`compiler/rustc_const_eval/src/interpret/call.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/call.rs#L391-L399>
+
+> "if !callee_fn_abi.can_unwind {
+>     // The callee cannot unwind, so force the `Unreachable` unwind handling.
+>     match &mut cont {
+>         ReturnContinuation::Stop { .. } => {}
+>         ReturnContinuation::Goto { unwind, .. } => {
+>             *unwind = mir::UnwindAction::Unreachable;
+>         }
+>     }
+> }"
+
+Justification: see `narrowCallStackForTailCallee` and `Memory.rootUnwindCeiling`.
+`calleeBody.fnAbi.canUnwind` is the captured `FnAbi::can_unwind` of the callee
+instance, the same field the quoted interpreter passage tests.
+
+Modeling assumptions: caller-owned referents of the root frame are relocated by
+`relocateRootCallerReferents` in `evalTailCallTerminator` before this function
+is called; this function does not move any slot.
 -/
 @[simp]
 def enterTailCalleeFrame
@@ -856,15 +1040,75 @@ def enterTailCalleeFrame
     }
     memory := {
       mem with
+      callStack := narrowCallStackForTailCallee mem.callStack calleeBody.fnAbi.canUnwind
       activeCallee := .some calleeBody
+      rootUnwindCeiling :=
+        match calleeBody.fnAbi.canUnwind with
+        | true => mem.rootUnwindCeiling
+        | false =>
+          match mem.callStack with
+          | .nil => false
+          | _ :: _ => mem.rootUnwindCeiling
     }
   }
+
+/--
+`enterTailCalleeFrame` updates the root unwind ceiling exactly as
+`mem.rootUnwindCeiling && calleeBody.fnAbi.canUnwind` at the modular root and
+leaves it unchanged inside an inline callee frame.
+-/
+theorem enterTailCalleeFrame_rootUnwindCeiling
+    (mem : Memory)
+    (calleeBody : CapturedMir)
+    (argVals : List Value) :
+    (enterTailCalleeFrame mem calleeBody argVals).memory.rootUnwindCeiling =
+      match mem.callStack with
+      | .nil => Bool.and mem.rootUnwindCeiling calleeBody.fnAbi.canUnwind
+      | _ :: _ => mem.rootUnwindCeiling := by
+  cases hU : calleeBody.fnAbi.canUnwind <;> cases hS : mem.callStack <;>
+    cases hC : mem.rootUnwindCeiling <;>
+    simp [enterTailCalleeFrame, hU, hS, hC]
+
+/--
+An unwinding tail callee leaves the call stack and the root unwind ceiling
+unchanged: the state is the pre-repair `{ mem with activeCallee := .some calleeBody }`.
+-/
+theorem enterTailCalleeFrame_of_canUnwind
+    (mem : Memory)
+    (calleeBody : CapturedMir)
+    (argVals : List Value)
+    (hUnwind : calleeBody.fnAbi.canUnwind = true) :
+    enterTailCalleeFrame mem calleeBody argVals =
+      { frame := {
+          blockIdx := 0
+          stmtIdx := 0
+          locals := initLocals calleeBody argVals
+        }
+        memory := { mem with activeCallee := .some calleeBody } } := by
+  simp [enterTailCalleeFrame, narrowCallStackForTailCallee, hUnwind]
 
 /--
 Unwind out of the active frame by popping caller frames from `callStack` until a
 caller frame catches the unwind (`.cleanup cleanupBb`), aborts (`.terminate`),
 faults on an impossible unwind ABI (`.unreachable`), or reaches the root frame
-(`callStack = .nil`, halting with `.halted .panic`).
+(`callStack = .nil`): there the unwind escapes into the unmodeled caller of the
+root function and halts with `.halted .panic` while `memAfter.rootUnwindCeiling`
+is `true`, and faults with `.faulted .ub` once a tail call replaced the root
+activation by a callee that cannot unwind (`Memory.rootUnwindCeiling = false`,
+`DIV-LM-TAILCALL-NOUNWIND-UNWIND`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function imported
+> or transmuted as a "C" function or function pointer)."
+
+Justification for the root arm: see `Memory.rootUnwindCeiling`. A `false` ceiling
+records that the activation now running at the root inherited an `Unreachable`
+unwind action in every calling context, so the escaping unwind is the quoted
+undefined behavior; a `true` ceiling keeps the modular-root convention and does
+not assert that the root's caller tolerates unwinding.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -884,7 +1128,10 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 -/
 @[simp]
 def unwindFromCallStack : List SavedCallerFrame → Memory → MirExecState
-  | .nil, _ => .halted .panic
+  | .nil, memAfter =>
+    match memAfter.rootUnwindCeiling with
+    | true => .halted .panic
+    | false => .faulted .ub
   | caller :: restStack, memAfter =>
     let memCaller : Memory := {
       memAfter with
@@ -988,6 +1235,23 @@ def invalidateDirectDestWriteBorrows
 Resume after an external `TerminatorKind.call` response `ans : MirCallAns`,
 writing `retVal` to `destination` and updating `Memory` on normal return, or
 dispatching `unwind` / `.abort` on abnormal return.
+
+The answer memory keeps the caller's root unwind ceiling
+(`rootUnwindCeiling := s.memory.rootUnwindCeiling`): a non-tail call pushes and
+pops its own frame, so it cannot change the unwind action inherited by the root
+activation (`Memory.rootUnwindCeiling`, `DIV-LM-TAILCALL-NOUNWIND-UNWIND`), and
+the external answer is not constrained on that field.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function imported
+> or transmuted as a "C" function or function pointer)."
+
+Modeling assumption: the external callee's answer memory `memAns` is trusted
+for the heap, borrow, and call-stack state it reports, exactly as before; only
+the root unwind ceiling is restored from `s.memory`.
 -/
 def resumeExternalCall
     (s : MachineState)
@@ -998,7 +1262,9 @@ def resumeExternalCall
     (ans : MirCallAns) :
     MirExecState :=
   match ans with
-  | .returned retVal memAfter =>
+  | .returned retVal memAns =>
+    let memAfter : Memory :=
+      { memAns with rootUnwindCeiling := s.memory.rootUnwindCeiling }
     match destination.projection with
     | .deref :: restProj =>
       match
@@ -1076,8 +1342,12 @@ def resumeExternalCall
         }
       | .ub => .faulted .ub
       | .unsupported => .faulted .unsupported
-  | .panicked memAfter =>
-    applyUnwindAction s localsAfterArgs memAfter unwind
+  | .panicked memAns =>
+    applyUnwindAction
+      s
+      localsAfterArgs
+      { memAns with rootUnwindCeiling := s.memory.rootUnwindCeiling }
+      unwind
   | .aborted => .halted .abort
 
 /--
@@ -1086,8 +1356,10 @@ response `ans : MirCallAns`.
 
 Because a diverging call has no return target (`!` return type), a normal return
 (`MirCallAns.returned`) is immediate undefined behavior (`.faulted .ub`), an
-unwind (`MirCallAns.panicked memAfter`) dispatches `applyUnwindAction`, and an
-abort (`MirCallAns.aborted`) halts with `.halted .abort`.
+unwind (`MirCallAns.panicked memAns`) dispatches `applyUnwindAction` on the
+answer memory with the caller's root unwind ceiling restored
+(`rootUnwindCeiling := s.memory.rootUnwindCeiling`, see `resumeExternalCall`),
+and an abort (`MirCallAns.aborted`) halts with `.halted .abort`.
 
 Reference (The Rust Reference, "Never type"):
 <https://doc.rust-lang.org/1.98.0/reference/types/never.html>
@@ -1108,8 +1380,12 @@ def resumeExternalDivergingCall
     MirExecState :=
   match ans with
   | .returned _ _ => .faulted .ub
-  | .panicked memAfter =>
-    applyUnwindAction s localsAfterArgs memAfter unwind
+  | .panicked memAns =>
+    applyUnwindAction
+      s
+      localsAfterArgs
+      { memAns with rootUnwindCeiling := s.memory.rootUnwindCeiling }
+      unwind
   | .aborted => .halted .abort
 
 /--
@@ -1155,6 +1431,495 @@ def resumeExternalTailCall (ans : MirCallAns) : MirExecState :=
   | .panicked memAfter =>
     unwindFromCallStack memAfter.callStack memAfter
   | .aborted => .halted .abort
+
+/--
+Membership of `name` in a list of ABI strings (`stringEq` on each entry).
+-/
+@[reducible]
+def abiNameIn (name : String) : List String → Bool
+  | .nil => false
+  | candidate :: rest =>
+    match stringEq name candidate with
+    | true => true
+    | false => abiNameIn name rest
+
+/--
+Whether a function called through calling convention `conv` can unwind, when the
+captured `CallConv` decides it (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`, external
+callees): `.some true` when it certainly may unwind, `.some false` when it
+certainly cannot, and `.none` when the captured convention does not decide.
+
+Modeled property and scope (`rustc` commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, `-C panic=unwind`, no function
+`DefId`): `fn_can_unwind(tcx, None, abi)` over the ABI string that
+`trusted/rustc-capture` records in `CallConv` (`ExternAbi::Rust` as
+`CallConv.rust`, `ExternAbi::C { .. }` as `CallConv.c`, every other ABI as
+`CallConv.other abi.as_str()`).
+
+Reference (The Rust Reference 1.98.0, "External blocks", ABI):
+<https://doc.rust-lang.org/1.98.0/reference/items/external-blocks.html#abi>
+
+> "The strings that end with `-unwind` ... are the same as the corresponding ABI
+> strings without `-unwind`, except that they allow the called function to
+> safely unwind the stack (for example, via a Rust panic or a C++ exception)
+> through the foreign frame into the caller's frame."
+
+Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L1268-L1296>
+
+> "use ExternAbi::*;
+> match abi {
+>     C { unwind }
+>     | System { unwind }
+>     | Cdecl { unwind }
+>     | Stdcall { unwind }
+>     | Fastcall { unwind }
+>     | Vectorcall { unwind }
+>     | Thiscall { unwind }
+>     | Aapcs { unwind }
+>     | Win64 { unwind }
+>     | SysV64 { unwind } => unwind,
+>     PtxKernel
+>     | Msp430Interrupt
+>     | X86Interrupt
+>     | GpuKernel
+>     | EfiApi
+>     | AvrInterrupt
+>     | AvrNonBlockingInterrupt
+>     | CmseNonSecureCall
+>     | CmseNonSecureEntry
+>     | Custom
+>     | RiscvInterruptM
+>     | RiscvInterruptS
+>     | RustInvalid
+>     | Swift
+>     | Unadjusted => false,
+>     Rust | RustCall | RustCold | RustPreserveNone => tcx.sess.panic_strategy().unwinds(),
+> }"
+
+Reference (`compiler/rustc_abi/src/extern_abi.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/extern_abi.rs#L177-L181>
+
+> "C { unwind: false } =><= "C",
+> C { unwind: true } =><= "C-unwind",
+> Rust =><= "Rust",
+> Swift =><= "Swift",
+> Aapcs { unwind: false } =><= "aapcs","
+
+Justification: each `.some true` name is an ABI whose `unwind` flag is `true` in
+the quoted `abi_impls!` table or a Rust ABI under `-C panic=unwind`; each
+`.some false` name is an ABI whose arm in the quoted `match` is `unwind = false`
+or the literal `false`. The answer is used only in the stated direction:
+`.some false` licenses the undefined-behavior verdict for an unwind out of the
+callee, `.some true` keeps the unwind, and `.none` licenses neither.
+
+Modeling assumptions and unsupported behavior: `CallConv.c` stands for both
+`"C"` (cannot unwind) and `"C-unwind"` (can unwind) because the capture lowers
+`ExternAbi::C { .. }` to it, and `CallConv.rustIntrinsic` and unknown names are
+not classified, so all three are `.none` (fail closed in
+`resumeExternalTailCallWithAbi`). By contrast, `CallConv.other "C"` unambiguously
+names `ExternAbi::C { unwind: false }` (the `"C"` entry in the quoted
+`extern_abi.rs` passage) and maps to `.some false`. A `-C panic=abort` build,
+`#[rustc_nounwind]`, and `-Z panic-in-drop=abort` only make more callees
+non-unwinding; they are outside this table and are treated as "may unwind".
+-/
+@[reducible]
+def callConvCanUnwind? : CallConv → Option Bool
+  | .rust => .some true
+  | .c => .none
+  | .rustIntrinsic => .none
+  | .other name =>
+    match
+      abiNameIn name
+        ("C-unwind" :: "system-unwind" :: "cdecl-unwind" :: "stdcall-unwind" ::
+          "fastcall-unwind" :: "vectorcall-unwind" :: "thiscall-unwind" ::
+          "aapcs-unwind" :: "win64-unwind" :: "sysv64-unwind" :: "Rust" ::
+          "rust-call" :: "rust-cold" :: "rust-preserve-none" :: .nil)
+    with
+    | true => .some true
+    | false =>
+      match
+        abiNameIn name
+          ("C" :: "system" :: "cdecl" :: "stdcall" :: "fastcall" :: "vectorcall" ::
+            "thiscall" :: "aapcs" :: "win64" :: "sysv64" :: "ptx-kernel" ::
+            "msp430-interrupt" :: "x86-interrupt" :: "gpu-kernel" :: "efiapi" ::
+            "avr-interrupt" :: "avr-non-blocking-interrupt" ::
+            "cmse-nonsecure-call" :: "cmse-nonsecure-entry" :: "custom" ::
+            "riscv-interrupt-m" :: "riscv-interrupt-s" :: "rust-invalid" ::
+            "Swift" :: "unadjusted" :: .nil)
+      with
+      | true => .some false
+      | false => .none
+
+/--
+Whether an external (out-of-table) tail callee resolved as `target` can unwind,
+as far as the model knows (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`): `.some true` for a
+direct function-item callee (`target.isIndirect = false`), and
+`callConvCanUnwind?` of the function-pointer ABI for an indirect callee (the
+reified signature `target.fnSig`, else the call site's declared operand type
+`callerFuncTyOpt`), `.none` when neither carries a function-pointer type.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function imported
+> or transmuted as a "C" function or function pointer)."
+
+Justification: for an indirect callee, `resolveCallTarget` already requires the
+call-site ABI and the reified signature ABI to agree
+(`fnEntryCompatibleWithCallSite`), so either one names the ABI of the function
+pointer through which the callee is entered; `callConvCanUnwind?` then gives the
+unwind capability of that ABI in the stated one-directional sense.
+
+Modeling assumptions and unsupported behavior: a direct function-item callee
+keeps the pre-repair behavior (its unwind is propagated), because the ABI of an
+out-of-table function item is not part of `RigidTy.fnDef`; this is a documented
+fail-open residual for direct external tail callees declared with a
+non-unwinding ABI.
+-/
+@[reducible]
+def externalTargetCanUnwind
+    (target : ResolvedCallTarget)
+    (callerFuncTyOpt : Option Ty) :
+    Option Bool :=
+  match target.isIndirect with
+  | false => .some true
+  | true =>
+    match target.fnSig with
+    | .some (.fnPtr _ _ _ sigAbi) => callConvCanUnwind? sigAbi
+    | _ =>
+      match callerFuncTyOpt with
+      | .some { kind := .fnPtr _ _ _ callerAbi, .. } => callConvCanUnwind? callerAbi
+      | _ => .none
+
+/--
+Resume after an external `TerminatorKind.tailCall` response `ans : MirCallAns`
+when the tail call was made with root unwind ceiling `rootCeiling`
+(`s.memory.rootUnwindCeiling` of the tail-calling state) into a callee whose
+unwind capability is `extUnwind` (`externalTargetCanUnwind`).
+
+- The answer memory keeps `rootUnwindCeiling := rootCeiling` (the external
+  answer is not constrained on that field), and a normal return or an unwind out
+  of a callee that may unwind (`extUnwind = .some true`) then behaves as
+  `resumeExternalTailCall`.
+- An unwind out of a callee that certainly cannot unwind
+  (`extUnwind = .some false`) is undefined behavior (`.faulted .ub`) at every
+  call-stack depth: inside an inline callee the inherited caller frame's unwind
+  action is narrowed to `UnwindAction.unreachable`, and at the modular root the
+  root unwind ceiling is narrowed to `false`
+  (`narrowCallStackForTailCallee`, `Memory.rootUnwindCeiling`).
+- When the captured ABI does not decide (`extUnwind = .none`, e.g. `CallConv.c`
+  for both `"C"` and `"C-unwind"`), an unwind keeps only the verdict that holds
+  under both readings: `.faulted .ub` when the unwinding reading also faults
+  with `.ub`, and `.faulted .unsupported` otherwise (fail closed).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function imported
+> or transmuted as a "C" function or function pointer)."
+
+Reference (`compiler/rustc_const_eval/src/interpret/call.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/call.rs#L391-L399>
+
+> "if !callee_fn_abi.can_unwind {
+>     // The callee cannot unwind, so force the `Unreachable` unwind handling.
+>     match &mut cont {
+>         ReturnContinuation::Stop { .. } => {}
+>         ReturnContinuation::Goto { unwind, .. } => {
+>             *unwind = mir::UnwindAction::Unreachable;
+>         }
+>     }
+> }"
+
+Justification: a callee that cannot unwind is entered with unwind action
+`Unreachable` in every calling context, so an unwind out of it is the quoted
+undefined behavior regardless of the caller frames; a callee that may unwind
+inherits the tail caller's continuation unchanged, which is
+`resumeExternalTailCall` on the unchanged ceiling. For the undecided case the
+model reports undefined behavior only when both readings do, so it never turns
+a permitted unwind into undefined behavior, and it never propagates an unwind
+that one reading forbids.
+
+Modeling assumptions and unsupported behavior: see `callConvCanUnwind?` and
+`externalTargetCanUnwind`; `.faulted .unsupported` marks the undecided unwind.
+-/
+def resumeExternalTailCallWithAbi
+    (rootCeiling : Bool)
+    (extUnwind : Option Bool)
+    (ans : MirCallAns) :
+    MirExecState :=
+  match ans with
+  | .returned retVal memAns =>
+    resumeExternalTailCall
+      (.returned retVal { memAns with rootUnwindCeiling := rootCeiling })
+  | .panicked memAns =>
+    match extUnwind with
+    | .some false => .faulted .ub
+    | .some true =>
+      resumeExternalTailCall
+        (.panicked { memAns with rootUnwindCeiling := rootCeiling })
+    | .none =>
+      match
+        resumeExternalTailCall
+          (.panicked { memAns with rootUnwindCeiling := rootCeiling })
+      with
+      | .faulted .ub => .faulted .ub
+      | _ => .faulted .unsupported
+  | .aborted => .halted .abort
+
+/--
+Whether `entry` is a live borrow of a caller-owned referent of the root frame
+whose locals are `0 .. nOld - 1` (`DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`):
+its allocation is live (`allocDead = false`), it targets the root frame
+(`targetFrameDepth = 0`), and its target slot lies past the root frame's own
+locals (`nOld ≤ targetLocal`), i.e. in `Memory.callerLocals`.
+
+Reference (The Rust Reference 1.98.0, "Pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html>
+
+> "Shared references point to memory which is owned by some other value."
+> "Mutable references point to memory which is owned by some other value."
+
+Justification: the memory a reference or raw-pointer argument of the root
+function points to is owned by the root's caller, so it is not deallocated when
+the root activation is replaced by a tail callee. The model addresses such
+referents as depth-`0` slots past the root frame; a borrow whose allocation was
+deallocated (`allocDead = true`, set together with `perm := .disabled` by
+`disableFrameBorrows`, `disableFramesAbove`, and `disableLocalBorrows`) is a
+dangling borrow of a former root-frame local, not a caller referent, even when
+its slot index is past a later, narrower root frame.
+
+Modeling assumption: every transition that sets `allocDead := true` also sets
+`perm := .disabled`, so an unshifted dead borrow that comes to alias a callee
+local still faults on every access.
+-/
+@[reducible]
+def isRootCallerReferentBorrow (nOld : Nat) (entry : BorrowEntry) : Bool :=
+  Bool.and
+    (Bool.not entry.allocDead)
+    (Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.ble nOld entry.targetLocal))
+
+/--
+Whether `borrows` contains a live caller-owned referent borrow of the root frame
+with `nOld` locals (`isRootCallerReferentBorrow`).
+-/
+def hasAnyRootCallerReferent : List BorrowEntry → Nat → Bool
+  | .nil, _ => false
+  | entry :: rest, nOld =>
+    match isRootCallerReferentBorrow nOld entry with
+    | true => true
+    | false => hasAnyRootCallerReferent rest nOld
+
+/--
+Shift the target slot of every live caller-owned referent borrow of the root
+frame with `nOld` locals (`isRootCallerReferentBorrow`) by `delta` slots,
+leaving tags, permissions, protectors, parent links, projections, and byte
+ranges unchanged.
+-/
+def shiftRootCallerReferentBorrows
+    (borrows : List BorrowEntry)
+    (nOld delta : Nat) :
+    List BorrowEntry :=
+  match borrows with
+  | .nil => .nil
+  | entry :: rest =>
+    match isRootCallerReferentBorrow nOld entry with
+    | true =>
+      { entry with targetLocal := Nat.add entry.targetLocal delta } ::
+        shiftRootCallerReferentBorrows rest nOld delta
+    | false => entry :: shiftRootCallerReferentBorrows rest nOld delta
+
+/--
+`n` copies of `slot`.
+-/
+@[reducible]
+def replicateLocalSlots : Nat → LocalSlot → List LocalSlot
+  | .zero, _ => .nil
+  | .succ n, slot => slot :: replicateLocalSlots n slot
+
+/--
+Concatenate two `LocalSlot` lists.
+-/
+@[reducible]
+def appendLocalSlots : List LocalSlot → List LocalSlot → List LocalSlot
+  | .nil, ys => ys
+  | x :: xs, ys => x :: appendLocalSlots xs ys
+
+/--
+Relocate the caller-owned referents of the root frame when a root tail call
+replaces a frame of `nOld` locals by a wider frame of `nNew` locals
+(`DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`).
+
+Modeled property and scope: at the modular root (`callStack = .nil`) the memory
+behind incoming reference and raw-pointer arguments is owned by the root's
+caller and stays allocated across a `TerminatorKind.tailCall`; the model
+addresses it as depth-`0` slots `targetLocal ≥ length locals` backed by
+`Memory.callerLocals` (`foreignFrameSlot?`). A wider tail callee's own locals
+`nOld .. nNew - 1` would otherwise occupy those slot indices, so the callee's
+frame would shadow the referents (and a later frame teardown would disable
+their borrows). When `nNew > nOld` and a live referent borrow exists, every such
+borrow's `targetLocal` is shifted by `delta = nNew - nOld`, and
+`Memory.callerLocals` is padded with `delta` leading `.dead` slots when it is
+indexed directly at `targetLocal` (`length callerLocals > nOld`), so the shifted
+index reads the same slot. When `callerLocals` is no longer than the old frame
+(`length callerLocals ≤ nOld`), no slot is reachable directly at
+`targetLocal ≥ nOld`; the `copy_nonoverlapping` paths then use the frame-relative
+index `targetLocal - length locals`, which the shift preserves
+(`(targetLocal + delta) - nNew = targetLocal - nOld`), so `callerLocals` is left
+unchanged. When `nNew ≤ nOld` or no live referent borrow exists, `mem` is
+returned unchanged (definitionally, by evaluating the two tests).
+
+Reference (The Rust Reference 1.98.0, "Pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html>
+
+> "Shared references point to memory which is owned by some other value."
+> "Mutable references point to memory which is owned by some other value."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L826-L830>
+
+> "/// Semantically tail calls consists of two actions:
+> /// - pop of the current stack frame
+> /// - a call to the `func`, with the return address of the **current** caller
+> ///   - so that a `return` inside `func` returns to the caller of the caller
+> ///     of the function that is currently being executed"
+
+Justification: popping the current stack frame deallocates that frame's locals
+only; memory "owned by some other value" outside the frame is unaffected, so a
+pointer argument forwarded to the tail callee must still reach its referent.
+The relocation changes only the model's slot addressing of referents: borrow
+tags (pointer provenance), permissions, protectors, and parent links are
+untouched, so aliasing and Tree Borrows state are preserved.
+
+Modeling assumptions and unsupported behavior: `BorrowEntry`,
+`activeFrameSlot?`, `foreignFrameSlot?`, and `foreignFrameTarget?` are unchanged;
+a referent's `callerLocals` index and its synthetic address (keyed on
+`targetLocal`) change across a widening root tail call; a `callerLocals` list
+that mixes directly indexed and frame-relative referents is not supported.
+-/
+def relocateRootCallerReferents
+    (mem : Memory)
+    (nOld nNew : Nat) :
+    Memory :=
+  match Nat.blt nOld nNew with
+  | false => mem
+  | true =>
+    match hasAnyRootCallerReferent mem.borrows nOld with
+    | false => mem
+    | true =>
+      let delta := Nat.sub nNew nOld
+      { mem with
+        borrows := shiftRootCallerReferentBorrows mem.borrows nOld delta
+        callerLocals :=
+          match Nat.blt nOld (length mem.callerLocals) with
+          | true => appendLocalSlots (replicateLocalSlots delta .dead) mem.callerLocals
+          | false => mem.callerLocals }
+
+/--
+No borrow, no caller-owned referent borrow.
+-/
+@[simp]
+theorem hasAnyRootCallerReferent_nil (nOld : Nat) :
+    hasAnyRootCallerReferent .nil nOld = false :=
+  rfl
+
+/--
+`relocateRootCallerReferents` is the identity when the new frame is not wider.
+-/
+theorem relocateRootCallerReferents_not_wider
+    (mem : Memory)
+    (nOld nNew : Nat)
+    (hLe : Nat.blt nOld nNew = false) :
+    relocateRootCallerReferents mem nOld nNew = mem := by
+  simp [relocateRootCallerReferents, hLe]
+
+/--
+`relocateRootCallerReferents` is the identity when no live caller-owned referent
+borrow exists.
+-/
+theorem relocateRootCallerReferents_no_referents
+    (mem : Memory)
+    (nOld nNew : Nat)
+    (hNone : hasAnyRootCallerReferent mem.borrows nOld = false) :
+    relocateRootCallerReferents mem nOld nNew = mem := by
+  unfold relocateRootCallerReferents
+  cases Nat.blt nOld nNew <;> simp [hNone]
+
+/--
+Memory in which an in-table tail callee with `nCallee` locals is entered, given
+the tail-calling frame's call stack `callStack`, the memory after the frame
+teardown `memAfterTeardown`, and the torn-down frame's local count `nLocals`
+(`DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`): at the modular root
+(`callStack = .nil`) the caller-owned referents are relocated past the callee's
+frame (`relocateRootCallerReferents memAfterTeardown nLocals nCallee`); inside
+an inline callee frame the memory is `memAfterTeardown` unchanged.
+
+Reference (The Rust Reference 1.98.0, "Pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html>
+
+> "Shared references point to memory which is owned by some other value."
+> "Mutable references point to memory which is owned by some other value."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L826-L830>
+
+> "/// Semantically tail calls consists of two actions:
+> /// - pop of the current stack frame
+> /// - a call to the `func`, with the return address of the **current** caller
+> ///   - so that a `return` inside `func` returns to the caller of the caller
+> ///     of the function that is currently being executed"
+
+Justification: see `relocateRootCallerReferents`. Only the root frame addresses
+caller-owned referents as slots past its own locals (`foreignFrameSlot?` falls
+back to `Memory.callerLocals` only at depth `0`), so only a tail call that
+replaces the root frame can shadow them; a tail call inside an inline callee
+frame replaces a frame whose locals no other frame's slot indices depend on.
+
+Modeling assumption: the relocation runs after the frame teardown
+(`disableFrameBorrows`), so borrows of the popped frame's own locals are already
+dead and are not relocated.
+-/
+def tailCalleeEntryMemory
+    (callStack : List SavedCallerFrame)
+    (memAfterTeardown : Memory)
+    (nLocals nCallee : Nat) :
+    Memory :=
+  match callStack with
+  | .nil => relocateRootCallerReferents memAfterTeardown nLocals nCallee
+  | _ :: _ => memAfterTeardown
+
+/--
+At the modular root the tail callee is entered in the relocated memory.
+-/
+@[simp]
+theorem tailCalleeEntryMemory_nil
+    (memAfterTeardown : Memory)
+    (nLocals nCallee : Nat) :
+    tailCalleeEntryMemory .nil memAfterTeardown nLocals nCallee =
+      relocateRootCallerReferents memAfterTeardown nLocals nCallee :=
+  rfl
+
+/--
+Inside an inline callee frame the tail callee is entered in the torn-down
+memory unchanged.
+-/
+@[simp]
+theorem tailCalleeEntryMemory_cons
+    (caller : SavedCallerFrame)
+    (restStack : List SavedCallerFrame)
+    (memAfterTeardown : Memory)
+    (nLocals nCallee : Nat) :
+    tailCalleeEntryMemory (caller :: restStack) memAfterTeardown nLocals nCallee =
+      memAfterTeardown :=
+  rfl
 
 /--
 Extract `localDecls` from an optional active `CapturedMir` body, defaulting to
@@ -3183,14 +3948,15 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
     match target with
     | .none =>
       match
-        evalOperands
+        evalOperandsWithBodyCast
           localsAfterFunc
           argOps
           s.memory.borrows
           s.memory.globals
           bodyLayouts
           s.memory.callerLocals
-          (callStack := s.memory.callStack)
+          bodyLocalDecls
+          s.memory.callStack
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -3237,14 +4003,15 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
               (resumeExternalDivergingCall s locals' unwind)
     | .some targetBb =>
       match
-        evalOperands
+        evalOperandsWithBodyCast
           localsAfterFunc
           argOps
           s.memory.borrows
           s.memory.globals
           bodyLayouts
           s.memory.callerLocals
-          (callStack := s.memory.callStack)
+          bodyLocalDecls
+          s.memory.callStack
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -3295,6 +4062,38 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
 Evaluate a `TerminatorKind.tailCall` terminator, resolving direct or indirect
 function targets and polymorphic/trait-method callees via `lookupCallee`.
 
+- Function and argument operands are evaluated by `evalOperandWithBodyCast` /
+  `evalOperandsWithBodyCast` (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`).
+- For an in-table callee entered from the modular root
+  (`s.memory.callStack = .nil`), the caller-owned referents of the root frame
+  are relocated past the callee's frame before it is entered
+  (`tailCalleeEntryMemory`, i.e.
+  `relocateRootCallerReferents memAfterTeardown nLocals (length (initLocals calleeBody argVals))`,
+  `DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`); inside an inline callee frame
+  no relocation is needed.
+- `enterTailCalleeFrame` narrows the inherited unwind action for a callee that
+  cannot unwind (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`).
+- An external (out-of-table) callee is resumed by
+  `resumeExternalTailCallWithAbi` with the tail-calling state's root unwind
+  ceiling and the callee's unwind capability (`externalTargetCanUnwind`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function imported
+> or transmuted as a "C" function or function pointer)."
+
+Reference (The Rust Reference 1.98.0, "Pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html>
+
+> "Shared references point to memory which is owned by some other value."
+> "Mutable references point to memory which is owned by some other value."
+
+Justification: see `relocateRootCallerReferents`, `enterTailCalleeFrame`, and
+`resumeExternalTailCallWithAbi`. The frame teardown (`disableFrameBorrows`) runs
+first, so only borrows of memory owned outside the popped frame are relocated.
+
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L823-L839>
@@ -3323,14 +4122,15 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
   | .unsupported => MirStepNode.unsupported
   | .ok target localsAfterFunc =>
     match
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack)
+        bodyLocalDecls
+        s.memory.callStack
     with
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
@@ -3353,16 +4153,48 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
           match checkCalleeTargetCompatible target calleeBody (length argVals) with
           | false => MirStepNode.fail .ub
           | true =>
-            MirStepNode.step (enterTailCalleeFrame memAfterTeardown calleeBody argVals)
+            MirStepNode.step
+              (enterTailCalleeFrame
+                (tailCalleeEntryMemory
+                  s.memory.callStack
+                  memAfterTeardown
+                  nLocals
+                  (length (initLocals calleeBody argVals)))
+                calleeBody
+                argVals)
         | .none =>
           MirStepNode.extCall
             { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
               memory := memAfterTeardown }
-            resumeExternalTailCall
+            (resumeExternalTailCallWithAbi
+              s.memory.rootUnwindCeiling
+              (externalTargetCanUnwind target (operandTy bodyLocalDecls bodyLayouts func)))
 
 /--
 Evaluate basic-block `Terminator` `term` in `s`, producing the next
 `MirStepNode` transition.
+
+Opaque-cast root dispatch (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`): the
+`TerminatorKind.switchInt` discriminant, the `TerminatorKind.assert` condition,
+and `TerminatorKind.call` / `TerminatorKind.tailCall` function and argument
+operands are evaluated by `evalOperandWithBodyCast` / `evalOperandsWithBodyCast`
+(a moved pure `ProjectionElem.opaqueCast` chain de-initializes its local and is
+validated against the cast type; every other operand evaluates as before), and
+`TerminatorKind.drop` of a pure cast chain `(_l as T)` takes the whole-local arm
+(`stripLeadingOpaqueCast place.projection = .nil`). A cast chain followed by
+further projections takes the projected arm unchanged.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification: the cast "changes the place's type to the given one, and makes no
+other changes", so a terminator addressing `(_l as T)` addresses the whole
+local `_l`.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3394,14 +4226,15 @@ def evalTerminator
       | .some b => b.layouts
       | .none => emptyLayoutTable
     match
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         discr
         s.memory.borrows
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack)
+        (bodyLocalDeclsOf currentBody)
+        s.memory.callStack
     with
     | .ok (.scalar sc) locals' =>
       let target :=
@@ -3476,8 +4309,8 @@ def evalTerminator
     | .none => MirStepNode.fail .ub
     | .some .dead => MirStepNode.fail .ub
     | .some slot =>
-      match place.projection with
-      | .nil =>
+      match place.projection, stripLeadingOpaqueCast place.projection with
+      | .nil, _ =>
         match set? s.frame.locals place.local_ .uninit with
         | .some locals' =>
           MirStepNode.step {
@@ -3485,7 +4318,15 @@ def evalTerminator
             frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
           }
         | .none => MirStepNode.fail .ub
-      | _ :: _ =>
+      | .opaqueCast _ :: _, .nil =>
+        match set? s.frame.locals place.local_ .uninit with
+        | .some locals' =>
+          MirStepNode.step {
+            s with
+            frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+          }
+        | .none => MirStepNode.fail .ub
+      | _ :: _, _ =>
         match slot with
         | .init rootVal =>
           match readProjectedValue s.frame.locals rootVal place.projection with
@@ -3515,14 +4356,15 @@ def evalTerminator
     | .unsupported => MirStepNode.unsupported
     | .ok target localsAfterFunc =>
       match
-        evalOperands
+        evalOperandsWithBodyCast
           localsAfterFunc
           argOps
           s.memory.borrows
           s.memory.globals
           bodyLayouts
           s.memory.callerLocals
-          (callStack := s.memory.callStack)
+          bodyLocalDecls
+          s.memory.callStack
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -3610,14 +4452,15 @@ def evalTerminator
     | .unsupported => MirStepNode.unsupported
     | .ok target localsAfterFunc =>
       match
-        evalOperands
+        evalOperandsWithBodyCast
           localsAfterFunc
           argOps
           s.memory.borrows
           s.memory.globals
           bodyLayouts
           s.memory.callerLocals
-          (callStack := s.memory.callStack)
+          bodyLocalDecls
+          s.memory.callStack
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -3676,14 +4519,15 @@ def evalTerminator
       | .some b => b.layouts
       | .none => emptyLayoutTable
     match
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         cond
         s.memory.borrows
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack)
+        (bodyLocalDeclsOf currentBody)
+        s.memory.callStack
     with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0

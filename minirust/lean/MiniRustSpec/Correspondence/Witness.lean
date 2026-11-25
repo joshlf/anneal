@@ -13512,10 +13512,11 @@ theorem evalStmt_retag_scalar_noop (s : MachineState) (decls : List LocalDecl)
   · rename_i heq; rw [hTy] at heq; nomatch heq
   · rfl
 
-/-- Anneal's `Deinit` of a projected place whose root is initialized evaluates
-`deinitProjectedForLocal` (overwriting the projected sub-place with
-`Value.uninit`, or faulting on union/deref/invalid paths) and updates local `i`,
-matching MiniRust's `Statement::Deinit` (`paddedDeinitRead_anneal_ub`,
+/-- Anneal's `Deinit` of a genuinely projected place (`stripLeadingOpaqueCast (pe :: rest) ≠ []`,
+excluding pure `opaqueCast`-only views of the root local, which deinitialize the root slot to
+`LocalSlot.uninit`) whose root is initialized evaluates `deinitProjectedForLocal` (overwriting the
+projected sub-place with `Value.uninit`, or faulting on union/deref/invalid paths) and updates
+local `i`, matching MiniRust's `Statement::Deinit` (`paddedDeinitRead_anneal_ub`,
 `paddedDeinitRead_minirust_ub`). -/
 theorem evalStmt_deinit_proj_deinits (s : MachineState) (decls : List LocalDecl)
     (layouts : LayoutTable) (i : Nat) (pe : ProjectionElem) (rest : List ProjectionElem)
@@ -13523,12 +13524,20 @@ theorem evalStmt_deinit_proj_deinits (s : MachineState) (decls : List LocalDecl)
     (hs : s.frame.locals[i]? = some (.init rootVal))
     (hd : deinitProjectedForLocal s.frame.locals decls layouts i rootVal (pe :: rest) = .ok rootVal')
     (hset : Trusted.Sequence.set? s.frame.locals i (.init rootVal') = some newLocals)
+    (hnonempty : stripLeadingOpaqueCast (pe :: rest) ≠ [] := by decide)
     (hbor : s.memory.borrows = [] := by rfl)
     (hprot : s.memory.activeProtectors = [] := by rfl) :
     evalStmt s ⟨.deinit ⟨i, pe :: rest⟩, span⟩ decls layouts =
       MirStepNode.step (advanceStmt s newLocals) := by
   cases pe with
   | deref => simp [deinitProjectedForLocal] at hd
+  | opaqueCast ty =>
+    cases hstrip : stripLeadingOpaqueCast (ProjectionElem.opaqueCast ty :: rest) with
+    | nil => exact absurd hstrip hnonempty
+    | cons _ _ =>
+      simp [evalStmt, hstrip, Trusted.Sequence.get?, hs, hd, hset, hbor, hprot,
+        MirStepNode.step, advanceStmt]
+      cases hm : s.memory; simp_all
   | _ =>
     simp [evalStmt, Trusted.Sequence.get?, hs, hd, hset, hbor, hprot,
       MirStepNode.step, advanceStmt]
