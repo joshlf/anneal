@@ -33,8 +33,8 @@ Computable abstract transfer functions for MIR constants (`evalConstLitAbs`),
 operands (`evalOperandAbs`), rvalues (`evalRvalueAbs`), statements
 (`stepStmtAbs`), and terminators (`stepTermAbs`) over `MirAbsEnv`, together
 with kernel-checked one-step fault-freedom and soundness theorems stated
-directly against `Trusted.Rustc.V2026_06_01.MirSemantics.{evalOperand,
-evalRvalue, evalStmt, evalTerminator}`.
+directly against `evalOperand`, `evalRvalue`, `evalStmt`, and `evalTerminator`
+of `Trusted.Rustc.V2026_06_01.MirSemantics`.
 
 Supported fragment (everything else has no abstract successor, so no
 certificate passes if a reachable block uses it):
