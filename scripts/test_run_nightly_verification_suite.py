@@ -6493,11 +6493,12 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             spy.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(spy_log))}\nexit 0\n', encoding="utf-8")
             spy.chmod(0o755)
 
-            # The shim is a strict single-pass allowlist: `--version`, `--user` read-only queries,
-            # and `--user kill` of concrete `anneal-run-<digits>.scope` units reach the real
-            # `systemctl`, argv intact; option-value desyncs, repeated `kill`, missing `--user`,
-            # globs, and every mutating call are no-op exit 0. Also verify idempotency (a second
-            # install into the same `shim_dir` does not overwrite the shim with a self-exec loop).
+            # The shim forwards exactly two argv shapes, positionally: the `systemd --user`
+            # liveness query, and `kill -s SIGTERM|SIGKILL` of one `anneal-run-<PPID>-<digits>.scope`
+            # owned by its parent process (here: this test process, the shim's caller). Every
+            # other call, including kills of another process's live build scope, is a no-op
+            # exit 0. A second install into the same `shim_dir` must not overwrite the shim with
+            # a self-exec loop.
             probe_env = {"PATH": os.pathsep.join([os.fspath(spy_bin), "/usr/bin", "/bin"])}
             suite._install_probe_systemctl_shim(probe_env, root / "shim")
             shim_before = (root / "shim/systemctl").read_text(encoding="utf-8")
@@ -6505,61 +6506,76 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual((root / "shim/systemctl").read_text(encoding="utf-8"), shim_before)
             self.assertEqual(probe_env["PATH"].split(os.pathsep)[0], os.fspath(root / "shim"))
             self.assertEqual(shutil.which("systemctl", path=probe_env["PATH"]), os.fspath(root / "shim/systemctl"))
-            for argv in (
+            me = os.getpid()
+            own = f"anneal-run-{me}-123456789.scope"
+            forwarded = [
+                ["--user", "show", "-p", "Version", "--value"],
+                ["--user", "kill", "-s", "SIGTERM", own],
+                ["--user", "kill", "-s", "SIGKILL", own],
+            ]
+            swallowed = [
                 ["--user", "daemon-reload"],
                 ["daemon-reload"],
                 ["--user", "daemon-reexec"],
-                ["--user", "kill", "-s", "SIGKILL", "anneal-lsp-daemon-123.scope"],
-                ["--user", "show", "-p", "Version", "--value"],
-                ["--user", "kill", "-s", "SIGTERM", "anneal-run-999.scope"],
-                # Mutating verbs a denylist would miss.
                 ["--user", "restart", "anneal-lean-lsp.service"],
                 ["--user", "stop", "anneal-workloads.slice"],
                 ["--user", "start", "evil.service"],
                 ["--user", "set-environment", "LEAN_NUM_THREADS=3"],
                 ["--user", "reset-failed"],
                 ["--user", "enable", "--now", "x.service"],
-                # Option-value desync bypasses (`-p`/`-s`/`-H` + `show` before a mutating verb).
+                ["--user", "list-units"],
+                ["--user", "--version"],
+                ["--version"],
+                # Option-placement / value-desync tricks around the allowed shapes.
                 ["--user", "-p", "show", "daemon-reload"],
                 ["--user", "-s", "show", "kill", "anneal-lsp-daemon-1.scope"],
                 ["--user", "-H", "show", "stop", "anneal-workloads.slice"],
-                ["--user", "-pshow", "daemon-reload"],
                 ["--user", "--", "show"],
-                ["--user", "show", "-p"],
-                ["--user", "show", "-s", "SIGKILL"],
-                ["--user", "--version", "stop", "evil.service"],
-                # Kills of anything but `--user` + concrete `anneal-run-<digits>.scope` units.
+                ["--user", "show", "-p", "Version"],
+                ["--user", "show", "-p", "Version", "--value", "stop"],
+                ["--user", "show", "-p", "Version", "--value=x"],
+                ["show", "-p", "Version", "--value", "--user"],
+                ["--user show -p Version --value"],
+                # Kills of anything but one own, concrete scope.
+                ["--user", "kill", "-s", "SIGKILL", f"anneal-run-{me + 1}-5.scope"],
+                ["--user", "kill", "-s", "SIGKILL", f"anneal-run-{me}0-5.scope"],
+                ["--user", "kill", "-s", "SIGKILL", "anneal-run-999.scope"],
                 ["--user", "kill", "-s", "SIGKILL", "anneal-run-*.scope"],
-                ["--user", "kill", "-s", "SIGKILL", "anneal-run-1*.scope"],
-                ["--user", "kill", "-s", "SIGKILL", "anneal-run-.scope"],
-                ["--user", "kill", "-s", "SIGKILL", "anneal-run-1-.scope"],
-                ["--user", "kill", "-s", "SIGKILL", "anneal-run-1.scope", "anneal-lsp-daemon-1.scope"],
+                ["--user", "kill", "-s", "SIGKILL", f"anneal-run-{me}-*.scope"],
+                ["--user", "kill", "-s", "SIGKILL", f"anneal-run-{me}-.scope"],
+                ["--user", "kill", "-s", "SIGKILL", f"anneal-run-{me}-5x.scope"],
+                ["--user", "kill", "-s", "SIGKILL", f"anneal-run-{me}-1-2.scope"],
+                ["--user", "kill", "-s", "SIGKILL", f"anneal-run-{me}-5.service"],
+                ["--user", "kill", "-s", "SIGHUP", own],
+                ["--user", "kill", "-s", "SIGKILL", own, "anneal-lsp-daemon-1.scope"],
+                ["--user", "kill", "-s", "SIGKILL", "--", own],
+                ["--user", "kill", "--signal=SIGKILL", own],
+                ["--user", "kill", "-s", "SIGKILL", "anneal-lsp-daemon-123.scope"],
                 ["--user", "kill", "-s", "SIGKILL", "user@1000.service"],
-                ["--user", "kill", "--signal=SIGKILL"],
-                ["--user", "kill", "--signal=", "anneal-run-1.scope"],
-                ["--user", "kill", "-s", "anneal-run-1.scope"],
-                ["--user", "kill", "-s", "-s", "anneal-lsp-daemon-1.scope", "anneal-run-1.scope"],
-                ["--user", "kill", "kill", "anneal-run-1.scope"],
-                ["--user", "kill", "-p", "Version", "-s", "SIGKILL", "anneal-run-1.scope"],
-                ["kill", "-s", "SIGKILL", "anneal-run-1.scope"],
-                ["show", "-p", "Version", "--value"],
-                ["--user", "--version"],
-                ["--version"],
-                ["--user", "kill", "--signal=SIGKILL", "--kill-whom=all", "anneal-run-2-3.scope"],
-                ["--user", "kill", "-s", "SIGKILL", "--", "anneal-run-42.scope"],
-            ):
+                ["kill", "-s", "SIGKILL", own, "--user"],
+            ]
+            for argv in forwarded + swallowed:
                 res = subprocess.run(["systemctl", *argv], env=probe_env, capture_output=True, check=False, timeout=10)
                 self.assertEqual(res.returncode, 0, argv)
+            self.assertEqual(spy_log.read_text(encoding="utf-8").splitlines(), [" ".join(a) for a in forwarded])
+            # As a wrapper issues it (`subprocess.run([systemctl_bin, ...])` naming its own pid),
+            # the scope kill reaches `systemctl`; the same call naming another pid does not.
+            spy_log.unlink()
+            caller = root / "caller.py"
+            caller.write_text(
+                "import os, shutil, subprocess\n"
+                "bin_ = shutil.which('systemctl')\n"
+                "for pid in (os.getpid(), os.getpid() + 1):\n"
+                "    subprocess.run([bin_, '--user', 'kill', '-s', 'SIGKILL', f'anneal-run-{pid}-42.scope'], check=True)\n"
+                "print(os.getpid())\n",
+                encoding="utf-8",
+            )
+            res = subprocess.run(
+                [sys.executable, "-B", os.fspath(caller)], env=probe_env, capture_output=True, text=True, check=True, timeout=30
+            )
             self.assertEqual(
                 spy_log.read_text(encoding="utf-8").splitlines(),
-                [
-                    "--user show -p Version --value",
-                    "--user kill -s SIGTERM anneal-run-999.scope",
-                    "--user --version",
-                    "--version",
-                    "--user kill --signal=SIGKILL --kill-whom=all anneal-run-2-3.scope",
-                    "--user kill -s SIGKILL -- anneal-run-42.scope",
-                ],
+                [f"--user kill -s SIGKILL anneal-run-{res.stdout.strip()}-42.scope"],
             )
 
             # When `PATH` is unset (`env={}` / `env={"HOME": ...}`), the shim preserves `os.defpath`

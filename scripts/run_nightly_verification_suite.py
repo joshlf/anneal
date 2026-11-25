@@ -5371,93 +5371,31 @@ _WRAPPER_EXEC_CHECK_FLAGS: tuple[tuple[str, ...], ...] = (
     ("--mode", "file", "--no-slot-lock"),
     ("--mode", "build", "--concurrency", "1", "--no-slot-lock"),
 )
-# `systemctl` shim placed first on the probe's `PATH`, a strict single-pass allowlist:
-# every option (and its arity) is validated against an explicit table so option-value
-# desyncs (e.g. `--user -p show daemon-reload`, `--user -H show stop ...`, or
-# `--user kill -s -s evil.scope anneal-run-1.scope`) can never smuggle a mutating verb or
-# target past the shim. Forwards to the real `systemctl` only:
-# - `--version` / `--user --version` with no verb or other options,
-# - `--user` read-only queries (`show`, `status`, `is-*`, `cat`, `list-*`) with read-only
-#   options only, and
-# - `--user kill` (seen once, with signal / `--kill-whom` options only) targeting one or
-#   more concrete `anneal-run-<digits/dashes>.scope` transient units (no globs or other
-#   unit names).
-# Every other call exits 0 without effect.
+# `systemctl` shim placed first on the probe's `PATH`. It parses nothing: it forwards to
+# the real `systemctl` exactly the two argv shapes `anneal-lean-run` issues while running
+# a command, matched positionally with an exact argument count,
+#   `--user show -p Version --value`                 (is `systemd --user` live?)
+#   `--user kill -s SIGTERM|SIGKILL anneal-run-<PPID>-<digits>.scope`
+# where `<PPID>` is the shim's parent, i.e. the probed wrapper process itself (it names
+# its transient scopes `anneal-run-<pid>-<monotonic_ns>.scope`), so only scopes that
+# wrapper opened can be signalled, never another live build's scope. Every other call
+# (`daemon-reload`, `daemon-reexec`, any `start` / `stop` / `restart`, LSP-scope or glob
+# kills, option-placement tricks, ...) exits 0 without effect: a capability probe can
+# never reload the live user manager, touch its units, or evict warm LSP daemons.
 _WRAPPER_PROBE_SYSTEMCTL_SHIM = (
     "#!/bin/sh\n"
-    "user=0\n"
-    "ver=0\n"
-    'verb=""\n'
-    'expect=""\n'
-    "end_opts=0\n"
-    "units=0\n"
-    "saw_ro_opt=0\n"
-    "saw_kill_opt=0\n"
-    'for arg in "$@"; do\n'
-    '  if [ -n "$expect" ]; then\n'
-    '    case "$expect" in\n'
-    '      sig) case "$arg" in ""|-*|*[!A-Za-z0-9_+-]*) exit 0 ;; esac ;;\n'
-    '      whom) case "$arg" in main|control|all) ;; *) exit 0 ;; esac ;;\n'
-    "    esac\n"
-    '    expect=""\n'
-    "    continue\n"
-    "  fi\n"
-    '  if [ "$end_opts" -eq 0 ]; then\n'
-    '    case "$arg" in\n'
-    '      --) [ -z "$verb" ] && exit 0; end_opts=1; continue ;;\n'
-    "      --user) user=1; continue ;;\n"
-    "      --version) ver=1; continue ;;\n"
-    "      --no-pager|--no-legend|--quiet|-q|--plain|--full|-l|--value|--all|-a|--failed)\n"
-    "        saw_ro_opt=1; continue ;;\n"
-    "      -p|--property|-t|--type|--state|-o|--output|-n|--lines)\n"
-    '        saw_ro_opt=1; expect="ro"; continue ;;\n'
-    "      --property=*|--type=*|--state=*|--output=*|--lines=*)\n"
-    "        saw_ro_opt=1; continue ;;\n"
-    "      -s|--signal)\n"
-    '        saw_kill_opt=1; expect="sig"; continue ;;\n'
-    "      --signal=*)\n"
-    "        saw_kill_opt=1\n"
-    '        case "${{arg#--signal=}}" in ""|-*|*[!A-Za-z0-9_+-]*) exit 0 ;; esac\n'
-    "        continue ;;\n"
-    "      --kill-whom)\n"
-    '        saw_kill_opt=1; expect="whom"; continue ;;\n'
-    "      --kill-whom=*)\n"
-    "        saw_kill_opt=1\n"
-    '        case "${{arg#--kill-whom=}}" in main|control|all) ;; *) exit 0 ;; esac\n'
-    "        continue ;;\n"
-    "      -*) exit 0 ;;\n"
-    "    esac\n"
-    "  fi\n"
-    '  if [ -z "$verb" ]; then\n'
-    '    verb="$arg"\n'
-    "    continue\n"
-    "  fi\n"
-    '  if [ "$verb" = "kill" ]; then\n'
-    '    case "$arg" in\n'
-    "      anneal-run-[0-9]*.scope)\n"
-    '        mid="${{arg#anneal-run-}}"\n'
-    '        mid="${{mid%.scope}}"\n'
-    '        case "$mid" in\n'
-    '          ""|*[!0-9-]*|*-) exit 0 ;;\n'
-    "          *) units=$((units + 1)) ;;\n"
-    "        esac ;;\n"
-    "      *) exit 0 ;;\n"
-    "    esac\n"
-    "  fi\n"
-    "done\n"
-    '[ -n "$expect" ] && exit 0\n'
-    'if [ -z "$verb" ]; then\n'
-    '  [ "$ver" -eq 1 ] && [ "$saw_ro_opt" -eq 0 ] && [ "$saw_kill_opt" -eq 0 ] && [ "$end_opts" -eq 0 ] && exec {real} "$@"\n'
-    "  exit 0\n"
+    'if [ "$#" -eq 5 ] && [ "$1" = --user ] && [ "$2" = show ] && [ "$3" = -p ] \\\n'
+    '    && [ "$4" = Version ] && [ "$5" = --value ]; then\n'
+    '  exec @REAL@ "$@"\n'
     "fi\n"
-    '[ "$user" -eq 1 ] || exit 0\n'
-    '[ "$ver" -eq 0 ] || exit 0\n'
-    'case "$verb" in\n'
-    "  show|status|is-active|is-enabled|is-failed|is-system-running|cat|list-units|list-unit-files)\n"
-    '    [ "$saw_kill_opt" -eq 0 ] && exec {real} "$@" ;;\n'
-    "  kill)\n"
-    '    [ "$saw_ro_opt" -eq 0 ] && [ "$units" -gt 0 ] && exec {real} "$@" ;;\n'
-    "esac\n"
+    'if [ "$#" -eq 5 ] && [ "$1" = --user ] && [ "$2" = kill ] && [ "$3" = -s ]; then\n'
+    '  case "$4" in SIGTERM|SIGKILL) ;; *) exit 0 ;; esac\n'
+    '  case "$5" in "anneal-run-$PPID-"*.scope) ;; *) exit 0 ;; esac\n'
+    '  ns="${5#"anneal-run-$PPID-"}"\n'
+    '  ns="${ns%.scope}"\n'
+    '  case "$ns" in ""|*[!0-9]*) exit 0 ;; esac\n'
+    '  exec @REAL@ "$@"\n'
+    "fi\n"
     "exit 0\n"
 )
 # Most probe output read back (a sane wrapper prints well under 4 KiB). Output exceeding
@@ -5597,7 +5535,9 @@ def _install_probe_systemctl_shim(probe_env: dict[str, str], shim_dir: Path) -> 
         return
     try:
         shim_dir.mkdir(mode=0o700, exist_ok=True)
-        shim.write_text(_WRAPPER_PROBE_SYSTEMCTL_SHIM.format(real=shlex.quote(os.path.abspath(real))), encoding="utf-8")
+        shim.write_text(
+            _WRAPPER_PROBE_SYSTEMCTL_SHIM.replace("@REAL@", shlex.quote(os.path.abspath(real))), encoding="utf-8"
+        )
         shim.chmod(0o700)
     except OSError:
         return
@@ -5679,8 +5619,9 @@ def _wrapper_honors_lean_num_threads(
     Runs, with `LEAN_NUM_THREADS=1`, `ANNEAL_LSP_NO_EVICT=1`, an isolated non-existent
     `ANNEAL_LSP_SOCKET`, scrubbed outer-scope and resource-override `ANNEAL_*` env vars,
     private temporary `XDG_CONFIG_HOME` / `XDG_RUNTIME_DIR`, and a `PATH`-first
-    allowlisting `systemctl` shim (`_WRAPPER_PROBE_SYSTEMCTL_SHIM`: read-only queries and
-    kills of the wrapper's own `anneal-run-*.scope`s only), each bounded by `timeout_sec`:
+    exact-argv `systemctl` shim (`_WRAPPER_PROBE_SYSTEMCTL_SHIM`: the `systemd --user`
+    liveness query and kills of the wrapper's own `anneal-run-<pid>-*.scope`s only), each
+    bounded by `timeout_sec`:
     1. `<wrapper> --mode build --concurrency 1 --probe` (text): a non-zero exit, a
        timeout, oversized output, or any reported `LEAN_NUM_THREADS=<T>` with `<T> != 1`
        -> `False`;
