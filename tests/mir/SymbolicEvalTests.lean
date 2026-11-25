@@ -4753,6 +4753,10 @@ d. **Periodic-tick traces**: `s17PeriodicTrace` replays the exact
 e. **Open-term loop**: `s17SymLoopPred_holds` / `_refutes` combine (c) with the
    `switchInt` back-edge loop (three `loop -> mid -> leaf` round trips with `x`
    symbolic in caller slot `1`).
+f. **Modular external calls with computed arguments** (§17f): forced
+   `req.args` / `expectedRet` in `checkMirRustModularPinnedSpecLoop` via
+   `dischargeRustModularContractAuto` and `dischargeRustModularBoundedRange1Auto`,
+   with out-of-contract and wrong-`defPath` `= false` canaries.
 -/
 private def s17U32MutRefTy : Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
 private def s17UnitTy : Ty := { kind := .tuple [], layoutIdx := 0 }
@@ -5370,6 +5374,135 @@ theorem s17SymLoopPred_periodicTrace (x : Nat) :
           [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] s17Callees)) [] =
       [(2, 10), (2, 40), (2, 72), (2, 74), (2, 104)] :=
   rfl
+
+/-! ### 17f. Modular external calls with computed (thunked) arguments
+
+`s17ModCallerMir` passes a *computed* argument (`x + 3`, an arithmetic thunk over
+the running state) to the uninterpreted external callee `sym_test::s17_ext`, and
+then computes on the contract-pinned return value. `checkMirRustModularPinnedSpecLoop`
+must force `req.args` (`mapStrictList (strictValue 16)`) before feeding it to the
+callee `requires` / `ensures` pin extraction, and force the extracted
+`expectedRet` (`strictScalarInt`) before resuming the continuation. Covers both
+`dischargeRustModularContractAuto` (pinned caller) and
+`dischargeRustModularBoundedRange1Auto` (bounded caller, `x < 4`), which had no
+`by rfl` regression coverage before. -/
+
+/-- External callee `requires`: `a < 16`. -/
+def s17ExtReqMir : CapturedMir :=
+  mkMirBody "sym_test::req_s17_ext" 1
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .lt (.copy ⟨1, []⟩) (u32ConstOperand 16))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.requires "sym_test::s17_ext")
+
+/-- External callee `ensures`: `ret == 42`. -/
+def s17ExtEnsMir : CapturedMir :=
+  mkMirBody "sym_test::ens_s17_ext" 2
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨2, []⟩) (u32ConstOperand 42))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.ensures "sym_test::s17_ext")
+
+def s17ExtContract : MirCallContract where
+  pre req :=
+    And (req.defPath = "sym_test::s17_ext")
+      (And (Trusted.Sequence.length req.args = 1) (MirBoolPredicateHolds s17ExtReqMir req.args))
+  post req ans :=
+    ∃ retVal,
+      And (ans = .returned retVal req.memory)
+        (MirBoolPredicateHolds s17ExtEnsMir (req.args ++ [retVal]))
+
+/-- `fn s17_mod_caller(x: u32) -> u32 { s17_ext(x + 3) + 1 }` (unchecked adds). -/
+def s17ModCallerMir : CapturedMir :=
+  mkMirBody "sym_test::s17_mod_caller" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy, mkDecl .mut u32MirTy]
+    [ { statements :=
+          [ mkStmt (.storageLive 2)
+          , mkStmt (.assign ⟨2, []⟩ (.binaryOp .add (.copy ⟨1, []⟩) (u32ConstOperand 3)))
+          , mkStmt (.storageLive 3) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_ext")
+            [.move ⟨2, []⟩] ⟨3, []⟩ (.some 1) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .add (.copy ⟨3, []⟩) (u32ConstOperand 1)))
+          , mkStmt (.storageDead 3)
+          , mkStmt (.storageDead 2) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- Caller `ensures`: `ret == 43`. -/
+def s17ModEnsMir : CapturedMir :=
+  mkMirBody "sym_test::ens_s17_mod_caller" 2
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨2, []⟩) (u32ConstOperand 43))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.ensures "sym_test::s17_mod_caller")
+
+/-- Caller `requires` for the bounded variant: `x < 4`. -/
+def s17ModBoundReqMir : CapturedMir :=
+  mkMirBody "sym_test::req_s17_mod_caller" 1
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .lt (.copy ⟨1, []⟩) (u32ConstOperand 4))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.requires "sym_test::s17_mod_caller")
+
+/-- Direct checker receipts: the forced `req.args = [x + 3]` satisfies the callee
+`requires` and pins `ret = 42` (`x = 10`); the out-of-contract argument `x = 13`
+(`req.args = [16]`) violates the callee `requires`, so the modular check fails. -/
+theorem s17ModCaller_check :
+    checkMirRustModularPinnedSpec 32 64 s17ModCallerMir (.some s17ModEnsMir)
+        "sym_test::s17_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir [.scalar ⟨10, 4⟩] = true ∧
+    checkMirRustModularPinnedSpec 32 64 s17ModCallerMir (.some s17ModEnsMir)
+        "sym_test::s17_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir [.scalar ⟨13, 4⟩] = false ∧
+    checkMirRustModularPinnedSpec 32 64 s17ModCallerMir (.some s17ModEnsMir)
+        "sym_test::s17_wrong_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir [.scalar ⟨10, 4⟩] = false :=
+  ⟨rfl, rfl, rfl⟩
+
+theorem s17ModCallerPinned_verified :
+    ModularVerificationResult
+      { body := s17ModCallerMir
+        envAssumed := s17ExtContract.holdsOn
+        pre := fun args mem =>
+          And
+            (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ReqMir args))
+            (mem = (initMachineState s17ModCallerMir args).memory)
+        post := fun args _ ret _ => MirBoolPredicateHolds s17ModEnsMir (args ++ [ret])
+        callees := [] } :=
+  dischargeRustModularContractAuto
+    s17ExtContract s17ModCallerMir _ _ 32 64
+    (.some s17ReqMir) (.some s17ModEnsMir)
+    "sym_test::s17_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir []
+
+theorem s17ModCallerBounded_verified :
+    ModularVerificationResult
+      { body := s17ModCallerMir
+        envAssumed := s17ExtContract.holdsOn
+        pre := fun args mem =>
+          And
+            (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ModBoundReqMir args))
+            (mem = (initMachineState s17ModCallerMir args).memory)
+        post := fun args _ ret _ => MirBoolPredicateHolds s17ModEnsMir (args ++ [ret])
+        callees := [] } :=
+  dischargeRustModularBoundedRange1Auto
+    s17ExtContract s17ModCallerMir _ _ 32 64
+    s17ModBoundReqMir (.some s17ModEnsMir)
+    "sym_test::s17_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir []
+
+theorem s17ModCallerBounded_nonVacuous :
+    ∃ args mem, (fun args mem =>
+      And
+        (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ModBoundReqMir args))
+        (mem = (initMachineState s17ModCallerMir args).memory)) args mem :=
+  ⟨[.scalar ⟨3, 4⟩], _, ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree s17ModBoundReqMir _⟩, rfl⟩
 
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
