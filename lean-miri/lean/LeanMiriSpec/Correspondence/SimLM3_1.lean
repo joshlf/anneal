@@ -1993,7 +1993,7 @@ theorem evalBinOp_offset_inbounds_simulation
     (hptr_slot : get? s.frame.locals ptrLoc = some (.init (.ptr ptrVal 8)))
     (hoff_slot : get? s.frame.locals offLoc = some (.init (.scalar offsetSc)))
     (hsc_sz : offsetSc.sizeBytes = 8 := by rfl)
-    (hnot_dis : ∀ e, lookupBorrow s.memory.borrows ptrVal.tag = some e → e.perm ≠ .disabled :=
+    (_hnot_dis : ∀ e, lookupBorrow s.memory.borrows ptrVal.tag = some e → e.perm ≠ .disabled :=
       by intro _ h; cases h)
     (hbound : ∀ b, ptrAllocByteBound? s.frame.locals s.memory [] emptyLayoutTable ptrVal = some b →
       localAlloc.allocation.byteSize.bytes.toNat ≤ b ∧ b < 2 ^ 63 :=

@@ -1519,7 +1519,7 @@ theorem evalProjection_constantIndex_simulation
         hget_seq
       cases fromEnd <;>
         (simp only [Bool.false_eq_true, ↓reduceIte] at hget_idx;
-         simp (config := { zetaDelta := true }) only [readProjectedValue, valueContainsUninit, hlen_seq, hble,
+         simp (config := { zetaDelta := true }) only [readProjectedValue, hlen_seq, hble,
            Nat.sub_eq, hget_idx, hval_eq])
     · simp only [annealProjectList, Miri.Interpreter.project, hnot_ovf, ↓reduceIte,
         Miri.Interpreter.projectConstantIndex, hlen_miri, bind, Except.bind, hnot_lt_min]
@@ -2383,7 +2383,7 @@ theorem evalRvalue_len_array_simulation
               intro hall_es
               obtain ⟨sc, h0⟩ := hall_es 0 hd rfl
               subst h0
-              simp [valueListContainsUninit, valueContainsUninit]
+              simp [valueListContainsUninit]
               exact ih (fun k ev hk => hall_es (k + 1) ev hk)
           exact aux elems hall
         rw [hwf.ptr_bytes, hbor, hcaller]

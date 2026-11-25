@@ -31,17 +31,27 @@ Profiles (`--profile`):
                and `cargo test --workspace --lib --bins --locked`.
   nightly      Runs `quick` plus `check_trusted.py --self-test`, a `lake build +<Module>`
                of every workspace module imported by the standalone `tests/mir/*` Lean
-               suites, those suites, `lake build Correspondence`, `lake build MiniRustSpec`,
-               `lake --dir examples build Miri` (the vendored Miri library) followed by
+               suites, those suites, `lake build Correspondence`, the bounded `MiniRustSpec`
+               wave `lake build MiniRustSpec.Correspondence.MiniRustEval
+               MiniRustSpec.Correspondence.AnnealEval` followed by `lake build MiniRustSpec`,
+               `lake --dir examples build Miri` (the vendored Miri library), the bounded
+               `LeanMiriSpec` wave `lake --dir examples build
+               LeanMiriSpec.Correspondence.Translate LeanMiriSpec.Correspondence.SimLM2_1
+               LeanMiriSpec.Correspondence.SimLM3_1` followed by
                `lake --dir examples build LeanMiriSpec`, domain crate integration tests,
                `cargo-anneal` end-to-end suites, and real-world Fuchsia/Fxfs example
                crate verifications.
 
 Step environment: every step runs with `LAKE_ARTIFACT_CACHE=true` and
-`LAKE_RESTORE_ARTIFACTS=true`, and `lake_build_minirust_spec` and
-`lake_build_lean_miri_spec` each with `LEAN_NUM_THREADS=1` when its effective RAM ceiling
-is below 10 GiB (`lake_build_examples_miri_vendor` and every other step keep their
-thread count). Before their first step, `quick` and
+`LAKE_RESTORE_ARTIFACTS=true`, and the `LOW_RAM_SINGLE_THREAD_STEPS`
+(`lake_build_minirust_spec_core`, `lake_build_minirust_spec`,
+`lake_build_lean_miri_spec_core`, `lake_build_lean_miri_spec`) each with
+`LEAN_NUM_THREADS=1` when its effective RAM ceiling is below 10 GiB
+(`lake_build_examples_miri_vendor` and every other step keep their thread count).
+Wrapped steps run under the `anneal-lean-run` `_resolve_anneal_lean_run` picks: an
+ambient `PATH` / `~/.local/bin` wrapper that does not keep a caller's
+`LEAN_NUM_THREADS=1` (`_wrapper_honors_lean_num_threads`) is skipped for the in-repo
+`scripts/anneal-lean-run`. Before their first step, `quick` and
 `nightly` remove stale Lean build artifacts from `.lake/build/lib/lean/` and
 `examples/.lake/build/lib/lean/` (`clean_stale_oleans`) and report them on stderr.
 
@@ -4971,11 +4981,18 @@ LAKE_ARTIFACT_CACHE_ENV: dict[str, str] = {
 # `lake_build_lean_miri_spec` alone and is kept for callers that import it.)
 LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB = 10240
 # Steps `_build_step_env` runs with `LEAN_NUM_THREADS=1` below that threshold: the
-# `MiniRustSpec` closure and the `LeanMiriSpec` modules. The vendored `Miri` library
-# under them is built by `lake_build_examples_miri_vendor`, which is deliberately not
-# listed and stays multi-threaded.
+# `MiniRustSpec` closure and the `LeanMiriSpec` modules, each built in two topological
+# waves (a bounded `*_core` prebuild of the heaviest modules, then the rest of the
+# library on top of its `.olean`s). The vendored `Miri` library under `LeanMiriSpec` is
+# built by `lake_build_examples_miri_vendor`, which is deliberately not listed and stays
+# multi-threaded.
 LOW_RAM_SINGLE_THREAD_STEPS: frozenset[str] = frozenset(
-    ("lake_build_minirust_spec", "lake_build_lean_miri_spec")
+    (
+        "lake_build_minirust_spec_core",
+        "lake_build_minirust_spec",
+        "lake_build_lean_miri_spec_core",
+        "lake_build_lean_miri_spec",
+    )
 )
 
 # Sentinel distinguishing "caller omitted `effective_ram_mib`" from an explicit
@@ -5299,8 +5316,217 @@ def _ensure_toolchain_path(env: dict[str, str], *, use_ambient_home: bool = True
 def _is_executable_file(path: Path) -> bool:
     try:
         return path.is_file() and os.access(path, os.X_OK)
-    except OSError:
+    except (OSError, ValueError):
         return False
+
+
+# `_wrapper_honors_lean_num_threads` memo. Keyed by the wrapper's absolute path, the
+# identity (`st_dev`, `st_ino`) and timestamps (`st_mtime_ns`, `st_ctime_ns`) of the file
+# it resolves to, its size and SHA-256 (a same-size rewrite within one coarse kernel
+# timestamp tick, or an `os.utime`-restored mtime, still changes the key), a digest of
+# the probe environment, and the timeout, so repeated `build_suite_steps()` calls spawn
+# no redundant probe subprocesses while any edit to the wrapper is re-probed.
+_WRAPPER_THREAD_PROBE_CACHE: dict[tuple[Any, ...], bool] = {}
+# Environment the probe never inherits: re-entrancy pass-through (an ambient
+# `ANNEAL_LEAN_RUN_IN_SCOPE=1`, e.g. when the suite itself runs under `anneal-lean-run`,
+# would make any wrapper exec the command untouched and so "honor" the caller's
+# `LEAN_NUM_THREADS`) and the config/runtime dirs the probe replaces with private ones.
+_WRAPPER_PROBE_SCRUBBED_ENV: frozenset[str] = frozenset(
+    ("ANNEAL_LEAN_RUN_IN_SCOPE", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR")
+)
+# `--probe` text banner: `Thread Budget (-j) : <B> threads (LEAN_NUM_THREADS=<T>)`.
+_WRAPPER_PROBE_THREAD_BANNER_RE = re.compile(
+    r"Thread Budget \(-j\)\s*:\s*(\S+)\s+threads?\s*\(LEAN_NUM_THREADS=([^)\n]*)\)"
+)
+# Every `LEAN_NUM_THREADS=<v>` the probe text mentions, banner or not.
+_WRAPPER_PROBE_LEAN_THREADS_RE = re.compile(r"LEAN_NUM_THREADS\s*=\s*([^\s),;]*)")
+# Child the execution check runs under the wrapper: prints the `LEAN_NUM_THREADS` it got.
+_WRAPPER_EXEC_THREADS_DUMP = "import os, sys; sys.stdout.write(os.environ.get('LEAN_NUM_THREADS', ''))"
+# Most probe output read back (a sane wrapper prints well under 4 KiB).
+_WRAPPER_PROBE_MAX_OUTPUT_BYTES = 1 << 20
+# Most bytes of an existing `anneal-workloads.slice` unit seeded into the probe config.
+_WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES = 64 * 1024
+
+
+def _run_wrapper_probe_cmd(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    cwd: Path,
+    timeout_sec: float,
+) -> tuple[int, str] | None:
+    """Run one wrapper probe command; return `(returncode, stdout)` or `None` on a
+    timeout or launch failure.
+
+    The child gets its own session, `stdin` from `/dev/null`, `stderr` discarded, and
+    `stdout` in a regular file under `cwd` rather than a pipe, so a grandchild that
+    outlives the wrapper (an `anneal-lean-run` runs its command in a separate process
+    group) can never stall the read. On timeout the wrapper's process group gets `SIGTERM`
+    (which `anneal-lean-run` forwards to the group it created), then `SIGKILL`.
+    """
+    try:
+        with tempfile.TemporaryFile(mode="w+b", dir=os.fspath(cwd)) as out_fh:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=out_fh,
+                stderr=subprocess.DEVNULL,
+                env=dict(env),
+                cwd=os.fspath(cwd),
+                start_new_session=True,
+            )
+            try:
+                returncode = proc.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                _signal_process_group(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+                _signal_process_group(proc.pid, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+                return None
+            out_fh.seek(0)
+            data = out_fh.read(_WRAPPER_PROBE_MAX_OUTPUT_BYTES)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return returncode, data.decode("utf-8", errors="replace")
+
+
+def _seed_probe_workloads_slice_unit(env: Mapping[str, str], config_dir: Path) -> None:
+    """Copy the caller's existing `anneal-workloads.slice` user unit into the probe's
+    private `XDG_CONFIG_HOME`, so a wrapper that reconciles the slice before running a
+    command finds it up to date there and does not `systemctl --user daemon-reload`."""
+    raw_cfg = env.get("XDG_CONFIG_HOME", "").strip()
+    if raw_cfg:
+        cfg_base = Path(raw_cfg)
+    else:
+        raw_home = env.get("HOME", "").strip()
+        if not raw_home:
+            return
+        cfg_base = Path(raw_home) / ".config"
+    src = cfg_base / "systemd" / "user" / "anneal-workloads.slice"
+    try:
+        st = os.stat(src)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _WRAPPER_PROBE_MAX_SLICE_UNIT_BYTES:
+            return
+        content = src.read_bytes()
+        dest = config_dir / "systemd" / "user" / "anneal-workloads.slice"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+    except (OSError, ValueError):
+        return
+
+
+def _probe_wrapper_thread_honoring(abs_path: str, probe_base: Mapping[str, str], env: Mapping[str, str], timeout_sec: float) -> bool:
+    """Uncached body of `_wrapper_honors_lean_num_threads` (see there)."""
+    with tempfile.TemporaryDirectory(prefix="anneal-lean-run-probe-") as tmp:
+        tmp_dir = Path(tmp)
+        config_dir = tmp_dir / "config"
+        runtime_dir = tmp_dir / "runtime"
+        work_dir = tmp_dir / "work"
+        config_dir.mkdir(mode=0o700)
+        runtime_dir.mkdir(mode=0o700)
+        work_dir.mkdir(mode=0o700)
+        _seed_probe_workloads_slice_unit(env, config_dir)
+        probe_env = {
+            **probe_base,
+            "XDG_CONFIG_HOME": os.fspath(config_dir),
+            "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+        }
+
+        probed = _run_wrapper_probe_cmd(
+            [abs_path, "--mode", "build", "--concurrency", "1", "--probe"],
+            env=probe_env,
+            cwd=work_dir,
+            timeout_sec=timeout_sec,
+        )
+        if probed is None or probed[0] != 0:
+            return False
+        probe_text = probed[1]
+        # Any reported thread count other than the caller's `1` is a clobbering wrapper
+        # (the older fleet wrapper prints `(LEAN_NUM_THREADS=<budget>)`).
+        if any(val != "1" for val in _WRAPPER_PROBE_LEAN_THREADS_RE.findall(probe_text)):
+            return False
+        if any(t.strip() != "1" for _b, t in _WRAPPER_PROBE_THREAD_BANNER_RE.findall(probe_text)):
+            return False
+
+        # A `(LEAN_NUM_THREADS=1)` banner is necessary but not sufficient: on a 1-thread
+        # budget a wrapper that prints its budget also prints `1`, a minimal wrapper prints
+        # no banner at all, and a wrapper's banner can disagree with what it exports. So
+        # the verdict is always what a real command run through the wrapper sees.
+        executed = _run_wrapper_probe_cmd(
+            [abs_path, "--mode", "file", "--no-slot-lock", "--", sys.executable, "-B", "-c", _WRAPPER_EXEC_THREADS_DUMP],
+            env=probe_env,
+            cwd=work_dir,
+            timeout_sec=timeout_sec,
+        )
+        return executed is not None and executed[0] == 0 and executed[1].strip() == "1"
+
+
+def _wrapper_honors_lean_num_threads(
+    wrapper_path: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout_sec: float = 5.0,
+) -> bool:
+    """Whether the `anneal-lean-run` at `wrapper_path` keeps a caller's
+    `LEAN_NUM_THREADS=1` for the command it runs.
+
+    The in-repo `scripts/anneal-lean-run` keeps a caller's lower thread count
+    (`_resolve_thread_env`) and its `--probe` reports it as
+    `Thread Budget (-j) : <B> threads (LEAN_NUM_THREADS=1)`; the older fleet
+    `~/.local/bin/anneal-lean-run` overwrites it with its `<B>`-thread budget, which
+    defeats the `LOW_RAM_SINGLE_THREAD_STEPS` policy on a low-RAM host.
+
+    Runs, with `LEAN_NUM_THREADS=1`, `ANNEAL_LSP_NO_EVICT=1`, no
+    `ANNEAL_LEAN_RUN_IN_SCOPE`, and private temporary `XDG_CONFIG_HOME` /
+    `XDG_RUNTIME_DIR`, each bounded by `timeout_sec`:
+    1. `<wrapper> --mode build --concurrency 1 --probe` (text): a non-zero exit, a
+       timeout, or any reported `LEAN_NUM_THREADS=<T>` with `<T> != 1` -> `False`;
+    2. `<wrapper> --mode file --no-slot-lock -- <python> -B -c <print LEAN_NUM_THREADS>`
+       (holds no build slot): `True` iff it exits 0 and prints exactly `1`.
+    A missing, non-regular, or non-executable path is `False` without spawning anything.
+    The wrapper always runs by absolute path (a bare relative name would otherwise be
+    looked up on `PATH`). Results are memoized in `_WRAPPER_THREAD_PROBE_CACHE`.
+    """
+    try:
+        abs_path = os.path.abspath(os.fspath(wrapper_path))
+        st = os.stat(abs_path)
+        if not stat.S_ISREG(st.st_mode) or not os.access(abs_path, os.X_OK):
+            return False
+        with open(abs_path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        st_after = os.stat(abs_path)
+    except (OSError, ValueError, TypeError):
+        return False
+    try:
+        timeout = float(timeout_sec)
+    except (TypeError, ValueError):
+        return False
+    if not timeout > 0:
+        return False
+    env_map: Mapping[str, str] = os.environ if env is None else env
+    probe_base = {k: v for k, v in env_map.items() if k not in _WRAPPER_PROBE_SCRUBBED_ENV}
+    probe_base["LEAN_NUM_THREADS"] = "1"
+    probe_base["ANNEAL_LSP_NO_EVICT"] = "1"
+    env_digest = hashlib.sha256(
+        json.dumps(sorted(probe_base.items()), ensure_ascii=True).encode("ascii")
+    ).hexdigest()
+    identity = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    if identity != (st_after.st_dev, st_after.st_ino, st_after.st_mtime_ns, st_after.st_ctime_ns, st_after.st_size):
+        # Rewritten while hashing: probe it, but cache nothing under a torn identity.
+        return _probe_wrapper_thread_honoring(abs_path, probe_base, env_map, timeout)
+    key = (abs_path, *identity, digest, env_digest, timeout)
+    cached = _WRAPPER_THREAD_PROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = _probe_wrapper_thread_honoring(abs_path, probe_base, env_map, timeout)
+    _WRAPPER_THREAD_PROBE_CACHE[key] = result
+    return result
 
 
 def _resolve_anneal_lean_run(
@@ -5309,12 +5535,30 @@ def _resolve_anneal_lean_run(
     home: Path | None = None,
 ) -> Path | None:
     """Resolve `anneal-lean-run` wrapper with strict precedence:
-    1. `ANNEAL_LEAN_RUN` environment variable (executable regular file),
+    1. `ANNEAL_LEAN_RUN` environment variable (executable regular file), returned
+       unconditionally (an explicit operator override),
     2. Fleet-managed `anneal-lean-run` on `PATH` or `~/.local/bin/anneal-lean-run`
        (so cron environments with minimal `PATH` still prefer the fleet wrapper),
+       unless the in-repo wrapper exists (and is a different file) and that candidate
+       fails `_wrapper_honors_lean_num_threads`: a wrapper that clobbers a caller's
+       `LEAN_NUM_THREADS=1` is skipped for the in-repo one,
     3. Fallback to in-repo `repo_root / "scripts/anneal-lean-run"` (executable file).
     """
     env_map: Mapping[str, str] = os.environ if env is None else env
+    local_lean_run = repo_root / "scripts/anneal-lean-run"
+
+    def vetted(candidate: Path) -> Path:
+        # Without an in-repo wrapper there is nothing better to fall back to.
+        if not _is_executable_file(local_lean_run):
+            return candidate
+        try:
+            if os.path.samefile(candidate, local_lean_run):
+                return candidate
+        except (OSError, ValueError):
+            pass
+        if _wrapper_honors_lean_num_threads(candidate, env=env_map):
+            return candidate
+        return Path(os.path.abspath(local_lean_run))
 
     # Steps run with `cwd=repo_root`, so a relative `ANNEAL_LEAN_RUN` or `PATH` hit is
     # anchored here, against the directory it was just found executable in.
@@ -5330,7 +5574,7 @@ def _resolve_anneal_lean_run(
         if path_lean_run:
             found_path = Path(path_lean_run)
             if _is_executable_file(found_path):
-                return Path(os.path.abspath(found_path))
+                return vetted(Path(os.path.abspath(found_path)))
 
     home_dir = home
     if home_dir is None:
@@ -5345,9 +5589,8 @@ def _resolve_anneal_lean_run(
     if home_dir is not None:
         user_local = home_dir / ".local/bin/anneal-lean-run"
         if _is_executable_file(user_local):
-            return user_local
+            return vetted(user_local)
 
-    local_lean_run = repo_root / "scripts/anneal-lean-run"
     if _is_executable_file(local_lean_run):
         return local_lean_run
     return None
@@ -5629,7 +5872,8 @@ def _build_step_env(
     - Always populates toolchain dirs on `PATH` without mutating `os.environ`.
     - Always sets `LAKE_ARTIFACT_CACHE=true` and `LAKE_RESTORE_ARTIFACTS=true`
       so Lake 4.34.1 restores cached `.olean`s into workspace build dirs.
-    - For each `LOW_RAM_SINGLE_THREAD_STEPS` step (`lake_build_minirust_spec` and
+    - For each `LOW_RAM_SINGLE_THREAD_STEPS` step (`lake_build_minirust_spec_core`,
+      `lake_build_minirust_spec`, `lake_build_lean_miri_spec_core`, and
       `lake_build_lean_miri_spec`), injects `LEAN_NUM_THREADS=1` whenever the
       effective RAM ceiling is `< 10240 MiB` (`< 10 GiB`), while preserving normal
       multi-threaded builds on `>= 10 GiB` hosts and for every other step (including
@@ -6569,7 +6813,11 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
     `rust_workspace_unit_tests`; `nightly` also builds every workspace module imported
     by the standalone `tests/mir` files (`lake_build_mir_test_modules`) right before
     running them, and the vendored `Miri` library (`lake_build_examples_miri_vendor`)
-    right before `lake_build_lean_miri_spec`. A step wrapped in
+    right before the `LeanMiriSpec` waves. `MiniRustSpec` and `LeanMiriSpec` are each
+    built in two topological waves, a bounded `*_core` prebuild of their heaviest
+    modules (`lake_build_minirust_spec_core`, `lake_build_lean_miri_spec_core`) right
+    before the full library (`lake_build_minirust_spec`, `lake_build_lean_miri_spec`),
+    so no single step elaborates the whole closure inside one budget. A step wrapped in
     `anneal-lean-run` receives its step budget as the wrapper's own `--timeout`, so
     the two can never drift apart (`_outer_timeout_sec` adds the wrapper's slot
     queueing and a grace margin on top).
@@ -6746,6 +6994,20 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             900,
             wrap="build",
         )
+        # `MiniRustSpec` wave 1: the evaluator correspondence modules (the bulk of the
+        # closure), so `lake_build_minirust_spec` only builds what remains on top of them.
+        add(
+            "lake_build_minirust_spec_core",
+            "cat2_correspondence_suites",
+            [
+                "lake",
+                "build",
+                "MiniRustSpec.Correspondence.MiniRustEval",
+                "MiniRustSpec.Correspondence.AnnealEval",
+            ],
+            900,
+            wrap="build",
+        )
         add(
             "lake_build_minirust_spec",
             "cat2_correspondence_suites",
@@ -6753,16 +7015,33 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             1200,
             wrap="build",
         )
-        # The `LeanMiriSpec` closure is built in two steps, each with its own budget and
+        # The `LeanMiriSpec` closure is built in three steps, each with its own budget and
         # thread policy: first the vendored `Miri` library (`lean-miri/vendor`, which never
-        # imports `Trusted`), always multi-threaded, then the `LeanMiriSpec` modules on top
-        # of it, single-threaded below 10 GiB (`LOW_RAM_SINGLE_THREAD_STEPS`). Both run in
-        # the `examples` Lake root, so the second step reuses the first one's `.olean`s.
+        # imports `Trusted`), always multi-threaded, then two `LeanMiriSpec` waves on top
+        # of it, single-threaded below 10 GiB (`LOW_RAM_SINGLE_THREAD_STEPS`): the
+        # `Translate` / `SimLM2_1` / `SimLM3_1` correspondence core, then the rest of the
+        # library. All run in the `examples` Lake root, so each step reuses the previous
+        # steps' `.olean`s.
         add(
             "lake_build_examples_miri_vendor",
             "cat2_correspondence_suites",
             ["lake", "--dir", "examples", "build", "Miri"],
             900,
+            wrap="build",
+        )
+        add(
+            "lake_build_lean_miri_spec_core",
+            "cat2_correspondence_suites",
+            [
+                "lake",
+                "--dir",
+                "examples",
+                "build",
+                "LeanMiriSpec.Correspondence.Translate",
+                "LeanMiriSpec.Correspondence.SimLM2_1",
+                "LeanMiriSpec.Correspondence.SimLM3_1",
+            ],
+            1200,
             wrap="build",
         )
         add(
