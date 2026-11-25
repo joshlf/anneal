@@ -2592,6 +2592,9 @@ inductive PublicExportKind : Type where
   /-- A derived or hand-written unchecked builder (deserialization, byte
       reinterpretation, fuzzing) that never runs a smart constructor. -/
   | uncheckedTraitBuilder
+  /-- A public method returning `&mut` or `*mut` into an internal field, letting
+      external clients mutate the value unchecked. -/
+  | mutableFieldEscape
   | smartConstructor
   | transform
   deriving DecidableEq, Repr
@@ -2713,9 +2716,26 @@ theorem leakKind_rejected {V : Type} {d : StructDecl V} {exps : List (PublicExpo
   rw [hKind] at this
   cases this
 
+/-- **Collapse**: a mutable-field-escape export (modeled as a `.mutableFieldEscape`
+    step that overwrites a valid value with an arbitrary client-chosen `bad`) breaks the
+    invariant and is rejected by `StructSealingGuard`. -/
+theorem mutableFieldEscape_soundness_collapse {V : Type} (d : StructDecl V)
+    (eBuild : PublicExport V) (r good bad : V)
+    (hb : eBuild.build r = some good) (hBad : ¬ d.inv bad) :
+    let eEsc : PublicExport V :=
+      { kind := .mutableFieldEscape, build := fun _ => none, step := fun _ => some bad }
+    ¬ StructSealingGuard d [eBuild, eEsc] ∧
+      ClientReach (effectiveExports d [eBuild, eEsc]) [bad, good] ∧
+      ¬ ∀ v ∈ [bad, good], d.inv v := by
+  intro eEsc
+  refine ⟨leakKind_rejected (e := eEsc) (by simp) rfl, ?_⟩
+  exact leakyTransform_soundness_collapse d [eBuild, eEsc] eBuild eEsc
+    (by simp) (by simp) r good bad hb rfl hBad
+
 theorem leakKinds_unsealed :
     [PublicExportKind.directMk, .derivingInhabited, .abbrevAlias, .carrierWrap,
-      .privateForwarder, .unqualifiedMk, .openRenaming, .uncheckedTraitBuilder].all
+      .privateForwarder, .unqualifiedMk, .openRenaming, .uncheckedTraitBuilder,
+      .mutableFieldEscape].all
       (fun k => !k.isSealedKind) = true :=
   rfl
 

@@ -1240,28 +1240,41 @@ fn parse_int(text: &str) -> Option<u128> {
     }
 }
 
-/// Constant truth value of a clause body, when it is one.
+/// Constant truth value of a clause body (strict, no symbolic identities so
+/// `requires(f != f)` on a NaN float can never fold to `false`).
 fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError> {
+    const_bool_ex(r, depth, false)
+}
+
+/// Constant truth value of a clause body; when `allow_symbolic` is `true`
+/// (used for `ensures` contradiction detection, never for `requires`
+/// exemptions), also folds syntactic contradictions (`x != x`, `r < r`,
+/// `r == 1 && r == 2`, `1 == r && 2 == r`, `r == 1 && r != 1`, `x && !x`).
+fn const_bool_ex(
+    r: Lexer<'_>,
+    depth: usize,
+    allow_symbolic: bool,
+) -> Result<Option<bool>, PeerScanError> {
     if depth > MAX_EVAL_DEPTH {
         return Ok(None);
     }
     if let Some(inner) = whole_group(r, "(")? {
-        return const_bool(inner, depth + 1);
+        return const_bool_ex(inner, depth + 1, allow_symbolic);
     }
     if let Some(inner) = whole_group(r, "{")? {
-        return const_bool(inner, depth + 1);
+        return const_bool_ex(inner, depth + 1, allow_symbolic);
     }
     if let Some((l, rr, _)) = split_first_top(r, &["<==>", "↔", "<->"], &[])? {
-        let a = const_bool(l, depth + 1)?;
-        let b = const_bool(rr, depth + 1)?;
+        let a = const_bool_ex(l, depth + 1, allow_symbolic)?;
+        let b = const_bool_ex(rr, depth + 1, allow_symbolic)?;
         return Ok(match (a, b) {
             (Some(x), Some(y)) => Some(x == y),
             _ => None,
         });
     }
     if let Some((l, rr, _)) = split_first_top(r, &["==>", "→"], &[])? {
-        let a = const_bool(l, depth + 1)?;
-        let b = const_bool(rr, depth + 1)?;
+        let a = const_bool_ex(l, depth + 1, allow_symbolic)?;
+        let b = const_bool_ex(rr, depth + 1, allow_symbolic)?;
         return Ok(match (a, b) {
             (Some(false), _) | (_, Some(true)) => Some(true),
             (Some(true), Some(false)) => Some(false),
@@ -1269,8 +1282,8 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
         });
     }
     if let Some((l, rr, _)) = split_first_top(r, &["||", "∨"], &[])? {
-        let a = const_bool(l, depth + 1)?;
-        let b = const_bool(rr, depth + 1)?;
+        let a = const_bool_ex(l, depth + 1, allow_symbolic)?;
+        let b = const_bool_ex(rr, depth + 1, allow_symbolic)?;
         return Ok(match (a, b) {
             (Some(true), _) | (_, Some(true)) => Some(true),
             (Some(false), Some(false)) => Some(false),
@@ -1278,9 +1291,9 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
         });
     }
     if let Some((l, rr, _)) = split_first_top(r, &["&&", "∧"], &[])? {
-        let a = const_bool(l, depth + 1)?;
-        let b = const_bool(rr, depth + 1)?;
-        if conflicting_equalities(l, rr)? {
+        let a = const_bool_ex(l, depth + 1, allow_symbolic)?;
+        let b = const_bool_ex(rr, depth + 1, allow_symbolic)?;
+        if allow_symbolic && conflicting_conjuncts(l, rr)? {
             return Ok(Some(false));
         }
         return Ok(match (a, b) {
@@ -1290,21 +1303,29 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
         });
     }
     if let Some((l, rr, op)) = split_first_top(r, &["==", "!="], &[])? {
-        if let (Some(a), Some(b)) = (const_bool(l, depth + 1)?, const_bool(rr, depth + 1)?) {
+        if let (Some(a), Some(b)) = (
+            const_bool_ex(l, depth + 1, allow_symbolic)?,
+            const_bool_ex(rr, depth + 1, allow_symbolic)?,
+        ) {
             return Ok(Some(if op.text == "==" { a == b } else { a != b }));
         }
     }
     // A comparison of syntactically identical sides (`x != x`, `r < r`).
-    if let Some((l, rr, op)) = split_first_top(r, &["==", "!=", "<", ">", "<=", ">=", "≠"], &[])?
-    {
-        if !l.is_empty()? && tokens_equal(l, rr)? {
-            return Ok(Some(matches!(op.text, "==" | "<=" | ">=")));
+    // Restricted to `allow_symbolic` so `requires(f != f)` on NaN floats cannot
+    // exempt a contract.
+    if allow_symbolic {
+        if let Some((l, rr, op)) =
+            split_first_top(r, &["==", "!=", "<", ">", "<=", ">=", "≠"], &[])?
+        {
+            if !l.is_empty()? && tokens_equal(l, rr)? {
+                return Ok(Some(matches!(op.text, "==" | "<=" | ">=")));
+            }
         }
     }
     let mut c = r;
     let Some(t0) = c.next()? else { return Ok(None) };
     if t0.is_punct("!") || t0.is_punct("¬") || t0.is_kw("not") {
-        return Ok(const_bool(r.range(c.pos, r.end), depth + 1)?.map(|b| !b));
+        return Ok(const_bool_ex(r.range(c.pos, r.end), depth + 1, allow_symbolic)?.map(|b| !b));
     }
     if t0.is_kw("if") {
         let cond_start = c.pos;
@@ -1321,17 +1342,17 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
         if let Some(open) = open {
             let then_start = c.pos;
             let close = skip_group(&mut c, &open)?;
-            let cond = const_bool(r.range(cond_start, open.start), depth + 1)?;
+            let cond = const_bool_ex(r.range(cond_start, open.start), depth + 1, allow_symbolic)?;
             if c.next_is_kw("else")? {
                 c.next()?;
                 let else_r = r.range(c.pos, r.end);
                 let then_r = r.range(then_start, close);
                 return match cond {
-                    Some(true) => const_bool(then_r, depth + 1),
-                    Some(false) => const_bool(else_r, depth + 1),
+                    Some(true) => const_bool_ex(then_r, depth + 1, allow_symbolic),
+                    Some(false) => const_bool_ex(else_r, depth + 1, allow_symbolic),
                     None => match (
-                        const_bool(then_r, depth + 1)?,
-                        const_bool(else_r, depth + 1)?,
+                        const_bool_ex(then_r, depth + 1, allow_symbolic)?,
+                        const_bool_ex(else_r, depth + 1, allow_symbolic)?,
                     ) {
                         (Some(a), Some(b)) if a == b => Ok(Some(a)),
                         _ => Ok(None),
@@ -1383,32 +1404,81 @@ fn tokens_equal(a: Lexer<'_>, b: Lexer<'_>) -> Result<bool, PeerScanError> {
     }
 }
 
-/// `X == lit₁` and `X == lit₂` (any conjunct of either side) with the same `X`
-/// and distinct literals: the conjunction is unsatisfiable.
-fn conflicting_equalities(l: Lexer<'_>, r: Lexer<'_>) -> Result<bool, PeerScanError> {
-    fn eq_lit<'a>(e: Lexer<'a>) -> Result<Option<(Lexer<'a>, &'a str)>, PeerScanError> {
-        let Some((lhs, rhs, op)) = split_first_top(e, &["=="], &["&&", "||"])? else {
-            return Ok(None);
-        };
-        let _ = op;
-        let mut c = rhs;
-        let Some(lit) = c.next()? else {
-            return Ok(None);
-        };
-        if lit.kind != TokKind::Literal || !c.is_empty()? || lhs.is_empty()? {
+fn unwrap_parens(mut e: Lexer<'_>) -> Result<Lexer<'_>, PeerScanError> {
+    for _ in 0..MAX_EVAL_DEPTH {
+        match whole_group(e, "(")? {
+            Some(inner) => e = inner,
+            None => break,
+        }
+    }
+    Ok(e)
+}
+
+/// Detects contradictions across any pair of conjuncts drawn from `l` and `r`:
+/// - `X == lit₁` and `X == lit₂` (or `lit == X`) with `lit₁ ≠ lit₂`
+/// - `X == lit` and `X != lit` (either side)
+/// - `P` and `!P` (or `¬P` / `not P`)
+fn conflicting_conjuncts(l: Lexer<'_>, r: Lexer<'_>) -> Result<bool, PeerScanError> {
+    fn single_int(e: Lexer<'_>) -> Result<Option<u128>, PeerScanError> {
+        let mut c = unwrap_parens(e)?;
+        let Some(t) = c.next()? else { return Ok(None) };
+        if t.kind != TokKind::Literal || !c.is_empty()? {
             return Ok(None);
         }
-        Ok(Some((lhs, lit.text)))
+        Ok(parse_int(t.text))
+    }
+    /// Returns `(is_eq, expr, literal_val)` for `X == lit`, `lit == X`,
+    /// `X != lit`, or `lit != X`.
+    fn cmp_lit<'a>(e: Lexer<'a>) -> Result<Option<(bool, Lexer<'a>, u128)>, PeerScanError> {
+        let e = unwrap_parens(e)?;
+        let Some((lhs, rhs, op)) = split_first_top(e, &["==", "!=", "≠"], &["&&", "||"])? else {
+            return Ok(None);
+        };
+        let is_eq = op.text == "==";
+        if let Some(v) = single_int(rhs)? {
+            if !lhs.is_empty()? {
+                return Ok(Some((is_eq, unwrap_parens(lhs)?, v)));
+            }
+        }
+        if let Some(v) = single_int(lhs)? {
+            if !rhs.is_empty()? {
+                return Ok(Some((is_eq, unwrap_parens(rhs)?, v)));
+            }
+        }
+        Ok(None)
+    }
+    fn strip_neg<'a>(e: Lexer<'a>) -> Result<Option<Lexer<'a>>, PeerScanError> {
+        let e = unwrap_parens(e)?;
+        let mut c = e;
+        let Some(t) = c.next()? else { return Ok(None) };
+        if t.is_punct("!") || t.is_punct("¬") || t.is_kw("not") {
+            return Ok(Some(unwrap_parens(e.range(c.pos, e.end))?));
+        }
+        Ok(None)
     }
     let mut lefts = TopAndSplit::new(l);
     while let Some(a) = lefts.next_part()? {
-        let Some((xa, la)) = eq_lit(a)? else { continue };
+        let a = unwrap_parens(a)?;
+        let cmp_a = cmp_lit(a)?;
+        let neg_a = strip_neg(a)?;
         let mut rights = TopAndSplit::new(r);
         while let Some(b) = rights.next_part()? {
-            let Some((xb, lb)) = eq_lit(b)? else { continue };
-            if let (Some(va), Some(vb)) = (parse_int(la), parse_int(lb)) {
-                if va != vb && tokens_equal(xa, xb)? {
+            let b = unwrap_parens(b)?;
+            if let Some(na) = neg_a {
+                if !na.is_empty()? && tokens_equal(na, b)? {
                     return Ok(true);
+                }
+            }
+            if let Some(nb) = strip_neg(b)? {
+                if !nb.is_empty()? && tokens_equal(a, nb)? {
+                    return Ok(true);
+                }
+            }
+            if let (Some((eq_a, xa, va)), Some((eq_b, xb, vb))) = (cmp_a, cmp_lit(b)?) {
+                if tokens_equal(xa, xb)? {
+                    if (eq_a && eq_b && va != vb) || (eq_a != eq_b && va == vb) {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -1512,9 +1582,34 @@ fn clause_list(r: Lexer<'_>) -> Result<ClauseList<'_>, PeerScanError> {
     Ok(ClauseList::Many(TopSplit::new(r, false)))
 }
 
+/// Checks pairwise contradictions across a comma-separated list of clauses
+/// (`[r == 1, r == 2]`, `ensures(r == 1, r == 2)`).
+fn clause_parts_conflict(mut parts: TopSplit<'_>) -> Result<bool, PeerScanError> {
+    const MAX_CLAUSES: usize = 16;
+    let mut items: [Option<Lexer<'_>>; MAX_CLAUSES] = [None; MAX_CLAUSES];
+    let mut len = 0usize;
+    while let Some(p) = parts.next_part()? {
+        let body = strip_closure_params(p)?;
+        for prev in items[..len].iter().flatten() {
+            if conflicting_conjuncts(*prev, body)? {
+                return Ok(true);
+            }
+        }
+        if len < MAX_CLAUSES {
+            items[len] = Some(body);
+            len += 1;
+        }
+    }
+    Ok(false)
+}
+
 /// Whether a clause (`false`, `|r| false`, `[a, false]`, `x && false`,
 /// `1 > 2`, ...) is unsatisfiable.
-fn clause_is_unsatisfiable(r: Lexer<'_>, depth: usize) -> Result<bool, PeerScanError> {
+fn clause_is_unsatisfiable(
+    r: Lexer<'_>,
+    depth: usize,
+    allow_symbolic: bool,
+) -> Result<bool, PeerScanError> {
     if depth > MAX_EVAL_DEPTH {
         return Ok(false);
     }
@@ -1523,24 +1618,24 @@ fn clause_is_unsatisfiable(r: Lexer<'_>, depth: usize) -> Result<bool, PeerScanE
         ClauseList::Single(one) => one,
         ClauseList::Many(mut parts) => {
             while let Some(p) = parts.next_part()? {
-                if clause_is_unsatisfiable(p, depth + 1)? {
+                if clause_is_unsatisfiable(p, depth + 1, allow_symbolic)? {
                     return Ok(true);
                 }
             }
-            return Ok(false);
+            return Ok(allow_symbolic && clause_parts_conflict(TopSplit::new(r, false))?);
         }
     };
     let body = strip_closure_params(r)?;
     if let Some(inner) = whole_group(body, "[")? {
         let mut parts = TopSplit::new(inner, false);
         while let Some(p) = parts.next_part()? {
-            if clause_is_unsatisfiable(p, depth + 1)? {
+            if clause_is_unsatisfiable(p, depth + 1, allow_symbolic)? {
                 return Ok(true);
             }
         }
-        return Ok(false);
+        return Ok(allow_symbolic && clause_parts_conflict(TopSplit::new(inner, false))?);
     }
-    Ok(const_bool(body, 0)? == Some(false))
+    Ok(const_bool_ex(body, 0, allow_symbolic)? == Some(false))
 }
 
 // ----------------------------------------------------------------------------
@@ -1634,7 +1729,8 @@ fn handle_clause<'a>(
     flags: &mut AttrFlags,
     visitor: &mut dyn ClauseVisitor<'a>,
 ) -> GResult<()> {
-    let unsat = clause_is_unsatisfiable(clause, 0)?;
+    let allow_symbolic = kind == ClauseKind::Ensures;
+    let unsat = clause_is_unsatisfiable(clause, 0, allow_symbolic)?;
     match kind {
         ClauseKind::Ensures => flags.ensures_false |= unsat,
         ClauseKind::Requires => flags.requires_false |= unsat && !in_cfg,
@@ -2639,10 +2735,27 @@ pub fn check_extern_ensures_false_source(src: &str) -> GResult<()> {
             "fn" => {
                 if let Some(sig) = scan_fn_signature(lx, infallible_shadowed)? {
                     if let Some(clauses) = sig.clauses {
+                        const MAX_SIG_ENSURES: usize = 16;
+                        let mut ensures_segs: [Option<Lexer<'_>>; MAX_SIG_ENSURES] =
+                            [None; MAX_SIG_ENSURES];
+                        let mut ensures_len = 0usize;
                         for_each_sig_clause(clauses, &mut |kind, seg| {
-                            let unsat = clause_is_unsatisfiable(seg, 0)?;
+                            let allow_symbolic = kind == ClauseKind::Ensures;
+                            let unsat = clause_is_unsatisfiable(seg, 0, allow_symbolic)?;
                             match kind {
-                                ClauseKind::Ensures => pending.ensures_false |= unsat,
+                                ClauseKind::Ensures => {
+                                    pending.ensures_false |= unsat;
+                                    let body = strip_closure_params(seg)?;
+                                    for prev in ensures_segs[..ensures_len].iter().flatten() {
+                                        if conflicting_conjuncts(*prev, body)? {
+                                            pending.ensures_false = true;
+                                        }
+                                    }
+                                    if ensures_len < MAX_SIG_ENSURES {
+                                        ensures_segs[ensures_len] = Some(body);
+                                        ensures_len += 1;
+                                    }
+                                }
                                 ClauseKind::Requires => pending.requires_false |= unsat,
                             }
                             Ok(())
@@ -3190,6 +3303,13 @@ impl CtxStack {
             .find(|c| c.kind != CtxKind::Repeat && c.phase == CtxPhase::Body)
             .map(|c| c.kind)
     }
+
+    /// True whenever inside a `fn` header (params/return type) or body.
+    fn in_fn(&self) -> bool {
+        self.items[..self.len]
+            .iter()
+            .any(|c| c.kind != CtxKind::Repeat)
+    }
 }
 
 fn starts_expression(prev: Option<Tok<'_>>) -> bool {
@@ -3331,6 +3451,7 @@ fn collect_generic_mint_fns<'a>(
                 }
             }
             impl_params_pending = impl_params.len > 0;
+            skip_item_header_to_brace(&mut lx)?;
             continue;
         }
         if !t.is_kw("fn") {
@@ -3490,10 +3611,15 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
         }
         ctx.on_token(st.depth(), &t);
         if t.is_punct(",") || t.is_punct(";") {
+            let had_fn = ctx.in_fn();
             ctx.on_separator(st.depth(), t.is_punct(";"));
             if t.is_punct(";") {
                 in_impl_header = false;
                 impl_pending = None;
+                if had_fn && !ctx.in_fn() {
+                    saw_ctor_type_in_fn = false;
+                    pending_generic_call = None;
+                }
             }
             prev = Some(t);
             continue;
@@ -3609,7 +3735,7 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                 _ => {}
             }
         }
-        if t.is_ident() && tables.is_ctor_type(t.text) && ctx.innermost_fn().is_some() {
+        if t.is_ident() && tables.is_ctor_type(t.text) && ctx.in_fn() {
             saw_ctor_type_in_fn = true;
         }
         // Calling or coercing a locally defined generic constructor dispatcher
@@ -3839,6 +3965,13 @@ pub fn check_external_type_drop_omission_source(src: &str) -> GResult<()> {
                         drops.push(h.self_ty, "", t.start)?;
                     }
                 }
+            }
+        }
+    }
+    if drops.len > 0 {
+        for _ in 0..MAX_DROP_TYPES {
+            if !collect_inv_aliases(src, &mut drops)? {
+                break;
             }
         }
     }
@@ -5032,11 +5165,13 @@ const MAX_TAINTED_HELPERS: usize = 32;
 /// Whether `body` calls or coerces a tainted helper (`raw(..)`,
 /// `Self::raw::<T>(..)`, `Self::raw`), references a tainted `const`/`static`,
 /// or (when `names_inv` is true) calls a generic raw-materializing helper `"M"`.
+/// Returns `(offset, kind)` so callers can distinguish raw construction (`"F"` /
+/// `"V"` / `"M"`) from mutable-field escape forwarding (`"E"`).
 fn body_calls_tainted<'a>(
     body: Lexer<'a>,
     tainted: &PairTable<'a, MAX_TAINTED_HELPERS>,
     names_inv: bool,
-) -> Result<Option<usize>, PeerScanError> {
+) -> Result<Option<(usize, &'a str)>, PeerScanError> {
     let mut c = body;
     let mut prev: Option<Tok<'a>> = None;
     while let Some(t) = c.next()? {
@@ -5055,7 +5190,7 @@ fn body_calls_tainted<'a>(
                     probe = c;
                 }
                 if probe.next_is_punct("(")? {
-                    return Ok(Some(t.start));
+                    return Ok(Some((t.start, kind)));
                 }
                 let def_pos = matches!(prev, Some(p) if p.is_kw("fn") || p.is_kw("let") || p.is_kw("const") || p.is_kw("static"));
                 if !def_pos {
@@ -5063,7 +5198,7 @@ fn body_calls_tainted<'a>(
                         || matches!(prev, Some(p) if p.is_punct("::"))
                         || starts_expression(prev)
                     {
-                        return Ok(Some(t.start));
+                        return Ok(Some((t.start, kind)));
                     }
                 }
             }
@@ -5073,17 +5208,123 @@ fn body_calls_tainted<'a>(
     Ok(None)
 }
 
-/// `&mut self.field` (or `&mut self.0`) in a body.
-fn body_mut_field_borrow(body: Lexer<'_>) -> Result<Option<usize>, PeerScanError> {
+/// Whether the return type of a function signature exposes a mutable reference
+/// (`&mut T`, `&'a mut T`) or mutable raw pointer (`*mut T`).
+fn sig_returns_mut(sig_range: Lexer<'_>) -> Result<bool, PeerScanError> {
+    let mut sc = sig_range;
+    let mut after_arrow = false;
+    let mut saw_ref_prefix = false;
+    while let Some(n) = sc.next()? {
+        if n.is_punct("->") {
+            after_arrow = true;
+            saw_ref_prefix = false;
+            continue;
+        }
+        if !after_arrow {
+            continue;
+        }
+        if saw_ref_prefix {
+            if n.kind == TokKind::Lifetime {
+                continue;
+            }
+            if n.is_kw("mut") {
+                return Ok(true);
+            }
+        }
+        saw_ref_prefix = n.is_punct("&") || n.is_punct("*");
+    }
+    Ok(false)
+}
+
+/// Extracts parameter names bound to `&mut <InvType>` (or `&'a mut <InvType>`),
+/// plus `self` when `self_is_inv`.
+fn collect_mut_inv_params<'a>(
+    sig_range: Lexer<'a>,
+    invs: &PairTable<'a, MAX_INVARIANT_STRUCTS>,
+    self_is_inv: bool,
+) -> Result<PairTable<'a, 8>, PeerScanError> {
+    let mut params: PairTable<'a, 8> = PairTable::new();
+    if self_is_inv {
+        let _ = params.push("self", "", sig_range.pos);
+    }
+    let mut c = sig_range;
+    while let Some(t) = c.next()? {
+        if t.is_punct("(") {
+            let s = c.pos;
+            let close = skip_group(&mut c, &t)?;
+            let mut parts = TopSplit::new(sig_range.range(s, close), true);
+            while let Some(part) = parts.next_part()? {
+                if let Some((pat, ty, _)) = split_first_top(part, &[":"], &[])? {
+                    let mut p = pat;
+                    let mut pname: Option<Tok<'a>> = None;
+                    while let Some(tok) = p.next()? {
+                        if tok.is_ident() && !tok.is_kw("mut") && !tok.is_kw("ref") {
+                            pname = Some(tok);
+                        }
+                    }
+                    let mut tc = ty;
+                    let mut saw_mut = false;
+                    let mut saw_inv = false;
+                    while let Some(tok) = tc.next()? {
+                        if tok.is_kw("mut") {
+                            saw_mut = true;
+                        } else if tok.is_ident()
+                            && (invs.contains_first(tok.text)
+                                || (self_is_inv && tok.is_kw("Self")))
+                        {
+                            saw_inv = true;
+                        }
+                    }
+                    if saw_mut && saw_inv {
+                        if let Some(n) = pname {
+                            let _ = params.push(n.text, "", n.start);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+    Ok(params)
+}
+
+/// Detects mutable field escapes in a function returning `&mut` / `*mut`:
+/// `&mut self.field`, `&mut (self.field)`, `&mut param.field`, or destructuring
+/// `Self { .. } = self` / `R { .. } = param` / `R(..) = param`.
+fn body_mut_field_borrow<'a>(
+    body: Lexer<'a>,
+    mut_params: &PairTable<'a, 8>,
+    invs: &PairTable<'a, MAX_INVARIANT_STRUCTS>,
+    self_is_inv: bool,
+) -> Result<Option<usize>, PeerScanError> {
+    if mut_params.len == 0 {
+        return Ok(None);
+    }
     let mut c = body;
     while let Some(t) = c.next()? {
         if t.is_punct("&") {
             let mut p = c;
             if p.next_is_kw("mut")? {
                 p.next()?;
-                if p.next_is_kw("self")? {
-                    p.next()?;
-                    if p.next_is_punct(".")? {
+                while p.eat_punct("(")? {}
+                if let Some(base) = p.next()? {
+                    if base.is_ident()
+                        && mut_params.contains_first(base.text)
+                        && p.next_is_punct(".")?
+                    {
+                        return Ok(Some(t.start));
+                    }
+                }
+            }
+        }
+        // Destructuring a `&mut R` / `&mut self` binds mutable references to its
+        // fields (`let Self { lo, .. } = self; lo`, `match self { Self { lo, .. } => lo }`).
+        if t.is_ident() && (invs.contains_first(t.text) || (self_is_inv && t.is_kw("Self"))) {
+            let mut p = c;
+            if let Some(open) = p.next()? {
+                if open.is_punct("{") || open.is_punct("(") {
+                    skip_group(&mut p, &open)?;
+                    if is_pattern_trailer(p)? {
                         return Ok(Some(t.start));
                     }
                 }
@@ -5203,42 +5444,45 @@ fn sealing_pass<'a>(
                     names_inv |= n.is_ident() && invs.contains_first(n.text);
                 }
             }
-            // A public method of the invariant type returning `&mut` into a field
-            // lets clients mutate it unchecked outside the defining boundary.
-            if public && self_kind.is_some() {
-                let mut returns_mut = false;
-                let mut sc = lx.range(lx.pos, open.start);
-                let mut after_arrow = false;
-                let mut prev_amp = false;
-                while let Some(n) = sc.next()? {
-                    if n.is_punct("->") {
-                        after_arrow = true;
-                    }
-                    if after_arrow && prev_amp && n.is_kw("mut") {
-                        returns_mut = true;
-                    }
-                    prev_amp = n.is_punct("&");
+            // A method or module-local function returning `&mut` / `*mut` into a
+            // field lets clients mutate it unchecked outside the defining
+            // boundary; private helpers that do so taint public forwarders (`"E"`).
+            let sig_range = lx.range(lx.pos, open.start);
+            let mut_escape = if names_inv && sig_returns_mut(sig_range)? {
+                let mut_params = collect_mut_inv_params(sig_range, invs, self_kind.is_some())?;
+                body_mut_field_borrow(body, &mut_params, invs, self_kind.is_some())?
+            } else {
+                None
+            };
+            if let Some(at) = mut_escape {
+                if public {
+                    return violation(PeerViolationReason::InvariantMutableFieldEscape, at);
                 }
-                if returns_mut {
-                    if let Some(at) = body_mut_field_borrow(body)? {
-                        return violation(PeerViolationReason::InvariantMutableFieldEscape, at);
-                    }
-                }
+                changed |= tainted.push(sig.name.text, "E", sig.name.start)?;
             }
             let raw_mat = body_raw_materializer(body)?;
             let materializes = if names_inv { raw_mat } else { None };
-            let hit = match body_constructs_raw(body, invs, self_kind)? {
+            let tainted_call = body_calls_tainted(body, tainted, names_inv)?;
+            let raw_hit = match body_constructs_raw(body, invs, self_kind)? {
                 Some(at) => Some(at),
                 None => match materializes {
                     Some(at) => Some(at),
-                    None => body_calls_tainted(body, tainted, names_inv)?,
+                    None => match tainted_call {
+                        Some((at, kind)) if kind != "E" => Some(at),
+                        _ => None,
+                    },
                 },
             };
-            if let Some(at) = hit {
+            if let Some(at) = raw_hit {
                 if public {
                     return violation(PeerViolationReason::InvariantRawPublicConstructor, at);
                 }
                 changed |= tainted.push(sig.name.text, "F", sig.name.start)?;
+            } else if let Some((at, "E")) = tainted_call {
+                if public {
+                    return violation(PeerViolationReason::InvariantMutableFieldEscape, at);
+                }
+                changed |= tainted.push(sig.name.text, "E", sig.name.start)?;
             } else if !public && raw_mat.is_some() {
                 changed |= tainted.push(sig.name.text, "M", sig.name.start)?;
             }
@@ -5285,7 +5529,7 @@ fn sealing_pass<'a>(
                         Some(at) => Some(at),
                         None => match materializes {
                             Some(at) => Some(at),
-                            None => body_calls_tainted(init, tainted, names_inv)?,
+                            None => body_calls_tainted(init, tainted, names_inv)?.map(|(at, _)| at),
                         },
                     };
                     if let Some(at) = hit {
@@ -7142,6 +7386,112 @@ mod tests {
                 "struct H<T>(T); impl<T> H<T> { fn get(&self) -> &T { &self.0 } } fn main() { let _t = Tokens::new(); }"
             ),
             None
+        );
+    }
+
+    // --- Pass B3 red-team regression tests ------------------------------------
+
+    #[test]
+    fn b3_g3_rejects_nan_requires_exemption_and_catches_symmetric_and_multi_clause_contradictions()
+    {
+        // IEEE-754 `f != f` is satisfiable for NaN and must NEVER exempt `ensures(false)`.
+        assert_eq!(
+            g3("#[trusted] #[requires(f != f)] #[ensures(false)] fn read(f: f64) -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        // Symmetric literal equalities, parens, `x == 1 && x != 1`, `x && !x`.
+        for clause in [
+            "1 == r && 2 == r",
+            "(r == 1) && (r == 2)",
+            "r == 1 && r != 1",
+            "1 == r && r != 0x1",
+            "ok && !ok",
+            "!ok && ok",
+        ] {
+            let src = std::format!("#[trusted] #[ensures({clause})] fn f() -> u8;");
+            assert_eq!(g3(&src), Some(R::EnsuresFalseOnReturningFn), "{clause}");
+        }
+        // Contradictions split across comma-separated `ensures` lists / Verus clauses.
+        assert_eq!(
+            g3("#[trusted] #[ensures(r == 1, r == 2)] fn f() -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[spec(trusted, ensures: [r == 1, r != 1])] fn f() -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[verifier::external_body] fn read() -> (r: u8) ensures r == 1, r == 2;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+    }
+
+    #[test]
+    fn b3_g4_catches_header_return_type_inference_and_const_generic_impl() {
+        // `Tokens` only appears in `helper`'s return type header, not its body!
+        assert_eq!(
+            g4("fn mk<T: Mint>() -> T { T::new() } fn helper() -> Tokens { mk() } fn main() { let a = helper(); let b = helper(); }"),
+            Some(R::GenericConstructorDispatch)
+        );
+        // Const-generic `{ 1 }` inside `impl<T: Trait<{ 1 }>>` must not drop `T`.
+        assert_eq!(
+            g4("struct H<T>(T); impl<T: Trait<{ 1 }>> H<T> { fn mk() -> T { T::new() } } fn main() { let a: Tokens = H::mk(); }"),
+            Some(R::GenericConstructorDispatch)
+        );
+    }
+
+    #[test]
+    fn b3_g5_propagates_drop_type_aliases() {
+        let src = "struct Guard; impl Drop for Guard { fn drop(&mut self) {} } type G = Guard; #[verifier::external_type_specification] #[verifier::external_body] #[no_drop_glue] struct ExGuard(G);";
+        assert_eq!(g5(src), Some(R::ExternalBodyWithDrop));
+        let src_use = "struct Guard; impl Drop for Guard { fn drop(&mut self) {} } use self::Guard as G; #[verifier::external_type_specification] #[no_drop_glue] struct ExGuard(G);";
+        assert_eq!(g5(src_use), Some(R::ContradictoryDropDeclaration));
+    }
+
+    #[test]
+    fn b3_g6b_catches_lifetime_free_fn_ptr_destructure_and_helper_mutable_escapes() {
+        let inv = "#[invariant(self.lo <= self.hi)] pub struct R { lo: u32, hi: u32 } ";
+        // Explicit lifetime `&'a mut u32`.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} impl R {{ pub fn lo_mut<'a>(&'a mut self) -> &'a mut u32 {{ &mut self.lo }} }}"
+            )),
+            Some(R::InvariantMutableFieldEscape)
+        );
+        // Free function in same module taking `&mut R`.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} pub fn lo_mut(r: &mut R) -> &mut u32 {{ &mut r.lo }}"
+            )),
+            Some(R::InvariantMutableFieldEscape)
+        );
+        // Raw pointer `*mut u32` escape.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} impl R {{ pub fn lo_ptr(&mut self) -> *mut u32 {{ &mut self.lo as *mut u32 }} }}"
+            )),
+            Some(R::InvariantMutableFieldEscape)
+        );
+        // Destructuring `let Self { lo, .. } = self; lo`.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} impl R {{ pub fn lo_mut(&mut self) -> &mut u32 {{ let Self {{ lo, .. }} = self; lo }} }}"
+            )),
+            Some(R::InvariantMutableFieldEscape)
+        );
+        // Private helper forwarding `&mut self.lo` through a public method.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} impl R {{ fn lo_priv(&mut self) -> &mut u32 {{ &mut self.lo }} pub fn lo_pub(&mut self) -> &mut u32 {{ self.lo_priv() }} }}"
+            )),
+            Some(R::InvariantMutableFieldEscape)
+        );
+        // Parenthesized `&mut (self.lo)`.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} impl R {{ pub fn lo_mut(&mut self) -> &mut u32 {{ &mut (self.lo) }} }}"
+            )),
+            Some(R::InvariantMutableFieldEscape)
         );
     }
 }

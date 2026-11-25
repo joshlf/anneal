@@ -480,6 +480,11 @@ example : ClientReach (effectiveExports evenDecl [evenSmart, evenBadStep]) [7, 6
   leakyTransform_soundness_collapse evenDecl [evenSmart, evenBadStep] evenSmart evenBadStep
     (by simp) (by simp) 3 6 7 rfl rfl (by show ¬ (7 % 2 = 0); decide)
 
+example : ¬ StructSealingGuard evenDecl
+      [evenSmart, { kind := .mutableFieldEscape, build := fun _ => none, step := fun _ => some 5 }] :=
+  (mutableFieldEscape_soundness_collapse evenDecl evenSmart 3 6 5 rfl
+    (by show ¬ (5 % 2 = 0); decide)).1
+
 /-! ## 5. Axiom pins -/
 
 end Anneal.InductiveReplayAndPeerSpecGuardsTests
@@ -605,3 +610,7 @@ open Anneal.InductiveReplayAndPeerSpecGuards
 /-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.subShardPartition_sound' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms subShardPartition_sound
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.mutableFieldEscape_soundness_collapse' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mutableFieldEscape_soundness_collapse
