@@ -638,6 +638,80 @@ theorem frameDeallocProtectorExactWP_iff (depth nLocals : Nat)
   cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors depth nLocals <;>
     simp
 
+/-! ### Part A.3. Non-Vacuous Concrete Whole-Body `ExactBodySafetyVC` Discharges \& Refutations on
+Unmodified `Trusted.MirSemantics.stepMirFn` -/
+
+/-- Zero-sized unit layout for the concrete Part A.3 `CapturedMir` bodies. -/
+def exactVcUnitLayout : TypeLayout :=
+  { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [] [], variants := .single 0, isUninhabited := false }
+
+/-- Single-block unit-returning `CapturedMir` body with statements `stmts` and terminator `term`. -/
+def exactVcBody (stmts : List Statement) (term : TerminatorKind) : CapturedMir :=
+  { defPath := "ep2::exact_vc", phase := .runtimePostCleanup, role := .subject, argCount := 0,
+    localDecls := [{ mutability := .mut, ty := ⟨.tuple [], 0⟩, debugName := none }],
+    basicBlocks := [{ statements := stmts, terminator := { kind := term, span := "ep2.rs" },
+                      isCleanup := false }],
+    fnAbi := { args := [], ret := { layout := exactVcUnitLayout, mode := .direct },
+               conv := .rust, canUnwind := true },
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [exactVcUnitLayout] },
+    allocations := [] }
+
+/-- `_0 = (); return` -/
+def exactVcReturnBody : CapturedMir :=
+  exactVcBody [{ kind := .assign { local_ := 0, projection := [] } (.aggregate .tuple []),
+                 span := "ep2.rs" }] .return_
+
+/-- `unreachable` -/
+def exactVcUnreachableBody : CapturedMir := exactVcBody [] .unreachable
+
+/-- `unwindTerminate` (process abort) -/
+def exactVcAbortBody : CapturedMir := exactVcBody [] .unwindTerminate
+
+/-- Boolean classification of a fuel-bounded `mirRunFuelAction` outcome. -/
+def exactVcIsNormal : ExactOutcome MachineState MirStepErr MirOutcome → Bool
+  | .ok (.normal _) _ => true
+  | _ => false
+
+/-- **Concrete non-vacuous whole-body `ExactBodySafetyVC` facts on REAL `stepMirFn` executions**:
+1. `_0 = (); return` terminates normally within `4` steps, so `ExactBodySafetyVC` with the
+   postcondition "normal return" and an UNSATISFIABLE error continuation (`False`) HOLDS;
+2. `unreachable` faults with EXACTLY `.fail .ub` at the pre-state, so the safety VC with an
+   unsatisfiable error continuation is REFUTED, while the exact error continuation
+   `err = .fail .ub` holds;
+3. `unwindTerminate` halts with `.abort` (never `.normal`), so the "normal return" VC is REFUTED. -/
+theorem exactBodySafetyVC_concrete_trusted_bodies :
+    let s0 := initMachineStateWithCallees exactVcReturnBody [] []
+    let u0 := initMachineStateWithCallees exactVcUnreachableBody [] []
+    let a0 := initMachineStateWithCallees exactVcAbortBody [] []
+    exactVcIsNormal (mirRunFuelAction exactVcReturnBody 4 s0) = true ∧
+    ExactBodySafetyVC exactVcReturnBody 4
+      (fun out _ => exactVcIsNormal (.ok out s0) = true) (fun _ _ => False) s0 ∧
+    mirRunFuelAction exactVcUnreachableBody 2 u0 = .error (.fail .ub) u0 ∧
+    ExactBodySafetyVC exactVcUnreachableBody 2 (fun _ _ => True) (fun e _ => e = .fail .ub) u0 ∧
+    ¬ ExactBodySafetyVC exactVcUnreachableBody 2 (fun _ _ => True) (fun _ _ => False) u0 ∧
+    mirRunFuelAction exactVcAbortBody 2 a0 = .ok .abort a0 ∧
+    ¬ ExactBodySafetyVC exactVcAbortBody 2
+      (fun out _ => exactVcIsNormal (.ok out a0) = true) (fun _ _ => True) a0 := by
+  intro s0 u0 a0
+  have hRet : exactVcIsNormal (mirRunFuelAction exactVcReturnBody 4 s0) = true := by decide
+  have hUb : mirRunFuelAction exactVcUnreachableBody 2 u0 = .error (.fail .ub) u0 := rfl
+  have hAb : mirRunFuelAction exactVcAbortBody 2 a0 = .ok .abort a0 := rfl
+  refine ⟨hRet, ?_, hUb, ?_, ?_, hAb, ?_⟩
+  · rw [exactBodySafetyVC_iff]
+    unfold AnnealExactWP
+    revert hRet
+    cases mirRunFuelAction exactVcReturnBody 4 s0 with
+    | ok out s' =>
+      cases out with
+      | normal r => intro _; rfl
+      | panic => intro h; cases h
+      | abort => intro h; cases h
+    | error e s' => intro h; cases h
+  · rw [exactBodySafetyVC_iff, exactWP_of_eq_error hUb]
+  · rw [exactBodySafetyVC_iff, exactWP_of_eq_error hUb]; exact id
+  · rw [exactBodySafetyVC_iff, exactWP_of_eq_ok hAb]; intro h; cases h
+
 end ExactWPAlgebra
 
 /-! ## Part B. `Bitprism` (`cl/1029634110`) Kernel-Proved Smart Simplifying Constructors -/
@@ -3762,6 +3836,7 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
     (type_of% @protectorReleaseWP_error_preserves_prefix) ∧
     (type_of% @exactBodySafetyVC_iff) ∧
     (type_of% @exactBodySafetyVC_loop_invariant) ∧
+    (type_of% @exactBodySafetyVC_concrete_trusted_bodies) ∧
     (type_of% @frameDeallocProtectorExactWP_iff) ∧
     (type_of% @mkAddSmart_eq_raw) ∧
     (type_of% @mkSubSmart_eq_raw) ∧
@@ -3798,7 +3873,8 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
     (type_of% @anneal_veil_frame_multistep_demo) :=
   ⟨@exactWP_iff, @exactWP_bind, @exactWP_foldl, @exactWP_negation_refutation,
    @treeBorrowsFrameWP_committed_prefix_on_error, @protectorReleaseWP_error_preserves_prefix,
-   @exactBodySafetyVC_iff, @exactBodySafetyVC_loop_invariant, @frameDeallocProtectorExactWP_iff,
+   @exactBodySafetyVC_iff, @exactBodySafetyVC_loop_invariant,
+   @exactBodySafetyVC_concrete_trusted_bodies, @frameDeallocProtectorExactWP_iff,
    @mkAddSmart_eq_raw, @mkSubSmart_eq_raw, @mkMulSmart_eq_raw, @mkBitAndSmart_eq_raw,
    @mkBitOrSmart_eq_raw, @mkBitXorSmart_eq_raw, @mkShlSmart_eq_raw, @mkShrSmart_eq_raw,
    @mkPtrOffsetSmart_eq_raw, @mkWrappingPtrOffsetSmart_eq_raw, @bitprism_nested_collapse_o1,

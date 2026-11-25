@@ -293,6 +293,10 @@ theorem lm_ep2_le_vs_be_disjoint_memory_frame :
     (type_of% @allocWriteUninit_disjoint_readScalar_frame_exactWP) ∧
     (type_of% @allocWriteBytes_disjoint_readScalar_frame_exactWP) ∧
     (type_of% @allocCopy_disjoint_readScalar_frame_exactWP) ∧
+    (type_of% @allocWriteScalar_disjoint_readScalar_frame_eq) ∧
+    (type_of% @allocWriteUninit_disjoint_readScalar_frame_eq) ∧
+    (type_of% @allocWriteBytes_disjoint_readScalar_frame_eq) ∧
+    (type_of% @allocCopy_disjoint_readScalar_frame_eq) ∧
     (type_of% @allocReadScalar_uninit_exactWP) ∧
     (type_of% @allocMapExtra_preserves_readScalar_exactWP) ∧
     (type_of% @allocWithExtra_preserves_readScalar_exactWP) :=
@@ -303,6 +307,8 @@ theorem lm_ep2_le_vs_be_disjoint_memory_frame :
    @allocWriteUninit_disjoint_readScalar_frame_exactWP,
    @allocWriteBytes_disjoint_readScalar_frame_exactWP,
    @allocCopy_disjoint_readScalar_frame_exactWP,
+   @allocWriteScalar_disjoint_readScalar_frame_eq, @allocWriteUninit_disjoint_readScalar_frame_eq,
+   @allocWriteBytes_disjoint_readScalar_frame_eq, @allocCopy_disjoint_readScalar_frame_eq,
    @allocReadScalar_uninit_exactWP,
    @allocMapExtra_preserves_readScalar_exactWP,
    @allocWithExtra_preserves_readScalar_exactWP⟩
@@ -417,6 +423,17 @@ theorem core_ep2_exact_wp_direct_unsound_refutation (s : Nat) :
   refine ⟨⟨rfl, rfl⟩, ?_⟩
   exact (exactWP_negation_refutation (ExactAction.throw (S := Nat) (A := Unit) "ub") s).mpr
     ⟨"ub", s, rfl⟩
+
+/-- Concrete whole-body `ExactBodySafetyVC` on REAL `Trusted.MirSemantics.stepMirFn` executions:
+the `_0 = (); return` body discharges the normal-return VC with an unsatisfiable error branch, while
+the `unreachable` and `unwindTerminate` bodies REFUTE the corresponding safety VCs. -/
+theorem core_ep2_trusted_whole_body_vc_positive_and_refutation :
+    ¬ ExactBodySafetyVC exactVcUnreachableBody 2 (fun _ _ => True) (fun _ _ => False)
+        (initMachineStateWithCallees exactVcUnreachableBody [] []) ∧
+    ExactBodySafetyVC exactVcReturnBody 4
+      (fun out _ => exactVcIsNormal (.ok out (initMachineStateWithCallees exactVcReturnBody [] [])) = true)
+      (fun _ _ => False) (initMachineStateWithCallees exactVcReturnBody [] []) :=
+  ⟨exactBodySafetyVC_concrete_trusted_bodies.2.2.2.2.1, exactBodySafetyVC_concrete_trusted_bodies.2.1⟩
 
 /-- Exhaustive 14-field `Memory` & 17-field `MachineState` extensionality + `ExactWpAndSmartCtors`
 core capstone linkage. -/
