@@ -43,11 +43,13 @@ certificate passes if a reachable block uses it):
   unprojected scalar/bool/unit/`(u, bool)` locals (`Move` leaves the source
   `LocalSlot.uninit` and clears guards mentioning it); and `.field 0` /
   `.field 1` projections on initialized `(u, bool)` checked-arithmetic tuples;
-* signed (`IntTy`) constants, locals, and casts, sign-agnostic signed
-  arithmetic (wrapping `add` / `sub` / `mul`, bitwise, `eq` / `ne`, `shl`),
-  arithmetic `shr`, `UnOp.not` / `UnOp.neg`, and signed ordered comparisons
-  (decided via the unsigned transfer when both operands are certainly
-  non-negative, else an unknown `bool`);
+* signed (`IntTy`) constants, locals, copy aliases, casts, sign-agnostic
+  arithmetic, mixed-width/mixed-signedness shifts (exact `shr` on
+  non-negative values), `UnOp.not` / `UnOp.neg`, ordered comparisons (exact
+  on same-sign or opposite-sign operands plus `RelGuard` synthesis on sign
+  tests against `0` and `-1`), checked (`*WithOverflow` `(i, bool)` tuples),
+  unchecked (`*Unchecked`), and UB-free `div` / `rem` (exact on non-negative
+  operands);
 * unsigned wrapping, checked (`*WithOverflow`), unchecked (overflow-free), and
   `div` / `rem` (nonzero divisor) arithmetic, bitwise operations, shifts,
   boolean binary operations, comparisons recording `RelGuard`s, `UnOp.not` /
@@ -79,23 +81,27 @@ and `entryEnv_sound` / `initMachineState_root` describe the initial state of
 
 /-- Abstract evaluated operand, optionally remembering the copied source local
 `srcReg?` (used to synthesize relational comparison guards). Signed values
-(`.sint`) are tracked by their bit pattern at width `uintWidth (intTwin i)`. -/
+(`.sint`) and checked signed tuples (`.sintBoolPair`) are tracked by their bit
+pattern at width `uintWidth (intTwin i)`. -/
 inductive MirAbsVal where
   | uint (u : UintTy) (a : AbsVal) (srcReg? : Option Nat)
   | bool (b : BoolAbs)
   | unit
   | uintBoolPair (u : UintTy) (a : AbsVal) (ov : BoolAbs)
   | sint (i : IntTy) (a : AbsVal) (srcReg? : Option Nat)
+  | sintBoolPair (i : IntTy) (a : AbsVal) (ov : BoolAbs)
 
 /-- Abstract slot stored by an assignment of `av` (a value copied from local
-`r` records the copy alias `.uintCopy u a r`). -/
+`r` records `.uintCopy u a r` or `.sintCopy i a r`). -/
 def MirAbsVal.toSlot : MirAbsVal → MirAbsSlot
   | .uint u a none => .uint u a
   | .uint u a (some r) => .uintCopy u a r
   | .bool b => .bool b
   | .unit => .unit true
   | .uintBoolPair u a ov => .uintBoolPair u a ov
-  | .sint i a _ => .sint i a
+  | .sint i a none => .sint i a
+  | .sint i a (some r) => .sintCopy i a r
+  | .sintBoolPair i a ov => .sintBoolPair i a ov
 
 /-- `av` has MIR type kind `k`. -/
 def MirAbsVal.kindOk (av : MirAbsVal) (k : RigidTy) : Prop :=
@@ -105,6 +111,7 @@ def MirAbsVal.kindOk (av : MirAbsVal) (k : RigidTy) : Prop :=
   | .unit => k = .tuple []
   | .uintBoolPair u _ _ => k = .tuple [.uint u, .bool]
   | .sint i _ _ => k = .int i
+  | .sintBoolPair i _ _ => k = .tuple [.int i, .bool]
 
 /-- Decidable check that `av` has MIR type kind `k`. -/
 def MirAbsVal.kindMatches (av : MirAbsVal) (k : RigidTy) : Bool :=
@@ -114,6 +121,7 @@ def MirAbsVal.kindMatches (av : MirAbsVal) (k : RigidTy) : Bool :=
   | .unit, .tuple [] => true
   | .uintBoolPair u _ _, .tuple [.uint u', .bool] => uintTyBeq u u'
   | .sint i _ _, .int i' => intTyBeq i i'
+  | .sintBoolPair i _ _, .tuple [.int i', .bool] => intTyBeq i i'
   | _, _ => false
 
 theorem mirAbsVal_kindOk_of_kindMatches {av : MirAbsVal} {k : RigidTy}
@@ -160,6 +168,28 @@ theorem mirAbsVal_kindOk_of_kindMatches {av : MirAbsVal} {k : RigidTy}
     cases k with
     | int i' => exact congrArg RigidTy.int (intTy_eq_of_beq h).symm
     | _ => nomatch h
+  | sintBoolPair i a ov =>
+    cases k with
+    | tuple fs =>
+      cases fs with
+      | nil => nomatch h
+      | cons t0 rest =>
+        cases t0 with
+        | int i' =>
+          cases rest with
+          | nil => nomatch h
+          | cons t1 rest2 =>
+            cases t1 with
+            | bool =>
+              cases rest2 with
+              | nil =>
+                have hi := intTy_eq_of_beq h
+                subst hi
+                rfl
+              | cons _ _ => nomatch h
+            | _ => nomatch h
+        | _ => nomatch h
+    | _ => nomatch h
 
 /-- Concrete denotation of an evaluated operand value `v` in frame `locals`. -/
 def MirAbsVal.denote (locals : List LocalSlot) (av : MirAbsVal) (v : Value) :
@@ -193,6 +223,14 @@ def MirAbsVal.denote (locals : List LocalSlot) (av : MirAbsVal) (v : Value) :
       | none => True
       | some r => localUintNat? locals r (intTwin i) = some sc.bits
     | _ => False
+  | .sintBoolPair i a ov =>
+    a.isInit = true ∧ ov.isInit = true ∧
+    match v with
+    | .aggregate 0 [.scalar sc, vb] =>
+      sc.sizeBytes = uintBytes (intTwin i) ∧
+      a.denote (uintWidth (intTwin i)) (some sc.bits) ∧
+      ov.denote locals (some vb)
+    | _ => False
 
 /-- A signed value denotes exactly what its unsigned twin denotes. -/
 theorem mirAbsVal_sint_denote_iff {locals : List LocalSlot} {i : IntTy}
@@ -217,8 +255,12 @@ theorem mirAbsVal_toSlot_denote {ty : Ty} {locals : List LocalSlot}
   | uintBoolPair u a ov => exact ⟨hk, h.2.2⟩
   | sint i a src =>
     cases v with
-    | scalar sc => exact ⟨hk, h.2.1, h.2.2.1⟩
+    | scalar sc =>
+      cases src with
+      | none => exact ⟨hk, h.2.1, h.2.2.1⟩
+      | some r => exact ⟨hk, h.2.1, h.2.2.1, h.2.2.2⟩
     | _ => exact False.elim h.2
+  | sintBoolPair i a ov => exact ⟨hk, h.2.2⟩
 
 theorem mirAbsVal_valueContainsUninit {locals : List LocalSlot}
     {av : MirAbsVal} {v : Value} (h : av.denote locals v) :
@@ -260,6 +302,27 @@ theorem mirAbsVal_valueContainsUninit {locals : List LocalSlot}
     cases v with
     | scalar sc => rfl
     | _ => exact False.elim h.2
+  | sintBoolPair i a ov =>
+    cases v with
+    | aggregate tag fs =>
+      cases tag with
+      | succ _ => exact False.elim h.2.2
+      | zero =>
+        cases fs with
+        | nil => exact False.elim h.2.2
+        | cons v0 rest =>
+          cases v0 with
+          | scalar sc =>
+            cases rest with
+            | nil => exact False.elim h.2.2
+            | cons vb rest2 =>
+              cases rest2 with
+              | cons _ _ => exact False.elim h.2.2
+              | nil =>
+                cases boolAbs_denote_some h.2.2.2.2 with
+                | intro c hc => rw [hc.1]
+          | _ => exact False.elim h.2.2
+    | _ => exact False.elim h.2.2
 
 /-- Local deinitialized by `op` when `op` is an unprojected `Move`, else
 `none`. -/
@@ -391,24 +454,8 @@ theorem evalConstLitAbs_sound {c : ConstOperand} {av : MirAbsVal}
 
 /-! ## 3. Operands -/
 
-/-- Extract the concrete scalar of an initialized `.sint` slot. -/
-theorem sint_slot_extract {ty : Ty} {locals : List LocalSlot} {i : IntTy}
-    {a : AbsVal} {cs : LocalSlot} (hInit : a.isInit = true)
-    (h : (MirAbsSlot.sint i a).denote ty locals cs) :
-    ∃ sc, cs = .init (.scalar sc) ∧ sc.sizeBytes = uintBytes (intTwin i) ∧
-      a.denote (uintWidth (intTwin i)) (some sc.bits) := by
-  cases cs with
-  | dead => exact False.elim h.2
-  | uninit =>
-    cases absVal_init_of_isInit hInit h.2 with
-    | intro _ hx => nomatch hx.1
-  | init v =>
-    cases v with
-    | scalar sc => exact ⟨sc, rfl, h.2.1, h.2.2⟩
-    | _ => exact False.elim h.2
-
-/-- Read field `idx` (`0` = unsigned scalar, `1` = overflow `bool`) from an
-initialized `.uintBoolPair` slot. -/
+/-- Read field `idx` (`0` = integer scalar, `1` = overflow `bool`) from an
+initialized `.uintBoolPair` or `.sintBoolPair` slot. -/
 def evalPairFieldAbs (env : MirAbsEnv) (l idx : Nat) (fty : Ty) :
     Option (MirAbsVal × MirAbsEnv) :=
   match get? env l with
@@ -423,14 +470,25 @@ def evalPairFieldAbs (env : MirAbsEnv) (l idx : Nat) (fty : Ty) :
         | false => none
       | 1, .bool => some (.bool ov, env)
       | _, _ => none
+  | some (.sintBoolPair i a ov) =>
+    match a.isInit && ov.isInit with
+    | false => none
+    | true =>
+      match idx, fty.kind with
+      | 0, .int i' =>
+        match intTyBeq i i' with
+        | true => some (.sint i a none, env)
+        | false => none
+      | 1, .bool => some (.bool ov, env)
+      | _, _ => none
   | _ => none
 
 /-- Abstract operand evaluation for constants, `Copy` / `Move` of unprojected
-locals (including `(u, bool)` pairs), and `.field 0` / `.field 1` projections
-on initialized `(u, bool)` checked-arithmetic tuples. An unprojected `Move`
-leaves the source slot uninitialized (clearing every guard mentioning it),
-mirroring `evalOperand`'s `set? .. .uninit`. Reading a `.uintCopy u a src`
-slot reports the alias root `src` as the source local. -/
+locals (including `(u, bool)` and `(i, bool)` pairs), and `.field 0` /
+`.field 1` projections on initialized checked-arithmetic tuples. An unprojected
+`Move` leaves the source slot uninitialized (clearing every guard mentioning
+it), mirroring `evalOperand`'s `set? .. .uninit`. Reading a `.uintCopy` or
+`.sintCopy` slot reports the alias root `src` as the source local. -/
 def evalOperandAbs (env : MirAbsEnv) : Operand → Option (MirAbsVal × MirAbsEnv)
   | .copy p =>
     match p.projection with
@@ -448,6 +506,10 @@ def evalOperandAbs (env : MirAbsEnv) : Operand → Option (MirAbsVal × MirAbsEn
         match a.isInit with
         | true => some (.sint i a (some p.local_), env)
         | false => none
+      | some (.sintCopy i a src) =>
+        match a.isInit with
+        | true => some (.sint i a (some src), env)
+        | false => none
       | some (.bool ba) =>
         match ba.isInit with
         | true => some (.bool ba, env)
@@ -456,6 +518,10 @@ def evalOperandAbs (env : MirAbsEnv) : Operand → Option (MirAbsVal × MirAbsEn
       | some (.uintBoolPair u a ov) =>
         match a.isInit && ov.isInit with
         | true => some (.uintBoolPair u a ov, env)
+        | false => none
+      | some (.sintBoolPair i a ov) =>
+        match a.isInit && ov.isInit with
+        | true => some (.sintBoolPair i a ov, env)
         | false => none
       | _ => none
     | [.field idx fty] => evalPairFieldAbs env p.local_ idx fty
@@ -483,6 +549,15 @@ def evalOperandAbs (env : MirAbsEnv) : Operand → Option (MirAbsVal × MirAbsEn
               (.sint i (AbsVal.uninit (uintWidth (intTwin i)))) env with
         | true, some env' => some (.sint i a none, env')
         | _, _ => none
+      | some (.sintCopy i a src) =>
+        match a.isInit,
+            setMirAbsSlot p.local_
+              (.sint i (AbsVal.uninit (uintWidth (intTwin i)))) env with
+        | true, some env' =>
+          match Nat.beq src p.local_ with
+          | true => some (.sint i a none, env')
+          | false => some (.sint i a (some src), env')
+        | _, _ => none
       | some (.bool ba) =>
         match ba.isInit, setMirAbsSlot p.local_ (.bool .uninit) env with
         | true, some env' => some (.bool (ba.clearGuardIf p.local_), env')
@@ -497,6 +572,14 @@ def evalOperandAbs (env : MirAbsEnv) : Operand → Option (MirAbsVal × MirAbsEn
               (.uintBoolPair u (AbsVal.uninit (uintWidth u)) .uninit) env with
         | true, some env' =>
           some (.uintBoolPair u a (ov.clearGuardIf p.local_), env')
+        | _, _ => none
+      | some (.sintBoolPair i a ov) =>
+        match a.isInit && ov.isInit,
+            setMirAbsSlot p.local_
+              (.sintBoolPair i (AbsVal.uninit (uintWidth (intTwin i))) .uninit)
+              env with
+        | true, some env' =>
+          some (.sintBoolPair i a (ov.clearGuardIf p.local_), env')
         | _, _ => none
       | _ => none
     | [.field idx fty] => evalPairFieldAbs env p.local_ idx fty
@@ -528,8 +611,10 @@ private theorem evalPairFieldAbs_sound {decls : List LocalDecl}
       get? decls l = some d ∧
       d.ty.kind = .tuple (match av with
         | .uint u _ _ => [.uint u, .bool]
+        | .sint i _ _ => [.int i, .bool]
         | _ => match get? env l with
           | some (.uintBoolPair u _ _) => [.uint u, .bool]
+          | some (.sintBoolPair i _ _) => [.int i, .bool]
           | _ => []) ∧
       get? locals l = some (.init rootVal) ∧
       readProjectedValue locals rootVal [.field idx fty] = .ok v ∧
@@ -574,6 +659,62 @@ private theorem evalPairFieldAbs_sound {decls : List LocalDecl}
                       subst hE
                       have hu := uintTy_eq_of_beq hU
                       subst hu
+                      refine ⟨.scalar sc, d, .aggregate 0 [.scalar sc, vb],
+                        hcs.1, hcs.2.2.1, hL, rfl, rfl, ?_, rfl⟩
+                      exact ⟨hAi, hsc.2.1, hsc.2.2.1, True.intro⟩
+                  | _ => rw [hFk] at hAbs; nomatch hAbs
+                | succ idx' =>
+                  cases idx' with
+                  | zero =>
+                    cases hFk : fty.kind with
+                    | bool =>
+                      rw [hFk] at hAbs
+                      simp only at hAbs
+                      injection hAbs with hAbs
+                      injection hAbs with hAv hE
+                      subst hAv
+                      subst hE
+                      cases boolAbs_denote_some hsc.2.2.2 with
+                      | intro b hb =>
+                        refine ⟨vb, d, .aggregate 0 [.scalar sc, vb], hcs.1,
+                          hcs.2.2.1, hL, ?_, rfl, hsc.2.2.2, rfl⟩
+                        simp only [readProjectedValue, get?, hb.1]; rfl
+                    | _ => rw [hFk] at hAbs; nomatch hAbs
+                  | succ _ => nomatch hAbs
+    | sintBoolPair i a ov =>
+      simp only at hAbs
+      cases hI : (a.isInit && ov.isInit) with
+      | false => rw [hI] at hAbs; nomatch hAbs
+      | true =>
+        rw [hI] at hAbs
+        have hAi := bool_and_true_left hI
+        cases mirAbsEnv_lookup hEnv hS with
+        | intro d hd =>
+          cases hd with
+          | intro cs hcs =>
+            cases sintBoolPair_slot_extract hI hcs.2.2 with
+            | intro sc hsc =>
+              cases hsc with
+              | intro vb hsc =>
+                have hL : get? locals l =
+                    some (.init (.aggregate 0 [.scalar sc, vb])) := by
+                  rw [hcs.2.1, hsc.1]
+                cases idx with
+                | zero =>
+                  cases hFk : fty.kind with
+                  | int i' =>
+                    rw [hFk] at hAbs
+                    simp only at hAbs
+                    cases hIeq : intTyBeq i i' with
+                    | false => rw [hIeq] at hAbs; nomatch hAbs
+                    | true =>
+                      rw [hIeq] at hAbs
+                      injection hAbs with hAbs
+                      injection hAbs with hAv hE
+                      subst hAv
+                      subst hE
+                      have hi := intTy_eq_of_beq hIeq
+                      subst hi
                       refine ⟨.scalar sc, d, .aggregate 0 [.scalar sc, vb],
                         hcs.1, hcs.2.2.1, hL, rfl, rfl, ?_, rfl⟩
                       exact ⟨hAi, hsc.2.1, hsc.2.2.1, True.intro⟩
@@ -724,6 +865,29 @@ theorem evalOperandAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                         localUintNat?_of_get? hL hsc.2.1⟩
                     · intro layouts
                       exact ⟨d.ty, (operandTy_local hcs.1).1, hcs.2.2.1⟩
+              | sintCopy i a src =>
+                simp only at hAbs
+                cases hI : a.isInit with
+                | false => rw [hI] at hAbs; nomatch hAbs
+                | true =>
+                  rw [hI] at hAbs
+                  injection hAbs with hAbs
+                  injection hAbs with hAv hE
+                  subst hAv
+                  subst hE
+                  cases sint_slot_extract hI (sintCopy_denote_sint hcs.2.2) with
+                  | intro sc hsc =>
+                    have hL : get? locals l = some (.init (.scalar sc)) := by
+                      rw [hcs.2.1, hsc.1]
+                    have hDen := hcs.2.2
+                    rw [hsc.1] at hDen
+                    refine ⟨.scalar sc, locals, ?_, ?_, hEnv, fun _ => rfl,
+                      hNoMove rfl, ?_⟩
+                    · intro borrows globals layouts callerLocals cdecls callStack _
+                      simp only [evalOperand, hL, readProjectedValue]
+                    · exact ⟨hI, hsc.2.1, hsc.2.2, hDen.2.2.2⟩
+                    · intro layouts
+                      exact ⟨d.ty, (operandTy_local hcs.1).1, hcs.2.2.1⟩
               | bool ba =>
                 simp only at hAbs
                 cases hI : ba.isInit with
@@ -777,6 +941,29 @@ theorem evalOperandAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                   subst hAv
                   subst hE
                   cases mirAbsSlot_init (s := .uintBoolPair u a ov) hI hcs.2.2 with
+                  | intro v hv =>
+                    have hL : get? locals l = some (.init v) := by
+                      rw [hcs.2.1, hv.1]
+                    have hDen := hcs.2.2
+                    rw [hv.1] at hDen
+                    refine ⟨v, locals, ?_,
+                      ⟨bool_and_true_left hI, bool_and_true_right hI, hDen.2⟩,
+                      hEnv, fun _ => rfl, hNoMove rfl, ?_⟩
+                    · intro borrows globals layouts callerLocals cdecls callStack _
+                      simp only [evalOperand, hL, readProjectedValue, hv.2]
+                    · intro layouts
+                      exact ⟨d.ty, (operandTy_local hcs.1).1, hcs.2.2.1⟩
+              | sintBoolPair i a ov =>
+                simp only at hAbs
+                cases hI : (a.isInit && ov.isInit) with
+                | false => rw [hI] at hAbs; nomatch hAbs
+                | true =>
+                  rw [hI] at hAbs
+                  injection hAbs with hAbs
+                  injection hAbs with hAv hE
+                  subst hAv
+                  subst hE
+                  cases mirAbsSlot_init (s := .sintBoolPair i a ov) hI hcs.2.2 with
                   | intro v hv =>
                     have hL : get? locals l = some (.init v) := by
                       rw [hcs.2.1, hv.1]
@@ -948,6 +1135,54 @@ theorem evalOperandAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                             ⟨hcs.2.2.1, absVal_uninit_sound_none⟩
                         · intro layouts
                           exact ⟨d.ty, (operandTy_local hcs.1).2, hcs.2.2.1⟩
+                | sintCopy i a src =>
+                  simp only at hAbs
+                  cases hI : a.isInit with
+                  | false => rw [hI] at hAbs; nomatch hAbs
+                  | true =>
+                    cases hSA : setMirAbsSlot l
+                        (.sint i (AbsVal.uninit (uintWidth (intTwin i)))) env with
+                    | none => rw [hI, hSA] at hAbs; nomatch hAbs
+                    | some envM =>
+                      rw [hI, hSA] at hAbs
+                      cases sint_slot_extract hI (sintCopy_denote_sint hcs.2.2) with
+                      | intro sc hsc =>
+                        have hL : get? locals l = some (.init (.scalar sc)) := by
+                          rw [hcs.2.1, hsc.1]
+                        have hDen := hcs.2.2
+                        rw [hsc.1] at hDen
+                        have hEnvM := setMirAbsSlot_sound hEnv hcs.1 hSA hSetC
+                          ⟨hcs.2.2.1, absVal_uninit_sound_none⟩
+                        have hTyM : ∀ layouts, ∃ ty,
+                            operandTy decls layouts (.move ⟨l, []⟩) = some ty ∧
+                            (MirAbsVal.sint i a none).kindOk ty.kind :=
+                          fun _ => ⟨d.ty, (operandTy_local hcs.1).2, hcs.2.2.1⟩
+                        cases hB : Nat.beq src l with
+                        | true =>
+                          simp only [hB] at hAbs
+                          injection hAbs with hAbs
+                          injection hAbs with hAv hE
+                          subst hAv
+                          subst hE
+                          refine ⟨.scalar sc, locals', ?_, ⟨hI, hsc.2.1, hsc.2.2,
+                            True.intro⟩, hEnvM, hMvNone, hMvSome, hTyM⟩
+                          intro borrows globals layouts callerLocals cdecls callStack _
+                          simp only [evalOperand, hL, readProjectedValue, hSetC]
+                        | false =>
+                          simp only [hB] at hAbs
+                          injection hAbs with hAbs
+                          injection hAbs with hAv hE
+                          subst hAv
+                          subst hE
+                          refine ⟨.scalar sc, locals', ?_, ⟨hI, hsc.2.1, hsc.2.2,
+                            ?_⟩, hEnvM, hMvNone, hMvSome, hTyM⟩
+                          · intro borrows globals layouts callerLocals cdecls
+                              callStack _
+                            simp only [evalOperand, hL, readProjectedValue, hSetC]
+                          · show localUintNat? locals' src (intTwin i) = some sc.bits
+                            rw [localUintNat?_set?_ne (intTwin i) hSetC
+                              (fun hE => nat_ne_of_beq_false hB hE.symm)]
+                            exact hDen.2.2.2
                 | bool ba =>
                   simp only at hAbs
                   cases hI : ba.isInit with
@@ -1018,6 +1253,45 @@ theorem evalOperandAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                       subst hAv
                       subst hE
                       cases uintBoolPair_slot_extract hI hcs.2.2 with
+                      | intro sc hsc =>
+                        cases hsc with
+                        | intro vb hsc =>
+                          have hL : get? locals l =
+                              some (.init (.aggregate 0 [.scalar sc, vb])) := by
+                            rw [hcs.2.1, hsc.1]
+                          cases boolAbs_denote_some hsc.2.2.2 with
+                          | intro b hb =>
+                            refine ⟨.aggregate 0 [.scalar sc, vb], locals', ?_,
+                              ?_, ?_, hMvNone, hMvSome, ?_⟩
+                            · intro borrows globals layouts callerLocals cdecls callStack _
+                              simp only [evalOperand, hL, readProjectedValue,
+                                hb.1, hSetC]
+                            · exact ⟨bool_and_true_left hI,
+                                by rw [boolAbs_clearGuardIf_isInit]
+                                   exact bool_and_true_right hI,
+                                hsc.2.1, hsc.2.2.1,
+                                boolAbs_clearGuardIf_denote_update hSetC
+                                  hsc.2.2.2⟩
+                            · exact setMirAbsSlot_sound hEnv hcs.1 hSA hSetC
+                                ⟨hcs.2.2.1, absVal_uninit_sound_none, True.intro⟩
+                            · intro layouts
+                              exact ⟨d.ty, (operandTy_local hcs.1).2, hcs.2.2.1⟩
+                | sintBoolPair i a ov =>
+                  simp only at hAbs
+                  cases hI : (a.isInit && ov.isInit) with
+                  | false => rw [hI] at hAbs; nomatch hAbs
+                  | true =>
+                    cases hSA : setMirAbsSlot l
+                        (.sintBoolPair i (AbsVal.uninit (uintWidth (intTwin i)))
+                          .uninit) env with
+                    | none => rw [hI, hSA] at hAbs; nomatch hAbs
+                    | some envM =>
+                      rw [hI, hSA] at hAbs
+                      injection hAbs with hAbs
+                      injection hAbs with hAv hE
+                      subst hAv
+                      subst hE
+                      cases sintBoolPair_slot_extract hI hcs.2.2 with
                       | intro sc hsc =>
                         cases hsc with
                         | intro vb hsc =>
@@ -3366,7 +3640,20 @@ theorem mkSintVal_denote {locals : List LocalSlot} {i : IntTy} {a : AbsVal}
     (mkSintVal i a).denote locals (.scalar ⟨bits, uintBytes (intTwin i)⟩) :=
   ⟨absVal_ensureInit_isInit _ a, rfl, absVal_ensureInit_sound h, True.intro⟩
 
-/-- `a` (a signed bit pattern) is certainly non-negative. -/
+/-- Checked signed arithmetic tuple `(i, bool)` (initialized). -/
+def mkSintBoolPairVal (i : IntTy) (a : AbsVal) (ov : BoolAbs) : MirAbsVal :=
+  .sintBoolPair i (AbsVal.ensureInit (uintWidth (intTwin i)) a) ov
+
+theorem mkSintBoolPairVal_denote {locals : List LocalSlot} {i : IntTy}
+    {a : AbsVal} {ov : BoolAbs} {bits : Nat} {vb : Value}
+    (hOvI : ov.isInit = true)
+    (ha : a.denote (uintWidth (intTwin i)) (some bits))
+    (hov : ov.denote locals (some vb)) :
+    (mkSintBoolPairVal i a ov).denote locals
+      (.aggregate 0 [.scalar ⟨bits, uintBytes (intTwin i)⟩, vb]) :=
+  ⟨absVal_ensureInit_isInit _ a, hOvI, rfl, absVal_ensureInit_sound ha, hov⟩
+
+/-- `a` (a signed bit pattern) is certainly non-negative (`< 2^(w-1)`). -/
 def sintNonneg (i : IntTy) (a : AbsVal) : Bool :=
   match a.ubound? with
   | some hi => Nat.blt hi (modPow2 (uintWidth (intTwin i)) / 2)
@@ -3381,6 +3668,515 @@ theorem sintNonneg_sound {i : IntTy} {a : AbsVal} {x : Nat}
   | some hi =>
     rw [hU] at h
     exact Nat.lt_of_le_of_lt (absVal_ubound?_sound hU hx) (lt_of_blt_true h)
+
+/-- `a` (a signed bit pattern) is certainly negative (`≥ 2^(w-1)`). -/
+def sintNeg (i : IntTy) (a : AbsVal) : Bool :=
+  match a.lbound? with
+  | some lo => Nat.ble (modPow2 (uintWidth (intTwin i)) / 2) lo
+  | none => false
+
+theorem sintNeg_sound {i : IntTy} {a : AbsVal} {x : Nat}
+    (h : sintNeg i a = true) (hx : a.denote (uintWidth (intTwin i)) (some x)) :
+    modPow2 (uintWidth (intTwin i)) / 2 ≤ x ∧
+      x < modPow2 (uintWidth (intTwin i)) := by
+  unfold sintNeg at h
+  cases hL : a.lbound? with
+  | none => rw [hL] at h; nomatch h
+  | some lo =>
+    rw [hL] at h
+    exact ⟨Nat.le_trans (Nat.le_of_ble_eq_true h) (absVal_lbound?_sound hL hx),
+      (absVal_some_elim hx).1⟩
+
+/-- Certifies `signedOverflowAdd x y (uintBytes (intTwin i)) = false`. -/
+def sintNoOverflowAdd (i : IntTy) (a1 a2 : AbsVal) : Bool :=
+  let w := uintWidth (intTwin i)
+  isZeroExact w a1 || isZeroExact w a2 ||
+    (sintNonneg i a1 && sintNeg i a2) ||
+    (sintNeg i a1 && sintNonneg i a2) ||
+    match a1.ubound?, a2.ubound? with
+    | some hi1, some hi2 => Nat.blt (hi1 + hi2) (modPow2 w / 2)
+    | _, _ => false
+
+theorem sintNoOverflowAdd_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
+    (h : sintNoOverflowAdd i a1 a2 = true)
+    (hx : a1.denote (uintWidth (intTwin i)) (some x))
+    (hy : a2.denote (uintWidth (intTwin i)) (some y)) :
+    signedOverflowAdd x y (uintBytes (intTwin i)) = false := by
+  unfold sintNoOverflowAdd at h
+  cases hZ1 : isZeroExact (uintWidth (intTwin i)) a1 with
+  | true =>
+    have hx0 := isZeroExact_eq hZ1 hx
+    subst hx0
+    exact signedOverflowAdd_false_of_zero_left (absVal_some_elim hy).1
+  | false =>
+    cases hZ2 : isZeroExact (uintWidth (intTwin i)) a2 with
+    | true =>
+      have hy0 := isZeroExact_eq hZ2 hy
+      subst hy0
+      exact signedOverflowAdd_false_of_zero_right (absVal_some_elim hx).1
+    | false =>
+      cases hO1 : (sintNonneg i a1 && sintNeg i a2) with
+      | true =>
+        have h1 := sintNonneg_sound (bool_and_true_left hO1) hx
+        have h2 := sintNeg_sound (bool_and_true_right hO1) hy
+        exact signedOverflowAdd_false_of_opp_sign (Or.inl ⟨h1, h2.1, h2.2⟩)
+      | false =>
+        cases hO2 : (sintNeg i a1 && sintNonneg i a2) with
+        | true =>
+          have h1 := sintNeg_sound (bool_and_true_left hO2) hx
+          have h2 := sintNonneg_sound (bool_and_true_right hO2) hy
+          exact signedOverflowAdd_false_of_opp_sign (Or.inr ⟨h1.1, h1.2, h2⟩)
+        | false =>
+          simp only [hZ1, hZ2, hO1, hO2, Bool.false_or] at h
+          cases hU1 : a1.ubound? with
+          | none => rw [hU1] at h; nomatch h
+          | some hi1 =>
+            cases hU2 : a2.ubound? with
+            | none => rw [hU1, hU2] at h; nomatch h
+            | some hi2 =>
+              rw [hU1, hU2] at h
+              have hSumLt : x + y < modPow2 (uintWidth (intTwin i)) / 2 :=
+                Nat.lt_of_le_of_lt
+                  (Nat.add_le_add (absVal_ubound?_sound hU1 hx)
+                    (absVal_ubound?_sound hU2 hy))
+                  (lt_of_blt_true h)
+              exact signedOverflowAdd_false_of_nonneg_lt
+                (Nat.lt_of_le_of_lt (Nat.le_add_right x y) hSumLt)
+                (Nat.lt_of_le_of_lt (Nat.le_add_left y x) hSumLt) hSumLt
+
+/-- Certifies `signedOverflowSub x y (uintBytes (intTwin i)) = false`. -/
+def sintNoOverflowSub (i : IntTy) (a1 a2 : AbsVal) : Bool :=
+  isZeroExact (uintWidth (intTwin i)) a2 ||
+    (sintNonneg i a1 && sintNonneg i a2) ||
+    (sintNeg i a1 && sintNeg i a2)
+
+theorem sintNoOverflowSub_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
+    (h : sintNoOverflowSub i a1 a2 = true)
+    (hx : a1.denote (uintWidth (intTwin i)) (some x))
+    (hy : a2.denote (uintWidth (intTwin i)) (some y)) :
+    signedOverflowSub x y (uintBytes (intTwin i)) = false := by
+  unfold sintNoOverflowSub at h
+  cases hZ2 : isZeroExact (uintWidth (intTwin i)) a2 with
+  | true =>
+    have hy0 := isZeroExact_eq hZ2 hy
+    subst hy0
+    exact signedOverflowSub_false_of_zero_right (absVal_some_elim hx).1
+  | false =>
+    cases hNN : (sintNonneg i a1 && sintNonneg i a2) with
+    | true =>
+      exact signedOverflowSub_false_of_same_sign
+        (Or.inl ⟨sintNonneg_sound (bool_and_true_left hNN) hx,
+          sintNonneg_sound (bool_and_true_right hNN) hy⟩)
+    | false =>
+      simp only [hZ2, hNN, Bool.false_or] at h
+      have h1 := sintNeg_sound (bool_and_true_left h) hx
+      have h2 := sintNeg_sound (bool_and_true_right h) hy
+      exact signedOverflowSub_false_of_same_sign
+        (Or.inr ⟨h1.1, h1.2, h2.1, h2.2⟩)
+
+/-- Certifies `signedOverflowMul x y (uintBytes (intTwin i)) = false`. -/
+def sintNoOverflowMul (i : IntTy) (a1 a2 : AbsVal) : Bool :=
+  let w := uintWidth (intTwin i)
+  isZeroExact w a1 || isZeroExact w a2 ||
+    (sintNonneg i a1 && sintNonneg i a2 &&
+      match a1.ubound?, a2.ubound? with
+      | some hi1, some hi2 => Nat.blt (hi1 * hi2) (modPow2 w / 2)
+      | _, _ => false)
+
+theorem sintNoOverflowMul_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
+    (h : sintNoOverflowMul i a1 a2 = true)
+    (hx : a1.denote (uintWidth (intTwin i)) (some x))
+    (hy : a2.denote (uintWidth (intTwin i)) (some y)) :
+    signedOverflowMul x y (uintBytes (intTwin i)) = false := by
+  unfold sintNoOverflowMul at h
+  cases hZ1 : isZeroExact (uintWidth (intTwin i)) a1 with
+  | true =>
+    have hx0 := isZeroExact_eq hZ1 hx
+    subst hx0
+    exact signedOverflowMul_false_of_zero_left (absVal_some_elim hy).1
+  | false =>
+    cases hZ2 : isZeroExact (uintWidth (intTwin i)) a2 with
+    | true =>
+      have hy0 := isZeroExact_eq hZ2 hy
+      subst hy0
+      exact signedOverflowMul_false_of_zero_right (absVal_some_elim hx).1
+    | false =>
+      simp only [hZ1, hZ2, Bool.false_or] at h
+      have hNN := bool_and_true_left h
+      have hProdB := bool_and_true_right h
+      cases hU1 : a1.ubound? with
+      | none => rw [hU1] at hProdB; nomatch hProdB
+      | some hi1 =>
+        cases hU2 : a2.ubound? with
+        | none => rw [hU1, hU2] at hProdB; nomatch hProdB
+        | some hi2 =>
+          rw [hU1, hU2] at hProdB
+          have hProdLt : x * y < modPow2 (uintWidth (intTwin i)) / 2 :=
+            Nat.lt_of_le_of_lt
+              (Nat.mul_le_mul (absVal_ubound?_sound hU1 hx)
+                (absVal_ubound?_sound hU2 hy))
+              (lt_of_blt_true hProdB)
+          exact signedOverflowMul_false_of_nonneg_lt
+            (sintNonneg_sound (bool_and_true_left hNN) hx)
+            (sintNonneg_sound (bool_and_true_right hNN) hy) hProdLt
+
+/-- Certifies `¬ (x = MIN ∧ y = -1)` for signed division / remainder. -/
+def sintNotMinDivNegOne (i : IntTy) (a1 a2 : AbsVal) : Bool :=
+  let w := uintWidth (intTwin i)
+  let m := modPow2 w
+  sintNonneg i a1 || sintNonneg i a2 ||
+    (match AbsVal.decideEq? w a1 (AbsVal.const w (m / 2)) with
+     | some false => true
+     | _ => false) ||
+    (match AbsVal.decideEq? w a2 (AbsVal.const w (m - 1)) with
+     | some false => true
+     | _ => false)
+
+theorem sintNotMinDivNegOne_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
+    (h : sintNotMinDivNegOne i a1 a2 = true)
+    (hx : a1.denote (uintWidth (intTwin i)) (some x))
+    (hy : a2.denote (uintWidth (intTwin i)) (some y)) :
+    ¬ (x = modPow2 (uintWidth (intTwin i)) / 2 ∧
+       y = modPow2 (uintWidth (intTwin i)) - 1) := by
+  intro hBad
+  unfold sintNotMinDivNegOne at h
+  cases hN1 : sintNonneg i a1 with
+  | true =>
+    have hLt := sintNonneg_sound hN1 hx
+    rw [hBad.1] at hLt
+    exact Nat.lt_irrefl _ hLt
+  | false =>
+    cases hN2 : sintNonneg i a2 with
+    | true =>
+      have hLt := sintNonneg_sound hN2 hy
+      have hGe := half_le_sub_one_uint (intTwin i)
+      rw [hBad.2] at hLt
+      exact Nat.not_le_of_gt hLt hGe
+    | false =>
+      simp only [hN1, hN2, Bool.false_or] at h
+      have hCheck2 :
+          (match AbsVal.decideEq? (uintWidth (intTwin i)) a2
+              (AbsVal.const (uintWidth (intTwin i))
+                (modPow2 (uintWidth (intTwin i)) - 1)) with
+           | some false => true
+           | _ => false) = true → False := by
+        intro h2
+        cases hE2 : AbsVal.decideEq? (uintWidth (intTwin i)) a2
+            (AbsVal.const (uintWidth (intTwin i))
+              (modPow2 (uintWidth (intTwin i)) - 1)) with
+        | none => rw [hE2] at h2; nomatch h2
+        | some b2 =>
+          cases b2 with
+          | true => rw [hE2] at h2; nomatch h2
+          | false =>
+            have hM1Lt : modPow2 (uintWidth (intTwin i)) - 1 <
+                modPow2 (uintWidth (intTwin i)) :=
+              Nat.sub_lt (modPow2_pos _) Nat.zero_lt_one
+            have hBeq := absVal_decideEq?_sound hE2 hy
+              (absVal_const_denote_lt (uintWidth_valid (intTwin i)) hM1Lt)
+            exact nat_ne_of_beq_false hBeq hBad.2
+      cases hE1 : AbsVal.decideEq? (uintWidth (intTwin i)) a1
+          (AbsVal.const (uintWidth (intTwin i))
+            (modPow2 (uintWidth (intTwin i)) / 2)) with
+      | some b1 =>
+        cases b1 with
+        | false =>
+          have hHalfLt : modPow2 (uintWidth (intTwin i)) / 2 <
+              modPow2 (uintWidth (intTwin i)) :=
+            Nat.lt_of_le_of_lt (half_le_sub_one_uint (intTwin i))
+              (Nat.sub_lt (modPow2_pos _) Nat.zero_lt_one)
+          have hBeq := absVal_decideEq?_sound hE1 hx
+            (absVal_const_denote_lt (uintWidth_valid (intTwin i)) hHalfLt)
+          exact nat_ne_of_beq_false hBeq hBad.1
+        | true =>
+          simp only [hE1, Bool.false_or] at h
+          exact hCheck2 h
+      | none =>
+        simp only [hE1, Bool.false_or] at h
+        exact hCheck2 h
+
+/-- Build the `BoolAbs` for a sign test (`wantNonneg = true` means `x ≥_s 0`,
+i.e. `x ≤ 2^(w-1) - 1`; `wantNonneg = false` means `x <_s 0`, i.e.
+`x > 2^(w-1) - 1`), attaching a `RelGuard` on `src` even when `a` is `top`. -/
+def sintSignTestBool (i : IntTy) (a : AbsVal) (src : Option Nat)
+    (wantNonneg : Bool) : BoolAbs :=
+  let u := intTwin i
+  let half1 := modPow2 (uintWidth u) / 2 - 1
+  let g : RelGuard :=
+    match src with
+    | some r =>
+      match wantNonneg with
+      | true => .uleConst r u half1
+      | false => .ugtConst r u half1
+    | none => .none
+  match sintNonneg i a with
+  | true => .exact wantNonneg g
+  | false =>
+    match sintNeg i a with
+    | true => .exact (!wantNonneg) g
+    | false => .top g
+
+theorem sintSignTestBool_sound {locals : List LocalSlot} {i : IntTy}
+    {a : AbsVal} {src : Option Nat} {x : Nat} (wantNonneg : Bool)
+    (hx : a.denote (uintWidth (intTwin i)) (some x))
+    (hSrc : ∀ r, src = some r → localUintNat? locals r (intTwin i) = some x) :
+    (sintSignTestBool i a src wantNonneg).denoteBool locals
+      (match wantNonneg with
+       | true => Nat.ble x (modPow2 (uintWidth (intTwin i)) / 2 - 1)
+       | false => !(Nat.ble x (modPow2 (uintWidth (intTwin i)) / 2 - 1))) := by
+  let half1 := modPow2 (uintWidth (intTwin i)) / 2 - 1
+  let bRes :=
+    match wantNonneg with
+    | true => Nat.ble x half1
+    | false => !(Nat.ble x half1)
+  have hGuard :
+      (match src with
+       | some r =>
+         match wantNonneg with
+         | true => RelGuard.uleConst r (intTwin i) half1
+         | false => RelGuard.ugtConst r (intTwin i) half1
+       | none => RelGuard.none).denote locals bRes := by
+    cases src with
+    | none => exact True.intro
+    | some r =>
+      cases wantNonneg with
+      | true =>
+        intro x' hx'
+        rw [hSrc r rfl] at hx'
+        injection hx' with hxEq
+        subst hxEq
+        exact nat_ble_true_iff
+      | false =>
+        intro x' hx'
+        rw [hSrc r rfl] at hx'
+        injection hx' with hxEq
+        subst hxEq
+        dsimp only [bRes]
+        exact ⟨fun hb =>
+          Nat.lt_of_not_le (fun hle => by
+            rw [Nat.ble_eq_true_of_le hle] at hb; nomatch hb),
+          fun hlt => by
+            cases hb : Nat.ble x half1 with
+            | false => rfl
+            | true =>
+              exact False.elim (Nat.not_le_of_gt hlt (Nat.le_of_ble_eq_true hb))⟩
+  unfold sintSignTestBool
+  cases hNN : sintNonneg i a with
+  | true =>
+    have hBleT : Nat.ble x half1 = true :=
+      Nat.ble_eq_true_of_le (Nat.le_sub_one_of_lt (sintNonneg_sound hNN hx))
+    refine ⟨?_, hGuard⟩
+    cases wantNonneg with
+    | true => exact hBleT
+    | false => dsimp only; rw [hBleT]; rfl
+  | false =>
+    cases hNeg : sintNeg i a with
+    | true =>
+      have hGt : half1 < x :=
+        Nat.lt_of_lt_of_le (Nat.sub_lt (half_pos_uint (intTwin i)) Nat.zero_lt_one)
+          (sintNeg_sound hNeg hx).1
+      have hBleF : Nat.ble x half1 = false := by
+        cases hb : Nat.ble x half1 with
+        | false => rfl
+        | true => exact False.elim (Nat.not_le_of_gt hGt (Nat.le_of_ble_eq_true hb))
+      refine ⟨?_, hGuard⟩
+      cases wantNonneg with
+      | true => exact hBleF
+      | false => dsimp only; rw [hBleF]
+    | false =>
+      exact hGuard
+
+/-- Exact `BoolAbs` + `RelGuard` for the 8 signed sign-test comparisons against
+`0` (`x < 0`, `x ≥ 0`, `0 > y`, `0 ≤ y`) and `-1` (`x ≤ -1`, `x > -1`,
+`-1 ≥ y`, `-1 < y`). -/
+def sintSignCmpAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (srcL : Option Nat)
+    (a2 : AbsVal) (srcR : Option Nat) : Option BoolAbs :=
+  let w := uintWidth (intTwin i)
+  let m1 := modPow2 w - 1
+  match op with
+  | .lt =>
+    match isZeroExact w a2 with
+    | true => some (sintSignTestBool i a1 srcL false)
+    | false =>
+      match a1.exactVal? w with
+      | some v =>
+        match Nat.beq v m1 with
+        | true => some (sintSignTestBool i a2 srcR true)
+        | false => none
+      | none => none
+  | .ge =>
+    match isZeroExact w a2 with
+    | true => some (sintSignTestBool i a1 srcL true)
+    | false =>
+      match a1.exactVal? w with
+      | some v =>
+        match Nat.beq v m1 with
+        | true => some (sintSignTestBool i a2 srcR false)
+        | false => none
+      | none => none
+  | .gt =>
+    match isZeroExact w a1 with
+    | true => some (sintSignTestBool i a2 srcR false)
+    | false =>
+      match a2.exactVal? w with
+      | some v =>
+        match Nat.beq v m1 with
+        | true => some (sintSignTestBool i a1 srcL true)
+        | false => none
+      | none => none
+  | .le =>
+    match isZeroExact w a1 with
+    | true => some (sintSignTestBool i a2 srcR true)
+    | false =>
+      match a2.exactVal? w with
+      | some v =>
+        match Nat.beq v m1 with
+        | true => some (sintSignTestBool i a1 srcL false)
+        | false => none
+      | none => none
+  | _ => none
+
+theorem sintSignCmpAbs_sound {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
+    {srcL srcR : Option Nat} {ba : BoolAbs} {locals : List LocalSlot}
+    {x y : Nat} (mem : Memory)
+    (h : sintSignCmpAbs op i a1 srcL a2 srcR = some ba)
+    (hx : a1.denote (uintWidth (intTwin i)) (some x))
+    (hy : a2.denote (uintWidth (intTwin i)) (some y))
+    (hL : ∀ r, srcL = some r → localUintNat? locals r (intTwin i) = some x)
+    (hR : ∀ r, srcR = some r → localUintNat? locals r (intTwin i) = some y) :
+    ∃ v, evalScalarBinOp op ⟨x, uintBytes (intTwin i)⟩
+        ⟨y, uintBytes (intTwin i)⟩ locals mem true = .ok v locals mem ∧
+      ba.denote locals (some v) := by
+  have hxLt := (absVal_some_elim hx).1
+  have hyLt := (absVal_some_elim hy).1
+  cases op with
+  | lt =>
+    simp only [sintSignCmpAbs] at h
+    cases hZ : isZeroExact (uintWidth (intTwin i)) a2 with
+    | true =>
+      rw [hZ] at h; injection h with h; subst h
+      have hy0 := isZeroExact_eq hZ hy; subst hy0
+      refine ⟨.scalar (boolToScalar (signedLt x 0 (uintBytes (intTwin i)))),
+        ?_, ?_⟩
+      · simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+      · rw [signedLt_zero_eq hxLt]
+        exact boolAbs_denote_of_bool (sintSignTestBool_sound false hx hL)
+    | false =>
+      rw [hZ] at h
+      cases hEx : a1.exactVal? (uintWidth (intTwin i)) with
+      | none => rw [hEx] at h; nomatch h
+      | some v =>
+        rw [hEx] at h
+        dsimp only at h
+        cases hEq : Nat.beq v (modPow2 (uintWidth (intTwin i)) - 1) with
+        | false => rw [hEq] at h; nomatch h
+        | true =>
+          rw [hEq] at h; injection h with h; subst h
+          have hxEq : x = modPow2 (uintWidth (intTwin i)) - 1 :=
+            Eq.trans (exactVal?_eq hEx hx).symm (Nat.eq_of_beq_eq_true hEq)
+          subst hxEq
+          refine ⟨.scalar (boolToScalar
+            (signedLt (modPow2 (uintWidth (intTwin i)) - 1) y
+              (uintBytes (intTwin i)))), ?_, ?_⟩
+          · simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+          · rw [signedLt_minusOne_eq hyLt]
+            exact boolAbs_denote_of_bool (sintSignTestBool_sound true hy hR)
+  | le =>
+    simp only [sintSignCmpAbs] at h
+    cases hZ : isZeroExact (uintWidth (intTwin i)) a1 with
+    | true =>
+      rw [hZ] at h; injection h with h; subst h
+      have hx0 := isZeroExact_eq hZ hx; subst hx0
+      refine ⟨.scalar (boolToScalar (!(signedLt y 0 (uintBytes (intTwin i))))),
+        ?_, ?_⟩
+      · simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl, signedLe]
+      · rw [signedLt_zero_eq hyLt, Bool.not_not]
+        exact boolAbs_denote_of_bool (sintSignTestBool_sound true hy hR)
+    | false =>
+      rw [hZ] at h
+      cases hEx : a2.exactVal? (uintWidth (intTwin i)) with
+      | none => rw [hEx] at h; nomatch h
+      | some v =>
+        rw [hEx] at h
+        dsimp only at h
+        cases hEq : Nat.beq v (modPow2 (uintWidth (intTwin i)) - 1) with
+        | false => rw [hEq] at h; nomatch h
+        | true =>
+          rw [hEq] at h; injection h with h; subst h
+          have hyEq : y = modPow2 (uintWidth (intTwin i)) - 1 :=
+            Eq.trans (exactVal?_eq hEx hy).symm (Nat.eq_of_beq_eq_true hEq)
+          subst hyEq
+          refine ⟨.scalar (boolToScalar
+            (!(signedLt (modPow2 (uintWidth (intTwin i)) - 1) x
+              (uintBytes (intTwin i))))), ?_, ?_⟩
+          · simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl,
+              signedLe]
+          · rw [signedLt_minusOne_eq hxLt]
+            exact boolAbs_denote_of_bool (sintSignTestBool_sound false hx hL)
+  | gt =>
+    simp only [sintSignCmpAbs] at h
+    cases hZ : isZeroExact (uintWidth (intTwin i)) a1 with
+    | true =>
+      rw [hZ] at h; injection h with h; subst h
+      have hx0 := isZeroExact_eq hZ hx; subst hx0
+      refine ⟨.scalar (boolToScalar (signedLt y 0 (uintBytes (intTwin i)))),
+        ?_, ?_⟩
+      · simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+      · rw [signedLt_zero_eq hyLt]
+        exact boolAbs_denote_of_bool (sintSignTestBool_sound false hy hR)
+    | false =>
+      rw [hZ] at h
+      cases hEx : a2.exactVal? (uintWidth (intTwin i)) with
+      | none => rw [hEx] at h; nomatch h
+      | some v =>
+        rw [hEx] at h
+        dsimp only at h
+        cases hEq : Nat.beq v (modPow2 (uintWidth (intTwin i)) - 1) with
+        | false => rw [hEq] at h; nomatch h
+        | true =>
+          rw [hEq] at h; injection h with h; subst h
+          have hyEq : y = modPow2 (uintWidth (intTwin i)) - 1 :=
+            Eq.trans (exactVal?_eq hEx hy).symm (Nat.eq_of_beq_eq_true hEq)
+          subst hyEq
+          refine ⟨.scalar (boolToScalar
+            (signedLt (modPow2 (uintWidth (intTwin i)) - 1) x
+              (uintBytes (intTwin i)))), ?_, ?_⟩
+          · simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+          · rw [signedLt_minusOne_eq hxLt]
+            exact boolAbs_denote_of_bool (sintSignTestBool_sound true hx hL)
+  | ge =>
+    simp only [sintSignCmpAbs] at h
+    cases hZ : isZeroExact (uintWidth (intTwin i)) a2 with
+    | true =>
+      rw [hZ] at h; injection h with h; subst h
+      have hy0 := isZeroExact_eq hZ hy; subst hy0
+      refine ⟨.scalar (boolToScalar (!(signedLt x 0 (uintBytes (intTwin i))))),
+        ?_, ?_⟩
+      · simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl, signedLe]
+      · rw [signedLt_zero_eq hxLt, Bool.not_not]
+        exact boolAbs_denote_of_bool (sintSignTestBool_sound true hx hL)
+    | false =>
+      rw [hZ] at h
+      cases hEx : a1.exactVal? (uintWidth (intTwin i)) with
+      | none => rw [hEx] at h; nomatch h
+      | some v =>
+        rw [hEx] at h
+        dsimp only at h
+        cases hEq : Nat.beq v (modPow2 (uintWidth (intTwin i)) - 1) with
+        | false => rw [hEq] at h; nomatch h
+        | true =>
+          rw [hEq] at h; injection h with h; subst h
+          have hxEq : x = modPow2 (uintWidth (intTwin i)) - 1 :=
+            Eq.trans (exactVal?_eq hEx hx).symm (Nat.eq_of_beq_eq_true hEq)
+          subst hxEq
+          refine ⟨.scalar (boolToScalar
+            (!(signedLt (modPow2 (uintWidth (intTwin i)) - 1) y
+              (uintBytes (intTwin i))))), ?_, ?_⟩
+          · simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl,
+              signedLe]
+          · rw [signedLt_minusOne_eq hyLt]
+            exact boolAbs_denote_of_bool (sintSignTestBool_sound false hy hR)
+  | _ => nomatch h
 
 /-- Retype an unsigned-twin result as signed (`bool` results pass through). -/
 def retypeSintResult (i : IntTy) : Option MirAbsVal → Option MirAbsVal
@@ -3414,31 +4210,207 @@ theorem retypeSintResult_denote {i : IntTy} {av0 av : MirAbsVal}
   | unit => nomatch h
   | uintBoolPair _ _ _ => nomatch h
   | sint _ _ _ => nomatch h
+  | sintBoolPair _ _ _ => nomatch h
+
+/-- True iff `op` is a bit-shift operator (which permits mixed integer widths
+and mixed signedness between LHS and RHS). -/
+def binOpIsShift : BinOp → Bool
+  | .shl | .shr | .shlUnchecked | .shrUnchecked => true
+  | _ => false
+
+/-- Signed-LHS shift transfer supporting arbitrary RHS integer width `u2`
+(both unsigned and signed RHS). Left shifts and non-negative right shifts
+reuse `binOpUintAbs` on the unsigned twin. -/
+def shiftSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (u2 : UintTy)
+    (a2 : AbsVal) : Option MirAbsVal :=
+  let u1 := intTwin i
+  let w1 := uintWidth u1
+  let w2 := uintWidth u2
+  match op with
+  | .shl | .shlUnchecked =>
+    retypeSintResult i (binOpUintAbs op u1 a1 none u2 a2 none)
+  | .shr =>
+    match sintNonneg i a1 with
+    | true => retypeSintResult i (binOpUintAbs .shr u1 a1 none u2 a2 none)
+    | false => some (mkSintVal i (AbsVal.topInit w1))
+  | .shrUnchecked =>
+    match sintNonneg i a1 with
+    | true =>
+      retypeSintResult i (binOpUintAbs .shrUnchecked u1 a1 none u2 a2 none)
+    | false =>
+      match AbsVal.shiftInBounds w1 w2 a2 with
+      | true => some (mkSintVal i (AbsVal.topInit w1))
+      | false => none
+  | _ => none
+
+theorem shiftSintAbs_not_offset {op : BinOp} {i : IntTy} {a1 : AbsVal}
+    {u2 : UintTy} {a2 : AbsVal} {av : MirAbsVal}
+    (h : shiftSintAbs op i a1 u2 a2 = some av) : op ≠ .offset := by
+  intro hOp
+  subst hOp
+  nomatch h
+
+theorem shiftSintAbs_sound {op : BinOp} {i : IntTy} {a1 : AbsVal}
+    {u2 : UintTy} {a2 : AbsVal} {av : MirAbsVal} {locals : List LocalSlot}
+    {x y : Nat} (mem : Memory)
+    (h : shiftSintAbs op i a1 u2 a2 = some av)
+    (hi1 : a1.isInit = true) (hi2 : a2.isInit = true)
+    (hx : a1.denote (uintWidth (intTwin i)) (some x))
+    (hy : a2.denote (uintWidth u2) (some y)) :
+    ∃ v, evalScalarBinOp op ⟨x, uintBytes (intTwin i)⟩ ⟨y, uintBytes u2⟩
+        locals mem true = .ok v locals mem ∧
+      av.denote locals v := by
+  cases op with
+  | shl =>
+    simp only [shiftSintAbs] at h
+    cases hB : binOpUintAbs .shl (intTwin i) a1 none u2 a2 none with
+    | none => rw [hB] at h; nomatch h
+    | some av0 =>
+      rw [hB] at h
+      cases binOpUintAbs_sound mem hB hi1 hi2 hx hy
+          (fun _ hr => nomatch hr) (fun _ hr => nomatch hr) with
+      | intro v hv =>
+        rw [evalScalarBinOp_signAgnostic locals mem (op := .shl) rfl]
+        exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
+  | shlUnchecked =>
+    simp only [shiftSintAbs] at h
+    cases hB : binOpUintAbs .shlUnchecked (intTwin i) a1 none u2 a2 none with
+    | none => rw [hB] at h; nomatch h
+    | some av0 =>
+      rw [hB] at h
+      cases binOpUintAbs_sound mem hB hi1 hi2 hx hy
+          (fun _ hr => nomatch hr) (fun _ hr => nomatch hr) with
+      | intro v hv =>
+        rw [evalScalarBinOp_signAgnostic locals mem (op := .shlUnchecked) rfl]
+        exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
+  | shr =>
+    simp only [shiftSintAbs] at h
+    cases hNN : sintNonneg i a1 with
+    | true =>
+      rw [hNN] at h
+      cases hB : binOpUintAbs .shr (intTwin i) a1 none u2 a2 none with
+      | none => rw [hB] at h; nomatch h
+      | some av0 =>
+        rw [hB] at h
+        cases binOpUintAbs_sound mem hB hi1 hi2 hx hy
+            (fun _ hr => nomatch hr) (fun _ hr => nomatch hr) with
+        | intro v hv =>
+          rw [evalScalarBinOp_sint_shr_nonneg locals mem
+            (sintNonneg_sound hNN hx)]
+          exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
+    | false =>
+      rw [hNN] at h; injection h with h; subst h
+      cases evalScalarBinOp_sint_shr locals mem (u := intTwin i) (a := x)
+          (b := y) (u2 := u2) with
+      | intro bits hb =>
+        exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+  | shrUnchecked =>
+    simp only [shiftSintAbs] at h
+    cases hNN : sintNonneg i a1 with
+    | true =>
+      rw [hNN] at h
+      cases hB : binOpUintAbs .shrUnchecked (intTwin i) a1 none u2 a2 none with
+      | none => rw [hB] at h; nomatch h
+      | some av0 =>
+        rw [hB] at h
+        cases binOpUintAbs_sound mem hB hi1 hi2 hx hy
+            (fun _ hr => nomatch hr) (fun _ hr => nomatch hr) with
+        | intro v hv =>
+          rw [evalScalarBinOp_sint_shrUnchecked_nonneg locals mem
+            (sintNonneg_sound hNN hx)]
+          exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
+    | false =>
+      rw [hNN] at h
+      cases hS : AbsVal.shiftInBounds (uintWidth (intTwin i))
+          (uintWidth u2) a2 with
+      | false => rw [hS] at h; nomatch h
+      | true =>
+        rw [hS] at h; injection h with h; subst h
+        cases absVal_shiftInBounds_sound hS hy with
+        | intro y' hy' =>
+          injection hy'.1 with hyEq; subst hyEq
+          cases evalScalarBinOp_sint_shrUnchecked locals mem (u := intTwin i)
+              (a := x) (u2 := u2) hy'.2.1 with
+          | intro bits hb =>
+            exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+  | _ => nomatch h
 
 /-- Abstract signed `BinOp` transfer on operands of equal type `i`, tracked by
-bit pattern: sign-agnostic operators reuse the unsigned transfer on the twin
-type; ordered comparisons reuse it when both operands are certainly
-non-negative (else an unknown `bool`); arithmetic `shr` yields an unknown
-in-range value. Signed division, remainder, unchecked, and checked arithmetic
-have no abstract successor. -/
+two's-complement bit pattern: covers sign-agnostic operators (via the unsigned
+transfer), ordered comparisons (sign tests against `0` and `-1` with `RelGuard`
+synthesis, same-sign unsigned reuse, and opposite-sign exact folding), checked
+(`*WithOverflow`), unchecked (`*Unchecked`), safe `div` / `rem` (exact when
+non-negative), and shifts (`shiftSintAbs`). -/
 def binOpSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (srcL : Option Nat)
     (a2 : AbsVal) (srcR : Option Nat) : Option MirAbsVal :=
   let u := intTwin i
+  let w := uintWidth u
   match binOpSignAgnostic op with
   | true => retypeSintResult i (binOpUintAbs op u a1 srcL u a2 srcR)
   | false =>
     match binOpIsOrdCmp op with
     | true =>
-      match sintNonneg i a1 && sintNonneg i a2 with
-      | true => retypeSintResult i (binOpUintAbs op u a1 srcL u a2 srcR)
-      | false => some (.bool (.top .none))
+      match sintSignCmpAbs op i a1 srcL a2 srcR with
+      | some ba => some (.bool ba)
+      | none =>
+        match (sintNonneg i a1 && sintNonneg i a2) ||
+            (sintNeg i a1 && sintNeg i a2) with
+        | true => retypeSintResult i (binOpUintAbs op u a1 srcL u a2 srcR)
+        | false =>
+          match sintNeg i a1 && sintNonneg i a2 with
+          | true =>
+            some (.bool (.exact
+              (match op with | .lt | .le => true | _ => false) .none))
+          | false =>
+            match sintNonneg i a1 && sintNeg i a2 with
+            | true =>
+              some (.bool (.exact
+                (match op with | .lt | .le => false | _ => true) .none))
+            | false => some (.bool (.top .none))
     | false =>
       match op with
-      | .shr => some (mkSintVal i (AbsVal.topInit (uintWidth u)))
-      | .shrUnchecked =>
-        match AbsVal.shiftInBounds (uintWidth u) (uintWidth u) a2 with
-        | true => some (mkSintVal i (AbsVal.topInit (uintWidth u)))
+      | .shr | .shrUnchecked => shiftSintAbs op i a1 u a2
+      | .addUnchecked =>
+        match sintNoOverflowAdd i a1 a2 with
+        | true => some (mkSintVal i (addUintAbs w a1 a2))
         | false => none
+      | .subUnchecked =>
+        match sintNoOverflowSub i a1 a2 with
+        | true => some (mkSintVal i (subUintAbs w a1 a2))
+        | false => none
+      | .mulUnchecked =>
+        match sintNoOverflowMul i a1 a2 with
+        | true => some (mkSintVal i (mulUintAbs w a1 a2))
+        | false => none
+      | .addWithOverflow =>
+        let ov := match sintNoOverflowAdd i a1 a2 with
+          | true => BoolAbs.exact false .none
+          | false => BoolAbs.top .none
+        some (mkSintBoolPairVal i (addUintAbs w a1 a2) ov)
+      | .subWithOverflow =>
+        let ov := match sintNoOverflowSub i a1 a2 with
+          | true => BoolAbs.exact false .none
+          | false => BoolAbs.top .none
+        some (mkSintBoolPairVal i (subUintAbs w a1 a2) ov)
+      | .mulWithOverflow =>
+        let ov := match sintNoOverflowMul i a1 a2 with
+          | true => BoolAbs.exact false .none
+          | false => BoolAbs.top .none
+        some (mkSintBoolPairVal i (mulUintAbs w a1 a2) ov)
+      | .div =>
+        match nonzeroDivSafe w a2 && sintNotMinDivNegOne i a1 a2 with
+        | false => none
+        | true =>
+          match sintNonneg i a1 && sintNonneg i a2 with
+          | true => some (mkSintVal i (divUintAbs w a1 a2))
+          | false => some (mkSintVal i (AbsVal.topInit w))
+      | .rem =>
+        match nonzeroDivSafe w a2 && sintNotMinDivNegOne i a1 a2 with
+        | false => none
+        | true =>
+          match sintNonneg i a1 && sintNonneg i a2 with
+          | true => some (mkSintVal i (remUintAbs w a1 a2))
+          | false => some (mkSintVal i (AbsVal.topInit w))
       | _ => none
 
 theorem binOpSintAbs_not_offset {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
@@ -3480,52 +4452,215 @@ theorem binOpSintAbs_sound {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
     cases hOrd : binOpIsOrdCmp op with
     | true =>
       simp only [hOrd] at h
-      cases hNN : (sintNonneg i a1 && sintNonneg i a2) with
-      | true =>
-        simp only [hNN] at h
-        cases hB : binOpUintAbs op (intTwin i) a1 srcL (intTwin i) a2 srcR with
-        | none => rw [hB] at h; nomatch h
-        | some av0 =>
-          rw [hB] at h
-          cases binOpUintAbs_sound mem hB hi1 hi2 hx hy hL hR with
-          | intro v hv =>
-            rw [evalScalarBinOp_ordCmp_nonneg locals mem hOrd
-              (sintNonneg_sound (bool_and_true_left hNN) hx)
-              (sintNonneg_sound (bool_and_true_right hNN) hy)]
-            exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
-      | false =>
-        simp only [hNN] at h
+      cases hSign : sintSignCmpAbs op i a1 srcL a2 srcR with
+      | some ba =>
+        rw [hSign] at h
         injection h with h
         subst h
-        cases evalScalarBinOp_ordCmp_bool locals mem (u := intTwin i) (x := x)
-            (y := y) hOrd with
-        | intro c hc =>
-          exact ⟨_, hc, boolAbs_denote_of_bool True.intro⟩
+        exact sintSignCmpAbs_sound mem hSign hx hy hL hR
+      | none =>
+        rw [hSign] at h
+        cases hNN : (sintNonneg i a1 && sintNonneg i a2) with
+        | true =>
+          simp only [hNN, Bool.true_or] at h
+          cases hB : binOpUintAbs op (intTwin i) a1 srcL (intTwin i) a2 srcR with
+          | none => rw [hB] at h; nomatch h
+          | some av0 =>
+            rw [hB] at h
+            cases binOpUintAbs_sound mem hB hi1 hi2 hx hy hL hR with
+            | intro v hv =>
+              rw [evalScalarBinOp_ordCmp_nonneg locals mem hOrd
+                (sintNonneg_sound (bool_and_true_left hNN) hx)
+                (sintNonneg_sound (bool_and_true_right hNN) hy)]
+              exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
+        | false =>
+          cases hNeg2 : (sintNeg i a1 && sintNeg i a2) with
+          | true =>
+            simp only [hNN, hNeg2, Bool.false_or] at h
+            cases hB : binOpUintAbs op (intTwin i) a1 srcL (intTwin i) a2 srcR with
+            | none => rw [hB] at h; nomatch h
+            | some av0 =>
+              rw [hB] at h
+              cases binOpUintAbs_sound mem hB hi1 hi2 hx hy hL hR with
+              | intro v hv =>
+                have h1 := sintNeg_sound (bool_and_true_left hNeg2) hx
+                have h2 := sintNeg_sound (bool_and_true_right hNeg2) hy
+                rw [evalScalarBinOp_ordCmp_neg locals mem hOrd h1.1 h1.2
+                  h2.1 h2.2]
+                exact ⟨v, hv.1, retypeSintResult_denote h hv.2⟩
+          | false =>
+            simp only [hNN, hNeg2, Bool.false_or] at h
+            cases hOpp1 : (sintNeg i a1 && sintNonneg i a2) with
+            | true =>
+              simp only [hOpp1] at h
+              injection h with h
+              subst h
+              have h1 := sintNeg_sound (bool_and_true_left hOpp1) hx
+              have h2 := sintNonneg_sound (bool_and_true_right hOpp1) hy
+              exact ⟨_, evalScalarBinOp_ordCmp_neg_nonneg locals mem hOrd
+                h1.1 h1.2 h2,
+                boolAbs_denote_of_bool (ba := .exact _ .none)
+                  ⟨by cases op <;> rfl, True.intro⟩⟩
+            | false =>
+              simp only [hOpp1] at h
+              cases hOpp2 : (sintNonneg i a1 && sintNeg i a2) with
+              | true =>
+                simp only [hOpp2] at h
+                injection h with h
+                subst h
+                have h1 := sintNonneg_sound (bool_and_true_left hOpp2) hx
+                have h2 := sintNeg_sound (bool_and_true_right hOpp2) hy
+                exact ⟨_, evalScalarBinOp_ordCmp_nonneg_neg locals mem hOrd
+                  h1 h2.1 h2.2,
+                  boolAbs_denote_of_bool (ba := .exact _ .none)
+                    ⟨by cases op <;> rfl, True.intro⟩⟩
+              | false =>
+                simp only [hOpp2] at h
+                injection h with h
+                subst h
+                cases evalScalarBinOp_ordCmp_bool locals mem (u := intTwin i)
+                    (x := x) (y := y) hOrd with
+                | intro c hc =>
+                  exact ⟨_, hc, boolAbs_denote_of_bool True.intro⟩
     | false =>
       simp only [hOrd] at h
       cases op <;> simp only [binOpSignAgnostic, binOpIsOrdCmp,
         reduceCtorEq] at hAg hOrd h
       case shr =>
-        injection h with h
-        subst h
-        cases evalScalarBinOp_sint_shr locals mem (u := intTwin i) (a := x)
-            (b := y) (u2 := intTwin i) with
-        | intro bits hb =>
-          exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+        exact shiftSintAbs_sound mem h hi1 hi2 hx hy
       case shrUnchecked =>
-        cases hS : AbsVal.shiftInBounds (uintWidth (intTwin i))
-            (uintWidth (intTwin i)) a2 with
-        | false => rw [hS] at h; nomatch h
+        exact shiftSintAbs_sound mem h hi1 hi2 hx hy
+      case addUnchecked =>
+        cases hNo : sintNoOverflowAdd i a1 a2 with
+        | false => rw [hNo] at h; nomatch h
         | true =>
-          rw [hS] at h
-          injection h with h
-          subst h
-          cases absVal_shiftInBounds_sound hS hy with
-          | intro y' hy' =>
-            injection hy'.1 with hyEq
-            subst hyEq
-            cases evalScalarBinOp_sint_shrUnchecked locals mem (u := intTwin i)
-                (a := x) (u2 := intTwin i) hy'.2.1 with
+          rw [hNo] at h; injection h with h; subst h
+          exact ⟨_, evalScalarBinOp_sint_addUnchecked locals mem
+            (sintNoOverflowAdd_sound hNo hx hy),
+            mkSintVal_denote (addUintAbs_sound (uintWidth_valid (intTwin i))
+              hi1 hi2 hx hy)⟩
+      case subUnchecked =>
+        cases hNo : sintNoOverflowSub i a1 a2 with
+        | false => rw [hNo] at h; nomatch h
+        | true =>
+          rw [hNo] at h; injection h with h; subst h
+          have hSub := subUintAbs_sound (uintWidth_valid (intTwin i))
+            hi1 hi2 hx hy
+          rw [Nat.add_comm (modPow2 (uintWidth (intTwin i))) x] at hSub
+          exact ⟨_, evalScalarBinOp_sint_subUnchecked locals mem
+            (absVal_some_elim hx).1 (absVal_some_elim hy).1
+            (sintNoOverflowSub_sound hNo hx hy), mkSintVal_denote hSub⟩
+      case mulUnchecked =>
+        cases hNo : sintNoOverflowMul i a1 a2 with
+        | false => rw [hNo] at h; nomatch h
+        | true =>
+          rw [hNo] at h; injection h with h; subst h
+          exact ⟨_, evalScalarBinOp_sint_mulUnchecked locals mem
+            (sintNoOverflowMul_sound hNo hx hy),
+            mkSintVal_denote (mulUintAbs_sound (uintWidth_valid (intTwin i))
+              hx hy)⟩
+      case addWithOverflow =>
+        injection h with h; subst h
+        refine ⟨_, evalScalarBinOp_sint_addWithOverflow locals mem, ?_⟩
+        cases hNo : sintNoOverflowAdd i a1 a2 with
+        | true =>
+          simp only
+          have hF := sintNoOverflowAdd_sound hNo hx hy
+          rw [hF]
+          exact mkSintBoolPairVal_denote rfl
+            (addUintAbs_sound (uintWidth_valid (intTwin i)) hi1 hi2 hx hy)
+            (boolAbs_denote_of_bool ⟨rfl, True.intro⟩)
+        | false =>
+          simp only
+          exact mkSintBoolPairVal_denote rfl
+            (addUintAbs_sound (uintWidth_valid (intTwin i)) hi1 hi2 hx hy)
+            (boolAbs_denote_of_bool True.intro)
+      case subWithOverflow =>
+        injection h with h; subst h
+        have hSub := subUintAbs_sound (uintWidth_valid (intTwin i))
+          hi1 hi2 hx hy
+        rw [Nat.add_comm (modPow2 (uintWidth (intTwin i))) x] at hSub
+        refine ⟨_, evalScalarBinOp_sint_subWithOverflow locals mem
+          (absVal_some_elim hx).1 (absVal_some_elim hy).1, ?_⟩
+        cases hNo : sintNoOverflowSub i a1 a2 with
+        | true =>
+          simp only
+          have hF := sintNoOverflowSub_sound hNo hx hy
+          rw [hF]
+          exact mkSintBoolPairVal_denote rfl hSub
+            (boolAbs_denote_of_bool ⟨rfl, True.intro⟩)
+        | false =>
+          simp only
+          exact mkSintBoolPairVal_denote rfl hSub
+            (boolAbs_denote_of_bool True.intro)
+      case mulWithOverflow =>
+        injection h with h; subst h
+        refine ⟨_, evalScalarBinOp_sint_mulWithOverflow locals mem, ?_⟩
+        cases hNo : sintNoOverflowMul i a1 a2 with
+        | true =>
+          simp only
+          have hF := sintNoOverflowMul_sound hNo hx hy
+          rw [hF]
+          exact mkSintBoolPairVal_denote rfl
+            (mulUintAbs_sound (uintWidth_valid (intTwin i)) hx hy)
+            (boolAbs_denote_of_bool ⟨rfl, True.intro⟩)
+        | false =>
+          simp only
+          exact mkSintBoolPairVal_denote rfl
+            (mulUintAbs_sound (uintWidth_valid (intTwin i)) hx hy)
+            (boolAbs_denote_of_bool True.intro)
+      case div =>
+        cases hOk : (nonzeroDivSafe (uintWidth (intTwin i)) a2 &&
+            sintNotMinDivNegOne i a1 a2) with
+        | false => rw [hOk] at h; nomatch h
+        | true =>
+          rw [hOk] at h
+          have hyPos := nonzeroDivSafe_sound (bool_and_true_left hOk) hy
+          have hyNe : y ≠ 0 := Nat.ne_of_gt hyPos
+          have hNoMin := sintNotMinDivNegOne_sound (bool_and_true_right hOk)
+            hx hy
+          cases hNN : (sintNonneg i a1 && sintNonneg i a2) with
+          | true =>
+            rw [hNN] at h; injection h with h; subst h
+            have hDiv := divUintAbs_sound (uintWidth_valid (intTwin i))
+              hx hy hyPos
+            rw [wrapVal_of_lt (Nat.lt_of_le_of_lt (Nat.div_le_self x y)
+              (absVal_some_elim hx).1)] at hDiv
+            exact ⟨_, evalScalarBinOp_sint_div_nonneg locals mem
+              (sintNonneg_sound (bool_and_true_left hNN) hx)
+              (sintNonneg_sound (bool_and_true_right hNN) hy) hyNe,
+              mkSintVal_denote hDiv⟩
+          | false =>
+            rw [hNN] at h; injection h with h; subst h
+            cases evalScalarBinOp_sint_div_safe locals mem
+                (absVal_some_elim hx).1 (absVal_some_elim hy).1 hyNe hNoMin with
+            | intro bits hb =>
+              exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
+      case rem =>
+        cases hOk : (nonzeroDivSafe (uintWidth (intTwin i)) a2 &&
+            sintNotMinDivNegOne i a1 a2) with
+        | false => rw [hOk] at h; nomatch h
+        | true =>
+          rw [hOk] at h
+          have hyPos := nonzeroDivSafe_sound (bool_and_true_left hOk) hy
+          have hyNe : y ≠ 0 := Nat.ne_of_gt hyPos
+          have hNoMin := sintNotMinDivNegOne_sound (bool_and_true_right hOk)
+            hx hy
+          cases hNN : (sintNonneg i a1 && sintNonneg i a2) with
+          | true =>
+            rw [hNN] at h; injection h with h; subst h
+            have hRem := remUintAbs_sound (uintWidth_valid (intTwin i))
+              hx hy hyPos
+            rw [wrapVal_of_lt (Nat.lt_of_le_of_lt (Nat.mod_le x y)
+              (absVal_some_elim hx).1)] at hRem
+            exact ⟨_, evalScalarBinOp_sint_rem_nonneg locals mem
+              (sintNonneg_sound (bool_and_true_left hNN) hx)
+              (sintNonneg_sound (bool_and_true_right hNN) hy) hyNe,
+              mkSintVal_denote hRem⟩
+          | false =>
+            rw [hNN] at h; injection h with h; subst h
+            cases evalScalarBinOp_sint_rem_safe locals mem
+                (absVal_some_elim hx).1 (absVal_some_elim hy).1 hyNe hNoMin with
             | intro bits hb =>
               exact ⟨_, hb.2, mkSintVal_denote (absVal_topInit_sound hb.1)⟩
 
@@ -3792,6 +4927,13 @@ def evalRvalueAbs (env : MirAbsEnv) : Rvalue → Option (MirAbsVal × MirAbsEnv)
         | true => some (.uintBoolPair u a ov, env₂)
         | false => none
       | _ => none
+    | some (.sint i a _, env₁) =>
+      match evalOperandAbs env₁ op1 with
+      | some (.bool ov, env₂) =>
+        match ov.isInit with
+        | true => some (.sintBoolPair i a ov, env₂)
+        | false => none
+      | _ => none
     | _ => none
   | .binaryOp op lhs rhs =>
     match evalOperandAbs env lhs with
@@ -3808,6 +4950,13 @@ def evalRvalueAbs (env : MirAbsEnv) : Rvalue → Option (MirAbsVal × MirAbsEnv)
         match binOpUintAbs op u1 a1 srcL' u2 a2 srcR with
         | some av => some (av, env₂)
         | none => none
+      | some (.sint i2 a2 _, env₂) =>
+        match binOpIsShift op with
+        | true =>
+          match binOpUintAbs op u1 a1 none (intTwin i2) a2 none with
+          | some av => some (av, env₂)
+          | none => none
+        | false => none
       | _ => none
     | some (.bool ba1, env₁) =>
       match evalOperandAbs env₁ rhs with
@@ -3823,16 +4972,29 @@ def evalRvalueAbs (env : MirAbsEnv) : Rvalue → Option (MirAbsVal × MirAbsEnv)
     | some (.sint i1 a1 srcL, env₁) =>
       match evalOperandAbs env₁ rhs with
       | some (.sint i2 a2 srcR, env₂) =>
-        let srcL' :=
-          match operandMovedLocal? rhs, srcL with
-          | some l, some r =>
-            match Nat.beq r l with
-            | true => none
-            | false => some r
-          | _, _ => srcL
-        match intTyBeq i1 i2 with
+        match binOpIsShift op with
         | true =>
-          match binOpSintAbs op i1 a1 srcL' a2 srcR with
+          match shiftSintAbs op i1 a1 (intTwin i2) a2 with
+          | some av => some (av, env₂)
+          | none => none
+        | false =>
+          let srcL' :=
+            match operandMovedLocal? rhs, srcL with
+            | some l, some r =>
+              match Nat.beq r l with
+              | true => none
+              | false => some r
+            | _, _ => srcL
+          match intTyBeq i1 i2 with
+          | true =>
+            match binOpSintAbs op i1 a1 srcL' a2 srcR with
+            | some av => some (av, env₂)
+            | none => none
+          | false => none
+      | some (.uint u2 a2 _, env₂) =>
+        match binOpIsShift op with
+        | true =>
+          match shiftSintAbs op i1 a1 u2 a2 with
           | some av => some (av, env₂)
           | none => none
         | false => none
@@ -3907,6 +5069,9 @@ theorem validateLoadedValue_ok {layouts : LayoutTable} {decls : List LocalDecl}
       | sint i a src =>
         have hk : ty.kind = .int i := hty.2
         rw [hk]
+      | sintBoolPair i a ov =>
+        have hk : ty.kind = .tuple [.int i, .bool] := hty.2
+        rw [hk]
     | move p =>
       simp only [validateLoadedValue, hty.1]
       cases av with
@@ -3928,6 +5093,9 @@ theorem validateLoadedValue_ok {layouts : LayoutTable} {decls : List LocalDecl}
         rw [hk]
       | sint i a src =>
         have hk : ty.kind = .int i := hty.2
+        rw [hk]
+      | sintBoolPair i a ov =>
+        have hk : ty.kind = .tuple [.int i, .bool] := hty.2
         rw [hk]
 
 theorem operandIsSigned_of_kind {decls : List LocalDecl} {op : Operand}
@@ -4106,6 +5274,7 @@ theorem evalRvalueAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                   | _ => exact False.elim hDen.2
                 | unit => nomatch hAbs
                 | uintBoolPair _ _ _ => nomatch hAbs
+                | sintBoolPair _ _ _ => nomatch hAbs
     | neg =>
       simp only [evalRvalueAbs] at hAbs
       cases hO : evalOperandAbs env op with
@@ -4179,6 +5348,7 @@ theorem evalRvalueAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
               | bool _ => nomatch hAbs
               | unit => nomatch hAbs
               | uintBoolPair _ _ _ => nomatch hAbs
+              | sintBoolPair _ _ _ => nomatch hAbs
     | ptrMetadata => nomatch hAbs
   | cast ck op targetTy =>
     cases ck with
@@ -4271,6 +5441,7 @@ theorem evalRvalueAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                     | _ => exact False.elim hDen.2
                   | unit => nomatch hAbs
                   | uintBoolPair _ _ _ => nomatch hAbs
+                  | sintBoolPair _ _ _ => nomatch hAbs
       · rename_i iDst hK
         cases hO : evalOperandAbs env op with
         | none => rw [hO] at hAbs; nomatch hAbs
@@ -4361,6 +5532,7 @@ theorem evalRvalueAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                     | _ => exact False.elim hDen.2
                   | unit => nomatch hAbs
                   | uintBoolPair _ _ _ => nomatch hAbs
+                  | sintBoolPair _ _ _ => nomatch hAbs
       · nomatch hAbs
     | _ => nomatch hAbs
   | aggregate ak ops =>
@@ -4435,10 +5607,58 @@ theorem evalRvalueAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
                       | unit => nomatch hAbs
                       | uintBoolPair _ _ _ => nomatch hAbs
                       | sint _ _ _ => nomatch hAbs
+                      | sintBoolPair _ _ _ => nomatch hAbs
+                | sint i a src =>
+                  simp only at hAbs
+                  cases hO1 : evalOperandAbs env₁ op1 with
+                  | none => rw [hO1] at hAbs; nomatch hAbs
+                  | some r1 =>
+                    rw [hO1] at hAbs
+                    cases r1 with
+                    | mk av1 env₂ =>
+                      cases av1 with
+                      | bool ov =>
+                        simp only at hAbs
+                        cases hOvI : ov.isInit with
+                        | false => rw [hOvI] at hAbs; nomatch hAbs
+                        | true =>
+                          rw [hOvI] at hAbs
+                          injection hAbs with hAbs
+                          injection hAbs with hAv hE
+                          subst hAv
+                          subst hE
+                          cases evalOperandAbs_sound hEnv hO0 with
+                          | intro v0 hv0 =>
+                            cases hv0 with
+                            | intro locals₁ hv0 =>
+                              cases evalOperandAbs_sound hv0.2.2.1 hO1 with
+                              | intro v1 hv1 =>
+                                cases hv1 with
+                                | intro locals₂ hv1 =>
+                                  have hD0 := hv0.2.1
+                                  cases v0 with
+                                  | scalar sc =>
+                                    have hEv0 := hv0.1 mem.borrows mem.globals
+                                      layouts mem.callerLocals decls
+                                      mem.callStack (Or.inl rfl)
+                                    have hEv1 := hv1.1 mem.borrows mem.globals
+                                      layouts mem.callerLocals decls
+                                      mem.callStack (Or.inl rfl)
+                                    refine ⟨.aggregate 0 [.scalar sc, v1],
+                                      locals₂, ?_,
+                                      ⟨hD0.1, hOvI, hD0.2.1, hD0.2.2.1, hv1.2.1⟩,
+                                      hv1.2.2.1⟩
+                                    simp only [evalRvalue, evalOperands, hEv0, hEv1]
+                                  | _ => exact False.elim hD0.2
+                      | uint _ _ _ => nomatch hAbs
+                      | unit => nomatch hAbs
+                      | uintBoolPair _ _ _ => nomatch hAbs
+                      | sint _ _ _ => nomatch hAbs
+                      | sintBoolPair _ _ _ => nomatch hAbs
                 | bool _ => nomatch hAbs
                 | unit => nomatch hAbs
                 | uintBoolPair _ _ _ => nomatch hAbs
-                | sint _ _ _ => nomatch hAbs
+                | sintBoolPair _ _ _ => nomatch hAbs
     | _ => nomatch hAbs
   | binaryOp op lhs rhs =>
     simp only [evalRvalueAbs] at hAbs
@@ -4560,7 +5780,65 @@ theorem evalRvalueAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
               | bool _ => nomatch hAbs
               | unit => nomatch hAbs
               | uintBoolPair _ _ _ => nomatch hAbs
-              | sint _ _ _ => nomatch hAbs
+              | sintBoolPair _ _ _ => nomatch hAbs
+              | sint i2 a2 srcR =>
+                simp only at hAbs
+                cases hSh : binOpIsShift op with
+                | false => rw [hSh] at hAbs; nomatch hAbs
+                | true =>
+                  rw [hSh] at hAbs
+                  cases hB : binOpUintAbs op u1 a1 none (intTwin i2) a2 none with
+                  | none => rw [hB] at hAbs; nomatch hAbs
+                  | some av0 =>
+                    rw [hB] at hAbs
+                    injection hAbs with hAbs
+                    injection hAbs with hAv hE
+                    subst hAv
+                    subst hE
+                    cases evalOperandAbs_sound hEnv hO1 with
+                    | intro v1 hv1 =>
+                      cases hv1 with
+                      | intro locals₁ hv1 =>
+                        cases evalOperandAbs_sound hv1.2.2.1 hO2 with
+                        | intro v2 hv2 =>
+                          cases hv2 with
+                          | intro locals₂ hv2 =>
+                            cases hv1.2.2.2.2.2 layouts with
+                            | intro ty1 hty1 =>
+                              have hD1 := hv1.2.1
+                              have hD2 := hv2.2.1
+                              cases v1 with
+                              | scalar sc1 =>
+                                cases v2 with
+                                | scalar sc2 =>
+                                  cases sc1 with
+                                  | mk x sz1 =>
+                                    cases sc2 with
+                                    | mk y sz2 =>
+                                      have hS1 : sz1 = uintBytes u1 := hD1.2.1
+                                      have hS2 : sz2 = uintBytes (intTwin i2) := hD2.2.1
+                                      subst hS1
+                                      subst hS2
+                                      have hSg := operandIsSigned_of_kind hty1.1
+                                        (tyIsSigned_of_uint hty1.2)
+                                      have hEval := evalRvalue_binaryOp_scalar
+                                        (binOpUintAbs_not_offset hB)
+                                        (hv1.1 mem.borrows mem.globals layouts
+                                          mem.callerLocals decls mem.callStack
+                                          (Or.inl rfl))
+                                        (hv2.1 mem.borrows mem.globals layouts
+                                          mem.callerLocals decls mem.callStack
+                                          (Or.inl rfl))
+                                      rw [hSg] at hEval
+                                      cases binOpUintAbs_sound mem hB hD1.1 hD2.1
+                                          hD1.2.2.1 hD2.2.2.1
+                                          (fun _ hr => nomatch hr)
+                                          (fun _ hr => nomatch hr) with
+                                      | intro v hv =>
+                                        exact ⟨v, locals₂, Eq.trans hEval hv.1,
+                                          hv.2, hv2.2.2.1⟩
+                                | _ => exact False.elim hD2.2
+                              | _ => exact False.elim hD1.2
         | sint i1 a1 srcL =>
           simp only at hAbs
           cases hO2 : evalOperandAbs env₁ rhs with
@@ -4572,113 +5850,224 @@ theorem evalRvalueAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
               cases av2 with
               | sint i2 a2 srcR =>
                 simp only at hAbs
-                cases hII : intTyBeq i1 i2 with
-                | false => simp only [hII, reduceCtorEq] at hAbs
+                cases hSh : binOpIsShift op with
                 | true =>
-                have hi := intTy_eq_of_beq hII
-                subst hi
-                simp only [hII] at hAbs
-                let srcL' :=
-                  match operandMovedLocal? rhs, srcL with
-                  | some l, some r =>
-                    match Nat.beq r l with
-                    | true => none
-                    | false => some r
-                  | _, _ => srcL
-                cases hB : binOpSintAbs op i1 a1 srcL' a2 srcR with
-                | none => rw [hB] at hAbs; nomatch hAbs
-                | some av0 =>
-                  rw [hB] at hAbs
-                  injection hAbs with hAbs
-                  injection hAbs with hAv hE
-                  subst hAv
-                  subst hE
-                  cases evalOperandAbs_sound hEnv hO1 with
-                  | intro v1 hv1 =>
-                    cases hv1 with
-                    | intro locals₁ hv1 =>
-                      cases evalOperandAbs_sound hv1.2.2.1 hO2 with
-                      | intro v2 hv2 =>
-                        cases hv2 with
-                        | intro locals₂ hv2 =>
-                          cases hv1.2.2.2.2.2 layouts with
-                          | intro ty1 hty1 =>
-                            have hD1 := hv1.2.1
-                            have hD2 := hv2.2.1
-                            cases v1 with
-                            | scalar sc1 =>
-                              cases v2 with
-                              | scalar sc2 =>
-                                cases sc1 with
-                                | mk x sz1 =>
-                                  cases sc2 with
-                                  | mk y sz2 =>
-                                    have hS1 : sz1 = uintBytes (intTwin i1) := hD1.2.1
-                                    have hS2 : sz2 = uintBytes (intTwin i1) := hD2.2.1
-                                    subst hS1
-                                    subst hS2
-                                    have hSg := operandIsSigned_of_kind_true hty1.1
-                                      (tyIsSigned_of_int hty1.2)
-                                    have hEval := evalRvalue_binaryOp_scalar
-                                      (binOpSintAbs_not_offset hB)
-                                      (hv1.1 mem.borrows mem.globals layouts
-                                        mem.callerLocals decls mem.callStack
-                                        (Or.inl rfl))
-                                      (hv2.1 mem.borrows mem.globals layouts
-                                        mem.callerLocals decls mem.callStack
-                                        (Or.inl rfl))
-                                    rw [hSg] at hEval
-                                    have hLsrc : ∀ r, srcL' = some r →
-                                        localUintNat? locals₂ r (intTwin i1) = some x := by
-                                      intro r hr
-                                      dsimp only [srcL'] at hr
-                                      cases hMv : operandMovedLocal? rhs with
-                                      | none =>
-                                        rw [hMv] at hr
-                                        simp only at hr
-                                        rw [hv2.2.2.2.1 hMv]
-                                        have h1 := hD1.2.2.2
-                                        rw [hr] at h1
-                                        exact h1
-                                      | some l =>
-                                        rw [hMv] at hr
-                                        cases hSL : srcL with
-                                        | none => rw [hSL] at hr; nomatch hr
-                                        | some r0 =>
-                                          rw [hSL] at hr
+                  rw [hSh] at hAbs
+                  cases hB : shiftSintAbs op i1 a1 (intTwin i2) a2 with
+                  | none => rw [hB] at hAbs; nomatch hAbs
+                  | some av0 =>
+                    rw [hB] at hAbs
+                    injection hAbs with hAbs
+                    injection hAbs with hAv hE
+                    subst hAv
+                    subst hE
+                    cases evalOperandAbs_sound hEnv hO1 with
+                    | intro v1 hv1 =>
+                      cases hv1 with
+                      | intro locals₁ hv1 =>
+                        cases evalOperandAbs_sound hv1.2.2.1 hO2 with
+                        | intro v2 hv2 =>
+                          cases hv2 with
+                          | intro locals₂ hv2 =>
+                            cases hv1.2.2.2.2.2 layouts with
+                            | intro ty1 hty1 =>
+                              have hD1 := hv1.2.1
+                              have hD2 := hv2.2.1
+                              cases v1 with
+                              | scalar sc1 =>
+                                cases v2 with
+                                | scalar sc2 =>
+                                  cases sc1 with
+                                  | mk x sz1 =>
+                                    cases sc2 with
+                                    | mk y sz2 =>
+                                      have hS1 : sz1 = uintBytes (intTwin i1) := hD1.2.1
+                                      have hS2 : sz2 = uintBytes (intTwin i2) := hD2.2.1
+                                      subst hS1
+                                      subst hS2
+                                      have hSg := operandIsSigned_of_kind_true hty1.1
+                                        (tyIsSigned_of_int hty1.2)
+                                      have hEval := evalRvalue_binaryOp_scalar
+                                        (shiftSintAbs_not_offset hB)
+                                        (hv1.1 mem.borrows mem.globals layouts
+                                          mem.callerLocals decls mem.callStack
+                                          (Or.inl rfl))
+                                        (hv2.1 mem.borrows mem.globals layouts
+                                          mem.callerLocals decls mem.callStack
+                                          (Or.inl rfl))
+                                      rw [hSg] at hEval
+                                      cases shiftSintAbs_sound mem hB hD1.1 hD2.1
+                                          hD1.2.2.1 hD2.2.2.1 with
+                                      | intro v hv =>
+                                        exact ⟨v, locals₂, Eq.trans hEval hv.1,
+                                          hv.2, hv2.2.2.1⟩
+                                | _ => exact False.elim hD2.2
+                              | _ => exact False.elim hD1.2
+                | false =>
+                  rw [hSh] at hAbs
+                  cases hII : intTyBeq i1 i2 with
+                  | false => simp only [hII, reduceCtorEq] at hAbs
+                  | true =>
+                  have hi := intTy_eq_of_beq hII
+                  subst hi
+                  simp only [hII] at hAbs
+                  let srcL' :=
+                    match operandMovedLocal? rhs, srcL with
+                    | some l, some r =>
+                      match Nat.beq r l with
+                      | true => none
+                      | false => some r
+                    | _, _ => srcL
+                  cases hB : binOpSintAbs op i1 a1 srcL' a2 srcR with
+                  | none => rw [hB] at hAbs; nomatch hAbs
+                  | some av0 =>
+                    rw [hB] at hAbs
+                    injection hAbs with hAbs
+                    injection hAbs with hAv hE
+                    subst hAv
+                    subst hE
+                    cases evalOperandAbs_sound hEnv hO1 with
+                    | intro v1 hv1 =>
+                      cases hv1 with
+                      | intro locals₁ hv1 =>
+                        cases evalOperandAbs_sound hv1.2.2.1 hO2 with
+                        | intro v2 hv2 =>
+                          cases hv2 with
+                          | intro locals₂ hv2 =>
+                            cases hv1.2.2.2.2.2 layouts with
+                            | intro ty1 hty1 =>
+                              have hD1 := hv1.2.1
+                              have hD2 := hv2.2.1
+                              cases v1 with
+                              | scalar sc1 =>
+                                cases v2 with
+                                | scalar sc2 =>
+                                  cases sc1 with
+                                  | mk x sz1 =>
+                                    cases sc2 with
+                                    | mk y sz2 =>
+                                      have hS1 : sz1 = uintBytes (intTwin i1) := hD1.2.1
+                                      have hS2 : sz2 = uintBytes (intTwin i1) := hD2.2.1
+                                      subst hS1
+                                      subst hS2
+                                      have hSg := operandIsSigned_of_kind_true hty1.1
+                                        (tyIsSigned_of_int hty1.2)
+                                      have hEval := evalRvalue_binaryOp_scalar
+                                        (binOpSintAbs_not_offset hB)
+                                        (hv1.1 mem.borrows mem.globals layouts
+                                          mem.callerLocals decls mem.callStack
+                                          (Or.inl rfl))
+                                        (hv2.1 mem.borrows mem.globals layouts
+                                          mem.callerLocals decls mem.callStack
+                                          (Or.inl rfl))
+                                      rw [hSg] at hEval
+                                      have hLsrc : ∀ r, srcL' = some r →
+                                          localUintNat? locals₂ r (intTwin i1) = some x := by
+                                        intro r hr
+                                        dsimp only [srcL'] at hr
+                                        cases hMv : operandMovedLocal? rhs with
+                                        | none =>
+                                          rw [hMv] at hr
                                           simp only at hr
-                                          cases hEqRL : Nat.beq r0 l with
-                                          | true => rw [hEqRL] at hr; nomatch hr
-                                          | false =>
-                                            rw [hEqRL] at hr
-                                            injection hr with hr
-                                            subst hr
-                                            cases hv2.2.2.2.2.1 l hMv with
-                                            | intro newCs hSet =>
-                                              have hNe : l ≠ r0 :=
-                                                fun hE => nat_ne_of_beq_false hEqRL hE.symm
-                                              have h1 := hD1.2.2.2
-                                              rw [hSL] at h1
-                                              unfold localUintNat?
-                                              rw [get?_set?_ne hSet hNe]
-                                              exact h1
-                                    have hRsrc : ∀ r, srcR = some r →
-                                        localUintNat? locals₂ r (intTwin i1) = some y := by
-                                      intro r hr
-                                      have h2 := hD2.2.2.2
-                                      rw [hr] at h2
-                                      exact h2
-                                    cases binOpSintAbs_sound mem hB hD1.1 hD2.1
-                                        hD1.2.2.1 hD2.2.2.1 hLsrc hRsrc with
-                                    | intro v hv =>
-                                      exact ⟨v, locals₂, Eq.trans hEval hv.1, hv.2,
-                                        hv2.2.2.1⟩
-                              | _ => exact False.elim hD2.2
-                            | _ => exact False.elim hD1.2
+                                          rw [hv2.2.2.2.1 hMv]
+                                          have h1 := hD1.2.2.2
+                                          rw [hr] at h1
+                                          exact h1
+                                        | some l =>
+                                          rw [hMv] at hr
+                                          cases hSL : srcL with
+                                          | none => rw [hSL] at hr; nomatch hr
+                                          | some r0 =>
+                                            rw [hSL] at hr
+                                            simp only at hr
+                                            cases hEqRL : Nat.beq r0 l with
+                                            | true => rw [hEqRL] at hr; nomatch hr
+                                            | false =>
+                                              rw [hEqRL] at hr
+                                              injection hr with hr
+                                              subst hr
+                                              cases hv2.2.2.2.2.1 l hMv with
+                                              | intro newCs hSet =>
+                                                have hNe : l ≠ r0 :=
+                                                  fun hE => nat_ne_of_beq_false hEqRL hE.symm
+                                                have h1 := hD1.2.2.2
+                                                rw [hSL] at h1
+                                                unfold localUintNat?
+                                                rw [get?_set?_ne hSet hNe]
+                                                exact h1
+                                      have hRsrc : ∀ r, srcR = some r →
+                                          localUintNat? locals₂ r (intTwin i1) = some y := by
+                                        intro r hr
+                                        have h2 := hD2.2.2.2
+                                        rw [hr] at h2
+                                        exact h2
+                                      cases binOpSintAbs_sound mem hB hD1.1 hD2.1
+                                          hD1.2.2.1 hD2.2.2.1 hLsrc hRsrc with
+                                      | intro v hv =>
+                                        exact ⟨v, locals₂, Eq.trans hEval hv.1, hv.2,
+                                          hv2.2.2.1⟩
+                                | _ => exact False.elim hD2.2
+                              | _ => exact False.elim hD1.2
+              | uint u2 a2 srcR =>
+                simp only at hAbs
+                cases hSh : binOpIsShift op with
+                | false => rw [hSh] at hAbs; nomatch hAbs
+                | true =>
+                  rw [hSh] at hAbs
+                  cases hB : shiftSintAbs op i1 a1 u2 a2 with
+                  | none => rw [hB] at hAbs; nomatch hAbs
+                  | some av0 =>
+                    rw [hB] at hAbs
+                    injection hAbs with hAbs
+                    injection hAbs with hAv hE
+                    subst hAv
+                    subst hE
+                    cases evalOperandAbs_sound hEnv hO1 with
+                    | intro v1 hv1 =>
+                      cases hv1 with
+                      | intro locals₁ hv1 =>
+                        cases evalOperandAbs_sound hv1.2.2.1 hO2 with
+                        | intro v2 hv2 =>
+                          cases hv2 with
+                          | intro locals₂ hv2 =>
+                            cases hv1.2.2.2.2.2 layouts with
+                            | intro ty1 hty1 =>
+                              have hD1 := hv1.2.1
+                              have hD2 := hv2.2.1
+                              cases v1 with
+                              | scalar sc1 =>
+                                cases v2 with
+                                | scalar sc2 =>
+                                  cases sc1 with
+                                  | mk x sz1 =>
+                                    cases sc2 with
+                                    | mk y sz2 =>
+                                      have hS1 : sz1 = uintBytes (intTwin i1) := hD1.2.1
+                                      have hS2 : sz2 = uintBytes u2 := hD2.2.1
+                                      subst hS1
+                                      subst hS2
+                                      have hSg := operandIsSigned_of_kind_true hty1.1
+                                        (tyIsSigned_of_int hty1.2)
+                                      have hEval := evalRvalue_binaryOp_scalar
+                                        (shiftSintAbs_not_offset hB)
+                                        (hv1.1 mem.borrows mem.globals layouts
+                                          mem.callerLocals decls mem.callStack
+                                          (Or.inl rfl))
+                                        (hv2.1 mem.borrows mem.globals layouts
+                                          mem.callerLocals decls mem.callStack
+                                          (Or.inl rfl))
+                                      rw [hSg] at hEval
+                                      cases shiftSintAbs_sound mem hB hD1.1 hD2.1
+                                          hD1.2.2.1 hD2.2.2.1 with
+                                      | intro v hv =>
+                                        exact ⟨v, locals₂, Eq.trans hEval hv.1,
+                                          hv.2, hv2.2.2.1⟩
+                                | _ => exact False.elim hD2.2
+                              | _ => exact False.elim hD1.2
               | bool _ => nomatch hAbs
               | unit => nomatch hAbs
               | uintBoolPair _ _ _ => nomatch hAbs
-              | uint _ _ _ => nomatch hAbs
+              | sintBoolPair _ _ _ => nomatch hAbs
         | bool ba1 =>
           simp only at hAbs
           cases hO2 : evalOperandAbs env₁ rhs with
@@ -4746,8 +6135,10 @@ theorem evalRvalueAbs_sound {decls : List LocalDecl} {env env' : MirAbsEnv}
               | unit => nomatch hAbs
               | uintBoolPair _ _ _ => nomatch hAbs
               | sint _ _ _ => nomatch hAbs
+              | sintBoolPair _ _ _ => nomatch hAbs
         | unit => nomatch hAbs
         | uintBoolPair _ _ _ => nomatch hAbs
+        | sintBoolPair _ _ _ => nomatch hAbs
   | _ => nomatch hAbs
 
 /-! ## 8. Statements -/
@@ -4943,6 +6334,12 @@ theorem stepStmtAbs_sound {decls : List LocalDecl} {layouts : LayoutTable}
                     cases v with
                     | scalar sc => simp only [evalStmt, hEv, hPl]
                     | _ => exact False.elim hv.2.1.2
+                  | sintBoolPair i a ov =>
+                    have hk : k = .tuple [.int i, .bool] := hty.2
+                    subst hk
+                    cases v with
+                    | aggregate tag fs => simp only [evalStmt, hEv, hPl]
+                    | _ => exact False.elim hv.2.1.2.2
     | storageLive l =>
       simp only [stepStmtAbs] at hStep
       cases hD : get? decls l with
@@ -5656,6 +7053,7 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                 | _ => exact False.elim hDen.2
               | unit => nomatch hTerm
               | uintBoolPair _ _ _ => nomatch hTerm
+              | sintBoolPair _ _ _ => nomatch hTerm
     | assert cond expected target unwind =>
       simp only [stepTermAbs] at hTerm
       cases hO : evalOperandAbs env cond with
@@ -5847,6 +7245,7 @@ theorem mirAbsSlot_denote_reframe {ty : Ty} {l1 l2 : List LocalSlot}
   | unit _ => exact h
   | uintCopy _ _ _ => nomatch hNoG
   | sint _ _ => exact h
+  | sintCopy _ _ _ => nomatch hNoG
   | bool ba =>
     refine ⟨h.1, ?_⟩
     cases cs with
@@ -5854,6 +7253,31 @@ theorem mirAbsSlot_denote_reframe {ty : Ty} {l1 l2 : List LocalSlot}
     | uninit => exact boolAbs_denote_reframe hNoG h.2
     | init v => exact boolAbs_denote_reframe hNoG h.2
   | uintBoolPair u a ov =>
+    refine ⟨h.1, ?_⟩
+    cases cs with
+    | dead => exact h.2
+    | uninit => exact ⟨h.2.1, boolAbs_denote_reframe hNoG h.2.2⟩
+    | init v =>
+      cases v with
+      | aggregate tag fs =>
+        cases tag with
+        | succ _ => exact h.2
+        | zero =>
+          cases fs with
+          | nil => exact h.2
+          | cons v0 rest =>
+            cases v0 with
+            | scalar sc =>
+              cases rest with
+              | nil => exact h.2
+              | cons vb rest2 =>
+                cases rest2 with
+                | cons _ _ => exact h.2
+                | nil =>
+                  exact ⟨h.2.1, h.2.2.1, boolAbs_denote_reframe hNoG h.2.2.2⟩
+            | _ => exact h.2
+      | _ => exact h.2
+  | sintBoolPair i a ov =>
     refine ⟨h.1, ?_⟩
     cases cs with
     | dead => exact h.2
