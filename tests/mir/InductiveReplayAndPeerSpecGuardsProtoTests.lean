@@ -413,6 +413,28 @@ theorem a2_kindConfusion_and_boolNeg_regression_test :
 #guard_msgs in
 #print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.publicLeakOrDerivingInhabited_forges_invalid_value
 
+/-- B3: a module with a sound checked ctor AND an invariant-preserving method passes the
+    guard, and every client term over it (including method chains) yields a valid payload. -/
+theorem b3_method_preserving_module_sound :
+    let posInv : Nat → Bool := fun n => decide (0 < n)
+    let m : StructModule :=
+      { ctorPrivate := true, derivesInhabited := false, inv := posInv,
+        exports := [.checkedCtor posInv, .transform (· + 1)] }
+    ∀ e : ClientExpr, ∀ v, e.eval m = some v → posInv v = true := by
+  intro posInv m e v h
+  refine moduleSealingGuard_preserves_client_invariant ?_ e h
+  refine ⟨rfl, rfl, ?_⟩
+  intro ex hex
+  simp only [m, List.mem_cons, List.not_mem_nil, or_false] at hex
+  rcases hex with rfl | rfl
+  · exact fun _ hg => hg
+  · intro n _
+    exact decide_eq_true (Nat.succ_pos n)
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant
+
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
@@ -489,6 +511,7 @@ run_cmd do
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.assumesOnlyNegative_monotone,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.checkAssumesNegativePolarity_sound,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.flippedConsequent_violates_antitonicity,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.uncheckedMethod_forges_invalid_value,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.danglingRecursor_rejected_statically_and_postReplay,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardLocalDupCheck_misses_crossShard_conflict,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.crossShardFingerprintReconciliation_sound,

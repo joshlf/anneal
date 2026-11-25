@@ -871,6 +871,17 @@ class TestPillar3Guard3UnsatisfiableExternEnsures(unittest.TestCase):
                 self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(src), [], name)
 
 
+    def test_20e_extern_spec_macro_bodies(self) -> None:
+        """B3: Creusot's `extern_spec! { mod ... { fn ... } }` macro form was unrecognized."""
+        for src in (
+            "extern_spec! {\n  mod core::ptr {\n    #[ensures(false)]\n    fn read_volatile<T>(src: *const T) -> T;\n  }\n}",
+            "extern_spec!( mod m { #[ensures(1 == 2)] fn f() -> u32; } );",
+        ):
+            self.assertEqual(len(proto.scan_rust_unsatisfiable_extern_ensures(src)), 1, src)
+        ok = "extern_spec! { mod m { #[ensures(result == 1)] fn f() -> u32; } }\nfn g() -> u32 { 1 }"
+        self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(ok), [])
+
+
 class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
     def test_21_catches_fndef_value_bind_coercion_higher_order_and_closure(self) -> None:
         src = """
@@ -1462,16 +1473,66 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
         ok = {
             "checked_option_ctor": (
                 sealed_hdr
-                + "\ndef Cap.mkChecked (v : Nat) : Option Cap :=\n"
+                + "\n-- @smart_constructor (B3: reviewed allowlist replaces proof-token heuristics)\n"
+                + "def Cap.mkChecked (v : Nat) : Option Cap :=\n"
                 + "  if h : 0 < v then some ⟨v⟩ else none\n"
             ),
-            "proof_guarded_ctor": sealed_hdr + "\ndef Cap.mkProven (v : Nat) (h : 0 < v) : Cap := ⟨v⟩\n",
+            "proof_guarded_ctor": sealed_hdr + "\n/-- @smart_constructor -/\ndef Cap.mkProven (v : Nat) (h : 0 < v) : Cap := ⟨v⟩\n",
             "private_helper": sealed_hdr + "\nprivate def Cap.mkInternal (v : Nat) : Cap := ⟨v⟩\n",
-            "proof_backed_inhabited": sealed_hdr + "\ninstance : Inhabited Cap := ⟨⟨1, by decide⟩⟩\n",
+            "proof_backed_inhabited": sealed_hdr + "\n-- @smart_constructor\ninstance : Inhabited Cap := ⟨⟨1, by decide⟩⟩\n",
         }
         for name, src in ok.items():
             with self.subTest(name=name):
                 self.assertEqual(proto.scan_lean_invariant_struct_sealing(src), [], name)
+
+    def test_30h_guard6b_fail_closed_leak_detection_redteam(self) -> None:
+        """B3: A2 exempted any public construction whose signature/body merely CONTAINED
+        proof-ish tokens (`=`, `by`, `if h :`) and only inspected bare `S` return types and
+        `Inhabited`/`OfNat` instances. Each case below forges an invariant-violating value."""
+        hdr = "-- @sealed_invariant\nstructure V where\n  private mk ::\n  val : Nat\n"
+        bad = {
+            "option_wrap": "def leak (v : Nat) : Option V := some ⟨v⟩",
+            "irrelevant_proof_binder": "def leak (v : Nat) (h : 0 = 0) : V := ⟨v⟩",
+            "trivial_dite": "def leak (v : Nat) : V := if h : v = v then ⟨v⟩ else ⟨1⟩",
+            "by_exact_payload": "def leak (v : Nat) : V := ⟨by exact v⟩",
+            "coe_instance": "instance : Coe Nat V := ⟨fun n => ⟨n⟩⟩",
+            "inhabited_with_by": "instance : Inhabited V := ⟨⟨by exact 0⟩⟩",
+            "unchecked_method": "def V.decr (x : V) : V := ⟨x.val - 1⟩",
+            "list_wrap": "def leakL (v : Nat) : List V := [V.mk v]",
+            "unmarked_checked": "def mkChecked (n : Nat) (h : 0 < n) : V := V.mk n",
+        }
+        for name, body in bad.items():
+            with self.subTest(name=name):
+                self.assertTrue(proto.scan_lean_invariant_struct_sealing(hdr + body + "\n"), name)
+        ok = {
+            "private_helper": "private def helper (v : Nat) : V := ⟨v⟩",
+            "marked_checked": "-- @smart_constructor\ndef mkChecked (n : Nat) (h : 0 < n) : V := V.mk n",
+            "reader_only": "def V.double (x : V) : Nat × Nat := ⟨x.val, x.val⟩",
+        }
+        for name, body in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_invariant_struct_sealing(hdr + body + "\n"), [], name)
+
+    def test_30i_guard6a_unknown_bool_context_fails_closed(self) -> None:
+        """B3: A2 enumerated `= false` / `!= true` / `!` forms; any other Bool-level context
+        (`= !true`, `== false` (`==` was not even lexed), `.not`, `xor`) bypassed it."""
+        pre = "theorem t (i s : EvalRes Nat) : "
+        for name, stmt in {
+            "eq_not_true": "i.assumesHold = !true → s.output = i.output",
+            "beq_false": "(i.assumesHold == false) = true → s.output = i.output",
+            "dot_not": "(i.assumesHold).not = true → s.output = i.output",
+            "xor": "xor i.assumesHold true = true → s.output = i.output",
+            "wrapped_pred": "P (implAssumes s) → s.output = i.output",
+        }.items():
+            with self.subTest(name=name):
+                self.assertTrue(proto.scan_lean_assumption_polarity(pre + stmt + " := by sorry"), name)
+        for name, stmt in {
+            "clean_eq_true": "i.assumesHold = true → s.output = i.output",
+            "clean_app": "implAssumes s x → s.output = i.output",
+            "clean_beq_true": "(i.assumesHold == true) → s.output = i.output",
+        }.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_assumption_polarity(pre + stmt + " := by sorry"), [], name)
 
     def test_31_live_repo_sweep_zero_false_positives_on_theory_and_anneal_spec(self) -> None:
         res = proto.scan_live_repo_peer_guards(REPO_ROOT)

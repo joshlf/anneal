@@ -3050,6 +3050,25 @@ def scan_rust_unsatisfiable_extern_ensures(
                 i = j + 1
                 continue
 
+        # Creusot `extern_spec! { ... }` macro bodies (B3): every contract inside (incl. nested
+        # `mod`/`impl`/`trait` items) is a trusted extern spec.
+        if (
+            tokens[i].text == "extern_spec"
+            and i + 2 < n
+            and tokens[i + 1].text == "!"
+            and tokens[i + 2].text in ("{", "(", "[")
+        ):
+            brace_depth += 1
+            in_extern_block_brace_depths.append(brace_depth)
+            if tokens[i + 2].text != "{":
+                # Non-brace delimiters: treat the whole macro invocation as one extern region.
+                close = _find_matching_delim(
+                    tokens, i + 2, tokens[i + 2].text, ")" if tokens[i + 2].text == "(" else "]"
+                )
+                tokens = tokens[:close] + [Token("PUNCT", "}", tokens[close].start, tokens[close].end, tokens[close].line)] + tokens[close + 1 :]
+            i += 3
+            continue
+
         if tokens[i].text == "#" and i + 1 < n and tokens[i + 1].text == "[":
             attrs, after_attrs = _collect_rust_outer_attrs(tokens, i)
             is_external_spec_attr = False
@@ -4259,7 +4278,7 @@ def _lex_lean_tokens_impl(text: str) -> tuple[list[Token], list[CommentSpan]]:
     n = len(text)
     i = 0
     line = 1
-    two_char_ops = {"::", ":=", "->", "/\\", "\\/", "!=", "<=", ">=", "&&", "||", "@["}
+    two_char_ops = {"::", ":=", "->", "/\\", "\\/", "!=", "==", "<=", ">=", "&&", "||", "@["}
     unicode_ops = {"→", "↔", "∧", "∨", "¬", "∀", "∃", "≠", "≤", "≥"}
 
     while i < n:
@@ -4682,7 +4701,24 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
                 do_flip = flip_on_true if lhs_s[0].text == "true" else flip_on_false
                 return _check_lean_prop_polarity(rhs_s, _flip_pol(pol) if do_flip else pol)
 
-    # Leaf / atomic expression: check sub-bracketed expressions and direct assumes tokens
+    # Leaf / atomic expression. FAIL CLOSED (B3): an assumption atom is only polarity-
+    # transparent in a *clean* leaf: the atom itself (`i.assumesHold`), optionally applied to
+    # plain arguments (`implAssumes s`). Any other Bool-level context (`= !true`, `== false`,
+    # `.not`, `xor a b`, `P (implAssumes s)`, arithmetic, ...) has unknown polarity and is
+    # flagged in EITHER polarity instead of being enumerated case by case.
+    live_assumes = [
+        k for k, t in enumerate(toks)
+        if _is_assumes_token(t) and not (k + 1 < len(toks) and toks[k + 1].text == ":=")
+    ]
+    if live_assumes:
+        core = _strip_outer_parens(toks)
+        clean = (
+            bool(core)
+            and _is_assumes_token(core[0])
+            and all(t.kind in ("IDENT", "NUMBER") and not _is_assumes_token(t) for t in core[1:])
+        )
+        if not clean:
+            return [toks[live_assumes[0]]]
     bad = []
     i = 0
     while i < len(toks):
@@ -5157,7 +5193,6 @@ def scan_lean_invariant_struct_sealing(
     # sealed invariant-bearing structure (`def V.mk' v := ⟨v⟩`, `instance : Inhabited V := ⟨⟨0⟩⟩`,
     # standalone `deriving instance Inhabited for V`).
     if sealed_targets:
-        _PROOF_SIG_TOKS = frozenset({"=", "<", "≤", ">", "≥", "≠", "Prop", "∧", "∨", "→", "¬", "∀", "∃"})
         i = 0
         while i < n:
             start_i = i
@@ -5254,104 +5289,55 @@ def scan_lean_invariant_struct_sealing(
                     ret_toks = tokens[colon_idx + 1 : assign_idx] if colon_idx != -1 else []
                     body_toks = tokens[assign_idx + 1 : body_end]
 
-                    # Split `ret_toks` on depth-0 arrows to isolate final return type vs antecedents
-                    ret_arrows: list[list[Token]] = []
-                    cur_seg: list[Token] = []
-                    d = 0
-                    for rt in ret_toks:
-                        if rt.text in ("(", "[", "{", "⦃"):
-                            d += 1
-                        elif rt.text in (")", "]", "}", "⦄"):
-                            d = max(0, d - 1)
-                        if d == 0 and rt.text in ("→", "->"):
-                            ret_arrows.append(cur_seg)
-                            cur_seg = []
-                        else:
-                            cur_seg.append(rt)
-                    ret_arrows.append(cur_seg)
-                    final_ret = _strip_outer_parens(ret_arrows[-1]) if ret_arrows else []
-                    ret_antes = ret_arrows[:-1]
 
+                    # FAIL CLOSED (B3): proof-ish tokens (`=`, `by`, `if h :`) in a signature or
+                    # body say nothing about WHICH payload is constrained, so they never exempt a
+                    # same-file public construction. Only an explicitly reviewed smart
+                    # constructor (`-- @smart_constructor` immediately before it) is exempt.
+                    lead = _comments_immediately_before(
+                        comments, tokens[start_i - 1].end if start_i > 0 else 0, tokens[start_i].start
+                    )
+                    is_smart_ctor = any("@smart_constructor" in c.text for c in lead)
                     for st in sealed_targets:
                         if j < st["decl_end"]:
                             continue
                         s_names = {st["qual_name"], st["raw_name"], st["short_leaf"]}
                         ctor = st["ctor_name"]
-                        explicit_ctors = {f"{sn}.{ctor}" for sn in s_names} | {f".{ctor}"}
-                        constructs_directly = any(
-                            t.text in ("⟨", "{") or t.text in explicit_ctors for t in body_toks
-                        ) or any(
-                            body_toks[idx].text == "."
-                            and idx + 1 < len(body_toks)
-                            and body_toks[idx + 1].text == ctor
-                            for idx in range(len(body_toks))
-                        )
-                        if not constructs_directly:
-                            continue
 
-                        if is_inst:
-                            is_default_inst = (
-                                bool(final_ret)
-                                and final_ret[0].text.split(".")[-1] in ("Inhabited", "OfNat")
-                                and any(
-                                    t.text in s_names or t.text.split(".")[-1] == st["short_leaf"]
-                                    for t in final_ret[1:]
-                                )
+                        def _is_s(tok: Token) -> bool:
+                            return tok.text in s_names or tok.text.split(".")[-1] == st["short_leaf"]
+
+                        explicit_ctors = {f"{sn}.{ctor}" for sn in s_names}
+                        explicit_ref = any(t.text in explicit_ctors for t in body_toks) or any(
+                            body_toks[idx].text == "." and idx + 1 < len(body_toks) and body_toks[idx + 1].text == ctor
+                            for idx in range(len(body_toks))
+                        ) or any(t.text == f".{ctor}" for t in body_toks)
+                        anon_or_struct = any(t.text in ("⟨", "{") for t in body_toks)
+                        if not (explicit_ref or anon_or_struct):
+                            continue
+                        # Where can a constructed `S` escape? Through the declared result type
+                        # (`S`, `Option S`, `S × T`, `Nat → S`), an instance whose class type
+                        # mentions `S` (`Inhabited S`, `Coe Nat S`, ...), or an unannotated body
+                        # that ascribes `S`.
+                        escapes = (
+                            explicit_ref
+                            or any(_is_s(t) for t in ret_toks)
+                            or (colon_idx == -1 and any(_is_s(t) for t in body_toks))
+                        )
+                        if not escapes or is_smart_ctor:
+                            continue
+                        what = "instance" if is_inst else kw
+                        findings.append(
+                            _make_peer_finding(
+                                "unsealed_invariant_struct",
+                                st["qual_name"],
+                                tokens[j].line,
+                                f"public same-file `{what} {decl_name}` constructs sealed `{st['short_leaf']}` "
+                                f"directly (bypassing `private {ctor} ::`); fail closed unless reviewed as "
+                                "`-- @smart_constructor`",
+                                file_path=file_path,
                             )
-                            has_proof_in_body = any(
-                                t.text in ("by", "decide", "omega", "simp", "rfl")
-                                for t in body_toks
-                            )
-                            if is_default_inst and not has_proof_in_body:
-                                findings.append(
-                                    _make_peer_finding(
-                                        "unsealed_invariant_struct",
-                                        st["qual_name"],
-                                        tokens[j].line,
-                                        f"public `{final_ret[0].text}` instance `{decl_name}` leaks unguarded private constructor",
-                                        file_path=file_path,
-                                    )
-                                )
-                        else:
-                            returns_bare_s = bool(final_ret) and (
-                                final_ret[0].text in s_names
-                                or final_ret[0].text.split(".")[-1] == st["short_leaf"]
-                            )
-                            unannotated_ctor_leak = (
-                                colon_idx == -1
-                                and any(t.text in {f"{sn}.{ctor}" for sn in s_names} for t in body_toks)
-                                and not any(t.text in ("some", "none", "Except.ok", "Except.error") for t in body_toks)
-                            )
-                            if not (returns_bare_s or unannotated_ctor_leak):
-                                continue
-                            # Check whether signature or body enforces an invariant proof
-                            binder_tys = _lean_binder_types(sig_toks) + ret_antes
-                            has_proof_binder = any(
-                                any(
-                                    bt.text in _PROOF_SIG_TOKS
-                                    or bt.text.lower().endswith("inv")
-                                    or bt.text.lower().startswith("valid")
-                                    for bt in ty
-                                )
-                                for ty in binder_tys
-                            )
-                            has_dite_or_proof = any(t.text == "by" for t in body_toks) or any(
-                                body_toks[idx].text == "if"
-                                and idx + 2 < len(body_toks)
-                                and body_toks[idx + 1].kind == "IDENT"
-                                and body_toks[idx + 2].text == ":"
-                                for idx in range(len(body_toks))
-                            )
-                            if not has_proof_binder and not has_dite_or_proof:
-                                findings.append(
-                                    _make_peer_finding(
-                                        "unsealed_invariant_struct",
-                                        st["qual_name"],
-                                        tokens[j].line,
-                                        f"public same-file `{kw} {decl_name}` leaks private constructor `{ctor}` without invariant check or proof",
-                                        file_path=file_path,
-                                    )
-                                )
+                        )
                 i = max(body_end, start_i + 1)
                 continue
             i = max(j + 1, start_i + 1)

@@ -2996,7 +2996,8 @@ structure SealedCap : Type where
   inv : 0 < val
   deriving DecidableEq
 
-/-- Smart constructor for `SealedCap` enforcing `0 < val`. -/
+/-- Smart constructor for `SealedCap` enforcing `0 < val` (reviewed: `@smart_constructor`,
+    the private `mk` is only reached under the `0 < n` proof). -/
 def SealedCap.mkChecked (n : Nat) : Option SealedCap :=
   if h : 0 < n then some (SealedCap.mk n h) else none
 
@@ -3083,6 +3084,9 @@ inductive PublicExportKind : Type where
   | uncheckedLeak
   /-- Public `Inhabited` / `OfNat` constant instance yielding a fixed payload `d`. -/
   | defaultInstance (defaultVal : Nat)
+  /-- Public same-file METHOD rebuilding a struct from an existing one through the private
+      constructor (e.g. `def V.decr (x : V) : V := ⟨x.val - 1⟩`) (B3). -/
+  | transform (f : Nat → Nat)
 
 /-- Module-boundary specification for an invariant-bearing Lean `structure`. -/
 structure StructModule : Type where
@@ -3101,6 +3105,8 @@ inductive ClientExpr : Type where
   | callExport (idx : Nat) (arg : Nat)
   /-- Client-side branching between two struct-producing expressions. -/
   | choose (cond : Bool) (lhs rhs : ClientExpr)
+  /-- Invocation of same-file public method `#idx` on a client-produced struct (B3). -/
+  | callMethod (idx : Nat) (arg : ClientExpr)
   deriving DecidableEq, Repr, Inhabited
 
 /-- Operational semantics: evaluates a client expression against module `m`, returning
@@ -3113,14 +3119,20 @@ def ClientExpr.eval (m : StructModule) : ClientExpr → Option Nat
     | some (.checkedCtor g) => if g arg then some arg else none
     | some .uncheckedLeak => some arg
     | some (.defaultInstance d) => some d
+    | some (.transform _) => none
     | none => none
   | .choose cond lhs rhs => if cond then lhs.eval m else rhs.eval m
+  | .callMethod idx arg =>
+    match m.exports[idx]? with
+    | some (.transform f) => (arg.eval m).map f
+    | _ => none
 
 /-- Soundness obligation for a same-file public constructor export. -/
 def ExportPreservesInv (inv : Nat → Bool) : PublicExportKind → Prop
   | .checkedCtor g => ∀ n, g n = true → inv n = true
   | .uncheckedLeak => False
   | .defaultInstance d => inv d = true
+  | .transform f => ∀ n, inv n = true → inv (f n) = true
 
 /-- **Module-Boundary Sealing Guard (A2)**: requires `private mk ::`, forbids `deriving Inhabited`,
     and requires every same-file public export to establish the struct invariant `m.inv`. -/
@@ -3191,11 +3203,50 @@ theorem moduleSealingGuard_preserves_client_invariant {m : StructModule}
         simp only [Option.some.injEq] at hEval
         subst hEval
         exact hEx
+      | transform _ =>
+        cases hEval
   | choose cond lhs rhs ihL ihR =>
     intro v hEval
     cases cond with
     | true => exact ihL (by simpa [ClientExpr.eval] using hEval)
     | false => exact ihR (by simpa [ClientExpr.eval] using hEval)
+  | callMethod idx arg ih =>
+    intro v hEval
+    simp only [ClientExpr.eval] at hEval
+    cases hGet : m.exports[idx]? with
+    | none => rw [hGet] at hEval; cases hEval
+    | some ex =>
+      rw [hGet] at hEval
+      have hEx := hGuard.2.2 ex (List.mem_of_getElem? hGet)
+      cases ex with
+      | transform f =>
+        cases hArg : arg.eval m with
+        | none => rw [hArg] at hEval; cases hEval
+        | some w =>
+          rw [hArg] at hEval
+          simp only [Option.map_some, Option.some.injEq] at hEval
+          subst hEval
+          exact hEx w (ih hArg)
+      | checkedCtor _ | uncheckedLeak | defaultInstance _ => cases hEval
+
+/-- **Method-Leak Collapse (B3)**: a module whose ONLY constructor export is a sound checked
+    smart constructor still lets clients forge `0` through an unchecked same-file method
+    `decr` (`⟨x.val - 1⟩`): `checkedCtor (· > 0)` then `decr` yields `0 ∉ inv`. Constructor-only
+    sealing models (A2) miss this; `ModuleSealingGuard` rejects it because `decr` does not
+    preserve the invariant. -/
+theorem uncheckedMethod_forges_invalid_value :
+    let posInv : Nat → Bool := fun n => decide (0 < n)
+    let modWithMethod : StructModule :=
+      { ctorPrivate := true, derivesInhabited := false, inv := posInv,
+        exports := [.checkedCtor posInv, .transform (fun n => n - 1)] }
+    (ClientExpr.callMethod 1 (.callExport 0 1)).eval modWithMethod = some 0 ∧
+      posInv 0 = false ∧
+      ¬ ModuleSealingGuard modWithMethod := by
+  refine ⟨rfl, rfl, ?_⟩
+  intro h
+  have hT := h.2.2 (.transform (fun n => n - 1)) (by simp)
+  have := hT 1 rfl
+  cases this
 
 /-- Combined Guard 6 (`Verifrag` cl/1029131309 + `Samite` cl/1029680381). -/
 def AssumptionPolarityAndStructSealingGuard
