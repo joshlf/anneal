@@ -1459,98 +1459,104 @@ theorem absVal_ubound?_sound {w x hi : Nat} {a : AbsVal}
     · nomatch h
   · nomatch h
 
-/-- Refine `a` under `x ≠ v` by tightening endpoint exclusions (`v = 0`,
-`v = lo`, `v = hi`, or `v = 2^w - 1`). -/
+/-- Refine `a` under `x ≠ v` by intersecting with the exact ring complement
+`[(v + 1) mod 2^w, (v - 1) mod 2^w]` on `Z / 2^w Z`. -/
 def AbsVal.refineUneConst (w : Nat) (a : AbsVal) (v : Nat) : AbsVal :=
-  match Nat.beq v 0 with
-  | true => AbsVal.refineUgtConst w a 0
-  | false =>
-    match a.lbound? with
-    | some lo =>
-      match Nat.beq v lo with
-      | true => AbsVal.refineUgtConst w a lo
-      | false =>
-        match a.ubound? with
-        | some (k + 1) =>
-          match Nat.beq v (k + 1) with
-          | true => AbsVal.refineUleConst w a k
-          | false => a
-        | _ =>
-          match Nat.beq v (modPow2 w - 1) with
-          | true => AbsVal.refineUleConst w a (modPow2 w - 2)
-          | false => a
-    | none =>
-      match Nat.beq v (modPow2 w - 1) with
-      | true => AbsVal.refineUleConst w a (modPow2 w - 2)
-      | false => a
+  match validWidth w && a.isInit with
+  | false => AbsVal.bot
+  | true =>
+    let M := modPow2 w
+    match Nat.blt v M with
+    | false => a
+    | true =>
+      let lo := Nat.mod (v + 1) M
+      let hi := Nat.mod (M + v - 1) M
+      reduceAbsVal w
+        ⟨.init, a.tnum, WrappedInterval.meet M a.wi (.iv lo hi), a.sc⟩
+
+private theorem wrapped_denote_complement {w x v : Nat}
+    (hw : validWidth w = true) (hx : x < modPow2 w) (hv : v < modPow2 w)
+    (hNe : x ≠ v) :
+    WrappedInterval.denote (modPow2 w)
+      (.iv (Nat.mod (v + 1) (modPow2 w))
+           (Nat.mod (modPow2 w + v - 1) (modPow2 w))) x := by
+  let M := modPow2 w
+  have h2Le : 2 ≤ M := modPow2_mono (Nat.le_of_ble_eq_true (bool_and_true_left hw))
+  have hMPos : 0 < M := modPow2_pos w
+  cases v with
+  | zero =>
+    have h1Lt : 1 < M := Nat.lt_of_lt_of_le (Nat.lt_succ_self 1) h2Le
+    have hM1Lt : M - 1 < M := Nat.sub_lt hMPos Nat.zero_lt_one
+    have h1LeM1 : 1 ≤ M - 1 := Nat.le_sub_one_of_lt h1Lt
+    have hLo : Nat.mod (0 + 1) M = 1 := Nat.mod_eq_of_lt h1Lt
+    have hHi : Nat.mod (M + 0 - 1) M = M - 1 := by
+      rw [Nat.add_zero]
+      exact Nat.mod_eq_of_lt hM1Lt
+    rw [hLo, hHi]
+    exact wrapped_denote_iv_of_le h1Lt hM1Lt h1LeM1
+      (Nat.pos_of_ne_zero hNe) (Nat.le_sub_one_of_lt hx)
+  | succ k =>
+    have hkLt : k < M := Nat.lt_of_lt_of_le (Nat.lt_succ_self k) (Nat.le_of_lt hv)
+    have hHi : Nat.mod (M + (k + 1) - 1) M = k := by
+      have hSub : M + (k + 1) - 1 = M + k := by
+        rw [← Nat.add_assoc, Nat.add_sub_cancel]
+      rw [hSub]
+      change (M + k) % M = k
+      rw [Nat.add_mod_left]
+      exact Nat.mod_eq_of_lt hkLt
+    cases hTop : Nat.beq (k + 1) (M - 1) with
+    | true =>
+      have hEq : k + 1 = M - 1 := Nat.eq_of_beq_eq_true hTop
+      have hLo : Nat.mod (k + 1 + 1) M = 0 := by
+        rw [hEq, Nat.sub_add_cancel hMPos]
+        exact Nat.mod_self M
+      have hxLtTop : x < k + 1 := by
+        rw [hEq]
+        exact Nat.lt_of_le_of_ne (Nat.le_sub_one_of_lt hx) (by rw [← hEq]; exact hNe)
+      rw [hLo, hHi]
+      exact wrapped_denote_iv_of_le hMPos hkLt (Nat.zero_le k) (Nat.zero_le x)
+        (Nat.le_of_lt_succ hxLtTop)
+    | false =>
+      have hNeTop : k + 1 ≠ M - 1 := nat_ne_of_beq_false hTop
+      have hLtTop : k + 1 < M - 1 :=
+        Nat.lt_of_le_of_ne (Nat.le_sub_one_of_lt hv) hNeTop
+      have hk2Lt : k + 2 < M := by
+        have h1 : k + 1 + 1 ≤ M - 1 := hLtTop
+        exact Nat.lt_of_le_of_lt h1 (Nat.sub_lt hMPos Nat.zero_lt_one)
+      have hLo : Nat.mod (k + 1 + 1) M = k + 2 := Nat.mod_eq_of_lt hk2Lt
+      have hNotLe : Nat.ble (k + 2) k = false := by
+        cases hB : Nat.ble (k + 2) k with
+        | false => rfl
+        | true =>
+          exact False.elim (Nat.not_le_of_gt
+            (Nat.lt_trans (Nat.lt_succ_self k) (Nat.lt_succ_self (k + 1)))
+            (Nat.le_of_ble_eq_true hB))
+      rw [hLo, hHi]
+      simp only [WrappedInterval.denote, hNotLe]
+      refine ⟨hk2Lt, hkLt, hx, ?_⟩
+      cases Nat.lt_or_ge x (k + 1) with
+      | inl hLt => exact Or.inr (Nat.le_of_lt_succ hLt)
+      | inr hGe =>
+        exact Or.inl (Nat.lt_of_le_of_ne hGe (fun h => hNe h.symm))
 
 /-- Soundness of `AbsVal.refineUneConst`. -/
 theorem absVal_refineUneConst_sound {w x v : Nat} {a : AbsVal}
     (hw : validWidth w = true) (ha : a.denote w (some x))
     (hai : a.isInit = true) (hNe : x ≠ v) :
     (AbsVal.refineUneConst w a v).denote w (some x) := by
-  have hTopExcl : Nat.beq v (modPow2 w - 1) = true →
-      (AbsVal.refineUleConst w a (modPow2 w - 2)).denote w (some x) := by
-    intro hTop
-    have hvEq := Nat.eq_of_beq_eq_true hTop
-    have hxLe : x ≤ modPow2 w - 1 := Nat.le_sub_one_of_lt (absVal_some_elim ha).1
-    have hxLt : x < modPow2 w - 1 :=
-      Nat.lt_of_le_of_ne hxLe (fun hEq => hNe (Eq.trans hEq hvEq.symm))
-    have hxLe2 : x ≤ modPow2 w - 2 := by
-      have h1 : x ≤ (modPow2 w - 1) - 1 := Nat.le_sub_one_of_lt hxLt
-      rw [Nat.sub_sub] at h1
-      exact h1
-    exact absVal_refineUleConst_sound hw ha hai hxLe2
   unfold AbsVal.refineUneConst
-  cases h0 : Nat.beq v 0 with
+  rw [hw, hai]
+  dsimp only
+  cases hV : Nat.blt v (modPow2 w) with
+  | false => exact ha
   | true =>
-    simp only
-    have hv0 := Nat.eq_of_beq_eq_true h0
-    subst hv0
-    exact absVal_refineUgtConst_sound hw ha hai (Nat.pos_of_ne_zero hNe)
-  | false =>
-    simp only
-    cases hLo : a.lbound? with
-    | none =>
-      simp only
-      cases hTop : Nat.beq v (modPow2 w - 1) with
-      | true => simp only; exact hTopExcl hTop
-      | false => exact ha
-    | some lo =>
-      simp only
-      cases hEqLo : Nat.beq v lo with
-      | true =>
-        simp only
-        have hvLo := Nat.eq_of_beq_eq_true hEqLo
-        subst hvLo
-        exact absVal_refineUgtConst_sound hw ha hai
-          (Nat.lt_of_le_of_ne (absVal_lbound?_sound hLo ha) (fun h => hNe h.symm))
-      | false =>
-        simp only
-        cases hHi : a.ubound? with
-        | none =>
-          simp only
-          cases hTop : Nat.beq v (modPow2 w - 1) with
-          | true => simp only; exact hTopExcl hTop
-          | false => exact ha
-        | some hi =>
-          cases hi with
-          | zero =>
-            simp only
-            cases hTop : Nat.beq v (modPow2 w - 1) with
-            | true => simp only; exact hTopExcl hTop
-            | false => exact ha
-          | succ k =>
-            simp only
-            cases hEqHi : Nat.beq v (k + 1) with
-            | true =>
-              simp only
-              have hvHi := Nat.eq_of_beq_eq_true hEqHi
-              subst hvHi
-              exact absVal_refineUleConst_sound hw ha hai
-                (Nat.le_of_lt_succ (Nat.lt_of_le_of_ne
-                  (absVal_ubound?_sound hHi ha) hNe))
-            | false => exact ha
+    dsimp only
+    have haE := absVal_some_elim ha
+    apply reduceAbsVal_sound hw
+    exact ⟨⟨x, rfl, haE.1⟩, haE.2.1,
+      wrappedInterval_meet_sound (modPow2_pos w) haE.2.2.1
+        (wrapped_denote_complement hw haE.1 (lt_of_blt_true hV) hNe),
+      haE.2.2.2⟩
 
 /-- Reduced-product meet of two initialized `AbsVal`s (returns `AbsVal.bot`
 when the components are disjoint). -/
@@ -2280,23 +2286,37 @@ theorem mirAbsSlot_le_sound {ty : Ty} {locals : List LocalSlot}
           | _ => exact ha.2
       | _ => nomatch hLe
 
-/-- Pointwise inclusion on `MirAbsEnv`. -/
-def mirAbsEnvLe : MirAbsEnv → MirAbsEnv → Bool
+/-- Pointwise inclusion helper on `MirAbsEnv`. -/
+private def mirAbsEnvLeAux : MirAbsEnv → MirAbsEnv → Bool
   | [], [] => true
-  | a :: as, b :: bs => MirAbsSlot.le a b && mirAbsEnvLe as bs
+  | a :: as, b :: bs => MirAbsSlot.le a b && mirAbsEnvLeAux as bs
   | _, _ => false
 
-theorem mirAbsEnvLe_length :
-    ∀ {e1 e2 : MirAbsEnv}, mirAbsEnvLe e1 e2 = true → length e1 = length e2
+/-- Lattice inclusion on `MirAbsEnv` (an unreachable `mirAbsEnvIsBot`
+environment is bottom and included in every same-length environment). -/
+def mirAbsEnvLe (e1 e2 : MirAbsEnv) : Bool :=
+  match mirAbsEnvIsBot e1 with
+  | true => Nat.beq (length e1) (length e2)
+  | false => mirAbsEnvLeAux e1 e2
+
+private theorem mirAbsEnvLeAux_length :
+    ∀ {e1 e2 : MirAbsEnv}, mirAbsEnvLeAux e1 e2 = true → length e1 = length e2
   | [], [], _ => rfl
   | _ :: _, _ :: _, h =>
-    congrArg Nat.succ (mirAbsEnvLe_length (bool_and_true_right h))
+    congrArg Nat.succ (mirAbsEnvLeAux_length (bool_and_true_right h))
   | [], _ :: _, h => nomatch h
   | _ :: _, [], h => nomatch h
 
-theorem mirAbsEnvLe_get :
+theorem mirAbsEnvLe_length {e1 e2 : MirAbsEnv}
+    (h : mirAbsEnvLe e1 e2 = true) : length e1 = length e2 := by
+  unfold mirAbsEnvLe at h
+  cases hB : mirAbsEnvIsBot e1 with
+  | true => rw [hB] at h; exact Nat.eq_of_beq_eq_true h
+  | false => rw [hB] at h; exact mirAbsEnvLeAux_length h
+
+private theorem mirAbsEnvLeAux_get :
     ∀ {e1 e2 : MirAbsEnv} {i : Nat} {a b : MirAbsSlot},
-      mirAbsEnvLe e1 e2 = true → get? e1 i = some a → get? e2 i = some b →
+      mirAbsEnvLeAux e1 e2 = true → get? e1 i = some a → get? e2 i = some b →
       MirAbsSlot.le a b = true
   | [], _, _, _, _, _, h1, _ => nomatch h1
   | _ :: _, [], _, _, _, h, _, _ => nomatch h
@@ -2307,19 +2327,24 @@ theorem mirAbsEnvLe_get :
     subst hb
     exact bool_and_true_left h
   | _ :: xs, _ :: ys, i + 1, _, _, h, h1, h2 =>
-    mirAbsEnvLe_get (e1 := xs) (e2 := ys) (i := i) (bool_and_true_right h) h1 h2
+    mirAbsEnvLeAux_get (e1 := xs) (e2 := ys) (i := i) (bool_and_true_right h) h1 h2
 
 /-- Soundness of `mirAbsEnvLe`. -/
 theorem mirAbsEnvLe_sound {decls : List LocalDecl} {e1 e2 : MirAbsEnv}
     {locals : List LocalSlot}
     (hLe : mirAbsEnvLe e1 e2 = true) (h1 : mirAbsEnvDenote decls e1 locals) :
     mirAbsEnvDenote decls e2 locals := by
-  refine ⟨Eq.trans (mirAbsEnvLe_length hLe).symm h1.1, h1.2.1, ?_⟩
-  intro i d s2 cs hD h2 hCs
-  cases get?_exists_of_length (mirAbsEnvLe_length hLe) h2 with
-  | intro s1 hs1 =>
-    exact mirAbsSlot_le_sound (mirAbsEnvLe_get hLe hs1 h2)
-      (h1.2.2 i d s1 cs hD hs1 hCs)
+  unfold mirAbsEnvLe at hLe
+  cases hB : mirAbsEnvIsBot e1 with
+  | true => exact False.elim (mirAbsEnv_not_isBot hB h1)
+  | false =>
+    rw [hB] at hLe
+    refine ⟨Eq.trans (mirAbsEnvLeAux_length hLe).symm h1.1, h1.2.1, ?_⟩
+    intro i d s2 cs hD h2 hCs
+    cases get?_exists_of_length (mirAbsEnvLeAux_length hLe) h2 with
+    | intro s1 hs1 =>
+      exact mirAbsSlot_le_sound (mirAbsEnvLeAux_get hLe hs1 h2)
+        (h1.2.2 i d s1 cs hD hs1 hCs)
 
 /-- Join of two plain unsigned slots (`.top` on a type mismatch). -/
 def uintJoinSlot (u1 : UintTy) (a1 : AbsVal) (u2 : UintTy) (a2 : AbsVal) :
@@ -2638,17 +2663,30 @@ theorem mirAbsSlot_join_sound_right {ty : Ty} {locals : List LocalSlot}
               | _ => exact hb.2
         | _ => exact True.intro
 
-/-- Pointwise join on `MirAbsEnv` (fails closed on a length mismatch). -/
-def mirAbsEnvJoin : MirAbsEnv → MirAbsEnv → Option MirAbsEnv
+/-- Pointwise join helper on `MirAbsEnv`. -/
+private def mirAbsEnvJoinAux : MirAbsEnv → MirAbsEnv → Option MirAbsEnv
   | [], [] => some []
   | a :: as, b :: bs =>
-    match mirAbsEnvJoin as bs with
+    match mirAbsEnvJoinAux as bs with
     | some cs => some (MirAbsSlot.join a b :: cs)
     | none => none
   | _, _ => none
 
-theorem mirAbsEnvJoin_get :
-    ∀ {e1 e2 e3 : MirAbsEnv}, mirAbsEnvJoin e1 e2 = some e3 →
+/-- Lattice join on `MirAbsEnv` (fails closed on a length mismatch; an
+unreachable environment `mirAbsEnvIsBot` acts as smashed bottom). -/
+def mirAbsEnvJoin (e1 e2 : MirAbsEnv) : Option MirAbsEnv :=
+  match Nat.beq (length e1) (length e2) with
+  | false => none
+  | true =>
+    match mirAbsEnvIsBot e1 with
+    | true => some e2
+    | false =>
+      match mirAbsEnvIsBot e2 with
+      | true => some e1
+      | false => mirAbsEnvJoinAux e1 e2
+
+private theorem mirAbsEnvJoinAux_get :
+    ∀ {e1 e2 e3 : MirAbsEnv}, mirAbsEnvJoinAux e1 e2 = some e3 →
       length e1 = length e3 ∧ length e2 = length e3 ∧
       ∀ {i : Nat} {c : MirAbsSlot}, get? e3 i = some c →
         ∃ a b, get? e1 i = some a ∧ get? e2 i = some b ∧
@@ -2660,14 +2698,14 @@ theorem mirAbsEnvJoin_get :
   | [], _ :: _, _, h => nomatch h
   | _ :: _, [], _, h => nomatch h
   | a :: as, b :: bs, e3, h => by
-    simp only [mirAbsEnvJoin] at h
-    cases hJ : mirAbsEnvJoin as bs with
+    simp only [mirAbsEnvJoinAux] at h
+    cases hJ : mirAbsEnvJoinAux as bs with
     | none => rw [hJ] at h; nomatch h
     | some cs =>
       rw [hJ] at h
       injection h with h
       subst h
-      have ih := mirAbsEnvJoin_get hJ
+      have ih := mirAbsEnvJoinAux_get hJ
       refine ⟨congrArg Nat.succ ih.1, congrArg Nat.succ ih.2.1, ?_⟩
       intro i c hc
       cases i with
@@ -2680,29 +2718,63 @@ theorem mirAbsEnvJoin_sound_left {decls : List LocalDecl}
     {e1 e2 e3 : MirAbsEnv} {locals : List LocalSlot}
     (hJ : mirAbsEnvJoin e1 e2 = some e3) (h1 : mirAbsEnvDenote decls e1 locals) :
     mirAbsEnvDenote decls e3 locals := by
-  have hG := mirAbsEnvJoin_get hJ
-  refine ⟨Eq.trans hG.1.symm h1.1, h1.2.1, ?_⟩
-  intro i d c cs hD hC hCs
-  cases hG.2.2 hC with
-  | intro a hab =>
-    cases hab with
-    | intro b hab =>
-      rw [hab.2.2]
-      exact mirAbsSlot_join_sound_left (h1.2.2 i d a cs hD hab.1 hCs)
+  unfold mirAbsEnvJoin at hJ
+  cases hLen : Nat.beq (length e1) (length e2) with
+  | false => rw [hLen] at hJ; nomatch hJ
+  | true =>
+    rw [hLen] at hJ
+    cases hB1 : mirAbsEnvIsBot e1 with
+    | true => exact False.elim (mirAbsEnv_not_isBot hB1 h1)
+    | false =>
+      rw [hB1] at hJ
+      cases hB2 : mirAbsEnvIsBot e2 with
+      | true =>
+        rw [hB2] at hJ
+        injection hJ with hEq
+        subst hEq
+        exact h1
+      | false =>
+        rw [hB2] at hJ
+        have hG := mirAbsEnvJoinAux_get hJ
+        refine ⟨Eq.trans hG.1.symm h1.1, h1.2.1, ?_⟩
+        intro i d c cs hD hC hCs
+        cases hG.2.2 hC with
+        | intro a hab =>
+          cases hab with
+          | intro b hab =>
+            rw [hab.2.2]
+            exact mirAbsSlot_join_sound_left (h1.2.2 i d a cs hD hab.1 hCs)
 
 theorem mirAbsEnvJoin_sound_right {decls : List LocalDecl}
     {e1 e2 e3 : MirAbsEnv} {locals : List LocalSlot}
     (hJ : mirAbsEnvJoin e1 e2 = some e3) (h2 : mirAbsEnvDenote decls e2 locals) :
     mirAbsEnvDenote decls e3 locals := by
-  have hG := mirAbsEnvJoin_get hJ
-  refine ⟨Eq.trans hG.2.1.symm h2.1, h2.2.1, ?_⟩
-  intro i d c cs hD hC hCs
-  cases hG.2.2 hC with
-  | intro a hab =>
-    cases hab with
-    | intro b hab =>
-      rw [hab.2.2]
-      exact mirAbsSlot_join_sound_right (h2.2.2 i d b cs hD hab.2.1 hCs)
+  unfold mirAbsEnvJoin at hJ
+  cases hLen : Nat.beq (length e1) (length e2) with
+  | false => rw [hLen] at hJ; nomatch hJ
+  | true =>
+    rw [hLen] at hJ
+    cases hB1 : mirAbsEnvIsBot e1 with
+    | true =>
+      rw [hB1] at hJ
+      injection hJ with hEq
+      subst hEq
+      exact h2
+    | false =>
+      rw [hB1] at hJ
+      cases hB2 : mirAbsEnvIsBot e2 with
+      | true => exact False.elim (mirAbsEnv_not_isBot hB2 h2)
+      | false =>
+        rw [hB2] at hJ
+        have hG := mirAbsEnvJoinAux_get hJ
+        refine ⟨Eq.trans hG.2.1.symm h2.1, h2.2.1, ?_⟩
+        intro i d c cs hD hC hCs
+        cases hG.2.2 hC with
+        | intro a hab =>
+          cases hab with
+          | intro b hab =>
+            rw [hab.2.2]
+            exact mirAbsSlot_join_sound_right (h2.2.2 i d b cs hD hab.2.1 hCs)
 
 /-! ## 6. Guard-Clearing Writes (`setMirAbsSlot`) -/
 

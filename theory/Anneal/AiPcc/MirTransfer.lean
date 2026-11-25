@@ -987,22 +987,34 @@ theorem topBelow_sound {w x : Nat} {hi? : Option Nat}
     exact absVal_refineUleConst_sound hw (absVal_topInit_sound hx)
       (absVal_topInit_isInit w) (hle hi rfl)
 
-/-- Overflow-freedom check for unsigned multiplication via interval bounds. -/
+/-- Overflow-freedom check for unsigned multiplication via interval bounds
+(defaulting an unconstrained operand upper bound to `2^w - 1`). -/
 def AbsVal.noOverflowMul (w : Nat) (a b : AbsVal) : Bool :=
-  match a.ubound?, b.ubound? with
-  | some h1, some h2 => Nat.blt (h1 * h2) (modPow2 w)
-  | _, _ => false
+  let h1 :=
+    match a.ubound? with
+    | some h => h
+    | none => modPow2 w - 1
+  let h2 :=
+    match b.ubound? with
+    | some h => h
+    | none => modPow2 w - 1
+  Nat.blt (h1 * h2) (modPow2 w)
 
 theorem absVal_noOverflowMul_sound {w x y : Nat} {a b : AbsVal}
     (h : AbsVal.noOverflowMul w a b = true) (hx : a.denote w (some x))
     (hy : b.denote w (some y)) : x * y < modPow2 w := by
+  have hxLt := (absVal_some_elim hx).1
+  have hyLt := (absVal_some_elim hy).1
   unfold AbsVal.noOverflowMul at h
-  split at h
-  · rename_i h1 h2 hU1 hU2
-    exact Nat.lt_of_le_of_lt
-      (Nat.mul_le_mul (absVal_ubound?_sound hU1 hx) (absVal_ubound?_sound hU2 hy))
-      (lt_of_blt_true h)
-  · nomatch h
+  have hX : x ≤ (match a.ubound? with | some hi => hi | none => modPow2 w - 1) := by
+    cases hU1 : a.ubound? with
+    | some hi => exact absVal_ubound?_sound hU1 hx
+    | none => exact Nat.le_sub_one_of_lt hxLt
+  have hY : y ≤ (match b.ubound? with | some hi => hi | none => modPow2 w - 1) := by
+    cases hU2 : b.ubound? with
+    | some hi => exact absVal_ubound?_sound hU2 hy
+    | none => exact Nat.le_sub_one_of_lt hyLt
+  exact Nat.lt_of_le_of_lt (Nat.mul_le_mul hX hY) (lt_of_blt_true h)
 
 private theorem mod_wrapVal_of_dvd {w c n : Nat}
     (hDvd : Nat.mod (modPow2 w) c = 0) (hN : Nat.mod n c = 0) :
@@ -1043,12 +1055,16 @@ def mulCongFactor (w : Nat) (a1 a2 : AbsVal) (noWrap : Bool) : StridedCong :=
       | false => .top
     | none => .top
 
-/-- Unsigned multiplication transfer: folds exact constants, propagates
-non-wrapping product intervals `[lo1 * lo2, hi1 * hi2]`, and tracks stride
-congruence `≡ 0 (mod c)` for constant factors (preserving alignment). -/
+/-- Unsigned multiplication transfer: folds exact constants, `0`/`1`
+identities, propagates non-wrapping product intervals `[lo1 * lo2, hi1 * hi2]`,
+and tracks stride congruence `≡ 0 (mod c)` for constant factors. -/
 def mulUintAbs (w : Nat) (a1 a2 : AbsVal) : AbsVal :=
   match a1.exactVal? w, a2.exactVal? w with
   | some x, some y => AbsVal.const w (x * y)
+  | some 0, _ => AbsVal.const w 0
+  | _, some 0 => AbsVal.const w 0
+  | some 1, _ => a2
+  | _, some 1 => a1
   | _, _ =>
     match a1.lbound?, a1.ubound?, a2.lbound?, a2.ubound? with
     | some lo1, some hi1, some lo2, some hi2 =>
@@ -1104,6 +1120,8 @@ theorem mulUintAbs_sound {w x y : Nat} {a1 a2 : AbsVal}
     (hw : validWidth w = true) (hx : a1.denote w (some x))
     (hy : a2.denote w (some y)) :
     (mulUintAbs w a1 a2).denote w (some (wrapVal w (x * y))) := by
+  have hxLt := (absVal_some_elim hx).1
+  have hyLt := (absVal_some_elim hy).1
   have hWrapLt : wrapVal w (x * y) < modPow2 w := nat_mod_lt _ (modPow2_pos w)
   have hTopCase : (reduceAbsVal w ⟨.init, Tnum.top w, .top,
       mulCongFactor w a1 a2 false⟩).denote w (some (wrapVal w (x * y))) := by
@@ -1120,6 +1138,30 @@ theorem mulUintAbs_sound {w x y : Nat} {a1 a2 : AbsVal}
     subst h1
     subst h2
     exact absVal_const_sound hw
+  · rename_i hEx _
+    have h1 := (absVal_exactVal?_sound hEx hx).1
+    injection h1 with h1
+    subst h1
+    rw [Nat.zero_mul]
+    exact absVal_const_sound hw
+  · rename_i hEy _
+    have h2 := (absVal_exactVal?_sound hEy hy).1
+    injection h2 with h2
+    subst h2
+    rw [Nat.mul_zero]
+    exact absVal_const_sound hw
+  · rename_i hEx _
+    have h1 := (absVal_exactVal?_sound hEx hx).1
+    injection h1 with h1
+    subst h1
+    rw [Nat.one_mul, wrapVal_of_lt hyLt]
+    exact hy
+  · rename_i hEy _
+    have h2 := (absVal_exactVal?_sound hEy hy).1
+    injection h2 with h2
+    subst h2
+    rw [Nat.mul_one, wrapVal_of_lt hxLt]
+    exact hx
   · cases hLo1 : a1.lbound? with
     | none => exact hTopCase
     | some lo1 =>
@@ -1161,12 +1203,14 @@ private theorem nat_div_le_div_left_of_le {a b c : Nat} (hbc : b ≤ c)
     (hb : 0 < b) : a / c ≤ a / b :=
   Nat.div_le_div_left hbc hb
 
-/-- Unsigned division transfer: folds exact constants, otherwise bounds
-`[lo1 / hi2, hi1 / lo2]` (defaulting an unconstrained dividend upper bound
-to `2^w - 1`). -/
+/-- Unsigned division transfer: folds exact constants and `0`/`1` identities,
+otherwise bounds `[lo1 / hi2, hi1 / lo2]` (defaulting an unconstrained dividend
+upper bound to `2^w - 1`). -/
 def divUintAbs (w : Nat) (a1 a2 : AbsVal) : AbsVal :=
   match a1.exactVal? w, a2.exactVal? w with
   | some x, some y => AbsVal.const w (x / y)
+  | some 0, _ => AbsVal.const w 0
+  | _, some 1 => a1
   | _, _ =>
     let hi1 :=
       match a1.ubound? with
@@ -1206,6 +1250,18 @@ theorem divUintAbs_sound {w x y : Nat} {a1 a2 : AbsVal}
     subst h1
     subst h2
     exact absVal_const_sound hw
+  · rename_i hEx _
+    have h1 := (absVal_exactVal?_sound hEx hx).1
+    injection h1 with h1
+    subst h1
+    rw [Nat.zero_div]
+    exact absVal_const_sound hw
+  · rename_i hEy _
+    have h2 := (absVal_exactVal?_sound hEy hy).1
+    injection h2 with h2
+    subst h2
+    rw [Nat.div_one, wrapVal_of_lt hxLt]
+    exact hx
   · rw [wrapVal_of_lt hDivLt]
     let hi1 :=
       match a1.ubound? with
@@ -1276,11 +1332,14 @@ theorem divUintAbs_sound {w x y : Nat} {a1 a2 : AbsVal}
         wrapped_denote_iv_of_le hLoLt hHiLt hLoHi hLoLeDiv hDivLeHi,
         True.intro⟩
 
-/-- Unsigned remainder transfer: folds exact constants, returns `a1` unchanged
-when `hi1 < lo2` (`x % y = x`), else bounds by `min hi1 (hi2 - 1)`. -/
+/-- Unsigned remainder transfer: folds exact constants and `0`/`1` identities,
+returns `a1` unchanged when `hi1 < lo2` (`x % y = x`), else bounds by
+`min hi1 (hi2 - 1)`. -/
 def remUintAbs (w : Nat) (a1 a2 : AbsVal) : AbsVal :=
   match a1.exactVal? w, a2.exactVal? w with
   | some x, some y => AbsVal.const w (x % y)
+  | some 0, _ => AbsVal.const w 0
+  | _, some 1 => AbsVal.const w 0
   | _, _ =>
     match a1.ubound?, a2.lbound? with
     | some hi1, some lo2 =>
@@ -1332,6 +1391,18 @@ theorem remUintAbs_sound {w x y : Nat} {a1 a2 : AbsVal}
     injection h2 with h2
     subst h1
     subst h2
+    exact absVal_const_sound hw
+  · rename_i hEx _
+    have h1 := (absVal_exactVal?_sound hEx hx).1
+    injection h1 with h1
+    subst h1
+    rw [Nat.zero_mod]
+    exact absVal_const_sound hw
+  · rename_i hEy _
+    have h2 := (absVal_exactVal?_sound hEy hy).1
+    injection h2 with h2
+    subst h2
+    rw [Nat.mod_one]
     exact absVal_const_sound hw
   · rw [wrapVal_of_lt hRemLt]
     cases hU1 : a1.ubound? with
@@ -2098,12 +2169,150 @@ theorem addOverflowBoolAbs_sound {u : UintTy} {srcL srcR : Option Nat}
           subst hx'
           exact add_overflow_ugt_iff hyLt
 
+/-- True iff `a` is statically known to equal `0` at width `w`. -/
+def isZeroExact (w : Nat) (a : AbsVal) : Bool :=
+  match a.exactVal? w with
+  | some 0 => true
+  | _ => false
+
+private theorem isZeroExact_eq {w x : Nat} {a : AbsVal}
+    (h : isZeroExact w a = true) (ha : a.denote w (some x)) : x = 0 := by
+  unfold isZeroExact at h
+  cases hE : a.exactVal? w with
+  | none => rw [hE] at h; nomatch h
+  | some c =>
+    rw [hE] at h
+    cases c with
+    | succ _ => nomatch h
+    | zero =>
+      have hEq := (absVal_exactVal?_sound hE ha).1
+      injection hEq
+
+/-- Overflow-freedom check for unsigned addition, handling `0 + y` and `x + 0`
+even when the other operand is unconstrained (`topInit`). -/
+def noOverflowAddSafe (w : Nat) (a1 a2 : AbsVal) : Bool :=
+  AbsVal.noOverflowAdd w a1 a2 || isZeroExact w a1 || isZeroExact w a2
+
+theorem noOverflowAddSafe_sound {w x y : Nat} {a1 a2 : AbsVal}
+    (h : noOverflowAddSafe w a1 a2 = true) (hx : a1.denote w (some x))
+    (hy : a2.denote w (some y)) : x + y < modPow2 w := by
+  unfold noOverflowAddSafe at h
+  cases hA : AbsVal.noOverflowAdd w a1 a2 with
+  | true =>
+    cases absVal_noOverflowAdd_sound hA hx hy with
+    | intro x' hxy =>
+      cases hxy with
+      | intro y' hxy =>
+        injection hxy.1 with h1
+        injection hxy.2.1 with h2
+        subst h1
+        subst h2
+        exact hxy.2.2.1
+  | false =>
+    rw [hA, Bool.false_or] at h
+    cases hZ1 : isZeroExact w a1 with
+    | true =>
+      rw [isZeroExact_eq hZ1 hx, Nat.zero_add]
+      exact (absVal_some_elim hy).1
+    | false =>
+      rw [hZ1, Bool.false_or] at h
+      rw [isZeroExact_eq h hy, Nat.add_zero]
+      exact (absVal_some_elim hx).1
+
+/-- Underflow-freedom check for unsigned subtraction, handling `x - 0` even
+when `x` is unconstrained (`topInit`). -/
+def noUnderflowSubSafe (w : Nat) (a1 a2 : AbsVal) : Bool :=
+  AbsVal.noUnderflowSub w a1 a2 || isZeroExact w a2
+
+theorem noUnderflowSubSafe_sound {w x y : Nat} {a1 a2 : AbsVal}
+    (h : noUnderflowSubSafe w a1 a2 = true) (hx : a1.denote w (some x))
+    (hy : a2.denote w (some y)) : y ≤ x := by
+  unfold noUnderflowSubSafe at h
+  cases hS : AbsVal.noUnderflowSub w a1 a2 with
+  | true =>
+    cases absVal_noUnderflowSub_sound hS hx hy with
+    | intro x' hxy =>
+      cases hxy with
+      | intro y' hxy =>
+        injection hxy.1 with h1
+        injection hxy.2.1 with h2
+        subst h1
+        subst h2
+        exact hxy.2.2.1
+  | false =>
+    rw [hS, Bool.false_or] at h
+    rw [isZeroExact_eq h hy]
+    exact Nat.zero_le x
+
+/-- Nonzero-divisor check combining `AbsVal.nonzeroDiv` with `Tnum` known-one
+bits (`tnum.val > 0`) and `StridedCong` nonzero residues (`r > 0`). -/
+def nonzeroDivSafe (w : Nat) (a : AbsVal) : Bool :=
+  AbsVal.nonzeroDiv w a ||
+  Nat.blt 0 a.tnum.val ||
+  match a.sc with
+  | .cong _ r => Nat.blt 0 r
+  | _ => false
+
+theorem nonzeroDivSafe_sound {w y : Nat} {a : AbsVal}
+    (h : nonzeroDivSafe w a = true) (hy : a.denote w (some y)) : 0 < y := by
+  have hyE := absVal_some_elim hy
+  unfold nonzeroDivSafe at h
+  cases hN : AbsVal.nonzeroDiv w a with
+  | true =>
+    cases absVal_nonzeroDiv_sound hN hy with
+    | intro y' hy' =>
+      injection hy'.1 with hEq
+      subst hEq
+      exact hy'.2.1
+  | false =>
+    rw [hN, Bool.false_or] at h
+    cases hT : Nat.blt 0 a.tnum.val with
+    | true =>
+      have hValPos : 0 < a.tnum.val := lt_of_blt_true hT
+      apply Nat.pos_of_ne_zero
+      intro hy0
+      subst hy0
+      have hTn := hyE.2.1
+      rw [tnum_denote_iff_bitAt] at hTn
+      have hValZero : a.tnum.val = 0 := by
+        apply nat_eq_of_bitAt
+        intro k
+        rw [bitAt_zero_nat]
+        cases hm : bitAt a.tnum.mask k with
+        | false =>
+          have hBit := hTn.2 k hm
+          rw [bitAt_zero_nat] at hBit
+          exact hBit.symm
+        | true =>
+          have hWf : bitAt (Nat.land a.tnum.val a.tnum.mask) k = bitAt 0 k := by
+            rw [Nat.eq_of_beq_eq_true hTn.1]
+          rw [bitAt_land, hm, Bool.and_true, bitAt_zero_nat] at hWf
+          exact hWf
+      rw [hValZero] at hValPos
+      exact Nat.lt_irrefl 0 hValPos
+    | false =>
+      rw [hT, Bool.false_or] at h
+      have hSc := hyE.2.2.2
+      cases hScTag : a.sc with
+      | bot => rw [hScTag] at h; nomatch h
+      | top => rw [hScTag] at h; nomatch h
+      | cong m r =>
+        rw [hScTag] at h hSc
+        have hrPos : 0 < r := lt_of_blt_true h
+        apply Nat.pos_of_ne_zero
+        intro hy0
+        subst hy0
+        have hMod0 : 0 % m = r := hSc.2.2
+        rw [Nat.zero_mod] at hMod0
+        rw [← hMod0] at hrPos
+        exact Nat.lt_irrefl 0 hrPos
+
 /-- Overflow boolean and guard for `subWithOverflow` (underflow iff `x < y`). -/
 def subOverflowBoolAbs (u : UintTy) (srcL srcR : Option Nat) (a1 a2 : AbsVal) :
     BoolAbs :=
   let w := uintWidth u
   let known? :=
-    match AbsVal.noUnderflowSub w a1 a2 with
+    match noUnderflowSubSafe w a1 a2 with
     | true => some false
     | false => decideCmpAbs .lt w a1 a2
   mkBoolAbs known? (synthCmpGuard .lt u srcL srcR a1 a2)
@@ -2122,21 +2331,14 @@ theorem subOverflowBoolAbs_sound {u : UintTy} {srcL srcR : Option Nat}
   rw [← nat_blt_eq_not_ble]
   apply mkBoolAbs_sound
   · intro r hr
-    cases hNo : AbsVal.noUnderflowSub (uintWidth u) a1 a2 with
+    cases hNo : noUnderflowSubSafe (uintWidth u) a1 a2 with
     | true =>
       rw [hNo] at hr
       injection hr with hr
       subst hr
-      cases absVal_noUnderflowSub_sound hNo hx hy with
-      | intro x' hxy =>
-        cases hxy with
-        | intro y' hxy =>
-          injection hxy.1 with h1
-          injection hxy.2.1 with h2
-          subst h1
-          subst h2
-          rw [nat_blt_eq_not_ble, Nat.ble_eq_true_of_le hxy.2.2.1]
-          rfl
+      rw [nat_blt_eq_not_ble,
+        Nat.ble_eq_true_of_le (noUnderflowSubSafe_sound hNo hx hy)]
+      rfl
     | false =>
       rw [hNo] at hr
       exact decideCmpAbs_sound hr hx hy
@@ -2392,44 +2594,102 @@ private theorem nat_xor_self_zero (x : Nat) : Nat.xor x x = 0 := by
   rw [bitAt_xor, bitAt_zero_nat]
   cases bitAt x k <;> rfl
 
+private theorem nat_land_self (x : Nat) : Nat.land x x = x := by
+  apply nat_eq_of_bitAt
+  intro k
+  rw [bitAt_land]
+  cases bitAt x k <;> rfl
+
+private theorem nat_lor_self (x : Nat) : Nat.lor x x = x := by
+  apply nat_eq_of_bitAt
+  intro k
+  rw [bitAt_lor]
+  cases bitAt x k <;> rfl
+
 /-- Constant outcome of comparing a value with itself (`x op x`). -/
 def decideCmpSame : BinOp → Bool
   | .eq | .le | .ge => true
   | _ => false
 
+/-- Unsigned wrapping addition preserving the other operand when one side is
+known `0`. -/
+def addUintAbs (w : Nat) (a1 a2 : AbsVal) : AbsVal :=
+  match isZeroExact w a1, isZeroExact w a2 with
+  | true, _ => a2
+  | false, true => a1
+  | false, false => AbsVal.addWrap w a1 a2
+
+theorem addUintAbs_sound {w x y : Nat} {a1 a2 : AbsVal}
+    (hw : validWidth w = true) (hi1 : a1.isInit = true) (hi2 : a2.isInit = true)
+    (hx : a1.denote w (some x)) (hy : a2.denote w (some y)) :
+    (addUintAbs w a1 a2).denote w (some (wrapVal w (x + y))) := by
+  unfold addUintAbs
+  cases hZ1 : isZeroExact w a1 with
+  | true =>
+    rw [isZeroExact_eq hZ1 hx, Nat.zero_add, wrapVal_of_lt (absVal_some_elim hy).1]
+    exact hy
+  | false =>
+    cases hZ2 : isZeroExact w a2 with
+    | true =>
+      rw [isZeroExact_eq hZ2 hy, Nat.add_zero, wrapVal_of_lt (absVal_some_elim hx).1]
+      exact hx
+    | false => exact absVal_addWrap_sound hw hx hy hi1 hi2
+
+/-- Unsigned wrapping subtraction preserving `a1` when `a2` is known `0`. -/
+def subUintAbs (w : Nat) (a1 a2 : AbsVal) : AbsVal :=
+  match isZeroExact w a2 with
+  | true => a1
+  | false => AbsVal.subWrap w a1 a2
+
+theorem subUintAbs_sound {w x y : Nat} {a1 a2 : AbsVal}
+    (hw : validWidth w = true) (hi1 : a1.isInit = true) (hi2 : a2.isInit = true)
+    (hx : a1.denote w (some x)) (hy : a2.denote w (some y)) :
+    (subUintAbs w a1 a2).denote w (some (wrapVal w (modPow2 w + x - y))) := by
+  unfold subUintAbs
+  cases hZ2 : isZeroExact w a2 with
+  | true =>
+    rw [isZeroExact_eq hZ2 hy, Nat.sub_zero]
+    have hMod : wrapVal w (modPow2 w + x) = x := by
+      change (modPow2 w + x) % modPow2 w = x
+      rw [Nat.add_mod_left]
+      exact Nat.mod_eq_of_lt (absVal_some_elim hx).1
+    rw [hMod]
+    exact hx
+  | false => exact absVal_subWrap_sound hw hx hy hi1 hi2
+
 /-- Abstract unsigned `BinOp` transfer for operands of equal type `u`.
 When both operands share the same source local (`sameLocalOpt`), self-identities
-(`x - x = 0`, `x ^ x = 0`, `x / x = 1`, `x % x = 0`, `x == x = true`, etc.) are
-folded directly. -/
+(`x - x = 0`, `x ^ x = 0`, `x & x = x`, `x | x = x`, `x / x = 1`, `x % x = 0`,
+`x == x = true`, etc.) are folded directly. -/
 def binOpSameAbs (op : BinOp) (u : UintTy) (a1 : AbsVal) (srcL : Option Nat)
     (a2 : AbsVal) (srcR : Option Nat) : Option MirAbsVal :=
   let w := uintWidth u
   let same := sameLocalOpt srcL srcR
   match op with
-  | .add => some (mkUintVal u (AbsVal.addWrap w a1 a2))
+  | .add => some (mkUintVal u (addUintAbs w a1 a2))
   | .addUnchecked =>
-    match AbsVal.noOverflowAdd w a1 a2 with
-    | true => some (mkUintVal u (AbsVal.addWrap w a1 a2))
+    match noOverflowAddSafe w a1 a2 with
+    | true => some (mkUintVal u (addUintAbs w a1 a2))
     | false => none
   | .addWithOverflow =>
-    some (mkUintBoolPairVal u (AbsVal.addWrap w a1 a2)
+    some (mkUintBoolPairVal u (addUintAbs w a1 a2)
       (addOverflowBoolAbs u srcL srcR a1 a2))
   | .sub =>
     match same with
     | true => some (mkUintVal u (AbsVal.const w 0))
-    | false => some (mkUintVal u (AbsVal.subWrap w a1 a2))
+    | false => some (mkUintVal u (subUintAbs w a1 a2))
   | .subUnchecked =>
     match same with
     | true => some (mkUintVal u (AbsVal.const w 0))
     | false =>
-      match AbsVal.noUnderflowSub w a1 a2 with
-      | true => some (mkUintVal u (AbsVal.subWrap w a1 a2))
+      match noUnderflowSubSafe w a1 a2 with
+      | true => some (mkUintVal u (subUintAbs w a1 a2))
       | false => none
   | .subWithOverflow =>
     match same with
     | true => some (mkUintBoolPairVal u (AbsVal.const w 0) (.exact false .none))
     | false =>
-      some (mkUintBoolPairVal u (AbsVal.subWrap w a1 a2)
+      some (mkUintBoolPairVal u (subUintAbs w a1 a2)
         (subOverflowBoolAbs u srcL srcR a1 a2))
   | .mul => some (mkUintVal u (mulUintAbs w a1 a2))
   | .mulUnchecked =>
@@ -2440,21 +2700,27 @@ def binOpSameAbs (op : BinOp) (u : UintTy) (a1 : AbsVal) (srcL : Option Nat)
     some (mkUintBoolPairVal u (mulUintAbs w a1 a2)
       (mulOverflowBoolAbs u srcL srcR a1 a2))
   | .div =>
-    match AbsVal.nonzeroDiv w a2 with
+    match nonzeroDivSafe w a2 with
     | true =>
       match same with
       | true => some (mkUintVal u (AbsVal.const w 1))
       | false => some (mkUintVal u (divUintAbs w a1 a2))
     | false => none
   | .rem =>
-    match AbsVal.nonzeroDiv w a2 with
+    match nonzeroDivSafe w a2 with
     | true =>
       match same with
       | true => some (mkUintVal u (AbsVal.const w 0))
       | false => some (mkUintVal u (remUintAbs w a1 a2))
     | false => none
-  | .bitAnd => some (mkUintVal u (AbsVal.bitAnd w a1 a2))
-  | .bitOr => some (mkUintVal u (AbsVal.bitOr w a1 a2))
+  | .bitAnd =>
+    match same with
+    | true => some (mkUintVal u a1)
+    | false => some (mkUintVal u (AbsVal.bitAnd w a1 a2))
+  | .bitOr =>
+    match same with
+    | true => some (mkUintVal u a1)
+    | false => some (mkUintVal u (AbsVal.bitOr w a1 a2))
   | .bitXor =>
     match same with
     | true => some (mkUintVal u (AbsVal.const w 0))
@@ -2551,29 +2817,22 @@ theorem binOpSameAbs_sound {op : BinOp} {u : UintTy} {a1 a2 : AbsVal}
     injection h with h
     subst h
     exact ⟨_, evalScalarBinOp_uint_add locals mem,
-      mkUintVal_denote (absVal_addWrap_sound hw hx hy hi1 hi2)⟩
+      mkUintVal_denote (addUintAbs_sound hw hi1 hi2 hx hy)⟩
   case addUnchecked =>
-    cases hB : AbsVal.noOverflowAdd (uintWidth u) a1 a2 with
+    cases hB : noOverflowAddSafe (uintWidth u) a1 a2 with
     | false => rw [hB] at h; nomatch h
     | true =>
       rw [hB] at h
       injection h with h
       subst h
-      cases absVal_noOverflowAdd_sound hB hx hy with
-      | intro x' hxy =>
-        cases hxy with
-        | intro y' hxy =>
-          injection hxy.1 with h1
-          injection hxy.2.1 with h2
-          subst h1
-          subst h2
-          exact ⟨_, evalScalarBinOp_uint_addUnchecked locals mem hxy.2.2.1,
-            mkUintVal_denote (absVal_addWrap_sound hw hx hy hi1 hi2)⟩
+      exact ⟨_, evalScalarBinOp_uint_addUnchecked locals mem
+        (noOverflowAddSafe_sound hB hx hy),
+        mkUintVal_denote (addUintAbs_sound hw hi1 hi2 hx hy)⟩
   case addWithOverflow =>
     injection h with h
     subst h
     exact ⟨_, evalScalarBinOp_uint_addWithOverflow locals mem,
-      mkUintBoolPairVal_denote (absVal_addWrap_sound hw hx hy hi1 hi2)
+      mkUintBoolPairVal_denote (addUintAbs_sound hw hi1 hi2 hx hy)
         (addOverflowBoolAbs_isInit u srcL srcR a1 a2)
         (addOverflowBoolAbs_sound hx hy hL hR)⟩
   case sub =>
@@ -2595,7 +2854,7 @@ theorem binOpSameAbs_sound {op : BinOp} {u : UintTy} {a1 a2 : AbsVal}
       injection h with h
       subst h
       exact ⟨_, evalScalarBinOp_uint_sub locals mem hxLt hyLt,
-        mkUintVal_denote (absVal_subWrap_sound hw hx hy hi1 hi2)⟩
+        mkUintVal_denote (subUintAbs_sound hw hi1 hi2 hx hy)⟩
   case subUnchecked =>
     cases hSame : sameLocalOpt srcL srcR with
     | true =>
@@ -2613,22 +2872,15 @@ theorem binOpSameAbs_sound {op : BinOp} {u : UintTy} {a1 a2 : AbsVal}
       exact ⟨_, hEv, mkUintVal_denote (absVal_const_denote_lt hw (modPow2_pos _))⟩
     | false =>
       rw [hSame] at h
-      cases hB : AbsVal.noUnderflowSub (uintWidth u) a1 a2 with
+      cases hB : noUnderflowSubSafe (uintWidth u) a1 a2 with
       | false => rw [hB] at h; nomatch h
       | true =>
         rw [hB] at h
         injection h with h
         subst h
-        cases absVal_noUnderflowSub_sound hB hx hy with
-        | intro x' hxy =>
-          cases hxy with
-          | intro y' hxy =>
-            injection hxy.1 with h1
-            injection hxy.2.1 with h2
-            subst h1
-            subst h2
-            exact ⟨_, evalScalarBinOp_uint_subUnchecked locals mem hxLt hxy.2.2.1,
-              mkUintVal_denote (absVal_subWrap_sound hw hx hy hi1 hi2)⟩
+        exact ⟨_, evalScalarBinOp_uint_subUnchecked locals mem hxLt
+          (noUnderflowSubSafe_sound hB hx hy),
+          mkUintVal_denote (subUintAbs_sound hw hi1 hi2 hx hy)⟩
   case subWithOverflow =>
     cases hSame : sameLocalOpt srcL srcR with
     | true =>
@@ -2650,7 +2902,7 @@ theorem binOpSameAbs_sound {op : BinOp} {u : UintTy} {a1 a2 : AbsVal}
       injection h with h
       subst h
       exact ⟨_, evalScalarBinOp_uint_subWithOverflow locals mem hxLt hyLt,
-        mkUintBoolPairVal_denote (absVal_subWrap_sound hw hx hy hi1 hi2)
+        mkUintBoolPairVal_denote (subUintAbs_sound hw hi1 hi2 hx hy)
           (subOverflowBoolAbs_isInit u srcL srcR a1 a2)
           (subOverflowBoolAbs_sound hx hy hL hR)⟩
   case mul =>
@@ -2676,69 +2928,89 @@ theorem binOpSameAbs_sound {op : BinOp} {u : UintTy} {a1 a2 : AbsVal}
         (mulOverflowBoolAbs_isInit u srcL srcR a1 a2)
         (mulOverflowBoolAbs_sound hx hy hL hR)⟩
   case div =>
-    cases hB : AbsVal.nonzeroDiv (uintWidth u) a2 with
+    cases hB : nonzeroDivSafe (uintWidth u) a2 with
     | false => rw [hB] at h; nomatch h
     | true =>
       rw [hB] at h
-      cases absVal_nonzeroDiv_sound hB hy with
-      | intro y' hy' =>
-        injection hy'.1 with hEq
-        subst hEq
-        cases hSame : sameLocalOpt srcL srcR with
-        | true =>
-          rw [hSame] at h
-          injection h with h
-          subst h
-          have hxy := sameLocalOpt_eq hSame hL hR
-          subst hxy
-          have hEv := evalScalarBinOp_uint_div (u := u) (a := x) (b := x)
-            locals mem hy'.2.1
-          rw [Nat.div_self hy'.2.1, wrapVal_of_lt (one_lt_modPow2_uint u)] at hEv
-          exact ⟨_, hEv, mkUintVal_denote
-            (absVal_const_denote_lt hw (one_lt_modPow2_uint u))⟩
-        | false =>
-          rw [hSame] at h
-          injection h with h
-          subst h
-          exact ⟨_, evalScalarBinOp_uint_div locals mem hy'.2.1,
-            mkUintVal_denote (divUintAbs_sound hw hx hy hy'.2.1)⟩
+      have hyPos := nonzeroDivSafe_sound hB hy
+      cases hSame : sameLocalOpt srcL srcR with
+      | true =>
+        rw [hSame] at h
+        injection h with h
+        subst h
+        have hxy := sameLocalOpt_eq hSame hL hR
+        subst hxy
+        have hEv := evalScalarBinOp_uint_div (u := u) (a := x) (b := x)
+          locals mem hyPos
+        rw [Nat.div_self hyPos, wrapVal_of_lt (one_lt_modPow2_uint u)] at hEv
+        exact ⟨_, hEv, mkUintVal_denote
+          (absVal_const_denote_lt hw (one_lt_modPow2_uint u))⟩
+      | false =>
+        rw [hSame] at h
+        injection h with h
+        subst h
+        exact ⟨_, evalScalarBinOp_uint_div locals mem hyPos,
+          mkUintVal_denote (divUintAbs_sound hw hx hy hyPos)⟩
   case rem =>
-    cases hB : AbsVal.nonzeroDiv (uintWidth u) a2 with
+    cases hB : nonzeroDivSafe (uintWidth u) a2 with
     | false => rw [hB] at h; nomatch h
     | true =>
       rw [hB] at h
-      cases absVal_nonzeroDiv_sound hB hy with
-      | intro y' hy' =>
-        injection hy'.1 with hEq
-        subst hEq
-        cases hSame : sameLocalOpt srcL srcR with
-        | true =>
-          rw [hSame] at h
-          injection h with h
-          subst h
-          have hxy := sameLocalOpt_eq hSame hL hR
-          subst hxy
-          have hEv := evalScalarBinOp_uint_rem (u := u) (a := x) (b := x)
-            locals mem hy'.2.1
-          rw [Nat.mod_self, wrapVal_of_lt (modPow2_pos _)] at hEv
-          exact ⟨_, hEv, mkUintVal_denote
-            (absVal_const_denote_lt hw (modPow2_pos _))⟩
-        | false =>
-          rw [hSame] at h
-          injection h with h
-          subst h
-          exact ⟨_, evalScalarBinOp_uint_rem locals mem hy'.2.1,
-            mkUintVal_denote (remUintAbs_sound hw hx hy hy'.2.1)⟩
+      have hyPos := nonzeroDivSafe_sound hB hy
+      cases hSame : sameLocalOpt srcL srcR with
+      | true =>
+        rw [hSame] at h
+        injection h with h
+        subst h
+        have hxy := sameLocalOpt_eq hSame hL hR
+        subst hxy
+        have hEv := evalScalarBinOp_uint_rem (u := u) (a := x) (b := x)
+          locals mem hyPos
+        rw [Nat.mod_self, wrapVal_of_lt (modPow2_pos _)] at hEv
+        exact ⟨_, hEv, mkUintVal_denote
+          (absVal_const_denote_lt hw (modPow2_pos _))⟩
+      | false =>
+        rw [hSame] at h
+        injection h with h
+        subst h
+        exact ⟨_, evalScalarBinOp_uint_rem locals mem hyPos,
+          mkUintVal_denote (remUintAbs_sound hw hx hy hyPos)⟩
   case bitAnd =>
-    injection h with h
-    subst h
-    exact ⟨_, evalScalarBinOp_uint_bitAnd locals mem hxLt,
-      mkUintVal_denote (absVal_bitAnd_sound hw hx hy hi1 hi2)⟩
+    cases hSame : sameLocalOpt srcL srcR with
+    | true =>
+      rw [hSame] at h
+      injection h with h
+      subst h
+      have hxy := sameLocalOpt_eq hSame hL hR
+      subst hxy
+      have hEv := evalScalarBinOp_uint_bitAnd (u := u) (a := x) (b := x)
+        locals mem hxLt
+      rw [nat_land_self] at hEv
+      exact ⟨_, hEv, mkUintVal_denote hx⟩
+    | false =>
+      rw [hSame] at h
+      injection h with h
+      subst h
+      exact ⟨_, evalScalarBinOp_uint_bitAnd locals mem hxLt,
+        mkUintVal_denote (absVal_bitAnd_sound hw hx hy hi1 hi2)⟩
   case bitOr =>
-    injection h with h
-    subst h
-    exact ⟨_, evalScalarBinOp_uint_bitOr locals mem hxLt hyLt,
-      mkUintVal_denote (absVal_bitOr_sound hw hx hy hi1 hi2)⟩
+    cases hSame : sameLocalOpt srcL srcR with
+    | true =>
+      rw [hSame] at h
+      injection h with h
+      subst h
+      have hxy := sameLocalOpt_eq hSame hL hR
+      subst hxy
+      have hEv := evalScalarBinOp_uint_bitOr (u := u) (a := x) (b := x)
+        locals mem hxLt hxLt
+      rw [nat_lor_self] at hEv
+      exact ⟨_, hEv, mkUintVal_denote hx⟩
+    | false =>
+      rw [hSame] at h
+      injection h with h
+      subst h
+      exact ⟨_, evalScalarBinOp_uint_bitOr locals mem hxLt hyLt,
+        mkUintVal_denote (absVal_bitOr_sound hw hx hy hi1 hi2)⟩
   case bitXor =>
     cases hSame : sameLocalOpt srcL srcR with
     | true =>
@@ -4226,86 +4498,21 @@ private theorem reduceAbsVal_isInit_of_denote {w x : Nat} {t : Tnum}
                 | true => rw [h7] at h; exact False.elim h.1
                 | false => rfl
 
-private theorem absVal_refineUleConst_isInit {w x bound : Nat} {a : AbsVal}
-    (hai : a.isInit = true)
-    (h : (AbsVal.refineUleConst w a bound).denote w (some x)) :
-    (AbsVal.refineUleConst w a bound).isInit = true := by
-  unfold AbsVal.refineUleConst at h ⊢
-  cases hV : (validWidth w && a.isInit) with
-  | false => rw [hV] at h; exact False.elim h.1
-  | true =>
-    rw [hV] at h
-    simp only at h ⊢
-    cases hB : Nat.blt bound (modPow2 w) with
-    | false => exact hai
-    | true =>
-      rw [hB] at h
-      exact reduceAbsVal_isInit_of_denote h
-
-private theorem absVal_refineUgtConst_isInit {w x bound : Nat} {a : AbsVal}
-    (h : (AbsVal.refineUgtConst w a bound).denote w (some x)) :
-    (AbsVal.refineUgtConst w a bound).isInit = true := by
-  unfold AbsVal.refineUgtConst at h ⊢
-  cases hV : (validWidth w && a.isInit) with
-  | false => rw [hV] at h; exact False.elim h.1
-  | true =>
-    rw [hV] at h
-    simp only at h ⊢
-    cases hB : Nat.blt (bound + 1) (modPow2 w) with
-    | false => rw [hB] at h; exact False.elim h.1
-    | true =>
-      rw [hB] at h
-      exact reduceAbsVal_isInit_of_denote h
-
 private theorem absVal_refineUneConst_isInit {w x v : Nat} {a : AbsVal}
     (hai : a.isInit = true)
     (h : (AbsVal.refineUneConst w a v).denote w (some x)) :
     (AbsVal.refineUneConst w a v).isInit = true := by
   unfold AbsVal.refineUneConst at h ⊢
-  cases h0 : Nat.beq v 0 with
+  cases hV : (validWidth w && a.isInit) with
+  | false => rw [hV] at h; exact False.elim h.1
   | true =>
-    rw [h0] at h
-    exact absVal_refineUgtConst_isInit h
-  | false =>
-    rw [h0] at h
+    rw [hV] at h
     simp only at h ⊢
-    cases hLo : a.lbound? with
-    | none =>
-      rw [hLo] at h
-      simp only at h ⊢
-      cases hTop : Nat.beq v (modPow2 w - 1) with
-      | true => rw [hTop] at h; exact absVal_refineUleConst_isInit hai h
-      | false => exact hai
-    | some lo =>
-      rw [hLo] at h
-      simp only at h ⊢
-      cases hEqLo : Nat.beq v lo with
-      | true => rw [hEqLo] at h; exact absVal_refineUgtConst_isInit h
-      | false =>
-        rw [hEqLo] at h
-        simp only at h ⊢
-        cases hHi : a.ubound? with
-        | none =>
-          rw [hHi] at h
-          simp only at h ⊢
-          cases hTop : Nat.beq v (modPow2 w - 1) with
-          | true => rw [hTop] at h; exact absVal_refineUleConst_isInit hai h
-          | false => exact hai
-        | some hi =>
-          rw [hHi] at h
-          cases hi with
-          | zero =>
-            simp only at h ⊢
-            cases hTop : Nat.beq v (modPow2 w - 1) with
-            | true => rw [hTop] at h; exact absVal_refineUleConst_isInit hai h
-            | false => exact hai
-          | succ k =>
-            simp only at h ⊢
-            cases hEqHi : Nat.beq v (k + 1) with
-            | true =>
-              rw [hEqHi] at h
-              exact absVal_refineUleConst_isInit hai h
-            | false => exact hai
+    cases hB : Nat.blt v (modPow2 w) with
+    | false => exact hai
+    | true =>
+      rw [hB] at h
+      exact reduceAbsVal_isInit_of_denote h
 
 /-- Unfiltered `switchInt` edges for an unsigned discriminant: skips
 out-of-range branch values (`v ≥ 2^w`), prunes remaining branches and
@@ -4393,7 +4600,8 @@ def stepTermAbs (env : MirAbsEnv) (term : Terminator) : Option TermAbsOutcome :=
     match evalOperandAbs env cond with
     | some (.bool (.exact c g), env₁) =>
       match boolBeq c expected with
-      | true => some (.edges [(target, refineEnvByGuard env₁ g c)])
+      | true => some (.edges (filterFeasibleEdges
+          [(target, refineEnvByGuard env₁ g c)]))
       | false => none
     | _ => none
   | _ => none
@@ -4758,9 +4966,10 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                     | intro b hb =>
                       have hbc : b = c := hb.2.1
                       subst hbc
+                      have hRef := refineEnvByGuard_sound hv.2.2.1 hb.2.2
                       refine ⟨target, _, .silent, locals', s.memory,
-                        List.Mem.head _, ?_, rfl, rfl, rfl,
-                        refineEnvByGuard_sound hv.2.2.1 hb.2.2⟩
+                        filterFeasibleEdges_mem (List.Mem.head _) hRef,
+                        ?_, rfl, rfl, rfl, hRef⟩
                       simp only [evalTerminator]
                       rw [hEvalT, hb.1]
                       cases b <;> rfl
@@ -5020,6 +5229,27 @@ private theorem entryEnvAux_spec :
     | succ i => exact ih.2.2 i d' s cs hD hS hCs locals
   | _ + 1, _ :: _, [], _ :: _, hOk => nomatch hOk
   | _ + 1, _ :: _, _ :: _, [], hOk => nomatch hOk
+
+/-- The abstract entry frame has one slot per declared local. -/
+theorem length_entryEnv (decls : List LocalDecl) (argSlots : List MirAbsSlot) :
+    length (entryEnv decls argSlots) = length decls := by
+  have hAux : ∀ k ds as, length (entryEnvAux k ds as) = length ds := by
+    intro k ds
+    induction ds generalizing k with
+    | nil => intro _; rfl
+    | cons d rest ih =>
+      intro as
+      cases k with
+      | zero => exact congrArg Nat.succ (ih 1 as)
+      | succ k' =>
+        cases as with
+        | nil => exact congrArg Nat.succ (ih (k' + 1) [])
+        | cons _ as' => exact congrArg Nat.succ (ih (k' + 1) as')
+  exact hAux 0 decls argSlots
+
+/-- Zero-argument calls trivially satisfy `entryArgsOk`. -/
+theorem entryArgsOk_nil (ds : List LocalDecl) : entryArgsOk ds [] [] := by
+  cases ds <;> exact True.intro
 
 /-- The abstract entry frame denotes the concrete initial frame
 `initLocalsAux 0 decls args` built by `initMachineState`. -/
