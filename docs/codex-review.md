@@ -35,20 +35,21 @@ the head of its target base, which is `main` for a lone PR or the bottom PR of
 a stack, and the head of the PR directly below it otherwise.
 
 Review evidence recorded on this PR for one identity (review receipts, Gate 2
-reviews, and human approvals) remains valid for every later head of the same
-PR with that identity, however that head was produced, and for no other,
-subject to the Gate 5 rules for the Review Receipt comment's `Human review
-surface` block. Evidence never transfers
-between pull requests. In particular, when a lower stack PR is squash-merged
-and the PR above it is rebased onto that squash commit (whose tree equals the
-lower PR's reviewed head tree), the upper PR's identity—and its review
-evidence—is unchanged. The identity omits author and committer metadata, and
-GitHub reports CI per commit SHA, so every new head still needs its own
-SHA-bound deterministic preflight (including the authorship and trailer checks
-in [`AGENTS.md`](../AGENTS.md#standing-rules)) and its own Gate 3 CI. Any
-change to either tree or to the commit message changes a one-commit PR's
-identity, and any change of SHA changes a multi-commit PR's identity;
-re-confirm every affected gate whenever the identity changes:
+reviews, and human approvals) remains valid for every later head of the same PR
+with that identity, however that head was produced, and for no other, subject to
+the Gate 5 rules for the Review Receipt comment's `Human review surface` block.
+The one exception is the evaluator-verified rebase-only carry-forward of a clean
+Gate 2 review described under Gate 2. Evidence never transfers between pull
+requests. In particular, when a lower stack PR is squash-merged and the PR above
+it is rebased onto that squash commit (whose tree equals the lower PR's reviewed
+head tree), the upper PR's identity—and its review evidence—is unchanged. The
+identity omits author and committer metadata, and GitHub reports CI per commit
+SHA, so every new head still needs its own SHA-bound deterministic preflight
+(including the authorship and trailer checks in
+[`AGENTS.md`](../AGENTS.md#standing-rules)) and its own Gate 3 CI. Any change to
+either tree or to the commit message changes a one-commit PR's identity, and any
+change of SHA changes a multi-commit PR's identity; re-confirm every affected
+gate whenever the identity changes:
 
 1. **Gate 1 — Local review and receipt:** Local
    [`change-review`](../skills/change-review/SKILL.md) and
@@ -91,17 +92,72 @@ re-confirm every affected gate whenever the identity changes:
      `identity_key`, `panel_seats[]`, `prior_findings_status[]`, and `coverage`
      (plus per-finding `fingerprint`, `surface`, `consensus_count`,
      `raised_by[]`, and `repro_status`) may carry one-commit identity or
-     multi-seat diagnostic metadata. Gate 2 provides the cold cross-family
-     review and falsification pass after Gate 1's pre-push convergence.
+     multi-seat diagnostic metadata. When `identity_key` uses a structured
+     `one:` or `multi:` prefix (case-insensitive after trimming whitespace), it
+     must match `one:<parent_tree>:<tree_sha>:<commit_msg_sha256>` (lowercase
+     40-hex SHAs and 64-hex SHA-256 over the UTF-8 `commit.message` returned by
+     GitHub's commits API, which omits the raw commit object's trailing
+     newlines) or `multi:<base_sha>:<head_sha>` and agree with `tree_sha`,
+     `parent_tree`, `commit_msg_sha256`, `base_sha`, and `head_sha` fail-closed;
+     non-structured legacy keys are accepted only on exact `(head_sha, base_sha,
+     tree_sha)` and never transfer across heads. Gate 2 provides the cold
+     cross-family review and falsification pass after Gate 1's pre-push
+     convergence.
+
+     Optional `advisories[]` entries are `P3` notes in the finding shape. They
+     never block, and are not findings for the resolution rule below; a
+     reviewer that would report only `P3` issues may report `verdict: "clean"`
+     with those notes as advisories. A `P3` entry in `findings[]` keeps its
+     blocking meaning, so a reviewer that follows only the Code Review Rules
+     and reports `P3` issues as findings is still correct.
+
+     **Rebase-only carry-forward.** A clean `anneal-gate2-review:v1` review
+     also covers a later identity of a one-commit PR when the evaluator itself
+     confirms from GitHub data that the PR was only rebased onto a later base
+     since that review:
+     - the review is the latest Gate 2 item on the PR (deleted comments
+       included, and never itself a deleted comment), names a different head
+       and base than the current ones, and passes with the PR's whole review
+       history judged as of the reviewed head's GitHub-verified tree and
+       one-commit identity (clean, cross-family, `COMMENTED`, current
+       `merge_base`, no active failure);
+     - no Gate 2 item recorded on the reviewed head or tree has findings or,
+       unless it is a deleted comment, fails on its own recorded identity; every
+       other head with Gate 2 findings or failures makes different changes than
+       the reviewed head; and every legacy Codex summary on the PR is a
+       completed clean review;
+     - both heads are single commits on their bases with the same commit
+       message;
+     - every file's added and removed lines, status, rename source, resulting
+       blob, and mode (from the raw diff) are identical between the two
+       commits; only context lines and hunk positions may differ, and a file
+       without a comparable patch or blob fails closed; and
+     - the base moved strictly forward (`compare` status `ahead`) without
+       touching the review rules (any `AGENTS.md`, `AGENTS.override.md`,
+       `CLAUDE.md`, or `GEMINI.md`, `.gemini/styleguide.md` files, `skills/`
+       and `.github/` trees, this document, `review-policy-design.md`,
+       `trust-model.md`, the principles and threat model docs, or
+       `ci/codex_review.py`) or any file the PR touches, except
+       `trusted/root-manifest.sha256` (or `anneal/trusted/root-manifest.sha256`),
+       whose lines each name their file and digest: if the base changed it,
+       only its blob may differ.
+
+     Anything else, including GitHub's 300-file truncation or an API error,
+     needs a new review. No reviewer posts anything for a carry-forward; the
+     evaluator's status names the reviewed commit it carried forward. This is
+     an intentional relaxation of the one-identity rule: interactions between
+     the PR and base changes to other files (outside the review rules above)
+     are left to Gate 3 CI and the merge queue.
    - **Legacy Codex summary (`codex-review-state:v1`):** For backwards
      compatibility, a complete code review by an authentic
      `chatgpt-codex-connector[bot]` covering the current identity.
 
    An aborted run, a request answered with an error, a `verdict: "incomplete"`
    run, or a run that has not completed is never a passing Gate 2 review. Every
-   finding that a Gate 2 reviewer posts on this PR, for any identity and
-   including findings from incomplete or errored runs, is resolved in exactly
-   one of two ways:
+   finding that a Gate 2 reviewer posts on this PR (a `findings[]` entry or a
+   legacy Codex finding, never an advisory), for any identity and including
+   findings from incomplete or errored runs, is resolved in exactly one of two
+   ways:
    - **Fixed:** after the finding, the surface it concerns changes (the PR's
      tree; its commit message; or, for a finding about something outside the
      identity, such as the PR description or Review Receipt comment, that
@@ -187,6 +243,14 @@ service limit. See
 [`docs/review-policy-design.md`](review-policy-design.md#policy-ownership) for
 file ownership across skills and docs.
 
+On a pull request that edits a file in that ownership table, if any Gate 2
+review after the second round raises a finding about policy wording rather
+than a trust, soundness, or correctness defect, stop requesting automated
+reviews. Send a human maintainer a short Gate 5 decision brief listing the
+open findings, a proposed disposition for each, and a recommendation, then
+follow the maintainer's decision. Gate 2 still requires a complete review of
+the identity that lands, with every finding resolved.
+
 ## Live GitHub ruleset state and diagnostic workflow
 
 The diagnostic [workflow](../.github/workflows/codex-review.yml) runs only on
@@ -225,15 +289,50 @@ GH_TOKEN="$(gh auth token)" python3 -I -B ci/codex_review.py \
   --repository joshlf/anneal
 ```
 
-The evaluator reads live PRs, PR reviews, summaries, commit trees, historical
-deletion records, and merge queue state, then prints proposed verdicts. For
-`anneal-gate2-review:v1` reviews, it validates `base_sha`, `head_sha`,
-`tree_sha`, `reviewer_family != author_family`, `COMMENTED` state, and
-`findings[]` fail-closed. For legacy `codex-review-state:v1` summaries, its
-freshness rules still reject a completed review when Codex edits an older
-summary or supplies only a prose receipt; deletion records are no longer updated
-automatically. Treat diagnostic output as evidence and inspect actual Gate 2
-reviews before making a manual merge decision.
+The evaluator reads live PRs, PR reviews, summaries, commit metadata (`tree`,
+`parents`, and `commit.message`), historical deletion records, and merge queue
+state, then prints proposed verdicts. For `anneal-gate2-review:v1` reviews, it
+derives `one:<parent_tree>:<tree_sha>:<commit_msg_sha256>` (single-commit PR on
+`base_sha`) or `multi:<base_sha>:<head_sha>` from GitHub's commits API and
+validates `tree_sha`, structured `identity_key`, `reviewer_family !=
+author_family`, `COMMENTED` state, and `findings[]` fail-closed (`merge_base`
+when set must equal `base_sha`; `advisories[]` must be `P3`-only). Clean
+verdicts with a `one:` key transfer across `head_sha`/`base_sha` changes only
+when `merge_base` is absent or equals `payload.base_sha` and GitHub confirms
+that the historical `(payload.head_sha, payload.base_sha)` commit has the same
+`(tree_sha, identity_key)`, or when the rebase-only carry-forward above holds,
+which it checks with the `commits/{sha}` file patches and raw diff modes and
+`compare/{base}...{base}`; a clean review whose `base_sha` equals the current
+`base_sha` (exact head or not) must still postdate the last `base_changed_at`
+event, with or without a matching key, so only transfers from a different,
+GitHub-verified `base_sha` skip that freshness check, and a base change never
+stops a failing review from blocking. Active prior findings on the exact
+`(head_sha, base_sha, tree_sha)` or any historical commit whose GitHub tree
+matches `tree_sha` (including message-only amends, identity-preserving
+rewrites, and still-present issue comments with `id <= deleted_through`) block
+later clean reviews regardless of `identity_key` presence or format (and
+despite `base_changed_at` events or `base_sha` retargets on the same commit),
+while `deleted_through` still prevents comments with `id <= deleted_through`
+from approving. Earlier non-finding failures (`CHANGES_REQUESTED`, `APPROVED`,
+same-family reviews, or a mismatched `commit_id`) on the exact `(head_sha,
+base_sha, tree_sha)`, or on any historical commit that GitHub confirms has the
+current `one:` identity (with or without a payload `identity_key`), also remain
+blocking across later clean retries and identity-preserving rewrites. Such a
+failure stops blocking only when it carries a mismatched structured
+`identity_key` or a stale `merge_base`, or when it is an issue comment with
+`id <= deleted_through` (whose historical commit is then never looked up). If
+GitHub cannot resolve the historical commit of such a failure (HTTP 404 or
+422), the evaluator fails closed instead of dropping it. For legacy
+`codex-review-state:v1` summaries, active completed findings on the current head
+or a historical commit whose GitHub tree matches `tree_sha` (including
+still-present comments with `id <= deleted_through`) continue blocking across
+rewrites; such a summary records no tree, so one on a historical commit GitHub
+cannot resolve (HTTP 404 or 422) is treated like a finding on a different tree
+and does not block. `review_snapshot` tracks those active summaries alongside
+the latest summary, and freshness rules still reject a completed review when
+Codex edits an older summary or supplies only a prose receipt; deletion records
+are no longer updated automatically. Treat diagnostic output as evidence and
+inspect actual Gate 2 reviews before making a manual merge decision.
 
 ## Preserve the evaluator and re-enablement criteria
 

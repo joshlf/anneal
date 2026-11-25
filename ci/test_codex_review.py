@@ -9,6 +9,7 @@
 """Exercise policy boundaries and publication using in-memory GitHub data."""
 
 import copy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -18,7 +19,9 @@ from urllib.error import HTTPError
 
 from codex_review import (
     BOT_ID, BOT_LOGIN, CONTEXT, PUBLISHER_LOGIN, GitHub, Result, combine_results,
-    STATE_ANCHOR, reconcile, review_result,
+    STATE_ANCHOR, base_drift_allows_carry_forward, diff_file_modes,
+    parse_gate2_payload, rebase_only_patch_equivalent, reconcile,
+    review_result,
 )
 
 
@@ -254,7 +257,7 @@ class FakeGitHub:
     def __init__(self, initial, comments, final=None, changed_comments=None,
                  deleted=None, queues=None, bases=None,
                  reviews=None, changed_reviews=None, trees=None,
-                 authorized_reviewers=None):
+                 authorized_reviewers=None, parents=None, messages=None):
         self.snapshots = [initial, initial if final is None else final]
         self.bodies = comments
         self.review_bodies = (
@@ -270,6 +273,8 @@ class FakeGitHub:
         self.bases = {p["number"]: None for p in initial} if bases is None else bases
         self.trees = {HEAD: TREE, OTHER_HEAD: OTHER_TREE} if trees is None else trees
         self.authorized_reviewers = authorized_reviewers
+        self.parents = {} if parents is None else parents
+        self.messages = {} if messages is None else messages
 
     def pulls(self):
         return copy.deepcopy(self.snapshots.pop(0))
@@ -295,6 +300,26 @@ class FakeGitHub:
         if isinstance(val, Exception):
             raise val
         return val
+
+    def commit_info(self, sha):
+        tree_sha = self.commit_tree(sha)
+        return {
+            "sha": sha,
+            "tree_sha": tree_sha,
+            "parents": list(self.parents.get(sha, [])),
+            "message": self.messages.get(sha, ""),
+        }
+
+    def commit_identity(self, head, base_sha):
+        tree_sha = self.commit_tree(head)
+        if head in self.parents and head in self.messages and base_sha in self.trees:
+            if len(self.parents[head]) == 1 and self.parents[head][0] == base_sha:
+                parent_tree = self.commit_tree(base_sha)
+                msg_sha256 = hashlib.sha256(
+                    self.messages[head].encode("utf-8")
+                ).hexdigest()
+                return tree_sha, f"one:{parent_tree}:{tree_sha}:{msg_sha256}"
+        return tree_sha, f"multi:{base_sha}:{head}"
 
     def deleted_summaries(self):
         return self.deleted
@@ -1094,6 +1119,2145 @@ class Gate2CrossFamilyTests(unittest.TestCase):
                     "failure",
                 )
 
+    def test_one_commit_identity_key_reuse_and_fail_closed_invalidation(self):
+        parent_tree = "1" * 40
+        other_parent_tree = "2" * 40
+        msg = "Subject\n\nBody text."
+        msg_hash = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+        other_msg_hash = hashlib.sha256(b"Changed subject").hexdigest()
+        ik = f"one:{parent_tree}:{TREE}:{msg_hash}"
+        verified_hist = {(OTHER_HEAD, BASE): (TREE, ik)}
+
+        # Clean review on OLD_HEAD/BASE transfers to rebased HEAD/OTHER_BASE
+        # when historical head/base identity is verified to match current ik.
+        old_clean_rev = gate2_review(
+            head_sha=OTHER_HEAD,
+            base_sha=BASE,
+            tree_sha=TREE,
+            parent_tree=parent_tree,
+            commit_msg_sha256=msg_hash,
+            identity_key=ik,
+            submitted_at="2026-11-23T01:00:00Z",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[old_clean_rev],
+                base_sha=OTHER_BASE, tree_sha=TREE,
+                base_changed_at="2026-11-23T02:00:00Z",
+                identity_key=ik,
+                historical_identities=verified_hist,
+            ).state,
+            "success",
+        )
+        old_clean_cmt = gate2_comment(
+            head_sha=OTHER_HEAD,
+            base_sha=BASE,
+            tree_sha=TREE,
+            parent_tree=parent_tree,
+            commit_msg_sha256=msg_hash,
+            identity_key=ik,
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [old_clean_cmt],
+                base_sha=OTHER_BASE, tree_sha=TREE,
+                identity_key=ik,
+                historical_identities=verified_hist,
+            ).state,
+            "success",
+        )
+
+        # Cross-head reuse fails closed without verified historical head/base
+        # identity, or if historical commit actually had a different identity.
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[old_clean_rev],
+                base_sha=OTHER_BASE, tree_sha=TREE,
+                identity_key=ik,
+            ).state,
+            "pending",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[old_clean_rev],
+                base_sha=OTHER_BASE, tree_sha=TREE,
+                identity_key=ik,
+                historical_identities={
+                    (OTHER_HEAD, BASE): (TREE, f"one:{parent_tree}:{TREE}:{other_msg_hash}"),
+                },
+            ).state,
+            "pending",
+        )
+
+        # Any change to tree, commit message, parent_tree, or multi-commit
+        # shape fails closed to pending (never reuses prior review).
+        for changed_ik in (
+            f"one:{parent_tree}:{OTHER_TREE}:{msg_hash}",
+            f"one:{parent_tree}:{TREE}:{other_msg_hash}",
+            f"one:{other_parent_tree}:{TREE}:{msg_hash}",
+            f"multi:{OTHER_BASE}:{HEAD}",
+            None,
+        ):
+            target_tree = OTHER_TREE if changed_ik == f"one:{parent_tree}:{OTHER_TREE}:{msg_hash}" else TREE
+            with self.subTest(changed_ik=changed_ik):
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[old_clean_rev],
+                        base_sha=OTHER_BASE, tree_sha=target_tree,
+                        identity_key=changed_ik,
+                        historical_identities=verified_hist,
+                    ).state,
+                    "pending",
+                )
+
+        # Legacy or custom v1 identity_key values remain valid on exact
+        # head/base/tree, but never transfer across heads.
+        legacy_rev = gate2_review(identity_key="custom:legacy-v1-key")
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[legacy_rev],
+                base_sha=BASE, tree_sha=TREE, identity_key=ik,
+            ).state,
+            "success",
+        )
+        legacy_old = gate2_review(
+            head_sha=OTHER_HEAD, base_sha=BASE,
+            identity_key="custom:legacy-v1-key",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[legacy_old],
+                base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                historical_identities={(OTHER_HEAD, BASE): (TREE, ik)},
+            ).state,
+            "pending",
+        )
+
+        # Malformed structured or self-contradictory identity_key fields fail
+        # closed.
+        bad_ik_reviews = [
+            gate2_review(identity_key=" "),
+            gate2_review(identity_key="one:not-a-valid-key"),
+            gate2_review(identity_key=" one:bad"),
+            gate2_review(identity_key="multi:bad"),
+            gate2_review(identity_key=f"one:{parent_tree}:{OTHER_TREE}:{msg_hash}"),
+            gate2_review(
+                parent_tree=other_parent_tree,
+                identity_key=ik,
+            ),
+            gate2_review(
+                commit_msg_sha256=other_msg_hash,
+                identity_key=ik,
+            ),
+            gate2_review(identity_key=f"multi:{OTHER_BASE}:{HEAD}"),
+            gate2_review(identity_key=f"multi:{BASE}:{OTHER_HEAD}"),
+        ]
+        for bad_rev in bad_ik_reviews:
+            for caller_ik in (ik, None):
+                with self.subTest(bad_ik=bad_rev["body"], caller_ik=caller_ik):
+                    self.assertEqual(
+                        review_result(
+                            HEAD, [], reviews=[bad_rev],
+                            base_sha=BASE, tree_sha=TREE, identity_key=caller_ik,
+                        ).state,
+                        "failure",
+                    )
+        # parse_gate2_payload's own consistency checks reject these, with no
+        # caller identity_key to mask a disabled check.
+        for bad_rev, expected_msg in (
+            (bad_ik_reviews[4], "identity_key tree_sha mismatch"),
+            (bad_ik_reviews[5], "identity_key parent_tree mismatch"),
+            (bad_ik_reviews[6], "identity_key commit_msg_sha256 mismatch"),
+            (bad_ik_reviews[7], "identity_key base/head mismatch"),
+            (bad_ik_reviews[8], "identity_key base/head mismatch"),
+        ):
+            with self.subTest(parser_only=bad_rev["body"]):
+                with self.assertRaisesRegex(ValueError, expected_msg):
+                    parse_gate2_payload(bad_rev["body"])
+        # Contradictory identity_key on exact head/base fails closed.
+        self.assertEqual(
+            review_result(
+                HEAD, [],
+                reviews=[gate2_review(identity_key=ik)],
+                base_sha=BASE, tree_sha=TREE,
+                identity_key=f"one:{other_parent_tree}:{TREE}:{msg_hash}",
+            ).state,
+            "failure",
+        )
+        # Base retarget without rebase (unchanged head, changed base_sha) stays
+        # pending rather than failing on identity_key mismatch.
+        self.assertEqual(
+            review_result(
+                HEAD, [],
+                reviews=[gate2_review(identity_key=f"multi:{BASE}:{HEAD}")],
+                base_sha=OTHER_BASE, tree_sha=TREE,
+                identity_key=f"multi:{OTHER_BASE}:{HEAD}",
+            ).state,
+            "pending",
+        )
+        # Payload claiming one: identity_key with stale merge_base != base_sha
+        # cannot match across rebases.
+        self.assertEqual(
+            review_result(
+                HEAD, [],
+                reviews=[gate2_review(
+                    head_sha=OTHER_HEAD,
+                    base_sha=BASE,
+                    merge_base=OTHER_BASE,
+                    identity_key=ik,
+                )],
+                base_sha=OTHER_BASE, tree_sha=TREE,
+                identity_key=ik,
+                historical_identities=verified_hist,
+            ).state,
+            "pending",
+        )
+
+        # Anti-downgrade: findings on OLD_HEAD block NEW_HEAD with the same
+        # identity_key, even if a clean review is posted on NEW_HEAD.
+        finding = {"severity": "P1", "summary": "Soundness defect"}
+        old_findings = gate2_review(
+            review_id=10,
+            head_sha=OTHER_HEAD,
+            base_sha=BASE,
+            tree_sha=TREE,
+            identity_key=ik,
+            submitted_at="2026-11-23T01:00:00Z",
+            verdict="findings",
+            findings=[finding],
+        )
+        new_clean = gate2_review(
+            review_id=11,
+            head_sha=HEAD,
+            base_sha=OTHER_BASE,
+            tree_sha=TREE,
+            identity_key=ik,
+            submitted_at="2026-11-23T02:00:00Z",
+            verdict="clean",
+            findings=[],
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[old_findings],
+                base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                historical_identities=verified_hist,
+            ).state,
+            "failure",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[old_findings, new_clean],
+                base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                historical_identities=verified_hist,
+            ).state,
+            "failure",
+        )
+        # Once the tree changes (new identity_key), a clean review passes.
+        new_ik = f"one:{parent_tree}:{OTHER_TREE}:{msg_hash}"
+        fixed_clean = gate2_review(
+            review_id=12,
+            head_sha=HEAD,
+            base_sha=OTHER_BASE,
+            tree_sha=OTHER_TREE,
+            identity_key=new_ik,
+            submitted_at="2026-11-23T03:00:00Z",
+            verdict="clean",
+            findings=[],
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[old_findings, fixed_clean],
+                base_sha=OTHER_BASE, tree_sha=OTHER_TREE, identity_key=new_ik,
+                historical_identities=verified_hist,
+            ).state,
+            "success",
+        )
+        # Incomplete review on NEW_HEAD supersedes clean review on OLD_HEAD.
+        new_incomplete = gate2_review(
+            review_id=13,
+            head_sha=HEAD,
+            base_sha=OTHER_BASE,
+            tree_sha=TREE,
+            identity_key=ik,
+            submitted_at="2026-11-23T02:30:00Z",
+            verdict="incomplete",
+            findings=[],
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[old_clean_rev, new_incomplete],
+                base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                historical_identities=verified_hist,
+            ).state,
+            "pending",
+        )
+
+    def test_reconcile_and_transport_identity_key(self):
+        parent_tree = "1" * 40
+        other_parent_tree = "2" * 40
+        msg = "[anneal] Clean single commit"
+        msg_trailing_nl = "[anneal] Clean single commit\n"
+        msg_hash = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+        msg_nl_hash = hashlib.sha256(msg_trailing_nl.encode("utf-8")).hexdigest()
+        ik = f"one:{parent_tree}:{TREE}:{msg_hash}"
+
+        with patch("sys.stdout", new=io.StringIO()):
+            # End-to-end reconcile reuses a clean review on OTHER_HEAD after a
+            # squash-rebase onto OTHER_BASE only when OTHER_HEAD/BASE also
+            # resolves to the same 1-commit identity on GitHub.
+            pr1 = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": OTHER_BASE}, "draft": False}
+            old_clean = gate2_review(
+                head_sha=OTHER_HEAD,
+                base_sha=BASE,
+                tree_sha=TREE,
+                parent_tree=parent_tree,
+                commit_msg_sha256=msg_hash,
+                identity_key=ik,
+                submitted_at="2026-11-23T01:00:00Z",
+            )
+            github = FakeGitHub(
+                [pr1],
+                {1: []},
+                reviews={1: [old_clean]},
+                bases={1: "2026-11-23T02:00:00Z"},
+                trees={HEAD: TREE, OTHER_HEAD: TREE, OTHER_BASE: parent_tree, BASE: parent_tree},
+                parents={HEAD: [OTHER_BASE], OTHER_HEAD: [BASE]},
+                messages={HEAD: msg, OTHER_HEAD: msg},
+            )
+            verdicts = reconcile(github, publish=True)
+            self.assertEqual(verdicts[HEAD].state, "success")
+
+            # Spoofed/miscomputed identity_key on historical OTHER_HEAD must not
+            # transfer when GitHub shows OTHER_HEAD actually had a different
+            # message or parent.
+            github_mismatch = FakeGitHub(
+                [pr1],
+                {1: []},
+                reviews={1: [old_clean]},
+                bases={1: "2026-11-23T02:00:00Z"},
+                trees={HEAD: TREE, OTHER_HEAD: TREE, OTHER_BASE: parent_tree, BASE: parent_tree},
+                parents={HEAD: [OTHER_BASE], OTHER_HEAD: [BASE]},
+                messages={HEAD: msg, OTHER_HEAD: msg_trailing_nl},
+            )
+            verdicts_mismatch = reconcile(github_mismatch, publish=True)
+            self.assertEqual(verdicts_mismatch[HEAD].state, "pending")
+
+            # Missing (404) historical commit denies cross-head reuse on clean
+            # review without hiding a fresher review on HEAD, while failing
+            # closed if an unverified 404/500 blocks a historical findings item.
+            github_404 = FakeGitHub(
+                [pr1],
+                {1: []},
+                reviews={1: [old_clean]},
+                trees={
+                    HEAD: TREE,
+                    OTHER_HEAD: RuntimeError("GitHub GET: HTTP 404"),
+                    OTHER_BASE: parent_tree,
+                },
+                parents={HEAD: [OTHER_BASE]},
+                messages={HEAD: msg},
+            )
+            verdicts_404 = reconcile(github_404, publish=True)
+            self.assertEqual(verdicts_404[HEAD].state, "pending")
+
+            # A 404 on PR #1's historical item must not poison PR #2 when PR #2
+            # uses that same (head, base) as its live head (no TypeError).
+            pr2_same_missing = {
+                "number": 2, "head": {"sha": OTHER_HEAD},
+                "base": {"ref": "main", "sha": BASE}, "draft": False,
+            }
+            pr2_rev = gate2_review(
+                review_id=19, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            )
+            github_shared_404 = FakeGitHub(
+                [pr1, pr2_same_missing],
+                {1: [], 2: []},
+                reviews={1: [old_clean], 2: [pr2_rev]},
+                trees={
+                    HEAD: TREE,
+                    OTHER_HEAD: RuntimeError("GitHub GET: HTTP 404"),
+                    OTHER_BASE: parent_tree,
+                },
+                parents={HEAD: [OTHER_BASE]},
+                messages={HEAD: msg},
+            )
+            with self.assertRaises(RuntimeError):
+                reconcile(github_shared_404, publish=True)
+            written_shared = dict(github_shared_404.writes)
+            self.assertEqual(written_shared[HEAD].state, "pending")
+            self.assertEqual(written_shared[OTHER_HEAD].state, "failure")
+
+            old_findings_404 = gate2_review(
+                review_id=20,
+                head_sha=OTHER_HEAD,
+                base_sha=BASE,
+                tree_sha=TREE,
+                parent_tree=parent_tree,
+                commit_msg_sha256=msg_hash,
+                identity_key=ik,
+                verdict="findings",
+                findings=[{"severity": "P1", "summary": "Bug"}],
+            )
+            github_findings_404 = FakeGitHub(
+                [pr1],
+                {1: []},
+                reviews={1: [old_findings_404]},
+                trees={
+                    HEAD: TREE,
+                    OTHER_HEAD: RuntimeError("GitHub GET: HTTP 404"),
+                    OTHER_BASE: parent_tree,
+                },
+                parents={HEAD: [OTHER_BASE]},
+                messages={HEAD: msg},
+            )
+            with self.assertRaises(RuntimeError):
+                reconcile(github_findings_404, publish=True)
+            self.assertEqual(github_findings_404.writes[-1][1].state, "failure")
+
+            # Legacy v1 identity_key remains accepted on exact head/base/tree.
+            pr_legacy = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": BASE}, "draft": False}
+            legacy_clean = gate2_review(
+                head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                identity_key="legacy-v1-key",
+            )
+            github_legacy = FakeGitHub(
+                [pr_legacy],
+                {1: []},
+                reviews={1: [legacy_clean]},
+                trees={HEAD: TREE, BASE: parent_tree},
+                parents={HEAD: [BASE]},
+                messages={HEAD: msg},
+            )
+            self.assertEqual(reconcile(github_legacy, publish=True)[HEAD].state, "success")
+
+            # Rebase onto a base commit with a different parent tree waits.
+            github_changed_base = FakeGitHub(
+                [pr1],
+                {1: []},
+                reviews={1: [old_clean]},
+                trees={HEAD: TREE, OTHER_HEAD: TREE, OTHER_BASE: other_parent_tree, BASE: parent_tree},
+                parents={HEAD: [OTHER_BASE], OTHER_HEAD: [BASE]},
+                messages={HEAD: msg, OTHER_HEAD: msg},
+            )
+            verdicts_changed = reconcile(github_changed_base, publish=True)
+            self.assertEqual(verdicts_changed[HEAD].state, "pending")
+
+            # Multi-commit PR (parent != base) stays pending with same tree.
+            github_multi = FakeGitHub(
+                [pr1],
+                {1: []},
+                reviews={1: [old_clean]},
+                trees={HEAD: TREE, OTHER_HEAD: TREE, OTHER_BASE: parent_tree, BASE: parent_tree},
+                parents={HEAD: [BASE], OTHER_HEAD: [BASE]},
+                messages={HEAD: msg, OTHER_HEAD: msg},
+            )
+            verdicts_multi = reconcile(github_multi, publish=True)
+            self.assertEqual(verdicts_multi[HEAD].state, "pending")
+
+        # Transport: GitHub.commit_info and GitHub.commit_identity hash the
+        # UTF-8 bytes of GitHub REST's `commit.message` verbatim (GitHub's
+        # commits API omits the raw commit object's trailing newlines, so
+        # local producers must hash that same canonical message).
+        gh = GitHub("google/zerocopy", "not-a-real-token")
+        head_resp = {
+            "sha": HEAD,
+            "commit": {"tree": {"sha": TREE}, "message": msg},
+            "parents": [{"sha": BASE}],
+        }
+        head_nl_resp = {
+            "sha": HEAD,
+            "commit": {"tree": {"sha": TREE}, "message": msg_trailing_nl},
+            "parents": [{"sha": BASE}],
+        }
+        base_resp = {"sha": BASE, "commit": {"tree": {"sha": parent_tree}}}
+        with patch.object(gh, "request", side_effect=[head_resp, base_resp]):
+            self.assertEqual(gh.commit_identity(HEAD, BASE), (TREE, ik))
+        with patch.object(gh, "request", side_effect=[head_nl_resp, base_resp]):
+            self.assertEqual(
+                gh.commit_identity(HEAD, BASE),
+                (TREE, f"one:{parent_tree}:{TREE}:{msg_nl_hash}"),
+            )
+        self.assertNotEqual(msg_hash, msg_nl_hash)
+        merge_resp = {
+            "sha": HEAD,
+            "commit": {"tree": {"sha": TREE}, "message": msg},
+            "parents": [{"sha": BASE}, {"sha": OTHER_HEAD}],
+        }
+        with patch.object(gh, "request", return_value=merge_resp):
+            self.assertEqual(gh.commit_identity(HEAD, BASE), (TREE, f"multi:{BASE}:{HEAD}"))
+        # A single parent other than base_sha (a multi-commit PR) is never a
+        # one-commit identity, and GitHub is not asked for that parent's tree.
+        other_parent_resp = {
+            "sha": HEAD,
+            "commit": {"tree": {"sha": TREE}, "message": msg},
+            "parents": [{"sha": OTHER_BASE}],
+        }
+        with patch.object(gh, "request", side_effect=[other_parent_resp]) as req:
+            self.assertEqual(gh.commit_identity(HEAD, BASE), (TREE, f"multi:{BASE}:{HEAD}"))
+            self.assertEqual(req.call_count, 1)
+        # Malformed parent SHAs and non-string messages fail closed.
+        for bad_commit_payload in (
+            {"sha": HEAD, "commit": {"tree": {"sha": TREE}, "message": msg},
+             "parents": [{"sha": "not-a-sha"}]},
+            {"sha": HEAD, "commit": {"tree": {"sha": TREE}, "message": msg},
+             "parents": ["bad"]},
+            {"sha": HEAD, "commit": {"tree": {"sha": TREE}, "message": None},
+             "parents": [{"sha": BASE}]},
+        ):
+            with self.subTest(bad_commit_payload=bad_commit_payload):
+                with patch.object(gh, "request", return_value=bad_commit_payload):
+                    with self.assertRaises(RuntimeError):
+                        gh.commit_info(HEAD)
+        with self.assertRaises(ValueError):
+            gh.commit_identity(HEAD, "bad-base")
+        bad_commit = {"sha": HEAD, "commit": {"tree": {"sha": TREE}, "message": msg}, "parents": "bad"}
+        with patch.object(gh, "request", return_value=bad_commit):
+            with self.assertRaises(RuntimeError):
+                gh.commit_info(HEAD)
+        for bad_payload in (
+            {"sha": HEAD, "commit": "bad"},
+            {"sha": HEAD, "commit": {"tree": "bad"}},
+        ):
+            with self.subTest(bad_payload=bad_payload):
+                with patch.object(gh, "request", return_value=bad_payload):
+                    with self.assertRaises(RuntimeError):
+                        gh.commit_info(HEAD)
+
+    def test_gate2_antidowngrade_preserves_mismatched_malformed_and_legacy_findings(self):
+        msg = "feat: add identity check\n\nBody"
+        other_msg = "feat: fix wording\n\nBody"
+        msg_hash = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+        parent_tree = "4" * 40
+        other_parent_tree = "5" * 40
+        ik = f"one:{parent_tree}:{TREE}:{msg_hash}"
+        finding = {"severity": "P1", "summary": "Soundness gap"}
+
+        later_clean_exact = gate2_review(
+            review_id=20, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T02:00:00Z",
+        )
+        # Exact-head findings with mismatched structured key,
+        # malformed one:/multi: key, or contradictory key still block a later
+        # clean review on the exact commit.
+        prior_exact_cases = [
+            ("mismatched_structured", {"identity_key": f"one:{other_parent_tree}:{TREE}:{msg_hash}"}),
+            ("malformed_one", {"identity_key": "one:not-a-valid-key"}),
+            ("malformed_multi", {"identity_key": "multi:bad"}),
+            ("whitespace_ik", {"identity_key": " "}),
+            ("contradictory_parent_tree", {"parent_tree": other_parent_tree, "identity_key": ik}),
+        ]
+        for label, extra in prior_exact_cases:
+            with self.subTest(case=label):
+                prior_bad = gate2_review(
+                    review_id=10, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                    verdict="findings", findings=[finding], **extra,
+                )
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[prior_bad, later_clean_exact],
+                        base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                    ).state,
+                    "failure",
+                )
+        # A malformed prior clean review does not poison a newer clean one.
+        prior_bad_clean = gate2_review(
+            review_id=11, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key="one:not-a-valid-key",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[prior_bad_clean, later_clean_exact],
+                base_sha=BASE, tree_sha=TREE, identity_key=ik,
+            ).state,
+            "success",
+        )
+
+        # Legacy (no identity_key or custom legacy key) findings on
+        # OTHER_HEAD still block HEAD after squash-rebase onto OTHER_BASE or
+        # no-op amend on BASE when historical commit identity matches.
+        pr_rebased = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": OTHER_BASE}, "draft": False}
+        pr_amended = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": BASE}, "draft": False}
+        for label, extra in (("keyless", {}), ("legacy_key", {"identity_key": "legacy-v1"})):
+            old_findings = gate2_review(
+                review_id=30, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+                verdict="findings", findings=[finding], **extra,
+            )
+            clean_rebased = gate2_review(
+                review_id=31, head_sha=HEAD, base_sha=OTHER_BASE, tree_sha=TREE,
+                identity_key=ik, submitted_at="2026-11-23T02:00:00Z",
+            )
+            with self.subTest(mode="squash_rebase", label=label):
+                gh_rebase = FakeGitHub(
+                    [pr_rebased], {1: []},
+                    reviews={1: [old_findings, clean_rebased]},
+                    trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree, OTHER_BASE: parent_tree},
+                    parents={HEAD: [OTHER_BASE], OTHER_HEAD: [BASE]},
+                    messages={HEAD: msg, OTHER_HEAD: msg},
+                )
+                self.assertEqual(reconcile(gh_rebase, publish=True)[HEAD].state, "failure")
+
+            clean_amended = gate2_review(
+                review_id=32, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                submitted_at="2026-11-23T02:00:00Z",
+            )
+            with self.subTest(mode="noop_amend", label=label):
+                gh_amend = FakeGitHub(
+                    [pr_amended], {1: []},
+                    reviews={1: [old_findings, clean_amended]},
+                    trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree},
+                    parents={HEAD: [BASE], OTHER_HEAD: [BASE]},
+                    messages={HEAD: msg, OTHER_HEAD: msg},
+                )
+                self.assertEqual(reconcile(gh_amend, publish=True)[HEAD].state, "failure")
+
+        # Changing only the commit message while preserving the tree
+        # keeps prior same-tree Gate 2 findings blocking (keyless and one:).
+        for label, extra in (
+            ("keyless", {}),
+            ("one_key", {"identity_key": f"one:{parent_tree}:{TREE}:{hashlib.sha256(other_msg.encode('utf-8')).hexdigest()}"}),
+        ):
+            old_same_tree_findings = gate2_review(
+                review_id=40, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+                verdict="findings", findings=[finding], **extra,
+            )
+            new_msg_clean = gate2_review(
+                review_id=41, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                identity_key=ik, submitted_at="2026-11-23T02:00:00Z",
+            )
+            with self.subTest(msg_changed=label):
+                gh_msg_changed = FakeGitHub(
+                    [pr_amended], {1: []},
+                    reviews={1: [old_same_tree_findings, new_msg_clean]},
+                    trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree},
+                    parents={HEAD: [BASE], OTHER_HEAD: [BASE]},
+                    messages={HEAD: msg, OTHER_HEAD: other_msg},
+                )
+                self.assertEqual(reconcile(gh_msg_changed, publish=True)[HEAD].state, "failure")
+
+        # Spoofed same tree_sha in a prior OTHER_HEAD payload does not block
+        # when GitHub confirms OTHER_HEAD actually had a different tree.
+        spoofed_tree_findings = gate2_review(
+            review_id=42, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            verdict="findings", findings=[finding],
+        )
+        new_msg_clean = gate2_review(
+            review_id=41, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T02:00:00Z",
+        )
+        gh_spoofed_tree = FakeGitHub(
+            [pr_amended], {1: []},
+            reviews={1: [spoofed_tree_findings, new_msg_clean]},
+            trees={HEAD: TREE, OTHER_HEAD: OTHER_TREE, BASE: parent_tree},
+            parents={HEAD: [BASE], OTHER_HEAD: [BASE]},
+            messages={HEAD: msg, OTHER_HEAD: other_msg},
+        )
+        self.assertEqual(reconcile(gh_spoofed_tree, publish=True)[HEAD].state, "success")
+
+        # Needed by gh_same_tree_404 below.
+        old_keyless_findings = gate2_review(
+            review_id=40, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            verdict="findings", findings=[finding],
+        )
+
+        # Changing the tree after a keyless finding also passes without needing
+        # the superseded OTHER_HEAD commit to still exist in GitHub.
+        old_tree_findings = gate2_review(
+            review_id=50, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=OTHER_TREE,
+            verdict="findings", findings=[finding],
+        )
+        gh_tree_changed_404 = FakeGitHub(
+            [pr_amended], {1: []},
+            reviews={1: [old_tree_findings, new_msg_clean]},
+            trees={HEAD: TREE, OTHER_HEAD: RuntimeError("GitHub GET: HTTP 404"), BASE: parent_tree},
+            parents={HEAD: [BASE]},
+            messages={HEAD: msg},
+        )
+        self.assertEqual(reconcile(gh_tree_changed_404, publish=True)[HEAD].state, "success")
+
+        # Missing (404) same-tree historical keyless findings fail closed.
+        gh_same_tree_404 = FakeGitHub(
+            [pr_amended], {1: []},
+            reviews={1: [old_keyless_findings, new_msg_clean]},
+            trees={HEAD: TREE, OTHER_HEAD: RuntimeError("GitHub GET: HTTP 404"), BASE: parent_tree},
+            parents={HEAD: [BASE]},
+            messages={HEAD: msg},
+        )
+        with self.assertRaises(RuntimeError):
+            reconcile(gh_same_tree_404, publish=True)
+        self.assertEqual(gh_same_tree_404.writes[-1][1].state, "failure")
+
+        # Sole/latest keyless findings on OTHER_HEAD still block HEAD after
+        # squash-rebase or no-op amend, even with a clean Codex summary on HEAD.
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[old_keyless_findings],
+                base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                historical_identities={(OTHER_HEAD, BASE): (TREE, ik)},
+            ).state,
+            "failure",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [summary()], reviews=[old_keyless_findings],
+                base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                historical_identities={(OTHER_HEAD, BASE): (TREE, ik)},
+            ).state,
+            "failure",
+        )
+        gh_sole_finding_with_codex = FakeGitHub(
+            [pr_rebased], {1: [summary()]},
+            reviews={1: [old_keyless_findings]},
+            trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree, OTHER_BASE: parent_tree},
+            parents={HEAD: [OTHER_BASE], OTHER_HEAD: [BASE]},
+            messages={HEAD: msg, OTHER_HEAD: msg},
+        )
+        self.assertEqual(
+            reconcile(gh_sole_finding_with_codex, publish=True)[HEAD].state,
+            "failure",
+        )
+
+    def test_gate2_antidowngrade_codex_merge_base_clean_poison_and_tombstone(self):
+        msg = "feat: add identity check\n\nBody"
+        other_msg = "feat: edit message\n\nBody"
+        msg_hash = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+        parent_tree = "4" * 40
+        other_parent_tree = "5" * 40
+        ik = f"one:{parent_tree}:{TREE}:{msg_hash}"
+        finding = {"severity": "P1", "summary": "Soundness defect"}
+
+        # Exact-(HEAD, BASE, TREE) findings without matching one:
+        # identity_key still block after a base_changed_at event on exact BASE.
+        for label, extra in (
+            ("keyless", {}),
+            ("legacy_key", {"identity_key": "legacy-v1"}),
+            ("malformed_one", {"identity_key": "one:bad"}),
+            ("mismatched_one", {"identity_key": f"one:{other_parent_tree}:{TREE}:{msg_hash}"}),
+        ):
+            r_findings = gate2_review(
+                review_id=10, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                submitted_at="2026-11-23T01:00:00Z",
+                verdict="findings", findings=[finding], **extra,
+            )
+            r_clean_after = gate2_review(
+                review_id=11, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+            )
+            with self.subTest(exact_finding_without_key=label):
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[r_findings],
+                        base_changed_at="2026-11-23T02:00:00Z",
+                        base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                    ).state,
+                    "failure",
+                )
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[r_findings, r_clean_after],
+                        base_changed_at="2026-11-23T02:00:00Z",
+                        base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                    ).state,
+                    "failure",
+                )
+
+        # Clean keyless exact-head review still turns pending after base change.
+        stale_clean = gate2_review(
+            review_id=12, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            submitted_at="2026-11-23T01:00:00Z",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[stale_clean],
+                base_changed_at="2026-11-23T02:00:00Z",
+                base_sha=BASE, tree_sha=TREE, identity_key=ik,
+            ).state,
+            "pending",
+        )
+
+        # Completed legacy Codex findings on OTHER_HEAD cannot be
+        # bypassed via no-op amend or squash-rebase with matching identity_key.
+        codex_old_findings = summary(
+            OTHER_HEAD, status="completed",
+            has_any_findings=True, has_unresolved_findings=True,
+        )
+        clean_rebased_g2 = gate2_review(
+            review_id=20, head_sha=HEAD, base_sha=OTHER_BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+        )
+        clean_old_g2 = gate2_review(
+            review_id=21, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T02:00:00Z",
+        )
+        pr_rebased = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": OTHER_BASE}, "draft": False}
+        pr_amended = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": BASE}, "draft": False}
+        for label, pr_obj, g2_rev in (
+            ("squash_rebase_new_g2", pr_rebased, clean_rebased_g2),
+            ("squash_rebase_reused_g2", pr_rebased, clean_old_g2),
+            ("noop_amend", pr_amended, gate2_review(
+                review_id=22, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+            )),
+        ):
+            with self.subTest(historical_codex_findings=label):
+                gh = FakeGitHub(
+                    [pr_obj], {1: [codex_old_findings]},
+                    reviews={1: [g2_rev]},
+                    trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree, OTHER_BASE: parent_tree},
+                    parents={HEAD: [pr_obj["base"]["sha"]], OTHER_HEAD: [BASE]},
+                    messages={HEAD: msg, OTHER_HEAD: msg},
+                )
+                self.assertEqual(reconcile(gh, publish=True)[HEAD].state, "failure")
+
+        # Even if a newer Codex summary on HEAD is running or clean, an active
+        # historical completed Codex finding on the same identity still blocks.
+        codex_running_new = summary(HEAD, status="running")
+        codex_running_new["id"] = 11
+        gh_codex_running = FakeGitHub(
+            [pr_rebased], {1: [codex_old_findings, codex_running_new]},
+            reviews={1: [clean_rebased_g2]},
+            trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree, OTHER_BASE: parent_tree},
+            parents={HEAD: [OTHER_BASE], OTHER_HEAD: [BASE]},
+            messages={HEAD: msg, OTHER_HEAD: msg},
+        )
+        self.assertEqual(reconcile(gh_codex_running, publish=True)[HEAD].state, "failure")
+
+        # A newer clean, completed Codex summary on HEAD does not mask an older
+        # completed-findings summary on HEAD or on a same-tree historical
+        # commit.
+        codex_old_findings_head = summary(
+            HEAD, has_any_findings=True, has_unresolved_findings=True,
+        )
+        codex_old_findings_head["id"] = 10
+        codex_old_findings_hist = summary(
+            OTHER_HEAD, has_any_findings=True, has_unresolved_findings=True,
+        )
+        codex_old_findings_hist["id"] = 10
+        codex_clean_new = summary(
+            HEAD, created_at="2026-11-08T11:00:00Z",
+            completed_at="2026-11-08T11:01:00Z",
+        )
+        codex_clean_new["id"] = 11
+        for label, cmts, hist_trees, expected in (
+            ("clean_only", [codex_clean_new], None, "success"),
+            ("older_findings_on_head",
+             [codex_old_findings_head, codex_clean_new], None, "failure"),
+            ("older_findings_same_tree",
+             [codex_old_findings_hist, codex_clean_new],
+             {OTHER_HEAD: TREE}, "failure"),
+            ("older_findings_other_tree",
+             [codex_old_findings_hist, codex_clean_new],
+             {OTHER_HEAD: OTHER_TREE}, "success"),
+        ):
+            with self.subTest(codex_clean_after_findings=label):
+                self.assertEqual(
+                    review_result(
+                        HEAD, cmts, tree_sha=TREE, historical_trees=hist_trees,
+                    ).state,
+                    expected,
+                )
+
+        # Changing only the commit message keeps historical same-tree Codex
+        # findings blocking; changing the tree clears them.
+        gh_codex_same_tree_msg = FakeGitHub(
+            [pr_amended], {1: [codex_old_findings]},
+            reviews={1: [gate2_review(
+                review_id=23, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+            )]},
+            trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree},
+            parents={HEAD: [BASE], OTHER_HEAD: [BASE]},
+            messages={HEAD: msg, OTHER_HEAD: other_msg},
+        )
+        self.assertEqual(reconcile(gh_codex_same_tree_msg, publish=True)[HEAD].state, "failure")
+        gh_codex_changed_tree = FakeGitHub(
+            [pr_amended], {1: [codex_old_findings]},
+            reviews={1: [gate2_review(
+                review_id=23, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+            )]},
+            trees={HEAD: TREE, OTHER_HEAD: OTHER_TREE, BASE: parent_tree},
+            parents={HEAD: [BASE], OTHER_HEAD: [BASE]},
+            messages={HEAD: msg, OTHER_HEAD: msg},
+        )
+        self.assertEqual(reconcile(gh_codex_changed_tree, publish=True)[HEAD].state, "success")
+
+        # A historical completed Codex commit that GitHub cannot resolve
+        # (404/422) carries no tree claim, so like any other-tree finding it
+        # does not block a clean Gate 2 review of the current identity; other
+        # read errors (HTTP 500) still fail closed.
+        for label, err, expected in (
+            ("http_404", "GitHub GET: HTTP 404", "success"),
+            ("http_422", "GitHub GET: HTTP 422", "success"),
+            ("http_500", "GitHub GET: HTTP 500", "failure"),
+        ):
+            with self.subTest(codex_unresolvable=label):
+                gh_codex_missing = FakeGitHub(
+                    [pr_amended], {1: [codex_old_findings]},
+                    reviews={1: [gate2_review(
+                        review_id=24, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                        identity_key=ik,
+                    )]},
+                    trees={HEAD: TREE, OTHER_HEAD: RuntimeError(err), BASE: parent_tree},
+                    parents={HEAD: [BASE]},
+                    messages={HEAD: msg},
+                )
+                if expected == "failure":
+                    with self.assertRaises(RuntimeError):
+                        reconcile(gh_codex_missing, publish=True)
+                    self.assertEqual(gh_codex_missing.writes[-1][1].state, "failure")
+                else:
+                    self.assertEqual(
+                        reconcile(gh_codex_missing, publish=True)[HEAD].state,
+                        expected,
+                    )
+
+        # Exact-head review with merge_base != base_sha fails closed
+        # even when base_changed_at is None and identity_key matches.
+        self.assertEqual(
+            review_result(
+                HEAD, [],
+                reviews=[gate2_review(
+                    head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                    merge_base=OTHER_BASE, identity_key=ik,
+                )],
+                base_sha=BASE, tree_sha=TREE, identity_key=ik,
+            ).state,
+            "failure",
+        )
+
+        # Prior clean review with valid-syntax mismatched structured
+        # identity_key (or bad merge_base) does not poison a valid clean retry.
+        for label, bad_clean_kwargs in (
+            ("mismatched_one", {"identity_key": f"one:{other_parent_tree}:{TREE}:{msg_hash}"}),
+            ("mismatched_multi", {"identity_key": f"multi:{BASE}:{HEAD}"}),
+            ("bad_merge_base", {"identity_key": ik, "merge_base": OTHER_BASE}),
+        ):
+            bad_clean = gate2_review(
+                review_id=30, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                submitted_at="2026-11-23T01:00:00Z", **bad_clean_kwargs,
+            )
+            good_clean = gate2_review(
+                review_id=31, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                identity_key=ik, submitted_at="2026-11-23T02:00:00Z",
+            )
+            with self.subTest(bad_clean_no_poison=label):
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[bad_clean, good_clean],
+                        base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                    ).state,
+                    "success",
+                )
+
+        # deleted_through stops older comments (<= deleted_through)
+        # from approving, skips historical lookups for still-present clean
+        # comments <= deleted_through, and keeps live finding comments blocking.
+        # The tombstoned comment carries the matching identity_key and its
+        # commit raises an unswallowed HTTP 500, so any historical lookup for
+        # it fails the PR instead of passing.
+        tombstoned_clean_g2 = gate2_comment(
+            comment_id=10, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, created_at="2026-11-23T01:00:00Z",
+        )
+        fresh_clean_cmt = gate2_comment(
+            comment_id=30, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, created_at="2026-11-23T03:00:00Z",
+        )
+        gh_tombstoned_clean = FakeGitHub(
+            [pr_amended],
+            {1: [tombstoned_clean_g2, fresh_clean_cmt]},
+            deleted={1: 20},
+            trees={HEAD: TREE, OTHER_HEAD: RuntimeError("GitHub GET: HTTP 500"), BASE: parent_tree},
+            parents={HEAD: [BASE]},
+            messages={HEAD: msg},
+        )
+        with patch.object(
+            gh_tombstoned_clean, "commit_identity",
+            wraps=gh_tombstoned_clean.commit_identity,
+        ) as identity_spy:
+            self.assertEqual(reconcile(gh_tombstoned_clean, publish=True)[HEAD].state, "success")
+            self.assertEqual(
+                [call.args for call in identity_spy.call_args_list],
+                [(HEAD, BASE)],
+            )
+        # Control: the same comment above deleted_through is looked up, so the
+        # HTTP 500 surfaces and fails closed.
+        gh_untombstoned_clean = FakeGitHub(
+            [pr_amended],
+            {1: [tombstoned_clean_g2, fresh_clean_cmt]},
+            deleted={1: 5},
+            trees={HEAD: TREE, OTHER_HEAD: RuntimeError("GitHub GET: HTTP 500"), BASE: parent_tree},
+            parents={HEAD: [BASE]},
+            messages={HEAD: msg},
+        )
+        with self.assertRaises(RuntimeError):
+            reconcile(gh_untombstoned_clean, publish=True)
+        self.assertEqual(gh_untombstoned_clean.writes[-1][1].state, "failure")
+
+    def test_gate2_deleted_through_snapshot_and_same_tree_findings(self):
+        msg = "feat: add identity check\n\nBody"
+        other_msg = "feat: edit commit message\n\nBody"
+        msg_hash = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+        parent_tree = "4" * 40
+        ik = f"one:{parent_tree}:{TREE}:{msg_hash}"
+        finding = {"severity": "P1", "path": "anneal/ci/codex_review.py", "line": 657, "summary": "Live finding"}
+        pr_amended = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": BASE}, "draft": False}
+        pr_multi = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": OTHER_BASE}, "draft": False}
+
+        # Live undeleted Gate 2 and Codex finding comments <=
+        # deleted_through still block clean comment #30 and clean review #5.
+        live_g2_finding_head = gate2_comment(
+            comment_id=12, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            created_at="2026-11-23T01:00:00Z",
+            verdict="findings", findings=[finding],
+        )
+        live_g2_finding_hist = gate2_comment(
+            comment_id=12, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            created_at="2026-11-23T01:00:00Z",
+            verdict="findings", findings=[finding],
+        )
+        live_codex_finding_head = summary(
+            HEAD, status="completed",
+            has_any_findings=True, has_unresolved_findings=True,
+        )
+        live_codex_finding_head["id"] = 10
+        live_codex_finding_hist = summary(
+            OTHER_HEAD, status="completed",
+            has_any_findings=True, has_unresolved_findings=True,
+        )
+        live_codex_finding_hist["id"] = 10
+        clean_cmt_30 = gate2_comment(
+            comment_id=30, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, created_at="2026-11-23T03:00:00Z",
+        )
+        clean_rev_5 = gate2_review(
+            review_id=5, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+        )
+        for label, cmts, revs in (
+            ("g2_head_cmt_vs_clean_cmt", [live_g2_finding_head, clean_cmt_30], []),
+            ("g2_head_cmt_vs_clean_rev", [live_g2_finding_head], [clean_rev_5]),
+            ("g2_head_cmt_sole_tombstoned", [live_g2_finding_head], []),
+            ("g2_hist_cmt_vs_clean_cmt", [live_g2_finding_hist, clean_cmt_30], []),
+            ("g2_hist_cmt_vs_clean_rev", [live_g2_finding_hist], [clean_rev_5]),
+            ("codex_head_vs_clean_cmt", [live_codex_finding_head, clean_cmt_30], []),
+            ("codex_head_vs_clean_rev", [live_codex_finding_head], [clean_rev_5]),
+            ("codex_hist_vs_clean_cmt", [live_codex_finding_hist, clean_cmt_30], []),
+            ("codex_hist_vs_clean_rev", [live_codex_finding_hist], [clean_rev_5]),
+        ):
+            with self.subTest(live_finding_comment=label):
+                gh = FakeGitHub(
+                    [pr_amended],
+                    {1: cmts},
+                    reviews={1: revs},
+                    deleted={1: 20},
+                    trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree},
+                    parents={HEAD: [BASE], OTHER_HEAD: [BASE]},
+                    messages={HEAD: msg, OTHER_HEAD: other_msg},
+                )
+                self.assertEqual(reconcile(gh, publish=True)[HEAD].state, "failure")
+
+        # Live tombstoned-era Gate 2 finding on 404 OTHER_HEAD fails closed.
+        gh_live_g2_404 = FakeGitHub(
+            [pr_amended],
+            {1: [live_g2_finding_hist, clean_cmt_30]},
+            deleted={1: 20},
+            trees={HEAD: TREE, OTHER_HEAD: RuntimeError("GitHub GET: HTTP 404"), BASE: parent_tree},
+            parents={HEAD: [BASE]},
+            messages={HEAD: msg},
+        )
+        with self.assertRaises(RuntimeError):
+            reconcile(gh_live_g2_404, publish=True)
+        self.assertEqual(gh_live_g2_404.writes[-1][1].state, "failure")
+
+        # Older clean comment <= deleted_through still cannot approve.
+        old_clean_cmt_10 = gate2_comment(
+            comment_id=10, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            created_at="2026-11-23T01:00:00Z",
+        )
+        old_clean_codex_10 = summary(HEAD)
+        old_clean_codex_10["id"] = 10
+        for label, cmts in (
+            ("clean_g2_blocked_by_deletion", [old_clean_cmt_10]),
+            ("clean_codex_blocked_by_deletion", [old_clean_codex_10]),
+        ):
+            with self.subTest(tombstoned_clean=label):
+                gh_pend = FakeGitHub(
+                    [pr_amended],
+                    {1: cmts},
+                    deleted={1: 20},
+                    trees={HEAD: TREE, BASE: parent_tree},
+                    parents={HEAD: [BASE]},
+                    messages={HEAD: msg},
+                )
+                self.assertEqual(reconcile(gh_pend, publish=True)[HEAD].state, "pending")
+
+        # Concurrent in-place edit of a non-latest Codex summary from
+        # running to completed findings invalidates the snapshot -> pending.
+        codex_10_running = summary(HEAD, status="running")
+        codex_10_running["id"] = 10
+        codex_10_findings = summary(
+            HEAD, status="completed",
+            has_any_findings=True, has_unresolved_findings=True,
+        )
+        codex_10_findings["id"] = 10
+        codex_10_hist_findings = summary(
+            OTHER_HEAD, status="completed",
+            has_any_findings=True, has_unresolved_findings=True,
+        )
+        codex_10_hist_findings["id"] = 10
+        codex_11_clean = summary(HEAD)
+        codex_11_clean["id"] = 11
+        codex_11_running = summary(HEAD, status="running")
+        codex_11_running["id"] = 11
+        for label, init_cmts, changed_cmts, revs in (
+            (
+                "head_codex_vs_clean_codex",
+                [codex_10_running, codex_11_clean],
+                [codex_10_findings, codex_11_clean],
+                [],
+            ),
+            (
+                "hist_codex_vs_clean_gate2",
+                [codex_10_running, codex_11_running],
+                [codex_10_hist_findings, codex_11_running],
+                [clean_rev_5],
+            ),
+        ):
+            with self.subTest(codex_summary_edit=label):
+                gh_toctou = FakeGitHub(
+                    [pr_amended],
+                    {1: init_cmts},
+                    changed_comments={1: changed_cmts},
+                    reviews={1: revs},
+                    trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree},
+                    parents={HEAD: [BASE], OTHER_HEAD: [BASE]},
+                    messages={HEAD: msg, OTHER_HEAD: other_msg},
+                )
+                self.assertEqual(reconcile(gh_toctou, publish=True)[HEAD].state, "pending")
+
+        # Multi-commit HEAD preserving TREE still blocks on prior
+        # same-tree Gate 2 or Codex findings on OTHER_HEAD.
+        live_g2_rev_hist = gate2_review(
+            review_id=59, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            submitted_at="2026-11-23T01:00:00Z",
+            verdict="findings", findings=[finding],
+        )
+        multi_clean = gate2_review(
+            review_id=60, head_sha=HEAD, base_sha=OTHER_BASE, tree_sha=TREE,
+            identity_key=f"multi:{OTHER_BASE}:{HEAD}",
+            submitted_at="2026-11-23T03:00:00Z",
+        )
+        for label, cmts, revs, expected_substr in (
+            ("multi_same_tree_g2", [], [live_g2_rev_hist, multi_clean], "finding"),
+            ("multi_same_tree_codex", [live_codex_finding_hist], [multi_clean], "Codex findings"),
+        ):
+            with self.subTest(same_tree_rewrite=label):
+                gh_multi_same_tree = FakeGitHub(
+                    [pr_multi],
+                    {1: cmts},
+                    reviews={1: revs},
+                    trees={HEAD: TREE, OTHER_HEAD: TREE, BASE: parent_tree, OTHER_BASE: "9" * 40},
+                    parents={HEAD: [BASE, OTHER_BASE], OTHER_HEAD: [BASE]},
+                    messages={HEAD: msg, OTHER_HEAD: other_msg},
+                )
+                verdict = reconcile(gh_multi_same_tree, publish=True)[HEAD]
+                self.assertEqual(verdict.state, "failure")
+                self.assertIn(expected_substr, verdict.reason)
+
+        # Direct review_result() keeps same-head, same-tree findings
+        # blocking across base_sha retargets without historical_trees[head],
+        # and reconcile() reuses tree_sha without a second commit_tree(head).
+        retarget_finding = gate2_review(
+            review_id=70, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            submitted_at="2026-11-23T01:00:00Z",
+            verdict="findings", findings=[finding],
+        )
+        retarget_clean = gate2_review(
+            review_id=71, head_sha=HEAD, base_sha=OTHER_BASE, tree_sha=TREE,
+            submitted_at="2026-11-23T03:00:00Z",
+        )
+        for label, revs in (
+            ("sole_after_retarget", [retarget_finding]),
+            ("followed_by_clean", [retarget_finding, retarget_clean]),
+        ):
+            with self.subTest(same_head_retarget=label):
+                verdict = review_result(
+                    HEAD, [], reviews=revs, base_sha=OTHER_BASE, tree_sha=TREE,
+                )
+                self.assertEqual(verdict.state, "failure")
+                self.assertIn("finding", verdict.reason)
+
+        gh_retarget = FakeGitHub(
+            [pr_multi], {1: []},
+            reviews={1: [retarget_finding, retarget_clean]},
+            trees={HEAD: TREE, BASE: parent_tree, OTHER_BASE: "9" * 40},
+            parents={HEAD: [OTHER_BASE]},
+            messages={HEAD: msg},
+        )
+        with patch.object(
+            gh_retarget, "commit_tree", wraps=gh_retarget.commit_tree
+        ) as tree_spy:
+            self.assertEqual(reconcile(gh_retarget, publish=True)[HEAD].state, "failure")
+            self.assertEqual(
+                [call.args for call in tree_spy.call_args_list].count((HEAD,)),
+                1,
+            )
+
+        # Earlier non-finding failures (CHANGES_REQUESTED, APPROVED,
+        # same-family, wrong commit_id) on exact (HEAD, BASE, TREE) block.
+        valid_clean_after = gate2_review(
+            review_id=81, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+        )
+        for label, bad_rev, expected_substr in (
+            (
+                "changes_requested",
+                gate2_review(
+                    review_id=80, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                    state="CHANGES_REQUESTED", submitted_at="2026-11-23T01:00:00Z",
+                ),
+                "CHANGES_REQUESTED",
+            ),
+            (
+                "approved",
+                gate2_review(
+                    review_id=80, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                    state="APPROVED", submitted_at="2026-11-23T01:00:00Z",
+                ),
+                "APPROVE",
+            ),
+            (
+                "same_family",
+                gate2_review(
+                    review_id=80, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                    reviewer_family="claude", author_family="claude",
+                    submitted_at="2026-11-23T01:00:00Z",
+                ),
+                "differ",
+            ),
+            (
+                "wrong_commit_id",
+                gate2_review(
+                    review_id=80, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                    commit_id=OTHER_HEAD, submitted_at="2026-11-23T01:00:00Z",
+                ),
+                "commit_id",
+            ),
+        ):
+            with self.subTest(exact_non_finding_failure=label):
+                verdict = review_result(
+                    HEAD, [], reviews=[bad_rev, valid_clean_after],
+                    base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                )
+                self.assertEqual(verdict.state, "failure")
+                self.assertIn(expected_substr, verdict.reason)
+
+        # A keyed clean review recorded against the current base_sha
+        # (exact head, or a verified historical head on the same base) must
+        # postdate base_changed_at; a verified cross-base transfer still works.
+        changed = "2026-11-23T02:00:00Z"
+        same_base_hist = {(OTHER_HEAD, BASE): (TREE, ik)}
+        cross_base_hist = {(OTHER_HEAD, OTHER_BASE): (TREE, ik)}
+        for label, rev_head, rev_base, submitted, hist, expected in (
+            ("exact_stale", HEAD, BASE, "2026-11-23T01:00:00Z", None, "pending"),
+            ("exact_fresh", HEAD, BASE, "2026-11-23T03:00:00Z", None, "success"),
+            ("same_base_hist_stale", OTHER_HEAD, BASE, "2026-11-23T01:00:00Z",
+             same_base_hist, "pending"),
+            ("same_base_hist_fresh", OTHER_HEAD, BASE, "2026-11-23T03:00:00Z",
+             same_base_hist, "success"),
+            ("cross_base_hist_stale", OTHER_HEAD, OTHER_BASE,
+             "2026-11-23T01:00:00Z", cross_base_hist, "success"),
+        ):
+            keyed_clean = gate2_review(
+                review_id=90, head_sha=rev_head, base_sha=rev_base,
+                tree_sha=TREE, identity_key=ik, submitted_at=submitted,
+            )
+            with self.subTest(keyed_freshness=label):
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[keyed_clean],
+                        base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                        base_changed_at=changed,
+                        historical_identities=hist,
+                    ).state,
+                    expected,
+                )
+        stale_keyed_comment = gate2_comment(
+            comment_id=91, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, created_at="2026-11-23T01:00:00Z",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [stale_keyed_comment], base_sha=BASE, tree_sha=TREE,
+                identity_key=ik, base_changed_at=changed,
+            ).state,
+            "pending",
+        )
+        pr_same_base = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": BASE}, "draft": False}
+        gh_stale_keyed = FakeGitHub(
+            [pr_same_base], {1: []},
+            reviews={1: [gate2_review(
+                review_id=92, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+                identity_key=ik, submitted_at="2026-11-23T01:00:00Z",
+            )]},
+            bases={1: changed},
+            trees={HEAD: TREE, BASE: parent_tree},
+            parents={HEAD: [BASE]},
+            messages={HEAD: msg},
+        )
+        self.assertEqual(reconcile(gh_stale_keyed, publish=True)[HEAD].state, "pending")
+
+        # Non-finding failures on a verified historical commit with
+        # the current one-commit identity keep blocking a clean verdict that
+        # transfers from that identity, with or without a payload identity_key.
+        hist_clean = gate2_review(
+            review_id=101, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+        )
+        hist_failures = []
+        for keyed in (True, False):
+            key_kwargs = {"identity_key": ik} if keyed else {}
+            suffix = "keyed" if keyed else "keyless"
+            hist_failures.extend((
+                (f"changes_requested_{suffix}", gate2_review(
+                    review_id=100, head_sha=OTHER_HEAD, base_sha=BASE,
+                    tree_sha=TREE, state="CHANGES_REQUESTED",
+                    submitted_at="2026-11-23T01:00:00Z", **key_kwargs,
+                ), "CHANGES_REQUESTED"),
+                (f"approved_{suffix}", gate2_review(
+                    review_id=100, head_sha=OTHER_HEAD, base_sha=BASE,
+                    tree_sha=TREE, state="APPROVED",
+                    submitted_at="2026-11-23T01:00:00Z", **key_kwargs,
+                ), "APPROVE"),
+                (f"same_family_{suffix}", gate2_review(
+                    review_id=100, head_sha=OTHER_HEAD, base_sha=BASE,
+                    tree_sha=TREE, reviewer_family="claude",
+                    author_family="claude",
+                    submitted_at="2026-11-23T01:00:00Z", **key_kwargs,
+                ), "differ"),
+                (f"wrong_commit_id_{suffix}", gate2_review(
+                    review_id=100, head_sha=OTHER_HEAD, base_sha=BASE,
+                    tree_sha=TREE, commit_id=HEAD,
+                    submitted_at="2026-11-23T01:00:00Z", **key_kwargs,
+                ), "commit_id"),
+            ))
+        for label, bad_rev, expected_substr in hist_failures:
+            with self.subTest(historical_non_finding_failure=label):
+                verdict = review_result(
+                    HEAD, [], reviews=[bad_rev, hist_clean],
+                    base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                    historical_identities=same_base_hist,
+                )
+                self.assertEqual(verdict.state, "failure")
+                self.assertIn(expected_substr, verdict.reason)
+                # Without the historical failure, the clean verdict transfers.
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[hist_clean],
+                        base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                        historical_identities=same_base_hist,
+                    ).state,
+                    "success",
+                )
+
+        # A keyless historical failure that is the sole or latest Gate 2 item
+        # still blocks (it evaluates as pending when treated as the latest
+        # item) and is not masked by a clean legacy Codex summary on HEAD; a
+        # sole keyless historical clean review stays pending.
+        clean_codex_head = summary(HEAD)
+        for label, failing_kwargs, expected_substr in (
+            ("changes_requested", {"state": "CHANGES_REQUESTED"},
+             "CHANGES_REQUESTED"),
+            ("same_family", {"reviewer_family": "claude",
+                             "author_family": "claude"}, "differ"),
+        ):
+            latest_keyless = gate2_review(
+                review_id=102, head_sha=OTHER_HEAD, base_sha=BASE,
+                tree_sha=TREE, submitted_at="2026-11-23T04:00:00Z",
+                **failing_kwargs,
+            )
+            for order_label, revs in (
+                ("sole", [latest_keyless]),
+                ("latest_after_clean", [hist_clean, latest_keyless]),
+            ):
+                for codex_label, cmts in (
+                    ("no_codex", []),
+                    ("clean_codex_head", [clean_codex_head]),
+                ):
+                    with self.subTest(latest_historical_failure=(
+                            label, order_label, codex_label)):
+                        verdict = review_result(
+                            HEAD, cmts, reviews=revs,
+                            base_sha=OTHER_BASE, tree_sha=TREE,
+                            identity_key=ik,
+                            historical_identities=same_base_hist,
+                        )
+                        self.assertEqual(verdict.state, "failure")
+                        self.assertIn(expected_substr, verdict.reason)
+        sole_keyless_clean = gate2_review(
+            review_id=103, head_sha=OTHER_HEAD, base_sha=BASE, tree_sha=TREE,
+            submitted_at="2026-11-23T04:00:00Z",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[sole_keyless_clean],
+                base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                historical_identities=same_base_hist,
+            ).state,
+            "pending",
+        )
+
+        # Failures on unverified or different identities do not block.
+        third_head = "7" * 40
+        for label, bad_rev in (
+            ("unverified_commit", gate2_review(
+                review_id=100, head_sha=third_head, base_sha=BASE,
+                tree_sha=TREE, state="CHANGES_REQUESTED",
+                submitted_at="2026-11-23T01:00:00Z",
+            )),
+            ("mismatched_structured_key", gate2_review(
+                review_id=100, head_sha=OTHER_HEAD, base_sha=BASE,
+                tree_sha=TREE, state="CHANGES_REQUESTED",
+                identity_key=f"multi:{BASE}:{OTHER_HEAD}",
+                submitted_at="2026-11-23T01:00:00Z",
+            )),
+            ("stale_merge_base", gate2_review(
+                review_id=100, head_sha=OTHER_HEAD, base_sha=BASE,
+                tree_sha=TREE, state="CHANGES_REQUESTED", identity_key=ik,
+                merge_base=OTHER_BASE, submitted_at="2026-11-23T01:00:00Z",
+            )),
+        ):
+            with self.subTest(unverified_or_mismatched_failure=label):
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[bad_rev, hist_clean],
+                        base_sha=OTHER_BASE, tree_sha=TREE, identity_key=ik,
+                        historical_identities=same_base_hist,
+                    ).state,
+                    "success",
+                )
+
+        # reconcile() verifies a keyless same-tree failure's commit identity
+        # even when it sits on a different historical commit than the clean
+        # review that transfers.
+        third_base = "8" * 40
+        keyless_cr_third = gate2_review(
+            review_id=100, head_sha=third_head, base_sha=third_base,
+            tree_sha=TREE, state="CHANGES_REQUESTED",
+            submitted_at="2026-11-23T01:00:00Z",
+        )
+        recon_trees = {
+            HEAD: TREE, OTHER_HEAD: TREE, third_head: TREE,
+            BASE: parent_tree, OTHER_BASE: parent_tree, third_base: parent_tree,
+        }
+        recon_parents = {
+            HEAD: [OTHER_BASE], OTHER_HEAD: [BASE], third_head: [third_base],
+        }
+        recon_messages = {HEAD: msg, OTHER_HEAD: msg, third_head: msg}
+        for label, revs, expected in (
+            ("clean_only", [hist_clean], "success"),
+            ("keyless_failure_elsewhere", [keyless_cr_third, hist_clean], "failure"),
+        ):
+            with self.subTest(reconcile_historical_failure=label):
+                gh_hist_failure = FakeGitHub(
+                    [pr_multi], {1: []},
+                    reviews={1: revs},
+                    trees=recon_trees,
+                    parents=recon_parents,
+                    messages=recon_messages,
+                )
+                self.assertEqual(
+                    reconcile(gh_hist_failure, publish=True)[HEAD].state,
+                    expected,
+                )
+
+        # A base change never makes a failing review on the exact
+        # identity stop blocking, keyed or keyless; it only stops a stale
+        # review from passing.
+        fresh_keyed_clean = gate2_review(
+            review_id=111, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+        )
+        for label, stale_kwargs, expected_substr in (
+            ("changes_requested", {"state": "CHANGES_REQUESTED"},
+             "CHANGES_REQUESTED"),
+            ("approved", {"state": "APPROVED"}, "APPROVE"),
+            ("same_family", {"reviewer_family": "claude",
+                             "author_family": "claude"}, "differ"),
+            ("wrong_commit_id", {"commit_id": OTHER_HEAD}, "commit_id"),
+        ):
+            for keyed in (False, True):
+                key_kwargs = {"identity_key": ik} if keyed else {}
+                stale_failure = gate2_review(
+                    review_id=110, head_sha=HEAD, base_sha=BASE,
+                    tree_sha=TREE, submitted_at="2026-11-23T01:00:00Z",
+                    **stale_kwargs, **key_kwargs,
+                )
+                with self.subTest(failure_predating_base_change=(label, keyed)):
+                    verdict = review_result(
+                        HEAD, [], reviews=[stale_failure, fresh_keyed_clean],
+                        base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                        base_changed_at=changed,
+                    )
+                    self.assertEqual(verdict.state, "failure")
+                    self.assertIn(expected_substr, verdict.reason)
+        stale_keyless_clean = gate2_review(
+            review_id=112, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            submitted_at="2026-11-23T01:00:00Z",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[stale_keyless_clean],
+                base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                base_changed_at=changed,
+            ).state,
+            "pending",
+        )
+        self.assertEqual(
+            review_result(
+                HEAD, [], reviews=[stale_keyless_clean, fresh_keyed_clean],
+                base_sha=BASE, tree_sha=TREE, identity_key=ik,
+                base_changed_at=changed,
+            ).state,
+            "success",
+        )
+
+        # reconcile() fails closed when a blocking same-tree
+        # non-finding failure sits on a historical commit GitHub cannot
+        # resolve (404/422), even next to a clean review on HEAD, while an
+        # unresolvable clean review or a stale-merge_base failure only
+        # loses reuse.
+        pr_head_base = {"number": 1, "head": {"sha": HEAD}, "base": {"ref": "main", "sha": BASE}, "draft": False}
+        clean_on_head = gate2_review(
+            review_id=121, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, submitted_at="2026-11-23T03:00:00Z",
+        )
+        for label, hist_rev, err, expected in (
+            ("keyless_cr_404", gate2_review(
+                review_id=120, head_sha=OTHER_HEAD, base_sha=BASE,
+                tree_sha=TREE, state="CHANGES_REQUESTED",
+                submitted_at="2026-11-23T01:00:00Z",
+            ), "GitHub GET: HTTP 404", "failure"),
+            ("keyed_same_family_422", gate2_review(
+                review_id=120, head_sha=OTHER_HEAD, base_sha=BASE,
+                tree_sha=TREE, identity_key=ik, reviewer_family="claude",
+                author_family="claude", submitted_at="2026-11-23T01:00:00Z",
+            ), "GitHub GET: HTTP 422", "failure"),
+            ("keyed_clean_404", gate2_review(
+                review_id=120, head_sha=OTHER_HEAD, base_sha=BASE,
+                tree_sha=TREE, identity_key=ik,
+                submitted_at="2026-11-23T01:00:00Z",
+            ), "GitHub GET: HTTP 404", "success"),
+            ("stale_merge_base_cr_404", gate2_review(
+                review_id=120, head_sha=OTHER_HEAD, base_sha=BASE,
+                tree_sha=TREE, state="CHANGES_REQUESTED", identity_key=ik,
+                merge_base=OTHER_BASE, submitted_at="2026-11-23T01:00:00Z",
+            ), "GitHub GET: HTTP 404", "success"),
+        ):
+            with self.subTest(unresolvable_historical_failure=label):
+                gh_unverifiable = FakeGitHub(
+                    [pr_head_base], {1: []},
+                    reviews={1: [hist_rev, clean_on_head]},
+                    trees={HEAD: TREE, OTHER_HEAD: RuntimeError(err), BASE: parent_tree},
+                    parents={HEAD: [BASE]},
+                    messages={HEAD: msg},
+                )
+                if expected == "failure":
+                    with self.assertRaises(RuntimeError):
+                        reconcile(gh_unverifiable, publish=True)
+                    self.assertEqual(gh_unverifiable.writes[-1][1].state, "failure")
+                else:
+                    self.assertEqual(
+                        reconcile(gh_unverifiable, publish=True)[HEAD].state,
+                        expected,
+                    )
+
+        # A non-finding failure in an issue comment with id <= deleted_through
+        # no longer blocks a later clean review above the tombstone, while the
+        # same comment above deleted_through still blocks.
+        same_family_cmt = gate2_comment(
+            comment_id=130, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            reviewer_family="claude", author_family="claude",
+            created_at="2026-11-23T01:00:00Z",
+        )
+        clean_cmt_above = gate2_comment(
+            comment_id=140, head_sha=HEAD, base_sha=BASE, tree_sha=TREE,
+            identity_key=ik, created_at="2026-11-23T03:00:00Z",
+        )
+        for label, deleted, expected in (
+            ("tombstoned", 135, "success"),
+            ("live", 0, "failure"),
+        ):
+            with self.subTest(non_finding_comment=label):
+                self.assertEqual(
+                    review_result(
+                        HEAD, [same_family_cmt, clean_cmt_above],
+                        deleted_through=deleted, base_sha=BASE, tree_sha=TREE,
+                        identity_key=ik,
+                    ).state,
+                    expected,
+                )
+
+    def test_gate2_advisories(self):
+        advisory = {"severity": "P3", "summary": "Wording nit"}
+        blocking = {"severity": "P2", "summary": "Real defect"}
+        p3_finding = {"severity": "P3", "summary": "Blocking P3"}
+
+        # Advisories are P3-only and never block a clean review; a P3 in
+        # findings[] keeps blocking.
+        for label, rev, expected in (
+            ("clean_with_advisory",
+             gate2_review(advisories=[advisory]), "success"),
+            ("clean_with_empty_advisories", gate2_review(advisories=[]),
+             "success"),
+            ("p3_finding_blocks", gate2_review(
+                verdict="findings", findings=[p3_finding]), "failure"),
+            ("findings_with_advisory", gate2_review(
+                verdict="findings", findings=[blocking],
+                advisories=[advisory]), "failure"),
+        ):
+            with self.subTest(valid=label):
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[rev], base_sha=BASE, tree_sha=TREE,
+                    ).state,
+                    expected,
+                )
+        for label, extra in (
+            ("p2_advisory", {"advisories": [blocking]}),
+            ("malformed_advisory", {"advisories": [{"severity": "P3"}]}),
+            ("advisories_not_list", {"advisories": 5}),
+            ("advisories_null", {"advisories": None}),
+            ("unhashable_advisory_severity", {
+                "advisories": [{"severity": [], "summary": "note"}]}),
+            ("unhashable_finding_severity", {
+                "verdict": "findings",
+                "findings": [{"severity": {}, "summary": "note"}]}),
+            # Delta reviews are not part of the schema.
+            ("delta_mode", {"review_mode": "delta", "delta_from": OTHER_HEAD}),
+            ("full_mode_key", {"review_mode": "full"}),
+        ):
+            with self.subTest(malformed=label):
+                with self.assertRaises(ValueError):
+                    parse_gate2_payload(gate2_review(**extra)["body"])
+                # A malformed payload fails closed instead of crashing.
+                self.assertEqual(
+                    review_result(
+                        HEAD, [], reviews=[gate2_review(**extra)],
+                        base_sha=BASE, tree_sha=TREE,
+                    ).state,
+                    "failure",
+                )
+
+
+class Gate2CarryForwardTests(unittest.TestCase):
+    """Evaluator-verified rebase-only carry-forward of a clean Gate 2 review."""
+
+    NEW_HEAD = "1" * 40
+    NEW_BASE = "2" * 40
+    NEW_TREE = "3" * 40
+    BLOB = "9" * 40
+
+    def _file(self, name, patch, status="modified", previous=None, sha=None):
+        entry = {"filename": name, "status": status, "patch": patch,
+                 "sha": self.BLOB if sha is None else sha}
+        if previous is not None:
+            entry["previous_filename"] = previous
+        return entry
+
+    def _ik(self):
+        return f"one:{'4' * 40}:{self.NEW_TREE}:{'5' * 64}"
+
+    @staticmethod
+    def _anchor_ik(*_args):
+        return f"one:{'6' * 40}:{TREE}:{'7' * 64}"
+
+    def _result(self, verifier, reviews=None, comments=(), **kwargs):
+        return review_result(
+            self.NEW_HEAD, list(comments), reviews=reviews,
+            base_sha=self.NEW_BASE, tree_sha=self.NEW_TREE,
+            identity_key=kwargs.pop("identity_key", self._ik()),
+            carry_forward_verifier=verifier, **kwargs,
+        )
+
+    def test_patch_equivalence(self):
+        old = [self._file("a.rs", "@@ -1,3 +1,3 @@\n ctx\n-x = 1\n+x = 2\n ctx2")]
+        moved = [self._file("a.rs", "@@ -9,3 +9,3 @@\n other\n-x = 1\n+x = 2\n ctx3")]
+        self.assertTrue(rebase_only_patch_equivalent(old, moved))
+        # A one-line semantic change in an added line never carries forward.
+        semantic = [self._file("a.rs", "@@ -1,3 +1,3 @@\n ctx\n-x = 1\n+x = 3\n ctx2")]
+        self.assertFalse(rebase_only_patch_equivalent(old, semantic))
+        removed = [self._file("a.rs", "@@ -1,3 +1,3 @@\n ctx\n-x = 0\n+x = 2\n ctx2")]
+        self.assertFalse(rebase_only_patch_equivalent(old, removed))
+        no_eol = [self._file("a.rs", "@@ -1,3 +1,3 @@\n ctx\n-x = 1\n+x = 2\n\\ No newline at end of file")]
+        self.assertFalse(rebase_only_patch_equivalent(old, no_eol))
+        extra = old + [self._file("b.rs", "@@ -0,0 +1 @@\n+y", status="added")]
+        self.assertFalse(rebase_only_patch_equivalent(old, extra))
+        self.assertFalse(rebase_only_patch_equivalent(extra, old))
+        renamed = [self._file("a.rs", old[0]["patch"], status="renamed", previous="z.rs")]
+        self.assertFalse(rebase_only_patch_equivalent(old, renamed))
+        added = [self._file("a.rs", old[0]["patch"], status="added")]
+        self.assertFalse(rebase_only_patch_equivalent(old, added))
+        other_src = [self._file("a.rs", old[0]["patch"], status="renamed", previous="y.rs")]
+        self.assertFalse(rebase_only_patch_equivalent(renamed, other_src))
+        binary = [{"filename": "a.rs", "status": "modified", "sha": self.BLOB}]
+        self.assertFalse(rebase_only_patch_equivalent(binary, binary))
+        self.assertFalse(rebase_only_patch_equivalent(old + old, old + old))
+        self.assertFalse(rebase_only_patch_equivalent(old, old + old))
+        self.assertFalse(rebase_only_patch_equivalent([], []))
+        many = [self._file(f"f{i}", "+x") for i in range(300)]
+        self.assertFalse(rebase_only_patch_equivalent(many, many))
+        self.assertFalse(rebase_only_patch_equivalent([{"filename": 5}], [{"filename": 5}]))
+        # The resulting blob must match and must be present.
+        self.assertFalse(rebase_only_patch_equivalent(old, [dict(old[0], sha="8" * 40)]))
+        no_sha = [{k: v for k, v in old[0].items() if k != "sha"}]
+        self.assertFalse(rebase_only_patch_equivalent(no_sha, no_sha))
+        self.assertFalse(rebase_only_patch_equivalent(
+            [dict(old[0], sha="xyz")], [dict(old[0], sha="xyz")]))
+        # Only an allowlisted file the base changed skips the blob check.
+        manifest = "anneal/trusted/root-manifest.sha256"
+        m_old = [self._file(manifest, "@@ -1 +1 @@\n-a\n+b", sha="a" * 40)]
+        m_new = [self._file(manifest, "@@ -1 +1 @@\n-a\n+b", sha="b" * 40)]
+        self.assertTrue(rebase_only_patch_equivalent(m_old, m_new, frozenset({manifest})))
+        self.assertFalse(rebase_only_patch_equivalent(m_old, m_new))
+        m_add = [dict(m, status="added") for m in m_old]
+        m_add2 = [dict(m, status="added") for m in m_new]
+        self.assertFalse(rebase_only_patch_equivalent(m_add, m_add2, frozenset({manifest})))
+
+    def test_diff_file_modes(self):
+        diff = ("diff --git a/x.sh b/x.sh\nold mode 100644\nnew mode 100755\n"
+                "index 1111111..2222222\n--- a/x.sh\n+++ b/x.sh\n@@ -1 +1 @@\n-a\n+b\n"
+                "diff --git a/y b/y\nnew file mode 120000\nindex 0000000..3333333\n"
+                "--- /dev/null\n+++ b/y\n@@ -0,0 +1 @@\n+target\n"
+                "diff --git a/z.rs b/z.rs\nindex 4444444..5555555 100644\n--- a/z.rs\n")
+        self.assertEqual(diff_file_modes(diff), {
+            "x.sh": ["old mode 100644", "new mode 100755"],
+            "y": ["new file mode 120000"],
+            "z.rs": ["index 100644"],
+        })
+        self.assertIsNone(diff_file_modes(
+            diff + "diff --git a/z.rs b/z.rs\nindex 6666666..7777777 100644\n"))
+        self.assertIsNone(diff_file_modes('diff --git "a/q x" "b/q x"\n'))
+        self.assertIsNone(diff_file_modes(None))
+        self.assertIsNone(diff_file_modes("diff --git a/q b/q\n--- a/q\n"))
+
+    def test_base_drift(self):
+        manifest = "anneal/trusted/root-manifest.sha256"
+        paths = {"anneal/x.rs", manifest, "anneal/Cargo.lock"}
+        other = [{"filename": "zerocopy/src/lib.rs"}]
+        self.assertEqual(base_drift_allows_carry_forward("ahead", other, paths), frozenset())
+        self.assertIsNone(base_drift_allows_carry_forward("identical", [], paths))
+        self.assertIsNone(base_drift_allows_carry_forward("identical", other, paths))
+        self.assertIsNone(base_drift_allows_carry_forward(
+            "ahead", [{"filename": "anneal/x.rs"}], paths))
+        self.assertIsNone(base_drift_allows_carry_forward(
+            "ahead", [{"filename": "new.rs", "previous_filename": "anneal/x.rs"}], paths))
+        self.assertEqual(base_drift_allows_carry_forward(
+            "ahead", [{"filename": manifest}], paths), frozenset({manifest}))
+        self.assertEqual(base_drift_allows_carry_forward(
+            "ahead", [{"filename": "trusted/root-manifest.sha256"}],
+            {"trusted/root-manifest.sha256", "crates/x.rs"}),
+            frozenset({"trusted/root-manifest.sha256"}))
+        # Cargo.lock lines depend on their enclosing package, so no overlap.
+        self.assertIsNone(base_drift_allows_carry_forward(
+            "ahead", [{"filename": "anneal/Cargo.lock"}], paths))
+        for status in ("diverged", "behind", None):
+            self.assertIsNone(base_drift_allows_carry_forward(status, other, paths))
+        self.assertIsNone(base_drift_allows_carry_forward("ahead", [], paths))
+        self.assertIsNone(base_drift_allows_carry_forward(
+            "ahead", [{"filename": f"f{i}"} for i in range(300)], paths))
+        self.assertIsNone(base_drift_allows_carry_forward("ahead", [{"x": 1}], paths))
+        self.assertIsNone(base_drift_allows_carry_forward(
+            "ahead", [{"filename": "q", "previous_filename": []}], paths))
+
+    def test_review_result_carries_forward_only_when_verified(self):
+        anchor = gate2_review(head_sha=HEAD, base_sha=BASE, tree_sha=TREE)
+        calls = []
+
+        def ok(*args):
+            calls.append(args)
+            return self._anchor_ik()
+
+        res = self._result(ok, reviews=[anchor])
+        self.assertEqual(res.state, "success")
+        self.assertIn(f"Gate 2 review of {HEAD[:12]} carried forward", res.reason)
+        self.assertEqual(calls, [(HEAD, BASE, TREE, self.NEW_HEAD, self.NEW_BASE, [])])
+        for bad in (None, False, True, "multi:x", f"one:{'6' * 40}"):
+            with self.subTest(verifier_returns=bad):
+                self.assertEqual(self._result(lambda *a, b=bad: b, reviews=[anchor]).state,
+                                 "pending")
+
+        def boom(*a):
+            raise RuntimeError("GitHub GET: HTTP 404")
+        self.assertEqual(self._result(boom, reviews=[anchor]).state, "pending")
+        # Without a verifier (the default) nothing changes.
+        self.assertEqual(self._result(None, reviews=[anchor]).state, "pending")
+
+    def test_anchor_requirements(self):
+        verify = self._anchor_ik
+        p2 = {"severity": "P2", "summary": "bug"}
+        cases = {
+            "findings": gate2_review(verdict="findings", findings=[p2]),
+            "incomplete": gate2_review(verdict="incomplete"),
+            "same_family": gate2_review(reviewer_family="claude", author_family="claude"),
+            "changes_requested": gate2_review(state="CHANGES_REQUESTED"),
+            "stale_merge_base": gate2_review(merge_base=OTHER_BASE),
+            "wrong_commit_id": gate2_review(commit_id=OTHER_HEAD),
+            # A structured identity_key that contradicts the verified one.
+            "wrong_identity_key": gate2_review(
+                identity_key=f"one:{'6' * 40}:{TREE}:{'8' * 64}"),
+            # Same base: identity-preserving rewrites use the normal path,
+            # which enforces base-change freshness.
+            "same_base": gate2_review(base_sha=self.NEW_BASE),
+            "same_head": gate2_review(head_sha=self.NEW_HEAD, tree_sha=self.NEW_TREE),
+        }
+        for label, rev in cases.items():
+            with self.subTest(label):
+                self.assertNotEqual(self._result(verify, reviews=[rev]).state, "success")
+        self.assertEqual(self._result(verify, reviews=[gate2_review(
+            identity_key=self._anchor_ik())]).state, "success")
+        # Only the latest item can anchor: a later findings review blocks.
+        clean = gate2_review(review_id=20, submitted_at="2026-11-23T01:00:00Z")
+        later = gate2_review(review_id=21, submitted_at="2026-11-23T02:00:00Z",
+                             head_sha=OTHER_HEAD, tree_sha=OTHER_TREE,
+                             verdict="findings", findings=[p2])
+        self.assertNotEqual(self._result(verify, reviews=[clean, later]).state, "success")
+        # A tombstoned (deleted-through) comment cannot anchor.
+        comment = gate2_comment(comment_id=30)
+        self.assertEqual(self._result(verify, comments=[comment]).state, "success")
+        self.assertNotEqual(
+            self._result(verify, comments=[comment], deleted_through=30).state, "success")
+        # Multi-commit PRs never carry forward.
+        self.assertNotEqual(self._result(
+            verify, reviews=[gate2_review()],
+            identity_key=f"multi:{self.NEW_BASE}:{self.NEW_HEAD}").state, "success")
+
+    def test_earlier_findings_on_anchor_still_block(self):
+        verify = self._anchor_ik
+        p0 = {"severity": "P0", "summary": "unsound"}
+        r1 = gate2_review(review_id=20, submitted_at="2026-11-23T01:00:00Z",
+                          verdict="findings", findings=[p0])
+        r2 = gate2_review(review_id=21, submitted_at="2026-11-23T02:00:00Z")
+        self.assertNotEqual(self._result(verify, reviews=[r1, r2]).state, "success")
+        # Findings on another head with the anchor's tree also block.
+        r1_tree = gate2_review(review_id=20, submitted_at="2026-11-23T01:00:00Z",
+                               head_sha=OTHER_HEAD, verdict="findings", findings=[p0])
+        self.assertNotEqual(self._result(verify, reviews=[r1_tree, r2]).state, "success")
+        # Findings in a deleted-through comment still block, on the anchor's
+        # head or on another head with its tree.
+        for c_head in (HEAD, OTHER_HEAD):
+            c1 = gate2_comment(comment_id=30, head_sha=c_head,
+                               verdict="findings", findings=[p0])
+            self.assertNotEqual(
+                self._result(verify, comments=[c1], reviews=[r2],
+                             deleted_through=30).state,
+                "success")
+        # Unrelated findings on an earlier head and tree do not.
+        r1_other = gate2_review(review_id=20, submitted_at="2026-11-23T01:00:00Z",
+                                head_sha=OTHER_HEAD, tree_sha=OTHER_TREE,
+                                verdict="findings", findings=[p0])
+        self.assertEqual(self._result(verify, reviews=[r1_other, r2]).state, "success")
+
+    def test_non_finding_failures_on_anchor_identity_block(self):
+        verify = self._anchor_ik
+        anchor = gate2_review(review_id=21, submitted_at="2026-11-23T02:00:00Z")
+        # A failing item on another commit with the anchor's tree (the only
+        # commits that can share its one-commit identity) still blocks.
+        for label, failing in (
+            ("changes_requested", gate2_review(
+                review_id=20, submitted_at="2026-11-23T01:00:00Z",
+                head_sha=OTHER_HEAD, state="CHANGES_REQUESTED")),
+            ("same_family", gate2_review(
+                review_id=20, submitted_at="2026-11-23T01:00:00Z",
+                head_sha=OTHER_HEAD, reviewer_family="claude")),
+            ("wrong_commit_id", gate2_review(
+                review_id=20, submitted_at="2026-11-23T01:00:00Z",
+                head_sha=OTHER_HEAD, commit_id=HEAD)),
+        ):
+            with self.subTest(label):
+                self.assertNotEqual(
+                    self._result(verify, reviews=[failing, anchor]).state, "success")
+        # As under the normal rules, such a failure in a deleted-through
+        # comment, on another tree, or with a stale merge_base does not.
+        tomb = gate2_comment(comment_id=30, created_at="2026-11-23T01:00:00Z",
+                             head_sha=OTHER_HEAD, reviewer_family="claude")
+        self.assertEqual(
+            self._result(verify, reviews=[anchor], comments=[tomb],
+                         deleted_through=30).state, "success")
+        other_tree = gate2_review(review_id=20, submitted_at="2026-11-23T01:00:00Z",
+                                  head_sha=OTHER_HEAD, tree_sha=OTHER_TREE,
+                                  state="CHANGES_REQUESTED")
+        self.assertEqual(self._result(verify, reviews=[other_tree, anchor]).state, "success")
+
+    def test_deletion_cannot_hide_newer_items(self):
+        verify = self._anchor_ik
+        p2 = {"severity": "P2", "summary": "bug"}
+        anchor = gate2_review(review_id=21, submitted_at="2026-11-23T01:00:00Z")
+        newer = gate2_comment(comment_id=50, created_at="2026-11-23T02:00:00Z",
+                              head_sha=OTHER_HEAD, tree_sha=OTHER_TREE,
+                              verdict="findings", findings=[p2])
+        self.assertNotEqual(
+            self._result(verify, reviews=[anchor], comments=[newer],
+                         deleted_through=60).state, "success")
+        clean_tomb = gate2_comment(comment_id=50, created_at="2026-11-23T02:00:00Z")
+        self.assertNotEqual(
+            self._result(verify, reviews=[anchor], comments=[clean_tomb],
+                         deleted_through=60).state, "success")
+
+    def test_heads_with_findings_are_sent_to_the_verifier(self):
+        p2 = {"severity": "P2", "summary": "bug"}
+        seen = []
+
+        def verify(*args):
+            seen.append(args[5])
+            return self._anchor_ik()
+
+        # Findings on another head (say, an earlier rebase of the same patch)
+        # posted before a late clean review of the anchor: the verifier gets
+        # that head so it can refuse when the patches match.
+        findings = gate2_review(review_id=20, submitted_at="2026-11-23T01:00:00Z",
+                                head_sha=OTHER_HEAD, tree_sha=OTHER_TREE,
+                                base_sha=OTHER_BASE, verdict="findings", findings=[p2])
+        failing = gate2_review(review_id=19, submitted_at="2026-11-23T00:30:00Z",
+                               head_sha="d" * 40, tree_sha="c" * 40,
+                               state="CHANGES_REQUESTED")
+        clean_other = gate2_review(review_id=18, submitted_at="2026-11-23T00:20:00Z",
+                                   head_sha="9" * 40, tree_sha="8" * 40)
+        anchor = gate2_review(review_id=21, submitted_at="2026-11-23T02:00:00Z")
+        self.assertEqual(self._result(verify, reviews=[clean_other, failing, findings,
+                                                       anchor]).state, "success")
+        self.assertEqual(seen, [sorted([OTHER_HEAD, "d" * 40])])
+        self.assertEqual(self._result(lambda *a: None, reviews=[findings, anchor]).state,
+                         "pending")
+
+    def test_codex_summaries_block(self):
+        verify = self._anchor_ik
+        for label, summ in (
+            ("findings_on_anchor", summary(head=HEAD, has_any_findings=True)),
+            ("in_progress_on_new_head", summary(head=self.NEW_HEAD, status="in_progress")),
+            ("findings_on_new_head", summary(head=self.NEW_HEAD, has_any_findings=True)),
+        ):
+            with self.subTest(label):
+                self.assertNotEqual(
+                    self._result(verify, reviews=[gate2_review()], comments=[summ]).state,
+                    "success")
+        clean = summary(head=OTHER_HEAD)
+        self.assertEqual(
+            self._result(verify, reviews=[gate2_review()], comments=[clean]).state, "success")
+
+    def test_reconcile_uses_github_verifier(self):
+        new_head, new_tree = "1" * 40, "3" * 40
+        anchor = gate2_review(head_sha=HEAD, base_sha=OTHER_BASE, tree_sha=TREE)
+
+        class VerifyingGitHub(FakeGitHub):
+            def __init__(self, verdict, **kw):
+                super().__init__(**kw)
+                self.verdict = verdict
+                self.calls = []
+
+            def verify_rebase_carry_forward(self, *args):
+                self.calls.append(args)
+                return self.verdict
+
+        for verdict, expected in ((self._anchor_ik(), "success"), (None, "pending")):
+            with self.subTest(verdict=verdict):
+                gh = VerifyingGitHub(
+                    verdict,
+                    initial=[pull(head=new_head)], comments={1: []},
+                    reviews={1: [anchor]},
+                    trees={new_head: new_tree, BASE: "4" * 40, HEAD: TREE},
+                    parents={new_head: [BASE]}, messages={new_head: "m"},
+                )
+                results = reconcile(gh)
+                self.assertEqual(results[new_head].state, expected)
+                self.assertEqual(gh.calls, [(HEAD, OTHER_BASE, TREE, new_head, BASE, [])])
+        # A fake without the verifier keeps the old behavior.
+        gh = FakeGitHub(
+            initial=[pull(head=new_head)], comments={1: []}, reviews={1: [anchor]},
+            trees={new_head: new_tree, BASE: "4" * 40, HEAD: TREE},
+            parents={new_head: [BASE]}, messages={new_head: "m"},
+        )
+        self.assertEqual(reconcile(gh)[new_head].state, "pending")
+
+
+class Gate2CarryForwardTransportTests(unittest.TestCase):
+    """GitHub.verify_rebase_carry_forward against canned API responses."""
+
+    OLD_HEAD, OLD_BASE, OLD_TREE = "6" * 40, "7" * 40, "0" * 40
+    NEW_HEAD, NEW_BASE = "8" * 40, "9" * 40
+    PARENT_TREE = "5" * 40
+    MANIFEST = "anneal/trusted/root-manifest.sha256"
+    BLOB = "4" * 40
+
+    def _commit(self, sha, parent, files, message="msg", tree=None):
+        return {"sha": sha, "commit": {"tree": {"sha": tree or self.OLD_TREE},
+                                       "message": message},
+                "parents": [{"sha": parent}], "files": files}
+
+    @staticmethod
+    def _diff(files, modes=None):
+        modes = modes or {}
+        return "".join(
+            f"diff --git a/{f['filename']} b/{f['filename']}\n"
+            f"index 1111111..2222222 {modes.get(f['filename'], '100644')}\n"
+            f"--- a/{f['filename']}\n" for f in files)
+
+    def _gh(self, old_files, new_files, base_files, *, status="ahead",
+            new_message="msg", old_tree=None, new_modes=None, calls=None):
+        responses = {
+            f"commits/{self.OLD_HEAD}": self._commit(
+                self.OLD_HEAD, self.OLD_BASE, old_files, tree=old_tree),
+            f"commits/{self.NEW_HEAD}": self._commit(
+                self.NEW_HEAD, self.NEW_BASE, new_files, new_message, tree="1" * 40),
+            f"compare/{self.OLD_BASE}...{self.NEW_BASE}": {
+                "status": status, "files": base_files},
+            f"commits/{self.OLD_BASE}": self._commit(
+                self.OLD_BASE, "3" * 40, [], tree=self.PARENT_TREE),
+        }
+        diffs = {
+            f"commits/{self.OLD_HEAD}": self._diff(old_files),
+            f"commits/{self.NEW_HEAD}": self._diff(new_files, new_modes),
+        }
+        gh = GitHub("google/zerocopy", "token")
+
+        def request(path, data=None):
+            if calls is not None:
+                calls.append(path)
+            return copy.deepcopy(responses[path])
+        gh.request = request
+        gh.request_text = lambda path, accept: diffs[path]
+        return gh
+
+    def _verify(self, gh, old_tree=None):
+        return gh.verify_rebase_carry_forward(
+            self.OLD_HEAD, self.OLD_BASE, old_tree or self.OLD_TREE,
+            self.NEW_HEAD, self.NEW_BASE)
+
+    def _f(self, name, patch, sha=None):
+        return {"filename": name, "status": "modified", "patch": patch,
+                "sha": sha or self.BLOB}
+
+    def _manifest(self, ctx_before, removed, added, ctx_after, sha):
+        return self._f(self.MANIFEST,
+                       f"@@ -1,3 +1,3 @@\n {ctx_before}\n-{removed}\n+{added}\n {ctx_after}",
+                       sha)
+
+    def test_clean_rebase_over_unrelated_base(self):
+        f = [self._f("anneal/a.rs", "@@ -1 +1 @@\n-a\n+b")]
+        calls = []
+        ik = self._verify(self._gh(f, f, [{"filename": "zerocopy/src/lib.rs"}], calls=calls))
+        msg_sha = hashlib.sha256(b"msg").hexdigest()
+        self.assertEqual(ik, f"one:{self.PARENT_TREE}:{self.OLD_TREE}:{msg_sha}")
+        # Each commit is read once for metadata and files.
+        self.assertEqual(calls.count(f"commits/{self.OLD_HEAD}"), 1)
+        self.assertEqual(calls.count(f"commits/{self.NEW_HEAD}"), 1)
+        self.assertIsNone(self._verify(self._gh(f, f, [{"filename": "anneal/a.rs"}])))
+        self.assertIsNone(self._verify(self._gh(f, f, [{"filename": "x"}], status="diverged")))
+        self.assertIsNone(self._verify(self._gh(f, f, [{"filename": "x"}], new_message="msg2")))
+        semantic = [self._f("anneal/a.rs", "@@ -1 +1 @@\n-a\n+c")]
+        self.assertIsNone(self._verify(self._gh(f, semantic, [{"filename": "x"}])))
+        # The anchor's reviewed tree must be the commit's real tree.
+        self.assertIsNone(self._verify(self._gh(f, f, [{"filename": "x"}]), old_tree="2" * 40))
+        # A mode change with identical content is caught from the raw diff.
+        self.assertIsNone(self._verify(self._gh(
+            f, f, [{"filename": "x"}], new_modes={"anneal/a.rs": "100755"})))
+        self.assertIsNone(self._verify(self._gh(
+            f, f, [{"filename": "x"}], new_modes={"anneal/a.rs": "120000"})))
+
+    def test_parent_and_diff_coverage_checks(self):
+        f = [self._f("a", "+x"), self._f("b", "+y")]
+        gh = self._gh(f, f, [{"filename": "c"}])
+        self.assertIsNotNone(self._verify(gh))
+        # The anchor must sit directly on the base its review names.
+        self.assertIsNone(gh.verify_rebase_carry_forward(
+            self.OLD_HEAD, "3" * 40, self.OLD_TREE, self.NEW_HEAD, self.NEW_BASE))
+        # Both raw diffs must cover exactly the JSON file list.
+        short = self._diff(f[:1])
+        gh.request_text = lambda path, accept: short
+        self.assertIsNone(self._verify(gh))
+
+    def test_other_heads_with_the_same_patch_block(self):
+        f = [self._f("anneal/a.rs", "@@ -1 +1 @@\n-a\n+b")]
+        gh = self._gh(f, f, [{"filename": "zerocopy/src/lib.rs"}])
+        other = "3" * 40
+        responses = {}
+        base_request = gh.request
+
+        def request(path, data=None):
+            if path in responses:
+                return copy.deepcopy(responses[path])
+            return base_request(path, data)
+        gh.request = request
+
+        def verify(heads):
+            return gh.verify_rebase_carry_forward(
+                self.OLD_HEAD, self.OLD_BASE, self.OLD_TREE,
+                self.NEW_HEAD, self.NEW_BASE, heads)
+
+        # A head whose findings concern the same patch (moved context only).
+        same = [self._f("anneal/a.rs", "@@ -7 +7 @@\n-a\n+b", sha="2" * 40)]
+        responses[f"commits/{other}"] = self._commit(other, "1" * 40, same)
+        self.assertIsNone(verify([other]))
+        # A head with a different patch does not block.
+        responses[f"commits/{other}"] = self._commit(
+            other, "1" * 40, [self._f("anneal/a.rs", "@@ -1 +1 @@\n-a\n+c")])
+        self.assertIsNotNone(verify([other]))
+        # An unreadable or uncomparable head fails closed.
+        responses[f"commits/{other}"] = self._commit(
+            other, "1" * 40, [{"filename": "anneal/a.rs", "status": "modified"}])
+        self.assertIsNone(verify([other]))
+        del responses[f"commits/{other}"]
+
+        def missing(path, data=None):
+            if path == f"commits/{other}":
+                raise RuntimeError("GitHub GET: HTTP 404")
+            return request(path, data)
+        gh.request = missing
+        self.assertIsNone(verify([other]))
+
+    def test_base_changes_to_review_rules_need_a_new_review(self):
+        f = [self._f("anneal/a.rs", "@@ -1 +1 @@\n-a\n+b")]
+        for path in ("anneal/AGENTS.md", "anneal/.gemini/styleguide.md",
+                     "anneal/skills/trust-review/SKILL.md", "skills/x/SKILL.md",
+                     "docs/codex-review.md", "anneal/docs/codex-review.md",
+                     "ci/codex_review.py", "anneal/ci/codex_review.py",
+                     "THREAT_MODEL.md", "anneal/THREAT_MODEL.md",
+                     ".github/workflows/ci.yml", "AGENTS.md",
+                     "anneal/x/AGENTS.override.md",
+                     "zerocopy/src/CLAUDE.md", "GEMINI.md"):
+            with self.subTest(path):
+                self.assertIsNone(self._verify(self._gh(f, f, [{"filename": path}])))
+        self.assertIsNone(self._verify(self._gh(
+            f, f, [{"filename": "x.md", "previous_filename": "anneal/AGENTS.md"}])))
+
+    def test_same_base_never_carries_forward(self):
+        f = [self._f("a", "+x")]
+        gh = self._gh(f, f, [{"filename": "b"}])
+        self.assertIsNone(gh.verify_rebase_carry_forward(
+            self.OLD_HEAD, self.NEW_BASE, self.OLD_TREE, self.NEW_HEAD, self.NEW_BASE))
+
+    def test_manifest_edge_cases(self):
+        # The PR changes its own flake.nix digest line; main separately bumps
+        # an adjacent Cargo.lock digest line in the same manifest. The PR's
+        # own added and removed lines are unchanged, so it qualifies.
+        old = [self._manifest("aaa  anneal/Cargo.lock", "f0  flake.nix",
+                              "f1  flake.nix", "ccc  anneal/x", "a" * 40)]
+        new = [self._manifest("bbb  anneal/Cargo.lock", "f0  flake.nix",
+                              "f1  flake.nix", "ccc  anneal/x", "b" * 40)]
+        base = [{"filename": self.MANIFEST}, {"filename": "anneal/Cargo.lock"}]
+        self.assertIsNotNone(self._verify(self._gh(old, new, base)))
+        # Without a base change to the manifest, its blob must still match.
+        self.assertIsNone(self._verify(self._gh(old, new, [{"filename": "q"}])))
+        # If main also changed flake.nix, the PR's removed digest line
+        # differs, so it falls back to a full review.
+        moved = [self._manifest("bbb  anneal/Cargo.lock", "f9  flake.nix",
+                                "f1  flake.nix", "ccc  anneal/x", "b" * 40)]
+        self.assertIsNone(self._verify(self._gh(old, moved, base + [{"filename": "flake.nix"}])))
+        # Neither flake.nix nor Cargo.lock is an allowlisted overlap.
+        for name in ("flake.nix", "anneal/Cargo.lock"):
+            f = [self._f(name, "@@ -1 +1 @@\n-a\n+b")]
+            self.assertIsNone(self._verify(self._gh(f, f, [{"filename": name}])))
 
 if __name__ == "__main__":
     unittest.main()
