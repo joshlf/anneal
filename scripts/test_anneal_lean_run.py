@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,7 +71,10 @@ _ENV_PATCHER: Any = None
 # `os.execve` (`os.execl*` / `os.execvp*` are wrappers around them).
 _GUARDED_EXEC_FUNCTIONS: tuple[str, ...] = ("execv", "execve", "execvp", "execvpe")
 _EXEC_GUARDS: list[Any] = []
+_ORIG_ACQUIRE_BUILD_SLOT = alr.acquire_build_slot
+_SLOT_LOCK_GUARD: Any = None
 _XDG_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
+_XDG_RUNTIME_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
 # Text of the `anneal-workloads.slice` unit `ensure_workloads_slice` reconciles on this
 # host, or `None` when it refuses to write one (no delegated `systemd --user`).
 _SLICE_UNIT_SEED: str | None = None
@@ -83,15 +87,64 @@ def _scrub_ambient_anneal_env(env: MutableMapping[str, str]) -> None:
 
 
 def _isolated_cli_env(
-    xdg_config_home: Path, env_extra: dict[str, str] | None = None
+    xdg_config_home: Path,
+    env_extra: dict[str, str] | None = None,
+    *,
+    xdg_runtime_dir: Path | None = None,
 ) -> dict[str, str]:
     env = dict(os.environ)
     _scrub_ambient_anneal_env(env)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    if xdg_runtime_dir is not None:
+        env["XDG_RUNTIME_DIR"] = str(xdg_runtime_dir)
+    elif _XDG_RUNTIME_TMPDIR is not None:
+        env["XDG_RUNTIME_DIR"] = _XDG_RUNTIME_TMPDIR.name
+    else:
+        env.pop("XDG_RUNTIME_DIR", None)
     if env_extra:
         env.update(env_extra)
     return env
+
+
+@contextlib.contextmanager
+def _guarded_acquire_build_slot(
+    max_slots: int,
+    timeout_sec: float,
+    enabled: bool,
+    *,
+    exclusive: bool = False,
+    runtime_base: Path | None = None,
+    poll_interval: float = 0.5,
+) -> Iterator[int | list[int] | None]:
+    if enabled and max_slots > 0:
+        uid = os.getuid()
+        eff_base = (
+            Path(runtime_base)
+            if runtime_base is not None
+            else alr.resolve_runtime_base()[0]
+        )
+        forbidden_bases = {
+            Path(f"/run/user/{uid}").resolve(),
+            Path("/tmp").resolve(),
+        }
+        slot_subdir = f"anneal-build-slots-{uid}"
+        forbidden_slot_dirs = {base / slot_subdir for base in forbidden_bases}
+        resolved_base = eff_base.resolve()
+        resolved_slot_dir = (resolved_base / slot_subdir).resolve()
+        if resolved_base in forbidden_bases or resolved_slot_dir in forbidden_slot_dirs:
+            raise AssertionError(
+                f"test attempted to acquire a live host build-slot lock under {resolved_base}"
+            )
+    with _ORIG_ACQUIRE_BUILD_SLOT(
+        max_slots,
+        timeout_sec,
+        enabled,
+        exclusive=exclusive,
+        runtime_base=runtime_base,
+        poll_interval=poll_interval,
+    ) as slots:
+        yield slots
 
 
 def _forbid_in_process_exec(file: str, args: Any, *rest: Any) -> None:
@@ -167,10 +220,16 @@ def _file_identity(path: Path) -> tuple[int, int, str]:
 
 
 def setUpModule() -> None:
-    global _ENV_PATCHER, _XDG_TMPDIR, _SLICE_UNIT_SEED
+    global _ENV_PATCHER, _SLOT_LOCK_GUARD, _XDG_TMPDIR, _XDG_RUNTIME_TMPDIR, _SLICE_UNIT_SEED
     try:
         _XDG_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-")
-        patch_vals = {**_HERMETIC_GIT_ENV, "XDG_CONFIG_HOME": _XDG_TMPDIR.name}
+        _XDG_RUNTIME_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-rt-")
+        os.chmod(_XDG_RUNTIME_TMPDIR.name, 0o700)
+        patch_vals = {
+            **_HERMETIC_GIT_ENV,
+            "XDG_CONFIG_HOME": _XDG_TMPDIR.name,
+            "XDG_RUNTIME_DIR": _XDG_RUNTIME_TMPDIR.name,
+        }
         _ENV_PATCHER = mock.patch.dict(os.environ, patch_vals)
         _ENV_PATCHER.start()
         # `patch.dict` restores the full original environment on stop.
@@ -185,6 +244,12 @@ def setUpModule() -> None:
             guard = mock.patch.object(os, name, side_effect=_forbid_in_process_exec)
             guard.start()
             _EXEC_GUARDS.append(guard)
+        # Fail loudly if any in-process test attempts to acquire a live host build-slot lock
+        # under `/run/user/<uid>` or `/tmp`.
+        _SLOT_LOCK_GUARD = mock.patch.object(
+            alr, "acquire_build_slot", side_effect=_guarded_acquire_build_slot
+        )
+        _SLOT_LOCK_GUARD.start()
         # In-process `alr.main([... "--", cmd])` runs reconcile the unit under this module-wide
         # `XDG_CONFIG_HOME`; seed it so they never reload the live user manager either.
         _SLICE_UNIT_SEED = _render_live_workloads_slice_unit()
@@ -195,16 +260,30 @@ def setUpModule() -> None:
 
 
 def tearDownModule() -> None:
-    global _ENV_PATCHER, _XDG_TMPDIR, _SLICE_UNIT_SEED
-    while _EXEC_GUARDS:
-        _EXEC_GUARDS.pop().stop()
-    if _ENV_PATCHER is not None:
-        _ENV_PATCHER.stop()
-        _ENV_PATCHER = None
-    if _XDG_TMPDIR is not None:
-        _XDG_TMPDIR.cleanup()
-        _XDG_TMPDIR = None
-    _SLICE_UNIT_SEED = None
+    global _ENV_PATCHER, _SLOT_LOCK_GUARD, _XDG_TMPDIR, _XDG_RUNTIME_TMPDIR, _SLICE_UNIT_SEED
+    try:
+        if _SLOT_LOCK_GUARD is not None:
+            _SLOT_LOCK_GUARD.stop()
+            _SLOT_LOCK_GUARD = None
+    finally:
+        try:
+            while _EXEC_GUARDS:
+                _EXEC_GUARDS.pop().stop()
+        finally:
+            try:
+                if _ENV_PATCHER is not None:
+                    _ENV_PATCHER.stop()
+                    _ENV_PATCHER = None
+            finally:
+                try:
+                    if _XDG_TMPDIR is not None:
+                        _XDG_TMPDIR.cleanup()
+                        _XDG_TMPDIR = None
+                finally:
+                    if _XDG_RUNTIME_TMPDIR is not None:
+                        _XDG_RUNTIME_TMPDIR.cleanup()
+                        _XDG_RUNTIME_TMPDIR = None
+                    _SLICE_UNIT_SEED = None
 
 
 # ---------------------------------------------------------------------------
@@ -918,32 +997,35 @@ class TestCliAndLimits(unittest.TestCase):
 
     def test_systemd_scope_keeps_memory_max_and_zero_swap(self) -> None:
         _FakePopen.calls = []
-        limits = alr.compute_workload_memory_envelope(
-            cpu_cores=int(FIXED_HW["cpu_cores"]),
-            mem_total_mb=int(FIXED_HW["mem_total_mb"]),
-            mem_avail_mb=int(FIXED_HW["mem_avail_mb"]),
-            user_systemd_active=True,
-            t_cg_is_user_service=True,
-            cli_concurrency=2,
-            mode="file",
-        )
-        with mock.patch.object(alr, "probe_host_envelope", return_value=limits), \
-             mock.patch.object(alr, "resolve_runtime_base", return_value=(Path("/tmp"), True)), \
-             mock.patch.object(alr, "ensure_workloads_slice", return_value=(True, False, "ok")), \
-             mock.patch.object(alr, "_find_systemd_run", return_value="/usr/bin/systemd-run"), \
-             mock.patch.object(alr.subprocess, "Popen", _FakePopen):
-            rc = alr.main(
-                [
-                    "--mode",
-                    "file",
-                    "--concurrency",
-                    "2",
-                    "--no-slot-lock",
-                    "--",
-                    "lean",
-                    "Foo.lean",
-                ]
+        with tempfile.TemporaryDirectory(prefix="anneal-scope-rt-") as rt_tmp:
+            rt_path = Path(rt_tmp)
+            limits = alr.compute_workload_memory_envelope(
+                cpu_cores=int(FIXED_HW["cpu_cores"]),
+                mem_total_mb=int(FIXED_HW["mem_total_mb"]),
+                mem_avail_mb=int(FIXED_HW["mem_avail_mb"]),
+                user_systemd_active=True,
+                t_cg_is_user_service=True,
+                cli_concurrency=2,
+                mode="file",
+                runtime_base=str(rt_path),
             )
+            with mock.patch.object(alr, "probe_host_envelope", return_value=limits), \
+                 mock.patch.object(alr, "resolve_runtime_base", return_value=(rt_path, True)), \
+                 mock.patch.object(alr, "ensure_workloads_slice", return_value=(True, False, "ok")), \
+                 mock.patch.object(alr, "_find_systemd_run", return_value="/usr/bin/systemd-run"), \
+                 mock.patch.object(alr.subprocess, "Popen", _FakePopen):
+                rc = alr.main(
+                    [
+                        "--mode",
+                        "file",
+                        "--concurrency",
+                        "2",
+                        "--no-slot-lock",
+                        "--",
+                        "lean",
+                        "Foo.lean",
+                    ]
+                )
         self.assertEqual(rc, 0)
         self.assertEqual(len(_FakePopen.calls), 1)
         argv, kwargs = _FakePopen.calls[0]
@@ -1195,7 +1277,7 @@ class TestCliAndLimits(unittest.TestCase):
         err_buf = io.StringIO()
         with mock.patch("sys.stderr", err_buf), mock.patch.object(
             alr, "probe_cgroup_v2_memory", return_value=dict(FAKE_CGROUP_INFO)
-        ):
+        ), mock.patch.object(alr, "stamp_last_oom"):
             rc = alr.main(
                 ["--mode", "file", "--no-slot-lock", "--", "sh", "-c", "exit 137"]
             )
@@ -1886,21 +1968,26 @@ class TestCliSubprocess(unittest.TestCase):
     """Runs `scripts/anneal-lean-run` as a real subprocess (stdin=/dev/null).
 
     Every subprocess is isolated from the invoking host: ambient `ANNEAL_LEAN_*` /
-    `ANNEAL_WORKTREE_*` / `ANNEAL_LSP_*` / `ANNEAL_OOM_*` variables are scrubbed, and
-    `XDG_CONFIG_HOME` is a fresh empty directory unless `env_extra` provides one.
+    `ANNEAL_WORKTREE_*` / `ANNEAL_LSP_*` / `ANNEAL_OOM_*` variables are scrubbed,
+    `XDG_CONFIG_HOME` is a fresh empty directory, and `XDG_RUNTIME_DIR` is a fresh
+    `0700` directory unless `env_extra` provides an explicit override.
     """
 
     def _run_isolated(
         self, argv: list[str], env_extra: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        with tempfile.TemporaryDirectory(prefix="anneal-cli-xdg-") as xdg_dir:
+        with tempfile.TemporaryDirectory(prefix="anneal-cli-xdg-") as xdg_dir, \
+             tempfile.TemporaryDirectory(prefix="anneal-cli-rt-") as rt_dir:
+            os.chmod(rt_dir, 0o700)
             return subprocess.run(
                 argv,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 check=False,
-                env=_isolated_cli_env(Path(xdg_dir), env_extra),
+                env=_isolated_cli_env(
+                    Path(xdg_dir), env_extra, xdg_runtime_dir=Path(rt_dir)
+                ),
                 timeout=120,
             )
 
@@ -2560,41 +2647,266 @@ class TestCliSubprocess(unittest.TestCase):
             )
 
         if _can_launch_live_systemd_scope():
-            live_probe = self._probe_json(
-                self._cli(
+            with tempfile.TemporaryDirectory(prefix="anneal-cli-live-xdg-") as live_xdg:
+                _seed_workloads_slice_unit(Path(live_xdg))
+                live_probe = self._probe_json(
+                    self._cli(
+                        "--mode",
+                        "file",
+                        "--concurrency",
+                        "2",
+                        "--memory-max-mb",
+                        "2048",
+                        "--probe",
+                        "--json",
+                        env_extra={"XDG_CONFIG_HOME": live_xdg},
+                    )
+                )
+                live_res = self._cli(
                     "--mode",
                     "file",
                     "--concurrency",
                     "2",
                     "--memory-max-mb",
                     "2048",
-                    "--probe",
-                    "--json",
+                    "--no-slot-lock",
+                    "--",
+                    *inspect_cmd,
+                    env_extra={
+                        "XDG_CONFIG_HOME": live_xdg,
+                        "ANNEAL_LEAN_RUN_SLOTS": "77",
+                        "ANNEAL_LEAN_RUN_MEM_MB": "777777",
+                    },
                 )
+                self.assertEqual(live_res.returncode, 0, live_res.stderr)
+                self.assertEqual(
+                    json.loads(live_res.stdout),
+                    {
+                        "ANNEAL_LEAN_RUN_SLOTS": "0",
+                        "ANNEAL_LEAN_RUN_MEM_MB": str(live_probe["memory_max_mb"]),
+                    },
+                )
+
+    def test_run_isolated_and_cli_provide_unique_0700_xdg_runtime_dir_and_clean_up(
+        self,
+    ) -> None:
+        """Module setup and every `_run_isolated` / `_cli` subprocess receive a unique,
+        existing `0700` `XDG_RUNTIME_DIR` distinct from host `/run/user/<uid>` and `/tmp`
+        (unless overridden via `env_extra`), and clean it up after returning or raising."""
+        uid = os.getuid()
+        host_run_user = Path(f"/run/user/{uid}").resolve()
+        host_tmp = Path("/tmp").resolve()
+
+        # Module-level isolation in `setUpModule()`.
+        self.assertIsNotNone(_XDG_RUNTIME_TMPDIR)
+        assert _XDG_RUNTIME_TMPDIR is not None
+        mod_rt = Path(_XDG_RUNTIME_TMPDIR.name)
+        self.assertEqual(os.environ.get("XDG_RUNTIME_DIR"), _XDG_RUNTIME_TMPDIR.name)
+        self.assertTrue(mod_rt.is_dir())
+        self.assertEqual(stat.S_IMODE(mod_rt.stat().st_mode), 0o700)
+        self.assertNotIn(mod_rt.resolve(), {host_run_user, host_tmp})
+
+        inspect_rt_cmd = [
+            sys.executable,
+            "-c",
+            (
+                "import json, os, pathlib, stat; "
+                "rt = os.environ.get('XDG_RUNTIME_DIR'); "
+                "p = pathlib.Path(rt) if rt else None; "
+                "print(json.dumps({"
+                "'rt': rt, "
+                "'exists': bool(p and p.is_dir()), "
+                "'mode': stat.S_IMODE(p.stat().st_mode) if (p and p.exists()) else None"
+                "}))"
+            ),
+        ]
+
+        seen_rts: list[Path] = []
+        for _ in range(2):
+            res = self._run_isolated(inspect_rt_cmd)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            info = json.loads(res.stdout)
+            self.assertTrue(info["exists"], info)
+            self.assertEqual(info["mode"], 0o700, info)
+            rt_path = Path(info["rt"])
+            self.assertTrue(rt_path.name.startswith("anneal-cli-rt-"), rt_path)
+            self.assertNotIn(rt_path.resolve(), {host_run_user, host_tmp, mod_rt.resolve()})
+            self.assertFalse(rt_path.exists(), f"per-invocation rt dir leaked: {rt_path}")
+            seen_rts.append(rt_path)
+        self.assertNotEqual(seen_rts[0], seen_rts[1])
+
+        # `_cli` pass-through receives a fresh `0700` `XDG_RUNTIME_DIR` and cleans it up.
+        cli_res = self._cli(
+            "--mode",
+            "file",
+            "--no-slot-lock",
+            "--",
+            *inspect_rt_cmd,
+            env_extra={"ANNEAL_LEAN_RUN_IN_SCOPE": "1"},
+        )
+        self.assertEqual(cli_res.returncode, 0, cli_res.stderr)
+        cli_info = json.loads(cli_res.stdout)
+        self.assertTrue(cli_info["exists"], cli_info)
+        self.assertEqual(cli_info["mode"], 0o700, cli_info)
+        cli_rt = Path(cli_info["rt"])
+        self.assertTrue(cli_rt.name.startswith("anneal-cli-rt-"), cli_rt)
+        self.assertNotIn(cli_rt.resolve(), {host_run_user, host_tmp, mod_rt.resolve()})
+        self.assertNotIn(cli_rt, seen_rts)
+        self.assertFalse(cli_rt.exists(), f"_cli rt dir leaked: {cli_rt}")
+
+        # Explicit `env_extra={"XDG_RUNTIME_DIR": ...}` override wins and is left intact,
+        # while `_run_isolated`'s unused temp dir is still cleaned up.
+        with tempfile.TemporaryDirectory(prefix="anneal-custom-rt-") as custom_rt:
+            os.chmod(custom_rt, 0o700)
+            override_res = self._run_isolated(
+                inspect_rt_cmd, env_extra={"XDG_RUNTIME_DIR": custom_rt}
             )
-            live_res = self._cli(
-                "--mode",
-                "file",
-                "--concurrency",
-                "2",
-                "--memory-max-mb",
-                "2048",
-                "--no-slot-lock",
-                "--",
-                *inspect_cmd,
-                env_extra={
-                    "ANNEAL_LEAN_RUN_SLOTS": "77",
-                    "ANNEAL_LEAN_RUN_MEM_MB": "777777",
-                },
-            )
-            self.assertEqual(live_res.returncode, 0, live_res.stderr)
+            self.assertEqual(override_res.returncode, 0, override_res.stderr)
+            override_info = json.loads(override_res.stdout)
+            self.assertEqual(override_info["rt"], custom_rt)
+            self.assertTrue(Path(custom_rt).is_dir())
+
+        # Cleanup also holds when `subprocess.run` raises (e.g., timeout or OSError).
+        captured_exc_rt: list[Path] = []
+
+        def raising_run(*_args: Any, **kwargs: Any) -> Any:
+            rt = Path(kwargs["env"]["XDG_RUNTIME_DIR"])
+            self.assertTrue(rt.is_dir())
+            self.assertEqual(stat.S_IMODE(rt.stat().st_mode), 0o700)
+            captured_exc_rt.append(rt)
+            raise subprocess.TimeoutExpired(cmd=["sleep"], timeout=1)
+
+        with mock.patch.object(subprocess, "run", side_effect=raising_run):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self._run_isolated(["true"])
+        self.assertEqual(len(captured_exc_rt), 1)
+        self.assertFalse(
+            captured_exc_rt[0].exists(),
+            f"per-invocation rt dir leaked after exception: {captured_exc_rt[0]}",
+        )
+
+    def test_ambient_xdg_runtime_dir_slot_lock_does_not_block_isolated_tests(
+        self,
+    ) -> None:
+        """Holding an exclusive `flock` on a simulated ambient
+        `XDG_RUNTIME_DIR/anneal-build-slots-<uid>/slot-1.lock` must not block
+        `_isolated_cli_env`, `_run_isolated`, or slot tests."""
+        uid = os.getuid()
+        with tempfile.TemporaryDirectory(prefix="anneal-ambient-rt-") as amb_tmp:
+            ambient_rt = Path(amb_tmp)
+            os.chmod(ambient_rt, 0o700)
+            slot_dir = ambient_rt / f"anneal-build-slots-{uid}"
+            slot_dir.mkdir(parents=True)
+            lock_path = slot_dir / "slot-1.lock"
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                # Positive control: ambient slot-1 really is locked and blocks acquisition.
+                self.assertEqual(alr.count_active_build_slots(ambient_rt), 1)
+                err_buf = io.StringIO()
+                with mock.patch("sys.stderr", err_buf), self.assertRaises(TimeoutError):
+                    with alr.acquire_build_slot(
+                        1, 0.06, enabled=True, runtime_base=ambient_rt, poll_interval=0.02
+                    ):
+                        self.fail("Expected ambient slot-1 lock to block")
+
+                with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(ambient_rt)}):
+                    with tempfile.TemporaryDirectory(prefix="anneal-iso-cfg-") as cfg_tmp:
+                        iso_env = _isolated_cli_env(Path(cfg_tmp))
+                    iso_rt = Path(iso_env["XDG_RUNTIME_DIR"])
+                    self.assertNotEqual(iso_rt.resolve(), ambient_rt.resolve())
+                    self.assertEqual(alr.count_active_build_slots(iso_rt), 0)
+                    with alr.acquire_build_slot(
+                        1, 0.5, enabled=True, runtime_base=iso_rt, poll_interval=0.02
+                    ) as acquired:
+                        self.assertEqual(acquired, 1)
+
+                    # `_run_isolated` subprocess acquiring slot-1 under its isolated
+                    # `XDG_RUNTIME_DIR` succeeds immediately despite ambient lock.
+                    slot_probe_code = (
+                        "import importlib.machinery, importlib.util, os, pathlib, sys\n"
+                        "loader = importlib.machinery.SourceFileLoader('alr_sub', sys.argv[1])\n"
+                        "spec = importlib.util.spec_from_loader('alr_sub', loader)\n"
+                        "mod = importlib.util.module_from_spec(spec)\n"
+                        "loader.exec_module(mod)\n"
+                        "rt = pathlib.Path(os.environ['XDG_RUNTIME_DIR'])\n"
+                        "assert mod.count_active_build_slots(rt) == 0\n"
+                        "with mod.acquire_build_slot(1, 0.5, enabled=True, runtime_base=rt, poll_interval=0.02) as s:\n"
+                        "    assert s == 1\n"
+                        "print(str(rt))\n"
+                    )
+                    res = self._run_isolated(
+                        [sys.executable, "-B", "-c", slot_probe_code, str(SCRIPT_PATH)]
+                    )
+                    self.assertEqual(res.returncode, 0, res.stderr)
+                    child_rt = Path(res.stdout.strip())
+                    self.assertNotEqual(child_rt.resolve(), ambient_rt.resolve())
+                    self.assertFalse(child_rt.exists())
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+    def test_alr_main_and_cli_never_lock_or_mutate_host_build_slot_dirs(self) -> None:
+        """`alr.main` / CLI tests never acquire locks or create files under host
+        `/run/user/<uid>/anneal-build-slots-<uid>` or `/tmp/anneal-build-slots-<uid>`."""
+        uid = os.getuid()
+        forbidden_slot_dirs = {
+            Path(f"/run/user/{uid}").resolve() / f"anneal-build-slots-{uid}",
+            Path("/tmp").resolve() / f"anneal-build-slots-{uid}",
+        }
+
+        # Positive control: the module-wide slot-lock guard catches live host lock attempts.
+        self.assertIsNotNone(_SLOT_LOCK_GUARD)
+        for forbidden_base in (Path(f"/run/user/{uid}"), Path("/tmp")):
+            with self.assertRaisesRegex(AssertionError, "live host build-slot lock"):
+                with alr.acquire_build_slot(
+                    1, 0.05, enabled=True, runtime_base=forbidden_base
+                ):
+                    pass
+
+        real_open = os.open
+        write_flags = os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_TRUNC | os.O_APPEND
+        host_slot_writes: list[str] = []
+
+        def spy_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            if flags & write_flags:
+                try:
+                    resolved = Path(os.fsdecode(path)).resolve()
+                except OSError:
+                    resolved = None
+                if resolved is not None and any(
+                    resolved == d or d in resolved.parents for d in forbidden_slot_dirs
+                ):
+                    host_slot_writes.append(str(resolved))
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", side_effect=spy_open):
+            out_buf = io.StringIO()
+            with mock.patch("sys.stdout", out_buf):
+                self.assertEqual(alr.main(["--probe", "--json"]), 0)
             self.assertEqual(
-                json.loads(live_res.stdout),
-                {
-                    "ANNEAL_LEAN_RUN_SLOTS": "0",
-                    "ANNEAL_LEAN_RUN_MEM_MB": str(live_probe["memory_max_mb"]),
-                },
+                alr.main(["--mode", "file", "--no-slot-lock", "--concurrency", "1", "--", "true"]),
+                0,
             )
+            self.assertEqual(
+                alr.main(["--mode", "build", "--no-slot-lock", "--concurrency", "1", "--", "true"]),
+                0,
+            )
+        self.assertEqual(host_slot_writes, [])
+
+        # Enabled build-slot locking in `_synthetic_cli` creates `slot-1.lock` strictly
+        # inside the synthetic temp root, never under `/run/user/<uid>` or `/tmp`.
+        with tempfile.TemporaryDirectory(prefix="anneal-slot-audit-") as tmp:
+            root = Path(tmp)
+            _write_synthetic_host_base(root)
+            _write_synthetic_cgroup_root(root, "cg_uncapped", None)
+            res = self._synthetic_cli(
+                root, "cg_uncapped", "--mode", "build", "--concurrency", "1", "--", "true"
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            synth_lock = root / f"anneal-build-slots-{uid}" / "slot-1.lock"
+            self.assertTrue(synth_lock.is_file(), f"expected synthetic lock at {synth_lock}")
+            self.assertNotIn(synth_lock.parent.resolve(), forbidden_slot_dirs)
 
 
 class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
@@ -2648,11 +2960,14 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
             fd2 = os.open(str(slot_dir / "slot-2.lock"), os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
-                with self.assertRaises(TimeoutError):
-                    with alr.acquire_build_slot(
-                        3, 0.12, enabled=True, exclusive=True, runtime_base=rt, poll_interval=0.03
-                    ):
-                        self.fail("Expected timeout while slot-2 locked")
+                err_buf = io.StringIO()
+                with mock.patch("sys.stderr", err_buf):
+                    with self.assertRaises(TimeoutError):
+                        with alr.acquire_build_slot(
+                            3, 0.12, enabled=True, exclusive=True, runtime_base=rt, poll_interval=0.03
+                        ):
+                            self.fail("Expected timeout while slot-2 locked")
+                self.assertIn("Waiting for exclusive access", err_buf.getvalue())
                 fd1 = os.open(str(slot_dir / "slot-1.lock"), os.O_CREAT | os.O_RDWR, 0o600)
                 try:
                     fcntl.flock(fd1, fcntl.LOCK_EX | fcntl.LOCK_NB)

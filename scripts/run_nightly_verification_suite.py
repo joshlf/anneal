@@ -43,7 +43,8 @@ Profiles (`--profile`):
                crate verifications.
 
 Step environment: every step runs with `LAKE_ARTIFACT_CACHE=true` and
-`LAKE_RESTORE_ARTIFACTS=true`, and the `LOW_RAM_SINGLE_THREAD_STEPS`
+`LAKE_RESTORE_ARTIFACTS=true`, `PYTHON_UNIT_TEST_STEPS` run with a private temporary
+`XDG_RUNTIME_DIR` (cleaned up on step exit), and the `LOW_RAM_SINGLE_THREAD_STEPS`
 (`lake_build_minirust_spec_core`, `lake_build_minirust_spec`,
 `lake_build_lean_miri_spec_core`, `lake_build_lean_miri_spec`) each with
 `LEAN_NUM_THREADS=1` when its effective RAM ceiling is below 10 GiB
@@ -67,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+import contextlib
 import datetime
 import hashlib
 import json
@@ -4997,6 +4999,190 @@ LOW_RAM_SINGLE_THREAD_STEPS: frozenset[str] = frozenset(
     )
 )
 
+# Python unit test steps that receive an isolated, auto-cleaned `0700` `XDG_RUNTIME_DIR`
+# in `_run_step` (and have any inherited host `XDG_RUNTIME_DIR` scrubbed in `_build_step_env`
+# unless explicitly supplied via `isolated_runtime_dir` or `env_overrides`).
+PYTHON_UNIT_TEST_STEPS: frozenset[str] = frozenset(
+    (
+        "ci_python_unit_tests",
+        "scripts_python_unit_tests_core",
+        "scripts_python_unit_tests_campaign_and_guards",
+        "anneal_lsp_python_unit_tests",
+    )
+)
+
+SCRIPTS_PYTHON_UNIT_TESTS_CORE: tuple[str, ...] = (
+    "scripts/test_anneal_lean_run.py",
+    "scripts/test_audit_mir_coverage_matrix.py",
+    "scripts/test_receipt_claim_guard.py",
+)
+_SCRIPTS_PYTHON_UNIT_TESTS_CAMPAIGN_CANONICAL: tuple[str, ...] = (
+    "scripts/test_run_diff_test_campaign.py",
+    "scripts/test_run_nightly_verification_suite.py",
+    "scripts/test_check_mir_guard_mutation.py",
+)
+
+ANNEAL_DIFFTEST_MIRI_TEST_TARGET = "miri_difftest_oracle"
+_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK: tuple[str, ...] = (
+    "campaign_orchestrator",
+    "generation_and_honesty",
+    "itree_difftest_oracle",
+    "parse_frame_benchmark",
+    "rustc_end_to_end",
+    "vtable_fnptr_mutator_tests",
+)
+_CARGO_TEST_TARGET_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+
+
+def scripts_campaign_and_guard_test_files(repo_root: Path) -> list[str]:
+    """Return deterministic `scripts/test_*.py` paths for `scripts_python_unit_tests_campaign_and_guards`.
+
+    Always preserves the canonical campaign/guard trio in order, and appends any
+    additional regular `scripts/test_*.py` modules discovered under `repo_root / "scripts"`
+    not already covered by `SCRIPTS_PYTHON_UNIT_TESTS_CORE` (sorted by name). Falls back
+    to the canonical trio when `repo_root / "scripts"` is absent, symlinked, or unreadable.
+    """
+    core = frozenset(SCRIPTS_PYTHON_UNIT_TESTS_CORE)
+    ordered = list(_SCRIPTS_PYTHON_UNIT_TESTS_CAMPAIGN_CANONICAL)
+    seen = set(core) | set(ordered)
+    scripts_dir = repo_root / "scripts"
+    try:
+        if scripts_dir.is_symlink() or not scripts_dir.is_dir():
+            return ordered
+        extras: list[str] = []
+        with os.scandir(scripts_dir) as it:
+            for entry in it:
+                name = entry.name
+                if not (name.startswith("test_") and name.endswith(".py")):
+                    continue
+                if not name[:-3].isidentifier():
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                rel = f"scripts/{name}"
+                if rel not in seen:
+                    extras.append(rel)
+        extras.sort()
+        ordered.extend(extras)
+    except OSError:
+        return list(_SCRIPTS_PYTHON_UNIT_TESTS_CAMPAIGN_CANONICAL)
+    return ordered
+
+
+def anneal_difftest_non_miri_test_targets(repo_root: Path) -> list[str]:
+    """Discover all non-Miri Cargo integration test targets under `crates/anneal-difftest/tests`.
+
+    Matches Cargo's target auto-discovery (`tests/<name>.rs` and `tests/<name>/main.rs`),
+    skipping `miri_difftest_oracle` (run in its own dedicated step), helper module
+    subdirectories without `main.rs`, symlinks, hidden files, and unsafe names. Falls back
+    to `_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK` when the directory is absent, empty, or
+    unreadable (e.g. synthetic temp repos in unit tests).
+    """
+    tests_dir = repo_root / "crates/anneal-difftest/tests"
+    try:
+        if tests_dir.is_symlink() or not tests_dir.is_dir():
+            return list(_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK)
+        discovered: set[str] = set()
+        with os.scandir(tests_dir) as it:
+            for entry in it:
+                name = entry.name
+                if name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                target: str | None = None
+                if stat.S_ISREG(st.st_mode) and name.endswith(".rs"):
+                    target = name[:-3]
+                elif stat.S_ISDIR(st.st_mode):
+                    main_rs = Path(entry.path) / "main.rs"
+                    try:
+                        main_st = main_rs.lstat()
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(main_st.st_mode):
+                        target = name
+                if (
+                    target
+                    and target != ANNEAL_DIFFTEST_MIRI_TEST_TARGET
+                    and _CARGO_TEST_TARGET_NAME_RE.fullmatch(target)
+                ):
+                    discovered.add(target)
+        return sorted(discovered) if discovered else list(_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK)
+    except OSError:
+        return list(_ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK)
+
+
+def _is_disjoint_cache_dir(candidate: Path, checkout: Path, uid: int) -> bool:
+    """Return True iff `candidate` resolves strictly disjoint from `checkout` and is safe to use."""
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return False
+    if resolved == checkout or checkout in resolved.parents or resolved in checkout.parents:
+        return False
+    try:
+        st = candidate.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == uid
+
+
+def _dir_is_writable(path: Path) -> bool:
+    try:
+        return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def resolve_check_trusted_cache_dir(repo_root: Path) -> str:
+    """Resolve a deterministic out-of-checkout `--cache-dir` for `check_trusted.py --fast`.
+
+    Prefers `/tmp/anneal-trusted-cache-nightly-<uid>` (matching `anneal-clean-tmp`'s
+    `anneal-trusted-cache-*` pool while preventing multi-UID collisions on shared hosts).
+    Falls back deterministically to an out-of-checkout sibling when the primary path
+    would collide with `repo_root.resolve()` or an existing symlinked/unowned entry,
+    preserving `check_trusted.py`'s fail-closed admission invariant
+    (`cache_dir != checkout and checkout not in cache_dir.parents`).
+    """
+    uid = os.getuid()
+    checkout = repo_root.resolve()
+    base_name = f"anneal-trusted-cache-nightly-{uid}"
+    checkout_tag = hashlib.sha256(os.fspath(checkout).encode("utf-8")).hexdigest()[:12]
+    suffixed_name = f"{base_name}-{checkout_tag}"
+
+    candidates: list[Path] = [
+        Path("/tmp") / base_name,
+        Path("/tmp") / suffixed_name,
+    ]
+    tmpdir = Path(tempfile.gettempdir())
+    if tmpdir != Path("/tmp"):
+        candidates.extend([tmpdir / base_name, tmpdir / suffixed_name])
+    var_tmp = Path("/var/tmp")
+    candidates.extend([var_tmp / base_name, var_tmp / suffixed_name])
+    if checkout.parent != checkout:
+        candidates.extend([checkout.parent / base_name, checkout.parent / suffixed_name])
+    try:
+        home_cache = Path.home() / ".cache"
+        candidates.extend([home_cache / base_name, home_cache / suffixed_name])
+    except RuntimeError:
+        pass
+
+    for candidate in candidates:
+        if _dir_is_writable(candidate.parent) and _is_disjoint_cache_dir(candidate, checkout, uid):
+            return os.fspath(candidate)
+    for candidate in candidates:
+        if _is_disjoint_cache_dir(candidate, checkout, uid):
+            return os.fspath(candidate)
+    return os.fspath(Path("/var/tmp") / suffixed_name)
+
 # Sentinel distinguishing "caller omitted `effective_ram_mib`" from an explicit
 # `None` (representing an unreadable `/proc` / cgroup probe).
 _RAM_UNSET: object = object()
@@ -6071,12 +6257,16 @@ def _build_step_env(
     effective_ram_mib: int | None | object = _RAM_UNSET,
     cmd: list[str] | None = None,
     cwd: Path | None = None,
+    isolated_runtime_dir: Path | None = None,
 ) -> dict[str, str]:
     """Build an isolated subprocess environment for suite step `step_name`.
 
     - Always populates toolchain dirs on `PATH` without mutating `os.environ`.
     - Always sets `LAKE_ARTIFACT_CACHE=true` and `LAKE_RESTORE_ARTIFACTS=true`
       so Lake 4.34.1 restores cached `.olean`s into workspace build dirs.
+    - For `PYTHON_UNIT_TEST_STEPS`, sets `XDG_RUNTIME_DIR` to `isolated_runtime_dir`
+      when provided, or scrubs any inherited host `XDG_RUNTIME_DIR` when omitted
+      (unless `env_overrides` explicitly supplies `XDG_RUNTIME_DIR`).
     - For each `LOW_RAM_SINGLE_THREAD_STEPS` step (`lake_build_minirust_spec_core`,
       `lake_build_minirust_spec`, `lake_build_lean_miri_spec_core`, and
       `lake_build_lean_miri_spec`), injects `LEAN_NUM_THREADS=1` whenever the
@@ -6090,6 +6280,13 @@ def _build_step_env(
     env = dict(os.environ if base_env is None else base_env)
     _ensure_toolchain_path(env, use_ambient_home=base_env is None)
     env.update(LAKE_ARTIFACT_CACHE_ENV)
+    if step_name in PYTHON_UNIT_TEST_STEPS:
+        if isolated_runtime_dir is not None:
+            env["XDG_RUNTIME_DIR"] = os.fspath(isolated_runtime_dir)
+        else:
+            env.pop("XDG_RUNTIME_DIR", None)
+    elif isolated_runtime_dir is not None:
+        env["XDG_RUNTIME_DIR"] = os.fspath(isolated_runtime_dir)
     if step_name in LOW_RAM_SINGLE_THREAD_STEPS and not (
         env_overrides is not None and "LEAN_NUM_THREADS" in env_overrides
     ):
@@ -6756,7 +6953,7 @@ def _run_step(
     cmd: list[str],
     cwd: Path,
     timeout_sec: int = 900,
-    env_overrides: dict[str, str] | None = None,
+    env_overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     t0 = time.monotonic()
     if not cmd:
@@ -6770,50 +6967,67 @@ def _run_step(
             "audit_tags": [],
             "failure_excerpt": "Failed to launch <empty>: empty command",
         }
-    env = _build_step_env(name, env_overrides=env_overrides, cmd=cmd, cwd=cwd)
-    outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
-    timed_out = False
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            start_new_session=True,
+    need_isolated_py_rt = name in PYTHON_UNIT_TEST_STEPS and not (
+        env_overrides is not None and "XDG_RUNTIME_DIR" in env_overrides
+    )
+    with contextlib.ExitStack() as stack:
+        isolated_rt: Path | None = None
+        if need_isolated_py_rt:
+            py_rt_dir = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="anneal-suite-py-rt-")
+            )
+            os.chmod(py_rt_dir, 0o700)
+            isolated_rt = Path(py_rt_dir)
+        env = _build_step_env(
+            name,
+            env_overrides=env_overrides,
+            cmd=cmd,
+            cwd=cwd,
+            isolated_runtime_dir=isolated_rt,
         )
-    except (OSError, ValueError) as exc:
-        return {
-            "name": name,
-            "category": category,
-            "status": "FAIL",
-            "exit_code": 127,
-            "duration_sec": round(time.monotonic() - t0, 2),
-            "command": " ".join(cmd),
-            "audit_tags": [],
-            "failure_excerpt": f"Failed to launch {cmd[0] if cmd else '<empty>'}: {exc}",
-        }
-    try:
+        outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
+        timed_out = False
         try:
-            out, err = proc.communicate(timeout=outer_timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_step(proc)
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            return {
+                "name": name,
+                "category": category,
+                "status": "FAIL",
+                "exit_code": 127,
+                "duration_sec": round(time.monotonic() - t0, 2),
+                "command": " ".join(cmd),
+                "audit_tags": [],
+                "failure_excerpt": f"Failed to launch {cmd[0] if cmd else '<empty>'}: {exc}",
+            }
+        try:
             try:
-                out, err = proc.communicate(timeout=STEP_PIPE_DRAIN_SEC)
-            except subprocess.TimeoutExpired as drain_exc:
-                # An escaped descendant still holds the pipes open: keep what was read.
-                out, err = _as_text(drain_exc.output), _as_text(drain_exc.stderr)
-                for stream in (proc.stdout, proc.stderr):
-                    if stream is not None:
-                        stream.close()
-    except BaseException:
-        # Ctrl-C / SystemExit: never leave the detached step group running.
-        _terminate_step(proc)
-        raise
+                out, err = proc.communicate(timeout=outer_timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _terminate_step(proc)
+                try:
+                    out, err = proc.communicate(timeout=STEP_PIPE_DRAIN_SEC)
+                except subprocess.TimeoutExpired as drain_exc:
+                    # An escaped descendant still holds the pipes open: keep what was read.
+                    out, err = _as_text(drain_exc.output), _as_text(drain_exc.stderr)
+                    for stream in (proc.stdout, proc.stderr):
+                        if stream is not None:
+                            stream.close()
+        except BaseException:
+            # Ctrl-C / SystemExit: never leave the detached step group running.
+            _terminate_step(proc)
+            raise
     elapsed = round(time.monotonic() - t0, 2)
     out, err = _as_text(out), _as_text(err)
     combined_out = (out + "\n" + err).strip()
@@ -7067,8 +7281,15 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
         add(
             "check_trusted_fast",
             "cat1_trusted_boundary",
-            [sys.executable, "-B", "trusted/audit/check_trusted.py", "--fast"],
-            600,
+            [
+                sys.executable,
+                "-B",
+                "trusted/audit/check_trusted.py",
+                "--fast",
+                "--cache-dir",
+                resolve_check_trusted_cache_dir(repo_root),
+            ],
+            1200,
             wrap="build",
         )
         add(
@@ -7078,10 +7299,22 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             120,
         )
         add(
-            "scripts_python_unit_tests",
+            "scripts_python_unit_tests_core",
             "cat7_python_and_ci_tests",
-            [sys.executable, "-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"],
-            180,
+            [sys.executable, "-B", "-m", "unittest", *SCRIPTS_PYTHON_UNIT_TESTS_CORE],
+            300,
+        )
+        add(
+            "scripts_python_unit_tests_campaign_and_guards",
+            "cat7_python_and_ci_tests",
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "unittest",
+                *scripts_campaign_and_guard_test_files(repo_root),
+            ],
+            300,
         )
         add(
             "anneal_lsp_python_unit_tests",
@@ -7281,15 +7514,13 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             300,
             wrap="build",
         )
-        # Measures ~575 s warm on a 96-core host across `--lib`, `campaign_orchestrator`,
-        # `itree_difftest_oracle`, and `miri_difftest_oracle` (after preserving
-        # `anneal-trace` staging artifacts, narrowing ITree Lean imports to
-        # `TraceCheck`, and serializing Miri sysroot setup). `itree_difftest_oracle`
-        # alone is ~350 s and mostly serial (13 min CPU over 6 min wall: one staging
-        # slot, one `lake env lean` worker), so extra cores barely help it; 1500 s
-        # keeps ~2.5x headroom for slower hosts.
+        # Split `crates/anneal-difftest` so `miri_difftest_oracle` has its own dedicated
+        # 1200 s budget instead of starving behind `itree_difftest_oracle` (~350 s mostly
+        # serial). Together the two steps cover 100% of `--lib`, `--bins`, and every
+        # integration test target under `crates/anneal-difftest/tests/`.
+        non_miri_difftest_targets = anneal_difftest_non_miri_test_targets(repo_root)
         add(
-            "domain_integration_tests_anneal_difftest",
+            "domain_integration_tests_anneal_difftest_unit_and_itree",
             "cat4_rust_domain_integration_tests",
             [
                 "cargo",
@@ -7298,10 +7529,25 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
                 "crates/anneal-difftest/Cargo.toml",
                 "--lib",
                 "--bins",
-                "--tests",
+                *(arg for target in non_miri_difftest_targets for arg in ("--test", target)),
                 "--locked",
             ],
-            1500,
+            1200,
+            wrap="build",
+        )
+        add(
+            "domain_integration_tests_anneal_difftest_miri",
+            "cat4_rust_domain_integration_tests",
+            [
+                "cargo",
+                "test",
+                "--manifest-path",
+                "crates/anneal-difftest/Cargo.toml",
+                "--test",
+                ANNEAL_DIFFTEST_MIRI_TEST_TARGET,
+                "--locked",
+            ],
+            1200,
             wrap="build",
         )
         add(

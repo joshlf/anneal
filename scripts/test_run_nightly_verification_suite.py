@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -543,7 +544,8 @@ def _write_fake_lean_run(path: Path, **kwargs: Any) -> Path:
 class NightlyVerificationSuiteTests(unittest.TestCase):
     # Operator knobs read from the ambient environment that change which wrapper the suite
     # resolves or how long it waits for it. The suite runs these tests as one of its own
-    # steps (`scripts_python_unit_tests`), with whatever the operator exported for the run.
+    # steps (`scripts_python_unit_tests_campaign_and_guards`), with whatever the operator
+    # exported for the run.
     _AMBIENT_SUITE_KNOBS = (
         "ANNEAL_LEAN_RUN",
         "ANNEAL_LEAN_TIMEOUT_SEC",
@@ -2866,7 +2868,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertTrue(miri_olean.exists())
 
             # 2. `run_suite_and_generate_dashboard` records the new steps and reconciled 90/94
-            #    MIR matrix in both JSON and Markdown outputs for `quick` (12) and `nightly` (31).
+            #    MIR matrix in both JSON and Markdown outputs for `quick` (13) and `nightly` (33).
             #    Stub Stage B corpus scanning and divergence discovery (covered by their own
             #    end-to-end tests) so running both profiles stays fast while Stage A, step
             #    planning, Markdown rendering, and JSON persistence remain real.
@@ -2899,12 +2901,26 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             }
             stub_divs = {"actionable_anneal_bugs_count": 0, "actionable_anneal_bugs": []}
             for profile, expected_count, required_order in (
-                ("quick", 12, ("lake_build_core_theory", "lake_build_examples_trusted", "rust_workspace_unit_tests")),
                 (
-                    "nightly",
-                    31,
+                    "quick",
+                    13,
                     (
                         "lake_build_core_theory",
+                        "check_trusted_fast",
+                        "scripts_python_unit_tests_core",
+                        "scripts_python_unit_tests_campaign_and_guards",
+                        "lake_build_examples_trusted",
+                        "rust_workspace_unit_tests",
+                    ),
+                ),
+                (
+                    "nightly",
+                    33,
+                    (
+                        "lake_build_core_theory",
+                        "check_trusted_fast",
+                        "scripts_python_unit_tests_core",
+                        "scripts_python_unit_tests_campaign_and_guards",
                         "lake_build_examples_trusted",
                         "rust_workspace_unit_tests",
                         "lake_build_correspondence",
@@ -2913,6 +2929,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                         "lake_build_examples_miri_vendor",
                         "lake_build_lean_miri_spec_core",
                         "lake_build_lean_miri_spec",
+                        "domain_integration_tests_anneal_difftest_unit_and_itree",
+                        "domain_integration_tests_anneal_difftest_miri",
                     ),
                 ),
             ):
@@ -2993,7 +3011,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         }
         expected_timeouts = {
             "lake_build_core_theory": 900,
-            "check_trusted_fast": 600,
+            "check_trusted_fast": 1200,
             "lake_build_examples_trusted": 600,
             "rust_workspace_unit_tests": 600,
             "check_trusted_self_test": 1500,
@@ -3009,7 +3027,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "lake_build_examples_miri_vendor": 900,
             "lake_build_lean_miri_spec_core": 1200,
             "lake_build_lean_miri_spec": 1800,
-            "domain_integration_tests_anneal_difftest": 1500,
+            "domain_integration_tests_anneal_difftest_unit_and_itree": 1200,
+            "domain_integration_tests_anneal_difftest_miri": 1200,
             "cargo_anneal_e2e_minirust_correspondence": 600,
             "cargo_anneal_e2e_pipeline_and_adoption": 900,
         }
@@ -6952,8 +6971,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             canonical_wrapped = {
                 name for name, (cmd, _t) in canonical.items() if Path(cmd[0]).name == "anneal-lean-run"
             }
-            self.assertEqual(len(canonical), 31)
-            self.assertEqual(len(canonical_wrapped), 23)
+            self.assertEqual(len(canonical), 33)
+            self.assertEqual(len(canonical_wrapped), 24)
 
             with mock.patch.dict(os.environ, {"ANNEAL_LEAN_RUN": os.fspath(renamed), "LEAN_NUM_THREADS": "7"}):
                 steps = suite.build_suite_steps(REPO_ROOT, "nightly")
@@ -7568,41 +7587,500 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
 
     def test_domain_integration_tests_anneal_difftest_config_and_timeout_invariants(self) -> None:
         nightly_steps = suite.build_suite_steps(REPO_ROOT, "nightly")
-        self.assertEqual(len(nightly_steps), 31)
+        self.assertEqual(len(nightly_steps), 33)
         for step in nightly_steps:
             self.assertEqual(len(step), 4)
         by_name = {name: (cat, cmd, timeout) for name, cat, cmd, timeout in nightly_steps}
-        self.assertIn("domain_integration_tests_anneal_difftest", by_name)
-        cat, cmd, timeout = by_name["domain_integration_tests_anneal_difftest"]
-        self.assertEqual(cat, "cat4_rust_domain_integration_tests")
-        self.assertEqual(timeout, 1500)
-        self.assertTrue(suite._is_lean_run_wrapped(cmd))
-        mode, inner_timeout, slot_lock = suite._lean_run_wrapper_flags(cmd)
-        self.assertEqual(mode, "build")
-        self.assertEqual(inner_timeout, timeout)
-        self.assertTrue(slot_lock)
-        sep = cmd.index("--")
-        self.assertEqual(
-            cmd[sep + 1 :],
-            [
+        self.assertNotIn("domain_integration_tests_anneal_difftest", by_name)
+
+        expected_non_miri = [
+            "campaign_orchestrator",
+            "generation_and_honesty",
+            "itree_difftest_oracle",
+            "parse_frame_benchmark",
+            "rustc_end_to_end",
+            "vtable_fnptr_mutator_tests",
+        ]
+        expected_steps = {
+            "domain_integration_tests_anneal_difftest_unit_and_itree": [
                 "cargo",
                 "test",
                 "--manifest-path",
                 "crates/anneal-difftest/Cargo.toml",
                 "--lib",
                 "--bins",
-                "--tests",
+                *(arg for target in expected_non_miri for arg in ("--test", target)),
                 "--locked",
             ],
-        )
-        outer_timeout = suite._outer_timeout_sec(cmd, timeout)
-        self.assertGreater(outer_timeout, timeout)
-        # Step env always receives Lake artifact-cache restoration defaults and never leaks into os.environ.
+            "domain_integration_tests_anneal_difftest_miri": [
+                "cargo",
+                "test",
+                "--manifest-path",
+                "crates/anneal-difftest/Cargo.toml",
+                "--test",
+                "miri_difftest_oracle",
+                "--locked",
+            ],
+        }
         before_env = os.environ.copy()
-        step_env = suite._build_step_env("domain_integration_tests_anneal_difftest")
-        self.assertEqual(step_env["LAKE_ARTIFACT_CACHE"], "true")
-        self.assertEqual(step_env["LAKE_RESTORE_ARTIFACTS"], "true")
+        for step_name, expected_inner in expected_steps.items():
+            self.assertIn(step_name, by_name)
+            cat, cmd, timeout = by_name[step_name]
+            self.assertEqual(cat, "cat4_rust_domain_integration_tests", step_name)
+            self.assertEqual(timeout, 1200, step_name)
+            self.assertTrue(suite._is_lean_run_wrapped(cmd), step_name)
+            mode, inner_timeout, slot_lock = suite._lean_run_wrapper_flags(cmd)
+            self.assertEqual(mode, "build", step_name)
+            self.assertEqual(inner_timeout, timeout, step_name)
+            self.assertTrue(slot_lock, step_name)
+            self.assertEqual(self._inner_cmd(cmd), expected_inner, step_name)
+            outer_timeout = suite._outer_timeout_sec(cmd, timeout)
+            self.assertGreater(outer_timeout, timeout, step_name)
+            step_env = suite._build_step_env(step_name)
+            self.assertEqual(step_env["LAKE_ARTIFACT_CACHE"], "true", step_name)
+            self.assertEqual(step_env["LAKE_RESTORE_ARTIFACTS"], "true", step_name)
+            self.assertNotIn(step_name, suite.LOW_RAM_SINGLE_THREAD_STEPS)
         self.assertEqual(os.environ, before_env)
+
+        # Split steps are absent from `census-only` and `quick`, and together cover 100%
+        # of `crates/anneal-difftest/tests/*.rs` with zero orphaned targets.
+        for profile in ("census-only", "quick"):
+            names = [s[0] for s in suite.build_suite_steps(REPO_ROOT, profile)]
+            self.assertNotIn("domain_integration_tests_anneal_difftest", names)
+            self.assertNotIn("domain_integration_tests_anneal_difftest_unit_and_itree", names)
+            self.assertNotIn("domain_integration_tests_anneal_difftest_miri", names)
+
+        repo_difftest_targets = sorted(
+            p.stem for p in (REPO_ROOT / "crates/anneal-difftest/tests").glob("*.rs") if p.is_file()
+        )
+        covered_targets = sorted(
+            [*suite.anneal_difftest_non_miri_test_targets(REPO_ROOT), suite.ANNEAL_DIFFTEST_MIRI_TEST_TARGET]
+        )
+        self.assertEqual(covered_targets, repo_difftest_targets)
+        self.assertNotIn(
+            suite.ANNEAL_DIFFTEST_MIRI_TEST_TARGET,
+            suite.anneal_difftest_non_miri_test_targets(REPO_ROOT),
+        )
+        self.assertIn("parse_frame_benchmark", suite.anneal_difftest_non_miri_test_targets(REPO_ROOT))
+        self.assertIn("rustc_end_to_end", suite.anneal_difftest_non_miri_test_targets(REPO_ROOT))
+
+        # Dynamic discovery & fallback on synthetic repositories.
+        with tempfile.TemporaryDirectory(prefix="anneal-difftest-disc-") as tmp:
+            synth = Path(tmp)
+            # Absent `tests/` falls back deterministically to the canonical 6 targets.
+            self.assertEqual(
+                suite.anneal_difftest_non_miri_test_targets(synth),
+                list(suite._ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK),
+            )
+            tests_dir = synth / "crates/anneal-difftest/tests"
+            tests_dir.mkdir(parents=True)
+            # Empty `tests/` also falls back deterministically.
+            self.assertEqual(
+                suite.anneal_difftest_non_miri_test_targets(synth),
+                list(suite._ANNEAL_DIFFTEST_NON_MIRI_TESTS_FALLBACK),
+            )
+            for fname in (
+                "campaign_orchestrator.rs",
+                "miri_difftest_oracle.rs",
+                "z_future_oracle.rs",
+                ".hidden_test.rs",
+                "-flag_injection.rs",
+            ):
+                (tests_dir / fname).write_text("fn main() {}\n", encoding="utf-8")
+            # Subdirectory with `main.rs` IS a Cargo integration test; helper `common/mod.rs` is NOT.
+            (tests_dir / "sub_oracle").mkdir()
+            (tests_dir / "sub_oracle/main.rs").write_text("fn main() {}\n", encoding="utf-8")
+            (tests_dir / "common").mkdir()
+            (tests_dir / "common/mod.rs").write_text("pub fn helper() {}\n", encoding="utf-8")
+            # Directory ending in `.rs` without `main.rs` and symlinks are skipped.
+            (tests_dir / "dir_named_rs.rs").mkdir()
+            (tests_dir / "symlink_test.rs").symlink_to(tests_dir / "z_future_oracle.rs")
+
+            discovered = suite.anneal_difftest_non_miri_test_targets(synth)
+            self.assertEqual(discovered, ["campaign_orchestrator", "sub_oracle", "z_future_oracle"])
+            synth_nightly = {
+                name: cmd for name, _c, cmd, _t in suite.build_suite_steps(synth, "nightly")
+            }
+            inner = self._inner_cmd(
+                synth_nightly["domain_integration_tests_anneal_difftest_unit_and_itree"]
+            )
+            self.assertEqual(
+                inner,
+                [
+                    "cargo",
+                    "test",
+                    "--manifest-path",
+                    "crates/anneal-difftest/Cargo.toml",
+                    "--lib",
+                    "--bins",
+                    "--test",
+                    "campaign_orchestrator",
+                    "--test",
+                    "sub_oracle",
+                    "--test",
+                    "z_future_oracle",
+                    "--locked",
+                ],
+            )
+
+    def test_scripts_python_unit_tests_sharding_and_dynamic_discovery(self) -> None:
+        self.assertNotIn(
+            "scripts_python_unit_tests",
+            [s[0] for s in suite.build_suite_steps(REPO_ROOT, "census-only")],
+        )
+        for profile in ("quick", "nightly"):
+            steps = suite.build_suite_steps(REPO_ROOT, profile)
+            by_name = {name: (cat, cmd, timeout) for name, cat, cmd, timeout in steps}
+            self.assertNotIn("scripts_python_unit_tests", by_name, profile)
+            self.assertIn("scripts_python_unit_tests_core", by_name, profile)
+            self.assertIn("scripts_python_unit_tests_campaign_and_guards", by_name, profile)
+
+            core_cat, core_cmd, core_timeout = by_name["scripts_python_unit_tests_core"]
+            self.assertEqual(core_cat, "cat7_python_and_ci_tests", profile)
+            self.assertEqual(core_timeout, 300, profile)
+            self.assertFalse(suite._is_lean_run_wrapped(core_cmd), profile)
+            self.assertEqual(
+                core_cmd,
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "unittest",
+                    "scripts/test_anneal_lean_run.py",
+                    "scripts/test_audit_mir_coverage_matrix.py",
+                    "scripts/test_receipt_claim_guard.py",
+                ],
+                profile,
+            )
+
+            camp_cat, camp_cmd, camp_timeout = by_name["scripts_python_unit_tests_campaign_and_guards"]
+            self.assertEqual(camp_cat, "cat7_python_and_ci_tests", profile)
+            self.assertEqual(camp_timeout, 300, profile)
+            self.assertFalse(suite._is_lean_run_wrapped(camp_cmd), profile)
+            self.assertEqual(
+                camp_cmd,
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "unittest",
+                    "scripts/test_run_diff_test_campaign.py",
+                    "scripts/test_run_nightly_verification_suite.py",
+                    "scripts/test_check_mir_guard_mutation.py",
+                ],
+                profile,
+            )
+
+            # 100% disjoint union coverage of `REPO_ROOT / "scripts/test_*.py"`.
+            core_files = core_cmd[4:]
+            camp_files = camp_cmd[4:]
+            self.assertEqual(set(core_files) & set(camp_files), set())
+            repo_test_files = sorted(
+                f"scripts/{p.name}"
+                for p in (REPO_ROOT / "scripts").glob("test_*.py")
+                if p.is_file() and not p.is_symlink()
+            )
+            self.assertEqual(sorted([*core_files, *camp_files]), repo_test_files)
+
+        # Synthetic repo: fallback when `scripts/` absent; dynamic pickup of new regular test files;
+        # rejection of symlinks, directories, and non-identifier filenames.
+        with tempfile.TemporaryDirectory(prefix="anneal-py-shard-") as tmp:
+            synth = Path(tmp)
+            self.assertEqual(
+                suite.scripts_campaign_and_guard_test_files(synth),
+                [
+                    "scripts/test_run_diff_test_campaign.py",
+                    "scripts/test_run_nightly_verification_suite.py",
+                    "scripts/test_check_mir_guard_mutation.py",
+                ],
+            )
+            scripts_dir = synth / "scripts"
+            scripts_dir.mkdir()
+            (scripts_dir / "test_anneal_lean_run.py").write_text("", encoding="utf-8")
+            (scripts_dir / "test_future_extra.py").write_text("", encoding="utf-8")
+            (scripts_dir / "test_alpha_extra.py").write_text("", encoding="utf-8")
+            (scripts_dir / "test_bad-name.py").write_text("", encoding="utf-8")
+            (scripts_dir / "test_dir.py").mkdir()
+            (scripts_dir / "test_symlink.py").symlink_to(scripts_dir / "test_future_extra.py")
+            (scripts_dir / "helper.py").write_text("", encoding="utf-8")
+
+            discovered = suite.scripts_campaign_and_guard_test_files(synth)
+            self.assertEqual(
+                discovered,
+                [
+                    "scripts/test_run_diff_test_campaign.py",
+                    "scripts/test_run_nightly_verification_suite.py",
+                    "scripts/test_check_mir_guard_mutation.py",
+                    "scripts/test_alpha_extra.py",
+                    "scripts/test_future_extra.py",
+                ],
+            )
+            synth_quick = {
+                name: cmd for name, _c, cmd, _t in suite.build_suite_steps(synth, "quick")
+            }
+            self.assertEqual(
+                synth_quick["scripts_python_unit_tests_campaign_and_guards"],
+                [sys.executable, "-B", "-m", "unittest", *discovered],
+            )
+
+    def test_python_unit_test_steps_isolate_and_clean_up_xdg_runtime_dir(self) -> None:
+        self.assertEqual(
+            suite.PYTHON_UNIT_TEST_STEPS,
+            frozenset(
+                (
+                    "ci_python_unit_tests",
+                    "scripts_python_unit_tests_core",
+                    "scripts_python_unit_tests_campaign_and_guards",
+                    "anneal_lsp_python_unit_tests",
+                )
+            ),
+        )
+        # Direct `_build_step_env`: scrubs inherited host `XDG_RUNTIME_DIR` for Python unit
+        # test steps when `isolated_runtime_dir` is omitted, honors `isolated_runtime_dir`,
+        # preserves host `XDG_RUNTIME_DIR` for non-Python steps, and lets `env_overrides` win.
+        ambient = {"PATH": "/usr/bin", "XDG_RUNTIME_DIR": "/run/user/99999"}
+        for py_step in sorted(suite.PYTHON_UNIT_TEST_STEPS):
+            scrubbed = suite._build_step_env(py_step, base_env=ambient)
+            self.assertNotIn("XDG_RUNTIME_DIR", scrubbed, py_step)
+            isolated = suite._build_step_env(
+                py_step, base_env=ambient, isolated_runtime_dir=Path("/tmp/fake-py-rt")
+            )
+            self.assertEqual(isolated["XDG_RUNTIME_DIR"], "/tmp/fake-py-rt", py_step)
+            overridden = suite._build_step_env(
+                py_step,
+                base_env=ambient,
+                isolated_runtime_dir=Path("/tmp/fake-py-rt"),
+                env_overrides={"XDG_RUNTIME_DIR": "/custom/rt"},
+            )
+            self.assertEqual(overridden["XDG_RUNTIME_DIR"], "/custom/rt", py_step)
+            empty_override = suite._build_step_env(
+                py_step,
+                base_env=ambient,
+                isolated_runtime_dir=Path("/tmp/fake-py-rt"),
+                env_overrides={"XDG_RUNTIME_DIR": ""},
+            )
+            self.assertEqual(empty_override["XDG_RUNTIME_DIR"], "", py_step)
+
+        non_py_env = suite._build_step_env("lake_build_core_theory", base_env=ambient)
+        self.assertEqual(non_py_env["XDG_RUNTIME_DIR"], "/run/user/99999")
+        self.assertEqual(ambient["XDG_RUNTIME_DIR"], "/run/user/99999")
+
+        # End-to-end `_run_step`: private `0700` `XDG_RUNTIME_DIR` created, passed to child,
+        # never leaks host `XDG_RUNTIME_DIR`, and cleaned up on PASS, FAIL, TIMEOUT, and
+        # Popen launch failure; explicit `env_overrides={"XDG_RUNTIME_DIR": ...}` wins.
+        with tempfile.TemporaryDirectory(prefix="anneal-suite-rt-test-") as tmp:
+            root = Path(tmp)
+            ambient_rt = root / "host_rt"
+            ambient_rt.mkdir()
+            report_file = root / "rt_report.json"
+            inspect_code = (
+                "import json, os, pathlib, stat, sys; "
+                "rt = os.environ.get('XDG_RUNTIME_DIR'); "
+                "p = pathlib.Path(rt) if rt else None; "
+                f"pathlib.Path({str(report_file)!r}).write_text(json.dumps({{"
+                "'rt': rt, "
+                "'exists': bool(p and p.is_dir()), "
+                "'mode': stat.S_IMODE(p.stat().st_mode) if (p and p.exists()) else None"
+                "}), encoding='utf-8'); "
+                "sys.exit(int(sys.argv[1]))"
+            )
+            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(ambient_rt)}):
+                # PASS path for all 4 Python unit test steps.
+                for py_step in sorted(suite.PYTHON_UNIT_TEST_STEPS):
+                    res = suite._run_step(
+                        py_step,
+                        "cat7_python_and_ci_tests",
+                        [sys.executable, "-c", inspect_code, "0"],
+                        cwd=root,
+                        timeout_sec=30,
+                    )
+                    self.assertEqual(res["status"], "PASS", (py_step, res))
+                    info = json.loads(report_file.read_text(encoding="utf-8"))
+                    self.assertTrue(info["exists"], (py_step, info))
+                    self.assertEqual(info["mode"], 0o700, (py_step, info))
+                    rt_path = Path(info["rt"])
+                    self.assertTrue(rt_path.name.startswith("anneal-suite-py-rt-"), rt_path)
+                    self.assertNotEqual(rt_path.resolve(), ambient_rt.resolve())
+                    self.assertFalse(rt_path.exists(), f"temp rt dir leaked on PASS: {rt_path}")
+
+                # FAIL path cleans up temp dir.
+                fail_res = suite._run_step(
+                    "scripts_python_unit_tests_core",
+                    "cat7_python_and_ci_tests",
+                    [sys.executable, "-c", inspect_code, "1"],
+                    cwd=root,
+                    timeout_sec=30,
+                )
+                self.assertEqual(fail_res["status"], "FAIL")
+                fail_rt = Path(json.loads(report_file.read_text(encoding="utf-8"))["rt"])
+                self.assertFalse(fail_rt.exists(), f"temp rt dir leaked on FAIL: {fail_rt}")
+
+                # TIMEOUT path cleans up temp dir.
+                timeout_code = (
+                    "import json, os, pathlib, time; "
+                    f"pathlib.Path({str(report_file)!r}).write_text("
+                    "json.dumps({'rt': os.environ.get('XDG_RUNTIME_DIR')}), encoding='utf-8'); "
+                    "time.sleep(30)"
+                )
+                timeout_res = suite._run_step(
+                    "scripts_python_unit_tests_campaign_and_guards",
+                    "cat7_python_and_ci_tests",
+                    [sys.executable, "-c", timeout_code],
+                    cwd=root,
+                    timeout_sec=1,
+                )
+                self.assertEqual(timeout_res["status"], "TIMEOUT")
+                timeout_rt = Path(json.loads(report_file.read_text(encoding="utf-8"))["rt"])
+                self.assertTrue(timeout_rt.name.startswith("anneal-suite-py-rt-"))
+                self.assertFalse(timeout_rt.exists(), f"temp rt dir leaked on TIMEOUT: {timeout_rt}")
+
+                # Popen launch failure cleans up temp dir.
+                seen_popen_rt: list[Path] = []
+
+                def failing_popen(*_args: Any, **kwargs: Any) -> Any:
+                    rt = Path(kwargs["env"]["XDG_RUNTIME_DIR"])
+                    self.assertTrue(rt.is_dir())
+                    self.assertEqual(stat.S_IMODE(rt.stat().st_mode), 0o700)
+                    seen_popen_rt.append(rt)
+                    raise FileNotFoundError("no such binary")
+
+                with mock.patch.object(suite.subprocess, "Popen", side_effect=failing_popen):
+                    err_res = suite._run_step(
+                        "ci_python_unit_tests",
+                        "cat7_python_and_ci_tests",
+                        ["/nonexistent/binary"],
+                        cwd=root,
+                        timeout_sec=10,
+                    )
+                self.assertEqual(err_res["status"], "FAIL")
+                self.assertEqual(err_res["exit_code"], 127)
+                self.assertEqual(len(seen_popen_rt), 1)
+                self.assertFalse(
+                    seen_popen_rt[0].exists(),
+                    f"temp rt dir leaked on Popen error: {seen_popen_rt[0]}",
+                )
+
+                # Explicit `env_overrides={"XDG_RUNTIME_DIR": ...}` wins and skips temp allocation.
+                custom_rt = root / "custom_rt"
+                custom_rt.mkdir()
+                os.chmod(custom_rt, 0o700)
+                with mock.patch.object(
+                    suite.tempfile, "TemporaryDirectory", side_effect=AssertionError("should not allocate")
+                ):
+                    ovr_res = suite._run_step(
+                        "scripts_python_unit_tests_core",
+                        "cat7_python_and_ci_tests",
+                        [sys.executable, "-c", inspect_code, "0"],
+                        cwd=root,
+                        timeout_sec=30,
+                        env_overrides={"XDG_RUNTIME_DIR": str(custom_rt)},
+                    )
+                self.assertEqual(ovr_res["status"], "PASS", ovr_res)
+                self.assertEqual(
+                    json.loads(report_file.read_text(encoding="utf-8"))["rt"],
+                    str(custom_rt),
+                )
+                self.assertTrue(custom_rt.is_dir())
+
+    def test_check_trusted_fast_timeout_and_out_of_checkout_cache_dir(self) -> None:
+        self.assertNotIn(
+            "check_trusted_fast",
+            [s[0] for s in suite.build_suite_steps(REPO_ROOT, "census-only")],
+        )
+        uid = os.getuid()
+        expected_default = f"/tmp/anneal-trusted-cache-nightly-{uid}"
+        for profile in ("quick", "nightly"):
+            steps = suite.build_suite_steps(REPO_ROOT, profile)
+            by_name = {name: (cat, cmd, timeout) for name, cat, cmd, timeout in steps}
+            self.assertIn("check_trusted_fast", by_name, profile)
+            cat, cmd, timeout = by_name["check_trusted_fast"]
+            self.assertEqual(cat, "cat1_trusted_boundary", profile)
+            self.assertEqual(timeout, 1200, profile)
+            self.assertTrue(suite._is_lean_run_wrapped(cmd), profile)
+            self.assertEqual(suite._lean_run_wrapper_flags(cmd), ("build", 1200, True), profile)
+            inner = self._inner_cmd(cmd)
+            self.assertEqual(
+                inner[:5],
+                [sys.executable, "-B", "trusted/audit/check_trusted.py", "--fast", "--cache-dir"],
+                profile,
+            )
+            self.assertEqual(len(inner), 6, profile)
+            cache_dir = inner[5]
+            self.assertTrue(cache_dir.startswith("/tmp/anneal-trusted-cache-nightly"), cache_dir)
+            if not (Path(expected_default).is_symlink() or (Path(expected_default).exists() and not Path(expected_default).is_dir())):
+                self.assertEqual(cache_dir, expected_default)
+            resolved_cache = Path(cache_dir).resolve()
+            resolved_repo = REPO_ROOT.resolve()
+            self.assertNotEqual(resolved_cache, resolved_repo)
+            self.assertNotIn(resolved_repo, resolved_cache.parents)
+            self.assertNotIn(resolved_cache, resolved_repo.parents)
+
+        # Deterministic across calls and strictly outside `repo_root.resolve()` even when
+        # `repo_root` lives inside `/tmp`, IS `/tmp`, is a symlink to `/tmp`, collides with
+        # the primary cache dir itself, or has `TMPDIR` pointing inside `repo_root`.
+        with tempfile.TemporaryDirectory(prefix="anneal-ct-cache-") as tmp:
+            tmp_root = Path(tmp)
+            tmp_checkout = tmp_root / "repo"
+            tmp_checkout.mkdir()
+            c_in_tmp = suite.resolve_check_trusted_cache_dir(tmp_checkout)
+            self.assertEqual(c_in_tmp, suite.resolve_check_trusted_cache_dir(tmp_checkout))
+            self.assertNotEqual(Path(c_in_tmp).resolve(), tmp_checkout.resolve())
+            self.assertNotIn(tmp_checkout.resolve(), Path(c_in_tmp).resolve().parents)
+
+            # `repo_root` IS `/tmp` (and via a symlink to `/tmp`) -> must still reside outside `/tmp`.
+            link_to_tmp = tmp_root / "link_to_tmp"
+            link_to_tmp.symlink_to("/tmp")
+            for root_as_tmp in (Path("/tmp"), link_to_tmp):
+                c_tmp = suite.resolve_check_trusted_cache_dir(root_as_tmp)
+                resolved_c = Path(c_tmp).resolve()
+                resolved_t = root_as_tmp.resolve()
+                self.assertNotEqual(resolved_c, resolved_t, root_as_tmp)
+                self.assertNotIn(resolved_t, resolved_c.parents, root_as_tmp)
+                self.assertNotIn(resolved_c, resolved_t.parents, root_as_tmp)
+                self.assertIn("anneal-trusted-cache-nightly-", Path(c_tmp).name)
+
+            # `repo_root` collides with primary `/tmp/anneal-trusted-cache-nightly-<uid>`
+            # (or sits inside it) -> falls back deterministically to a disjoint sibling.
+            for colliding_root in (Path(expected_default), Path(expected_default) / "nested"):
+                c_col = suite.resolve_check_trusted_cache_dir(colliding_root)
+                resolved_c = Path(c_col).resolve()
+                resolved_r = colliding_root.resolve()
+                self.assertNotEqual(resolved_c, resolved_r, colliding_root)
+                self.assertNotIn(resolved_r, resolved_c.parents, colliding_root)
+                self.assertNotIn(resolved_c, resolved_r.parents, colliding_root)
+                self.assertTrue(c_col.startswith("/tmp/anneal-trusted-cache-nightly-"), c_col)
+
+            # Poisoned `TMPDIR` pointing inside `repo_root` never places `--cache-dir` inside checkout.
+            inside_tmp = tmp_checkout / "subtmp"
+            inside_tmp.mkdir()
+            with mock.patch.dict(os.environ, {"TMPDIR": str(inside_tmp)}):
+                for test_root in (tmp_checkout, Path("/tmp")):
+                    c_poison = suite.resolve_check_trusted_cache_dir(test_root)
+                    resolved_c = Path(c_poison).resolve()
+                    resolved_r = test_root.resolve()
+                    self.assertNotEqual(resolved_c, resolved_r)
+                    self.assertNotIn(resolved_r, resolved_c.parents)
+                    self.assertNotIn(inside_tmp.resolve(), resolved_c.parents)
+                    self.assertNotEqual(resolved_c, inside_tmp.resolve())
+
+            # Symlinked candidate pointing inside checkout (or non-directory file) is rejected.
+            symlink_candidate = tmp_root / "symlink_cache"
+            symlink_candidate.symlink_to(tmp_checkout)
+            self.assertFalse(
+                suite._is_disjoint_cache_dir(symlink_candidate, tmp_checkout.resolve(), uid)
+            )
+            symlink_outside = tmp_root / "symlink_outside"
+            outside_dir = tmp_root / "outside_target"
+            outside_dir.mkdir()
+            symlink_outside.symlink_to(outside_dir)
+            self.assertFalse(
+                suite._is_disjoint_cache_dir(symlink_outside, tmp_checkout.resolve(), uid)
+            )
+            regular_file = tmp_root / "regular_file"
+            regular_file.write_text("x", encoding="utf-8")
+            self.assertFalse(
+                suite._is_disjoint_cache_dir(regular_file, tmp_checkout.resolve(), uid)
+            )
 
 
 if __name__ == "__main__":
