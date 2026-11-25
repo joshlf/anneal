@@ -2239,6 +2239,11 @@ def upcastDiamondWitnessVTables : List CapturedVTable :=
   mk 3 "A" .none .nil ::
   mk 4 "M" .none .nil :: .nil
 
+/--
+Kernel-checked witness that `resolveUpcastVTable?` walks diamond supertrait
+graphs (`D -> {B, C} -> A`) via both primary-prefix and secondary `traitVPtr`
+chains while rejecting unrelated traits (`M`) and sibling branches (`C -> B`).
+-/
 theorem resolveUpcastVTable?_diamond_witness :
     (match upcastDiamondWitnessVTables with
      | d :: _ :: c :: _ =>

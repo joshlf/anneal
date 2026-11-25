@@ -16155,6 +16155,82 @@ def evalDynToDynUnsize
                 | false => .ub
   | _ => .ub
 
+/--
+Kernel-checked regression witness pinning:
+1. Forged/null vtable metadata on equal-key NOP `evalDynToDynUnsize` (`"Sup" -> "Sup"`)
+   faults `.ub` for both raw pointers and references (`write_immediate` validity);
+2. `dynRefDataValid` enforces stack-local base alignment (`[u8; 32]` align 1 at offset 0
+   is rejected for an align-16 vtable, while `A16` align 16 at offset 0 is accepted);
+3. Trait upcasting (`"Sub" -> "Sup"`) rejects a dangling reference (`.ub`) while
+   permitting a dangling raw pointer (`.ok`, Condition `C2`).
+-/
+theorem evalDynToDynUnsize_nop_and_alignment_witness :
+    (let layByte32 : TypeLayout :=
+       { size := { bytes := 32 }, align := { bytes := 1 }, backendRepr := .memory,
+         fields := .array { bytes := 1 } 32, variants := .single 0, isUninhabited := false }
+     let layA16 : TypeLayout :=
+       { size := { bytes := 16 }, align := { bytes := 16 }, backendRepr := .memory,
+         fields := .arbitrary ({ bytes := 0 } :: .nil) (0 :: .nil),
+         variants := .single 0, isUninhabited := false }
+     let layUnit : TypeLayout :=
+       { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+         fields := .primitive, variants := .single 0, isUninhabited := false }
+     let layouts : LayoutTable :=
+       { pointerBits := 64, isLittleEndian := true,
+         entries := layUnit :: layByte32 :: layA16 :: .nil }
+     let localDecls : List LocalDecl :=
+       { mutability := .not, ty := { kind := .array (.uint .u8) 32, layoutIdx := 1 }, debugName := .none } ::
+       { mutability := .not, ty := { kind := .adt "A16" .nil, layoutIdx := 2 }, debugName := .none } ::
+       { mutability := .not, ty := { kind := .adt "A16" .nil, layoutIdx := 2 }, debugName := .none } :: .nil
+     let locals : List LocalSlot := .init .unit :: .init .unit :: .dead :: .nil
+     let hdrSlots : List CapturedVTableSlot := .dropInPlace .none :: .size :: .align :: .nil
+     let vtSub : CapturedVTable :=
+       { vtableId := 0, vtableAllocId := vtableAllocBase, concreteTy := .adt "A16" .nil,
+         dynKey := "Sub", sizeBytes := 16, alignBytes := 16,
+         primarySuperVTableId? := .some 1, slots := hdrSlots }
+     let vtSup : CapturedVTable :=
+       { vtableId := 1, vtableAllocId := Nat.add vtableAllocBase 1, concreteTy := .adt "A16" .nil,
+         dynKey := "Sup", sizeBytes := 16, alignBytes := 16,
+         primarySuperVTableId? := .none, slots := hdrSlots }
+     let body : CapturedMir :=
+       { defPath := "witness", phase := .runtimePostCleanup, role := .subject,
+         argCount := 0, localDecls := .nil, basicBlocks := .nil,
+         fnAbi := { args := .nil, ret := { layout := layUnit, mode := .ignore },
+                    conv := .rust, canUnwind := false },
+         layouts := layouts, allocations := .nil,
+         vtables := vtSub :: vtSup :: .nil }
+     let borrows : List BorrowEntry :=
+       { tag := 1, targetLocal := 0, targetProjection := .nil, perm := .active } ::
+       { tag := 2, targetLocal := 1, targetProjection := .nil, perm := .active } ::
+       { tag := 3, targetLocal := 2, targetProjection := .nil, perm := .active } :: .nil
+     let mv : DynMemView :=
+       { borrows := borrows, globals := .nil, callerLocals := .nil, callStack := .nil,
+         dynBodies := body :: .nil, fnPtrs := .nil, nextAllocId := 100,
+         activeProtectors := .nil, nextTag := 10 }
+     let dataMisaligned : Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+     let dataAligned : Value := .ptr { allocId := 2, offsetBytes := 0 } 8
+     let dataDangling : Value := .ptr { allocId := 3, offsetBytes := 0 } 8
+     let subVt : Value := .ptr { allocId := vtSub.vtableAllocId, offsetBytes := 0 } 8
+     let forgedVt : Value := .ptr { allocId := 0, offsetBytes := 0 } 8
+     let isUb : DynCheck Value → Bool
+       | .ub => true
+       | _ => false
+     let isOk : DynCheck Value → Bool
+       | .ok _ => true
+       | _ => false
+     (isUb (evalDynToDynUnsize locals mv localDecls layouts
+              (.aggregate 0 (dataAligned :: forgedVt :: .nil)) "Sup" "Sup" false false),
+      isUb (evalDynToDynUnsize locals mv localDecls layouts
+              (.aggregate 0 (dataAligned :: forgedVt :: .nil)) "Sup" "Sup" true false),
+      dynRefDataValid locals mv localDecls layouts 8 dataMisaligned vtSup false true,
+      dynRefDataValid locals mv localDecls layouts 8 dataAligned vtSup false true,
+      isUb (evalDynToDynUnsize locals mv localDecls layouts
+              (.aggregate 0 (dataDangling :: subVt :: .nil)) "Sub" "Sup" true false),
+      isOk (evalDynToDynUnsize locals mv localDecls layouts
+              (.aggregate 0 (dataDangling :: subVt :: .nil)) "Sub" "Sup" false false))) =
+      (true, true, false, true, true, true) := by
+  rfl
+
 /-- Mutability of an unsizing source `src` is compatible with target `dst`
 (`&mut`/`*mut` may weaken to `&`/`*const`, never the reverse). -/
 @[reducible]
