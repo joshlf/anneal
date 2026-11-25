@@ -603,12 +603,13 @@ private theorem ovf_step_bb0_0 (l0 l1 l3 l4 l5 : LocalSlot) (acc : Nat) (hLt : a
                          locals := [l0, l1, .init (.scalar ⟨acc, 2⟩), l3, l4, l5] }
               memory := mem } := by
   cases mem with
-  | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
+  | mk na gl bo nt ca ti cs ac ap np cl fp ex rc =>
     dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
     let m' : Memory :=
       { nextAllocId := na, globals := gl, borrows := [], nextTag := nt, callees := ca,
         traitImpls := ti, callStack := [], activeCallee := none, activeProtectors := ap,
-        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex }
+        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex,
+        rootUnwindCeiling := rc }
     have hW := wrapScalarBits_of_lt hLt
     cases ap with
     | nil =>
@@ -636,12 +637,13 @@ private theorem ovf_step_bb1_1 (l0 l1 l3 l5 : LocalSlot) (acc : Nat) (hLt : acc 
                                     .init (.aggregate 0 [.scalar ⟨acc * 3, 2⟩, .scalar ⟨0, 1⟩]), l5] }
               memory := mem } := by
   cases mem with
-  | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
+  | mk na gl bo nt ca ti cs ac ap np cl fp ex rc =>
     dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
     let m' : Memory :=
       { nextAllocId := na, globals := gl, borrows := [], nextTag := nt, callees := ca,
         traitImpls := ti, callStack := [], activeCallee := none, activeProtectors := ap,
-        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex }
+        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex,
+        rootUnwindCeiling := rc }
     have hBle : Nat.ble 65536 (acc * 3) = false := nat_ble_false_of_lt hLt
     have hEv :
         evalRvalue [l0, l1, .init (.scalar ⟨acc, 2⟩), l3, .uninit, l5]
@@ -684,12 +686,13 @@ private theorem ovf_step_bb3_1 (l0 l1 l3 l4 : LocalSlot) (acc : Nat) (hLt : acc 
                                     .init (.aggregate 0 [.scalar ⟨acc + 7, 2⟩, .scalar ⟨0, 1⟩])] }
               memory := mem } := by
   cases mem with
-  | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
+  | mk na gl bo nt ca ti cs ac ap np cl fp ex rc =>
     dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
     let m' : Memory :=
       { nextAllocId := na, globals := gl, borrows := [], nextTag := nt, callees := ca,
         traitImpls := ti, callStack := [], activeCallee := none, activeProtectors := ap,
-        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex }
+        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex,
+        rootUnwindCeiling := rc }
     have hBle : Nat.ble 65536 (Nat.add acc 7) = false := nat_ble_false_of_lt hLt
     have hEv :
         evalRvalue [l0, l1, .init (.scalar ⟨acc, 2⟩), l3, l4, .uninit]
@@ -731,12 +734,13 @@ private theorem ovf_step_bb5_0 (l0 l1 l3 l4 l5 : LocalSlot) (acc : Nat) (hLt : a
                          locals := [l0, l1, .init (.scalar ⟨acc, 4⟩), l3, l4, l5] }
               memory := mem } := by
   cases mem with
-  | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
+  | mk na gl bo nt ca ti cs ac ap np cl fp ex rc =>
     dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
     let m' : Memory :=
       { nextAllocId := na, globals := gl, borrows := [], nextTag := nt, callees := ca,
         traitImpls := ti, callStack := [], activeCallee := none, activeProtectors := ap,
-        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex }
+        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex,
+        rootUnwindCeiling := rc }
     have hW := wrapScalarBits_of_lt hLt
     cases ap with
     | nil =>
@@ -763,12 +767,13 @@ private theorem ovf_step_bb6_1 (l1 l3 l4 l5 : LocalSlot) (acc : Nat) (hLt : acc 
                          locals := [.uninit, l1, .init (.scalar ⟨acc + 100, 4⟩), l3, l4, l5] }
               memory := mem } := by
   cases mem with
-  | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
+  | mk na gl bo nt ca ti cs ac ap np cl fp ex rc =>
     dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
     let m' : Memory :=
       { nextAllocId := na, globals := gl, borrows := [], nextTag := nt, callees := ca,
         traitImpls := ti, callStack := [], activeCallee := none, activeProtectors := ap,
-        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex }
+        nextProtector := np, callerLocals := cl, fnPtrs := fp, exposedAllocIds := ex,
+        rootUnwindCeiling := rc }
     have hBle : Nat.ble 4294967296 (Nat.add acc 100) = false := nat_ble_false_of_lt hLt
     have hEv :
         evalRvalue [.uninit, l1, .init (.scalar ⟨acc, 4⟩), l3, l4, l5]

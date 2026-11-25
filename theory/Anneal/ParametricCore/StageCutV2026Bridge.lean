@@ -1251,8 +1251,15 @@ theorem applyUnwindAction_cleanup_eq_running (s : MachineState)
       .running { frame := { s.frame with blockIdx := cleanupBb, stmtIdx := 0, locals := locs }
                  memory := mem } := rfl
 
-theorem unwindFromCallStack_nil_eq_panic (mem : Memory) :
-    unwindFromCallStack [] mem = .halted .panic := rfl
+theorem unwindFromCallStack_nil_eq_panic (mem : Memory)
+    (hCeil : mem.rootUnwindCeiling = true) :
+    unwindFromCallStack [] mem = .halted .panic := by
+  unfold unwindFromCallStack; rw [hCeil]
+
+theorem unwindFromCallStack_nil_eq_ub (mem : Memory)
+    (hCeil : mem.rootUnwindCeiling = false) :
+    unwindFromCallStack [] mem = .faulted .ub := by
+  unfold unwindFromCallStack; rw [hCeil]
 
 theorem unwindFromCallStack_unreachable_eq_ub (caller : SavedCallerFrame)
     (rest : List SavedCallerFrame) (mem : Memory)
@@ -1327,8 +1334,9 @@ theorem stepMirFn_assert_unreachable_ub {body : CapturedMir} {s : MachineState}
     (hStmt : s.frame.stmtIdx = length bb.statements)
     (hTerm : bb.terminator.kind = .assert cond expected target .unreachable)
     (hEval :
-      evalOperand s.frame.locals cond s.memory.borrows s.memory.globals body.layouts
-        s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.scalar sc) locals')
+      evalOperandWithBodyCast s.frame.locals cond s.memory.borrows s.memory.globals body.layouts
+        s.memory.callerLocals (bodyLocalDeclsOf (some body)) s.memory.callStack =
+        .ok (.scalar sc) locals')
     (hNe : Nat.beq sc.bits (if expected then 1 else 0) = false) :
     stepMirFn body s = MirStepNode.fail .ub := by
   have hStmtNone : get? bb.statements s.frame.stmtIdx = none := by
@@ -1364,8 +1372,9 @@ theorem not_mirWpConverges_assert_unreachable_ub {body : CapturedMir} {s : Machi
     (hStmt : s.frame.stmtIdx = length bb.statements)
     (hTerm : bb.terminator.kind = .assert cond expected target .unreachable)
     (hEval :
-      evalOperand s.frame.locals cond s.memory.borrows s.memory.globals body.layouts
-        s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.scalar sc) locals')
+      evalOperandWithBodyCast s.frame.locals cond s.memory.borrows s.memory.globals body.layouts
+        s.memory.callerLocals (bodyLocalDeclsOf (some body)) s.memory.callStack =
+        .ok (.scalar sc) locals')
     (hNe : Nat.beq sc.bits (if expected then 1 else 0) = false) :
     ¬ MirWpConverges body s post :=
   not_mirWpConverges_of_step_fail
