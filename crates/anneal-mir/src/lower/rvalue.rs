@@ -877,7 +877,7 @@ fn canonical_zst_value_within(
 /// of any non-zero-sized union field, so every non-ZST union field reads as uninitialized
 /// (`InactiveUnionField`), every inhabited zero-sized field reads its unique value, and a
 /// whole-value copy is defined, exactly as for uninitialized union storage in Miri and
-/// `Trusted.MirSemantics` (`kani#5176`; `AdtAndControl.lean`'s
+/// `Trusted.MirSemantics` (`kani#5176`; `UnionZst.lean`'s
 /// `kani5176_uninit_storage_zst_field`, `kani5176_uninit_storage_zst_subProj`, and
 /// `kani5176_uninit_storage_int_field_ub`).
 ///
@@ -4490,10 +4490,12 @@ fn decode_mir_value(
 /// Every union field starts at offset `0` (`FieldsShape::Union`; `Trusted.MirSemantics`'
 /// `readProjectedValueUnionAware` reads a field of size `n` from the prefix `[0 .. n)` of the
 /// union's storage, ignoring the trailing bytes `[n .. size)`, and a zero-sized field from no
-/// bytes: `AdtAndControl.lean`'s `readUnion_posField_offset0` and
+/// bytes: `UnionZst.lean`'s `readUnion_posField_offset0` and
 /// `readDecodedUnion_trailing_bytes_ignored`), while a union value in the value tree
 /// holds a single active field. So, among the union's inhabited fields (an uninhabited field
-/// can never be read, so it does not constrain the representation):
+/// can never be read as a whole value, and inhabited sub-places through one fail closed as
+/// `InactiveUnionField` here / `.unsupported` in `Trusted.MirSemantics`, so it does not
+/// constrain the active-field representation):
 /// - with no non-zero-sized one, no field can observe any byte: the first inhabited
 ///   (zero-sized) field becomes active with its unique value;
 /// - with exactly one non-zero-sized one, `f` (`MaybeUninit<T>`'s `value`, or a `#[repr(C)]`
@@ -6239,8 +6241,9 @@ where
 /// MiniRust reading it (or any place inside it) accesses no memory and yields its unique value
 /// whatever the union's bytes are; `Trusted.MirSemantics`' `readProjectedValueUnionAware`
 /// likewise decodes an inhabited zero-sized field (or zero-sized sub-place) from zero bytes
-/// (`AdtAndControl.lean`'s `readUnion_zeroByte_root` / `readUnion_zeroByte_subProj`), and
-/// faults with `.ub` on an uninhabited one, which [`resolve_inactive_union_zst_subplace`] never
+/// (`UnionZst.lean`'s `readUnion_zeroByte_root` / `readUnion_zeroByte_subProj`), faults with
+/// `.ub` on an uninhabited leaf, and fails closed with `.unsupported` on an inhabited leaf
+/// through an uninhabited container, neither of which [`resolve_inactive_union_zst_subplace`]
 /// selects (`kani#5159`). The read walks `zst_tail` over that unique value
 /// ([`canonical_zst_value`]), so its steps are checked exactly as on any initialized value: a
 /// type mismatch is `TypeMismatch`, an out-of-bounds `Index` / `ConstantIndex` / `Subslice` of

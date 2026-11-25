@@ -2855,16 +2855,20 @@ theorem kani5159_v2026_08_01_nonStatic_fallthrough_parity :
     readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
         [.field 0 wW0Ty08, .downcast (some "A") 0, .field 1 wUnitTy08] = .unsupported ∧
     readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
+        [.field 0 wW0Ty08, .downcast (some "A") 0, .field 1 wUnitTy08] ≠ .ub ∧
+    readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
         [.field 0 wW0Ty08, .downcast (some "A") 0, .field 0 wInfTy08] = .ub ∧
     readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
         [.field 1 wW4Ty08, .downcast (some "A") 0, .field 1 wU32Ty08] = .unsupported ∧
+    readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
+        [.field 1 wW4Ty08, .downcast (some "A") 0, .field 1 wU32Ty08] ≠ .ub ∧
     readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
         [.field 1 wW4Ty08, .downcast (some "A") 0, .field 0 wInfTy08] = .ub ∧
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
         wUWTy [.field 0 wW0Ty, .downcast (some "A") 0, .field 1 wUnitTy] = .unsupported ∧
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
         wUWTy [.field 1 wW4Ty, .downcast (some "A") 0, .field 1 wU32Ty] = .unsupported :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, (by intro h; cases h), rfl, rfl, (by intro h; cases h), rfl, rfl, rfl⟩
 
 end V2026_08_01Parity
 

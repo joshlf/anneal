@@ -8588,6 +8588,7 @@ Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.def>
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.bool>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.char>
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.scalar>
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.reference-box>
 
@@ -8597,6 +8598,9 @@ Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid
 > "A `!` value must never exist."
 >
 > "A `bool` value must be `false` (`0`) or `true` (`1`)."
+>
+> "A `char` value must not be a surrogate (i.e., must not be in the range
+> `0xD800..=0xDFFF`) and must be equal to or less than `char::MAX`."
 >
 > "An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be
 > initialized, i.e., must not be obtained from uninitialized memory."
@@ -8655,9 +8659,13 @@ at reference type here (this keeps thin-reference decoding in
 `decodeTypedValueFromBytes` independent of `layoutIdx`). When `ty.layoutIdx`
 is absent from `layouts` and `ty.kind` is an opaque custom ADT,
 `tyIsUninhabited` returns `false` (leaving custom uninhabited ADTs without
-captured layout metadata undetected here rather than over-claiming UB). A
-`false` result is therefore never evidence of inhabitedness; callers use it
-only to avoid emitting `.ub`.
+captured layout metadata undetected here rather than over-claiming UB). That
+`false` result does not synthesize an unsound 0-byte value in
+`readProjectedValueUnionAware`: for `.adt` types without a `layouts` entry,
+`tyByteSize` returns `.none` (selecting fail-closed `.unsupported`); for
+`&T` / `&mut T`, `tyByteSize` is pointer-sized (`4` or `8` bytes) and goes
+through byte decoding rather than 0-byte synthesis; and for `bool`, `char`,
+integers, floats, and raw pointers, the type is inhabited and positive-sized.
 -/
 @[reducible]
 def tyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
@@ -9039,15 +9047,14 @@ def readProjectedValueUnionAware
                     resolveProjectedTyResolved localDecls layouts rFieldTy normRest
                   with
                   | .some subOff, .some leafTy =>
-                    -- Loading a value of an uninhabited leaf type is immediate
-                    -- UB in Rust, Miri, and MiniRust (`kani#5159`), regardless
-                    -- of whether `leafTy` is 0-byte, positive-sized, or lacks a
-                    -- byte size in `tyByteSize`. When `leafTy` is inhabited,
-                    -- intermediate place projections in Miri/MiniRust only
-                    -- compute offsets without validating intermediate
-                    -- containers, so passing through an uninhabited container
-                    -- fails closed as `.unsupported` rather than false-positive
-                    -- `.ub`.
+                    -- Reading a value of an uninhabited leaf type "produces"
+                    -- an invalid value (`r-undefined.invalid`, `kani#5159`),
+                    -- regardless of whether `leafTy` is 0-byte, positive-sized,
+                    -- or lacks a byte size in `tyByteSize`. When `leafTy` is
+                    -- inhabited, the Reference does not establish that
+                    -- projecting through an uninhabited container is UB, so
+                    -- Anneal fails closed with `.unsupported` rather than
+                    -- emitting false-positive `.ub`.
                     match tyIsUninhabited layouts leafTy with
                     | true => .some .ub
                     | false =>
@@ -9125,6 +9132,9 @@ def readProjectedValueUnionAware
                   | .none => .unit
                 readProjectedValueUnionAware locals localDecls layouts zstVal rFieldTy rest
             | .some (.succ szPred) =>
+              -- Match `rFieldTy.kind` syntactically here (mirroring `tyIsUninhabited`'s
+              -- primitive/pointer short-circuit) so downstream proofs that rewrite
+              -- `rFieldTy.kind` without unfolding `tyIsUninhabited` reduce by `rfl`.
               let fieldUninhabited : Bool :=
                 match rFieldTy.kind with
                 | .bool | .char | .uint _ | .int _ | .float _ | .rawPtr _ _ | .ref _ _ => false

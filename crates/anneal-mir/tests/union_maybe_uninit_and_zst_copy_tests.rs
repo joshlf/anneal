@@ -2970,10 +2970,12 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
                 "field {idx} on {pw:?}"
             );
         }
-        // So is reading any place through one: `(Infallible, ()).1` and `.0`,
-        // `[Infallible; 1][0]` (constant and dynamic index), `ManuallyDrop<Infallible>`'s
-        // `value`, `(Infallible, u32).0` and `.1` (whose `u32` leaf is positive-sized),
-        // `[CustomVoid; 1][0]`, and `(CustomVoid, ()).1`.
+        // Uninhabited leaf reads through an uninhabited field (`(Infallible, ()).0`,
+        // `[Infallible; 1][0]` with constant or dynamic index, `ManuallyDrop<Infallible>.value`,
+        // `(Infallible, u32).0`, `[CustomVoid; 1][0]`) are UB in `Trusted.MirSemantics`, while
+        // inhabited-leaf reads through an uninhabited container (`(Infallible, ()).1`,
+        // `(Infallible, u32).1`, `(CustomVoid, ()).1`) fail closed as `.unsupported` there;
+        // both fail closed with `InactiveUnionField` in this value-tree evaluator.
         assert_eq!(
             state.read_place(&proj(0, vec![f(2), field(1, unit())])),
             inactive(2)
@@ -3010,9 +3012,11 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
             state.read_place(&proj(0, vec![f(13), field(1, unit())])),
             inactive(13)
         );
-        // Inside `V` (and `[V; 2][0..-1][0]`), the uninhabited field `p` and `p.1` (whose `()`
-        // leaf alone is inhabited) fault, as do `V4.p.1` and `MaybeUninit<Infallible>`'s
-        // `value` field.
+        // Inside `V` (and `[V; 2][0..-1][0]`), the uninhabited field `p` (and
+        // `MaybeUninit<Infallible>`'s `value` field) is an uninhabited leaf load (`.ub` in
+        // `Trusted.MirSemantics`), while `p.1` and `V4.p.1` have inhabited leaves through an
+        // uninhabited container (fail-closed `.unsupported` in `Trusted.MirSemantics`); all
+        // fail closed with `InactiveUnionField` here.
         let v_inactive = Err(RvalueEvalError::InactiveUnionField {
             active_field: 1,
             requested_field: 0,
@@ -3069,7 +3073,7 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
 // ---------------------------------------------------------------------------------------------
 
 /// `kani#5159` through `copy` / `move` operands and non-static enum `Downcast` sub-projections,
-/// mirroring `AdtAndControl.lean`'s `kani5159_witness_evalPlaceRead` (reads through
+/// mirroring `UnionZst.lean`'s `kani5159_witness_evalPlaceRead` (reads through
 /// `Trusted.MirSemantics`' `evalPlaceRead`, the read behind both operands) and
 /// `kani5159_witness_fieldRoot_downcast` (an instance of `readUnion_zeroByte_fieldRoot`): assigning
 /// from an uninhabited union field, from a place (0-byte or positive-sized) through an uninhabited

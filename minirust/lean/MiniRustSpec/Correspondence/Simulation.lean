@@ -6902,7 +6902,7 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
     (fun bb hbb => by
       obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
       obtain ⟨hlen, hstspec, htermspec⟩ := translateBlock_spec _ _ bb tb htb
-      exact ⟨tb, htb ▸ hgetb, hlen, fun st hst => hstspec _ st hst, htermspec⟩)
+      exact ⟨tb, hgetb, hlen, fun st hst => hstspec _ st hst, htermspec⟩)
     hrel
 
 /-- **Correspondence theorem (one step).** For a fragment body `body`, its

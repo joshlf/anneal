@@ -2685,11 +2685,10 @@ theorem step_padded_zst_union_uninhabited_field_read_ub
     simp only [annealUnionValidityHooks, Bool.false_eq_true, ↓reduceIte,
       pure, Pure.pure, EStateM.pure, bind, Bind.bind, EStateM.bind]
     unfold Miri.Interpreter.ValidityVisitor.visit
-    simp only [annealUnionValidityHooks, bind, Bind.bind, EStateM.bind]
+    simp only [bind, Bind.bind, EStateM.bind]
     rw [hclassVoid]
     simp only [voidLay, translateTypeLayout, hvoid_fields, hvoid_var,
-      translateFieldsShape, translateVariantsShape,
-      pure, Pure.pure, EStateM.pure, bind, Bind.bind, EStateM.bind]
+      translateFieldsShape, translateVariantsShape, pure, Pure.pure]
     rfl
   have hlm24 : lm24Assign body.localDecls body.layouts ⟨r, #[]⟩
       (translateRvalue (.use (.copy ⟨u, [.field j voidTy]⟩))) = true := by

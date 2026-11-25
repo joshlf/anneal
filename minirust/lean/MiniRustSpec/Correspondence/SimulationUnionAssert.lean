@@ -2255,7 +2255,7 @@ theorem step_correspondence_withAssert (body : CapturedMir) (f : Gen.Function)
       have hstepEq := stepMirFn_term body s bb hrelA.activeCallee hphase hbb heq
       rw [stepMirFn_eraseAssert_term_nonAssert hrelA.activeCallee hphase hbb heq htermE hna]
       apply StepRelN.toStepRelWithAssert
-      · refine step_correspondence_NF_at (eraseAssert body) f hfragE hflE ctx s m ?_
+      · refine step_correspondence_NF (eraseAssert body) f hfragE hflE ctx s m ?_
           ⟨view, lm, hrelA, hthr, hlo, hns, hbo⟩
         intro bb' hbb'
         rw [hbbE] at hbb'; cases hbb'
@@ -2264,7 +2264,7 @@ theorem step_correspondence_withAssert (body : CapturedMir) (f : Gen.Function)
           rw [eraseAssertBlock, eraseAssertTerm_of_not hna]
           exact ((translateTerminatorWithAssert_keys body.layouts body.localDecls nf nf'
             bb.terminator tb.terminator ext htt).2.2.2 hna).1
-        exact ⟨tb, hgetb, hlen, fun st' hst' => hstB _ st' hst', fun _ => httE⟩
+        exact ⟨tb, hgetb, hlen, fun st' hst' => hstB _ st' hst', httE⟩
       · intro s' hs'
         rw [← stepMirFn_eraseAssert_term_nonAssert hrelA.activeCallee hphase hbb heq htermE hna, hstepEq] at hs'
         exact (hpres.1 s' hs').trans hceil
