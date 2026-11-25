@@ -29,8 +29,10 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
   closed form on EVERY bit pattern (`evalFloatCmp_self`: `<` / `>` irreflexive even
   on NaN, `==` / `<=` / `>=` reflexive iff not NaN, `x != x` iff NaN), signed zeros
   under `<=` / `>=`, unconditional `PartialOrd` consistency (`<=` iff `<` or `==`),
-  asymmetry of `<`, and the exact NaN boundary of negation duality
-  (`a < b = !(a >= b)` iff neither operand is NaN);
+  asymmetry of `<`, the exact NaN boundary of negation duality
+  (`a < b = !(a >= b)` iff neither operand is NaN), simultaneous-negation order
+  reversal (`evalFloatPartialCompare_neg_both`), and the six `PartialOrd`/`PartialEq`
+  `evalFloatCmp` inversion biconditionals (`evalFloatCmp_eq_some_true_iff`);
 - **§3**: Single-rounding `roundTiesToEven` characterizations (`add`, `sub`,
   `mul`, `div`), exact grid representability (`roundRatioTiesToEven_exact_grid`),
   Sterbenz's exact subtraction (`y / 2 ≤ x ∧ x ≤ 2 * y`), exact addition,
@@ -54,10 +56,15 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
 - **§4**: `FloatArithMode` inclusion (`EvalFloatBinOpRel.det_imp_nondet`,
   `EvalRvalueFloatRel.det_imp_nondet`, `evalFloatBinOp` realizes `.deterministic`),
   `nanChoices` membership / width / NaN / quietness / `4`-vs-`6` sNaN structure,
+  list-level and membership-level `nanChoices` decompositions (general, 1-input
+  `floatToFloat`, exact 2-input binary `mem_nanChoices_nondet_binary_iff` and
+  same-format simplified `mem_nanChoices_nondet_binary_same_fmt_iff`, length lower
+  bounds, indices `0`/`1`, input-swap invariance, and subset monotonicity),
   `sub` vs `add ∘ neg` ordered-list swap witness, relational sign-symmetry
   (`rem` right-negation invariance in both modes, `.deterministic`
   `(+0.0) * (+Inf)` counterexample, `.nondeterministic` unconditional left/right
-  sign symmetry for `mul`/`div`/`rem` and non-zero-canceling `add`/`sub`), and
+  sign symmetry for `mul`/`div`/`rem` and non-zero-canceling `add`/`sub`),
+  `evalFloatArithBase_lt` canonical width bound, and
   mode-independence of finite `rem` (`EvalFloatBinOpRel_rem_finite_deterministic`);
 - **§5**: `Ptr2IntTransmutePolicy` refinement (`strictUcg630Ub` refines
   `stripProvenance`), exact cast split (`strip = strict ∨ strict = .ub`),
@@ -109,13 +116,18 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
   `EvalFloatBinOpRel`, `evalFloatScalarBinOp`, `evalRvalue`, and
   `EvalRvalueFloatRel`, and the Episode 2 readiness laws at ANY `FloatArithMode`
   and ANY `Ptr2IntTransmutePolicy`: mode-invariant supportedness / totality /
-  well-formedness of `EvalFloatBinOpRel` (`isFloatBinOp`), policy irrelevance
+  well-formedness of `EvalFloatBinOpRel` (`isFloatBinOp`, partitioned into
+  `isFloatArithBinOp` vs `isFloatCmpBinOp`), separate arithmetic / comparison /
+  unsupported inversion (`_iff`) lemmas for `evalFloatBinOp` and `EvalFloatBinOpRel`
+  plus mode-parametric `add`/`mul` commutativity, policy irrelevance
   outside byte casts and mode irrelevance outside float arithmetic, mode
   invariance and `evalRvalue`-exactness of every `.ub` / `.unsupported` outcome,
   totality, the executable `evalRvalueDet` characterizing `.deterministic` mode
-  exactly, generic-mode float `.binaryOp` and NaN `.cast .floatToFloat`
-  dispatchers, relation-level and decoder-level `Ptr2IntTransmutePolicy`
-  refinement / exact split / provenance-necessity bridges for every (composite)
+  exactly, generic-mode float `.unaryOp .neg`, `.binaryOp` (overall, comparison,
+  arithmetic), and `.cast .floatToFloat` (overall, non-NaN, NaN)
+  dispatchers, full `rv`-generic `Ptr2IntTransmutePolicy` and joint `(mode, policy)`
+  refinement / exact split / `.ub` & `.unsupported` monotonicity / unconditional
+  `.ok` realization bridges for every (composite)
   type, and concrete witnesses (float operands and NaN choices read from locals,
   pointer-to-integer and array / tuple / struct-with-padding / union / float
   policy separation, `{to,from}_bits`, and the every-fuel non-vacuity instantiation
@@ -875,6 +887,85 @@ theorem evalFloatCmp_nan_duality_and_signed_zero_witness :
         (.binaryOp .lt (mkFloatConstOp f32Ty 0x80000000 4) (mkFloatConstOp f32Ty 0x00000000 4)) =
       .ok (.scalar (boolToScalar false)) .nil emptyMemory := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `evalFloatPartialCompare` depends on both operands only modulo `2 ^ f.width`. -/
+theorem evalFloatPartialCompare_mod (f : IeeeFormat) (a b : Nat) :
+    evalFloatPartialCompare f (a % 2 ^ f.width) (b % 2 ^ f.width) =
+      evalFloatPartialCompare f a b := by
+  unfold evalFloatPartialCompare
+  rw [Nat.mod_mod, Nat.mod_mod]
+
+/-- `evalFloatCmp` depends on both operands only modulo `2 ^ f.width`. -/
+theorem evalFloatCmp_mod (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    evalFloatCmp op f (a % 2 ^ f.width) (b % 2 ^ f.width) = evalFloatCmp op f a b := by
+  unfold evalFloatCmp
+  rw [evalFloatPartialCompare_mod]
+
+/-- **Simultaneous negation reverses IEEE-754 partial ordering** (`(-a) <=> (-b) = b <=> a`,
+including all NaN, signed-zero, subnormal, normal, and infinity cases). -/
+theorem evalFloatPartialCompare_neg_both (f : IeeeFormat) (a b : Nat) :
+    evalFloatPartialCompare f (evalFloatNeg f a) (evalFloatNeg f b) =
+      evalFloatPartialCompare f b a := by
+  unfold evalFloatPartialCompare
+  rw [decodeBits_mod, decodeBits_mod, decodeBits_mod, decodeBits_mod,
+    decodeBits_evalFloatNeg, decodeBits_evalFloatNeg]
+  cases decodeBits f a with
+  | nan _ _ _ => cases decodeBits f b <;> rfl
+  | inf ln =>
+    cases decodeBits f b with
+    | nan _ _ _ => rfl
+    | inf rn => cases ln <;> cases rn <;> rfl
+    | zero _ => cases ln <;> rfl
+    | finite _ _ _ => cases ln <;> rfl
+  | zero _ =>
+    cases decodeBits f b with
+    | nan _ _ _ => rfl
+    | inf rn => cases rn <;> rfl
+    | zero _ => rfl
+    | finite rn rnum _ =>
+      dsimp only [negateFloatKind]
+      by_cases h0 : rnum = 0
+      · rw [if_pos' h0, if_pos' h0]
+      · rw [if_neg' h0, if_neg' h0]; cases rn <;> rfl
+  | finite ln lnum lden =>
+    cases decodeBits f b with
+    | nan _ _ _ => rfl
+    | inf rn => cases rn <;> rfl
+    | zero _ =>
+      dsimp only [negateFloatKind]
+      by_cases h0 : lnum = 0
+      · rw [if_pos' h0, if_pos' h0]
+      · rw [if_neg' h0, if_neg' h0]; cases ln <;> rfl
+    | finite rn rnum rden =>
+      dsimp only [negateFloatKind]
+      rw [signedNum_not, signedNum_not, Int.neg_mul, Int.neg_mul]
+      by_cases hlt : -(signedNum ln lnum * (rden : Int)) < -(signedNum rn rnum * (lden : Int))
+      · rw [if_pos' hlt,
+          if_pos' (show signedNum rn rnum * (lden : Int) < signedNum ln lnum * (rden : Int) by omega)]
+      · rw [if_neg' hlt,
+          if_neg' (show ¬ signedNum rn rnum * (lden : Int) < signedNum ln lnum * (rden : Int) by omega)]
+        by_cases heq : -(signedNum ln lnum * (rden : Int)) = -(signedNum rn rnum * (lden : Int))
+        · rw [if_pos' heq,
+            if_pos' (show signedNum rn rnum * (lden : Int) = signedNum ln lnum * (rden : Int) by omega)]
+        · rw [if_neg' heq,
+            if_neg' (show ¬ signedNum rn rnum * (lden : Int) = signedNum ln lnum * (rden : Int) by omega)]
+
+/-- **Exact `PartialOrd` / `PartialEq` inversion for all six IEEE-754 comparisons**: relates
+each `evalFloatCmp op f a b = .some true` directly to `evalFloatPartialCompare f a b`
+(matching `Miri.Interpreter.FloatBits.comparison` clause for clause). -/
+theorem evalFloatCmp_eq_some_true_iff (f : IeeeFormat) (a b : Nat) :
+    (evalFloatCmp .eq f a b = .some true ↔ evalFloatPartialCompare f a b = .some .eq) ∧
+    (evalFloatCmp .ne f a b = .some true ↔ evalFloatPartialCompare f a b ≠ .some .eq) ∧
+    (evalFloatCmp .lt f a b = .some true ↔ evalFloatPartialCompare f a b = .some .lt) ∧
+    (evalFloatCmp .le f a b = .some true ↔
+      (evalFloatPartialCompare f a b = .some .lt ∨ evalFloatPartialCompare f a b = .some .eq)) ∧
+    (evalFloatCmp .gt f a b = .some true ↔ evalFloatPartialCompare f a b = .some .gt) ∧
+    (evalFloatCmp .ge f a b = .some true ↔
+      (evalFloatPartialCompare f a b = .some .gt ∨ evalFloatPartialCompare f a b = .some .eq)) := by
+  unfold evalFloatCmp
+  cases evalFloatPartialCompare f a b with
+  | none => decide
+  | some ord => cases ord <;> decide
 
 /-! ## §3. Single-rounding `roundTiesToEven`, Sterbenz's lemma, gradual underflow, `1.0` identity, & exact Euclidean `rem` -/
 
@@ -3916,6 +4007,584 @@ theorem nanChoices_sub_vs_add_neg_order_witness :
           · exact List.mem_cons_of_mem _ (List.mem_cons_of_mem _ List.mem_cons_self)
           · cases h4
 
+/-! ### `nanChoices` structural & 1-input / 2-input membership decompositions (Episode 2 bridge) -/
+
+/-- `isNaNBits` depends on `bits` only modulo `2 ^ f.width`. -/
+theorem isNaNBits_mod (f : IeeeFormat) (bits : Nat) :
+    isNaNBits f (bits % 2 ^ f.width) = isNaNBits f bits := by
+  unfold isNaNBits
+  rw [decodeBits_mod]
+
+/-- `isQuietNaNBits` depends on `bits` only modulo `2 ^ f.width`. -/
+theorem isQuietNaNBits_mod (f : IeeeFormat) (bits : Nat) :
+    isQuietNaNBits f (bits % 2 ^ f.width) = isQuietNaNBits f bits := by
+  unfold isQuietNaNBits
+  rw [decodeBits_mod]
+
+/-- `isSignalingNaNBits` depends on `bits` only modulo `2 ^ f.width`. -/
+theorem isSignalingNaNBits_mod (f : IeeeFormat) (bits : Nat) :
+    isSignalingNaNBits f (bits % 2 ^ f.width) = isSignalingNaNBits f bits := by
+  unfold isSignalingNaNBits
+  rw [decodeBits_mod]
+
+/-- Single-input quieted NaN candidate converting `a % 2 ^ src.width` from `src` to `dst`
+(the exact element emitted by `nanChoicesQuieted`). -/
+def quietedNaNCand (src dst : IeeeFormat) (a : Nat) : Nat :=
+  evalFloatToFloatRoundTiesToEven src dst (a % 2 ^ src.width)
+
+/-- Lower (non-quiet) NaN payload bits after converting `a % 2 ^ src.width` from `src` to `dst`
+(the exact nonzero guard checked by `nanChoicesSignaling`). -/
+def signalingNaNLowerPayload (src dst : IeeeFormat) (a : Nat) : Nat :=
+  (unpackBits dst (quietedNaNCand src dst a)).fraction % 2 ^ (dst.fractionBits - 1)
+
+/-- Single-input unchanged-signaling NaN candidate in format `dst`
+(the exact element emitted by `nanChoicesSignaling` when `isSignalingNaNBits src a = true`
+and `signalingNaNLowerPayload src dst a ≠ 0`). -/
+def signalingNaNCand (src dst : IeeeFormat) (a : Nat) : Nat :=
+  encodeBits dst (unpackBits dst (quietedNaNCand src dst a)).neg
+    (2 ^ dst.exponentBits - 1) (signalingNaNLowerPayload src dst a)
+
+theorem quietedNaNCand_mod (src dst : IeeeFormat) (a : Nat) :
+    quietedNaNCand src dst (a % 2 ^ src.width) = quietedNaNCand src dst a := by
+  unfold quietedNaNCand
+  rw [Nat.mod_mod]
+
+theorem signalingNaNLowerPayload_mod (src dst : IeeeFormat) (a : Nat) :
+    signalingNaNLowerPayload src dst (a % 2 ^ src.width) = signalingNaNLowerPayload src dst a := by
+  unfold signalingNaNLowerPayload
+  rw [quietedNaNCand_mod]
+
+theorem signalingNaNCand_mod (src dst : IeeeFormat) (a : Nat) :
+    signalingNaNCand src dst (a % 2 ^ src.width) = signalingNaNCand src dst a := by
+  unfold signalingNaNCand
+  rw [quietedNaNCand_mod, signalingNaNLowerPayload_mod]
+
+theorem expandNanSigns_append (f : IeeeFormat) (xs ys : List Nat) :
+    expandNanSigns f (xs ++ ys) = expandNanSigns f xs ++ expandNanSigns f ys := by
+  induction xs with
+  | nil => rfl
+  | cons x rest ih =>
+    change x :: evalFloatNeg f x :: expandNanSigns f (rest ++ ys) =
+      x :: evalFloatNeg f x :: (expandNanSigns f rest ++ expandNanSigns f ys)
+    rw [ih]
+
+theorem length_expandNanSigns (f : IeeeFormat) (xs : List Nat) :
+    (expandNanSigns f xs).length = 2 * xs.length := by
+  induction xs with
+  | nil => rfl
+  | cons _ rest ih =>
+    change (expandNanSigns f rest).length + 2 = 2 * (rest.length + 1)
+    rw [ih]
+    omega
+
+theorem nanChoicesQuieted_cons (dst src : IeeeFormat) (a : Nat) (rest : List (IeeeFormat × Nat)) :
+    nanChoicesQuieted dst ((src, a) :: rest) =
+      (if isNaNBits src a = true then [quietedNaNCand src dst a] else []) ++
+        nanChoicesQuieted dst rest := by
+  conv => lhs; unfold nanChoicesQuieted
+  dsimp only
+  rw [isNaNBits_mod]
+  cases isNaNBits src a <;> rfl
+
+theorem nanChoicesQuieted_append (dst : IeeeFormat) (xs ys : List (IeeeFormat × Nat)) :
+    nanChoicesQuieted dst (xs ++ ys) = nanChoicesQuieted dst xs ++ nanChoicesQuieted dst ys := by
+  induction xs with
+  | nil => rfl
+  | cons inp rest ih =>
+    cases inp with
+    | mk src a =>
+      change nanChoicesQuieted dst ((src, a) :: (rest ++ ys)) =
+        nanChoicesQuieted dst ((src, a) :: rest) ++ nanChoicesQuieted dst ys
+      rw [nanChoicesQuieted_cons, nanChoicesQuieted_cons, ih, List.append_assoc]
+
+theorem nanChoicesSignaling_cons (dst src : IeeeFormat) (a : Nat) (rest : List (IeeeFormat × Nat)) :
+    nanChoicesSignaling dst ((src, a) :: rest) =
+      (if isSignalingNaNBits src a = true ∧ signalingNaNLowerPayload src dst a ≠ 0 then
+          [signalingNaNCand src dst a]
+        else []) ++ nanChoicesSignaling dst rest := by
+  conv => lhs; unfold nanChoicesSignaling
+  dsimp only
+  rw [isSignalingNaNBits_mod]
+  cases isSignalingNaNBits src a with
+  | false =>
+    rw [if_neg' Bool.false_ne_true, if_neg' (fun h => Bool.noConfusion h.1)]
+    rfl
+  | true =>
+    rw [if_pos' rfl]
+    by_cases hl : signalingNaNLowerPayload src dst a = 0
+    · change (if signalingNaNLowerPayload src dst a = 0 then nanChoicesSignaling dst rest
+          else signalingNaNCand src dst a :: nanChoicesSignaling dst rest) = _
+      rw [if_pos' hl, if_neg' (fun h => h.2 hl)]
+      rfl
+    · change (if signalingNaNLowerPayload src dst a = 0 then nanChoicesSignaling dst rest
+          else signalingNaNCand src dst a :: nanChoicesSignaling dst rest) = _
+      rw [if_neg' hl, if_pos' ⟨rfl, hl⟩]
+      rfl
+
+theorem nanChoicesSignaling_append (dst : IeeeFormat) (xs ys : List (IeeeFormat × Nat)) :
+    nanChoicesSignaling dst (xs ++ ys) = nanChoicesSignaling dst xs ++ nanChoicesSignaling dst ys := by
+  induction xs with
+  | nil => rfl
+  | cons inp rest ih =>
+    cases inp with
+    | mk src a =>
+      change nanChoicesSignaling dst ((src, a) :: (rest ++ ys)) =
+        nanChoicesSignaling dst ((src, a) :: rest) ++ nanChoicesSignaling dst ys
+      rw [nanChoicesSignaling_cons, nanChoicesSignaling_cons, ih, List.append_assoc]
+
+/-- Canonicalizing a single input modulo `2 ^ src.width` leaves `nanChoices` list-equal. -/
+theorem nanChoices_mod_single (dst src : IeeeFormat) (a : Nat) (mode : FloatArithMode) :
+    nanChoices dst [(src, a % 2 ^ src.width)] mode = nanChoices dst [(src, a)] mode := by
+  cases mode with
+  | deterministic => rfl
+  | nondeterministic =>
+    unfold nanChoices
+    dsimp only
+    rw [nanChoicesQuieted_cons, nanChoicesQuieted_cons,
+      nanChoicesSignaling_cons, nanChoicesSignaling_cons,
+      isNaNBits_mod, isSignalingNaNBits_mod,
+      quietedNaNCand_mod, signalingNaNLowerPayload_mod, signalingNaNCand_mod]
+
+/-- Canonicalizing both inputs modulo `2 ^ width` leaves binary `nanChoices` list-equal. -/
+theorem nanChoices_mod_pair (dst src₁ src₂ : IeeeFormat) (a b : Nat) (mode : FloatArithMode) :
+    nanChoices dst [(src₁, a % 2 ^ src₁.width), (src₂, b % 2 ^ src₂.width)] mode =
+      nanChoices dst [(src₁, a), (src₂, b)] mode := by
+  cases mode with
+  | deterministic => rfl
+  | nondeterministic =>
+    unfold nanChoices
+    dsimp only
+    rw [nanChoicesQuieted_cons, nanChoicesQuieted_cons, nanChoicesQuieted_cons, nanChoicesQuieted_cons,
+      nanChoicesSignaling_cons, nanChoicesSignaling_cons, nanChoicesSignaling_cons, nanChoicesSignaling_cons,
+      isNaNBits_mod, isNaNBits_mod, isSignalingNaNBits_mod, isSignalingNaNBits_mod,
+      quietedNaNCand_mod, quietedNaNCand_mod,
+      signalingNaNLowerPayload_mod, signalingNaNLowerPayload_mod,
+      signalingNaNCand_mod, signalingNaNCand_mod]
+
+/-- Exact length of `nanChoices dst inputs .nondeterministic` (always even and `≥ 2`). -/
+theorem nanChoices_nondet_length (dst : IeeeFormat) (inputs : List (IeeeFormat × Nat)) :
+    (nanChoices dst inputs .nondeterministic).length =
+      2 * (1 + (nanChoicesQuieted dst inputs).length + (nanChoicesSignaling dst inputs).length) := by
+  unfold nanChoices
+  dsimp only
+  rw [length_expandNanSigns]
+  simp only [List.length_cons, List.length_append]
+  omega
+
+/-- `nanChoices` is always non-empty (`length ≥ 1` in both modes, `length ≥ 2` in `.nondeterministic`). -/
+theorem nanChoices_length_bounds (dst : IeeeFormat) (inputs : List (IeeeFormat × Nat)) :
+    (∀ mode, 1 ≤ (nanChoices dst inputs mode).length) ∧
+    2 ≤ (nanChoices dst inputs .nondeterministic).length := by
+  have h2 : 2 ≤ (nanChoices dst inputs .nondeterministic).length := by
+    rw [nanChoices_nondet_length]; omega
+  refine ⟨fun mode => ?_, h2⟩
+  cases mode with
+  | deterministic => exact Nat.le_refl 1
+  | nondeterministic => omega
+
+/-- Whenever any input is NaN, `nanChoices dst inputs .nondeterministic` has length at least `4`
+(preferred `±` plus that input's quieted `±`). -/
+theorem nanChoices_nondet_length_ge_four_of_mem_nan (dst : IeeeFormat)
+    (inputs : List (IeeeFormat × Nat)) (src : IeeeFormat) (a : Nat)
+    (hmem : (src, a) ∈ inputs) (hnan : isNaNBits src a = true) :
+    4 ≤ (nanChoices dst inputs .nondeterministic).length := by
+  have hq_pos : 1 ≤ (nanChoicesQuieted dst inputs).length := by
+    induction inputs with
+    | nil => cases hmem
+    | cons inp rest ih =>
+      cases inp with
+      | mk s b =>
+        rw [nanChoicesQuieted_cons, List.length_append]
+        rcases List.mem_cons.mp hmem with heq | hrest
+        · injection heq with hs hb
+          subst hs hb
+          rw [if_pos' hnan]
+          simp only [List.length_cons, List.length_nil]
+          omega
+        · have := ih hrest
+          omega
+  rw [nanChoices_nondet_length]
+  omega
+
+/-- Indices `0` and `1` of `nanChoices dst inputs .nondeterministic` are unconditionally
+`preferredNaNBits dst` and `-preferredNaNBits dst` (so selector index `0` always realizes
+deterministic preferred-NaN mode). -/
+theorem nanChoices_nondet_getElem_zero_one (dst : IeeeFormat) (inputs : List (IeeeFormat × Nat)) :
+    (nanChoices dst inputs .nondeterministic)[0]? = .some (preferredNaNBits dst) ∧
+    (nanChoices dst inputs .nondeterministic)[1]? = .some (evalFloatNeg dst (preferredNaNBits dst)) := by
+  exact ⟨rfl, rfl⟩
+
+/-- Exact membership characterization of `nanChoicesQuieted`. -/
+theorem mem_nanChoicesQuieted_iff (dst : IeeeFormat) (inputs : List (IeeeFormat × Nat)) (c : Nat) :
+    c ∈ nanChoicesQuieted dst inputs ↔
+      ∃ src a, (src, a) ∈ inputs ∧ isNaNBits src a = true ∧ c = quietedNaNCand src dst a := by
+  induction inputs with
+  | nil =>
+    constructor
+    · intro h; cases h
+    · rintro ⟨_, _, h, _, _⟩; cases h
+  | cons inp rest ih =>
+    cases inp with
+    | mk src a =>
+      rw [nanChoicesQuieted_cons, List.mem_append]
+      constructor
+      · rintro (hhead | htail)
+        · cases hnan : isNaNBits src a with
+          | false => rw [hnan, if_neg' Bool.false_ne_true] at hhead; cases hhead
+          | true =>
+            rw [hnan, if_pos' rfl] at hhead
+            rcases List.mem_cons.mp hhead with rfl | hnil
+            · exact ⟨src, a, List.mem_cons_self, hnan, rfl⟩
+            · cases hnil
+        · rcases ih.mp htail with ⟨s, b, hb, hnan, hc⟩
+          exact ⟨s, b, List.mem_cons_of_mem _ hb, hnan, hc⟩
+      · rintro ⟨s, b, hmem, hnan, rfl⟩
+        rcases List.mem_cons.mp hmem with heq | hrest
+        · injection heq with hs hb
+          subst hs hb
+          left
+          rw [if_pos' hnan]
+          exact List.mem_cons_self
+        · exact Or.inr (ih.mpr ⟨s, b, hrest, hnan, rfl⟩)
+
+/-- Exact membership characterization of `nanChoicesSignaling`. -/
+theorem mem_nanChoicesSignaling_iff (dst : IeeeFormat) (inputs : List (IeeeFormat × Nat)) (c : Nat) :
+    c ∈ nanChoicesSignaling dst inputs ↔
+      ∃ src a, (src, a) ∈ inputs ∧
+        isSignalingNaNBits src a = true ∧
+        signalingNaNLowerPayload src dst a ≠ 0 ∧
+        c = signalingNaNCand src dst a := by
+  induction inputs with
+  | nil =>
+    constructor
+    · intro h; cases h
+    · rintro ⟨_, _, h, _, _, _⟩; cases h
+  | cons inp rest ih =>
+    cases inp with
+    | mk src a =>
+      rw [nanChoicesSignaling_cons, List.mem_append]
+      constructor
+      · rintro (hhead | htail)
+        · by_cases hcond : isSignalingNaNBits src a = true ∧ signalingNaNLowerPayload src dst a ≠ 0
+          · rw [if_pos' hcond] at hhead
+            rcases List.mem_cons.mp hhead with rfl | hnil
+            · exact ⟨src, a, List.mem_cons_self, hcond.1, hcond.2, rfl⟩
+            · cases hnil
+          · rw [if_neg' hcond] at hhead; cases hhead
+        · rcases ih.mp htail with ⟨s, b, hb, hsn, hlow, hc⟩
+          exact ⟨s, b, List.mem_cons_of_mem _ hb, hsn, hlow, hc⟩
+      · rintro ⟨s, b, hmem, hsn, hlow, rfl⟩
+        rcases List.mem_cons.mp hmem with heq | hrest
+        · injection heq with hs hb
+          subst hs hb
+          left
+          rw [if_pos' ⟨hsn, hlow⟩]
+          exact List.mem_cons_self
+        · exact Or.inr (ih.mpr ⟨s, b, hrest, hsn, hlow, rfl⟩)
+
+/-- Exact membership characterization of `nanChoices dst inputs .deterministic`. -/
+theorem mem_nanChoices_det_iff (dst : IeeeFormat) (inputs : List (IeeeFormat × Nat)) (x : Nat) :
+    x ∈ nanChoices dst inputs .deterministic ↔ x = preferredNaNBits dst := by
+  unfold nanChoices
+  constructor
+  · intro h
+    rcases List.mem_cons.mp h with rfl | hnil
+    · rfl
+    · cases hnil
+  · intro h
+    rw [h]
+    exact List.mem_cons_self
+
+/-- **Exact general membership decomposition of `nanChoices dst inputs .nondeterministic`**:
+a candidate belongs to `nanChoices` iff it is (with either sign) the preferred quiet NaN,
+a quieted input NaN, or an unchanged nonzero-lower-payload signaling input NaN. -/
+theorem mem_nanChoices_nondet_iff (dst : IeeeFormat) (inputs : List (IeeeFormat × Nat)) (x : Nat) :
+    x ∈ nanChoices dst inputs .nondeterministic ↔
+      (x = preferredNaNBits dst ∨ x = evalFloatNeg dst (preferredNaNBits dst)) ∨
+      (∃ src a, (src, a) ∈ inputs ∧ isNaNBits src a = true ∧
+        (x = quietedNaNCand src dst a ∨ x = evalFloatNeg dst (quietedNaNCand src dst a))) ∨
+      (∃ src a, (src, a) ∈ inputs ∧ isSignalingNaNBits src a = true ∧
+        signalingNaNLowerPayload src dst a ≠ 0 ∧
+        (x = signalingNaNCand src dst a ∨ x = evalFloatNeg dst (signalingNaNCand src dst a))) := by
+  unfold nanChoices
+  rw [mem_expandNanSigns_iff]
+  constructor
+  · rintro ⟨c, hc, hsign⟩
+    rcases List.mem_cons.mp hc with rfl | hrest
+    · exact Or.inl hsign
+    · rcases List.mem_append.mp hrest with hq | hs
+      · rcases (mem_nanChoicesQuieted_iff dst inputs c).mp hq with ⟨src, a, hmem, hnan, rfl⟩
+        exact Or.inr (Or.inl ⟨src, a, hmem, hnan, hsign⟩)
+      · rcases (mem_nanChoicesSignaling_iff dst inputs c).mp hs with ⟨src, a, hmem, hsn, hlow, rfl⟩
+        exact Or.inr (Or.inr ⟨src, a, hmem, hsn, hlow, hsign⟩)
+  · rintro (hpref | ⟨src, a, hmem, hnan, hsign⟩ | ⟨src, a, hmem, hsn, hlow, hsign⟩)
+    · exact ⟨preferredNaNBits dst, List.mem_cons_self, hpref⟩
+    · exact ⟨quietedNaNCand src dst a,
+        List.mem_cons_of_mem _ (List.mem_append_left _
+          ((mem_nanChoicesQuieted_iff dst inputs _).mpr ⟨src, a, hmem, hnan, rfl⟩)),
+        hsign⟩
+    · exact ⟨signalingNaNCand src dst a,
+        List.mem_cons_of_mem _ (List.mem_append_right _
+          ((mem_nanChoicesSignaling_iff dst inputs _).mpr ⟨src, a, hmem, hsn, hlow, rfl⟩)),
+        hsign⟩
+
+/-- **Exact 1-input membership decomposition of `nanChoices dst [(src, a)] .nondeterministic`**
+(for `.cast .floatToFloat` NaN propagation in Episode 2). -/
+theorem mem_nanChoices_nondet_single_iff (src dst : IeeeFormat) (a x : Nat) :
+    x ∈ nanChoices dst [(src, a)] .nondeterministic ↔
+      (x = preferredNaNBits dst ∨ x = evalFloatNeg dst (preferredNaNBits dst)) ∨
+      (isNaNBits src a = true ∧
+        (x = quietedNaNCand src dst a ∨ x = evalFloatNeg dst (quietedNaNCand src dst a))) ∨
+      (isSignalingNaNBits src a = true ∧ signalingNaNLowerPayload src dst a ≠ 0 ∧
+        (x = signalingNaNCand src dst a ∨ x = evalFloatNeg dst (signalingNaNCand src dst a))) := by
+  rw [mem_nanChoices_nondet_iff]
+  constructor
+  · rintro (hp | ⟨s, u, hmem, hnan, hsign⟩ | ⟨s, u, hmem, hsn, hlow, hsign⟩)
+    · exact Or.inl hp
+    · rcases List.mem_cons.mp hmem with heq | hnil
+      · injection heq with hs hu; subst hs hu
+        exact Or.inr (Or.inl ⟨hnan, hsign⟩)
+      · cases hnil
+    · rcases List.mem_cons.mp hmem with heq | hnil
+      · injection heq with hs hu; subst hs hu
+        exact Or.inr (Or.inr ⟨hsn, hlow, hsign⟩)
+      · cases hnil
+  · rintro (hp | ⟨hnan, hsign⟩ | ⟨hsn, hlow, hsign⟩)
+    · exact Or.inl hp
+    · exact Or.inr (Or.inl ⟨src, a, List.mem_cons_self, hnan, hsign⟩)
+    · exact Or.inr (Or.inr ⟨src, a, List.mem_cons_self, hsn, hlow, hsign⟩)
+
+/-- **Exact 2-input binary membership decomposition of `nanChoices f [(f, a), (f, b)] .nondeterministic`**:
+explicitly decomposes membership into the five target-independent branches:
+1. preferred quiet NaN (both signs);
+2. quieted `a` (both signs, if `a` is NaN);
+3. quieted `b` (both signs, if `b` is NaN);
+4. signaling `a` (both signs, if `a` is sNaN with nonzero lower payload);
+5. signaling `b` (both signs, if `b` is sNaN with nonzero lower payload). -/
+theorem mem_nanChoices_nondet_binary_iff (f : IeeeFormat) (a b x : Nat) :
+    x ∈ nanChoices f [(f, a), (f, b)] .nondeterministic ↔
+      (x = preferredNaNBits f ∨ x = evalFloatNeg f (preferredNaNBits f)) ∨
+      (isNaNBits f a = true ∧
+        (x = quietedNaNCand f f a ∨ x = evalFloatNeg f (quietedNaNCand f f a))) ∨
+      (isNaNBits f b = true ∧
+        (x = quietedNaNCand f f b ∨ x = evalFloatNeg f (quietedNaNCand f f b))) ∨
+      (isSignalingNaNBits f a = true ∧ signalingNaNLowerPayload f f a ≠ 0 ∧
+        (x = signalingNaNCand f f a ∨ x = evalFloatNeg f (signalingNaNCand f f a))) ∨
+      (isSignalingNaNBits f b = true ∧ signalingNaNLowerPayload f f b ≠ 0 ∧
+        (x = signalingNaNCand f f b ∨ x = evalFloatNeg f (signalingNaNCand f f b))) := by
+  rw [mem_nanChoices_nondet_iff]
+  constructor
+  · rintro (hp | ⟨s, u, hmem, hnan, hsign⟩ | ⟨s, u, hmem, hsn, hlow, hsign⟩)
+    · exact Or.inl hp
+    · rcases List.mem_cons.mp hmem with heq | hmem
+      · injection heq with hs hu; subst hs hu
+        exact Or.inr (Or.inl ⟨hnan, hsign⟩)
+      · rcases List.mem_cons.mp hmem with heq | hnil
+        · injection heq with hs hu; subst hs hu
+          exact Or.inr (Or.inr (Or.inl ⟨hnan, hsign⟩))
+        · cases hnil
+    · rcases List.mem_cons.mp hmem with heq | hmem
+      · injection heq with hs hu; subst hs hu
+        exact Or.inr (Or.inr (Or.inr (Or.inl ⟨hsn, hlow, hsign⟩)))
+      · rcases List.mem_cons.mp hmem with heq | hnil
+        · injection heq with hs hu; subst hs hu
+          exact Or.inr (Or.inr (Or.inr (Or.inr ⟨hsn, hlow, hsign⟩)))
+        · cases hnil
+  · rintro (hp | ⟨hnan, hsign⟩ | ⟨hnan, hsign⟩ | ⟨hsn, hlow, hsign⟩ | ⟨hsn, hlow, hsign⟩)
+    · exact Or.inl hp
+    · exact Or.inr (Or.inl ⟨f, a, List.mem_cons_self, hnan, hsign⟩)
+    · exact Or.inr (Or.inl ⟨f, b, List.mem_cons_of_mem _ List.mem_cons_self, hnan, hsign⟩)
+    · exact Or.inr (Or.inr ⟨f, a, List.mem_cons_self, hsn, hlow, hsign⟩)
+    · exact Or.inr (Or.inr ⟨f, b, List.mem_cons_of_mem _ List.mem_cons_self, hsn, hlow, hsign⟩)
+
+private theorem nat_lor_two_pow_mod_two_pow (p k : Nat) (hp : p < 2 ^ k) :
+    Nat.lor p (2 ^ k) % 2 ^ k = p := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  change ((p ||| 2 ^ k) % 2 ^ k).testBit i = p.testBit i
+  rw [Nat.testBit_mod_two_pow, Nat.testBit_or, Nat.testBit_two_pow]
+  by_cases hi : i < k
+  · have hne : k ≠ i := Nat.ne_of_gt hi
+    simp [hi, hne]
+  · simp only [hi, decide_false, Bool.false_and]
+    exact (Nat.testBit_lt_two_pow
+      (Nat.lt_of_lt_of_le hp (two_pow_le_two_pow (Nat.le_of_not_lt hi)))).symm
+
+/-- Same-format quieting of an already-quiet NaN returns its canonical bit pattern unchanged. -/
+theorem quietedNaNCand_same_fmt_of_quiet (f : IeeeFormat) (a : Nat)
+    (hq : isQuietNaNBits f a = true) :
+    quietedNaNCand f f a = a % 2 ^ f.width := by
+  unfold quietedNaNCand
+  rw [evalFloatToFloatRoundTiesToEven_self_eq f (a % 2 ^ f.width) (Nat.mod_lt a (Nat.two_pow_pos f.width)),
+    decodeBits_mod]
+  unfold isQuietNaNBits at hq
+  cases hd : decodeBits f a with
+  | nan _ q _ =>
+    rw [hd] at hq
+    subst hq
+    rfl
+  | _ => rfl
+
+/-- **Same-format signaling NaN simplification**: when `src = dst = f`, a signaling NaN input
+ALWAYS has a nonzero lower payload (`signalingNaNLowerPayload f f a ≠ 0`) and its unchanged
+signaling NaN candidate is literally its own canonical bit pattern `a % 2 ^ f.width`. -/
+theorem signalingNaN_same_fmt_eq_self (f : IeeeFormat) (a : Nat)
+    (hsn : isSignalingNaNBits f a = true) :
+    signalingNaNLowerPayload f f a ≠ 0 ∧
+    signalingNaNCand f f a = a % 2 ^ f.width := by
+  have hdec : ∃ neg payload, decodeBits f (a % 2 ^ f.width) = .nan neg false payload := by
+    rw [decodeBits_mod]
+    unfold isSignalingNaNBits at hsn
+    cases hd : decodeBits f a with
+    | nan neg q payload =>
+      rw [hd] at hsn
+      cases q with
+      | true => cases hsn
+      | false => exact ⟨neg, payload, rfl⟩
+    | _ => rw [hd] at hsn; cases hsn
+  obtain ⟨neg, payload, hd⟩ := hdec
+  obtain ⟨_, hp_ne, hp_lt, hq_eq⟩ := decodeBits_nan_payload f (a % 2 ^ f.width) neg false payload hd
+  have hsplit : 2 ^ f.fractionBits = 2 * 2 ^ (f.fractionBits - 1) := by cases f <;> decide
+  have hp_lt_half : payload < 2 ^ (f.fractionBits - 1) := by
+    have hdm := Nat.div_add_mod payload (2 ^ (f.fractionBits - 1))
+    cases hd0 : payload / 2 ^ (f.fractionBits - 1) with
+    | zero =>
+      rw [hd0, Nat.mul_zero, Nat.zero_add] at hdm
+      rw [← hdm]
+      exact Nat.mod_lt payload (Nat.two_pow_pos (f.fractionBits - 1))
+    | succ k =>
+      cases k with
+      | zero =>
+        rw [hd0] at hq_eq
+        cases hq_eq
+      | succ _ =>
+        rw [hd0, Nat.mul_succ, Nat.mul_succ] at hdm
+        omega
+  have hq_cand : quietedNaNCand f f a =
+      encodeBits f neg (2 ^ f.exponentBits - 1) (Nat.lor payload (2 ^ (f.fractionBits - 1))) := by
+    unfold quietedNaNCand
+    rw [evalFloatToFloatRoundTiesToEven_of_nan f f (a % 2 ^ f.width) neg false payload hd]
+    have hsame :
+        (if f.fractionBits ≤ f.fractionBits then
+          Nat.lor payload (2 ^ (f.fractionBits - 1)) * 2 ^ (f.fractionBits - f.fractionBits)
+        else Nat.lor payload (2 ^ (f.fractionBits - 1)) / 2 ^ (f.fractionBits - f.fractionBits)) =
+          Nat.lor payload (2 ^ (f.fractionBits - 1)) := by
+      rw [if_pos' (Nat.le_refl _), Nat.sub_self, Nat.pow_zero, Nat.mul_one]
+    have hlor_idem : ∀ u v : Nat, Nat.lor (Nat.lor u v) v = Nat.lor u v := by
+      intro u v; change (u ||| v) ||| v = u ||| v; rw [Nat.or_assoc, Nat.or_self]
+    rw [hsame, hlor_idem]
+  have hE : 2 ^ f.exponentBits - 1 < 2 ^ f.exponentBits :=
+    Nat.sub_lt (Nat.two_pow_pos _) (by decide)
+  have hq_lt : Nat.lor payload (2 ^ (f.fractionBits - 1)) < 2 ^ f.fractionBits :=
+    Nat.or_lt_two_pow hp_lt (two_pow_lt_two_pow (Nat.sub_lt (IeeeFormat.one_le_fb f) (by decide)))
+  have hunp : unpackBits f (quietedNaNCand f f a) =
+      { neg := neg, exponent := 2 ^ f.exponentBits - 1,
+        fraction := Nat.lor payload (2 ^ (f.fractionBits - 1)) } := by
+    rw [hq_cand, unpackBits_encodeBits f neg _ _ hE hq_lt]
+  have hlow_eq : signalingNaNLowerPayload f f a = payload := by
+    unfold signalingNaNLowerPayload
+    rw [hunp]
+    exact nat_lor_two_pow_mod_two_pow payload (f.fractionBits - 1) hp_lt_half
+  have horig_unp : unpackBits f (a % 2 ^ f.width) =
+      { neg := neg, exponent := 2 ^ f.exponentBits - 1, fraction := payload } := by
+    have hraw := hd
+    unfold decodeBits at hraw
+    dsimp only at hraw
+    by_cases hEeq : (unpackBits f (a % 2 ^ f.width)).exponent = 2 ^ f.exponentBits - 1
+    · rw [if_pos' hEeq] at hraw
+      by_cases hF0 : (unpackBits f (a % 2 ^ f.width)).fraction = 0
+      · rw [if_pos' hF0] at hraw; cases hraw
+      · rw [if_neg' hF0] at hraw
+        injection hraw with hneg _ hfrac
+        cases hu : unpackBits f (a % 2 ^ f.width) with
+        | mk un ue uf =>
+          rw [hu] at hneg hEeq hfrac
+          dsimp only at hneg hEeq hfrac
+          rw [hneg, hEeq, hfrac]
+    · rw [if_neg' hEeq] at hraw
+      by_cases hE0 : (unpackBits f (a % 2 ^ f.width)).exponent = 0
+      · rw [if_pos' hE0] at hraw
+        by_cases hF0 : (unpackBits f (a % 2 ^ f.width)).fraction = 0
+        · rw [if_pos' hF0] at hraw; cases hraw
+        · rw [if_neg' hF0] at hraw; cases hraw
+      · rw [if_neg' hE0] at hraw; cases hraw
+  refine ⟨by rw [hlow_eq]; exact hp_ne, ?_⟩
+  unfold signalingNaNCand
+  rw [hunp, hlow_eq]
+  have henc := encodeBits_unpackBits f (a % 2 ^ f.width) (Nat.mod_lt a (Nat.two_pow_pos f.width))
+  rw [horig_unp] at henc
+  exact henc
+
+/-- **Simplified same-format 2-input `nanChoices` membership decomposition**: in binary
+arithmetic (`src = dst = f`), the signaling-NaN branches reduce directly to each signaling
+input's own canonical bit pattern `a % 2 ^ f.width` / `b % 2 ^ f.width` (with either sign),
+with no extra lower-payload nonzero side condition. -/
+theorem mem_nanChoices_nondet_binary_same_fmt_iff (f : IeeeFormat) (a b x : Nat) :
+    x ∈ nanChoices f [(f, a), (f, b)] .nondeterministic ↔
+      (x = preferredNaNBits f ∨ x = evalFloatNeg f (preferredNaNBits f)) ∨
+      (isNaNBits f a = true ∧
+        (x = quietedNaNCand f f a ∨ x = evalFloatNeg f (quietedNaNCand f f a))) ∨
+      (isNaNBits f b = true ∧
+        (x = quietedNaNCand f f b ∨ x = evalFloatNeg f (quietedNaNCand f f b))) ∨
+      (isSignalingNaNBits f a = true ∧ (x = a % 2 ^ f.width ∨ x = evalFloatNeg f a)) ∨
+      (isSignalingNaNBits f b = true ∧ (x = b % 2 ^ f.width ∨ x = evalFloatNeg f b)) := by
+  rw [mem_nanChoices_nondet_binary_iff]
+  constructor
+  · rintro (hp | hqa | hqb | ⟨hsa, _, hsa_eq⟩ | ⟨hsb, _, hsb_eq⟩)
+    · exact Or.inl hp
+    · exact Or.inr (Or.inl hqa)
+    · exact Or.inr (Or.inr (Or.inl hqb))
+    · obtain ⟨_, hca⟩ := signalingNaN_same_fmt_eq_self f a hsa
+      rw [hca, evalFloatNeg_mod] at hsa_eq
+      exact Or.inr (Or.inr (Or.inr (Or.inl ⟨hsa, hsa_eq⟩)))
+    · obtain ⟨_, hcb⟩ := signalingNaN_same_fmt_eq_self f b hsb
+      rw [hcb, evalFloatNeg_mod] at hsb_eq
+      exact Or.inr (Or.inr (Or.inr (Or.inr ⟨hsb, hsb_eq⟩)))
+  · rintro (hp | hqa | hqb | ⟨hsa, hsa_eq⟩ | ⟨hsb, hsb_eq⟩)
+    · exact Or.inl hp
+    · exact Or.inr (Or.inl hqa)
+    · exact Or.inr (Or.inr (Or.inl hqb))
+    · obtain ⟨hlow, hca⟩ := signalingNaN_same_fmt_eq_self f a hsa
+      rw [← evalFloatNeg_mod f a, ← hca] at hsa_eq
+      exact Or.inr (Or.inr (Or.inr (Or.inl ⟨hsa, hlow, hsa_eq⟩)))
+    · obtain ⟨hlow, hcb⟩ := signalingNaN_same_fmt_eq_self f b hsb
+      rw [← evalFloatNeg_mod f b, ← hcb] at hsb_eq
+      exact Or.inr (Or.inr (Or.inr (Or.inr ⟨hsb, hlow, hsb_eq⟩)))
+
+/-- **Monotonicity of `nanChoices` membership under input-list inclusion** (both modes). -/
+theorem mem_nanChoices_mono (dst : IeeeFormat) (xs ys : List (IeeeFormat × Nat))
+    (mode : FloatArithMode) (hsub : ∀ inp, inp ∈ xs → inp ∈ ys) (x : Nat)
+    (hx : x ∈ nanChoices dst xs mode) :
+    x ∈ nanChoices dst ys mode := by
+  cases mode with
+  | deterministic => exact hx
+  | nondeterministic =>
+    rw [mem_nanChoices_nondet_iff] at hx ⊢
+    rcases hx with hp | ⟨src, a, hmem, hnan, hsign⟩ | ⟨src, a, hmem, hsn, hlow, hsign⟩
+    · exact Or.inl hp
+    · exact Or.inr (Or.inl ⟨src, a, hsub _ hmem, hnan, hsign⟩)
+    · exact Or.inr (Or.inr ⟨src, a, hsub _ hmem, hsn, hlow, hsign⟩)
+
+/-- **Mode-parametric input-swap invariance of binary `nanChoices` membership**. -/
+theorem mem_nanChoices_swap (mode : FloatArithMode) (f : IeeeFormat) (a b x : Nat) :
+    x ∈ nanChoices f [(f, a), (f, b)] mode ↔ x ∈ nanChoices f [(f, b), (f, a)] mode := by
+  cases mode with
+  | deterministic => exact Iff.rfl
+  | nondeterministic =>
+    rw [mem_nanChoices_nondet_binary_iff, mem_nanChoices_nondet_binary_iff]
+    exact ⟨fun h => by rcases h with h | h | h | h | h
+                       · exact Or.inl h
+                       · exact Or.inr (Or.inr (Or.inl h))
+                       · exact Or.inr (Or.inl h)
+                       · exact Or.inr (Or.inr (Or.inr (Or.inr h)))
+                       · exact Or.inr (Or.inr (Or.inr (Or.inl h))),
+           fun h => by rcases h with h | h | h | h | h
+                       · exact Or.inl h
+                       · exact Or.inr (Or.inr (Or.inl h))
+                       · exact Or.inr (Or.inl h)
+                       · exact Or.inr (Or.inr (Or.inr (Or.inr h)))
+                       · exact Or.inr (Or.inr (Or.inr (Or.inl h)))⟩
+
 /-! ### `FloatArithMode` inclusion & deterministic realization -/
 
 theorem EvalFloatBinOpRel.det_imp_nondet
@@ -4394,7 +5063,8 @@ private theorem mem_nanChoices_nondet_neg_input_aux (dst : IeeeFormat)
           · exact Or.inl rfl
         · exact ⟨c, List.mem_cons_of_mem _ (List.mem_append.mpr (Or.inr (List.mem_append.mpr (Or.inr hs2)))), hxeq⟩
 
-private theorem mem_nanChoices_nondet_swap (f : IeeeFormat) (a b x : Nat) :
+/-- Swapping the two inputs of binary `.nondeterministic` `nanChoices` preserves membership. -/
+theorem mem_nanChoices_nondet_swap (f : IeeeFormat) (a b x : Nat) :
     x ∈ nanChoices f [(f, a), (f, b)] .nondeterministic ↔
       x ∈ nanChoices f [(f, b), (f, a)] .nondeterministic := by
   have hmem2 : ∀ (u v c : Nat), c ∈ [u, v] ↔ c ∈ [v, u] := by
@@ -4751,7 +5421,8 @@ private theorem evalFloatArithBase_mul_div_neg_right
     · exact ⟨_, _, rfl, rfl, rfl, fun h => by rw [isNaNBits_preferredNaNBits] at h; cases h⟩
     · exact ⟨_, _, rfl, rfl, rfl, fun h => by rw [isNaNBits_preferredNaNBits] at h; cases h⟩
 
-private theorem evalFloatArithBase_lt (op : BinOp) (f : IeeeFormat) (a b bits : Nat)
+/-- Every output of `evalFloatArithBase` is canonical (`< 2 ^ f.width`). -/
+theorem evalFloatArithBase_lt (op : BinOp) (f : IeeeFormat) (a b bits : Nat)
     (h : evalFloatArithBase op f a b = .some bits) : bits < 2 ^ f.width := by
   have hsum_lt : ∀ (l r : FloatKind),
       (∀ s n d, l = .finite s n d → 0 < d) →
@@ -14041,6 +14712,106 @@ def isFloatBinOp : BinOp → Bool
   | .add | .sub | .mul | .div | .rem | .eq | .ne | .lt | .le | .gt | .ge => true
   | _ => false
 
+/-- `true` exactly on the five IEEE-754 arithmetic `BinOp`s (`add`, `sub`, `mul`, `div`, `rem`). -/
+def isFloatArithBinOp : BinOp → Bool
+  | .add | .sub | .mul | .div | .rem => true
+  | _ => false
+
+/-- `true` exactly on the six IEEE-754 comparison `BinOp`s (`eq`, `ne`, `lt`, `le`, `gt`, `ge`). -/
+def isFloatCmpBinOp : BinOp → Bool
+  | .eq | .ne | .lt | .le | .gt | .ge => true
+  | _ => false
+
+/-- `isFloatBinOp` is the disjoint union of `isFloatArithBinOp` and `isFloatCmpBinOp`. -/
+theorem isFloatBinOp_partition (op : BinOp) :
+    isFloatBinOp op = Bool.or (isFloatArithBinOp op) (isFloatCmpBinOp op) ∧
+    Bool.and (isFloatArithBinOp op) (isFloatCmpBinOp op) = false := by
+  cases op <;> exact ⟨rfl, rfl⟩
+
+/-- `evalFloatCmp` returns `.none` iff `op` is not one of the six IEEE-754 comparison ops. -/
+theorem evalFloatCmp_eq_none_iff (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    evalFloatCmp op f a b = .none ↔ isFloatCmpBinOp op = false := by
+  cases op <;>
+    first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (nomatch h), fun h => (nomatch h)⟩
+
+/-- `evalFloatCmp` returns `.some _` iff `op` is one of the six IEEE-754 comparison ops. -/
+theorem evalFloatCmp_isSome_iff (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    (∃ c, evalFloatCmp op f a b = .some c) ↔ isFloatCmpBinOp op = true := by
+  constructor
+  · rintro ⟨c, hc⟩
+    cases hop : isFloatCmpBinOp op with
+    | true => rfl
+    | false =>
+      have hn := (evalFloatCmp_eq_none_iff op f a b).mpr hop
+      rw [hc] at hn
+      cases hn
+  · intro hop
+    cases h : evalFloatCmp op f a b with
+    | some c => exact ⟨c, rfl⟩
+    | none =>
+      have hf := (evalFloatCmp_eq_none_iff op f a b).mp h
+      rw [hop] at hf
+      cases hf
+
+/-- `evalFloatCmp` always returns `.none` on every float arithmetic `BinOp`. -/
+theorem evalFloatCmp_of_arith (op : BinOp) (f : IeeeFormat) (a b : Nat)
+    (hop : isFloatArithBinOp op = true) :
+    evalFloatCmp op f a b = .none := by
+  apply (evalFloatCmp_eq_none_iff op f a b).mpr
+  have hdisj := (isFloatBinOp_partition op).2
+  rw [hop, Bool.true_and] at hdisj
+  exact hdisj
+
+/-- `evalFloatArithBase` returns `.none` iff `op` is not one of the five IEEE-754 arithmetic ops. -/
+theorem evalFloatArithBase_eq_none_iff (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    evalFloatArithBase op f a b = .none ↔ isFloatArithBinOp op = false := by
+  cases op <;>
+    first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (nomatch h), fun h => (nomatch h)⟩
+
+/-- `evalFloatArithBase` returns `.some _` iff `op` is one of the five IEEE-754 arithmetic ops. -/
+theorem evalFloatArithBase_isSome_iff (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    (∃ bits, evalFloatArithBase op f a b = .some bits) ↔ isFloatArithBinOp op = true := by
+  constructor
+  · rintro ⟨bits, hb⟩
+    cases hop : isFloatArithBinOp op with
+    | true => rfl
+    | false =>
+      have hn := (evalFloatArithBase_eq_none_iff op f a b).mpr hop
+      rw [hb] at hn
+      cases hn
+  · intro hop
+    cases h : evalFloatArithBase op f a b with
+    | some bits => exact ⟨bits, rfl⟩
+    | none =>
+      have hf := (evalFloatArithBase_eq_none_iff op f a b).mp h
+      rw [hop] at hf
+      cases hf
+
+/-- `evalFloatArithBase` depends on both operands only modulo `2 ^ f.width`. -/
+theorem evalFloatArithBase_mod (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    evalFloatArithBase op f (a % 2 ^ f.width) (b % 2 ^ f.width) =
+      evalFloatArithBase op f a b := by
+  unfold evalFloatArithBase
+  rw [Nat.mod_mod, Nat.mod_mod]
+
+/-- `evalFloatBinOp` depends on both operands only modulo `2 ^ f.width`. -/
+theorem evalFloatBinOp_mod (op : BinOp) (f : IeeeFormat) (a b : Nat) :
+    evalFloatBinOp op f (a % 2 ^ f.width) (b % 2 ^ f.width) = evalFloatBinOp op f a b := by
+  unfold evalFloatBinOp
+  rw [evalFloatCmp_mod, evalFloatArithBase_mod]
+
+/-- `EvalFloatBinOpRel` depends on both operands only modulo `2 ^ f.width` (in both modes). -/
+theorem EvalFloatBinOpRel_mod (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) :
+    EvalFloatBinOpRel mode op f (a % 2 ^ f.width) (b % 2 ^ f.width) out ↔
+      EvalFloatBinOpRel mode op f a b out := by
+  unfold EvalFloatBinOpRel
+  rw [evalFloatCmp_mod, evalFloatArithBase_mod, Nat.mod_mod, Nat.mod_mod]
+
 /-- **Closed-form supportedness of `evalFloatBinOp`**: it returns `.none` exactly on the
 non-float `BinOp`s, independently of the format and of both operands (in particular float
 division and remainder by zero, NaN operands, and overflow are never `.none`). -/
@@ -14131,6 +14902,210 @@ theorem EvalFloatBinOpRel_out_wf (mode : FloatArithMode) (op : BinOp) (f : IeeeF
       · rw [if_neg' hnan] at h
         rw [h]
         exact Or.inr ⟨rfl, rfl, evalFloatArithBase_lt op f a b baseBits harith⟩
+
+/-- Inversion of `evalFloatBinOp` on any comparison `BinOp` (`eq`, `ne`, `lt`, `le`, `gt`, `ge`). -/
+theorem evalFloatBinOp_cmp_iff (op : BinOp) (f : IeeeFormat) (a b : Nat) (out : ScalarInt)
+    (hop : isFloatCmpBinOp op = true) :
+    evalFloatBinOp op f a b = .some out ↔
+      ∃ c, evalFloatCmp op f a b = .some c ∧ out = boolToScalar c := by
+  obtain ⟨c, hc⟩ := (evalFloatCmp_isSome_iff op f a b).mpr hop
+  unfold evalFloatBinOp
+  rw [hc]
+  constructor
+  · intro h
+    injection h with hsc
+    exact ⟨c, rfl, hsc.symm⟩
+  · rintro ⟨c', hc', rfl⟩
+    injection hc' with hcc
+    rw [hcc]
+
+/-- Inversion of `evalFloatBinOp` on any arithmetic `BinOp` (`add`, `sub`, `mul`, `div`, `rem`). -/
+theorem evalFloatBinOp_arith_iff (op : BinOp) (f : IeeeFormat) (a b : Nat) (out : ScalarInt)
+    (hop : isFloatArithBinOp op = true) :
+    evalFloatBinOp op f a b = .some out ↔
+      ∃ baseBits, evalFloatArithBase op f a b = .some baseBits ∧ out = ⟨baseBits, f.byteWidth⟩ := by
+  have hcmp := evalFloatCmp_of_arith op f a b hop
+  obtain ⟨bits, hb⟩ := (evalFloatArithBase_isSome_iff op f a b).mpr hop
+  unfold evalFloatBinOp
+  rw [hcmp, hb]
+  constructor
+  · intro h
+    injection h with hsc
+    exact ⟨bits, rfl, hsc.symm⟩
+  · rintro ⟨bits', hb', rfl⟩
+    injection hb' with hbb
+    rw [hbb]
+
+/-- Direct inversion of `EvalFloatBinOpRel` when `evalFloatCmp op f a b = .some c` is known
+(both modes). -/
+theorem EvalFloatBinOpRel_of_cmp (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) (c : Bool) (hcmp : evalFloatCmp op f a b = .some c) :
+    EvalFloatBinOpRel mode op f a b out ↔ out = boolToScalar c := by
+  unfold EvalFloatBinOpRel
+  rw [hcmp]
+
+/-- **Comparison-op inversion of `EvalFloatBinOpRel`** (both modes): for every comparison
+`BinOp` (`eq`, `ne`, `lt`, `le`, `gt`, `ge`), `EvalFloatBinOpRel` holds iff `out` is the
+`bool` scalar produced by `evalFloatCmp`. -/
+theorem EvalFloatBinOpRel_cmp_iff (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) (hop : isFloatCmpBinOp op = true) :
+    EvalFloatBinOpRel mode op f a b out ↔
+      ∃ c, evalFloatCmp op f a b = .some c ∧ out = boolToScalar c := by
+  obtain ⟨c, hc⟩ := (evalFloatCmp_isSome_iff op f a b).mpr hop
+  rw [EvalFloatBinOpRel_of_cmp mode op f a b out c hc]
+  constructor
+  · intro h; exact ⟨c, hc, h⟩
+  · rintro ⟨c', hc', h⟩
+    rw [hc] at hc'
+    injection hc' with hcc
+    rw [h, ← hcc]
+
+/-- **NaN-base inversion of `EvalFloatBinOpRel`** (both modes; pairs with
+`EvalFloatBinOpRel_of_base_not_nan`): whenever `evalFloatArithBase` yields a NaN bit pattern,
+`EvalFloatBinOpRel` admits EXACTLY the candidates of `nanChoices f [(f, a), (f, b)] mode`. -/
+theorem EvalFloatBinOpRel_of_base_nan (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b baseBits : Nat) (out : ScalarInt)
+    (hcmp : evalFloatCmp op f a b = .none)
+    (hbase : evalFloatArithBase op f a b = .some baseBits)
+    (hnan : isNaNBits f baseBits = true) :
+    EvalFloatBinOpRel mode op f a b out ↔
+      ∃ cand,
+        cand ∈ nanChoices f [(f, a), (f, b)] mode ∧
+        out = ⟨cand, f.byteWidth⟩ := by
+  unfold EvalFloatBinOpRel
+  rw [hcmp, hbase]
+  dsimp only
+  rw [if_pos' hnan, nanChoices_mod_pair]
+
+/-- **Known-base arithmetic inversion of `EvalFloatBinOpRel`** (both modes): given
+`isFloatArithBinOp op = true` and `evalFloatArithBase op f a b = .some baseBits`, splits
+directly on `isNaNBits f baseBits` into `nanChoices f [(f, a), (f, b)] mode` vs `baseBits`. -/
+theorem EvalFloatBinOpRel_arith_of_base_iff (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b baseBits : Nat) (out : ScalarInt)
+    (hop : isFloatArithBinOp op = true)
+    (hbase : evalFloatArithBase op f a b = .some baseBits) :
+    EvalFloatBinOpRel mode op f a b out ↔
+      (if isNaNBits f baseBits = true then
+        ∃ cand,
+          cand ∈ nanChoices f [(f, a), (f, b)] mode ∧
+          out = ⟨cand, f.byteWidth⟩
+      else
+        out = ⟨baseBits, f.byteWidth⟩) := by
+  have hcmp := evalFloatCmp_of_arith op f a b hop
+  cases hnan : isNaNBits f baseBits with
+  | true =>
+    rw [if_pos' rfl]
+    exact EvalFloatBinOpRel_of_base_nan mode op f a b baseBits out hcmp hbase hnan
+  | false =>
+    rw [if_neg' Bool.false_ne_true]
+    exact EvalFloatBinOpRel_of_base_not_nan mode op f a b baseBits out hcmp hbase hnan
+
+/-- **Arithmetic-op inversion of `EvalFloatBinOpRel`** (both modes): for every arithmetic
+`BinOp` (`add`, `sub`, `mul`, `div`, `rem`), `EvalFloatBinOpRel` holds iff `evalFloatArithBase`
+produces `baseBits` and either `baseBits` is NaN with `out` from `nanChoices f [(f, a), (f, b)] mode`,
+or `baseBits` is non-NaN with `out = ⟨baseBits, f.byteWidth⟩`. -/
+theorem EvalFloatBinOpRel_arith_iff (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) (hop : isFloatArithBinOp op = true) :
+    EvalFloatBinOpRel mode op f a b out ↔
+      ∃ baseBits,
+        evalFloatArithBase op f a b = .some baseBits ∧
+        ((isNaNBits f baseBits = true ∧
+            ∃ cand,
+              cand ∈ nanChoices f [(f, a), (f, b)] mode ∧
+              out = ⟨cand, f.byteWidth⟩) ∨
+          (isNaNBits f baseBits = false ∧ out = ⟨baseBits, f.byteWidth⟩)) := by
+  obtain ⟨bits, hb⟩ := (evalFloatArithBase_isSome_iff op f a b).mpr hop
+  rw [EvalFloatBinOpRel_arith_of_base_iff mode op f a b bits out hop hb]
+  constructor
+  · intro h
+    cases hnan : isNaNBits f bits with
+    | true =>
+      rw [hnan, if_pos' rfl] at h
+      exact ⟨bits, hb, Or.inl ⟨hnan, h⟩⟩
+    | false =>
+      rw [hnan, if_neg' Bool.false_ne_true] at h
+      exact ⟨bits, hb, Or.inr ⟨hnan, h⟩⟩
+  · rintro ⟨bits', hb', hcase⟩
+    rw [hb] at hb'
+    injection hb' with hbb
+    subst hbb
+    rcases hcase with ⟨hnan, hcand⟩ | ⟨hnan, hout⟩
+    · rw [if_pos' hnan]; exact hcand
+    · rw [if_neg' (by rw [hnan]; exact Bool.false_ne_true)]; exact hout
+
+/-- **Unsupported-op inversion of `EvalFloatBinOpRel`** (both modes): every non-float `BinOp`
+is identically `False`. -/
+theorem EvalFloatBinOpRel_unsupported_iff (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) (hop : isFloatBinOp op = false) :
+    EvalFloatBinOpRel mode op f a b out ↔ False :=
+  ⟨fun h => (EvalFloatBinOpRel_none_iff mode op f a b).mpr
+      ((evalFloatBinOp_eq_none_iff op f a b).mpr hop) out h,
+    False.elim⟩
+
+/-- **Unified 3-way inversion of `EvalFloatBinOpRel`** (both modes): decomposes an arbitrary
+`BinOp` into comparison, arithmetic (NaN vs non-NaN), or unsupported (`False`). -/
+theorem EvalFloatBinOpRel_iff_cases (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) :
+    EvalFloatBinOpRel mode op f a b out ↔
+      (isFloatCmpBinOp op = true ∧
+        ∃ c, evalFloatCmp op f a b = .some c ∧ out = boolToScalar c) ∨
+      (isFloatArithBinOp op = true ∧
+        ∃ baseBits, evalFloatArithBase op f a b = .some baseBits ∧
+          ((isNaNBits f baseBits = true ∧
+              ∃ cand,
+                cand ∈ nanChoices f [(f, a), (f, b)] mode ∧
+                out = ⟨cand, f.byteWidth⟩) ∨
+            (isNaNBits f baseBits = false ∧ out = ⟨baseBits, f.byteWidth⟩))) := by
+  have ⟨hpart, hdisj⟩ := isFloatBinOp_partition op
+  cases hcmp : isFloatCmpBinOp op with
+  | true =>
+    have harith : isFloatArithBinOp op = false := by
+      rw [hcmp, Bool.and_true] at hdisj; exact hdisj
+    rw [EvalFloatBinOpRel_cmp_iff mode op f a b out hcmp]
+    constructor
+    · intro h; exact Or.inl ⟨rfl, h⟩
+    · rintro (⟨_, h⟩ | ⟨ha, _⟩)
+      · exact h
+      · rw [harith] at ha; cases ha
+  | false =>
+    cases harith : isFloatArithBinOp op with
+    | true =>
+      rw [EvalFloatBinOpRel_arith_iff mode op f a b out harith]
+      constructor
+      · intro h; exact Or.inr ⟨rfl, h⟩
+      · rintro (⟨hc, _⟩ | ⟨_, h⟩)
+        · cases hc
+        · exact h
+    | false =>
+      have hnot : isFloatBinOp op = false := by rw [hpart, harith, hcmp]; rfl
+      rw [EvalFloatBinOpRel_unsupported_iff mode op f a b out hnot]
+      constructor
+      · exact False.elim
+      · rintro (⟨hc, _⟩ | ⟨ha, _⟩)
+        · cases hc
+        · cases ha
+
+/-- **Mode-parametric commutativity of `EvalFloatBinOpRel` for `+` and `*`** (holds in BOTH
+`.deterministic` and `.nondeterministic` modes, on ALL bit patterns including NaNs). -/
+theorem EvalFloatBinOpRel_add_mul_comm (mode : FloatArithMode) (f : IeeeFormat)
+    (a b : Nat) (out : ScalarInt) :
+    (EvalFloatBinOpRel mode .add f a b out ↔ EvalFloatBinOpRel mode .add f b a out) ∧
+    (EvalFloatBinOpRel mode .mul f a b out ↔ EvalFloatBinOpRel mode .mul f b a out) := by
+  have hcomm : ∀ (op : BinOp), isFloatArithBinOp op = true →
+      evalFloatArithBase op f a b = evalFloatArithBase op f b a →
+      (EvalFloatBinOpRel mode op f a b out ↔ EvalFloatBinOpRel mode op f b a out) := by
+    intro op hop hbase_comm
+    obtain ⟨bits, hb⟩ := (evalFloatArithBase_isSome_iff op f b a).mpr hop
+    rw [EvalFloatBinOpRel_arith_of_base_iff mode op f a b bits out hop (hbase_comm.trans hb),
+      EvalFloatBinOpRel_arith_of_base_iff mode op f b a bits out hop hb]
+    cases isNaNBits f bits with
+    | false => exact Iff.rfl
+    | true =>
+      rw [if_pos' rfl, if_pos' rfl]
+      exact ⟨fun ⟨c, hc, ho⟩ => ⟨c, (mem_nanChoices_swap mode f a b c).mp hc, ho⟩,
+             fun ⟨c, hc, ho⟩ => ⟨c, (mem_nanChoices_swap mode f a b c).mpr hc, ho⟩⟩
+  exact ⟨hcomm .add rfl (evalFloatArithBase_add_comm f a b),
+    hcomm .mul rfl (evalFloatArithBase_mul_comm f a b)⟩
 
 /-- **Policy irrelevance outside byte casts**: for every `rv` other than `.cast .transmute` and
 `.cast .subtype`, `EvalRvalueFloatRel` does not depend on the `Ptr2IntTransmutePolicy`. -/
@@ -14814,6 +15789,193 @@ theorem EvalRvalueFloatRel_floatToFloat_nan_iff
   dsimp only
   rw [if_pos' hnan]
 
+/-- Exact `.ok` inversion of `evalFloatUnaryNeg`. -/
+theorem evalFloatUnaryNeg_eq_ok_iff (sc : ScalarInt) (opTy? : Option Ty)
+    (locals : List LocalSlot) (mem : Memory) (v : Value) (locals' : List LocalSlot) (mem' : Memory) :
+    evalFloatUnaryNeg sc opTy? locals mem = .ok v locals' mem' ↔
+      ∃ ty f,
+        opTy? = .some ty ∧
+        ieeeFormatOfTy? ty = .some f ∧
+        sc.sizeBytes = f.byteWidth ∧
+        v = .scalar ⟨evalFloatNeg f sc.bits, f.byteWidth⟩ ∧
+        locals' = locals ∧
+        mem' = mem := by
+  unfold evalFloatUnaryNeg
+  cases opTy? with
+  | none =>
+    exact ⟨fun h => (nomatch h), fun ⟨_, _, h, _⟩ => (nomatch h)⟩
+  | some ty =>
+    dsimp only
+    cases hfmt : ieeeFormatOfTy? ty with
+    | none =>
+      exact ⟨fun h => (nomatch h), fun ⟨ty', _, hty, hf, _⟩ => by
+        injection hty with hty'; subst hty'; rw [hfmt] at hf; cases hf⟩
+    | some f =>
+      dsimp only
+      cases hsz : Nat.beq sc.sizeBytes f.byteWidth with
+      | false =>
+        refine ⟨fun h => (nomatch h), fun ⟨ty', f', hty, hf, hsz', _⟩ => ?_⟩
+        injection hty with hty'; subst hty'
+        rw [hfmt] at hf; injection hf with hf'; subst hf'
+        rw [hsz', Nat.beq_refl] at hsz; cases hsz
+      | true =>
+        have hsz_eq : sc.sizeBytes = f.byteWidth := Nat.eq_of_beq_eq_true hsz
+        constructor
+        · intro h
+          injection h with hv hl hm
+          exact ⟨ty, f, rfl, hfmt, hsz_eq, hv.symm, hl.symm, hm.symm⟩
+        · rintro ⟨ty', f', hty, hf, _, hv, hl, hm⟩
+          injection hty with hty'; subst hty'
+          rw [hfmt] at hf; injection hf with hf'; subst hf'
+          rw [hv, hl, hm]
+
+/-- Closed-form evaluation of `evalFloatScalarBinOp` on matched `f32`/`f64` scalar operands. -/
+theorem evalFloatScalarBinOp_of_fmt (op : BinOp) (lhs rhs : ScalarInt)
+    (lTy rTy : Ty) (f : IeeeFormat) (locals : List LocalSlot) (mem : Memory)
+    (hlf : ieeeFormatOfTy? lTy = .some f) (hrf : ieeeFormatOfTy? rTy = .some f)
+    (hlsz : lhs.sizeBytes = f.byteWidth) (hrsz : rhs.sizeBytes = f.byteWidth) :
+    evalFloatScalarBinOp op lhs rhs (.some lTy) (.some rTy) locals mem =
+      match evalFloatBinOp op f lhs.bits rhs.bits with
+      | .some outSc => .ok (.scalar outSc) locals mem
+      | .none => .unsupported := by
+  unfold evalFloatScalarBinOp
+  dsimp only
+  rw [hlf, hrf]
+  dsimp only
+  rw [hlsz, hrsz, Nat.beq_refl]
+  cases f <;> rfl
+
+/-- **Generic-mode float `.unaryOp .neg` dispatcher** (BOTH modes, ANY policy): on a scalar
+operand of modeled format `f`, `EvalRvalueFloatRel` admits EXACTLY the bitwise sign flip
+`evalFloatNeg f sc.bits` (preserving all NaN quiet/signaling bits and payloads). -/
+theorem EvalRvalueFloatRel_unaryNeg_float_iff
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals locals' : List LocalSlot) (op : Operand) (sc : ScalarInt)
+    (ty : Ty) (f : IeeeFormat)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar sc) locals')
+    (hty : operandTy localDecls layouts op = .some ty)
+    (hfmt : ieeeFormatOfTy? ty = .some f)
+    (hsz : sc.sizeBytes = f.byteWidth) :
+    EvalRvalueFloatRel mode policy locals (.unaryOp .neg op) mem localDecls layouts res ↔
+      res = .ok (.scalar ⟨evalFloatNeg f sc.bits, f.byteWidth⟩) locals' mem := by
+  have hfloat : isFloatOptTy (operandTy localDecls layouts op) = true := by
+    rw [hty]
+    unfold isFloatOptTy isFloatTy
+    unfold ieeeFormatOfTy? at hfmt
+    cases hk : ty.kind with
+    | float _ => dsimp only; rw [hk]
+    | _ => rw [hk] at hfmt; cases hfmt
+  rw [EvalRvalueFloatRel_unaryNeg_iff,
+    evalRvalue_unaryOp_neg_float locals locals' op sc mem localDecls layouts hop hfloat, hty]
+  unfold evalFloatUnaryNeg
+  dsimp only
+  rw [hfmt]
+  dsimp only
+  rw [hsz, Nat.beq_refl]
+
+/-- **Generic-mode float comparison `.binaryOp` dispatcher** (BOTH modes, ANY policy):
+specializes `EvalRvalueFloatRel_binaryOp_float_iff` to comparison `BinOp`s (`eq`, `ne`, `lt`,
+`le`, `gt`, `ge`), eliminating the `.unsupported` branch and `EvalFloatBinOpRel` indirection. -/
+theorem EvalRvalueFloatRel_binaryOp_float_cmp_iff
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand)
+    (lhs rhs : ScalarInt) (lTy rTy : Ty) (f : IeeeFormat)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hop : isFloatCmpBinOp op = true)
+    (hl : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar lhs) locals₁)
+    (hr : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar rhs) locals₂)
+    (hlTy : operandTy localDecls layouts lhsOp = .some lTy)
+    (hrTy : operandTy localDecls layouts rhsOp = .some rTy)
+    (hlf : ieeeFormatOfTy? lTy = .some f)
+    (hrf : ieeeFormatOfTy? rTy = .some f)
+    (hlsz : lhs.sizeBytes = f.byteWidth)
+    (hrsz : rhs.sizeBytes = f.byteWidth) :
+    EvalRvalueFloatRel mode policy locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts res ↔
+      ∃ c, evalFloatCmp op f lhs.bits rhs.bits = .some c ∧
+        res = .ok (.scalar (boolToScalar c)) locals₂ mem := by
+  have hnotOff : op ≠ .offset := by intro h; rw [h] at hop; cases hop
+  have hfloatOp : isFloatBinOp op = true := by
+    rw [(isFloatBinOp_partition op).1, hop, Bool.or_true]
+  rw [EvalRvalueFloatRel_binaryOp_float_iff mode policy locals locals₁ locals₂ op lhsOp rhsOp
+    lhs rhs lTy rTy f mem localDecls layouts res hnotOff hl hr hlTy hrTy hlf hrf hlsz hrsz]
+  constructor
+  · rintro (⟨outSc, hrel, hres⟩ | ⟨hf, _⟩)
+    · rcases (EvalFloatBinOpRel_cmp_iff mode op f lhs.bits rhs.bits outSc hop).mp hrel with ⟨c, hc, hout⟩
+      exact ⟨c, hc, by rw [hres, hout]⟩
+    · rw [hfloatOp] at hf; cases hf
+  · rintro ⟨c, hc, hres⟩
+    exact Or.inl ⟨boolToScalar c, (EvalFloatBinOpRel_of_cmp mode op f lhs.bits rhs.bits _ c hc).mpr rfl, hres⟩
+
+/-- **Generic-mode float arithmetic `.binaryOp` dispatcher** (BOTH modes, ANY policy):
+specializes `EvalRvalueFloatRel_binaryOp_float_iff` to arithmetic `BinOp`s (`add`, `sub`,
+`mul`, `div`, `rem`), eliminating the `.unsupported` branch. -/
+theorem EvalRvalueFloatRel_binaryOp_float_arith_iff
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand)
+    (lhs rhs : ScalarInt) (lTy rTy : Ty) (f : IeeeFormat)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hop : isFloatArithBinOp op = true)
+    (hl : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar lhs) locals₁)
+    (hr : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar rhs) locals₂)
+    (hlTy : operandTy localDecls layouts lhsOp = .some lTy)
+    (hrTy : operandTy localDecls layouts rhsOp = .some rTy)
+    (hlf : ieeeFormatOfTy? lTy = .some f)
+    (hrf : ieeeFormatOfTy? rTy = .some f)
+    (hlsz : lhs.sizeBytes = f.byteWidth)
+    (hrsz : rhs.sizeBytes = f.byteWidth) :
+    EvalRvalueFloatRel mode policy locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts res ↔
+      ∃ outSc, EvalFloatBinOpRel mode op f lhs.bits rhs.bits outSc ∧
+        res = .ok (.scalar outSc) locals₂ mem := by
+  have hnotOff : op ≠ .offset := by intro h; rw [h] at hop; cases hop
+  have hfloatOp : isFloatBinOp op = true := by
+    rw [(isFloatBinOp_partition op).1, hop, Bool.true_or]
+  rw [EvalRvalueFloatRel_binaryOp_float_iff mode policy locals locals₁ locals₂ op lhsOp rhsOp
+    lhs rhs lTy rTy f mem localDecls layouts res hnotOff hl hr hlTy hrTy hlf hrf hlsz hrsz]
+  constructor
+  · rintro (h | ⟨hf, _⟩)
+    · exact h
+    · rw [hfloatOp] at hf; cases hf
+  · exact Or.inl
+
+/-- **Unified generic-mode `.cast .floatToFloat` dispatcher** (BOTH modes, ANY policy, both
+NaN and non-NaN inputs): combines `EvalRvalueFloatRel_floatToFloat_of_not_nan` and
+`EvalRvalueFloatRel_floatToFloat_nan_iff` into a single biconditional. -/
+theorem EvalRvalueFloatRel_floatToFloat_iff
+    (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy srcTy : Ty)
+    (sc : ScalarInt) (src dst : IeeeFormat)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar sc) locals')
+    (hty : operandTy localDecls layouts op = .some srcTy)
+    (hsrc : ieeeFormatOfTy? srcTy = .some src)
+    (hdst : ieeeFormatOfTy? targetTy = .some dst)
+    (hsz : sc.sizeBytes = src.byteWidth) :
+    EvalRvalueFloatRel mode policy locals (.cast .floatToFloat op targetTy) mem localDecls layouts res ↔
+      (if isNaNBits src sc.bits = true then
+        ∃ cand,
+          cand ∈ nanChoices dst [(src, sc.bits)] mode ∧
+          res = .ok (.scalar ⟨cand, dst.byteWidth⟩) locals' mem
+      else
+        res = .ok (.scalar ⟨evalFloatToFloatRoundTiesToEven src dst sc.bits, dst.byteWidth⟩) locals' mem) := by
+  unfold EvalRvalueFloatRel
+  dsimp only
+  rw [hop]
+  dsimp only
+  rw [hty]
+  dsimp only
+  rw [hsrc, hdst]
+  dsimp only
+  rw [hsz, Nat.beq_refl]
+  dsimp only
+  rw [nanChoices_mod_single]
+
 /-! ### `Ptr2IntTransmutePolicy` at the `EvalRvalueFloatRel` level & type-generic composite bridges
 
 The laws below hold uniformly for EVERY target type (scalars, floats, structs, tuples, arrays,
@@ -14961,6 +16123,132 @@ theorem EvalRvalueFloatRel_byteCast_policy_irrelevant_of_provFree
     (Iff.trans ⟨fun h => h.trans hall, fun h => h.trans hall.symm⟩
       (EvalRvalueFloatRel_byteCast_iff mode policy₂ locals kind op targetTy mem localDecls
         layouts res hkind).symm)
+
+/-- **`.ub` monotonicity of `evalByteCast`**: every `.ub` under `.stripProvenance` is also
+`.ub` under `.strictUcg630Ub` (conservative UCG #630 never admits strictly fewer UBs). -/
+theorem evalByteCast_ub_strip_imp_strict
+    (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : evalByteCast locals op targetTy mem localDecls layouts .stripProvenance = .ub) :
+    evalByteCast locals op targetTy mem localDecls layouts .strictUcg630Ub = .ub := by
+  rcases evalByteCast_strip_eq_strict_or_strict_ub locals op targetTy mem localDecls layouts with
+    heq | hub
+  · exact heq.symm.trans h
+  · exact hub
+
+/-- **`.unsupported` monotonicity of `evalByteCast`**: every `.unsupported` under
+`.strictUcg630Ub` is also `.unsupported` under `.stripProvenance`. -/
+theorem evalByteCast_unsupported_strict_imp_strip
+    (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : evalByteCast locals op targetTy mem localDecls layouts .strictUcg630Ub = .unsupported) :
+    evalByteCast locals op targetTy mem localDecls layouts .stripProvenance = .unsupported := by
+  rcases evalByteCast_strip_eq_strict_or_strict_ub locals op targetTy mem localDecls layouts with
+    heq | hub
+  · exact heq.trans h
+  · rw [h] at hub; cases hub
+
+/-- **Full `Rvalue`-generic policy refinement (EVERY `rv`, BOTH modes)**: every `.ok` result
+admitted under `.strictUcg630Ub` is admitted identically under `.stripProvenance` (no
+`transmute`/`subtype` case split needed in Episode 2). -/
+theorem EvalRvalueFloatRel_strict_refines_strip
+    (mode : FloatArithMode) (locals locals' : List LocalSlot) (rv : Rvalue)
+    (mem mem' : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (v : Value)
+    (h : EvalRvalueFloatRel mode .strictUcg630Ub locals rv mem localDecls layouts (.ok v locals' mem')) :
+    EvalRvalueFloatRel mode .stripProvenance locals rv mem localDecls layouts (.ok v locals' mem') := by
+  cases rv with
+  | cast kind op targetTy =>
+    cases kind with
+    | transmute =>
+      exact EvalRvalueFloatRel_byteCast_strict_refines_strip mode locals locals' .transmute
+        op targetTy mem mem' localDecls layouts v (Or.inl rfl) h
+    | subtype =>
+      exact EvalRvalueFloatRel_byteCast_strict_refines_strip mode locals locals' .subtype
+        op targetTy mem mem' localDecls layouts v (Or.inr rfl) h
+    | _ => exact h
+  | _ => exact h
+
+/-- **Full `Rvalue`-generic exact policy split (EVERY `rv`, BOTH modes)**: every result
+admitted under `.stripProvenance` is either admitted identically under `.strictUcg630Ub`, or
+`.strictUcg630Ub` admits `.ub`. -/
+theorem EvalRvalueFloatRel_strip_split
+    (mode : FloatArithMode) (locals : List LocalSlot) (rv : Rvalue)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (h : EvalRvalueFloatRel mode .stripProvenance locals rv mem localDecls layouts res) :
+    EvalRvalueFloatRel mode .strictUcg630Ub locals rv mem localDecls layouts res ∨
+    EvalRvalueFloatRel mode .strictUcg630Ub locals rv mem localDecls layouts .ub := by
+  cases rv with
+  | cast kind op targetTy =>
+    cases kind with
+    | transmute =>
+      exact EvalRvalueFloatRel_byteCast_strip_split mode locals .transmute op targetTy mem
+        localDecls layouts res (Or.inl rfl) h
+    | subtype =>
+      exact EvalRvalueFloatRel_byteCast_strip_split mode locals .subtype op targetTy mem
+        localDecls layouts res (Or.inr rfl) h
+    | _ => exact Or.inl h
+  | _ => exact Or.inl h
+
+/-- **Full `Rvalue`-generic `.ub` policy monotonicity (EVERY `rv`, BOTH modes)**: every `.ub`
+admitted under `.stripProvenance` is also `.ub` under `.strictUcg630Ub`. -/
+theorem EvalRvalueFloatRel_ub_strip_imp_strict
+    (mode : FloatArithMode) (locals : List LocalSlot) (rv : Rvalue)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : EvalRvalueFloatRel mode .stripProvenance locals rv mem localDecls layouts .ub) :
+    EvalRvalueFloatRel mode .strictUcg630Ub locals rv mem localDecls layouts .ub := by
+  rcases EvalRvalueFloatRel_strip_split mode locals rv mem localDecls layouts .ub h with h1 | h2
+  · exact h1
+  · exact h2
+
+/-- **Full `Rvalue`-generic `.unsupported` policy monotonicity (EVERY `rv`, BOTH modes)**:
+every `.unsupported` admitted under `.strictUcg630Ub` is also `.unsupported` under
+`.stripProvenance`. -/
+theorem EvalRvalueFloatRel_unsupported_strict_imp_strip
+    (mode : FloatArithMode) (locals : List LocalSlot) (rv : Rvalue)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : EvalRvalueFloatRel mode .strictUcg630Ub locals rv mem localDecls layouts .unsupported) :
+    EvalRvalueFloatRel mode .stripProvenance locals rv mem localDecls layouts .unsupported := by
+  cases rv with
+  | cast kind op targetTy =>
+    cases kind with
+    | transmute =>
+      exact (evalByteCast_unsupported_strict_imp_strip locals op targetTy mem localDecls layouts h.symm).symm
+    | subtype =>
+      exact (evalByteCast_unsupported_strict_imp_strip locals op targetTy mem localDecls layouts h.symm).symm
+    | _ => exact h
+  | _ => exact h
+
+/-- **Joint `(mode, policy)` refinement (EVERY `rv`)**: every `.ok` result admitted by the
+most conservative mode/policy pair `(.deterministic, .strictUcg630Ub)` is admitted identically
+by the Miri / MiniRust pair `(.nondeterministic, .stripProvenance)`. -/
+theorem EvalRvalueFloatRel_det_strict_refines_nondet_strip
+    (locals locals' : List LocalSlot) (rv : Rvalue)
+    (mem mem' : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (v : Value)
+    (h : EvalRvalueFloatRel .deterministic .strictUcg630Ub locals rv mem localDecls layouts (.ok v locals' mem')) :
+    EvalRvalueFloatRel .nondeterministic .stripProvenance locals rv mem localDecls layouts (.ok v locals' mem') :=
+  EvalRvalueFloatRel_strict_refines_strip .nondeterministic locals locals' rv mem mem'
+    localDecls layouts v
+    (EvalRvalueFloatRel.det_imp_nondet .strictUcg630Ub locals rv mem localDecls layouts _ h)
+
+/-- **Unconditional `.ok` realization at ANY `Ptr2IntTransmutePolicy` (EVERY `rv`, zero side
+conditions)**: every `.ok` result of the executable `evalRvalue` realizes
+`EvalRvalueFloatRel .nondeterministic policy` for BOTH `.strictUcg630Ub` and `.stripProvenance`
+(removing the `hNotTransmute`/`hNotSubtype` side conditions of
+`evalRvalue_realizes_EvalRvalueFloatRel_nondet_of_not_byteCast` for `.ok` outcomes). -/
+theorem evalRvalue_ok_realizes_EvalRvalueFloatRel_nondet_any_policy
+    (policy : Ptr2IntTransmutePolicy) (locals locals' : List LocalSlot) (rv : Rvalue)
+    (v : Value) (mem mem' : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (heval : evalRvalue locals rv mem localDecls layouts = .ok v locals' mem') :
+    EvalRvalueFloatRel .nondeterministic policy locals rv mem localDecls layouts (.ok v locals' mem') := by
+  have hstrict : EvalRvalueFloatRel .nondeterministic .strictUcg630Ub locals rv mem localDecls layouts
+      (.ok v locals' mem') := by
+    rw [← heval]
+    exact evalRvalue_realizes_EvalRvalueFloatRel_nondet locals rv mem localDecls layouts
+  cases policy with
+  | strictUcg630Ub => exact hstrict
+  | stripProvenance =>
+    exact EvalRvalueFloatRel_strict_refines_strip .nondeterministic locals locals' rv mem mem'
+      localDecls layouts v hstrict
 
 /-! ### Concrete Episode 2 witnesses: operands from locals, NaN choices, & `Ptr2IntTransmutePolicy` separation -/
 
@@ -15867,6 +17155,90 @@ depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms axiomAudit_cmp_identity
+
+set_option linter.defProp false in
+/-- Axiom-audit bundle for the Episode 2 bridge & inversion layer: comparison sign/inversion
+helpers (§2), `nanChoices` structural & 1-input / 2-input membership decompositions (§4),
+promoted `mem_nanChoices_nondet_swap` and `evalFloatArithBase_lt`, decomposed `evalFloatBinOp`
+/ `EvalFloatBinOpRel` / `EvalRvalueFloatRel` inversion lemmas (§7), and full-`Rvalue`
+`Ptr2IntTransmutePolicy` / joint `(mode, policy)` monotonicity laws (§7). -/
+def axiomAudit_ep2_bridges :=
+  And.intro (@pack_unpack_f32) <|
+  And.intro (@evalFloatPartialCompare_mod) <|
+  And.intro (@evalFloatCmp_mod) <|
+  And.intro (@evalFloatPartialCompare_neg_both) <|
+  And.intro (@evalFloatCmp_eq_some_true_iff) <|
+  And.intro (@isNaNBits_mod) <|
+  And.intro (@isQuietNaNBits_mod) <|
+  And.intro (@isSignalingNaNBits_mod) <|
+  And.intro (@quietedNaNCand_mod) <|
+  And.intro (@signalingNaNLowerPayload_mod) <|
+  And.intro (@signalingNaNCand_mod) <|
+  And.intro (@expandNanSigns_append) <|
+  And.intro (@length_expandNanSigns) <|
+  And.intro (@nanChoicesQuieted_cons) <|
+  And.intro (@nanChoicesQuieted_append) <|
+  And.intro (@nanChoicesSignaling_cons) <|
+  And.intro (@nanChoicesSignaling_append) <|
+  And.intro (@nanChoices_mod_single) <|
+  And.intro (@nanChoices_mod_pair) <|
+  And.intro (@nanChoices_nondet_length) <|
+  And.intro (@nanChoices_length_bounds) <|
+  And.intro (@nanChoices_nondet_length_ge_four_of_mem_nan) <|
+  And.intro (@nanChoices_nondet_getElem_zero_one) <|
+  And.intro (@mem_nanChoicesQuieted_iff) <|
+  And.intro (@mem_nanChoicesSignaling_iff) <|
+  And.intro (@mem_nanChoices_det_iff) <|
+  And.intro (@mem_nanChoices_nondet_iff) <|
+  And.intro (@mem_nanChoices_nondet_single_iff) <|
+  And.intro (@mem_nanChoices_nondet_binary_iff) <|
+  And.intro (@quietedNaNCand_same_fmt_of_quiet) <|
+  And.intro (@signalingNaN_same_fmt_eq_self) <|
+  And.intro (@mem_nanChoices_nondet_binary_same_fmt_iff) <|
+  And.intro (@mem_nanChoices_mono) <|
+  And.intro (@mem_nanChoices_swap) <|
+  And.intro (@mem_nanChoices_nondet_swap) <|
+  And.intro (@evalFloatArithBase_lt) <|
+  And.intro (@isFloatBinOp_partition) <|
+  And.intro (@evalFloatCmp_eq_none_iff) <|
+  And.intro (@evalFloatCmp_isSome_iff) <|
+  And.intro (@evalFloatCmp_of_arith) <|
+  And.intro (@evalFloatArithBase_eq_none_iff) <|
+  And.intro (@evalFloatArithBase_isSome_iff) <|
+  And.intro (@evalFloatArithBase_mod) <|
+  And.intro (@evalFloatBinOp_mod) <|
+  And.intro (@EvalFloatBinOpRel_mod) <|
+  And.intro (@evalFloatBinOp_cmp_iff) <|
+  And.intro (@evalFloatBinOp_arith_iff) <|
+  And.intro (@EvalFloatBinOpRel_of_cmp) <|
+  And.intro (@EvalFloatBinOpRel_cmp_iff) <|
+  And.intro (@EvalFloatBinOpRel_of_base_nan) <|
+  And.intro (@EvalFloatBinOpRel_arith_of_base_iff) <|
+  And.intro (@EvalFloatBinOpRel_arith_iff) <|
+  And.intro (@EvalFloatBinOpRel_unsupported_iff) <|
+  And.intro (@EvalFloatBinOpRel_iff_cases) <|
+  And.intro (@EvalFloatBinOpRel_add_mul_comm) <|
+  And.intro (@evalFloatUnaryNeg_eq_ok_iff) <|
+  And.intro (@evalFloatScalarBinOp_of_fmt) <|
+  And.intro (@EvalRvalueFloatRel_unaryNeg_float_iff) <|
+  And.intro (@EvalRvalueFloatRel_binaryOp_float_cmp_iff) <|
+  And.intro (@EvalRvalueFloatRel_binaryOp_float_arith_iff) <|
+  And.intro (@EvalRvalueFloatRel_floatToFloat_iff) <|
+  And.intro (@evalByteCast_ub_strip_imp_strict) <|
+  And.intro (@evalByteCast_unsupported_strict_imp_strip) <|
+  And.intro (@EvalRvalueFloatRel_strict_refines_strip) <|
+  And.intro (@EvalRvalueFloatRel_strip_split) <|
+  And.intro (@EvalRvalueFloatRel_ub_strip_imp_strict) <|
+  And.intro (@EvalRvalueFloatRel_unsupported_strict_imp_strip) <|
+  And.intro (@EvalRvalueFloatRel_det_strict_refines_nondet_strip) <|
+  @evalRvalue_ok_realizes_EvalRvalueFloatRel_nondet_any_policy
+
+/--
+info: 'Anneal.Mir.IeeeFloatArith.axiomAudit_ep2_bridges'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms axiomAudit_ep2_bridges
 
 end AxiomGuards
 
