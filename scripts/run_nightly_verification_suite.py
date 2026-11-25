@@ -7093,27 +7093,32 @@ def _rmtree_private_dir(path: Path, attempts: int = 3) -> bool:
 
     retried: set[str] = set()
 
-    def _onerror(func: Any, target: str, exc: Any) -> None:
+    def _onerror(func: Any, target: Any, exc: Any) -> None:
         # Mirrors `tempfile.TemporaryDirectory`'s cleanup: `exc` is the exception
-        # (`onexc`, 3.12+) or an `exc_info` tuple (`onerror`).
+        # (`onexc`, 3.12+) or an `exc_info` tuple (`onerror`). Normalize `target` so
+        # `Path` (top-level call) and `str` (recursive calls) deduplicate in `retried`.
         err = exc if isinstance(exc, BaseException) else exc[1]
         if isinstance(err, FileNotFoundError):
             return
-        if not isinstance(err, PermissionError) or target in retried or not _within_root(target):
-            raise err
-        retried.add(target)
-        _restore_owner_rwx(target)
         try:
-            st = os.lstat(target)
+            target_norm = os.path.normpath(os.fspath(target))
+        except TypeError:
+            raise err
+        if not isinstance(err, PermissionError) or target_norm in retried or not _within_root(target_norm):
+            raise err
+        retried.add(target_norm)
+        _restore_owner_rwx(target_norm)
+        try:
+            st = os.lstat(target_norm)
         except FileNotFoundError:
             return
         except OSError:
             raise err
         if stat.S_ISDIR(st.st_mode):
-            shutil.rmtree(target, **rmtree_kw)
+            shutil.rmtree(target_norm, **rmtree_kw)
         else:
             try:
-                os.unlink(target)
+                os.unlink(target_norm)
             except FileNotFoundError:
                 pass
 

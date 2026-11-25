@@ -3339,7 +3339,12 @@ class TestCliSubprocess(unittest.TestCase):
         `XDG_RUNTIME_DIR`: probes, `--exclusive` slot locking, and exit-137 OOM memos all
         land in the per-invocation `anneal-cli-rt-*` directory instead."""
         uid = os.getuid()
-        markers = (f"anneal-build-slots-{uid}", f"anneal-last-oom-{uid}", "anneal-lean-lsp.sock")
+        markers = (
+            f"anneal-build-slots-{uid}",
+            f"anneal-last-oom-{uid}",
+            ".anneal-last-oom.",
+            "anneal-lean-lsp.sock",
+        )
         host_bases = sorted(str(b) for b in _host_runtime_bases())
         audit_code = (
             "import json, os, sys\n"
@@ -3471,6 +3476,14 @@ class TestCliSubprocess(unittest.TestCase):
             touches,
         )
         self.assertTrue(any(f"anneal-last-oom-{uid}" in t["path"] for t in rt_touches), touches)
+        self.assertTrue(
+            any(
+                any(part.startswith("anneal-synth-audit-") for part in Path(t["path"]).parts)
+                and t["path"].endswith(f"anneal-build-slots-{uid}{os.sep}slot-1.lock")
+                for t in touches
+            ),
+            touches,
+        )
 
     def test_in_process_probes_redirect_host_slot_counts_oom_memos_and_lsp_eviction(
         self,

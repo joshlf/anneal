@@ -8163,7 +8163,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             # Missing directory: success, no exception.
             self.assertTrue(suite._rmtree_private_dir(root / "never-created"))
 
-            # Persistent failure: reports False but never raises.
+            # Persistent failure: reports False without raising or duplicating Path/str retries.
             stuck = root / "stuck"
             stuck.mkdir()
             with mock.patch.object(
@@ -8171,6 +8171,34 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             ), mock.patch.object(suite.time, "sleep"):
                 self.assertFalse(suite._rmtree_private_dir(stuck))
             self.assertTrue(stuck.exists())
+
+            # Persistent `PermissionError` on a `Path` root retries at most once per attempt
+            # (normalizing `Path` vs `str` in `retried`) and returns False cleanly.
+            perm_stuck = root / "perm-stuck"
+            perm_stuck.mkdir()
+            real_rmtree_fn = shutil.rmtree
+            perm_calls: list[str] = []
+
+            def always_perm_rmtree(p: Any, *args: Any, **kwargs: Any) -> None:
+                perm_calls.append(os.path.normpath(os.fspath(p)))
+                cb = kwargs.get("onexc") or kwargs.get("onerror")
+                err = PermissionError(13, "Permission denied", os.fspath(p))
+                if cb is not None:
+                    if "onexc" in kwargs:
+                        cb(os.open, p, err)
+                    else:
+                        cb(os.open, p, (PermissionError, err, None))
+                    return
+                raise err
+
+            with (
+                mock.patch.object(suite.shutil, "rmtree", side_effect=always_perm_rmtree),
+                mock.patch.object(suite.time, "sleep"),
+            ):
+                self.assertFalse(suite._rmtree_private_dir(perm_stuck, attempts=2))
+            # 2 attempts x (1 initial `Path` call + 1 normalized `str` retry) = 4 calls max.
+            self.assertEqual(len(perm_calls), 4)
+            real_rmtree_fn(perm_stuck)
 
             # `_run_step` still returns a step result when cleanup keeps failing, and the
             # private dir is a fresh `0700` `anneal-suite-py-rt-*` directory.
