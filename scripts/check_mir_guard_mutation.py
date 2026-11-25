@@ -1889,6 +1889,18 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Terminators",
         description="evalTerminator .drop rejects dropping a local with an active protector conflict as UB",
         anchor=(
+            "      | .nil, _ =>\n"
+            "        match set? s.frame.locals place.local_ .uninit with\n"
+            "        | .some locals' =>\n"
+            "          match s.memory.activeProtectors with\n"
+            "          | .nil =>\n"
+            "            let borrows' :=\n"
+            "              invalidateConflictingBorrows s.memory.borrows place.local_ .none depth\n"
+            "            MirStepNode.step {\n"
+            "              s with\n"
+            "              frame := { blockIdx := target, stmtIdx := 0, locals := locals' }\n"
+            "              memory := { s.memory with borrows := borrows' }\n"
+            "            }\n"
             "          | protHead :: protTail =>\n"
             "            match\n"
             "              hasProtectedWriteConflict\n"
@@ -1907,6 +1919,18 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "                invalidateConflictingBorrows s.memory.borrows place.local_ .none depth"
         ),
         replacement=(
+            "      | .nil, _ =>\n"
+            "        match set? s.frame.locals place.local_ .uninit with\n"
+            "        | .some locals' =>\n"
+            "          match s.memory.activeProtectors with\n"
+            "          | .nil =>\n"
+            "            let borrows' :=\n"
+            "              invalidateConflictingBorrows s.memory.borrows place.local_ .none depth\n"
+            "            MirStepNode.step {\n"
+            "              s with\n"
+            "              frame := { blockIdx := target, stmtIdx := 0, locals := locals' }\n"
+            "              memory := { s.memory with borrows := borrows' }\n"
+            "            }\n"
             "          | _protHead :: _protTail =>\n"
             "            match false with\n"
             "            | true => MirStepNode.fail .ub\n"
