@@ -4743,6 +4743,16 @@ c. **Open-term symbolic caller parameters across inline calls**: `s17SymPred_hol
    `(x : Nat)` in caller parameter slot `1 ≤ idx ≤ callerBody.argCount` while
    `s17_mid` / `s17_leaf` run with the caller frame suspended across both
    parities of `stepMirStatePeriodic` ticks.
+d. **Periodic-tick traces**: `s17PeriodicTrace` replays the exact
+   `stepMirStatePeriodic` schedule and records every even-`fuel'` normalization
+   tick taken at `callStack` depth `2`, together with the suspended root
+   caller's `acc` slot; `s17*_periodicTrace` pin by `rfl` (closed and open-term
+   with symbolic `x`) that such ticks occur *after* cross-frame `&mut` writes
+   (`40`, `72`, `104`) landed two frames up, so the suspended `SavedCallerFrame`
+   normalization path is genuinely exercised rather than vacuously skipped.
+e. **Open-term loop**: `s17SymLoopPred_holds` / `_refutes` combine (c) with the
+   `switchInt` back-edge loop (three `loop -> mid -> leaf` round trips with `x`
+   symbolic in caller slot `1`).
 -/
 private def s17U32MutRefTy : Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
 private def s17UnitTy : Ty := { kind := .tuple [], layoutIdx := 0 }
@@ -5198,6 +5208,142 @@ theorem s17Pin_fuelBoundary :
 
 theorem s17PinEqClaim_nonVacuous : ∃ args, s17PinEqClaim.pre args :=
   proveNonVacuousPre [.scalar ⟨10, 4⟩] ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree s17ReqMir _⟩
+
+/-- Open-term looped predicate:
+`fn s17_sym_loop_pred(unused: u32, y: u32) -> bool { let mut acc = y; let mut i = 0; while i < 3 { s17_mid(&mut acc); i += 1; } acc == 106 }`.
+Combines Part (c) with the `switchInt` back-edge loop: `unused` stays symbolic in
+caller parameter slot `1` across three `loop -> mid -> leaf` round trips, so every
+`Memory.activeCallee := .some sf.callerBody` restore and every even-`fuel'`
+normalization of the suspended caller frame must avoid both the callee-body
+projection leak and `Nat.div` on fvar-mentioning counter thunks. -/
+def s17SymLoopPredMir : CapturedMir :=
+  mkMirBody "sym_test::s17_sym_loop_pred" 2
+    [ mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy
+    , mkDecl .mut u32MirTy, mkDecl .mut u32MirTy, mkDecl .mut boolMirTy
+    , mkDecl .mut s17U32MutRefTy, mkDecl .mut s17UnitTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 3)
+          , mkStmt (.assign ⟨3, []⟩ (.use (.copy ⟨2, []⟩)))
+          , mkStmt (.storageLive 4)
+          , mkStmt (.assign ⟨4, []⟩ (.use (u32ConstOperand 0))) ]
+        terminator := mkTerm (.goto 1)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageLive 5)
+          , mkStmt (.assign ⟨5, []⟩ (.binaryOp .lt (.copy ⟨4, []⟩) (u32ConstOperand 3))) ]
+        terminator :=
+          mkTerm (.switchInt (.copy ⟨5, []⟩) { branches := [(0, 4)], otherwise := 2 })
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 5)
+          , mkStmt (.storageLive 6)
+          , mkStmt (.assign ⟨6, []⟩ (.ref (.mut false) ⟨3, []⟩))
+          , mkStmt (.storageLive 7) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_mid")
+            [.move ⟨6, []⟩] ⟨7, []⟩ (.some 3) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 7)
+          , mkStmt (.storageDead 6)
+          , mkStmt (.assign ⟨4, []⟩ (.binaryOp .add (.copy ⟨4, []⟩) (u32ConstOperand 1))) ]
+        terminator := mkTerm (.goto 1)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 5)
+          , mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨3, []⟩) (u32ConstOperand 106)))
+          , mkStmt (.storageDead 4)
+          , mkStmt (.storageDead 3) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- Part (c) + loop: symbolic `x` in suspended caller slot `1` across three looped
+`loop -> mid -> leaf` call round trips (default `by rfl`). -/
+theorem s17SymLoopPred_holds (x : Nat) :
+    MirBoolPredicateHoldsWithCallees s17SymLoopPredMir s17Callees
+      [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] :=
+  mirBoolPredicateHoldsWithCallees_of_checkBounded 128 _ _ _
+
+/-- Refutation canary for `s17SymLoopPred_holds`: `y = 11` yields `107 ≠ 106`. -/
+theorem s17SymLoopPred_refutes (x : Nat) :
+    checkMirBoolWithCalleesBounded 128 s17SymLoopPredMir s17Callees
+      [.scalar ⟨x, 4⟩, .scalar ⟨11, 4⟩] = false :=
+  rfl
+
+/-- Bits of the scalar in local slot `i` (sentinels `1000000` / `2000000` for a
+missing slot / non-scalar), used by `s17PeriodicTrace`. -/
+def s17SlotBits : Nat → List LocalSlot → Nat
+  | _, .nil => 1000000
+  | .zero, .init (.scalar sc) :: _ => sc.bits
+  | .zero, _ :: _ => 2000000
+  | .succ i, _ :: rest => s17SlotBits i rest
+
+/-- Executable trace of exactly the `stepMirStatePeriodic` schedule used by every
+closed-term checker: at each even-`fuel'` (normalizing) tick on a running state
+whose `Memory.callStack` has depth exactly `2` (`root -> mid` suspended while
+`leaf` runs, or `root` + `mid` suspended), record `(2, bits of local `slot` in the
+bottom-most suspended root caller frame)`. A `(2, v)` entry with `v` differing
+from the caller's pre-call value certifies that a normalization tick ran at
+`callStack` depth `2` *after* a cross-frame `&mut` write landed in the suspended
+root caller's frame (two frames up from the writer). -/
+def s17PeriodicTrace (body : CapturedMir) (slot : Nat) :
+    Nat → MirExecState → List (Nat × Nat) → List (Nat × Nat)
+  | 0, _, acc => acc.reverse
+  | fuel' + 1, st, acc =>
+    -- Force the tick entry with an outer `match` so the accumulator stays a
+    -- concrete cons spine (tail-recursive like `checkMirBoolExecBounded`).
+    match
+      (match Nat.beq (fuel' % 2) 0, st with
+       | true, .running s =>
+         match s.memory.callStack with
+         | [_, sf] => Option.some (2, s17SlotBits slot sf.frame.locals)
+         | _ => Option.none
+       | _, _ => Option.none)
+    with
+    | .some e =>
+      match stepMirStatePeriodic fuel' body st with
+      | .tau st' => s17PeriodicTrace body slot fuel' st' (e :: acc)
+      | .vis (.inr (.inl _)) k => s17PeriodicTrace body slot fuel' (k PUnit.unit) (e :: acc)
+      | _ => (e :: acc).reverse
+    | .none =>
+      match stepMirStatePeriodic fuel' body st with
+      | .tau st' => s17PeriodicTrace body slot fuel' st' acc
+      | .vis (.inr (.inl _)) k => s17PeriodicTrace body slot fuel' (k PUnit.unit) acc
+      | _ => acc.reverse
+
+/-- Two `s17_mid` calls: depth-`2` normalization ticks observe the suspended
+root caller's `acc` after the first leaf write (`40`), after the first `mid`
+write (`42`, still at depth `2` before the pop is normalized), and after the
+second leaf write (`72`). -/
+theorem s17Caller_periodicTrace :
+    s17PeriodicTrace s17CallerMir 2 64
+        (.running (initMachineStateWithCallees s17CallerMir [.scalar ⟨10, 4⟩] s17Callees)) [] =
+      [(2, 40), (2, 42), (2, 72)] :=
+  rfl
+
+/-- Three looped `s17_mid` calls: depth-`2` ticks at `40`, `72`, and `104`. -/
+theorem s17LoopCaller_periodicTrace :
+    s17PeriodicTrace s17LoopCallerMir 2 96
+        (.running (initMachineStateWithCallees s17LoopCallerMir [.scalar ⟨10, 4⟩] s17Callees)) [] =
+      [(2, 10), (2, 40), (2, 72), (2, 74), (2, 104)] :=
+  rfl
+
+/-- Open-term trace: with `x` symbolic in caller slot `1`, the depth-`2`
+normalization tick still observes the cross-frame write (`acc = 40`). -/
+theorem s17SymPred_periodicTrace (x : Nat) :
+    s17PeriodicTrace s17SymPredMir 3 64
+        (.running (initMachineStateWithCallees s17SymPredMir
+          [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] s17Callees)) [] =
+      [(2, 40)] :=
+  rfl
+
+/-- Open-term looped trace: three depth-`2` round trips with symbolic `x`. -/
+theorem s17SymLoopPred_periodicTrace (x : Nat) :
+    s17PeriodicTrace s17SymLoopPredMir 3 128
+        (.running (initMachineStateWithCallees s17SymLoopPredMir
+          [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] s17Callees)) [] =
+      [(2, 10), (2, 40), (2, 72), (2, 74), (2, 104)] :=
+  rfl
 
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
