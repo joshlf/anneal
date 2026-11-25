@@ -3009,6 +3009,66 @@ theorem boolNegAssumes_antecedent_violates_antitonicity :
   intro h
   exact h (fun hFalse => hFalse)
 
+/-- Substitute every occurrence of atom `x` in a `PropFormula` with `repl` (models inlining
+    a statement-local `let x := <assumes-expr>; body` binding before polarity checking, A4). -/
+def substAtom (x : String) (repl : PropFormula) : PropFormula → PropFormula
+  | .atom t => if t == x then repl else .atom t
+  | .assumes t => .assumes t
+  | .not p => .not (substAtom x repl p)
+  | .and p q => .and (substAtom x repl p) (substAtom x repl q)
+  | .or p q => .or (substAtom x repl p) (substAtom x repl q)
+  | .imp p q => .imp (substAtom x repl p) (substAtom x repl q)
+  | .iff p q => .iff (substAtom x repl p) (substAtom x repl q)
+  | .ifte c t e => .ifte (substAtom x repl c) (substAtom x repl t) (substAtom x repl e)
+
+/-- Semantic soundness of `let`-inlining: evaluating `substAtom x repl f` equals evaluating `f`
+    with atom `x` bound to the denotation of `repl`. -/
+theorem evalPF_substAtom (va vs : String → Prop) (x : String) (repl : PropFormula) :
+    ∀ f : PropFormula,
+      evalPF va vs (substAtom x repl f) ↔
+        evalPF (fun t => if t == x then evalPF va vs repl else va t) vs f := by
+  intro f
+  induction f with
+  | atom t =>
+    simp only [substAtom, evalPF]
+    split <;> exact Iff.rfl
+  | assumes t => exact Iff.rfl
+  | not p ih => exact not_congr ih
+  | and p q ihp ihq => exact and_congr ihp ihq
+  | or p q ihp ihq => exact or_congr ihp ihq
+  | imp p q ihp ihq => exact imp_congr ihp ihq
+  | iff p q ihp ihq => exact iff_congr ihp ihq
+  | ifte c t e ihc iht ihe =>
+    exact and_congr (imp_congr ihc iht) (imp_congr (not_congr ihc) ihe)
+
+/-- **Let-Alias Polarity Soundness & Collapse (A4)**:
+    (1) If inlining `let x := repl; body` passes `checkAssumesNegativePolarity`, then the
+        let-bound formula is semantically antitone in assumptions under `evalPF_substAtom`.
+    (2) Concretely, hiding `.assumes "impl"` behind `let a := impl.assumesHold; outputEq → a`
+        is rejected once inlined (`checkAssumesNegativePolarity = false`) and violates
+        antitonicity, whereas `let a := impl.assumesHold; a → outputEq` passes! -/
+theorem letAlias_subst_polarity_sound_and_collapse :
+    let posBody : PropFormula := .imp (.atom "outputEq") (.atom "a")
+    let negBody : PropFormula := .imp (.atom "a") (.atom "outputEq")
+    let inlinedPos := substAtom "a" (.assumes "impl") posBody
+    let inlinedNeg := substAtom "a" (.assumes "impl") negBody
+    let va : String → Prop := fun _ => True
+    checkAssumesNegativePolarity inlinedPos = false ∧
+      checkAssumesNegativePolarity inlinedNeg = true ∧
+      evalPF va (fun _ => True) inlinedPos ∧
+      ¬ evalPF va (fun _ => False) inlinedPos ∧
+      (∀ (va' : String → Prop) (repl body : PropFormula),
+        checkAssumesNegativePolarity (substAtom "a" repl body) = true →
+        evalPF (fun t => if t == "a" then evalPF va' (fun _ => True) repl else va' t)
+          (fun _ => True) body →
+        ∀ vs, evalPF (fun t => if t == "a" then evalPF va' vs repl else va' t) vs body) := by
+  refine ⟨by decide, by decide, fun _ => trivial, fun h => h trivial, ?_⟩
+  intro va' repl body hChk hAll vs
+  have hAllSub : evalPF va' (fun _ => True) (substAtom "a" repl body) :=
+    (evalPF_substAtom va' (fun _ => True) "a" repl body).mpr hAll
+  have hVsSub := checkAssumesNegativePolarity_sound va' hChk hAllSub vs
+  exact (evalPF_substAtom va' vs "a" repl body).mp hVsSub
+
 /-! #### 4.4.2 Part 6b: Invariant-Struct `private mk ::` Sealing (`Samite` cl/1029680381) -/
 
 /-- Unsealed capability structure (public default `mk` allows forging arbitrary invalid values). -/

@@ -469,6 +469,16 @@ theorem a3_checked_privateHelper_forwarder_sound :
 #guard_msgs in
 #print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.canonicalSiteGuard_sound
 
+/-! ## 9. A4 Regression Tests: Let-Alias Inlining Polarity Soundness -/
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.evalPF_substAtom' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.evalPF_substAtom
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.letAlias_subst_polarity_sound_and_collapse' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.letAlias_subst_polarity_sound_and_collapse
+
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
@@ -557,7 +567,9 @@ run_cmd do
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.privateHelper_leaked_by_public_forwarder_collapse,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.aliasCanonicalization_catches_aliased_double_issuance,
-        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.canonicalSiteGuard_sound] do
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.canonicalSiteGuard_sound,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.evalPF_substAtom,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.letAlias_subst_polarity_sound_and_collapse] do
     match env.find? flagship with
     | some (.thmInfo _) =>
       unless env.getModuleIdxFor? flagship == some modIdx do

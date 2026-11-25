@@ -1704,6 +1704,76 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
         ok = "namespace V\ndef get (x : V) : Nat := x.val\nend V\ndef w (f : Nat → Nat) : Nat := f 0"
         self.assertEqual(proto.scan_lean_invariant_struct_sealing(hdr + ok + "\n"), [])
 
+    def test_30m_guard6a_let_alias_inlining_and_guard6b_open_renaming_param_shadow_redteam(self) -> None:
+        """A4: (1) Guard 6a inlines `let a := i.assumesHold` (incl. chained `let` and negated
+        `let`) so positive-polarity assumptions cannot hide behind statement-local aliases;
+        (2) Guard 6b catches `open V renaming mk → forge` (bypassed B4) while eliminating B4's
+        false positive on unrelated functions with a local parameter/lambda named `mk`."""
+        # Guard 6a `let`-alias attacks
+        bad_6a = {
+            "let_alias_pos_bool": (
+                "theorem t (i s : EvalRes Nat) :\n"
+                "  let a := i.assumesHold\n"
+                "  s.output = i.output → a = true := by sorry"
+            ),
+            "let_alias_chained": (
+                "theorem t (i s : EvalRes Nat) :\n"
+                "  let a := i.assumesHold\n"
+                "  let b := a\n"
+                "  s.output = i.output → b = true := by sorry"
+            ),
+            "let_alias_negated_ant": (
+                "theorem t (i s : EvalRes Nat) :\n"
+                "  let a := !i.assumesHold\n"
+                "  a = true → s.output = i.output := by sorry"
+            ),
+            "let_alias_prop_conseq": (
+                "theorem t (i s : EvalRes Nat) :\n"
+                "  let p := i.assumesHold = true\n"
+                "  s.output = i.output → p := by sorry"
+            ),
+        }
+        for name, src in bad_6a.items():
+            with self.subTest(name=name):
+                hits = proto.scan_lean_assumption_polarity(src)
+                self.assertEqual([h["code"] for h in hits], ["assumption_positive_polarity"], name)
+        ok_6a = {
+            "let_alias_neg_use": (
+                "theorem ok (i s : EvalRes Nat) :\n"
+                "  let p := i.assumesHold = true\n"
+                "  p → s.output = i.output := by sorry"
+            ),
+            "let_struct_lit_not_alias": (
+                "theorem ok_lit :\n"
+                "  let r : EvalRes Nat := { assumesHold := true, assertionFailed := false, output := 1 }\n"
+                "  r.assumesHold = true → r.output = 1 := by sorry"
+            ),
+        }
+        for name, src in ok_6a.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_assumption_polarity(src), [], name)
+
+        # Guard 6b `open ... renaming` bypasses + B4 param/lambda `mk` shadowing FP fix
+        hdr = "-- @sealed_invariant\nstructure V where\n  private mk ::\n  val : Nat\n"
+        bad_6b = {
+            "open_renaming_in": "open V renaming mk → forge in\ndef leak (v : Nat) : V := forge v",
+            "open_renaming_ascii": "open V renaming mk -> forge\ndef leak (v : Nat) : V := forge v",
+            "open_renaming_unannotated": "open V renaming mk → forge in\ndef leak v := forge v",
+            "namespace_unannotated_bare_mk": "namespace V\ndef leak v := mk v\nend V",
+        }
+        for name, body in bad_6b.items():
+            with self.subTest(name=name):
+                hits = proto.scan_lean_invariant_struct_sealing(hdr + body + "\n")
+                self.assertTrue(hits, name)
+                self.assertTrue(all(h["code"] == "unsealed_invariant_struct" for h in hits), (name, hits))
+        ok_6b = {
+            "param_named_mk_unrelated": "def otherFn (mk : Nat) : Nat := mk + 1",
+            "lambda_named_mk_unrelated": "def readInc (x : V) : Nat := (fun mk => mk + 1) x.val",
+        }
+        for name, body in ok_6b.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_invariant_struct_sealing(hdr + body + "\n"), [], name)
+
     def test_31_live_repo_sweep_zero_false_positives_on_theory_and_anneal_spec(self) -> None:
         res = proto.scan_live_repo_peer_guards(REPO_ROOT)
         self.assertTrue(res["ok"], f"Live repo sweep had false positives: {res['findings']}")

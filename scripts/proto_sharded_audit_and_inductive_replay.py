@@ -3078,7 +3078,12 @@ def scan_rust_unsatisfiable_extern_ensures(
                 close = _find_matching_delim(
                     tokens, i + 2, tokens[i + 2].text, ")" if tokens[i + 2].text == "(" else "]"
                 )
-                tokens = tokens[:close] + [Token("PUNCT", "}", tokens[close].start, tokens[close].end, tokens[close].line)] + tokens[close + 1 :]
+                if close < n:
+                    tokens = (
+                        tokens[:close]
+                        + [Token("PUNCT", "}", tokens[close].start, tokens[close].end, tokens[close].line)]
+                        + tokens[close + 1 :]
+                    )
             i += 3
             continue
 
@@ -4540,7 +4545,7 @@ def _lean_binder_types(toks: list[Token]) -> list[list[Token]]:
     return out
 
 
-def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token]:
+def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos", _let_depth: int = 0) -> list[Token]:
     """Recursive-descent Lean propositional polarity checker returning any positive-polarity assumes tokens."""
     # Strip outer parens
     while (
@@ -4552,7 +4557,10 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
     if not toks:
         return []
 
-    # Strip leading `let ... := ...;` or newline-delimited `let ... := val\n body` bindings
+    # Strip leading `let ... := ...;` or newline-delimited `let ... := val\n body` bindings.
+    # A4: if `val` contains a real assumption reference (excluding struct-literal field labels
+    # `assumesHold := ...`), inline `(val)` for the bound variable in `body` so `let a := i.assumesHold;
+    # P → a = true` cannot hide positive-polarity assumptions behind a local alias!
     if toks[0].text in ("let", "have"):
         d = 0
         assign_pos = -1
@@ -4568,11 +4576,13 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
         if assign_pos != -1 and assign_pos + 1 < len(toks):
             d = 0
             body_pos = -1
+            val_end = -1
             val_start_line = toks[assign_pos + 1].line
             _CONT_OPS = frozenset({":=", ":", "→", "->", "↔", "<->", "∧", "/\\", "∨", "\\/", ",", "+", "-", "*", "="})
             for idx in range(assign_pos + 1, len(toks)):
                 t = toks[idx].text
                 if d == 0 and idx > assign_pos + 1 and toks[idx].line > val_start_line and toks[idx - 1].text not in _CONT_OPS:
+                    val_end = idx
                     body_pos = idx
                     break
                 if t in ("(", "[", "{", "⦃"):
@@ -4580,11 +4590,38 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
                 elif t in (")", "]", "}", "⦄"):
                     d = max(0, d - 1)
                 elif d == 0 and t == ";":
+                    val_end = idx
                     body_pos = idx + 1
                     break
                 val_start_line = toks[idx].line
             if body_pos != -1 and body_pos < len(toks):
-                return _check_lean_prop_polarity(toks[body_pos:], pol)
+                body_toks = toks[body_pos:]
+                if toks[0].text == "let" and _let_depth < 8 and assign_pos >= 2 and toks[1].kind == "IDENT":
+                    var_name = toks[1].text
+                    val_toks = toks[assign_pos + 1 : val_end]
+                    has_real_assumes = any(
+                        _is_assumes_token(val_toks[k])
+                        and not (k + 1 < len(val_toks) and val_toks[k + 1].text == ":=")
+                        for k in range(len(val_toks))
+                    )
+                    if has_real_assumes and val_toks:
+                        inlined: list[Token] = []
+                        lp = Token("PUNCT", "(", val_toks[0].start, val_toks[0].start, val_toks[0].line)
+                        rp = Token("PUNCT", ")", val_toks[-1].end, val_toks[-1].end, val_toks[-1].line)
+                        for bidx, bt in enumerate(body_toks):
+                            if (
+                                bt.kind == "IDENT"
+                                and bt.text == var_name
+                                and not (bidx > 0 and body_toks[bidx - 1].text == ".")
+                                and not (bidx + 1 < len(body_toks) and body_toks[bidx + 1].text == ":=")
+                            ):
+                                inlined.append(lp)
+                                inlined.extend(val_toks)
+                                inlined.append(rp)
+                            else:
+                                inlined.append(bt)
+                        return _check_lean_prop_polarity(inlined, pol, _let_depth + 1)
+                return _check_lean_prop_polarity(body_toks, pol, _let_depth + 1)
 
     # Leading `∀ binders, body` / `∃ binders, body`: a `∀ (h : T), B` binder type `T` is an
     # ANTECEDENT (`T → B`, flipped polarity); an `∃ (h : T), B` binder type is a conjunct
@@ -5344,6 +5381,7 @@ def scan_lean_invariant_struct_sealing(
         file_decls: list[dict[str, Any]] = []
         file_carriers: list[dict[str, Any]] = []
         standalone_derivings: list[tuple[int, set[str], set[str]]] = []
+        open_renamings: list[tuple[str, str, str]] = []  # (target_ns, old_name, new_name)
         i = 0
         while i < n:
             start_i = i
@@ -5352,6 +5390,37 @@ def scan_lean_invariant_struct_sealing(
                 break
             mods = {tokens[m].text for m in range(start_i, j)}
             kw = tokens[j].text
+
+            # Track `open <S> renaming <old> (→|->) <new> [in ...]` constructor aliases (A4)
+            if kw == "open" and j + 1 < n:
+                k = j + 1
+                if k < n and tokens[k].text == "scoped":
+                    k += 1
+                open_ns = tokens[k].text if (k < n and tokens[k].kind == "IDENT") else ""
+                k += 1
+                while k < n and tokens[k].text not in _LEAN_TOP_COMMANDS and tokens[k].text != "@[":
+                    if tokens[k].text == "in":
+                        k += 1
+                        break
+                    if tokens[k].text == "renaming":
+                        k += 1
+                        while k + 2 < n and tokens[k].text not in ("in", "hiding", "export") and tokens[k].text not in _LEAN_TOP_COMMANDS:
+                            if tokens[k].text == ",":
+                                k += 1
+                                continue
+                            if (
+                                tokens[k].kind == "IDENT"
+                                and tokens[k + 1].text in ("→", "->")
+                                and tokens[k + 2].kind == "IDENT"
+                            ):
+                                open_renamings.append((open_ns, tokens[k].text, tokens[k + 2].text))
+                                k += 3
+                                continue
+                            break
+                        continue
+                    k += 1
+                i = max(k, start_i + 1)
+                continue
 
             # Standalone `deriving instance Inhabited for V` (checked after Step 2a resolves aliases)
             if kw == "deriving" and j + 2 < n and tokens[j + 1].text == "instance":
@@ -5557,9 +5626,56 @@ def scan_lean_invariant_struct_sealing(
                 return tok.text in carrier_names or tok.text.split(".")[-1] in carrier_leaves
 
             explicit_ctors = {f"{sn}.{ctor}" for sn in s_names}
+            renamed_ctors = {
+                new_nm
+                for tgt_ns, old_nm, new_nm in open_renamings
+                if old_nm == ctor and (tgt_ns in s_names or tgt_ns.split(".")[-1] in s_leaves)
+            }
 
-            def _direct_ctor_flags(d: dict[str, Any]) -> tuple[bool, bool, int]:
+            def _bound_param_names(param_toks: list[Token]) -> set[str]:
+                """Collect locally bound parameter identifiers so `def f (mk : Nat) : Nat := mk + 1`
+                is not misclassified as an unqualified constructor reference (A4)."""
+                names: set[str] = set()
+                pidx = 0
+                plen = len(param_toks)
+                while pidx < plen:
+                    pt = param_toks[pidx].text
+                    if pt in _LEAN_BINDER_BRACKETS:
+                        close = _find_matching_delim(param_toks, pidx, pt, _LEAN_BINDER_BRACKETS[pt])
+                        inner = param_toks[pidx + 1 : close]
+                        depth = 0
+                        col = -1
+                        for k_in, it in enumerate(inner):
+                            if it.text in ("(", "[", "{", "⦃"):
+                                depth += 1
+                            elif it.text in (")", "]", "}", "⦄"):
+                                depth = max(0, depth - 1)
+                            elif depth == 0 and it.text == ":":
+                                col = k_in
+                                break
+                        head = inner[:col] if col != -1 else inner
+                        for it in head:
+                            if it.kind == "IDENT":
+                                names.add(it.text)
+                        pidx = close + 1
+                        continue
+                    if param_toks[pidx].kind == "IDENT":
+                        names.add(pt)
+                    pidx += 1
+                return names
+
+            def _direct_ctor_flags(d: dict[str, Any]) -> tuple[bool, bool, bool, int]:
                 body_toks = d["body_toks"]
+                param_names = _bound_param_names(d["param_toks"])
+                # Collect body-local lambda/let/have bound names (`fun mk => ...`, `let mk := ...`)
+                local_bound = set(param_names)
+                for bidx, bt in enumerate(body_toks):
+                    if bt.text in ("fun", "λ", "let", "have") and bidx + 1 < len(body_toks):
+                        nxt = body_toks[bidx + 1]
+                        if nxt.kind == "IDENT":
+                            local_bound.add(nxt.text)
+                        elif nxt.text == "(" and bidx + 2 < len(body_toks) and body_toks[bidx + 2].kind == "IDENT":
+                            local_bound.add(body_toks[bidx + 2].text)
                 exp_ref = (
                     any(t.text in explicit_ctors for t in body_toks)
                     or any(
@@ -5569,20 +5685,27 @@ def scan_lean_invariant_struct_sealing(
                         for idx in range(len(body_toks))
                     )
                     or any(t.text == f".{ctor}" for t in body_toks)
-                    # B4: an UNQUALIFIED `mk` resolves to the private constructor inside
-                    # `namespace S` / after `open S` / `open S in` (fail closed: any bare,
-                    # non-projection occurrence of the constructor name counts).
+                    # A4: `open V renaming mk → forge` alias reference
                     or any(
                         t.kind == "IDENT"
-                        and t.text == ctor
-                        and not (idx > 0 and body_toks[idx - 1].text in (".", "fun", "λ", "let", "have"))
+                        and t.text in renamed_ctors
+                        and t.text not in local_bound
+                        and not (idx > 0 and body_toks[idx - 1].text == ".")
                         for idx, t in enumerate(body_toks)
                     )
+                )
+                # B4 + A4: unqualified `mk` inside `namespace S` / `open S` / `open S in`,
+                # excluding projection `.mk` and locally shadowed `mk` binders.
+                bare_ctor = ctor not in local_bound and any(
+                    t.kind == "IDENT"
+                    and t.text == ctor
+                    and not (idx > 0 and body_toks[idx - 1].text in (".", "fun", "λ", "let", "have"))
+                    for idx, t in enumerate(body_toks)
                 )
                 anon_count = sum(1 for t in body_toks if t.text in ("⟨", "{"))
                 if d["is_where_ctor"]:
                     anon_count += 1
-                return exp_ref, anon_count > 0, anon_count
+                return exp_ref, bare_ctor, anon_count > 0, anon_count
 
             # Step 2b: transitive taint over same-file `private` helpers constructing `S`
             tainted_priv: set[str] = set()
@@ -5593,7 +5716,7 @@ def scan_lean_invariant_struct_sealing(
                 for d in file_decls:
                     if not d["is_private"] or d["is_smart_ctor"] or d["start"] < st["decl_end"]:
                         continue
-                    exp_ref, anon, anon_count = _direct_ctor_flags(d)
+                    exp_ref, bare_ctor, anon, anon_count = _direct_ctor_flags(d)
                     calls_tainted = any(
                         t.text in tainted_priv or t.text.split(".")[-1] in tainted_priv_leaves
                         for t in d["body_toks"]
@@ -5604,6 +5727,7 @@ def scan_lean_invariant_struct_sealing(
                     constructs_s = (
                         exp_ref
                         or calls_tainted
+                        or (bare_ctor and (ret_s or ret_car or d["colon_idx"] == -1))
                         or (
                             anon
                             and (
@@ -5623,29 +5747,30 @@ def scan_lean_invariant_struct_sealing(
             for d in file_decls:
                 if d["is_private"] or d["is_smart_ctor"] or d["start"] < st["decl_end"]:
                     continue
-                exp_ref, anon, anon_count = _direct_ctor_flags(d)
+                exp_ref, bare_ctor, anon, anon_count = _direct_ctor_flags(d)
                 calls_tainted = any(
                     t.text in tainted_priv or t.text.split(".")[-1] in tainted_priv_leaves
                     for t in d["body_toks"]
                 )
-                if not (exp_ref or anon or calls_tainted):
+                if not (exp_ref or bare_ctor or anon or calls_tainted):
                     continue
                 ret_mentions_s = any(_is_s_or_alias(t) for t in d["ret_toks"])
                 ret_mentions_car = any(_is_carrier(t) for t in d["ret_toks"])
                 params_mentions_s = any(_is_s_or_alias(t) or _is_carrier(t) for t in d["param_toks"])
+                bare_escapes = bare_ctor and (ret_mentions_s or ret_mentions_car or d["colon_idx"] == -1)
                 unannotated_escapes = d["colon_idx"] == -1 and (
                     calls_tainted or any(_is_s_or_alias(t) for t in d["body_toks"])
                 )
                 carrier_escapes = ret_mentions_car and (
-                    calls_tainted or exp_ref or anon_count >= 2 or (anon and not params_mentions_s)
+                    calls_tainted or exp_ref or bare_ctor or anon_count >= 2 or (anon and not params_mentions_s)
                 )
-                escapes = exp_ref or ret_mentions_s or unannotated_escapes or carrier_escapes
+                escapes = exp_ref or bare_escapes or (ret_mentions_s and (anon or calls_tainted)) or unannotated_escapes or carrier_escapes
                 if not escapes:
                     continue
                 what = "instance" if d["is_inst"] else d["kw"]
                 via = (
                     "transitively via an unreviewed `private` helper"
-                    if calls_tainted and not (exp_ref or anon)
+                    if calls_tainted and not (exp_ref or bare_ctor or anon)
                     else f"directly (bypassing `private {ctor} ::`)"
                 )
                 findings.append(
