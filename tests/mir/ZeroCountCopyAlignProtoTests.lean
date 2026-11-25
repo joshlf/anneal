@@ -1152,6 +1152,190 @@ theorem target64_u64_resolved :
     resolveCopyElemLayout (declsFor u64K u64K) emptyLayoutTable (cp 2) (cp 3) = .ok 8 8 := by
   decide +kernel
 
+/-! ## 11e. B2 hardening: `unitLayout` hijacking, primitive `layoutIdx` validation,
+non-multiple-of-align layouts, unsized-tuple & opaque-ADT pointers, 32-bit `i686`
+`u64` decl layout, aligned packed-field offset arithmetic, Kleene 3-valued `.ub`
+dominance, and `UnsafeObligations` breakage witnesses -/
+
+/-- `unitLayout` at `entries[0]` (standard in `rustc-capture`, e.g. `adtUnitFirstLayouts`). -/
+def unitLayout0 : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [] [], variants := .single 0, isUninhabited := false }
+
+def unitFirstLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [unitLayout0, u64Layout] }
+
+/-- **Soundness (B2)**: when `entries[0] = unitLayout` and `_1 : u64` carries synthetic
+`layoutIdx = 0`, `[u64; 4]` MUST resolve to `(32, 8)` (NOT A1's `(0, 1)` ZST!). -/
+theorem unitFirst_array_u64_not_hijacked :
+    resolveCopyElemLayout (declsFor (.array u64K 4) (.array u64K 4)) unitFirstLayouts
+      (cp 2) (cp 3) = .ok 32 8 := by
+  decide +kernel
+
+theorem unitFirst_array_u64_misaligned_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (cp 3)
+        (declsFor (.array u64K 4) (.array u64K 4)) unitFirstLayouts
+        (danglingScalar 4) (danglingScalar 8) 0 st.frame.locals = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- **Soundness (B2)**: when `entries[0] = unitLayout` and `_2 : *const u64` carries
+synthetic `layoutIdx = 0`, `copy_nonoverlapping::<*const u64>` MUST resolve to `(8, 8)`
+(NOT A1's `(0, 1)` ZST!). -/
+def rawPtrToRawPtrDecls : List LocalDecl :=
+  [declOf unitK, declOf (rawConstK u64K),
+   declOf (rawConstK (rawConstK u64K)), declOf (rawMutK (rawConstK u64K))]
+
+theorem unitFirst_rawptr_u64_not_hijacked :
+    resolveCopyElemLayout rawPtrToRawPtrDecls unitFirstLayouts (cp 2) (cp 3) = .ok 8 8 := by
+  decide +kernel
+
+/-- **Soundness (B2)**: a `u8` operand whose `layoutIdx = 1` erroneously points to
+`u64`'s `.primitive` `(8, 8)` layout must NOT claim `align = 8` for `u8`. -/
+def badPrimPtrLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 },
+    backendRepr := .scalar (.union (.pointer 0)),
+    fields := .primitive, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1] }
+
+def badPrimLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [unitLayout0, u64Layout, badPrimPtrLayout] }
+
+def badPrimDecls : List LocalDecl :=
+  [declNL unitK,
+   { mutability := .not, ty := { kind := rawConstK u8K, layoutIdx := 2 }, debugName := none },
+   { mutability := .not, ty := { kind := rawMutK u8K, layoutIdx := 2 }, debugName := none }]
+
+theorem mismatched_primitive_layoutIdx_rejected :
+    resolveCopyElemLayout badPrimDecls badPrimLayouts (cp 1) (cp 2) = .unsupported := by
+  decide +kernel
+
+/-- **Soundness (B2)**: a `TypeLayout` violating `size % align == 0` (`size = 5, align = 4`)
+must fail closed `.unsupported` (A1 accepted `.ok 5 4`). -/
+def nonMultAlignLayout : TypeLayout :=
+  { size := { bytes := 5 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0, isUninhabited := false }
+
+def nonMultLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [nonMultAlignLayout, ptrLayoutTo0] }
+
+def nonMultDecls : List LocalDecl :=
+  [declNL unitK,
+   { mutability := .not, ty := { kind := rawConstK reprCK, layoutIdx := 1 }, debugName := none },
+   { mutability := .not, ty := { kind := rawMutK reprCK, layoutIdx := 1 }, debugName := none }]
+
+theorem malformed_nonmult_align_layout_rejected :
+    resolveCopyElemLayout nonMultDecls nonMultLayouts (cp 1) (cp 2) = .unsupported := by
+  decide +kernel
+
+/-- **Soundness (B2)**: `*const (u8, [u8])` is a **wide pointer** (size `16`, align `8`),
+not thin size `8` (A1 returned `.ok 8 8` and missed `count = 2^59` overflow!). -/
+def wideTuplePtrK : RigidTy := rawConstK (.tuple [u8K, .slice u8K])
+
+theorem wide_ptr_unsized_tuple_layout :
+    resolveCopyElemLayout (declsFor wideTuplePtrK wideTuplePtrK) emptyLayoutTable (cp 2) (cp 3) =
+      .ok 16 8 := by
+  decide +kernel
+
+theorem wide_ptr_unsized_tuple_overflow_ub :
+    proto .rejectNull wideTuplePtrK wideTuplePtrK (stackPtr 0) (stackPtr 0) 576460752303423488 =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- **Soundness (B2)**: `*const OpaqueMaybeDst` (unlaid-out ADT that could be a DST struct)
+fails closed `.unsupported` instead of guessing thin size `8`, while `*const ReprC` (sized
+ADT with a `LocalDecl` layout) resolves cleanly to `.ok 8 8`. -/
+theorem opaque_adt_ptr_fail_closed :
+    resolveCopyElemLayout
+      (declsFor (rawConstK (.adt "opaque::MaybeDst" [])) (rawConstK (.adt "opaque::MaybeDst" [])))
+      emptyLayoutTable (cp 2) (cp 3) = .unsupported := by
+  decide +kernel
+
+def sizedAdtPtrDecls : List LocalDecl :=
+  [declNL unitK,
+   { mutability := .mut, ty := { kind := reprCK, layoutIdx := 0 }, debugName := none },
+   declNL (rawConstK (rawConstK reprCK)),
+   declNL (rawMutK (rawConstK reprCK))]
+
+theorem sized_adt_ptr_resolved :
+    resolveCopyElemLayout sizedAdtPtrDecls adtLayouts (cp 2) (cp 3) = .ok 8 8 := by
+  decide +kernel
+
+/-- **Completeness (B2)**: on 32-bit `i686`, when `_1 : u64` carries its compiler
+`TypeLayout` (`size = 8, align = 4, fields = .primitive`), `copy_nonoverlapping::<u64>`
+resolves to `.ok 8 4`, steps on 4-aligned `&raw mut _1` and `.scalar ⟨4, 4⟩`, and rejects
+`.scalar ⟨2, 4⟩` as `.ub` (A1 returned `.unsupported`). -/
+def u64Layout32 : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def i686Layouts : LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true, entries := [unitLayout0, u64Layout32] }
+
+def i686Decls : List LocalDecl :=
+  [declNL unitK,
+   { mutability := .mut, ty := { kind := u64K, layoutIdx := 1 }, debugName := none },
+   declNL (rawConstK u64K), declNL (rawMutK u64K)]
+
+def i686State : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨7, 8⟩), .uninit, .uninit] }
+    memory := { emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }],
+      nextTag := 2 } }
+
+theorem target32_i686_u64_with_decl_layout_resolved :
+    resolveCopyElemLayout i686Decls i686Layouts (cp 2) (cp 3) = .ok 8 4 := by
+  decide +kernel
+
+theorem target32_i686_u64_with_decl_layout_steps :
+    evalCopyNonOverlappingWithCountProto .rejectNull i686State (cp 2) (cp 3) i686Decls
+        i686Layouts (.ptr ⟨1, 0⟩ 4) (.scalar ⟨4, 4⟩) 0 i686State.frame.locals =
+      MirStepNode.step (advanceStmt i686State i686State.frame.locals) := by
+  kernel_rfl
+
+theorem target32_i686_u64_with_decl_layout_misaligned_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull i686State (cp 2) (cp 3) i686Decls
+        i686Layouts (.ptr ⟨1, 0⟩ 4) (.scalar ⟨2, 4⟩) 0 i686State.frame.locals =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- **False-UB fix (B2)**: `(outer.p.b as *mut u8).add(7) as *mut u64` has `placeOff = 1`
+and `offsetBytes = 7`, giving exact byte offset `1 + 7 = 8 ≡ 0 (mod 8)` inside 8-aligned
+`OuterOff0`. A1/B1 falsely returned `.fail .ub` via a redundant `offsetBytes % 8 == 0` check;
+B2 steps cleanly! -/
+theorem nested_packed_plus7_aligned_noop :
+    evalCopyNonOverlappingWithCountProto .rejectNull extAdtState (cp 6) (cp 7) extAdtDecls
+        extAdtLayouts (.ptr ⟨2, 7⟩ 8) (danglingScalar 8) 0 extAdtState.frame.locals =
+      noopExtAdt := by
+  kernel_rfl
+
+/-- **Kleene three-valued `.ub` dominance (B2)**: when `src` has unknown alignment
+(`&raw mut u8_local as *const u64`, `.unsupported`) and `dst` is unconditionally `.ub`
+(misaligned `9` or null `0` under `.rejectNull`), the call is unconditionally `.ub` in every
+execution (A1 returned `.unsupported`). -/
+theorem kleene_unknown_src_misaligned_dst_ub :
+    proto .rejectNull u64K u64K u8LocalPtr (danglingScalar 9) 0 = MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem kleene_unknown_src_null_dst_ub :
+    proto .rejectNull u64K u64K u8LocalPtr (danglingScalar 0) 0 = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- **`UnsafeObligations.evalCopyNonOverlapping_one_of_obligations` breakage witnesses (B2)**:
+with `localDecls = []`, `count = 1`, legacy steps for arbitrary `sz : Nat` and arbitrary
+`dstOp`, whereas the prototype (1) faults `.ub` on `sz = 4` (width gate) and (2) takes the
+ZST no-op path (leaving `_5` untouched!) when `dstOp` is a `*mut ()` constant. -/
+def constNullUnitMutPtr : Operand :=
+  .constant { ty := tyOf (rawMutK unitK), val := .scalar (.ptr ⟨4, 0⟩ 8) }
+
+theorem unsafeObligations_one_zst_dst_breaks :
+    slot5Of (evalCopyNonOverlappingWithCount stW (cp 2) constNullUnitMutPtr [] emptyLayoutTable
+        (.ptr ⟨1, 0⟩ 8) (.ptr ⟨4, 0⟩ 8) 1 stW.frame.locals) = 42 ∧
+    slot5Of (evalCopyNonOverlappingWithCountProto .rejectNull stW (cp 2) constNullUnitMutPtr []
+        emptyLayoutTable (.ptr ⟨1, 0⟩ 8) (.ptr ⟨4, 0⟩ 8) 1 stW.frame.locals) = 0 := by
+  exact ⟨by decide +kernel, by decide +kernel⟩
+
 /-! ## 12. Terminator-level call path inherits the fix -/
 
 /-- `evalCopyNonOverlappingCallProto` with a misaligned dangling `src` faults
@@ -1252,6 +1436,15 @@ def toV0801 (n : Name) : Name :=
   n.replacePrefix `Trusted.Rustc.V2026_06_01 `Trusted.Rustc.V2026_08_01
 
 open Lean Elab Command in
+/-- Map every `Trusted.Rustc.V2026_06_01.*` constant name inside an `Expr` to
+`Trusted.Rustc.V2026_08_01.*`, for exact type-signature verification (B2). -/
+def toV0801Expr (e : Expr) : Expr :=
+  e.replace fun sub =>
+    match sub with
+    | .const n us => some (.const (toV0801 n) us)
+    | _ => none
+
+open Lean Elab Command in
 elab "#zc_port_audit" : command => do
   let env ← getEnv
   let deps := protoTrustedDeps env
@@ -1267,6 +1460,8 @@ elab "#zc_port_audit" : command => do
      `Trusted.Rustc.V2026_08_01.MirSemantics.Machine]
   let stmtMod : Name := `Trusted.Rustc.V2026_08_01.MirSemantics.Statements
   let mut problems : Array String := #[]
+  let mut sigChecked : Nat := 0
+  let mut structChecked : Nat := 0
   for n in deps.toList do
     let n' := toV0801 n
     match env.getModuleIdxFor? n' with
@@ -1288,7 +1483,19 @@ elab "#zc_port_audit" : command => do
             if r.range.pos.line > anchorLine then
               problems := problems.push s!"{n'} defined after the patch point"
           | none => problems := problems.push s!"no range for {n'}"
-  -- Constructor-set differences of every inductive type the prototype matches on.
+      -- Type-signature verification (B2): check `toV0801Expr ci.type == ci'.type`
+      -- (ignoring `Value.{casesOn,rec}` whose motive differs solely due to `Value.uninit`).
+      let skipValueRec :=
+        n == ``Trusted.Rustc.V2026_06_01.MirSemantics.Value.casesOn ||
+        n == ``Trusted.Rustc.V2026_06_01.MirSemantics.Value.rec
+      if !skipValueRec then
+        match env.find? n, env.find? n' with
+        | some ci, some ci' =>
+          sigChecked := sigChecked + 1
+          if !(Expr.eqv (toV0801Expr ci.type) ci'.type) then
+            problems := problems.push s!"type signature mismatch on {n'}"
+        | _, _ => pure ()
+  -- Constructor-set and structure-field differences of every inductive / structure used.
   let mut inducts : NameSet := {}
   for n in deps.toList do
     match env.find? n with
@@ -1298,8 +1505,10 @@ elab "#zc_port_audit" : command => do
     | _ =>
       if n.getString! == "casesOn" then inducts := inducts.insert n.getPrefix
   let mut ctorDiffs : Array String := #[]
+  let mut fieldDiffs : Array String := #[]
   for i in inducts.toList do
-    match env.find? i, env.find? (toV0801 i) with
+    let i' := toV0801 i
+    match env.find? i, env.find? i' with
     | some (.inductInfo a), some (.inductInfo b) =>
       let an := a.ctors.map (·.getString!)
       let bn := b.ctors.map (·.getString!)
@@ -1308,16 +1517,30 @@ elab "#zc_port_audit" : command => do
       if !onlyA.isEmpty || !onlyB.isEmpty then
         ctorDiffs := ctorDiffs.push
           s!"{i.getString!}: only V2026_06_01 {onlyA}, only V2026_08_01 {onlyB}"
-    | some (.inductInfo _), _ => ctorDiffs := ctorDiffs.push s!"missing inductive {toV0801 i}"
+      if isStructure env i && isStructure env i' then
+        structChecked := structChecked + 1
+        let fa := (getStructureFields env i).toList.map (·.getString!)
+        let fb := (getStructureFields env i').toList.map (·.getString!)
+        let fOnlyA := fa.filter (fun f => !fb.contains f)
+        let fOnlyB := fb.filter (fun f => !fa.contains f)
+        if !fOnlyA.isEmpty || !fOnlyB.isEmpty then
+          fieldDiffs := fieldDiffs.push
+            s!"{i.getString!}: only V2026_06_01 {fOnlyA}, only V2026_08_01 {fOnlyB}"
+    | some (.inductInfo _), _ => ctorDiffs := ctorDiffs.push s!"missing inductive {i'}"
     | _, _ => pure ()
   if deps.size < 100 then
     problems := problems.push s!"suspiciously few dependencies ({deps.size})"
+  if sigChecked < 100 then
+    problems := problems.push s!"suspiciously few signatures checked ({sigChecked})"
+  if structChecked < 5 then
+    problems := problems.push s!"suspiciously few structures checked ({structChecked})"
   let sorted := problems.qsort (· < ·)
   let sortedD := ctorDiffs.qsort (· < ·)
-  logInfo m!"port audit problems: {sorted.toList}; constructor-set differences: {sortedD.toList}"
+  let sortedF := fieldDiffs.qsort (· < ·)
+  logInfo m!"port audit problems: {sorted.toList}; constructor-set differences: {sortedD.toList}; structure-field differences: {sortedF.toList}"
 
 /--
-info: port audit problems: []; constructor-set differences: [Value: only V2026_06_01 [uninit], only V2026_08_01 []]
+info: port audit problems: []; constructor-set differences: [Value: only V2026_06_01 [uninit], only V2026_08_01 []]; structure-field differences: [TypeLayout: only V2026_06_01 [variantDiscriminants], only V2026_08_01 []]
 -/
 #guard_msgs in
 #zc_port_audit
@@ -1549,5 +1772,35 @@ theorem zeroCountCopyAlignProto_bundle :
 -/
 #guard_msgs in
 #print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.zero_shape_first_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.unitFirst_array_u64_not_hijacked' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.unitFirst_array_u64_not_hijacked
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.wide_ptr_unsized_tuple_overflow_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.wide_ptr_unsized_tuple_overflow_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.target32_i686_u64_with_decl_layout_steps' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.target32_i686_u64_with_decl_layout_steps
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.nested_packed_plus7_aligned_noop' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.nested_packed_plus7_aligned_noop
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.kleene_unknown_src_misaligned_dst_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.kleene_unknown_src_misaligned_dst_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.unsafeObligations_one_zst_dst_breaks' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.unsafeObligations_one_zst_dst_breaks
 
 end Anneal.Proto.ZeroCountCopyAlign.Tests
