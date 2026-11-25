@@ -2127,7 +2127,32 @@ struct FnSig<'a> {
 /// must not be assumed uninhabited).
 fn shadows_infallible(src: &str) -> Result<bool, PeerScanError> {
     let mut lx = Lexer::new(src, SourceDialect::Rust);
+    let mut prev: Option<Tok<'_>> = None;
+    let mut in_use = false;
+    let mut use_has_convert = false;
     while let Some(t) = lx.next()? {
+        // `use x::Y as Infallible;`, a non-`convert` `use ..::Infallible`, or a
+        // generic parameter named `Infallible` all shadow the core type.
+        if t.is_kw("use") {
+            in_use = true;
+            use_has_convert = false;
+        } else if t.is_punct(";") {
+            in_use = false;
+        } else if t.is_ident() && t.text == "convert" {
+            use_has_convert = true;
+        } else if t.is_ident() && t.text == "Infallible" {
+            let after = lx.peek()?;
+            if in_use && (matches!(prev, Some(p) if p.is_kw("as")) || !use_has_convert) {
+                return Ok(true);
+            }
+            if !in_use
+                && matches!(prev, Some(p) if p.is_punct("<") || p.is_punct(","))
+                && matches!(after, Some(a) if a.is_punct(":") || a.is_punct("="))
+            {
+                return Ok(true);
+            }
+        }
+        prev = Some(t);
         if t.is_kw("struct") || t.is_kw("type") || t.is_kw("union") || t.is_kw("enum") {
             if let Some(name) = lx.peek()? {
                 if name.is_ident() && name.text == "Infallible" {
@@ -4166,18 +4191,32 @@ struct AliasTable<'a> {
     len: usize,
 }
 
+/// Capacity of the table of functions whose bodies mention the assumption atom.
+const MAX_ASSUMPTION_HELPERS: usize = 32;
+
 struct PolarityAnalyzer<'a> {
     aliases: AliasTable<'a>,
+    /// Functions whose bodies (transitively) mention the assumption atom: a call
+    /// to one hides the atom's polarity, so it is an unclean leaf.
+    helpers: PairTable<'a, MAX_ASSUMPTION_HELPERS>,
 }
 
 impl<'a> PolarityAnalyzer<'a> {
     fn new(dialect: SourceDialect) -> Self {
+        Self::with_helpers(dialect, PairTable::new())
+    }
+
+    fn with_helpers(
+        dialect: SourceDialect,
+        helpers: PairTable<'a, MAX_ASSUMPTION_HELPERS>,
+    ) -> Self {
         Self {
             aliases: AliasTable {
                 names: [""; MAX_LET_ALIAS_DEPTH],
                 values: [Lexer::new("", dialect); MAX_LET_ALIAS_DEPTH],
                 len: 0,
             },
+            helpers,
         }
     }
 
@@ -4196,7 +4235,7 @@ impl<'a> PolarityAnalyzer<'a> {
             if !t.is_ident() {
                 continue;
             }
-            if ASSUMPTION_ATOMS.contains(&t.text) {
+            if ASSUMPTION_ATOMS.contains(&t.text) || self.helpers.contains_first(t.text) {
                 return Ok(Some(t.start));
             }
             if let Some(i) = self.lookup(t.text, limit) {
@@ -4611,9 +4650,11 @@ pub fn check_assumption_polarity_expr(
     )
 }
 
-struct PolarityVisitor;
+struct PolarityVisitor<'a> {
+    helpers: PairTable<'a, MAX_ASSUMPTION_HELPERS>,
+}
 
-impl<'a> ClauseVisitor<'a> for PolarityVisitor {
+impl<'a> ClauseVisitor<'a> for PolarityVisitor<'a> {
     fn visit_clause(&mut self, kind: ClauseKind, clause: Lexer<'a>) -> GResult<()> {
         let sign = match kind {
             ClauseKind::Ensures => Sign::Pos,
@@ -4638,32 +4679,72 @@ impl<'a> ClauseVisitor<'a> for PolarityVisitor {
         if let Some(inner) = whole_group(body, "[")? {
             let mut parts = TopSplit::new(inner, false);
             while let Some(p) = parts.next_part()? {
-                PolarityAnalyzer::new(clause.dialect).analyze(strip_closure_params(p)?, cx)?;
+                PolarityAnalyzer::with_helpers(clause.dialect, self.helpers)
+                    .analyze(strip_closure_params(p)?, cx)?;
             }
             return Ok(());
         }
-        PolarityAnalyzer::new(clause.dialect).analyze(body, cx)
+        PolarityAnalyzer::with_helpers(clause.dialect, self.helpers).analyze(body, cx)
     }
+}
+
+/// Functions (including Verus `spec fn`s) whose bodies mention the assumption
+/// atom, directly or through another such function.
+fn collect_assumption_helpers(src: &str) -> GResult<PairTable<'_, MAX_ASSUMPTION_HELPERS>> {
+    let mut helpers: PairTable<'_, MAX_ASSUMPTION_HELPERS> = PairTable::new();
+    for _ in 0..=MAX_ASSUMPTION_HELPERS {
+        let mut changed = false;
+        let mut lx = Lexer::new(src, SourceDialect::Rust);
+        while let Some(t) = lx.next()? {
+            if !t.is_kw("fn") {
+                continue;
+            }
+            let Some(sig) = scan_fn_signature(lx, false)? else {
+                continue;
+            };
+            let mut c = sig.rest;
+            let Some(open) = c.next()? else { continue };
+            if !open.is_punct("{") {
+                continue;
+            }
+            let s = c.pos;
+            let close = skip_group(&mut c, &open)?;
+            let mut body = lx.range(s, close);
+            while let Some(n) = body.next()? {
+                if n.is_ident()
+                    && (ASSUMPTION_ATOMS.contains(&n.text) || helpers.contains_first(n.text))
+                {
+                    changed |= helpers.push(sig.name.text, "", sig.name.start)?;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(helpers)
 }
 
 /// Source scanner of Guard 6a over Rust specification attributes: every
 /// `ensures` clause is positive and every `requires` clause negative.
 pub fn check_assumption_polarity_source(src: &str) -> GResult<()> {
+    let mut visitor = PolarityVisitor {
+        helpers: collect_assumption_helpers(src)?,
+    };
     let mut lx = Lexer::new(src, SourceDialect::Rust);
     let mut st = DelimStack::new();
     while let Some(t) = lx.next()? {
         if t.is_punct("#") {
             if let Some((_, content)) = take_attribute(&mut lx)? {
-                classify_attribute(content, &mut PolarityVisitor)?;
+                classify_attribute(content, &mut visitor)?;
                 continue;
             }
         }
         if t.is_kw("fn") {
             if let Some(sig) = scan_fn_signature(lx, false)? {
                 if let Some(clauses) = sig.clauses {
-                    for_each_sig_clause(clauses, &mut |kind, seg| {
-                        PolarityVisitor.visit_clause(kind, seg)
-                    })?;
+                    for_each_sig_clause(clauses, &mut |kind, seg| visitor.visit_clause(kind, seg))?;
                 }
             }
         }
@@ -5269,8 +5350,7 @@ fn collect_mut_inv_params<'a>(
                         if tok.is_kw("mut") {
                             saw_mut = true;
                         } else if tok.is_ident()
-                            && (invs.contains_first(tok.text)
-                                || (self_is_inv && tok.is_kw("Self")))
+                            && (invs.contains_first(tok.text) || (self_is_inv && tok.is_kw("Self")))
                         {
                             saw_inv = true;
                         }
@@ -7430,12 +7510,16 @@ mod tests {
     fn b3_g4_catches_header_return_type_inference_and_const_generic_impl() {
         // `Tokens` only appears in `helper`'s return type header, not its body!
         assert_eq!(
-            g4("fn mk<T: Mint>() -> T { T::new() } fn helper() -> Tokens { mk() } fn main() { let a = helper(); let b = helper(); }"),
+            g4(
+                "fn mk<T: Mint>() -> T { T::new() } fn helper() -> Tokens { mk() } fn main() { let a = helper(); let b = helper(); }"
+            ),
             Some(R::GenericConstructorDispatch)
         );
         // Const-generic `{ 1 }` inside `impl<T: Trait<{ 1 }>>` must not drop `T`.
         assert_eq!(
-            g4("struct H<T>(T); impl<T: Trait<{ 1 }>> H<T> { fn mk() -> T { T::new() } } fn main() { let a: Tokens = H::mk(); }"),
+            g4(
+                "struct H<T>(T); impl<T: Trait<{ 1 }>> H<T> { fn mk() -> T { T::new() } } fn main() { let a: Tokens = H::mk(); }"
+            ),
             Some(R::GenericConstructorDispatch)
         );
     }
@@ -7492,6 +7576,64 @@ mod tests {
                 "{inv} impl R {{ pub fn lo_mut(&mut self) -> &mut u32 {{ &mut (self.lo) }} }}"
             )),
             Some(R::InvariantMutableFieldEscape)
+        );
+    }
+
+    #[test]
+    fn a3_g3_infallible_shadowing_by_use_and_generics() {
+        assert_eq!(
+            g3("use foo::Bar as Infallible; #[trusted] #[ensures(false)] fn f() -> Infallible;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("use foo::Infallible; #[trusted] #[ensures(false)] fn f() -> Infallible;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[trusted] #[ensures(false)] fn f<Infallible: Default>() -> Infallible;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("use core::convert::Infallible; #[trusted] #[ensures(false)] fn f() -> Infallible;"),
+            None
+        );
+        assert_eq!(
+            g3(
+                "use std::convert::{Infallible, TryFrom}; #[trusted] #[ensures(false)] fn f() -> Infallible;"
+            ),
+            None
+        );
+        assert_eq!(
+            g3(
+                "use foo::Bar as Infallible; #[trusted] #[ensures(false)] fn f() -> core::convert::Infallible;"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a3_g6a_helper_function_indirection() {
+        assert_eq!(
+            g6a("fn helper() -> bool { assumes_hold } #[ensures(helper())] fn f() {}"),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            g6a("fn helper() -> bool { !assumes_hold } #[requires(helper())] fn f() {}"),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            g6a(
+                "fn a() -> bool { assumes_hold } fn b() -> bool { a() } #[ensures(x && b())] fn f() {}"
+            ),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            g6a("verus! { spec fn h() -> bool { assumes_hold } fn f() ensures h() {} }"),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            g6a("fn helper() -> bool { true } #[ensures(helper())] fn f() {}"),
+            None
         );
     }
 }
