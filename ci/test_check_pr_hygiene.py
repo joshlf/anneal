@@ -1286,6 +1286,28 @@ class StandaloneLayoutTests(StandaloneRepoTestCase):
         self.assertEqual(report["human_review_surface"],
                          ["lean-miri/vendor/Miri/X.lean"])
 
+    def test_rename_into_scope_and_trusted_checked(self):
+        # Renaming a headerless vendored file into Anneal scope must still
+        # fail the Fuchsia license header check, and renaming a file with an
+        # unpinned upstream link into `trusted/lean/` must fail citations.
+        self.write("lean-miri/vendor/Miri/Raw.lean", "def raw := 1\n")
+        self.write("theory/Link.lean",
+                   HEADER_LEAN + "\n-- https://doc.rust-lang.org/std/\n")
+        base_with_files = self.commit("Seed vendor and theory files")
+        (self.repo / "theory").mkdir(parents=True, exist_ok=True)
+        (self.repo / "trusted" / "lean").mkdir(parents=True, exist_ok=True)
+        git(self.repo, "mv", "lean-miri/vendor/Miri/Raw.lean",
+            "theory/Raw.lean")
+        git(self.repo, "mv", "theory/Link.lean", "trusted/lean/Link.lean")
+        self.commit("Move files into scope and trusted")
+        code, report = self.run_check(base=base_with_files)
+        self.assertEqual(code, 1, report)
+        found = {(f["check"], f["path"]) for f in report["findings"]}
+        self.assertEqual(found, {
+            ("header", "theory/Raw.lean"),
+            ("trusted-citation", "trusted/lean/Link.lean"),
+        })
+
     def test_explicit_layout_overrides_detection(self):
         self.assertEqual(self.assert_clean("--layout", "standalone",
                                            base=None)["layout"], "standalone")

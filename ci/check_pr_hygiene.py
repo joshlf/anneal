@@ -1708,25 +1708,41 @@ def check(
     for f in scoped:
         if f.status == "D":
             continue
+        entered_scope = (
+            f.status == "A"
+            or (f.old_path is not None
+                and not in_anneal_scope(f.old_path, layout))
+        )
+        entered_trusted = (
+            f.path.startswith(citation_prefixes)
+            and (f.status == "A"
+                 or (f.old_path is not None
+                     and not f.old_path.startswith(citation_prefixes)))
+        )
         needs_content = (
             Path(f.path).suffix in HEADER_EXTS
             or f.path.startswith(citation_prefixes)
         )
-        if not needs_content or not (f.added or f.status == "A"):
+        if not needs_content or not (
+                f.added or entered_scope or entered_trusted):
             continue
         content = git.blob_text(head, f.path)
         if content is None:
             raise GitError(f"cannot read {head[:12]}:{f.path}")
-        if f.status == "A" and needs_header(f.path, layout):
+        if entered_scope and needs_header(f.path, layout):
             report.findings += header_findings(f.path, content, max_year)
         wrap_errs, wrap_warns = wrap_findings(f.path, content, f.added,
                                               layout)
         report.findings += wrap_errs
         report.warnings += wrap_warns
         if f.path.startswith(citation_prefixes):
+            cite_lines = (
+                dict(enumerate(content.split("\n"), 1))
+                if entered_trusted else f.added_text
+            )
             report.findings += trusted_citation_findings(
-                f.path, content, f.added_text)
-            if (f.status == "A" and Path(f.path).suffix in (".lean", ".rs")
+                f.path, content, cite_lines)
+            if (entered_trusted and Path(f.path).suffix in (".lean", ".rs")
                     and not SHA40_RE.search(content)):
                 report.warnings.append(Finding(
                     "trusted-citation",

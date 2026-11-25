@@ -391,7 +391,7 @@ def stride8LoopClaim : Trusted.VerificationResult.Claim where
 /-- `VerificationResult stride8LoopClaim`, from the `rfl` certificate. -/
 theorem canary_stride8_loop_verificationResult :
     Trusted.VerificationResult.VerificationResult stride8LoopClaim :=
-  verifyMirCutpoints_verificationResult (argSlots := []) rfl
+  verifyMirCutpoints_verificationResult (argSlots := [])
     stride8Loop_cert_ok
     (fun args hPre => by
       have hArgs : args = [] := hPre
@@ -405,16 +405,18 @@ theorem canary_stride8_loop_verificationResult :
         exact uint_valDenote_exact rfl hDen)
 
 /-- Audited claim for `signedHalfBody`: for every `i32` argument it is
-UB-free and every normal return is an `i32` with bit pattern `< 2^30`. -/
+UB-free and every normal return is an `i32` with bit pattern `< 2^30`, even
+with a non-empty linked callee table. -/
 def signedHalfClaim : Trusted.VerificationResult.Claim where
   body := signedHalfBody
   pre args := ∃ x, x < modPow2 32 ∧ args = [.scalar ⟨x, 4⟩]
   post _ ret := ∃ bits, ret = .scalar ⟨bits, 4⟩ ∧ bits < modPow2 30
+  callees := [stride8LoopBody]
 
 /-- `VerificationResult signedHalfClaim`, from the `rfl` certificate. -/
 theorem canary_signed_half_verificationResult :
     Trusted.VerificationResult.VerificationResult signedHalfClaim :=
-  verifyMirCutpoints_verificationResult (argSlots := signedHalfArgSlots) rfl
+  verifyMirCutpoints_verificationResult (argSlots := signedHalfArgSlots)
     signedHalf_cert_ok
     (fun args hPre => by
       match hPre with
@@ -430,6 +432,42 @@ theorem canary_signed_half_verificationResult :
         | ⟨bits, hV, hLe⟩ =>
           exact ⟨bits, hV,
             Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 30) Nat.one_pos)⟩)
+
+/-- Audited stateful claim for `bitmaskDivCastBody`: from any root-entry
+memory and any `u32` inputs, execution is UB-free and returns `< 2^32`. -/
+def bitmaskDivCastStatefulClaim :
+    Trusted.VerificationResult.StatefulClaim where
+  body := bitmaskDivCastBody
+  pre args mem :=
+    mem.callStack = [] ∧ mem.activeCallee = none ∧
+    mem.activeProtectors = [] ∧
+    ∃ a b, a < modPow2 32 ∧ b < modPow2 32 ∧
+      args = [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]
+  post _ _ ret _ := ∃ bits, ret = .scalar ⟨bits, 8⟩ ∧ bits < modPow2 32
+
+/-- `StatefulVerificationResult bitmaskDivCastStatefulClaim`, from the `rfl`
+certificate. -/
+theorem canary_bitmask_div_cast_statefulVerificationResult :
+    Trusted.VerificationResult.StatefulVerificationResult
+      bitmaskDivCastStatefulClaim :=
+  verifyMirCutpoints_statefulVerificationResult
+    (argSlots := bitmaskDivCastArgSlots) bitmaskDivCast_cert_ok
+    (fun args mem hPre => by
+      match hPre with
+      | ⟨hCS, hCal, hProt, a, b, ha, hb, hArgs⟩ =>
+        subst hArgs
+        exact ⟨hCS, hCal, hProt,
+          ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound ha⟩,
+           rfl, ⟨rfl, rfl, absVal_topInit_sound hb⟩, True.intro⟩⟩)
+    (fun _ _ _ _ _ hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        match uint_valDenote_ubound (hi := modPow2 32 - 1) rfl hDen with
+        | ⟨bits, hV, hLe⟩ =>
+          exact ⟨bits, hV,
+            Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 32) Nat.one_pos)⟩)
 
 /-! ## Positive Controls and CFG Joins -/
 

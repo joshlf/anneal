@@ -1015,19 +1015,52 @@ theorem verifyMirCutpoints_sound_call {body : CapturedMir}
         (mirRetPost body retInv) (initMachineState body args)) :=
   checkMirCert_sound_call (bool_and_true_right hVer) hArgs
 
-/-! ## 8. Trusted `VerificationResult` Certificates -/
+/-! ## 8. Trusted Verification Certificates (`VerificationResult` & `StatefulVerificationResult`) -/
 
-/-- Every normal return observed in the interaction tree of an invariant
-state is a `ReturnsFrom` return of the concrete transition system. -/
-theorem returnsFrom_of_reachesRet {body : CapturedMir} {retInv : MirAbsSlot}
-    {invs : List (Option MirAbsEnv)} {s0 : MachineState}
-    {tr : List (Event MirEffect)} {retVal : Value} {mem : Memory}
+/-- `initMachineStateWithCallees body args callees` starts at a root frame
+with `initLocals body args`, regardless of whether `callees` is empty. -/
+theorem initMachineStateWithCallees_root (body : CapturedMir)
+    (args : List Value) (callees : List CapturedMir) :
+    MirRootStart
+      (Trusted.Rustc.V2026_06_01.MirSemantics.initMachineStateWithCallees
+        body args callees) ∧
+    (Trusted.Rustc.V2026_06_01.MirSemantics.initMachineStateWithCallees
+        body args callees).frame.locals = initLocals body args := by
+  cases callees with
+  | nil =>
+    have h := initMachineState_root body args
+    exact ⟨⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1⟩, h.2.2.2.2.2⟩
+  | cons _ _ =>
+    exact ⟨⟨rfl, rfl, rfl, rfl, rfl⟩, rfl⟩
+
+/-- `initMachineStateWithMemoryAndCallees body args mem callees` starts at a
+root frame with `initLocals body args` whenever `mem` has an empty call stack,
+no active callee, and no active protectors, for arbitrary `callees`. -/
+theorem initMachineStateWithMemoryAndCallees_root (body : CapturedMir)
+    (args : List Value) (mem : Memory) (callees : List CapturedMir)
+    (hCS : mem.callStack = []) (hCallee : mem.activeCallee = none)
+    (hProt : mem.activeProtectors = []) :
+    MirRootStart
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        body args mem callees) ∧
+    (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        body args mem callees).frame.locals = initLocals body args := by
+  cases callees with
+  | nil => exact ⟨⟨hCS, hCallee, hProt, rfl, rfl⟩, rfl⟩
+  | cons _ _ => exact ⟨⟨hCS, hCallee, hProt, rfl, rfl⟩, rfl⟩
+
+/-- Every return outcome observed in the interaction tree of an invariant
+state is a normal return (`MirOutcome.normal`) witnessed by `ReturnsFrom`
+(ruling out `.panic` and `.abort`). -/
+theorem reachesRet_normal_of_mirPccInv {body : CapturedMir}
+    {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)} {s0 : MachineState}
+    {tr : List (Event MirEffect)} {out : MirOutcome}
     (hPhase : mirPhaseSupported body.phase = true)
     (hAll : checkAllBlocksCert body.localDecls retInv body.basicBlocks invs
       body.basicBlocks invs = true)
     (h0 : MirPccInv body invs s0)
-    (hR : ReachesRet (mirTree body s0) tr (.normal (retVal, mem))) :
-    ReturnsFrom body s0 retVal := by
+    (hR : ReachesRet (mirTree body s0) tr out) :
+    ∃ retVal mem', out = .normal (retVal, mem') ∧ ReturnsFrom body s0 retVal := by
   have hQ : ∀ (t : ITree MirEffect MirOutcome) tr' (u : ITree MirEffect MirOutcome),
       Reaches t tr' u →
       (∃ s, MirReach body s0 s ∧ MirPccInv body invs s ∧
@@ -1092,7 +1125,7 @@ theorem returnsFrom_of_reachesRet {body : CapturedMir} {retInv : MirAbsSlot}
       subst hEq
       rw [ITree.observe_cofix] at hObs
       have hObs' : (stepMirFn body s).map (ITree.cofix (stepMirState body)) =
-          .ret (.normal (retVal, mem)) := hObs
+          .ret out := hObs
       cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
       | inl hS =>
         match hS with
@@ -1106,19 +1139,177 @@ theorem returnsFrom_of_reachesRet {body : CapturedMir} {retInv : MirAbsSlot}
         | ⟨retVal', mem', _, hRet, _, _⟩ =>
           rw [hRet] at hObs'
           injection hObs' with hOut
-          injection hOut with hPair
-          injection hPair with hV
-          subst hV
-          exact ⟨s, mem', hRs, hRet⟩
+          exact ⟨retVal', mem', hOut.symm, s, mem', hRs, hRet⟩
+
+/-- Every normal return observed in the interaction tree of an invariant
+state is a `ReturnsFrom` return of the concrete transition system. -/
+theorem returnsFrom_of_reachesRet {body : CapturedMir} {retInv : MirAbsSlot}
+    {invs : List (Option MirAbsEnv)} {s0 : MachineState}
+    {tr : List (Event MirEffect)} {retVal : Value} {mem : Memory}
+    (hPhase : mirPhaseSupported body.phase = true)
+    (hAll : checkAllBlocksCert body.localDecls retInv body.basicBlocks invs
+      body.basicBlocks invs = true)
+    (h0 : MirPccInv body invs s0)
+    (hR : ReachesRet (mirTree body s0) tr (.normal (retVal, mem))) :
+    ReturnsFrom body s0 retVal := by
+  match reachesRet_normal_of_mirPccInv hPhase hAll h0 hR with
+  | ⟨retVal', _, hEq, hRet⟩ =>
+    injection hEq with hPair
+    injection hPair with hV
+    subst hV
+    exact hRet
+
+/-- From an invariant state that satisfies fault-tolerant `wpOutcome`
+termination, `mirTree body s` stabilizes in finitely many `.tau` steps. -/
+theorem stabilizes_of_mirPccInv {body : CapturedMir} {retInv : MirAbsSlot}
+    {invs : List (Option MirAbsEnv)} {s : MachineState}
+    (hPhase : mirPhaseSupported body.phase = true)
+    (hAll : checkAllBlocksCert body.localDecls retInv body.basicBlocks invs
+      body.basicBlocks invs = true)
+    (hTerm : @Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps body)
+      (fun _ => True) (fun _ => True) s)
+    (hInv : MirPccInv body invs s) :
+    ∃ u', TauStar (mirTree body s) u' ∧ ∀ w, u'.observe ≠ .tau w := by
+  revert hInv
+  refine Anneal.ParametricCore.wpOutcome_induction (ops := mirPccWpOps body)
+    (C := fun s' => MirPccInv body invs s' →
+      ∃ u', TauStar (mirTree body s') u' ∧ ∀ w, u'.observe ≠ .tau w)
+    ?_ hTerm
+  intro s' hStepC hInv'
+  cases mirPccInv_step (retInv := retInv) hPhase hAll hInv' with
+  | inl h =>
+    match h with
+    | ⟨obs, s'', hStep, hInv''⟩ =>
+      cases obs with
+      | silent =>
+        have hC : MirPccInv body invs s'' →
+            ∃ u', TauStar (mirTree body s'') u' ∧ ∀ w, u'.observe ≠ .tau w := by
+          change (mirNodeOutcome (stepMirFn body s')).wp _ _ _ at hStepC
+          rw [hStep] at hStepC
+          exact hStepC
+        match hC hInv'' with
+        | ⟨u', hT', hNe'⟩ =>
+          have hObs : (mirTree body s').observe = .tau (mirTree body s'') := by
+            show (ITree.cofix (stepMirState body) (.running s')).observe = _
+            rw [ITree.observe_cofix]
+            change (stepMirFn body s').map (ITree.cofix (stepMirState body)) = _
+            rw [hStep]
+            rfl
+          exact ⟨u', .step hObs hT', hNe'⟩
+      | event _ =>
+        refine ⟨mirTree body s', .refl _, fun w hw => ?_⟩
+        rw [mirTree, ITree.observe_cofix] at hw
+        have hw' : (stepMirFn body s').map (ITree.cofix (stepMirState body)) =
+            .tau w := hw
+        rw [hStep] at hw'
+        nomatch hw'
+  | inr h =>
+    match h with
+    | ⟨retVal, mem', _, hRet, _, _⟩ =>
+      have hObs : (mirTree body s').observe = .ret (.normal (retVal, mem')) := by
+        show (ITree.cofix (stepMirState body) (.running s')).observe = _
+        rw [ITree.observe_cofix]
+        change (stepMirFn body s').map (ITree.cofix (stepMirState body)) = _
+        rw [hRet]
+        rfl
+      exact ⟨mirTree body s', .refl _, fun w hw => by rw [hObs] at hw; nomatch hw⟩
+
+/-- Fault-tolerant `wpOutcome` termination from an invariant state implies
+`Productive (mirTree body s0)` constructively. -/
+theorem productive_of_mirPccInv {body : CapturedMir}
+    {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)} {s0 : MachineState}
+    (hPhase : mirPhaseSupported body.phase = true)
+    (hAll : checkAllBlocksCert body.localDecls retInv body.basicBlocks invs
+      body.basicBlocks invs = true)
+    (hInv0 : MirPccInv body invs s0)
+    (hTerm0 : @Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps body)
+      (fun _ => True) (fun _ => True) s0) :
+    Productive (mirTree body s0) := by
+  have hQ : ∀ (t : ITree MirEffect MirOutcome) tr (u : ITree MirEffect MirOutcome),
+      Reaches t tr u →
+      (∃ s, MirPccInv body invs s ∧
+        @Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps body)
+          (fun _ => True) (fun _ => True) s ∧
+        t = mirTree body s) →
+      ∃ s, MirPccInv body invs s ∧
+        @Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps body)
+          (fun _ => True) (fun _ => True) s ∧
+        u = mirTree body s := by
+    intro t tr u hReach
+    induction hReach with
+    | refl => exact fun h => h
+    | tau hObs _ ih =>
+      intro h
+      apply ih
+      match h with
+      | ⟨s, hInv, hTerm, hEq⟩ =>
+        subst hEq
+        have hUnf := (Anneal.ParametricCore.wpOutcome_unfold_iff
+          (ops := mirPccWpOps body)).mp hTerm
+        rw [mirTree, ITree.observe_cofix] at hObs
+        have hObs' : (stepMirFn body s).map (ITree.cofix (stepMirState body)) =
+            .tau _ := hObs
+        cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
+        | inl hS =>
+          match hS with
+          | ⟨obs, s', hStep, hInv'⟩ =>
+            rw [hStep] at hObs'
+            cases obs with
+            | silent =>
+              injection hObs' with hT
+              have hTerm' : @Anneal.ParametricCore.wpOutcome _ _ _
+                  (mirPccWpOps body) (fun _ => True) (fun _ => True) s' := by
+                change (mirNodeOutcome (stepMirFn body s)).wp _ _ _ at hUnf
+                rw [hStep] at hUnf
+                exact hUnf
+              exact ⟨s', hInv', hTerm', hT.symm⟩
+            | event _ => nomatch hObs'
+        | inr hS =>
+          match hS with
+          | ⟨_, _, _, hRet, _, _⟩ => rw [hRet] at hObs'; nomatch hObs'
+    | vis hObs _ o _ ih =>
+      intro h
+      apply ih
+      match h with
+      | ⟨s, hInv, hTerm, hEq⟩ =>
+        subst hEq
+        have hUnf := (Anneal.ParametricCore.wpOutcome_unfold_iff
+          (ops := mirPccWpOps body)).mp hTerm
+        rw [mirTree, ITree.observe_cofix] at hObs
+        have hObs' : (stepMirFn body s).map (ITree.cofix (stepMirState body)) =
+            .vis _ _ := hObs
+        cases mirPccInv_step (retInv := retInv) hPhase hAll hInv with
+        | inl hS =>
+          match hS with
+          | ⟨obs, s', hStep, hInv'⟩ =>
+            rw [hStep] at hObs'
+            cases obs with
+            | silent => nomatch hObs'
+            | event _ =>
+              cases hObs'
+              have hTerm' : @Anneal.ParametricCore.wpOutcome _ _ _
+                  (mirPccWpOps body) (fun _ => True) (fun _ => True) s' := by
+                change (mirNodeOutcome (stepMirFn body s)).wp _ _ _ at hUnf
+                rw [hStep] at hUnf
+                exact hUnf
+              exact ⟨s', hInv', hTerm', rfl⟩
+        | inr hS =>
+          match hS with
+          | ⟨_, _, _, hRet, _, _⟩ => rw [hRet] at hObs'; nomatch hObs'
+  intro tr u hR
+  match hQ _ tr u hR ⟨s0, hInv0, hTerm0, rfl⟩ with
+  | ⟨s', hInv', hTerm', hEq⟩ =>
+    subst hEq
+    exact stabilizes_of_mirPccInv hPhase hAll hTerm' hInv'
 
 /-- A `checkMirCert` certificate over the abstract entry frame
 `entryEnv c.body.localDecls argSlots` yields the trusted, audited
-`VerificationResult c` for a callee-free `Claim` whose precondition implies
-the argument slots and whose postcondition follows from `retInv`. -/
+`VerificationResult c` for any `Claim` (with arbitrary `c.callees`) whose
+precondition implies the argument slots and whose postcondition follows from
+`retInv`. -/
 theorem checkMirCert_verificationResult
     {c : Trusted.VerificationResult.Claim} {argSlots : List MirAbsSlot}
     {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)}
-    (hCallees : c.callees = [])
     (hChk : checkMirCert c.body (entryEnv c.body.localDecls argSlots) retInv
       invs = true)
     (hPre : ∀ args, c.pre args →
@@ -1134,35 +1325,27 @@ theorem checkMirCert_verificationResult
   refine ⟨?_⟩
   intro args hDef
   have hArgs := hPre args hDef
-  have hSound := checkMirCert_sound_call hChk hArgs
-  have hTree : Trusted.VerificationResult.mirCallTreeWithCallees c.body args
-      c.callees = mirCallTree c.body args := by
-    rw [hCallees]
-    rfl
-  refine ⟨?_, ?_⟩
-  · show TreeSafe (Trusted.VerificationResult.mirCallTreeWithCallees c.body args
-      c.callees)
-    rw [hTree]
-    exact hSound.2.2.1
-  · intro outPair hOut _ retVal mem' hEq
-    have hRR : ReachesRet (mirCallTree c.body args) outPair.1
-        (.normal (retVal, mem')) := by
-      have h := hOut
-      simp only [Trusted.VerificationResult.MirExecPartialWithCallees,
-        ITree.toPartial] at h
-      rw [hTree, hEq] at h
-      exact h
-    have hRoot := initMachineState_root c.body args
-    have hStart : MirRootStart (initMachineState c.body args) :=
-      ⟨hRoot.1, hRoot.2.1, hRoot.2.2.1, hRoot.2.2.2.1, hRoot.2.2.2.2.1⟩
-    have hEntry : mirAbsEnvDenote c.body.localDecls
-        (entryEnv c.body.localDecls argSlots)
-        (initMachineState c.body args).frame.locals := by
-      rw [hRoot.2.2.2.2.2]
-      exact entryEnv_sound hArgs
-    have hRet := returnsFrom_of_reachesRet (retInv := retInv) hPhase hAll
-      (mirPccInv_start hChk hStart hEntry) hRR
-    exact hPost args retVal hDef (hSound.2.1 retVal hRet)
+  have hRoot := initMachineStateWithCallees_root c.body args c.callees
+  have hEntry : mirAbsEnvDenote c.body.localDecls
+      (entryEnv c.body.localDecls argSlots)
+      (Trusted.Rustc.V2026_06_01.MirSemantics.initMachineStateWithCallees
+        c.body args c.callees).frame.locals := by
+    rw [hRoot.2]
+    exact entryEnv_sound hArgs
+  have hSound := checkMirCert_sound hChk hRoot.1 hEntry
+  refine ⟨hSound.2.2.1, ?_⟩
+  intro outPair hOut _ retVal mem' hEq
+  have hRR : ReachesRet
+      (Trusted.VerificationResult.mirCallTreeWithCallees c.body args c.callees)
+      outPair.1 (.normal (retVal, mem')) := by
+    have h := hOut
+    simp only [Trusted.VerificationResult.MirExecPartialWithCallees,
+      ITree.toPartial] at h
+    rw [hEq] at h
+    exact h
+  have hRet := returnsFrom_of_reachesRet (retInv := retInv) hPhase hAll
+    (mirPccInv_start hChk hRoot.1 hEntry) hRR
+  exact hPost args retVal hDef (hSound.2.1 retVal hRet)
 
 /-- `checkMirCert_verificationResult` for a `verifyMirCutpoints`
 certificate. -/
@@ -1170,7 +1353,6 @@ theorem verifyMirCutpoints_verificationResult
     {c : Trusted.VerificationResult.Claim} {argSlots : List MirAbsSlot}
     {retInv : MirAbsSlot} {cutpoints : List (Nat × MirAbsEnv)}
     {rpoOrder : List Nat}
-    (hCallees : c.callees = [])
     (hVer : verifyMirCutpoints c.body (entryEnv c.body.localDecls argSlots)
       retInv cutpoints rpoOrder = true)
     (hPre : ∀ args, c.pre args →
@@ -1180,7 +1362,73 @@ theorem verifyMirCutpoints_verificationResult
         retInv.valDenote d.ty retVal) →
       c.post args retVal) :
     Trusted.VerificationResult.VerificationResult c :=
-  checkMirCert_verificationResult hCallees (bool_and_true_right hVer) hPre
-    hPost
+  checkMirCert_verificationResult (bool_and_true_right hVer) hPre hPost
+
+/-- A `checkMirCert` certificate yields a trusted `StatefulVerificationResult`
+for any `StatefulClaim` (with arbitrary `c.callees`) whose precondition
+establishes a root-entry `Memory` (`callStack = []`, `activeCallee = none`,
+`activeProtectors = []`) and the argument slots `argSlots`. -/
+theorem checkMirCert_statefulVerificationResult
+    {c : Trusted.VerificationResult.StatefulClaim} {argSlots : List MirAbsSlot}
+    {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)}
+    (hChk : checkMirCert c.body (entryEnv c.body.localDecls argSlots) retInv
+      invs = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧
+      entryArgsOk (c.body.localDecls.drop 1) argSlots args)
+    (hPost : ∀ args mem retVal mem', c.pre args mem →
+      (∃ d, get? c.body.localDecls 0 = some d ∧
+        retInv.valDenote d.ty retVal) →
+      c.post args mem retVal mem') :
+    Trusted.VerificationResult.StatefulVerificationResult c := by
+  have hPhase := bool_and_true_left hChk
+  have hAll := bool_and_true_right (bool_and_true_right
+    (bool_and_true_right (bool_and_true_right hChk)))
+  refine ⟨?_⟩
+  intro args mem hDef
+  have hP := hPre args mem hDef
+  have hRoot := initMachineStateWithMemoryAndCallees_root c.body args mem
+    c.callees hP.1 hP.2.1 hP.2.2.1
+  have hEntry : mirAbsEnvDenote c.body.localDecls
+      (entryEnv c.body.localDecls argSlots)
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        c.body args mem c.callees).frame.locals := by
+    rw [hRoot.2]
+    exact entryEnv_sound hP.2.2.2
+  have hSound := checkMirCert_sound hChk hRoot.1 hEntry
+  refine ⟨hSound.2.2.1, ?_⟩
+  intro outPair hOut _ retVal mem' hEq
+  have hRR : ReachesRet
+      (Trusted.VerificationResult.mirStatefulTreeWithCallees c.body args mem
+        c.callees)
+      outPair.1 (.normal (retVal, mem')) := by
+    have h := hOut
+    simp only [Trusted.VerificationResult.MirStatefulExecPartialWithCallees,
+      ITree.toPartial] at h
+    rw [hEq] at h
+    exact h
+  have hRet := returnsFrom_of_reachesRet (retInv := retInv) hPhase hAll
+    (mirPccInv_start hChk hRoot.1 hEntry) hRR
+  exact hPost args mem retVal mem' hDef (hSound.2.1 retVal hRet)
+
+/-- `checkMirCert_statefulVerificationResult` for a `verifyMirCutpoints`
+certificate. -/
+theorem verifyMirCutpoints_statefulVerificationResult
+    {c : Trusted.VerificationResult.StatefulClaim} {argSlots : List MirAbsSlot}
+    {retInv : MirAbsSlot} {cutpoints : List (Nat × MirAbsEnv)}
+    {rpoOrder : List Nat}
+    (hVer : verifyMirCutpoints c.body (entryEnv c.body.localDecls argSlots)
+      retInv cutpoints rpoOrder = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧
+      entryArgsOk (c.body.localDecls.drop 1) argSlots args)
+    (hPost : ∀ args mem retVal mem', c.pre args mem →
+      (∃ d, get? c.body.localDecls 0 = some d ∧
+        retInv.valDenote d.ty retVal) →
+      c.post args mem retVal mem') :
+    Trusted.VerificationResult.StatefulVerificationResult c :=
+  checkMirCert_statefulVerificationResult (bool_and_true_right hVer) hPre hPost
 
 end Anneal.AiPcc

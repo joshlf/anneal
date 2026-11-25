@@ -550,7 +550,131 @@ theorem checkedInc_v2026Bridge_converges :
    mirStepsConverges_of_mirPccWpUntilOk checkedInc_wpStateOk,
    dwp_of_mirPccWpStateOk checkedInc_wpStateOk⟩
 
+/-- A `checkMirCert` certificate plus a fault-tolerant `wpOutcome` termination
+proof yields a trusted `TotalVerificationResult` (`TreeSafe`, `Productive`,
+`¬ MayDiverge`, and normal-only `ReachesRet` satisfying `c.post`). Placed in
+the test bridge because `Trusted.ITree.Diverges` uses `coinductive_fixpoint`
+(`Classical.choice`), keeping `theory/Anneal/AiPcc/MirPcc.lean` strictly
+`[propext, Quot.sound]`. -/
+theorem checkMirCert_totalVerificationResult
+    {c : Trusted.VerificationResult.TotalClaim} {argSlots : List MirAbsSlot}
+    {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)}
+    (hChk : checkMirCert c.body (entryEnv c.body.localDecls argSlots) retInv
+      invs = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧
+      entryArgsOk (c.body.localDecls.drop 1) argSlots args)
+    (hTerm : ∀ args mem, c.pre args mem →
+      @Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps c.body)
+        (fun _ => True) (fun _ => True)
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees))
+    (hPost : ∀ args mem retVal mem', c.pre args mem →
+      (∃ d, get? c.body.localDecls 0 = some d ∧
+        retInv.valDenote d.ty retVal) →
+      c.post args mem retVal mem') :
+    Trusted.VerificationResult.TotalVerificationResult c := by
+  have hPhase := bool_and_true_left hChk
+  have hAll := bool_and_true_right (bool_and_true_right
+    (bool_and_true_right (bool_and_true_right hChk)))
+  refine ⟨?_⟩
+  intro args mem hDef
+  have hP := hPre args mem hDef
+  have hRoot := initMachineStateWithMemoryAndCallees_root c.body args mem
+    c.callees hP.1 hP.2.1 hP.2.2.1
+  have hEntry : mirAbsEnvDenote c.body.localDecls
+      (entryEnv c.body.localDecls argSlots)
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        c.body args mem c.callees).frame.locals := by
+    rw [hRoot.2]
+    exact entryEnv_sound hP.2.2.2
+  have hInv0 := mirPccInv_start hChk hRoot.1 hEntry
+  have hSound := checkMirCert_sound hChk hRoot.1 hEntry
+  have hProd := productive_of_mirPccInv hPhase hAll hInv0 (hTerm args mem hDef)
+  have hNoDiv : ¬ Trusted.ITree.MayDiverge
+      (Trusted.VerificationResult.mirStatefulTreeWithCallees c.body args mem
+        c.callees) := by
+    intro hM
+    match hM with
+    | ⟨tr, u, hR, hD⟩ =>
+      match hProd tr u hR with
+      | ⟨u', hT, hNe⟩ =>
+        exact Anneal.ITree.Diverges.not_nonTau hD hT hNe
+  refine ⟨hSound.2.2.1, hProd, hNoDiv, ?_⟩
+  intro tr out hRR
+  match reachesRet_normal_of_mirPccInv (retInv := retInv) hPhase hAll hInv0 hRR
+    with
+  | ⟨retVal, mem', hEq, hRet⟩ =>
+    exact ⟨retVal, mem', hEq,
+      hPost args mem retVal mem' hDef (hSound.2.1 retVal hRet)⟩
+
+/-- Total-correctness claim for `checkedIncBody` on `x = 200` and default
+empty memory: UB-free, productive, non-diverging, and returning a `u8` in
+`[1, 128]`. -/
+def checkedIncTotalClaim : Trusted.VerificationResult.TotalClaim where
+  body := checkedIncBody
+  pre args mem := args = checkedIncArgs ∧ mem = {}
+  post _ _ ret _ := ∃ b, ret = .scalar ⟨b, 1⟩ ∧ 1 ≤ b ∧ b ≤ 128
+
+/-- End-to-end `TotalVerificationResult checkedIncTotalClaim` from the `rfl`
+certificate and fuel-bounded `detStops` termination proof. -/
+theorem checkedInc_totalVerificationResult :
+    Trusted.VerificationResult.TotalVerificationResult checkedIncTotalClaim :=
+  checkMirCert_totalVerificationResult (argSlots := u8ArgSlots)
+    checkedInc_cert_ok
+    (fun args mem hPre => by
+      match hPre with
+      | ⟨hArgs, hMem⟩ =>
+        subst hArgs
+        subst hMem
+        exact ⟨rfl, rfl, rfl,
+          ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound (by decide)⟩, True.intro⟩⟩)
+    (fun args mem hPre => by
+      match hPre with
+      | ⟨hArgs, hMem⟩ =>
+        subst hArgs
+        subst hMem
+        exact wpOutcome_of_detStops _ _ 32 _ checkedInc_detStops)
+    (fun _ _ retVal _ _ hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        have h2 := hDen.2
+        cases retVal with
+        | scalar sc =>
+          cases sc with
+          | mk bits sz =>
+            have hSz : sz = 1 := h2.1
+            subst hSz
+            exact ⟨bits, rfl, absVal_lbound?_sound (lo := 1) rfl h2.2,
+              absVal_ubound?_sound (hi := 128) rfl h2.2⟩
+        | _ => exact False.elim h2)
+
 /-! ## 3. Axiom Guards -/
+
+/--
+info: 'Anneal.AiPcc.productive_of_mirPccInv' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms productive_of_mirPccInv
+
+/--
+info: 'Anneal.AiPcc.checkMirCert_statefulVerificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirCert_statefulVerificationResult
+
+/--
+info: 'Anneal.AiPcc.canary_bitmask_div_cast_statefulVerificationResult'
+depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_bitmask_div_cast_statefulVerificationResult
 
 /--
 info: 'Anneal.AiPcc.checkMirCert_sound_call' depends on axioms:
