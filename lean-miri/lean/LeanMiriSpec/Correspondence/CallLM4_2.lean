@@ -1874,6 +1874,29 @@ theorem IsIntegralTy.intrinsicIntSignedness?_eq {ty : Ty} {kind : Miri.MIR.Integ
   · rw [hk]; cases it <;> rfl
   · rw [hk]; cases ut <;> rfl
 
+/-- A well-typed scalar call argument (a constant or a copied bare local) is not a move of a
+place that starts with `ProjectionElem.opaqueCast`, so Stage-1 `TerminatorKind.call` evaluates
+it with erased declarations (`evalOperandsWithBodyCast_eq_evalOperands`,
+`DIV-TR-OPAQUECAST-ROOT-DISPATCH`). -/
+theorem operandsHaveLeadingOpaqueCastMove_one_of_wellTyped
+    {body : CapturedMir}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {op₁ : MirAst.Operand} {ty₁ : Ty}
+    (h₁ : WellTypedScalarOperand body tf op₁ ty₁) :
+    operandsHaveLeadingOpaqueCastMove [op₁] = false := by
+  cases h₁ <;> rfl
+
+/-- Two well-typed scalar call arguments contain no move of a place that starts with
+`ProjectionElem.opaqueCast` (see `operandsHaveLeadingOpaqueCastMove_one_of_wellTyped`). -/
+theorem operandsHaveLeadingOpaqueCastMove_two_of_wellTyped
+    {body : CapturedMir}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {op₁ op₂ : MirAst.Operand} {ty₁ ty₂ : Ty}
+    (h₁ : WellTypedScalarOperand body tf op₁ ty₁)
+    (h₂ : WellTypedScalarOperand body tf op₂ ty₂) :
+    operandsHaveLeadingOpaqueCastMove [op₁, op₂] = false := by
+  cases h₁ <;> cases h₂ <;> rfl
+
 /-- Stage-1 `evalTerminator` on a call of `AnnealIntrinsic.ofBit op` when unlinked:
 evaluates the argument and runs the Stage-1 bit intrinsic (`evalCtpop`, `evalCtlz`,
 `evalCtlzNonzero`, `evalCttz`, `evalCttzNonzero`, `evalBswap`, `evalBitreverse`). -/
@@ -1885,7 +1908,8 @@ theorem evalTerminator_stage1_bitcount_call
     (hterm : term.kind = .call (.constant c) [op₁] ⟨dstIdx, []⟩ (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef (AnnealIntrinsic.ofBit op).defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts (AnnealIntrinsic.ofBit op).defPath
-      [argKind] s.memory.traitImpls = none) :
+      [argKind] s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove [op₁] = false) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [op₁] s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -1907,6 +1931,7 @@ theorem evalTerminator_stage1_bitcount_call
   unfold evalTerminator
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
+  rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
   cases evalOperands s.frame.locals [op₁] s.memory.borrows s.memory.globals body.layouts
       s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
@@ -1927,7 +1952,8 @@ theorem evalTerminator_stage1_saturating_call
     (hterm : term.kind = .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef k.defPath [ty.kind])
     (hcallee : lookupCallee s.memory.callees body.layouts k.defPath [ty.kind]
-      s.memory.traitImpls = none) :
+      s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove [op₁, op₂] = false) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -1943,6 +1969,7 @@ theorem evalTerminator_stage1_saturating_call
   unfold evalTerminator
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
+  rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
   cases evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
       s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
@@ -1965,7 +1992,8 @@ theorem evalTerminator_stage1_exactDiv_call
     (hterm : term.kind = .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef AnnealIntrinsic.exactDiv.defPath [ty.kind])
     (hcallee : lookupCallee s.memory.callees body.layouts AnnealIntrinsic.exactDiv.defPath
-      [ty.kind] s.memory.traitImpls = none) :
+      [ty.kind] s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove [op₁, op₂] = false) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -1982,6 +2010,7 @@ theorem evalTerminator_stage1_exactDiv_call
   unfold evalTerminator
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
+  rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
   cases evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
       s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
@@ -2019,7 +2048,8 @@ theorem evalTerminator_stage1_unclassified_call_extCall
     (hterm : term.kind = .call (.constant c) argOps destination (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef defPath typeArgs)
     (hcallee : lookupCallee s.memory.callees body.layouts defPath typeArgs
-      s.memory.traitImpls = none) :
+      s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -2032,6 +2062,7 @@ theorem evalTerminator_stage1_unclassified_call_extCall
   unfold evalTerminator
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
+  rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
   cases evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
       s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
@@ -2088,7 +2119,8 @@ theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
     (hterm : bb.terminator.kind = .call (.constant c) argOps destination (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef k.defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts k.defPath [argKind]
-      s.memory.traitImpls = none) :
+      s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -2102,7 +2134,7 @@ theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
   obtain ⟨hcls, hexact⟩ := AnnealIntrinsic.stage1Unmodeled_classify hk
-  exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+  exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc
 
 /-- The 12 `AnnealIntrinsic`s that Stage-1 `evalTerminator` evaluates inline
 (`exact_div`, `arith_offset`, `ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
@@ -2140,7 +2172,8 @@ theorem stepMirFn_stage1_std_offset_alias_extCall
     (hterm : bb.terminator.kind = .call (.constant c) argOps destination (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts defPath [argKind]
-      s.memory.traitImpls = none) :
+      s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -2155,9 +2188,9 @@ theorem stepMirFn_stage1_std_offset_alias_extCall
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
   rcases halias with rfl | rfl
   · obtain ⟨⟨hcls, hexact⟩, _⟩ := stage1_std_offset_aliases_unclassified
-    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc
   · obtain ⟨_, ⟨hcls, hexact⟩⟩ := stage1_std_offset_aliases_unclassified
-    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc
 
 /-! ## 3. `rotate_left` / `rotate_right`
 
@@ -2686,7 +2719,8 @@ theorem evalTerminator_stage1_wrappingAdd_call
     (hterm : term.kind = .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef "core::intrinsics::wrapping_add" [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts "core::intrinsics::wrapping_add"
-      [argKind] s.memory.traitImpls = none) :
+      [argKind] s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove [op₁, op₂] = false) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -2700,6 +2734,7 @@ theorem evalTerminator_stage1_wrappingAdd_call
   unfold evalTerminator
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
+  rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
   cases evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
       s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>

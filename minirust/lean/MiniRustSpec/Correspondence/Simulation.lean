@@ -6787,7 +6787,10 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
       cases hb : opBits view (copyOp discr) with
       | none =>
         have hA : evalTerminator s bb.terminator (some body) = MirStepNode.fail .ub := by
-          simp [MirSemantics.evalTerminator, hk, hmove, hdeq, hAnone (hbitsEq.trans hb),
+          simp [MirSemantics.evalTerminator, hk,
+            evalOperandWithBodyCast_eq_evalOperand _ _ _ _ _ _ _ _
+              (operandIsLeadingOpaqueCastMove_of_simpleOp hsimple),
+            hmove, hdeq, hAnone (hbitsEq.trans hb),
             opWithLocals]
         rw [hA]
         obtain ⟨msg, hmsg⟩ := hMnone hb
@@ -6812,7 +6815,10 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
             MirStepNode.emitStep (.event bits)
               (jumpState s (MirSemantics.lookupSwitchTarget bits targets.branches targets.otherwise)
                 (opPost s.frame.locals discr)) := by
-          simp [MirSemantics.evalTerminator, hk, hmove, hdeq, hAok bits (hbitsEq.trans hb),
+          simp [MirSemantics.evalTerminator, hk,
+            evalOperandWithBodyCast_eq_evalOperand _ _ _ _ _ _ _ _
+              (operandIsLeadingOpaqueCastMove_of_simpleOp hsimple),
+            hmove, hdeq, hAok bits (hbitsEq.trans hb),
             opWithLocals, jumpState]
         rw [hA]
         have hM : evalTerminator (resetPick m) tb.terminator = .ok m4 := by
@@ -10541,7 +10547,10 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         | none =>
           have hA : MirSemantics.evalTerminator s bb.terminator (some curBody) =
               MirStepNode.fail .ub := by
-            simp [MirSemantics.evalTerminator, hk, hmove, hdeq, hAnone (hbitsEq.trans hb),
+            simp [MirSemantics.evalTerminator, hk,
+              evalOperandWithBodyCast_eq_evalOperand _ _ _ _ _ _ _ _
+                (operandIsLeadingOpaqueCastMove_of_simpleOp hsimple),
+              hmove, hdeq, hAnone (hbitsEq.trans hb),
               opWithLocals]
           rw [hA]
           obtain ⟨msg, hmsgR⟩ := hMnone hb
@@ -10577,7 +10586,10 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
           have hA : MirSemantics.evalTerminator s bb.terminator (some curBody) =
               MirStepNode.emitStep (.event bits)
                 (jumpState s tgt (opPost s.frame.locals discr)) := by
-            simp [MirSemantics.evalTerminator, hk, hmove, hdeq, hAok bits (hbitsEq.trans hb),
+            simp [MirSemantics.evalTerminator, hk,
+              evalOperandWithBodyCast_eq_evalOperand _ _ _ _ _ _ _ _
+                (operandIsLeadingOpaqueCastMove_of_simpleOp hsimple),
+              hmove, hdeq, hAok bits (hbitsEq.trans hb),
               opWithLocals, jumpState, tgt]
           rw [hA]
           have hM : Interp.evalTerminator (resetPick m) tb.terminator = .ok m4 := by

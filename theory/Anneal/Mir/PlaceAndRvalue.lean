@@ -1249,7 +1249,9 @@ theorem evalOperand_eq_nil_localDecls_of_noUnion
     (callerLocals : List LocalSlot)
     (localDecls : List LocalDecl)
     (hNoDeref : OperandNonDeref op)
-    (hNoUnion : operandTouchesUnion localDecls layouts op = false) :
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false)
+    (hNotCastMove : ∀ loc ty r, op ≠ .move ⟨loc, .opaqueCast ty :: r⟩ := by
+      intro _ _ _ h; nomatch h) :
     evalOperand locals op borrows globals layouts callerLocals localDecls =
       evalOperand locals op borrows globals layouts callerLocals := by
   cases op with
@@ -1269,6 +1271,7 @@ theorem evalOperand_eq_nil_localDecls_of_noUnion
     · rfl
     · cases hd with
       | deref => exact False.elim (hNoDeref tl rfl)
+      | opaqueCast ty => exact False.elim (hNotCastMove loc ty tl rfl)
       | _ =>
         dsimp only [operandTouchesUnion] at hNoUnion
         unfold evalOperand
@@ -1555,12 +1558,14 @@ theorem evalOperand_move_proj_of_noUnion
     (hNotDeref : proj ≠ .deref)
     (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false)
     (hGet : get? locals loc = .some (.init rootVal))
-    (hRead : readProjectedValue locals rootVal (proj :: rest) = .ok outVal) :
+    (hRead : readProjectedValue locals rootVal (proj :: rest) = .ok outVal)
+    (hNotCast : ∀ ty, proj ≠ .opaqueCast ty := by intro _ h; nomatch h) :
     evalOperand locals (.move ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals
         localDecls =
       .ok outVal locals := by
   cases proj with
   | deref => exact False.elim (hNotDeref rfl)
+  | opaqueCast ty => exact False.elim (hNotCast ty rfl)
   | _ =>
     unfold evalOperand
     dsimp only
@@ -1602,13 +1607,15 @@ theorem writePlaceValue_proj_of_noUnion
       validateValueForTy? layouts (placeTy localDecls layouts ⟨loc, proj :: rest⟩) val = true)
     (hGet : get? locals loc = .some (.init rootVal))
     (hWrite : writeProjectedValue locals rootVal (proj :: rest) val = .ok rootVal')
-    (hSet : set? locals loc (.init rootVal') = .some locals') :
+    (hSet : set? locals loc (.init rootVal') = .some locals')
+    (hNotCast : ∀ ty, proj ≠ .opaqueCast ty := by intro _ h; nomatch h) :
     writePlaceValue locals borrows ⟨loc, proj :: rest⟩ val localDecls layouts = .ok locals' := by
   have hWriteL :=
     (writeProjectedForLocal_of_placeTouchesUnion_false locals localDecls layouts loc rootVal
       (proj :: rest) val hNoUnion).trans hWrite
   cases proj with
   | deref => exact False.elim (hNotDeref rfl)
+  | opaqueCast ty => exact False.elim (hNotCast ty rfl)
   | _ =>
     cases localDecls with
     | nil =>
@@ -2648,6 +2655,20 @@ theorem evalValueProjRead_write_same
     | deref => cases val <;> nomatch hWrite
     | opaqueCast _ => cases val <;> nomatch hWrite
     | unwrapUnsafeBinder _ => cases val <;> nomatch hWrite
+
+/-- `evalValueProjRead` fails closed on a leading `.opaqueCast`. -/
+theorem evalValueProjRead_not_opaqueCast
+    {locals : List LocalSlot} {v out : Value} {proj : ProjectionElem} {rest : List ProjectionElem}
+    (h : evalValueProjRead locals v (proj :: rest) = .ok out) :
+    ∀ ty, proj ≠ .opaqueCast ty := by
+  intro ty hEq; subst hEq; cases v <;> nomatch h
+
+/-- `evalValueProjWrite` fails closed on a leading `.opaqueCast`. -/
+theorem evalValueProjWrite_not_opaqueCast
+    {locals : List LocalSlot} {v nw out : Value} {proj : ProjectionElem} {rest : List ProjectionElem}
+    (h : evalValueProjWrite locals v (proj :: rest) nw = .ok out) :
+    ∀ ty, proj ≠ .opaqueCast ty := by
+  intro ty hEq; subst hEq; cases v <;> nomatch h
 
 /-- **Put-Put Lens Law (`evalValueProjWrite_write_same`)**:
 For every projection path `proj`, local environment `locals`, and root value
@@ -6739,6 +6760,7 @@ theorem evalOperand_move_bare_vs_projected_correspondence
     exact evalOperand_move_proj_of_noUnion locals loc proj rest borrows globals layouts
       callerLocals localDecls rootVal outVal hNotDeref hNoUnion hGet
       (evalValueProjRead_refines_readProjectedValue (proj :: rest) locals rootVal outVal hProjRead)
+      (evalValueProjRead_not_opaqueCast hProjRead)
 
 /-- Pointwise lifting of a per-slot refinement relation `R` between Anneal
 `LocalSlotState`s and Trusted `LocalSlot`s to whole frames (equal lengths). -/
@@ -7185,6 +7207,7 @@ theorem evalStmt_setDiscriminant_correspondence
         (evalOperand_copy_proj_of_noUnion s.frame.locals loc proj rest s.memory.borrows
           s.memory.globals layouts s.memory.callerLocals localDecls rootVal
           (.aggregate oldVar fields) hNotDeref hDestOk.1 hGet hTrustedRead)
+    have hNotCast : ∀ ty, proj ≠ .opaqueCast ty := evalValueProjRead_not_opaqueCast hRead
     have hPW :=
       (writePlaceValue_eq_nil_callStack_of_nonDeref s.frame.locals s.memory.borrows
         ⟨loc, proj :: rest⟩ (.aggregate variantIdx fields) localDecls layouts
@@ -7192,9 +7215,10 @@ theorem evalStmt_setDiscriminant_correspondence
         (writePlaceValue_proj_of_noUnion s.frame.locals s.memory.borrows loc proj rest
           (.aggregate variantIdx fields) rootVal rootVal' locals' localDecls layouts hNotDeref
           hDestOk.1 (validateValueForTy?_of_not_bool_char layouts _ _ hDestOk.2)
-          hGet hTrustedWrite hSet)
+          hGet hTrustedWrite hSet hNotCast)
     cases proj with
     | deref => exact False.elim (hNotDeref rfl)
+    | opaqueCast ty => exact False.elim (hNotCast ty rfl)
     | _ =>
       dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
       rw [hOp]
@@ -7315,9 +7339,11 @@ theorem evalStmt_assign_uninit_array_proj_ub
     rcases hArrProj with ⟨_, rfl⟩ | ⟨_, _, _, rfl⟩ | ⟨_, _, _, rfl⟩ <;> intro h <;> nomatch h
   have hNoShell : uninitFieldWriteShell? localDecls layouts dstLoc proj = .none := by
     rcases hArrProj with ⟨_, rfl⟩ | ⟨_, _, _, rfl⟩ | ⟨_, _, _, rfl⟩ <;> rfl
+  have hNotCast : ∀ (castTy : Ty), proj ≠ .opaqueCast castTy := by
+    rcases hArrProj with ⟨_, rfl⟩ | ⟨_, _, _, rfl⟩ | ⟨_, _, _, rfl⟩ <;> intro _ h <;> nomatch h
   exact evalStmt_assign_uninit_non_aggregate_ub
     s dstLoc proj rest rv span localDecls layouts val locals₁ mem₁
-    hNotDeref hRv hUninit hNoShell
+    hNotDeref hRv hUninit hNoShell hNotCast
 
 /-- **`D13b` Trusted Divergence on In-Place Enum Payload Writes (`evalStmt_assign_uninit_downcast_proj_ub`)**:
 `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt` materializes a default shell
@@ -7847,6 +7873,45 @@ def evalOperandState
       | .some val => (.ok val, slots)
       | .none => (.unsupported, slots)
 
+/-- `readPlaceState` fails closed on a leading `.opaqueCast`. -/
+theorem readPlaceState_not_opaqueCast
+    {slots : List LocalSlotState} {loc : Local} {proj : ProjectionElem}
+    {rest : List ProjectionElem} {out : Value}
+    (h : readPlaceState slots ⟨loc, proj :: rest⟩ = .ok out) :
+    ∀ ty, proj ≠ .opaqueCast ty := by
+  intro ty hEq
+  subst hEq
+  unfold readPlaceState at h
+  cases hD : Trusted.Rustc.V2026_06_01.MirSemantics.projectionHasDeref (.opaqueCast ty :: rest) with
+  | true => rw [hD] at h; nomatch h
+  | false =>
+    rw [hD] at h
+    dsimp only at h
+    cases hGet : get? slots loc with
+    | none => rw [hGet] at h; nomatch h
+    | some slot =>
+      rw [hGet] at h
+      cases slot with
+      | dead => nomatch h
+      | uninit => nomatch h
+      | init v => exact evalValueProjRead_not_opaqueCast h ty rfl
+      | partialShell shell => nomatch h
+
+/-- A successful `evalOperandState` never evaluates `.move` on a leading `.opaqueCast`. -/
+theorem evalOperandState_ok_not_opaqueCastMove
+    {slots slots' : List LocalSlotState} {op : Operand}
+    {layouts : LayoutTable} {globals : List CapturedAllocation} {val : Value}
+    (hEval : evalOperandState slots op layouts globals = (.ok val, slots')) :
+    ∀ loc ty r, op ≠ .move ⟨loc, .opaqueCast ty :: r⟩ := by
+  intro loc ty r hEq
+  subst hEq
+  unfold evalOperandState movePlaceState at hEval
+  dsimp only at hEval
+  cases hR : readPlaceState slots ⟨loc, .opaqueCast ty :: r⟩ with
+  | ub => rw [hR] at hEval; nomatch hEval
+  | unsupported => rw [hR] at hEval; nomatch hEval
+  | ok out => exact readPlaceState_not_opaqueCast hR ty rfl
+
 /-- Legacy root-only evaluator for `StatementKind.placeMention` over promoted
 `slots : List LocalSlotState` (retained for `PromotedSlotRefines` compatibility;
 **superseded** for full Episode 1 `rvalue.rs:6439-6513` fidelity — including
@@ -8001,7 +8066,7 @@ theorem evalOperandState_trusted_correspondence
         locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine PromotedSlotRefines slots' locals' := by
   rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
-    localDecls hNoDeref hNoUnion]
+    localDecls hNoDeref hNoUnion (evalOperandState_ok_not_opaqueCastMove hEval)]
   have hLocEq : slotsToTrustedLocals slots = locals :=
     slotsToTrustedLocals_eq_of_promoted hRel
   cases op with
@@ -8156,6 +8221,7 @@ theorem evalOperandState_trusted_correspondence
               refine ⟨locals, ?_, hRel⟩
               cases p with
               | deref => exact False.elim (hNoDeref rest rfl)
+              | opaqueCast ty => exact False.elim (evalValueProjRead_not_opaqueCast hRead ty rfl)
               | _ =>
                 dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
                 rw [hGetT]
@@ -8793,7 +8859,8 @@ theorem writePlaceState_writePlaceValue_correspondence
             rootVal (proj :: rest) newVal hNoUnion).trans hProjW
         exact ⟨hW, hForLocal,
           writePlaceValue_proj_of_noUnion locals borrows loc proj rest newVal rootVal rootVal'
-            _ localDecls layouts hNotDeref hNoUnion hValid hGetT hProjW hSet,
+            _ localDecls layouts hNotDeref hNoUnion hValid hGetT hProjW hSet
+            (evalValueProjWrite_not_opaqueCast hWrite),
           hRel'⟩
 
 /-! ### `D13b` Flat Tuple-Shell Refinement Against Trusted's `.unit`-Padded Shells
@@ -10580,7 +10647,7 @@ theorem evalOperandState_flat_refines
         locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine FlatSlotStateRefines slots' locals' := by
   rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
-    localDecls hNoDeref hNoUnion]
+    localDecls hNoDeref hNoUnion (evalOperandState_ok_not_opaqueCastMove hEval)]
   cases op with
   | constant constOp =>
     unfold evalOperandState at hEval
@@ -10693,6 +10760,7 @@ theorem evalOperandState_flat_refines
         refine ⟨locals, ?_, hRel⟩
         cases p with
         | deref => exact False.elim (hNoDeref rest rfl)
+        | opaqueCast ty => exact False.elim (readPlaceState_not_opaqueCast hRead ty rfl)
         | _ =>
           dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
           rw [hGetT]
@@ -12688,7 +12756,7 @@ theorem evalOperandState_nested_refines
         locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine NestedSlotStateRefines slots' locals' := by
   rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
-    localDecls hNoDeref hNoUnion]
+    localDecls hNoDeref hNoUnion (evalOperandState_ok_not_opaqueCastMove hEval)]
   cases op with
   | constant constOp =>
     unfold evalOperandState at hEval
@@ -12801,6 +12869,7 @@ theorem evalOperandState_nested_refines
         refine ⟨locals, ?_, hRel⟩
         cases p with
         | deref => exact False.elim (hNoDeref rest rfl)
+        | opaqueCast ty => exact False.elim (readPlaceState_not_opaqueCast hRead ty rfl)
         | _ =>
           dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
           rw [hGetT]
@@ -13665,7 +13734,7 @@ theorem evalStmt_assign_init_root_nested_refines
       ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc rootVal
         (proj :: rest) val hNoUnion).trans
         (evalValueProjWrite_refines_writeProjectedValue (proj :: rest) locals₁ rootVal val w' hE))
-      hSetT hNoConflict,
+      hSetT hNoConflict (evalValueProjWrite_not_opaqueCast hE),
     SlotsRefine.set (a := .init w') (t := .init w') rfl loc hRel⟩
 
 /-- **Statement-Level 2-Level Nested Tuple `Assign` Refinement (`evalStmt_assign_two_level_field_nested_refines`)**:

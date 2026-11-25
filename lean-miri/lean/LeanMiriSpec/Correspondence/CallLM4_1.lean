@@ -973,7 +973,7 @@ theorem unwindFromCallStack_running_releaseCallProtectors
       s'.memory.activeProtectors = releaseCallProtectors k callStack mem.activeProtectors ∧
       s'.memory.callStack = callStack.drop k := by
   induction callStack generalizing mem with
-  | nil => simp [unwindFromCallStack] at h
+  | nil => cases hceil : mem.rootUnwindCeiling <;> simp [unwindFromCallStack, hceil] at h
   | cons cf rest ih =>
     cases hru : cf.returnUnwind with
     | unreachable => simp [unwindFromCallStack, hru] at h

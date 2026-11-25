@@ -29,25 +29,27 @@ simulation theorems, and in explicitly labeled contrast conjuncts.
   undefined behavior): `assume`, the bit / saturating / `exact_div` /
   `arith_offset` calls, single-element / OOB / overflow `write_bytes`, and the
   `copy_nonoverlapping` zero-count, overlap, out-of-bounds same-local, overflow,
-  distinct-local single-element, and distinct-local full-byte multi-element
-  (`count * size_of::<u8>() = 8` via `copyViaBytes`) witnesses.
-* Stage-1 boundary witnesses (`*_boundary`): Stage-1 hands `rotate_left`,
+  distinct-local single-element, distinct-local out-of-bounds (`count = 2` on
+  `bool` and `u64` via `copyAccessFitsAlloc?`), and distinct-local full-byte
+  multi-element (`count * size_of::<u8>() = 8` via `copyBytesSubplace`) witnesses.
+* Stage-1 boundary witnesses (`*_boundary*`): Stage-1 hands `rotate_left`,
   `rotate_right`, and the `wrapping_offset` / `std::intrinsics::*` aliases to the
   environment (`MirStepNode.extCall`), while `lean-miri` executes them inline or
   fails closed; for `write_bytes`, Stage-1 rejects `.frozen` and misaligned
   zero-count writes as UB and fails closed on partial non-zero-offset sub-range
-  writes; conversely, on `Stage1ExtraIntrinsic` calls (`wrapping_add`) and
+  writes; on multi-byte partial scalar `copy_nonoverlapping::<u8>` (`count = 2` on
+  `u64`), Stage-1 fails closed (`MirStepNode.unsupported` via `copyBytesSubplace`);
+  conversely, on `Stage1ExtraIntrinsic` calls (`wrapping_add`) and
   pointer-valued `copy_nonoverlapping::<*mut u64>` (`TyId 80`), Stage-1 steps
   while `annealStepHooks` fails closed.
-* Stage-1 divergence witnesses (`*_divergence`, `*_stage1_steps`, `*_clobbers*`):
+* Stage-1 divergence witnesses (`*_divergence`, `*_single_clobber*`):
   concrete programs on which Stage-1 `Trusted` and canonical `lean-miri` disagree —
-  Stage-1 accepts zero-count misaligned and out-of-bounds copies that Miri
-  rejects, rejects same-tag disjoint copies and provenance-free `.scalar` pointers
-  in `arith_offset` that Miri accepts, stores an ill-sized value on cross-type
-  copies, clobbers the whole destination on partial distinct-local copies (both
-  Anneal-side and 5-step lockstep against `lean-miri`), and rejects
-  uninitialized-source and Tree Borrows-forbidden copies that the vendored hooks
-  allow.
+  Stage-1 accepts zero-count misaligned copies that Miri rejects, rejects same-tag
+  disjoint copies and provenance-free `.scalar` pointers in `arith_offset` that
+  Miri accepts, stores an ill-sized value on cross-type copies, clobbers the whole
+  destination on `count = 1` cross-width copies (`evalCopySingleDirect`), and
+  rejects uninitialized-source and Tree Borrows-forbidden copies that the vendored
+  hooks allow.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -3175,9 +3177,9 @@ then `copy_nonoverlapping::<u8>` of `2` bytes (`count = 2 > 1`) from byte sub-ra
 sub-range `[2, 4)` of the same local. `lean-miri` performs the copy (rustc's
 `mem_copy` only rejects overlapping byte ranges), stepping to a state related to an
 Anneal state with `_1 = 0x0000_0000_002A_002A` (`2752554_u64`, also read back from
-`lm31AllocId1`), whereas Stage-1 `evalCopyNonOverlappingPermOk` treats any two
-pointers carrying the same borrow tag as overlapping (`Nat.beq srcPtr.tag dstPtr.tag`,
-`Statements.lean:1513`) and reports undefined behavior: Stage-1 `Trusted` rejects a
+`lm31AllocId1`), whereas Stage-1 `copyBytesSubplace` treats any two
+pointers carrying the same borrow tag as overlapping (`Nat.beq srcEp.ptr.tag dstEp.ptr.tag`,
+`Statements.lean`) and reports undefined behavior: Stage-1 `Trusted` rejects a
 program that canonical Miri accepts. -/
 theorem wit_lm4_2_copy_nonoverlapping_disjoint_subrange_divergence :
     ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
@@ -4007,15 +4009,15 @@ theorem wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok :
       get? s'.frame.locals 2 = some (.init (.scalar ⟨0x04030201, 4⟩)) :=
   ⟨_, rfl, rfl⟩
 
-/-- **`wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps`** (Stage-1 divergence;
-Stage-1 is more permissive than rustc / Miri): `copy_nonoverlapping::<bool>(src,
-dst, 2)` between the distinct 1-byte locals `_1 : bool` and `_2 : bool` accesses
-2 bytes of 1-byte allocations, which is undefined behavior (rustc's `mem_copy`
-bounds check; the pre-Stage-1 reference model also rejects it), yet Stage-1
-`evalCopyNonOverlapping` steps, copying the whole source value (`_2 := true`).
-`wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence` is the lockstep version
-against `lean-miri`. -/
-theorem wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps :
+/-- **`wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_ub`** (Stage-1 UB
+agreement via `copyAccessFitsAlloc?`): `copy_nonoverlapping::<bool>(src, dst, 2)`
+between the distinct 1-byte locals `_1 : bool` and `_2 : bool` accesses 2 bytes of
+1-byte allocations, and both Stage-1 `evalCopyNonOverlapping` (via
+`copyBytesSubplace` / `copyAccessFitsAlloc?`) and `evalCopyNonOverlappingLM4_2`
+report undefined behavior (`MirStepNode.fail .ub`).
+`wit_lm4_2_copy_nonoverlapping_distinct_oob_ub` is the lockstep version against
+`lean-miri`. -/
+theorem wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_ub :
     let decls := [declOf unitK, declOf .bool, declOf .bool,
       declOf (.rawPtr .not .bool), declOf (.rawPtr .mut .bool)]
     let st : MachineState := {
@@ -4030,15 +4032,14 @@ theorem wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps :
           [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
            { tag := 2, targetLocal := 2, targetProjection := [], perm := .active }]
         nextTag := 3 } }
-    (∃ s', evalCopyNonOverlapping st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
-        (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = .step s' ∧
-      get? s'.frame.locals 2 = some (.init (.scalar ⟨1, 1⟩))) ∧
+    evalCopyNonOverlapping st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = MirStepNode.fail .ub ∧
     evalCopyNonOverlappingLM4_2 st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
       (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = MirStepNode.fail .ub := by
   intro decls st
-  exact ⟨⟨_, rfl, rfl⟩, rfl⟩
+  exact ⟨rfl, rfl⟩
 
-/-- Locals of `wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers`:
+/-- Locals of `wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber`:
 `_1 : u64`, `_2 : u64`, `_3 : *const u8`, `_4 : *mut u8`. -/
 def partialCopyDecls : List LocalDecl :=
   [declOf unitK, declOf u64K, declOf u64K, declOf rawConstU8K, declOf rawMutU8K]
@@ -4058,20 +4059,21 @@ def partialCopyState (dst0 : Nat) : MachineState :=
          { tag := 2, targetLocal := 2, targetProjection := [], perm := .active }]
       nextTag := 3 } }
 
-/-- **`wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers`** (Stage-1
-divergence; Stage-1 computes a wrong value): `copy_nonoverlapping::<u8>(_3, _4,
-count)` from `_1 : u64 = 0x0102_0304_0506_0708` into the distinct, in-bounds
-local `_2 : u64` copies exactly the little-endian bytes `[0, count)` in Rust (and
-in the pre-Stage-1 reference model): `_2 := 0x0708` for `count = 2` from `_2 = 0`,
-and `_2 := 0xFFFF_FFFF_FFFF_FF08` for `count = 1` from `_2 = u64::MAX`. Stage-1
-`evalCopyNonOverlapping` instead stores the whole source value
-`0x0102_0304_0506_0708` into `_2` in both cases (through `copyViaBytes` for
-`count = 2` and `evalCopySingleDirect` for `count = 1`), clobbering destination
-bytes outside the copied range. -/
-theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers :
-    (∃ s', evalCopyNonOverlapping (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
-        (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
-      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+/-- **`wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber`**:
+`copy_nonoverlapping::<u8>(_3, _4, count)` from `_1 : u64 = 0x0102_0304_0506_0708`
+into the distinct, in-bounds local `_2 : u64` copies the little-endian bytes
+`[0, count)` in Rust (and in `evalCopyNonOverlappingLM4_2`: `_2 := 0x0708` for
+`count = 2` from `_2 = 0`, and `_2 := 0xFFFF_FFFF_FFFF_FF08` for `count = 1` from
+`_2 = u64::MAX`). On Stage-1 `evalCopyNonOverlapping`:
+* for `count = 2`, `copyBytesSubplace` checks `length bs == count * size_of::<u8>()`
+  (`8 == 2`) and fails closed with `MirStepNode.unsupported` (no longer clobbering
+  `_2`);
+* for `count = 1`, `evalCopySingleDirect` still stores the whole source scalar
+  `0x0102_0304_0506_0708` into `_2`. -/
+theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber :
+    evalCopyNonOverlapping (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable =
+      MirStepNode.unsupported ∧
     (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
         (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
       get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
@@ -4083,7 +4085,7 @@ theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers :
         (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
         .step s' ∧
       get? s'.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
-  ⟨⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩⟩
+  ⟨rfl, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩⟩
 
 /-- `0x0102_0304_0506_0708_u64` as a `lean-miri` scalar. -/
 def lm42ScalarSrc : Miri.Memory.ScalarInt :=
@@ -4223,19 +4225,17 @@ theorem partialCopyLockstep_stateRel (count dst0 : Nat) (mdst0 : Miri.Memory.Sca
         (fun h => nomatch h) (fun h => nomatch h)⟩)
   | _ + 6 => simp [partialCopyLockstepBody, get?] at hdecl
 
-/-- Shared 4-step setup + Step-5 simulation for `partialCopyLockstepBody count`
+/-- Shared 4-step setup + Step-5 reference simulation for `partialCopyLockstepBody count`
 (`1 ≤ count ≤ 8`):
 * Steps 1–4 (`_0 = &raw const _1; _3 = &raw mut _2; _4 = copy _0 as *const u8;
   _5 = copy _3 as *mut u8`) execute in lockstep `StateRelLM3_1` on Stage-1
   `stepMirFn` and `lean-miri`;
-* At Step 5 (`copy_nonoverlapping::<u8>(copy _4, copy _5, count_usize)`), Stage-1
-  `stepMirFn` always stores the whole source scalar `0x0102_0304_0506_0708_u64`
-  into `_2`, while `stepMirFnLM4_2` and `lean-miri` step in `StepRelLM3_1`
-  lockstep. -/
+* At Step 5 (`copy_nonoverlapping::<u8>(copy _4, copy _5, count_usize)`),
+  `stepMirFnLM4_2` and `lean-miri` step in `StepRelLM3_1` lockstep. -/
 theorem partialCopyLockstep_steps4_and_sim
     (count dst0 : Nat) (mdst0 : Miri.Memory.ScalarInt)
     (hdst0 : ScalarRel ⟨dst0, 8⟩ mdst0)
-    (hpos : 0 < count) (hle8 : count ≤ 8) :
+    (_hpos : 0 < count) (_hle8 : count ≤ 8) :
     let b := partialCopyLockstepBody count
     let hooks := annealStepHooks b.localDecls b.layouts
     let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
@@ -4244,11 +4244,6 @@ theorem partialCopyLockstep_steps4_and_sim
     let ptr2 := Value.ptr { allocId := 2, offsetBytes := 0 } 8
     let s₄ := mkPtrState b 0 4
       [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩), .init (.scalar ⟨dst0, 8⟩),
-       .init ptr2, .init ptr1, .init ptr2]
-      [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
-    let s₅_stage1 := mkPtrState b 0 5
-      [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩),
-       .init (.scalar ⟨0x0102030405060708, 8⟩),
        .init ptr2, .init ptr1, .init ptr2]
       [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
     ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
@@ -4264,10 +4259,9 @@ theorem partialCopyLockstep_steps4_and_sim
       stepMirFn b s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
-      stepMirFn b s₄ = .step s₅_stage1 ∧
       StepRelLM3_1 b m₄ [e₂, e₁] (stepMirFnLM4_2 b s₄)
         (Miri.Interpreter.Step.step hooks () m₄) := by
-  intro b hooks e₁ e₂ ptr1 ptr2 s₄ s₅_stage1
+  intro b hooks e₁ e₂ ptr1 ptr2 s₄
   have hrel₀ : StateRel b (partialCopyLockstepAnnealPre b dst0)
       (partialCopyLockstepMiriPre b mdst0) :=
     partialCopyLockstep_stateRel count dst0 mdst0 hdst0
@@ -4356,13 +4350,6 @@ theorem partialCopyLockstep_steps4_and_sim
   have hcnt_lt : count < scalarModulus 8 := by
     have : scalarModulus 8 = 2 ^ 64 := by decide
     omega
-  have hs₅_stage1 : stepMirFn b s₄ = .step s₅_stage1 :=
-    stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
-      (body := b) (s := s₄) (srcIdx := 4) (dstIdx := 5) (pointeeTy := tyOf u8K)
-      (e_s := e₁) (e_d := e₂) (srcBytes := 8)
-      rfl hphase rfl rfl u8_integral.prim rfl rfl rfl rfl rfl rfl rfl rfl
-      (Or.inl ⟨_, rfl, rfl⟩) hpos rfl rfl (by nofun) (Or.inl rfl)
-      (by decide) (by nofun) rfl rfl rfl rfl rfl rfl rfl (by decide) rfl (by decide)
   have hsim₅ := step_intrinsic_copyNonOverlapping_simulation_same_allocMap (pointeeTy := tyOf u8K)
     hrel₄ hphase rfl rfl rfl rfl (fun tf₄ htf₄ => himm₄ tf₄ htf₄ 4 (by decide) (by decide))
     rfl rfl (fun tf₄ htf₄ => himm₄ tf₄ htf₄ 5 (by decide) (by decide))
@@ -4437,28 +4424,28 @@ theorem partialCopyLockstep_steps4_and_sim
         · cases h)
   exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
     hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
-    hs₅_stage1, hsim₅⟩
+    hsim₅⟩
 
-/-- **`wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep`**:
+/-- **`wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber_lockstep`**:
 real 5-step lockstep execution of `partialCopyLockstepBody count` from
 `_1 = 0x0102_0304_0506_0708_u64` and `_2 = dst0` (`_0 = &raw const _1;
 _3 = &raw mut _2; _4 = copy _0 as *const u8; _5 = copy _3 as *mut u8;
 copy_nonoverlapping::<u8>(copy _4, copy _5, count_usize)`):
-1. For `dst0 = 0, count = 2`: Stage-1 `stepMirFn` (via `copyViaBytes`) stores the
-   entire source scalar `0x0102_0304_0506_0708_u64` into `_2`, whereas
-   `lean-miri`'s `Miri.Interpreter.Step.step` steps with `.ok true` to a
-   `StateRelLM3_1`-related state with `_2 = 0x0708_u64`.
+1. For `dst0 = 0, count = 2`: Stage-1 `stepMirFn` (via `copyBytesSubplace`) fails
+   closed with `MirStepNode.unsupported`, whereas `lean-miri`'s
+   `Miri.Interpreter.Step.step` steps with `.ok true` to a `StateRelLM3_1`-related
+   state with `_2 = 0x0708_u64`.
 2. For `dst0 = 0xFFFF_FFFF_FFFF_FFFF, count = 1`: Stage-1 `stepMirFn` (via
    `evalCopySingleDirect`) stores the entire source scalar
    `0x0102_0304_0506_0708_u64` into `_2`, whereas `lean-miri`'s
    `Miri.Interpreter.Step.step` steps with `.ok true` to a `StateRelLM3_1`-related
    state with `_2 = 0xFFFF_FFFF_FFFF_FF08_u64`. -/
-theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep :
+theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber_lockstep :
     (let b := partialCopyLockstepBody 2
      let hooks := annealStepHooks b.localDecls b.layouts
      let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
      let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
-     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+     ∃ (s₁ s₂ s₃ s₄ s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
        stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
          (m₁, .ok true) ∧
@@ -4472,8 +4459,7 @@ theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep :
        stepMirFn b s₃ = .step s₄ ∧
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
        StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
-       stepMirFn b s₄ = .step s₅_stage1 ∧
-       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       stepMirFn b s₄ = MirStepNode.unsupported ∧
        Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
        StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
        get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
@@ -4503,7 +4489,7 @@ theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep :
   refine ⟨?_, ?_⟩
   · obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
       hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
-      hs₅_stage1, hsim₅⟩ :=
+      hsim₅⟩ :=
       partialCopyLockstep_steps4_and_sim 2 0 lm42ScalarZero lm42_scalarRelZero
         (by decide) (by decide)
     let b := partialCopyLockstepBody 2
@@ -4523,12 +4509,12 @@ theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep :
     have hs₅_lm42 : stepMirFnLM4_2 b s₄ = .step s₅_miri := rfl
     rw [hs₅_lm42] at hsim₅
     obtain ⟨m₅, hm₅, hrel₅⟩ := hsim₅.miri_step_of_anneal_step
-    exact ⟨s₁, s₂, s₃, s₄, _, s₅_miri, m₁, m₂, m₃, m₄, m₅,
+    exact ⟨s₁, s₂, s₃, s₄, s₅_miri, m₁, m₂, m₃, m₄, m₅,
       hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
-      hs₅_stage1, rfl, hm₅, hrel₅, rfl⟩
+      by dsimp only [b, s₄, ptr1, ptr2, e₁, e₂]; rfl, hm₅, hrel₅, rfl⟩
   · obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
       hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
-      hs₅_stage1, hsim₅⟩ :=
+      hsim₅⟩ :=
       partialCopyLockstep_steps4_and_sim 1 0xFFFFFFFFFFFFFFFF lm42ScalarMax lm42_scalarRelMax
         (by decide) (by decide)
     let b := partialCopyLockstepBody 1
@@ -4541,15 +4527,22 @@ theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep :
        .init (.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩),
        .init ptr2, .init ptr1, .init ptr2]
       [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+    let s₅_stage1 := mkPtrState b 0 5
+      [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩),
+       .init (.scalar ⟨0x0102030405060708, 8⟩),
+       .init ptr2, .init ptr1, .init ptr2]
+      [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
     let s₅_miri := mkPtrState b 0 5
       [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩),
        .init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩),
        .init ptr2, .init ptr1, .init ptr2]
       [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+    have hs₅_stage1 : stepMirFn b s₄ = .step s₅_stage1 := by
+      dsimp only [b, s₄, s₅_stage1, ptr1, ptr2, e₁, e₂]; rfl
     have hs₅_lm42 : stepMirFnLM4_2 b s₄ = .step s₅_miri := rfl
     rw [hs₅_lm42] at hsim₅
     obtain ⟨m₅, hm₅, hrel₅⟩ := hsim₅.miri_step_of_anneal_step
-    exact ⟨s₁, s₂, s₃, s₄, _, s₅_miri, m₁, m₂, m₃, m₄, m₅,
+    exact ⟨s₁, s₂, s₃, s₄, s₅_stage1, s₅_miri, m₁, m₂, m₃, m₄, m₅,
       hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
       hs₅_stage1, rfl, hm₅, hrel₅, rfl⟩
 
@@ -4558,8 +4551,9 @@ multi-element lockstep simulation): real 5-step lockstep execution of
 `partialCopyLockstepBody 8` (`copy_nonoverlapping::<u8>(copy _4, copy _5, 8_usize)`,
 copying `count * size_of::<u8>() = 8 = size_of::<u64>()` bytes from
 `_1 = 0x0102_0304_0506_0708_u64` into `_2 = 0_u64`): Stage-1 `stepMirFn` (via
-`copyViaBytes`) and `lean-miri`'s `Miri.Interpreter.Step.step` step in
-`StateRelLM3_1` lockstep to `_2 = 0x0102_0304_0506_0708_u64`. -/
+`evalCopySubplaceMulti` / `copyBytesSubplace`) and `lean-miri`'s
+`Miri.Interpreter.Step.step` step in `StateRelLM3_1` lockstep to
+`_2 = 0x0102_0304_0506_0708_u64`. -/
 theorem wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok :
     let b := partialCopyLockstepBody 8
     let hooks := annealStepHooks b.localDecls b.layouts
@@ -4585,7 +4579,7 @@ theorem wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok :
       get? s₅.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) := by
   obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
     hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
-    hs₅_stage1, hsim₅⟩ :=
+    hsim₅⟩ :=
     partialCopyLockstep_steps4_and_sim 8 0 lm42ScalarZero lm42_scalarRelZero
       (by decide) (by decide)
   let b := partialCopyLockstepBody 8
@@ -4602,6 +4596,14 @@ theorem wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok :
      .init (.scalar ⟨0x0102030405060708, 8⟩),
      .init ptr2, .init ptr1, .init ptr2]
     [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+  have hs₅_stage1 : stepMirFn b s₄ = .step s₅ :=
+    stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
+      (body := b) (s := s₄) (srcIdx := 4) (dstIdx := 5) (pointeeTy := tyOf u8K)
+      (e_s := e₁) (e_d := e₂) (elemBytes := 1) (srcBytes := 8)
+      (borrows' := [e₂.toBorrowEntry, e₁.toBorrowEntry])
+      rfl (fun _ h => nomatch h) rfl rfl u8_integral.prim rfl rfl rfl rfl rfl rfl rfl rfl rfl
+      (Or.inl ⟨_, rfl, rfl⟩) (by decide) rfl rfl rfl (by nofun) (Or.inl rfl)
+      (by decide) (by nofun) rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl (by decide) rfl
   have hs₅_lm42 : stepMirFnLM4_2 b s₄ = .step s₅ := rfl
   rw [hs₅_lm42] at hsim₅
   obtain ⟨m₅, hm₅, hrel₅⟩ := hsim₅.miri_step_of_anneal_step
@@ -4618,15 +4620,15 @@ def copyDistinctOobBody : CapturedMir :=
      mkStmt42 (.assign (local42 4) (.rawPtr .mut (local42 2))),
      copyStmt 3 4 2]
 
-/-- **`wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence`** (Stage-1 divergence;
-Stage-1 is more permissive than `lean-miri`): real 2-step lockstep execution
+/-- **`wit_lm4_2_copy_nonoverlapping_distinct_oob_ub`** (Stage-1 UB lockstep via
+`copyAccessFitsAlloc?`): real 2-step lockstep execution
 `_3 = &raw const _1; _4 = &raw mut _2` from `_1 = 42_u64`, `_2 = 99_u64`, then
-`copy_nonoverlapping::<u64>(copy _3, copy _4, 2_usize)`, which reads and writes
-`16` bytes of the 8-byte allocations `lm31AllocId1` / `lm31AllocId2`. `lean-miri`
-reports undefined behavior (out-of-bounds `mem_copy`), whereas Stage-1 `stepMirFn`
-steps, copying the whole scalar (`_2 := 42_u64`) without any bounds check: Stage-1
-`Trusted` accepts a program that canonical Miri rejects. -/
-theorem wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence :
+`copy_nonoverlapping::<u64>(copy _3, copy _4, 2_usize)`, which attempts to read
+and write `16` bytes of the 8-byte allocations `lm31AllocId1` / `lm31AllocId2`.
+Both Stage-1 `stepMirFn` (via `copyBytesSubplace` / `copyAccessFitsAlloc?`) and
+`lean-miri` report undefined behavior (`MirStepNode.fail .ub` and
+`.error (.undefinedBehavior msg)`). -/
+theorem wit_lm4_2_copy_nonoverlapping_distinct_oob_ub :
     ∃ (s₁ s₂ : MachineState) (m₁ m₂ m₃ : AnnealStepState) (msg : String),
       let b := copyDistinctOobBody
       let hooks := annealStepHooks b.localDecls b.layouts
@@ -4638,8 +4640,7 @@ theorem wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence :
       stepMirFn b s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
-      (∃ s₃, stepMirFn b s₂ = .step s₃ ∧
-        get? s₃.frame.locals 2 = some (.init (.scalar ⟨42, 8⟩))) ∧
+      stepMirFn b s₂ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .error (.undefinedBehavior msg)) := by
   let b := copyDistinctOobBody
   have hrel₀ : StateRel b (copy6AnnealPre b true) (copy6MiriPre b true) :=
@@ -4699,9 +4700,8 @@ theorem wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence :
     intro tf₂ htf₂ k hk₁ hk₂
     obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
     exact himm₂_step tf₁ tf₂ htf₁ htf₂ k hk₂ (himm₁ tf₁ htf₁ k hk₁)
-  -- Step 3: `copy_nonoverlapping(copy _3, copy _4, 2_usize)`: `lean-miri` reports
-  -- out-of-bounds undefined behavior (derived through the reference model, which
-  -- also rejects the copy), while Stage-1 steps.
+  -- Step 3: `copy_nonoverlapping(copy _3, copy _4, 2_usize)`: both Stage-1 and
+  -- `lean-miri` report out-of-bounds undefined behavior.
   obtain ⟨_, hsim₃⟩ := step_intrinsic_copyNonOverlapping_simulation (pointeeTy := tyOf u64K)
     hrel₂ hphase rfl rfl rfl rfl (fun tf₂ htf₂ => himm₂ tf₂ htf₂ 3 (by decide) (by decide))
     rfl rfl (fun tf₂ htf₂ => himm₂ tf₂ htf₂ 4 (by decide) (by decide))
@@ -4744,7 +4744,8 @@ theorem wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence :
   have hs₃ : stepMirFnLM4_2 b s₂ = .fail .ub := rfl
   rw [hs₃] at hsim₃
   obtain ⟨m₃, msg, hm₃⟩ := hsim₃.miri_ub_of_anneal_ub
-  exact ⟨s₁, s₂, m₁, m₂, m₃, msg, hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, ⟨_, rfl, rfl⟩, hm₃⟩
+  exact ⟨s₁, s₂, m₁, m₂, m₃, msg, hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂,
+    by dsimp only [b, s₂, ptr1, ptr2, e₁, e₂]; rfl, hm₃⟩
 
 /-- Body for Stage-1 provenance-preserving raw-pointer `copy_nonoverlapping`:
 `_1 : *mut u64`, `_2 : *mut u64`, `_3 : *const *mut u64`, `_4 : *mut *mut u64`. -/
@@ -4797,8 +4798,8 @@ theorem wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok :
     rfl⟩
 
 /-- **`wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip`**: Stage-1's byte-codec
-(`encodeUntypedValueToBytes` + `decodeValueFromBytes`, used by `copyViaBytes` on
-multi-byte copies) round-trips the concrete `ProvenancePtr` `⟨9, 16⟩` at type
+(`encodeUntypedValueToBytes` + `decodeValueFromBytes`) round-trips the concrete
+`ProvenancePtr` `⟨9, 16⟩` at type
 `*mut u64` with its provenance tag intact. -/
 theorem wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip :
     let p : ProvenancePtr := { allocId := 9, offsetBytes := 16 }

@@ -1023,6 +1023,27 @@ theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : 
       | deref | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
       | opaqueCast _ | unwrapUnsafeBinder _ => rfl
 
+def evalOperandWithBodyCastFast
+    (body : CapturedMir) (locals : List LocalSlot) (op : Operand)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (callerLocals : List LocalSlot) (bodyLocalDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) : PlaceReadResult :=
+  match operandIsLeadingOpaqueCastMove op with
+  | true =>
+    evalOperandFast body locals op borrows globals callerLocals bodyLocalDecls callStack
+  | false =>
+    evalOperandFast body locals op borrows globals callerLocals .nil callStack
+
+theorem evalOperandWithBodyCastFast_eq
+    (body : CapturedMir) (locals : List LocalSlot) (op : Operand)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (callerLocals : List LocalSlot) (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandWithBodyCastFast body locals op borrows globals callerLocals bodyLocalDecls callStack =
+      evalOperandWithBodyCast locals op borrows globals body.layouts callerLocals bodyLocalDecls callStack := by
+  unfold evalOperandWithBodyCastFast evalOperandWithBodyCast
+  cases operandIsLeadingOpaqueCastMove op <;> simp only [evalOperandFast_eq]
+
 def evalOperandsFast
     (body : CapturedMir) (locals : List LocalSlot) (ops : List Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
@@ -1896,8 +1917,8 @@ def evalTerminatorSymTreeFast
       | _ => .leaf (MirStepNode.fail .ub)
     | _ :: _ => evalTerminatorFallback s term body
   | .switchInt discr targets =>
-    match evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals (callStack := s.memory.callStack) with
+    match evalOperandWithBodyCastFast body s.frame.locals discr s.memory.borrows s.memory.globals
+        s.memory.callerLocals body.localDecls s.memory.callStack with
     | .ok (.scalar sc) locals' =>
       (lookupSwitchTargetTree sc.bits targets.branches targets.otherwise).bind
         (fun target =>
@@ -1908,8 +1929,8 @@ def evalTerminatorSymTreeFast
     | .ub => .leaf (MirStepNode.fail .ub)
     | .unsupported => .leaf MirStepNode.unsupported
   | .assert cond expected target unwind =>
-    match evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals (callStack := s.memory.callStack) with
+    match evalOperandWithBodyCastFast body s.frame.locals cond s.memory.borrows s.memory.globals
+        s.memory.callerLocals body.localDecls s.memory.callStack with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
       .branch (Nat.beq sc.bits expectedBit)
@@ -1955,14 +1976,14 @@ theorem evalTerminatorSymTreeFast_eq
       evalTerminatorSymTree s { kind := .switchInt discr targets, span := span } body
     unfold evalTerminatorSymTreeFast evalTerminatorSymTree
     dsimp only
-    rw [evalOperandFast_eq]
+    rw [evalOperandWithBodyCastFast_eq]
     rfl
   | assert cond expected target unwind =>
     unfold evalTerminatorSymTreeFast evalTerminatorFallback evalTerminatorSymTree
     dsimp only
-    rw [evalOperandFast_eq]
-    cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+    rw [evalOperandWithBodyCastFast_eq]
+    cases evalOperandWithBodyCast s.frame.locals cond s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals body.localDecls s.memory.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok v _ => cases v <;> rfl
@@ -2493,15 +2514,15 @@ def evalTerminatorCfg
       | _ => .faulted
     | _ :: _ => .faulted
   | .switchInt discr targets =>
-    match evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals (callStack := s.memory.callStack) with
+    match evalOperandWithBodyCastFast body s.frame.locals discr s.memory.borrows s.memory.globals
+        s.memory.callerLocals body.localDecls s.memory.callStack with
     | .ok (.scalar sc) locals' =>
       let target := lookupSwitchTarget sc.bits targets.branches targets.otherwise
       .running ok .none { s with frame := { blockIdx := target, stmtIdx := 0, locals := locals' } }
     | _ => .faulted
   | .assert cond expected target _ =>
-    match evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals (callStack := s.memory.callStack) with
+    match evalOperandWithBodyCastFast body s.frame.locals cond s.memory.borrows s.memory.globals
+        s.memory.callerLocals body.localDecls s.memory.callStack with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
       .running (Bool.and ok (Nat.beq sc.bits expectedBit)) .none
@@ -2625,14 +2646,14 @@ theorem cfgOk_evalTerminatorCfg_false
             cases valueContainsUninit retVal <;> rfl
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg]
-    cases evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals (callStack := s.memory.callStack) with
+    cases evalOperandWithBodyCastFast body s.frame.locals discr s.memory.borrows s.memory.globals
+        s.memory.callerLocals body.localDecls s.memory.callStack with
     | ok v _ => cases v <;> rfl
     | _ => rfl
   | assert cond expected target unwind =>
     dsimp only [evalTerminatorCfg]
-    cases evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals (callStack := s.memory.callStack) with
+    cases evalOperandWithBodyCastFast body s.frame.locals cond s.memory.borrows s.memory.globals
+        s.memory.callerLocals body.localDecls s.memory.callStack with
     | ok v _ => cases v <;> rfl
     | _ => rfl
   | _ => rfl
@@ -2823,10 +2844,10 @@ theorem wpCoalBounded_evalTerminatorCfg
               rw [runCfgSteps_halted] at h_wp
               exact h_wp.2
   | switchInt discr targets =>
-    dsimp only [evalTerminatorCfg, evalTerminator]
-    rw [evalOperandFast_eq]
-    cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+    dsimp only [evalTerminatorCfg, evalTerminator, bodyLocalDeclsOf]
+    rw [evalOperandWithBodyCastFast_eq]
+    cases evalOperandWithBodyCast s.frame.locals discr s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals body.localDecls s.memory.callStack with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -2850,10 +2871,10 @@ theorem wpCoalBounded_evalTerminatorCfg
           ⟨rfl, trivial⟩ h_wp
       | _ => rintro ⟨⟩ _
   | assert cond expected target unwind =>
-    dsimp only [evalTerminatorCfg, evalTerminator]
-    rw [evalOperandFast_eq]
-    cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+    dsimp only [evalTerminatorCfg, evalTerminator, bodyLocalDeclsOf]
+    rw [evalOperandWithBodyCastFast_eq]
+    cases evalOperandWithBodyCast s.frame.locals cond s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals body.localDecls s.memory.callStack with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -3317,10 +3338,10 @@ theorem wpMirExecStepsSym_evalTerminatorCfg
               rw [runCfgSteps_halted] at h_wp
               exact h_wp.2
   | switchInt discr targets =>
-    dsimp only [evalTerminatorCfg, evalTerminator]
-    rw [evalOperandFast_eq]
-    cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+    dsimp only [evalTerminatorCfg, evalTerminator, bodyLocalDeclsOf]
+    rw [evalOperandWithBodyCastFast_eq]
+    cases evalOperandWithBodyCast s.frame.locals discr s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals body.localDecls s.memory.callStack with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -3344,10 +3365,10 @@ theorem wpMirExecStepsSym_evalTerminatorCfg
           ⟨rfl, trivial⟩ h_wp
       | _ => rintro ⟨⟩ _
   | assert cond expected target unwind =>
-    dsimp only [evalTerminatorCfg, evalTerminator]
-    rw [evalOperandFast_eq]
-    cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+    dsimp only [evalTerminatorCfg, evalTerminator, bodyLocalDeclsOf]
+    rw [evalOperandWithBodyCastFast_eq]
+    cases evalOperandWithBodyCast s.frame.locals cond s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals body.localDecls s.memory.callStack with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>

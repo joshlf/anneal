@@ -141,6 +141,9 @@ REQUIRED_MANIFEST_VARIANTS: tuple[str, ...] = (
     "StatementKind.constEvalCounter",
     "TerminatorKind.tailCall",
     "ProjectionElem.opaqueCast",
+    # Not a formerly untested variant: the element sub-place `copy_nonoverlapping` semantics
+    # (multi-element windows, fail-closed canaries) is pinned in the same audited file.
+    "NonDivergingIntrinsic.copyNonOverlapping",
 )
 MANIFEST_KEYS: tuple[str, ...] = ("trusted", "minirust", "leanmiri", "positive", "negative")
 # A manifest theorem must reference its variant: directly (name or code) or through a
@@ -149,6 +152,7 @@ VARIANT_REFERENCE_RES: dict[str, re.Pattern[str]] = {
     "StatementKind.constEvalCounter": re.compile(r"const_?eval_?counter", re.IGNORECASE),
     "TerminatorKind.tailCall": re.compile(r"tail_?call", re.IGNORECASE),
     "ProjectionElem.opaqueCast": re.compile(r"opaque_?cast", re.IGNORECASE),
+    "NonDivergingIntrinsic.copyNonOverlapping": re.compile(r"copy_?non_?overlapping", re.IGNORECASE),
 }
 SLICE_LENS_NON_VACUITY_MESSAGE = "theorems not instantiated by any witness"
 REQUIRED_AUDIT_MENTIONS: tuple[str, ...] = ("collectAxioms", "sorryAx", "Lean.ofReduceBool")
@@ -457,6 +461,16 @@ REQUIRED_SOURCE_ANCHORS: tuple[tuple[str, str], ...] = (
     (f"{_MR}/bb.rs", "| rs::StatementKind::ConstEvalCounter"),
     (f"{_MR}/bb.rs", "| rs::TerminatorKind::TailCall { .. }"),
     (f"{_MR}/rvalue.rs", "| smir::ProjectionElem::OpaqueCast(_) => {"),
+    (
+        "lean-miri/vendor/Miri/Interpreter/Intrinsics.lean",
+        "let some size := IntegerOps.computeSizeInBytes layout.layout.size count h.maxSizeOfVal",
+    ),
+    ("lean-miri/vendor/Miri/Interpreter/Intrinsics.lean", '| ub "overflow computing total size of copy"'),
+    ("lean-miri/vendor/Miri/Interpreter/Intrinsics.lean", "h.checkAlign choice source layout.layout.align.abi"),
+    ("lean-miri/vendor/Miri/Interpreter/Intrinsics.lean", "h.checkAlign choice dest layout.layout.align.abi"),
+    ("lean-miri/vendor/Miri/Interpreter/Intrinsics.lean", "h.memCopy choice source dest size nonoverlapping"),
+    ("lean-miri/vendor/Miri/Interpreter/Intrinsics.lean", "copyWith h choice source dest count true"),
+    (f"{_MR}/bb.rs", "rs::NonDivergingIntrinsic::CopyNonOverlapping(_) =>"),
 )
 
 _MANIFEST_LINE_RE = re.compile(

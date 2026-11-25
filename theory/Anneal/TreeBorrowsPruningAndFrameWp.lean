@@ -5861,8 +5861,9 @@ def pruneAssignLocalPlaceBorrows (allBorrows : List BorrowEntry)
       activeProtectors
   | proj :: rest =>
     pruneForeignWriteProj allBorrows forest dst.local_ .none
-      (resolveBorrowWriteLocalProj localDecls layouts locals dst.local_
-        (proj :: rest))
+      (resolveBorrowWriteLocalProj
+        (eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ (proj :: rest))
+        layouts locals dst.local_ (proj :: rest))
       0 0 targetFrameDepth activeProtectors
 
 /--
@@ -5882,8 +5883,9 @@ theorem assignLocalPlace_borrows_eq {locals locals' : PureEnv}
           invalidateConflictingBorrows borrows dst.local_ .none targetFrameDepth
         | proj :: rest =>
           invalidateConflictingBorrowsAtProj borrows dst.local_ .none
-            (resolveBorrowWriteLocalProj localDecls layouts locals dst.local_
-              (proj :: rest))
+            (resolveBorrowWriteLocalProj
+              (eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ (proj :: rest))
+              layouts locals dst.local_ (proj :: rest))
             0 0 targetFrameDepth) := by
   unfold assignLocalPlace at h
   cases hp : dst.projection with
@@ -5944,8 +5946,9 @@ def pruneAssignLocalPlaceBorrowsDisabled (allBorrows : List BorrowEntry)
       targetFrameDepth
   | proj :: rest =>
     pruneForeignWriteProjDisabled allBorrows forest dst.local_ .none
-      (resolveBorrowWriteLocalProj localDecls layouts locals dst.local_
-        (proj :: rest))
+      (resolveBorrowWriteLocalProj
+        (eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ (proj :: rest))
+        layouts locals dst.local_ (proj :: rest))
       0 0 targetFrameDepth
 
 /--

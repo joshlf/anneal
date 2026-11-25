@@ -7730,7 +7730,8 @@ theorem step_terminator_return_lm2_2_simulation
         traitImpls := s.memory.traitImpls, callStack := s.memory.callStack,
         activeCallee := s.memory.activeCallee, activeProtectors := s.memory.activeProtectors,
         nextProtector := s.memory.nextProtector, callerLocals := s.memory.callerLocals,
-        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds } = s.memory := by
+        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds,
+        rootUnwindCeiling := s.memory.rootUnwindCeiling } = s.memory := by
     cases hm : s.memory; rw [hm] at hbor; dsimp at hbor; subst hbor; rfl
   unfold evalTerminator translateTerminator
     Miri.Interpreter.ControlFlow.evalTerminator
@@ -7868,7 +7869,8 @@ theorem step_terminator_return_struct_lm2_2_simulation
         traitImpls := s.memory.traitImpls, callStack := s.memory.callStack,
         activeCallee := s.memory.activeCallee, activeProtectors := s.memory.activeProtectors,
         nextProtector := s.memory.nextProtector, callerLocals := s.memory.callerLocals,
-        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds } = s.memory := by
+        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds,
+        rootUnwindCeiling := s.memory.rootUnwindCeiling } = s.memory := by
     cases hm : s.memory; rw [hm] at hbor; dsimp at hbor; subst hbor; rfl
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by

@@ -706,7 +706,7 @@ theorem fc_evalByteCast_eq
                 (resolveTyWithLocalDecls decls layouts dstTy) bs with
             | .some v' => .ok v' locals' mem
             | .none => .ub := by
-  unfold evalByteCast
+  unfold evalByteCast resolveByteCastSrcTyAndSize
   rw [h_op]
   dsimp only
   rw [h_dst_sz]
@@ -771,7 +771,7 @@ theorem fc_evalRvalue_transmute_ub
         mem.callStack = .ub) :
     evalRvalue locals (.cast .transmute op dstTy) mem decls layouts = .ub := by
   show evalByteCast locals op dstTy mem decls layouts = _
-  unfold evalByteCast
+  unfold evalByteCast resolveByteCastSrcTyAndSize
   rw [hOp]
 
 /-! ### 5.1 Types of `fcLayouts`: resolution and sizes -/
@@ -5719,25 +5719,25 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fcLeRound_eq8' depends on axioms:
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fcLeRound_eq8
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_bits_round_trip_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_bits_round_trip_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_bits_round_trip_raw
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_i32_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_i32_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_i32_raw
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_int_as_f64_bits_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_int_as_f64_bits_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_int_as_f64_bits_raw
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_widen_bits_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_widen_bits_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_widen_bits_raw
@@ -6001,7 +6001,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_wrapScalarBits_of_lt' does not
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_wrapScalarBits_of_lt
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast_raw
@@ -6043,7 +6043,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast64_argsOk' depends 
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast64_argsOk
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast64_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast64_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast64_raw
@@ -6067,13 +6067,13 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_widen_bits_machine' de
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_widen_bits_machine
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_f64_from_bits_as_i64_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_f64_from_bits_as_i64_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_f64_from_bits_as_i64_raw
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_narrow_bits_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_narrow_bits_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_narrow_bits_raw
@@ -6187,13 +6187,13 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_all_five_bm_and_tb' de
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_all_five_bm_and_tb
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_u32_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_u32_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_u32_raw
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_u64_as_f64_bits_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_u64_as_f64_bits_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_u64_as_f64_bits_raw
@@ -6253,7 +6253,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_goodSize_1' depends on axioms:
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_goodSize_1
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_u8_raw' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_u8_raw' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_u8_raw

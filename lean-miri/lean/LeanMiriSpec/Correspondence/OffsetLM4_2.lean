@@ -1091,7 +1091,8 @@ theorem evalTerminator_stage1_arithOffset_call
     (hc : c.ty.kind = .fnDef "core::intrinsics::arith_offset" [pointeeKind])
     (hcallee : lookupCallee s.memory.callees body.layouts "core::intrinsics::arith_offset"
       [pointeeKind] s.memory.traitImpls = none)
-    (helem : rigidTyKindByteSize pointeeKind = some elemBytes) :
+    (helem : rigidTyKindByteSize pointeeKind = some elemBytes)
+    (hnc : operandsHaveLeadingOpaqueCastMove [ptrOp, countOp] = false) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [ptrOp, countOp] s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals [] s.memory.callStack with
@@ -1111,6 +1112,7 @@ theorem evalTerminator_stage1_arithOffset_call
   unfold evalTerminator
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
+  rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
   cases evalOperands s.frame.locals [ptrOp, countOp] s.memory.borrows s.memory.globals body.layouts
       s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
@@ -1175,7 +1177,9 @@ theorem call_intrinsic_arithOffset_stage1_simulation
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-  rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal, hstack,
+  rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal
+      (show operandsHaveLeadingOpaqueCastMove [.copy ⟨ptrIdx, []⟩, countOp] = false by
+        cases (hcountOp tf hframes) <;> rfl), hstack,
     miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none,
     translateTerminator_intrinsic_call (k := .arithOffset) hterm hc]
   simp only [List.map_cons, List.map_nil]
@@ -1446,7 +1450,9 @@ theorem call_intrinsic_arithOffset_stage1_scalar_ptr_divergence
   have hstage1_ub : stepMirFn body s = MirStepNode.fail .ub := by
     rw [stepMirFn_eq_of_not_other body s hcal hphase]
     simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-    rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal, hstack, hevals]
+    rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal
+      (show operandsHaveLeadingOpaqueCastMove [.copy ⟨ptrIdx, []⟩, countOp] = false by
+        cases (hcountOp tf hframes) <;> rfl), hstack, hevals]
   refine ⟨hstage1_ub, ?_⟩
   rcases annealEvalOperand_rawPtr_copy_lm3_1 hstate hframes hptrDecl hptrTy (hptrImm tf hframes) with
     ⟨_, _, ha₁', _⟩ | ⟨_, ha₁', _⟩ |

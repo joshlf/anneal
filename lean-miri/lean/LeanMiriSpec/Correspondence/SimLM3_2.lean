@@ -9812,7 +9812,7 @@ theorem step_terminator_switchInt_lm3_2_simulation
   unfold evalTerminator
   rw [hterm, hm_term]
   dsimp only []
-  rw [hstack]
+  rw [hstack, (hdiscr topFrame hframes).evalOperandWithBodyCast_eq]
   rcases evalOperand_scalar_lm3_2_simulation hstate hframes (hdiscr topFrame hframes) hprim none with
     ⟨m', msg, ha_ub, hm_ub⟩ |
     ⟨sc, msc, tf', ha_ok, hm_ok, hstate', himm, _, _⟩
@@ -9915,7 +9915,7 @@ theorem step_terminator_assert_lm3_2_simulation
   unfold evalTerminator
   rw [hterm, hm_term]
   dsimp only [Miri.Interpreter.ControlFlow.evalTerminator]
-  rw [hstack]
+  rw [hstack, (hop topFrame hframes).evalOperandWithBodyCast_eq]
   rcases evalOperand_scalar_lm3_2_simulation hstate hframes (hop topFrame hframes)
       (Or.inl hbool) none with
     ⟨m', msg, ha_ub, hm_ub⟩ |
@@ -13370,23 +13370,23 @@ theorem step_terminator_switchInt_lm3_2_tree_simulation
     · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
       dsimp only [s_e, eraseBorrowParents] at ha_ub ⊢
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ub]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, ha_ub]
     · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
       dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ub
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_eq.trans ha_ub]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, hop_eq.trans ha_ub]
   · let tgtBlk := lookupSwitchTarget sc.bits targets.branches targets.otherwise
     refine Or.inr ⟨sc.bits,
       { s_e with frame := { blockIdx := tgtBlk, stmtIdx := 0, locals := s.frame.locals } }, ?_, ?_⟩
     · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
       dsimp only [s_e, eraseBorrowParents] at ha_ok ⊢
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ok]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, ha_ok]
     · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
       dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ok ⊢
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
       unfold evalTerminator; rw [hterm]; dsimp only []
-      rw [hstack_s, hop_eq.trans ha_ok, ← htree.borrows_eq]
+      rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, hop_eq.trans ha_ok, ← htree.borrows_eq]
       exact congrArg (fun mem => MirStepNode.emitStep (MirObs.event sc.bits) { frame := _, memory := mem })
         (memory_eq_of_callStack_nil hstack_s).symm
 
@@ -13428,11 +13428,11 @@ theorem step_terminator_assert_lm3_2_tree_simulation
     · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
       dsimp only [s_e, eraseBorrowParents] at ha_ub ⊢
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ub]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, ha_ub]
     · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
       dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ub
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_eq.trans ha_ub]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, hop_eq.trans ha_ub]
   · obtain ⟨sc₀, _, hsc_eq, _, _, _, hsc_bool, _⟩ := himm.of_primitive_scalar (Or.inl hbool)
     injection hsc_eq with hsc_eq'; subst hsc_eq'
     rcases hsc_bool hbool with ⟨hsc_sz1, hsc_bits⟩
@@ -13449,13 +13449,13 @@ theorem step_terminator_assert_lm3_2_tree_simulation
       · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
         dsimp only [s_e, eraseBorrowParents] at ha_ok ⊢
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ok]
+        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, ha_ok]
         cases expected <;> rfl
       · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
         dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ok ⊢
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
         unfold evalTerminator; rw [hterm]; dsimp only []
-        rw [hstack_s, hop_eq.trans ha_ok, ← htree.borrows_eq]
+        rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, hop_eq.trans ha_ok, ← htree.borrows_eq]
         cases expected <;>
           exact congrArg (fun mem => MirStepNode.step { frame := _, memory := mem })
             (memory_eq_of_callStack_nil hstack_s).symm
@@ -13463,12 +13463,12 @@ theorem step_terminator_assert_lm3_2_tree_simulation
       · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
         dsimp only [s_e, eraseBorrowParents] at ha_ok ⊢
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ok]
+        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, ha_ok]
         cases expected <;> cases b <;> first | exact absurd rfl h_eq | rfl
       · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
         dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ok
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_eq.trans ha_ok]
+        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_tf.evalOperandWithBodyCast_eq, hop_eq.trans ha_ok]
         cases expected <;> cases b <;> first | exact absurd rfl h_eq | rfl
 
 /-- State-dependent well-typedness predicate for the `LM-3.2` lockstep statement

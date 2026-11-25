@@ -596,6 +596,76 @@ structure Memory : Type where
       `IntPtrCast::expose` inserts `provenance` into `exposed`, and `IntPtrCast::int2ptr`
       predicts exposed provenance when available or `None` otherwise. -/
   exposedAllocIds : List Nat := .nil
+  /-- Root unwind ceiling (`DIV-LM-TAILCALL-NOUNWIND-UNWIND` at the modular root).
+
+      Modeled property and scope (`Runtime` MIR at `rustc` commit
+      `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, `-C panic=unwind`): whether an
+      unwind that escapes the root activation (`callStack = .nil`) may propagate
+      into the unmodeled caller of the root function. `true` (the default, and
+      the value in every initial state) keeps the modular-root convention
+      `MirReturn.panic`; `enterTailCalleeFrame` clears it when the root
+      activation is replaced, via `TerminatorKind.tailCall`, by a callee whose ABI
+      cannot unwind (`CapturedMir.fnAbi.canUnwind = false`), after which
+      `unwindFromCallStack .nil` faults with `.faulted .ub`. No transition sets
+      it back to `true`, and the external-call continuations
+      (`resumeExternalCall`, `resumeExternalDivergingCall`,
+      `resumeExternalTailCallWithAbi`) restore the pre-call value because the
+      answer memory of an external callee is not constrained on this field.
+
+      Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+      <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+      > "Calling a function with the wrong call ABI, or unwinding past a stack
+      > frame that does not allow unwinding (e.g. by calling a "C-unwind"
+      > function imported or transmuted as a "C" function or function pointer)."
+
+      Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+      `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+      <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L826-L835>
+
+      > "/// Semantically tail calls consists of two actions:
+      > /// - pop of the current stack frame
+      > /// - a call to the `func`, with the return address of the **current** caller
+      > ///   - so that a `return` inside `func` returns to the caller of the caller
+      > ///     of the function that is currently being executed
+      > ///
+      > /// Note that in difference with [`Call`] this is missing
+      > /// - `destination` (because it's always the return place)
+      > /// - `target` (because it's always taken from the current stack frame)
+      > /// - `unwind` (because it's always taken from the current stack frame)"
+
+      Reference (`compiler/rustc_const_eval/src/interpret/call.rs` at commit
+      `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+      <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/call.rs#L391-L399>
+
+      > "if !callee_fn_abi.can_unwind {
+      >     // The callee cannot unwind, so force the `Unreachable` unwind handling.
+      >     match &mut cont {
+      >         ReturnContinuation::Stop { .. } => {}
+      >         ReturnContinuation::Goto { unwind, .. } => {
+      >             *unwind = mir::UnwindAction::Unreachable;
+      >         }
+      >     }
+      > }"
+
+      Justification: a tail call re-uses the unwind action "taken from the
+      current stack frame", and the interpreter replaces that action by
+      `Unreachable` whenever the callee's ABI cannot unwind. For the root
+      activation that action belongs to the unmodeled caller, so the only
+      information the model has is whether some tail callee that replaced the
+      root activation could not unwind: in that case every calling context makes
+      an escaping unwind "unwinding past a stack frame that does not allow
+      unwinding", which the Reference lists as undefined behavior. The
+      implication is one-directional: `false` implies that an unwind escaping the
+      root is undefined behavior; `true` does not assert that the root's caller
+      tolerates unwinding.
+
+      Modeling assumptions and unsupported behavior: the root's caller frame and
+      its `UnwindAction` are not represented (modular-root convention); the quoted
+      interpreter passage is supplied compiler behavior, not a stable-documentation
+      guarantee; an external (out-of-table) tail callee narrows the ceiling only
+      through `resumeExternalTailCallWithAbi`. -/
+  rootUnwindCeiling : Bool := true
 
 /--
 Check whether `allocId` has been recorded in `exposed` via
@@ -640,6 +710,7 @@ def emptyMemory : Memory where
   callerLocals := .nil
   fnPtrs := .nil
   exposedAllocIds := .nil
+  rootUnwindCeiling := true
 
 /--
 Small-step machine configuration for `CapturedMir` execution.

@@ -109,7 +109,7 @@ agreeing whole-program facts.
    `w6_exact_div_non_multiple_ub`, `w6_ctlz_returns`,
    `w6_saturating_add_returns`, `w6_copy_nonoverlapping_disjoint_returns`,
    `w6_copy_nonoverlapping_full_bytes_returns` (from-entry multi-element
-   Stage-1 `copyViaBytes` `8`-byte `u8` copy between `u64` locals),
+   Stage-1 `copyBytesSubplace` `8`-byte `u8` copy between `u64` locals),
    `w6_copy_nonoverlapping_rawPtr_tyId80_boundary` (Stage-1 provenance-preserving
    pointer `copy_nonoverlapping` vs. `lean-miri`'s `TyId 80` `.unsupported`
    boundary), `w6_copy_nonoverlapping_disjoint_lockstep`, and

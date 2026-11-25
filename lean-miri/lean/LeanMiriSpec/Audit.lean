@@ -21268,11 +21268,13 @@ open LeanMiriSpec.Correspondence in
   step_terminator_unwindResume_callee_simulation
   returnFromCurrentFrame_unwind_root_ub
   step_terminator_unwindResume_root_panic_vs_ub_divergence
+  step_terminator_unwindResume_root_cleared_ceiling_ub_agreement
   lookupCallee_nil_eq_of_findCallee_some
   lookupCallee_nil_eq_none_of_findCallee_none
   step_terminator_call_unreachable_unchecked_ub_simulation
   WellTypedCallArgOperand
   WellTypedCallArgs
+  WellTypedCallArgs.evalOperandsWithBodyCast_any
   CalleeArgsRel
   evalCallArgOperand_simulation
   evalCallArgs_simulation
@@ -21753,6 +21755,7 @@ example
     {fnPtrs : List FnPtrEntry}
     (hstate : MultiFrameStateRel rootBody s m)
     (hstack : s.memory.callStack = .nil)
+    (hceil : s.memory.rootUnwindCeiling = true)
     (hphase : ∀ p, rootBody.phase ≠ .other p)
     {bb : BasicBlockData}
     (hbb : get? rootBody.basicBlocks s.frame.blockIdx = some bb)
@@ -21766,7 +21769,28 @@ example
       () m).2 =
       .error (.undefinedBehavior "unwinding past the topmost stack frame") :=
   step_terminator_unwindResume_root_panic_vs_ub_divergence
-    hstate hstack hphase hbb hstmt_none hstmt_len hcleanup hterm fnPtrs
+    hstate hstack hceil hphase hbb hstmt_none hstmt_len hcleanup hterm fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = .nil)
+    (hceil : s.memory.rootUnwindCeiling = false)
+    (hphase : ∀ p, rootBody.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? rootBody.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume) :
+    stepMirFn rootBody s = MirStepNode.fail .ub ∧
+    (Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs)
+      () m).2 =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") :=
+  step_terminator_unwindResume_root_cleared_ceiling_ub_agreement
+    hstate hstack hceil hphase hbb hstmt_none hstmt_len hcleanup hterm fnPtrs
 
 example (callStack : List SavedCallerFrame) (mem : Memory) (s' : MachineState)
     (h : unwindFromCallStack callStack mem = .running s') :
@@ -21919,7 +21943,8 @@ example :
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hunw : UnwindingStateRel rootBody s m)
-    (hwf : UnwindChainWf rootBody s m) :
+    (hwf : UnwindChainWf rootBody s m)
+    (hceil : s.memory.rootUnwindCeiling = true) :
     (∀ s', unwindFromCallStack s.memory.callStack s.memory = .running s' →
       ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
         s'.memory.activeProtectors =
@@ -21937,12 +21962,13 @@ example
     (unwindFromCallStack s.memory.callStack s.memory = .halted .abort →
       ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
         MiriUnwindSteps rootBody k s m (m', .error (.unsupported "unwindTerminate"))) :=
-  unwindFromCallStack_miri_multiStep_simulation hunw hwf
+  unwindFromCallStack_miri_multiStep_simulation hunw hwf hceil
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : MultiFrameStateRel rootBody s m)
     (hwf : UnwindChainWf rootBody s m)
+    (hceil : s.memory.rootUnwindCeiling = true)
     (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
     {bb : BasicBlockData}
     (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
@@ -21968,7 +21994,7 @@ example
       ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
         MiriUnwindSteps rootBody k s m (m', .error (.unsupported "unwindTerminate"))) :=
   step_terminator_unwindResume_multiFrame_simulation
-    hstate hwf hphase hbb hstmt_none hstmt_len hcleanup hterm
+    hstate hwf hceil hphase hbb hstmt_none hstmt_len hcleanup hterm
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -23326,10 +23352,9 @@ example :
       stepMirFn b s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
-      (∃ s₃, stepMirFn b s₂ = .step s₃ ∧
-        get? s₃.frame.locals 2 = some (.init (.scalar ⟨42, 8⟩))) ∧
+      stepMirFn b s₂ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .error (.undefinedBehavior msg)) :=
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_distinct_oob_ub
 
 open Trusted.Rustc.V2026_06_01.MirSemantics in
 example :
@@ -23395,18 +23420,17 @@ example :
           [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
            { tag := 2, targetLocal := 2, targetProjection := [], perm := .active }]
         nextTag := 3 } }
-    (∃ s', evalCopyNonOverlapping st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
-        (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = .step s' ∧
-      get? s'.frame.locals 2 = some (.init (.scalar ⟨1, 1⟩))) ∧
+    evalCopyNonOverlapping st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = MirStepNode.fail .ub ∧
     evalCopyNonOverlappingLM4_2 st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
       (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = MirStepNode.fail .ub :=
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_ub
 
 open WitnessLM4_2 in
 example :
-    (∃ s', evalCopyNonOverlapping (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
-        (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
-      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+    evalCopyNonOverlapping (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable =
+      MirStepNode.unsupported ∧
     (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
         (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
       get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
@@ -23418,7 +23442,7 @@ example :
         (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
         .step s' ∧
       get? s'.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber
 
 example {s : MachineState} {body : CapturedMir} {term : Terminator}
     {c : ConstOperand} {argOps : List MirAst.Operand} {destination : Place}
@@ -23429,7 +23453,8 @@ example {s : MachineState} {body : CapturedMir} {term : Terminator}
     (hterm : term.kind = .call (.constant c) argOps destination (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef defPath typeArgs)
     (hcallee : lookupCallee s.memory.callees body.layouts defPath typeArgs
-      s.memory.traitImpls = none) :
+      s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -23439,7 +23464,7 @@ example {s : MachineState} {body : CapturedMir} {term : Terminator}
           (resumeExternalCall s locals' destination targetBb unwind)
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported :=
-  evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+  evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee hnc
 
 example {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
@@ -23455,7 +23480,8 @@ example {body : CapturedMir} {s : MachineState}
     (hterm : bb.terminator.kind = .call (.constant c) argOps destination (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef k.defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts k.defPath [argKind]
-      s.memory.traitImpls = none) :
+      s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -23466,7 +23492,7 @@ example {body : CapturedMir} {s : MachineState}
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported :=
   stepMirFn_stage1_unmodeled_intrinsic_extCall hcal hphase hbb hstmt_none hstmt_len hk hterm hc
-    hcallee
+    hcallee hnc
 
 example {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
@@ -23483,7 +23509,8 @@ example {body : CapturedMir} {s : MachineState}
     (hterm : bb.terminator.kind = .call (.constant c) argOps destination (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef defPath [argKind])
     (hcallee : lookupCallee s.memory.callees body.layouts defPath [argKind]
-      s.memory.traitImpls = none) :
+      s.memory.traitImpls = none)
+    (hnc : operandsHaveLeadingOpaqueCastMove argOps = false) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals [] s.memory.callStack with
@@ -23494,7 +23521,7 @@ example {body : CapturedMir} {s : MachineState}
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported :=
   stepMirFn_stage1_std_offset_alias_extCall hcal hphase hbb hstmt_none hstmt_len halias hterm hc
-    hcallee
+    hcallee hnc
 
 example (k : Stage1ExtraIntrinsic) :
     classifyRustIntrinsic? k.defPath = some k.toRustIntrinsicKind ∧
@@ -23718,7 +23745,7 @@ example :
      let hooks := annealStepHooks b.localDecls b.layouts
      let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
      let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
-     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+     ∃ (s₁ s₂ s₃ s₄ s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
        stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
          (m₁, .ok true) ∧
@@ -23732,8 +23759,7 @@ example :
        stepMirFn b s₃ = .step s₄ ∧
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
        StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
-       stepMirFn b s₄ = .step s₅_stage1 ∧
-       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       stepMirFn b s₄ = MirStepNode.unsupported ∧
        Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
        StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
        get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
@@ -23760,7 +23786,7 @@ example :
        Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
        StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
        get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber_lockstep
 
 open WitnessLM4_2 in
 example :
@@ -23900,7 +23926,7 @@ example
     (hsc_sz : srcSc.sizeBytes = integerKindByteWidth srcKind)
     (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind)) :
     StepRelLM3_1 body m
-      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (copyStage1FullBytesNextAllocMap s.frame.locals allocMap srcIdx dstIdx countOp elemBytes)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
   step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation
@@ -23944,6 +23970,10 @@ open LeanMiriSpec.Correspondence in
   CopyTargetCompatible
   copyNextAllocMap
   copyNextAllocMap_eq_self
+  copyStage1FullBytesNextAllocMap
+  operandsHaveLeadingOpaqueCastMove_one_of_wellTyped
+  operandsHaveLeadingOpaqueCastMove_two_of_wellTyped
+  WellTypedScalarOperand.evalOperandWithBodyCast_eq
   step_intrinsic_assume_simulation
   call_intrinsic_bitcount_simulation
   call_intrinsic_rotate_simulation
@@ -24058,15 +24088,15 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_perm_range_divergence
   WitnessLM4_2.wit_lm4_2_adt_pointee_stage1_copy_offset
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_ub
   WitnessLM4_2.partialCopyDecls
   WitnessLM4_2.partialCopyState
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber
   WitnessLM4_2.partialCopyLockstepBody
   WitnessLM4_2.partialCopyLockstep_steps4_and_sim
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_boundary_and_single_clobber_lockstep
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_distinct_oob_ub
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip
   WitnessLM4_2.copyStage1RawPtrBoundaryBody
