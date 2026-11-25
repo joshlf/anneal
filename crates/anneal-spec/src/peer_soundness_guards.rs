@@ -1408,7 +1408,11 @@ enum ClauseList<'a> {
 
 fn clause_list(r: Lexer<'_>) -> Result<ClauseList<'_>, PeerScanError> {
     let mut c = r;
-    if c.next_is_kw("move")? {
+    if c.next_is_kw("move")?
+        || c.next_is_kw("forall")?
+        || c.next_is_kw("exists")?
+        || c.next_is_kw("choose")?
+    {
         c.next()?;
     }
     if c.next_is_punct("|")? || c.next_is_punct("||")? {
@@ -1819,15 +1823,48 @@ const UNCHECKED_CONSTRUCTOR_TRAITS: [&str; 12] = [
 ];
 
 /// Calls that materialize a value from raw bits, bypassing constructors.
-const RAW_MATERIALIZERS: [&str; 7] = [
+const RAW_MATERIALIZERS: [&str; 16] = [
     "transmute",
     "transmute_copy",
     "zeroed",
+    "uninitialized",
     "assume_init",
     "assume_init_read",
+    "assume_init_ref",
+    "assume_init_mut",
     "read_unaligned",
+    "read_volatile",
     "from_raw_parts",
+    "from_bytes",
+    "read_from_bytes",
+    "read_from_prefix",
+    "mut_from_bytes",
+    "ref_from_bytes",
 ];
+
+/// Returns the byte offset of the first raw-bit materialization call in `body`
+/// (including `ptr::read`).
+fn body_raw_materializer(body: Lexer<'_>) -> Result<Option<usize>, PeerScanError> {
+    let mut bc = body;
+    let mut prev2: Option<Tok<'_>> = None;
+    let mut prev1: Option<Tok<'_>> = None;
+    while let Some(n) = bc.next()? {
+        if n.is_ident() {
+            if RAW_MATERIALIZERS.contains(&n.text) {
+                return Ok(Some(n.start));
+            }
+            if n.text == "read"
+                && matches!(prev1, Some(p) if p.is_punct("::"))
+                && matches!(prev2, Some(p) if p.is_ident() && p.text == "ptr")
+            {
+                return Ok(Some(n.start));
+            }
+        }
+        prev2 = prev1;
+        prev1 = Some(n);
+    }
+    Ok(None)
+}
 
 fn classify_attribute<'a>(
     content: Lexer<'a>,
@@ -1976,7 +2013,8 @@ const SIG_CLAUSE_KEYWORDS: [&str; 7] = [
 ];
 
 /// Visits each comma-separated expression of the `requires` / `ensures`
-/// signature clauses (`ensures false, r > 0`).
+/// signature clauses (`ensures false, r > 0`), keeping balanced `|...|`
+/// quantifier/closure parameter lists intact.
 fn for_each_sig_clause<'a>(
     clauses: Lexer<'a>,
     f: &mut dyn FnMut(ClauseKind, Lexer<'a>) -> GResult<()>,
@@ -1984,6 +2022,7 @@ fn for_each_sig_clause<'a>(
     let mut c = clauses;
     let mut kind: Option<ClauseKind> = None;
     let mut seg_start = c.pos;
+    let mut prev: Option<Tok<'a>> = None;
     loop {
         let before = c.pos;
         let t = c.next()?;
@@ -2009,15 +2048,64 @@ fn for_each_sig_clause<'a>(
                 };
             }
             seg_start = c.pos;
+            prev = Some(t);
             continue;
         }
         if let Some(t) = t {
             if t.is_open() {
                 skip_group(&mut c, &t)?;
+            } else if t.is_punct("|")
+                && (before == seg_start
+                    || matches!(
+                        prev,
+                        Some(p) if p.is_kw("forall")
+                            || p.is_kw("exists")
+                            || p.is_kw("choose")
+                            || p.is_kw("move")
+                            || starts_expression(Some(p))
+                    ))
+            {
+                let mut pst = DelimStack::new();
+                loop {
+                    let Some(p) = c.next()? else {
+                        return Err(PeerScanError::new(
+                            PeerScanErrorKind::UnbalancedDelimiter,
+                            t.start,
+                        )
+                        .into());
+                    };
+                    if p.is_punct("|") && pst.depth() == 0 {
+                        break;
+                    }
+                    pst.feed(&p)?;
+                }
             }
+            prev = Some(t);
         }
     }
     Ok(())
+}
+
+/// Whether a `{ ... }` seen while scanning Verus signature clauses is part of
+/// a clause expression (`ensures if b { false } else { false } { body }`,
+/// `ensures { false };`) rather than the function body itself.
+fn brace_continues_sig_clause(after_open: Lexer<'_>, open: &Tok<'_>) -> Result<bool, PeerScanError> {
+    let mut probe = after_open;
+    skip_group(&mut probe, open)?;
+    let Some(next) = probe.peek()? else {
+        return Ok(false);
+    };
+    Ok(next.is_kw("else")
+        || next.is_punct(",")
+        || next.is_punct(";")
+        || next.is_punct("{")
+        || next.is_punct("==>")
+        || next.is_punct("<==>")
+        || next.is_punct("&&")
+        || next.is_punct("||")
+        || next.is_punct("==")
+        || next.is_punct("!=")
+        || (next.is_ident() && !next.raw && SIG_CLAUSE_KEYWORDS.contains(&next.text)))
 }
 
 fn scan_fn_signature<'a>(
@@ -2072,7 +2160,19 @@ fn scan_fn_signature<'a>(
     }
     let mut clause_start: Option<usize> = None;
     while let Some(t) = c.peek()? {
-        if t.is_punct("{") || t.is_punct(";") {
+        if t.is_punct(";") {
+            break;
+        }
+        if t.is_punct("{") {
+            if clause_start.is_some() {
+                let mut probe = c;
+                probe.next()?;
+                if brace_continues_sig_clause(probe, &t)? {
+                    c.next()?;
+                    skip_group(&mut c, &t)?;
+                    continue;
+                }
+            }
             break;
         }
         if clause_start.is_none() && t.is_ident() && !t.raw && SIG_CLAUSE_KEYWORDS.contains(&t.text)
@@ -3051,7 +3151,130 @@ pub fn check_fndef_ghost_token_coercion_source<'a>(
     check_ghost_references(src, &tables)
 }
 
+/// Standard non-minting container types whose `Container::<Tokens>::...`
+/// turbofish does not invoke a trait constructor on `Tokens`.
+const SAFE_GENERIC_CONTAINERS: [&str; 22] = [
+    "Vec",
+    "Option",
+    "Result",
+    "Box",
+    "PhantomData",
+    "MaybeUninit",
+    "ManuallyDrop",
+    "Cell",
+    "RefCell",
+    "UnsafeCell",
+    "Arc",
+    "Rc",
+    "Mutex",
+    "RwLock",
+    "Pin",
+    "NonNull",
+    "BTreeMap",
+    "HashMap",
+    "VecDeque",
+    "LinkedList",
+    "BinaryHeap",
+    "HashSet",
+];
+
+/// Pure metadata/drop intrinsics whose turbofish `size_of::<Tokens>()` never
+/// mints a value of `Tokens`.
+const SAFE_GENERIC_INTRINSICS: [&str; 7] = [
+    "size_of",
+    "align_of",
+    "needs_drop",
+    "type_name",
+    "type_id",
+    "drop",
+    "forget",
+];
+
+/// Collects names of generic functions (`fn mk<T: ...>(...) { T::new() }`)
+/// whose body invokes a ghost-token constructor method on a generic type
+/// parameter `T` (so even type-inferred `let t: Tokens = mk();` is caught).
+fn collect_generic_mint_fns<'a>(
+    src: &'a str,
+    tables: &GhostTables<'a>,
+) -> GResult<PairTable<'a, MAX_GHOST_ALIASES>> {
+    let mut out: PairTable<'a, MAX_GHOST_ALIASES> = PairTable::new();
+    let mut lx = Lexer::new(src, SourceDialect::Rust);
+    while let Some(t) = lx.next()? {
+        if t.is_punct("#") {
+            take_attribute(&mut lx)?;
+            continue;
+        }
+        if !t.is_kw("fn") {
+            continue;
+        }
+        let mut c = lx;
+        let Some(name) = c.next()? else { continue };
+        if !name.is_ident() || !c.next_is_punct("<")? {
+            continue;
+        }
+        let lt = c.next()?;
+        let at = lt.map_or(c.pos, |x| x.start);
+        let gen_start = c.pos;
+        skip_angles(&mut c, at)?;
+        let gen_end = c.pos.saturating_sub(1);
+        // Extract generic type parameter identifiers (`<T: Mint, U>`).
+        let mut tparams: PairTable<'a, 16> = PairTable::new();
+        let mut parts = TopSplit::new(lx.range(gen_start, gen_end), true);
+        while let Some(mut p) = parts.next_part()? {
+            if let Some(tok) = p.next()? {
+                if tok.is_ident() && !tok.is_kw("const") {
+                    let _ = tparams.push(tok.text, "", tok.start);
+                }
+            }
+        }
+        if tparams.len == 0 {
+            continue;
+        }
+        let Some(sig) = scan_fn_signature(lx, false)? else {
+            continue;
+        };
+        let mut bc = sig.rest;
+        let Some(open) = bc.next()? else { continue };
+        if !open.is_punct("{") {
+            continue;
+        }
+        let s = bc.pos;
+        let close = skip_group(&mut bc, &open)?;
+        let mut body = lx.range(s, close);
+        while let Some(n) = body.next()? {
+            if n.is_ident() && tparams.contains_first(n.text) {
+                let mut p = body;
+                if p.eat_punct("::")? {
+                    if let Some(m) = p.next()? {
+                        if m.is_ident() && tables.any_ctor_method(m.text) {
+                            out.push(name.text, "", name.start)?;
+                            break;
+                        }
+                    }
+                }
+            } else if n.is_punct("<") {
+                let mut p = body;
+                if let Some(ty) = p.next()? {
+                    if ty.is_ident() && tparams.contains_first(ty.text) {
+                        skip_angles(&mut p, n.start)?;
+                        if p.eat_punct("::")? {
+                            if let Some(m) = p.next()? {
+                                if m.is_ident() && tables.any_ctor_method(m.text) {
+                                    out.push(name.text, "", name.start)?;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult<()> {
+    let generic_mint_fns = collect_generic_mint_fns(src, tables)?;
     let mut lx = Lexer::new(src, SourceDialect::Rust);
     let mut st = DelimStack::new();
     let mut ctx = CtxStack::new();
@@ -3062,6 +3285,8 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
     let mut mint_sites = 0usize;
     let mut main_mints = 0usize;
     let mut main_ref: Option<usize> = None;
+    let mut saw_ctor_type_in_fn = false;
+    let mut pending_generic_call: Option<usize> = None;
     while let Some(t) = lx.next()? {
         if t.is_punct("#") {
             if take_attribute(&mut lx)?.is_some() {
@@ -3109,7 +3334,17 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
         if t.is_close() {
             st.feed(&t)?;
             let next_lbrace = t.is_punct("}") && lx.next_is_punct("{")?;
+            let had_fn = ctx.innermost_fn().is_some();
             ctx.on_close(st.depth(), next_lbrace);
+            if had_fn && ctx.innermost_fn().is_none() {
+                if saw_ctor_type_in_fn {
+                    if let Some(at) = pending_generic_call {
+                        return violation(PeerViolationReason::GenericConstructorDispatch, at);
+                    }
+                }
+                saw_ctor_type_in_fn = false;
+                pending_generic_call = None;
+            }
             if matches!(impl_scope, Some((_, d)) if st.depth() < d) {
                 impl_scope = None;
             }
@@ -3237,16 +3472,36 @@ fn check_ghost_references<'a>(src: &'a str, tables: &GhostTables<'a>) -> GResult
                 _ => {}
             }
         }
-        // A constructor type passed as a turbofish argument of a call
-        // (`mk::<Tokens>()`) lets a generic body (`T::new()`) mint it.
-        if t.is_ident() && !tables.is_ctor_type(t.text) && !t.is_kw("Self") {
+        if t.is_ident() && tables.is_ctor_type(t.text) && ctx.innermost_fn().is_some() {
+            saw_ctor_type_in_fn = true;
+        }
+        // Calling or coercing a locally defined generic constructor dispatcher
+        // (`fn mk<T: Mint>() -> T { T::new() }`) inside a function that mentions
+        // `Tokens` (e.g. type-inferred `let a: Tokens = mk();`) can mint it.
+        if t.is_ident()
+            && generic_mint_fns.contains_first(t.text)
+            && !matches!(prev, Some(p) if p.is_kw("fn"))
+            && ctx.innermost_fn().is_some()
+        {
+            pending_generic_call = pending_generic_call.or(Some(t.start));
+        }
+        // A constructor type passed as a turbofish argument of a call, fn-value
+        // coercion (`let f = mk::<Tokens>;`), or non-container helper
+        // (`Helper::<Tokens>::mk()`) lets a generic body (`T::new()`) mint it.
+        if t.is_ident()
+            && !tables.is_ctor_type(t.text)
+            && !t.is_kw("Self")
+            && !SAFE_GENERIC_INTRINSICS.contains(&t.text)
+        {
             let mut c = lx;
             if c.eat_punct("::")? && c.next_is_punct("<")? {
                 let args_start = c.pos;
                 let lt = c.next()?;
                 let at = lt.map_or(c.pos, |x| x.start);
                 skip_angles(&mut c, at)?;
-                if c.next_is_punct("(")? {
+                let is_safe_container_path =
+                    SAFE_GENERIC_CONTAINERS.contains(&t.text) && c.next_is_punct("::")?;
+                if !is_safe_container_path {
                     let mut a = lx.range(args_start, c.pos);
                     while let Some(n) = a.next()? {
                         if n.is_ident() && tables.is_ctor_type(n.text) {
@@ -3893,7 +4148,20 @@ impl<'a> PolarityAnalyzer<'a> {
                         skip_group(&mut c, &t)?;
                     }
                 }
-                self.analyze(r.range(cond_start, then_tok.start), cond_cx)?;
+                let cond_r = r.range(cond_start, then_tok.start);
+                let mut cond_scan = cond_r;
+                let cond_expr = match cond_scan.next()? {
+                    Some(n)
+                        if n.is_ident()
+                            && !ASSUMPTION_ATOMS.contains(&n.text)
+                            && self.lookup(n.text, self.aliases.len).is_none()
+                            && cond_scan.eat_punct(":")? =>
+                    {
+                        cond_r.range(cond_scan.pos, cond_r.end)
+                    }
+                    _ => cond_r,
+                };
+                self.analyze(cond_expr, cond_cx)?;
                 match else_tok {
                     Some(e) => {
                         self.analyze(r.range(then_tok.end, e.start), cx)?;
@@ -4201,10 +4469,11 @@ pub fn check_assumption_polarity_lean_source(src: &str) -> GResult<()> {
             let mut an = PolarityAnalyzer::new(SourceDialect::Lean);
             an.analyze(lx.range(col.end, sig_end), pos_cx)?;
         }
-        // Unannotated `def`/`abbrev := body` or equation-style `def ... | p => rhs`.
+        // `def`/`abbrev := body` (with or without explicit `: Prop` type) or
+        // equation-style `def ... | p => rhs`.
         if is_def_like {
             match stopped_at {
-                Some(tok) if tok.is_punct(":=") && colon.is_none() => {
+                Some(tok) if tok.is_punct(":=") => {
                     c.next()?;
                     let body_start = c.pos;
                     let mut body_end = c.end;
@@ -4220,8 +4489,11 @@ pub fn check_assumption_polarity_lean_source(src: &str) -> GResult<()> {
                             skip_group(&mut c, &n)?;
                         }
                     }
-                    let mut an = PolarityAnalyzer::new(SourceDialect::Lean);
-                    an.analyze(lx.range(body_start, body_end), pos_cx)?;
+                    let body = lx.range(body_start, body_end);
+                    if !body.next_is_kw("by")? {
+                        let mut an = PolarityAnalyzer::new(SourceDialect::Lean);
+                        an.analyze(body, pos_cx)?;
+                    }
                 }
                 Some(tok) if tok.is_punct("|") => {
                     while let Some(bar) = c.peek()? {
@@ -4439,6 +4711,33 @@ fn collect_inv_aliases<'a>(
     Ok(changed)
 }
 
+/// Whether `after_pat` (immediately after a candidate struct/tuple pattern
+/// `Pos(...)` or `Range { ... }`) is followed by a match-arm `=>`, `let` `=`,
+/// or another `| ... =>` OR-pattern branch.
+fn is_pattern_trailer(after_pat: Lexer<'_>) -> Result<bool, PeerScanError> {
+    let mut p = after_pat;
+    let Some(next) = p.next()? else {
+        return Ok(false);
+    };
+    if next.is_punct("=>") || next.is_punct("=") {
+        return Ok(true);
+    }
+    if next.is_punct("|") || next.is_kw("if") {
+        while let Some(t) = p.next()? {
+            if t.is_punct("=>") {
+                return Ok(true);
+            }
+            if t.is_punct(";") || t.is_punct(",") {
+                return Ok(false);
+            }
+            if t.is_open() {
+                skip_group(&mut p, &t)?;
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn body_constructs_raw<'a>(
     body: Lexer<'a>,
     invs: &PairTable<'a, MAX_INVARIANT_STRUCTS>,
@@ -4458,9 +4757,9 @@ fn body_constructs_raw<'a>(
         } else {
             None
         };
-        let pattern_ctx = matches!(prev, Some(p) if p.is_kw("let") || p.is_punct("|"));
+        let let_pat = matches!(prev, Some(p) if p.is_kw("let"));
         if let Some(k) = kind {
-            if !pattern_ctx {
+            if !let_pat {
                 let mut probe = c;
                 let mut had_turbofish = false;
                 if probe.eat_punct("::")? && probe.next_is_punct("<")? {
@@ -4474,9 +4773,11 @@ fn body_constructs_raw<'a>(
                 if let Some(open) = probe.next()? {
                     if open.is_punct("{") || open.is_punct("(") {
                         skip_group(&mut probe, &open)?;
-                        if !probe.next_is_punct("=>")? && !probe.next_is_punct("=")? {
+                        if !is_pattern_trailer(probe)? {
                             return Ok(Some(t.start));
                         }
+                        prev = Some(t);
+                        continue;
                     }
                 }
                 // A tuple struct's name is also a value-namespace constructor
@@ -4499,7 +4800,10 @@ fn body_constructs_raw<'a>(
                     let is_generic_type_arg = c.next_is_punct("<")?;
                     let is_pattern_eq = c.next_is_punct("=>")?;
                     if !type_ctx && !method_path && !is_generic_type_arg && !is_pattern_eq {
-                        if had_turbofish || starts_expression(prev) {
+                        if had_turbofish
+                            || starts_expression(prev)
+                            || matches!(prev, Some(p) if p.is_punct("|"))
+                        {
                             return Ok(Some(t.start));
                         }
                     }
@@ -4584,16 +4888,22 @@ pub fn check_struct_sealing_source(src: &str) -> GResult<()> {
 const MAX_TAINTED_HELPERS: usize = 32;
 
 /// Whether `body` calls or coerces a tainted helper (`raw(..)`,
-/// `Self::raw::<T>(..)`, `Self::raw`) or references a tainted `const`/`static`.
+/// `Self::raw::<T>(..)`, `Self::raw`), references a tainted `const`/`static`,
+/// or (when `names_inv` is true) calls a generic raw-materializing helper `"M"`.
 fn body_calls_tainted<'a>(
     body: Lexer<'a>,
     tainted: &PairTable<'a, MAX_TAINTED_HELPERS>,
+    names_inv: bool,
 ) -> Result<Option<usize>, PeerScanError> {
     let mut c = body;
     let mut prev: Option<Tok<'a>> = None;
     while let Some(t) = c.next()? {
         if t.is_ident() {
             if let Some(&(_, kind)) = tainted.entries().iter().find(|&&(n, _)| n == t.text) {
+                if kind == "M" && !names_inv {
+                    prev = Some(t);
+                    continue;
+                }
                 let mut probe = c;
                 if probe.eat_punct("::")? && probe.next_is_punct("<")? {
                     let lt = probe.next()?;
@@ -4731,21 +5041,13 @@ fn sealing_pass<'a>(
                     names_inv |= n.is_ident() && invs.contains_first(n.text);
                 }
             }
-            let mut materializes = None;
-            if names_inv {
-                let mut bc = body;
-                while let Some(n) = bc.next()? {
-                    if n.is_ident() && RAW_MATERIALIZERS.contains(&n.text) {
-                        materializes = Some(n.start);
-                        break;
-                    }
-                }
-            }
+            let raw_mat = body_raw_materializer(body)?;
+            let materializes = if names_inv { raw_mat } else { None };
             let hit = match body_constructs_raw(body, invs, self_kind)? {
                 Some(at) => Some(at),
                 None => match materializes {
                     Some(at) => Some(at),
-                    None => body_calls_tainted(body, tainted)?,
+                    None => body_calls_tainted(body, tainted, names_inv)?,
                 },
             };
             if let Some(at) = hit {
@@ -4753,6 +5055,8 @@ fn sealing_pass<'a>(
                     return violation(PeerViolationReason::InvariantRawPublicConstructor, at);
                 }
                 changed |= tainted.push(sig.name.text, "F", sig.name.start)?;
+            } else if !public && raw_mat.is_some() {
+                changed |= tainted.push(sig.name.text, "M", sig.name.start)?;
             }
             continue;
         }
@@ -4780,10 +5084,25 @@ fn sealing_pass<'a>(
             }
             if !gated {
                 if let Some(init_start) = eq_pos {
+                    let mut names_inv = self_kind.is_some();
+                    {
+                        let mut sc = lx.range(lx.pos, init_start);
+                        while let Some(n) = sc.next()? {
+                            names_inv |= n.is_ident() && invs.contains_first(n.text);
+                        }
+                    }
                     let init = lx.range(init_start, end);
+                    let materializes = if names_inv {
+                        body_raw_materializer(init)?
+                    } else {
+                        None
+                    };
                     let hit = match body_constructs_raw(init, invs, self_kind)? {
                         Some(at) => Some(at),
-                        None => body_calls_tainted(init, tainted)?,
+                        None => match materializes {
+                            Some(at) => Some(at),
+                            None => body_calls_tainted(init, tainted, names_inv)?,
+                        },
                     };
                     if let Some(at) = hit {
                         if public {
@@ -6396,6 +6715,149 @@ mod tests {
             })
             .map_err(|v| v.reason),
             Err(R::GenericConstructorDispatch)
+        );
+    }
+
+    // --- Pass B2 red-team regression tests ------------------------------------
+
+    #[test]
+    fn b2_verus_sig_clauses_handle_quantifier_commas_and_braced_expressions() {
+        // Multi-binder `forall|x, y|` must not split on the comma inside `|...|`.
+        assert_eq!(
+            g6a("fn f() -> (r: u8) ensures forall|x: int, y: int| assumes_hold ==> x + y >= 0, { 0 }"),
+            None
+        );
+        assert_eq!(
+            g6a("fn f() -> (r: u8) ensures forall|x: int, y: int| assumes_hold && x == y, { 0 }"),
+            Some(R::AssumptionPositive)
+        );
+        // Braced `if` / block expressions inside Verus `ensures` must not truncate at `{`.
+        assert_eq!(
+            g3("#[verifier::external_body] fn read(b: bool) -> (r: u8) ensures if b { false } else { false } { 0 }"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[verifier::external_body] fn read() -> (r: u8) ensures { false } { 0 }"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g6a("fn f(b: bool) -> (r: u8) ensures if b { assumes_hold } else { true } { 0 }"),
+            Some(R::AssumptionPositive)
+        );
+        assert_eq!(
+            g6a("fn f() -> (r: u8) ensures { assumes_hold } { 0 }"),
+            Some(R::AssumptionPositive)
+        );
+    }
+
+    #[test]
+    fn b2_g4_catches_turbofish_coercion_helper_and_type_inferred_generic_dispatch() {
+        // Coercing generic dispatcher without `(` (`let f = mk::<Tokens>;`).
+        assert_eq!(
+            g4("fn mk<T: Mint>() -> T { T::new() } fn main() { let f = mk::<Tokens>; f(); f(); }"),
+            Some(R::GenericConstructorDispatch)
+        );
+        // Associated generic helper (`Helper::<Tokens>::mk()`).
+        assert_eq!(
+            g4("struct Helper<T>(PhantomData<T>); impl<T: Mint> Helper<T> { fn mk() -> T { T::new() } } fn main() { Helper::<Tokens>::mk(); }"),
+            Some(R::GenericConstructorDispatch)
+        );
+        // Type-inferred generic dispatch without any turbofish (`let a: Tokens = mk();`).
+        assert_eq!(
+            g4("fn mk<T: Mint>() -> T { T::new() } fn main() { let a: Tokens = mk(); let b: Tokens = mk(); }"),
+            Some(R::GenericConstructorDispatch)
+        );
+        // Pure metadata intrinsics and std containers do NOT false-positive.
+        assert_eq!(
+            g4("fn main() { let _sz = core::mem::size_of::<Tokens>(); let _t = Tokens::new(); }"),
+            None
+        );
+        assert_eq!(
+            g4("fn main() { let _o = Option::<Tokens>::None; let _t = Tokens::new(); }"),
+            None
+        );
+    }
+
+    #[test]
+    fn b2_g6a_catches_typed_lean_def_bodies_and_dependent_if_conditions() {
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source(
+                "abbrev Bad : Prop := assumesHold"
+            )),
+            Some(R::AssumptionPositive)
+        );
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source(
+                "def badSpec (x : Nat) : Prop := x > 0 ∧ assumesHold"
+            )),
+            Some(R::AssumptionPositive)
+        );
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source(
+                "def goodSpec (x : Nat) : Prop := assumesHold → x > 0"
+            )),
+            None
+        );
+        assert_eq!(
+            expr("if h : assumesHold then P else Q", SourceDialect::Lean, Polarity::Positive),
+            Some(R::AssumptionInIfCondition)
+        );
+    }
+
+    #[test]
+    fn b2_g6b_catches_closure_body_const_transmute_ptr_read_and_generic_cast_helper() {
+        let inv = "#[invariant(self.0 > 0)] pub struct Pos(u32);";
+        // Closure `|x| Pos(x)` must NOT be treated as a `|` OR-pattern!
+        assert_eq!(
+            g6b(&std::format!("{inv} pub fn leak() -> Pos {{ (|x| Pos(x))(0) }}")),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} pub fn leak(xs: &[u32]) -> Vec<Pos> {{ xs.iter().map(|&x| Pos(x)).collect() }}"
+            )),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // Genuine OR-patterns in `match` remain allowed.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} pub fn is_small(p: Pos) -> bool {{ match p {{ Pos(1) | Pos(2) => true, _ => false }} }}"
+            )),
+            None
+        );
+        // `pub const` / private `const` raw materialization via `transmute`.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} pub const BAD: Pos = unsafe {{ core::mem::transmute(0u32) }};"
+            )),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} const BAD: Pos = unsafe {{ core::mem::transmute(0u32) }}; pub fn leak() -> Pos {{ BAD }}"
+            )),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // `core::ptr::read` and `core::ptr::read_volatile` materialization.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} pub fn forge(p: *const Pos) -> Pos {{ unsafe {{ core::ptr::read(p) }} }}"
+            )),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // Generic raw-materializing helper not naming `Pos` in its own signature.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} fn cast<A, B>(a: A) -> B {{ unsafe {{ core::mem::transmute_copy(&a) }} }} pub fn forge(x: u32) -> Pos {{ cast(x) }}"
+            )),
+            Some(R::InvariantRawPublicConstructor)
+        );
+        // Calling the same generic helper on unrelated types does NOT false-positive.
+        assert_eq!(
+            g6b(&std::format!(
+                "{inv} fn cast<A, B>(a: A) -> B {{ unsafe {{ core::mem::transmute_copy(&a) }} }} pub fn bits(f: f32) -> u32 {{ cast(f) }}"
+            )),
+            None
         );
     }
 }

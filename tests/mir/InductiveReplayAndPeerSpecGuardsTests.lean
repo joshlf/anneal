@@ -252,6 +252,10 @@ example : ¬ InductiveReplayWellFormed fDroppedRec cleanModule.constants :=
 example : lookup cleanModule.constants 4 = some (.recInfo fixtureRec) :=
   inductiveReplayWellFormed_kernel_exact (md := cleanModule) (kenv := cleanModule.constants)
     (by decide) (by decide) (.recInfo fixtureRec) (by decide) rfl
+example : (.recInfo fixtureRec ∈ cleanModule.constants) ↔
+    (.recInfo fixtureRec ∈ cleanModule.constants) :=
+  inductiveReplayWellFormed_family_iff (md := cleanModule) (kenv := cleanModule.constants)
+    (by decide) (by decide) rfl
 
 /-! ## 3. Pillar 2 -/
 
@@ -349,6 +353,8 @@ example : ¬ FnDefGhostTokenGuard (.repeatCtx .closure 1 (.seq .skip .mintCall))
   fun h => absurd h.no_repeat_mint (by decide)
 example : ¬ UniqueAuthority (TokStmt.repeatCtx .forKw 2 .mintCall).mintedTokens :=
   repeatMint_soundness_collapse .forKw
+example : ¬ UniqueAuthority (TokStmt.repeatCtx .genericDispatch 2 .mintCall).mintedTokens :=
+  repeatMint_soundness_collapse .genericDispatch
 example : (evalTok fnDefDupProg ([], 0)).2 = 2 := by decide
 example : (evalTok (.seq (.callVar 0) (.bindFnDef 0)) ([], 0)).2 = 0 := by decide
 example : UniqueAuthority (List.range (evalTok (.seq .mintCall .skip) ([], 0)).2) :=
@@ -591,3 +597,11 @@ open Anneal.InductiveReplayAndPeerSpecGuards
 /-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.leakyTransform_soundness_collapse' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms leakyTransform_soundness_collapse
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.inductiveReplayWellFormed_family_iff' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms inductiveReplayWellFormed_family_iff
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.subShardPartition_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms subShardPartition_sound

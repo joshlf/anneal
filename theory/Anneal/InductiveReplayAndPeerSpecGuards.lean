@@ -1229,6 +1229,19 @@ theorem inductiveReplayWellFormed_kernel_exact {md : ModuleData} {kenv : Env}
     rw [hd, hK]
   · cases hAll
 
+/-- **Two-sided set exactness.** Under `InductiveReplayWellFormed` and distinct kernel
+    names, the stored inductive family coincides set-theoretically with the
+    kernel-generated inductive family. -/
+theorem inductiveReplayWellFormed_family_iff {md : ModuleData} {kenv : Env}
+    (h : InductiveReplayWellFormed md kenv) (hNodup : (kenv.map RConstInfo.name).Nodup)
+    {c : RConstInfo} (hFam : c.isInductFamily = true) :
+    c ∈ md.constants ↔ c ∈ kenv := by
+  constructor
+  · intro hc
+    exact (lookup_some_mem (inductiveReplayWellFormed_kernel_agreement h c hc hFam)).1
+  · intro hc
+    exact (lookup_some_mem (inductiveReplayWellFormed_kernel_exact h hNodup c hc hFam)).1
+
 /-- An inductive-family constant the kernel never regenerated is rejected by the
     unconditional post-replay sweep. -/
 theorem postReplaySweep_rejects_unreplayed {md : ModuleData} {kenv : Env} {c : RConstInfo}
@@ -1557,6 +1570,31 @@ theorem shardedAudit_exact {W : ModuleWorld} {shards : List AuditShard}
   ⟨violation_parity hP hC, fun hNo =>
     (shardAxiomUnion_sound hP hC ((crossShardReconciled_iff_no_conflict shards).mpr hNo)).axiom_union⟩
 
+/-- **Sub-sharding preservation.** Replacing one shard `s` of an orphan-free, locally
+    closed, reconciled partition by sub-shards `subs` covering `s.modules` preserves
+    orphan-freedom, cross-shard reconciliation, and `ShardAxiomUnionSound`. -/
+theorem subShardPartition_sound {W : ModuleWorld} {s : AuditShard}
+    {rest subs : List AuditShard}
+    (hP : OrphanFreePartition W (s :: rest))
+    (hSubCover : ∀ m ∈ s.modules, ∃ t ∈ subs, m ∈ t.modules)
+    (hSubWithin : ∀ t ∈ subs, ∀ m ∈ t.modules, m ∈ s.modules)
+    (hC : ∀ t ∈ subs ++ rest, ShardLocalClosure W t)
+    (hR : CrossShardReconciled (subs ++ rest)) :
+    OrphanFreePartition W (subs ++ rest) ∧ ShardAxiomUnionSound W (subs ++ rest) := by
+  have hP' : OrphanFreePartition W (subs ++ rest) := by
+    refine ⟨?_, ?_⟩
+    · intro m hm
+      obtain ⟨u, hu, hmu⟩ := hP.1 m hm
+      rcases List.mem_cons.mp hu with rfl | hRest
+      · obtain ⟨t, ht, hmt⟩ := hSubCover m hmu
+        exact ⟨t, List.mem_append_left rest ht, hmt⟩
+      · exact ⟨u, List.mem_append_right subs hRest, hmu⟩
+    · intro t ht m hmt
+      rcases List.mem_append.mp ht with hSub | hRest
+      · exact hP.2 s (List.mem_cons_self ..) m (hSubWithin t hSub m hmt)
+      · exact hP.2 t (List.mem_cons_of_mem s hRest) m hmt
+  exact ⟨hP', shardAxiomUnion_sound hP' hC hR⟩
+
 /-! ### 3.1 Counterexamples: naive reconciliation, orphans, and independent shards -/
 
 /-- Claim `t` (name `10`) refers to `n` (name `7`). Module `0` defines `n` as a
@@ -1814,6 +1852,7 @@ inductive RepeatKind : Type where
   | closure
   | asyncBlock
   | reentrantMain
+  | genericDispatch
   deriving DecidableEq, Repr
 
 /-- `TokProg`: a linear ghost-token program. -/
