@@ -64,7 +64,10 @@ alias (`setMirAbsSlot`).
 
 The statement and terminator theorems assume the root-frame invariants
 `activeProtectors = []` (and `callStack = []` for `return`), which every
-supported step preserves.
+supported step preserves. `stepMirFn_stmt_sound` / `stepMirFn_term_sound`
+lift them to the machine coalgebra `stepMirFn` (root frame, supported phase),
+and `entryEnv_sound` / `initMachineState_root` describe the initial state of
+`initMachineState`, for the certificate checker in `Anneal.AiPcc.MirPcc`.
 -/
 
 /-! ## 1. Abstract Operand Values -/
@@ -4764,5 +4767,279 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
             | _ => nomatch hTerm
           | _ => nomatch hTerm
     | _ => nomatch hTerm
+
+/-! ## 10. Machine-Level Step Bridge (`stepMirFn`) -/
+
+/-- `if c = true then a else b` reduces to `a` when `c = true`, for any
+`Decidable` instance (avoids classical `ite` congruence in `simp`). -/
+theorem ite_bool_true_eq {α : Sort _} {c : Bool} {d : Decidable (c = true)}
+    (hc : c = true) (a b : α) : @ite α (c = true) d a b = a := by
+  cases d with
+  | isTrue _ => rfl
+  | isFalse h => exact False.elim (h hc)
+
+/-- `phase` admits stepping (`stepMirFn` fails closed on `.other _`). -/
+def mirPhaseSupported : MirPhaseTag → Bool
+  | .other _ => false
+  | _ => true
+
+/-- `stepMirFn` on a root frame (`activeCallee = none`) dispatches on `body`. -/
+theorem stepMirFn_root {body : CapturedMir} {s : MachineState}
+    (hPhase : mirPhaseSupported body.phase = true)
+    (hCallee : s.memory.activeCallee = none) :
+    stepMirFn body s =
+      match get? body.basicBlocks s.frame.blockIdx with
+      | none => MirStepNode.fail .ub
+      | some bb =>
+        match get? bb.statements s.frame.stmtIdx with
+        | some stmt => evalStmt s stmt body.localDecls body.layouts
+        | none =>
+          if s.frame.stmtIdx == length bb.statements then
+            evalTerminator s bb.terminator (some body)
+          else
+            MirStepNode.fail .ub := by
+  unfold stepMirFn
+  rw [hCallee]
+  simp only [Option.getD]
+  cases hP : body.phase with
+  | other n => rw [hP] at hPhase; nomatch hPhase
+  | runtimePostCleanup => rfl
+  | runtimeOptimized => rfl
+
+/-- Statement-position `stepMirFn` soundness: from a root frame at statement
+`stmt` of block `bb`, a successful `stepStmtAbs` certifies a silent step to
+the next statement with the abstract frame updated to `env'`. -/
+theorem stepMirFn_stmt_sound {body : CapturedMir} {s : MachineState}
+    {bb : BasicBlockData} {stmt : Statement} {env env' : MirAbsEnv}
+    (hPhase : mirPhaseSupported body.phase = true)
+    (hCallee : s.memory.activeCallee = none)
+    (hBb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hSt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hEnv : mirAbsEnvDenote body.localDecls env s.frame.locals)
+    (hProt : s.memory.activeProtectors = [])
+    (hStep : stepStmtAbs body.localDecls env stmt = some env') :
+    ∃ locals' mem',
+      stepMirFn body s = MirStepNode.step (advanceStmt s locals' mem') ∧
+      mem'.callStack = s.memory.callStack ∧
+      mem'.activeCallee = s.memory.activeCallee ∧
+      mem'.activeProtectors = s.memory.activeProtectors ∧
+      mirAbsEnvDenote body.localDecls env' locals' := by
+  rw [stepMirFn_root hPhase hCallee, hBb]
+  simp only [hSt]
+  exact stepStmtAbs_sound (layouts := body.layouts) hEnv hProt hStep
+
+/-- Terminator-position `stepMirFn` soundness: once `stmtIdx` reaches the end
+of block `bb`, a successful `stepTermAbs` certifies either a root-frame
+`retNormal` or a step to one of the abstract successor edges. -/
+theorem stepMirFn_term_sound {body : CapturedMir} {s : MachineState}
+    {bb : BasicBlockData} {env : MirAbsEnv} {out : TermAbsOutcome}
+    (hPhase : mirPhaseSupported body.phase = true)
+    (hCallee : s.memory.activeCallee = none)
+    (hBb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hEnd : s.frame.stmtIdx = length bb.statements)
+    (hEnv : mirAbsEnvDenote body.localDecls env s.frame.locals)
+    (hProt : s.memory.activeProtectors = [])
+    (hStack : s.memory.callStack = [])
+    (hTerm : stepTermAbs env bb.terminator = some out) :
+    match out with
+    | .ret retSlot =>
+      ∃ retVal mem' d, get? body.localDecls 0 = some d ∧
+        stepMirFn body s = MirStepNode.retNormal retVal mem' ∧
+        retSlot.denote d.ty s.frame.locals (.init retVal)
+    | .edges succs =>
+      ∃ target envT obs locals' mem', List.Mem (target, envT) succs ∧
+        stepMirFn body s =
+          MirStepNode.emitStep obs
+            { frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+              memory := mem' } ∧
+        mem'.callStack = s.memory.callStack ∧
+        mem'.activeCallee = s.memory.activeCallee ∧
+        mem'.activeProtectors = s.memory.activeProtectors ∧
+        mirAbsEnvDenote body.localDecls envT locals' := by
+  have hNone : get? bb.statements s.frame.stmtIdx = none := by
+    rw [hEnd]
+    exact List.getElem?_eq_none (Nat.le_refl _)
+  have hEq : (s.frame.stmtIdx == length bb.statements) = true := by
+    rw [hEnd]
+    exact decide_eq_true rfl
+  have hStep : stepMirFn body s = evalTerminator s bb.terminator (some body) := by
+    rw [stepMirFn_root hPhase hCallee, hBb]
+    simp only [hNone]
+    exact ite_bool_true_eq hEq _ _
+  have hT := stepTermAbs_sound (some body) hEnv hProt hStack hTerm
+  rw [hStep]
+  cases out with
+  | ret r => exact hT
+  | edges es => exact hT
+
+/-! ## 11. Entry Frame (`initLocalsAux`) -/
+
+theorem boolAbs_denote_reframe {l1 l2 : List LocalSlot} {ba : BoolAbs}
+    {opt : Option Value} (hNoG : ba.noRelGuard = true)
+    (h : ba.denote l1 opt) : ba.denote l2 opt := by
+  cases opt with
+  | none => exact h
+  | some v =>
+    simp only [BoolAbs.denote] at h ⊢
+    cases hB : boolOfValue? v with
+    | none => rw [hB] at h; exact h
+    | some b =>
+      rw [hB] at h
+      cases ba with
+      | bot => exact h
+      | uninit => exact True.intro
+      | top g =>
+        simp only [BoolAbs.noRelGuard] at hNoG
+        simp only [BoolAbs.denoteBool]
+        rw [relGuard_eq_of_beq hNoG]
+        exact True.intro
+      | exact c g =>
+        simp only [BoolAbs.noRelGuard] at hNoG
+        simp only [BoolAbs.denoteBool] at h ⊢
+        rw [relGuard_eq_of_beq hNoG]
+        exact ⟨h.1, True.intro⟩
+
+/-- A slot without frame-relative guards or aliases denotes the same concrete
+slot in every frame. -/
+theorem mirAbsSlot_denote_reframe {ty : Ty} {l1 l2 : List LocalSlot}
+    {slot : MirAbsSlot} {cs : LocalSlot} (hNoG : slot.noRelGuard = true)
+    (h : slot.denote ty l1 cs) : slot.denote ty l2 cs := by
+  cases slot with
+  | top => exact h
+  | dead => exact h
+  | uint _ _ => exact h
+  | unit _ => exact h
+  | uintCopy _ _ _ => nomatch hNoG
+  | bool ba =>
+    refine ⟨h.1, ?_⟩
+    cases cs with
+    | dead => exact h.2
+    | uninit => exact boolAbs_denote_reframe hNoG h.2
+    | init v => exact boolAbs_denote_reframe hNoG h.2
+  | uintBoolPair u a ov =>
+    refine ⟨h.1, ?_⟩
+    cases cs with
+    | dead => exact h.2
+    | uninit => exact ⟨h.2.1, boolAbs_denote_reframe hNoG h.2.2⟩
+    | init v =>
+      cases v with
+      | aggregate tag fs =>
+        cases tag with
+        | succ _ => exact h.2
+        | zero =>
+          cases fs with
+          | nil => exact h.2
+          | cons v0 rest =>
+            cases v0 with
+            | scalar sc =>
+              cases rest with
+              | nil => exact h.2
+              | cons vb rest2 =>
+                cases rest2 with
+                | cons _ _ => exact h.2
+                | nil =>
+                  exact ⟨h.2.1, h.2.2.1, boolAbs_denote_reframe hNoG h.2.2.2⟩
+            | _ => exact h.2
+      | _ => exact h.2
+
+/-- Abstract entry frame mirroring `initLocalsAux`: the return place `_0` is
+live and uninitialized, parameter `_(i+1)` is described by `argSlots[i]`, and
+every local past the supplied arguments is `.dead`. -/
+def entryEnvAux : Nat → List LocalDecl → List MirAbsSlot → MirAbsEnv
+  | _, [], _ => []
+  | 0, d :: ds, args => uninitSlotFor d.ty :: entryEnvAux 1 ds args
+  | k + 1, _ :: ds, a :: as => a :: entryEnvAux (k + 1) ds as
+  | k + 1, _ :: ds, [] => .dead :: entryEnvAux (k + 1) ds []
+
+/-- Abstract entry frame for `initLocalsAux 0 decls args`. -/
+def entryEnv (decls : List LocalDecl) (argSlots : List MirAbsSlot) : MirAbsEnv :=
+  entryEnvAux 0 decls argSlots
+
+/-- Argument slots are guard-free and describe the argument values at the
+parameter declarations (`decls` here starts at `_1`). -/
+def entryArgsOk : List LocalDecl → List MirAbsSlot → List Value → Prop
+  | [], _, _ => True
+  | _ :: _, [], [] => True
+  | d :: ds, a :: as, v :: vs =>
+    a.noRelGuard = true ∧ a.valDenote d.ty v ∧ entryArgsOk ds as vs
+  | _ :: _, _, _ => False
+
+private theorem entryEnvAux_spec :
+    ∀ (k : Nat) (ds : List LocalDecl) (as : List MirAbsSlot) (vs : List Value),
+      (match k with
+        | 0 => entryArgsOk (ds.drop 1) as vs
+        | _ + 1 => entryArgsOk ds as vs) →
+      length (entryEnvAux k ds as) = length ds ∧
+      length (initLocalsAux k ds vs) = length ds ∧
+      ∀ (i : Nat) (d : LocalDecl) (s : MirAbsSlot) (cs : LocalSlot),
+        get? ds i = some d → get? (entryEnvAux k ds as) i = some s →
+        get? (initLocalsAux k ds vs) i = some cs →
+        ∀ locals, s.denote d.ty locals cs
+  | _, [], _, _, _ =>
+    ⟨rfl, rfl, fun _ _ _ _ hD _ _ _ => nomatch hD⟩
+  | 0, d :: ds, as, vs, hOk => by
+    have ih := entryEnvAux_spec 1 ds as vs hOk
+    refine ⟨congrArg Nat.succ ih.1, congrArg Nat.succ ih.2.1, ?_⟩
+    intro i d' s cs hD hS hCs locals
+    cases i with
+    | zero =>
+      injection hD with hD
+      injection hS with hS
+      injection hCs with hCs
+      subst hD
+      subst hS
+      subst hCs
+      exact uninitSlotFor_denote d.ty locals
+    | succ i => exact ih.2.2 i d' s cs hD hS hCs locals
+  | k + 1, d :: ds, [], [], _ => by
+    have ih := entryEnvAux_spec (k + 1) ds [] []
+      (by cases ds <;> exact True.intro)
+    refine ⟨congrArg Nat.succ ih.1, congrArg Nat.succ ih.2.1, ?_⟩
+    intro i d' s cs hD hS hCs locals
+    cases i with
+    | zero =>
+      injection hS with hS
+      injection hCs with hCs
+      subst hS
+      subst hCs
+      rfl
+    | succ i => exact ih.2.2 i d' s cs hD hS hCs locals
+  | k + 1, d :: ds, a :: as, v :: vs, hOk => by
+    have ih := entryEnvAux_spec (k + 1) ds as vs hOk.2.2
+    refine ⟨congrArg Nat.succ ih.1, congrArg Nat.succ ih.2.1, ?_⟩
+    intro i d' s cs hD hS hCs locals
+    cases i with
+    | zero =>
+      injection hD with hD
+      injection hS with hS
+      injection hCs with hCs
+      subst hD
+      subst hS
+      subst hCs
+      exact mirAbsSlot_denote_reframe hOk.1 hOk.2.1
+    | succ i => exact ih.2.2 i d' s cs hD hS hCs locals
+  | _ + 1, _ :: _, [], _ :: _, hOk => nomatch hOk
+  | _ + 1, _ :: _, _ :: _, [], hOk => nomatch hOk
+
+/-- The abstract entry frame denotes the concrete initial frame
+`initLocalsAux 0 decls args` built by `initMachineState`. -/
+theorem entryEnv_sound {decls : List LocalDecl} {argSlots : List MirAbsSlot}
+    {args : List Value} (hOk : entryArgsOk (decls.drop 1) argSlots args) :
+    mirAbsEnvDenote decls (entryEnv decls argSlots) (initLocalsAux 0 decls args) := by
+  have h := entryEnvAux_spec 0 decls argSlots args hOk
+  exact ⟨h.1, h.2.1, fun i d s cs hD hS hCs => h.2.2 i d s cs hD hS hCs _⟩
+
+/-- `initMachineState body args` is a root frame at `bb0[0]` with no callee,
+call stack, or active protectors, over `initLocalsAux 0 body.localDecls args`
+(the preconditions of `stepMirFn_stmt_sound` / `stepMirFn_term_sound`). -/
+theorem initMachineState_root (body : CapturedMir) (args : List Value) :
+    (initMachineState body args).memory.callStack = [] ∧
+    (initMachineState body args).memory.activeCallee = none ∧
+    (initMachineState body args).memory.activeProtectors = [] ∧
+    (initMachineState body args).frame.blockIdx = 0 ∧
+    (initMachineState body args).frame.stmtIdx = 0 ∧
+    (initMachineState body args).frame.locals =
+      initLocalsAux 0 body.localDecls args :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.AiPcc
