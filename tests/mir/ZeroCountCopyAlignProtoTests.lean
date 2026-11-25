@@ -272,8 +272,9 @@ theorem cc5_unit_legacy_permissive :
     legacy u8K u8K .unit .unit 0 = noop := by kernel_rfl
 
 /-- `bdCopyZeroScalars` (`IntrinsicBoundary.lean:320`): `copy_nonoverlapping(0_u32,
-0_u32, 0_usize)` steps in legacy `evalStmt` for every state, but the prototype
-rejects the non-pointer operands. -/
+0_u32, 0_usize)` steps in legacy `evalStmt` for every state, whereas the B1-hardened
+prototype detects statically non-pointer (`u32`) operands and faults `.fail .ub`
+even with `localDecls = []`. -/
 def bdCopyZeroScalars : Statement :=
   { kind := .intrinsic (.copyNonOverlapping (constU32 0) (constU32 0) (constUsize 0)),
     span := "proto" }
@@ -283,10 +284,29 @@ theorem cc5_bdCopyZeroScalars_legacy (s : MachineState) (decls : List LocalDecl)
     evalStmt s bdCopyZeroScalars decls layouts = MirStepNode.step (advanceStmt s s.frame.locals) :=
   rfl
 
-/-- With pointer-typed operand decls missing, the prototype fails closed
-(`.unsupported`) — never a permissive step. -/
-theorem cc5_bdCopyZeroScalars_proto_nil :
-    evalStmtProto .rejectNull st bdCopyZeroScalars [] emptyLayoutTable = MirStepNode.unsupported := by
+/-- Even with empty `localDecls`, `bdCopyZeroScalars` faults `.fail .ub` (not merely
+`.unsupported`), because `constU32 0` is statically a non-pointer `u32` (and 4 bytes). -/
+theorem cc5_bdCopyZeroScalars_proto_ub :
+    evalStmtProto .rejectNull st bdCopyZeroScalars [] emptyLayoutTable = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- Even an 8-byte aligned scalar constant of static non-pointer type `u64`
+(`copy_nonoverlapping(src_ptr_u64, 8_u64, 0_usize)`) must fault `.fail .ub`,
+never stepping just because `src`'s pointee resolved to `u64`! -/
+def constU64 (n : Nat) : Operand :=
+  .constant { ty := tyOf u64K, val := .scalar (.int ⟨n, 8⟩) }
+
+theorem cc5_nonptr_u64_dst_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (constU64 8) (declsFor u64K u64K)
+        emptyLayoutTable (danglingScalar 8) (danglingScalar 8) 0 st.frame.locals =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- A malformed `.unit` operand with empty `localDecls` faults `.fail .ub`
+(Corner Case 5 beats missing-decl `.unsupported`). -/
+theorem cc5_unit_no_decls_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull st (cp 2) (cp 3) [] emptyLayoutTable
+        .unit (danglingScalar 8) 0 st.frame.locals = MirStepNode.fail .ub := by
   kernel_rfl
 
 /-- Statement-level count width check (missing in legacy `evalCopyNonOverlapping`):
@@ -295,6 +315,14 @@ def countU32Zero : Operand := constU32 0
 
 theorem cc5_count_wrong_width_proto :
     evalCopyNonOverlappingProto .rejectNull st (cp 1) (cp 1) countU32Zero
+        (declsFor u64K u64K) emptyLayoutTable = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- Statement-level out-of-range `count` (`bits = 2^64` on 64-bit) faults `.ub`. -/
+def countOutOfRange : Operand := constUsize 18446744073709551616
+
+theorem cc5_count_out_of_range_proto :
+    evalCopyNonOverlappingProto .rejectNull st (cp 1) (cp 1) countOutOfRange
         (declsFor u64K u64K) emptyLayoutTable = MirStepNode.fail .ub := by
   kernel_rfl
 
@@ -334,9 +362,14 @@ theorem cc6_opaque_adt :
         (danglingScalar 8) 0 = MirStepNode.unsupported := by
   kernel_rfl
 
-/-- Unsized pointee (`[u8]`) is `.ub`. -/
+/-- Unsized pointee (`[u8]`) is `.ub` for both `count = 0` and `count = 1`. -/
 theorem cc6_unsized_slice_ub :
     proto .rejectNull (.slice u8K) (.slice u8K) (danglingScalar 8) (danglingScalar 8) 0 =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem cc6_unsized_slice_count1_ub :
+    proto .rejectNull (.slice u8K) (.slice u8K) (stackPtr 0) (stackPtr 0) 1 =
       MirStepNode.fail .ub := by
   kernel_rfl
 
@@ -671,6 +704,293 @@ theorem returned_frame_u64_unsupported :
 theorem returned_frame_u8_noop :
     protoCaller u8K (.ptr ⟨6, 0⟩ 8) (.ptr ⟨6, 3⟩ 8) = noopCaller := by kernel_rfl
 
+/-! ## 11c. B1 hardening: 32-bit targets, `fieldLayouts`, aligned ZSTs,
+frame-depth reuse (`allocDead`), `fnPtrs`, over-aligned `131072`, nested packed,
+and TCB / `MirFuelFree` downstream breakage witnesses -/
+
+/-- 32-bit target layout table (`pointerBits = 32`, `ptrBytes = 4`). -/
+def layouts32 : LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true, entries := [] }
+
+def decls32 (k : RigidTy) : List LocalDecl :=
+  [declOf unitK, declOf usizeK, declOf (rawConstK k), declOf (rawMutK k), declOf u8K]
+
+def st32 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨7, 4⟩), .uninit, .uninit,
+                          .init (.scalar ⟨1, 1⟩)] }
+    memory := { emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }],
+      nextTag := 2 } }
+
+def proto32 (policy : ZeroCountNullPolicy) (k : RigidTy) (srcVal dstVal : Value) (count : Nat) :
+    MirStepNode :=
+  evalCopyNonOverlappingWithCountProto policy st32 (cp 2) (cp 3) (decls32 k) layouts32 srcVal dstVal
+    count st32.frame.locals
+
+def noop32 : MirStepNode := MirStepNode.step (advanceStmt st32 st32.frame.locals)
+
+theorem target32_layout_usize :
+    resolveCopyElemLayout (decls32 usizeK) layouts32 (cp 2) (cp 3) = .ok 4 4 := by decide +kernel
+
+theorem target32_layout_rawptr :
+    resolveCopyElemLayout (decls32 (rawConstK u8K)) layouts32 (cp 2) (cp 3) = .ok 4 4 := by
+  decide +kernel
+
+theorem target32_layout_wideptr :
+    resolveCopyElemLayout (decls32 (rawConstK (.slice u8K))) layouts32 (cp 2) (cp 3) = .ok 8 4 := by
+  decide +kernel
+
+/-- On 32-bit, `NonNull::<usize>::dangling()` (addr `4`, width `4`) steps cleanly. -/
+theorem target32_dangling_usize_aligned :
+    proto32 .rejectNull usizeK (.scalar ⟨4, 4⟩) (.scalar ⟨4, 4⟩) 0 = noop32 := by kernel_rfl
+
+/-- On 32-bit, `NonNull::<*const u8>::dangling()` (addr `4`, width `4`) steps cleanly. -/
+theorem target32_dangling_rawptr_aligned :
+    proto32 .rejectNull (rawConstK u8K) (.scalar ⟨4, 4⟩) (.scalar ⟨4, 4⟩) 0 = noop32 := by
+  kernel_rfl
+
+/-- On 32-bit, live stack `usize` local is 4-aligned and steps cleanly. -/
+theorem target32_stack_usize_aligned :
+    proto32 .rejectNull usizeK (.ptr ⟨1, 0⟩ 4) (.ptr ⟨1, 0⟩ 4) 0 = noop32 := by kernel_rfl
+
+/-- On 32-bit, addr `2` is misaligned for `usize` (`align = 4`) → `.ub`. -/
+theorem target32_misaligned_usize_ub :
+    proto32 .rejectNull usizeK (.scalar ⟨2, 4⟩) (.scalar ⟨4, 4⟩) 0 = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- On 32-bit, `allocId = 65536` wraps `65536 * 65536 = 2^32 ≡ 0 (mod 2^32)` → null `.ub`. -/
+theorem target32_wrapped_null_ub :
+    proto32 .rejectNull u8K (.ptr ⟨65536, 0⟩ 4) (.scalar ⟨1, 4⟩) 0 = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- On 32-bit, an 8-byte scalar is wrong-width → `.ub`. -/
+theorem target32_wrong_width_8_ub :
+    proto32 .rejectNull usizeK (.scalar ⟨4, 8⟩) (.scalar ⟨4, 4⟩) 0 = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- On 32-bit, `count = 2^29` for `usize` (`4` bytes) gives `2^31 > i32::MAX` → `.ub`,
+whereas `count = 2^28` (`2^30 ≤ i32::MAX`) does NOT overflow (A0 wrongly used `8` bytes). -/
+theorem target32_overflow_usize_ub :
+    proto32 .rejectNull usizeK (.ptr ⟨1, 0⟩ 4) (.ptr ⟨1, 0⟩ 4) 536870912 =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem target32_no_overflow_2pow28 :
+    268435456 * 4 ≤ isizeMaxBytes (layoutPointerBytes layouts32) ∧
+    isizeMaxBytes (layoutPointerBytes layouts32) < 536870912 * 4 := by
+  decide +kernel
+
+/-- Pointer-only ADT (`fn copy_pair(src: *const Pair, dst: *mut Pair)` with **no** local
+of type `Pair`): `ptrLayout.fieldLayouts = [0]` points directly to `Pair`'s layout at
+`entries[0]`. -/
+def ptrLayoutTo0 : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 },
+    backendRepr := .scalar (.union (.pointer 0)),
+    fields := .primitive, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [0] }
+
+def ptrOnlyAdtLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [reprCLayout, ptrLayoutTo0] }
+
+def ptrOnlyAdtDecls : List LocalDecl :=
+  [declNL unitK,
+   { mutability := .not, ty := { kind := rawConstK reprCK, layoutIdx := 1 }, debugName := none },
+   { mutability := .not, ty := { kind := rawMutK reprCK, layoutIdx := 1 }, debugName := none }]
+
+theorem ptr_only_adt_fieldLayouts_layout :
+    resolveCopyElemLayout ptrOnlyAdtDecls ptrOnlyAdtLayouts (cp 1) (cp 2) = .ok 16 8 := by
+  decide +kernel
+
+theorem ptr_only_adt_fieldLayouts_aligned_noop :
+    evalCopyNonOverlappingWithCountProto .rejectNull st (cp 1) (cp 2) ptrOnlyAdtDecls
+        ptrOnlyAdtLayouts (danglingScalar 8) (danglingScalar 8) 0 st.frame.locals = noop := by
+  kernel_rfl
+
+theorem ptr_only_adt_fieldLayouts_misaligned_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull st (cp 1) (cp 2) ptrOnlyAdtDecls
+        ptrOnlyAdtLayouts (danglingScalar 4) (danglingScalar 8) 0 st.frame.locals =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- Aligned ZST `[u64; 0]`: `size = 0`, `align = 8`. Even with `count = 5`, total bytes = `0`,
+but alignment `8` is strictly enforced! -/
+def alignedZstK : RigidTy := .array u64K 0
+
+theorem aligned_zst_layout :
+    resolveCopyElemLayout (declsFor alignedZstK alignedZstK) emptyLayoutTable (cp 2) (cp 3) =
+      .ok 0 8 := by
+  decide +kernel
+
+theorem aligned_zst_count5_aligned_noop :
+    proto .rejectNull alignedZstK alignedZstK (danglingScalar 8) (danglingScalar 8) 5 = noop := by
+  kernel_rfl
+
+theorem aligned_zst_count5_misaligned_ub :
+    proto .rejectNull alignedZstK alignedZstK (danglingScalar 4) (danglingScalar 8) 5 =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem aligned_zst_count5_null_reject_ub :
+    proto .rejectNull alignedZstK alignedZstK (danglingScalar 0) (danglingScalar 8) 5 =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem aligned_zst_count5_null_allowRaw_noop :
+    proto .allowRawIntrinsicNull alignedZstK alignedZstK (danglingScalar 0) (danglingScalar 8) 5 =
+      noop := by
+  kernel_rfl
+
+/-- Frame-depth reuse soundness (`allocDead = true`): tag `7` is a dead borrow from a returned
+callee at depth `0` (whose `_1` may have been `u8`), while the active frame at depth `0` has
+`_1 : u64`. Tag `8` is a dead projected borrow. -/
+def deadReuseState : MachineState :=
+  { st with
+    memory := { st.memory with
+      borrows := borrowsFix ++
+        [{ tag := 7, targetLocal := 1, targetProjection := [], perm := .disabled,
+           targetFrameDepth := 0, allocDead := true },
+         { tag := 8, targetLocal := 1, targetProjection := [.field 0 (tyOf u8K)],
+           perm := .disabled, targetFrameDepth := 0, allocDead := true }],
+      globals := globalsFix ++
+        [{ allocId := 11, bytes := List.replicate 16 (some 0), relocations := [],
+           align := { bytes := 12 }, mutability := .not }],
+      fnPtrs := [{ allocId := 65536, defPath := "proto::fn_item" }] } }
+
+def protoDead (k : RigidTy) (srcVal dstVal : Value) (count : Nat) : MirStepNode :=
+  evalCopyNonOverlappingWithCountProto .rejectNull deadReuseState (cp 2) (cp 3) (declsFor k k)
+    emptyLayoutTable srcVal dstVal count deadReuseState.frame.locals
+
+def noopDead : MirStepNode :=
+  MirStepNode.step (advanceStmt deadReuseState deadReuseState.frame.locals)
+
+/-- Dead borrow at reused frame depth on `u64` fails closed `.unsupported` (must NOT trust
+the active frame's `_1 : u64` decl!). -/
+theorem reused_frame_dead_u8_borrow_u64_unsupported :
+    protoDead u64K (.ptr ⟨7, 0⟩ 8) (stackPtr 0) 0 = MirStepNode.unsupported := by kernel_rfl
+
+/-- Dead non-projected borrow on `u8` (`elemAlign = 1`) still steps as a zero-byte no-op. -/
+theorem reused_frame_dead_borrow_u8_noop :
+    protoDead u8K (.ptr ⟨7, 0⟩ 8) (.ptr ⟨7, 3⟩ 8) 0 = noopDead := by kernel_rfl
+
+/-- Dead projected borrow fails closed `.unsupported` even on `u8` (projection offset cannot
+trust the reused frame's `LocalDecl`). -/
+theorem reused_frame_dead_projected_borrow_u8_unsupported :
+    protoDead u8K (.ptr ⟨8, 0⟩ 8) (danglingScalar 1) 0 = MirStepNode.unsupported := by kernel_rfl
+
+/-- Registered `FnPtrEntry` (`s.memory.fnPtrs`): `u8` steps, misaligned `u64` is `.ub`,
+aligned `u64` is `.unsupported` (unknown function-pointer base alignment). -/
+theorem cc1_fnptr_u8_noop :
+    protoDead u8K (.ptr ⟨65536, 0⟩ 8) (.ptr ⟨65536, 0⟩ 8) 0 = noopDead := by kernel_rfl
+
+theorem cc4_fnptr_misaligned_u64_ub :
+    protoDead u64K (.ptr ⟨65536, 3⟩ 8) (stackPtr 0) 0 = MirStepNode.fail .ub := by kernel_rfl
+
+theorem cc6_fnptr_aligned_u64_unsupported :
+    protoDead u64K (.ptr ⟨65536, 0⟩ 8) (stackPtr 0) 0 = MirStepNode.unsupported := by kernel_rfl
+
+/-- Global allocation with malformed non-power-of-two `align = 12` fails closed on `u32`. -/
+theorem cc6_global_nonpow2_align_u32_unsupported :
+    protoDead u32K (.ptr ⟨11, 0⟩ 8) (danglingScalar 4) 0 = MirStepNode.unsupported := by kernel_rfl
+
+/-- Over-aligned `#[repr(align(131072))]` struct (exceeding the `65536`-byte virtual page)
+and nested `#[repr(packed)]` inside `#[repr(align(8))]`:
+* `OuterOff0 { p: Packed }` → `&raw mut outer.p.b` at offset `1` is `.ub`;
+* `OuterOff7 { pad: [u8; 7], p: Packed }` → `&raw mut outer2.p.b` at offset `7 + 1 = 8` steps! -/
+def overAlignK : RigidTy := .adt "proto::OverAlign131072" []
+def outerOff0K : RigidTy := .adt "proto::OuterOff0" []
+def outerOff7K : RigidTy := .adt "proto::OuterOff7" []
+
+def overAlignLayout : TypeLayout :=
+  { size := { bytes := 131072 }, align := { bytes := 131072 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0, isUninhabited := false }
+
+def outerOff0Layout : TypeLayout :=
+  { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1] }
+
+def outerOff7Layout : TypeLayout :=
+  { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 7 }] [0, 1], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [99, 1] }
+
+def extAdtLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [reprCLayout, packedLayout, overAlignLayout, outerOff0Layout, outerOff7Layout] }
+
+def extAdtDecls : List LocalDecl :=
+  [declNL unitK,
+   { mutability := .mut, ty := { kind := overAlignK, layoutIdx := 2 }, debugName := none },
+   declNL (rawConstK overAlignK),
+   declNL (rawMutK overAlignK),
+   { mutability := .mut, ty := { kind := outerOff0K, layoutIdx := 3 }, debugName := none },
+   { mutability := .mut, ty := { kind := outerOff7K, layoutIdx := 4 }, debugName := none },
+   declNL (rawConstK u64K),
+   declNL (rawMutK u64K)]
+
+def extAdtState : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := List.replicate 8 .uninit }
+    memory := { emptyMemory with
+      borrows :=
+        [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique },
+         { tag := 2, targetLocal := 4,
+           targetProjection := [.field 0 { kind := packedK, layoutIdx := 1 },
+                                .field 1 (tyNL u64K)],
+           perm := .unique },
+         { tag := 3, targetLocal := 5,
+           targetProjection := [.field 1 { kind := packedK, layoutIdx := 1 },
+                                .field 1 (tyNL u64K)],
+           perm := .unique }],
+      nextTag := 4 } }
+
+def noopExtAdt : MirStepNode :=
+  MirStepNode.step (advanceStmt extAdtState extAdtState.frame.locals)
+
+theorem overaligned_131072_aligned_noop :
+    evalCopyNonOverlappingWithCountProto .rejectNull extAdtState (cp 2) (cp 3) extAdtDecls
+        extAdtLayouts (.ptr ⟨1, 0⟩ 8) (.ptr ⟨1, 0⟩ 8) 0 extAdtState.frame.locals = noopExtAdt := by
+  kernel_rfl
+
+theorem overaligned_131072_offset65536_misaligned_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull extAdtState (cp 2) (cp 3) extAdtDecls
+        extAdtLayouts (.ptr ⟨1, 65536⟩ 8) (.ptr ⟨1, 0⟩ 8) 0 extAdtState.frame.locals =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem nested_packed_in_align8_off1_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull extAdtState (cp 6) (cp 7) extAdtDecls
+        extAdtLayouts (.ptr ⟨2, 0⟩ 8) (danglingScalar 8) 0 extAdtState.frame.locals =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem nested_packed_in_align8_off8_noop :
+    evalCopyNonOverlappingWithCountProto .rejectNull extAdtState (cp 6) (cp 7) extAdtDecls
+        extAdtLayouts (.ptr ⟨3, 0⟩ 8) (.ptr ⟨3, 0⟩ 8) 0 extAdtState.frame.locals = noopExtAdt := by
+  kernel_rfl
+
+/-- **TCB downstream breakage witness (`evalStmt_storageRevive_old_ptr_deref_ub`)**:
+with `count = 1` (`n + 1`) on ZST `()` and a disabled `allocDead = true` stack borrow,
+the zero-byte copy is a valid no-op (matching Rust/Miri), NOT `.fail .ub`. Thus
+`Statements.evalStmt_storageRevive_old_ptr_deref_ub` in BOTH `V2026_06_01` and
+`V2026_08_01` must add a non-ZST hypothesis to its `copy_nonoverlapping` conjuncts! -/
+theorem tcb_storageRevive_zst_count1_noop :
+    protoDead unitK (.ptr ⟨7, 0⟩ 8) (.ptr ⟨7, 0⟩ 8) 1 = noopDead := by kernel_rfl
+
+/-- **`MirFuelFree.evalCopyNonOverlappingWithCount_borrows_nil` breakage witness**:
+with `s.memory.borrows = []`, `count = 5` (`Nat.beq 5 0 = false`) on ZST `()` steps as
+a no-op instead of faulting, falsifying the old `Nat.beq countBits 0 = true` disjunct! -/
+def emptyBorrowsState : MachineState :=
+  { st with memory := { emptyMemory with borrows := [] } }
+
+theorem mirFuelFree_borrows_nil_zst_count5_noop :
+    evalCopyNonOverlappingWithCountProto .rejectNull emptyBorrowsState (cp 2) (cp 3)
+        (declsFor unitK unitK) emptyLayoutTable (danglingScalar 1) (danglingScalar 1) 5
+        emptyBorrowsState.frame.locals =
+      MirStepNode.step (advanceStmt emptyBorrowsState emptyBorrowsState.frame.locals) := by
+  kernel_rfl
+
 /-! ## 12. Terminator-level call path inherits the fix -/
 
 /-- `evalCopyNonOverlappingCallProto` with a misaligned dangling `src` faults
@@ -733,24 +1053,62 @@ example : miriCopyWithRef 8 0 8 8 0 0 = .noop := rfl
 example : corePtrCopyRef false 8 0 1 1 0 0 = .ub := rfl
 example : corePtrCopyRef true 8 0 1 1 0 0 = .noop := rfl
 
-/-- Bundle of the top-level guarantees (for the axiom audit). -/
+/-- Bundle of the top-level guarantees (for the axiom audit), including end-to-end
+`evalCopyNonOverlappingWithCountProto` ↔ `lean-miri` / `core::ptr` equivalence,
+lifted `stepMirFnProto` / `evalCopyNonOverlappingCallProto` soundness refinement,
+`resolveCopyElemLayout_align_pow2`, and `copyIsUnsizedRigidTy_eq`. -/
 theorem zeroCountCopyAlignProto_bundle :
     (∀ s s' src dst ld ly sv dv c l,
       evalCopyNonOverlappingWithCountProto .rejectNull s src dst ld ly sv dv c l =
           MirStepNode.step s' →
         evalCopyNonOverlappingWithCountProto .allowRawIntrinsicNull s src dst ld ly sv dv c l =
           MirStepNode.step s') ∧
-    (∀ pb c sz al a d, c * sz = 0 →
-      protoFragment .allowRawIntrinsicNull pb c sz (exactView al a) (exactView al d) =
-        some (miriCopyWithRef pb c sz al a d)) ∧
-    (∀ pb c sz al a d, c * sz = 0 →
-      protoFragment .allowRawIntrinsicNull pb c sz (exactView al a) (exactView al d) =
-        some (corePtrCopyRef true pb c sz al a d)) ∧
-    (∀ pb c sz al a d, c * sz = 0 →
-      protoFragment .rejectNull pb c sz (exactView al a) (exactView al d) =
-        some (corePtrCopyRef false pb c sz al a d)) :=
-  ⟨evalCopyNonOverlappingWithCountProto_rejectNull_refines, protoFragment_allowRaw_eq_miri,
-    protoFragment_allowRaw_eq_corePtr, protoFragment_rejectNull_eq_corePtrStrict⟩
+    (∀ body s s',
+      stepMirFnProto .rejectNull body s = MirStepNode.step s' →
+        stepMirFnProto .allowRawIntrinsicNull body s = MirStepNode.step s') ∧
+    (∀ s s' ld ly ao av l' dst bb,
+      evalCopyNonOverlappingCallProto .rejectNull s ld ly ao av l' dst bb = MirStepNode.step s' →
+        evalCopyNonOverlappingCallProto .allowRawIntrinsicNull s ld ly ao av l' dst bb =
+          MirStepNode.step s') ∧
+    (∀ s src dst ld ly sb db c sz al l3,
+      resolveCopyElemLayout ld ly src dst = .ok sz al →
+      c * sz = 0 →
+      sb < scalarModulus (layoutPointerBytes ly) →
+      db < scalarModulus (layoutPointerBytes ly) →
+      evalCopyNonOverlappingWithCountProto .allowRawIntrinsicNull s src dst ld ly
+          (.scalar ⟨sb, layoutPointerBytes ly⟩) (.scalar ⟨db, layoutPointerBytes ly⟩) c l3 =
+        refOutcomeToStep s l3
+          (.some (miriCopyWithRef (layoutPointerBytes ly) c sz al sb db))) ∧
+    (∀ s src dst ld ly sb db c sz al l3,
+      resolveCopyElemLayout ld ly src dst = .ok sz al →
+      c * sz = 0 →
+      sb < scalarModulus (layoutPointerBytes ly) →
+      db < scalarModulus (layoutPointerBytes ly) →
+      evalCopyNonOverlappingWithCountProto .allowRawIntrinsicNull s src dst ld ly
+          (.scalar ⟨sb, layoutPointerBytes ly⟩) (.scalar ⟨db, layoutPointerBytes ly⟩) c l3 =
+        refOutcomeToStep s l3
+          (.some (corePtrCopyRef true (layoutPointerBytes ly) c sz al sb db))) ∧
+    (∀ s src dst ld ly sb db c sz al l3,
+      resolveCopyElemLayout ld ly src dst = .ok sz al →
+      c * sz = 0 →
+      sb < scalarModulus (layoutPointerBytes ly) →
+      db < scalarModulus (layoutPointerBytes ly) →
+      evalCopyNonOverlappingWithCountProto .rejectNull s src dst ld ly
+          (.scalar ⟨sb, layoutPointerBytes ly⟩) (.scalar ⟨db, layoutPointerBytes ly⟩) c l3 =
+        refOutcomeToStep s l3
+          (.some (corePtrCopyRef false (layoutPointerBytes ly) c sz al sb db))) ∧
+    (∀ ld ly src dst sz al,
+      resolveCopyElemLayout ld ly src dst = .ok sz al →
+      isPowTwoAlign al = true ∧ 1 ≤ al) ∧
+    (∀ fuel ty, copyIsUnsizedRigidTy fuel ty = isUnsizedRigidTy fuel ty) :=
+  ⟨evalCopyNonOverlappingWithCountProto_rejectNull_refines,
+    stepMirFnProto_rejectNull_refines,
+    evalCopyNonOverlappingCallProto_rejectNull_refines,
+    evalCopyNonOverlappingWithCountProto_scalar_allowRaw_eq_miri,
+    evalCopyNonOverlappingWithCountProto_scalar_allowRaw_eq_corePtr,
+    evalCopyNonOverlappingWithCountProto_scalar_rejectNull_eq_corePtrStrict,
+    resolveCopyElemLayout_align_pow2,
+    copyIsUnsizedRigidTy_eq⟩
 
 /-! ## 15. Standard-axioms audit -/
 
@@ -758,6 +1116,46 @@ theorem zeroCountCopyAlignProto_bundle :
 -/
 #guard_msgs in
 #print axioms zeroCountCopyAlignProto_bundle
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_policy_difference' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_policy_difference
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_scalar_rejectNull_refines_miri' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_scalar_rejectNull_refines_miri
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.zeroPtrView_stack_live_addr_eq_ptrAddress?' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.zeroPtrView_stack_live_addr_eq_ptrAddress?
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.cc5_bdCopyZeroScalars_proto_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.cc5_bdCopyZeroScalars_proto_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.target32_dangling_usize_aligned' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.target32_dangling_usize_aligned
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.ptr_only_adt_fieldLayouts_aligned_noop' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.ptr_only_adt_fieldLayouts_aligned_noop
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.reused_frame_dead_u8_borrow_u64_unsupported' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.reused_frame_dead_u8_borrow_u64_unsupported
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.tcb_storageRevive_zst_count1_noop' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.tcb_storageRevive_zst_count1_noop
 
 
 /-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.wit_copyMisalignedZero_legacy_steps_proto_ub' depends on axioms: [propext]

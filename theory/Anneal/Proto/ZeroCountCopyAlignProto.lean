@@ -30,35 +30,49 @@ zero-length `memCopy`) reject. Conversely, a ZST copy with `count > 0`
 `countBits ≠ 0` branch and spuriously faults on provenance-free dangling
 pointers. Separately, the statement-level `evalCopyNonOverlapping` never checks
 `countSc.sizeBytes = ptrBytes` (the terminator-level `evalCopyNonOverlappingCall`
-does).
+does), and neither path checks `countSc.bits < 2^(8·ptrBytes)`.
 
-## The prototype fix
+## The prototype fix (hardened in B1)
 
-* `resolveCopyElemLayout` resolves the common pointee `T` (`elemSize`,
-  `elemAlign`), fail-closed `.unsupported` on conflicting/unresolved pointees,
-  `.ub` on unsized `T`, and `.unsupported` on a non-power-of-two alignment
-  (malformed `LayoutTable`).
+* `resolveCopyElemLayout` uses a self-contained, target-pointer-width-aware
+  (`layoutPointerBytes`, handling both 32-bit and 64-bit targets) and
+  `ptrLayout.fieldLayouts`-aware resolver (`copyTySizeAndAlign?`, with zero
+  dependency on `Terminators.lean` so the exact same code drops directly into
+  `V2026_08_01/Statements.lean`):
+  - statically non-pointer operands (`u32`, `u64`, etc.) and unsized pointees
+    (`[u8]`, `str`, `dyn Trait`, `extern type`, or arrays/tuples containing one)
+    yield `.ub`;
+  - conflicting or unresolved pointees and non-power-of-two alignments yield
+    fail-closed `.unsupported`;
+  - authoritative `ptrLayout.fieldLayouts = [ptLayoutIdx]` entries resolve
+    pointer-only ADT parameters even when no local in `localDecls` has type `T`
+    and even when `ptLayoutIdx = 0`.
 * `evalCopyNonOverlappingWithCountProto` checks `count * elemSize ≤ isize::MAX`
   first and then gates the **zero-byte** fast path on `totalBytes = 0`
-  (covering both `count = 0` and ZST `elemSize = 0`). Non-zero-byte copies with
-  a resolved, non-overflowing layout, and every `count ≠ 0` copy whose layout is
-  not resolved, are delegated *unchanged* to the legacy
-  `evalCopyNonOverlappingWithCount`, so the fix's blast radius is exactly the
-  zero-byte fragment (+ the overflow guard).
+  (covering both `count = 0` and ZST `elemSize = 0`, including aligned ZSTs
+  such as `[u64; 0]`). Non-zero-byte copies with a resolved, non-overflowing
+  layout, and every `count ≠ 0` copy whose layout is `.unsupported`, are
+  delegated *unchanged* to the legacy `evalCopyNonOverlappingWithCount`.
+  On `count = 0` with `.unsupported` layout, malformed pointer values (`.unit`,
+  wrong width, etc.) still fault `.ub` before falling back to `.unsupported`.
 * The zero-byte fragment validates each pointer through a `ZeroPtrView`
   (`malformed` / `unresolvedAddr` / `resolved addr alignKnowledge`) and a
   policy-parametric decision `ZeroPtrView.decide`:
   - `ZeroCountNullPolicy.rejectNull` (default): additionally rejects address `0`
     (mod `2^(8·ptrBytes)`, so wrapped addresses are caught);
   - `ZeroCountNullPolicy.allowRawIntrinsicNull`: exactly `lean-miri`'s raw
-    `Intrinsics.copyWith` (and Rust 1.98 `core::ptr::ub_checks`, whose
-    `maybe_is_aligned_and_not_null(ptr, align, is_zst)` waives the null check for
-    zero-sized copies).
+    `Intrinsics.copyWith` (and Rust 1.98 `core::ptr::copy_nonoverlapping`, whose
+    `# Safety` clause adds "or that number must be 0" and whose `ub_checks`
+    passes `zero_size := count == 0 || size == 0`).
+* `stackBorrowAlignKnown` checks `entry.allocDead` (preventing frame-depth-reuse
+  unsoundness when a returned callee's dead borrow collides with a new frame's
+  `LocalDecl`), honors `placeTy.layoutIdx` and `rootDecl.ty.layoutIdx` at the
+  target pointer width, fails closed on unlaid-out root containers, checks
+  `(placeOff + p.offsetBytes) % elemAlign = 0` (catching `.downcast` offsets and
+  over-aligned `align > 65536` structs), and passes the real `rootValOpt` to
+  `checkTargetPlaceAlignWalk`.
 * On success the step is a pure no-op: `MirStepNode.step (advanceStmt s locals₃)`
   (no slot read/write, no Tree Borrows access, no overlap check).
-
-Everything is defined over `Trusted.Rustc.V2026_06_01`; `V2026_08_01` shares the
-byte-identical `evalCopyNonOverlapping*` definitions (see the prototype report).
 -/
 
 namespace Anneal.Proto.ZeroCountCopyAlign
@@ -73,14 +87,16 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 /-- Null-pointer policy for zero-byte `copy_nonoverlapping`.
 
 * `rejectNull` (default): address `0` is `.ub` even for zero bytes. This is a
-  conservative (sound-for-verification) strengthening: it is the pre-relaxation
-  `core::ptr` `ub_checks` contract and is retained so that `.runtimeOptimized`
-  MIR (where `-C debug-assertions=no` strips `core::ptr`'s inline `ub_checks`)
-  is still checked at least as strictly as the documented library contract.
+  conservative (sound-for-verification) strengthening matching Anneal's Rust MIR
+  evaluator (`crates/anneal-mir/src/lower/rvalue.rs:12808`) and pre-relaxation
+  `core::ptr` validity (`library/core/src/ptr/mod.rs:19-21`), retained so that
+  `.runtimeOptimized` MIR (where `-C debug-assertions=no` strips inline
+  `ub_checks`) cannot admit null pointers on zero-byte copies.
 * `allowRawIntrinsicNull`: the raw `lean-miri` `Intrinsics.copyWith` semantics
   (`checkAndDerefPtr` returns `.ok none` for size `0` without resolving the
-  address), which also coincides with Rust 1.98 `ub_checks`
-  (`maybe_is_aligned_and_not_null(ptr, align, is_zst := true)`). -/
+  address), which coincides with Rust 1.98 `core::ptr::copy_nonoverlapping`
+  (`library/core/src/ptr/mod.rs:455-457,542-545`: "or that number must be 0"
+  and `maybe_is_aligned_and_not_null(ptr, align, zero_size)`). -/
 inductive ZeroCountNullPolicy : Type where
   | rejectNull
   | allowRawIntrinsicNull
@@ -126,7 +142,241 @@ def isizeMaxBytes (ptrBytes : Nat) : Nat :=
 def isPowTwoAlign (n : Nat) : Bool :=
   Align.isPowerOfTwoBytes { bytes := n }
 
-/-! ## 2. Pointer views and the policy-parametric decision -/
+/-- Whether `v` has the runtime shape of a well-formed thin pointer of byte
+width `ptrBytes` (`.ptr _ ptrBytes`, or `.scalar ⟨bits, ptrBytes⟩` with
+`bits < 2^(8·ptrBytes)`). -/
+@[reducible]
+def isThinPtrValue (ptrBytes : Nat) : Value → Bool
+  | .ptr _ sz => Nat.beq sz ptrBytes
+  | .scalar sc =>
+    Bool.and (Nat.beq sc.sizeBytes ptrBytes) (Nat.blt sc.bits (scalarModulus ptrBytes))
+  | _ => false
+
+/-! ## 2. Self-contained, target-width-aware & `fieldLayouts`-aware layout helpers
+
+These helpers depend only on `Layout`, `State`, `Bytes`, and `Places` (and
+**not** on `Terminators`), so the exact same definitions drop into both
+`V2026_06_01/MirSemantics/Statements.lean` and
+`V2026_08_01/MirSemantics/Statements.lean` without relocating anything out of
+`V2026_08_01/MirSemantics/Terminators.lean`. They also respect
+`layoutPointerBytes layouts` (32-bit & 64-bit targets) and preserve
+`ptrLayout.fieldLayouts` / `Ty.layoutIdx`. -/
+
+/-- Fuel-bounded list check matching `anyUnsizedRigidTy`. -/
+@[reducible]
+def copyAnyUnsizedRigidTy (pred : RigidTy → Bool) : List RigidTy → Bool
+  | .nil => false
+  | k :: rest =>
+    match pred k with
+    | true => true
+    | false => copyAnyUnsizedRigidTy pred rest
+
+/-- Self-contained unsized-type check (proved equal to `Trusted`'s
+`isUnsizedRigidTy` below; does not depend on `V2026_08_01/Terminators.lean`). -/
+@[reducible]
+def copyIsUnsizedRigidTy : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ fuel', ty =>
+    match ty with
+    | .slice _ => true
+    | .str => true
+    | .dynamic _ => true
+    | .foreign _ => true
+    | .array elemTy _ => copyIsUnsizedRigidTy fuel' elemTy
+    | .tuple ks => copyAnyUnsizedRigidTy (copyIsUnsizedRigidTy fuel') ks
+    | _ => false
+
+/-- Round `bytes` up to a multiple of `alignBytes` (self-contained mirror of
+`roundUpToAlign`). -/
+@[reducible]
+def copyRoundUpToAlign (bytes alignBytes : Nat) : Nat :=
+  match Nat.beq (Nat.mod bytes alignBytes) 0 with
+  | true => bytes
+  | false => Nat.add bytes (Nat.sub alignBytes (Nat.mod bytes alignBytes))
+
+/-- Scan `localDecls` for a sized declaration whose `RigidTy` structurally matches
+`ty` and whose `TypeLayout` has a positive power-of-two alignment. -/
+@[reducible]
+def copyFindDeclLayout?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : RigidTy) :
+    Option TypeLayout :=
+  match copyIsUnsizedRigidTy 8 ty with
+  | true => .none
+  | false =>
+    let rec go : List LocalDecl → Option TypeLayout
+      | .nil => .none
+      | decl :: rest =>
+        match rigidTyEq decl.ty.kind ty with
+        | false => go rest
+        | true =>
+          match LayoutTable.lookup layouts decl.ty.layoutIdx with
+          | .some l => .some l
+          | .none => go rest
+    go localDecls
+
+/-- Fold `(size, align)` over tuple field kinds: returns `(sumOfFieldSizes,
+maxFieldAlign)` or `.none` if any field fails to resolve. -/
+@[reducible]
+def copyTupleFieldsSizeAndAlign
+    (recKind : RigidTy → Option (Nat × Nat)) :
+    List RigidTy → Option (Nat × Nat)
+  | .nil => .some (0, 1)
+  | k :: rest =>
+    match recKind k, copyTupleFieldsSizeAndAlign recKind rest with
+    | .some (sz, al), .some (restSz, restAl) =>
+      let maxAl :=
+        match Nat.ble al restAl with
+        | true => restAl
+        | false => al
+      .some (Nat.add sz restSz, maxAl)
+    | _, _ => .none
+
+/-- Extract validated `(size, align)` from a `TypeLayout`, rejecting
+non-power-of-two alignments (including `0`). -/
+@[reducible]
+def validatedLayoutSizeAlign? (l : TypeLayout) : Option (Nat × Nat) :=
+  match isPowTwoAlign l.align.bytes with
+  | true => .some (l.size.bytes, l.align.bytes)
+  | false => .none
+
+/-- Target-pointer-width-aware `(elemSize, elemAlign)` resolution for a sized
+`RigidTy`. Unlike `intrinsicRigidTy{ByteSize,Align}`, pointer-width-dependent
+types (`usize`, `isize`, `*const T`, `*mut T`, `&T`, `&mut T`, `fn(...)`) use
+`ptrBytes := layoutPointerBytes layouts` (4 on 32-bit, 8 on 64-bit), and wide
+pointers to `[T]` / `str` / `dyn Trait` have size `2 * ptrBytes` and align
+`ptrBytes`. -/
+@[reducible]
+def copyRigidTySizeAndAlignAux
+    (ptrBytes : Nat) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    Nat → RigidTy → Option (Nat × Nat)
+  | .zero, _ => .none
+  | .succ fuel', ty =>
+    match copyIsUnsizedRigidTy 8 ty with
+    | true => .none
+    | false =>
+      match ty with
+      | .bool => .some (1, 1)
+      | .char => .some (4, 4)
+      | .never => .some (0, 1)
+      | .fnDef _ _ => .some (0, 1)
+      | .tuple .nil => .some (0, 1)
+      | .uint .u8 | .int .i8 => .some (1, 1)
+      | .uint .u16 | .int .i16 | .float .f16 => .some (2, 2)
+      | .uint .u32 | .int .i32 | .float .f32 => .some (4, 4)
+      | .uint .u64 | .int .i64 | .float .f64 => .some (8, 8)
+      | .uint .u128 | .int .i128 | .float .f128 => .some (16, 16)
+      | .uint .usize | .int .isize | .fnPtr _ _ _ _ =>
+        match isPowTwoAlign ptrBytes with
+        | true => .some (ptrBytes, ptrBytes)
+        | false => .none
+      | .rawPtr _ pt | .ref _ pt =>
+        match copyFindDeclLayout? localDecls layouts ty with
+        | .some l => validatedLayoutSizeAlign? l
+        | .none =>
+          match isPowTwoAlign ptrBytes with
+          | false => .none
+          | true =>
+            match pt with
+            | .slice _ | .str | .dynamic _ => .some (Nat.mul 2 ptrBytes, ptrBytes)
+            | _ => .some (ptrBytes, ptrBytes)
+      | .array elemKind n =>
+        match copyFindDeclLayout? localDecls layouts elemKind with
+        | .some l =>
+          match validatedLayoutSizeAlign? l with
+          | .some (eSz, eAl) => .some (Nat.mul eSz n, eAl)
+          | .none => .none
+        | .none =>
+          match copyFindDeclLayout? localDecls layouts ty with
+          | .some l => validatedLayoutSizeAlign? l
+          | .none =>
+            match copyRigidTySizeAndAlignAux ptrBytes localDecls layouts fuel' elemKind with
+            | .some (eSz, eAl) => .some (Nat.mul eSz n, eAl)
+            | .none => .none
+      | .tuple ks =>
+        match copyFindDeclLayout? localDecls layouts ty with
+        | .some l => validatedLayoutSizeAlign? l
+        | .none =>
+          match copyTupleFieldsSizeAndAlign
+              (copyRigidTySizeAndAlignAux ptrBytes localDecls layouts fuel') ks with
+          | .some (rawSz, maxAl) =>
+            match isPowTwoAlign maxAl with
+            | true => .some (copyRoundUpToAlign rawSz maxAl, maxAl)
+            | false => .none
+          | .none => .none
+      | _ =>
+        match copyFindDeclLayout? localDecls layouts ty with
+        | .some l => validatedLayoutSizeAlign? l
+        | .none => .none
+
+/-- Whether `l : TypeLayout` can be trusted directly from `ty.layoutIdx` (when
+`ty.layoutIdx` is non-zero and in bounds of `layouts`, avoiding synthetic
+`layoutIdx := 0` aliasing `entries[0]`). -/
+@[reducible]
+def directTyLayout? (layouts : LayoutTable) (ty : Ty) : Option TypeLayout :=
+  match isUnresolvedLayoutIdx layouts ty.layoutIdx with
+  | true => .none
+  | false =>
+    match LayoutTable.lookup layouts ty.layoutIdx with
+    | .none => .none
+    | .some l =>
+      let ok : Bool :=
+        match ty.kind with
+        | .adt _ _ | .closure _ _ => layoutValidForResolvedAdt ty.layoutIdx l
+        | .tuple ks => layoutMatchesAggregateVariant l 0 (length ks)
+        | .array _ n =>
+          match l.fields with
+          | .array _ count => Nat.beq count n
+          | _ => false
+        | _ =>
+          match l.fields with
+          | .primitive => true
+          | _ => false
+      match ok with
+      | true => .some l
+      | false => .none
+
+/-- Resolve validated `(sizeBytes, alignBytes)` for a `Ty` (with optional
+authoritative `TypeLayout` extracted directly from `ptrLayout.fieldLayouts`):
+1. Unsized types always return `.none` (caller classifies unsized as `.ub`).
+2. An authoritative `authLayoutOpt` (from `ptrLayout.fieldLayouts`) is used
+   directly, validating `isPowTwoAlign` — resolving pointer-only ADT parameters
+   even when no local has type `T` and even when `ptLayoutIdx = 0`.
+3. A validated non-zero `ty.layoutIdx` (`directTyLayout?`) is used next, so
+   nested struct fields resolved by `placeTyResolved` also retain their layout.
+4. Otherwise falls back to target-pointer-width-aware
+   `copyRigidTySizeAndAlignAux (layoutPointerBytes layouts) localDecls layouts 8`. -/
+def copyTySizeAndAlign?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty)
+    (authLayoutOpt : Option TypeLayout := .none) :
+    Option (Nat × Nat) :=
+  match copyIsUnsizedRigidTy 8 ty.kind with
+  | true => .none
+  | false =>
+    match authLayoutOpt with
+    | .some l => validatedLayoutSizeAlign? l
+    | .none =>
+      match directTyLayout? layouts ty with
+      | .some l => validatedLayoutSizeAlign? l
+      | .none =>
+        copyRigidTySizeAndAlignAux (layoutPointerBytes layouts) localDecls layouts 8 ty.kind
+
+/-- Resolve the validated ABI alignment of `ty` (preserving `ty.layoutIdx` and
+target pointer width). -/
+@[reducible]
+def copyTyAlign?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty) :
+    Option Nat :=
+  match copyTySizeAndAlign? localDecls layouts ty with
+  | .some (_, al) => .some al
+  | .none => .none
+
+/-! ## 3. Pointer views and the policy-parametric decision -/
 
 /-- Abstract view of one `copy_nonoverlapping` pointer operand on the zero-byte
 fragment. -/
@@ -135,11 +385,11 @@ inductive ZeroPtrView : Type where
       wrong-width or out-of-range `.scalar`, wrong-width `.ptr`): `.ub`. -/
   | malformed
   /-- Provenance pointer whose canonical address is unresolvable
-      (`ptrAddress? = none`): fail closed. -/
+      (`borrowPlaceByteOffset? = none` or dead projected borrow): fail closed. -/
   | unresolvedAddr
   /-- Canonical address `addr` with alignment knowledge `aligned`:
       `some true` (aligned), `some false` (misaligned), `none` (unknown, e.g.
-      under-aligned backing allocation). -/
+      under-aligned backing allocation or dead allocation with `elemAlign > 1`). -/
   | resolved (addr : Nat) (aligned : Option Bool)
   deriving DecidableEq, Repr
 
@@ -161,62 +411,95 @@ def ZeroPtrView.decide (policy : ZeroCountNullPolicy) (ptrBytes : Nat) :
       | .none => .unsupported
 
 /-- Alignment knowledge for a provenance pointer `p` whose tag resolves to the
-stack `BorrowEntry` `entry` (mirrors `Terminators.writeBytesAction:3823-3845`):
+stack `BorrowEntry` `entry` at resolved sub-place offset `placeOff` (mirrors
+`Terminators.writeBytesAction:3823-3845`, hardened in B1):
 
 1. `elemAlign ≤ 1`: trivially aligned.
-2. Resolve the target frame's `(localDecls, layouts)` at
-   `entry.targetFrameDepth` (`frameLocalDeclsAndLayoutsAtDepth`: active frame
-   or saved caller frame); a returned frame, missing root decl, unresolved place
-   type, or unresolved place alignment is unknown (`none`).
-3. The backing place's alignment must be a non-zero multiple of `elemAlign`
-   (else unknown: the canonical `65536`-byte virtual page base of
-   `borrowBaseAddress?` is a modelling artifact, not a real alignment
-   guarantee, so `&raw mut u8_local as *mut u64` must not pass).
-4. Otherwise aligned iff `p.offsetBytes % elemAlign = 0` and
-   `checkTargetPlaceAlignWalk` accepts (catches misaligned `#[repr(packed)]`
-   fields). -/
+2. `entry.allocDead = true`: fail closed (`none`) so a dead borrow from a
+   returned callee can never accidentally read the `LocalDecl` of a different
+   function that later reuses `entry.targetFrameDepth`!
+3. Resolve the target frame's `(decls, lays)` at `entry.targetFrameDepth`
+   (`frameLocalDeclsAndLayoutsAtDepth`: active frame or saved caller frame),
+   `rootDecl`, and `placeTy` (`placeTyResolved`).
+4. Resolve `placeAlign := copyTyAlign? decls lays placeTy` (preserving
+   `placeTy.layoutIdx` and target pointer width). If `placeAlign` is unknown or
+   not a nonzero multiple of `elemAlign`, return `none` (`.unsupported`: the
+   canonical `65536`-byte virtual page base is not a real alignment guarantee,
+   so `&raw mut u8_local as *mut u64` must not pass).
+5. Resolve `rootAlign := copyTyAlign? decls lays rootDecl.ty`:
+   - unknown `rootAlign` → fail closed `none` (never assume aligned when root
+     container alignment is unknown);
+   - `rootAlign` not a multiple of `elemAlign` (e.g. a `u64` field inside a
+     `#[repr(packed)]` struct of align `1`) → `some false` (`.ub`);
+   - otherwise aligned iff `(placeOff + p.offsetBytes) % elemAlign = 0` (catches
+     `.downcast` offsets and works above the `65536`-byte virtual page size for
+     `#[repr(align(131072))]`), `p.offsetBytes % elemAlign = 0`, and
+     `checkTargetPlaceAlignWalk` (passed the real `rootValOpt`) accepts. -/
 def stackBorrowAlignKnown
     (s : MachineState)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (elemAlign : Nat)
     (p : ProvenancePtr)
-    (entry : BorrowEntry) :
+    (entry : BorrowEntry)
+    (placeOff : Nat) :
     Option Bool :=
   match Nat.ble elemAlign 1 with
   | true => .some true
   | false =>
-    match
-      frameLocalDeclsAndLayoutsAtDepth s.memory.callStack localDecls layouts
-        entry.targetFrameDepth
-    with
-    | .none => .none
-    | .some (decls, lays) =>
-      match get? decls entry.targetLocal with
+    match entry.allocDead with
+    | true => .none
+    | false =>
+      match
+        frameLocalDeclsAndLayoutsAtDepth s.memory.callStack localDecls layouts
+          entry.targetFrameDepth
+      with
       | .none => .none
-      | .some rootDecl =>
-        match
-          placeTyResolved decls lays
-            { local_ := entry.targetLocal, projection := entry.targetProjection }
-        with
+      | .some (decls, lays) =>
+        match get? decls entry.targetLocal with
         | .none => .none
-        | .some placeTy =>
-          match intrinsicRigidTyAlign decls lays placeTy.kind with
+        | .some rootDecl =>
+          match
+            placeTyResolved decls lays
+              { local_ := entry.targetLocal, projection := entry.targetProjection }
+          with
           | .none => .none
-          | .some placeAlign =>
-            match
-              Bool.and (Bool.not (Nat.beq placeAlign 0))
-                (Nat.beq (Nat.mod placeAlign elemAlign) 0)
-            with
-            | false => .none
-            | true =>
-              .some
-                (Bool.and (Nat.beq (Nat.mod p.offsetBytes elemAlign) 0)
-                  (checkTargetPlaceAlignWalk decls lays elemAlign p.offsetBytes
-                    (.some rootDecl.ty) .none .none entry.targetProjection))
+          | .some placeTy =>
+            match copyTyAlign? decls lays placeTy with
+            | .none => .none
+            | .some placeAlign =>
+              match
+                Bool.and (Bool.not (Nat.beq placeAlign 0))
+                  (Nat.beq (Nat.mod placeAlign elemAlign) 0)
+              with
+              | false => .none
+              | true =>
+                match copyTyAlign? decls lays rootDecl.ty with
+                | .none => .none
+                | .some rootAlign =>
+                  match
+                    Bool.and (Bool.not (Nat.beq rootAlign 0))
+                      (Nat.beq (Nat.mod rootAlign elemAlign) 0)
+                  with
+                  | false => .some false
+                  | true =>
+                    let rootValOpt : Option Value :=
+                      match
+                        readFrameLocalSlot s.frame.locals s.memory.callStack
+                          s.memory.callerLocals entry.targetFrameDepth entry.targetLocal
+                      with
+                      | .some (.init v) => .some v
+                      | _ => .none
+                    .some
+                      (Bool.and
+                        (Nat.beq (Nat.mod (Nat.add placeOff p.offsetBytes) elemAlign) 0)
+                        (Bool.and (Nat.beq (Nat.mod p.offsetBytes elemAlign) 0)
+                          (checkTargetPlaceAlignWalk decls lays elemAlign p.offsetBytes
+                            (.some rootDecl.ty) rootValOpt .none entry.targetProjection)))
 
 /-- Alignment knowledge for a provenance pointer into the global allocation
-`g`: the base is only guaranteed `g.align.bytes`-aligned. -/
+`g`: the base is guaranteed `g.align.bytes`-aligned only when `g.align.bytes`
+is a valid power of two and a multiple of `elemAlign`. -/
 @[reducible]
 def globalAllocAlignKnown (g : CapturedAllocation) (elemAlign : Nat) (p : ProvenancePtr) :
     Option Bool :=
@@ -224,7 +507,7 @@ def globalAllocAlignKnown (g : CapturedAllocation) (elemAlign : Nat) (p : Proven
   | true => .some true
   | false =>
     match
-      Bool.and (Bool.not (Nat.beq g.align.bytes 0))
+      Bool.and (isPowTwoAlign g.align.bytes)
         (Nat.beq (Nat.mod g.align.bytes elemAlign) 0)
     with
     | false => .none
@@ -263,18 +546,30 @@ def zeroPtrView
     | true =>
       match lookupBorrow s.memory.borrows p.tag with
       | .some entry =>
-        match
-          ptrAddress? s.frame.locals s.memory.borrows s.memory.callerLocals localDecls layouts
-            ptrBytes p s.memory.callStack
-        with
+        let placeOffOpt : Option Nat :=
+          match entry.allocDead with
+          | true =>
+            match normalizeSubsliceProjections
+                (stripTransparentProjections entry.targetProjection) with
+            | .nil => .some 0
+            | _ :: _ => .none
+          | false =>
+            borrowPlaceByteOffset? s.frame.locals s.memory.callerLocals localDecls layouts entry
+              s.memory.callStack
+        match placeOffOpt with
         | .none => .unresolvedAddr
-        | .some addr =>
-          .resolved addr (stackBorrowAlignKnown s localDecls layouts elemAlign p entry)
+        | .some placeOff =>
+          let localPage := Nat.add (stackLocalAddrPageBase ptrBytes) entry.targetLocal
+          let addr := Nat.add (Nat.add (Nat.mul localPage 65536) placeOff) p.offsetBytes
+          .resolved addr (stackBorrowAlignKnown s localDecls layouts elemAlign p entry placeOff)
       | .none =>
         let addr := Nat.add (Nat.mul p.allocId 65536) p.offsetBytes
         match lookupGlobalAlloc s.memory.globals p.allocId with
         | .some g => .resolved addr (globalAllocAlignKnown g elemAlign p)
-        | .none => .resolved addr (unbackedAlignKnown elemAlign p)
+        | .none =>
+          match lookupFnPtr s.memory.fnPtrs p.allocId with
+          | .some _ => .resolved addr (unbackedAlignKnown elemAlign p)
+          | .none => .resolved addr (unbackedAlignKnown elemAlign p)
   | .unit => .malformed
   | .aggregate _ _ => .malformed
   | .uninit => .malformed
@@ -305,7 +600,48 @@ def zeroByteCopyPrecheck
     (checkZeroCountCopyPtr policy s localDecls layouts elemAlign srcVal)
     (checkZeroCountCopyPtr policy s localDecls layouts elemAlign dstVal)
 
-/-! ## 3. Element layout resolution -/
+/-! ## 4. Element layout resolution -/
+
+/-- Outcome of classifying a single pointer operand's static type:
+* `unknown`: no static type available (e.g. missing `localDecls`);
+* `nonPtr`: statically known to be a non-pointer type (e.g. `u32`, `u64`, `bool`);
+* `pointee ty authLayoutOpt`: pointer/ref operand with pointee `ty` and optional
+  authoritative `TypeLayout` from `ptrLayout.fieldLayouts`. -/
+inductive OperandPointeeLookup : Type where
+  | unknown
+  | nonPtr
+  | pointee (ty : Ty) (authLayoutOpt : Option TypeLayout)
+
+/-- Classify a `copy_nonoverlapping` pointer operand, retaining any
+authoritative `TypeLayout` recorded in `ptrLayout.fieldLayouts` (even when
+`ptLayoutIdx = 0` and no local has the pointee type). -/
+@[reducible]
+def operandPointeeLookup
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (op : Operand) :
+    OperandPointeeLookup :=
+  match operandTy localDecls layouts op with
+  | .none => .unknown
+  | .some ptrTy =>
+    match pointeeTyOf ptrTy with
+    | .none => .nonPtr
+    | .some pt =>
+      match LayoutTable.lookup layouts ptrTy.layoutIdx with
+      | .some ptrLayout =>
+        let isPtrRepr :=
+          match ptrLayout.backendRepr with
+          | .scalar (.initialized (.pointer _) _) => true
+          | .scalar (.union (.pointer _)) => true
+          | .scalarPair (.initialized (.pointer _) _) _ => true
+          | .scalarPair (.union (.pointer _)) _ => true
+          | _ => false
+        match isPtrRepr, ptrLayout.fieldLayouts with
+        | true, ptLayoutIdx :: .nil =>
+          .pointee { kind := pt.kind, layoutIdx := ptLayoutIdx }
+            (LayoutTable.lookup layouts ptLayoutIdx)
+        | _, _ => .pointee pt .none
+      | .none => .pointee pt .none
 
 /-- Outcome of resolving the common pointee `T` of a `copy_nonoverlapping`. -/
 inductive CopyElemLayout : Type where
@@ -314,70 +650,79 @@ inductive CopyElemLayout : Type where
   | unsupported
   deriving DecidableEq, Repr
 
-/-- Whether the two statically known pointee types cannot be confirmed to be a
-common `T`: they disagree on (`tyByteSize`-based) size, or they are not
-structurally equal (`rigidTyEq`) and disagree on intrinsic size/alignment or
-either side's intrinsic size/alignment is unresolved. Structurally equal
-pointees never conflict on their own (so an unsized `[u8]` / `[u8]` pair still
-reaches the `.ub` unsized check). Prevents synthetic MIR `*const u8 → *mut u64` from
-bypassing `dst`'s alignment requirement. -/
+/-- Resolve one pointee `(ty, authLayoutOpt)` into `CopyElemLayout`:
+unsized pointees are `.ub`, resolved sized pointees with power-of-two alignment
+are `.ok elemSize elemAlign`, and everything else fails closed `.unsupported`. -/
 @[reducible]
-def copyPointeeLayoutsConflict
+def resolveSinglePointeeLayout
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (srcPtOpt dstPtOpt : Option Ty) :
-    Bool :=
-  match srcPtOpt, dstPtOpt with
-  | .some sp, .some dp =>
-    match rigidTyEq sp.kind dp.kind, copyPointeeSizesConflict localDecls layouts srcPtOpt dstPtOpt with
-    | true, false => false
-    | _, true => true
-    | false, false =>
-      match
-        intrinsicRigidTyByteSize localDecls layouts sp.kind,
-        intrinsicRigidTyByteSize localDecls layouts dp.kind,
-        intrinsicRigidTyAlign localDecls layouts sp.kind,
-        intrinsicRigidTyAlign localDecls layouts dp.kind
-      with
-      | .some a, .some b, .some c, .some d =>
-        Bool.not (Bool.and (Nat.beq a b) (Nat.beq c d))
-      | _, _, _, _ => true
-  | _, _ => false
+    (ty : Ty)
+    (authLayoutOpt : Option TypeLayout) :
+    CopyElemLayout :=
+  match copyIsUnsizedRigidTy 8 ty.kind with
+  | true => .ub
+  | false =>
+    match copyTySizeAndAlign? localDecls layouts ty authLayoutOpt with
+    | .some (elemSize, elemAlign) =>
+      match isPowTwoAlign elemAlign with
+      | true => .ok elemSize elemAlign
+      | false => .unsupported
+    | .none => .unsupported
 
-/-- Resolve `(elemSize, elemAlign)` for `copy_nonoverlapping::<T>(src, dst, _)`.
-Unresolved size/alignment or a non-power-of-two alignment (incl. `0`) is `.ub`
-for an unsized `T` (as `Terminators.writeBytesAction:3880`) and `.unsupported`
-otherwise (corner case 6). -/
+/-- Resolve `(elemSize, elemAlign)` for `copy_nonoverlapping::<T>(src, dst, _)`:
+* statically non-pointer `src` or `dst` → `.ub` (catches `bdCopyZeroScalars` and
+  `copy_nonoverlapping(ptr, 8_u64, 0)` even with `localDecls = []`);
+* both operands have pointees:
+  - if `copyPointeeSizesConflict` → `.unsupported`;
+  - if both are unsized and `rigidTyEq` → `.ub`;
+  - if `rigidTyEq`: resolve both; if one side has an authoritative layout and
+    they disagree → `.unsupported`, else return the resolved layout;
+  - if not `rigidTyEq`: require both to resolve to `.ok` with equal
+    `(elemSize, elemAlign)`, else `.unsupported`;
+* one operand known, one `.unknown` (missing decl) → resolve the known one;
+* both `.unknown` → `.unsupported`. -/
 def resolveCopyElemLayout
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (src dst : Operand) :
     CopyElemLayout :=
-  let srcPtOpt := operandPointeeTy localDecls layouts src
-  let dstPtOpt := operandPointeeTy localDecls layouts dst
-  match copyPointeeLayoutsConflict localDecls layouts srcPtOpt dstPtOpt with
-  | true => .unsupported
-  | false =>
-    match copyEffectivePointee? srcPtOpt dstPtOpt with
-    | .none => .unsupported
-    | .some elemTy =>
-      match
-        intrinsicRigidTyByteSize localDecls layouts elemTy.kind,
-        intrinsicRigidTyAlign localDecls layouts elemTy.kind
-      with
-      | .some elemSize, .some elemAlign =>
-        match isPowTwoAlign elemAlign with
-        | true => .ok elemSize elemAlign
-        | false =>
-          match isUnsizedRigidTy 8 elemTy.kind with
-          | true => .ub
+  match operandPointeeLookup localDecls layouts src, operandPointeeLookup localDecls layouts dst with
+  | .nonPtr, _ => .ub
+  | _, .nonPtr => .ub
+  | .unknown, .unknown => .unsupported
+  | .pointee sp sAuth, .unknown => resolveSinglePointeeLayout localDecls layouts sp sAuth
+  | .unknown, .pointee dp dAuth => resolveSinglePointeeLayout localDecls layouts dp dAuth
+  | .pointee sp sAuth, .pointee dp dAuth =>
+    match copyPointeeSizesConflict localDecls layouts (.some sp) (.some dp) with
+    | true => .unsupported
+    | false =>
+      match rigidTyEq sp.kind dp.kind with
+      | true =>
+        let rS := resolveSinglePointeeLayout localDecls layouts sp sAuth
+        let rD := resolveSinglePointeeLayout localDecls layouts dp dAuth
+        match rS, rD with
+        | .ok sSz sAl, .ok dSz dAl =>
+          match Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) with
+          | true => .ok sSz sAl
           | false => .unsupported
-      | _, _ =>
-        match isUnsizedRigidTy 8 elemTy.kind with
-        | true => .ub
-        | false => .unsupported
+        | .ok sSz sAl, .unsupported => .ok sSz sAl
+        | .unsupported, .ok dSz dAl => .ok dSz dAl
+        | .ub, _ => .ub
+        | _, .ub => .ub
+        | .unsupported, .unsupported => .unsupported
+      | false =>
+        match
+          resolveSinglePointeeLayout localDecls layouts sp sAuth,
+          resolveSinglePointeeLayout localDecls layouts dp dAuth
+        with
+        | .ok sSz sAl, .ok dSz dAl =>
+          match Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) with
+          | true => .ok sSz sAl
+          | false => .unsupported
+        | _, _ => .unsupported
 
-/-! ## 4. Prototype evaluators -/
+/-! ## 5. Prototype evaluators -/
 
 /-- Zero-byte `copy_nonoverlapping` (after layout resolution and the overflow
 check): validate both pointers and, on success, step as a pure no-op. -/
@@ -405,9 +750,10 @@ def evalCopyNonOverlappingWithCountProto
     (countBits : Nat)
     (locals₃ : List LocalSlot) :
     MirStepNode :=
+  let ptrBytes := layoutPointerBytes layouts
   match resolveCopyElemLayout localDecls layouts src dst with
   | .ok elemSize elemAlign =>
-    match Nat.ble (Nat.mul countBits elemSize) (isizeMaxBytes (layoutPointerBytes layouts)) with
+    match Nat.ble (Nat.mul countBits elemSize) (isizeMaxBytes ptrBytes) with
     | false => MirStepNode.fail .ub
     | true =>
       match Nat.beq (Nat.mul countBits elemSize) 0 with
@@ -417,14 +763,13 @@ def evalCopyNonOverlappingWithCountProto
       | false =>
         evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
           locals₃
-  | .ub =>
-    match Nat.beq countBits 0 with
-    | true => MirStepNode.fail .ub
-    | false =>
-      evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits locals₃
+  | .ub => MirStepNode.fail .ub
   | .unsupported =>
     match Nat.beq countBits 0 with
-    | true => MirStepNode.unsupported
+    | true =>
+      match Bool.and (isThinPtrValue ptrBytes srcVal) (isThinPtrValue ptrBytes dstVal) with
+      | false => MirStepNode.fail .ub
+      | true => MirStepNode.unsupported
     | false =>
       evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits locals₃
 
@@ -539,7 +884,7 @@ def stepMirFnProto (policy : ZeroCountNullPolicy) (body : CapturedMir) (s : Mach
     evalCopyNonOverlappingProto policy s src dst count cb.localDecls cb.layouts
   | none => stepMirFn body s
 
-/-! ## 5. Structural theorems (blast radius) -/
+/-! ## 6. Structural theorems (blast radius, helper invariants, address exactness) -/
 
 theorem ble_true_of_le {a b : Nat} (h : a ≤ b) : Nat.ble a b = true :=
   Nat.ble_eq_true_of_le h
@@ -572,6 +917,143 @@ theorem step_inj {s s' : MachineState} (h : MirStepNode.step s = MirStepNode.ste
   simp only [MirStepNode.step] at h
   injection h with h1
   injection h1
+
+/-- Our self-contained `copyIsUnsizedRigidTy` agrees everywhere with `Trusted`'s
+`isUnsizedRigidTy` (while avoiding any dependency on `V2026_08_01/Terminators.lean`). -/
+theorem copyAnyUnsizedRigidTy_eq {p q : RigidTy → Bool} (h : ∀ k, p k = q k) :
+    ∀ ks, copyAnyUnsizedRigidTy p ks = anyUnsizedRigidTy q ks
+  | .nil => rfl
+  | k :: rest => by
+    unfold copyAnyUnsizedRigidTy anyUnsizedRigidTy
+    rw [h k]
+    cases q k with
+    | true => rfl
+    | false => exact copyAnyUnsizedRigidTy_eq h rest
+
+theorem copyIsUnsizedRigidTy_eq :
+    ∀ (fuel : Nat) (ty : RigidTy), copyIsUnsizedRigidTy fuel ty = isUnsizedRigidTy fuel ty
+  | .zero, _ => rfl
+  | .succ fuel', ty => by
+    cases ty with
+    | array elem _ => exact copyIsUnsizedRigidTy_eq fuel' elem
+    | tuple ks => exact copyAnyUnsizedRigidTy_eq (copyIsUnsizedRigidTy_eq fuel') ks
+    | _ => rfl
+
+/-- Any positive power of two satisfies `1 ≤ n`. -/
+theorem isPowTwoAlign_pos {n : Nat} (h : isPowTwoAlign n = true) : 1 ≤ n := by
+  cases n with
+  | zero => cases h
+  | succ k => exact Nat.succ_le_succ (Nat.zero_le k)
+
+private theorem resolveSinglePointeeLayout_align_pow2
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Ty)
+    (authLayoutOpt : Option TypeLayout) (elemSize elemAlign : Nat)
+    (h : resolveSinglePointeeLayout localDecls layouts ty authLayoutOpt =
+      .ok elemSize elemAlign) :
+    isPowTwoAlign elemAlign = true ∧ 1 ≤ elemAlign := by
+  unfold resolveSinglePointeeLayout at h
+  cases hu : copyIsUnsizedRigidTy 8 ty.kind <;> rw [hu] at h
+  · dsimp only at h
+    cases hs : copyTySizeAndAlign? localDecls layouts ty authLayoutOpt with
+    | none => rw [hs] at h; cases h
+    | some pair =>
+      rcases pair with ⟨sz, al⟩
+      rw [hs] at h
+      dsimp only at h
+      cases hp : isPowTwoAlign al <;> rw [hp] at h
+      · cases h
+      · cases h
+        exact ⟨hp, isPowTwoAlign_pos hp⟩
+  · cases h
+
+/-- Whenever `resolveCopyElemLayout` succeeds with `.ok elemSize elemAlign`,
+`elemAlign` is a valid positive power of two (`1 ≤ elemAlign`, so `Nat.mod _ elemAlign`
+is never a degenerate mod-0). -/
+theorem resolveCopyElemLayout_align_pow2
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (src dst : Operand)
+    (elemSize elemAlign : Nat)
+    (h : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign) :
+    isPowTwoAlign elemAlign = true ∧ 1 ≤ elemAlign := by
+  unfold resolveCopyElemLayout at h
+  cases hS : operandPointeeLookup localDecls layouts src <;>
+    cases hD : operandPointeeLookup localDecls layouts dst <;>
+    rw [hS, hD] at h <;> dsimp only at h
+  · cases h
+  · cases h
+  · exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ h
+  · cases h
+  · cases h
+  · cases h
+  · exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ h
+  · cases h
+  · rename_i sp sAuth dp dAuth
+    cases hc : copyPointeeSizesConflict localDecls layouts (.some sp) (.some dp) <;>
+      rw [hc] at h <;> dsimp only at h
+    · cases heq : rigidTyEq sp.kind dp.kind <;> rw [heq] at h <;> dsimp only at h
+      · cases hRS : resolveSinglePointeeLayout localDecls layouts sp sAuth with
+        | ub => rw [hRS] at h; cases h
+        | unsupported => rw [hRS] at h; cases h
+        | ok sSz sAl =>
+          cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
+          | ub => rw [hRS, hRD] at h; cases h
+          | unsupported => rw [hRS, hRD] at h; cases h
+          | ok dSz dAl =>
+            rw [hRS, hRD] at h; dsimp only at h
+            cases hEq : Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) <;> rw [hEq] at h
+            · cases h
+            · cases h
+              exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRS
+      · cases hRS : resolveSinglePointeeLayout localDecls layouts sp sAuth with
+        | ub => rw [hRS] at h; cases h
+        | unsupported =>
+          cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
+          | ub => rw [hRS, hRD] at h; cases h
+          | unsupported => rw [hRS, hRD] at h; cases h
+          | ok dSz dAl =>
+            rw [hRS, hRD] at h; cases h
+            exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRD
+        | ok sSz sAl =>
+          cases hRD : resolveSinglePointeeLayout localDecls layouts dp dAuth with
+          | ub => rw [hRS, hRD] at h; cases h
+          | unsupported =>
+            rw [hRS, hRD] at h; cases h
+            exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRS
+          | ok dSz dAl =>
+            rw [hRS, hRD] at h; dsimp only at h
+            cases hEq : Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) <;> rw [hEq] at h
+            · cases h
+            · cases h
+              exact resolveSinglePointeeLayout_align_pow2 _ _ _ _ _ _ hRS
+    · cases h
+
+/-- For a live stack borrow (`entry.allocDead = false`), the canonical address
+recorded in `zeroPtrView` agrees identically with `Trusted`'s `ptrAddress?`. -/
+theorem zeroPtrView_stack_live_addr_eq_ptrAddress?
+    (s : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (elemAlign : Nat) (p : ProvenancePtr) (entry : BorrowEntry)
+    (hlookup : lookupBorrow s.memory.borrows p.tag = .some entry)
+    (hlive : entry.allocDead = false) :
+    match
+      ptrAddress? s.frame.locals s.memory.borrows s.memory.callerLocals localDecls layouts
+        (layoutPointerBytes layouts) p s.memory.callStack
+    with
+    | .none =>
+      zeroPtrView s localDecls layouts elemAlign (.ptr p (layoutPointerBytes layouts)) =
+        .unresolvedAddr
+    | .some addr =>
+      ∃ aligned,
+        zeroPtrView s localDecls layouts elemAlign (.ptr p (layoutPointerBytes layouts)) =
+          .resolved addr aligned := by
+  unfold ptrAddress? borrowBaseAddress? zeroPtrView
+  dsimp only
+  rw [hlookup, Nat.beq_refl]
+  dsimp only
+  rw [hlive]
+  dsimp only
+  cases hOff : borrowPlaceByteOffset? s.frame.locals s.memory.callerLocals localDecls layouts entry
+      s.memory.callStack with
+  | none => rfl
+  | some placeOff => exact ⟨_, rfl⟩
 
 /-- `evalStmtProto` coincides with `evalStmt` on every non-`copy_nonoverlapping`
 statement. -/
@@ -649,24 +1131,23 @@ theorem evalCopyNonOverlappingWithCountProto_nonzero
   dsimp only
   rw [hfit', hnz']
 
-/-- Non-zero-count copies whose layout does not resolve are delegated unchanged
-to the legacy evaluator. -/
+/-- Non-zero-count copies whose layout is `.unsupported` are delegated unchanged
+to the legacy evaluator (preserving e.g. `L5_ControlAndCalls` sub-case (d) and
+`UnsafeObligations.evalCopyNonOverlapping_one_of_obligations`). -/
 theorem evalCopyNonOverlappingWithCountProto_unresolved_nonzero_count
     (policy : ZeroCountNullPolicy) (s : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
     (countBits : Nat) (locals₃ : List LocalSlot)
-    (hl : ∀ a b, resolveCopyElemLayout localDecls layouts src dst ≠ .ok a b)
+    (hl : resolveCopyElemLayout localDecls layouts src dst = .unsupported)
     (hc : countBits ≠ 0) :
     evalCopyNonOverlappingWithCountProto policy s src dst localDecls layouts srcVal dstVal
         countBits locals₃ =
       evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
         locals₃ := by
   unfold evalCopyNonOverlappingWithCountProto
-  split
-  · rename_i a b heq
-    exact absurd heq (hl a b)
-  · rw [beq_false_of_ne hc]
-  · rw [beq_false_of_ne hc]
+  rw [hl]
+  dsimp only
+  rw [beq_false_of_ne hc]
 
 /-- The zero-byte fragment (`count * elemSize = 0`) is exactly the precheck
 followed by a pure no-op step. -/
@@ -686,21 +1167,43 @@ theorem evalCopyNonOverlappingWithCountProto_zero
   dsimp only
   rw [hz', ble_true_of_le (Nat.zero_le _)]
 
-/-- Unresolved / unsized pointee on a zero-count copy fails closed. -/
+/-- Unresolved / unsized / non-pointer pointees on a zero-count copy fail closed
+(and malformed pointer values still fault `.ub` even when the pointee layout is
+`.unsupported`). -/
 theorem evalCopyNonOverlappingWithCountProto_zero_count_unresolved
     (policy : ZeroCountNullPolicy) (s : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
     (locals₃ : List LocalSlot) :
     (resolveCopyElemLayout localDecls layouts src dst = .unsupported →
+      isThinPtrValue (layoutPointerBytes layouts) srcVal = true →
+      isThinPtrValue (layoutPointerBytes layouts) dstVal = true →
       evalCopyNonOverlappingWithCountProto policy s src dst localDecls layouts srcVal dstVal 0
         locals₃ = MirStepNode.unsupported) ∧
-    (resolveCopyElemLayout localDecls layouts src dst = .ub →
+    (resolveCopyElemLayout localDecls layouts src dst = .unsupported →
+      (isThinPtrValue (layoutPointerBytes layouts) srcVal = false ∨
+        isThinPtrValue (layoutPointerBytes layouts) dstVal = false) →
       evalCopyNonOverlappingWithCountProto policy s src dst localDecls layouts srcVal dstVal 0
-        locals₃ = MirStepNode.fail .ub) := by
-  refine ⟨fun hl => ?_, fun hl => ?_⟩ <;>
-    (unfold evalCopyNonOverlappingWithCountProto; rw [hl])
+        locals₃ = MirStepNode.fail .ub) ∧
+    (resolveCopyElemLayout localDecls layouts src dst = .ub →
+      ∀ countBits,
+      evalCopyNonOverlappingWithCountProto policy s src dst localDecls layouts srcVal dstVal
+        countBits locals₃ = MirStepNode.fail .ub) := by
+  refine ⟨fun hl hs hd => ?_, fun hl hbad => ?_, fun hl countBits => ?_⟩
+  · unfold evalCopyNonOverlappingWithCountProto
+    rw [hl]
+    dsimp only
+    rw [hs, hd]
+    rfl
+  · unfold evalCopyNonOverlappingWithCountProto
+    rw [hl]
+    dsimp only
+    rcases hbad with hs | hd
+    · rw [hs]; rfl
+    · cases isThinPtrValue (layoutPointerBytes layouts) srcVal <;> rw [hd] <;> rfl
+  · unfold evalCopyNonOverlappingWithCountProto
+    rw [hl]
 
-/-! ## 6. Null-policy refinement -/
+/-! ## 7. Null-policy refinement (lifted all the way to `stepMirFnProto`) -/
 
 /-- Per-view refinement: `.rejectNull` is never more permissive than
 `.allowRawIntrinsicNull`, and they differ only on a null address, where
@@ -742,8 +1245,39 @@ theorem zeroByteCopyPrecheck_refines
   · cases h
   · cases h
 
-/-- **Soundness refinement**: whenever the default `.rejectNull` prototype steps
-to `s'`, so does `.allowRawIntrinsicNull`, to the same post-state. -/
+/-- End-to-end policy difference on `zeroByteCopyPrecheck`: the two policies
+differ only when `srcVal` or `dstVal` resolves to a null address, in which case
+`.rejectNull` returns `.ub`. -/
+theorem zeroByteCopyPrecheck_policy_difference
+    (s : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (elemAlign : Nat) (srcVal dstVal : Value)
+    (hne : zeroByteCopyPrecheck .rejectNull s localDecls layouts elemAlign srcVal dstVal ≠
+      zeroByteCopyPrecheck .allowRawIntrinsicNull s localDecls layouts elemAlign srcVal dstVal) :
+    zeroByteCopyPrecheck .rejectNull s localDecls layouts elemAlign srcVal dstVal = .ub ∧
+      ((∃ addr al, zeroPtrView s localDecls layouts elemAlign srcVal = .resolved addr al ∧
+          isNullAddr (layoutPointerBytes layouts) addr = true) ∨
+        (∃ addr al, zeroPtrView s localDecls layouts elemAlign dstVal = .resolved addr al ∧
+          isNullAddr (layoutPointerBytes layouts) addr = true)) := by
+  unfold zeroByteCopyPrecheck checkZeroCountCopyPtr at *
+  generalize zeroPtrView s localDecls layouts elemAlign srcVal = vs at *
+  generalize zeroPtrView s localDecls layouts elemAlign dstVal = vd at *
+  generalize layoutPointerBytes layouts = pb at *
+  by_cases hs : ZeroPtrView.decide .rejectNull pb vs =
+      ZeroPtrView.decide .allowRawIntrinsicNull pb vs
+  · rw [hs] at hne ⊢
+    cases hsr : ZeroPtrView.decide .allowRawIntrinsicNull pb vs with
+    | ok =>
+      rw [hsr] at hne
+      have hd := (ZeroPtrView.decide_refines pb vd).2 hne
+      exact ⟨hd.1, Or.inr hd.2⟩
+    | ub => rw [hsr] at hne; exact absurd rfl hne
+    | unsupported => rw [hsr] at hne; exact absurd rfl hne
+  · have hsr := (ZeroPtrView.decide_refines pb vs).2 hs
+    rw [hsr.1]
+    exact ⟨rfl, Or.inl hsr.2⟩
+
+/-- **Soundness refinement** (`WithCount`): whenever the default `.rejectNull`
+prototype steps to `s'`, so does `.allowRawIntrinsicNull`, to the same post-state. -/
 theorem evalCopyNonOverlappingWithCountProto_rejectNull_refines
     (s s' : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
@@ -772,6 +1306,158 @@ theorem evalCopyNonOverlappingWithCountProto_rejectNull_refines
         · exact absurd h (fail_ne_step _ _)
         · exact absurd h (unsupported_ne_step _)
 
+/-- End-to-end policy difference directly on `evalCopyNonOverlappingWithCountProto`:
+whenever `.rejectNull` and `.allowRawIntrinsicNull` disagree, `.rejectNull`
+faults with `.ub` and at least one operand resolved to address `≡ 0`. -/
+theorem evalCopyNonOverlappingWithCountProto_policy_difference
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
+    (countBits : Nat) (locals₃ : List LocalSlot)
+    (hne : evalCopyNonOverlappingWithCountProto .rejectNull s src dst localDecls layouts srcVal
+        dstVal countBits locals₃ ≠
+      evalCopyNonOverlappingWithCountProto .allowRawIntrinsicNull s src dst localDecls layouts
+        srcVal dstVal countBits locals₃) :
+    evalCopyNonOverlappingWithCountProto .rejectNull s src dst localDecls layouts srcVal dstVal
+        countBits locals₃ = MirStepNode.fail .ub ∧
+      ∃ elemSize elemAlign,
+        resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign ∧
+        countBits * elemSize = 0 ∧
+        ((∃ addr al, zeroPtrView s localDecls layouts elemAlign srcVal = .resolved addr al ∧
+            isNullAddr (layoutPointerBytes layouts) addr = true) ∨
+          (∃ addr al, zeroPtrView s localDecls layouts elemAlign dstVal = .resolved addr al ∧
+            isNullAddr (layoutPointerBytes layouts) addr = true)) := by
+  unfold evalCopyNonOverlappingWithCountProto at *
+  cases hl : resolveCopyElemLayout localDecls layouts src dst with
+  | ub => rw [hl] at hne; exact absurd rfl hne
+  | unsupported => rw [hl] at hne; exact absurd rfl hne
+  | ok sz al =>
+    rw [hl] at hne
+    dsimp only at hne ⊢
+    cases hb : Nat.ble (Nat.mul countBits sz) (isizeMaxBytes (layoutPointerBytes layouts)) <;>
+      rw [hb] at hne
+    · exact absurd rfl hne
+    · cases hz : Nat.beq (Nat.mul countBits sz) 0 <;> rw [hz] at hne
+      · exact absurd rfl hne
+      · have hnePre :
+            zeroByteCopyPrecheck .rejectNull s localDecls layouts al srcVal dstVal ≠
+              zeroByteCopyPrecheck .allowRawIntrinsicNull s localDecls layouts al srcVal dstVal :=
+          fun heq => hne (congrArg (ZeroCheck.toStep s locals₃) heq)
+        have hdiff := zeroByteCopyPrecheck_policy_difference s localDecls layouts al srcVal dstVal
+          hnePre
+        refine ⟨?_, sz, al, rfl, Nat.eq_of_beq_eq_true hz, hdiff.2⟩
+        unfold evalCopyNonOverlappingZeroCountProto
+        rw [hdiff.1]
+
+/-- **Soundness refinement** lifted to statement-level `evalCopyNonOverlappingProto`. -/
+theorem evalCopyNonOverlappingProto_rejectNull_refines
+    (s s' : MachineState) (src dst count : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : evalCopyNonOverlappingProto .rejectNull s src dst count localDecls layouts =
+        MirStepNode.step s') :
+    evalCopyNonOverlappingProto .allowRawIntrinsicNull s src dst count localDecls layouts =
+      MirStepNode.step s' := by
+  unfold evalCopyNonOverlappingProto at *
+  cases h1 : evalOperand s.frame.locals src s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls s.memory.callStack with
+  | ub => rw [h1] at h; exact h
+  | unsupported => rw [h1] at h; exact h
+  | ok srcVal l1 =>
+    rw [h1] at h; dsimp only at h ⊢
+    cases h2 : evalOperand l1 dst s.memory.borrows s.memory.globals layouts
+        s.memory.callerLocals localDecls s.memory.callStack with
+    | ub => rw [h2] at h; exact h
+    | unsupported => rw [h2] at h; exact h
+    | ok dstVal l2 =>
+      rw [h2] at h; dsimp only at h ⊢
+      cases h3 : evalOperand l2 count s.memory.borrows s.memory.globals layouts
+          s.memory.callerLocals localDecls s.memory.callStack with
+      | ub => rw [h3] at h; exact h
+      | unsupported => rw [h3] at h; exact h
+      | ok cntVal l3 =>
+        rw [h3] at h
+        cases cntVal with
+        | scalar countSc =>
+          dsimp only at h ⊢
+          cases hwf : countScalarWellFormed (layoutPointerBytes layouts) countSc <;>
+            rw [hwf] at h <;> dsimp only at h ⊢
+          · exact h
+          · exact evalCopyNonOverlappingWithCountProto_rejectNull_refines _ _ _ _ _ _ _ _ _ _ h
+        | ptr _ _ => exact h
+        | unit => exact h
+        | aggregate _ _ => exact h
+        | uninit => exact h
+
+/-- **Soundness refinement** lifted to `evalStmtProto`. -/
+theorem evalStmtProto_rejectNull_refines
+    (s s' : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : evalStmtProto .rejectNull s stmt localDecls layouts = MirStepNode.step s') :
+    evalStmtProto .allowRawIntrinsicNull s stmt localDecls layouts = MirStepNode.step s' := by
+  unfold evalStmtProto at *
+  cases hk : stmt.kind with
+  | intrinsic intr =>
+    rw [hk] at h
+    cases intr with
+    | assume _ => exact h
+    | copyNonOverlapping src dst count =>
+      exact evalCopyNonOverlappingProto_rejectNull_refines s s' src dst count localDecls layouts h
+  | assign _ _ => rw [hk] at h; exact h
+  | setDiscriminant _ _ => rw [hk] at h; exact h
+  | deinit _ => rw [hk] at h; exact h
+  | storageLive _ => rw [hk] at h; exact h
+  | storageDead _ => rw [hk] at h; exact h
+  | retag _ _ => rw [hk] at h; exact h
+  | placeMention _ => rw [hk] at h; exact h
+  | nop => rw [hk] at h; exact h
+  | coverage => rw [hk] at h; exact h
+  | constEvalCounter => rw [hk] at h; exact h
+  | backwardIncompatibleDropHint _ => rw [hk] at h; exact h
+
+/-- **Soundness refinement** lifted all the way to `stepMirFnProto`. -/
+theorem stepMirFnProto_rejectNull_refines
+    (body : CapturedMir) (s s' : MachineState)
+    (h : stepMirFnProto .rejectNull body s = MirStepNode.step s') :
+    stepMirFnProto .allowRawIntrinsicNull body s = MirStepNode.step s' := by
+  unfold stepMirFnProto at *
+  cases hn : nextCopyNonOverlapping? body s <;> rw [hn] at h <;> dsimp only at h ⊢
+  · exact h
+  · rename_i q
+    rcases q with ⟨src, dst, count, cb⟩
+    exact evalCopyNonOverlappingProto_rejectNull_refines s s' src dst count cb.localDecls cb.layouts
+      h
+
+/-- **Soundness refinement** lifted to terminator-level `evalCopyNonOverlappingCallProto`. -/
+theorem evalCopyNonOverlappingCallProto_rejectNull_refines
+    (s s' : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    (h : evalCopyNonOverlappingCallProto .rejectNull s bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb = MirStepNode.step s') :
+    evalCopyNonOverlappingCallProto .allowRawIntrinsicNull s bodyLocalDecls bodyLayouts argOps
+        argVals locals' destination targetBb = MirStepNode.step s' := by
+  unfold evalCopyNonOverlappingCallProto at *
+  split at h
+  · rename_i srcOp dstOp cntOp srcVal dstVal countSc
+    cases hwf : countScalarWellFormed (layoutPointerBytes bodyLayouts) countSc <;>
+      rw [hwf] at h <;> dsimp only at h ⊢
+    · exact h
+    · cases hStep : evalCopyNonOverlappingWithCountProto .rejectNull s srcOp dstOp
+          bodyLocalDecls bodyLayouts srcVal dstVal countSc.bits locals' with
+      | tau res =>
+        cases res with
+        | running sMid =>
+          have hMid := evalCopyNonOverlappingWithCountProto_rejectNull_refines
+            s sMid srcOp dstOp bodyLocalDecls bodyLayouts srcVal dstVal
+            countSc.bits locals' hStep
+          rw [hStep] at h
+          rw [hMid]
+          exact h
+        | halted _ => rw [hStep] at h; unfold finishMemIntrinsicCall at h; cases h
+        | faulted _ => rw [hStep] at h; unfold finishMemIntrinsicCall at h; cases h
+      | vis _ _ => rw [hStep] at h; unfold finishMemIntrinsicCall at h; cases h
+      | ret _ => rw [hStep] at h; unfold finishMemIntrinsicCall at h; cases h
+  · exact absurd h (fail_ne_step _ _)
+
 /-- On the zero-byte fragment, a successful prototype step is the pure no-op
 `advanceStmt s locals₃` (memory and locals untouched; no Tree Borrows access). -/
 theorem evalCopyNonOverlappingWithCountProto_zero_noop
@@ -793,15 +1479,14 @@ theorem evalCopyNonOverlappingWithCountProto_zero_noop
   · exact absurd h (fail_ne_step _ _)
   · exact absurd h (unsupported_ne_step _)
 
-
-/-! ## 7. Standalone reference models (`lean-miri` and `core::ptr`)
+/-! ## 8. Standalone reference models (`lean-miri` and `core::ptr`) and end-to-end bridge
 
 Resolved-integer abstractions of the check order of
 `lean-miri/vendor/Miri/Interpreter/Intrinsics.lean:143-158` (`copyWith`) with
 `Miri/Memory/Access.lean:134-153` (`checkAndDerefPtr`: size `0` returns
 `.ok none` before any provenance resolution, so address `0` is accepted) and
 of Rust's `core::ptr::copy_nonoverlapping` (`ub_checks` precondition followed by
-the intrinsic). -/
+the intrinsic), **directly bridged** to `evalCopyNonOverlappingWithCountProto`. -/
 
 /-- Outcome of the reference models. -/
 inductive RefCopyOutcome : Type where
@@ -809,6 +1494,17 @@ inductive RefCopyOutcome : Type where
   | noop
   | access (bytes : Nat)
   deriving DecidableEq, Repr
+
+/-- Map a zero-byte or overflow `Option RefCopyOutcome` to the corresponding
+`MirStepNode` (`none` → `.unsupported`, `some .ub` → `.fail .ub`,
+`some .noop` → `.step (advanceStmt s locals₃)`). -/
+@[reducible]
+def refOutcomeToStep (s : MachineState) (locals₃ : List LocalSlot) :
+    Option RefCopyOutcome → MirStepNode
+  | .some .noop => MirStepNode.step (advanceStmt s locals₃)
+  | .some .ub => MirStepNode.fail .ub
+  | .some (.access _) => MirStepNode.unsupported
+  | .none => MirStepNode.unsupported
 
 /-- `lean-miri` `Intrinsics.copyWith` on resolved addresses: (1) count read,
 (2) `computeSizeInBytes` against `isize::MAX`, (3) `checkAlign source`,
@@ -859,9 +1555,9 @@ def corePtrCopyRef
   | false => .ub
   | true => miriCopyWithRef ptrBytes countBits elemSize elemAlign srcAddr dstAddr
 
-/-- The prototype's zero-byte decision on resolved views, as a reference
-outcome (`none` = fail-closed `.unsupported`). Non-zero-byte copies are outside
-the fragment (`access`). -/
+/-- The prototype's zero-byte & overflow decision on views, as a reference
+outcome (`none` = fail-closed `.unsupported`). Non-zero-byte copies that do not
+overflow are outside the fragment (`access`). -/
 @[reducible]
 def protoFragment (policy : ZeroCountNullPolicy) (ptrBytes countBits elemSize : Nat)
     (srcV dstV : ZeroPtrView) : Option RefCopyOutcome :=
@@ -894,6 +1590,38 @@ theorem zeroPtrView_scalar
   dsimp only
   rw [Nat.beq_refl, blt_true_of_lt hlt]
   rfl
+
+/-- **Direct bridge from `evalCopyNonOverlappingWithCountProto` to
+`protoFragment`** on the entire zero-byte and overflow fragment (connecting the
+actual prototype evaluator to the standalone reference theorems below). -/
+theorem evalCopyNonOverlappingWithCountProto_eq_protoFragment
+    (policy : ZeroCountNullPolicy) (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
+    (countBits elemSize elemAlign : Nat) (locals₃ : List LocalSlot)
+    (hl : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign)
+    (hfrag : countBits * elemSize = 0 ∨
+      isizeMaxBytes (layoutPointerBytes layouts) < countBits * elemSize) :
+    evalCopyNonOverlappingWithCountProto policy s src dst localDecls layouts srcVal dstVal
+        countBits locals₃ =
+      refOutcomeToStep s locals₃
+        (protoFragment policy (layoutPointerBytes layouts) countBits elemSize
+          (zeroPtrView s localDecls layouts elemAlign srcVal)
+          (zeroPtrView s localDecls layouts elemAlign dstVal)) := by
+  unfold evalCopyNonOverlappingWithCountProto protoFragment
+  rw [hl]
+  dsimp only
+  rcases hfrag with hz | hov
+  · have hz' : Nat.mul countBits elemSize = 0 := hz
+    rw [hz', ble_true_of_le (Nat.zero_le _)]
+    dsimp only [evalCopyNonOverlappingZeroCountProto, zeroByteCopyPrecheck, checkZeroCountCopyPtr]
+    cases ZeroCheck.andThen
+        (ZeroPtrView.decide policy (layoutPointerBytes layouts)
+          (zeroPtrView s localDecls layouts elemAlign srcVal))
+        (ZeroPtrView.decide policy (layoutPointerBytes layouts)
+          (zeroPtrView s localDecls layouts elemAlign dstVal)) <;> rfl
+  · have hov' : Nat.ble (Nat.mul countBits elemSize)
+        (isizeMaxBytes (layoutPointerBytes layouts)) = false := ble_false_of_lt hov
+    rw [hov']
 
 /-- The zero-byte fragment (`count * elemSize = 0`) of `protoFragment`. -/
 theorem protoFragment_zero (policy : ZeroCountNullPolicy) (ptrBytes countBits elemSize : Nat)
@@ -965,6 +1693,106 @@ theorem protoFragment_rejectNull_eq_corePtrStrict
   cases isNullAddr ptrBytes srcAddr <;> cases isNullAddr ptrBytes dstAddr <;>
     cases Nat.beq (Nat.mod srcAddr elemAlign) 0 <;> cases Nat.beq (Nat.mod dstAddr elemAlign) 0 <;>
     cases Bool.or (Nat.beq countBits 0) (Nat.beq elemSize 0) <;> rfl
+
+/-- **End-to-end Equivalence 1 on `evalCopyNonOverlappingWithCountProto`**:
+for any well-formed `.scalar` pointer pair (`NonNull::dangling()`, null,
+misaligned, on either 32-bit or 64-bit targets) with resolved layout and
+`countBits * elemSize = 0`, `.allowRawIntrinsicNull` matches `miriCopyWithRef`
+identically. -/
+theorem evalCopyNonOverlappingWithCountProto_scalar_allowRaw_eq_miri
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcBits dstBits countBits elemSize elemAlign : Nat) (locals₃ : List LocalSlot)
+    (hl : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign)
+    (hz : countBits * elemSize = 0)
+    (hsLt : srcBits < scalarModulus (layoutPointerBytes layouts))
+    (hdLt : dstBits < scalarModulus (layoutPointerBytes layouts)) :
+    evalCopyNonOverlappingWithCountProto .allowRawIntrinsicNull s src dst localDecls layouts
+        (.scalar ⟨srcBits, layoutPointerBytes layouts⟩)
+        (.scalar ⟨dstBits, layoutPointerBytes layouts⟩) countBits locals₃ =
+      refOutcomeToStep s locals₃
+        (.some (miriCopyWithRef (layoutPointerBytes layouts) countBits elemSize elemAlign
+          srcBits dstBits)) := by
+  rw [evalCopyNonOverlappingWithCountProto_eq_protoFragment .allowRawIntrinsicNull s src dst
+      localDecls layouts _ _ countBits elemSize elemAlign locals₃ hl (Or.inl hz),
+    zeroPtrView_scalar s localDecls layouts elemAlign srcBits hsLt,
+    zeroPtrView_scalar s localDecls layouts elemAlign dstBits hdLt,
+    protoFragment_allowRaw_eq_miri _ _ _ _ _ _ hz]
+
+/-- **End-to-end Equivalence 2 on `evalCopyNonOverlappingWithCountProto`**:
+`.allowRawIntrinsicNull` matches Rust 1.98 `core::ptr::copy_nonoverlapping` on
+all well-formed `.scalar` zero-byte inputs. -/
+theorem evalCopyNonOverlappingWithCountProto_scalar_allowRaw_eq_corePtr
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcBits dstBits countBits elemSize elemAlign : Nat) (locals₃ : List LocalSlot)
+    (hl : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign)
+    (hz : countBits * elemSize = 0)
+    (hsLt : srcBits < scalarModulus (layoutPointerBytes layouts))
+    (hdLt : dstBits < scalarModulus (layoutPointerBytes layouts)) :
+    evalCopyNonOverlappingWithCountProto .allowRawIntrinsicNull s src dst localDecls layouts
+        (.scalar ⟨srcBits, layoutPointerBytes layouts⟩)
+        (.scalar ⟨dstBits, layoutPointerBytes layouts⟩) countBits locals₃ =
+      refOutcomeToStep s locals₃
+        (.some (corePtrCopyRef true (layoutPointerBytes layouts) countBits elemSize elemAlign
+          srcBits dstBits)) := by
+  rw [evalCopyNonOverlappingWithCountProto_eq_protoFragment .allowRawIntrinsicNull s src dst
+      localDecls layouts _ _ countBits elemSize elemAlign locals₃ hl (Or.inl hz),
+    zeroPtrView_scalar s localDecls layouts elemAlign srcBits hsLt,
+    zeroPtrView_scalar s localDecls layouts elemAlign dstBits hdLt,
+    protoFragment_allowRaw_eq_corePtr _ _ _ _ _ _ hz]
+
+/-- **End-to-end Equivalence 3 on `evalCopyNonOverlappingWithCountProto`**:
+`.rejectNull` matches the strict `core::ptr::copy_nonoverlapping` contract on
+all well-formed `.scalar` zero-byte inputs (including null rejection on `u8`/`()`). -/
+theorem evalCopyNonOverlappingWithCountProto_scalar_rejectNull_eq_corePtrStrict
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcBits dstBits countBits elemSize elemAlign : Nat) (locals₃ : List LocalSlot)
+    (hl : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign)
+    (hz : countBits * elemSize = 0)
+    (hsLt : srcBits < scalarModulus (layoutPointerBytes layouts))
+    (hdLt : dstBits < scalarModulus (layoutPointerBytes layouts)) :
+    evalCopyNonOverlappingWithCountProto .rejectNull s src dst localDecls layouts
+        (.scalar ⟨srcBits, layoutPointerBytes layouts⟩)
+        (.scalar ⟨dstBits, layoutPointerBytes layouts⟩) countBits locals₃ =
+      refOutcomeToStep s locals₃
+        (.some (corePtrCopyRef false (layoutPointerBytes layouts) countBits elemSize elemAlign
+          srcBits dstBits)) := by
+  rw [evalCopyNonOverlappingWithCountProto_eq_protoFragment .rejectNull s src dst
+      localDecls layouts _ _ countBits elemSize elemAlign locals₃ hl (Or.inl hz),
+    zeroPtrView_scalar s localDecls layouts elemAlign srcBits hsLt,
+    zeroPtrView_scalar s localDecls layouts elemAlign dstBits hdLt,
+    protoFragment_rejectNull_eq_corePtrStrict _ _ _ _ _ _ hz]
+
+/-- **End-to-end Soundness Refinement against `lean-miri`**: whenever
+`evalCopyNonOverlappingWithCountProto .rejectNull` steps on resolved `.scalar`
+zero-byte inputs, `miriCopyWithRef` also steps as `.noop`. -/
+theorem evalCopyNonOverlappingWithCountProto_scalar_rejectNull_refines_miri
+    (s s' : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcBits dstBits countBits elemSize elemAlign : Nat) (locals₃ : List LocalSlot)
+    (hl : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign)
+    (hz : countBits * elemSize = 0)
+    (hsLt : srcBits < scalarModulus (layoutPointerBytes layouts))
+    (hdLt : dstBits < scalarModulus (layoutPointerBytes layouts))
+    (hstep : evalCopyNonOverlappingWithCountProto .rejectNull s src dst localDecls layouts
+        (.scalar ⟨srcBits, layoutPointerBytes layouts⟩)
+        (.scalar ⟨dstBits, layoutPointerBytes layouts⟩) countBits locals₃ = MirStepNode.step s') :
+    miriCopyWithRef (layoutPointerBytes layouts) countBits elemSize elemAlign srcBits dstBits =
+        .noop ∧
+      s' = advanceStmt s locals₃ := by
+  have hraw := evalCopyNonOverlappingWithCountProto_rejectNull_refines s s' src dst localDecls
+    layouts _ _ countBits locals₃ hstep
+  rw [evalCopyNonOverlappingWithCountProto_scalar_allowRaw_eq_miri s src dst localDecls layouts
+      srcBits dstBits countBits elemSize elemAlign locals₃ hl hz hsLt hdLt] at hraw
+  cases hm : miriCopyWithRef (layoutPointerBytes layouts) countBits elemSize elemAlign
+      srcBits dstBits with
+  | noop =>
+    rw [hm] at hraw
+    exact ⟨rfl, (step_inj hraw).symm⟩
+  | ub =>
+    rw [hm] at hraw
+    exact absurd hraw (fail_ne_step _ _)
+  | access n =>
+    rw [hm] at hraw
+    exact absurd hraw (unsupported_ne_step _)
 
 /-- **Overflow agreement**: when `count * elemSize > isize::MAX`, the prototype
 and `lean-miri` both report `.ub` (for every view / address). -/
