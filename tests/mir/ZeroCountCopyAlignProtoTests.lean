@@ -750,9 +750,14 @@ theorem target32_dangling_rawptr_aligned :
     proto32 .rejectNull (rawConstK u8K) (.scalar ⟨4, 4⟩) (.scalar ⟨4, 4⟩) 0 = noop32 := by
   kernel_rfl
 
-/-- On 32-bit, live stack `usize` local is 4-aligned and steps cleanly. -/
+/-- On 32-bit **without** a layout entry, a `usize` local is only guaranteed
+2-aligned (`m68k`), so an align-4 requirement through it fails closed (A2;
+B1/B2 stepped here by assuming the local is 4-aligned). See
+`target32_align4_over_layout_usize_local_noop` for the precise case with a
+captured layout. -/
 theorem target32_stack_usize_aligned :
-    proto32 .rejectNull usizeK (.ptr ⟨1, 0⟩ 4) (.ptr ⟨1, 0⟩ 4) 0 = noop32 := by kernel_rfl
+    proto32 .rejectNull usizeK (.ptr ⟨1, 0⟩ 4) (.ptr ⟨1, 0⟩ 4) 0 = MirStepNode.unsupported := by
+  kernel_rfl
 
 /-- On 32-bit, addr `2` is misaligned for `usize` (`align = 4`) → `.ub`. -/
 theorem target32_misaligned_usize_ub :
@@ -1336,6 +1341,153 @@ theorem unsafeObligations_one_zst_dst_breaks :
         emptyLayoutTable (.ptr ⟨1, 0⟩ 8) (.ptr ⟨4, 0⟩ 8) 1 stW.frame.locals) = 0 := by
   exact ⟨by decide +kernel, by decide +kernel⟩
 
+/-! ### A2: null is `.ub` for every `T` even when `T` is unresolved (Kleene) -/
+
+def opaqueK : RigidTy := .adt "opaque::Foo" []
+
+/-- `copy_nonoverlapping::<Opaque>(null, dangling, 0)`: `T`'s alignment is
+unknown, but under `.rejectNull` a null pointer is `.ub` for every `T`
+(B2: `.unsupported`). -/
+theorem opaque_null_scalar_rejectNull_ub :
+    proto .rejectNull opaqueK opaqueK (danglingScalar 0) (danglingScalar 8) 0 =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+theorem opaque_null_ptr_rejectNull_ub :
+    proto .rejectNull opaqueK opaqueK (danglingScalar 8) (.ptr ⟨0, 0⟩ 8) 0 =
+      MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- Under the raw-intrinsic policy the same input stays fail-closed. -/
+theorem opaque_null_allowRaw_unsupported :
+    proto .allowRawIntrinsicNull opaqueK opaqueK (danglingScalar 0) (danglingScalar 8) 0 =
+      MirStepNode.unsupported := by
+  kernel_rfl
+
+/-- A non-null pointer with unresolved `T` is still `.unsupported` (alignment
+unknown). -/
+theorem opaque_nonnull_unsupported :
+    proto .rejectNull opaqueK opaqueK (danglingScalar 9) (danglingScalar 8) 0 =
+      MirStepNode.unsupported := by
+  kernel_rfl
+
+/-! ### A2: placement soundness instances (`.ptr` ⇒ Miri `checkAlign` for every placement) -/
+
+/-- Global allocation `9` of `globalsFix`. -/
+def global9 : CapturedAllocation :=
+  { allocId := 9, bytes := List.replicate 16 (some 0), relocations := [],
+    align := { bytes := 8 }, mutability := .not }
+
+/-- The live 8-aligned global at offset `8` (`cc1_global_aligned`) is 8-aligned
+for every 8-aligned placement of allocation `9`. -/
+theorem global_ptr_placement_sound :
+    ∀ base, base % 8 = 0 → (base + 8) % 8 = 0 :=
+  checkZeroCountCopyPtr_global_ok_sound .rejectNull st (declsFor u64K u64K) emptyLayoutTable 8
+    ⟨9, 8⟩ global9 rfl rfl rfl (by kernel_rfl)
+
+/-- The root local `_1 : u64` behind tag `1` has resolved alignment `8` (so the
+placement hypothesis below is satisfiable, not vacuous). -/
+theorem stack_root_align_u64 :
+    stackRootAlign? st (declsFor u64K u64K) emptyLayoutTable
+      { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique } = some 8 := by
+  decide +kernel
+
+/-- `&raw mut _1` (tag `1`, `_1 : u64`) is 8-aligned for every 8-aligned
+placement of `_1` (independently of the `65536`-byte page model). -/
+theorem stack_ptr_placement_sound :
+    ∀ base, base % 8 = 0 → (base + (0 + 0)) % 8 = 0 := by
+  intro base hb
+  exact checkZeroCountCopyPtr_stack_ok_sound .rejectNull st (declsFor u64K u64K)
+    emptyLayoutTable 8 ⟨1, 0⟩
+    { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique } 0 rfl rfl rfl rfl
+    (by kernel_rfl) base (fun ra hra => by
+      rw [stack_root_align_u64] at hra
+      cases hra
+      exact hb)
+
+
+/-! ### A2: two-sided alignment — place guarantees are lower bounds -/
+
+def align4K : RigidTy := .adt "proto::Align4" []
+
+/-- `#[repr(align(4))] struct Align4(u16)`: size 4, align 4 (every target). -/
+def align4Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0, isUninhabited := false }
+
+/-- A captured 32-bit `usize` layout (size 4, align 4, e.g. `i686`/`armv7`). -/
+def usize32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def layouts32b : LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true,
+    entries := [align4Layout, align4Layout, usize32Layout] }
+
+/-- Locals: `_0 : ()`, `_1 : usize` (no layout), `_2 : *const Align4`,
+`_3 : *mut Align4`, `_4 : Align4` (layout `1`), `_5 : usize` (layout `2`). -/
+def decls32b : List LocalDecl :=
+  [declNL unitK, declNL usizeK, declNL (rawConstK align4K), declNL (rawMutK align4K),
+   { mutability := .mut, ty := { kind := align4K, layoutIdx := 1 }, debugName := none },
+   { mutability := .mut, ty := { kind := usizeK, layoutIdx := 2 }, debugName := none }]
+
+def st32b : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨7, 4⟩), .uninit, .uninit, .uninit,
+                          .init (.scalar ⟨9, 4⟩)] }
+    memory := { emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique },
+                  { tag := 2, targetLocal := 5, targetProjection := [], perm := .unique }],
+      nextTag := 3 } }
+
+def proto32b (srcVal dstVal : Value) : MirStepNode :=
+  evalCopyNonOverlappingWithCountProto .rejectNull st32b (cp 2) (cp 3) decls32b layouts32b srcVal
+    dstVal 0 st32b.frame.locals
+
+/-- Same locals but **no** `usize` layout anywhere in the body (`_5 : u8`). -/
+def decls32c : List LocalDecl :=
+  [declNL unitK, declNL usizeK, declNL (rawConstK align4K), declNL (rawMutK align4K),
+   { mutability := .mut, ty := { kind := align4K, layoutIdx := 1 }, debugName := none },
+   declNL u8K]
+
+/-- **Soundness (A2)**: `&raw mut x as *mut Align4` for a 32-bit `x : usize`
+whose layout is not captured must not be accepted (on `m68k` `x` is only
+2-aligned). B2 stepped (it assumed the structural `usize` alignment `4` for the
+backing place). -/
+theorem target32_align4_over_usize_local_unsupported :
+    evalCopyNonOverlappingWithCountProto .rejectNull st32b (cp 2) (cp 3) decls32c layouts32b
+        (.ptr ⟨1, 0⟩ 4) (.ptr ⟨1, 0⟩ 4) 0 st32b.frame.locals = MirStepNode.unsupported := by
+  kernel_rfl
+
+/-- When the body captures the target's `usize` layout (another local `_5 : usize`
+with layout align 4), the backing `usize` local is known 4-aligned and the copy
+steps. -/
+theorem target32_align4_over_usize_local_with_body_layout_noop :
+    proto32b (.ptr ⟨1, 0⟩ 4) (.ptr ⟨1, 0⟩ 4) =
+      MirStepNode.step (advanceStmt st32b st32b.frame.locals) := by
+  kernel_rfl
+
+/-- With the captured layout (`usize` align 4) the same copy is precise. -/
+theorem target32_align4_over_layout_usize_local_noop :
+    proto32b (.ptr ⟨2, 0⟩ 4) (.ptr ⟨2, 0⟩ 4) =
+      MirStepNode.step (advanceStmt st32b st32b.frame.locals) := by
+  kernel_rfl
+
+/-- The element requirement still uses the (upper-bound) layout alignment:
+a 2-aligned dangling address is `.ub` for `Align4`. -/
+theorem target32_align4_dangling2_ub :
+    proto32b (.scalar ⟨2, 4⟩) (.scalar ⟨4, 4⟩) = MirStepNode.fail .ub := by kernel_rfl
+
+theorem lower_align_u128_64bit :
+    copyTyAlignPlace? [] emptyLayoutTable (tyNL (.uint .u128)) = some 8 ∧
+      copyTyAlign? [] emptyLayoutTable (tyNL (.uint .u128)) = some 16 := by
+  decide +kernel
+
+theorem lower_align_u32_32bit :
+    copyTyAlignPlace? [] layouts32 (tyNL u32K) = some 2 ∧
+      copyTyAlign? [] layouts32 (tyNL u32K) = some 4 := by
+  decide +kernel
+
 /-! ## 12. Terminator-level call path inherits the fix -/
 
 /-- `evalCopyNonOverlappingCallProto` with a misaligned dangling `src` faults
@@ -1802,5 +1954,45 @@ theorem zeroCountCopyAlignProto_bundle :
 -/
 #guard_msgs in
 #print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.unsafeObligations_one_zst_dst_breaks
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.globalAllocAlignKnown_sound' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.globalAllocAlignKnown_sound
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.stackBorrowAlignKnown_sound' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.stackBorrowAlignKnown_sound
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.checkZeroCountCopyPtr_global_ok_sound' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.checkZeroCountCopyPtr_global_ok_sound
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.checkZeroCountCopyPtr_stack_ok_sound' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.checkZeroCountCopyPtr_stack_ok_sound
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_zero_count_unresolved' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_zero_count_unresolved
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.opaque_null_scalar_rejectNull_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.opaque_null_scalar_rejectNull_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.stack_ptr_placement_sound' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.stack_ptr_placement_sound
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.target32_align4_over_usize_local_unsupported' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.target32_align4_over_usize_local_unsupported
 
 end Anneal.Proto.ZeroCountCopyAlign.Tests
