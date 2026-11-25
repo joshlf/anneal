@@ -111,6 +111,8 @@ import os, socket as _socket
 _UID = os.getuid()
 _SLOT_DIR_NAME = f"anneal-build-slots-{_UID}"
 _OOM_PREFIX = f"anneal-last-oom-{_UID}."
+# `stamp_last_oom`'s atomic-replace temp file (`mkstemp(prefix=".anneal-last-oom.")`).
+_OOM_TMP_PREFIX = ".anneal-last-oom."
 _BASES = []
 for _b in (f"/run/user/{_UID}", "/tmp"):
     for _v in {_b, os.path.realpath(_b)}:
@@ -145,6 +147,7 @@ def _host_state_path(raw):
                 rel == _SLOT_DIR_NAME
                 or rel.startswith(_SLOT_DIR_NAME + os.sep)
                 or rel.startswith(_OOM_PREFIX)
+                or (rel.startswith(_OOM_TMP_PREFIX) and os.sep not in rel)
             ):
                 return cand
     return None
@@ -3563,6 +3566,8 @@ class TestCliSubprocess(unittest.TestCase):
             ("open", (f"/run/user/{uid}/anneal-last-oom-{uid}.json", None, os.O_RDWR)),
             ("os.rename", ("/x/elsewhere", f"/run/user/{uid}/anneal-last-oom-{uid}.json", -1, -1)),
             ("socket.connect", (None, "/tmp/anneal-lean-lsp.sock")),
+            # `stamp_last_oom`'s `mkstemp` temp memo written beside the live host memo.
+            ("open", (f"/run/user/{uid}/.anneal-last-oom.k3x9q2", None, os.O_RDWR | os.O_CREAT)),
         ):
             self.assertIsNotNone(classify(event, args), (event, args))
         for event, args in (
@@ -3571,6 +3576,8 @@ class TestCliSubprocess(unittest.TestCase):
             ("open", (f"/tmp/anneal-build-slots-{uid}0/slot-1.lock", None, 0)),
             ("open", (f"/tmp/anneal-last-oom-{uid}0.json", None, 0)),
             ("open", (f"/run/user/{uid}/bus", None, 0)),
+            ("open", (f"/tmp/anneal-cli-rt-abc/.anneal-last-oom.k3x9q2", None, os.O_CREAT)),
+            ("open", (f"/tmp/.anneal-last-oom.dir/nested", None, 0)),
             ("os.mkdir", (f"/tmp/not-{slots}", 0o777, -1)),
             ("socket.connect", (None, "/tmp/anneal-cli-rt-abc/anneal-lean-lsp.sock")),
             ("socket.connect", (None, ("127.0.0.1", 80))),

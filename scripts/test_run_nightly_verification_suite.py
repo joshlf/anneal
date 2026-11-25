@@ -8021,8 +8021,17 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(len(inner), 6, profile)
             cache_dir = inner[5]
             self.assertTrue(cache_dir.startswith("/tmp/anneal-trusted-cache-nightly"), cache_dir)
-            if not (Path(expected_default).is_symlink() or (Path(expected_default).exists() and not Path(expected_default).is_dir())):
+            # Host-state independent: the primary is chosen exactly when the resolver's own
+            # admission predicate accepts it (absent, or a private non-symlink dir owned by
+            # this uid); otherwise (e.g. a pre-existing group-writable `0775` dir from an
+            # umask-002 run, or another account's squatted entry) a disjoint sibling wins.
+            primary_ok = os.access("/tmp", os.W_OK | os.X_OK) and suite._is_disjoint_cache_dir(
+                Path(expected_default), REPO_ROOT.resolve(), uid
+            )
+            if primary_ok:
                 self.assertEqual(cache_dir, expected_default)
+            else:
+                self.assertNotEqual(cache_dir, expected_default)
             resolved_cache = Path(cache_dir).resolve()
             resolved_repo = REPO_ROOT.resolve()
             self.assertNotEqual(resolved_cache, resolved_repo)
