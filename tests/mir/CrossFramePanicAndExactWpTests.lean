@@ -372,6 +372,17 @@ theorem core_ep2_bitprism_smart_ctors_o1_collapse :
    @mkBitAndSmart_eq_raw, @mkBitOrSmart_eq_raw, @mkBitXorSmart_eq_raw, @mkShlSmart_eq_raw,
    @mkShrSmart_eq_raw, @mkPtrOffsetSmart_eq_raw, @mkWrappingPtrOffsetSmart_eq_raw⟩
 
+/-- Scalar-level strict-semantics (`evalE`) UB non-erasure: a faulting subtree is NEVER dropped by
+any of the 8 scalar `Bitprism` constructors (universal), with the concrete
+`(u8::MAX +unchecked 1) * 0` witness (raw `none`, smart `none`, lossy `eval` = `0`). -/
+theorem core_ep2_bitprism_scalar_strict_non_erasure (env : Nat → Nat) (l r : SmartScalarExpr 4) :
+    ((SmartScalarExpr.bin .mul l r).evalE env = none → (mkMulSmart l r).evalE env = none) ∧
+    ((SmartScalarExpr.bin .bitAnd l r).evalE env = none → (mkBitAndSmart l r).evalE env = none) ∧
+    ((SmartScalarExpr.bin .sub l r).evalE env = none → (mkSubSmart l r).evalE env = none) ∧
+    (type_of% @bitprism_scalar_ub_subtree_not_erased) :=
+  ⟨mkMulSmart_never_erases_ub (by decide) env l r, mkBitAndSmart_never_erases_ub (by decide) env l r,
+   mkSubSmart_never_erases_ub (by decide) env l r, bitprism_scalar_ub_subtree_not_erased⟩
+
 /-- Critical UB non-erasure negative refutations (`0 & dead`, `0 & uninit`, `uninit * 0`,
 `addUnchecked` overflow) proving operand-definedness and overflow-mode preconditions are strictly
 necessary, plus coalescing `mkMemWriteFrame` exactness and dead-slot failure preservation. -/
