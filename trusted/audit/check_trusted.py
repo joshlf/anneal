@@ -335,6 +335,179 @@ def snapshot(root: Path) -> tuple[dict, dict[str, str]]:
     return inventory, dict(sorted(modules.items()))
 
 
+# lean4#16717: pre-replay inductive metadata invariants plus a two-sided post-replay sweep
+# of every target inductive/constructor/recursor against the kernel-regenerated environment.
+INDUCTIVE_REPLAY_SOURCE = r"""import Lean.Replay
+open Lean
+def fail (m : String) : IO α := throw <| IO.userError s!"policy:{m}"
+def field [FromJson α] (j : Json) (k : String) : IO α := IO.ofExcept <| j.getObjValAs? α k
+def importEnv (j : Json) (roots : Array Name) : IO Environment := do
+  let mut arts : NameMap ImportArtifacts := {}
+  for (n, ps) in (← field (α := Array (String × Array (Array String))) j "artifacts") do
+    arts := arts.insert n.toName (.ofArrays (ps.map (·.map System.FilePath.mk)))
+  return (← importModules (roots.map ({module := ·})) {} (trustLevel := 0) (plugins := #[])
+    (loadExts := false) (level := .private) (arts := arts)).setExporting false
+def nodup (l : List Name) : Bool := l.eraseDups.length == l.length
+def family : ConstantInfo → Bool | .inductInfo _ | .ctorInfo _ | .recInfo _ => true | _ => false
+def same : ConstantInfo → ConstantInfo → Bool
+  | .inductInfo a, .inductInfo b => a.name == b.name && a.levelParams == b.levelParams &&
+    a.type == b.type && a.numParams == b.numParams && a.numIndices == b.numIndices &&
+    a.all == b.all && a.ctors == b.ctors && a.numNested == b.numNested && a.isRec == b.isRec &&
+    a.isUnsafe == b.isUnsafe && a.isReflexive == b.isReflexive
+  | .ctorInfo a, .ctorInfo b => a == b
+  | .recInfo a, .recInfo b => a == b
+  | _, _ => false
+def run (j : Json) : IO Json := do
+  initSearchPath (← field (α := String) j "sysroot")
+  let targets := (← field (α := Array String) j "targets").map String.toName
+  let env ← importEnv j ((← field (α := Array String) j "roots").map String.toName)
+  let mut st : Std.HashMap Name ConstantInfo := {}
+  for m in env.header.modules, d in env.header.moduleData do
+    if !targets.contains m.module then continue
+    unless d.constNames == d.constants.map (·.name) do fail s!"missing_constName_entry {m.module}"
+    for ci in d.constants do
+      let rhs := match ci with | .recInfo r => r.rules.map (·.rhs) | _ => []
+      unless (ci.type :: rhs ++ (ci.value? true).toList).all fun e =>
+          !(e.hasFVar || e.hasMVar || e.hasLooseBVars) do fail s!"open expression in {ci.name}"
+      if let some o := st[ci.name]? then  -- reserved auxiliaries realized by sibling modules
+        let thm := match o, ci with | .thmInfo _, .thmInfo _ => true | _, _ => false
+        unless !family ci && o.type == ci.type && o.levelParams == ci.levelParams &&
+            (thm || o.value? true == ci.value? true) do
+          fail s!"conflicting duplicate target constant {ci.name}"
+      else st := st.insert ci.name ci
+  for (_, ci) in st do
+    match ci with
+    | .inductInfo I =>
+      unless I.all.contains I.name && nodup I.all && nodup I.ctors do fail s!"malformed all/ctors of {I.name}"
+      for n in I.all do
+        let some (.inductInfo J) := st[n]? | fail s!"non-inductive {n} in all of {I.name}"
+        unless J.all == I.all && J.numParams == I.numParams && J.levelParams == I.levelParams &&
+          J.isRec == I.isRec do fail s!"mutual metadata mismatch {I.name}/{n}"
+      let mut i := 0
+      for c in I.ctors do
+        let some (.ctorInfo C) := st[c]? | fail s!"non-constructor {c} in ctors of {I.name}"
+        unless C.induct == I.name && C.cidx == i && C.numParams == I.numParams &&
+          C.levelParams == I.levelParams do fail s!"constructor metadata mismatch {c}"
+        i := i + 1
+    | .ctorInfo C =>
+      let some (.inductInfo I) := st[C.induct]? | fail s!"dangling constructor {C.name}"
+      unless I.ctors.contains C.name do fail s!"dangling constructor {C.name}"
+    | .recInfo R =>
+      unless !R.all.isEmpty && nodup R.all && R.all.all (fun n => match st[n]? with
+          | some (.inductInfo _) => true | _ => false) do fail s!"dangling recursor {R.name}"
+      for r in R.rules do
+        match st[r.ctor]?, env.find? r.ctor with
+        | some (.ctorInfo C), _ => unless R.all.contains C.induct do fail s!"foreign rule in {R.name}"
+        | none, some (.ctorInfo _) => pure ()
+        | _, _ => fail s!"dangling recursor rule {r.ctor} in {R.name}"
+    | _ => pure ()
+  let mut picked : Std.HashMap Name ConstantInfo := {}
+  let mut work : Array Name := st.fold (fun a n ci => if family ci then a.push n else a) #[]
+  while !work.isEmpty do
+    let n := work.back!
+    work := work.pop
+    let some ci := st[n]? | continue
+    if picked.contains n then continue
+    picked := picked.insert n ci
+    for d in ci.getUsedConstantsAsSet do work := work.push d
+    work := work ++ (match ci with
+      | .inductInfo I => I.all ++ I.ctors | .ctorInfo C => [C.induct] | .recInfo R => R.all | _ => []).toArray
+  let base ← importEnv j (env.header.modules.filterMap fun m =>
+    if targets.contains m.module then none else some m.module)
+  let k ← try base.toKernelEnv.replay picked
+    catch e => fail s!"kernel replay rejected target inductives: {e}"
+  let mut fam := 0
+  for (n, ci) in picked do
+    if !family ci then continue
+    fam := fam + 1
+    let some kc := k.find? n | fail s!"kernel never regenerated {n}"
+    unless same ci kc do fail s!"post-replay metadata mismatch {n}"
+    if let .inductInfo I := kc then
+      let nested := if I.all.head? == some n then (List.range I.numNested).map (s!"rec_{·+1}") else []
+      for g in I.ctors ++ (("rec" :: nested).map (Name.str n ·)) do
+        if let some gc := k.find? g then
+          let some sc := st[g]? | fail s!"kernel constant {g} dropped from module data"
+          unless same sc gc do fail s!"kernel constant {g} replaced in module data"
+  return Json.mkObj [("inductiveConstants", toJson fam), ("replayedConstants", toJson picked.size)]
+def main (args : List String) : IO UInt32 := do
+  let [req, out] := args | IO.eprintln "expected request and result files"; return 2
+  try
+    let r ← run (← IO.ofExcept <| Json.parse (← IO.FS.readFile req))
+    IO.FS.writeFile out (Json.mkObj [("ok", toJson true), ("result", r)]).pretty
+    return 0
+  catch e =>
+    let m := e.toString
+    let c := if m.startsWith "policy:" then "policy" else "operational"
+    IO.FS.writeFile out (Json.mkObj [("ok", toJson false), ("category", toJson c), ("message", toJson m)]).pretty
+    IO.eprintln m
+    return if c == "policy" then 1 else 2
+"""
+
+
+def resolve_exact_modules(spec: str, targets=None) -> list:
+    """`--exact-modules`: the named DOWNSTREAM_TARGETS entries plus their transitive downstream
+    imports, in DOWNSTREAM_TARGETS order (fail-closed on empty, malformed, duplicate, or unknown names)."""
+    targets = DOWNSTREAM_TARGETS if targets is None else targets
+    names = [n.strip() for n in spec.split(",")]
+    by_name = {t[0]: t for t in targets}
+    if not names or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_']*(\.[A-Za-z_][A-Za-z0-9_']*)*", n) for n in names):
+        raise Failure(1, "exact-modules", f"empty or malformed --exact-modules: {spec!r}")
+    if len(set(names)) != len(names) or any(n not in by_name for n in names):
+        raise Failure(1, "exact-modules", f"duplicate or unknown module in --exact-modules: {spec!r}")
+    closure, pending = set(), list(names)
+    while pending:
+        if (name := pending.pop()) not in closure:
+            closure.add(name)
+            pending.extend(i for i in by_name[name][2] if i in by_name)
+    return [t for t in targets if t[0] in closure]
+
+
+def lake_modules(checkout: Path) -> dict[str, str]:
+    """Every on-disk `.lean` module under the `[[lean_lib]]` roots of `lakefile.toml`."""
+    found: dict[str, str] = {}
+    for lib in tomllib.loads((checkout / "lakefile.toml").read_text()).get("lean_lib", []):
+        src = checkout / lib.get("srcDir", ".")
+        for root in lib.get("roots", [lib["name"]]):
+            base = src / root.replace(".", "/")
+            files = [base.with_suffix(".lean")] if base.with_suffix(".lean").is_file() else []
+            files += sorted(base.rglob("*.lean")) if base.is_dir() else []
+            for f in files:
+                found[".".join(f.relative_to(src).with_suffix("").parts)] = f.relative_to(checkout).as_posix()
+    return found
+
+
+def orphan_check(checkout: Path, manifest: Path | None = None, targets=None) -> dict:
+    """`--orphan-only`: pure-Python shard partition completeness and case-folding uniqueness."""
+    targets = DOWNSTREAM_TARGETS if targets is None else targets
+    phase = "orphan-check"
+    try:
+        spec = json.loads(manifest.read_text()) if manifest else {"shards": [{"name": "all", "modules": [t[0] for t in targets]}]}
+    except (OSError, ValueError) as error:
+        raise Failure(1, phase, f"unreadable shard manifest: {error}") from error
+    shards = spec.get("shards") if isinstance(spec, dict) else None
+    if not isinstance(shards, list) or not shards:
+        raise Failure(1, phase, "shard manifest has no shards")
+    universe = {t[0]: t[1] for t in targets}
+    if spec.get("lakefile_check") is True:
+        universe.update(lake_modules(checkout))
+    missing = sorted(m for m, rel in universe.items() if not (checkout / rel).is_file())
+    folded: dict[str, str] = {}
+    for module in sorted(universe):
+        if folded.setdefault(module.casefold(), module) != module:
+            raise Failure(1, phase, f"case-folding module collision: {folded[module.casefold()]} / {module}")
+    covered: set[str] = set()
+    for shard in shards:
+        modules = shard.get("modules") if isinstance(shard, dict) else None
+        if not isinstance(modules, list) or not modules or not all(isinstance(m, str) for m in modules):
+            raise Failure(1, phase, f"empty or malformed shard: {shard!r}")
+        if unknown := sorted(set(modules) - set(universe)):
+            raise Failure(1, phase, f"unknown module(s) in shard {shard.get('name')}: {unknown[:5]}")
+        covered.update(modules)
+    if orphans := sorted(set(universe) - covered) + missing:
+        raise Failure(1, phase, f"{len(orphans)} orphaned/missing module(s): {orphans[:5]}")
+    return {"modules": len(universe), "shards": len(shards)}
+
+
 class Checker:
     def __init__(
         self,
@@ -355,7 +528,7 @@ class Checker:
         self.expected_tcb_drift = tuple(expected_tcb_drift)
         self.cache_dir: Path | None = None
         self.expected_lean_sha: str | None = None
-        self._compiled_inspector: Path | None = None
+        self._compiled_programs: dict[Path, Path] = {}
         if self.fast:
             env_cache = os.environ.get("ANNEAL_TRUSTED_CACHE_DIR")
             raw_cache = (
@@ -414,11 +587,13 @@ class Checker:
             raise Failure(2, label, f"Lean exited {code}; see {stem}.stdout/.stderr")
         return stdout.read_text(encoding="utf-8", errors="strict")
 
-    def _get_compiled_inspector(self) -> Path | None:
+    def _get_compiled_inspector(self, program: Path | None = None) -> Path | None:
+        program = program or self.inspector
         if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
             return None
-        if self._compiled_inspector is not None and self._compiled_inspector.is_file():
-            return self._compiled_inspector
+        known = self._compiled_programs.get(program)
+        if known is not None and known.is_file():
+            return known
         leanc = self.lean.parent / "leanc"
         if not leanc.is_file():
             return None
@@ -427,12 +602,12 @@ class Checker:
             "toolchain": TOOLCHAIN,
             "leanSha256": self.expected_lean_sha,
             "leancSha256": digest(leanc),
-            "inspectorSha256": getattr(self, "inspector_hash", None),
+            "inspectorSha256": digest(program),
         })
         bin_dir = self.cache_dir / "inspector-bin"
-        bin_path = bin_dir / f"TrustedBoundary-{bin_key}"
+        bin_path = bin_dir / f"{program.stem}-{bin_key}"
         if bin_path.is_file() and os.access(bin_path, os.X_OK):
-            self._compiled_inspector = bin_path
+            self._compiled_programs[program] = bin_path
             return bin_path
         try:
             bin_dir.mkdir(parents=True, exist_ok=True)
@@ -440,10 +615,10 @@ class Checker:
         except OSError:
             return None
         try:
-            c_path = tmp_dir / "TrustedBoundary.c"
-            tmp_bin = tmp_dir / "TrustedBoundary"
+            c_path = tmp_dir / f"{program.stem}.c"
+            tmp_bin = tmp_dir / program.stem
             res_c = subprocess.run(
-                [str(self.lean), "-c", str(c_path), str(self.inspector)],
+                [str(self.lean), "-c", str(c_path), str(program)],
                 cwd=self.stage,
                 env=self.environment,
                 stdout=subprocess.DEVNULL,
@@ -466,7 +641,7 @@ class Checker:
                 return None
             tmp_bin.chmod(0o755)
             os.replace(tmp_bin, bin_path)
-            self._compiled_inspector = bin_path
+            self._compiled_programs[program] = bin_path
             return bin_path
         except (OSError, subprocess.SubprocessError):
             return None
@@ -500,7 +675,8 @@ class Checker:
                 "allowedAxiomModules": fields.get("allowedAxiomModules", []),
                 "sources": source_digests,
             })
-        if mode in ("audit", "downstream-audit"):
+        if mode in ("audit", "downstream-audit") or mode.startswith("inductive-replay"):
+            scope = set(fields.get("roots", self.artifacts))
             artifact_hashes = [
                 (
                     mod,
@@ -510,16 +686,16 @@ class Checker:
                         for p in group
                     ],
                 )
-                for mod in sorted(self.artifacts)
+                for mod in sorted(self.artifacts) if mod in scope
             ]
             return fingerprint({
                 "schema": 1,
                 "mode": mode,
                 "toolchain": TOOLCHAIN,
                 "leanSha256": self.expected_lean_sha,
-                "inspectorSha256": inspector_sha,
+                "inspectorSha256": self.replay_hash if mode.startswith("inductive-replay") else inspector_sha,
                 "lock": self.lock,
-                "graph": self.graph,
+                "graph": {k: v for k, v in self.graph.items() if k in scope},
                 "artifactHashes": artifact_hashes,
                 "fields": fields,
             })
@@ -652,12 +828,13 @@ class Checker:
         request_path, result_path = Path(str(stem) + ".json"), Path(str(stem) + ".result.json")
         request_path.write_text(json.dumps(request, sort_keys=True))
         self.last_status = None
-        compiled_inspector = self._get_compiled_inspector()
+        program = self.replay_inspector if mode.startswith("inductive-replay") else self.inspector
+        compiled_inspector = self._get_compiled_inspector(program)
         try:
             if compiled_inspector is not None:
                 self.process(mode, [str(request_path), str(result_path)], executable=compiled_inspector)
             else:
-                self.process(mode, ["-j1", "-M2048", "--run", str(self.inspector), str(request_path), str(result_path)])
+                self.process(mode, ["-j1", "-M2048", "--run", str(program), str(request_path), str(result_path)])
         except Failure as failure:
             self.budget()
             if self.last_status and self.last_status["returncode"] == 1 and not self.last_status["timeout"] and result_path.is_file():
@@ -744,6 +921,9 @@ class Checker:
                     and all(type(result[k]) is int and result[k] >= 0
                             for k in ("replayedDeclarations", "claimTheoremsChecked", "localTestAxioms")),
                     mode, "invalid downstream-audit observation")
+        elif mode.startswith("inductive-replay"):
+            require(set(result) == {"inductiveConstants", "replayedConstants"}
+                    and all(type(v) is int and v >= 0 for v in result.values()), mode, "invalid inductive-replay observation")
         else:
             raise Failure(2, mode, "unknown inspector result mode")
 
@@ -762,6 +942,10 @@ class Checker:
         # process can mutate them in place; freshness() still re-hashes them.
         make_read_only(self.inspector)
         self.inspector_hash = digest(self.inspector)
+        self.replay_inspector = self.stage / "InductiveReplayAudit.lean"
+        self.replay_inspector.write_text(INDUCTIVE_REPLAY_SOURCE)
+        make_read_only(self.replay_inspector)
+        self.replay_hash = digest(self.replay_inspector)
         source_copy = self.stage / "source"
         source_copy.mkdir()
         for relative, entry in self.initial.items():
@@ -871,7 +1055,7 @@ class Checker:
             raise Failure(2, "freshness", "staged Trusted root inventory/bytes changed during check")
         if any(digest(self.checkout / p) != h for p, h in self.tool_hashes.items()):
             raise Failure(2, "freshness", "checker/policy inputs changed during check")
-        if digest(self.inspector) != self.inspector_hash:
+        if digest(self.inspector) != self.inspector_hash or digest(self.replay_inspector) != self.replay_hash:
             raise Failure(2, "freshness", "staged inspector changed")
         for path, expected in self.expected_artifacts.items():
             regular(Path(path), "freshness")
@@ -994,10 +1178,13 @@ class Checker:
             claimModules=[m for m, _, _, r in targets if r == "claim"],
             testModules=[m for m, _, _, r in targets if r == "test"],
         ))
+        down = [m for m, _, _, _ in targets]
+        result["inductiveReplay"] = self.inspect("inductive-replay-downstream", targets=down,
+                                                 roots=self.foundation + list(self.modules) + down)
         result["waiverVacuityAudit"] = waiver_audit
         return result
 
-    def run(self, *, check_downstream: bool = False) -> dict:
+    def run(self, *, check_downstream: bool = False, targets=None) -> dict:
         base_hashes = (
             verify_base_snapshot(self.checkout, self.base_snapshot, self.expected_tcb_drift)
             if self.base_snapshot is not None
@@ -1076,8 +1263,10 @@ class Checker:
         report = self.inspect("audit", trusted=list(self.modules))
         if report.get("graph") != self.graph or report.get("replay") is not True:
             raise Failure(2, "audit", "incomplete final audit evidence")
+        report["inductiveReplay"] = self.inspect("inductive-replay-trusted", targets=list(self.modules),
+                                                 roots=self.foundation + list(self.modules))
         if check_downstream:
-            downstream = self.compile_and_audit_downstream()
+            downstream = self.compile_and_audit_downstream(targets)
             report["downstream"] = downstream
         self.freshness()
         report.update(sourceSha256=fingerprint(self.initial),
@@ -7897,6 +8086,10 @@ def main() -> int:
                              "(default: $ANNEAL_TRUSTED_BASE_SNAPSHOT); any other TCB drift fails")
     parser.add_argument("--expected-tcb-drift", action="append", default=[], metavar="RELPATH",
                         help="checkout-relative TCB path allowed to differ from --base-snapshot (repeatable)")
+    parser.add_argument("--exact-modules", metavar="M1,M2,...",
+                        help="audit only these DOWNSTREAM_TARGETS modules and their transitive downstream imports")
+    parser.add_argument("--orphan-only", action="store_true", help="only check shard partition completeness (no Lean)")
+    parser.add_argument("--shard-manifest", type=Path, help="JSON shard manifest for --orphan-only")
     args = parser.parse_args()
     checkout = Path(__file__).resolve().parent.parent.parent
     if args.lean is not None and not args.lean.is_absolute():
@@ -7908,6 +8101,15 @@ def main() -> int:
     base_snapshot = args.base_snapshot
     if base_snapshot is None and os.environ.get("ANNEAL_TRUSTED_BASE_SNAPSHOT"):
         base_snapshot = Path(os.environ["ANNEAL_TRUSTED_BASE_SNAPSHOT"])
+    if args.orphan_only or args.exact_modules is not None:
+        try:
+            if args.orphan_only:
+                print(f"PASS: shard partition complete; {json.dumps(orphan_check(checkout, args.shard_manifest))}")
+                return 0
+            exact_targets = resolve_exact_modules(args.exact_modules)
+        except Failure as error:
+            print(f"Trusted check failed ({error.phase}): {error}", file=sys.stderr)
+            return error.code
     if args.audit_vacuity:
         try:
             if base_snapshot is not None:
@@ -7931,7 +8133,7 @@ def main() -> int:
         print(f"Trusted check could not create its private temporary directory: {error}", file=sys.stderr)
         return 2
     try:
-        report = checker.run(check_downstream=True)
+        report = checker.run(check_downstream=True, targets=exact_targets if args.exact_modules is not None else None)
     except (Failure, OSError, ValueError, KeyError, TypeError) as error:
         code = error.code if isinstance(error, Failure) else 2
         phase = error.phase if isinstance(error, Failure) else checker.phase
@@ -7948,7 +8150,9 @@ def main() -> int:
           f"{report['kernelDeclarations']} Trusted kernel declarations; "
           f"{downstream.get('replayedDeclarations', 0)} total replayed declarations; "
           f"{downstream.get('claimTheoremsChecked', 0)} claim theorem statements origin-checked; "
-          f"axioms={report['axioms']}\nSource {report['sourceSha256']}; tools/policy {report['toolsSha256']}\n"
+          f"axioms={report['axioms']}\n{report['inductiveReplay']['inductiveConstants'] + downstream.get('inductiveReplay', {}).get('inductiveConstants', 0)} "
+          f"inductive/constructor/recursor constants replay-swept (lean4#16717)\n"
+          f"Source {report['sourceSha256']}; tools/policy {report['toolsSha256']}\n"
           f"Waiver pins and annotated-claim vacuity: {staged_lean} staged Lean files, "
           f"{audited.get('rustcCapture', {}).get('rustFiles', 0)} trusted/rustc-capture Rust files\n"
           f"{report['toolchain']}")
