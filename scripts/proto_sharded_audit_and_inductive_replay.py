@@ -5569,6 +5569,15 @@ def scan_lean_invariant_struct_sealing(
                         for idx in range(len(body_toks))
                     )
                     or any(t.text == f".{ctor}" for t in body_toks)
+                    # B4: an UNQUALIFIED `mk` resolves to the private constructor inside
+                    # `namespace S` / after `open S` / `open S in` (fail closed: any bare,
+                    # non-projection occurrence of the constructor name counts).
+                    or any(
+                        t.kind == "IDENT"
+                        and t.text == ctor
+                        and not (idx > 0 and body_toks[idx - 1].text in (".", "fun", "λ", "let", "have"))
+                        for idx, t in enumerate(body_toks)
+                    )
                 )
                 anon_count = sum(1 for t in body_toks if t.text in ("⟨", "{"))
                 if d["is_where_ctor"]:

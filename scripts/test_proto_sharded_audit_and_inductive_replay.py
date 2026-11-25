@@ -1688,6 +1688,22 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(proto.scan_lean_invariant_struct_sealing(hdr + body + "\n"), [], name)
 
+    def test_30l_guard6b_unqualified_private_ctor_via_namespace_or_open(self) -> None:
+        """B4: inside `namespace V` or after `open V` / `open V in`, the private constructor is
+        reachable UNQUALIFIED (`mk v`, `mk` as a function value) with no `⟨`, `{`, `V.mk`
+        token: A3's leak detection reported 0 findings for all three."""
+        hdr = "-- @sealed_invariant\nstructure V where\n  private mk ::\n  val : Nat\n"
+        bad = {
+            "namespace_bare_mk": "namespace V\ndef leak (v : Nat) : V := mk v\nend V",
+            "open_in_bare_mk": "open V in\ndef leak (v : Nat) : V := mk v",
+            "namespace_mk_value": "namespace V\ndef mkFn : Nat → V := mk\nend V",
+        }
+        for name, body in bad.items():
+            with self.subTest(name=name):
+                self.assertTrue(proto.scan_lean_invariant_struct_sealing(hdr + body + "\n"), name)
+        ok = "namespace V\ndef get (x : V) : Nat := x.val\nend V\ndef w (f : Nat → Nat) : Nat := f 0"
+        self.assertEqual(proto.scan_lean_invariant_struct_sealing(hdr + ok + "\n"), [])
+
     def test_31_live_repo_sweep_zero_false_positives_on_theory_and_anneal_spec(self) -> None:
         res = proto.scan_live_repo_peer_guards(REPO_ROOT)
         self.assertTrue(res["ok"], f"Live repo sweep had false positives: {res['findings']}")
