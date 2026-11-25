@@ -2207,7 +2207,41 @@ fn shadows_infallible(src: &str) -> Result<bool, PeerScanError> {
     Ok(false)
 }
 
-fn type_is_uninhabited(r: Lexer<'_>, infallible_shadowed: bool) -> Result<bool, PeerScanError> {
+/// Which names a source shadows when resolving `Infallible`.
+#[derive(Clone, Copy, Debug, Default)]
+struct Shadow {
+    /// A bare `Infallible` does not name `core::convert::Infallible`.
+    bare: bool,
+    /// A local `core` / `std` (module or alias) hijacks `core::..` / `std::..`
+    /// paths; only `::core::..` / `::std::..` stay trustworthy.
+    roots: bool,
+}
+
+impl Shadow {
+    const NONE: Self = Self {
+        bare: false,
+        roots: false,
+    };
+}
+
+/// Whether the source declares a local `core` / `std` module or alias.
+fn shadows_std_roots(src: &str) -> Result<bool, PeerScanError> {
+    let mut lx = Lexer::new(src, SourceDialect::Rust);
+    let mut prev: Option<Tok<'_>> = None;
+    while let Some(t) = lx.next()? {
+        if t.is_ident()
+            && matches!(t.text, "core" | "std")
+            && matches!(prev, Some(p) if p.is_kw("mod") || p.is_kw("as") || p.is_kw("crate")
+                || p.is_kw("struct") || p.is_kw("enum") || p.is_kw("type"))
+        {
+            return Ok(true);
+        }
+        prev = Some(t);
+    }
+    Ok(false)
+}
+
+fn type_is_uninhabited(r: Lexer<'_>, infallible_shadowed: Shadow) -> Result<bool, PeerScanError> {
     // Verus named return `(r: T)`.
     if let Some(inner) = whole_group(r, "(")? {
         let mut c = inner;
@@ -2224,6 +2258,7 @@ fn type_is_uninhabited(r: Lexer<'_>, infallible_shadowed: bool) -> Result<bool, 
         Some(t) if t.is_ident() || t.is_punct("::") => {
             let mut segs: [&str; 4] = [""; 4];
             let mut len = 0usize;
+            let leading_root = t.is_punct("::");
             if t.is_ident() {
                 segs[0] = t.text;
                 len = 1;
@@ -2240,8 +2275,10 @@ fn type_is_uninhabited(r: Lexer<'_>, infallible_shadowed: bool) -> Result<bool, 
                 }
             }
             Ok(match &segs[..len] {
-                ["Infallible"] => !infallible_shadowed,
-                ["core", "convert", "Infallible"] | ["std", "convert", "Infallible"] => true,
+                ["Infallible"] => !infallible_shadowed.bare,
+                ["core", "convert", "Infallible"] | ["std", "convert", "Infallible"] => {
+                    leading_root || !infallible_shadowed.roots
+                }
                 _ => false,
             })
         }
@@ -2361,7 +2398,7 @@ fn brace_continues_sig_clause(
 
 fn scan_fn_signature<'a>(
     after_fn: Lexer<'a>,
-    infallible_shadowed: bool,
+    infallible_shadowed: Shadow,
 ) -> Result<Option<FnSig<'a>>, PeerScanError> {
     let mut c = after_fn;
     let Some(name) = c.next()? else {
@@ -2750,7 +2787,10 @@ pub fn check_extern_ensures_false(
 
 /// Source scanner of Guard 3 over Rust source.
 pub fn check_extern_ensures_false_source(src: &str) -> GResult<()> {
-    let infallible_shadowed = shadows_infallible(src)?;
+    let infallible_shadowed = Shadow {
+        bare: shadows_infallible(src)?,
+        roots: shadows_std_roots(src)?,
+    };
     let mut lx = Lexer::new(src, SourceDialect::Rust);
     let mut st = DelimStack::new();
     let mut pending = AttrFlags::default();
@@ -3556,7 +3596,7 @@ fn collect_generic_mint_fns<'a>(
         if tparams.len == 0 {
             continue;
         }
-        let Some(sig) = scan_fn_signature(lx, false)? else {
+        let Some(sig) = scan_fn_signature(lx, Shadow::NONE)? else {
             continue;
         };
         let mut bc = sig.rest;
@@ -4744,8 +4784,31 @@ fn collect_assumption_helpers(src: &str) -> GResult<PairTable<'_, MAX_ASSUMPTION
                 take_attribute(&mut lx)?;
                 continue;
             }
+            if t.is_ident() && t.text == "macro_rules" && lx.next_is_punct("!")? {
+                // `macro_rules! h { () => { assumes_hold } }`: invoking `h!()`
+                // hides the atom's polarity.
+                let mut c = lx;
+                c.next()?;
+                let Some(name) = c.next()? else { continue };
+                let Some(open) = c.next()? else { continue };
+                if !name.is_ident() || !open.is_open() {
+                    continue;
+                }
+                let s = c.pos;
+                let close = skip_group(&mut c, &open)?;
+                let mut body = lx.range(s, close);
+                while let Some(n) = body.next()? {
+                    if n.is_ident()
+                        && (ASSUMPTION_ATOMS.contains(&n.text) || helpers.contains_first(n.text))
+                    {
+                        changed |= helpers.push(name.text, "", name.start)?;
+                        break;
+                    }
+                }
+                continue;
+            }
             if t.is_kw("fn") {
-                let Some(sig) = scan_fn_signature(lx, false)? else {
+                let Some(sig) = scan_fn_signature(lx, Shadow::NONE)? else {
                     continue;
                 };
                 let mut c = sig.rest;
@@ -4789,7 +4852,8 @@ fn collect_assumption_helpers(src: &str) -> GResult<PairTable<'_, MAX_ASSUMPTION
                     let mut init = lx.range(init_start, end);
                     while let Some(n) = init.next()? {
                         if n.is_ident()
-                            && (ASSUMPTION_ATOMS.contains(&n.text) || helpers.contains_first(n.text))
+                            && (ASSUMPTION_ATOMS.contains(&n.text)
+                                || helpers.contains_first(n.text))
                         {
                             changed |= helpers.push(name.text, "", name.start)?;
                             break;
@@ -4842,7 +4906,7 @@ pub fn check_assumption_polarity_source(src: &str) -> GResult<()> {
             }
         }
         if t.is_kw("fn") {
-            if let Some(sig) = scan_fn_signature(lx, false)? {
+            if let Some(sig) = scan_fn_signature(lx, Shadow::NONE)? {
                 if let Some(clauses) = sig.clauses {
                     for_each_sig_clause(clauses, &mut |kind, seg| visitor.visit_clause(kind, seg))?;
                 }
@@ -5662,7 +5726,7 @@ fn sealing_pass<'a>(
             if gated {
                 continue;
             }
-            let Some(sig) = scan_fn_signature(lx, false)? else {
+            let Some(sig) = scan_fn_signature(lx, Shadow::NONE)? else {
                 continue;
             };
             let mut c = sig.rest;
@@ -7813,12 +7877,16 @@ mod tests {
             Some(R::EnsuresFalseOnReturningFn)
         );
         assert_eq!(
-            g3("use my_crate::convert::Infallible; #[trusted] #[ensures(false)] fn f() -> Infallible;"),
+            g3(
+                "use my_crate::convert::Infallible; #[trusted] #[ensures(false)] fn f() -> Infallible;"
+            ),
             Some(R::EnsuresFalseOnReturningFn)
         );
         // Genuine `Option<Infallible>` / `Result<u8, Infallible>` elsewhere does NOT shadow.
         assert_eq!(
-            g3("use core::convert::Infallible; fn g() -> Option<Infallible> { None } #[trusted] #[ensures(false)] fn abort() -> Infallible;"),
+            g3(
+                "use core::convert::Infallible; fn g() -> Option<Infallible> { None } #[trusted] #[ensures(false)] fn abort() -> Infallible;"
+            ),
             None
         );
     }
@@ -7855,6 +7923,32 @@ mod tests {
             reason(check_assumption_polarity_lean_source(
                 "def benign : Prop := True\ntheorem t : benign → P := by simp"
             )),
+            None
+        );
+    }
+
+    #[test]
+    fn a4_g6a_macro_indirection_and_g3_root_hijack() {
+        assert_eq!(
+            g6a("macro_rules! h { () => { assumes_hold } } #[ensures(h!())] fn f() {}"),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            g6a("macro_rules! h { () => { !assumes_hold } } #[requires(h!())] fn f() {}"),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            g6a("macro_rules! h { () => { true } } #[ensures(h!())] fn f() {}"),
+            None
+        );
+        let hijack = "mod core { pub mod convert { pub struct Infallible(pub u8); } } #[trusted] #[ensures(false)] fn f() -> core::convert::Infallible;";
+        assert_eq!(g3(hijack), Some(R::EnsuresFalseOnReturningFn));
+        let hijack = "extern crate alloc as std; #[trusted] #[ensures(false)] fn f() -> std::convert::Infallible;";
+        assert_eq!(g3(hijack), Some(R::EnsuresFalseOnReturningFn));
+        let rooted = "mod core { pub mod convert { pub struct Infallible(pub u8); } } #[trusted] #[ensures(false)] fn f() -> ::core::convert::Infallible;";
+        assert_eq!(g3(rooted), None);
+        assert_eq!(
+            g3("#[trusted] #[ensures(false)] fn f() -> std::convert::Infallible;"),
             None
         );
     }
