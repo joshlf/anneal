@@ -515,6 +515,7 @@ run_cmd do
         `dvV2UpcastSideMir, `dvV2UpcastBaseMir, `dvV2UpcastAltMir, `dvV2NopRefMir,
         `dvV2NopRawMir, `dvGetU32Mir, `dvGetU64Mir, `dvPokeU32Mir, `dvV3CallU32Mir,
         `dvV3CallU64Mir, `dvV3CallOobMir, `dvV3CallHdrMir, `dvV3ArgCallMir,
+        `dvRawGetU32Mir, `dvV3RawCallMir,
         `dvV3ProtectedPokeMir, `dvV3PokeCallerMir, `dvV4SizeSafeMir, `dvV4AlignSafeMir,
         `dvV4IntrLayoutMir, `dvV4RawBorrowMir, `dvV4WideCmpMir, `dvV4WideEqMir,
         `dvV4AddrEqMir ]
@@ -587,8 +588,8 @@ run_cmd do
           (mkApp2 (mkConst ``Eq.refl [1]) calTy mrCal)
         added := added.push lockCal
         lockCount := lockCount + 1
-    unless lockCount = 99 do
-      throwError "cross-root: expected 99 fixture/spec locks (35 named + 64 per-key), got {lockCount}"
+    unless lockCount = 101 do
+      throwError "cross-root: expected 101 fixture/spec locks (37 named + 64 per-key), got {lockCount}"
 
     -- 4. Negative controls on scratch copies of the environment: the Lean kernel MUST reject
     -- every forged theorem, mode-inverted / variant-swapped authority, colliding or
@@ -782,6 +783,7 @@ run_cmd do
         lmNs ++ `dvUnsizeIntoPointer_thin_agrees_trusted,
         lmNs ++ `dvUnsizeIntoPointer_dynToDyn_agrees_trusted,
         lmNs ++ `dvResolveVirtual_agrees_trusted,
+        lmNs ++ `dvResolveVirtual_safeRef_agrees_trusted,
         lmNs ++ `dvLmObserve_v1_thinUnsize_table,
         lmNs ++ `dvLmObserve_v2_dynUpcastAndNop_table,
         lmNs ++ `dvLmObserve_v3_virtualDispatchAndProtector_table,
@@ -799,6 +801,7 @@ run_cmd do
         lmNs ++ `dv_unsize_agrees_realizable,
         lmNs ++ `dv_dynToDyn_agrees_realizable,
         lmNs ++ `dv_resolveVirtual_agrees_realizable,
+        lmNs ++ `dv_resolveVirtual_safeRef_agrees_realizable,
         lmNs ++ `dv_extra_witnesses,
         lmNs ++ `dv_c16_witnesses,
         lmNs ++ `dv_kani5216_uninhabited_witness,
@@ -906,7 +909,7 @@ run_cmd do
     { fileName := "<dv-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 134 && bundleCount = 5 && lockCount = 99 && rejectedCount = 17 do
+  unless addedCount = 136 && bundleCount = 5 && lockCount = 101 && rejectedCount = 17 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount})"
   logInfo m!"dv cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture/spec locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
@@ -2407,6 +2410,147 @@ theorem dynRefDataValid_scalar_hom
     scalarModulus_hom, wrapScalarBits_hom]
   rfl
 
+/-- **C7** Safe-reference (`isRef := true`) `T -> dyn K` unsizing on any scalar address
+(covering 32-bit wrapped null, ZST alignment, and `kani#5216` uninhabited `!`) commutes across
+dialects at EVERY pointer width under `DynViewRel`. -/
+theorem evalThinToDynUnsize_scalarRef_hom
+    (l6 : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (l8 : List Trusted.Rustc.V2026_08_01.MirSemantics.LocalSlot)
+    {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView}
+    {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView}
+    (h : DynViewRel mv6 mv8)
+    (ld6 : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
+    (ld8 : List Trusted.Rustc.V2026_08_01.MirAst.LocalDecl)
+    (La : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (Lb : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (hL : Trusted.Rustc.V2026_06_01.MirSemantics.layoutPointerBytes La =
+      Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb)
+    (sc : Trusted.Rustc.V2026_08_01.MirAst.ScalarInt)
+    (srcPointee : Trusted.Rustc.V2026_08_01.MirAst.RigidTy)
+    (dynKey : String) (isMut : Bool) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize
+        l6 mv6 ld6 La (.scalar (homScalar sc)) (homTy srcPointee) dynKey true isMut =
+      homDynCheckVal (Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize
+        l8 mv8 ld8 Lb (.scalar sc) srcPointee dynKey true isMut) := by
+  have hSz : (homScalar sc).sizeBytes = sc.sizeBytes := rfl
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize,
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize, hL, hSz, dynVTableEnv?_hom h]
+  generalize Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb = pb
+  cases Nat.beq sc.sizeBytes pb
+  · rfl
+  · cases Trusted.Rustc.V2026_08_01.MirSemantics.dynVTableEnv? .none mv8 pb with
+    | none => rfl
+    | some e =>
+      obtain ⟨vts, dts⟩ := e
+      simp only [Option.map_some, dynTypeModeled_hom]
+      cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dynKey
+      · rfl
+      · simp only [lookupVTableFor_hom]
+        cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupVTableFor vts srcPointee dynKey with
+        | none => rfl
+        | some entry =>
+          simp only [Option.map_some]
+          rw [dynRefDataValid_scalar_hom l6 mv6 ld6 La l8 mv8 ld8 Lb]
+          cases Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid l8 mv8 ld8 Lb pb
+            (.scalar sc) entry isMut true <;> rfl
+
+/-- **C7** Safe-reference (`isRef := true`) `dyn Src -> dyn Dst` NOP and trait upcasting on any
+scalar address commutes across dialects at EVERY pointer width under `DynViewRel`. -/
+theorem evalDynToDynUnsize_scalarRef_hom
+    (l6 : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (l8 : List Trusted.Rustc.V2026_08_01.MirSemantics.LocalSlot)
+    {mv6 : Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView}
+    {mv8 : Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView}
+    (h : DynViewRel mv6 mv8)
+    (ld6 : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
+    (ld8 : List Trusted.Rustc.V2026_08_01.MirAst.LocalDecl)
+    (La : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (Lb : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (hL : Trusted.Rustc.V2026_06_01.MirSemantics.layoutPointerBytes La =
+      Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb)
+    (sc : Trusted.Rustc.V2026_08_01.MirAst.ScalarInt)
+    (metaVal : Trusted.Rustc.V2026_08_01.MirSemantics.Value)
+    (srcKey dstKey : String) (isMut : Bool) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize
+        l6 mv6 ld6 La (.aggregate 0 [.scalar (homScalar sc), homValue metaVal]) srcKey dstKey true isMut =
+      homDynCheckVal (Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize
+        l8 mv8 ld8 Lb (.aggregate 0 [.scalar sc, metaVal]) srcKey dstKey true isMut) := by
+  have hSz : (homScalar sc).sizeBytes = sc.sizeBytes := rfl
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize,
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize, hL, hSz, stringEq_hom,
+    checkDynVTablePtr_hom h]
+  generalize Trusted.Rustc.V2026_08_01.MirSemantics.layoutPointerBytes Lb = pb
+  cases Nat.beq sc.sizeBytes pb
+  · rfl
+  · cases Trusted.Rustc.V2026_08_01.MirSemantics.stringEq srcKey dstKey
+    · cases Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr .none mv8 pb metaVal srcKey with
+      | ub => rfl
+      | unsupported => rfl
+      | ok w =>
+        obtain ⟨entry, vts, dts⟩ := w
+        simp only [homDynCheck, lookupDynType_hom, dynTypeModeled_hom, resolveUpcastVTable?_hom]
+        cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts srcKey with
+        | none =>
+          cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts dstKey with
+          | none =>
+            cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+            · rfl
+            · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey with
+              | none => rfl
+              | some dstEntry =>
+                simp only [Option.map_some]
+                rw [dynRefDataValid_scalar_hom l6 mv6 ld6 La l8 mv8 ld8 Lb]
+                cases Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid l8 mv8 ld8 Lb pb
+                  (.scalar sc) dstEntry isMut true <;> rfl
+          | some dd =>
+            simp only [Option.map_none, Option.map_some, homDynType_autoTraits]
+            cases dd.autoTraits with
+            | nil =>
+              cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+              · rfl
+              · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey with
+                | none => rfl
+                | some dstEntry =>
+                  simp only [Option.map_some]
+                  rw [dynRefDataValid_scalar_hom l6 mv6 ld6 La l8 mv8 ld8 Lb]
+                  cases Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid l8 mv8 ld8 Lb pb
+                    (.scalar sc) dstEntry isMut true <;> rfl
+            | cons _ _ => rfl
+        | some ds =>
+          cases Trusted.Rustc.V2026_08_01.MirSemantics.lookupDynType dts dstKey with
+          | none =>
+            cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+            · rfl
+            · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey with
+              | none => rfl
+              | some dstEntry =>
+                simp only [Option.map_some]
+                rw [dynRefDataValid_scalar_hom l6 mv6 ld6 La l8 mv8 ld8 Lb]
+                cases Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid l8 mv8 ld8 Lb pb
+                  (.scalar sc) dstEntry isMut true <;> rfl
+          | some dd =>
+            simp only [Option.map_some, homDynType_autoTraits, defPathsSubset_hom]
+            cases Trusted.Rustc.V2026_08_01.MirSemantics.defPathsSubset dd.autoTraits ds.autoTraits
+            · rfl
+            · cases Trusted.Rustc.V2026_08_01.MirSemantics.dynTypeModeled dts dstKey
+              · rfl
+              · cases Trusted.Rustc.V2026_08_01.MirSemantics.resolveUpcastVTable? vts dts entry dstKey with
+                | none => rfl
+                | some dstEntry =>
+                  simp only [Option.map_some]
+                  rw [dynRefDataValid_scalar_hom l6 mv6 ld6 La l8 mv8 ld8 Lb]
+                  cases Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid l8 mv8 ld8 Lb pb
+                    (.scalar sc) dstEntry isMut true <;> rfl
+    · cases Trusted.Rustc.V2026_08_01.MirSemantics.checkDynVTablePtr .none mv8 pb metaVal srcKey with
+      | ub => rfl
+      | unsupported => rfl
+      | ok w =>
+        obtain ⟨srcEntry, _, _⟩ := w
+        simp only [homDynCheck]
+        rw [dynRefDataValid_scalar_hom l6 mv6 ld6 La l8 mv8 ld8 Lb]
+        cases Trusted.Rustc.V2026_08_01.MirSemantics.dynRefDataValid l8 mv8 ld8 Lb pb
+          (.scalar sc) srcEntry isMut true <;> rfl
+
 theorem stackLocalAddrPageBase_hom (pb : Nat) :
     Trusted.Rustc.V2026_06_01.MirSemantics.stackLocalAddrPageBase pb =
       Trusted.Rustc.V2026_08_01.MirSemantics.stackLocalAddrPageBase pb := by
@@ -2898,6 +3042,60 @@ theorem evalDynToDynUnsize_raw_witness :
     Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts8 supPtr "Sub" "Sub" false false =
       .ub :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Witness 32-bit ZST + uninhabited (`kani#5216`) environment for safe-ref scalar unsizing &
+NOP/upcast in BOTH dialects. -/
+def wZstUninhabBody8 : Trusted.Rustc.V2026_08_01.MirAst.CapturedMir :=
+  { wBody8 with vtables := [wVTableUninhab8, wVTableZst8] }
+
+def wZstUninhabBody6 : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  { wBody6 with vtables := [homVTable wVTableUninhab8, homVTable wVTableZst8] }
+
+def wZstUninhabState8 : Trusted.Rustc.V2026_08_01.MirSemantics.MachineState :=
+  Trusted.Rustc.V2026_08_01.MirSemantics.initMachineStateWithCallees wZstUninhabBody8 [] [wZstUninhabBody8]
+
+def wZstUninhabState6 : Trusted.Rustc.V2026_06_01.MirSemantics.MachineState :=
+  Trusted.Rustc.V2026_06_01.MirSemantics.initMachineStateWithCallees wZstUninhabBody6 [] [wZstUninhabBody6]
+
+/-- Non-vacuity of `evalThinToDynUnsize_scalarRef_hom` & `evalDynToDynUnsize_scalarRef_hom`:
+at 32-bit pointer width (`pointerBits = 32`), in BOTH dialects:
+1. Valid aligned non-null ZST `&() -> &dyn Tr` returns `.ok` (both thin-to-dyn and dyn-to-dyn NOP);
+2. 32-bit wrapped null `2^32` on `&() -> &dyn Tr` faults `.ub`;
+3. `kani#5216` uninhabited `&! -> &dyn Tr` faults `.ub` (both thin-to-dyn and dyn-to-dyn NOP). -/
+theorem evalScalarRefUnsize_witness_32bit_uninhabited :
+    let mv6 := Trusted.Rustc.V2026_06_01.MirSemantics.DynMemView.ofMemory wZstUninhabState6.memory
+    let mv8 := Trusted.Rustc.V2026_08_01.MirSemantics.DynMemView.ofMemory wZstUninhabState8.memory
+    let zstOk8 : Trusted.Rustc.V2026_08_01.MirSemantics.Value :=
+      .aggregate 0 [.scalar ⟨4, 4⟩, .ptr { allocId := 16386, offsetBytes := 0 } 4]
+    let zstNull8 : Trusted.Rustc.V2026_08_01.MirSemantics.Value :=
+      .aggregate 0 [.scalar ⟨4294967296, 4⟩, .ptr { allocId := 16386, offsetBytes := 0 } 4]
+    let unin8 : Trusted.Rustc.V2026_08_01.MirSemantics.Value :=
+      .aggregate 0 [.scalar ⟨4, 4⟩, .ptr { allocId := 16385, offsetBytes := 0 } 4]
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize [] mv6 [] wLayouts32_6
+        (.scalar (homScalar ⟨4, 4⟩)) (homTy (.tuple [])) "Tr" true false = .ok (homValue zstOk8) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize [] mv8 [] wLayouts32_8
+        (.scalar ⟨4, 4⟩) (.tuple []) "Tr" true false = .ok zstOk8 ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize [] mv6 [] wLayouts32_6
+        (.scalar (homScalar ⟨4294967296, 4⟩)) (homTy (.tuple [])) "Tr" true false = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize [] mv8 [] wLayouts32_8
+        (.scalar ⟨4294967296, 4⟩) (.tuple []) "Tr" true false = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalThinToDynUnsize [] mv6 [] wLayouts32_6
+        (.scalar (homScalar ⟨4, 4⟩)) (homTy .never) "Tr" true false = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalThinToDynUnsize [] mv8 [] wLayouts32_8
+        (.scalar ⟨4, 4⟩) .never "Tr" true false = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize [] mv6 [] wLayouts32_6
+        (homValue zstOk8) "Tr" "Tr" true false = .ok (homValue zstOk8) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts32_8
+        zstOk8 "Tr" "Tr" true false = .ok zstOk8 ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize [] mv6 [] wLayouts32_6
+        (homValue zstNull8) "Tr" "Tr" true false = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts32_8
+        zstNull8 "Tr" "Tr" true false = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalDynToDynUnsize [] mv6 [] wLayouts32_6
+        (homValue unin8) "Tr" "Tr" true false = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalDynToDynUnsize [] mv8 [] wLayouts32_8
+        unin8 "Tr" "Tr" true false = .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.Mir.DynTraitVTableTests.Hom
 
@@ -4559,12 +4757,14 @@ run_cmd do
       `checkDynVTablePtr_opt_hom, `checkDynVTablePtr_hom,
       `evalThinToDynUnsize_raw_hom, `defPathsSubset_hom, `evalDynToDynUnsize_raw_hom,
       `dynRefDataValid_scalar_hom,
+      `evalThinToDynUnsize_scalarRef_hom, `evalDynToDynUnsize_scalarRef_hom,
       `evalDynSizeAlignOfVal_hom, `evalAddrEqCall_hom,
       `addrRel_of_root_borrows, `addrRel_of_no_borrows,
       `wState_dynMemRel, `wBare_dynMemRel, `wBody_optBodyRel, `wState_addrRel,
       `wBorrowState_addrRel, `wUpState_dynMemRel,
       `witness_written_values, `checkDynVTablePtr_opt_witness,
       `unpackDynReceiver?_witness, `evalDynToDynUnsize_raw_witness,
+      `evalScalarRefUnsize_witness_32bit_uninhabited,
       `evalThinToDynUnsize_raw_witness_32bit_64bit,
       `dynRefDataValid_scalar_witness_32bit_uninhabited,
       `evalDynSizeAlignOfVal_witness_write, `evalDynSizeAlignOfVal_witness_ub,

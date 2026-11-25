@@ -361,6 +361,19 @@ def dvV3ArgCallMir : CapturedMir :=
         (dvLoc 0) (some 1) .continue_),
      dvBb [] .return_]
 
+/-- Raw-pointer-receiver counterpart of `dvGetU32Mir` (`*const u32` receiver),
+locked in §0 for the raw-receiver virtual-call correspondence witness. -/
+def dvRawGetU32Mir : CapturedMir :=
+  { dvGetU32Mir with localDecls := [dvDecl dvU32Ty, dvDecl dvRawConstU32Ty, dvDecl dvU32Ty] }
+
+/-- Raw-receiver virtual-call fixture (`fn(p: *const dyn Tr) -> u32`), locked in
+§0 alongside `dvRawGetU32Mir`. -/
+def dvV3RawCallMir : CapturedMir :=
+  dvMkBody "dv::v3_raw_call" [dvDecl dvU32Ty, dvDecl (dvRawConstDynTy dvTrKey)] 1
+    [dvBb [] (.call (dvFnConst "dv::Tr::get" [.dynamic dvTrKey]) [.move (dvLoc 1), dvConstU32 5]
+        (dvLoc 0) (some 1) .continue_),
+     dvBb [] .return_]
+
 /-- The body of `<u32 as Tr>::poke` run in its own frame, with the receiver's
 pointee as the extra local `_3 : u32`: the Crubit `c16` protected-receiver
 aliased write isolated at callee level (`*p = 99` while `&self` is live). -/
@@ -2317,16 +2330,19 @@ private theorem dv_get?_eq_getElem? {α : Type} :
   | x :: xs, n => by cases n with | zero => rfl | succ m => exact dv_get?_eq_getElem? xs m
 
 /-- **Universal (`Cast.unsizeIntoPointer` ↔ Trusted `evalThinToDynUnsize`,
-pointer-coupled on BOTH data and vtable words)**: for EVERY captured body
-`currentBody`, concrete type `cty`, trait key `k`, and coupled thin data pointer
-`(dataAid, dataTag, dataBase, dataAddr)` ↔ Trusted `p : ProvenancePtr`:
+pointer-coupled on BOTH data and vtable words, kind-locked across BOTH raw
+`*const`/`*mut` AND safe `&`/`&mut` coercions)**: for EVERY captured body
+`currentBody`, concrete type `cty`, trait key `k`, pointer kind `isRef`, and
+coupled thin data pointer `(dataAid, dataTag, dataBase, dataAddr)` ↔ Trusted
+`p : ProvenancePtr` (with `tgtTy = wideSafeDynRefTyId` iff `isRef = true`, else
+`wideRawDynPtrTyId`):
 1. Miri's data scalar `dataSc` couples to Trusted's exact `p`
    (`dvPtrCouples st.machine dataSc p`) and Miri's reserved vtable scalar `vtSc`
    couples to Trusted's exact `{ allocId := entry.vtableAllocId, offsetBytes := 0 }`;
 2. Vendored `Miri.Interpreter.Cast.unsizeIntoPointer` (under
    `annealCastHooksDynTraitVTable`) writes `(.scalarPair dataSc vtSc)` into `dest`;
-3. Trusted `evalThinToDynUnsize … isRef := false` on the matching 64-bit
-   environment produces `.ok (.aggregate 0 [.ptr p 8, .ptr { allocId :=
+3. Trusted `evalThinToDynUnsize … isRef isMut` (assuming `dynRefDataValid` when
+   `isRef = true`) produces `.ok (.aggregate 0 [.ptr p 8, .ptr { allocId :=
    entry.vtableAllocId, offsetBytes := 0 } 8])`. -/
 theorem dvUnsizeIntoPointer_thin_agrees_trusted
     (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry) (tb : Bool)
@@ -2337,6 +2353,8 @@ theorem dvUnsizeIntoPointer_thin_agrees_trusted
     (srcLay : Miri.Interpreter.LocalLayout) (dest : Miri.Interpreter.RuntimePlace AnnealProv)
     (srcTy tgtTy : Miri.MIR.TyId) (st : AnnealStepState)
     (srcKind : Miri.Interpreter.CastTypeInfo)
+    (isRef isMut : Bool)
+    (hTgtTy : tgtTy = if isRef then wideSafeDynRefTyId else wideRawDynPtrTyId)
     (hTails : dvActiveUnsizeTails? currentBody st =
       some (dvConcreteTyId currentBody.vtables cty, dvDynTailTyId currentBody.vtables k))
     (hKeySmall : dvKeyIdx currentBody.vtables k < 100000)
@@ -2357,7 +2375,9 @@ theorem dvUnsizeIntoPointer_thin_agrees_trusted
     (hPb : layoutPointerBytes layouts = 8)
     (hEnv : dynVTableEnv? .none mv 8 = some (currentBody.vtables, dts))
     (hMod : dynTypeModeled dts k = true)
-    (p : ProvenancePtr) (isMut : Bool)
+    (p : ProvenancePtr)
+    (hRefOk : isRef = true →
+      dynRefDataValid hLocals mv decls layouts 8 (.ptr p 8) entry isMut true = true)
     (hDataBase : st.machine.lookupBaseAddr dataAid = some dataBase)
     (hDataLe : dataBase ≤ dataAddr)
     (hDataId : dataAid.value.toNat = p.allocId)
@@ -2373,9 +2393,10 @@ theorem dvUnsizeIntoPointer_thin_agrees_trusted
         ⟨.immediate (.scalar dataSc), srcLay⟩ dest srcTy tgtTy st =
       (annealCastHooksDynTraitVTable currentBody fnPtrs tb).writeImmediate ()
         (.scalarPair dataSc vtSc) dest st ∧
-    evalThinToDynUnsize hLocals mv decls layouts (.ptr p 8) cty k false isMut =
+    evalThinToDynUnsize hLocals mv decls layouts (.ptr p 8) cty k isRef isMut =
       .ok (.aggregate 0 [.ptr p 8, .ptr { allocId := entry.vtableAllocId, offsetBytes := 0 } 8]) := by
   intro dataPtr dataSc vtSc
+  have _ := hTgtTy
   have hIdEq : aid.value.toNat = entry.vtableAllocId := by
     have hReg := dvRegistryReserve_eq_lookupVTableFor currentBody.vtables cty k hNz hCty
     rw [hRes, hLookup] at hReg
@@ -2433,23 +2454,30 @@ theorem dvUnsizeIntoPointer_thin_agrees_trusted
       rfl
   · unfold evalThinToDynUnsize
     have h88 : Nat.beq 8 8 = true := rfl
-    simp only [hPb, h88, hEnv, hMod, hLookup]
+    cases isRef with
+    | false => simp only [hPb, h88, hEnv, hMod, hLookup]
+    | true => simp only [hPb, h88, hEnv, hMod, hLookup, hRefOk rfl]
 
 /-- **Universal (`Cast.unsizeIntoPointer` dyn-to-dyn ↔ Trusted
-`evalDynToDynUnsize`, pointer-coupled on BOTH data and vtable words)**:
+`evalDynToDynUnsize`, pointer-coupled on BOTH data and vtable words, kind-locked
+across BOTH raw `*const`/`*mut dyn` AND safe `&`/`&mut dyn`)**:
 for EVERY captured body `currentBody`, source/target trait keys `srcKey`,
-`dstKey`, and coupled wide source pointer `(dataSc, srcVtSc)` ↔
+`dstKey`, pointer kind `isRef` (with `srcTy = tgtTy = srcLay.ty =
+wideSafeDynRefTyId` iff `isRef = true`, else `wideRawDynPtrTyId`), and coupled
+wide source pointer `(dataSc, srcVtSc)` ↔
 `(dp, { allocId := srcEntry.vtableAllocId, offsetBytes := 0 })`:
 1. **NOP (`stringEq srcKey dstKey = true`)**: vendored `Cast.unsizeIntoPointer`
    writes `(.scalarPair dataSc srcVtSc)` unchanged AND Trusted
-   `evalDynToDynUnsize … isRef := false` preserves
+   `evalDynToDynUnsize … isRef isMut` (assuming `dynRefDataValid` on `srcEntry`
+   when `isRef = true`) preserves
    `.aggregate 0 [.ptr dp 8, .ptr { allocId := srcEntry.vtableAllocId, offsetBytes := 0 } 8]`,
    with both output words coupled by `dvPtrCouples`;
 2. **`TraitVPtr` supertrait upcast (`stringEq srcKey dstKey = false`,
    `dvSupertraitSlot = some slotIdx`, `resolveUpcastVTable? = some dstEntry`)**:
    vendored `Cast.unsizeIntoPointer` validates the source vtable + `TraitVPtr`
    slot and writes `(.scalarPair dataSc dstVtSc)` AND Trusted
-   `evalDynToDynUnsize … isRef := false` produces
+   `evalDynToDynUnsize … isRef isMut` (assuming `dynRefDataValid` on `dstEntry`
+   when `isRef = true`) produces
    `.aggregate 0 [.ptr dp 8, .ptr { allocId := dstEntry.vtableAllocId, offsetBytes := 0 } 8]`,
    with BOTH output words coupled by `dvPtrCouples` to the exact same `(dp, dstEntry)`. -/
 theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
@@ -2460,6 +2488,10 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
     (srcVtAid : Miri.Memory.AllocId) (srcVtTag : Miri.Memory.BorTag) (srcVtBase : UInt64)
     (srcLay : Miri.Interpreter.LocalLayout) (dest : Miri.Interpreter.RuntimePlace AnnealProv)
     (srcTy tgtTy : Miri.MIR.TyId) (st : AnnealStepState)
+    (isRef isMut : Bool)
+    (hSrcTy : srcTy = if isRef then wideSafeDynRefTyId else wideRawDynPtrTyId)
+    (hTgtTy : tgtTy = if isRef then wideSafeDynRefTyId else wideRawDynPtrTyId)
+    (hSrcLay : srcLay.ty = srcTy)
     (hTails : dvActiveUnsizeTails? currentBody st =
       some (dvDynTailTyId currentBody.vtables srcKey, dvDynTailTyId currentBody.vtables dstKey))
     (hSrcSmall : dvKeyIdx currentBody.vtables srcKey < 100000)
@@ -2472,7 +2504,7 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
     (hNb : lookupBorrow mv.borrows srcEntry.vtableAllocId = none)
     (hLookupSrc : lookupVTableByAllocId currentBody.vtables srcEntry.vtableAllocId = some srcEntry)
     (hSrcKeyEq : stringEq srcEntry.dynKey srcKey = true)
-    (dp : ProvenancePtr) (isMut : Bool)
+    (dp : ProvenancePtr)
     (hDataBase : st.machine.lookupBaseAddr dataAid = some dataBase)
     (hDataLe : dataBase ≤ dataAddr)
     (hDataId : dataAid.value.toNat = dp.allocId)
@@ -2489,13 +2521,15 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
     let srcFatVal : Value :=
       .aggregate 0 [.ptr dp 8, .ptr { allocId := srcEntry.vtableAllocId, offsetBytes := 0 } 8]
     (stringEq srcKey dstKey = true →
+      (isRef = true →
+        dynRefDataValid hLocals mv decls layouts 8 (.ptr dp 8) srcEntry isMut true = true) →
       dvPtrCouples st.machine dataSc dp ∧
       dvPtrCouples st.machine srcVtSc { allocId := srcEntry.vtableAllocId, offsetBytes := 0 } ∧
       Miri.Interpreter.Cast.unsizeIntoPointer (annealCastHooksDynTraitVTable currentBody fnPtrs tb) ()
           ⟨.immediate (.scalarPair dataSc srcVtSc), srcLay⟩ dest srcTy tgtTy st =
         (annealCastHooksDynTraitVTable currentBody fnPtrs tb).writeImmediate ()
           (.scalarPair dataSc srcVtSc) dest st ∧
-      evalDynToDynUnsize hLocals mv decls layouts srcFatVal srcKey dstKey false isMut =
+      evalDynToDynUnsize hLocals mv decls layouts srcFatVal srcKey dstKey isRef isMut =
         .ok srcFatVal) ∧
     (∀ (dstEntry : CapturedVTable) (dstVtAid : Miri.Memory.AllocId) (dstVtBase : UInt64)
         (slotIdx : Nat),
@@ -2512,6 +2546,8 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
       dvRegistryReserve (dvRegistry vts) (dvConcreteTyId vts srcEntry.concreteTy)
         (dvKeyIdx vts dstKey) 0 = some dstVtAid →
       st.machine.lookupBaseAddr dstVtAid = some dstVtBase →
+      (isRef = true →
+        dynRefDataValid hLocals mv decls layouts 8 (.ptr dp 8) dstEntry isMut true = true) →
       let dstVtSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
         ⟨Miri.ABI.Size.ofBytes dstVtBase, .concrete dstVtAid .one⟩
       dvPtrCouples st.machine dataSc dp ∧
@@ -2520,10 +2556,11 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
           ⟨.immediate (.scalarPair dataSc srcVtSc), srcLay⟩ dest srcTy tgtTy st =
         (annealCastHooksDynTraitVTable currentBody fnPtrs tb).writeImmediate ()
           (.scalarPair dataSc dstVtSc) dest st ∧
-      evalDynToDynUnsize hLocals mv decls layouts srcFatVal srcKey dstKey false isMut =
+      evalDynToDynUnsize hLocals mv decls layouts srcFatVal srcKey dstKey isRef isMut =
         .ok (.aggregate 0
           [.ptr dp 8, .ptr { allocId := dstEntry.vtableAllocId, offsetBytes := 0 } 8])) := by
   intro vts dataPtr srcVtPtr dataSc srcVtSc srcFatVal
+  have _ := hSrcTy; have _ := hTgtTy; have _ := hSrcLay
   have hMkKind : ∀ (k : DefPath), dvKeyIdx vts k < 100000 →
       (annealCastHooksDynTraitVTable currentBody fnPtrs tb).typeInfo ()
         (dvDynTailTyId vts k) st = .ok (.dynamic (dvKeyIdx vts k)) st := by
@@ -2561,8 +2598,8 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
       { allocId := srcEntry.vtableAllocId, offsetBytes := 0 } :=
     ⟨srcVtAid, srcVtTag, srcVtBase, srcVtBase, rfl, hSrcVtBase, UInt64.le_refl _, hSrcVtId, by simp⟩
   have h88 : Nat.beq 8 8 = true := rfl
-  refine ⟨fun hEqKey => ?_, fun dstEntry dstVtAid dstVtBase slotIdx hNeKey hNeIdx hCty hVtForSrc
-      hSupSlot hEntSlot hUpcast hDstRes hDstBase => ?_⟩
+  refine ⟨fun hEqKey hRefNop => ?_, fun dstEntry dstVtAid dstVtBase slotIdx hNeKey hNeIdx hCty hVtForSrc
+      hSupSlot hEntSlot hUpcast hDstRes hDstBase hRefUp => ?_⟩
   · have hSrcMem : srcEntry ∈ vts := dv_lookupVTableByAllocId_mem vts _ _ hLookupSrc
     have hEntryDst : stringEq srcEntry.dynKey dstKey = true := by
       rw [dv_stringEq_iff] at hSrcKeyEq hEqKey ⊢
@@ -2576,7 +2613,9 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
       simp only [bind, EStateM.bind, hLock, hSrcKind, hDstKind, hReadImm, hKeyEq,
         beq_self_eq_true, ↓reduceIte]
     · unfold evalDynToDynUnsize
-      simp only [hPb, h88, hEqKey, hChkSrc, srcFatVal]
+      cases isRef with
+      | false => simp only [hPb, h88, hEqKey, hChkSrc, srcFatVal]
+      | true => simp only [hPb, h88, hEqKey, hChkSrc, hRefNop rfl, srcFatVal]
   · intro dstVtSc
     have hLookupDst : lookupVTableFor vts srcEntry.concreteTy dstKey = some dstEntry :=
       dv_resolveUpcastVTable_eq_lookupVTableFor vts [] srcEntry dstEntry dstKey hUpcast
@@ -2641,8 +2680,20 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
         hSrcVtToPtr, hVtCheck, hSup, hPrinc, hEnts, hEntSlot, hErase, hNorm, bne_self_eq_false,
         hGetDst, hNewDyn, pure, EStateM.pure]
     · unfold evalDynToDynUnsize
-      simp only [hPb, h88, hNeKey, hChkSrc, lookupDynType, dynTypeModeled, hUpcast, srcFatVal]
-      rfl
+      cases isRef with
+      | false =>
+        simp only [hPb, h88, hNeKey, hChkSrc, lookupDynType, dynTypeModeled, hUpcast, srcFatVal]
+        rfl
+      | true =>
+        simp only [hPb, h88, hNeKey, hChkSrc, lookupDynType, dynTypeModeled, hUpcast, srcFatVal]
+        show (match true && true with
+          | false => DynCheck.unsupported
+          | true =>
+            match dynRefDataValid hLocals mv decls layouts 8 (.ptr dp 8) dstEntry isMut true with
+            | true => DynCheck.ok (Value.aggregate 0 [Value.ptr dp 8, Value.ptr { allocId := dstEntry.vtableAllocId, offsetBytes := 0 } 8])
+            | false => DynCheck.ub) = _
+        simp only [hRefUp rfl]
+        rfl
 
 /-- **Universal JOINT (`VirtualCalls.resolveVirtual` ↔ Trusted `evalVirtualCall`,
 pointer-coupled on BOTH data and vtable words)**:
@@ -2757,25 +2808,15 @@ theorem dvResolveVirtual_agrees_trusted
       .ok ⟨⟨⟨dataPtr.offset, some dataPtr.provenance⟩, .metadata vtSc, none⟩,
         dvDynLayout (dvDynTailBase + dvKeyIdx vts k)⟩ st := by
     unfold Miri.Interpreter.VirtualCalls.receiverPlace
-    have hRecvTy : recvLay.ty = wideSafeDynRefTyId ∨ recvLay.ty = wideRawDynPtrTyId :=
-      Or.inr hRecvRaw
-    rcases hRecvTy with hSafe | hRaw
-    · simp only [dvVirtualHooks, dvVirtualCompilerHooks, hSafe, beq_self_eq_true, ↓reduceIte,
-        Bool.true_or, annealReadImmediateOverlay, bind, EStateM.bind, pure, EStateM.pure]
-      unfold Miri.Interpreter.VirtualCalls.pointerPlace
-      dv_vc_pre
-      simp only [dvVirtualCompilerHooks, hSafe, beq_self_eq_true, ↓reduceIte, Bool.true_or,
-        hTailIdx, Miri.Interpreter.Immediate.toScalarAndMeta, hDataToPtr, dv_hvse,
-        bind, EStateM.bind, pure, EStateM.pure]
-    · have hNe : (wideRawDynPtrTyId == wideSafeDynRefTyId) = false := by decide
-      simp only [dvVirtualHooks, dvVirtualCompilerHooks, hRaw, hNe, beq_self_eq_true,
-        Bool.false_eq_true, ↓reduceIte, Bool.or_true, annealReadImmediateOverlay,
-        bind, EStateM.bind, pure, EStateM.pure]
-      unfold Miri.Interpreter.VirtualCalls.pointerPlace
-      dv_vc_pre
-      simp only [dvVirtualCompilerHooks, hRaw, hNe, beq_self_eq_true, Bool.false_eq_true,
-        ↓reduceIte, Bool.or_true, hTailIdx, Miri.Interpreter.Immediate.toScalarAndMeta,
-        hDataToPtr, dv_hvse, bind, EStateM.bind, pure, EStateM.pure]
+    have hNe : (wideRawDynPtrTyId == wideSafeDynRefTyId) = false := by decide
+    simp only [dvVirtualHooks, dvVirtualCompilerHooks, hRecvRaw, hNe, beq_self_eq_true,
+      Bool.false_eq_true, ↓reduceIte, Bool.or_true, annealReadImmediateOverlay,
+      bind, EStateM.bind, pure, EStateM.pure]
+    unfold Miri.Interpreter.VirtualCalls.pointerPlace
+    dv_vc_pre
+    simp only [dvVirtualCompilerHooks, hRecvRaw, hNe, beq_self_eq_true, Bool.false_eq_true,
+      ↓reduceIte, Bool.or_true, hTailIdx, Miri.Interpreter.Immediate.toScalarAndMeta,
+      hDataToPtr, dv_hvse, bind, EStateM.bind, pure, EStateM.pure]
   have hArgs0 : args[0]? =
       some (.Copy ⟨.immediate (.scalarPair dataSc vtSc), recvLay⟩) := rfl
   have hUnsized : (dvDynLayout (dvDynTailBase + dvKeyIdx vts k)).layout.isSized = false := rfl
@@ -2872,6 +2913,267 @@ theorem dvResolveVirtual_agrees_trusted
   · unfold evalVirtualCall
     simp only [hPb, hTy, hKind, hCompat, unpackDynReceiver?, hChkTrusted, DynReceiverKind.isSafeRef,
       hVmSlotEq, dv_get?_eq_getElem?, hSlot, narrowDynReceiver, hCal, hAbiOk, trustedRecvVal]
+
+/-- **Universal JOINT SAFE-REFERENCE (`VirtualCalls.resolveVirtual` ↔ Trusted
+`evalVirtualCall` with Condition `C3` pre-`extCall` validity gate & Condition
+`C4` Crubit `c16` `protectDynReceiverOnEntry`)**:
+for EVERY captured vtable table `vts`, virtual-method table `vms`, trait key
+`k`, and coupled safe-reference receiver `(dataSc, vtSc)` ↔ `(dp, vp)` with the
+**EXACT SAME safe `&dyn` / `&mut dyn` receiver kind** on BOTH authorities
+(Miri `wideSafeDynRefTyId`, Trusted `.ref mutb`):
+1. Both `dataSc` ↔ `dp` and `vtSc` ↔ `vp` satisfy `dvPtrCouples`;
+2. **Non-method / OOB slot**: whenever `v.slots[slot]?` is neither `.method` nor
+   `.unmodeledMethod`, vendored `VirtualCalls.resolveVirtual` throws
+   `.undefinedBehavior` AND Trusted `evalVirtualCall` faults `MirStepNode.fail .ub`;
+3. **Condition `C3` pre-`extCall` reference-validity gate**: whenever
+   `v.slots[slot]?` is `.method _ _` or `.unmodeledMethod` AND
+   `dynRefDataValid … (.ptr dp 8) v isMut true = false`, Trusted `evalVirtualCall`
+   faults `MirStepNode.fail .ub` **for ANY `s.memory.callees`** (even empty `[]`,
+   never escaping to `.extCall`);
+4. **Valid safe-ref method dispatch + Condition `C4` `protectDynReceiverOnEntry`**:
+   whenever `v.slots[slot]? = some (.method p tys)`, `dynRefDataValid … = true`,
+   `lookupCallee … = some calleeBody`, and `virtualCalleeAbiOk … = some true`:
+   - If `protectDynReceiverOnEntry (pushCalleeFrame …) (.ref mutb) (.ptr dp 8) v = some s2`,
+     vendored `VirtualCalls.resolveVirtual` resolves `(dvMethodInstance vts p, callerAbi', args')`
+     with narrowed `args'[0]?` coupled to `dp` AND Trusted `evalVirtualCall` steps
+     to `MirStepNode.step s2` (the protected callee entry frame);
+   - If `protectDynReceiverOnEntry … = none`, Trusted `evalVirtualCall` faults
+     `MirStepNode.fail .ub`. -/
+theorem dvResolveVirtual_safeRef_agrees_trusted
+    (vts : List CapturedVTable) (vms : List CapturedVirtualMethod) (k : DefPath)
+    (v : CapturedVTable) (ty : Miri.MIR.TyId)
+    (dataAid : Miri.Memory.AllocId) (dataTag : Miri.Memory.BorTag)
+    (dataBase dataAddr : UInt64)
+    (vtAid : Miri.Memory.AllocId) (vtTag : Miri.Memory.BorTag) (vtBase : UInt64)
+    (recvLay : Miri.Interpreter.LocalLayout)
+    (restArgs : List (Miri.Interpreter.FnArg AnnealProv))
+    (virtInst : Miri.Interpreter.CallInstance) (defn : Miri.MIR.DefId) (slot : Nat)
+    (callerAbi : Miri.ABI.FnAbi Miri.MIR.TyId) (st : AnnealStepState)
+    (hRecvSafe : recvLay.ty = wideSafeDynRefTyId)
+    (hKeySmall : dvKeyIdx vts k < 100000)
+    (hVtTy : Miri.Interpreter.VTable.getPtrVTableType (dvVTableHooks vts) ()
+      ⟨Miri.ABI.Size.ofBytes vtBase, some (.concrete vtAid vtTag)⟩
+      (some (dvKeyIdx vts k)) st = .ok ty st)
+    (hVtFor : dvVTableFor? vts (some (dvKeyIdx vts k)) ty = some v)
+    (s : MachineState) (callerBody : CapturedMir) (vm : CapturedVirtualMethod)
+    (decls : List LocalDecl) (layouts : LayoutTable)
+    (recvOp : Operand) (restOps : List Operand) (restVals : List Value)
+    (locals' : List LocalSlot) (dest : Place) (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction) (recvTy : Ty) (mutb : Mutability)
+    (dp vp : ProvenancePtr)
+    (hPb : layoutPointerBytes layouts = 8)
+    (hTy : operandTy decls layouts recvOp = some recvTy)
+    (hKind : classifyDynReceiver? recvTy.kind = some (.ref mutb, k))
+    (hCompat : dynKeysCompatible (collectMemoryDynTypes (some callerBody) s.memory) k vm.dynKey = true)
+    (hEnv : dynVTableEnv? (some callerBody) (DynMemView.ofMemory s.memory) 8 = some (vts, []))
+    (hNb : lookupBorrow s.memory.borrows vp.tag = none)
+    (hLookupV : lookupVTableByAllocId vts vp.allocId = some v)
+    (hVpOff : vp.offsetBytes = 0)
+    (hKeyEq : stringEq v.dynKey k = true)
+    (hVmSlotEq : vm.slotIdx = slot)
+    (hDataBase : st.machine.lookupBaseAddr dataAid = some dataBase)
+    (hDataLe : dataBase ≤ dataAddr)
+    (hDataId : dataAid.value.toNat = dp.allocId)
+    (hDataOff : (dataAddr - dataBase).toNat = dp.offsetBytes)
+    (hVtBase : st.machine.lookupBaseAddr vtAid = some vtBase)
+    (hVtId : vtAid.value.toNat = vp.allocId) :
+    let dataPtr : Miri.Memory.Pointer AnnealProv :=
+      ⟨Miri.ABI.Size.ofBytes dataAddr, .concrete dataAid dataTag⟩
+    let vptr : Miri.Memory.Pointer AnnealProv :=
+      ⟨Miri.ABI.Size.ofBytes vtBase, .concrete vtAid vtTag⟩
+    let dataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout dataPtr
+    let vtSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout vptr
+    let args : Array (Miri.Interpreter.FnArg AnnealProv) :=
+      (.Copy ⟨.immediate (.scalarPair dataSc vtSc), recvLay⟩ :: restArgs).toArray
+    let trustedRecvVal : Value := .aggregate 0 [.ptr dp 8, .ptr vp 8]
+    let recvIsMut : Bool := match mutb with | .mut => true | .not => false
+    dvPtrCouples st.machine dataSc dp ∧
+    dvPtrCouples st.machine vtSc vp ∧
+    ((∀ p tys, v.slots[slot]? ≠ some (.method p tys)) →
+      v.slots[slot]? ≠ some .unmodeledMethod →
+      Miri.Interpreter.VirtualCalls.resolveVirtual (dvVirtualHooks vts vms (dvKeyIdx vts k)) () 1
+          virtInst defn slot callerAbi args st =
+        .error (.undefinedBehavior "dyn call trying to call something that is not a method") st ∧
+      evalVirtualCall s (some callerBody) vm decls layouts (recvOp :: restOps)
+          (trustedRecvVal :: restVals) locals' dest (some targetBb) unwind =
+        MirStepNode.fail .ub) ∧
+    (((∃ p tys, v.slots[slot]? = some (.method p tys)) ∨ v.slots[slot]? = some .unmodeledMethod) →
+      dynRefDataValid locals' (DynMemView.ofMemory s.memory) decls layouts 8 (.ptr dp 8) v
+          recvIsMut true = false →
+      evalVirtualCall s (some callerBody) vm decls layouts (recvOp :: restOps)
+          (trustedRecvVal :: restVals) locals' dest (some targetBb) unwind =
+        MirStepNode.fail .ub) ∧
+    (∀ (p : DefPath) (tys : List RigidTy) (vmRec : CapturedVirtualMethod) (cty : RigidTy)
+        (calleeBody : CapturedMir),
+      v.slots[slot]? = some (.method p tys) →
+      dynRefDataValid locals' (DynMemView.ofMemory s.memory) decls layouts 8 (.ptr dp 8) v
+          recvIsMut true = true →
+      dvVirtualBase ≤ defn →
+      vms[defn - dvVirtualBase]? = some vmRec →
+      dvKeyIdx vts vmRec.dynKey = dvKeyIdx vts k →
+      vmRec.slotIdx = slot →
+      dvConcreteOfTyId? vts ty = some cty →
+      0 < callerAbi.args.size →
+      lookupCallee s.memory.callees layouts p tys s.memory.traitImpls = some calleeBody →
+      virtualCalleeAbiOk calleeBody (.ref mutb) v.concreteTy (recvOp :: restOps)
+        (length (trustedRecvVal :: restVals)) decls layouts = some true →
+      let s1 := pushCalleeFrame s callerBody locals' dest targetBb calleeBody
+        (.ptr dp 8 :: restVals) unwind
+      (∀ s2,
+        protectDynReceiverOnEntry s1 (.ref mutb) (.ptr dp 8) v = some s2 →
+        (∃ callerAbi' args' recvThinLay,
+          Miri.Interpreter.VirtualCalls.resolveVirtual (dvVirtualHooks vts vms (dvKeyIdx vts k)) () 1
+              virtInst defn slot callerAbi args st =
+            .ok (dvMethodInstance vts p, callerAbi', args') st ∧
+          args'.size = args.size ∧
+          args'[0]? = some (.Copy ⟨.immediate (.scalar dataSc), recvThinLay⟩)) ∧
+        evalVirtualCall s (some callerBody) vm decls layouts (recvOp :: restOps)
+            (trustedRecvVal :: restVals) locals' dest (some targetBb) unwind =
+          MirStepNode.step s2) ∧
+      (protectDynReceiverOnEntry s1 (.ref mutb) (.ptr dp 8) v = none →
+        evalVirtualCall s (some callerBody) vm decls layouts (recvOp :: restOps)
+            (trustedRecvVal :: restVals) locals' dest (some targetBb) unwind =
+          MirStepNode.fail .ub)) := by
+  intro dataPtr vptr dataSc vtSc args trustedRecvVal recvIsMut
+  have hTailIdx : dvDynTailIdx? (dvDynTailBase + dvKeyIdx vts k) = some (dvKeyIdx vts k) := by
+    unfold dvDynTailIdx? dvDynTailBase dvConcreteBase
+    have hLo : 100000 ≤ 100000 + dvKeyIdx vts k := Nat.le_add_right _ _
+    have hHi : 100000 + dvKeyIdx vts k < 200000 := by omega
+    simp [hLo, hHi]
+  have hDataToPtr : dataSc.toPointer annealTargetDataLayout =
+      .ok ⟨dataPtr.offset, some dataPtr.provenance⟩ := rfl
+  have hVtToPtr : vtSc.toPointer annealTargetDataLayout =
+      .ok ⟨vptr.offset, some vptr.provenance⟩ := rfl
+  have hRecvPlace : Miri.Interpreter.VirtualCalls.receiverPlace
+      (dvVirtualHooks vts vms (dvKeyIdx vts k)) () 1
+      ⟨.immediate (.scalarPair dataSc vtSc), recvLay⟩ st =
+      .ok ⟨⟨⟨dataPtr.offset, some dataPtr.provenance⟩, .metadata vtSc, none⟩,
+        dvDynLayout (dvDynTailBase + dvKeyIdx vts k)⟩ st := by
+    unfold Miri.Interpreter.VirtualCalls.receiverPlace
+    simp only [dvVirtualHooks, dvVirtualCompilerHooks, hRecvSafe, beq_self_eq_true, ↓reduceIte,
+      Bool.true_or, annealReadImmediateOverlay, bind, EStateM.bind, pure, EStateM.pure]
+    unfold Miri.Interpreter.VirtualCalls.pointerPlace
+    dv_vc_pre
+    simp only [dvVirtualCompilerHooks, hRecvSafe, beq_self_eq_true, ↓reduceIte, Bool.true_or,
+      hTailIdx, Miri.Interpreter.Immediate.toScalarAndMeta, hDataToPtr, dv_hvse,
+      bind, EStateM.bind, pure, EStateM.pure]
+  have hArgs0 : args[0]? =
+      some (.Copy ⟨.immediate (.scalarPair dataSc vtSc), recvLay⟩) := rfl
+  have hUnsized : (dvDynLayout (dvDynTailBase + dvKeyIdx vts k)).layout.isSized = false := rfl
+  have hLayTy : (dvDynLayout (dvDynTailBase + dvKeyIdx vts k)).ty =
+      dvDynTailBase + dvKeyIdx vts k := rfl
+  have hComp : (dvVirtualHooks vts vms (dvKeyIdx vts k)).compiler =
+      dvVirtualCompilerHooks vts vms (dvKeyIdx vts k) := rfl
+  have hVt : (dvVirtualHooks vts vms (dvKeyIdx vts k)).vtable = dvVTableHooks vts := rfl
+  have hTgt : (dvVirtualHooks vts vms (dvKeyIdx vts k)).target = annealTargetDataLayout := rfl
+  have hTail : (dvVirtualCompilerHooks vts vms (dvKeyIdx vts k)).structTailForCodegen
+      (dvDynTailBase + dvKeyIdx vts k) = pure (dvDynTailBase + dvKeyIdx vts k) := rfl
+  have hDynData : (dvVirtualCompilerHooks vts vms (dvKeyIdx vts k)).dynamicData
+      (dvDynTailBase + dvKeyIdx vts k) =
+      pure (some { predicates := dvKeyIdx vts k, principal := some (dvKeyIdx vts k) }) := by
+    simp [dvVirtualCompilerHooks, hTailIdx]
+  have hChkTrusted : checkDynVTablePtr (some callerBody) (DynMemView.ofMemory s.memory) 8
+      (.ptr vp 8) k = .ok (v, vts, []) := by
+    rw [dv_checkDynVTablePtr_found (some callerBody) (DynMemView.ofMemory s.memory) vts vp k v
+      hEnv hNb hLookupV]
+    simp [hVpOff, hKeyEq]
+  have hDataCouples : dvPtrCouples st.machine dataSc dp :=
+    ⟨dataAid, dataTag, dataBase, dataAddr, rfl, hDataBase, hDataLe, hDataId, hDataOff⟩
+  have hVtCouples : dvPtrCouples st.machine vtSc vp :=
+    ⟨vtAid, vtTag, vtBase, vtBase, rfl, hVtBase, UInt64.le_refl _, hVtId, by simp [hVpOff]⟩
+  refine ⟨hDataCouples, hVtCouples, fun hSlot hUnm => ⟨?_, ?_⟩, fun hSl hRefBad => ?_,
+    fun p tys vmRec cty calleeBody hSlot hRefOk hDefGe hVm hVmKey hVmSlot hCty hAbiPos hCal hAbiOk =>
+      ⟨fun s2 hProt => ⟨?_, ?_⟩, fun hProtNone => ?_⟩⟩
+  · unfold Miri.Interpreter.VirtualCalls.resolveVirtual
+    dv_vc_pre
+    simp only [hArgs0, Miri.Interpreter.FnArg.copyFnArg, bind, EStateM.bind, hRecvPlace]
+    simp only [hComp, hVt, hTgt, hLayTy, hTail, hDynData, hUnsized, Bool.false_eq_true, ↓reduceIte,
+      Miri.Interpreter.MemPlaceMeta.unwrapMeta, dv_hvse, bind, EStateM.bind, hVtToPtr, vptr, hVtTy,
+      dvVTableHooks_entries, hVtFor, pure, EStateM.pure]
+    have hnm := dvVTableEntries_not_method vts v slot hSlot hUnm
+    cases hIdx : (dvVTableEntries vts v)[slot]? with
+    | none => rfl
+    | some en =>
+      cases en with
+      | method f => exact absurd hIdx (hnm f)
+      | _ => rfl
+  · unfold evalVirtualCall
+    simp only [hPb, hTy, hKind, hCompat, unpackDynReceiver?, hChkTrusted, hVmSlotEq,
+      dv_get?_eq_getElem?, trustedRecvVal]
+  · unfold evalVirtualCall
+    rcases hSl with ⟨p, tys, hSlM⟩ | hSlU
+    · cases mutb <;>
+        (dsimp only [recvIsMut] at hRefBad;
+         simp only [hPb, hTy, hKind, hCompat, unpackDynReceiver?, hChkTrusted,
+           DynReceiverKind.isSafeRef, DynReceiverKind.mutability, hVmSlotEq,
+           dv_get?_eq_getElem?, hSlM, hRefBad, trustedRecvVal])
+    · cases mutb <;>
+        (dsimp only [recvIsMut] at hRefBad;
+         simp only [hPb, hTy, hKind, hCompat, unpackDynReceiver?, hChkTrusted,
+           DynReceiverKind.isSafeRef, DynReceiverKind.mutability, hVmSlotEq,
+           dv_get?_eq_getElem?, hSlU, hRefBad, trustedRecvVal])
+  · have hEnt : (dvVTableEntries vts v)[slot]? = some (.method (dvMethodInstance vts p)) := by
+      rw [dvVTableEntries_getElem?, hSlot]; rfl
+    have hSlotGet : get? v.slots slot = some (.method p tys) := by
+      rw [dv_get?_eq_getElem?]; exact hSlot
+    have hArr0 : (#[Miri.MIR.GenericArg.Type ty] : Array Miri.MIR.GenericArg)[0]? =
+        some (.Type ty) := rfl
+    have hAssert : Miri.Interpreter.VirtualCalls.assertConcrete
+        (dvVirtualCompilerHooks vts vms (dvKeyIdx vts k)) () ty defn virtInst
+        (dvMethodInstance vts p) st = .ok () st := by
+      unfold Miri.Interpreter.VirtualCalls.assertConcrete
+      simp only [dvVirtualCompilerHooks, hDefGe, ↓reduceIte, hVm, hArr0, hVmKey, hVtFor, hVmSlot,
+        hSlotGet, bind, EStateM.bind, pure, EStateM.pure, bne_self_eq_false, Bool.false_eq_true]
+    have hArgsPos : 0 < args.size := by simp [args]
+    obtain ⟨firstAbi, hAbi0⟩ : ∃ a, callerAbi.args[0]? = some a := by
+      exact ⟨callerAbi.args[0], by simp [Array.getElem?_eq_getElem hAbiPos]⟩
+    let recvTyId := encodeTyIdOverlay { kind := .rawPtr .mut cty, layoutIdx := 0 }
+    have hMutPtr : (dvVirtualCompilerHooks vts vms (dvKeyIdx vts k)).mutPointerType ty st =
+        .ok recvTyId st := by
+      simp [dvVirtualCompilerHooks, hCty, recvTyId, pure, EStateM.pure]
+    let recvThinLay : Miri.Interpreter.LocalLayout :=
+      match dvDynTailIdx? recvTyId with
+      | some _ => dvDynLayout recvTyId
+      | none =>
+        match dvVTableOfConcreteTyId? vts recvTyId with
+        | some w => dvConcreteLayout vts w
+        | none => layoutOfEncodedTyIdOverlay recvTyId
+    have hLayOf : (dvVirtualCompilerHooks vts vms (dvKeyIdx vts k)).layoutOf recvTyId st =
+        .ok recvThinLay st := by
+      unfold dvVirtualCompilerHooks
+      dsimp only [recvThinLay]
+      cases dvDynTailIdx? recvTyId with
+      | some _ => rfl
+      | none =>
+        cases dvVTableOfConcreteTyId? vts recvTyId <;> rfl
+    have hFromMaybe : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
+        ⟨dataPtr.offset, some dataPtr.provenance⟩ = .ok dataSc := rfl
+    let recvArg : Miri.Interpreter.FnArg AnnealProv :=
+      .Copy ⟨.immediate (.scalar dataSc), recvThinLay⟩
+    let args' := args.set 0 recvArg hArgsPos
+    let firstAbi' := { firstAbi with layout := { firstAbi.layout with ty := recvTyId } }
+    let callerAbi' := { callerAbi with args := callerAbi.args.set 0 firstAbi' hAbiPos }
+    refine ⟨callerAbi', args', recvThinLay, ?_, by simp [args'], by simp [args', recvArg, hArgsPos]⟩
+    unfold Miri.Interpreter.VirtualCalls.resolveVirtual
+    dv_vc_pre
+    simp only [hArgs0, Miri.Interpreter.FnArg.copyFnArg, bind, EStateM.bind, hRecvPlace]
+    simp only [hComp, hVt, hTgt, hLayTy, hTail, hDynData, hUnsized, Bool.false_eq_true, ↓reduceIte,
+      Miri.Interpreter.MemPlaceMeta.unwrapMeta, dv_hvse, bind, EStateM.bind, hVtToPtr, vptr, hVtTy,
+      dvVTableHooks_entries, hVtFor, hEnt, hAssert, hMutPtr, hFromMaybe, hLayOf, hArgsPos,
+      ↓reduceDIte, hAbi0, hAbiPos, pure, EStateM.pure]
+    rfl
+  · unfold evalVirtualCall
+    cases mutb <;>
+      (dsimp only [recvIsMut] at hRefOk;
+       simp only [hPb, hTy, hKind, hCompat, unpackDynReceiver?, hChkTrusted, DynReceiverKind.isSafeRef,
+         DynReceiverKind.mutability, hVmSlotEq, dv_get?_eq_getElem?, hSlot, hRefOk,
+         narrowDynReceiver, hCal, hAbiOk, hProt, trustedRecvVal])
+  · unfold evalVirtualCall
+    cases mutb <;>
+      (dsimp only [recvIsMut] at hRefOk;
+       simp only [hPb, hTy, hKind, hCompat, unpackDynReceiver?, hChkTrusted, DynReceiverKind.isSafeRef,
+         DynReceiverKind.mutability, hVmSlotEq, dv_get?_eq_getElem?, hSlot, hRefOk,
+         narrowDynReceiver, hCal, hAbiOk, hProtNone, trustedRecvVal])
 
 /-! ## §3. Shared LeanMiri Execution, State & Observation Helpers -/
 
@@ -3763,72 +4065,136 @@ theorem dv_pin_adt_unsize_and_dispatch_from_dyn_witness :
     dispOk = true := by
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
 
+/-- Advance only the top frame's MIR statement index to `stmtIdx`, leaving the
+machine state and all locals intact. -/
+private def dvAtStmt (st : AnnealStepState) (stmtIdx : Nat) : AnnealStepState :=
+  match st.stack.frames[0]? with
+  | some f =>
+    { st with stack := { st.stack with
+        frames := st.stack.frames.set! 0 { f with location := .mir ⟨0, stmtIdx⟩ } } }
+  | none => st
+
 /-- **Realizability of `dvUnsizeIntoPointer_thin_agrees_trusted`**: instantiates
-the pointer-coupled universal `Cast.unsizeIntoPointer` ↔ Trusted
-`evalThinToDynUnsize` theorem on `dvV1RawUnsizeMir`, proving BOTH output words
-couple (`dvPtrCouples`, equivalently `dvDecodePtr`) to `(5, 1)` and `(16384, 0)`. -/
+the pointer-coupled, kind-locked universal `Cast.unsizeIntoPointer` ↔ Trusted
+`evalThinToDynUnsize` theorem on BOTH §0-locked fixtures:
+1. Raw `*const u32 -> *const dyn Tr` (`dvV1RawUnsizeMir`, dangling `(5, 1)` &
+   `(16384, 0)`);
+2. Safe `&u32 -> &dyn Tr` (`dvV1RefUnsizeMir` at `bb0, stmt 1`, live `(1, 0)` &
+   `(16384, 0)` passing `dynRefDataValid`). -/
 theorem dv_unsize_agrees_realizable :
-    let st0 := dvLmInit 0 1
+    let stRaw := dvLmInit 0 1
+    let stRef := dvAtStmt (dvLmInit 0 0) 1
     let vtAid : Miri.Memory.AllocId := ⟨16384, by decide⟩
-    let dataPtr : Miri.Memory.Pointer AnnealProv :=
+    let rawDataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
       ⟨Miri.ABI.Size.ofBytes (dvBase5 + 1), .concrete dvAid5 .one⟩
-    let dataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout dataPtr
+    let refDataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr dvAid1), .concrete dvAid1 .one⟩
     let vtSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
       ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr vtAid), .concrete vtAid .one⟩
-    let dest : Miri.Interpreter.RuntimePlace AnnealProv :=
+    let destRaw : Miri.Interpreter.RuntimePlace AnnealProv :=
       { ref := .local 0 0 none (.ofAllocationToken 0),
         layout := translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable }
-    let mv := DynMemView.ofMemory (initMachineStateWithCallees dvV1RawUnsizeMir [] [dvV1RawUnsizeMir]).memory
-    dvDecodePtr st0.machine dataSc = some (5, 1) ∧
-    dvDecodePtr st0.machine vtSc = some (16384, 0) ∧
-    Miri.Interpreter.Cast.unsizeIntoPointer (annealCastHooksDynTraitVTable dvV1RawUnsizeMir [] false) ()
-        ⟨.immediate (.scalar dataSc), translateTyOverlay dvRawConstU32Ty emptyLayoutTable⟩
-        dest wideRawDynPtrTyId wideRawDynPtrTyId st0 =
-      (annealCastHooksDynTraitVTable dvV1RawUnsizeMir [] false).writeImmediate ()
-        (.scalarPair dataSc vtSc) dest st0 ∧
-    evalThinToDynUnsize [] mv dvV1RawUnsizeMir.localDecls emptyLayoutTable
-        (.ptr { allocId := 5, offsetBytes := 1 } 8) (.uint .u32) dvTrKey false false =
-      .ok (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8,
-        .ptr { allocId := 16384, offsetBytes := 0 } 8]) := by
-  let st0 := dvLmInit 0 1
+    let destRef : Miri.Interpreter.RuntimePlace AnnealProv :=
+      { ref := .local 0 0 none (.ofAllocationToken 0),
+        layout := translateTyOverlay (dvRefDynTy dvTrKey) emptyLayoutTable }
+    let mvRaw := DynMemView.ofMemory (initMachineStateWithCallees dvV1RawUnsizeMir [] [dvV1RawUnsizeMir]).memory
+    let sRef0 := initMachineStateWithCallees dvV1RefUnsizeMir [.scalar ⟨7, 4⟩] [dvV1RefUnsizeMir]
+    let sRef : MachineState :=
+      { frame := { sRef0.frame with locals := [.uninit, .init (.scalar ⟨7, 4⟩), .uninit] },
+        memory := { sRef0.memory with
+          borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+                        rangeOffset := 0, rangeLen := 4 }],
+          nextTag := 2 } }
+    let mvRef := DynMemView.ofMemory sRef.memory
+    (dvDecodePtr stRaw.machine rawDataSc = some (5, 1) ∧
+     dvDecodePtr stRaw.machine vtSc = some (16384, 0) ∧
+     Miri.Interpreter.Cast.unsizeIntoPointer (annealCastHooksDynTraitVTable dvV1RawUnsizeMir [] false) ()
+         ⟨.immediate (.scalar rawDataSc), translateTyOverlay dvRawConstU32Ty emptyLayoutTable⟩
+         destRaw (translateTyOverlay dvRawConstU32Ty emptyLayoutTable).ty wideRawDynPtrTyId stRaw =
+       (annealCastHooksDynTraitVTable dvV1RawUnsizeMir [] false).writeImmediate ()
+         (.scalarPair rawDataSc vtSc) destRaw stRaw ∧
+     evalThinToDynUnsize [] mvRaw dvV1RawUnsizeMir.localDecls emptyLayoutTable
+         (.ptr { allocId := 5, offsetBytes := 1 } 8) (.uint .u32) dvTrKey false false =
+       .ok (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8,
+         .ptr { allocId := 16384, offsetBytes := 0 } 8])) ∧
+    (dvDecodePtr stRef.machine refDataSc = some (1, 0) ∧
+     dvDecodePtr stRef.machine vtSc = some (16384, 0) ∧
+     Miri.Interpreter.Cast.unsizeIntoPointer (annealCastHooksDynTraitVTable dvV1RefUnsizeMir [] false) ()
+         ⟨.immediate (.scalar refDataSc), translateTyOverlay dvRefU32Ty emptyLayoutTable⟩
+         destRef (translateTyOverlay dvRefU32Ty emptyLayoutTable).ty wideSafeDynRefTyId stRef =
+       (annealCastHooksDynTraitVTable dvV1RefUnsizeMir [] false).writeImmediate ()
+         (.scalarPair refDataSc vtSc) destRef stRef ∧
+     evalThinToDynUnsize sRef.frame.locals mvRef dvV1RefUnsizeMir.localDecls emptyLayoutTable
+         (.ptr { allocId := 1, offsetBytes := 0 } 8) (.uint .u32) dvTrKey true false =
+       .ok (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8,
+         .ptr { allocId := 16384, offsetBytes := 0 } 8])) := by
+  let stRaw := dvLmInit 0 1
+  let stRef := dvAtStmt (dvLmInit 0 0) 1
   let vtAid : Miri.Memory.AllocId := ⟨16384, by decide⟩
-  let dest : Miri.Interpreter.RuntimePlace AnnealProv :=
+  let destRaw : Miri.Interpreter.RuntimePlace AnnealProv :=
     { ref := .local 0 0 none (.ofAllocationToken 0),
       layout := translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable }
-  let mv := DynMemView.ofMemory (initMachineStateWithCallees dvV1RawUnsizeMir [] [dvV1RawUnsizeMir]).memory
-  have h := dvUnsizeIntoPointer_thin_agrees_trusted dvV1RawUnsizeMir [] false (.uint .u32) dvTrKey
+  let destRef : Miri.Interpreter.RuntimePlace AnnealProv :=
+    { ref := .local 0 0 none (.ofAllocationToken 0),
+      layout := translateTyOverlay (dvRefDynTy dvTrKey) emptyLayoutTable }
+  let mvRaw := DynMemView.ofMemory (initMachineStateWithCallees dvV1RawUnsizeMir [] [dvV1RawUnsizeMir]).memory
+  let sRef0 := initMachineStateWithCallees dvV1RefUnsizeMir [.scalar ⟨7, 4⟩] [dvV1RefUnsizeMir]
+  let sRef : MachineState :=
+    { frame := { sRef0.frame with locals := [.uninit, .init (.scalar ⟨7, 4⟩), .uninit] },
+      memory := { sRef0.memory with
+        borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+                      rangeOffset := 0, rangeLen := 4 }],
+        nextTag := 2 } }
+  let mvRef := DynMemView.ofMemory sRef.memory
+  have hNzAll : ∀ w ∈ dvVTables, 0 < w.vtableAllocId ∧ w.vtableAllocId < 2 ^ 64 := by
+    intro w hw
+    simp only [dvVTables, List.mem_cons, List.not_mem_nil, or_false] at hw
+    rcases hw with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+  have hCtyU32 : ∀ w ∈ dvVTables,
+      (dvConcreteTyId dvVTables w.concreteTy == dvConcreteTyId dvVTables (.uint .u32)) =
+        rigidTyEq w.concreteTy (.uint .u32) := by
+    intro w hw
+    simp only [dvVTables, List.mem_cons, List.not_mem_nil, or_false] at hw
+    rcases hw with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+  have hRaw := dvUnsizeIntoPointer_thin_agrees_trusted dvV1RawUnsizeMir [] false (.uint .u32) dvTrKey
     (dvVTables.head (by decide)) vtAid (annealStackBaseAddr vtAid) dvAid5 .one dvBase5 (dvBase5 + 1)
-    (translateTyOverlay dvRawConstU32Ty emptyLayoutTable) dest wideRawDynPtrTyId wideRawDynPtrTyId
-    st0 (.integer .u32) rfl (by decide) rfl (fun _ _ h => by cases h)
-    (fun _ h => by cases h)
-    (by
-      intro w hw
-      simp only [dvV1RawUnsizeMir, dvMkBody, dvVTables, List.mem_cons, List.not_mem_nil, or_false] at hw
-      rcases hw with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide)
-    (by
-      intro w hw
-      simp only [dvV1RawUnsizeMir, dvMkBody, dvVTables, List.mem_cons, List.not_mem_nil, or_false] at hw
-      rcases hw with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide)
-    rfl (by decide +kernel) (by decide +kernel)
-    [] mv dvV1RawUnsizeMir.localDecls emptyLayoutTable [] rfl rfl rfl
-    { allocId := 5, offsetBytes := 1 } false
+    (translateTyOverlay dvRawConstU32Ty emptyLayoutTable) destRaw
+    (translateTyOverlay dvRawConstU32Ty emptyLayoutTable).ty wideRawDynPtrTyId
+    stRaw (.integer .u32) false false rfl rfl (by decide) rfl (fun _ _ h => by cases h)
+    (fun _ h => by cases h) hNzAll hCtyU32 rfl (by decide +kernel) (by decide +kernel)
+    [] mvRaw dvV1RawUnsizeMir.localDecls emptyLayoutTable [] rfl rfl rfl
+    { allocId := 5, offsetBytes := 1 } (fun h => by cases h)
     (by decide +kernel) (by decide) rfl (by decide)
-  exact ⟨(dvPtrCouples_iff_dvDecodePtr _ _ _).mp h.1,
-    (dvPtrCouples_iff_dvDecodePtr _ _ _).mp h.2.1, h.2.2.1, h.2.2.2⟩
+  have hRef := dvUnsizeIntoPointer_thin_agrees_trusted dvV1RefUnsizeMir [] false (.uint .u32) dvTrKey
+    (dvVTables.head (by decide)) vtAid (annealStackBaseAddr vtAid) dvAid1 .one
+    (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
+    (translateTyOverlay dvRefU32Ty emptyLayoutTable) destRef
+    (translateTyOverlay dvRefU32Ty emptyLayoutTable).ty wideSafeDynRefTyId
+    stRef (.integer .u32) true false rfl rfl (by decide) rfl (fun _ _ h => by cases h)
+    (fun _ h => by cases h) hNzAll hCtyU32 rfl (by decide +kernel) (by decide +kernel)
+    sRef.frame.locals mvRef dvV1RefUnsizeMir.localDecls emptyLayoutTable [] rfl rfl rfl
+    { allocId := 1, offsetBytes := 0 } (fun _ => by decide +kernel)
+    (by decide +kernel) (UInt64.le_refl _) rfl (by decide)
+  exact ⟨⟨(dvPtrCouples_iff_dvDecodePtr _ _ _).mp hRaw.1,
+      (dvPtrCouples_iff_dvDecodePtr _ _ _).mp hRaw.2.1, hRaw.2.2.1, hRaw.2.2.2⟩,
+    ⟨(dvPtrCouples_iff_dvDecodePtr _ _ _).mp hRef.1,
+      (dvPtrCouples_iff_dvDecodePtr _ _ _).mp hRef.2.1, hRef.2.2.1, hRef.2.2.2⟩⟩
 
 /-- **Realizability of `dvUnsizeIntoPointer_dynToDyn_agrees_trusted`**:
-instantiates BOTH arms of the pointer-coupled dyn-to-dyn universal theorem:
-1. NOP `*const dyn Tr -> *const dyn Tr` (`dvV2NopRawMir`, `(5, 1)` & `16384 -> 16384`);
-2. `TraitVPtr` supertrait upcast `*const dyn Sub -> *const dyn Side`
-   (`(5, 1)` & `16387 -> 16389` via slot `5`). -/
+instantiates BOTH arms strictly on §0-locked fixtures (zero ad-hoc bodies):
+1. Raw NOP `*const dyn Tr -> *const dyn Tr` (`dvV2NopRawMir`, `(5, 1)` & `16384 -> 16384`);
+2. Safe `TraitVPtr` supertrait upcast `&dyn Sub -> &dyn Side` (`dvV2UpcastSideMir`
+   at `bb0, stmt 2`, live `(1, 0)` & `16387 -> 16389` via slot `5`, passing `dynRefDataValid`). -/
 theorem dv_dynToDyn_agrees_realizable :
     let stNop := dvLmInit 1 3
+    let stUp := dvAtStmt (dvLmInit 1 1) 2
     let vtTr : Miri.Memory.AllocId := ⟨16384, by decide⟩
     let vtSub : Miri.Memory.AllocId := ⟨16387, by decide⟩
     let vtSide : Miri.Memory.AllocId := ⟨16389, by decide⟩
-    let dataPtr : Miri.Memory.Pointer AnnealProv :=
+    let rawDataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
       ⟨Miri.ABI.Size.ofBytes (dvBase5 + 1), .concrete dvAid5 .one⟩
-    let dataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout dataPtr
+    let refDataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr dvAid1), .concrete dvAid1 .one⟩
     let vtTrSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
       ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr vtTr), .concrete vtTr .one⟩
     let vtSubSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
@@ -3839,39 +4205,41 @@ theorem dv_dynToDyn_agrees_realizable :
       { ref := .local 0 0 none (.ofAllocationToken 0),
         layout := translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable }
     let mvNop := DynMemView.ofMemory (initMachineStateWithCallees dvV2NopRawMir [] [dvV2NopRawMir]).memory
-    let upcastRawMir : CapturedMir :=
-      dvMkBody "dv::v2_raw_upcast_side"
-        [dvDecl (dvRawConstDynTy dvSideKey), dvDecl (dvRawConstDynTy dvSubKey)] 1
-        [dvBb [dvSt (.assign (dvLoc 0)
-          (.cast (.pointerCoercion "Unsize") (.copy (dvLoc 1)) (dvRawConstDynTy dvSideKey)))] .return_]
-    let stUp := dvStRawDyn upcastRawMir 1 [(16387, dvSubKey)]
     let destSide : Miri.Interpreter.RuntimePlace AnnealProv :=
       { ref := .local 0 0 none (.ofAllocationToken 0),
-        layout := translateTyOverlay (dvRawConstDynTy dvSideKey) emptyLayoutTable }
-    let mvUp := DynMemView.ofMemory (initMachineStateWithCallees upcastRawMir [] [upcastRawMir]).memory
-    (dvDecodePtr stNop.machine dataSc = some (5, 1) ∧
+        layout := translateTyOverlay (dvRefDynTy dvSideKey) emptyLayoutTable }
+    let sUp0 := initMachineStateWithCallees dvV2UpcastSideMir [.scalar ⟨7, 4⟩] [dvV2UpcastSideMir]
+    let sUp : MachineState :=
+      { frame := { sUp0.frame with locals := [.uninit, .init (.scalar ⟨7, 4⟩), .uninit, .uninit] },
+        memory := { sUp0.memory with
+          borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+                        rangeOffset := 0, rangeLen := 4 }],
+          nextTag := 2 } }
+    let mvUp := DynMemView.ofMemory sUp.memory
+    (dvDecodePtr stNop.machine rawDataSc = some (5, 1) ∧
      dvDecodePtr stNop.machine vtTrSc = some (16384, 0) ∧
      Miri.Interpreter.Cast.unsizeIntoPointer (annealCastHooksDynTraitVTable dvV2NopRawMir [] false) ()
-         ⟨.immediate (.scalarPair dataSc vtTrSc), translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable⟩
+         ⟨.immediate (.scalarPair rawDataSc vtTrSc), translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable⟩
          destTr wideRawDynPtrTyId wideRawDynPtrTyId stNop =
        (annealCastHooksDynTraitVTable dvV2NopRawMir [] false).writeImmediate ()
-         (.scalarPair dataSc vtTrSc) destTr stNop ∧
+         (.scalarPair rawDataSc vtTrSc) destTr stNop ∧
      evalDynToDynUnsize [] mvNop dvV2NopRawMir.localDecls emptyLayoutTable
          (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8, .ptr { allocId := 16384, offsetBytes := 0 } 8])
          dvTrKey dvTrKey false false =
        .ok (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8, .ptr { allocId := 16384, offsetBytes := 0 } 8])) ∧
-    (dvDecodePtr stUp.machine dataSc = some (5, 1) ∧
+    (dvDecodePtr stUp.machine refDataSc = some (1, 0) ∧
      dvDecodePtr stUp.machine vtSideSc = some (16389, 0) ∧
-     Miri.Interpreter.Cast.unsizeIntoPointer (annealCastHooksDynTraitVTable upcastRawMir [] false) ()
-         ⟨.immediate (.scalarPair dataSc vtSubSc), translateTyOverlay (dvRawConstDynTy dvSubKey) emptyLayoutTable⟩
-         destSide wideRawDynPtrTyId wideRawDynPtrTyId stUp =
-       (annealCastHooksDynTraitVTable upcastRawMir [] false).writeImmediate ()
-         (.scalarPair dataSc vtSideSc) destSide stUp ∧
-     evalDynToDynUnsize [] mvUp upcastRawMir.localDecls emptyLayoutTable
-         (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8, .ptr { allocId := 16387, offsetBytes := 0 } 8])
-         dvSubKey dvSideKey false false =
-       .ok (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 1 } 8, .ptr { allocId := 16389, offsetBytes := 0 } 8])) := by
+     Miri.Interpreter.Cast.unsizeIntoPointer (annealCastHooksDynTraitVTable dvV2UpcastSideMir [] false) ()
+         ⟨.immediate (.scalarPair refDataSc vtSubSc), translateTyOverlay (dvRefDynTy dvSubKey) emptyLayoutTable⟩
+         destSide wideSafeDynRefTyId wideSafeDynRefTyId stUp =
+       (annealCastHooksDynTraitVTable dvV2UpcastSideMir [] false).writeImmediate ()
+         (.scalarPair refDataSc vtSideSc) destSide stUp ∧
+     evalDynToDynUnsize sUp.frame.locals mvUp dvV2UpcastSideMir.localDecls emptyLayoutTable
+         (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .ptr { allocId := 16387, offsetBytes := 0 } 8])
+         dvSubKey dvSideKey true false =
+       .ok (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .ptr { allocId := 16389, offsetBytes := 0 } 8])) := by
   let stNop := dvLmInit 1 3
+  let stUp := dvAtStmt (dvLmInit 1 1) 2
   let vtTr : Miri.Memory.AllocId := ⟨16384, by decide⟩
   let vtSub : Miri.Memory.AllocId := ⟨16387, by decide⟩
   let vtSide : Miri.Memory.AllocId := ⟨16389, by decide⟩
@@ -3879,16 +4247,17 @@ theorem dv_dynToDyn_agrees_realizable :
     { ref := .local 0 0 none (.ofAllocationToken 0),
       layout := translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable }
   let mvNop := DynMemView.ofMemory (initMachineStateWithCallees dvV2NopRawMir [] [dvV2NopRawMir]).memory
-  let upcastRawMir : CapturedMir :=
-    dvMkBody "dv::v2_raw_upcast_side"
-      [dvDecl (dvRawConstDynTy dvSideKey), dvDecl (dvRawConstDynTy dvSubKey)] 1
-      [dvBb [dvSt (.assign (dvLoc 0)
-        (.cast (.pointerCoercion "Unsize") (.copy (dvLoc 1)) (dvRawConstDynTy dvSideKey)))] .return_]
-  let stUp := dvStRawDyn upcastRawMir 1 [(16387, dvSubKey)]
   let destSide : Miri.Interpreter.RuntimePlace AnnealProv :=
     { ref := .local 0 0 none (.ofAllocationToken 0),
-      layout := translateTyOverlay (dvRawConstDynTy dvSideKey) emptyLayoutTable }
-  let mvUp := DynMemView.ofMemory (initMachineStateWithCallees upcastRawMir [] [upcastRawMir]).memory
+      layout := translateTyOverlay (dvRefDynTy dvSideKey) emptyLayoutTable }
+  let sUp0 := initMachineStateWithCallees dvV2UpcastSideMir [.scalar ⟨7, 4⟩] [dvV2UpcastSideMir]
+  let sUp : MachineState :=
+    { frame := { sUp0.frame with locals := [.uninit, .init (.scalar ⟨7, 4⟩), .uninit, .uninit] },
+      memory := { sUp0.memory with
+        borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+                      rangeOffset := 0, rangeLen := 4 }],
+        nextTag := 2 } }
+  let mvUp := DynMemView.ofMemory sUp.memory
   have hNzAll : ∀ w ∈ dvVTables, 0 < w.vtableAllocId ∧ w.vtableAllocId < 2 ^ 64 := by
     intro w hw
     simp only [dvVTables, List.mem_cons, List.not_mem_nil, or_false] at hw
@@ -3902,9 +4271,9 @@ theorem dv_dynToDyn_agrees_realizable :
   have hNop := (dvUnsizeIntoPointer_dynToDyn_agrees_trusted dvV2NopRawMir [] false dvTrKey dvTrKey
     (dvVTables[0]'(by decide)) dvAid5 .one dvBase5 (dvBase5 + 1) vtTr .one (annealStackBaseAddr vtTr)
     (translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable) destTr wideRawDynPtrTyId
-    wideRawDynPtrTyId stNop rfl (by decide) (by decide) hNzAll [] mvNop dvV2NopRawMir.localDecls
-    emptyLayoutTable rfl rfl rfl rfl rfl { allocId := 5, offsetBytes := 1 } false
-    (by decide +kernel) (by decide) rfl (by decide) (by decide +kernel) rfl).1 rfl
+    wideRawDynPtrTyId stNop false false rfl rfl rfl rfl (by decide) (by decide) hNzAll [] mvNop
+    dvV2NopRawMir.localDecls emptyLayoutTable rfl rfl rfl rfl rfl { allocId := 5, offsetBytes := 1 }
+    (by decide +kernel) (by decide) rfl (by decide) (by decide +kernel) rfl).1 rfl (fun h => by cases h)
   have hVtForSub :
       dvVTableFor? dvVTables (some (dvKeyIdx dvVTables dvSubKey))
         (dvConcreteTyId dvVTables (dvVTables[3]'(by decide)).concreteTy) =
@@ -3921,27 +4290,30 @@ theorem dv_dynToDyn_agrees_realizable :
       resolveUpcastVTable? dvVTables [] (dvVTables[3]'(by decide)) dvSideKey =
       some (dvVTables[5]'(by decide)) := by
     rfl
-  have hUp := (dvUnsizeIntoPointer_dynToDyn_agrees_trusted upcastRawMir [] false dvSubKey dvSideKey
-    (dvVTables[3]'(by decide)) dvAid5 .one dvBase5 (dvBase5 + 1) vtSub .one (annealStackBaseAddr vtSub)
-    (translateTyOverlay (dvRawConstDynTy dvSubKey) emptyLayoutTable) destSide wideRawDynPtrTyId
-    wideRawDynPtrTyId stUp rfl (by decide) (by decide) hNzAll [] mvUp upcastRawMir.localDecls
-    emptyLayoutTable rfl rfl rfl rfl rfl { allocId := 5, offsetBytes := 1 } false
-    (by decide +kernel) (by decide) rfl (by decide) (by decide +kernel) rfl).2
+  have hUp := (dvUnsizeIntoPointer_dynToDyn_agrees_trusted dvV2UpcastSideMir [] false dvSubKey dvSideKey
+    (dvVTables[3]'(by decide)) dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
+    vtSub .one (annealStackBaseAddr vtSub)
+    (translateTyOverlay (dvRefDynTy dvSubKey) emptyLayoutTable) destSide wideSafeDynRefTyId
+    wideSafeDynRefTyId stUp true false rfl rfl rfl rfl (by decide) (by decide) hNzAll
+    sUp.frame.locals mvUp dvV2UpcastSideMir.localDecls emptyLayoutTable rfl rfl rfl rfl rfl
+    { allocId := 1, offsetBytes := 0 }
+    (by decide +kernel) (UInt64.le_refl _) rfl (by decide) (by decide +kernel) rfl).2
     (dvVTables[5]'(by decide)) vtSide (annealStackBaseAddr vtSide) 5
     rfl (by decide) hCtyU32 hVtForSub (by decide +kernel) hEntSlotSide hUpcastSubSide
-    (by decide +kernel) (by decide +kernel)
+    (by decide +kernel) (by decide +kernel) (fun _ => by decide +kernel)
   exact ⟨⟨(dvPtrCouples_iff_dvDecodePtr _ _ _).mp hNop.1,
       (dvPtrCouples_iff_dvDecodePtr _ _ _).mp hNop.2.1, hNop.2.2.1, hNop.2.2.2⟩,
     ⟨(dvPtrCouples_iff_dvDecodePtr _ _ _).mp hUp.1,
       (dvPtrCouples_iff_dvDecodePtr _ _ _).mp hUp.2.1, hUp.2.2.1, hUp.2.2.2⟩⟩
 
-/-- **Realizability of `dvResolveVirtual_agrees_trusted` (joint Miri + Trusted
-`evalVirtualCall`, pointer-coupled)**: instantiates BOTH arms on the corpus
-`(u32, dyn Tr)` vtable (`16384`) and coupled data pointer `(1, 0)`:
+/-- **Realizability of `dvResolveVirtual_agrees_trusted` (raw receiver, joint
+Miri + Trusted `evalVirtualCall`, pointer-coupled, §0-locked)**: instantiates
+all 3 arms on the §0-locked fixtures `dvV3RawCallMir` and `dvRawGetU32Mir` with
+the corpus `(u32, dyn Tr)` vtable (`16384`) and coupled data pointer `(1, 0)`:
 1. Positive method slot `3` (`Tr::get`) resolves on Miri to
    `dvMethodInstance dvVTables "dv::<u32 as Tr>::get"` with narrowed `args'[0]?`
    decoding to `(1, 0)`, AND Trusted `evalVirtualCall` steps directly to
-   `pushCalleeFrame` entering `rawGetU32` with narrowed receiver `.ptr (1, 0) 8`;
+   `pushCalleeFrame` entering `dvRawGetU32Mir` with narrowed receiver `.ptr (1, 0) 8`;
 2. Negative non-method header slot `1` (`.size`) and OOB slot `9` BOTH throw
    `.undefinedBehavior` on Miri AND return `MirStepNode.fail .ub` on Trusted. -/
 theorem dv_resolveVirtual_agrees_realizable :
@@ -3960,14 +4332,7 @@ theorem dv_resolveVirtual_agrees_realizable :
       (translateTyOverlay dvU32Ty emptyLayoutTable)
     let virtInst : Miri.Interpreter.CallInstance :=
       { kind := .Virtual dvVirtualBase 3, args := #[.Type (dvDynTailTyId dvVTables dvTrKey)] }
-    let rawCaller : CapturedMir :=
-      dvMkBody "dv::v3_raw_caller" [dvDecl dvU32Ty, dvDecl (dvRawConstDynTy dvTrKey)] 1
-        [dvBb [] (.call (dvFnConst "dv::Tr::get" [.dynamic dvTrKey]) [.move (dvLoc 1), dvConstU32 5]
-            (dvLoc 0) (some 1) .continue_),
-         dvBb [] .return_]
-    let rawGetU32 : CapturedMir :=
-      { dvGetU32Mir with localDecls := [dvDecl dvU32Ty, dvDecl dvRawConstU32Ty, dvDecl dvU32Ty] }
-    let sTr := initMachineStateWithCallees rawCaller [] [rawCaller, rawGetU32]
+    let sTr := initMachineStateWithCallees dvV3RawCallMir [] [dvV3RawCallMir, dvRawGetU32Mir]
     let dp : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
     let vp : ProvenancePtr := { allocId := 16384, offsetBytes := 0 }
     let tRecv : Value := .aggregate 0 [.ptr dp 8, .ptr vp 8]
@@ -3979,26 +4344,26 @@ theorem dv_resolveVirtual_agrees_realizable :
         .ok (dvMethodInstance dvVTables "dv::<u32 as Tr>::get", abi', args') st0 ∧
       args'.size = 1 ∧
       args'[0]? = some (.Copy ⟨.immediate (.scalar dataSc), thinLay⟩)) ∧
-     evalVirtualCall sTr (some rawCaller)
+     evalVirtualCall sTr (some dvV3RawCallMir)
          { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
-         rawCaller.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
+         dvV3RawCallMir.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
          [tRecv, .scalar ⟨5, 4⟩] sTr.frame.locals (dvLoc 0) (some 1) .continue_ =
-       MirStepNode.step (pushCalleeFrame sTr rawCaller sTr.frame.locals (dvLoc 0) 1 rawGetU32
+       MirStepNode.step (pushCalleeFrame sTr dvV3RawCallMir sTr.frame.locals (dvLoc 0) 1 dvRawGetU32Mir
          [.ptr dp 8, .scalar ⟨5, 4⟩] .continue_)) ∧
     (Miri.Interpreter.VirtualCalls.resolveVirtual (dvVirtualHooks dvVTables dvVirtualMethods 0) () 1
         virtInst dvVirtualBase 1 abi args st0 =
       .error (.undefinedBehavior "dyn call trying to call something that is not a method") st0 ∧
-     evalVirtualCall sTr (some rawCaller)
+     evalVirtualCall sTr (some dvV3RawCallMir)
          { methodDefPath := "dv::Tr::hdr", dynKey := dvTrKey, slotIdx := 1 }
-         rawCaller.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
+         dvV3RawCallMir.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
          [tRecv, .scalar ⟨5, 4⟩] sTr.frame.locals (dvLoc 0) (some 1) .continue_ =
        MirStepNode.fail .ub) ∧
     (Miri.Interpreter.VirtualCalls.resolveVirtual (dvVirtualHooks dvVTables dvVirtualMethods 0) () 1
         virtInst dvVirtualBase 9 abi args st0 =
       .error (.undefinedBehavior "dyn call trying to call something that is not a method") st0 ∧
-     evalVirtualCall sTr (some rawCaller)
+     evalVirtualCall sTr (some dvV3RawCallMir)
          { methodDefPath := "dv::Tr::oob", dynKey := dvTrKey, slotIdx := 9 }
-         rawCaller.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
+         dvV3RawCallMir.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
          [tRecv, .scalar ⟨5, 4⟩] sTr.frame.locals (dvLoc 0) (some 1) .continue_ =
        MirStepNode.fail .ub) := by
   let st0 := dvLmInit 2 0
@@ -4014,14 +4379,7 @@ theorem dv_resolveVirtual_agrees_realizable :
     (translateTyOverlay dvU32Ty emptyLayoutTable)
   let virtInst : Miri.Interpreter.CallInstance :=
     { kind := .Virtual dvVirtualBase 3, args := #[.Type (dvDynTailTyId dvVTables dvTrKey)] }
-  let rawCaller : CapturedMir :=
-    dvMkBody "dv::v3_raw_caller" [dvDecl dvU32Ty, dvDecl (dvRawConstDynTy dvTrKey)] 1
-      [dvBb [] (.call (dvFnConst "dv::Tr::get" [.dynamic dvTrKey]) [.move (dvLoc 1), dvConstU32 5]
-          (dvLoc 0) (some 1) .continue_),
-       dvBb [] .return_]
-  let rawGetU32 : CapturedMir :=
-    { dvGetU32Mir with localDecls := [dvDecl dvU32Ty, dvDecl dvRawConstU32Ty, dvDecl dvU32Ty] }
-  let sTr := initMachineStateWithCallees rawCaller [] [rawCaller, rawGetU32]
+  let sTr := initMachineStateWithCallees dvV3RawCallMir [] [dvV3RawCallMir, dvRawGetU32Mir]
   let dp : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
   let vp : ProvenancePtr := { allocId := 16384, offsetBytes := 0 }
   have hVtTy : Miri.Interpreter.VTable.getPtrVTableType (dvVTableHooks dvVTables) ()
@@ -4042,8 +4400,8 @@ theorem dv_resolveVirtual_agrees_realizable :
     dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
     vtAid .one (annealStackBaseAddr vtAid)
     recvLay [] virtInst dvVirtualBase 3 abi st0 rfl (by decide) hVtTy rfl
-    sTr rawCaller { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
-    rawCaller.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
+    sTr dvV3RawCallMir { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
+    dvV3RawCallMir.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
     sTr.frame.locals (dvLoc 0) 1 .continue_ (dvRawConstDynTy dvTrKey) .not dp vp
     rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
     (by decide +kernel) (UInt64.le_refl _) rfl (by decide) (by decide +kernel) rfl
@@ -4052,8 +4410,8 @@ theorem dv_resolveVirtual_agrees_realizable :
     dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
     vtAid .one (annealStackBaseAddr vtAid)
     recvLay [] virtInst dvVirtualBase 1 abi st0 rfl (by decide) hVtTy rfl
-    sTr rawCaller { methodDefPath := "dv::Tr::hdr", dynKey := dvTrKey, slotIdx := 1 }
-    rawCaller.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
+    sTr dvV3RawCallMir { methodDefPath := "dv::Tr::hdr", dynKey := dvTrKey, slotIdx := 1 }
+    dvV3RawCallMir.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
     sTr.frame.locals (dvLoc 0) 1 .continue_ (dvRawConstDynTy dvTrKey) .not dp vp
     rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
     (by decide +kernel) (UInt64.le_refl _) rfl (by decide) (by decide +kernel) rfl
@@ -4062,17 +4420,294 @@ theorem dv_resolveVirtual_agrees_realizable :
     dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
     vtAid .one (annealStackBaseAddr vtAid)
     recvLay [] virtInst dvVirtualBase 9 abi st0 rfl (by decide) hVtTy rfl
-    sTr rawCaller { methodDefPath := "dv::Tr::oob", dynKey := dvTrKey, slotIdx := 9 }
-    rawCaller.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
+    sTr dvV3RawCallMir { methodDefPath := "dv::Tr::oob", dynKey := dvTrKey, slotIdx := 9 }
+    dvV3RawCallMir.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
     sTr.frame.locals (dvLoc 0) 1 .continue_ (dvRawConstDynTy dvTrKey) .not dp vp
     rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
     (by decide +kernel) (UInt64.le_refl _) rfl (by decide) (by decide +kernel) rfl
   exact ⟨(dvPtrCouples_iff_dvDecodePtr _ _ _).mp hU3.1,
     (dvPtrCouples_iff_dvDecodePtr _ _ _).mp hU3.2.1,
-    hU3.2.2.2 "dv::<u32 as Tr>::get" [] (dvVirtualMethods.head (by decide)) (.uint .u32) rawGetU32
+    hU3.2.2.2 "dv::<u32 as Tr>::get" [] (dvVirtualMethods.head (by decide)) (.uint .u32) dvRawGetU32Mir
       rfl (Nat.le_refl _) rfl rfl rfl rfl (by decide) rfl (by decide +kernel),
     hU1.2.2.1 (fun _ _ h => by cases h) (fun h => by cases h),
     hU9.2.2.1 (fun _ _ h => by cases h) (fun h => by cases h)⟩
+
+/-- **Realizability of `dvResolveVirtual_safeRef_agrees_trusted` (safe `&dyn`
+receiver, joint Miri + Trusted `evalVirtualCall` with `C3` pre-`extCall`
+validity gate & `C4` Crubit `c16` `protectDynReceiverOnEntry`, 100% §0-locked)**:
+instantiates ALL 4 arms strictly on §0-locked corpus fixtures:
+1. Valid `&dyn Tr::get` (`dvV3ArgCallMir` → `dvGetU32Mir`, live `(1, 0)`):
+   Miri resolves `dv::<u32 as Tr>::get` with narrowed `args'[0]?` decoding to
+   `(1, 0)`, AND Trusted `evalVirtualCall` steps to a protected callee state
+   `s2Get` with `s2Get.memory.activeProtectors.isEmpty = false`;
+2. Crubit `c16` `&dyn Tr::poke` (`dvV3PokeCallerMir` → `dvPokeU32Mir`, live
+   `(1, 0)`): Miri resolves `dv::<u32 as Tr>::poke` with narrowed `args'[0]?`
+   decoding to `(1, 0)`, AND Trusted `evalVirtualCall` steps to a protected
+   callee state `s2Poke` with `s2Poke.memory.activeProtectors.isEmpty = false`;
+3. Condition `C3` pre-`extCall` invalid-ref UB (`dvV3ArgCallMir` with empty
+   `callees = []` and dangling `(5, 1)`): Trusted `evalVirtualCall` faults
+   `MirStepNode.fail .ub` (never `.extCall`);
+4. Non-method header slot `1` (`dvV3CallHdrMir`) and OOB slot `9`
+   (`dvV3CallOobMir`): BOTH Miri throws `.undefinedBehavior` AND Trusted faults
+   `MirStepNode.fail .ub`. -/
+theorem dv_resolveVirtual_safeRef_agrees_realizable :
+    let stGet := dvLmInit 2 0
+    let stPoke := dvLmInit 2 3
+    let vtAid : Miri.Memory.AllocId := ⟨16384, by decide⟩
+    let dataSc : Miri.Memory.Scalar AnnealProv := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr dvAid1), Miri.Memory.Provenance.concrete dvAid1 .one⟩
+    let vtSc : Miri.Memory.Scalar AnnealProv := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr vtAid), Miri.Memory.Provenance.concrete vtAid .one⟩
+    let recvLay := translateTyOverlay (dvRefDynTy dvTrKey) emptyLayoutTable
+    let argsGet : Array (Miri.Interpreter.FnArg AnnealProv) :=
+      #[.Copy ⟨.immediate (.scalarPair dataSc vtSc), recvLay⟩]
+    let abiGet := dvCallerAbi [⟨.scalarPair dataSc vtSc, recvLay⟩]
+      (translateTyOverlay dvU32Ty emptyLayoutTable)
+    let argsPoke : Array (Miri.Interpreter.FnArg AnnealProv) :=
+      #[.Copy ⟨.immediate (.scalarPair dataSc vtSc), recvLay⟩,
+        .Copy ⟨.immediate (.scalar dataSc), translateTyOverlay dvRawMutU32Ty emptyLayoutTable⟩]
+    let abiPoke := dvCallerAbi
+      [⟨.scalarPair dataSc vtSc, recvLay⟩,
+       ⟨.scalar dataSc, translateTyOverlay dvRawMutU32Ty emptyLayoutTable⟩]
+      (translateTyOverlay dvU32Ty emptyLayoutTable)
+    let virtGet : Miri.Interpreter.CallInstance :=
+      { kind := .Virtual dvVirtualBase 3, args := #[.Type (dvDynTailTyId dvVTables dvTrKey)] }
+    let virtPoke : Miri.Interpreter.CallInstance :=
+      { kind := .Virtual (dvVirtualBase + 1) 4, args := #[.Type (dvDynTailTyId dvVTables dvTrKey)] }
+    let dp : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+    let vp : ProvenancePtr := { allocId := 16384, offsetBytes := 0 }
+    let tRecv : Value := .aggregate 0 [.ptr dp 8, .ptr vp 8]
+    let sGet0 := initMachineStateWithCallees dvV3ArgCallMir [tRecv] [dvV3ArgCallMir, dvGetU32Mir]
+    let sGet : MachineState :=
+      { frame := { sGet0.frame with locals := [.uninit, .init tRecv, .init (.scalar ⟨7, 4⟩)] },
+        memory := { sGet0.memory with
+          borrows := [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .frozen,
+                        rangeOffset := 0, rangeLen := 4 }],
+          nextTag := 2 } }
+    let sPoke0 := initMachineStateWithCallees dvV3PokeCallerMir [.scalar ⟨7, 4⟩]
+      [dvV3PokeCallerMir, dvPokeU32Mir]
+    let sPoke : MachineState :=
+      { frame := { sPoke0.frame with
+          locals := [.uninit, .init (.scalar ⟨7, 4⟩), .uninit, .uninit, .uninit, .uninit] },
+        memory := { sPoke0.memory with
+          borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+                        rangeOffset := 0, rangeLen := 4 }],
+          nextTag := 2 } }
+    let dpDead : ProvenancePtr := { allocId := 5, offsetBytes := 1 }
+    let tRecvDead : Value := .aggregate 0 [.ptr dpDead 8, .ptr vp 8]
+    let sDead := initMachineStateWithCallees dvV3ArgCallMir [tRecvDead] []
+    let sHdr := initMachineStateWithCallees dvV3CallHdrMir [.scalar ⟨7, 4⟩] [dvV3CallHdrMir]
+    let sOob := initMachineStateWithCallees dvV3CallOobMir [.scalar ⟨7, 4⟩] [dvV3CallOobMir]
+    dvDecodePtr stGet.machine dataSc = some (1, 0) ∧
+    dvDecodePtr stGet.machine vtSc = some (16384, 0) ∧
+    (∃ s2Get,
+      protectDynReceiverOnEntry
+          (pushCalleeFrame sGet dvV3ArgCallMir sGet.frame.locals (dvLoc 0) 1 dvGetU32Mir
+            [.ptr dp 8, .scalar ⟨5, 4⟩] .continue_)
+          (.ref .not) (.ptr dp 8) (dvVTables.head (by decide)) = some s2Get ∧
+      s2Get.memory.activeProtectors.isEmpty = false ∧
+      (∃ abi' args' thinLay,
+        Miri.Interpreter.VirtualCalls.resolveVirtual (dvVirtualHooks dvVTables dvVirtualMethods 0) () 1
+            virtGet dvVirtualBase 3 abiGet argsGet stGet =
+          .ok (dvMethodInstance dvVTables "dv::<u32 as Tr>::get", abi', args') stGet ∧
+        args'.size = 1 ∧
+        args'[0]? = some (.Copy ⟨.immediate (.scalar dataSc), thinLay⟩)) ∧
+      evalVirtualCall sGet (some dvV3ArgCallMir)
+          { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
+          dvV3ArgCallMir.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
+          [tRecv, .scalar ⟨5, 4⟩] sGet.frame.locals (dvLoc 0) (some 1) .continue_ =
+        MirStepNode.step s2Get) ∧
+    (∃ s2Poke,
+      protectDynReceiverOnEntry
+          (pushCalleeFrame sPoke dvV3PokeCallerMir sPoke.frame.locals (dvLoc 0) 1 dvPokeU32Mir
+            [.ptr dp 8, .ptr dp 8] .continue_)
+          (.ref .not) (.ptr dp 8) (dvVTables.head (by decide)) = some s2Poke ∧
+      s2Poke.memory.activeProtectors.isEmpty = false ∧
+      (∃ abi' args' thinLay,
+        Miri.Interpreter.VirtualCalls.resolveVirtual (dvVirtualHooks dvVTables dvVirtualMethods 0) () 1
+            virtPoke (dvVirtualBase + 1) 4 abiPoke argsPoke stPoke =
+          .ok (dvMethodInstance dvVTables "dv::<u32 as Tr>::poke", abi', args') stPoke ∧
+        args'.size = 2 ∧
+        args'[0]? = some (.Copy ⟨.immediate (.scalar dataSc), thinLay⟩)) ∧
+      evalVirtualCall sPoke (some dvV3PokeCallerMir)
+          { methodDefPath := "dv::Tr::poke", dynKey := dvTrKey, slotIdx := 4 }
+          dvV3PokeCallerMir.localDecls emptyLayoutTable [.move (dvLoc 5), .move (dvLoc 3)]
+          [tRecv, .ptr dp 8] sPoke.frame.locals (dvLoc 0) (some 1) .continue_ =
+        MirStepNode.step s2Poke) ∧
+    evalVirtualCall sDead (some dvV3ArgCallMir)
+        { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
+        dvV3ArgCallMir.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
+        [tRecvDead, .scalar ⟨5, 4⟩] sDead.frame.locals (dvLoc 0) (some 1) .continue_ =
+      MirStepNode.fail .ub ∧
+    (Miri.Interpreter.VirtualCalls.resolveVirtual (dvVirtualHooks dvVTables dvVirtualMethods 0) () 1
+        virtGet dvVirtualBase 1 abiGet argsGet stGet =
+      .error (.undefinedBehavior "dyn call trying to call something that is not a method") stGet ∧
+     evalVirtualCall sHdr (some dvV3CallHdrMir)
+         { methodDefPath := "dv::Tr::hdr", dynKey := dvTrKey, slotIdx := 1 }
+         dvV3CallHdrMir.localDecls emptyLayoutTable [.move (dvLoc 3), dvConstU32 5]
+         [tRecv, .scalar ⟨5, 4⟩] sHdr.frame.locals (dvLoc 0) (some 1) .continue_ =
+       MirStepNode.fail .ub) ∧
+    (Miri.Interpreter.VirtualCalls.resolveVirtual (dvVirtualHooks dvVTables dvVirtualMethods 0) () 1
+        virtGet dvVirtualBase 9 abiGet argsGet stGet =
+      .error (.undefinedBehavior "dyn call trying to call something that is not a method") stGet ∧
+     evalVirtualCall sOob (some dvV3CallOobMir)
+         { methodDefPath := "dv::Tr::oob", dynKey := dvTrKey, slotIdx := 9 }
+         dvV3CallOobMir.localDecls emptyLayoutTable [.move (dvLoc 3), dvConstU32 5]
+         [tRecv, .scalar ⟨5, 4⟩] sOob.frame.locals (dvLoc 0) (some 1) .continue_ =
+       MirStepNode.fail .ub) := by
+  let stGet := dvLmInit 2 0
+  let stPoke := dvLmInit 2 3
+  let vtAid : Miri.Memory.AllocId := ⟨16384, by decide⟩
+  let dataSc : Miri.Memory.Scalar AnnealProv := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+    ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr dvAid1), Miri.Memory.Provenance.concrete dvAid1 .one⟩
+  let vtSc : Miri.Memory.Scalar AnnealProv := Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+    ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr vtAid), Miri.Memory.Provenance.concrete vtAid .one⟩
+  let recvLay := translateTyOverlay (dvRefDynTy dvTrKey) emptyLayoutTable
+  let abiGet := dvCallerAbi [⟨.scalarPair dataSc vtSc, recvLay⟩]
+    (translateTyOverlay dvU32Ty emptyLayoutTable)
+  let abiPoke := dvCallerAbi
+    [⟨.scalarPair dataSc vtSc, recvLay⟩,
+     ⟨.scalar dataSc, translateTyOverlay dvRawMutU32Ty emptyLayoutTable⟩]
+    (translateTyOverlay dvU32Ty emptyLayoutTable)
+  let virtGet : Miri.Interpreter.CallInstance :=
+    { kind := .Virtual dvVirtualBase 3, args := #[.Type (dvDynTailTyId dvVTables dvTrKey)] }
+  let virtPoke : Miri.Interpreter.CallInstance :=
+    { kind := .Virtual (dvVirtualBase + 1) 4, args := #[.Type (dvDynTailTyId dvVTables dvTrKey)] }
+  let dp : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+  let vp : ProvenancePtr := { allocId := 16384, offsetBytes := 0 }
+  let tRecv : Value := .aggregate 0 [.ptr dp 8, .ptr vp 8]
+  let sGet0 := initMachineStateWithCallees dvV3ArgCallMir [tRecv] [dvV3ArgCallMir, dvGetU32Mir]
+  let sGet : MachineState :=
+    { frame := { sGet0.frame with locals := [.uninit, .init tRecv, .init (.scalar ⟨7, 4⟩)] },
+      memory := { sGet0.memory with
+        borrows := [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .frozen,
+                      rangeOffset := 0, rangeLen := 4 }],
+        nextTag := 2 } }
+  let sPoke0 := initMachineStateWithCallees dvV3PokeCallerMir [.scalar ⟨7, 4⟩]
+    [dvV3PokeCallerMir, dvPokeU32Mir]
+  let sPoke : MachineState :=
+    { frame := { sPoke0.frame with
+        locals := [.uninit, .init (.scalar ⟨7, 4⟩), .uninit, .uninit, .uninit, .uninit] },
+      memory := { sPoke0.memory with
+        borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+                      rangeOffset := 0, rangeLen := 4 }],
+        nextTag := 2 } }
+  let dpDead : ProvenancePtr := { allocId := 5, offsetBytes := 1 }
+  let tRecvDead : Value := .aggregate 0 [.ptr dpDead 8, .ptr vp 8]
+  let sDead := initMachineStateWithCallees dvV3ArgCallMir [tRecvDead] []
+  let sHdr := initMachineStateWithCallees dvV3CallHdrMir [.scalar ⟨7, 4⟩] [dvV3CallHdrMir]
+  let sOob := initMachineStateWithCallees dvV3CallOobMir [.scalar ⟨7, 4⟩] [dvV3CallOobMir]
+  have hVtTyOf : ∀ (st : AnnealStepState),
+      st.machine.lookupBaseAddr vtAid = some (annealStackBaseAddr vtAid) →
+      Miri.Interpreter.VTable.getPtrVTableType (dvVTableHooks dvVTables) ()
+        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr vtAid), some (.concrete vtAid .one)⟩
+        (some (dvKeyIdx dvVTables dvTrKey)) st =
+        .ok (dvConcreteTyId dvVTables (.uint .u32)) st := by
+    intro st hB
+    change Miri.Interpreter.VTable.getPtrVTableTypeRead (dvVTableReadHooks dvVTables) ()
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr vtAid), some (.concrete vtAid .one)⟩
+      (some (dvKeyIdx dvVTables dvTrKey)) st = .ok (dvConcreteTyId dvVTables (.uint .u32)) st
+    rw [dvGetPtrVTableTypeRead_eq dvVTables st vtAid .one (annealStackBaseAddr vtAid)
+      (annealStackBaseAddr vtAid) (dvKeyIdx dvVTables dvTrKey) hB (UInt64.le_refl _)]
+    have hSub : annealStackBaseAddr vtAid - annealStackBaseAddr vtAid = 0 := by decide
+    have hReg : dvRegistryLookup (dvRegistry dvVTables) vtAid =
+        some (dvConcreteTyId dvVTables (.uint .u32), dvKeyIdx dvVTables dvTrKey) := by decide +kernel
+    simp [hSub, hReg]
+  have hVtGet := hVtTyOf stGet (by decide +kernel)
+  have hVtPoke := hVtTyOf stPoke (by decide +kernel)
+  have hSGet := dvResolveVirtual_safeRef_agrees_trusted dvVTables dvVirtualMethods dvTrKey
+    (dvVTables.head (by decide)) (dvConcreteTyId dvVTables (.uint .u32))
+    dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
+    vtAid .one (annealStackBaseAddr vtAid)
+    recvLay [] virtGet dvVirtualBase 3 abiGet stGet rfl (by decide) hVtGet rfl
+    sGet dvV3ArgCallMir { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
+    dvV3ArgCallMir.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
+    sGet.frame.locals (dvLoc 0) 1 .continue_ (dvRefDynTy dvTrKey) .not dp vp
+    rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
+    (by decide +kernel) (UInt64.le_refl _) rfl (by decide) (by decide +kernel) rfl
+  have hSPoke := dvResolveVirtual_safeRef_agrees_trusted dvVTables dvVirtualMethods dvTrKey
+    (dvVTables.head (by decide)) (dvConcreteTyId dvVTables (.uint .u32))
+    dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
+    vtAid .one (annealStackBaseAddr vtAid)
+    recvLay [.Copy ⟨.immediate (.scalar dataSc), translateTyOverlay dvRawMutU32Ty emptyLayoutTable⟩]
+    virtPoke (dvVirtualBase + 1) 4 abiPoke stPoke rfl (by decide) hVtPoke rfl
+    sPoke dvV3PokeCallerMir { methodDefPath := "dv::Tr::poke", dynKey := dvTrKey, slotIdx := 4 }
+    dvV3PokeCallerMir.localDecls emptyLayoutTable (.move (dvLoc 5)) [.move (dvLoc 3)] [.ptr dp 8]
+    sPoke.frame.locals (dvLoc 0) 1 .continue_ (dvRefDynTy dvTrKey) .not dp vp
+    rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
+    (by decide +kernel) (UInt64.le_refl _) rfl (by decide) (by decide +kernel) rfl
+  have hSDead := dvResolveVirtual_safeRef_agrees_trusted dvVTables dvVirtualMethods dvTrKey
+    (dvVTables.head (by decide)) (dvConcreteTyId dvVTables (.uint .u32))
+    dvAid5 .one dvBase5 (dvBase5 + 1)
+    vtAid .one (annealStackBaseAddr vtAid)
+    recvLay [] virtGet dvVirtualBase 3 abiGet (dvLmInit 0 1) rfl (by decide)
+    (hVtTyOf (dvLmInit 0 1) (by decide +kernel)) rfl
+    sDead dvV3ArgCallMir { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
+    dvV3ArgCallMir.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
+    sDead.frame.locals (dvLoc 0) 1 .continue_ (dvRefDynTy dvTrKey) .not dpDead vp
+    rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
+    (by decide +kernel) (by decide) rfl (by decide) (by decide +kernel) rfl
+  have hSHdr := dvResolveVirtual_safeRef_agrees_trusted dvVTables dvVirtualMethods dvTrKey
+    (dvVTables.head (by decide)) (dvConcreteTyId dvVTables (.uint .u32))
+    dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
+    vtAid .one (annealStackBaseAddr vtAid)
+    recvLay [] virtGet dvVirtualBase 1 abiGet stGet rfl (by decide) hVtGet rfl
+    sHdr dvV3CallHdrMir { methodDefPath := "dv::Tr::hdr", dynKey := dvTrKey, slotIdx := 1 }
+    dvV3CallHdrMir.localDecls emptyLayoutTable (.move (dvLoc 3)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
+    sHdr.frame.locals (dvLoc 0) 1 .continue_ (dvRefDynTy dvTrKey) .not dp vp
+    rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
+    (by decide +kernel) (UInt64.le_refl _) rfl (by decide) (by decide +kernel) rfl
+  have hSOob := dvResolveVirtual_safeRef_agrees_trusted dvVTables dvVirtualMethods dvTrKey
+    (dvVTables.head (by decide)) (dvConcreteTyId dvVTables (.uint .u32))
+    dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
+    vtAid .one (annealStackBaseAddr vtAid)
+    recvLay [] virtGet dvVirtualBase 9 abiGet stGet rfl (by decide) hVtGet rfl
+    sOob dvV3CallOobMir { methodDefPath := "dv::Tr::oob", dynKey := dvTrKey, slotIdx := 9 }
+    dvV3CallOobMir.localDecls emptyLayoutTable (.move (dvLoc 3)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
+    sOob.frame.locals (dvLoc 0) 1 .continue_ (dvRefDynTy dvTrKey) .not dp vp
+    rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
+    (by decide +kernel) (UInt64.le_refl _) rfl (by decide) (by decide +kernel) rfl
+  refine ⟨(dvPtrCouples_iff_dvDecodePtr _ _ _).mp hSGet.1,
+    (dvPtrCouples_iff_dvDecodePtr _ _ _).mp hSGet.2.1, ?_, ?_, ?_,
+    hSHdr.2.2.1 (fun _ _ h => by cases h) (fun h => by cases h),
+    hSOob.2.2.1 (fun _ _ h => by cases h) (fun h => by cases h)⟩
+  · let s1Get := pushCalleeFrame sGet dvV3ArgCallMir sGet.frame.locals (dvLoc 0) 1 dvGetU32Mir
+      [.ptr dp 8, .scalar ⟨5, 4⟩] .continue_
+    have hGetSome :
+        (protectDynReceiverOnEntry s1Get (.ref .not) (.ptr dp 8) (dvVTables.head (by decide))).isSome = true := by
+      decide +kernel
+    cases hPGet : protectDynReceiverOnEntry s1Get (.ref .not) (.ptr dp 8) (dvVTables.head (by decide)) with
+    | none => simp [hPGet] at hGetSome
+    | some s2Get =>
+      have hActGet : s2Get.memory.activeProtectors.isEmpty = false := by
+        have hAll :
+            (match protectDynReceiverOnEntry s1Get (.ref .not) (.ptr dp 8) (dvVTables.head (by decide)) with
+              | some s => s.memory.activeProtectors.isEmpty
+              | none => true) = false := by decide +kernel
+        rw [hPGet] at hAll; exact hAll
+      have hResGet := (hSGet.2.2.2.2 "dv::<u32 as Tr>::get" [] (dvVirtualMethods.head (by decide))
+        (.uint .u32) dvGetU32Mir rfl (by decide +kernel) (Nat.le_refl _) rfl rfl rfl rfl
+        (by decide) rfl (by decide +kernel)).1 s2Get hPGet
+      exact ⟨s2Get, rfl, hActGet, hResGet.1, hResGet.2⟩
+  · let s1Poke := pushCalleeFrame sPoke dvV3PokeCallerMir sPoke.frame.locals (dvLoc 0) 1 dvPokeU32Mir
+      [.ptr dp 8, .ptr dp 8] .continue_
+    have hPokeSome :
+        (protectDynReceiverOnEntry s1Poke (.ref .not) (.ptr dp 8) (dvVTables.head (by decide))).isSome = true := by
+      decide +kernel
+    cases hPPoke : protectDynReceiverOnEntry s1Poke (.ref .not) (.ptr dp 8) (dvVTables.head (by decide)) with
+    | none => simp [hPPoke] at hPokeSome
+    | some s2Poke =>
+      have hActPoke : s2Poke.memory.activeProtectors.isEmpty = false := by
+        have hAll :
+            (match protectDynReceiverOnEntry s1Poke (.ref .not) (.ptr dp 8) (dvVTables.head (by decide)) with
+              | some s => s.memory.activeProtectors.isEmpty
+              | none => true) = false := by decide +kernel
+        rw [hPPoke] at hAll; exact hAll
+      have hResPoke := (hSPoke.2.2.2.2 "dv::<u32 as Tr>::poke" [] (dvVirtualMethods[1]'(by decide))
+        (.uint .u32) dvPokeU32Mir rfl (by decide +kernel) (by decide) rfl rfl rfl rfl
+        (by decide) rfl (by decide +kernel)).1 s2Poke hPPoke
+      exact ⟨s2Poke, rfl, hActPoke, hResPoke.1, hResPoke.2⟩
+  · exact hSDead.2.2.2.1 (Or.inl ⟨"dv::<u32 as Tr>::get", [], rfl⟩) (by decide +kernel)
 
 /-! ## §7. Documented Cross-Authority Divergences & Modeling Notes
 
@@ -4100,8 +4735,12 @@ authority:
    `concreteLay.layout.uninhabited = false` on safe references, rejecting
    `&! -> &dyn Trait` as `.ub` while accepting `*const ! -> *const dyn Trait`
    (`dv_kani5216_uninhabited_witness`).
-5. **`Classical.choice`** enters only through vendored
-   `Miri.Memory.MemoryState.empty` (the initial machine), never through a law.
+5. **`Classical.choice` boundary**: the pure table, slot, registry, vtable-check,
+   and upcast laws listed in §8 (`choiceFree`) are kernel-audited strictly
+   constructive (`[propext, Quot.sound]`, zero `Classical.choice`); stateful and
+   ABI laws that quantify over vendored `Miri.Memory` / `Miri.ABI` /
+   `Miri.Interpreter` definitions inherit `Classical.choice` from vendored
+   `lean-miri` itself (never from `sorryAx` or `ofReduceBool`).
 
 Further modeling notes and known gaps of this authority:
 
@@ -4155,7 +4794,23 @@ elab "#assert_dyn_trait_vtable_lm_audit" : command => do
     checked := checked + 1
   if checked == 0 then
     throwError "LeanMiriSpec.DynTraitVTableLM: 0 declarations found"
-  logInfo m!"LeanMiriSpec.DynTraitVTableLM: verified {checked} declarations (sorry_free=true, import_isolated=true, 0 trivial, 0 ofReduceBool)"
+  let choiceFree : List Lean.Name := [
+    ``dv_listByteEq_iff,
+    ``dv_stringEq_iff,
+    ``dvVTableEntries_getElem?,
+    ``dvVTableEntries_method_iff,
+    ``dvVTableEntries_not_method,
+    ``dv_vtableEnvOk_allocId_bounds,
+    ``dvRegistryLookup_eq_lookupVTableByAllocId,
+    ``dv_checkDynVTablePtr_found,
+    ``dv_resolveUpcastVTable_eq_lookupVTableFor
+  ]
+  for c in choiceFree do
+    let axs ← liftCoreM <| Lean.collectAxioms c
+    for a in axs do
+      unless a == ``propext || a == ``Quot.sound do
+        throwError "LM pure law {c} uses non-constructive axiom {a}"
+  logInfo m!"LeanMiriSpec.DynTraitVTableLM: verified {checked} declarations (sorry_free=true, import_isolated=true, 0 trivial, 0 ofReduceBool, choice_free_pure_laws={choiceFree.length})"
 
 #assert_dyn_trait_vtable_lm_audit
 

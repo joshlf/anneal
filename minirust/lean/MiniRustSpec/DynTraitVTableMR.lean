@@ -408,6 +408,19 @@ def dvV3ArgCallMir : CapturedMir :=
         (dvLoc 0) (some 1) .continue_),
      dvBb [] .return_]
 
+/-- Raw-pointer-receiver counterpart of `dvGetU32Mir` (`*const u32` receiver),
+locked in §0 for the raw-receiver virtual-call correspondence witness. -/
+def dvRawGetU32Mir : CapturedMir :=
+  { dvGetU32Mir with localDecls := [dvDecl dvU32Ty, dvDecl dvRawConstU32Ty, dvDecl dvU32Ty] }
+
+/-- Raw-receiver virtual-call fixture (`fn(p: *const dyn Tr) -> u32`), locked in
+§0 alongside `dvRawGetU32Mir`. -/
+def dvV3RawCallMir : CapturedMir :=
+  dvMkBody "dv::v3_raw_call" [dvDecl dvU32Ty, dvDecl (dvRawConstDynTy dvTrKey)] 1
+    [dvBb [] (.call (dvFnConst "dv::Tr::get" [.dynamic dvTrKey]) [.move (dvLoc 1), dvConstU32 5]
+        (dvLoc 0) (some 1) .continue_),
+     dvBb [] .return_]
+
 /-- The body of `<u32 as Tr>::poke` run in its own frame, with the receiver's
 pointee as the extra local `_3 : u32`: the Crubit `c16` protected-receiver
 aliased write isolated at callee level (`*p = 99` while `&self` is live). -/
