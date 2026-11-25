@@ -114,6 +114,37 @@ one module and nothing downstream of it.
                       Faster, weaker: do not re-hash each reused `.olean`.
   --jobs N            Worker threads (default: `min(4, CPU count)`).
   --timeout-sec SEC   Timeout of each Lean invocation (default: 120).
+  --taxonomy-json     Print the canonical `PropertyTaxonomyManifest` JSON (the
+                      12 property classes and 3 spec-boundary guards) after
+                      checking it against `property_registry.rs` and
+                      `SpecBoundaryGuards.lean`. Runs no Lean.
+  --check-spec-wildcards PATH [PATH ...]
+                      Scan Lean (`.lean`) or Rust (`.rs`) specification sources
+                      for postcondition arms that accept every error outcome
+                      (`| .ub => True`, `Err(_) => true`). Exit `0` when clean,
+                      `1` on a finding or an unreadable path. Runs no Lean.
+
+Property taxonomy and the spec-boundary wildcard probe
+------------------------------------------------------
+
+Every guard names the canonical `PropertyClass` of the UB check it mutates
+(`property_class`, one of the 12 `CANONICAL_PROPERTY_CLASSES`), and
+`PROPERTY_CLASS_DISPOSITIONS` accounts for all 12 classes: the ones the
+catalog guards, the ones whose single-step checks have no cataloged mutant
+yet, and the two that are not single-step UB at all (`loop_termination`,
+`unsupported_fallback`). `--list` and every run compare these identifiers and
+the 3 `CANONICAL_SPEC_BOUNDARY_GUARDS` with the live
+`crates/cargo-anneal/src/property_registry.rs` and
+`theory/Anneal/SpecBoundaryGuards.lean`, so the two taxonomies cannot drift
+apart silently. Reports carry `property_class` per result and a
+`property_class_summary` row per class.
+
+`detect_postcondition_error_wildcards` and
+`verify_postcondition_kills_error_mutants` are the `error_branch_wildcard`
+(`awsm2`) probe: a postcondition whose error, `ub` or `unsupported` arm folds
+to constant truth lets the error mutant survive, while a guarded arm kills
+it. The probe lexes comments and literals of both languages and fails closed
+on anything it cannot delimit.
 
 Exit status and JSON report
 ---------------------------
@@ -160,6 +191,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -378,6 +410,11 @@ class MirSemanticsGuard:
     refute_source: str
     quick: bool = False
     rebuild_modules: tuple[str, ...] = ()
+    # Canonical `PropertyClass` identifier of the UB check this guard mutates.
+    # The default exists only so a synthetic guard can be built positionally;
+    # `validate_catalog_invariants` requires an explicit canonical class on
+    # every `MIR_SEMANTICS_GUARDS` entry.
+    property_class: str = ""
 
     @property
     def effective_rebuild_modules(self) -> tuple[str, ...]:
@@ -405,6 +442,8 @@ class GuardResult:
     status: str  # KILLED | SURVIVED | ERROR
     duration_sec: float
     detail: str
+    # Stamped from the catalog by `run_guard_mutation_suite`.
+    property_class: str = ""
 
 
 MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
@@ -413,6 +452,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="div_by_zero",
+        property_class="div_rem_ub",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalScalarBinOp .div rejects divisor == 0 as UB",
@@ -463,6 +503,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="rem_by_zero",
+        property_class="div_rem_ub",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalScalarBinOp .rem rejects divisor == 0 as UB",
@@ -512,6 +553,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="signed_div_overflow",
+        property_class="div_rem_ub",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalSignedDiv rejects signed MIN / -1 overflow as UB",
@@ -567,6 +609,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="signed_rem_overflow",
+        property_class="div_rem_ub",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalSignedRem rejects signed MIN % -1 overflow as UB",
@@ -622,6 +665,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="shift_oob",
+        property_class="shift_bounds",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalScalarBinOp .shlUnchecked rejects shift distance >= bit width as UB",
@@ -675,6 +719,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="shr_oob",
+        property_class="shift_bounds",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalScalarBinOp .shrUnchecked rejects shift distance >= bit width as UB",
@@ -733,6 +778,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     # the shift guards' refutation inputs to the exact boundary.
     MirSemanticsGuard(
         guard_id="shl_oob_off_by_one",
+        property_class="shift_bounds",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalScalarBinOp .shlUnchecked rejects shift distance == bit width (off-by-one boundary)",
@@ -786,6 +832,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="shr_oob_off_by_one",
+        property_class="shift_bounds",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalScalarBinOp .shrUnchecked rejects shift distance == bit width (off-by-one boundary)",
@@ -841,6 +888,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="bool_valid_range",
+        property_class="discriminant_validity",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
         description="evalUnaryNot on .bool rejects invalid bit patterns outside {0, 1} as UB",
@@ -905,6 +953,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="storage_dead_read",
+        property_class="uninit_read",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Places",
         description="evalOperand .copy of a LocalSlot.dead local faults UB",
@@ -968,6 +1017,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="storage_uninit_read",
+        property_class="uninit_read",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Places",
         description="evalOperand .copy of a LocalSlot.uninit local faults UB",
@@ -1031,6 +1081,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="unaligned_deref",
+        property_class="pointer_deref",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Places",
         description="checkDerefAlign rejects misaligned non-zero pointer dereference as UB",
@@ -1147,6 +1198,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="intrinsic_assume_false",
+        property_class="discriminant_validity",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
         description="evalStmt .intrinsic (.assume op) rejects false operand as UB",
@@ -1239,6 +1291,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="intrinsic_assume_invalid_bool",
+        property_class="discriminant_validity",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
         description="evalStmt .intrinsic (.assume op) rejects invalid non-bool bit pattern (2) as UB",
@@ -1330,6 +1383,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="intrinsic_assume_non_bool_size",
+        property_class="discriminant_validity",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
         description="evalStmt .intrinsic (.assume op) rejects a scalar that is not 1 byte wide as UB",
@@ -1421,6 +1475,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="copy_nonoverlapping_overlap",
+        property_class="memory_copy_overlap",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
         description="evalCopySingleDirect rejects overlapping copy_nonoverlapping ranges as UB",
@@ -1551,6 +1606,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="copy_nonoverlapping_place_overlap",
+        property_class="memory_copy_overlap",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
         description="evalCopySingleDirect rejects distinct-tag pointers targeting overlapping places as UB",
@@ -1677,6 +1733,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="copy_nonoverlapping_subplace_overlap",
+        property_class="memory_copy_overlap",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
         description="evalCopySingleDirect rejects a sub-place (field of a local vs the whole local) overlap as UB",
@@ -1827,10 +1884,23 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="tb_drop_protector_conflict",
+        property_class="pointer_deref",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Terminators",
         description="evalTerminator .drop rejects dropping a local with an active protector conflict as UB",
         anchor=(
+            "      | .nil, _ =>\n"
+            "        match set? s.frame.locals place.local_ .uninit with\n"
+            "        | .some locals' =>\n"
+            "          match s.memory.activeProtectors with\n"
+            "          | .nil =>\n"
+            "            let borrows' :=\n"
+            "              invalidateConflictingBorrows s.memory.borrows place.local_ .none depth\n"
+            "            MirStepNode.step {\n"
+            "              s with\n"
+            "              frame := { blockIdx := target, stmtIdx := 0, locals := locals' }\n"
+            "              memory := { s.memory with borrows := borrows' }\n"
+            "            }\n"
             "          | protHead :: protTail =>\n"
             "            match\n"
             "              hasProtectedWriteConflict\n"
@@ -1849,6 +1919,18 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "                invalidateConflictingBorrows s.memory.borrows place.local_ .none depth"
         ),
         replacement=(
+            "      | .nil, _ =>\n"
+            "        match set? s.frame.locals place.local_ .uninit with\n"
+            "        | .some locals' =>\n"
+            "          match s.memory.activeProtectors with\n"
+            "          | .nil =>\n"
+            "            let borrows' :=\n"
+            "              invalidateConflictingBorrows s.memory.borrows place.local_ .none depth\n"
+            "            MirStepNode.step {\n"
+            "              s with\n"
+            "              frame := { blockIdx := target, stmtIdx := 0, locals := locals' }\n"
+            "              memory := { s.memory with borrows := borrows' }\n"
+            "            }\n"
             "          | _protHead :: _protTail =>\n"
             "            match false with\n"
             "            | true => MirStepNode.fail .ub\n"
@@ -1939,6 +2021,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     ),
     MirSemanticsGuard(
         guard_id="tb_return_frame_dealloc_protector_conflict",
+        property_class="pointer_deref",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Terminators",
         description="evalTerminator .return_ rejects frame deallocation under an active protector as UB",
@@ -3150,12 +3233,4048 @@ def _fixture_shape_errors(
     return errors
 
 
-def validate_catalog_invariants(anneal_root: Path) -> list[str]:
+# ---------------------------------------------------------------------------
+# Canonical property taxonomy shared with `PropertyRegistry` (Rust) and
+# `Anneal.SpecBoundaryGuards` (Lean)
+# ---------------------------------------------------------------------------
+
+# `PROPERTY_TAXONOMY_SCHEMA_VERSION` of `property_registry.rs`.
+PROPERTY_TAXONOMY_SCHEMA_VERSION = 1
+
+# The 12 `PropertyClass` wire identifiers in canonical rank order `0..11`.
+CANONICAL_PROPERTY_CLASSES: tuple[str, ...] = (
+    "arithmetic_overflow",
+    "shift_bounds",
+    "div_rem_ub",
+    "pointer_deref",
+    "slice_array_bounds",
+    "discriminant_validity",
+    "call_contract",
+    "loop_termination",
+    "switch_exhaustiveness",
+    "memory_copy_overlap",
+    "uninit_read",
+    "unsupported_fallback",
+)
+
+# The 3 `SpecBoundaryGuardId` wire identifiers in canonical rank order `0..2`.
+CANONICAL_SPEC_BOUNDARY_GUARDS: tuple[str, ...] = (
+    "entry_point_requires",
+    "fixed_width_ghost_length",
+    "error_branch_wildcard",
+)
+
+# `(id, Rust variant, description)` of every property class, in rank order.
+_PROPERTY_CLASS_ROWS: tuple[tuple[str, str, str], ...] = (
+    (
+        "arithmetic_overflow",
+        "ArithmeticOverflow",
+        "signed/unsigned arithmetic and float-to-int conversion overflow",
+    ),
+    ("shift_bounds", "ShiftBounds", "bit-shift distance within target integer bit width"),
+    (
+        "div_rem_ub",
+        "DivRemUb",
+        "non-zero divisor and non-overflowing signed MIN / -1 division",
+    ),
+    (
+        "pointer_deref",
+        "PointerDereference",
+        "pointer alignment, provenance, Tree Borrows permissions, and live dereference",
+    ),
+    (
+        "slice_array_bounds",
+        "SliceArrayBounds",
+        "array, slice, subslice, and runtime assert index bounds",
+    ),
+    (
+        "discriminant_validity",
+        "DiscriminantValidity",
+        "union/enum discriminant, scalar niche validity, assume, and unreachability",
+    ),
+    (
+        "call_contract",
+        "CallContract",
+        "call argument ABI compatibility, callee preconditions, and unwind contracts",
+    ),
+    (
+        "loop_termination",
+        "LoopTermination",
+        "CFG cycle back-edge and recursive-call termination / decreasing variant",
+    ),
+    (
+        "switch_exhaustiveness",
+        "SwitchExhaustiveness",
+        "SwitchInt branch / otherwise exhaustiveness and in-bounds CFG targets",
+    ),
+    (
+        "memory_copy_overlap",
+        "MemoryCopyOverlap",
+        "copy_nonoverlapping disjointness, byte-count validity, and copy/set bounds",
+    ),
+    ("uninit_read", "UninitRead", "initialized local slot and memory byte reads"),
+    (
+        "unsupported_fallback",
+        "UnsupportedFallback",
+        "fail-closed fallback for unsupported or unscannable MIR constructs",
+    ),
+)
+
+# `(id, canonical_name, vacuity_class, description)` of every spec-boundary
+# guard, in rank order.
+_SPEC_BOUNDARY_GUARD_ROWS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "entry_point_requires",
+        "EntryPointPrecondition",
+        "DeadPrecondition",
+        "binary entry point (main, #![no_main] _start, #[entry]) carries a non-trivial "
+        "requires that no verified caller discharges",
+    ),
+    (
+        "fixed_width_ghost_length",
+        "FixedWidthGhostLength",
+        "SpecViolation",
+        "ghost collection length or cardinality typed at a fixed machine width wraps at "
+        "2^64 instead of using Nat or Int",
+    ),
+    (
+        "error_branch_wildcard",
+        "ErrorBranchWildcard",
+        "SurvivedAllMutants",
+        "postcondition arm accepts every error payload, ub, or unsupported outcome",
+    ),
+)
+
+# `PropertyClass::is_waivable` is false for exactly these classes, and
+# `PropertyRegistry::for_partial_correctness` waives exactly these.
+_NON_WAIVABLE_PROPERTY_CLASSES: frozenset[str] = frozenset({"unsupported_fallback"})
+_PARTIAL_WAIVED_PROPERTY_CLASSES: frozenset[str] = frozenset({"loop_termination"})
+
+# `MirSemanticsGuard.property_class` of a guard that names no class. Only a
+# synthetic guard built by a unit test may carry it: `validate_catalog_invariants`
+# rejects it on every `MIR_SEMANTICS_GUARDS` entry.
+PROPERTY_CLASS_UNSPECIFIED = ""
+
+# How the single-guard mutation catalog relates to one property class.
+PROPERTY_CLASS_COVERAGE_KINDS: tuple[str, ...] = (
+    # At least one cataloged guard mutates a single-step UB check of the class.
+    "single_step_ub_guarded",
+    # `MirSemantics` has single-step UB checks of the class, none cataloged yet.
+    "single_step_ub_uncataloged",
+    # The class is a property of whole executions; no single step faults.
+    "coinductive_non_ub",
+    # The class is the fail-closed `.unsupported` outcome, which is not UB.
+    "fail_closed_non_ub",
+)
+
+
+@dataclass(frozen=True)
+class PropertyClassDisposition:
+    """Guard-mutation coverage of one canonical property class."""
+
+    coverage: str
+    rationale: str
+
+
+# One entry per canonical property class, in rank order. A class is
+# `single_step_ub_guarded` exactly when `MIR_SEMANTICS_GUARDS` tags a guard with
+# it, so adding the first guard of a class forces this table to be updated.
+PROPERTY_CLASS_DISPOSITIONS: dict[str, PropertyClassDisposition] = {
+    "arithmetic_overflow": PropertyClassDisposition(
+        "single_step_ub_uncataloged",
+        "the `addUnchecked` / `subUnchecked` / `mulUnchecked` overflow checks of "
+        "`Scalars.lean` have no cataloged mutant",
+    ),
+    "shift_bounds": PropertyClassDisposition(
+        "single_step_ub_guarded",
+        "`shlUnchecked` / `shrUnchecked` distance checks of `evalScalarBinOp`",
+    ),
+    "div_rem_ub": PropertyClassDisposition(
+        "single_step_ub_guarded",
+        "zero-divisor and signed `MIN / -1`, `MIN % -1` checks of `Scalars.lean`",
+    ),
+    "pointer_deref": PropertyClassDisposition(
+        "single_step_ub_guarded",
+        "`checkDerefAlign` and the Tree Borrows active-protector conflict checks",
+    ),
+    "slice_array_bounds": PropertyClassDisposition(
+        "single_step_ub_uncataloged",
+        "the `.index` / `.constantIndex` / `.subslice` bounds checks of `Places.lean` "
+        "have no cataloged mutant",
+    ),
+    "discriminant_validity": PropertyClassDisposition(
+        "single_step_ub_guarded",
+        "`bool` bit-pattern validity and the `assume` intrinsic operand checks",
+    ),
+    "call_contract": PropertyClassDisposition(
+        "single_step_ub_uncataloged",
+        "the call ABI and callee-contract checks of `Terminators.lean` have no "
+        "cataloged mutant",
+    ),
+    "loop_termination": PropertyClassDisposition(
+        "coinductive_non_ub",
+        "divergence is a property of an infinite execution, not a single-step `.ub` "
+        "result, so no `rfl` refutation theorem can state it",
+    ),
+    "switch_exhaustiveness": PropertyClassDisposition(
+        "single_step_ub_uncataloged",
+        "the `SwitchInt` target and basic-block index checks of `Terminators.lean` "
+        "have no cataloged mutant",
+    ),
+    "memory_copy_overlap": PropertyClassDisposition(
+        "single_step_ub_guarded",
+        "`copy_nonoverlapping` range, place and sub-place overlap checks",
+    ),
+    "uninit_read": PropertyClassDisposition(
+        "single_step_ub_guarded",
+        "reads of `LocalSlot.dead` and `LocalSlot.uninit` locals",
+    ),
+    "unsupported_fallback": PropertyClassDisposition(
+        "fail_closed_non_ub",
+        "an unsupported construct evaluates to `.unsupported`, not `.ub`, and a "
+        "refutation fixture must expect UB literally",
+    ),
+}
+
+_RUST_TAXONOMY_REL = "crates/cargo-anneal/src/property_registry.rs"
+_LEAN_TAXONOMY_REL = "theory/Anneal/SpecBoundaryGuards.lean"
+
+
+def canonical_property_taxonomy() -> dict[str, object]:
+    """The `PropertyTaxonomyManifest` this script is written against."""
+    classes: list[dict[str, object]] = []
+    for rank, (class_id, variant, description) in enumerate(_PROPERTY_CLASS_ROWS):
+        waivable = class_id not in _NON_WAIVABLE_PROPERTY_CLASSES
+        strict = "discharged" if waivable else "unsupported_fail_closed"
+        classes.append(
+            {
+                "rank": rank,
+                "id": class_id,
+                "variant": variant,
+                "is_waivable": waivable,
+                "strict_disposition": strict,
+                "partial_disposition": (
+                    "explicitly_waived"
+                    if class_id in _PARTIAL_WAIVED_PROPERTY_CLASSES
+                    else strict
+                ),
+                "description": description,
+            }
+        )
+    guards: list[dict[str, object]] = [
+        {
+            "rank": rank,
+            "id": guard_id,
+            "canonical_name": canonical_name,
+            "vacuity_class": vacuity_class,
+            "description": description,
+        }
+        for rank, (guard_id, canonical_name, vacuity_class, description) in enumerate(
+            _SPEC_BOUNDARY_GUARD_ROWS
+        )
+    ]
+    return {
+        "schema_version": PROPERTY_TAXONOMY_SCHEMA_VERSION,
+        "property_classes": classes,
+        "spec_boundary_guards": guards,
+    }
+
+
+def _taxonomy_json_string(value: str) -> str:
+    """JSON string literal, escaped exactly like `push_json_string` in Rust."""
+    out = ['"']
+    for ch in value:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def render_property_taxonomy_manifest(taxonomy: dict[str, object] | None = None) -> str:
+    """Render the manifest byte for byte like `PropertyTaxonomyManifest::to_json`.
+
+    Fixed key order, two-space indentation, one entry per line, and a trailing
+    newline. A per-class `disposition` is emitted only when the entry has one.
+    """
+    tax = canonical_property_taxonomy() if taxonomy is None else taxonomy
+    quote = _taxonomy_json_string
+
+    def rows(entries: Sequence[dict[str, object]], keys: Sequence[str]) -> list[str]:
+        rendered: list[str] = []
+        for entry in entries:
+            fields: list[str] = []
+            for key in keys:
+                value = entry.get(key)
+                if key == "disposition" and value is None:
+                    continue
+                if isinstance(value, bool):
+                    text = "true" if value else "false"
+                elif isinstance(value, int):
+                    text = str(value)
+                else:
+                    text = quote(str(value))
+                fields.append(f'"{key}": {text}')
+            rendered.append("    {" + ", ".join(fields) + "}")
+        return [row + "," for row in rendered[:-1]] + rendered[-1:]
+
+    lines = ["{", f'  "schema_version": {tax["schema_version"]},', '  "property_classes": [']
+    lines += rows(
+        tax["property_classes"],  # type: ignore[arg-type]
+        (
+            "rank",
+            "id",
+            "variant",
+            "is_waivable",
+            "strict_disposition",
+            "partial_disposition",
+            "disposition",
+            "description",
+        ),
+    )
+    lines += ["  ],", '  "spec_boundary_guards": [']
+    lines += rows(
+        tax["spec_boundary_guards"],  # type: ignore[arg-type]
+        ("rank", "id", "canonical_name", "vacuity_class", "description"),
+    )
+    lines += ["  ]", "}"]
+    return "\n".join(lines) + "\n"
+
+
+class SourceLexError(ValueError):
+    """Source text whose comments or literals cannot be delimited exactly."""
+
+
+# Everything that can hide code from a scanner, per language: comments, string
+# literals (plain and raw) and character literals. A lifetime (`'a`) or an
+# identifier prime (`x'`) is not a character literal and never matches.
+_RUST_LEX_RE = re.compile(
+    r"//[^\n]*|/\*"
+    r"|(?<![A-Za-z0-9_])(?:b|c)?r#*\"|(?<![A-Za-z0-9_])(?:b|c)?\""
+    r"|(?<![A-Za-z0-9_'])b?'(?:\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]{1,8}\}|[^\nxu])|[^\\'\n])'"
+)
+_LEAN_LEX_RE = re.compile(
+    r"--[^\n]*|/-|«[^»\n]*»|«"
+    r"|#+\"|(?<![\w'!?.])r#*\"|\""
+    r"|(?<![\w'])'(?:\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|[^\nxu])|[^\\'\n])'"
+)
+_DQ_STRING_TAIL_RE = re.compile(r'(?:[^"\\]|\\.)*"', re.S)
+_BLOCK_COMMENT_EDGE_RE: dict[str, re.Pattern[str]] = {
+    "rust": re.compile(r"/\*|\*/"),
+    "lean": re.compile(r"/-|-/"),
+}
+_NOT_NEWLINE_RE = re.compile(r"[^\n]")
+
+
+def _line_of(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def _strip_source_comments(text: str, language: str, *, blank_literals: bool = False) -> str:
+    """Blank the comments of Lean or Rust `text`, keeping every offset.
+
+    Line comments and nested block comments become spaces (newlines survive,
+    so offsets and line numbers still match `text`). With `blank_literals`, a
+    string literal keeps only its outer quotes and a character literal becomes
+    `0`, so no literal content can be mistaken for code.
+
+    Raises `SourceLexError` for an unterminated comment or string, and for a
+    Lean interpolated string with a `{` hole, whose end only Lean's parser can
+    find.
+    """
+    lex_re = _RUST_LEX_RE if language == "rust" else _LEAN_LEX_RE
+    edge_re = _BLOCK_COMMENT_EDGE_RE["rust" if language == "rust" else "lean"]
+    out: list[str] = []
+    pos = 0
+    while True:
+        m = lex_re.search(text, pos)
+        if m is None:
+            out.append(text[pos:])
+            break
+        start = m.start()
+        out.append(text[pos:start])
+        tok = m.group(0)
+        if tok in ("/*", "/-"):
+            depth, end = 1, m.end()
+            while depth:
+                edge = edge_re.search(text, end)
+                if edge is None:
+                    raise SourceLexError(
+                        f"unterminated block comment opened at line {_line_of(text, start)}"
+                    )
+                depth += 1 if edge.group(0) == tok else -1
+                end = edge.end()
+            out.append(_NOT_NEWLINE_RE.sub(" ", text[start:end]))
+        elif tok.startswith(("//", "--")):
+            end = m.end()
+            out.append(" " * (end - start))
+        elif tok[0] == "«":
+            if len(tok) == 1 or tok[-1] != "»":
+                raise SourceLexError(
+                    f"unterminated guillemet identifier opened at line {_line_of(text, start)}"
+                )
+            if not tok[1:-1].strip():
+                raise SourceLexError(
+                    f"empty guillemet identifier at line {_line_of(text, start)}"
+                )
+            end = m.end()
+            out.append(tok)
+        elif tok[-1] == '"':
+            if "r" in tok or tok[0] == "#":
+                closer = '"' + "#" * tok.count("#")
+                close_at = text.find(closer, m.end())
+                if close_at < 0:
+                    raise SourceLexError(
+                        f"unterminated raw string opened at line {_line_of(text, start)}"
+                    )
+                end = close_at + len(closer)
+            else:
+                tail = _DQ_STRING_TAIL_RE.match(text, m.end())
+                if tail is None:
+                    raise SourceLexError(
+                        f"unterminated string literal opened at line {_line_of(text, start)}"
+                    )
+                end = tail.end()
+            literal = text[start:end]
+            if language != "rust" and start > 0 and text[start - 1] == "!" and "{" in literal:
+                raise SourceLexError(
+                        f"interpolated string with a hole at line {_line_of(text, start)}"
+                    )
+            if blank_literals:
+                out.append('"' + _NOT_NEWLINE_RE.sub(" ", literal[1:-1]) + '"')
+            else:
+                out.append(literal)
+        else:
+            end = m.end()
+            out.append("0" + " " * (end - start - 1) if blank_literals else tok)
+        pos = end
+    return "".join(out)
+
+
+_BRACE_RE = re.compile(r"[{}]")
+_RUST_VARIANT_RE = re.compile(r"[A-Z][A-Za-z0-9]*")
+_RUST_SIMPLE_ESCAPES: dict[str, str] = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "0": "\0",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+}
+
+
+def _keyword_matches(pattern: str, text: str) -> list[re.Match[str]]:
+    """Matches of `pattern` (which starts with a keyword) at a word start.
+
+    The pattern carries no leading `\\b`, so the regex engine can search for
+    its literal prefix; the word boundary is checked here instead.
+    """
+    return [
+        m
+        for m in re.compile(pattern).finditer(text)
+        if m.start() == 0 or not (text[m.start() - 1].isalnum() or text[m.start() - 1] == "_")
+    ]
+
+
+def _one_match(pattern: str, text: str, what: str) -> re.Match[str]:
+    found = _keyword_matches(pattern, text)
+    if len(found) != 1:
+        raise ValueError(f"expected exactly one {what}, found {len(found)}")
+    return found[0]
+
+
+def _brace_block(code: str, open_idx: int, what: str) -> tuple[int, int]:
+    """`(start, end)` of the body of the `{ ... }` block opening at `open_idx`."""
+    depth = 0
+    for edge in _BRACE_RE.finditer(code, open_idx):
+        depth += 1 if edge.group(0) == "{" else -1
+        if depth == 0:
+            return (open_idx + 1, edge.start())
+    raise ValueError(f"unbalanced braces in {what}")
+
+
+def _decode_rust_string_literal(literal: str) -> str:
+    """Value of a plain Rust `"..."` literal (escapes and `\\`-newline joins)."""
+    if len(literal) < 2 or literal[0] != '"' or literal[-1] != '"':
+        raise ValueError(f"not a plain string literal: {literal[:40]!r}")
+    body = literal[1:-1]
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        nxt = body[i + 1 : i + 2]
+        if nxt == "\n":
+            i += 2
+            while i < len(body) and body[i] in " \t\r\n":
+                i += 1
+        elif nxt in _RUST_SIMPLE_ESCAPES:
+            out.append(_RUST_SIMPLE_ESCAPES[nxt])
+            i += 2
+        elif nxt == "x":
+            out.append(chr(int(body[i + 2 : i + 4], 16)))
+            i += 4
+        elif nxt == "u" and body[i + 2 : i + 3] == "{":
+            close_at = body.index("}", i)
+            out.append(chr(int(body[i + 3 : close_at].replace("_", ""), 16)))
+            i = close_at + 1
+        else:
+            raise ValueError(f"unsupported escape in string literal {literal[:40]!r}")
+    return "".join(out)
+
+
+class _RustTaxonomySource:
+    """Comment-stripped view of `property_registry.rs` for taxonomy extraction.
+
+    `code` has comments and literal contents blanked and is offset-aligned
+    with `text`, so structure is found in `code` and literal values are read
+    from `text`: a slug inside a comment or a string is never taken for code.
+    """
+
+    _ARM_RE = re.compile(
+        r"\s*Self::([A-Za-z0-9_]+)\s*(?:\{\s*\.\.\s*\})?\s*=>\s*"
+        r"(\{\s*)?(\"[^\"]*\"|[0-9]+)\s*(\}\s*)?,?\s*"
+    )
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.code = _strip_source_comments(text, "rust", blank_literals=True)
+        if len(self.code) != len(text):  # pragma: no cover - lexer invariant
+            raise ValueError("comment stripping changed the source length")
+        self._impl_spans: dict[str, list[tuple[int, int]]] = {}
+
+    def impl_spans(self, type_name: str) -> list[tuple[int, int]]:
+        spans = self._impl_spans.get(type_name)
+        if spans is None:
+            spans = [
+                _brace_block(self.code, m.end() - 1, f"`impl {type_name}`")
+                for m in _keyword_matches(rf"impl\s+{type_name}\s*\{{", self.code)
+            ]
+            self._impl_spans[type_name] = spans
+        if not spans:
+            raise ValueError(f"no `impl {type_name}` block")
+        return spans
+
+    def _one_in_impl_with_span(self, type_name: str, pattern: str, what: str) -> tuple[re.Match[str], int]:
+        compiled = re.compile(pattern)
+        hits = [
+            (m, hi)
+            for lo, hi in self.impl_spans(type_name)
+            for m in compiled.finditer(self.code, lo, hi)
+        ]
+        if len(hits) != 1:
+            raise ValueError(f"expected exactly one `{type_name}::{what}`, found {len(hits)}")
+        return hits[0]
+
+    def _one_in_impl(self, type_name: str, pattern: str, what: str) -> re.Match[str]:
+        return self._one_in_impl_with_span(type_name, pattern, what)[0]
+
+    def enum_variants(self, name: str) -> list[str]:
+        head = _one_match(rf"enum\s+{name}\s*\{{", self.code, f"`enum {name}`")
+        lo, hi = _brace_block(self.code, head.end() - 1, f"`enum {name}`")
+        variants = [part.strip() for part in self.code[lo:hi].split(",")]
+        if variants and not variants[-1]:
+            variants.pop()
+        for variant in variants:
+            if not _RUST_VARIANT_RE.fullmatch(variant):
+                raise ValueError(f"`enum {name}` has an unsupported variant {variant!r}")
+        if len(set(variants)) != len(variants):
+            raise ValueError(f"`enum {name}` repeats a variant")
+        return variants
+
+    def const_all(self, type_name: str) -> list[str]:
+        m = self._one_in_impl(
+            type_name, r"\bconst\s+ALL\s*:\s*\[[^\]]*\]\s*=\s*\[([^\]]*)\]\s*;", "ALL"
+        )
+        items = [part.strip() for part in m.group(1).split(",")]
+        if items and not items[-1]:
+            items.pop()
+        out: list[str] = []
+        for item in items:
+            for prefix in (f"{type_name}::", "Self::"):
+                if item.startswith(prefix):
+                    out.append(item[len(prefix) :])
+                    break
+            else:
+                raise ValueError(f"`{type_name}::ALL` has an unsupported entry {item!r}")
+        return out
+
+    def const_count(self, type_name: str) -> int:
+        m = self._one_in_impl(
+            type_name, r"\bconst\s+COUNT\s*:\s*usize\s*=\s*([0-9]+)\s*;", "COUNT"
+        )
+        return int(m.group(1))
+
+    def fn_body(self, type_name: str, fn_name: str) -> tuple[int, int]:
+        m, impl_hi = self._one_in_impl_with_span(type_name, rf"\bfn\s+{fn_name}\s*\(", fn_name)
+        open_idx = self.code.find("{", m.end(), impl_hi)
+        if open_idx < 0 or ";" in self.code[m.end() : open_idx]:
+            raise ValueError(f"`{type_name}::{fn_name}` has no body")
+        return _brace_block(self.code, open_idx, f"`{type_name}::{fn_name}`")
+
+    def match_arms(self, type_name: str, fn_name: str) -> dict[str, object]:
+        """`{variant: value}` of a body that is one `match self { ... }`."""
+        what = f"`{type_name}::{fn_name}`"
+        lo, hi = self.fn_body(type_name, fn_name)
+        head = re.compile(r"\s*match\s+\*?self\s*\{").match(self.code, lo, hi)
+        if head is None:
+            raise ValueError(f"{what} is not a single `match self`")
+        arm_lo, arm_hi = _brace_block(self.code, head.end() - 1, what)
+        if self.code[arm_hi + 1 : hi].strip():
+            raise ValueError(f"{what} has code after its `match self`")
+        arms: dict[str, object] = {}
+        pos = arm_lo
+        while self.code[pos:arm_hi].strip():
+            m = self._ARM_RE.match(self.code, pos, arm_hi)
+            if m is None or bool(m.group(2)) != bool(m.group(4)):
+                raise ValueError(f"{what} has an arm this parser cannot read")
+            variant = m.group(1)
+            if variant in arms:
+                raise ValueError(f"{what} repeats the arm `Self::{variant}`")
+            raw = self.text[m.start(3) : m.end(3)]
+            arms[variant] = int(raw) if raw.isdigit() else _decode_rust_string_literal(raw)
+            pos = m.end()
+        return arms
+
+    def non_matching_variants(self, type_name: str, fn_name: str) -> list[str]:
+        """Variants `V` of a body that is exactly `!matches!(self, Self::V | ...)`."""
+        lo, hi = self.fn_body(type_name, fn_name)
+        m = re.fullmatch(
+            r"\s*!\s*matches!\s*\(\s*self\s*,\s*(Self::\w+(?:\s*\|\s*Self::\w+)*)\s*\)\s*",
+            self.code[lo:hi],
+        )
+        if m is None:
+            raise ValueError(f"`{type_name}::{fn_name}` is not `!matches!(self, ...)`")
+        return [part.strip()[len("Self::") :] for part in m.group(1).split("|")]
+
+    def body_text(self, type_name: str, fn_name: str) -> str:
+        lo, hi = self.fn_body(type_name, fn_name)
+        return self.code[lo:hi]
+
+
+def _parse_rust_property_taxonomy(text: str) -> dict[str, object]:
+    src = _RustTaxonomySource(text)
+    schema_version = int(
+        _one_match(
+            r"const\s+PROPERTY_TAXONOMY_SCHEMA_VERSION\s*:\s*u32\s*=\s*([0-9]+)\s*;",
+            src.code,
+            "`PROPERTY_TAXONOMY_SCHEMA_VERSION`",
+        ).group(1)
+    )
+
+    def table(type_name: str, fns: Sequence[str]) -> tuple[list[str], dict[str, dict[str, object]]]:
+        variants = src.enum_variants(type_name)
+        if src.const_all(type_name) != variants:
+            raise ValueError(f"`{type_name}::ALL` is not the enum declaration order")
+        if src.const_count(type_name) != len(variants):
+            raise ValueError(f"`{type_name}::COUNT` is not the number of variants")
+        columns: dict[str, dict[str, object]] = {}
+        for fn_name in fns:
+            arms = src.match_arms(type_name, fn_name)
+            if list(arms) != variants:
+                raise ValueError(
+                    f"`{type_name}::{fn_name}` arms are not the variants in declaration order"
+                )
+            columns[fn_name] = arms
+        if [columns["rank"][v] for v in variants] != list(range(len(variants))):
+            raise ValueError(f"`{type_name}::rank` is not the declaration order `0..`")
+        return variants, columns
+
+    variants, cols = table("PropertyClass", ("rank", "as_str", "description", "variant_name"))
+    for variant in variants:
+        if cols["variant_name"][variant] != variant:
+            raise ValueError(f"`PropertyClass::variant_name` of `{variant}` is not its name")
+    non_waivable = src.non_matching_variants("PropertyClass", "is_waivable")
+    if any(variant not in variants for variant in non_waivable):
+        raise ValueError("`PropertyClass::is_waivable` names an unknown variant")
+    tags = src.match_arms("PropertyDisposition", "tag")
+
+    strict_body = src.body_text("PropertyRegistry", "strict")
+    strict_match = re.fullmatch(
+        r"\s*Self\s*\{\s*entries\s*:\s*PropertyClass::ALL\s*\.\s*map\s*\(\s*\|\s*class\s*\|\s*"
+        r"PropertyEntry\s*\{\s*class\s*,\s*disposition\s*:\s*"
+        r"if\s+class\s*==\s*PropertyClass::(\w+)\s*\{\s*PropertyDisposition::(\w+)\s*\}"
+        r"\s*else\s*\{\s*PropertyDisposition::(\w+)\s*\}\s*,\s*"
+        r"description\s*:\s*class\s*\.\s*description\s*\(\s*\)\s*,?\s*\}\s*\)\s*,?\s*\}\s*",
+        strict_body,
+    )
+    if strict_match is None or strict_match.group(1) not in variants:
+        raise ValueError("`PropertyRegistry::strict` has dispositions this parser cannot read")
+    strict = {
+        v: tags[strict_match.group(2) if v == strict_match.group(1) else strict_match.group(3)]
+        for v in variants
+    }
+    partial_body = src.body_text("PropertyRegistry", "for_partial_correctness")
+    init = re.match(r"\s*let\s+mut\s+reg\s*=\s*Self::strict\s*\(\s*\)\s*;", partial_body)
+    if init is None:
+        raise ValueError(
+            "`PropertyRegistry::for_partial_correctness` does not start with `let mut reg = Self::strict();`"
+        )
+    overrides: list[tuple[str, str]] = []
+    pos = init.end()
+    override_re = re.compile(
+        r"\s*reg\s*\.\s*entries\s*\[\s*PropertyClass::(\w+)\s*\.\s*rank\s*\(\s*\)\s*\]\s*\.\s*"
+        r"disposition\s*=\s*PropertyDisposition::(\w+)\s*"
+    )
+    while True:
+        om = override_re.match(partial_body, pos)
+        if om is None:
+            break
+        pos = om.end()
+        if pos < len(partial_body) and partial_body[pos] == "{":
+            _, close_idx = _brace_block(partial_body, pos, "`for_partial_correctness`")
+            pos = close_idx + 1
+        semi = re.match(r"\s*;", partial_body[pos:])
+        if semi is None:
+            raise ValueError(
+                "`PropertyRegistry::for_partial_correctness` has a disposition statement this "
+                "parser cannot read"
+            )
+        pos += semi.end()
+        overrides.append((om.group(1), om.group(2)))
+    if re.fullmatch(r"\s*reg\s*", partial_body[pos:]) is None:
+        raise ValueError(
+            "`PropertyRegistry::for_partial_correctness` has statements this parser cannot read"
+        )
+    partial = dict(strict)
+    for variant, disposition in overrides:
+        if variant not in partial:
+            raise ValueError("`for_partial_correctness` overrides an unknown variant")
+        partial[variant] = tags[disposition]
+
+    classes = [
+        {
+            "rank": rank,
+            "id": cols["as_str"][variant],
+            "variant": variant,
+            "is_waivable": variant not in non_waivable,
+            "strict_disposition": strict[variant],
+            "partial_disposition": partial[variant],
+            "description": cols["description"][variant],
+        }
+        for rank, variant in enumerate(variants)
+    ]
+    guard_variants, guard_cols = table(
+        "SpecBoundaryGuardId",
+        ("rank", "as_str", "canonical_name", "vacuity_class", "description"),
+    )
+    guards = [
+        {
+            "rank": rank,
+            "id": guard_cols["as_str"][variant],
+            "canonical_name": guard_cols["canonical_name"][variant],
+            "vacuity_class": guard_cols["vacuity_class"][variant],
+            "description": guard_cols["description"][variant],
+        }
+        for rank, variant in enumerate(guard_variants)
+    ]
+    return {
+        "schema_version": schema_version,
+        "property_classes": classes,
+        "spec_boundary_guards": guards,
+    }
+
+
+def _parse_lean_property_taxonomy(text: str) -> dict[str, object]:
+    code = _strip_source_comments(text, "lean", blank_literals=True)
+    if len(code) != len(text):  # pragma: no cover - lexer invariant
+        raise ValueError("comment stripping changed the source length")
+    ident = r"[A-Za-z_][A-Za-z0-9_']*"
+
+    def _next_nonblank_starts_bar(buf: str, pos: int) -> bool:
+        m_next = re.search(r"(?m)^[ \t]*(\S)", buf[pos:])
+        return m_next is not None and m_next.group(1) == "|"
+
+    def ctors(name: str) -> list[str]:
+        m = _one_match(
+            rf"(?m)^inductive[ \t]+{name}\b[^\n]*\bwhere[ \t]*\n"
+            rf"((?:[ \t]*(?:\|[ \t]*{ident})?[ \t]*\n)+)",
+            code,
+            f"`inductive {name}`",
+        )
+        if _next_nonblank_starts_bar(code, m.end()):
+            raise ValueError(f"`inductive {name}` has a constructor this parser cannot read")
+        found = re.findall(rf"\|[ \t]*({ident})", m.group(1))
+        if not found or len(set(found)) != len(found):
+            raise ValueError(f"`inductive {name}` has no or repeated constructors")
+        return found
+
+    def namespace_span(name: str) -> tuple[int, int]:
+        start = _one_match(rf"(?m)^namespace[ \t]+{name}[ \t]*$", code, f"`namespace {name}`")
+        stop = re.compile(rf"(?m)^end[ \t]+{name}[ \t]*$").search(code, start.end())
+        if stop is None:
+            raise ValueError(f"`namespace {name}` is never closed")
+        return start.end(), stop.start()
+
+    def arms(ns_span: tuple[int, int], def_name: str, where: str) -> list[tuple[str, str]]:
+        ns_lo, ns_hi = ns_span
+        body = code[ns_lo:ns_hi]
+        m = _one_match(
+            rf"(?m)^def[ \t]+{def_name}[ \t]*:[^\n]*\n((?:[ \t]*(?:\|[^\n]*)?\n)+)",
+            body,
+            f"`{where}.{def_name}`",
+        )
+        if _next_nonblank_starts_bar(body, m.end()):
+            raise ValueError(f"`{where}.{def_name}` has an arm this parser cannot read")
+        out: list[tuple[str, str]] = []
+        offset = ns_lo + m.start(1)
+        for raw_line in m.group(1).splitlines(keepends=True):
+            line = raw_line.rstrip("\n")
+            if line.strip():
+                arm = re.fullmatch(rf"[ \t]*\|[ \t]*(\.{ident}|_)[ \t]*=>[ \t]*(\S.*?)[ \t]*", line)
+                if arm is None:
+                    raise ValueError(f"`{where}.{def_name}` has an arm this parser cannot read")
+                val_raw = text[offset + arm.start(2) : offset + arm.end(2)]
+                out.append((arm.group(1).lstrip("."), val_raw))
+            offset += len(raw_line)
+        if not out or len({pattern for pattern, _ in out}) != len(out):
+            raise ValueError(f"`{where}.{def_name}` has no or repeated arms")
+        return out
+
+    def column(ns_span: tuple[int, int], def_name: str, where: str, names: list[str]) -> dict[str, str]:
+        found = arms(ns_span, def_name, where)
+        if [pattern for pattern, _ in found] != names:
+            raise ValueError(
+                f"`{where}.{def_name}` arms are not the constructors in declaration order"
+            )
+        return dict(found)
+
+    def all_list(ns_span: tuple[int, int], where: str) -> list[str]:
+        body = code[ns_span[0] : ns_span[1]]
+        m = _one_match(
+            r"(?m)^def[ \t]+all[ \t]*:[^\n]*:=\s*\[([^\]]*)\][ \t]*$", body, f"`{where}.all`"
+        )
+        m_cont = re.search(r"(?m)^([ \t]*)(\S+)", body[m.end() :])
+        if m_cont is not None and (
+            m_cont.group(1)
+            or (
+                m_cont.group(2) not in _LEAN_DECL_WORDS
+                and not m_cont.group(2).startswith(("#", "@"))
+            )
+        ):
+            raise ValueError(f"`{where}.all` has a trailing continuation")
+        out: list[str] = []
+        for raw_item in m.group(1).split(","):
+            item = raw_item.strip()
+            if not re.fullmatch(rf"\.{ident}", item):
+                raise ValueError(f"`{where}.all` has an unsupported entry {item!r}")
+            out.append(item[1:])
+        return out
+
+    def string(value: str, where: str) -> str:
+        if not re.fullmatch(r'"[^"\\]*"', value):
+            raise ValueError(f"{where} is not a plain string literal: {value!r}")
+        return value[1:-1]
+
+    def ranks(ns_span: tuple[int, int], where: str, names: list[str]) -> None:
+        col = column(ns_span, "rank", where, names)
+        if [col[name] for name in names] != [str(i) for i in range(len(names))]:
+            raise ValueError(f"`{where}.rank` is not the declaration order `0..`")
+
+    cls = "PropertyClassTag"
+    cls_ctors = ctors(cls)
+    cls_ns = namespace_span(cls)
+    if all_list(cls_ns, cls) != cls_ctors:
+        raise ValueError(f"`{cls}.all` is not the constructor declaration order")
+    ranks(cls_ns, cls, cls_ctors)
+    as_str = column(cls_ns, "asStr", cls, cls_ctors)
+    variant = column(cls_ns, "variantName", cls, cls_ctors)
+    waivable = arms(cls_ns, "isWaivable", cls)
+    if (
+        not waivable
+        or waivable[-1] != ("_", "true")
+        or any(value != "false" or name not in cls_ctors for name, value in waivable[:-1])
+    ):
+        raise ValueError(f"`{cls}.isWaivable` is not `false` arms followed by `| _ => true`")
+    non_waivable = {name for name, _ in waivable[:-1]}
+    classes = [
+        {
+            "rank": rank,
+            "id": string(as_str[name], f"`{cls}.asStr`"),
+            "variant": string(variant[name], f"`{cls}.variantName`"),
+            "is_waivable": name not in non_waivable,
+        }
+        for rank, name in enumerate(cls_ctors)
+    ]
+    for entry, name in zip(classes, cls_ctors):
+        if entry["variant"] != name[:1].upper() + name[1:]:
+            raise ValueError(f"`{cls}.variantName` of `{name}` is not its Rust variant name")
+
+    guard = "SpecBoundaryGuardClass"
+    guard_ctors = ctors(guard)
+    guard_ns = namespace_span(guard)
+    if all_list(guard_ns, guard) != guard_ctors:
+        raise ValueError(f"`{guard}.all` is not the constructor declaration order")
+    ranks(guard_ns, guard, guard_ctors)
+    guard_id = column(guard_ns, "guardId", guard, guard_ctors)
+    canonical_name = column(guard_ns, "canonicalName", guard, guard_ctors)
+    vacuity = column(guard_ns, "toVacuityClass", guard, guard_ctors)
+    guards: list[dict[str, object]] = []
+    for rank, name in enumerate(guard_ctors):
+        vac = vacuity[name]
+        if not re.fullmatch(rf"\.{ident}", vac):
+            raise ValueError(f"`{guard}.toVacuityClass` of `{name}` is not a constructor")
+        guards.append(
+            {
+                "rank": rank,
+                "id": string(guard_id[name], f"`{guard}.guardId`"),
+                "canonical_name": string(canonical_name[name], f"`{guard}.canonicalName`"),
+                "vacuity_class": vac[1:2].upper() + vac[2:],
+            }
+        )
+    return {"property_classes": classes, "spec_boundary_guards": guards}
+
+
+# Parsed taxonomies by source text: the catalog is validated many times per
+# process against the same two files.
+_TAXONOMY_PARSE_CACHE: dict[tuple[str, str], dict[str, object] | str] = {}
+
+
+def _extract_taxonomy(anneal_root: Path, rel: str, kind: str) -> dict[str, object]:
+    path = Path(anneal_root) / rel
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot read {rel}: {exc}") from exc
+    key = (kind, text)
+    cached = _TAXONOMY_PARSE_CACHE.get(key)
+    if cached is None:
+        parser = _parse_rust_property_taxonomy if kind == "rust" else _parse_lean_property_taxonomy
+        try:
+            cached = parser(text)
+        except (ValueError, KeyError, IndexError) as exc:
+            cached = f"{rel}: malformed taxonomy source: {exc}"
+        if len(_TAXONOMY_PARSE_CACHE) >= 8:
+            _TAXONOMY_PARSE_CACHE.clear()
+        _TAXONOMY_PARSE_CACHE[key] = cached
+    if isinstance(cached, str):
+        raise ValueError(cached)
+    return {
+        key_: [dict(entry) for entry in value] if isinstance(value, list) else value
+        for key_, value in cached.items()
+    }
+
+
+def extract_rust_property_taxonomy(anneal_root: Path) -> dict[str, object]:
+    """Read the taxonomy manifest out of the live `property_registry.rs`.
+
+    Parses the comment-stripped source directly: `PropertyClass` and
+    `SpecBoundaryGuardId` declaration order, `ALL`, `COUNT`, `rank`, `as_str`,
+    `variant_name`, `description`, `is_waivable`, the strict and
+    partial-correctness dispositions, and the manifest schema version. The
+    result has the shape of `canonical_property_taxonomy()`.
+
+    Raises `ValueError` when the file is missing, unreadable, or not shaped
+    the way this parser can prove it reads completely.
+    """
+    return _extract_taxonomy(anneal_root, _RUST_TAXONOMY_REL, "rust")
+
+
+def extract_lean_property_taxonomy(anneal_root: Path) -> dict[str, object]:
+    """Read `PropertyClassTag` and `SpecBoundaryGuardClass` out of the Lean theory.
+
+    The result has the rank, identifier, variant / canonical name, waivability
+    and vacuity-class fields of `canonical_property_taxonomy()`; Lean carries
+    no descriptions or dispositions.
+    """
+    return _extract_taxonomy(anneal_root, _LEAN_TAXONOMY_REL, "lean")
+
+
+_TAXONOMY_REQUIRED_KEYS: dict[str, dict[str, tuple[str, ...]]] = {
+    "property_registry.rs": {
+        "property_classes": (
+            "rank", "id", "variant", "is_waivable",
+            "strict_disposition", "partial_disposition", "description",
+        ),
+        "spec_boundary_guards": (
+            "rank", "id", "canonical_name", "vacuity_class", "description",
+        ),
+    },
+    "SpecBoundaryGuards.lean": {
+        "property_classes": ("rank", "id", "variant", "is_waivable"),
+        "spec_boundary_guards": ("rank", "id", "canonical_name", "vacuity_class"),
+    },
+}
+
+
+def _taxonomy_drift_errors(
+    source: str, found: dict[str, object], expected: dict[str, object]
+) -> list[str]:
+    errors: list[str] = []
+    if source == "property_registry.rs" and "schema_version" not in found:
+        errors.append(f"property taxonomy drift: {source} is missing schema_version")
+    elif "schema_version" in found and found["schema_version"] != expected["schema_version"]:
+        errors.append(
+            f"property taxonomy drift: {source} schema_version is "
+            f"{found['schema_version']!r}, expected {expected['schema_version']!r}"
+        )
+    req_sections = _TAXONOMY_REQUIRED_KEYS.get(source, {})
+    for section in ("property_classes", "spec_boundary_guards"):
+        found_rows: list[dict[str, object]] = found[section]  # type: ignore[assignment]
+        expected_rows: list[dict[str, object]] = expected[section]  # type: ignore[assignment]
+        if len(found_rows) != len(expected_rows):
+            errors.append(
+                f"property taxonomy drift: {source} has {len(found_rows)} {section}, "
+                f"expected {len(expected_rows)}"
+            )
+        req_keys = req_sections.get(section, ())
+        for found_row, expected_row in zip(found_rows, expected_rows):
+            keys_to_check = list(dict.fromkeys((*req_keys, *found_row.keys())))
+            for key in keys_to_check:
+                if key not in found_row:
+                    errors.append(
+                        f"property taxonomy drift: {source} {section}[{expected_row['rank']}] "
+                        f"is missing key {key!r}"
+                    )
+                    continue
+                value = found_row[key]
+                want = expected_row.get(key)
+                if key not in expected_row or value != want or type(value) is not type(want):
+                    errors.append(
+                        f"property taxonomy drift: {source} {section}[{expected_row['rank']}]"
+                        f".{key} is {value!r}, expected {want!r}"
+                    )
+    return errors
+
+
+def validate_property_taxonomy(
+    anneal_root: Path,
+    *,
+    require_rust_taxonomy: bool | None = None,
+    require_lean_taxonomy: bool | None = None,
+) -> list[str]:
+    """Check this script's taxonomy against the live Rust and Lean sources.
+
+    `property_registry.rs` is checked whenever it exists under `anneal_root`,
+    and its absence is an error when `require_rust_taxonomy` is true. With the
+    default `None` it is required exactly when `anneal_root` is the checkout
+    this script lives in, so an isolated test root that stages only
+    `trusted/lean` still validates. `SpecBoundaryGuards.lean` follows the same
+    rule (overrideable via `require_lean_taxonomy`).
+    """
+    errors: list[str] = []
+    canonical = canonical_property_taxonomy()
+    if (
+        tuple(row[0] for row in _PROPERTY_CLASS_ROWS) != CANONICAL_PROPERTY_CLASSES
+        or len(set(CANONICAL_PROPERTY_CLASSES)) != 12
+    ):
+        errors.append("CANONICAL_PROPERTY_CLASSES is not the 12 distinct manifest class ids")
+    if (
+        tuple(row[0] for row in _SPEC_BOUNDARY_GUARD_ROWS) != CANONICAL_SPEC_BOUNDARY_GUARDS
+        or len(set(CANONICAL_SPEC_BOUNDARY_GUARDS)) != 3
+    ):
+        errors.append("CANONICAL_SPEC_BOUNDARY_GUARDS is not the 3 distinct manifest guard ids")
+
+    root = Path(anneal_root)
+    try:
+        own_checkout = root.resolve() == _default_anneal_root()
+    except OSError:
+        own_checkout = False
+    rust_required = own_checkout if require_rust_taxonomy is None else require_rust_taxonomy
+    lean_required = own_checkout if require_lean_taxonomy is None else require_lean_taxonomy
+    for rel, required, extract, source in (
+        (_RUST_TAXONOMY_REL, rust_required, extract_rust_property_taxonomy, "property_registry.rs"),
+        (_LEAN_TAXONOMY_REL, lean_required, extract_lean_property_taxonomy, "SpecBoundaryGuards.lean"),
+    ):
+        if not required and not os.path.lexists(root / rel):
+            continue
+        try:
+            found = extract(root)
+        except ValueError as exc:
+            errors.append(f"property taxonomy: {exc}")
+            continue
+        errors.extend(_taxonomy_drift_errors(source, found, canonical))
+    return errors
+
+
+def _guard_property_class_errors() -> list[str]:
+    """Every cataloged guard names a canonical class its disposition allows."""
+    errors: list[str] = []
+    if tuple(PROPERTY_CLASS_DISPOSITIONS) != CANONICAL_PROPERTY_CLASSES:
+        errors.append(
+            "PROPERTY_CLASS_DISPOSITIONS must list exactly the 12 canonical property "
+            "classes in rank order"
+        )
+    guarded: Counter[str] = Counter()
+    for guard in MIR_SEMANTICS_GUARDS:
+        if guard.property_class == PROPERTY_CLASS_UNSPECIFIED:
+            errors.append(f"{guard.guard_id}: missing explicit property_class")
+        elif guard.property_class not in CANONICAL_PROPERTY_CLASSES:
+            errors.append(
+                f"{guard.guard_id}: unknown property_class {guard.property_class!r} "
+                f"(expected one of {', '.join(CANONICAL_PROPERTY_CLASSES)})"
+            )
+        else:
+            guarded[guard.property_class] += 1
+    for class_id in CANONICAL_PROPERTY_CLASSES:
+        disposition = PROPERTY_CLASS_DISPOSITIONS.get(class_id)
+        if disposition is None:
+            continue
+        if disposition.coverage not in PROPERTY_CLASS_COVERAGE_KINDS:
+            errors.append(
+                f"PROPERTY_CLASS_DISPOSITIONS[{class_id!r}]: unknown coverage "
+                f"{disposition.coverage!r}"
+            )
+        elif not disposition.rationale.strip():
+            errors.append(f"PROPERTY_CLASS_DISPOSITIONS[{class_id!r}]: empty rationale")
+        elif (disposition.coverage == "single_step_ub_guarded") != (guarded[class_id] > 0):
+            errors.append(
+                f"PROPERTY_CLASS_DISPOSITIONS[{class_id!r}] is {disposition.coverage!r} "
+                f"but the catalog tags {guarded[class_id]} guard(s) with the class"
+            )
+    return errors
+
+
+def property_class_summary(
+    guards: Sequence[MirSemanticsGuard], results: Sequence[GuardResult] = ()
+) -> list[dict[str, object]]:
+    """One row per canonical property class, in rank order.
+
+    `cataloged` counts the class's guards in `MIR_SEMANTICS_GUARDS`; `selected`,
+    `guard_ids` and the `killed` / `survived` / `errors` tallies cover `guards`
+    and their `results`.
+    """
+    status_by_id = {result.guard_id: result.status for result in results}
+    rows: list[dict[str, object]] = []
+    for rank, class_id in enumerate(CANONICAL_PROPERTY_CLASSES):
+        selected = [g.guard_id for g in guards if g.property_class == class_id]
+        statuses = [status_by_id.get(guard_id) for guard_id in selected]
+        disposition = PROPERTY_CLASS_DISPOSITIONS.get(class_id)
+        rows.append(
+            {
+                "rank": rank,
+                "property_class": class_id,
+                "coverage": disposition.coverage if disposition else None,
+                "cataloged": sum(
+                    1 for g in MIR_SEMANTICS_GUARDS if g.property_class == class_id
+                ),
+                "selected": len(selected),
+                "killed": statuses.count("KILLED"),
+                "survived": statuses.count("SURVIVED"),
+                "errors": statuses.count("ERROR"),
+                "guard_ids": selected,
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Postcondition error-branch wildcard probe (`error_branch_wildcard`, `awsm2`)
+# ---------------------------------------------------------------------------
+#
+# A postcondition arm such as `| .ub => True` or `Err(_) => true` accepts every
+# error escape, so a kernel-checked proof of it says nothing about the error
+# path. The scanner below is the stdlib-only counterpart of
+# `anneal_spec::spec_check::scan_error_branch_wildcard` and reports under the
+# same guard id and pattern wire identifiers.
+
+SPEC_WILDCARD_GUARD_ID = "error_branch_wildcard"
+
+# `ErrorWildcardPattern::as_str` of `anneal-spec`.
+ERROR_WILDCARD_PATTERNS: tuple[str, ...] = (
+    "err_arm_true",
+    "ub_arm_true",
+    "unsupported_arm_true",
+    "matches_any_err",
+    "catch_all_arm_true",
+    "unclosed_literal_or_comment",
+)
+
+# The error outcomes a postcondition must reject: an `Err` / `.error` result
+# with an arbitrary payload, undefined behavior, and an unsupported construct.
+ERROR_MUTANT_KINDS: tuple[str, ...] = ("err", "ub", "unsupported")
+
+_WILDCARD_WIRE_ID: dict[str, str] = {
+    "err": "err_arm_true",
+    "ub": "ub_arm_true",
+    "unsupported": "unsupported_arm_true",
+}
+
+
+@dataclass(frozen=True)
+class ErrorWildcardFinding:
+    """One vacuous error-branch arm (or a source that cannot be scanned)."""
+
+    guard_id: str
+    pattern: str
+    language: str
+    line: int
+    column: int
+    arm: str
+
+
+_SPEC_TOKEN_RE = re.compile(
+    r'"[^"]*"|«[^»\n]*»|r#[^\W\d][\w]*|[^\W\d][\w\']*|\d[\w.]*'
+    r"|==>|=>|::|\.\.=|\.\.|->|:=|==|!=|<=|>=|&&|\|\|\||\|\||\|>|/\\|\\/|<->|\S"
+)
+_SPEC_WORD_RE = re.compile(r"[^\W\d][\w']*")
+_SPEC_OPENERS: dict[str, str] = {"(": ")", "[": "]", "{": "}", "⟨": "⟩"}
+_SPEC_CLOSERS: frozenset[str] = frozenset(_SPEC_OPENERS.values())
+_LEAN_ARM_BOUNDARY_WORDS: frozenset[str] = frozenset(
+    "with fun match def theorem lemma abbrev instance example where then else do by in "
+    "at have show from let if return structure inductive namespace open end".split()
+)
+_LEAN_DECL_WORDS: frozenset[str] = frozenset(
+    "def theorem lemma abbrev instance example structure inductive class namespace "
+    "section end open variable universe import private protected noncomputable "
+    "opaque axiom syntax macro elab notation local scoped unsafe partial mutual "
+    "export attribute set_option".split()
+)
+_RUST_ARM_BOUNDARY_WORDS: frozenset[str] = frozenset({"match", "return", "else", "let"})
+# Boundaries after which the first `|`-separated piece really is a pattern.
+_CLEAN_ARM_STARTS: frozenset[str] = frozenset({"", "with", "fun", ",", "}", *_SPEC_OPENERS})
+_TRUE_ATOMS: frozenset[str] = frozenset({"true", "True", "trivial", "⊤"})
+_FALSE_ATOMS: frozenset[str] = frozenset({"false", "False", "⊥"})
+_SPECIFIC_LOWER_PATTERNS: frozenset[str] = frozenset(
+    {"true", "false", "none", "some", "nil", "zero", "unit"}
+)
+_PATTERN_PREFIX_WORDS: frozenset[str] = frozenset({"&", "&&", "ref", "mut", "box"})
+_MAX_SPEC_DEPTH = 24
+
+
+def _spec_tokens(code: str) -> list[tuple[str, int, int, bool]]:
+    """`(text, line, column, first_on_line)` tokens of comment-free `code`."""
+    toks: list[tuple[str, int, int, bool]] = []
+    line, line_start, scan, prev_line = 1, 0, 0, 0
+    for m in _SPEC_TOKEN_RE.finditer(code):
+        start = m.start()
+        newlines = code.count("\n", scan, start)
+        if newlines:
+            line += newlines
+            line_start = code.rfind("\n", scan, start) + 1
+        scan = start
+        toks.append((m.group(0), line, start - line_start + 1, line != prev_line))
+        prev_line = line
+    return toks
+
+
+def _match_delimiters(toks: Sequence[tuple[str, int, int, bool]]) -> dict[int, int]:
+    partner: dict[int, int] = {}
+    stack: list[int] = []
+    for idx, tok in enumerate(toks):
+        text = tok[0]
+        if text in _SPEC_OPENERS:
+            stack.append(idx)
+        elif text in _SPEC_CLOSERS:
+            if not stack or _SPEC_OPENERS[toks[stack[-1]][0]] != text:
+                raise SourceLexError(f"unbalanced `{text}` at line {tok[1]}")
+            open_idx = stack.pop()
+            partner[open_idx] = idx
+            partner[idx] = open_idx
+    if stack:
+        raise SourceLexError(f"unclosed `{toks[stack[-1]][0]}` at line {toks[stack[-1]][1]}")
+    return partner
+
+
+def _split_top(texts: Sequence[str], seps: frozenset[str] | set[str]) -> list[list[str]]:
+    """Split a balanced token run on `seps` outside every bracket."""
+    parts: list[list[str]] = [[]]
+    depth = 0
+    for text in texts:
+        if text in _SPEC_OPENERS:
+            depth += 1
+        elif text in _SPEC_CLOSERS:
+            depth -= 1
+        elif depth == 0 and text in seps:
+            parts.append([])
+            continue
+        parts[-1].append(text)
+    return parts
+
+
+def _wrapped(texts: Sequence[str]) -> bool:
+    """Whether `texts` is one bracket group: its first token closes at its last."""
+    if len(texts) < 2 or texts[0] not in _SPEC_OPENERS or texts[-1] != _SPEC_OPENERS[texts[0]]:
+        return False
+    depth = 0
+    for idx, text in enumerate(texts):
+        if text in _SPEC_OPENERS:
+            depth += 1
+        elif text in _SPEC_CLOSERS:
+            depth -= 1
+            if depth == 0:
+                return idx == len(texts) - 1
+    return False
+
+
+def _strip_parens(texts: Sequence[str]) -> list[str]:
+    out = list(texts)
+    while out and out[0] == "(" and _wrapped(out) and len(_split_top(out[1:-1], {","})) == 1:
+        out = out[1:-1]
+    return out
+
+
+def _int_literal(texts: Sequence[str]) -> int | None:
+    if len(texts) == 1 and texts[0].isascii() and texts[0].isdigit():
+        return int(texts[0])
+    return None
+
+
+_RUST_EXPR_CONT_OPS: frozenset[str] = frozenset(
+    {".", "&&", "||", "==", "!=", "<", "<=", ">", ">=", "as", "?", "+", "-", "*", "/", "%", "&", "|", "^"}
+)
+_RUST_BLOCK_CTRL_WORDS: frozenset[str] = frozenset(
+    {"if", "match", "while", "for", "loop", "break", "continue", "return", "panic", "assert",
+     "assert_eq", "assert_ne", "debug_assert", "unreachable"}
+)
+_RUST_NON_STRUCT_BEFORE_BRACE: frozenset[str] = frozenset(
+    {"match", "else", "loop", "unsafe", "async", "try", "move", "do"}
+)
+
+
+def _split_first_top(texts: Sequence[str], seps: frozenset[str] | set[str]) -> tuple[list[str], list[str]] | None:
+    """Split `texts` at the first top-level token in `seps`, or `None` if absent."""
+    depth = 0
+    for idx, text in enumerate(texts):
+        if text in _SPEC_OPENERS:
+            depth += 1
+        elif text in _SPEC_CLOSERS:
+            depth -= 1
+        elif depth == 0 and text in seps:
+            return list(texts[:idx]), list(texts[idx + 1 :])
+    return None
+
+
+_COMPLEMENT_LOW_PREC_OPS: frozenset[str] = frozenset(
+    {"&&", "∧", "/\\", "||", "∨", "\\/", "→", "->", "==>", "↔", "<->"}
+)
+_COMPLEMENT_CMP_OPS: frozenset[str] = frozenset(
+    {"==", "=", "!=", "≠", "<=", "≤", ">=", "≥", "<", ">"}
+)
+_CLOSURE_BAR_PRECEDERS: frozenset[str] = frozenset(
+    {"", "(", "{", "[", ",", ";", "=", ":=", "=>", "move", "return", "&&", "||", "!"}
+)
+
+
+_PURE_BOOL_MACROS: frozenset[str] = frozenset({"matches", "cfg"})
+
+
+def _has_macro_invocation(toks: Sequence[str]) -> bool:
+    return any(
+        tok == "!"
+        and idx > 0
+        and _is_spec_word(toks[idx - 1])
+        and _ident_key(toks[idx - 1]) not in _PURE_BOOL_MACROS
+        for idx, tok in enumerate(toks)
+    )
+
+
+_RUST_NON_CALL_KEYWORDS: frozenset[str] = frozenset(
+    {"let", "mut", "ref", "box", "return", "if", "else", "match", "while", "for", "in", "as"}
+)
+
+
+def _has_call_expr(toks: Sequence[str]) -> bool:
+    return any(
+        tok == "("
+        and idx > 0
+        and (
+            (_is_spec_word(toks[idx - 1]) and toks[idx - 1] not in _RUST_NON_CALL_KEYWORDS)
+            or toks[idx - 1] in (")", "]", ">")
+        )
+        for idx, tok in enumerate(toks)
+    )
+
+
+_RUST_ARM_START_OPS: frozenset[str] = frozenset({"|", "&", "&&", "-"})
+
+
+def _rust_brace_ends_arm(toks: Sequence[str], close_idx: int) -> bool:
+    """Whether closing `}` at `close_idx` terminates a Rust `match` arm body."""
+    n = len(toks)
+    if close_idx + 1 >= n:
+        return True
+    after = toks[close_idx + 1]
+    if after in (",", ";") or after in _SPEC_CLOSERS:
+        return True
+    if after in ("else", "=", "{"):
+        return False
+    if after in _RUST_EXPR_CONT_OPS:
+        # Only `|`, `&`, `&&`, and `-` can legally open a new Rust match-arm pattern
+        # (`| Pat =>`, `&Pat =>`, `&&Pat =>`, `-1 =>`). Binary ops like `||` or `==`
+        # always continue the current arm expression (`{ false } || { true }`).
+        if after not in _RUST_ARM_START_OPS:
+            return False
+        bdepth = 0
+        probe = close_idx + 1
+        while probe < n:
+            pt = toks[probe]
+            if pt in _SPEC_OPENERS:
+                if bdepth == 0 and pt == "{":
+                    prev_pt = toks[probe - 1] if probe > close_idx + 1 else ""
+                    if not (_is_spec_word(prev_pt) or prev_pt == ">"):
+                        # Bare `{ ... }` after `&`/`|` is a block expression, not a struct pattern.
+                        return False
+                bdepth += 1
+            elif pt in _SPEC_CLOSERS:
+                if bdepth == 0:
+                    return False
+                bdepth -= 1
+            elif bdepth == 0:
+                if pt == "=>":
+                    return True
+                if pt in (",", ";"):
+                    return False
+            probe += 1
+        return False
+    return True
+
+
+_NON_BINDER_PATTERN_WORDS: frozenset[str] = frozenset(
+    {"mut", "ref", "box", "_", "true", "false", "True", "False", "none", "some", "nil", "zero", "unit"}
+)
+
+
+def _pattern_binder_names(pat_toks: Sequence[str]) -> set[str]:
+    """Variable names bound by a Rust or Lean pattern slice."""
+    names: set[str] = set()
+    n = len(pat_toks)
+    in_type = False
+    bdepth = 0
+    for idx, tok in enumerate(pat_toks):
+        prev = pat_toks[idx - 1] if idx > 0 else ""
+        nxt = pat_toks[idx + 1] if idx + 1 < n else ""
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+            in_type = False
+            continue
+        if tok in _SPEC_CLOSERS:
+            bdepth = max(0, bdepth - 1)
+            in_type = False
+            continue
+        if tok in (",", "|"):
+            in_type = False
+            continue
+        if tok == ":" and prev != ":" and nxt != ":":
+            if bdepth == 0:
+                in_type = True
+            continue
+        if in_type or not _is_spec_word(tok):
+            continue
+        if prev in (".", "::") or nxt in ("::", ".", "{", ":="):
+            continue
+        if nxt == ":" and idx + 2 < n:
+            # Struct field label (`{ field: pat }`), not the bound variable.
+            continue
+        if tok.startswith("r#") and len(tok) > 2:
+            plain = tok[2:]
+            if plain != "_" and not plain[0].isupper():
+                names.add(plain)
+            continue
+        plain = _unquote_ident(tok)
+        if plain in _NON_BINDER_PATTERN_WORDS:
+            continue
+        if plain[0] == "_" or not plain[0].isupper():
+            names.add(plain)
+    return names
+
+
+def _subst_lean_match_arms(arms_toks: Sequence[str], scope: dict[str, str], depth: int) -> list[str]:
+    """Substitute `scope` across Lean `| <pat> => <body>` arms while respecting pattern binders."""
+    if not arms_toks or depth > _MAX_SPEC_DEPTH:
+        return list(arms_toks)
+    segments: list[list[str]] = [[]]
+    has_bar: list[bool] = [False]
+    bdepth = 0
+    for tok in arms_toks:
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+        elif tok in _SPEC_CLOSERS:
+            bdepth -= 1
+        elif bdepth == 0 and tok == "|":
+            segments.append([])
+            has_bar.append(True)
+            continue
+        segments[-1].append(tok)
+    out: list[str] = []
+    pending_pats: list[tuple[bool, list[str]]] = []
+    for bar, seg in zip(has_bar, segments):
+        if not seg and not bar:
+            continue
+        arrow = _split_first_top(seg, {"=>"})
+        if arrow is None:
+            pending_pats.append((bar, seg))
+            continue
+        pat, body = arrow
+        pats = [*pending_pats, (bar, pat)]
+        pending_pats = []
+        binders: set[str] = set()
+        for _, p_toks in pats:
+            binders |= _pattern_binder_names(p_toks)
+        arm_scope = {k: v for k, v in scope.items() if k not in binders}
+        for p_bar, p_toks in pats:
+            if p_bar:
+                out.append("|")
+            out.extend(p_toks)
+        out.append("=>")
+        out.extend(_subst_ident_map(body, arm_scope, depth + 1))
+    for p_bar, p_toks in pending_pats:
+        if p_bar:
+            out.append("|")
+        out.extend(p_toks)
+    return out
+
+
+def _subst_rust_match_inner(inner: Sequence[str], scope: dict[str, str], depth: int) -> list[str]:
+    """Substitute `scope` across a Rust `match` `{ ... }` arm list while respecting pattern binders."""
+    if not inner or depth > _MAX_SPEC_DEPTH:
+        return list(inner)
+    raw_arms: list[list[str]] = []
+    cur: list[str] = []
+    bdepth = 0
+    saw_arrow = False
+    n = len(inner)
+    for idx, tok in enumerate(inner):
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+            cur.append(tok)
+            continue
+        if tok in _SPEC_CLOSERS:
+            bdepth -= 1
+            cur.append(tok)
+            if bdepth == 0 and tok == "}" and saw_arrow and _rust_brace_ends_arm(inner, idx):
+                raw_arms.append(cur)
+                cur = []
+                saw_arrow = False
+            continue
+        if bdepth == 0 and tok == ",":
+            if cur:
+                raw_arms.append(cur)
+                cur = []
+                saw_arrow = False
+            continue
+        if bdepth == 0 and tok == "=>":
+            saw_arrow = True
+        cur.append(tok)
+    if cur:
+        raw_arms.append(cur)
+    out: list[str] = []
+    for arm_idx, arm in enumerate(raw_arms):
+        if arm_idx > 0:
+            out.append(",")
+        arrow = _split_first_top(arm, {"=>"})
+        if arrow is None:
+            out.extend(_subst_ident_map(arm, scope, depth + 1))
+            continue
+        pat_part, body = arrow
+        guard_split = _split_first_top(pat_part, {"if"})
+        pat_toks = pat_part if guard_split is None else guard_split[0]
+        binders = _pattern_binder_names(pat_toks)
+        arm_scope = {k: v for k, v in scope.items() if k not in binders}
+        out.extend(pat_toks)
+        if guard_split is not None:
+            out.append("if")
+            out.extend(_subst_ident_map(guard_split[1], arm_scope, depth + 1))
+        out.append("=>")
+        out.extend(_subst_ident_map(body, arm_scope, depth + 1))
+    return out
+
+
+def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str], depth: int = 0) -> list[str]:
+    """Substitute known constant identifiers outside member and shadowing binder positions."""
+    if not bindings or depth > _MAX_SPEC_DEPTH:
+        return list(toks)
+    out: list[str] = []
+    scopes: list[dict[str, str]] = [dict(bindings)]
+    # Pending `(scope_depth, shadowed_names)` from `let`/`have` headers waiting for `;`/`in`.
+    pending_lets: list[tuple[int, set[str]]] = []
+    # Pending `[scope_depth, shadowed_names, saved_scope, stage, if_nesting]` for `if let`.
+    pending_if_lets: list[list[object]] = []
+    skip_until = -1
+    n = len(toks)
+    idx = 0
+    while idx < n:
+        tok = toks[idx]
+        prev = toks[idx - 1] if idx > 0 else ""
+        sdepth = len(scopes) - 1
+        if idx < skip_until:
+            if tok in _SPEC_OPENERS:
+                scopes.append(dict(scopes[-1]))
+            elif tok in _SPEC_CLOSERS and len(scopes) > 1:
+                scopes.pop()
+            out.append(tok)
+            idx += 1
+            continue
+        if tok in _SPEC_OPENERS:
+            new_scope = dict(scopes[-1])
+            if tok == "{":
+                # Check if this `{ ... }` is a scrutinee block (e.g. `if let P(x) = unsafe { e } { ... }`)
+                # rather than the `if let` body block itself.
+                close_b = -1
+                bd = 1
+                scan_b = idx + 1
+                while scan_b < n:
+                    sbt = toks[scan_b]
+                    if sbt in _SPEC_OPENERS:
+                        bd += 1
+                    elif sbt in _SPEC_CLOSERS:
+                        bd -= 1
+                        if bd == 0:
+                            close_b = scan_b
+                            break
+                    scan_b += 1
+                after_b = toks[close_b + 1] if 0 <= close_b and close_b + 1 < n else ""
+                is_scrutinee_block = after_b == "{" or after_b in _RUST_EXPR_CONT_OPS
+                if not is_scrutinee_block:
+                    earliest_chain_saved: dict[str, str] | None = None
+                    kept_if_lets: list[list[object]] = []
+                    for entry in pending_if_lets:
+                        if entry[0] == sdepth and entry[3] in (0, 2):
+                            for name in entry[1]:  # type: ignore[attr-defined]
+                                new_scope.pop(name, None)
+                            if entry[3] == 2 and earliest_chain_saved is None:
+                                earliest_chain_saved = dict(entry[2])  # type: ignore[arg-type]
+                        else:
+                            kept_if_lets.append(entry)
+                    if earliest_chain_saved is not None:
+                        scopes[-1] = earliest_chain_saved
+                    pending_if_lets = kept_if_lets
+            scopes.append(new_scope)
+            out.append(tok)
+            idx += 1
+            continue
+        if tok == "&&":
+            for entry in reversed(pending_if_lets):
+                if entry[0] == sdepth and entry[3] == 0:
+                    entry[3] = 2
+                    for name in entry[1]:  # type: ignore[attr-defined]
+                        scopes[-1].pop(name, None)
+                    break
+        if tok in _SPEC_CLOSERS:
+            if len(scopes) > 1:
+                pending_lets = [p for p in pending_lets if p[0] < sdepth]
+                pending_if_lets = [p for p in pending_if_lets if int(p[0]) < sdepth]  # type: ignore[arg-type]
+                scopes.pop()
+            out.append(tok)
+            idx += 1
+            continue
+        if tok == "if":
+            for entry in pending_if_lets:
+                if entry[0] == sdepth and entry[3] == 1:
+                    entry[4] = int(entry[4]) + 1  # type: ignore[arg-type]
+        elif tok == "then":
+            for entry in reversed(pending_if_lets):
+                if entry[0] == sdepth and entry[3] == 0:
+                    entry[3] = 1
+                    for name in entry[1]:  # type: ignore[attr-defined]
+                        scopes[-1].pop(name, None)
+                    break
+        elif tok == "else":
+            for p_idx in range(len(pending_if_lets) - 1, -1, -1):
+                entry = pending_if_lets[p_idx]
+                if entry[0] == sdepth and entry[3] == 1:
+                    if int(entry[4]) > 0:  # type: ignore[arg-type]
+                        entry[4] = int(entry[4]) - 1  # type: ignore[arg-type]
+                    else:
+                        scopes[-1] = dict(entry[2])  # type: ignore[arg-type]
+                        pending_if_lets.pop(p_idx)
+                    break
+        if tok in (";", "in"):
+            remaining_pending: list[tuple[int, set[str]]] = []
+            for p_depth, p_names in pending_lets:
+                if p_depth == sdepth:
+                    for name in p_names:
+                        scopes[-1].pop(name, None)
+                else:
+                    remaining_pending.append((p_depth, p_names))
+            pending_lets = remaining_pending
+            out.append(tok)
+            idx += 1
+            continue
+        if tok == "match":
+            # Find extent of current bracket scope so inner/outer `match` blocks stay bounded.
+            end_scope = idx + 1
+            bdepth = 0
+            open_brace = -1
+            with_at = -1
+            while end_scope < n:
+                st = toks[end_scope]
+                if st in _SPEC_OPENERS:
+                    if bdepth == 0 and st == "{" and open_brace == -1 and with_at == -1:
+                        open_brace = end_scope
+                    bdepth += 1
+                elif st in _SPEC_CLOSERS:
+                    if bdepth == 0:
+                        break
+                    bdepth -= 1
+                    if bdepth == 0 and open_brace != -1:
+                        if toks[end_scope + 1 : end_scope + 2] == ["{"]:
+                            open_brace = -1
+                        else:
+                            close_brace = end_scope
+                            out.append("match")
+                            out.extend(_subst_ident_map(toks[idx + 1 : open_brace], scopes[-1], depth + 1))
+                            out.append("{")
+                            out.extend(_subst_rust_match_inner(toks[open_brace + 1 : close_brace], scopes[-1], depth + 1))
+                            out.append("}")
+                            idx = close_brace + 1
+                            open_brace = -2
+                            break
+                elif bdepth == 0 and st == "with" and open_brace == -1 and with_at == -1:
+                    with_at = end_scope
+                end_scope += 1
+            if open_brace == -2:
+                continue
+            if with_at != -1:
+                out.append("match")
+                out.extend(_subst_ident_map(toks[idx + 1 : with_at], scopes[-1], depth + 1))
+                out.append("with")
+                out.extend(_subst_lean_match_arms(toks[with_at + 1 : end_scope], scopes[-1], depth + 1))
+                idx = end_scope
+                continue
+        if (tok == "fun" or tok.startswith("λ")) and toks[idx + 1 : idx + 2] == ["|"]:
+            end_scope = idx + 1
+            bdepth = 0
+            while end_scope < n:
+                st = toks[end_scope]
+                if st in _SPEC_OPENERS:
+                    bdepth += 1
+                elif st in _SPEC_CLOSERS:
+                    if bdepth == 0:
+                        break
+                    bdepth -= 1
+                end_scope += 1
+            out.append(tok)
+            out.extend(_subst_lean_match_arms(toks[idx + 1 : end_scope], scopes[-1], depth + 1))
+            idx = end_scope
+            continue
+        if tok in ("let", "have"):
+            bdepth = 0
+            scan = idx + 1
+            while scan < n:
+                st = toks[scan]
+                if st in _SPEC_OPENERS:
+                    bdepth += 1
+                elif st in _SPEC_CLOSERS:
+                    if bdepth == 0:
+                        break
+                    bdepth -= 1
+                elif bdepth == 0 and st in (":=", "=", ";", "in"):
+                    break
+                scan += 1
+            header_names = _pattern_binder_names(toks[idx + 1 : scan])
+            if prev in ("if", "while", "&&"):
+                if header_names:
+                    chain_saved = next(
+                        (
+                            dict(e[2])  # type: ignore[arg-type]
+                            for e in pending_if_lets
+                            if e[0] == sdepth and e[3] == 2
+                        ),
+                        dict(scopes[-1]),
+                    )
+                    pending_if_lets.append([sdepth, header_names, chain_saved, 0, 0])
+            elif header_names:
+                pending_lets.append((sdepth, header_names))
+            skip_until = scan
+            out.append(tok)
+            idx += 1
+            continue
+        if tok == "fun" or tok.startswith("λ") or tok in ("∀", "forall"):
+            stop_tok = "," if tok in ("∀", "forall") else "=>"
+            bdepth = 0
+            scan = idx + 1
+            binder_names: set[str] = set()
+            binder_positions: set[int] = set()
+            in_top_type = False
+            in_group_type = False
+            if tok.startswith("λ") and len(tok) > 1:
+                binder_names.add(tok[1:])
+            while scan < n:
+                st = toks[scan]
+                if st in _SPEC_OPENERS:
+                    if bdepth == 0:
+                        in_group_type = False
+                    bdepth += 1
+                elif st in _SPEC_CLOSERS:
+                    if bdepth == 0:
+                        break
+                    bdepth -= 1
+                    if bdepth == 0:
+                        in_group_type = False
+                elif bdepth == 0 and st == stop_tok:
+                    break
+                elif bdepth == 0 and st == ":":
+                    in_top_type = True
+                elif bdepth == 1 and st == ":":
+                    in_group_type = True
+                elif _is_spec_word(st) and (
+                    (bdepth == 0 and not in_top_type) or (bdepth == 1 and not in_group_type)
+                ):
+                    u = _ident_key(st)
+                    binder_positions.add(scan)
+                    if u in scopes[-1]:
+                        binder_names.add(u)
+                scan += 1
+            if scan < n and toks[scan] == stop_tok:
+                out.append(tok)
+                hdr_idx = idx + 1
+                while hdr_idx <= scan:
+                    ht = toks[hdr_idx]
+                    hprev = toks[hdr_idx - 1] if hdr_idx > 0 else ""
+                    hkey = _ident_key(ht)
+                    if hdr_idx not in binder_positions and hprev not in (".", "::") and hkey in scopes[-1]:
+                        out.append(scopes[-1][hkey])
+                    else:
+                        out.append(ht)
+                    hdr_idx += 1
+                for name in binder_names:
+                    scopes[-1].pop(name, None)
+                idx = scan + 1
+                continue
+        if tok == "|" and prev in _CLOSURE_BAR_PRECEDERS:
+            bdepth = 0
+            scan = idx + 1
+            binder_names = set()
+            binder_positions = set()
+            in_param_type = False
+            while scan < n:
+                st = toks[scan]
+                if st in _SPEC_OPENERS:
+                    bdepth += 1
+                elif st in _SPEC_CLOSERS:
+                    if bdepth == 0:
+                        break
+                    bdepth -= 1
+                elif bdepth == 0 and st == "|":
+                    break
+                elif bdepth == 0 and st in (";", "=>"):
+                    scan = n
+                    break
+                elif bdepth == 0 and st == ",":
+                    in_param_type = False
+                elif bdepth == 0 and st == ":":
+                    in_param_type = True
+                elif not in_param_type and _is_spec_word(st):
+                    u = _ident_key(st)
+                    binder_positions.add(scan)
+                    if u in scopes[-1]:
+                        binder_names.add(u)
+                scan += 1
+            if scan < n and toks[scan] == "|":
+                out.append(tok)
+                hdr_idx = idx + 1
+                while hdr_idx <= scan:
+                    ht = toks[hdr_idx]
+                    hprev = toks[hdr_idx - 1] if hdr_idx > 0 else ""
+                    hkey = _ident_key(ht)
+                    if hdr_idx not in binder_positions and hprev not in (".", "::") and hkey in scopes[-1]:
+                        out.append(scopes[-1][hkey])
+                    else:
+                        out.append(ht)
+                    hdr_idx += 1
+                for name in binder_names:
+                    scopes[-1].pop(name, None)
+                idx = scan + 1
+                continue
+        key = _ident_key(tok)
+        if prev not in (".", "::") and key in scopes[-1]:
+            out.append(scopes[-1][key])
+        else:
+            out.append(tok)
+        idx += 1
+    return out
+
+
+def _is_pure_reflexive_operand(toks: Sequence[str]) -> bool:
+    """Whether `toks` is a side-effect-free non-NaN operand safe for `e == e` folding."""
+    stripped = _strip_parens(toks)
+    if not stripped:
+        return True  # unit `()`
+    for idx, tok in enumerate(stripped):
+        u = _unquote_ident(tok)
+        if u.upper() in ("NAN", "INFINITY", "INF"):
+            return False
+        if tok in ("{", "}", "?", "/", "%"):
+            return False
+        if tok == "!" and idx > 0 and _is_spec_word(stripped[idx - 1]):
+            # Macro invocation (`foo!(...)`): may panic or have side effects.
+            return False
+        if tok == "(" and idx > 0 and (_is_spec_word(stripped[idx - 1]) or stripped[idx - 1] in (")", "]", ">")):
+            # Function or method call (`f(x)`, `iter.next()`): may have side effects.
+            return False
+    return True
+
+
+def _complement_signature(part: Sequence[str], depth: int = 0) -> tuple[str, object] | None:
+    """Canonical polarity signature of a pure proposition/boolean disjunct or conjunct."""
+    if depth > _MAX_SPEC_DEPTH:
+        return None
+    toks = _strip_parens(part)
+    if not toks:
+        return None
+    if toks[0] in ("!", "¬", "Not", "not") and len(toks) > 1:
+        rest = toks[1:]
+        # Only treat leading negation as applying to the full expression when
+        # no looser-binding top-level connective sits in `rest` (e.g. `!x && y`
+        # or `¬p ∧ q` is `(!x) && y`, not `!(x && y)`).
+        looser_ops = _COMPLEMENT_LOW_PREC_OPS | (
+            _COMPLEMENT_CMP_OPS if toks[0] in ("!", "not") else frozenset()
+        )
+        if len(_split_top(rest, looser_ops)) == 1:
+            inner = _strip_parens(rest)
+            if inner:
+                sub = _complement_signature(inner, depth + 1)
+                if sub is not None:
+                    sub_kind, sub_payload = sub
+                    flip = {"pos": "neg", "neg": "pos", "eq": "neq", "neq": "eq"}[sub_kind]
+                    return (flip, sub_payload)
+            return None
+    if len(_split_top(toks, _COMPLEMENT_LOW_PREC_OPS)) == 1:
+        for eq_ops, polarity in ((("==", "="), "eq"), (("!=", "≠"), "neq")):
+            for op in eq_ops:
+                sides = _split_top(toks, {op})
+                if len(sides) == 2 and sides[0] and sides[1]:
+                    lhs, rhs = _strip_parens(sides[0]), _strip_parens(sides[1])
+                    if _is_pure_reflexive_operand(lhs) and _is_pure_reflexive_operand(rhs):
+                        pair = tuple(sorted((tuple(lhs), tuple(rhs))))
+                        return (polarity, pair)
+    if _is_pure_reflexive_operand(toks):
+        return ("pos", tuple(toks))
+    return None
+
+
+def _has_complementary_pair(parts: Sequence[Sequence[str]]) -> bool:
+    seen: set[tuple[str, object]] = set()
+    for part in parts:
+        sig = _complement_signature(part)
+        if sig is None:
+            continue
+        kind, payload = sig
+        opposite = {"pos": "neg", "neg": "pos", "eq": "neq", "neq": "eq"}[kind]
+        if (opposite, payload) in seen:
+            return True
+        seen.add(sig)
+    return False
+
+
+_RUST_BLOCK_ABORT_WORDS: frozenset[str] = frozenset(
+    {"while", "for", "loop", "break", "continue", "return", "panic", "assert",
+     "assert_eq", "assert_ne", "debug_assert", "unreachable"}
+)
+
+
+def _split_rust_block_statements(toks: Sequence[str]) -> list[list[str]]:
+    """Split a Rust `{ ... }` body into top-level `;`- and block-terminated statements."""
+    statements: list[list[str]] = []
+    cur: list[str] = []
+    bdepth = 0
+    n = len(toks)
+    for idx, tok in enumerate(toks):
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+            cur.append(tok)
+            continue
+        if tok in _SPEC_CLOSERS:
+            bdepth -= 1
+            cur.append(tok)
+            if (
+                bdepth == 0
+                and tok == "}"
+                and cur[0] in ("{", "unsafe", "if", "match")
+                and idx + 1 < n
+                and toks[idx + 1] != ";"
+                and _rust_brace_ends_arm(toks, idx)
+            ):
+                statements.append(cur)
+                cur = []
+            continue
+        if bdepth == 0 and tok == ";":
+            if cur:
+                statements.append(cur)
+                cur = []
+            continue
+        cur.append(tok)
+    if cur:
+        statements.append(cur)
+    return statements
+
+
+_LEAN_EXPR_MARKERS: frozenset[str] = frozenset(
+    {"decide", "True", "False", ":=", "fun", "∀", "forall", "∃", "exists", "¬", "∧", "∨", "→", "↔"}
+)
+
+
+def _has_non_let_assignment(toks: Sequence[str]) -> bool:
+    """Whether `toks` contains any Rust `=` assignment outside an inner `let` header."""
+    if any(t in _LEAN_EXPR_MARKERS for t in toks):
+        return False
+    bdepth = 0
+    let_depth: int | None = None
+    n = len(toks)
+    for idx, tok in enumerate(toks):
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+        elif tok in _SPEC_CLOSERS:
+            bdepth = max(0, bdepth - 1)
+            if let_depth is not None and bdepth < let_depth:
+                let_depth = None
+        elif tok == ";":
+            if let_depth is not None and bdepth <= let_depth:
+                let_depth = None
+        elif tok == "let":
+            let_depth = bdepth
+        elif tok == "=":
+            if toks[idx + 1 : idx + 2] == ["."]:
+                # `.ctor` after `=` is Lean dot-constructor equality, never Rust assignment.
+                continue
+            if let_depth is None or bdepth != let_depth:
+                return True
+            let_depth = None
+    return False
+
+
+def _is_pure_small_int_tok(tok: str) -> bool:
+    return tok.isascii() and tok.isdigit() and len(tok) <= 9
+
+
+def _rust_let_rhs_may_panic(rhs: Sequence[str]) -> bool:
+    """Whether an unfolded Rust expression may panic (arithmetic, shifts, indexing)."""
+    cleaned = _strip_pattern_generics(rhs)
+    n = len(cleaned)
+    for idx, tok in enumerate(cleaned):
+        prev = cleaned[idx - 1] if idx > 0 else ""
+        nxt = cleaned[idx + 1] if idx + 1 < n else ""
+        is_after_val = _is_spec_word(prev) or prev[:1].isdigit() or prev in (")", "]")
+        if tok == "-" and not is_after_val and nxt[:1].isdigit() and cleaned[idx + 2 : idx + 3] != ["."]:
+            # Constant negative numeric literal (`-1`, `-1_i32`).
+            continue
+        if tok in ("+", "-", "*", "/", "%"):
+            if tok == "*" and not is_after_val:
+                continue
+            if _is_pure_small_int_tok(prev) and _is_pure_small_int_tok(nxt):
+                if tok not in ("/", "%") or int(nxt) != 0:
+                    continue
+            return True
+        if tok == "[" and is_after_val:
+            return True
+        if is_after_val and cleaned[idx : idx + 2] in (["<", "<"], [">", ">"]):
+            return True
+    return False
+
+
+def _rust_part_may_early_exit(toks: Sequence[str]) -> bool:
+    """Whether a Rust subexpression may early-return, panic, or diverge before short-circuiting."""
+    return (
+        any(word in _RUST_BLOCK_ABORT_WORDS for word in toks)
+        or "?" in toks
+        or _has_macro_invocation(toks)
+        or _has_non_let_assignment(toks)
+        or _rust_let_rhs_may_panic(toks)
+    )
+
+
+def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
+    """Fold a Rust `{ ... }` block body without ignoring earlier control flow."""
+    statements = _split_rust_block_statements(toks)
+    if not statements:
+        return None
+    bindings: dict[str, str] = {}
+    for stmt in statements[:-1]:
+        if stmt[0] == "return":
+            return _const_truth(_subst_ident_map(stmt[1:], bindings), depth + 1)
+        if (
+            any(word in _RUST_BLOCK_ABORT_WORDS for word in stmt)
+            or "?" in stmt
+            or _has_macro_invocation(stmt)
+            or _has_call_expr(stmt)
+        ):
+            return None
+        if stmt[0] == "let":
+            eq_split = _split_first_top(stmt[1:], {"="})
+            if eq_split is None:
+                continue
+            lhs, rhs = eq_split
+            if _has_non_let_assignment(rhs):
+                return None
+            if lhs[:1] == ["mut"]:
+                lhs = lhs[1:]
+            lhs = _strip_parens(_split_top(_strip_parens(lhs), {":"})[0])
+            if len(lhs) != 1 or not (lhs[0] == "_" or _is_spec_word(lhs[0])):
+                # Refutable destructuring (`let Ok(x) = ...` / `let true = ...`).
+                return None
+            binder = _ident_key(lhs[0])
+            rhs_val = _const_truth(_subst_ident_map(rhs, bindings), depth + 1)
+            if rhs_val is None and _rust_let_rhs_may_panic(rhs):
+                return None
+            if binder != "_":
+                if rhs_val is True:
+                    bindings[binder] = "true"
+                elif rhs_val is False:
+                    bindings[binder] = "false"
+                else:
+                    bindings.pop(binder, None)
+            continue
+        eq_split = _split_first_top(stmt, {"="})
+        if eq_split is not None and stmt[0] not in ("{", "if", "match", "unsafe"):
+            lhs, rhs = eq_split
+            lhs_s = _strip_parens(lhs)
+            if len(lhs_s) != 1 or not _is_spec_word(lhs_s[0]) or _has_non_let_assignment(rhs):
+                # Compound assignment (`&=`, `|=`), inner mutation, or field/deref mutation: abort.
+                return None
+            target = _ident_key(lhs_s[0])
+            rhs_val = _const_truth(_subst_ident_map(rhs, bindings), depth + 1)
+            if rhs_val is None and _rust_let_rhs_may_panic(rhs):
+                return None
+            if rhs_val is True:
+                bindings[target] = "true"
+            elif rhs_val is False:
+                bindings[target] = "false"
+            else:
+                bindings.pop(target, None)
+            continue
+        if _has_non_let_assignment(stmt) or _rust_let_rhs_may_panic(stmt):
+            return None
+    return _const_truth(_subst_ident_map(statements[-1], bindings), depth + 1)
+
+
+def _strip_lean_let_prefix(toks: Sequence[str], depth: int) -> list[str] | None:
+    """Strip or constant-propagate one `let`/`have` `<binder> ... := <rhs> (; | in) <body>` prefix."""
+    if not toks or toks[0] not in ("let", "have"):
+        return None
+    split_pair = _split_first_top(toks, {";", "in"})
+    if split_pair is None or not split_pair[0] or not split_pair[1]:
+        return None
+    header, rest = split_pair
+    eq_split = _split_first_top(header[1:], {":="})
+    if eq_split is None or not eq_split[1]:
+        return None
+    binder_lhs, rhs = eq_split
+    binder_lhs = _strip_parens(_split_top(_strip_parens(binder_lhs), {":"})[0])
+    if len(binder_lhs) != 1:
+        return None
+    binder = _ident_key(binder_lhs[0])
+    if binder == "_":
+        return rest
+    if not _is_spec_word(binder_lhs[0]):
+        return None
+    rhs_val = _const_truth(rhs, depth + 1)
+    if rhs_val is True:
+        return _subst_ident_map(rest, {binder: "True"})
+    if rhs_val is False:
+        return _subst_ident_map(rest, {binder: "False"})
+    if all(_ident_key(tok) != binder for tok in rest):
+        return rest
+    return None
+
+
+def _split_lean_if(toks: Sequence[str]) -> tuple[list[str], list[str], list[str]] | None:
+    """Split Lean `if <cond> then <t> else <f>` matching nested `if`/`else` pairs."""
+    if not toks or toks[0] != "if":
+        return None
+    bdepth = 0
+    if_depth = 0
+    then_idx: int | None = None
+    else_idx: int | None = None
+    for idx in range(1, len(toks)):
+        tok = toks[idx]
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+        elif tok in _SPEC_CLOSERS:
+            bdepth -= 1
+        elif bdepth == 0:
+            if tok == "if":
+                if_depth += 1
+            elif tok == "then":
+                if if_depth == 0 and then_idx is None:
+                    then_idx = idx
+            elif tok == "else":
+                if if_depth == 0:
+                    if then_idx is None:
+                        return None
+                    else_idx = idx
+                    break
+                if_depth -= 1
+    if then_idx is None or else_idx is None:
+        return None
+    cond = list(toks[1:then_idx])
+    t_branch = list(toks[then_idx + 1 : else_idx])
+    f_branch = list(toks[else_idx + 1 :])
+    if not cond or not t_branch or not f_branch:
+        return None
+    return cond, t_branch, f_branch
+
+
+def _split_rust_if(toks: Sequence[str]) -> tuple[list[str], list[str], list[str]] | None:
+    """Split a complete Rust `if <cond> { ... } else ({ ... } | if ...)` expression."""
+    if not toks or toks[0] != "if" or toks[-1] != "}":
+        return None
+    else_split = _split_first_top(toks[1:], {"else"})
+    if else_split is None or not else_split[0] or not else_split[1]:
+        return None
+    head, f_branch = else_split
+    if head[-1] != "}":
+        return None
+    if not (
+        (f_branch[0] == "{" and _wrapped(f_branch))
+        or (f_branch[0] == "if" and _split_rust_if(f_branch) is not None)
+    ):
+        return None
+    depth = 0
+    open_idx = -1
+    for idx, tok in enumerate(head):
+        if tok in _SPEC_OPENERS:
+            if depth == 0 and tok == "{":
+                open_idx = idx
+            depth += 1
+        elif tok in _SPEC_CLOSERS:
+            depth -= 1
+            if depth == 0 and idx == len(head) - 1 and open_idx >= 0:
+                return list(head[:open_idx]), list(head[open_idx:]), list(f_branch)
+    return None
+
+
+def _eval_lean_match_arms(arms_toks: Sequence[str], depth: int) -> bool | None:
+    """Fold Lean `| <pat> => <body> ...` arms when every arm returns the same constant."""
+    if not arms_toks:
+        return None
+    # Split on top-level `|`; layout-delimited nested `match`/`fun |` blocks are
+    # parenthesized by `_normalize_lean_layout_lets`, and single-line inline ones
+    # stay guarded by `nested_match`.
+    segments: list[list[str]] = [[]]
+    bdepth = 0
+    saw_arrow = False
+    nested_match = False
+    for idx, tok in enumerate(arms_toks):
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+        elif tok in _SPEC_CLOSERS:
+            bdepth -= 1
+        elif bdepth == 0:
+            if tok == "|" and not nested_match:
+                segments.append([])
+                saw_arrow = False
+                continue
+            if tok == "=>" and not saw_arrow:
+                saw_arrow = True
+            elif saw_arrow and (
+                tok == "match"
+                or ((tok == "fun" or tok.startswith("λ")) and list(arms_toks[idx + 1 : idx + 2]) == ["|"])
+            ):
+                nested_match = True
+        segments[-1].append(tok)
+    parsed: list[tuple[list[list[str]], bool | None]] = []
+    pending_pats: list[list[str]] = []
+    for seg in segments:
+        if not seg:
+            continue
+        arrow = _split_first_top(seg, {"=>"})
+        if arrow is None:
+            pending_pats.append(seg)
+            continue
+        pat, body = arrow
+        if not pat or not body:
+            return None
+        pats = [*pending_pats, pat]
+        pending_pats = []
+        parsed.append((pats, _const_truth(body, depth + 1)))
+    if pending_pats or not parsed:
+        return None
+    if len(parsed) == 1:
+        pats, val = parsed[0]
+        if not any(_alt_is_catch_all(p) for p in pats):
+            return None
+        return val
+    vals = [val for _, val in parsed]
+    if all(v is True for v in vals):
+        return True
+    if all(v is False for v in vals):
+        return False
+    return None
+
+
+def _eval_rust_match(toks: Sequence[str], depth: int) -> bool | None:
+    """Fold a Rust `match <scrutinee> { ... }` when every arm returns the same constant."""
+    if not toks or toks[0] != "match" or toks[-1] != "}":
+        return None
+    bdepth = 0
+    open_idx = -1
+    for idx, tok in enumerate(toks):
+        if tok in _SPEC_OPENERS:
+            if bdepth == 0 and tok == "{":
+                open_idx = idx
+            bdepth += 1
+        elif tok in _SPEC_CLOSERS:
+            bdepth -= 1
+            if bdepth == 0 and idx == len(toks) - 1 and open_idx > 1:
+                break
+            if bdepth == 0 and open_idx >= 0 and tok == "}":
+                nxt_tok = toks[idx + 1] if idx + 1 < len(toks) else ""
+                if nxt_tok != "{" and nxt_tok not in _RUST_EXPR_CONT_OPS:
+                    return None
+                open_idx = -1
+    if open_idx <= 1:
+        return None
+    scrutinee = toks[1:open_idx]
+    if (
+        any(word in _RUST_BLOCK_ABORT_WORDS for word in scrutinee)
+        or "?" in scrutinee
+        or "/" in scrutinee
+        or "%" in scrutinee
+        or _has_macro_invocation(scrutinee)
+        or _has_call_expr(scrutinee)
+        or _has_non_let_assignment(scrutinee)
+    ):
+        return None
+    inner = toks[open_idx + 1 : -1]
+    if not inner:
+        return None
+    raw_arms: list[list[str]] = []
+    cur: list[str] = []
+    bdepth = 0
+    saw_arrow = False
+    idx = 0
+    n = len(inner)
+    while idx < n:
+        tok = inner[idx]
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+            cur.append(tok)
+            idx += 1
+            continue
+        if tok in _SPEC_CLOSERS:
+            bdepth -= 1
+            cur.append(tok)
+            if bdepth == 0 and tok == "}" and saw_arrow and _rust_brace_ends_arm(inner, idx):
+                raw_arms.append(cur)
+                cur = []
+                saw_arrow = False
+            idx += 1
+            continue
+        if bdepth == 0 and tok == ",":
+            if cur:
+                raw_arms.append(cur)
+                cur = []
+                saw_arrow = False
+            idx += 1
+            continue
+        if bdepth == 0 and tok == "=>":
+            saw_arrow = True
+        cur.append(tok)
+        idx += 1
+    if cur:
+        raw_arms.append(cur)
+    if not raw_arms:
+        return None
+    parsed: list[tuple[list[list[str]], bool, bool | None]] = []
+    for arm in raw_arms:
+        arrow = _split_first_top(arm, {"=>"})
+        if arrow is None or not arrow[0] or not arrow[1]:
+            return None
+        pat_part, body = arrow
+        guard_split = _split_first_top(pat_part, {"if"})
+        if guard_split is not None:
+            pat_toks, guard_toks = guard_split
+            if not pat_toks or not guard_toks:
+                return None
+            if not _is_pure_reflexive_operand(guard_toks):
+                return None
+            guard_always_true = _const_truth(guard_toks, depth + 1) is True
+        else:
+            pat_toks = pat_part
+            guard_always_true = True
+        alts = [alt for alt in _split_top(pat_toks, {"|"}) if alt]
+        if not alts:
+            return None
+        parsed.append((alts, guard_always_true, _const_truth(body, depth + 1)))
+    if len(parsed) == 1:
+        alts, guard_always_true, val = parsed[0]
+        if not guard_always_true or not any(_alt_is_catch_all(a) for a in alts):
+            return None
+        return val
+    # An exhaustive Rust `match` always contains at least one unguarded (or
+    # unconditionally-true guarded) arm; guarded-only partial snippets cannot fold.
+    if not any(guard_always_true for _, guard_always_true, _ in parsed):
+        return None
+    vals = [val for _, _, val in parsed]
+    if all(v is True for v in vals):
+        return True
+    if all(v is False for v in vals):
+        return False
+    return None
+
+
+def _strip_closure_return_type(body: Sequence[str]) -> list[str]:
+    """Strip an optional Rust closure `-> <Type>` prefix before its `{ ... }` body."""
+    if not body or body[0] != "->":
+        return list(body)
+    if body[-1] != "}":
+        return list(body)
+    bdepth = 0
+    open_idx = -1
+    for idx in range(1, len(body)):
+        tok = body[idx]
+        if tok in _SPEC_OPENERS:
+            if bdepth == 0 and tok == "{":
+                open_idx = idx
+            bdepth += 1
+        elif tok in _SPEC_CLOSERS:
+            bdepth -= 1
+            if bdepth == 0 and idx == len(body) - 1 and open_idx > 1:
+                return list(body[open_idx:])
+    return list(body)
+
+
+def _has_non_ctor_call_expr(toks: Sequence[str]) -> bool:
+    """Whether `toks` invokes a non-constructor function or method (`f(x)`, `x.m()`, `(f)(x)`)."""
+    cleaned = _strip_pattern_generics(toks)
+    for idx, tok in enumerate(cleaned):
+        if tok != "(" or idx == 0:
+            continue
+        prev = cleaned[idx - 1]
+        if prev in (")", "]", ">"):
+            return True
+        if _is_spec_word(prev) and prev not in _RUST_NON_CALL_KEYWORDS:
+            before_prev = cleaned[idx - 2] if idx >= 2 else ""
+            if before_prev == ".":
+                return True
+            plain = _ident_key(prev)
+            if not plain[:1].isupper():
+                return True
+    return False
+
+
+def _scrutinee_matches_alt(scrutinee: Sequence[str], alt: Sequence[str], depth: int = 0) -> bool:
+    """Whether pure `scrutinee` unconditionally matches Rust pattern alternative `alt`."""
+    if depth > _MAX_SPEC_DEPTH:
+        return False
+    if _alt_is_catch_all(alt):
+        return True
+    scr = list(_strip_pattern_generics(scrutinee))
+    while scr and scr[0] == "(" and _wrapped(scr):
+        scr = scr[1:-1]
+    pat = _strip_pattern_generics(_strip_pattern_wrappers(alt))
+    if not scr or not pat:
+        return False
+    or_parts = _split_top(pat, {"|"})
+    if len(or_parts) > 1:
+        return any(_scrutinee_matches_alt(scr, part, depth + 1) for part in or_parts if part)
+    s_parts = _split_top(scr, {","})
+    p_parts = _split_top(pat, {","})
+    if len(s_parts) > 1 or len(p_parts) > 1:
+        if s_parts and not s_parts[-1]:
+            s_parts = s_parts[:-1]
+        if p_parts and not p_parts[-1]:
+            p_parts = p_parts[:-1]
+        return (
+            len(s_parts) > 1
+            and len(s_parts) == len(p_parts)
+            and all(
+                bool(sp) and bool(pp) and _scrutinee_matches_alt(sp, pp, depth + 1)
+                for sp, pp in zip(s_parts, p_parts)
+            )
+        )
+    if len(scr) == 1 and len(pat) == 1 and scr[0] == pat[0] and (
+        scr[0].isdigit() or scr[0] in ("true", "false")
+    ):
+        return True
+    s_head, s_dot, s_payload = _alt_head(scr)
+    p_head, p_dot, p_payload = _alt_head(pat)
+    if (
+        s_head is not None
+        and s_head == p_head
+        and not s_dot
+        and not p_dot
+        and s_head[:1].isupper()
+        and s_payload
+        and s_payload[0] == "("
+        and _wrapped(s_payload)
+    ):
+        if _payload_is_wildcard(p_payload):
+            return True
+        if p_payload and p_payload[0] == "(" and _wrapped(p_payload):
+            return _scrutinee_matches_alt(s_payload[1:-1], p_payload[1:-1], depth + 1)
+    return False
+
+
+def _eval_rust_matches_macro(toks: Sequence[str], depth: int) -> bool | None:
+    """Fold pure `(::? (core|std)::)? matches!(<scrutinee>, <pat> [if <guard>])` when constant."""
+    pos = 0
+    if toks[pos : pos + 1] == ["::"]:
+        pos += 1
+    while pos + 2 < len(toks) and _is_spec_word(toks[pos]) and toks[pos + 1] == "::":
+        pos += 2
+    if (
+        pos + 3 >= len(toks)
+        or toks[pos] != "matches"
+        or toks[pos + 1] != "!"
+        or toks[pos + 2] not in ("(", "[", "{")
+        or not _wrapped(toks[pos + 2 :])
+    ):
+        return None
+    inner = toks[pos + 3 : -1]
+    first_comma = _split_first_top(inner, {","})
+    if first_comma is None or not first_comma[0] or not first_comma[1]:
+        return None
+    scrutinee, rhs_pat = first_comma
+    if _rust_part_may_early_exit(scrutinee) or _has_non_ctor_call_expr(scrutinee):
+        return None
+    rhs_list = list(rhs_pat)
+    while rhs_list and rhs_list[-1] == ",":
+        rhs_list.pop()
+    if not rhs_list:
+        return None
+    guard_split = _split_first_top(rhs_list, {"if"})
+    pat_toks = rhs_list if guard_split is None else guard_split[0]
+    guard_val: bool | None = True
+    if guard_split is not None:
+        guard_toks = guard_split[1]
+        if _rust_part_may_early_exit(guard_toks) or _has_call_expr(guard_toks):
+            return None
+        guard_val = _const_truth(guard_toks, depth + 1)
+        if guard_val is False:
+            return False
+    alts = [alt for alt in _split_top(pat_toks, {"|"}) if alt]
+    if guard_val is True and any(_scrutinee_matches_alt(scrutinee, alt) for alt in alts):
+        return True
+    return None
+
+
+def _const_truth(texts: Sequence[str], depth: int = 0) -> bool | None:
+    """Constant truth value of a boolean / `Prop` expression, or `None`.
+
+    Three-valued folding over `true` / `false` atoms, negation, conjunction,
+    disjunction, implication, `iff`, universal quantification and constant
+    lambdas/closures, pure reflexive and literal comparisons, casts,
+    `Prop` / `Bool` ascriptions, `if` / `match` with constant conditions or
+    agreeing branches, Rust blocks, `let` / `have` bindings, and `by trivial`.
+    Anything else is `None`: the arm depends on its inputs.
+    """
+    if depth > _MAX_SPEC_DEPTH:
+        return None
+    toks = list(texts)
+    changed = True
+    while changed and toks:
+        changed = False
+        while toks and toks[-1] in (";", ","):
+            toks.pop()
+            changed = True
+        if (
+            len(toks) >= 2
+            and toks[0] == "("
+            and _wrapped(toks)
+            and len(_split_top(toks[1:-1], {","})) == 1
+        ):
+            toks = toks[1:-1]
+            changed = True
+        elif len(toks) >= 3 and toks[0] == "unsafe" and toks[1] == "{" and _wrapped(toks[1:]):
+            toks = toks[1:]
+            changed = True
+        elif len(toks) >= 2 and toks[0] == "{" and _wrapped(toks):
+            return _eval_rust_block_statements(toks[1:-1], depth + 1)
+        if toks and toks[0] == "return":
+            toks = toks[1:]
+            changed = True
+        stripped_let = _strip_lean_let_prefix(toks, depth + 1)
+        if stripped_let is not None:
+            toks = stripped_let
+            changed = True
+    if not toks:
+        return None
+    if toks[0] == "by":
+        return True if toks[1:] in (
+            ["trivial"], ["exact", "trivial"], ["exact", "True", ".", "intro"], ["constructor"]
+        ) else None
+    if toks[0] in ("∀", "forall"):
+        comma_split = _split_first_top(toks[1:], {","})
+        if comma_split is not None and comma_split[1]:
+            body_val = _const_truth(comma_split[1], depth + 1)
+            return True if body_val is True else None
+        return None
+    if toks[0] == "fun" or toks[0].startswith("λ"):
+        if toks[1:2] == ["|"]:
+            return _eval_lean_match_arms(toks[1:], depth + 1)
+        arrow_split = _split_first_top(toks[1:], {"=>"})
+        if arrow_split is not None and arrow_split[1]:
+            body_val = _const_truth(arrow_split[1], depth + 1)
+            return body_val if body_val is not None else None
+        return None
+    if toks[0] == "match":
+        rust_match = _eval_rust_match(toks, depth + 1)
+        if rust_match is not None:
+            return rust_match
+        with_split = _split_first_top(toks[1:], {"with"})
+        if (
+            with_split is not None
+            and with_split[0]
+            and with_split[1]
+            and _is_pure_reflexive_operand(with_split[0])
+        ):
+            return _eval_lean_match_arms(with_split[1], depth + 1)
+        return None
+    closure_toks = toks[1:] if toks[0] == "move" and toks[1:2] in (["||"], ["|"]) else toks
+    if closure_toks[0] == "||" and len(closure_toks) > 1:
+        body_val = _const_truth(_strip_closure_return_type(closure_toks[1:]), depth + 1)
+        return body_val if body_val is not None else None
+    if closure_toks[0] == "|":
+        bar_split = _split_first_top(closure_toks[1:], {"|"})
+        if bar_split is not None and bar_split[1]:
+            body_val = _const_truth(_strip_closure_return_type(bar_split[1]), depth + 1)
+            return body_val if body_val is not None else None
+        return None
+    # Lean `if c then t else f` and complete Rust `if c { t } else { f }` extend
+    # over their conditions (which may contain `||`/`&&`), so fold them before
+    # splitting on binary connectives.
+    if toks[0] == "if":
+        lean_if = _split_lean_if(toks)
+        rust_if = None if lean_if is not None else _split_rust_if(toks)
+        if_parts = lean_if or rust_if
+        if if_parts is not None:
+            cond_toks, t_branch, f_branch = if_parts
+            cond_val = _const_truth(cond_toks, depth + 1)
+            if cond_val is True:
+                return _const_truth(t_branch, depth + 1)
+            if cond_val is False:
+                return _const_truth(f_branch, depth + 1)
+            if rust_if is not None and (
+                any(word in _RUST_BLOCK_ABORT_WORDS for word in cond_toks)
+                or "?" in cond_toks
+                or _has_macro_invocation(cond_toks)
+                or _has_non_let_assignment(cond_toks)
+            ):
+                return None
+            first = _const_truth(t_branch, depth + 1)
+            return first if first is not None and first == _const_truth(f_branch, depth + 1) else None
+
+    parts = _split_top(toks, {"→", "->", "==>"})
+    if len(parts) > 1:
+        norm_hyps = [_strip_parens(p) for p in parts[:-1] if p]
+        norm_conc = _strip_parens(parts[-1])
+        if norm_conc and _is_pure_reflexive_operand(norm_conc) and norm_conc in norm_hyps:
+            return True
+        values = [_const_truth(part, depth + 1) for part in parts]
+        if values[-1] is True or any(value is False for value in values[:-1]):
+            return True
+        if values[-1] is False and all(value is True for value in values[:-1]):
+            return False
+        return None
+    parts = _split_top(toks, {"↔", "<->"})
+    if len(parts) == 2:
+        if (
+            parts[0]
+            and _strip_parens(parts[0]) == _strip_parens(parts[1])
+            and _is_pure_reflexive_operand(parts[0])
+        ):
+            return True
+        left, right = (_const_truth(part, depth + 1) for part in parts)
+        return None if left is None or right is None else left == right
+    if len(parts) > 2:
+        return None
+    parts = _split_top(toks, {"||", "∨", "\\/"})
+    if len(parts) > 1:
+        has_rust_or = "||" in toks
+        values = [_const_truth(part, depth + 1) for part in parts]
+        for idx, value in enumerate(values):
+            if value is True and not (
+                has_rust_or and any(_rust_part_may_early_exit(p) for p in parts[:idx])
+            ):
+                return True
+        if _has_complementary_pair(parts) and not (
+            has_rust_or and any(_rust_part_may_early_exit(p) for p in parts)
+        ):
+            return True
+        return (
+            False
+            if all(value is False for value in values)
+            and not (has_rust_or and any(_rust_part_may_early_exit(p) for p in parts))
+            else None
+        )
+    parts = _split_top(toks, {"&&", "∧", "/\\"})
+    if len(parts) > 1:
+        has_rust_and = "&&" in toks
+        values = [_const_truth(part, depth + 1) for part in parts]
+        for idx, value in enumerate(values):
+            if value is False and not (
+                has_rust_and and any(_rust_part_may_early_exit(p) for p in parts[:idx])
+            ):
+                return False
+        if _has_complementary_pair(parts) and not (
+            has_rust_and and any(_rust_part_may_early_exit(p) for p in parts)
+        ):
+            return False
+        return (
+            True
+            if all(value is True for value in values)
+            and not (has_rust_and and any(_rust_part_may_early_exit(p) for p in parts))
+            else None
+        )
+    # Lean `¬` / `Not` bind looser than `=` (`¬ x = x` means `¬ (x = x)`), while
+    # Rust `!` binds tighter than `==` / `!=` (`!c == !c` means `(!c) == (!c)`).
+    if toks[0] in ("¬", "Not"):
+        value = _const_truth(toks[1:], depth + 1)
+        return None if value is None else not value
+
+    for op in ("==", "=", "≠", "!=", "<=", "≤", ">=", "≥", "<", ">"):
+        parts = _split_top(toks, {op})
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            continue
+        lhs, rhs = parts
+        same = (
+            _strip_parens(lhs) == _strip_parens(rhs)
+            and _is_pure_reflexive_operand(lhs)
+        )
+        lv, rv = _const_truth(lhs, depth + 1), _const_truth(rhs, depth + 1)
+        ln, rn = _int_literal(_strip_parens(lhs)), _int_literal(_strip_parens(rhs))
+        if op in ("==", "="):
+            if same:
+                return True
+            if lv is not None and rv is not None:
+                return lv == rv
+            return ln == rn if ln is not None and rn is not None else None
+        if op in ("≠", "!="):
+            if same:
+                return False
+            if lv is not None and rv is not None:
+                return lv != rv
+            return ln != rn if ln is not None and rn is not None else None
+        if ln is not None and rn is not None:
+            return {"<=": ln <= rn, "≤": ln <= rn, ">=": ln >= rn, "≥": ln >= rn,
+                    "<": ln < rn, ">": ln > rn}[op]
+        if same:
+            return op in ("<=", "≤", ">=", "≥")
+        return None
+
+    if toks[0] in ("!", "not"):
+        value = _const_truth(toks[1:], depth + 1)
+        return None if value is None else not value
+
+    for sep, types in (("as", (["bool"],)), (":", (["Prop"], ["Bool"], ["bool"]))):
+        parts = _split_top(toks, {sep})
+        if len(parts) == 2 and parts[0] and parts[1] in types:
+            return _const_truth(parts[0], depth + 1)
+    if toks[0] == "decide" and len(toks) > 1:
+        return _const_truth(toks[1:], depth + 1)
+    matches_val = _eval_rust_matches_macro(toks, depth + 1)
+    if matches_val is not None:
+        return matches_val
+    if len(toks) == 1:
+        atom = _unquote_ident(toks[0])
+        return True if atom in _TRUE_ATOMS else False if atom in _FALSE_ATOMS else None
+    if [_unquote_ident(t) for t in toks] in (["True", ".", "intro"], ["Bool", ".", "true"]):
+        return True
+    if [_unquote_ident(t) for t in toks] == ["Bool", ".", "false"]:
+        return False
+    return None
+
+
+def _unquote_ident(text: str) -> str:
+    return text[1:-1] if len(text) >= 3 and text[0] == "«" and text[-1] == "»" else text
+
+
+_RAW_IDENT_RESERVED: frozenset[str] = frozenset(
+    {
+        "true", "false", "True", "False", "if", "else", "match", "let",
+        "return", "as", "in", "unsafe", "move", "for", "while", "loop",
+        "break", "continue",
+    }
+)
+
+
+def _ident_key(text: str) -> str:
+    """Canonical identifier name, keeping `r#<keyword>` distinct from bare keywords/literals."""
+    if text.startswith("r#") and len(text) > 2:
+        plain = text[2:]
+        return text if plain in _RAW_IDENT_RESERVED else plain
+    return _unquote_ident(text)
+
+
+def _is_spec_word(text: str) -> bool:
+    if len(text) >= 3 and text[0] == "«" and text[-1] == "»":
+        return bool(text[1:-1].strip())
+    if text.startswith("r#") and len(text) > 2:
+        return _SPEC_WORD_RE.fullmatch(text[2:]) is not None
+    return _SPEC_WORD_RE.fullmatch(text) is not None
+
+
+def _is_wildcard_payload_word(word: str) -> bool:
+    """A payload word that binds or ignores instead of constraining (`_`, `e`)."""
+    if not _is_spec_word(word):
+        return False
+    if word.startswith("r#") and len(word) > 2:
+        plain = word[2:]
+        return plain[0] == "_" or not plain[0].isupper()
+    plain = _unquote_ident(word)
+    if plain in ("true", "false"):
+        return False
+    return plain[0] == "_" or not plain[0].isupper()
+
+
+def _is_catch_all_word(word: str) -> bool:
+    """A lone pattern word that matches every value (`_`, `other`)."""
+    if not _is_spec_word(word):
+        return False
+    if word.startswith("r#") and len(word) > 2:
+        plain = word[2:]
+        return plain[0] == "_" or plain[0].islower()
+    plain = _unquote_ident(word)
+    if plain in _SPECIFIC_LOWER_PATTERNS:
+        return False
+    return plain[0] == "_" or plain[0].islower()
+
+
+def _strip_pattern_wrappers(texts: Sequence[str]) -> list[str]:
+    """Repeatedly strip outer `(...)`, `&`/`ref`/`mut`/`box`, and `ident @`."""
+    toks = list(texts)
+    changed = True
+    while changed and toks:
+        changed = False
+        if toks[0] == "(" and _wrapped(toks):
+            toks = toks[1:-1]
+            changed = True
+        elif toks[0] in _PATTERN_PREFIX_WORDS:
+            toks = toks[1:]
+            changed = True
+        elif len(toks) >= 2 and _is_spec_word(toks[0]) and toks[1] == "@":
+            toks = toks[2:]
+            changed = True
+    return toks
+
+
+def _struct_field_patterns(inner: Sequence[str]) -> list[list[str]]:
+    """Field value patterns inside `{ a: pat, b := pat, .. }`."""
+    fields: list[list[str]] = []
+    for part in _split_top(inner, {","}):
+        if not part or part == [".."]:
+            continue
+        for sep in (":=", ":"):
+            kv = _split_top(part, {sep})
+            if len(kv) == 2 and kv[1]:
+                fields.append(kv[1])
+                break
+        else:
+            fields.append(part)
+    return fields
+
+
+def _payload_is_wildcard(payload: Sequence[str], depth: int = 0) -> bool:
+    """Whether an error payload pattern accepts every payload value."""
+    if depth > _MAX_SPEC_DEPTH:
+        return False
+    toks = _strip_pattern_wrappers(payload)
+    parts = _split_top(toks, {"|"})
+    if len(parts) > 1:
+        return any(_payload_is_wildcard(part, depth + 1) for part in parts)
+    parts = _split_top(toks, {","})
+    if len(parts) > 1:
+        return all(_payload_is_wildcard(part, depth + 1) for part in parts if part)
+    toks = _split_top(toks, {":"})[0]
+    toks = _strip_pattern_wrappers(toks)
+    idx = 0
+    while idx < len(toks):
+        text = toks[idx]
+        if text in _SPEC_OPENERS:
+            close = idx
+            nesting = 0
+            while close < len(toks):
+                if toks[close] in _SPEC_OPENERS:
+                    nesting += 1
+                elif toks[close] in _SPEC_CLOSERS:
+                    nesting -= 1
+                    if nesting == 0:
+                        break
+                close += 1
+            inner = toks[idx + 1 : close]
+            if text in ("(", "⟨"):
+                if not _payload_is_wildcard(inner, depth + 1):
+                    return False
+            elif text == "{":
+                field_pats = _struct_field_patterns(inner)
+                if not all(_payload_is_wildcard(fp, depth + 1) for fp in field_pats):
+                    return False
+            elif text == "[":
+                if _strip_pattern_wrappers(inner) != [".."]:
+                    return False
+            else:
+                return False
+            idx = close + 1
+            continue
+        if text == "@" and idx > 0:
+            # Handle inline `e @ _` or `ref e @ _` inside a multi-token Lean/Rust payload.
+            idx += 1
+            continue
+        if text != ".." and text not in _PATTERN_PREFIX_WORDS and not _is_wildcard_payload_word(text):
+            return False
+        idx += 1
+    return True
+
+
+def _skip_angle_args(toks: Sequence[str], start: int) -> int | None:
+    """Index right after balanced `< ... >` generic arguments starting at `start`."""
+    if start >= len(toks) or toks[start] != "<":
+        return None
+    depth = 0
+    for idx in range(start, len(toks)):
+        tok = toks[idx]
+        if tok == "<":
+            depth += 1
+        elif tok == ">":
+            depth -= 1
+            if depth == 0:
+                return idx + 1
+    return None
+
+
+def _strip_pattern_generics(toks: Sequence[str]) -> list[str]:
+    """Strip Rust `::< ... >` turbofishes and leading `< ... >::` from a pattern token list."""
+    out: list[str] = []
+    idx = 0
+    n = len(toks)
+    if idx < n and toks[idx] == "<":
+        after = _skip_angle_args(toks, idx)
+        if after is not None and toks[after : after + 1] == ["::"]:
+            idx = after + 1
+    while idx < n:
+        if toks[idx : idx + 2] == ["::", "<"]:
+            after = _skip_angle_args(toks, idx + 1)
+            if after is not None:
+                idx = after
+                continue
+        out.append(toks[idx])
+        idx += 1
+    return out
+
+
+def _alt_head(alt: Sequence[str]) -> tuple[str | None, bool, list[str]]:
+    """`(constructor, after_dot, payload)` of one pattern alternative."""
+    toks = _strip_pattern_generics(_strip_pattern_wrappers(alt))
+    idx = 0
+    after_dot = False
+    if idx < len(toks) and toks[idx] == ".":
+        after_dot = True
+        idx += 1
+    head: str | None = None
+    while idx < len(toks) and _is_spec_word(toks[idx]):
+        head = _ident_key(toks[idx])
+        idx += 1
+        if idx + 1 < len(toks) and toks[idx] in ("::", ".") and _is_spec_word(toks[idx + 1]):
+            after_dot = toks[idx] == "."
+            idx += 1
+            continue
+        break
+    return head, after_dot, toks[idx:]
+
+
+def _error_ctor(word: str, after_dot: bool) -> str | None:
+    """`ErrorCtor::of`: capitalized names stand alone, lowercase ones need a dot."""
+    word = _ident_key(word)
+    if word == "Err":
+        return "err"
+    if word in ("Ub", "UB"):
+        return "ub"
+    if word == "Unsupported":
+        return "unsupported"
+    if word == "Fail":
+        return "fail"
+    if after_dot:
+        return {"err": "err", "error": "err", "ub": "ub", "unsupported": "unsupported",
+                "fail": "fail"}.get(word)
+    return None
+
+
+def _alt_error_matches(alt: Sequence[str], depth: int = 0) -> list[tuple[str, bool]]:
+    """`(error kind, accepts every payload)` for each error pattern inside `alt`."""
+    if depth > _MAX_SPEC_DEPTH:
+        return []
+    toks = _strip_pattern_generics(_strip_pattern_wrappers(alt))
+    if not toks:
+        return []
+    for seps in ({"|"}, {","}):
+        parts = _split_top(toks, seps)
+        if len(parts) > 1:
+            return [hit for part in parts for hit in _alt_error_matches(part, depth + 1)]
+    if toks[0] == "{" and _wrapped(toks):
+        return [
+            hit
+            for fp in _struct_field_patterns(toks[1:-1])
+            for hit in _alt_error_matches(fp, depth + 1)
+        ]
+    if toks[0] in ("⟨", "[") and _wrapped(toks):
+        return _alt_error_matches(toks[1:-1], depth + 1)
+    head, after_dot, payload = _alt_head(toks)
+    if head is None:
+        return []
+    ctor = _error_ctor(head, after_dot)
+    if ctor is None:
+        hits: list[tuple[str, bool]] = []
+        idx = 0
+        while idx < len(payload):
+            if payload[idx] in _SPEC_OPENERS:
+                close, nesting = idx, 0
+                while close < len(payload):
+                    if payload[close] in _SPEC_OPENERS:
+                        nesting += 1
+                    elif payload[close] in _SPEC_CLOSERS:
+                        nesting -= 1
+                        if nesting == 0:
+                            break
+                    close += 1
+                sub = payload[idx + 1 : close]
+                if payload[idx] == "{":
+                    for fp in _struct_field_patterns(sub):
+                        hits += _alt_error_matches(fp, depth + 1)
+                else:
+                    hits += _alt_error_matches(sub, depth + 1)
+                idx = close + 1
+            else:
+                idx += 1
+        if not hits and payload[:1] == ["."]:
+            hits = _alt_error_matches(payload, depth + 1)
+        return hits
+    if ctor == "fail":
+        inner = _alt_error_matches(payload, depth + 1)
+        if inner:
+            return [hit for hit in inner if hit[0] in ("ub", "unsupported")]
+        if _payload_is_wildcard(payload):
+            return [("ub", True), ("unsupported", True)]
+        return []
+    return [(ctor, _payload_is_wildcard(payload))]
+
+
+def _alt_is_ok_ctor(alt: Sequence[str], depth: int = 0) -> bool:
+    if depth > _MAX_SPEC_DEPTH:
+        return False
+    toks = _strip_pattern_generics(_strip_pattern_wrappers(alt))
+    if not toks:
+        return False
+    for seps in ({"|"}, {","}):
+        parts = _split_top(toks, seps)
+        if len(parts) > 1:
+            return any(_alt_is_ok_ctor(part, depth + 1) for part in parts if part)
+    if toks[0] == "{" and _wrapped(toks):
+        return any(_alt_is_ok_ctor(fp, depth + 1) for fp in _struct_field_patterns(toks[1:-1]))
+    if toks[0] in ("⟨", "[") and _wrapped(toks):
+        return _alt_is_ok_ctor(toks[1:-1], depth + 1)
+    head, after_dot, payload = _alt_head(toks)
+    if head == "Ok" or (head == "ok" and after_dot):
+        return True
+    idx = 0
+    while idx < len(payload):
+        if payload[idx] in _SPEC_OPENERS:
+            close, nesting = idx, 0
+            while close < len(payload):
+                if payload[close] in _SPEC_OPENERS:
+                    nesting += 1
+                elif payload[close] in _SPEC_CLOSERS:
+                    nesting -= 1
+                    if nesting == 0:
+                        break
+                close += 1
+            sub = payload[idx + 1 : close]
+            if payload[idx] == "{":
+                if any(_alt_is_ok_ctor(fp, depth + 1) for fp in _struct_field_patterns(sub)):
+                    return True
+            elif _alt_is_ok_ctor(sub, depth + 1):
+                return True
+            idx = close + 1
+        else:
+            idx += 1
+    if payload[:1] == ["."]:
+        return _alt_is_ok_ctor(payload, depth + 1)
+    return False
+
+
+def _alt_is_catch_all(alt: Sequence[str], depth: int = 0) -> bool:
+    if depth > _MAX_SPEC_DEPTH:
+        return False
+    toks = _strip_pattern_wrappers(alt)
+    if not toks:
+        return False
+    if toks[0] == "⟨" and _wrapped(toks):
+        toks = toks[1:-1]
+    # Tuple comma binds looser than inner `|` inside a tuple element (`(_ | 0, Ok(y))`
+    # has two tuple elements), while top-level `|` without top-level `,` (`_ | 0`) splits below.
+    comma_parts = _split_top(toks, {","})
+    if len(comma_parts) > 1:
+        if not comma_parts[-1]:
+            comma_parts = comma_parts[:-1]
+        return bool(comma_parts) and all(
+            bool(part) and _alt_is_catch_all(part, depth + 1) for part in comma_parts
+        )
+    or_parts = _split_top(toks, {"|"})
+    if len(or_parts) > 1:
+        return any(_alt_is_catch_all(part, depth + 1) for part in or_parts)
+    toks = _strip_pattern_wrappers(toks)
+    toks = _split_top(toks, {":"})[0]
+    toks = _strip_pattern_wrappers(toks)
+    return len(toks) == 1 and _is_catch_all_word(toks[0])
+
+
+def _normalize_lean_layout_lets(
+    body_toks: Sequence[tuple[str, int, int, bool]],
+    *,
+    outer_arm_col: int = -1,
+    outer_line: int = -1,
+) -> list[str]:
+    """Insert `;` for layout `let`/`have` and `(` `)` around layout `match`/`fun |` blocks."""
+    out: list[str] = []
+    line_first_col: dict[int, int] = {}
+    for _t, ln, col, _first in body_toks:
+        line_first_col.setdefault(ln, col)
+    # LIFO stack of layout blocks:
+    # - `{"kind": "let", "depth": d, "col": c, "ready": 0|1}`
+    # - `{"kind": "match", "depth": d, "min_col": m, "arm_col": -1|c, "saw_with": 0|1, "if_count": k}`
+    layout: list[dict[str, int | str]] = []
+    depth = 0
+    n = len(body_toks)
+    for idx, (text, ln, col, first_on_line) in enumerate(body_toks):
+        if first_on_line:
+            closed_let = False
+            while layout and layout[-1]["depth"] == depth:
+                top = layout[-1]
+                if top["kind"] == "match":
+                    arm_c = int(top["arm_col"])
+                    thresh = arm_c if arm_c != -1 else int(top["min_col"])
+                    if col < thresh or (arm_c != -1 and col == arm_c and text != "|"):
+                        layout.pop()
+                        out.append(")")
+                        continue
+                    break
+                if int(top["ready"]) and col <= int(top["col"]):
+                    layout.pop()
+                    closed_let = True
+                    continue
+                break
+            if closed_let and out and out[-1] not in (";", "in"):
+                out.append(";")
+        if text in _SPEC_OPENERS:
+            depth += 1
+            out.append(text)
+            continue
+        if text in _SPEC_CLOSERS:
+            while layout and int(layout[-1]["depth"]) >= depth:
+                popped = layout.pop()
+                if popped["kind"] == "match":
+                    out.append(")")
+            depth -= 1
+            out.append(text)
+            continue
+        if text in (";", "in"):
+            while layout and layout[-1]["depth"] == depth:
+                top = layout[-1]
+                if top["kind"] == "match":
+                    layout.pop()
+                    out.append(")")
+                    continue
+                if int(top["ready"]):
+                    layout.pop()
+                    if text == "in":
+                        break
+                    continue
+                break
+            out.append(text)
+            continue
+        if text == "if":
+            for entry in reversed(layout):
+                if entry["depth"] == depth and entry["kind"] == "match":
+                    entry["if_count"] = int(entry["if_count"]) + 1
+                    break
+        elif text == "else":
+            while layout and layout[-1]["depth"] == depth and layout[-1]["kind"] == "match":
+                top = layout[-1]
+                if int(top["if_count"]) > 0:
+                    top["if_count"] = int(top["if_count"]) - 1
+                    break
+                layout.pop()
+                out.append(")")
+        is_match_head = text == "match" or (
+            (text == "fun" or text.startswith("λ"))
+            and idx + 1 < n
+            and body_toks[idx + 1][0] == "|"
+        )
+        if is_match_head:
+            if ln == outer_line and outer_arm_col >= 0:
+                min_col = outer_arm_col + 1
+            else:
+                after_arrow = any(
+                    body_toks[p][0] == "=>" and body_toks[p][1] == ln
+                    for p in range(idx - 1, -1, -1)
+                    if body_toks[p][1] == ln
+                )
+                min_col = line_first_col[ln] + (1 if after_arrow else 0)
+            out.append("(")
+            layout.append(
+                {
+                    "kind": "match",
+                    "depth": depth,
+                    "min_col": min_col,
+                    "arm_col": -1,
+                    "saw_with": 0 if text == "match" else 1,
+                    "if_count": 0,
+                }
+            )
+            out.append(text)
+            continue
+        if text == "with":
+            for entry in reversed(layout):
+                if entry["depth"] == depth and entry["kind"] == "match" and not int(entry["saw_with"]):
+                    entry["saw_with"] = 1
+                    break
+        elif text == "|":
+            for entry in reversed(layout):
+                if entry["depth"] == depth and entry["kind"] == "match":
+                    if int(entry["saw_with"]) and int(entry["arm_col"]) == -1:
+                        entry["arm_col"] = col
+                    break
+        elif text in ("let", "have") and (not out or out[-1] != "if"):
+            layout.append({"kind": "let", "depth": depth, "col": col, "ready": 0})
+        elif text == ":=":
+            for entry in reversed(layout):
+                if entry["depth"] == depth and entry["kind"] == "let" and not int(entry["ready"]):
+                    entry["ready"] = 1
+                    break
+        out.append(text)
+    while layout:
+        popped = layout.pop()
+        if popped["kind"] == "match":
+            out.append(")")
+    return out
+
+
+_TIGHTER_THAN_EQ_RIGHT_OPS: frozenset[str] = frozenset(
+    {".", "(", "[", "?", "as", "+", "-", "*", "/", "%", "<", "<=", ">", ">=", "&", "^", "|"}
+)
+_TIGHTER_THAN_EQ_LEFT_OPS: frozenset[str] = frozenset(
+    {".", ")", "]", "?", "as", "+", "-", "*", "/", "%", "<", "<=", ">", ">=", "&", "^", "|"}
+)
+
+
+def _read_bool_atom_right(
+    texts: Sequence[str], partner: dict[int, int], start: int
+) -> tuple[int, bool | None]:
+    """Read a unary/atomic/parenthesized boolean operand starting at `start`."""
+    n = len(texts)
+    cur = start
+    while cur < n and texts[cur] == "!":
+        cur += 1
+    if cur >= n:
+        return start, None
+    if texts[cur] in ("(", "{") and cur in partner:
+        end = partner[cur]
+    elif texts[cur] in ("true", "false"):
+        end = cur
+    else:
+        return start, None
+    if end + 1 < n and texts[end + 1] in _TIGHTER_THAN_EQ_RIGHT_OPS:
+        return start, None
+    return end, _const_truth(texts[start : end + 1])
+
+
+def _read_bool_atom_left(
+    texts: Sequence[str], partner: dict[int, int], end: int
+) -> tuple[int, bool | None]:
+    """Read a unary/atomic/parenthesized boolean operand ending at `end`."""
+    if end < 0:
+        return end, None
+    if texts[end] in (")", "}") and end in partner:
+        lo = partner[end]
+    elif texts[end] in ("true", "false"):
+        lo = end
+    else:
+        return end, None
+    while lo >= 1 and texts[lo - 1] == "!":
+        lo -= 1
+    if lo >= 1 and (texts[lo - 1] in _TIGHTER_THAN_EQ_LEFT_OPS or _is_spec_word(texts[lo - 1])):
+        return end, None
+    return lo, _const_truth(texts[lo : end + 1])
+
+
+def _has_rust_if_guard_before_brace(
+    texts: Sequence[str], partner: dict[int, int], open_idx: int
+) -> bool:
+    """Whether `{` at `open_idx` sits inside a Rust match-arm `if` guard rather than a prior arm body."""
+    g = open_idx - 1
+    found_guard_if = False
+    while g >= 0:
+        gt = texts[g]
+        if gt in _SPEC_CLOSERS:
+            g = partner[g] - 1
+            continue
+        if gt in _SPEC_OPENERS or gt in ("=>", ";", ",", ":="):
+            break
+        if gt == "if":
+            prev_gt = texts[g - 1] if g > 0 else ""
+            if prev_gt in ("=>", "return", "=", "let", ";", "{"):
+                return False
+            if prev_gt != "else":
+                found_guard_if = True
+        g -= 1
+    return found_guard_if
+
+
+def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
+    """Every match arm and `matches!` of `text`, with its folded body truth.
+
+    Raises `SourceLexError` when comments, literals or brackets cannot be
+    delimited.
+    """
+    code = _strip_source_comments(text, lang, blank_literals=True)
+    toks = _spec_tokens(code)
+    partner = _match_delimiters(toks)
+    lean = lang == "lean"
+    texts = [tok[0] for tok in toks]
+    count = len(texts)
+    line_col: dict[int, int] = {}
+    for tok in toks:
+        line_col.setdefault(tok[1], tok[2])
+    enclosing = [-1] * count
+    stack = [-1]
+    for idx, text_ in enumerate(texts):
+        if text_ in _SPEC_CLOSERS:
+            stack.pop()
+        enclosing[idx] = stack[-1]
+        if text_ in _SPEC_OPENERS:
+            stack.append(idx)
+
+    def snippet(lo: int, hi: int) -> str:
+        return " ".join(texts[lo:hi])[:200]
+
+    arms: list[dict[str, object]] = []
+    decl_by_enclosing: dict[int, int] = {}
+    # Per delimiter scope, stack of `[head_col, match_token_idx, first_arm_col, min_arm_col]`
+    # so sequential and nested Lean `match ... with` and `fun | ...` expressions
+    # never collide even when `match` sits after `=>` with indented arms below.
+    lean_matches: dict[int, list[list[int]]] = {}
+    for i, text_ in enumerate(texts):
+        enc = enclosing[i]
+        if lean and toks[i][3] and (
+            text_ in _LEAN_DECL_WORDS
+            or text_.startswith("#")
+            or (text_ == "@" and texts[i + 1 : i + 2] == ["["])
+        ):
+            decl_by_enclosing[enc] = i
+            lean_matches[enc] = []
+        is_lean_match_head = lean and (
+            text_ == "match"
+            or ((text_ == "fun" or text_.startswith("λ")) and texts[i + 1 : i + 2] == ["|"])
+        )
+        if is_lean_match_head:
+            cur_line = toks[i][1]
+            after_arrow_on_line = any(
+                texts[p] == "=>" and enclosing[p] == enc and toks[p][1] == cur_line
+                for p in range(i - 1, -1, -1)
+                if toks[p][1] == cur_line
+            )
+            head_col = toks[i][2] if after_arrow_on_line else line_col[cur_line]
+            min_arm_col = line_col[cur_line] + (1 if after_arrow_on_line else 0)
+            m_stack = lean_matches.setdefault(enc, [])
+            while m_stack:
+                top_head_col, top_idx, top_arm_col, _top_min = m_stack[-1]
+                if top_arm_col != -1 and head_col <= top_arm_col:
+                    m_stack.pop()
+                elif top_arm_col == -1 and top_head_col >= head_col and toks[i][1] > toks[top_idx][1]:
+                    m_stack.pop()
+                else:
+                    break
+            m_stack.append([head_col, i, -1, min_arm_col])
+        if (
+            text_ == "matches"
+            and texts[i + 1 : i + 2] == ["!"]
+            and texts[i + 2 : i + 3] in (["("], ["["], ["{"])
+        ):
+            close = partner[i + 2]
+            first_comma = _split_first_top(texts[i + 3 : close], {","})
+            if first_comma is None or not first_comma[1]:
+                continue
+            rhs_pat = list(first_comma[1])
+            while rhs_pat and rhs_pat[-1] == ",":
+                rhs_pat.pop()
+            if not rhs_pat:
+                continue
+            expr_lo, expr_hi = i, close
+            negations = 0
+            changed_span = True
+            while changed_span:
+                changed_span = False
+                while (
+                    expr_lo >= 2
+                    and texts[expr_lo - 1] == "::"
+                    and _is_spec_word(texts[expr_lo - 2])
+                ):
+                    expr_lo -= 2
+                    changed_span = True
+                if expr_lo >= 1 and texts[expr_lo - 1] == "::":
+                    expr_lo -= 1
+                    changed_span = True
+                while expr_lo >= 1 and texts[expr_lo - 1] == "!":
+                    negations += 1
+                    expr_lo -= 1
+                    changed_span = True
+                if (
+                    expr_lo >= 1
+                    and expr_hi + 1 < count
+                    and texts[expr_lo - 1] == "("
+                    and partner.get(expr_lo - 1) == expr_hi + 1
+                ):
+                    expr_lo -= 1
+                    expr_hi += 1
+                    changed_span = True
+                if expr_hi + 2 < count and texts[expr_hi + 1] in ("==", "!="):
+                    eq_op = texts[expr_hi + 1]
+                    r_end, r_val = _read_bool_atom_right(texts, partner, expr_hi + 2)
+                    if r_val is not None:
+                        if (eq_op == "==" and r_val is False) or (eq_op == "!=" and r_val is True):
+                            negations += 1
+                        expr_hi = r_end
+                        changed_span = True
+                if expr_lo >= 2 and texts[expr_lo - 1] in ("==", "!="):
+                    eq_op = texts[expr_lo - 1]
+                    l_lo, l_val = _read_bool_atom_left(texts, partner, expr_lo - 2)
+                    if l_val is not None:
+                        if (eq_op == "==" and l_val is False) or (eq_op == "!=" and l_val is True):
+                            negations += 1
+                        expr_lo = l_lo
+                        changed_span = True
+            annihilated_false = (
+                expr_hi + 2 < count
+                and texts[expr_hi + 1] == "&&"
+                and _read_bool_atom_right(texts, partner, expr_hi + 2)[1] is False
+            ) or (
+                expr_lo >= 2
+                and texts[expr_lo - 1] == "&&"
+                and _read_bool_atom_left(texts, partner, expr_lo - 2)[1] is False
+            )
+            guard_split = _split_first_top(rhs_pat, {"if"})
+            pat_tokens = rhs_pat if guard_split is None else guard_split[0]
+            guard_ok = (
+                not annihilated_false
+                and negations % 2 == 0
+                and (guard_split is None or _const_truth(guard_split[1]) is True)
+            )
+            group = (lang, enc, decl_by_enclosing.get(enc, -1) if lean else -1, -1)
+            arms.append(
+                {
+                    "macro": True,
+                    "group": group,
+                    "line": toks[i][1],
+                    "column": toks[i][2],
+                    "alts": [alt for alt in _split_top(pat_tokens, {"|"}) if alt],
+                    "guard_ok": guard_ok,
+                    "body_truth": None,
+                    "text": snippet(i, close + 1),
+                }
+            )
+            continue
+        if text_ != "=>":
+            continue
+
+        # Pattern: scan left to the token that ends the previous construct.
+        j = i - 1
+        boundary = ""
+        while j >= 0:
+            prev = texts[j]
+            if not lean and prev == ">" and texts[j + 1 : j + 2] == ["::"]:
+                angle_depth = 1
+                b = j - 1
+                while b >= 0 and angle_depth > 0:
+                    bt = texts[b]
+                    if bt in ("=>", ";", "{", "}", "if"):
+                        break
+                    if bt == ">":
+                        angle_depth += 1
+                    elif bt == "<":
+                        angle_depth -= 1
+                    b -= 1
+                if angle_depth == 0:
+                    j = b
+                    continue
+            if prev in _SPEC_CLOSERS:
+                if prev == "}" and not lean:
+                    open_idx = partner[j]
+                    before_brace = texts[open_idx - 1] if open_idx > 0 else ""
+                    after_brace = texts[j + 1] if j + 1 < count else ""
+                    has_block_syntax = any(t in ("=>", ";") for t in texts[open_idx + 1 : j])
+                    is_struct_pat = (
+                        (_is_spec_word(before_brace) or before_brace == ">")
+                        and before_brace not in _RUST_NON_STRUCT_BEFORE_BRACE
+                        and not has_block_syntax
+                    )
+                    if (
+                        j == i - 1
+                        or after_brace == "else"
+                        or (is_struct_pat and after_brace in ("|", "if"))
+                        or (
+                            (after_brace in _RUST_EXPR_CONT_OPS or after_brace == "{")
+                            and _has_rust_if_guard_before_brace(texts, partner, open_idx)
+                        )
+                    ):
+                        j = open_idx - 1
+                        continue
+                    boundary = prev
+                    break
+                j = partner[j] - 1
+                continue
+            if prev in _SPEC_OPENERS or prev in ("=>", ";", ":=") or (prev == "," and not lean):
+                boundary = prev
+                break
+            if lean and (prev in _LEAN_ARM_BOUNDARY_WORDS or prev.startswith("λ")):
+                boundary = "fun" if prev.startswith("λ") else prev
+                break
+            if not lean and prev in _RUST_ARM_BOUNDARY_WORDS:
+                if prev == "else" and texts[j + 1 : j + 2] == ["{"]:
+                    j -= 1
+                    continue
+                boundary = prev
+                break
+            j -= 1
+        pat_lo = j + 1
+        if pat_lo >= i:
+            continue
+        if lean and boundary == "fun" and texts[pat_lo] != "|":
+            continue  # `fun x => ...` binds a variable; it is not a match arm.
+        pattern = texts[pat_lo:i]
+        guard_ok = True
+        if not lean:
+            guard_split = _split_first_top(pattern, {"if"})
+            if guard_split is not None:
+                pattern = guard_split[0]
+                guard_ok = _const_truth(guard_split[1]) is True
+        segments = _split_top(pattern, {"|"})
+        if boundary not in _CLEAN_ARM_STARTS:
+            # What precedes the first `|` is the tail of the previous arm body.
+            segments = segments[1:]
+        alts = [segment for segment in segments if segment]
+        if not alts:
+            continue
+        alt_tokens = sum(len(alt) for alt in alts) + len(alts) - 1
+        alt_lo = min(max(pat_lo, pat_lo + len(pattern) - alt_tokens), i - 1)
+        alt_line = toks[alt_lo][1]
+        after_arrow_on_alt_line = any(
+            texts[p] == "=>" and enclosing[p] == enc
+            for p in range(alt_lo - 1, -1, -1)
+            if toks[p][1] == alt_line
+        )
+        if after_arrow_on_alt_line:
+            bar_col = toks[alt_lo - 1][2] if alt_lo > 0 and texts[alt_lo - 1] == "|" and toks[alt_lo - 1][1] == alt_line else toks[alt_lo][2]
+            arm_col = bar_col
+        else:
+            arm_col = line_col[alt_line]
+        match_id = -1
+        if lean:
+            m_stack = lean_matches.get(enc, [])
+            while m_stack:
+                _top_head, _top_idx, top_arm_col, top_min_arm_col = m_stack[-1]
+                if top_arm_col != -1 and arm_col < top_arm_col:
+                    m_stack.pop()
+                elif top_arm_col == -1 and arm_col < top_min_arm_col:
+                    m_stack.pop()
+                else:
+                    break
+            if m_stack:
+                if m_stack[-1][2] == -1:
+                    m_stack[-1][2] = arm_col
+                match_id = m_stack[-1][1]
+        group = (lang, enc, decl_by_enclosing.get(enc, -1) if lean else -1, match_id)
+
+        # Body: scan right to the token that ends this arm.
+        k = i + 1
+        in_lean_nested_match = False
+        inner_let_headers = 0
+        while k < count:
+            nxt = texts[k]
+            if nxt in _SPEC_OPENERS:
+                close_idx = partner[k]
+                if not lean and nxt == "{" and _rust_brace_ends_arm(texts, close_idx):
+                    k = close_idx + 1
+                    break
+                k = close_idx + 1
+                continue
+            if nxt in _SPEC_CLOSERS or (nxt in (";", ",") and not lean):
+                break
+            if lean:
+                if nxt in ("let", "have"):
+                    inner_let_headers += 1
+                elif nxt == ":=":
+                    if inner_let_headers == 0:
+                        break
+                    inner_let_headers -= 1
+                elif nxt in (";", "in"):
+                    inner_let_headers = 0
+                if (
+                    nxt == "match"
+                    or ((nxt == "fun" or nxt.startswith("λ")) and texts[k + 1 : k + 2] == ["|"])
+                ):
+                    in_lean_nested_match = True
+                if (
+                    (nxt == "|" and (not in_lean_nested_match or (toks[k][3] and toks[k][2] <= arm_col)))
+                    or (
+                        toks[k][3]
+                        and (
+                            nxt in _LEAN_DECL_WORDS
+                            or nxt.startswith("#")
+                            or (nxt == "@" and texts[k + 1 : k + 2] == ["["])
+                            or (k > i + 1 and toks[k][2] <= arm_col)
+                        )
+                    )
+                ):
+                    break
+            k += 1
+        body_slice = (
+            _normalize_lean_layout_lets(toks[i + 1 : k], outer_arm_col=arm_col, outer_line=toks[i][1])
+            if lean
+            else texts[i + 1 : k]
+        )
+        arms.append(
+            {
+                "macro": False,
+                "group": group,
+                "line": toks[i][1],
+                "column": toks[i][2],
+                "alts": alts,
+                "guard_ok": guard_ok,
+                "body_truth": _const_truth(body_slice),
+                "text": snippet(alt_lo, k),
+            }
+        )
+    return arms
+
+
+_LEAN_HINT_RE = re.compile(
+    r":=|=>\s*\(*\s*(?:True|False|trivial)\b|\bmatch\b[^\n]*\bwith\b|\bwith\s*$"
+    r"|\|\s*\.(?:[A-Za-z_]|«)|\b(?:theorem|Prop|fun)\b|/-|[∀→∧∨¬«»]",
+    re.M,
+)
+_RUST_HINT_RE = re.compile(
+    r"=>\s*[({]*\s*(?:true|false)\b|\bfn\b|\b(?:Err|Ok)\s*[(<{]|(?:\w|>)::\s*[A-Za-z_<]"
+    r"|;\s*$|//|/\*|\bmatches!|\blet\s+(?:mut\s+)?[A-Za-z_][\w:<> ,()]*=(?!=)",
+    re.M,
+)
+
+
+def _spec_languages(text: str, language: str) -> tuple[str, ...]:
+    """Languages to scan `text` as: the named one, or what `auto` cannot exclude."""
+    if language in ("lean", "rust"):
+        return (language,)
+    if language != "auto":
+        raise ValueError(f"unknown language {language!r} (expected auto, lean or rust)")
+    lean_stripped: str | None = None
+    rust_stripped: str | None = None
+    try:
+        lean_stripped = _strip_source_comments(text, "lean", blank_literals=True)
+    except SourceLexError:
+        pass
+    try:
+        rust_stripped = _strip_source_comments(text, "rust", blank_literals=True)
+    except SourceLexError:
+        pass
+    if lean_stripped is not None and rust_stripped is None:
+        if (
+            "/*" not in lean_stripped
+            and (_LEAN_HINT_RE.search(lean_stripped) is not None or _RUST_HINT_RE.search(text) is None)
+        ):
+            return ("lean",)
+    elif rust_stripped is not None and lean_stripped is None:
+        if (
+            "/-" not in rust_stripped
+            and "«" not in rust_stripped
+            and (_RUST_HINT_RE.search(rust_stripped) is not None or _LEAN_HINT_RE.search(text) is None)
+        ):
+            return ("rust",)
+    lean_probe = lean_stripped if lean_stripped is not None else text
+    rust_probe = rust_stripped if rust_stripped is not None else text
+    lean = _LEAN_HINT_RE.search(lean_probe) is not None
+    rust = _RUST_HINT_RE.search(rust_probe) is not None
+    if lean != rust:
+        return ("lean",) if lean else ("rust",)
+    return ("lean", "rust")
+
+
+def _arm_wildcard_pattern(arm: dict[str, object], ok_groups: set[object]) -> str | None:
+    alts: list[list[str]] = arm["alts"]  # type: ignore[assignment]
+    if not arm["guard_ok"]:
+        return None
+    if arm["macro"]:
+        matches_saw_ok = any(_alt_is_ok_ctor(alt) for alt in alts)
+        for alt in alts:
+            if any(wild for _, wild in _alt_error_matches(alt)) or (
+                matches_saw_ok and _alt_is_catch_all(alt)
+            ):
+                return "matches_any_err"
+        return None
+    if arm["body_truth"] is not True:
+        return None
+    for alt in alts:
+        for kind, wild in _alt_error_matches(alt):
+            if wild:
+                return _WILDCARD_WIRE_ID[kind]
+    if arm["group"] in ok_groups and any(_alt_is_catch_all(alt) for alt in alts):
+        return "catch_all_arm_true"
+    return None
+
+
+def _ok_groups(arms: Sequence[dict[str, object]]) -> set[object]:
+    return {
+        arm["group"]
+        for arm in arms
+        if not arm["macro"]
+        and any(_alt_is_ok_ctor(alt) for alt in arm["alts"])  # type: ignore[union-attr]
+    }
+
+
+def detect_postcondition_error_wildcards(
+    source_text: str, *, language: str = "auto"
+) -> list[ErrorWildcardFinding]:
+    """Find postcondition arms that accept every error, `ub` or `unsupported` outcome.
+
+    `language` is `"lean"`, `"rust"` or `"auto"`; `auto` scans the text as
+    every language its syntax does not exclude. Comments and string literals
+    are never scanned. Reported shapes (all under guard `error_branch_wildcard`):
+
+    * `err_arm_true`: `| Err _ => True`, `| .err _ => True`, `| .error _ => True`,
+      `Err(_) => true`, `Err(..) => true`, `Err(e) => true`;
+    * `ub_arm_true`: `| .ub => True`, `| MirStepNode.fail .ub => True`,
+      `| .fail _ => True`, `Ub => true`;
+    * `unsupported_arm_true`: `| .unsupported => True`, `Unsupported => true`;
+    * `matches_any_err`: `matches!(out, Ok(_) | Err(_))`;
+    * `catch_all_arm_true`: `_ => true` beside an `Ok` arm of the same match;
+    * `unclosed_literal_or_comment`: an unterminated comment, string or
+      bracket. The scanner cannot tell code from text there and fails closed.
+
+    An arm counts when any of its `|` alternatives is such a pattern and its
+    body folds to a constant truth (`True`, `(true)`, `trivial`, `!false`,
+    `True ∧ True`, `true || x == 3`, `x == x`, `{ return true; }`).
+    """
+    findings: list[ErrorWildcardFinding] = []
+    seen: set[tuple[int, int, str]] = set()
+    for lang in _spec_languages(source_text, language):
+        try:
+            arms = _collect_spec_arms(source_text, lang)
+        except SourceLexError as exc:
+            findings.append(
+                ErrorWildcardFinding(
+                    SPEC_WILDCARD_GUARD_ID, "unclosed_literal_or_comment", lang, 1, 1, str(exc)
+                )
+            )
+            continue
+        ok_groups = _ok_groups(arms)
+        for arm in arms:
+            pattern = _arm_wildcard_pattern(arm, ok_groups)
+            key = (arm["line"], arm["column"], pattern or "")
+            if pattern is None or key in seen:
+                continue
+            seen.add(key)  # type: ignore[arg-type]
+            findings.append(
+                ErrorWildcardFinding(
+                    SPEC_WILDCARD_GUARD_ID,
+                    pattern,
+                    lang,
+                    arm["line"],  # type: ignore[arg-type]
+                    arm["column"],  # type: ignore[arg-type]
+                    arm["text"],  # type: ignore[arg-type]
+                )
+            )
+    return findings
+
+
+def _probe_arms(arms: Sequence[dict[str, object]], mutant: str, lang: str) -> dict[str, object]:
+    """Run the `mutant` outcome through the arms of one scanned source."""
+    base: dict[str, object] = {
+        "guard_id": SPEC_WILDCARD_GUARD_ID,
+        "mutant": mutant,
+        "language": lang,
+        "pattern": None,
+        "line": None,
+    }
+    outcome_groups = {
+        arm["group"]
+        for arm in arms
+        if not arm["macro"]
+        and any(
+            _alt_is_ok_ctor(alt) or _alt_error_matches(alt)
+            for alt in arm["alts"]  # type: ignore[union-attr]
+        )
+    }
+    decided: dict[object, dict[str, object]] = {}
+    constrained_line: int | None = None
+    for arm in arms:
+        alts: list[list[str]] = arm["alts"]  # type: ignore[assignment]
+        hits = [hit for alt in alts for hit in _alt_error_matches(alt) if hit[0] == mutant]
+        catch_all = any(_alt_is_catch_all(alt) for alt in alts)
+        if arm["macro"]:
+            matches_saw_ok = any(_alt_is_ok_ctor(alt) for alt in alts)
+            if arm["guard_ok"] and (
+                (matches_saw_ok and catch_all) or any(wild for _, wild in hits)
+            ):
+                return {
+                    **base,
+                    "status": "SURVIVED",
+                    "pattern": "matches_any_err",
+                    "line": arm["line"],
+                    "detail": f"`matches!` at line {arm['line']} accepts every `{mutant}` outcome",
+                }
+            if hits and constrained_line is None:
+                constrained_line = arm["line"]  # type: ignore[assignment]
+            continue
+        group = arm["group"]
+        if group in decided:
+            continue
+        catch_all = catch_all and group in outcome_groups
+        covers = catch_all or any(wild for _, wild in hits)
+        if covers and arm["guard_ok"]:
+            if arm["body_truth"] is True:
+                return {
+                    **base,
+                    "status": "SURVIVED",
+                    "pattern": _WILDCARD_WIRE_ID[mutant] if hits else "catch_all_arm_true",
+                    "line": arm["line"],
+                    "detail": (
+                        f"arm at line {arm['line']} accepts every `{mutant}` outcome: "
+                        f"{arm['text']}"
+                    ),
+                }
+            decided[group] = {
+                **base,
+                "status": "KILLED",
+                "line": arm["line"],
+                "detail": (
+                    f"arm at line {arm['line']} rejects or constrains the `{mutant}` "
+                    f"outcome: {arm['text']}"
+                ),
+            }
+        elif (covers or hits) and constrained_line is None:
+            constrained_line = arm["line"]  # type: ignore[assignment]
+    if decided:
+        return next(iter(decided.values()))
+    if constrained_line is not None:
+        return {
+            **base,
+            "status": "KILLED",
+            "line": constrained_line,
+            "detail": (
+                f"only payload-specific or guarded arms match the `{mutant}` outcome "
+                f"(first at line {constrained_line})"
+            ),
+        }
+    return {
+        **base,
+        "status": "UNMATCHED",
+        "detail": f"no arm matches the `{mutant}` outcome",
+    }
+
+
+_PROBE_SEVERITY: dict[str, int] = {"SURVIVED": 3, "ERROR": 2, "KILLED": 1, "UNMATCHED": 0}
+
+
+def probe_postcondition_error_wildcard_mutant(
+    postcondition_source: str, mutant: str = "err", *, language: str = "auto"
+) -> dict[str, object]:
+    """Decide whether a postcondition kills one error mutant, without running Lean.
+
+    The mutant is an implementation that ends in the `mutant` outcome (`"err"`:
+    an error with an arbitrary payload, `"ub"`, or `"unsupported"`). In every
+    match of the postcondition, the first arm that covers the whole outcome
+    decides: a body that folds to constant truth lets the mutant `SURVIVE`
+    (the `error_branch_wildcard` violation); any other body `KILLS` it.
+
+    Returns `guard_id`, `mutant`, `status` (`KILLED`, `SURVIVED`, `UNMATCHED`
+    when no arm mentions the outcome, `ERROR` when the source cannot be
+    scanned), `pattern`, `language`, `line` and `detail`.
+    """
+    if mutant not in ERROR_MUTANT_KINDS:
+        raise ValueError(f"unknown error mutant {mutant!r} (expected one of {ERROR_MUTANT_KINDS})")
+    best: dict[str, object] | None = None
+    for lang in _spec_languages(postcondition_source, language):
+        try:
+            result = _probe_arms(_collect_spec_arms(postcondition_source, lang), mutant, lang)
+        except SourceLexError as exc:
+            result = {
+                "guard_id": SPEC_WILDCARD_GUARD_ID,
+                "mutant": mutant,
+                "language": lang,
+                "pattern": "unclosed_literal_or_comment",
+                "line": None,
+                "status": "ERROR",
+                "detail": str(exc),
+            }
+        if best is None or _PROBE_SEVERITY[str(result["status"])] > _PROBE_SEVERITY[str(best["status"])]:
+            best = result
+    assert best is not None
+    return best
+
+
+def verify_postcondition_kills_error_mutants(
+    postcondition_source: str,
+    *,
+    language: str = "auto",
+    mutants: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Self-contained mutant-kill check of one postcondition's error branches.
+
+    Probes every error mutant (`ERROR_MUTANT_KINDS`, or exactly `mutants`) and
+    runs the static wildcard scan. `ok` holds only when no mutant survives,
+    nothing fails to scan, the scan reports no wildcard arm, and at least one
+    mutant is killed. With explicit `mutants`, every one of them must be
+    killed. A postcondition that inspects no error outcome kills nothing and
+    is rejected.
+    """
+    selected = tuple(ERROR_MUTANT_KINDS if mutants is None else mutants)
+    results = [
+        probe_postcondition_error_wildcard_mutant(postcondition_source, mutant, language=language)
+        for mutant in selected
+    ]
+    findings = detect_postcondition_error_wildcards(postcondition_source, language=language)
+    tally = Counter(str(result["status"]) for result in results)
+    ok = (
+        not findings
+        and tally["SURVIVED"] == 0
+        and tally["ERROR"] == 0
+        and tally["KILLED"] > 0
+        and (mutants is None or tally["KILLED"] == len(selected))
+    )
+    return {
+        "ok": ok,
+        "guard_id": SPEC_WILDCARD_GUARD_ID,
+        "killed": tally["KILLED"],
+        "survived": tally["SURVIVED"],
+        "unmatched": tally["UNMATCHED"],
+        "errors": tally["ERROR"],
+        "results": results,
+        "findings": [asdict(finding) for finding in findings],
+    }
+
+
+# `(language, postcondition, mutant, expected status)`: a guarded postcondition
+# kills its error mutant, and the same postcondition with the vacuous arm
+# injected lets it survive. `--check-spec-wildcards` refuses to report a clean
+# scan unless the probe still tells every pair apart.
+_ERROR_WILDCARD_SELF_CHECK: tuple[tuple[str, str, str, str], ...] = (
+    ("lean", "match out with\n  | .ok v => v = spec x\n  | .ub => False\n", "ub", "KILLED"),
+    ("lean", "match out with\n  | .ok v => v = spec x\n  | .ub => True\n", "ub", "SURVIVED"),
+    ("lean", "| .ok v => v = 1\n| Err e => e = .overflow\n", "err", "KILLED"),
+    ("lean", "| .ok v => v = 1\n| Err _ => True\n", "err", "SURVIVED"),
+    ("lean", "| .ok v => v = 1\n| .unsupported => False\n", "unsupported", "KILLED"),
+    ("lean", "| .ok v => v = 1\n| .unsupported => True\n", "unsupported", "SURVIVED"),
+    ("rust", "match out { Ok(v) => *v == x + 1, Err(e) => *e == E::Overflow }", "err", "KILLED"),
+    ("rust", "match out { Ok(v) => *v == x + 1, Err(_) => true }", "err", "SURVIVED"),
+)
+
+
+def error_wildcard_probe_self_check() -> list[str]:
+    """Errors of the probe's built-in kill / survive demonstrations (empty when sound)."""
+    errors: list[str] = []
+    for lang, source, mutant, expected in _ERROR_WILDCARD_SELF_CHECK:
+        status = probe_postcondition_error_wildcard_mutant(source, mutant, language=lang)["status"]
+        flagged = bool(detect_postcondition_error_wildcards(source, language=lang))
+        if status != expected or flagged != (expected == "SURVIVED"):
+            errors.append(
+                f"wildcard probe self-check: {lang} {mutant} mutant of {source!r} is "
+                f"{status} (flagged={flagged}), expected {expected}"
+            )
+    return errors
+
+
+# Largest specification source `--check-spec-wildcards` reads.
+_MAX_SPEC_SOURCE_BYTES = 8 * 1024 * 1024
+
+
+def _read_regular_spec_utf8(path: Path) -> str:
+    """Read a UTF-8 regular file bounded by `_MAX_SPEC_SOURCE_BYTES`, never blocking on a FIFO."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not a regular file")
+        if info.st_size > _MAX_SPEC_SOURCE_BYTES:
+            raise OSError(f"larger than {_MAX_SPEC_SOURCE_BYTES} bytes")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            data = handle.read(_MAX_SPEC_SOURCE_BYTES + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(data) > _MAX_SPEC_SOURCE_BYTES:
+        raise OSError(f"larger than {_MAX_SPEC_SOURCE_BYTES} bytes")
+    return data.decode("utf-8")
+
+
+def _empty_spec_wildcard_report(fatal_error: str | None = None) -> dict[str, object]:
+    return {
+        "ok": False,
+        "fatal_error": fatal_error,
+        "mode": "check-spec-wildcards",
+        "guard_id": SPEC_WILDCARD_GUARD_ID,
+        "checked": 0,
+        "findings": [],
+        "errors": [],
+    }
+
+
+def check_spec_wildcard_paths(paths: Sequence[Path]) -> dict[str, object]:
+    """Scan specification files for error-branch wildcard arms.
+
+    `.lean` files are scanned as Lean, `.rs` files as Rust, anything else as
+    `auto`. `ok` holds only when every path was read as a UTF-8 regular file
+    and scanned with no finding, and the probe's self-check passes.
+    """
+    findings: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = [
+        {"path": None, "error": message} for message in error_wildcard_probe_self_check()
+    ]
+    checked = 0
+    for path in paths:
+        try:
+            text = _read_regular_spec_utf8(path)
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append({"path": str(path), "error": f"cannot read: {exc}"})
+            continue
+        language = {".lean": "lean", ".rs": "rust"}.get(path.suffix.lower(), "auto")
+        checked += 1
+        findings.extend(
+            {"path": str(path), **asdict(finding)}
+            for finding in detect_postcondition_error_wildcards(text, language=language)
+        )
+    return {
+        "ok": not findings and not errors and checked == len(paths) and checked > 0,
+        "fatal_error": None,
+        "mode": "check-spec-wildcards",
+        "guard_id": SPEC_WILDCARD_GUARD_ID,
+        "checked": checked,
+        "findings": findings,
+        "errors": errors,
+    }
+
+
+def validate_catalog_invariants(
+    anneal_root: Path,
+    *,
+    require_rust_taxonomy: bool | None = None,
+    require_lean_taxonomy: bool | None = None,
+) -> list[str]:
     """Validate static catalog and topological invariants without invoking Lean.
 
     Returns a list of error strings (empty when all invariants hold).
+
+    Besides the fixture and topology checks, the catalog must agree with the
+    canonical property taxonomy: every guard names one of the 12
+    `PropertyClass` identifiers, `PROPERTY_CLASS_DISPOSITIONS` accounts for all
+    12, and the identifiers match the live `property_registry.rs` and
+    `SpecBoundaryGuards.lean` (see `validate_property_taxonomy` for when a
+    missing source file is an error and what `require_rust_taxonomy` does).
     """
     errors: list[str] = []
+    errors.extend(
+        validate_property_taxonomy(
+            anneal_root,
+            require_rust_taxonomy=require_rust_taxonomy,
+            require_lean_taxonomy=require_lean_taxonomy,
+        )
+    )
+    errors.extend(_guard_property_class_errors())
     seen_ids: set[str] = set()
     covered_modules: set[str] = set()
     quick_count = 0
@@ -4779,7 +8898,11 @@ def _run_guard_mutation_suite(
             except BaseException:
                 _abort_pending(list(future_map))
                 raise
-        results.extend(by_id[g.guard_id] for g in selected_guards)
+        # A result carries the class of its cataloged guard, whoever built it.
+        results.extend(
+            GuardResult(**{**asdict(by_id[g.guard_id]), "property_class": g.property_class})
+            for g in selected_guards
+        )
 
         # The reused Lake artifacts are shared by hardlink. Prove that nothing
         # in this run wrote through one.
@@ -4811,6 +8934,7 @@ def _run_guard_mutation_suite(
         "baseline_sec": round(baseline_sec, 3),
         "total_sec": round(time.monotonic() - t_start, 3),
         "results": [asdict(r) for r in results],
+        "property_class_summary": property_class_summary(selected_guards, results),
     }
 
 
@@ -4889,6 +9013,7 @@ def _fatal_report(mode_label: str, message: str) -> dict[str, object]:
         "baseline_sec": 0.0,
         "total_sec": 0.0,
         "results": [],
+        "property_class_summary": property_class_summary(()),
     }
 
 
@@ -4938,6 +9063,51 @@ def _termination_signals_as_interrupt() -> Iterator[None]:
 def _write_json_out(path: Path, report: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
+def _run_spec_wildcard_check(
+    paths: Sequence[Path], *, emit_json: bool, json_out: Path | None
+) -> int:
+    """`--check-spec-wildcards`: exit `0` when clean, `1` on a finding or bad path."""
+    if json_out is not None:
+        # Same fail-closed sink as a guard run: a stale pass never survives.
+        pending = _empty_spec_wildcard_report("run did not complete")
+        try:
+            _write_json_out(json_out, pending)
+        except OSError as exc:
+            msg = f"cannot write {json_out}: {exc}"
+            print(f"ERROR: {msg}", file=sys.stderr)
+            if emit_json:
+                print(json.dumps(_empty_spec_wildcard_report(msg), indent=2))
+            return 1
+    report = check_spec_wildcard_paths(paths)
+    exit_code = 0 if report["ok"] else 1
+    if json_out is not None:
+        try:
+            _write_json_out(json_out, report)
+        except OSError as exc:
+            msg = f"cannot write {json_out}: {exc}"
+            print(f"ERROR: {msg}", file=sys.stderr)
+            report["ok"] = False
+            report["fatal_error"] = msg
+            exit_code = 1
+    if emit_json:
+        print(json.dumps(report, indent=2))
+        return exit_code
+    for finding in report["findings"]:  # type: ignore[union-attr]
+        print(
+            f"{finding['path']}:{finding['line']}:{finding['column']}: "
+            f"{finding['guard_id']} [{finding['pattern']}] {finding['arm']}"
+        )
+    for error in report["errors"]:  # type: ignore[union-attr]
+        where = f"{error['path']}: " if error["path"] else ""
+        print(f"ERROR: {where}{error['error']}", file=sys.stderr)
+    print(
+        f"Spec wildcard check: {report['checked']} file(s) scanned, "
+        f"{len(report['findings'])} finding(s), "  # type: ignore[arg-type]
+        f"{len(report['errors'])} error(s)"  # type: ignore[arg-type]
+    )
+    return exit_code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -5039,6 +9209,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=120,
         help="Per-Lean-invocation timeout in seconds (default: 120).",
     )
+    parser.add_argument(
+        "--taxonomy-json",
+        action="store_true",
+        help=(
+            "Print the canonical PropertyTaxonomyManifest JSON after checking it "
+            "against property_registry.rs and SpecBoundaryGuards.lean, and exit."
+        ),
+    )
+    parser.add_argument(
+        "--check-spec-wildcards",
+        nargs="+",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Scan Lean or Rust specification sources for vacuous error-branch "
+            "postcondition arms and exit 0 when clean, 1 otherwise."
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.jobs < 1:
@@ -5049,10 +9238,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--guard cannot be combined with --quick or --all")
     if args.list and args.json_out is not None:
         parser.error("--json-out cannot be combined with --list")
+    run_selection = args.list or args.quick or args.all or bool(args.guards)
+    if args.taxonomy_json and (
+        run_selection or args.json_out is not None or args.check_spec_wildcards is not None
+    ):
+        parser.error(
+            "--taxonomy-json cannot be combined with --list, --quick, --all, --guard, "
+            "--json-out or --check-spec-wildcards"
+        )
+    if args.check_spec_wildcards is not None and run_selection:
+        parser.error(
+            "--check-spec-wildcards cannot be combined with --list, --quick, --all or --guard"
+        )
 
     # Lean always runs with `cwd=<anneal_root>`; relative paths must not shift.
     anneal_root = Path(os.path.abspath(args.anneal_root))
     mode_label = "quick" if args.quick else ("guard" if args.guards else "all")
+
+    if args.taxonomy_json:
+        taxonomy_errors = validate_property_taxonomy(
+            anneal_root, require_rust_taxonomy=True, require_lean_taxonomy=True
+        )
+        if taxonomy_errors:
+            for err in taxonomy_errors:
+                print(f"ERROR: {err}", file=sys.stderr)
+            return 1
+        sys.stdout.write(render_property_taxonomy_manifest())
+        return 0
+
+    if args.check_spec_wildcards is not None:
+        return _run_spec_wildcard_check(
+            args.check_spec_wildcards, emit_json=args.emit_json, json_out=args.json_out
+        )
 
     if args.list:
         errors = validate_catalog_invariants(anneal_root)
@@ -5071,6 +9288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "guards": [
                     {
                         "guard_id": g.guard_id,
+                        "property_class": g.property_class,
                         "target_file": g.target_file,
                         "target_module": g.target_module,
                         "quick": g.quick,
@@ -5080,12 +9298,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                     for g in selected
                 ],
+                "property_classes": list(CANONICAL_PROPERTY_CLASSES),
+                "spec_boundary_guards": list(CANONICAL_SPEC_BOUNDARY_GUARDS),
+                "property_class_summary": property_class_summary(selected),
             }
             print(json.dumps(payload, indent=2))
         else:
             for g in selected:
                 tag = "quick" if g.quick else "full "
                 print(f"{tag}  {g.guard_id:42s} {g.target_file}")
+            summary_rows = property_class_summary(selected)
+            print(
+                "Property classes with selected guards: "
+                + ", ".join(
+                    f"{row['property_class']}={row['selected']}"
+                    for row in summary_rows
+                    if row["selected"]
+                )
+            )
             print(f"Total cataloged guards: {len(selected)}")
         return 0
 

@@ -3630,6 +3630,3722 @@ where
     }
 }
 
+// ============================================================================
+// Specification-Boundary Soundness Guards
+// ============================================================================
+//
+// A kernel-checked proof certifies a claim only relative to its specification.
+// The three guards below reject specifications whose *boundary* makes the
+// certificate worthless even though every vacuity class above passes:
+//
+// 1. `EntryPointPrecondition` (`verus#3606`): a binary entry point (`main`,
+//    `#![no_main]` `_start`, `#[entry]`) has no verified caller, so a
+//    non-trivial `requires` is never discharged.
+// 2. `FixedWidthGhostLength` (`Slate` soundness bug 121): a ghost collection
+//    length typed at a machine width wraps at `2^64` and makes the standard
+//    collection axioms inconsistent. Its scanner lives in
+//    `cargo_anneal::property_registry`; this module only freezes its identity.
+// 3. `ErrorBranchWildcard` (`awsm2`): a postcondition arm such as
+//    `Err(_) => true` passes postcondition dichotomy through its `Ok` arm
+//    while accepting every error escape.
+//
+// The identifiers, ranks, and vacuity classes are frozen across
+// `Anneal.SpecBoundaryGuards` (Lean), this module, and
+// `cargo_anneal::property_registry::SpecBoundaryGuardId`.
+
+/// Frozen 3-class specification-boundary guard taxonomy, in rank order `0..3`.
+///
+/// Each guard reports under one class of the frozen 5-class [`VacuityClass`]
+/// taxonomy ([`Self::to_vacuity_class`]), which is left unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SpecBoundaryGuardClass {
+    /// Rank 0 (`verus#3606`): a binary entry point carries a non-trivial
+    /// `requires` clause that no verified caller discharges.
+    EntryPointPrecondition,
+    /// Rank 1 (`Slate` soundness bug 121): a ghost collection length or
+    /// cardinality is typed at a fixed machine width instead of `Nat` / `Int`.
+    FixedWidthGhostLength,
+    /// Rank 2 (`awsm2`): a postcondition accepts every error payload, `Ub`, or
+    /// `Unsupported` outcome.
+    ErrorBranchWildcard,
+}
+
+impl SpecBoundaryGuardClass {
+    /// Total number of specification-boundary guards.
+    pub const COUNT: usize = 3;
+
+    /// All three guards in their frozen cross-language rank order
+    /// (`SpecBoundaryGuardClass.all` in Lean).
+    pub const ALL: [Self; 3] = [
+        Self::EntryPointPrecondition,
+        Self::FixedWidthGhostLength,
+        Self::ErrorBranchWildcard,
+    ];
+
+    /// 0-based canonical rank (`0..3`).
+    pub const fn rank(self) -> usize {
+        match self {
+            Self::EntryPointPrecondition => 0,
+            Self::FixedWidthGhostLength => 1,
+            Self::ErrorBranchWildcard => 2,
+        }
+    }
+
+    /// Reconstructs a guard from its canonical rank; `None` for `rank >= 3`.
+    pub const fn from_rank(rank: usize) -> Option<Self> {
+        match rank {
+            0 => Some(Self::EntryPointPrecondition),
+            1 => Some(Self::FixedWidthGhostLength),
+            2 => Some(Self::ErrorBranchWildcard),
+            _ => None,
+        }
+    }
+
+    /// Canonical `snake_case` guard identifier shared with
+    /// `cargo_anneal::property_registry::SpecBoundaryGuardId::as_str`.
+    pub const fn guard_id(self) -> &'static str {
+        match self {
+            Self::EntryPointPrecondition => "entry_point_requires",
+            Self::FixedWidthGhostLength => "fixed_width_ghost_length",
+            Self::ErrorBranchWildcard => "error_branch_wildcard",
+        }
+    }
+
+    /// Parses a guard identifier, the inverse of [`Self::guard_id`]. Matching
+    /// is exact and case-sensitive.
+    pub fn from_guard_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|guard| guard.guard_id() == id)
+    }
+
+    /// Canonical cross-language diagnostic name.
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::EntryPointPrecondition => "EntryPointPrecondition",
+            Self::FixedWidthGhostLength => "FixedWidthGhostLength",
+            Self::ErrorBranchWildcard => "ErrorBranchWildcard",
+        }
+    }
+
+    /// Parses a canonical diagnostic name, the inverse of
+    /// [`Self::canonical_name`]. Matching is exact and case-sensitive.
+    pub fn from_canonical_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|guard| guard.canonical_name() == name)
+    }
+
+    /// The frozen [`VacuityClass`] a violation of this guard is reported under.
+    pub const fn to_vacuity_class(self) -> VacuityClass {
+        match self {
+            Self::EntryPointPrecondition => VacuityClass::DeadPrecondition,
+            Self::FixedWidthGhostLength => VacuityClass::SpecViolation,
+            Self::ErrorBranchWildcard => VacuityClass::SurvivedAllMutants,
+        }
+    }
+}
+
+impl fmt::Display for SpecBoundaryGuardClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.canonical_name())
+    }
+}
+
+macro_rules! spec_boundary_guard_marker {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+        pub struct $name;
+
+        impl $name {
+            /// The guard class this check type reports.
+            pub const CLASS: SpecBoundaryGuardClass = SpecBoundaryGuardClass::$name;
+            /// Canonical guard identifier of [`Self::CLASS`].
+            pub const GUARD_ID: &'static str = Self::CLASS.guard_id();
+            /// Canonical diagnostic name of [`Self::CLASS`].
+            pub const CANONICAL_NAME: &'static str = Self::CLASS.canonical_name();
+            /// Frozen vacuity class of [`Self::CLASS`].
+            pub const VACUITY_CLASS: VacuityClass = Self::CLASS.to_vacuity_class();
+        }
+    };
+}
+
+spec_boundary_guard_marker!(
+    /// Check type of the `verus#3606` entry-point `requires` guard
+    /// ([`check_entry_point_requires`]).
+    EntryPointPrecondition
+);
+spec_boundary_guard_marker!(
+    /// Check type of the `Slate` bug 121 fixed-width ghost length guard
+    /// (scanned by `cargo_anneal::property_registry`).
+    FixedWidthGhostLength
+);
+spec_boundary_guard_marker!(
+    /// Check type of the `awsm2` error-branch wildcard guard
+    /// ([`detect_error_branch_wildcard`],
+    /// [`check_result_contract_no_error_wildcard`]).
+    ErrorBranchWildcard
+);
+
+// ----------------------------------------------------------------------------
+// Comment- and literal-aware specification lexer
+// ----------------------------------------------------------------------------
+
+/// Source dialect of a specification snippet, which decides what a comment is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SpecSyntax {
+    /// Rust: `//` line comments and nested `/* */` block comments.
+    Rust,
+    /// Lean 4: `--` line comments and nested `/- -/` block comments.
+    Lean,
+    /// Unknown dialect: both comment families are recognized.
+    ///
+    /// The comment markers of one language are operators in the other (`--`
+    /// is two Rust negations, `//` may be user notation in Lean), so prefer
+    /// [`Self::Rust`] or [`Self::Lean`] whenever the dialect is known.
+    #[default]
+    Any,
+}
+
+/// Malformed-source error reported by the strict specification scanners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SpecScanError {
+    /// A block comment, string literal, or character literal is not closed, so
+    /// the remaining source cannot be attributed to code or to a literal.
+    UnclosedLiteralOrComment,
+}
+
+impl fmt::Display for SpecScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnclosedLiteralOrComment => {
+                f.write_str("unclosed block comment, string literal, or character literal")
+            }
+        }
+    }
+}
+
+/// One lexical token of a specification snippet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecTok<'a> {
+    /// Identifier, keyword, or numeric literal.
+    Word(&'a str),
+    /// String, raw-string, byte-string, or character literal. Its contents are
+    /// never inspected.
+    Literal,
+    /// The match-arm arrow `=>`.
+    FatArrow,
+    /// The path separator `::`.
+    PathSep,
+    /// A rest or range token: `..`, `..=`, or `...`.
+    DotDot,
+    /// Any other operator or punctuation (`(`, `|`, `==`, `==>`, `&&`, `∧`).
+    Sym(&'a str),
+}
+
+/// Zero-allocation lexer over Rust and Lean specification source that skips
+/// comments and never looks inside literals.
+#[derive(Clone, Copy, Debug)]
+struct SpecLexer<'a> {
+    src: &'a str,
+    pos: usize,
+    syntax: SpecSyntax,
+}
+
+/// Longest character-literal escape body searched for a closing quote
+/// (`'\u{10FFFF}'` needs 9 bytes after the escaped character).
+const MAX_CHAR_ESCAPE_BYTES: usize = 12;
+
+impl<'a> SpecLexer<'a> {
+    const fn new(src: &'a str, syntax: SpecSyntax) -> Self {
+        Self {
+            src,
+            pos: 0,
+            syntax,
+        }
+    }
+
+    const fn rust_comments(&self) -> bool {
+        !matches!(self.syntax, SpecSyntax::Lean)
+    }
+
+    const fn lean_comments(&self) -> bool {
+        !matches!(self.syntax, SpecSyntax::Rust)
+    }
+
+    fn byte_at(&self, idx: usize) -> Option<u8> {
+        self.src.as_bytes().get(idx).copied()
+    }
+
+    fn skip_line_comment(&mut self) {
+        let bytes = self.src.as_bytes();
+        while self.pos < bytes.len() && bytes[self.pos] != b'\n' {
+            self.pos += 1;
+        }
+    }
+
+    /// Skips a nested block comment opened by `/` + `marker` and closed by
+    /// `marker` + `/`.
+    fn skip_block_comment(&mut self, marker: u8) -> Result<(), SpecScanError> {
+        let bytes = self.src.as_bytes();
+        self.pos += 2;
+        let mut depth = 1usize;
+        while self.pos < bytes.len() {
+            let here = bytes[self.pos];
+            let next = bytes.get(self.pos + 1).copied();
+            if here == b'/' && next == Some(marker) {
+                depth += 1;
+                self.pos += 2;
+            } else if here == marker && next == Some(b'/') {
+                depth -= 1;
+                self.pos += 2;
+                if depth == 0 {
+                    return Ok(());
+                }
+            } else {
+                self.pos += 1;
+            }
+        }
+        Err(SpecScanError::UnclosedLiteralOrComment)
+    }
+
+    /// Skips a `"…"` string literal starting at the opening quote.
+    fn skip_string(&mut self) -> Result<(), SpecScanError> {
+        let bytes = self.src.as_bytes();
+        self.pos += 1;
+        while self.pos < bytes.len() {
+            match bytes[self.pos] {
+                b'\\' => self.pos += 2,
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                _ => self.pos += 1,
+            }
+        }
+        // A trailing backslash may have stepped past the end.
+        self.pos = bytes.len();
+        Err(SpecScanError::UnclosedLiteralOrComment)
+    }
+
+    /// Skips a raw string `#…#"…"#…#` whose hashes start at `self.pos`.
+    /// Returns `Ok(false)` without consuming anything when no raw string
+    /// starts here.
+    fn skip_raw_string(&mut self) -> Result<bool, SpecScanError> {
+        let bytes = self.src.as_bytes();
+        let mut idx = self.pos;
+        let mut hashes = 0usize;
+        while bytes.get(idx) == Some(&b'#') {
+            hashes += 1;
+            idx += 1;
+        }
+        if bytes.get(idx) != Some(&b'"') {
+            return Ok(false);
+        }
+        idx += 1;
+        while idx < bytes.len() {
+            if bytes[idx] == b'"' {
+                let mut closing = 0usize;
+                while closing < hashes && bytes.get(idx + 1 + closing) == Some(&b'#') {
+                    closing += 1;
+                }
+                if closing == hashes {
+                    self.pos = idx + 1 + hashes;
+                    return Ok(true);
+                }
+            }
+            idx += 1;
+        }
+        self.pos = bytes.len();
+        Err(SpecScanError::UnclosedLiteralOrComment)
+    }
+
+    /// Lexes the token starting at a `'`: a character literal, or a lone quote
+    /// (a Rust lifetime marker).
+    fn lex_quote(&mut self) -> Result<SpecTok<'a>, SpecScanError> {
+        let start = self.pos;
+        let rest = &self.src[start + 1..];
+        if let Some(escape_body) = rest.strip_prefix('\\') {
+            // Escaped character literal: skip the escaped character, then
+            // find the closing quote within a short single-line window.
+            let Some(escaped) = escape_body.chars().next() else {
+                self.pos = self.src.len();
+                return Err(SpecScanError::UnclosedLiteralOrComment);
+            };
+            if escaped == '\n' || escaped == '\r' {
+                self.pos = self.src.len();
+                return Err(SpecScanError::UnclosedLiteralOrComment);
+            }
+            let body_start = start + 2 + escaped.len_utf8();
+            let window_end = (body_start + MAX_CHAR_ESCAPE_BYTES).min(self.src.len());
+            let mut idx = body_start;
+            while idx < window_end {
+                match self.byte_at(idx) {
+                    Some(b'\'') => {
+                        self.pos = idx + 1;
+                        return Ok(SpecTok::Literal);
+                    }
+                    Some(b'\n' | b'\r') => break,
+                    _ => idx += 1,
+                }
+            }
+            self.pos = self.src.len();
+            return Err(SpecScanError::UnclosedLiteralOrComment);
+        }
+        if let Some(ch) = rest.chars().next() {
+            let after = start + 1 + ch.len_utf8();
+            if ch != '\'' && ch != '\n' && ch != '\r' && self.byte_at(after) == Some(b'\'') {
+                self.pos = after + 1;
+                return Ok(SpecTok::Literal);
+            }
+        }
+        self.pos = start + 1;
+        Ok(SpecTok::Sym(&self.src[start..start + 1]))
+    }
+
+    /// Returns the next token, `Ok(None)` at end of input, or an error when a
+    /// comment or literal is left unclosed.
+    fn next_tok(&mut self) -> Result<Option<SpecTok<'a>>, SpecScanError> {
+        let bytes = self.src.as_bytes();
+        loop {
+            while self.pos < bytes.len() && bytes[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            }
+            let Some(here) = self.byte_at(self.pos) else {
+                return Ok(None);
+            };
+            let next = self.byte_at(self.pos + 1);
+            let rust_line_comment = self.rust_comments() && here == b'/' && next == Some(b'/');
+            let lean_line_comment = self.lean_comments() && here == b'-' && next == Some(b'-');
+            if rust_line_comment || lean_line_comment {
+                self.skip_line_comment();
+            } else if self.rust_comments() && here == b'/' && next == Some(b'*') {
+                self.skip_block_comment(b'*')?;
+            } else if self.lean_comments() && here == b'/' && next == Some(b'-') {
+                self.skip_block_comment(b'-')?;
+            } else {
+                break;
+            }
+        }
+
+        let start = self.pos;
+        let here = bytes[start];
+
+        // A Lean quoted identifier `«…»` is one name, whatever it contains:
+        // `«pre»` is the identifier `pre`, and `«(»` is a name, not a
+        // bracket.
+        if self.lean_comments() && self.src[start..].starts_with('«') {
+            let inner_start = start + '«'.len_utf8();
+            let Some(len) = self.src[inner_start..].find('»').filter(|len| *len > 0) else {
+                self.pos = self.src.len();
+                return Err(SpecScanError::UnclosedLiteralOrComment);
+            };
+            self.pos = inner_start + len + '»'.len_utf8();
+            return Ok(Some(SpecTok::Word(
+                &self.src[inner_start..inner_start + len],
+            )));
+        }
+
+        if here == b'"' {
+            self.skip_string()?;
+            return Ok(Some(SpecTok::Literal));
+        }
+        if here == b'\'' {
+            return self.lex_quote().map(Some);
+        }
+
+        let first = self.src[start..]
+            .chars()
+            .next()
+            .expect("`start` is a character boundary inside the source");
+        if is_spec_word_char(first) {
+            let mut end = start;
+            for (offset, ch) in self.src[start..].char_indices() {
+                if !is_spec_word_char(ch) {
+                    break;
+                }
+                end = start + offset + ch.len_utf8();
+            }
+            let word = &self.src[start..end];
+            self.pos = end;
+            // Raw strings exist in both languages (`r"…"`, `r#"…"#`): a
+            // backslash inside one is not an escape.
+            if word == "r" && self.skip_raw_string()? {
+                return Ok(Some(SpecTok::Literal));
+            }
+            // Rust byte/C-string literal prefixes (`br"…"`, `cr#"…"#`,
+            // `b"…"`, `c"…"`, `b'…'`). Never apply these in Lean mode, where
+            // `b'` is a primed identifier.
+            if !matches!(self.syntax, SpecSyntax::Lean) {
+                if matches!(word, "br" | "cr") && self.skip_raw_string()? {
+                    return Ok(Some(SpecTok::Literal));
+                }
+                if matches!(word, "b" | "c") && self.byte_at(end) == Some(b'"') {
+                    self.skip_string()?;
+                    return Ok(Some(SpecTok::Literal));
+                }
+                if word == "b" && self.byte_at(end) == Some(b'\'') {
+                    let mut look = *self;
+                    match look.lex_quote()? {
+                        SpecTok::Literal => {
+                            *self = look;
+                            return Ok(Some(SpecTok::Literal));
+                        }
+                        _ if matches!(self.syntax, SpecSyntax::Rust) => {
+                            return Err(SpecScanError::UnclosedLiteralOrComment);
+                        }
+                        // In `SpecSyntax::Any`, fall through so Lean's primed
+                        // identifier `b'` lexes cleanly as `Word("b'")`.
+                        _ => {}
+                    }
+                }
+            }
+            // Lean identifiers may end in primes (`x'`, `b'`, `h''`). Rust
+            // never places a quote directly after an identifier other than
+            // `b'…'`.
+            if !matches!(self.syntax, SpecSyntax::Rust) {
+                while self.byte_at(self.pos) == Some(b'\'') {
+                    self.pos += 1;
+                }
+            }
+            return Ok(Some(SpecTok::Word(&self.src[start..self.pos])));
+        }
+
+        let rest = &self.src[start..];
+        let (tok, len) = if rest.starts_with("==>") {
+            (SpecTok::Sym(&rest[..3]), 3)
+        } else if rest.starts_with("=>") {
+            (SpecTok::FatArrow, 2)
+        } else if rest.starts_with("...") || rest.starts_with("..=") {
+            (SpecTok::DotDot, 3)
+        } else if rest.starts_with("..") {
+            (SpecTok::DotDot, 2)
+        } else if rest.starts_with("::") {
+            (SpecTok::PathSep, 2)
+        } else if rest.starts_with("<->") {
+            (SpecTok::Sym(&rest[..3]), 3)
+        } else if [
+            "==", "!=", "<=", ">=", "&&", "||", "->", "<-", ":=", "/\\", "\\/",
+        ]
+        .iter()
+        .any(|op| rest.starts_with(op))
+        {
+            (SpecTok::Sym(&rest[..2]), 2)
+        } else {
+            let len = first.len_utf8();
+            (SpecTok::Sym(&rest[..len]), len)
+        };
+        self.pos = start + len;
+        Ok(Some(tok))
+    }
+}
+
+/// Characters that make up identifiers, keywords, and numeric literals.
+fn is_spec_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+// ----------------------------------------------------------------------------
+// Guard 1: entry-point `requires` ban (`verus#3606`)
+// ----------------------------------------------------------------------------
+
+/// How an item becomes a binary entry point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryPointKind {
+    /// Rust `fn main` of a binary crate, called by the `std` runtime.
+    Main,
+    /// `#![no_main]` entry symbol: `_start`, `__start`, or an exported C
+    /// `main`.
+    NoMainStart,
+    /// Item marked by an entry attribute (`#[entry]`, `#[main]`, `#[start]`).
+    EntryAttribute,
+}
+
+impl EntryPointKind {
+    /// All entry-point kinds in declaration order.
+    pub const ALL: [Self; 3] = [Self::Main, Self::NoMainStart, Self::EntryAttribute];
+
+    /// Canonical wire identifier (`EntryPointKind.asStr` in Lean).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::NoMainStart => "no_main_start",
+            Self::EntryAttribute => "entry_attribute",
+        }
+    }
+}
+
+impl fmt::Display for EntryPointKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Facts about an item that decide whether it is a binary entry point
+/// (`EntryPointDescriptor` in Lean).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EntryPointDescriptor<'a> {
+    /// Crate-qualified definition path, for example `"my_crate::main"`.
+    pub def_path: &'a str,
+    /// The crate is compiled with `#![no_main]`.
+    pub crate_no_main: bool,
+    /// The item carries an entry attribute (`#[entry]`, `#[main]`, `#[start]`).
+    pub has_entry_attr: bool,
+    /// Exported link symbol when the item is `#[no_mangle]` or
+    /// `#[export_name = "…"]`.
+    pub link_symbol: Option<&'a str>,
+    /// The item is an associated function or method (`Type::main`).
+    pub is_assoc_fn: bool,
+}
+
+impl<'a> EntryPointDescriptor<'a> {
+    /// Describes a free function at `def_path` in a default (`std` runtime)
+    /// crate with no attributes.
+    pub const fn new(def_path: &'a str) -> Self {
+        Self {
+            def_path,
+            crate_no_main: false,
+            has_entry_attr: false,
+            link_symbol: None,
+            is_assoc_fn: false,
+        }
+    }
+
+    /// Sets whether the crate is compiled with `#![no_main]`.
+    pub const fn with_crate_no_main(mut self, crate_no_main: bool) -> Self {
+        self.crate_no_main = crate_no_main;
+        self
+    }
+
+    /// Sets whether the item carries an entry attribute.
+    pub const fn with_entry_attr(mut self, has_entry_attr: bool) -> Self {
+        self.has_entry_attr = has_entry_attr;
+        self
+    }
+
+    /// Sets the exported link symbol.
+    pub const fn with_link_symbol(mut self, link_symbol: Option<&'a str>) -> Self {
+        self.link_symbol = link_symbol;
+        self
+    }
+
+    /// Sets whether the item is an associated function or method.
+    pub const fn with_assoc_fn(mut self, is_assoc_fn: bool) -> Self {
+        self.is_assoc_fn = is_assoc_fn;
+        self
+    }
+
+    /// Derives [`Self::has_entry_attr`] and [`Self::link_symbol`] from the
+    /// source text of the item's outer attributes, with or without the
+    /// surrounding `#[…]`.
+    ///
+    /// `#[entry]`, `#[main]`, `#[start]` and their path-qualified forms
+    /// (`#[cortex_m_rt::entry]`, `#[tokio::main]`) are entry attributes.
+    /// `#[no_mangle]` exports the item under its own name, and
+    /// `#[export_name = "sym"]` under `sym` (escape sequences are decoded, so
+    /// `"\x5fstart"` is `_start`); an `unsafe(…)` wrapper is accepted around
+    /// either.
+    ///
+    /// `#[cfg_attr(predicate, attr, …)]` contributes every conditional
+    /// attribute: the predicate may hold in the configuration that ships, so
+    /// `#[cfg_attr(not(test), no_mangle)]` exports the item. When several
+    /// attributes name different link symbols, an entry symbol (`main`,
+    /// `_start`, `__start`) takes precedence.
+    pub fn with_attributes(mut self, attributes: &[&'a str]) -> Self {
+        for attribute in attributes {
+            for body in attribute_bodies(attribute) {
+                self.apply_attribute(body, MAX_CFG_ATTR_DEPTH);
+            }
+        }
+        self
+    }
+
+    /// Derives [`Self::crate_no_main`] from the source text of the crate-level
+    /// attributes: `#![no_main]`, also behind `cfg_attr`
+    /// (`#![cfg_attr(not(test), no_main)]`).
+    pub fn with_crate_attributes(mut self, attributes: &[&str]) -> Self {
+        if attributes.iter().any(|attr| is_no_main_attribute(attr)) {
+            self.crate_no_main = true;
+        }
+        self
+    }
+
+    /// Records the link symbol `symbol`, never replacing an entry symbol by a
+    /// non-entry one.
+    fn export_as(&mut self, symbol: &'a str) {
+        if !self.link_symbol.is_some_and(is_entry_leaf_symbol) {
+            self.link_symbol = Some(symbol);
+        }
+    }
+
+    /// Applies one attribute body (without `#[…]`); `fuel` bounds the nesting
+    /// of `cfg_attr`.
+    fn apply_attribute(&mut self, body: &'a str, fuel: usize) {
+        let body = body.trim();
+        if let Some(args) = cfg_attr_arguments(body) {
+            // Skip the predicate, then apply every conditional attribute.
+            let (_, mut rest) = split_top_level_comma(args);
+            if fuel == 0 {
+                // Nested too deeply to follow: assume the worst.
+                self.has_entry_attr |= rest.is_some();
+                return;
+            }
+            while let Some(attrs) = rest {
+                let (attr, tail) = split_top_level_comma(attrs);
+                self.apply_attribute(attr, fuel - 1);
+                rest = tail;
+            }
+            return;
+        }
+        if is_entry_attribute(body) {
+            self.has_entry_attr = true;
+        }
+        let inner = strip_unsafe_wrapper(body);
+        if is_single_word(inner, "no_mangle") {
+            let leaf = path_segment_count_and_leaf(self.def_path).1;
+            if self.link_symbol.is_none() || is_entry_leaf_symbol(leaf) {
+                self.link_symbol = Some(leaf);
+            }
+        } else if let Some((symbol, is_raw)) = export_name_literal(inner) {
+            if is_raw || !symbol.contains('\\') {
+                self.export_as(symbol);
+            } else if let Some(entry) = escaped_entry_symbol(symbol) {
+                self.export_as(entry);
+            }
+        }
+    }
+}
+
+/// Maximum nesting of `cfg_attr(…, cfg_attr(…, …))` followed by
+/// [`EntryPointDescriptor::with_attributes`]; deeper nests fail closed.
+const MAX_CFG_ATTR_DEPTH: usize = 8;
+
+/// Returns `true` when a crate-level attribute (with or without `#![…]`)
+/// makes the crate `#![no_main]`, directly or as a conditional attribute of
+/// `cfg_attr` (the predicate may hold in the configuration that ships).
+pub fn is_no_main_attribute(attribute: &str) -> bool {
+    fn declares_no_main(body: &str, fuel: usize) -> bool {
+        let body = body.trim();
+        let Some(args) = cfg_attr_arguments(body) else {
+            return is_single_word(body, "no_main");
+        };
+        let (_, mut rest) = split_top_level_comma(args);
+        if fuel == 0 {
+            // Nested too deeply to follow: assume the worst.
+            return rest.is_some();
+        }
+        while let Some(attrs) = rest {
+            let (attr, tail) = split_top_level_comma(attrs);
+            if declares_no_main(attr, fuel - 1) {
+                return true;
+            }
+            rest = tail;
+        }
+        false
+    }
+    attribute_bodies(attribute).any(|body| declares_no_main(body, MAX_CFG_ATTR_DEPTH))
+}
+
+/// Skips leading Rust whitespace and comments (`//…` and nested `/*…*/`).
+/// Returns `None` if an unclosed block comment is encountered.
+fn strip_leading_rust_ws_and_comments(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let rest = &s[pos..];
+        let first = rest.chars().next()?;
+        if first.is_whitespace() {
+            pos += first.len_utf8();
+            continue;
+        }
+        if rest.starts_with("//") {
+            pos += 2;
+            while pos < bytes.len() && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        if rest.starts_with("/*") {
+            pos += 2;
+            let mut depth = 1u32;
+            while pos < bytes.len() && depth > 0 {
+                if bytes[pos..].starts_with(b"/*") {
+                    depth += 1;
+                    pos += 2;
+                } else if bytes[pos..].starts_with(b"*/") {
+                    depth -= 1;
+                    pos += 2;
+                } else {
+                    pos += 1;
+                }
+            }
+            if depth > 0 {
+                return None;
+            }
+            continue;
+        }
+        break;
+    }
+    Some(&s[pos..])
+}
+
+/// Returns `true` when `s` contains only Rust whitespace and well-formed
+/// comments.
+fn has_only_rust_ws_and_comments(s: &str) -> bool {
+    strip_leading_rust_ws_and_comments(s).is_some_and(str::is_empty)
+}
+
+/// Returns `true` when `body` consists solely of the identifier `expected`
+/// (ignoring Rust whitespace and comments).
+fn is_single_word(body: &str, expected: &str) -> bool {
+    let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
+    matches!(lexer.next_tok(), Ok(Some(SpecTok::Word(w))) if w == expected)
+        && matches!(lexer.next_tok(), Ok(None))
+}
+
+/// If `body` (ignoring Rust whitespace and comments) has the exact form
+/// `<kw>(<inner>)`, returns `<inner>`.
+fn unwrap_keyword_parens<'a>(body: &'a str, kw: &str) -> Option<&'a str> {
+    let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
+    if !matches!(lexer.next_tok(), Ok(Some(SpecTok::Word(w))) if w == kw) {
+        return None;
+    }
+    if !matches!(lexer.next_tok(), Ok(Some(SpecTok::Sym("(")))) {
+        return None;
+    }
+    let inner_start = lexer.pos;
+    let mut depth = 1u32;
+    let inner_end = loop {
+        match lexer.next_tok() {
+            Ok(Some(SpecTok::Sym("("))) => depth += 1,
+            Ok(Some(SpecTok::Sym(")"))) => {
+                depth -= 1;
+                if depth == 0 {
+                    break lexer.pos - 1;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    };
+    matches!(lexer.next_tok(), Ok(None)).then_some(&body[inner_start..inner_end])
+}
+
+/// Returns the argument list of a `cfg_attr(…)` attribute body (ignoring Rust
+/// whitespace and comments around `cfg_attr` and its parentheses).
+fn cfg_attr_arguments(body: &str) -> Option<&str> {
+    unwrap_keyword_parens(body, "cfg_attr")
+}
+
+/// Splits `args` at its first top-level comma (outside brackets and
+/// literals): returns the text before it and, when there is one, the text
+/// after it.
+fn split_top_level_comma(args: &str) -> (&str, Option<&str>) {
+    let mut lexer = SpecLexer::new(args, SpecSyntax::Rust);
+    let mut depth = 0u32;
+    loop {
+        match lexer.next_tok() {
+            Ok(Some(SpecTok::Sym("(" | "[" | "{"))) => depth += 1,
+            Ok(Some(SpecTok::Sym(")" | "]" | "}"))) => depth = depth.saturating_sub(1),
+            Ok(Some(SpecTok::Sym(","))) if depth == 0 => {
+                // `lexer.pos` is right after the one-byte comma.
+                return (&args[..lexer.pos - 1], Some(&args[lexer.pos..]));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return (args, None),
+        }
+    }
+}
+
+/// Returns `true` when the body of a non-raw Rust string literal decodes to
+/// exactly `target` (`"\x5fstart"` and `"\u{5f}start"` decode to `_start`).
+/// Malformed escapes decode to nothing.
+fn escaped_literal_decodes_to(raw: &str, target: &str) -> bool {
+    let mut chars = raw.chars();
+    let mut expected = target.chars();
+    while let Some(ch) = chars.next() {
+        let decoded = if ch == '\\' {
+            match chars.next() {
+                Some('n') => '\n',
+                Some('r') => '\r',
+                Some('t') => '\t',
+                Some('0') => '\0',
+                Some(quoted @ ('\\' | '\'' | '"')) => quoted,
+                Some('x') => {
+                    let hi = chars.next().and_then(|c| c.to_digit(16));
+                    let lo = chars.next().and_then(|c| c.to_digit(16));
+                    match (hi, lo) {
+                        (Some(hi), Some(lo)) if hi < 8 => match char::from_u32(hi * 16 + lo) {
+                            Some(c) => c,
+                            None => return false,
+                        },
+                        _ => return false,
+                    }
+                }
+                Some('u') => {
+                    if chars.next() != Some('{') {
+                        return false;
+                    }
+                    let mut value = 0u32;
+                    let mut digits = 0u32;
+                    loop {
+                        match chars.next() {
+                            Some('}') => break,
+                            Some('_') if digits > 0 => {}
+                            Some(c) => match c.to_digit(16) {
+                                Some(digit) if digits < 6 => {
+                                    value = value * 16 + digit;
+                                    digits += 1;
+                                }
+                                _ => return false,
+                            },
+                            None => return false,
+                        }
+                    }
+                    match char::from_u32(value) {
+                        Some(c) if digits > 0 => c,
+                        _ => return false,
+                    }
+                }
+                Some('\n' | '\r') => {
+                    // Line continuation: the newline and the whitespace that
+                    // follows it are dropped.
+                    loop {
+                        let mut look = chars.clone();
+                        match look.next() {
+                            Some(' ' | '\t' | '\n' | '\r') => chars = look,
+                            _ => break,
+                        }
+                    }
+                    continue;
+                }
+                _ => return false,
+            }
+        } else {
+            ch
+        };
+        if expected.next() != Some(decoded) {
+            return false;
+        }
+    }
+    expected.next().is_none()
+}
+
+/// The entry link symbol an escaped string-literal body decodes to, if any.
+fn escaped_entry_symbol(raw: &str) -> Option<&'static str> {
+    ["main", "_start", "__start"]
+        .into_iter()
+        .find(|target| escaped_literal_decodes_to(raw, target))
+}
+
+/// Iterator over the bodies (the text inside `#[…]` / `#![…]`) of the
+/// attributes in a source snippet; see [`attribute_bodies`].
+struct AttributeBodies<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Iterator for AttributeBodies<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let rest = strip_leading_rust_ws_and_comments(self.rest).unwrap_or(self.rest);
+        if rest.is_empty() {
+            self.rest = rest;
+            return None;
+        }
+        let mut lexer = SpecLexer::new(rest, SpecSyntax::Rust);
+        let opened = matches!(lexer.next_tok(), Ok(Some(SpecTok::Sym("#"))))
+            && match lexer.next_tok() {
+                Ok(Some(SpecTok::Sym("!"))) => {
+                    matches!(lexer.next_tok(), Ok(Some(SpecTok::Sym("["))))
+                }
+                Ok(Some(SpecTok::Sym("["))) => true,
+                _ => false,
+            };
+        if !opened {
+            // A bare attribute body (`no_mangle`).
+            self.rest = "";
+            return Some(rest);
+        }
+        let body_start = lexer.pos;
+        let mut depth = 1u32;
+        loop {
+            match lexer.next_tok() {
+                Ok(Some(SpecTok::Sym("[" | "(" | "{"))) => depth += 1,
+                Ok(Some(SpecTok::Sym("]"))) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // `lexer.pos` is right after the one-byte closer.
+                        let body = &rest[body_start..lexer.pos - 1];
+                        self.rest = &rest[lexer.pos..];
+                        return Some(body);
+                    }
+                }
+                Ok(Some(SpecTok::Sym(")" | "}"))) if depth > 1 => {
+                    depth -= 1;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    // Unclosed: the remainder is the body.
+                    self.rest = "";
+                    return Some(&rest[body_start..]);
+                }
+            }
+        }
+    }
+}
+
+/// The attribute bodies of `attribute`, the source text of one or more
+/// attributes with or without the surrounding `#[…]` / `#![…]`.
+///
+/// Attributes are found the way the Rust lexer finds them: whitespace and
+/// comments (doc comments included) may surround them and separate `#`, `!`,
+/// and `[` (`# [no_mangle]`, `#[no_mangle] // exported`), and a snippet may
+/// hold several (`#[inline] #[no_mangle]`).
+fn attribute_bodies(attribute: &str) -> AttributeBodies<'_> {
+    AttributeBodies { rest: attribute }
+}
+
+/// Strips an `unsafe(…)` attribute wrapper (`#[unsafe(no_mangle)]`), ignoring
+/// Rust whitespace and comments around `unsafe` and its parentheses.
+fn strip_unsafe_wrapper(body: &str) -> &str {
+    unwrap_keyword_parens(body, "unsafe").unwrap_or(body)
+}
+
+/// Extracts the literal of `export_name = "sym"`, `export_name = r"sym"`, or
+/// `export_name = r#"sym"#`, ignoring Rust comments around the tokens and
+/// rejecting trailing non-comment tokens after it. Returns the text between
+/// the quotes and whether the literal is raw (a non-raw literal may contain
+/// escape sequences).
+fn export_name_literal(body: &str) -> Option<(&str, bool)> {
+    let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
+    if !matches!(lexer.next_tok(), Ok(Some(SpecTok::Word("export_name")))) {
+        return None;
+    }
+    if !matches!(lexer.next_tok(), Ok(Some(SpecTok::Sym("=")))) {
+        return None;
+    }
+    let rest = strip_leading_rust_ws_and_comments(&body[lexer.pos..])?;
+    if let Some(after_r) = rest.strip_prefix('r') {
+        let bytes = after_r.as_bytes();
+        let mut hashes = 0usize;
+        while bytes.get(hashes) == Some(&b'#') {
+            hashes += 1;
+        }
+        if bytes.get(hashes) != Some(&b'"') {
+            return None;
+        }
+        let content_start = hashes + 1;
+        let mut idx = content_start;
+        while idx < bytes.len() {
+            if bytes[idx] == b'"' {
+                let mut closing = 0usize;
+                while closing < hashes && bytes.get(idx + 1 + closing) == Some(&b'#') {
+                    closing += 1;
+                }
+                if closing == hashes {
+                    let after = &after_r[idx + 1 + hashes..];
+                    return has_only_rust_ws_and_comments(after)
+                        .then_some((&after_r[content_start..idx], true));
+                }
+            }
+            idx += 1;
+        }
+        return None;
+    }
+    let rest = rest.strip_prefix('"')?;
+    // Find the closing quote, stepping over escaped characters.
+    let bytes = rest.as_bytes();
+    let mut end = 0usize;
+    loop {
+        match bytes.get(end) {
+            Some(b'"') => break,
+            Some(b'\\') => end += 2,
+            Some(_) => end += 1,
+            None => return None,
+        }
+    }
+    let after = &rest[end + 1..];
+    if !has_only_rust_ws_and_comments(after) {
+        return None;
+    }
+    Some((&rest[..end], false))
+}
+
+/// Returns `true` when the attribute (with or without `#[…]`) names an entry
+/// attribute: its path ends in the segment `entry`, `main`, or `start`, either
+/// directly or as a conditional attribute of `cfg_attr`.
+///
+/// Handles whitespace and comments around `::` (`#[cortex_m_rt :: entry]`,
+/// `#[::tokio::main]`, `#[cfg_attr(not(test), entry)]`) and matches on the
+/// whole final segment, so `maintain`, `entry_point`, and `restart` are not
+/// entry attributes.
+pub fn is_entry_attribute(attribute: &str) -> bool {
+    fn is_entry_body(body: &str, fuel: usize) -> bool {
+        let body = body.trim();
+        if let Some(args) = cfg_attr_arguments(body) {
+            let (_, mut rest) = split_top_level_comma(args);
+            if fuel == 0 {
+                return rest.is_some();
+            }
+            while let Some(attrs) = rest {
+                let (attr, tail) = split_top_level_comma(attrs);
+                if is_entry_body(attr, fuel - 1) {
+                    return true;
+                }
+                rest = tail;
+            }
+            return false;
+        }
+        let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
+        let mut last_segment: Option<&str> = None;
+        let mut expect_segment = true;
+        while let Ok(Some(tok)) = lexer.next_tok() {
+            match tok {
+                SpecTok::PathSep => {
+                    expect_segment = true;
+                }
+                SpecTok::Word(word) if expect_segment => {
+                    last_segment = Some(word);
+                    expect_segment = false;
+                }
+                SpecTok::Sym("(" | "[" | "{") if !expect_segment => break,
+                SpecTok::Sym("=") => return false,
+                _ => return false,
+            }
+        }
+        if expect_segment {
+            return false;
+        }
+        matches!(last_segment, Some("entry" | "main" | "start"))
+    }
+    attribute_bodies(attribute).any(|body| is_entry_body(body, MAX_CFG_ATTR_DEPTH))
+}
+
+/// Number of `::`-separated segments of `path`, and its last segment.
+///
+/// Splits at the leftmost non-overlapping `::` occurrences, exactly as
+/// `pathSegments` does in Lean; the empty path has the single segment `""`.
+fn path_segment_count_and_leaf(path: &str) -> (usize, &str) {
+    let mut count = 0usize;
+    let mut leaf = path;
+    for segment in path.split("::") {
+        count += 1;
+        leaf = segment;
+    }
+    (count, leaf)
+}
+
+/// Whether `seg` is a valid crate-root segment name (`isValidCrateSegment` in
+/// Lean): non-empty, starting with an ASCII letter or `_`, containing only
+/// ASCII alphanumerics, `_`, or `-`. Rejects rustc impl/trait segments such as
+/// `<MyType as Trait>`, `<impl Foo>`, and `{{impl}}`.
+fn is_valid_crate_segment(seg: &str) -> bool {
+    let mut chars = seg.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// Strips a single leading root `::` and returns `(optional_crate_segment, leaf)`
+/// when the normalized path has 1 or 2 segments (`normalizeEntryPathSegments` in
+/// Lean).
+fn split_entry_path(def_path: &str) -> Option<(Option<&str>, &str)> {
+    let stripped = def_path.strip_prefix("::").unwrap_or(def_path);
+    let mut iter = stripped.split("::");
+    let first = iter.next()?;
+    match iter.next() {
+        None => Some((None, first)),
+        Some(second) => {
+            if iter.next().is_some() {
+                None
+            } else {
+                Some((Some(first), second))
+            }
+        }
+    }
+}
+
+/// Link-level names under which a loader or C runtime transfers control to a
+/// binary: `main`, `_start`, and `__start` (`isEntryLeafSymbol` in Lean).
+pub fn is_entry_leaf_symbol(leaf: &str) -> bool {
+    matches!(leaf, "main" | "_start" | "__start")
+}
+
+/// Name-only entry-point test (`isBinaryEntrySymbol` in Lean): `main`,
+/// `::main`, `<crate>::main`, `::<crate>::main`, `_start`, `<crate>::_start`,
+/// `__start`, and `<crate>::__start`.
+///
+/// Matching is on whole path segments with a validated crate segment, so
+/// `domain`, `maintain`, `main_loop`, `<crate>::Type::main`,
+/// `<MyType as Trait>::main`, `{{impl}}::main`, and `:::main` are rejected.
+/// This over-approximates [`classify_entry_point`] for callers that have no
+/// attribute information.
+pub fn is_binary_entry_symbol(def_path: &str) -> bool {
+    match split_entry_path(def_path) {
+        Some((None, leaf)) => is_entry_leaf_symbol(leaf),
+        Some((Some(crate_seg), leaf)) => {
+            is_valid_crate_segment(crate_seg) && is_entry_leaf_symbol(leaf)
+        }
+        None => false,
+    }
+}
+
+/// Classifies a crate-root item by its leaf name (`classifyEntryLeaf` in
+/// Lean): `main` is always an entry point, and `_start` / `__start` are entry
+/// points under `#![no_main]`.
+fn classify_entry_leaf(leaf: &str, crate_no_main: bool) -> Option<EntryPointKind> {
+    if leaf == "main" {
+        Some(if crate_no_main {
+            EntryPointKind::NoMainStart
+        } else {
+            EntryPointKind::Main
+        })
+    } else if crate_no_main && (leaf == "_start" || leaf == "__start") {
+        Some(EntryPointKind::NoMainStart)
+    } else {
+        None
+    }
+}
+
+/// Classifies an item by its definition path alone (`classifyEntryPath` in
+/// Lean): only crate-root items (`leaf`, `::leaf`, `<crate>::leaf`,
+/// `::<crate>::leaf` with a valid crate segment) can be entry points.
+pub fn classify_entry_path(def_path: &str, crate_no_main: bool) -> Option<EntryPointKind> {
+    match split_entry_path(def_path) {
+        Some((None, leaf)) => classify_entry_leaf(leaf, crate_no_main),
+        Some((Some(crate_seg), leaf)) if is_valid_crate_segment(crate_seg) => {
+            classify_entry_leaf(leaf, crate_no_main)
+        }
+        _ => None,
+    }
+}
+
+/// Classifies an item as a binary entry point (`classifyEntryPoint` in Lean):
+///
+/// 1. an associated function is an entry point only when it is exported
+///    under the link symbol `main`, `_start`, or `__start` (the linker does
+///    not see Rust namespaces); its path and attributes never make it one;
+/// 2. an entry attribute makes the item an [`EntryPointKind::EntryAttribute`]
+///    entry point;
+/// 3. an exported link symbol `main`, `_start`, or `__start` is an
+///    [`EntryPointKind::NoMainStart`] entry point;
+/// 4. otherwise the crate-root items `main` (always) and `_start` / `__start`
+///    (under `#![no_main]`) are entry points.
+pub fn classify_entry_point(desc: &EntryPointDescriptor<'_>) -> Option<EntryPointKind> {
+    let exported_entry_symbol = desc.link_symbol.is_some_and(is_entry_leaf_symbol);
+    if desc.is_assoc_fn {
+        return exported_entry_symbol.then_some(EntryPointKind::NoMainStart);
+    }
+    if desc.has_entry_attr {
+        return Some(EntryPointKind::EntryAttribute);
+    }
+    if exported_entry_symbol {
+        return Some(EntryPointKind::NoMainStart);
+    }
+    classify_entry_path(desc.def_path, desc.crate_no_main)
+}
+
+/// Maximum bracket nesting accepted by the trivial-`requires` scanner; deeper
+/// nesting fails closed.
+const MAX_TRIVIAL_REQUIRES_DEPTH: usize = 32;
+
+/// Strict form of [`is_syntactically_trivial_requires_in`]: reports malformed
+/// source instead of folding it into `false`.
+pub fn scan_trivial_requires(src: &str, syntax: SpecSyntax) -> Result<bool, SpecScanError> {
+    let mut lexer = SpecLexer::new(src, syntax);
+    let mut stack = [0u8; MAX_TRIVIAL_REQUIRES_DEPTH];
+    let mut depth = 0usize;
+    // True while the grammar expects a value: at the start, after an opening
+    // bracket, and after a comma.
+    let mut expect_value = true;
+    let mut seen_any = false;
+    while let Some(tok) = lexer.next_tok()? {
+        seen_any = true;
+        match tok {
+            SpecTok::Word(word)
+                if matches!(
+                    (syntax, word),
+                    (SpecSyntax::Rust, "true")
+                        | (SpecSyntax::Lean, "True")
+                        | (SpecSyntax::Any, "true" | "True")
+                ) =>
+            {
+                if !expect_value {
+                    return Ok(false);
+                }
+                expect_value = false;
+            }
+            SpecTok::Sym(open @ ("(" | "[")) => {
+                if !expect_value || depth == MAX_TRIVIAL_REQUIRES_DEPTH {
+                    return Ok(false);
+                }
+                stack[depth] = open.as_bytes()[0];
+                depth += 1;
+            }
+            SpecTok::Sym(")") => {
+                // A parenthesized value: `()` is the unit value, not `true`.
+                if depth == 0 || stack[depth - 1] != b'(' || expect_value {
+                    return Ok(false);
+                }
+                depth -= 1;
+            }
+            SpecTok::Sym("]") => {
+                // A list may be empty and may end in a trailing comma.
+                if depth == 0 || stack[depth - 1] != b'[' {
+                    return Ok(false);
+                }
+                depth -= 1;
+                expect_value = false;
+            }
+            SpecTok::Sym(",") => {
+                if depth == 0 || stack[depth - 1] != b'[' || expect_value {
+                    return Ok(false);
+                }
+                expect_value = true;
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(depth == 0 && (!seen_any || !expect_value))
+}
+
+/// Returns `true` iff the `requires` source `src` in dialect `syntax` is
+/// syntactically trivial: empty, `true` (Lean `True`), a parenthesized trivial
+/// clause, or a list `[…]` of trivial clauses.
+///
+/// Comments are ignored. Any other token, including a string literal or an
+/// operator, makes the clause non-trivial, and malformed source (an unclosed
+/// comment or literal, unbalanced brackets) fails closed with `false`.
+pub fn is_syntactically_trivial_requires_in(src: &str, syntax: SpecSyntax) -> bool {
+    matches!(scan_trivial_requires(src, syntax), Ok(true))
+}
+
+/// [`is_syntactically_trivial_requires_in`] for source of unknown dialect
+/// ([`SpecSyntax::Any`]): Rust and Lean comments are both ignored.
+pub fn is_syntactically_trivial_requires(src: &str) -> bool {
+    is_syntactically_trivial_requires_in(src, SpecSyntax::Any)
+}
+
+/// An authored `requires` clause together with its source dialect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RequiresClause<'a> {
+    /// Source text of the clause, without the `requires:` keyword.
+    pub source: &'a str,
+    /// Dialect the clause is written in.
+    pub syntax: SpecSyntax,
+}
+
+impl<'a> RequiresClause<'a> {
+    /// A Rust `requires` clause (`#[spec(requires: …)]`).
+    pub const fn rust(source: &'a str) -> Self {
+        Self {
+            source,
+            syntax: SpecSyntax::Rust,
+        }
+    }
+
+    /// A Lean precondition body (`def pre … : Prop := …`).
+    pub const fn lean(source: &'a str) -> Self {
+        Self {
+            source,
+            syntax: SpecSyntax::Lean,
+        }
+    }
+
+    /// A clause of unknown dialect.
+    pub const fn any(source: &'a str) -> Self {
+        Self {
+            source,
+            syntax: SpecSyntax::Any,
+        }
+    }
+
+    /// See [`is_syntactically_trivial_requires_in`].
+    pub fn is_syntactically_trivial(&self) -> bool {
+        is_syntactically_trivial_requires_in(self.source, self.syntax)
+    }
+}
+
+/// Why the entry-point `requires` guard rejected an entry point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EntryPointGuardViolationKind {
+    /// The entry point carries an authored `requires` clause that is not
+    /// syntactically trivial (or whose source is malformed).
+    ExplicitNonTrivialRequires,
+    /// The precondition rejected the ABI-admissible input sampled at
+    /// `trial_idx`.
+    PreconditionRejectedInput { trial_idx: usize },
+    /// The precondition trapped on the input sampled at `trial_idx`.
+    PreconditionTrapped { trial_idx: usize },
+    /// `max_trials == 0`: no input was sampled (fail-closed).
+    DegenerateConfig,
+}
+
+/// Structured report of an entry-point `requires` guard violation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EntryPointGuardViolation {
+    /// Always [`SpecBoundaryGuardClass::EntryPointPrecondition`].
+    pub guard: SpecBoundaryGuardClass,
+    /// How the item was classified as an entry point.
+    pub entry_kind: EntryPointKind,
+    /// What the guard found.
+    pub kind: EntryPointGuardViolationKind,
+    /// Number of inputs sampled before the violation.
+    pub trials_run: usize,
+    /// Number of sampled inputs the precondition admitted.
+    pub precondition_hits: usize,
+}
+
+impl EntryPointGuardViolation {
+    /// Frozen vacuity class of the violation
+    /// ([`VacuityClass::DeadPrecondition`]).
+    pub const fn vacuity_class(&self) -> VacuityClass {
+        self.guard.to_vacuity_class()
+    }
+
+    /// Index of the sampled input the precondition rejected or trapped on.
+    /// Pass it to [`replay_trial_input`] with the same [`SpecCheckConfig`] to
+    /// reconstruct the excluded ABI-admissible input.
+    pub const fn counterexample_trial(&self) -> Option<usize> {
+        match self.kind {
+            EntryPointGuardViolationKind::PreconditionRejectedInput { trial_idx }
+            | EntryPointGuardViolationKind::PreconditionTrapped { trial_idx } => Some(trial_idx),
+            EntryPointGuardViolationKind::ExplicitNonTrivialRequires
+            | EntryPointGuardViolationKind::DegenerateConfig => None,
+        }
+    }
+}
+
+/// Outcome of the entry-point `requires` guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EntryPointGuardOutcome {
+    /// The item is not a binary entry point; the guard does not apply and the
+    /// precondition was not evaluated.
+    NotEntryPoint,
+    /// The item is an entry point whose precondition held, without trapping,
+    /// on every sampled ABI-admissible input.
+    Guarded {
+        /// How the item was classified as an entry point.
+        entry_kind: EntryPointKind,
+        /// Number of inputs sampled.
+        trials_run: usize,
+    },
+    /// The item is an entry point that violates the guard.
+    Violation(EntryPointGuardViolation),
+}
+
+impl EntryPointGuardOutcome {
+    /// Returns `true` iff the guard found no violation.
+    pub const fn passes(&self) -> bool {
+        !matches!(self, Self::Violation(_))
+    }
+
+    /// Returns the violation, if any.
+    pub const fn violation(&self) -> Option<&EntryPointGuardViolation> {
+        match self {
+            Self::Violation(violation) => Some(violation),
+            Self::NotEntryPoint | Self::Guarded { .. } => None,
+        }
+    }
+
+    /// Returns the guard class of the violation, if any.
+    pub const fn guard_class(&self) -> Option<SpecBoundaryGuardClass> {
+        match self {
+            Self::Violation(violation) => Some(violation.guard),
+            Self::NotEntryPoint | Self::Guarded { .. } => None,
+        }
+    }
+
+    /// Converts the outcome into a `Result` carrying the entry-point kind
+    /// (`None` when the item is not an entry point).
+    pub const fn into_result(self) -> Result<Option<EntryPointKind>, EntryPointGuardViolation> {
+        match self {
+            Self::NotEntryPoint => Ok(None),
+            Self::Guarded { entry_kind, .. } => Ok(Some(entry_kind)),
+            Self::Violation(violation) => Err(violation),
+        }
+    }
+}
+
+/// Checks the entry-point `requires` guard with a precondition that may trap.
+///
+/// The input type `I` models the loader ABI: every value [`SampleInput`]
+/// produces is an initial state the operating system, C runtime, or reset
+/// vector may start the entry point in. The guard:
+///
+/// 1. returns [`EntryPointGuardOutcome::NotEntryPoint`] unless
+///    [`classify_entry_point`] accepts `desc`;
+/// 2. rejects an authored `requires` clause that is not syntactically trivial;
+/// 3. fails closed on `config.max_trials == 0`;
+/// 4. samples trials `0..config.max_trials` from the same stream as
+///    [`check_contract`] and requires `pre` to return `Ok(true)` on every one
+///    of them. A single rejected input or trap is a violation.
+///
+/// Only `config.seed` and `config.max_trials` are consulted.
+pub fn check_entry_point_requires_fallible<I, Pre>(
+    config: SpecCheckConfig,
+    desc: &EntryPointDescriptor<'_>,
+    requires: Option<RequiresClause<'_>>,
+    mut pre: Pre,
+) -> EntryPointGuardOutcome
+where
+    I: SampleInput,
+    Pre: FnMut(&I) -> Result<bool, ()>,
+{
+    let Some(entry_kind) = classify_entry_point(desc) else {
+        return EntryPointGuardOutcome::NotEntryPoint;
+    };
+    let violation = |kind, trials_run, precondition_hits| {
+        EntryPointGuardOutcome::Violation(EntryPointGuardViolation {
+            guard: SpecBoundaryGuardClass::EntryPointPrecondition,
+            entry_kind,
+            kind,
+            trials_run,
+            precondition_hits,
+        })
+    };
+
+    if let Some(clause) = requires
+        && !clause.is_syntactically_trivial()
+    {
+        return violation(
+            EntryPointGuardViolationKind::ExplicitNonTrivialRequires,
+            0,
+            0,
+        );
+    }
+    if config.max_trials == 0 {
+        return violation(EntryPointGuardViolationKind::DegenerateConfig, 0, 0);
+    }
+
+    let (mut rng, _) = stateless_streams(config.seed);
+    let mut precondition_hits = 0usize;
+    for trial_idx in 0..config.max_trials {
+        let input = I::sample_at(trial_idx, &mut rng);
+        match pre(&input) {
+            Ok(true) => precondition_hits += 1,
+            Ok(false) => {
+                return violation(
+                    EntryPointGuardViolationKind::PreconditionRejectedInput { trial_idx },
+                    trial_idx + 1,
+                    precondition_hits,
+                );
+            }
+            Err(()) => {
+                return violation(
+                    EntryPointGuardViolationKind::PreconditionTrapped { trial_idx },
+                    trial_idx + 1,
+                    precondition_hits,
+                );
+            }
+        }
+    }
+    EntryPointGuardOutcome::Guarded {
+        entry_kind,
+        trials_run: config.max_trials,
+    }
+}
+
+/// Checks the entry-point `requires` guard with an infallible precondition.
+/// See [`check_entry_point_requires_fallible`].
+pub fn check_entry_point_requires<I, Pre>(
+    config: SpecCheckConfig,
+    desc: &EntryPointDescriptor<'_>,
+    requires: Option<RequiresClause<'_>>,
+    mut pre: Pre,
+) -> EntryPointGuardOutcome
+where
+    I: SampleInput,
+    Pre: FnMut(&I) -> bool,
+{
+    check_entry_point_requires_fallible(config, desc, requires, |input: &I| Ok(pre(input)))
+}
+
+// ----------------------------------------------------------------------------
+// Guard 3: error-branch `true` wildcard (`awsm2`)
+// ----------------------------------------------------------------------------
+
+/// Four-branch semantic outcome of a fallible computation
+/// (`FallibleOutcome` in Lean).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SemanticOutcome<T, E> {
+    /// Successful completion with a value.
+    Ok(T),
+    /// Domain error with a payload.
+    Err(E),
+    /// Undefined behavior.
+    Ub,
+    /// Unsupported, fail-closed construct.
+    Unsupported,
+}
+
+impl<T, E> SemanticOutcome<T, E> {
+    /// Embeds a `Result`.
+    pub fn from_result(result: Result<T, E>) -> Self {
+        match result {
+            Ok(value) => Self::Ok(value),
+            Err(error) => Self::Err(error),
+        }
+    }
+
+    /// Projects back to a `Result`; `None` for [`Self::Ub`] and
+    /// [`Self::Unsupported`].
+    pub fn into_result(self) -> Option<Result<T, E>> {
+        match self {
+            Self::Ok(value) => Some(Ok(value)),
+            Self::Err(error) => Some(Err(error)),
+            Self::Ub | Self::Unsupported => None,
+        }
+    }
+
+    /// Which of the four branches this outcome is.
+    pub const fn branch(&self) -> OutcomeBranch {
+        match self {
+            Self::Ok(_) => OutcomeBranch::Ok,
+            Self::Err(_) => OutcomeBranch::Err,
+            Self::Ub => OutcomeBranch::Ub,
+            Self::Unsupported => OutcomeBranch::Unsupported,
+        }
+    }
+
+    /// Returns `true` for the operational faults [`Self::Ub`] and
+    /// [`Self::Unsupported`].
+    pub const fn is_fault(&self) -> bool {
+        matches!(self, Self::Ub | Self::Unsupported)
+    }
+}
+
+impl<T, E> From<Result<T, E>> for SemanticOutcome<T, E> {
+    fn from(result: Result<T, E>) -> Self {
+        Self::from_result(result)
+    }
+}
+
+impl<T: SampleInput, E: SampleInput> SampleInput for SemanticOutcome<T, E> {
+    const BOUNDARY_COUNT: usize = <Result<T, E> as SampleInput>::BOUNDARY_COUNT.saturating_add(2);
+
+    fn sample_at(trial_idx: usize, rng: &mut SplitMix64) -> Self {
+        let result_count = <Result<T, E> as SampleInput>::BOUNDARY_COUNT;
+        if trial_idx < result_count {
+            Self::from_result(<Result<T, E>>::sample_at(trial_idx, rng))
+        } else if trial_idx == result_count {
+            Self::Ub
+        } else if trial_idx == result_count.saturating_add(1) {
+            Self::Unsupported
+        } else {
+            match rng.next_u64() & 7 {
+                0 => Self::Ub,
+                1 => Self::Unsupported,
+                _ => Self::from_result(<Result<T, E>>::sample_at(trial_idx.max(result_count), rng)),
+            }
+        }
+    }
+}
+
+impl<T: SampleInput + ReturnMutants, E: SampleInput + ReturnMutants> ReturnMutants
+    for SemanticOutcome<T, E>
+{
+    // `Ub` and `Unsupported` are always two distinct inhabitants.
+    const IS_SUBSINGLETON: bool = false;
+
+    fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
+        let mut flip_rng = rng.fork();
+        match self {
+            Self::Ok(value) => {
+                let mut emitted_flips = false;
+                if !T::IS_SUBSINGLETON {
+                    value.visit_mutants(rng, |mutant| {
+                        emit(Self::Ok(mutant));
+                        if !emitted_flips {
+                            emitted_flips = true;
+                            // Emit the fault and error flips right after the
+                            // first payload mutant so small budgets test
+                            // every branch.
+                            emit(Self::Ub);
+                            emit(Self::Unsupported);
+                            emit_variant_flip_samples(&mut flip_rng, Self::Err, &mut emit);
+                        }
+                    });
+                }
+                if !emitted_flips {
+                    emit(Self::Ub);
+                    emit(Self::Unsupported);
+                    emit_variant_flip_samples(&mut flip_rng, Self::Err, &mut emit);
+                }
+            }
+            Self::Err(error) => {
+                let mut emitted_flips = false;
+                if !E::IS_SUBSINGLETON {
+                    error.visit_mutants(rng, |mutant| {
+                        emit(Self::Err(mutant));
+                        if !emitted_flips {
+                            emitted_flips = true;
+                            emit(Self::Ub);
+                            emit(Self::Unsupported);
+                            emit_variant_flip_samples(&mut flip_rng, Self::Ok, &mut emit);
+                        }
+                    });
+                }
+                if !emitted_flips {
+                    emit(Self::Ub);
+                    emit(Self::Unsupported);
+                    emit_variant_flip_samples(&mut flip_rng, Self::Ok, &mut emit);
+                }
+            }
+            Self::Ub => {
+                emit(Self::Unsupported);
+                emit_variant_flip_samples(&mut flip_rng, Self::Ok, &mut emit);
+                emit_variant_flip_samples(&mut flip_rng, Self::Err, &mut emit);
+            }
+            Self::Unsupported => {
+                emit(Self::Ub);
+                emit_variant_flip_samples(&mut flip_rng, Self::Ok, &mut emit);
+                emit_variant_flip_samples(&mut flip_rng, Self::Err, &mut emit);
+            }
+        }
+    }
+}
+
+/// Branch of a fallible outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OutcomeBranch {
+    /// Successful completion.
+    Ok,
+    /// Domain error.
+    Err,
+    /// Undefined behavior.
+    Ub,
+    /// Unsupported construct.
+    Unsupported,
+}
+
+/// Outcome types whose error and fault branches the error-branch wildcard
+/// probes can construct and inspect: `Result<T, E>` and
+/// [`SemanticOutcome<T, E>`].
+pub trait ErrorBranchOutcome: Sized {
+    /// Error payload type.
+    type Error;
+
+    /// Which branch this outcome is.
+    fn branch(&self) -> OutcomeBranch;
+
+    /// The error payload of an error outcome.
+    fn error_payload(&self) -> Option<&Self::Error>;
+
+    /// Builds the error outcome carrying `error`.
+    fn from_error(error: Self::Error) -> Self;
+
+    /// The undefined-behavior outcome, when the type has one.
+    fn ub() -> Option<Self>;
+
+    /// The unsupported-construct outcome, when the type has one.
+    fn unsupported() -> Option<Self>;
+}
+
+impl<T, E> ErrorBranchOutcome for Result<T, E> {
+    type Error = E;
+
+    fn branch(&self) -> OutcomeBranch {
+        match self {
+            Ok(_) => OutcomeBranch::Ok,
+            Err(_) => OutcomeBranch::Err,
+        }
+    }
+
+    fn error_payload(&self) -> Option<&E> {
+        self.as_ref().err()
+    }
+
+    fn from_error(error: E) -> Self {
+        Err(error)
+    }
+
+    fn ub() -> Option<Self> {
+        None
+    }
+
+    fn unsupported() -> Option<Self> {
+        None
+    }
+}
+
+impl<T, E> ErrorBranchOutcome for SemanticOutcome<T, E> {
+    type Error = E;
+
+    fn branch(&self) -> OutcomeBranch {
+        SemanticOutcome::branch(self)
+    }
+
+    fn error_payload(&self) -> Option<&E> {
+        match self {
+            Self::Err(error) => Some(error),
+            Self::Ok(_) | Self::Ub | Self::Unsupported => None,
+        }
+    }
+
+    fn from_error(error: E) -> Self {
+        Self::Err(error)
+    }
+
+    fn ub() -> Option<Self> {
+        Some(Self::Ub)
+    }
+
+    fn unsupported() -> Option<Self> {
+        Some(Self::Unsupported)
+    }
+}
+
+/// Syntactic shape of an error-branch wildcard found in postcondition source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ErrorWildcardPattern {
+    /// A match arm accepting every error payload: `Err(_) => true`,
+    /// `Err(..) => true`, `Err(e) => true`, `| Err _ => True`,
+    /// `| .err _ => True`, `| .error _ => True`.
+    ErrArmTrue,
+    /// A match arm accepting undefined behavior: `| .ub => True`,
+    /// `| .fail .ub => True`, `| .fail _ => True`, `Ub => true`.
+    UbArmTrue,
+    /// A match arm accepting an unsupported construct:
+    /// `| .unsupported => True`, `Unsupported => true`.
+    UnsupportedArmTrue,
+    /// A `matches!` whose pattern accepts every error payload:
+    /// `matches!(out, Ok(_) | Err(_))`.
+    MatchesAnyErr,
+    /// A catch-all arm `_ => true` in a postcondition that also matches an
+    /// `Ok` constructor, so the catch-all covers the error branches.
+    CatchAllArmTrue,
+    /// The source is malformed (an unclosed comment or literal): the scanner
+    /// cannot tell code from text and fails closed.
+    UnclosedLiteralOrComment,
+}
+
+impl ErrorWildcardPattern {
+    /// Short wire identifier of the pattern.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ErrArmTrue => "err_arm_true",
+            Self::UbArmTrue => "ub_arm_true",
+            Self::UnsupportedArmTrue => "unsupported_arm_true",
+            Self::MatchesAnyErr => "matches_any_err",
+            Self::CatchAllArmTrue => "catch_all_arm_true",
+            Self::UnclosedLiteralOrComment => "unclosed_literal_or_comment",
+        }
+    }
+
+    /// The guard class every pattern reports under
+    /// ([`SpecBoundaryGuardClass::ErrorBranchWildcard`]).
+    pub const fn guard_class(self) -> SpecBoundaryGuardClass {
+        SpecBoundaryGuardClass::ErrorBranchWildcard
+    }
+}
+
+impl fmt::Display for ErrorWildcardPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error-like constructor an arm alternative accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorCtor {
+    /// `Err`, `.err`, `.error`.
+    Err,
+    /// `Ub`, `.ub`.
+    Ub,
+    /// `Unsupported`, `.unsupported`.
+    Unsupported,
+    /// `.fail`: every failure kind, undefined behavior included.
+    Fail,
+}
+
+impl ErrorCtor {
+    /// Recognizes an error constructor. Capitalized names stand on their own
+    /// (`Err`, `Result::Err`, `SemanticOutcome::Ub`); lowercase names are
+    /// constructors only in dotted position (`.err`, `Except.error`), since a
+    /// bare lowercase word is a variable.
+    fn of(word: &str, after_dot: bool) -> Option<Self> {
+        match word {
+            "Err" => Some(Self::Err),
+            "Ub" | "UB" => Some(Self::Ub),
+            "Unsupported" => Some(Self::Unsupported),
+            "err" | "error" if after_dot => Some(Self::Err),
+            "ub" if after_dot => Some(Self::Ub),
+            "unsupported" if after_dot => Some(Self::Unsupported),
+            "fail" if after_dot => Some(Self::Fail),
+            _ => None,
+        }
+    }
+
+    const fn pattern(self) -> ErrorWildcardPattern {
+        match self {
+            Self::Err => ErrorWildcardPattern::ErrArmTrue,
+            Self::Ub | Self::Fail => ErrorWildcardPattern::UbArmTrue,
+            Self::Unsupported => ErrorWildcardPattern::UnsupportedArmTrue,
+        }
+    }
+}
+
+/// Returns `true` when `word`, appearing as an error payload, binds or ignores
+/// the payload instead of constraining it: `_`, `_e`, `e`, `ref`, `mut`.
+/// Capitalized names (constructors, types), numeric literals, and the boolean
+/// literals constrain it.
+fn is_wildcard_payload_word(word: &str) -> bool {
+    if matches!(word, "true" | "false") {
+        return false;
+    }
+    match word.chars().next() {
+        Some(first) => first == '_' || (!first.is_uppercase() && !first.is_numeric()),
+        None => true,
+    }
+}
+
+/// Returns `true` when `word`, standing alone as a pattern alternative, binds
+/// every value: `_`, `_rest`, `e`, `other`. Capitalized names (constructors,
+/// constants), numeric and boolean literals, and the lowercase Lean
+/// constructors of `Option`, `List`, `Nat`, and `Unit` are specific patterns.
+fn is_catch_all_binder_word(word: &str) -> bool {
+    if matches!(
+        word,
+        "true" | "false" | "none" | "some" | "nil" | "zero" | "unit"
+    ) {
+        return false;
+    }
+    word.chars()
+        .next()
+        .is_some_and(|first| first == '_' || first.is_lowercase())
+}
+
+/// Maximum nested catch-all parenthesis levels tracked per pattern alternative
+/// (`(((_, _), _))`).
+const MAX_CATCH_ALL_PAREN_DEPTH: usize = 8;
+
+/// Per-parenthesis-level tuple and or-pattern catch-all state so nested
+/// parenthesized patterns (`(_, ())`, `(_, (a, b) | (0, 1))`) never leak into
+/// or overwrite an enclosing tuple's state.
+#[derive(Clone, Copy, Debug, Default)]
+struct CatchAllParenFrame {
+    /// An earlier `|` alternative of the current component was a catch-all.
+    or_wild: bool,
+    /// A `,` was seen directly inside this parenthesis group (it is a tuple).
+    tuple_started: bool,
+    /// Every completed component of this tuple was a catch-all.
+    tuple_wild: bool,
+}
+
+/// One pattern alternative of a match arm (the text between two `|`), or the
+/// arm body that follows `=>`.
+#[derive(Clone, Copy, Debug, Default)]
+struct ArmAlternative {
+    /// Brackets opened and not yet closed around the scan position.
+    depth: u32,
+    /// Bracket depth at which this match arm's pattern began (e.g. `1` inside
+    /// `(match r with | …)`).
+    arm_base_depth: u32,
+    /// Number of outer grouping parentheses `(` opened around a catch-all
+    /// pattern (`(_)`, `((e))`, `(_ : T)`, `(_, _)`).
+    catch_all_parens: u32,
+    /// Number of tokens.
+    tokens: u32,
+    /// The alternative is exactly a catch-all so far: `_`, a bare binding
+    /// (`e`, `other`), or a binding behind `&` / `ref` / `mut` / `(...)` /
+    /// Lean type ascription `(_ : T)`.
+    catch_all: bool,
+    /// Every token so far is a `&` / `ref` / `mut` / `(` catch-all modifier.
+    only_modifiers: bool,
+    /// Innermost error constructor seen.
+    error_ctor: Option<ErrorCtor>,
+    /// Bracket depth at which `error_ctor` was encountered.
+    error_ctor_depth: Option<u32>,
+    /// The error payload is constrained (a constructor, literal, or path).
+    constrained: bool,
+    /// Bracket depth of a Lean type ascription `(_ : Type)` inside an
+    /// unconstrained error payload or catch-all; tokens at `depth >= d` are
+    /// type syntax.
+    type_ascription_depth: Option<u32>,
+    /// The alternative began right after `=>`: it is an arm body, not a
+    /// pattern.
+    after_arrow: bool,
+    /// Bracket depth at which the arm body began. A `|` at this depth ends
+    /// the body and starts the next arm; a deeper `|` belongs to the body
+    /// (`(a ||| b)`, a Rust closure `|x| …`).
+    body_depth: u32,
+    /// Scanning a Lean `fun … =>` / `λ … =>` lambda binder list rather than a
+    /// match arm.
+    in_lambda: bool,
+    /// Bracket depth just inside the outermost struct-pattern brace around
+    /// the scan position (`W { r: Err(_) }`, Lean `{ val := .err _ }`); a
+    /// `:=` at or below it separates a field from its pattern.
+    struct_pattern_depth: Option<u32>,
+    /// Stack of per-level tuple/or catch-all frames for the active
+    /// `catch_all_parens` levels (`0..catch_all_parens`).
+    paren_frames: [CatchAllParenFrame; MAX_CATCH_ALL_PAREN_DEPTH],
+}
+
+impl ArmAlternative {
+    /// A fresh pattern alternative starting a new arm at bracket depth `depth`.
+    fn pattern(depth: u32) -> Self {
+        Self {
+            depth,
+            arm_base_depth: depth,
+            ..Self::default()
+        }
+    }
+
+    /// The next `|` / sibling alternative inside the same arm, preserving the
+    /// arm's base depth, the enclosing struct pattern, and `catch_all_parens`
+    /// outer catch-all parentheses (along with their active frames).
+    fn next_alt(&self, catch_all_parens: u32) -> Self {
+        let mut next = Self {
+            depth: self.depth,
+            arm_base_depth: self.arm_base_depth,
+            catch_all_parens,
+            struct_pattern_depth: self.struct_pattern_depth,
+            ..Self::default()
+        };
+        let keep = (catch_all_parens as usize).min(MAX_CATCH_ALL_PAREN_DEPTH);
+        next.paren_frames[..keep].copy_from_slice(&self.paren_frames[..keep]);
+        next
+    }
+
+    /// Whether the scan position is directly inside the outer catch-all
+    /// parentheses (not in a nested bracket).
+    fn at_catch_all_paren_level(&self) -> bool {
+        self.catch_all_parens > 0 && self.depth == self.arm_base_depth + self.catch_all_parens
+    }
+
+    /// Mutable reference to the innermost active catch-all paren frame.
+    fn top_paren_frame_mut(&mut self) -> Option<&mut CatchAllParenFrame> {
+        let idx = self.catch_all_parens.checked_sub(1)? as usize;
+        self.paren_frames.get_mut(idx)
+    }
+
+    /// An arm body beginning at bracket depth `depth`.
+    fn body(depth: u32) -> Self {
+        Self {
+            depth,
+            arm_base_depth: depth,
+            after_arrow: true,
+            body_depth: depth,
+            ..Self::default()
+        }
+    }
+
+    /// Records a pattern token that is not an identifier.
+    fn push_non_word(&mut self) {
+        self.tokens += 1;
+        self.catch_all = false;
+        self.only_modifiers = false;
+    }
+}
+
+/// Accumulated facts about the alternatives of the arm being scanned.
+#[derive(Clone, Copy, Debug, Default)]
+struct ArmState {
+    /// First alternative that accepts an error constructor with an
+    /// unconstrained payload.
+    wildcard: Option<ErrorCtor>,
+    /// Some alternative is a catch-all (`_` or a bare binding).
+    catch_all: bool,
+    /// A Rust `if` guard follows the pattern.
+    guarded: bool,
+    /// Number of guard tokens.
+    guard_tokens: u32,
+    /// The guard is the literal `true`.
+    guard_trivial: bool,
+}
+
+impl ArmState {
+    fn absorb(&mut self, alt: &ArmAlternative) {
+        if alt.tokens == 0 || alt.after_arrow || alt.in_lambda {
+            return;
+        }
+        if self.wildcard.is_none()
+            && !alt.constrained
+            && let Some(ctor) = alt.error_ctor
+        {
+            self.wildcard = Some(ctor);
+        }
+        if alt.catch_all {
+            self.catch_all = true;
+        }
+    }
+
+    const fn guard_blocks(&self) -> bool {
+        self.guarded && !(self.guard_tokens == 1 && self.guard_trivial)
+    }
+}
+
+/// Kind of a scope tracked for [`ErrorWildcardPattern::CatchAllArmTrue`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OkScopeKind {
+    /// A `{ … }` block; `saved_depth` is the bracket depth around it,
+    /// restored when the block closes.
+    Brace { saved_depth: u32 },
+    /// The arms of a Lean `match … with` opened at bracket depth `depth`.
+    /// A Lean match has no terminator: its arms extend to the bracket
+    /// closing that depth, to the brace closing the enclosing block, or to
+    /// the next declaration.
+    LeanMatch { depth: u32 },
+}
+
+/// One entry of [`OkScopes`].
+#[derive(Clone, Copy, Debug)]
+struct OkScope {
+    kind: OkScopeKind,
+    /// The scope matched an `Ok` constructor.
+    saw_ok: bool,
+}
+
+/// Maximum nested `{ … }` / Lean `match … with` scopes tracked for
+/// `CatchAllArmTrue`.
+const MAX_OK_SCOPE_DEPTH: usize = 32;
+
+/// Fixed-capacity stack of the scopes enclosing the scan position. A
+/// catch-all arm is an error wildcard only when its own scope also matches an
+/// `Ok` constructor, so an inner `match n { 0 => false, _ => true }` never
+/// inherits the `Ok` of the result match around it.
+#[derive(Clone, Copy, Debug)]
+struct OkScopes {
+    /// `saw_ok` of the outermost (unbracketed) scope.
+    root_saw_ok: bool,
+    stack: [OkScope; MAX_OK_SCOPE_DEPTH],
+    len: usize,
+    /// Brace scopes opened beyond the capacity of `stack`.
+    overflow: u32,
+}
+
+impl OkScopes {
+    const fn new() -> Self {
+        Self {
+            root_saw_ok: false,
+            stack: [OkScope {
+                kind: OkScopeKind::Brace { saved_depth: 0 },
+                saw_ok: false,
+            }; MAX_OK_SCOPE_DEPTH],
+            len: 0,
+            overflow: 0,
+        }
+    }
+
+    /// Records an `Ok` constructor in the innermost scope.
+    fn mark_ok(&mut self) {
+        if self.overflow > 0 {
+            return;
+        }
+        match self.len {
+            0 => self.root_saw_ok = true,
+            len => self.stack[len - 1].saw_ok = true,
+        }
+    }
+
+    /// Whether the innermost scope matched an `Ok` constructor. Scopes nested
+    /// beyond the tracked capacity answer `true` (fail closed).
+    fn saw_ok(&self) -> bool {
+        self.overflow > 0
+            || match self.len {
+                0 => self.root_saw_ok,
+                len => self.stack[len - 1].saw_ok,
+            }
+    }
+
+    fn push(&mut self, kind: OkScopeKind) {
+        if self.len < MAX_OK_SCOPE_DEPTH {
+            self.stack[self.len] = OkScope {
+                kind,
+                saw_ok: false,
+            };
+            self.len += 1;
+        } else if matches!(kind, OkScopeKind::Brace { .. }) {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+    }
+
+    /// Closes the innermost brace scope above `floor`, together with the Lean
+    /// matches opened inside it, and returns the bracket depth to restore.
+    /// Returns `None` when no brace scope is open above `floor`.
+    fn pop_brace(&mut self, floor: usize) -> Option<u32> {
+        if self.overflow > 0 {
+            self.overflow -= 1;
+            return Some(0);
+        }
+        let mut idx = self.len;
+        while idx > floor {
+            idx -= 1;
+            if let OkScopeKind::Brace { saved_depth } = self.stack[idx].kind {
+                self.len = idx;
+                return Some(saved_depth);
+            }
+        }
+        None
+    }
+
+    /// Closes the innermost Lean matches opened at a bracket depth of at
+    /// least `min_depth`.
+    fn close_lean_matches(&mut self, min_depth: u32) {
+        if self.overflow > 0 {
+            return;
+        }
+        while self.len > 0
+            && matches!(
+                self.stack[self.len - 1].kind,
+                OkScopeKind::LeanMatch { depth } if depth >= min_depth
+            )
+        {
+            self.len -= 1;
+        }
+    }
+
+    /// A new top-level declaration begins: every open Lean match ends, and
+    /// the outermost scope forgets the `Ok` of the previous declaration.
+    fn begin_declaration(&mut self) {
+        self.close_lean_matches(0);
+        if self.len == 0 && self.overflow == 0 {
+            self.root_saw_ok = false;
+        }
+    }
+}
+
+/// Position of the scanner relative to a `matches!(scrutinee, pattern)` call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatchesState {
+    /// Not inside a `matches!` call.
+    Outside,
+    /// Inside the scrutinee expression, at bracket depth `depth`.
+    Scrutinee { depth: u32 },
+    /// Inside the pattern.
+    Pattern,
+}
+
+/// Returns `true` when the operator following a trivially true arm body
+/// combines it into a body that is no longer trivially true (`true && p`,
+/// `True ∧ P`, `True → P`, `true == p`).
+fn is_constraining_continuation(tok: SpecTok<'_>) -> bool {
+    match tok {
+        SpecTok::Sym(sym) => matches!(
+            sym,
+            "&&" | "&"
+                | "∧"
+                | "/\\"
+                | "->"
+                | "→"
+                | "↔"
+                | "<->"
+                | "="
+                | "=="
+                | "!="
+                | "≠"
+                | "==>"
+                | "."
+                | "?"
+                | "^"
+                | "<"
+                | ">"
+                | "<="
+                | ">="
+                | "≤"
+                | "≥"
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "@"
+        ),
+        SpecTok::PathSep | SpecTok::DotDot => true,
+        SpecTok::Word(word) => matches!(word, "as" | "and"),
+        SpecTok::Literal | SpecTok::FatArrow => false,
+    }
+}
+
+/// Maximum number of `&&` / `∧` terms unfolded in a trivially-true arm body.
+const MAX_TRIVIAL_CONJUNCTS: usize = 8;
+
+/// Maximum nesting of parenthesized / braced expressions inspected inside a
+/// trivially-true arm body.
+const MAX_TRIVIAL_EXPR_DEPTH: u32 = 8;
+
+/// Maximum tokens scanned while inspecting disjunctions inside an arm body.
+const MAX_ARM_BODY_SCAN_TOKENS: usize = 128;
+
+fn is_disjunction_tok(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("||" | "∨" | "\\/") | SpecTok::Word("or"))
+}
+
+fn is_conjunction_tok(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("&&" | "∧" | "/\\") | SpecTok::Word("and"))
+}
+
+fn is_implication_tok(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("->" | "→" | "==>"))
+}
+
+fn is_biconditional_tok(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("↔" | "<->"))
+}
+
+/// Whether `tok` (followed by `next`) ends an arm body that no bracket
+/// closes: the next arm, a statement or item boundary, or the next top-level
+/// command of a Lean module (`#eval …`, `@[simp] theorem …`, `namespace …`).
+/// Scanning past it would attribute unrelated code to the arm.
+fn is_arm_body_terminator(tok: SpecTok<'_>, next: Option<SpecTok<'_>>) -> bool {
+    match tok {
+        SpecTok::FatArrow => true,
+        SpecTok::Sym("," | "|" | ";" | ")" | "]" | "}" | "#") => true,
+        SpecTok::Sym("@") => matches!(next, Some(SpecTok::Sym("["))),
+        SpecTok::Word(word) => {
+            is_lean_decl_reset_word(word)
+                || matches!(
+                    word,
+                    "fn" | "pub"
+                        | "struct"
+                        | "enum"
+                        | "impl"
+                        | "trait"
+                        | "mod"
+                        | "use"
+                        | "const"
+                        | "static"
+                        | "type"
+                        | "where"
+                        | "end"
+                        | "namespace"
+                        | "section"
+                        | "open"
+                        | "export"
+                        | "import"
+                        | "variable"
+                        | "universe"
+                        | "set_option"
+                        | "attribute"
+                        | "class"
+                        | "mutual"
+                        | "noncomputable"
+                        | "private"
+                        | "protected"
+                        | "local"
+                        | "scoped"
+                        | "notation"
+                        | "infix"
+                        | "infixl"
+                        | "infixr"
+                        | "prefix"
+                        | "postfix"
+                        | "macro"
+                        | "syntax"
+                        | "deriving"
+                        | "termination_by"
+                        | "decreasing_by"
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Whether `tok` starts a construct that extends as far to the right as
+/// possible (`if … then … else e`, `fun x => e`, `∀ x, e`, `let x := v; e`):
+/// a later disjunction belongs to that construct, not to the whole body, so
+/// `if c then False else P ∨ True` is not a disjunction with `True`.
+fn extends_to_the_right(tok: SpecTok<'_>) -> bool {
+    matches!(
+        tok,
+        SpecTok::Word(
+            "if" | "then"
+                | "else"
+                | "fun"
+                | "λ"
+                | "match"
+                | "let"
+                | "have"
+                | "show"
+                | "from"
+                | "do"
+                | "forall"
+                | "exists"
+        ) | SpecTok::Sym("∀" | "∃" | "Σ" | "∑" | "∏")
+    )
+}
+
+/// Whether the token at `look` continues the preceding operand as a function
+/// application, Lean bitwise-OR (`|||`), Lean pipeline (`|>`), or literal
+/// suffix (Lean `f = f x`, `n = n ||| 1`, `x = x |> f`), so that the operand
+/// is not complete yet.
+fn continues_as_application(mut look: SpecLexer<'_>) -> Result<bool, SpecScanError> {
+    let Some(tok) = look.next_tok()? else {
+        return Ok(false);
+    };
+    Ok(match tok {
+        SpecTok::Literal | SpecTok::Sym("(" | "[" | "⟨" | "@") => true,
+        SpecTok::Sym("||") => matches!(look.next_tok()?, Some(SpecTok::Sym("|"))),
+        SpecTok::Sym("|") => matches!(look.next_tok()?, Some(SpecTok::Sym(">"))),
+        SpecTok::Word(word) => {
+            !matches!(word, "as" | "and" | "or" | "then" | "else")
+                && !is_arm_body_terminator(tok, look.next_tok()?)
+        }
+        _ => false,
+    })
+}
+
+/// Whether `tok` keeps a `let` statement benign: it only names, projects,
+/// borrows, dereferences, or copies values, so the statement can neither
+/// panic nor diverge nor return early (`let _ = e;`, `let code = &e.code;`,
+/// `let _ = *e;`). Calls, macros, indexing, blocks, control flow, and
+/// arithmetic may constrain the outcome (`check(e)?;`, `let _ = 1 / *e;`,
+/// `let _ = *e + 1;` panics on overflow in a debug build).
+/// `prev_is_operand` tells a multiplication from a prefix `*`.
+fn keeps_statement_benign(tok: SpecTok<'_>, prev_is_operand: bool) -> bool {
+    match tok {
+        SpecTok::Literal | SpecTok::PathSep => true,
+        SpecTok::FatArrow | SpecTok::DotDot => false,
+        SpecTok::Word(word) => !matches!(
+            word,
+            "match"
+                | "if"
+                | "else"
+                | "loop"
+                | "while"
+                | "for"
+                | "return"
+                | "break"
+                | "continue"
+                | "unsafe"
+                | "await"
+                | "async"
+                | "move"
+                | "yield"
+        ),
+        SpecTok::Sym(sym) => match sym {
+            "=" | "." | "&" | ":" => true,
+            "*" => !prev_is_operand,
+            _ => false,
+        },
+    }
+}
+
+/// Maximum tokens in one side of a reflexive equality atom (`*e == *e`,
+/// `e.code == e.code`, `0 = 0`): up to 2 deref/ref prefixes + 1 word + up to
+/// 4 `.field` projections.
+const MAX_REFLEXIVE_OPERAND_TOKS: usize = 12;
+
+/// Consumes a simple reflexive operand (`e`, `0`, `*e`, `&e`, `e.code`) into
+/// `out`, returning the number of tokens stored (`0` when `first` does not
+/// start such an operand).
+fn consume_reflexive_operand<'a>(
+    look: &mut SpecLexer<'a>,
+    first: SpecTok<'a>,
+    out: &mut [SpecTok<'a>; MAX_REFLEXIVE_OPERAND_TOKS],
+) -> Result<usize, SpecScanError> {
+    let mut len = 0usize;
+    let mut tok = first;
+    for _ in 0..2 {
+        if matches!(tok, SpecTok::Sym("*" | "&")) {
+            out[len] = tok;
+            len += 1;
+            let Some(next) = look.next_tok()? else {
+                return Ok(0);
+            };
+            tok = next;
+        } else {
+            break;
+        }
+    }
+    if !matches!(tok, SpecTok::Word(_)) {
+        return Ok(0);
+    }
+    out[len] = tok;
+    len += 1;
+    for _ in 0..4 {
+        let mut dot_probe = *look;
+        if dot_probe.next_tok()? == Some(SpecTok::Sym("."))
+            && let Some(field @ SpecTok::Word(_)) = dot_probe.next_tok()?
+            && len + 2 <= MAX_REFLEXIVE_OPERAND_TOKS
+        {
+            out[len] = SpecTok::Sym(".");
+            out[len + 1] = field;
+            len += 2;
+            *look = dot_probe;
+        } else {
+            break;
+        }
+    }
+    Ok(len)
+}
+
+/// Consumes a reflexive comparison of identical simple operands (`e == e`,
+/// `*e == *e`, `e.code == e.code`, `0 = 0`, `false == false`) not continued by
+/// an application or Lean `|||` / `|>` operator.
+fn consume_reflexive_path_eq<'a>(
+    look: &mut SpecLexer<'a>,
+    first: SpecTok<'a>,
+) -> Result<bool, SpecScanError> {
+    let mut eq = *look;
+    let mut lhs = [SpecTok::Literal; MAX_REFLEXIVE_OPERAND_TOKS];
+    let len = consume_reflexive_operand(&mut eq, first, &mut lhs)?;
+    if len == 0 {
+        return Ok(false);
+    }
+    if !matches!(eq.next_tok()?, Some(SpecTok::Sym("==" | "="))) {
+        return Ok(false);
+    }
+    for expected in &lhs[..len] {
+        if eq.next_tok()? != Some(*expected) {
+            return Ok(false);
+        }
+    }
+    if continues_as_application(eq)? {
+        return Ok(false);
+    }
+    *look = eq;
+    Ok(true)
+}
+
+/// Consumes one trivially-true boolean/Prop atom (`true`, `True`, `trivial`,
+/// `!false`, `¬False`, `Not False`, reflexive equality `e == e` / `*e == *e` /
+/// `e.code = e.code`, or a parenthesized/braced trivially-true expression,
+/// optionally preceded by `return`/`by` and followed by `as bool`).
+/// Returns `Ok(true)` iff such an atom was consumed; `look` is left right
+/// after it.
+fn consume_trivial_true_atom(look: &mut SpecLexer<'_>, depth: u32) -> Result<bool, SpecScanError> {
+    if depth == 0 {
+        return Ok(false);
+    }
+    let mut probe = *look;
+    let mut tok = probe.next_tok()?;
+    while matches!(tok, Some(SpecTok::Word("return" | "by"))) {
+        tok = probe.next_tok()?;
+    }
+    let matched = match tok {
+        Some(SpecTok::Sym("(")) => expr_is_trivially_true(&mut probe, Some(")"), depth - 1)?,
+        Some(SpecTok::Sym("{")) => expr_is_trivially_true(&mut probe, Some("}"), depth - 1)?,
+        Some(SpecTok::Sym("!")) => {
+            let next = probe.next_tok()?;
+            matches!(next, Some(SpecTok::Word("false")))
+                || (next == Some(SpecTok::Sym("!"))
+                    && consume_trivial_true_atom(&mut probe, depth - 1)?)
+        }
+        Some(SpecTok::Sym("¬") | SpecTok::Word("Not")) => {
+            let next = probe.next_tok()?;
+            matches!(next, Some(SpecTok::Word("False")))
+                || (matches!(next, Some(SpecTok::Sym("¬") | SpecTok::Word("Not")))
+                    && consume_trivial_true_atom(&mut probe, depth - 1)?)
+        }
+        Some(first @ (SpecTok::Word(_) | SpecTok::Sym("*" | "&"))) => {
+            consume_reflexive_path_eq(&mut probe, first)?
+                || matches!(first, SpecTok::Word("true" | "True" | "trivial"))
+        }
+        _ => false,
+    };
+    if !matched {
+        return Ok(false);
+    }
+    // Consume an optional `as bool` cast.
+    let mut cast_probe = probe;
+    if matches!(cast_probe.next_tok()?, Some(SpecTok::Word("as")))
+        && matches!(cast_probe.next_tok()?, Some(SpecTok::Word("bool")))
+    {
+        probe = cast_probe;
+    }
+    *look = probe;
+    Ok(true)
+}
+
+/// Whether `tok` (followed by `next`) may follow a trivially-true operand
+/// without making it part of a larger term: the end of the body, a closing
+/// bracket, a separator, or a connective the caller evaluates (`||`, `→`,
+/// `↔`). Any other operator binds the operand into a term the scanner cannot
+/// evaluate (`f = f ∘ g`, `s = s ∪ t`, Rust `e == e | m`), so the operand is
+/// not the value of the body. `|` starts the next arm in Lean and is bitwise
+/// or in Rust (`rust`).
+fn may_follow_trivial_atom(tok: SpecTok<'_>, next: Option<SpecTok<'_>>, rust: bool) -> bool {
+    match tok {
+        SpecTok::FatArrow => true,
+        SpecTok::Literal | SpecTok::PathSep | SpecTok::DotDot => false,
+        SpecTok::Word(_) => !is_constraining_continuation(tok),
+        SpecTok::Sym(sym) => match sym {
+            ")" | "]" | "}" | "⟩" | "," | ";" | "#" | ":=" => true,
+            // Lean `|||` is an operator, `||` a disjunction.
+            "||" => !matches!(next, Some(SpecTok::Sym("|"))),
+            // Lean `|>` is the pipeline operator.
+            "|" => !rust && !matches!(next, Some(SpecTok::Sym(">"))),
+            "@" => matches!(next, Some(SpecTok::Sym("["))),
+            _ => is_disjunction_tok(tok) || is_implication_tok(tok) || is_biconditional_tok(tok),
+        },
+    }
+}
+
+/// Consumes a conjunction of trivially-true atoms (`true && true`,
+/// `(True ∧ True)`, optionally followed by `as bool` or a parenthesized
+/// `: Prop` / `: Bool` ascription) that is not continued by a constraining
+/// operator.
+fn consume_trivial_conjunction(
+    look: &mut SpecLexer<'_>,
+    allow_type_ascription: bool,
+    depth: u32,
+) -> Result<bool, SpecScanError> {
+    let mut probe = *look;
+    if !consume_trivial_true_atom(&mut probe, depth)? {
+        return Ok(false);
+    }
+    for _ in 0..MAX_TRIVIAL_CONJUNCTS {
+        let mut next_probe = probe;
+        let next = next_probe.next_tok()?;
+        match next {
+            Some(tok) if is_conjunction_tok(tok) => {
+                if !consume_trivial_true_atom(&mut next_probe, depth)? {
+                    return Ok(false);
+                }
+                probe = next_probe;
+            }
+            Some(SpecTok::Word("as")) => {
+                if matches!(next_probe.next_tok()?, Some(SpecTok::Word("bool"))) {
+                    probe = next_probe;
+                } else {
+                    return Ok(false);
+                }
+            }
+            Some(SpecTok::Sym(":")) if allow_type_ascription => {
+                if matches!(
+                    next_probe.next_tok()?,
+                    Some(SpecTok::Word("Prop" | "Bool" | "bool"))
+                ) {
+                    probe = next_probe;
+                } else {
+                    return Ok(false);
+                }
+            }
+            other => {
+                let rust = matches!(probe.syntax, SpecSyntax::Rust);
+                let follows = match other {
+                    None => true,
+                    Some(tok) => may_follow_trivial_atom(tok, next_probe.next_tok()?, rust),
+                };
+                if follows {
+                    *look = probe;
+                }
+                return Ok(follows);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Evaluates whether the expression starting at `look` (up to `stop_delim` at
+/// inner depth 0, or up to the arm-body terminator when `stop_delim` is
+/// `None`) is trivially true: a disjunction where at least one disjunct is a
+/// conjunction of trivially-true atoms, with no looser operator (`→`, `↔`) or
+/// trailing non-empty block statement invalidating it.
+fn expr_is_trivially_true(
+    look: &mut SpecLexer<'_>,
+    stop_delim: Option<&str>,
+    depth: u32,
+) -> Result<bool, SpecScanError> {
+    if depth == 0 {
+        return Ok(false);
+    }
+    // Strip optional leading `return` / `by` before splitting disjunctions so
+    // `{ return x == 1 || true; }` is handled identically to `x == 1 || true`.
+    loop {
+        let mut peek = *look;
+        if matches!(peek.next_tok()?, Some(SpecTok::Word("return" | "by"))) {
+            *look = peek;
+        } else {
+            break;
+        }
+    }
+    let mut found_trivial = false;
+    let mut scanned = 0usize;
+    let mut at_disjunct_start = true;
+    let mut inner_depth = 0u32;
+    let mut prev_closed_brace_at_zero = false;
+    // A right-extending construct was seen: later disjuncts are its own
+    // (unless a Rust `else { … }` block closes right before a disjunction).
+    let mut disjuncts_blocked = false;
+    let mut saw_else_before_brace = false;
+    let mut in_else_brace = false;
+    let mut else_brace_just_closed = false;
+    // Inside a block: the current statement began with `let` and holds no
+    // call, macro, block, or control flow so far.
+    let mut stmt_started = false;
+    let mut stmt_benign = false;
+    let mut stmt_prev_operand = false;
+    loop {
+        if at_disjunct_start && inner_depth == 0 {
+            at_disjunct_start = false;
+            let mut conj_probe = *look;
+            if !disjuncts_blocked
+                && consume_trivial_conjunction(&mut conj_probe, stop_delim == Some(")"), depth)?
+            {
+                found_trivial = true;
+                *look = conj_probe;
+            }
+        }
+        let before = *look;
+        let Some(tok) = look.next_tok()? else {
+            return Ok(stop_delim.is_none() && found_trivial);
+        };
+        scanned += 1;
+        if scanned > MAX_ARM_BODY_SCAN_TOKENS {
+            return Ok(false);
+        }
+        if inner_depth == 0 {
+            let unblocks_rust_if_else = else_brace_just_closed && is_disjunction_tok(tok);
+            else_brace_just_closed = false;
+            if prev_closed_brace_at_zero {
+                prev_closed_brace_at_zero = false;
+                if stop_delim.is_none()
+                    && matches!(
+                        tok,
+                        SpecTok::Word(w) if !matches!(w, "else" | "or" | "and" | "as")
+                    )
+                {
+                    *look = before;
+                    return Ok(found_trivial);
+                }
+            }
+            if let Some(delim) = stop_delim {
+                if tok == SpecTok::Sym(delim) {
+                    return Ok(found_trivial);
+                }
+                if delim == "}" && tok == SpecTok::Sym(";") {
+                    let mut after = *look;
+                    if matches!(after.next_tok()?, Some(SpecTok::Sym("}"))) {
+                        *look = after;
+                        return Ok(found_trivial);
+                    }
+                    if stmt_benign || !stmt_started {
+                        // `let _ = e;` or an empty `;` constrains nothing:
+                        // the value of the block is what follows it.
+                        found_trivial = false;
+                        at_disjunct_start = true;
+                        disjuncts_blocked = false;
+                        prev_closed_brace_at_zero = false;
+                        saw_else_before_brace = false;
+                        in_else_brace = false;
+                        stmt_started = false;
+                        stmt_benign = false;
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                if delim == "}" {
+                    if !stmt_started {
+                        stmt_started = true;
+                        stmt_benign = tok == SpecTok::Word("let");
+                        stmt_prev_operand = false;
+                    } else {
+                        if !keeps_statement_benign(tok, stmt_prev_operand) {
+                            stmt_benign = false;
+                        }
+                        stmt_prev_operand = matches!(tok, SpecTok::Word(_) | SpecTok::Literal);
+                    }
+                }
+                // A tuple or argument list (`(true, x)`) is not a
+                // parenthesized proposition.
+                if matches!(tok, SpecTok::Sym(")" | "]" | "}" | ",")) {
+                    return Ok(false);
+                }
+            } else {
+                let mut peek = *look;
+                if is_arm_body_terminator(tok, peek.next_tok()?) {
+                    *look = before;
+                    return Ok(found_trivial);
+                }
+            }
+            if is_biconditional_tok(tok) {
+                return Ok(false);
+            }
+            if is_implication_tok(tok) {
+                // `P → True` is tautologically true whenever the implication
+                // is at top level (not nested under an unparenthesized `if`);
+                // `True → False` and `P ∨ True → False` recurse into `False`
+                // and return `Ok(false)`.
+                if disjuncts_blocked {
+                    return Ok(false);
+                }
+                return expr_is_trivially_true(look, stop_delim, depth - 1);
+            }
+            if unblocks_rust_if_else {
+                disjuncts_blocked = false;
+            }
+            if tok == SpecTok::Word("else") {
+                saw_else_before_brace = true;
+                disjuncts_blocked = true;
+            } else {
+                if tok == SpecTok::Sym("{") && saw_else_before_brace {
+                    in_else_brace = true;
+                }
+                saw_else_before_brace = false;
+                if extends_to_the_right(tok) {
+                    disjuncts_blocked = true;
+                }
+            }
+            if is_disjunction_tok(tok) {
+                at_disjunct_start = true;
+                continue;
+            }
+            if stop_delim == Some(")") && tok == SpecTok::Sym(":") {
+                let mut asc = *look;
+                if matches!(
+                    asc.next_tok()?,
+                    Some(SpecTok::Word("Prop" | "Bool" | "bool"))
+                ) && matches!(asc.next_tok()?, Some(SpecTok::Sym(")")))
+                {
+                    *look = asc;
+                    return Ok(found_trivial);
+                }
+                return Ok(false);
+            }
+            if tok == SpecTok::Word("as") {
+                let mut cast = *look;
+                if matches!(cast.next_tok()?, Some(SpecTok::Word("bool"))) {
+                    *look = cast;
+                    continue;
+                }
+                found_trivial = false;
+            }
+        }
+        match tok {
+            SpecTok::Sym("(" | "[" | "{") => inner_depth += 1,
+            SpecTok::Sym(")" | "]" | "}") => {
+                if inner_depth == 0 {
+                    return Ok(false);
+                }
+                inner_depth -= 1;
+                if inner_depth == 0 && tok == SpecTok::Sym("}") {
+                    prev_closed_brace_at_zero = true;
+                    if in_else_brace {
+                        in_else_brace = false;
+                        else_brace_just_closed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Returns `true` when the arm body starting at `look` is trivially true:
+/// `true`, `True`, `trivial`, `!false`, `¬False`, `Not False`, optionally
+/// wrapped (`(true)`, `{ true }`, `{ return true; }`, `by trivial`,
+/// `true as bool`), a conjunction of trivially-true atoms (`true && true`,
+/// `(true && true)`, `(True ∧ True)`), or a disjunction containing one
+/// (`true || p`, `p || true`, `(p || true)`, `P ∨ True`), and not combined
+/// with a constraining operator.
+///
+/// An operand compared with itself (`e == e`, `*e == *e`, `e.code = e.code`,
+/// `0 = 0`) is such an atom. For a `PartialEq` that is not reflexive (a
+/// floating-point `NaN`) the comparison is not a tautology; it is reported
+/// all the same, since it accepts every other payload.
+///
+/// An atom counts only when nothing binds it into a larger term: it must be
+/// followed by the end of the body, a closing bracket, a separator, or a
+/// connective evaluated here ([`may_follow_trivial_atom`]). `f = f ∘ g` and
+/// Rust `e == e | m` are not tautologies.
+///
+/// A block has the value of its final expression when every statement before
+/// it is a `let` that only names, projects, borrows, or dereferences
+/// (`{ let _ = e; true }`); a call, macro, or arithmetic may panic and is
+/// therefore a constraint ([`keeps_statement_benign`]).
+fn arm_body_is_trivially_true(mut look: SpecLexer<'_>) -> Result<bool, SpecScanError> {
+    expr_is_trivially_true(&mut look, None, MAX_TRIVIAL_EXPR_DEPTH)
+}
+
+/// Lean declaration keywords that begin a fresh top-level item and therefore
+/// close any prior `match` or arm-pattern state.
+fn is_lean_decl_reset_word(word: &str) -> bool {
+    matches!(
+        word,
+        "def"
+            | "theorem"
+            | "lemma"
+            | "axiom"
+            | "opaque"
+            | "abbrev"
+            | "instance"
+            | "example"
+            | "structure"
+            | "inductive"
+    )
+}
+
+/// Maximum tokens of a brace group inspected to recognize a struct pattern.
+const MAX_STRUCT_PATTERN_TOKENS: usize = 256;
+
+/// Whether the brace group whose `{` was just read closes within
+/// [`MAX_STRUCT_PATTERN_TOKENS`] tokens without containing `=>` or `;`: such
+/// a group has no arms or statements of its own (a struct pattern, a struct
+/// literal, a one-expression block).
+fn brace_is_pattern_like(mut look: SpecLexer<'_>) -> Result<bool, SpecScanError> {
+    let mut depth = 1u32;
+    for _ in 0..MAX_STRUCT_PATTERN_TOKENS {
+        match look.next_tok()? {
+            None | Some(SpecTok::FatArrow | SpecTok::Sym(";")) => return Ok(false),
+            Some(SpecTok::Sym("{")) => depth += 1,
+            Some(SpecTok::Sym("}")) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(true);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Strict error-branch wildcard scanner over postcondition source in dialect
+/// `syntax`. Returns the first wildcard in source order, `Ok(None)` when the
+/// source has none, and an error when the source is malformed.
+///
+/// A match arm is a wildcard when one of its pattern alternatives names an
+/// error constructor (`Err`, `.err`, `.error`, `.ub`, `.unsupported`,
+/// `.fail`) whose payload is unconstrained (`_`, `..`, a bare binding, or a
+/// Lean type ascription `(_ : E)`) and its body is trivially true (`true`,
+/// `True`, `trivial`, `!false`, `¬False`, possibly parenthesized or in a
+/// disjunction). `matches!(…, … | Err(_))` is a wildcard without a body, and
+/// a catch-all arm (`_ => true`, `e => true`) is one when its own match also
+/// has an `Ok` arm. Arms are found at any bracket depth
+/// (`P ∧ (match r with | .ok v => … | .err _ => True)`), and each component
+/// of a tuple pattern or Lean multi-discriminant arm is judged on its own
+/// (`(Err(_), Ok(_)) => true`). An error constructor inside a struct pattern
+/// counts (`Wrapper { inner: Err(_) } => true`, Lean `{ val := .err _ }`),
+/// and a tuple of catch-alls is a catch-all (`(_, _) => true`).
+///
+/// An arm body ends at the next arm, at the bracket that closes the match,
+/// or at the next top-level item or Lean command; nothing after it is read
+/// as part of the body.
+///
+/// The scanner is syntactic: it reads `match` arms and `matches!`. An error
+/// escape written without them (`out.map_or(true, …)`,
+/// `out.is_err() || …`, `if let Ok(v) = out { … } else { true }`,
+/// `∀ v, out = .ok v → …`) is caught by the dynamic probes of
+/// [`check_result_contract_no_error_wildcard`] and
+/// [`check_semantic_outcome_no_error_wildcard`], not here.
+///
+/// An arm that constrains the payload (`Err(E::Overflow) => …`,
+/// `Err(Unsupported) => …`, `| .err .ub => …`), has a non-trivial `if` guard,
+/// or has any other body (`| .ub => False`, `Err(_) => x == u32::MAX`) is not
+/// reported. Comments and literals are never inspected.
+pub fn scan_error_branch_wildcard(
+    post_src: &str,
+    syntax: SpecSyntax,
+) -> Result<Option<ErrorWildcardPattern>, SpecScanError> {
+    let lean_keywords = !matches!(syntax, SpecSyntax::Rust);
+    let mut lexer = SpecLexer::new(post_src, syntax);
+    let mut alt = ArmAlternative::default();
+    let mut arm = ArmState::default();
+    let mut matches_state = MatchesState::Outside;
+    let mut matches_saw_ok = false;
+    let mut matches_scope_floor = 0usize;
+    let mut after_dot = false;
+    let mut in_match_scrutinee = false;
+    let mut scopes = OkScopes::new();
+
+    while let Some(tok) = lexer.next_tok()? {
+        let was_after_dot = after_dot;
+        after_dot = matches!(tok, SpecTok::Sym("."));
+
+        // Skip the scrutinee of `matches!(scrutinee, pattern)`.
+        if let MatchesState::Scrutinee { depth } = matches_state {
+            match tok {
+                SpecTok::Sym("(" | "[" | "{") => {
+                    matches_state = MatchesState::Scrutinee { depth: depth + 1 };
+                }
+                SpecTok::Sym(")" | "]" | "}") => {
+                    matches_state = if depth <= 1 {
+                        MatchesState::Outside
+                    } else {
+                        MatchesState::Scrutinee { depth: depth - 1 }
+                    };
+                }
+                SpecTok::Sym(",") if depth == 1 => {
+                    matches_state = MatchesState::Pattern;
+                    matches_saw_ok = false;
+                    matches_scope_floor = scopes.len;
+                    in_match_scrutinee = false;
+                    alt = ArmAlternative::default();
+                    arm = ArmState::default();
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match tok {
+            SpecTok::FatArrow => {
+                in_match_scrutinee = false;
+                if !alt.in_lambda {
+                    arm.absorb(&alt);
+                    if !arm.guard_blocks() && arm_body_is_trivially_true(lexer)? {
+                        if let Some(ctor) = arm.wildcard {
+                            return Ok(Some(ctor.pattern()));
+                        }
+                        if arm.catch_all && scopes.saw_ok() {
+                            return Ok(Some(ErrorWildcardPattern::CatchAllArmTrue));
+                        }
+                    }
+                }
+                arm = ArmState::default();
+                alt = ArmAlternative::body(alt.depth);
+            }
+            SpecTok::Sym("|")
+                if !arm.guarded && (!alt.after_arrow || alt.depth == alt.body_depth) =>
+            {
+                if alt.after_arrow {
+                    // The previous arm's body ends here: it is not a pattern.
+                    arm = ArmState::default();
+                    alt = ArmAlternative::pattern(alt.depth);
+                } else {
+                    if alt.at_catch_all_paren_level() {
+                        // Record the error wildcard now; the catch-all
+                        // verdict waits for the closing parenthesis.
+                        arm.absorb(&ArmAlternative {
+                            catch_all: false,
+                            ..alt
+                        });
+                    } else {
+                        arm.absorb(&alt);
+                    }
+                    match alt.error_ctor_depth {
+                        Some(ctor_depth) if alt.depth > ctor_depth => {
+                            // Or-pattern inside an error payload. Directly
+                            // under the constructor (`Err(E::A | _)`) the
+                            // next alternative starts unconstrained; deeper
+                            // (`Err(Wrap(E::A | _))`) the enclosing
+                            // constructor still constrains the payload.
+                            alt.push_non_word();
+                            if alt.depth == ctor_depth + 1 {
+                                alt.constrained = false;
+                                alt.type_ascription_depth = None;
+                            }
+                        }
+                        // Or-pattern directly inside catch-all parentheses
+                        // (`(0 | _)`, `(_ | 0, y)`): whether the group is a
+                        // catch-all is only known once it closes.
+                        _ if alt.at_catch_all_paren_level() => {
+                            let catch_all = alt.catch_all;
+                            if let Some(frame) = alt.top_paren_frame_mut() {
+                                frame.or_wild |= catch_all;
+                            }
+                            alt = alt.next_alt(alt.catch_all_parens);
+                        }
+                        // Top-level or nested or-pattern
+                        // (`Some(Err(_) | Ok(0))`).
+                        _ => alt = alt.next_alt(alt.catch_all_parens),
+                    }
+                }
+            }
+            SpecTok::Sym(",")
+                if !arm.guarded
+                    && !alt.after_arrow
+                    && !alt.in_lambda
+                    && alt.error_ctor_depth.is_some_and(|d| alt.depth <= d) =>
+            {
+                // A sibling of the error constructor, not part of its
+                // payload: the next tuple component (`(Err(_), Ok(_))`) or
+                // Lean discriminant (`| .err _, .ok v`). Its constructors
+                // must not constrain the payload already scanned.
+                arm.absorb(&ArmAlternative {
+                    catch_all: false,
+                    ..alt
+                });
+                alt = alt.next_alt(0);
+            }
+            SpecTok::Sym("," | ";") if alt.depth == 0 => {
+                in_match_scrutinee = false;
+                if matches_state == MatchesState::Pattern {
+                    // Allow a Rust trailing comma in `matches!(out, pat,)`.
+                    let mut look = lexer;
+                    if tok == SpecTok::Sym(",")
+                        && matches!(look.next_tok()?, Some(SpecTok::Sym(")" | "]" | "}")))
+                    {
+                        continue;
+                    }
+                    matches_state = MatchesState::Outside;
+                }
+                arm = ArmState::default();
+                alt = ArmAlternative::default();
+            }
+            SpecTok::Sym("(") => {
+                let outer_wrapper = (alt.tokens == 0 || alt.only_modifiers)
+                    && alt.depth == alt.arm_base_depth + alt.catch_all_parens
+                    && (alt.catch_all_parens as usize) < MAX_CATCH_ALL_PAREN_DEPTH;
+                alt.depth += 1;
+                if alt.type_ascription_depth.is_some() {
+                    alt.tokens += 1;
+                } else {
+                    alt.tokens += 1;
+                    alt.catch_all = false;
+                    alt.only_modifiers = outer_wrapper;
+                    if outer_wrapper {
+                        alt.paren_frames[alt.catch_all_parens as usize] =
+                            CatchAllParenFrame::default();
+                        alt.catch_all_parens += 1;
+                    }
+                }
+            }
+            SpecTok::Sym("[") => {
+                alt.depth += 1;
+                if alt.type_ascription_depth.is_some() {
+                    alt.tokens += 1;
+                } else {
+                    alt.push_non_word();
+                }
+            }
+            SpecTok::Sym("{") => {
+                // In pattern position a brace group without `=>` or `;` is a
+                // struct pattern (`W { r: Err(_) }`, Lean `{ val := .err _ }`)
+                // or a small expression: either way it holds no arms of its
+                // own, so it is tracked by depth and its error constructors
+                // stay with the arm around it.
+                let is_struct_pattern_brace = !alt.after_arrow
+                    && !arm.guarded
+                    && !in_match_scrutinee
+                    && (matches_state == MatchesState::Pattern || brace_is_pattern_like(lexer)?);
+                if is_struct_pattern_brace {
+                    alt.depth += 1;
+                    if alt.struct_pattern_depth.is_none() {
+                        alt.struct_pattern_depth = Some(alt.depth);
+                    }
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else {
+                        alt.push_non_word();
+                    }
+                } else {
+                    in_match_scrutinee = false;
+                    scopes.push(OkScopeKind::Brace {
+                        saved_depth: alt.depth,
+                    });
+                    arm = ArmState::default();
+                    alt = ArmAlternative::default();
+                }
+            }
+            SpecTok::Sym(")" | "]" | "}") => {
+                if alt.depth > 0 {
+                    alt.depth -= 1;
+                    let was_ascription = alt.type_ascription_depth.is_some();
+                    if alt.type_ascription_depth.is_some_and(|d| alt.depth < d) {
+                        alt.type_ascription_depth = None;
+                    }
+                    if alt.struct_pattern_depth.is_some_and(|d| alt.depth < d) {
+                        alt.struct_pattern_depth = None;
+                    }
+                    let closed_outer_catch_all_paren = tok == SpecTok::Sym(")")
+                        && alt.catch_all_parens > 0
+                        && alt.depth < alt.arm_base_depth + alt.catch_all_parens;
+                    if closed_outer_catch_all_paren {
+                        alt.catch_all_parens -= 1;
+                        let frame = alt.paren_frames[alt.catch_all_parens as usize];
+                        alt.paren_frames[alt.catch_all_parens as usize] =
+                            CatchAllParenFrame::default();
+                        // The group is a catch-all when its last component
+                        // is (`(e)`, `(0 | _)`) and, for a tuple, every
+                        // earlier component was too (`(_, _)`, `(_, _,)`).
+                        let last_wild = alt.catch_all || frame.or_wild;
+                        alt.catch_all = if frame.tuple_started {
+                            frame.tuple_wild && (last_wild || alt.only_modifiers)
+                        } else {
+                            last_wild
+                        };
+                    }
+                    if was_ascription || closed_outer_catch_all_paren {
+                        alt.tokens += 1;
+                        if !was_ascription {
+                            alt.only_modifiers = false;
+                        }
+                    } else {
+                        alt.push_non_word();
+                    }
+                    if alt.after_arrow && alt.depth < alt.body_depth {
+                        // The bracket around the arm list closed: what
+                        // follows continues the enclosing body.
+                        alt.body_depth = alt.depth;
+                    }
+                    scopes.close_lean_matches(alt.depth + 1);
+                } else if tok == SpecTok::Sym("}")
+                    && let Some(saved_depth) =
+                        scopes.pop_brace(if matches_state == MatchesState::Pattern {
+                            matches_scope_floor
+                        } else {
+                            0
+                        })
+                {
+                    // The block closed: a new arm pattern may follow
+                    // (`Ok(v) => { … } Err(_) => true`).
+                    in_match_scrutinee = false;
+                    arm = ArmState::default();
+                    alt = ArmAlternative::pattern(saved_depth);
+                } else {
+                    // The closer of a bracket opened before the scanned
+                    // text, or of `matches!(…)`.
+                    if matches_state == MatchesState::Pattern {
+                        arm.absorb(&alt);
+                        if !arm.guard_blocks()
+                            && (arm.wildcard.is_some() || (arm.catch_all && matches_saw_ok))
+                        {
+                            return Ok(Some(ErrorWildcardPattern::MatchesAnyErr));
+                        }
+                        matches_state = MatchesState::Outside;
+                    }
+                    in_match_scrutinee = false;
+                    scopes.close_lean_matches(0);
+                    arm = ArmState::default();
+                    alt = ArmAlternative::default();
+                }
+            }
+            SpecTok::Sym(":=")
+                if alt.struct_pattern_depth.is_some() && !alt.after_arrow && !alt.in_lambda =>
+            {
+                // Lean structure pattern field `{ val := pattern }`.
+                if !arm.guarded {
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else {
+                        alt.push_non_word();
+                    }
+                }
+            }
+            SpecTok::Sym(":=") => {
+                in_match_scrutinee = false;
+                arm = ArmState::default();
+                alt = ArmAlternative::body(alt.depth);
+            }
+            SpecTok::Word(word) => {
+                if word == "Ok" || (was_after_dot && word == "ok") {
+                    if matches_state == MatchesState::Pattern {
+                        matches_saw_ok = true;
+                    } else {
+                        scopes.mark_ok();
+                    }
+                }
+                if word == "matches" && matches_state == MatchesState::Outside {
+                    let mut look = lexer;
+                    if matches!(look.next_tok()?, Some(SpecTok::Sym("!")))
+                        && matches!(look.next_tok()?, Some(SpecTok::Sym("(" | "[" | "{")))
+                    {
+                        lexer = look;
+                        after_dot = false;
+                        matches_state = MatchesState::Scrutinee { depth: 1 };
+                        continue;
+                    }
+                }
+                if !arm.guarded && alt.depth == 0 && is_lean_decl_reset_word(word) {
+                    in_match_scrutinee = false;
+                    scopes.begin_declaration();
+                    arm = ArmState::default();
+                    alt = ArmAlternative::default();
+                    continue;
+                }
+                if !arm.guarded
+                    && lean_keywords
+                    && matches!(word, "fun" | "λ")
+                    && alt.error_ctor.is_none()
+                    && (alt.after_arrow || alt.tokens == 0)
+                {
+                    arm = ArmState::default();
+                    alt = ArmAlternative {
+                        in_lambda: true,
+                        ..ArmAlternative::pattern(alt.depth)
+                    };
+                    continue;
+                }
+                if !arm.guarded && matches!(word, "match" | "with") {
+                    in_match_scrutinee = word == "match";
+                    if word == "with" && lean_keywords {
+                        scopes.push(OkScopeKind::LeanMatch { depth: alt.depth });
+                    }
+                    arm = ArmState::default();
+                    alt = ArmAlternative::pattern(alt.depth);
+                    continue;
+                }
+                if arm.guarded {
+                    arm.guard_tokens += 1;
+                    arm.guard_trivial = word == "true";
+                } else if word == "if" && alt.depth == 0 && !alt.after_arrow && !alt.in_lambda {
+                    arm.absorb(&alt);
+                    alt = ArmAlternative::default();
+                    arm.guarded = true;
+                } else if !alt.after_arrow && !alt.in_lambda {
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                        continue;
+                    }
+                    let leading = (alt.tokens == 0 || alt.only_modifiers)
+                        && alt.depth == alt.arm_base_depth + alt.catch_all_parens;
+                    alt.catch_all = leading && is_catch_all_binder_word(word);
+                    alt.only_modifiers = leading && matches!(word, "ref" | "mut");
+                    alt.tokens += 1;
+                    if let Some(ctor) = ErrorCtor::of(word, was_after_dot) {
+                        match alt.error_ctor {
+                            None => {
+                                alt.error_ctor = Some(ctor);
+                                alt.error_ctor_depth = Some(alt.depth);
+                            }
+                            Some(ErrorCtor::Fail)
+                                if matches!(ctor, ErrorCtor::Ub | ErrorCtor::Unsupported) =>
+                            {
+                                alt.error_ctor = Some(ctor);
+                            }
+                            Some(_) => {
+                                alt.constrained = true;
+                            }
+                        }
+                    } else if alt.error_ctor.is_some()
+                        && (was_after_dot || !is_wildcard_payload_word(word))
+                    {
+                        alt.constrained = true;
+                    }
+                }
+            }
+            SpecTok::Literal | SpecTok::PathSep => {
+                if arm.guarded {
+                    arm.guard_tokens += 1;
+                    arm.guard_trivial = false;
+                } else if !alt.after_arrow && !alt.in_lambda {
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else {
+                        alt.push_non_word();
+                        if alt.error_ctor.is_some() {
+                            alt.constrained = true;
+                        }
+                    }
+                }
+            }
+            SpecTok::DotDot | SpecTok::Sym(_) => {
+                if arm.guarded {
+                    arm.guard_tokens += 1;
+                    arm.guard_trivial = false;
+                } else if !alt.after_arrow && !alt.in_lambda {
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else if matches!(tok, SpecTok::Sym("&" | "&&")) {
+                        let keep_mod = alt.tokens == 0 || alt.only_modifiers;
+                        alt.tokens += 1;
+                        alt.catch_all = false;
+                        alt.only_modifiers = keep_mod;
+                    } else if tok == SpecTok::Sym(",") && alt.at_catch_all_paren_level() {
+                        // A tuple component ended (`(_, _)`).
+                        let catch_all = alt.catch_all;
+                        let tuple_wild = if let Some(frame) = alt.top_paren_frame_mut() {
+                            let component_wild = catch_all || frame.or_wild;
+                            frame.tuple_wild =
+                                component_wild && (frame.tuple_wild || !frame.tuple_started);
+                            frame.tuple_started = true;
+                            frame.or_wild = false;
+                            frame.tuple_wild
+                        } else {
+                            false
+                        };
+                        alt.tokens += 1;
+                        alt.catch_all = false;
+                        alt.only_modifiers = tuple_wild;
+                    } else if tok == SpecTok::Sym("@") && alt.catch_all {
+                        alt.tokens += 1;
+                        alt.catch_all = false;
+                        alt.only_modifiers = true;
+                    } else if tok == SpecTok::Sym(":")
+                        && alt.depth > 0
+                        && ((alt.error_ctor.is_some() && !alt.constrained) || alt.catch_all)
+                    {
+                        alt.tokens += 1;
+                        alt.type_ascription_depth = Some(alt.depth);
+                    } else {
+                        alt.push_non_word();
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Scans postcondition source of unknown dialect for an error-branch
+/// wildcard. Malformed source fails closed with
+/// [`ErrorWildcardPattern::UnclosedLiteralOrComment`]. See
+/// [`scan_error_branch_wildcard`] for the strict, dialect-aware form.
+pub fn detect_error_branch_wildcard(post_src: &str) -> Option<ErrorWildcardPattern> {
+    match scan_error_branch_wildcard(post_src, SpecSyntax::Any) {
+        Ok(pattern) => pattern,
+        Err(SpecScanError::UnclosedLiteralOrComment) => {
+            Some(ErrorWildcardPattern::UnclosedLiteralOrComment)
+        }
+    }
+}
+
+/// Statistics of a passing error-branch wildcard check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ErrorWildcardStats {
+    /// Statistics of the base contract check.
+    pub base: SpecCheckStats,
+    /// Precondition hits on which the function returned `Ok`.
+    pub ok_hits: usize,
+    /// Precondition hits on which the function returned `Err`.
+    pub err_hits: usize,
+    /// `Err(e)` candidates offered on `Ok` hits, all rejected.
+    pub error_escape_probes: usize,
+    /// Distinct `Err(e_bad)` payload mutants offered on `Err` hits.
+    pub err_payload_mutants_tested: usize,
+    /// Payload mutants the postcondition rejected.
+    pub err_payload_mutants_killed: usize,
+    /// `Ub` / `Unsupported` candidates offered, all rejected.
+    pub fault_probes: usize,
+}
+
+/// What the error-branch wildcard probes found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ErrorWildcardViolationKind {
+    /// On the `Ok` hit at `trial_idx` the postcondition accepted an `Err`
+    /// outcome: an implementation may fail where the function succeeds.
+    ErrorEscapeAccepted { trial_idx: usize },
+    /// On the `Err` hit at `trial_idx` the postcondition accepted every
+    /// distinct error payload offered.
+    ErrorPayloadUnconstrained { trial_idx: usize },
+    /// On the hit at `trial_idx` the postcondition accepted `Ub`.
+    UbAccepted { trial_idx: usize },
+    /// On the hit at `trial_idx` the postcondition accepted `Unsupported`.
+    UnsupportedAccepted { trial_idx: usize },
+}
+
+/// Structured report of an error-branch wildcard violation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ErrorWildcardViolation {
+    /// Always [`SpecBoundaryGuardClass::ErrorBranchWildcard`].
+    pub guard: SpecBoundaryGuardClass,
+    /// What the probes found.
+    pub kind: ErrorWildcardViolationKind,
+    /// Statistics accumulated up to the violation.
+    pub stats: ErrorWildcardStats,
+}
+
+impl ErrorWildcardViolation {
+    /// Frozen vacuity class of the violation
+    /// ([`VacuityClass::SurvivedAllMutants`]).
+    pub const fn vacuity_class(&self) -> VacuityClass {
+        self.guard.to_vacuity_class()
+    }
+
+    /// Index of the trial whose input exhibits the wildcard. Pass it to
+    /// [`replay_trial_input`] with the same [`SpecCheckConfig`].
+    pub const fn counterexample_trial(&self) -> usize {
+        match self.kind {
+            ErrorWildcardViolationKind::ErrorEscapeAccepted { trial_idx }
+            | ErrorWildcardViolationKind::ErrorPayloadUnconstrained { trial_idx }
+            | ErrorWildcardViolationKind::UbAccepted { trial_idx }
+            | ErrorWildcardViolationKind::UnsupportedAccepted { trial_idx } => trial_idx,
+        }
+    }
+}
+
+/// Outcome of an error-branch wildcard check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorWildcardCheckOutcome {
+    /// The base contract check passed and every error and fault probe was
+    /// rejected.
+    Strong(ErrorWildcardStats),
+    /// The base contract check ([`check_contract`]) failed with its own
+    /// [`VacuityClass`].
+    BaseFailed(SpecCheckFailure),
+    /// The base check passed but the postcondition is an error-branch
+    /// wildcard.
+    Wildcard(ErrorWildcardViolation),
+}
+
+impl ErrorWildcardCheckOutcome {
+    /// Returns `true` iff the contract passed the base check and every probe.
+    pub const fn is_strong(&self) -> bool {
+        matches!(self, Self::Strong(_))
+    }
+
+    /// Returns the failing [`VacuityClass`], or `None` when [`Self::Strong`].
+    pub const fn vacuity_class(&self) -> Option<VacuityClass> {
+        match self {
+            Self::Strong(_) => None,
+            Self::BaseFailed(failure) => Some(failure.class),
+            Self::Wildcard(violation) => Some(violation.vacuity_class()),
+        }
+    }
+
+    /// Returns the guard class when the outcome is a wildcard violation.
+    pub const fn guard_class(&self) -> Option<SpecBoundaryGuardClass> {
+        match self {
+            Self::Wildcard(violation) => Some(violation.guard),
+            Self::Strong(_) | Self::BaseFailed(_) => None,
+        }
+    }
+
+    /// Returns the wildcard violation, if any.
+    pub const fn violation(&self) -> Option<&ErrorWildcardViolation> {
+        match self {
+            Self::Wildcard(violation) => Some(violation),
+            Self::Strong(_) | Self::BaseFailed(_) => None,
+        }
+    }
+}
+
+/// Maximum number of boundary error payloads offered per `Ok` hit by the
+/// error-escape probe.
+pub const MAX_ERROR_ESCAPE_BOUNDARY_PROBES: usize = 16;
+
+/// Number of seeded error payloads offered per `Ok` hit after the boundary
+/// payloads.
+const ERROR_ESCAPE_SEEDED_PROBES: usize = 2;
+
+/// Shared core of the error-branch wildcard checks.
+///
+/// Runs the base contract check, then replays the same input stream and, on
+/// every precondition hit:
+///
+/// - **`Ok` hit** — offers `Err(e)` for the boundary payloads of the error
+///   type and two seeded payloads. Accepting any of them is an error escape.
+/// - **`Err(e_ok)` hit** — when the error type is not a subsingleton, offers
+///   its distinct payload mutants `Err(e_bad)`. Accepting all of them (or
+///   having none to offer) leaves the payload unconstrained.
+/// - **every hit** — offers `Ub` and `Unsupported` when the outcome type has
+///   them. Accepting either is a violation, as is a live `Ub` / `Unsupported`
+///   outcome the base check let through.
+///
+/// A postcondition that traps on a probe rejects it.
+fn check_no_error_wildcard_core<I, R, Pre, Body, Post>(
+    config: SpecCheckConfig,
+    mut pre: Pre,
+    mut body: Body,
+    mut post: Post,
+) -> ErrorWildcardCheckOutcome
+where
+    I: SampleInput,
+    R: ErrorBranchOutcome + ReturnMutants + PartialEq,
+    R::Error: SampleInput + ReturnMutants + PartialEq,
+    Pre: FnMut(&I) -> Result<bool, ()>,
+    Body: FnMut(&I) -> Result<R, ()>,
+    Post: FnMut(&I, &R) -> Result<bool, ()>,
+{
+    let base = match check_contract_core(config, None, &mut pre, &mut body, &mut post) {
+        SpecCheckOutcome::Strong(stats) => stats,
+        SpecCheckOutcome::Failed(failure) => {
+            return ErrorWildcardCheckOutcome::BaseFailed(failure);
+        }
+    };
+    let mut stats = ErrorWildcardStats {
+        base,
+        ..ErrorWildcardStats::default()
+    };
+    let wildcard = |kind, stats| {
+        ErrorWildcardCheckOutcome::Wildcard(ErrorWildcardViolation {
+            guard: SpecBoundaryGuardClass::ErrorBranchWildcard,
+            kind,
+            stats,
+        })
+    };
+    let trapped = |trial_idx, trap| match execution_trapped(base, trial_idx, trap) {
+        SpecCheckOutcome::Failed(failure) => ErrorWildcardCheckOutcome::BaseFailed(failure),
+        SpecCheckOutcome::Strong(_) => unreachable!("`execution_trapped` always fails"),
+    };
+
+    let (mut rng, mut mutant_rng) = stateless_streams(config.seed);
+    let mut probe_rng = mutant_rng.fork();
+    let boundary_probes = min_usize(
+        <R::Error as SampleInput>::BOUNDARY_COUNT,
+        MAX_ERROR_ESCAPE_BOUNDARY_PROBES,
+    );
+
+    for trial_idx in 0..config.max_trials {
+        let input = I::sample_at(trial_idx, &mut rng);
+        match pre(&input) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(()) => return trapped(trial_idx, TrapKind::PreconditionPanicked),
+        }
+        let ret = match body(&input) {
+            Ok(ret) => ret,
+            Err(()) => return trapped(trial_idx, TrapKind::BodyPanicked),
+        };
+
+        match ret.branch() {
+            // The base check verified that `post` accepts the live outcome.
+            OutcomeBranch::Ub => {
+                return wildcard(ErrorWildcardViolationKind::UbAccepted { trial_idx }, stats);
+            }
+            OutcomeBranch::Unsupported => {
+                return wildcard(
+                    ErrorWildcardViolationKind::UnsupportedAccepted { trial_idx },
+                    stats,
+                );
+            }
+            OutcomeBranch::Ok => {
+                stats.ok_hits += 1;
+                for probe in 0..boundary_probes + ERROR_ESCAPE_SEEDED_PROBES {
+                    let sample_idx = if probe < boundary_probes {
+                        probe
+                    } else {
+                        <R::Error as SampleInput>::BOUNDARY_COUNT
+                            .saturating_add(probe - boundary_probes)
+                    };
+                    let candidate = R::from_error(<R::Error as SampleInput>::sample_at(
+                        sample_idx,
+                        &mut probe_rng,
+                    ));
+                    stats.error_escape_probes += 1;
+                    if matches!(post(&input, &candidate), Ok(true)) {
+                        return wildcard(
+                            ErrorWildcardViolationKind::ErrorEscapeAccepted { trial_idx },
+                            stats,
+                        );
+                    }
+                }
+            }
+            OutcomeBranch::Err => {
+                stats.err_hits += 1;
+                if !<R::Error as ReturnMutants>::IS_SUBSINGLETON
+                    && let Some(error_ok) = ret.error_payload()
+                {
+                    let mut tested = 0usize;
+                    let mut killed = 0usize;
+                    error_ok.visit_mutants(&mut mutant_rng, |error_bad| {
+                        if killed > 0 || &error_bad == error_ok {
+                            return;
+                        }
+                        tested += 1;
+                        if !matches!(post(&input, &R::from_error(error_bad)), Ok(true)) {
+                            killed += 1;
+                        }
+                    });
+                    stats.err_payload_mutants_tested += tested;
+                    stats.err_payload_mutants_killed += killed;
+                    if killed == 0 {
+                        return wildcard(
+                            ErrorWildcardViolationKind::ErrorPayloadUnconstrained { trial_idx },
+                            stats,
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(ub) = R::ub() {
+            stats.fault_probes += 1;
+            if matches!(post(&input, &ub), Ok(true)) {
+                return wildcard(ErrorWildcardViolationKind::UbAccepted { trial_idx }, stats);
+            }
+        }
+        if let Some(unsupported) = R::unsupported() {
+            stats.fault_probes += 1;
+            if matches!(post(&input, &unsupported), Ok(true)) {
+                return wildcard(
+                    ErrorWildcardViolationKind::UnsupportedAccepted { trial_idx },
+                    stats,
+                );
+            }
+        }
+    }
+
+    ErrorWildcardCheckOutcome::Strong(stats)
+}
+
+/// Checks a `Result`-returning contract `(pre, body, post)` against the
+/// error-branch wildcard guard.
+///
+/// On top of [`check_contract`], the check offers `Err(e)` on every input
+/// where `body` returned `Ok` and distinct `Err(e_bad)` payloads on every
+/// input where it returned `Err`. The postcondition
+/// `Ok(v) => v == x + 1, Err(_) => true` passes [`check_contract`] (its `Ok`
+/// mutants are killed) and is rejected here with
+/// [`ErrorWildcardViolationKind::ErrorEscapeAccepted`].
+///
+/// As with [`check_contract`], a `post` that can panic on a wrong output must
+/// be checked through [`check_result_contract_no_error_wildcard_fallible`].
+pub fn check_result_contract_no_error_wildcard<I, T, E, Pre, Body, Post>(
+    config: SpecCheckConfig,
+    mut pre: Pre,
+    mut body: Body,
+    mut post: Post,
+) -> ErrorWildcardCheckOutcome
+where
+    I: SampleInput,
+    T: SampleInput + ReturnMutants + PartialEq,
+    E: SampleInput + ReturnMutants + PartialEq,
+    Pre: FnMut(&I) -> bool,
+    Body: FnMut(&I) -> Result<T, E>,
+    Post: FnMut(&I, &Result<T, E>) -> bool,
+{
+    check_no_error_wildcard_core(
+        config,
+        |input: &I| Ok(pre(input)),
+        |input: &I| Ok(body(input)),
+        |input: &I, ret: &Result<T, E>| Ok(post(input, ret)),
+    )
+}
+
+/// Fallible form of [`check_result_contract_no_error_wildcard`]: `pre`,
+/// `body`, and `post` may trap by returning `Err(())`, exactly as in
+/// [`check_contract_fallible`]. A `post` that traps on a probe rejects it.
+pub fn check_result_contract_no_error_wildcard_fallible<I, T, E, Pre, Body, Post>(
+    config: SpecCheckConfig,
+    pre: Pre,
+    body: Body,
+    post: Post,
+) -> ErrorWildcardCheckOutcome
+where
+    I: SampleInput,
+    T: SampleInput + ReturnMutants + PartialEq,
+    E: SampleInput + ReturnMutants + PartialEq,
+    Pre: FnMut(&I) -> Result<bool, ()>,
+    Body: FnMut(&I) -> Result<Result<T, E>, ()>,
+    Post: FnMut(&I, &Result<T, E>) -> Result<bool, ()>,
+{
+    check_no_error_wildcard_core(config, pre, body, post)
+}
+
+/// Checks a [`SemanticOutcome`]-returning contract against the error-branch
+/// wildcard guard.
+///
+/// In addition to the error probes of
+/// [`check_result_contract_no_error_wildcard`], the postcondition must reject
+/// [`SemanticOutcome::Ub`] and [`SemanticOutcome::Unsupported`] on every
+/// precondition-admissible input.
+pub fn check_semantic_outcome_no_error_wildcard<I, T, E, Pre, Body, Post>(
+    config: SpecCheckConfig,
+    mut pre: Pre,
+    mut body: Body,
+    mut post: Post,
+) -> ErrorWildcardCheckOutcome
+where
+    I: SampleInput,
+    T: SampleInput + ReturnMutants + PartialEq,
+    E: SampleInput + ReturnMutants + PartialEq,
+    Pre: FnMut(&I) -> bool,
+    Body: FnMut(&I) -> SemanticOutcome<T, E>,
+    Post: FnMut(&I, &SemanticOutcome<T, E>) -> bool,
+{
+    check_no_error_wildcard_core(
+        config,
+        |input: &I| Ok(pre(input)),
+        |input: &I| Ok(body(input)),
+        |input: &I, ret: &SemanticOutcome<T, E>| Ok(post(input, ret)),
+    )
+}
+
+/// Fallible form of [`check_semantic_outcome_no_error_wildcard`].
+pub fn check_semantic_outcome_no_error_wildcard_fallible<I, T, E, Pre, Body, Post>(
+    config: SpecCheckConfig,
+    pre: Pre,
+    body: Body,
+    post: Post,
+) -> ErrorWildcardCheckOutcome
+where
+    I: SampleInput,
+    T: SampleInput + ReturnMutants + PartialEq,
+    E: SampleInput + ReturnMutants + PartialEq,
+    Pre: FnMut(&I) -> Result<bool, ()>,
+    Body: FnMut(&I) -> Result<SemanticOutcome<T, E>, ()>,
+    Post: FnMut(&I, &SemanticOutcome<T, E>) -> Result<bool, ()>,
+{
+    check_no_error_wildcard_core(config, pre, body, post)
+}
+
 /// Implements [`SampleInput`](crate::spec_check::SampleInput) and
 /// [`ReturnMutants`](crate::spec_check::ReturnMutants) for a struct by
 /// delegating to the implementations of its field types.
@@ -3902,4 +7618,2573 @@ macro_rules! impl_spec_check_struct {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod spec_boundary_guard_tests {
+    use super::*;
+    use std::vec::Vec;
+
+    fn desc(def_path: &'static str) -> EntryPointDescriptor<'static> {
+        EntryPointDescriptor::new(def_path)
+    }
+
+    fn config() -> SpecCheckConfig {
+        SpecCheckConfig::default()
+    }
+
+    // ---- Frozen taxonomy contract ------------------------------------------
+
+    #[test]
+    fn guard_taxonomy_matches_frozen_cross_language_contract() {
+        let table: [(usize, &str, &str, VacuityClass, &str); 3] = [
+            (
+                0,
+                "entry_point_requires",
+                "EntryPointPrecondition",
+                VacuityClass::DeadPrecondition,
+                "DeadPrecondition",
+            ),
+            (
+                1,
+                "fixed_width_ghost_length",
+                "FixedWidthGhostLength",
+                VacuityClass::SpecViolation,
+                "SpecViolation",
+            ),
+            (
+                2,
+                "error_branch_wildcard",
+                "ErrorBranchWildcard",
+                VacuityClass::SurvivedAllMutants,
+                "SurvivedAllMutants",
+            ),
+        ];
+        assert_eq!(SpecBoundaryGuardClass::COUNT, 3);
+        assert_eq!(
+            SpecBoundaryGuardClass::ALL.len(),
+            SpecBoundaryGuardClass::COUNT
+        );
+        for (guard, (rank, id, name, class, class_name)) in
+            SpecBoundaryGuardClass::ALL.into_iter().zip(table)
+        {
+            assert_eq!(guard.rank(), rank);
+            assert_eq!(SpecBoundaryGuardClass::from_rank(rank), Some(guard));
+            assert_eq!(guard.guard_id(), id);
+            assert_eq!(SpecBoundaryGuardClass::from_guard_id(id), Some(guard));
+            assert_eq!(guard.canonical_name(), name);
+            assert_eq!(
+                SpecBoundaryGuardClass::from_canonical_name(name),
+                Some(guard)
+            );
+            assert_eq!(guard.to_vacuity_class(), class);
+            assert_eq!(guard.to_vacuity_class().canonical_name(), class_name);
+            assert_eq!(std::format!("{guard}"), name);
+        }
+        assert_eq!(SpecBoundaryGuardClass::from_rank(3), None);
+        assert_eq!(SpecBoundaryGuardClass::from_rank(usize::MAX), None);
+    }
+
+    #[test]
+    fn guard_parsing_is_exact_and_namespaces_do_not_mix() {
+        for near_miss in [
+            "",
+            "EntryPointPrecondition",
+            "entry_point_precondition",
+            "entry_point_requires ",
+            "Entry_Point_Requires",
+            "fixed_width_ghost_len",
+            "error_branch_wildcards",
+            "arithmetic_overflow",
+        ] {
+            assert_eq!(
+                SpecBoundaryGuardClass::from_guard_id(near_miss),
+                None,
+                "{near_miss:?}"
+            );
+        }
+        for near_miss in [
+            "",
+            "entry_point_requires",
+            "entryPointPrecondition",
+            "EntryPointRequires",
+            "DeadPrecondition",
+            "FixedWidthGhostLength ",
+            "ErrorBranchWildCard",
+        ] {
+            assert_eq!(
+                SpecBoundaryGuardClass::from_canonical_name(near_miss),
+                None,
+                "{near_miss:?}"
+            );
+        }
+        // No guard name collides with a vacuity class name.
+        for guard in SpecBoundaryGuardClass::ALL {
+            assert_eq!(
+                VacuityClass::from_canonical_name(guard.canonical_name()),
+                None
+            );
+            assert_eq!(VacuityClass::from_canonical_name(guard.guard_id()), None);
+        }
+    }
+
+    #[test]
+    fn vacuity_taxonomy_stays_frozen_at_five_classes() {
+        assert_eq!(
+            VacuityClass::ALL.map(VacuityClass::canonical_name),
+            [
+                "DeadPrecondition",
+                "SpecViolation",
+                "TrivialPostcondition",
+                "UnboundReturnOutput",
+                "SurvivedAllMutants",
+            ]
+        );
+        // The three guards report under three distinct existing classes.
+        let classes = SpecBoundaryGuardClass::ALL.map(SpecBoundaryGuardClass::to_vacuity_class);
+        assert_ne!(classes[0], classes[1]);
+        assert_ne!(classes[1], classes[2]);
+        assert_ne!(classes[0], classes[2]);
+        for class in classes {
+            assert!(VacuityClass::ALL.contains(&class));
+        }
+    }
+
+    #[test]
+    fn guard_marker_types_agree_with_the_enum() {
+        assert_eq!(
+            EntryPointPrecondition::CLASS,
+            SpecBoundaryGuardClass::EntryPointPrecondition
+        );
+        assert_eq!(EntryPointPrecondition::GUARD_ID, "entry_point_requires");
+        assert_eq!(
+            EntryPointPrecondition::CANONICAL_NAME,
+            "EntryPointPrecondition"
+        );
+        assert_eq!(
+            EntryPointPrecondition::VACUITY_CLASS,
+            VacuityClass::DeadPrecondition
+        );
+        assert_eq!(
+            FixedWidthGhostLength::CLASS,
+            SpecBoundaryGuardClass::FixedWidthGhostLength
+        );
+        assert_eq!(FixedWidthGhostLength::GUARD_ID, "fixed_width_ghost_length");
+        assert_eq!(
+            FixedWidthGhostLength::VACUITY_CLASS,
+            VacuityClass::SpecViolation
+        );
+        assert_eq!(
+            ErrorBranchWildcard::CLASS,
+            SpecBoundaryGuardClass::ErrorBranchWildcard
+        );
+        assert_eq!(ErrorBranchWildcard::GUARD_ID, "error_branch_wildcard");
+        assert_eq!(
+            ErrorBranchWildcard::VACUITY_CLASS,
+            VacuityClass::SurvivedAllMutants
+        );
+    }
+
+    // ---- Guard 1: entry-point classification -------------------------------
+
+    #[test]
+    fn entry_point_kind_wire_ids_match_lean() {
+        assert_eq!(
+            EntryPointKind::ALL.map(EntryPointKind::as_str),
+            ["main", "no_main_start", "entry_attribute"]
+        );
+    }
+
+    #[test]
+    fn name_only_entry_symbol_test_matches_lean_vectors() {
+        for accepted in [
+            "main",
+            "::main",
+            "my_crate::main",
+            "::my_crate::main",
+            "_start",
+            "::_start",
+            "my_crate::_start",
+            "::my_crate::_start",
+            "__start",
+            "::__start",
+            "my_crate::__start",
+            "::my_crate::__start",
+            "crate::main",
+        ] {
+            assert!(is_binary_entry_symbol(accepted), "{accepted:?}");
+        }
+        for rejected in [
+            "",
+            "domain",
+            "maintain",
+            "main_loop",
+            "mainx",
+            "xmain",
+            "Main",
+            "MAIN",
+            "start",
+            "_start_",
+            "___start",
+            "my_crate::domain",
+            "my_crate::maintain",
+            "my_crate::main_loop",
+            "my_crate::Type::main",
+            "my_crate::module::_start",
+            "my_crate::main::helper",
+            "main::",
+            "my_crate::main ",
+            "my_crate:main",
+            "<MyType as Trait>::main",
+            "<impl Foo>::main",
+            "{{impl}}::main",
+            ":::main",
+            "::::main",
+            "my_crate::::main",
+            "123::main",
+            "my crate::main",
+            " ::main",
+        ] {
+            assert!(!is_binary_entry_symbol(rejected), "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn path_segmentation_matches_lean_vectors() {
+        assert_eq!(path_segment_count_and_leaf("main"), (1, "main"));
+        assert_eq!(path_segment_count_and_leaf("my_crate::main"), (2, "main"));
+        assert_eq!(path_segment_count_and_leaf("a::b::c"), (3, "c"));
+        assert_eq!(path_segment_count_and_leaf(""), (1, ""));
+        assert_eq!(path_segment_count_and_leaf("::main"), (2, "main"));
+        assert_eq!(path_segment_count_and_leaf("a:b"), (1, "a:b"));
+        assert_eq!(path_segment_count_and_leaf("a:::b"), (2, ":b"));
+    }
+
+    /// The same table is asserted by `entryClassificationVectors` in
+    /// `tests/mir/SpecBoundaryGuardsTests.lean`.
+    #[test]
+    fn entry_point_classification_matches_lean_vectors() {
+        use EntryPointKind::{EntryAttribute, Main, NoMainStart};
+        let vectors: [(EntryPointDescriptor<'static>, Option<EntryPointKind>); 38] = [
+            (desc("main"), Some(Main)),
+            (desc("::main"), Some(Main)),
+            (desc("my_crate::main"), Some(Main)),
+            (desc("::my_crate::main"), Some(Main)),
+            (
+                desc("my_crate::main").with_crate_no_main(true),
+                Some(NoMainStart),
+            ),
+            (desc("_start").with_crate_no_main(true), Some(NoMainStart)),
+            (desc("::_start").with_crate_no_main(true), Some(NoMainStart)),
+            (
+                desc("my_crate::_start").with_crate_no_main(true),
+                Some(NoMainStart),
+            ),
+            (
+                desc("::my_crate::_start").with_crate_no_main(true),
+                Some(NoMainStart),
+            ),
+            (
+                desc("my_crate::__start").with_crate_no_main(true),
+                Some(NoMainStart),
+            ),
+            (desc("my_crate::_start"), None),
+            (desc("my_crate::__start"), None),
+            (
+                desc("my_crate::boot").with_link_symbol(Some("_start")),
+                Some(NoMainStart),
+            ),
+            (
+                desc("my_crate::arch::boot").with_link_symbol(Some("__start")),
+                Some(NoMainStart),
+            ),
+            (
+                desc("my_crate::arch::c_main").with_link_symbol(Some("main")),
+                Some(NoMainStart),
+            ),
+            (
+                desc("my_crate::helper").with_link_symbol(Some("helper")),
+                None,
+            ),
+            (
+                desc("my_crate::helper").with_link_symbol(Some("main_loop")),
+                None,
+            ),
+            (
+                desc("my_crate::reset").with_entry_attr(true),
+                Some(EntryAttribute),
+            ),
+            (
+                desc("my_crate::main").with_entry_attr(true),
+                Some(EntryAttribute),
+            ),
+            (desc("my_crate::Type::main").with_assoc_fn(true), None),
+            (desc("Type::main").with_assoc_fn(true), None),
+            (
+                desc("my_crate::Type::run")
+                    .with_assoc_fn(true)
+                    .with_entry_attr(true),
+                None,
+            ),
+            (
+                desc("my_crate::Boot::_start")
+                    .with_assoc_fn(true)
+                    .with_link_symbol(Some("_start")),
+                Some(NoMainStart),
+            ),
+            (
+                desc("my_crate::Server::main")
+                    .with_assoc_fn(true)
+                    .with_entry_attr(true)
+                    .with_link_symbol(Some("main")),
+                Some(NoMainStart),
+            ),
+            (
+                desc("my_crate::Boot::run")
+                    .with_assoc_fn(true)
+                    .with_link_symbol(Some("run")),
+                None,
+            ),
+            (
+                desc("my_crate::Boot::main")
+                    .with_assoc_fn(true)
+                    .with_link_symbol(Some("boot_main")),
+                None,
+            ),
+            (desc("my_crate::Type::main"), None),
+            (desc("<MyType as Trait>::main"), None),
+            (desc("<impl Foo>::main"), None),
+            (desc("{{impl}}::main"), None),
+            (desc(":::main"), None),
+            (desc("::::main"), None),
+            (desc("123::main"), None),
+            (desc("my_crate::module::main"), None),
+            (desc("my_crate::domain"), None),
+            (desc("my_crate::maintain"), None),
+            (desc("my_crate::main_loop"), None),
+            (desc("my_crate::main_loop").with_crate_no_main(true), None),
+        ];
+        for (descriptor, expected) in vectors {
+            assert_eq!(
+                classify_entry_point(&descriptor),
+                expected,
+                "{descriptor:?}"
+            );
+            // Path-based classification never accepts a path the name-only
+            // test rejects.
+            if classify_entry_path(descriptor.def_path, descriptor.crate_no_main).is_some() {
+                assert!(
+                    is_binary_entry_symbol(descriptor.def_path),
+                    "{descriptor:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn entry_attributes_are_recognized_by_whole_segment() {
+        for entry in [
+            "entry",
+            "#[entry]",
+            "cortex_m_rt::entry",
+            "#[cortex_m_rt :: entry]",
+            "#[::tokio::main]",
+            "#[riscv_rt::entry]",
+            "main",
+            "#[tokio::main]",
+            "tokio::main(flavor = \"current_thread\")",
+            "#[ start ]",
+            "start",
+        ] {
+            assert!(is_entry_attribute(entry), "{entry:?}");
+        }
+        for other in [
+            "",
+            "maintain",
+            "entry_point",
+            "restart",
+            "test",
+            "inline",
+            "no_mangle",
+            "export_name = \"main\"",
+            "doc = \"the main entry\"",
+            "main_loop",
+            "cfg(main)",
+            "main = \"x\"",
+        ] {
+            assert!(!is_entry_attribute(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn descriptor_attributes_derive_entry_attr_and_link_symbol() {
+        use EntryPointKind::{EntryAttribute, Main, NoMainStart};
+        let reset = desc("fw::reset").with_attributes(&["#[cortex_m_rt::entry]"]);
+        assert!(reset.has_entry_attr);
+        assert_eq!(classify_entry_point(&reset), Some(EntryAttribute));
+
+        let spaced_entry = desc("fw::reset").with_attributes(&["#[cortex_m_rt :: entry]"]);
+        assert_eq!(classify_entry_point(&spaced_entry), Some(EntryAttribute));
+
+        let nested_start = desc("fw::arch::_start").with_attributes(&["#[no_mangle]"]);
+        assert_eq!(nested_start.link_symbol, Some("_start"));
+        assert_eq!(classify_entry_point(&nested_start), Some(NoMainStart));
+        // Without the attribute the nested `_start` is an ordinary function.
+        assert_eq!(classify_entry_point(&desc("fw::arch::_start")), None);
+
+        let unsafe_no_mangle = desc("fw::arch::__start").with_attributes(&["#[unsafe(no_mangle)]"]);
+        assert_eq!(unsafe_no_mangle.link_symbol, Some("__start"));
+        assert_eq!(classify_entry_point(&unsafe_no_mangle), Some(NoMainStart));
+
+        let exported = desc("fw::boot").with_attributes(&["#[export_name = \"_start\"]"]);
+        assert_eq!(exported.link_symbol, Some("_start"));
+        assert_eq!(classify_entry_point(&exported), Some(NoMainStart));
+
+        let raw_exported = desc("fw::boot").with_attributes(&["#[export_name = r#\"_start\"#]"]);
+        assert_eq!(raw_exported.link_symbol, Some("_start"));
+        assert_eq!(classify_entry_point(&raw_exported), Some(NoMainStart));
+
+        let malformed_exported =
+            desc("fw::boot").with_attributes(&["#[export_name = \"_start\" + \"x\"]"]);
+        assert_eq!(malformed_exported.link_symbol, None);
+        assert_eq!(classify_entry_point(&malformed_exported), None);
+
+        let unsafe_exported =
+            desc("fw::boot").with_attributes(&["#[unsafe(export_name = \"main\")]"]);
+        assert_eq!(unsafe_exported.link_symbol, Some("main"));
+        assert_eq!(classify_entry_point(&unsafe_exported), Some(NoMainStart));
+
+        let helper = desc("fw::helper").with_attributes(&["#[no_mangle]", "#[inline]"]);
+        assert_eq!(helper.link_symbol, Some("helper"));
+        assert_eq!(classify_entry_point(&helper), None);
+
+        let renamed = desc("fw::helper").with_attributes(&["#[export_name = \"main_loop\"]"]);
+        assert_eq!(classify_entry_point(&renamed), None);
+
+        let tokio_main = desc("app::main").with_attributes(&["#[tokio::main]"]);
+        assert_eq!(classify_entry_point(&tokio_main), Some(EntryAttribute));
+        assert_eq!(classify_entry_point(&desc("app::main")), Some(Main));
+
+        // A method is not an entry point by its path or an entry attribute…
+        let method = desc("app::Server::main")
+            .with_assoc_fn(true)
+            .with_attributes(&["#[entry]", "#[inline]"]);
+        assert_eq!(classify_entry_point(&method), None);
+        let exported_method = desc("app::Server::run")
+            .with_assoc_fn(true)
+            .with_attributes(&["#[no_mangle]"]);
+        assert_eq!(classify_entry_point(&exported_method), None);
+        // …but the linker does not see Rust namespaces: exported as `main`
+        // or `_start` it is the entry symbol of the binary.
+        let no_mangle_method = desc("app::Server::main")
+            .with_assoc_fn(true)
+            .with_attributes(&["#[no_mangle]"]);
+        assert_eq!(no_mangle_method.link_symbol, Some("main"));
+        assert_eq!(classify_entry_point(&no_mangle_method), Some(NoMainStart));
+        let exported_start = desc("fw::Boot::reset")
+            .with_assoc_fn(true)
+            .with_attributes(&["#[unsafe(export_name = \"_start\")]"]);
+        assert_eq!(classify_entry_point(&exported_start), Some(NoMainStart));
+    }
+
+    #[test]
+    fn conditional_attributes_count_as_present() {
+        use EntryPointKind::{EntryAttribute, NoMainStart};
+        for attrs in [
+            &["#[cfg_attr(not(test), no_mangle)]"][..],
+            &["#[cfg_attr(not(test), unsafe(no_mangle))]"],
+            &["#[cfg_attr(target_os = \"none\", inline, no_mangle)]"],
+            &["#[cfg_attr(all(a, any(b, c)), cfg_attr(d, no_mangle))]"],
+            &["#[ cfg_attr ( feature = \"rt,x\" , no_mangle , ) ]"],
+            &["#[inline]", "#[cfg_attr(not(test), no_mangle)]"],
+        ] {
+            let start = desc("fw::arch::_start").with_attributes(attrs);
+            assert_eq!(start.link_symbol, Some("_start"), "{attrs:?}");
+            assert_eq!(classify_entry_point(&start), Some(NoMainStart), "{attrs:?}");
+        }
+        for attrs in [
+            &["#[cfg_attr(not(test), export_name = \"_start\")]"][..],
+            &[
+                "#[cfg_attr(a, export_name = \"boot\")]",
+                "#[cfg_attr(not(a), export_name = \"__start\")]",
+            ],
+            &[
+                "#[cfg_attr(not(a), export_name = \"main\")]",
+                "#[cfg_attr(a, export_name = \"boot\")]",
+            ],
+            &["#[export_name = \"main\"]", "#[no_mangle]"],
+        ] {
+            let boot = desc("fw::arch::boot").with_attributes(attrs);
+            assert_eq!(classify_entry_point(&boot), Some(NoMainStart), "{attrs:?}");
+        }
+        for attrs in [
+            &["#[cfg_attr(not(test), entry)]"][..],
+            &["#[cfg_attr(not(test), cortex_m_rt::entry)]"],
+            &["#[cfg_attr(feature = \"rt\", tokio::main(flavor = \"current_thread\"))]"],
+        ] {
+            let reset = desc("fw::reset").with_attributes(attrs);
+            assert!(reset.has_entry_attr, "{attrs:?}");
+            assert_eq!(
+                classify_entry_point(&reset),
+                Some(EntryAttribute),
+                "{attrs:?}"
+            );
+        }
+        // The predicate itself is never an attribute, and a `cfg_attr`
+        // without attributes adds nothing.
+        for attrs in [
+            &["#[cfg_attr(entry, inline)]"][..],
+            &["#[cfg_attr(no_mangle, inline)]"],
+            &["#[cfg_attr(main)]"],
+            &["#[cfg_attr(feature = \"entry, no_mangle\", inline)]"],
+            &["#[cfg(not(test))]"],
+            &["#[cfg_attrs(a, entry)]"],
+        ] {
+            let helper = desc("fw::arch::_start").with_attributes(attrs);
+            assert!(!helper.has_entry_attr, "{attrs:?}");
+            assert_eq!(helper.link_symbol, None, "{attrs:?}");
+            assert_eq!(classify_entry_point(&helper), None, "{attrs:?}");
+        }
+        // Nesting beyond the followed depth fails closed.
+        let mut nested = std::string::String::from("no_mangle");
+        for _ in 0..=MAX_CFG_ATTR_DEPTH {
+            nested = std::format!("cfg_attr(a, {nested})");
+        }
+        let deep = desc("fw::helper").with_attributes(&[nested.as_str()]);
+        assert_eq!(classify_entry_point(&deep), Some(EntryAttribute));
+    }
+
+    #[test]
+    fn attributes_are_found_like_the_rust_lexer_finds_them() {
+        use EntryPointKind::{EntryAttribute, NoMainStart};
+        for attrs in [
+            &["# [no_mangle]"][..],
+            &["#\n[no_mangle]"],
+            &["#[no_mangle] // exported for the loader"],
+            &["/* boot */ #[no_mangle]"],
+            &["/// The reset vector.\n#[no_mangle]"],
+            &["#[inline] #[no_mangle]"],
+            &["#[no_mangle]\n#[inline]"],
+            &["#[unsafe(no_mangle)] /* c */"],
+            &["#[cfg_attr(not(test), no_mangle)] // c"],
+            &["# [ cfg_attr ( not ( test ) , no_mangle ) ]"],
+        ] {
+            let start = desc("fw::arch::_start").with_attributes(attrs);
+            assert_eq!(start.link_symbol, Some("_start"), "{attrs:?}");
+            assert_eq!(classify_entry_point(&start), Some(NoMainStart), "{attrs:?}");
+        }
+        for attrs in [
+            &["# [ export_name = \"_start\" ]"][..],
+            &["#[inline]\n#[export_name = \"__start\"] // c"],
+            &["/** doc */ #[unsafe(export_name = \"main\")]"],
+        ] {
+            let boot = desc("fw::boot").with_attributes(attrs);
+            assert_eq!(classify_entry_point(&boot), Some(NoMainStart), "{attrs:?}");
+        }
+        for attr in [
+            "# [entry]",
+            "#[entry] // c",
+            "/* c */ #[cortex_m_rt::entry]",
+            "#[inline]\n#[entry]",
+            "#[tokio::main(flavor = \"current_thread\")] // c",
+            "#[tokio::main[flavor = \"current_thread\"]]",
+            "#[my_rt::entry { stack = 4096 }]",
+        ] {
+            assert!(is_entry_attribute(attr), "{attr}");
+            let reset = desc("fw::reset").with_attributes(&[attr]);
+            assert_eq!(classify_entry_point(&reset), Some(EntryAttribute), "{attr}");
+        }
+        for attr in [
+            "# ! [no_main]",
+            "#!\n[no_main]",
+            "#![no_main] // c",
+            "/* c */ #![no_main]",
+            "#![no_std]\n#![no_main]",
+        ] {
+            assert!(is_no_main_attribute(attr), "{attr}");
+        }
+        // Text inside comments and literals is never an attribute.
+        for attrs in [
+            &["// #[no_mangle]"][..],
+            &["/* #[no_mangle] */ #[inline]"],
+            &["#[doc = \"#[no_mangle]\"]"],
+            &["#[inline] // #[entry]"],
+            &["#[doc = \"entry\"]"],
+            &[""],
+        ] {
+            let helper = desc("fw::arch::_start").with_attributes(attrs);
+            assert_eq!(helper.link_symbol, None, "{attrs:?}");
+            assert!(!helper.has_entry_attr, "{attrs:?}");
+            assert_eq!(classify_entry_point(&helper), None, "{attrs:?}");
+        }
+        assert!(!is_no_main_attribute("// #![no_main]"));
+        assert!(!is_no_main_attribute("#![doc = \"#![no_main]\"]"));
+        assert!(!is_entry_attribute("/* #[entry] */"));
+        // The iterator itself.
+        let bodies: Vec<&str> =
+            attribute_bodies("/// d\n#[a(b, [c])] # ! [d = \"]\"] // e\n#[f]").collect();
+        assert_eq!(bodies, ["a(b, [c])", "d = \"]\"", "f"]);
+        assert_eq!(
+            attribute_bodies("no_mangle").collect::<Vec<_>>(),
+            ["no_mangle"]
+        );
+        assert_eq!(attribute_bodies("  ").count(), 0);
+        assert_eq!(
+            attribute_bodies("#[unclosed").collect::<Vec<_>>(),
+            ["unclosed"]
+        );
+    }
+
+    #[test]
+    fn crate_attributes_derive_no_main() {
+        use EntryPointKind::NoMainStart;
+        for attr in [
+            "#![no_main]",
+            "no_main",
+            "#![cfg_attr(not(test), no_main)]",
+            "#![cfg_attr(target_os = \"none\", no_std, no_main)]",
+            "#![cfg_attr(a, cfg_attr(b, no_main))]",
+        ] {
+            assert!(is_no_main_attribute(attr), "{attr}");
+            let start = desc("fw::_start").with_crate_attributes(&["#![no_std]", attr]);
+            assert!(start.crate_no_main, "{attr}");
+            assert_eq!(classify_entry_point(&start), Some(NoMainStart), "{attr}");
+        }
+        for attr in [
+            "#![no_std]",
+            "#![cfg_attr(no_main, no_std)]",
+            "#![cfg_attr(feature = \"x, no_main\", no_std)]",
+            "#![no_main_please]",
+            "#![doc = \"no_main\"]",
+            "",
+        ] {
+            assert!(!is_no_main_attribute(attr), "{attr}");
+            let start = desc("fw::_start").with_crate_attributes(&[attr]);
+            assert!(!start.crate_no_main, "{attr}");
+            assert_eq!(classify_entry_point(&start), None, "{attr}");
+        }
+        // Attributes only ever add the fact.
+        let kept = desc("fw::_start")
+            .with_crate_no_main(true)
+            .with_crate_attributes(&["#![no_std]"]);
+        assert!(kept.crate_no_main);
+    }
+
+    #[test]
+    fn attributes_tolerate_rust_comments_and_cfg_attr_entry_symmetry() {
+        use EntryPointKind::{EntryAttribute, NoMainStart};
+        // `is_entry_attribute` unwraps `cfg_attr` symmetrically with
+        // `is_no_main_attribute` and ignores comments inside attributes.
+        for attr in [
+            "#[cfg_attr(not(test), entry)]",
+            "#[cfg_attr(not(test), cortex_m_rt::entry)]",
+            "#[/* boot */ cfg_attr(/* pred */ not(test), /* attr */ entry /* end */)]",
+            "#[cfg_attr(a, cfg_attr(b, tokio::main(flavor = \"current_thread\")))]",
+        ] {
+            assert!(is_entry_attribute(attr), "{attr}");
+        }
+        for attr in [
+            "#[cfg_attr(entry, inline)]",
+            "#[cfg_attr(not(test), inline)]",
+            "#[cfg_attr(not(test), /* c */ maintain)]",
+        ] {
+            assert!(!is_entry_attribute(attr), "{attr}");
+        }
+        // Comments inside `no_main`, `no_mangle`, `unsafe(...)`, `export_name`,
+        // and `cfg_attr` must not hide entry points.
+        for attr in [
+            "#![/* boot */ no_main /* end */]",
+            "#![/* c */ cfg_attr(not(test), /* c */ no_main /* c */)]",
+        ] {
+            assert!(is_no_main_attribute(attr), "{attr}");
+        }
+        for attrs in [
+            &["#[/* boot */ no_mangle /* end */]"][..],
+            &["#[/* c */ unsafe(/* c */ no_mangle /* c */) /* c */]"],
+            &["#[cfg_attr(not(test), /* c */ no_mangle /* c */)]"],
+            &["#[/* c */ cfg_attr(not(test), /* c */ unsafe(/* c */ no_mangle))]"],
+        ] {
+            let start = desc("fw::arch::_start").with_attributes(attrs);
+            assert_eq!(classify_entry_point(&start), Some(NoMainStart), "{attrs:?}");
+        }
+        for attrs in [
+            &["#[/* c */ export_name /* c */ = /* c */ \"_start\" /* c */]"][..],
+            &["#[unsafe(/* c */ export_name = /* c */ r#\"_start\"# /* c */)]"],
+            &["#[cfg_attr(not(test), /* c */ export_name /* c */ = /* c */ \"\\x5fstart\")]"],
+        ] {
+            let boot = desc("fw::arch::boot").with_attributes(attrs);
+            assert_eq!(classify_entry_point(&boot), Some(NoMainStart), "{attrs:?}");
+        }
+        let reset = desc("fw::reset").with_attributes(&[
+            "#[/* c */ cfg_attr(not(test), /* c */ cortex_m_rt :: /* c */ entry)]",
+        ]);
+        assert_eq!(classify_entry_point(&reset), Some(EntryAttribute));
+        // Trailing non-comment tokens after `unsafe(...)` or `export_name` stay rejected.
+        assert_eq!(
+            classify_entry_point(
+                &desc("fw::arch::_start").with_attributes(&["#[unsafe(no_mangle) bogus]"])
+            ),
+            None
+        );
+        assert_eq!(
+            classify_entry_point(
+                &desc("fw::boot").with_attributes(&["#[export_name = \"_start\" bogus]"])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn escaped_export_names_are_decoded() {
+        use EntryPointKind::NoMainStart;
+        for (attr, symbol) in [
+            ("#[export_name = \"\\x5fstart\"]", "_start"),
+            ("#[export_name = \"\\u{5f}start\"]", "_start"),
+            ("#[export_name = \"\\u{00_5F}\\x5Fstart\"]", "__start"),
+            ("#[export_name = \"m\\x61in\"]", "main"),
+            ("#[export_name = \"ma\\\n      in\"]", "main"),
+            ("#[unsafe(export_name = \"\\u{6d}ain\")]", "main"),
+            (
+                "#[cfg_attr(not(test), export_name = \"_st\\x61rt\")]",
+                "_start",
+            ),
+        ] {
+            let boot = desc("fw::boot").with_attributes(&[attr]);
+            assert_eq!(boot.link_symbol, Some(symbol), "{attr}");
+            assert_eq!(classify_entry_point(&boot), Some(NoMainStart), "{attr}");
+        }
+        for attr in [
+            // Escapes that decode to another name, or to nothing.
+            "#[export_name = \"\\x5fstar\\x74ed\"]",
+            "#[export_name = \"\\x5f\\x5f\\x5fstart\"]",
+            "#[export_name = \"\\nmain\"]",
+            "#[export_name = \"main\\0\"]",
+            "#[export_name = \"\\xffstart\"]",
+            "#[export_name = \"\\u{}main\"]",
+            "#[export_name = \"\\u{110000}main\"]",
+            "#[export_name = \"\\qmain\"]",
+            // A raw literal has no escapes: this exports the 8 characters.
+            "#[export_name = r\"\\x5fstart\"]",
+            "#[export_name = \"_start\\\"\" extra]",
+        ] {
+            let helper = desc("fw::helper").with_attributes(&[attr]);
+            assert_eq!(classify_entry_point(&helper), None, "{attr}");
+        }
+        assert!(escaped_literal_decodes_to("\\x5fstart", "_start"));
+        assert!(escaped_literal_decodes_to("_start", "_start"));
+        assert!(!escaped_literal_decodes_to("_start", "__start"));
+        assert!(!escaped_literal_decodes_to("__start", "_start"));
+        assert!(!escaped_literal_decodes_to("", "main"));
+        assert_eq!(escaped_entry_symbol("\\x6dain"), Some("main"));
+        assert_eq!(escaped_entry_symbol("\\x6dain_loop"), None);
+    }
+
+    // ---- Guard 1: trivial `requires` lexer ---------------------------------
+
+    #[test]
+    fn trivial_requires_accepts_only_tautological_clauses() {
+        for trivial in [
+            "",
+            "   \n\t ",
+            "true",
+            "True",
+            "(true)",
+            "((true))",
+            "[true]",
+            "[true, true]",
+            "[true, (true),]",
+            "[ True , True ]",
+            "[]",
+            "// nothing to require\ntrue",
+            "true // trailing comment",
+            "/* a /* nested */ block */ true",
+            "true /* x > 0 */",
+            "-- Lean line comment\nTrue",
+            "/- Lean /- nested -/ block -/ True",
+            "// only a comment",
+        ] {
+            assert!(is_syntactically_trivial_requires(trivial), "{trivial:?}");
+        }
+        for non_trivial in [
+            "x > 0",
+            "argc == 1",
+            "false",
+            "False",
+            "TRUE",
+            "!true",
+            "true && x",
+            "true || false",
+            "true, true",
+            "true true",
+            "()",
+            "(true",
+            "true)",
+            "[true",
+            "true]",
+            "[true,,]",
+            "[,]",
+            "(true,)",
+            "[true, argc > 0]",
+            "\"true\"",
+            "r#\"true\"#",
+            "'t'",
+            "true.then(|| ())",
+            "truex",
+            "x",
+        ] {
+            assert!(
+                !is_syntactically_trivial_requires(non_trivial),
+                "{non_trivial:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trivial_requires_fails_closed_on_malformed_source() {
+        for malformed in [
+            "/* unclosed true",
+            "true /* unclosed",
+            "/- unclosed true",
+            "/* outer /* inner */ true",
+            "\"unclosed",
+            "true \"unclosed",
+            "r#\"unclosed\"",
+            "'\\",
+        ] {
+            assert!(
+                !is_syntactically_trivial_requires(malformed),
+                "{malformed:?}"
+            );
+            assert_eq!(
+                scan_trivial_requires(malformed, SpecSyntax::Any),
+                Err(SpecScanError::UnclosedLiteralOrComment),
+                "{malformed:?}"
+            );
+        }
+        // Nesting beyond the fixed stack fails closed instead of overflowing.
+        let mut deep = std::string::String::new();
+        for _ in 0..MAX_TRIVIAL_REQUIRES_DEPTH {
+            deep.push('(');
+        }
+        deep.push_str("true");
+        for _ in 0..MAX_TRIVIAL_REQUIRES_DEPTH {
+            deep.push(')');
+        }
+        assert!(is_syntactically_trivial_requires(&deep));
+        let deeper = std::format!("({deep})");
+        assert!(!is_syntactically_trivial_requires(&deeper));
+    }
+
+    #[test]
+    fn trivial_requires_respects_the_source_dialect() {
+        // `--` is a Lean comment but Rust code; `//` is the reverse.
+        let lean_commented = "True -- x > 0";
+        assert!(is_syntactically_trivial_requires_in(
+            lean_commented,
+            SpecSyntax::Lean
+        ));
+        assert!(!is_syntactically_trivial_requires_in(
+            lean_commented,
+            SpecSyntax::Rust
+        ));
+        let rust_commented = "true // x > 0";
+        assert!(is_syntactically_trivial_requires_in(
+            rust_commented,
+            SpecSyntax::Rust
+        ));
+        assert!(!is_syntactically_trivial_requires_in(
+            rust_commented,
+            SpecSyntax::Lean
+        ));
+        // Block comments of the other dialect are code as well.
+        assert!(!is_syntactically_trivial_requires_in(
+            "true /- x -/",
+            SpecSyntax::Rust
+        ));
+        assert!(!is_syntactically_trivial_requires_in(
+            "True /* x */",
+            SpecSyntax::Lean
+        ));
+        assert!(RequiresClause::rust("[true, true]").is_syntactically_trivial());
+        assert!(RequiresClause::lean("True").is_syntactically_trivial());
+        assert!(!RequiresClause::any("argc > 0").is_syntactically_trivial());
+        // `True` is an arbitrary identifier in Rust, not the boolean literal
+        // `true`, and `true` is `Bool.true` rather than `Prop` `True` in Lean.
+        assert!(!RequiresClause::rust("True").is_syntactically_trivial());
+        assert!(!RequiresClause::lean("true").is_syntactically_trivial());
+        // Lean primed identifier `b'` must not fail as an unclosed byte literal.
+        assert_eq!(scan_trivial_requires("b' = 1", SpecSyntax::Lean), Ok(false));
+        assert_eq!(scan_trivial_requires("b' = 1", SpecSyntax::Any), Ok(false));
+        assert_eq!(
+            scan_trivial_requires("b' = 1", SpecSyntax::Rust),
+            Err(SpecScanError::UnclosedLiteralOrComment)
+        );
+        assert_eq!(
+            scan_trivial_requires("cr#\"quote \" true\"#", SpecSyntax::Rust),
+            Ok(false)
+        );
+    }
+
+    // ---- Guard 1: dynamic entry-point `requires` check ---------------------
+
+    #[test]
+    fn non_entry_points_are_exempt_and_never_evaluated() {
+        let outcome = check_entry_point_requires(
+            config().with_max_trials(0),
+            &desc("my_crate::helper"),
+            Some(RequiresClause::rust("x > 0")),
+            |_: &u8| -> bool { panic!("precondition of a non-entry point must not run") },
+        );
+        assert_eq!(outcome, EntryPointGuardOutcome::NotEntryPoint);
+        assert!(outcome.passes());
+        assert_eq!(outcome.violation(), None);
+        assert_eq!(outcome.guard_class(), None);
+        assert_eq!(outcome.into_result(), Ok(None));
+        // A method named `main` is exempt as well.
+        let method = desc("my_crate::Type::main").with_assoc_fn(true);
+        assert_eq!(
+            check_entry_point_requires(config(), &method, None, |x: &u8| *x == 1),
+            EntryPointGuardOutcome::NotEntryPoint
+        );
+    }
+
+    #[test]
+    fn entry_point_without_requires_passes() {
+        let outcome = check_entry_point_requires(config(), &desc("app::main"), None, |_: &()| true);
+        assert_eq!(
+            outcome,
+            EntryPointGuardOutcome::Guarded {
+                entry_kind: EntryPointKind::Main,
+                trials_run: 256,
+            }
+        );
+        assert_eq!(outcome.into_result(), Ok(Some(EntryPointKind::Main)));
+
+        // A trivial clause and an ABI-total precondition pass on `_start`.
+        let start = desc("fw::_start").with_crate_no_main(true);
+        let outcome = check_entry_point_requires(
+            config().with_max_trials(64),
+            &start,
+            Some(RequiresClause::rust("[true, true] // nothing to require")),
+            |_: &(u32, usize)| true,
+        );
+        assert_eq!(
+            outcome,
+            EntryPointGuardOutcome::Guarded {
+                entry_kind: EntryPointKind::NoMainStart,
+                trials_run: 64,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_non_trivial_requires_on_entry_point_is_rejected() {
+        for (descriptor, kind) in [
+            (desc("app::main"), EntryPointKind::Main),
+            (
+                desc("fw::_start").with_crate_no_main(true),
+                EntryPointKind::NoMainStart,
+            ),
+            (
+                desc("fw::reset").with_entry_attr(true),
+                EntryPointKind::EntryAttribute,
+            ),
+        ] {
+            // The dynamic precondition is total: only the authored clause is
+            // at fault.
+            let outcome = check_entry_point_requires(
+                config(),
+                &descriptor,
+                Some(RequiresClause::rust("argc == 1")),
+                |_: &u8| true,
+            );
+            let violation = outcome.violation().copied().expect("violation");
+            assert_eq!(
+                violation,
+                EntryPointGuardViolation {
+                    guard: SpecBoundaryGuardClass::EntryPointPrecondition,
+                    entry_kind: kind,
+                    kind: EntryPointGuardViolationKind::ExplicitNonTrivialRequires,
+                    trials_run: 0,
+                    precondition_hits: 0,
+                }
+            );
+            assert_eq!(violation.vacuity_class(), VacuityClass::DeadPrecondition);
+            assert_eq!(violation.counterexample_trial(), None);
+            assert!(!outcome.passes());
+            assert_eq!(
+                outcome.guard_class(),
+                Some(SpecBoundaryGuardClass::EntryPointPrecondition)
+            );
+            assert_eq!(outcome.into_result(), Err(violation));
+        }
+        // Malformed clause source fails closed.
+        let outcome = check_entry_point_requires(
+            config(),
+            &desc("app::main"),
+            Some(RequiresClause::rust("true /* unclosed")),
+            |_: &u8| true,
+        );
+        assert_eq!(
+            outcome.violation().map(|violation| violation.kind),
+            Some(EntryPointGuardViolationKind::ExplicitNonTrivialRequires)
+        );
+    }
+
+    /// `verus#3606`: `fn main(argc: u8) -> u8 { 1 / argc }` with
+    /// `requires argc == 1` passes every ordinary gate (the precondition is
+    /// satisfiable, the contract is strong), and only the entry-point guard
+    /// reports that the loader may start it with `argc == 0`.
+    #[test]
+    fn satisfiable_non_universal_requires_passes_contract_check_but_not_the_guard() {
+        let pre = |argc: &u8| *argc == 1;
+        let strong = check_contract(
+            config(),
+            pre,
+            |argc: &u8| 1 / *argc,
+            |_: &u8, ret: &u8| *ret == 1,
+        );
+        assert!(strong.is_strong(), "{strong:?}");
+        assert!(strong.stats().precondition_hits >= 1);
+
+        let outcome = check_entry_point_requires(
+            config(),
+            &desc("entry_demo::main"),
+            Some(RequiresClause::rust("true")),
+            pre,
+        );
+        let violation = outcome.violation().copied().expect("violation");
+        assert_eq!(
+            violation.kind,
+            EntryPointGuardViolationKind::PreconditionRejectedInput { trial_idx: 0 }
+        );
+        assert_eq!(violation.entry_kind, EntryPointKind::Main);
+        assert_eq!(violation.trials_run, 1);
+        assert_eq!(violation.precondition_hits, 0);
+        assert_eq!(violation.vacuity_class(), VacuityClass::DeadPrecondition);
+        // The counterexample replays to the excluded ABI input `argc == 0`.
+        let trial = violation.counterexample_trial().expect("trial");
+        assert_eq!(replay_trial_input::<u8>(config(), trial), Some(0));
+    }
+
+    #[test]
+    fn precondition_excluding_one_abi_input_is_found_and_replayed() {
+        let outcome = check_entry_point_requires(
+            config(),
+            &desc("fw::__start").with_crate_no_main(true),
+            None,
+            |argc: &u32| *argc != u32::MAX,
+        );
+        let violation = outcome.violation().copied().expect("violation");
+        let EntryPointGuardViolationKind::PreconditionRejectedInput { trial_idx } = violation.kind
+        else {
+            panic!("unexpected violation {violation:?}");
+        };
+        assert_eq!(
+            replay_trial_input::<u32>(config(), trial_idx),
+            Some(u32::MAX)
+        );
+        assert_eq!(violation.trials_run, trial_idx + 1);
+        assert_eq!(violation.precondition_hits, trial_idx);
+        assert_eq!(violation.entry_kind, EntryPointKind::NoMainStart);
+    }
+
+    #[test]
+    fn trapping_precondition_and_zero_budget_fail_closed() {
+        let outcome =
+            check_entry_point_requires_fallible(config(), &desc("app::main"), None, |argc: &u8| {
+                if *argc == 2 { Err(()) } else { Ok(true) }
+            });
+        let violation = outcome.violation().copied().expect("violation");
+        let EntryPointGuardViolationKind::PreconditionTrapped { trial_idx } = violation.kind else {
+            panic!("unexpected violation {violation:?}");
+        };
+        assert_eq!(replay_trial_input::<u8>(config(), trial_idx), Some(2));
+        assert_eq!(violation.counterexample_trial(), Some(trial_idx));
+        assert_eq!(violation.precondition_hits, trial_idx);
+
+        // `max_trials == 0` proves nothing about the ABI: fail closed.
+        let outcome = check_entry_point_requires(
+            config().with_max_trials(0),
+            &desc("app::main"),
+            None,
+            |_: &u8| true,
+        );
+        assert_eq!(
+            outcome.violation().copied(),
+            Some(EntryPointGuardViolation {
+                guard: SpecBoundaryGuardClass::EntryPointPrecondition,
+                entry_kind: EntryPointKind::Main,
+                kind: EntryPointGuardViolationKind::DegenerateConfig,
+                trials_run: 0,
+                precondition_hits: 0,
+            })
+        );
+        // A single trial is enough to observe a rejection at the first
+        // boundary input.
+        let outcome = check_entry_point_requires(
+            config().with_max_trials(1),
+            &desc("app::main"),
+            None,
+            |argc: &u8| *argc != 0,
+        );
+        assert_eq!(
+            outcome.violation().map(|violation| violation.kind),
+            Some(EntryPointGuardViolationKind::PreconditionRejectedInput { trial_idx: 0 })
+        );
+    }
+
+    #[test]
+    fn entry_point_guard_is_deterministic_in_the_seed() {
+        let run = |seed: u64| {
+            check_entry_point_requires(
+                config().with_seed(seed).with_max_trials(512),
+                &desc("app::main"),
+                None,
+                |argc: &u64| *argc % 1_000_003 != 17,
+            )
+        };
+        assert_eq!(run(7), run(7));
+        assert_eq!(run(0), run(0));
+    }
+
+    // ---- Guard 3: `SemanticOutcome` ----------------------------------------
+
+    #[test]
+    fn semantic_outcome_conversions_and_branches() {
+        type Outcome = SemanticOutcome<u8, bool>;
+        assert_eq!(Outcome::from_result(Ok(3)), SemanticOutcome::Ok(3));
+        assert_eq!(Outcome::from(Err(true)), SemanticOutcome::Err(true));
+        assert_eq!(Outcome::Ok(3).into_result(), Some(Ok(3)));
+        assert_eq!(Outcome::Err(false).into_result(), Some(Err(false)));
+        assert_eq!(Outcome::Ub.into_result(), None);
+        assert_eq!(Outcome::Unsupported.into_result(), None);
+        assert_eq!(Outcome::Ok(3).branch(), OutcomeBranch::Ok);
+        assert_eq!(Outcome::Err(true).branch(), OutcomeBranch::Err);
+        assert_eq!(Outcome::Ub.branch(), OutcomeBranch::Ub);
+        assert_eq!(Outcome::Unsupported.branch(), OutcomeBranch::Unsupported);
+        assert!(Outcome::Ub.is_fault() && Outcome::Unsupported.is_fault());
+        assert!(!Outcome::Ok(0).is_fault() && !Outcome::Err(true).is_fault());
+
+        assert_eq!(<Outcome as ErrorBranchOutcome>::ub(), Some(Outcome::Ub));
+        assert_eq!(
+            <Outcome as ErrorBranchOutcome>::unsupported(),
+            Some(Outcome::Unsupported)
+        );
+        assert_eq!(
+            <Outcome as ErrorBranchOutcome>::from_error(true),
+            Outcome::Err(true)
+        );
+        assert_eq!(Outcome::Err(true).error_payload(), Some(&true));
+        assert_eq!(Outcome::Ok(1).error_payload(), None);
+        assert_eq!(<Result<u8, bool> as ErrorBranchOutcome>::ub(), None);
+        assert_eq!(
+            <Result<u8, bool> as ErrorBranchOutcome>::unsupported(),
+            None
+        );
+        assert_eq!(Err::<u8, bool>(true).error_payload(), Some(&true));
+        assert_eq!(Ok::<u8, bool>(1).branch(), OutcomeBranch::Ok);
+    }
+
+    #[test]
+    fn semantic_outcome_sampling_covers_all_four_branches_at_the_boundary() {
+        type Outcome = SemanticOutcome<u8, bool>;
+        let count = <Outcome as SampleInput>::BOUNDARY_COUNT;
+        assert_eq!(count, <Result<u8, bool> as SampleInput>::BOUNDARY_COUNT + 2);
+        let mut rng = SplitMix64::default();
+        let mut seen = [false; 4];
+        for trial_idx in 0..count {
+            let sample = Outcome::sample_at(trial_idx, &mut rng);
+            seen[match sample.branch() {
+                OutcomeBranch::Ok => 0,
+                OutcomeBranch::Err => 1,
+                OutcomeBranch::Ub => 2,
+                OutcomeBranch::Unsupported => 3,
+            }] = true;
+        }
+        assert_eq!(seen, [true; 4]);
+        assert_eq!(Outcome::sample_at(count - 2, &mut rng), Outcome::Ub);
+        assert_eq!(
+            Outcome::sample_at(count - 1, &mut rng),
+            Outcome::Unsupported
+        );
+        // Seeded draws are deterministic.
+        let draw = |seed: u64| {
+            let mut rng = SplitMix64::new(seed);
+            (count..count + 64)
+                .map(|idx| Outcome::sample_at(idx, &mut rng))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(draw(1), draw(1));
+    }
+
+    #[test]
+    fn semantic_outcome_mutants_flip_into_every_other_branch() {
+        type Outcome = SemanticOutcome<u8, bool>;
+        let collect = |start: Outcome| {
+            let mut rng = SplitMix64::default();
+            let mut mutants = Vec::new();
+            start.visit_mutants(&mut rng, |mutant| mutants.push(mutant));
+            mutants
+        };
+        let is_subsingleton = <Outcome as ReturnMutants>::IS_SUBSINGLETON;
+        assert!(!is_subsingleton);
+
+        let from_ok = collect(Outcome::Ok(5));
+        assert!(from_ok.contains(&Outcome::Ok(6)));
+        assert!(from_ok.contains(&Outcome::Ub));
+        assert!(from_ok.contains(&Outcome::Unsupported));
+        assert!(from_ok.iter().any(|m| matches!(m, Outcome::Err(_))));
+        assert!(!from_ok.contains(&Outcome::Ok(5)));
+        // The fault flips arrive within the first three mutants.
+        assert!(from_ok[..3].contains(&Outcome::Ub));
+
+        let from_err = collect(Outcome::Err(true));
+        assert!(from_err.contains(&Outcome::Err(false)));
+        assert!(from_err.contains(&Outcome::Ub));
+        assert!(from_err.contains(&Outcome::Unsupported));
+        assert!(from_err.iter().any(|m| matches!(m, Outcome::Ok(_))));
+
+        let from_ub = collect(Outcome::Ub);
+        assert_eq!(from_ub[0], Outcome::Unsupported);
+        assert!(!from_ub.contains(&Outcome::Ub));
+        assert!(from_ub.iter().any(|m| matches!(m, Outcome::Ok(_))));
+        assert!(from_ub.iter().any(|m| matches!(m, Outcome::Err(_))));
+
+        let from_unsupported = collect(Outcome::Unsupported);
+        assert_eq!(from_unsupported[0], Outcome::Ub);
+        assert!(!from_unsupported.contains(&Outcome::Unsupported));
+
+        // Subsingleton payloads still flip across branches.
+        let unit: SemanticOutcome<(), ()> = SemanticOutcome::Ok(());
+        let mut rng = SplitMix64::default();
+        let mut mutants = Vec::new();
+        unit.visit_mutants(&mut rng, |mutant| mutants.push(mutant));
+        assert!(mutants.contains(&SemanticOutcome::Ub));
+        assert!(mutants.contains(&SemanticOutcome::Unsupported));
+        assert!(mutants.contains(&SemanticOutcome::Err(())));
+    }
+
+    // ---- Guard 3: static error-branch wildcard scanner ---------------------
+
+    #[test]
+    fn wildcard_scanner_flags_every_listed_error_arm_shape() {
+        use ErrorWildcardPattern::{
+            CatchAllArmTrue, ErrArmTrue, MatchesAnyErr, UbArmTrue, UnsupportedArmTrue,
+        };
+        let cases: &[(&str, ErrorWildcardPattern)] = &[
+            // Rust.
+            ("Err(_) => true", ErrArmTrue),
+            ("Err(..) => true", ErrArmTrue),
+            ("Err(_e) => true", ErrArmTrue),
+            ("Err(e) => true", ErrArmTrue),
+            ("Err(fun) => true", ErrArmTrue),
+            ("Err(ref e) => true", ErrArmTrue),
+            ("Result::Err(_) => true", ErrArmTrue),
+            ("core::result::Result::Err(_) => true", ErrArmTrue),
+            ("Err(_) => (true)", ErrArmTrue),
+            ("Err(_) => ((true))", ErrArmTrue),
+            ("Err(_) => { true }", ErrArmTrue),
+            ("Err(_) => { return true; }", ErrArmTrue),
+            ("Err(_) => true,", ErrArmTrue),
+            ("Err(_) if true => true", ErrArmTrue),
+            ("Err(_) => true || x == 3", ErrArmTrue),
+            ("Ok(0) | Err(_) => true", ErrArmTrue),
+            ("Some(Ok(_) | Err(_)) => true", ErrArmTrue),
+            ("Some(Err(_) | Ok(0)) => true", ErrArmTrue),
+            ("(Err(_) | Ok(0)) => true", ErrArmTrue),
+            ("Err(E::A | _) => true", ErrArmTrue),
+            ("Err(_ | E::A) => true", ErrArmTrue),
+            ("Err(()) => true", ErrArmTrue),
+            ("Err(_) => !false", ErrArmTrue),
+            ("Err(_) => true && true", ErrArmTrue),
+            ("Err(_) => (true || x == 3)", ErrArmTrue),
+            ("Err(_) => true as bool", ErrArmTrue),
+            ("Err(_) => (true as bool)", ErrArmTrue),
+            ("(Err(_), _) => true", ErrArmTrue),
+            (
+                "match out { Ok(v) => *v == x + 1, Err(_) => true }",
+                ErrArmTrue,
+            ),
+            (
+                "|out: &Result<u32, E>| match out {\n    Ok(v) => *v == x + 1,\n    Err(_) => true,\n}",
+                ErrArmTrue,
+            ),
+            (
+                "#[spec(ensures: |out| match out { Ok(v) => v == x + 1, Err(_) => true })]",
+                ErrArmTrue,
+            ),
+            ("SemanticOutcome::Ub => true", UbArmTrue),
+            ("Ub => true", UbArmTrue),
+            ("SemanticOutcome::Unsupported => true", UnsupportedArmTrue),
+            ("matches!(out, Ok(_) | Err(_))", MatchesAnyErr),
+            ("matches!(out, Ok(_) | Err(_),)", MatchesAnyErr),
+            ("matches!(out, Err(_) if true)", MatchesAnyErr),
+            ("matches!(out, Ok(v) | _)", MatchesAnyErr),
+            ("matches!(out, (Err(_) | Ok(0)))", MatchesAnyErr),
+            ("matches!(out, Err(_))", MatchesAnyErr),
+            ("matches!(f(x), Ok(v) | Err(..))", MatchesAnyErr),
+            ("match out { Ok(v) => *v == 1, _ => true }", CatchAllArmTrue),
+            // Lean.
+            ("| Err _ => True", ErrArmTrue),
+            ("| .err _ => True", ErrArmTrue),
+            ("| .error _ => True", ErrArmTrue),
+            ("| .err e => True", ErrArmTrue),
+            ("| .err () => True", ErrArmTrue),
+            ("| .err (_ : String) => True", ErrArmTrue),
+            ("| .err (e : Result Nat String) => True", ErrArmTrue),
+            ("| Except.error _ => True", ErrArmTrue),
+            ("| .err _ => (True)", ErrArmTrue),
+            ("| .err _ => trivial", ErrArmTrue),
+            ("| .err _ => by trivial", ErrArmTrue),
+            ("| .err _ => ¬False", ErrArmTrue),
+            ("| .err _ => ¬ False", ErrArmTrue),
+            ("| .err _ => Not False", ErrArmTrue),
+            ("| .err _ => True ∧ True", ErrArmTrue),
+            ("| .err _ => (True ∨ x = 3)", ErrArmTrue),
+            ("| .err _ => True ∨ x = 3", ErrArmTrue),
+            ("match out with .err _ => True", ErrArmTrue),
+            ("| .ub => True", UbArmTrue),
+            ("| .unsupported => True", UnsupportedArmTrue),
+            ("| .fail .ub => True", UbArmTrue),
+            ("| .fail .unsupported => True", UnsupportedArmTrue),
+            ("| .fail _ => True", UbArmTrue),
+            ("| .ub | .unsupported => True", UbArmTrue),
+            ("| .unsupported | .ub => True", UnsupportedArmTrue),
+            (
+                "match out with\n  | .ok v => v = specFn x\n  | .err _ => True\n  | .ub => False",
+                ErrArmTrue,
+            ),
+            (
+                "fun x out => match out with | .ok v => v = x + 1 | .ub => True",
+                UbArmTrue,
+            ),
+            (
+                "def post (x : Nat) : Except String Nat → Prop\n  | .ok v => v = x + 1\n  | .error _ => True\n\ntheorem next : True := trivial",
+                ErrArmTrue,
+            ),
+            ("| .ok v => v = 1 | _ => True", CatchAllArmTrue),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(
+                detect_error_branch_wildcard(src),
+                Some(*expected),
+                "{src:?}"
+            );
+            assert_eq!(
+                expected.guard_class(),
+                SpecBoundaryGuardClass::ErrorBranchWildcard
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_scanner_does_not_flag_constrained_arms_comments_or_literals() {
+        for src in [
+            // Constrained error arms.
+            "match out { Ok(v) => *v == x + 1, Err(E::Overflow) => x == u32::MAX }",
+            "Err(E::Overflow) => true",
+            "Err(Unsupported) => true",
+            "Err(E::A | E::B) => true",
+            "Err(Error::Overflow) => true",
+            "Err(0) => true",
+            "Err(\"overflow\") => true",
+            "Err(MyErr { .. }) => true",
+            "Err(_) => x == u32::MAX",
+            "Err(()) => *x == u32::MAX",
+            "Err(e) => *e == E::Overflow",
+            "Err(_) => false",
+            "Err(_) if x == u32::MAX => true",
+            "Err(_) => true && x == 3",
+            "Err(_) => (true && x == 3)",
+            "Err(_) => (true || x == 3) && y == 4",
+            "Err(_) => true as u8 == 1",
+            "Err(_) => true as bool && x == 1",
+            "Err(_) => true == done",
+            "| .ub => False",
+            "| .unsupported => False",
+            "| .err _ => False",
+            "| .err e => e = .overflow",
+            "| .err .overflow => True",
+            "| .err .ub => True",
+            "| .err .unsupported => True",
+            "| .fail .outOfFuel => True",
+            "| .err _ => True ∧ x = 3",
+            "| .err _ => True → False",
+            "| .ub => True = False",
+            "| .ok v => v = 1",
+            "| .ok _ => True",
+            "Ok(_) => true",
+            // Scoped catch-all arms: nested inner match and subsequent items
+            // must not inherit `Ok` from an outer or earlier `Result` match.
+            "match out { Ok(v) => match *v { 0 => false, _ => true }, Err(E::A) => true }",
+            "match out { Ok(v) => *v == 1, Err(E::A) => true }\nfn other(x: u32) { match x { 0 => false, _ => true } }",
+            "def post1 : Except String Nat → Prop\n  | .ok v => v = 1\n  | .error e => e = \"a\"\ndef helper : Nat → Prop\n  | 0 => False\n  | _ => True",
+            "def post : Except String Nat → Prop\n  | .ok v => (match v with | 0 => False | _ => True)\n  | .error e => e = \"a\"",
+            // Lambdas and prior definitions must not leak an error ctor into `fun _ => True`.
+            "def helper (e : String) := Except.error e\ndef f := fun _ => True",
+            "| .ok v => let fallback := Outcome.err e\n  fun _ => True",
+            "| .ok v => fun _ => True",
+            // Comments.
+            "// Err(_) => true\nmatch out { Ok(v) => *v == 1, Err(e) => *e == E::A }",
+            "/* Err(_) => true */ match out { Ok(v) => *v == 1, Err(e) => *e == E::A }",
+            "/* outer /* Err(_) => true */ still comment */ out.is_ok()",
+            "-- | .err _ => True\n| .err e => e = E.a",
+            "/- | .ub => True -/ | .ub => False",
+            "/- outer /- | .ub => True -/ -/ | .ub => False",
+            "/// `Err(_) => true` would be a wildcard.\nfn post() {}",
+            // String, raw-string, byte-string, C-string, and character literals.
+            "let s = \"Err(_) => true\"; out == Ok(1)",
+            "let s = r#\"| .err _ => True\"#; out == Ok(1)",
+            "let s = r\"Err(_) => true\"; out == Ok(1)",
+            "let s = b\"Err(_) => true\"; out == Ok(1)",
+            "let s = c\"Err(_) => true\"; out == Ok(1)",
+            "let s = cr#\"quote \" Err(_) => true \"#; out == Ok(1)",
+            "let s = \"quote \\\" Err(_) => true\"; out == Ok(1)",
+            "| .ok c => c = '\"' ∧ s = \"| .err _ => True\"",
+            // Catch-all arms outside an `Ok` match.
+            "match x { 0 => out == 1, _ => true }",
+            "| 0 => out = 1 | _ => True",
+            // `matches!` with constrained or guarded patterns.
+            "matches!(out, Ok(_))",
+            "matches!(out, Err(E::Overflow))",
+            "matches!(out, Ok(v) if v == 3)",
+            "matches!(out, Err(_) if x == u32::MAX)",
+            "matches!(classify(Err(1)), Ok(_))",
+            // A previous arm's body is not a pattern alternative.
+            "| .none => r = .err | .some w => True",
+            "| .ok v => if v = 1 then True else False | .err e => e = .a",
+            // Lean primes (including `b'`), Rust lifetimes, and character literals lex cleanly.
+            "| .ok v' => v' = f x' | .err e => e = g x'",
+            "| .ok b' => b' = x' | .err e => e = b'",
+            "|out: &'a Result<u8, E>| match out { Ok(c) => *c == b'x', Err(e) => *e == E::A }",
+            "match c { 'a' => true, '\\n' => false, _ => false }",
+            "",
+        ] {
+            assert_eq!(detect_error_branch_wildcard(src), None, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn wildcard_scanner_fails_closed_on_malformed_source() {
+        for malformed in [
+            "/* unclosed Err(_) => false",
+            "/- unclosed | .ub => False",
+            "\"unclosed string",
+            "match out { Ok(v) => v == 1, Err(e) => e == \"oops }",
+            "r#\"unclosed raw\"",
+            "cr#\"unclosed raw c\"",
+            "'\\n\nfn f<'a>() {}",
+            "Err(_) => true /* unclosed",
+            "| .err «unclosed => False",
+            "| .err «» => False",
+        ] {
+            assert_eq!(
+                detect_error_branch_wildcard(malformed),
+                Some(ErrorWildcardPattern::UnclosedLiteralOrComment),
+                "{malformed:?}"
+            );
+            assert_eq!(
+                scan_error_branch_wildcard(malformed, SpecSyntax::Any),
+                Err(SpecScanError::UnclosedLiteralOrComment),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_lean_identifiers_are_single_names() {
+        // `«…»` is one name whatever it contains: never a bracket.
+        let mut lexer = SpecLexer::new("«(» «pre» x", SpecSyntax::Lean);
+        assert_eq!(lexer.next_tok(), Ok(Some(SpecTok::Word("("))));
+        assert_eq!(lexer.next_tok(), Ok(Some(SpecTok::Word("pre"))));
+        assert_eq!(lexer.next_tok(), Ok(Some(SpecTok::Word("x"))));
+        assert_eq!(lexer.next_tok(), Ok(None));
+        // Rust has no quoted identifiers.
+        assert_eq!(
+            SpecLexer::new("«x»", SpecSyntax::Rust).next_tok(),
+            Ok(Some(SpecTok::Sym("«")))
+        );
+        // Unclosed and empty quotes are malformed source.
+        for malformed in ["«x", "«»", "a «"] {
+            let mut lexer = SpecLexer::new(malformed, SpecSyntax::Any);
+            let mut last = lexer.next_tok();
+            while let Ok(Some(_)) = last {
+                last = lexer.next_tok();
+            }
+            assert_eq!(
+                last,
+                Err(SpecScanError::UnclosedLiteralOrComment),
+                "{malformed}"
+            );
+        }
+        // The quoted spelling of a name is that name.
+        assert!(RequiresClause::lean("«True»").is_syntactically_trivial());
+        assert!(!RequiresClause::lean("«False»").is_syntactically_trivial());
+        assert_eq!(
+            scan_trivial_requires("«True", SpecSyntax::Lean),
+            Err(SpecScanError::UnclosedLiteralOrComment)
+        );
+        // A bracket inside a quoted name does not shift the arms that follow.
+        assert_eq!(
+            scan_error_branch_wildcard(
+                "def «)» := 0\nmatch x with | 0 => False | _ => True",
+                SpecSyntax::Lean
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            scan_error_branch_wildcard(
+                "def «)» := 0\nmatch r with | .ok v => v = 1 | _ => True",
+                SpecSyntax::Lean
+            ),
+            Ok(Some(ErrorWildcardPattern::CatchAllArmTrue))
+        );
+    }
+
+    #[test]
+    fn wildcard_scanner_respects_the_source_dialect() {
+        // In Rust `--` continues the expression; in Lean it starts a comment.
+        let src = "Err(_) => true -- && x == 3";
+        assert_eq!(
+            scan_error_branch_wildcard(src, SpecSyntax::Lean),
+            Ok(Some(ErrorWildcardPattern::ErrArmTrue))
+        );
+        assert_eq!(scan_error_branch_wildcard(src, SpecSyntax::Rust), Ok(None));
+        // Unknown dialect: flag (fail-closed towards reporting).
+        assert_eq!(
+            detect_error_branch_wildcard(src),
+            Some(ErrorWildcardPattern::ErrArmTrue)
+        );
+        // A Lean wildcard hidden behind a Rust-style comment marker is not
+        // hidden from the Lean scanner.
+        let lean = "| .err _ => True // ∧ False";
+        assert_eq!(scan_error_branch_wildcard(lean, SpecSyntax::Lean), Ok(None));
+        assert_eq!(
+            scan_error_branch_wildcard(lean, SpecSyntax::Rust),
+            Ok(Some(ErrorWildcardPattern::ErrArmTrue))
+        );
+    }
+
+    /// Regression vectors shared byte-for-byte by `anneal_spec::spec_check`
+    /// and `cargo_anneal::property_registry` (the two crates cannot depend on
+    /// each other): `(dialect, source, wire tag of the first finding)`, where
+    /// an empty tag means "no finding".
+    const WILDCARD_PARITY_VECTORS: &[(&str, &str, &str)] = &[
+        // A parenthesized or bracketed Lean `match` has arms below depth 0.
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | .err _ => True)",
+            "err_arm_true",
+        ),
+        (
+            "any",
+            "(match r with | .ok v => v = 1 | .err _ => True)",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "P ∧ (match r with | .ok v => v = 1 | .err _ => True)",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "fun x out => (match out with | .ok v => v = x + 1 | .ub => True)",
+            "ub_arm_true",
+        ),
+        (
+            "lean",
+            "def post (x : Nat) (out : Outcome) : Prop :=\n  (match out with\n  | .ok v => v = x\n  | .unsupported => True)",
+            "unsupported_arm_true",
+        ),
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | _ => True)",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "[match r with | .ok v => v = 1 | .err _ => True]",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "(fun out => match out with | .ok v => v = 1 | .err _ => True)",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => (match v with | 0 => False | _ => True) ∧ Q | .err _ => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => xs.all (fun x => x ||| 1 = v) | .err _ => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | .err e => e = 2) ∧ (match q with | 0 => False | _ => True)",
+            "",
+        ),
+        // A Lean `match` without parentheses owns every later arm.
+        (
+            "lean",
+            "match out with | .err e => e = .a | .ok v => match v with | 0 => False | _ => True",
+            "",
+        ),
+        (
+            "lean",
+            "match out with | .err e => e = .a | .ok v => match v with | 0 => False | n => True",
+            "",
+        ),
+        (
+            "lean",
+            "match out with | .ok v => { s with a := v } = t | _ => True",
+            "catch_all_arm_true",
+        ),
+        // Tuple components and Lean discriminants are siblings, not payloads.
+        ("rust", "(Err(_), Err(_)) => true", "err_arm_true"),
+        ("rust", "(Err(_), Ok(_)) => true", "err_arm_true"),
+        ("rust", "(Err(E::A), Err(_)) => true", "err_arm_true"),
+        ("rust", "(Err(_), Err(E::A)) => true", "err_arm_true"),
+        ("rust", "Wrap(Err(_), 3) => true", "err_arm_true"),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (Err(_), _) | (_, Err(_)) => true }",
+            "err_arm_true",
+        ),
+        ("lean", "| .err _, .ok v => True", "err_arm_true"),
+        ("lean", "| .ok v, .err _ => True", "err_arm_true"),
+        ("lean", "| .err .a, .ok v => True", ""),
+        ("rust", "(Err(E::A), Err(E::B)) => true", ""),
+        ("rust", "Err((_, E::A)) => true", ""),
+        // A bare binding is a catch-all exactly like `_`.
+        (
+            "rust",
+            "match out { Ok(v) => *v == 1, e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => *v == 1, _e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => *v == 1, ref other => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => { *v == 1 } e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => { *v == 1 } Err(_) => true }",
+            "err_arm_true",
+        ),
+        ("lean", "| .ok v => v = 1 | e => True", "catch_all_arm_true"),
+        (
+            "lean",
+            "match out with | .ok v => v = 1 | _e => True",
+            "catch_all_arm_true",
+        ),
+        ("rust", "match x { 0 => out == 1, n => true }", ""),
+        ("rust", "match out { Ok(v) => *v == 1, MAX => true }", ""),
+        (
+            "rust",
+            "match out { Ok(v) => match v.kind { Kind::A => true, other => true }, Err(e) => *e == E::A }",
+            "",
+        ),
+        (
+            "lean",
+            "match x with | some (.ok v) => v = 1 | none => True",
+            "",
+        ),
+        (
+            "lean",
+            "| .ok v => f (fun e => True) | .err e => e = .a",
+            "",
+        ),
+        // Scopes: a block restores the bracket depth around it, and neither
+        // dialect leaks a nested scope into the arms that follow it.
+        (
+            "any",
+            "match out { Ok(v) => (match v { 0 => false, _ => true }), _ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "matches!(out, Ok(Foo { x: 1 }) | Err(_))",
+            "matches_any_err",
+        ),
+        (
+            "rust",
+            "fn f() -> bool { matches!{out, Err(_)} }",
+            "matches_any_err",
+        ),
+        ("rust", "matches!(out, Ok(Foo { x: 1 }) | Err(E::A))", ""),
+        // Lean raw strings: a backslash does not escape the closing quote.
+        (
+            "lean",
+            "| .ok v => v = r\"\\\" ∧ True | .err _ => True -- \"",
+            "err_arm_true",
+        ),
+        (
+            "any",
+            "| .ok v => v = r\"\\\" ∧ True | .err _ => True -- \"",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => v = r\"| .err _ => True\" | .err e => e = .a",
+            "",
+        ),
+        (
+            "lean",
+            "| .ok v => v = r#\"\"| .err _ => True\"\"# | .err e => e = .a",
+            "",
+        ),
+        // Trivially-true bodies.
+        ("lean", "| .err _ => (True : Prop)", "err_arm_true"),
+        ("rust", "Err(_) => { return true || p; }", "err_arm_true"),
+        ("rust", "Err(_) => { true || p; false }", ""),
+        ("lean", "| .err _ => (True : Prop) ∧ x = 3", ""),
+        // An or-pattern below a payload constructor stays constrained.
+        ("rust", "Err(Wrap(E::A | _)) => true", ""),
+        ("rust", "Err(Wrap(E::A) | _) => true", "err_arm_true"),
+        ("lean", "| .err (.a | _) => True", "err_arm_true"),
+        ("lean", "| .err (.wrap (.a | _)) => True", ""),
+        // Struct patterns after `|` must not wipe an earlier wildcard or
+        // `matches!` arm state.
+        (
+            "rust",
+            "matches!(out, Err(_) | Ok(Foo { x: 1 }))",
+            "matches_any_err",
+        ),
+        (
+            "rust",
+            "matches!(out, Err(_) | Foo { x: 1 })",
+            "matches_any_err",
+        ),
+        ("rust", "Err(_) | Ok(Foo { x: 1 }) => true", "err_arm_true"),
+        ("rust", "Err(_) | Foo { x: 1 } => true", "err_arm_true"),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, _ | Foo { x: 1 } => true }",
+            "catch_all_arm_true",
+        ),
+        // Catch-all binders behind `&`, `&mut`, `(...)`, `@`, and Lean type
+        // ascriptions, without false-positiving on constructor-wrapped or-patterns.
+        (
+            "rust",
+            "match out { &Ok(v) => v == 1, &_ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { &Ok(v) => v == 1, &e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, &mut e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, &&_ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, (_) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, ((e)) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, e @ _ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => v = 1 | (_ : Except String Nat) => True",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | (e : Except String (List Nat)) => True)",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Some(0 | _) => true }",
+            "",
+        ),
+        ("rust", "match out { Ok(v) => v == 1, &E::A => true }", ""),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, e @ E::A => true }",
+            "",
+        ),
+        // Parenthesized conjunctions and right-hand disjunctions in arm bodies,
+        // respecting `&&` > `||` and `∨` > `→` precedence.
+        ("rust", "Err(_) => (true && true)", "err_arm_true"),
+        ("lean", "| .err _ => (True ∧ True)", "err_arm_true"),
+        ("rust", "Err(_) => x == 1 || true", "err_arm_true"),
+        ("rust", "Err(_) => (x == 1 || true)", "err_arm_true"),
+        (
+            "rust",
+            "Err(_) => { return x == 1 || true; }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(_) => x == 1 || (true && true)", "err_arm_true"),
+        ("lean", "| .err _ => x = 1 ∨ True", "err_arm_true"),
+        ("lean", "| .err _ => (x = 1 ∨ True)", "err_arm_true"),
+        ("rust", "Err(_) => x == 1 || true && y == 2", ""),
+        ("rust", "Err(_) => (x == 1 || true) && y == 2", ""),
+        ("lean", "| .err _ => x = 1 ∨ True → False", ""),
+        ("lean", "| .err _ => True ∨ x = 1 → False", ""),
+        ("rust", "Err(_) => { check() } _ if a || true => false", ""),
+        // Unicode Lean lambda `λ` behaves like `fun`.
+        ("lean", "| .ok v => λ _ => True", ""),
+        ("lean", "| .ok v => f (λ e => True) | .err e => e = .a", ""),
+        // An arm body ends at the next top-level command: later code is
+        // not part of it.
+        (
+            "lean",
+            "def post : Outcome → Prop\n  | .ok v => v = 1\n  | .err _ => False\n\n#eval decide (1 = 1) || true",
+            "",
+        ),
+        (
+            "lean",
+            "def post : Outcome → Prop\n  | .ok v => v = 1\n  | .err _ => False\n\n#check P ∨ True",
+            "",
+        ),
+        (
+            "lean",
+            "def post : Outcome → Prop\n  | .ok v => v = 1\n  | .ub => False\n\nnamespace Foo\nvariable (x : Nat)\n#reduce x = x ∨ True",
+            "",
+        ),
+        (
+            "lean",
+            "| .err _ => False\n@[simp] theorem t : P ∨ True := trivial",
+            "",
+        ),
+        (
+            "lean",
+            "| .err _ => e = .a\nopen Foo in\n#check Q ∨ True",
+            "",
+        ),
+        // Right-extending constructs own the disjunctions after them.
+        ("lean", "| .err _ => if c then False else P ∨ True", ""),
+        (
+            "lean",
+            "| .err _ => True ∨ if c then P else Q",
+            "err_arm_true",
+        ),
+        ("lean", "| .err _ => False ∨ True", "err_arm_true"),
+        // A tuple is not a parenthesized proposition.
+        ("rust", "Err(_) => (true, x)", ""),
+        ("rust", "Err(_) => (true || x, y)", ""),
+        // Struct patterns keep their error constructors.
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Wrapper { inner: Err(_) } => true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Wrapper { x: 1, inner: Err(_) } => true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Wrapper { inner: Err(_), x: 1, y: 2 } => true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Wrapper { inner: Err(E::A), x: 1 } => true }",
+            "",
+        ),
+        (
+            "rust",
+            "match w { W { r: Ok(v), .. } => v == 1, _ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "match out with | { val := .ok v } => v = 1 | { val := .err _ } => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "match out with | { val := .ok v } => v = 1 | { val := .err .a } => True",
+            "",
+        ),
+        (
+            "rust",
+            "fn f() -> Foo { Foo { r: Err(e) } }\nfn g(x: u8) -> bool { match x { 0 => false, _ => true } }",
+            "",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => { check(Err(e)) } Err(E::A) => true }",
+            "",
+        ),
+        // A tuple of catch-alls is a catch-all.
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_, _) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (e, f,) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, ((_, _), _) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_, Ok(y)) => true }",
+            "",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_ | 0, Ok(y)) => true }",
+            "",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, (_ | 0) => true }",
+            "catch_all_arm_true",
+        ),
+        // Lean identifier quotes are transparent.
+        (
+            "lean",
+            "match out with | .ok v => v = 1 | «e» => True",
+            "catch_all_arm_true",
+        ),
+        ("lean", "| «Except.error» _ => True", ""),
+        // Nested catch-all paren frames neither leak into inner unit patterns
+        // nor lose outer tuple/or state.
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_, ()) => true }",
+            "",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_, (a, b) | (0, 1)) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, ((a, b) | (0, 1), _) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, ((_, _), (0, 1)) => true }",
+            "",
+        ),
+        // Double negation, tautological implications (`P → True`), and Rust
+        // braced `if … else { … } || true`.
+        ("rust", "Err(_) => !!true", "err_arm_true"),
+        ("lean", "| .err _ => ¬¬True", "err_arm_true"),
+        ("lean", "| .err _ => ¬ ¬ True", "err_arm_true"),
+        ("lean", "| .err _ => e = .overflow → True", "err_arm_true"),
+        ("lean", "| .err _ => P → Q → True", "err_arm_true"),
+        ("lean", "| .err _ => (P → True)", "err_arm_true"),
+        ("lean", "| .err _ => (P → True) ∧ x = 3", ""),
+        ("lean", "| .err _ => P ↔ True", ""),
+        ("lean", "| .err _ => if c then False else P → True", ""),
+        (
+            "rust",
+            "Err(_) => if c { false } else { x == 1 } || true",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "Err(_) => if c || true { false } else { false }",
+            "",
+        ),
+        (
+            "rust",
+            "Err(_) => if c { false } else { x == 1 } && true",
+            "",
+        ),
+        // One token compared with itself is trivially true.
+        ("rust", "Err(e) => e == e", "err_arm_true"),
+        ("lean", "| .err e => e = e", "err_arm_true"),
+        ("lean", "| .err _ => 0 = 0", "err_arm_true"),
+        ("rust", "Err(e) => e == e && x == 1", ""),
+        ("rust", "Err(e) => e == e.clone()", ""),
+        ("rust", "Err(e) => e == f", ""),
+        ("lean", "| .err e => f = f x", ""),
+        ("lean", "| .err e => e = e'", ""),
+        // A `let` statement without a call, macro, or control flow does not
+        // constrain the outcome: the block's value is what follows it.
+        ("rust", "Err(e) => { let _ = e; true }", "err_arm_true"),
+        (
+            "rust",
+            "Err(e) => { let _unused = &e; let code = e.code; true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "Err(e) => { let _ = e; return true; }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(e) => { let _ = e; false }", ""),
+        ("rust", "Err(e) => { let _ = e; x == 1 }", ""),
+        ("rust", "Err(e) => { assert_eq!(*e, E::A); true }", ""),
+        ("rust", "Err(e) => { let ok = check(e); true }", ""),
+        ("rust", "Err(e) => { true; x == 1 }", ""),
+        // Deref/field reflexive equality, Lean `|||` / `|>` continuations,
+        // empty `;`, and panicking div/rem `let` statements.
+        ("rust", "Err(e) => *e == *e", "err_arm_true"),
+        ("rust", "Err(e) => e.code == e.code", "err_arm_true"),
+        ("lean", "| .err e => e.code = e.code", "err_arm_true"),
+        ("rust", "Err(_) => false == false", "err_arm_true"),
+        ("rust", "Err(_) => true == true", "err_arm_true"),
+        ("rust", "Err(_) => true == false", ""),
+        ("rust", "Err(e) => *e == *e && x == 1", ""),
+        ("rust", "Err(e) => e.code == e.code.abs()", ""),
+        ("lean", "| .err e => n = n ||| 1", ""),
+        ("lean", "| .err e => x = x |> f", ""),
+        ("rust", "Err(e) => { let _ = e;; true }", "err_arm_true"),
+        ("rust", "Err(e) => { ; true }", "err_arm_true"),
+        ("rust", "Err(e) => { let _ = 1 / *e; true }", ""),
+        ("rust", "Err(e) => { let _ = *e % 2; true }", ""),
+        // What follows a trivially-true operand must not bind it into a
+        // larger term: an unknown operator is not a tautology.
+        ("lean", "| .err f => f = f ∘ g", ""),
+        ("lean", "| .err s => s = s ∪ t", ""),
+        ("lean", "| .err e => e = e $ x", ""),
+        ("lean", "| .err a => a = a ∣ b", ""),
+        ("rust", "Err(e) => e == e | m", ""),
+        ("lean", "| .err e => e = e | .ok v => v = 1", "err_arm_true"),
+        ("any", "| .err e => e = e | .ok v => v = 1", "err_arm_true"),
+        (
+            "lean",
+            "⟨fun out => match out with | .ok v => v = 1 | .err _ => True⟩",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "have h : match x with | .ok v => v = 1 | .err _ => True := by simp",
+            "err_arm_true",
+        ),
+        // Only a `let` that names, projects, borrows, or dereferences is
+        // benign: arithmetic may panic.
+        ("rust", "Err(e) => { let _ = *e + 1; true }", ""),
+        ("rust", "Err(e) => { let _ = *e - 1; true }", ""),
+        ("rust", "Err(e) => { let _ = *e * 2; true }", ""),
+        ("rust", "Err(e) => { let _ = -*e; true }", ""),
+        ("rust", "Err(e) => { let _ = *e << 70; true }", ""),
+        ("rust", "Err(e) => { let _ = *e; true }", "err_arm_true"),
+        (
+            "rust",
+            "Err(e) => { let _ = &*e; let c = e.code; true }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(e) => { let _ = E::A; true }", "err_arm_true"),
+        // A quoted Lean identifier is one name, never a bracket or a
+        // constructor path.
+        (
+            "lean",
+            "def «(» : Nat := 0\ndef post : Outcome → Prop\n  | .ok v => v = 1\n  | .err _ => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "match out with | .ok v => v = 1 | «e'» => True",
+            "catch_all_arm_true",
+        ),
+    ];
+
+    #[test]
+    fn wildcard_scanner_agrees_with_the_parity_vectors() {
+        for (dialect, src, expected) in WILDCARD_PARITY_VECTORS {
+            let syntax = match *dialect {
+                "rust" => SpecSyntax::Rust,
+                "lean" => SpecSyntax::Lean,
+                "any" => SpecSyntax::Any,
+                other => panic!("unknown dialect {other:?}"),
+            };
+            let found = scan_error_branch_wildcard(src, syntax)
+                .expect("parity vectors are well-formed")
+                .map_or("", ErrorWildcardPattern::as_str);
+            assert_eq!(found, *expected, "{dialect}: {src:?}");
+        }
+    }
+
+    #[test]
+    fn wildcard_scanner_scope_tracking_is_bounded_and_fails_closed() {
+        use std::string::String;
+        let depth = MAX_OK_SCOPE_DEPTH + 8;
+        let opens = "{ ".repeat(depth);
+        let closes = " }".repeat(depth);
+        // Beyond the tracked capacity a catch-all is reported (fail closed).
+        let deep = std::format!("{opens}match x {{ 0 => false, _ => true }}{closes}");
+        assert_eq!(
+            detect_error_branch_wildcard(&deep),
+            Some(ErrorWildcardPattern::CatchAllArmTrue)
+        );
+        // The stack unwinds: after the nest, scopes are tracked exactly again.
+        let after = std::format!("{opens}{closes} match y {{ 0 => false, _ => true }}");
+        assert_eq!(detect_error_branch_wildcard(&after), None);
+        let after_ok = std::format!("{opens}{closes} match out {{ Ok(v) => *v == 1, _ => true }}");
+        assert_eq!(
+            detect_error_branch_wildcard(&after_ok),
+            Some(ErrorWildcardPattern::CatchAllArmTrue)
+        );
+        // Sequential Lean matches never accumulate scopes.
+        let mut many = String::new();
+        for _ in 0..(4 * MAX_OK_SCOPE_DEPTH) {
+            many.push_str("(match a with | 0 => False | _ => True) ∧ ");
+        }
+        let clean = std::format!("{many}(match r with | .ok v => v = 1 | .err e => e = 2)");
+        assert_eq!(
+            scan_error_branch_wildcard(&clean, SpecSyntax::Lean),
+            Ok(None)
+        );
+        let dirty = std::format!("{many}(match r with | .ok v => v = 1 | _ => True)");
+        assert_eq!(
+            scan_error_branch_wildcard(&dirty, SpecSyntax::Lean),
+            Ok(Some(ErrorWildcardPattern::CatchAllArmTrue))
+        );
+        // Closers of brackets opened before the snippet are tolerated.
+        assert_eq!(
+            detect_error_branch_wildcard("} ) ] } match out { Ok(v) => *v == 1, _ => true }"),
+            Some(ErrorWildcardPattern::CatchAllArmTrue)
+        );
+        assert_eq!(
+            detect_error_branch_wildcard("} ) ] } match x { 0 => false, _ => true }"),
+            None
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_wire_ids_are_distinct() {
+        let all = [
+            ErrorWildcardPattern::ErrArmTrue,
+            ErrorWildcardPattern::UbArmTrue,
+            ErrorWildcardPattern::UnsupportedArmTrue,
+            ErrorWildcardPattern::MatchesAnyErr,
+            ErrorWildcardPattern::CatchAllArmTrue,
+            ErrorWildcardPattern::UnclosedLiteralOrComment,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.as_str(), b.as_str());
+            }
+            assert_eq!(std::format!("{a}"), a.as_str());
+        }
+    }
+
+    // ---- Guard 3: dynamic error-branch wildcard checks ---------------------
+
+    fn checked_incr(x: &u32) -> Result<u32, ()> {
+        x.checked_add(1).ok_or(())
+    }
+
+    /// `Ok(v) => v == x + 1, Err(_) => true`.
+    fn incr_wildcard_post(x: &u32, ret: &Result<u32, ()>) -> bool {
+        match ret {
+            Ok(v) => x.checked_add(1) == Some(*v),
+            Err(_) => true,
+        }
+    }
+
+    /// `Ok(v) => v == x + 1, Err(()) => x == u32::MAX`.
+    fn incr_guarded_post(x: &u32, ret: &Result<u32, ()>) -> bool {
+        match ret {
+            Ok(v) => x.checked_add(1) == Some(*v),
+            Err(()) => *x == u32::MAX,
+        }
+    }
+
+    /// `awsm2`: the wildcard postcondition passes the base contract check and
+    /// is deterministically killed by the error-escape probe.
+    #[test]
+    fn error_wildcard_passes_base_check_and_is_killed_by_the_guard() {
+        let base = check_contract(config(), |_: &u32| true, checked_incr, incr_wildcard_post);
+        assert!(base.is_strong(), "{base:?}");
+
+        let outcome = check_result_contract_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            checked_incr,
+            incr_wildcard_post,
+        );
+        let violation = outcome.violation().copied().expect("violation");
+        assert_eq!(violation.guard, SpecBoundaryGuardClass::ErrorBranchWildcard);
+        assert_eq!(violation.vacuity_class(), VacuityClass::SurvivedAllMutants);
+        assert_eq!(
+            violation.kind,
+            ErrorWildcardViolationKind::ErrorEscapeAccepted { trial_idx: 0 }
+        );
+        assert_eq!(
+            outcome.vacuity_class(),
+            Some(VacuityClass::SurvivedAllMutants)
+        );
+        assert_eq!(
+            outcome.guard_class(),
+            Some(SpecBoundaryGuardClass::ErrorBranchWildcard)
+        );
+        assert!(!outcome.is_strong());
+        // The counterexample input is one on which the function succeeds.
+        let input = replay_trial_input::<u32>(config(), violation.counterexample_trial())
+            .expect("replayable trial");
+        assert!(checked_incr(&input).is_ok());
+        assert_eq!(violation.stats.base, base.stats());
+        // Deterministic: the same configuration reports the same violation.
+        assert_eq!(
+            outcome,
+            check_result_contract_no_error_wildcard(
+                config(),
+                |_: &u32| true,
+                checked_incr,
+                incr_wildcard_post,
+            )
+        );
+    }
+
+    #[test]
+    fn guarded_result_contract_is_strong() {
+        let outcome = check_result_contract_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            checked_incr,
+            incr_guarded_post,
+        );
+        let ErrorWildcardCheckOutcome::Strong(stats) = outcome else {
+            panic!("expected a strong contract, got {outcome:?}");
+        };
+        assert_eq!(outcome.vacuity_class(), None);
+        assert_eq!(outcome.guard_class(), None);
+        assert_eq!(outcome.violation(), None);
+        assert!(stats.ok_hits > 0);
+        // `u32::MAX` is a boundary input, so the error branch is exercised.
+        assert!(stats.err_hits > 0);
+        assert_eq!(stats.ok_hits + stats.err_hits, stats.base.precondition_hits);
+        // `()` has one boundary payload plus two seeded draws per `Ok` hit.
+        assert_eq!(stats.error_escape_probes, stats.ok_hits * 3);
+        // `()` is a subsingleton: there is no payload mutant to test.
+        assert_eq!(stats.err_payload_mutants_tested, 0);
+        assert_eq!(stats.fault_probes, 0);
+    }
+
+    fn coded_incr(x: &u32) -> Result<u32, u8> {
+        x.checked_add(1).ok_or(7)
+    }
+
+    #[test]
+    fn unconstrained_error_payload_is_rejected() {
+        // The error is required exactly when `x == u32::MAX`, but any code is
+        // accepted: the constant-wrong-code mutant survives.
+        let payload_wildcard = |x: &u32, ret: &Result<u32, u8>| match ret {
+            Ok(v) => x.checked_add(1) == Some(*v),
+            Err(_) => *x == u32::MAX,
+        };
+        let base = check_contract(config(), |_: &u32| true, coded_incr, payload_wildcard);
+        assert!(base.is_strong(), "{base:?}");
+
+        let outcome = check_result_contract_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            coded_incr,
+            payload_wildcard,
+        );
+        let violation = outcome.violation().copied().expect("violation");
+        let ErrorWildcardViolationKind::ErrorPayloadUnconstrained { trial_idx } = violation.kind
+        else {
+            panic!("unexpected violation {violation:?}");
+        };
+        assert_eq!(
+            replay_trial_input::<u32>(config(), trial_idx),
+            Some(u32::MAX)
+        );
+        assert!(violation.stats.err_payload_mutants_tested > 0);
+        assert_eq!(violation.stats.err_payload_mutants_killed, 0);
+        assert_eq!(violation.vacuity_class(), VacuityClass::SurvivedAllMutants);
+
+        // Pinning the code repairs the contract.
+        let outcome = check_result_contract_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            coded_incr,
+            |x: &u32, ret: &Result<u32, u8>| match ret {
+                Ok(v) => x.checked_add(1) == Some(*v),
+                Err(code) => *x == u32::MAX && *code == 7,
+            },
+        );
+        let ErrorWildcardCheckOutcome::Strong(stats) = outcome else {
+            panic!("expected a strong contract, got {outcome:?}");
+        };
+        assert!(stats.err_hits > 0);
+        assert!(stats.err_payload_mutants_killed >= stats.err_hits);
+    }
+
+    #[test]
+    fn wrong_error_payload_escape_on_ok_inputs_is_rejected() {
+        // Accepts `Err(0)` everywhere: an error escape with a specific code.
+        let outcome = check_result_contract_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            coded_incr,
+            |x: &u32, ret: &Result<u32, u8>| match ret {
+                Ok(v) => x.checked_add(1) == Some(*v),
+                Err(code) => *code == 0 || (*x == u32::MAX && *code == 7),
+            },
+        );
+        assert_eq!(
+            outcome.violation().map(|violation| violation.kind),
+            Some(ErrorWildcardViolationKind::ErrorEscapeAccepted { trial_idx: 0 })
+        );
+    }
+
+    type IncrOutcome = SemanticOutcome<u32, ()>;
+
+    fn semantic_incr(x: &u32) -> IncrOutcome {
+        SemanticOutcome::from_result(checked_incr(x))
+    }
+
+    fn semantic_guarded_post(x: &u32, ret: &IncrOutcome) -> bool {
+        match ret {
+            SemanticOutcome::Ok(v) => x.checked_add(1) == Some(*v),
+            SemanticOutcome::Err(()) => *x == u32::MAX,
+            SemanticOutcome::Ub | SemanticOutcome::Unsupported => false,
+        }
+    }
+
+    #[test]
+    fn semantic_outcome_contract_must_reject_ub_and_unsupported() {
+        let strong = check_semantic_outcome_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            semantic_incr,
+            semantic_guarded_post,
+        );
+        let ErrorWildcardCheckOutcome::Strong(stats) = strong else {
+            panic!("expected a strong contract, got {strong:?}");
+        };
+        assert_eq!(stats.fault_probes, 2 * stats.base.precondition_hits);
+        assert!(stats.ok_hits > 0 && stats.err_hits > 0);
+
+        // `| .ub => True`.
+        let ub_wildcard = check_semantic_outcome_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            semantic_incr,
+            |x: &u32, ret: &IncrOutcome| {
+                matches!(ret, SemanticOutcome::Ub) || semantic_guarded_post(x, ret)
+            },
+        );
+        assert_eq!(
+            ub_wildcard.violation().map(|violation| violation.kind),
+            Some(ErrorWildcardViolationKind::UbAccepted { trial_idx: 0 })
+        );
+        assert_eq!(
+            ub_wildcard.vacuity_class(),
+            Some(VacuityClass::SurvivedAllMutants)
+        );
+
+        // `| .unsupported => True`.
+        let unsupported_wildcard = check_semantic_outcome_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            semantic_incr,
+            |x: &u32, ret: &IncrOutcome| {
+                matches!(ret, SemanticOutcome::Unsupported) || semantic_guarded_post(x, ret)
+            },
+        );
+        assert_eq!(
+            unsupported_wildcard
+                .violation()
+                .map(|violation| violation.kind),
+            Some(ErrorWildcardViolationKind::UnsupportedAccepted { trial_idx: 0 })
+        );
+
+        // `| .err _ => True` on the semantic outcome type.
+        let err_wildcard = check_semantic_outcome_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            semantic_incr,
+            |x: &u32, ret: &IncrOutcome| {
+                matches!(ret, SemanticOutcome::Err(())) || semantic_guarded_post(x, ret)
+            },
+        );
+        assert_eq!(
+            err_wildcard.violation().map(|violation| violation.kind),
+            Some(ErrorWildcardViolationKind::ErrorEscapeAccepted { trial_idx: 0 })
+        );
+    }
+
+    #[test]
+    fn live_fault_accepted_by_the_postcondition_is_rejected() {
+        // The body has undefined behavior on `x == 3` and the postcondition
+        // waves it through.
+        let body = |x: &u32| {
+            if *x == 3 {
+                IncrOutcome::Ub
+            } else {
+                semantic_incr(x)
+            }
+        };
+        let outcome = check_semantic_outcome_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            body,
+            |x: &u32, ret: &IncrOutcome| {
+                if *x == 3 {
+                    matches!(ret, SemanticOutcome::Ub)
+                } else {
+                    semantic_guarded_post(x, ret)
+                }
+            },
+        );
+        let violation = outcome.violation().copied().expect("violation");
+        let ErrorWildcardViolationKind::UbAccepted { trial_idx } = violation.kind else {
+            panic!("unexpected violation {violation:?}");
+        };
+        assert_eq!(replay_trial_input::<u32>(config(), trial_idx), Some(3));
+
+        // With the guarded postcondition the same body is a plain live
+        // violation of the base check.
+        let outcome = check_semantic_outcome_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            body,
+            semantic_guarded_post,
+        );
+        let ErrorWildcardCheckOutcome::BaseFailed(failure) = outcome else {
+            panic!("expected a base failure, got {outcome:?}");
+        };
+        assert_eq!(failure.class, VacuityClass::SpecViolation);
+        assert_eq!(outcome.vacuity_class(), Some(VacuityClass::SpecViolation));
+        assert_eq!(outcome.guard_class(), None);
+    }
+
+    #[test]
+    fn base_failures_are_reported_before_any_probe() {
+        // Dead precondition.
+        let outcome = check_result_contract_no_error_wildcard(
+            config(),
+            |_: &u32| false,
+            checked_incr,
+            incr_guarded_post,
+        );
+        let ErrorWildcardCheckOutcome::BaseFailed(failure) = outcome else {
+            panic!("expected a base failure, got {outcome:?}");
+        };
+        assert_eq!(failure.class, VacuityClass::DeadPrecondition);
+
+        // Degenerate configuration.
+        let outcome = check_result_contract_no_error_wildcard(
+            config().with_max_trials(0),
+            |_: &u32| true,
+            checked_incr,
+            incr_wildcard_post,
+        );
+        let ErrorWildcardCheckOutcome::BaseFailed(failure) = outcome else {
+            panic!("expected a base failure, got {outcome:?}");
+        };
+        assert_eq!(
+            failure.detail,
+            FailureDetail::Violation(ViolationKind::DegenerateConfig)
+        );
+
+        // A trivially true postcondition is the base check's finding.
+        let outcome = check_result_contract_no_error_wildcard(
+            config(),
+            |_: &u32| true,
+            checked_incr,
+            |_: &u32, _: &Result<u32, ()>| true,
+        );
+        assert_eq!(
+            outcome.vacuity_class(),
+            Some(VacuityClass::TrivialPostcondition)
+        );
+    }
+
+    #[test]
+    fn fallible_checks_treat_a_trapping_probe_as_a_rejection() {
+        // The postcondition traps (instead of returning `false`) on every
+        // outcome it does not expect.
+        let trapping_post = |x: &u32, ret: &Result<u32, ()>| -> Result<bool, ()> {
+            match ret {
+                Ok(v) if x.checked_add(1) == Some(*v) => Ok(true),
+                Err(()) if *x == u32::MAX => Ok(true),
+                _ => Err(()),
+            }
+        };
+        let outcome = check_result_contract_no_error_wildcard_fallible(
+            config(),
+            |_: &u32| Ok(true),
+            |x: &u32| Ok(checked_incr(x)),
+            trapping_post,
+        );
+        assert!(outcome.is_strong(), "{outcome:?}");
+
+        // A trapping body is a live violation of the base check.
+        let outcome = check_result_contract_no_error_wildcard_fallible(
+            config(),
+            |_: &u32| Ok(true),
+            |x: &u32| {
+                if *x == 2 {
+                    Err(())
+                } else {
+                    Ok(checked_incr(x))
+                }
+            },
+            trapping_post,
+        );
+        assert_eq!(outcome.vacuity_class(), Some(VacuityClass::SpecViolation));
+
+        // The fallible semantic form rejects a `Ub` wildcard as well.
+        let outcome = check_semantic_outcome_no_error_wildcard_fallible(
+            config(),
+            |_: &u32| Ok(true),
+            |x: &u32| Ok(semantic_incr(x)),
+            |x: &u32, ret: &IncrOutcome| {
+                Ok(matches!(ret, SemanticOutcome::Ub) || semantic_guarded_post(x, ret))
+            },
+        );
+        assert_eq!(
+            outcome.violation().map(|violation| violation.kind),
+            Some(ErrorWildcardViolationKind::UbAccepted { trial_idx: 0 })
+        );
+    }
+
+    #[test]
+    fn precondition_restricts_the_probed_inputs() {
+        // Under `x < 100` the function never fails, so `Err` is rejected on
+        // every hit and no `Err` hit exists.
+        let outcome = check_result_contract_no_error_wildcard(
+            config(),
+            |x: &u32| *x < 100,
+            checked_incr,
+            |x: &u32, ret: &Result<u32, ()>| matches!(ret, Ok(v) if *v == *x + 1),
+        );
+        let ErrorWildcardCheckOutcome::Strong(stats) = outcome else {
+            panic!("expected a strong contract, got {outcome:?}");
+        };
+        assert_eq!(stats.err_hits, 0);
+        assert_eq!(stats.ok_hits, stats.base.precondition_hits);
+    }
 }
