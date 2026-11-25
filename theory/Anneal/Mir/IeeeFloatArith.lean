@@ -25,7 +25,12 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
 - **§2**: Bitwise `evalFloatNeg` / `evalFloatAbs` involution, idempotence,
   `decodeBits` commutation, sNaN/qNaN payload & quiet-bit preservation, and
   `evalFloatCmp` NaN unorderedness, `.ne` duality, trichotomy, reflexivity /
-  symmetry / antisymmetry, `-0.0 == +0.0`, and mode-independence;
+  symmetry / antisymmetry, `-0.0 == +0.0`, mode-independence, the self-comparison
+  closed form on EVERY bit pattern (`evalFloatCmp_self`: `<` / `>` irreflexive even
+  on NaN, `==` / `<=` / `>=` reflexive iff not NaN, `x != x` iff NaN), signed zeros
+  under `<=` / `>=`, unconditional `PartialOrd` consistency (`<=` iff `<` or `==`),
+  asymmetry of `<`, and the exact NaN boundary of negation duality
+  (`a < b = !(a >= b)` iff neither operand is NaN);
 - **§3**: Single-rounding `roundTiesToEven` characterizations (`add`, `sub`,
   `mul`, `div`), exact grid representability (`roundRatioTiesToEven_exact_grid`),
   Sterbenz's exact subtraction (`y / 2 ≤ x ∧ x ≤ 2 * y`), exact addition,
@@ -90,7 +95,12 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
   infectiousness, signed-zero sums, exact cancellation `x + (-x) = +0`, invalid
   operations, `finite / ±0 = ±∞` with XOR sign, `x % ±0 = NaN`, `±∞ % y = NaN`,
   `finite % ±∞ = finite`, `±0 % finite = ±0`), the documented signed-zero rule
-  for arbitrary zero-valued sums and differences, the no-NaN-input `nanChoices`
+  for arbitrary zero-valued sums and differences, commutativity of `add` / `mul`,
+  the signed-zero additive-identity asymmetry (`-0.0` is the two-sided identity on
+  every non-NaN value, `x + (+0.0) = x` fails exactly at `x = -0.0`), `x - (+0.0) = x`,
+  negation as `(-0.0) - x` (never `(+0.0) - x`), `1.0` / `-1.0` multiplicative and
+  divisive units (`(-1.0) * x = -x` bitwise), all lifted to `evalFloatBinOp` and to
+  `EvalFloatBinOpRel` in every mode, the no-NaN-input `nanChoices`
   closed form (`[preferred, -preferred]`), admissibility of `evalRvalue`'s
   quieting `floatToFloat` NaN in `.nondeterministic` (but not `.deterministic`)
   mode, `evalRvalue`-level realization & dispatcher laws for `EvalRvalueFloatRel`
@@ -108,7 +118,8 @@ Constructive (`[propext, Quot.sound]`, zero `Classical.choice`, zero host
   refinement / exact split / provenance-necessity bridges for every (composite)
   type, and concrete witnesses (float operands and NaN choices read from locals,
   pointer-to-integer and array / tuple / struct-with-padding / union / float
-  policy separation, `{to,from}_bits`);
+  policy separation, `{to,from}_bits`, and the every-fuel non-vacuity instantiation
+  of each universal selective-erasure law, `mixed_strip_laws_nonvacuous_witness`);
 - **§8**: `#guard_msgs in #print axioms` bundles pinning every public theorem to
   `[propext, Quot.sound]`.
 -/
@@ -660,6 +671,210 @@ theorem EvalFloatBinOpRel_cmp_mode_independent
       EvalFloatBinOpRel .nondeterministic op f a b out := by
   unfold EvalFloatBinOpRel
   rw [hcmp]
+
+/-! ### IEEE-754 comparison completeness: self-comparison on EVERY bit pattern, signed zeros under `<=` / `>=`, `PartialOrd` consistency, & the exact NaN boundary of negation duality -/
+
+/-- `evalFloatPartialCompare` is ordered (`.some _`) EXACTLY when neither operand is NaN
+(the positive counterpart of `evalFloatPartialCompare_none_iff`). -/
+theorem evalFloatPartialCompare_some_iff (f : IeeeFormat) (a b : Nat) :
+    (∃ ord, evalFloatPartialCompare f a b = .some ord) ↔
+      (isNaNBits f a = false ∧ isNaNBits f b = false) := by
+  constructor
+  · rintro ⟨ord, hord⟩
+    refine ⟨?_, ?_⟩
+    · cases ha : isNaNBits f a with
+      | false => rfl
+      | true =>
+        rw [evalFloatPartialCompare_nan_left f a b ha] at hord
+        cases hord
+    · cases hb : isNaNBits f b with
+      | false => rfl
+      | true =>
+        rw [evalFloatPartialCompare_nan_right f a b hb] at hord
+        cases hord
+  · rintro ⟨ha, hb⟩
+    cases hord : evalFloatPartialCompare f a b with
+    | some ord => exact ⟨ord, rfl⟩
+    | none =>
+      rcases (evalFloatPartialCompare_none_iff f a b).mp hord with h | h
+      · rw [ha] at h; cases h
+      · rw [hb] at h; cases h
+
+/-- **Self-comparison closed form on EVERY bit pattern** (NaNs, `±0.0`, subnormals, normals,
+`±∞`, and non-canonical `bits ≥ 2^f.width` alike):
+- `x < x` and `x > x` are ALWAYS `false` (irreflexivity holds even on NaN);
+- `x == x`, `x <= x`, and `x >= x` are `true` exactly when `x` is NOT NaN;
+- `x != x` is `true` exactly when `x` IS NaN (the classic `x != x` NaN test). -/
+theorem evalFloatCmp_self (f : IeeeFormat) (a : Nat) :
+    evalFloatCmp .lt f a a = .some false ∧
+    evalFloatCmp .gt f a a = .some false ∧
+    evalFloatCmp .eq f a a = .some (Bool.not (isNaNBits f a)) ∧
+    evalFloatCmp .le f a a = .some (Bool.not (isNaNBits f a)) ∧
+    evalFloatCmp .ge f a a = .some (Bool.not (isNaNBits f a)) ∧
+    evalFloatCmp .ne f a a = .some (isNaNBits f a) := by
+  cases ha : isNaNBits f a with
+  | true =>
+    obtain ⟨heq, hne, hlt, hle, hgt, hge⟩ := evalFloatCmp_of_nan f a a (Or.inl ha)
+    exact ⟨hlt, hgt, heq, hle, hge, hne⟩
+  | false =>
+    have hord := evalFloatPartialCompare_refl f a ha
+    unfold evalFloatCmp
+    rw [hord]
+    exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Reflexivity of `==` / `<=` / `>=` holds IF AND ONLY IF the operand is not NaN**, and
+`x != x` holds IF AND ONLY IF `x` is NaN. -/
+theorem evalFloatCmp_refl_iff (f : IeeeFormat) (a : Nat) :
+    (evalFloatCmp .eq f a a = .some true ↔ isNaNBits f a = false) ∧
+    (evalFloatCmp .le f a a = .some true ↔ isNaNBits f a = false) ∧
+    (evalFloatCmp .ge f a a = .some true ↔ isNaNBits f a = false) ∧
+    (evalFloatCmp .ne f a a = .some true ↔ isNaNBits f a = true) := by
+  obtain ⟨_, _, heq, hle, hge, hne⟩ := evalFloatCmp_self f a
+  rw [heq, hle, hge, hne]
+  cases isNaNBits f a <;> decide
+
+/-- `-0.0 <= +0.0` and `-0.0 >= +0.0` (and every other sign combination) are `true` in both
+formats, complementing `evalFloatCmp_signed_zeros_eq` (`==` true, `!=` / `<` / `>` false). -/
+theorem evalFloatCmp_signed_zeros_le_ge (f : IeeeFormat) (neg₁ neg₂ : Bool) :
+    evalFloatCmp .le f (zeroBits f neg₁) (zeroBits f neg₂) = .some true ∧
+    evalFloatCmp .ge f (zeroBits f neg₁) (zeroBits f neg₂) = .some true := by
+  have hord : evalFloatPartialCompare f (zeroBits f neg₁) (zeroBits f neg₂) = .some .eq := by
+    unfold evalFloatPartialCompare
+    rw [decodeBits_mod, decodeBits_mod, decodeBits_zeroBits, decodeBits_zeroBits]
+  unfold evalFloatCmp
+  rw [hord]
+  exact ⟨rfl, rfl⟩
+
+/-- **`PartialOrd` / `PartialEq` consistency on EVERY bit pattern (including NaNs)**: the
+quoted `core::cmp::PartialOrd` conditions `a <= b ⟺ a < b || a == b`,
+`a >= b ⟺ a > b || a == b`, and `a != b ⟺ !(a == b)` hold unconditionally. -/
+theorem evalFloatCmp_partialOrd_consistency (f : IeeeFormat) (a b : Nat) :
+    (evalFloatCmp .le f a b = .some true ↔
+      (evalFloatCmp .lt f a b = .some true ∨ evalFloatCmp .eq f a b = .some true)) ∧
+    (evalFloatCmp .ge f a b = .some true ↔
+      (evalFloatCmp .gt f a b = .some true ∨ evalFloatCmp .eq f a b = .some true)) ∧
+    (evalFloatCmp .ne f a b = .some true ↔ evalFloatCmp .eq f a b = .some false) ∧
+    (evalFloatCmp .ne f a b = .some false ↔ evalFloatCmp .eq f a b = .some true) := by
+  unfold evalFloatCmp
+  cases evalFloatPartialCompare f a b with
+  | none => decide
+  | some ord => cases ord <;> decide
+
+/-- **Negation duality on non-NaN operands**: `a < b = !(a >= b)`, `a >= b = !(a < b)`,
+`a > b = !(a <= b)`, and `a <= b = !(a > b)` whenever neither operand is NaN. -/
+theorem evalFloatCmp_not_duality_of_not_nan (f : IeeeFormat) (a b : Nat)
+    (ha : isNaNBits f a = false) (hb : isNaNBits f b = false) :
+    evalFloatCmp .lt f a b = Option.map Bool.not (evalFloatCmp .ge f a b) ∧
+    evalFloatCmp .ge f a b = Option.map Bool.not (evalFloatCmp .lt f a b) ∧
+    evalFloatCmp .gt f a b = Option.map Bool.not (evalFloatCmp .le f a b) ∧
+    evalFloatCmp .le f a b = Option.map Bool.not (evalFloatCmp .gt f a b) := by
+  obtain ⟨ord, hord⟩ := (evalFloatPartialCompare_some_iff f a b).mpr ⟨ha, hb⟩
+  unfold evalFloatCmp
+  rw [hord]
+  cases ord <;> exact ⟨rfl, rfl, rfl, rfl⟩
+
+/-- **Negation duality FAILS on NaN** (contrast with the unconditional `.ne = !.eq` law
+`evalFloatCmp_ne_eq_not_eq`): whenever either operand is NaN, `<`, `>=`, `>`, and `<=` are ALL
+`false`, so none of `a < b = !(a >= b)`, `a >= b = !(a < b)`, `a > b = !(a <= b)`,
+`a <= b = !(a > b)` holds. Rewriting `!(a >= b)` to `a < b` is therefore unsound on floats. -/
+theorem evalFloatCmp_not_duality_fails_of_nan (f : IeeeFormat) (a b : Nat)
+    (hnan : isNaNBits f a = true ∨ isNaNBits f b = true) :
+    evalFloatCmp .lt f a b = .some false ∧
+    evalFloatCmp .ge f a b = .some false ∧
+    evalFloatCmp .gt f a b = .some false ∧
+    evalFloatCmp .le f a b = .some false ∧
+    evalFloatCmp .lt f a b ≠ Option.map Bool.not (evalFloatCmp .ge f a b) ∧
+    evalFloatCmp .ge f a b ≠ Option.map Bool.not (evalFloatCmp .lt f a b) ∧
+    evalFloatCmp .gt f a b ≠ Option.map Bool.not (evalFloatCmp .le f a b) ∧
+    evalFloatCmp .le f a b ≠ Option.map Bool.not (evalFloatCmp .gt f a b) := by
+  obtain ⟨_, _, hlt, hle, hgt, hge⟩ := evalFloatCmp_of_nan f a b hnan
+  rw [hlt, hle, hgt, hge]
+  exact ⟨rfl, rfl, rfl, rfl, by decide, by decide, by decide, by decide⟩
+
+/-- **Exact NaN boundary of negation duality**: each of `a < b = !(a >= b)`,
+`a >= b = !(a < b)`, `a > b = !(a <= b)`, `a <= b = !(a > b)` holds IF AND ONLY IF neither
+operand is NaN. -/
+theorem evalFloatCmp_not_duality_iff (f : IeeeFormat) (a b : Nat) :
+    (evalFloatCmp .lt f a b = Option.map Bool.not (evalFloatCmp .ge f a b) ↔
+      (isNaNBits f a = false ∧ isNaNBits f b = false)) ∧
+    (evalFloatCmp .ge f a b = Option.map Bool.not (evalFloatCmp .lt f a b) ↔
+      (isNaNBits f a = false ∧ isNaNBits f b = false)) ∧
+    (evalFloatCmp .gt f a b = Option.map Bool.not (evalFloatCmp .le f a b) ↔
+      (isNaNBits f a = false ∧ isNaNBits f b = false)) ∧
+    (evalFloatCmp .le f a b = Option.map Bool.not (evalFloatCmp .gt f a b) ↔
+      (isNaNBits f a = false ∧ isNaNBits f b = false)) := by
+  cases ha : isNaNBits f a with
+  | true =>
+    obtain ⟨_, _, _, _, h1, h2, h3, h4⟩ :=
+      evalFloatCmp_not_duality_fails_of_nan f a b (Or.inl ha)
+    exact ⟨⟨fun h => absurd h h1, fun h => Bool.noConfusion h.1⟩,
+      ⟨fun h => absurd h h2, fun h => Bool.noConfusion h.1⟩,
+      ⟨fun h => absurd h h3, fun h => Bool.noConfusion h.1⟩,
+      ⟨fun h => absurd h h4, fun h => Bool.noConfusion h.1⟩⟩
+  | false =>
+    cases hb : isNaNBits f b with
+    | true =>
+      obtain ⟨_, _, _, _, h1, h2, h3, h4⟩ :=
+        evalFloatCmp_not_duality_fails_of_nan f a b (Or.inr hb)
+      exact ⟨⟨fun h => absurd h h1, fun h => Bool.noConfusion h.2⟩,
+        ⟨fun h => absurd h h2, fun h => Bool.noConfusion h.2⟩,
+        ⟨fun h => absurd h h3, fun h => Bool.noConfusion h.2⟩,
+        ⟨fun h => absurd h h4, fun h => Bool.noConfusion h.2⟩⟩
+    | false =>
+      obtain ⟨h1, h2, h3, h4⟩ := evalFloatCmp_not_duality_of_not_nan f a b ha hb
+      exact ⟨⟨fun _ => ⟨rfl, rfl⟩, fun _ => h1⟩, ⟨fun _ => ⟨rfl, rfl⟩, fun _ => h2⟩,
+        ⟨fun _ => ⟨rfl, rfl⟩, fun _ => h3⟩, ⟨fun _ => ⟨rfl, rfl⟩, fun _ => h4⟩⟩
+
+/-- **Asymmetry of `<`**: `a < b` excludes `b < a`, `a == b`, and `a >= b`, and implies
+`a <= b` and `a != b` (so `<` is a strict partial order on bit patterns: irreflexive by
+`evalFloatCmp_self` and asymmetric here). -/
+theorem evalFloatCmp_lt_asymm (f : IeeeFormat) (a b : Nat)
+    (h : evalFloatCmp .lt f a b = .some true) :
+    evalFloatCmp .lt f b a = .some false ∧
+    evalFloatCmp .eq f a b = .some false ∧
+    evalFloatCmp .ge f a b = .some false ∧
+    evalFloatCmp .le f a b = .some true ∧
+    evalFloatCmp .ne f a b = .some true := by
+  rw [evalFloatCmp_lt_gt_symm f a b]
+  unfold evalFloatCmp at h ⊢
+  revert h
+  cases evalFloatPartialCompare f a b with
+  | none => decide
+  | some ord => cases ord <;> decide
+
+/-- **Concrete NaN / signed-zero comparison witnesses** (`f32` and `f64`, `evalFloatCmp` and
+full `evalRvalue`):
+- `qNaN < 1.0` and `qNaN >= 1.0` are BOTH `false` (so `a < b ≠ !(a >= b)`), likewise with a
+  signaling NaN on the right;
+- `qNaN <= qNaN` and `qNaN >= qNaN` are `false` while `qNaN != qNaN` is `true`;
+- `-0.0 == +0.0`, `-0.0 <= +0.0`, `-0.0 >= +0.0` are `true` while `-0.0 < +0.0` is `false`. -/
+theorem evalFloatCmp_nan_duality_and_signed_zero_witness :
+    evalFloatCmp .lt .binary32 0x7FC00000 0x3F800000 = .some false ∧
+    evalFloatCmp .ge .binary32 0x7FC00000 0x3F800000 = .some false ∧
+    evalFloatCmp .lt .binary32 0x3F800000 0x7FA00001 = .some false ∧
+    evalFloatCmp .ge .binary32 0x3F800000 0x7FA00001 = .some false ∧
+    evalFloatCmp .le .binary64 0x7FF8000000000000 0x7FF8000000000000 = .some false ∧
+    evalFloatCmp .ge .binary64 0x7FF8000000000000 0x7FF8000000000000 = .some false ∧
+    evalFloatCmp .ne .binary64 0x7FF8000000000000 0x7FF8000000000000 = .some true ∧
+    evalFloatCmp .eq .binary64 0x8000000000000000 0x0000000000000000 = .some true ∧
+    evalFloatCmp .le .binary64 0x8000000000000000 0x0000000000000000 = .some true ∧
+    evalFloatCmp .ge .binary64 0x8000000000000000 0x0000000000000000 = .some true ∧
+    evalFloatCmp .lt .binary64 0x8000000000000000 0x0000000000000000 = .some false ∧
+    evalFloatCmp .le .binary32 0x80000000 0x00000000 = .some true ∧
+    evalFloatCmp .lt .binary32 0x80000000 0x00000000 = .some false ∧
+    evalRvalue .nil
+        (.binaryOp .lt (mkFloatConstOp f32Ty 0x7FC00000 4) (mkFloatConstOp f32Ty 0x3F800000 4)) =
+      .ok (.scalar (boolToScalar false)) .nil emptyMemory ∧
+    evalRvalue .nil
+        (.binaryOp .ge (mkFloatConstOp f32Ty 0x7FC00000 4) (mkFloatConstOp f32Ty 0x3F800000 4)) =
+      .ok (.scalar (boolToScalar false)) .nil emptyMemory ∧
+    evalRvalue .nil
+        (.binaryOp .le (mkFloatConstOp f32Ty 0x80000000 4) (mkFloatConstOp f32Ty 0x00000000 4)) =
+      .ok (.scalar (boolToScalar true)) .nil emptyMemory ∧
+    evalRvalue .nil
+        (.binaryOp .lt (mkFloatConstOp f32Ty 0x80000000 4) (mkFloatConstOp f32Ty 0x00000000 4)) =
+      .ok (.scalar (boolToScalar false)) .nil emptyMemory := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## §3. Single-rounding `roundTiesToEven`, Sterbenz's lemma, gradual underflow, `1.0` identity, & exact Euclidean `rem` -/
 
@@ -12673,6 +12888,530 @@ theorem evalFloatArithBase_sub_zero_sign (f : IeeeFormat) (a b : Nat) (sa sb s :
   rw [evalFloatArithBase_sub_eq_add_neg] at h
   exact evalFloatArithBase_add_zero_sign f a (evalFloatNeg f b) sa (Bool.not sb) s ha hnb h
 
+/-! ### IEEE-754 identity laws: commutativity, the signed-zero additive-identity asymmetry (`-0.0` vs `+0.0`), & `±1.0` multiplicative / divisive units
+
+`-0.0` (NOT `+0.0`) is the two-sided additive identity of IEEE-754 arithmetic on every
+non-NaN value: `x + (-0.0) = x` and `(-0.0) + x = x` hold for all zeros, subnormals, normals,
+and infinities, whereas `x + (+0.0) = x` fails exactly at `x = -0.0`
+(`(-0.0) + (+0.0) = +0.0`). Dually `x - (+0.0) = x` always, and negation is `(-0.0) - x`
+(never `(+0.0) - x`, which maps `+0.0` to `+0.0`). `1.0` is the two-sided multiplicative unit
+and right divisive unit, and multiplying / dividing by `-1.0` is exactly the bitwise
+`evalFloatNeg`. Every law requires the operand to be non-NaN at the deterministic base level
+(a NaN operand yields `preferredNaNBits f`, see `evalFloatArithBase_of_nan`), and is lifted
+to `evalFloatBinOp` and to `EvalFloatBinOpRel` in EVERY `FloatArithMode`. -/
+
+/-- **Canonical re-encoding of a decoded non-NaN float**: re-encoding the decoded zero /
+finite rational / infinity of ANY bit pattern `a` returns its canonical representative
+`a % 2 ^ f.width` (finite values lie on the format grid, so rounding is exact). -/
+theorem canonicalBits_of_decodeBits (f : IeeeFormat) (a : Nat) :
+    (∀ neg, decodeBits f a = .zero neg → zeroBits f neg = a % 2 ^ f.width) ∧
+    (∀ neg n d, decodeBits f a = .finite neg n d →
+      roundRatioTiesToEven f neg n d = a % 2 ^ f.width) ∧
+    (∀ neg, decodeBits f a = .inf neg → infBits f neg = a % 2 ^ f.width) := by
+  have hself := evalFloatToFloatRoundTiesToEven_self_eq f (a % 2 ^ f.width)
+    (Nat.mod_lt a (Nat.two_pow_pos f.width))
+  unfold evalFloatToFloatRoundTiesToEven at hself
+  rw [decodeBits_mod] at hself
+  refine ⟨fun neg h => ?_, fun neg n d h => ?_, fun neg h => ?_⟩ <;>
+    (rw [h] at hself; exact hself)
+
+/-- Exact IEEE-754 addition of decoded values is commutative (including every NaN, infinity,
+and signed-zero case). -/
+theorem exactSumFloat_comm (f : IeeeFormat) (l r : FloatKind) :
+    exactSumFloat f l r = exactSumFloat f r l := by
+  have hb : ∀ A B x y : Bool,
+      Bool.and A (Bool.and B (Bool.and x y)) = Bool.and B (Bool.and A (Bool.and y x)) := by
+    intro A B x y
+    cases A <;> cases B <;> cases x <;> cases y <;> rfl
+  cases l with
+  | zero ln =>
+    cases r with
+    | zero rn =>
+      show zeroBits f (Bool.and ln rn) = zeroBits f (Bool.and rn ln)
+      rw [Bool.and_comm]
+    | finite rn rnum rden =>
+      show roundRatioTiesToEven f (if rnum = 0 then Bool.and ln rn else rn) rnum rden =
+        roundRatioTiesToEven f (if rnum = 0 then Bool.and rn ln else rn) rnum rden
+      rw [Bool.and_comm]
+    | inf rn => rfl
+    | nan _ _ _ => rfl
+  | finite ln lnum lden =>
+    cases r with
+    | zero rn =>
+      show roundRatioTiesToEven f (if lnum = 0 then Bool.and ln rn else ln) lnum lden =
+        roundRatioTiesToEven f (if lnum = 0 then Bool.and rn ln else ln) lnum lden
+      rw [Bool.and_comm]
+    | finite rn rnum rden =>
+      show roundRatioTiesToEven f
+          (if signedNum ln lnum * (rden : Int) + signedNum rn rnum * (lden : Int) = 0 then
+            Bool.and (Nat.beq lnum 0) (Bool.and (Nat.beq rnum 0) (Bool.and ln rn))
+          else decide (signedNum ln lnum * (rden : Int) + signedNum rn rnum * (lden : Int) < 0))
+          (signedNum ln lnum * (rden : Int) + signedNum rn rnum * (lden : Int)).natAbs
+          (lden * rden) =
+        roundRatioTiesToEven f
+          (if signedNum rn rnum * (lden : Int) + signedNum ln lnum * (rden : Int) = 0 then
+            Bool.and (Nat.beq rnum 0) (Bool.and (Nat.beq lnum 0) (Bool.and rn ln))
+          else decide (signedNum rn rnum * (lden : Int) + signedNum ln lnum * (rden : Int) < 0))
+          (signedNum rn rnum * (lden : Int) + signedNum ln lnum * (rden : Int)).natAbs
+          (rden * lden)
+      rw [Int.add_comm (signedNum rn rnum * (lden : Int)) (signedNum ln lnum * (rden : Int)),
+        Nat.mul_comm rden lden, hb (Nat.beq rnum 0) (Nat.beq lnum 0) rn ln]
+    | inf rn => rfl
+    | nan _ _ _ => rfl
+  | inf ln =>
+    cases r with
+    | zero rn => rfl
+    | finite rn rnum rden => rfl
+    | inf rn => cases ln <;> cases rn <;> rfl
+    | nan _ _ _ => rfl
+  | nan _ _ _ => cases r <;> rfl
+
+/-- **Commutativity of IEEE-754 addition** at the deterministic base level, on ALL bit
+patterns (NaN operands yield `preferredNaNBits f` on both sides). -/
+theorem evalFloatArithBase_add_comm (f : IeeeFormat) (a b : Nat) :
+    evalFloatArithBase .add f a b = evalFloatArithBase .add f b a := by
+  unfold evalFloatArithBase
+  dsimp only
+  exact congrArg some (exactSumFloat_comm f _ _)
+
+/-- **Commutativity of IEEE-754 multiplication** at the deterministic base level, on ALL bit
+patterns (NaN operands yield `preferredNaNBits f` on both sides). -/
+theorem evalFloatArithBase_mul_comm (f : IeeeFormat) (a b : Nat) :
+    evalFloatArithBase .mul f a b = evalFloatArithBase .mul f b a := by
+  unfold evalFloatArithBase
+  dsimp only
+  cases decodeBits f (a % 2 ^ f.width) with
+  | zero ln =>
+    cases decodeBits f (b % 2 ^ f.width) with
+    | zero rn => dsimp only; rw [Bool.xor_comm]
+    | finite rn rnum rden => dsimp only; rw [Bool.xor_comm]
+    | inf rn => rfl
+    | nan _ _ _ => rfl
+  | finite ln lnum lden =>
+    cases decodeBits f (b % 2 ^ f.width) with
+    | zero rn => dsimp only; rw [Bool.xor_comm]
+    | finite rn rnum rden =>
+      dsimp only
+      rw [Bool.xor_comm ln rn, Nat.mul_comm lnum rnum, Nat.mul_comm lden rden]
+    | inf rn => dsimp only; rw [Bool.xor_comm]
+    | nan _ _ _ => rfl
+  | inf ln =>
+    cases decodeBits f (b % 2 ^ f.width) with
+    | zero rn => rfl
+    | finite rn rnum rden => dsimp only; rw [Bool.xor_comm]
+    | inf rn => dsimp only; rw [Bool.xor_comm]
+    | nan _ _ _ => rfl
+  | nan _ _ _ =>
+    cases decodeBits f (b % 2 ^ f.width) <;> rfl
+
+/-- `evalFloatBinOp` on an arithmetic `BinOp` wraps the deterministic base result. -/
+theorem evalFloatBinOp_of_base (op : BinOp) (f : IeeeFormat) (a b bits : Nat)
+    (hcmp : evalFloatCmp op f a b = .none)
+    (hbase : evalFloatArithBase op f a b = .some bits) :
+    evalFloatBinOp op f a b = .some ⟨bits, f.byteWidth⟩ := by
+  unfold evalFloatBinOp
+  rw [hcmp, hbase]
+
+/-- **Non-NaN arithmetic results are `FloatArithMode`-independent**: whenever the deterministic
+base result of an arithmetic `BinOp` is not NaN, `EvalFloatBinOpRel` admits EXACTLY that result
+in BOTH `.deterministic` and `.nondeterministic` modes. -/
+theorem EvalFloatBinOpRel_of_base_not_nan (mode : FloatArithMode) (op : BinOp) (f : IeeeFormat)
+    (a b baseBits : Nat) (out : ScalarInt)
+    (hcmp : evalFloatCmp op f a b = .none)
+    (hbase : evalFloatArithBase op f a b = .some baseBits)
+    (hnan : isNaNBits f baseBits = false) :
+    EvalFloatBinOpRel mode op f a b out ↔ out = ⟨baseBits, f.byteWidth⟩ := by
+  unfold EvalFloatBinOpRel
+  rw [hcmp, hbase]
+  dsimp only
+  rw [if_neg' (by rw [hnan]; exact Bool.false_ne_true)]
+
+/-- **Commutativity of `+` and `*`** at `evalFloatBinOp` (the executable `evalRvalue` float
+evaluator) on ALL bit patterns. -/
+theorem evalFloatBinOp_add_mul_comm (f : IeeeFormat) (a b : Nat) :
+    evalFloatBinOp .add f a b = evalFloatBinOp .add f b a ∧
+    evalFloatBinOp .mul f a b = evalFloatBinOp .mul f b a := by
+  have hadd := evalFloatArithBase_add_comm f a b
+  have hmul := evalFloatArithBase_mul_comm f a b
+  refine ⟨?_, ?_⟩
+  · cases hba : evalFloatArithBase .add f b a with
+    | none =>
+      unfold evalFloatArithBase at hba
+      cases hba
+    | some bits =>
+      rw [evalFloatBinOp_of_base .add f b a bits rfl hba,
+        evalFloatBinOp_of_base .add f a b bits rfl (hadd.trans hba)]
+  · cases hba : evalFloatArithBase .mul f b a with
+    | none =>
+      unfold evalFloatArithBase at hba
+      cases hba
+    | some bits =>
+      rw [evalFloatBinOp_of_base .mul f b a bits rfl hba,
+        evalFloatBinOp_of_base .mul f a b bits rfl (hmul.trans hba)]
+
+/-- **`-0.0` is the two-sided additive identity on every non-NaN value**: for EVERY non-NaN
+bit pattern `a` (either zero, every subnormal / normal, and both infinities),
+`a + (-0.0) = a` and `(-0.0) + a = a` (returning the canonical `a % 2 ^ f.width`). In
+particular `(-0.0) + (-0.0) = -0.0` and `(+0.0) + (-0.0) = +0.0`. -/
+theorem evalFloatArithBase_add_neg_zero (f : IeeeFormat) (a : Nat)
+    (ha : isNaNBits f a = false) :
+    evalFloatArithBase .add f a (zeroBits f true) = .some (a % 2 ^ f.width) ∧
+    evalFloatArithBase .add f (zeroBits f true) a = .some (a % 2 ^ f.width) := by
+  obtain ⟨hz, hfin, hinf⟩ := canonicalBits_of_decodeBits f a
+  have hright : evalFloatArithBase .add f a (zeroBits f true) = .some (a % 2 ^ f.width) := by
+    unfold evalFloatArithBase
+    dsimp only
+    rw [decodeBits_mod, decodeBits_mod, decodeBits_zeroBits]
+    unfold isNaNBits at ha
+    cases hk : decodeBits f a with
+    | zero neg =>
+      show some (zeroBits f (Bool.and neg true)) = _
+      rw [Bool.and_true, hz neg hk]
+    | finite neg n d =>
+      have hn : 0 < n := decodeBits_finite_num_pos f a neg n d hk
+      show some (roundRatioTiesToEven f (if n = 0 then Bool.and neg true else neg) n d) = _
+      rw [if_neg' (Nat.ne_of_gt hn), hfin neg n d hk]
+    | inf neg => exact congrArg some (hinf neg hk)
+    | nan neg q p => rw [hk] at ha; cases ha
+  exact ⟨hright, (evalFloatArithBase_add_comm f (zeroBits f true) a).trans hright⟩
+
+/-- **`+0.0` is NOT an additive identity: closed form**. For every non-NaN bit pattern `a`,
+`a + (+0.0)` (and `(+0.0) + a`) returns the canonical `a % 2 ^ f.width` EXCEPT when `a` is
+`-0.0`, where the result is `+0.0` (`(-0.0) + (+0.0) = +0.0 ≠ -0.0`). -/
+theorem evalFloatArithBase_add_pos_zero (f : IeeeFormat) (a : Nat)
+    (ha : isNaNBits f a = false) :
+    evalFloatArithBase .add f a (zeroBits f false) =
+      .some (if decodeBits f a = .zero true then zeroBits f false else a % 2 ^ f.width) ∧
+    evalFloatArithBase .add f (zeroBits f false) a =
+      .some (if decodeBits f a = .zero true then zeroBits f false else a % 2 ^ f.width) := by
+  obtain ⟨hz, hfin, hinf⟩ := canonicalBits_of_decodeBits f a
+  have hright : evalFloatArithBase .add f a (zeroBits f false) =
+      .some (if decodeBits f a = .zero true then zeroBits f false else a % 2 ^ f.width) := by
+    unfold evalFloatArithBase
+    dsimp only
+    rw [decodeBits_mod, decodeBits_mod, decodeBits_zeroBits]
+    unfold isNaNBits at ha
+    cases hk : decodeBits f a with
+    | zero neg =>
+      cases neg with
+      | true =>
+        rw [if_pos' rfl]
+        rfl
+      | false =>
+        rw [if_neg' (fun h => by cases h)]
+        exact congrArg some (hz false hk)
+    | finite neg n d =>
+      have hn : 0 < n := decodeBits_finite_num_pos f a neg n d hk
+      rw [if_neg' (fun h => by cases h)]
+      show some (roundRatioTiesToEven f (if n = 0 then Bool.and neg false else neg) n d) = _
+      rw [if_neg' (Nat.ne_of_gt hn), hfin neg n d hk]
+    | inf neg =>
+      rw [if_neg' (fun h => by cases h)]
+      exact congrArg some (hinf neg hk)
+    | nan neg q p => rw [hk] at ha; cases ha
+  exact ⟨hright, (evalFloatArithBase_add_comm f (zeroBits f false) a).trans hright⟩
+
+/-- **Exact failure set of the `+0.0` additive identity**: for non-NaN `a`,
+`a + (+0.0) = a` (equivalently `(+0.0) + a = a`) holds IF AND ONLY IF `a` is not `-0.0`. -/
+theorem evalFloatArithBase_add_pos_zero_eq_self_iff (f : IeeeFormat) (a : Nat)
+    (ha : isNaNBits f a = false) :
+    (evalFloatArithBase .add f a (zeroBits f false) = .some (a % 2 ^ f.width) ↔
+      decodeBits f a ≠ .zero true) ∧
+    (evalFloatArithBase .add f (zeroBits f false) a = .some (a % 2 ^ f.width) ↔
+      decodeBits f a ≠ .zero true) := by
+  obtain ⟨hr, hl⟩ := evalFloatArithBase_add_pos_zero f a ha
+  have hne : zeroBits f false ≠ zeroBits f true :=
+    fun h => Bool.noConfusion (zeroBits_injective f _ _ h)
+  have key : (some (if decodeBits f a = .zero true then zeroBits f false else a % 2 ^ f.width) =
+      some (a % 2 ^ f.width)) ↔ decodeBits f a ≠ .zero true := by
+    constructor
+    · intro h hk
+      rw [if_pos' hk] at h
+      exact hne ((Option.some.inj h).trans
+        ((canonicalBits_of_decodeBits f a).1 true hk).symm)
+    · intro hk
+      rw [if_neg' hk]
+  rw [hr, hl]
+  exact ⟨key, key⟩
+
+/-- **Signed-zero additive-identity asymmetry** (both formats): `-0.0` is a two-sided
+identity even on signed zeros (`(±0.0) + (-0.0) = ±0.0`), whereas `+0.0` flips `-0.0` to
+`+0.0` (`(-0.0) + (+0.0) = (+0.0) + (-0.0) = +0.0 ≠ -0.0`). -/
+theorem evalFloatArithBase_signed_zero_identity_asymmetry (f : IeeeFormat) :
+    (∀ s, evalFloatArithBase .add f (zeroBits f s) (zeroBits f true) = .some (zeroBits f s) ∧
+      evalFloatArithBase .add f (zeroBits f true) (zeroBits f s) = .some (zeroBits f s)) ∧
+    evalFloatArithBase .add f (zeroBits f true) (zeroBits f false) = .some (zeroBits f false) ∧
+    evalFloatArithBase .add f (zeroBits f false) (zeroBits f true) = .some (zeroBits f false) ∧
+    zeroBits f false ≠ zeroBits f true := by
+  refine ⟨fun s => ?_, ?_, ?_, fun h => Bool.noConfusion (zeroBits_injective f _ _ h)⟩
+  · cases f <;> cases s <;> exact ⟨rfl, rfl⟩
+  · cases f <;> rfl
+  · cases f <;> rfl
+
+/-- **`x - (+0.0) = x` and negation as `(-0.0) - x`**: for every non-NaN `a`,
+`a - (+0.0) = a` and `(-0.0) - a = -a` (the bitwise `evalFloatNeg`, including
+`(-0.0) - (+0.0) = -0.0` and `(-0.0) - (-0.0) = +0.0`). -/
+theorem evalFloatArithBase_sub_zero_identities (f : IeeeFormat) (a : Nat)
+    (ha : isNaNBits f a = false) :
+    evalFloatArithBase .sub f a (zeroBits f false) = .some (a % 2 ^ f.width) ∧
+    evalFloatArithBase .sub f (zeroBits f true) a = .some (evalFloatNeg f a) := by
+  refine ⟨?_, ?_⟩
+  · rw [evalFloatArithBase_sub_eq_add_neg, evalFloatNeg_zeroBits]
+    exact (evalFloatArithBase_add_neg_zero f a ha).1
+  · have hneg : isNaNBits f (evalFloatNeg f a) = false := by
+      rw [isNaNBits_evalFloatNeg]; exact ha
+    rw [evalFloatArithBase_sub_eq_add_neg,
+      (evalFloatArithBase_add_neg_zero f (evalFloatNeg f a) hneg).2,
+      Nat.mod_eq_of_lt (evalFloatNeg_lt f a)]
+
+/-- **`(+0.0) - x` is NOT negation**: `(+0.0) - (+0.0) = +0.0`, whereas `-(+0.0) = -0.0`
+(so `0.0 - x` must not be rewritten to `-x`; contrast `evalFloatArithBase_sub_zero_identities`). -/
+theorem evalFloatArithBase_pos_zero_sub_not_neg (f : IeeeFormat) :
+    evalFloatArithBase .sub f (zeroBits f false) (zeroBits f false) = .some (zeroBits f false) ∧
+    evalFloatNeg f (zeroBits f false) = zeroBits f true ∧
+    zeroBits f false ≠ zeroBits f true := by
+  refine ⟨?_, evalFloatNeg_zeroBits f false, fun h => Bool.noConfusion (zeroBits_injective f _ _ h)⟩
+  cases f <;> rfl
+
+/-- Canonical `-1.0` bit pattern in format `f` (`encodeBits f true f.bias 0`). -/
+def negOneBits (f : IeeeFormat) : Nat := encodeBits f true f.bias 0
+
+/-- `-1.0` is the bitwise negation of `1.0`, with the expected `f32` / `f64` literals. -/
+theorem negOneBits_eq_evalFloatNeg_oneBits (f : IeeeFormat) :
+    negOneBits f = evalFloatNeg f (oneBits f) ∧
+    oneBits .binary32 = 0x3F800000 ∧ negOneBits .binary32 = 0xBF800000 ∧
+    oneBits .binary64 = 0x3FF0000000000000 ∧ negOneBits .binary64 = 0xBFF0000000000000 := by
+  have hE : f.bias < 2 ^ f.exponentBits := by cases f <;> decide
+  refine ⟨?_, by decide, by decide, by decide, by decide⟩
+  unfold negOneBits oneBits
+  exact (evalFloatNeg_encodeBits f false f.bias 0 hE (Nat.two_pow_pos _)).symm
+
+/-- Sign-applied canonical re-encoding used by the `±1.0` unit laws. -/
+private theorem signedCanonicalBits_of_decodeBits (f : IeeeFormat) (a : Nat) (s : Bool) :
+    (∀ neg, decodeBits f a = .zero neg →
+      zeroBits f (Bool.xor neg s) = if s = true then evalFloatNeg f a else a % 2 ^ f.width) ∧
+    (∀ neg n d, decodeBits f a = .finite neg n d →
+      roundRatioTiesToEven f (Bool.xor neg s) n d =
+        if s = true then evalFloatNeg f a else a % 2 ^ f.width) ∧
+    (∀ neg, decodeBits f a = .inf neg →
+      infBits f (Bool.xor neg s) = if s = true then evalFloatNeg f a else a % 2 ^ f.width) := by
+  obtain ⟨hz, hfin, hinf⟩ := canonicalBits_of_decodeBits f a
+  cases s with
+  | false =>
+    refine ⟨fun neg h => ?_, fun neg n d h => ?_, fun neg h => ?_⟩
+    · rw [Bool.xor_false, if_neg' Bool.false_ne_true]; exact hz neg h
+    · rw [Bool.xor_false, if_neg' Bool.false_ne_true]; exact hfin neg n d h
+    · rw [Bool.xor_false, if_neg' Bool.false_ne_true]; exact hinf neg h
+  | true =>
+    refine ⟨fun neg h => ?_, fun neg n d h => ?_, fun neg h => ?_⟩
+    · rw [Bool.xor_true, if_pos' rfl, ← evalFloatNeg_mod, ← hz neg h, evalFloatNeg_zeroBits]
+    · have hd : 0 < d := decodeBits_finite_den_pos f a neg n d h
+      rw [Bool.xor_true, if_pos' rfl, roundRatioTiesToEven_neg f neg n d hd, hfin neg n d h,
+        evalFloatNeg_mod]
+    · rw [Bool.xor_true, if_pos' rfl, ← evalFloatNeg_mod, ← hinf neg h, evalFloatNeg_infBits]
+
+/-- Multiplying or dividing a non-NaN value by a unit `±1.0` (any bit pattern decoding to
+`(-1)^s * 2^fb / 2^fb`) applies the sign `s` exactly. -/
+private theorem evalFloatArithBase_mul_div_unit (f : IeeeFormat) (a u : Nat) (s : Bool)
+    (hu : decodeBits f (u % 2 ^ f.width) =
+      .finite s (2 ^ f.fractionBits) (2 ^ f.fractionBits))
+    (ha : isNaNBits f a = false) :
+    evalFloatArithBase .mul f a u =
+      .some (if s = true then evalFloatNeg f a else a % 2 ^ f.width) ∧
+    evalFloatArithBase .div f a u =
+      .some (if s = true then evalFloatNeg f a else a % 2 ^ f.width) := by
+  obtain ⟨hz, hfin, hinf⟩ := signedCanonicalBits_of_decodeBits f a s
+  have h2pos : 0 < 2 ^ f.fractionBits := Nat.two_pow_pos f.fractionBits
+  have h2ne : ¬ (2 ^ f.fractionBits = 0) := by omega
+  unfold isNaNBits at ha
+  refine ⟨?_, ?_⟩
+  · unfold evalFloatArithBase
+    dsimp only
+    rw [hu, decodeBits_mod]
+    cases hk : decodeBits f a with
+    | nan neg q p => rw [hk] at ha; cases ha
+    | zero ln => exact congrArg some (hz ln hk)
+    | inf ln =>
+      dsimp only
+      rw [if_neg' h2ne]
+      exact congrArg some (hinf ln hk)
+    | finite ln n d =>
+      dsimp only
+      rw [← roundRatioBits_tiesToEven,
+        roundRatioBits_mul .tiesToEven f _ n d (2 ^ f.fractionBits) h2pos,
+        roundRatioBits_tiesToEven]
+      exact congrArg some (hfin ln n d hk)
+  · unfold evalFloatArithBase
+    dsimp only
+    rw [hu, decodeBits_mod]
+    cases hk : decodeBits f a with
+    | nan neg q p => rw [hk] at ha; cases ha
+    | zero ln =>
+      dsimp only
+      rw [if_neg' h2ne]
+      exact congrArg some (hz ln hk)
+    | inf ln => exact congrArg some (hinf ln hk)
+    | finite ln n d =>
+      dsimp only
+      rw [if_neg' h2ne, ← roundRatioBits_tiesToEven,
+        roundRatioBits_mul .tiesToEven f _ n d (2 ^ f.fractionBits) h2pos,
+        roundRatioBits_tiesToEven]
+      exact congrArg some (hfin ln n d hk)
+
+/-- **`1.0` is the left multiplicative unit and the right divisive unit**: for every non-NaN
+bit pattern `a`, `1.0 * a = a` and `a / 1.0 = a` (complementing the right unit law
+`evalFloatArithBase_mul_oneBits`), preserving signed zeros, subnormals, and infinities. -/
+theorem evalFloatArithBase_oneBits_mul_div (f : IeeeFormat) (a : Nat)
+    (ha : isNaNBits f a = false) :
+    evalFloatArithBase .mul f (oneBits f) a = .some (a % 2 ^ f.width) ∧
+    evalFloatArithBase .div f a (oneBits f) = .some (a % 2 ^ f.width) := by
+  have hu : decodeBits f (oneBits f % 2 ^ f.width) =
+      .finite false (2 ^ f.fractionBits) (2 ^ f.fractionBits) := by
+    rw [decodeBits_mod, decodeBits_oneBits]
+    cases f <;> rfl
+  obtain ⟨hmul, hdiv⟩ := evalFloatArithBase_mul_div_unit f a (oneBits f) false hu ha
+  exact ⟨(evalFloatArithBase_mul_comm f (oneBits f) a).trans hmul, hdiv⟩
+
+/-- **Multiplying or dividing by `-1.0` is exactly bitwise negation**: for every non-NaN bit
+pattern `a` (signed zeros, subnormals, normals, and infinities),
+`a * (-1.0) = (-1.0) * a = a / (-1.0) = evalFloatNeg f a`. -/
+theorem evalFloatArithBase_negOneBits_mul_div (f : IeeeFormat) (a : Nat)
+    (ha : isNaNBits f a = false) :
+    evalFloatArithBase .mul f a (negOneBits f) = .some (evalFloatNeg f a) ∧
+    evalFloatArithBase .mul f (negOneBits f) a = .some (evalFloatNeg f a) ∧
+    evalFloatArithBase .div f a (negOneBits f) = .some (evalFloatNeg f a) := by
+  have hu : decodeBits f (negOneBits f % 2 ^ f.width) =
+      .finite true (2 ^ f.fractionBits) (2 ^ f.fractionBits) := by
+    rw [decodeBits_mod, (negOneBits_eq_evalFloatNeg_oneBits f).1, decodeBits_evalFloatNeg,
+      decodeBits_oneBits]
+    cases f <;> rfl
+  obtain ⟨hmul, hdiv⟩ := evalFloatArithBase_mul_div_unit f a (negOneBits f) true hu ha
+  exact ⟨hmul, (evalFloatArithBase_mul_comm f (negOneBits f) a).trans hmul, hdiv⟩
+
+/-- **Identity laws at `evalFloatBinOp`** (the executable float evaluator used by
+`evalRvalue`): for every non-NaN `a`, `a + (-0.0)`, `(-0.0) + a`, `a - (+0.0)`, `a * 1.0`,
+`1.0 * a`, `a / 1.0` return `a`, and `(-0.0) - a`, `a * (-1.0)`, `(-1.0) * a`, `a / (-1.0)`
+return `-a`. -/
+theorem evalFloatBinOp_identity_laws (f : IeeeFormat) (a : Nat) (ha : isNaNBits f a = false) :
+    evalFloatBinOp .add f a (zeroBits f true) = .some ⟨a % 2 ^ f.width, f.byteWidth⟩ ∧
+    evalFloatBinOp .add f (zeroBits f true) a = .some ⟨a % 2 ^ f.width, f.byteWidth⟩ ∧
+    evalFloatBinOp .sub f a (zeroBits f false) = .some ⟨a % 2 ^ f.width, f.byteWidth⟩ ∧
+    evalFloatBinOp .mul f a (oneBits f) = .some ⟨a % 2 ^ f.width, f.byteWidth⟩ ∧
+    evalFloatBinOp .mul f (oneBits f) a = .some ⟨a % 2 ^ f.width, f.byteWidth⟩ ∧
+    evalFloatBinOp .div f a (oneBits f) = .some ⟨a % 2 ^ f.width, f.byteWidth⟩ ∧
+    evalFloatBinOp .sub f (zeroBits f true) a = .some ⟨evalFloatNeg f a, f.byteWidth⟩ ∧
+    evalFloatBinOp .mul f a (negOneBits f) = .some ⟨evalFloatNeg f a, f.byteWidth⟩ ∧
+    evalFloatBinOp .mul f (negOneBits f) a = .some ⟨evalFloatNeg f a, f.byteWidth⟩ ∧
+    evalFloatBinOp .div f a (negOneBits f) = .some ⟨evalFloatNeg f a, f.byteWidth⟩ := by
+  obtain ⟨h1, h2⟩ := evalFloatArithBase_add_neg_zero f a ha
+  obtain ⟨h3, h7⟩ := evalFloatArithBase_sub_zero_identities f a ha
+  have h4 := evalFloatArithBase_mul_oneBits f a ha
+  obtain ⟨h5, h6⟩ := evalFloatArithBase_oneBits_mul_div f a ha
+  obtain ⟨h8, h9, h10⟩ := evalFloatArithBase_negOneBits_mul_div f a ha
+  exact ⟨evalFloatBinOp_of_base _ f _ _ _ rfl h1, evalFloatBinOp_of_base _ f _ _ _ rfl h2,
+    evalFloatBinOp_of_base _ f _ _ _ rfl h3, evalFloatBinOp_of_base _ f _ _ _ rfl h4,
+    evalFloatBinOp_of_base _ f _ _ _ rfl h5, evalFloatBinOp_of_base _ f _ _ _ rfl h6,
+    evalFloatBinOp_of_base _ f _ _ _ rfl h7, evalFloatBinOp_of_base _ f _ _ _ rfl h8,
+    evalFloatBinOp_of_base _ f _ _ _ rfl h9, evalFloatBinOp_of_base _ f _ _ _ rfl h10⟩
+
+/-- **Identity laws at `EvalFloatBinOpRel` in EVERY `FloatArithMode`**: for every non-NaN
+`a`, the relational semantics admits EXACTLY `a` for `a + (-0.0)`, `(-0.0) + a`,
+`a - (+0.0)`, `a * 1.0`, `1.0 * a`, `a / 1.0`, and EXACTLY `-a` for `(-0.0) - a`,
+`a * (-1.0)`, `(-1.0) * a`, `a / (-1.0)` (no NaN choice arises, in either mode). -/
+theorem EvalFloatBinOpRel_identity_laws (mode : FloatArithMode) (f : IeeeFormat) (a : Nat)
+    (out : ScalarInt) (ha : isNaNBits f a = false) :
+    (EvalFloatBinOpRel mode .add f a (zeroBits f true) out ↔
+      out = ⟨a % 2 ^ f.width, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .add f (zeroBits f true) a out ↔
+      out = ⟨a % 2 ^ f.width, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .sub f a (zeroBits f false) out ↔
+      out = ⟨a % 2 ^ f.width, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .mul f a (oneBits f) out ↔
+      out = ⟨a % 2 ^ f.width, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .mul f (oneBits f) a out ↔
+      out = ⟨a % 2 ^ f.width, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .div f a (oneBits f) out ↔
+      out = ⟨a % 2 ^ f.width, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .sub f (zeroBits f true) a out ↔
+      out = ⟨evalFloatNeg f a, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .mul f a (negOneBits f) out ↔
+      out = ⟨evalFloatNeg f a, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .mul f (negOneBits f) a out ↔
+      out = ⟨evalFloatNeg f a, f.byteWidth⟩) ∧
+    (EvalFloatBinOpRel mode .div f a (negOneBits f) out ↔
+      out = ⟨evalFloatNeg f a, f.byteWidth⟩) := by
+  have hmod : isNaNBits f (a % 2 ^ f.width) = false := by
+    unfold isNaNBits; rw [decodeBits_mod]; exact ha
+  have hneg : isNaNBits f (evalFloatNeg f a) = false := by
+    rw [isNaNBits_evalFloatNeg]; exact ha
+  obtain ⟨h1, h2⟩ := evalFloatArithBase_add_neg_zero f a ha
+  obtain ⟨h3, h7⟩ := evalFloatArithBase_sub_zero_identities f a ha
+  have h4 := evalFloatArithBase_mul_oneBits f a ha
+  obtain ⟨h5, h6⟩ := evalFloatArithBase_oneBits_mul_div f a ha
+  obtain ⟨h8, h9, h10⟩ := evalFloatArithBase_negOneBits_mul_div f a ha
+  exact ⟨EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h1 hmod,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h2 hmod,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h3 hmod,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h4 hmod,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h5 hmod,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h6 hmod,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h7 hneg,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h8 hneg,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h9 hneg,
+    EvalFloatBinOpRel_of_base_not_nan mode _ f _ _ _ out rfl h10 hneg⟩
+
+/-- **Concrete signed-zero / unit witnesses** (`evalFloatBinOp` and full `evalRvalue`):
+- `(-0.0) + (+0.0) = +0.0` but `(-0.0) + (-0.0) = -0.0` and `(+0.0) + (-0.0) = +0.0`
+  (`f32` and `f64`);
+- `(+0.0) - (+0.0) = +0.0` (not `-0.0`) while `(-0.0) - (+0.0) = -0.0`;
+- `1.0 * (-0.0) = -0.0`, `(-1.0) * (+0.0) = -0.0`, `(-1.0) * (+∞) = -∞`, and
+  `(-1.0) * minSubnormal = -minSubnormal`;
+- NaN operands are NOT preserved by the deterministic evaluator: `1.0 * qNaN(payload 1)` and
+  `qNaN(payload 1) + (-0.0)` both return the preferred NaN `0x7FC00000`, so the non-NaN
+  hypothesis of the identity laws is necessary. -/
+theorem evalFloatBinOp_signed_zero_and_unit_witness :
+    evalFloatBinOp .add .binary32 0x80000000 0x00000000 = .some ⟨0x00000000, 4⟩ ∧
+    evalFloatBinOp .add .binary32 0x80000000 0x80000000 = .some ⟨0x80000000, 4⟩ ∧
+    evalFloatBinOp .add .binary32 0x00000000 0x80000000 = .some ⟨0x00000000, 4⟩ ∧
+    evalFloatBinOp .add .binary64 0x8000000000000000 0x0000000000000000 =
+      .some ⟨0x0000000000000000, 8⟩ ∧
+    evalFloatBinOp .add .binary64 0x8000000000000000 0x8000000000000000 =
+      .some ⟨0x8000000000000000, 8⟩ ∧
+    evalFloatBinOp .sub .binary32 0x00000000 0x00000000 = .some ⟨0x00000000, 4⟩ ∧
+    evalFloatBinOp .sub .binary32 0x80000000 0x00000000 = .some ⟨0x80000000, 4⟩ ∧
+    evalFloatBinOp .mul .binary32 0x3F800000 0x80000000 = .some ⟨0x80000000, 4⟩ ∧
+    evalFloatBinOp .mul .binary32 0xBF800000 0x00000000 = .some ⟨0x80000000, 4⟩ ∧
+    evalFloatBinOp .mul .binary32 0xBF800000 0x7F800000 = .some ⟨0xFF800000, 4⟩ ∧
+    evalFloatBinOp .mul .binary32 0xBF800000 0x00000001 = .some ⟨0x80000001, 4⟩ ∧
+    evalFloatBinOp .mul .binary32 0x3F800000 0x7FC00001 = .some ⟨0x7FC00000, 4⟩ ∧
+    evalFloatBinOp .add .binary32 0x7FC00001 0x80000000 = .some ⟨0x7FC00000, 4⟩ ∧
+    evalRvalue .nil
+        (.binaryOp .add (mkFloatConstOp f32Ty 0x80000000 4) (mkFloatConstOp f32Ty 0x00000000 4)) =
+      .ok (.scalar ⟨0x00000000, 4⟩) .nil emptyMemory ∧
+    evalRvalue .nil
+        (.binaryOp .add (mkFloatConstOp f32Ty 0x80000000 4) (mkFloatConstOp f32Ty 0x80000000 4)) =
+      .ok (.scalar ⟨0x80000000, 4⟩) .nil emptyMemory ∧
+    evalRvalue .nil
+        (.binaryOp .mul (mkFloatConstOp f32Ty 0xBF800000 4) (mkFloatConstOp f32Ty 0x00000000 4)) =
+      .ok (.scalar ⟨0x80000000, 4⟩) .nil emptyMemory := by
+  refine ⟨
+    evalFloatBinOp_of_base .add .binary32 0x80000000 0x00000000 0x00000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .add .binary32 0x80000000 0x80000000 0x80000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .add .binary32 0x00000000 0x80000000 0x00000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .add .binary64 0x8000000000000000 0x0000000000000000
+      0x0000000000000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .add .binary64 0x8000000000000000 0x8000000000000000
+      0x8000000000000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .sub .binary32 0x00000000 0x00000000 0x00000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .sub .binary32 0x80000000 0x00000000 0x80000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .mul .binary32 0x3F800000 0x80000000 0x80000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .mul .binary32 0xBF800000 0x00000000 0x80000000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .mul .binary32 0xBF800000 0x7F800000 0xFF800000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .mul .binary32 0xBF800000 0x00000001 0x80000001 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .mul .binary32 0x3F800000 0x7FC00001 0x7FC00000 rfl (by decide +kernel),
+    evalFloatBinOp_of_base .add .binary32 0x7FC00001 0x80000000 0x7FC00000 rfl (by decide +kernel),
+    rfl, rfl, rfl⟩
+
 /-! ### `evalRvalue`-level realization, dispatcher laws, & subtraction-as-negated-addition -/
 
 /-- `evalFloatBinOp .sub` coincides unconditionally with `evalFloatBinOp .add` on the
@@ -14627,6 +15366,89 @@ theorem decodeTypedValueFromBytes_mixed_ptr_int_strip_vs_whole_buffer_witness :
   injection hfs with h0 _
   cases h0
 
+/-- Two-entry `LayoutTable` for the `.scalarPair` non-vacuity witness: `0 ↦ ()` and
+`1 ↦ struct Mixed { p: *const u8, n: u64 }` with `backendRepr = .scalarPair (pointer, u64)` and
+NO `fieldLayouts` (so decoding takes the `.scalarPair` path, not the per-field-layout path). -/
+private def b3ScalarPairLayouts : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries :=
+      [ { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .arbitrary [] [],
+          variants := .single 0, isUninhabited := false },
+        { size := ⟨16⟩, align := ⟨8⟩,
+          backendRepr := .scalarPair (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩)
+            (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+          fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0,
+          isUninhabited := false } ] }
+
+/-- **Non-vacuity of the universal selective-erasure theorems, at EVERY fuel**: each
+hypothesis-laden universal law of the "Selective per-field provenance preservation" section is
+instantiated on a concrete layout / spec with ALL hypotheses discharged by `rfl`, so their
+hypothesis sets are jointly satisfiable, and the law's right-hand side computes the expected
+value `(ptrA with provenance, 0x2000 without provenance)` for EVERY `fuel` (not only
+`defaultCodecFuel`):
+1. `decodeTypedValueFromBytes_tuple_pair_mixed_strip` on the resolved `(*const u8, u64)`;
+2. `decodeTypedValueFromBytes_tuple_pair_seq_mixed_strip` on the unresolved `(*const u8, usize)`;
+3. `decodeTypedValueFromBytes_adt_scalarPair_mixed_strip` on a `.scalarPair (pointer, u64)`
+   struct WITHOUT `fieldLayouts` (a decoder path no other concrete witness exercises);
+4. `decodeTypedValueRichWithPolicy_structFields_mixed_strip` on a `RichAdtSpec.structFields`
+   `struct Mixed { p: *const u8, n: u64 }` (likewise otherwise unexercised);
+5. `decodeTypedValueRichWithPolicy_nichePointerEnum_intact_strip` on `Option<&u8>`. -/
+theorem mixed_strip_laws_nonvacuous_witness (fuel : Nat) :
+    let ptrBytesA := encodeLittleEndianBytes 0x1000 8 (.some (7, 7))
+    let ptrBytesB := encodeLittleEndianBytes 0x2000 8 (.some (9, 9))
+    let twoPtrBytes := appendAbstractBytes ptrBytesA ptrBytesB
+    let ptrK : RigidTy := .rawPtr .not (.uint .u8)
+    let keptPtrAndInt : Value := .aggregate 0 [b2PtrA, .scalar ⟨0x2000, 8⟩]
+    let mixedSpec : List (DefPath × RichAdtSpec) :=
+      [("Mixed", .structFields 0 16
+        [(0, 8, { kind := ptrK, layoutIdx := 0 }), (8, 8, { kind := .uint .u64, layoutIdx := 0 })])]
+    let optRefSpec : List (DefPath × RichAdtSpec) :=
+      [("OptionRef", .nichePointerEnum 8 0 8 0 .nil 1
+        [(0, 8, { kind := .ref .not (.uint .u8), layoutIdx := 0 })])]
+    decodeTypedValueFromBytes (fuel + 2) b2Layouts b2PtrU64TupT twoPtrBytes .stripProvenance =
+      .some keptPtrAndInt ∧
+    decodeTypedValueFromBytes (fuel + 2) emptyLayoutTable
+        { kind := .tuple [ptrK, .uint .usize], layoutIdx := 0 } twoPtrBytes .stripProvenance =
+      .some keptPtrAndInt ∧
+    decodeTypedValueFromBytes (fuel + 1) b3ScalarPairLayouts
+        { kind := .adt "Mixed" .nil, layoutIdx := 1 } twoPtrBytes .stripProvenance =
+      .some keptPtrAndInt ∧
+    decodeTypedValueFromBytes (fuel + 1) b3ScalarPairLayouts
+        { kind := .adt "Mixed" .nil, layoutIdx := 1 } twoPtrBytes .strictUcg630Ub = .none ∧
+    decodeTypedValueRichWithPolicy (fuel + 2) emptyLayoutTable mixedSpec
+        { kind := .adt "Mixed" .nil, layoutIdx := 0 } twoPtrBytes .stripProvenance =
+      .some keptPtrAndInt ∧
+    decodeTypedValueRichWithPolicy (fuel + 2) emptyLayoutTable mixedSpec
+        { kind := .adt "Mixed" .nil, layoutIdx := 0 } twoPtrBytes .strictUcg630Ub = .none ∧
+    decodeTypedValueRichWithPolicy (fuel + 2) emptyLayoutTable optRefSpec
+        { kind := .adt "OptionRef" .nil, layoutIdx := 0 } ptrBytesA .stripProvenance =
+      .some (.aggregate 1 [b2PtrA]) := by
+  intro ptrBytesA ptrBytesB twoPtrBytes ptrK keptPtrAndInt mixedSpec optRefSpec
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · exact (decodeTypedValueFromBytes_tuple_pair_mixed_strip fuel b2Layouts ptrK (.uint .u64) 6
+      (b2PairLayout 4 3) (b2PrimLayout 8 (.pointer 0) 0xFFFFFFFFFFFFFFFF)
+      (b2PrimLayout 8 (.int 64 false) 0xFFFFFFFFFFFFFFFF) ⟨0⟩ ⟨8⟩ [0, 1] 4 3
+      twoPtrBytes ptrBytesA ptrBytesB rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+      (Or.inl ⟨_, _, rfl⟩) (Or.inr (Or.inr (Or.inr (Or.inl ⟨_, rfl⟩))))).trans rfl
+  · exact (decodeTypedValueFromBytes_tuple_pair_seq_mixed_strip fuel emptyLayoutTable ptrK
+      (.uint .usize) 0 8 8 twoPtrBytes rfl rfl rfl rfl
+      (Or.inl ⟨_, _, rfl⟩) (Or.inr (Or.inr (Or.inr (Or.inl ⟨_, rfl⟩))))).trans rfl
+  · exact (decodeTypedValueFromBytes_adt_scalarPair_mixed_strip fuel b3ScalarPairLayouts "Mixed" .nil 1
+      _ 0 ⟨0⟩ ⟨8⟩ [0, 1] (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩)
+      (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩) 8 8 twoPtrBytes ptrBytesA ptrBytesB
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl).trans rfl
+  · rfl
+  · exact (decodeTypedValueRichWithPolicy_structFields_mixed_strip fuel emptyLayoutTable mixedSpec
+      "Mixed" .nil 0 0 16 0 8 8 8 { kind := ptrK, layoutIdx := 0 }
+      { kind := .uint .u64, layoutIdx := 0 } twoPtrBytes ptrBytesA ptrBytesB rfl rfl rfl rfl
+      (Or.inl ⟨_, _, rfl⟩) (Or.inr (Or.inr (Or.inr (Or.inl ⟨_, rfl⟩))))).trans rfl
+  · rfl
+  · exact ((decodeTypedValueRichWithPolicy_nichePointerEnum_intact_strip (fuel + 1) emptyLayoutTable
+      optRefSpec "OptionRef" .nil 0 8 0 8 0 .nil 1
+      [(0, 8, { kind := .ref .not (.uint .u8), layoutIdx := 0 })] ptrBytesA ptrBytesA
+      rfl rfl rfl rfl).1).trans rfl
+
 /-- **`{to,from}_bits` byte casts preserve float bit patterns verbatim** (documented bitwise
 operations): with a compiler-supplied `f32` layout, `transmute::<u32, f32>` and
 `transmute::<f32, u32>` on the signaling NaN `0x7FA00001` return the unchanged bit pattern
@@ -15001,6 +15823,50 @@ depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms axiomAudit_places
+
+set_option linter.defProp false in
+/-- Axiom-audit bundle for the round-3 IEEE-754 comparison-completeness laws (§2), the
+commutativity / signed-zero additive-identity / `±1.0` unit laws (§7), and the
+selective-erasure non-vacuity witness (§7). -/
+def axiomAudit_cmp_identity :=
+  And.intro (@pack_unpack_f32) <|
+  And.intro (@evalFloatPartialCompare_some_iff) <|
+  And.intro (@evalFloatCmp_self) <|
+  And.intro (@evalFloatCmp_refl_iff) <|
+  And.intro (@evalFloatCmp_signed_zeros_le_ge) <|
+  And.intro (@evalFloatCmp_partialOrd_consistency) <|
+  And.intro (@evalFloatCmp_not_duality_of_not_nan) <|
+  And.intro (@evalFloatCmp_not_duality_fails_of_nan) <|
+  And.intro (@evalFloatCmp_not_duality_iff) <|
+  And.intro (@evalFloatCmp_lt_asymm) <|
+  And.intro (@evalFloatCmp_nan_duality_and_signed_zero_witness) <|
+  And.intro (@canonicalBits_of_decodeBits) <|
+  And.intro (@exactSumFloat_comm) <|
+  And.intro (@evalFloatArithBase_add_comm) <|
+  And.intro (@evalFloatArithBase_mul_comm) <|
+  And.intro (@evalFloatBinOp_of_base) <|
+  And.intro (@EvalFloatBinOpRel_of_base_not_nan) <|
+  And.intro (@evalFloatBinOp_add_mul_comm) <|
+  And.intro (@evalFloatArithBase_add_neg_zero) <|
+  And.intro (@evalFloatArithBase_add_pos_zero) <|
+  And.intro (@evalFloatArithBase_add_pos_zero_eq_self_iff) <|
+  And.intro (@evalFloatArithBase_signed_zero_identity_asymmetry) <|
+  And.intro (@evalFloatArithBase_sub_zero_identities) <|
+  And.intro (@evalFloatArithBase_pos_zero_sub_not_neg) <|
+  And.intro (@negOneBits_eq_evalFloatNeg_oneBits) <|
+  And.intro (@evalFloatArithBase_oneBits_mul_div) <|
+  And.intro (@evalFloatArithBase_negOneBits_mul_div) <|
+  And.intro (@evalFloatBinOp_identity_laws) <|
+  And.intro (@EvalFloatBinOpRel_identity_laws) <|
+  And.intro (@evalFloatBinOp_signed_zero_and_unit_witness) <|
+  @mixed_strip_laws_nonvacuous_witness
+
+/--
+info: 'Anneal.Mir.IeeeFloatArith.axiomAudit_cmp_identity'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms axiomAudit_cmp_identity
 
 end AxiomGuards
 
