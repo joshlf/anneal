@@ -2518,38 +2518,73 @@ def dvLmFixture (variantIdx caseIdx : Nat) : CapturedMir :=
   | 3, 3 => dvV4WideEqMir
   | _, _ => dvV1RefUnsizeMir
 
-/-- Direct vendored `Miri.Interpreter.Step.step` observation for every
-`(treeBorrows, variantIdx, caseIdx)` key (`variantIdx, caseIdx ∈ 0..3`). -/
-def dvLmObserve (treeBorrows : Bool) (variantIdx : Nat) (caseIdx : Nat) : DynVtLmObs :=
+/-- The concrete trait-method / library bodies linked for each
+`(variantIdx, caseIdx)` key. -/
+def dvLmCallees (variantIdx caseIdx : Nat) : List CapturedMir :=
+  match variantIdx, caseIdx with
+  | 2, _ => dvCallees
+  | 3, 1 => [dvCoreAddrEqMir]
+  | _, _ => []
+
+/-- The initial LeanMiri state of each `(variantIdx, caseIdx)` key. Every state
+is built over the key's own fixture `dvLmFixture variantIdx caseIdx` (key
+`(2, 3)` is the caller state `dvStC16Caller`, `dvLmInit_c16`). -/
+def dvLmInit (variantIdx caseIdx : Nat) : AnnealStepState :=
   match variantIdx, caseIdx with
   -- 0: thinUnsize
-  | 0, 0 => dvLmRun dvV1RefUnsizeMir [] treeBorrows
-      (dvStThinLocal dvV1RefUnsizeMir 7 4 dvU32Ty dvRefU32Ty)
-  | 0, 1 => dvLmRun dvV1RawUnsizeMir [] treeBorrows (dvStThinArg dvV1RawUnsizeMir dvRawConstU32Ty)
-  | 0, 2 => dvLmRun dvV1RefArgUnsizeMir [] treeBorrows (dvStThinArg dvV1RefArgUnsizeMir dvRefU32Ty)
-  | 0, 3 => dvLmRun dvV1MutUnsizeMir [] treeBorrows
-      (dvStThinLocal dvV1MutUnsizeMir 64 8 dvU64Ty dvRefMutU64Ty)
+  | 0, 0 => dvStThinLocal (dvLmFixture 0 0) 7 4 dvU32Ty dvRefU32Ty
+  | 0, 1 => dvStThinArg (dvLmFixture 0 1) dvRawConstU32Ty
+  | 0, 2 => dvStThinArg (dvLmFixture 0 2) dvRefU32Ty
+  | 0, 3 => dvStThinLocal (dvLmFixture 0 3) 64 8 dvU64Ty dvRefMutU64Ty
   -- 1: dynUpcastAndNop
-  | 1, 0 => dvLmRun dvV2UpcastSuperMir [] treeBorrows (dvStUpcast dvV2UpcastSuperMir)
-  | 1, 1 => dvLmRun dvV2UpcastSideMir [] treeBorrows (dvStUpcast dvV2UpcastSideMir)
-  | 1, 2 => dvLmRun dvV2NopRefMir [] treeBorrows (dvStPointee dvV2NopRefMir 16386)
-  | 1, 3 => dvLmRun dvV2NopRawMir [] treeBorrows (dvStRawDyn dvV2NopRawMir 1 [(16384, dvTrKey)])
+  | 1, 0 => dvStUpcast (dvLmFixture 1 0)
+  | 1, 1 => dvStUpcast (dvLmFixture 1 1)
+  | 1, 2 => dvStPointee (dvLmFixture 1 2) 16386
+  | 1, 3 => dvStRawDyn (dvLmFixture 1 3) 1 [(16384, dvTrKey)]
   -- 2: virtualDispatchAndProtector
-  | 2, 0 => dvLmRun dvV3CallU32Mir dvCallees treeBorrows (dvStCall dvV3CallU32Mir 7 4 dvU32Ty dvRefU32Ty)
-  | 2, 1 => dvLmRun dvV3CallU64Mir dvCallees treeBorrows (dvStCall dvV3CallU64Mir 64 8 dvU64Ty dvRefU64Ty)
-  | 2, 2 => dvLmRun dvV3ArgCallMir dvCallees treeBorrows (dvStPointee dvV3ArgCallMir 16386)
-  | 2, 3 => dvLmRun dvV3PokeCallerMir dvCallees treeBorrows dvStC16Caller
+  | 2, 0 => dvStCall (dvLmFixture 2 0) 7 4 dvU32Ty dvRefU32Ty
+  | 2, 1 => dvStCall (dvLmFixture 2 1) 64 8 dvU64Ty dvRefU64Ty
+  | 2, 2 => dvStPointee (dvLmFixture 2 2) 16386
+  | 2, 3 =>
+    dvMkState (dvLmFixture 2 3) #[dvUninit dvU32Ty, dvIndirectLocal dvAid1 retagParentTag,
+       dvUninit dvRefMutU32Ty, dvUninit dvRawMutU32Ty, dvUninit dvRefU32Ty,
+       dvUninit (dvRefDynTy dvTrKey)]
+      (dvMachine dvVTables (dvLiveU32 dvAid1 7 (some dvRootTree)) #[⟨dvAid1, annealStackBaseAddr dvAid1⟩]
+        (some (dvRecvBorrowState false)))
   -- 3: dynLayoutRawBorrowAndAddrEq
-  | 3, 0 => dvLmRun dvV4SizeSafeMir [] treeBorrows
-      (dvStPointee dvV4SizeSafeMir 16384 (some dvDisabledTree) retagChildTag
-        (bt := some (dvRecvBorrowState false)))
-  | 3, 1 => dvLmRun dvV4AddrEqMir [dvCoreAddrEqMir] treeBorrows
-      (dvStRawDyn dvV4AddrEqMir 0 [(16384, dvTrKey), (16386, dvAltKey)])
-  | 3, 2 => dvLmRun dvV4SizeSafeMir [] treeBorrows (dvStPointee dvV4SizeSafeMir 16384 (live := false))
-  | 3, 3 => dvLmRun dvV4WideEqMir [] treeBorrows
-      (dvStRawDyn dvV4WideEqMir 0 [(16384, dvTrKey), (16385, dvTrKey)])
-  | _, _ => .unsupported
+  | 3, 0 => dvStPointee (dvLmFixture 3 0) 16384 (some dvDisabledTree) retagChildTag
+      (bt := some (dvRecvBorrowState false))
+  | 3, 1 => dvStRawDyn (dvLmFixture 3 1) 0 [(16384, dvTrKey), (16386, dvAltKey)]
+  | 3, 2 => dvStPointee (dvLmFixture 3 2) 16384 (live := false)
+  | 3, 3 => dvStRawDyn (dvLmFixture 3 3) 0 [(16384, dvTrKey), (16385, dvTrKey)]
+  | _, _ => dvStThinLocal (dvLmFixture 0 0) 7 4 dvU32Ty dvRefU32Ty
 
+/-- Direct vendored `Miri.Interpreter.Step.step` observation for every
+`(treeBorrows, variantIdx, caseIdx)` key (`variantIdx, caseIdx ∈ 0..3`). Every key
+executes EXACTLY the fixture `dvLmFixture variantIdx caseIdx` (the body locked to
+Authority 0's `dvTrustedFixture` by the cross-root per-key `Eq.refl` locks), with
+the linked bodies `dvLmCallees` from the state `dvLmInit`
+(`dvLmObserve_eq_run`); outside the 16 keys it fails closed. -/
+def dvLmObserve (treeBorrows : Bool) (variantIdx : Nat) (caseIdx : Nat) : DynVtLmObs :=
+  if variantIdx < 4 ∧ caseIdx < 4 then
+    dvLmRun (dvLmFixture variantIdx caseIdx) (dvLmCallees variantIdx caseIdx) treeBorrows
+      (dvLmInit variantIdx caseIdx)
+  else .unsupported
+
+/-- The `(2, 3)` initial state is the Crubit `c16` caller state. -/
+theorem dvLmInit_c16 : dvLmInit 2 3 = dvStC16Caller := rfl
+
+/-- **Universal: `dvLmObserve` runs the locked fixture.** On every corpus key and
+in both modes, the observation is the vendored run of
+`dvLmFixture variantIdx caseIdx` itself, so the per-key fixture locks of the
+cross-root bridge constrain the body that Authority 2 actually executes. -/
+theorem dvLmObserve_eq_run (tb : Bool) (v c : Nat) (h : v < 4 ∧ c < 4) :
+    dvLmObserve tb v c = dvLmRun (dvLmFixture v c) (dvLmCallees v c) tb (dvLmInit v c) := by
+  unfold dvLmObserve
+  split
+  · rfl
+  · rename_i hc
+    exact absurd h hc
 
 theorem dvLmObserve_v1_thinUnsize_table (tb : Bool) :
     dvLmObserve tb 0 0 = .widePtr 1 0 16384 ∧ dvLmObserve tb 0 1 = .widePtr 5 1 16384 ∧
@@ -2601,15 +2636,11 @@ theorem dvLmObserve_c16_mode_sensitivity :
 /-- Outside the 16 corpus keys the observation fails closed. -/
 theorem dvLmObserve_out_of_range (tb : Bool) (v c : Nat) (h : 4 ≤ v ∨ 4 ≤ c) :
     dvLmObserve tb v c = .unsupported := by
-  rcases h with h | h
-  · match v, c, h with
-    | v + 4, _, _ => rfl
-  · match v, c, h with
-    | 0, c + 4, _ => rfl
-    | 1, c + 4, _ => rfl
-    | 2, c + 4, _ => rfl
-    | 3, c + 4, _ => rfl
-    | _ + 4, _, _ => rfl
+  unfold dvLmObserve
+  split
+  · rename_i hc
+    exact absurd hc (by omega)
+  · rfl
 
 
 /-! ## §6. Realizability Witnesses & Concrete Witnesses Beyond the Corpus -/

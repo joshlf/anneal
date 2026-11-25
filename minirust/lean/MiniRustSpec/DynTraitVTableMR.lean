@@ -656,31 +656,40 @@ key.
 | `dynLayout….ubFault`      | `&dyn Tr` whose pointee local is dead (`StorageDead`)               |
 | `dynLayout….modeCase`     | two `*const dyn Tr` to the same address: `(u32, Tr)` vs `(u64, Tr)` | -/
 def dvTrustedInit (protectedMode : Bool) : DynVtVariant → DynVtCase → MachineState
-  | .thinUnsize, .okPrimary => dvInitLive dvV1RefUnsizeMir [.scalar ⟨7, 4⟩]
-  | .thinUnsize, .okSecondary => dvInitLive dvV1RawUnsizeMir [dvDanglingPtr]
-  | .thinUnsize, .ubFault => dvInitLive dvV1RefArgUnsizeMir [dvDanglingPtr]
-  | .thinUnsize, .modeCase => dvInitLive dvV1MutUnsizeMir [.scalar ⟨64, 8⟩]
-  | .dynUpcastAndNop, .okPrimary => dvInitLive dvV2UpcastSuperMir [.scalar ⟨7, 4⟩]
-  | .dynUpcastAndNop, .okSecondary => dvInitLive dvV2UpcastSideMir [.scalar ⟨7, 4⟩]
+  | .thinUnsize, .okPrimary => dvInitLive (dvTrustedFixture .thinUnsize .okPrimary) [.scalar ⟨7, 4⟩]
+  | .thinUnsize, .okSecondary =>
+    dvInitLive (dvTrustedFixture .thinUnsize .okSecondary) [dvDanglingPtr]
+  | .thinUnsize, .ubFault => dvInitLive (dvTrustedFixture .thinUnsize .ubFault) [dvDanglingPtr]
+  | .thinUnsize, .modeCase => dvInitLive (dvTrustedFixture .thinUnsize .modeCase) [.scalar ⟨64, 8⟩]
+  | .dynUpcastAndNop, .okPrimary =>
+    dvInitLive (dvTrustedFixture .dynUpcastAndNop .okPrimary) [.scalar ⟨7, 4⟩]
+  | .dynUpcastAndNop, .okSecondary =>
+    dvInitLive (dvTrustedFixture .dynUpcastAndNop .okSecondary) [.scalar ⟨7, 4⟩]
   | .dynUpcastAndNop, .ubFault =>
-    dvPointeeInit dvV2NopRefMir 16386 .frozen (.init (.scalar ⟨7, 4⟩))
-  | .dynUpcastAndNop, .modeCase => dvInitLive dvV2NopRawMir [dvWide dvDanglingPtr 16384]
+    dvPointeeInit (dvTrustedFixture .dynUpcastAndNop .ubFault)
+      16386 .frozen (.init (.scalar ⟨7, 4⟩))
+  | .dynUpcastAndNop, .modeCase =>
+    dvInitLive (dvTrustedFixture .dynUpcastAndNop .modeCase) [dvWide dvDanglingPtr 16384]
   | .virtualDispatchAndProtector, .okPrimary =>
-    dvInitLive dvV3CallU32Mir [.scalar ⟨7, 4⟩] dvCallees
+    dvInitLive (dvTrustedFixture .virtualDispatchAndProtector .okPrimary) [.scalar ⟨7, 4⟩] dvCallees
   | .virtualDispatchAndProtector, .okSecondary =>
-    dvInitLive dvV3CallU64Mir [.scalar ⟨64, 8⟩] dvCallees
+    dvInitLive (dvTrustedFixture .virtualDispatchAndProtector .okSecondary)
+      [.scalar ⟨64, 8⟩] dvCallees
   | .virtualDispatchAndProtector, .ubFault =>
-    dvPointeeInit dvV3ArgCallMir 16386 .frozen (.init (.scalar ⟨7, 4⟩))
+    dvPointeeInit (dvTrustedFixture .virtualDispatchAndProtector .ubFault)
+      16386 .frozen (.init (.scalar ⟨7, 4⟩))
   | .virtualDispatchAndProtector, .modeCase => dvV3ProtectedInit protectedMode
   | .dynLayoutRawBorrowAndAddrEq, .okPrimary =>
-    dvPointeeInit dvV4SizeSafeMir 16384 .disabled (.init (.scalar ⟨7, 4⟩))
+    dvPointeeInit (dvTrustedFixture .dynLayoutRawBorrowAndAddrEq .okPrimary)
+      16384 .disabled (.init (.scalar ⟨7, 4⟩))
   | .dynLayoutRawBorrowAndAddrEq, .okSecondary =>
-    dvInitLive dvV4AddrEqMir
+    dvInitLive (dvTrustedFixture .dynLayoutRawBorrowAndAddrEq .okSecondary)
       [dvWide (.ptr { allocId := 5, offsetBytes := 0 } 8) 16384,
        dvWide (.ptr { allocId := 5, offsetBytes := 0 } 8) 16386]
-  | .dynLayoutRawBorrowAndAddrEq, .ubFault => dvPointeeInit dvV4SizeSafeMir 16384 .frozen .dead
+  | .dynLayoutRawBorrowAndAddrEq, .ubFault =>
+    dvPointeeInit (dvTrustedFixture .dynLayoutRawBorrowAndAddrEq .ubFault) 16384 .frozen .dead
   | .dynLayoutRawBorrowAndAddrEq, .modeCase =>
-    dvInitLive dvV4WideEqMir
+    dvInitLive (dvTrustedFixture .dynLayoutRawBorrowAndAddrEq .modeCase)
       [dvWide (.ptr { allocId := 5, offsetBytes := 0 } 8) 16384,
        dvWide (.ptr { allocId := 5, offsetBytes := 0 } 8) 16385]
 

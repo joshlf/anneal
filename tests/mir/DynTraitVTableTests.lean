@@ -653,7 +653,15 @@ run_cmd do
           value := mkApp2 (mkConst ``Eq.refl [1]) capMirTy
             (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
               (mkConst (mrNs ++ `DynVtVariant ++ `virtualDispatchAndProtector))
-              (mkConst (mrNs ++ `DynVtCase ++ `modeCase))) }) ]
+              (mkConst (mrNs ++ `DynVtCase ++ `modeCase))) }),
+        ("forged LM execution of a non-locked fixture at key (0, 0)", .thmDecl {
+          name := ns ++ `forged.lmRunsUnlockedFixture, levelParams := [],
+          type := mkApp3 (mkConst ``Eq [1]) lmObsTy (lmObserveAt false 0 0)
+            (mkApp4 (mkConst (lmNs ++ `dvLmRun))
+              (mkApp2 (mkConst (lmNs ++ `dvLmFixture)) (mkNatLit 0) (mkNatLit 1))
+              (mkApp2 (mkConst (lmNs ++ `dvLmCallees)) (mkNatLit 0) (mkNatLit 0)) boolFalse
+              (mkApp2 (mkConst (lmNs ++ `dvLmInit)) (mkNatLit 0) (mkNatLit 0))),
+          value := mkApp2 (mkConst ``Eq.refl [1]) lmObsTy (lmObserveAt false 0 0) }) ]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
@@ -720,6 +728,8 @@ run_cmd do
         lmNs ++ `dvLmObserve_all_32_table,
         lmNs ++ `dvLmObserve_c16_mode_sensitivity,
         lmNs ++ `dvLmObserve_out_of_range,
+        lmNs ++ `dvLmObserve_eq_run,
+        lmNs ++ `dvLmInit_c16,
         lmNs ++ `dv_table_hypotheses_realizable,
         lmNs ++ `dv_table_laws_instances,
         lmNs ++ `dv_conservative_law_realizable,
@@ -793,6 +803,10 @@ run_cmd do
         `Miri.Interpreter.VirtualCalls.resolveVirtual,
         `Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta,
         `LeanMiriSpec.DynTraitVTableLM.dvLmObserve,
+        `LeanMiriSpec.DynTraitVTableLM.dvLmFixture,
+        `LeanMiriSpec.DynTraitVTableLM.dvLmInit,
+        `MiniRustSpec.DynTraitVTableMR.dvTrustedFixture,
+        `MiniRustSpec.DynTraitVTableMR.dvTrustedInit,
         `LeanMiriSpec.DynTraitVTableLM.annealStepHooksDynTraitVTableFor ]
     for req in requiredReach do
       unless (env.find? req).isSome do
@@ -823,7 +837,7 @@ run_cmd do
     { fileName := "<dv-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 85 && bundleCount = 5 && lockCount = 50 && rejectedCount = 14 do
+  unless addedCount = 85 && bundleCount = 5 && lockCount = 50 && rejectedCount = 15 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount})"
   logInfo m!"dv cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
