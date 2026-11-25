@@ -927,7 +927,7 @@ def runTrustedObs (body : CapturedMir) (callees : List CapturedMir)
   | .halted .panic lastS =>
     match get? lastS.frame.locals 1 with
     | .some (.init (.scalar refv)) => .unwound refv.bits
-    | _ => .unwound 0
+    | _ => .invalidOrUnsupported
   | .halted .abort _ => .abort
   | .faulted .ub => .ub
   | .faulted _ => .invalidOrUnsupported
@@ -1220,14 +1220,22 @@ def mirCase17 : CapturedMir × List CapturedMir :=
      bb [packObs 2 (cU32Op 0) (opCopy 1)] .return_ true]
   (main, [callee])
 
-/-- Case 18: Failing `assert` -> `.cleanup` mutates `*r = 116` -> `unwindTerminate` -> `.abort`. -/
+/-- Case 18: Cross-frame callee with `FnEntry`-protected `&mut x`: failing `assert` ->
+`.cleanup` mutates `*r = 116` through the protected reference -> `unwindTerminate` -> `.abort`
+(mirroring MiniRust `mrProg18` and LeanMiri case 18 frame-for-frame). -/
 def mirCase18 : CapturedMir × List CapturedMir :=
-  let main := mkBody "ep1::c18_main" [decl tyObsTuple, decl tyU32] 0
-    [bb [st (.assign (pl 1) (.use (cU32Op 10)))]
-        (.assert (cBoolOp false) true 1 (.cleanup 2)),
+  let callee := mkBody "ep1::c18_callee" [decl tyUnit, decl tyMutRefU32] 1
+    [bb [st (.retag .fnEntry (pl 1))] (.assert (cBoolOp false) true 1 (.cleanup 2)),
+     bb [st (.assign (pl 0) (.aggregate .tuple []))] .return_,
+     bb [st (.assign (plDeref 1) (.use (cU32Op 116)))] .unwindTerminate true]
+  let main := mkBody "ep1::c18_main"
+    [decl tyObsTuple, decl tyU32, decl tyMutRefU32, decl tyUnit] 0
+    [bb [st (.assign (pl 1) (.use (cU32Op 10))),
+         st (.assign (pl 2) (.ref (.mut false) (pl 1)))]
+        (.call (cFnOp "ep1::c18_callee") [opCopy 2] (pl 3) (some 1) (.cleanup 2)),
      bb [packObs 0 (cU32Op 0) (opCopy 1)] .return_,
-     bb [st (.assign (pl 1) (.use (cU32Op 116)))] .unwindTerminate true]
-  (main, [])
+     bb [packObs 2 (cU32Op 0) (opCopy 1)] .return_ true]
+  (main, [callee])
 
 /-- Case 19: Failing `assert(..., unwind: .terminate)` -> `.abort`. -/
 def mirCase19 : CapturedMir × List CapturedMir :=
@@ -1311,24 +1319,37 @@ def mirCase23 : CapturedMir × List CapturedMir :=
          packObs 1 (opCopy 1) (opCopy 1)] .return_ true]
   (main, [mid, leaf])
 
-/-- Case 24: Callee panics into caller call edge `unwind: .terminate` -> `.abort`. -/
+/-- Case 24: Callee holding an `FnEntry`-protected `&mut x` writes partial update `44`, panics
+(`assert(.., .continue_)`), and unwinds into the caller call edge `unwind: .terminate` ->
+`.abort` (mirroring MiniRust `mrProg24` and LeanMiri case 24). -/
 def mirCase24 : CapturedMir × List CapturedMir :=
-  let callee := mkBody "ep1::c24_callee" [decl tyUnit] 0
-    [bb [] (.assert (cBoolOp false) true 1 .continue_),
+  let callee := mkBody "ep1::c24_callee" [decl tyUnit, decl tyMutRefU32] 1
+    [bb [st (.retag .fnEntry (pl 1)),
+         st (.assign (plDeref 1) (.use (cU32Op 44)))]
+        (.assert (cBoolOp false) true 1 .continue_),
      bb [st (.assign (pl 0) (.aggregate .tuple []))] .return_]
-  let main := mkBody "ep1::c24_main" [decl tyObsTuple, decl tyUnit] 0
-    [bb [] (.call (cFnOp "ep1::c24_callee") [] (pl 1) (some 1) .terminate),
-     bb [packObs 0 (cU32Op 0) (cU32Op 0)] .return_]
+  let main := mkBody "ep1::c24_main"
+    [decl tyObsTuple, decl tyU32, decl tyMutRefU32, decl tyUnit] 0
+    [bb [st (.assign (pl 1) (.use (cU32Op 10))),
+         st (.assign (pl 2) (.ref (.mut false) (pl 1)))]
+        (.call (cFnOp "ep1::c24_callee") [opCopy 2] (pl 3) (some 1) .terminate),
+     bb [packObs 0 (cU32Op 0) (opCopy 1)] .return_]
   (main, [callee])
 
-/-- Case 25: Callee panics into caller call edge `unwind: .unreachable` -> `.ub`. -/
+/-- Case 25: Same `FnEntry`-protected partial-writeback panicking callee, unwinding into the
+caller call edge `unwind: .unreachable` -> `.ub` (mirroring `mrProg25` and LeanMiri case 25). -/
 def mirCase25 : CapturedMir × List CapturedMir :=
-  let callee := mkBody "ep1::c25_callee" [decl tyUnit] 0
-    [bb [] (.assert (cBoolOp false) true 1 .continue_),
+  let callee := mkBody "ep1::c25_callee" [decl tyUnit, decl tyMutRefU32] 1
+    [bb [st (.retag .fnEntry (pl 1)),
+         st (.assign (plDeref 1) (.use (cU32Op 44)))]
+        (.assert (cBoolOp false) true 1 .continue_),
      bb [st (.assign (pl 0) (.aggregate .tuple []))] .return_]
-  let main := mkBody "ep1::c25_main" [decl tyObsTuple, decl tyUnit] 0
-    [bb [] (.call (cFnOp "ep1::c25_callee") [] (pl 1) (some 1) .unreachable),
-     bb [packObs 0 (cU32Op 0) (cU32Op 0)] .return_]
+  let main := mkBody "ep1::c25_main"
+    [decl tyObsTuple, decl tyU32, decl tyMutRefU32, decl tyUnit] 0
+    [bb [st (.assign (pl 1) (.use (cU32Op 10))),
+         st (.assign (pl 2) (.ref (.mut false) (pl 1)))]
+        (.call (cFnOp "ep1::c25_callee") [opCopy 2] (pl 3) (some 1) .unreachable),
+     bb [packObs 0 (cU32Op 0) (opCopy 1)] .return_]
   (main, [callee])
 
 /-- Cases 26 & 27: Bare root-frame unwind after setting `_1 = 77`.

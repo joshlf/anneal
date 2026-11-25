@@ -704,6 +704,136 @@ def lmUnreachableCheck : Except LmExecFailure Unit :=
   | (_, .ok ()) => .ok ()
   | (_, .error e) => .error (.controlFlow e)
 
+/-! ### Vendored `Miri.Interpreter.ControlFlow` driver over the multi-frame harness state
+
+Every `TerminatorKind.assert` / `UnwindAction` / `UnwindResume` / `UnwindTerminate` decision in
+scenarios `14..25` is taken by the REAL vendored `Miri.Interpreter.ControlFlow.evalTerminator`
+(`Assert` → `goToBlock` / `assertPanic`, `UnwindResume` → `returnFromCurrentFrame (unwinding := true)`
+→ `popFrame` → `cleanupFrame` → `unwindToBlock`, `UnwindTerminate` → `unwindTerminate`), running
+over `StepState` whose machine component is the harness `LmState`. The `cleanupFrame` hook executes
+the callee frame teardown (`lmExitCall`: stack-local deallocation via vendored
+`MemoryLifecycle.deallocatePtrWith` + `FnEntry` protector release via vendored
+`BorrowTree.releaseProtector` / `GlobalState.endCall`) exactly where pinned Miri runs
+`pop_stack_frame` / `after_stack_pop`, i.e. AFTER the frame pop and BEFORE the caller's unwind
+continuation is followed. `assertPanic` follows the asserting frame's `UnwindAction` through the
+vendored `unwindToBlock` (the net control effect of Miri's `assert_panic` → `start_panic` call
+unwinding back into the asserting frame). -/
+
+/-- Canonical harness `SourceInfo`. -/
+def lmSrc : Miri.MIR.SourceInfo := { span := ⟨0⟩, scope := 0 }
+
+/-- Harness basic block with an empty statement list. -/
+def lmCfBlock (k : Miri.MIR.TerminatorKind) (cleanup : Bool) : Miri.MIR.BasicBlock :=
+  { statements := #[], terminator := { sourceInfo := lmSrc, kind := k }, cleanup := cleanup }
+
+/-- Harness block layout shared by every driver frame: `bb0` (regular entry), `bb1` (regular
+return target), `bb2` (`isCleanup = true` landing pad executing `UnwindResume`). -/
+def lmCfBlocks : Array Miri.MIR.BasicBlock :=
+  #[lmCfBlock .Return false, lmCfBlock .Return false, lmCfBlock .UnwindResume true]
+
+/-- A vendored `Miri.Interpreter.Frame` for the driver at `loc` with continuation `ret`. -/
+def lmCfFrame (loc : Miri.Interpreter.FrameLocation) (ret : Miri.Interpreter.ReturnContinuation) :
+    Miri.Interpreter.Frame Provenance Unit Unit :=
+  { body := { phase := .Built, argumentCount := 0, spreadArgument := none, locals := #[0],
+              basicBlocks := lmCfBlocks }
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := ret
+    returnPlace := .frameLocal 0 0 none ⟨0, zstLayoutData⟩ (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[⟨.dead, none⟩]
+    vaList := #[]
+    trackCallerArg := none
+    location := loc }
+
+/-- Vendored `ControlHooks` over the harness machine `LmState`; `cleanupFrame` runs the
+supplied frame-exit operation (instantiated with `lmExitCall`), stashing typed failures in
+`LmCtx.pending` so the classifier sees the genuine root cause. -/
+def lmCfControlHooks (exitCall : LmState → Except LmExecFailure LmState) :
+    Miri.Interpreter.ControlHooks Provenance Unit Unit LmState Unit Unit :=
+  { bodySpan := fun _ => .ok ⟨0⟩
+    returnOperand := fun _ s => (s, .ok ())
+    popFrame := fun _ s =>
+      match s.stack.frames.back? with
+      | none => (s, .error (.stack .emptyStack))
+      | some fr => ({ s with stack := ⟨s.stack.frames.pop⟩ }, .ok fr)
+    copyReturn := fun _ _ _ s => (s, .ok ())
+    cleanupFrame := fun _ _ _ s =>
+      match exitCall s.machine with
+      | .ok m => ({ s with machine := m }, .ok .normal)
+      | .error e =>
+        ({ s with machine := { s.machine with ctx := { s.machine.ctx with pending := some e } } },
+          .error (.callback "frame teardown failed"))
+    unwindTerminate := fun _ _ s =>
+      (s, .error (.termination (.abort "panic in a function that cannot unwind"))) }
+
+/-- Vendored `TerminatorHooks` over `LmState`; `readAssertCondition` yields `cond` (read from
+harness memory by the caller), `assertPanic` follows the asserting frame's unwind action. -/
+def lmCfTermHooks (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool) :
+    Miri.Interpreter.TerminatorHooks Provenance Unit Unit LmState Unit Unit Unit :=
+  { lmCfControlHooks exitCall with
+    evalDiscriminant := fun _ _ s => (s, .error (.unsupported "harness: SwitchInt"))
+    compareSwitchCase := fun _ _ _ s => (s, .error (.unsupported "harness: SwitchInt"))
+    call := fun _ _ s => (s, .error (.unsupported "harness: nested call"))
+    tailCall := fun _ _ s => (s, .error (.unsupported "harness: tail call"))
+    drop := fun _ _ _ _ s => (s, .error (.unsupported "harness: drop"))
+    ignoreOptionalOverflowChecks := fun _ => false
+    readAssertCondition := fun _ _ s => (s, .ok cond)
+    assertPanic := fun _ _ unwind s =>
+      Miri.Interpreter.ControlFlow.unwindToBlock (lmCfControlHooks exitCall) () unwind s }
+
+/-- Control location reached by the active frame after a vendored `ControlFlow` transition. -/
+inductive LmCfOutcome where
+  | atBlock (bb : Nat)
+  | unwinding
+  deriving DecidableEq, Repr
+
+/-- Run ONE terminator through vendored `Miri.Interpreter.ControlFlow.evalTerminator` on the
+driver stack `frames` with machine `st`, returning the resulting active-frame location. -/
+def lmCfRun (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool)
+    (frames : Array (Miri.Interpreter.Frame Provenance Unit Unit)) (st : LmState)
+    (kind : Miri.MIR.TerminatorKind) : Except LmExecFailure (LmCfOutcome × LmState) :=
+  match Miri.Interpreter.ControlFlow.evalTerminator (lmCfTermHooks exitCall cond) ()
+      { sourceInfo := lmSrc, kind := kind } { stack := ⟨frames⟩, machine := st } with
+  | (s, .error e) => .error (s.machine.ctx.pending.getD (.controlFlow e))
+  | (s, .ok ()) =>
+    match s.stack.currentFrame? with
+    | none => .error (.controlFlow (.stack .emptyStack))
+    | some fr =>
+      match fr.location with
+      | .mir loc => .ok (.atBlock loc.block, s.machine)
+      | .unwinding _ => .ok (.unwinding, s.machine)
+
+/-- `TerminatorKind.assert(cond == expected, target = bb1, unwind)` in the active frame. -/
+def lmCfAssert (exitCall : LmState → Except LmExecFailure LmState) (cond expected : Bool)
+    (unwind : Miri.MIR.UnwindAction) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  lmCfRun exitCall cond #[lmCfFrame (.mir ⟨0, 0⟩) (.stop false)] st
+    (.Assert (.Copy ⟨1, #[]⟩) expected .NullPointerDereference 1 unwind)
+
+/-- Callee `UnwindResume` from location `calleeLoc` (a cleanup block or an `.unwinding`
+location) whose call edge in the caller carries `unwind`: vendored `returnFromCurrentFrame`
+pops the callee, runs `cleanupFrame` (frame teardown + protector release), then follows
+`unwindToBlock unwind` in the caller. -/
+def lmCfUnwindResume (exitCall : LmState → Except LmExecFailure LmState)
+    (calleeLoc : Miri.Interpreter.FrameLocation) (unwind : Miri.MIR.UnwindAction) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  lmCfRun exitCall true
+    #[lmCfFrame (.mir ⟨0, 0⟩) (.stop false), lmCfFrame calleeLoc (.goto (some 1) unwind)] st
+    .UnwindResume
+
+/-- `TerminatorKind.unwindTerminate` executed from the active frame's cleanup block. -/
+def lmCfUnwindTerminate (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  lmCfRun exitCall true #[lmCfFrame (.mir ⟨2, 0⟩) (.stop false)] st (.UnwindTerminate .InCleanup)
+
+/-- Fail-closed expectation on the vendored control-flow location (mismatch ⇒ `invalidProgram`
+⇒ `.invalidOrUnsupported`, never a silent pass). -/
+def lmCfExpect (o expected : LmCfOutcome) : Except LmExecFailure Unit :=
+  if o = expected then .ok ()
+  else .error (.controlFlow (.invalidProgram "harness control-flow location mismatch"))
+
 /-- Map any `LmExecFailure` into the frozen `LmCrossFramePanicObs` domain. -/
 def classifyLmFailure : LmExecFailure → LmCrossFramePanicObs
   | .abort => .abort
@@ -895,16 +1025,34 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let q ← lmPtrOffsetWrapping pr 400
     let (v, _) ← lmLoadU32 st q
     .ok (.okVal v v)
-  -- Case 14: `TerminatorKind.assert` pass (`true == true`).
-  | 14 => .ok (.okVal 101 101)
-  -- Case 15: `TerminatorKind.assert` pass (`false == false`).
-  | 15 => .ok (.okVal 102 102)
+  -- Case 14: `TerminatorKind.assert(cond == true)` passes: the condition `1` is stored to and
+  -- loaded from vendored `Miri` memory, and vendored `ControlFlow.evalTerminator (.Assert ..)`
+  -- must jump to `target = bb1`.
+  | 14 => do
+    let st := lmInit tb
+    let (pc, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st pc 1
+    let (c, st) ← lmLoadU32 st pc
+    let (o, _) ← lmCfAssert lmExitCall (c == 1) true .Unreachable st
+    lmCfExpect o (.atBlock 1)
+    .ok (.okVal 101 101)
+  -- Case 15: `TerminatorKind.assert(cond == false)` passes (condition `0` loaded from memory).
+  | 15 => do
+    let st := lmInit tb
+    let (pc, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st pc 0
+    let (c, st) ← lmLoadU32 st pc
+    let (o, _) ← lmCfAssert lmExitCall (c == 1) false .Unreachable st
+    lmCfExpect o (.atBlock 1)
+    .ok (.okVal 102 102)
   -- Case 16: `TerminatorKind.unreachable` via vendored `ControlFlow.evalTerminator`.
   | 16 => do
     lmUnreachableCheck
     .ok (.okVal 0 0)
-  -- Case 17: failing `assert` -> `.cleanup` block mutates `*r = 115` -> `unwindResume` -> caught
-  -- by outer harness observing `.unwound 115`.
+  -- Case 17: callee `FnEntry` + write 15, failing `assert(.., unwind: .Cleanup bb2)` (vendored
+  -- `assertPanic` -> `unwindToBlock`), cleanup mutates `*r = 115`, callee `UnwindResume`
+  -- (vendored `returnFromCurrentFrame` pops + tears down the callee frame + follows caller's
+  -- `.Cleanup bb2` catch pad) -> outer harness observes `.unwound 115`.
   | 17 => do
     let st := lmInit tb
     let (px, st) ← lmAllocStack st 4 align4
@@ -913,12 +1061,16 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
     let st ← lmStoreU32 st pr 15
     let st := lmStartUnwind st
+    let (o, st) ← lmCfAssert lmExitCall false true (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
     let st ← lmStoreU32 st pr 115
-    let st ← lmExitCall st
+    let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
     let st ← lmCatchUnwind st
     let (v, _) ← lmLoadU32 st px
     .ok (.unwound v)
-  -- Case 18: failing `assert` -> `.cleanup` block mutates `*r = 116` -> `unwindTerminate` -> `.abort`.
+  -- Case 18: failing `assert(.., unwind: .Cleanup bb2)`, cleanup mutates `*r = 116`, vendored
+  -- `UnwindTerminate` -> `.abort`.
   | 18 => do
     let st := lmInit tb
     let (px, st) ← lmAllocStack st 4 align4
@@ -926,15 +1078,23 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let st := lmEnterCall st
     let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
     let st := lmStartUnwind st
-    let _ ← lmStoreU32 st pr 116
-    .error .abort
-  -- Case 19: failing `assert(..., unwind: .terminate)` -> `.abort`.
-  | 19 => .error .abort
-  -- Case 20: failing `assert(..., unwind: .unreachable)` -> `.ub`.
-  | 20 => .error (.ub "unwinding past a frame that does not allow unwinding")
-  -- Case 21: callee `FnEntry` protector + partial writeback 55 + panic -> unwind releases callee
-  -- protector -> caller `.cleanup` reads 55, writes `55 + 10 = 65` via parent tag -> `unwindResume`
-  -- -> outer catch recovers `.okCleanupRecovered 65 65`.
+    let (o, st) ← lmCfAssert lmExitCall false true (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let st ← lmStoreU32 st pr 116
+    let _ ← lmCfUnwindTerminate lmExitCall st
+    .ok .invalidOrUnsupported
+  -- Case 19: failing `assert(.., unwind: .Terminate)` -> vendored `unwindToBlock` -> `unwindTerminate`.
+  | 19 => do
+    let _ ← lmCfAssert lmExitCall false true (.Terminate .Abi) (lmInit tb)
+    .ok .invalidOrUnsupported
+  -- Case 20: failing `assert(.., unwind: .Unreachable)` -> vendored `unwindToBlock` UB.
+  | 20 => do
+    let _ ← lmCfAssert lmExitCall false true .Unreachable (lmInit tb)
+    .ok .invalidOrUnsupported
+  -- Case 21: callee `FnEntry` + partial writeback 55 + failing `assert(.., unwind: .Continue)`;
+  -- vendored `UnwindResume` pops the callee (releasing `pr` in `cleanupFrame`) into the caller's
+  -- `.Cleanup bb2`; caller cleanup reads 55, writes 65 through `pc` (succeeds iff `pr` released),
+  -- caller `UnwindResume` pops into the outer catch pad -> `.okCleanupRecovered 65 65`.
   | 21 => do
     let st := lmInit tb
     let (px, st) ← lmAllocStack st 4 align4
@@ -945,17 +1105,19 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let (pr, st) ← lmRetagRef st pc .Mutable .FnEntry
     let st ← lmStoreU32 st pr 55
     let st := lmStartUnwind st
-    -- Callee frame unwind pops and releases `pr`'s `FnEntry` protector:
-    let st ← lmExitCall st
-    -- Caller cleanup block reads preserved 55 and writes 65 through `pc` (succeeds iff `pr` released!):
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
     let (vPartial, st) ← lmLoadU32 st pc
     let st ← lmStoreU32 st pc (vPartial + 10)
-    -- Caller `unwindResume` pops and releases `pc`:
-    let st ← lmExitCall st
+    let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
     let st ← lmCatchUnwind st
     let (vFinal, _) ← lmLoadU32 st px
     .ok (.okCleanupRecovered vFinal vFinal)
-  -- Case 22: same partial writeback + callee protector release, caller cleanup writes 66 + `.abort`.
+  -- Case 22: same partial writeback + callee protector release, caller cleanup writes 66, then
+  -- vendored `UnwindTerminate` -> `.abort`.
   | 22 => do
     let st := lmInit tb
     let (px, st) ← lmAllocStack st 4 align4
@@ -966,12 +1128,18 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let (pr, st) ← lmRetagRef st pc .Mutable .FnEntry
     let st ← lmStoreU32 st pr 55
     let st := lmStartUnwind st
-    let st ← lmExitCall st
-    let _ ← lmStoreU32 st pc 66
-    .error .abort
-  -- Case 23: 3-frame LIFO `.continue_` unwind `outer -> mid(p1) -> leaf(p2)`:
-  -- `leaf` writes 3, panics; `leaf` releases `p2`, `mid` propagates `.continue_` releasing `p1`;
-  -- `outer` cleanup reads preserved 3, writes `3 * 100 = 300`, catches -> `.okCleanupRecovered 300 300`.
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let st ← lmStoreU32 st pc 66
+    let _ ← lmCfUnwindTerminate lmExitCall st
+    .ok .invalidOrUnsupported
+  -- Case 23: 3-frame LIFO unwind `outer(po) -> mid(pm) -> leaf(pl)`: leaf asserts with `.Continue`;
+  -- vendored `UnwindResume` pops leaf (releasing `pl`) into mid's `.Continue` edge (mid becomes
+  -- `.unwinding`), pops mid (releasing `pm`) into outer's `.Cleanup bb2`; outer cleanup reads
+  -- preserved 3 and writes 300 through `po` (succeeds iff BOTH `pl` and `pm` released), outer
+  -- `UnwindResume` pops into the root catch pad -> `.okCleanupRecovered 300 300`.
   | 23 => do
     let st := lmInit tb
     let (px, st) ← lmAllocStack st 4 align4
@@ -985,18 +1153,21 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let (pl, st) ← lmRetagRef st pm .Mutable .FnEntry
     let st ← lmStoreU32 st pl 3
     let st := lmStartUnwind st
-    -- LIFO pop 1: leaf releases `pl`
-    let st ← lmExitCall st
-    -- LIFO pop 2: mid propagates `.continue_` and releases `pm`
-    let st ← lmExitCall st
-    -- outer cleanup reads 3 and writes 300 through `po` (succeeds iff BOTH `pl` & `pm` released!)
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) .Continue st
+    lmCfExpect o .unwinding
+    let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
     let (v3, st) ← lmLoadU32 st po
     let st ← lmStoreU32 st po (v3 * 100)
-    let st ← lmExitCall st
+    let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
     let st ← lmCatchUnwind st
     let (vFinal, _) ← lmLoadU32 st px
     .ok (.okCleanupRecovered vFinal vFinal)
-  -- Case 24: callee panics into caller `UnwindAction.terminate` -> `.abort`.
+  -- Case 24: callee `FnEntry` + write 44 + `.Continue` panic; vendored `UnwindResume` pops the
+  -- callee into the caller call edge `unwind: .Terminate` -> `unwindTerminate` -> `.abort`.
   | 24 => do
     let st := lmInit tb
     let (px, st) ← lmAllocStack st 4 align4
@@ -1005,9 +1176,11 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
     let st ← lmStoreU32 st pr 44
     let st := lmStartUnwind st
-    let _ ← lmExitCall st
-    .error .abort
-  -- Case 25: callee panics into caller `UnwindAction.unreachable` -> `.ub`.
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let _ ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Terminate .Abi) st
+    .ok .invalidOrUnsupported
+  -- Case 25: same, caller call edge `unwind: .Unreachable` -> vendored `unwindToBlock` UB.
   | 25 => do
     let st := lmInit tb
     let (px, st) ← lmAllocStack st 4 align4
@@ -1016,8 +1189,10 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
     let st ← lmStoreU32 st pr 44
     let st := lmStartUnwind st
-    let _ ← lmExitCall st
-    .error (.ub "unwinding past a frame that does not allow unwinding")
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let _ ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) .Unreachable st
+    .ok .invalidOrUnsupported
   -- Case 26 & 27: bare root frame unwind via vendored `ControlFlow.returnFromCurrentFrame` -> `.ub`.
   | 26 | 27 => do
     lmRootUnwindCheck
@@ -1132,7 +1307,11 @@ theorem lmCrossFramePanicObserve_out_of_range (tb : Bool) (idx : Nat)
   rfl
 
 /-- Exact typed-failure diagnostics on vendored `Miri` (`tb = true`) confirming genuine root
-causes on Cases `8`, `9`, `10`, `11`, `12`, `16`, `27` (not harness artifacts!). -/
+causes on Cases `8`, `9`, `10`, `11`, `12`, `16`, `27` (memory / Tree Borrows / pointer offset /
+control flow) and on the `assert` / `UnwindAction` / `unwindTerminate` Cases `18`, `19`, `20`, `22`,
+`24`, `25`, whose abort / UB verdicts are produced by vendored
+`Miri.Interpreter.ControlFlow.{evalTerminator, unwindToBlock, returnFromCurrentFrame}` (not
+harness-hardcoded constants). -/
 theorem lm_tb_exact_failure_diagnostics :
     lmCase true 8 = .error (.treeAccess (.AccessFailure ⟨0, 4⟩
       (.TransitionError 1 (.ProtectedDisabled .Unique)))) ∧
@@ -1145,9 +1324,22 @@ theorem lm_tb_exact_failure_diagnostics :
       (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 (-4) .inboundsPointerArithmetic))) ∧
     lmCase true 16 = .error (.controlFlow (.undefinedBehavior "Unreachable")) ∧
     lmCase true 27 = .error (.controlFlow
-      (.undefinedBehavior "unwinding past the topmost stack frame")) := by
+      (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    -- Control-flow root causes come from vendored `ControlFlow.{unwindToBlock, evalTerminator}`:
+    lmCase true 18 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase true 19 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase true 20 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) ∧
+    lmCase true 22 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase true 24 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase true 25 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
   rw [lmCaseU.eq_src]
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- Exact LeanMiri Tree Borrows mode-sensitivity `↔` theorem: Cases `8` and `9` flip between
 `treeBorrows = false` and `treeBorrows = true`, and every other canonical case agrees. -/
@@ -1267,6 +1459,44 @@ theorem lm_controlFlow_root_unwind_ub {P L E M C Op : Type}
   simp only [Miri.Interpreter.Stack.currentFrame?, Array.back?, Array.size_singleton,
     Nat.sub_self, h0, hLoc, hBb, hClean, Id.run, ↓reduceIte, beq_self_eq_true, Bool.and_self]
   rfl
+
+/-- **Universal 4-way `TerminatorKind.assert` law on vendored `ControlFlow.evalTerminator`** (driver
+`lmCfAssert`), for EVERY frame-exit operation, EVERY harness state `st` without a pending failure,
+and EVERY condition bit `b`:
+- `assert(b == b)` jumps to `target = bb1` for every unwind action, leaving `st` untouched;
+- `assert(b == !b, .Cleanup bb)` lands on the cleanup pad `bb`;
+- `assert(b == !b, .Continue)` leaves the frame `.unwinding` (propagating to the caller);
+- `assert(b == !b, .Terminate r)` aborts via `unwindTerminate`;
+- `assert(b == !b, .Unreachable)` faults with vendored `unwindToBlock`'s UB. -/
+theorem lm_cf_assert_four_way (exitCall : LmState → Except LmExecFailure LmState) (st : LmState)
+    (hP : st.ctx.pending = none) (b : Bool) (u : Miri.MIR.UnwindAction) (bb : Nat)
+    (r : Miri.MIR.UnwindTerminateReason) :
+    lmCfAssert exitCall b b u st = .ok (.atBlock 1, st) ∧
+    lmCfAssert exitCall b (!b) (.Cleanup bb) st = .ok (.atBlock bb, st) ∧
+    lmCfAssert exitCall b (!b) .Continue st = .ok (.unwinding, st) ∧
+    lmCfAssert exitCall b (!b) (.Terminate r) st =
+      .error (.controlFlow (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCfAssert exitCall b (!b) .Unreachable st =
+      .error (.controlFlow
+        (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · cases b <;> rfl
+  · cases b <;> rfl
+  · cases b <;> rfl
+  · cases b
+    · show Except.error (st.ctx.pending.getD (.controlFlow
+          (.termination (.abort "panic in a function that cannot unwind")))) = _
+      rw [hP]; rfl
+    · show Except.error (st.ctx.pending.getD (.controlFlow
+          (.termination (.abort "panic in a function that cannot unwind")))) = _
+      rw [hP]; rfl
+  · cases b
+    · show Except.error (st.ctx.pending.getD (.controlFlow
+          (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) = _
+      rw [hP]; rfl
+    · show Except.error (st.ctx.pending.getD (.controlFlow
+          (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) = _
+      rw [hP]; rfl
 
 /-- **Universal `GlobalState.endCall` LIFO protector removal law**:
 1. Calling `endCall` on a frame `f` with `protectedTags = #[(id, tag)]` removes `tag` from
@@ -1427,13 +1657,14 @@ theorem ep1_lean_miri_cross_frame_panic_capstone :
     (type_of% @lm_controlFlow_unreachable_ub) ∧
     (type_of% @lm_controlFlow_unwindToBlock_laws) ∧
     (type_of% @lm_controlFlow_root_unwind_ub) ∧
+    (type_of% @lm_cf_assert_four_way) ∧
     (type_of% @lm_globalState_endCall_lifo_preservation) ∧
     (type_of% @lm_multiframe_lifo_protector_release_witness) ∧
     (type_of% @lm_stepMirFn_miri_lockstep_simulations) :=
   ⟨@lmCrossFramePanicObserve_table, @lmCrossFramePanicObserve_out_of_range,
    @lmCrossFramePanicObserve_mode_sensitivity, @lm_tb_exact_failure_diagnostics,
    @lm_ptr_wrappingSignedOffset_roundtrip, @lm_controlFlow_unreachable_ub,
-   @lm_controlFlow_unwindToBlock_laws, @lm_controlFlow_root_unwind_ub,
+   @lm_controlFlow_unwindToBlock_laws, @lm_controlFlow_root_unwind_ub, @lm_cf_assert_four_way,
    @lm_globalState_endCall_lifo_preservation, @lm_multiframe_lifo_protector_release_witness,
    @lm_stepMirFn_miri_lockstep_simulations⟩
 
