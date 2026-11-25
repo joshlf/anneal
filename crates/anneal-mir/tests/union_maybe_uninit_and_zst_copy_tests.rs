@@ -1,3 +1,12 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0>, the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, or the BSD-2-Clause
+// license <LICENSE-BSD or https://opensource.org/license/bsd-2-clause>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+
 //! Episode 1 (`ep1-anneal-mir-union-offset0-and-zst-copy`) regression tests for unions,
 //! `MaybeUninit<T>`, and zero-sized union fields in the value-tree evaluator:
 //! - an inhabited zero-sized union field other than the active one occupies no bytes of the

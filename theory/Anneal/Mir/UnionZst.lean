@@ -39,7 +39,10 @@ Stated and proved directly against `Trusted.Rustc.V2026_06_01.MirSemantics.readP
   `MirLowerError::InactiveUnionField` (`readUnion_zeroByte_subProj`, `readUnion_zeroByte_subProj_iff`,
   `kani5159_inhabitedLeaf_through_uninhabitedContainer_subProj_unsupported`,
   `readUnion_posLeaf_subProj`, `readUnion_zeroByte_fieldRoot`,
-  `readUnion_uninhabited_nonEmpty_fallthrough_unsupported`).
+  `readUnion_uninhabited_nonEmpty_fallthrough_unsupported`, with non-vacuity witnesses on every
+  `tyByteSize rFieldTy` arm in `kani5159_witness_nonStatic_fallthrough`,
+  `kani5159_v2026_08_01_nonStatic_fallthrough_parity`, and
+  `kani5159_v2026_08_01_nonEmpty_fallthrough_parity`).
 - A 0-byte field or sub-place occupies no storage, so an inhabited one not passing through an
   uninhabited container reads its unique value even from all-`.uninit` storage (`kani#5176`:
   `kani5176_uninit_storage_zst_field`, `kani5176_uninit_storage_zst_subProj`,
@@ -2618,6 +2621,80 @@ theorem kani5159_witness_arr2v_fieldRoot_path :
       (Or.inr (Or.inr ⟨rfl, (by intro h; cases h), (by intro p a h; cases h)⟩))
       (.field 1 wUnitTy) [] [.field 1 wUnitTy] rfl rfl 0 rfl wUnitTy rfl rfl rfl
 
+/-! Non-static fallthrough witness: `union UW { w0: W0, w4: W4, x: u32 }` with the uninhabited
+single-variant enums `enum W0 { A(Infallible, ()) }` (0 bytes) and `enum W4 { A(Infallible, u32) }`
+(4 bytes). A `.downcast` is never statically bounded (`checkStaticSubProjBounds = false`), so reads
+through `w0` / `w4` take the field-root fallthrough on its `.some 0` and `.some (.succ _)` arms. -/
+
+/-- `enum W0 { A(Infallible, ()) }`: a 0-byte single-variant uninhabited enum. -/
+def wW0Layout : TypeLayout :=
+  { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨0⟩] [0, 1],
+    variants := .single 0, isUninhabited := true, fieldLayouts := [3, 1] }
+
+/-- `enum W4 { A(Infallible, u32) }`: a 4-byte single-variant uninhabited enum. -/
+def wW4Layout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨0⟩] [0, 1],
+    variants := .single 0, isUninhabited := true, fieldLayouts := [3, 0] }
+
+/-- `UW`: a 4-byte union of `w0 : W0` (layout `14`), `w4 : W4` (layout `15`), and `x : u32`. -/
+def wUWLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .union 3, variants := .single 0,
+    isUninhabited := false, fieldLayouts := [14, 15, 0] }
+
+/-- `wLayouts` extended with `W0` (`14`), `W4` (`15`), and `UW` (`16`). -/
+def wLayoutsW : LayoutTable :=
+  { wLayouts with entries := wLayouts.entries ++ [wW0Layout, wW4Layout, wUWLayout] }
+
+def wW0Ty : Ty := { kind := .adt "W0" [], layoutIdx := 14 }
+def wW4Ty : Ty := { kind := .adt "W4" [], layoutIdx := 15 }
+def wUWTy : Ty := { kind := .adt "UW" [], layoutIdx := 16 }
+def wDeclsW : List LocalDecl := [{ mutability := .mut, ty := wUWTy, debugName := none }]
+
+/-- `UW { x: 7 }`. -/
+def wUWVal : Value := .aggregate 0 [.unit, .unit, .scalar ⟨7, 4⟩]
+
+/-- **Non-static fallthrough through an uninhabited union field (`.some 0` and `.some (.succ _)`
+arms).** Non-vacuity of `readUnion_uninhabited_nonEmpty_fallthrough_unsupported`: reading the
+inhabited leaf `.1` of the uninhabited variant `A` through a `.downcast` fails closed with
+`.unsupported` (never `.ub`) for both the 0-byte `W0` and the 4-byte `W4`, while reading the
+uninhabited leaf `.0 : Infallible` on the same paths is a genuine leaf load and faults with `.ub`.
+The `tyByteSize = none` arm is covered by `kani5159_v2026_08_01_nonEmpty_fallthrough_parity`. -/
+theorem kani5159_witness_nonStatic_fallthrough :
+    tyByteSize wDeclsW wLayoutsW wW0Ty = some 0 ∧
+    tyByteSize wDeclsW wLayoutsW wW4Ty = some 4 ∧
+    tyByteSize wDecls wLayouts wPairTy = none ∧
+    checkStaticSubProjBounds wDeclsW wLayoutsW wW4Ty [.downcast (some "A") 0, .field 1 wU32Ty] =
+      false ∧
+    readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal wUWTy [.field 2 wU32Ty] =
+      .ok (.scalar ⟨7, 4⟩) ∧
+    readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal wUWTy
+        [.field 0 wW0Ty, .downcast (some "A") 0, .field 1 wUnitTy] = .unsupported ∧
+    readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal wUWTy
+        [.field 0 wW0Ty, .downcast (some "A") 0, .field 1 wUnitTy] ≠ .ub ∧
+    readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal wUWTy
+        [.field 0 wW0Ty, .downcast (some "A") 0, .field 0 wInfTy] = .ub ∧
+    readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal wUWTy
+        [.field 1 wW4Ty, .downcast (some "A") 0, .field 1 wU32Ty] = .unsupported ∧
+    readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal wUWTy
+        [.field 1 wW4Ty, .downcast (some "A") 0, .field 1 wU32Ty] ≠ .ub ∧
+    readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal wUWTy
+        [.field 1 wW4Ty, .downcast (some "A") 0, .field 0 wInfTy] = .ub := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, ?_, (by intro h; cases h), rfl, ?_, (by intro h; cases h), rfl⟩
+  · exact readUnion_uninhabited_nonEmpty_fallthrough_unsupported [] wDeclsW wLayoutsW wUWTy wW0Ty _ 0 3
+      wUWLayout "UW" [] rfl rfl rfl (by decide) (Or.inl rfl)
+      (Or.inr (Or.inr ⟨rfl, (by intro h; cases h), (by intro p a h; cases h)⟩)) rfl
+      (.downcast (some "A") 0) [.field 1 wUnitTy] [.downcast (some "A") 0, .field 1 wUnitTy] rfl rfl
+      (fun leafTy h => by
+        obtain rfl := Option.some.inj (h.symm.trans (rfl : _ = some wUnitTy))
+        rfl)
+  · exact readUnion_uninhabited_nonEmpty_fallthrough_unsupported [] wDeclsW wLayoutsW wUWTy wW4Ty _ 1 3
+      wUWLayout "UW" [] rfl rfl rfl (by decide) (Or.inl rfl)
+      (Or.inr (Or.inr ⟨rfl, (by intro h; cases h), (by intro p a h; cases h)⟩)) rfl
+      (.downcast (some "A") 0) [.field 1 wU32Ty] [.downcast (some "A") 0, .field 1 wU32Ty] rfl rfl
+      (fun leafTy h => by
+        obtain rfl := Option.some.inj (h.symm.trans (rfl : _ = some wU32Ty))
+        rfl)
+
 end V2026_06_01
 
 /-! ### Section 6f: `V2026_08_01` Dialect Parity Witnesses -/
@@ -2751,6 +2828,43 @@ theorem kani5159_v2026_08_01_nonEmpty_fallthrough_parity :
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
         [.field 4 wPairTy, .downcast none 0, .field 1 wUnitTy] = .unsupported :=
   ⟨rfl, rfl⟩
+
+def wW0Ty08 : Ty := { kind := .adt "W0" [], layoutIdx := 14 }
+def wW4Ty08 : Ty := { kind := .adt "W4" [], layoutIdx := 15 }
+def wUWTy08 : Ty := { kind := .adt "UW" [], layoutIdx := 16 }
+def wDeclsW08 : List LocalDecl := [{ mutability := .mut, ty := wUWTy08, debugName := none }]
+def wUWVal08 : Value := .aggregate 0 [.unit, .unit, .scalar ⟨7, 4⟩]
+
+/-- `wLayouts08` extended with `V2026_08_01` copies of `W0` (`14`), `W4` (`15`), and `UW` (`16`)
+(see `kani5159_witness_nonStatic_fallthrough`). -/
+def wLayoutsW08 : LayoutTable :=
+  { wLayouts08 with
+    entries := wLayouts08.entries ++ [
+      { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨0⟩] [0, 1],
+        variants := .single 0, isUninhabited := true, fieldLayouts := [3, 1] },
+      { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨0⟩] [0, 1],
+        variants := .single 0, isUninhabited := true, fieldLayouts := [3, 0] },
+      { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .union 3, variants := .single 0,
+        isUninhabited := false, fieldLayouts := [14, 15, 0] }] }
+
+/-- **Dialect parity (`V2026_08_01`) for the non-static fallthrough on the `.some 0` and
+`.some (.succ _)` arms.** Mirrors `kani5159_witness_nonStatic_fallthrough`: inhabited leaves through
+the uninhabited variants of `W0` / `W4` fail closed with `.unsupported`, uninhabited leaves fault
+with `.ub`, in both dialects. -/
+theorem kani5159_v2026_08_01_nonStatic_fallthrough_parity :
+    readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
+        [.field 0 wW0Ty08, .downcast (some "A") 0, .field 1 wUnitTy08] = .unsupported ∧
+    readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
+        [.field 0 wW0Ty08, .downcast (some "A") 0, .field 0 wInfTy08] = .ub ∧
+    readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
+        [.field 1 wW4Ty08, .downcast (some "A") 0, .field 1 wU32Ty08] = .unsupported ∧
+    readProjectedValueUnionAware [] wDeclsW08 wLayoutsW08 wUWVal08 wUWTy08
+        [.field 1 wW4Ty08, .downcast (some "A") 0, .field 0 wInfTy08] = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
+        wUWTy [.field 0 wW0Ty, .downcast (some "A") 0, .field 1 wUnitTy] = .unsupported ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware [] wDeclsW wLayoutsW wUWVal
+        wUWTy [.field 1 wW4Ty, .downcast (some "A") 0, .field 1 wU32Ty] = .unsupported :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end V2026_08_01Parity
 

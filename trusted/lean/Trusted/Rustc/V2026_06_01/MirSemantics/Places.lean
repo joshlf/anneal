@@ -8422,46 +8422,107 @@ type argument is uninhabited.
 
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.enum>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.struct>
 
 > "A `!` value must never exist."
 >
-> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+> "An enum must have a valid discriminant, and all fields of the variant
+> indicated by that discriminant must be valid at their respective type."
+>
+> "A `struct`, tuple, and array requires all fields/elements to be valid at
+> their respective type."
+
+Reference (The Rust Reference 1.98.0, "Closure types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.intro>
+
+> "A closure type is approximately equivalent to a struct which contains the
+> captured values."
+
+Reference (`library/core/src/convert/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/convert/mod.rs#L930>
+
+> "pub enum Infallible {}"
+
+Reference (`library/std/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/std/src/lib.rs#L511>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/std/src/lib.rs#L519>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/std/src/lib.rs#L553>
+
+> "pub use core::cell;"
+>
+> "pub use core::convert;"
+>
+> "pub use core::mem;"
 
 Reference (`library/core/src/cell.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L2323-L2325>
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L312-L314>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L849-L858>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L2323-L2325>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L2615-L2617>
 
+> "pub struct Cell<T: ?Sized> {
+>     value: UnsafeCell<T>,
+> }"
+>
+> "pub struct RefCell<T: ?Sized> {
+>     borrow: Cell<BorrowCounter>,
+>     // Stores the location of the earliest currently active borrow.
+>     // This gets updated whenever we go from having zero borrows
+>     // to having a single borrow. When a borrow occurs, this gets included
+>     // in the generated `BorrowError`/`BorrowMutError`
+>     #[cfg(feature = "debug_refcell")]
+>     borrowed_at: Cell<Option<&'static crate::panic::Location<'static>>>,
+>     value: UnsafeCell<T>,
+> }"
+>
 > "pub struct UnsafeCell<T: ?Sized> {
 >     value: T,
 > }"
 >
-> "pub struct Cell<T: ?Sized> {
+> "pub struct SyncUnsafeCell<T: ?Sized> {
 >     value: UnsafeCell<T>,
 > }"
 
-Reference (`library/core/src/mem/manually_drop.rs` at commit
+Reference (`library/core/src/mem/manually_drop.rs` and
+`library/core/src/mem/maybe_dangling.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/manually_drop.rs#L161-L163>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/maybe_dangling.rs#L74>
 
 > "pub struct ManuallyDrop<T: ?Sized> {
 >     value: MaybeDangling<T>,
 > }"
+>
+> "pub struct MaybeDangling<P: ?Sized>(P);"
 
-Justification: by the quoted validity rules, `!` has no valid value, and a
-struct, tuple, closure environment, or non-empty array has a valid value only
-if every field/element is valid at its respective type. Because `Infallible` is
-a zero-variant enum in `core`/`std` and `UnsafeCell`/`SyncUnsafeCell`/`Cell`/
-`RefCell`/`ManuallyDrop` are structs containing a field of type `T`, any
-`RigidTy` for which `rigidTyIsUninhabited fuel k = true` is genuinely
-uninhabited. Conversely, a zero-length array `[T; 0]` or empty tuple `()` has
-no elements to validate and returns `false`.
+Justification: by the quoted validity rules, `!` has no valid value; an enum
+needs a valid discriminant, and `Infallible` (the `std::convert` path is a
+re-export of `core::convert`) declares no variants, so it has no valid
+discriminant and no valid value; and a struct, tuple, or non-empty array has a
+valid value only if every field/element is valid at its respective type.
+`UnsafeCell<T>` has a field of type `T`; `Cell<T>`, `RefCell<T>`, and
+`SyncUnsafeCell<T>` each have a field of type `UnsafeCell<T>`; and
+`ManuallyDrop<T>` has a field of type `MaybeDangling<T>`, a tuple struct whose
+only field has type `T` (the `std::cell` / `std::mem` paths are re-exports of
+the `core` modules). Hence each of these wrappers is uninhabited whenever `T`
+is. Conversely, a zero-length array `[T; 0]` or empty tuple `()` has no
+elements to validate and returns `false`.
 
-Guarantees vs. modeling choices: this is a sound structural sufficient
-condition (returning `false` when `fuel` runs out or for arbitrary user-defined
-uninhabited ADTs); compiler-captured uninhabitedness for arbitrary ADTs is
-supplied separately via `TypeLayout.isUninhabited` in `tyIsUninhabited`.
+Guarantees vs. modeling choices: the `!`, `Infallible`, tuple, array, and
+standard-library wrapper cases follow from the quoted documentation and pinned
+library definitions (private field layouts of the wrappers are taken from the
+pinned `core` source, not from a stable documentation promise). The closure
+case applies the struct rule to a closure's captured values under the
+Reference's "approximately equivalent to a struct" description; that is an
+Anneal modeling assumption, not a documented guarantee. This is a structural
+sufficient condition (returning `false` when `fuel` runs out or for arbitrary
+user-defined uninhabited ADTs); compiler-captured uninhabitedness for arbitrary
+ADTs is supplied separately via `TypeLayout.isUninhabited` in
+`tyIsUninhabited`.
 -/
 @[reducible]
 def rigidTyIsUninhabited : Nat → RigidTy → Bool
@@ -8524,45 +8585,81 @@ for the current MIR body at `Runtime(PostCleanup)` phase (`TypingMode::PostAnaly
 and `ty.layoutIdx` indexes that table when resolved.
 
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.def>
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.bool>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.scalar>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.reference-box>
 
-> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
 >
 > "A `!` value must never exist."
+>
+> "A `bool` value must be `false` (`0`) or `true` (`1`)."
+>
+> "An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be
+> initialized, i.e., must not be obtained from uninitialized memory."
+>
+> "A reference or `Box<T>` must be aligned and non-null, it cannot be dangling,
+> and it must point to a valid value (in case of dynamically sized types, using
+> the actual dynamic type of the pointee as determined by the metadata). Note
+> that the last point (about pointing to a valid value) remains a subject of
+> some debate."
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L2127-L2131>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L2170-L2173>
+
+> "/// Is this type known to be uninhabted?
+> ///
+> /// This is separate from BackendRepr because uninhabited return types can affect ABI,
+> /// especially in the case of by-pointer struct returns, which allocate stack even when unused.
+> pub uninhabited: bool,"
+>
+> "/// Returns `true` if this is an uninhabited type
+> pub fn is_uninhabited(&self) -> bool {
+>     self.uninhabited
+> }"
 
 Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L706-L712>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L706-L711>
 
 > "pub trait LayoutOf<'tcx>: LayoutOfHelpers<'tcx> {
 >     /// Computes the layout of a type. Note that this implicitly
 >     /// executes in `TypingMode::PostAnalysis`, and will normalize the input type.
 >     #[inline]
 >     fn layout_of(&self, ty: Ty<'tcx>) -> Self::LayoutOfResult {
->         self.spanned_layout_of(ty, DUMMY_SP)
->     }
-> }"
+>         self.spanned_layout_of(ty, DUMMY_SP)"
 
 Justification: if `rigidTyIsUninhabited 16 ty.kind = true`, `ty` has no valid
 values by the structural validity rules quoted on `rigidTyIsUninhabited`; if
 `LayoutTable.lookup layouts ty.layoutIdx = .some l` with `l.isUninhabited = true`,
-`rustc`'s `LayoutData::is_uninhabited()` proved the type uninhabited for the
-target and monomorphization.
+the captured `TypeLayout.isUninhabited` is `rustc`'s `LayoutData::uninhabited`
+flag ("Is this type known to be uninhabted?") computed by `layout_of` in
+`TypingMode::PostAnalysis` for the monomorphic type and target. Primitive
+scalars (`bool`, `char`, integers, floats) and raw pointers short-circuit to
+`false`: each has documented valid values (e.g. `false`, `0`, a null raw
+pointer), so the type is inhabited regardless of any layout-table entry.
 
 Guarantees vs. modeling choices: combines documented Rust validity guarantees
 for structural forms (`rigidTyIsUninhabited`) with compiler-captured layout
-facts (`TypeLayout.isUninhabited`). When `ty.layoutIdx` is absent from `layouts`
-and `ty.kind` is an opaque custom ADT, `tyIsUninhabited` returns `false`
-(leaving custom uninhabited ADTs without captured layout metadata undetected
-here rather than over-claiming UB).
+facts (`TypeLayout.isUninhabited`); `rustc`'s flag is a compiler fact, not a
+Reference guarantee, and is trusted as captured. References `&T` / `&mut T`
+also short-circuit to `false` even when `T` is uninhabited: the quoted rule
+that a reference "must point to a valid value" is explicitly marked as
+"a subject of some debate", so Anneal deliberately does not claim UB for loads
+at reference type here (this keeps thin-reference decoding in
+`decodeTypedValueFromBytes` independent of `layoutIdx`). When `ty.layoutIdx`
+is absent from `layouts` and `ty.kind` is an opaque custom ADT,
+`tyIsUninhabited` returns `false` (leaving custom uninhabited ADTs without
+captured layout metadata undetected here rather than over-claiming UB). A
+`false` result is therefore never evidence of inhabitedness; callers use it
+only to avoid emitting `.ub`.
 -/
 @[reducible]
--- Note: primitive scalars (`bool`, `char`, integers, floats) and raw pointers
--- (`*const T`, `*mut T`, which remain inhabited in Rust even when `T = !`) are
--- always inhabited; references (`&T`, `&mut T`) also short-circuit `false` here
--- because `decodeTypedValueFromBytes` decodes thin references independently of
--- `layoutIdx`.
 def tyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
   match ty.kind with
   | .bool | .char | .uint _ | .int _ | .float _ | .rawPtr _ _ | .ref _ _ => false
@@ -8592,30 +8689,46 @@ element layout is never lost), and `.opaqueCast` / `.unwrapUnsafeBinder` as
 their target type. The walk stops with `false` at `.index`, `.downcast`, and
 `.deref` (and at array projections on a non-array type).
 
-Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.invalid>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.def>
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.struct>
 
-> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+>
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
 >
 > "A `!` value must never exist."
 >
-> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+> "A `struct`, tuple, and array requires all fields/elements to be valid at
+> their respective type."
 
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Places based on misaligned pointers"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#places-based-on-misaligned-pointers>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.misaligned.load-store>
 
-> "Note that a place based on a misaligned pointer only leads to undefined behavior when it is loaded from or stored to."
+> "Note that a place based on a misaligned pointer only leads to undefined
+> behavior when it is loaded from or stored to."
 
-Justification: in Rust MIR (as well as Miri and MiniRust), place projections
-such as `Field` and `ConstantIndex` compute offsets without validating
-intermediate container types — only loading a value of an **uninhabited leaf
-type** (`tyIsUninhabited layouts leafTy = true`) is guaranteed immediate UB by
-the quoted invalid-values rules. When the leaf type is inhabited
-(`tyIsUninhabited layouts leafTy = false`), projecting through an uninhabited
-intermediate container (e.g., `_u.pair.1 : ()` or `_u.pair_u32.1 : u32` where
-`pair : (Infallible, ())` or `pair_u32 : (Infallible, u32)`) is NOT UB in Miri
-or MiniRust.
+Justification: by the quoted rules, UB from an invalid value arises when a
+value is *produced*, i.e. "read from a place"; reading a value at an
+uninhabited **leaf** type (`tyIsUninhabited layouts leafTy = true`) necessarily
+produces an invalid value and is therefore immediate UB. A read of an
+inhabited leaf through an uninhabited intermediate container (e.g.,
+`_u.pair.1 : ()` or `_u.pair_u32.1 : u32` where `pair : (Infallible, ())` or
+`pair_u32 : (Infallible, u32)`) produces only a value of the leaf type, so the
+quoted rules do not make it UB. The misaligned-pointer note is cited only as
+the Reference's analogous statement that computing a place is distinct from
+loading from it; it is not a premise about uninhabited containers.
+
+Documented gap: the 1.98.0 Reference does not state whether computing a place
+whose intermediate type is uninhabited is itself UB. (Miri and MiniRust, which
+compute field/index offsets without validating intermediate container types,
+treat such reads as non-UB; that is interpreter behavior, not a Reference
+premise.) Anneal therefore claims neither `.ok` nor `.ub` for these reads.
 
 Guarantees vs. modeling choices: `readProjectedValueUnionAware` checks
 `tyIsUninhabited layouts leafTy` first to emit `.ub` strictly for uninhabited
@@ -8623,7 +8736,10 @@ leaf loads (documented Rust UB), and uses `subProjTouchesUninhabited` (together
 with `tyIsUninhabited layouts rFieldTy`) ONLY as a fail-closed **`.unsupported`**
 guard on inhabited-leaf reads through uninhabited intermediate containers. That
 `.unsupported` outcome is an Anneal modeling choice (conservative incompleteness,
-never a false-positive `.ub`).
+never a false-positive `.ub`). `subProjTouchesUninhabited` itself makes no Rust
+claim: it is a pure walk over captured types whose `true` result only selects
+the fail-closed branch, and whose `false` result (including the early stops at
+`.index`, `.downcast`, and `.deref`) is never used to emit `.ub`.
 -/
 @[reducible]
 def subProjTouchesUninhabited
@@ -8744,28 +8860,46 @@ Reference (The Rust Reference 1.98.0, "Union types"):
 > just interprets the storage as the type of the field used for the access.
 > Reading a union field reads the bits of the union at the field's type."
 
-Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.invalid>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.def>
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.struct>
 
-> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+>
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
 >
 > "A `!` value must never exist."
 >
-> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+> "A `struct`, tuple, and array requires all fields/elements to be valid at
+> their respective type."
 
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Places based on misaligned pointers"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#places-based-on-misaligned-pointers>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.misaligned.load-store>
 
-> "Note that a place based on a misaligned pointer only leads to undefined behavior when it is loaded from or stored to."
+> "Note that a place based on a misaligned pointer only leads to undefined
+> behavior when it is loaded from or stored to."
 
 Justification: interpreting union storage at a leaf type `leafTy` (or field-root
-`rFieldTy` when `rest = .nil`) loads a value of that type; when `tyIsUninhabited`
-holds for the loaded leaf, no valid value of that type exists, so the load is
-immediate UB by the quoted validity rules. When `rest = _ :: _` reaches an
-inhabited leaf through an uninhabited container, Rust/Miri/MiniRust only check
-validity at the loaded leaf, so emitting `.ub` would be a false positive;
-returning `.unsupported` is a sound fail-closed modeling choice.
+`rFieldTy` when `rest = .nil`) reads a value of that type from a place, which
+"produces" it; when `tyIsUninhabited` holds for the loaded leaf, no valid value
+of that type exists, so the read is immediate UB by the quoted rules
+(`kani#5159`). When `rest = _ :: _` reaches an inhabited leaf through an
+uninhabited container, the read produces only a value of the inhabited leaf
+type, so the quoted rules do not make it UB and emitting `.ub` would be a false
+positive. The misaligned-pointer note is cited only as the Reference's
+analogous statement that computing a place is distinct from loading from it.
+The 1.98.0 Reference does not say whether computing a place through an
+uninhabited intermediate type is UB (Miri and MiniRust treat it as non-UB;
+that is interpreter behavior, not a Reference premise), so returning
+`.unsupported` there is a fail-closed modeling choice that claims neither
+`.ok` nor `.ub`. A non-static `rest = _ :: _` through an uninhabited field
+returns `.ub` only when `resolveProjectedTyResolved` resolves the loaded leaf
+itself to an uninhabited type (again a leaf read).
 
 Guarantees vs. modeling choices: `.ub` on uninhabited leaf loads relies on
 documented Rust validity guarantees plus compiler-captured layout facts
