@@ -2647,7 +2647,9 @@ theorem dvUnsizeIntoPointer_dynToDyn_agrees_trusted
 /-- **Universal JOINT (`VirtualCalls.resolveVirtual` ↔ Trusted `evalVirtualCall`,
 pointer-coupled on BOTH data and vtable words)**:
 for EVERY captured vtable table `vts`, virtual-method table `vms`, trait key `k`,
-and coupled wide receiver `(dataSc, vtSc)` ↔ `(dp, vp)` resolving to vtable `v`:
+and coupled wide receiver `(dataSc, vtSc)` ↔ `(dp, vp)` resolving to vtable `v`,
+with the SAME receiver kind on both authorities (a raw `*const dyn k` /
+`*mut dyn k` receiver: Miri `wideRawDynPtrTyId`, Trusted `.raw mutb`):
 1. Both `dataSc` ↔ `dp` and `vtSc` ↔ `vp` satisfy `dvPtrCouples`;
 2. **Non-method / OOB slot**: whenever `v.slots[slot]?` is neither `.method` nor
    `.unmodeledMethod`, vendored `Miri.Interpreter.VirtualCalls.resolveVirtual`
@@ -2670,7 +2672,7 @@ theorem dvResolveVirtual_agrees_trusted
     (restArgs : List (Miri.Interpreter.FnArg AnnealProv))
     (virtInst : Miri.Interpreter.CallInstance) (defn : Miri.MIR.DefId) (slot : Nat)
     (callerAbi : Miri.ABI.FnAbi Miri.MIR.TyId) (st : AnnealStepState)
-    (hRecvTy : recvLay.ty = wideSafeDynRefTyId ∨ recvLay.ty = wideRawDynPtrTyId)
+    (hRecvRaw : recvLay.ty = wideRawDynPtrTyId)
     (hKeySmall : dvKeyIdx vts k < 100000)
     (hVtTy : Miri.Interpreter.VTable.getPtrVTableType (dvVTableHooks vts) ()
       ⟨Miri.ABI.Size.ofBytes vtBase, some (.concrete vtAid vtTag)⟩
@@ -2755,6 +2757,8 @@ theorem dvResolveVirtual_agrees_trusted
       .ok ⟨⟨⟨dataPtr.offset, some dataPtr.provenance⟩, .metadata vtSc, none⟩,
         dvDynLayout (dvDynTailBase + dvKeyIdx vts k)⟩ st := by
     unfold Miri.Interpreter.VirtualCalls.receiverPlace
+    have hRecvTy : recvLay.ty = wideSafeDynRefTyId ∨ recvLay.ty = wideRawDynPtrTyId :=
+      Or.inr hRecvRaw
     rcases hRecvTy with hSafe | hRaw
     · simp only [dvVirtualHooks, dvVirtualCompilerHooks, hSafe, beq_self_eq_true, ↓reduceIte,
         Bool.true_or, annealReadImmediateOverlay, bind, EStateM.bind, pure, EStateM.pure]
@@ -3949,7 +3953,7 @@ theorem dv_resolveVirtual_agrees_realizable :
       ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr vtAid), .concrete vtAid .one⟩
     let dataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout dataPtr
     let vtSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout vptr
-    let recvLay := translateTyOverlay (dvRefDynTy dvTrKey) emptyLayoutTable
+    let recvLay := translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable
     let args : Array (Miri.Interpreter.FnArg AnnealProv) :=
       #[.Copy ⟨.immediate (.scalarPair dataSc vtSc), recvLay⟩]
     let abi := dvCallerAbi [⟨.scalarPair dataSc vtSc, recvLay⟩]
@@ -4005,7 +4009,7 @@ theorem dv_resolveVirtual_agrees_realizable :
     ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr vtAid), .concrete vtAid .one⟩
   let dataSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout dataPtr
   let vtSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout vptr
-  let recvLay := translateTyOverlay (dvRefDynTy dvTrKey) emptyLayoutTable
+  let recvLay := translateTyOverlay (dvRawConstDynTy dvTrKey) emptyLayoutTable
   let abi := dvCallerAbi [⟨.scalarPair dataSc vtSc, recvLay⟩]
     (translateTyOverlay dvU32Ty emptyLayoutTable)
   let virtInst : Miri.Interpreter.CallInstance :=
@@ -4037,7 +4041,7 @@ theorem dv_resolveVirtual_agrees_realizable :
     (dvVTables.head (by decide)) (dvConcreteTyId dvVTables (.uint .u32))
     dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
     vtAid .one (annealStackBaseAddr vtAid)
-    recvLay [] virtInst dvVirtualBase 3 abi st0 (Or.inl rfl) (by decide) hVtTy rfl
+    recvLay [] virtInst dvVirtualBase 3 abi st0 rfl (by decide) hVtTy rfl
     sTr rawCaller { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
     rawCaller.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
     sTr.frame.locals (dvLoc 0) 1 .continue_ (dvRawConstDynTy dvTrKey) .not dp vp
@@ -4047,7 +4051,7 @@ theorem dv_resolveVirtual_agrees_realizable :
     (dvVTables.head (by decide)) (dvConcreteTyId dvVTables (.uint .u32))
     dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
     vtAid .one (annealStackBaseAddr vtAid)
-    recvLay [] virtInst dvVirtualBase 1 abi st0 (Or.inl rfl) (by decide) hVtTy rfl
+    recvLay [] virtInst dvVirtualBase 1 abi st0 rfl (by decide) hVtTy rfl
     sTr rawCaller { methodDefPath := "dv::Tr::hdr", dynKey := dvTrKey, slotIdx := 1 }
     rawCaller.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
     sTr.frame.locals (dvLoc 0) 1 .continue_ (dvRawConstDynTy dvTrKey) .not dp vp
@@ -4057,7 +4061,7 @@ theorem dv_resolveVirtual_agrees_realizable :
     (dvVTables.head (by decide)) (dvConcreteTyId dvVTables (.uint .u32))
     dvAid1 .one (annealStackBaseAddr dvAid1) (annealStackBaseAddr dvAid1)
     vtAid .one (annealStackBaseAddr vtAid)
-    recvLay [] virtInst dvVirtualBase 9 abi st0 (Or.inl rfl) (by decide) hVtTy rfl
+    recvLay [] virtInst dvVirtualBase 9 abi st0 rfl (by decide) hVtTy rfl
     sTr rawCaller { methodDefPath := "dv::Tr::oob", dynKey := dvTrKey, slotIdx := 9 }
     rawCaller.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5] [.scalar ⟨5, 4⟩]
     sTr.frame.locals (dvLoc 0) 1 .continue_ (dvRawConstDynTy dvTrKey) .not dp vp
