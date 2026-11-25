@@ -9,6 +9,7 @@ those terms.
 -/
 
 import Anneal.Mir.PlaceAndRvalue
+import Anneal.Mir.UnionZst
 import Anneal.ByteCodec
 import Lean.Elab.Command
 import Trusted.Rustc.V2026_06_01.MirSemantics.Bytes
@@ -348,6 +349,26 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      (`witness_value_returning_intrinsics_run`, `witness_ub_fault_parity`,
      `witness_diverging_abort_vs_panicUnwind`, `witness_two_deep_linked_callees_and_unwind`,
      ..., `witness_diverging_proj_move_cleanup_and_protectors`).
+
+6. **Section 6 — Unions: offset-0 field decoding, `kani#5159` 0-byte field reads, and `kani#5176`
+   `[(); N]` arms** (extracted into `Anneal.Mir.UnionZst`, re-exported via `import Anneal.Mir.UnionZst`
+   under `namespace Anneal.Mir.AdtAndControl.UnionZst` with all theorems public):
+   - Offset-0 decoding (`readUnion_posField_offset0`, `decodeUnionBytes_roundtrip`,
+     `readDecodedUnion_posField_offset0`, `readDecodedUnion_trailing_bytes_ignored`).
+   - `kani#5159`: uninhabited leaf loads (`tyIsUninhabited`) fault with `.ub`, while inhabited-leaf
+     reads through uninhabited containers (`subProjTouchesUninhabited` / uninhabited `rFieldTy`)
+     fail closed with `.unsupported` (never `.ub`), across all 5 `Value` constructors including
+     `Value.uninit` (`UnionSlotInactive`, `readUnion_activeSlot_root`,
+     `readUnion_uninitSlot_zeroByte_root`, `readUnion_zeroByte_root`, `readUnion_zeroByte_subProj`,
+     `readUnion_zeroByte_subProj_iff`, `kani5159_uninhabited_field_root_ub`,
+     `kani5159_uninhabited_subProj_ub`,
+     `kani5159_inhabitedLeaf_through_uninhabitedContainer_subProj_unsupported`,
+     `readUnion_uninhabited_nonEmpty_fallthrough_unsupported`), plus `V2026_08_01` dialect parity
+     witnesses (`V2026_08_01Parity.kani5159_v2026_08_01_parity_reads`).
+   - `kani#5176`: from all-`.uninit` storage, inhabited 0-byte arms (`[(); N]`, `[(); N][i]`) read
+     their canonical value while positive-sized integer arms fault with `.ub`
+     (`kani5176_uninit_storage_zst_field`, `kani5176_uninit_storage_zst_subProj`,
+     `kani5176_uninit_storage_int_field_ub`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
