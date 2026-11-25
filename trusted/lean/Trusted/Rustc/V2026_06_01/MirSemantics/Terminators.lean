@@ -2848,6 +2848,82 @@ def writeIntrinsicScalarResult
   | .some sc => writeIntrinsicReturn s locals' destination targetBb (.scalar sc)
   | .none => MirStepNode.fail .ub
 
+/-!
+## `dyn Trait` calls: dynamic `size_of_val` / `align_of_val`, `core::ptr::addr_eq`, and
+## `InstanceKind::Virtual` dispatch (Episode 1, `ws-tcb-dyn-trait-unsize-and-vtable-dispatch`)
+-/
+
+/--
+Dynamic `size_of_val` / `align_of_val` intrinsic (`isSize`) on a raw pointer
+`ptrArgVal : *const dyn K`, reading the size or alignment from the vtable
+(Condition `C5`).
+
+Reference (`compiler/rustc_const_eval/src/interpret/eval_context.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/eval_context.rs#L495-L499>
+
+> "ty::Dynamic(expected_trait, _) => {
+>     let vtable = metadata.unwrap_meta().to_pointer(self)?;
+>     // Read size and align from vtable (already checks size).
+>     interp_ok(Some(self.get_vtable_size_and_align(vtable, Some(expected_trait))?))
+> }"
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L426-L429>
+
+> "///     - a [trait object], then the vtable part of the pointer must point
+> ///       to a valid vtable acquired by an unsizing coercion, and the size
+> ///       of the *entire value* (dynamic tail length + statically sized prefix)
+> ///       must fit in `isize`."
+
+Justification: only the metadata word is consulted (the data word is never
+read, so no Tree Borrows access occurs); the wide pointer's shape is checked at
+the body's pointer width (`layoutPointerBytes bodyLayouts`, 32- or 64-bit); the
+vtable pointer is validated by `checkDynVTablePtr` against `K` (invalid →
+`.ub`, unavailable environment → `.unsupported`), and the captured layout must
+be well-formed (`wfVTableEntry`, part of `vtableEnvOk`). The result is
+`entry.sizeBytes` / `entry.alignBytes` as a `usize`.
+
+Reachability (Episode 1 status): not yet wired into the `.sizeOfVal` /
+`.alignOfVal` arms of `evalNonSelectIntrinsicCall`, which keep returning
+`.unsupported` for `dyn` pointees: the downstream theorem
+`evalNonSelectIntrinsicCall_cases` (`theory/Anneal/MirFuelFree.lean`) states
+that every intrinsic's outcome is independent of the machine state, whereas a
+vtable lookup reads the caller frames.
+-/
+def evalDynSizeAlignOfVal
+    (s : MachineState)
+    (bodyLayouts : LayoutTable)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (ptrArgVal : Value)
+    (dynKey : DefPath)
+    (isSize : Bool) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match ptrArgVal with
+  | .aggregate 0 (dataVal :: metaVal :: .nil) =>
+    let dataOk : Bool :=
+      match dataVal with
+      | .ptr _ sz => Nat.beq sz ptrBytes
+      | .scalar sc => Nat.beq sc.sizeBytes ptrBytes
+      | _ => false
+    match dataOk with
+    | false => MirStepNode.fail .ub
+    | true =>
+      match checkDynVTablePtr .none (DynMemView.ofMemory s.memory) ptrBytes metaVal dynKey with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok (entry, _, _) =>
+        let res : Nat :=
+          match isSize with
+          | true => entry.sizeBytes
+          | false => entry.alignBytes
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨res, ptrBytes⟩)
+  | _ => MirStepNode.fail .ub
+
 /--
 Evaluate a value-returning `RustIntrinsicKind` (all variants except
 `.constEvalSelect`, `.copyNonOverlapping`, and `.writeBytes`) from evaluated
@@ -4606,6 +4682,513 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
             (resumeExternalTailCallWithAbi
               s.memory.rootUnwindCeiling
               (externalTargetCanUnwind target (operandTy bodyLocalDecls bodyLayouts func)))
+
+/-- `core::ptr::addr_eq` (re-exported as `std::ptr::addr_eq`). -/
+@[reducible]
+def isAddrEqDefPath (p : DefPath) : Bool :=
+  Bool.or (stringEq p "core::ptr::addr_eq") (stringEq p "std::ptr::addr_eq")
+
+/-- Data (address) word of a thin or wide raw-pointer argument value. -/
+@[reducible]
+def ptrArgDataWord? : Value → Option Value
+  | .ptr p sz => .some (.ptr p sz)
+  | .scalar sc => .some (.scalar sc)
+  | .aggregate 0 (dataVal :: _ :: .nil) =>
+    match dataVal with
+    | .ptr _ _ => .some dataVal
+    | .scalar _ => .some dataVal
+    | _ => .none
+  | _ => .none
+
+/--
+Direct call of `core::ptr::addr_eq(p, q)` on thin, slice, or `dyn` raw pointers
+(`rust#166144`, Condition `C5`): compares the data addresses only, ignoring all
+metadata.
+
+Reference (`core::ptr::addr_eq`, Rust 1.98.0 standard library):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.addr_eq.html>
+
+> "Compares the addresses of the two pointers for equality, ignoring any metadata
+> in fat pointers.
+>
+> If the arguments are thin pointers of the same type, then this is the same as
+> eq."
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2489-L2491>
+
+> "pub fn addr_eq<T: PointeeSized, U: PointeeSized>(p: *const T, q: *const U) -> bool {
+>     (p as *const ()) == (q as *const ())
+> }"
+
+Justification: the result equals the library body — both arguments are cast to
+`*const ()` (dropping metadata, as `evalCastPtrToPtr` does) and compared by
+canonical address (`resolveWideWordScalar?`, the same address function
+`evalWidePtrRelBinOp` uses). Argument evaluation already rejected dead or
+moved-out operands; an argument that is not a pointer value (e.g. `.uninit`) is
+`.ub`, an address that cannot be resolved is `.unsupported`, and a diverging
+call site (`targetBbOpt = .none`) is `.ub` because the function returns.
+This interception applies only when `addr_eq` has no linked body (a linked body
+evaluates the same expression).
+-/
+def evalAddrEqCall
+    (s : MachineState)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBbOpt : Option BasicBlockIdx) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match argVals with
+  | pVal :: qVal :: .nil =>
+    match ptrArgDataWord? pVal, ptrArgDataWord? qVal with
+    | .some pw, .some qw =>
+      match targetBbOpt with
+      | .none => MirStepNode.fail .ub
+      | .some targetBb =>
+        match
+          resolveWideWordScalar? pw locals' s.memory.borrows s.memory.callerLocals
+            bodyLocalDecls bodyLayouts ptrBytes s.memory.callStack,
+          resolveWideWordScalar? qw locals' s.memory.borrows s.memory.callerLocals
+            bodyLocalDecls bodyLayouts ptrBytes s.memory.callStack
+        with
+        | .some pa, .some qa =>
+          writeIntrinsicReturn s locals' destination targetBb
+            (.scalar (boolToScalar (Nat.beq pa.bits qa.bits)))
+        | _, _ => MirStepNode.unsupported
+    | _, _ => MirStepNode.fail .ub
+  | _ => MirStepNode.fail .ub
+
+/-- Shape of a dyn-compatible receiver: `&m dyn K` / `*m dyn K` / `Pin<&m dyn K>`. -/
+inductive DynReceiverKind : Type where
+  /-- `&m dyn K` (`self: &Self` / `&mut Self`). -/
+  | ref (m : Mutability) : DynReceiverKind
+  /-- `*m dyn K` (`self: *const Self` / `*mut Self`). -/
+  | raw (m : Mutability) : DynReceiverKind
+  /-- `Pin<&m dyn K>` (`self: Pin<&Self>` / `Pin<&mut Self>`). -/
+  | pinRef (m : Mutability) : DynReceiverKind
+
+/-- Classify a virtual call's receiver type, returning its kind and `dyn` key;
+`Box<dyn K>`, `Rc<dyn K>`, `Arc<dyn K>`, and other `DispatchFromDyn` receivers
+are not modeled (`.none`). -/
+@[reducible]
+def classifyDynReceiver? : RigidTy → Option (DynReceiverKind × DefPath)
+  | .ref m (.dynamic k) => .some (.ref m, k)
+  | .rawPtr m (.dynamic k) => .some (.raw m, k)
+  | .adt p (.ref m (.dynamic k) :: .nil) =>
+    match isPinDefPath p with
+    | true => .some (.pinRef m, k)
+    | false => .none
+  | _ => .none
+
+/-- Split a receiver value of `kind` into its data and metadata words. -/
+@[reducible]
+def unpackDynReceiver? : DynReceiverKind → Value → Option (Value × Value)
+  | .ref _, .aggregate 0 (d :: m :: .nil) => .some (d, m)
+  | .raw _, .aggregate 0 (d :: m :: .nil) => .some (d, m)
+  | .pinRef _, .aggregate 0 (.aggregate 0 (d :: m :: .nil) :: .nil) => .some (d, m)
+  | _, _ => .none
+
+/-- Narrowed (thin) receiver value passed to the concrete method: the data word,
+re-wrapped in `Pin`'s single field for `Pin` receivers. -/
+@[reducible]
+def narrowDynReceiver : DynReceiverKind → Value → Value
+  | .pinRef _, d => .aggregate 0 (d :: .nil)
+  | _, d => d
+
+/-- Mutability of a receiver kind. -/
+@[reducible]
+def DynReceiverKind.mutability : DynReceiverKind → Mutability
+  | .ref m => m
+  | .raw m => m
+  | .pinRef m => m
+
+/-- `true` iff the receiver is a safe reference (`&`, `&mut`, or inside `Pin`). -/
+@[reducible]
+def DynReceiverKind.isSafeRef : DynReceiverKind → Bool
+  | .raw _ => false
+  | _ => true
+
+/--
+Three-way ABI compatibility of the concrete callee body with a virtual call
+site: `.some true` compatible, `.some false` undefined behavior, `.none`
+unsupported.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function imported
+> or transmuted as a "C" function or function pointer)."
+
+Checks: `calleeBody.argCount = argCount`; `calleeBody.fnAbi.conv` is not
+`rust-intrinsic`; the callee's `_1` has the receiver's shape with the concrete
+type as pointee (`&m' T`, `*m' T`, or `Pin<&m' T>`) where a shared receiver
+never feeds a `&mut Self` / `*mut Self` parameter; and every trailing argument's
+caller-side byte size (when resolvable) equals the callee's
+`fnAbi.args[i].layout.size`. A mutability escalation or size mismatch is `.ub`;
+a pointee that is not `entry.concreteTy` or an unexpected receiver shape (a
+capture inconsistency) is `.none`.
+-/
+def virtualCalleeAbiOk
+    (calleeBody : CapturedMir)
+    (kind : DynReceiverKind)
+    (concreteTy : RigidTy)
+    (argOps : List Operand)
+    (argCount : Nat)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) :
+    Option Bool :=
+  let mutOk (cm : Mutability) : Bool :=
+    match kind.mutability, cm with
+    | .not, .mut => false
+    | _, _ => true
+  let recvShape : Option Bool :=
+    match kind, get? calleeBody.localDecls 1 with
+    | .ref _, .some { ty := { kind := .ref cm p, .. }, .. } =>
+      match rigidTyEq p concreteTy with
+      | true => .some (mutOk cm)
+      | false => .none
+    | .raw _, .some { ty := { kind := .rawPtr cm p, .. }, .. } =>
+      match rigidTyEq p concreteTy with
+      | true => .some (mutOk cm)
+      | false => .none
+    | .pinRef _, .some { ty := { kind := .adt pp (.ref cm p :: .nil), .. }, .. } =>
+      match Bool.and (isPinDefPath pp) (rigidTyEq p concreteTy) with
+      | true => .some (mutOk cm)
+      | false => .none
+    | _, _ => .none
+  let rec trailingOk : Nat → List Operand → Bool
+    | _, .nil => true
+    | i, op :: ops =>
+      let here : Bool :=
+        match operandTy bodyLocalDecls bodyLayouts op, get? calleeBody.fnAbi.args i with
+        | .some ty, .some argAbi =>
+          match tyByteSize bodyLocalDecls bodyLayouts ty with
+          | .some sz => Nat.beq sz argAbi.layout.size.bytes
+          | .none => true
+        | _, _ => true
+      Bool.and here (trailingOk (Nat.add i 1) ops)
+  match
+    Bool.and (Nat.beq calleeBody.argCount argCount)
+      (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+  with
+  | false => .some false
+  | true =>
+    match recvShape with
+    | .none => .none
+    | .some false => .some false
+    | .some true =>
+      match argOps with
+      | _ :: rest => .some (trailingOk 1 rest)
+      | .nil => .some false
+
+/--
+Function-entry retag of a narrowed safe-reference receiver in the freshly pushed
+callee frame `s1` (Condition `C4`, Crubit `c16`): a fresh child tag of the
+receiver's tag with an active protector covering the concrete pointee for the
+duration of the call. Returns `.none` on undefined behavior.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L276-L287>
+
+> "pub enum RetagKind {
+>     /// The initial retag of arguments when entering a function.
+>     FnEntry,"
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L211-L216>
+
+> "protector: is_protected.then_some(if ref_mutability.is_some() {
+>     // Strong protector for references
+>     ProtectorKind::StrongProtector"
+
+Justification: identical to `evalFnEntryRetag` on `_1 : &m T` (resp. the field of
+`_1 : Pin<&m T>`) with `T = entry.concreteTy`: permission `fnEntryRetagPerm m T`,
+initial child read through the receiver tag unless the permission is `Cell` or
+`T` is zero-sized, and the protector identifier pushed onto
+`activeProtectors` *after* `pushCalleeFrame` snapshotted the caller's
+protectors, so the protector is released when the callee returns or unwinds.
+Receivers without a stack borrow tag (globals, provenance-less ZST addresses)
+are left unchanged, as `evalFnEntryRetag`'s `attachOnly` / global paths do not
+create a tracked child.
+-/
+def protectDynReceiverOnEntry
+    (s1 : MachineState)
+    (kind : DynReceiverKind)
+    (dataVal : Value)
+    (entry : CapturedVTable) :
+    Option MachineState :=
+  match dataVal with
+  | .ptr p sz =>
+    match lookupBorrow s1.memory.borrows p.tag with
+    | .none => .some s1
+    | .some parentEntry =>
+      let perm := fnEntryRetagPerm kind.mutability entry.concreteTy
+      let skipInitRead : Bool :=
+        match perm with
+        | .cell => true
+        | _ => Nat.beq entry.sizeBytes 0
+      let readUB : Bool :=
+        match skipInitRead with
+        | true => false
+        | false =>
+          hasTreeReadUB
+            s1.memory.borrows
+            s1.memory.borrows
+            s1.memory.activeProtectors
+            parentEntry.targetLocal
+            (.some p.tag)
+            parentEntry.targetProjection
+            parentEntry.rangeOffset
+            parentEntry.rangeLen
+            parentEntry.targetFrameDepth
+      match readUB with
+      | true => .none
+      | false =>
+        let borrowsAfterRead :=
+          match skipInitRead with
+          | true => s1.memory.borrows
+          | false =>
+            freezeTreeBorrowsOnReadAtProj
+              s1.memory.borrows
+              s1.memory.borrows
+              parentEntry.targetLocal
+              (.some p.tag)
+              parentEntry.targetProjection
+              parentEntry.rangeOffset
+              parentEntry.rangeLen
+              s1.memory.activeProtectors
+              parentEntry.targetFrameDepth
+        let tag := s1.memory.nextTag
+        let protId := s1.memory.nextProtector
+        let child : BorrowEntry := {
+          tag := tag
+          targetLocal := parentEntry.targetLocal
+          targetFrameDepth := parentEntry.targetFrameDepth
+          allocDead := parentEntry.allocDead
+          targetProjection := parentEntry.targetProjection
+          perm := perm
+          rangeOffset := parentEntry.rangeOffset
+          rangeLen := parentEntry.rangeLen
+          protector := .some protId
+          parentTag := .some p.tag
+        }
+        let newRecv := narrowDynReceiver kind (.ptr { allocId := tag, offsetBytes := p.offsetBytes } sz)
+        match set? s1.frame.locals 1 (.init newRecv) with
+        | .none => .none
+        | .some locals1 =>
+          .some
+            { frame := { s1.frame with locals := locals1 }
+              memory :=
+                { s1.memory with
+                  borrows := child :: borrowsAfterRead
+                  nextTag := Nat.add tag 1
+                  activeProtectors := protId :: s1.memory.activeProtectors
+                  nextProtector := Nat.add protId 1 } }
+  | _ => .some s1
+
+/--
+Virtual call `<dyn K as Trait>::method(recv, args..)` resolved to
+`InstanceKind::Virtual(_, slotIdx)` (Conditions `C3` and `C4`).
+
+Reference (`compiler/rustc_const_eval/src/interpret/call.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/call.rs#L739-L758>
+
+> "// Get the required information from the vtable.
+> let vptr = receiver_place.meta().unwrap_meta().to_pointer(self)?;
+> let dyn_ty = self.get_ptr_vtable_ty(vptr, Some(receiver_trait))?;
+> let adjusted_recv = receiver_place.ptr();
+>
+> // Now determine the actual method to call. Usually we use the easy way of just
+> // looking up the method at index `idx`.
+> let vtable_entries = self.vtable_entries(receiver_trait.principal(), dyn_ty);
+> let Some(ty::VtblEntry::Method(fn_inst)) = vtable_entries.get(idx).copied() else {
+>     // FIXME(fee1-dead) these could be variants of the UB info enum instead of this
+>     throw_ub_format!("`dyn` call trying to call something that is not a method");
+> };
+> ...
+> // Adjust receiver argument. Layout can be any (thin) ptr.
+> let receiver_ty = Ty::new_mut_ptr(self.tcx.tcx, dyn_ty);
+> args[0] = FnArg::Copy("
+
+Reference (The Rust Reference 1.98.0, "Trait objects"):
+<https://doc.rust-lang.org/1.98.0/reference/types/trait-object.html>
+
+> "Calling a method on a trait object results in virtual dispatch at runtime:
+> that is, a function pointer is loaded from the trait object vtable and invoked
+> indirectly."
+
+Steps: (1) the function and all argument operands were evaluated by the caller
+(`kani#5172`: uninitialized or dead operands already faulted); (2) the receiver
+type is classified (`&`/`&mut`/`*const`/`*mut`/`Pin<&[mut]>` of `dyn K`; any
+other receiver is `.unsupported`); (3) the vtable pointer is validated against
+`K` and slot `slotIdx` must be `.method concrete` — an out-of-range or
+non-method slot is `.ub`; (4) safe-reference receivers must satisfy
+`dynRefDataValid` with the Tree Borrows gate (`receiverIsMut` on frozen tags /
+immutable globals) *before* any external call; (5) the receiver is narrowed to
+its data word (re-wrapped for `Pin`); (6) a linked concrete body is entered
+after `virtualCalleeAbiOk`, with the safe-reference receiver retagged and
+protected (`protectDynReceiverOnEntry`); an unlinked concrete method becomes a
+`MirCallE` interaction on the concrete `DefPath` with the narrowed arguments.
+
+Modeling choices: unlike Miri, which reaches the concrete callee's own
+function-entry retag to check the receiver, the model checks receiver validity
+at the dispatch point so unlinked callees cannot hide an invalid receiver; the
+check is a necessary validity condition of the safe reference argument.
+-/
+def evalVirtualCall
+    (s : MachineState)
+    (currentBody : Option CapturedMir)
+    (vm : CapturedVirtualMethod)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBbOpt : Option BasicBlockIdx)
+    (unwind : UnwindAction) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match argOps, argVals with
+  | recvOp :: _, recvVal :: restVals =>
+    match operandTy bodyLocalDecls bodyLayouts recvOp with
+    | .none => MirStepNode.unsupported
+    | .some recvTy =>
+      match classifyDynReceiver? recvTy.kind with
+      | .none => MirStepNode.unsupported
+      | .some (kind, recvKey) =>
+        match stringEq recvKey vm.dynKey with
+        | false => MirStepNode.unsupported
+        | true =>
+          match unpackDynReceiver? kind recvVal with
+          | .none => MirStepNode.fail .ub
+          | .some (dataVal, metaVal) =>
+            match checkDynVTablePtr currentBody (DynMemView.ofMemory s.memory) ptrBytes metaVal recvKey with
+            | .ub => MirStepNode.fail .ub
+            | .unsupported => MirStepNode.unsupported
+            | .ok (entry, _, _) =>
+              match get? entry.slots vm.slotIdx with
+              | .some (.method concreteDefPath concreteArgs) =>
+                let recvOk : Bool :=
+                  match kind.isSafeRef with
+                  | false => true
+                  | true =>
+                    dynRefDataValid locals' (DynMemView.ofMemory s.memory) bodyLocalDecls bodyLayouts ptrBytes dataVal entry
+                      (match kind.mutability with
+                       | .mut => true
+                       | .not => false)
+                      true
+                match recvOk with
+                | false => MirStepNode.fail .ub
+                | true =>
+                  let narrowedArgs := narrowDynReceiver kind dataVal :: restVals
+                  match
+                    lookupCallee s.memory.callees bodyLayouts concreteDefPath concreteArgs
+                      s.memory.traitImpls
+                  with
+                  | .some calleeBody =>
+                    match
+                      virtualCalleeAbiOk calleeBody kind entry.concreteTy argOps
+                        (length argVals) bodyLocalDecls bodyLayouts
+                    with
+                    | .none => MirStepNode.unsupported
+                    | .some false => MirStepNode.fail .ub
+                    | .some true =>
+                      match currentBody with
+                      | .none => MirStepNode.unsupported
+                      | .some callerBody =>
+                        let s1 : MachineState :=
+                          match targetBbOpt with
+                          | .some targetBb =>
+                            pushCalleeFrame s callerBody locals' destination targetBb calleeBody
+                              narrowedArgs unwind
+                          | .none =>
+                            pushDivergingCalleeFrame s callerBody locals' destination unwind
+                              calleeBody narrowedArgs
+                        match kind.isSafeRef with
+                        | false => MirStepNode.step s1
+                        | true =>
+                          match protectDynReceiverOnEntry s1 kind dataVal entry with
+                          | .some s2 => MirStepNode.step s2
+                          | .none => MirStepNode.fail .ub
+                  | .none =>
+                    match targetBbOpt with
+                    | .some targetBb =>
+                      MirStepNode.extCall
+                        { defPath := concreteDefPath, typeArgs := concreteArgs, args := narrowedArgs,
+                          memory := s.memory }
+                        (resumeExternalCall s locals' destination targetBb unwind)
+                    | .none =>
+                      MirStepNode.extCall
+                        { defPath := concreteDefPath, typeArgs := concreteArgs, args := narrowedArgs,
+                          memory := s.memory }
+                        (resumeExternalDivergingCall s locals' unwind)
+              | _ => MirStepNode.fail .ub
+  | _, _ => MirStepNode.fail .ub
+
+/--
+`dyn`-aware handling of a direct call that has no linked body
+(`lookupCallee = .none`): `core::ptr::addr_eq` (`evalAddrEqCall`) and calls
+whose `(target.defPath, Self = dyn K)` has a captured `InstanceKind::Virtual`
+record (`evalVirtualCall`). Every other call returns `.none` and keeps the
+pre-existing semantics (intrinsics, panics, external calls).
+
+Justification: a call is dispatched through the vtable exactly when rustc
+resolved it to `InstanceKind::Virtual` (see `CapturedVirtualMethod`); the
+`Self` type of a trait method call is its first generic argument.
+
+Reachability (Episode 1 status): this hook is intended to run in
+`evalTerminator`'s `.call` arms when `lookupCallee` finds no linked body, before
+the intrinsic / external-call fallbacks. It is **not yet wired**: the
+downstream characterization theorems
+`Anneal.Rustc.V2026_06_01.evalTerminatorSymTree_call_extCall` and
+`evalTerminatorSymTree_diverging_extCall` (`theory/Anneal/Rustc/V2026_06_01/SymbolicEval.lean`)
+state that every unlinked, non-intrinsic direct call is a `MirCallE` external
+call, which a vtable dispatch necessarily contradicts. Until those theorems
+gain the hypothesis `evalDynCallHook? .. = .none`, virtual calls keep the
+pre-existing external-call semantics (on the trait method's `DefPath`).
+-/
+def evalDynCallHook?
+    (s : MachineState)
+    (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBbOpt : Option BasicBlockIdx)
+    (unwind : UnwindAction) :
+    Option MirStepNode :=
+  match target.isIndirect with
+  | true => .none
+  | false =>
+    match isAddrEqDefPath target.defPath with
+    | true =>
+      .some (evalAddrEqCall s bodyLocalDecls bodyLayouts argVals locals' destination targetBbOpt)
+    | false =>
+      match target.typeArgs with
+      | .dynamic dynKey :: _ =>
+        match
+          lookupVirtualMethod (collectMemoryVirtualMethods currentBody s.memory) target.defPath
+            dynKey
+        with
+        | .some vm =>
+          .some
+            (evalVirtualCall s currentBody vm bodyLocalDecls bodyLayouts argOps argVals locals'
+              destination targetBbOpt unwind)
+        | .none => .none
+      | _ => .none
 
 /--
 Evaluate basic-block `Terminator` `term` in `s`, producing the next

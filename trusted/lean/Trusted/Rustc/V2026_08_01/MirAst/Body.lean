@@ -148,6 +148,262 @@ structure CapturedAllocation : Type where
   mutability : Mutability
 
 /--
+Captured vtable slot, modeling one `rustc_middle::ty::vtable::VtblEntry` of a
+`(concrete type, dyn Trait)` vtable as returned by `tcx.vtable_entries(..)`.
+
+Modeled `rustc` property and scope: `Runtime(PostCleanup)` MIR at pinned
+`rustc` commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`. Constructors
+correspond one-to-one with `VtblEntry` variants:
+`.dropInPlace` ↔ `MetadataDropInPlace`, `.size` ↔ `MetadataSize`, `.align` ↔
+`MetadataAlign`, `.vacant` ↔ `Vacant`, `.method` ↔ `Method(Instance)`, and
+`.traitVPtr` ↔ `TraitVPtr(TraitRef)`.
+
+Reference (`compiler/rustc_middle/src/ty/vtable.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L13-L26>
+
+> "pub enum VtblEntry<'tcx> {
+>     /// destructor of this type (used in vtable header)
+>     MetadataDropInPlace,
+>     /// layout size of this type (used in vtable header)
+>     MetadataSize,
+>     /// layout align of this type (used in vtable header)
+>     MetadataAlign,
+>     /// non-dispatchable associated function that is excluded from trait object
+>     Vacant,
+>     /// dispatchable associated function
+>     Method(Instance<'tcx>),
+>     /// pointer to a separate supertrait vtable, can be used by trait upcasting coercion
+>     TraitVPtr(TraitRef<'tcx>),
+> }"
+
+Modeling choices (not `rustc` guarantees): `.dropInPlace` additionally records
+the canonical `DefPath` of the concrete `drop_in_place` glue when one is
+captured (`.none` for types without drop glue); `.method` records the resolved
+`Instance` as its canonical `DefPath` plus erased monomorphic generic arguments;
+and `.traitVPtr` names the target supertrait vtable by its `CapturedVTable.vtableId`
+rather than by `TraitRef`. Only `.method` slots are callable; every other slot
+faults a virtual call (see `Terminators.lean`).
+-/
+inductive CapturedVTableSlot : Type where
+  /-- `VtblEntry::MetadataDropInPlace`, with the captured drop glue `DefPath`. -/
+  | dropInPlace (dropFn : Option DefPath) : CapturedVTableSlot
+  /-- `VtblEntry::MetadataSize`. -/
+  | size : CapturedVTableSlot
+  /-- `VtblEntry::MetadataAlign`. -/
+  | align : CapturedVTableSlot
+  /-- `VtblEntry::Vacant` (non-dispatchable method excluded from the vtable). -/
+  | vacant : CapturedVTableSlot
+  /-- `VtblEntry::Method(instance)`: the concrete method's canonical `DefPath`
+      and erased generic arguments of the resolved `Instance`. -/
+  | method (defPath : DefPath) (typeArgs : List RigidTy) : CapturedVTableSlot
+  /-- `VtblEntry::TraitVPtr(trait_ref)`: pointer to the supertrait vtable with
+      `CapturedVTable.vtableId = vtableId`. -/
+  | traitVPtr (vtableId : Nat) : CapturedVTableSlot
+
+/--
+Captured existential-predicate descriptor of one `dyn Trait` type
+(`TyKind::Dynamic(preds, region)`), keyed by the `RigidTy.dynamic dynKey` string
+that `rustc-capture` emits for that type.
+
+Modeled `rustc` property and scope: pinned `rustc` commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, erased monomorphic types. `dynKey`
+is the canonical rendering of the complete predicate list (principal trait
+`DefPath`, its generic arguments, projection bounds, and auto traits in
+canonical sorted order); a `dyn Trait` with no generic arguments, no projection
+bounds, and no auto traits renders as the principal's canonical `DefPath`.
+`predicateKey` is the same rendering *without* auto traits, which is what the
+interpreter compares when checking a vtable against an expected trait object
+type.
+
+Reference (`compiler/rustc_type_ir/src/ty_kind.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_type_ir/src/ty_kind.rs#L197-L198>
+
+> "/// A trait object. Written as `dyn for<'b> Trait<'b, Assoc = u32> + Send + 'a`.
+>     Dynamic(I::BoundExistentialPredicates, I::Region),"
+
+Reference (`compiler/rustc_middle/src/ty/predicate.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/predicate.rs#L274-L284>
+
+> "/// For example, in the trait object `dyn std::fmt::Debug + Sync`, the
+> /// principal bound is `Some(std::fmt::Debug)`, while the auto-trait bounds
+> /// are the set `{Sync}`.
+> ///
+> /// It is also possible to have a \"trivial\" trait object that
+> /// consists only of auto traits, with no principal - for example,
+> /// `dyn Send + Sync`. In that case, the set of auto-trait bounds
+> /// is `{Send, Sync}`, while there is no principal. These trait objects
+> /// have a \"trivial\" vtable consisting of just the size, alignment,
+> /// and destructor."
+
+Reference (`compiler/rustc_const_eval/src/interpret/traits.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/traits.rs#L72-L78>
+
+> "// We check validity by comparing the lists of predicates for equality. We *could* instead
+> // check that the dynamic type to which the vtable belongs satisfies all the expected
+> // predicates, but that would likely be a lot slower and seems unnecessarily permissive.
+>
+> // FIXME: we are skipping auto traits for now, but might revisit this in the future.
+> let mut sorted_vtable: Vec<_> = vtable_dyn_type.without_auto_traits().collect();"
+
+Modeling choices and unsupported cases: `hasUnresolvedExistentialBinder` is set
+when the predicate list still has escaping bound variables after erasure
+(higher-ranked `dyn for<'a> Tr<'a>` binders, `charon#1640`), and
+`supertraitOutlivesOk = false` records a supertrait/projection outlives
+obligation the extractor could not discharge; both make every operation on the
+type fail closed with `.unsupported` rather than `.ub`.
+-/
+structure CapturedDynType : Type where
+  /-- Canonical `RigidTy.dynamic` key of this trait-object type. -/
+  dynKey : DefPath
+  /-- Canonical key of the predicate list without auto traits (the interpreter's
+      vtable trait-equality key). -/
+  predicateKey : DefPath
+  /-- Canonical `DefPath` of the principal trait (`.none` for auto-trait-only
+      trait objects such as `dyn Send`). -/
+  principalTrait? : Option DefPath
+  /-- Erased generic arguments of the principal trait (excluding `Self`). -/
+  typeArgs : List RigidTy := .nil
+  /-- Projection bounds `(associated item name, bound type)` sorted canonically. -/
+  assocBindings : List (String × RigidTy) := .nil
+  /-- Canonical `DefPath`s of the auto traits, sorted and deduplicated. -/
+  autoTraits : List DefPath := .nil
+  /-- `true` when the predicates retain escaping bound variables (`charon#1640`). -/
+  hasUnresolvedExistentialBinder : Bool := false
+  /-- `false` when a supertrait/projection outlives obligation was not discharged. -/
+  supertraitOutlivesOk : Bool := true
+
+/--
+Captured vtable of one `(concreteTy, dyn Trait)` pair, modeling the
+`GlobalAlloc::VTable(ty, dyn_ty)` allocation that a `dyn Trait` wide pointer's
+metadata word points to.
+
+Modeled `rustc` property and scope: pinned `rustc` commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, monomorphic `concreteTy`. `slots`
+is `tcx.vtable_entries(..)` for the principal trait (or the three common header
+entries when there is no principal); `sizeBytes` / `alignBytes` / `isUninhabited`
+are `tcx.layout_of(concreteTy)` for the capture target.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, `GlobalAlloc`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+> "pub enum GlobalAlloc<'tcx> {
+>     /// The alloc ID is used as a function pointer.
+>     Function {
+>         instance: ty::Instance<'tcx>,
+>     },"
+
+Reference (`compiler/rustc_const_eval/src/interpret/memory.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/memory.rs#L1066-L1087>
+
+> "/// Get the dynamic type of the given vtable pointer.
+> /// If `expected_trait` is `Some`, it must be a vtable for the given trait.
+> pub fn get_ptr_vtable_ty(
+>     ...
+>     let (alloc_id, offset, _tag) = self.ptr_get_alloc_id(ptr, 0)?;
+>     if offset.bytes() != 0 {
+>         throw_ub!(InvalidVTablePointer(Pointer::new(alloc_id, offset)))
+>     }
+>     let Some(GlobalAlloc::VTable(ty, vtable_dyn_type)) =
+>         self.tcx.try_get_global_alloc(alloc_id)
+>     else {
+>         throw_ub!(InvalidVTablePointer(Pointer::new(alloc_id, offset)))
+>     };"
+
+Reference (The Rust Reference 1.98.0, "Trait objects"):
+<https://doc.rust-lang.org/1.98.0/reference/types/trait-object.html>
+
+> "Each instance of a pointer to a trait object includes:
+> - a pointer to an instance of a type T that implements SomeTrait
+> - a virtual method table, often just called a vtable, which contains, for each
+>   method of SomeTrait and its supertraits that T implements, a pointer to T’s
+>   implementation (i.e. a function pointer)."
+
+Modeling choices: `vtableAllocId` is the synthetic `AllocId` that runtime
+metadata words `.ptr { allocId := vtableAllocId, offsetBytes := 0 } ptrBytes`
+carry; `rustc-capture` assigns it deterministically in
+`[vtableAllocBase, vtableAllocBase + vtableAllocSpan)` and `vtableEnvOk`
+(`State.lean`) rejects tables whose identifiers collide with globals, function
+pointers, or stack-local page addresses. `primarySuperVTableId?` records the
+supertrait vtable that rustc lays out as a prefix of this one (no `TraitVPtr`
+slot), if any. The vtable allocation itself is not byte-addressable in this
+model: reading or writing through a metadata pointer is unsupported.
+-/
+structure CapturedVTable : Type where
+  /-- Deterministic index of this vtable in the crate-level table. -/
+  vtableId : Nat
+  /-- Synthetic allocation identifier carried by metadata pointers. -/
+  vtableAllocId : AllocId
+  /-- The concrete (erased, monomorphic) type `T` behind the trait object. -/
+  concreteTy : RigidTy
+  /-- `RigidTy.dynamic` key of the trait-object type this vtable was built for. -/
+  dynKey : DefPath
+  /-- `size_of::<T>()` in bytes. -/
+  sizeBytes : Nat
+  /-- `align_of::<T>()` in bytes. -/
+  alignBytes : Nat
+  /-- `true` when `T`'s layout is uninhabited. -/
+  isUninhabited : Bool := false
+  /-- Supertrait vtable laid out as a prefix of this vtable (if any). -/
+  primarySuperVTableId? : Option Nat := .none
+  /-- `tcx.vtable_entries(..)` slots in order. -/
+  slots : List CapturedVTableSlot := .nil
+
+/--
+Captured virtual method record, modeling a call target that
+`Instance::try_resolve` resolves to `InstanceKind::Virtual(def_id, idx)`: a call
+of trait method `methodDefPath` whose `Self` type is the trait object
+`RigidTy.dynamic dynKey` dispatches through vtable slot `slotIdx`.
+
+Reference (`compiler/rustc_middle/src/ty/instance.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/instance.rs#L109-L117>
+
+> "/// Dynamic dispatch to `<dyn Trait as Trait>::fn`.
+> ///
+> /// This `InstanceKind` may have a callable MIR as the default implementation.
+> /// Calls to `Virtual` instances must be codegen'd as virtual calls through the vtable.
+> /// *This means we might not know exactly what is being called.*
+> ///
+> /// If this is reified to a `fn` pointer, a `ReifyShim` is used (see `ReifyShim` above for more
+> /// details on that).
+> Virtual(DefId, usize),"
+
+Justification: only calls whose resolution is `Virtual` are dispatched through
+the vtable; a call of the same trait method whose `Self` is `dyn Trait` but that
+resolves to an ordinary `Item` (e.g. `impl OtherTrait for dyn Trait`) has no
+`CapturedVirtualMethod` record and keeps the static call semantics. Reified
+`ReifyShim` function pointers to virtual methods are unsupported.
+-/
+structure CapturedVirtualMethod : Type where
+  /-- Canonical `DefPath` of the trait method (`def_id`). -/
+  methodDefPath : DefPath
+  /-- `RigidTy.dynamic` key of the receiver trait object (`Self`). -/
+  dynKey : DefPath
+  /-- Vtable slot index (`idx`). -/
+  slotIdx : Nat
+
+/-!
+Structural `DecidableEq` / `Repr` instances for the `dyn Trait` capture records,
+parametric in the (downstream-provided) `DecidableEq RigidTy` / `Repr RigidTy`
+instances so that every `deriving instance DecidableEq, Repr for CapturedMir`
+keeps elaborating. These are generic programming instances with no Rust
+counterpart.
+-/
+section DynCaptureInstances
+variable [DecidableEq RigidTy] [Repr RigidTy]
+deriving instance DecidableEq, Repr for CapturedVTableSlot
+deriving instance DecidableEq, Repr for CapturedDynType
+deriving instance DecidableEq, Repr for CapturedVTable
+deriving instance DecidableEq, Repr for CapturedVirtualMethod
+end DynCaptureInstances
+
+/--
 Complete 1-to-1 captured `Runtime(PostCleanup)` MIR body and layout environment
 emitted by `anneal-rustc-capture` into `Mir/<Item>.lean`, modeling
 `rustc_middle::mir::Body` paired with its `FnAbi`, `LayoutTable`, and global
@@ -226,6 +482,15 @@ structure CapturedMir : Type where
   genericParams : List GenericParamDef := .nil
   /-- Trait implementations. -/
   traitImpls : List TraitImplEntry := .nil
+  /-- Captured `dyn Trait` existential-predicate descriptors reachable from the
+      capture unit (`CapturedDynType`); empty for bodies without trait objects. -/
+  dynTypes : List CapturedDynType := .nil
+  /-- Captured crate-level vtables (`CapturedVTable`), one per
+      `(concrete type, dyn Trait)` pair reachable from an `Unsize` coercion or a
+      `GlobalAlloc::VTable`; empty when none is reachable. -/
+  vtables : List CapturedVTable := .nil
+  /-- Captured `InstanceKind::Virtual` call targets (`CapturedVirtualMethod`). -/
+  virtualMethods : List CapturedVirtualMethod := .nil
 
 /--
 Look up the `BasicBlockData` for 0-based basic-block index `bb` in
@@ -1489,6 +1754,125 @@ theorem dropGenericParams_dropGenericParams
       exact ih rest
 
 /--
+Instantiate the `RigidTy` occurrences of a `CapturedVTableSlot` (`.method`
+generic arguments) under `args`.
+
+Modeling note: crate-level vtables are captured for erased monomorphic types,
+so this substitution is the identity on every table `rustc-capture` emits; it
+exists so `CapturedMir.instantiate` treats every `RigidTy` field uniformly.
+-/
+@[reducible]
+def CapturedVTableSlot.instantiate (args : TypeSubst) : CapturedVTableSlot → CapturedVTableSlot
+  | .method defPath typeArgs => .method defPath (RigidTy.instantiateList args typeArgs)
+  | slot => slot
+
+/-- Structurally instantiate a list of `CapturedVTableSlot`s. -/
+@[reducible]
+def CapturedVTableSlot.instantiateList (args : TypeSubst) :
+    List CapturedVTableSlot → List CapturedVTableSlot
+  | .nil => .nil
+  | s :: ss => CapturedVTableSlot.instantiate args s :: CapturedVTableSlot.instantiateList args ss
+
+/-- `CapturedVTableSlot.instantiate` is the identity under `.nil`. -/
+@[simp]
+theorem CapturedVTableSlot.instantiate_nil :
+    (s : CapturedVTableSlot) → CapturedVTableSlot.instantiate .nil s = s
+  | .dropInPlace _ => rfl
+  | .size => rfl
+  | .align => rfl
+  | .vacant => rfl
+  | .method p a => congrArg (CapturedVTableSlot.method p) (RigidTy.instantiateList_nil a)
+  | .traitVPtr _ => rfl
+
+/-- `CapturedVTableSlot.instantiateList` is the identity under `.nil`. -/
+@[simp]
+theorem CapturedVTableSlot.instantiateList_nil :
+    (ss : List CapturedVTableSlot) → CapturedVTableSlot.instantiateList .nil ss = ss
+  | .nil => rfl
+  | s :: ss =>
+    congrArg2 List.cons (CapturedVTableSlot.instantiate_nil s)
+      (CapturedVTableSlot.instantiateList_nil ss)
+
+/-- Instantiate the `RigidTy` occurrences (`concreteTy`, slot generic arguments)
+of a `CapturedVTable` under `args` (identity on monomorphic tables). -/
+@[reducible]
+def CapturedVTable.instantiate (args : TypeSubst) (v : CapturedVTable) : CapturedVTable :=
+  { v with
+    concreteTy := RigidTy.instantiate args v.concreteTy
+    slots := CapturedVTableSlot.instantiateList args v.slots }
+
+/-- Structurally instantiate a list of `CapturedVTable`s. -/
+@[reducible]
+def CapturedVTable.instantiateList (args : TypeSubst) :
+    List CapturedVTable → List CapturedVTable
+  | .nil => .nil
+  | v :: vs => CapturedVTable.instantiate args v :: CapturedVTable.instantiateList args vs
+
+/-- `CapturedVTable.instantiate` is the identity under `.nil`. -/
+@[simp]
+theorem CapturedVTable.instantiate_nil (v : CapturedVTable) :
+    CapturedVTable.instantiate .nil v = v := by
+  cases v
+  simp only [CapturedVTable.instantiate, RigidTy.instantiate_nil,
+    CapturedVTableSlot.instantiateList_nil]
+
+/-- `CapturedVTable.instantiateList` is the identity under `.nil`. -/
+@[simp]
+theorem CapturedVTable.instantiateList_nil :
+    (vs : List CapturedVTable) → CapturedVTable.instantiateList .nil vs = vs
+  | .nil => rfl
+  | v :: vs =>
+    congrArg2 List.cons (CapturedVTable.instantiate_nil v) (CapturedVTable.instantiateList_nil vs)
+
+/-- Instantiate the `RigidTy` occurrences of projection bindings. -/
+@[reducible]
+def CapturedDynType.instantiateBindings (args : TypeSubst) :
+    List (String × RigidTy) → List (String × RigidTy)
+  | .nil => .nil
+  | (n, t) :: bs => (n, RigidTy.instantiate args t) :: CapturedDynType.instantiateBindings args bs
+
+/-- `CapturedDynType.instantiateBindings` is the identity under `.nil`. -/
+@[simp]
+theorem CapturedDynType.instantiateBindings_nil :
+    (bs : List (String × RigidTy)) → CapturedDynType.instantiateBindings .nil bs = bs
+  | .nil => rfl
+  | (n, t) :: bs => by
+    simp only [CapturedDynType.instantiateBindings, RigidTy.instantiate_nil,
+      CapturedDynType.instantiateBindings_nil bs]
+
+/-- Instantiate the `RigidTy` occurrences (`typeArgs`, `assocBindings`) of a
+`CapturedDynType` under `args` (identity on monomorphic descriptors). -/
+@[reducible]
+def CapturedDynType.instantiate (args : TypeSubst) (d : CapturedDynType) : CapturedDynType :=
+  { d with
+    typeArgs := RigidTy.instantiateList args d.typeArgs
+    assocBindings := CapturedDynType.instantiateBindings args d.assocBindings }
+
+/-- Structurally instantiate a list of `CapturedDynType`s. -/
+@[reducible]
+def CapturedDynType.instantiateList (args : TypeSubst) :
+    List CapturedDynType → List CapturedDynType
+  | .nil => .nil
+  | d :: ds => CapturedDynType.instantiate args d :: CapturedDynType.instantiateList args ds
+
+/-- `CapturedDynType.instantiate` is the identity under `.nil`. -/
+@[simp]
+theorem CapturedDynType.instantiate_nil (d : CapturedDynType) :
+    CapturedDynType.instantiate .nil d = d := by
+  cases d
+  simp only [CapturedDynType.instantiate, RigidTy.instantiateList_nil,
+    CapturedDynType.instantiateBindings_nil]
+
+/-- `CapturedDynType.instantiateList` is the identity under `.nil`. -/
+@[simp]
+theorem CapturedDynType.instantiateList_nil :
+    (ds : List CapturedDynType) → CapturedDynType.instantiateList .nil ds = ds
+  | .nil => rfl
+  | d :: ds =>
+    congrArg2 List.cons (CapturedDynType.instantiate_nil d)
+      (CapturedDynType.instantiateList_nil ds)
+
+/--
 Instantiate a polymorphic `CapturedMir` body with concrete `(RigidTy × TypeLayout)`
 arguments `args : TypeSubst`, substituting `.param idx _` across all `localDecls`,
 `basicBlocks` (statements, rvalues, operands, places/projections, constants,
@@ -1506,7 +1890,10 @@ def CapturedMir.instantiate (m : CapturedMir) (args : TypeSubst) : CapturedMir :
     layouts := tbl'
     typeParamCount := Nat.sub m.typeParamCount substLen
     genericParams := dropGenericParams substLen m.genericParams
-    traitImpls := TraitImplEntry.instantiateList args m.traitImpls }
+    traitImpls := TraitImplEntry.instantiateList args m.traitImpls
+    dynTypes := CapturedDynType.instantiateList args m.dynTypes
+    vtables := CapturedVTable.instantiateList args m.vtables
+    virtualMethods := m.virtualMethods }
 
 /--
 Universal identity theorem `CapturedMir.instantiate_nil` over arbitrary
@@ -1521,7 +1908,9 @@ theorem CapturedMir.instantiate_nil (m : CapturedMir) :
       BasicBlockData.instantiateList_nil,
       FnAbi.instantiate_nil,
       LayoutTable.instantiateForBody_nil,
-      TraitImplEntry.instantiateList_nil]
+      TraitImplEntry.instantiateList_nil,
+      CapturedDynType.instantiateList_nil,
+      CapturedVTable.instantiateList_nil]
 
 /--
 Universal identity theorem `CapturedMir.instantiate_empty_id` over arbitrary

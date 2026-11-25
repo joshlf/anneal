@@ -15050,6 +15050,421 @@ def evalUnsafeFnPointer
   | .ok _ _ => .ub
 
 /--
+Compute the default byte size of an untyped runtime `Value` when `localDecls`
+does not provide a `LocalDecl` for a stack allocation.
+-/
+@[reducible]
+def valueDefaultByteSize : Value → Option Nat
+  | .unit => .some 0
+  | .scalar sc => .some sc.sizeBytes
+  | .ptr _ sz => .some sz
+  | .aggregate 0 fields => inferValueCReprBytes (.aggregate 0 fields)
+  | _ => .none
+
+/--
+Resolve the byte bound of a projected value `rootVal` at `proj` using
+`readProjectedValue` and `valueDefaultByteSize`.
+-/
+@[reducible]
+def projectedValueDefaultByteSize
+    (locals : List LocalSlot)
+    (rootVal : Value)
+    (proj : List ProjectionElem) :
+    Option Nat :=
+  match readProjectedValue locals rootVal proj with
+  | .ok projVal => valueDefaultByteSize projVal
+  | _ => .some 0
+
+/--
+Resolve the byte bound of the allocation backing `ptrVal` from `mem.borrows`
+(using `entry.rangeOffset + entry.rangeLen`, `localDecls`, or `locals`) or
+`mem.globals` (`length alloc.bytes`).
+
+The bound of a stack borrow is independent of its Tree Borrows permission: it is
+`0` once the backing allocation was deallocated (`entry.allocDead`, set by
+`StorageDead`, the implicit free of a repeated `StorageLive`, and the owning
+frame's `TerminatorKind.return_`) or when the target slot is dead, and otherwise
+the size of the live target. The target slot, `localDecls`, and `layouts` are
+those of the frame owning the target (`entry.targetFrameDepth`, resolved through
+`mem.callStack`; `DIV-MR-CALL-TARGET-LOCAL`).
+
+When `entry.targetProjection` ends in `.field`, computes the remaining byte
+capacity `enclosingByteSize - fieldByteOffset` from that field's byte offset to
+the end of the enclosing allocation (or enclosing subslice window), permitting
+intra-allocation cross-field and one-past-the-end pointer arithmetic via
+`BinOp.offset`.
+
+Reference (`library/core/src/ptr/const_ptr.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L380-L430>
+
+> "/// * If the computed offset is non-zero, then `self` must be derived from a
+> ///   pointer to some allocated object, and the entire memory range between
+> ///   `self` and the result must be in bounds of that allocated object."
+-/
+def ptrAllocByteBound?
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ptrVal : ProvenancePtr) :
+    Option Nat :=
+  match lookupBorrow mem.borrows ptrVal.tag with
+  | .some entry =>
+    match entry.allocDead with
+    | true => .some 0
+    | false =>
+      let targetFrameDeclsAndLayouts : List LocalDecl × LayoutTable :=
+        match mem.callStack with
+        | .nil => (localDecls, layouts)
+        | _ :: _ =>
+          match
+            frameLocalDeclsAndLayoutsAtDepth
+              mem.callStack
+              localDecls
+              layouts
+              entry.targetFrameDepth
+          with
+          | .some declsAndLayouts => declsAndLayouts
+          | .none => (.nil, layouts)
+      let localDecls := targetFrameDeclsAndLayouts.1
+      let layouts := targetFrameDeclsAndLayouts.2
+      let targetLive : Bool :=
+        match activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal with
+        | .some (.init _) => true
+        | .some .uninit => true
+        | .some .dead => false
+        | .none =>
+          match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal with
+          | .some (.init _) => true
+          | .some .uninit => true
+          | _ => false
+      match targetLive, Nat.beq entry.rangeLen 0 with
+      | false, _ => .some 0
+      | true, false => .some (Nat.add entry.rangeOffset entry.rangeLen)
+      | true, true =>
+        let rootValOpt : Option Value :=
+          match activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal with
+          | .some (.init v) => .some v
+          | .some _ => .none
+          | .none =>
+            match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal with
+            | .some (.init v) => .some v
+            | _ => .none
+        let normTargetProj :=
+          normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
+        let windowTargetProj :=
+          normalizeAdjacentSubslices (stripTransparentProjections entry.targetProjection)
+        match splitLastConstantIndex? windowTargetProj with
+        | .some (initProj, baseIdx, minLen) =>
+          match rootValOpt with
+          | .some rootVal =>
+            match readProjectedValue locals rootVal initProj with
+            | .ok (.aggregate 0 elems) =>
+              match
+                Bool.and
+                  (Nat.ble minLen (length elems))
+                  (Nat.ble baseIdx (length elems))
+              with
+              | false => .some 0
+              | true =>
+                let remElems := Nat.sub (length elems) baseIdx
+                let elemSz :=
+                  resolveSeqContainerElemByteStride
+                    localDecls
+                    layouts
+                    entry.targetLocal
+                    initProj
+                    elems
+                .some (Nat.mul remElems elemSz)
+            | _ => .some 0
+          | .none =>
+            let initPlace : Place := {
+              local_ := entry.targetLocal
+              projection := initProj
+            }
+            match placeTyResolved localDecls layouts initPlace with
+            | .some arrTy =>
+              match arrTy.kind with
+              | .array elemKind arrLen =>
+                let containerLenOpt : Option Nat :=
+                  match splitLastSubslice? initProj with
+                  | .none => .some arrLen
+                  | .some (_, fromIdx, toIdx, fromEnd) =>
+                    match fromEnd with
+                    | false =>
+                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
+                      | true => .some (Nat.sub toIdx fromIdx)
+                      | false => .none
+                    | true =>
+                      match Nat.ble (Nat.add fromIdx toIdx) arrLen with
+                      | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
+                      | false => .none
+                match containerLenOpt with
+                | .none => .some 0
+                | .some cLen =>
+                  match
+                    Bool.and
+                      (Nat.ble minLen cLen)
+                      (Nat.ble baseIdx cLen)
+                  with
+                  | false => .some 0
+                  | true =>
+                    let remElems := Nat.sub cLen baseIdx
+                    match LayoutTable.lookup layouts arrTy.layoutIdx with
+                    | .some layout =>
+                      match layout.fields with
+                      | .array stride _ => .some (Nat.mul remElems stride.bytes)
+                      | _ =>
+                        match
+                          tyByteSize
+                            localDecls
+                            layouts
+                            { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                        with
+                        | .some elemSz => .some (Nat.mul remElems elemSz)
+                        | .none => .some 0
+                    | .none =>
+                      match
+                        tyByteSize
+                          localDecls
+                          layouts
+                          { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                      with
+                      | .some elemSz => .some (Nat.mul remElems elemSz)
+                      | .none => .some 0
+              | _ => .some 0
+            | _ => .some 0
+        | .none =>
+          match splitLastSubslice? normTargetProj with
+          | .some (initProj, fromIdx, toIdx, fromEnd) =>
+            match rootValOpt with
+            | .some rootVal =>
+              match readProjectedValue locals rootVal normTargetProj with
+              | .ok (.aggregate 0 subElems) =>
+                let elemSz :=
+                  resolveSeqContainerElemByteStride
+                    localDecls
+                    layouts
+                    entry.targetLocal
+                    initProj
+                    subElems
+                .some (Nat.mul (length subElems) elemSz)
+              | _ => .some 0
+            | .none =>
+              let initPlace : Place := {
+                local_ := entry.targetLocal
+                projection := initProj
+              }
+              match placeTyResolved localDecls layouts initPlace with
+              | .some arrTy =>
+                match arrTy.kind with
+                | .array elemKind arrLen =>
+                  let subLenOpt : Option Nat :=
+                    match fromEnd with
+                    | false =>
+                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
+                      | true => .some (Nat.sub toIdx fromIdx)
+                      | false => .none
+                    | true =>
+                      match Nat.ble (Nat.add fromIdx toIdx) arrLen with
+                      | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
+                      | false => .none
+                  match subLenOpt with
+                  | .some subLen =>
+                    match LayoutTable.lookup layouts arrTy.layoutIdx with
+                    | .some layout =>
+                      match layout.fields with
+                      | .array stride _ => .some (Nat.mul subLen stride.bytes)
+                      | _ =>
+                        match
+                          tyByteSize
+                            localDecls
+                            layouts
+                            { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                        with
+                        | .some elemSz => .some (Nat.mul subLen elemSz)
+                        | .none => .some 0
+                    | .none =>
+                      match
+                        tyByteSize
+                          localDecls
+                          layouts
+                          { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                      with
+                      | .some elemSz => .some (Nat.mul subLen elemSz)
+                      | .none => .some 0
+                  | .none => .some 0
+                | _ => .some 0
+              | _ => .some 0
+          | .none =>
+            let fallbackTargetPlaceBytes : Option Nat :=
+              let targetPlace : Place := {
+                local_ := entry.targetLocal
+                projection := entry.targetProjection
+              }
+              match placeTyResolved localDecls layouts targetPlace with
+              | .some projTy =>
+                match tyByteSize localDecls layouts projTy with
+                | .some n => .some n
+                | .none => .some 0
+              | .none =>
+                match rootValOpt with
+                | .some rootVal =>
+                  match readProjectedValue locals rootVal entry.targetProjection with
+                  | .ok (.aggregate 0 fs) =>
+                    match isHomogeneousUntypedFields fs with
+                    | true => inferValueCReprBytes (.aggregate 0 fs)
+                    | false => .some 0
+                  | .ok pv => valueDefaultByteSize pv
+                  | _ => .some 0
+                | .none => .some 0
+            match splitLastField? windowTargetProj with
+            | .none => fallbackTargetPlaceBytes
+            | .some _ =>
+              let (encProj, rawRelProj) := splitAfterLastSeqProj windowTargetProj
+              let relProj := normalizeSubsliceProjections rawRelProj
+              let encTyOpt :=
+                placeTyResolved
+                  localDecls
+                  layouts
+                  { local_ := entry.targetLocal, projection := encProj }
+              let encValOpt : Option Value :=
+                match rootValOpt with
+                | .some rootVal =>
+                  match readProjectedValue locals rootVal encProj with
+                  | .ok ev => .some ev
+                  | _ => .none
+                | .none => .none
+              let enclosingBytesOpt : Option Nat :=
+                match splitLastSubslice? encProj with
+                | .some (subInitProj, fromIdx, toIdx, fromEnd) =>
+                  let subInitPlace : Place := {
+                    local_ := entry.targetLocal
+                    projection := subInitProj
+                  }
+                  let subInitValOpt : Option Value :=
+                    match rootValOpt with
+                    | .some rootVal =>
+                      match readProjectedValue locals rootVal subInitProj with
+                      | .ok v => .some v
+                      | _ => .none
+                    | .none => .none
+                  match subInitValOpt with
+                  | .some (.aggregate 0 subElems) =>
+                    let elemSz :=
+                      resolveSeqContainerElemByteStride
+                        localDecls
+                        layouts
+                        entry.targetLocal
+                        subInitProj
+                        subElems
+                    let subLenOpt : Option Nat :=
+                      match fromEnd with
+                      | false =>
+                        match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx (length subElems)) with
+                        | true => .some (Nat.sub toIdx fromIdx)
+                        | false => .none
+                      | true =>
+                        match Nat.ble (Nat.add fromIdx toIdx) (length subElems) with
+                        | true => .some (Nat.sub (Nat.sub (length subElems) toIdx) fromIdx)
+                        | false => .none
+                    match subLenOpt with
+                    | .some subLen => .some (Nat.mul subLen elemSz)
+                    | .none => .some 0
+                  | .some _ => .some 0
+                  | .none =>
+                    match placeTyResolved localDecls layouts subInitPlace with
+                    | .some parentTy =>
+                      match parentTy.kind with
+                      | .array elemKind arrLen =>
+                        let subLenOpt : Option Nat :=
+                          match fromEnd with
+                          | false =>
+                            match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
+                            | true => .some (Nat.sub toIdx fromIdx)
+                            | false => .none
+                          | true =>
+                            match Nat.ble (Nat.add fromIdx toIdx) arrLen with
+                            | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
+                            | false => .none
+                        let elemSzOpt : Option Nat :=
+                          match LayoutTable.lookup layouts parentTy.layoutIdx with
+                          | .some layout =>
+                            match layout.fields with
+                            | .array stride _ => .some stride.bytes
+                            | _ =>
+                              tyByteSize
+                                localDecls
+                                layouts
+                                { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                          | .none =>
+                            tyByteSize
+                              localDecls
+                              layouts
+                              { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                        match subLenOpt, elemSzOpt with
+                        | .some subLen, .some elemSz => .some (Nat.mul subLen elemSz)
+                        | _, _ => .some 0
+                      | _ => .some 0
+                    | .none => .none
+                | .none =>
+                  let encSzOpt_fromArray : Option Nat :=
+                    match splitLastConstantIndex? encProj with
+                    | .some (arrProj, _, _) =>
+                      match placeTyResolved localDecls layouts { local_ := entry.targetLocal, projection := arrProj } with
+                      | .some arrTy =>
+                        match LayoutTable.lookup layouts arrTy.layoutIdx with
+                        | .some layout =>
+                          match layout.fields with
+                          | .array stride _ => .some stride.bytes
+                          | _ => .none
+                        | .none => .none
+                      | .none => .none
+                    | .none => .none
+                  match encSzOpt_fromArray with
+                  | .some sz => .some sz
+                  | .none =>
+                    match encTyOpt with
+                    | .some encTy => tyByteSize localDecls layouts encTy
+                    | .none =>
+                      match encValOpt with
+                      | .some (.aggregate 0 fs) =>
+                        match isHomogeneousUntypedFields fs with
+                        | true => inferValueCReprBytes (.aggregate 0 fs)
+                        | false => .none
+                      | .some ev => valueDefaultByteSize ev
+                      | .none => .none
+              match enclosingBytesOpt with
+              | .none => fallbackTargetPlaceBytes
+              | .some encBytes =>
+                match
+                  projectionChainByteOffset?
+                    layouts
+                    encTyOpt
+                    encValOpt
+                    .none
+                    0
+                    localDecls
+                    relProj
+                with
+                | .none => .some 0
+                | .some fieldOff =>
+                  match Nat.ble fieldOff encBytes with
+                  | true => .some (Nat.sub encBytes fieldOff)
+                  | false => .some 0
+  | .none =>
+    match lookupGlobalAlloc mem.globals ptrVal.allocId with
+    | .some alloc => .some (length alloc.bytes)
+    | .none =>
+      match Nat.beq ptrVal.allocId 0 with
+      | true => .some 0
+      | false =>
+        match mem.borrows, mem.globals with
+        | .nil, .nil => .none
+        | _, _ => .some 0
+
+/--
 Check whether `srcKind` and `dstKind` form a valid array-to-slice pointer or
 reference unsizing coercion (`&[T; N]` / `&mut [T; N]` / `*const [T; N]` /
 `*mut [T; N]` to `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]`), returning
@@ -15107,7 +15522,619 @@ def rawPtrUnsizeArrayToSliceLen?
     | false => .none
   | _, _ => .none
 
+/-!
+## `dyn Trait` unsizing (Episode 1, `ws-tcb-dyn-trait-unsize-and-vtable-dispatch`)
+-/
+
 /--
+Classification of a `PointerCoercion::Unsize` target type that involves a trait
+object (`RigidTy.dynamic`), or any other unsized-tail target the slice path does
+not model.
+
+Reference (The Rust Reference 1.98.0, "Unsized coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#unsized-coercions>
+
+> "Two traits, Unsize and CoerceUnsized, are used to assist in this process and
+> expose it for library use. The following coercions are built-ins and, if T can
+> be coerced to U with one of them, then an implementation of Unsize<U> for T
+> will be provided:
+> - [T; n] to [T].
+> - T to dyn U, when T implements U + Sized, and U is dyn compatible.
+> - dyn T to dyn U, when U is one of T’s supertraits.
+>   - This allows dropping auto traits, i.e. dyn T + Auto to dyn U is allowed.
+>   - This allows adding auto traits if the principal trait has the auto trait as
+>     a super trait, i.e. given trait T: U + Send {}, dyn T to dyn T + Send or to
+>     dyn U + Send coercions are allowed.
+> - Foo<..., T, ...> to Foo<..., U, ...>, when: ..."
+>
+> "Additionally, a type Foo<T> can implement CoerceUnsized<Foo<U>> when T
+> implements Unsize<U> or CoerceUnsized<Foo<U>>. This allows it to provide an
+> unsized coercion to Foo<U>."
+
+Modeled targets: `&[mut] dyn K` (`.ref`), `*[const|mut] dyn K` (`.raw`), and
+`Pin<&[mut] dyn K>` (`.pinRef`, the `CoerceUnsized` impl of `Pin<Ptr>`).
+Every other ADT target (`Box`, `Rc`, `Arc`, `Pin<Box<_>>`, user `CoerceUnsized`
+structs) and every reference / raw pointer to an ADT (unsized-tail structs) is
+`.unmodeled` and fails closed with `.unsupported` — never `.ub` (Condition `C1`).
+Slice / `str` targets and every other shape return `.none` and keep the
+existing array-to-slice semantics unchanged.
+-/
+inductive DynUnsizeTarget : Type where
+  /-- `&m dyn K`. -/
+  | ref (m : Mutability) (dynKey : DefPath) : DynUnsizeTarget
+  /-- `*m dyn K`. -/
+  | raw (m : Mutability) (dynKey : DefPath) : DynUnsizeTarget
+  /-- `Pin<&m dyn K>`. -/
+  | pinRef (m : Mutability) (dynKey : DefPath) : DynUnsizeTarget
+  /-- Any other `CoerceUnsized` ADT / unsized-tail struct target. -/
+  | unmodeled : DynUnsizeTarget
+
+/-- `core::pin::Pin` (re-exported as `std::pin::Pin`). -/
+@[reducible]
+def isPinDefPath (p : DefPath) : Bool :=
+  Bool.or (stringEq p "core::pin::Pin") (stringEq p "std::pin::Pin")
+
+/-- Classify an `Unsize` target kind (see `DynUnsizeTarget`). Inspects only the
+outer two type constructors, so slice targets `&[T]` / `*const [T]` reduce to
+`.none` for every element type `T`. -/
+@[reducible]
+def dynUnsizeTarget? : RigidTy → Option DynUnsizeTarget
+  | .ref m (.dynamic k) => .some (.ref m k)
+  | .rawPtr m (.dynamic k) => .some (.raw m k)
+  | .ref _ (.adt _ _) => .some .unmodeled
+  | .rawPtr _ (.adt _ _) => .some .unmodeled
+  | .adt p (.ref m (.dynamic k) :: .nil) =>
+    match isPinDefPath p with
+    | true => .some (.pinRef m k)
+    | false => .some .unmodeled
+  | .adt _ _ => .some .unmodeled
+  | _ => .none
+
+/--
+The `Memory` components a `dyn` rvalue consults, passed as a projection of the
+machine memory so that `dyn` evaluation never depends on the frame bookkeeping
+fields (`activeCallee`, `rootUnwindCeiling`) or on fields it does not read.
+Call sites build it field-by-field from `Memory`, passing `callStack := []` and
+`callerBodies := []` when `borrows = []`: the call stack is only consulted to
+resolve the target frame of a stack borrow (and by `evalOperand`, whose result
+does not depend on the call stack when there are no borrows), and without any
+borrow no reference-typed `dyn` value can be validated, so a `dyn` rvalue over
+an empty borrow table conservatively sees an empty vtable environment
+(`.unsupported`).
+-/
+structure DynMemView : Type where
+  /-- `Memory.borrows`. -/
+  borrows : List BorrowEntry
+  /-- `Memory.globals`. -/
+  globals : List CapturedAllocation
+  /-- `Memory.callerLocals`. -/
+  callerLocals : List LocalSlot
+  /-- `Memory.callStack`. -/
+  callStack : List SavedCallerFrame
+  /-- Caller bodies of `Memory.callStack` (`callerBodiesOf`), the source of the
+      `Rvalue`-level vtable environment. -/
+  callerBodies : List CapturedMir
+  /-- `Memory.fnPtrs`. -/
+  fnPtrs : List FnPtrEntry
+  /-- `Memory.nextAllocId`. -/
+  nextAllocId : AllocId
+  /-- `Memory.activeProtectors`. -/
+  activeProtectors : List Nat
+  /-- `Memory.nextTag`. -/
+  nextTag : Nat
+
+/-- The `DynMemView` projection of a full `Memory`. -/
+@[reducible]
+def DynMemView.ofMemory (m : Memory) : DynMemView :=
+  { borrows := m.borrows, globals := m.globals, callerLocals := m.callerLocals,
+    callStack := m.callStack, callerBodies := callerBodiesOf m.callStack, fnPtrs := m.fnPtrs,
+    nextAllocId := m.nextAllocId, activeProtectors := m.activeProtectors,
+    nextTag := m.nextTag }
+
+/-- The bound-computation `Memory` (`ptrAllocByteBound?`) of a `DynMemView`, built
+like the `boundMem` of `checkSafeRefDerefOk`. -/
+@[reducible]
+def DynMemView.boundMemory (mv : DynMemView) : Memory :=
+  { emptyMemory with
+    globals := mv.globals
+    borrows := mv.borrows
+    callerLocals := mv.callerLocals
+    callStack := mv.callStack }
+
+/-- Three-way result of a `dyn` validity check. -/
+inductive DynCheck (α : Type) : Type where
+  /-- The check passed with witness `a`. -/
+  | ok (a : α) : DynCheck α
+  /-- The check found undefined behavior. -/
+  | ub : DynCheck α
+  /-- The check depends on unmodeled / uncaptured information. -/
+  | unsupported : DynCheck α
+
+/--
+The vtable environment visible from `(currentBody, mv.callerBodies)`
+(`collectBodyVTables`, `collectBodyDynTypes`) when it is non-empty,
+consistent across every captured body, and satisfies `vtableEnvOk ptrBytes`;
+`.none` otherwise (fail closed).
+-/
+def dynVTableEnv? (currentBody : Option CapturedMir) (mv : DynMemView) (ptrBytes : Nat) :
+    Option (List CapturedVTable × List CapturedDynType) :=
+  let vts := collectBodyVTables currentBody mv.callerBodies
+  match vts with
+  | .nil => .none
+  | _ :: _ =>
+    match
+      Bool.and (bodyVTablesConsistent currentBody mv.callerBodies vts)
+        (vtableEnvOk ptrBytes vts mv.nextAllocId mv.globals mv.fnPtrs)
+    with
+    | true => .some (vts, collectBodyDynTypes currentBody mv.callerBodies)
+    | false => .none
+
+/--
+Resolve the metadata word `metaVal` of a `dyn expectedKey` wide pointer to its
+captured vtable.
+
+Modeled property: a trait-object wide pointer's vtable part must point (at
+offset `0`) to a vtable allocation built for a trait-object type whose
+predicates equal the expected ones up to auto traits.
+
+Reference (`compiler/rustc_const_eval/src/interpret/memory.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/memory.rs#L1074-L1085>
+
+> "let (alloc_id, offset, _tag) = self.ptr_get_alloc_id(ptr, 0)?;
+> if offset.bytes() != 0 {
+>     throw_ub!(InvalidVTablePointer(Pointer::new(alloc_id, offset)))
+> }
+> let Some(GlobalAlloc::VTable(ty, vtable_dyn_type)) =
+>     self.tcx.try_get_global_alloc(alloc_id)
+> else {
+>     throw_ub!(InvalidVTablePointer(Pointer::new(alloc_id, offset)))
+> };
+> if let Some(expected_dyn_type) = expected_trait {
+>     self.check_vtable_for_type(vtable_dyn_type, expected_dyn_type)?;
+> }"
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L426-L429>
+
+> "///     - a [trait object], then the vtable part of the pointer must point
+> ///       to a valid vtable acquired by an unsizing coercion, and the size
+> ///       of the *entire value* (dynamic tail length + statically sized prefix)
+> ///       must fit in `isize`."
+
+Justification and fail-closed boundary: `.ub` is returned only when the
+metadata is provably not a vtable of a compatible type — a non-pointer or
+wrong-width word, a non-zero offset, an `AllocId` that is a live stack borrow
+tag / global / function pointer / null / an unused identifier of the reserved
+vtable range, or a captured vtable of an incompatible trait object. An
+unavailable or ill-formed environment (`dynVTableEnv? = .none`), an unmodeled
+trait object (`dynTypeModeled = false`), a pointer into an unknown allocation
+outside the reserved range, and a captured vtable whose identifier collides with
+a live borrow tag all return `.unsupported`.
+-/
+def checkDynVTablePtr
+    (currentBody : Option CapturedMir)
+    (mv : DynMemView)
+    (ptrBytes : Nat)
+    (metaVal : Value)
+    (expectedKey : DefPath) :
+    DynCheck (CapturedVTable × List CapturedVTable × List CapturedDynType) :=
+  match metaVal with
+  | .ptr vt vsz =>
+    match Nat.beq vsz ptrBytes with
+    | false => .ub
+    | true =>
+      match dynVTableEnv? currentBody mv ptrBytes with
+      | .none => .unsupported
+      | .some (vts, dts) =>
+        match dynTypeModeled dts expectedKey with
+        | false => .unsupported
+        | true =>
+          match lookupVTableByAllocId vts vt.allocId with
+          | .some entry =>
+            match lookupBorrow mv.borrows vt.tag with
+            | .some _ => .unsupported
+            | .none =>
+              match Nat.beq vt.offsetBytes 0 with
+              | false => .ub
+              | true =>
+                match dynKeysCompatible dts entry.dynKey expectedKey with
+                | true => .ok (entry, vts, dts)
+                | false => .ub
+          | .none =>
+            let provablyNotVTable : Bool :=
+              Bool.or (Nat.beq vt.allocId 0)
+                (Bool.or
+                  (match lookupBorrow mv.borrows vt.tag with
+                   | .some _ => true
+                   | .none => false)
+                  (Bool.or (isGlobalAllocIdIn mv.globals vt.allocId)
+                    (Bool.or
+                      (match lookupFnPtr mv.fnPtrs vt.allocId with
+                       | .some _ => true
+                       | .none => false)
+                      (Bool.and (Nat.ble vtableAllocBase vt.allocId)
+                        (Nat.blt vt.allocId (Nat.add vtableAllocBase vtableAllocSpan))))))
+            match provablyNotVTable with
+            | true => .ub
+            | false => .unsupported
+  | _ => .ub
+
+/--
+Value validity of a safe reference `&T` / `&mut T` (or the reference inside
+`Pin<&T>` / `Pin<&mut T>`) whose dynamic pointee type is described by the
+captured vtable `entry`, with an optional Tree Borrows permission gate.
+
+Modeled property (necessary conditions only): a reference must be non-null,
+aligned for the pointee, point to a live allocation that covers the pointee's
+size, and never point to an uninhabited value.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "A reference or Box<T> must be aligned and non-null, it cannot be dangling, and
+> it must point to a valid value (in case of dynamically sized types, using the
+> actual dynamic type of the pointee as determined by the metadata)."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Breaking the pointer aliasing rules."
+
+Checks performed on `dataVal` against `entry.sizeBytes` / `entry.alignBytes` /
+`entry.isUninhabited`:
+- `entry.isUninhabited = false` (`kani#5216`);
+- `sizeBytes + (alignBytes - 1) < 2^(8*ptrBytes - 1)`;
+- a provenance-less `.scalar` data word must wrap to a non-zero address modulo
+  `2^(8*ptrBytes)` (so the 32-bit wrapped address `2^32` is null), be aligned,
+  and designate a zero-sized pointee;
+- a stack-borrow data pointer must have a live, non-deallocated target, an
+  offset that is a multiple of `alignBytes`, and
+  `offsetBytes + sizeBytes <= ptrAllocByteBound?`; when `checkTB` its tag must
+  not be `.disabled` and, for `isMut`, not `.frozen`;
+- a global data pointer must be aligned, in bounds, and (for `isMut`) mutable;
+- any other provenance is accepted only for a zero-sized pointee.
+
+Modeling choices: `checkTB = false` (`refDataValidNoTB`) is used where the
+interpreter performs no Tree Borrows access (`&raw const (*r)`, safe
+`size_of_val(&dyn)`), matching Miri's value-validity check that consults
+liveness, bounds, alignment, and nullness but not aliasing permissions. Ancestor
+permissions are not walked: an access through a disabled ancestor is detected
+when the reference is later used.
+-/
+def dynRefDataValid
+    (locals : List LocalSlot)
+    (mv : DynMemView)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ptrBytes : Nat)
+    (dataVal : Value)
+    (entry : CapturedVTable)
+    (isMut : Bool)
+    (checkTB : Bool) :
+    Bool :=
+  let half := Nat.pow 2 (Nat.sub (Nat.mul 8 ptrBytes) 1)
+  let align := entry.alignBytes
+  let sizeOk : Bool :=
+    Bool.and (Bool.not entry.isUninhabited)
+      (Bool.and (Bool.not (Nat.beq align 0))
+        (Nat.blt (Nat.add entry.sizeBytes (Nat.sub align 1)) half))
+  match sizeOk with
+  | false => false
+  | true =>
+    match dataVal with
+    | .scalar sc =>
+      let addr := wrapScalarBits sc.bits (scalarModulus ptrBytes)
+      Bool.and (Nat.beq sc.sizeBytes ptrBytes)
+        (Bool.and (Bool.not (Nat.beq addr 0))
+          (Bool.and (Nat.beq (Nat.mod addr align) 0) (Nat.beq entry.sizeBytes 0)))
+    | .ptr p psz =>
+      match Nat.beq psz ptrBytes with
+      | false => false
+      | true =>
+        match lookupBorrow mv.borrows p.tag with
+        | .some be =>
+          let permOk : Bool :=
+            match checkTB with
+            | false => true
+            | true =>
+              match be.perm, isMut with
+              | .disabled, _ => false
+              | .frozen, true => false
+              | _, _ => true
+          let liveOk : Bool :=
+            match be.allocDead with
+            | true => false
+            | false =>
+              match activeFrameSlot? locals mv.callStack be.targetFrameDepth be.targetLocal with
+              | .some (.init _) => true
+              | .some .uninit => true
+              | .some .dead => false
+              | .none =>
+                match foreignFrameSlot? mv.callStack mv.callerLocals be.targetFrameDepth be.targetLocal with
+                | .some (.init _) => true
+                | .some .uninit => true
+                | _ => false
+          let boundOk : Bool :=
+            match ptrAllocByteBound? locals mv.boundMemory localDecls layouts p with
+            | .some bound => Nat.ble (Nat.add p.offsetBytes entry.sizeBytes) bound
+            | .none => true
+          Bool.and permOk
+            (Bool.and liveOk
+              (Bool.and (Nat.beq (Nat.mod p.offsetBytes align) 0) boundOk))
+        | .none =>
+          match lookupGlobalAlloc mv.globals p.allocId with
+          | .some alloc =>
+            let mutOk : Bool :=
+              match isMut, alloc.mutability with
+              | true, .not => false
+              | _, _ => true
+            Bool.and mutOk
+              (Bool.and (Nat.beq (Nat.mod alloc.align.bytes align) 0)
+                (Bool.and (Nat.beq (Nat.mod p.offsetBytes align) 0)
+                  (Nat.ble (Nat.add p.offsetBytes entry.sizeBytes) (length alloc.bytes))))
+          | .none =>
+            Bool.and (Nat.beq entry.sizeBytes 0)
+              (Bool.not (Bool.and (Nat.beq p.allocId 0) (Nat.beq p.offsetBytes 0)))
+    | _ => false
+
+/--
+`T -> dyn K` unsizing of a thin data word for a reference (`isRef`) or raw
+pointer target, given the operand's static pointee `srcPointee`.
+
+Reference (`compiler/rustc_const_eval/src/interpret/cast.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/cast.rs#L439-L445>
+
+> "(_, &ty::Dynamic(data, _)) => {
+>     // Initial cast from sized to dyn trait
+>     let vtable = self.get_vtable_ptr(src_pointee_ty, data)?;
+>     let ptr = self.read_pointer(src)?;
+>     let val = Immediate::new_dyn_trait(ptr, vtable, &*self.tcx);
+>     self.write_immediate(val, dest)
+> }"
+
+Justification: the result is the data word paired with the vtable pointer of
+`(srcPointee, K)`; raw targets perform no dereferenceability, alignment, or
+Tree Borrows check on the data word (Condition `C2`). For reference targets the
+model additionally enforces `dynRefDataValid` with the Tree Borrows gate — a
+necessary validity condition of the produced `&dyn K` value (see
+`dynRefDataValid`), not an interpreter step. An uncaptured `(srcPointee, K)`
+vtable, an unmodeled `K`, or an inconsistent environment is `.unsupported`.
+-/
+def evalThinToDynUnsize
+    (locals' : List LocalSlot)
+    (mv : DynMemView)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (dataVal : Value)
+    (srcPointee : RigidTy)
+    (dynKey : DefPath)
+    (isRef : Bool)
+    (isMut : Bool) :
+    DynCheck Value :=
+  let ptrBytes := layoutPointerBytes layouts
+  let shapeOk : Bool :=
+    match dataVal with
+    | .ptr _ sz => Nat.beq sz ptrBytes
+    | .scalar sc => Bool.and (Bool.not isRef) (Nat.beq sc.sizeBytes ptrBytes)
+    | _ => false
+  match shapeOk with
+  | false => .ub
+  | true =>
+    match dynVTableEnv? .none mv ptrBytes with
+    | .none => .unsupported
+    | .some (vts, dts) =>
+      match dynTypeModeled dts dynKey with
+      | false => .unsupported
+      | true =>
+        match lookupVTableFor vts srcPointee dynKey with
+        | .none => .unsupported
+        | .some entry =>
+          let vtWord : Value := .ptr { allocId := entry.vtableAllocId, offsetBytes := 0 } ptrBytes
+          match isRef with
+          | false => .ok (.aggregate 0 (dataVal :: vtWord :: .nil))
+          | true =>
+            match dynRefDataValid locals' mv localDecls layouts ptrBytes dataVal entry isMut true with
+            | true => .ok (.aggregate 0 (dataVal :: vtWord :: .nil))
+            | false => .ub
+
+/--
+`dyn J -> dyn K` unsizing (identity coercion when `J = K`, trait upcasting
+otherwise) of a wide data word `fatVal`.
+
+Reference (`compiler/rustc_const_eval/src/interpret/cast.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/cast.rs#L389-L401>
+
+> "(ty::Dynamic(data_a, _), ty::Dynamic(data_b, _)) => {
+>     let val = self.read_immediate(src)?;
+>     // MIR building generates odd NOP casts, prevent them from causing unexpected trouble.
+>     // See <https://github.com/rust-lang/rust/issues/128880>.
+>     // FIXME: ideally we wouldn't have to do this.
+>     if data_a == data_b {
+>         return self.write_immediate(*val, dest);
+>     }
+>     // Take apart the old pointer, and find the dynamic type.
+>     let (old_data, old_vptr) = val.to_scalar_pair();
+>     let old_data = old_data.to_pointer(self)?;
+>     let old_vptr = old_vptr.to_pointer(self)?;
+>     let ty = self.get_ptr_vtable_ty(old_vptr, Some(data_a))?;"
+
+Reference (`compiler/rustc_const_eval/src/interpret/cast.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/cast.rs#L435-L437>
+
+> "// Get the destination trait vtable and return that.
+> let new_vptr = self.get_vtable_ptr(ty, data_b)?;
+> self.write_immediate(Immediate::new_dyn_trait(old_data, new_vptr, self), dest)"
+
+Justification: equal keys copy the value unchanged (the interpreter's NOP-cast
+path, which performs no vtable check). Otherwise the source vtable pointer is
+validated first (`checkDynVTablePtr` against `J`: invalid pointers are `.ub`),
+then the auto traits of `K` must be a subset of those of `J` (an apparently
+added auto trait may be implied by a supertrait the capture does not record, so
+a violation is `.unsupported`, never `.ub`), and the destination vtable is the
+captured vtable of `(entry.concreteTy, K)` (`.unsupported` if uncaptured). The
+data word is preserved; the reference validity of the data word was established
+when the `dyn J` reference was produced.
+-/
+def evalDynToDynUnsize
+    (mv : DynMemView)
+    (layouts : LayoutTable)
+    (fatVal : Value)
+    (srcKey dstKey : DefPath) :
+    DynCheck Value :=
+  let ptrBytes := layoutPointerBytes layouts
+  match fatVal with
+  | .aggregate 0 (dataVal :: metaVal :: .nil) =>
+    match stringEq srcKey dstKey with
+    | true => .ok fatVal
+    | false =>
+      match checkDynVTablePtr .none mv ptrBytes metaVal srcKey with
+      | .ub => .ub
+      | .unsupported => .unsupported
+      | .ok (entry, vts, dts) =>
+        let autosOk : Bool :=
+          match lookupDynType dts srcKey, lookupDynType dts dstKey with
+          | .some ds, .some dd => defPathsSubset dd.autoTraits ds.autoTraits
+          | _, .none => true
+          | .none, .some dd =>
+            match dd.autoTraits with
+            | .nil => true
+            | _ :: _ => false
+        match Bool.and autosOk (dynTypeModeled dts dstKey) with
+        | false => .unsupported
+        | true =>
+          match lookupVTableFor vts entry.concreteTy dstKey with
+          | .none => .unsupported
+          | .some dstEntry =>
+            .ok (.aggregate 0
+              (dataVal :: .ptr { allocId := dstEntry.vtableAllocId, offsetBytes := 0 } ptrBytes :: .nil))
+  | _ => .ub
+
+/-- Mutability of an unsizing source `src` is compatible with target `dst`
+(`&mut`/`*mut` may weaken to `&`/`*const`, never the reverse). -/
+@[reducible]
+def dynUnsizeMutOk : Mutability → Mutability → Bool
+  | .not, .mut => false
+  | _, _ => true
+
+/--
+Evaluate `PointerCoercion::Unsize` to a trait-object target classified by
+`dynUnsizeTarget? targetTy.kind = .some tgt` (Conditions `C1`/`C2`), returning
+the produced value and post-operand locals; `evalUnsizeCoercion` re-attaches the
+unchanged `Memory` (unsizing never changes memory).
+
+- `.unmodeled` targets fail closed with `.unsupported`.
+- `.ref m K` / `.raw m K`: the operand's static type must be `&sm P` / `*sm P`
+  (a reference source may unsize to a raw target); `P = dyn J` delegates to
+  `evalDynToDynUnsize`, any other `P` to `evalThinToDynUnsize`. Ill-typed
+  mutability or reference/raw combinations fail closed.
+- `.pinRef m K`: the operand must be `Pin<&sm P>` with value `.aggregate 0
+  [inner]`; `inner` is unsized as a reference and re-wrapped, matching the
+  `CoerceUnsized` impl of `Pin`.
+
+Reference (`library/core/src/pin.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/pin.rs#L1811-L1814>
+
+> "impl<Ptr, U> CoerceUnsized<Pin<U>> for Pin<Ptr>
+> where
+>     Ptr: CoerceUnsized<U> + PinCoerceUnsized,
+>     U: PinCoerceUnsized,"
+
+Modeling choices: operands without a declared type (`operandTy = .none`), and
+`Pin` over anything but a reference (`Pin<*const T>`, `Pin<Box<T>>`), are
+`.unsupported`.
+-/
+def evalDynUnsizeCore
+    (locals : List LocalSlot)
+    (op : Operand)
+    (tgt : DynUnsizeTarget)
+    (mv : DynMemView)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    DynCheck (Value × List LocalSlot) :=
+  let unsizePtrLike
+      (locals' : List LocalSlot)
+      (v : Value)
+      (srcTy : RigidTy)
+      (dstIsRef : Bool)
+      (dstMut : Mutability)
+      (dstKey : DefPath) : DynCheck Value :=
+    let srcInfo : Option (Bool × Mutability × RigidTy) :=
+      match srcTy with
+      | .ref sm p => .some (true, sm, p)
+      | .rawPtr sm p => .some (false, sm, p)
+      | _ => .none
+    match srcInfo with
+    | .none => .unsupported
+    | .some (srcIsRef, sm, p) =>
+      match Bool.and (dynUnsizeMutOk sm dstMut) (Bool.or srcIsRef (Bool.not dstIsRef)) with
+      | false => .unsupported
+      | true =>
+        match p with
+        | .dynamic srcKey => evalDynToDynUnsize mv layouts v srcKey dstKey
+        | _ =>
+          evalThinToDynUnsize locals' mv localDecls layouts v p dstKey dstIsRef
+            (match dstMut with
+             | .mut => true
+             | .not => false)
+  match tgt with
+  | .unmodeled => .unsupported
+  | .ref m k =>
+    match evalOperand locals op mv.borrows mv.globals layouts mv.callerLocals localDecls mv.callStack with
+    | .ub => .ub
+    | .unsupported => .unsupported
+    | .ok v locals' =>
+      match operandTy localDecls layouts op with
+      | .none => .unsupported
+      | .some srcTy =>
+        match unsizePtrLike locals' v srcTy.kind true m k with
+        | .ok r => .ok (r, locals')
+        | .ub => .ub
+        | .unsupported => .unsupported
+  | .raw m k =>
+    match evalOperand locals op mv.borrows mv.globals layouts mv.callerLocals localDecls mv.callStack with
+    | .ub => .ub
+    | .unsupported => .unsupported
+    | .ok v locals' =>
+      match operandTy localDecls layouts op with
+      | .none => .unsupported
+      | .some srcTy =>
+        match unsizePtrLike locals' v srcTy.kind false m k with
+        | .ok r => .ok (r, locals')
+        | .ub => .ub
+        | .unsupported => .unsupported
+  | .pinRef m k =>
+    match evalOperand locals op mv.borrows mv.globals layouts mv.callerLocals localDecls mv.callStack with
+    | .ub => .ub
+    | .unsupported => .unsupported
+    | .ok v locals' =>
+      match operandTy localDecls layouts op, v with
+      | .some { kind := .adt pinPath (innerTy :: .nil), .. }, .aggregate 0 (innerVal :: .nil) =>
+        match isPinDefPath pinPath, innerTy with
+        | true, .ref _ _ =>
+          match unsizePtrLike locals' innerVal innerTy true m k with
+          | .ok r => .ok (.aggregate 0 (r :: .nil), locals')
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | _, _ => .unsupported
+      | .some { kind := .adt pinPath (_ :: .nil), .. }, _ =>
+        match isPinDefPath pinPath with
+        | true => .ub
+        | false => .unsupported
+      | _, _ => .unsupported
+
+/--
+Trait-object targets (`dynUnsizeTarget? targetTy.kind = .some tgt`: `&[mut] dyn K`,
+`*[const|mut] dyn K`, `Pin<&[mut] dyn K>`, and every other unsized-tail /
+`CoerceUnsized` ADT target, which fails closed) are evaluated by
+`evalDynUnsizeCoercion`; every other target keeps the array-to-slice semantics
+below unchanged.
+
 Evaluate `CastKind.pointerCoercion "Unsize"`, coercing an array reference or
 raw pointer (`Value.ptr p sz` of type `&[T; N]`, `&mut [T; N]`, `*const [T; N]`,
 or `*mut [T; N]`, or provenance-less `Value.scalar sc` of type `*const [T; N]` /
@@ -15126,77 +16153,154 @@ def evalUnsizeCoercion
     (layouts : LayoutTable) :
     RvalueEvalResult :=
   let ptrBytes := layoutPointerBytes layouts
-  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
-  | .ub => .ub
-  | .unsupported => .unsupported
-  | .ok (.ptr ptrVal sz) locals' =>
-    match Nat.beq sz ptrBytes with
-    | false => .ub
-    | true =>
-      let isTargetMutSlicePtr :=
-        match targetTy.kind with
-        | .ref .mut (.slice _) => true
-        | .rawPtr .mut (.slice _) => true
-        | _ => false
-      let isTargetSlicePtr :=
-        match targetTy.kind with
-        | .ref _ (.slice _) => true
-        | .rawPtr _ (.slice _) => true
-        | _ => false
-      let borrowValid :=
-        match isTargetSlicePtr with
-        | false => true
-        | true =>
-          match lookupBorrow mem.borrows ptrVal.tag with
-          | .some { perm := .disabled, .. } => false
-          | .some { perm := .frozen, .. } => Bool.not isTargetMutSlicePtr
-          | _ => true
-      match Bool.and isTargetSlicePtr borrowValid with
+  match dynUnsizeTarget? targetTy.kind with
+  | .some tgt =>
+    match
+      evalDynUnsizeCore locals op tgt
+        { borrows := mem.borrows, globals := mem.globals, callerLocals := mem.callerLocals,
+          callStack := (match mem.borrows with | .nil => .nil | _ :: _ => mem.callStack),
+          callerBodies :=
+            (match mem.borrows with | .nil => .nil | _ :: _ => callerBodiesOf mem.callStack),
+          fnPtrs := mem.fnPtrs,
+          nextAllocId := mem.nextAllocId, activeProtectors := mem.activeProtectors,
+          nextTag := mem.nextTag }
+        localDecls layouts
+    with
+    | .ok (v, locals') => .ok v locals' mem
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .none =>
+    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+    | .ub => .ub
+    | .unsupported => .unsupported
+    | .ok (.ptr ptrVal sz) locals' =>
+      match Nat.beq sz ptrBytes with
       | false => .ub
       | true =>
-        match operandTy localDecls layouts op with
-        | .some srcTy =>
-          match unsizeArrayToSliceSpec? srcTy.kind targetTy.kind with
-          | .some n =>
-            let stackTargetValid :=
-              match lookupBorrow mem.borrows ptrVal.tag with
-              | .none =>
-                match lookupGlobalAlloc mem.globals ptrVal.allocId with
-                | .some alloc =>
-                  let mutOk :=
-                    match isTargetMutSlicePtr, alloc.mutability with
-                    | true, .not => false
-                    | _, _ => true
-                  let elemSz :=
-                    match targetTy.kind with
-                    | .ref _ (.slice dstElem) =>
-                      match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
-                      | .some sz => sz
-                      | .none => 1
-                    | .rawPtr _ (.slice dstElem) =>
-                      match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
-                      | .some sz => sz
-                      | .none => 1
-                    | _ => 1
-                  let alignedOk :=
-                    match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
-                    | .some _ => true
-                    | .none => false
-                  Bool.and
-                    mutOk
-                    (Bool.and
-                      alignedOk
-                      (Nat.ble
-                        (Nat.add ptrVal.offsetBytes (Nat.mul n elemSz))
-                        (length alloc.bytes)))
+        let isTargetMutSlicePtr :=
+          match targetTy.kind with
+          | .ref .mut (.slice _) => true
+          | .rawPtr .mut (.slice _) => true
+          | _ => false
+        let isTargetSlicePtr :=
+          match targetTy.kind with
+          | .ref _ (.slice _) => true
+          | .rawPtr _ (.slice _) => true
+          | _ => false
+        let borrowValid :=
+          match isTargetSlicePtr with
+          | false => true
+          | true =>
+            match lookupBorrow mem.borrows ptrVal.tag with
+            | .some { perm := .disabled, .. } => false
+            | .some { perm := .frozen, .. } => Bool.not isTargetMutSlicePtr
+            | _ => true
+        match Bool.and isTargetSlicePtr borrowValid with
+        | false => .ub
+        | true =>
+          match operandTy localDecls layouts op with
+          | .some srcTy =>
+            match unsizeArrayToSliceSpec? srcTy.kind targetTy.kind with
+            | .some n =>
+              let stackTargetValid :=
+                match lookupBorrow mem.borrows ptrVal.tag with
                 | .none =>
-                  match Nat.beq ptrVal.allocId 0 with
-                  | true =>
+                  match lookupGlobalAlloc mem.globals ptrVal.allocId with
+                  | .some alloc =>
+                    let mutOk :=
+                      match isTargetMutSlicePtr, alloc.mutability with
+                      | true, .not => false
+                      | _, _ => true
+                    let elemSz :=
+                      match targetTy.kind with
+                      | .ref _ (.slice dstElem) =>
+                        match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
+                        | .some sz => sz
+                        | .none => 1
+                      | .rawPtr _ (.slice dstElem) =>
+                        match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
+                        | .some sz => sz
+                        | .none => 1
+                      | _ => 1
+                    let alignedOk :=
+                      match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+                      | .some _ => true
+                      | .none => false
                     Bool.and
-                      (Bool.not (Nat.beq ptrVal.offsetBytes 0))
-                      (Nat.beq n 0)
-                  | false => true
-              | .some entry =>
+                      mutOk
+                      (Bool.and
+                        alignedOk
+                        (Nat.ble
+                          (Nat.add ptrVal.offsetBytes (Nat.mul n elemSz))
+                          (length alloc.bytes)))
+                  | .none =>
+                    match Nat.beq ptrVal.allocId 0 with
+                    | true =>
+                      Bool.and
+                        (Bool.not (Nat.beq ptrVal.offsetBytes 0))
+                        (Nat.beq n 0)
+                    | false => true
+                | .some entry =>
+                  let rootValOpt : Option Value :=
+                    match activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal with
+                    | .some (.init v) => .some v
+                    | .some _ => .none
+                    | .none =>
+                      match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal with
+                      | .some (.init v) => .some v
+                      | _ => .none
+                  match rootValOpt with
+                  | .some rootVal =>
+                    let dstElemSzOpt : Option Nat :=
+                      match targetTy.kind with
+                      | .ref _ (.slice dstElem) =>
+                        tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }
+                      | .rawPtr _ (.slice dstElem) =>
+                        tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }
+                      | _ => .none
+                    match
+                      readSliceBackingAggregate?
+                        locals'
+                        rootVal
+                        entry.targetProjection
+                        n
+                        dstElemSzOpt
+                    with
+                    | .some (_, baseIdx, elems) =>
+                      let elemSz := inferElemListByteStride elems
+                      match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+                      | .some rawElemOffset =>
+                        let elemOffset := Nat.add rawElemOffset baseIdx
+                        Nat.ble (Nat.add elemOffset n) (length elems)
+                      | .none => false
+                    | .none =>
+                      match readProjectedValue locals' rootVal entry.targetProjection with
+                      | .ok .unit =>
+                        Bool.and
+                          (Nat.beq ptrVal.offsetBytes 0)
+                          (Nat.beq n 0)
+                      | .ok (.ptr _ _) => true
+                      | _ => false
+                  | .none => false
+              match stackTargetValid with
+              | true =>
+                .ok
+                  (.aggregate 0 (.ptr ptrVal sz :: .scalar ⟨n, ptrBytes⟩ :: .nil))
+                  locals'
+                  mem
+              | false => .ub
+            | .none => .ub
+          | .none =>
+            match lookupBorrow mem.borrows ptrVal.tag with
+            | .some entry =>
+              let permOk :=
+                match entry.perm, isTargetMutSlicePtr with
+                | .disabled, _ => false
+                | .frozen, true => false
+                | _, _ => true
+              match permOk with
+              | false => .ub
+              | true =>
                 let rootValOpt : Option Value :=
                   match activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal with
                   | .some (.init v) => .some v
@@ -15219,7 +16323,7 @@ def evalUnsizeCoercion
                       locals'
                       rootVal
                       entry.targetProjection
-                      n
+                      0
                       dstElemSzOpt
                   with
                   | .some (_, baseIdx, elems) =>
@@ -15227,143 +16331,132 @@ def evalUnsizeCoercion
                     match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
                     | .some rawElemOffset =>
                       let elemOffset := Nat.add rawElemOffset baseIdx
-                      Nat.ble (Nat.add elemOffset n) (length elems)
-                    | .none => false
+                      match Nat.ble elemOffset (length elems) with
+                      | true =>
+                        .ok
+                          (.aggregate 0
+                            (.ptr ptrVal sz ::
+                              .scalar ⟨Nat.sub (length elems) elemOffset, ptrBytes⟩ ::
+                              .nil))
+                          locals'
+                          mem
+                      | false => .ub
+                    | .none => .ub
                   | .none =>
                     match readProjectedValue locals' rootVal entry.targetProjection with
                     | .ok .unit =>
-                      Bool.and
-                        (Nat.beq ptrVal.offsetBytes 0)
-                        (Nat.beq n 0)
-                    | .ok (.ptr _ _) => true
-                    | _ => false
-                | .none => false
-            match stackTargetValid with
-            | true =>
-              .ok
-                (.aggregate 0 (.ptr ptrVal sz :: .scalar ⟨n, ptrBytes⟩ :: .nil))
-                locals'
-                mem
-            | false => .ub
-          | .none => .ub
-        | .none =>
-          match lookupBorrow mem.borrows ptrVal.tag with
-          | .some entry =>
-            let permOk :=
-              match entry.perm, isTargetMutSlicePtr with
-              | .disabled, _ => false
-              | .frozen, true => false
-              | _, _ => true
-            match permOk with
-            | false => .ub
-            | true =>
-              let rootValOpt : Option Value :=
-                match activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal with
-                | .some (.init v) => .some v
-                | .some _ => .none
-                | .none =>
-                  match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal with
-                  | .some (.init v) => .some v
-                  | _ => .none
-              match rootValOpt with
-              | .some rootVal =>
-                let dstElemSzOpt : Option Nat :=
+                      match Nat.beq ptrVal.offsetBytes 0 with
+                      | true =>
+                        .ok
+                          (.aggregate 0
+                            (.ptr ptrVal sz ::
+                              .scalar ⟨0, ptrBytes⟩ ::
+                              .nil))
+                          locals'
+                          mem
+                      | false => .ub
+                    | _ => .ub
+                | .none => .ub
+            | .none =>
+              match lookupGlobalAlloc mem.globals ptrVal.allocId with
+              | .some alloc =>
+                let mutOk :=
+                  match isTargetMutSlicePtr, alloc.mutability with
+                  | true, .not => false
+                  | _, _ => true
+                let dstElemOpt : Option RigidTy :=
                   match targetTy.kind with
-                  | .ref _ (.slice dstElem) =>
-                    tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }
-                  | .rawPtr _ (.slice dstElem) =>
-                    tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }
+                  | .ref _ (.slice dstElem) => .some dstElem
+                  | .rawPtr _ (.slice dstElem) => .some dstElem
                   | _ => .none
-                match
-                  readSliceBackingAggregate?
-                    locals'
-                    rootVal
-                    entry.targetProjection
-                    0
-                    dstElemSzOpt
-                with
-                | .some (_, baseIdx, elems) =>
-                  let elemSz := inferElemListByteStride elems
-                  match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
-                  | .some rawElemOffset =>
-                    let elemOffset := Nat.add rawElemOffset baseIdx
-                    match Nat.ble elemOffset (length elems) with
-                    | true =>
+                match Bool.and mutOk (Nat.ble ptrVal.offsetBytes (length alloc.bytes)), dstElemOpt with
+                | true, .some dstElem =>
+                  let elemSz :=
+                    match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
+                    | .some n => n
+                    | .none => 1
+                  let remBytes := Nat.sub (length alloc.bytes) ptrVal.offsetBytes
+                  match Nat.beq elemSz 0 with
+                  | true => .ub
+                  | false =>
+                    match
+                      byteOffsetToElemIdx? ptrVal.offsetBytes elemSz,
+                      byteOffsetToElemIdx? remBytes elemSz
+                    with
+                    | .some _, .some elemCount =>
                       .ok
                         (.aggregate 0
                           (.ptr ptrVal sz ::
-                            .scalar ⟨Nat.sub (length elems) elemOffset, ptrBytes⟩ ::
+                            .scalar ⟨elemCount, ptrBytes⟩ ::
                             .nil))
                         locals'
                         mem
-                    | false => .ub
-                  | .none => .ub
-                | .none =>
-                  match readProjectedValue locals' rootVal entry.targetProjection with
-                  | .ok .unit =>
-                    match Nat.beq ptrVal.offsetBytes 0 with
-                    | true =>
-                      .ok
-                        (.aggregate 0
-                          (.ptr ptrVal sz ::
-                            .scalar ⟨0, ptrBytes⟩ ::
-                            .nil))
-                        locals'
-                        mem
-                    | false => .ub
-                  | _ => .ub
+                    | _, _ => .ub
+                | _, _ => .ub
               | .none => .ub
-          | .none =>
-            match lookupGlobalAlloc mem.globals ptrVal.allocId with
-            | .some alloc =>
-              let mutOk :=
-                match isTargetMutSlicePtr, alloc.mutability with
-                | true, .not => false
-                | _, _ => true
-              let dstElemOpt : Option RigidTy :=
-                match targetTy.kind with
-                | .ref _ (.slice dstElem) => .some dstElem
-                | .rawPtr _ (.slice dstElem) => .some dstElem
-                | _ => .none
-              match Bool.and mutOk (Nat.ble ptrVal.offsetBytes (length alloc.bytes)), dstElemOpt with
-              | true, .some dstElem =>
-                let elemSz :=
-                  match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
-                  | .some n => n
-                  | .none => 1
-                let remBytes := Nat.sub (length alloc.bytes) ptrVal.offsetBytes
-                match Nat.beq elemSz 0 with
-                | true => .ub
-                | false =>
-                  match
-                    byteOffsetToElemIdx? ptrVal.offsetBytes elemSz,
-                    byteOffsetToElemIdx? remBytes elemSz
-                  with
-                  | .some _, .some elemCount =>
-                    .ok
-                      (.aggregate 0
-                        (.ptr ptrVal sz ::
-                          .scalar ⟨elemCount, ptrBytes⟩ ::
-                          .nil))
-                      locals'
-                      mem
-                  | _, _ => .ub
-              | _, _ => .ub
-            | .none => .ub
-  | .ok (.scalar sc) locals' =>
-    match Nat.beq sc.sizeBytes ptrBytes with
-    | false => .ub
-    | true =>
-      match rawPtrUnsizeArrayToSliceLen? (operandTy localDecls layouts op) targetTy ptrBytes with
-      | .some n =>
-        .ok
-          (.aggregate 0
-            (.scalar ⟨wrapScalarBits sc.bits (scalarModulus ptrBytes), ptrBytes⟩ ::
-              .scalar ⟨n, ptrBytes⟩ :: .nil))
-          locals'
-          mem
-      | .none => .ub
-  | .ok _ _ => .ub
+    | .ok (.scalar sc) locals' =>
+      match Nat.beq sc.sizeBytes ptrBytes with
+      | false => .ub
+      | true =>
+        match rawPtrUnsizeArrayToSliceLen? (operandTy localDecls layouts op) targetTy ptrBytes with
+        | .some n =>
+          .ok
+            (.aggregate 0
+              (.scalar ⟨wrapScalarBits sc.bits (scalarModulus ptrBytes), ptrBytes⟩ ::
+                .scalar ⟨n, ptrBytes⟩ :: .nil))
+            locals'
+            mem
+        | .none => .ub
+    | .ok _ _ => .ub
+
+
+/-!
+### Universal checks of the `dyn` unsizing dispatch (Condition `C1`)
+-/
+
+/-- Slice reference targets never take the `dyn` path, for every element type. -/
+theorem dynUnsizeTarget?_ref_slice (m : Mutability) (e : RigidTy) :
+    dynUnsizeTarget? (.ref m (.slice e)) = .none := rfl
+
+/-- Slice raw-pointer targets never take the `dyn` path, for every element type. -/
+theorem dynUnsizeTarget?_rawPtr_slice (m : Mutability) (e : RigidTy) :
+    dynUnsizeTarget? (.rawPtr m (.slice e)) = .none := rfl
+
+/-- `str` reference targets never take the `dyn` path. -/
+theorem dynUnsizeTarget?_ref_str (m : Mutability) :
+    dynUnsizeTarget? (.ref m .str) = .none := rfl
+
+/-- Every unmodeled unsizing target (`Box<dyn _>`, `Rc<dyn _>`, `Arc<dyn _>`,
+`Pin<Box<dyn _>>`, user `CoerceUnsized` structs, unsized-tail structs) fails
+closed with `.unsupported` — never `.ub` (Condition `C1`). -/
+theorem evalUnsizeCoercion_unmodeled_unsupported
+    (locals : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : dynUnsizeTarget? targetTy.kind = .some .unmodeled) :
+    evalUnsizeCoercion locals op targetTy mem localDecls layouts = .unsupported := by
+  unfold evalUnsizeCoercion
+  rw [h]
+  rfl
+
+/-- `Box<T> as Box<dyn K>` fails closed (`.unsupported`, never `.ub`). -/
+theorem evalUnsizeCoercion_box_dyn_unsupported
+    (locals : List LocalSlot) (op : Operand) (k : DefPath) (lIdx : LayoutIdx) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalUnsizeCoercion locals op
+        { kind := .adt "alloc::boxed::Box" (.dynamic k :: .adt "alloc::alloc::Global" .nil :: .nil),
+          layoutIdx := lIdx }
+        mem localDecls layouts = .unsupported :=
+  evalUnsizeCoercion_unmodeled_unsupported locals op _ mem localDecls layouts rfl
+
+/-- A reference to a user struct whose tail is unsized (`&Wrapper<T> as
+&Wrapper<dyn K>`) fails closed (`.unsupported`, never `.ub`). -/
+theorem evalUnsizeCoercion_ref_adt_unsupported
+    (locals : List LocalSlot) (op : Operand) (m : Mutability) (p : DefPath)
+    (args : List RigidTy) (lIdx : LayoutIdx) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalUnsizeCoercion locals op { kind := .ref m (.adt p args), layoutIdx := lIdx }
+        mem localDecls layouts = .unsupported :=
+  evalUnsizeCoercion_unmodeled_unsupported locals op _ mem localDecls layouts rfl
 
 /--
 Resolve a stack-backed array or slice borrow `parentEntry` at `ptrVal` into a
@@ -16795,421 +17888,6 @@ def evalScalarPtrOffsetBinOp
         match Bool.or (Nat.beq rhsBits 0) (Nat.beq elemStride 0) with
         | true => .ok (.scalar ⟨lhsBits, ptrBytes⟩) locals₂ mem
         | false => .ub
-
-/--
-Compute the default byte size of an untyped runtime `Value` when `localDecls`
-does not provide a `LocalDecl` for a stack allocation.
--/
-@[reducible]
-def valueDefaultByteSize : Value → Option Nat
-  | .unit => .some 0
-  | .scalar sc => .some sc.sizeBytes
-  | .ptr _ sz => .some sz
-  | .aggregate 0 fields => inferValueCReprBytes (.aggregate 0 fields)
-  | _ => .none
-
-/--
-Resolve the byte bound of a projected value `rootVal` at `proj` using
-`readProjectedValue` and `valueDefaultByteSize`.
--/
-@[reducible]
-def projectedValueDefaultByteSize
-    (locals : List LocalSlot)
-    (rootVal : Value)
-    (proj : List ProjectionElem) :
-    Option Nat :=
-  match readProjectedValue locals rootVal proj with
-  | .ok projVal => valueDefaultByteSize projVal
-  | _ => .some 0
-
-/--
-Resolve the byte bound of the allocation backing `ptrVal` from `mem.borrows`
-(using `entry.rangeOffset + entry.rangeLen`, `localDecls`, or `locals`) or
-`mem.globals` (`length alloc.bytes`).
-
-The bound of a stack borrow is independent of its Tree Borrows permission: it is
-`0` once the backing allocation was deallocated (`entry.allocDead`, set by
-`StorageDead`, the implicit free of a repeated `StorageLive`, and the owning
-frame's `TerminatorKind.return_`) or when the target slot is dead, and otherwise
-the size of the live target. The target slot, `localDecls`, and `layouts` are
-those of the frame owning the target (`entry.targetFrameDepth`, resolved through
-`mem.callStack`; `DIV-MR-CALL-TARGET-LOCAL`).
-
-When `entry.targetProjection` ends in `.field`, computes the remaining byte
-capacity `enclosingByteSize - fieldByteOffset` from that field's byte offset to
-the end of the enclosing allocation (or enclosing subslice window), permitting
-intra-allocation cross-field and one-past-the-end pointer arithmetic via
-`BinOp.offset`.
-
-Reference (`library/core/src/ptr/const_ptr.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L380-L430>
-
-> "/// * If the computed offset is non-zero, then `self` must be derived from a
-> ///   pointer to some allocated object, and the entire memory range between
-> ///   `self` and the result must be in bounds of that allocated object."
--/
-def ptrAllocByteBound?
-    (locals : List LocalSlot)
-    (mem : Memory)
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (ptrVal : ProvenancePtr) :
-    Option Nat :=
-  match lookupBorrow mem.borrows ptrVal.tag with
-  | .some entry =>
-    match entry.allocDead with
-    | true => .some 0
-    | false =>
-      let targetFrameDeclsAndLayouts : List LocalDecl × LayoutTable :=
-        match mem.callStack with
-        | .nil => (localDecls, layouts)
-        | _ :: _ =>
-          match
-            frameLocalDeclsAndLayoutsAtDepth
-              mem.callStack
-              localDecls
-              layouts
-              entry.targetFrameDepth
-          with
-          | .some declsAndLayouts => declsAndLayouts
-          | .none => (.nil, layouts)
-      let localDecls := targetFrameDeclsAndLayouts.1
-      let layouts := targetFrameDeclsAndLayouts.2
-      let targetLive : Bool :=
-        match activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal with
-        | .some (.init _) => true
-        | .some .uninit => true
-        | .some .dead => false
-        | .none =>
-          match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal with
-          | .some (.init _) => true
-          | .some .uninit => true
-          | _ => false
-      match targetLive, Nat.beq entry.rangeLen 0 with
-      | false, _ => .some 0
-      | true, false => .some (Nat.add entry.rangeOffset entry.rangeLen)
-      | true, true =>
-        let rootValOpt : Option Value :=
-          match activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal with
-          | .some (.init v) => .some v
-          | .some _ => .none
-          | .none =>
-            match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal with
-            | .some (.init v) => .some v
-            | _ => .none
-        let normTargetProj :=
-          normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
-        let windowTargetProj :=
-          normalizeAdjacentSubslices (stripTransparentProjections entry.targetProjection)
-        match splitLastConstantIndex? windowTargetProj with
-        | .some (initProj, baseIdx, minLen) =>
-          match rootValOpt with
-          | .some rootVal =>
-            match readProjectedValue locals rootVal initProj with
-            | .ok (.aggregate 0 elems) =>
-              match
-                Bool.and
-                  (Nat.ble minLen (length elems))
-                  (Nat.ble baseIdx (length elems))
-              with
-              | false => .some 0
-              | true =>
-                let remElems := Nat.sub (length elems) baseIdx
-                let elemSz :=
-                  resolveSeqContainerElemByteStride
-                    localDecls
-                    layouts
-                    entry.targetLocal
-                    initProj
-                    elems
-                .some (Nat.mul remElems elemSz)
-            | _ => .some 0
-          | .none =>
-            let initPlace : Place := {
-              local_ := entry.targetLocal
-              projection := initProj
-            }
-            match placeTyResolved localDecls layouts initPlace with
-            | .some arrTy =>
-              match arrTy.kind with
-              | .array elemKind arrLen =>
-                let containerLenOpt : Option Nat :=
-                  match splitLastSubslice? initProj with
-                  | .none => .some arrLen
-                  | .some (_, fromIdx, toIdx, fromEnd) =>
-                    match fromEnd with
-                    | false =>
-                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
-                      | true => .some (Nat.sub toIdx fromIdx)
-                      | false => .none
-                    | true =>
-                      match Nat.ble (Nat.add fromIdx toIdx) arrLen with
-                      | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
-                      | false => .none
-                match containerLenOpt with
-                | .none => .some 0
-                | .some cLen =>
-                  match
-                    Bool.and
-                      (Nat.ble minLen cLen)
-                      (Nat.ble baseIdx cLen)
-                  with
-                  | false => .some 0
-                  | true =>
-                    let remElems := Nat.sub cLen baseIdx
-                    match LayoutTable.lookup layouts arrTy.layoutIdx with
-                    | .some layout =>
-                      match layout.fields with
-                      | .array stride _ => .some (Nat.mul remElems stride.bytes)
-                      | _ =>
-                        match
-                          tyByteSize
-                            localDecls
-                            layouts
-                            { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
-                        with
-                        | .some elemSz => .some (Nat.mul remElems elemSz)
-                        | .none => .some 0
-                    | .none =>
-                      match
-                        tyByteSize
-                          localDecls
-                          layouts
-                          { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
-                      with
-                      | .some elemSz => .some (Nat.mul remElems elemSz)
-                      | .none => .some 0
-              | _ => .some 0
-            | _ => .some 0
-        | .none =>
-          match splitLastSubslice? normTargetProj with
-          | .some (initProj, fromIdx, toIdx, fromEnd) =>
-            match rootValOpt with
-            | .some rootVal =>
-              match readProjectedValue locals rootVal normTargetProj with
-              | .ok (.aggregate 0 subElems) =>
-                let elemSz :=
-                  resolveSeqContainerElemByteStride
-                    localDecls
-                    layouts
-                    entry.targetLocal
-                    initProj
-                    subElems
-                .some (Nat.mul (length subElems) elemSz)
-              | _ => .some 0
-            | .none =>
-              let initPlace : Place := {
-                local_ := entry.targetLocal
-                projection := initProj
-              }
-              match placeTyResolved localDecls layouts initPlace with
-              | .some arrTy =>
-                match arrTy.kind with
-                | .array elemKind arrLen =>
-                  let subLenOpt : Option Nat :=
-                    match fromEnd with
-                    | false =>
-                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
-                      | true => .some (Nat.sub toIdx fromIdx)
-                      | false => .none
-                    | true =>
-                      match Nat.ble (Nat.add fromIdx toIdx) arrLen with
-                      | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
-                      | false => .none
-                  match subLenOpt with
-                  | .some subLen =>
-                    match LayoutTable.lookup layouts arrTy.layoutIdx with
-                    | .some layout =>
-                      match layout.fields with
-                      | .array stride _ => .some (Nat.mul subLen stride.bytes)
-                      | _ =>
-                        match
-                          tyByteSize
-                            localDecls
-                            layouts
-                            { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
-                        with
-                        | .some elemSz => .some (Nat.mul subLen elemSz)
-                        | .none => .some 0
-                    | .none =>
-                      match
-                        tyByteSize
-                          localDecls
-                          layouts
-                          { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
-                      with
-                      | .some elemSz => .some (Nat.mul subLen elemSz)
-                      | .none => .some 0
-                  | .none => .some 0
-                | _ => .some 0
-              | _ => .some 0
-          | .none =>
-            let fallbackTargetPlaceBytes : Option Nat :=
-              let targetPlace : Place := {
-                local_ := entry.targetLocal
-                projection := entry.targetProjection
-              }
-              match placeTyResolved localDecls layouts targetPlace with
-              | .some projTy =>
-                match tyByteSize localDecls layouts projTy with
-                | .some n => .some n
-                | .none => .some 0
-              | .none =>
-                match rootValOpt with
-                | .some rootVal =>
-                  match readProjectedValue locals rootVal entry.targetProjection with
-                  | .ok (.aggregate 0 fs) =>
-                    match isHomogeneousUntypedFields fs with
-                    | true => inferValueCReprBytes (.aggregate 0 fs)
-                    | false => .some 0
-                  | .ok pv => valueDefaultByteSize pv
-                  | _ => .some 0
-                | .none => .some 0
-            match splitLastField? windowTargetProj with
-            | .none => fallbackTargetPlaceBytes
-            | .some _ =>
-              let (encProj, rawRelProj) := splitAfterLastSeqProj windowTargetProj
-              let relProj := normalizeSubsliceProjections rawRelProj
-              let encTyOpt :=
-                placeTyResolved
-                  localDecls
-                  layouts
-                  { local_ := entry.targetLocal, projection := encProj }
-              let encValOpt : Option Value :=
-                match rootValOpt with
-                | .some rootVal =>
-                  match readProjectedValue locals rootVal encProj with
-                  | .ok ev => .some ev
-                  | _ => .none
-                | .none => .none
-              let enclosingBytesOpt : Option Nat :=
-                match splitLastSubslice? encProj with
-                | .some (subInitProj, fromIdx, toIdx, fromEnd) =>
-                  let subInitPlace : Place := {
-                    local_ := entry.targetLocal
-                    projection := subInitProj
-                  }
-                  let subInitValOpt : Option Value :=
-                    match rootValOpt with
-                    | .some rootVal =>
-                      match readProjectedValue locals rootVal subInitProj with
-                      | .ok v => .some v
-                      | _ => .none
-                    | .none => .none
-                  match subInitValOpt with
-                  | .some (.aggregate 0 subElems) =>
-                    let elemSz :=
-                      resolveSeqContainerElemByteStride
-                        localDecls
-                        layouts
-                        entry.targetLocal
-                        subInitProj
-                        subElems
-                    let subLenOpt : Option Nat :=
-                      match fromEnd with
-                      | false =>
-                        match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx (length subElems)) with
-                        | true => .some (Nat.sub toIdx fromIdx)
-                        | false => .none
-                      | true =>
-                        match Nat.ble (Nat.add fromIdx toIdx) (length subElems) with
-                        | true => .some (Nat.sub (Nat.sub (length subElems) toIdx) fromIdx)
-                        | false => .none
-                    match subLenOpt with
-                    | .some subLen => .some (Nat.mul subLen elemSz)
-                    | .none => .some 0
-                  | .some _ => .some 0
-                  | .none =>
-                    match placeTyResolved localDecls layouts subInitPlace with
-                    | .some parentTy =>
-                      match parentTy.kind with
-                      | .array elemKind arrLen =>
-                        let subLenOpt : Option Nat :=
-                          match fromEnd with
-                          | false =>
-                            match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
-                            | true => .some (Nat.sub toIdx fromIdx)
-                            | false => .none
-                          | true =>
-                            match Nat.ble (Nat.add fromIdx toIdx) arrLen with
-                            | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
-                            | false => .none
-                        let elemSzOpt : Option Nat :=
-                          match LayoutTable.lookup layouts parentTy.layoutIdx with
-                          | .some layout =>
-                            match layout.fields with
-                            | .array stride _ => .some stride.bytes
-                            | _ =>
-                              tyByteSize
-                                localDecls
-                                layouts
-                                { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
-                          | .none =>
-                            tyByteSize
-                              localDecls
-                              layouts
-                              { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
-                        match subLenOpt, elemSzOpt with
-                        | .some subLen, .some elemSz => .some (Nat.mul subLen elemSz)
-                        | _, _ => .some 0
-                      | _ => .some 0
-                    | .none => .none
-                | .none =>
-                  let encSzOpt_fromArray : Option Nat :=
-                    match splitLastConstantIndex? encProj with
-                    | .some (arrProj, _, _) =>
-                      match placeTyResolved localDecls layouts { local_ := entry.targetLocal, projection := arrProj } with
-                      | .some arrTy =>
-                        match LayoutTable.lookup layouts arrTy.layoutIdx with
-                        | .some layout =>
-                          match layout.fields with
-                          | .array stride _ => .some stride.bytes
-                          | _ => .none
-                        | .none => .none
-                      | .none => .none
-                    | .none => .none
-                  match encSzOpt_fromArray with
-                  | .some sz => .some sz
-                  | .none =>
-                    match encTyOpt with
-                    | .some encTy => tyByteSize localDecls layouts encTy
-                    | .none =>
-                      match encValOpt with
-                      | .some (.aggregate 0 fs) =>
-                        match isHomogeneousUntypedFields fs with
-                        | true => inferValueCReprBytes (.aggregate 0 fs)
-                        | false => .none
-                      | .some ev => valueDefaultByteSize ev
-                      | .none => .none
-              match enclosingBytesOpt with
-              | .none => fallbackTargetPlaceBytes
-              | .some encBytes =>
-                match
-                  projectionChainByteOffset?
-                    layouts
-                    encTyOpt
-                    encValOpt
-                    .none
-                    0
-                    localDecls
-                    relProj
-                with
-                | .none => .some 0
-                | .some fieldOff =>
-                  match Nat.ble fieldOff encBytes with
-                  | true => .some (Nat.sub encBytes fieldOff)
-                  | false => .some 0
-  | .none =>
-    match lookupGlobalAlloc mem.globals ptrVal.allocId with
-    | .some alloc => .some (length alloc.bytes)
-    | .none =>
-      match Nat.beq ptrVal.allocId 0 with
-      | true => .some 0
-      | false =>
-        match mem.borrows, mem.globals with
-        | .nil, .nil => .none
-        | _, _ => .some 0
 
 /--
 Evaluate in-bounds pointer arithmetic `BinOp.offset` (`ptr::offset` / inbounds
@@ -19091,6 +19769,235 @@ def checkSafeRefDerefOk
         Bool.and (Nat.beq parentPtr.allocId 0) isZstPointee
 
 /--
+Static classification of the local dereferenced by a `dyn` place `*l`:
+`.some (isRef, mutability, dynKey)` when `l : &m dyn K` (`isRef = true`) or
+`l : *m dyn K` (`isRef = false`).
+-/
+@[reducible]
+def dynPlaceLocalKind? (localDecls : List LocalDecl) (loc : Local) :
+    Option (Bool × Mutability × DefPath) :=
+  match get? localDecls loc with
+  | .some { ty := { kind := .ref m (.dynamic k), .. }, .. } => .some (true, m, k)
+  | .some { ty := { kind := .rawPtr m (.dynamic k), .. }, .. } => .some (false, m, k)
+  | _ => .none
+
+/--
+Tree Borrows permission of a reborrow `&(*r)` / `&mut (*r)` of a `dyn K` place
+whose dynamic type is the captured vtable's `concreteTy`.
+
+Modeled property: Miri's retag of a reference visits the pointee at its
+*dynamic* type, so a shared reborrow of a `Freeze` concrete type is `Frozen`
+(with an initial read) and of a `!Freeze` concrete type `Cell` (no read); a
+mutable reborrow is `Reserved` (`ReservedFrz` for `Freeze`, `ReservedIM`
+otherwise), exactly as `sharedBorrowPerm` / `mutableBorrowPerm` compute for a
+statically typed place.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "A reference or Box<T> must be aligned and non-null, it cannot be dangling, and
+> it must point to a valid value (in case of dynamically sized types, using the
+> actual dynamic type of the pointee as determined by the metadata)."
+
+Reference (The Rust Reference 1.98.0, "Interior mutability"):
+<https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
+
+> "All interior mutability in Rust is enabled by the UnsafeCell<T> type, which
+> is defined in the standard library."
+
+Modeling choice: the operational aliasing model is Tree Borrows (see
+`TreeBorrowPerm`); using the dynamic type for the freeze decision follows the
+quoted "actual dynamic type of the pointee as determined by the metadata".
+-/
+@[reducible]
+def dynReborrowPerm (isMut : Bool) (concreteTy : RigidTy) : TreeBorrowPerm :=
+  match isMut, rigidTyIsFreeze 16 concreteTy with
+  | false, true => TreeBorrowPerm.frozen
+  | false, false => TreeBorrowPerm.cell
+  | true, true => TreeBorrowPerm.reservedFrz false
+  | true, false => TreeBorrowPerm.reservedIM
+
+/--
+Evaluate a reborrow `&(*l)` / `&mut (*l)` of a `dyn K` place whose local `l`
+holds the wide pointer `.aggregate 0 [dataVal, metaVal]`, returning the new
+wide pointer and, when a child tag is created, `(child, borrowsAfterRead,
+nextTag')` that `evalRvalueRefDeref` writes back into `Memory` as
+`borrows := child :: borrowsAfterRead` (`.none` leaves `Memory` unchanged).
+
+Modeled property: reborrowing through a trait-object reference creates a child
+reference to the same object with the same vtable; the new reference must be
+valid for the dynamic type and the parent tag must permit the reborrow.
+
+Reference (The Rust Reference 1.98.0, "Borrow operators"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#borrow-operators>
+
+> "The & (shared borrow) and &mut (mutable borrow) operators are unary prefix
+> operators. When applied to a place expression, this expressions produces a
+> reference (pointer) to the location that the value refers to."
+
+Justification: the vtable pointer is validated against `K`
+(`checkDynVTablePtr`); the data word must satisfy `dynRefDataValid` with the
+Tree Borrows gate for the vtable's layout; a stack-borrowed data pointer gets a
+fresh child tag with `dynReborrowPerm` after the initial child read
+(`hasTreeReadUB` / `freezeTreeBorrowsOnReadAtProj`, skipped for `Cell` and
+zero-sized pointees), mirroring the statically typed path of
+`evalRvalueRefDeref`. The metadata word is copied unchanged.
+
+Unsupported: trailing projections after `*l` (a `dyn` place has no fields),
+`&mut (*l)` on `l : &dyn K` (rejected by the borrow checker), untyped locals,
+and every `.unsupported` outcome of `checkDynVTablePtr`.
+-/
+def evalDynFatPtrDerefBorrow
+    (locals : List LocalSlot)
+    (borrowKind : BorrowKind)
+    (place : Place)
+    (restProj : List ProjectionElem)
+    (mv : DynMemView)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (dataVal metaVal : Value) :
+    DynCheck (Value × Option (BorrowEntry × List BorrowEntry × Nat)) :=
+  let ptrBytes := layoutPointerBytes layouts
+  let isMut : Bool :=
+    match borrowKind with
+    | .shared => false
+    | .mut _ => true
+  match stripTransparentProjections restProj with
+  | _ :: _ => .unsupported
+  | .nil =>
+    match dynPlaceLocalKind? localDecls place.local_ with
+    | .none => .unsupported
+    | .some (isRefLocal, localMut, dynKey) =>
+      let illTyped : Bool :=
+        Bool.and isRefLocal
+          (Bool.and isMut
+            (match localMut with
+             | .not => true
+             | .mut => false))
+      match illTyped with
+      | true => .unsupported
+      | false =>
+        match checkDynVTablePtr .none mv ptrBytes metaVal dynKey with
+        | .ub => .ub
+        | .unsupported => .unsupported
+        | .ok (entry, _, _) =>
+          match dynRefDataValid locals mv localDecls layouts ptrBytes dataVal entry isMut true with
+          | false => .ub
+          | true =>
+            match dataVal with
+            | .ptr p sz =>
+              match lookupBorrow mv.borrows p.tag with
+              | .none => .ok (.aggregate 0 (dataVal :: metaVal :: .nil), .none)
+              | .some parentEntry =>
+                let perm := dynReborrowPerm isMut entry.concreteTy
+                let skipInitRead : Bool :=
+                  match perm with
+                  | .cell => true
+                  | _ => Nat.beq entry.sizeBytes 0
+                let readUB : Bool :=
+                  match skipInitRead with
+                  | true => false
+                  | false =>
+                    hasTreeReadUB
+                      mv.borrows
+                      mv.borrows
+                      mv.activeProtectors
+                      parentEntry.targetLocal
+                      (.some p.tag)
+                      parentEntry.targetProjection
+                      parentEntry.rangeOffset
+                      parentEntry.rangeLen
+                      parentEntry.targetFrameDepth
+                match readUB with
+                | true => .ub
+                | false =>
+                  let borrowsAfterRead :=
+                    match skipInitRead with
+                    | true => mv.borrows
+                    | false =>
+                      freezeTreeBorrowsOnReadAtProj
+                        mv.borrows
+                        mv.borrows
+                        parentEntry.targetLocal
+                        (.some p.tag)
+                        parentEntry.targetProjection
+                        parentEntry.rangeOffset
+                        parentEntry.rangeLen
+                        mv.activeProtectors
+                        parentEntry.targetFrameDepth
+                  let tag := mv.nextTag
+                  let child : BorrowEntry := {
+                    tag := tag
+                    targetLocal := parentEntry.targetLocal
+                    targetFrameDepth := parentEntry.targetFrameDepth
+                    allocDead := parentEntry.allocDead
+                    targetProjection := parentEntry.targetProjection
+                    perm := perm
+                    rangeOffset := parentEntry.rangeOffset
+                    rangeLen := parentEntry.rangeLen
+                    parentTag := .some p.tag
+                  }
+                  .ok
+                    (.aggregate 0
+                      (.ptr { allocId := tag, offsetBytes := p.offsetBytes } sz :: metaVal :: .nil),
+                     .some (child, borrowsAfterRead, Nat.add tag 1))
+            | _ => .ok (.aggregate 0 (dataVal :: metaVal :: .nil), .none)
+
+/--
+Evaluate a raw borrow `&raw const (*l)` / `&raw mut (*l)` of a `dyn K` place
+whose local `l` holds `.aggregate 0 [dataVal, metaVal]` (Condition `C5`).
+
+Reference (The Rust Reference 1.98.0, "Raw borrow operators"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#raw-borrow-operators>
+
+> "Evaluating the operand of a raw borrow expression does not cause its value to
+> be moved or read, and does not create any temporary references."
+
+Justification: a raw borrow performs no Tree Borrows access, so the wide pointer
+is returned unchanged. For a raw-pointer local the only check is the mutability
+gate. For a reference local `l : &[mut] dyn K` the place `*l` is a safe
+dereference: the vtable pointer is validated and the data word must satisfy
+`dynRefDataValid` *without* the Tree Borrows gate (`refDataValidNoTB`: live,
+non-null, aligned, in bounds, inhabited), so `&raw const (*r)` succeeds on a
+`.frozen` or `.disabled` tag as in Miri and MiniRust, matching the convention of
+`checkSafeRefDerefOk` on thin references up to the permission gate.
+
+Unsupported: trailing projections after `*l`, `&raw mut (*l)` on
+`l : *const dyn K` or `l : &dyn K` (mutability escalation rejected by the type
+checker), untyped locals, and `.unsupported` vtable checks.
+-/
+def evalDynFatPtrDerefRaw
+    (locals : List LocalSlot)
+    (mutability : Mutability)
+    (place : Place)
+    (restProj : List ProjectionElem)
+    (mv : DynMemView)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (dataVal metaVal : Value) :
+    DynCheck Value :=
+  let ptrBytes := layoutPointerBytes layouts
+  match stripTransparentProjections restProj with
+  | _ :: _ => .unsupported
+  | .nil =>
+    match dynPlaceLocalKind? localDecls place.local_ with
+    | .none => .unsupported
+    | .some (isRefLocal, localMut, dynKey) =>
+      match localMut, mutability with
+      | .not, .mut => .unsupported
+      | _, _ =>
+        match isRefLocal with
+        | false => .ok (.aggregate 0 (dataVal :: metaVal :: .nil))
+        | true =>
+          match checkDynVTablePtr .none mv ptrBytes metaVal dynKey with
+          | .ub => .ub
+          | .unsupported => .unsupported
+          | .ok (entry, _, _) =>
+            match dynRefDataValid locals mv localDecls layouts ptrBytes dataVal entry false false with
+            | true => .ok (.aggregate 0 (dataVal :: metaVal :: .nil))
+            | false => .ub
+
+/--
 Evaluate a dereferenced safe borrow (`Rvalue.ref borrowKind place` when
 `place.projection = .deref :: restProj`), validating pointer width, alignment,
 and Tree Borrows permissions before creating a child reborrow tag or delegating
@@ -19373,6 +20280,23 @@ def evalRvalueRefDeref
         localDecls
         accessedTyOpt
         true
+  | .some (.init (.aggregate 0 (dataVal :: .ptr vtPtr vtSz :: .nil))) =>
+    match
+      evalDynFatPtrDerefBorrow locals borrowKind place restProj
+        { borrows := mem.borrows, globals := mem.globals, callerLocals := mem.callerLocals,
+          callStack := (match mem.borrows with | .nil => .nil | _ :: _ => mem.callStack),
+          callerBodies :=
+            (match mem.borrows with | .nil => .nil | _ :: _ => callerBodiesOf mem.callStack),
+          fnPtrs := mem.fnPtrs,
+          nextAllocId := mem.nextAllocId, activeProtectors := mem.activeProtectors,
+          nextTag := mem.nextTag }
+        localDecls layouts dataVal (.ptr vtPtr vtSz)
+    with
+    | .ok (v, .none) => .ok v locals mem
+    | .ok (v, .some (child, borrowsAfterRead, nextTag')) =>
+      .ok v locals { mem with borrows := child :: borrowsAfterRead, nextTag := nextTag' }
+    | .ub => .ub
+    | .unsupported => .unsupported
   | _ => .ub
 
 /--
@@ -19927,6 +20851,21 @@ def evalRvalueRawPtr
             pointeeTyOpt
             localDecls
             layouts
+    | .some (.init (.aggregate 0 (dataVal :: .ptr vtPtr vtSz :: .nil))) =>
+      match
+        evalDynFatPtrDerefRaw locals mutability place restProj
+          { borrows := mem.borrows, globals := mem.globals, callerLocals := mem.callerLocals,
+            callStack := (match mem.borrows with | .nil => .nil | _ :: _ => mem.callStack),
+            callerBodies :=
+              (match mem.borrows with | .nil => .nil | _ :: _ => callerBodiesOf mem.callStack),
+            fnPtrs := mem.fnPtrs,
+            nextAllocId := mem.nextAllocId, activeProtectors := mem.activeProtectors,
+            nextTag := mem.nextTag }
+          localDecls layouts dataVal (.ptr vtPtr vtSz)
+      with
+      | .ok v => .ok v locals mem
+      | .ub => .ub
+      | .unsupported => .unsupported
     | _ => .ub
   | _ =>
     match get? locals place.local_ with

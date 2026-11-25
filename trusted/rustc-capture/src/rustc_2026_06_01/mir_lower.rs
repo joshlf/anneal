@@ -409,6 +409,7 @@ pub fn lower_mir_body<'tcx>(
     body: &Body<'tcx>,
     role: IrContractRole,
 ) -> IrCapturedMir {
+    ensure_session_dyn_metadata(tcx, def_id);
     let (generic_params, param_index_map) = collect_generic_type_params(tcx, def_id);
     let type_param_count = generic_params.len();
 
@@ -814,13 +815,7 @@ impl<'tcx> MirLowerCtx<'tcx> {
                     .collect::<Vec<_>>();
                 IrRigidTy::Closure(def_path, ty_args)
             }
-            TyKind::Dynamic(preds, _) => {
-                if let Some(principal_def_id) = preds.principal_def_id() {
-                    IrRigidTy::Dynamic(canonical_def_path(self.tcx, principal_def_id))
-                } else {
-                    IrRigidTy::Dynamic(format!("{ty}"))
-                }
-            }
+            TyKind::Dynamic(preds, _) => IrRigidTy::Dynamic(dyn_type_key(self.tcx, ty, preds)),
             TyKind::Foreign(def_id) => IrRigidTy::Foreign(canonical_def_path(self.tcx, *def_id)),
             TyKind::Param(p) => {
                 let index = self
@@ -2885,6 +2880,10 @@ fn record_referenced_alloc<'tcx>(
             }
         }
         GlobalAlloc::VTable(ty, dyn_ty) => {
+            // Condition `C6`: every `VtblEntry::Method` of this vtable is a
+            // potential virtual-call target (see `vtable_method_callees`).
+            let dyn_full_ty = Ty::new_dynamic(tcx, dyn_ty, tcx.lifetimes.re_erased);
+            out.extend(vtable_method_callees(tcx, ty, dyn_full_ty));
             record_referenced_ty(tcx, owner_def_id, typing_env, parent_substs, ty, out);
             if let Some(principal) = dyn_ty.principal() {
                 for arg in principal.skip_binder().args.iter() {
@@ -3028,6 +3027,52 @@ pub fn collect_referenced_callees<'tcx>(
                 StatementKind::Assign(assign_box) => {
                     let (_, ref rvalue) = **assign_box;
                     match rvalue {
+                        Rvalue::Cast(
+                            CastKind::PointerCoercion(
+                                rustc_middle::ty::adjustment::PointerCoercion::Unsize,
+                                _,
+                            ),
+                            op,
+                            target_ty,
+                        ) => {
+                            // Condition `C6`: an `Unsize` coercion to `dyn Trait`
+                            // makes every method of the `(concrete, dyn)` vtable
+                            // reachable through virtual calls.
+                            let src_ty = op.ty(&body.local_decls, tcx);
+                            let (src_ty, dst_ty) = if let Some(p_substs) = parent_substs
+                                && p_substs.len() == tcx.generics_of(owner_def_id).count()
+                                && !src_ty.has_escaping_bound_vars()
+                                && !target_ty.has_escaping_bound_vars()
+                            {
+                                (
+                                    rustc_middle::ty::EarlyBinder::bind(src_ty)
+                                        .instantiate(tcx, p_substs)
+                                        .skip_norm_wip(),
+                                    rustc_middle::ty::EarlyBinder::bind(*target_ty)
+                                        .instantiate(tcx, p_substs)
+                                        .skip_norm_wip(),
+                                )
+                            } else {
+                                (src_ty, *target_ty)
+                            };
+                            let src_ty = tcx.erase_and_anonymize_regions(src_ty);
+                            let dst_ty = tcx.erase_and_anonymize_regions(dst_ty);
+                            if let Some((s, d)) =
+                                unsize_pointee_tails(tcx, typing_env, src_ty, dst_ty, 0)
+                                && !matches!(s.kind(), TyKind::Dynamic(..))
+                            {
+                                out.extend(vtable_method_callees(tcx, s, d));
+                            }
+                            record_referenced_operand(
+                                tcx,
+                                owner_def_id,
+                                typing_env,
+                                parent_substs,
+                                op,
+                                &mut visited_allocs,
+                                &mut out,
+                            );
+                        }
                         Rvalue::Use(op, _)
                         | Rvalue::Repeat(op, _)
                         | Rvalue::Cast(_, op, _)
@@ -3215,3 +3260,600 @@ pub fn collect_referenced_callees<'tcx>(
     out
 }
 
+// ---------------------------------------------------------------------------
+// `dyn Trait` capture (Episode 1, `ws-tcb-dyn-trait-unsize-and-vtable-dispatch`)
+// ---------------------------------------------------------------------------
+
+/// Returns the canonical `RigidTy.dynamic` key of the trait-object type `ty`
+/// whose existential predicates are `preds`.
+///
+/// `rustc` (`compiler/rustc_middle/src/ty/predicate.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) documents the predicate list:
+///
+/// > ```text
+/// > /// For example, in the trait object `dyn std::fmt::Debug + Sync`, the
+/// > /// principal bound is `Some(std::fmt::Debug)`, while the auto-trait bounds
+/// > /// are the set `{Sync}`.
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/predicate.rs#L274-L276
+///
+/// Modeling choice: a trait object with a principal trait, no principal
+/// generic arguments, no projection bounds, and no auto traits keys as the
+/// principal's canonical path (the pre-existing `RigidTy.dynamic` rendering,
+/// so captured bodies without such types are unchanged); every other trait
+/// object keys as its region-erased `Display` rendering, which distinguishes
+/// `dyn Tr<u8>` from `dyn Tr<u16>` and `dyn Tr + Send` from `dyn Tr`.
+pub fn dyn_type_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    preds: &'tcx rustc_middle::ty::List<rustc_middle::ty::PolyExistentialPredicate<'tcx>>,
+) -> String {
+    let simple_principal = preds
+        .principal()
+        .is_some_and(|p| p.skip_binder().args.is_empty())
+        && preds.projection_bounds().next().is_none()
+        && preds.auto_traits().next().is_none();
+    if simple_principal && let Some(principal_def_id) = preds.principal_def_id() {
+        return canonical_def_path(tcx, principal_def_id);
+    }
+    let erased = tcx.erase_and_anonymize_regions(ty);
+    with_no_visible_paths!(format!("{erased}"))
+}
+
+/// Returns the canonical key of the predicates of `preds` without auto traits
+/// (the trait-equality key of a vtable check).
+///
+/// `rustc` (`compiler/rustc_const_eval/src/interpret/traits.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) compares vtables as:
+///
+/// > ```text
+/// > // FIXME: we are skipping auto traits for now, but might revisit this in the future.
+/// > let mut sorted_vtable: Vec<_> = vtable_dyn_type.without_auto_traits().collect();
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/traits.rs#L76-L77
+///
+/// Modeling choice: the rendering is the session-local `Debug` form of the
+/// erased predicates, compared only among descriptors of one capture session.
+fn dyn_predicate_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    preds: &'tcx rustc_middle::ty::List<rustc_middle::ty::PolyExistentialPredicate<'tcx>>,
+) -> String {
+    let parts: Vec<String> = preds
+        .without_auto_traits()
+        .map(|p| format!("{:?}", tcx.erase_and_anonymize_regions(p.skip_binder())))
+        .collect();
+    parts.join(" + ")
+}
+
+/// Returns the `(source pointee, target pointee)` pair of an `Unsize`
+/// coercion between pointer-like types (`&T`, `*T`, or a `CoerceUnsized`
+/// struct such as `Pin<&T>` whose single changing field is pointer-like),
+/// followed through `struct_lockstep_tails_for_codegen` exactly as the
+/// interpreter does.
+///
+/// `rustc` (`compiler/rustc_const_eval/src/interpret/cast.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+///
+/// > ```text
+/// > // A<Struct> -> A<Trait> conversion
+/// > let (src_pointee_ty, dest_pointee_ty) =
+/// >     self.tcx.struct_lockstep_tails_for_codegen(source_ty, cast_ty, self.typing_env);
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/cast.rs#L373-L375
+fn unsize_pointee_tails<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: rustc_middle::ty::TypingEnv<'tcx>,
+    src: Ty<'tcx>,
+    dst: Ty<'tcx>,
+    depth: usize,
+) -> Option<(Ty<'tcx>, Ty<'tcx>)> {
+    if depth > 8 {
+        return None;
+    }
+    match (src.builtin_deref(true), dst.builtin_deref(true)) {
+        (Some(s), Some(d)) => Some(tcx.struct_lockstep_tails_for_codegen(s, d, typing_env)),
+        _ => match (src.kind(), dst.kind()) {
+            (TyKind::Adt(sdef, sargs), TyKind::Adt(ddef, dargs))
+                if sdef.did() == ddef.did() && sdef.is_struct() =>
+            {
+                let variant = sdef.non_enum_variant();
+                for field in variant.fields.iter() {
+                    let sf = field.ty(tcx, sargs).skip_norm_wip();
+                    let df = field.ty(tcx, dargs).skip_norm_wip();
+                    if sf != df {
+                        return unsize_pointee_tails(tcx, typing_env, sf, df, depth + 1);
+                    }
+                }
+                None
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Returns `tcx.vtable_entries(..)` for `(concrete, dyn_ty)`, exactly as the
+/// interpreter computes them.
+///
+/// `rustc` (`compiler/rustc_const_eval/src/interpret/traits.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+///
+/// > ```text
+/// > if let Some(trait_) = trait_ {
+/// >     let trait_ref = trait_.with_self_ty(*self.tcx, dyn_ty);
+/// >     let trait_ref = self.tcx.erase_and_anonymize_regions(
+/// >         self.tcx.instantiate_bound_regions_with_erased(trait_ref),
+/// >     );
+/// >     self.tcx.vtable_entries(trait_ref)
+/// > } else {
+/// >     TyCtxt::COMMON_VTABLE_ENTRIES
+/// > }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/traits.rs#L54-L62
+fn vtable_entries_for<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    concrete: Ty<'tcx>,
+    preds: &'tcx rustc_middle::ty::List<rustc_middle::ty::PolyExistentialPredicate<'tcx>>,
+) -> Vec<rustc_middle::ty::VtblEntry<'tcx>> {
+    match preds.principal() {
+        Some(trait_) => {
+            let trait_ref = trait_.with_self_ty(tcx, concrete);
+            let trait_ref =
+                tcx.erase_and_anonymize_regions(tcx.instantiate_bound_regions_with_erased(trait_ref));
+            tcx.vtable_entries(trait_ref).to_vec()
+        }
+        None => TyCtxt::COMMON_VTABLE_ENTRIES.to_vec(),
+    }
+}
+
+/// `true` iff `ty` is fully monomorphic (no generic parameters, inference
+/// variables, or escaping bound variables), i.e. a vtable can be built for it.
+fn is_vtable_monomorphic(ty: Ty<'_>) -> bool {
+    use rustc_middle::ty::TypeVisitableExt;
+    !ty.has_param() && !ty.has_escaping_bound_vars() && !ty.has_infer()
+}
+
+/// Every concrete `VtblEntry::Method(instance)` of the `(concrete, dyn_ty)`
+/// vtable, as `(def_id, args)` callee pairs (Condition `C6`): a virtual call
+/// through this vtable may enter any of them, so `collect_referenced_callees`
+/// must capture their bodies even though no direct call names them.
+///
+/// `rustc` (`compiler/rustc_middle/src/ty/vtable.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+///
+/// > ```text
+/// > /// dispatchable associated function
+/// > Method(Instance<'tcx>),
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L22-L23
+pub fn vtable_method_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    concrete: Ty<'tcx>,
+    dyn_ty: Ty<'tcx>,
+) -> Vec<(DefId, Option<rustc_middle::ty::GenericArgsRef<'tcx>>)> {
+    let TyKind::Dynamic(preds, _) = *dyn_ty.kind() else {
+        return Vec::new();
+    };
+    if !is_vtable_monomorphic(concrete) || !is_vtable_monomorphic(dyn_ty) {
+        return Vec::new();
+    }
+    vtable_entries_for(tcx, concrete, preds)
+        .into_iter()
+        .filter_map(|e| match e {
+            rustc_middle::ty::VtblEntry::Method(instance) => {
+                Some((instance.def_id(), Some(tcx.erase_and_anonymize_regions(instance.args))))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `(concrete, dyn)` pair reachable from `Rvalue::Cast(Unsize)` in
+/// `body`, plus every `(dyn Sub, dyn Super)` upcast pair.
+fn collect_body_unsize_pairs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner_def_id: DefId,
+    body: &Body<'tcx>,
+    concrete_pairs: &mut Vec<(Ty<'tcx>, Ty<'tcx>)>,
+    upcast_pairs: &mut Vec<(Ty<'tcx>, Ty<'tcx>)>,
+) {
+    use rustc_middle::ty::adjustment::PointerCoercion;
+    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, owner_def_id);
+    for bb in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            let StatementKind::Assign(assign) = &stmt.kind else {
+                continue;
+            };
+            let (_, ref rvalue) = **assign;
+            let Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::Unsize, _), op, target_ty) =
+                rvalue
+            else {
+                continue;
+            };
+            let src_ty = tcx.erase_and_anonymize_regions(op.ty(&body.local_decls, tcx));
+            let dst_ty = tcx.erase_and_anonymize_regions(*target_ty);
+            let Some((s, d)) = unsize_pointee_tails(tcx, typing_env, src_ty, dst_ty, 0) else {
+                continue;
+            };
+            if !matches!(d.kind(), TyKind::Dynamic(..)) {
+                continue;
+            }
+            if matches!(s.kind(), TyKind::Dynamic(..)) {
+                if s != d && is_vtable_monomorphic(s) && is_vtable_monomorphic(d) {
+                    upcast_pairs.push((s, d));
+                }
+            } else if is_vtable_monomorphic(s) && is_vtable_monomorphic(d) {
+                concrete_pairs.push((s, d));
+            }
+        }
+    }
+}
+
+/// Every `GlobalAlloc::VTable(ty, dyn_ty)` reachable from the constants of
+/// `body` (through nested `GlobalAlloc::Memory` provenance).
+fn collect_body_vtable_allocs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    concrete_pairs: &mut Vec<(Ty<'tcx>, Ty<'tcx>)>,
+) {
+    fn visit<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        alloc_id: AllocId,
+        seen: &mut BTreeSet<AllocId>,
+        out: &mut Vec<(Ty<'tcx>, Ty<'tcx>)>,
+    ) {
+        if !seen.insert(alloc_id) {
+            return;
+        }
+        match tcx.try_get_global_alloc(alloc_id) {
+            Some(GlobalAlloc::VTable(ty, preds)) => {
+                let dyn_ty = Ty::new_dynamic(tcx, preds, tcx.lifetimes.re_erased);
+                if is_vtable_monomorphic(ty) && is_vtable_monomorphic(dyn_ty) {
+                    out.push((ty, dyn_ty));
+                }
+            }
+            Some(GlobalAlloc::Memory(mem)) => {
+                for &(_, prov) in mem.inner().provenance().ptrs().iter() {
+                    visit(tcx, prov.alloc_id(), seen, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for bb in body.basic_blocks.iter() {
+        let mut ops: Vec<&Operand<'tcx>> = Vec::new();
+        for stmt in &bb.statements {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (_, ref rvalue) = **assign;
+                match rvalue {
+                    Rvalue::Use(op, ..) | Rvalue::Cast(_, op, _) | Rvalue::Repeat(op, _) => {
+                        ops.push(op)
+                    }
+                    Rvalue::Aggregate(_, fields) => ops.extend(fields.iter()),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(term) = &bb.terminator
+            && let TerminatorKind::Call { args, .. } = &term.kind
+        {
+            ops.extend(args.iter().map(|a| &a.node));
+        }
+        for op in ops {
+            if let Operand::Constant(c) = op
+                && let Const::Val(cv, _) = c.const_
+            {
+                match cv {
+                    ConstValue::Scalar(Scalar::Ptr(ptr, _)) => {
+                        let (prov, _) = ptr.prov_and_relative_offset();
+                        visit(tcx, prov.alloc_id(), &mut seen, concrete_pairs);
+                    }
+                    ConstValue::Slice { alloc_id, .. } | ConstValue::Indirect { alloc_id, .. } => {
+                        visit(tcx, alloc_id, &mut seen, concrete_pairs);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Every `InstanceKind::Virtual(def_id, idx)` call target of `body`, as
+/// `(trait method def_id, Self trait-object type, idx)`.
+///
+/// `rustc` (`compiler/rustc_middle/src/ty/instance.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+///
+/// > ```text
+/// > /// Dynamic dispatch to `<dyn Trait as Trait>::fn`.
+/// > ...
+/// > Virtual(DefId, usize),
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/instance.rs#L109-L117
+fn collect_body_virtual_calls<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner_def_id: DefId,
+    body: &Body<'tcx>,
+    out: &mut Vec<(DefId, Ty<'tcx>, usize)>,
+) {
+    use rustc_middle::ty::TypeVisitableExt;
+    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, owner_def_id);
+    for bb in body.basic_blocks.iter() {
+        let Some(term) = &bb.terminator else {
+            continue;
+        };
+        let func = match &term.kind {
+            TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
+            _ => continue,
+        };
+        let Some((def_id, args)) = func.const_fn_def() else {
+            continue;
+        };
+        let args = tcx.erase_and_anonymize_regions(args);
+        if args.has_escaping_bound_vars() {
+            continue;
+        }
+        let resolve_env = if !args.has_non_region_param() {
+            rustc_middle::ty::TypingEnv::fully_monomorphized()
+        } else {
+            typing_env
+        };
+        if let Ok(Some(instance)) =
+            rustc_middle::ty::Instance::try_resolve(tcx, resolve_env, def_id, args)
+            && let rustc_middle::ty::InstanceKind::Virtual(method_def_id, idx) = instance.def
+            && let Some(self_ty) = args.types().next()
+            && matches!(self_ty.kind(), TyKind::Dynamic(..))
+        {
+            out.push((method_def_id, self_ty, idx));
+        }
+    }
+}
+
+/// Computes the crate-level `dyn Trait` metadata of the local crate: every
+/// `(concrete, dyn)` vtable reachable from an `Unsize` coercion or a
+/// `GlobalAlloc::VTable` constant in a capturable local body, closed under
+/// trait upcasting (`dyn Sub -> dyn Super` casts) and supertrait `TraitVPtr`
+/// slots; the `CapturedDynType` descriptor of every involved trait object; and
+/// every `InstanceKind::Virtual` call target (Conditions `C6`/`C7`).
+///
+/// Determinism: vtables are sorted by `(dyn key, rendered concrete type)` and
+/// numbered densely (`vtable_alloc_id = VTABLE_ALLOC_BASE + vtable_id`);
+/// descriptors by key; virtual methods by `(method path, dyn key, slot)`.
+/// Pairs beyond `VTABLE_ALLOC_SPAN` are dropped (their unsizings are then
+/// `.unsupported`).
+pub fn compute_crate_dyn_metadata<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    anchor_def_id: DefId,
+) -> crate::lean_emit::IrDynMetadata {
+    use crate::lean_emit::{
+        IrDynMetadata, IrDynType, IrVTable, IrVTableSlot, IrVirtualMethod, VTABLE_ALLOC_BASE,
+        VTABLE_ALLOC_SPAN,
+    };
+    let mut concrete_pairs = Vec::new();
+    let mut upcast_pairs = Vec::new();
+    let mut virtual_calls = Vec::new();
+    for &local_def_id in tcx.mir_keys(()).iter() {
+        if !should_capture_mir_item(tcx, local_def_id) {
+            continue;
+        }
+        let def_id = local_def_id.to_def_id();
+        let body = query_post_cleanup_mir(tcx, local_def_id);
+        collect_body_unsize_pairs(tcx, def_id, body, &mut concrete_pairs, &mut upcast_pairs);
+        collect_body_vtable_allocs(tcx, body, &mut concrete_pairs);
+        collect_body_virtual_calls(tcx, def_id, body, &mut virtual_calls);
+    }
+    if concrete_pairs.is_empty() && virtual_calls.is_empty() {
+        return IrDynMetadata::default();
+    }
+
+    // Types lowered here are monomorphic, so the anchor item only seeds the
+    // layout builder's typing environment.
+    let mut ctx = MirLowerCtx::new(tcx, anchor_def_id, BTreeMap::new());
+    let render_ty = |ctx: &mut MirLowerCtx<'tcx>, ty: Ty<'tcx>| {
+        crate::lean_emit::render_rigid_ty_pub(&ctx.lower_rigid_ty(ty))
+    };
+    let dyn_key_of = |ty: Ty<'tcx>| match *ty.kind() {
+        TyKind::Dynamic(preds, _) => Some(dyn_type_key(tcx, ty, preds)),
+        _ => None,
+    };
+
+    // Worklist closure over upcasts and supertrait `TraitVPtr` slots.
+    let mut pairs: BTreeMap<(String, String), (Ty<'tcx>, Ty<'tcx>)> = BTreeMap::new();
+    let mut queue: Vec<(Ty<'tcx>, Ty<'tcx>)> = concrete_pairs;
+    let mut rounds = 0usize;
+    while let Some((concrete, dyn_ty)) = queue.pop() {
+        rounds += 1;
+        if rounds > 4 * VTABLE_ALLOC_SPAN as usize {
+            break;
+        }
+        let Some(key) = dyn_key_of(dyn_ty) else {
+            continue;
+        };
+        let conc = render_ty(&mut ctx, concrete);
+        if pairs.contains_key(&(key.clone(), conc.clone())) {
+            continue;
+        }
+        pairs.insert((key, conc), (concrete, dyn_ty));
+        for &(sub, sup) in &upcast_pairs {
+            if sub == dyn_ty {
+                queue.push((concrete, sup));
+            }
+        }
+        if let TyKind::Dynamic(preds, region) = *dyn_ty.kind() {
+            for entry in vtable_entries_for(tcx, concrete, preds) {
+                if let rustc_middle::ty::VtblEntry::TraitVPtr(trait_ref) = entry {
+                    let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref);
+                    let sup_preds = tcx.mk_poly_existential_predicates(&[
+                        rustc_middle::ty::Binder::dummy(rustc_middle::ty::ExistentialPredicate::Trait(ex)),
+                    ]);
+                    queue.push((concrete, Ty::new_dynamic(tcx, sup_preds, region)));
+                }
+            }
+        }
+    }
+
+    let ordered: Vec<((String, String), (Ty<'tcx>, Ty<'tcx>))> = pairs
+        .into_iter()
+        .take(VTABLE_ALLOC_SPAN as usize)
+        .collect();
+    let id_of: BTreeMap<(String, String), u64> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, (k, _))| (k.clone(), i as u64))
+        .collect();
+
+    let mut dyn_types: BTreeMap<String, IrDynType> = BTreeMap::new();
+    let mut record_dyn = |ctx: &mut MirLowerCtx<'tcx>, dyn_ty: Ty<'tcx>| {
+        use rustc_middle::ty::TypeVisitableExt;
+        let TyKind::Dynamic(preds, _) = *dyn_ty.kind() else {
+            return;
+        };
+        let key = dyn_type_key(tcx, dyn_ty, preds);
+        if dyn_types.contains_key(&key) {
+            return;
+        }
+        let principal = preds.principal();
+        let mut auto_traits: Vec<String> =
+            preds.auto_traits().map(|d| canonical_def_path(tcx, d)).collect();
+        auto_traits.sort();
+        auto_traits.dedup();
+        let type_args = principal
+            .map(|p| p.skip_binder().args.types().map(|t| ctx.lower_rigid_ty(t)).collect())
+            .unwrap_or_default();
+        let mut assoc_bindings: Vec<(String, crate::lean_emit::IrRigidTy)> = preds
+            .projection_bounds()
+            .filter_map(|p| {
+                let p = p.skip_binder();
+                let t = p.term.as_type()?;
+                Some((format!("{:?}", p.def_id), ctx.lower_rigid_ty(t)))
+            })
+            .collect();
+        assoc_bindings.sort_by(|a, b| a.0.cmp(&b.0));
+        dyn_types.insert(
+            key.clone(),
+            IrDynType {
+                dyn_key: key,
+                predicate_key: dyn_predicate_key(tcx, preds),
+                principal_trait: preds.principal_def_id().map(|d| canonical_def_path(tcx, d)),
+                type_args,
+                assoc_bindings,
+                auto_traits,
+                has_unresolved_existential_binder: preds.iter().any(|p| !p.bound_vars().is_empty())
+                    || preds.has_escaping_bound_vars(),
+                supertrait_outlives_ok: true,
+            },
+        );
+    };
+
+    let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
+    let mut vtables = Vec::with_capacity(ordered.len());
+    for (idx, ((key, _), (concrete, dyn_ty))) in ordered.iter().enumerate() {
+        record_dyn(&mut ctx, *dyn_ty);
+        let TyKind::Dynamic(preds, region) = *dyn_ty.kind() else {
+            continue;
+        };
+        let Ok(layout) = tcx.layout_of(typing_env.as_query_input(*concrete)) else {
+            continue;
+        };
+        let slots = vtable_entries_for(tcx, *concrete, preds)
+            .into_iter()
+            .map(|e| match e {
+                rustc_middle::ty::VtblEntry::MetadataDropInPlace => IrVTableSlot::DropInPlace(
+                    concrete
+                        .needs_drop(tcx, typing_env)
+                        .then(|| String::from("core::ptr::drop_in_place")),
+                ),
+                rustc_middle::ty::VtblEntry::MetadataSize => IrVTableSlot::Size,
+                rustc_middle::ty::VtblEntry::MetadataAlign => IrVTableSlot::Align,
+                rustc_middle::ty::VtblEntry::Vacant => IrVTableSlot::Vacant,
+                rustc_middle::ty::VtblEntry::Method(instance) => IrVTableSlot::Method(
+                    canonical_def_path(tcx, instance.def_id()),
+                    tcx.erase_and_anonymize_regions(instance.args)
+                        .types()
+                        .map(|t| ctx.lower_rigid_ty(t))
+                        .collect(),
+                ),
+                rustc_middle::ty::VtblEntry::TraitVPtr(trait_ref) => {
+                    let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref);
+                    let sup_preds = tcx.mk_poly_existential_predicates(&[
+                        rustc_middle::ty::Binder::dummy(rustc_middle::ty::ExistentialPredicate::Trait(ex)),
+                    ]);
+                    let sup_ty = Ty::new_dynamic(tcx, sup_preds, region);
+                    let sup_key = dyn_type_key(tcx, sup_ty, sup_preds);
+                    let conc = render_ty(&mut ctx, *concrete);
+                    match id_of.get(&(sup_key, conc)) {
+                        Some(&id) => IrVTableSlot::TraitVPtr(id),
+                        None => IrVTableSlot::Vacant,
+                    }
+                }
+            })
+            .collect();
+        vtables.push(IrVTable {
+            vtable_id: idx as u64,
+            vtable_alloc_id: VTABLE_ALLOC_BASE + idx as u64,
+            concrete_ty: ctx.lower_rigid_ty(*concrete),
+            dyn_key: key.clone(),
+            size_bytes: layout.size.bytes(),
+            align_bytes: layout.align.abi.bytes(),
+            is_uninhabited: layout.uninhabited,
+            primary_super_vtable_id: None,
+            slots,
+        });
+    }
+    for &(sub, sup) in &upcast_pairs {
+        record_dyn(&mut ctx, sub);
+        record_dyn(&mut ctx, sup);
+    }
+
+    let mut virtual_methods: Vec<IrVirtualMethod> = virtual_calls
+        .iter()
+        .filter_map(|&(method_def_id, self_ty, idx)| {
+            record_dyn(&mut ctx, self_ty);
+            Some(IrVirtualMethod {
+                method_def_path: canonical_def_path(tcx, method_def_id),
+                dyn_key: dyn_key_of(self_ty)?,
+                slot_idx: idx as u64,
+            })
+        })
+        .collect();
+    virtual_methods.sort_by(|a, b| {
+        (&a.method_def_path, &a.dyn_key, a.slot_idx).cmp(&(&b.method_def_path, &b.dyn_key, b.slot_idx))
+    });
+    virtual_methods.dedup();
+
+    IrDynMetadata {
+        dyn_types: dyn_types.into_values().collect(),
+        vtables,
+        virtual_methods,
+    }
+}
+
+thread_local! {
+    /// Identity of the capture session whose metadata is currently published
+    /// through `lean_emit::set_session_dyn_metadata`.
+    static DYN_METADATA_SESSION: std::cell::RefCell<Option<(usize, String, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Ensures the crate-level `dyn` metadata of the session owning `tcx` has been
+/// computed and published for `lean_emit` (once per session); `anchor_def_id`
+/// is any item with generics (the body being lowered).
+pub fn ensure_session_dyn_metadata(tcx: TyCtxt<'_>, anchor_def_id: DefId) {
+    let key = (
+        tcx.sess as *const _ as usize,
+        tcx.crate_name(LOCAL_CRATE).as_str().to_owned(),
+        tcx.stable_crate_id(LOCAL_CRATE).as_u64(),
+    );
+    let fresh = DYN_METADATA_SESSION.with(|cell| cell.borrow().as_ref() != Some(&key));
+    if fresh {
+        let md = compute_crate_dyn_metadata(tcx, anchor_def_id);
+        crate::lean_emit::set_session_dyn_metadata(md);
+        DYN_METADATA_SESSION.with(|cell| *cell.borrow_mut() = Some(key));
+    }
+}

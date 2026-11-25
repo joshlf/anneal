@@ -2104,4 +2104,158 @@ pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
 
         let _ = fs::remove_dir_all(&temp_root);
     }
+
+    #[test]
+    fn driver_captures_dyn_trait_vtables_and_virtual_methods() {
+        // Episode 1 (`ws-tcb-dyn-trait-unsize-and-vtable-dispatch`), Conditions
+        // `C6`/`C7`: every captured body of the session carries the identical,
+        // deterministic crate-level `dynTypes` / `vtables` / `virtualMethods`
+        // tables; trait upcasting closes the vtable set; `dyn Tr + Send` keys
+        // distinctly from `dyn Tr`; and `Any::type_id` (a vtable method of a
+        // non-local trait) is collected as a referenced callee.
+        let temp_root = unique_temp_dir("dyn-trait");
+        let capture_dir = temp_root.join("capture");
+        let out_dir = temp_root.join("out");
+        fs::create_dir_all(&capture_dir).expect("create capture dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        let src_path = temp_root.join("demo_dyn.rs");
+        let sample_rust = r#"#![allow(dead_code)]
+pub trait Shape {
+    fn area(&self) -> u32;
+    fn scale(&mut self, k: u32);
+}
+pub trait Named: Shape {
+    fn name_len(&self) -> u32;
+}
+pub struct Sq(pub u32);
+pub struct Rect(pub u32, pub u32);
+impl Shape for Sq {
+    fn area(&self) -> u32 { self.0 * self.0 }
+    fn scale(&mut self, k: u32) { self.0 *= k; }
+}
+impl Shape for Rect {
+    fn area(&self) -> u32 { self.0 * self.1 }
+    fn scale(&mut self, k: u32) { self.0 *= k; }
+}
+impl Named for Sq {
+    fn name_len(&self) -> u32 { 2 }
+}
+pub fn use_dyn(x: u32) -> u32 {
+    let s = Sq(x);
+    let r = Rect(x, 2);
+    let a: &dyn Shape = &s;
+    let b: &dyn Shape = &r;
+    let n: &dyn Named = &s;
+    let up: &dyn Shape = n;
+    a.area() + b.area() + n.name_len() + up.area()
+}
+pub fn use_raw(p: *const Sq) -> *const dyn Shape {
+    p as *const dyn Shape
+}
+pub fn use_send(s: &Sq) -> &(dyn Shape + Send) {
+    s
+}
+pub fn use_any(x: &u32) -> &dyn core::any::Any {
+    x
+}
+"#;
+        fs::write(&src_path, sample_rust.as_bytes()).expect("write sample rust source");
+        let args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "demo_dyn".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            "--edition=2024".to_owned(),
+            "--out-dir".to_owned(),
+            out_dir.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run_with_args(&args, Some(capture_dir.clone()), None), 0);
+
+        let crate_capture_dir = capture_dir.join("demo_dyn");
+        let manifest_content =
+            fs::read_to_string(crate_capture_dir.join("UnitCaptureManifest.json")).unwrap();
+        let manifest: crate::manifest::UnitCaptureManifest =
+            crate::manifest::UnitCaptureManifest::from_json_str(&manifest_content).unwrap();
+        assert!(manifest.compilation_succeeded);
+        let lean_of = |def_id: &str| {
+            let rec = manifest
+                .unit_targets
+                .iter()
+                .find(|t| t.target.def_id == def_id)
+                .unwrap_or_else(|| panic!("missing target {def_id}"));
+            fs::read_to_string(crate_capture_dir.join(&rec.target.mir_module_path)).unwrap()
+        };
+        let use_dyn = lean_of("demo_dyn::use_dyn");
+        let tables = |src: &str| -> String {
+            src.lines()
+                .filter(|l| {
+                    l.trim_start().starts_with("dynTypes :=")
+                        || l.trim_start().starts_with("vtables :=")
+                        || l.trim_start().starts_with("virtualMethods :=")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let t = tables(&use_dyn);
+        assert!(t.contains("vtables := "), "missing vtables in:\n{use_dyn}");
+        // `(Sq, dyn Shape)`, `(Rect, dyn Shape)`, `(Sq, dyn Named)` vtables, with
+        // dense allocation identifiers from `VTABLE_ALLOC_BASE`.
+        assert!(t.contains(
+            "concreteTy := (RigidTy.adt \"demo_dyn::Sq\" List.nil), dynKey := \"demo_dyn::Shape\""
+        ));
+        assert!(t.contains(
+            "concreteTy := (RigidTy.adt \"demo_dyn::Rect\" List.nil), dynKey := \"demo_dyn::Shape\""
+        ));
+        assert!(t.contains(
+            "concreteTy := (RigidTy.adt \"demo_dyn::Sq\" List.nil), dynKey := \"demo_dyn::Named\""
+        ));
+        assert!(t.contains("vtableId := 0, vtableAllocId := 16384"));
+        // Header slots and the concrete `Shape::area` method of `Sq`.
+        assert!(t.contains(
+            "(CapturedVTableSlot.dropInPlace Option.none) (List.cons CapturedVTableSlot.size (List.cons CapturedVTableSlot.align"
+        ));
+        assert!(t.contains("(CapturedVTableSlot.method \"demo_dyn::<Sq as Shape>::area\" List.nil)"));
+        // `InstanceKind::Virtual` call targets.
+        assert!(t.contains(
+            "{ methodDefPath := \"demo_dyn::Shape::area\", dynKey := \"demo_dyn::Shape\", slotIdx := 3 }"
+        ));
+        assert!(t.contains("methodDefPath := \"demo_dyn::Named::name_len\", dynKey := \"demo_dyn::Named\""));
+        // `dyn Shape + Send` keys distinctly and records its auto trait.
+        assert!(t.contains("autoTraits := (List.cons \"core::marker::Send\" List.nil)"));
+        let use_send = lean_of("demo_dyn::use_send");
+        assert!(use_send.contains("(RigidTy.dynamic \"dyn Shape + core::marker::Send\")"));
+        assert!(t.contains("dynKey := \"dyn Shape + core::marker::Send\""));
+        // Every captured body of the session carries the identical tables (C7 determinism).
+        for def_id in ["demo_dyn::use_raw", "demo_dyn::use_send", "demo_dyn::use_any"] {
+            assert_eq!(tables(&lean_of(def_id)), t, "tables differ for {def_id}");
+        }
+        // `core::any::Any::type_id` of `u32` is reachable only through the vtable
+        // of `(u32, dyn Any)` and must still be collected (Condition `C6`).
+        assert!(
+            manifest
+                .unit_targets
+                .iter()
+                .any(|r| r.target.def_id.contains("type_id")),
+            "expected a captured `type_id` vtable callee; targets: {:?}",
+            manifest.unit_targets.iter().map(|t| &t.target.def_id).collect::<Vec<_>>()
+        );
+
+        // Re-capturing in the same thread (fresh session) is deterministic.
+        let capture_dir2 = temp_root.join("capture2");
+        fs::create_dir_all(&capture_dir2).expect("create capture dir 2");
+        assert_eq!(run_with_args(&args, Some(capture_dir2.clone()), None), 0);
+        let rec = manifest
+            .unit_targets
+            .iter()
+            .find(|t| t.target.def_id == "demo_dyn::use_dyn")
+            .unwrap();
+        let again =
+            fs::read_to_string(capture_dir2.join("demo_dyn").join(&rec.target.mir_module_path))
+                .unwrap();
+        assert_eq!(tables(&again), t);
+        let _ = fs::remove_dir_all(&temp_root);
+    }
 }

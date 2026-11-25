@@ -1824,6 +1824,292 @@ fn render_trait_impl_entry(e: &IrTraitImplEntry) -> String {
     )
 }
 
+/// Synthetic `AllocId` base of the vtable range, mirroring
+/// `Trusted.Rustc.V2026_06_01.MirSemantics.vtableAllocBase` (`16384`).
+///
+/// Modeling choice (not a `rustc` property): `rustc` vtable `AllocId`s are
+/// interned per session; the capture renumbers them densely as
+/// `VTABLE_ALLOC_BASE + vtable_id` so the Lean `vtableEnvOk` invariant can
+/// check disjointness from globals, function pointers, and stack-local pages.
+pub const VTABLE_ALLOC_BASE: u64 = 16384;
+
+/// Width of the synthetic vtable `AllocId` range
+/// (`Trusted.Rustc.V2026_06_01.MirSemantics.vtableAllocSpan`).
+pub const VTABLE_ALLOC_SPAN: u64 = 16384;
+
+/// One vtable slot corresponding to
+/// `Trusted.Rustc.V2026_06_01.MirAst.CapturedVTableSlot`, lowered from
+/// `rustc_middle::ty::vtable::VtblEntry`.
+///
+/// `rustc` (`compiler/rustc_middle/src/ty/vtable.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) defines:
+///
+/// > ```text
+/// > pub enum VtblEntry<'tcx> {
+/// >     /// destructor of this type (used in vtable header)
+/// >     MetadataDropInPlace,
+/// >     /// layout size of this type (used in vtable header)
+/// >     MetadataSize,
+/// >     /// layout align of this type (used in vtable header)
+/// >     MetadataAlign,
+/// >     /// non-dispatchable associated function that is excluded from trait object
+/// >     Vacant,
+/// >     /// dispatchable associated function
+/// >     Method(Instance<'tcx>),
+/// >     /// pointer to a separate supertrait vtable, can be used by trait upcasting coercion
+/// >     TraitVPtr(TraitRef<'tcx>),
+/// > }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L13-L26
+///
+/// Modeling choices: `DropInPlace` carries the canonical path of the drop glue
+/// when the concrete type needs dropping (`None` otherwise); `Method` carries
+/// the resolved instance's canonical `DefId` path and erased generic
+/// arguments; `TraitVPtr` names the target vtable by its dense `vtable_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IrVTableSlot {
+    /// `VtblEntry::MetadataDropInPlace`.
+    DropInPlace(Option<String>),
+    /// `VtblEntry::MetadataSize`.
+    Size,
+    /// `VtblEntry::MetadataAlign`.
+    Align,
+    /// `VtblEntry::Vacant`.
+    Vacant,
+    /// `VtblEntry::Method(instance)`: `(def path, generic args)`.
+    Method(String, Vec<IrRigidTy>),
+    /// `VtblEntry::TraitVPtr(trait_ref)`: target `vtable_id`.
+    TraitVPtr(u64),
+}
+
+/// Existential-predicate descriptor of one `dyn Trait` type corresponding to
+/// `Trusted.Rustc.V2026_06_01.MirAst.CapturedDynType`, lowered from
+/// `TyKind::Dynamic(preds, _)`.
+///
+/// `rustc` (`compiler/rustc_type_ir/src/ty_kind.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) defines:
+///
+/// > ```text
+/// > /// A trait object. Written as `dyn for<'b> Trait<'b, Assoc = u32> + Send + 'a`.
+/// > Dynamic(I::BoundExistentialPredicates, I::Region),
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_type_ir/src/ty_kind.rs#L197-L198
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrDynType {
+    /// Canonical `RigidTy.dynamic` key (see `mir_lower::dyn_type_key`).
+    pub dyn_key: String,
+    /// Canonical key of the predicates without auto traits.
+    pub predicate_key: String,
+    /// Canonical path of the principal trait, if any.
+    pub principal_trait: Option<String>,
+    /// Erased generic arguments of the principal trait (excluding `Self`).
+    pub type_args: Vec<IrRigidTy>,
+    /// Projection bounds `(associated item name, type)` in canonical order.
+    pub assoc_bindings: Vec<(String, IrRigidTy)>,
+    /// Canonical paths of the auto traits, sorted and deduplicated.
+    pub auto_traits: Vec<String>,
+    /// `true` when a predicate carries bound variables (`charon#1640`).
+    pub has_unresolved_existential_binder: bool,
+    /// `false` when an outlives obligation was not discharged.
+    pub supertrait_outlives_ok: bool,
+}
+
+/// Captured vtable of one `(concrete type, dyn Trait)` pair corresponding to
+/// `Trusted.Rustc.V2026_06_01.MirAst.CapturedVTable` (the `GlobalAlloc::VTable`
+/// allocation a wide pointer's metadata designates).
+///
+/// `rustc` (`compiler/rustc_const_eval/src/interpret/memory.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) resolves a vtable pointer as:
+///
+/// > ```text
+/// > let Some(GlobalAlloc::VTable(ty, vtable_dyn_type)) =
+/// >     self.tcx.try_get_global_alloc(alloc_id)
+/// > else {
+/// >     throw_ub!(InvalidVTablePointer(Pointer::new(alloc_id, offset)))
+/// > };
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/memory.rs#L1078-L1082
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrVTable {
+    /// Dense deterministic index.
+    pub vtable_id: u64,
+    /// `VTABLE_ALLOC_BASE + vtable_id`.
+    pub vtable_alloc_id: u64,
+    /// The concrete type.
+    pub concrete_ty: IrRigidTy,
+    /// `RigidTy.dynamic` key of the trait object type.
+    pub dyn_key: String,
+    /// `layout_of(concrete_ty).size`.
+    pub size_bytes: u64,
+    /// `layout_of(concrete_ty).align.abi`.
+    pub align_bytes: u64,
+    /// `layout_of(concrete_ty).uninhabited`.
+    pub is_uninhabited: bool,
+    /// Supertrait vtable laid out as a prefix (not computed: always `None`).
+    pub primary_super_vtable_id: Option<u64>,
+    /// `tcx.vtable_entries(..)` in order.
+    pub slots: Vec<IrVTableSlot>,
+}
+
+/// `InstanceKind::Virtual(def_id, idx)` call target record corresponding to
+/// `Trusted.Rustc.V2026_06_01.MirAst.CapturedVirtualMethod`.
+///
+/// `rustc` (`compiler/rustc_middle/src/ty/instance.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) defines:
+///
+/// > ```text
+/// > /// Dynamic dispatch to `<dyn Trait as Trait>::fn`.
+/// > ///
+/// > /// This `InstanceKind` may have a callable MIR as the default implementation.
+/// > /// Calls to `Virtual` instances must be codegen'd as virtual calls through the vtable.
+/// > /// *This means we might not know exactly what is being called.*
+/// > ...
+/// > Virtual(DefId, usize),
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/instance.rs#L109-L117
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrVirtualMethod {
+    /// Canonical path of the trait method (`def_id`).
+    pub method_def_path: String,
+    /// `RigidTy.dynamic` key of the receiver trait object (`Self`).
+    pub dyn_key: String,
+    /// Vtable slot index (`idx`).
+    pub slot_idx: u64,
+}
+
+/// Crate-level `dyn Trait` metadata of one capture session, attached to every
+/// `CapturedMir` emitted in that session (`dynTypes`, `vtables`,
+/// `virtualMethods`). All vectors are deterministically sorted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IrDynMetadata {
+    /// `CapturedMir.dynTypes`.
+    pub dyn_types: Vec<IrDynType>,
+    /// `CapturedMir.vtables`.
+    pub vtables: Vec<IrVTable>,
+    /// `CapturedMir.virtualMethods`.
+    pub virtual_methods: Vec<IrVirtualMethod>,
+}
+
+impl IrDynMetadata {
+    /// `true` when the session captured no `dyn` metadata at all.
+    pub fn is_empty(&self) -> bool {
+        self.dyn_types.is_empty() && self.vtables.is_empty() && self.virtual_methods.is_empty()
+    }
+}
+
+thread_local! {
+    /// Crate-level `dyn` metadata of the capture session running on this
+    /// thread. `IrCapturedMir` is constructed by struct literal in downstream
+    /// crates, so the session tables travel beside it rather than as new
+    /// fields; `mir_lower::lower_mir_body` (re)computes them once per session
+    /// before the first body of the session is emitted.
+    static SESSION_DYN_METADATA: std::cell::RefCell<IrDynMetadata> =
+        std::cell::RefCell::new(IrDynMetadata::default());
+}
+
+/// Replace the current session's crate-level `dyn` metadata.
+pub fn set_session_dyn_metadata(md: IrDynMetadata) {
+    SESSION_DYN_METADATA.with(|cell| *cell.borrow_mut() = md);
+}
+
+/// Snapshot of the current session's crate-level `dyn` metadata.
+pub fn session_dyn_metadata() -> IrDynMetadata {
+    SESSION_DYN_METADATA.with(|cell| cell.borrow().clone())
+}
+
+fn render_vtable_slot(s: &IrVTableSlot) -> String {
+    match s {
+        IrVTableSlot::DropInPlace(None) => String::from("(CapturedVTableSlot.dropInPlace Option.none)"),
+        IrVTableSlot::DropInPlace(Some(p)) => {
+            format!("(CapturedVTableSlot.dropInPlace (Option.some {}))", render_lean_str(p))
+        }
+        IrVTableSlot::Size => String::from("CapturedVTableSlot.size"),
+        IrVTableSlot::Align => String::from("CapturedVTableSlot.align"),
+        IrVTableSlot::Vacant => String::from("CapturedVTableSlot.vacant"),
+        IrVTableSlot::Method(p, args) => format!(
+            "(CapturedVTableSlot.method {} {})",
+            render_lean_str(p),
+            render_list(args, render_rigid_ty_pub)
+        ),
+        IrVTableSlot::TraitVPtr(id) => format!("(CapturedVTableSlot.traitVPtr {id})"),
+    }
+}
+
+fn render_option_str(o: &Option<String>) -> String {
+    match o {
+        Some(s) => format!("(Option.some {})", render_lean_str(s)),
+        None => String::from("Option.none"),
+    }
+}
+
+fn render_dyn_type(d: &IrDynType) -> String {
+    format!(
+        "{{ dynKey := {}, predicateKey := {}, principalTrait? := {}, typeArgs := {}, assocBindings := {}, autoTraits := {}, hasUnresolvedExistentialBinder := {}, supertraitOutlivesOk := {} }}",
+        render_lean_str(&d.dyn_key),
+        render_lean_str(&d.predicate_key),
+        render_option_str(&d.principal_trait),
+        render_list(&d.type_args, render_rigid_ty_pub),
+        render_list(&d.assoc_bindings, |(n, t)| format!(
+            "({}, {})",
+            render_lean_str(n),
+            render_rigid_ty_pub(t)
+        )),
+        render_list(&d.auto_traits, |s| render_lean_str(s)),
+        render_bool(d.has_unresolved_existential_binder),
+        render_bool(d.supertrait_outlives_ok)
+    )
+}
+
+fn render_vtable(v: &IrVTable) -> String {
+    let sup = match v.primary_super_vtable_id {
+        Some(id) => format!("(Option.some {id})"),
+        None => String::from("Option.none"),
+    };
+    format!(
+        "{{ vtableId := {}, vtableAllocId := {}, concreteTy := {}, dynKey := {}, sizeBytes := {}, alignBytes := {}, isUninhabited := {}, primarySuperVTableId? := {sup}, slots := {} }}",
+        v.vtable_id,
+        v.vtable_alloc_id,
+        render_rigid_ty_pub(&v.concrete_ty),
+        render_lean_str(&v.dyn_key),
+        v.size_bytes,
+        v.align_bytes,
+        render_bool(v.is_uninhabited),
+        render_list(&v.slots, render_vtable_slot)
+    )
+}
+
+fn render_virtual_method(m: &IrVirtualMethod) -> String {
+    format!(
+        "{{ methodDefPath := {}, dynKey := {}, slotIdx := {} }}",
+        render_lean_str(&m.method_def_path),
+        render_lean_str(&m.dyn_key),
+        m.slot_idx
+    )
+}
+
+/// Render the `dynTypes` / `vtables` / `virtualMethods` `CapturedMir` fields of
+/// `md` (omitting empty lists, which default to `.nil` in Lean).
+pub fn render_dyn_metadata_fields(md: &IrDynMetadata) -> String {
+    let mut out = String::new();
+    if !md.dyn_types.is_empty() {
+        out.push_str(&format!("    dynTypes := {},\n", render_list(&md.dyn_types, render_dyn_type)));
+    }
+    if !md.vtables.is_empty() {
+        out.push_str(&format!("    vtables := {},\n", render_list(&md.vtables, render_vtable)));
+    }
+    if !md.virtual_methods.is_empty() {
+        out.push_str(&format!(
+            "    virtualMethods := {},\n",
+            render_list(&md.virtual_methods, render_virtual_method)
+        ));
+    }
+    out
+}
+
 fn render_captured_mir(mir: &IrCapturedMir) -> String {
     let mut out = String::from("{\n");
     out.push_str(&format!("    defPath := {},\n", render_lean_str(&mir.def_path)));
@@ -1838,6 +2124,7 @@ fn render_captured_mir(mir: &IrCapturedMir) -> String {
     if !mir.trait_impls.is_empty() {
         out.push_str(&format!("    traitImpls := {},\n", render_list(&mir.trait_impls, render_trait_impl_entry)));
     }
+    out.push_str(&render_dyn_metadata_fields(&session_dyn_metadata()));
     out.push_str(&format!("    argCount := {},\n", mir.arg_count));
     out.push_str(&format!("    localDecls := {},\n", render_list(&mir.local_decls, render_local_decl)));
     out.push_str(&format!("    basicBlocks := {},\n", render_list(&mir.basic_blocks, render_basic_block_data)));
@@ -2044,5 +2331,52 @@ mod tests {
         assert!(code.contains("traitImpls := (List.cons { traitRef := { defPath := \"demo::MyTrait::method\", args := (List.cons (RigidTy.adt \"demo::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil)) List.nil) }, implPath := \"demo::<Wrapper<T> as MyTrait>::method\" } List.nil)"));
         assert!(code.contains("(RigidTy.alias \"demo::MyTrait::Assoc\" (List.cons (RigidTy.param 0 \"T\") List.nil))"));
         assert!(code.contains("fieldLayouts := (List.cons 0 (List.cons 0 List.nil))"));
+    }
+
+    #[test]
+    fn render_dyn_metadata_fields_is_deterministic_and_omits_empty() {
+        assert_eq!(render_dyn_metadata_fields(&IrDynMetadata::default()), "");
+        let md = IrDynMetadata {
+            dyn_types: vec![IrDynType {
+                dyn_key: String::from("demo::Tr"),
+                predicate_key: String::from("Trait(Tr)"),
+                principal_trait: Some(String::from("demo::Tr")),
+                type_args: vec![],
+                assoc_bindings: vec![],
+                auto_traits: vec![],
+                has_unresolved_existential_binder: false,
+                supertrait_outlives_ok: true,
+            }],
+            vtables: vec![IrVTable {
+                vtable_id: 0,
+                vtable_alloc_id: VTABLE_ALLOC_BASE,
+                concrete_ty: IrRigidTy::Uint(IrUintTy::U32),
+                dyn_key: String::from("demo::Tr"),
+                size_bytes: 4,
+                align_bytes: 4,
+                is_uninhabited: false,
+                primary_super_vtable_id: None,
+                slots: vec![
+                    IrVTableSlot::DropInPlace(None),
+                    IrVTableSlot::Size,
+                    IrVTableSlot::Align,
+                    IrVTableSlot::Method(String::from("demo::<u32 as Tr>::m"), vec![]),
+                ],
+            }],
+            virtual_methods: vec![IrVirtualMethod {
+                method_def_path: String::from("demo::Tr::m"),
+                dyn_key: String::from("demo::Tr"),
+                slot_idx: 3,
+            }],
+        };
+        let out = render_dyn_metadata_fields(&md);
+        assert_eq!(out, render_dyn_metadata_fields(&md.clone()));
+        assert!(out.contains("principalTrait? := (Option.some \"demo::Tr\")"));
+        assert!(out.contains("vtableAllocId := 16384, concreteTy := (RigidTy.uint UintTy.u32)"));
+        assert!(out.contains("(CapturedVTableSlot.method \"demo::<u32 as Tr>::m\" List.nil)"));
+        assert!(out.contains("virtualMethods := (List.cons { methodDefPath := \"demo::Tr::m\", dynKey := \"demo::Tr\", slotIdx := 3 } List.nil)"));
+        // No session metadata is attached outside a capture session.
+        set_session_dyn_metadata(IrDynMetadata::default());
+        assert!(session_dyn_metadata().is_empty());
     }
 }

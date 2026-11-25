@@ -1599,4 +1599,384 @@ def internFnPtr
     }
     (allocId, { mem with fnPtrs := entry :: mem.fnPtrs })
 
+/-!
+## `dyn Trait` vtable environment (Episode 1, `ws-tcb-dyn-trait-unsize-and-vtable-dispatch`)
+
+The vtable environment is harvested from the `CapturedMir.dynTypes` / `vtables`
+/ `virtualMethods` tables of captured bodies the machine already holds. No
+`Memory` / `MachineState` field and no `Value` constructor is added: wide `dyn`
+pointers are `Value.aggregate 0 [dataWord, .ptr vtPtr ptrBytes]`.
+
+Modeling choice (which bodies are consulted):
+- `Rvalue`-level `dyn` evaluation (`Places.lean`) reads only the
+  `SavedCallerFrame.callerBody`s on `Memory.callStack`, never
+  `Memory.callees`, `Memory.activeCallee`, or `Memory.traitImpls`, exactly like
+  every other `Rvalue` evaluator (whose results are invariant under replacing
+  the callee context). `rustc-capture` attaches the same crate-level tables to
+  every captured body, so any caller frame exposes the complete environment; an
+  `Rvalue` evaluated in the modular root frame (empty `callStack`) sees an empty
+  environment and every `dyn` operation there is `.unsupported`.
+- Call-level lookups (`Terminators.lean`) may additionally read
+  `Memory.callees`.
+-/
+
+/--
+Base of the synthetic `AllocId` range reserved for vtable allocations
+(`GlobalAlloc::VTable`).
+
+Modeled property: the metadata word of a `dyn Trait` wide pointer is a pointer
+to a vtable allocation distinct from every data allocation and every function
+pointer allocation.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+> "pub enum GlobalAlloc<'tcx> {
+>     /// The alloc ID is used as a function pointer.
+>     Function {
+>         instance: ty::Instance<'tcx>,
+>     },"
+
+Modeling choice (not a Rust guarantee): vtable `AllocId`s live in
+`[vtableAllocBase, vtableAllocBase + vtableAllocSpan) = [16384, 32768)`. This
+range is (1) disjoint from function pointers (`>= fnPtrAllocBase = 65536`),
+(2) strictly below the 32-bit stack-local page base `stackLocalAddrPageBase 4 =
+32768` (and the 64-bit base `1048576`), so the canonical address
+`allocId * 65536` of a vtable never aliases a stack local on either pointer
+width and stays below `2^31` on 32-bit targets, and (3) far above the global
+`AllocId`s `1..length allocations` that `rustc-capture` assigns. Collisions with
+live Tree Borrows tags (also drawn from `1, 2, ...`) are detected at every use
+(`lookupBorrow` on the vtable pointer must be `.none`) and fail closed.
+-/
+@[reducible]
+def vtableAllocBase : AllocId := 16384
+
+/-- Width of the reserved vtable `AllocId` range (see `vtableAllocBase`). -/
+@[reducible]
+def vtableAllocSpan : Nat := 16384
+
+/--
+Bodies whose dyn metadata tables are visible, in lookup priority order: the
+optional explicit `currentBody`, then `bodies`.
+-/
+def dynSourceBodies (currentBody : Option CapturedMir) (bodies : List CapturedMir) :
+    List CapturedMir :=
+  match currentBody with
+  | .some b => b :: bodies
+  | .none => bodies
+
+/-- The caller bodies saved on a call stack (innermost first). -/
+def callerBodiesOf (callStack : List SavedCallerFrame) : List CapturedMir :=
+  callStack.map (fun sf => sf.callerBody)
+
+/-- Structural equality of `CapturedVTableSlot`s. -/
+@[reducible]
+def capturedVTableSlotBEq : CapturedVTableSlot → CapturedVTableSlot → Bool
+  | .dropInPlace .none, .dropInPlace .none => true
+  | .dropInPlace (.some a), .dropInPlace (.some b) => stringEq a b
+  | .size, .size => true
+  | .align, .align => true
+  | .vacant, .vacant => true
+  | .method p₁ a₁, .method p₂ a₂ => Bool.and (stringEq p₁ p₂) (rigidTyListEq a₁ a₂)
+  | .traitVPtr i₁, .traitVPtr i₂ => Nat.beq i₁ i₂
+  | _, _ => false
+
+/-- Pointwise structural equality of `CapturedVTableSlot` lists. -/
+@[reducible]
+def capturedVTableSlotListBEq : List CapturedVTableSlot → List CapturedVTableSlot → Bool
+  | .nil, .nil => true
+  | a :: as, b :: bs => Bool.and (capturedVTableSlotBEq a b) (capturedVTableSlotListBEq as bs)
+  | _, _ => false
+
+/-- Structural equality of `CapturedVTable` records. -/
+@[reducible]
+def capturedVTableBEq (a b : CapturedVTable) : Bool :=
+  Bool.and (Nat.beq a.vtableId b.vtableId)
+    (Bool.and (Nat.beq a.vtableAllocId b.vtableAllocId)
+      (Bool.and (rigidTyEq a.concreteTy b.concreteTy)
+        (Bool.and (stringEq a.dynKey b.dynKey)
+          (Bool.and (Nat.beq a.sizeBytes b.sizeBytes)
+            (Bool.and (Nat.beq a.alignBytes b.alignBytes)
+              (Bool.and (Bool.not (Bool.xor a.isUninhabited b.isUninhabited))
+                (capturedVTableSlotListBEq a.slots b.slots)))))))
+
+/-- Look up the vtable with synthetic allocation identifier `allocId`. -/
+@[reducible]
+def lookupVTableByAllocId : List CapturedVTable → AllocId → Option CapturedVTable
+  | .nil, _ => .none
+  | v :: vs, allocId =>
+    match Nat.beq v.vtableAllocId allocId with
+    | true => .some v
+    | false => lookupVTableByAllocId vs allocId
+
+/-- Look up the vtable built for `(concreteTy, dynKey)`. -/
+@[reducible]
+def lookupVTableFor : List CapturedVTable → RigidTy → DefPath → Option CapturedVTable
+  | .nil, _, _ => .none
+  | v :: vs, concreteTy, dynKey =>
+    match Bool.and (stringEq v.dynKey dynKey) (rigidTyEq v.concreteTy concreteTy) with
+    | true => .some v
+    | false => lookupVTableFor vs concreteTy dynKey
+
+/-- Look up the existential-predicate descriptor of `RigidTy.dynamic dynKey`. -/
+@[reducible]
+def lookupDynType : List CapturedDynType → DefPath → Option CapturedDynType
+  | .nil, _ => .none
+  | d :: ds, dynKey =>
+    match stringEq d.dynKey dynKey with
+    | true => .some d
+    | false => lookupDynType ds dynKey
+
+/-- Look up the `InstanceKind::Virtual` record of `(methodDefPath, dynKey)`. -/
+@[reducible]
+def lookupVirtualMethod :
+    List CapturedVirtualMethod → DefPath → DefPath → Option CapturedVirtualMethod
+  | .nil, _, _ => .none
+  | m :: ms, methodDefPath, dynKey =>
+    match Bool.and (stringEq m.methodDefPath methodDefPath) (stringEq m.dynKey dynKey) with
+    | true => .some m
+    | false => lookupVirtualMethod ms methodDefPath dynKey
+
+/-- Merge `new` into `acc`, keeping the first record per `vtableAllocId`. -/
+def dedupVTablesInto : List CapturedVTable → List CapturedVTable → List CapturedVTable
+  | acc, .nil => acc
+  | acc, v :: vs =>
+    match lookupVTableByAllocId acc v.vtableAllocId with
+    | .some _ => dedupVTablesInto acc vs
+    | .none => dedupVTablesInto (acc ++ v :: .nil) vs
+
+/-- `true` iff every record of `vs` agrees structurally with the record that
+`acc` holds for its `vtableAllocId` (absent records are vacuously consistent). -/
+def vtablesAgreeWith : List CapturedVTable → List CapturedVTable → Bool
+  | _, .nil => true
+  | acc, v :: vs =>
+    Bool.and
+      (match lookupVTableByAllocId acc v.vtableAllocId with
+       | .some w => capturedVTableBEq v w
+       | .none => true)
+      (vtablesAgreeWith acc vs)
+
+/--
+Deduplicated vtable table visible from `(currentBody, bodies)`
+(`dynSourceBodies`), keeping the first record per `vtableAllocId`.
+-/
+def collectBodyVTables (currentBody : Option CapturedMir) (bodies : List CapturedMir) :
+    List CapturedVTable :=
+  (dynSourceBodies currentBody bodies).foldl (fun acc b => dedupVTablesInto acc b.vtables) .nil
+
+/-- `collectBodyVTables` over the caller bodies of `mem.callStack` followed by
+`mem.callees` (call-level lookups only). -/
+def collectMemoryVTables (currentBody : Option CapturedMir := .none) (mem : Memory) :
+    List CapturedVTable :=
+  collectBodyVTables currentBody (callerBodiesOf mem.callStack ++ mem.callees)
+
+/-- Deduplicated `CapturedDynType` table visible from `(currentBody, bodies)`. -/
+def collectBodyDynTypes (currentBody : Option CapturedMir) (bodies : List CapturedMir) :
+    List CapturedDynType :=
+  (dynSourceBodies currentBody bodies).foldl
+    (fun acc b =>
+      b.dynTypes.foldl
+        (fun acc' d =>
+          match lookupDynType acc' d.dynKey with
+          | .some _ => acc'
+          | .none => acc' ++ d :: .nil)
+        acc)
+    .nil
+
+/-- Deduplicated `CapturedVirtualMethod` table visible from `(currentBody, bodies)`. -/
+def collectBodyVirtualMethods (currentBody : Option CapturedMir) (bodies : List CapturedMir) :
+    List CapturedVirtualMethod :=
+  (dynSourceBodies currentBody bodies).foldl
+    (fun acc b =>
+      b.virtualMethods.foldl
+        (fun acc' m =>
+          match lookupVirtualMethod acc' m.methodDefPath m.dynKey with
+          | .some _ => acc'
+          | .none => acc' ++ m :: .nil)
+        acc)
+    .nil
+
+
+/-- `collectBodyDynTypes` over the caller bodies of `mem.callStack` followed by
+`mem.callees` (call-level lookups only). -/
+def collectMemoryDynTypes (currentBody : Option CapturedMir := .none) (mem : Memory) :
+    List CapturedDynType :=
+  collectBodyDynTypes currentBody (callerBodiesOf mem.callStack ++ mem.callees)
+
+/-- `collectBodyVirtualMethods` over the caller bodies of `mem.callStack` followed by
+`mem.callees` (call-level lookups only). -/
+def collectMemoryVirtualMethods (currentBody : Option CapturedMir := .none) (mem : Memory) :
+    List CapturedVirtualMethod :=
+  collectBodyVirtualMethods currentBody (callerBodiesOf mem.callStack ++ mem.callees)
+
+/-- `true` iff every captured body visible from `(currentBody, bodies)` carries
+a vtable table consistent with the deduplicated table `vts`. -/
+def bodyVTablesConsistent (currentBody : Option CapturedMir) (bodies : List CapturedMir)
+    (vts : List CapturedVTable) : Bool :=
+  (dynSourceBodies currentBody bodies).all (fun b => vtablesAgreeWith vts b.vtables)
+
+/-- `n` is a non-zero power of two. -/
+@[reducible]
+def isPowerOfTwoNat (n : Nat) : Bool :=
+  Bool.and (Bool.not (Nat.beq n 0)) (Nat.beq (Nat.land n (Nat.sub n 1)) 0)
+
+/--
+Decidable well-formedness of one captured vtable on a target with
+`ptrBytes`-byte pointers.
+
+Modeled property: a vtable describes the layout of a sized concrete type; the
+layout size is a multiple of its power-of-two alignment and the size of every
+value is at most `isize::MAX`.
+
+Reference (The Rust Reference 1.98.0, "Type layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html>
+
+> "The alignment of a value specifies what addresses are valid to store the
+> value at. ... Alignment is measured in bytes, and must be at least 1, and
+> always a power of 2."
+>
+> "The size of a value is always a multiple of its alignment."
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, `size_of_val_raw` safety contract):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L426-L429>
+
+> "///     - a [trait object], then the vtable part of the pointer must point
+> ///       to a valid vtable acquired by an unsizing coercion, and the size
+> ///       of the *entire value* (dynamic tail length + statically sized prefix)
+> ///       must fit in `isize`."
+
+Justification: the checks are necessary conditions on any `rustc` layout; a
+table violating them is not a faithful capture and every operation consulting it
+fails closed (`.unsupported`). Header shape: the first three slots must be
+`[.dropInPlace _, .size, .align]` (`TyCtxt::COMMON_VTABLE_ENTRIES`).
+-/
+def wfVTableEntry (ptrBytes : Nat) (v : CapturedVTable) : Bool :=
+  let half := Nat.pow 2 (Nat.sub (Nat.mul 8 ptrBytes) 1)
+  let headerOk : Bool :=
+    match v.slots with
+    | .dropInPlace _ :: .size :: .align :: _ => true
+    | _ => false
+  Bool.and (isPowerOfTwoNat v.alignBytes)
+    (Bool.and (Nat.blt v.alignBytes half)
+      (Bool.and (Nat.blt (Nat.add v.sizeBytes (Nat.sub v.alignBytes 1)) half)
+        (Bool.and (Nat.beq (Nat.mod v.sizeBytes v.alignBytes) 0) headerOk)))
+
+/-- `true` iff the `vtableAllocId`s of `vs` are pairwise distinct. -/
+def vtableAllocIdsUnique : List CapturedVTable → Bool
+  | .nil => true
+  | v :: vs =>
+    Bool.and
+      (match lookupVTableByAllocId vs v.vtableAllocId with
+       | .some _ => false
+       | .none => true)
+      (vtableAllocIdsUnique vs)
+
+/-- `true` iff `allocId` is the `allocId` of some captured global allocation. -/
+def isGlobalAllocIdIn : List CapturedAllocation → AllocId → Bool
+  | .nil, _ => false
+  | a :: as, allocId => Bool.or (Nat.beq a.allocId allocId) (isGlobalAllocIdIn as allocId)
+
+/--
+Decidable vtable-environment invariant `vtableEnvOk ptrBytes vts nextAllocId globals fnPtrs`.
+
+Modeled property: every vtable pointer designates a vtable allocation that is
+disjoint from data allocations (globals, stack locals) and function-pointer
+allocations, so a metadata word can be resolved to exactly one vtable.
+
+Checks, for every `v ∈ vts`: `wfVTableEntry ptrBytes v`; `vtableAllocId` is
+non-zero, in `[vtableAllocBase, vtableAllocBase + vtableAllocSpan)`, strictly
+below the stack-local page base of `ptrBytes` (`32768` on 32-bit, `1048576` on
+64-bit), not below `mem.nextAllocId`, not the `allocId` of any global, and not a
+registered function pointer; and the identifiers are pairwise distinct. The
+memory components are passed individually (`Memory.nextAllocId`,
+`Memory.globals`, `Memory.fnPtrs`) so the invariant never depends on frame
+bookkeeping.
+
+Reference: see `vtableAllocBase` and `CapturedVTable`.
+
+Unsupported: when the invariant fails every `dyn` operation fails closed with
+`.unsupported` (never `.ub`).
+-/
+def vtableEnvOk (ptrBytes : Nat) (vts : List CapturedVTable) (nextAllocId : AllocId)
+    (globals : List CapturedAllocation) (fnPtrs : List FnPtrEntry) : Bool :=
+  let stackBase : Nat :=
+    match Nat.ble 8 ptrBytes with
+    | true => 1048576
+    | false => 32768
+  Bool.and (vtableAllocIdsUnique vts)
+    (vts.all (fun v =>
+      Bool.and (wfVTableEntry ptrBytes v)
+        (Bool.and (Nat.ble vtableAllocBase v.vtableAllocId)
+          (Bool.and (Nat.blt v.vtableAllocId (Nat.add vtableAllocBase vtableAllocSpan))
+            (Bool.and (Nat.blt v.vtableAllocId stackBase)
+              (Bool.and (Nat.ble nextAllocId v.vtableAllocId)
+                (Bool.and (Bool.not (isGlobalAllocIdIn globals v.vtableAllocId))
+                  (match lookupFnPtr fnPtrs v.vtableAllocId with
+                   | .some _ => false
+                   | .none => true))))))))
+
+/--
+Register `body` in `mem.callees` (appended, so existing callees keep priority)
+unless a callee with the same `defPath` is already linked, making `body`'s dyn
+metadata tables visible to the call-level lookups (`collectMemoryVTables`,
+`collectMemoryVirtualMethods`) when `body` executes as the modular root
+(single-body unit and correspondence tests). `Rvalue`-level `dyn` evaluation
+reads caller frames only and is unaffected.
+
+Modeling note: this is an environment-construction helper with no Rust
+counterpart; it changes only which captured tables are visible.
+-/
+def withBodyDynMetadata (body : CapturedMir) (mem : Memory) : Memory :=
+  match mem.callees.any (fun c => stringEq c.defPath body.defPath) with
+  | true => mem
+  | false => { mem with callees := mem.callees ++ body :: .nil }
+
+/--
+Whether trait-object types `a` and `b` have the same predicate list up to auto
+traits, the relation the interpreter uses to check a vtable against the
+expected trait object type (`check_vtable_for_type`).
+
+Reference (`compiler/rustc_const_eval/src/interpret/traits.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/traits.rs#L72-L78>
+
+> "// We check validity by comparing the lists of predicates for equality. We *could* instead
+> // check that the dynamic type to which the vtable belongs satisfies all the expected
+> // predicates, but that would likely be a lot slower and seems unnecessarily permissive.
+>
+> // FIXME: we are skipping auto traits for now, but might revisit this in the future.
+> let mut sorted_vtable: Vec<_> = vtable_dyn_type.without_auto_traits().collect();"
+
+Justification: equal keys are trivially compatible; otherwise the captured
+`predicateKey`s (predicate lists without auto traits) must agree. Missing
+descriptors make distinct keys incompatible, which callers treat as `.ub` only
+after the vtable pointer itself has been resolved.
+-/
+def dynKeysCompatible (dts : List CapturedDynType) (a b : DefPath) : Bool :=
+  match stringEq a b with
+  | true => true
+  | false =>
+    match lookupDynType dts a, lookupDynType dts b with
+    | .some da, .some db => stringEq da.predicateKey db.predicateKey
+    | _, _ => false
+
+/--
+`true` iff the descriptor of `dynKey` (if captured) marks the type as fully
+modeled: no unresolved existential binder (`charon#1640`) and every supertrait /
+projection outlives obligation discharged. Types without a descriptor are
+modeled only when they carry no generic or auto-trait components, which
+`rustc-capture` guarantees by emitting a descriptor for every other key.
+-/
+def dynTypeModeled (dts : List CapturedDynType) (dynKey : DefPath) : Bool :=
+  match lookupDynType dts dynKey with
+  | .some d => Bool.and (Bool.not d.hasUnresolvedExistentialBinder) d.supertraitOutlivesOk
+  | .none => true
+
+/-- `true` iff every element of `xs` occurs in `ys` (string equality). -/
+def defPathsSubset (xs ys : List DefPath) : Bool :=
+  xs.all (fun x => ys.any (fun y => stringEq x y))
+
+
 end Trusted.Rustc.V2026_08_01.MirSemantics
