@@ -119,4 +119,37 @@ theorem lt_two_pow (f : Bool → Bool → Bool) (w : Nat) :
             (Nat.add_le_add_left hr _)
             (Nat.add_lt_add_right hr (Nat.pow 2 w))
 
+/-- Definitional unfolding of `Nat.land` to `Nat.bitwise and`. -/
+theorem land_eq_bitwise (n m : Nat) :
+    Nat.land n m = Nat.bitwise and n m := by
+  rfl
+
+/-- Definitional unfolding of `Nat.lor` to `Nat.bitwise or`. -/
+theorem lor_eq_bitwise (n m : Nat) :
+    Nat.lor n m = Nat.bitwise or n m := by
+  rfl
+
+/-- Definitional unfolding of `Nat.xor` to `Nat.bitwise bne`. -/
+theorem xor_eq_bitwise (n m : Nat) :
+    Nat.xor n m = Nat.bitwise bne n m := by
+  rfl
+
+/-- Bitwise AND of two `w`-bit naturals stays below `2 ^ w`. -/
+theorem land_lt_two_pow {w n m : Nat}
+    (hn : n < Nat.pow 2 w) (hm : m < Nat.pow 2 w) :
+    Nat.land n m < Nat.pow 2 w :=
+  land_eq_bitwise n m ▸ lt_two_pow and w n m hn hm
+
+/-- Bitwise OR of two `w`-bit naturals stays below `2 ^ w`. -/
+theorem lor_lt_two_pow {w n m : Nat}
+    (hn : n < Nat.pow 2 w) (hm : m < Nat.pow 2 w) :
+    Nat.lor n m < Nat.pow 2 w :=
+  lor_eq_bitwise n m ▸ lt_two_pow or w n m hn hm
+
+/-- Bitwise XOR of two `w`-bit naturals stays below `2 ^ w`. -/
+theorem xor_lt_two_pow {w n m : Nat}
+    (hn : n < Nat.pow 2 w) (hm : m < Nat.pow 2 w) :
+    Nat.xor n m < Nat.pow 2 w :=
+  xor_eq_bitwise n m ▸ lt_two_pow bne w n m hn hm
+
 end Anneal.NatBitwise
