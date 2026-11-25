@@ -622,6 +622,78 @@ theorem applyUnwindAction_matches_evalRefFrameExit
   | unreachable =>
     exact ⟨rfl, rfl⟩
 
+/-- **Universal protected frame-exit correspondence between unmodified
+`Trusted.MirSemantics.applyUnwindAction` and `Anneal.ParametricCore.evalProtectedRefFrameExit`**:
+1. When protector release succeeds (`exitFrameWithProtectors tree prf.frameTags = ⟨tree', .Released⟩`),
+   every tag in `prf.frameTags` is stripped from `tree'.protectedTags`, every outer tag not in
+   `prf.frameTags` is preserved (LIFO!), AND the resulting `CallerContOutcome` matches
+   `Trusted.MirSemantics.applyUnwindAction` across ALL 4 `MirAst.UnwindAction` variants.
+2. Fail-closed conflict: when `exitFrameWithProtectors` reports `.AccessFailure` (e.g., a
+   `.ProtectedDisabled` violation), `evalProtectedRefFrameExit` unconditionally returns `.fault`. -/
+theorem applyUnwindAction_matches_evalProtectedRefFrameExit
+    {Mem Addr Byte Val : Type} [ByteStoreOps Mem Addr Byte]
+    (s : MachineState) (localsAfter : List LocalSlot) (memAfter : TrustedMem)
+    (u : UnwindAction) (L : ByteSubLens Addr) (onRet : Option Nat) (frameTags : List Nat)
+    (m m' : Mem) (partialSlice : List Byte)
+    (hSet : L.set m partialSlice = some m') :
+    let prf : ProtectedRefFrame Addr := ⟨⟨L, ⟨onRet, mirToUnwindAction4 u⟩⟩, frameTags⟩
+    (∀ tree tree',
+      Anneal.RefFrame.exitFrameWithProtectors tree frameTags = ⟨tree', .Released⟩ →
+      (∀ t, Anneal.RefFrame.natListMem t frameTags = true →
+        Anneal.RefFrame.natListMem t tree'.protectedTags = false) ∧
+      (∀ t, Anneal.RefFrame.natListMem t frameTags = false →
+        Anneal.RefFrame.natListMem t tree'.protectedTags =
+          Anneal.RefFrame.natListMem t tree.protectedTags) ∧
+      match u with
+      | .cleanup bb =>
+        applyUnwindAction s localsAfter memAfter u =
+          .running { frame := { s.frame with blockIdx := bb, stmtIdx := 0, locals := localsAfter },
+                     memory := memAfter } ∧
+        evalProtectedRefFrameExit prf m tree (CalleeExit.unwound (Val := Val) partialSlice) =
+          (.jumpCleanup bb m', tree')
+      | .continue_ =>
+        applyUnwindAction s localsAfter memAfter u =
+          unwindFromCallStack memAfter.callStack memAfter ∧
+        evalProtectedRefFrameExit prf m tree (CalleeExit.unwound (Val := Val) partialSlice) =
+          (.propagateUnwind m', tree')
+      | .terminate =>
+        applyUnwindAction s localsAfter memAfter u = .halted .abort ∧
+        evalProtectedRefFrameExit prf m tree (CalleeExit.unwound (Val := Val) partialSlice) =
+          (.abortTerminate m', tree')
+      | .unreachable =>
+        applyUnwindAction s localsAfter memAfter u = .faulted .ub ∧
+        evalProtectedRefFrameExit prf m tree (CalleeExit.unwound (Val := Val) partialSlice) =
+          (.fault, tree')) ∧
+    (∀ tree tree' off len nodeTag err,
+      Anneal.RefFrame.exitFrameWithProtectors tree frameTags =
+        ⟨tree', .AccessFailure off len nodeTag err⟩ →
+      (evalProtectedRefFrameExit prf m tree (CalleeExit.unwound (Val := Val) partialSlice)).1 =
+        .fault) := by
+  intro prf
+  refine ⟨?_, ?_⟩
+  · intro tree tree' hRel
+    have hProt := evalProtectedRefFrameExit_of_released (Val := Val) prf m
+      (CalleeExit.unwound (Val := Val) partialSlice) hRel
+    have hBase := applyUnwindAction_matches_evalRefFrameExit (Val := Val) s localsAfter memAfter
+      u L onRet m m' partialSlice hSet
+    refine ⟨hProt.2.1, hProt.2.2, ?_⟩
+    cases u with
+    | cleanup bb =>
+      refine ⟨hBase.1, ?_⟩
+      rw [hProt.1, hBase.2]
+    | continue_ =>
+      refine ⟨hBase.1, ?_⟩
+      rw [hProt.1, hBase.2]
+    | terminate =>
+      refine ⟨hBase.1, ?_⟩
+      rw [hProt.1, hBase.2]
+    | unreachable =>
+      refine ⟨hBase.1, ?_⟩
+      rw [hProt.1, hBase.2]
+  · intro tree tree' off len nodeTag err hErr
+    exact evalProtectedRefFrameExit_fault_of_accessFailure prf m
+      (CalleeExit.unwound (Val := Val) partialSlice) hErr
+
 /-! ### §5b. Universal Trusted Protector, Deallocation, & Multi-Frame Unwind Laws -/
 
 /-- Embedding `TreeBorrowPerm → MiniRustSpec.Gen.PermissionProt` matching MiniRust's
@@ -754,6 +826,42 @@ theorem trusted_unwind_continue_chain_to_cleanup
       } := by
   rw [MiniRustSpec.CrossFrameRefAndPanicMR.trusted_unwindFromCallStack_continue_chain conts (catcher :: restStack) mem hConts]
   simp only [unwindFromCallStack, hCatch]
+
+/-- **Universal multi-frame unwind protector-release & outer-protector-preservation law** directly
+on unmodified `Trusted.MirSemantics.{unwindFromCallStack, restoreCallerProtectors, isBorrowProtected}`:
+when a chain `conts` of `.continue_` frames unwinds into `catcher` (`returnUnwind = .cleanup cleanupBb`),
+the resulting running state `s'` has:
+1. every popped callee borrow entry whose protector is absent from `restoreCallerProtectors catcher`
+   is NO LONGER protected (`isBorrowProtected s'.memory.activeProtectors e = false`), enabling
+   caller cleanup writes (Cases `21` and `23`);
+2. every surviving outer borrow entry whose protector IS present in `restoreCallerProtectors catcher`
+   REMAINS protected (`isBorrowProtected s'.memory.activeProtectors eOuter = true`, strict LIFO!). -/
+theorem trusted_unwind_releases_callee_protector
+    (conts : List SavedCallerFrame) (catcher : SavedCallerFrame)
+    (restStack : List SavedCallerFrame) (mem : TrustedMem) (cleanupBb : BasicBlockIdx)
+    (hConts : ∀ c ∈ conts, c.returnUnwind = .continue_)
+    (hCatch : catcher.returnUnwind = .cleanup cleanupBb) :
+    ∃ s',
+      unwindFromCallStack (conts ++ catcher :: restStack) mem = .running s' ∧
+      s'.memory.activeProtectors = restoreCallerProtectors catcher ∧
+      (∀ (e : BorrowEntry) (p : Nat),
+        e.protector = .some p →
+        natListContainsBool (restoreCallerProtectors catcher) p = false →
+        isBorrowProtected s'.memory.activeProtectors e = false) ∧
+      (∀ (eOuter : BorrowEntry) (pOuter : Nat),
+        eOuter.protector = .some pOuter →
+        natListContainsBool (restoreCallerProtectors catcher) pOuter = true →
+        isBorrowProtected s'.memory.activeProtectors eOuter = true) := by
+  have hUnw := trusted_unwind_continue_chain_to_cleanup conts catcher restStack mem cleanupBb hConts hCatch
+  refine ⟨_, hUnw, rfl, ?_, ?_⟩
+  · intro e p hP hNot
+    unfold isBorrowProtected
+    rw [hP]
+    exact hNot
+  · intro eOuter pOuter hP hIn
+    unfold isBorrowProtected
+    rw [hP]
+    exact hIn
 
 /-- **Universal root-unwind ceiling boundary theorem**:
 - When `mem.rootUnwindCeiling = false`, unwinding past all `.continue_` frames to empty
@@ -1612,7 +1720,10 @@ def mkCrossFramePanicDualBundle (c : CrossFramePanicDualContract) :
 
 /-- Projected bundle corollaries from `mkCrossFramePanicDualBundle`: positive non-vacuity,
 fault-equivalence witness, flip-direction non-constancy, exact cross-authority fault/normal/
-unwind/behavioral equivalence, and 3-way normal & unwind agreement across every `idx ≠ 27`. -/
+unwind/diverge/well-formedness equivalence (`crossAuthorityExactEquiv`, `crossAuthorityUnwindIff`,
+`crossAuthorityWellFormedEquiv`), and explicit 3-way bundle witnesses on Case `17` (`.unwind 115`),
+Case `21` (`.normal ⟨65, 65, true⟩` cleanup recovery), and Case `23` (`.normal ⟨300, 300, true⟩`
+3-frame LIFO cleanup recovery) proving every branch of the bundle is non-vacuous! -/
 theorem crossFramePanicDualBundle_projections (c : CrossFramePanicDualContract) :
     let B := mkCrossFramePanicDualBundle c
     B.mrSim.reverse_total?.isSome = true ∧
@@ -1631,11 +1742,38 @@ theorem crossFramePanicDualBundle_projections (c : CrossFramePanicDualContract) 
     (∀ idx, idx ≠ 27 → ∀ retMR retLM,
       (∃ ch, B.mrRel.ExecR () idx () ch (.normal retMR)) →
       (∃ ch, B.lmRel.ExecR () idx () ch (.normal retLM)) →
-      B.repMR retMR = B.repLM retLM) := by
+      B.repMR retMR = B.repLM retLM) ∧
+    (∀ idx, idx ≠ 27 → ∀ uA,
+      ((∃ ch u, B.mrRel.ExecR () idx () ch (.unwind u) ∧ B.mrRel.UnwRel uA u) ↔
+        B.ExecAnneal () idx () (.unwind uA)) ∧
+      ((∃ ch u, B.lmRel.ExecR () idx () ch (.unwind u) ∧ B.lmRel.UnwRel uA u) ↔
+        B.ExecAnneal () idx () (.unwind uA)) ∧
+      ((∃ ch u, B.mrRel.ExecR () idx () ch (.unwind u) ∧ B.mrRel.UnwRel uA u) ↔
+        (∃ ch u, B.lmRel.ExecR () idx () ch (.unwind u) ∧ B.lmRel.UnwRel uA u))) ∧
+    (∀ idx, idx ≠ 27 →
+      (B.mrRel.WellFormedRef () idx () ↔ ∀ k, ¬ B.ExecAnneal () idx () (.fault k)) ∧
+      (B.lmRel.WellFormedRef () idx () ↔ ∀ k, ¬ B.ExecAnneal () idx () (.fault k)) ∧
+      (B.mrRel.WellFormedRef () idx () ↔ B.lmRel.WellFormedRef () idx ())) ∧
+    -- Concrete non-vacuity witnesses for unwind (Case 17) and cleanup-recovered normal returns (Cases 21 & 23):
+    (B.ExecAnneal () 17 () (.unwind 115) ∧
+      B.mrRel.ExecR () 17 () () (.unwind 115) ∧
+      B.lmRel.ExecR () 17 () () (.unwind 115) ∧
+      B.ExecAnneal () 21 () (.normal ⟨65, 65, true⟩) ∧
+      B.mrRel.ExecR () 21 () () (.normal ⟨65, 65, true⟩) ∧
+      B.lmRel.ExecR () 21 () () (.normal ⟨65, 65, true⟩) ∧
+      B.ExecAnneal () 23 () (.normal ⟨300, 300, true⟩) ∧
+      B.mrRel.ExecR () 23 () () (.normal ⟨300, 300, true⟩) ∧
+      B.lmRel.ExecR () 23 () () (.normal ⟨300, 300, true⟩)) := by
   intro B
+  have hRevMR : B.mrRel.ReverseTotal := by
+    obtain ⟨h⟩ := Option.isSome_iff_exists.mp (rfl : B.mrSim.reverse_total?.isSome = true)
+    exact h.down
+  have hRevLM : B.lmRel.ReverseTotal := by
+    obtain ⟨h⟩ := Option.isSome_iff_exists.mp (rfl : B.lmSim.reverse_total?.isSome = true)
+    exact h.down
   refine ⟨rfl, rfl, B.mrSim.correspondenceClaim, B.lmSim.correspondenceClaim,
     B.mrSim.faultEquivClaim, B.lmSim.faultEquivClaim,
-    ⟨B.not_constant_anneal_outcome.1, B.not_constant_anneal_outcome.2.1⟩, ?_, ?_⟩
+    ⟨B.not_constant_anneal_outcome.1, B.not_constant_anneal_outcome.2.1⟩, ?_, ?_, ?_, ?_, ?_⟩
   · intro idx hNe k
     exact B.crossAuthorityFaultEquiv rfl hNe hNe k
   · intro idx hNe retMR retLM ⟨chM, hM⟩ ⟨chL, hL⟩
@@ -1652,6 +1790,31 @@ theorem crossFramePanicDualBundle_projections (c : CrossFramePanicDualContract) 
     rw [hE1] at hE2
     cases hE2
     rfl
+  · intro idx hNe uA
+    exact B.crossAuthorityUnwindIff rfl hNe hNe hRevMR hRevLM
+      (fun _ _ _ h1 h2 => h1.trans h2.symm)
+      (fun _ _ _ h1 h2 => h1.trans h2.symm) uA
+  · intro idx hNe
+    exact B.crossAuthorityWellFormedEquiv rfl hNe hNe
+  · refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    · change obsToExecOutcome4 (trustedCrossFramePanicObserve 17) = _
+      rw [trustedCrossFramePanicObserve_matches_expected]; rfl
+    · change obsToExecOutcome4 (mrObserve .treeBorrows 17) = _
+      rw [mrObserve_matches_expected]; rfl
+    · change obsToExecOutcome4 (c.lm.observe true 17) = _
+      rw [contract_lm_tb_eq, mrObserve_matches_expected]; rfl
+    · change obsToExecOutcome4 (trustedCrossFramePanicObserve 21) = _
+      rw [trustedCrossFramePanicObserve_matches_expected]; rfl
+    · change obsToExecOutcome4 (mrObserve .treeBorrows 21) = _
+      rw [mrObserve_matches_expected]; rfl
+    · change obsToExecOutcome4 (c.lm.observe true 21) = _
+      rw [contract_lm_tb_eq, mrObserve_matches_expected]; rfl
+    · change obsToExecOutcome4 (trustedCrossFramePanicObserve 23) = _
+      rw [trustedCrossFramePanicObserve_matches_expected]; rfl
+    · change obsToExecOutcome4 (mrObserve .treeBorrows 23) = _
+      rw [mrObserve_matches_expected]; rfl
+    · change obsToExecOutcome4 (c.lm.observe true 23) = _
+      rw [contract_lm_tb_eq, mrObserve_matches_expected]; rfl
 
 /-- Direct 2-mode (`CrossFramePanicMode`: `.basic` vs `.treeBorrows`) step relation between
 MiniRust (`Mach`/`MachTB`) and LeanMiri (`treeBorrows = false`/`true`) with constructive
@@ -1724,11 +1887,13 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       (type_of% (contract_wire_total_eq c)) ∧
       (type_of% (contract_joint_mode_sensitivity c))) ∧
     ((type_of% @applyUnwindAction_matches_evalRefFrameExit) ∧
+      (type_of% @applyUnwindAction_matches_evalProtectedRefFrameExit) ∧
       (type_of% @preventsDeallocation_eq_mr) ∧
       (type_of% @disableFrameBorrows_preserves_outer_frames) ∧
       (type_of% @disableFramesAbove_preserves_surviving_frames) ∧
       (type_of% @hasFrameDeallocProtectorConflict_iff) ∧
       (type_of% @trusted_unwind_continue_chain_to_cleanup) ∧
+      (type_of% @trusted_unwind_releases_callee_protector) ∧
       (type_of% @trusted_unwind_continue_chain_root_boundary) ∧
       (type_of% @trustedCrossFramePanicObserve_table) ∧
       (type_of% @trustedCrossFramePanicObserve_out_of_range) ∧
@@ -1741,11 +1906,13 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
     ep1_minirust_cross_frame_panic_capstone,
     ⟨mrObserve_matches_expected, mrObserve_out_of_range, mrObserve_mode_sensitivity,
       contract_mr_lm_total_eq c, contract_wire_total_eq c, contract_joint_mode_sensitivity c⟩,
-    ⟨@applyUnwindAction_matches_evalRefFrameExit, @preventsDeallocation_eq_mr,
+    ⟨@applyUnwindAction_matches_evalRefFrameExit,
+      @applyUnwindAction_matches_evalProtectedRefFrameExit, @preventsDeallocation_eq_mr,
       @disableFrameBorrows_preserves_outer_frames, @disableFramesAbove_preserves_surviving_frames,
       @hasFrameDeallocProtectorConflict_iff, @trusted_unwind_continue_chain_to_cleanup,
-      @trusted_unwind_continue_chain_root_boundary, @trustedCrossFramePanicObserve_table,
-      @trustedCrossFramePanicObserve_out_of_range, contract_three_way_and_root_ceiling_exact c⟩,
+      @trusted_unwind_releases_callee_protector, @trusted_unwind_continue_chain_root_boundary,
+      @trustedCrossFramePanicObserve_table, @trustedCrossFramePanicObserve_out_of_range,
+      contract_three_way_and_root_ceiling_exact c⟩,
     ⟨crossFramePanicDualBundle_projections c, mrLmModeStepRel_not_mode_invariant c⟩⟩
 
 section AxiomAudit
@@ -1788,6 +1955,8 @@ run_cmd do
         `Trusted.Rustc.V2026_06_01.MirSemantics.applyUnwindAction),
       (ns ++ `applyUnwindAction_matches_evalRefFrameExit,
         `Anneal.ParametricCore.evalRefFrameExit),
+      (ns ++ `applyUnwindAction_matches_evalProtectedRefFrameExit,
+        `Anneal.ParametricCore.evalProtectedRefFrameExit),
       (ns ++ `preventsDeallocation_eq_mr,
         `Trusted.Rustc.V2026_06_01.MirSemantics.preventsDeallocation),
       (ns ++ `disableFrameBorrows_preserves_outer_frames,
@@ -1800,6 +1969,8 @@ run_cmd do
         `Trusted.Rustc.V2026_06_01.MirSemantics.unwindFromCallStack),
       (ns ++ `trusted_unwind_continue_chain_to_cleanup,
         `Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors),
+      (ns ++ `trusted_unwind_releases_callee_protector,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowProtected),
       (ns ++ `trustedCrossFramePanicObserve_table,
         `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mkCrossFramePanicDualBundle,

@@ -410,14 +410,76 @@ theorem evalResumeUnwindM_dispatch {M : Type} [Memory M] [MemoryOps M]
     unfold evalResumeUnwindM
     simp only [hTid, hLast, hSet, hDealloc, hEnd, hAct, pure, Except.pure, bind, Except.bind, ub]
 
-/-- **Universal Tree Borrows `FnEntry` strong-protector foreign-write UB & post-release
-permission law** on `MiniRustSpec.Interp.Node`:
-1. A foreign write to a strongly protected `Unique` / `Frozen true` / `Reserved true _` child
-   node faults with UB (`Tree Borrows: foreign write of protected ...`).
-2. Once `end_call` / protector release changes `Protected.Strong` to `Protected.No` and
-   unprotects the permission, a foreign write through the parent succeeds cleanly (disabling
-   the child without UB).
-3. A local write through a `Frozen` node faults with `"Tree Borrows: local write of Frozen reference"`. -/
+/-- **Universal Tree Borrows protected foreign-write UB ↔ `prevents_deallocation` law**:
+for EVERY `p : PermissionProt`, a foreign write (`Permission.transition (.Prot p) .Write .Foreign`)
+faults with UB if and only if `PermissionProt.prevents_deallocation p = true` (`Unique`,
+`Frozen true`, or `Reserved true _`). -/
+theorem tbm_perm_prot_foreign_write_ub_iff_prevents_dealloc (p : PermissionProt) :
+    (∃ msg, Permission.transition (.Prot p) .Write .Foreign = .error (.ub msg)) ↔
+      PermissionProt.prevents_deallocation p = true := by
+  cases p with
+  | Cell =>
+    exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => by cases h)⟩
+  | Disabled =>
+    exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => by cases h)⟩
+  | Unique =>
+    exact ⟨fun _ => rfl, fun _ => ⟨"Tree Borrows: foreign read of protected Unique reference", rfl⟩⟩
+  | Frozen hr =>
+    cases hr with
+    | false => exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => by cases h)⟩
+    | true =>
+      exact ⟨fun _ => rfl,
+        fun _ => ⟨"Tree Borrows: foreign write of protected Frozen reference which had a local read", rfl⟩⟩
+  | Reserved hr hf =>
+    cases hr with
+    | false => exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => by cases h)⟩
+    | true =>
+      exact ⟨fun _ => rfl,
+        fun _ => ⟨"Tree Borrows: foreign write of protected Reserved reference which had a local read", rfl⟩⟩
+
+/-- **Universal Tree Borrows protector-release law (`Permission.unprotect`)**:
+1. Every unprotected permission `u : PermissionUnprot` admits a foreign write without UB.
+2. Releasing ANY protected permission `p : PermissionProt` through `Permission.unprotect`
+   yields an unprotected permission `p'` that ALWAYS admits a foreign write without UB
+   (universally explaining why `end_call` turns Case `8`'s foreign-write UB into Case `2` / `21`'s
+   legal post-release parent write). -/
+theorem tbm_perm_unprotect_enables_foreign_write :
+    (∀ u : PermissionUnprot, ∃ u', Permission.transition (.Unprot u) .Write .Foreign = .ok (.Unprot u')) ∧
+    (∀ p : PermissionProt, ∃ p' acc p'',
+      Permission.unprotect (.Prot p) = .ok (p', acc) ∧
+      Permission.transition p' .Write .Foreign = .ok p'') := by
+  refine ⟨?_, ?_⟩
+  · intro u
+    cases u <;> first | exact ⟨.Cell, rfl⟩ | exact ⟨.ReservedIm, rfl⟩ | exact ⟨.Disabled, rfl⟩
+  · intro p
+    cases p with
+    | Cell => exact ⟨.Unprot .Cell, none, .Unprot .Cell, rfl, rfl⟩
+    | Unique => exact ⟨.Unprot .Unique, some .Write, .Unprot .Disabled, rfl, rfl⟩
+    | Disabled => exact ⟨.Unprot .Disabled, none, .Unprot .Disabled, rfl, rfl⟩
+    | Frozen hr =>
+      cases hr with
+      | false => exact ⟨.Unprot .Frozen, none, .Unprot .Disabled, rfl, rfl⟩
+      | true => exact ⟨.Unprot .Frozen, some .Read, .Unprot .Disabled, rfl, rfl⟩
+    | Reserved hr hf =>
+      cases hr with
+      | false => cases hf <;> exact ⟨.Unprot .Reserved, none, .Unprot .Disabled, rfl, rfl⟩
+      | true => cases hf <;> exact ⟨.Unprot .Reserved, some .Read, .Unprot .Disabled, rfl, rfl⟩
+
+/-- **Universal Tree Borrows `Frozen` local-write UB law**:
+a local write through ANY `Frozen` permission — unprotected (`PermissionUnprot.Frozen`) or
+protected (`PermissionProt.Frozen hadLocalRead` for EVERY `hadLocalRead : Bool`) — unconditionally
+faults with UB. -/
+theorem tbm_perm_frozen_local_write_ub_universal :
+    Permission.transition (.Unprot .Frozen) .Write .Local =
+      .error (.ub "Tree Borrows: local write of Frozen reference") ∧
+    (∀ hadLocalRead : Bool,
+      Permission.transition (.Prot (.Frozen hadLocalRead)) .Write .Local =
+        .error (.ub "Tree Borrows: local write to protected Frozen reference")) :=
+  ⟨rfl, fun hr => by cases hr <;> rfl⟩
+
+/-- Concrete 1-byte `MiniRustSpec.Interp.Node.access` witnesses lifting the universal
+permission laws above onto full parent/child borrow-tree traversal (protected foreign write UB vs.
+post-unprotect disable + `Frozen` local write UB). -/
 theorem tbm_node_protector_and_frozen_laws :
     (Node.access ⟨[⟨[], [.Prot (.Reserved true false)], .Strong⟩], [.Unprot .Unique], .No⟩
         (some []) .Write ⟨0⟩ ⟨1⟩ =
@@ -1211,13 +1273,20 @@ def mrProg19 : Program :=
   mkProg [(fnId 0, main)]
 
 /-- **Case 20 (`assert_fail_unwind_unreachable`)**:
-Failing `assert(0 == 1, unwind: .unreachable)` -> `.ub`. -/
+Failing `assert(0 == 1, unwind: .unreachable)` invokes the panic-initiation helper
+(`StartUnwind` -> `ResumeUnwind`) across a call edge with `unwind_block := none`
+(`StackPopAction.BackToCaller _ none _`), so MiniRust's own `evalResumeUnwindM` rejects the
+unwind with `"unwinding from a function where the caller did not specify an unwind_block"`
+(genuinely exercising the missing unwind edge rather than duplicating Case `16`'s `.Unreachable`). -/
 def mrProg20 : Program :=
-  let main := mkFn [(locId 0, u32Ty)] [] (locId 0)
-    [(bbId 0, ⟨[], .Switch (cU32 0) ⟨[(1, bbId 1)]⟩ (bbId 2), .Regular⟩),
+  let assertPanic := mkFn [(locId 0, u32Ty)] [] (locId 0)
+    [(bbId 0, ⟨[], .StartUnwind cNullRaw (bbId 1), .Regular⟩),
+     (bbId 1, ⟨[], .ResumeUnwind, .Cleanup⟩)]
+  let main := mkFn [(locId 0, u32Ty), (locId 1, u32Ty)] [] (locId 0)
+    [(bbId 0, ⟨[.StorageLive (locId 1)], .Switch (cU32 0) ⟨[(1, bbId 1)]⟩ (bbId 2), .Regular⟩),
      (bbId 1, ⟨[], exitTerm, .Regular⟩),
-     (bbId 2, ⟨[], .Unreachable, .Cleanup⟩)]
-  mkProg [(fnId 0, main)]
+     (bbId 2, ⟨[], .Call (cFn 1) .Rust [] (.Local (locId 1)) (some (bbId 1)) none, .Regular⟩)]
+  mkProg [(fnId 0, main), (fnId 1, assertPanic)]
 
 /-- **Case 21 (`callee_panic_partial_writeback_cleanup_release_protector_resume`)**:
 Caller allocates `x = 10`, passes `&mut x` to panicking callee (`unwind: .cleanup bb_clean`).
@@ -1620,11 +1689,13 @@ theorem mr_tb_exact_ub_diagnostics :
       some "dereferencing pointer outside the bounds of its allocation" ∧
     runStopMsgTB mrProg16 =
       some "reached unreachable code" ∧
+    runStopMsgTB mrProg20 =
+      some "unwinding from a function where the caller did not specify an unwind_block" ∧
     runStopMsgTB mrProg25 =
       some "unwinding from a function where the caller did not specify an unwind_block" ∧
     runStopMsgTB mrProgRootUnwind =
       some "the function at the bottom of the stack must not unwind" := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 end CanonicalMrPrograms
 
@@ -1641,6 +1712,9 @@ theorem ep1_minirust_cross_frame_panic_capstone :
     (type_of% @evalTerminatorM_switch_assert) ∧
     (type_of% @evalTerminatorM_abort) ∧
     (type_of% @evalResumeUnwindM_dispatch) ∧
+    (type_of% @tbm_perm_prot_foreign_write_ub_iff_prevents_dealloc) ∧
+    (type_of% @tbm_perm_unprotect_enables_foreign_write) ∧
+    (type_of% @tbm_perm_frozen_local_write_ub_universal) ∧
     (type_of% @tbm_node_protector_and_frozen_laws) ∧
     (type_of% @trusted_evalTerminator_unreachable_ub) ∧
     (type_of% @trusted_evalTerminator_unwindTerminate_abort) ∧
@@ -1660,6 +1734,8 @@ theorem ep1_minirust_cross_frame_panic_capstone :
   ⟨@bootProgramM_tb_wfLive, @runToStopM_tb_wfLive, @evalPtrOffsetM_wrapping_eq,
    @evalPtrOffsetM_inbounds_eq, @ptrOffsetWrappingM_roundtrip, @evalTerminatorM_unreachable_ub,
    @evalTerminatorM_switch_assert, @evalTerminatorM_abort, @evalResumeUnwindM_dispatch,
+   @tbm_perm_prot_foreign_write_ub_iff_prevents_dealloc,
+   @tbm_perm_unprotect_enables_foreign_write, @tbm_perm_frozen_local_write_ub_universal,
    @tbm_node_protector_and_frozen_laws, @trusted_evalTerminator_unreachable_ub,
    @trusted_evalTerminator_unwindTerminate_abort, @trusted_evalTerminator_assert_pass,
    @trusted_evalTerminator_assert_fail, @trusted_applyUnwindAction_four_way,
@@ -1674,11 +1750,45 @@ open Lean Elab Command
 
 run_cmd do
   let env ← getEnv
+  -- 1. Strict root isolation: ZERO `Miri.*`, `LeanMiriSpec.*`, or `Anneal.*` imports!
   for modName in env.header.moduleNames do
     if (`Miri).isPrefixOf modName || (`LeanMiriSpec).isPrefixOf modName ||
         (`Anneal).isPrefixOf modName then
       throwError "import-isolation violation: {modName} must not be imported by MiniRustSpec.CrossFrameRefAndPanicMR"
   let ns := `MiniRustSpec.CrossFrameRefAndPanicMR
+  -- 2. Bridge-reality audit: confirm our MR theorems transitively reach real MiniRustSpec.Interp & Trusted constants.
+  let bridgeReq : List (Lean.Name × Lean.Name) :=
+    [ (ns ++ `mrCrossFramePanicObserve_table, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mrCrossFramePanicObserve_table, `MiniRustSpec.Interp.createFrameM),
+      (ns ++ `evalResumeUnwindM_dispatch, `MiniRustSpec.Interp.evalResumeUnwindM),
+      (ns ++ `evalTerminatorM_unreachable_ub, `MiniRustSpec.Interp.evalTerminatorM),
+      (ns ++ `evalPtrOffsetM_wrapping_eq, `MiniRustSpec.Interp.evalPtrOffsetM),
+      (ns ++ `tbm_perm_prot_foreign_write_ub_iff_prevents_dealloc, `MiniRustSpec.Interp.Permission.transition),
+      (ns ++ `tbm_perm_unprotect_enables_foreign_write, `MiniRustSpec.Interp.Permission.unprotect),
+      (ns ++ `trusted_evalTerminator_assert_fail, `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator),
+      (ns ++ `trusted_applyUnwindAction_four_way, `Trusted.Rustc.V2026_06_01.MirSemantics.applyUnwindAction),
+      (ns ++ `trusted_unwindFromCallStack_continue_chain, `Trusted.Rustc.V2026_06_01.MirSemantics.unwindFromCallStack),
+      (ns ++ `trusted_evalBinOpOffset_oob_none, `Trusted.Rustc.V2026_06_01.MirSemantics.evalBinOpOffset),
+      (ns ++ `trusted_evalArithOffset_roundtrip, `Trusted.Rustc.V2026_06_01.MirSemantics.evalArithOffset),
+      (ns ++ `trusted_restoreCallerProtectors_releases, `Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors) ]
+  for (thm, req) in bridgeReq do
+    let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
+    let mut seen : NameSet := {}
+    let mut todo : Array Lean.Name := ci.type.getUsedConstants
+    if let .defnInfo v := ci then
+      todo := todo ++ v.value.getUsedConstants
+    while !todo.isEmpty do
+      let n := todo.back!
+      todo := todo.pop
+      if seen.contains n then continue
+      seen := seen.insert n
+      if n == req then break
+      if ns.isPrefixOf n then
+        if let some (.defnInfo v) := env.find? n then
+          todo := todo ++ v.value.getUsedConstants
+    unless seen.contains req do
+      throwError "shadow-evaluator audit: {thm} does not reach real {req}"
+  -- 3. Standard-3-axiom purity & non-vacuous theorem count floor.
   let mut theorems : Nat := 0
   for (c, info) in env.constants.map₂.toList do
     for a in ← liftCoreM <| Lean.collectAxioms c do
@@ -1689,7 +1799,7 @@ run_cmd do
         throwError "{c} depends on non-standard axiom {a}"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 25 then
+  if theorems < 28 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit
