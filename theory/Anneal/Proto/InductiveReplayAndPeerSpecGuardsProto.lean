@@ -2057,6 +2057,84 @@ theorem injectiveDigest_reconciliation_exact {registered onDisk : List String}
     simp only at hm₁ hm₂ hn ⊢
     rw [h e₁ h₁ e₂ h₂ hm₁ hm₂ hn]
 
+/-- Constant constructor tags mirroring Lean's `ConstantInfo` constructors. -/
+inductive ConstKindTag : Type where
+  | axiomDecl
+  | defnDecl
+  | thmDecl
+  | opaqueDecl
+  | quotDecl
+  | inductDecl
+  | ctorDecl
+  | recDecl
+  deriving DecidableEq, Repr, Inhabited
+
+/-- Typed constant record modeling `ConstantInfo` fields compared during duplicate reconciliation. -/
+structure TypedConstRecord : Type where
+  kind : ConstKindTag
+  levelParams : List String
+  typeTag : String
+  valueOpt : Option String
+  metaTag : String
+  isSafe : Bool := true
+  deriving DecidableEq, Repr, Inhabited
+
+/-- Pre-A2 lossy compatibility predicate: short-circuits on `valueOpt == none` and fails to
+    discriminate `ConstantInfo` constructors or inductive/ctor/recursor metadata. -/
+def lossyValueOptCompat (a b : TypedConstRecord) : Bool :=
+  a.levelParams == b.levelParams &&
+    match a.kind, b.kind with
+    | .thmDecl, .thmDecl => a.typeTag == b.typeTag
+    | _, _ =>
+      a.typeTag == b.typeTag &&
+        (a.valueOpt == b.valueOpt || a.valueOpt.isNone || b.valueOpt.isNone)
+
+/-- Hardened A2 exact structural compatibility predicate: discriminates every `ConstantInfo`
+    constructor, rejects kind confusion (`axiom` vs `defn`), and requires full metadata and
+    safety parity across duplicates. -/
+def strictConstCompat (a b : TypedConstRecord) : Bool :=
+  a.levelParams == b.levelParams &&
+    match a.kind, b.kind with
+    | .thmDecl, .thmDecl => a.typeTag == b.typeTag
+    | ka, kb =>
+      ka == kb && a.typeTag == b.typeTag && a.valueOpt == b.valueOpt &&
+        a.metaTag == b.metaTag && a.isSafe == b.isSafe
+
+/-- **Kind-Confusion & Metadata-Bypass Witness (A2)**: `lossyValueOptCompat` falsely accepts
+    both an `axiom` masquerading as a `defn` of the same type AND two `inductDecl` duplicates
+    with different `numIndices`/`isRec` metadata, whereas `strictConstCompat` rejects both! -/
+theorem lossyCompat_accepts_axiom_vs_defn_and_forged_induct :
+    let axRec : TypedConstRecord :=
+      { kind := .axiomDecl, levelParams := [], typeTag := "Nat", valueOpt := none, metaTag := "" }
+    let defRec : TypedConstRecord :=
+      { kind := .defnDecl, levelParams := [], typeTag := "Nat", valueOpt := some "0", metaTag := "" }
+    let indGood : TypedConstRecord :=
+      { kind := .inductDecl, levelParams := [], typeTag := "Type", valueOpt := none,
+        metaTag := "numIndices=0,isRec=false" }
+    let indBad : TypedConstRecord :=
+      { kind := .inductDecl, levelParams := [], typeTag := "Type", valueOpt := none,
+        metaTag := "numIndices=1,isRec=true" }
+    lossyValueOptCompat axRec defRec = true ∧
+      strictConstCompat axRec defRec = false ∧
+      lossyValueOptCompat indGood indBad = true ∧
+      strictConstCompat indGood indBad = false := by
+  decide
+
+/-- For all non-theorem constants, `strictConstCompat` holds if and only if the two records
+    are structurally identical. -/
+theorem strictConstCompat_iff_eq_nonThm {a b : TypedConstRecord}
+    (ha : a.kind ≠ .thmDecl) :
+    strictConstCompat a b = true ↔ a = b := by
+  cases a with
+  | mk ka la ta va ma sa =>
+    cases b with
+    | mk kb lb tb vb mb sb =>
+      simp only at ha
+      cases ka <;> cases kb <;> simp_all [strictConstCompat] <;>
+        exact fun _ =>
+          ⟨fun ⟨⟨⟨h1, h2⟩, h3⟩, h4⟩ => ⟨h1, h2, h3, h4⟩,
+            fun ⟨h1, h2, h3, h4⟩ => ⟨⟨⟨h1, h2⟩, h3⟩, h4⟩⟩
+
 /-! ## 4. Pillar 3 — Four Peer-Verifier Spec-Boundary Soundness Guards -/
 
 /-! ### 4.1 Guard 3 — Unsatisfiable Extern `ensures` (`creusot#2388`, rank `3`) -/
@@ -2889,6 +2967,19 @@ theorem flippedConsequent_violates_antitonicity :
     ⟨by decide, rfl⟩
   exact (h hAnt).1
 
+/-- **Boolean-Negated Assumption Antecedent Collapse (A2)**: writing `(impl.assumesHold = false) → outputEq`
+    (i.e. `(¬ assumes) → outputEq`) places `assumes` in POSITIVE polarity: `checkAssumesNegativePolarity`
+    rejects it, and semantically it holds vacuously when `assumes` is `True` even if `outputEq` is `False`! -/
+theorem boolNegAssumes_antecedent_violates_antitonicity :
+    let f : PropFormula := .imp (.not (.assumes "impl")) (.atom "outputEq")
+    let va : String → Prop := fun _ => False
+    checkAssumesNegativePolarity f = false ∧
+      evalPF va (fun _ => True) f ∧
+      ¬ evalPF va (fun _ => False) f := by
+  refine ⟨by decide, fun hNot => absurd trivial hNot, ?_⟩
+  intro h
+  exact h (fun hFalse => hFalse)
+
 /-! #### 4.4.2 Part 6b: Invariant-Struct `private mk ::` Sealing (`Samite` cl/1029680381) -/
 
 /-- Unsealed capability structure (public default `mk` allows forging arbitrary invalid values). -/
@@ -2974,6 +3065,137 @@ theorem invariantStructSealingGuard_sound {decls : List StructSealingDescriptor}
   have hD := hGuard d hd
   simp only [hInv, Bool.not_true, Bool.false_or] at hD
   exact hD
+
+/-! #### 4.4.2b Operational Module-Boundary Sealing Model (A2)
+
+Closing B2's open issue: `private mk ::` alone is insufficient if the same file either
+attaches `deriving Inhabited` (synthesizing a public `default` constructor) OR exports a
+public unchecked wrapper `def V.mk' (v : Nat) : V := ⟨v⟩`. The operational model below
+evaluates arbitrary external client terms against a `StructModule` and proves by structural
+induction that `ModuleSealingGuard` preserves the struct invariant on EVERY client-producible
+value. -/
+
+/-- Classification of a same-file public export that can construct a sealed struct. -/
+inductive PublicExportKind : Type where
+  /-- Smart constructor checking a boolean guard `g` before invoking private `mk`. -/
+  | checkedCtor (guard : Nat → Bool)
+  /-- Unchecked public wrapper (e.g., `def V.mk' (v : Nat) : V := ⟨v⟩`). -/
+  | uncheckedLeak
+  /-- Public `Inhabited` / `OfNat` constant instance yielding a fixed payload `d`. -/
+  | defaultInstance (defaultVal : Nat)
+
+/-- Module-boundary specification for an invariant-bearing Lean `structure`. -/
+structure StructModule : Type where
+  ctorPrivate : Bool
+  derivesInhabited : Bool
+  inv : Nat → Bool
+  exports : List PublicExportKind
+
+/-- External client expression language over a `StructModule`. -/
+inductive ClientExpr : Type where
+  /-- Direct constructor invocation `S.mk n` (succeeds iff constructor is public). -/
+  | directMk (n : Nat)
+  /-- Derived `default` invocation (succeeds iff `deriving Inhabited` was emitted). -/
+  | callDefault
+  /-- Invocation of same-file public export `#idx` with payload `arg`. -/
+  | callExport (idx : Nat) (arg : Nat)
+  /-- Client-side branching between two struct-producing expressions. -/
+  | choose (cond : Bool) (lhs rhs : ClientExpr)
+  deriving DecidableEq, Repr, Inhabited
+
+/-- Operational semantics: evaluates a client expression against module `m`, returning
+    `some v` if the module boundary permits producing a struct carrying payload `v`. -/
+def ClientExpr.eval (m : StructModule) : ClientExpr → Option Nat
+  | .directMk n => if !m.ctorPrivate then some n else none
+  | .callDefault => if m.derivesInhabited then some 0 else none
+  | .callExport idx arg =>
+    match m.exports[idx]? with
+    | some (.checkedCtor g) => if g arg then some arg else none
+    | some .uncheckedLeak => some arg
+    | some (.defaultInstance d) => some d
+    | none => none
+  | .choose cond lhs rhs => if cond then lhs.eval m else rhs.eval m
+
+/-- Soundness obligation for a same-file public constructor export. -/
+def ExportPreservesInv (inv : Nat → Bool) : PublicExportKind → Prop
+  | .checkedCtor g => ∀ n, g n = true → inv n = true
+  | .uncheckedLeak => False
+  | .defaultInstance d => inv d = true
+
+/-- **Module-Boundary Sealing Guard (A2)**: requires `private mk ::`, forbids `deriving Inhabited`,
+    and requires every same-file public export to establish the struct invariant `m.inv`. -/
+def ModuleSealingGuard (m : StructModule) : Prop :=
+  m.ctorPrivate = true ∧
+    m.derivesInhabited = false ∧
+    ∀ ex ∈ m.exports, ExportPreservesInv m.inv ex
+
+/-- **Operational Leak Collapse (A2)**: even when `private mk ::` is enabled (`ctorPrivate = true`),
+    EITHER `deriving Inhabited` OR a same-file public wrapper `def V.mk' v := ⟨v⟩` allows an
+    external client to construct `v = 0` violating `0 < v`, and BOTH are rejected by
+    `ModuleSealingGuard`! -/
+theorem publicLeakOrDerivingInhabited_forges_invalid_value :
+    let posInv : Nat → Bool := fun n => decide (0 < n)
+    let modWithDeriving : StructModule :=
+      { ctorPrivate := true, derivesInhabited := true, inv := posInv, exports := [] }
+    let modWithLeak : StructModule :=
+      { ctorPrivate := true, derivesInhabited := false, inv := posInv,
+        exports := [.uncheckedLeak] }
+    ClientExpr.callDefault.eval modWithDeriving = some 0 ∧
+      posInv 0 = false ∧
+      ¬ ModuleSealingGuard modWithDeriving ∧
+      (ClientExpr.callExport 0 0).eval modWithLeak = some 0 ∧
+      ¬ ModuleSealingGuard modWithLeak := by
+  refine ⟨rfl, rfl, ?_, rfl, ?_⟩
+  · intro h
+    cases h.2.1
+  · intro h
+    exact h.2.2 .uncheckedLeak (by simp)
+
+/-- **Operational Guard 6b Soundness (A2)**: under `ModuleSealingGuard m`, EVERY value
+    constructible by ANY external `ClientExpr` genuinely satisfies `m.inv v = true`! -/
+theorem moduleSealingGuard_preserves_client_invariant {m : StructModule}
+    (hGuard : ModuleSealingGuard m) :
+    ∀ (e : ClientExpr) {v : Nat}, e.eval m = some v → m.inv v = true := by
+  intro e
+  induction e with
+  | directMk n =>
+    intro v hEval
+    simp only [ClientExpr.eval, hGuard.1, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hEval
+    cases hEval
+  | callDefault =>
+    intro v hEval
+    simp only [ClientExpr.eval, hGuard.2.1, Bool.false_eq_true, ↓reduceIte] at hEval
+    cases hEval
+  | callExport idx arg =>
+    intro v hEval
+    simp only [ClientExpr.eval] at hEval
+    cases hGet : m.exports[idx]? with
+    | none =>
+      rw [hGet] at hEval
+      cases hEval
+    | some ex =>
+      rw [hGet] at hEval
+      have hMem : ex ∈ m.exports := List.mem_of_getElem? hGet
+      have hEx := hGuard.2.2 ex hMem
+      cases ex with
+      | checkedCtor g =>
+        by_cases hg : g arg = true
+        · simp only [hg, ↓reduceIte, Option.some.injEq] at hEval
+          subst hEval
+          exact hEx arg hg
+        · simp only [hg] at hEval
+          cases hEval
+      | uncheckedLeak =>
+        exact False.elim hEx
+      | defaultInstance d =>
+        simp only [Option.some.injEq] at hEval
+        subst hEval
+        exact hEx
+  | choose cond lhs rhs ihL ihR =>
+    intro v hEval
+    cases cond with
+    | true => exact ihL (by simpa [ClientExpr.eval] using hEval)
+    | false => exact ihR (by simpa [ClientExpr.eval] using hEval)
 
 /-- Combined Guard 6 (`Verifrag` cl/1029131309 + `Samite` cl/1029680381). -/
 def AssumptionPolarityAndStructSealingGuard

@@ -570,6 +570,39 @@ def isCodegenUnsafeRec (lookup : Name → Option ConstantInfo) (n : Name) (ci : 
       | none => false
     | _ => false
 
+/-- Strict structural compatibility predicate for duplicate `ConstantInfo` records (A2).
+    Never short-circuits on `value? == none` and never allows kind confusion (`axiom` vs
+    `defn`) or differing inductive/ctor/recursor metadata. -/
+def constInfoCompat (a b : ConstantInfo) : Bool :=
+  a.levelParams == b.levelParams &&
+  match a, b with
+  | .thmInfo x, .thmInfo y => x.type.eqv y.type
+  | .defnInfo x, .defnInfo y => x.type == y.type && x.value == y.value && x.safety == y.safety
+  | .opaqueInfo x, .opaqueInfo y => x.type == y.type && x.value == y.value && x.isUnsafe == y.isUnsafe
+  | .axiomInfo x, .axiomInfo y => x.type == y.type && x.isUnsafe == y.isUnsafe
+  | .quotInfo x, .quotInfo y =>
+    x.type == y.type &&
+      (match x.kind, y.kind with
+       | .type, .type | .ctor, .ctor | .lift, .lift | .ind, .ind => true
+       | _, _ => false)
+  | .inductInfo x, .inductInfo y =>
+    x.type == y.type && x.numParams == y.numParams && x.numIndices == y.numIndices &&
+      x.all == y.all && x.ctors == y.ctors && x.numNested == y.numNested &&
+      x.isRec == y.isRec && x.isUnsafe == y.isUnsafe && x.isReflexive == y.isReflexive
+  | .ctorInfo x, .ctorInfo y => x == y
+  | .recInfo x, .recInfo y => x == y
+  | _, _ => false
+
+/-- Bijective JSON encoding of `Lean.Name` components (preserving `Name.num`, `«a.b»`,
+    tabs, and newlines without lossy `String.toName` round-tripping). -/
+def encodeNameSegs : Name → Array Json
+  | .anonymous => #[]
+  | .str p s => (encodeNameSegs p).push (toJson #["s", s])
+  | .num p k => (encodeNameSegs p).push (toJson #["n", toString k])
+
+def encodeNameKey (n : Name) : String :=
+  (toJson (encodeNameSegs n)).compress
+
 def expressionEdges (e : Expr) : NameSet :=
   let base := e.getUsedConstantsAsSet
   let base := if (e.find? fun | .lit (.natVal _) => true | _ => false).isSome then base.insert `Nat else base
@@ -677,23 +710,18 @@ def main (args : List String) : IO UInt32 := do
             viols := viols.push (mkViol "key_mismatch" m.toString "constNames_size_mismatch")
           for idx in [:mdata.constants.size] do
             let ci := mdata.constants[idx]!
+            if (baseEnv.find? ci.name).isSome then
+              viols := viols.push (mkViol "stale_sibling_duplicate" ci.name.toString "shadows_stdlib_constant")
             match constMap[ci.name]? with
             | none =>
               constMap := constMap.insert ci.name ci
               constOrigin := constOrigin.insert ci.name m
             | some existing =>
               siblingEqDedup := siblingEqDedup + 1
-              let compat :=
-                existing.levelParams == ci.levelParams &&
-                (match existing, ci with
-                 | .thmInfo _, .thmInfo _ => existing.type.eqv ci.type
-                 | _, _ =>
-                   existing.type == ci.type &&
-                   (existing.value? true == ci.value? true || existing.value? true == none || ci.value? true == none))
-              if !compat then
-                let vCode := match ci with
-                  | .inductInfo _ => "mutual_metadata_mismatch"
-                  | _ => "stale_sibling_duplicate"
+              if !constInfoCompat existing ci then
+                let vCode := match existing, ci with
+                  | .inductInfo _, _ | _, .inductInfo _ => "mutual_metadata_mismatch"
+                  | _, _ => "stale_sibling_duplicate"
                 viols := viols.push (mkViol vCode ci.name.toString "sibling_duplicate_diff")
               if (existing.value? true).isNone && (ci.value? true).isSome then
                 constMap := constMap.insert ci.name ci
@@ -728,10 +756,10 @@ def main (args : List String) : IO UInt32 := do
           let (hasVal, valHash) := match ci.value? (allowOpaque := true) with
             | some v => ("1", toString v.hash)
             | none => ("0", "0")
-          -- JSON-lines (B2): names may contain tabs/newlines via `«...»`; a TSV split would
-          -- silently DROP such records from cross-shard reconciliation.
+          -- JSON-lines (B2 + A2): 9th element is bijective `encodeNameKey` preserving
+          -- `Name.num`, `«a.b»`, tabs, and newlines without lossy `String.toName`.
           fh.putStrLn (toJson #[modName.toString, ci.name.toString, ciKindStr ci, lvlStr,
-            toString ci.type.hash, hasVal, valHash, ciMetaTag ci]).compress
+            toString ci.type.hash, hasVal, valHash, ciMetaTag ci, encodeNameKey ci.name]).compress
         if kName != ci.name then
           viols := viols.push (mkViol "key_mismatch" kName.toString ci.name.toString)
         match ci with
@@ -1041,27 +1069,26 @@ def inspect_live_oleans(
         result["axioms_reached"] = sorted(result.get("axioms_reached", []))
         result["wall_sec"] = wall_sec
         if export_fingerprints and fp_path.is_file():
-            fps: list[tuple[str, str, str, str, str, bool, str, str]] = []
+            fps: list[tuple[Any, ...]] = []
             with fp_path.open("r", encoding="utf-8") as fh:
                 for raw in fh:
                     raw = raw.rstrip("\n")
                     if not raw:
                         continue
                     parts = json.loads(raw)
-                    if not (isinstance(parts, list) and len(parts) == 8):
+                    if not (isinstance(parts, list) and len(parts) in (8, 9)):
                         raise RuntimeError(f"malformed fingerprint record: {raw[:200]!r}")
-                    fps.append(
-                        (
-                            parts[0],
-                            parts[1],
-                            parts[2],
-                            parts[3],
-                            parts[4],
-                            parts[5] == "1",
-                            parts[6],
-                            parts[7],
-                        )
+                    base_rec = (
+                        parts[0],
+                        parts[1],
+                        parts[2],
+                        parts[3],
+                        parts[4],
+                        parts[5] == "1",
+                        parts[6],
+                        parts[7],
                     )
+                    fps.append(base_rec + (parts[8],) if len(parts) == 9 else base_rec)
             result["declaration_fingerprints"] = fps
         return result
 
@@ -1071,30 +1098,63 @@ import Lean
 
 open Lean
 
-/-- Exact (structural) cross-module duplicate reconciliation: load ONLY the `.olean` parts of
-    the involved modules and compare every duplicated declaration with the SAME predicate
-    the monolithic loader applies (never a lossy hash). -/
+def encodeNameSegs : Name → Array Json
+  | .anonymous => #[]
+  | .str p s => (encodeNameSegs p).push (toJson #["s", s])
+  | .num p k => (encodeNameSegs p).push (toJson #["n", toString k])
+
+def encodeNameKey (n : Name) : String :=
+  (toJson (encodeNameSegs n)).compress
+
+/-- Strict structural compatibility predicate (A2): discriminates every `ConstantInfo`
+    constructor, rejects kind confusion (`axiom` vs `defn`), and checks full inductive,
+    constructor, recursor, and safety metadata. -/
+def constInfoCompat (a b : ConstantInfo) : Bool :=
+  a.levelParams == b.levelParams &&
+  match a, b with
+  | .thmInfo x, .thmInfo y => x.type.eqv y.type
+  | .defnInfo x, .defnInfo y => x.type == y.type && x.value == y.value && x.safety == y.safety
+  | .opaqueInfo x, .opaqueInfo y => x.type == y.type && x.value == y.value && x.isUnsafe == y.isUnsafe
+  | .axiomInfo x, .axiomInfo y => x.type == y.type && x.isUnsafe == y.isUnsafe
+  | .quotInfo x, .quotInfo y =>
+    x.type == y.type &&
+      (match x.kind, y.kind with
+       | .type, .type | .ctor, .ctor | .lift, .lift | .ind, .ind => true
+       | _, _ => false)
+  | .inductInfo x, .inductInfo y =>
+    x.type == y.type && x.numParams == y.numParams && x.numIndices == y.numIndices &&
+      x.all == y.all && x.ctors == y.ctors && x.numNested == y.numNested &&
+      x.isRec == y.isRec && x.isUnsafe == y.isUnsafe && x.isReflexive == y.isReflexive
+  | .ctorInfo x, .ctorInfo y => x == y
+  | .recInfo x, .recInfo y => x == y
+  | _, _ => false
+
+/-- Exact (structural) cross-module duplicate reconciliation (B2 + A2):
+    keys declarations bijectively via `encodeNameKey` (never `String.toName`), checks
+    intra-module parts for conflicts, and compares cross-module pairs using `constInfoCompat`. -/
 def main (args : List String) : IO UInt32 := do
   let some path := args.head? | return 2
   let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile path)
-  let names ← IO.ofExcept <| j.getObjValAs? (Array (Array String)) "names"
+  -- Each row: `[displayName, canonicalKey, mod1, mod2, ...]`
+  let rows ← IO.ofExcept <| j.getObjValAs? (Array (Array String)) "rows"
   let overridePairs := (j.getObjValAs? (Array (Array String)) "olean_overrides").toOption.getD #[]
-  let overrides : Std.HashMap Name String := overridePairs.foldl (fun acc pr =>
-    if pr.size == 2 then acc.insert pr[0]!.toName pr[1]! else acc) {}
+  let overrides : Std.HashMap String String := overridePairs.foldl (fun acc pr =>
+    if pr.size == 2 then acc.insert pr[0]! pr[1]! else acc) {}
   initSearchPath (← Lean.findSysroot) (System.SearchPath.parse ((← IO.getEnv "LEAN_PATH").getD ""))
-  let mut wantedMods : NameSet := {}
-  let mut wantedNames : NameSet := {}
-  for row in names do
-    if row.size >= 1 then
-      wantedNames := wantedNames.insert row[0]!.toName
-      for m in row[1:] do
-        wantedMods := wantedMods.insert m.toName
-  let mut table : Std.HashMap (Name × Name) ConstantInfo := {}
-  for m in wantedMods.toList do
-    let paths ← match overrides[m]? with
+  let mut wantedMods : Std.HashSet String := {}
+  let mut wantedKeys : Std.HashSet String := {}
+  for row in rows do
+    if row.size >= 2 then
+      wantedKeys := wantedKeys.insert row[1]!
+      for m in row[2:] do
+        wantedMods := wantedMods.insert m
+  let mut table : Std.HashMap (String × String) ConstantInfo := {}
+  let mut conflicts : Array Json := #[]
+  for mStr in wantedMods.toList do
+    let paths ← match overrides[mStr]? with
       | some op => pure #[System.FilePath.mk op]
       | none => do
-        let base ← Lean.findOLean m
+        let base ← Lean.findOLean mStr.toName
         let mut ps : Array System.FilePath := #[base]
         for suf in [".server", ".private"] do
           let q := System.FilePath.mk (base.toString ++ suf)
@@ -1103,34 +1163,33 @@ def main (args : List String) : IO UInt32 := do
     let parts ← Lean.readModuleDataParts paths
     for (mdata, _) in parts do
       for ci in mdata.constants do
-        if wantedNames.contains ci.name then
-          match table[(m, ci.name)]? with
+        let eKey := encodeNameKey ci.name
+        let sKey := ci.name.toString
+        let matchedKey? :=
+          if wantedKeys.contains eKey then some eKey
+          else if wantedKeys.contains sKey then some sKey
+          else none
+        if let some k := matchedKey? then
+          match table[(mStr, k)]? with
           | some prev =>
-            if (prev.value? true).isNone && (ci.value? true).isSome then
-              table := table.insert (m, ci.name) ci
-          | none => table := table.insert (m, ci.name) ci
-  let compat (a b : ConstantInfo) : Bool :=
-    a.levelParams == b.levelParams &&
-      (match a, b with
-       | .thmInfo _, .thmInfo _ => a.type.eqv b.type
-       | _, _ =>
-         a.type == b.type &&
-         (a.value? true == b.value? true || a.value? true == none || b.value? true == none))
-  let mut conflicts : Array Json := #[]
+            if !constInfoCompat prev ci then
+              conflicts := conflicts.push (toJson #[ci.name.toString, mStr, mStr, "intra_mod_conflict"])
+          | none => table := table.insert (mStr, k) ci
   let mut compared : Nat := 0
-  for row in names do
-    if row.size >= 3 then
-      let n := row[0]!.toName
-      let mods := row[1:].toArray.map String.toName
+  for row in rows do
+    if row.size >= 4 then
+      let disp := row[0]!
+      let key := row[1]!
+      let mods := row[2:].toArray
       for i in [:mods.size] do
         for k in [i+1:mods.size] do
-          match table[(mods[i]!, n)]?, table[(mods[k]!, n)]? with
+          match table[(mods[i]!, key)]?, table[(mods[k]!, key)]? with
           | some a, some b =>
             compared := compared + 1
-            if !compat a b then
-              conflicts := conflicts.push (toJson #[n.toString, mods[i]!.toString, mods[k]!.toString])
+            if !constInfoCompat a b then
+              conflicts := conflicts.push (toJson #[disp, mods[i]!, mods[k]!])
           | _, _ =>
-            conflicts := conflicts.push (toJson #[n.toString, mods[i]!.toString, mods[k]!.toString, "missing"])
+            conflicts := conflicts.push (toJson #[disp, mods[i]!, mods[k]!, "missing"])
   IO.println (Json.mkObj [("pairs_compared", toJson compared), ("conflicts", .arr conflicts)]).compress
   return 0
 '''
@@ -1138,29 +1197,32 @@ def main (args : List String) : IO UInt32 := do
 
 def exact_reconcile_cross_module_duplicates(
     repo_root: Path,
-    shard_fingerprints: dict[str, list[tuple[str, str, str, str, str, bool, str, str]]],
+    shard_fingerprints: dict[str, list[tuple[Any, ...]]],
     olean_overrides: dict[str, str] | None = None,
     timeout_sec: int = 600,
 ) -> dict[str, Any]:
-    """Exact cross-shard duplicate reconciliation (B2).
+    """Exact cross-shard duplicate reconciliation (B2 + A2).
 
-    The fingerprint table is used ONLY to select candidates: every declaration name that
-    occurs in two or more DISTINCT modules belonging to DIFFERENT shards, regardless of
-    whether their `Expr.hash` fingerprints agree (64-bit hashes collide, e.g. `Nat`
-    literals `k` and `k + 2^64`). Each candidate pair is then compared structurally in Lean
-    with the monolithic loader's compatibility predicate.
+    The fingerprint table selects every declaration name key occurring in two or more
+    DISTINCT modules belonging to DIFFERENT shards, keyed bijectively by `encodeNameKey`
+    (falling back to display name for synthetic 8-tuples). Each candidate pair is compared
+    structurally in Lean via `constInfoCompat` (strict constructor/kind + full metadata parity).
     """
     shard_of_mod: dict[str, str] = {}
-    mods_of_name: dict[str, set[str]] = {}
+    mods_of_key: dict[str, set[str]] = {}
+    disp_of_key: dict[str, str] = {}
     for shard_name, recs in shard_fingerprints.items():
         for rec in recs:
-            shard_of_mod.setdefault(rec[0], shard_name)
-            mods_of_name.setdefault(rec[1], set()).add(rec[0])
+            mod_name, disp_name = rec[0], rec[1]
+            canon_key = rec[8] if len(rec) >= 9 else disp_name
+            shard_of_mod.setdefault(mod_name, shard_name)
+            mods_of_key.setdefault(canon_key, set()).add(mod_name)
+            disp_of_key.setdefault(canon_key, disp_name)
     rows: list[list[str]] = []
-    for name in sorted(mods_of_name):
-        mods = sorted(mods_of_name[name])
+    for canon_key in sorted(mods_of_key):
+        mods = sorted(mods_of_key[canon_key])
         if len(mods) >= 2 and len({shard_of_mod[m] for m in mods}) >= 2:
-            rows.append([name] + mods)
+            rows.append([disp_of_key[canon_key], canon_key] + mods)
     if not rows:
         return {"ok": True, "candidate_names": 0, "pairs_compared": 0, "violations": []}
     runner = _find_anneal_lean_run(repo_root)
@@ -1172,7 +1234,7 @@ def exact_reconcile_cross_module_duplicates(
         req.write_text(
             json.dumps(
                 {
-                    "names": rows,
+                    "rows": rows,
                     "olean_overrides": [[m, str(pth)] for m, pth in sorted((olean_overrides or {}).items())],
                 },
                 sort_keys=True,
@@ -1193,13 +1255,14 @@ def exact_reconcile_cross_module_duplicates(
     violations: list[dict[str, str]] = []
     for c in out["conflicts"]:
         name, ma, mb = c[0], c[1], c[2]
-        if shard_of_mod.get(ma) != shard_of_mod.get(mb):
+        tag = c[3] if len(c) > 3 else ""
+        if tag == "intra_mod_conflict" or shard_of_mod.get(ma) != shard_of_mod.get(mb):
             violations.append(
                 {
                     "code": "cross_shard_duplicate_conflict",
                     "subject": name,
                     "detail": f"exact:{shard_of_mod.get(ma)}:{ma}!={shard_of_mod.get(mb)}:{mb}"
-                    + (":missing" if len(c) > 3 else ""),
+                    + (f":{tag}" if tag else ""),
                 }
             )
     return {
@@ -1335,6 +1398,10 @@ def main (args : List String) : IO UInt32 := do
             | .lit (.natVal k) => some (.lit (.natVal (k + 18446744073709551616)))
             | _ => none }
           hit := true
+        else if v.name == target && mutation == "replace_defn_with_axiom" then
+          -- A2 red-team: replace a `.defnInfo` with an `.axiomInfo` of identical name/levels/type!
+          ci' := .axiomInfo { name := v.name, levelParams := v.levelParams, type := v.type, isUnsafe := false }
+          hit := true
       | .thmInfo v =>
         if v.name == target && mutation == "forge_open_expr" then
           ci' := .thmInfo { v with value := .bvar 0 }; hit := true
@@ -1355,6 +1422,7 @@ def main (args : List String) : IO UInt32 := do
 
 FORGE_MUTATIONS: tuple[str, ...] = (
     "collide_nat_literal",
+    "replace_defn_with_axiom",
     "flip_is_rec",
     "bump_num_indices",
     "drop_self_from_all",
@@ -2589,14 +2657,44 @@ def _rust_expr_is_tautology(toks: list[Token]) -> bool:
             return True
         pos: set[str] = set()
         neg: set[str] = set()
+        eq_p: set[tuple[str, str]] = set()
+        neq_p: set[tuple[str, str]] = set()
+        lt_p: set[tuple[str, str]] = set()
+        le_p: set[tuple[str, str]] = set()
         for d in disjuncts:
             ds = _strip_outer_rust_wrappers(d)
-            if ds and ds[0].text == "!":
+            if not ds:
+                continue
+            if ds[0].text == "!":
                 neg.add(_norm_tok_expr(ds[1:]))
-            elif ds:
+            else:
                 pos.add(_norm_tok_expr(ds))
-        if pos & neg:
+            for op in ("==", "!=", "<", "<=", ">", ">="):
+                pts = _split_top_level_tokens(ds, op)
+                if len(pts) == 2 and pts[0] and pts[1]:
+                    a, b = _norm_tok_expr(pts[0]), _norm_tok_expr(pts[1])
+                    if op == "==":
+                        eq_p.add((a, b)); eq_p.add((b, a))
+                    elif op == "!=":
+                        neq_p.add((a, b)); neq_p.add((b, a))
+                    elif op == "<":
+                        lt_p.add((a, b))
+                    elif op == ">":
+                        lt_p.add((b, a))
+                    elif op == "<=":
+                        le_p.add((a, b))
+                    elif op == ">=":
+                        le_p.add((b, a))
+                    break
+        if (pos & neg) or (eq_p & neq_p):
             return True
+        # Complementary total-order disjuncts: `a < b || a >= b` (i.e. `(a,b) in lt_p` and `(b,a) in le_p`)
+        for a, b in lt_p:
+            if (b, a) in le_p:
+                return True
+        for a, b in le_p:
+            if (b, a) in le_p:
+                return True
     conjuncts = _split_top_level_tokens(toks, "&&")
     if len(conjuncts) > 1:
         return all(_rust_expr_is_tautology(c) for c in conjuncts)
@@ -2710,15 +2808,17 @@ def _rust_expr_is_unsatisfiable(toks: list[Token]) -> bool:
 
 
 def _rust_conjuncts_contradict(conjuncts: list[list[Token]]) -> bool:
-    # Flatten nested `&&` across conjuncts so `[x == 1 && y == 2, x == 2]` is caught too.
+    # Recursively flatten nested `&&` across conjuncts so `a && (b && (c && !a))` is caught.
     flat: list[list[Token]] = []
-    for raw in conjuncts:
+    queue = list(conjuncts)
+    while queue:
+        raw = queue.pop()
         s = _strip_outer_rust_wrappers(raw)
         if not s:
             continue
         sub = _split_top_level_tokens(s, "&&")
         if len(sub) > 1:
-            flat.extend(sub)
+            queue.extend(sub)
         else:
             flat.append(s)
 
@@ -2961,7 +3061,7 @@ def scan_rust_unsatisfiable_extern_ensures(
             for attr_toks, ln in attrs:
                 path, args = _attr_path_and_args(attr_toks)
                 leaf = path.split("::")[-1] if path else ""
-                if leaf == "external_spec":
+                if leaf in ("external_spec", "extern_spec"):
                     is_external_spec_attr = True
                     attr_line = ln
                     rq, en = _extract_contract_clauses(args)
@@ -3017,6 +3117,21 @@ def scan_rust_unsatisfiable_extern_ensures(
                             )
                 i = next_pos
                 continue
+            # Support `#[extern_spec]` / `#[external_spec]` attached to an `impl`, `mod`, or `trait` block.
+            if is_external_spec_attr:
+                j = after_attrs
+                while j < n and tokens[j].text in ("pub", "unsafe"):
+                    j += 1
+                    if j < n and tokens[j - 1].text == "pub" and tokens[j].text == "(":
+                        j = _find_matching_delim(tokens, j, "(", ")") + 1
+                if j < n and tokens[j].text in ("impl", "mod", "trait"):
+                    while j < n and tokens[j].text not in ("{", ";"):
+                        j += 1
+                    if j < n and tokens[j].text == "{":
+                        brace_depth += 1
+                        in_extern_block_brace_depths.append(brace_depth)
+                        i = j + 1
+                        continue
             i = after_attrs
             continue
         i += 1
@@ -3250,12 +3365,17 @@ def scan_rust_fndef_ghost_token_coercion(
                         d -= 1
                     j += 1
             last_ident = None
+            angle_d = 0
             while j < n and tokens[j].text != "{":
-                if tokens[j].text == "where":
+                if tokens[j].text == "where" and angle_d == 0:
                     while j < n and tokens[j].text != "{":
                         j += 1
                     break
-                if tokens[j].kind == "IDENT" and tokens[j].text != "for":
+                if tokens[j].text == "<":
+                    angle_d += 1
+                elif tokens[j].text == ">":
+                    angle_d = max(0, angle_d - 1)
+                elif angle_d == 0 and tokens[j].kind == "IDENT" and tokens[j].text != "for":
                     last_ident = tokens[j].text
                 j += 1
             if j < n and tokens[j].text == "{":
@@ -3406,7 +3526,7 @@ def scan_rust_fndef_ghost_token_coercion(
         # Detect closure start: `|| expr` or `|params| expr` when preceded by expr-start token
         prev_txt = tokens[i - 1].text if i > 0 else ""
         can_start_closure = i == 0 or prev_txt in (
-            "=", "(", ",", "{", ";", "return", "move", "=>", ":", "[", "&&", "||",
+            "=", "(", ",", "{", ";", "return", "move", "async", "static", "=>", ":", "[", "&&", "||",
         )
         if can_start_closure and tokens[i].text in ("||", "|"):
             body_start = -1
@@ -3483,13 +3603,12 @@ def scan_rust_fndef_ghost_token_coercion(
                 impl_ty = enclosing_impl_type(i)
                 if impl_ty is not None:
                     segs = [impl_ty] + segs[1:]
-            # Track calls to single-entry authority functions (`main(...)`) for re-entrancy checks
+            # Track calls AND FnDef value references to single-entry authority functions (`main`)
             if (
                 segs
                 and segs[-1] in GHOST_TOKEN_AUTHORITY_FNS
-                and next_i < n
-                and tokens[next_i].text == "("
-                and (i == 0 or tokens[i - 1].text != ".")
+                and (i == 0 or tokens[i - 1].text not in (".", "mod", "struct", "enum", "trait", "type", "fn"))
+                and not (next_i < n and tokens[next_i].text == ":")
             ):
                 authority_calls.append((segs[-1], i, "::".join(segs)))
             if matches_ctor(segs):
@@ -3641,8 +3760,10 @@ def _extract_owned_type_names(type_toks: list[Token]) -> set[str]:
                     d -= 1
                 i += 1
             continue
-        if t.kind == "IDENT" and t.text in ("dyn", "impl", "mut", "const", "where", "for"):
+        if t.kind == "IDENT" and t.text in ("dyn", "impl", "mut", "const", "where", "for", "unsafe", "extern"):
             i += 1
+            if t.text == "extern" and i < n and type_toks[i].kind == "STRING":
+                i += 1
             continue
         if t.text in ("&", "*"):
             # Skip inner borrowed/raw-pointer type (including multi-segment paths, tuples, slices)
@@ -4384,6 +4505,40 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
     if not toks:
         return []
 
+    # Strip leading `let ... := ...;` or newline-delimited `let ... := val\n body` bindings
+    if toks[0].text in ("let", "have"):
+        d = 0
+        assign_pos = -1
+        for idx in range(1, len(toks)):
+            t = toks[idx].text
+            if t in ("(", "[", "{", "⦃"):
+                d += 1
+            elif t in (")", "]", "}", "⦄"):
+                d = max(0, d - 1)
+            elif d == 0 and t == ":=":
+                assign_pos = idx
+                break
+        if assign_pos != -1 and assign_pos + 1 < len(toks):
+            d = 0
+            body_pos = -1
+            val_start_line = toks[assign_pos + 1].line
+            _CONT_OPS = frozenset({":=", ":", "→", "->", "↔", "<->", "∧", "/\\", "∨", "\\/", ",", "+", "-", "*", "="})
+            for idx in range(assign_pos + 1, len(toks)):
+                t = toks[idx].text
+                if d == 0 and idx > assign_pos + 1 and toks[idx].line > val_start_line and toks[idx - 1].text not in _CONT_OPS:
+                    body_pos = idx
+                    break
+                if t in ("(", "[", "{", "⦃"):
+                    d += 1
+                elif t in (")", "]", "}", "⦄"):
+                    d = max(0, d - 1)
+                elif d == 0 and t == ";":
+                    body_pos = idx + 1
+                    break
+                val_start_line = toks[idx].line
+            if body_pos != -1 and body_pos < len(toks):
+                return _check_lean_prop_polarity(toks[body_pos:], pol)
+
     # Leading `∀ binders, body` / `∃ binders, body`: a `∀ (h : T), B` binder type `T` is an
     # ANTECEDENT (`T → B`, flipped polarity); an `∃ (h : T), B` binder type is a conjunct
     # (`T ∧ B`, same polarity).
@@ -4499,9 +4654,33 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
                 bad.extend(_check_lean_prop_polarity(p, pol))
             return bad
 
-    # Next: unary negation `¬` / `Not`
-    if toks[0].text in ("¬", "Not"):
+    # Next: unary negation `¬` / `Not` / boolean `!`
+    if toks[0].text in ("¬", "Not", "!"):
         return _check_lean_prop_polarity(toks[1:], _flip_pol(pol))
+
+    # Prefix `Iff P Q` (both polarities, same as `P ↔ Q`)
+    if toks[0].text == "Iff" and len(toks) >= 3:
+        args_toks = toks[1:]
+        return _check_lean_prop_polarity(args_toks, "pos") + _check_lean_prop_polarity(args_toks, "neg")
+
+    # Boolean equality / disequality against `true` / `false`:
+    # `assumes = false`, `false = assumes`, `assumes != true`, `assumes ≠ true` flip polarity!
+    for op, flip_on_true, flip_on_false in (
+        ("=", False, True),
+        ("==", False, True),
+        ("!=", True, False),
+        ("≠", True, False),
+    ):
+        eq_parts = _split_top_level_tokens(toks, op)
+        if len(eq_parts) == 2 and eq_parts[0] and eq_parts[1]:
+            lhs_s = _strip_outer_parens(eq_parts[0])
+            rhs_s = _strip_outer_parens(eq_parts[1])
+            if len(rhs_s) == 1 and rhs_s[0].text in ("true", "false"):
+                do_flip = flip_on_true if rhs_s[0].text == "true" else flip_on_false
+                return _check_lean_prop_polarity(lhs_s, _flip_pol(pol) if do_flip else pol)
+            if len(lhs_s) == 1 and lhs_s[0].text in ("true", "false"):
+                do_flip = flip_on_true if lhs_s[0].text == "true" else flip_on_false
+                return _check_lean_prop_polarity(rhs_s, _flip_pol(pol) if do_flip else pol)
 
     # Leaf / atomic expression: check sub-bracketed expressions and direct assumes tokens
     bad = []
@@ -4512,8 +4691,15 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
             bad.extend(_check_lean_prop_polarity(toks[i + 1 : close], pol))
             i = close + 1
             continue
+        if toks[i].text == "!" and i + 1 < len(toks) and _is_assumes_token(toks[i + 1]):
+            if _flip_pol(pol) == "pos":
+                bad.append(toks[i + 1])
+            i += 2
+            continue
         if _is_assumes_token(toks[i]) and pol == "pos":
-            bad.append(toks[i])
+            # Exclude struct-literal field labels `{ assumesHold := true }`
+            if not (i + 1 < len(toks) and toks[i + 1].text == ":="):
+                bad.append(toks[i])
         i += 1
     return bad
 
@@ -4593,15 +4779,39 @@ def scan_lean_assumption_polarity(
             i = max(k, start_i + 1)
             continue
         is_example = kw == "example"
-        if (kw in ("theorem", "lemma", "def", "abbrev") and j + 1 < n and tokens[j + 1].kind == "IDENT") or is_example:
-            decl_name = f"example@L{tokens[j].line}" if is_example else tokens[j + 1].text
+        is_instance = kw == "instance"
+        if (
+            (kw in ("theorem", "lemma", "def", "abbrev") and j + 1 < n and tokens[j + 1].kind == "IDENT")
+            or is_example
+            or is_instance
+        ):
+            if is_example:
+                decl_name = f"example@L{tokens[j].line}"
+                sig_start = j + 1
+            elif is_instance:
+                if (
+                    j + 1 < n
+                    and tokens[j + 1].kind == "IDENT"
+                    and tokens[j + 1].text not in _LEAN_TOP_COMMANDS
+                    and (j + 2 >= n or tokens[j + 2].text not in (":=", "where"))
+                    and tokens[j + 1].text not in ("(", "[", "{", "⦃", ":")
+                ):
+                    decl_name = tokens[j + 1].text
+                    sig_start = j + 2
+                else:
+                    decl_name = f"instance@L{tokens[j].line}"
+                    sig_start = j + 1
+            else:
+                decl_name = tokens[j + 1].text
+                sig_start = j + 2
             decl_line = tokens[j].line
-            sig_start = j + 1 if is_example else j + 2
-            # Find depth-0 `:` (signature start) and `:=` / `where` (body start)
+            # Find depth-0 `:` (signature start) and `:=` / `where` (body start), skipping
+            # `:=` belonging to `let`/`have` bindings inside the statement type.
             k = sig_start
             depth = 0
             colon_idx = -1
             assign_idx = -1
+            let_assigns_expected = 0
             while k < n:
                 t = tokens[k].text
                 if t in ("(", "[", "{", "⦃", "@["):
@@ -4611,7 +4821,15 @@ def scan_lean_assumption_polarity(
                 elif depth == 0:
                     if t == ":" and colon_idx == -1:
                         colon_idx = k
-                    elif t in (":=", "where"):
+                    elif colon_idx != -1 and t in ("let", "have") and kw in ("theorem", "lemma", "example", "instance"):
+                        let_assigns_expected += 1
+                    elif t == ":=":
+                        if let_assigns_expected > 0:
+                            let_assigns_expected -= 1
+                        else:
+                            assign_idx = k
+                            break
+                    elif t == "where" and let_assigns_expected == 0:
                         assign_idx = k
                         break
                     elif t in _LEAN_TOP_COMMANDS and k > sig_start:
@@ -4633,22 +4851,33 @@ def scan_lean_assumption_polarity(
                     break
                 body_end += 1
 
-            # Inspect statement (for theorem/lemma) or Prop body + binders (for `: Prop :=` def/abbrev)
+            # Inspect statement (for theorem/lemma/example/instance) or Prop body + binders (for def/abbrev)
             target_slices: list[list[Token]] = []
             binder_bad: list[Token] = []
-            if kw in ("theorem", "lemma", "example") and colon_idx != -1:
+            _PROP_CONN = ("→", "->", "↔", "<->", "∧", "/\\", "∨", "\\/", "¬", "Not", "∀", "∃", "Iff")
+            if kw in ("theorem", "lemma", "example", "instance") and colon_idx != -1:
                 stmt_end = assign_idx if assign_idx != -1 else k
                 target_slices.append(tokens[colon_idx + 1 : stmt_end])
                 # Signature binders `(h : T)` are hypotheses: `theorem t (h : T) : B` is
                 # `T → B`, so each binder type is checked in NEGATIVE polarity.
                 for ty in _lean_binder_types(tokens[sig_start : colon_idx]):
                     binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
-            elif kw in ("def", "abbrev") and colon_idx != -1 and assign_idx != -1:
-                ret_slice = tokens[colon_idx + 1 : assign_idx]
-                if any(t.text == "Prop" for t in ret_slice):
-                    target_slices.append(tokens[assign_idx + 1 : body_end])
-                    for ty in _lean_binder_types(tokens[j + 2 : colon_idx]):
-                        binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
+            elif kw in ("def", "abbrev") and assign_idx != -1:
+                if colon_idx != -1:
+                    ret_slice = tokens[colon_idx + 1 : assign_idx]
+                    if any(t.text == "Prop" for t in ret_slice):
+                        target_slices.append(tokens[assign_idx + 1 : body_end])
+                        for ty in _lean_binder_types(tokens[sig_start : colon_idx]):
+                            binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
+                else:
+                    # Unannotated `def equiv (s i : EvalRes Nat) := ... → i.assumesHold = true`
+                    body_slice = tokens[assign_idx + 1 : body_end]
+                    if any(_is_assumes_token(t) for t in body_slice) and any(
+                        t.text in _PROP_CONN for t in body_slice
+                    ):
+                        target_slices.append(body_slice)
+                        for ty in _lean_binder_types(tokens[sig_start : assign_idx]):
+                            binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
             if binder_bad:
                 findings.append(
                     _make_peer_finding(
@@ -4730,6 +4959,9 @@ def scan_lean_invariant_struct_sealing(
     n = len(tokens)
     ns_stack: list[str] = []
     scope_kinds: list[tuple[str, str | None]] = []  # ("namespace"|"section", name)
+
+    sealed_targets: list[dict[str, Any]] = []
+    _MOD_KWS = frozenset({"private", "protected", "noncomputable", "unsafe", "partial", "scoped", "local"})
 
     i = 0
     while i < n:
@@ -4829,8 +5061,35 @@ def scan_lean_invariant_struct_sealing(
                         break
                 k += 1
 
+            # Locate end of this structure declaration (including any attached `deriving ...` clause).
+            decl_end = (where_idx + 1) if where_idx != -1 else k
+            depth = 0
+            deriving_idx = -1
+            while decl_end < n:
+                t = tokens[decl_end].text
+                if t == "@[":
+                    break
+                if t in ("(", "[", "{", "⦃"):
+                    depth += 1
+                elif t in (")", "]", "}", "⦄"):
+                    depth = max(0, depth - 1)
+                elif depth == 0:
+                    if t == "deriving":
+                        if decl_end + 1 < n and tokens[decl_end + 1].text == "instance":
+                            break
+                        deriving_idx = decl_end
+                    elif t in _LEAN_TOP_COMMANDS and t != "deriving":
+                        break
+                    elif t in _MOD_KWS and decl_end > (where_idx + 1 if where_idx != -1 else k):
+                        # Only break on a modifier if it begins a new top-level declaration
+                        nxt = _skip_lean_attrs_and_mods(tokens, decl_end)
+                        if nxt < n and tokens[nxt].text in _LEAN_TOP_COMMANDS:
+                            break
+                decl_end += 1
+
             if is_target:
                 sealed_ok = False
+                ctor_name: str | None = None
                 reason = "missing `where` clause and `private mk ::` constructor"
                 if where_idx != -1:
                     # Skip ONLY `@[...]` attribute blocks immediately after `where`
@@ -4847,6 +5106,7 @@ def scan_lean_invariant_struct_sealing(
                         and tokens[b + 2].text == "::"
                     ):
                         sealed_ok = True
+                        ctor_name = tokens[b + 1].text
                     else:
                         preview = " ".join(t.text for t in tokens[b : min(b + 4, n)])
                         reason = f"`where` body does not begin with `private <ctor> ::` (found `{preview}`)"
@@ -4860,11 +5120,242 @@ def scan_lean_invariant_struct_sealing(
                             file_path=file_path,
                         )
                     )
+                else:
+                    # Check attached `deriving ... Inhabited` (synthesizes public `default` ctor!)
+                    if deriving_idx != -1:
+                        derived_classes = {
+                            t.text.split(".")[-1]
+                            for t in tokens[deriving_idx + 1 : decl_end]
+                            if t.kind == "IDENT"
+                        }
+                        if "Inhabited" in derived_classes:
+                            findings.append(
+                                _make_peer_finding(
+                                    "unsealed_invariant_struct",
+                                    qual_name,
+                                    tokens[deriving_idx].line,
+                                    f"`deriving Inhabited` synthesizes a public `default` constructor bypassing `private {ctor_name} ::`",
+                                    file_path=file_path,
+                                )
+                            )
+                    sealed_targets.append(
+                        {
+                            "qual_name": qual_name,
+                            "raw_name": raw_name,
+                            "short_leaf": short_leaf,
+                            "ctor_name": ctor_name or "mk",
+                            "decl_end": decl_end,
+                        }
+                    )
 
-            i = max((where_idx + 1 if where_idx != -1 else k), j + 2)
+            i = max(decl_end, j + 2)
             continue
 
         i = max(j + 1, start_i + 1)
+
+    # Pass 2 (A2, closing B2 OPEN issue): audit same-file public constructor leaks on every
+    # sealed invariant-bearing structure (`def V.mk' v := ⟨v⟩`, `instance : Inhabited V := ⟨⟨0⟩⟩`,
+    # standalone `deriving instance Inhabited for V`).
+    if sealed_targets:
+        _PROOF_SIG_TOKS = frozenset({"=", "<", "≤", ">", "≥", "≠", "Prop", "∧", "∨", "→", "¬", "∀", "∃"})
+        i = 0
+        while i < n:
+            start_i = i
+            j = _skip_lean_attrs_and_mods(tokens, i)
+            if j >= n:
+                break
+            mods = {tokens[m].text for m in range(start_i, j)}
+            kw = tokens[j].text
+
+            # Standalone `deriving instance Inhabited for V`
+            if kw == "deriving" and j + 2 < n and tokens[j + 1].text == "instance":
+                k = j + 2
+                while k < n and tokens[k].text not in _LEAN_TOP_COMMANDS and tokens[k].text != "@[":
+                    k += 1
+                clause = tokens[j + 2 : k]
+                for_idx = next((idx for idx, t in enumerate(clause) if t.text == "for"), -1)
+                if for_idx != -1:
+                    cls_names = {t.text.split(".")[-1] for t in clause[:for_idx] if t.kind == "IDENT"}
+                    tgt_names = {t.text for t in clause[for_idx + 1 :] if t.kind == "IDENT"}
+                    if "Inhabited" in cls_names:
+                        for st in sealed_targets:
+                            s_names = {st["qual_name"], st["raw_name"], st["short_leaf"]}
+                            if s_names & tgt_names or any(tn.split(".")[-1] == st["short_leaf"] for tn in tgt_names):
+                                findings.append(
+                                    _make_peer_finding(
+                                        "unsealed_invariant_struct",
+                                        st["qual_name"],
+                                        tokens[j].line,
+                                        "standalone `deriving instance Inhabited` synthesizes a public `default` constructor",
+                                        file_path=file_path,
+                                    )
+                                )
+                i = max(k, start_i + 1)
+                continue
+
+            if kw in ("def", "abbrev", "instance") and "private" not in mods:
+                is_inst = kw == "instance"
+                if is_inst:
+                    decl_name = (
+                        tokens[j + 1].text
+                        if (j + 1 < n and tokens[j + 1].kind == "IDENT" and tokens[j + 1].text not in _LEAN_TOP_COMMANDS)
+                        else f"instance@L{tokens[j].line}"
+                    )
+                    sig_start = j + 1
+                else:
+                    if j + 1 >= n or tokens[j + 1].kind != "IDENT":
+                        i = j + 1
+                        continue
+                    decl_name = tokens[j + 1].text
+                    sig_start = j + 2
+
+                k = sig_start
+                depth = 0
+                colon_idx = -1
+                assign_idx = -1
+                while k < n:
+                    t = tokens[k].text
+                    if t in ("(", "[", "{", "⦃", "@["):
+                        depth += 1
+                    elif t in (")", "]", "}", "⦄"):
+                        depth = max(0, depth - 1)
+                    elif depth == 0:
+                        if t == ":" and colon_idx == -1:
+                            colon_idx = k
+                        elif t in (":=", "where"):
+                            assign_idx = k
+                            break
+                        elif t in _LEAN_TOP_COMMANDS and k > sig_start:
+                            break
+                    k += 1
+
+                body_end = (assign_idx + 1) if assign_idx != -1 else k
+                depth = 0
+                while body_end < n:
+                    t = tokens[body_end].text
+                    if t in ("(", "[", "{", "⦃", "@["):
+                        depth += 1
+                    elif t in (")", "]", "}", "⦄"):
+                        depth = max(0, depth - 1)
+                    elif depth == 0 and (
+                        t in _LEAN_TOP_COMMANDS
+                        or t == "@["
+                        or (
+                            t in _MOD_KWS
+                            and _skip_lean_attrs_and_mods(tokens, body_end) < n
+                            and tokens[_skip_lean_attrs_and_mods(tokens, body_end)].text in _LEAN_TOP_COMMANDS
+                        )
+                    ):
+                        break
+                    body_end += 1
+
+                if assign_idx != -1:
+                    sig_toks = tokens[sig_start : (colon_idx if colon_idx != -1 else assign_idx)]
+                    ret_toks = tokens[colon_idx + 1 : assign_idx] if colon_idx != -1 else []
+                    body_toks = tokens[assign_idx + 1 : body_end]
+
+                    # Split `ret_toks` on depth-0 arrows to isolate final return type vs antecedents
+                    ret_arrows: list[list[Token]] = []
+                    cur_seg: list[Token] = []
+                    d = 0
+                    for rt in ret_toks:
+                        if rt.text in ("(", "[", "{", "⦃"):
+                            d += 1
+                        elif rt.text in (")", "]", "}", "⦄"):
+                            d = max(0, d - 1)
+                        if d == 0 and rt.text in ("→", "->"):
+                            ret_arrows.append(cur_seg)
+                            cur_seg = []
+                        else:
+                            cur_seg.append(rt)
+                    ret_arrows.append(cur_seg)
+                    final_ret = _strip_outer_parens(ret_arrows[-1]) if ret_arrows else []
+                    ret_antes = ret_arrows[:-1]
+
+                    for st in sealed_targets:
+                        if j < st["decl_end"]:
+                            continue
+                        s_names = {st["qual_name"], st["raw_name"], st["short_leaf"]}
+                        ctor = st["ctor_name"]
+                        explicit_ctors = {f"{sn}.{ctor}" for sn in s_names} | {f".{ctor}"}
+                        constructs_directly = any(
+                            t.text in ("⟨", "{") or t.text in explicit_ctors for t in body_toks
+                        ) or any(
+                            body_toks[idx].text == "."
+                            and idx + 1 < len(body_toks)
+                            and body_toks[idx + 1].text == ctor
+                            for idx in range(len(body_toks))
+                        )
+                        if not constructs_directly:
+                            continue
+
+                        if is_inst:
+                            is_default_inst = (
+                                bool(final_ret)
+                                and final_ret[0].text.split(".")[-1] in ("Inhabited", "OfNat")
+                                and any(
+                                    t.text in s_names or t.text.split(".")[-1] == st["short_leaf"]
+                                    for t in final_ret[1:]
+                                )
+                            )
+                            has_proof_in_body = any(
+                                t.text in ("by", "decide", "omega", "simp", "rfl")
+                                for t in body_toks
+                            )
+                            if is_default_inst and not has_proof_in_body:
+                                findings.append(
+                                    _make_peer_finding(
+                                        "unsealed_invariant_struct",
+                                        st["qual_name"],
+                                        tokens[j].line,
+                                        f"public `{final_ret[0].text}` instance `{decl_name}` leaks unguarded private constructor",
+                                        file_path=file_path,
+                                    )
+                                )
+                        else:
+                            returns_bare_s = bool(final_ret) and (
+                                final_ret[0].text in s_names
+                                or final_ret[0].text.split(".")[-1] == st["short_leaf"]
+                            )
+                            unannotated_ctor_leak = (
+                                colon_idx == -1
+                                and any(t.text in {f"{sn}.{ctor}" for sn in s_names} for t in body_toks)
+                                and not any(t.text in ("some", "none", "Except.ok", "Except.error") for t in body_toks)
+                            )
+                            if not (returns_bare_s or unannotated_ctor_leak):
+                                continue
+                            # Check whether signature or body enforces an invariant proof
+                            binder_tys = _lean_binder_types(sig_toks) + ret_antes
+                            has_proof_binder = any(
+                                any(
+                                    bt.text in _PROOF_SIG_TOKS
+                                    or bt.text.lower().endswith("inv")
+                                    or bt.text.lower().startswith("valid")
+                                    for bt in ty
+                                )
+                                for ty in binder_tys
+                            )
+                            has_dite_or_proof = any(t.text == "by" for t in body_toks) or any(
+                                body_toks[idx].text == "if"
+                                and idx + 2 < len(body_toks)
+                                and body_toks[idx + 1].kind == "IDENT"
+                                and body_toks[idx + 2].text == ":"
+                                for idx in range(len(body_toks))
+                            )
+                            if not has_proof_binder and not has_dite_or_proof:
+                                findings.append(
+                                    _make_peer_finding(
+                                        "unsealed_invariant_struct",
+                                        st["qual_name"],
+                                        tokens[j].line,
+                                        f"public same-file `{kw} {decl_name}` leaks private constructor `{ctor}` without invariant check or proof",
+                                        file_path=file_path,
+                                    )
+                                )
+                i = max(body_end, start_i + 1)
+                continue
+            i = max(j + 1, start_i + 1)
+
     return findings
 
 

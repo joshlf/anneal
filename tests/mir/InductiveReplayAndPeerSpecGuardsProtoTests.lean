@@ -378,6 +378,41 @@ theorem b2_correctEquiv_semantically_antitone (va : String → Prop)
 #guard_msgs in
 #print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.injectiveDigest_reconciliation_exact
 
+/-! ## 7. A2 Regression Tests: Strict Kind Compat, Bool-Neg Polarity, Operational Guard 6b -/
+
+theorem a2_moduleSealingGuard_checked_client_test :
+    let posInv : Nat → Bool := fun n => decide (0 < n)
+    let safeMod : StructModule :=
+      { ctorPrivate := true, derivesInhabited := false, inv := posInv,
+        exports := [.checkedCtor posInv, .defaultInstance 1] }
+    ∀ (e : ClientExpr) {v : Nat}, e.eval safeMod = some v → posInv v = true := by
+  refine moduleSealingGuard_preserves_client_invariant ⟨rfl, rfl, ?_⟩
+  intro ex hex
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hex
+  rcases hex with rfl | rfl
+  · intro n hn; exact hn
+  · exact rfl
+
+theorem a2_kindConfusion_and_boolNeg_regression_test :
+    (strictConstCompat
+      { kind := .axiomDecl, levelParams := [], typeTag := "Nat", valueOpt := none, metaTag := "" }
+      { kind := .defnDecl, levelParams := [], typeTag := "Nat", valueOpt := some "0", metaTag := "" } = false) ∧
+    checkAssumesNegativePolarity (.imp (.not (.assumes "impl")) (.atom "outputEq")) = false :=
+  ⟨lossyCompat_accepts_axiom_vs_defn_and_forged_induct.2.1,
+   boolNegAssumes_antecedent_violates_antitonicity.1⟩
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.strictConstCompat_iff_eq_nonThm' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.strictConstCompat_iff_eq_nonThm
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant
+
+/-- info: 'Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.publicLeakOrDerivingInhabited_forges_invalid_value' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.publicLeakOrDerivingInhabited_forges_invalid_value
+
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
@@ -457,7 +492,12 @@ run_cmd do
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.danglingRecursor_rejected_statically_and_postReplay,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.shardLocalDupCheck_misses_crossShard_conflict,
         ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.crossShardFingerprintReconciliation_sound,
-        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.iffAndIftePolarity_accept_broken_impl] do
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.iffAndIftePolarity_accept_broken_impl,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.lossyCompat_accepts_axiom_vs_defn_and_forged_induct,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.strictConstCompat_iff_eq_nonThm,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.boolNegAssumes_antecedent_violates_antitonicity,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.publicLeakOrDerivingInhabited_forges_invalid_value,
+        ``Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto.moduleSealingGuard_preserves_client_invariant] do
     match env.find? flagship with
     | some (.thmInfo _) =>
       unless env.getModuleIdxFor? flagship == some modIdx do

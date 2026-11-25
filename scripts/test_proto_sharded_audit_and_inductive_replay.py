@@ -650,6 +650,46 @@ class TestPillar2ShardedAuditAndOrphanGate(unittest.TestCase):
                 {(v["code"], v["subject"]) for v in mono["violations"]},
             )
 
+    def test_15d_exact_reconciler_catches_axiom_vs_defn_kind_confusion_and_induct_meta_redteam(self) -> None:
+        """A2: B2's `compat` predicate short-circuited on `value? == none`, allowing an `.axiomInfo`
+        to match a `.defnInfo` of the same type AND allowing forged `.inductInfo` metadata (`isRec`)
+        across shards. `constInfoCompat` + bijective `encodeNameKey` catches both."""
+        mod = "Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"
+        def_target = mod + ".PeerSpecGuardClass.rank"
+        ind_target = mod + ".PeerSpecGuardClass"
+        dup_ax = "Fake.KindConfuseAx"
+        dup_ind = "Fake.IndMetaConflict"
+        with tempfile.TemporaryDirectory(prefix="anneal-kind-confuse-") as tmp_str:
+            out_ax = Path(tmp_str) / "ax.olean"
+            out_ind = Path(tmp_str) / "ind.olean"
+            proto.forge_olean_fixture(REPO_ROOT, mod, def_target, "replace_defn_with_axiom", out_ax)
+            proto.forge_olean_fixture(REPO_ROOT, mod, ind_target, "flip_is_rec", out_ind)
+            ov = {dup_ax: str(out_ax), dup_ind: str(out_ind)}
+            a = proto.inspect_live_oleans(REPO_ROOT, [mod], [mod], kernel_replay_inductives=False, export_fingerprints=True)
+            # Verify bijective 9-tuple `encodeNameKey` is exported
+            self.assertTrue(all(len(r) == 9 and r[8].startswith("[") for r in a["declaration_fingerprints"]))
+            b_ax = proto.inspect_live_oleans(
+                REPO_ROOT, [dup_ax], [dup_ax], kernel_replay_inductives=False, export_fingerprints=True, olean_overrides=ov
+            )
+            b_ind = proto.inspect_live_oleans(
+                REPO_ROOT, [dup_ind], [dup_ind], kernel_replay_inductives=False, export_fingerprints=True, olean_overrides=ov
+            )
+            exact_ax = proto.exact_reconcile_cross_module_duplicates(
+                REPO_ROOT, {"A": a["declaration_fingerprints"], "B": b_ax["declaration_fingerprints"]}, olean_overrides=ov
+            )
+            self.assertEqual([v["subject"] for v in exact_ax["violations"]], [def_target])
+            exact_ind = proto.exact_reconcile_cross_module_duplicates(
+                REPO_ROOT, {"A": a["declaration_fingerprints"], "B": b_ind["declaration_fingerprints"]}, olean_overrides=ov
+            )
+            self.assertEqual([v["subject"] for v in exact_ind["violations"]], [ind_target])
+            mono = proto.inspect_live_oleans(
+                REPO_ROOT, [mod, dup_ax], [mod, dup_ax], kernel_replay_inductives=False, olean_overrides=ov
+            )
+            self.assertIn(
+                ("stale_sibling_duplicate", def_target),
+                {(v["code"], v["subject"]) for v in mono["violations"]},
+            )
+
     def test_16_cli_orphan_only_with_modules_and_shard_files_detects_orphan(self) -> None:
         with tempfile.TemporaryDirectory(prefix="anneal-test-sh-") as tmp_str:
             tmp = Path(tmp_str)
@@ -806,6 +846,30 @@ class TestPillar3Guard3UnsatisfiableExternEnsures(unittest.TestCase):
         ok = 'extern "C" { #[requires(false)] #[cfg_attr(creusot, ensures(false))] fn f(x: u32) -> u32; }'
         self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(ok), [])
 
+    def test_20e_guard3_extern_spec_blocks_complementary_disjuncts_and_nested_and_redteam(self) -> None:
+        """A2: recognizes Creusot's `#[extern_spec]` attribute on functions AND `impl`/`mod`
+        blocks, negated complementary disjunctions `!(x == y || x != y)` / `!(x < y || x >= y)`,
+        and deeply nested conjunction contradictions `a && (b && (c && !a))`."""
+        bad = {
+            "creusot_extern_spec_fn": "#[extern_spec]\n#[ensures(false)]\nunsafe fn read_volatile<T>(p: *const T) -> T;",
+            "creusot_extern_spec_impl": "#[creusot_contracts::extern_spec]\nimpl Foo { #[ensures(false)] fn read(self) -> u32; }",
+            "creusot_extern_spec_mod": "#[extern_spec]\nmod core { #[ensures(false)] fn read() -> u32; }",
+            "negated_eq_or_neq": 'extern "C" { #[ensures(!(x == y || x != y))] fn f(x: u32, y: u32) -> u32; }',
+            "negated_lt_or_ge": 'extern "C" { #[ensures(!(x < y || x >= y))] fn f(x: u32, y: u32) -> u32; }',
+            "deeply_nested_and": 'extern "C" { #[ensures(a && (b && (c && !a)))] fn f(a: bool, b: bool, c: bool) -> u32; }',
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_rust_unsatisfiable_extern_ensures(src)
+                self.assertEqual([h["code"] for h in hits], ["unsatisfiable_extern_ensures"], name)
+        ok = {
+            "extern_spec_impl_diverging": "#[extern_spec]\nimpl Foo { #[ensures(false)] fn die(self) -> !; }",
+            "extern_spec_impl_sat": "#[extern_spec]\nimpl Foo { #[ensures(ret == self.x)] fn get(self) -> u32; }",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(src), [], name)
+
 
 class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
     def test_21_catches_fndef_value_bind_coercion_higher_order_and_closure(self) -> None:
@@ -933,6 +997,27 @@ class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
         for name, src in ok.items():
             with self.subTest(name=name):
                 self.assertEqual(proto.scan_rust_fndef_ghost_token_coercion(src), [], name)
+
+    def test_23d_guard4_generic_impl_main_fndef_value_and_async_closure_redteam(self) -> None:
+        """A2: fixes `impl<T> Auth<T>` picking `T` instead of `Auth`, catches non-call `FnDef`
+        value references to `main` (`let m = main; call_twice(m)`), and catches `async ||` closures."""
+        bad = {
+            "generic_impl_ctor": (
+                "struct Auth<T>(T);\nimpl<T> Auth<T> {\n"
+                "  #[ghost_token_ctor] fn issue() -> Self { todo!() }\n}\n"
+                "fn exploit() { let f = Auth::<u32>::issue; }"
+            ),
+            "main_fndef_value_bind": "fn main() { let _t = Tokens::new(); let m: fn() = main; call_twice(m); }",
+            "main_higher_order_arg": "fn helper() { call_twice(main); }\nfn main() { let _t = Tokens::new(); }",
+            "async_closure_ctor": "fn main() { let _c = async || Tokens::new(); }",
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_rust_fndef_ghost_token_coercion(src)
+                self.assertTrue(hits, name)
+                self.assertTrue(all(h["code"] == "fndef_ghost_token_coercion" for h in hits), name)
+        ok = "fn main() { let _t = Tokens::new(); let cfg = S { main: 1 }; let _ = cfg.main; }"
+        self.assertEqual(proto.scan_rust_fndef_ghost_token_coercion(ok), [])
 
 
 class TestPillar3Guard5ExternalTypeDropOmission(unittest.TestCase):
@@ -1078,6 +1163,27 @@ class TestPillar3Guard5ExternalTypeDropOmission(unittest.TestCase):
                 self.assertEqual(len(proto.scan_rust_external_type_drop_omission(src)), 1, name)
         ok = drop + "#[external_type_specification]\n#[models_drop]\nstruct E(D);"
         self.assertEqual(proto.scan_rust_external_type_drop_omission(ok), [])
+
+    def test_26e_guard5_unsafe_extern_fn_ptr_no_false_positive_redteam(self) -> None:
+        """A2: `unsafe extern "C" fn(...)` fields carry no drop glue and must not leak
+        `unsafe`/`extern` as unknown foreign types."""
+        ok = (
+            '#[external_type_specification]\n'
+            'struct ExCb {\n'
+            '  cb: unsafe extern "C" fn(Box<u8>),\n'
+            '  cb2: Option<unsafe fn(Vec<u8>) -> String>,\n'
+            '}'
+        )
+        self.assertEqual(proto.scan_rust_external_type_drop_omission(ok), [])
+        bad = (
+            '#[external_type_specification]\n'
+            'struct ExCbDrop {\n'
+            '  cb: unsafe extern "C" fn(Box<u8>),\n'
+            '  owned: Box<u8>,\n'
+            '}'
+        )
+        hits = proto.scan_rust_external_type_drop_omission(bad)
+        self.assertEqual([h["code"] for h in hits], ["external_type_drop_omission"])
 
 
 class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
@@ -1298,6 +1404,74 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
                 self.assertTrue(proto.scan_lean_assumption_polarity(src), name)
         ok = "variable (s : St) (h : implAssumes s)\nexample : implAssumes s → True := fun _ => trivial"
         self.assertEqual(proto.scan_lean_assumption_polarity(ok), [])
+
+    def test_30f_guard6a_bool_neg_prefix_iff_let_binding_unannotated_def_and_instance_redteam(self) -> None:
+        """A2: catches boolean-negated assumptions in antecedents (`assumesHold = false → P`,
+        `!assumesHold = true → P`, `assumesHold != true → P`), prefix `Iff`, `let` bindings inside
+        theorem statements, unannotated `def` propositions, and `instance` hypothesis binders."""
+        bad = {
+            "bool_eq_false_ant": "theorem t (s i : EvalRes Nat) : (i.assumesHold = false) → i.output = s.output := by sorry",
+            "false_eq_bool_ant": "theorem t (s i : EvalRes Nat) : (false = i.assumesHold) → i.output = s.output := by sorry",
+            "neq_true_ant": "theorem t (s i : EvalRes Nat) : i.assumesHold != true → i.output = s.output := by sorry",
+            "bang_eq_true_ant": "theorem t (s i : EvalRes Nat) : (!i.assumesHold) = true → i.output = s.output := by sorry",
+            "not_eq_false": "theorem t (i : EvalRes Nat) : ¬ (i.assumesHold = false) := by sorry",
+            "prefix_iff_ant": "theorem t (i : EvalRes Nat) : Iff (i.assumesHold = true) P → Q := by sorry",
+            "let_before_pos_assumes": (
+                "theorem t (s i : EvalRes Nat) :\n"
+                "  let ok := i.output = s.output\n"
+                "  ok → i.assumesHold = true := by sorry"
+            ),
+            "unannotated_prop_def": "def sneak (s i : EvalRes Nat) := i.output = s.output → i.assumesHold = true",
+            "instance_pos_binder": "instance bad_inst (i : EvalRes Nat) (h : i.assumesHold = true → P) : Q := sorry",
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_lean_assumption_polarity(src)
+                self.assertEqual([h["code"] for h in hits], ["assumption_positive_polarity"], name)
+        ok = {
+            "antitone_eq_false_conseq": "theorem ok (i : EvalRes Nat) : P → (i.assumesHold = false) := by sorry",
+            "struct_literal_let_neg": (
+                "theorem ok_let :\n"
+                "  let r : EvalRes Nat := { assumesHold := true, assertionFailed := false, output := 1 }\n"
+                "  r.assumesHold = true → r.output = 1 := by sorry"
+            ),
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_assumption_polarity(src), [], name)
+
+    def test_30g_guard6b_deriving_inhabited_and_same_file_public_ctor_leaks_redteam(self) -> None:
+        """A2 (closes B2 OPEN issue): catches `deriving Inhabited`, standalone
+        `deriving instance Inhabited for V`, and same-file public constructor leaks
+        (`def V.mk' v := ⟨v⟩`, `.mk`, `{ val := v }`, `instance : Inhabited V := ⟨⟨0⟩⟩`),
+        while permitting checked `Option`/proof-guarded constructors and `private` helpers."""
+        sealed_hdr = "-- @sealed_invariant\nstructure Cap where\n  private mk ::\n  val : Nat\n"
+        bad = {
+            "deriving_inhabited": sealed_hdr + "deriving DecidableEq, Inhabited\n",
+            "standalone_deriving_inhabited": sealed_hdr + "\nderiving instance Inhabited for Cap\n",
+            "public_anon_ctor_leak": sealed_hdr + "\ndef Cap.mk' (v : Nat) : Cap := ⟨v⟩\n",
+            "public_dot_mk_leak": sealed_hdr + "\ndef leak (v : Nat) : Cap := .mk v\n",
+            "public_struct_lit_leak": sealed_hdr + "\ndef leak2 (v : Nat) : Cap := { val := v }\n",
+            "unannotated_ctor_leak": sealed_hdr + "\ndef leak3 v := Cap.mk v\n",
+            "public_inhabited_inst_leak": sealed_hdr + "\ninstance : Inhabited Cap := ⟨⟨0⟩⟩\n",
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_lean_invariant_struct_sealing(src)
+                self.assertEqual([h["code"] for h in hits], ["unsealed_invariant_struct"], name)
+        ok = {
+            "checked_option_ctor": (
+                sealed_hdr
+                + "\ndef Cap.mkChecked (v : Nat) : Option Cap :=\n"
+                + "  if h : 0 < v then some ⟨v⟩ else none\n"
+            ),
+            "proof_guarded_ctor": sealed_hdr + "\ndef Cap.mkProven (v : Nat) (h : 0 < v) : Cap := ⟨v⟩\n",
+            "private_helper": sealed_hdr + "\nprivate def Cap.mkInternal (v : Nat) : Cap := ⟨v⟩\n",
+            "proof_backed_inhabited": sealed_hdr + "\ninstance : Inhabited Cap := ⟨⟨1, by decide⟩⟩\n",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_invariant_struct_sealing(src), [], name)
 
     def test_31_live_repo_sweep_zero_false_positives_on_theory_and_anneal_spec(self) -> None:
         res = proto.scan_live_repo_peer_guards(REPO_ROOT)
