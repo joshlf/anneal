@@ -3862,17 +3862,41 @@ theorem unwindTerminate_modifiesOnlyFields (span : String) (currentBody : Option
 
 /-! ### C.3. Ergonomic `anneal_veil_frame` Tactic / Macro -/
 
+/-- Recursively SYNTHESIZE a `ModifiesOnlyFields ?W act` certificate (with `?W` inferred) by
+structural decomposition of `act` through `ExactAction.seq` / `ExactAction.bind` down to the
+library's real `Trusted.MirSemantics` transition framing lemmas — so callers never have to
+assemble write-field sets by hand. Falls back to hypotheses in context. -/
+syntax "anneal_veil_mods" : tactic
+
+macro_rules
+  | `(tactic| anneal_veil_mods) => `(tactic| first
+      | assumption
+      | (apply modifiesOnlyFields_seq
+         case hM => anneal_veil_mods
+         case hN => anneal_veil_mods)
+      | (apply modifiesOnlyFields_bind
+         case hM => anneal_veil_mods
+         case hK => intro _; anneal_veil_mods)
+      | apply restoreCallerProtectors_modifiesOnlyFields
+      | apply disableFrameBorrows_modifiesOnlyFields
+      | apply frameDeallocProtector_modifiesOnlyFields
+      | apply assign_const_local_modifiesOnlyFields
+      | apply nop_modifiesOnlyFields
+      | apply unreachable_modifiesOnlyFields
+      | apply unwindTerminate_modifiesOnlyFields)
+
 /-- Automatically discharge named-field `AnnealExactWP` preservation goals (`veil#209` style)
-using `veil_frame_preserves` / `exactWP_veil_frame`, resolving `ReadsOnlyFields` for standard
-named framing combinators (`frame_locals`, `frame_callerLocals`, `frame_borrows`, `frame_globals`,
-`frame_heap`, `frame_callStack`, `frame_protectors`, and conjunctions), `ModifiesOnlyFields`
-(including `modifiesOnlyFields_bind` / `modifiesOnlyFields_seq`), and `disjointFieldsBool = true`
-by `decide`! -/
+using `veil_frame_preserves` / `exactWP_veil_frame`: SYNTHESIZES `ModifiesOnlyFields` for composite
+actions via `anneal_veil_mods` (no hand-built write sets required), resolves `ReadsOnlyFields` for
+the standard named framing combinators (`frame_locals`, `frame_callerLocals`, `frame_borrows`,
+`frame_globals`, `frame_heap`, `frame_callStack`, `frame_protectors`, and conjunctions), and
+discharges `disjointFieldsBool = true` by `decide` (failing — never unsoundly succeeding — when a
+read field is clobbered). -/
 macro "anneal_veil_frame" : tactic =>
   `(tactic| (
     first
     | (apply veil_frame_preserves
-       · first | assumption | apply modifiesOnlyFields_seq <;> assumption | apply modifiesOnlyFields_bind <;> assumption
+       · anneal_veil_mods
        · repeat (first
            | apply readsOnlyFields_and
            | apply frame_locals_readsOnly
@@ -3886,7 +3910,7 @@ macro "anneal_veil_frame" : tactic =>
        · decide
        · assumption)
     | (apply exactWP_veil_frame
-       · first | assumption | apply modifiesOnlyFields_seq <;> assumption | apply modifiesOnlyFields_bind <;> assumption
+       · anneal_veil_mods
        · repeat (first
            | apply readsOnlyFields_and
            | apply frame_locals_readsOnly
@@ -3914,11 +3938,34 @@ theorem anneal_veil_frame_multistep_demo (dstLoc : Local) (ty : Ty) (sc : Scalar
         (ExactAction.seq (restoreCallerProtectorsAction caller) (disableFrameBorrowsAction depth nLocals))
     AnnealExactWP act (fun _ s' => frame_globals Pglob s' ∧ frame_callStack Pcall s')
       (fun _ s' => frame_globals Pglob s' ∧ frame_callStack Pcall s') s := by
-  have hMod1 := assign_const_local_modifiesOnlyFields dstLoc ty sc "demo" .nil emptyLayoutTable
-  have hMod2 := restoreCallerProtectors_modifiesOnlyFields caller
-  have hMod3 := disableFrameBorrows_modifiesOnlyFields depth nLocals
-  have hMod23 := modifiesOnlyFields_seq hMod2 hMod3
-  have hMod := modifiesOnlyFields_seq hMod1 hMod23
+  -- ZERO hand-built `ModifiesOnlyFields` certificates: `anneal_veil_frame` synthesizes the
+  -- write set `[.frameStmtIdx, .frameLocals, .mem .borrows] ++ ([.mem .activeProtectors] ++
+  -- [.mem .borrows])` by itself and checks it is disjoint from `{globals, callStack}`.
+  anneal_veil_frame
+
+/-- **`anneal_veil_frame` is fail-closed on clobbered fields**: an invariant reading `borrows`
+across `disableFrameBorrows` (which WRITES `borrows`) is NOT discharged by the automatic framing
+tactic (`fail_if_success`: the synthesized write set overlaps the read set, so `decide` refuses);
+the goal here is only closable because its invariant is trivially `True`. -/
+theorem anneal_veil_frame_rejects_clobbered_field (depth nLocals : Nat) (s : MachineState) :
+    AnnealExactWP (disableFrameBorrowsAction depth nLocals)
+      (fun _ s' => frame_borrows (fun _ => True) s') (fun _ s' => frame_borrows (fun _ => True) s') s := by
+  fail_if_success anneal_veil_frame
+  exact trivial
+
+/-- **Fully automatic 3-step `anneal_veil_frame` through `ExactAction.bind`** (synthesizing the
+write set through a dependent continuation, with ZERO hand-built certificates): framing
+`activeProtectors`-free invariants on `locals` + `callerLocals` across
+`nop ; restoreCallerProtectors >>= fun _ => disableFrameBorrows`. -/
+theorem anneal_veil_frame_auto_bind_demo (caller : SavedCallerFrame) (depth nLocals : Nat)
+    (Ploc Pcl : List LocalSlot → Prop) (s : MachineState)
+    (hInv : frame_callerLocals Pcl s ∧ frame_locals Ploc s) :
+    AnnealExactWP
+      (ExactAction.seq (evalStmtAction { kind := .nop, span := "auto" })
+        (ExactAction.bind (restoreCallerProtectorsAction caller)
+          (fun _ => disableFrameBorrowsAction depth nLocals)))
+      (fun _ s' => frame_callerLocals Pcl s' ∧ frame_locals Ploc s')
+      (fun _ s' => frame_callerLocals Pcl s' ∧ frame_locals Ploc s') s := by
   anneal_veil_frame
 
 end VeilFrame
@@ -3974,7 +4021,9 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
     (type_of% @Memory.ext_allFields) ∧
     (type_of% @MachineState.ext_allFields) ∧
     (type_of% @exactWP_veil_frame) ∧
-    (type_of% @anneal_veil_frame_multistep_demo) :=
+    (type_of% @anneal_veil_frame_multistep_demo) ∧
+    (type_of% @anneal_veil_frame_rejects_clobbered_field) ∧
+    (type_of% @anneal_veil_frame_auto_bind_demo) :=
   ⟨@exactWP_iff, @exactWP_bind, @exactWP_foldl, @exactWP_negation_refutation,
    @treeBorrowsFrameWP_committed_prefix_on_error, @protectorReleaseWP_error_preserves_prefix,
    @exactBodySafetyVC_iff, @exactBodySafetyVC_loop_invariant,
@@ -3993,7 +4042,8 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
    @mul_zero_uninit_local_preserves_ub, @bitOr_allOnes_uninit_local_preserves_ub,
    @addUnchecked_overflow_preserves_ub, @mkMemWriteFrame_eq_raw,
    @mkMemWriteFrame_dead_slot_preserves_failure, @Memory.ext_allFields,
-   @MachineState.ext_allFields, @exactWP_veil_frame, @anneal_veil_frame_multistep_demo⟩
+   @MachineState.ext_allFields, @exactWP_veil_frame, @anneal_veil_frame_multistep_demo,
+   @anneal_veil_frame_rejects_clobbered_field, @anneal_veil_frame_auto_bind_demo⟩
 
 /-!
 Note on import minimality & kernel audits:

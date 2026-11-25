@@ -422,14 +422,17 @@ theorem core_ep2_veil_frame_downstream_tactic_test
     AnnealExactWP act
       (fun _ s' => frame_heap Pheap s' ∧ frame_callerLocals Pcaller s' ∧ frame_globals Pglob s')
       (fun _ s' => frame_heap Pheap s' ∧ frame_callerLocals Pcaller s' ∧ frame_globals Pglob s') s := by
-  have hMod0 := nop_modifiesOnlyFields "t0" .nil emptyLayoutTable
-  have hMod1 := assign_const_local_modifiesOnlyFields dstLoc ty sc "t1" .nil emptyLayoutTable
-  have hMod2 := restoreCallerProtectors_modifiesOnlyFields caller
-  have hMod3 := disableFrameBorrows_modifiesOnlyFields depth nLocals
-  have hMod23 := modifiesOnlyFields_seq hMod2 hMod3
-  have hMod123 := modifiesOnlyFields_seq hMod1 hMod23
-  have hMod := modifiesOnlyFields_seq hMod0 hMod123
+  -- Fully automatic: `anneal_veil_frame` synthesizes the 4-step write set itself.
   anneal_veil_frame
+
+/-- Downstream fail-closed check: `anneal_veil_frame` REFUSES to frame a `callerLocals`-free but
+`activeProtectors`-reading invariant across `restoreCallerProtectors` (which writes it). -/
+theorem core_ep2_veil_frame_downstream_rejects_clobber (caller : SavedCallerFrame) (s : MachineState) :
+    AnnealExactWP (restoreCallerProtectorsAction caller)
+      (fun _ s' => frame_protectors (fun _ _ => True) s')
+      (fun _ s' => frame_protectors (fun _ _ => True) s') s := by
+  fail_if_success anneal_veil_frame
+  exact trivial
 
 /-- Direct `AnnealExactWP` bidirectional `↔` negation refutation witness: a failing action
 discharges `onError := (· = "ub")` AND refutes `onError := False` via `exactWP_negation_refutation`. -/
