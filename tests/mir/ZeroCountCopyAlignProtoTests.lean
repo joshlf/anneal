@@ -991,6 +991,167 @@ theorem mirFuelFree_borrows_nil_zst_count5_noop :
       MirStepNode.step (advanceStmt emptyBorrowsState emptyBorrowsState.frame.locals) := by
   kernel_rfl
 
+/-! ## 11d. A1: target-dependent primitive alignment (32-bit, 16-bit) and alias operands
+
+`align_of::<u64>()` / `f64` / `i64` is `4` on `i686` but `8` on `armv7`, and
+`u128` varies across 32-bit targets; on 16-bit targets (AVR) even `u16`,
+`usize`, and pointers are 1-aligned. A structural table that claims `8` for a
+`u64` **place** on a 32-bit target over-estimates the backing local's alignment,
+so an align-8 element (`AtomicU64`, `#[repr(align(8))]`) copied through a
+pointer to a 4-aligned `u64` local would be accepted although it may be
+misaligned (unsound). A1 makes target-dependent primitives unresolved off
+64-bit targets (fail closed) unless a `LayoutTable` entry is available. -/
+
+def atomic64K : RigidTy := .adt "core::sync::atomic::AtomicU64" []
+
+/-- `AtomicU64` on `i686`: size 8, align 8 (whereas `u64` is only 4-aligned there). -/
+def atomic64Layout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0, isUninhabited := false }
+
+def layouts32a : LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true, entries := [atomic64Layout, atomic64Layout] }
+
+/-- Locals: `_0 : ()`, `_1 : u64` (no layout entry), `_2 : *const AtomicU64`,
+`_3 : *mut AtomicU64`, `_4 : AtomicU64` (layout entry `1`), `_5 : *const u64`,
+`_6 : *mut u64`, `_7 : PtrAlias` (unnormalized alias). -/
+def decls32a : List LocalDecl :=
+  [declNL unitK, declNL u64K, declNL (rawConstK atomic64K), declNL (rawMutK atomic64K),
+   { mutability := .mut, ty := { kind := atomic64K, layoutIdx := 1 }, debugName := none },
+   declNL (rawConstK u64K), declNL (rawMutK u64K), declNL (.alias "proto::PtrAlias" [])]
+
+def st32a : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨7, 8⟩), .uninit, .uninit, .uninit, .uninit,
+                          .uninit, .uninit] }
+    memory := { emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }],
+      nextTag := 2 } }
+
+def proto32a (srcOp dstOp : Operand) (srcVal dstVal : Value) (count : Nat) : MirStepNode :=
+  evalCopyNonOverlappingWithCountProto .rejectNull st32a srcOp dstOp decls32a layouts32a srcVal
+    dstVal count st32a.frame.locals
+
+def noop32a : MirStepNode := MirStepNode.step (advanceStmt st32a st32a.frame.locals)
+
+theorem target32_atomic64_layout :
+    resolveCopyElemLayout decls32a layouts32a (cp 2) (cp 3) = .ok 8 8 := by decide +kernel
+
+/-- **Soundness (A1)**: an align-8 `AtomicU64` copied through `&raw mut x as
+*mut AtomicU64` where `x : u64` lives in a 4-aligned (`i686`) local must not be
+accepted; the backing alignment is unknown, so fail closed. -/
+theorem target32_atomic64_over_u64_local_unsupported :
+    proto32a (cp 2) (cp 3) (.ptr ⟨1, 0⟩ 4) (.ptr ⟨1, 0⟩ 4) 0 = MirStepNode.unsupported := by
+  kernel_rfl
+
+/-- A 32-bit `u64` pointee has target-dependent alignment: no `.ub` claim for a
+4-aligned dangling `NonNull::<u64>::dangling()`-style address (fail closed). -/
+theorem target32_u64_dangling4_unsupported :
+    proto32a (cp 5) (cp 6) (.scalar ⟨4, 4⟩) (.scalar ⟨4, 4⟩) 0 = MirStepNode.unsupported := by
+  kernel_rfl
+
+/-- ... while the authoritative-layout `AtomicU64` still decides alignment
+precisely on 32-bit dangling addresses. -/
+theorem target32_atomic64_dangling8_noop :
+    proto32a (cp 2) (cp 3) (.scalar ⟨8, 4⟩) (.scalar ⟨8, 4⟩) 0 = noop32a := by kernel_rfl
+
+theorem target32_atomic64_dangling4_ub :
+    proto32a (cp 2) (cp 3) (.scalar ⟨4, 4⟩) (.scalar ⟨8, 4⟩) 0 = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- An unnormalized alias-typed operand is **not** statically a non-pointer:
+the pointee comes from the other operand (zero-byte no-op here) ... -/
+theorem alias_operand_unknown_noop :
+    proto32a (cp 7) (cp 3) (.scalar ⟨8, 4⟩) (.scalar ⟨8, 4⟩) 0 = noop32a := by kernel_rfl
+
+theorem alias_operand_layout_unsupported :
+    resolveCopyElemLayout decls32a layouts32a (cp 7) (cp 7) = .unsupported := by decide +kernel
+
+/-- ... and a non-zero count with an alias-typed operand is delegated unchanged
+to the legacy evaluator (B1 returned a spurious `.ub` here). -/
+theorem alias_operand_nonzero_count_legacy :
+    proto32a (cp 7) (cp 7) (.ptr ⟨1, 0⟩ 4) (.ptr ⟨1, 0⟩ 4) 1 =
+      evalCopyNonOverlappingWithCount st32a (cp 7) (cp 7) decls32a layouts32a (.ptr ⟨1, 0⟩ 4)
+        (.ptr ⟨1, 0⟩ 4) 1 st32a.frame.locals :=
+  evalCopyNonOverlappingWithCountProto_unresolved_nonzero_count _ _ _ _ _ _ _ _ _ _
+    alias_operand_layout_unsupported (by decide) rfl
+
+/-! ### A1: pointer-width gate on the delegated non-zero path, and shape-first order -/
+
+/-- Locals: `_0 : ()`, `_1 : u64 = 42`, `_2 : *const u64`, `_3 : *mut u64`,
+`_4 : u8`, `_5 : u64 = 0`; tag `1` → `_1`, tag `4` → `_5`. -/
+def declsW : List LocalDecl :=
+  [declOf unitK, declOf u64K, declOf (rawConstK u64K), declOf (rawMutK u64K), declOf u8K,
+   declOf u64K]
+
+def stW : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨42, 8⟩), .uninit, .uninit,
+                          .init (.scalar ⟨7, 1⟩), .init (.scalar ⟨0, 8⟩)] }
+    memory := { emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique },
+                  { tag := 4, targetLocal := 5, targetProjection := [], perm := .unique }],
+      nextTag := 5 } }
+
+/-- Copied value in `_5` after a step (or `999`). -/
+def slot5Of : MirStepNode → Nat
+  | .tau (.running s') =>
+    match get? s'.frame.locals 5 with
+    | some (.init (.scalar sc)) => sc.bits
+    | _ => 999
+  | _ => 999
+
+/-- The legacy non-zero path is **width-blind**: `.ptr p 1` / `.ptr p 99` on a
+64-bit target still copy `42` into `_5`. -/
+theorem nonzero_wrong_width_ptr_legacy_copies :
+    slot5Of (evalCopyNonOverlappingWithCount stW (cp 2) (cp 3) declsW emptyLayoutTable
+        (.ptr ⟨1, 0⟩ 1) (.ptr ⟨4, 0⟩ 99) 1 stW.frame.locals) = 42 := by
+  decide +kernel
+
+/-- The prototype rejects the malformed pointer values (`.ub`) on every count ... -/
+theorem nonzero_wrong_width_ptr_proto_ub :
+    evalCopyNonOverlappingWithCountProto .rejectNull stW (cp 2) (cp 3) declsW emptyLayoutTable
+        (.ptr ⟨1, 0⟩ 1) (.ptr ⟨4, 0⟩ 99) 1 stW.frame.locals = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- ... while delegating well-formed pointers unchanged (the copy still happens). -/
+theorem nonzero_well_formed_ptr_proto_copies :
+    slot5Of (evalCopyNonOverlappingWithCountProto .rejectNull stW (cp 2) (cp 3) declsW
+        emptyLayoutTable (.ptr ⟨1, 0⟩ 8) (.ptr ⟨4, 0⟩ 8) 1 stW.frame.locals) = 42 := by
+  decide +kernel
+
+/-- **Shape-first order** (`Intrinsics.copyWith` reads both pointers before any
+alignment check): `src` with unknown alignment (`&raw mut u8_local as *mut u64`)
+and a non-pointer `dst` is `.ub` (B1: `.unsupported`). -/
+theorem zero_shape_first_ub :
+    proto .rejectNull u64K u64K u8LocalPtr .unit 0 = MirStepNode.fail .ub := by kernel_rfl
+
+/-- A statically scalar operand (`u64`) is still rejected as `.ub`. -/
+theorem nonptr_scalar_operand_still_ub :
+    proto32a (cp 1) (cp 3) (.scalar ⟨8, 4⟩) (.scalar ⟨8, 4⟩) 0 = MirStepNode.fail .ub := by
+  kernel_rfl
+
+/-- 16-bit target (AVR-like, `pointerBits = 16`): `u16` / `usize` alignment is
+target-dependent (AVR: `1`), so no structural alignment is claimed. -/
+def layouts16 : LayoutTable := { pointerBits := 16, isLittleEndian := true, entries := [] }
+
+theorem target16_u16_unresolved :
+    resolveCopyElemLayout (declsFor u8K (.uint .u16)) layouts16 (cp 3) (cp 3) = .unsupported := by
+  decide +kernel
+
+theorem target16_usize_unresolved :
+    resolveCopyElemLayout (declsFor usizeK usizeK) layouts16 (cp 2) (cp 3) = .unsupported := by
+  decide +kernel
+
+theorem target16_u8_resolved :
+    resolveCopyElemLayout (declsFor u8K u8K) layouts16 (cp 2) (cp 3) = .ok 1 1 := by
+  decide +kernel
+
+/-- 64-bit targets keep the full structural table. -/
+theorem target64_u64_resolved :
+    resolveCopyElemLayout (declsFor u64K u64K) emptyLayoutTable (cp 2) (cp 3) = .ok 8 8 := by
+  decide +kernel
+
 /-! ## 12. Terminator-level call path inherits the fix -/
 
 /-- `evalCopyNonOverlappingCallProto` with a misaligned dangling `src` faults
@@ -1034,6 +1195,132 @@ theorem v2026_06_01_zero_count_permissive
     evalCopyNonOverlappingWithCount s src dst decls layouts srcVal dstVal 0 locals₃ =
       MirStepNode.step (advanceStmt s locals₃) :=
   rfl
+
+
+/-! ## 13b. Machine-checked dual-snapshot port audit (A1)
+
+The TCB patch inserts the prototype's statement-level definitions into
+`MirSemantics/Statements.lean` *before* `evalCopyNonOverlappingWithCount` in
+**both** snapshots. This audit walks the transitive closure of
+`evalCopyNonOverlappingProto` / `evalCopyNonOverlappingWithCountProto` through
+`Anneal.Proto.ZeroCountCopyAlign.*`, collects every referenced
+`Trusted.Rustc.V2026_06_01.*` constant, and checks that its `V2026_08_01`
+counterpart (1) exists, (2) is not defined in a module that imports
+`Statements` (`Terminators`, `Eval`, `Machine`), and (3) if defined in
+`Statements`, starts no later than `V2026_08_01.evalCopyNonOverlappingWithCount`
+(the patched definition itself, renamed in place). B1's `directTyLayout?` used
+`layoutValidForResolvedAdt`, which exists only in `V2026_06_01` — this audit
+fails on that commit. -/
+
+open Lean Elab Command in
+/-- Collect the `Trusted.Rustc.V2026_06_01.*` constants reachable from `roots`
+through constants under `Anneal.Proto.ZeroCountCopyAlign`. -/
+partial def protoTrustedDeps (env : Environment) (roots : List Name) : NameSet := Id.run do
+  let protoPfx : Name := `Anneal.Proto.ZeroCountCopyAlign
+  let trustedPfx : Name := `Trusted.Rustc.V2026_06_01
+  let mut seen : NameSet := {}
+  let mut out : NameSet := {}
+  let mut todo := roots
+  let mut fuel := 100000
+  while fuel > 0 do
+    fuel := fuel - 1
+    match todo with
+    | [] => break
+    | n :: rest =>
+      todo := rest
+      if seen.contains n then continue
+      seen := seen.insert n
+      if trustedPfx.isPrefixOf n then
+        out := out.insert n
+      else if protoPfx.isPrefixOf n &&
+          !(n.getString!.startsWith "_sparseCasesOn") then
+        -- `_sparseCasesOn_k` auxiliaries are regenerated per snapshot by the
+        -- match compiler; constructor-set differences are audited separately.
+        match env.find? n with
+        | some ci =>
+          let consts := ci.type.getUsedConstants ++
+            (match ci.value? with
+             | some v => v.getUsedConstants
+             | none => #[])
+          todo := consts.toList ++ todo
+        | none => pure ()
+  return out
+
+open Lean Elab Command in
+/-- Map `Trusted.Rustc.V2026_06_01.x` to `Trusted.Rustc.V2026_08_01.x`. -/
+def toV0801 (n : Name) : Name :=
+  n.replacePrefix `Trusted.Rustc.V2026_06_01 `Trusted.Rustc.V2026_08_01
+
+open Lean Elab Command in
+elab "#zc_port_audit" : command => do
+  let env ← getEnv
+  let deps := protoTrustedDeps env
+    [``Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingProto,
+     ``Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto]
+  let anchor := ``Trusted.Rustc.V2026_08_01.MirSemantics.evalCopyNonOverlappingWithCount
+  let some anchorRange ← liftCoreM (findDeclarationRanges? anchor)
+    | throwError "no declaration range for {anchor}"
+  let anchorLine := anchorRange.range.pos.line
+  let banned : List Name :=
+    [`Trusted.Rustc.V2026_08_01.MirSemantics.Terminators,
+     `Trusted.Rustc.V2026_08_01.MirSemantics.Eval,
+     `Trusted.Rustc.V2026_08_01.MirSemantics.Machine]
+  let stmtMod : Name := `Trusted.Rustc.V2026_08_01.MirSemantics.Statements
+  let mut problems : Array String := #[]
+  for n in deps.toList do
+    let n' := toV0801 n
+    match env.getModuleIdxFor? n' with
+    | none => problems := problems.push s!"missing {n'}"
+    | some idx =>
+      let mod := env.header.moduleNames[idx.toNat]!
+      if banned.contains mod then
+        problems := problems.push s!"{n'} defined in {mod} (imports Statements)"
+      else if mod == stmtMod then
+        match ← liftCoreM (findDeclarationRanges? n') with
+        | some r =>
+          if r.range.pos.line > anchorLine then
+            problems := problems.push s!"{n'} defined after the patch point (line {r.range.pos.line})"
+        | none =>
+          -- Auxiliary (`match_k`, structure projections, constructors) of an
+          -- earlier declaration: check its parent declaration instead.
+          match ← liftCoreM (findDeclarationRanges? n'.getPrefix) with
+          | some r =>
+            if r.range.pos.line > anchorLine then
+              problems := problems.push s!"{n'} defined after the patch point"
+          | none => problems := problems.push s!"no range for {n'}"
+  -- Constructor-set differences of every inductive type the prototype matches on.
+  let mut inducts : NameSet := {}
+  for n in deps.toList do
+    match env.find? n with
+    | some (.ctorInfo c) => inducts := inducts.insert c.induct
+    | some (.recInfo _) => inducts := inducts.insert n.getPrefix
+    | some (.inductInfo _) => inducts := inducts.insert n
+    | _ =>
+      if n.getString! == "casesOn" then inducts := inducts.insert n.getPrefix
+  let mut ctorDiffs : Array String := #[]
+  for i in inducts.toList do
+    match env.find? i, env.find? (toV0801 i) with
+    | some (.inductInfo a), some (.inductInfo b) =>
+      let an := a.ctors.map (·.getString!)
+      let bn := b.ctors.map (·.getString!)
+      let onlyA := an.filter (fun c => !bn.contains c)
+      let onlyB := bn.filter (fun c => !an.contains c)
+      if !onlyA.isEmpty || !onlyB.isEmpty then
+        ctorDiffs := ctorDiffs.push
+          s!"{i.getString!}: only V2026_06_01 {onlyA}, only V2026_08_01 {onlyB}"
+    | some (.inductInfo _), _ => ctorDiffs := ctorDiffs.push s!"missing inductive {toV0801 i}"
+    | _, _ => pure ()
+  if deps.size < 100 then
+    problems := problems.push s!"suspiciously few dependencies ({deps.size})"
+  let sorted := problems.qsort (· < ·)
+  let sortedD := ctorDiffs.qsort (· < ·)
+  logInfo m!"port audit problems: {sorted.toList}; constructor-set differences: {sortedD.toList}"
+
+/--
+info: port audit problems: []; constructor-set differences: [Value: only V2026_06_01 [uninit], only V2026_08_01 []]
+-/
+#guard_msgs in
+#zc_port_audit
 
 /-! ## 14. Generic refinement / equivalence corollaries -/
 
@@ -1222,5 +1509,45 @@ theorem zeroCountCopyAlignProto_bundle :
 -/
 #guard_msgs in
 #print axioms Anneal.Proto.ZeroCountCopyAlign.protoFragment_overflow_eq_miri
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.target32_atomic64_over_u64_local_unsupported' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.target32_atomic64_over_u64_local_unsupported
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.alias_operand_nonzero_count_legacy' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.alias_operand_nonzero_count_legacy
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.target16_u16_unresolved' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.target16_u16_unresolved
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.copyLayoutValidForResolvedAdt_eq' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.copyLayoutValidForResolvedAdt_eq
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_malformed_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.evalCopyNonOverlappingWithCountProto_malformed_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.zeroByteCopyPrecheck_eq_views' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.zeroByteCopyPrecheck_eq_views
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.nonzero_wrong_width_ptr_proto_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.nonzero_wrong_width_ptr_proto_ub
+
+/-- info: 'Anneal.Proto.ZeroCountCopyAlign.Tests.zero_shape_first_ub' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms Anneal.Proto.ZeroCountCopyAlign.Tests.zero_shape_first_ub
 
 end Anneal.Proto.ZeroCountCopyAlign.Tests

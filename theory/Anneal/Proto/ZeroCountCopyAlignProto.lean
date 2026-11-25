@@ -91,7 +91,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
   evaluator (`crates/anneal-mir/src/lower/rvalue.rs:12808`) and pre-relaxation
   `core::ptr` validity (`library/core/src/ptr/mod.rs:19-21`), retained so that
   `.runtimeOptimized` MIR (where `-C debug-assertions=no` strips inline
-  `ub_checks`) cannot admit null pointers on zero-byte copies.
+  `ub_checks`) cannot accept null pointers on zero-byte copies.
 * `allowRawIntrinsicNull`: the raw `lean-miri` `Intrinsics.copyWith` semantics
   (`checkAndDerefPtr` returns `.ok none` for size `0` without resolving the
   address), which coincides with Rust 1.98 `core::ptr::copy_nonoverlapping`
@@ -241,6 +241,23 @@ def validatedLayoutSizeAlign? (l : TypeLayout) : Option (Nat × Nat) :=
   | true => .some (l.size.bytes, l.align.bytes)
   | false => .none
 
+/-- Whether `ptrBytes` is a target width (`4` or `8`) on which the ABI
+alignment of `u16`/`i16`/`f16` (`2`), `u32`/`i32`/`f32`/`char` (`4`), and
+pointer-width types (`ptrBytes`) is uniform across all Rust targets. On 16-bit
+targets (AVR, MSP430) these may be 1-aligned. -/
+@[reducible]
+def copyTargetWidthUniform (ptrBytes : Nat) : Bool :=
+  Bool.or (Nat.beq ptrBytes 4) (Nat.beq ptrBytes 8)
+
+/-- Whether `ptrBytes = 8`, the only width on which `Trusted`'s structural
+alignment of 8-byte and 16-byte primitives (`u64`/`i64`/`f64` → `8`, `u128`/`i128`/`f128`
+→ `16`) is assumed. On 32-bit targets these vary (`align_of::<u64>()` is `4` on
+`i686` but `8` on `armv7`), so claiming them would over-estimate the alignment of
+a backing **place** and accept misaligned higher-aligned elements (A1). -/
+@[reducible]
+def copyTarget64 (ptrBytes : Nat) : Bool :=
+  Nat.beq ptrBytes 8
+
 /-- Target-pointer-width-aware `(elemSize, elemAlign)` resolution for a sized
 `RigidTy`. Unlike `intrinsicRigidTy{ByteSize,Align}`, pointer-width-dependent
 types (`usize`, `isize`, `*const T`, `*mut T`, `&T`, `&mut T`, `fn(...)`) use
@@ -258,24 +275,39 @@ def copyRigidTySizeAndAlignAux
     | false =>
       match ty with
       | .bool => .some (1, 1)
-      | .char => .some (4, 4)
+      | .char =>
+        match copyTargetWidthUniform ptrBytes with
+        | true => .some (4, 4)
+        | false => .none
       | .never => .some (0, 1)
       | .fnDef _ _ => .some (0, 1)
       | .tuple .nil => .some (0, 1)
       | .uint .u8 | .int .i8 => .some (1, 1)
-      | .uint .u16 | .int .i16 | .float .f16 => .some (2, 2)
-      | .uint .u32 | .int .i32 | .float .f32 => .some (4, 4)
-      | .uint .u64 | .int .i64 | .float .f64 => .some (8, 8)
-      | .uint .u128 | .int .i128 | .float .f128 => .some (16, 16)
+      | .uint .u16 | .int .i16 | .float .f16 =>
+        match copyTargetWidthUniform ptrBytes with
+        | true => .some (2, 2)
+        | false => .none
+      | .uint .u32 | .int .i32 | .float .f32 =>
+        match copyTargetWidthUniform ptrBytes with
+        | true => .some (4, 4)
+        | false => .none
+      | .uint .u64 | .int .i64 | .float .f64 =>
+        match copyTarget64 ptrBytes with
+        | true => .some (8, 8)
+        | false => .none
+      | .uint .u128 | .int .i128 | .float .f128 =>
+        match copyTarget64 ptrBytes with
+        | true => .some (16, 16)
+        | false => .none
       | .uint .usize | .int .isize | .fnPtr _ _ _ _ =>
-        match isPowTwoAlign ptrBytes with
+        match copyTargetWidthUniform ptrBytes with
         | true => .some (ptrBytes, ptrBytes)
         | false => .none
       | .rawPtr _ pt | .ref _ pt =>
         match copyFindDeclLayout? localDecls layouts ty with
         | .some l => validatedLayoutSizeAlign? l
         | .none =>
-          match isPowTwoAlign ptrBytes with
+          match copyTargetWidthUniform ptrBytes with
           | false => .none
           | true =>
             match pt with
@@ -310,6 +342,23 @@ def copyRigidTySizeAndAlignAux
         | .some l => validatedLayoutSizeAlign? l
         | .none => .none
 
+/-- Self-contained copy of `V2026_06_01`'s `layoutValidForResolvedAdt`
+(`Places.lean:3470`), which does **not** exist in `V2026_08_01` (only
+`layoutValidForAdt`, `Places.lean:3427`, does). Using this copy keeps the TCB
+patch portable to both snapshots (A1; machine-checked by the port audit in
+`ZeroCountCopyAlignProtoTests.lean`). -/
+@[reducible]
+def copyLayoutValidForResolvedAdt (layoutIdx : Nat) (l : TypeLayout) : Bool :=
+  match layoutValidForAdt l with
+  | true => true
+  | false =>
+    match Nat.beq layoutIdx 0, l.isUninhabited, l.fields, l.variants with
+    | false, false, .primitive, .single _ => true
+    | _, _, _, _ => false
+
+theorem copyLayoutValidForResolvedAdt_eq (layoutIdx : Nat) (l : TypeLayout) :
+    copyLayoutValidForResolvedAdt layoutIdx l = layoutValidForResolvedAdt layoutIdx l := rfl
+
 /-- Whether `l : TypeLayout` can be trusted directly from `ty.layoutIdx` (when
 `ty.layoutIdx` is non-zero and in bounds of `layouts`, avoiding synthetic
 `layoutIdx := 0` aliasing `entries[0]`). -/
@@ -323,7 +372,7 @@ def directTyLayout? (layouts : LayoutTable) (ty : Ty) : Option TypeLayout :=
     | .some l =>
       let ok : Bool :=
         match ty.kind with
-        | .adt _ _ | .closure _ _ => layoutValidForResolvedAdt ty.layoutIdx l
+        | .adt _ _ | .closure _ _ => copyLayoutValidForResolvedAdt ty.layoutIdx l
         | .tuple ks => layoutMatchesAggregateVariant l 0 (length ks)
         | .array _ n =>
           match l.fields with
@@ -570,9 +619,9 @@ def zeroPtrView
           match lookupFnPtr s.memory.fnPtrs p.allocId with
           | .some _ => .resolved addr (unbackedAlignKnown elemAlign p)
           | .none => .resolved addr (unbackedAlignKnown elemAlign p)
-  | .unit => .malformed
-  | .aggregate _ _ => .malformed
-  | .uninit => .malformed
+  -- `.unit`, `.aggregate`, and (in `V2026_06_01` only) `.uninit`: a wildcard keeps
+  -- the definition portable to `V2026_08_01`, whose `Value` has no `.uninit`.
+  | _ => .malformed
 
 /-- Zero-byte check of one pointer operand (the six corner cases). -/
 @[reducible]
@@ -586,7 +635,10 @@ def checkZeroCountCopyPtr
     ZeroCheck :=
   ZeroPtrView.decide policy (layoutPointerBytes layouts) (zeroPtrView s localDecls layouts elemAlign v)
 
-/-- Zero-byte precheck of both operands, `src` first (as `Intrinsics.copyWith`). -/
+/-- Zero-byte precheck of both operands in `Intrinsics.copyWith` order: **both**
+pointer reads (`toPointer`, i.e. the thin-pointer shape check) precede **any**
+alignment check, so a malformed `dst` is `.ub` even when `src`'s alignment is
+unknown (A1; B1 returned `.unsupported` there); then `src` before `dst`. -/
 @[reducible]
 def zeroByteCopyPrecheck
     (policy : ZeroCountNullPolicy)
@@ -596,9 +648,15 @@ def zeroByteCopyPrecheck
     (elemAlign : Nat)
     (srcVal dstVal : Value) :
     ZeroCheck :=
-  ZeroCheck.andThen
-    (checkZeroCountCopyPtr policy s localDecls layouts elemAlign srcVal)
-    (checkZeroCountCopyPtr policy s localDecls layouts elemAlign dstVal)
+  match
+    Bool.and (isThinPtrValue (layoutPointerBytes layouts) srcVal)
+      (isThinPtrValue (layoutPointerBytes layouts) dstVal)
+  with
+  | false => .ub
+  | true =>
+    ZeroCheck.andThen
+      (checkZeroCountCopyPtr policy s localDecls layouts elemAlign srcVal)
+      (checkZeroCountCopyPtr policy s localDecls layouts elemAlign dstVal)
 
 /-! ## 4. Element layout resolution -/
 
@@ -611,6 +669,19 @@ inductive OperandPointeeLookup : Type where
   | unknown
   | nonPtr
   | pointee (ty : Ty) (authLayoutOpt : Option TypeLayout)
+
+/-- Whether a non-pointer (`pointeeTyOf = none`) static operand kind is
+**definitely** not a raw pointer: scalars, aggregates, `!`, function items /
+pointers, closures. Unnormalized `.alias` / `.param` types, non-`Box` ADTs,
+`dyn` and `extern` types are *not* classified (they stay `.unknown`, so a
+statically unknown operand never triggers a spurious `.ub`, and a non-zero
+count is delegated to the legacy evaluator unchanged). -/
+@[reducible]
+def copyKindDefinitelyNonPtr : RigidTy → Bool
+  | .bool | .char | .int _ | .uint _ | .float _ | .never | .str => true
+  | .tuple _ | .array _ _ | .slice _ => true
+  | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _ => true
+  | _ => false
 
 /-- Classify a `copy_nonoverlapping` pointer operand, retaining any
 authoritative `TypeLayout` recorded in `ptrLayout.fieldLayouts` (even when
@@ -625,7 +696,10 @@ def operandPointeeLookup
   | .none => .unknown
   | .some ptrTy =>
     match pointeeTyOf ptrTy with
-    | .none => .nonPtr
+    | .none =>
+      match copyKindDefinitelyNonPtr ptrTy.kind with
+      | true => .nonPtr
+      | false => .unknown
     | .some pt =>
       match LayoutTable.lookup layouts ptrTy.layoutIdx with
       | .some ptrLayout =>
@@ -671,8 +745,10 @@ def resolveSinglePointeeLayout
     | .none => .unsupported
 
 /-- Resolve `(elemSize, elemAlign)` for `copy_nonoverlapping::<T>(src, dst, _)`:
-* statically non-pointer `src` or `dst` → `.ub` (catches `bdCopyZeroScalars` and
-  `copy_nonoverlapping(ptr, 8_u64, 0)` even with `localDecls = []`);
+* statically non-pointer `src` or `dst` (`copyKindDefinitelyNonPtr`) → `.ub`
+  (catches `bdCopyZeroScalars` and `copy_nonoverlapping(ptr, 8_u64, 0)` even with
+  `localDecls = []`); unnormalized `.alias` / `.param` / non-`Box` ADT operand
+  types are `.unknown` (A1), never `.ub`;
 * both operands have pointees:
   - if `copyPointeeSizesConflict` → `.unsupported`;
   - if both are unsized and `rigidTyEq` → `.ub`;
@@ -739,6 +815,30 @@ def evalCopyNonOverlappingZeroCountProto
   ZeroCheck.toStep s locals₃
     (zeroByteCopyPrecheck policy s localDecls layouts elemAlign srcVal dstVal)
 
+/-- Legacy non-zero-byte path behind a pointer-**width** gate (A1). The legacy
+`evalCopyNonOverlappingWithCount` ignores the `sizeBytes` field of `.ptr p sz`
+on `count > 0` (kernel-checked: `.ptr p 1` / `.ptr p 99` on a 64-bit target
+still perform the copy, `nonzero_wrong_width_ptr_legacy_copies`), so a
+malformed pointer value is rejected `.ub` here before delegation; every
+well-formed thin pointer value is delegated unchanged. -/
+@[reducible]
+def evalCopyNonOverlappingWithCountNonZeroGated
+    (s : MachineState)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcVal dstVal : Value)
+    (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    MirStepNode :=
+  match
+    Bool.and (isThinPtrValue (layoutPointerBytes layouts) srcVal)
+      (isThinPtrValue (layoutPointerBytes layouts) dstVal)
+  with
+  | false => MirStepNode.fail .ub
+  | true =>
+    evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits locals₃
+
 /-- Prototype replacement for `evalCopyNonOverlappingWithCount`. -/
 def evalCopyNonOverlappingWithCountProto
     (policy : ZeroCountNullPolicy)
@@ -761,8 +861,8 @@ def evalCopyNonOverlappingWithCountProto
         evalCopyNonOverlappingZeroCountProto policy s localDecls layouts elemAlign srcVal dstVal
           locals₃
       | false =>
-        evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
-          locals₃
+        evalCopyNonOverlappingWithCountNonZeroGated s src dst localDecls layouts srcVal dstVal
+          countBits locals₃
   | .ub => MirStepNode.fail .ub
   | .unsupported =>
     match Nat.beq countBits 0 with
@@ -771,7 +871,8 @@ def evalCopyNonOverlappingWithCountProto
       | false => MirStepNode.fail .ub
       | true => MirStepNode.unsupported
     | false =>
-      evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits locals₃
+      evalCopyNonOverlappingWithCountNonZeroGated s src dst localDecls layouts srcVal dstVal
+        countBits locals₃
 
 /-- Whether `countSc` is a well-formed `usize` on a `ptrBytes`-byte target. -/
 @[reducible]
@@ -1118,7 +1219,9 @@ theorem evalCopyNonOverlappingWithCountProto_nonzero
     (countBits elemSize elemAlign : Nat) (locals₃ : List LocalSlot)
     (hl : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign)
     (hfit : countBits * elemSize ≤ isizeMaxBytes (layoutPointerBytes layouts))
-    (hnz : countBits * elemSize ≠ 0) :
+    (hnz : countBits * elemSize ≠ 0)
+    (hthin : Bool.and (isThinPtrValue (layoutPointerBytes layouts) srcVal)
+      (isThinPtrValue (layoutPointerBytes layouts) dstVal) = true) :
     evalCopyNonOverlappingWithCountProto policy s src dst localDecls layouts srcVal dstVal
         countBits locals₃ =
       evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
@@ -1130,6 +1233,8 @@ theorem evalCopyNonOverlappingWithCountProto_nonzero
   rw [hl]
   dsimp only
   rw [hfit', hnz']
+  unfold evalCopyNonOverlappingWithCountNonZeroGated
+  rw [hthin]
 
 /-- Non-zero-count copies whose layout is `.unsupported` are delegated unchanged
 to the legacy evaluator (preserving e.g. `L5_ControlAndCalls` sub-case (d) and
@@ -1139,7 +1244,9 @@ theorem evalCopyNonOverlappingWithCountProto_unresolved_nonzero_count
     (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
     (countBits : Nat) (locals₃ : List LocalSlot)
     (hl : resolveCopyElemLayout localDecls layouts src dst = .unsupported)
-    (hc : countBits ≠ 0) :
+    (hc : countBits ≠ 0)
+    (hthin : Bool.and (isThinPtrValue (layoutPointerBytes layouts) srcVal)
+      (isThinPtrValue (layoutPointerBytes layouts) dstVal) = true) :
     evalCopyNonOverlappingWithCountProto policy s src dst localDecls layouts srcVal dstVal
         countBits locals₃ =
       evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
@@ -1148,6 +1255,42 @@ theorem evalCopyNonOverlappingWithCountProto_unresolved_nonzero_count
   rw [hl]
   dsimp only
   rw [beq_false_of_ne hc]
+  unfold evalCopyNonOverlappingWithCountNonZeroGated
+  rw [hthin]
+
+/-- **Width gate (A1)**: a malformed (non-thin or wrong-width) pointer value is
+`.ub` for every count, never delegated to the width-blind legacy body. -/
+theorem evalCopyNonOverlappingWithCountProto_malformed_ub
+    (policy : ZeroCountNullPolicy) (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
+    (countBits : Nat) (locals₃ : List LocalSlot)
+    (hbad : Bool.and (isThinPtrValue (layoutPointerBytes layouts) srcVal)
+      (isThinPtrValue (layoutPointerBytes layouts) dstVal) = false) :
+    evalCopyNonOverlappingWithCountProto policy s src dst localDecls layouts srcVal dstVal
+        countBits locals₃ = MirStepNode.fail .ub := by
+  have hview : ∀ (elemAlign : Nat),
+      zeroByteCopyPrecheck policy s localDecls layouts elemAlign srcVal dstVal = .ub := by
+    intro elemAlign
+    unfold zeroByteCopyPrecheck
+    rw [hbad]
+  unfold evalCopyNonOverlappingWithCountProto
+  cases hl : resolveCopyElemLayout localDecls layouts src dst with
+  | ub => rfl
+  | unsupported =>
+    dsimp only
+    cases Nat.beq countBits 0
+    · unfold evalCopyNonOverlappingWithCountNonZeroGated; rw [hbad]
+    · dsimp only; rw [hbad]
+  | ok sz al =>
+    dsimp only
+    cases Nat.ble (Nat.mul countBits sz) (isizeMaxBytes (layoutPointerBytes layouts))
+    · rfl
+    · dsimp only
+      cases Nat.beq (Nat.mul countBits sz) 0
+      · unfold evalCopyNonOverlappingWithCountNonZeroGated; rw [hbad]
+      · dsimp only
+        unfold evalCopyNonOverlappingZeroCountProto
+        rw [hview al]
 
 /-- The zero-byte fragment (`count * elemSize = 0`) is exactly the precheck
 followed by a pure no-op step. -/
@@ -1236,6 +1379,10 @@ theorem zeroByteCopyPrecheck_refines
     zeroByteCopyPrecheck .allowRawIntrinsicNull s localDecls layouts elemAlign srcVal dstVal =
       .ok := by
   unfold zeroByteCopyPrecheck checkZeroCountCopyPtr at *
+  cases hg : Bool.and (isThinPtrValue (layoutPointerBytes layouts) srcVal)
+      (isThinPtrValue (layoutPointerBytes layouts) dstVal) <;> rw [hg] at h
+  · cases h
+  dsimp only at h ⊢
   generalize zeroPtrView s localDecls layouts elemAlign srcVal = vs at *
   generalize zeroPtrView s localDecls layouts elemAlign dstVal = vd at *
   generalize layoutPointerBytes layouts = pb at *
@@ -1259,6 +1406,10 @@ theorem zeroByteCopyPrecheck_policy_difference
         (∃ addr al, zeroPtrView s localDecls layouts elemAlign dstVal = .resolved addr al ∧
           isNullAddr (layoutPointerBytes layouts) addr = true)) := by
   unfold zeroByteCopyPrecheck checkZeroCountCopyPtr at *
+  cases hg : Bool.and (isThinPtrValue (layoutPointerBytes layouts) srcVal)
+      (isThinPtrValue (layoutPointerBytes layouts) dstVal) <;> rw [hg] at hne
+  · exact absurd rfl hne
+  dsimp only at hne ⊢
   generalize zeroPtrView s localDecls layouts elemAlign srcVal = vs at *
   generalize zeroPtrView s localDecls layouts elemAlign dstVal = vd at *
   generalize layoutPointerBytes layouts = pb at *
@@ -1555,6 +1706,62 @@ def corePtrCopyRef
   | false => .ub
   | true => miriCopyWithRef ptrBytes countBits elemSize elemAlign srcAddr dstAddr
 
+/-- Whether a view is `malformed` (failed thin-pointer shape check). -/
+@[reducible]
+def ZeroPtrView.isMalformed : ZeroPtrView → Bool
+  | .malformed => true
+  | _ => false
+
+/-- Two-view zero-byte decision in `Intrinsics.copyWith` order: both pointer
+reads (shape) first, then `src` / `dst` null+alignment. -/
+@[reducible]
+def zeroViewsDecide (policy : ZeroCountNullPolicy) (ptrBytes : Nat) (srcV dstV : ZeroPtrView) :
+    ZeroCheck :=
+  match Bool.or srcV.isMalformed dstV.isMalformed with
+  | true => .ub
+  | false =>
+    ZeroCheck.andThen (ZeroPtrView.decide policy ptrBytes srcV)
+      (ZeroPtrView.decide policy ptrBytes dstV)
+
+/-- `isThinPtrValue` is exactly "the view is not malformed" (for every
+`elemAlign`). -/
+theorem isThinPtrValue_eq_not_malformed (s : MachineState) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (elemAlign : Nat) (v : Value) :
+    isThinPtrValue (layoutPointerBytes layouts) v =
+      !(zeroPtrView s localDecls layouts elemAlign v).isMalformed := by
+  cases v with
+  | scalar sc =>
+    unfold isThinPtrValue zeroPtrView
+    dsimp only
+    cases Bool.and (Nat.beq sc.sizeBytes (layoutPointerBytes layouts))
+      (Nat.blt sc.bits (scalarModulus (layoutPointerBytes layouts))) <;> rfl
+  | ptr p sz =>
+    unfold isThinPtrValue zeroPtrView
+    dsimp only
+    cases Nat.beq sz (layoutPointerBytes layouts)
+    · rfl
+    · dsimp only
+      split
+      · split <;> rfl
+      · split <;> (try split) <;> rfl
+  | unit => rfl
+  | aggregate _ _ => rfl
+  | uninit => rfl
+
+/-- `zeroByteCopyPrecheck` factors through the two views. -/
+theorem zeroByteCopyPrecheck_eq_views (policy : ZeroCountNullPolicy) (s : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (elemAlign : Nat)
+    (srcVal dstVal : Value) :
+    zeroByteCopyPrecheck policy s localDecls layouts elemAlign srcVal dstVal =
+      zeroViewsDecide policy (layoutPointerBytes layouts)
+        (zeroPtrView s localDecls layouts elemAlign srcVal)
+        (zeroPtrView s localDecls layouts elemAlign dstVal) := by
+  unfold zeroByteCopyPrecheck zeroViewsDecide checkZeroCountCopyPtr
+  rw [isThinPtrValue_eq_not_malformed s localDecls layouts elemAlign srcVal,
+    isThinPtrValue_eq_not_malformed s localDecls layouts elemAlign dstVal]
+  cases (zeroPtrView s localDecls layouts elemAlign srcVal).isMalformed <;>
+    cases (zeroPtrView s localDecls layouts elemAlign dstVal).isMalformed <;> rfl
+
 /-- The prototype's zero-byte & overflow decision on views, as a reference
 outcome (`none` = fail-closed `.unsupported`). Non-zero-byte copies that do not
 overflow are outside the fragment (`access`). -/
@@ -1567,8 +1774,7 @@ def protoFragment (policy : ZeroCountNullPolicy) (ptrBytes countBits elemSize : 
     match Nat.beq (Nat.mul countBits elemSize) 0 with
     | false => .some (.access (Nat.mul countBits elemSize))
     | true =>
-      match ZeroCheck.andThen (ZeroPtrView.decide policy ptrBytes srcV)
-          (ZeroPtrView.decide policy ptrBytes dstV) with
+      match zeroViewsDecide policy ptrBytes srcV dstV with
       | .ok => .some .noop
       | .ub => .some .ub
       | .unsupported => .none
@@ -1613,12 +1819,11 @@ theorem evalCopyNonOverlappingWithCountProto_eq_protoFragment
   rcases hfrag with hz | hov
   · have hz' : Nat.mul countBits elemSize = 0 := hz
     rw [hz', ble_true_of_le (Nat.zero_le _)]
-    dsimp only [evalCopyNonOverlappingZeroCountProto, zeroByteCopyPrecheck, checkZeroCountCopyPtr]
-    cases ZeroCheck.andThen
-        (ZeroPtrView.decide policy (layoutPointerBytes layouts)
-          (zeroPtrView s localDecls layouts elemAlign srcVal))
-        (ZeroPtrView.decide policy (layoutPointerBytes layouts)
-          (zeroPtrView s localDecls layouts elemAlign dstVal)) <;> rfl
+    dsimp only [evalCopyNonOverlappingZeroCountProto]
+    rw [zeroByteCopyPrecheck_eq_views]
+    cases zeroViewsDecide policy (layoutPointerBytes layouts)
+        (zeroPtrView s localDecls layouts elemAlign srcVal)
+        (zeroPtrView s localDecls layouts elemAlign dstVal) <;> rfl
   · have hov' : Nat.ble (Nat.mul countBits elemSize)
         (isizeMaxBytes (layoutPointerBytes layouts)) = false := ble_false_of_lt hov
     rw [hov']
@@ -1627,8 +1832,7 @@ theorem evalCopyNonOverlappingWithCountProto_eq_protoFragment
 theorem protoFragment_zero (policy : ZeroCountNullPolicy) (ptrBytes countBits elemSize : Nat)
     (srcV dstV : ZeroPtrView) (hz : countBits * elemSize = 0) :
     protoFragment policy ptrBytes countBits elemSize srcV dstV =
-      match ZeroCheck.andThen (ZeroPtrView.decide policy ptrBytes srcV)
-          (ZeroPtrView.decide policy ptrBytes dstV) with
+      match zeroViewsDecide policy ptrBytes srcV dstV with
       | .ok => .some .noop
       | .ub => .some .ub
       | .unsupported => .none := by
@@ -1687,7 +1891,8 @@ theorem protoFragment_rejectNull_eq_corePtrStrict
       .some (corePtrCopyRef false ptrBytes countBits elemSize elemAlign srcAddr dstAddr) := by
   have hz' : Nat.mul countBits elemSize = 0 := hz
   rw [protoFragment_zero _ _ _ _ _ _ hz]
-  unfold corePtrCopyRef ubChecksAlignedAndNotNull miriCopyWithRef exactView ZeroPtrView.decide
+  unfold corePtrCopyRef ubChecksAlignedAndNotNull miriCopyWithRef exactView zeroViewsDecide
+    ZeroPtrView.isMalformed ZeroPtrView.decide
   rw [hz', ble_true_of_le (Nat.zero_le _)]
   dsimp only
   cases isNullAddr ptrBytes srcAddr <;> cases isNullAddr ptrBytes dstAddr <;>
@@ -1823,7 +2028,7 @@ theorem protoFragment_policy_difference
       (isNullAddr ptrBytes srcAddr = true ∨ isNullAddr ptrBytes dstAddr = true) := by
   revert hne
   rw [protoFragment_zero _ _ _ _ _ _ hz, protoFragment_zero _ _ _ _ _ _ hz]
-  unfold exactView
+  unfold exactView zeroViewsDecide ZeroPtrView.isMalformed
   cases hs : isNullAddr ptrBytes srcAddr <;> cases hd : isNullAddr ptrBytes dstAddr <;>
     cases Nat.beq (Nat.mod srcAddr elemAlign) 0 <;> cases Nat.beq (Nat.mod dstAddr elemAlign) 0 <;>
     simp [ZeroPtrView.decide, hs, hd, ZeroCheck.andThen]
