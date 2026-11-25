@@ -357,13 +357,17 @@ theorem core_ep2_bitprism_negative_ub_non_erasure :
     (type_of% @addUnchecked_overflow_preserves_ub) ∧
     (type_of% @mkAddSmartRvalue_zero_right_eq_raw) ∧
     (type_of% @mkBitAndSmartRvalue_zero_left_eq_raw) ∧
+    (type_of% @mkBitAndSmartRvalue_zero_right_eq_raw) ∧
+    (type_of% @mkMulSmartRvalue_zero_left_eq_raw) ∧
     (type_of% @mkMulSmartRvalue_zero_right_eq_raw) ∧
+    (type_of% @bitprism_const_annihilators_fire) ∧
     (type_of% @mkMemWriteFrame_eq_raw) ∧
     (type_of% @mkMemWriteFrame_dead_slot_preserves_failure) :=
   ⟨@bitAnd_zero_dead_local_preserves_ub, @bitAnd_zero_uninit_local_preserves_ub,
    @mul_zero_uninit_local_preserves_ub, @addUnchecked_overflow_preserves_ub,
    @mkAddSmartRvalue_zero_right_eq_raw, @mkBitAndSmartRvalue_zero_left_eq_raw,
-   @mkMulSmartRvalue_zero_right_eq_raw, @mkMemWriteFrame_eq_raw,
+   @mkBitAndSmartRvalue_zero_right_eq_raw, @mkMulSmartRvalue_zero_left_eq_raw,
+   @mkMulSmartRvalue_zero_right_eq_raw, @bitprism_const_annihilators_fire, @mkMemWriteFrame_eq_raw,
    @mkMemWriteFrame_dead_slot_preserves_failure⟩
 
 /-- Downstream test of the `anneal_veil_frame` tactic preserving a 3-field compound invariant
@@ -837,15 +841,18 @@ run_cmd do
     let projNil := mkApp (mkConst ``List.nil [0]) (mkConst `Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem)
     let opLoc1 := mkApp (mkConst `Trusted.Rustc.V2026_06_01.MirAst.Operand.copy)
       (mkApp2 (mkConst `Trusted.Rustc.V2026_06_01.MirAst.Place.mk) (mkNatLit 1) projNil)
-    let rvZeroAndLoc1 := mkApp3 (mkConst `Trusted.Rustc.V2026_06_01.MirAst.Rvalue.binaryOp)
-      (mkConst `Trusted.Rustc.V2026_06_01.MirAst.BinOp.bitAnd) opZero opLoc1
     let emptyMem := mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.emptyMemory
     let declNil := mkApp (mkConst ``List.nil [0]) (mkConst `Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
     let rvResTy := mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.RvalueEvalResult
     let rvUb := mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.RvalueEvalResult.ub
+    -- Evaluate the SMART constructor's output (not the raw `Rvalue`): the baseline certifies that
+    -- `mkBitAndSmartRvalue` PRESERVES `.ub` on `0 & uninit` / `0 & dead`, and the forgery (claiming
+    -- the smart constructor erased the UB to `.ok 0`) MUST be kernel-rejected.
+    let rvSmartZeroAndLoc1 := mkApp3 (mkConst (ep2CoreNs ++ `mkBitAndSmartRvalue))
+      (mkConst (ep2CoreNs ++ `cU32Ty)) opZero opLoc1
     let mkEvalRv (locs : Expr) : Expr :=
       mkAppN (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue)
-        #[locs, rvZeroAndLoc1, emptyMem, declNil, emptyLay]
+        #[locs, rvSmartZeroAndLoc1, emptyMem, declNil, emptyLay]
     let mkRvOkZero (locs : Expr) : Expr :=
       mkApp3 (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.RvalueEvalResult.ok)
         (mkApp (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.Value.scalar) scZero) locs emptyMem
