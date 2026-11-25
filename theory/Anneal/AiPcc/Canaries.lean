@@ -247,7 +247,7 @@ theorem canary_stride8_loop_pcc_safe :
     MirNoUBTree (mirCallTree stride8LoopBody []) := by
   have h := verifyMirCutpoints_sound_call stride8Loop_cert_ok
     (entryArgsOk_nil _)
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -305,7 +305,7 @@ theorem canary_bitmask_div_cast_pcc_safe (a b : Nat)
     ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound ha⟩,
      rfl, ⟨rfl, rfl, absVal_topInit_sound hb⟩, True.intro⟩
   have h := verifyMirCutpoints_sound_call bitmaskDivCast_cert_ok hArgs
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -366,7 +366,7 @@ theorem canary_signed_half_pcc_safe (x : Nat) (hx : x < modPow2 32) :
       signedHalfArgSlots [.scalar ⟨x, 4⟩] :=
     ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩
   have h := verifyMirCutpoints_sound_call signedHalf_cert_ok hArgs
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -423,10 +423,50 @@ def moveCheckedBody : CapturedMir :=
 def moveCheckedRetInv : MirAbsSlot :=
   .uint .u8 (reduceAbsVal 8 ⟨.init, Tnum.top 8, .iv 1 128, .top⟩)
 
+/-- Guard-refinement body: compares `_1 < 8` into `_2`, executes `midStmts`,
+and branches on `_2` to `shlUnchecked(1, _1)` on the `true` arm. -/
+def guardShiftBody (midStmts : List StatementKind) : CapturedMir :=
+  canaryBody "ai_pcc::guard_shift_u8" 1
+    [canaryUintTy .u8, canaryUintTy .u8, canaryBoolTy, canaryUintTy .u8]
+    [ canaryBlock
+        ([.storageLive 2, .storageLive 3,
+          .assign (canaryPlace 2)
+            (.binaryOp .lt (canaryCopy 1) (canaryUConst .u8 8))] ++ midStmts)
+        (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .shlUnchecked (canaryUConst .u8 1) (canaryCopy 1))]
+        (.goto 3),
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryUConst .u8 0))]
+        (.goto 3),
+      canaryBlock [.storageDead 3, .storageDead 2] .return_ ]
+
+/-- Four-block diamond whose branches produce `[128, 12]` (straddling
+`255 -> 0`) and `[0, 140]` (covering the full `u8` ring on join at `bb3`). -/
+def diamondWrapJoinU8Body : CapturedMir :=
+  canaryBody "ai_pcc::diamond_wrap_join_u8" 2
+    [canaryUintTy .u8, canaryUintTy .u8, canaryBoolTy]
+    [ canaryBlock [] (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .add (canaryCopy 1) (canaryUConst .u8 128))] (.goto 3),
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1))] (.goto 3),
+      canaryBlock [] .return_ ]
+
+/-- Four-local `u8` body isolating a read of `_2` or `_1` into scratch `_3`
+before returning initialized `_1` in `_0`. -/
+def isolatedReadBody (src : Nat) : CapturedMir :=
+  canaryBody "ai_pcc::isolated_read" 1
+    [canaryUintTy .u8, canaryUintTy .u8, canaryUintTy .u8, canaryUintTy .u8]
+    [canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 3) (.use (canaryCopy src)),
+        .assign (canaryPlace 0) (.use (canaryCopy 1))] .return_]
+
 /-- Positive controls: the `stride8` header invariant is inductive under
-re-checking with `checkMirCert` on the materialized table, a
-`switchInt` diamond certifies both refined arms and their join, and a
-`move` followed by checked arithmetic and `assert` certifies. -/
+re-checking with `checkMirCert` on the materialized table, a `switchInt`
+diamond certifies both refined arms and their join, a `move` followed by
+checked arithmetic and `assert` certifies, `Add(copy _1, move _1)` sequences
+validly, an unrelated write preserves a relational guard, a straddling
+`WrappedInterval` diamond join covers the full `u8` ring, and reading an
+initialized local into scratch certifies. -/
 theorem canary_positive_controls_and_cfg_joins :
     checkMirCert stride8LoopBody (entryEnv stride8LoopBody.localDecls [])
       stride8LoopRetInv
@@ -438,8 +478,26 @@ theorem canary_positive_controls_and_cfg_joins :
       [0, 1, 2, 3] = true ∧
     verifyMirCutpoints moveCheckedBody
       (entryEnv moveCheckedBody.localDecls u8TopArgSlots) moveCheckedRetInv []
-      [0, 1] = true :=
-  ⟨rfl, rfl, rfl⟩
+      [0, 1] = true ∧
+    verifyMirCutpoints
+      (canaryBody "ai_pcc::copy_then_move" 1 [canaryUintTy .u8, canaryUintTy .u8]
+        [canaryBlock [.assign (canaryPlace 0)
+            (.binaryOp .add (canaryCopy 1) (canaryMove 1))] .return_])
+      [.uint .u8 (AbsVal.uninit 8), .uint .u8 (AbsVal.topInit 8)]
+      (.uint .u8 (AbsVal.topInit 8)) [] [0] = true ∧
+    verifyMirCutpoints
+      (guardShiftBody [.assign (canaryPlace 3) (.use (canaryUConst .u8 99))])
+      (entryEnv (guardShiftBody []).localDecls u8TopArgSlots)
+      (.uint .u8 (AbsVal.topInit 8)) [] [0, 1, 2, 3] = true ∧
+    verifyMirCutpoints diamondWrapJoinU8Body
+      [.uint .u8 (AbsVal.uninit 8),
+       .uint .u8 (reduceAbsVal 8 ⟨.init, Tnum.top 8, .iv 0 140, .top⟩),
+       .bool (.top .none)]
+      (.uint .u8 (AbsVal.topInit 8)) [] [0, 1, 2, 3] = true ∧
+    verifyMirCutpoints (isolatedReadBody 1)
+      (entryEnv (isolatedReadBody 1).localDecls u8TopArgSlots)
+      (.uint .u8 (AbsVal.topInit 8)) [] [0] = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## Fail-Closed Negative Suite -/
 
@@ -498,10 +556,13 @@ def stride8BadBoundBody : CapturedMir :=
 
 /-- Fail-closed regression suite: unchecked overflow and underflow,
 out-of-range unchecked shifts, division and remainder by zero, reads of dead
-and uninitialized locals, an uninitialized return, use after `move`, a
-reachable `unreachable`, a violated return postcondition, a guard-carrying
-return postcondition, a non-inductive loop invariant, and a schedule that
-omits the loop cutpoint. -/
+and uninitialized locals (including isolated scratch reads), an uninitialized
+return, `StorageDead 0` on the return place, use after `move` (sequential and
+within one binary operation), a clobbered relational guard, a reachable
+`unreachable`, a violated return postcondition, a guard-carrying return
+postcondition, a non-inductive loop invariant, a schedule that omits the loop
+cutpoint, an `entryEnv` length mismatch, a cutpoint length mismatch, and an
+unsupported MIR phase. -/
 theorem canary_negative_fail_closed_pcc_tests :
     u8StraightLineOk (u8ConstOpBody .addUnchecked 255 1) [] = false ∧
     u8StraightLineOk (u8ConstOpBody .subUnchecked 0 1) [] = false ∧
@@ -511,8 +572,27 @@ theorem canary_negative_fail_closed_pcc_tests :
     u8StraightLineOk (u8ConstOpBody .rem 1 0) [] = false ∧
     u8StraightLineOk readDeadBody [] = false ∧
     u8StraightLineOk readUninitBody [] = false ∧
+    u8StraightLineOk (isolatedReadBody 2) u8TopArgSlots = false ∧
     u8StraightLineOk retUninitBody [] = false ∧
+    u8StraightLineOk
+      (canaryBody "ai_pcc::neg_storage_dead_ret" 1
+        [canaryUintTy .u8, canaryUintTy .u8]
+        [canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1)),
+          .storageDead 0] .return_])
+      u8TopArgSlots = false ∧
     u8StraightLineOk useAfterMoveBody u8TopArgSlots = false ∧
+    u8StraightLineOk
+      (canaryBody "ai_pcc::neg_move_then_copy" 1
+        [canaryUintTy .u8, canaryUintTy .u8]
+        [canaryBlock [.assign (canaryPlace 0)
+            (.binaryOp .add (canaryMove 1) (canaryCopy 1))] .return_])
+      u8TopArgSlots = false ∧
+    verifyMirCutpoints
+      (guardShiftBody
+        [.assign (canaryPlace 1)
+          (.binaryOp .add (canaryCopy 1) (canaryUConst .u8 1))])
+      (entryEnv (guardShiftBody []).localDecls u8TopArgSlots)
+      (.uint .u8 (AbsVal.topInit 8)) [] [0, 1, 2, 3] = false ∧
     verifyMirCutpoints reachableTrapBody
       (entryEnv reachableTrapBody.localDecls u8TopArgSlots)
       (.uint .u8 (AbsVal.topInit 8)) [] [0, 1, 2] = false ∧
@@ -527,8 +607,19 @@ theorem canary_negative_fail_closed_pcc_tests :
       (entryEnv stride8BadBoundBody.localDecls []) stride8LoopRetInv
       stride8LoopCutpoints [0, 1, 2, 3, 4, 5] = false ∧
     verifyMirCutpoints stride8LoopBody (entryEnv stride8LoopBody.localDecls [])
-      stride8LoopRetInv [] [0, 1, 2, 3, 4, 5] = false :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      stride8LoopRetInv [] [0, 1, 2, 3, 4, 5] = false ∧
+    verifyMirCutpoints
+      (canaryBody "ai_pcc::neg_entry_len" 1 [canaryUintTy .u8, canaryUintTy .u8]
+        [canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1))] .return_])
+      [.uint .u8 (AbsVal.uninit 8), .uint .u8 (AbsVal.topInit 8), .dead]
+      (.uint .u8 (AbsVal.topInit 8)) [] [0] = false ∧
+    verifyMirCutpoints stride8LoopBody (entryEnv stride8LoopBody.localDecls [])
+      stride8LoopRetInv [(1, [])] [0, 1, 2, 3, 4, 5] = false ∧
+    verifyMirCutpoints { stride8LoopBody with phase := .other "Analysis" }
+      (entryEnv stride8LoopBody.localDecls []) stride8LoopRetInv
+      stride8LoopCutpoints [0, 1, 2, 3, 4, 5] = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## `validRpoSchedule` Suite -/
 

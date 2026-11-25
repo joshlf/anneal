@@ -198,13 +198,14 @@ def checkBlockCert (decls : List LocalDecl) (retInv : MirAbsSlot)
   match invOpt with
   | none => true
   | some entryEnv =>
-    match stepStmtsAbs decls entryEnv bb.statements with
-    | none => false
-    | some exitEnv =>
-      match stepTermAbs exitEnv bb.terminator with
+    Nat.beq (length entryEnv) (length decls) &&
+      match stepStmtsAbs decls entryEnv bb.statements with
       | none => false
-      | some (.ret retSlot) => MirAbsSlot.le retSlot retInv
-      | some (.edges succs) => checkEdgesAgainstCert bbs invs succs
+      | some exitEnv =>
+        match stepTermAbs exitEnv bb.terminator with
+        | none => false
+        | some (.ret retSlot) => MirAbsSlot.le retSlot retInv
+        | some (.edges succs) => checkEdgesAgainstCert bbs invs succs
 
 /-- Pointwise `checkBlockCert` over aligned block and invariant lists. -/
 def checkAllBlocksCert (decls : List LocalDecl) (retInv : MirAbsSlot)
@@ -236,18 +237,19 @@ theorem checkAllBlocksCert_get {decls : List LocalDecl} {retInv : MirAbsSlot}
     checkAllBlocksCert_get (bbs := bbs) (os := os) (bool_and_true_right h) h1 h2
 
 /-- Full-map post-fixpoint certificate checker for `body`: the phase is
-supported, the return postcondition `retInv` is guard-free, the entry
-environment `entryEnv` is included in the invariant of block `0`, and every
-block certificate checks. -/
+supported, `entryEnv` matches `body.localDecls` in length, the return
+postcondition `retInv` is guard-free, `entryEnv` is included in the invariant
+of block `0`, and every block certificate checks. -/
 def checkMirCert (body : CapturedMir) (entryEnv : MirAbsEnv)
     (retInv : MirAbsSlot) (invs : List (Option MirAbsEnv)) : Bool :=
   mirPhaseSupported body.phase &&
-    (retInv.noRelGuard &&
-      ((match get? body.basicBlocks 0, get? invs 0 with
-        | some _, some (some inv0) => mirAbsEnvLe entryEnv inv0
-        | _, _ => false) &&
-        checkAllBlocksCert body.localDecls retInv body.basicBlocks invs
-          body.basicBlocks invs))
+    (Nat.beq (length entryEnv) (length body.localDecls) &&
+      (retInv.noRelGuard &&
+        ((match get? body.basicBlocks 0, get? invs 0 with
+          | some _, some (some inv0) => mirAbsEnvLe entryEnv inv0
+          | _, _ => false) &&
+          checkAllBlocksCert body.localDecls retInv body.basicBlocks invs
+            body.basicBlocks invs)))
 
 /-! ## 3. Concrete Invariant, Reachability, and Safety -/
 
@@ -283,8 +285,7 @@ theorem mirPccInv_step {body : CapturedMir} {retInv : MirAbsSlot}
       retInv.denote d.ty s.frame.locals (.init retVal)) := by
   match hInv with
   | ⟨hCS, hCallee, hProt, bb, entryEnv, curEnv, hBb, hInvB, hLe, hTo, hDen⟩ =>
-  have hBlk := checkAllBlocksCert_get hAll hBb hInvB
-  dsimp only [checkBlockCert] at hBlk
+  have hBlk := bool_and_true_right (checkAllBlocksCert_get hAll hBb hInvB)
   cases hStmts : stepStmtsAbs body.localDecls entryEnv bb.statements with
   | none => rw [hStmts] at hBlk; nomatch hBlk
   | some exitEnv =>
@@ -411,7 +412,8 @@ theorem mirPccInv_start {body : CapturedMir} {entryEnv : MirAbsEnv}
     (hEntry : mirAbsEnvDenote body.localDecls entryEnv s0.frame.locals) :
     MirPccInv body invs s0 := by
   have hEntryChk := bool_and_true_left
-    (bool_and_true_right (bool_and_true_right hChk))
+    (bool_and_true_right
+      (bool_and_true_right (bool_and_true_right hChk)))
   match hStart with
   | ⟨hCS, hCallee, hProt, hBlk, hIdx⟩ =>
   cases hBb0 : get? body.basicBlocks 0 with
@@ -442,7 +444,8 @@ theorem mirPccInv_reach {body : CapturedMir} {entryEnv : MirAbsEnv}
     (hR : MirReach body s0 s) : MirPccInv body invs s := by
   have hPhase := bool_and_true_left hChk
   have hAll := bool_and_true_right
-    (bool_and_true_right (bool_and_true_right hChk))
+    (bool_and_true_right
+      (bool_and_true_right (bool_and_true_right hChk)))
   induction hR with
   | refl => exact mirPccInv_start hChk hStart hEntry
   | step obs _ hStep ih =>
@@ -718,9 +721,9 @@ theorem checkMirCert_sound {body : CapturedMir} {entryEnv : MirAbsEnv}
       @Anneal.ParametricCore.wpStateOk _ _ _ (mirPccWpOps body)
         (mirRetPost body retInv) s0) := by
   have hPhase := bool_and_true_left hChk
-  have hNoG := bool_and_true_left (bool_and_true_right hChk)
-  have hAll := bool_and_true_right
-    (bool_and_true_right (bool_and_true_right hChk))
+  have hRest1 := bool_and_true_right (bool_and_true_right hChk)
+  have hNoG := bool_and_true_left hRest1
+  have hAll := bool_and_true_right (bool_and_true_right hRest1)
   have hInv0 := mirPccInv_start hChk hStart hEntry
   refine ⟨?_, ?_, mirNoUBTree_of_mirPccInv hPhase hAll hInv0,
     fun hTerm => wpStateOk_of_mirPccInv hPhase hNoG hAll hTerm hInv0⟩
@@ -751,6 +754,26 @@ theorem checkMirCert_sound {body : CapturedMir} {entryEnv : MirAbsEnv}
           subst hV
           exact ⟨d, hD, mirAbsSlot_valDenote_of_denote hNoG hDen⟩
 
+/-- Checkpoint convergence (`wpUntil`) from a certified root start upgrades to
+fault-free `wpUntilOk` with the certified invariant and return postcondition. -/
+theorem checkMirCert_wpUntilOk {body : CapturedMir} {entryEnv : MirAbsEnv}
+    {retInv : MirAbsSlot} {invs : List (Option MirAbsEnv)}
+    {stop : MachineState → Prop} {s0 : MachineState}
+    (hChk : checkMirCert body entryEnv retInv invs = true)
+    (hStart : MirRootStart s0)
+    (hEntry : mirAbsEnvDenote body.localDecls entryEnv s0.frame.locals)
+    (hConv : @Anneal.ParametricCore.wpUntil _ _ _ (mirPccWpOps body) stop
+      (fun _ => True) (fun _ => True) s0) :
+    @Anneal.ParametricCore.wpUntilOk _ _ _ (mirPccWpOps body)
+      (fun s' => stop s' ∧ MirPccInv body invs s') (mirRetPost body retInv)
+      s0 := by
+  have hPhase := bool_and_true_left hChk
+  have hRest1 := bool_and_true_right (bool_and_true_right hChk)
+  have hNoG := bool_and_true_left hRest1
+  have hAll := bool_and_true_right (bool_and_true_right hRest1)
+  exact wpUntilOk_of_mirPccInv hPhase hNoG hAll hConv
+    (mirPccInv_start hChk hStart hEntry)
+
 /-- `checkMirCert_sound` specialized to a call `initMachineState body args`
 whose arguments satisfy the guard-free argument slots `argSlots` of the
 abstract entry frame `entryEnv body.localDecls argSlots`. -/
@@ -763,7 +786,11 @@ theorem checkMirCert_sound_call {body : CapturedMir}
     SafeFrom body (initMachineState body args) ∧
     (∀ retVal, ReturnsFrom body (initMachineState body args) retVal →
       ∃ d, get? body.localDecls 0 = some d ∧ retInv.valDenote d.ty retVal) ∧
-    MirNoUBTree (mirCallTree body args) := by
+    MirNoUBTree (mirCallTree body args) ∧
+    (@Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps body)
+        (fun _ => True) (fun _ => True) (initMachineState body args) →
+      @Anneal.ParametricCore.wpStateOk _ _ _ (mirPccWpOps body)
+        (mirRetPost body retInv) (initMachineState body args)) := by
   have hRoot := initMachineState_root body args
   have hStart : MirRootStart (initMachineState body args) :=
     ⟨hRoot.1, hRoot.2.1, hRoot.2.2.1, hRoot.2.2.2.1, hRoot.2.2.2.2.1⟩
@@ -772,8 +799,7 @@ theorem checkMirCert_sound_call {body : CapturedMir}
       (initMachineState body args).frame.locals := by
     rw [hRoot.2.2.2.2.2]
     exact entryEnv_sound hArgs
-  have h := checkMirCert_sound hChk hStart hEntry
-  exact ⟨h.1, h.2.1, h.2.2.1⟩
+  exact checkMirCert_sound hChk hStart hEntry
 
 /-! ## 7. Single-Pass Bourdoncle Cutpoint Materializer and Verifier -/
 
@@ -821,7 +847,8 @@ def syntacticTermTargets : TerminatorKind → List Nat
     (match target with | some t => [t] | none => []) ++ unwindTargets unwind
   | .assert _ _ target unwind => target :: unwindTargets unwind
   | .inlineAsm _ targets unwind => targets ++ unwindTargets unwind
-  | _ => []
+  | .unwindResume | .unwindTerminate | .return_ | .unreachable | .tailCall _ _ =>
+    []
 
 /-- Every syntactic successor of `bb` is a cutpoint or already `visited`. -/
 def succsScheduled (cutpoints : List (Nat × MirAbsEnv)) (visited : List Nat)
@@ -946,6 +973,24 @@ theorem verifyMirCutpoints_sound {body : CapturedMir} {entryEnv : MirAbsEnv}
         (mirRetPost body retInv) s0) :=
   checkMirCert_sound (bool_and_true_right hVer) hStart hEntry
 
+/-- Checkpoint convergence (`wpUntil`) from a verified cutpoint certificate
+upgrades to fault-free `wpUntilOk`. -/
+theorem verifyMirCutpoints_wpUntilOk {body : CapturedMir}
+    {entryEnv : MirAbsEnv} {retInv : MirAbsSlot}
+    {cutpoints : List (Nat × MirAbsEnv)} {rpoOrder : List Nat}
+    {stop : MachineState → Prop} {s0 : MachineState}
+    (hVer : verifyMirCutpoints body entryEnv retInv cutpoints rpoOrder = true)
+    (hStart : MirRootStart s0)
+    (hEntry : mirAbsEnvDenote body.localDecls entryEnv s0.frame.locals)
+    (hConv : @Anneal.ParametricCore.wpUntil _ _ _ (mirPccWpOps body) stop
+      (fun _ => True) (fun _ => True) s0) :
+    @Anneal.ParametricCore.wpUntilOk _ _ _ (mirPccWpOps body)
+      (fun s' => stop s' ∧
+        MirPccInv body (materializeCutpoints body entryEnv cutpoints rpoOrder)
+          s')
+      (mirRetPost body retInv) s0 :=
+  checkMirCert_wpUntilOk (bool_and_true_right hVer) hStart hEntry hConv
+
 /-- `verifyMirCutpoints_sound` specialized to `initMachineState body args`. -/
 theorem verifyMirCutpoints_sound_call {body : CapturedMir}
     {argSlots : List MirAbsSlot} {args : List Value} {retInv : MirAbsSlot}
@@ -956,7 +1001,11 @@ theorem verifyMirCutpoints_sound_call {body : CapturedMir}
     SafeFrom body (initMachineState body args) ∧
     (∀ retVal, ReturnsFrom body (initMachineState body args) retVal →
       ∃ d, get? body.localDecls 0 = some d ∧ retInv.valDenote d.ty retVal) ∧
-    MirNoUBTree (mirCallTree body args) :=
+    MirNoUBTree (mirCallTree body args) ∧
+    (@Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps body)
+        (fun _ => True) (fun _ => True) (initMachineState body args) →
+      @Anneal.ParametricCore.wpStateOk _ _ _ (mirPccWpOps body)
+        (mirRetPost body retInv) (initMachineState body args)) :=
   checkMirCert_sound_call (bool_and_true_right hVer) hArgs
 
 end Anneal.AiPcc

@@ -216,16 +216,18 @@ class Layout:
     def agents_file_counts(self, path: str) -> bool:
         """Whether `path` counts toward the shared `AGENTS.md` budget.
 
-        Instruction files at the repository root and under `root` count.
-        Rule bundles that tools ship (`tools/*/rules/AGENTS.md`) are data
-        for those tools, not instructions loaded from the tree.
+        Instruction files at the repository root and under `root` count,
+        excluding pinned upstream vendor trees (`excluded`) and tool rule
+        bundles (`tools/*/rules/AGENTS.md`) shipped as tool data.
         """
         if Path(path).name not in ("AGENTS.md", "AGENTS.override.md"):
             return False
+        if path.startswith(self.excluded):
+            return False
         if "/" in path and not path.startswith(self.root):
             return False
-        return not fnmatch.fnmatchcase(path[len(self.root):],
-                                       "tools/*/rules/AGENTS.md")
+        rel = path[len(self.root):] if path.startswith(self.root) else path
+        return not fnmatch.fnmatchcase(rel, "tools/*/rules/AGENTS.md")
 
 
 MONOREPO = Layout(
@@ -1376,6 +1378,10 @@ def is_hrs_path(path: str, trust_tier_changed: bool = False,
             name == "request.json"
             or (name.endswith(".lean") and name != "Proof.lean")):
         return True
+    # Vendored upstream corpora are excluded from mechanical lint but still
+    # require human review.
+    if path.startswith(layout.excluded):
+        return True
     if path.startswith(layout.root):
         rel = path[len(layout.root):]
         if rel.startswith(HRS_ANNEAL_PREFIXES) or rel in HRS_ANNEAL_FILES:
@@ -1547,13 +1553,19 @@ def crr_parity_findings(git: Git, head: str,
 
 
 def detect_layout(git: Git, commit: str) -> Layout:
-    """Return the layout of the tree at `commit` (see `MONOREPO_MARKER`)."""
+    """Return the layout of the tree at `commit` (see `MONOREPO_MARKER`).
+
+    Only a regular-file blob (`100644` / `100755`) matches `MONOREPO_MARKER`,
+    so a symlink (`120000`) cannot trigger or spoof the monorepo layout.
+    """
     listing = git.run("ls-tree", "-z", commit, "--", MONOREPO_MARKER)
     for entry in listing.decode("utf-8", "surrogateescape").split("\0"):
         if not entry:
             continue
         meta, path = entry.split("\t", 1)
-        if path == MONOREPO_MARKER and meta.split()[1] == "blob":
+        parts = meta.split()
+        if (path == MONOREPO_MARKER and len(parts) >= 2
+                and parts[0] in ("100644", "100755") and parts[1] == "blob"):
             return MONOREPO
     return STANDALONE
 

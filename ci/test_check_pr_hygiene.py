@@ -1263,6 +1263,29 @@ class StandaloneLayoutTests(StandaloneRepoTestCase):
         # Without a trusted base, the head's own layout applies.
         self.assertEqual(self.assert_clean(base=None)["layout"], "monorepo")
 
+    def test_symlink_marker_does_not_switch_layout(self):
+        # A symlink at `anneal/AGENTS.md` has Git type `blob` (mode `120000`)
+        # and must not be mistaken for a regular monorepo marker file.
+        marker = self.repo / "anneal" / "AGENTS.md"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink("../AGENTS.md", marker)
+        self.commit()
+        report = self.assert_clean(base=None)
+        self.assertEqual(report["layout"], "standalone")
+        _, report_diff = self.run_check()
+        self.assertEqual(report_diff["layout"], "standalone")
+        self.assertNotIn("layout", {f["check"] for f in report_diff["findings"]})
+
+    def test_standalone_vendor_is_hrs_but_out_of_lint_scope(self):
+        # Vendored corpora skip mechanical lint (headers, wrapping) while
+        # still appearing on the Human review surface.
+        self.write("lean-miri/vendor/Miri/X.lean",
+                   "x   \n-- " + "w " * 60 + "\n")
+        self.commit()
+        report = self.assert_clean()
+        self.assertEqual(report["human_review_surface"],
+                         ["lean-miri/vendor/Miri/X.lean"])
+
     def test_explicit_layout_overrides_detection(self):
         self.assertEqual(self.assert_clean("--layout", "standalone",
                                            base=None)["layout"], "standalone")
@@ -1308,17 +1331,24 @@ class LayoutUnitTests(unittest.TestCase):
         self.assertTrue(solo.agents_file_counts("AGENTS.md"))
         self.assertTrue(solo.agents_file_counts("a/b/AGENTS.override.md"))
         self.assertFalse(solo.agents_file_counts("tools/x/rules/AGENTS.md"))
+        self.assertFalse(solo.agents_file_counts("vendor/x/AGENTS.md"))
+        self.assertFalse(solo.agents_file_counts(
+            "lean-miri/vendor/x/AGENTS.md"))
         self.assertFalse(solo.agents_file_counts("README.md"))
         self.assertTrue(mono.agents_file_counts("AGENTS.md"))
         self.assertTrue(mono.agents_file_counts("anneal/sub/AGENTS.md"))
         self.assertFalse(mono.agents_file_counts("zerocopy/AGENTS.md"))
+        self.assertFalse(mono.agents_file_counts(
+            "anneal/vendor/x/AGENTS.md"))
         self.assertFalse(mono.agents_file_counts(
             "anneal/tools/x/rules/AGENTS.md"))
 
     def test_standalone_review_surface(self):
         solo = cph.STANDALONE
         for path in ("trusted/lean/A.lean", "ci/x.py", ".github/x.yml",
-                     "skills/x/SKILL.md", "vendor/x", "Cargo.lock",
+                     "skills/x/SKILL.md", "vendor/x", "anneal/vendor/x",
+                     "lean-miri/vendor/x", "minirust/vendor/x",
+                     "theory/MiniRust/vendor/x", "Cargo.lock",
                      "docs/codex-review.md", "PRINCIPLES.md", "AGENTS.md",
                      ".gemini/styleguide.md", "lakefile.toml",
                      "lean-toolchain", "theory/bundle-manifest.json"):

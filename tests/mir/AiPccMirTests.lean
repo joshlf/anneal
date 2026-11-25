@@ -7,6 +7,7 @@
 -- those terms.
 
 import Anneal.AiPcc.Canaries
+import Anneal.ParametricCore.V2026Bridge
 
 /-!
 # MIR-Level AI-PCC Soundness and Refutation Tests
@@ -118,7 +119,7 @@ theorem checkedInc_pcc_safe (x : Nat) (hx : x < modPow2 8) :
       [.scalar ⟨x, 1⟩] :=
     ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩
   have h := checkMirCert_sound_call checkedInc_cert_ok hArgs
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -164,7 +165,7 @@ theorem uncheckedArith_pcc_safe (x : Nat) (hx : x < modPow2 8) :
       [.scalar ⟨x, 1⟩] :=
     ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩
   have h := verifyMirCutpoints_sound_call uncheckedArith_cert_ok hArgs
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -217,7 +218,7 @@ theorem guardInc_pcc_safe (x : Nat) (hx : x < modPow2 8) :
       [.scalar ⟨x, 1⟩] :=
     ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩
   have h := verifyMirCutpoints_sound_call guardInc_cert_ok hArgs
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -288,7 +289,7 @@ theorem stride4Loop_pcc_safe :
     MirNoUBTree (mirCallTree stride4LoopBody []) := by
   have h := verifyMirCutpoints_sound_call stride4Loop_cert_ok
     (entryArgsOk_nil _)
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -330,7 +331,7 @@ theorem widenMul_pcc_safe (x : Nat) (hx : x < modPow2 8) :
       [.scalar ⟨x, 1⟩] :=
     ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩
   have h := verifyMirCutpoints_sound_call widenMul_cert_ok hArgs
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -383,7 +384,7 @@ theorem signedCheckedInc_pcc_safe (x : Nat) (hx : x < modPow2 32) :
       i32ArgSlots [.scalar ⟨x, 4⟩] :=
     ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound hx⟩, True.intro⟩
   have h := verifyMirCutpoints_sound_call signedCheckedInc_cert_ok hArgs
-  refine ⟨h.1, ?_, h.2.2⟩
+  refine ⟨h.1, ?_, h.2.2.1⟩
   intro v hRet
   match h.2.1 v hRet with
   | ⟨d, hD, hDen⟩ =>
@@ -436,26 +437,134 @@ theorem checkedInc_detStops :
 /-- Fault-free total correctness of `checkedIncBody` on `x = 200` in the
 `Anneal.ParametricCore` weakest-precondition calculus: the run terminates
 without faults and returns a value described by `checkedIncRetInv`. The
-termination proof is fault-tolerant; `checkMirCert_sound` removes the faults
-and adds the postcondition. -/
+termination proof is fault-tolerant; `checkMirCert_sound_call` removes the
+faults and adds the postcondition. -/
 theorem checkedInc_wpStateOk :
     @Anneal.ParametricCore.wpStateOk _ _ _ (mirPccWpOps checkedIncBody)
       (mirRetPost checkedIncBody checkedIncRetInv)
       (initMachineState checkedIncBody checkedIncArgs) := by
-  have hRoot := initMachineState_root checkedIncBody checkedIncArgs
-  have hStart : MirRootStart (initMachineState checkedIncBody checkedIncArgs) :=
-    ⟨hRoot.1, hRoot.2.1, hRoot.2.2.1, hRoot.2.2.2.1, hRoot.2.2.2.2.1⟩
   have hArgs : entryArgsOk (checkedIncBody.localDecls.drop 1) u8ArgSlots
       checkedIncArgs :=
     ⟨rfl, ⟨rfl, rfl, absVal_topInit_sound (by decide)⟩, True.intro⟩
-  have hEntry : mirAbsEnvDenote checkedIncBody.localDecls checkedIncEntry
-      (initMachineState checkedIncBody checkedIncArgs).frame.locals := by
-    rw [hRoot.2.2.2.2.2]
-    exact entryEnv_sound hArgs
-  exact (checkMirCert_sound checkedInc_cert_ok hStart hEntry).2.2.2
+  exact (checkMirCert_sound_call checkedInc_cert_ok hArgs).2.2.2
     (wpOutcome_of_detStops _ _ 32 _ checkedInc_detStops)
 
+/-- Fault-free `wpUntilOk` over `mirPccWpOps` refines into `V2026Bridge`'s
+call-free coalgebraic `mirNoCallCoalWpOps`. -/
+theorem wpUntilOk_noCallCoal_of_mirPcc {body : CapturedMir}
+    {stop : MachineState → Prop} {post : MirOutcome → Prop}
+    {s : MachineState}
+    (h : @Anneal.ParametricCore.wpUntilOk _ _ _ (mirPccWpOps body) stop post s) :
+    @Anneal.ParametricCore.wpUntilOk _ _ _
+      (Anneal.ParametricCore.V2026Bridge.mirNoCallCoalWpOps body)
+      stop post s := by
+  refine Anneal.ParametricCore.wpUntil_induction (ops := mirPccWpOps body)
+    (C := fun s' =>
+      @Anneal.ParametricCore.wpUntilOk _ _ _
+        (Anneal.ParametricCore.V2026Bridge.mirNoCallCoalWpOps body)
+        stop post s')
+    (fun _ hStop => Anneal.ParametricCore.wpUntil_here
+      (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallCoalWpOps body) hStop)
+    (fun s' hStep => by
+      refine Anneal.ParametricCore.wpUntil_step
+        (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallCoalWpOps body) ?_
+      change (mirNodeOutcome (stepMirFn body s')).wp _ _ _ at hStep
+      change match stepMirState body (.running s') with
+        | .ret out => post out
+        | .tau st' => Anneal.ParametricCore.V2026Bridge.liftExecCont
+            _ post (fun _ => False) st'
+        | .vis i k => Anneal.Rustc.V2026_06_01.Lower.mirNoCallWP.wp i
+            (fun o _ => Anneal.ParametricCore.V2026Bridge.liftExecCont
+              _ post (fun _ => False) (k o)) PUnit.unit
+      dsimp only [stepMirState]
+      cases hFn : stepMirFn body s' with
+      | ret out => rw [hFn] at hStep; exact hStep
+      | tau st' =>
+        rw [hFn] at hStep
+        cases st' with
+        | running s'' => exact hStep
+        | halted out => exact hStep
+        | faulted _ => exact False.elim hStep
+      | vis i k =>
+        rw [hFn] at hStep
+        rcases i with f | (e | c)
+        · cases f; exact False.elim hStep
+        · cases e
+          dsimp only [mirNodeOutcome] at hStep
+          change Anneal.ParametricCore.V2026Bridge.liftExecCont
+            _ post (fun _ => False) (k PUnit.unit)
+          cases hK : k PUnit.unit with
+          | running s'' => rw [hK] at hStep; exact hStep
+          | halted out => rw [hK] at hStep; exact hStep
+          | faulted _ => rw [hK] at hStep; exact False.elim hStep
+        · cases c; exact False.elim hStep)
+    h
+
+/-- Transport from `mirPccWpOps` `wpUntilOk` into `MirStepsConverges` via
+`Anneal.ParametricCore.V2026Bridge`. -/
+theorem mirStepsConverges_of_mirPccWpUntilOk {body : CapturedMir}
+    {stop : MachineState → Prop} {post : MirOutcome → Prop}
+    {s : MachineState}
+    (h : @Anneal.ParametricCore.wpUntilOk _ _ _ (mirPccWpOps body) stop post s) :
+    Anneal.MirFuelFree.MirStepsConverges body s stop post :=
+  Anneal.ParametricCore.V2026Bridge.mirStepsConverges_of_noCallCoalWpUntilOk
+    (wpUntilOk_noCallCoal_of_mirPcc h)
+
+/-- Transport from `mirPccWpOps` `wpStateOk` into `MirWpConverges` via
+`Anneal.ParametricCore.V2026Bridge`. -/
+theorem mirWpConverges_of_mirPccWpStateOk {body : CapturedMir}
+    {post : MirOutcome → Prop} {s : MachineState}
+    (h : @Anneal.ParametricCore.wpStateOk _ _ _ (mirPccWpOps body) post s) :
+    Anneal.MirFuelFree.MirWpConverges body s post :=
+  Anneal.ParametricCore.V2026Bridge.mirWpConverges_of_noCallCoalWpStateOk
+    (wpUntilOk_noCallCoal_of_mirPcc h)
+
+/-- Transport from `mirPccWpOps` `wpStateOk` into total-correctness `DWP` over
+`mirDefaultWP` via `Anneal.ParametricCore.V2026Bridge`. -/
+theorem dwp_of_mirPccWpStateOk {body : CapturedMir}
+    {post : MirOutcome → Prop} {s : MachineState}
+    (h : @Anneal.ParametricCore.wpStateOk _ _ _ (mirPccWpOps body) post s) :
+    Anneal.ITreeWP.DWP Anneal.Rustc.V2026_06_01.Lower.mirDefaultWP
+      (mirTree body s) (fun out _ => post out) PUnit.unit :=
+  Anneal.ParametricCore.V2026Bridge.dwp_of_coalWpStateOk
+    (Anneal.ParametricCore.wpUntil_of_refines
+      (Anneal.ParametricCore.V2026Bridge.mirNoCallCoalWpOps_refines_mirCoalWpOps
+        body)
+      (wpUntilOk_noCallCoal_of_mirPcc h))
+
+/-- End-to-end `MirWpConverges`, `MirStepsConverges`, and `DWP` soundness for
+`checkedIncBody` on `x = 200`, bridged through
+`Anneal.ParametricCore.V2026Bridge`. -/
+theorem checkedInc_v2026Bridge_converges :
+    Anneal.MirFuelFree.MirWpConverges checkedIncBody
+      (initMachineState checkedIncBody checkedIncArgs)
+      (mirRetPost checkedIncBody checkedIncRetInv) ∧
+    Anneal.MirFuelFree.MirStepsConverges checkedIncBody
+      (initMachineState checkedIncBody checkedIncArgs) (fun _ => False)
+      (mirRetPost checkedIncBody checkedIncRetInv) ∧
+    Anneal.ITreeWP.DWP Anneal.Rustc.V2026_06_01.Lower.mirDefaultWP
+      (mirCallTree checkedIncBody checkedIncArgs)
+      (fun out _ => mirRetPost checkedIncBody checkedIncRetInv out)
+      PUnit.unit :=
+  ⟨mirWpConverges_of_mirPccWpStateOk checkedInc_wpStateOk,
+   mirStepsConverges_of_mirPccWpUntilOk checkedInc_wpStateOk,
+   dwp_of_mirPccWpStateOk checkedInc_wpStateOk⟩
+
 /-! ## 3. Axiom Guards -/
+
+/--
+info: 'Anneal.AiPcc.checkMirCert_sound_call' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirCert_sound_call
+
+/--
+info: 'Anneal.AiPcc.verifyMirCutpoints_sound_call' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms verifyMirCutpoints_sound_call
 
 /--
 info: 'Anneal.AiPcc.checkMirCert_sound' depends on axioms:
@@ -639,8 +748,19 @@ theorem bad_full_map_rejected :
     -- `bb0`'s invariant does not cover the entry environment.
     checkMirCert body e0 u8Top
       [some [.uint .u8 (AbsVal.uninit 8), .uint .u8 (AbsVal.const 8 0)],
-       some e0] = false :=
-  ⟨rfl, rfl, rfl, rfl⟩
+       some e0] = false ∧
+    -- `entryEnv` has wrong length (3 slots on a 2-local body).
+    checkMirCert body (e0 ++ [.dead]) u8Top
+      [some (e0 ++ [.dead]), some (e0 ++ [.dead])] = false ∧
+    verifyMirCutpoints body (e0 ++ [.dead]) u8Top [] [0, 1] = false ∧
+    -- An unreachable block invariant in `invs` with wrong length is rejected.
+    checkMirCert
+      (canaryBody "ai_pcc_tests::dead_block" 1
+        [canaryUintTy .u8, canaryUintTy .u8]
+        [canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1))] .return_,
+         canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1))] .return_])
+      e0 u8Top [some e0, some (e0 ++ [.dead])] = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Invalid Bourdoncle schedules are rejected by `validRpoSchedule` and by
 `verifyMirCutpoints`. -/
