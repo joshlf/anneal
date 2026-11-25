@@ -2017,6 +2017,72 @@ theorem trusted_case10_live_callee_teardown_disable_trace :
   case10TeardownCheck_sound mirCase10.1
     (initMachineStateWithCallees mirCase10.1 [] mirCase10.2) (by kernel_rfl)
 
+/-- Generic decidable checker verifying directly on `runTrustedSteps` that executing `body` with
+`rootUnwindCeiling = false` faults with `.faulted .ub` while executing the exact same `body` with
+`rootUnwindCeiling = true` halts with `.halted .panic sLast` preserving root local `_1 = 77`
+(distinguishing a genuine `MirOutcome.panic` from any synthetic `packObs 2` normal return). -/
+def rootUnwindDichotomyCheck (body : CapturedMir) (s0 : MachineState) : Bool :=
+  let sFalse := { s0 with memory := { s0.memory with rootUnwindCeiling := false } }
+  let sTrue := { s0 with memory := { s0.memory with rootUnwindCeiling := true } }
+  let okFalse := match runTrustedSteps body 120 sFalse with
+    | .faulted .ub => true
+    | _ => false
+  let okTrue := match runTrustedSteps body 120 sTrue with
+    | .halted .panic sLast => decide (readRootLocalU32 sLast 1 = some 77)
+    | _ => false
+  okFalse && okTrue
+
+private theorem rootUnwindDichotomyCheck_sound (body : CapturedMir) (s0 : MachineState)
+    (hCheck : rootUnwindDichotomyCheck body s0 = true) :
+    runTrustedSteps body 120 { s0 with memory := { s0.memory with rootUnwindCeiling := false } } =
+      .faulted .ub ∧
+    ∃ sLast,
+      runTrustedSteps body 120 { s0 with memory := { s0.memory with rootUnwindCeiling := true } } =
+        .halted .panic sLast ∧
+      readRootLocalU32 sLast 1 = some 77 := by
+  unfold rootUnwindDichotomyCheck at hCheck
+  simp only [Bool.and_eq_true] at hCheck
+  obtain ⟨hF, hT⟩ := hCheck
+  refine ⟨?_, ?_⟩
+  · cases hRes : runTrustedSteps body 120
+        { s0 with memory := { s0.memory with rootUnwindCeiling := false } } with
+    | faulted fk =>
+      rw [hRes] at hF
+      cases fk with
+      | ub => rfl
+      | _ => cases hF
+    | halted _ _ => rw [hRes] at hF; cases hF
+    | unsupported => rw [hRes] at hF; cases hF
+    | outOfFuel => rw [hRes] at hF; cases hF
+  · cases hRes : runTrustedSteps body 120
+        { s0 with memory := { s0.memory with rootUnwindCeiling := true } } with
+    | halted out sLast =>
+      rw [hRes] at hT
+      cases out with
+      | panic => exact ⟨sLast, rfl, of_decide_eq_true hT⟩
+      | normal _ => cases hT
+      | abort => cases hT
+    | faulted _ => rw [hRes] at hT; cases hT
+    | unsupported => rw [hRes] at hT; cases hT
+    | outOfFuel => rw [hRes] at hT; cases hT
+
+/-- **Direct `TrustedRunResult` root-unwind ceiling dichotomy on `mirCaseRootUnwind`**:
+certifies on `runTrustedSteps` (before `runTrustedObs` decoding) that Case `26`
+(`rootUnwindCeiling = false`) genuinely terminates with `.faulted .ub`, whereas Case `27`
+(`rootUnwindCeiling = true`) genuinely terminates with `.halted .panic sLast` (not a synthetic
+normal-return encoding) preserving root local `_1 = 77`. -/
+theorem trusted_root_unwind_exact_outcome_dichotomy :
+    let s0 := initMachineStateWithCallees mirCaseRootUnwind.1 [] mirCaseRootUnwind.2
+    runTrustedSteps mirCaseRootUnwind.1 120
+      { s0 with memory := { s0.memory with rootUnwindCeiling := false } } = .faulted .ub ∧
+    ∃ sLast,
+      runTrustedSteps mirCaseRootUnwind.1 120
+        { s0 with memory := { s0.memory with rootUnwindCeiling := true } } =
+          .halted .panic sLast ∧
+      readRootLocalU32 sLast 1 = some 77 :=
+  rootUnwindDichotomyCheck_sound mirCaseRootUnwind.1
+    (initMachineStateWithCallees mirCaseRootUnwind.1 [] mirCaseRootUnwind.2) (by kernel_rfl)
+
 /-- **Causal unwind protector-release contrast across BOTH `Trusted.MirSemantics` and `MiniRust`**:
 attempting the parent write BEFORE callee unwind releases the `FnEntry` protector faults with `.ub`
 on BOTH unmodified `Trusted.MirSemantics.stepMirFn` (`mirCase21PrematureWrite`) and MiniRust
@@ -2451,6 +2517,7 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       (type_of% @trustedCrossFramePanicObserve_table) ∧
       (type_of% @trustedCrossFramePanicObserve_out_of_range) ∧
       (type_of% @trusted_case10_live_callee_teardown_disable_trace) ∧
+      (type_of% @trusted_root_unwind_exact_outcome_dichotomy) ∧
       (type_of% @trusted_case21_live_unwind_protector_release_trace) ∧
       (type_of% @trusted_case23_three_frame_lifo_unwind_trace) ∧
       (type_of% @trusted_case21_premature_parent_write_ub_contrast) ∧
@@ -2474,6 +2541,7 @@ theorem ep1_cross_frame_ref_and_panic_dual_authority_capstone (c : CrossFramePan
       @trusted_unwind_releases_callee_protector, @trusted_unwind_continue_chain_root_boundary,
       @trustedCrossFramePanicObserve_table, @trustedCrossFramePanicObserve_out_of_range,
       @trusted_case10_live_callee_teardown_disable_trace,
+      @trusted_root_unwind_exact_outcome_dichotomy,
       @trusted_case21_live_unwind_protector_release_trace,
       @trusted_case23_three_frame_lifo_unwind_trace,
       @trusted_case21_premature_parent_write_ub_contrast,
@@ -2504,7 +2572,7 @@ run_cmd do
   for modName in env.header.moduleNames do
     if (`Miri).isPrefixOf modName || (`LeanMiriSpec).isPrefixOf modName then
       throwError "import-isolation violation: {modName} must not be imported"
-  -- 3. Constructive codecs, bijections, and authority checker are strictly choice-free (`[propext, Quot.sound]`).
+  -- 3. Constructive codecs, bijections, and authority/observer lemmas are strictly choice-free (`[propext, Quot.sound]`).
   let ns := `Anneal.Mir.CrossFrameRefAndPanicDualSpec
   let constructiveDecls : List Lean.Name :=
     [ ns ++ `crossFramePanicOutcomeCodec, ns ++ `crossFramePanicOutcomeCodec_tight,
@@ -2518,6 +2586,11 @@ run_cmd do
       ns ++ `mirToUnwindAction4_left_inv, ns ++ `mirToUnwindAction4_right_inv,
       ns ++ `unwindAction4Codec,
       ns ++ `lmAuthorityCheck_sound, ns ++ `lmAuthorityOfCheck,
+      ns ++ `mrObserve_matches_expected, ns ++ `mrObserve_out_of_range,
+      ns ++ `trustedCrossFramePanicObserve_matches_expected,
+      ns ++ `trustedCrossFramePanicObserve_out_of_range,
+      ns ++ `CrossFramePanicDualContract.lm_matches_all,
+      ns ++ `contract_mr_lm_total_eq, ns ++ `contract_wire_total_eq,
       ns ++ `mrBackedLmAuthority, ns ++ `crossFramePanicDualContract_nonempty ]
   for c in constructiveDecls do
     unless env.contains c do throwError "constructive audit: {c} missing"
@@ -2549,6 +2622,8 @@ run_cmd do
       (ns ++ `trustedCrossFramePanicObserve_table,
         `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `trusted_case10_live_callee_teardown_disable_trace,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `trusted_root_unwind_exact_outcome_dichotomy,
         `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `trusted_case21_live_unwind_protector_release_trace,
         `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),

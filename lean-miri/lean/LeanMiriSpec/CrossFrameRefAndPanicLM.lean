@@ -1493,11 +1493,11 @@ theorem lmCrossFramePanicObserve_out_of_range (tb : Bool) (idx : Nat)
   rfl
 
 /-- Exact typed-failure diagnostics on vendored `Miri` (`tb = true`) confirming genuine root
-causes on Cases `8`, `9`, `10`, `11`, `12`, `16`, `27` (memory / Tree Borrows / pointer offset /
-control flow) and on the `assert` / `UnwindAction` / `unwindTerminate` Cases `18`, `19`, `20`, `22`,
-`24`, `25`, whose abort / UB verdicts are produced by vendored
-`Miri.Interpreter.ControlFlow.{evalTerminator, unwindToBlock, returnFromCurrentFrame}` (not
-harness-hardcoded constants). -/
+causes on Cases `8`, `9`, `10`, `11`, `12`, `13`, `16`, `26`, `27` (memory / Tree Borrows / pointer
+offset / control flow) and on the `assert` / `UnwindAction` / `unwindTerminate` Cases `18`, `19`,
+`20`, `22`, `24`, `25`, whose abort / UB verdicts are produced by vendored
+`Miri.Interpreter.Step.step` → `ControlFlow.{evalTerminator, unwindToBlock, returnFromCurrentFrame}`
+(not harness-hardcoded constants). -/
 theorem lm_tb_exact_failure_diagnostics :
     lmCase true 8 = .error (.treeAccess (.AccessFailure ⟨0, 4⟩
       (.TransitionError 1 (.ProtectedDisabled .Unique)))) ∧
@@ -1511,9 +1511,11 @@ theorem lm_tb_exact_failure_diagnostics :
     lmCase true 13 = .error (.access
       (.pointerOutOfBounds ⟨1, by decide⟩ ⟨4⟩ 400 4 .memoryAccess)) ∧
     lmCase true 16 = .error (.controlFlow (.undefinedBehavior "Unreachable")) ∧
+    lmCase true 26 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
     lmCase true 27 = .error (.controlFlow
       (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
-    -- Control-flow root causes come from vendored `ControlFlow.{unwindToBlock, evalTerminator}`:
+    -- Control-flow root causes come from vendored `Step.step` -> `ControlFlow`:
     lmCase true 18 = .error (.controlFlow
       (.termination (.abort "panic in a function that cannot unwind"))) ∧
     lmCase true 19 = .error (.controlFlow
@@ -1527,7 +1529,7 @@ theorem lm_tb_exact_failure_diagnostics :
     lmCase true 25 = .error (.controlFlow
       (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
   rw [lmCaseU.eq_src]
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- **Exact typed-failure diagnostics in `treeBorrows = false` mode**: every mode-INSENSITIVE UB /
 abort cell of the basic-memory table fails for the SAME genuine vendored root cause as in Tree
@@ -1683,9 +1685,9 @@ theorem lm_controlFlow_root_unwind_ub {P L E M C Op : Type}
     Nat.sub_self, h0, hLoc, hBb, hClean, Id.run, ↓reduceIte, beq_self_eq_true, Bool.and_self]
   rfl
 
-/-- **Universal 4-way `TerminatorKind.assert` law on vendored `ControlFlow.evalTerminator`** (driver
-`lmCfAssert`), for EVERY frame-exit operation, EVERY harness state `st` without a pending failure,
-and EVERY condition bit `b`:
+/-- **Universal 4-way `TerminatorKind.assert` law on vendored `Miri.Interpreter.Step.step`** (driver
+`lmCfAssert` on `translateBody`-lowered `lmAssertMirBody`), for EVERY frame-exit operation, EVERY
+harness state `st` without a pending failure, and EVERY condition bit `b`:
 - `assert(b == b)` jumps to `target = bb1` for every unwind action, leaving `st` untouched;
 - `assert(b == !b, .Cleanup bb)` lands on the cleanup pad `bb`;
 - `assert(b == !b, .Continue)` leaves the frame `.unwinding` (propagating to the caller);
@@ -1719,7 +1721,9 @@ theorem lm_cf_assert_four_way (exitCall : LmState → Except LmExecFailure LmSta
       rw [hP]; rfl
 
 /-- **Universal `lmCfReturn`, `lmCfUnwindResume`, and `lmCfUnwindTerminate` control-flow &
-teardown laws on vendored `Miri.Interpreter.ControlFlow.evalTerminator`**:
+teardown laws on vendored `Miri.Interpreter.Step.step`** (executing `translateBody`-lowered
+`lmCfMirBody` / `lmUnwindTerminateMirBody` frames through `ControlFlow.evalTerminator` &
+`ControlFlow.returnFromCurrentFrame`):
 1. Normal `.Return` executes `exitCall` inside `cleanupFrame` and jumps the caller to `bb1`.
 2. Callee `.UnwindResume` executes `exitCall` inside `cleanupFrame` and dispatches all 4 caller
    `UnwindAction` regimes (`.Cleanup bb`, `.Continue`, `.Terminate r`, `.Unreachable`).

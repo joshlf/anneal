@@ -1709,7 +1709,7 @@ theorem mrCanonicalProg_tb_wfLive (idx : Nat) (prog : Program) (m0 : MachTB)
     (bootProgramM_tb_wfLive ({ implicit_writes := true } : TreeBorrowsParams) prog m0 hBoot)
 
 /-- Exact UB-message witnesses on `MachTB` confirming the *genuine* root cause of Cases `8`,
-`9`, `10`, `11`, `12`, `16`, `25`, `27` (not accidental harness errors!). -/
+`9`, `10`, `11`, `12`, `13`, `16`, `20`, `25`, `26`/`27` (not accidental harness errors!). -/
 def runStopMsgTB (prog : Program) (fuel : Nat := 120) : Option String :=
   match bootProgramM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams) prog with
   | .ok m0 =>
@@ -1758,6 +1758,52 @@ theorem mr_tb_exact_abort_diagnostics :
     runStopsWithAbortTB mrProg22 = true ∧
     runStopsWithAbortTB mrProg24 = true := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- Exact UB-message extractor on `Mach` (`BasicMemory<x86_64>`), symmetric to `runStopMsgTB`. -/
+def runStopMsgBasic (prog : Program) (fuel : Nat := 120) : Option String :=
+  match bootProgramM (M := BM) () prog with
+  | .ok m0 =>
+    match runToStopM fuel m0 with
+    | .error (.ub msg, _) => some msg
+    | _ => none
+  | .error _ => none
+
+/-- Exact `Stop.abort` detector on `Mach` (`BasicMemory<x86_64>`), symmetric to `runStopsWithAbortTB`. -/
+def runStopsWithAbortBasic (prog : Program) (fuel : Nat := 120) : Bool :=
+  match bootProgramM (M := BM) () prog with
+  | .ok m0 =>
+    match runToStopM fuel m0 with
+    | .error (.abort, _) => true
+    | _ => false
+  | .error _ => false
+
+/-- **Exact UB & `Stop.abort` root-cause diagnostics on `Mach` (`BasicMemory<x86_64>`)**:
+confirms every mode-insensitive UB cell (`10`, `11`, `12`, `13`, `16`, `20`, `25`, `26`/`27`)
+and every abort cell (`18`, `19`, `22`, `24`) under basic memory fails with the EXACT SAME
+MiniRust root-cause diagnostic as `MachTB` (never a coincidental `.ub`/`.abort` collapse of a
+different basic-mode failure; symmetric to LeanMiri's `lm_basic_exact_failure_diagnostics`). -/
+theorem mr_basic_exact_ub_and_abort_diagnostics :
+    runStopMsgBasic mrProg10 =
+      some "dereferencing pointer to dead allocation" ∧
+    runStopMsgBasic mrProg11 =
+      some "dereferencing pointer outside the bounds of its allocation" ∧
+    runStopMsgBasic mrProg12 =
+      some "dereferencing pointer outside the bounds of its allocation" ∧
+    runStopMsgBasic mrProg13 =
+      some "dereferencing pointer outside the bounds of its allocation" ∧
+    runStopMsgBasic mrProg16 =
+      some "reached unreachable code" ∧
+    runStopMsgBasic mrProg20 =
+      some "unwinding from a function where the caller did not specify an unwind_block" ∧
+    runStopMsgBasic mrProg25 =
+      some "unwinding from a function where the caller did not specify an unwind_block" ∧
+    runStopMsgBasic mrProgRootUnwind =
+      some "the function at the bottom of the stack must not unwind" ∧
+    runStopsWithAbortBasic mrProg18 = true ∧
+    runStopsWithAbortBasic mrProg19 = true ∧
+    runStopsWithAbortBasic mrProg22 = true ∧
+    runStopsWithAbortBasic mrProg24 = true := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- **Root-unwind body wrapped in an outer catch harness** (the "unless wrapped in an outer
 catch harness" clause of the root-frame boundary): the SAME panicking body as
@@ -1925,6 +1971,7 @@ theorem ep1_minirust_cross_frame_panic_capstone :
     (type_of% @mrCanonicalProg_tb_wfLive) ∧
     (type_of% @mr_tb_exact_ub_diagnostics) ∧
     (type_of% @mr_tb_exact_abort_diagnostics) ∧
+    (type_of% @mr_basic_exact_ub_and_abort_diagnostics) ∧
     (type_of% @mr_root_unwind_boundary_vs_catch_harness) ∧
     (type_of% @mrProgRootUnwindCaught_tb_wfLive) ∧
     (type_of% @mr_case21_premature_parent_write_ub_contrast) ∧
@@ -1943,6 +1990,7 @@ theorem ep1_minirust_cross_frame_panic_capstone :
    @trusted_restoreCallerProtectors_releases, @mrCrossFramePanicObserve_table,
    @mrCrossFramePanicObserve_out_of_range, @mrCrossFramePanicObserve_mode_sensitivity,
    @mrCanonicalProg_tb_wfLive, @mr_tb_exact_ub_diagnostics, @mr_tb_exact_abort_diagnostics,
+   @mr_basic_exact_ub_and_abort_diagnostics,
    @mr_root_unwind_boundary_vs_catch_harness, @mrProgRootUnwindCaught_tb_wfLive,
    @mr_case21_premature_parent_write_ub_contrast, @mrProg21PrematureWrite_tb_wfLive⟩
 
