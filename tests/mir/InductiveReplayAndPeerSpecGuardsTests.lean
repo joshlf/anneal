@@ -414,6 +414,8 @@ example : ¬ LetAssumptionPolarityGuard [(0, .assumesHold), (1, .not (.not (.ato
   exact absurd hPol (by decide)
 example : LetAssumptionPolarityGuard [(0, .assumesHold)] (.imp (.atom 0) (.atom 2)) :=
   ⟨.imp .assumesHold (.atom 2), by decide, by decide⟩
+example : ¬ LetAssumptionPolarityGuard [(0, .not .assumesHold)] (.imp (.atom 0) (.atom 1)) :=
+  negatedAlias_in_antecedent_collapse.2.2.1
 
 /-! ### Guard 6b -/
 
@@ -614,3 +616,7 @@ open Anneal.InductiveReplayAndPeerSpecGuards
 /-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.mutableFieldEscape_soundness_collapse' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms mutableFieldEscape_soundness_collapse
+
+/-- info: 'Anneal.InductiveReplayAndPeerSpecGuards.negatedAlias_in_antecedent_collapse' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms negatedAlias_in_antecedent_collapse

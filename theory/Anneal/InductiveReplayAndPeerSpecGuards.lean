@@ -2563,6 +2563,26 @@ theorem letAlias_depthExceeded_rejected {bs : List (Nat × PropFormula)} {f : Pr
   have hNotLe : ¬ bs.length ≤ maxLetAliasDepth := by omega
   simp [hNotLe] at hg
 
+/-- **An alias hides a negated antecedent**: `¬ assumesHold` passes the guard on its
+    own (negative polarity), and `h → C` passes on its own, yet binding
+    `let h := ¬ assumesHold; h → C` puts `assumesHold` into positive polarity, is
+    rejected after inlining, and collapses. -/
+theorem negatedAlias_in_antecedent_collapse :
+    AssumptionPolarityGuard (.not .assumesHold) ∧
+      AssumptionPolarityGuard (.imp (.atom 0) (.atom 1)) ∧
+      ¬ LetAssumptionPolarityGuard [(0, .not .assumesHold)] (.imp (.atom 0) (.atom 1)) ∧
+      ∃ ρ, evalLet ρ True [(0, .not .assumesHold)] (.imp (.atom 0) (.atom 1)) ∧
+        ¬ evalLet ρ False [(0, .not .assumesHold)] (.imp (.atom 0) (.atom 1)) := by
+  refine ⟨by decide, by decide, ?_, ⟨fun _ => False, ?_, ?_⟩⟩
+  · rintro ⟨g, hg, hPol⟩
+    have : g = .imp (.not .assumesHold) (.atom 1) := by
+      simp [inlineLetAliases?, inlineLetAliases, substAtom, maxLetAliasDepth] at hg
+      exact hg.symm
+    subst this
+    exact absurd hPol (by decide)
+  · simp [evalLet, evalPF, updateVal]
+  · simp [evalLet, evalPF, updateVal]
+
 /-- **An alias hides a positive assumption**: `let h := assumesHold; h` passes the guard
     on its body alone, is rejected after inlining, and collapses. -/
 theorem letAlias_hides_positive_assumption :

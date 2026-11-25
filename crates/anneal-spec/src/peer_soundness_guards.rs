@@ -2123,40 +2123,83 @@ struct FnSig<'a> {
     rest: Lexer<'a>,
 }
 
-/// Returns whether the source locally defines `Infallible` (so bare `Infallible`
-/// must not be assumed uninhabited).
+/// Returns whether a `<...>` generic parameter list declares a type parameter
+/// named `Infallible` (including unbounded `fn f<Infallible>()`).
+fn generic_params_shadow_infallible(mut c: Lexer<'_>) -> Result<bool, PeerScanError> {
+    if !c.next_is_punct("<")? {
+        return Ok(false);
+    }
+    let lt = c.next()?;
+    let at = lt.map_or(c.pos, |x| x.start);
+    let start = c.pos;
+    skip_angles(&mut c, at)?;
+    let end = c.pos.saturating_sub(1);
+    let mut parts = TopSplit::new(c.range(start, end), true);
+    while let Some(mut p) = parts.next_part()? {
+        if let Some(tok) = p.next()? {
+            if tok.is_ident() && !tok.is_kw("const") && tok.text == "Infallible" {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Returns whether the source locally defines, imports from a non-`core`/`std`
+/// `convert` path, renames via `as Infallible`, or binds as a generic type
+/// parameter `Infallible` (so bare `-> Infallible` must not be assumed
+/// uninhabited).
 fn shadows_infallible(src: &str) -> Result<bool, PeerScanError> {
     let mut lx = Lexer::new(src, SourceDialect::Rust);
     let mut prev: Option<Tok<'_>> = None;
     let mut in_use = false;
+    let mut use_root_is_core_or_std = false;
+    let mut use_saw_root = false;
     let mut use_has_convert = false;
     while let Some(t) = lx.next()? {
-        // `use x::Y as Infallible;`, a non-`convert` `use ..::Infallible`, or a
-        // generic parameter named `Infallible` all shadow the core type.
         if t.is_kw("use") {
             in_use = true;
+            use_root_is_core_or_std = false;
+            use_saw_root = false;
             use_has_convert = false;
         } else if t.is_punct(";") {
             in_use = false;
-        } else if t.is_ident() && t.text == "convert" {
-            use_has_convert = true;
-        } else if t.is_ident() && t.text == "Infallible" {
-            let after = lx.peek()?;
-            if in_use && (matches!(prev, Some(p) if p.is_kw("as")) || !use_has_convert) {
-                return Ok(true);
+        } else if in_use && t.is_ident() {
+            if !use_saw_root {
+                use_saw_root = true;
+                use_root_is_core_or_std = matches!(t.text, "core" | "std");
             }
-            if !in_use
-                && matches!(prev, Some(p) if p.is_punct("<") || p.is_punct(","))
-                && matches!(after, Some(a) if a.is_punct(":") || a.is_punct("="))
+            if t.text == "convert" && use_root_is_core_or_std {
+                use_has_convert = true;
+            }
+            if t.text == "Infallible"
+                && (matches!(prev, Some(p) if p.is_kw("as")) || !use_has_convert)
             {
                 return Ok(true);
             }
         }
         prev = Some(t);
-        if t.is_kw("struct") || t.is_kw("type") || t.is_kw("union") || t.is_kw("enum") {
-            if let Some(name) = lx.peek()? {
-                if name.is_ident() && name.text == "Infallible" {
-                    return Ok(true);
+        if t.is_kw("impl") && generic_params_shadow_infallible(lx)? {
+            return Ok(true);
+        }
+        if t.is_kw("fn")
+            || t.is_kw("trait")
+            || t.is_kw("struct")
+            || t.is_kw("type")
+            || t.is_kw("union")
+            || t.is_kw("enum")
+        {
+            let mut c = lx;
+            if let Some(name) = c.next()? {
+                if name.is_ident() {
+                    if name.text == "Infallible"
+                        && matches!(t.text, "struct" | "type" | "union" | "enum")
+                    {
+                        return Ok(true);
+                    }
+                    if generic_params_shadow_infallible(c)? {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -4688,34 +4731,91 @@ impl<'a> ClauseVisitor<'a> for PolarityVisitor<'a> {
     }
 }
 
-/// Functions (including Verus `spec fn`s) whose bodies mention the assumption
-/// atom, directly or through another such function.
+/// Functions (including Verus `spec fn`s), `const`/`static` items, and `use`
+/// aliases whose definitions mention the assumption atom, directly or
+/// transitively.
 fn collect_assumption_helpers(src: &str) -> GResult<PairTable<'_, MAX_ASSUMPTION_HELPERS>> {
     let mut helpers: PairTable<'_, MAX_ASSUMPTION_HELPERS> = PairTable::new();
     for _ in 0..=MAX_ASSUMPTION_HELPERS {
         let mut changed = false;
         let mut lx = Lexer::new(src, SourceDialect::Rust);
         while let Some(t) = lx.next()? {
-            if !t.is_kw("fn") {
+            if t.is_punct("#") {
+                take_attribute(&mut lx)?;
                 continue;
             }
-            let Some(sig) = scan_fn_signature(lx, false)? else {
-                continue;
-            };
-            let mut c = sig.rest;
-            let Some(open) = c.next()? else { continue };
-            if !open.is_punct("{") {
-                continue;
-            }
-            let s = c.pos;
-            let close = skip_group(&mut c, &open)?;
-            let mut body = lx.range(s, close);
-            while let Some(n) = body.next()? {
-                if n.is_ident()
-                    && (ASSUMPTION_ATOMS.contains(&n.text) || helpers.contains_first(n.text))
-                {
-                    changed |= helpers.push(sig.name.text, "", sig.name.start)?;
-                    break;
+            if t.is_kw("fn") {
+                let Some(sig) = scan_fn_signature(lx, false)? else {
+                    continue;
+                };
+                let mut c = sig.rest;
+                let Some(open) = c.next()? else { continue };
+                if !open.is_punct("{") {
+                    continue;
+                }
+                let s = c.pos;
+                let close = skip_group(&mut c, &open)?;
+                let mut body = lx.range(s, close);
+                while let Some(n) = body.next()? {
+                    if n.is_ident()
+                        && (ASSUMPTION_ATOMS.contains(&n.text) || helpers.contains_first(n.text))
+                    {
+                        changed |= helpers.push(sig.name.text, "", sig.name.start)?;
+                        break;
+                    }
+                }
+            } else if (t.is_kw("const") || t.is_kw("static")) && !lx.next_is_kw("fn")? {
+                let mut c = lx;
+                let Some(name) = c.next()? else { continue };
+                if !name.is_ident() {
+                    continue;
+                }
+                let mut eq_pos = None;
+                let mut end = c.end;
+                while let Some(n) = c.next()? {
+                    if n.is_punct("=") && eq_pos.is_none() {
+                        eq_pos = Some(n.end);
+                        continue;
+                    }
+                    if n.is_punct(";") {
+                        end = n.start;
+                        break;
+                    }
+                    if n.is_open() {
+                        skip_group(&mut c, &n)?;
+                    }
+                }
+                if let Some(init_start) = eq_pos {
+                    let mut init = lx.range(init_start, end);
+                    while let Some(n) = init.next()? {
+                        if n.is_ident()
+                            && (ASSUMPTION_ATOMS.contains(&n.text) || helpers.contains_first(n.text))
+                        {
+                            changed |= helpers.push(name.text, "", name.start)?;
+                            break;
+                        }
+                    }
+                }
+            } else if t.is_kw("use") {
+                let mut prev_ident: Option<&str> = None;
+                while let Some(n) = lx.next()? {
+                    if n.is_punct(";") {
+                        break;
+                    }
+                    if n.is_kw("as") {
+                        if let (Some(src_name), Some(alias)) = (prev_ident, lx.next()?) {
+                            if alias.is_ident()
+                                && alias.text != "_"
+                                && (ASSUMPTION_ATOMS.contains(&src_name)
+                                    || helpers.contains_first(src_name))
+                            {
+                                changed |= helpers.push(alias.text, "", alias.start)?;
+                            }
+                        }
+                        prev_ident = None;
+                    } else if n.is_ident() {
+                        prev_ident = Some(n.text);
+                    }
                 }
             }
         }
@@ -4758,10 +4858,69 @@ const LEAN_DECL_KEYWORDS: [&str; 9] = [
     "theorem", "lemma", "def", "abbrev", "instance", "example", "axiom", "opaque", "variable",
 ];
 
+/// Lean `def`/`abbrev` declarations whose bodies mention `assumesHold` (or
+/// another such helper), so calling them in a subsequent theorem (e.g.
+/// `def h : Prop := ¬ assumesHold; theorem t : h → P`) cannot invert polarity.
+fn collect_lean_assumption_defs(src: &str) -> GResult<PairTable<'_, MAX_ASSUMPTION_HELPERS>> {
+    let mut helpers: PairTable<'_, MAX_ASSUMPTION_HELPERS> = PairTable::new();
+    for _ in 0..=MAX_ASSUMPTION_HELPERS {
+        let mut changed = false;
+        let mut lx = Lexer::new(src, SourceDialect::Lean);
+        let mut st = DelimStack::new();
+        while let Some(t) = lx.next()? {
+            if !(t.is_ident() && st.depth() == 0 && matches!(t.text, "def" | "abbrev")) {
+                st.feed(&t)?;
+                continue;
+            }
+            let mut c = lx;
+            let Some(name) = c.next()? else { break };
+            if !name.is_ident() {
+                continue;
+            }
+            let mut body_start = None;
+            let mut body_end = c.end;
+            loop {
+                let save = c;
+                let Some(n) = c.next()? else { break };
+                if n.is_ident() && LEAN_DECL_KEYWORDS.contains(&n.text) {
+                    body_end = n.start;
+                    c = save;
+                    break;
+                }
+                if body_start.is_none() && (n.is_punct(":=") || n.is_punct("|")) {
+                    body_start = Some(n.end);
+                    continue;
+                }
+                if n.is_open() {
+                    skip_group(&mut c, &n)?;
+                }
+            }
+            if let Some(bs) = body_start {
+                let mut body = lx.range(bs, body_end);
+                while let Some(n) = body.next()? {
+                    if n.is_ident()
+                        && n.text != name.text
+                        && (ASSUMPTION_ATOMS.contains(&n.text) || helpers.contains_first(n.text))
+                    {
+                        changed |= helpers.push(name.text, "", name.start)?;
+                        break;
+                    }
+                }
+            }
+            lx = c;
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(helpers)
+}
+
 /// Source scanner of Guard 6a over Lean declarations: binders are negative
-/// and the declared type (and unannotated `def`/`abbrev` or equation-style
-/// right-hand sides) is positive.
+/// and the declared type (and `def`/`abbrev` or equation-style right-hand
+/// sides) is positive.
 pub fn check_assumption_polarity_lean_source(src: &str) -> GResult<()> {
+    let helpers = collect_lean_assumption_defs(src)?;
     let mut lx = Lexer::new(src, SourceDialect::Lean);
     let mut st = DelimStack::new();
     let pos_cx = PCtx {
@@ -4807,7 +4966,7 @@ pub fn check_assumption_polarity_lean_source(src: &str) -> GResult<()> {
                 let s = c.pos;
                 let close = skip_group(&mut c, &n)?;
                 if colon.is_none() {
-                    let mut an = PolarityAnalyzer::new(SourceDialect::Lean);
+                    let mut an = PolarityAnalyzer::with_helpers(SourceDialect::Lean, helpers);
                     an.analyze_binder(lx.range(s, close), neg_cx)?;
                 }
                 continue;
@@ -4817,7 +4976,7 @@ pub fn check_assumption_polarity_lean_source(src: &str) -> GResult<()> {
             }
         }
         if let Some(col) = colon {
-            let mut an = PolarityAnalyzer::new(SourceDialect::Lean);
+            let mut an = PolarityAnalyzer::with_helpers(SourceDialect::Lean, helpers);
             an.analyze(lx.range(col.end, sig_end), pos_cx)?;
         }
         // `def`/`abbrev := body` (with or without explicit `: Prop` type) or
@@ -7633,6 +7792,69 @@ mod tests {
         );
         assert_eq!(
             g6a("fn helper() -> bool { true } #[ensures(helper())] fn f() {}"),
+            None
+        );
+    }
+
+    // --- Pass B4 red-team regression tests ------------------------------------
+
+    #[test]
+    fn b4_g3_rejects_unbounded_generic_infallible_and_fake_convert_module() {
+        assert_eq!(
+            g3("#[trusted] #[ensures(false)] fn f<Infallible>() -> Infallible;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[trusted] #[ensures(false)] fn f<T, Infallible>() -> Infallible;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("impl<Infallible> S { #[trusted] #[ensures(false)] fn f() -> Infallible; }"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("use my_crate::convert::Infallible; #[trusted] #[ensures(false)] fn f() -> Infallible;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        // Genuine `Option<Infallible>` / `Result<u8, Infallible>` elsewhere does NOT shadow.
+        assert_eq!(
+            g3("use core::convert::Infallible; fn g() -> Option<Infallible> { None } #[trusted] #[ensures(false)] fn abort() -> Infallible;"),
+            None
+        );
+    }
+
+    #[test]
+    fn b4_g6a_catches_const_static_use_aliases_and_lean_def_helper_indirection() {
+        // Rust `const` / `static` / `use ... as` aliases hiding `assumes_hold`.
+        assert_eq!(
+            g6a("const H: bool = assumes_hold; #[ensures(H)] fn f() {}"),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            g6a("static H: bool = !assumes_hold; #[requires(H)] fn f() {}"),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            g6a("use crate::assumes_hold as ok; #[ensures(ok)] fn f() {}"),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        // Lean `def helper : Prop := ¬ assumesHold` used in antecedent of a theorem!
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source(
+                "def helper : Prop := ¬ assumesHold\ntheorem t : helper → P := by simp"
+            )),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source(
+                "def a : Prop := ¬ assumesHold\ndef b : Prop := a\ntheorem t : b → P := by simp"
+            )),
+            Some(R::AssumptionUncleanLeaf)
+        );
+        assert_eq!(
+            reason(check_assumption_polarity_lean_source(
+                "def benign : Prop := True\ntheorem t : benign → P := by simp"
+            )),
             None
         );
     }
