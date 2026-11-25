@@ -996,18 +996,40 @@ def scan_polarity(path: str, toks: list, helpers: set[str]) -> None:
         if kw in ("def", "abbrev", "opaque", "instance") and any(
                 _is_atom(tok[0]) or scanner._is_helper(tok[0]) for tok in body):
             PolarityScanner(path, others).analyze(body, "pos")
-        # `where` auxiliaries (`theorem t : T := aux where aux : X := p`) are separate public
-        # declarations `t.aux`: every top-level `binders : X` in the tail is a declared type.
-        for aux_sig in _where_aux_signatures(body):
-            _analyze_signature(PolarityScanner(path, others), aux_sig)
+        # `where` auxiliaries (`theorem t : T := aux where aux : X := p` or untyped `where aux := ...`)
+        # are separate public declarations `t.aux`: check their signatures and Prop/untyped bodies.
+        for aux_sig, aux_rhs in _where_aux_items(body):
+            if aux_sig:
+                _analyze_signature(PolarityScanner(path, others), aux_sig)
+            if aux_rhs and any(_is_atom(tok[0]) or scanner._is_helper(tok[0]) for tok in aux_rhs):
+                PolarityScanner(path, others).analyze(aux_rhs, "pos")
     # `structure` / `class` fields and `inductive` constructor arguments are conclusions of the
     # projections / eliminators, so the atom (or a helper) may not appear in them at all.
+    depth = 0
+    _CONT_OPS = {":", ":=", "→", "->", "∧", "∨", "¬", "↔", "=>", ","}
     for k, tok in enumerate(toks):
-        if tok[0] in ("structure", "class", "inductive") and (k == 0 or toks[k - 1][0] != "."):
+        t = tok[0]
+        if t in OPEN:
+            depth += 1
+            continue
+        if t in CLOSE:
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0 and t in ("structure", "class", "inductive") and (k == 0 or toks[k - 1][0] != "."):
             span = _command_span(toks, k)
+            inner_depth = 0
             for m, st in enumerate(span):
-                field_name = (m > 0 and span[m - 1][0] == "|") or (m + 1 < len(span) and span[m + 1][0] == ":"
-                                                                   and (m == 0 or span[m - 1][1] < st[1]))
+                if st[0] in OPEN:
+                    inner_depth += 1
+                    continue
+                if st[0] in CLOSE:
+                    inner_depth = max(0, inner_depth - 1)
+                    continue
+                field_name = inner_depth == 0 and (
+                    (m > 0 and span[m - 1][0] == "|")
+                    or (m + 1 < len(span) and span[m + 1][0] == ":"
+                        and (m == 0 or (span[m - 1][1] < st[1] and span[m - 1][0] not in _CONT_OPS)))
+                )
                 if not field_name and (_is_atom(st[0]) or st[0] in local_helpers
                                        or st[0].split(".")[-1] in local_helpers):
                     raise GuardViolation("6a", "assumption atom inside a structure field or inductive constructor",
@@ -1032,29 +1054,75 @@ def _analyze_signature(scanner, sig: list) -> None:
         scanner.analyze(sig[colon + 1:], "pos")
 
 
-def _where_aux_signatures(body: list) -> list:
-    """Signatures `name binders : type` of the auxiliaries following a top-level `where`."""
-    sigs, i, n = [], 0, len(body)
+def _where_aux_items(body: list) -> list[tuple[list, list]]:
+    """`(sig, prop_or_untyped_rhs)` pairs for auxiliaries following a top-level `where`."""
+    items: list[tuple[list, list]] = []
+    i, n = 0, len(body)
     while i < n and body[i][0] != "where":
         i = _group_end(body, i) if body[i][0] in OPEN else i + 1
+    if i >= n:
+        return items
     i += 1
     while i < n:
         if body[i][0] in OPEN:
             i = _group_end(body, i)
             continue
         if body[i][0] == ":":
+            # Back up over binder groups (even multi-line) and leading identifiers of the aux head.
             start = i
-            # Back up over binder groups / names on the same logical declaration head.
-            while start > 0 and body[start - 1][0] not in (":=", "|", "where") and body[start - 1][1] == body[i][1]:
-                start -= 1
-            end = i + 1
-            while end < n and body[end][0] not in (":=", "|"):
-                end = _group_end(body, end) if body[end][0] in OPEN else end + 1
-            sigs.append(body[start:end])
-            i = end
+            while start > 0:
+                prev = body[start - 1][0]
+                if prev in (":=", "|", "where"):
+                    break
+                if prev in CLOSE:
+                    d, j = 1, start - 2
+                    while j >= 0 and d > 0:
+                        if body[j][0] in CLOSE:
+                            d += 1
+                        elif body[j][0] in OPEN:
+                            d -= 1
+                        j -= 1
+                    start = max(0, j + 1)
+                    continue
+                if re.fullmatch(r"[A-Za-z_][\w.']*", prev):
+                    if body[start - 1][1] == body[start][1] or (
+                        start < i and (body[start][0] in OPEN or body[start][0] == ":")
+                    ):
+                        start -= 1
+                        continue
+                break
+            end, in_match = i + 1, False
+            while end < n:
+                te = body[end][0]
+                if te == "match":
+                    in_match = True
+                elif te == ":=" or (te == "|" and not in_match):
+                    break
+                end = _group_end(body, end) if te in OPEN else end + 1
+            aux_sig = body[start:end]
+            # If the auxiliary is a Prop-valued `def` (`where aux : Prop := ...`), also collect its RHS.
+            rhs = []
+            ret_tokens = [tok[0] for tok in body[i + 1:end]]
+            if end < n and body[end][0] == ":=" and ret_tokens and ret_tokens[-1] == "Prop":
+                r = end + 1
+                while r < n and body[r][0] not in (":", ":="):
+                    r = _group_end(body, r) if body[r][0] in OPEN else r + 1
+                rhs = body[end + 1:r]
+                i = r
+            else:
+                i = end + (1 if end < n and body[end][0] == ":=" else 0)
+            items.append((aux_sig, rhs))
+            continue
+        if body[i][0] == ":=":
+            # Untyped auxiliary `where aux := ...`: check RHS in positive polarity.
+            r = i + 1
+            while r < n and body[r][0] not in (":", ":="):
+                r = _group_end(body, r) if body[r][0] in OPEN else r + 1
+            items.append(([], body[i + 1:r]))
+            i = r
             continue
         i += 1
-    return sigs
+    return items
 
 
 def _doc_tag(text: str, end: int, tag: str) -> bool:
@@ -1185,12 +1253,19 @@ def _has_struct_literal_or_anon_ctor(body: list, return_is_sealed: bool, codomai
                         return sub
                     i = end_rhs + (1 if end_rhs < len(toks) and toks[end_rhs][0] in (";", "in") else 0)
                     continue
-            # `show R from ⟨..⟩` / `show R by exact ⟨..⟩` gives the following term a sealed expected type.
-            if t == "show" and i + 1 < len(toks) and (
-                    toks[i + 1][0] in sealed_types or toks[i + 1][0].split(".")[-1] in sealed_types):
-                sub = check_slice(toks[i + 2:], True)
-                if sub is not None:
-                    return sub
+            # `show R from ⟨..⟩` / `show (R) from ⟨..⟩` gives the following term a sealed expected type.
+            if t == "show" and i + 1 < len(toks):
+                if toks[i + 1][0] in OPEN:
+                    end_ty = _group_end(toks, i + 1)
+                    ty_slice = toks[i + 2:end_ty - 1]
+                    after_ty = end_ty
+                else:
+                    ty_slice = [toks[i + 1]]
+                    after_ty = i + 2
+                if any(tok[0] in sealed_types or tok[0].split(".")[-1] in sealed_types for tok in ty_slice):
+                    sub = check_slice(toks[after_ty:], True)
+                    if sub is not None:
+                        return sub
             if t == "⟨":
                 end = _group_end(toks, i)
                 if allow_return:
@@ -1461,8 +1536,8 @@ def scan_sealing(path: str, text: str) -> None:
             direct_ctors.add(f"{alias_ty}.{ctor}")
             direct_ctors.add(f"{full}.{ctor}")
 
-        def token_hits(t: str, bound: set[str], prev_tok: str | None) -> bool:
-            if prev_tok == "." and t in sealed_ctors and cod_mentions_sealed:
+        def token_hits(t: str, bound: set[str], prev_tok: str | None, expected_sealed: bool) -> bool:
+            if prev_tok == "." and t in sealed_ctors and expected_sealed:
                 return True
             if t in bound:
                 return False
@@ -1487,12 +1562,24 @@ def scan_sealing(path: str, text: str) -> None:
                 return True
             return False
 
-        def walk(toks_slice: list, bound: set[str]) -> int | None:
+        def walk(toks_slice: list, bound: set[str], expected_sealed: bool) -> int | None:
             local_bound = set(bound)
             i = 0
             while i < len(toks_slice):
                 t, line = toks_slice[i][0], toks_slice[i][1]
                 prev_tok = toks_slice[i - 1][0] if i > 0 else None
+                if t == "show" and i + 1 < len(toks_slice):
+                    if toks_slice[i + 1][0] in OPEN:
+                        end_ty = _group_end(toks_slice, i + 1)
+                        ty_slice = toks_slice[i + 2:end_ty - 1]
+                        after_ty = end_ty
+                    else:
+                        ty_slice = [toks_slice[i + 1]]
+                        after_ty = i + 2
+                    if any(tok[0] in all_sealed_types or tok[0].split(".")[-1] in all_sealed_types for tok in ty_slice):
+                        hit = walk(toks_slice[after_ty:], local_bound, True)
+                        if hit is not None:
+                            return hit
                 if t in ("fun", "λ"):
                     j = i + 1
                     while j < len(toks_slice) and toks_slice[j][0] not in ("=>", "↦"):
@@ -1520,6 +1607,10 @@ def scan_sealing(path: str, text: str) -> None:
                             break
                         j = _group_end(toks_slice, j) if toks_slice[j][0] in OPEN else j + 1
                     if eq is not None:
+                        let_ty_sealed = any(
+                            tok[0] in all_sealed_types or tok[0].split(".")[-1] in all_sealed_types
+                            for tok in toks_slice[i + 2:eq]
+                        )
                         end_rhs, k = len(toks_slice), eq + 1
                         while k < len(toks_slice):
                             tk, ln = toks_slice[k][0], toks_slice[k][1]
@@ -1528,7 +1619,7 @@ def scan_sealing(path: str, text: str) -> None:
                                 break
                             k = _group_end(toks_slice, k) if tk in OPEN else k + 1
                         # Check RHS BEFORE adding `let_name` to `local_bound`.
-                        hit = walk(toks_slice[eq + 1:end_rhs], local_bound)
+                        hit = walk(toks_slice[eq + 1:end_rhs], local_bound, expected_sealed or let_ty_sealed)
                         if hit is not None:
                             return hit
                         local_bound.add(let_name)
@@ -1536,17 +1627,32 @@ def scan_sealing(path: str, text: str) -> None:
                         continue
                 if t in OPEN:
                     end_g = _group_end(toks_slice, i)
-                    hit = walk(toks_slice[i + 1:end_g - 1], local_bound)
+                    inner = toks_slice[i + 1:end_g - 1]
+                    # Explicit type ascription `(expr : R)` gives `expr` a sealed expected type.
+                    ascr_sealed = False
+                    k = 0
+                    while k < len(inner):
+                        if inner[k][0] in OPEN:
+                            k = _group_end(inner, k)
+                            continue
+                        if inner[k][0] == ":":
+                            ascr_sealed = any(
+                                tok[0] in all_sealed_types or tok[0].split(".")[-1] in all_sealed_types
+                                for tok in inner[k + 1:]
+                            )
+                            break
+                        k += 1
+                    hit = walk(inner, local_bound, expected_sealed or ascr_sealed)
                     if hit is not None:
                         return hit
                     i = end_g
                     continue
-                if token_hits(t, local_bound, prev_tok):
+                if token_hits(t, local_bound, prev_tok, expected_sealed):
                     return line
                 i += 1
             return None
 
-        hit = walk(body, _sig_bound_names(sig))
+        hit = walk(body, _sig_bound_names(sig), cod_mentions_sealed)
         if hit is not None:
             return hit
         return _has_struct_literal_or_anon_ctor(

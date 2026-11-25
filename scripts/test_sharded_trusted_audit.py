@@ -704,9 +704,23 @@ class PeerGuardScannerTests(unittest.TestCase):
         # 6b: `show R from \u27e8..\u27e9` and namespace-qualified / forwarder `export`.
         head = "/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\n\n"
         self.assert_violation(head + "def leak (n : Nat) : Nat := (show R from \u27e8n\u27e9).lo\n", "6b")
+        self.assert_violation(head + "def leak (n : Nat) : Nat := (show (R) from \u27e8n\u27e9).lo\n", "6b")
+        self.assert_violation(head + "def leak (n : Nat) : Nat := (show R from .mk n).lo\n", "6b")
+        self.assert_violation(head + "def leak (n : Nat) : Nat := ((.mk n : R)).lo\n", "6b")
+        self.assert_violation(head + "def leak (n : Nat) : Nat := let x : R := .mk n; x.lo\n", "6b")
         self.assert_violation("namespace Ns\n" + head + "end Ns\nnamespace Evil\nexport Ns (R.mk)\nend Evil\n", "6b", "export")
         self.assert_violation(head + "private def fwd (n : Nat) : R := R.mk n\nnamespace Evil\nexport _root_ (fwd)\nend Evil\n",
                               "6b", "export")
+        # 6a: multi-line where-aux binder, untyped/Prop where-aux, match in where-aux, and
+        # multi-line type ascription `assumesHold : Prop` inside a structure field/default.
+        self.assert_violation("theorem t : True := aux\nwhere\n  aux\n    (h : \u00ac assumesHold)\n    : True := trivial\n",
+                              "6a", "antecedent")
+        self.assert_violation("theorem t : True := trivial\nwhere\n  aux := assumesHold\n", "6a", "positive")
+        self.assert_violation("theorem t : True := trivial\nwhere\n  aux : Prop := assumesHold\n", "6a", "positive")
+        self.assert_violation("theorem t : True := trivial\nwhere\n  aux (x : Nat) : match x with | 0 => assumesHold | _ => True := sorry\n",
+                              "6a")
+        self.assert_violation("structure S where\n  h :\n    assumesHold : Prop\n", "6a", "structure field")
+        self.assert_violation("structure S where\n  p : Prop :=\n    assumesHold : Prop\n", "6a", "structure field")
 
     def test_live_theory_has_zero_false_positives(self):
         summary = sta.scan_peer_guards([REPO / "theory/Anneal"])
@@ -742,7 +756,7 @@ class ExactModulesEndToEndTests(unittest.TestCase):
         return root
 
     def _run(self, root: Path, spec: str | None, temp_parent: Path):
-        checker = ct.Checker(root, fast=True, temp_parent=temp_parent)
+        checker = ct.Checker(root, fast=True, cache_dir=temp_parent / "cache", temp_parent=temp_parent)
         try:
             targets = None if spec is None else ct.resolve_exact_modules(spec, self.TARGETS)
             with unittest.mock.patch.object(ct, "DOWNSTREAM_TARGETS", self.TARGETS):
