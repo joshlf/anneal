@@ -2918,10 +2918,10 @@ def dvLmInit (variantIdx caseIdx : Nat) : AnnealStepState :=
   match variantIdx, caseIdx, dvKeyInitSpec variantIdx caseIdx with
   -- 0: thinUnsize
   | 0, 0, (0, val, _, _, _, _, _) => dvStThinLocal body val 4 dvU32Ty dvRefU32Ty
-  | 0, 1, (2, _, off, _, _, _, _) =>
+  | 0, 1, (2, 5, off, _, _, _, _) =>
     dvMkState body #[dvUninit ((body.localDecls.head?.map (·.ty)).getD dvU32Ty),
       dvImmLocal (.scalar (dvPtrScalar dvAid5 (dvBase5 + UInt64.ofNat off))) dvRawConstU32Ty] dvMachine5
-  | 0, 2, (2, _, off, _, _, _, _) =>
+  | 0, 2, (2, 5, off, _, _, _, _) =>
     dvMkState body #[dvUninit ((body.localDecls.head?.map (·.ty)).getD dvU32Ty),
       dvImmLocal (.scalar (dvPtrScalar dvAid5 (dvBase5 + UInt64.ofNat off))) dvRefU32Ty] dvMachine5
   | 0, 3, (1, val, _, _, _, _, _) => dvStThinLocal body val 8 dvU64Ty dvRefMutU64Ty
@@ -2935,7 +2935,7 @@ def dvLmInit (variantIdx caseIdx : Nat) : AnnealStepState :=
       dvIndirectLocal dvAid1, dvUninit dvRefU32Ty, dvUninit (dvRefDynTy dvSubKey)]
       (dvMachine dvVTables (dvLiveU32 dvAid1 val none) #[⟨dvAid1, annealStackBaseAddr dvAid1⟩])
   | 1, 2, (4, vt, val, _, _, disabled, live) => dvStPointeeSpec body vt disabled live val
-  | 1, 3, (3, _, off, vt, _, _, _) => dvStRawDyn body (UInt64.ofNat off) [(vt, dvTrKey)]
+  | 1, 3, (3, 5, off, vt, _, _, _) => dvStRawDyn body (UInt64.ofNat off) [(vt, dvTrKey)]
   -- 2: virtualDispatchAndProtector
   | 2, 0, (0, val, _, _, _, _, _) => dvStCall body val 4 dvU32Ty dvRefU32Ty
   | 2, 1, (1, val, _, _, _, _, _) => dvStCall body val 8 dvU64Ty dvRefU64Ty
@@ -2948,10 +2948,10 @@ def dvLmInit (variantIdx caseIdx : Nat) : AnnealStepState :=
         (some (dvRecvBorrowState false)))
   -- 3: dynLayoutRawBorrowAndAddrEq
   | 3, 0, (4, vt, val, _, _, disabled, live) => dvStPointeeSpec body vt disabled live val
-  | 3, 1, (5, _, off, vt1, vt2, _, _) =>
+  | 3, 1, (5, 5, off, vt1, vt2, _, _) =>
     dvStRawDyn body (UInt64.ofNat off) [(vt1, dvTrKey), (vt2, dvAltKey)]
   | 3, 2, (4, vt, val, _, _, disabled, live) => dvStPointeeSpec body vt disabled live val
-  | 3, 3, (5, _, off, vt1, vt2, _, _) =>
+  | 3, 3, (5, 5, off, vt1, vt2, _, _) =>
     dvStRawDyn body (UInt64.ofNat off) [(vt1, dvTrKey), (vt2, dvTrKey)]
   | _, _, _ => dvStThinLocal (dvLmFixture 0 0) 7 4 dvU32Ty dvRefU32Ty
 
