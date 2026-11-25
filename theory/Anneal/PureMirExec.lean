@@ -899,8 +899,9 @@ private theorem evalDynCallHook?_pushBaseStack_of_noCallWP
                         | true =>
                           rw [h_cmp] at h_st; dsimp only at h_st ⊢
                           cases h_unp : unpackDynReceiver? kind recvVal with
-                          | none => rw [h_unp] at h_st; exact False.elim h_st
-                          | some dm =>
+                          | ub => rw [h_unp] at h_st; exact False.elim h_st
+                          | unsupported => rw [h_unp] at h_st; exact False.elim h_st
+                          | ok dm =>
                             rcases dm with ⟨dataVal, metaVal⟩
                             rw [h_unp] at h_st; dsimp only at h_st ⊢
                             rw [checkDynVTablePtr_eq_of_mem_fields (some curBody)
@@ -919,6 +920,9 @@ private theorem evalDynCallHook?_pushBaseStack_of_noCallWP
                                 cases sl with
                                 | dropInPlace _ | size | align | vacant | traitVPtr _ =>
                                   rw [h_sl] at h_st; exact False.elim h_st
+                                | unmodeledMethod =>
+                                  rw [h_sl] at h_st; dsimp only at h_st
+                                  split at h_st <;> exact False.elim h_st
                                 | method concreteDefPath concreteArgs =>
                                   rw [h_sl] at h_st; dsimp only at h_st ⊢
                                   rw [dynRefDataValid_pushBaseStack calleeBody baseStack ms _ _ _ _ _ _ _ _ h_bor]
@@ -3772,8 +3776,9 @@ private theorem evalDynCallHook?_borrows_ne_nil_of_noCallWP
                       | true =>
                         rw [h_k] at h_st; dsimp only at h_st ⊢
                         cases h_u : unpackDynReceiver? kind recvVal with
-                        | none => rw [h_u] at h_st; exact False.elim h_st
-                        | some dm =>
+                        | ub => rw [h_u] at h_st; exact False.elim h_st
+                        | unsupported => rw [h_u] at h_st; exact False.elim h_st
+                        | ok dm =>
                           rcases dm with ⟨dataVal, metaVal⟩
                           rw [h_u] at h_st; dsimp only at h_st ⊢
                           cases h_v : checkDynVTablePtr (some curBody) (DynMemView.ofMemory ms.memory)
@@ -3789,6 +3794,9 @@ private theorem evalDynCallHook?_borrows_ne_nil_of_noCallWP
                               cases sl with
                               | dropInPlace _ | size | align | vacant | traitVPtr _ =>
                                 rw [h_sl] at h_st; exact False.elim h_st
+                              | unmodeledMethod =>
+                                rw [h_sl] at h_st; dsimp only at h_st
+                                split at h_st <;> exact False.elim h_st
                               | method cdp cargs =>
                                 rw [h_sl] at h_st; dsimp only at h_st ⊢
                                 split at h_st

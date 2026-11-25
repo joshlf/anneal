@@ -2329,6 +2329,13 @@ pub fn use_cn(s: &Sq) -> usize {
             manifest.unit_targets.iter().map(|t| &t.target.def_id).collect::<Vec<_>>()
         );
 
+        // `core::marker::MetaSized` must never pollute the vtable table or shadow
+        // primary supertrait links (`Named: Shape`).
+        assert!(
+            !t.contains("MetaSized"),
+            "spurious MetaSized vtable leaked into dyn tables:\n{t}"
+        );
+
         // Re-capturing in the same thread (fresh session) is deterministic.
         let capture_dir2 = temp_root.join("capture2");
         fs::create_dir_all(&capture_dir2).expect("create capture dir 2");
@@ -2342,6 +2349,211 @@ pub fn use_cn(s: &Sq) -> usize {
             fs::read_to_string(capture_dir2.join("demo_dyn").join(&rec.target.mir_module_path))
                 .unwrap();
         assert_eq!(tables(&again), t);
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn driver_captures_dyn_supertrait_hierarchy_and_edge_cases() {
+        let temp_root = unique_temp_dir("dyn-edge-cases");
+        let capture_dir = temp_root.join("capture");
+        let out_dir = temp_root.join("out");
+        fs::create_dir_all(&capture_dir).expect("create capture dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        let src_path = temp_root.join("dyn_edges.rs");
+        let sample_rust = r#"#![allow(dead_code)]
+pub trait Base { fn b(&self) -> u32; }
+pub trait Mid: Base { fn m(&self) -> u32; }
+pub trait Side { fn s(&self) -> u32; }
+pub trait Diamond: Mid + Side {}
+
+pub trait M1 {}
+pub trait M2 {}
+pub trait TwoMarkers: M1 + M2 {}
+
+pub trait AssocSuper {
+    type Out;
+    fn out(&self) -> Self::Out;
+}
+pub trait AssocSub: AssocSuper<Out = u32> {
+    fn extra(&self) -> u32;
+}
+
+pub trait GenCn<const N: usize> {
+    fn val(&self) -> usize;
+}
+
+pub trait HrSuper<'a> {
+    fn f(&self, x: &'a u32) -> u32;
+}
+pub trait HrSub: for<'a> HrSuper<'a> {}
+
+pub struct HasDrop(pub u32);
+impl Drop for HasDrop {
+    fn drop(&mut self) { self.0 = 0; }
+}
+impl Base for HasDrop { fn b(&self) -> u32 { self.0 } }
+impl Mid for HasDrop { fn m(&self) -> u32 { self.0 + 1 } }
+impl Side for HasDrop { fn s(&self) -> u32 { self.0 + 2 } }
+impl Diamond for HasDrop {}
+impl M1 for HasDrop {}
+impl M2 for HasDrop {}
+impl TwoMarkers for HasDrop {}
+impl AssocSuper for HasDrop {
+    type Out = u32;
+    fn out(&self) -> u32 { self.0 }
+}
+impl AssocSub for HasDrop { fn extra(&self) -> u32 { self.0 + 3 } }
+impl<const N: usize> GenCn<N> for HasDrop {
+    fn val(&self) -> usize { N }
+}
+impl<'a> HrSuper<'a> for HasDrop {
+    fn f(&self, x: &'a u32) -> u32 { self.0 + *x }
+}
+impl HrSub for HasDrop {}
+
+pub fn exercise(h: &HasDrop) -> u32 {
+    let d: &dyn Diamond = h;
+    let m: &dyn Mid = d;
+    let b: &dyn Base = m;
+    let s: &dyn Side = d;
+    let tm: &dyn TwoMarkers = h;
+    let _m1: &dyn M1 = tm;
+    let _m2: &dyn M2 = tm;
+    let asub: &dyn AssocSub = h;
+    let asup: &dyn AssocSuper<Out = u32> = asub;
+    let gc3: &dyn GenCn<3> = h;
+    let gc4: &dyn GenCn<4> = h;
+    let _hr: &dyn HrSub = h;
+    b.b() + m.m() + s.s() + asup.out() + (gc3.val() + gc4.val()) as u32
+}
+"#;
+        fs::write(&src_path, sample_rust.as_bytes()).expect("write dyn_edges.rs");
+        let args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "dyn_edges".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            "--edition=2024".to_owned(),
+            "--out-dir".to_owned(),
+            out_dir.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run_with_args(&args, Some(capture_dir.clone()), None), 0);
+
+        let crate_capture_dir = capture_dir.join("dyn_edges");
+        let manifest_content =
+            fs::read_to_string(crate_capture_dir.join("UnitCaptureManifest.json")).unwrap();
+        let manifest: crate::manifest::UnitCaptureManifest =
+            crate::manifest::UnitCaptureManifest::from_json_str(&manifest_content).unwrap();
+        let rec = manifest
+            .unit_targets
+            .iter()
+            .find(|t| t.target.def_id == "dyn_edges::exercise")
+            .expect("missing dyn_edges::exercise");
+        let lean = fs::read_to_string(crate_capture_dir.join(&rec.target.mir_module_path)).unwrap();
+        let vtables_line = lean
+            .lines()
+            .find(|l| l.trim_start().starts_with("vtables :="))
+            .expect("missing vtables line");
+        let dyn_types_line = lean
+            .lines()
+            .find(|l| l.trim_start().starts_with("dynTypes :="))
+            .expect("missing dynTypes line");
+
+        // 1. No spurious `core::marker::MetaSized` vtable.
+        assert!(
+            !vtables_line.contains("MetaSized"),
+            "spurious MetaSized vtable in:\n{vtables_line}"
+        );
+
+        // Parse `(vtableId, dynKey, chunk)` for exact parent-link assertions.
+        let parse_vt = |needle: &str| -> (u64, String) {
+            for chunk in vtables_line.split("{ vtableId := ").skip(1) {
+                let id_str = chunk.split(',').next().unwrap().trim();
+                let id: u64 = id_str.parse().unwrap();
+                let key = chunk
+                    .split("dynKey := \"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap();
+                if key == needle {
+                    return (id, chunk.to_owned());
+                }
+            }
+            panic!("missing vtable for dynKey `{needle}` in:\n{vtables_line}");
+        };
+
+        let (base_id, _) = parse_vt("dyn_edges::Base");
+        let (mid_id, mid_chunk) = parse_vt("dyn_edges::Mid");
+        let (side_id, _) = parse_vt("dyn_edges::Side");
+        let (_, diamond_chunk) = parse_vt("dyn_edges::Diamond");
+        assert!(
+            diamond_chunk.contains(&format!("primarySuperVTableId? := (Option.some {mid_id})")),
+            "Diamond primarySuperVTableId? must point to Mid ({mid_id}), got:\n{diamond_chunk}"
+        );
+        assert!(
+            mid_chunk.contains(&format!("primarySuperVTableId? := (Option.some {base_id})")),
+            "Mid primarySuperVTableId? must point to Base ({base_id}), got:\n{mid_chunk}"
+        );
+        assert!(
+            diamond_chunk.contains(&format!("(CapturedVTableSlot.traitVPtr {side_id})")),
+            "Diamond must link Side ({side_id}) via traitVPtr, got:\n{diamond_chunk}"
+        );
+
+        // 2. TwoMarkers: M1 + M2 has both 0-method prefix supertraits linked.
+        let (m1_id, _) = parse_vt("dyn_edges::M1");
+        let (m2_id, _) = parse_vt("dyn_edges::M2");
+        let (_, tm_chunk) = parse_vt("dyn_edges::TwoMarkers");
+        assert!(
+            tm_chunk.contains(&format!("primarySuperVTableId? := (Option.some {m1_id})")),
+            "TwoMarkers primarySuperVTableId? must point to M1 ({m1_id}), got:\n{tm_chunk}"
+        );
+        assert!(
+            tm_chunk.contains(&format!(
+                "extraSuperVTableIds := (List.cons {m2_id} List.nil)"
+            )),
+            "TwoMarkers extraSuperVTableIds must contain M2 ({m2_id}), got:\n{tm_chunk}"
+        );
+
+        // 3. AssocSub: AssocSuper<Out = u32> links primarySuperVTableId? to AssocSuper<Out = u32>.
+        let (asup_id, _) = parse_vt("dyn AssocSuper<Out = u32>");
+        let (_, asub_chunk) = parse_vt("dyn AssocSub");
+        assert!(
+            asub_chunk.contains(&format!("primarySuperVTableId? := (Option.some {asup_id})")),
+            "AssocSub primarySuperVTableId? must point to AssocSuper<Out = u32> ({asup_id}), got:\n{asub_chunk}"
+        );
+
+        // 4. Generic const-param impl `impl<const N: usize> GenCn<N> for HasDrop` emits `unmodeledMethod`.
+        let (_, gc3_chunk) = parse_vt("dyn GenCn<3>");
+        assert!(
+            gc3_chunk.contains("CapturedVTableSlot.unmodeledMethod"),
+            "const-generic impl method must emit unmodeledMethod, got:\n{gc3_chunk}"
+        );
+
+        // 5. Higher-ranked supertrait `HrSub: for<'a> HrSuper<'a>` sets `supertraitOutlivesOk := false`.
+        let hrsub_desc = dyn_types_line
+            .split("{ dynKey := \"dyn_edges::HrSub\"")
+            .nth(1)
+            .expect("missing dyn_edges::HrSub descriptor");
+        let hrsub_desc = hrsub_desc.split(" }").next().unwrap();
+        assert!(
+            hrsub_desc.contains("supertraitOutlivesOk := false"),
+            "HrSub must set supertraitOutlivesOk := false, got:\n{hrsub_desc}"
+        );
+
+        // 6. Concrete `Drop` impl records `HasDrop`'s destructor in `dropInPlace`.
+        assert!(
+            diamond_chunk.contains("CapturedVTableSlot.dropInPlace (Option.some \"dyn_edges::<HasDrop as core::ops::drop::Drop>::drop\")")
+                || (diamond_chunk.contains("CapturedVTableSlot.dropInPlace (Option.some \"")
+                    && diamond_chunk.contains("HasDrop")
+                    && diamond_chunk.contains("drop\"")),
+            "expected concrete HasDrop destructor DefPath in dropInPlace, got:\n{diamond_chunk}"
+        );
+
         let _ = fs::remove_dir_all(&temp_root);
     }
 }

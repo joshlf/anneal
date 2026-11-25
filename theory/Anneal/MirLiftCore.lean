@@ -11842,7 +11842,8 @@ theorem collectMatchingTraitImpls_eq_of_no_traitImpl (callees : CalleeEnv) :
 `typeArgs : List RigidTy` (both monomorphic `[]` and polymorphic `firstArg :: restArgs`). -/
 theorem resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (c : CalleeEnv) (dp : DefPath)
     (typeArgs : List RigidTy) (ti : List TraitImplEntry)
-    (h_no : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c) dp = false) :
+    (h_no : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c) dp = false)
+    (h_ta : typeArgs.all rigidTyHasNoDyn = true) :
     resolveCalleeBodyAndArgs? c dp typeArgs ti =
       match findCallee? c dp with
       | some b => some (b, typeArgs)
@@ -11852,17 +11853,18 @@ theorem resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (c : CalleeEnv) (dp : DefPa
   | cons firstArg restArgs =>
     have h_col := collectMatchingTraitImpls_eq_of_no_traitImpl c (ti ++ flatMapTraitImpls c)
       dp (firstArg :: restArgs) [] h_no
-    cases firstArg <;> (
-      unfold resolveCalleeBodyAndArgs?
-      dsimp only
-      try rw [h_col]
-      try dsimp only
-      cases findCallee? c dp with
-      | none => rfl
-      | some b =>
-        dsimp only
-        rw [h_no]
-        try rfl)
+    cases firstArg <;> (first
+      | (simp only [List.all_cons, rigidTyHasNoDyn, Bool.false_and] at h_ta; cases h_ta)
+      | (unfold resolveCalleeBodyAndArgs?
+         dsimp only
+         try rw [h_col]
+         try dsimp only
+         cases findCallee? c dp with
+         | none => rfl
+         | some b =>
+           dsimp only
+           rw [h_no]
+           try rfl))
 
 /-- Polymorphic `lookupCallee` (`typeArgs` arbitrary) depends on `c₁` and `c₂` only through
 `findCallee?` whenever neither table's trait-impl list registers `dp`. -/
@@ -11870,11 +11872,12 @@ theorem lookupCallee_eq_of_findCallee_eq_of_no_traitImpl {c₁ c₂ : CalleeEnv}
     (L : LayoutTable) (typeArgs : List RigidTy) (ti : List TraitImplEntry)
     (h : findCallee? c₁ dp = findCallee? c₂ dp)
     (h₁ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₁) dp = false)
-    (h₂ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₂) dp = false) :
+    (h₂ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₂) dp = false)
+    (h_ta : typeArgs.all rigidTyHasNoDyn = true) :
     lookupCallee c₁ L dp typeArgs ti = lookupCallee c₂ L dp typeArgs ti := by
   unfold lookupCallee
-  rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl c₁ dp typeArgs ti h₁,
-    resolveCalleeBodyAndArgs?_eq_of_no_traitImpl c₂ dp typeArgs ti h₂, h]
+  rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl c₁ dp typeArgs ti h₁ h_ta,
+    resolveCalleeBodyAndArgs?_eq_of_no_traitImpl c₂ dp typeArgs ti h₂ h_ta, h]
 
 /-- Polymorphic `checkCalleeSig` (`typeArgs` arbitrary) depends on `c₁` and `c₂` only through
 `findCallee?` (including when either table is `[]`) whenever neither table registers a
@@ -11884,7 +11887,8 @@ theorem checkCalleeSig_eq_of_findCallee_eq_of_no_traitImpl {c₁ c₂ : CalleeEn
     (typeArgs : List RigidTy) (ti : List TraitImplEntry)
     (h : findCallee? c₁ dp = findCallee? c₂ dp)
     (h₁ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₁) dp = false)
-    (h₂ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₂) dp = false) :
+    (h₂ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₂) dp = false)
+    (h_ta : typeArgs.all rigidTyHasNoDyn = true) :
     checkCalleeSig c₁ dp fnInputs fnOutput fnAbi typeArgs ti =
       checkCalleeSig c₂ dp fnInputs fnOutput fnAbi typeArgs ti := by
   cases c₁ with
@@ -11894,17 +11898,17 @@ theorem checkCalleeSig_eq_of_findCallee_eq_of_no_traitImpl {c₁ c₂ : CalleeEn
     | cons b₂ r₂ =>
       have hfn : findCallee? (b₂ :: r₂) dp = none := h.symm
       unfold checkCalleeSig
-      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₂ :: r₂) dp typeArgs ti h₂, hfn]
+      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₂ :: r₂) dp typeArgs ti h₂ h_ta, hfn]
   | cons b₁ r₁ =>
     cases c₂ with
     | nil =>
       have hfn : findCallee? (b₁ :: r₁) dp = none := h
       unfold checkCalleeSig
-      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₁ :: r₁) dp typeArgs ti h₁, hfn]
+      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₁ :: r₁) dp typeArgs ti h₁ h_ta, hfn]
     | cons b₂ r₂ =>
       unfold checkCalleeSig
-      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₁ :: r₁) dp typeArgs ti h₁,
-        resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₂ :: r₂) dp typeArgs ti h₂, h]
+      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₁ :: r₁) dp typeArgs ti h₁ h_ta,
+        resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₂ :: r₂) dp typeArgs ti h₂ h_ta, h]
 
 /-- `internFnPtr` depends only on `Memory.fnPtrs` and `Memory.nextTag`, so it commutes with
 `Memory.withCalleeCtx`. -/
@@ -14599,7 +14603,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
         | ok argVals locals' =>
           dsimp only
           rw [lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
-              s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁,
+              s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁ h_ta_nd,
             evalDirectRustIntrinsic?_withCallees_of_nonSelect c₂ s (some cur) tgt
               (bodyLocalDeclsOf (some cur)) cur.layouts argOps argVals locals' destination
               targetBb unwind h_cl h_pt_nd,
@@ -14637,7 +14641,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
         | ok argVals locals' =>
           dsimp only
           rw [lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
-              s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁,
+              s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁ h_ta_nd,
             evalDynCallHook?_withCallees_of_noDyn c₂ s (some cur) tgt
               (bodyLocalDeclsOf (some cur)) cur.layouts argOps argVals locals' destination
               none unwind h_ta_nd h_pt_nd]
@@ -14663,7 +14667,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
     | ub => rfl
     | unsupported => rfl
     | ok tgt localsAfterFunc =>
-      obtain ⟨h_dp, h_no₁, h_no₂, _, _⟩ := hq tgt localsAfterFunc h_res
+      obtain ⟨h_dp, h_no₁, h_no₂, _, h_ta_nd⟩ := hq tgt localsAfterFunc h_res
       dsimp only
       cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
           s.memory.callerLocals (bodyLocalDeclsOf (some cur)) s.memory.callStack with
@@ -14677,7 +14681,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
         | false =>
           dsimp only
           rw [lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
-              s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁]
+              s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁ h_ta_nd]
           cases lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs s.memory.traitImpls with
           | none => rfl
           | some calleeBody =>
@@ -15037,7 +15041,7 @@ theorem lookupCallee_eq_some_of_no_traitImpl {c : CalleeEnv} {L : LayoutTable} {
       subst.all (fun p => rigidTyHasNoDyn p.1) = true ∧
       calleeBody = b.instantiate subst := by
   unfold lookupCallee at h_lk
-  rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl c dp typeArgs ti h_no] at h_lk
+  rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl c dp typeArgs ti h_no h_ta] at h_lk
   cases hf : findCallee? c dp with
   | none => rw [hf] at h_lk; cases h_lk
   | some b =>

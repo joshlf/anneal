@@ -4473,13 +4473,17 @@ def classifyDynReceiver? : RigidTy → Option (DynReceiverKind × DefPath)
     | false => .none
   | _ => .none
 
-/-- Split a receiver value of `kind` into its data and metadata words. -/
+/-- Split a receiver value of `kind` into its data and metadata words, failing
+closed (`.unsupported`) on unexpected non-aggregate `Pin` shapes (e.g.
+`#[repr(transparent)]`-transmuted `Pin<&dyn>`; uninitialized operands were
+already rejected as `.ub` by `evalOperandsWithBodyCast`). -/
 @[reducible]
-def unpackDynReceiver? : DynReceiverKind → Value → Option (Value × Value)
-  | .ref _, .aggregate 0 (d :: m :: .nil) => .some (d, m)
-  | .raw _, .aggregate 0 (d :: m :: .nil) => .some (d, m)
-  | .pinRef _, .aggregate 0 (.aggregate 0 (d :: m :: .nil) :: .nil) => .some (d, m)
-  | _, _ => .none
+def unpackDynReceiver? : DynReceiverKind → Value → DynCheck (Value × Value)
+  | .ref _, .aggregate 0 (d :: m :: .nil) => .ok (d, m)
+  | .raw _, .aggregate 0 (d :: m :: .nil) => .ok (d, m)
+  | .pinRef _, .aggregate 0 (.aggregate 0 (d :: m :: .nil) :: .nil) => .ok (d, m)
+  | .pinRef _, _ => .unsupported
+  | _, _ => .ub
 
 /-- Narrowed (thin) receiver value passed to the concrete method: the data word,
 re-wrapped in `Pin`'s single field for `Pin` receivers. -/
@@ -4759,23 +4763,28 @@ def evalVirtualCall
         | false => MirStepNode.unsupported
         | true =>
           match unpackDynReceiver? kind recvVal with
-          | .none => MirStepNode.fail .ub
-          | .some (dataVal, metaVal) =>
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+          | .ok (dataVal, metaVal) =>
             match checkDynVTablePtr currentBody (DynMemView.ofMemory s.memory) ptrBytes metaVal recvKey with
             | .ub => MirStepNode.fail .ub
             | .unsupported => MirStepNode.unsupported
             | .ok (entry, _, _) =>
+              let recvOk : Bool :=
+                match kind.isSafeRef with
+                | false => true
+                | true =>
+                  dynRefDataValid locals' (DynMemView.ofMemory s.memory) bodyLocalDecls bodyLayouts ptrBytes dataVal entry
+                    (match kind.mutability with
+                     | .mut => true
+                     | .not => false)
+                    true
               match get? entry.slots vm.slotIdx with
+              | .some .unmodeledMethod =>
+                match recvOk with
+                | false => MirStepNode.fail .ub
+                | true => MirStepNode.unsupported
               | .some (.method concreteDefPath concreteArgs) =>
-                let recvOk : Bool :=
-                  match kind.isSafeRef with
-                  | false => true
-                  | true =>
-                    dynRefDataValid locals' (DynMemView.ofMemory s.memory) bodyLocalDecls bodyLayouts ptrBytes dataVal entry
-                      (match kind.mutability with
-                       | .mut => true
-                       | .not => false)
-                      true
                 match recvOk with
                 | false => MirStepNode.fail .ub
                 | true =>
@@ -4825,20 +4834,29 @@ def evalVirtualCall
   | _, _ => MirStepNode.fail .ub
 
 /--
-`dyn`-aware handling of a direct call that has no linked body
+`dyn`-aware fallback handling of a direct call that has no linked body
 (`lookupCallee = .none`): `core::ptr::addr_eq` (`evalAddrEqCall`), uninlined
 safe `core::mem::{size_of_val, align_of_val}` on `&dyn K`
-(`evalSafeDynSizeAlignOfValCall`), and calls whose `(target.defPath, Self = dyn K)`
-has a captured `InstanceKind::Virtual` record (`evalVirtualCall`). Every other
-call returns `.none` and keeps the pre-existing semantics (intrinsics, panics,
+(`evalSafeDynSizeAlignOfValCall`), and virtual method calls whose `Self` type
+argument is `.dynamic dynKey` and whose `(target.defPath, dynKey)` is recorded
+as an `InstanceKind::Virtual` call target (`evalVirtualCall`). Every other call
+returns `.none` and keeps the pre-existing semantics (intrinsics, panics,
 external calls).
 
-Justification: a call is dispatched through the vtable exactly when rustc
-resolved it to `InstanceKind::Virtual` (see `CapturedVirtualMethod`); the
-`Self` type of a trait method call is its first generic argument. Wired into
-both normal and diverging `.call` arms of `evalTerminator` (and
-`evalCallTerminator`) after `lookupCallee` / intrinsic / panic resolution and
-before falling back to `MirStepNode.extCall`.
+Reference (`compiler/rustc_middle/src/ty/instance.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/instance.rs#L109-L117>
+
+> "/// Dynamic dispatch to `<dyn Trait as Trait>::fn`.
+> ///
+> /// This `InstanceKind` may have a callable MIR as the default implementation.
+> /// Calls to `Virtual` instances must be codegen'd as virtual calls through the vtable.
+> /// *This means we might not know exactly what is being called.*"
+
+Justification: `resolveCalleeBodyAndArgs?` (and `RigidTy.computeLayout` returning
+`.none` on `.dynamic _`) guarantees `lookupCallee` returns `.none` on every
+registered virtual method call, so a trait's default method body can never
+shadow virtual dispatch while all non-`dyn` call-inlining proofs remain intact.
 -/
 def evalDynCallHook?
     (s : MachineState)

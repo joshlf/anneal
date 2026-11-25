@@ -178,12 +178,19 @@ Reference (`compiler/rustc_middle/src/ty/vtable.rs` at commit
 > }"
 
 Modeling choices (not `rustc` guarantees): `.dropInPlace` additionally records
-the canonical `DefPath` of the concrete `drop_in_place` glue when one is
-captured (`.none` for types without drop glue); `.method` records the resolved
-`Instance` as its canonical `DefPath` plus erased monomorphic generic arguments;
-and `.traitVPtr` names the target supertrait vtable by its `CapturedVTable.vtableId`
-rather than by `TraitRef`. Only `.method` slots are callable; every other slot
-faults a virtual call (see `Terminators.lean`).
+the canonical `DefPath` of the concrete `drop_in_place` glue or ADT destructor
+when one is captured (`.none` for types without drop glue); `.method` records
+the resolved `InstanceKind::Item` as its canonical `DefPath` plus erased
+monomorphic type generic arguments when it has no const generic arguments;
+`.unmodeledMethod` represents a valid `VtblEntry::Method(instance)` slot whose
+`Instance` is a compiler-synthesized shim (`ClosureOnceShim`, `FnPtrShim`,
+`CloneShim`, etc.) or carries const generic arguments that `CapturedMir` cannot
+represent faithfully (so virtual calls to that slot fail closed with
+`.unsupported` rather than mis-dispatching or falsely faulting `.ub`); and
+`.traitVPtr` names the target supertrait vtable by its `CapturedVTable.vtableId`
+rather than by `TraitRef`. Every non-method slot (`.dropInPlace`, `.size`,
+`.align`, `.vacant`, `.traitVPtr`) faults `.ub` on a virtual call (see
+`Terminators.lean`).
 -/
 inductive CapturedVTableSlot : Type where
   /-- `VtblEntry::MetadataDropInPlace`, with the captured drop glue `DefPath`. -/
@@ -194,9 +201,13 @@ inductive CapturedVTableSlot : Type where
   | align : CapturedVTableSlot
   /-- `VtblEntry::Vacant` (non-dispatchable method excluded from the vtable). -/
   | vacant : CapturedVTableSlot
-  /-- `VtblEntry::Method(instance)`: the concrete method's canonical `DefPath`
-      and erased generic arguments of the resolved `Instance`. -/
+  /-- `VtblEntry::Method(instance)` for a modeled `InstanceKind::Item` without
+      const generic arguments: the concrete method's canonical `DefPath` and
+      erased type generic arguments of the resolved `Instance`. -/
   | method (defPath : DefPath) (typeArgs : List RigidTy) : CapturedVTableSlot
+  /-- `VtblEntry::Method(instance)` for a valid method slot that is a compiler
+      shim or carries const generic arguments (fails closed `.unsupported`). -/
+  | unmodeledMethod : CapturedVTableSlot
   /-- `VtblEntry::TraitVPtr(trait_ref)`: pointer to the supertrait vtable with
       `CapturedVTable.vtableId = vtableId`. -/
   | traitVPtr (vtableId : Nat) : CapturedVTableSlot
@@ -330,9 +341,12 @@ carry; `rustc-capture` assigns it deterministically in
 `[vtableAllocBase, vtableAllocBase + vtableAllocSpan)` and `vtableEnvOk`
 (`State.lean`) rejects tables whose identifiers collide with globals, function
 pointers, or stack-local page addresses. `primarySuperVTableId?` records the
-supertrait vtable that rustc lays out as a prefix of this one (no `TraitVPtr`
-slot), if any. The vtable allocation itself is not byte-addressable in this
-model: reading or writing through a metadata pointer is unsupported.
+longest-prefix explicit supertrait vtable that rustc lays out as a prefix of
+this one (no `TraitVPtr` slot), if any; `extraSuperVTableIds` records any
+additional explicit 0-method supertrait vtables whose 3-slot header is also a
+prefix of this vtable without a `TraitVPtr` slot (e.g. `trait Sub: M1 + M2`).
+The vtable allocation itself is not byte-addressable in this model: reading or
+writing through a metadata pointer is unsupported.
 -/
 structure CapturedVTable : Type where
   /-- Deterministic index of this vtable in the crate-level table. -/
@@ -349,8 +363,11 @@ structure CapturedVTable : Type where
   alignBytes : Nat
   /-- `true` when `T`'s layout is uninhabited. -/
   isUninhabited : Bool := false
-  /-- Supertrait vtable laid out as a prefix of this vtable (if any). -/
+  /-- Primary supertrait vtable laid out as a prefix of this vtable (if any). -/
   primarySuperVTableId? : Option Nat := .none
+  /-- Additional explicit 0-method supertrait vtables whose header is a prefix
+      of this vtable without a `TraitVPtr` slot. -/
+  extraSuperVTableIds : List Nat := .nil
   /-- `tcx.vtable_entries(..)` slots in order. -/
   slots : List CapturedVTableSlot := .nil
 
@@ -1782,6 +1799,7 @@ theorem CapturedVTableSlot.instantiate_nil :
   | .align => rfl
   | .vacant => rfl
   | .method p a => congrArg (CapturedVTableSlot.method p) (RigidTy.instantiateList_nil a)
+  | .unmodeledMethod => rfl
   | .traitVPtr _ => rfl
 
 /-- `CapturedVTableSlot.instantiateList` is the identity under `.nil`. -/

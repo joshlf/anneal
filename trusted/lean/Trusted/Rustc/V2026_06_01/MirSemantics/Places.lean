@@ -14819,6 +14819,21 @@ def resolveCalleeBodyAndArgs?
       | true => Option.none
       | false => Option.some (c, typeArgs)
   | firstArg :: restArgs =>
+    -- Virtual dispatch guard (`InstanceKind::Virtual`,
+    -- `compiler/rustc_middle/src/ty/instance.rs` lines 109-117): if
+    -- `(defPath, dynKey)` is a recorded virtual method, refuse direct body
+    -- lookup so a trait's default method body or a trait-impl entry can never
+    -- shadow vtable dispatch in `evalDynCallHook?`. Non-virtual calls with
+    -- `Self = dyn Other` (e.g. `impl Foo for dyn Bar`) are absent from
+    -- `virtualMethods` and resolve normally.
+    let shadowedByVirtual : Bool :=
+      match firstArg with
+      | .dynamic dynKey =>
+        (lookupVirtualMethod (collectBodyVirtualMethods Option.none callees) defPath dynKey).isSome
+      | _ => false
+    if shadowedByVirtual then
+      Option.none
+    else
     let allTraitImpls := extraTraitImpls ++ flatMapTraitImpls callees
     let matchedImpls :=
       collectMatchingTraitImpls
@@ -16150,7 +16165,7 @@ def evalDynUnsizeCore
             | .ok r => .ok (.aggregate 0 (r :: .nil), locals')
             | .ub => .ub
             | .unsupported => .unsupported
-          | _ => .ub
+          | _ => .unsupported
         | _, _ => .unsupported
       | _ => .unsupported
 

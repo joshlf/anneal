@@ -3465,6 +3465,151 @@ fn is_vtable_monomorphic(ty: Ty<'_>) -> bool {
     !ty.has_param() && !ty.has_escaping_bound_vars() && !ty.has_infer()
 }
 
+/// `true` iff `instance` is a directly capturable vtable method item whose
+/// generic arguments contain no const parameters.
+///
+/// Compiler-synthesized shims (`ClosureOnceShim`, `FnPtrShim`, `CloneShim`,
+/// `ReifyShim`, etc.) are not `InstanceKind::Item`, and `MirBody` substitution
+/// instantiates type parameters (`typeArgs`) only — not const parameters.
+/// Emitting `IrVTableSlot::UnmodeledMethod` for those slots prevents
+/// mis-dispatching shims or colliding const-generic specializations while
+/// preserving vtable slot indices (fail-closed `.unsupported` on call).
+fn is_modeled_vtable_method<'tcx>(instance: rustc_middle::ty::Instance<'tcx>) -> bool {
+    matches!(instance.def, rustc_middle::ty::InstanceKind::Item(_))
+        && instance.args.consts().next().is_none()
+}
+
+/// `true` iff `def_id` is one of the compiler's sizedness hierarchy lang
+/// traits (`Sized`, `MetaSized`, `PointeeSized`).
+///
+/// `rustc 1.98` emits `core::marker::MetaSized` as an implicit superpredicate
+/// of every non-`PointeeSized` trait, and its 3-slot header-only vtable is a
+/// trivial prefix of every vtable. Filtering these lang traits out keeps
+/// `primary_super_tys_for` from shadowing the real primary supertrait.
+fn is_sized_lang_trait(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let lang = tcx.lang_items();
+    lang.sized_trait() == Some(def_id)
+        || lang.meta_sized_trait() == Some(def_id)
+        || lang.pointee_sized_trait() == Some(def_id)
+}
+
+/// Reconstructs the `dyn Super<...>` trait-object type for a concrete
+/// supertrait `trait_ref` (with `Self = concrete` and erased regions),
+/// including normalized concrete associated-type `ExistentialPredicate::Projection`
+/// bounds from `trait_ref` and its supertrait hierarchy.
+///
+/// `rustc` (`compiler/rustc_middle/src/ty/predicate.rs` at commit
+/// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) orders existential predicates via
+/// `ExistentialPredicateStableCmpExt::stable_cmp`:
+///
+/// > ```text
+/// > #[extension(pub trait ExistentialPredicateStableCmpExt<'tcx>)]
+/// > impl<'tcx> ExistentialPredicate<'tcx> {
+/// >     /// Compares via an ordering that will not change if modules are reordered or other changes are
+/// >     /// made to the tree. In particular, this ordering is preserved across incremental compilations.
+/// >     fn stable_cmp(&self, tcx: TyCtxt<'tcx>, other: &Self) -> Ordering {
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/predicate.rs#L211-L223
+fn super_dyn_ty_for_trait_ref<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_ref: rustc_middle::ty::TraitRef<'tcx>,
+    region: rustc_middle::ty::Region<'tcx>,
+) -> Ty<'tcx> {
+    use rustc_middle::ty::ExistentialPredicateStableCmpExt;
+    let trait_ref = tcx.erase_and_anonymize_regions(trait_ref);
+    let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref);
+    let mut ex_preds: Vec<rustc_middle::ty::PolyExistentialPredicate<'tcx>> = vec![
+        rustc_middle::ty::Binder::dummy(rustc_middle::ty::ExistentialPredicate::Trait(ex)),
+    ];
+
+    let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
+    let def_id_key = |did: DefId| (did.krate.as_u32(), did.index.as_u32());
+    let mut visited_traits: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut seen_assoc: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut work: Vec<rustc_middle::ty::TraitRef<'tcx>> = vec![trait_ref];
+    while let Some(cur) = work.pop() {
+        if !visited_traits.insert(def_id_key(cur.def_id)) {
+            continue;
+        }
+        for item in tcx.associated_items(cur.def_id).in_definition_order() {
+            if !item.is_type() || !seen_assoc.insert(def_id_key(item.def_id)) {
+                continue;
+            }
+            let own = tcx.generics_of(item.def_id).own_counts();
+            if own.types != 0 || own.consts != 0 || own.lifetimes != 0 {
+                continue;
+            }
+            let proj_ty = Ty::new_projection_from_args(tcx, item.def_id, cur.args);
+            if let Ok(norm_ty) = tcx.try_normalize_erasing_regions(
+                typing_env,
+                rustc_middle::ty::Unnormalized::new(proj_ty),
+            ) && is_vtable_monomorphic(norm_ty)
+            {
+                let ex_args = tcx.mk_args(&cur.args[1..]);
+                let ex_proj = rustc_middle::ty::ExistentialProjection::new_from_args(
+                    tcx,
+                    item.def_id,
+                    ex_args,
+                    norm_ty.into(),
+                );
+                ex_preds.push(rustc_middle::ty::Binder::dummy(
+                    rustc_middle::ty::ExistentialPredicate::Projection(ex_proj),
+                ));
+            }
+        }
+        for unnorm in tcx
+            .explicit_super_predicates_of(cur.def_id)
+            .iter_instantiated_copied(tcx, cur.args)
+        {
+            let (clause, _) = unnorm.skip_norm_wip();
+            if !clause.kind().bound_vars().is_empty() {
+                continue;
+            }
+            if let rustc_middle::ty::ClauseKind::Trait(tr_pred) = clause.kind().skip_binder() {
+                let sup = tcx.erase_and_anonymize_regions(tr_pred.trait_ref);
+                if sup.def_id != cur.def_id
+                    && !is_sized_lang_trait(tcx, sup.def_id)
+                    && !tcx.trait_is_auto(sup.def_id)
+                    && sup.self_ty() == cur.self_ty()
+                {
+                    work.push(sup);
+                }
+            }
+        }
+    }
+
+    ex_preds.sort_by(|a, b| a.skip_binder().stable_cmp(tcx, &b.skip_binder()));
+    let sup_preds = tcx.mk_poly_existential_predicates(&ex_preds);
+    Ty::new_dynamic(tcx, sup_preds, region)
+}
+
+/// Returns `true` iff `principal_def_id` or any trait in its explicit
+/// supertrait hierarchy carries a higher-ranked (`for<...>`) superpredicate
+/// binder.
+fn has_higher_ranked_superpredicate(tcx: TyCtxt<'_>, principal_def_id: DefId) -> bool {
+    let def_id_key = |did: DefId| (did.krate.as_u32(), did.index.as_u32());
+    let mut visited: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut work: Vec<DefId> = vec![principal_def_id];
+    while let Some(tid) = work.pop() {
+        if !visited.insert(def_id_key(tid)) || is_sized_lang_trait(tcx, tid) {
+            continue;
+        }
+        for &(clause, _) in tcx.explicit_super_predicates_of(tid).skip_binder() {
+            if !clause.kind().bound_vars().is_empty() {
+                return true;
+            }
+            if let rustc_middle::ty::ClauseKind::Trait(tr_pred) = clause.kind().skip_binder() {
+                let sup_did = tr_pred.trait_ref.def_id;
+                if !is_sized_lang_trait(tcx, sup_did) && !tcx.trait_is_auto(sup_did) {
+                    work.push(sup_did);
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Every concrete `VtblEntry::Method(instance)` of the `(concrete, dyn_ty)`
 /// vtable, as `(def_id, args)` callee pairs (Condition `C6`): a virtual call
 /// through this vtable may enter any of them, so `collect_referenced_callees`
@@ -3502,20 +3647,18 @@ pub fn vtable_method_callees<'tcx>(
         for e in vtable_entries_for(tcx, concrete, cur_preds) {
             match e {
                 rustc_middle::ty::VtblEntry::Method(instance) => {
-                    out.push((
-                        instance.def_id(),
-                        Some(tcx.erase_and_anonymize_regions(instance.args)),
-                    ));
+                    if is_modeled_vtable_method(instance) {
+                        out.push((
+                            instance.def_id(),
+                            Some(tcx.erase_and_anonymize_regions(instance.args)),
+                        ));
+                    }
                 }
                 rustc_middle::ty::VtblEntry::TraitVPtr(trait_ref) => {
-                    let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref);
-                    let sup_preds = tcx.mk_poly_existential_predicates(&[
-                        rustc_middle::ty::Binder::dummy(
-                            rustc_middle::ty::ExistentialPredicate::Trait(ex),
-                        ),
-                    ]);
-                    let sup_ty = Ty::new_dynamic(tcx, sup_preds, region);
-                    if is_vtable_monomorphic(sup_ty) {
+                    let sup_ty = super_dyn_ty_for_trait_ref(tcx, trait_ref, region);
+                    if let TyKind::Dynamic(sup_preds, _) = *sup_ty.kind()
+                        && is_vtable_monomorphic(sup_ty)
+                    {
                         stack.push((sup_preds, sup_ty));
                     }
                 }
@@ -3526,13 +3669,13 @@ pub fn vtable_method_callees<'tcx>(
     out
 }
 
-/// Computes the primary supertrait `dyn Super` type whose vtable forms the
-/// prefix of `(concrete, dyn_ty)`'s vtable (if `dyn_ty`'s principal trait has
-/// a primary supertrait).
+/// Computes all explicit prefix supertrait `dyn Super` types whose vtables
+/// form an exact prefix of `(concrete, dyn_ty)`'s vtable (ordered longest
+/// prefix first, then by canonical `dyn_type_key`).
 ///
 /// `rustc` (`compiler/rustc_middle/src/ty/vtable.rs` at commit
 /// `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) emits `TraitVPtr` only for
-/// non-primary supertraits that have a separate vtable:
+/// non-primary supertraits that require a separate vtable:
 ///
 /// > ```text
 /// > /// pointer to a separate supertrait vtable, can be used by trait upcasting coercion
@@ -3542,20 +3685,27 @@ pub fn vtable_method_callees<'tcx>(
 /// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L24-L25
 ///
 /// Modeling choice: we inspect `tcx.explicit_super_predicates_of(sub_def_id)`
-/// instantiated with `sub_trait_ref.args`, filtering to dyn-compatible non-auto
-/// supertraits that are NOT emitted as `VtblEntry::TraitVPtr` and whose
-/// `tcx.vtable_entries` form an exact prefix of `sub_entries`. Because only
-/// explicit supertraits are considered, unrelated 0-method marker traits are
-/// never selected (Condition `C2`).
-fn primary_super_ty_for<'tcx>(
+/// instantiated with `sub_trait_ref.args`, filtering out `Sized`/`MetaSized`/
+/// `PointeeSized`, auto traits, higher-ranked binders, and supertraits already
+/// emitted as `VtblEntry::TraitVPtr`, keeping every dyn-compatible explicit
+/// supertrait whose `tcx.vtable_entries` form an exact prefix of `sub_entries`.
+/// Sorting by descending entry count places the true primary supertrait first
+/// (`primary_super_vtable_id`) and any additional 0-method prefix supertraits
+/// (e.g., `trait TwoMarkers: M1 + M2` or `trait Combo: Base + Marker`, where
+/// `rustc` elides `TraitVPtr` because the 3-slot header is already a prefix)
+/// in `extra_super_vtable_ids`. Unrelated 0-method marker traits are never
+/// selected (Condition `C2`).
+fn primary_super_tys_for<'tcx>(
     tcx: TyCtxt<'tcx>,
     concrete: Ty<'tcx>,
     dyn_ty: Ty<'tcx>,
-) -> Option<Ty<'tcx>> {
+) -> Vec<Ty<'tcx>> {
     let TyKind::Dynamic(preds, region) = *dyn_ty.kind() else {
-        return None;
+        return Vec::new();
     };
-    let principal = preds.principal()?;
+    let Some(principal) = preds.principal() else {
+        return Vec::new();
+    };
     let sub_trait_ref = tcx.erase_and_anonymize_regions(
         tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, concrete)),
     );
@@ -3566,16 +3716,22 @@ fn primary_super_ty_for<'tcx>(
             vptr_supers.push(tcx.erase_and_anonymize_regions(tr));
         }
     }
+    let mut candidates: Vec<(usize, String, Ty<'tcx>)> = Vec::new();
+    let mut seen_keys: BTreeSet<String> = BTreeSet::new();
     for unnorm in tcx
         .explicit_super_predicates_of(sub_trait_ref.def_id)
         .iter_instantiated_copied(tcx, sub_trait_ref.args)
     {
         let (clause, _) = unnorm.skip_norm_wip();
+        if !clause.kind().bound_vars().is_empty() {
+            continue;
+        }
         let rustc_middle::ty::ClauseKind::Trait(tr_pred) = clause.kind().skip_binder() else {
             continue;
         };
         let sup_ref = tcx.erase_and_anonymize_regions(tr_pred.trait_ref);
         if sup_ref.def_id == sub_trait_ref.def_id
+            || is_sized_lang_trait(tcx, sup_ref.def_id)
             || tcx.trait_is_auto(sup_ref.def_id)
             || !tcx.is_dyn_compatible(sup_ref.def_id)
             || sup_ref.self_ty() != concrete
@@ -3589,17 +3745,19 @@ fn primary_super_ty_for<'tcx>(
         let sup_entries = tcx.vtable_entries(sup_ref);
         if sub_entries.len() >= sup_entries.len() && &sub_entries[..sup_entries.len()] == sup_entries
         {
-            let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, sup_ref);
-            let sup_preds = tcx.mk_poly_existential_predicates(&[
-                rustc_middle::ty::Binder::dummy(rustc_middle::ty::ExistentialPredicate::Trait(ex)),
-            ]);
-            let sup_ty = Ty::new_dynamic(tcx, sup_preds, region);
-            if is_vtable_monomorphic(sup_ty) {
-                return Some(sup_ty);
+            let sup_ty = super_dyn_ty_for_trait_ref(tcx, sup_ref, region);
+            if let TyKind::Dynamic(sup_preds, _) = *sup_ty.kind()
+                && is_vtable_monomorphic(sup_ty)
+            {
+                let sup_key = dyn_type_key(tcx, sup_ty, sup_preds);
+                if seen_keys.insert(sup_key.clone()) {
+                    candidates.push((sup_entries.len(), sup_key, sup_ty));
+                }
             }
         }
     }
-    None
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.into_iter().map(|(_, _, ty)| ty).collect()
 }
 
 /// Every `(concrete, dyn)` pair reachable from `Rvalue::Cast(Unsize)` in
@@ -3835,17 +3993,16 @@ pub fn compute_crate_dyn_metadata<'tcx>(
                 queue.push((concrete, sup));
             }
         }
-        if let Some(sup_ty) = primary_super_ty_for(tcx, concrete, dyn_ty) {
+        for sup_ty in primary_super_tys_for(tcx, concrete, dyn_ty) {
             queue.push((concrete, sup_ty));
         }
         if let TyKind::Dynamic(preds, region) = *dyn_ty.kind() {
             for entry in vtable_entries_for(tcx, concrete, preds) {
                 if let rustc_middle::ty::VtblEntry::TraitVPtr(trait_ref) = entry {
-                    let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref);
-                    let sup_preds = tcx.mk_poly_existential_predicates(&[
-                        rustc_middle::ty::Binder::dummy(rustc_middle::ty::ExistentialPredicate::Trait(ex)),
-                    ]);
-                    queue.push((concrete, Ty::new_dynamic(tcx, sup_preds, region)));
+                    let sup_ty = super_dyn_ty_for_trait_ref(tcx, trait_ref, region);
+                    if is_vtable_monomorphic(sup_ty) {
+                        queue.push((concrete, sup_ty));
+                    }
                 }
             }
         }
@@ -3892,7 +4049,15 @@ pub fn compute_crate_dyn_metadata<'tcx>(
         let predicate_key = dyn_predicate_key(tcx, preds, region);
         let has_unresolved_existential_binder =
             preds.iter().any(|p| !p.bound_vars().is_empty()) || preds.has_escaping_bound_vars();
+        let all_projections_are_types = preds
+            .projection_bounds()
+            .all(|p| p.skip_binder().term.as_type().is_some());
+        let has_hrtb_super = preds
+            .principal_def_id()
+            .is_some_and(|d| has_higher_ranked_superpredicate(tcx, d));
         let supertrait_outlives_ok = !has_unresolved_existential_binder
+            && all_projections_are_types
+            && !has_hrtb_super
             && !dyn_ty.has_escaping_bound_vars()
             && !dyn_ty.has_non_region_param();
         dyn_types.insert(
@@ -3923,44 +4088,62 @@ pub fn compute_crate_dyn_metadata<'tcx>(
         let slots = vtable_entries_for(tcx, *concrete, preds)
             .into_iter()
             .map(|e| match e {
-                rustc_middle::ty::VtblEntry::MetadataDropInPlace => IrVTableSlot::DropInPlace(
-                    concrete
-                        .needs_drop(tcx, typing_env)
-                        .then(|| String::from("core::ptr::drop_in_place")),
-                ),
+                rustc_middle::ty::VtblEntry::MetadataDropInPlace => {
+                    let drop_path = if !concrete.needs_drop(tcx, typing_env) {
+                        None
+                    } else if let TyKind::Adt(adt_def, _) = *concrete.kind()
+                        && let Some(dtor) = tcx.adt_destructor(adt_def.did())
+                    {
+                        Some(canonical_def_path(tcx, dtor.did))
+                    } else {
+                        Some(String::from("core::ptr::drop_in_place"))
+                    };
+                    IrVTableSlot::DropInPlace(drop_path)
+                }
                 rustc_middle::ty::VtblEntry::MetadataSize => IrVTableSlot::Size,
                 rustc_middle::ty::VtblEntry::MetadataAlign => IrVTableSlot::Align,
                 rustc_middle::ty::VtblEntry::Vacant => IrVTableSlot::Vacant,
-                rustc_middle::ty::VtblEntry::Method(instance) => IrVTableSlot::Method(
-                    canonical_def_path(tcx, instance.def_id()),
-                    tcx.erase_and_anonymize_regions(instance.args)
-                        .types()
-                        .map(|t| ctx.lower_rigid_ty(t))
-                        .collect(),
-                ),
+                rustc_middle::ty::VtblEntry::Method(instance) => {
+                    if is_modeled_vtable_method(instance) {
+                        IrVTableSlot::Method(
+                            canonical_def_path(tcx, instance.def_id()),
+                            tcx.erase_and_anonymize_regions(instance.args)
+                                .types()
+                                .map(|t| ctx.lower_rigid_ty(t))
+                                .collect(),
+                        )
+                    } else {
+                        IrVTableSlot::UnmodeledMethod
+                    }
+                }
                 rustc_middle::ty::VtblEntry::TraitVPtr(trait_ref) => {
-                    let ex = rustc_middle::ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref);
-                    let sup_preds = tcx.mk_poly_existential_predicates(&[
-                        rustc_middle::ty::Binder::dummy(rustc_middle::ty::ExistentialPredicate::Trait(ex)),
-                    ]);
-                    let sup_ty = Ty::new_dynamic(tcx, sup_preds, region);
-                    let sup_key = dyn_type_key(tcx, sup_ty, sup_preds);
+                    let sup_ty = super_dyn_ty_for_trait_ref(tcx, trait_ref, region);
+                    let sup_key = dyn_key_of(sup_ty);
                     let conc = render_ty(&mut ctx, *concrete);
-                    match id_of.get(&(sup_key, conc)) {
-                        Some(&id) => IrVTableSlot::TraitVPtr(id),
+                    match sup_key.and_then(|k| id_of.get(&(k, conc)).copied()) {
+                        Some(id) => IrVTableSlot::TraitVPtr(id),
                         None => IrVTableSlot::Vacant,
                     }
                 }
             })
             .collect();
-        let primary_super_vtable_id = primary_super_ty_for(tcx, *concrete, *dyn_ty).and_then(
-            |sup_ty| {
-                let sup_key = dyn_key_of(sup_ty)?;
-                let conc = render_ty(&mut ctx, *concrete);
-                let &sup_id = id_of.get(&(sup_key, conc))?;
-                (sup_id != idx as u64).then_some(sup_id)
-            },
-        );
+        let conc = render_ty(&mut ctx, *concrete);
+        let mut prefix_super_ids: Vec<u64> = Vec::new();
+        for sup_ty in primary_super_tys_for(tcx, *concrete, *dyn_ty) {
+            if let Some(sup_key) = dyn_key_of(sup_ty)
+                && let Some(&sup_id) = id_of.get(&(sup_key, conc.clone()))
+                && sup_id != idx as u64
+                && !prefix_super_ids.contains(&sup_id)
+            {
+                prefix_super_ids.push(sup_id);
+            }
+        }
+        let primary_super_vtable_id = prefix_super_ids.first().copied();
+        let extra_super_vtable_ids = if prefix_super_ids.len() > 1 {
+            prefix_super_ids[1..].to_vec()
+        } else {
+            Vec::new()
+        };
         vtables.push(IrVTable {
             vtable_id: idx as u64,
             vtable_alloc_id: VTABLE_ALLOC_BASE + idx as u64,
@@ -3970,6 +4153,7 @@ pub fn compute_crate_dyn_metadata<'tcx>(
             align_bytes: layout.align.abi.bytes(),
             is_uninhabited: layout.uninhabited,
             primary_super_vtable_id,
+            extra_super_vtable_ids,
             slots,
         });
     }

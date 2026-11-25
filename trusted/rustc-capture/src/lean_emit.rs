@@ -1869,10 +1869,15 @@ pub const VTABLE_ALLOC_SPAN: u64 = 16384;
 ///
 /// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/vtable.rs#L13-L26
 ///
-/// Modeling choices: `DropInPlace` carries the canonical path of the drop glue
-/// when the concrete type needs dropping (`None` otherwise); `Method` carries
-/// the resolved instance's canonical `DefId` path and erased generic
-/// arguments; `TraitVPtr` names the target vtable by its dense `vtable_id`.
+/// Modeling choices: `DropInPlace` carries the canonical path of the concrete
+/// ADT destructor or `drop_in_place` glue when the concrete type needs
+/// dropping (`None` otherwise); `Method` carries the resolved
+/// `InstanceKind::Item`'s canonical `DefId` path and erased type generic
+/// arguments when it has no const generic arguments; `UnmodeledMethod` marks a
+/// valid `VtblEntry::Method(instance)` whose `Instance` is a compiler shim or
+/// carries const generic arguments (so virtual calls fail closed
+/// `.unsupported` rather than mis-dispatching or falsely faulting `.ub`); and
+/// `TraitVPtr` names the target vtable by its dense `vtable_id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IrVTableSlot {
     /// `VtblEntry::MetadataDropInPlace`.
@@ -1883,8 +1888,12 @@ pub enum IrVTableSlot {
     Align,
     /// `VtblEntry::Vacant`.
     Vacant,
-    /// `VtblEntry::Method(instance)`: `(def path, generic args)`.
+    /// `VtblEntry::Method(instance)` for a modeled `InstanceKind::Item` without
+    /// const generic arguments: `(def path, type generic args)`.
     Method(String, Vec<IrRigidTy>),
+    /// `VtblEntry::Method(instance)` for a compiler shim or const-generic
+    /// instantiation (fails closed `.unsupported`).
+    UnmodeledMethod,
     /// `VtblEntry::TraitVPtr(trait_ref)`: target `vtable_id`.
     TraitVPtr(u64),
 }
@@ -1954,8 +1963,11 @@ pub struct IrVTable {
     pub align_bytes: u64,
     /// `layout_of(concrete_ty).uninhabited`.
     pub is_uninhabited: bool,
-    /// Supertrait vtable laid out as a prefix (not computed: always `None`).
+    /// Primary supertrait vtable laid out as a prefix of this vtable (if any).
     pub primary_super_vtable_id: Option<u64>,
+    /// Additional explicit 0-method supertrait vtables whose 3-slot header is
+    /// also a prefix of this vtable without a `TraitVPtr` slot.
+    pub extra_super_vtable_ids: Vec<u64>,
     /// `tcx.vtable_entries(..)` in order.
     pub slots: Vec<IrVTableSlot>,
 }
@@ -2021,6 +2033,7 @@ fn render_vtable_slot(s: &IrVTableSlot) -> String {
             render_lean_str(p),
             render_list(args, render_rigid_ty_pub)
         ),
+        IrVTableSlot::UnmodeledMethod => String::from("CapturedVTableSlot.unmodeledMethod"),
         IrVTableSlot::TraitVPtr(id) => format!("(CapturedVTableSlot.traitVPtr {id})"),
     }
 }
@@ -2055,8 +2068,16 @@ fn render_vtable(v: &IrVTable) -> String {
         Some(id) => format!("(Option.some {id})"),
         None => String::from("Option.none"),
     };
+    let extra = if v.extra_super_vtable_ids.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", extraSuperVTableIds := {}",
+            render_list(&v.extra_super_vtable_ids, |id| id.to_string())
+        )
+    };
     format!(
-        "{{ vtableId := {}, vtableAllocId := {}, concreteTy := {}, dynKey := {}, sizeBytes := {}, alignBytes := {}, isUninhabited := {}, primarySuperVTableId? := {sup}, slots := {} }}",
+        "{{ vtableId := {}, vtableAllocId := {}, concreteTy := {}, dynKey := {}, sizeBytes := {}, alignBytes := {}, isUninhabited := {}, primarySuperVTableId? := {sup}{extra}, slots := {} }}",
         v.vtable_id,
         v.vtable_alloc_id,
         render_rigid_ty_pub(&v.concrete_ty),
@@ -2363,6 +2384,7 @@ mod tests {
                 align_bytes: 4,
                 is_uninhabited: false,
                 primary_super_vtable_id: None,
+                extra_super_vtable_ids: vec![],
                 slots: vec![
                     IrVTableSlot::DropInPlace(None),
                     IrVTableSlot::Size,

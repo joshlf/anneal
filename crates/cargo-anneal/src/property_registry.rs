@@ -5769,6 +5769,7 @@ impl<'a> LeanMirParser<'a> {
                     let args = p.parse_list("CapturedVTableSlot.method args", Self::parse_rigid_ty)?;
                     Ok(IrVTableSlot::Method(def_path, args))
                 }
+                "unmodeledMethod" => Ok(IrVTableSlot::UnmodeledMethod),
                 "traitVPtr" => {
                     let id = p.expect_u64("CapturedVTableSlot.traitVPtr id")?;
                     Ok(IrVTableSlot::TraitVPtr(id))
@@ -5789,6 +5790,7 @@ impl<'a> LeanMirParser<'a> {
         let mut align_bytes = 1u64;
         let mut is_uninhabited = false;
         let mut primary_super_vtable_id = None;
+        let mut extra_super_vtable_ids = Vec::new();
         let mut slots = Vec::new();
         self.parse_struct_fields("CapturedVTable", |p, f| match f {
             "vtableId" => {
@@ -5826,6 +5828,13 @@ impl<'a> LeanMirParser<'a> {
                     })?;
                 Ok(())
             }
+            "extraSuperVTableIds" => {
+                extra_super_vtable_ids = p.parse_list(
+                    "CapturedVTable.extraSuperVTableIds",
+                    |p2| p2.expect_u64("CapturedVTable.extraSuperVTableIds elem"),
+                )?;
+                Ok(())
+            }
             "slots" => {
                 slots = p.parse_list("CapturedVTable.slots", Self::parse_vtable_slot)?;
                 Ok(())
@@ -5846,6 +5855,7 @@ impl<'a> LeanMirParser<'a> {
             align_bytes,
             is_uninhabited,
             primary_super_vtable_id,
+            extra_super_vtable_ids,
             slots,
         })
     }

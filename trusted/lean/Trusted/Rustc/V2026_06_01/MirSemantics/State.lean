@@ -1694,6 +1694,7 @@ def capturedVTableSlotBEq : CapturedVTableSlot → CapturedVTableSlot → Bool
   | .align, .align => true
   | .vacant, .vacant => true
   | .method p₁ a₁, .method p₂ a₂ => Bool.and (stringEq p₁ p₂) (rigidTyListEq a₁ a₂)
+  | .unmodeledMethod, .unmodeledMethod => true
   | .traitVPtr i₁, .traitVPtr i₂ => Nat.beq i₁ i₂
   | _, _ => false
 
@@ -1711,6 +1712,13 @@ def optNatBEq : Option Nat → Option Nat → Bool
   | .some a, .some b => Nat.beq a b
   | _, _ => false
 
+/-- Pointwise structural equality of `List Nat`. -/
+@[reducible]
+def natListBEq : List Nat → List Nat → Bool
+  | .nil, .nil => true
+  | a :: as, b :: bs => Bool.and (Nat.beq a b) (natListBEq as bs)
+  | _, _ => false
+
 /-- Structural equality of `CapturedVTable` records. -/
 @[reducible]
 def capturedVTableBEq (a b : CapturedVTable) : Bool :=
@@ -1722,7 +1730,8 @@ def capturedVTableBEq (a b : CapturedVTable) : Bool :=
             (Bool.and (Nat.beq a.alignBytes b.alignBytes)
               (Bool.and (Bool.not (Bool.xor a.isUninhabited b.isUninhabited))
                 (Bool.and (optNatBEq a.primarySuperVTableId? b.primarySuperVTableId?)
-                  (capturedVTableSlotListBEq a.slots b.slots))))))))
+                  (Bool.and (natListBEq a.extraSuperVTableIds b.extraSuperVTableIds)
+                    (capturedVTableSlotListBEq a.slots b.slots)))))))))
 
 /-- Look up the vtable with dense identifier `vtableId`. -/
 @[reducible]
@@ -1797,7 +1806,15 @@ def collectBodyVTables (currentBody : Option CapturedMir) (bodies : List Capture
     List CapturedVTable :=
   (dynSourceBodies currentBody bodies).foldl (fun acc b => dedupVTablesInto acc b.vtables) .nil
 
-/-- `collectBodyVTables` over `currentBody` followed by `mem.callees`. -/
+/-- `collectBodyVTables` over `currentBody` followed by `mem.callees`.
+
+Modeling note: `mem.activeCallee` and `mem.callStack` caller bodies are
+intentionally not harvested here so that `Memory.pushBaseStack` (which
+normalizes `activeCallee` from `.none` to `.some calleeBody` and appends
+arbitrary outer caller frames to `callStack`) preserves `collectMemoryVTables`
+for 4-argument `evalStmt` (`Places.lean`). In captured crates every body in
+`mem.callees` carries the crate's dyn tables, and single-body root tests with
+empty `callees` use `withBodyDynMetadata` to register the root body. -/
 def collectMemoryVTables (currentBody : Option CapturedMir := .none) (mem : Memory) :
     List CapturedVTable :=
   collectBodyVTables currentBody mem.callees
@@ -1829,12 +1846,14 @@ def collectBodyVirtualMethods (currentBody : Option CapturedMir) (bodies : List 
     .nil
 
 
-/-- `collectBodyDynTypes` over `currentBody` followed by `mem.callees`. -/
+/-- `collectBodyDynTypes` over `currentBody` followed by `mem.callees` (see
+`collectMemoryVTables` for the `Memory.pushBaseStack` invariance note). -/
 def collectMemoryDynTypes (currentBody : Option CapturedMir := .none) (mem : Memory) :
     List CapturedDynType :=
   collectBodyDynTypes currentBody mem.callees
 
-/-- `collectBodyVirtualMethods` over `currentBody` followed by `mem.callees`. -/
+/-- `collectBodyVirtualMethods` over `currentBody` followed by `mem.callees` (see
+`collectMemoryVTables` for the `Memory.pushBaseStack` invariance note). -/
 def collectMemoryVirtualMethods (currentBody : Option CapturedMir := .none) (mem : Memory) :
     List CapturedVirtualMethod :=
   collectBodyVirtualMethods currentBody mem.callees
@@ -1943,22 +1962,24 @@ def vtableSuperLinkOk (vts : List CapturedVTable) (v : CapturedVTable) (targetId
             (Bool.not (Bool.xor tgt.isUninhabited v.isUninhabited))))
 
 /--
-`true` iff every supertrait link (`primarySuperVTableId?` and `.traitVPtr`
-slots) of `v` targets a distinct same-concrete-type vtable in `vts`
-(`vtableSuperLinkOk`; see there for the `rustc` citation and the fail-closed
-modeling choice).
+`true` iff every supertrait link (`primarySuperVTableId?`, `extraSuperVTableIds`,
+and `.traitVPtr` slots) of `v` targets a distinct same-concrete-type vtable in
+`vts` (`vtableSuperLinkOk`; see there for the `rustc` citation and the
+fail-closed modeling choice).
 -/
 def vtableSuperLinksOk (vts : List CapturedVTable) (v : CapturedVTable) : Bool :=
   let primOk : Bool :=
     match v.primarySuperVTableId? with
     | .none => true
     | .some supId => vtableSuperLinkOk vts v supId
+  let extraOk : Bool :=
+    v.extraSuperVTableIds.all (fun supId => vtableSuperLinkOk vts v supId)
   let slotsOk : Bool :=
     v.slots.all (fun s =>
       match s with
       | .traitVPtr supId => vtableSuperLinkOk vts v supId
       | _ => true)
-  Bool.and primOk slotsOk
+  Bool.and primOk (Bool.and extraOk slotsOk)
 
 /-- `true` iff `allocId` is the `allocId` of some captured global allocation. -/
 def isGlobalAllocIdIn : List CapturedAllocation → AllocId → Bool
@@ -2078,8 +2099,8 @@ def dynKeysCompatible (dts : List CapturedDynType) (a b : DefPath) : Bool :=
   Bool.or (stringEq a b) (stringEq (dynPredicateKeyOf dts a) (dynPredicateKeyOf dts b))
 
 /--
-Direct supertrait `vtableId`s of `v`: its `primarySuperVTableId?` (if any)
-followed by all `.traitVPtr supId` slots.
+Direct supertrait `vtableId`s of `v`: its `primarySuperVTableId?` (if any),
+followed by `extraSuperVTableIds` and all `.traitVPtr supId` slots.
 
 Reference (`compiler/rustc_middle/src/ty/vtable.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2090,7 +2111,9 @@ Reference (`compiler/rustc_middle/src/ty/vtable.rs` at commit
 
 Modeling choice: the primary supertrait, whose vtable is a prefix of `v` and so
 has no `TraitVPtr` entry, is recorded separately by `rustc-capture` as
-`primarySuperVTableId?`.
+`primarySuperVTableId?`; any additional explicit 0-method supertraits whose
+3-slot header is also a prefix without a `TraitVPtr` entry (such as
+`trait Sub: M1 + M2`) are recorded in `extraSuperVTableIds`.
 -/
 def vtableDirectSuperIds (v : CapturedVTable) : List Nat :=
   let slotIds : List Nat :=
@@ -2100,9 +2123,10 @@ def vtableDirectSuperIds (v : CapturedVTable) : List Nat :=
         | .traitVPtr supId => supId :: acc
         | _ => acc)
       .nil
+  let tailIds := v.extraSuperVTableIds ++ slotIds
   match v.primarySuperVTableId? with
-  | .some pId => pId :: slotIds
-  | .none => slotIds
+  | .some pId => pId :: tailIds
+  | .none => tailIds
 
 /--
 Worklist reachability of a supertrait vtable whose `dynKey` is predicate-key
