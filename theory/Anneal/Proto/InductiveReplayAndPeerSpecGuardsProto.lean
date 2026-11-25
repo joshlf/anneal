@@ -26,7 +26,9 @@ integration into `trusted/audit/`:
    forged `numIndices`/`isRec` metadata bypassing pre-`#16717` replay), defines the
    hardened structural + post-replay `checkPostponedInductives` checker
    (`checkInductiveReplayIntegrity` / `hardenedInductiveReplay`), proves rejection
-   theorems for all 12 malformed variants, and proves `inductiveReplayWellFormed_sound`.
+   theorems for all 13 malformed variants (incl. postponed-recursor agreement), and proves
+   `inductiveReplayWellFormed_sound`. The replay model faithfully mirrors 4.34.1's
+   `remaining`-erasure order sensitivity and kernel "already declared" rejection.
 3. **Pillar 2 — `grmf` cl/1029226310 `--exact-modules` Sharded Audit & `--orphan-only`**:
    Formalizes `ShardPartitionValid` and `ExactModulesShardAudit` with full cross-shard
    transitive dependency walks (`TransDep`), proves `shardPartitionCheck_iff_valid`,
@@ -243,7 +245,9 @@ end PeerSpecGuardClass
 
 /-! ### 1.2 Frozen Violation Codes Across All Three Pillars -/
 
-/-- All 12 forged-inductive replay violation codes (`lean4#16717`). -/
+/-- All 13 forged-inductive replay violation codes (`lean4#16717` + postponed-recursor
+    agreement, which Lean 4.34.1 `checkPostponedRecursors` already enforces and which the
+    hardened checker must therefore never weaken). -/
 inductive InductiveReplayViolationCode : Type where
   | keyMismatch
   | selfNotInAll
@@ -257,6 +261,7 @@ inductive InductiveReplayViolationCode : Type where
   | danglingCtorNotListedInInduct
   | indicesMismatch
   | isRecMismatch
+  | recursorMismatch
   deriving DecidableEq, Repr, Inhabited
 
 namespace InductiveReplayViolationCode
@@ -274,12 +279,13 @@ def asStr : InductiveReplayViolationCode → String
   | .danglingCtorNotListedInInduct => "dangling_ctor_not_listed_in_induct"
   | .indicesMismatch => "indices_mismatch"
   | .isRecMismatch => "is_rec_mismatch"
+  | .recursorMismatch => "recursor_mismatch"
 
 def all : List InductiveReplayViolationCode :=
   [.keyMismatch, .selfNotInAll, .duplicateInAll, .nonInductInAll,
     .mutualMetadataMismatch, .duplicateInCtors, .nonCtorInCtors,
     .ctorInductMismatch, .ctorCidxMismatch, .danglingCtorNotListedInInduct,
-    .indicesMismatch, .isRecMismatch]
+    .indicesMismatch, .isRecMismatch, .recursorMismatch]
 
 def ofStr? (s : String) : Option InductiveReplayViolationCode :=
   all.find? (fun c => c.asStr == s)
@@ -293,13 +299,15 @@ theorem asStr_injective {a b : InductiveReplayViolationCode} (h : a.asStr = b.as
   rw [ofStr?_asStr, ofStr?_asStr] at hP
   exact Option.some.inj hP
 
-theorem all_length : all.length = 12 := rfl
+theorem all_length : all.length = 13 := rfl
 
 theorem all_nodup : all.Nodup := by decide
 
 end InductiveReplayViolationCode
 
-/-- All 9 sharded-audit and orphan-gate violation codes (`grmf` cl/1029226310). -/
+/-- All 10 sharded-audit and orphan-gate violation codes (`grmf` cl/1029226310), including
+    case-folding module-name collisions that alias one `.lean`/`.olean` path on
+    case-insensitive filesystems. -/
 inductive ShardAuditViolationCode : Type where
   | emptyShardList
   | emptyShard
@@ -310,6 +318,7 @@ inductive ShardAuditViolationCode : Type where
   | unregisteredOnDiskOrphan
   | disallowedTransitiveAxiom
   | missingDependencyDecl
+  | moduleNameCollision
   deriving DecidableEq, Repr, Inhabited
 
 namespace ShardAuditViolationCode
@@ -324,11 +333,13 @@ def asStr : ShardAuditViolationCode → String
   | .unregisteredOnDiskOrphan => "unregistered_on_disk_orphan"
   | .disallowedTransitiveAxiom => "disallowed_transitive_axiom"
   | .missingDependencyDecl => "missing_dependency_decl"
+  | .moduleNameCollision => "module_name_collision"
 
 def all : List ShardAuditViolationCode :=
   [.emptyShardList, .emptyShard, .duplicateModuleInShard, .overlappingShards,
     .unregisteredModuleInShard, .uncoveredRegisteredModule,
-    .unregisteredOnDiskOrphan, .disallowedTransitiveAxiom, .missingDependencyDecl]
+    .unregisteredOnDiskOrphan, .disallowedTransitiveAxiom, .missingDependencyDecl,
+    .moduleNameCollision]
 
 def ofStr? (s : String) : Option ShardAuditViolationCode :=
   all.find? (fun c => c.asStr == s)
@@ -342,7 +353,7 @@ theorem asStr_injective {a b : ShardAuditViolationCode} (h : a.asStr = b.asStr) 
   rw [ofStr?_asStr, ofStr?_asStr] at hP
   exact Option.some.inj hP
 
-theorem all_length : all.length = 9 := rfl
+theorem all_length : all.length = 10 := rfl
 
 end ShardAuditViolationCode
 
@@ -423,12 +434,20 @@ structure SimCtorVal : Type where
   isUnsafe : Bool := false
   deriving DecidableEq, Repr, Inhabited
 
-/-- Pure-kernel model of `Lean.RecursorVal` metadata. -/
+/-- Pure-kernel model of `Lean.RecursorVal` metadata (every field compared by Lean 4.34.1
+    `checkPostponedRecursors` via `RecursorVal` `BEq`). -/
 structure SimRecVal : Type where
   name : String
+  levelParams : List String
+  typeTag : String
   all : List String
   numParams : Nat
   numIndices : Nat
+  numMotives : Nat
+  numMinors : Nat
+  ruleCtors : List String
+  k : Bool
+  isUnsafe : Bool := false
   deriving DecidableEq, Repr, Inhabited
 
 /-- Pure-kernel model of `Lean.ConstantInfo`. -/
@@ -482,6 +501,7 @@ structure KernelInductDeclReq : Type where
 structure KernelInductOutput : Type where
   inducts : List SimInductVal
   ctors : List SimCtorVal
+  recs : List SimRecVal
   deriving DecidableEq, Repr
 
 /-- Abstract kernel oracle modeling `Kernel.Environment.addDeclCore` for inductive blocks. -/
@@ -634,13 +654,30 @@ def checkPostponedConstructors (m : SimConstMap) (kernelEnv : SimConstMap) :
         [{ code := .danglingCtorNotListedInInduct, subject := cInfo.name, detail := "ctor_not_in_kernel" }]
     | _ => []
 
+/-- Post-replay `checkPostponedRecursors` (already present in Lean 4.34.1 `Replay.lean`):
+    compares every `.recInfo` entry in `newConstants` field-for-field (`RecursorVal` `BEq`)
+    against the kernel-generated `SimRecVal` in `kernelEnv`. -/
+def checkPostponedRecursors (m : SimConstMap) (kernelEnv : SimConstMap) :
+    List InductiveReplayViolation :=
+  m.flatMap fun (_, ci) =>
+    match ci with
+    | .recInfo rInfo =>
+      match lookupConst kernelEnv rInfo.name with
+      | some (.recInfo kRec) =>
+        if kRec == rInfo then []
+        else [{ code := .recursorMismatch, subject := rInfo.name, detail := "post_replay_rec_diff" }]
+      | _ =>
+        [{ code := .recursorMismatch, subject := rInfo.name, detail := "rec_not_in_kernel" }]
+    | _ => []
+
 /-- Full `lean4#16717` integrity checker combining static pre-replay checks and
-    post-replay postponed-inductive + postponed-constructor checks. -/
+    post-replay postponed-inductive + postponed-constructor + postponed-recursor checks. -/
 def checkInductiveReplayIntegrity (m : SimConstMap) (kernelEnv : SimConstMap) :
     List InductiveReplayViolation :=
   checkStaticInductiveIntegrity m ++
     checkPostponedInductives m kernelEnv ++
-    checkPostponedConstructors m kernelEnv
+    checkPostponedConstructors m kernelEnv ++
+    checkPostponedRecursors m kernelEnv
 
 /-! ### 2.1 Pre-`#16717` Vulnerable Replay Model & Concrete Exploit Witnesses -/
 
@@ -648,9 +685,11 @@ def checkInductiveReplayIntegrity (m : SimConstMap) (kernelEnv : SimConstMap) :
 def insertConst (env : SimConstMap) (k : String) (ci : SimConstInfo) : SimConstMap :=
   (k, ci) :: env.filter (fun p => p.1 != k)
 
-/-- Build the `KernelInductDeclReq` that Lean 4.34.1 `Replay.lean` lines 103-120
-    constructs when replaying `.inductInfo info`: it iterates ONLY over `info.all`
-    (trusting `info.all` blindly without checking `info.name ∈ info.all`!). -/
+/-- Build the `KernelInductDeclReq` that Lean 4.34.1 `Replay.lean` constructs when
+    replaying `.inductInfo info`: it iterates ONLY over `info.all` (trusting `info.all`
+    blindly without checking `info.name ∈ info.all`!). A missing/non-inductive `all`
+    member or non-constructor `ctors` member models the `newConstants[n]!` /
+    `inductiveVal!` panic as a replay error. -/
 def buildReplayInductReq (m : SimConstMap) (info : SimInductVal) : Option KernelInductDeclReq := do
   let types ← info.all.mapM fun n => do
     match lookupConst m n with
@@ -663,55 +702,80 @@ def buildReplayInductReq (m : SimConstMap) (info : SimInductVal) : Option Kernel
     | _ => none
   some { levelParams := info.levelParams, numParams := info.numParams, types := types }
 
-/-- Replay loop modeling Lean 4.34.1 `Replay.lean` lines 102-190:
-    - Marks each visited `k` as erased from `remaining`,
-    - On `.induct info`, replays ONLY `info.all` via `oracle` (skipping `info.name`
-      if `info.name ∉ info.all`!),
-    - Checks `checkPostponedConstructors` at the end,
-    - **Omits `checkPostponedInductives`!** -/
-def vulnerableReplayStep (oracle : KernelInductOracle) (m : SimConstMap) :
-    List String → SimConstMap → Except String SimConstMap
-  | [], env => .ok env
-  | k :: rest, env =>
-    match lookupConst m k with
-    | none => vulnerableReplayStep oracle m rest env
-    | some (.induct info) =>
-      -- If `info.all` already replayed in `env`, skip (mirrors erasing `o.name` from `remaining`).
-      if info.all.all (fun n => (lookupConst env n).isSome) then
-        vulnerableReplayStep oracle m rest env
-      else
+/-- Replay state mirroring Lean 4.34.1 `Replay.State` (`remaining` + kernel `env`).
+    `pending` is subsumed because dependency pre-replay is abstracted away: a name is
+    processed exactly when it is still in `remaining` at the moment it is visited. -/
+structure ReplayState : Type where
+  remaining : List String
+  env : SimConstMap
+  deriving Repr
+
+/-- Insert every kernel-generated inductive, constructor, and recursor into `env`. -/
+def insertKernelOutput (env : SimConstMap) (out : KernelInductOutput) : SimConstMap :=
+  let env1 := out.inducts.foldl (fun e iv => insertConst e iv.name (.induct iv)) env
+  let env2 := out.ctors.foldl (fun e cv => insertConst e cv.name (.ctor cv)) env1
+  out.recs.foldl (fun e rv => insertConst e rv.name (.recInfo rv)) env2
+
+/-- Faithful model of Lean 4.34.1 `Replay.lean` `replayConstant` (lines 74-141):
+    - `isTodo k`: skip `k` unless it is still in `remaining`; otherwise erase it.
+    - `.inductInfo info`: erase EVERY `n ∈ info.all` from `remaining` (so peers are never
+      revisited), build the `inductDecl` from `info.all` ONLY (never `info.name`!), and
+      send it to the kernel, which rejects any already-declared type name
+      (`addDeclCore` "already declared").
+    - `.ctorInfo` / `.recInfo`: postponed (checked at the end).
+    - `.defnInfo` / `.thmInfo`: abstracted as accepted by the kernel.
+    There is **no** `checkPostponedInductives`. -/
+def replayLoop (oracle : KernelInductOracle) (m : SimConstMap) :
+    List String → ReplayState → Except String ReplayState
+  | [], st => .ok st
+  | k :: rest, st =>
+    if !st.remaining.contains k then
+      replayLoop oracle m rest st
+    else
+      let st := { st with remaining := st.remaining.filter (· != k) }
+      match lookupConst m k with
+      | none => replayLoop oracle m rest st
+      | some (.induct info) =>
+        let st := { st with remaining := st.remaining.filter (fun n => !info.all.contains n) }
         match buildReplayInductReq m info with
         | none => .error s!"malformed induct req for {k}"
         | some req =>
-          match oracle req with
-          | none => .error s!"kernel rejected induct req for {k}"
-          | some out =>
-            let env1 := out.inducts.foldl (fun e iv => insertConst e iv.name (.induct iv)) env
-            let env2 := out.ctors.foldl (fun e cv => insertConst e cv.name (.ctor cv)) env1
-            vulnerableReplayStep oracle m rest env2
-    | some (.ctor _) =>
-      -- Postponed until end (checked by `checkPostponedConstructors`).
-      vulnerableReplayStep oracle m rest env
-    | some (.recInfo _) =>
-      vulnerableReplayStep oracle m rest env
-    | some (.defn n t) =>
-      vulnerableReplayStep oracle m rest (insertConst env n (.defn n t))
-    | some (.thm n t) =>
-      vulnerableReplayStep oracle m rest (insertConst env n (.thm n t))
+          if req.types.any (fun t => (lookupConst st.env t.1).isSome) then
+            .error s!"kernel: already declared while replaying {k}"
+          else
+            match oracle req with
+            | none => .error s!"kernel rejected induct req for {k}"
+            | some out =>
+              replayLoop oracle m rest { st with env := insertKernelOutput st.env out }
+      | some (.ctor _) => replayLoop oracle m rest st
+      | some (.recInfo _) => replayLoop oracle m rest st
+      | some (.defn n t) =>
+        replayLoop oracle m rest { st with env := insertConst st.env n (.defn n t) }
+      | some (.thm n t) =>
+        replayLoop oracle m rest { st with env := insertConst st.env n (.thm n t) }
 
-/-- Pre-`#16717` vulnerable replay: replays constants and checks ONLY postponed
-    constructors (no `checkStaticInductiveIntegrity`, no `checkPostponedInductives`). -/
+/-- Run `replayLoop` over `keys` (iteration order of Lean's `NameSet`) starting from
+    `remaining := keys` and kernel environment `env`. -/
+def vulnerableReplayStep (oracle : KernelInductOracle) (m : SimConstMap)
+    (keys : List String) (env : SimConstMap) : Except String SimConstMap :=
+  (replayLoop oracle m keys { remaining := keys, env := env }).map ReplayState.env
+
+/-- Pre-`#16717` vulnerable replay (Lean 4.34.1): replays constants, then checks
+    postponed constructors AND postponed recursors, but has no static `info.all` /
+    `info.ctors` integrity checks and no `checkPostponedInductives`. -/
 def vulnerableInductiveReplay (oracle : KernelInductOracle) (m : SimConstMap) :
     Except String SimConstMap := do
   let env ← vulnerableReplayStep oracle m (m.map Prod.fst) []
-  if (checkPostponedConstructors m env).isEmpty then
-    .ok env
-  else
+  if !(checkPostponedConstructors m env).isEmpty then
     .error "postponed constructor mismatch"
+  else if !(checkPostponedRecursors m env).isEmpty then
+    .error "postponed recursor mismatch"
+  else
+    .ok env
 
 /-- Post-`#16717` hardened replay: enforces static structural checks BEFORE replay,
-    runs kernel replay, and enforces BOTH `checkPostponedInductives` AND
-    `checkPostponedConstructors` afterward. -/
+    runs kernel replay, and enforces `checkPostponedInductives`,
+    `checkPostponedConstructors`, AND `checkPostponedRecursors` afterward. -/
 def hardenedInductiveReplay (oracle : KernelInductOracle) (m : SimConstMap) :
     Except (List InductiveReplayViolation) SimConstMap :=
   let staticViols := checkStaticInductiveIntegrity m
@@ -722,7 +786,8 @@ def hardenedInductiveReplay (oracle : KernelInductOracle) (m : SimConstMap) :
     | .error msg =>
       .error [{ code := .mutualMetadataMismatch, subject := "<kernel>", detail := msg }]
     | .ok env =>
-      let postViols := checkPostponedInductives m env ++ checkPostponedConstructors m env
+      let postViols := checkPostponedInductives m env ++ checkPostponedConstructors m env ++
+        checkPostponedRecursors m env
       if postViols.isEmpty then .ok env
       else .error postViols
 
@@ -739,6 +804,12 @@ def unitCtorVal : SimCtorVal :=
   { name := "Unit.unit", levelParams := [], typeTag := "Unit",
     induct := "Unit", cidx := 0, numParams := 0, numFields := 0 }
 
+/-- Canonical `Unit.rec` recursor generated by the kernel. -/
+def unitRecVal : SimRecVal :=
+  { name := "Unit.rec", levelParams := ["u"], typeTag := "Unit.rec.type", all := ["Unit"],
+    numParams := 0, numIndices := 0, numMotives := 1, numMinors := 1,
+    ruleCtors := ["Unit.unit"], k := true }
+
 /-- Canonical `Nat` recursive inductive value generated by the kernel. -/
 def natInductVal : SimInductVal :=
   { name := "Nat", levelParams := [], typeTag := "Type", numParams := 0,
@@ -753,13 +824,22 @@ def natSuccCtorVal : SimCtorVal :=
   { name := "Nat.succ", levelParams := [], typeTag := "Nat -> Nat",
     induct := "Nat", cidx := 1, numParams := 0, numFields := 1 }
 
-/-- Concrete demo kernel oracle accepting canonical `Unit` and `Nat` declarations. -/
+/-- Canonical `Nat.rec` recursor generated by the kernel. -/
+def natRecVal : SimRecVal :=
+  { name := "Nat.rec", levelParams := ["u"], typeTag := "Nat.rec.type", all := ["Nat"],
+    numParams := 0, numIndices := 0, numMotives := 1, numMinors := 2,
+    ruleCtors := ["Nat.zero", "Nat.succ"], k := false }
+
+/-- Concrete demo kernel oracle accepting canonical `Unit` and `Nat` declarations and
+    generating their inductive, constructor, and recursor values. -/
 def demoKernelOracle : KernelInductOracle
   | { levelParams := [], numParams := 0, types := [("Unit", "Type", [("Unit.unit", "Unit")])] } =>
-    some { inducts := [unitInductVal], ctors := [unitCtorVal] }
+    some { inducts := [unitInductVal], ctors := [unitCtorVal], recs := [unitRecVal] }
   | { levelParams := [], numParams := 0,
       types := [("Nat", "Type", [("Nat.zero", "Nat"), ("Nat.succ", "Nat -> Nat")])] } =>
-    some { inducts := [natInductVal], ctors := [natZeroCtorVal, natSuccCtorVal] }
+    some { inducts := [natInductVal]
+           ctors := [natZeroCtorVal, natSuccCtorVal]
+           recs := [natRecVal] }
   | _ => none
 
 /-- **Pre-`#16717` Exploit #1 (`selfNotInAll`)**: `FakeFalse : Prop` has `ctors := []`
@@ -769,19 +849,53 @@ def fakeFalseInductVal : SimInductVal :=
     numIndices := 0, all := ["Unit"], ctors := [],
     isRec := false, isReflexive := false }
 
+/-- Exploit map whose `NameSet` iteration order visits `FakeFalse` BEFORE `Unit`
+    (attackers choose names so `Name.quickCmp` orders them this way). Replaying
+    `FakeFalse` erases `Unit` from `remaining` and sends ONLY `Unit` to the kernel. -/
 def fakeFalseExploitMap : SimConstMap :=
+  [("FakeFalse", .induct fakeFalseInductVal),
+   ("Unit", .induct unitInductVal),
+   ("Unit.unit", .ctor unitCtorVal)]
+
+/-- **Exploit Witness 1**: `fakeFalseExploitMap` PASSES pre-`#16717`
+    `vulnerableInductiveReplay` (faithful `remaining`-erasure model), yet `"FakeFalse"`
+    is NEVER added to or checked by the kernel environment! -/
+theorem fakeFalse_passes_vulnerableInductiveReplay :
+    ∃ env, vulnerableInductiveReplay demoKernelOracle fakeFalseExploitMap = .ok env ∧
+      lookupConst env "FakeFalse" = none ∧
+      lookupConst env "Unit" = some (.induct unitInductVal) ∧
+      lookupConst fakeFalseExploitMap "FakeFalse" = some (.induct fakeFalseInductVal) :=
+  ⟨_, rfl, rfl, rfl, rfl⟩
+
+/-- **Model Fidelity (order sensitivity)**: if `Unit` is visited BEFORE `FakeFalse`, the
+    real kernel rejects the second `inductDecl [Unit]` as "already declared", so the
+    exploit only works when `FakeFalse` precedes its `all` targets. A model that silently
+    skips already-replayed `all` blocks would overstate the attack surface. -/
+def fakeFalseUnitFirstMap : SimConstMap :=
   [("Unit", .induct unitInductVal),
    ("Unit.unit", .ctor unitCtorVal),
    ("FakeFalse", .induct fakeFalseInductVal)]
 
-/-- **Exploit Witness 1**: `fakeFalseExploitMap` PASSES pre-`#16717`
-    `vulnerableInductiveReplay`, yet `"FakeFalse"` is NEVER added to or checked by
-    the kernel environment! -/
-theorem fakeFalse_passes_vulnerableInductiveReplay :
-    ∃ env, vulnerableInductiveReplay demoKernelOracle fakeFalseExploitMap = .ok env ∧
-      lookupConst env "FakeFalse" = none ∧
-      lookupConst fakeFalseExploitMap "FakeFalse" = some (.induct fakeFalseInductVal) :=
-  ⟨[("Unit.unit", .ctor unitCtorVal), ("Unit", .induct unitInductVal)], rfl, rfl, rfl⟩
+theorem fakeFalse_unitFirst_rejected_by_vulnerable_kernel :
+    ∃ msg, vulnerableInductiveReplay demoKernelOracle fakeFalseUnitFirstMap = .error msg :=
+  ⟨_, rfl⟩
+
+/-- **Model Fidelity (postponed recursors)**: Lean 4.34.1 already runs
+    `checkPostponedRecursors`, so an attacker who also ships the eliminator
+    `FakeFalse.rec` (needed to derive `False` from `FakeFalse`) is rejected even by the
+    VULNERABLE replay: the kernel never generated `FakeFalse.rec`. -/
+def fakeFalseRecVal : SimRecVal :=
+  { name := "FakeFalse.rec", levelParams := [], typeTag := "FakeFalse.rec.type",
+    all := ["FakeFalse"], numParams := 0, numIndices := 0, numMotives := 1, numMinors := 0,
+    ruleCtors := [], k := false }
+
+def fakeFalseWithRecExploitMap : SimConstMap :=
+  fakeFalseExploitMap ++ [("FakeFalse.rec", .recInfo fakeFalseRecVal)]
+
+theorem fakeFalseWithRec_rejected_by_vulnerable_postponedRecursors :
+    vulnerableInductiveReplay demoKernelOracle fakeFalseWithRecExploitMap =
+      .error "postponed recursor mismatch" :=
+  rfl
 
 /-- **Fix Witness 1**: `hardenedInductiveReplay` REJECTS `fakeFalseExploitMap` with
     `selfNotInAll`! -/
@@ -791,25 +905,31 @@ theorem fakeFalse_rejected_by_hardenedInductiveReplay :
   ⟨checkStaticInductiveIntegrity fakeFalseExploitMap, rfl, by decide⟩
 
 /-- **Pre-`#16717` Exploit #2 (`indicesMismatch` & `isRecMismatch`)**: `Nat` stored in
-    `newConstants` lies about `numIndices := 1` and `isRec := false`, while `all` and
-    `ctors` match `demoKernelOracle`. -/
+    `newConstants` lies about `numIndices := 1` and `isRec := false`, while `all`,
+    `ctors`, AND the shipped `Nat.rec` all match `demoKernelOracle` exactly (so neither
+    `checkPostponedConstructors` nor `checkPostponedRecursors` notices). -/
 def forgedNatMetadataVal : SimInductVal :=
   { natInductVal with numIndices := 1, isRec := false }
 
 def forgedMetadataExploitMap : SimConstMap :=
   [("Nat", .induct forgedNatMetadataVal),
    ("Nat.zero", .ctor natZeroCtorVal),
-   ("Nat.succ", .ctor natSuccCtorVal)]
+   ("Nat.succ", .ctor natSuccCtorVal),
+   ("Nat.rec", .recInfo natRecVal)]
+
+/-- Kernel environment produced by replaying `forgedMetadataExploitMap`. -/
+def forgedMetadataKernelEnv : SimConstMap :=
+  insertKernelOutput []
+    { inducts := [natInductVal], ctors := [natZeroCtorVal, natSuccCtorVal], recs := [natRecVal] }
 
 /-- **Exploit Witness 2**: `forgedMetadataExploitMap` PASSES pre-`#16717`
     `vulnerableInductiveReplay` because `checkPostponedInductives` does not exist! -/
 theorem forgedMetadata_passes_vulnerableInductiveReplay :
-    ∃ env, vulnerableInductiveReplay demoKernelOracle forgedMetadataExploitMap = .ok env ∧
-      lookupConst env "Nat" = some (.induct natInductVal) ∧
+    vulnerableInductiveReplay demoKernelOracle forgedMetadataExploitMap = .ok forgedMetadataKernelEnv ∧
+      lookupConst forgedMetadataKernelEnv "Nat" = some (.induct natInductVal) ∧
       natInductVal.numIndices ≠ forgedNatMetadataVal.numIndices ∧
       natInductVal.isRec ≠ forgedNatMetadataVal.isRec :=
-  ⟨[("Nat.succ", .ctor natSuccCtorVal), ("Nat.zero", .ctor natZeroCtorVal),
-    ("Nat", .induct natInductVal)], rfl, rfl, by decide, by decide⟩
+  ⟨rfl, rfl, by decide, by decide⟩
 
 /-- **Fix Witness 2**: `hardenedInductiveReplay` REJECTS `forgedMetadataExploitMap`
     reporting BOTH `indicesMismatch` and `isRecMismatch`! -/
@@ -817,11 +937,25 @@ theorem forgedMetadata_rejected_by_hardenedInductiveReplay :
     ∃ vs, hardenedInductiveReplay demoKernelOracle forgedMetadataExploitMap = .error vs ∧
       vs.any (fun v => v.code == .indicesMismatch && v.subject == "Nat") = true ∧
       vs.any (fun v => v.code == .isRecMismatch && v.subject == "Nat") = true :=
-  ⟨checkPostponedInductives forgedMetadataExploitMap
-      [("Nat.succ", .ctor natSuccCtorVal), ("Nat.zero", .ctor natZeroCtorVal),
-        ("Nat", .induct natInductVal)], rfl, by decide, by decide⟩
+  ⟨_, rfl, by decide, by decide⟩
 
-/-! ### 2.3 Rejection Theorems for All 12 Malformed Variants -/
+/-- **Recursor Forgery**: a shipped `Nat.rec` lying about `k` (structural-eta /
+    K-like reduction flag) is rejected by the hardened checker with `recursorMismatch`
+    (and, faithfully, also by Lean 4.34.1's `checkPostponedRecursors`). -/
+def forgedNatRecMap : SimConstMap :=
+  [("Nat", .induct natInductVal),
+   ("Nat.zero", .ctor natZeroCtorVal),
+   ("Nat.succ", .ctor natSuccCtorVal),
+   ("Nat.rec", .recInfo { natRecVal with k := true })]
+
+theorem forgedNatRec_rejected_by_hardened_and_vulnerable :
+    (∃ vs, hardenedInductiveReplay demoKernelOracle forgedNatRecMap = .error vs ∧
+      vs.any (fun v => v.code == .recursorMismatch && v.subject == "Nat.rec") = true) ∧
+    vulnerableInductiveReplay demoKernelOracle forgedNatRecMap =
+      .error "postponed recursor mismatch" :=
+  ⟨⟨_, rfl, by decide⟩, rfl⟩
+
+/-! ### 2.3 Rejection Theorems for All 13 Malformed Variants -/
 
 /-- Helper checking whether a violation list contains a given violation code. -/
 def hasReplayViolation (vs : List InductiveReplayViolation)
@@ -923,6 +1057,12 @@ theorem checkInductive_rejects_isRecMismatch :
       .isRecMismatch = true := by
   decide
 
+theorem checkInductive_rejects_recursorMismatch :
+    hasReplayViolation
+      (checkPostponedRecursors forgedNatRecMap forgedMetadataKernelEnv)
+      .recursorMismatch = true := by
+  decide
+
 /-! ### 2.4 Semantic `InductiveReplayWellFormed` & Soundness Theorem -/
 
 /-- Relational well-formedness invariant established by hardened `lean4#16717` replay:
@@ -933,8 +1073,8 @@ theorem checkInductive_rejects_isRecMismatch :
        `cVal.induct = ind.name`, matching params/levels, and `cVal.cidx = i`.
     3. Every `.ctor` in `m` has its parent inductive in `m` listing it in `parent.ctors`
        (zero dangling constructors).
-    4. Every `.induct` and `.ctor` in `m` exists in the kernel-replayed `kernelEnv`
-       with identical field-for-field metadata. -/
+    4. Every `.induct`, `.ctor`, and `.recInfo` in `m` exists in the kernel-replayed
+       `kernelEnv` with identical field-for-field metadata. -/
 structure InductiveReplayWellFormed (m kernelEnv : SimConstMap) : Prop where
   keys_nodup : (m.map Prod.fst).Nodup
   key_matches_name : ∀ k ci, (k, ci) ∈ m → ci.constName = k
@@ -956,6 +1096,8 @@ structure InductiveReplayWellFormed (m kernelEnv : SimConstMap) : Prop where
     lookupConst kernelEnv ind.name = some (.induct ind)
   ctor_matches_kernel : ∀ k cVal, (k, .ctor cVal) ∈ m →
     lookupConst kernelEnv cVal.name = some (.ctor cVal)
+  rec_matches_kernel : ∀ k rVal, (k, .recInfo rVal) ∈ m →
+    lookupConst kernelEnv rVal.name = some (.recInfo rVal)
 
 private theorem checkAllList_nil_imp {m : SimConstMap} {ind : SimInductVal}
     {ns : List String} (h : checkAllList m ind ns = []) :
@@ -1091,6 +1233,24 @@ private theorem checkPostponedConstructors_nil_imp {m kernelEnv : SimConstMap}
         split at hItem <;> cases hItem
     | induct _ | recInfo _ | defn _ _ | thm _ _ => rw [hL] at hItem; cases hItem
 
+private theorem checkPostponedRecursors_nil_imp {m kernelEnv : SimConstMap}
+    (h : checkPostponedRecursors m kernelEnv = []) :
+    ∀ k rVal, (k, .recInfo rVal) ∈ m → lookupConst kernelEnv rVal.name = some (.recInfo rVal) := by
+  intro k rVal hMem
+  unfold checkPostponedRecursors at h
+  have hItem := (List.flatMap_eq_nil_iff.mp h) (k, .recInfo rVal) hMem
+  simp only at hItem
+  cases hL : lookupConst kernelEnv rVal.name with
+  | none => rw [hL] at hItem; cases hItem
+  | some ci =>
+    cases ci with
+    | recInfo kRec =>
+      rw [hL] at hItem
+      by_cases hEq : (kRec == rVal) = true
+      · rw [eq_of_beq hEq]
+      · simp [hEq] at hItem
+    | induct _ | ctor _ | defn _ _ | thm _ _ => rw [hL] at hItem; cases hItem
+
 /-- **Flagship Soundness Theorem (`inductiveReplayWellFormed_sound`)**:
     Whenever `checkInductiveReplayIntegrity m kernelEnv = []` (and in particular
     whenever `hardenedInductiveReplay oracle m = .ok kernelEnv`), every structural
@@ -1102,8 +1262,8 @@ theorem inductiveReplayWellFormed_sound {m kernelEnv : SimConstMap}
     (hCheck : checkInductiveReplayIntegrity m kernelEnv = []) :
     InductiveReplayWellFormed m kernelEnv := by
   unfold checkInductiveReplayIntegrity at hCheck
-  rw [List.append_eq_nil_iff, List.append_eq_nil_iff] at hCheck
-  obtain ⟨⟨hStatic, hPostInd⟩, hPostCtor⟩ := hCheck
+  rw [List.append_eq_nil_iff, List.append_eq_nil_iff, List.append_eq_nil_iff] at hCheck
+  obtain ⟨⟨⟨hStatic, hPostInd⟩, hPostCtor⟩, hPostRec⟩ := hCheck
   unfold checkStaticInductiveIntegrity at hStatic
   rw [List.append_eq_nil_iff] at hStatic
   obtain ⟨hDupKeys, hEntries⟩ := hStatic
@@ -1184,7 +1344,8 @@ theorem inductiveReplayWellFormed_sound {m kernelEnv : SimConstMap}
             exact ⟨parent, rfl, hB⟩
           | ctor _ | recInfo _ | defn _ _ | thm _ _ => rw [hL] at hB; cases hB
       induct_matches_kernel := checkPostponedInductives_nil_imp hPostInd
-      ctor_matches_kernel := checkPostponedConstructors_nil_imp hPostCtor }
+      ctor_matches_kernel := checkPostponedConstructors_nil_imp hPostCtor
+      rec_matches_kernel := checkPostponedRecursors_nil_imp hPostRec }
 
 /-- Corollary: a successful `hardenedInductiveReplay` guarantees `InductiveReplayWellFormed`. -/
 theorem hardenedInductiveReplay_sound {oracle : KernelInductOracle} {m env : SimConstMap}
@@ -1201,17 +1362,19 @@ theorem hardenedInductiveReplay_sound {oracle : KernelInductOracle} {m env : Sim
     | ok env' =>
       rw [hStep] at hOk
       dsimp only at hOk
-      cases hPost : (checkPostponedInductives m env' ++ checkPostponedConstructors m env').isEmpty with
+      cases hPost : (checkPostponedInductives m env' ++ checkPostponedConstructors m env' ++
+          checkPostponedRecursors m env').isEmpty with
       | false => rw [hPost] at hOk; cases hOk
       | true =>
         rw [hPost] at hOk
         simp only [↓reduceIte, Except.ok.injEq] at hOk
         subst hOk
-        have hPostNil : checkPostponedInductives m env' ++ checkPostponedConstructors m env' = [] :=
+        have hPostNil : checkPostponedInductives m env' ++ checkPostponedConstructors m env' ++
+            checkPostponedRecursors m env' = [] :=
           List.isEmpty_iff.mp hPost
-        rw [List.append_eq_nil_iff] at hPostNil
+        rw [List.append_eq_nil_iff, List.append_eq_nil_iff] at hPostNil
         apply inductiveReplayWellFormed_sound
-        simp [checkInductiveReplayIntegrity, hStatic, hPostNil.1, hPostNil.2]
+        simp [checkInductiveReplayIntegrity, hStatic, hPostNil.1.1, hPostNil.1.2, hPostNil.2]
 
 /-! ## 3. Pillar 2 — `grmf` cl/1029226310 `--exact-modules` Sharded Audit & `--orphan-only` -/
 
@@ -1273,7 +1436,13 @@ structure MonolithicAuditSafe (env : RepoEnv) : Prop where
         dr.isUnsafeOrPartial = false ∧
         (dr.isAxiom = true → d ∈ env.permittedAxioms)
 
-/-- Exact-partition + zero-orphan completeness predicate (`--orphan-only` gate). -/
+/-- Case-folding key of a module name (`Anneal.Foo` and `anneal.foo` collide on
+    case-insensitive filesystems such as default macOS APFS). -/
+def caseFoldKey (s : String) : List Char :=
+  s.toList.map Char.toLower
+
+/-- Exact-partition + zero-orphan + zero-case-fold-collision completeness predicate
+    (`--orphan-only` gate). -/
 structure ShardPartitionValid (registered onDisk : List String)
     (shards : List (List String)) : Prop where
   nonempty_shards : shards ≠ []
@@ -1284,6 +1453,8 @@ structure ShardPartitionValid (registered onDisk : List String)
   subset_registered : ∀ s ∈ shards, ∀ m ∈ s, m ∈ registered
   covers_registered : ∀ m ∈ registered, ∃ s ∈ shards, m ∈ s
   no_on_disk_orphans : ∀ m ∈ onDisk, m ∈ registered
+  no_case_fold_collisions : ∀ a ∈ registered ++ onDisk, ∀ b ∈ registered ++ onDisk,
+    caseFoldKey a = caseFoldKey b → a = b
 
 /-- Violation record produced by `checkShardPartition`. -/
 structure ShardAuditViolation : Type where
@@ -1318,7 +1489,12 @@ def checkShardPartition (registered onDisk : List String)
     if !covered.contains m then [{ code := .uncoveredRegisteredModule, subject := m }] else []
   let vOrphans := onDisk.flatMap fun m =>
     if !registered.contains m then [{ code := .unregisteredOnDiskOrphan, subject := m }] else []
-  vEmptyList ++ vPerShard ++ vDisjoint ++ vUncovered ++ vOrphans
+  let univ := registered ++ onDisk
+  let vCollide := univ.flatMap fun a => univ.flatMap fun b =>
+    if a != b && caseFoldKey a == caseFoldKey b then
+      [{ code := .moduleNameCollision, subject := a }]
+    else []
+  vEmptyList ++ vPerShard ++ vDisjoint ++ vUncovered ++ vOrphans ++ vCollide
 
 private theorem checkPairwiseDisjoint_nil_iff (shards : List (List String)) :
     checkPairwiseDisjoint shards = [] ↔
@@ -1385,7 +1561,7 @@ theorem shardPartitionCheck_iff_valid (registered onDisk : List String)
   unfold checkShardPartition
   simp only [List.append_eq_nil_iff, checkPairwiseDisjoint_nil_iff]
   constructor
-  · rintro ⟨⟨⟨⟨hEmptyList, hPerShard⟩, hDisj⟩, hUncov⟩, hOrph⟩
+  · rintro ⟨⟨⟨⟨⟨hEmptyList, hPerShard⟩, hDisj⟩, hUncov⟩, hOrph⟩, hColl⟩
     have hNonEmpty : shards ≠ [] := by
       intro hNil; subst hNil; cases hEmptyList
     have hEach : ∀ s ∈ shards, s ≠ [] ∧ s.Nodup ∧ ∀ m ∈ s, m ∈ registered := by
@@ -1414,9 +1590,18 @@ theorem shardPartitionCheck_iff_valid (registered onDisk : List String)
         no_on_disk_orphans := fun m hm => by
           have hM := (List.flatMap_eq_nil_iff.mp hOrph) m hm
           simp at hM
-          exact hM }
+          exact hM
+        no_case_fold_collisions := fun a ha b hb hKey => by
+          have hA := (List.flatMap_eq_nil_iff.mp hColl) a ha
+          have hB := (List.flatMap_eq_nil_iff.mp hA) b hb
+          by_cases hNe : a = b
+          · exact hNe
+          · have hT : (a != b && caseFoldKey a == caseFoldKey b) = true := by
+              simp [hNe, hKey]
+            simp only [hT, ↓reduceIte] at hB
+            cases hB }
   · intro hV
-    refine ⟨⟨⟨⟨?_, ?_⟩, hV.pairwise_disjoint⟩, ?_⟩, ?_⟩
+    refine ⟨⟨⟨⟨⟨?_, ?_⟩, hV.pairwise_disjoint⟩, ?_⟩, ?_⟩, ?_⟩
     · cases hSh : shards with
       | nil => exact absurd hSh hV.nonempty_shards
       | cons _ _ => rfl
@@ -1444,6 +1629,17 @@ theorem shardPartitionCheck_iff_valid (registered onDisk : List String)
       have hIn : registered.contains m = true :=
         List.contains_iff_mem.mpr (hV.no_on_disk_orphans m hm)
       simp only [hIn, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    · rw [List.flatMap_eq_nil_iff]
+      intro a ha
+      rw [List.flatMap_eq_nil_iff]
+      intro b hb
+      have hC : (a != b && caseFoldKey a == caseFoldKey b) = false := by
+        cases hEq : (caseFoldKey a == caseFoldKey b) with
+        | false => simp
+        | true =>
+          have hab := hV.no_case_fold_collisions a ha b hb (eq_of_beq hEq)
+          simp [hab]
+      simp only [hC, Bool.false_eq_true, ↓reduceIte]
 
 /-- `--exact-modules` shard audit: checks direct declarations owned by `m ∈ shard`,
     walking the FULL transitive constant graph `TransDep env` across all imports
@@ -1569,6 +1765,15 @@ theorem truncatedShardAudit_misses_crossShard_badAxiom :
   · exact absurd hMod (by decide)
   · exact absurd hMod (by decide)
 
+/-- **Case-fold collision**: `Anneal.Foo` and `Anneal.foo` alias one file on
+    case-insensitive filesystems, so a shard plan listing both would audit one `.olean`
+    twice (or silently shadow the other); `checkShardPartition` rejects it. -/
+theorem caseFoldCollision_rejected_by_checkShardPartition :
+    (checkShardPartition ["Anneal.Foo", "Anneal.foo"] ["Anneal.Foo", "Anneal.foo"]
+        [["Anneal.Foo"], ["Anneal.foo"]]).any
+      (fun v => v.code == .moduleNameCollision && v.subject == "Anneal.Foo") = true := by
+  decide
+
 /-- **Why `--orphan-only` matters**: omitting an unregistered on-disk orphan module
     causes `checkShardPartition` to emit `unregisteredOnDiskOrphan`. -/
 theorem orphanModule_rejected_by_checkShardPartition :
@@ -1620,13 +1825,23 @@ theorem unsatisfiableExternEnsures_derives_arbitrary_post {X Y : Type}
     ∀ Q : Y → Prop, ExternContinuationVerified spec x Q :=
   fun _ _ y hPost => False.elim (hUnsat y hPost)
 
-/-- Guard 3 (`creusot#2388`): every non-diverging trusted extern must admit at least
-    one satisfying output `y` for every input `x` satisfying `pre x`.
-    Diverging (`-> !`) functions and `requires(false)` (`unreachable_unchecked`)
-    remain cleanly permitted. -/
-def ExternEnsuresGuard {X Y : Type} (spec : ExternCallableSpec X Y) : Prop :=
+/-- Legacy (A0) flag-only formulation of Guard 3: trusts the self-declared
+    `isDiverging` metadata bit. Retained ONLY to exhibit the bypass below. -/
+def FlagOnlyExternEnsuresGuard {X Y : Type} (spec : ExternCallableSpec X Y) : Prop :=
   spec.isTrustedExtern = true → spec.isDiverging = false →
     ∀ x, spec.pre x → ∃ y, spec.post x y
+
+/-- Guard 3 (`creusot#2388`): for every trusted extern,
+    1. a declared-diverging spec must GENUINELY diverge: its return type `Y` is empty
+       (`-> !`), so the `isDiverging` bit cannot be forged on an inhabited return type; and
+    2. every non-diverging spec must admit at least one satisfying output `y` for every
+       input `x` satisfying `pre x`.
+    Genuinely diverging (`-> !`) functions and `requires(false)` (`unreachable_unchecked`)
+    remain cleanly permitted. -/
+def ExternEnsuresGuard {X Y : Type} (spec : ExternCallableSpec X Y) : Prop :=
+  spec.isTrustedExtern = true →
+    (spec.isDiverging = true → (Y → False)) ∧
+    ∀ x, spec.pre x → spec.isDiverging = false → ∃ y, spec.post x y
 
 /-- **Diverging Distinction**: genuinely diverging `-> !` functions (`abort`, `exit`,
     return type `PEmpty`) satisfy `ExternEnsuresGuard` vacuously without needing a return
@@ -1640,7 +1855,8 @@ def abortDivergingSpec : ExternCallableSpec Nat PEmpty :=
 
 theorem divergingExtern_admissible :
     ExternEnsuresGuard abortDivergingSpec ∧ (PEmpty → False) :=
-  ⟨fun _ hDiv => absurd hDiv (by decide), fun y => PEmpty.elim y⟩
+  ⟨fun _ => ⟨fun _ y => PEmpty.elim y, fun _ _ hNd => absurd hNd (by decide)⟩,
+    fun y => PEmpty.elim y⟩
 
 /-- **`unreachable_unchecked` Distinction**: explicit `requires(false)` satisfies
     `ExternEnsuresGuard` because no verified caller can discharge `pre x`. -/
@@ -1653,14 +1869,33 @@ def unreachableUncheckedSpec : ExternCallableSpec Nat Nat :=
 
 theorem unreachableUnchecked_requires_false_admissible :
     ExternEnsuresGuard unreachableUncheckedSpec :=
-  fun _ _ _ hPre => False.elim hPre
+  fun _ => ⟨fun hDiv => absurd hDiv (by decide), fun _ hPre _ => False.elim hPre⟩
 
 /-- **Guard 3 Rejection**: `readVolatileBrokenSpec` fails `ExternEnsuresGuard`. -/
 theorem externEnsuresGuard_rejects_readVolatileBrokenSpec :
     ¬ ExternEnsuresGuard readVolatileBrokenSpec := by
   intro hG
-  obtain ⟨_, hFalse⟩ := hG rfl rfl 0 trivial
+  obtain ⟨_, hFalse⟩ := (hG rfl).2 0 trivial rfl
   exact hFalse
+
+/-- **Forged-Divergence Bypass (B1 regression)**: a trusted extern that falsely declares
+    `isDiverging := true` while returning an INHABITED type (`Nat`) with `ensures(false)`
+    passes the flag-only guard and still collapses every continuation to `False`, but is
+    rejected by `ExternEnsuresGuard` because `Nat` is inhabited. -/
+def lyingDivergingSpec : ExternCallableSpec Nat Nat :=
+  { fnName := "core::ptr::read_volatile"
+    isTrustedExtern := true
+    isDiverging := true
+    pre := fun _ => True
+    post := fun _ _ => False }
+
+theorem lyingDiverging_bypasses_flagOnly_but_rejected_by_guard :
+    FlagOnlyExternEnsuresGuard lyingDivergingSpec ∧
+      (∀ x, ExternContinuationVerified lyingDivergingSpec x (fun _ => False)) ∧
+      ¬ ExternEnsuresGuard lyingDivergingSpec := by
+  refine ⟨fun _ hNd => absurd hNd (by decide), fun _ _ _ hF => hF, ?_⟩
+  intro hG
+  exact (hG rfl).1 rfl 0
 
 /-- **Guard 3 Soundness Restoration**: under `ExternEnsuresGuard`, a non-diverging
     trusted extern with satisfiable `pre` can NEVER derive `False` in its continuation,
@@ -1674,8 +1909,22 @@ theorem externEnsuresGuard_sound {X Y : Type} {spec : ExternCallableSpec X Y}
     ¬ (∀ x, ExternContinuationVerified spec x (fun _ => False)) := by
   intro hBad
   obtain ⟨x, hx⟩ := hPreSat
-  obtain ⟨y, hy⟩ := hGuard hTrusted hNonDiv x hx
+  obtain ⟨y, hy⟩ := (hGuard hTrusted).2 x hx hNonDiv
   exact hBad x hx y hy
+
+/-- **Guard 3 General Soundness**: under `ExternEnsuresGuard`, a trusted extern can make a
+    satisfiable-precondition continuation vacuous ONLY when its return type is genuinely
+    empty (true `-> !` divergence): every `pre`-satisfying input either admits a
+    post-state witness or no return value can exist at all. -/
+theorem externEnsuresGuard_vacuity_only_from_genuine_divergence {X Y : Type}
+    {spec : ExternCallableSpec X Y}
+    (hTrusted : spec.isTrustedExtern = true)
+    (hGuard : ExternEnsuresGuard spec) :
+    ∀ x, spec.pre x → (∃ y, spec.post x y) ∨ (Y → False) := by
+  intro x hx
+  cases hDiv : spec.isDiverging with
+  | true => exact Or.inr ((hGuard hTrusted).1 hDiv)
+  | false => exact Or.inl ((hGuard hTrusted).2 x hx hDiv)
 
 /-- Continuation transfer for an honest returning extern implementation. -/
 theorem externEnsuresGuard_continuation_transfer {X Y : Type}
@@ -1683,9 +1932,12 @@ theorem externEnsuresGuard_continuation_transfer {X Y : Type}
     (hHonest : ∀ x, spec.pre x → spec.post x (implFn x))
     {x : X} {Q : Y → Prop}
     (hPre : spec.pre x)
-    (hCont : ExternContinuationVerified spec x Q) :
+    (hCont : ExternContinuationVerified spec x Q)
+    (hNonDiv : spec.isDiverging = false) :
     ExternEnsuresGuard spec ∧ Q (implFn x) :=
-  ⟨fun _ _ x' hx' => ⟨implFn x', hHonest x' hx'⟩, hCont hPre (implFn x) (hHonest x hPre)⟩
+  ⟨fun _ => ⟨fun hDiv => absurd (hDiv.symm.trans hNonDiv) (by decide),
+      fun x' hx' _ => ⟨implFn x', hHonest x' hx'⟩⟩,
+    hCont hPre (implFn x) (hHonest x hPre)⟩
 
 /-! ### 4.2 Guard 4 — `FnDef` Ghost-Token Coercion Ban (`creusot#2389`, rank `4`) -/
 

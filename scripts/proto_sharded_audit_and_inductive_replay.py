@@ -11,13 +11,16 @@ import argparse
 import concurrent.futures
 from dataclasses import dataclass
 import json
+import functools
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from typing import Any
 
 sys.dont_write_bytecode = True
@@ -101,6 +104,7 @@ INDUCTIVE_REPLAY_VIOLATION_CODES: tuple[str, ...] = (
     "dangling_ctor_not_listed_in_induct",
     "indices_mismatch",
     "is_rec_mismatch",
+    "recursor_mismatch",
 )
 
 SHARD_AUDIT_VIOLATION_CODES: tuple[str, ...] = (
@@ -113,6 +117,7 @@ SHARD_AUDIT_VIOLATION_CODES: tuple[str, ...] = (
     "unregistered_on_disk_orphan",
     "disallowed_transitive_axiom",
     "missing_dependency_decl",
+    "module_name_collision",
 )
 
 PEER_GUARD_VIOLATION_CODES: tuple[str, ...] = (
@@ -170,12 +175,53 @@ def _has_dups(items: list[str]) -> bool:
     return len(set(items)) != len(items)
 
 
+_MISSING = object()
+
+_KERNEL_INDUCT_META_FIELDS: tuple[str, ...] = (
+    "name",
+    "level_params",
+    "type",
+    "num_params",
+    "all",
+    "ctors",
+    "num_nested",
+    "is_reflexive",
+    "is_unsafe",
+)
+
+_KERNEL_CTOR_FIELDS: tuple[str, ...] = (
+    "name",
+    "induct",
+    "num_params",
+    "num_fields",
+    "level_params",
+    "type",
+    "is_unsafe",
+)
+
+
+def _stored_differs(kernel_rec: dict[str, Any], stored: dict[str, Any], field: str) -> bool:
+    """A field the kernel generated must be present AND equal in the stored entry.
+
+    Omitting a field from the stored `.olean`/JSON entry is itself a mismatch (fail closed):
+    a forged entry must never pass merely by leaving out the field it lies about.
+    """
+    if field not in kernel_rec:
+        return False
+    return stored.get(field, _MISSING) != kernel_rec[field]
+
+
 def check_inductive_replay_integrity(
     constants: dict[str, dict[str, Any]],
     kernel_inductives: dict[str, dict[str, Any]] | None = None,
     kernel_ctors: dict[str, dict[str, Any]] | None = None,
+    kernel_recursors: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
-    """Verify all 12 `lean4#16717` structural and post-replay inductive invariants."""
+    """Verify all 13 `lean4#16717` structural and post-replay inductive invariants.
+
+    Mirrors Lean `checkInductiveReplayIntegrity` = static ++ postponed inductives ++
+    postponed constructors ++ postponed recursors.
+    """
     violations: list[dict[str, str]] = []
 
     for key in sorted(constants):
@@ -307,7 +353,7 @@ def check_inductive_replay_integrity(
                     }
                 )
                 continue
-            if k_info.get("num_indices") != entry.get("num_indices"):
+            if entry.get("num_indices", _MISSING) != k_info.get("num_indices", _MISSING):
                 violations.append(
                     {
                         "code": "indices_mismatch",
@@ -315,7 +361,7 @@ def check_inductive_replay_integrity(
                         "detail": f"kernel={k_info.get('num_indices')} stored={entry.get('num_indices')}",
                     }
                 )
-            if k_info.get("is_rec") != entry.get("is_rec"):
+            if entry.get("is_rec", _MISSING) != k_info.get("is_rec", _MISSING):
                 violations.append(
                     {
                         "code": "is_rec_mismatch",
@@ -323,17 +369,8 @@ def check_inductive_replay_integrity(
                         "detail": f"kernel={k_info.get('is_rec')} stored={entry.get('is_rec')}",
                     }
                 )
-            for field in (
-                "name",
-                "level_params",
-                "type",
-                "num_params",
-                "all",
-                "ctors",
-                "is_reflexive",
-                "is_unsafe",
-            ):
-                if field in k_info and field in entry and k_info[field] != entry[field]:
+            for field in _KERNEL_INDUCT_META_FIELDS:
+                if _stored_differs(k_info, entry, field):
                     violations.append(
                         {
                             "code": "mutual_metadata_mismatch",
@@ -358,7 +395,7 @@ def check_inductive_replay_integrity(
                         "detail": "ctor_not_in_kernel",
                     }
                 )
-            elif k_ctor.get("cidx") != entry.get("cidx"):
+            elif entry.get("cidx", _MISSING) != k_ctor.get("cidx", _MISSING):
                 violations.append(
                     {
                         "code": "ctor_cidx_mismatch",
@@ -366,15 +403,38 @@ def check_inductive_replay_integrity(
                         "detail": "post_replay_cidx",
                     }
                 )
-            elif any(
-                field in k_ctor and field in entry and k_ctor[field] != entry[field]
-                for field in ("induct", "num_params", "num_fields", "level_params", "type")
-            ):
+            elif any(_stored_differs(k_ctor, entry, field) for field in _KERNEL_CTOR_FIELDS):
                 violations.append(
                     {
                         "code": "ctor_induct_mismatch",
                         "subject": name,
                         "detail": "post_replay_ctor_diff",
+                    }
+                )
+
+    if kernel_recursors is not None:
+        for key in sorted(constants):
+            entry = constants[key]
+            if entry.get("kind") != "recursor":
+                continue
+            name = str(entry.get("name"))
+            k_rec = kernel_recursors.get(name)
+            if k_rec is None:
+                violations.append(
+                    {
+                        "code": "recursor_mismatch",
+                        "subject": name,
+                        "detail": "rec_not_in_kernel",
+                    }
+                )
+            elif {f: v for f, v in entry.items() if f != "kind"} != {
+                f: v for f, v in k_rec.items() if f != "kind"
+            }:
+                violations.append(
+                    {
+                        "code": "recursor_mismatch",
+                        "subject": name,
+                        "detail": "post_replay_rec_diff",
                     }
                 )
 
@@ -385,57 +445,86 @@ def simulate_vulnerable_replay(
     constants: dict[str, dict[str, Any]],
     kernel_inductives: dict[str, dict[str, Any]],
     kernel_ctors: dict[str, dict[str, Any]],
+    kernel_recursors: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Model Lean 4.34.1 `Replay.lean` lines 102-190 (pre-`lean4#16717`).
+    """Faithful model of Lean 4.34.1 `Replay.lean` (pre-`lean4#16717`), mirroring Lean `replayLoop`.
 
-    Replays `info.all` blindly without checking `info.name in info.all`, checks
-    `postponedConstructors` at the end, and omits `checkPostponedInductives`.
+    - Iterates keys in the given order; a key is processed only while still in `remaining`.
+    - `.inductInfo`: erases every `n in info.all` from `remaining`, replays ONLY `info.all`
+      (never `info.name`), and the kernel rejects already-declared types.
+    - Checks postponed constructors AND postponed recursors at the end (both exist in
+      4.34.1) but has no `checkPostponedInductives`.
     """
+    k_recs = kernel_recursors if kernel_recursors is not None else {}
     replayed_inducts: dict[str, dict[str, Any]] = {}
     replayed_ctors: dict[str, dict[str, Any]] = {}
-    postponed_ctors: list[str] = []
-    remaining = set(constants.keys())
+    replayed_recs: dict[str, dict[str, Any]] = {}
+    keys = list(constants.keys())
+    remaining = list(keys)
 
-    for key in list(constants.keys()):
+    def _result(accepted: bool, error: str | None, ctor_errors: list[str], rec_errors: list[str]) -> dict[str, Any]:
+        return {
+            "accepted": accepted,
+            "error": error,
+            "ctor_errors": ctor_errors,
+            "rec_errors": rec_errors,
+            "replayed_inductives": sorted(replayed_inducts.keys()),
+            "replayed_ctors": sorted(replayed_ctors.keys()),
+            "replayed_recursors": sorted(replayed_recs.keys()),
+        }
+
+    for key in keys:
         if key not in remaining:
             continue
-        remaining.discard(key)
+        remaining = [k for k in remaining if k != key]
         entry = constants[key]
-        kind = entry.get("kind")
-        if kind == "inductive":
-            all_names = list(entry.get("all", []))
-            for peer_name in all_names:
-                remaining.discard(peer_name)
-                if peer_name in kernel_inductives:
-                    replayed_inducts[peer_name] = kernel_inductives[peer_name]
-                    for ctor_name in kernel_inductives[peer_name].get("ctors", []):
-                        if ctor_name in kernel_ctors:
-                            replayed_ctors[ctor_name] = kernel_ctors[ctor_name]
-        elif kind == "constructor":
-            postponed_ctors.append(entry["name"])
+        if entry.get("kind") != "inductive":
+            continue
+        all_names = list(entry.get("all", []))
+        remaining = [k for k in remaining if k not in all_names]
+        for peer_name in all_names:
+            peer = constants.get(peer_name)
+            if peer is None or peer.get("kind") != "inductive":
+                return _result(False, f"malformed induct req for {key}", [], [])
+            for ctor_name in peer.get("ctors", []):
+                c = constants.get(ctor_name)
+                if c is None or c.get("kind") != "constructor":
+                    return _result(False, f"malformed induct req for {key}", [], [])
+        if any(peer_name in replayed_inducts for peer_name in all_names):
+            return _result(False, f"kernel: already declared while replaying {key}", [], [])
+        if any(peer_name not in kernel_inductives for peer_name in all_names):
+            return _result(False, f"kernel rejected induct req for {key}", [], [])
+        for peer_name in all_names:
+            k_ind = kernel_inductives[peer_name]
+            replayed_inducts[peer_name] = k_ind
+            for ctor_name in k_ind.get("ctors", []):
+                if ctor_name in kernel_ctors:
+                    replayed_ctors[ctor_name] = kernel_ctors[ctor_name]
+            for rec_name, k_rec in k_recs.items():
+                if list(k_rec.get("all", [])) == list(k_ind.get("all", [])):
+                    replayed_recs[rec_name] = k_rec
 
     ctor_errors: list[str] = []
-    for ctor_name in postponed_ctors:
-        if ctor_name not in replayed_ctors or replayed_ctors[ctor_name] != constants.get(ctor_name):
-            ctor_errors.append(ctor_name)
-
-    return {
-        "accepted": len(ctor_errors) == 0,
-        "ctor_errors": ctor_errors,
-        "replayed_inductives": sorted(replayed_inducts.keys()),
-        "replayed_ctors": sorted(replayed_ctors.keys()),
-    }
+    rec_errors: list[str] = []
+    for key in keys:
+        entry = constants[key]
+        if entry.get("kind") == "constructor":
+            if key not in replayed_ctors or replayed_ctors[key] != entry:
+                ctor_errors.append(key)
+        elif entry.get("kind") == "recursor":
+            if key not in replayed_recs or replayed_recs[key] != entry:
+                rec_errors.append(key)
+    if ctor_errors:
+        return _result(False, "postponed constructor mismatch", ctor_errors, rec_errors)
+    if rec_errors:
+        return _result(False, "postponed recursor mismatch", ctor_errors, rec_errors)
+    return _result(True, None, ctor_errors, rec_errors)
 
 
 _LIVE_OLEAN_INSPECTOR_LEAN = r'''
 import Lean
 
 open Lean
-
-def isStdlibMod (m : Name) : Bool :=
-  let s := m.toString
-  m == `Init || s.startsWith "Init." || m == `Std || s.startsWith "Std." ||
-  m == `Lean || s.startsWith "Lean."
 
 def expressionEdges (e : Expr) : NameSet :=
   let base := e.getUsedConstantsAsSet
@@ -467,6 +556,14 @@ def hasDupNames (xs : List Name) : Bool :=
 def mkViol (code subject detail : String) : Json :=
   Json.mkObj [("code", toJson code), ("subject", toJson subject), ("detail", toJson detail)]
 
+/-- Unchecked kernel declaration for a non-inductive-block constant (dependency context only). -/
+def declOfNonBlock? : ConstantInfo → Option Declaration
+  | .defnInfo v => some (.defnDecl v)
+  | .thmInfo v => some (.thmDecl v)
+  | .axiomInfo v => some (.axiomDecl v)
+  | .opaqueInfo v => some (.opaqueDecl v)
+  | _ => none
+
 def main (args : List String) : IO UInt32 := do
   let t0 ← IO.monoMsNow
   let mut reqPath : Option String := none
@@ -479,80 +576,97 @@ def main (args : List String) : IO UInt32 := do
   let importMods ← IO.ofExcept <| j.getObjValAs? (Array String) "import_modules"
   let exactMods ← IO.ofExcept <| j.getObjValAs? (Array String) "exact_modules"
   let allowedAxioms ← IO.ofExcept <| j.getObjValAs? (Array String) "permitted_axioms"
+  let kernelReplay := (j.getObjValAs? Bool "kernel_replay_inductives").toOption.getD true
+  -- Optional `[[module, path]]` overrides used ONLY by red-team tests to feed synthetic
+  -- forged `.olean` fixtures through the exact same audit pipeline.
+  let overridePairs := (j.getObjValAs? (Array (Array String)) "olean_overrides").toOption.getD #[]
+  let overrides : Std.HashMap Name String := overridePairs.foldl (fun acc pr =>
+    if pr.size == 2 then acc.insert pr[0]!.toName pr[1]! else acc) {}
   let sysroot ← Lean.findSysroot
   let leanPathStr := (← IO.getEnv "LEAN_PATH").getD ""
   let sp := System.SearchPath.parse leanPathStr
   initSearchPath sysroot sp
+  -- Toolchain-owned modules are identified by their `.olean` living under the toolchain
+  -- sysroot (never by name prefix: a repo module named `Lean.Evil` must still be audited).
+  let sysLibPrefix := (sysroot / "lib" / "lean").toString ++ "/"
   let baseEnv ← importModules #[{ module := `Init }, { module := `Std }, { module := `Lean }] {}
     (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private)
   let baseEnv := baseEnv.setExporting false
   let exactSet : NameSet := exactMods.foldl (fun s m => s.insert m.toName) {}
   let allowedAxSet : NameSet := allowedAxioms.foldl (fun s a => s.insert a.toName) {}
-  -- Load all requested non-stdlib `.olean` files and their transitive non-stdlib imports
-  -- directly via `Lean.readModuleData` so sibling `.eq_k` realizations never abort loading.
   let mut queue : List Name := (importMods.map String.toName).toList
+  let mut visitedMods : NameSet := {}
   let mut loadedMods : NameSet := {}
+  let mut stdlibSkipped : Nat := 0
   let mut modDatas : Array (Name × ModuleData) := #[]
   let mut constMap : Std.HashMap Name ConstantInfo := {}
+  let mut constOrigin : Std.HashMap Name Name := {}
   let mut viols : Array Json := #[]
   let mut siblingEqDedup : Nat := 0
   while !queue.isEmpty do
     let m := queue.head!
     queue := queue.tail!
-    if !loadedMods.contains m && !isStdlibMod m then
-      loadedMods := loadedMods.insert m
-      let oleanPath ← Lean.findOLean m
-      let mut partPaths : Array System.FilePath := #[oleanPath]
-      let serverPath := System.FilePath.mk (oleanPath.toString ++ ".server")
-      if ← serverPath.pathExists then
-        partPaths := partPaths.push serverPath
-      let privPath := System.FilePath.mk (oleanPath.toString ++ ".private")
-      if ← privPath.pathExists then
-        partPaths := partPaths.push privPath
-      let parts ← Lean.readModuleDataParts partPaths
-      for (mdata, _region) in parts do
-        modDatas := modDatas.push (m, mdata)
-        if mdata.constNames.size != mdata.constants.size then
-          viols := viols.push (mkViol "key_mismatch" m.toString "constNames_size_mismatch")
-        for idx in [:mdata.constants.size] do
-          let ci := mdata.constants[idx]!
-          match constMap[ci.name]? with
-          | none => constMap := constMap.insert ci.name ci
-          | some existing =>
-            siblingEqDedup := siblingEqDedup + 1
-            -- Mirror Lean 4.34.1 `Replay.lean` lines 90-95: reserved/duplicate theorems
-            -- must agree on type & levelParams (proof bodies are proof-irrelevant or
-            -- split between exported `.olean` stubs and `.olean.private`).
-            let compat :=
-              existing.levelParams == ci.levelParams &&
-              (match existing, ci with
-               | .thmInfo _, .thmInfo _ => existing.type.eqv ci.type
-               | _, _ =>
-                 existing.type == ci.type &&
-                 (existing.value? true == ci.value? true || existing.value? true == none || ci.value? true == none))
-            if !compat then
-              let vCode := match ci with
-                | .inductInfo _ => "mutual_metadata_mismatch"
-                | _ => "stale_sibling_duplicate"
-              viols := viols.push (mkViol vCode ci.name.toString "sibling_duplicate_diff")
-            -- Prefer the entry carrying a body if one came from an exported stub.
-            if (existing.value? true).isNone && (ci.value? true).isSome then
+    if !visitedMods.contains m then
+      visitedMods := visitedMods.insert m
+      let overridePath? := overrides[m]?
+      let oleanPath ← match overridePath? with
+        | some op => pure (System.FilePath.mk op)
+        | none => Lean.findOLean m
+      if overridePath?.isNone && oleanPath.toString.startsWith sysLibPrefix then
+        stdlibSkipped := stdlibSkipped + 1
+      else
+        loadedMods := loadedMods.insert m
+        let mut partPaths : Array System.FilePath := #[oleanPath]
+        if overridePath?.isNone then
+          let serverPath := System.FilePath.mk (oleanPath.toString ++ ".server")
+          if ← serverPath.pathExists then
+            partPaths := partPaths.push serverPath
+          let privPath := System.FilePath.mk (oleanPath.toString ++ ".private")
+          if ← privPath.pathExists then
+            partPaths := partPaths.push privPath
+        let parts ← Lean.readModuleDataParts partPaths
+        for (mdata, _region) in parts do
+          modDatas := modDatas.push (m, mdata)
+          if mdata.constNames.size != mdata.constants.size then
+            viols := viols.push (mkViol "key_mismatch" m.toString "constNames_size_mismatch")
+          for idx in [:mdata.constants.size] do
+            let ci := mdata.constants[idx]!
+            match constMap[ci.name]? with
+            | none =>
               constMap := constMap.insert ci.name ci
-        for imp in mdata.imports do
-          if !loadedMods.contains imp.module && !isStdlibMod imp.module then
-            queue := imp.module :: queue
+              constOrigin := constOrigin.insert ci.name m
+            | some existing =>
+              siblingEqDedup := siblingEqDedup + 1
+              let compat :=
+                existing.levelParams == ci.levelParams &&
+                (match existing, ci with
+                 | .thmInfo _, .thmInfo _ => existing.type.eqv ci.type
+                 | _, _ =>
+                   existing.type == ci.type &&
+                   (existing.value? true == ci.value? true || existing.value? true == none || ci.value? true == none))
+              if !compat then
+                let vCode := match ci with
+                  | .inductInfo _ => "mutual_metadata_mismatch"
+                  | _ => "stale_sibling_duplicate"
+                viols := viols.push (mkViol vCode ci.name.toString "sibling_duplicate_diff")
+              if (existing.value? true).isNone && (ci.value? true).isSome then
+                constMap := constMap.insert ci.name ci
+          for imp in mdata.imports do
+            if !visitedMods.contains imp.module then
+              queue := imp.module :: queue
   let lookupConst (n : Name) : Option ConstantInfo :=
     match constMap[n]? with
     | some ci => some ci
     | none => baseEnv.find? n
+  let isTargetMod (modName : Name) : Bool :=
+    if exactMods.isEmpty then true else exactSet.contains modName
   let mut checkedModSet : NameSet := {}
   let mut declsChecked : Nat := 0
   let mut inductsChecked : Nat := 0
   let mut ctorsChecked : Nat := 0
   let mut roots : Array Name := #[]
   for (modName, data) in modDatas do
-    let isTarget := if exactMods.isEmpty then true else exactSet.contains modName
-    if isTarget then
+    if isTargetMod modName then
       checkedModSet := checkedModSet.insert modName
       for idx in [:data.constants.size] do
         let ci := data.constants[idx]!
@@ -591,18 +705,6 @@ def main (args : List String) : IO UInt32 := do
             | _ =>
               viols := viols.push (mkViol "non_ctor_in_ctors" ind.name.toString cName.toString)
             cidxExpected := cidxExpected + 1
-          match lookupConst ind.name with
-          | some (.inductInfo stored) =>
-            if stored.numIndices != ind.numIndices then
-              viols := viols.push (mkViol "indices_mismatch" ind.name.toString "env_diff")
-            if stored.isRec != ind.isRec then
-              viols := viols.push (mkViol "is_rec_mismatch" ind.name.toString "env_diff")
-            if stored.all != ind.all || stored.ctors != ind.ctors ||
-                stored.numParams != ind.numParams || stored.levelParams != ind.levelParams ||
-                stored.isReflexive != ind.isReflexive || stored.type != ind.type then
-              viols := viols.push (mkViol "mutual_metadata_mismatch" ind.name.toString "env_diff")
-          | _ =>
-            viols := viols.push (mkViol "self_not_in_all" ind.name.toString "missing_in_env")
         | .ctorInfo cVal =>
           ctorsChecked := ctorsChecked + 1
           match lookupConst cVal.induct with
@@ -612,13 +714,120 @@ def main (args : List String) : IO UInt32 := do
           | _ =>
             viols := viols.push (mkViol "dangling_ctor_not_listed_in_induct" cVal.name.toString cVal.induct.toString)
         | _ => pure ()
+  -- Every requested exact module must actually have been loaded and audited.
+  for m in exactMods do
+    if !checkedModSet.contains m.toName then
+      viols := viols.push (mkViol "uncovered_registered_module" m "exact_module_not_audited")
+  -- lean4#16717 `checkPostponedInductives`: re-send every non-stdlib inductive block to
+  -- the REAL kernel (dependencies added unchecked as context) and compare the
+  -- kernel-generated inductive / constructor / recursor values against the stored ones.
+  let tk0 ← IO.monoMsNow
+  let mut kBlocksChecked : Nat := 0
+  let mut kBlocksUnresolved : Nat := 0
+  let mut kUncheckedAdded : Nat := 0
+  if kernelReplay then
+    let mut kenv := baseEnv.toKernelEnv
+    for (_, ci) in constMap.toList do
+      match declOfNonBlock? ci with
+      | some d =>
+        match kenv.addDeclWithoutChecking d with
+        | .ok e => kenv := e; kUncheckedAdded := kUncheckedAdded + 1
+        | .error _ => viols := viols.push (mkViol "missing_dependency_decl" ci.name.toString "kernel_context_add_failed")
+      | none => pure ()
+    -- Group inductives into blocks keyed by the head of their (stored) `all` list.
+    let mut blockHeads : NameSet := {}
+    let mut blocks : Array (Name × InductiveVal) := #[]
+    for (_, ci) in constMap.toList do
+      match ci with
+      | .inductInfo ind =>
+        let head := ind.all.headD ind.name
+        if !blockHeads.contains head then
+          blockHeads := blockHeads.insert head
+          blocks := blocks.push (head, ind)
+      | _ => pure ()
+    let mut pending := blocks.toList
+    let mut progress := true
+    while progress && !pending.isEmpty do
+      progress := false
+      let mut deferred : List (Name × InductiveVal) := []
+      for (head, ind) in pending do
+        let mut types : List InductiveType := []
+        let mut wellFormed := true
+        for n in ind.all do
+          match constMap[n]? with
+          | some (.inductInfo peer) =>
+            let mut ctors : List Constructor := []
+            for c in peer.ctors do
+              match constMap[c]? with
+              | some (.ctorInfo cv) => ctors := ctors ++ [{ name := c, type := cv.type }]
+              | _ => wellFormed := false
+            types := types ++ [{ name := n, type := peer.type, ctors := ctors }]
+          | _ => wellFormed := false
+        if !wellFormed then
+          progress := true
+          continue
+        let decl := Declaration.inductDecl ind.levelParams ind.numParams types ind.isUnsafe
+        match kenv.addDeclCore 0 0 decl (cancelTk? := none) with
+        | .error (.unknownConstant _ _) =>
+          deferred := (head, ind) :: deferred
+        | .error ex =>
+          progress := true
+          let isTgt := match constOrigin[head]? with | some om => isTargetMod om | none => false
+          if isTgt then
+            let msg := (← (ex.toMessageData {}).toString)
+            viols := viols.push (mkViol "mutual_metadata_mismatch" head.toString s!"kernel_rejected_stored_block: {msg.take 200}")
+        | .ok e =>
+          progress := true
+          kenv := e
+          kBlocksChecked := kBlocksChecked + 1
+          let isTgt := match constOrigin[head]? with | some om => isTargetMod om | none => false
+          if isTgt then
+            for n in ind.all do
+              match e.find? n, constMap[n]? with
+              | some (.inductInfo k), some (.inductInfo st) =>
+                if k.numIndices != st.numIndices then
+                  viols := viols.push (mkViol "indices_mismatch" n.toString s!"kernel={k.numIndices} stored={st.numIndices}")
+                if k.isRec != st.isRec then
+                  viols := viols.push (mkViol "is_rec_mismatch" n.toString s!"kernel={k.isRec} stored={st.isRec}")
+                if k.all != st.all || k.ctors != st.ctors || k.numParams != st.numParams ||
+                    k.levelParams != st.levelParams || k.isReflexive != st.isReflexive ||
+                    k.type != st.type || k.numNested != st.numNested || k.isUnsafe != st.isUnsafe then
+                  viols := viols.push (mkViol "mutual_metadata_mismatch" n.toString "kernel_post_replay_diff")
+                for c in st.ctors do
+                  match e.find? c, constMap[c]? with
+                  | some (.ctorInfo kc), some (.ctorInfo sc) =>
+                    if kc.cidx != sc.cidx then
+                      viols := viols.push (mkViol "ctor_cidx_mismatch" c.toString "kernel_post_replay_cidx")
+                    else if !(kc == sc) then
+                      viols := viols.push (mkViol "ctor_induct_mismatch" c.toString "kernel_post_replay_ctor_diff")
+                  | _, _ =>
+                    viols := viols.push (mkViol "dangling_ctor_not_listed_in_induct" c.toString "ctor_not_in_kernel")
+                let recName := n ++ `rec
+                match constMap[recName]? with
+                | some (.recInfo sr) =>
+                  match e.find? recName with
+                  | some (.recInfo kr) =>
+                    if !(kr == sr) then
+                      viols := viols.push (mkViol "recursor_mismatch" recName.toString "kernel_post_replay_rec_diff")
+                  | _ =>
+                    viols := viols.push (mkViol "recursor_mismatch" recName.toString "rec_not_in_kernel")
+                | _ => pure ()
+              | _, _ =>
+                viols := viols.push (mkViol "self_not_in_all" n.toString "not_replayed_in_kernel")
+      pending := deferred
+    for (head, _) in pending do
+      kBlocksUnresolved := kBlocksUnresolved + 1
+      let isTgt := match constOrigin[head]? with | some om => isTargetMod om | none => false
+      if isTgt then
+        viols := viols.push (mkViol "missing_dependency_decl" head.toString "kernel_replay_unresolved_dependency")
+  let tk1 ← IO.monoMsNow
   -- Full transitive constant-graph walk across all loaded + stdlib imports for `--exact-modules`.
-  let mut pending : List Name := roots.toList
+  let mut pendingNames : List Name := roots.toList
   let mut visited : NameSet := {}
   let mut axiomsReached : NameSet := {}
-  while !pending.isEmpty do
-    let n := pending.head!
-    pending := pending.tail!
+  while !pendingNames.isEmpty do
+    let n := pendingNames.head!
+    pendingNames := pendingNames.tail!
     if !visited.contains n then
       visited := visited.insert n
       match lookupConst n with
@@ -632,16 +841,22 @@ def main (args : List String) : IO UInt32 := do
         let edges := declarationEdges ci
         for e in edges do
           if !visited.contains e then
-            pending := e :: pending
+            pendingNames := e :: pendingNames
   let t1 ← IO.monoMsNow
   let sortedAxioms := (axiomsReached.toArray.qsort Name.lt).map Name.toString
   let out := Json.mkObj [
     ("modules_checked", toJson checkedModSet.size),
     ("loaded_olean_count", toJson loadedMods.size),
+    ("stdlib_modules_skipped", toJson stdlibSkipped),
     ("sibling_eq_dedup_count", toJson siblingEqDedup),
     ("declarations_checked", toJson declsChecked),
     ("inductives_checked", toJson inductsChecked),
     ("ctors_checked", toJson ctorsChecked),
+    ("kernel_replay_enabled", toJson kernelReplay),
+    ("kernel_blocks_checked", toJson kBlocksChecked),
+    ("kernel_blocks_unresolved", toJson kBlocksUnresolved),
+    ("kernel_context_decls_added_unchecked", toJson kUncheckedAdded),
+    ("kernel_replay_elapsed_ms", toJson (tk1 - tk0)),
     ("transitive_visited", toJson visited.size),
     ("axioms_reached", toJson sortedAxioms),
     ("violations", .arr viols),
@@ -667,9 +882,16 @@ def inspect_live_oleans(
     import_modules: list[str],
     exact_modules: list[str] | None = None,
     permitted_axioms: list[str] | None = None,
-    timeout_sec: int = 300,
+    timeout_sec: int = 600,
+    kernel_replay_inductives: bool = True,
+    olean_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run live read-only `.olean` inspection under `anneal-lean-run --mode file`."""
+    """Run live read-only `.olean` inspection under `anneal-lean-run --mode file`.
+
+    With `kernel_replay_inductives` (default), every non-stdlib inductive block is re-sent
+    to the real Lean kernel and the kernel-generated inductive/constructor/recursor values
+    are compared against the stored `.olean` values (`lean4#16717` `checkPostponedInductives`).
+    """
     runner = _find_anneal_lean_run(repo_root)
     t0 = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="anneal-olean-insp-") as tmp_str:
@@ -685,6 +907,10 @@ def inspect_live_oleans(
                 if permitted_axioms is not None
                 else sorted(PERMITTED_FOUNDATIONAL_AXIOMS)
             ),
+            "kernel_replay_inductives": bool(kernel_replay_inductives),
+            "olean_overrides": [
+                [mod, str(path)] for mod, path in sorted((olean_overrides or {}).items())
+            ],
         }
         req_json.write_text(json.dumps(req_payload, sort_keys=True), encoding="utf-8")
         cmd = [
@@ -720,6 +946,94 @@ def inspect_live_oleans(
         result["axioms_reached"] = sorted(result.get("axioms_reached", []))
         result["wall_sec"] = wall_sec
         return result
+
+
+_OLEAN_FORGER_LEAN = r'''
+import Lean
+
+open Lean
+
+/-- Red-team fixture generator: rewrite ONE stored `ConstantInfo` inside a copy of a real
+    compiled `.olean`, emulating a malicious/buggy `.olean` producer (lean4#16717). -/
+def main (args : List String) : IO UInt32 := do
+  match args with
+  | [inPath, outPath, modStr, targetStr, mutation] =>
+    let parts ← readModuleDataParts #[System.FilePath.mk inPath]
+    let some (data, _) := parts[0]? | return 3
+    let target := targetStr.toName
+    let mut hit := false
+    let mut consts : Array ConstantInfo := #[]
+    for ci in data.constants do
+      let mut ci' := ci
+      match ci with
+      | .inductInfo v =>
+        if v.name == target then
+          match mutation with
+          | "flip_is_rec" => ci' := .inductInfo { v with isRec := !v.isRec }; hit := true
+          | "bump_num_indices" => ci' := .inductInfo { v with numIndices := v.numIndices + 1 }; hit := true
+          | "drop_self_from_all" =>
+            ci' := .inductInfo { v with all := v.all.filter (· != v.name) ++ [`Nat] }; hit := true
+          | "flip_is_reflexive" => ci' := .inductInfo { v with isReflexive := !v.isReflexive }; hit := true
+          | _ => pure ()
+      | .recInfo v =>
+        if v.name == target ++ `rec && mutation == "flip_rec_k" then
+          ci' := .recInfo { v with k := !v.k }; hit := true
+      | .ctorInfo v =>
+        if v.induct == target && v.cidx == 0 && mutation == "bump_ctor_fields" then
+          ci' := .ctorInfo { v with numFields := v.numFields + 1 }; hit := true
+      | _ => pure ()
+      consts := consts.push ci'
+    if !hit then
+      IO.eprintln s!"forger: no constant matched {targetStr} / {mutation}"
+      return 4
+    saveModuleData (System.FilePath.mk outPath) modStr.toName { data with constants := consts }
+    return 0
+  | _ =>
+    IO.eprintln "usage: forge <in.olean> <out.olean> <module> <inductive> <mutation>"
+    return 2
+'''
+
+FORGE_MUTATIONS: tuple[str, ...] = (
+    "flip_is_rec",
+    "bump_num_indices",
+    "drop_self_from_all",
+    "flip_is_reflexive",
+    "flip_rec_k",
+    "bump_ctor_fields",
+)
+
+
+def forge_olean_fixture(
+    repo_root: Path,
+    module: str,
+    inductive: str,
+    mutation: str,
+    out_path: Path,
+    timeout_sec: int = 300,
+) -> None:
+    """Write a synthetic forged copy of `module`'s compiled `.olean` to `out_path`."""
+    if mutation not in FORGE_MUTATIONS:
+        raise ValueError(f"unknown forge mutation {mutation!r}")
+    runner = _find_anneal_lean_run(repo_root)
+    src_olean = repo_root / ".lake" / "build" / "lib" / "lean" / (module.replace(".", "/") + ".olean")
+    if not src_olean.is_file():
+        raise FileNotFoundError(f"compiled .olean not found for {module}: {src_olean}")
+    with tempfile.TemporaryDirectory(prefix="anneal-olean-forge-") as tmp_str:
+        script = Path(tmp_str) / "forge_olean.lean"
+        script.write_text(_OLEAN_FORGER_LEAN, encoding="utf-8")
+        proc = subprocess.run(
+            [runner, "--mode", "file", "--", "lake", "env", "lean", "--run", str(script),
+             str(src_olean), str(out_path), module, inductive, mutation],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"olean forger failed (rc={proc.returncode}): {proc.stderr.strip()} {proc.stdout.strip()}"
+            )
 
 
 def run_trusted_boundary_inspect_source(
@@ -819,75 +1133,221 @@ def _lean_path_to_module(rel_under_root: Path) -> str:
     return ".".join(rel_under_root.with_suffix("").parts)
 
 
+def load_lake_lean_libs(repo_root: Path) -> list[dict[str, Any]]:
+    """Parse `[[lean_lib]]` declarations (name, srcDir, roots, globs) from `lakefile.toml`."""
+    lakefile = repo_root / "lakefile.toml"
+    if not lakefile.is_file():
+        return []
+    data = tomllib.loads(lakefile.read_text(encoding="utf-8"))
+    libs: list[dict[str, Any]] = []
+    for lib in data.get("lean_lib", []):
+        name = str(lib["name"])
+        roots = [str(r) for r in lib.get("roots", [name])]
+        globs = [str(g) for g in lib.get("globs", roots)]
+        libs.append(
+            {
+                "name": name,
+                "src_dir": str(lib.get("srcDir", ".")).strip("/") or ".",
+                "roots": roots,
+                "globs": globs,
+            }
+        )
+    return libs
+
+
+def _name_is_prefix(prefix: str, mod: str) -> bool:
+    return mod == prefix or mod.startswith(prefix + ".")
+
+
+def _lake_glob_matches(glob: str, mod: str) -> bool:
+    """Lake `Glob` semantics: `M` (one), `M.*` (strict submodules), `M.+` (M and submodules)."""
+    if glob.endswith(".*"):
+        base = glob[:-2]
+        return mod.startswith(base + ".")
+    if glob.endswith(".+"):
+        return _name_is_prefix(glob[:-2], mod)
+    return mod == glob
+
+
+def lake_is_buildable_module(lib: dict[str, Any], mod: str) -> bool:
+    """Mirror Lake `LeanLibConfig.isBuildableModule` (Lake/Config/LeanLibConfig.lean)."""
+    globs = lib["globs"]
+    if any(_lake_glob_matches(g, mod) for g in globs):
+        return True
+    return any(
+        _name_is_prefix(root, mod) and any(_lake_glob_matches(g, root) for g in globs)
+        for root in lib["roots"]
+    )
+
+
+def _walk_lean_files(base: Path) -> list[Path]:
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d != "build")
+        for fn in sorted(filenames):
+            if fn.endswith(".lean"):
+                out.append(Path(dirpath) / fn)
+    return out
+
+
+def _parse_lean_header_imports(path: Path) -> list[str]:
+    """Fast header-only `import` parser.
+
+    Nesting-aware for `/- ... -/` block comments and `--` line comments; stops at the first
+    token that is not part of the Lean module header (`module`, `prelude`, `import`
+    [`public`|`meta`|`all`] `Mod`).
+    """
+    imports: list[str] = []
+    depth = 0
+    expecting_mod = False
+    try:
+        fh = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return imports
+    with fh:
+        for raw in fh:
+            chars: list[str] = []
+            i = 0
+            n = len(raw)
+            while i < n:
+                if depth:
+                    if raw.startswith("/-", i):
+                        depth += 1
+                        i += 2
+                    elif raw.startswith("-/", i):
+                        depth -= 1
+                        i += 2
+                    else:
+                        i += 1
+                elif raw.startswith("/-", i):
+                    depth = 1
+                    i += 2
+                elif raw.startswith("--", i):
+                    break
+                else:
+                    chars.append(raw[i])
+                    i += 1
+            for word in "".join(chars).split():
+                if expecting_mod:
+                    if word in ("public", "meta", "all", "private"):
+                        continue
+                    imports.append(word.strip("«»"))
+                    expecting_mod = False
+                elif word in ("module", "prelude"):
+                    continue
+                elif word == "import":
+                    expecting_mod = True
+                else:
+                    return imports
+    return imports
+
+
+def discover_lake_sources(repo_root: Path) -> dict[str, Any]:
+    """Discover every on-disk `.lean` file under each `lean_lib` `srcDir` and its Lake owner.
+
+    Returns `{"modules": {mod: [entries...]}, "libs": [...]}` where every entry records
+    the file path, srcDir, and the list of libs for which the module is buildable.
+    """
+    libs = load_lake_lean_libs(repo_root)
+    by_src: dict[str, list[dict[str, Any]]] = {}
+    for lib in libs:
+        by_src.setdefault(lib["src_dir"], []).append(lib)
+    modules: dict[str, list[dict[str, Any]]] = {}
+    for src_dir in sorted(by_src):
+        base = repo_root / src_dir
+        if not base.is_dir():
+            continue
+        for fp in _walk_lean_files(base):
+            mod = _lean_path_to_module(fp.relative_to(base))
+            owners = sorted(lib["name"] for lib in by_src[src_dir] if lake_is_buildable_module(lib, mod))
+            modules.setdefault(mod, []).append(
+                {
+                    "rel_path": fp.relative_to(repo_root).as_posix(),
+                    "src_dir": src_dir,
+                    "owners": owners,
+                }
+            )
+    return {"modules": modules, "libs": libs}
+
+
+def lake_default_import_closure(repo_root: Path, lake: dict[str, Any] | None = None) -> set[str]:
+    """Modules reachable by `import` from every `lean_lib` root (what `lake build <lib>` builds)."""
+    lake = lake if lake is not None else discover_lake_sources(repo_root)
+    path_of: dict[str, Path] = {}
+    for mod, entries in lake["modules"].items():
+        owned = [e for e in entries if e["owners"]]
+        if owned:
+            path_of[mod] = repo_root / owned[0]["rel_path"]
+    seen: set[str] = set()
+    stack = [root for lib in lake["libs"] for root in lib["roots"]]
+    while stack:
+        mod = stack.pop()
+        if mod in seen or mod not in path_of:
+            continue
+        seen.add(mod)
+        stack.extend(_parse_lean_header_imports(path_of[mod]))
+    return seen
+
+
 def discover_repo_modules(repo_root: Path) -> dict[str, dict[str, Any]]:
-    """Fast (< 0.05s) discovery of all Lean modules across Trusted, theory/, examples/, tests/."""
+    """Fast discovery of all Lean modules: every `lean_lib` srcDir (Lake-owned or orphaned) plus
+    the standalone `examples/` and `tests/` harness files."""
     modules: dict[str, dict[str, Any]] = {}
     olean_root = repo_root / ".lake" / "build" / "lib" / "lean"
 
-    def add_mod(mod_name: str, abs_path: Path, root_group: str) -> None:
-        rel_posix = abs_path.relative_to(repo_root).as_posix()
+    def add_mod(mod_name: str, rel_posix: str, root_group: str, lake_owners: list[str] | None) -> None:
         olean_path = olean_root / (mod_name.replace(".", "/") + ".olean")
         modules[mod_name] = {
             "module": mod_name,
             "rel_path": rel_posix,
             "root_group": root_group,
             "has_olean": olean_path.is_file(),
+            "lake_owners": lake_owners,
         }
 
-    # 1. trusted/lean -> Trusted.*
-    trusted_dir = repo_root / "trusted" / "lean"
-    if trusted_dir.is_dir():
-        for dirpath, dirnames, filenames in os.walk(trusted_dir):
-            dirnames.sort()
-            for fn in sorted(filenames):
-                if fn.endswith(".lean"):
-                    p = Path(dirpath) / fn
-                    mod = _lean_path_to_module(p.relative_to(trusted_dir))
-                    add_mod(mod, p, "trusted")
+    lake = discover_lake_sources(repo_root)
+    for mod, entries in sorted(lake["modules"].items()):
+        e = entries[0]
+        group = "trusted" if e["src_dir"].startswith("trusted") else (
+            "minirust" if e["src_dir"].startswith("minirust") else "theory"
+        )
+        add_mod(mod, e["rel_path"], group, sorted({o for x in entries for o in x["owners"]}))
 
-    # 2. theory/ -> Anneal.*, Correspondence.*, MiniRust.*
-    theory_dir = repo_root / "theory"
-    if theory_dir.is_dir():
-        for dirpath, dirnames, filenames in os.walk(theory_dir):
-            dirnames.sort()
-            for fn in sorted(filenames):
-                if fn.endswith(".lean"):
-                    p = Path(dirpath) / fn
-                    mod = _lean_path_to_module(p.relative_to(theory_dir))
-                    add_mod(mod, p, "theory")
-
-    # 3. Root standalone examples/ Lean modules (excluding Cargo subproject examples)
-    examples_dir = repo_root / "examples"
-    if examples_dir.is_dir():
+    # Standalone examples/ and tests/ harness files (compiled per-file via `lake env lean`).
+    for top, group in (("examples", "examples"), ("tests", "tests")):
+        top_dir = repo_root / top
+        if not top_dir.is_dir():
+            continue
         for sub in ("", "mir", "pass", "refinement", "step-result"):
-            d = examples_dir / sub if sub else examples_dir
-            if d.is_dir():
-                for fn in sorted(os.listdir(d)):
-                    if fn.endswith(".lean"):
-                        p = d / fn
-                        if p.is_file():
-                            mod = p.stem
-                            if mod in modules:
-                                mod = f"Examples.{mod}"
-                            add_mod(mod, p, "examples")
-
-    # 4. Root tests/ Lean modules (excluding trusted-boundary/positive.lean harness fixture)
-    tests_dir = repo_root / "tests"
-    if tests_dir.is_dir():
-        for sub in ("", "mir", "pass", "refinement", "step-result"):
-            d = tests_dir / sub if sub else tests_dir
-            if d.is_dir():
-                for fn in sorted(os.listdir(d)):
-                    if fn.endswith(".lean"):
-                        p = d / fn
-                        if p.is_file():
-                            stem = p.stem
-                            mod = "SmokeTest" if (sub == "" and stem == "Smoke") else stem
-                            if mod in modules:
-                                mod = f"Tests.{mod}"
-                            add_mod(mod, p, "tests")
+            d = top_dir / sub if sub else top_dir
+            if not d.is_dir():
+                continue
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".lean") or not (d / fn).is_file():
+                    continue
+                stem = fn[: -len(".lean")]
+                mod = stem
+                if group == "tests" and sub == "" and stem == "Smoke":
+                    mod = "SmokeTest"
+                if mod in modules:
+                    mod = f"{'Examples' if group == 'examples' else 'Tests'}.{mod}"
+                add_mod(mod, (d / fn).relative_to(repo_root).as_posix(), group, None)
 
     return dict(sorted(modules.items()))
+
+
+def find_module_name_collisions(names: list[str]) -> list[dict[str, str]]:
+    """Case-folding collisions (`Anneal.Foo` vs `Anneal.foo`) that alias one path on
+    case-insensitive filesystems (Python `casefold` is a superset of Lean's ASCII fold)."""
+    groups: dict[str, set[str]] = {}
+    for nm in names:
+        groups.setdefault(nm.casefold(), set()).add(nm)
+    out: list[dict[str, str]] = []
+    for key in sorted(groups):
+        if len(groups[key]) > 1:
+            for nm in sorted(groups[key]):
+                out.append({"code": "module_name_collision", "subject": nm})
+    return out
 
 
 def classify_subsystem_shard(module_name: str, rel_path: str) -> str:
@@ -943,14 +1403,19 @@ def classify_subsystem_shard(module_name: str, rel_path: str) -> str:
         or module_name.startswith("Correspondence.")
         or module_name == "MiniRust"
         or module_name.startswith("MiniRust.")
+        or module_name == "MiniRustSpec"
+        or module_name.startswith("MiniRustSpec.")
     ):
         return "Anneal.RustcMir"
     return "Anneal.Core"
 
 
-def plan_subsystem_shards(repo_root: Path) -> dict[str, Any]:
+def plan_subsystem_shards(
+    repo_root: Path,
+    discovered: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Build the deterministic 8-shard subsystem partition covering all discovered modules."""
-    discovered = discover_repo_modules(repo_root)
+    discovered = discovered if discovered is not None else discover_repo_modules(repo_root)
     shards: dict[str, list[str]] = {name: [] for name in SUBSYSTEM_SHARD_NAMES}
     compiled_shards: dict[str, list[str]] = {name: [] for name in SUBSYSTEM_SHARD_NAMES}
     for mod_name, info in discovered.items():
@@ -1003,6 +1468,9 @@ def check_shard_partition(
         if mod not in reg_set:
             violations.append({"code": "unregistered_on_disk_orphan", "subject": mod})
 
+    violations.extend(
+        find_module_name_collisions(sorted(set(registered_modules) | set(on_disk_modules)))
+    )
     return violations
 
 
@@ -1011,25 +1479,45 @@ def run_orphan_only_gate(
     registered_modules: list[str] | None = None,
     shards: list[list[str]] | None = None,
 ) -> dict[str, Any]:
-    """Run `< 0.25s` `--orphan-only` completeness and exact-partition gate."""
+    """Run the `< 0.25s` `--orphan-only` completeness and exact-partition gate.
+
+    `registered` defaults to the modules Lake can actually build (`isBuildableModule` of
+    some `[[lean_lib]]` in `lakefile.toml`, plus the standalone examples/tests harness files);
+    `on_disk` is EVERY `.lean` file under every `lean_lib` srcDir, so a `.lean` file that no
+    library owns (e.g. `theory/Rogue.lean`) is reported as `unregistered_on_disk_orphan`.
+    Modules that Lake owns but that are NOT in the default import closure of any library
+    root are reported as advisory telemetry (`outside_lib_root_import_closure`).
+    """
     t0 = time.perf_counter()
+    lake = discover_lake_sources(repo_root)
     discovered = discover_repo_modules(repo_root)
     on_disk = sorted(discovered.keys())
+    lake_registered = sorted(
+        m for m, info in discovered.items()
+        if info["lake_owners"] is None or len(info["lake_owners"]) > 0
+    )
+    duplicate_paths = sorted(m for m, entries in lake["modules"].items() if len(entries) > 1)
     if registered_modules is None and shards is None:
-        plan = plan_subsystem_shards(repo_root)
-        registered = on_disk
+        plan = plan_subsystem_shards(repo_root, discovered=discovered)
+        registered = lake_registered
         shard_lists = [plan["shards"][name] for name in SUBSYSTEM_SHARD_NAMES]
     elif registered_modules is not None and shards is None:
         registered = list(registered_modules)
         shard_lists = [registered] if registered else []
     elif registered_modules is None and shards is not None:
-        registered = on_disk
+        registered = lake_registered
         shard_lists = shards
     else:
         registered = list(registered_modules)
         shard_lists = shards
 
     violations = check_shard_partition(registered, on_disk, shard_lists)
+    for mod in duplicate_paths:
+        violations.append({"code": "module_name_collision", "subject": mod})
+    closure = lake_default_import_closure(repo_root, lake)
+    outside_closure = sorted(
+        m for m, info in discovered.items() if info["lake_owners"] and m not in closure
+    )
     elapsed_sec = round(time.perf_counter() - t0, 5)
     return {
         "ok": len(violations) == 0,
@@ -1037,8 +1525,11 @@ def run_orphan_only_gate(
         "under_250ms": elapsed_sec < 0.25,
         "on_disk_count": len(on_disk),
         "registered_count": len(registered),
+        "lake_lib_count": len(lake["libs"]),
         "shard_count": len(shard_lists),
         "violations": violations,
+        "outside_lib_root_import_closure": outside_closure,
+        "outside_lib_root_import_closure_count": len(outside_closure),
     }
 
 
@@ -1096,8 +1587,14 @@ def run_live_benchmark(
 ) -> dict[str, Any]:
     """Benchmark `--orphan-only`, monolithic live `.olean` audit, and parallel sharded audit."""
     orphan_res = run_orphan_only_gate(repo_root)
-    plan = plan_subsystem_shards(repo_root)
+    discovered = discover_repo_modules(repo_root)
+    plan = plan_subsystem_shards(repo_root, discovered=discovered)
     compiled_shards: dict[str, list[str]] = plan["compiled_olean_shards"]
+    # Benchmark honesty: Lake-owned modules with NO compiled `.olean` are NOT audited by
+    # either the monolithic or the sharded run; surface them instead of silently dropping.
+    uncompiled = sorted(
+        m for m, info in discovered.items() if info["lake_owners"] and not info["has_olean"]
+    )
     all_compiled: list[str] = sorted(
         m for mods in compiled_shards.values() for m in mods
     )
@@ -1149,6 +1646,7 @@ def run_live_benchmark(
         "orphan_only": orphan_res,
         "compiled_shard_count": len(compiled_shards),
         "compiled_module_count": len(all_compiled),
+        "unaudited_uncompiled_lake_modules": uncompiled,
         "max_workers": workers,
         "monolithic": {
             "wall_sec": mono_wall,
@@ -1158,6 +1656,8 @@ def run_live_benchmark(
             "inductives_checked": mono_res["inductives_checked"],
             "ctors_checked": mono_res["ctors_checked"],
             "transitive_visited": mono_res["transitive_visited"],
+            "kernel_blocks_checked": mono_res.get("kernel_blocks_checked"),
+            "kernel_replay_elapsed_ms": mono_res.get("kernel_replay_elapsed_ms"),
             "axioms_reached": mono_res["axioms_reached"],
             "violation_count": len(mono_res["violations"]),
             "inductive_violation_count": len(mono_ind_viols),
@@ -1182,6 +1682,12 @@ def run_live_benchmark(
             "ctor_count_matches_monolithic": sharded_ctors == mono_res["ctors_checked"],
             "zero_inductive_violations": len(mono_ind_viols) == 0 and len(sharded_ind_viols) == 0,
             "zero_violations": len(mono_res["violations"]) == 0 and len(sharded_violations) == 0,
+            "violation_multiset_matches_monolithic": sorted(
+                (v.get("code", ""), v.get("subject", ""), v.get("detail", "")) for v in mono_res["violations"]
+            ) == sorted(
+                (v.get("code", ""), v.get("subject", ""), v.get("detail", "")) for v in sharded_violations
+            ),
+            "all_lake_modules_compiled_and_audited": not uncompiled,
             "speedup_vs_monolithic": speedup,
         },
     }
@@ -1434,14 +1940,32 @@ def _find_matching_delim(tokens: list[Token], open_idx: int, open_ch: str, close
     return len(tokens) - 1
 
 
+def _expand_cfg_attr(attr_toks: list[Token], line: int, depth: int = 0) -> list[tuple[list[Token], int]]:
+    """Expand `cfg_attr(pred, a1, a2, ...)` into `[a1, a2, ...]` (recursively).
+
+    A contract hidden behind `#[cfg_attr(creusot, ensures(false))]` is active whenever the
+    verifier's cfg is set, so every guard must see it (fail closed on any predicate).
+    """
+    if depth > 8:
+        return [(attr_toks, line)]
+    path, args = _attr_path_and_args(attr_toks)
+    if path.split("::")[-1] != "cfg_attr":
+        return [(attr_toks, line)]
+    out: list[tuple[list[Token], int]] = []
+    for part in _split_top_level_tokens(args, ",")[1:]:
+        if part:
+            out.extend(_expand_cfg_attr(part, line, depth + 1))
+    return out
+
+
 def _collect_rust_outer_attrs(tokens: list[Token], pos: int) -> tuple[list[tuple[list[Token], int]], int]:
-    """Collect contiguous outer attributes `#[...]` starting at `pos`."""
+    """Collect contiguous outer attributes `#[...]` starting at `pos` (with `cfg_attr` expanded)."""
     attrs: list[tuple[list[Token], int]] = []
     i = pos
     n = len(tokens)
     while i + 1 < n and tokens[i].text == "#" and tokens[i + 1].text == "[":
         close_idx = _find_matching_delim(tokens, i + 1, "[", "]")
-        attrs.append((tokens[i + 2 : close_idx], tokens[i].line))
+        attrs.extend(_expand_cfg_attr(tokens[i + 2 : close_idx], tokens[i].line))
         i = close_idx + 1
     return attrs, i
 
@@ -1508,12 +2032,69 @@ def _norm_tok_expr(toks: list[Token]) -> str:
     return " ".join(t.text for t in _strip_outer_parens(toks))
 
 
+def _rust_literal_value(tok: Token) -> int | bool | None:
+    """Integer/boolean value of a single literal token (`1_000u32`, `0xFF`, `true`), else `None`."""
+    if tok.text in ("true", "false"):
+        return tok.text == "true"
+    if tok.kind != "NUMBER":
+        return None
+    txt = tok.text.replace("_", "").lower()
+    for suf in ("u128", "i128", "usize", "isize", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8"):
+        if txt.endswith(suf) and len(txt) > len(suf):
+            txt = txt[: -len(suf)]
+            break
+    try:
+        if txt.startswith("0x"):
+            return int(txt[2:], 16)
+        if txt.startswith("0o"):
+            return int(txt[2:], 8)
+        if txt.startswith("0b"):
+            return int(txt[2:], 2)
+        return int(txt, 10)
+    except ValueError:
+        return None
+
+
+_LITERAL_CMP_OPS: dict[str, Any] = {
+    "==": lambda a, b: a == b,
+    "!=": lambda a, b: a != b,
+    "<=": lambda a, b: a <= b,
+    ">=": lambda a, b: a >= b,
+    "<": lambda a, b: a < b,
+    ">": lambda a, b: a > b,
+}
+
+
+def _rust_literal_comparison(toks: list[Token]) -> bool | None:
+    """Evaluate `lit OP lit` (e.g. `1 == 2`, `0u8 > 1`) to a constant truth value, else `None`."""
+    toks = _strip_outer_parens(toks)
+    if len(toks) == 1:
+        v = _rust_literal_value(toks[0])
+        return v if isinstance(v, bool) else None
+    if len(toks) != 3 or toks[1].text not in _LITERAL_CMP_OPS:
+        return None
+    a = _rust_literal_value(toks[0])
+    b = _rust_literal_value(toks[2])
+    if a is None or b is None or isinstance(a, bool) != isinstance(b, bool):
+        return None
+    if isinstance(a, bool) and toks[1].text not in ("==", "!="):
+        return None
+    return bool(_LITERAL_CMP_OPS[toks[1].text](a, b))
+
+
 def _rust_expr_is_unsatisfiable(toks: list[Token]) -> bool:
     """Sound syntactic unsatisfiability detector for Rust contract clauses."""
     toks = _strip_closure_header(toks)
     toks = _strip_outer_parens(toks)
     if not toks:
         return False
+
+    # Constant-foldable literal comparison (`1 == 2`, `0 > 1`, `true == false`)
+    if _rust_literal_comparison(toks) is False:
+        return True
+    # Negated tautology `!(1 == 1)` / `!(true)`
+    if toks[0].text == "!" and len(toks) > 1 and _rust_literal_comparison(toks[1:]) is True:
+        return True
 
     # Array conjunction `[e1, e2, ...]`
     if toks[0].text == "[" and _find_matching_delim(toks, 0, "[", "]") == len(toks) - 1:
@@ -1753,6 +2334,7 @@ def scan_rust_unsatisfiable_extern_ensures(
             attrs, after_attrs = _collect_rust_outer_attrs(tokens, i)
             is_external_spec_attr = False
             is_spec_attr = False
+            is_trusted_body = False
             req_clauses: list[list[Token]] = []
             ens_clauses: list[list[Token]] = []
             attr_line = tokens[i].line
@@ -1773,9 +2355,17 @@ def scan_rust_unsatisfiable_extern_ensures(
                         req_clauses.append(args)
                 elif leaf in ("spec", "embed_spec", "trusted"):
                     is_spec_attr = True
+                    if leaf == "trusted":
+                        is_trusted_body = True
                     rq, en = _extract_contract_clauses(args)
                     req_clauses.extend(rq)
                     ens_clauses.extend(en)
+                elif leaf == "external_body" or (
+                    leaf == "verifier" and any(t.text == "external_body" for t in args)
+                ):
+                    # Verus `#[verifier::external_body]` / Creusot `#[trusted]`: the body is
+                    # NOT verified, so its contract is as trusted as an extern spec.
+                    is_trusted_body = True
 
             fn_info = _parse_rust_fn_sig(tokens, after_attrs)
             if fn_info is not None:
@@ -1783,6 +2373,7 @@ def scan_rust_unsatisfiable_extern_ensures(
                 is_extern_target = (
                     is_external_spec_attr
                     or (is_spec_attr and (is_extern_fn or bool(in_extern_block_brace_depths)))
+                    or is_trusted_body
                 )
                 if is_extern_target and ens_clauses and not is_diverging:
                     req_unsat = any(_rust_expr_is_unsatisfiable(r) for r in req_clauses)
@@ -1796,7 +2387,7 @@ def scan_rust_unsatisfiable_extern_ensures(
                                     "unsatisfiable_extern_ensures",
                                     fn_name,
                                     attr_line,
-                                    "non-diverging extern/external_spec carries unsatisfiable ensures",
+                                    "non-diverging extern/external_spec/trusted-body callable carries unsatisfiable ensures",
                                     file_path=file_path,
                                 )
                             )
@@ -1845,6 +2436,97 @@ def _parse_rust_path_at(tokens: list[Token], pos: int) -> tuple[list[str], int, 
     return segs, i, had_turbofish
 
 
+def _parse_rust_use_tree(toks: list[Token], prefix: list[str] | None = None) -> list[tuple[list[str], str | None]]:
+    """Flatten a Rust `use` tree into `(path_segments, alias)` pairs.
+
+    Handles nested groups `a::{b as c, d::{e as f}}`, `self`, and globs (`*` yields
+    `(prefix + ['*'], None)`).
+    """
+    prefix = list(prefix or [])
+    out: list[tuple[list[str], str | None]] = []
+    for item in _split_top_level_tokens(toks, ","):
+        if not item:
+            continue
+        segs = list(prefix)
+        i = 0
+        n = len(item)
+        if i < n and item[i].text == "::":
+            i += 1
+        alias: str | None = None
+        handled = False
+        while i < n:
+            t = item[i]
+            if t.text == "{":
+                close = _find_matching_delim(item, i, "{", "}")
+                out.extend(_parse_rust_use_tree(item[i + 1 : close], segs))
+                handled = True
+                break
+            if t.text == "*":
+                out.append((segs + ["*"], None))
+                handled = True
+                break
+            if t.text == "as" and i + 1 < n:
+                alias = item[i + 1].text
+                break
+            if t.kind == "IDENT":
+                if t.text != "self":
+                    segs.append(t.text)
+            i += 1
+        if not handled and segs:
+            out.append((segs, alias))
+    return out
+
+
+def _rust_block_contexts(tokens: list[Token]) -> list[tuple[str | None, bool]]:
+    """Per-token `(enclosing_fn_name, inside_loop_of_that_fn)` brace-context map."""
+    n = len(tokens)
+    ctx: list[tuple[str | None, bool]] = [(None, False)] * n
+    stack: list[tuple[str, str | None]] = []
+    pending_fn: str | None = None
+    pending_loop = False
+    pending_impl = False
+    for i, t in enumerate(tokens):
+        cur_fn: str | None = None
+        in_loop = False
+        for kind, nm in reversed(stack):
+            if kind == "loop":
+                in_loop = True
+            if kind == "fn":
+                cur_fn = nm
+                break
+        ctx[i] = (cur_fn, in_loop)
+        txt = t.text
+        prev = tokens[i - 1].text if i > 0 else ""
+        if txt == "fn" and i + 1 < n and tokens[i + 1].kind == "IDENT":
+            pending_fn = tokens[i + 1].text
+        elif txt in ("impl", "trait") and pending_fn is None:
+            pending_impl = True
+        elif txt in ("loop", "while", "for") and prev not in (".", "::") and pending_fn is None and not pending_impl:
+            pending_loop = True
+        elif txt == "{":
+            if pending_fn is not None:
+                stack.append(("fn", pending_fn))
+                pending_fn = None
+            elif pending_impl:
+                stack.append(("impl", None))
+                pending_impl = False
+            elif pending_loop:
+                stack.append(("loop", None))
+                pending_loop = False
+            else:
+                stack.append(("block", None))
+        elif txt == "}":
+            if stack:
+                stack.pop()
+        elif txt == ";":
+            pending_fn = None
+            pending_loop = False
+    return ctx
+
+
+GHOST_TOKEN_AUTHORITY_FNS: frozenset[str] = frozenset({"main"})
+
+
 def scan_rust_fndef_ghost_token_coercion(
     text: str,
     *,
@@ -1861,8 +2543,7 @@ def scan_rust_fndef_ghost_token_coercion(
     if extra_token_ctors:
         for c in extra_token_ctors:
             ctor_suffixes.add(tuple(seg for seg in c.split("::") if seg))
-    type_aliases: dict[str, tuple[str, ...]] = {}
-    fn_aliases: set[str] = set()
+    path_aliases: dict[str, tuple[str, ...]] = {}
     fn_header_spans: list[tuple[int, int]] = []
     use_spans: list[tuple[int, int]] = []
 
@@ -1911,26 +2592,41 @@ def scan_rust_fndef_ghost_token_coercion(
                 i = j + 1
                 continue
 
-        # Track `use ...;`
+        # Track `use ...;` trees (nested groups, multiple `as` aliases) and `type A = P;`
         if tokens[i].text == "use":
             u_start = i
             j = i + 1
             while j < n and tokens[j].text != ";":
                 j += 1
-            use_toks = tokens[u_start + 1 : j]
             use_spans.append((u_start, j))
-            # Handle `use foo::Tokens as T;` and `use foo::Tokens::new as mk;`
-            as_idx = next((k for k, t in enumerate(use_toks) if t.text == "as"), -1)
-            if as_idx != -1 and as_idx + 1 < len(use_toks):
-                lhs_segs = [t.text for t in use_toks[:as_idx] if t.kind == "IDENT"]
-                alias = use_toks[as_idx + 1].text
-                if lhs_segs:
-                    if lhs_segs[-1] == "Tokens":
-                        type_aliases[alias] = ("Tokens",)
-                    elif tuple(lhs_segs[-2:]) in ctor_suffixes or (lhs_segs[-1],) in ctor_suffixes:
-                        fn_aliases.add(alias)
+            for segs, alias in _parse_rust_use_tree(tokens[u_start + 1 : j]):
+                if alias is not None and alias != "_" and segs and segs[-1] != "*":
+                    path_aliases[alias] = tuple(segs)
             i = j + 1
             continue
+        if (
+            tokens[i].text == "type"
+            and i + 2 < n
+            and tokens[i + 1].kind == "IDENT"
+            and (i == 0 or tokens[i - 1].text in (";", "{", "}", "pub", ")", "]"))
+        ):
+            j = i + 2
+            if j < n and tokens[j].text == "<":
+                d = 1
+                j += 1
+                while j < n and d > 0:
+                    d += 1 if tokens[j].text == "<" else (-1 if tokens[j].text == ">" else 0)
+                    j += 1
+            if j < n and tokens[j].text == "=":
+                segs, after, _ = _parse_rust_path_at(tokens, j + 1)
+                if segs:
+                    path_aliases[tokens[i + 1].text] = tuple(segs)
+                k = j
+                while k < n and tokens[k].text != ";":
+                    k += 1
+                use_spans.append((i, k))
+                i = k + 1
+                continue
 
         if tokens[i].text == "#" and i + 1 < n and tokens[i + 1].text == "[":
             attrs, after_attrs = _collect_rust_outer_attrs(tokens, i)
@@ -1960,12 +2656,37 @@ def scan_rust_fndef_ghost_token_coercion(
                 continue
         i += 1
 
-    # Expand aliases
+    # Expand aliases to a fixed point: a `use`/`type` alias of a ctor TYPE (`Tokens`,
+    # `#[ghost_token_ctor]` impl types) aliases every ctor fn on it; an alias of a ctor FN
+    # path aliases the fn itself.
     expanded_suffixes = set(ctor_suffixes)
-    for alias in type_aliases:
-        expanded_suffixes.add((alias, "new"))
-    for alias in fn_aliases:
-        expanded_suffixes.add((alias,))
+    changed = True
+    while changed:
+        changed = False
+        for alias, target in path_aliases.items():
+            for suf in list(expanded_suffixes):
+                if len(suf) >= 2 and target[-1:] == suf[-2:-1]:
+                    cand = (alias, suf[-1])
+                    if cand not in expanded_suffixes:
+                        expanded_suffixes.add(cand)
+                        changed = True
+                if len(target) >= len(suf) and target[-len(suf):] == suf:
+                    cand1 = (alias,)
+                    if cand1 not in expanded_suffixes:
+                        expanded_suffixes.add(cand1)
+                        changed = True
+
+    def matched_suffix(segs: list[str]) -> tuple[str, ...] | None:
+        t_segs = tuple(segs)
+        best: tuple[str, ...] | None = None
+        for suf in expanded_suffixes:
+            if len(t_segs) >= len(suf) and t_segs[-len(suf):] == suf:
+                if best is None or len(suf) > len(best):
+                    best = suf
+        return best
+
+    block_ctx = _rust_block_contexts(tokens)
+    direct_calls: list[tuple[str, int, str]] = []
 
     ignored = [False] * n
     for s, e in fn_header_spans:
@@ -2051,13 +2772,35 @@ def scan_rust_fndef_ghost_token_coercion(
                 i = body_start
                 continue
 
-        if tokens[i].kind == "IDENT" or (
+        # Qualified-self UFCS path `<Tokens>::new` / `<Tokens as Trait>::new`
+        ufcs_segs: list[str] | None = None
+        ufcs_next = i
+        if tokens[i].text == "<":
+            d = 1
+            j = i + 1
+            while j < n and d > 0 and tokens[j].text not in (";", "{", "}"):
+                d += 1 if tokens[j].text == "<" else (-1 if tokens[j].text == ">" else 0)
+                j += 1
+            if d == 0 and j + 1 < n and tokens[j].text == "::" and tokens[j + 1].kind == "IDENT":
+                inner_segs, _, _ = _parse_rust_path_at(tokens, i + 1)
+                if inner_segs:
+                    rest_segs, rest_next, _ = _parse_rust_path_at(tokens, j + 1)
+                    ufcs_segs = inner_segs + rest_segs
+                    ufcs_next = rest_next
+
+        if ufcs_segs is not None or tokens[i].kind == "IDENT" or (
             tokens[i].text == "::" and i + 1 < n and tokens[i + 1].kind == "IDENT"
         ):
-            segs, next_i, _ = _parse_rust_path_at(tokens, i)
+            if ufcs_segs is not None:
+                segs, next_i = ufcs_segs, ufcs_next
+            else:
+                segs, next_i, _ = _parse_rust_path_at(tokens, i)
             if matches_ctor(segs):
                 is_direct_call = next_i < n and tokens[next_i].text == "("
                 path_str = "::".join(segs)
+                if is_direct_call and not closure_end_stack:
+                    suf = matched_suffix(segs) or tuple(segs)
+                    direct_calls.append(("::".join(suf), i, path_str))
                 if not is_direct_call:
                     findings.append(
                         _make_peer_finding(
@@ -2083,6 +2826,32 @@ def scan_rust_fndef_ghost_token_coercion(
             i = max(i + 1, next_i)
             continue
         i += 1
+
+    # Single-entry authority (Lean `FnDefGhostTokenGuard`: only `directEntryCall true`, and
+    # at most ONE issuance per one-shot ctor): direct calls must sit in the entry function,
+    # outside any loop, and occur exactly once per ctor.
+    seen_ctor: dict[str, int] = {}
+    for ctor_key, idx, path_str in direct_calls:
+        fn_name, in_loop = block_ctx[idx]
+        reason: str | None = None
+        if fn_name not in GHOST_TOKEN_AUTHORITY_FNS:
+            reason = f"direct call outside the single-entry authority (in fn `{fn_name}`)"
+        elif in_loop:
+            reason = "direct call inside a loop issues the one-shot token repeatedly"
+        elif ctor_key in seen_ctor:
+            reason = f"second direct call site (first at line {seen_ctor[ctor_key]}) duplicates the one-shot token"
+        seen_ctor.setdefault(ctor_key, tokens[idx].line)
+        if reason is not None:
+            findings.append(
+                _make_peer_finding(
+                    "fndef_ghost_token_coercion",
+                    path_str,
+                    tokens[idx].line,
+                    reason,
+                    file_path=file_path,
+                )
+            )
+    findings.sort(key=lambda f: (f["line"], f["subject"], f["detail"]))
     return findings
 
 
@@ -2117,7 +2886,25 @@ _STD_DROP_GLUE_TYPES: frozenset[str] = frozenset(
     }
 )
 
-_NO_DROP_WRAPPER_TYPES: frozenset[str] = frozenset({"PhantomData", "ManuallyDrop", "NonNull"})
+_NO_DROP_WRAPPER_TYPES: frozenset[str] = frozenset({"PhantomData", "ManuallyDrop", "NonNull", "MaybeUninit"})
+
+# Types known to carry NO drop glue of their own (generic wrappers contribute only their
+# type arguments' glue, which is tracked separately). Anything outside this set, the
+# known-drop set, local items, and generic parameters is a FOREIGN type of unknown drop
+# status and fails closed (Guard 5 cannot prove `has_drop_glue == false`).
+_KNOWN_NO_DROP_TYPES: frozenset[str] = frozenset(
+    {
+        "u8", "u16", "u32", "u64", "u128", "usize",
+        "i8", "i16", "i32", "i64", "i128", "isize",
+        "f32", "f64", "bool", "char", "str", "Self",
+        "Option", "Result", "Cell", "Wrapping", "Saturating", "Reverse",
+        "NonZeroU8", "NonZeroU16", "NonZeroU32", "NonZeroU64", "NonZeroU128", "NonZeroUsize",
+        "NonZeroI8", "NonZeroI16", "NonZeroI32", "NonZeroI64", "NonZeroI128", "NonZeroIsize",
+        "NonZero", "Duration", "Instant", "Ordering", "Infallible", "TypeId", "Layout",
+        "AtomicBool", "AtomicU8", "AtomicU16", "AtomicU32", "AtomicU64", "AtomicUsize",
+        "AtomicI8", "AtomicI16", "AtomicI32", "AtomicI64", "AtomicIsize",
+    }
+)
 
 
 def _extract_owned_type_names(type_toks: list[Token]) -> set[str]:
@@ -2130,6 +2917,19 @@ def _extract_owned_type_names(type_toks: list[Token]) -> set[str]:
         return out
     while i < n:
         t = type_toks[i]
+        if t.text == ";":
+            # Array length expression `[T; N]`: skip to the closing `]`
+            d = 0
+            while i < n and not (type_toks[i].text == "]" and d == 0):
+                if type_toks[i].text == "[":
+                    d += 1
+                elif type_toks[i].text == "]":
+                    d -= 1
+                i += 1
+            continue
+        if t.kind == "IDENT" and t.text in ("dyn", "impl", "mut", "const", "where", "for"):
+            i += 1
+            continue
         if t.text in ("&", "*"):
             # Skip inner borrowed/raw-pointer type until matching delimiter or comma
             i += 1
@@ -2192,10 +2992,54 @@ def scan_rust_external_type_drop_omission(
     if known_drop_types:
         direct_drop.update(known_drop_types)
     type_fields: dict[str, set[str]] = {}
+    local_types: set[str] = set()
+    generic_params: dict[str, set[str]] = {}
     ext_type_items: list[dict[str, Any]] = []
+
+    def _generic_param_names(start: int) -> tuple[set[str], int]:
+        names: set[str] = set()
+        j = start
+        if j < n and tokens[j].text == "<":
+            close = j
+            d = 0
+            while close < n:
+                if tokens[close].text == "<":
+                    d += 1
+                elif tokens[close].text == ">":
+                    d -= 1
+                    if d == 0:
+                        break
+                close += 1
+            for part in _split_top_level_tokens(tokens[j + 1 : close], ","):
+                part = [t for t in part if t.text != "const"]
+                if part and part[0].kind == "IDENT":
+                    names.add(part[0].text)
+            j = close + 1
+        return names, j
 
     i = 0
     while i < n:
+        # `type Alias<...> = Target;` aliases contribute their RHS drop glue.
+        if (
+            tokens[i].text == "type"
+            and i + 1 < n
+            and tokens[i + 1].kind == "IDENT"
+            and (i == 0 or tokens[i - 1].text in (";", "{", "}", "pub", ")", "]"))
+        ):
+            alias_name = tokens[i + 1].text
+            gps, j = _generic_param_names(i + 2)
+            if j < n and tokens[j].text == "=":
+                k = j + 1
+                while k < n and tokens[k].text != ";":
+                    k += 1
+                type_fields.setdefault(alias_name, set()).update(
+                    _extract_owned_type_names(tokens[j + 1 : k])
+                )
+                local_types.add(alias_name)
+                generic_params.setdefault(alias_name, set()).update(gps)
+                i = k + 1
+                continue
+
         # Collect `impl [<...>] [path::]Drop for TypeName`
         if tokens[i].text == "impl":
             j = i + 1
@@ -2246,16 +3090,9 @@ def scan_rust_external_type_drop_omission(
                 type_name = tokens[j].text
                 type_line = tokens[j].line
                 j += 1
-                # Skip generics `<...>`
-                if j < n and tokens[j].text == "<":
-                    d = 1
-                    j += 1
-                    while j < n and d > 0:
-                        if tokens[j].text == "<":
-                            d += 1
-                        elif tokens[j].text == ">":
-                            d -= 1
-                        j += 1
+                local_types.add(type_name)
+                gps, j = _generic_param_names(j)
+                generic_params.setdefault(type_name, set()).update(gps)
                 # Skip `where ...`
                 if j < n and tokens[j].text == "where":
                     while j < n and tokens[j].text not in ("{", "(", ";"):
@@ -2304,6 +3141,7 @@ def scan_rust_external_type_drop_omission(
                 has_ext_body = False
                 drop_modeled = False
                 explicit_drop = False
+                asserted_no_drop = False
                 explicit_for_targets: set[str] = set()
                 attr_line = type_line
                 for attr_toks, ln in attrs:
@@ -2327,6 +3165,10 @@ def scan_rust_external_type_drop_omission(
                         drop_modeled = True
                     elif leaf in ("has_drop_glue", "implements_drop"):
                         explicit_drop = True
+                    elif leaf == "no_drop_glue":
+                        asserted_no_drop = True
+                    elif leaf == "verifier" and any(t.text == "external_body" for t in args):
+                        has_ext_body = True
 
                 if has_ext_type:
                     targets = set(explicit_for_targets) | set(tuple_wrapped) | {type_name}
@@ -2338,6 +3180,7 @@ def scan_rust_external_type_drop_omission(
                             "has_external_body": has_ext_body,
                             "drop_modeled": drop_modeled,
                             "explicit_drop": explicit_drop,
+                            "asserted_no_drop": asserted_no_drop,
                         }
                     )
                 i = max(j, item_start + 1)
@@ -2355,10 +3198,51 @@ def scan_rust_external_type_drop_omission(
                 has_drop_glue.add(tname)
                 changed = True
 
+    known_no_drop = set(_KNOWN_NO_DROP_TYPES)
+
+    def _unknown_foreign(root: str) -> list[str]:
+        """Foreign (non-local, non-std-known) types in the owned-type closure of `root`."""
+        seen: set[str] = set()
+        unknown: set[str] = set()
+        stack = [(root, frozenset())]
+        while stack:
+            tname, params = stack.pop()
+            if tname in seen:
+                continue
+            seen.add(tname)
+            if tname in local_types:
+                gp = frozenset(generic_params.get(tname, set()))
+                for dep in type_fields.get(tname, set()):
+                    if dep not in gp:
+                        stack.append((dep, gp))
+            elif tname in params or tname in direct_drop or tname in known_no_drop:
+                continue
+            else:
+                unknown.add(tname)
+        return sorted(unknown)
+
     # Pass 3: emit findings for `#[external_type_specification]` items
     findings: list[dict[str, Any]] = []
     for item in ext_type_items:
         drop_hits = sorted(t for t in item["targets"] if t in has_drop_glue)
+        unknown_hits: list[str] = []
+        if not drop_hits and not item["explicit_drop"] and not item["drop_modeled"] and not item["asserted_no_drop"]:
+            for tgt in sorted(item["targets"]):
+                unknown_hits.extend(_unknown_foreign(tgt))
+            unknown_hits = sorted(set(unknown_hits))
+        if unknown_hits:
+            findings.append(
+                _make_peer_finding(
+                    "external_type_drop_omission",
+                    item["name"],
+                    item["line"],
+                    "external_type_specification wraps foreign type(s) of unknown drop glue "
+                    f"({', '.join(unknown_hits)}); fail closed: model drop (#[models_drop]) or "
+                    "assert #[no_drop_glue]",
+                    file_path=file_path,
+                )
+            )
+            continue
         if item["explicit_drop"] or drop_hits:
             if item["has_external_body"]:
                 findings.append(
@@ -2457,8 +3341,24 @@ def _match_lean_char(text: str, pos: int, n: int) -> int | None:
     return None
 
 
+_LEAN_IDENT_RE = re.compile(r"[^\W\d][\w'?!]*(?:\.[^\W\d][\w'?!]*)*")
+_LEAN_NUMBER_RE = re.compile(r"\d\w*")
+_LEAN_WS_RE = re.compile(r"[ \t\r\n]+")
+
+
+@functools.lru_cache(maxsize=16)
+def _lex_lean_tokens_cached(text: str) -> tuple[tuple[Token, ...], tuple[CommentSpan, ...]]:
+    toks, comments = _lex_lean_tokens_impl(text)
+    return tuple(toks), tuple(comments)
+
+
 def lex_lean_tokens(text: str) -> tuple[list[Token], list[CommentSpan]]:
-    """Nested-comment, interpolated-string, char-literal, and guillemet-aware Lean 4 lexer."""
+    """Nested-comment, raw/interpolated-string, char-literal, and guillemet-aware Lean 4 lexer."""
+    toks, comments = _lex_lean_tokens_cached(text)
+    return list(toks), list(comments)
+
+
+def _lex_lean_tokens_impl(text: str) -> tuple[list[Token], list[CommentSpan]]:
     tokens: list[Token] = []
     comments: list[CommentSpan] = []
     n = len(text)
@@ -2469,12 +3369,11 @@ def lex_lean_tokens(text: str) -> tuple[list[Token], list[CommentSpan]]:
 
     while i < n:
         ch = text[i]
-        if ch in " \t\r":
-            i += 1
-            continue
-        if ch == "\n":
-            line += 1
-            i += 1
+        if ch in " \t\r\n":
+            m_ws = _LEAN_WS_RE.match(text, i)
+            assert m_ws is not None
+            line += m_ws.group(0).count("\n")
+            i = m_ws.end()
             continue
 
         # Line comment `-- ...`
@@ -2510,6 +3409,24 @@ def lex_lean_tokens(text: str) -> tuple[list[Token], list[CommentSpan]]:
                     i += 1
             comments.append(CommentSpan(ckind, text[start:i], start, i, start_line))
             continue
+
+        # Raw string literal `r"..."` / `r#"..."#` / `r##"..."##` (no escapes; comment markers
+        # inside are inert).
+        if ch == "r" and i + 1 < n and text[i + 1] in ('"', "#"):
+            j = i + 1
+            hashes = 0
+            while j < n and text[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and text[j] == '"':
+                closing = '"' + "#" * hashes
+                close_at = text.find(closing, j + 1)
+                end = n if close_at == -1 else close_at + len(closing)
+                seg = text[i:end]
+                tokens.append(Token("STRING", seg, i, end, line))
+                line += seg.count("\n")
+                i = end
+                continue
 
         # Interpolated string `s!"..."`, `m!"..."`, `f!"..."`
         if ch in ("s", "m", "f") and i + 2 < n and text[i + 1] == "!" and text[i + 2] == '"':
@@ -2576,22 +3493,16 @@ def lex_lean_tokens(text: str) -> tuple[list[Token], list[CommentSpan]]:
 
         # Identifiers (keep `.` separated as PUNCT or compound? Keep dotted names intact only if no spaces!)
         if _is_lean_ident_start(ch):
-            j = i + 1
-            while j < n and _is_lean_ident_continue(text[j]):
-                j += 1
-            # Attach dotted projection/namespace suffixes `a.b.c` cleanly
-            while j + 1 < n and text[j] == "." and _is_lean_ident_start(text[j + 1]):
-                j += 2
-                while j < n and _is_lean_ident_continue(text[j]):
-                    j += 1
+            # Identifier with dotted projection/namespace suffixes `a.b.c`
+            m_id = _LEAN_IDENT_RE.match(text, i)
+            j = m_id.end() if m_id is not None else i + 1
             tokens.append(Token("IDENT", text[i:j], i, j, line))
             i = j
             continue
 
         if ch.isdigit():
-            j = i + 1
-            while j < n and (text[j].isalnum() or text[j] == "_"):
-                j += 1
+            m_num = _LEAN_NUMBER_RE.match(text, i)
+            j = m_num.end() if m_num is not None else i + 1
             tokens.append(Token("NUMBER", text[i:j], i, j, line))
             i = j
             continue
@@ -2648,6 +3559,40 @@ def _flip_pol(pol: str) -> str:
     return "neg" if pol == "pos" else "pos"
 
 
+_LEAN_BINDER_BRACKETS: dict[str, str] = {"(": ")", "{": "}", "[": "]", "⦃": "⦄"}
+
+
+def _lean_binder_types(toks: list[Token]) -> list[list[Token]]:
+    """Types of Lean binders `(a b : T)`, `{x : T}`, `[inst : C]`, `⦃h : P⦄`, or bare `x y : T`."""
+    out: list[list[Token]] = []
+    i = 0
+    n = len(toks)
+    while i < n:
+        t = toks[i].text
+        if t in _LEAN_BINDER_BRACKETS:
+            close = _find_matching_delim(toks, i, t, _LEAN_BINDER_BRACKETS[t])
+            inner = toks[i + 1 : close]
+            depth = 0
+            for k, it in enumerate(inner):
+                if it.text in ("(", "[", "{", "⦃"):
+                    depth += 1
+                elif it.text in (")", "]", "}", "⦄"):
+                    depth = max(0, depth - 1)
+                elif depth == 0 and it.text == ":":
+                    ty = inner[k + 1 :]
+                    # strip default value `(x : T := v)`
+                    cut = next((m for m, tt in enumerate(ty) if tt.text == ":="), len(ty))
+                    out.append(ty[:cut])
+                    break
+            i = close + 1
+            continue
+        if t == ":":
+            out.append(toks[i + 1 :])
+            break
+        i += 1
+    return out
+
+
 def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token]:
     """Recursive-descent Lean propositional polarity checker returning any positive-polarity assumes tokens."""
     # Strip outer parens
@@ -2660,17 +3605,23 @@ def _check_lean_prop_polarity(toks: list[Token], pol: str = "pos") -> list[Token
     if not toks:
         return []
 
-    # Strip leading `∀ ... ,` or `∃ ... ,` quantifiers at depth 0
-    if toks[0].text in ("∀", "∃", "forall", "exists"):
+    # Leading `∀ binders, body` / `∃ binders, body`: a `∀ (h : T), B` binder type `T` is an
+    # ANTECEDENT (`T → B`, flipped polarity); an `∃ (h : T), B` binder type is a conjunct
+    # (`T ∧ B`, same polarity).
+    if toks[0].text in ("∀", "∃", "forall", "exists", "∃!"):
         depth = 0
         for idx in range(1, len(toks)):
             t = toks[idx].text
-            if t in ("(", "[", "{"):
+            if t in ("(", "[", "{", "⦃"):
                 depth += 1
-            elif t in (")", "]", "}"):
+            elif t in (")", "]", "}", "⦄"):
                 depth = max(0, depth - 1)
             elif depth == 0 and t == ",":
-                return _check_lean_prop_polarity(toks[idx + 1 :], pol)
+                binder_pol = _flip_pol(pol) if toks[0].text in ("∀", "forall") else pol
+                bad_binders: list[Token] = []
+                for ty in _lean_binder_types(toks[1:idx]):
+                    bad_binders.extend(_check_lean_prop_polarity(ty, binder_pol))
+                return bad_binders + _check_lean_prop_polarity(toks[idx + 1 :], pol)
 
     # Lowest precedence: `↔` / `<->` (both polarities!)
     for op in ("↔", "<->"):
@@ -2824,9 +3775,25 @@ def scan_lean_assumption_polarity(
 
             # Inspect statement (for theorem/lemma) or Prop body (for `: Prop :=` def/abbrev)
             target_slices: list[list[Token]] = []
+            binder_bad: list[Token] = []
             if kw in ("theorem", "lemma") and colon_idx != -1:
                 stmt_end = assign_idx if assign_idx != -1 else k
                 target_slices.append(tokens[colon_idx + 1 : stmt_end])
+                # Signature binders `(h : T)` are hypotheses: `theorem t (h : T) : B` is
+                # `T → B`, so each binder type is checked in NEGATIVE polarity.
+                for ty in _lean_binder_types(tokens[j + 2 : colon_idx]):
+                    binder_bad.extend(_check_lean_prop_polarity(ty, "neg"))
+            if binder_bad:
+                findings.append(
+                    _make_peer_finding(
+                        "assumption_positive_polarity",
+                        decl_name,
+                        binder_bad[0].line or decl_line,
+                        f"assumption `{binder_bad[0].text}` appears in positive polarity inside a hypothesis binder",
+                        file_path=file_path,
+                    )
+                )
+                target_slices = []
             elif kw in ("def", "abbrev") and colon_idx != -1 and assign_idx != -1:
                 ret_slice = tokens[colon_idx + 1 : assign_idx]
                 if any(t.text == "Prop" for t in ret_slice):
@@ -2911,7 +3878,12 @@ def scan_lean_invariant_struct_sealing(
             i = j + (2 if end_name else 1)
             continue
 
-        if tokens[j].text == "structure" and j + 1 < n and tokens[j + 1].kind == "IDENT":
+        if (
+            tokens[j].text in ("structure", "class")
+            and j + 1 < n
+            and tokens[j + 1].kind == "IDENT"
+            and tokens[j + 1].text not in ("inductive", "abbrev")
+        ):
             raw_name = tokens[j + 1].text
             struct_line = tokens[j].line
             qual_name = ".".join(ns_stack + [raw_name]) if ns_stack else raw_name
@@ -2967,7 +3939,7 @@ def scan_lean_invariant_struct_sealing(
                         and tokens[b].kind == "IDENT"
                         and tokens[b].text == "private"
                         and tokens[b + 1].kind == "IDENT"
-                        and tokens[b + 1].text == "mk"
+                        and "." not in tokens[b + 1].text
                         and tokens[b + 2].text == "::"
                     ):
                         sealed_ok = True

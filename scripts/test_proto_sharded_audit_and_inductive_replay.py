@@ -122,15 +122,23 @@ class TestCrossLanguageParityAndHygiene(unittest.TestCase):
             self.assertIn(f'"{g["guard_id"]}"', lean_text)
             self.assertIn(f'"{g["canonical_name"]}"', lean_text)
             self.assertIn(f'"{g["vacuity_class"]}"', lean_text)
-        # All 12 + 9 + 6 violation codes match Lean 1-for-1
+        # All 13 + 10 + 6 violation codes match Lean 1-for-1
         for code in proto.INDUCTIVE_REPLAY_VIOLATION_CODES:
             self.assertIn(f'"{code}"', lean_text)
         for code in proto.SHARD_AUDIT_VIOLATION_CODES:
             self.assertIn(f'"{code}"', lean_text)
         for code in proto.PEER_GUARD_VIOLATION_CODES:
             self.assertIn(f'"{code}"', lean_text)
-        self.assertEqual(len(proto.INDUCTIVE_REPLAY_VIOLATION_CODES), 12)
-        self.assertEqual(len(proto.SHARD_AUDIT_VIOLATION_CODES), 9)
+        self.assertEqual(len(proto.INDUCTIVE_REPLAY_VIOLATION_CODES), 13)
+        self.assertEqual(len(proto.SHARD_AUDIT_VIOLATION_CODES), 10)
+        # Exact ORDER parity: extract each Lean `asStr` table and compare to the Python tuple.
+        for ns, codes in (
+            ("InductiveReplayViolationCode", proto.INDUCTIVE_REPLAY_VIOLATION_CODES),
+            ("ShardAuditViolationCode", proto.SHARD_AUDIT_VIOLATION_CODES),
+            ("PeerGuardViolationCode", proto.PEER_GUARD_VIOLATION_CODES),
+        ):
+            block = lean_text.split(f"namespace {ns}", 1)[1].split("def all", 1)[0]
+            self.assertEqual(tuple(re.findall(r'=> "([a-z_]+)"', block)), codes, ns)
         self.assertEqual(len(proto.PEER_GUARD_VIOLATION_CODES), 6)
 
     def test_02_ranks_and_ids_disjoint_from_baseline_spec_boundary_guards(self) -> None:
@@ -172,7 +180,9 @@ class TestCrossLanguageParityAndHygiene(unittest.TestCase):
 
 class TestPillar1InductiveReplay(unittest.TestCase):
     def test_06_fake_false_passes_vulnerable_replay_but_caught_by_hardened_check(self) -> None:
-        consts, k_ind, k_ctor = _make_valid_unit_and_nat_fixture()
+        base, k_ind, k_ctor = _make_valid_unit_and_nat_fixture()
+        # NameSet iteration visits FakeFalse BEFORE Unit (attacker-chosen names).
+        consts: dict[str, dict] = {}
         consts["FakeFalse"] = {
             "name": "FakeFalse",
             "kind": "inductive",
@@ -186,13 +196,58 @@ class TestPillar1InductiveReplay(unittest.TestCase):
             "is_reflexive": False,
             "is_unsafe": False,
         }
+        consts.update(base)
         vuln = proto.simulate_vulnerable_replay(consts, k_ind, k_ctor)
-        self.assertTrue(vuln["accepted"])
+        self.assertTrue(vuln["accepted"], vuln)
         self.assertNotIn("FakeFalse", vuln["replayed_inductives"])
 
         viols = proto.check_inductive_replay_integrity(consts, k_ind, k_ctor)
         codes = {v["code"] for v in viols}
         self.assertIn("self_not_in_all", codes)
+
+    def test_06b_vulnerable_model_is_faithful_order_sensitive_and_checks_recursors(self) -> None:
+        """B1: mirrors Lean `fakeFalse_unitFirst_rejected_by_vulnerable_kernel` and
+        `fakeFalseWithRec_rejected_by_vulnerable_postponedRecursors`."""
+        base, k_ind, k_ctor = _make_valid_unit_and_nat_fixture()
+        fake = {
+            "name": "FakeFalse", "kind": "inductive", "level_params": [], "type": "Prop",
+            "num_params": 0, "num_indices": 0, "all": ["Unit"], "ctors": [],
+            "is_rec": False, "is_reflexive": False, "is_unsafe": False,
+        }
+        # Unit visited first: the second `inductDecl [Unit]` is "already declared".
+        unit_first = dict(base)
+        unit_first["FakeFalse"] = fake
+        res = proto.simulate_vulnerable_replay(unit_first, k_ind, k_ctor)
+        self.assertFalse(res["accepted"])
+        self.assertIn("already declared", res["error"])
+        # Shipping the eliminator FakeFalse.rec is caught by 4.34.1 checkPostponedRecursors.
+        k_rec = {
+            "Unit.rec": {"name": "Unit.rec", "kind": "recursor", "all": ["Unit"], "k": True},
+            "Nat.rec": {"name": "Nat.rec", "kind": "recursor", "all": ["Nat"], "k": False},
+        }
+        with_rec = {"FakeFalse": fake, **base,
+                    "FakeFalse.rec": {"name": "FakeFalse.rec", "kind": "recursor", "all": ["FakeFalse"], "k": False}}
+        res = proto.simulate_vulnerable_replay(with_rec, k_ind, k_ctor, k_rec)
+        self.assertFalse(res["accepted"])
+        self.assertEqual(res["error"], "postponed recursor mismatch")
+        viols = proto.check_inductive_replay_integrity(with_rec, k_ind, k_ctor, k_rec)
+        self.assertIn(("recursor_mismatch", "FakeFalse.rec"), {(v["code"], v["subject"]) for v in viols})
+        # A forged `k` flag on a shipped recursor is caught by the hardened checker.
+        forged = dict(base)
+        forged["Nat.rec"] = dict(k_rec["Nat.rec"], k=True)
+        viols = proto.check_inductive_replay_integrity(forged, k_ind, k_ctor, k_rec)
+        self.assertIn(("recursor_mismatch", "Nat.rec"), {(v["code"], v["subject"]) for v in viols})
+
+    def test_06c_post_replay_check_fails_closed_on_omitted_fields(self) -> None:
+        """B1: a forged stored entry must not pass by OMITTING the field it lies about."""
+        consts, k_ind, k_ctor = _make_valid_unit_and_nat_fixture()
+        del consts["Nat"]["type"]
+        del consts["Nat"]["num_indices"]
+        del consts["Nat.succ"]["num_fields"]
+        codes = {(v["code"], v["subject"]) for v in proto.check_inductive_replay_integrity(consts, k_ind, k_ctor)}
+        self.assertIn(("indices_mismatch", "Nat"), codes)
+        self.assertIn(("mutual_metadata_mismatch", "Nat"), codes)
+        self.assertIn(("ctor_induct_mismatch", "Nat.succ"), codes)
 
     def test_07_forged_indices_and_is_rec_passes_vulnerable_but_caught_by_postponed_check(self) -> None:
         consts, k_ind, k_ctor = _make_valid_unit_and_nat_fixture()
@@ -206,7 +261,7 @@ class TestPillar1InductiveReplay(unittest.TestCase):
         self.assertIn("indices_mismatch", codes)
         self.assertIn("is_rec_mismatch", codes)
 
-    def test_08_all_twelve_inductive_violation_codes_caught(self) -> None:
+    def test_08_all_thirteen_inductive_violation_codes_caught(self) -> None:
         # 1. key_mismatch
         c, ki, kc = _make_valid_unit_and_nat_fixture()
         c["WrongKey"] = c.pop("Unit")
@@ -277,6 +332,12 @@ class TestPillar1InductiveReplay(unittest.TestCase):
         self.assertIn("indices_mismatch", post_codes)
         self.assertIn("is_rec_mismatch", post_codes)
 
+        # 13. recursor_mismatch
+        c, ki, kc = _make_valid_unit_and_nat_fixture()
+        kr = {"Nat.rec": {"name": "Nat.rec", "kind": "recursor", "num_minors": 2}}
+        c["Nat.rec"] = {"name": "Nat.rec", "kind": "recursor", "num_minors": 3}
+        self.assertIn("recursor_mismatch", {v["code"] for v in proto.check_inductive_replay_integrity(c, ki, kc, kr)})
+
     def test_09_valid_mutual_inductive_block_passes_cleanly(self) -> None:
         mut_a = {
             "name": "Even", "kind": "inductive", "level_params": [], "type": "Nat -> Prop",
@@ -303,16 +364,51 @@ class TestPillar1InductiveReplay(unittest.TestCase):
         self.assertEqual(viols, [])
 
     def test_10_live_olean_inspection_on_trusted_and_proto_zero_violations(self) -> None:
-        res = proto.inspect_live_oleans(
-            REPO_ROOT,
-            import_modules=["Trusted", "Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"],
-            exact_modules=["Trusted", "Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"],
+        # B1: audit EVERY Trusted.* module directly (the `Trusted` umbrella alone has zero
+        # declarations) and re-send every inductive block to the real kernel.
+        trusted_mods = sorted(
+            m for m, info in proto.discover_repo_modules(REPO_ROOT).items()
+            if info["root_group"] == "trusted" and info["has_olean"]
         )
+        mods = trusted_mods + ["Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"]
+        res = proto.inspect_live_oleans(REPO_ROOT, import_modules=mods, exact_modules=mods)
         self.assertEqual(res["violations"], [], f"Unexpected live .olean violations: {res}")
-        self.assertEqual(res["modules_checked"], 2)
-        self.assertGreater(res["inductives_checked"], 0)
-        self.assertGreater(res["ctors_checked"], 0)
+        self.assertEqual(res["modules_checked"], len(mods))
+        self.assertGreater(res["inductives_checked"], 100)
+        self.assertGreater(res["ctors_checked"], 100)
+        self.assertTrue(res["kernel_replay_enabled"])
+        self.assertGreaterEqual(res["kernel_blocks_checked"], res["inductives_checked"] // 2)
+        self.assertEqual(res["kernel_blocks_unresolved"], 0)
         self.assertTrue(set(res["axioms_reached"]).issubset(proto.PERMITTED_FOUNDATIONAL_AXIOMS))
+
+    def test_10b_synthetic_forged_oleans_caught_only_with_kernel_replay(self) -> None:
+        """B1: forge real compiled `.olean`s (lean4#16717 metadata lies) and feed them through the
+        live pipeline. Name/structure-only checks (A0) miss 5/6 forgeries; the kernel
+        `checkPostponedInductives` replay catches all 6."""
+        mod = "Anneal.Proto.InductiveReplayAndPeerSpecGuardsProto"
+        enum_ind = mod + ".PeerSpecGuardClass"
+        struct_ind = mod + ".SimInductVal"
+        cases = [
+            ("flip_is_rec", enum_ind, "is_rec_mismatch"),
+            ("bump_num_indices", enum_ind, "indices_mismatch"),
+            ("drop_self_from_all", enum_ind, "self_not_in_all"),
+            ("flip_is_reflexive", enum_ind, "mutual_metadata_mismatch"),
+            ("flip_rec_k", struct_ind, "recursor_mismatch"),
+            ("bump_ctor_fields", struct_ind, "ctor_induct_mismatch"),
+        ]
+        missed_without_kernel = 0
+        with tempfile.TemporaryDirectory(prefix="anneal-forged-olean-") as tmp_str:
+            for mutation, target, expected in cases:
+                out = Path(tmp_str) / f"{mutation}.olean"
+                proto.forge_olean_fixture(REPO_ROOT, mod, target, mutation, out)
+                hard = proto.inspect_live_oleans(REPO_ROOT, [mod], [mod], olean_overrides={mod: str(out)})
+                self.assertIn(expected, {v["code"] for v in hard["violations"]}, (mutation, hard["violations"]))
+                weak = proto.inspect_live_oleans(
+                    REPO_ROOT, [mod], [mod], kernel_replay_inductives=False, olean_overrides={mod: str(out)}
+                )
+                if not weak["violations"]:
+                    missed_without_kernel += 1
+        self.assertEqual(missed_without_kernel, 5)
 
 
 class TestPillar2ShardedAuditAndOrphanGate(unittest.TestCase):
@@ -334,6 +430,56 @@ class TestPillar2ShardedAuditAndOrphanGate(unittest.TestCase):
         self.assertTrue(res["under_250ms"], f"Expected <0.25s, got {res['elapsed_sec']}s")
         self.assertLess(res["elapsed_sec"], 0.25)
         self.assertGreater(res["on_disk_count"], 150)
+
+    def test_12b_orphan_gate_uses_lakefile_ownership_not_tautology(self) -> None:
+        """B1: A0 compared discovered modules against THEMSELVES (registered = on_disk), so an
+        unowned `.lean` file could never be reported. The gate now derives registration from
+        `lakefile.toml` `[[lean_lib]]` srcDir/roots/globs (Lake `isBuildableModule`)."""
+        with tempfile.TemporaryDirectory(prefix="anneal-orphan-fixture-") as tmp_str:
+            root = Path(tmp_str)
+            (root / "lakefile.toml").write_text(
+                'name = "Fx"\n\n[[lean_lib]]\nname = "Anneal"\nsrcDir = "theory"\n\n'
+                '[[lean_lib]]\nname = "Spec"\nsrcDir = "spec"\nglobs = ["Spec.+"]\n',
+                encoding="utf-8",
+            )
+            (root / "theory" / "Anneal").mkdir(parents=True)
+            (root / "spec" / "Spec").mkdir(parents=True)
+            (root / "theory" / "Anneal.lean").write_text(
+                "/- header -/\nimport Anneal.A -- trailing\n\ndef x := 1\n", encoding="utf-8"
+            )
+            (root / "theory" / "Anneal" / "A.lean").write_text("def a := 1\n", encoding="utf-8")
+            (root / "theory" / "Anneal" / "B.lean").write_text("def b := 1\n", encoding="utf-8")
+            (root / "theory" / "Rogue.lean").write_text("axiom bad : False\n", encoding="utf-8")
+            (root / "spec" / "Spec" / "Ok.lean").write_text("def ok := 1\n", encoding="utf-8")
+            (root / "spec" / "Stray.lean").write_text("def stray := 1\n", encoding="utf-8")
+            res = proto.run_orphan_only_gate(root)
+            orphans = {v["subject"] for v in res["violations"] if v["code"] == "unregistered_on_disk_orphan"}
+            self.assertEqual(orphans, {"Rogue", "Stray"})
+            self.assertFalse(res["ok"])
+            self.assertIn("Anneal.B", res["outside_lib_root_import_closure"])
+            self.assertNotIn("Anneal.A", res["outside_lib_root_import_closure"])
+            # Case-fold collision `Anneal.A` vs `Anneal.a` (distinct files on case-sensitive FS).
+            (root / "theory" / "Anneal" / "a.lean").write_text("def a2 := 1\n", encoding="utf-8")
+            if (root / "theory" / "Anneal" / "A.lean").read_text(encoding="utf-8") == "def a := 1\n":
+                res2 = proto.run_orphan_only_gate(root)
+                coll = {v["subject"] for v in res2["violations"] if v["code"] == "module_name_collision"}
+                self.assertEqual(coll, {"Anneal.A", "Anneal.a"})
+        self.assertTrue(proto.lake_is_buildable_module(
+            {"name": "L", "roots": ["L"], "globs": ["L"]}, "L.Deep.Sub"))
+        self.assertFalse(proto.lake_is_buildable_module(
+            {"name": "L", "roots": ["L"], "globs": ["L"]}, "Lx.Deep"))
+        self.assertTrue(proto.lake_is_buildable_module(
+            {"name": "S", "roots": ["S"], "globs": ["S.*"]}, "S.X"))
+        self.assertFalse(proto.lake_is_buildable_module(
+            {"name": "S", "roots": ["S"], "globs": ["S.*"]}, "T.X"))
+
+    def test_12c_live_registry_covers_minirust_spec_srcdir(self) -> None:
+        """B1: A0 discovery skipped the `MiniRustSpec` lean_lib (`minirust/lean`, 70 files)."""
+        discovered = proto.discover_repo_modules(REPO_ROOT)
+        minirust = [m for m in discovered if m == "MiniRustSpec" or m.startswith("MiniRustSpec.")]
+        self.assertGreater(len(minirust), 50)
+        plan = proto.plan_subsystem_shards(REPO_ROOT)
+        self.assertTrue(set(minirust).issubset(set(plan["shards"]["Anneal.RustcMir"])))
 
     def test_13_shard_partition_catches_all_seven_malformed_partition_cases(self) -> None:
         self.assertIn("empty_shard_list", {v["code"] for v in proto.check_shard_partition(["A"], ["A"], [])})
@@ -357,6 +503,11 @@ class TestPillar2ShardedAuditAndOrphanGate(unittest.TestCase):
         self.assertIn(
             "unregistered_on_disk_orphan",
             {v["code"] for v in proto.check_shard_partition(["A"], ["A", "Orphan"], [["A"]])},
+        )
+        self.assertIn(
+            "module_name_collision",
+            {v["code"] for v in proto.check_shard_partition(
+                ["Anneal.Foo", "Anneal.foo"], ["Anneal.Foo", "Anneal.foo"], [["Anneal.Foo"], ["Anneal.foo"]])},
         )
 
     def test_14_three_hop_cross_shard_bad_axiom_caught_by_shard1(self) -> None:
@@ -482,6 +633,34 @@ class TestPillar3Guard3UnsatisfiableExternEnsures(unittest.TestCase):
         self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(src), [])
 
 
+    def test_20b_cfg_attr_trusted_body_and_literal_folding_redteam(self) -> None:
+        """B1: A0 missed contracts behind `cfg_attr`, trusted-body (`#[trusted]` /
+        `#[verifier::external_body]`) callables, and constant-false literal comparisons."""
+        bad = {
+            "cfg_attr": 'extern "C" { #[cfg_attr(creusot, ensures(false))] fn f(x: u32) -> u32; }',
+            "nested_cfg_attr_external_spec": (
+                "#[cfg_attr(all(creusot, x), cfg_attr(y, external_spec(for = a::b, ensures: |_| false)))]\n"
+                "fn g() -> u32;"
+            ),
+            "trusted_body": "#[trusted]\n#[ensures(false)]\nfn rv(p: *const u32) -> u32 { unsafe { *p } }",
+            "verus_external_body": "#[verifier::external_body]\n#[ensures(false)]\nfn rv2() -> u32 { 0 }",
+            "literal_eq": 'extern "C" { #[ensures(1 == 2)] fn h(x: u32) -> u32; }',
+            "literal_lt_suffix": 'extern "C" { #[ensures(5u8 < 0x1)] fn h(x: u32) -> u32; }',
+            "negated_tautology": 'extern "C" { #[ensures(!(1 == 1))] fn h(x: u32) -> u32; }',
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                self.assertEqual(len(proto.scan_rust_unsatisfiable_extern_ensures(src)), 1, name)
+        ok = {
+            "verified_body_not_trusted": "#[ensures(false)]\nfn diverge() -> u32 { loop {} }",
+            "literal_true": 'extern "C" { #[ensures(1 < 2)] fn h(x: u32) -> u32; }',
+            "trusted_diverging": "#[trusted]\n#[ensures(false)]\nfn die() -> ! { loop {} }",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_rust_unsatisfiable_extern_ensures(src), [], name)
+
+
 class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
     def test_21_catches_fndef_value_bind_coercion_higher_order_and_closure(self) -> None:
         src = """
@@ -526,11 +705,40 @@ class TestPillar3Guard4FnDefGhostTokenCoercion(unittest.TestCase):
         fn main() {
             let _msg = r#"let f = Tokens::new;"#;
             let _ch = '"';
-            let _tok = Tokens::new();
-            let _tok2 = creusot_std::ghost::Tokens::new::<()>();
+            let _tok = creusot_std::ghost::Tokens::new::<()>();
         }
         '''
         self.assertEqual(proto.scan_rust_fndef_ghost_token_coercion(src), [])
+
+    def test_23b_single_entry_authority_ufcs_and_alias_redteam(self) -> None:
+        """B1: A0 allowed ANY number of direct `Tokens::new()` calls anywhere (Lean guard allows
+        exactly one `directEntryCall true`), missed `<Tokens>::new` UFCS values, and only
+        followed `as` aliases of the literal name `Tokens`."""
+        cases = {
+            "two_calls_in_main": "fn main() { let a = Tokens::new(); let b = Tokens::new(); }",
+            "call_in_loop": "fn main() { for _ in 0..2 { let t = Tokens::new(); } }",
+            "call_in_while": "fn main() { while go() { let t = Tokens::new(); } }",
+            "call_outside_main": "fn helper() { let a = Tokens::new(); }",
+            "ufcs_value": "fn main() { let f = <Tokens>::new; }",
+            "ufcs_as_trait_value": "fn main() { let f = <Tokens as Mint>::new; }",
+            "type_alias_value": "type T = creusot_std::ghost::Tokens;\nfn main() { let f = T::new; }",
+            "custom_ctor_type_alias": (
+                "use crate::Auth as A;\nstruct Auth;\nimpl Auth { #[ghost_token_ctor] fn issue() -> Self { Auth } }\n"
+                "fn main() { let f = A::issue; }"
+            ),
+            "second_alias_in_group": (
+                "use creusot_std::ghost::{Other as O, Tokens as T};\nfn main() { let f = T::new; }"
+            ),
+            "cfg_attr_ctor": (
+                "struct Auth;\nimpl Auth { #[cfg_attr(creusot, ghost_token_ctor)] fn issue() -> Self { Auth } }\n"
+                "fn main() { call_twice(Auth::issue); }"
+            ),
+        }
+        for name, src in cases.items():
+            with self.subTest(name=name):
+                self.assertTrue(proto.scan_rust_fndef_ghost_token_coercion(src), name)
+        ok = "impl Mint for X { fn go() {} }\nfn main() { let t = Tokens::new(); for x in v { use_it(x); } }"
+        self.assertEqual(proto.scan_rust_fndef_ghost_token_coercion(ok), [])
 
 
 class TestPillar3Guard5ExternalTypeDropOmission(unittest.TestCase):
@@ -596,6 +804,34 @@ class TestPillar3Guard5ExternalTypeDropOmission(unittest.TestCase):
         struct ExModeled(DropRes);
         """
         self.assertEqual(proto.scan_rust_external_type_drop_omission(src), [])
+
+
+    def test_26b_type_alias_and_foreign_type_fail_closed_redteam(self) -> None:
+        """B1: A0 missed drop glue behind `type` aliases and treated every foreign wrapped type
+        (the normal case for `external_type_specification`!) as drop-free."""
+        bad = {
+            "alias_to_vec": "type Bytes = Vec<u8>;\n#[external_type_specification]\nstruct ExAl(Bytes);",
+            "generic_alias": "type Buf<T> = Box<T>;\n#[external_type_specification]\nstruct ExGA(Buf<u8>);",
+            "foreign_type": "#[external_type_specification]\nstruct ExF(other_crate::Foo);",
+            "foreign_for_target": "#[external_type_specification(for = other::Bar)]\nstruct ExBar;",
+            "lying_no_drop_glue": (
+                "struct D; impl Drop for D { fn drop(&mut self) {} }\n"
+                "#[external_type_specification]\n#[no_drop_glue]\nstruct ExL(D);"
+            ),
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                hits = proto.scan_rust_external_type_drop_omission(src)
+                self.assertEqual([h["code"] for h in hits], ["external_type_drop_omission"], name)
+        ok = {
+            "array_len_const": "const N: usize = 4;\n#[external_type_specification]\nstruct ExArr([u32; N]);",
+            "generic_param": "#[external_type_specification]\nstruct ExOpt<T>(Option<T>);",
+            "asserted_no_drop_foreign": "#[external_type_specification]\n#[no_drop_glue]\nstruct ExP(other::Pod);",
+            "modeled_foreign": "#[external_type_specification]\n#[models_drop]\nstruct ExM(other::Res);",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_rust_external_type_drop_omission(src), [], name)
 
 
 class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
@@ -712,6 +948,33 @@ class TestPillar3Guard6AssumptionPolarityAndStructSealing(unittest.TestCase):
             [],
         )
         self.assertEqual(proto.scan_lean_invariant_struct_sealing(lean_src), [])
+
+    def test_30b_binder_polarity_raw_strings_class_and_ctor_names_redteam(self) -> None:
+        """B1: A0 ignored hypothesis/quantifier binder types (`(h : A → P) : Q` puts `A` in
+        POSITIVE polarity), desynchronized on Lean raw strings `r#"..."#`, skipped `class`,
+        and rejected sealed ctors not literally named `mk`."""
+        bad = {
+            "hyp_binder": "theorem t (i s : EvalRes Nat) (h : i.assumesHold = true → s.output = i.output) : True := by sorry",
+            "forall_binder": "theorem t : ∀ (h : implAssumes s → s.out = 1), False := by sorry",
+            "strict_implicit_binder": "theorem t ⦃h : (implAssumes s → False) → True⦄ : True := by sorry",
+            "raw_string_desync": 'def s : String := r#"a \" -/ /- b"#\ntheorem t (i s : EvalRes Nat) : s.output = i.output → i.assumesHold = true := by sorry',
+        }
+        for name, src in bad.items():
+            with self.subTest(name=name):
+                self.assertTrue(proto.scan_lean_assumption_polarity(src), name)
+        ok = {
+            "hyp_binder_negative": "theorem t (i s : EvalRes Nat) (h : i.assumesHold = true) : s.output = i.output := by sorry",
+            "exists_binder_negative_body": "theorem t : (∃ (h : implAssumes s), True) → False := by sorry",
+        }
+        for name, src in ok.items():
+            with self.subTest(name=name):
+                self.assertEqual(proto.scan_lean_assumption_polarity(src), [], name)
+        seal_bad = "-- @sealed_invariant\nclass Cap where\n  val : Nat\n"
+        self.assertEqual(len(proto.scan_lean_invariant_struct_sealing(seal_bad)), 1)
+        seal_ok = "-- @sealed_invariant\nstructure Cap2 where\n  private mkCap ::\n  val : Nat\n"
+        self.assertEqual(proto.scan_lean_invariant_struct_sealing(seal_ok), [])
+        seal_raw = 'def s : String := r"structure Victim where private mk ::"\n-- @sealed_invariant\nstructure Victim where\n  val : Nat\n'
+        self.assertEqual([h["subject"] for h in proto.scan_lean_invariant_struct_sealing(seal_raw)], ["Victim"])
 
     def test_31_live_repo_sweep_zero_false_positives_on_theory_and_anneal_spec(self) -> None:
         res = proto.scan_live_repo_peer_guards(REPO_ROOT)
