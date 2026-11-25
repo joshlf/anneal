@@ -658,6 +658,17 @@ class PeerGuardScannerTests(unittest.TestCase):
         ns_head = "namespace Foo\n/-- @invariant -/\nstructure R where\n  private mk ::\n  lo : Nat\nend Foo\n\n"
         self.assert_violation(ns_head + "def leak (n : Nat) : Foo.R := Foo.R.mk n\n", "6b", "raw constructor")
 
+    def test_6a_spelling_renaming_and_notation_bypasses_rejected(self):
+        self.assert_violation("theorem t : True \u2227 \u00abassumesHold\u00bb := sorry\n", "6a", "positive")
+        self.assert_violation("theorem t : True \u2227 _root_.assumesHold := sorry\n", "6a", "positive")
+        self.assert_violation("theorem t : True \u2227 Verifrag.\u00abassumesHold\u00bb := sorry\n", "6a", "positive")
+        self.assert_violation("open Verifrag renaming assumesHold \u2192 ok\ntheorem t : True \u2227 ok := sorry\n",
+                              "6a", "positive")
+        scan_text("open Verifrag renaming assumesHold \u2192 ok\ntheorem t : ok \u2192 True := fun _ => trivial\n")
+        self.assert_violation("local notation \"AH\" => assumesHold\ntheorem t : AH := sorry\n", "6a", "notation")
+        self.assert_violation("macro \"AH\" : term => `(assumesHold)\ntheorem t : AH := sorry\n", "6a", "notation")
+        self.assert_violation("def h : Prop := assumesHold \u2192 True\nnotation \"H\" => h\n", "6a", "notation")
+
     def test_live_theory_has_zero_false_positives(self):
         summary = sta.scan_peer_guards([REPO / "theory/Anneal"])
         self.assertGreater(summary["files"], 50)

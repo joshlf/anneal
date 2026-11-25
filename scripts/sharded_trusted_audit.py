@@ -518,7 +518,11 @@ DECL_KEYWORDS = {"theorem", "lemma", "def", "abbrev", "instance", "example", "ax
 # Commands that end the preceding declaration without starting a scanned one.
 COMMAND_STOPS = {"inductive", "structure", "class", "namespace", "section", "end", "open", "mutual", "attribute",
                  "set_option", "universe", "deriving", "macro", "syntax", "notation", "infix", "infixl", "infixr",
-                 "prefix", "postfix", "#check", "#eval", "#print", "#guard_msgs", "#reduce"}
+                 "prefix", "postfix", "#check", "#eval", "#print", "#guard_msgs", "#reduce", "macro_rules", "elab",
+                 "elab_rules", "export"}
+# Commands that can bind a new surface syntax to an arbitrary term (hiding the atom's polarity).
+NOTATION_COMMANDS = {"notation", "macro", "macro_rules", "syntax", "elab", "elab_rules", "infix", "infixl", "infixr",
+                     "prefix", "postfix"}
 OPEN = {"(": ")", "[": "]", "{": "}", "⦃": "⦄", "⟨": "⟩"}
 CLOSE = set(OPEN.values())
 _TOKEN = re.compile(
@@ -577,11 +581,29 @@ def _tokenize_rich(text: str) -> list[tuple[str, int, int]]:
         line += clean.count("\n", last, match.start())
         last = match.start()
         token = match.group(0)
-        namespace, _, leaf = token.rpartition(".")
-        # `.assumesHold` (dot notation) and `Other.assumesHold` name different constants.
-        if leaf in ASSUMPTION_ATOMS and (namespace not in ATOM_NAMESPACES or (tokens and tokens[-1][0] == ".")):
-            token = f"{token}\u2020"
+        # `«assumesHold»` and `_root_.assumesHold` are the same constant as `assumesHold`.
+        name = token.replace("\u00ab", "").replace("\u00bb", "")
+        name = name[len("_root_."):] if name.startswith("_root_.") else name
+        namespace, _, leaf = name.rpartition(".")
+        if leaf in ASSUMPTION_ATOMS:
+            # `.assumesHold` (dot notation) and `Other.assumesHold` name different constants.
+            dotted = bool(tokens) and tokens[-1][0] == "."
+            token = name if namespace in ATOM_NAMESPACES and not dotted else f"{name}\u2020"
         tokens.append((token, line, match.start()))
+    # `open Verifrag renaming assumesHold → ok`: later uses of `ok` are the atom.
+    aliases: set[str] = set()
+    for k, (t, line, _off) in enumerate(tokens):
+        if t == "renaming":
+            j = k + 1
+            while j + 2 < len(tokens) and tokens[j][1] == line:
+                if tokens[j + 1][0] in ("→", "->") and _is_atom(tokens[j][0]):
+                    aliases.add(tokens[j + 2][0])
+                    j += 3
+                else:
+                    j += 1
+    if aliases:
+        tokens = [(ASSUMPTION_ATOMS[0] if t in aliases and (k == 0 or tokens[k - 1][0] != ".") else t, line, off)
+                  for k, (t, line, off) in enumerate(tokens)]
     return tokens
 
 
@@ -895,6 +917,15 @@ def assumption_helpers(files: dict[str, list]) -> set[str]:
 def scan_polarity(path: str, toks: list, helpers: set[str]) -> None:
     """Guard 6a over one file: binders negative, declared types positive; helper bodies are
     positive propositions and every use of a helper elsewhere is an unclean leaf."""
+    depth = 0
+    for k, (t, line) in enumerate(toks):
+        depth += 1 if t in OPEN else -1 if t in CLOSE else 0
+        if depth == 0 and t in NOTATION_COMMANDS:
+            j = k + 1
+            while j < len(toks) and toks[j][0] not in DECL_KEYWORDS and toks[j][0] not in COMMAND_STOPS:
+                if _is_atom(toks[j][0]) or toks[j][0] in helpers or toks[j][0].split(".")[-1] in helpers:
+                    raise GuardViolation("6a", "assumption atom hidden behind notation or macro", path, toks[j][1])
+                j += 1
     for kw, name, sig, body, _start in _declarations(toks):
         others = helpers - {name}
         scanner = PolarityScanner(path, others)
