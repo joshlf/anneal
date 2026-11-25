@@ -853,17 +853,19 @@ def lmCfRun (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool)
 /-- Root-frame unwind check directly invoking vendored `Miri.Interpreter.Step.step` on a 1-frame
 stack lowered from `lmRootUnwindMirBody` via `translateBody`:
 returns `.error (.controlFlow (.undefinedBehavior "unwinding past the topmost stack frame"))`. -/
-def lmRootUnwindCheck : Except LmExecFailure Unit :=
-  match lmCfRun (fun s => .ok s) true
-      #[lmCfFrameOf lmRootUnwindMirBody (.mir ⟨0, 0⟩) (.stop false)] (lmInit false) with
+def lmRootUnwindCheck (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
+    Except LmExecFailure Unit :=
+  match lmCfRun exitCall true
+      #[lmCfFrameOf lmRootUnwindMirBody (.mir ⟨0, 0⟩) (.stop false)] st with
   | .ok _ => .ok ()
   | .error e => .error e
 
 /-- `TerminatorKind.unreachable` check directly invoking vendored `Miri.Interpreter.Step.step` on
 a frame lowered from `lmUnreachableMirBody` via `translateBody`. -/
-def lmUnreachableCheck : Except LmExecFailure Unit :=
-  match lmCfRun (fun s => .ok s) true
-      #[lmCfFrameOf lmUnreachableMirBody (.mir ⟨0, 0⟩) (.stop false)] (lmInit false) with
+def lmUnreachableCheck (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
+    Except LmExecFailure Unit :=
+  match lmCfRun exitCall true
+      #[lmCfFrameOf lmUnreachableMirBody (.mir ⟨0, 0⟩) (.stop false)] st with
   | .ok _ => .ok ()
   | .error e => .error e
 
@@ -1134,7 +1136,9 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     .ok (.okVal 102 102)
   -- Case 16: `TerminatorKind.unreachable` via vendored `ControlFlow.evalTerminator`.
   | 16 => do
-    lmUnreachableCheck
+    -- Executed over the mode-`tb` harness state with the REAL frame-exit operation (previously a
+    -- fresh `lmInit false` state with an identity exit, silently ignoring `tb`).
+    lmUnreachableCheck lmExitCall (lmInit tb)
     -- Fail-closed: reaching here would mean vendored `Unreachable` did NOT fault.
     .ok .invalidOrUnsupported
   -- Case 17: callee `FnEntry` + write 15, vendored `Unwind.pushPayload`, failing
@@ -1290,8 +1294,10 @@ def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
     let st := lmInit tb
     let (px, st) ← lmAllocStack st 4 align4
     let st ← lmStoreU32 st px 77
-    let _st ← lmStartUnwind st
-    lmRootUnwindCheck
+    let st ← lmStartUnwind st
+    -- The root frame unwinds over the SAME harness state that holds `x = 77` and the pushed
+    -- payload (previously discarded in favour of a fresh `lmInit false` state, ignoring `tb`).
+    lmRootUnwindCheck lmExitCall st
     -- Fail-closed: reaching here would mean the root-frame unwind did NOT fault.
     .ok .invalidOrUnsupported
   | _ => .ok .invalidOrUnsupported
@@ -1522,6 +1528,41 @@ theorem lm_tb_exact_failure_diagnostics :
       (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
   rw [lmCaseU.eq_src]
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **Exact typed-failure diagnostics in `treeBorrows = false` mode**: every mode-INSENSITIVE UB /
+abort cell of the basic-memory table fails for the SAME genuine vendored root cause as in Tree
+Borrows mode (dead allocation, in-bounds pointer-offset OOB, OOB access, `Unreachable`, root-frame
+unwind, `unwindTerminate`, `.Unreachable` unwind edge) — so the 56-cell agreement on these cells is
+not a coincidental `.ub` / `.abort` collapse of DIFFERENT basic-mode failures. Cases `16` and
+`26`/`27` now run over the mode-`tb` harness state (the root unwind over the SAME state that
+holds `x = 77` and the pushed payload). -/
+theorem lm_basic_exact_failure_diagnostics :
+    lmCase false 10 = .error (.access (.allocationLookup (.deadAllocation ⟨1, by decide⟩))) ∧
+    lmCase false 11 = .error (.pointerOffset (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 12 .inboundsPointerArithmetic))) ∧
+    lmCase false 12 = .error (.pointerOffset (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 (-4) .inboundsPointerArithmetic))) ∧
+    lmCase false 13 = .error (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨4⟩ 400 4 .memoryAccess)) ∧
+    lmCase false 16 = .error (.controlFlow (.undefinedBehavior "Unreachable")) ∧
+    lmCase false 26 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    lmCase false 27 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    lmCase false 18 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase false 19 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase false 20 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) ∧
+    lmCase false 22 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase false 24 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase false 25 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
+  rw [lmCaseU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- Exact LeanMiri Tree Borrows mode-sensitivity `↔` theorem: Cases `8` and `9` flip between
 `treeBorrows = false` and `treeBorrows = true`, and every other canonical case agrees. -/
@@ -2185,6 +2226,7 @@ theorem ep1_lean_miri_cross_frame_panic_capstone :
     (type_of% @lmCrossFramePanicObserve_out_of_range) ∧
     (type_of% @lmCrossFramePanicObserve_mode_sensitivity) ∧
     (type_of% @lm_tb_exact_failure_diagnostics) ∧
+    (type_of% @lm_basic_exact_failure_diagnostics) ∧
     (type_of% @lm_ptr_wrappingSignedOffset_roundtrip) ∧
     (type_of% @lm_controlFlow_unreachable_ub) ∧
     (type_of% @lm_controlFlow_unwindToBlock_laws) ∧
@@ -2200,6 +2242,7 @@ theorem ep1_lean_miri_cross_frame_panic_capstone :
     (type_of% @lm_stepMirFn_miri_lockstep_simulations) :=
   ⟨@lmCrossFramePanicObserve_table, @lmCrossFramePanicObserve_out_of_range,
    @lmCrossFramePanicObserve_mode_sensitivity, @lm_tb_exact_failure_diagnostics,
+   @lm_basic_exact_failure_diagnostics,
    @lm_ptr_wrappingSignedOffset_roundtrip, @lm_controlFlow_unreachable_ub,
    @lm_controlFlow_unwindToBlock_laws, @lm_controlFlow_root_unwind_ub, @lm_cf_assert_four_way,
    @lm_root_unwind_boundary_vs_catch_harness, @lm_case21_premature_parent_write_ub_contrast,
