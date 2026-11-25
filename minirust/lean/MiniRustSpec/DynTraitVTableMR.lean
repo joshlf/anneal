@@ -54,16 +54,26 @@ The trailing corpus interface (`dvTrustedObserve`, `dvMrObserve`,
 stepsTB}` directly (no shadow evaluator) and exports kernel-checked 32-key
 table lemmas consumed by `Anneal.Mir.DynTraitVTableBundle`.
 
-Cross-authority divergences and modelling notes documented by the theorems of
-this module:
-- **MiniRust `VTableMethodLookup` on a missing method is `Stop.specPanic`**,
-  while Trusted (and Miri) report UB for a non-method or out-of-bounds slot
-  (`dv_v3_nonMethod_slot_ub_vs_minirust_specPanic`).
-- **MiniRust `checkPtrM` ignores Tree Borrows permissions on `MachTB`**: a typed
-  `Load` of a `&dyn Trait` whose tag is `Disabled` succeeds, matching Trusted's
-  `dynRefDataValid … checkTB := false` for the safe `size_of_val` /
-  `align_of_val` and `&raw const (*r)` (`dv_v4_dynLayout_three_way_witness`,
-  `dv_v4_rawBorrow_trusted_witness`).
+Cross-authority divergences and modelling notes (`PROTOTYPE_REPORT.md` §5)
+documented by the theorems of this module:
+1. **MiniRust `VTableMethodLookup` on a missing method is `Stop.specPanic`**,
+   while Trusted (and Miri) report UB for a non-method or out-of-bounds slot
+   (`dv_v3_nonMethod_slot_ub_vs_minirust_specPanic`).
+2. **MiniRust `checkPtrM` ignores Tree Borrows permissions on `MachTB`**: a typed
+   `Load` of a `&dyn Trait` whose tag is `Disabled` succeeds, matching Trusted's
+   `dynRefDataValid … checkTB := false` for the safe `size_of_val` /
+   `align_of_val` and `&raw const (*r)` (`dv_v4_dynLayout_three_way_witness`,
+   `dv_v4_evalSafeDynSizeAlignOfValCall_tb_irrel_universal`,
+   `dv_v4_rawBorrow_trusted_witness`).
+3. **`&raw const (*r)` on `StorageDead` `&dyn Trait`**: MiniRust evaluates
+   `Load(r)` (faulting UB on a dead local), and Trusted follows the
+   `checkSafeRefDerefOk` convention (UB on dead local, matching slice refs in
+   `Places.lean`), whereas Miri's place projection `*r` does not validate `r`
+   until dereference (`dv_v4_rawBorrow_trusted_witness`).
+4. **Uninhabited concrete type behind `&dyn Trait` (`kani#5216`)**: rejected as
+   `.ub` on safe reference unsizing/retag (`!entry.isUninhabited`), matching
+   MiniRust `LayoutStrategy::TraitObject` inhabitedness while allowing raw
+   `*const ! -> *const dyn Trait` (`dv_v1_uninhabited_ub_universal_M`).
 - **A raw `*const dyn Trait` must still carry a vtable of the right trait** on
   a NOP coercion, on all three interpreters
   (`dv_v2_upcast_and_nop_three_way_witness`).
@@ -71,10 +81,12 @@ this module:
   slots**: the corpus lowers unsizing to a raw-pair write plus a typed `Load`,
   and a trait upcast pairs the validated source data pointer with the
   statically known target vtable (§2).
-- **Authority 0 is always Tree Borrows**: the `basic` / `protectedTB` modes of
-  the Crubit `c16` key differ in the initial state (protector absent / present);
-  `dv_v3_c16_callee_entry_matches_corpus_state` ties that state to the full
-  virtual call.
+- **Authority 0 is always Tree Borrows**: on the Crubit `c16` key `(2, 3)`,
+  `protectedTB` mode executes the full virtual-call caller `dvV3PokeCallerMir`
+  (definitionally identical to Authority 2's `dvLmFixture 2 3`!), whereas
+  `basic` mode runs the unprotected callee `dvV3ProtectedPokeMir` from
+  `dvV3ProtectedInit false`; `dv_v3_c16_callee_entry_matches_corpus_state` ties
+  that callee state to the 5-step entry of `dvV3PokeCallerMir`.
 
 Strict import isolation: this module NEVER imports `Anneal.*`,
 `LeanMiriSpec.*`, `MiniRustSpec.Correspondence.DeinitBridge`, or
@@ -478,6 +490,58 @@ def dvV4AddrEqMir : CapturedMir :=
         [.copy (dvLoc 1), .copy (dvLoc 2)] (dvLoc 0) (some 1) .continue_),
      dvBb [] .return_]
 
+/-- Frozen cross-authority initial-state specification shared verbatim in §0
+between `MiniRustSpec.DynTraitVTableMR` (Authority 0) and
+`LeanMiriSpec.DynTraitVTableLM` (Authority 2), represented as a plain
+`Init`-typed tuple `(tag, a, b, c, d, disabled, live)` so per-key equality
+`MR.dvKeyInitSpec vi ci = LM.dvKeyInitSpec vi ci` holds definitionally by
+`Eq.refl` across the two Lake roots:
+- tag `0`: live `x : u32 = a`
+- tag `1`: live `x : u64 = a`
+- tag `2`: dangling thin pointer `(allocId := a, offsetBytes := b)`
+- tag `3`: dangling wide pointer `((allocId := a, offsetBytes := b), vtableAllocId := c)`
+- tag `4`: `&dyn Tr` to local `_2 : u32 = b` with `vtableAllocId := a`, `disabled`, `live`
+- tag `5`: two raw `*const dyn` pointers into `(a, b)` with vtables `(c, d)`. -/
+abbrev DvKeyInitSpec : Type := Nat × Nat × Nat × Nat × Nat × Bool × Bool
+
+@[reducible] def dvSpecLiveU32 (val : Nat) : DvKeyInitSpec := (0, val, 0, 0, 0, false, true)
+@[reducible] def dvSpecLiveU64 (val : Nat) : DvKeyInitSpec := (1, val, 0, 0, 0, false, true)
+@[reducible] def dvSpecDanglingThin (aid off : Nat) : DvKeyInitSpec := (2, aid, off, 0, 0, false, false)
+@[reducible] def dvSpecDanglingWide (aid off vt : Nat) : DvKeyInitSpec := (3, aid, off, vt, 0, false, false)
+@[reducible] def dvSpecPointeeDyn (vt : Nat) (disabled live : Bool) (val : Nat) : DvKeyInitSpec :=
+  (4, vt, val, 0, 0, disabled, live)
+@[reducible] def dvSpecTwoRawDyn (aid off vt1 vt2 : Nat) : DvKeyInitSpec :=
+  (5, aid, off, vt1, vt2, false, false)
+
+/-- Frozen per-key initial-state specification for `(variantIdx, caseIdx)`
+(`0..3 × 0..3`), consumed directly by both `dvTrustedInit` and `dvLmInit`. -/
+def dvKeyInitSpec (variantIdx caseIdx : Nat) : DvKeyInitSpec :=
+  match variantIdx, caseIdx with
+  | 0, 0 => dvSpecLiveU32 7
+  | 0, 1 => dvSpecDanglingThin 5 1
+  | 0, 2 => dvSpecDanglingThin 5 1
+  | 0, 3 => dvSpecLiveU64 64
+  | 1, 0 => dvSpecLiveU32 7
+  | 1, 1 => dvSpecLiveU32 7
+  | 1, 2 => dvSpecPointeeDyn 16386 false true 7
+  | 1, 3 => dvSpecDanglingWide 5 1 16384
+  | 2, 0 => dvSpecLiveU32 7
+  | 2, 1 => dvSpecLiveU64 64
+  | 2, 2 => dvSpecPointeeDyn 16386 false true 7
+  | 2, 3 => dvSpecLiveU32 7
+  | 3, 0 => dvSpecPointeeDyn 16384 true true 7
+  | 3, 1 => dvSpecTwoRawDyn 5 0 16384 16386
+  | 3, 2 => dvSpecPointeeDyn 16384 false false 7
+  | 3, 3 => dvSpecTwoRawDyn 5 0 16384 16385
+  | _, _ => dvSpecLiveU32 7
+
+/-- Frozen per-key concrete trait-method callee list shared verbatim by
+Authority 0 (`dvTrustedInit`) and Authority 2 (`dvLmCallees`). -/
+def dvKeyCallees (variantIdx _caseIdx : Nat) : List CapturedMir :=
+  match variantIdx with
+  | 2 => dvCallees
+  | _ => []
+
 /-! ## §1. Corpus Keys and the Direct Trusted `stepMirFn` Runner -/
 
 /-- The 4 `dyn Trait` variants of this correspondence. -/
@@ -584,9 +648,10 @@ wide pointer to the frame local `_2 : u32` (`dvV2NopRefMir`, `dvV3ArgCallMir`,
 `dvV4SafeLayoutMir`, `dvV4RawBorrowMir`): `_1 = (borrow tag 1, vtable)`, tag `1`
 is a borrow of local `2` with permission `perm`, and local `2` holds `slot`. -/
 def dvPointeeInit (body : CapturedMir) (vtableAllocId : Nat) (perm : TreeBorrowPerm)
-    (slot : LocalSlot) (dataOff : Nat := 0) : MachineState :=
+    (slot : LocalSlot) (dataOff : Nat := 0) (callees : List CapturedMir := dvCallees) :
+    MachineState :=
   let base := dvInitLive body
-    [dvWide (.ptr { allocId := 1, offsetBytes := dataOff } 8) vtableAllocId] dvCallees
+    [dvWide (.ptr { allocId := 1, offsetBytes := dataOff } 8) vtableAllocId] callees
   { frame := { base.frame with locals := base.frame.locals.set 2 slot },
     memory := { base.memory with
       borrows := [ { tag := 1, targetLocal := 2, targetProjection := [], perm := perm,
@@ -601,10 +666,10 @@ caller's shared reborrow (tag `2`, a child of the `&mut` tag `1`), the raw
 alias `_2` carries tag `1`, and all three tags target the pointee local `_3`.
 Tag `3` carries the active call protector `1` exactly when
 `protectedMode = true`. -/
-def dvV3ProtectedInit (protectedMode : Bool) : MachineState :=
+def dvV3ProtectedInit (protectedMode : Bool) (val : Nat := 7) : MachineState :=
   let base := dvInitLive dvV3ProtectedPokeMir
     [.ptr { allocId := 3, offsetBytes := 0 } 8, .ptr { allocId := 1, offsetBytes := 0 } 8]
-  { frame := { base.frame with locals := base.frame.locals.set 3 (.init (.scalar ⟨7, 4⟩)) },
+  { frame := { base.frame with locals := base.frame.locals.set 3 (.init (.scalar ⟨val, 4⟩)) },
     memory := { base.memory with
       borrows :=
         [ { tag := 3, targetLocal := 3, targetProjection := [], perm := .frozen,
@@ -616,8 +681,30 @@ def dvV3ProtectedInit (protectedMode : Bool) : MachineState :=
       activeProtectors := if protectedMode then [1] else [],
       nextProtector := 2 } }
 
-/-- The `CapturedMir` fixture executed for each `(variant, case)` key. -/
-def dvTrustedFixture : DynVtVariant → DynVtCase → CapturedMir
+/-- Numeric index of a `DynVtVariant` (matches the frozen §0 `dvKeyInitSpec` /
+`dvKeyCallees` table indices). -/
+def dvVariantIdx : DynVtVariant → Nat
+  | .thinUnsize => 0
+  | .dynUpcastAndNop => 1
+  | .virtualDispatchAndProtector => 2
+  | .dynLayoutRawBorrowAndAddrEq => 3
+
+/-- Numeric index of a `DynVtCase` (matches the frozen §0 `dvKeyInitSpec` /
+`dvKeyCallees` table indices). -/
+def dvCaseIdx : DynVtCase → Nat
+  | .okPrimary => 0
+  | .okSecondary => 1
+  | .ubFault => 2
+  | .modeCase => 3
+
+/-- The `CapturedMir` fixture executed for each `(protectedMode, variant, case)`
+key. In `protectedMode = true` (real Tree Borrows mode), ALL 16 keys — including
+Crubit `c16` (`virtualDispatchAndProtector.modeCase` = `dvV3PokeCallerMir`) —
+are definitionally identical to Authority 2's `dvLmFixture`. Only
+`(false, virtualDispatchAndProtector, modeCase)` runs the unprotected callee
+body `dvV3ProtectedPokeMir` because Authority 0 has no non-TB mode flag (bridged
+to `dvV3PokeCallerMir` by `dv_v3_c16_callee_entry_matches_corpus_state`). -/
+def dvTrustedFixture (protectedMode : Bool) : DynVtVariant → DynVtCase → CapturedMir
   | .thinUnsize, .okPrimary => dvV1RefUnsizeMir
   | .thinUnsize, .okSecondary => dvV1RawUnsizeMir
   | .thinUnsize, .ubFault => dvV1RefArgUnsizeMir
@@ -629,80 +716,63 @@ def dvTrustedFixture : DynVtVariant → DynVtCase → CapturedMir
   | .virtualDispatchAndProtector, .okPrimary => dvV3CallU32Mir
   | .virtualDispatchAndProtector, .okSecondary => dvV3CallU64Mir
   | .virtualDispatchAndProtector, .ubFault => dvV3ArgCallMir
-  | .virtualDispatchAndProtector, .modeCase => dvV3ProtectedPokeMir
+  | .virtualDispatchAndProtector, .modeCase =>
+    if protectedMode then dvV3PokeCallerMir else dvV3ProtectedPokeMir
   | .dynLayoutRawBorrowAndAddrEq, .okPrimary => dvV4SizeSafeMir
   | .dynLayoutRawBorrowAndAddrEq, .okSecondary => dvV4AddrEqMir
   | .dynLayoutRawBorrowAndAddrEq, .ubFault => dvV4SizeSafeMir
   | .dynLayoutRawBorrowAndAddrEq, .modeCase => dvV4WideEqMir
 
 /-- The initial Trusted `MachineState` for each `(protectedMode, variant, case)`
-key.
-
-| key                       | initial state                                                       |
-|---------------------------|---------------------------------------------------------------------|
-| `thinUnsize.okPrimary`    | `x = 7u32`                                                          |
-| `thinUnsize.okSecondary`  | the dangling, misaligned raw pointer `dvDanglingPtr`                |
-| `thinUnsize.ubFault`      | the same dangling pointer, typed `&u32`                             |
-| `thinUnsize.modeCase`     | `x = 64u64`                                                         |
-| `dynUpcastAndNop.ok*`     | `x = 7u32`                                                          |
-| `dynUpcastAndNop.ubFault` | live, aligned `&dyn Tr` whose metadata is the `(u32, Alt)` vtable   |
-| `dynUpcastAndNop.modeCase`| dangling `*const dyn Tr` with the valid `(u32, Tr)` vtable          |
-| `virtual….okPrimary`      | `x = 7u32`, callees linked                                          |
-| `virtual….okSecondary`    | `x = 64u64`, callees linked                                         |
-| `virtual….ubFault`        | live, aligned receiver whose metadata is the `(u32, Alt)` vtable    |
-| `virtual….modeCase`       | `dvV3ProtectedInit protectedMode`                                   |
-| `dynLayout….okPrimary`    | `&dyn Tr` whose borrow tag is `Disabled` (pointee live)             |
-| `dynLayout….okSecondary`  | `*const dyn Tr` and `*const dyn Alt` to the same address            |
-| `dynLayout….ubFault`      | `&dyn Tr` whose pointee local is dead (`StorageDead`)               |
-| `dynLayout….modeCase`     | two `*const dyn Tr` to the same address: `(u32, Tr)` vs `(u64, Tr)` | -/
-def dvTrustedInit (protectedMode : Bool) : DynVtVariant → DynVtCase → MachineState
-  | .thinUnsize, .okPrimary => dvInitLive (dvTrustedFixture .thinUnsize .okPrimary) [.scalar ⟨7, 4⟩]
-  | .thinUnsize, .okSecondary =>
-    dvInitLive (dvTrustedFixture .thinUnsize .okSecondary) [dvDanglingPtr]
-  | .thinUnsize, .ubFault => dvInitLive (dvTrustedFixture .thinUnsize .ubFault) [dvDanglingPtr]
-  | .thinUnsize, .modeCase => dvInitLive (dvTrustedFixture .thinUnsize .modeCase) [.scalar ⟨64, 8⟩]
-  | .dynUpcastAndNop, .okPrimary =>
-    dvInitLive (dvTrustedFixture .dynUpcastAndNop .okPrimary) [.scalar ⟨7, 4⟩]
-  | .dynUpcastAndNop, .okSecondary =>
-    dvInitLive (dvTrustedFixture .dynUpcastAndNop .okSecondary) [.scalar ⟨7, 4⟩]
-  | .dynUpcastAndNop, .ubFault =>
-    dvPointeeInit (dvTrustedFixture .dynUpcastAndNop .ubFault)
-      16386 .frozen (.init (.scalar ⟨7, 4⟩))
-  | .dynUpcastAndNop, .modeCase =>
-    dvInitLive (dvTrustedFixture .dynUpcastAndNop .modeCase) [dvWide dvDanglingPtr 16384]
-  | .virtualDispatchAndProtector, .okPrimary =>
-    dvInitLive (dvTrustedFixture .virtualDispatchAndProtector .okPrimary) [.scalar ⟨7, 4⟩] dvCallees
-  | .virtualDispatchAndProtector, .okSecondary =>
-    dvInitLive (dvTrustedFixture .virtualDispatchAndProtector .okSecondary)
-      [.scalar ⟨64, 8⟩] dvCallees
-  | .virtualDispatchAndProtector, .ubFault =>
-    dvPointeeInit (dvTrustedFixture .virtualDispatchAndProtector .ubFault)
-      16386 .frozen (.init (.scalar ⟨7, 4⟩))
-  | .virtualDispatchAndProtector, .modeCase => dvV3ProtectedInit protectedMode
-  | .dynLayoutRawBorrowAndAddrEq, .okPrimary =>
-    dvPointeeInit (dvTrustedFixture .dynLayoutRawBorrowAndAddrEq .okPrimary)
-      16384 .disabled (.init (.scalar ⟨7, 4⟩))
-  | .dynLayoutRawBorrowAndAddrEq, .okSecondary =>
-    dvInitLive (dvTrustedFixture .dynLayoutRawBorrowAndAddrEq .okSecondary)
-      [dvWide (.ptr { allocId := 5, offsetBytes := 0 } 8) 16384,
-       dvWide (.ptr { allocId := 5, offsetBytes := 0 } 8) 16386]
-  | .dynLayoutRawBorrowAndAddrEq, .ubFault =>
-    dvPointeeInit (dvTrustedFixture .dynLayoutRawBorrowAndAddrEq .ubFault) 16384 .frozen .dead
-  | .dynLayoutRawBorrowAndAddrEq, .modeCase =>
-    dvInitLive (dvTrustedFixture .dynLayoutRawBorrowAndAddrEq .modeCase)
-      [dvWide (.ptr { allocId := 5, offsetBytes := 0 } 8) 16384,
-       dvWide (.ptr { allocId := 5, offsetBytes := 0 } 8) 16385]
+key, driven directly by the frozen §0 `dvKeyInitSpec` and `dvKeyCallees` tables
+(locked by `Eq.refl` to Authority 2's `dvKeyInitSpec` / `dvKeyCallees`) over
+`dvTrustedFixture protectedMode v c`. -/
+def dvTrustedInit (protectedMode : Bool) (v : DynVtVariant) (c : DynVtCase) : MachineState :=
+  let body := dvTrustedFixture protectedMode v c
+  let vi := dvVariantIdx v
+  let ci := dvCaseIdx c
+  let callees := dvKeyCallees vi ci
+  let spec := dvKeyInitSpec vi ci
+  match protectedMode, v, c with
+  | false, .virtualDispatchAndProtector, .modeCase =>
+    dvV3ProtectedInit false (match spec with | (0, val, _, _, _, _, _) => val | _ => 7)
+  | _, _, _ =>
+    match spec with
+    | (0, val, _, _, _, _, _) => dvInitLive body [.scalar ⟨val, 4⟩] callees
+    | (1, val, _, _, _, _, _) => dvInitLive body [.scalar ⟨val, 8⟩] callees
+    | (2, aid, off, _, _, _, _) =>
+      dvInitLive body [.ptr { allocId := aid, offsetBytes := off } 8] callees
+    | (3, aid, off, vt, _, _, _) =>
+      dvInitLive body [dvWide (.ptr { allocId := aid, offsetBytes := off } 8) vt] callees
+    | (4, vt, val, _, _, disabled, live) =>
+      dvPointeeInit body vt (if disabled then .disabled else .frozen)
+        (if live then .init (.scalar ⟨val, 4⟩) else .dead) 0 callees
+    | (5, aid, off, vt1, vt2, _, _) =>
+      dvInitLive body
+        [dvWide (.ptr { allocId := aid, offsetBytes := off } 8) vt1,
+         dvWide (.ptr { allocId := aid, offsetBytes := off } 8) vt2] callees
+    | _ => dvInitLive body [.scalar ⟨7, 4⟩] callees
 
 /-- Step budget of every Trusted corpus execution (the longest run is the
-virtual call on the `u64` receiver: 2 caller statements, the call, 4 callee
-statements, the callee `return`, and the caller `return`). -/
+virtual call on the `u64` receiver or the Crubit `c16` full virtual call). -/
 def dvTrustedFuel : Nat := 24
 
 /-- Direct Trusted observation for every `(protectedMode, variant, case)` key:
-runs `stepMirFn` on the actual `CapturedMir` fixture from its initial state. -/
+runs `stepMirFn` on the actual `CapturedMir` fixture `dvTrustedFixture` from
+`dvTrustedInit`. -/
 def dvTrustedObserve (protectedMode : Bool) (v : DynVtVariant) (c : DynVtCase) :
     DynVtTrustedObs :=
-  dvRunTrusted (dvTrustedFixture v c) dvTrustedFuel (dvTrustedInit protectedMode v c)
+  dvRunTrusted (dvTrustedFixture protectedMode v c) dvTrustedFuel
+    (dvTrustedInit protectedMode v c)
+
+/-- **Universal: `dvTrustedObserve` runs the locked fixture and initial-state
+specification** (`dvTrustedFixture`, `dvTrustedInit` over `dvKeyInitSpec` /
+`dvKeyCallees`) on every mode and corpus key. -/
+theorem dvTrustedObserve_eq_run (protectedMode : Bool) (v : DynVtVariant) (c : DynVtCase) :
+    dvTrustedObserve protectedMode v c =
+      dvRunTrusted (dvTrustedFixture protectedMode v c) dvTrustedFuel
+        (dvTrustedInit protectedMode v c) :=
+  rfl
 
 /-- The frozen 32-key Trusted observation table. -/
 def dvTrustedExpected (protectedMode : Bool) : DynVtVariant → DynVtCase → DynVtTrustedObs
@@ -1104,17 +1174,62 @@ theorem dv_wfVTableEntry_minirust_valid_layout (v : CapturedVTable) (vt : Gen.VT
   simp only [hBits, Bool.and_eq_true, decide_eq_true_eq]
   constructor <;> omega
 
-/-- **Universal (`C2`, 64-bit & 32-bit): `vtableEnvOk` enforces uniqueness,
-well-formedness, supertrait-link soundness, non-aliasing against stack locals
-(`< 1048576` on 64-bit, `< 32768` on 32-bit), and disjointness from globals
-and function-pointer allocations**, for EVERY pointer width `ptrBytes`, vtable
-table `vts`, allocation counter `nextAllocId`, globals, and function pointers. -/
-theorem dv_vtableEnvOk_universal (ptrBytes : Nat) (vts : List CapturedVTable)
+/-- **Universal Cross-Authority (`C2`, 64-bit & 32-bit, `Mach` & `MachTB`):
+`vtableEnvOk` enforces Trusted uniqueness/non-aliasing/disjointness AND implies
+MiniRust vtable-pointer / layout / `ComputeSize` / `ComputeAlign` validity**.
+1. For EVERY pointer width `ptrBytes`, `vtableEnvOk` enforces uniqueness,
+   `wfVTableEntry`, `vtableSuperLinksOk`, `[vtableAllocBase, vtableAllocBase +
+   vtableAllocSpan)`, non-aliasing against stack locals (`< 1048576` on 64-bit,
+   `< 32768` on 32-bit), `≥ nextAllocId`, and disjointness from globals and
+   function pointers;
+2. When `ptrBytes = 8`, for EVERY `v ∈ vts` paired with a MiniRust vtable `vt`
+   (`DvVTableLayoutRel v vt`) registered at `vtThin` in ANY `m : Gen.Machine M`
+   (`Mach`, `MachTB`, or any `Gen.Memory`), MiniRust satisfies `inBounds
+   vt.size.bytes .Signed PTR_SIZE = true`, `vt.align.bytes ≠ 0`, `vt.size.bytes
+   % vt.align.bytes = 0`, `vtableFromPtrM m vtThin = .ok vt`,
+   `vtableLookupM m vtThin = .ok vt`, `checkPtrM … (.VTablePtr tr) = .ok ()`,
+   and `evalUnOpM (.ComputeSize / .ComputeAlign)` return `v.sizeBytes` /
+   `v.alignBytes`. -/
+theorem dv_vtableEnvOk_universal {M : Type} [Gen.Memory M] [MemoryOps M]
+    (ptrBytes : Nat) (vts : List CapturedVTable)
     (nextAllocId : MirAst.AllocId) (globals : List CapturedAllocation) (fnPtrs : List FnPtrEntry)
     (hEnv : vtableEnvOk ptrBytes vts nextAllocId globals fnPtrs = true) :
     vtableAllocIdsUnique vts = true ∧
     vtableIdsUnique vts = true ∧
-    ∀ v ∈ vts,
+    (∀ v ∈ vts,
+      wfVTableEntry ptrBytes v = true ∧
+      vtableSuperLinksOk vts v = true ∧
+      vtableAllocBase ≤ v.vtableAllocId ∧
+      v.vtableAllocId < vtableAllocBase + vtableAllocSpan ∧
+      v.vtableAllocId < (if 8 ≤ ptrBytes then 1048576 else 32768) ∧
+      nextAllocId ≤ v.vtableAllocId ∧
+      isGlobalAllocIdIn globals v.vtableAllocId = false ∧
+      lookupFnPtr fnPtrs v.vtableAllocId = none) ∧
+    (ptrBytes = 8 →
+      ∀ v ∈ vts, ∀ (m : Gen.Machine M) (tr : Gen.TraitName) (vt : Gen.VTable)
+        (vtName : Gen.VTableName) (vtThin vp : Gen.ThinPointer (Gen.Memory.Provenance M))
+        (opTy : Gen.Type),
+        DvVTableLayoutRel v vt →
+        m.vtable_ptrs.entries.find?
+          (fun (_, (vtablePtr : Gen.ThinPointer (Gen.Memory.Provenance M))) =>
+            decide (vtablePtr = vtThin)) = some (vtName, vp) →
+        mapIndex m.prog.vtables vtName "self.prog.vtables[vtable_name]" = .ok vt →
+        vt.trait_name = tr →
+        inBounds vtThin.addr .Unsigned x86_64.PTR_SIZE = true →
+        inBounds (vt.size.bytes : Int) .Signed x86_64.PTR_SIZE = true ∧
+        vt.align.bytes ≠ 0 ∧
+        vt.size.bytes % vt.align.bytes = 0 ∧
+        vtableFromPtrM m vtThin = .ok vt ∧
+        vtableLookupM m vtThin = .ok vt ∧
+        checkPtrM (ThinPointer.widen vtThin none) (.VTablePtr tr) (some m) = .ok () ∧
+        evalUnOpM (.ComputeSize (.TraitObject tr)) (.Ptr (ThinPointer.widen vtThin none), opTy)
+            (some m) = .ok (.Int (v.sizeBytes : Int), .Int IntType.usize_ty) ∧
+        evalUnOpM (.ComputeAlign (.TraitObject tr)) (.Ptr (ThinPointer.widen vtThin none), opTy)
+            (some m) = .ok (.Int (v.alignBytes : Int), .Int IntType.usize_ty)) := by
+  unfold vtableEnvOk at hEnv
+  simp only [Bool.and_eq_true, List.all_eq_true] at hEnv
+  obtain ⟨hUniqA, hUniqI, hAll⟩ := hEnv
+  have hEach : ∀ v ∈ vts,
       wfVTableEntry ptrBytes v = true ∧
       vtableSuperLinksOk vts v = true ∧
       vtableAllocBase ≤ v.vtableAllocId ∧
@@ -1123,32 +1238,38 @@ theorem dv_vtableEnvOk_universal (ptrBytes : Nat) (vts : List CapturedVTable)
       nextAllocId ≤ v.vtableAllocId ∧
       isGlobalAllocIdIn globals v.vtableAllocId = false ∧
       lookupFnPtr fnPtrs v.vtableAllocId = none := by
-  unfold vtableEnvOk at hEnv
-  simp only [Bool.and_eq_true, List.all_eq_true] at hEnv
-  obtain ⟨hUniqA, hUniqI, hAll⟩ := hEnv
-  refine ⟨hUniqA, hUniqI, fun v hv => ?_⟩
-  have hV := hAll v hv
-  simp only [Bool.and_eq_true, Bool.not_eq_true'] at hV
-  obtain ⟨hWf, hSup, hGeBase, hLtSpan, hLtStack, hGeNext, hNotGlob, hFn⟩ := hV
-  refine ⟨hWf, hSup, Nat.le_of_ble_eq_true hGeBase, Nat.le_of_ble_eq_true hLtSpan, ?_,
-    Nat.le_of_ble_eq_true hGeNext, hNotGlob, ?_⟩
-  · cases hPb : Nat.ble 8 ptrBytes with
-    | true =>
-      have h8 : 8 ≤ ptrBytes := Nat.le_of_ble_eq_true hPb
-      simp only [h8, ↓reduceIte]
-      rw [hPb] at hLtStack
-      exact Nat.le_of_ble_eq_true hLtStack
-    | false =>
-      have h8 : ¬ 8 ≤ ptrBytes := fun hle => by
-        have := Nat.ble_eq_true_of_le hle
-        rw [this] at hPb
-        cases hPb
-      simp only [h8, ↓reduceIte]
-      rw [hPb] at hLtStack
-      exact Nat.le_of_ble_eq_true hLtStack
-  · cases hF : lookupFnPtr fnPtrs v.vtableAllocId with
-    | none => rfl
-    | some _ => rw [hF] at hFn; cases hFn
+    intro v hv
+    have hV := hAll v hv
+    simp only [Bool.and_eq_true, Bool.not_eq_true'] at hV
+    obtain ⟨hWf, hSup, hGeBase, hLtSpan, hLtStack, hGeNext, hNotGlob, hFn⟩ := hV
+    refine ⟨hWf, hSup, Nat.le_of_ble_eq_true hGeBase, Nat.le_of_ble_eq_true hLtSpan, ?_,
+      Nat.le_of_ble_eq_true hGeNext, hNotGlob, ?_⟩
+    · cases hPb : Nat.ble 8 ptrBytes with
+      | true =>
+        have h8 : 8 ≤ ptrBytes := Nat.le_of_ble_eq_true hPb
+        simp only [h8, ↓reduceIte]
+        rw [hPb] at hLtStack
+        exact Nat.le_of_ble_eq_true hLtStack
+      | false =>
+        have h8 : ¬ 8 ≤ ptrBytes := fun hle => by
+          have := Nat.ble_eq_true_of_le hle
+          rw [this] at hPb
+          cases hPb
+        simp only [h8, ↓reduceIte]
+        rw [hPb] at hLtStack
+        exact Nat.le_of_ble_eq_true hLtStack
+    · cases hF : lookupFnPtr fnPtrs v.vtableAllocId with
+      | none => rfl
+      | some _ => rw [hF] at hFn; cases hFn
+  refine ⟨hUniqA, hUniqI, hEach, fun h8 v hv m tr vt vtName vtThin vp opTy hRel hFind hVt hTr hVAddr => ?_⟩
+  subst h8
+  have hLay := dv_wfVTableEntry_minirust_valid_layout v vt (hEach v hv).1 hRel
+  have hOps := np_v2_dyn_wide_ptr_vtable_ops_universal_M m tr vt vtName vtThin vtThin vp
+    hFind hVt hTr hVAddr
+  have hSA := hOps.2.2.2.2.1 opTy
+  obtain ⟨hSize, hAlign⟩ := hRel
+  rw [hSize, hAlign] at hSA
+  exact ⟨hLay.1, hLay.2.1, hLay.2.2, hOps.1, hOps.2.1, hOps.2.2.1, hSA.1, hSA.2⟩
 
 /-- **Universal: dynamic `size_of_val` / `align_of_val` agree with MiniRust
 `ComputeSize` / `ComputeAlign`** (`evalDynSizeAlignOfVal` vs. `evalUnOpM` over
@@ -2066,6 +2187,178 @@ theorem dv_v3_vtableMethodLookup_universal_M {M : Type} [Gen.Memory M] [MemoryOp
     rfl
   rw [h, hvt, ok_bind, hIdx]
   rfl
+
+/-- **Universal Cross-Authority (`C3`, `C4`): linked-callee `evalVirtualCall`
+entry, ABI gate, `protectDynReceiverOnEntry` fresh protected child tag, &
+MiniRust `VTableMethodLookup` agreement (`Mach` & `MachTB`)**.
+Whenever Trusted `evalVirtualCall` resolves a valid receiver (`dvRecvOk = true`)
+and slot `vm.slotIdx` to a linked concrete callee `calleeBody`:
+1. If `virtualCalleeAbiOk = some false` (e.g. intrinsic conv, arg-count
+   mismatch, `&dyn -> &mut Self` mutability mismatch, or trailing-arg ABI
+   mismatch), `evalVirtualCall` faults `.ub`;
+2. If `virtualCalleeAbiOk = some true` and the receiver is raw (`.raw _`),
+   `evalVirtualCall` steps directly to `pushCalleeFrame` without installing a
+   receiver protector;
+3. If `virtualCalleeAbiOk = some true`, the receiver is a safe reference
+   (`&dyn`, `&mut dyn`, `Pin<&[mut] dyn>`) carrying a tracked borrow pointer
+   `dataVal = .ptr p sz` (`lookupBorrow s1.memory.borrows p.tag = some parent`),
+   and the initial Tree Borrows read does not fault (`readUB = false`), then
+   `evalVirtualCall` steps to `MirStepNode.step s2` where `s2` installs a fresh
+   child tag `s1.memory.nextTag` with active call protector
+   `s1.memory.nextProtector` (`s2.memory.activeProtectors = s1.memory.nextProtector
+   :: s1.memory.activeProtectors`), parent `some p.tag`, permission
+   `fnEntryRetagPerm kind.mutability entry.concreteTy`, and narrowed (or
+   `Pin`-rewrapped) receiver in local `1`;
+4. On EVERY MiniRust memory model `M` (`Mach` & `MachTB`), when `vtableLookupM
+   m vptr = .ok vt` and `vt.methods[meth] = .ok fnName`, `evalUnOpM
+   (.VTableMethodLookup meth)` resolves to `evalConstantM m (.FnPointer fnName)`. -/
+theorem dv_v3_evalVirtualCall_linked_universal
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (s : MachineState) (callerBody calleeBody : CapturedMir) (vm : CapturedVirtualMethod)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (recvOp : MirAst.Operand) (restOps : List MirAst.Operand)
+    (recvVal : Value) (restVals : List Value) (locals' : List LocalSlot)
+    (dest : MirAst.Place) (targetBb : BasicBlockIdx) (unwind : MirAst.UnwindAction)
+    (recvTy : MirAst.Ty) (kind : DynReceiverKind) (recvKey : DefPath)
+    (dataVal metaVal : Value) (entry : CapturedVTable)
+    (vts : List CapturedVTable) (dts : List CapturedDynType)
+    (p : DefPath) (args : List MirAst.RigidTy)
+    (hTy : operandTy decls layouts recvOp = some recvTy)
+    (hKind : classifyDynReceiver? recvTy.kind = some (kind, recvKey))
+    (hCompat : dynKeysCompatible (collectMemoryDynTypes (some callerBody) s.memory) recvKey vm.dynKey
+      = true)
+    (hUnpack : unpackDynReceiver? kind recvVal = .ok (dataVal, metaVal))
+    (hChk : checkDynVTablePtr (some callerBody) (DynMemView.ofMemory s.memory)
+      (layoutPointerBytes layouts) metaVal recvKey = .ok (entry, vts, dts))
+    (hSlot : get? entry.slots vm.slotIdx = some (.method p args))
+    (hOk : dvRecvOk kind locals' s.memory decls layouts dataVal entry = true)
+    (hCallee : lookupCallee s.memory.callees layouts p args s.memory.traitImpls = some calleeBody) :
+    (virtualCalleeAbiOk calleeBody kind entry.concreteTy (recvOp :: restOps)
+        (length (recvVal :: restVals)) decls layouts = some false →
+      evalVirtualCall s (some callerBody) vm decls layouts (recvOp :: restOps)
+        (recvVal :: restVals) locals' dest (some targetBb) unwind = MirStepNode.fail .ub) ∧
+    (∀ mutb, kind = .raw mutb →
+      virtualCalleeAbiOk calleeBody kind entry.concreteTy (recvOp :: restOps)
+        (length (recvVal :: restVals)) decls layouts = some true →
+      evalVirtualCall s (some callerBody) vm decls layouts (recvOp :: restOps)
+        (recvVal :: restVals) locals' dest (some targetBb) unwind =
+        MirStepNode.step (pushCalleeFrame s callerBody locals' dest targetBb calleeBody
+          (narrowDynReceiver kind dataVal :: restVals) unwind)) ∧
+    (kind.isSafeRef = true →
+      virtualCalleeAbiOk calleeBody kind entry.concreteTy (recvOp :: restOps)
+        (length (recvVal :: restVals)) decls layouts = some true →
+      ∀ (ptr : ProvenancePtr) (psz : Nat) (parentEntry : BorrowEntry) (locals1 : List LocalSlot),
+        let s1 := pushCalleeFrame s callerBody locals' dest targetBb calleeBody
+          (narrowDynReceiver kind dataVal :: restVals) unwind
+        let perm := fnEntryRetagPerm kind.mutability entry.concreteTy
+        let skipInitRead : Bool := match perm with | .cell => true | _ => Nat.beq entry.sizeBytes 0
+        dataVal = .ptr ptr psz →
+        lookupBorrow s1.memory.borrows ptr.tag = some parentEntry →
+        (skipInitRead = true ∨
+          hasTreeReadUB s1.memory.borrows s1.memory.borrows s1.memory.activeProtectors
+            parentEntry.targetLocal (.some ptr.tag) parentEntry.targetProjection
+            parentEntry.rangeOffset parentEntry.rangeLen parentEntry.targetFrameDepth = false) →
+        set? s1.frame.locals 1
+          (.init (narrowDynReceiver kind (.ptr { allocId := s1.memory.nextTag, offsetBytes := ptr.offsetBytes } psz))) =
+          some locals1 →
+        ∃ s2,
+          evalVirtualCall s (some callerBody) vm decls layouts (recvOp :: restOps)
+            (recvVal :: restVals) locals' dest (some targetBb) unwind = MirStepNode.step s2 ∧
+          s2.frame.locals = locals1 ∧
+          s2.memory.activeProtectors = s1.memory.nextProtector :: s1.memory.activeProtectors ∧
+          s2.memory.nextTag = s1.memory.nextTag + 1 ∧
+          s2.memory.nextProtector = s1.memory.nextProtector + 1 ∧
+          (∃ child,
+            lookupBorrow s2.memory.borrows s1.memory.nextTag = some child ∧
+            child.protector = some s1.memory.nextProtector ∧
+            child.parentTag = some ptr.tag ∧
+            child.perm = perm)) ∧
+    (∀ (m : Gen.Machine M) (vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (ty : Gen.PtrType)
+        (meth : Gen.TraitMethodName) (vt : Gen.VTable) (fnName : Gen.FnName),
+      vtableLookupM m vptr = .ok vt →
+      mapIndex vt.methods meth "vtable.methods[method]" = .ok fnName →
+      evalUnOpM (.VTableMethodLookup meth) (.Ptr (ThinPointer.widen vptr none), .Ptr ty) (some m) =
+        (do
+          let fnPtr ← evalConstantM m (.FnPointer fnName)
+          pure (fnPtr, .Ptr .FnPtr))) := by
+  have hBase :
+      evalVirtualCall s (some callerBody) vm decls layouts (recvOp :: restOps)
+        (recvVal :: restVals) locals' dest (some targetBb) unwind =
+      match virtualCalleeAbiOk calleeBody kind entry.concreteTy (recvOp :: restOps)
+          (length (recvVal :: restVals)) decls layouts with
+      | .none => MirStepNode.unsupported
+      | .some false => MirStepNode.fail .ub
+      | .some true =>
+        let s1 := pushCalleeFrame s callerBody locals' dest targetBb calleeBody
+          (narrowDynReceiver kind dataVal :: restVals) unwind
+        match kind.isSafeRef with
+        | false => MirStepNode.step s1
+        | true =>
+          match protectDynReceiverOnEntry s1 kind dataVal entry with
+          | .some s2 => MirStepNode.step s2
+          | .none => MirStepNode.fail .ub := by
+    unfold evalVirtualCall
+    simp only [hTy, hKind, hCompat, hUnpack, hChk, hSlot]
+    rcases kind with (m | m | m) <;> cases m <;>
+      simp only [DynReceiverKind.isSafeRef, DynReceiverKind.mutability, dvRecvOk] at hOk ⊢ <;>
+      simp only [hOk, hCallee] <;>
+      cases virtualCalleeAbiOk calleeBody _ entry.concreteTy (recvOp :: restOps)
+        (length (recvVal :: restVals)) decls layouts with
+      | none => rfl
+      | some b =>
+        cases b with
+        | false => rfl
+        | true => rfl
+  refine ⟨fun hAbi => ?_, fun mutb hk hAbi => ?_, fun hSafe hAbi ptr psz parentEntry locals1 hData hPar hNoReadUB hSet => ?_,
+    fun m vptr ty meth vt fnName hvt hfn =>
+      evalUnOpM_vtableMethodLookup_eq_fnPointer m vptr ty meth vt fnName hvt hfn⟩
+  · rw [hBase, hAbi]
+  · rw [hBase, hAbi, hk]
+  · rw [hBase, hAbi, hSafe]
+    dsimp only []
+    generalize hs1 : pushCalleeFrame s callerBody locals' dest targetBb calleeBody
+      (narrowDynReceiver kind dataVal :: restVals) unwind = s1 at hPar hNoReadUB hSet ⊢
+    let child : BorrowEntry :=
+      { tag := s1.memory.nextTag,
+        targetLocal := parentEntry.targetLocal,
+        targetFrameDepth := parentEntry.targetFrameDepth,
+        allocDead := parentEntry.allocDead,
+        targetProjection := parentEntry.targetProjection,
+        perm := fnEntryRetagPerm kind.mutability entry.concreteTy,
+        rangeOffset := parentEntry.rangeOffset,
+        rangeLen := parentEntry.rangeLen,
+        protector := .some s1.memory.nextProtector,
+        parentTag := .some ptr.tag }
+    have hProt : protectDynReceiverOnEntry s1 kind dataVal entry =
+        some { frame := { s1.frame with locals := locals1 },
+               memory := { s1.memory with
+                 borrows := child ::
+                   (match (match fnEntryRetagPerm kind.mutability entry.concreteTy with
+                           | .cell => true | _ => Nat.beq entry.sizeBytes 0) with
+                    | true => s1.memory.borrows
+                    | false => freezeTreeBorrowsOnReadAtProj s1.memory.borrows s1.memory.borrows
+                        parentEntry.targetLocal (.some ptr.tag) parentEntry.targetProjection
+                        parentEntry.rangeOffset parentEntry.rangeLen s1.memory.activeProtectors
+                        parentEntry.targetFrameDepth),
+                 nextTag := Nat.add s1.memory.nextTag 1,
+                 activeProtectors := s1.memory.nextProtector :: s1.memory.activeProtectors,
+                 nextProtector := Nat.add s1.memory.nextProtector 1 } } := by
+      unfold protectDynReceiverOnEntry
+      rw [hData]
+      simp only []
+      rw [hPar]
+      rcases hNoReadUB with hSkip | hNoUb
+      · cases hP : fnEntryRetagPerm kind.mutability entry.concreteTy <;>
+          simp only [hP] at hSkip ⊢ <;>
+          simp only [child, hP, hSkip, hSet]
+      · cases hP : fnEntryRetagPerm kind.mutability entry.concreteTy <;>
+          cases hZ : Nat.beq entry.sizeBytes 0 <;>
+          simp only [child, hP, hZ, hNoUb, hSet]
+    rw [hProt]
+    refine ⟨_, rfl, rfl, rfl, rfl, rfl, child, ?_, rfl, rfl, rfl⟩
+    unfold lookupBorrow
+    have hSelf : Nat.beq child.tag s1.memory.nextTag = true := Nat.beq_refl _
+    simp only [hSelf]
 
 /-- A Trusted `MirStepNode` classified for the witnesses of this section:
 `0` = UB, `1` = unsupported, `2` = external call (with its `defPath`), `3` =
@@ -3334,12 +3627,18 @@ theorem dv_v3_pin_receiver_rewrap_trusted_witness :
 
 /-! ### B1 Hardening Witnesses & Realizability (`vtableEnvOk`, 32-bit, `kani#5216`, `evalDynToDynUnsize`, `evalSafeDynSizeAlignOfValCall`, `evalAddrEqCall`, and Linked `Pin<&mut dyn>` Protector) -/
 
-/-- **Realizability of `dv_vtableEnvOk_universal` (64-bit & 32-bit, `C2`)**:
-the corpus vtables satisfy `vtableEnvOk` on BOTH 64-bit (`ptrBytes = 8`) and
-32-bit (`ptrBytes = 4`), so every corpus vtable fits below `32768`; placing a
-vtable at `vtableAllocId = 32768` (`stackLocalAddrPageBase 4`) is REJECTED by
-`vtableEnvOk 4` while ACCEPTED by `vtableEnvOk 8`. -/
-theorem dv_vtableEnvOk_universal_nonvacuous :
+/-- **Realizability of `dv_vtableEnvOk_universal` (64-bit & 32-bit, `Mach` &
+`MachTB`, `C2`)**:
+1. The corpus vtables satisfy `vtableEnvOk` on BOTH 64-bit (`ptrBytes = 8`) and
+   32-bit (`ptrBytes = 4`), so every corpus vtable fits below `32768`;
+2. On BOTH `Mach` and `MachTB` (`MachTB.wfLive`), `dv_vtableEnvOk_universal`
+   yields MiniRust layout bounds (`inBounds`, `align ≠ 0`, `size % align = 0`),
+   `vtableFromPtrM`, `vtableLookupM`, `checkPtrM (.VTablePtr _)`, and
+   `ComputeSize`/`ComputeAlign` = `4`/`4` for `(u32, dyn Tr)`;
+3. Negative 32-bit controls: `vt32k` (`vtableAllocId = 32768`) is rejected, and
+   `vt2G` (`sizeBytes = 2^31`) is REJECTED by `vtableEnvOk 4` while ACCEPTED by
+   `vtableEnvOk 8`. -/
+theorem dv_vtableEnvOk_universal_nonvacuous (opTy : Gen.Type) :
     let vt32k : CapturedVTable :=
       { vtableId := 0, vtableAllocId := 32768, concreteTy := .uint .u32, dynKey := dvTrKey,
         sizeBytes := 4, alignBytes := 4, slots := [.dropInPlace none, .size, .align] }
@@ -3349,15 +3648,165 @@ theorem dv_vtableEnvOk_universal_nonvacuous :
     (vtableEnvOk 8 dvVTables 1 [] [] = true) ∧
     (vtableEnvOk 4 dvVTables 1 [] [] = true) ∧
     (∀ v ∈ dvVTables, v.vtableAllocId < 32768 ∧ wfVTableEntry 4 v = true) ∧
+    (vtableFromPtrM (dvMrV4ArgSizeMach true) (dvVtPtr 0) = .ok (dvMrVTable 0) ∧
+     evalUnOpM (.ComputeSize (.TraitObject (traitNameOf 0)))
+       (.Ptr (ThinPointer.widen (dvVtPtr 0) none), opTy) (some (dvMrV4ArgSizeMach true)) =
+       .ok (.Int 4, .Int IntType.usize_ty)) ∧
+    (MachTB.wfLive (liftMachToTB (dvMrV4ArgSizeMach true)) ∧
+     vtableFromPtrM (liftMachToTB (dvMrV4ArgSizeMach true)) (liftThinPtrTB (dvVtPtr 0)) =
+       .ok (dvMrVTable 0) ∧
+     evalUnOpM (.ComputeAlign (.TraitObject (traitNameOf 0)))
+       (.Ptr (ThinPointer.widen (liftThinPtrTB (dvVtPtr 0)) none), opTy)
+       (some (liftMachToTB (dvMrV4ArgSizeMach true))) =
+       .ok (.Int 4, .Int IntType.usize_ty)) ∧
     (vtableEnvOk 4 [vt32k] 1 [] [] = false) ∧
     (vtableEnvOk 4 [vt2G] 1 [] [] = false) ∧
     (vtableEnvOk 8 [vt2G] 1 [] [] = true) := by
+  have h8 : vtableEnvOk 8 dvVTables 1 [] [] = true := by decide +kernel
   have h4 : vtableEnvOk 4 dvVTables 1 [] [] = true := by decide +kernel
-  have hU4 := dv_vtableEnvOk_universal 4 dvVTables 1 [] [] h4
-  refine ⟨by decide +kernel, h4, ?_, by decide +kernel, by decide +kernel, by decide +kernel⟩
+  have hU4 := dv_vtableEnvOk_universal (M := BM) 4 dvVTables 1 [] [] h4
+  have hU8BM := dv_vtableEnvOk_universal (M := BM) 8 dvVTables 1 [] [] h8
+  have hU8TB := dv_vtableEnvOk_universal (M := TBM) 8 dvVTables 1 [] [] h8
+  obtain ⟨v0, hv0Mem, hv0Rel⟩ : ∃ v0 ∈ dvVTables, DvVTableLayoutRel v0 (dvMrVTable 0) ∧
+      v0.sizeBytes = 4 ∧ v0.alignBytes = 4 :=
+    ⟨dvVTables.head (by decide), List.head_mem (by decide), by decide, rfl, rfl⟩
+  have hBM := hU8BM.2.2.2 rfl v0 hv0Mem (dvMrV4ArgSizeMach true) (traitNameOf 0) (dvMrVTable 0)
+    ⟨⟨0⟩⟩ (dvVtPtr 0) (dvVtPtr 0) opTy hv0Rel.1 (by first | rfl | decide +kernel)
+    (by first | rfl | decide +kernel) rfl (by first | rfl | decide +kernel)
+  have hTB := hU8TB.2.2.2 rfl v0 hv0Mem (liftMachToTB (dvMrV4ArgSizeMach true)) (traitNameOf 0)
+    (dvMrVTable 0) ⟨⟨0⟩⟩ (liftThinPtrTB (dvVtPtr 0)) (liftThinPtrTB (dvVtPtr 0)) opTy hv0Rel.1
+    (by first | rfl | decide +kernel) (by first | rfl | decide +kernel) rfl
+    (by first | rfl | decide +kernel)
+  have hSz := hBM.2.2.2.2.2.2.1
+  have hAl := hTB.2.2.2.2.2.2.2
+  rw [hv0Rel.2.1] at hSz
+  rw [hv0Rel.2.2] at hAl
+  refine ⟨h8, h4, ?_, ⟨hBM.2.2.2.1, hSz⟩, ⟨liftMachToTB_wfLive _, hTB.2.2.2.1, hAl⟩,
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
   intro v hv
-  have hv' := hU4.2.2 v hv
+  have hv' := hU4.2.2.1 v hv
   exact ⟨by simpa using hv'.2.2.2.2.1, hv'.1⟩
+
+/-- **Realizability of `dv_v3_evalVirtualCall_linked_universal` (`C3`, `C4`,
+`Mach` & `MachTB`)**: instantiates the universal linked-callee virtual-call law
+on concrete corpus states:
+1. Linked `dvV3ArgCallMir -> dvGetU32Mir` enters a protected callee frame with
+   fresh child tag `2`, `activeProtectors = [1]`, `protector = some 1`,
+   `parentTag = some 1`, and `perm = .frozen`;
+2. ABI-mismatch control (linked callee expecting `argCount = 3` on a 2-arg call)
+   faults `.ub` through conjunct 1;
+3. MiniRust `VTableMethodLookup dvMethGet` resolves `dvMrVTable 0` to `fnName 1`
+   on BOTH `Mach` and `MachTB`. -/
+theorem dv_v3_evalVirtualCall_linked_universal_nonvacuous (ty : Gen.PtrType) :
+    let sLive := dvPointeeInit dvV3ArgCallMir 16384 .frozen (.init (.scalar ⟨7, 4⟩)) 0 dvCallees
+    let badCallee : CapturedMir := { dvGetU32Mir with argCount := 3 }
+    let sBadAbi : MachineState :=
+      { sLive with memory := { sLive.memory with callees := [dvV3ArgCallMir, badCallee] } }
+    (∃ s2,
+      evalVirtualCall sLive (some dvV3ArgCallMir)
+        { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
+        dvV3ArgCallMir.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
+        [.aggregate 0 [dvDataTag1, dvMetaTr], .scalar ⟨5, 4⟩] sLive.frame.locals
+        (dvLoc 0) (some 1) .continue_ = MirStepNode.step s2 ∧
+      s2.memory.activeProtectors = [1] ∧
+      ∃ child, lookupBorrow s2.memory.borrows 2 = some child ∧
+        child.protector = some 1 ∧ child.parentTag = some 1 ∧ child.perm = .frozen) ∧
+    evalVirtualCall sBadAbi (some dvV3ArgCallMir)
+      { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
+      dvV3ArgCallMir.localDecls emptyLayoutTable [.move (dvLoc 1), dvConstU32 5]
+      [.aggregate 0 [dvDataTag1, dvMetaTr], .scalar ⟨5, 4⟩] sBadAbi.frame.locals
+      (dvLoc 0) (some 1) .continue_ = MirStepNode.fail .ub ∧
+    evalUnOpM (.VTableMethodLookup dvMethGet) (.Ptr (ThinPointer.widen (dvVtPtr 0) none), .Ptr ty)
+        (some (dvMrV3Mach 0 (scalarBytes u32 7) 4)) =
+      .ok (.Ptr (ThinPointer.widen ({ addr := 4096, provenance := some (⟨0⟩, ()) } : Ptr) none),
+        .Ptr .FnPtr) ∧
+    MachTB.wfLive (liftMachToTB (dvMrV3Mach 0 (scalarBytes u32 7) 4)) ∧
+    evalUnOpM (.VTableMethodLookup dvMethGet)
+        (.Ptr (ThinPointer.widen (liftThinPtrTB (dvVtPtr 0)) none), .Ptr ty)
+        (some (liftMachToTB (dvMrV3Mach 0 (scalarBytes u32 7) 4))) =
+      .ok (.Ptr (ThinPointer.widen
+          (liftThinPtrTB ({ addr := 4096, provenance := some (⟨0⟩, ()) } : Ptr)) none),
+        .Ptr .FnPtr) := by
+  let sLive := dvPointeeInit dvV3ArgCallMir 16384 .frozen (.init (.scalar ⟨7, 4⟩)) 0 dvCallees
+  let badCallee : CapturedMir := { dvGetU32Mir with argCount := 3 }
+  let sBadAbi : MachineState :=
+    { sLive with memory := { sLive.memory with callees := [dvV3ArgCallMir, badCallee] } }
+  let vm : CapturedVirtualMethod := { methodDefPath := "dv::Tr::get", dynKey := dvTrKey, slotIdx := 3 }
+  obtain ⟨⟨eL, vtsL, dtsL⟩, hChkL, hProjL⟩ := dvDynCheck_ok_of_map
+    (r := checkDynVTablePtr (some dvV3ArgCallMir) (DynMemView.ofMemory sLive.memory)
+      (layoutPointerBytes emptyLayoutTable) dvMetaTr dvTrKey)
+    (f := fun a => (dvMethodSlotView (get? a.1.slots 3),
+      dvRecvOk (.ref .not) sLive.frame.locals sLive.memory dvV3ArgCallMir.localDecls
+        emptyLayoutTable dvDataTag1 a.1,
+      virtualCalleeAbiOk dvGetU32Mir (.ref .not) a.1.concreteTy [.move (dvLoc 1), dvConstU32 5] 2
+        dvV3ArgCallMir.localDecls emptyLayoutTable,
+      (match fnEntryRetagPerm .not a.1.concreteTy with | .frozen => true | _ => false),
+      a.1.sizeBytes))
+    (b := (some ("dv::<u32 as Tr>::get", 0), true, some true, true, 4)) (by decide +kernel)
+  have hS3L : get? eL.slots 3 = some (.method "dv::<u32 as Tr>::get" []) :=
+    dv_method_slot_of_view (congrArg Prod.fst hProjL)
+  have hOkL : dvRecvOk (.ref .not) sLive.frame.locals sLive.memory dvV3ArgCallMir.localDecls
+      emptyLayoutTable dvDataTag1 eL = true := congrArg (fun x => x.2.1) hProjL
+  have hAbiL : virtualCalleeAbiOk dvGetU32Mir (.ref .not) eL.concreteTy
+      [.move (dvLoc 1), dvConstU32 5] 2 dvV3ArgCallMir.localDecls emptyLayoutTable = some true :=
+    congrArg (fun x => x.2.2.1) hProjL
+  have hPermL : fnEntryRetagPerm .not eL.concreteTy = .frozen := by
+    have hp := congrArg (fun x => x.2.2.2.1) hProjL
+    cases h : fnEntryRetagPerm .not eL.concreteTy <;> simp [h] at hp ⊢
+  have hUL := dv_v3_evalVirtualCall_linked_universal (M := BM) sLive dvV3ArgCallMir dvGetU32Mir vm
+    dvV3ArgCallMir.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5]
+    (.aggregate 0 [dvDataTag1, dvMetaTr]) [.scalar ⟨5, 4⟩] sLive.frame.locals (dvLoc 0) 1 .continue_
+    (dvRefDynTy dvTrKey) (.ref .not) dvTrKey dvDataTag1 dvMetaTr eL vtsL dtsL
+    "dv::<u32 as Tr>::get" [] rfl rfl (by decide +kernel) rfl hChkL hS3L hOkL rfl
+  have hUTB := dv_v3_evalVirtualCall_linked_universal (M := TBM) sLive dvV3ArgCallMir dvGetU32Mir vm
+    dvV3ArgCallMir.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5]
+    (.aggregate 0 [dvDataTag1, dvMetaTr]) [.scalar ⟨5, 4⟩] sLive.frame.locals (dvLoc 0) 1 .continue_
+    (dvRefDynTy dvTrKey) (.ref .not) dvTrKey dvDataTag1 dvMetaTr eL vtsL dtsL
+    "dv::<u32 as Tr>::get" [] rfl rfl (by decide +kernel) rfl hChkL hS3L hOkL rfl
+  let s1 := pushCalleeFrame sLive dvV3ArgCallMir sLive.frame.locals (dvLoc 0) 1 dvGetU32Mir
+    (narrowDynReceiver (.ref .not) dvDataTag1 :: [.scalar ⟨5, 4⟩]) .continue_
+  have hNextTag : s1.memory.nextTag = 2 := rfl
+  have hNextProt : s1.memory.nextProtector = 1 := rfl
+  have hActProt : s1.memory.activeProtectors = [] := rfl
+  obtain ⟨s2, hStep2, _, hProt2, _, _, child, hChildLookup, hChildProt, hChildPar, hChildPerm⟩ :=
+    hUL.2.2.1 rfl hAbiL { allocId := 1, offsetBytes := 0 } 8
+      { tag := 1, targetLocal := 2, targetProjection := [], perm := .frozen, rangeOffset := 0, rangeLen := 4 }
+      (s1.frame.locals.set 1 (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)))
+      rfl rfl (Or.inr (by decide +kernel)) rfl
+  rw [hNextProt, hActProt] at hProt2
+  rw [hNextTag] at hChildLookup
+  rw [hNextProt] at hChildProt
+  rw [hPermL] at hChildPerm
+  obtain ⟨⟨eB, vtsB, dtsB⟩, hChkB, hProjB⟩ := dvDynCheck_ok_of_map
+    (r := checkDynVTablePtr (some dvV3ArgCallMir) (DynMemView.ofMemory sBadAbi.memory)
+      (layoutPointerBytes emptyLayoutTable) dvMetaTr dvTrKey)
+    (f := fun a => (dvMethodSlotView (get? a.1.slots 3),
+      dvRecvOk (.ref .not) sBadAbi.frame.locals sBadAbi.memory dvV3ArgCallMir.localDecls
+        emptyLayoutTable dvDataTag1 a.1,
+      virtualCalleeAbiOk badCallee (.ref .not) a.1.concreteTy [.move (dvLoc 1), dvConstU32 5] 2
+        dvV3ArgCallMir.localDecls emptyLayoutTable))
+    (b := (some ("dv::<u32 as Tr>::get", 0), true, some false)) (by decide +kernel)
+  have hS3B : get? eB.slots 3 = some (.method "dv::<u32 as Tr>::get" []) :=
+    dv_method_slot_of_view (congrArg Prod.fst hProjB)
+  have hOkB : dvRecvOk (.ref .not) sBadAbi.frame.locals sBadAbi.memory dvV3ArgCallMir.localDecls
+      emptyLayoutTable dvDataTag1 eB = true := congrArg (fun x => x.2.1) hProjB
+  have hAbiB : virtualCalleeAbiOk badCallee (.ref .not) eB.concreteTy
+      [.move (dvLoc 1), dvConstU32 5] 2 dvV3ArgCallMir.localDecls emptyLayoutTable = some false :=
+    congrArg (fun x => x.2.2) hProjB
+  have hUB := (dv_v3_evalVirtualCall_linked_universal (M := BM) sBadAbi dvV3ArgCallMir badCallee vm
+    dvV3ArgCallMir.localDecls emptyLayoutTable (.move (dvLoc 1)) [dvConstU32 5]
+    (.aggregate 0 [dvDataTag1, dvMetaTr]) [.scalar ⟨5, 4⟩] sBadAbi.frame.locals (dvLoc 0) 1 .continue_
+    (dvRefDynTy dvTrKey) (.ref .not) dvTrKey dvDataTag1 dvMetaTr eB vtsB dtsB
+    "dv::<u32 as Tr>::get" [] rfl rfl (by decide +kernel) rfl hChkB hS3B hOkB rfl).1 hAbiB
+  have hMrBM := hUL.2.2.2 (dvMrV3Mach 0 (scalarBytes u32 7) 4) (dvVtPtr 0) ty dvMethGet
+    (dvMrVTable 0) (fnName 1) (by first | rfl | decide +kernel) (by first | rfl | decide +kernel)
+  have hMrTB := hUTB.2.2.2 (liftMachToTB (dvMrV3Mach 0 (scalarBytes u32 7) 4))
+    (liftThinPtrTB (dvVtPtr 0)) ty dvMethGet (dvMrVTable 0) (fnName 1)
+    (by first | rfl | decide +kernel) (by first | rfl | decide +kernel)
+  refine ⟨⟨s2, hStep2, hProt2, child, hChildLookup, hChildProt, hChildPar, hChildPerm⟩, hUB,
+    ?_, liftMachToTB_wfLive _, ?_⟩
+  · rw [hMrBM]; first | rfl | decide +kernel
+  · rw [hMrTB]; first | rfl | decide +kernel
 
 /-- Uninhabited (`kani#5216`) `(Never, dyn Tr)` vtable (size `0`, align `1`,
 `isUninhabited := true`). -/
@@ -3987,6 +4436,7 @@ elab "#assert_dyn_trait_vtable_mr_audit" : command => do
     ``dvTrustedValueObs,
     ``dvRunTrusted,
     ``dvTrustedObserve,
+    ``dvTrustedObserve_eq_run,
     ``dvTrustedObserve_table,
     ``dvRunMrObs,
     ``dvMrObserve,
@@ -4003,10 +4453,10 @@ elab "#assert_dyn_trait_vtable_mr_audit" : command => do
     ``dv_dynRefDataValid_scalar_universal,
     ``dv_v3_evalVirtualCall_slot_universal,
     ``dv_v3_evalVirtualCall_slot_universal_nonvacuous,
+    ``dv_v3_evalVirtualCall_linked_universal,
     ``dv_v3_vtableMethodLookup_universal_M,
     ``dv_v3_c16_callee_entry_matches_corpus_state,
     ``dv_vtableEnvOk_universal,
-    ``dv_vtableEnvOk_universal_nonvacuous,
     ``dv_dynRefDataValid_scalar_32bit_universal,
     ``dv_v1_uninhabited_ub_universal_M,
     ``dv_v2_evalDynToDynUnsize_universal,
@@ -4023,6 +4473,7 @@ elab "#assert_dyn_trait_vtable_mr_audit" : command => do
       throwError "MR observer/law {c} unexpectedly depends on Classical.choice"
   let required : List Lean.Name := [
     ``dvVTables_layoutRel,
+    ``dvTrustedObserve_eq_run,
     ``dv_wfVTableEntry_minirust_valid_layout,
     ``dv_wfVTableEntry_minirust_valid_layout_nonvacuous,
     ``dv_dynSizeAlignOfVal_agrees_computeSizeAlign_M,
@@ -4040,6 +4491,8 @@ elab "#assert_dyn_trait_vtable_mr_audit" : command => do
     ``dv_v1_null_and_misaligned_ref_unsize_ub_universal_M_nonvacuous,
     ``dv_v3_evalVirtualCall_slot_universal,
     ``dv_v3_evalVirtualCall_slot_universal_nonvacuous,
+    ``dv_v3_evalVirtualCall_linked_universal,
+    ``dv_v3_evalVirtualCall_linked_universal_nonvacuous,
     ``dv_v3_vtableMethodLookup_universal_M,
     ``dv_v3_vtableMethodLookup_universal_M_nonvacuous,
     ``dv_v3_trusted_dispatch_gates_witness,

@@ -233,7 +233,7 @@ shadow evaluators: every key invokes `runTrustedVerdict` ->
 fixture (`dvTrustedFixture`) from its initial state (`dvTrustedInit`). -/
 def dvAnnealEval (mode : DynVtMode) (v : DynVtVariant) (c : DynVtCase)
     (_ch : Unit) : Option (Corpus.Verdict DynTraitVTableObs) :=
-  runTrustedVerdict (dvTrustedFixture v c) dvTrustedFuel
+  runTrustedVerdict (dvTrustedFixture (dvModeProtected mode) v c) dvTrustedFuel
     (dvTrustedInit (dvModeProtected mode) v c)
 
 /-- The frozen 32-key verdict table shared by all three authorities. -/

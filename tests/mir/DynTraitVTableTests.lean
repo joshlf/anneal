@@ -216,8 +216,11 @@ theorem dv_mr_deep_theorems_used :
   have _ := @dv_v1_null_and_misaligned_ref_unsize_ub_universal_M_nonvacuous
   have _ := @dv_v3_evalVirtualCall_slot_universal
   have _ := @dv_v3_evalVirtualCall_slot_universal_nonvacuous
+  have _ := @dv_v3_evalVirtualCall_linked_universal
+  have _ := @dv_v3_evalVirtualCall_linked_universal_nonvacuous
   have _ := @dv_v3_vtableMethodLookup_universal_M
   have _ := @dv_v3_vtableMethodLookup_universal_M_nonvacuous
+  have _ := @dvTrustedObserve_eq_run
   have _ := @dv_v3_trusted_dispatch_gates_witness
   have _ := @dv_v3_nonMethod_slot_ub_vs_minirust_specPanic
   have _ := @dv_v3_c16_callee_entry_matches_corpus_state
@@ -505,11 +508,11 @@ run_cmd do
     -- families are definitionally IDENTICAL between `MiniRustSpec` and `LeanMiriSpec`.
     let capMirTy := mkConst `Trusted.Rustc.V2026_06_01.MirAst.CapturedMir
     let fixtureNames : List Name :=
-      [ `dvVTables, `dvVirtualMethods, `dvCallees, `dvV1RefUnsizeMir,
-        `dvV1RawUnsizeMir, `dvV1RefArgUnsizeMir, `dvV1MutUnsizeMir, `dvV1PinUnsizeMir,
-        `dvV1ArgUnsizeMir, `dvV2UpcastMir, `dvV2UpcastSuperMir, `dvV2UpcastSideMir,
-        `dvV2UpcastBaseMir, `dvV2UpcastAltMir, `dvV2NopRefMir, `dvV2NopRawMir,
-        `dvGetU32Mir, `dvGetU64Mir, `dvPokeU32Mir, `dvV3CallU32Mir,
+      [ `dvVTables, `dvVirtualMethods, `dvCallees, `dvKeyInitSpec, `dvKeyCallees,
+        `dvV1RefUnsizeMir, `dvV1RawUnsizeMir, `dvV1RefArgUnsizeMir, `dvV1MutUnsizeMir,
+        `dvV1PinUnsizeMir, `dvV1ArgUnsizeMir, `dvV2UpcastMir, `dvV2UpcastSuperMir,
+        `dvV2UpcastSideMir, `dvV2UpcastBaseMir, `dvV2UpcastAltMir, `dvV2NopRefMir,
+        `dvV2NopRawMir, `dvGetU32Mir, `dvGetU64Mir, `dvPokeU32Mir, `dvV3CallU32Mir,
         `dvV3CallU64Mir, `dvV3CallOobMir, `dvV3CallHdrMir, `dvV3ArgCallMir,
         `dvV3ProtectedPokeMir, `dvV3PokeCallerMir, `dvV4SizeSafeMir, `dvV4AlignSafeMir,
         `dvV4IntrLayoutMir, `dvV4RawBorrowMir, `dvV4WideCmpMir, `dvV4WideEqMir,
@@ -524,12 +527,15 @@ run_cmd do
         (mkApp2 (mkConst ``Eq.refl [1]) ty lhs)
       added := added.push lockName
       lockCount := lockCount + 1
-    -- 3b. Per-key fixture locks: prove by `Eq.refl` that Authority 0 (`dvTrustedFixture`) and
-    -- Authority 2 (`dvLmFixture`) execute the EXACT SAME `CapturedMir` body on all 15 non-c16
-    -- keys, and explicitly pin the c16 key (`(2, 3)`: Trusted runs callee-level
-    -- `dvV3ProtectedPokeMir`, bridged to caller-level `dvV3PokeCallerMir` by
-    -- `dv_v3_c16_callee_entry_matches_corpus_state`, while LM runs `dvV3PokeCallerMir` and
-    -- ALSO witnesses `dvV3ProtectedPokeMir` in `dv_c16_witnesses`).
+    -- 3b. Per-key fixture, initial-state spec, and callee locks:
+    --   * In `protectedTB` mode (`true`), ALL 16/16 keys — including Crubit `c16` (`(2, 3)` =
+    --     `dvV3PokeCallerMir`) — satisfy `MR.dvTrustedFixture true v c = LM.dvLmFixture vi ci`
+    --     by `Eq.refl`.
+    --   * In `basic` mode (`false`), all 15 non-c16 keys satisfy `MR.dvTrustedFixture false v c =
+    --     LM.dvLmFixture vi ci`, while `(false, 2, 3)` is pinned to `dvV3ProtectedPokeMir`
+    --     (bridged to `dvV3PokeCallerMir` by `dv_v3_c16_callee_entry_matches_corpus_state`).
+    --   * For ALL 16/16 keys, both `MR.dvKeyInitSpec vi ci = LM.dvKeyInitSpec vi ci` and
+    --     `MR.dvKeyCallees vi ci = LM.dvKeyCallees vi ci` hold by `Eq.refl`.
     let caseCtors : List (Name × Nat) :=
       [(`okPrimary, 0), (`okSecondary, 1), (`ubFault, 2), (`modeCase, 3)]
     let variantPairs : List (Name × Nat) :=
@@ -539,29 +545,49 @@ run_cmd do
       let vConst := mkConst (mrNs ++ `DynVtVariant ++ vc)
       for (cc, ci) in caseCtors do
         let cConst := mkConst (mrNs ++ `DynVtCase ++ cc)
-        let mrFix := mkApp2 (mkConst (mrNs ++ `dvTrustedFixture)) vConst cConst
+        let mrFixTB := mkApp3 (mkConst (mrNs ++ `dvTrustedFixture)) boolTrue vConst cConst
+        let mrFixBasic := mkApp3 (mkConst (mrNs ++ `dvTrustedFixture)) boolFalse vConst cConst
         let lmFix := mkApp2 (mkConst (lmNs ++ `dvLmFixture)) (mkNatLit vi) (mkNatLit ci)
+        -- ProtectedTB body lock (16/16 identical, including c16!)
+        let lockTB := ns ++ `keyLockTB ++ vc ++ cc
+        addThm lockTB (mkApp3 (mkConst ``Eq [1]) capMirTy mrFixTB lmFix)
+          (mkApp2 (mkConst ``Eq.refl [1]) capMirTy mrFixTB)
+        added := added.push lockTB
+        lockCount := lockCount + 1
+        -- Basic body lock (15/16 identical + explicit c16 pin)
         if vi == 2 && ci == 3 then
-          let lockMr := ns ++ `keyLock ++ `c16Trusted
-          addThm lockMr (mkApp3 (mkConst ``Eq [1]) capMirTy mrFix
+          let lockBasic := ns ++ `keyLockBasic ++ `c16Trusted
+          addThm lockBasic (mkApp3 (mkConst ``Eq [1]) capMirTy mrFixBasic
               (mkConst (mrNs ++ `dvV3ProtectedPokeMir)))
-            (mkApp2 (mkConst ``Eq.refl [1]) capMirTy mrFix)
-          added := added.push lockMr
-          lockCount := lockCount + 1
-          let lockLm := ns ++ `keyLock ++ `c16Lm
-          addThm lockLm (mkApp3 (mkConst ``Eq [1]) capMirTy lmFix
-              (mkConst (lmNs ++ `dvV3PokeCallerMir)))
-            (mkApp2 (mkConst ``Eq.refl [1]) capMirTy lmFix)
-          added := added.push lockLm
+            (mkApp2 (mkConst ``Eq.refl [1]) capMirTy mrFixBasic)
+          added := added.push lockBasic
           lockCount := lockCount + 1
         else
-          let lockName := ns ++ `keyLock ++ vc ++ cc
-          addThm lockName (mkApp3 (mkConst ``Eq [1]) capMirTy mrFix lmFix)
-            (mkApp2 (mkConst ``Eq.refl [1]) capMirTy mrFix)
-          added := added.push lockName
+          let lockBasic := ns ++ `keyLockBasic ++ vc ++ cc
+          addThm lockBasic (mkApp3 (mkConst ``Eq [1]) capMirTy mrFixBasic lmFix)
+            (mkApp2 (mkConst ``Eq.refl [1]) capMirTy mrFixBasic)
+          added := added.push lockBasic
           lockCount := lockCount + 1
-    unless lockCount = 50 do
-      throwError "cross-root: expected 50 fixture locks (33 named + 17 per-key), got {lockCount}"
+        -- Per-key initial-state spec lock (16/16 identical)
+        let mrSpec := mkApp2 (mkConst (mrNs ++ `dvKeyInitSpec)) (mkNatLit vi) (mkNatLit ci)
+        let lmSpec := mkApp2 (mkConst (lmNs ++ `dvKeyInitSpec)) (mkNatLit vi) (mkNatLit ci)
+        let specTy ← MetaM.run' <| inferType mrSpec
+        let lockSpec := ns ++ `keyInitSpecLock ++ vc ++ cc
+        addThm lockSpec (mkApp3 (mkConst ``Eq [1]) specTy mrSpec lmSpec)
+          (mkApp2 (mkConst ``Eq.refl [1]) specTy mrSpec)
+        added := added.push lockSpec
+        lockCount := lockCount + 1
+        -- Per-key callee list lock (16/16 identical)
+        let mrCal := mkApp2 (mkConst (mrNs ++ `dvKeyCallees)) (mkNatLit vi) (mkNatLit ci)
+        let lmCal := mkApp2 (mkConst (lmNs ++ `dvKeyCallees)) (mkNatLit vi) (mkNatLit ci)
+        let calTy ← MetaM.run' <| inferType mrCal
+        let lockCal := ns ++ `keyCalleeLock ++ vc ++ cc
+        addThm lockCal (mkApp3 (mkConst ``Eq [1]) calTy mrCal lmCal)
+          (mkApp2 (mkConst ``Eq.refl [1]) calTy mrCal)
+        added := added.push lockCal
+        lockCount := lockCount + 1
+    unless lockCount = 99 do
+      throwError "cross-root: expected 99 fixture/spec locks (35 named + 64 per-key), got {lockCount}"
 
     -- 4. Negative controls on scratch copies of the environment: the Lean kernel MUST reject
     -- every forged theorem, mode-inverted / variant-swapped authority, colliding or
@@ -635,23 +661,23 @@ run_cmd do
         ("swapped per-key fixture lock (thinUnsize.okPrimary != thinUnsize.okSecondary)", .thmDecl {
           name := ns ++ `forged.swappedKeyLock, levelParams := [],
           type := mkApp3 (mkConst ``Eq [1]) capMirTy
-            (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
+            (mkApp3 (mkConst (mrNs ++ `dvTrustedFixture)) boolTrue
               (mkConst (mrNs ++ `DynVtVariant ++ `thinUnsize))
               (mkConst (mrNs ++ `DynVtCase ++ `okPrimary)))
             (mkApp2 (mkConst (lmNs ++ `dvLmFixture)) (mkNatLit 0) (mkNatLit 1)),
           value := mkApp2 (mkConst ``Eq.refl [1]) capMirTy
-            (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
+            (mkApp3 (mkConst (mrNs ++ `dvTrustedFixture)) boolTrue
               (mkConst (mrNs ++ `DynVtVariant ++ `thinUnsize))
               (mkConst (mrNs ++ `DynVtCase ++ `okPrimary))) }),
-        ("forged c16 key fixture identity (ProtectedPoke != PokeCaller)", .thmDecl {
+        ("forged basic-mode c16 key fixture identity (ProtectedPoke != PokeCaller)", .thmDecl {
           name := ns ++ `forged.c16FixtureConflation, levelParams := [],
           type := mkApp3 (mkConst ``Eq [1]) capMirTy
-            (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
+            (mkApp3 (mkConst (mrNs ++ `dvTrustedFixture)) boolFalse
               (mkConst (mrNs ++ `DynVtVariant ++ `virtualDispatchAndProtector))
               (mkConst (mrNs ++ `DynVtCase ++ `modeCase)))
             (mkApp2 (mkConst (lmNs ++ `dvLmFixture)) (mkNatLit 2) (mkNatLit 3)),
           value := mkApp2 (mkConst ``Eq.refl [1]) capMirTy
-            (mkApp2 (mkConst (mrNs ++ `dvTrustedFixture))
+            (mkApp3 (mkConst (mrNs ++ `dvTrustedFixture)) boolFalse
               (mkConst (mrNs ++ `DynVtVariant ++ `virtualDispatchAndProtector))
               (mkConst (mrNs ++ `DynVtCase ++ `modeCase))) }),
         ("forged LM execution of a non-locked fixture at key (0, 0)", .thmDecl {
@@ -661,7 +687,37 @@ run_cmd do
               (mkApp2 (mkConst (lmNs ++ `dvLmFixture)) (mkNatLit 0) (mkNatLit 1))
               (mkApp2 (mkConst (lmNs ++ `dvLmCallees)) (mkNatLit 0) (mkNatLit 0)) boolFalse
               (mkApp2 (mkConst (lmNs ++ `dvLmInit)) (mkNatLit 0) (mkNatLit 0))),
-          value := mkApp2 (mkConst ``Eq.refl [1]) lmObsTy (lmObserveAt false 0 0) }) ]
+          value := mkApp2 (mkConst ``Eq.refl [1]) lmObsTy (lmObserveAt false 0 0) }),
+        ("forged Trusted execution of a non-locked fixture at key (0, 0)", .thmDecl {
+          name := ns ++ `forged.trustedRunsUnlockedFixture, levelParams := [],
+          type :=
+            let trObsTy := mkConst (mrNs ++ `DynVtTrustedObs)
+            let v0 := mkConst (mrNs ++ `DynVtVariant ++ `thinUnsize)
+            let c0 := mkConst (mrNs ++ `DynVtCase ++ `okPrimary)
+            let c1 := mkConst (mrNs ++ `DynVtCase ++ `okSecondary)
+            let lhs := mkApp3 (mkConst (mrNs ++ `dvTrustedObserve)) boolFalse v0 c0
+            let rhs := mkApp3 (mkConst (mrNs ++ `dvRunTrusted))
+              (mkApp3 (mkConst (mrNs ++ `dvTrustedFixture)) boolFalse v0 c1)
+              (mkConst (mrNs ++ `dvTrustedFuel))
+              (mkApp3 (mkConst (mrNs ++ `dvTrustedInit)) boolFalse v0 c0)
+            mkApp3 (mkConst ``Eq [1]) trObsTy lhs rhs,
+          value :=
+            let trObsTy := mkConst (mrNs ++ `DynVtTrustedObs)
+            let v0 := mkConst (mrNs ++ `DynVtVariant ++ `thinUnsize)
+            let c0 := mkConst (mrNs ++ `DynVtCase ++ `okPrimary)
+            mkApp2 (mkConst ``Eq.refl [1]) trObsTy
+              (mkApp3 (mkConst (mrNs ++ `dvTrustedObserve)) boolFalse v0 c0) }),
+        ("swapped per-key init-spec lock (disabled live (3,0) != frozen dead (3,2))", .thmDecl {
+          name := ns ++ `forged.swappedInitSpecLock, levelParams := [],
+          type :=
+            let spTy := mkConst (mrNs ++ `DvKeyInitSpec)
+            mkApp3 (mkConst ``Eq [1]) spTy
+              (mkApp2 (mkConst (mrNs ++ `dvKeyInitSpec)) (mkNatLit 3) (mkNatLit 0))
+              (mkApp2 (mkConst (lmNs ++ `dvKeyInitSpec)) (mkNatLit 3) (mkNatLit 2)),
+          value :=
+            let spTy := mkConst (mrNs ++ `DvKeyInitSpec)
+            mkApp2 (mkConst ``Eq.refl [1]) spTy
+              (mkApp2 (mkConst (mrNs ++ `dvKeyInitSpec)) (mkNatLit 3) (mkNatLit 0)) }) ]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
@@ -721,6 +777,8 @@ run_cmd do
         lmNs ++ `dvGetMethod_nonMethod_ub,
         lmNs ++ `dvRegistryReserve_eq_lookupVTableFor,
         lmNs ++ `dvGetPointer_eq,
+        lmNs ++ `dvUnsizeIntoPointer_thin_agrees_trusted,
+        lmNs ++ `dvResolveVirtual_agrees_trusted,
         lmNs ++ `dvLmObserve_v1_thinUnsize_table,
         lmNs ++ `dvLmObserve_v2_dynUpcastAndNop_table,
         lmNs ++ `dvLmObserve_v3_virtualDispatchAndProtector_table,
@@ -735,6 +793,8 @@ run_cmd do
         lmNs ++ `dv_conservative_law_realizable,
         lmNs ++ `dv_vtable_check_agreement_realizable,
         lmNs ++ `dv_getMethod_realizable,
+        lmNs ++ `dv_unsize_agrees_realizable,
+        lmNs ++ `dv_resolveVirtual_agrees_realizable,
         lmNs ++ `dv_extra_witnesses,
         lmNs ++ `dv_c16_witnesses,
         lmNs ++ `dv_kani5216_uninhabited_witness,
@@ -804,9 +864,14 @@ run_cmd do
         `Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta,
         `LeanMiriSpec.DynTraitVTableLM.dvLmObserve,
         `LeanMiriSpec.DynTraitVTableLM.dvLmFixture,
+        `LeanMiriSpec.DynTraitVTableLM.dvLmCallees,
         `LeanMiriSpec.DynTraitVTableLM.dvLmInit,
+        `LeanMiriSpec.DynTraitVTableLM.dvKeyInitSpec,
+        `LeanMiriSpec.DynTraitVTableLM.dvKeyCallees,
         `MiniRustSpec.DynTraitVTableMR.dvTrustedFixture,
         `MiniRustSpec.DynTraitVTableMR.dvTrustedInit,
+        `MiniRustSpec.DynTraitVTableMR.dvKeyInitSpec,
+        `MiniRustSpec.DynTraitVTableMR.dvKeyCallees,
         `LeanMiriSpec.DynTraitVTableLM.annealStepHooksDynTraitVTableFor ]
     for req in requiredReach do
       unless (env.find? req).isSome do
@@ -837,9 +902,9 @@ run_cmd do
     { fileName := "<dv-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 85 && bundleCount = 5 && lockCount = 50 && rejectedCount = 15 do
+  unless addedCount = 134 && bundleCount = 5 && lockCount = 99 && rejectedCount = 17 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount})"
-  logInfo m!"dv cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
+  logInfo m!"dv cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture/spec locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
 end Anneal.Mir.DynTraitVTableTests
 
