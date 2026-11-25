@@ -331,6 +331,8 @@ witnesses proving committed segment-0 state mutations survive inside `result.tre
 faults on a protected node! -/
 theorem lm_ep2_tree_borrows_and_protector_committed_prefix_on_error :
     (type_of% @tbAccessExactWP_iff) ∧
+    (type_of% @tbAccessSymbolicPre_iff) ∧
+    (type_of% @tbAccessCursorsPre_of_ne_completed) ∧
     (type_of% @tbDeallocExactWP_iff) ∧
     (type_of% @tbDealloc_accessFailure_retains_tree) ∧
     (type_of% @protectorReleaseExactWP_iff) ∧
@@ -338,7 +340,8 @@ theorem lm_ep2_tree_borrows_and_protector_committed_prefix_on_error :
     (type_of% @protectorRelease_missingTag_exactWP) ∧
     (type_of% @tb_access_committed_prefix_on_error_witness) ∧
     (type_of% @protector_release_committed_prefix_on_error_witness) :=
-  ⟨@tbAccessExactWP_iff, @tbDeallocExactWP_iff, @tbDealloc_accessFailure_retains_tree,
+  ⟨@tbAccessExactWP_iff, @tbAccessSymbolicPre_iff, @tbAccessCursorsPre_of_ne_completed,
+   @tbDeallocExactWP_iff, @tbDealloc_accessFailure_retains_tree,
    @protectorReleaseExactWP_iff, @protectorReleaseSymbolicPre_iff,
    @protectorRelease_missingTag_exactWP,
    @tb_access_committed_prefix_on_error_witness,
@@ -433,6 +436,39 @@ theorem core_ep2_veil_frame_downstream_rejects_clobber (caller : SavedCallerFram
       (fun _ s' => frame_protectors (fun _ _ => True) s') s := by
   fail_if_success anneal_veil_frame
   exact trivial
+
+/-- Downstream automatic 6-step MIR statement + Bitprism smart-rvalue + terminator pipeline test:
+`anneal_veil_frame` synthesizes the write set across `storageLive ; assign (mkAddSmartRvalue ...) ;
+switchInt ; goto ; assert (.cleanup ...) ; unwindResume` with ZERO hand-built certificates,
+and REFUSES to frame a `callStack`-reading invariant across `unwindResume`! -/
+theorem core_ep2_veil_frame_downstream_full_mir_pipeline
+    (dstLoc : Local) (lhs rhs discr cond : Operand) (targets : SwitchTargets)
+    (bb1 bb2 cleanupBb : BasicBlockIdx)
+    (Pglob : List CapturedAllocation → Prop) (Pheap : AllocId → List CapturedAllocation → Prop)
+    (Pcl : List LocalSlot → Prop) (s : MachineState)
+    (hInv : frame_globals Pglob s ∧ frame_heap Pheap s ∧ frame_callerLocals Pcl s) :
+    let act :=
+      ExactAction.seq (evalStmtAction { kind := .storageLive dstLoc, span := "l" })
+        (ExactAction.seq
+          (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkAddSmartRvalue lhs rhs), span := "a" })
+          (ExactAction.seq
+            (evalTerminatorAction { kind := .switchInt discr targets, span := "s" })
+            (ExactAction.seq
+              (evalTerminatorAction { kind := .goto bb1, span := "g" })
+              (ExactAction.seq
+                (evalTerminatorAction
+                  { kind := .assert cond true bb2 (.cleanup cleanupBb), span := "c" })
+                (evalTerminatorAction { kind := .unwindResume, span := "u" })))))
+    AnnealExactWP act
+      (fun _ s' => frame_globals Pglob s' ∧ frame_heap Pheap s' ∧ frame_callerLocals Pcl s')
+      (fun _ s' => frame_globals Pglob s' ∧ frame_heap Pheap s' ∧ frame_callerLocals Pcl s') s ∧
+    AnnealExactWP (evalTerminatorAction { kind := .unwindResume, span := "u" })
+      (fun _ s' => frame_callStack (fun _ => True) s')
+      (fun _ s' => frame_callStack (fun _ => True) s') s := by
+  refine ⟨by anneal_veil_frame, ?_⟩
+  fail_if_success anneal_veil_frame
+  unfold AnnealExactWP
+  cases evalTerminatorAction { kind := .unwindResume, span := "u" } none s <;> trivial
 
 /-- Direct `AnnealExactWP` bidirectional `↔` negation refutation witness: a failing action
 discharges `onError := (· = "ub")` AND refutes `onError := False` via `exactWP_negation_refutation`. -/
@@ -1018,6 +1054,41 @@ run_cmd do
     let endianForgeTy := mkApp3 (mkConst ``Eq [1]) endianTy leEndian beEndian
     let endianForgePf := mkApp2 (mkConst ``Eq.refl [1]) endianTy leEndian
 
+    -- Ep2 Unconditional `protectorReleaseSymbolicPre` missing-tag forgery:
+    -- On `BorrowTree.new tag1 8`, releasing missing `tag4` reduces to `onError (.MissingTag tag4)`.
+    let borTagTy := mkConst `Miri.Memory.BorTag
+    let bTreeTy := mkConst `Miri.TreeBorrows.BorrowTree
+    let unitTy := mkConst ``Unit
+    let tag1Val := mkConst `Miri.Memory.BorTag.one
+    let sz8Val := mkApp (mkConst `Miri.ABI.Size.ofBytes) (mkApp (mkConst ``UInt64.ofNat) (mkNatLit 8))
+    let freshTreeVal := mkApp2 (mkConst `Miri.TreeBorrows.BorrowTree.new) tag1Val sz8Val
+    let protTagsEmpty := mkConst (ep2LmNs ++ `twoSegmentProtectedTags)
+    let postUnitFalse := Expr.lam `u unitTy (Expr.lam `t bTreeTy (mkConst ``False) .default) .default
+    let postUnitTrue := Expr.lam `u unitTy (Expr.lam `t bTreeTy (mkConst ``True) .default) .default
+    let errStatFalse := Expr.lam `e protStatusTy (Expr.lam `t bTreeTy (mkConst ``False) .default) .default
+    let errStatTrue := Expr.lam `e protStatusTy (Expr.lam `t bTreeTy (mkConst ``True) .default) .default
+    let symProtBaseTy := mkApp5 (mkConst (ep2LmNs ++ `protectorReleaseSymbolicPre))
+      tag4Val protTagsEmpty postUnitFalse errStatTrue freshTreeVal
+    let symProtForgeTy := mkApp5 (mkConst (ep2LmNs ++ `protectorReleaseSymbolicPre))
+      tag4Val protTagsEmpty postUnitTrue errStatFalse freshTreeVal
+
+    -- Ep2 `veil_frame` disjointness forgery (`storageLive` writes `.frameLocals`, so
+    -- `disjointFieldsBool [.frameStmtIdx, .frameLocals, .mem .borrows] [.frameLocals]` MUST be `false`):
+    let sfTy := mkConst (ep2CoreNs ++ `StateField)
+    let mfTy := mkConst (ep2CoreNs ++ `MemoryField)
+    let sfStmt := mkConst (ep2CoreNs ++ `StateField.frameStmtIdx)
+    let sfLoc := mkConst (ep2CoreNs ++ `StateField.frameLocals)
+    let sfBor := mkApp (mkConst (ep2CoreNs ++ `StateField.mem))
+      (mkConst (ep2CoreNs ++ `MemoryField.borrows))
+    let sfNil := mkApp (mkConst ``List.nil [0]) sfTy
+    let sfWrite := mkApp3 (mkConst ``List.cons [0]) sfTy sfStmt
+      (mkApp3 (mkConst ``List.cons [0]) sfTy sfLoc
+        (mkApp3 (mkConst ``List.cons [0]) sfTy sfBor sfNil))
+    let sfRead := mkApp3 (mkConst ``List.cons [0]) sfTy sfLoc sfNil
+    let disjExpr := mkApp2 (mkConst (ep2CoreNs ++ `disjointFieldsBool)) sfWrite sfRead
+    let _ := borTagTy
+    let _ := mfTy
+
     let extraForged : List (String × Option Declaration × Declaration) :=
       [ ("ill-typed 0 = 1 sanity control", none,
           thm "zeroEqOne" (mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit 0) (mkNatLit 1))
@@ -1084,7 +1155,13 @@ run_cmd do
           thm "protForgedReleased" protForgeTy protForgePf),
         ("Ep2 forged LE = BE endianness on TargetDataLayout",
           some (thm "endianLeBase" endianBaseTy endianBasePf),
-          thm "endianLeEqBe" endianForgeTy endianForgePf) ]
+          thm "endianLeEqBe" endianForgeTy endianForgePf),
+        ("Ep2 forged unconditional protectorReleaseSymbolicPre missing-tag claims success",
+          some (thm "symProtMissBase" symProtBaseTy (mkConst ``True.intro)),
+          thm "symProtMissForgedOk" symProtForgeTy (mkConst ``True.intro)),
+        ("Ep2 forged veil_frame disjointness for storageLive clobbering frameLocals",
+          some (thm "veilLiveDisjBaseFalse" (eqFalse disjExpr) reflFalse),
+          thm "veilLiveDisjForgedTrue" (eqTrue disjExpr) reflTrue) ]
     for (what, baseOpt, d) in extraForged do
       if let some baseDecl := baseOpt then
         if let some err ← acceptsMsg baseDecl then
@@ -1255,9 +1332,9 @@ run_cmd do
     { fileName := "<ep2-cross-frame-exactwp-cross-root>", fileMap := default,
       options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 54 && rejectedCount = 32 do
+  unless addedCount = 54 && rejectedCount = 34 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
-  logInfo m!"cross-frame/exact-wp cross-root kernel closure: added {addedCount} declarations, rejected {rejectedCount} forged controls (14 two-sided boolean + 18 baseline-paired value/Prop), verified Std.Do-free ExactWpAndSmartCtors, reached all 6 modules + MiniRust+Miri+MemoryLemmas+Trusted, axioms {crAxioms}"
+  logInfo m!"cross-frame/exact-wp cross-root kernel closure: added {addedCount} declarations, rejected {rejectedCount} forged controls (14 two-sided boolean + 20 baseline-paired value/Prop), verified Std.Do-free ExactWpAndSmartCtors, reached all 6 modules + MiniRust+Miri+MemoryLemmas+Trusted, axioms {crAxioms}"
 
 /-! ## §3. Test Module Axiom Audit -/
 

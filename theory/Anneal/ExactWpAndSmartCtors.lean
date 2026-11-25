@@ -3849,6 +3849,725 @@ theorem assign_const_local_modifiesOnlyFields (dstLoc : Local) (ty : Ty) (sc : S
               | activeProtectors => exact hProt
               | _ => rfl
 
+/-- `ExactAction.pure` and `ExactAction.throw` modify ZERO fields (`[]`). -/
+theorem exactAction_pure_modifiesOnlyFields {E A : Type} (a : A) :
+    ModifiesOnlyFields [] (ExactAction.pure a : ExactAction MachineState E A) :=
+  fun s => AgreeOutsideFields.refl [] s
+
+theorem exactAction_throw_modifiesOnlyFields {E A : Type} (e : E) :
+    ModifiesOnlyFields [] (ExactAction.throw e : ExactAction MachineState E A) :=
+  fun s => AgreeOutsideFields.refl [] s
+
+/-- `StatementKind.storageLive` modifies ONLY `[.frameStmtIdx, .frameLocals, .mem .borrows]`. -/
+theorem storageLive_modifiesOnlyFields (loc : Local) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .storageLive loc, span := span } localDecls layouts) := by
+  intro s
+  unfold evalStmtAction evalStmt
+  dsimp only
+  cases get? s.frame.locals loc with
+  | none => exact AgreeOutsideFields.refl _ s
+  | some _ =>
+    cases set? s.frame.locals loc .uninit with
+    | none => exact AgreeOutsideFields.refl _ s
+    | some locals' =>
+      cases hProt : s.memory.activeProtectors with
+      | nil =>
+        simp only [liftMirStepNode, MirStepNode.step]
+        intro f hf
+        cases f with
+        | frameBlockIdx => rfl
+        | frameStmtIdx => exact False.elim (hf (by simp))
+        | frameLocals => exact False.elim (hf (by simp))
+        | mem mf =>
+          cases mf with
+          | borrows => exact False.elim (hf (by simp))
+          | activeProtectors => exact hProt
+          | _ => rfl
+      | cons ph pt =>
+        cases hConf : hasProtectedLocalBorrow s.memory.borrows (ph :: pt) loc (length s.memory.callStack) with
+        | true =>
+          simp only [hConf, liftMirStepNode, MirStepNode.fail]
+          exact AgreeOutsideFields.refl _ s
+        | false =>
+          simp only [hConf, liftMirStepNode, MirStepNode.step]
+          intro f hf
+          cases f with
+          | frameBlockIdx => rfl
+          | frameStmtIdx => exact False.elim (hf (by simp))
+          | frameLocals => exact False.elim (hf (by simp))
+          | mem mf =>
+            cases mf with
+            | borrows => exact False.elim (hf (by simp))
+            | activeProtectors => exact hProt
+            | _ => rfl
+
+/-- `StatementKind.storageDead` modifies ONLY `[.frameStmtIdx, .frameLocals, .mem .borrows]`. -/
+theorem storageDead_modifiesOnlyFields (loc : Local) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .storageDead loc, span := span } localDecls layouts) := by
+  intro s
+  unfold evalStmtAction evalStmt
+  dsimp only
+  cases get? s.frame.locals loc with
+  | none => exact AgreeOutsideFields.refl _ s
+  | some _ =>
+    cases set? s.frame.locals loc .dead with
+    | none => exact AgreeOutsideFields.refl _ s
+    | some locals' =>
+      cases hProt : s.memory.activeProtectors with
+      | nil =>
+        simp only [liftMirStepNode, MirStepNode.step]
+        intro f hf
+        cases f with
+        | frameBlockIdx => rfl
+        | frameStmtIdx => exact False.elim (hf (by simp))
+        | frameLocals => exact False.elim (hf (by simp))
+        | mem mf =>
+          cases mf with
+          | borrows => exact False.elim (hf (by simp))
+          | activeProtectors => exact hProt
+          | _ => rfl
+      | cons ph pt =>
+        cases hConf : hasProtectedLocalBorrow s.memory.borrows (ph :: pt) loc (length s.memory.callStack) with
+        | true =>
+          simp only [hConf, liftMirStepNode, MirStepNode.fail]
+          exact AgreeOutsideFields.refl _ s
+        | false =>
+          simp only [hConf, liftMirStepNode, MirStepNode.step]
+          intro f hf
+          cases f with
+          | frameBlockIdx => rfl
+          | frameStmtIdx => exact False.elim (hf (by simp))
+          | frameLocals => exact False.elim (hf (by simp))
+          | mem mf =>
+            cases mf with
+            | borrows => exact False.elim (hf (by simp))
+            | activeProtectors => exact hProt
+            | _ => rfl
+
+/-- Helper: `evalScalarBinOp` on the 8 wrapping/bitwise ops never modifies `Memory` on `.ok`. -/
+private theorem evalScalarBinOp_wrapping_mem_eq {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (lhs rhs : ScalarInt) (locals : List LocalSlot) (mem : Memory) (isSigned : Bool)
+    (val : Value) (locals₁ : List LocalSlot) (mem₁ : Memory)
+    (h : evalScalarBinOp op lhs rhs locals mem isSigned = .ok val locals₁ mem₁) :
+    mem₁ = mem := by
+  unfold evalScalarBinOp at h
+  cases hSz0 : Nat.beq lhs.sizeBytes 0 with
+  | true => rw [hSz0] at h; cases h
+  | false =>
+    rw [hSz0] at h; dsimp only at h
+    rcases hSafe with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hEq] at h; cases h
+      | true => rw [hEq] at h; cases h; rfl
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hEq] at h; cases h
+      | true =>
+        rw [hEq] at h; dsimp only at h
+        cases hLe : Nat.ble rhs.bits lhs.bits with
+        | false => rw [hLe] at h; cases h; rfl
+        | true => rw [hLe] at h; cases h; rfl
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hEq] at h; cases h
+      | true => rw [hEq] at h; cases h; rfl
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hEq] at h; cases h
+      | true => rw [hEq] at h; cases h; rfl
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hEq] at h; cases h
+      | true => rw [hEq] at h; cases h; rfl
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hEq] at h; cases h
+      | true => rw [hEq] at h; cases h; rfl
+    · cases hR0 : Nat.beq rhs.sizeBytes 0 with
+      | true => rw [hR0] at h; cases h
+      | false => rw [hR0] at h; cases h; rfl
+    · cases hR0 : Nat.beq rhs.sizeBytes 0 with
+      | true => rw [hR0] at h; cases h
+      | false =>
+        rw [hR0] at h; dsimp only at h
+        cases isSigned <;> (cases h; rfl)
+
+/-- Helper: `evalRvalue` on `.use op` (for ANY operand `op`, including derefs!) only ever
+modifies `MemoryField.borrows`. -/
+private theorem evalRvalue_use_mem_agrees (locals : List LocalSlot) (op : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (val : Value) (locals₁ : List LocalSlot) (mem₁ : Memory)
+    (h : evalRvalue locals (.use op) mem localDecls layouts = .ok val locals₁ mem₁) :
+    ∀ mf : MemoryField, mf ≠ .borrows → MemFieldAgree mf mem mem₁ := by
+  simp only [evalRvalue] at h
+  cases hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+  | ub => rw [hOp] at h; cases h
+  | unsupported => rw [hOp] at h; cases h
+  | ok v locs' =>
+    rw [hOp] at h; dsimp only at h
+    cases hVal : validateLoadedValue layouts localDecls op v with
+    | false => rw [hVal] at h; cases h
+    | true =>
+      rw [hVal] at h; dsimp only at h
+      cases op with
+      | constant _ => cases h; intro mf _; cases mf <;> rfl
+      | copy p =>
+        cases p with
+        | mk ptrLoc proj =>
+          cases proj with
+          | nil => cases h; intro mf _; cases mf <;> rfl
+          | cons pe restProj =>
+            cases pe with
+            | deref =>
+              cases hB : mem.borrows with
+              | nil => rw [hB] at h; cases h; intro mf _; cases mf <;> rfl
+              | cons b1 bs1 =>
+                cases bs1 with
+                | nil => rw [hB] at h; cases h; intro mf _; cases mf <;> rfl
+                | cons b2 restB =>
+                  rw [hB] at h; dsimp only at h
+                  cases hUb : derefReadTreeUB locals ptrLoc restProj (b1 :: b2 :: restB) mem.activeProtectors with
+                  | true => rw [hUb] at h; cases h
+                  | false =>
+                    rw [hUb] at h; cases h
+                    intro mf hNe; cases mf with
+                    | borrows => exact absurd rfl hNe
+                    | _ => rfl
+            | _ => cases h; intro mf _; cases mf <;> rfl
+      | move p =>
+        cases p with
+        | mk ptrLoc proj =>
+          cases proj with
+          | nil => cases h; intro mf _; cases mf <;> rfl
+          | cons pe restProj =>
+            cases pe with
+            | deref =>
+              cases hB : mem.borrows with
+              | nil => rw [hB] at h; cases h; intro mf _; cases mf <;> rfl
+              | cons b1 bs1 =>
+                cases bs1 with
+                | nil => rw [hB] at h; cases h; intro mf _; cases mf <;> rfl
+                | cons b2 restB =>
+                  rw [hB] at h; dsimp only at h
+                  cases hUb : derefReadTreeUB locals ptrLoc restProj (b1 :: b2 :: restB) mem.activeProtectors with
+                  | true => rw [hUb] at h; cases h
+                  | false =>
+                    rw [hUb] at h; cases h
+                    intro mf hNe; cases mf with
+                    | borrows => exact absurd rfl hNe
+                    | _ => rfl
+            | _ => cases h; intro mf _; cases mf <;> rfl
+
+/-- Helper: `evalRvalue` on `.binaryOp op lhs rhs` for any of the 8 wrapping/bitwise ops leaves
+`Memory` completely unchanged. -/
+private theorem evalRvalue_wrapping_binaryOp_mem_eq {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (locals : List LocalSlot) (lhs rhs : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (val : Value) (locals₁ : List LocalSlot) (mem₁ : Memory)
+    (h : evalRvalue locals (.binaryOp op lhs rhs) mem localDecls layouts = .ok val locals₁ mem₁) :
+    mem₁ = mem := by
+  have hNotRel := isPtrRelationalBinOp_wrapping_false hSafe localDecls layouts lhs rhs
+  simp only [evalRvalue] at h
+  cases hL : evalOperand locals lhs mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+  | ub => rw [hL] at h; cases h
+  | unsupported => rw [hL] at h; cases h
+  | ok lv locs₁ =>
+    rw [hL] at h; dsimp only at h
+    cases hR : evalOperand locs₁ rhs mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+    | ub => rw [hR] at h; cases h
+    | unsupported => rw [hR] at h; cases h
+    | ok rv locs₂ =>
+      rw [hR] at h; dsimp only at h
+      cases lv with
+      | scalar lsc =>
+        cases rv with
+        | scalar rsc =>
+          dsimp only at h
+          rcases hSafe with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+          · exact evalScalarBinOp_wrapping_mem_eq (Or.inl rfl) lsc rsc locs₂ mem _ val locals₁ mem₁ h
+          · exact evalScalarBinOp_wrapping_mem_eq (Or.inr (Or.inl rfl)) lsc rsc locs₂ mem _ val locals₁ mem₁ h
+          · exact evalScalarBinOp_wrapping_mem_eq (Or.inr (Or.inr (Or.inl rfl))) lsc rsc locs₂ mem _ val locals₁ mem₁ h
+          · exact evalScalarBinOp_wrapping_mem_eq (Or.inr (Or.inr (Or.inr (Or.inl rfl)))) lsc rsc locs₂ mem _ val locals₁ mem₁ h
+          · exact evalScalarBinOp_wrapping_mem_eq (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))) lsc rsc locs₂ mem _ val locals₁ mem₁ h
+          · exact evalScalarBinOp_wrapping_mem_eq (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl)))))) lsc rsc locs₂ mem _ val locals₁ mem₁ h
+          · exact evalScalarBinOp_wrapping_mem_eq (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))))) lsc rsc locs₂ mem _ val locals₁ mem₁ h
+          · exact evalScalarBinOp_wrapping_mem_eq (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr rfl))))))) lsc rsc locs₂ mem _ val locals₁ mem₁ h
+        | ptr _ _ => rw [hNotRel] at h; cases h
+        | _ => cases h
+      | ptr _ _ =>
+        cases rv with
+        | scalar _ =>
+          rcases hSafe with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+            (rw [hNotRel] at h; cases h)
+        | ptr _ _ => rw [hNotRel] at h; cases h
+        | _ => cases h
+      | aggregate lv' lf =>
+        cases rv with
+        | aggregate rv' rf =>
+          dsimp only at h
+          rw [evalWidePtrAggregateRelBinOp_wrapping_unsupported hSafe] at h; cases h
+        | _ => cases h
+      | _ => cases h
+
+/-- Generic direct-local assignment framing: for ANY `Rvalue` whose evaluation only modifies
+`MemoryField.borrows`, `StatementKind.assign ⟨dstLoc, []⟩ rv` modifies ONLY
+`[.frameStmtIdx, .frameLocals, .mem .borrows]`! -/
+theorem assign_direct_local_of_borrowsOnly_rvalue (dstLoc : Local) (rv : Rvalue)
+    (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hRv : ∀ locals mem val locals₁ mem₁,
+      evalRvalue locals rv mem localDecls layouts = .ok val locals₁ mem₁ →
+      ∀ mf : MemoryField, mf ≠ .borrows → MemFieldAgree mf mem mem₁) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ rv, span := span } localDecls layouts) := by
+  intro s
+  unfold evalStmtAction evalStmt
+  dsimp only
+  cases hEval : evalRvalue s.frame.locals rv s.memory localDecls layouts with
+  | ub => exact AgreeOutsideFields.refl _ s
+  | unsupported => exact AgreeOutsideFields.refl _ s
+  | ok val locals₁ mem₁ =>
+    have hMem := hRv s.frame.locals s.memory val locals₁ mem₁ hEval
+    dsimp only
+    cases get? locals₁ dstLoc with
+    | none => exact AgreeOutsideFields.refl _ s
+    | some slot =>
+      cases slot with
+      | dead => exact AgreeOutsideFields.refl _ s
+      | uninit | init _ =>
+        cases set? locals₁ dstLoc (.init val) with
+        | none => exact AgreeOutsideFields.refl _ s
+        | some locals₂ =>
+          cases hProt : mem₁.activeProtectors with
+          | nil =>
+            simp only [liftMirStepNode, MirStepNode.step]
+            intro f hf
+            cases f with
+            | frameBlockIdx => rfl
+            | frameStmtIdx => exact False.elim (hf (by simp))
+            | frameLocals => exact False.elim (hf (by simp))
+            | mem mf =>
+              by_cases hB : mf = .borrows
+              · subst hB; exact False.elim (hf (by simp))
+              · have hF := hMem mf hB
+                cases mf with
+                | borrows => exact absurd rfl hB
+                | activeProtectors =>
+                  simp only [StateFieldAgree, MemFieldAgree, advanceStmt] at hF ⊢
+                  exact hF.trans hProt
+                | _ => exact hF
+          | cons ph pt =>
+            cases hConf : hasProtectedWriteConflict mem₁.borrows (ph :: pt) dstLoc .none .nil 0 0
+                (length mem₁.callStack) with
+            | true =>
+              simp only [hConf, liftMirStepNode, MirStepNode.fail]
+              exact AgreeOutsideFields.refl _ s
+            | false =>
+              simp only [hConf, liftMirStepNode, MirStepNode.step]
+              intro f hf
+              cases f with
+              | frameBlockIdx => rfl
+              | frameStmtIdx => exact False.elim (hf (by simp))
+              | frameLocals => exact False.elim (hf (by simp))
+              | mem mf =>
+                by_cases hB : mf = .borrows
+                · subst hB; exact False.elim (hf (by simp))
+                · have hF := hMem mf hB
+                  cases mf with
+                  | borrows => exact absurd rfl hB
+                  | activeProtectors =>
+                    simp only [StateFieldAgree, MemFieldAgree, advanceStmt] at hF ⊢
+                    exact hF.trans hProt
+                  | _ => exact hF
+
+/-- General direct-local `.use op` assignment (for ANY operand `op`: constant, local copy/move,
+or pointer deref!) modifies ONLY `[.frameStmtIdx, .frameLocals, .mem .borrows]`. -/
+theorem assign_direct_use_modifiesOnlyFields (dstLoc : Local) (op : Operand)
+    (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (.use op), span := span }
+        localDecls layouts) :=
+  assign_direct_local_of_borrowsOnly_rvalue dstLoc (.use op) span localDecls layouts
+    (fun locals mem val locals₁ mem₁ h =>
+      evalRvalue_use_mem_agrees locals op mem localDecls layouts val locals₁ mem₁ h)
+
+/-- General direct-local wrapping/bitwise `.binaryOp op lhs rhs` assignment modifies ONLY
+`[.frameStmtIdx, .frameLocals, .mem .borrows]`. -/
+theorem assign_direct_wrapping_binaryOp_modifiesOnlyFields (dstLoc : Local) {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (lhs rhs : Operand) (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (.binaryOp op lhs rhs), span := span }
+        localDecls layouts) :=
+  assign_direct_local_of_borrowsOnly_rvalue dstLoc (.binaryOp op lhs rhs) span localDecls layouts
+    (fun locals mem val locals₁ mem₁ h mf _ => by
+      rw [evalRvalue_wrapping_binaryOp_mem_eq hSafe locals lhs rhs mem localDecls layouts val locals₁ mem₁ h]
+      cases mf <;> rfl)
+
+/-- Bitprism smart-constructor direct-local assignments (all 8 `mk*SmartRvalue` constructors)
+modify ONLY `[.frameStmtIdx, .frameLocals, .mem .borrows]`. -/
+theorem assign_direct_mkAddSmart_modifiesOnlyFields (dstLoc : Local) (lhs rhs : Operand)
+    (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkAddSmartRvalue lhs rhs), span := span }
+        localDecls layouts) := by
+  unfold mkAddSmartRvalue
+  split <;> repeat (first
+    | split
+    | exact assign_direct_use_modifiesOnlyFields dstLoc _ span localDecls layouts
+    | exact assign_direct_wrapping_binaryOp_modifiesOnlyFields dstLoc (Or.inl rfl) lhs rhs span localDecls layouts)
+
+theorem assign_direct_mkSubSmart_modifiesOnlyFields (dstLoc : Local) (lhs rhs : Operand)
+    (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkSubSmartRvalue lhs rhs), span := span }
+        localDecls layouts) := by
+  unfold mkSubSmartRvalue
+  split <;> repeat (first
+    | split
+    | exact assign_direct_use_modifiesOnlyFields dstLoc _ span localDecls layouts
+    | exact assign_direct_wrapping_binaryOp_modifiesOnlyFields dstLoc (Or.inr (Or.inl rfl)) lhs rhs span localDecls layouts)
+
+theorem assign_direct_mkMulSmart_modifiesOnlyFields (dstLoc : Local) (resTy : Ty)
+    (lhs rhs : Operand) (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkMulSmartRvalue resTy lhs rhs), span := span }
+        localDecls layouts) := by
+  unfold mkMulSmartRvalue
+  split <;> repeat (first
+    | split
+    | exact assign_direct_use_modifiesOnlyFields dstLoc _ span localDecls layouts
+    | exact assign_direct_wrapping_binaryOp_modifiesOnlyFields dstLoc (Or.inr (Or.inr (Or.inl rfl))) lhs rhs span localDecls layouts)
+
+theorem assign_direct_mkBitAndSmart_modifiesOnlyFields (dstLoc : Local) (resTy : Ty)
+    (lhs rhs : Operand) (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkBitAndSmartRvalue resTy lhs rhs), span := span }
+        localDecls layouts) := by
+  unfold mkBitAndSmartRvalue
+  split <;> repeat (first
+    | split
+    | exact assign_direct_use_modifiesOnlyFields dstLoc _ span localDecls layouts
+    | exact assign_direct_wrapping_binaryOp_modifiesOnlyFields dstLoc (Or.inr (Or.inr (Or.inr (Or.inl rfl)))) lhs rhs span localDecls layouts)
+
+theorem assign_direct_mkBitOrSmart_modifiesOnlyFields (dstLoc : Local) (resTy : Ty)
+    (lhs rhs : Operand) (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkBitOrSmartRvalue resTy lhs rhs), span := span }
+        localDecls layouts) := by
+  unfold mkBitOrSmartRvalue
+  split <;> repeat (first
+    | split
+    | exact assign_direct_use_modifiesOnlyFields dstLoc _ span localDecls layouts
+    | exact assign_direct_wrapping_binaryOp_modifiesOnlyFields dstLoc (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))) lhs rhs span localDecls layouts)
+
+theorem assign_direct_mkBitXorSmart_modifiesOnlyFields (dstLoc : Local) (lhs rhs : Operand)
+    (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkBitXorSmartRvalue lhs rhs), span := span }
+        localDecls layouts) := by
+  unfold mkBitXorSmartRvalue
+  split <;> repeat (first
+    | split
+    | exact assign_direct_use_modifiesOnlyFields dstLoc _ span localDecls layouts
+    | exact assign_direct_wrapping_binaryOp_modifiesOnlyFields dstLoc (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl)))))) lhs rhs span localDecls layouts)
+
+theorem assign_direct_mkShlSmart_modifiesOnlyFields (dstLoc : Local) (lhs rhs : Operand)
+    (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkShlSmartRvalue lhs rhs), span := span }
+        localDecls layouts) := by
+  unfold mkShlSmartRvalue
+  split <;> repeat (first
+    | split
+    | exact assign_direct_use_modifiesOnlyFields dstLoc _ span localDecls layouts
+    | exact assign_direct_wrapping_binaryOp_modifiesOnlyFields dstLoc (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))))) lhs rhs span localDecls layouts)
+
+theorem assign_direct_mkShrSmart_modifiesOnlyFields (dstLoc : Local) (lhs rhs : Operand)
+    (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ModifiesOnlyFields [.frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkShrSmartRvalue lhs rhs), span := span }
+        localDecls layouts) := by
+  unfold mkShrSmartRvalue
+  split <;> repeat (first
+    | split
+    | exact assign_direct_use_modifiesOnlyFields dstLoc _ span localDecls layouts
+    | exact assign_direct_wrapping_binaryOp_modifiesOnlyFields dstLoc (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr rfl))))))) lhs rhs span localDecls layouts)
+
+/-- `TerminatorKind.goto` modifies ONLY `[.frameBlockIdx, .frameStmtIdx]`. -/
+theorem goto_modifiesOnlyFields (target : BasicBlockIdx) (span : String)
+    (currentBody : Option CapturedMir) :
+    ModifiesOnlyFields [.frameBlockIdx, .frameStmtIdx]
+      (evalTerminatorAction { kind := .goto target, span := span } currentBody) := by
+  intro s
+  unfold evalTerminatorAction evalTerminator liftMirStepNode
+  intro f hf
+  cases f with
+  | frameBlockIdx => exact False.elim (hf (by simp))
+  | frameStmtIdx => exact False.elim (hf (by simp))
+  | frameLocals => rfl
+  | mem mf => cases mf <;> rfl
+
+/-- `TerminatorKind.switchInt` modifies ONLY `[.frameBlockIdx, .frameStmtIdx, .frameLocals]`. -/
+theorem switchInt_modifiesOnlyFields (discr : Operand) (targets : SwitchTargets)
+    (span : String) (currentBody : Option CapturedMir) :
+    ModifiesOnlyFields [.frameBlockIdx, .frameStmtIdx, .frameLocals]
+      (evalTerminatorAction { kind := .switchInt discr targets, span := span } currentBody) := by
+  intro s
+  unfold evalTerminatorAction evalTerminator
+  dsimp only
+  cases evalOperandWithBodyCast s.frame.locals discr s.memory.borrows s.memory.globals
+      (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable)
+      s.memory.callerLocals (bodyLocalDeclsOf currentBody) s.memory.callStack with
+  | ub => exact AgreeOutsideFields.refl _ s
+  | unsupported => exact AgreeOutsideFields.refl _ s
+  | ok v locals' =>
+    cases v with
+    | scalar sc =>
+      simp only [liftMirStepNode]
+      intro f hf
+      cases f with
+      | frameBlockIdx => exact False.elim (hf (by simp))
+      | frameStmtIdx => exact False.elim (hf (by simp))
+      | frameLocals => exact False.elim (hf (by simp))
+      | mem mf => cases mf <;> rfl
+    | _ => exact AgreeOutsideFields.refl _ s
+
+/-- Direct-local `TerminatorKind.drop ⟨loc, []⟩` modifies ONLY
+`[.frameBlockIdx, .frameStmtIdx, .frameLocals, .mem .borrows]`. -/
+theorem drop_direct_local_modifiesOnlyFields (loc : Local) (target : BasicBlockIdx)
+    (unwind : UnwindAction) (span : String) (currentBody : Option CapturedMir) :
+    ModifiesOnlyFields [.frameBlockIdx, .frameStmtIdx, .frameLocals, .mem .borrows]
+      (evalTerminatorAction { kind := .drop ⟨loc, []⟩ target unwind, span := span } currentBody) := by
+  intro s
+  unfold evalTerminatorAction evalTerminator
+  dsimp only
+  cases get? s.frame.locals loc with
+  | none => exact AgreeOutsideFields.refl _ s
+  | some slot =>
+    cases slot with
+    | dead => exact AgreeOutsideFields.refl _ s
+    | uninit | init _ =>
+      cases set? s.frame.locals loc .uninit with
+      | none => exact AgreeOutsideFields.refl _ s
+      | some locals' =>
+        cases hProt : s.memory.activeProtectors with
+        | nil =>
+          simp only [liftMirStepNode]
+          intro f hf
+          cases f with
+          | frameBlockIdx => exact False.elim (hf (by simp))
+          | frameStmtIdx => exact False.elim (hf (by simp))
+          | frameLocals => exact False.elim (hf (by simp))
+          | mem mf =>
+            cases mf with
+            | borrows => exact False.elim (hf (by simp))
+            | activeProtectors => exact hProt
+            | _ => rfl
+        | cons ph pt =>
+          cases hConf : hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none .nil 0 0
+              (length s.memory.callStack) with
+          | true =>
+            simp only [hConf, liftMirStepNode]
+            exact AgreeOutsideFields.refl _ s
+          | false =>
+            simp only [hConf, liftMirStepNode]
+            intro f hf
+            cases f with
+            | frameBlockIdx => exact False.elim (hf (by simp))
+            | frameStmtIdx => exact False.elim (hf (by simp))
+            | frameLocals => exact False.elim (hf (by simp))
+            | mem mf =>
+              cases mf with
+              | borrows => exact False.elim (hf (by simp))
+              | activeProtectors => exact hProt
+              | _ => rfl
+
+/-- Helper: `unwindFromCallStack` never modifies `globals`, `nextAllocId` (heap), `callerLocals`,
+`callees`, `traitImpls`, `fnPtrs`, `exposedAllocIds`, `rootUnwindCeiling`, `nextTag`, or
+`nextProtector`. -/
+private theorem unwindFromCallStack_agrees (stack : List SavedCallerFrame) (mem : Memory)
+    (nextState : MachineState)
+    (h : unwindFromCallStack stack mem = .running nextState) :
+    ∀ mf : MemoryField,
+      mf ≠ .borrows → mf ≠ .callStack → mf ≠ .activeCallee → mf ≠ .activeProtectors →
+      MemFieldAgree mf mem nextState.memory := by
+  induction stack generalizing mem with
+  | nil =>
+    unfold unwindFromCallStack at h
+    cases hCeil : mem.rootUnwindCeiling <;> (rw [hCeil] at h; cases h)
+  | cons caller rest ih =>
+    simp only [unwindFromCallStack] at h
+    cases hRet : caller.returnUnwind with
+    | unreachable => simp only [hRet] at h; cases h
+    | terminate => simp only [hRet] at h; cases h
+    | continue_ =>
+      simp only [hRet] at h
+      intro mf hB hC hA hP
+      let memNext : Memory := {
+        mem with
+        callStack := rest
+        activeCallee := .some caller.callerBody
+        activeProtectors := restoreCallerProtectors caller
+      }
+      have hRec := ih memNext h mf hB hC hA hP
+      cases mf with
+      | borrows => exact absurd rfl hB
+      | callStack => exact absurd rfl hC
+      | activeCallee => exact absurd rfl hA
+      | activeProtectors => exact absurd rfl hP
+      | _ => exact hRec
+    | cleanup _ =>
+      simp only [hRet] at h; cases h
+      intro mf hB hC hA hP
+      cases mf with
+      | borrows => exact absurd rfl hB
+      | callStack => exact absurd rfl hC
+      | activeCallee => exact absurd rfl hA
+      | activeProtectors => exact absurd rfl hP
+      | _ => rfl
+
+/-- `TerminatorKind.unwindResume` modifies ONLY
+`[.frameBlockIdx, .frameStmtIdx, .frameLocals, .mem .borrows, .mem .callStack, .mem .activeCallee, .mem .activeProtectors]`
+(preserving `globals`, `heap`/`nextAllocId`, `callerLocals`, `callees`, `traitImpls`, `fnPtrs`,
+`exposedAllocIds`, `rootUnwindCeiling`, `nextTag`, `nextProtector` across arbitrary call-stack unwinds!). -/
+theorem unwindResume_modifiesOnlyFields (span : String) (currentBody : Option CapturedMir) :
+    ModifiesOnlyFields
+      [.frameBlockIdx, .frameStmtIdx, .frameLocals, .mem .borrows, .mem .callStack,
+       .mem .activeCallee, .mem .activeProtectors]
+      (evalTerminatorAction { kind := .unwindResume, span := span } currentBody) := by
+  intro s
+  unfold evalTerminatorAction evalTerminator
+  dsimp only
+  cases hUnw : unwindFromCallStack s.memory.callStack s.memory with
+  | halted _ => exact AgreeOutsideFields.refl _ s
+  | faulted _ => exact AgreeOutsideFields.refl _ s
+  | running nextState =>
+    simp only [liftMirStepNode]
+    intro f hf
+    cases f with
+    | frameBlockIdx => exact False.elim (hf (by simp))
+    | frameStmtIdx => exact False.elim (hf (by simp))
+    | frameLocals => exact False.elim (hf (by simp))
+    | mem mf =>
+      cases mf with
+      | borrows => exact False.elim (hf (by simp))
+      | callStack => exact False.elim (hf (by simp))
+      | activeCallee => exact False.elim (hf (by simp))
+      | activeProtectors => exact False.elim (hf (by simp))
+      | _ =>
+        dsimp only [StateFieldAgree]
+        apply unwindFromCallStack_agrees s.memory.callStack s.memory nextState hUnw <;> decide
+
+/-- `TerminatorKind.assert` with `.cleanup cleanupBb` modifies ONLY
+`[.frameBlockIdx, .frameStmtIdx, .frameLocals]` (never modifies ANY `Memory` field!). -/
+theorem assert_cleanup_modifiesOnlyFields (cond : Operand) (expected : Bool)
+    (target cleanupBb : BasicBlockIdx) (span : String) (currentBody : Option CapturedMir) :
+    ModifiesOnlyFields [.frameBlockIdx, .frameStmtIdx, .frameLocals]
+      (evalTerminatorAction
+        { kind := .assert cond expected target (.cleanup cleanupBb), span := span }
+        currentBody) := by
+  intro s
+  unfold evalTerminatorAction evalTerminator
+  dsimp only
+  cases evalOperandWithBodyCast s.frame.locals cond s.memory.borrows s.memory.globals
+      (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable)
+      s.memory.callerLocals (bodyLocalDeclsOf currentBody) s.memory.callStack with
+  | ub => exact AgreeOutsideFields.refl _ s
+  | unsupported => exact AgreeOutsideFields.refl _ s
+  | ok v locals' =>
+    cases v with
+    | scalar sc =>
+      dsimp only
+      cases Nat.beq sc.bits (match expected with | true => 1 | false => 0) with
+      | true =>
+        simp only [liftMirStepNode]
+        intro f hf
+        cases f with
+        | frameBlockIdx => exact False.elim (hf (by simp))
+        | frameStmtIdx => exact False.elim (hf (by simp))
+        | frameLocals => exact False.elim (hf (by simp))
+        | mem mf => cases mf <;> rfl
+      | false =>
+        simp only [applyUnwindAction, liftMirStepNode]
+        intro f hf
+        cases f with
+        | frameBlockIdx => exact False.elim (hf (by simp))
+        | frameStmtIdx => exact False.elim (hf (by simp))
+        | frameLocals => exact False.elim (hf (by simp))
+        | mem mf => cases mf <;> rfl
+    | _ => exact AgreeOutsideFields.refl _ s
+
+/-- General `TerminatorKind.assert` (for ANY `UnwindAction` — `.cleanup`, `.continue_`,
+`.terminate`, or `.unreachable`!) modifies ONLY
+`[.frameBlockIdx, .frameStmtIdx, .frameLocals, .mem .borrows, .mem .callStack, .mem .activeCallee, .mem .activeProtectors]`. -/
+theorem assert_modifiesOnlyFields (cond : Operand) (expected : Bool)
+    (target : BasicBlockIdx) (unwind : UnwindAction) (span : String)
+    (currentBody : Option CapturedMir) :
+    ModifiesOnlyFields
+      [.frameBlockIdx, .frameStmtIdx, .frameLocals, .mem .borrows, .mem .callStack,
+       .mem .activeCallee, .mem .activeProtectors]
+      (evalTerminatorAction
+        { kind := .assert cond expected target unwind, span := span }
+        currentBody) := by
+  intro s
+  unfold evalTerminatorAction evalTerminator
+  dsimp only
+  cases evalOperandWithBodyCast s.frame.locals cond s.memory.borrows s.memory.globals
+      (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable)
+      s.memory.callerLocals (bodyLocalDeclsOf currentBody) s.memory.callStack with
+  | ub => exact AgreeOutsideFields.refl _ s
+  | unsupported => exact AgreeOutsideFields.refl _ s
+  | ok v locals' =>
+    cases v with
+    | scalar sc =>
+      dsimp only
+      cases Nat.beq sc.bits (match expected with | true => 1 | false => 0) with
+      | true =>
+        simp only [liftMirStepNode]
+        intro f hf
+        cases f with
+        | frameBlockIdx => exact False.elim (hf (by simp))
+        | frameStmtIdx => exact False.elim (hf (by simp))
+        | frameLocals => exact False.elim (hf (by simp))
+        | mem mf => cases mf <;> rfl
+      | false =>
+        cases unwind with
+        | unreachable | terminate => exact AgreeOutsideFields.refl _ s
+        | cleanup _ =>
+          simp only [applyUnwindAction, liftMirStepNode]
+          intro f hf
+          cases f with
+          | frameBlockIdx => exact False.elim (hf (by simp))
+          | frameStmtIdx => exact False.elim (hf (by simp))
+          | frameLocals => exact False.elim (hf (by simp))
+          | mem mf => cases mf <;> rfl
+        | continue_ =>
+          simp only [applyUnwindAction]
+          cases hUnw : unwindFromCallStack s.memory.callStack s.memory with
+          | halted _ => exact AgreeOutsideFields.refl _ s
+          | faulted _ => exact AgreeOutsideFields.refl _ s
+          | running nextState =>
+            simp only [liftMirStepNode]
+            intro f hf
+            cases f with
+            | frameBlockIdx => exact False.elim (hf (by simp))
+            | frameStmtIdx => exact False.elim (hf (by simp))
+            | frameLocals => exact False.elim (hf (by simp))
+            | mem mf =>
+              cases mf with
+              | borrows => exact False.elim (hf (by simp))
+              | callStack => exact False.elim (hf (by simp))
+              | activeCallee => exact False.elim (hf (by simp))
+              | activeProtectors => exact False.elim (hf (by simp))
+              | _ =>
+                dsimp only [StateFieldAgree]
+                apply unwindFromCallStack_agrees s.memory.callStack s.memory nextState hUnw <;> decide
+    | _ => exact AgreeOutsideFields.refl _ s
+
 /-- `TerminatorKind.unreachable` and `TerminatorKind.unwindTerminate` modify ZERO fields (`[]`). -/
 theorem unreachable_modifiesOnlyFields (span : String) (currentBody : Option CapturedMir) :
     ModifiesOnlyFields []
@@ -3864,26 +4583,48 @@ theorem unwindTerminate_modifiesOnlyFields (span : String) (currentBody : Option
 
 /-- Recursively SYNTHESIZE a `ModifiesOnlyFields ?W act` certificate (with `?W` inferred) by
 structural decomposition of `act` through `ExactAction.seq` / `ExactAction.bind` down to the
-library's real `Trusted.MirSemantics` transition framing lemmas — so callers never have to
-assemble write-field sets by hand. Falls back to hypotheses in context. -/
+library's real `Trusted.MirSemantics` transition framing lemmas (covering `pure`, `throw`, `nop`,
+`storageLive`, `storageDead`, general direct-local `.use`/wrapping-`.binaryOp`/Bitprism-smart
+assignments, `goto`, `switchInt`, direct-local `drop`, `assert` (tight `.cleanup` and general
+`UnwindAction`), `unwindResume`, `unreachable`, `unwindTerminate`, `restoreCallerProtectors`,
+`disableFrameBorrows`, and `frameDeallocProtector`). Falls back to hypotheses in context. -/
 syntax "anneal_veil_mods" : tactic
 
 macro_rules
   | `(tactic| anneal_veil_mods) => `(tactic| first
       | assumption
-      | (apply modifiesOnlyFields_seq
+      | (with_reducible apply modifiesOnlyFields_seq
          case hM => anneal_veil_mods
          case hN => anneal_veil_mods)
-      | (apply modifiesOnlyFields_bind
+      | (with_reducible apply modifiesOnlyFields_bind
          case hM => anneal_veil_mods
          case hK => intro _; anneal_veil_mods)
-      | apply restoreCallerProtectors_modifiesOnlyFields
-      | apply disableFrameBorrows_modifiesOnlyFields
-      | apply frameDeallocProtector_modifiesOnlyFields
-      | apply assign_const_local_modifiesOnlyFields
-      | apply nop_modifiesOnlyFields
-      | apply unreachable_modifiesOnlyFields
-      | apply unwindTerminate_modifiesOnlyFields)
+      | with_reducible apply exactAction_pure_modifiesOnlyFields
+      | with_reducible apply exactAction_throw_modifiesOnlyFields
+      | with_reducible apply restoreCallerProtectors_modifiesOnlyFields
+      | with_reducible apply disableFrameBorrows_modifiesOnlyFields
+      | with_reducible apply frameDeallocProtector_modifiesOnlyFields
+      | with_reducible apply assign_direct_mkAddSmart_modifiesOnlyFields
+      | with_reducible apply assign_direct_mkSubSmart_modifiesOnlyFields
+      | with_reducible apply assign_direct_mkMulSmart_modifiesOnlyFields
+      | with_reducible apply assign_direct_mkBitAndSmart_modifiesOnlyFields
+      | with_reducible apply assign_direct_mkBitOrSmart_modifiesOnlyFields
+      | with_reducible apply assign_direct_mkBitXorSmart_modifiesOnlyFields
+      | with_reducible apply assign_direct_mkShlSmart_modifiesOnlyFields
+      | with_reducible apply assign_direct_mkShrSmart_modifiesOnlyFields
+      | with_reducible apply assign_const_local_modifiesOnlyFields
+      | with_reducible apply assign_direct_use_modifiesOnlyFields
+      | with_reducible apply storageLive_modifiesOnlyFields
+      | with_reducible apply storageDead_modifiesOnlyFields
+      | with_reducible apply nop_modifiesOnlyFields
+      | with_reducible apply goto_modifiesOnlyFields
+      | with_reducible apply switchInt_modifiesOnlyFields
+      | with_reducible apply drop_direct_local_modifiesOnlyFields
+      | with_reducible apply assert_cleanup_modifiesOnlyFields
+      | with_reducible apply assert_modifiesOnlyFields
+      | with_reducible apply unwindResume_modifiesOnlyFields
+      | with_reducible apply unreachable_modifiesOnlyFields
+      | with_reducible apply unwindTerminate_modifiesOnlyFields)
 
 /-- Automatically discharge named-field `AnnealExactWP` preservation goals (`veil#209` style)
 using `veil_frame_preserves` / `exactWP_veil_frame`: SYNTHESIZES `ModifiesOnlyFields` for composite
@@ -3968,6 +4709,32 @@ theorem anneal_veil_frame_auto_bind_demo (caller : SavedCallerFrame) (depth nLoc
       (fun _ s' => frame_callerLocals Pcl s' ∧ frame_locals Ploc s') s := by
   anneal_veil_frame
 
+/-- **Fully automatic 6-step MIR statement + Bitprism smart-rvalue + terminator pipeline demo**:
+synthesizes the full composite write set across `storageLive ; assign (mkAddSmartRvalue lhs rhs) ;
+switchInt ; goto ; assert (.cleanup ...) ; unwindResume` with ZERO hand-built certificates,
+automatically preserving `globals ∧ heap ∧ callerLocals` on BOTH `.ok` and `.error`! -/
+theorem anneal_veil_frame_full_mir_pipeline_demo (dstLoc : Local) (lhs rhs discr cond : Operand)
+    (targets : SwitchTargets) (bb1 bb2 cleanupBb : BasicBlockIdx)
+    (Pglob : List CapturedAllocation → Prop) (Pheap : AllocId → List CapturedAllocation → Prop)
+    (Pcl : List LocalSlot → Prop) (s : MachineState)
+    (hInv : frame_globals Pglob s ∧ frame_heap Pheap s ∧ frame_callerLocals Pcl s) :
+    let act :=
+      ExactAction.seq (evalStmtAction { kind := .storageLive dstLoc, span := "live" })
+        (ExactAction.seq
+          (evalStmtAction { kind := .assign ⟨dstLoc, []⟩ (mkAddSmartRvalue lhs rhs), span := "add" })
+          (ExactAction.seq
+            (evalTerminatorAction { kind := .switchInt discr targets, span := "sw" })
+            (ExactAction.seq
+              (evalTerminatorAction { kind := .goto bb1, span := "gt" })
+              (ExactAction.seq
+                (evalTerminatorAction
+                  { kind := .assert cond true bb2 (.cleanup cleanupBb), span := "asrt" })
+                (evalTerminatorAction { kind := .unwindResume, span := "res" })))))
+    AnnealExactWP act
+      (fun _ s' => frame_globals Pglob s' ∧ frame_heap Pheap s' ∧ frame_callerLocals Pcl s')
+      (fun _ s' => frame_globals Pglob s' ∧ frame_heap Pheap s' ∧ frame_callerLocals Pcl s') s := by
+  anneal_veil_frame
+
 end VeilFrame
 
 /-! ## Part D. Episode 2 Core Capstone & Silent Import / Axiom / Bridge-Reality Audit -/
@@ -4023,7 +4790,17 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
     (type_of% @exactWP_veil_frame) ∧
     (type_of% @anneal_veil_frame_multistep_demo) ∧
     (type_of% @anneal_veil_frame_rejects_clobbered_field) ∧
-    (type_of% @anneal_veil_frame_auto_bind_demo) :=
+    (type_of% @anneal_veil_frame_auto_bind_demo) ∧
+    (type_of% @anneal_veil_frame_full_mir_pipeline_demo) ∧
+    (type_of% @storageLive_modifiesOnlyFields) ∧
+    (type_of% @storageDead_modifiesOnlyFields) ∧
+    (type_of% @assign_direct_use_modifiesOnlyFields) ∧
+    (type_of% @assign_direct_mkAddSmart_modifiesOnlyFields) ∧
+    (type_of% @goto_modifiesOnlyFields) ∧
+    (type_of% @switchInt_modifiesOnlyFields) ∧
+    (type_of% @drop_direct_local_modifiesOnlyFields) ∧
+    (type_of% @assert_modifiesOnlyFields) ∧
+    (type_of% @unwindResume_modifiesOnlyFields) :=
   ⟨@exactWP_iff, @exactWP_bind, @exactWP_foldl, @exactWP_negation_refutation,
    @treeBorrowsFrameWP_committed_prefix_on_error, @protectorReleaseWP_error_preserves_prefix,
    @exactBodySafetyVC_iff, @exactBodySafetyVC_loop_invariant,
@@ -4043,7 +4820,12 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
    @addUnchecked_overflow_preserves_ub, @mkMemWriteFrame_eq_raw,
    @mkMemWriteFrame_dead_slot_preserves_failure, @Memory.ext_allFields,
    @MachineState.ext_allFields, @exactWP_veil_frame, @anneal_veil_frame_multistep_demo,
-   @anneal_veil_frame_rejects_clobbered_field, @anneal_veil_frame_auto_bind_demo⟩
+   @anneal_veil_frame_rejects_clobbered_field, @anneal_veil_frame_auto_bind_demo,
+   @anneal_veil_frame_full_mir_pipeline_demo, @storageLive_modifiesOnlyFields,
+   @storageDead_modifiesOnlyFields, @assign_direct_use_modifiesOnlyFields,
+   @assign_direct_mkAddSmart_modifiesOnlyFields, @goto_modifiesOnlyFields,
+   @switchInt_modifiesOnlyFields, @drop_direct_local_modifiesOnlyFields,
+   @assert_modifiesOnlyFields, @unwindResume_modifiesOnlyFields⟩
 
 /-!
 Note on import minimality & kernel audits:

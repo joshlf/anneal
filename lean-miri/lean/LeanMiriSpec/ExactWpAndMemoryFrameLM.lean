@@ -1886,22 +1886,72 @@ theorem protectorRelease_missingTag_exactWP (tag : BorTag) (tags : ProtectedTags
   unfold protectorReleasePre
   rw [hMiss]
 
-/-- Predicate characterizing segments skipped during `BorrowTree.releaseProtector`
-(either absent permission for `source`, `associatedAccess = none`, or `accessed = false`). -/
-def protectorReleaseSegmentSkipped (source : UniIndex)
-    (segment : RangeMapSegment LocationTree) : Prop :=
-  match segment.data.perms.get source with
-  | none => True
-  | some state =>
-    match state.permission.associatedAccess with
-    | none => True
-    | some _ => state.accessed = false
+-- Exact zero-fuel public projections for `Miri.TreeBorrows.BorrowTree.performTreeAccessAt`
+-- (each `.eq_src` is kernel-proved unconditionally for ALL `BorrowTree`s of arbitrary depth/size,
+-- with zero fuel truncation and zero modifications to `lean-miri/vendor/`).
+unroll_lm_loops performTreeAccessAtPublic := Miri.TreeBorrows.BorrowTree.performTreeAccessAt fuel 0
+unroll_lm_loops treeLocAccessLocation := Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.location fuel 0
+unroll_lm_loops treeLocAccessNormal := Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.normalAccess fuel 0
+unroll_lm_loops treeLocAccessStatus := Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.status fuel 0
 
-/-- Inductive per-segment scan precondition for `BorrowTree.releaseProtector` (`Std.Do`-free
-structural induction over `List.range' 0 tree.locations.entries.size` ending in
-`updateExposureForProtectorRelease`, covering `.RangeMapFailure`, `.ExposureUpdateFailure`,
-and `.Released`). -/
-def protectorReleaseSkipScanPre (tag : BorTag)
+/-- Public view of a single Tree Borrows segment access step (`BorrowTree.performTreeAccessAt`),
+exposing the updated `LocationTree`, optional `NormalAccessResult`, and optional failure status
+with kernel-proved unconditional equality to vendored `Miri.TreeBorrows.BorrowTree.performTreeAccessAt`. -/
+structure TreeSegmentAccessOutcome where
+  location : LocationTree
+  normalAccess : Option Tree.NormalAccessResult
+  status : Option BorrowTree.BorrowTreeAccessStatus
+
+/-- Run the exact vendored single-segment Tree Borrows access step (normal source root + wildcard
+other roots) and project its public outcome fields. -/
+noncomputable def runTreeSegmentAccess (tree : BorrowTree) (location : LocationTree)
+    (source? : Option UniIndex) (kind : AccessKind) (tags : ProtectedTags)
+    (mode : Tree.ChildrenVisitMode) (range : ByteRange) : TreeSegmentAccessOutcome :=
+  let raw := performTreeAccessAtPublic tree location source? kind tags mode range
+  ⟨treeLocAccessLocation raw, treeLocAccessNormal raw, treeLocAccessStatus raw⟩
+
+/-- **Unconditional per-segment symbolic precondition for `BorrowTree.releaseProtector`**
+(`Std.Do`-free mirror of `lean-miri#93` `ProtectorReleaseWP.segmentPre`, with ZERO `hSkipped`
+assumption — covering BOTH skipped segments AND accessed segments):
+- `.RangeMapFailure err` short-circuits immediately leaving `tree` untouched;
+- Skipped segments (`perms.get = none`, `associatedAccess = none`, or `accessed = false`) thread
+  `tree` unchanged to `next`;
+- Accessed segments (`state.accessed = true`) run `runTreeSegmentAccess` (kernel-proved equal to
+  vendored `BorrowTree.performTreeAccessAt`) + `tree.locations.setAtPos position access.location`,
+  committing `updated = { tree with locations := mutation.state }` BEFORE reporting
+  `.LocationMapFailure err` or `.AccessFailure segment.range status` on error, or threading
+  `updated` to `next`! -/
+def protectorReleaseSegmentPre (source : UniIndex) (tags : ProtectedTags) (position : Nat)
+    (next : BorrowTree → Prop)
+    (onError : BorrowTree.ProtectorReleaseStatus → BorrowTree → Prop)
+    (tree : BorrowTree) : Prop :=
+  match tree.locations.index position with
+  | .error err => onError (.RangeMapFailure err) tree
+  | .ok segment =>
+    match segment.data.perms.get source with
+    | none => next tree
+    | some state =>
+      match state.permission.associatedAccess with
+      | none => next tree
+      | some kind =>
+        if state.accessed then
+          let access := runTreeSegmentAccess tree segment.data (some source) kind
+            tags .SkipChildrenOfAccessed segment.range
+          let mutation := tree.locations.setAtPos position access.location
+          let updated := { tree with locations := mutation.state }
+          match mutation.outcome with
+          | .error err => onError (.LocationMapFailure err) updated
+          | .ok () =>
+            match access.status with
+            | some status => onError (.AccessFailure segment.range status) updated
+            | none => next updated
+        else next tree
+
+/-- Unconditional inductive per-segment scan precondition for `BorrowTree.releaseProtector`
+(`Std.Do`-free mirror of `lean-miri#93` `ProtectorReleaseWP.segmentsPre`), threading the updated
+`BorrowTree` across every segment in `List.range' 0 tree.locations.entries.size` and concluding
+with `updateExposureForProtectorRelease`. -/
+def protectorReleaseSegmentsPre (tag : BorTag) (tags : ProtectedTags) (source : UniIndex)
     (post : Unit → BorrowTree → Prop)
     (onError : BorrowTree.ProtectorReleaseStatus → BorrowTree → Prop) :
     List Nat → BorrowTree → Prop
@@ -1911,91 +1961,373 @@ def protectorReleaseSkipScanPre (tag : BorTag)
     | .error err => onError (.ExposureUpdateFailure err) exposure.tree
     | .ok () => post () exposure.tree
   | position :: rest, tree =>
-    match tree.locations.index position with
-    | .error err => onError (.RangeMapFailure err) tree
-    | .ok _ => protectorReleaseSkipScanPre tag post onError rest tree
+    protectorReleaseSegmentPre source tags position
+      (protectorReleaseSegmentsPre tag tags source post onError rest) onError tree
 
-/-- Full symbolic per-segment precondition for `BorrowTree.releaseProtector` on trees whose
-segments are skipped for `tag` (`Std.Do`-free mirror of `lean-miri#93`
-`ProtectorReleaseWP.releasePre`, strictly generalizing `TreeState.lean`'s unexposed-absent
-`release` lemma to arbitrary `associatedAccess = none`, `accessed = false`, `.RangeMapFailure`,
-and `.ExposureUpdateFailure` outcomes). -/
-def protectorReleaseSymbolicPre (tag : BorTag)
+/-- Unconditional full symbolic per-segment precondition for `BorrowTree.releaseProtector`
+(`Std.Do`-free mirror of `lean-miri#93` `ProtectorReleaseWP.releasePre`). -/
+def protectorReleaseSymbolicPre (tag : BorTag) (tags : ProtectedTags)
     (post : Unit → BorrowTree → Prop)
     (onError : BorrowTree.ProtectorReleaseStatus → BorrowTree → Prop)
     (tree : BorrowTree) : Prop :=
   match tree.indexOfTag tag with
   | none => onError (.MissingTag tag) tree
-  | some _ =>
-    protectorReleaseSkipScanPre tag post onError
+  | some source =>
+    protectorReleaseSegmentsPre tag tags source post onError
       (List.range' 0 tree.locations.entries.size) tree
 
-/-- **Genuine inductive per-segment bidirectional `↔` theorem `protectorReleaseSymbolicPre_iff`**
-proved by structural induction on `List.range' 0 tree.locations.entries.size` directly over
-unmodified `Miri.TreeBorrows.BorrowTree.releaseProtector` (handling `.MissingTag`,
-`.RangeMapFailure`, absent/`associatedAccess = none`/`accessed = false` segment skips,
-`.ExposureUpdateFailure`, and `.Released`). Combined with the concrete 2-segment accessed-prefix
-witness `protector_release_committed_prefix_on_error_witness` below, this covers both universal
-segment-skipping induction and accessed-segment committed-prefix error states! -/
+/-- **UNCONDITIONAL inductive per-segment bidirectional `↔` theorem `protectorReleaseSymbolicPre_iff`**
+(100% `Std.Do`-free mirror of `lean-miri#93` `ProtectorReleaseWP.releasePre_iff`, ZERO `hSkipped`
+assumption, proved by structural induction on `List.range' 0 tree.locations.entries.size` directly
+over unmodified `Miri.TreeBorrows.BorrowTree.releaseProtector` for EVERY `BorrowTree`, including
+accessed segments, foreign-access transitions, committed error prefixes on `.LocationMapFailure`
+and `.AccessFailure`, `.RangeMapFailure`, `.ExposureUpdateFailure`, `.MissingTag`, and `.Released`)! -/
 theorem protectorReleaseSymbolicPre_iff (tag : BorTag) (tags : ProtectedTags)
     (post : Unit → BorrowTree → Prop)
     (onError : BorrowTree.ProtectorReleaseStatus → BorrowTree → Prop)
-    (tree : BorrowTree)
-    (hSkipped : ∀ source, tree.indexOfTag tag = some source →
-      ∀ pos ∈ List.range' 0 tree.locations.entries.size,
-      ∀ seg, tree.locations.index pos = .ok seg →
-        protectorReleaseSegmentSkipped source seg) :
+    (tree : BorrowTree) :
     AnnealExactWP (protectorReleaseAction tag tags) post onError tree ↔
-      protectorReleaseSymbolicPre tag post onError tree := by
+      protectorReleaseSymbolicPre tag tags post onError tree := by
   unfold AnnealExactWP protectorReleaseAction protectorReleaseSymbolicPre BorrowTree.releaseProtector
   simp only [Id.run]
+  rw [performTreeAccessAtPublic.eq_src, treeLocAccessLocation.eq_src, treeLocAccessStatus.eq_src]
   cases hIdx : tree.indexOfTag tag with
   | none =>
     simp only [pure, Pure.pure]
   | some source =>
-    have hSk := hSkipped source hIdx
     simp only [Std.Legacy.Range.forIn_eq_forIn_range']
     have hSize : ([:tree.locations.entries.size] : Std.Legacy.Range).size =
         tree.locations.entries.size := by
       simp [Std.Legacy.Range.size]
     simp only [hSize]
-    clear hIdx hSize hSkipped
-    revert hSk
-    induction List.range' 0 tree.locations.entries.size with
+    clear hIdx hSize
+    induction List.range' 0 tree.locations.entries.size generalizing tree with
     | nil =>
-      intro _
-      simp only [protectorReleaseSkipScanPre, List.forIn_nil, bind, Bind.bind, pure, Pure.pure]
+      simp only [protectorReleaseSegmentsPre, List.forIn_nil, bind, Bind.bind, pure, Pure.pure]
       cases (tree.updateExposureForProtectorRelease tag).outcome with
       | error _ => simp only
       | ok u => cases u; simp only
     | cons position rest ih =>
-      intro hSk
-      simp only [protectorReleaseSkipScanPre, List.forIn_cons, bind, Bind.bind, pure, Pure.pure]
-      cases hLoc : tree.locations.index position with
+      simp only [protectorReleaseSegmentsPre, protectorReleaseSegmentPre, runTreeSegmentAccess,
+        List.forIn_cons, bind, Bind.bind, pure, Pure.pure]
+      cases tree.locations.index position with
       | error _ => simp only
       | ok segment =>
         dsimp only
-        have hSeg := hSk position List.mem_cons_self segment hLoc
-        have hRest : ∀ pos ∈ rest, ∀ seg, tree.locations.index pos = .ok seg →
-            protectorReleaseSegmentSkipped source seg :=
-          fun pos hp => hSk pos (List.mem_cons_of_mem position hp)
-        unfold protectorReleaseSegmentSkipped at hSeg
-        cases hPerm : segment.data.perms.get source with
+        cases segment.data.perms.get source with
         | none =>
           dsimp only
-          exact ih hRest
+          exact ih tree
         | some state =>
           dsimp only
-          simp only [hPerm] at hSeg
-          cases hAssoc : state.permission.associatedAccess with
+          cases state.permission.associatedAccess with
           | none =>
             dsimp only
-            exact ih hRest
-          | some _ =>
+            exact ih tree
+          | some kind =>
             dsimp only
-            simp only [hAssoc] at hSeg
-            simp only [hSeg, Bool.false_eq_true, ↓reduceIte]
-            exact ih hRest
+            cases state.accessed with
+            | false =>
+              simp only [Bool.false_eq_true, ↓reduceIte]
+              exact ih tree
+            | true =>
+              simp only [↓reduceIte]
+              let raw := performTreeAccessAtPublic tree segment.data (some source) kind
+                tags .SkipChildrenOfAccessed segment.range
+              let mutation := tree.locations.setAtPos position (treeLocAccessLocation raw)
+              cases mutation.outcome with
+              | error _ => simp only
+              | ok u =>
+                cases u
+                dsimp only
+                cases treeLocAccessStatus raw with
+                | some _ => simp only
+                | none =>
+                  dsimp only
+                  exact ih { tree with locations := mutation.state }
+
+/-- **Unconditional per-cursor symbolic precondition for `BorrowTree.performBorrowAccessRange`**
+(`Std.Do`-free mirror of `lean-miri#93` `TreeBorrowsWP`): threads `(currentMap, visited, status)`
+across every cursor in `List.range' 0 prepared.positions.size`, applying `runTreeSegmentAccess`
+and `currentMap.setAtPos`, and freezing `(currentMap, visited, status)` once any segment faults! -/
+def tbAccessCursorsPre (positions : Array Nat) (segments : Array (RangeMapSegment LocationTree))
+    (source? : Option UniIndex) (kind : AccessKind) (tags : ProtectedTags)
+    (mode : Tree.ChildrenVisitMode)
+    (post : Array BorrowTree.BorrowTreeLocationResult → BorrowTree → Prop)
+    (onError : (BorrowTree.BorrowTreeAccessStatus × Array BorrowTree.BorrowTreeLocationResult) →
+      BorrowTree → Prop)
+    (tree : BorrowTree) :
+    List Nat → DedupRangeMap LocationTree → Array BorrowTree.BorrowTreeLocationResult →
+      BorrowTree.BorrowTreeAccessStatus → Prop
+  | [], currentMap, visited, status =>
+    let finalTree := { tree with locations := currentMap }
+    match status with
+    | .Completed => post visited finalTree
+    | err => onError (err, visited) finalTree
+  | cursor :: rest, currentMap, visited, status =>
+    if status == .Completed then
+      match positions[cursor]?, segments[cursor]? with
+      | some position, some segment =>
+        let access := runTreeSegmentAccess tree segment.data source? kind tags mode segment.range
+        let mutation := currentMap.setAtPos position access.location
+        let nextVisited := visited.push ⟨segment.range, access.normalAccess⟩
+        let nextStatus :=
+          match mutation.outcome with
+          | .error err => .LocationMapFailure segment.range err
+          | .ok () =>
+            match access.status with
+            | some failure => failure
+            | none => status
+        tbAccessCursorsPre positions segments source? kind tags mode post onError tree
+          rest mutation.state nextVisited nextStatus
+      | _, _ =>
+        tbAccessCursorsPre positions segments source? kind tags mode post onError tree
+          rest currentMap visited (.RangeMapFailure (.indexOutOfBounds cursor positions.size))
+    else
+      tbAccessCursorsPre positions segments source? kind tags mode post onError tree
+        rest currentMap visited status
+
+/-- **Committed-prefix freeze law for `tbAccessCursorsPre`**: once any segment fails
+(`status ≠ .Completed`), all remaining cursors are no-ops, strictly preserving the committed
+`(currentMap, visited, status)` prefix into `onError`! -/
+theorem tbAccessCursorsPre_of_ne_completed (positions : Array Nat)
+    (segments : Array (RangeMapSegment LocationTree))
+    (source? : Option UniIndex) (kind : AccessKind) (tags : ProtectedTags)
+    (mode : Tree.ChildrenVisitMode)
+    (post : Array BorrowTree.BorrowTreeLocationResult → BorrowTree → Prop)
+    (onError : (BorrowTree.BorrowTreeAccessStatus × Array BorrowTree.BorrowTreeLocationResult) →
+      BorrowTree → Prop)
+    (tree : BorrowTree) (cursors : List Nat) (currentMap : DedupRangeMap LocationTree)
+    (visited : Array BorrowTree.BorrowTreeLocationResult)
+    (status : BorrowTree.BorrowTreeAccessStatus) (hNe : status ≠ .Completed) :
+    tbAccessCursorsPre positions segments source? kind tags mode post onError tree
+        cursors currentMap visited status ↔
+      onError (status, visited) { tree with locations := currentMap } := by
+  have hBeq : (status == .Completed) = false := by
+    cases h : (status == .Completed) with
+    | false => rfl
+    | true => exact absurd (beq_iff_eq.mp h) hNe
+  induction cursors with
+  | nil =>
+    unfold tbAccessCursorsPre
+    cases status with
+    | Completed => exact absurd rfl hNe
+    | _ => rfl
+  | cons _ rest ih =>
+    simp only [tbAccessCursorsPre, hBeq, Bool.false_eq_true, ↓reduceIte]
+    exact ih
+
+/-- Unconditional full symbolic precondition for `BorrowTree.performBorrowAccessRange`
+(`Std.Do`-free mirror of `lean-miri#93` `TreeBorrowsWP`). -/
+def tbAccessSymbolicPre (prov : ProvenanceExtra) (offset length : Size)
+    (kind : AccessKind) (tags : ProtectedTags) (mode : Tree.ChildrenVisitMode)
+    (post : Array BorrowTree.BorrowTreeLocationResult → BorrowTree → Prop)
+    (onError : (BorrowTree.BorrowTreeAccessStatus × Array BorrowTree.BorrowTreeLocationResult) →
+      BorrowTree → Prop)
+    (tree : BorrowTree) : Prop :=
+  let source? := match prov with | .concrete tag => tree.indexOfTag tag | .wildcard => none
+  match prov with
+  | .concrete tag =>
+    if source?.isNone then onError (.MissingTag tag, #[]) tree
+    else
+      let prepared := tree.locations.iterMut offset length
+      match prepared.outcome with
+      | .error err => onError (.RangeMapFailure err, #[]) { tree with locations := prepared.state }
+      | .ok _ =>
+        tbAccessCursorsPre prepared.positions prepared.segments source? kind tags mode post onError
+          tree (List.range' 0 prepared.positions.size) prepared.state #[] .Completed
+  | .wildcard =>
+    let prepared := tree.locations.iterMut offset length
+    match prepared.outcome with
+    | .error err => onError (.RangeMapFailure err, #[]) { tree with locations := prepared.state }
+    | .ok _ =>
+      tbAccessCursorsPre prepared.positions prepared.segments source? kind tags mode post onError
+        tree (List.range' 0 prepared.positions.size) prepared.state #[] .Completed
+
+/-- Auxiliary inductive loop theorem matching the exact `Id`-monad `forIn` loop inside
+`BorrowTree.performBorrowAccessRange` (keeping `.Completed` fixed in the loop guard while
+generalizing the initial `(currentMap, visited, status)` accumulator!). -/
+private theorem tbAccessCursorsLoop_iff
+    (positions : Array Nat) (segments : Array (RangeMapSegment LocationTree))
+    (source? : Option UniIndex) (kind : AccessKind) (tags : ProtectedTags)
+    (mode : Tree.ChildrenVisitMode)
+    (post : Array BorrowTree.BorrowTreeLocationResult → BorrowTree → Prop)
+    (onError : (BorrowTree.BorrowTreeAccessStatus × Array BorrowTree.BorrowTreeLocationResult) →
+      BorrowTree → Prop)
+    (tree : BorrowTree) (cursors : List Nat) (currentMap : DedupRangeMap LocationTree)
+    (visited : Array BorrowTree.BorrowTreeLocationResult)
+    (status : BorrowTree.BorrowTreeAccessStatus) :
+    ((fun res : DedupRangeMap LocationTree × Array BorrowTree.BorrowTreeLocationResult ×
+        BorrowTree.BorrowTreeAccessStatus =>
+      match res.snd.snd with
+      | .Completed => post res.snd.fst { tree with locations := res.fst }
+      | err => onError (err, res.snd.fst) { tree with locations := res.fst })
+      (forIn (m := Id) cursors (currentMap, visited, status) fun cursor __s =>
+        if (__s.snd.snd == BorrowTree.BorrowTreeAccessStatus.Completed) = true then
+          match positions[cursor]?, segments[cursor]? with
+          | some position, some segment =>
+            match
+              (__s.fst.setAtPos position
+                  (treeLocAccessLocation
+                    (performTreeAccessAtPublic tree segment.data source? kind tags mode
+                      segment.range))).outcome with
+            | Except.error error =>
+              ForInStep.yield
+                ((__s.fst.setAtPos position
+                      (treeLocAccessLocation
+                        (performTreeAccessAtPublic tree segment.data source? kind tags mode
+                          segment.range))).state,
+                  __s.snd.fst.push
+                    { range := segment.range,
+                      normalAccess :=
+                        treeLocAccessNormal
+                          (performTreeAccessAtPublic tree segment.data source? kind tags mode
+                            segment.range) },
+                  BorrowTree.BorrowTreeAccessStatus.LocationMapFailure segment.range error)
+            | Except.ok PUnit.unit =>
+              match
+                treeLocAccessStatus
+                  (performTreeAccessAtPublic tree segment.data source? kind tags mode
+                    segment.range) with
+              | some failure =>
+                ForInStep.yield
+                  ((__s.fst.setAtPos position
+                        (treeLocAccessLocation
+                          (performTreeAccessAtPublic tree segment.data source? kind tags mode
+                            segment.range))).state,
+                    __s.snd.fst.push
+                      { range := segment.range,
+                        normalAccess :=
+                          treeLocAccessNormal
+                            (performTreeAccessAtPublic tree segment.data source? kind tags mode
+                              segment.range) },
+                    failure)
+              | none =>
+                ForInStep.yield
+                  ((__s.fst.setAtPos position
+                        (treeLocAccessLocation
+                          (performTreeAccessAtPublic tree segment.data source? kind tags mode
+                            segment.range))).state,
+                    __s.snd.fst.push
+                      { range := segment.range,
+                        normalAccess :=
+                          treeLocAccessNormal
+                            (performTreeAccessAtPublic tree segment.data source? kind tags mode
+                              segment.range) },
+                    __s.snd.snd)
+          | _, _ =>
+            ForInStep.yield
+              (__s.fst, __s.snd.fst,
+                BorrowTree.BorrowTreeAccessStatus.RangeMapFailure
+                  (DedupRangeMapError.indexOutOfBounds cursor positions.size))
+        else ForInStep.yield (__s.fst, __s.snd.fst, __s.snd.snd))) ↔
+    tbAccessCursorsPre positions segments source? kind tags mode post onError tree
+      cursors currentMap visited status := by
+  induction cursors generalizing currentMap visited status with
+  | nil =>
+    simp only [tbAccessCursorsPre, List.forIn_nil, pure, Pure.pure]
+  | cons cursor rest ih =>
+    simp only [tbAccessCursorsPre, runTreeSegmentAccess, List.forIn_cons, bind, Bind.bind,
+      pure, Pure.pure]
+    cases (status == BorrowTree.BorrowTreeAccessStatus.Completed) with
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      exact ih currentMap visited status
+    | true =>
+      simp only [↓reduceIte]
+      cases positions[cursor]? with
+      | none =>
+        dsimp only
+        exact ih currentMap visited
+          (.RangeMapFailure (.indexOutOfBounds cursor positions.size))
+      | some position =>
+        cases segments[cursor]? with
+        | none =>
+          dsimp only
+          exact ih currentMap visited
+            (.RangeMapFailure (.indexOutOfBounds cursor positions.size))
+        | some segment =>
+          dsimp only
+          let raw := performTreeAccessAtPublic tree segment.data source? kind tags mode segment.range
+          let mutation := currentMap.setAtPos position (treeLocAccessLocation raw)
+          let visited' := visited.push ⟨segment.range, treeLocAccessNormal raw⟩
+          cases mutation.outcome with
+          | error err =>
+            dsimp only
+            exact ih mutation.state visited' (.LocationMapFailure segment.range err)
+          | ok u =>
+            cases u
+            dsimp only
+            cases treeLocAccessStatus raw with
+            | some failure =>
+              dsimp only
+              exact ih mutation.state visited' failure
+            | none =>
+              dsimp only
+              exact ih mutation.state visited' status
+
+/-- **UNCONDITIONAL inductive per-cursor bidirectional `↔` theorem `tbAccessSymbolicPre_iff`**
+proved by structural induction over `List.range' 0 prepared.positions.size` directly on unmodified
+`Miri.TreeBorrows.BorrowTree.performBorrowAccessRange` for EVERY `BorrowTree`, `ProvenanceExtra`,
+range, `AccessKind`, `ProtectedTags`, and `ChildrenVisitMode`! -/
+theorem tbAccessSymbolicPre_iff (prov : ProvenanceExtra) (offset length : Size)
+    (kind : AccessKind) (tags : ProtectedTags) (mode : Tree.ChildrenVisitMode)
+    (post : Array BorrowTree.BorrowTreeLocationResult → BorrowTree → Prop)
+    (onError : (BorrowTree.BorrowTreeAccessStatus × Array BorrowTree.BorrowTreeLocationResult) →
+      BorrowTree → Prop)
+    (tree : BorrowTree) :
+    AnnealExactWP (tbAccessAction prov offset length kind tags mode) post onError tree ↔
+      tbAccessSymbolicPre prov offset length kind tags mode post onError tree := by
+  unfold AnnealExactWP tbAccessAction tbAccessSymbolicPre BorrowTree.performBorrowAccessRange
+  simp only [Id.run]
+  rw [performTreeAccessAtPublic.eq_src, treeLocAccessLocation.eq_src, treeLocAccessNormal.eq_src,
+    treeLocAccessStatus.eq_src]
+  cases prov with
+  | concrete tag =>
+    dsimp only
+    cases (tree.indexOfTag tag).isNone with
+    | true =>
+      simp only [↓reduceIte, pure, Pure.pure]
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte, bind, Bind.bind, pure, Pure.pure]
+      cases (tree.locations.iterMut offset length).outcome with
+      | error _ => simp only
+      | ok _ =>
+        dsimp only
+        simp only [Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+          Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+        rw [← tbAccessCursorsLoop_iff
+          (tree.locations.iterMut offset length).positions
+          (tree.locations.iterMut offset length).segments
+          (tree.indexOfTag tag) kind tags mode post onError tree
+          (List.range' 0 (tree.locations.iterMut offset length).positions.size)
+          (tree.locations.iterMut offset length).state #[] .Completed]
+        dsimp only
+        generalize (forIn (m := Id)
+          (List.range' 0 (tree.locations.iterMut offset length).positions.size)
+          ((tree.locations.iterMut offset length).state, #[],
+            BorrowTree.BorrowTreeAccessStatus.Completed) _) = r
+        cases r.snd.snd <;> rfl
+  | wildcard =>
+    simp only [bind, Bind.bind, pure, Pure.pure]
+    cases (tree.locations.iterMut offset length).outcome with
+    | error _ => simp only
+    | ok _ =>
+      dsimp only
+      simp only [Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+        Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+      rw [← tbAccessCursorsLoop_iff
+        (tree.locations.iterMut offset length).positions
+        (tree.locations.iterMut offset length).segments
+        none kind tags mode post onError tree
+        (List.range' 0 (tree.locations.iterMut offset length).positions.size)
+        (tree.locations.iterMut offset length).state #[] .Completed]
+      dsimp only
+      generalize (forIn (m := Id)
+        (List.range' 0 (tree.locations.iterMut offset length).positions.size)
+        ((tree.locations.iterMut offset length).state, #[],
+          BorrowTree.BorrowTreeAccessStatus.Completed) _) = r
+      cases r.snd.snd <;> rfl
 
 /-- Multi-access sequence over `BorrowTree` instantiating `Anneal.ExactWpAndSmartCtors.TreeBorrowsFrameWP`. -/
 def tbAccessStepSpec (spec : ProvenanceExtra × Size × Size × AccessKind × ProtectedTags × Tree.ChildrenVisitMode) :
@@ -2700,6 +3032,8 @@ theorem ep2_lean_miri_exact_wp_and_memory_frame_capstone :
     (type_of% @allocCopy_disjoint_readScalar_ptr_frame_eq) ∧
     (type_of% @allocEndian_le_vs_be_disjoint_frame_witness) ∧
     (type_of% @tbAccessExactWP_iff) ∧
+    (type_of% @tbAccessSymbolicPre_iff) ∧
+    (type_of% @tbAccessCursorsPre_of_ne_completed) ∧
     (type_of% @tbDeallocExactWP_iff) ∧
     (type_of% @tbDealloc_accessFailure_retains_tree) ∧
     (type_of% @protectorReleaseExactWP_iff) ∧
@@ -2734,7 +3068,8 @@ theorem ep2_lean_miri_exact_wp_and_memory_frame_capstone :
    @allocWriteBytes_disjoint_readScalar_ptr_frame_eq,
    @allocCopy_disjoint_readScalar_ptr_frame_eq,
    @allocEndian_le_vs_be_disjoint_frame_witness,
-   @tbAccessExactWP_iff, @tbDeallocExactWP_iff, @tbDealloc_accessFailure_retains_tree,
+   @tbAccessExactWP_iff, @tbAccessSymbolicPre_iff, @tbAccessCursorsPre_of_ne_completed,
+   @tbDeallocExactWP_iff, @tbDealloc_accessFailure_retains_tree,
    @protectorReleaseExactWP_iff, @protectorReleaseSymbolicPre_iff,
    @protectorRelease_missingTag_exactWP,
    @tb_access_committed_prefix_on_error_witness,
