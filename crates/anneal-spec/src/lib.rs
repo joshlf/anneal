@@ -15,6 +15,7 @@
 extern crate std;
 
 pub mod panic_contract;
+pub mod peer_soundness_guards;
 pub mod spec_check;
 
 pub use anneal_spec_macros::{
@@ -242,5 +243,51 @@ mod tests {
         assert!(__anodized_fn_requires_assumed_double_u32(6));
         assert!(!__anodized_fn_requires_assumed_double_u32(11));
         assert!(__anodized_fn_ensures_assumed_double_u32(6, 12));
+    }
+
+    #[test]
+    fn peer_soundness_guards_extend_spec_boundary_taxonomy() {
+        use crate::peer_soundness_guards::{
+            CombinedSpecGuardClass, PeerSpecGuardClass, PeerViolationReason,
+            check_peer_soundness_guards_source, peer_guard_verdicts,
+        };
+        use crate::spec_check::SpecBoundaryGuardClass;
+
+        // Peer ranks continue the frozen base ranks without overlap.
+        assert_eq!(
+            PeerSpecGuardClass::FIRST_RANK,
+            SpecBoundaryGuardClass::COUNT
+        );
+        for (rank, guard) in CombinedSpecGuardClass::ALL.into_iter().enumerate() {
+            assert_eq!(CombinedSpecGuardClass::from_rank(rank), Some(guard));
+        }
+
+        // The `creusot#2388` stub and a looping ghost-token mint are rejected
+        // end to end; the sealed, genuinely diverging variant is accepted.
+        let unsound = r#"
+            #[spec(trusted, ensures: |r| false)]
+            fn read_volatile(p: *const u8) -> u8 { unsafe { core::ptr::read_volatile(p) } }
+            fn main() { loop { let _t = Tokens::new(); } }
+        "#;
+        let err = check_peer_soundness_guards_source(unsound, &["Tokens::new"]).unwrap_err();
+        assert_eq!(
+            err.reason(),
+            Some(PeerViolationReason::EnsuresFalseOnReturningFn)
+        );
+        let verdicts = peer_guard_verdicts(unsound, &["Tokens::new"]);
+        assert!(!verdicts[0].is_pass() && !verdicts[1].is_pass());
+
+        let sound = r#"
+            #[spec(trusted, ensures: |r| false)]
+            fn abort_now() -> ! { loop {} }
+            #[invariant(self.0 > 0)]
+            pub struct Positive(u32);
+            impl Positive {
+                #[smart_constructor]
+                pub fn new(x: u32) -> Option<Self> { if x > 0 { Some(Positive(x)) } else { None } }
+            }
+            fn main() { let _t = Tokens::new(); }
+        "#;
+        assert!(check_peer_soundness_guards_source(sound, &["Tokens::new"]).is_ok());
     }
 }
