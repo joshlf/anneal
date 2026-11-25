@@ -335,6 +335,9 @@ pub enum PeerViolationReason {
     /// that builds values from untrusted data or bytes without checking the
     /// invariant (`Deserialize`, `FromBytes`, `Pod`, `Arbitrary`, ...).
     InvariantUncheckedConstructorTrait,
+    /// Guard 6b: a public method returns a mutable reference into a field of an
+    /// invariant-bearing structure, so clients mutate it unchecked.
+    InvariantMutableFieldEscape,
     /// Guard 6b: a public function constructs the raw structure without a
     /// `#[smart_constructor]` invariant gate.
     InvariantRawPublicConstructor,
@@ -384,6 +387,7 @@ impl PeerViolationReason {
             Self::InvariantPubField => "invariant_pub_field",
             Self::InvariantDeriveDefault => "invariant_derive_default",
             Self::InvariantUncheckedConstructorTrait => "invariant_unchecked_constructor_trait",
+            Self::InvariantMutableFieldEscape => "invariant_mutable_field_escape",
             Self::InvariantDefaultImpl => "invariant_default_impl",
             Self::InvariantRawPublicConstructor => "invariant_raw_public_constructor",
         }
@@ -1276,6 +1280,9 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
     if let Some((l, rr, _)) = split_first_top(r, &["&&", "∧"], &[])? {
         let a = const_bool(l, depth + 1)?;
         let b = const_bool(rr, depth + 1)?;
+        if conflicting_equalities(l, rr)? {
+            return Ok(Some(false));
+        }
         return Ok(match (a, b) {
             (Some(false), _) | (_, Some(false)) => Some(false),
             (Some(true), Some(true)) => Some(true),
@@ -1285,6 +1292,13 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
     if let Some((l, rr, op)) = split_first_top(r, &["==", "!="], &[])? {
         if let (Some(a), Some(b)) = (const_bool(l, depth + 1)?, const_bool(rr, depth + 1)?) {
             return Ok(Some(if op.text == "==" { a == b } else { a != b }));
+        }
+    }
+    // A comparison of syntactically identical sides (`x != x`, `r < r`).
+    if let Some((l, rr, op)) = split_first_top(r, &["==", "!=", "<", ">", "<=", ">=", "≠"], &[])?
+    {
+        if !l.is_empty()? && tokens_equal(l, rr)? {
+            return Ok(Some(matches!(op.text, "==" | "<=" | ">=")));
         }
     }
     let mut c = r;
@@ -1355,6 +1369,76 @@ fn const_bool(r: Lexer<'_>, depth: usize) -> Result<Option<bool>, PeerScanError>
         });
     }
     Ok(None)
+}
+
+/// Whether two ranges hold the same token sequence.
+fn tokens_equal(a: Lexer<'_>, b: Lexer<'_>) -> Result<bool, PeerScanError> {
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a.next()?, b.next()?) {
+            (None, None) => return Ok(true),
+            (Some(x), Some(y)) if x.kind == y.kind && x.text == y.text => {}
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// `X == lit₁` and `X == lit₂` (any conjunct of either side) with the same `X`
+/// and distinct literals: the conjunction is unsatisfiable.
+fn conflicting_equalities(l: Lexer<'_>, r: Lexer<'_>) -> Result<bool, PeerScanError> {
+    fn eq_lit<'a>(e: Lexer<'a>) -> Result<Option<(Lexer<'a>, &'a str)>, PeerScanError> {
+        let Some((lhs, rhs, op)) = split_first_top(e, &["=="], &["&&", "||"])? else {
+            return Ok(None);
+        };
+        let _ = op;
+        let mut c = rhs;
+        let Some(lit) = c.next()? else {
+            return Ok(None);
+        };
+        if lit.kind != TokKind::Literal || !c.is_empty()? || lhs.is_empty()? {
+            return Ok(None);
+        }
+        Ok(Some((lhs, lit.text)))
+    }
+    let mut lefts = TopAndSplit::new(l);
+    while let Some(a) = lefts.next_part()? {
+        let Some((xa, la)) = eq_lit(a)? else { continue };
+        let mut rights = TopAndSplit::new(r);
+        while let Some(b) = rights.next_part()? {
+            let Some((xb, lb)) = eq_lit(b)? else { continue };
+            if let (Some(va), Some(vb)) = (parse_int(la), parse_int(lb)) {
+                if va != vb && tokens_equal(xa, xb)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Splits a range at top-level `&&` / `∧`.
+struct TopAndSplit<'a> {
+    rest: Option<Lexer<'a>>,
+}
+
+impl<'a> TopAndSplit<'a> {
+    const fn new(r: Lexer<'a>) -> Self {
+        Self { rest: Some(r) }
+    }
+
+    fn next_part(&mut self) -> Result<Option<Lexer<'a>>, PeerScanError> {
+        let Some(r) = self.rest else { return Ok(None) };
+        match split_first_top(r, &["&&", "∧"], &["||", "∨"])? {
+            Some((l, rr, _)) => {
+                self.rest = Some(rr);
+                Ok(Some(l))
+            }
+            None => {
+                self.rest = None;
+                Ok(Some(r))
+            }
+        }
+    }
 }
 
 /// Strips `move`, `|params|`, `||`, and an optional `-> T` from a closure
@@ -2089,7 +2173,10 @@ fn for_each_sig_clause<'a>(
 /// Whether a `{ ... }` seen while scanning Verus signature clauses is part of
 /// a clause expression (`ensures if b { false } else { false } { body }`,
 /// `ensures { false };`) rather than the function body itself.
-fn brace_continues_sig_clause(after_open: Lexer<'_>, open: &Tok<'_>) -> Result<bool, PeerScanError> {
+fn brace_continues_sig_clause(
+    after_open: Lexer<'_>,
+    open: &Tok<'_>,
+) -> Result<bool, PeerScanError> {
     let mut probe = after_open;
     skip_group(&mut probe, open)?;
     let Some(next) = probe.peek()? else {
@@ -3199,9 +3286,51 @@ fn collect_generic_mint_fns<'a>(
 ) -> GResult<PairTable<'a, MAX_GHOST_ALIASES>> {
     let mut out: PairTable<'a, MAX_GHOST_ALIASES> = PairTable::new();
     let mut lx = Lexer::new(src, SourceDialect::Rust);
+    let mut st = DelimStack::new();
+    // Type parameters of the enclosing `impl<..>` / `trait` block, with the
+    // depth of its body.
+    let mut impl_params: PairTable<'a, 16> = PairTable::new();
+    let mut impl_params_pending = false;
+    let mut impl_depth: Option<usize> = None;
     while let Some(t) = lx.next()? {
         if t.is_punct("#") {
             take_attribute(&mut lx)?;
+            continue;
+        }
+        if t.is_open() {
+            st.feed(&t)?;
+            if t.is_punct("{") && impl_params_pending {
+                impl_depth = Some(st.depth());
+                impl_params_pending = false;
+            }
+            continue;
+        }
+        if t.is_close() {
+            st.feed(&t)?;
+            if matches!(impl_depth, Some(d) if st.depth() < d) {
+                impl_depth = None;
+                impl_params = PairTable::new();
+            }
+            continue;
+        }
+        if t.is_kw("impl") && impl_depth.is_none() {
+            impl_params = PairTable::new();
+            if lx.next_is_punct("<")? {
+                let mut c = lx;
+                let lt = c.next()?;
+                let at = lt.map_or(c.pos, |x| x.start);
+                let gen_start = c.pos;
+                skip_angles(&mut c, at)?;
+                let mut parts = TopSplit::new(lx.range(gen_start, c.pos.saturating_sub(1)), true);
+                while let Some(mut p) = parts.next_part()? {
+                    if let Some(tok) = p.next()? {
+                        if tok.is_ident() && !tok.is_kw("const") {
+                            impl_params.push(tok.text, "", tok.start)?;
+                        }
+                    }
+                }
+            }
+            impl_params_pending = impl_params.len > 0;
             continue;
         }
         if !t.is_kw("fn") {
@@ -3209,21 +3338,29 @@ fn collect_generic_mint_fns<'a>(
         }
         let mut c = lx;
         let Some(name) = c.next()? else { continue };
-        if !name.is_ident() || !c.next_is_punct("<")? {
+        if !name.is_ident() {
             continue;
         }
-        let lt = c.next()?;
-        let at = lt.map_or(c.pos, |x| x.start);
-        let gen_start = c.pos;
-        skip_angles(&mut c, at)?;
-        let gen_end = c.pos.saturating_sub(1);
-        // Extract generic type parameter identifiers (`<T: Mint, U>`).
+        // Generic type parameter identifiers (`<T: Mint, U>`), plus those of an
+        // enclosing generic `impl`.
         let mut tparams: PairTable<'a, 16> = PairTable::new();
-        let mut parts = TopSplit::new(lx.range(gen_start, gen_end), true);
-        while let Some(mut p) = parts.next_part()? {
-            if let Some(tok) = p.next()? {
-                if tok.is_ident() && !tok.is_kw("const") {
-                    let _ = tparams.push(tok.text, "", tok.start);
+        if impl_depth.is_some() {
+            for &(p, _) in impl_params.entries() {
+                tparams.push(p, "", name.start)?;
+            }
+        }
+        if c.next_is_punct("<")? {
+            let lt = c.next()?;
+            let at = lt.map_or(c.pos, |x| x.start);
+            let gen_start = c.pos;
+            skip_angles(&mut c, at)?;
+            let gen_end = c.pos.saturating_sub(1);
+            let mut parts = TopSplit::new(lx.range(gen_start, gen_end), true);
+            while let Some(mut p) = parts.next_part()? {
+                if let Some(tok) = p.next()? {
+                    if tok.is_ident() && !tok.is_kw("const") {
+                        tparams.push(tok.text, "", tok.start)?;
+                    }
                 }
             }
         }
@@ -4558,6 +4695,8 @@ pub struct StructSealingDescriptor {
     /// An unchecked constructor trait (`Deserialize`, `FromBytes`, `Pod`, ...)
     /// is derived or implemented.
     pub unchecked_constructor_trait: bool,
+    /// A public method returns `&mut` into a field.
+    pub mutable_field_escape: bool,
     /// A public function builds the raw structure without a
     /// `#[smart_constructor]` gate.
     pub raw_public_constructor: bool,
@@ -4582,6 +4721,9 @@ pub fn check_struct_sealing(
     }
     if desc.unchecked_constructor_trait {
         return Err(descriptor_violation(R::InvariantUncheckedConstructorTrait));
+    }
+    if desc.mutable_field_escape {
+        return Err(descriptor_violation(R::InvariantMutableFieldEscape));
     }
     if desc.raw_public_constructor {
         return Err(descriptor_violation(R::InvariantRawPublicConstructor));
@@ -4931,6 +5073,26 @@ fn body_calls_tainted<'a>(
     Ok(None)
 }
 
+/// `&mut self.field` (or `&mut self.0`) in a body.
+fn body_mut_field_borrow(body: Lexer<'_>) -> Result<Option<usize>, PeerScanError> {
+    let mut c = body;
+    while let Some(t) = c.next()? {
+        if t.is_punct("&") {
+            let mut p = c;
+            if p.next_is_kw("mut")? {
+                p.next()?;
+                if p.next_is_kw("self")? {
+                    p.next()?;
+                    if p.next_is_punct(".")? {
+                        return Ok(Some(t.start));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// One sealing pass; returns whether the tainted-helper set grew.
 fn sealing_pass<'a>(
     src: &'a str,
@@ -5039,6 +5201,28 @@ fn sealing_pass<'a>(
                 let mut sc = lx.range(lx.pos, open.start);
                 while let Some(n) = sc.next()? {
                     names_inv |= n.is_ident() && invs.contains_first(n.text);
+                }
+            }
+            // A public method of the invariant type returning `&mut` into a field
+            // lets clients mutate it unchecked outside the defining boundary.
+            if public && self_kind.is_some() {
+                let mut returns_mut = false;
+                let mut sc = lx.range(lx.pos, open.start);
+                let mut after_arrow = false;
+                let mut prev_amp = false;
+                while let Some(n) = sc.next()? {
+                    if n.is_punct("->") {
+                        after_arrow = true;
+                    }
+                    if after_arrow && prev_amp && n.is_kw("mut") {
+                        returns_mut = true;
+                    }
+                    prev_amp = n.is_punct("&");
+                }
+                if returns_mut {
+                    if let Some(at) = body_mut_field_borrow(body)? {
+                        return violation(PeerViolationReason::InvariantMutableFieldEscape, at);
+                    }
                 }
             }
             let raw_mat = body_raw_materializer(body)?;
@@ -6724,7 +6908,9 @@ mod tests {
     fn b2_verus_sig_clauses_handle_quantifier_commas_and_braced_expressions() {
         // Multi-binder `forall|x, y|` must not split on the comma inside `|...|`.
         assert_eq!(
-            g6a("fn f() -> (r: u8) ensures forall|x: int, y: int| assumes_hold ==> x + y >= 0, { 0 }"),
+            g6a(
+                "fn f() -> (r: u8) ensures forall|x: int, y: int| assumes_hold ==> x + y >= 0, { 0 }"
+            ),
             None
         );
         assert_eq!(
@@ -6733,7 +6919,9 @@ mod tests {
         );
         // Braced `if` / block expressions inside Verus `ensures` must not truncate at `{`.
         assert_eq!(
-            g3("#[verifier::external_body] fn read(b: bool) -> (r: u8) ensures if b { false } else { false } { 0 }"),
+            g3(
+                "#[verifier::external_body] fn read(b: bool) -> (r: u8) ensures if b { false } else { false } { 0 }"
+            ),
             Some(R::EnsuresFalseOnReturningFn)
         );
         assert_eq!(
@@ -6759,12 +6947,16 @@ mod tests {
         );
         // Associated generic helper (`Helper::<Tokens>::mk()`).
         assert_eq!(
-            g4("struct Helper<T>(PhantomData<T>); impl<T: Mint> Helper<T> { fn mk() -> T { T::new() } } fn main() { Helper::<Tokens>::mk(); }"),
+            g4(
+                "struct Helper<T>(PhantomData<T>); impl<T: Mint> Helper<T> { fn mk() -> T { T::new() } } fn main() { Helper::<Tokens>::mk(); }"
+            ),
             Some(R::GenericConstructorDispatch)
         );
         // Type-inferred generic dispatch without any turbofish (`let a: Tokens = mk();`).
         assert_eq!(
-            g4("fn mk<T: Mint>() -> T { T::new() } fn main() { let a: Tokens = mk(); let b: Tokens = mk(); }"),
+            g4(
+                "fn mk<T: Mint>() -> T { T::new() } fn main() { let a: Tokens = mk(); let b: Tokens = mk(); }"
+            ),
             Some(R::GenericConstructorDispatch)
         );
         // Pure metadata intrinsics and std containers do NOT false-positive.
@@ -6799,7 +6991,11 @@ mod tests {
             None
         );
         assert_eq!(
-            expr("if h : assumesHold then P else Q", SourceDialect::Lean, Polarity::Positive),
+            expr(
+                "if h : assumesHold then P else Q",
+                SourceDialect::Lean,
+                Polarity::Positive
+            ),
             Some(R::AssumptionInIfCondition)
         );
     }
@@ -6809,7 +7005,9 @@ mod tests {
         let inv = "#[invariant(self.0 > 0)] pub struct Pos(u32);";
         // Closure `|x| Pos(x)` must NOT be treated as a `|` OR-pattern!
         assert_eq!(
-            g6b(&std::format!("{inv} pub fn leak() -> Pos {{ (|x| Pos(x))(0) }}")),
+            g6b(&std::format!(
+                "{inv} pub fn leak() -> Pos {{ (|x| Pos(x))(0) }}"
+            )),
             Some(R::InvariantRawPublicConstructor)
         );
         assert_eq!(
@@ -6857,6 +7055,92 @@ mod tests {
             g6b(&std::format!(
                 "{inv} fn cast<A, B>(a: A) -> B {{ unsafe {{ core::mem::transmute_copy(&a) }} }} pub fn bits(f: f32) -> u32 {{ cast(f) }}"
             )),
+            None
+        );
+    }
+
+    #[test]
+    fn a2_g6b_mutable_field_escape() {
+        let inv = "#[invariant(self.lo <= self.hi)] pub struct R { lo: u32, hi: u32 } ";
+        let leak = std::format!(
+            "{inv} impl R {{ pub fn lo_mut(&mut self) -> &mut u32 {{ &mut self.lo }} }}"
+        );
+        assert_eq!(g6b(&leak), Some(R::InvariantMutableFieldEscape));
+        let leak = std::format!(
+            "{inv} impl core::ops::DerefMut for R {{ fn deref_mut(&mut self) -> &mut u32 {{ &mut self.hi }} }}"
+        );
+        assert_eq!(g6b(&leak), Some(R::InvariantMutableFieldEscape));
+        let private =
+            std::format!("{inv} impl R {{ fn lo_mut(&mut self) -> &mut u32 {{ &mut self.lo }} }}");
+        assert_eq!(g6b(&private), None);
+        let shared = std::format!("{inv} impl R {{ pub fn lo(&self) -> &u32 {{ &self.lo }} }}");
+        assert_eq!(g6b(&shared), None);
+        assert_eq!(
+            check_struct_sealing(&StructSealingDescriptor {
+                has_invariant: true,
+                mutable_field_escape: true,
+                ..Default::default()
+            })
+            .map_err(|v| v.reason),
+            Err(R::InvariantMutableFieldEscape)
+        );
+    }
+
+    #[test]
+    fn a2_g3_syntactic_contradictions() {
+        assert_eq!(
+            g3("#[trusted] #[ensures(result == 1 && result == 2)] fn f() -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[trusted] #[ensures(x != x)] fn f(x: u8) -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[trusted] #[ensures(r.len() < r.len())] fn f() -> Vec<u8>;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[spec(trusted, ensures: |r| r > 0 && r == 3 && r == 0x4)] fn f() -> u8;"),
+            Some(R::EnsuresFalseOnReturningFn)
+        );
+        assert_eq!(
+            g3("#[spec(trusted, ensures: |r| r == 3 && r == 0x3)] fn f() -> u8;"),
+            None
+        );
+        assert_eq!(
+            g3("#[trusted] #[ensures(result == 1 && other == 2)] fn f() -> u8;"),
+            None
+        );
+        assert_eq!(
+            g3("#[trusted] #[ensures(result == 1 || result == 2)] fn f() -> u8;"),
+            None
+        );
+        assert_eq!(
+            g3("#[trusted] #[ensures(r == 3 && r == 3)] fn f() -> u8;"),
+            None
+        );
+        assert_eq!(g3("#[trusted] #[ensures(x <= x)] fn f(x: u8) -> u8;"), None);
+    }
+
+    #[test]
+    fn a2_g4_impl_level_generic_dispatch() {
+        assert_eq!(
+            g4(
+                "struct H<T>(T); impl<T: Mint> H<T> { fn mk() -> T { T::new() } } fn main() { let a: Tokens = H::mk(); let b: Tokens = H::mk(); }"
+            ),
+            Some(R::GenericConstructorDispatch)
+        );
+        assert_eq!(
+            g4(
+                "struct H<T>(T); impl<T: Mint> H<T> { fn mk() -> T { <T as Mint>::new() } } fn main() { let a: Tokens = H::<Tokens>::mk(); }"
+            ),
+            Some(R::GenericConstructorDispatch)
+        );
+        assert_eq!(
+            g4(
+                "struct H<T>(T); impl<T> H<T> { fn get(&self) -> &T { &self.0 } } fn main() { let _t = Tokens::new(); }"
+            ),
             None
         );
     }
