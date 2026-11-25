@@ -1852,10 +1852,12 @@ def bodyAssertCleanupResume : CapturedMir :=
         isCleanup := true } ]
 
 /-- **Whole-body `ExactWP` discharge #5 (Failing `Assert` → Cleanup `_0 = 99` → `UnwindResume`)**:
-Verifies both:
+Verifies all three exact properties:
 1. After 2 steps (assert fail + cleanup stmt), `_0` holds `99` and execution is poised at `UnwindResume`;
-2. Across the full 5-step body execution, `miriRunFuelAction` reaches `.undefinedBehavior` on root
-   `UnwindResume` while preserving the committed cleanup transition! -/
+2. Across the full 5-step body execution, `miriRunFuelAction` faults with the EXACT vendored root-unwind
+   error `.undefinedBehavior "unwinding past the topmost stack frame"` **while RETAINING the committed
+   cleanup mutation `activeLocal0Bits committed = some 99` inside `AnnealExactWP`'s `onError` branch**!
+3. Via bidirectional `↔` (`miriBodyExactWP_negation_refutation`), pure-safety VC `onError := False` is refuted! -/
 theorem miriBodyExactWP_assert_cleanup_resume :
     let hooks := annealUnwindStepHooks bodyAssertCleanupResume.localDecls emptyLayoutTable
     let init := initMiriStateForBody bodyAssertCleanupResume emptyLayoutTable
@@ -1865,8 +1867,15 @@ theorem miriBodyExactWP_assert_cleanup_resume :
       (fun _ _ => False) init ∧
     AnnealExactWP (miriRunFuelAction hooks () 5)
       (fun _ _ => False)
-      (fun err _ => match err with | .undefinedBehavior _ => True | _ => False) init :=
-  ⟨⟨rfl, rfl⟩, trivial⟩
+      (fun err committed =>
+        err = .undefinedBehavior "unwinding past the topmost stack frame" ∧
+        activeLocal0Bits committed = some 99) init ∧
+    ¬ AnnealExactWP (miriRunFuelAction hooks () 5)
+      (fun _ _ => True) (fun _ _ => False) init := by
+  refine ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ?_⟩
+  apply miriBodyExactWP_negation_refutation
+  intro hFalse
+  exact hFalse
 
 end StepAndBodyWP
 

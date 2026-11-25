@@ -51,12 +51,13 @@ into a fresh kernel environment via `Lean.importModules` in §2.
      = vendored protected foreign write `Miri.TreeBorrows.performAccess`.
    - Closed **Master 6-Module Workstream Capstone** uniting Episode 1 + Episode 2 across all 6
      workstream modules.
-   - **27 kernel-rejected negative forgery controls** (all boolean controls verified two-sided:
+   - **30 kernel-rejected negative forgery controls** (all boolean controls verified two-sided:
      `accepts (= false)` AND `rejects (= true)`; all value/Prop controls paired with accepted
      baselines), covering Ep1 observer/translator/mode/divergence/codec forgeries, permission-swap
-     forgeries, Ep2 unsound `ExactWP` postconditions, clobbered `veil_frame` field overlaps,
-     `Bitprism` uninit/dead-local erasure claims, Tree Borrows / `releaseProtector` committed-prefix
-     forgeries, and LE/BE endian confusion.
+     forgeries, Ep2 unsound `ExactWP` postconditions & cleanup-state erasure on error, clobbered
+     `veil_frame` field overlaps, `Bitprism` uninit/dead-local erasure claims across `bitAnd`/
+     `bitOr`/`mul`, Tree Borrows / `releaseProtector` committed-prefix forgeries, and LE/BE endian
+     confusion.
    - Transitive import-isolation audit of `Anneal.ExactWpAndSmartCtors` (ZERO `Std.Do.*`,
      `Std.Tactic.Do.*`, `Std.WP.*`, `Lean.*`, `Miri.*`, `LeanMiriSpec.*`, `MiniRustSpec.*`),
      choice-free constructive audits, transitive constant reachability (`reachFrom`) across all
@@ -354,21 +355,30 @@ theorem core_ep2_bitprism_negative_ub_non_erasure :
     (type_of% @bitAnd_zero_dead_local_preserves_ub) ∧
     (type_of% @bitAnd_zero_uninit_local_preserves_ub) ∧
     (type_of% @mul_zero_uninit_local_preserves_ub) ∧
+    (type_of% @bitOr_allOnes_uninit_local_preserves_ub) ∧
     (type_of% @addUnchecked_overflow_preserves_ub) ∧
     (type_of% @mkAddSmartRvalue_zero_right_eq_raw) ∧
+    (type_of% @mkSubSmartRvalue_zero_right_eq_raw) ∧
     (type_of% @mkBitAndSmartRvalue_zero_left_eq_raw) ∧
     (type_of% @mkBitAndSmartRvalue_zero_right_eq_raw) ∧
     (type_of% @mkMulSmartRvalue_zero_left_eq_raw) ∧
     (type_of% @mkMulSmartRvalue_zero_right_eq_raw) ∧
+    (type_of% @mkBitOrSmartRvalue_allOnes_left_eq_raw) ∧
+    (type_of% @mkBitOrSmartRvalue_allOnes_right_eq_raw) ∧
+    (type_of% @mkSmartRvalue_never_erases_ub) ∧
     (type_of% @bitprism_const_annihilators_fire) ∧
+    (type_of% @bitprism_const_width_mismatch_preserves_unsupported) ∧
     (type_of% @mkMemWriteFrame_eq_raw) ∧
     (type_of% @mkMemWriteFrame_dead_slot_preserves_failure) :=
   ⟨@bitAnd_zero_dead_local_preserves_ub, @bitAnd_zero_uninit_local_preserves_ub,
-   @mul_zero_uninit_local_preserves_ub, @addUnchecked_overflow_preserves_ub,
-   @mkAddSmartRvalue_zero_right_eq_raw, @mkBitAndSmartRvalue_zero_left_eq_raw,
+   @mul_zero_uninit_local_preserves_ub, @bitOr_allOnes_uninit_local_preserves_ub,
+   @addUnchecked_overflow_preserves_ub, @mkAddSmartRvalue_zero_right_eq_raw,
+   @mkSubSmartRvalue_zero_right_eq_raw, @mkBitAndSmartRvalue_zero_left_eq_raw,
    @mkBitAndSmartRvalue_zero_right_eq_raw, @mkMulSmartRvalue_zero_left_eq_raw,
-   @mkMulSmartRvalue_zero_right_eq_raw, @bitprism_const_annihilators_fire, @mkMemWriteFrame_eq_raw,
-   @mkMemWriteFrame_dead_slot_preserves_failure⟩
+   @mkMulSmartRvalue_zero_right_eq_raw, @mkBitOrSmartRvalue_allOnes_left_eq_raw,
+   @mkBitOrSmartRvalue_allOnes_right_eq_raw, @mkSmartRvalue_never_erases_ub,
+   @bitprism_const_annihilators_fire, @bitprism_const_width_mismatch_preserves_unsupported,
+   @mkMemWriteFrame_eq_raw, @mkMemWriteFrame_dead_slot_preserves_failure⟩
 
 /-- Downstream test of the `anneal_veil_frame` tactic preserving a 3-field compound invariant
 `(heap ∧ callerLocals ∧ globals)` across a 4-step sequence of real `Trusted.MirSemantics` actions
@@ -699,8 +709,8 @@ run_cmd do
               permEqName, miriAllName, permMrName, permCheckName, permCertName, masterName] do
       added := added.push n
 
-    -- 9. Negative forgery controls on scratch copies (27 total: 14 two-sided boolean forgeries +
-    --    13 value/Prop/type-level forgeries paired with accepted baselines).
+    -- 9. Negative forgery controls on scratch copies (30 total: 14 two-sided boolean forgeries +
+    --    16 value/Prop/type-level forgeries paired with accepted baselines).
     let saved ← getEnv
     let acceptsMsg (d : Declaration) : CoreM (Option String) := do
       let r ← try addDecl d; pure none catch e => pure (some (← e.toMessageData.toString))
@@ -863,6 +873,44 @@ run_cmd do
     let bpDeadBasePf := mkApp2 (mkConst ``Eq.refl [1]) rvResTy rvUb
     let bpDeadForgeTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRv locsDead) (mkRvOkZero locsDead)
 
+    -- Ep2 Bitprism `mkBitOrSmartRvalue` & `mkMulSmartRvalue` UB-erasure forgeries on `[.uninit, .uninit]`:
+    let scAllOnes := mkApp2 (mkConst `Trusted.Rustc.V2026_06_01.MirAst.ScalarInt.mk)
+      (mkApp (mkConst (ep2CoreNs ++ `allOnesMask)) (mkNatLit 4)) (mkNatLit 4)
+    let opAllOnes := mkApp2 (mkConst (ep2CoreNs ++ `mkConstScalarOp)) (mkConst (ep2CoreNs ++ `cU32Ty)) scAllOnes
+    let rvSmartOrAllOnes := mkApp3 (mkConst (ep2CoreNs ++ `mkBitOrSmartRvalue))
+      (mkConst (ep2CoreNs ++ `cU32Ty)) opAllOnes opLoc1
+    let rvSmartMulZero := mkApp3 (mkConst (ep2CoreNs ++ `mkMulSmartRvalue))
+      (mkConst (ep2CoreNs ++ `cU32Ty)) opLoc1 opZero
+    let mkEvalRvOf (rv locs : Expr) : Expr :=
+      mkAppN (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue)
+        #[locs, rv, emptyMem, declNil, emptyLay]
+    let mkRvOkAllOnes (locs : Expr) : Expr :=
+      mkApp3 (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.RvalueEvalResult.ok)
+        (mkApp (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.Value.scalar) scAllOnes) locs emptyMem
+    let bpOrBaseTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvSmartOrAllOnes locsUninit) rvUb
+    let bpOrForgeTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvSmartOrAllOnes locsUninit) (mkRvOkAllOnes locsUninit)
+    let bpMulBaseTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvSmartMulZero locsUninit) rvUb
+    let bpMulForgeTy := mkApp3 (mkConst ``Eq [1]) rvResTy (mkEvalRvOf rvSmartMulZero locsUninit) (mkRvOkZero locsUninit)
+
+    -- Ep2 `bodyAssertCleanupResume` committed-cleanup-state-on-error forgery (claiming `_0 = none`
+    -- on error instead of committed `some 99`):
+    let bodyClean := mkConst (ep2LmNs ++ `bodyAssertCleanupResume)
+    let hooksClean := mkApp2 (mkConst (ep2LmNs ++ `annealUnwindStepHooks))
+      (mkApp (mkConst `Trusted.Rustc.V2026_06_01.MirAst.CapturedMir.localDecls) bodyClean) emptyLay
+    let initClean := mkApp2 (mkConst (ep2LmNs ++ `initMiriStateForBody)) bodyClean emptyLay
+    let actClean := mkRunFuel hooksClean (mkNatLit 5)
+    let optNatTy := mkApp (mkConst ``Option [0]) natTy
+    let some99 := mkApp2 (mkConst ``Option.some [0]) natTy (mkNatLit 99)
+    let noneNat := mkApp (mkConst ``Option.none [0]) natTy
+    let mkCleanErrPred (targetOpt : Expr) : MetaM Expr :=
+      withLocalDeclD `_e stepErrTy fun e => withLocalDeclD `s annealStTy fun s =>
+        mkLambdaFVars #[e, s] (mkApp3 (mkConst ``Eq [1]) optNatTy
+          (mkApp (mkConst (ep2LmNs ++ `activeLocal0Bits)) s) targetOpt)
+    let wpCleanBaseTy := mkWpCall actClean initClean constFalsePost (← MetaM.run' <| mkCleanErrPred some99)
+    let wpCleanBasePf := mkApp2 (mkConst ``Eq.refl [1]) optNatTy some99
+    let wpCleanForgeTy := mkWpCall actClean initClean constFalsePost (← MetaM.run' <| mkCleanErrPred noneNat)
+    let wpCleanForgePf := mkApp2 (mkConst ``Eq.refl [1]) optNatTy noneNat
+
     -- Ep2 Tree Borrows committed-prefix-on-error forgery (`performBorrowAccessRangeLMU` claiming
     -- segment 0 stayed `Frozen` instead of committing `Disabled` before segment 1 faults!):
     let permTy := mkConst `Miri.TreeBorrows.Permission
@@ -956,6 +1004,15 @@ run_cmd do
         ("Ep2 forged Bitprism dead-local erasure (0 & dead = .ok 0)",
           some (thm "bpDeadBaseUb" bpDeadBaseTy bpDeadBasePf),
           thm "bpDeadForgedOk" bpDeadForgeTy bpDeadBasePf),
+        ("Ep2 forged Bitprism bitOr uninit erasure (allOnes | uninit = .ok allOnes)",
+          some (thm "bpOrBaseUb" bpOrBaseTy bpDeadBasePf),
+          thm "bpOrForgedOk" bpOrForgeTy bpDeadBasePf),
+        ("Ep2 forged Bitprism mul uninit erasure (uninit * 0 = .ok 0)",
+          some (thm "bpMulBaseUb" bpMulBaseTy bpDeadBasePf),
+          thm "bpMulForgedOk" bpMulForgeTy bpDeadBasePf),
+        ("Ep2 forged cleanup-unwind discards committed `_0 = 99` on error",
+          some (thm "wpCleanBase99" wpCleanBaseTy wpCleanBasePf),
+          thm "wpCleanForgedNone" wpCleanForgeTy wpCleanForgePf),
         ("Ep2 forged Tree Borrows error rollback (claiming seg 0 stayed Frozen instead of Disabled)",
           some (thm "tbPrefixBaseDisabled" tbPrefixBaseTy tbPrefixBasePf),
           thm "tbPrefixForgedFrozen" tbPrefixForgeTy tbPrefixForgePf),
@@ -1135,9 +1192,9 @@ run_cmd do
     { fileName := "<ep2-cross-frame-exactwp-cross-root>", fileMap := default,
       options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 54 && rejectedCount = 27 do
+  unless addedCount = 54 && rejectedCount = 30 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
-  logInfo m!"cross-frame/exact-wp cross-root kernel closure: added {addedCount} declarations, rejected {rejectedCount} forged controls (14 two-sided boolean + 13 baseline-paired value/Prop), verified Std.Do-free ExactWpAndSmartCtors, reached all 6 modules + MiniRust+Miri+MemoryLemmas+Trusted, axioms {crAxioms}"
+  logInfo m!"cross-frame/exact-wp cross-root kernel closure: added {addedCount} declarations, rejected {rejectedCount} forged controls (14 two-sided boolean + 16 baseline-paired value/Prop), verified Std.Do-free ExactWpAndSmartCtors, reached all 6 modules + MiniRust+Miri+MemoryLemmas+Trusted, axioms {crAxioms}"
 
 /-! ## §3. Test Module Axiom Audit -/
 

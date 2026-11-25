@@ -1760,74 +1760,103 @@ IDENTITY rewrites (`x + 0`, `x | 0`, `1 * x`, ...) keep evaluating `x` via `.use
 `*_eq_raw` theorems carry the exact direct-operand / width / canonicity / validity preconditions. -/
 def mkAddSmartRvalue (lhs rhs : Operand) : Rvalue :=
   match operandConstScalar? lhs, operandConstScalar? rhs with
-  | some ⟨0, sz⟩, _ => if sz == 0 then .binaryOp .add lhs rhs else .use rhs
-  | _, some ⟨0, sz⟩ => if sz == 0 then .binaryOp .add lhs rhs else .use lhs
+  | some ⟨a, sz⟩, some ⟨b, sz'⟩ =>
+    if sz != 0 && sz == sz' then
+      if a == 0 && b < scalarModulus sz then .use rhs
+      else if b == 0 && a < scalarModulus sz then .use lhs
+      else .binaryOp .add lhs rhs
+    else .binaryOp .add lhs rhs
+  | some ⟨0, sz⟩, none => if sz == 0 then .binaryOp .add lhs rhs else .use rhs
+  | none, some ⟨0, sz⟩ => if sz == 0 then .binaryOp .add lhs rhs else .use lhs
   | _, _ => .binaryOp .add lhs rhs
 
 def mkSubSmartRvalue (lhs rhs : Operand) : Rvalue :=
-  match operandConstScalar? rhs with
-  | some ⟨0, sz⟩ => if sz == 0 then .binaryOp .sub lhs rhs else .use lhs
-  | _ => .binaryOp .sub lhs rhs
+  match operandConstScalar? lhs, operandConstScalar? rhs with
+  | some ⟨a, sz⟩, some ⟨0, sz'⟩ =>
+    if sz != 0 && sz == sz' && a < scalarModulus sz then .use lhs else .binaryOp .sub lhs rhs
+  | none, some ⟨0, sz⟩ => if sz == 0 then .binaryOp .sub lhs rhs else .use lhs
+  | _, _ => .binaryOp .sub lhs rhs
 
 def mkMulSmartRvalue (resTy : Ty) (lhs rhs : Operand) : Rvalue :=
   match operandConstScalar? lhs, operandConstScalar? rhs with
-  -- Annihilator `0 * c` / `c * 0`: fires ONLY when the dropped operand is ITSELF a same-width
-  -- scalar constant (whose evaluation can never fault), so no operand read is ever erased.
-  | some ⟨0, sz⟩, some ⟨_, sz'⟩ =>
-    if sz != 0 && sz == sz' then .use (mkConstScalarOp resTy ⟨0, sz⟩) else .binaryOp .mul lhs rhs
-  | some ⟨_, sz'⟩, some ⟨0, sz⟩ =>
-    if sz != 0 && sz == sz' then .use (mkConstScalarOp resTy ⟨0, sz⟩) else .binaryOp .mul lhs rhs
+  -- Constant-constant pair: ALWAYS check `sz != 0 && sz == sz'` first so width-mismatched
+  -- constant pairs preserve `.unsupported` and annihilators never drop a non-constant read.
+  | some ⟨a, sz⟩, some ⟨b, sz'⟩ =>
+    if sz != 0 && sz == sz' then
+      if a == 0 || b == 0 then .use (mkConstScalarOp resTy ⟨0, sz⟩)
+      else if a == 1 && b < scalarModulus sz then .use rhs
+      else if b == 1 && a < scalarModulus sz then .use lhs
+      else .binaryOp .mul lhs rhs
+    else .binaryOp .mul lhs rhs
   -- `0 * x` / `x * 0` with NON-constant `x`: `x` may read a dead/uninit local (UB) -> keep raw.
   | some ⟨0, _⟩, none => .binaryOp .mul lhs rhs
   | none, some ⟨0, _⟩ => .binaryOp .mul lhs rhs
   -- Identity `1 * x` / `x * 1`: `x` is STILL evaluated (`.use x`), so its UB is preserved.
-  | some ⟨1, sz⟩, _ => if sz == 0 then .binaryOp .mul lhs rhs else .use rhs
-  | _, some ⟨1, sz⟩ => if sz == 0 then .binaryOp .mul lhs rhs else .use lhs
+  | some ⟨1, sz⟩, none => if sz == 0 then .binaryOp .mul lhs rhs else .use rhs
+  | none, some ⟨1, sz⟩ => if sz == 0 then .binaryOp .mul lhs rhs else .use lhs
   | _, _ => .binaryOp .mul lhs rhs
 
 def mkBitAndSmartRvalue (resTy : Ty) (lhs rhs : Operand) : Rvalue :=
   match operandConstScalar? lhs, operandConstScalar? rhs with
-  -- Annihilator `0 & c` / `c & 0`: ONLY for a same-width constant `c` (never erases a read).
-  | some ⟨0, sz⟩, some ⟨_, sz'⟩ =>
-    if sz != 0 && sz == sz' then .use (mkConstScalarOp resTy ⟨0, sz⟩) else .binaryOp .bitAnd lhs rhs
-  | some ⟨_, sz'⟩, some ⟨0, sz⟩ =>
-    if sz != 0 && sz == sz' then .use (mkConstScalarOp resTy ⟨0, sz⟩) else .binaryOp .bitAnd lhs rhs
+  -- Constant-constant pair: ALWAYS check `sz != 0 && sz == sz'` first.
+  | some ⟨a, sz⟩, some ⟨b, sz'⟩ =>
+    if sz != 0 && sz == sz' then
+      if a == 0 || b == 0 then .use (mkConstScalarOp resTy ⟨0, sz⟩)
+      else if a == allOnesMask sz && b < scalarModulus sz then .use rhs
+      else if b == allOnesMask sz && a < scalarModulus sz then .use lhs
+      else .binaryOp .bitAnd lhs rhs
+    else .binaryOp .bitAnd lhs rhs
   -- `0 & x` / `x & 0` with NON-constant `x`: keep raw so `x`'s dead/uninit-read UB survives.
   | some ⟨0, _⟩, none => .binaryOp .bitAnd lhs rhs
   | none, some ⟨0, _⟩ => .binaryOp .bitAnd lhs rhs
   -- Identity `allOnes & x` / `x & allOnes`: `x` is still evaluated.
-  | some ⟨a, sz⟩, _ => if sz != 0 && a == allOnesMask sz then .use rhs else .binaryOp .bitAnd lhs rhs
-  | _, some ⟨b, sz⟩ => if sz != 0 && b == allOnesMask sz then .use lhs else .binaryOp .bitAnd lhs rhs
+  | some ⟨a, sz⟩, none => if sz != 0 && a == allOnesMask sz then .use rhs else .binaryOp .bitAnd lhs rhs
+  | none, some ⟨b, sz⟩ => if sz != 0 && b == allOnesMask sz then .use lhs else .binaryOp .bitAnd lhs rhs
   | _, _ => .binaryOp .bitAnd lhs rhs
 
 def mkBitOrSmartRvalue (resTy : Ty) (lhs rhs : Operand) : Rvalue :=
   match operandConstScalar? lhs, operandConstScalar? rhs with
-  -- Identity `0 | x` / `x | 0`: `x` is still evaluated.
-  | some ⟨0, sz⟩, _ => if sz == 0 then .binaryOp .bitOr lhs rhs else .use rhs
-  | _, some ⟨0, sz⟩ => if sz == 0 then .binaryOp .bitOr lhs rhs else .use lhs
-  -- Annihilator `allOnes | c` / `c | allOnes`: ONLY when BOTH operands are same-width constants.
+  -- Constant-constant pair FIRST: width-mismatched pairs (e.g. `allOnes_u32 | 0_u8`) ALWAYS stay
+  -- raw (preserving `.unsupported`), while same-width `allOnes | c` / `c | allOnes` collapse cleanly.
   | some ⟨a, sz⟩, some ⟨b, sz'⟩ =>
-    if sz != 0 && sz == sz' && (a == allOnesMask sz || b == allOnesMask sz) then
-      .use (mkConstScalarOp resTy ⟨allOnesMask sz, sz⟩)
+    if sz != 0 && sz == sz' then
+      if a == allOnesMask sz || b == allOnesMask sz then
+        .use (mkConstScalarOp resTy ⟨allOnesMask sz, sz⟩)
+      else if a == 0 && b < scalarModulus sz then .use rhs
+      else if b == 0 && a < scalarModulus sz then .use lhs
+      else .binaryOp .bitOr lhs rhs
     else .binaryOp .bitOr lhs rhs
+  -- Identity `0 | x` / `x | 0` on non-constant `x`: `x` is still evaluated.
+  | some ⟨0, sz⟩, none => if sz == 0 then .binaryOp .bitOr lhs rhs else .use rhs
+  | none, some ⟨0, sz⟩ => if sz == 0 then .binaryOp .bitOr lhs rhs else .use lhs
   -- `allOnes | x` with NON-constant `x`: keep raw (never erase `x`'s dead/uninit-read UB).
   | _, _ => .binaryOp .bitOr lhs rhs
 
 def mkBitXorSmartRvalue (lhs rhs : Operand) : Rvalue :=
   match operandConstScalar? lhs, operandConstScalar? rhs with
-  | some ⟨0, sz⟩, _ => if sz == 0 then .binaryOp .bitXor lhs rhs else .use rhs
-  | _, some ⟨0, sz⟩ => if sz == 0 then .binaryOp .bitXor lhs rhs else .use lhs
+  | some ⟨a, sz⟩, some ⟨b, sz'⟩ =>
+    if sz != 0 && sz == sz' then
+      if a == 0 && b < scalarModulus sz then .use rhs
+      else if b == 0 && a < scalarModulus sz then .use lhs
+      else .binaryOp .bitXor lhs rhs
+    else .binaryOp .bitXor lhs rhs
+  | some ⟨0, sz⟩, none => if sz == 0 then .binaryOp .bitXor lhs rhs else .use rhs
+  | none, some ⟨0, sz⟩ => if sz == 0 then .binaryOp .bitXor lhs rhs else .use lhs
   | _, _ => .binaryOp .bitXor lhs rhs
 
 def mkShlSmartRvalue (lhs rhs : Operand) : Rvalue :=
-  match operandConstScalar? rhs with
-  | some ⟨0, sz⟩ => if sz == 0 then .binaryOp .shl lhs rhs else .use lhs
-  | _ => .binaryOp .shl lhs rhs
+  match operandConstScalar? lhs, operandConstScalar? rhs with
+  | some ⟨a, szL⟩, some ⟨0, szR⟩ =>
+    if szL != 0 && szR != 0 && a < scalarModulus szL then .use lhs else .binaryOp .shl lhs rhs
+  | none, some ⟨0, szR⟩ => if szR == 0 then .binaryOp .shl lhs rhs else .use lhs
+  | _, _ => .binaryOp .shl lhs rhs
 
 def mkShrSmartRvalue (lhs rhs : Operand) : Rvalue :=
-  match operandConstScalar? rhs with
-  | some ⟨0, sz⟩ => if sz == 0 then .binaryOp .shr lhs rhs else .use lhs
-  | _ => .binaryOp .shr lhs rhs
+  match operandConstScalar? lhs, operandConstScalar? rhs with
+  | some ⟨a, szL⟩, some ⟨0, szR⟩ =>
+    if szL != 0 && szR != 0 && a < scalarModulus szL then .use lhs else .binaryOp .shr lhs rhs
+  | none, some ⟨0, szR⟩ => if szR == 0 then .binaryOp .shr lhs rhs else .use lhs
+  | _, _ => .binaryOp .shr lhs rhs
 
 /-- Predicate ensuring an `Operand` is a non-dereferencing operand (constant or direct local copy/move)
 so `.use op` performs no Tree Borrows deref read-freeze side effect. -/
@@ -1920,20 +1949,42 @@ private theorem const_annihilator_raw_eval (locals : List LocalSlot) (ty0 tyR : 
       bitwiseAndBits_zero_left, bitwiseAndBits_zero_right, nat_mul_eq, Nat.mul_zero, Nat.zero_mul,
       wrapScalarBits_eq_mod, Nat.zero_mod]
 
-/-- Smart `.use (const 0)` evaluation. -/
-private theorem use_const_eval (locals : List LocalSlot) (resTy : Ty) (sz : Nat) (mem : Memory)
+/-- Smart `.use (const sc)` evaluation. -/
+private theorem use_const_scalar_eval (locals : List LocalSlot) (resTy : Ty) (sc : ScalarInt) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.use (.constant ⟨resTy, .scalar (.int ⟨0, sz⟩)⟩)) mem localDecls layouts =
-      .ok (.scalar ⟨0, sz⟩) locals mem :=
-  evalRvalue_use_direct locals locals (.constant ⟨resTy, .scalar (.int ⟨0, sz⟩)⟩) mem localDecls
-    layouts ⟨0, sz⟩ trivial rfl rfl
+    evalRvalue locals (.use (.constant ⟨resTy, .scalar (.int sc)⟩)) mem localDecls layouts =
+      .ok (.scalar sc) locals mem :=
+  evalRvalue_use_direct locals locals (.constant ⟨resTy, .scalar (.int sc)⟩) mem localDecls
+    layouts sc trivial rfl rfl
+
+/-- Raw evaluation of `allOnes | c` and `c | allOnes` on two same-width (`sz ≠ 0`) scalar constants. -/
+private theorem const_bitOr_allOnes_raw_eval (locals : List LocalSlot) (ty0 tyR : Ty) (b sz : Nat)
+    (hSz : sz ≠ 0) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.binaryOp .bitOr (mkConstScalarOp ty0 ⟨allOnesMask sz, sz⟩)
+        (mkConstScalarOp tyR ⟨b, sz⟩)) mem localDecls layouts =
+      .ok (.scalar ⟨allOnesMask sz, sz⟩) locals mem ∧
+    evalRvalue locals (.binaryOp .bitOr (mkConstScalarOp tyR ⟨b, sz⟩)
+        (mkConstScalarOp ty0 ⟨allOnesMask sz, sz⟩)) mem localDecls layouts =
+      .ok (.scalar ⟨allOnesMask sz, sz⟩) locals mem := by
+  have hNz := nat_beq_zero_false hSz
+  have hA : evalOperand locals (.constant ⟨ty0, .scalar (.int ⟨allOnesMask sz, sz⟩)⟩)
+      mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar ⟨allOnesMask sz, sz⟩) locals := rfl
+  have hB : evalOperand locals (.constant ⟨tyR, .scalar (.int ⟨b, sz⟩)⟩)
+      mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar ⟨b, sz⟩) locals := rfl
+  have hMod : scalarModulus sz = 2 ^ (sz * 8) := scalarModulus_eq_two_pow sz
+  have hMask : allOnesMask sz = 2 ^ (sz * 8) - 1 := by
+    unfold allOnesMask; rw [hMod]
+  refine ⟨?_, ?_⟩
+  · simp only [evalRvalue, mkConstScalarOp, hA, hB, evalScalarBinOp, hNz, Nat.beq_refl, nat_mul_eq]
+    rw [hMask, bitwiseOrBits_allOnes_left]
+  · simp only [evalRvalue, mkConstScalarOp, hA, hB, evalScalarBinOp, hNz, Nat.beq_refl, nat_mul_eq]
+    rw [hMask, bitwiseOrBits_allOnes_right]
 
 /-- **UNCONDITIONAL exact UB-preserving soundness of `mkBitAndSmartRvalue` on `0 & rhs`** on
 unmodified `Trusted.MirSemantics.evalRvalue`, for EVERY operand `rhs` (dead / uninit / deref /
-constant), EVERY width `sz`, EVERY `locals`, `mem`, `localDecls`, `layouts`: the smart
-constructor NEVER changes the observable result — in particular `0 & _1` with `_1` dead or
-uninit still faults with `.ub` (the annihilator only fires when `rhs` is itself a same-width
-constant). -/
+constant), EVERY width `sz`, EVERY `locals`, `mem`, `localDecls`, `layouts`. -/
 theorem mkBitAndSmartRvalue_zero_left_eq_raw (locals : List LocalSlot) (resTy ty0 : Ty)
     (rhs : Operand) (sz : Nat) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (mkBitAndSmartRvalue resTy (mkConstScalarOp ty0 ⟨0, sz⟩) rhs) mem localDecls layouts =
@@ -1948,9 +1999,10 @@ theorem mkBitAndSmartRvalue_zero_left_eq_raw (locals : List LocalSlot) (resTy ty
     obtain ⟨b, sz'⟩ := sc
     by_cases hC : sz ≠ 0 ∧ sz = sz'
     · obtain ⟨hSz, rfl⟩ := hC
-      have hCond : (sz != 0 && sz == sz) = true := by simp [hSz]
-      simp only [mkBitAndSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond, ↓reduceIte]
-      rw [use_const_eval]
+      have hSimp : mkBitAndSmartRvalue resTy (mkConstScalarOp ty0 ⟨0, sz⟩)
+          (.constant ⟨tyR, .scalar (.int ⟨b, sz⟩)⟩) = .use (mkConstScalarOp resTy ⟨0, sz⟩) := by
+        simp [mkBitAndSmartRvalue, mkConstScalarOp, operandConstScalar?, hSz]
+      rw [hSimp, mkConstScalarOp, use_const_scalar_eval]
       exact ((const_annihilator_raw_eval locals ty0 tyR b sz hSz mem localDecls layouts).1).symm
     · have hCond : (sz != 0 && sz == sz') = false := by
         cases h : (sz != 0 && sz == sz') with
@@ -1974,31 +2026,21 @@ theorem mkBitAndSmartRvalue_zero_right_eq_raw (locals : List LocalSlot) (resTy t
   | some sc =>
     obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
     obtain ⟨a, sz'⟩ := sc
-    by_cases hA : a = 0
-    · subst hA
-      exact mkBitAndSmartRvalue_zero_left_eq_raw locals resTy tyL (mkConstScalarOp ty0 ⟨0, sz⟩) sz' mem
-        localDecls layouts
-    · by_cases hC : sz ≠ 0 ∧ sz = sz'
-      · obtain ⟨hSz, rfl⟩ := hC
-        have hCond : (sz != 0 && sz == sz) = true := by simp [hSz]
-        cases a with
-        | zero => exact absurd rfl hA
-        | succ a' =>
-          simp only [mkBitAndSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond, ↓reduceIte]
-          rw [use_const_eval]
-          exact ((const_annihilator_raw_eval locals ty0 tyL (a' + 1) sz hSz mem localDecls
-            layouts).2.1).symm
-      · have hCond : (sz != 0 && sz == sz') = false := by
-          cases h : (sz != 0 && sz == sz') with
-          | false => rfl
-          | true =>
-            simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, beq_iff_eq] at h
-            exact absurd h hC
-        cases a with
-        | zero => exact absurd rfl hA
-        | succ a' =>
-          simp only [mkBitAndSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond,
-            Bool.false_eq_true, ↓reduceIte]
+    by_cases hC : sz' ≠ 0 ∧ sz' = sz
+    · obtain ⟨hSz, rfl⟩ := hC
+      have hSimp : mkBitAndSmartRvalue resTy (.constant ⟨tyL, .scalar (.int ⟨a, sz'⟩)⟩)
+          (mkConstScalarOp ty0 ⟨0, sz'⟩) = .use (mkConstScalarOp resTy ⟨0, sz'⟩) := by
+        simp [mkBitAndSmartRvalue, mkConstScalarOp, operandConstScalar?, hSz]
+      rw [hSimp, mkConstScalarOp, use_const_scalar_eval]
+      exact ((const_annihilator_raw_eval locals ty0 tyL a sz' hSz mem localDecls layouts).2.1).symm
+    · have hCond : (sz' != 0 && sz' == sz) = false := by
+        cases h : (sz' != 0 && sz' == sz) with
+        | false => rfl
+        | true =>
+          simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, beq_iff_eq] at h
+          exact absurd h hC
+      simp only [mkBitAndSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond,
+        Bool.false_eq_true, ↓reduceIte]
 
 /-- **UNCONDITIONAL** `0 * rhs` soundness on unmodified `evalRvalue` for EVERY operand `rhs`. -/
 theorem mkMulSmartRvalue_zero_left_eq_raw (locals : List LocalSlot) (resTy ty0 : Ty)
@@ -2015,9 +2057,10 @@ theorem mkMulSmartRvalue_zero_left_eq_raw (locals : List LocalSlot) (resTy ty0 :
     obtain ⟨b, sz'⟩ := sc
     by_cases hC : sz ≠ 0 ∧ sz = sz'
     · obtain ⟨hSz, rfl⟩ := hC
-      have hCond : (sz != 0 && sz == sz) = true := by simp [hSz]
-      simp only [mkMulSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond, ↓reduceIte]
-      rw [use_const_eval]
+      have hSimp : mkMulSmartRvalue resTy (mkConstScalarOp ty0 ⟨0, sz⟩)
+          (.constant ⟨tyR, .scalar (.int ⟨b, sz⟩)⟩) = .use (mkConstScalarOp resTy ⟨0, sz⟩) := by
+        simp [mkMulSmartRvalue, mkConstScalarOp, operandConstScalar?, hSz]
+      rw [hSimp, mkConstScalarOp, use_const_scalar_eval]
       exact ((const_annihilator_raw_eval locals ty0 tyR b sz hSz mem localDecls layouts).2.2.1).symm
     · have hCond : (sz != 0 && sz == sz') = false := by
         cases h : (sz != 0 && sz == sz') with
@@ -2042,31 +2085,154 @@ theorem mkMulSmartRvalue_zero_right_eq_raw (locals : List LocalSlot) (resTy ty0 
   | some sc =>
     obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
     obtain ⟨a, sz'⟩ := sc
-    by_cases hA : a = 0
-    · subst hA
-      exact mkMulSmartRvalue_zero_left_eq_raw locals resTy tyL (mkConstScalarOp ty0 ⟨0, sz⟩) sz' mem
-        localDecls layouts
-    · by_cases hC : sz ≠ 0 ∧ sz = sz'
-      · obtain ⟨hSz, rfl⟩ := hC
-        have hCond : (sz != 0 && sz == sz) = true := by simp [hSz]
-        cases a with
-        | zero => exact absurd rfl hA
-        | succ a' =>
-          simp only [mkMulSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond, ↓reduceIte]
-          rw [use_const_eval]
-          exact ((const_annihilator_raw_eval locals ty0 tyL (a' + 1) sz hSz mem localDecls
-            layouts).2.2.2).symm
-      · have hCond : (sz != 0 && sz == sz') = false := by
-          cases h : (sz != 0 && sz == sz') with
-          | false => rfl
-          | true =>
-            simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, beq_iff_eq] at h
-            exact absurd h hC
-        cases a with
-        | zero => exact absurd rfl hA
-        | succ a' =>
-          simp only [mkMulSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond,
-            Bool.false_eq_true, ↓reduceIte]
+    by_cases hC : sz' ≠ 0 ∧ sz' = sz
+    · obtain ⟨hSz, rfl⟩ := hC
+      have hSimp : mkMulSmartRvalue resTy (.constant ⟨tyL, .scalar (.int ⟨a, sz'⟩)⟩)
+          (mkConstScalarOp ty0 ⟨0, sz'⟩) = .use (mkConstScalarOp resTy ⟨0, sz'⟩) := by
+        simp [mkMulSmartRvalue, mkConstScalarOp, operandConstScalar?, hSz]
+      rw [hSimp, mkConstScalarOp, use_const_scalar_eval]
+      exact ((const_annihilator_raw_eval locals ty0 tyL a sz' hSz mem localDecls layouts).2.2.2).symm
+    · have hCond : (sz' != 0 && sz' == sz) = false := by
+        cases h : (sz' != 0 && sz' == sz) with
+        | false => rfl
+        | true =>
+          simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, beq_iff_eq] at h
+          exact absurd h hC
+      simp only [mkMulSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond,
+        Bool.false_eq_true, ↓reduceIte]
+
+private theorem allOnesMask_ne_zero_of_succ (k : Nat) : allOnesMask (k + 1) ≠ 0 := by
+  unfold allOnesMask
+  rw [scalarModulus_eq_two_pow]
+  have h1 : 1 ≤ (k + 1) * 8 := by omega
+  have hPow : 2 ^ 1 ≤ 2 ^ ((k + 1) * 8) := Nat.pow_le_pow_right (by decide) h1
+  omega
+
+/-- **UNCONDITIONAL** `allOnes | rhs` soundness on unmodified `evalRvalue` for EVERY operand `rhs`
+(dead/uninit/width-mismatched constant/same-width constant): width-mismatched constant pairs like
+`allOnes_u32 | 0_u8` preserve `.unsupported`, non-constant `rhs` preserves dead/uninit `.ub`, and
+same-width constants fold cleanly to `.use (const allOnes)`. -/
+theorem mkBitOrSmartRvalue_allOnes_left_eq_raw (locals : List LocalSlot) (resTy ty0 : Ty)
+    (rhs : Operand) (sz : Nat) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (mkBitOrSmartRvalue resTy (mkConstScalarOp ty0 ⟨allOnesMask sz, sz⟩) rhs)
+        mem localDecls layouts =
+      evalRvalue locals (.binaryOp .bitOr (mkConstScalarOp ty0 ⟨allOnesMask sz, sz⟩) rhs)
+        mem localDecls layouts := by
+  cases hR : operandConstScalar? rhs with
+  | none =>
+    cases sz with
+    | zero =>
+      unfold mkBitOrSmartRvalue; rw [hR]; rfl
+    | succ k =>
+      have hNe := allOnesMask_ne_zero_of_succ k
+      unfold mkBitOrSmartRvalue; rw [hR]
+      simp only [mkConstScalarOp, operandConstScalar?]
+      cases hZ : allOnesMask (k + 1) with
+      | zero => exact absurd hZ hNe
+      | succ _ => rfl
+  | some sc =>
+    obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+    obtain ⟨b, sz'⟩ := sc
+    by_cases hC : sz ≠ 0 ∧ sz = sz'
+    · obtain ⟨hSz, rfl⟩ := hC
+      have hSimp : mkBitOrSmartRvalue resTy (mkConstScalarOp ty0 ⟨allOnesMask sz, sz⟩)
+          (.constant ⟨tyR, .scalar (.int ⟨b, sz⟩)⟩) =
+          .use (mkConstScalarOp resTy ⟨allOnesMask sz, sz⟩) := by
+        simp [mkBitOrSmartRvalue, mkConstScalarOp, operandConstScalar?, hSz]
+      rw [hSimp, mkConstScalarOp, use_const_scalar_eval]
+      exact ((const_bitOr_allOnes_raw_eval locals ty0 tyR b sz hSz mem localDecls layouts).1).symm
+    · have hCond : (sz != 0 && sz == sz') = false := by
+        cases h : (sz != 0 && sz == sz') with
+        | false => rfl
+        | true =>
+          simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, beq_iff_eq] at h
+          exact absurd h hC
+      simp only [mkBitOrSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond,
+        Bool.false_eq_true, ↓reduceIte]
+
+/-- **UNCONDITIONAL** `lhs | allOnes` soundness (symmetric to `mkBitOrSmartRvalue_allOnes_left_eq_raw`). -/
+theorem mkBitOrSmartRvalue_allOnes_right_eq_raw (locals : List LocalSlot) (resTy ty0 : Ty)
+    (lhs : Operand) (sz : Nat) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (mkBitOrSmartRvalue resTy lhs (mkConstScalarOp ty0 ⟨allOnesMask sz, sz⟩))
+        mem localDecls layouts =
+      evalRvalue locals (.binaryOp .bitOr lhs (mkConstScalarOp ty0 ⟨allOnesMask sz, sz⟩))
+        mem localDecls layouts := by
+  cases hL : operandConstScalar? lhs with
+  | none =>
+    cases sz with
+    | zero =>
+      unfold mkBitOrSmartRvalue; rw [hL]; rfl
+    | succ k =>
+      have hNe := allOnesMask_ne_zero_of_succ k
+      unfold mkBitOrSmartRvalue; rw [hL]
+      simp only [mkConstScalarOp, operandConstScalar?]
+      cases hZ : allOnesMask (k + 1) with
+      | zero => exact absurd hZ hNe
+      | succ _ => rfl
+  | some sc =>
+    obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+    obtain ⟨a, sz'⟩ := sc
+    by_cases hC : sz' ≠ 0 ∧ sz' = sz
+    · obtain ⟨hSz, rfl⟩ := hC
+      have hSimp : mkBitOrSmartRvalue resTy (.constant ⟨tyL, .scalar (.int ⟨a, sz'⟩)⟩)
+          (mkConstScalarOp ty0 ⟨allOnesMask sz', sz'⟩) =
+          .use (mkConstScalarOp resTy ⟨allOnesMask sz', sz'⟩) := by
+        simp [mkBitOrSmartRvalue, mkConstScalarOp, operandConstScalar?, hSz]
+      rw [hSimp, mkConstScalarOp, use_const_scalar_eval]
+      exact ((const_bitOr_allOnes_raw_eval locals ty0 tyL a sz' hSz mem localDecls layouts).2).symm
+    · have hCond : (sz' != 0 && sz' == sz) = false := by
+        cases h : (sz' != 0 && sz' == sz) with
+        | false => rfl
+        | true =>
+          simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, beq_iff_eq] at h
+          exact absurd h hC
+      simp only [mkBitOrSmartRvalue, mkConstScalarOp, operandConstScalar?, hCond,
+        Bool.false_eq_true, ↓reduceIte]
+
+/-- Exact UB-preserving soundness for `mkSubSmartRvalue` on `lhs - 0`. -/
+theorem mkSubSmartRvalue_zero_right_eq_raw (locals locals' : List LocalSlot)
+    (lhs : Operand) (ty0 : Ty) (sz : Nat) (sc : ScalarInt)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hDirect : isDirectOperand lhs)
+    (hSz : sz ≠ 0) (hEqSz : sc.sizeBytes = sz)
+    (hCanon : sc.bits < scalarModulus sz)
+    (hEval : evalOperand locals lhs mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar sc) locals')
+    (hVal : validateLoadedValue layouts localDecls lhs (.scalar sc) = true) :
+    evalRvalue locals (mkSubSmartRvalue lhs (mkConstScalarOp ty0 ⟨0, sz⟩)) mem localDecls layouts =
+      evalRvalue locals (.binaryOp .sub lhs (mkConstScalarOp ty0 ⟨0, sz⟩)) mem localDecls layouts := by
+  have hNe0 : (sz == 0) = false := beq_false_of_ne hSz
+  have hNz := nat_beq_zero_false hSz
+  have hSimp : mkSubSmartRvalue lhs (mkConstScalarOp ty0 ⟨0, sz⟩) = .use lhs := by
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      unfold mkSubSmartRvalue; rw [hL]
+      simp only [mkConstScalarOp, operandConstScalar?, hNe0, Bool.false_eq_true, ↓reduceIte]
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      have hEqSc : scL = sc := by
+        have hConst : evalOperand locals (.constant ⟨tyL, .scalar (.int scL)⟩)
+            mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+            .ok (.scalar scL) locals := rfl
+        rw [hConst] at hEval; cases hEval; rfl
+      subst hEqSc
+      cases scL with
+      | mk bits sb =>
+        simp only at hEqSz hCanon
+        subst hEqSz
+        simp [mkSubSmartRvalue, mkConstScalarOp, operandConstScalar?, hSz, hCanon]
+  rw [hSimp, evalRvalue_use_direct locals locals' lhs mem localDecls layouts sc hDirect hEval hVal]
+  have hConstEval : evalOperand locals' (.constant ⟨ty0, .scalar (.int ⟨0, sz⟩)⟩)
+      mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar ⟨0, sz⟩) locals' := rfl
+  simp only [evalRvalue, mkConstScalarOp, hEval, hConstEval]
+  cases sc with
+  | mk bits sb =>
+    simp only at hEqSz hCanon
+    subst hEqSz
+    have hBle0 : Nat.ble 0 bits = true := rfl
+    simp only [evalScalarBinOp, hNz, Nat.beq_refl, nat_sub_eq, Nat.sub_zero,
+      hBle0, wrapScalarBits_of_lt hCanon]
 
 /-- Exact UB-preserving soundness for `mkBitOrSmartRvalue` on `lhs | 0`. -/
 theorem mkBitOrSmartRvalue_zero_right_eq_raw (locals locals' : List LocalSlot)
@@ -2145,13 +2311,28 @@ theorem mkShlSmartRvalue_zero_right_eq_raw (locals locals' : List LocalSlot)
   have hNe0 : (sz == 0) = false := beq_false_of_ne hSz
   have hNzR := nat_beq_zero_false hSz
   have hNzL := nat_beq_zero_false hScSz
-  unfold mkShlSmartRvalue
-  simp only [mkConstScalarOp, operandConstScalar?, hNe0, Bool.false_eq_true, ↓reduceIte]
-  rw [evalRvalue_use_direct locals locals' lhs mem localDecls layouts sc hDirect hEval hVal]
+  have hSimp : mkShlSmartRvalue lhs (mkConstScalarOp ty0 ⟨0, sz⟩) = .use lhs := by
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      unfold mkShlSmartRvalue; rw [hL]
+      simp only [mkConstScalarOp, operandConstScalar?, hNe0, Bool.false_eq_true, ↓reduceIte]
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      have hEqSc : scL = sc := by
+        have hConst : evalOperand locals (.constant ⟨tyL, .scalar (.int scL)⟩)
+            mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+            .ok (.scalar scL) locals := rfl
+        rw [hConst] at hEval; cases hEval; rfl
+      subst hEqSc
+      cases scL with
+      | mk bits sb =>
+        simp only at hScSz hCanon
+        simp [mkShlSmartRvalue, mkConstScalarOp, operandConstScalar?, hScSz, hSz, hCanon]
+  rw [hSimp, evalRvalue_use_direct locals locals' lhs mem localDecls layouts sc hDirect hEval hVal]
   have hRhsConst : evalOperand locals' (.constant ⟨ty0, .scalar (.int ⟨0, sz⟩)⟩)
       mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨0, sz⟩) locals' := rfl
-  simp only [evalRvalue, hEval, hRhsConst]
+  simp only [evalRvalue, mkConstScalarOp, hEval, hRhsConst]
   cases sc with
   | mk bits sb =>
     simp only at hNzL hCanon
@@ -2174,18 +2355,388 @@ theorem mkShrSmartRvalue_zero_right_eq_raw (locals locals' : List LocalSlot)
   have hNe0 : (sz == 0) = false := beq_false_of_ne hSz
   have hNzR := nat_beq_zero_false hSz
   have hNzL := nat_beq_zero_false hScSz
-  unfold mkShrSmartRvalue
-  simp only [mkConstScalarOp, operandConstScalar?, hNe0, Bool.false_eq_true, ↓reduceIte]
-  rw [evalRvalue_use_direct locals locals' lhs mem localDecls layouts sc hDirect hEval hVal]
+  have hSimp : mkShrSmartRvalue lhs (mkConstScalarOp ty0 ⟨0, sz⟩) = .use lhs := by
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      unfold mkShrSmartRvalue; rw [hL]
+      simp only [mkConstScalarOp, operandConstScalar?, hNe0, Bool.false_eq_true, ↓reduceIte]
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      have hEqSc : scL = sc := by
+        have hConst : evalOperand locals (.constant ⟨tyL, .scalar (.int scL)⟩)
+            mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+            .ok (.scalar scL) locals := rfl
+        rw [hConst] at hEval; cases hEval; rfl
+      subst hEqSc
+      cases scL with
+      | mk bits sb =>
+        simp only at hScSz hCanon
+        simp [mkShrSmartRvalue, mkConstScalarOp, operandConstScalar?, hScSz, hSz, hCanon]
+  rw [hSimp, evalRvalue_use_direct locals locals' lhs mem localDecls layouts sc hDirect hEval hVal]
   have hRhsConst : evalOperand locals' (.constant ⟨ty0, .scalar (.int ⟨0, sz⟩)⟩)
       mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨0, sz⟩) locals' := rfl
-  simp only [evalRvalue, hEval, hRhsConst, hUnsigned]
+  simp only [evalRvalue, mkConstScalarOp, hEval, hRhsConst, hUnsigned]
   cases sc with
   | mk bits sb =>
     simp only at hNzL hCanon
     simp only [evalScalarBinOp, hNzL, hNzR, nat_mul_eq, nat_mod_eq, nat_div_eq, Nat.zero_mod,
       shiftRightUnsignedBits, scalarPow2, Nat.div_one, wrapScalarBits_of_lt hCanon]
+
+/-! ### B.4b. Unconditional Universal UB-Preservation Across ALL 8 `mk*SmartRvalue` Constructors -/
+
+private theorem evalScalarBinOp_wrapping_ne_ub {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (lhs rhs : ScalarInt) (locals : List LocalSlot) (mem : Memory) (isSigned : Bool) :
+    evalScalarBinOp op lhs rhs locals mem isSigned ≠ .ub := by
+  intro hUb
+  unfold evalScalarBinOp at hUb
+  cases hL0 : Nat.beq lhs.sizeBytes 0 with
+  | true => rw [hL0] at hUb; cases hUb
+  | false =>
+    rw [hL0] at hUb; dsimp only at hUb
+    rcases hSafe with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes <;> rw [hEq] at hUb <;> cases hUb
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hEq] at hUb; cases hUb
+      | true =>
+        rw [hEq] at hUb; dsimp only at hUb
+        cases hLe : Nat.ble rhs.bits lhs.bits <;> rw [hLe] at hUb <;> cases hUb
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes <;> rw [hEq] at hUb <;> cases hUb
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes <;> rw [hEq] at hUb <;> cases hUb
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes <;> rw [hEq] at hUb <;> cases hUb
+    · cases hEq : Nat.beq lhs.sizeBytes rhs.sizeBytes <;> rw [hEq] at hUb <;> cases hUb
+    · cases hR0 : Nat.beq rhs.sizeBytes 0 <;> rw [hR0] at hUb <;> cases hUb
+    · cases hR0 : Nat.beq rhs.sizeBytes 0 <;> rw [hR0] at hUb <;> cases hUb
+
+private theorem isPtrRelationalBinOp_wrapping_false {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhs rhs : Operand) :
+    isPtrRelationalBinOp op localDecls layouts lhs rhs = false := by
+  rcases hSafe with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> rfl
+
+private theorem evalWidePtrAggregateRelBinOp_wrapping_unsupported {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (lhs : Operand) (lv : Nat) (lf : List Value) (rv : Nat) (rf : List Value)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalWidePtrAggregateRelBinOp op lhs lv lf rv rf locals mem localDecls layouts = .unsupported := by
+  unfold evalWidePtrAggregateRelBinOp
+  rcases hSafe with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+    (split <;> rfl)
+
+private theorem evalRvalue_binaryOp_ub_operand {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (locals : List LocalSlot) (lhs rhs : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals (.binaryOp op lhs rhs) mem localDecls layouts = .ub) :
+    evalOperand locals lhs mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack = .ub ∨
+    ∃ v1 locals₁,
+      evalOperand locals lhs mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok v1 locals₁ ∧
+      evalOperand locals₁ rhs mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack = .ub := by
+  simp only [evalRvalue] at hUb
+  cases hL : evalOperand locals lhs mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+  | ub => exact Or.inl rfl
+  | unsupported => rw [hL] at hUb; cases hUb
+  | ok v1 locals₁ =>
+    rw [hL] at hUb; dsimp only at hUb
+    cases hR : evalOperand locals₁ rhs mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+    | ub => exact Or.inr ⟨v1, locals₁, rfl, hR⟩
+    | unsupported => rw [hR] at hUb; cases hUb
+    | ok v2 locals₂ =>
+      rw [hR] at hUb; dsimp only at hUb
+      have hNotRel := isPtrRelationalBinOp_wrapping_false hSafe localDecls layouts lhs rhs
+      have hAgg := evalWidePtrAggregateRelBinOp_wrapping_unsupported hSafe
+      cases v1 <;> cases v2 <;>
+        rcases hSafe with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+        (dsimp only at hUb;
+         first
+         | exact False.elim (evalScalarBinOp_wrapping_ne_ub (by simp) _ _ _ _ _ hUb)
+         | (rw [hNotRel] at hUb; cases hUb)
+         | (rw [hAgg] at hUb; cases hUb)
+         | cases hUb)
+
+private theorem evalRvalue_ub_of_const_lhs {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (locals : List LocalSlot) (ty : Ty) (sc : ScalarInt) (rhs : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals (.binaryOp op (.constant ⟨ty, .scalar (.int sc)⟩) rhs) mem localDecls layouts = .ub) :
+    evalRvalue locals (.use rhs) mem localDecls layouts = .ub := by
+  have hOp := evalRvalue_binaryOp_ub_operand hSafe locals (.constant ⟨ty, .scalar (.int sc)⟩) rhs mem localDecls layouts hUb
+  have hConst : evalOperand locals (.constant ⟨ty, .scalar (.int sc)⟩) mem.borrows mem.globals layouts
+      mem.callerLocals localDecls mem.callStack = .ok (.scalar sc) locals := rfl
+  rcases hOp with hL | ⟨_, _, hL, hR⟩
+  · rw [hConst] at hL; cases hL
+  · rw [hConst] at hL; cases hL
+    simp only [evalRvalue, hR]
+
+private theorem evalRvalue_ub_of_const_rhs {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (locals : List LocalSlot) (lhs : Operand) (ty : Ty) (sc : ScalarInt)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals (.binaryOp op lhs (.constant ⟨ty, .scalar (.int sc)⟩)) mem localDecls layouts = .ub) :
+    evalRvalue locals (.use lhs) mem localDecls layouts = .ub := by
+  have hOp := evalRvalue_binaryOp_ub_operand hSafe locals lhs (.constant ⟨ty, .scalar (.int sc)⟩) mem localDecls layouts hUb
+  rcases hOp with hL | ⟨_, locals₁, _, hR⟩
+  · simp only [evalRvalue, hL]
+  · have hConst : evalOperand locals₁ (.constant ⟨ty, .scalar (.int sc)⟩) mem.borrows mem.globals layouts
+        mem.callerLocals localDecls mem.callStack = .ok (.scalar sc) locals₁ := rfl
+    rw [hConst] at hR; cases hR
+
+private theorem evalRvalue_binaryOp_const_const_ne_ub {op : BinOp}
+    (hSafe : op = .add ∨ op = .sub ∨ op = .mul ∨ op = .bitAnd ∨
+      op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .shr)
+    (locals : List LocalSlot) (ty1 ty2 : Ty) (sc1 sc2 : ScalarInt)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.binaryOp op (.constant ⟨ty1, .scalar (.int sc1)⟩)
+      (.constant ⟨ty2, .scalar (.int sc2)⟩)) mem localDecls layouts ≠ .ub := by
+  intro hUb
+  have hOp := evalRvalue_binaryOp_ub_operand hSafe locals
+    (.constant ⟨ty1, .scalar (.int sc1)⟩) (.constant ⟨ty2, .scalar (.int sc2)⟩)
+    mem localDecls layouts hUb
+  rcases hOp with hL | ⟨_, locals₁, _, hR⟩
+  · cases hL
+  · cases hR
+
+/-- **UNCONDITIONAL UNIVERSAL UB-PRESERVATION ACROSS ALL 8 `mk*SmartRvalue` CONSTRUCTORS**:
+For EVERY `locals`, `resTy`, `lhs`, `rhs`, `mem`, `localDecls`, `layouts`, ZERO hypotheses on
+definedness/width/types: if unmodified `Trusted.MirSemantics.evalRvalue` on the raw `.binaryOp`
+faults with `.ub`, then `evalRvalue` on the smart-constructed `Rvalue` ALSO faults with `.ub`!
+Not one of the 8 `Bitprism` MIR smart constructors can EVER erase UB! -/
+theorem mkSmartRvalue_never_erases_ub (locals : List LocalSlot) (resTy : Ty)
+    (lhs rhs : Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (evalRvalue locals (.binaryOp .add lhs rhs) mem localDecls layouts = .ub →
+      evalRvalue locals (mkAddSmartRvalue lhs rhs) mem localDecls layouts = .ub) ∧
+    (evalRvalue locals (.binaryOp .sub lhs rhs) mem localDecls layouts = .ub →
+      evalRvalue locals (mkSubSmartRvalue lhs rhs) mem localDecls layouts = .ub) ∧
+    (evalRvalue locals (.binaryOp .mul lhs rhs) mem localDecls layouts = .ub →
+      evalRvalue locals (mkMulSmartRvalue resTy lhs rhs) mem localDecls layouts = .ub) ∧
+    (evalRvalue locals (.binaryOp .bitAnd lhs rhs) mem localDecls layouts = .ub →
+      evalRvalue locals (mkBitAndSmartRvalue resTy lhs rhs) mem localDecls layouts = .ub) ∧
+    (evalRvalue locals (.binaryOp .bitOr lhs rhs) mem localDecls layouts = .ub →
+      evalRvalue locals (mkBitOrSmartRvalue resTy lhs rhs) mem localDecls layouts = .ub) ∧
+    (evalRvalue locals (.binaryOp .bitXor lhs rhs) mem localDecls layouts = .ub →
+      evalRvalue locals (mkBitXorSmartRvalue lhs rhs) mem localDecls layouts = .ub) ∧
+    (evalRvalue locals (.binaryOp .shl lhs rhs) mem localDecls layouts = .ub →
+      evalRvalue locals (mkShlSmartRvalue lhs rhs) mem localDecls layouts = .ub) ∧
+    (evalRvalue locals (.binaryOp .shr lhs rhs) mem localDecls layouts = .ub →
+      evalRvalue locals (mkShrSmartRvalue lhs rhs) mem localDecls layouts = .ub) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro hUb
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      cases hR : operandConstScalar? rhs with
+      | none => simp only [mkAddSmartRvalue, hL, hR]; exact hUb
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        rcases scR with ⟨b, sz⟩
+        cases b with
+        | zero =>
+          simp only [mkAddSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_rhs (Or.inl rfl) locals lhs tyR ⟨0, sz⟩ mem localDecls layouts hUb
+        | succ _ => simp only [mkAddSmartRvalue, hL, hR]; exact hUb
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      cases hR : operandConstScalar? rhs with
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        exact False.elim (evalRvalue_binaryOp_const_const_ne_ub (Or.inl rfl) locals tyL tyR scL scR mem localDecls layouts hUb)
+      | none =>
+        rcases scL with ⟨a, sz⟩
+        cases a with
+        | zero =>
+          simp only [mkAddSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_lhs (Or.inl rfl) locals tyL ⟨0, sz⟩ rhs mem localDecls layouts hUb
+        | succ _ => simp only [mkAddSmartRvalue, hL, hR]; exact hUb
+  · intro hUb
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      cases hR : operandConstScalar? rhs with
+      | none => simp only [mkSubSmartRvalue, hL, hR]; exact hUb
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        rcases scR with ⟨b, sz⟩
+        cases b with
+        | zero =>
+          simp only [mkSubSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_rhs (Or.inr (Or.inl rfl)) locals lhs tyR ⟨0, sz⟩ mem localDecls layouts hUb
+        | succ _ => simp only [mkSubSmartRvalue, hL, hR]; exact hUb
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      cases hR : operandConstScalar? rhs with
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        exact False.elim (evalRvalue_binaryOp_const_const_ne_ub (Or.inr (Or.inl rfl)) locals tyL tyR scL scR mem localDecls layouts hUb)
+      | none => simp only [mkSubSmartRvalue, hL, hR]; exact hUb
+  · intro hUb
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      cases hR : operandConstScalar? rhs with
+      | none => simp only [mkMulSmartRvalue, hL, hR]; exact hUb
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        rcases scR with ⟨b, sz⟩
+        cases b with
+        | zero => simp only [mkMulSmartRvalue, hL, hR]; exact hUb
+        | succ b' =>
+          cases b' with
+          | zero =>
+            simp only [mkMulSmartRvalue, hL, hR]; split
+            · exact hUb
+            · exact evalRvalue_ub_of_const_rhs (by simp) locals lhs tyR ⟨1, sz⟩ mem localDecls layouts hUb
+          | succ _ => simp only [mkMulSmartRvalue, hL, hR]; exact hUb
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      cases hR : operandConstScalar? rhs with
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        exact False.elim (evalRvalue_binaryOp_const_const_ne_ub (by simp) locals tyL tyR scL scR mem localDecls layouts hUb)
+      | none =>
+        rcases scL with ⟨a, sz⟩
+        cases a with
+        | zero => simp only [mkMulSmartRvalue, hL, hR]; exact hUb
+        | succ a' =>
+          cases a' with
+          | zero =>
+            simp only [mkMulSmartRvalue, hL, hR]; split
+            · exact hUb
+            · exact evalRvalue_ub_of_const_lhs (by simp) locals tyL ⟨1, sz⟩ rhs mem localDecls layouts hUb
+          | succ _ => simp only [mkMulSmartRvalue, hL, hR]; exact hUb
+  · intro hUb
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      cases hR : operandConstScalar? rhs with
+      | none => simp only [mkBitAndSmartRvalue, hL, hR]; exact hUb
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        rcases scR with ⟨b, sz⟩
+        cases b with
+        | zero => simp only [mkBitAndSmartRvalue, hL, hR]; exact hUb
+        | succ b' =>
+          simp only [mkBitAndSmartRvalue, hL, hR]; split
+          · exact evalRvalue_ub_of_const_rhs (by simp) locals lhs tyR ⟨b' + 1, sz⟩ mem localDecls layouts hUb
+          · exact hUb
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      cases hR : operandConstScalar? rhs with
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        exact False.elim (evalRvalue_binaryOp_const_const_ne_ub (by simp) locals tyL tyR scL scR mem localDecls layouts hUb)
+      | none =>
+        rcases scL with ⟨a, sz⟩
+        cases a with
+        | zero => simp only [mkBitAndSmartRvalue, hL, hR]; exact hUb
+        | succ a' =>
+          simp only [mkBitAndSmartRvalue, hL, hR]; split
+          · exact evalRvalue_ub_of_const_lhs (by simp) locals tyL ⟨a' + 1, sz⟩ rhs mem localDecls layouts hUb
+          · exact hUb
+  · intro hUb
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      cases hR : operandConstScalar? rhs with
+      | none => simp only [mkBitOrSmartRvalue, hL, hR]; exact hUb
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        rcases scR with ⟨b, sz⟩
+        cases b with
+        | zero =>
+          simp only [mkBitOrSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_rhs (by simp) locals lhs tyR ⟨0, sz⟩ mem localDecls layouts hUb
+        | succ _ => simp only [mkBitOrSmartRvalue, hL, hR]; exact hUb
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      cases hR : operandConstScalar? rhs with
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        exact False.elim (evalRvalue_binaryOp_const_const_ne_ub (by simp) locals tyL tyR scL scR mem localDecls layouts hUb)
+      | none =>
+        rcases scL with ⟨a, sz⟩
+        cases a with
+        | zero =>
+          simp only [mkBitOrSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_lhs (by simp) locals tyL ⟨0, sz⟩ rhs mem localDecls layouts hUb
+        | succ _ => simp only [mkBitOrSmartRvalue, hL, hR]; exact hUb
+  · intro hUb
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      cases hR : operandConstScalar? rhs with
+      | none => simp only [mkBitXorSmartRvalue, hL, hR]; exact hUb
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        rcases scR with ⟨b, sz⟩
+        cases b with
+        | zero =>
+          simp only [mkBitXorSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_rhs (by simp) locals lhs tyR ⟨0, sz⟩ mem localDecls layouts hUb
+        | succ _ => simp only [mkBitXorSmartRvalue, hL, hR]; exact hUb
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      cases hR : operandConstScalar? rhs with
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        exact False.elim (evalRvalue_binaryOp_const_const_ne_ub (by simp) locals tyL tyR scL scR mem localDecls layouts hUb)
+      | none =>
+        rcases scL with ⟨a, sz⟩
+        cases a with
+        | zero =>
+          simp only [mkBitXorSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_lhs (by simp) locals tyL ⟨0, sz⟩ rhs mem localDecls layouts hUb
+        | succ _ => simp only [mkBitXorSmartRvalue, hL, hR]; exact hUb
+  · intro hUb
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      cases hR : operandConstScalar? rhs with
+      | none => simp only [mkShlSmartRvalue, hL, hR]; exact hUb
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        rcases scR with ⟨b, sz⟩
+        cases b with
+        | zero =>
+          simp only [mkShlSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_rhs (by simp) locals lhs tyR ⟨0, sz⟩ mem localDecls layouts hUb
+        | succ _ => simp only [mkShlSmartRvalue, hL, hR]; exact hUb
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      cases hR : operandConstScalar? rhs with
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        exact False.elim (evalRvalue_binaryOp_const_const_ne_ub (by simp) locals tyL tyR scL scR mem localDecls layouts hUb)
+      | none => simp only [mkShlSmartRvalue, hL, hR]; exact hUb
+  · intro hUb
+    cases hL : operandConstScalar? lhs with
+    | none =>
+      cases hR : operandConstScalar? rhs with
+      | none => simp only [mkShrSmartRvalue, hL, hR]; exact hUb
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        rcases scR with ⟨b, sz⟩
+        cases b with
+        | zero =>
+          simp only [mkShrSmartRvalue, hL, hR]; split
+          · exact hUb
+          · exact evalRvalue_ub_of_const_rhs (by simp) locals lhs tyR ⟨0, sz⟩ mem localDecls layouts hUb
+        | succ _ => simp only [mkShrSmartRvalue, hL, hR]; exact hUb
+    | some scL =>
+      obtain ⟨tyL, rfl⟩ := operandConstScalar?_eq_some hL
+      cases hR : operandConstScalar? rhs with
+      | some scR =>
+        obtain ⟨tyR, rfl⟩ := operandConstScalar?_eq_some hR
+        exact False.elim (evalRvalue_binaryOp_const_const_ne_ub (by simp) locals tyL tyR scL scR mem localDecls layouts hUb)
+      | none => simp only [mkShrSmartRvalue, hL, hR]; exact hUb
 
 /-! ### B.5. Negative Non-Erasure Refutation Theorems (Proving Preconditions Are Essential!) -/
 
@@ -2234,21 +2785,54 @@ theorem mul_zero_uninit_local_preserves_ub :
     evalRvalue locals simpRv ≠ evalRvalue locals naiveRv := by
   refine ⟨rfl, rfl, rfl, fun h => by cases h⟩
 
-/-- **Annihilator still fires on genuine constants**: `0 & 7` and `7 * 0` on same-width `u32`
-constants collapse to `.use (const 0)` (no operand read is dropped), agreeing exactly with raw
-evaluation — the smart constructors remain non-trivial simplifiers. -/
+/-- **Non-erasure witness #4 (`allOnes | uninit`)**: `mkBitOrSmartRvalue` preserves the `.ub` of
+OR-ing `u32::MAX` with an `.uninit` local, unlike the naive `.use (const allOnes)` rewrite. -/
+theorem bitOr_allOnes_uninit_local_preserves_ub :
+    let locals : List LocalSlot := [.uninit, .uninit]
+    let allOnes := mkConstScalarOp cU32Ty ⟨allOnesMask 4, 4⟩
+    let rawRv := Rvalue.binaryOp .bitOr allOnes (.copy ⟨1, []⟩)
+    let simpRv := mkBitOrSmartRvalue cU32Ty allOnes (.copy ⟨1, []⟩)
+    let naiveRv := Rvalue.use allOnes
+    evalRvalue locals rawRv = .ub ∧
+    evalRvalue locals simpRv = .ub ∧
+    evalRvalue locals naiveRv = .ok (.scalar ⟨allOnesMask 4, 4⟩) locals emptyMemory ∧
+    evalRvalue locals simpRv ≠ evalRvalue locals naiveRv := by
+  refine ⟨rfl, rfl, rfl, fun h => by cases h⟩
+
+/-- **Width-mismatch & non-canonical constant-pair preservation**: width-mismatched constant pairs
+(`allOnes_u32 | 0_u8`, `0_u32 + 5_u8`, `1_u32 * 5_u8`, `allOnes_u32 & 5_u8`) preserve `.unsupported`
+in ALL smart constructors (never turning `.unsupported` into `.ok`), while `0_u8 + 256_u8` preserves
+wrapping (`0` rather than unwrapped `256`). -/
+theorem bitprism_const_width_mismatch_preserves_unsupported :
+    evalRvalue [] (mkBitOrSmartRvalue cU32Ty (mkConstScalarOp cU32Ty ⟨allOnesMask 4, 4⟩)
+        (mkConstScalarOp cU8Ty ⟨0, 1⟩)) = .unsupported ∧
+    evalRvalue [] (mkAddSmartRvalue (mkConstScalarOp cU32Ty ⟨0, 4⟩)
+        (mkConstScalarOp cU8Ty ⟨5, 1⟩)) = .unsupported ∧
+    evalRvalue [] (mkMulSmartRvalue cU32Ty (mkConstScalarOp cU32Ty ⟨1, 4⟩)
+        (mkConstScalarOp cU8Ty ⟨5, 1⟩)) = .unsupported ∧
+    evalRvalue [] (mkBitAndSmartRvalue cU32Ty (mkConstScalarOp cU32Ty ⟨allOnesMask 4, 4⟩)
+        (mkConstScalarOp cU8Ty ⟨5, 1⟩)) = .unsupported ∧
+    evalRvalue [] (mkAddSmartRvalue (mkConstScalarOp cU8Ty ⟨0, 1⟩)
+        (mkConstScalarOp cU8Ty ⟨256, 1⟩)) = .ok (.scalar ⟨0, 1⟩) [] emptyMemory := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Annihilator still fires on genuine constants**: `0 & 7`, `7 * 0`, and `allOnes | 7` on
+same-width `u32` constants collapse to `.use (const ...)`, agreeing exactly with raw evaluation. -/
 theorem bitprism_const_annihilators_fire :
     mkBitAndSmartRvalue cU32Ty (mkConstScalarOp cU32Ty ⟨0, 4⟩) (mkConstScalarOp cU32Ty ⟨7, 4⟩) =
       .use (mkConstScalarOp cU32Ty ⟨0, 4⟩) ∧
     mkMulSmartRvalue cU32Ty (mkConstScalarOp cU32Ty ⟨7, 4⟩) (mkConstScalarOp cU32Ty ⟨0, 4⟩) =
       .use (mkConstScalarOp cU32Ty ⟨0, 4⟩) ∧
+    mkBitOrSmartRvalue cU32Ty (mkConstScalarOp cU32Ty ⟨allOnesMask 4, 4⟩)
+        (mkConstScalarOp cU32Ty ⟨7, 4⟩) =
+      .use (mkConstScalarOp cU32Ty ⟨allOnesMask 4, 4⟩) ∧
     mkBitAndSmartRvalue cU32Ty (mkConstScalarOp cU32Ty ⟨0, 4⟩) (.copy ⟨1, []⟩) =
       .binaryOp .bitAnd (mkConstScalarOp cU32Ty ⟨0, 4⟩) (.copy ⟨1, []⟩) ∧
     evalRvalue [] (mkBitAndSmartRvalue cU32Ty (mkConstScalarOp cU32Ty ⟨0, 4⟩)
         (mkConstScalarOp cU32Ty ⟨7, 4⟩)) =
       evalRvalue [] (.binaryOp .bitAnd (mkConstScalarOp cU32Ty ⟨0, 4⟩)
         (mkConstScalarOp cU32Ty ⟨7, 4⟩)) := by
-  refine ⟨rfl, rfl, rfl, rfl⟩
+  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-- **Negative refutation #4 (`addUnchecked` overflow vs wrapping `add`)**:
 `u8::MAX + 1` faults with `.ub` under `.addUnchecked` whereas wrapping `.add` produces `0` —
@@ -3191,14 +3775,20 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
     (type_of% @mkWrappingPtrOffsetSmart_eq_raw) ∧
     (type_of% @bitprism_nested_collapse_o1) ∧
     (type_of% @mkAddSmartRvalue_zero_right_eq_raw) ∧
+    (type_of% @mkSubSmartRvalue_zero_right_eq_raw) ∧
     (type_of% @mkBitAndSmartRvalue_zero_left_eq_raw) ∧
     (type_of% @mkBitAndSmartRvalue_zero_right_eq_raw) ∧
     (type_of% @mkMulSmartRvalue_zero_left_eq_raw) ∧
     (type_of% @mkMulSmartRvalue_zero_right_eq_raw) ∧
+    (type_of% @mkBitOrSmartRvalue_allOnes_left_eq_raw) ∧
+    (type_of% @mkBitOrSmartRvalue_allOnes_right_eq_raw) ∧
+    (type_of% @mkSmartRvalue_never_erases_ub) ∧
     (type_of% @bitprism_const_annihilators_fire) ∧
+    (type_of% @bitprism_const_width_mismatch_preserves_unsupported) ∧
     (type_of% @bitAnd_zero_dead_local_preserves_ub) ∧
     (type_of% @bitAnd_zero_uninit_local_preserves_ub) ∧
     (type_of% @mul_zero_uninit_local_preserves_ub) ∧
+    (type_of% @bitOr_allOnes_uninit_local_preserves_ub) ∧
     (type_of% @addUnchecked_overflow_preserves_ub) ∧
     (type_of% @mkMemWriteFrame_eq_raw) ∧
     (type_of% @mkMemWriteFrame_dead_slot_preserves_failure) ∧
@@ -3212,10 +3802,14 @@ theorem ep2_exact_wp_smart_ctors_and_veil_frame_capstone :
    @mkAddSmart_eq_raw, @mkSubSmart_eq_raw, @mkMulSmart_eq_raw, @mkBitAndSmart_eq_raw,
    @mkBitOrSmart_eq_raw, @mkBitXorSmart_eq_raw, @mkShlSmart_eq_raw, @mkShrSmart_eq_raw,
    @mkPtrOffsetSmart_eq_raw, @mkWrappingPtrOffsetSmart_eq_raw, @bitprism_nested_collapse_o1,
-   @mkAddSmartRvalue_zero_right_eq_raw, @mkBitAndSmartRvalue_zero_left_eq_raw,
-   @mkBitAndSmartRvalue_zero_right_eq_raw, @mkMulSmartRvalue_zero_left_eq_raw,
-   @mkMulSmartRvalue_zero_right_eq_raw, @bitprism_const_annihilators_fire, @bitAnd_zero_dead_local_preserves_ub,
-   @bitAnd_zero_uninit_local_preserves_ub, @mul_zero_uninit_local_preserves_ub,
+   @mkAddSmartRvalue_zero_right_eq_raw, @mkSubSmartRvalue_zero_right_eq_raw,
+   @mkBitAndSmartRvalue_zero_left_eq_raw, @mkBitAndSmartRvalue_zero_right_eq_raw,
+   @mkMulSmartRvalue_zero_left_eq_raw, @mkMulSmartRvalue_zero_right_eq_raw,
+   @mkBitOrSmartRvalue_allOnes_left_eq_raw, @mkBitOrSmartRvalue_allOnes_right_eq_raw,
+   @mkSmartRvalue_never_erases_ub, @bitprism_const_annihilators_fire,
+   @bitprism_const_width_mismatch_preserves_unsupported,
+   @bitAnd_zero_dead_local_preserves_ub, @bitAnd_zero_uninit_local_preserves_ub,
+   @mul_zero_uninit_local_preserves_ub, @bitOr_allOnes_uninit_local_preserves_ub,
    @addUnchecked_overflow_preserves_ub, @mkMemWriteFrame_eq_raw,
    @mkMemWriteFrame_dead_slot_preserves_failure, @Memory.ext_allFields,
    @MachineState.ext_allFields, @exactWP_veil_frame, @anneal_veil_frame_multistep_demo⟩
