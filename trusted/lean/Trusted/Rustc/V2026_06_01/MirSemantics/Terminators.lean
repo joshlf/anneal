@@ -3250,6 +3250,31 @@ Reference (`library/core/src/intrinsics/mod.rs` at commit
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L899-L916>
 
 > "pub const unsafe fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;"
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, signatures of the core memory and
+pointer intrinsics whose generic parameter `T` is the pointee of the first
+parameter):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L954>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2272-L2278>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2318>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2569>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L3039>
+
+> "pub fn ptr_mask<T>(ptr: *const T, mask: usize) -> *const T;"
+> "pub const unsafe fn ptr_offset_from<T>(ptr: *const T, base: *const T) -> isize;"
+> "pub const unsafe fn ptr_offset_from_unsigned<T>(ptr: *const T, base: *const T) -> usize;"
+> "pub const unsafe fn raw_eq<T>(a: &T, b: &T) -> bool;"
+> "pub const unsafe fn typed_swap_nonoverlapping<T>(x: *mut T, y: *mut T) {"
+> "pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize);"
+
+`compare_bytes` is not generic and `black_box<T>(dummy: T)` is generic over the
+value type of its first parameter, so both return `false`:
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2337>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2345>
+
+> "pub const unsafe fn compare_bytes(left: *const u8, right: *const u8, bytes: usize) -> i32;"
+> "pub const fn black_box<T>(dummy: T) -> T;"
 -/
 @[reducible]
 def isPtrPointeeIntrinsicKind : RustIntrinsicKind → Bool
@@ -5323,6 +5348,11 @@ for `core::intrinsics::ptr_offset_from` / `ptr_offset_from_unsigned`:
 - Distinct dead tags of the same root local fault `.ub` when their known
   effective offsets differ, and fail closed `.unsupported` when equal or
   unknown (storage generation is not recorded).
+- Provenance tags are resolved in `s.memory.borrows` BEFORE `AllocId`s are
+  resolved in `s.memory.globals` (matching `resolveLiveMemEndpoint` and
+  `Places.ptrAddress?`), because stack tags and captured global `AllocId`s share
+  one numeric namespace (modeling choice). A stack pointer and a global pointer
+  never share an allocation, so mixing them at distinct addresses is `.ub`.
 
 Reference (`core::ptr::const_ptr::<impl *const T>::offset_from` documentation,
 `library/core/src/ptr/const_ptr.rs` at commit
@@ -5374,56 +5404,22 @@ def resolvePtrOffsetFromOffsets
         | true => .ok (0, 0)
         | false =>
           match
-            lookupGlobalAlloc s.memory.globals p1.allocId,
-            lookupGlobalAlloc s.memory.globals p2.allocId
+            lookupBorrow s.memory.borrows p1.tag,
+            lookupBorrow s.memory.borrows p2.tag
           with
-          | .some g1, .some g2 =>
-            match Nat.beq g1.allocId g2.allocId with
+          | .some e1, .some e2 =>
+            match
+              Bool.and
+                (Nat.beq e1.targetFrameDepth e2.targetFrameDepth)
+                (Nat.beq e1.targetLocal e2.targetLocal)
+            with
             | false => .ub
             | true =>
-              match Nat.beq p1.offsetBytes p2.offsetBytes with
-              | true => .ok (0, 0)
-              | false =>
-                let gSize := length g1.bytes
-                match Bool.and (Nat.ble p1.offsetBytes gSize) (Nat.ble p2.offsetBytes gSize) with
-                | true => .ok (p1.offsetBytes, p2.offsetBytes)
-                | false => .ub
-          | .some _, .none => .ub
-          | .none, .some _ => .ub
-          | .none, .none =>
-            match
-              lookupBorrow s.memory.borrows p1.tag,
-              lookupBorrow s.memory.borrows p2.tag
-            with
-            | .some e1, .some e2 =>
-              match
-                Bool.and
-                  (Nat.beq e1.targetFrameDepth e2.targetFrameDepth)
-                  (Nat.beq e1.targetLocal e2.targetLocal)
-              with
-              | false => .ub
-              | true =>
-                match e1.allocDead, e2.allocDead with
-                | true, true =>
-                  match Nat.beq e1.tag e2.tag with
-                  | true => .ub
-                  | false =>
-                    match
-                      borrowPlaceByteOffset?
-                        locals s.memory.callerLocals bodyLocalDecls bodyLayouts e1 s.memory.callStack,
-                      borrowPlaceByteOffset?
-                        locals s.memory.callerLocals bodyLocalDecls bodyLayouts e2 s.memory.callStack
-                    with
-                    | .some po1, .some po2 =>
-                      let eff1 := Nat.add po1 p1.offsetBytes
-                      let eff2 := Nat.add po2 p2.offsetBytes
-                      match Nat.beq eff1 eff2 with
-                      | false => .ub
-                      | true => .unsupported
-                    | _, _ => .unsupported
-                | true, false => .ub
-                | false, true => .ub
-                | false, false =>
+              match e1.allocDead, e2.allocDead with
+              | true, true =>
+                match Nat.beq e1.tag e2.tag with
+                | true => .ub
+                | false =>
                   match
                     borrowPlaceByteOffset?
                       locals s.memory.callerLocals bodyLocalDecls bodyLayouts e1 s.memory.callStack,
@@ -5434,46 +5430,80 @@ def resolvePtrOffsetFromOffsets
                     let eff1 := Nat.add po1 p1.offsetBytes
                     let eff2 := Nat.add po2 p2.offsetBytes
                     match Nat.beq eff1 eff2 with
-                    | true => .ok (0, 0)
-                    | false =>
-                      match
-                        readFrameLocalSlot
-                          locals s.memory.callStack s.memory.callerLocals
-                          e1.targetFrameDepth e1.targetLocal
-                      with
-                      | .none => .ub
-                      | .some .dead => .ub
-                      | .some slot =>
-                        let (targetDecls, targetLayouts) : List LocalDecl × LayoutTable :=
-                          match
-                            frameLocalDeclsAndLayoutsAtDepth
-                              s.memory.callStack bodyLocalDecls bodyLayouts e1.targetFrameDepth
-                          with
-                          | .some pair => pair
-                          | .none =>
-                            foreignFrameDeclsAndLayouts
-                              s.memory.callStack bodyLayouts e1.targetFrameDepth e1.targetLocal
-                        let rootTy? : Option Ty :=
-                          match get? targetDecls e1.targetLocal with
-                          | .some decl => .some decl.ty
-                          | .none => .none
-                        let allocSize? : Option Nat :=
-                          match rootTy? with
-                          | .some rTy => exactTyByteSize? targetDecls targetLayouts rTy
-                          | .none =>
-                            match slot with
-                            | .init rootVal =>
-                              match untypedValueHasExactByteImage defaultCodecFuel rootVal with
-                              | true => valueDefaultByteSize rootVal
-                              | false => .none
-                            | _ => .none
-                        match allocSize? with
-                        | .none => .unsupported
-                        | .some allocSize =>
-                          match Bool.and (Nat.ble eff1 allocSize) (Nat.ble eff2 allocSize) with
-                          | true => .ok (eff1, eff2)
-                          | false => .ub
+                    | false => .ub
+                    | true => .unsupported
                   | _, _ => .unsupported
+              | true, false => .ub
+              | false, true => .ub
+              | false, false =>
+                match
+                  borrowPlaceByteOffset?
+                    locals s.memory.callerLocals bodyLocalDecls bodyLayouts e1 s.memory.callStack,
+                  borrowPlaceByteOffset?
+                    locals s.memory.callerLocals bodyLocalDecls bodyLayouts e2 s.memory.callStack
+                with
+                | .some po1, .some po2 =>
+                  let eff1 := Nat.add po1 p1.offsetBytes
+                  let eff2 := Nat.add po2 p2.offsetBytes
+                  match Nat.beq eff1 eff2 with
+                  | true => .ok (0, 0)
+                  | false =>
+                    match
+                      readFrameLocalSlot
+                        locals s.memory.callStack s.memory.callerLocals
+                        e1.targetFrameDepth e1.targetLocal
+                    with
+                    | .none => .ub
+                    | .some .dead => .ub
+                    | .some slot =>
+                      let (targetDecls, targetLayouts) : List LocalDecl × LayoutTable :=
+                        match
+                          frameLocalDeclsAndLayoutsAtDepth
+                            s.memory.callStack bodyLocalDecls bodyLayouts e1.targetFrameDepth
+                        with
+                        | .some pair => pair
+                        | .none =>
+                          foreignFrameDeclsAndLayouts
+                            s.memory.callStack bodyLayouts e1.targetFrameDepth e1.targetLocal
+                      let rootTy? : Option Ty :=
+                        match get? targetDecls e1.targetLocal with
+                        | .some decl => .some decl.ty
+                        | .none => .none
+                      let allocSize? : Option Nat :=
+                        match rootTy? with
+                        | .some rTy => exactTyByteSize? targetDecls targetLayouts rTy
+                        | .none =>
+                          match slot with
+                          | .init rootVal =>
+                            match untypedValueHasExactByteImage defaultCodecFuel rootVal with
+                            | true => valueDefaultByteSize rootVal
+                            | false => .none
+                          | _ => .none
+                      match allocSize? with
+                      | .none => .unsupported
+                      | .some allocSize =>
+                        match Bool.and (Nat.ble eff1 allocSize) (Nat.ble eff2 allocSize) with
+                        | true => .ok (eff1, eff2)
+                        | false => .ub
+                | _, _ => .unsupported
+          | .some _, .none => .ub
+          | .none, .some _ => .ub
+          | .none, .none =>
+            match
+              lookupGlobalAlloc s.memory.globals p1.allocId,
+              lookupGlobalAlloc s.memory.globals p2.allocId
+            with
+            | .some g1, .some g2 =>
+              match Nat.beq g1.allocId g2.allocId with
+              | false => .ub
+              | true =>
+                match Nat.beq p1.offsetBytes p2.offsetBytes with
+                | true => .ok (0, 0)
+                | false =>
+                  let gSize := length g1.bytes
+                  match Bool.and (Nat.ble p1.offsetBytes gSize) (Nat.ble p2.offsetBytes gSize) with
+                  | true => .ok (p1.offsetBytes, p2.offsetBytes)
+                  | false => .ub
             | _, _ => .ub
     | _, _ => .ub
 
@@ -5605,6 +5635,26 @@ for alignment-invariant symbolic `ptr_mask`: returns `.some (align, placeOff)`
 only when the root allocation's alignment is a validated positive power of two
 (using `exactRootAllocAlign?` for stack allocations and `Align.isPowerOfTwoBytes`
 for global allocations).
+
+Resolution order and liveness (modeling choices, not documented Rust
+guarantees):
+- `p.tag` is looked up in `s.memory.borrows` BEFORE `p.allocId` is looked up in
+  `s.memory.globals`, matching `resolveLiveMemEndpoint`, `checkPtrArgAligned`,
+  and `Places.ptrAddress?`. Stack provenance tags (`1, 2, ...`) and captured
+  global `AllocId`s share one numeric namespace, so a globals-first lookup could
+  attribute a global's alignment to a colliding stack tag.
+- A borrow whose allocation is deallocated (`entry.allocDead = true`, set by
+  `StorageDead` and by frame teardown) yields `.none`: after a frame pop the same
+  `(targetFrameDepth, targetLocal)` may name a local of a different callee whose
+  declaration (and hence alignment) is unrelated to the dead allocation.
+
+The symbolic-base criterion relies on the allocation's base address being a
+multiple of its alignment.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The alignment of a value specifies what addresses are valid to store the value at. A value of alignment n must only be stored at an address that is a multiple of n."
 -/
 def resolvePtrAllocAlignAndPlaceOff
     (s : MachineState)
@@ -5613,15 +5663,11 @@ def resolvePtrAllocAlignAndPlaceOff
     (bodyLayouts : LayoutTable)
     (p : ProvenancePtr) :
     Option (Nat × Nat) :=
-  match lookupGlobalAlloc s.memory.globals p.allocId with
-  | .some gAlloc =>
-    match Align.isPowerOfTwoBytes gAlloc.align with
-    | true => .some (gAlloc.align.bytes, 0)
-    | false => .none
-  | .none =>
-    match lookupBorrow s.memory.borrows p.tag with
-    | .none => .none
-    | .some entry =>
+  match lookupBorrow s.memory.borrows p.tag with
+  | .some entry =>
+    match entry.allocDead with
+    | true => .none
+    | false =>
       match
         borrowPlaceByteOffset?
           locals s.memory.callerLocals bodyLocalDecls bodyLayouts entry s.memory.callStack
@@ -5643,6 +5689,13 @@ def resolvePtrAllocAlignAndPlaceOff
           match exactRootAllocAlign? targetDecls targetLayouts rootDecl.ty with
           | .some rootAlign => .some (rootAlign, placeOff)
           | .none => .none
+  | .none =>
+    match lookupGlobalAlloc s.memory.globals p.allocId with
+    | .some gAlloc =>
+      match Align.isPowerOfTwoBytes gAlloc.align with
+      | true => .some (gAlloc.align.bytes, 0)
+      | false => .none
+    | .none => .none
 
 /--
 Evaluate a direct call to `core::intrinsics::ptr_mask<T>(ptr: *const T, mask:

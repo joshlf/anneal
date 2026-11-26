@@ -9754,6 +9754,12 @@ required alignment `reqAlign` (a positive power of two):
   `copy`, while misaligned addresses fault `.ub`).
 - For unknown unbacked `allocId ≠ 0`, faults `.ub` when `nonZeroAccess = true`
   or `p.offsetBytes % reqAlign ≠ 0`, and fails closed `.unsupported` otherwise.
+- For a stack borrow whose allocation is deallocated (`entry.allocDead = true`),
+  faults `.ub` when `nonZeroAccess = true` (a dangling pointer is not
+  dereferenceable) and fails closed `.unsupported` otherwise: after a frame pop
+  the same `(targetFrameDepth, targetLocal)` may name an unrelated local of a
+  later callee, so neither the root alignment nor the place offset of the dead
+  allocation can be recovered from the current declarations (modeling choice).
 
 Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -9790,46 +9796,52 @@ def checkPtrArgAligned
       | false =>
         match lookupBorrow s.memory.borrows p.tag with
         | .some entry =>
-          match
-            borrowPlaceByteOffset?
-              locals
-              s.memory.callerLocals
-              bodyLocalDecls
-              bodyLayouts
-              entry
-              s.memory.callStack
-          with
-          | .none => .unsupported
-          | .some placeOff =>
-            let effOff := Nat.add placeOff p.offsetBytes
-            let (targetDecls, targetLayouts) : List LocalDecl × LayoutTable :=
-              match
-                frameLocalDeclsAndLayoutsAtDepth
-                  s.memory.callStack
-                  bodyLocalDecls
-                  bodyLayouts
-                  entry.targetFrameDepth
-              with
-              | .some pair => pair
+          match entry.allocDead with
+          | true =>
+            match nonZeroAccess with
+            | true => .ub
+            | false => .unsupported
+          | false =>
+            match
+              borrowPlaceByteOffset?
+                locals
+                s.memory.callerLocals
+                bodyLocalDecls
+                bodyLayouts
+                entry
+                s.memory.callStack
+            with
+            | .none => .unsupported
+            | .some placeOff =>
+              let effOff := Nat.add placeOff p.offsetBytes
+              let (targetDecls, targetLayouts) : List LocalDecl × LayoutTable :=
+                match
+                  frameLocalDeclsAndLayoutsAtDepth
+                    s.memory.callStack
+                    bodyLocalDecls
+                    bodyLayouts
+                    entry.targetFrameDepth
+                with
+                | .some pair => pair
+                | .none =>
+                  foreignFrameDeclsAndLayouts
+                    s.memory.callStack
+                    bodyLayouts
+                    entry.targetFrameDepth
+                    entry.targetLocal
+              let rootAlign? : Option Nat :=
+                match get? targetDecls entry.targetLocal with
+                | .some rootDecl => exactRootAllocAlign? targetDecls targetLayouts rootDecl.ty
+                | .none => .none
+              match rootAlign? with
+              | .some rootAlign =>
+                match Bool.and (Nat.ble reqAlign rootAlign) (Nat.beq (Nat.mod effOff reqAlign) 0) with
+                | true => .ok ()
+                | false => .ub
               | .none =>
-                foreignFrameDeclsAndLayouts
-                  s.memory.callStack
-                  bodyLayouts
-                  entry.targetFrameDepth
-                  entry.targetLocal
-            let rootAlign? : Option Nat :=
-              match get? targetDecls entry.targetLocal with
-              | .some rootDecl => exactRootAllocAlign? targetDecls targetLayouts rootDecl.ty
-              | .none => .none
-            match rootAlign? with
-            | .some rootAlign =>
-              match Bool.and (Nat.ble reqAlign rootAlign) (Nat.beq (Nat.mod effOff reqAlign) 0) with
-              | true => .ok ()
-              | false => .ub
-            | .none =>
-              match Nat.beq (Nat.mod effOff reqAlign) 0 with
-              | false => .ub
-              | true => .unsupported
+                match Nat.beq (Nat.mod effOff reqAlign) 0 with
+                | false => .ub
+                | true => .unsupported
         | .none =>
           match lookupGlobalAlloc s.memory.globals p.allocId with
           | .some gAlloc =>
