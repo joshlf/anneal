@@ -91,9 +91,14 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      `unifiedFloatArithAndUcg630DualBundle` conjoining all `W1`–`W6` MR/LM witnesses plus
      general correspondence/step-simulation theorems from both authorities and the
      `V2026_06_01` <-> `V2026_08_01` dialect-parity theorems;
-   - 26 well-typed negative controls verified to be REJECTED by the Lean kernel, 25 of them paired
-     with a positive control (the TRUE right-hand side for the same left-hand side is ACCEPTED), so
-     a rejection is never an artifact of a stuck or failing kernel reduction;
+   - 39 well-typed negative controls verified to be REJECTED by the Lean kernel, ALL 39 paired
+     with a positive control (the TRUE right-hand side for the same left-hand side is ACCEPTED,
+     including the baseline `0 = 0` vs. `0 = 1` harness calibration), so a rejection is never an
+     artifact of a stuck or failing kernel reduction; the Round-4 (`B4`) controls cover the two
+     coverage-matrix rows that had no concrete cross-root control: every comparison operator
+     beyond `eq` (`ne`, `lt`, `le`, `gt`, `ge` on unordered qNaN / sNaN operands, signed zeros, and
+     an ordered pair) and every float bitwise / shift operator (`bitXor`, `bitAnd`, `bitOr`, `shl`,
+     `shr` fail closed in `evalFloatBinOp` rather than computing the integer result);
    - Structural inspection of the MiniRust `Gen.Type` / `Gen.Value` / operator inductives (no float
      constructor) and automated `axiomAudit_*` bundle coverage of every public `FloatArithMR` /
      `FloatArithLM` theorem;
@@ -102,7 +107,8 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      `FloatArithLM` + cross-root theorems, module-import isolation (zero `MiniRustSpec.*`
      imports in `LeanMiriSpec.FloatArithLM`), and self-tests for `sorryAx` / `Lean.ofReduceBool` /
      `isTrivialProp` (recursive over `∀`, `∧`, `∨`, `↔`, so `True ∧ True` or `x = x ∧ y = y` cannot
-     evade the non-triviality audit);
+     evade the non-triviality audit, whose auto-generated-name exemption is keyed on the
+     USER-FACING name so that `private` theorems are audited too);
    - Transitive constant reachability from `unifiedFloatArithAndUcg630DualBundle` to `Trusted`
      (BOTH `V2026_06_01` and `V2026_08_01`), `MiniRustSpec` (`Interp` + translation gates), and
      vendored `Miri.Interpreter` / `Miri.Memory`.
@@ -1727,6 +1733,18 @@ run_cmd do
     let mkArith (op : Name) (f : Expr) (a b : Nat) : Expr :=
       mkApp4 (mkConst (tSem ++ `evalFloatArithBase)) (mkConst (tAst ++ op)) f (mkNatLit a) (mkNatLit b)
     let mkRem := mkArith `BinOp.rem
+    -- Round-4 (`B4`) builders: an arbitrary comparison `BinOp`, and `evalFloatBinOp` (the function
+    -- `evalRvalue` dispatches float `BinOp`s to) with its `Option ScalarInt` result.
+    let mkCmpOp (op : Name) (f : Expr) (a b : Nat) : Expr :=
+      mkApp4 (mkConst (tSem ++ `evalFloatCmp)) (mkConst (tAst ++ op)) f (mkNatLit a) (mkNatLit b)
+    let scalarIntTy := mkConst (tAst ++ `ScalarInt)
+    let optScalarTy := mkApp (mkConst ``Option [0]) scalarIntTy
+    let noneScalar := mkApp (mkConst ``Option.none [0]) scalarIntTy
+    let someScalar (bits size : Nat) : Expr :=
+      mkApp2 (mkConst ``Option.some [0]) scalarIntTy
+        (mkApp2 (mkConst (tAst ++ `ScalarInt.mk)) (mkNatLit bits) (mkNatLit size))
+    let mkBinOp (op : Name) (f : Expr) (a b : Nat) : Expr :=
+      mkApp4 (mkConst (tSem ++ `evalFloatBinOp)) (mkConst (tAst ++ op)) f (mkNatLit a) (mkNatLit b)
     -- (description, type, LHS, TRUE RHS, FORGED RHS)
     let controls : List (String × Expr × Expr × Expr × Expr) :=
       [ ("f32 qNaN == qNaN", optBoolTy, mkCmp f32 0x7FC00000 0x7FC00000, someFalse, someTrue),
@@ -1797,7 +1815,41 @@ run_cmd do
         ("f32 two-NaN swapped operand order: (0x7FC00007, 0x7FC0002A) swaps index 2 and index 4 without negating rhs", listNatTy,
           mkChoices f32 [(f32, 0x7FC00007), (f32, 0x7FC0002A)],
           mkNatList [0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0x7FC0002A, 0xFFC0002A],
-          mkNatList [0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0xFFC0002A, 0x7FC0002A]) ]
+          mkNatList [0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0xFFC0002A, 0x7FC0002A]),
+        -- Round-4 (`B4`): every comparison operator beyond `eq`. Unordered operands (qNaN / sNaN)
+        -- make `lt`, `le`, `gt`, `ge` all FALSE and `ne` TRUE, so `le` is NOT `!(a > b)` and `ge` is
+        -- NOT `!(a < b)`; signed zeros compare equal; and an ordered `-Inf` vs. subnormal pair.
+        ("f32 qNaN != qNaN is TRUE (`ne` is the only comparison that holds on unordered operands)",
+          optBoolTy, mkCmpOp `BinOp.ne f32 0x7FC00000 0x7FC00000, someTrue, someFalse),
+        ("f32 sNaN < 1.0 is false (unordered `lt`)", optBoolTy,
+          mkCmpOp `BinOp.lt f32 0x7FA00001 0x3F800000, someFalse, someTrue),
+        ("f32 qNaN <= qNaN is false (unordered `le` is NOT `!(a > b)`)", optBoolTy,
+          mkCmpOp `BinOp.le f32 0x7FC00000 0x7FC00000, someFalse, someTrue),
+        ("f64 1.0 > qNaN is false (unordered `gt`)", optBoolTy,
+          mkCmpOp `BinOp.gt f64 0x3FF0000000000000 0x7FF8000000000000, someFalse, someTrue),
+        ("f64 sNaN >= sNaN is false (unordered `ge` is NOT `!(a < b)`)", optBoolTy,
+          mkCmpOp `BinOp.ge f64 0x7FF4000000000001 0x7FF4000000000001, someFalse, someTrue),
+        ("f32 -0.0 <= +0.0 is true (signed zeros compare equal)", optBoolTy,
+          mkCmpOp `BinOp.le f32 0x80000000 0, someTrue, someFalse),
+        ("f64 -0.0 < +0.0 is false (signed zeros compare equal)", optBoolTy,
+          mkCmpOp `BinOp.lt f64 0x8000000000000000 0, someFalse, someTrue),
+        ("f64 -Inf >= smallest positive subnormal is false (ordered `ge`)", optBoolTy,
+          mkCmpOp `BinOp.ge f64 0xFFF0000000000000 0x0000000000000001, someFalse, someTrue),
+        -- Round-4 (`B4`): EVERY float bitwise / shift operator fails closed in `evalFloatBinOp`
+        -- (`none`, which `evalRvalue` maps to `.unsupported`). FORGED: the integer result of the
+        -- same operator on the raw bit patterns at the float's byte width (e.g. `1.0 | 2.0` as
+        -- integers is the bit pattern of `+Inf`).
+        ("f32 1.0 ^ 2.0 (`bitXor`) has no float result", optScalarTy,
+          mkBinOp `BinOp.bitXor f32 0x3F800000 0x40000000, noneScalar, someScalar 0x7F800000 4),
+        ("f32 1.0 & 2.0 (`bitAnd`) has no float result", optScalarTy,
+          mkBinOp `BinOp.bitAnd f32 0x3F800000 0x40000000, noneScalar, someScalar 0 4),
+        ("f64 1.0 | 2.0 (`bitOr`) has no float result", optScalarTy,
+          mkBinOp `BinOp.bitOr f64 0x3FF0000000000000 0x4000000000000000, noneScalar,
+          someScalar 0x7FF0000000000000 8),
+        ("f32 1.0 << 1 (`shl`) has no float result", optScalarTy,
+          mkBinOp `BinOp.shl f32 0x3F800000 1, noneScalar, someScalar 0x7F000000 4),
+        ("f64 2.0 >> 1 (`shr`) has no float result", optScalarTy,
+          mkBinOp `BinOp.shr f64 0x4000000000000000 1, noneScalar, someScalar 0x2000000000000000 8) ]
 
     let saved ← getEnv
     let mkEqDecl (name : Name) (ty lhs rhs : Expr) : Declaration := .thmDecl {
@@ -1807,10 +1859,15 @@ run_cmd do
       let r ← try addDecl d; pure true catch _ => pure false
       setEnv saved
       return r
+    -- Baseline harness calibration, PAIRED like every semantic control below (Round-4 `B4`): on the
+    -- SAME left-hand side `0`, the kernel ACCEPTS `0 = 0` and REJECTS `0 = 1`, so the baseline
+    -- rejection is not an artifact of a mis-built `mkEqDecl` / `kernelAccepts` either.
+    unless ← kernelAccepts (mkEqDecl (ns ++ `control.zeroEqZero) natTy (mkNatLit 0) (mkNatLit 0)) do
+      throwError "cross-root positive control FAILED: kernel rejected 0 = 0"
     if ← kernelAccepts (mkEqDecl (ns ++ `forged.zeroEqOne) natTy (mkNatLit 0) (mkNatLit 1)) then
       throwError "cross-root negative control FAILED: kernel accepted 0 = 1"
     let mut rejected : Nat := 1
-    let mut accepted : Nat := 0
+    let mut accepted : Nat := 1
     for (what, ty, lhs, trueRhs, forgedRhs) in controls do
       let okTy ← MetaM.run' do
         check lhs
@@ -1872,6 +1929,16 @@ run_cmd do
         && !isTrivialProp (mkOr nonTrivEq nonTrivEq)
         && !isTrivialProp (.forallE `n natTy (mkAnd bvarEq nonTrivEq) .default) do
       throwError "cross-root self-test: recursive And/Or/Iff trivial-conjunction detector failed"
+    -- Self-test (Round-4 `B4`): `Name.isInternalDetail` holds for EVERY private name (because of
+    -- its `_private.<module>.0` prefix), so keying the auto-generated-name exemption on the raw
+    -- name would let every `private theorem` bypass `isTrivialProp`. The audit below therefore
+    -- tests the USER-FACING name, which still exempts genuinely auto-generated auxiliaries.
+    let privProbe := mkPrivateNameCore `Probe.Module `Probe.userTheorem
+    let privAuxProbe := mkPrivateNameCore `Probe.Module (`Probe.userTheorem ++ `_proof_1)
+    unless privProbe.isInternalDetail && !(privateToUserName privProbe).isInternalDetail
+        && (privateToUserName privAuxProbe).isInternalDetail
+        && !(`Probe.userTheorem).isInternalDetail do
+      throwError "cross-root self-test: private-name non-triviality exemption probe failed"
 
     -- Structural MiniRust no-float inspection: the pinned MiniRust `Type`, `Value`, `Constant`, and
     -- operator inductives have NO float constructor (and `Type` / `Value` have exactly the pinned
@@ -1939,7 +2006,7 @@ run_cmd do
       let u := privateToUserName n
       match ci with
       | .thmInfo v =>
-        if !n.isInternalDetail && isTrivialProp v.type then
+        if !(privateToUserName n).isInternalDetail && isTrivialProp v.type then
           throwError "cross-root non-triviality audit FAILED: {n} has trivial type"
         let axs ← collectAxioms n
         if ieeeNs.isPrefixOf u then
@@ -2086,8 +2153,8 @@ run_cmd do
   let ((addedCount, rejectedCount, acceptedCount, ieeeThms, mrThms, lmThms, mrPublic, lmPublic,
       reachedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount == 7 && rejectedCount == 26 && acceptedCount == 25 && ieeeThms ≥ 300 &&
-      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 68 && lmPublic ≥ 71 && reachedCount == 53 do
+  unless addedCount == 7 && rejectedCount == 39 && acceptedCount == 39 && ieeeThms ≥ 300 &&
+      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic == 68 && lmPublic == 71 && reachedCount == 53 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount}, accepted={acceptedCount}, ieee={ieeeThms}, mr={mrThms}, lm={lmThms}, mrPublic={mrPublic}, lmPublic={lmPublic}, reached={reachedCount})"
   logInfo m!"ep2 float-arith cross-root kernel bridge: added {addedCount} dual theorems, rejected {rejectedCount} forged controls (paired with {acceptedCount} accepted positive controls), audited {ieeeThms} constructive IeeeFloatArith + {mrThms} MR + {lmThms} LM theorems (0 host Float, 0 MiniRustSpec imports in LM, {mrPublic} MR + {lmPublic} LM public theorems all covered by axiomAudit bundles, MiniRust Gen.Type has no float constructor), reached all {reachedCount} Trusted(06+08)+MiniRust+Miri constants, axioms {crAxioms}"
 

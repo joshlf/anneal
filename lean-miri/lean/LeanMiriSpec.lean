@@ -496,16 +496,21 @@ import LeanMiriSpec.Audit
   selector `annealChooseBinaryNaN` (contrasting with `annealChooseQuietedNaN`,
   which fails on 2-element `∞ - ∞` lists), conservative step-hook overlay
   (`annealStepHooksFloatArith`), real `Miri.Interpreter.Step.step` vs.
-  `stepMirFn` / `EvalRvalueFloatRel` simulations (immediate and indirect locals,
-  nondeterministic `copy/copy` AND `const/const` soundness + index-exact
-  completeness, exact-message uninit unary & binary UB lockstep, and
+  `stepMirFn` / `EvalRvalueFloatRel` simulations (immediate and indirect locals;
+  deterministic `copy/copy`, `const/const`, mixed `copy/const` & `const/copy`,
+  and `move/copy` arithmetic; nondeterministic `copy/copy` AND `const/const`
+  soundness + index-exact completeness plus index-exact mixed `const/copy` &
+  `copy/const`; exact-message uninit unary & binary UB lockstep; and
   exact-message `f16`/`f128` + invalid-`BinOp` fail-closed boundaries),
   `Ptr2IntTransmutePolicy` (`ucg#630` CTFE rejection vs. `reference#1752`
   runtime provenance-stripping, provenance-free `{to,from}_bits` agreement,
   explicit raw-pointer `usize -> *const T` / `*const T -> *const U` acceptance
   vs. no-forgery `usize -> &T` / `usize -> fn()` and uninit UB under both
   policies via `miriTransmuteScalarCheck`), and concrete witnesses
-  `w1_lm_finite_subnormal_overflow` .. `w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop`.
+  `w1_lm_finite_subnormal_overflow` .. `w12_lm_copy_const_nondet_sub_and_order_flip`
+  (including the `%` dividend sign on exactly-zero remainders, all five
+  IEEE-754 indeterminate forms, real `binary64` `Step.step`, and the mixed
+  `const/copy` vs. `copy/const` `.sub` candidate order).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

@@ -86,11 +86,15 @@ import MiniRustSpec.Audit
   `AggregateKind.closure`.
 * `MiniRustSpec.FloatArithMR`: two-sided fail-closed translation boundary for
   float unary negation and binary arithmetic/comparison ops (including
-  no-float-local float-constant comparison rejection), IEEE-754 bit-carrier
-  bridges (`UnOp.neg` ↔ `u32`/`u64` sign-bit XOR lockstep across `Mach` and
-  `MachTB` with `MachTB.wfLive`, `Bool` comparison carriers, and
+  no-float-local float-constant comparison rejection, arbitrary projected
+  float places `*p` / `_s.0` / `_a[i]`, and the exact two-sided
+  `translateRvalue` truth `fa_translateRvalue_binaryOp_two_sided`), IEEE-754
+  bit-carrier bridges (`UnOp.neg` ↔ `u32`/`u64` sign-bit XOR lockstep across
+  `Mach` and `MachTB` with `MachTB.wfLive`, `Bool` comparison carriers, and
   `EvalFloatBinOpRel` / `nanChoices` `.deterministic` & `.nondeterministic`
-  carriers), mode-parametric `Ptr2IntTransmutePolicy` (`ucg#630` vs.
+  carriers, with universal `f64` 8-byte, zero-extended `f32`, and native
+  4-byte `f32` `Mach` + `MachTB.wfLive` carrier execution), mode-parametric
+  `Ptr2IntTransmutePolicy` (`ucg#630` vs.
   `reference#1752`) scalar and composite `(*const u8, usize)` / `struct Mixed`
   correspondence across `BasicMemory` and `TreeBorrowsMemory`, shared UB /
   no-forgery (`usize → &u8`, `MaybeUninit` uninit → `u64`, size mismatch), and
