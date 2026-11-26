@@ -59,8 +59,8 @@ correspondence-local copy of the **pre-Stage-1** (`origin/sup/lm-0` at
   multi-element copies, same-tag ranges always treated as overlapping,
   whole-value single-element copies across pointee types, and a zero-byte
   precheck that resolves provenance pointers to their backing allocation and
-  fails closed when their alignment is undetermined, and on aligned integer
-  addresses once any provenance has been exposed); see the Stage-1
+  fails closed when their alignment is undetermined, and on any integer
+  address with `elemAlign > 1` once any provenance has been exposed); see the Stage-1
   divergence witnesses of `WitLM4_2.lean` §6. Both check alignment when
   `count = 0` and (while no provenance has been exposed) accept aligned null
   and aligned dangling pointers there

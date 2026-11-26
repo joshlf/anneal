@@ -23373,6 +23373,19 @@ example :
 
 open WitnessLM4_2 in
 example :
+    ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState) (msg : String),
+      let b := copyNonzeroScalarSrcBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4ScalarAddrAnnealPre b 0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4ScalarAddrMiriPre b unitK 0) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .error (.undefinedBehavior msg)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_nonzero_null_ub_agreement
+
+open WitnessLM4_2 in
+example :
     ∃ (s₁ s₂ : MachineState) (m₁ m₂ m₃ : AnnealStepState) (msg : String),
       let b := copyDistinctOobBody
       let hooks := annealStepHooks b.localDecls b.layouts
@@ -23669,10 +23682,14 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       get? s.frame.locals dstIdx = some (.init dstVal) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
       countSc.bits = 0 →
-      ptrValueAligned elemAlign srcVal = true ∧
+      (ptrValueAligned elemAlign srcVal = true ∧
         ptrValueAligned elemAlign dstVal = true ∧
         zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
-          srcVal dstVal = .ok)
+          srcVal dstVal = .ok) ∨
+      ((ptrValueAligned elemAlign srcVal = false ∨
+        ptrValueAligned elemAlign dstVal = false) ∧
+        zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
+          srcVal dstVal = .ub))
     (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
@@ -24124,6 +24141,7 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.ptr4ScalarAddr_stateRel
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_dangling_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_null_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_nonzero_null_ub_agreement
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_disjoint_subrange_divergence
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_cross_type_divergence

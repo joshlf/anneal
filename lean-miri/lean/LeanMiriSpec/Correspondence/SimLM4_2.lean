@@ -61,7 +61,8 @@ by `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`):
   check alignment (`wit_lm4_2_copy_nonoverlapping_zero_misaligned_ub_agreement`)
   and accept aligned null and dangling pointers
   (`wit_lm4_2_copy_nonoverlapping_zero_null_ok`,
-  `wit_lm4_2_copy_nonoverlapping_zero_dangling_ok`).
+  `wit_lm4_2_copy_nonoverlapping_zero_dangling_ok`), while rejecting null on
+  non-zero counts (`wit_lm4_2_copy_nonoverlapping_nonzero_null_ub_agreement`).
 * `call_intrinsic_write_bytes_simulation` (with
   `call_intrinsic_write_bytes_simulation_explicit` and
   `call_intrinsic_write_bytes_perm_divergence`; proved in `WriteBytesLM4_2`):

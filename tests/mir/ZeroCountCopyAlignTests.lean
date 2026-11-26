@@ -40,8 +40,10 @@ out-of-range `count` bits `.ub`; aligned/misaligned ZST `[u64; 0]` with `count =
 aligned pass, unlaid-out `(u128, u128)` / 32-bit `(u32, u32)` tuples (no false `.ub`),
 `10^10` offsets; pre-monomorphization placeholder layouts (`Wrapper<T>`, `[T; 4]`,
 depth-9 nesting, depth-16 truncation) `.unsupported` while monomorphized
-`Wrapper<u64>` resolves; dead stack borrow with `align > 1` `.unsupported`; aligned
-integer addresses after provenance exposure `.unsupported` (misaligned ones stay `.ub`); and the
+`Wrapper<u64>` resolves; dead stack borrow with `align > 1` `.unsupported`; integer
+addresses with `align > 1` after provenance exposure `.unsupported` (both aligned and
+misaligned, including over-aligned `align = 131072` canonical addresses, while `align = 1`
+still steps and malformed scalars remain `.ub`); and the
 terminator path `Terminators.evalCopyNonOverlappingCall` in both snapshots. §3 audits
 the axioms of every test.
 -/
@@ -318,7 +320,26 @@ theorem exposed_aligned_int_count0_unsupported :
     runExp 2 3 (av 8) (av 8) 0 = MirStepNode.unsupported := rfl
 theorem exposed_aligned_unbacked_ptr_count0_unsupported :
     runExp 2 3 (pv 0 8) (av 0) 0 = MirStepNode.unsupported := rfl
-theorem exposed_misaligned_int_count0_ub : runExp 2 3 (av 9) (av 8) 0 = MirStepNode.fail .ub := rfl
+theorem exposed_misaligned_int_count0_unsupported :
+    runExp 2 3 (av 9) (av 8) 0 = MirStepNode.unsupported := rfl
+theorem exposed_misaligned_unbacked_ptr_count0_unsupported :
+    runExp 2 3 (pv 0 9) (av 8) 0 = MirStepNode.unsupported := rfl
+/-- Over-aligned `#[repr(align(131072))]` allocation at canonical address `65536` (`allocId = 1`)
+is `≢ 0 (mod 131072)` in Anneal's canonical numbering even though every real execution aligns it
+to `131072`; after provenance exposure it must return `.unsupported`, never false `.ub`. -/
+theorem exposed_align131072_canonical_addr_unsupported :
+    let overL : LayoutTable :=
+      { pointerBits := 64, isLittleEndian := true,
+        entries := [lay 0 1 (.arbitrary [] []), lay 131072 131072 (.arbitrary [] []), ptrLay 8 1] }
+    let overD : List LocalDecl := [decl (.tuple []) 0, decl (ptrK (.adt "zc::Over131072" [])) 2]
+    evalCopyNonOverlappingWithCount S64exp (cp 1) (cp 1) overD overL (av 65536) (av 65536) 0
+      locals64 = MirStepNode.unsupported := rfl
+theorem exposed_align1_int_count0_noop :
+    let u8D : List LocalDecl := [decl (.tuple []) 0, decl (ptrK (.uint .u8))]
+    evalCopyNonOverlappingWithCount S64exp (cp 1) (cp 1) u8D L64 (av 9) (av 7) 0 locals64 =
+      MirStepNode.step (advanceStmt S64exp locals64) := rfl
+theorem exposed_malformed_scalar_still_ub :
+    runExp 2 3 (av 8 4) (av 8) 0 = MirStepNode.fail .ub := rfl
 theorem exposed_live_aligned_count0_noop :
     runExp 2 3 (pv 1 0) (pv 1 0) 0 = MirStepNode.step (advanceStmt S64exp locals64) := rfl
 theorem exposed_null_aligned_zst_count5_unsupported :
@@ -1241,7 +1262,26 @@ theorem exposed_aligned_int_count0_unsupported :
     runExp 2 3 (av 8) (av 8) 0 = MirStepNode.unsupported := rfl
 theorem exposed_aligned_unbacked_ptr_count0_unsupported :
     runExp 2 3 (pv 0 8) (av 0) 0 = MirStepNode.unsupported := rfl
-theorem exposed_misaligned_int_count0_ub : runExp 2 3 (av 9) (av 8) 0 = MirStepNode.fail .ub := rfl
+theorem exposed_misaligned_int_count0_unsupported :
+    runExp 2 3 (av 9) (av 8) 0 = MirStepNode.unsupported := rfl
+theorem exposed_misaligned_unbacked_ptr_count0_unsupported :
+    runExp 2 3 (pv 0 9) (av 8) 0 = MirStepNode.unsupported := rfl
+/-- Over-aligned `#[repr(align(131072))]` allocation at canonical address `65536` (`allocId = 1`)
+is `≢ 0 (mod 131072)` in Anneal's canonical numbering even though every real execution aligns it
+to `131072`; after provenance exposure it must return `.unsupported`, never false `.ub`. -/
+theorem exposed_align131072_canonical_addr_unsupported :
+    let overL : LayoutTable :=
+      { pointerBits := 64, isLittleEndian := true,
+        entries := [lay 0 1 (.arbitrary [] []), lay 131072 131072 (.arbitrary [] []), ptrLay 8 1] }
+    let overD : List LocalDecl := [decl (.tuple []) 0, decl (ptrK (.adt "zc::Over131072" [])) 2]
+    evalCopyNonOverlappingWithCount S64exp (cp 1) (cp 1) overD overL (av 65536) (av 65536) 0
+      locals64 = MirStepNode.unsupported := rfl
+theorem exposed_align1_int_count0_noop :
+    let u8D : List LocalDecl := [decl (.tuple []) 0, decl (ptrK (.uint .u8))]
+    evalCopyNonOverlappingWithCount S64exp (cp 1) (cp 1) u8D L64 (av 9) (av 7) 0 locals64 =
+      MirStepNode.step (advanceStmt S64exp locals64) := rfl
+theorem exposed_malformed_scalar_still_ub :
+    runExp 2 3 (av 8 4) (av 8) 0 = MirStepNode.fail .ub := rfl
 theorem exposed_live_aligned_count0_noop :
     runExp 2 3 (pv 1 0) (pv 1 0) 0 = MirStepNode.step (advanceStmt S64exp locals64) := rfl
 theorem exposed_null_aligned_zst_count5_unsupported :
@@ -3015,9 +3055,25 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.exposed_aligned_unbacked_ptr_count0_unsupported
 
-/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.exposed_misaligned_int_count0_ub' depends on axioms: [propext] -/
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.exposed_misaligned_int_count0_unsupported' depends on axioms: [propext] -/
 #guard_msgs in
-#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.exposed_misaligned_int_count0_ub
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.exposed_misaligned_int_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.exposed_misaligned_unbacked_ptr_count0_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.exposed_misaligned_unbacked_ptr_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.exposed_align131072_canonical_addr_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.exposed_align131072_canonical_addr_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.exposed_align1_int_count0_noop' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.exposed_align1_int_count0_noop
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.exposed_malformed_scalar_still_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.exposed_malformed_scalar_still_ub
 
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.exposed_live_aligned_count0_noop' depends on axioms: [propext] -/
 #guard_msgs in
@@ -3036,9 +3092,27 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.exposed_aligned_unbacked_ptr_count0_unsupported
 
-/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.exposed_misaligned_int_count0_ub' depends on axioms: [propext, Quot.sound] -/
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.exposed_misaligned_int_count0_unsupported' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
-#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.exposed_misaligned_int_count0_ub
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.exposed_misaligned_int_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.exposed_misaligned_unbacked_ptr_count0_unsupported' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.exposed_misaligned_unbacked_ptr_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.exposed_align131072_canonical_addr_unsupported' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.exposed_align131072_canonical_addr_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.exposed_align1_int_count0_noop' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.exposed_align1_int_count0_noop
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.exposed_malformed_scalar_still_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.exposed_malformed_scalar_still_ub
 
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.exposed_live_aligned_count0_noop' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in

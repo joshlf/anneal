@@ -7598,24 +7598,26 @@ from any `StateRelLM3_1`-related state at
 Stage-1 `stepMirFn body s` equals `stepMirFnLM4_2 body s` whenever:
 0. Stage-1 resolves the element layout of the statement to the pointee's
    `(elemBytes, elemAlign)` (`hres`) on a 64-bit layout table (`hptr8`);
-1. on a zero-element copy (`countSc.bits = 0`), `srcVal` and `dstVal` are aligned
-   to `elemAlign` and Stage-1's zero-byte precheck accepts them (`hzero_align`):
-   the reference model only checks `offsetBytes % elemAlign = 0`, whereas
-   Stage-1 `zeroByteCopyPrecheck` locates each provenance pointer's backing
-   allocation (a live stack local whose declared alignment is a multiple of
-   `elemAlign`, a captured global, or an unbacked allocation) and fails closed
-   (`.unsupported`) when the address alignment is undetermined (including
-   aligned integer addresses once any provenance has been exposed). No non-null
-   exclusion is needed: while no provenance has been exposed, both machines
-   accept an aligned null pointer (and an aligned dangling `NonNull::dangling()`
-   pointer) at `count = 0`;
+1. on a zero-element copy (`countSc.bits = 0`), either both pointers are
+   aligned and Stage-1's zero-byte precheck accepts them (`= .ok`), or at least
+   one pointer is misaligned/malformed and Stage-1's zero-byte precheck faults
+   (`= .ub`) (`hzero_align`): the reference model only checks
+   `offsetBytes % elemAlign = 0`, whereas Stage-1 `zeroByteCopyPrecheck`
+   locates each provenance pointer's backing allocation (a live stack local
+   whose declared alignment is a multiple of `elemAlign`, a captured global, or
+   an unbacked allocation) and fails closed (`.unsupported`) when the address
+   alignment is undetermined (including any integer address with `elemAlign > 1`
+   once any provenance has been exposed). No non-null exclusion is needed: while
+   no provenance has been exposed, both machines accept an aligned null pointer
+   (and an aligned dangling `NonNull::dangling()` pointer) at `count = 0`;
 2. on a positive-element copy (`0 < countSc.bits`) between provenance-carrying
    pointers `.ptr srcPtr 8` and `.ptr dstPtr 8`, `countSc.bits = 1`, both byte
    offsets are `0`, both target locals have the pointee type `pointeeTy.kind`, and
    neither target local is a union (`hptr_single`).
 
 Covers all outcomes on this fragment: dead/uninitialized operand UB, aligned
-`count = 0` no-op steps, positive-count provenance-free `.scalar` pointer UB,
+`count = 0` no-op steps, misaligned `count = 0` UB agreement, positive-count
+provenance-free `.scalar` pointer UB,
 dead target stack locals, uninitialized source locals, Tree Borrows permission
 failures, same-local overlap UB, and valid distinct-local single-element copies. -/
 theorem stepMirFn_copyNonOverlapping_stage1_eq_lm4_2
@@ -7645,10 +7647,14 @@ theorem stepMirFn_copyNonOverlapping_stage1_eq_lm4_2
       get? s.frame.locals dstIdx = some (.init dstVal) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
       countSc.bits = 0 →
-      ptrValueAligned elemAlign srcVal = true ∧
+      (ptrValueAligned elemAlign srcVal = true ∧
         ptrValueAligned elemAlign dstVal = true ∧
         zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
-          srcVal dstVal = .ok)
+          srcVal dstVal = .ok) ∨
+      ((ptrValueAligned elemAlign srcVal = false ∨
+        ptrValueAligned elemAlign dstVal = false) ∧
+        zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
+          srcVal dstVal = .ub))
     (hptr_single : ∀ srcPtr dstPtr countSc e_s e_d decl_s decl_d,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
@@ -7687,11 +7693,18 @@ theorem stepMirFn_copyNonOverlapping_stage1_eq_lm4_2
   obtain ⟨hopD_idx, hopD⟩ :=
     operandPointeeTy_copy_rawPtr_exists (layouts := body.layouts) hdstDecl hdstTy
   by_cases hc0 : countSc.bits = 0
-  · obtain ⟨halS, halD, hok⟩ := hzero_align srcVal dstVal countSc hsrc hdst hcnt hc0
-    rw [hc0, evalCopyNonOverlappingWithCount_zero_of_resolved hres hok]
-    unfold evalCopyNonOverlappingWithCountLM4_2
-    rw [copyPrecheck_eq _ _ 0 hopS hpt.wb.anneal_size hpt.anneal_align]
-    simp [halS, halD]
+  · rcases hzero_align srcVal dstVal countSc hsrc hdst hcnt hc0 with
+      ⟨halS, halD, hok⟩ | ⟨hmis, hub⟩
+    · rw [hc0, evalCopyNonOverlappingWithCount_zero_of_resolved hres hok]
+      unfold evalCopyNonOverlappingWithCountLM4_2
+      rw [copyPrecheck_eq _ _ 0 hopS hpt.wb.anneal_size hpt.anneal_align]
+      simp [halS, halD]
+    · rw [hc0, evalCopyNonOverlappingWithCount_zero_ub_of_resolved hres hub]
+      unfold evalCopyNonOverlappingWithCountLM4_2
+      rw [copyPrecheck_eq _ _ 0 hopS hpt.wb.anneal_size hpt.anneal_align]
+      rcases hmis with hms | hmd
+      · simp [hms]
+      · simp [hmd]
   · have hc_pos : 0 < countSc.bits := Nat.pos_of_ne_zero hc0
     have hb_c0 : Nat.beq countSc.bits 0 = false := by
       cases hb : Nat.beq countSc.bits 0
@@ -7819,7 +7832,8 @@ in lockstep (`StepRelLM3_1`) with `lean-miri`'s `Miri.Interpreter.Step.step` und
 via `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`, under the same Stage-1-specific
 hypotheses: `hres` (Stage-1 `resolveCopyElemLayout` yields the pointee's
 `(elemBytes, elemAlign)`), `hptr8` (64-bit layout table), and the
-`zeroByteCopyPrecheck … = .ok` conjunct of `hzero_align` on `count = 0`. -/
+`zeroByteCopyPrecheck` agreement (`= .ok` on aligned or `= .ub` on misaligned)
+in `hzero_align` on `count = 0`. -/
 theorem step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -7847,10 +7861,14 @@ theorem step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
       get? s.frame.locals dstIdx = some (.init dstVal) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
       countSc.bits = 0 →
-      ptrValueAligned elemAlign srcVal = true ∧
+      (ptrValueAligned elemAlign srcVal = true ∧
         ptrValueAligned elemAlign dstVal = true ∧
         zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
-          srcVal dstVal = .ok)
+          srcVal dstVal = .ok) ∨
+      ((ptrValueAligned elemAlign srcVal = false ∨
+        ptrValueAligned elemAlign dstVal = false) ∧
+        zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
+          srcVal dstVal = .ub))
     (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
@@ -7955,10 +7973,14 @@ theorem step_intrinsic_copyNonOverlapping_stage1_simulation
       get? s.frame.locals dstIdx = some (.init dstVal) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
       countSc.bits = 0 →
-      ptrValueAligned elemAlign srcVal = true ∧
+      (ptrValueAligned elemAlign srcVal = true ∧
         ptrValueAligned elemAlign dstVal = true ∧
         zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
-          srcVal dstVal = .ok)
+          srcVal dstVal = .ok) ∨
+      ((ptrValueAligned elemAlign srcVal = false ∨
+        ptrValueAligned elemAlign dstVal = false) ∧
+        zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
+          srcVal dstVal = .ub))
     (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
@@ -8035,10 +8057,14 @@ theorem step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap
       get? s.frame.locals dstIdx = some (.init dstVal) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
       countSc.bits = 0 →
-      ptrValueAligned elemAlign srcVal = true ∧
+      (ptrValueAligned elemAlign srcVal = true ∧
         ptrValueAligned elemAlign dstVal = true ∧
         zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
-          srcVal dstVal = .ok)
+          srcVal dstVal = .ok) ∨
+      ((ptrValueAligned elemAlign srcVal = false ∨
+        ptrValueAligned elemAlign dstVal = false) ∧
+        zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
+          srcVal dstVal = .ub))
     (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →

@@ -4594,11 +4594,11 @@ power of two):
 - `v` must be a thin pointer value (`.scalar ⟨bits, ptrBytes⟩` with in-range
   `bits`, or `.ptr p ptrBytes`); anything else is `.ub`;
 - an integer address (`.scalar`, or a provenance-free unbacked `.ptr` with
-  `allocId = 0`, whose `offsetBytes` must be `< 2^(8 * ptrBytes)`) must satisfy
-  `addr % elemAlign = 0` (so aligned null and aligned `NonNull::dangling()`
-  are accepted, misaligned addresses are `.ub`), except that an aligned
-  integer address with `elemAlign > 1` is undetermined (`.unsupported`) once
-  any allocation's provenance has been exposed (`exposedAllocIds ≠ []`);
+  `allocId = 0`, whose `offsetBytes` must be `< 2^(8 * ptrBytes)`) is
+  undetermined (`.unsupported`) when `elemAlign > 1` and any allocation's
+  provenance has been exposed (`exposedAllocIds ≠ []`), and otherwise must
+  satisfy `addr % elemAlign = 0` (so aligned null and aligned
+  `NonNull::dangling()` are accepted, misaligned addresses are `.ub`);
 - a provenance pointer is checked by `stackBorrowAlignKnown` (stack borrow
   tag), `globalAllocAlignKnown` (captured global), or `unbackedAlignKnown`
   (function pointer or other unbacked allocation).
@@ -4632,13 +4632,14 @@ pointers are permitted), while the alignment requirement still applies.
 Modeling choice: an integer address is the concrete runtime address only while
 no provenance has been exposed. `evalPointerExposeProvenance` reports the
 canonical `allocId * 65536 + offsetBytes` address of an exposed allocation,
-which is not a real alignment guarantee (the abstract machine may place the
-allocation at any address that is a multiple of its own alignment), so once
-`s.memory.exposedAllocIds` is non-empty an integer address that is aligned in
-the canonical numbering may be misaligned in some execution and is reported as
-undetermined (`.unsupported`) when `elemAlign > 1`. A canonical address that is
-misaligned stays `.ub`: placing the allocation at a multiple of `elemAlign`
-yields a misaligned execution.
+which is neither a real alignment guarantee for under-aligned allocations nor a
+guaranteed valid placement for over-aligned allocations (e.g., `#[repr(align(131072))]`
+at odd `allocId` has canonical address `allocId * 65536 ≢ 0 (mod 131072)` even
+though every real execution aligns it to `131072`). Once
+`s.memory.exposedAllocIds` is non-empty, any well-formed integer address is
+therefore reported as undetermined (`.unsupported`) whenever `elemAlign > 1`
+(avoiding both false `.ok` and false `.ub`); `elemAlign ≤ 1` still succeeds and
+malformed scalar widths / out-of-range bit patterns remain `.ub`.
 -/
 def checkZeroCountCopyPtr
     (s : MachineState)
@@ -4655,12 +4656,15 @@ def checkZeroCountCopyPtr
     match Bool.and (Nat.beq sv.sizeBytes ptrBytes) (Nat.blt sv.bits modW) with
     | false => .ub
     | true =>
-      match Bool.or (Nat.ble elemAlign 1) (Nat.beq (Nat.mod sv.bits elemAlign) 0) with
-      | true =>
-        match Nat.ble elemAlign 1, s.memory.exposedAllocIds with
-        | false, _ :: _ => .unsupported
-        | _, _ => .ok
-      | false => .ub
+      match Nat.ble elemAlign 1 with
+      | true => .ok
+      | false =>
+        match s.memory.exposedAllocIds with
+        | _ :: _ => .unsupported
+        | .nil =>
+          match Nat.beq (Nat.mod sv.bits elemAlign) 0 with
+          | true => .ok
+          | false => .ub
   | .ptr p sz =>
     match Nat.beq sz ptrBytes with
     | false => .ub
@@ -4678,14 +4682,15 @@ def checkZeroCountCopyPtr
             match Nat.blt p.offsetBytes modW with
             | false => .ub
             | true =>
-              match
-                Bool.or (Nat.ble elemAlign 1) (Nat.beq (Nat.mod p.offsetBytes elemAlign) 0)
-              with
-              | true =>
-                match Nat.ble elemAlign 1, s.memory.exposedAllocIds with
-                | false, _ :: _ => .unsupported
-                | _, _ => .ok
-              | false => .ub
+              match Nat.ble elemAlign 1 with
+              | true => .ok
+              | false =>
+                match s.memory.exposedAllocIds with
+                | _ :: _ => .unsupported
+                | .nil =>
+                  match Nat.beq (Nat.mod p.offsetBytes elemAlign) 0 with
+                  | true => .ok
+                  | false => .ub
           | _, _ => ZeroCheck.ofAligned? (unbackedAlignKnown p.offsetBytes elemAlign)
   | _ => .ub
 

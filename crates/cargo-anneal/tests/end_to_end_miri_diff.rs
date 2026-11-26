@@ -479,6 +479,8 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         "Verify.MiriDiffCorpus.pass_fn_entry_returns_reborrowed_child",
         "Verify.MiriDiffCorpus.panic_multi_callee_unwind_cleanup_guard",
         "Verify.MiriDiffCorpus.pass_shared_temp_const_raw_ptr_read_and_freeze_retag",
+        "Verify.MiriDiffCorpus.pass_copy_nonoverlapping_zero_dangling",
+        "Verify.MiriDiffCorpus.pass_copy_nonoverlapping_zero_null",
     ] {
         assert!(
             report.audited_certificate_modules.iter().any(|m| m == module),
@@ -578,13 +580,17 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         "`helper_unwind_mid` must use `UnwindAction.continue_`:\n{unguarded_mir}"
     );
 
-    // The Category 9 and Category 10 `copy_nonoverlapping` seeds lower to the
-    // inline MIR statement
+    // The Category 9, Category 10, and Category 12 `copy_nonoverlapping` seeds
+    // lower to the inline MIR statement
     // `StatementKind.intrinsic (NonDivergingIntrinsic.copyNonOverlapping ...)`.
     for name in [
         "pass_intrinsics_write_bytes_copy_and_arith_offset",
         "ub_copy_nonoverlapping_partial_overlap_array",
         "pass_copy_nonoverlapping_multi_elem_array_pair",
+        "ub_copy_nonoverlapping_zero_misaligned",
+        "pass_copy_nonoverlapping_zero_dangling",
+        "pass_copy_nonoverlapping_zero_null",
+        "ub_copy_nonoverlapping_nonzero_null",
     ] {
         let mir = captured_mir(name);
         assert!(
