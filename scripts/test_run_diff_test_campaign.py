@@ -9794,6 +9794,106 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
             for d in all_dedup:
                 self.assertTrue(campaign._is_well_formed_quarantine_token(d.fingerprint))
 
+    def test_failing_construct_hint_handles_multiline_dyn_wrap_repro_path_fallback_and_indirect_calls(
+        self,
+    ) -> None:
+        """Multi-line `prettyplease`-wrapped `&dyn` casts (including findings
+        that omit inline `mutant_source` and provide only `repro_path`), indirect
+        `TerminatorKind.call` with a `RigidTy.fnDef` argument, and unquarantined
+        primary promotion all preserve accurate hints."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            wrapped_src = "\n".join(
+                [
+                    "trait __AnnealVtableTrait7 { fn eval_vt(&self, x: u32) -> u32; }",
+                    "struct __AnnealVtableReceiver7 { pub bias: u32 }",
+                    "impl __AnnealVtableTrait7 for __AnnealVtableReceiver7 {",
+                    "    fn eval_vt(&self, x: u32) -> u32 { x ^ self.bias }",
+                    "}",
+                    "fn __anneal_vt_driver_7(__vt_seed: u32, __vt_bias: u32) -> u32 {",
+                    "    let __vt_rec = __AnnealVtableReceiver7 { bias: __vt_bias };",
+                    "    let __vt_rec_dyn: &dyn __AnnealVtableTrait7 = &__vt_rec",
+                    "        as &dyn __AnnealVtableTrait7;",
+                    "    __vt_rec_dyn.eval_vt(__vt_seed)",
+                    "}",
+                    "pub fn pass_seed__b0_c0() -> u32 { __anneal_vt_driver_7(1u32, 2u32) }",
+                ]
+            ) + "\n"
+            repro = tmp_path / "wrapped.rs"
+            repro.write_text(wrapped_src, encoding="utf-8")
+
+            # Legacy finding omitting BOTH `failing_construct_hint` and inline
+            # `mutant_source`, with a 2-line `prettyplease`-wrapped `as &dyn`.
+            f_wrapped = {
+                "finding_id": "finding_0000_pass_seed__b0_c0",
+                "fn_name": "pass_seed__b0_c0",
+                "seed_name": "pass_seed",
+                "applied_mutators": ["VTableAndFnPtrMutator"],
+                "divergence_class": "false_positive_ub",
+                "witness_polarity": "sound_conservative_abstraction",
+                "miri_outcome": "pass:scalar:55:4",
+                "anneal_outcome": "ub@src/lib.rs:8:51: 9:37",
+                "anneal_lean_tag": "MirDiffTag.ub",
+                "anneal_span": "src/lib.rs:8:51: 9:37",
+                "miri_excerpt": "MIRI_PASS:scalar:55:4",
+                "repro_path": str(repro),
+                "kernel_confirmed": True,
+            }
+            self.assertEqual(
+                campaign.extract_failing_construct_hint(f_wrapped),
+                "PointerCoercion::Unsize",
+            )
+
+            # Indirect `TerminatorKind.call` passing a `RigidTy.fnDef` argument
+            # must NOT misattribute the argument as the callee.
+            mir_indirect = (
+                '{ kind := (TerminatorKind.call (Operand.copy { local_ := 5, projection := List.nil }) '
+                '(List.cons (Operand.constant { ty := { kind := (RigidTy.fnDef "miri_diff_corpus::arg_fn" List.nil), '
+                'layoutIdx := 1 }, val := ConstValue.zeroSized }) List.nil) '
+                '{ local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), '
+                'span := "src/lib.rs:10:5: 10:25" }'
+            )
+            f_indirect = {
+                "anneal_span": "src/lib.rs:10:5: 10:25",
+                "mir_neighborhood": mir_indirect,
+            }
+            self.assertEqual(
+                campaign.extract_failing_construct_hint(f_indirect),
+                "TerminatorKind::Call",
+            )
+            mir_direct = (
+                '{ kind := (TerminatorKind.call (Operand.constant { ty := { kind := '
+                '(RigidTy.fnDef "miri_diff_corpus::direct_fn" List.nil), layoutIdx := 1 }, '
+                'val := ConstValue.zeroSized }) List.nil { local_ := 0, projection := List.nil } '
+                '(Option.some 1) UnwindAction.continue_), span := "src/lib.rs:11:5: 11:25" }'
+            )
+            self.assertEqual(
+                campaign.extract_failing_construct_hint(
+                    {"anneal_span": "src/lib.rs:11:5: 11:25", "mir_neighborhood": mir_direct}
+                ),
+                "Call::miri_diff_corpus::direct_fn",
+            )
+
+            # When an unquarantined finding promotes over a quarantined primary,
+            # `failing_construct_hints[0]` matches `failing_construct_hint`.
+            f_q = dict(f_wrapped)
+            f_q["fn_name"] = "quarantined_fn"
+            f_q["failing_construct_hint"] = "PointerCoercion::Unsize"
+            f_u = dict(f_wrapped)
+            f_u["fn_name"] = "unquarantined_fn"
+            f_u["failing_construct_hint"] = "PointerCoercion::ClosureFnPointer"
+            all_dedup, unq, quar = campaign.deduplicate_and_quarantine_findings(
+                [f_q, f_u], set(), {"quarantined_fn"}
+            )
+            self.assertEqual(len(all_dedup), 1)
+            self.assertEqual(len(unq), 1)
+            self.assertEqual(len(quar), 0)
+            self.assertEqual(unq[0].failing_construct_hint, "PointerCoercion::ClosureFnPointer")
+            self.assertEqual(
+                unq[0].failing_construct_hints,
+                ["PointerCoercion::ClosureFnPointer", "PointerCoercion::Unsize"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

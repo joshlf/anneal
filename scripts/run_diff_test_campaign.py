@@ -4378,6 +4378,51 @@ def _iter_mir_kind_span_records(mir_text: str) -> list[tuple[str, str]]:
     return records
 
 
+def _extract_call_direct_callee(kind_expr: str) -> str | None:
+    """Extracts the direct `RigidTy.fnDef` callee from the first operand of
+    `TerminatorKind.call`, returning `None` for indirect calls (whose first
+    operand is `Operand.copy` / `Operand.move`, even when a later argument has
+    a `RigidTy.fnDef` type)."""
+    m_call = re.search(r"TerminatorKind\.call(?=\s)", kind_expr)
+    if not m_call:
+        return None
+    rest = kind_expr[m_call.end() :].lstrip()
+    if not rest.startswith("("):
+        return None
+    depth = 0
+    in_str = False
+    i = 0
+    end = -1
+    n = len(rest)
+    while i < n:
+        ch = rest[i]
+        if in_str:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+        i += 1
+    if end == -1:
+        return None
+    callee_op = rest[: end + 1]
+    if not callee_op[1:].lstrip().startswith("Operand.constant"):
+        return None
+    m_fn = re.search(r'RigidTy\.fnDef\s+"([^"]+)"', callee_op)
+    return m_fn.group(1) if m_fn and m_fn.group(1) else None
+
+
 def _classify_mir_kind_expr(kind_expr: str) -> tuple[int, str] | None:
     """Maps a Lean MIR statement/terminator `kind` expression to `(priority, hint)`."""
     # 1. `CastKind.pointerCoercion` (both quoted rustc debug tags and constructor spellings).
@@ -4436,9 +4481,9 @@ def _classify_mir_kind_expr(kind_expr: str) -> tuple[int, str] | None:
         return (stmt_prio, f"StatementKind::{_camel_to_pascal(stmt_name)}")
     # 5. `TerminatorKind.*`.
     if "TerminatorKind.call" in kind_expr:
-        m_fn = re.search(r'RigidTy\.fnDef\s+"([^"]+)"', kind_expr)
-        if m_fn:
-            return (90, f"Call::{m_fn.group(1)}")
+        callee = _extract_call_direct_callee(kind_expr)
+        if callee:
+            return (90, f"Call::{callee}")
         return (60, "TerminatorKind::Call")
     m_term = re.search(
         r"TerminatorKind\.(assert|drop|switchInt|unreachable|inlineAsm|tailCall|goto|return_)\b",
@@ -4479,11 +4524,58 @@ def _extract_failing_construct_hint_from_mir(
     return None
 
 
+def _extract_fault_span_text(finding: dict[str, Any]) -> str:
+    """Returns the source snippet covering `anneal_span` (`start_line..=end_line`,
+    clamped to 6 lines and joined by spaces) so `prettyplease`-wrapped multi-line
+    expressions like `let x: &dyn T = &rec\\n as &dyn T;` are preserved intact.
+    Falls back to reading `repro_path` when inline `mutant_source` is absent,
+    and finally to `extract_fault_line_text(finding)`."""
+    src = finding.get("mutant_source")
+    if not isinstance(src, str) or not src:
+        repro = finding.get("repro_path")
+        if isinstance(repro, str) and repro:
+            try:
+                src = Path(repro).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                src = ""
+    if isinstance(src, str) and src:
+        src_lines = src.splitlines()
+        num_lines = len(src_lines)
+        loc = finding.get("anneal_span")
+        if not isinstance(loc, str) or ":" not in loc:
+            out_tag = finding.get("anneal_outcome")
+            if isinstance(out_tag, str) and "@" in out_tag:
+                loc = out_tag.partition("@")[2]
+        if isinstance(loc, str):
+            span = _parse_src_span(loc)
+            if span is not None and _is_src_lib_or_repro_file(span[0]):
+                start_line = span[1]
+                end_line = min(max(span[3], start_line), start_line + 5)
+                if 1 <= start_line <= num_lines:
+                    if end_line == start_line:
+                        cand_start = _candidate_fn_start_line_no(src_lines, finding)
+                        resolved = _resolve_preamble_fault_line_no(
+                            src_lines, start_line, cand_start
+                        )
+                        return src_lines[resolved - 1]
+                    chunk = [
+                        line.strip()
+                        for line in src_lines[start_line - 1 : min(end_line, num_lines)]
+                        if line.strip()
+                    ]
+                    if chunk:
+                        return " ".join(chunk)
+    return extract_fault_line_text(finding)
+
+
 def _extract_failing_construct_hint_from_fault_line(fault_line: str) -> str | None:
     if not fault_line:
         return None
     stripped = fault_line.strip()
-    if re.search(r"\bas\s+(?:&(?:mut\s+)?|\*(?:const|mut)\s+)dyn\b", stripped):
+    if re.search(r"\bas\s+(?:&(?:mut\s+)?|\*(?:const|mut)\s+)dyn\b", stripped) or (
+        "=" in stripped
+        and re.search(r":\s*(?:&(?:mut\s+)?|\*(?:const|mut)\s+)dyn\b", stripped)
+    ):
         return "PointerCoercion::Unsize"
     if (
         re.search(r"(?::\s*(?:unsafe\s+)?fn\s*\([^)]*\)|\bas\s+(?:unsafe\s+)?fn\s*\([^)]*\))", stripped)
@@ -4507,7 +4599,7 @@ def extract_failing_construct_hint(finding: dict[str, Any]) -> str | None:
 
     Prefers `finding["failing_construct_hint"]` emitted by `miri-difftest`,
     falling back to `mir_neighborhood` at `anneal_span` / `batch_anneal_span`
-    and then the Rust fault line so legacy findings without the field still
+    and then the Rust fault span/line so legacy findings without the field still
     surface concrete construct hints without changing the 3-part fingerprint.
     """
     raw = finding.get("failing_construct_hint")
@@ -4528,8 +4620,8 @@ def extract_failing_construct_hint(finding: dict[str, Any]) -> str | None:
         hint = _extract_failing_construct_hint_from_mir(mir_text, spans)
         if hint is not None:
             return hint
-    fault_line = extract_fault_line_text(finding)
-    return _extract_failing_construct_hint_from_fault_line(fault_line)
+    fault_text = _extract_fault_span_text(finding)
+    return _extract_failing_construct_hint_from_fault_line(fault_text)
 
 
 def infer_finding_cause(
@@ -4686,6 +4778,9 @@ def deduplicate_and_quarantine_findings(
                 existing.anneal_outcome = str(f["anneal_outcome"])
                 if construct_hint is not None:
                     existing.failing_construct_hint = construct_hint
+                    existing.failing_construct_hints = [construct_hint] + [
+                        h for h in existing.failing_construct_hints if h != construct_hint
+                    ]
         else:
             raw_polarity = f.get("witness_polarity")
             by_fp[fp] = DeduplicatedFinding(

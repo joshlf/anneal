@@ -3088,6 +3088,64 @@ fn take_lean_ident_prefix(raw: &str) -> Option<&str> {
     (len > 0).then_some(&raw[..len])
 }
 
+fn extract_call_direct_callee(kind_expr: &str) -> Option<String> {
+    let bytes = kind_expr.as_bytes();
+    let needle = "TerminatorKind.call";
+    let mut search_from = 0usize;
+    let after_call = loop {
+        let rel = kind_expr[search_from..].find(needle)?;
+        let end = search_from + rel + needle.len();
+        if bytes.get(end).is_some_and(|b| b.is_ascii_whitespace()) {
+            break &kind_expr[end..];
+        }
+        search_from = end;
+    };
+    let rest = after_call.trim_start();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let rest_bytes = rest.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut i = 0usize;
+    let mut close_idx = None;
+    while i < rest_bytes.len() {
+        let b = rest_bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close_idx = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let callee_op = &rest[..=close_idx?];
+    if !callee_op[1..].trim_start().starts_with("Operand.constant") {
+        return None;
+    }
+    let idx = callee_op.find("RigidTy.fnDef")?;
+    let fn_rest = callee_op[idx + "RigidTy.fnDef".len()..].trim_start();
+    let callee = extract_first_lean_string_literal(fn_rest)?;
+    (!callee.is_empty()).then_some(callee)
+}
+
 fn classify_mir_kind_expr(kind_expr: &str) -> Option<(u8, String)> {
     // 1. `CastKind.pointerCoercion` (both quoted rustc debug tags and constructor spellings).
     if let Some(idx) = kind_expr.find("CastKind.pointerCoercion") {
@@ -3190,13 +3248,8 @@ fn classify_mir_kind_expr(kind_expr: &str) -> Option<(u8, String)> {
     }
     // 5. `TerminatorKind.*`.
     if kind_expr.contains("TerminatorKind.call") {
-        if let Some(idx) = kind_expr.find("RigidTy.fnDef") {
-            let rest = kind_expr[idx + "RigidTy.fnDef".len()..].trim_start();
-            if let Some(callee) = extract_first_lean_string_literal(rest)
-                && !callee.is_empty()
-            {
-                return Some((90, format!("Call::{callee}")));
-            }
+        if let Some(callee) = extract_call_direct_callee(kind_expr) {
+            return Some((90, format!("Call::{callee}")));
         }
         return Some((60, "TerminatorKind::Call".to_string()));
     }
@@ -3252,6 +3305,31 @@ pub fn extract_failing_construct_hint_from_mir(
     None
 }
 
+fn extract_rust_span_snippet(source: &str, span_str: &str) -> Option<String> {
+    let parsed = SourceSpan::parse_anneal_span(span_str)?;
+    if parsed.start_line < 1 {
+        return None;
+    }
+    let start_idx = (parsed.start_line - 1) as usize;
+    let end_line = parsed
+        .end_line
+        .max(parsed.start_line)
+        .min(parsed.start_line.saturating_add(5));
+    let end_idx = end_line as usize;
+    let lines: Vec<&str> = source.lines().collect();
+    if start_idx >= lines.len() {
+        return None;
+    }
+    let slice = &lines[start_idx..end_idx.min(lines.len())];
+    let joined = slice
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.is_empty()).then_some(joined)
+}
+
 fn extract_failing_construct_hint_from_rust_line(fault_line: &str) -> Option<String> {
     let stripped = fault_line.trim();
     if stripped.is_empty() {
@@ -3261,6 +3339,11 @@ fn extract_failing_construct_hint_from_rust_line(fault_line: &str) -> Option<Str
         || stripped.contains("as &mut dyn ")
         || stripped.contains("as *const dyn ")
         || stripped.contains("as *mut dyn ")
+        || (stripped.contains('=')
+            && (stripped.contains(": &dyn ")
+                || stripped.contains(": &mut dyn ")
+                || stripped.contains(": *const dyn ")
+                || stripped.contains(": *mut dyn ")))
     {
         return Some("PointerCoercion::Unsize".to_string());
     }
@@ -3382,11 +3465,9 @@ fn derive_failing_construct_hint_from_staging(
         return Some(hint);
     }
     if let Some(sp) = repro_anneal_span
-        && let Some(parsed) = SourceSpan::parse_anneal_span(sp)
-        && parsed.start_line >= 1
-        && let Some(line) = repro_source.lines().nth((parsed.start_line - 1) as usize)
+        && let Some(snippet) = extract_rust_span_snippet(repro_source, sp)
     {
-        return extract_failing_construct_hint_from_rust_line(line);
+        return extract_failing_construct_hint_from_rust_line(&snippet);
     }
     None
 }
@@ -3544,12 +3625,24 @@ fn collect_ident_tokens(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<Str
 /// indexed. `impl` blocks with a named self type are indexed in `aux_tokens`
 /// under their self-type identifiers rather than merging their method names
 /// (such as `drop`) across unrelated `impl` blocks in `fn_bodies`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NestedFnOwner {
+    top_fn: Option<String>,
+    containers: Vec<String>,
+    leaf_fn: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InherentMethodOwner {
+    self_ty: String,
+    method: String,
+    containers: Vec<String>,
+}
+
 struct FnAndAuxCollector<'a> {
-    fn_bodies: &'a mut BTreeMap<String, proc_macro2::TokenStream>,
-    aux_tokens: &'a mut BTreeMap<String, Vec<proc_macro2::TokenStream>>,
-    impl_method_names: &'a mut BTreeSet<String>,
-    nested_fn_stems: &'a mut BTreeMap<String, Vec<(Option<String>, String)>>,
+    graph: &'a mut ScopeGraphData,
     path_stack: Vec<String>,
+    container_stack: Vec<String>,
     top_fn_stack: Vec<String>,
     in_impl_depth: usize,
 }
@@ -3559,9 +3652,13 @@ impl FnAndAuxCollector<'_> {
         if self.path_stack.len() < 2 {
             return;
         }
-        let owner = (self.top_fn_stack.first().cloned(), leaf_fn.to_string());
+        let owner = NestedFnOwner {
+            top_fn: self.top_fn_stack.first().cloned(),
+            containers: self.container_stack.clone(),
+            leaf_fn: leaf_fn.to_string(),
+        };
         for stem in [self.path_stack.join("_"), self.path_stack.join(".")] {
-            let entries = self.nested_fn_stems.entry(stem).or_default();
+            let entries = self.graph.nested_fn_stems.entry(stem).or_default();
             if !entries.contains(&owner) {
                 entries.push(owner.clone());
             }
@@ -3572,7 +3669,8 @@ impl FnAndAuxCollector<'_> {
 impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
     fn visit_item_fn(&mut self, func: &'ast syn::ItemFn) {
         let name = func.sig.ident.to_string();
-        self.fn_bodies
+        self.graph
+            .fn_bodies
             .entry(name.clone())
             .or_default()
             .extend(quote::ToTokens::to_token_stream(func));
@@ -3591,21 +3689,36 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
     }
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        self.path_stack.push(item.ident.to_string());
+        let name = item.ident.to_string();
+        self.path_stack.push(name.clone());
+        self.container_stack.push(name);
         syn::visit::visit_item_mod(self, item);
+        self.container_stack.pop();
         self.path_stack.pop();
     }
 
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
-        self.path_stack.push(item.ident.to_string());
+        let name = item.ident.to_string();
+        self.path_stack.push(name.clone());
+        self.container_stack.push(name);
         syn::visit::visit_item_trait(self, item);
+        self.container_stack.pop();
         self.path_stack.pop();
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        collect_ident_tokens(
+            quote::ToTokens::to_token_stream(item),
+            &mut self.graph.imported_idents,
+        );
+        syn::visit::visit_item_use(self, item);
     }
 
     fn visit_trait_item_fn(&mut self, method: &'ast syn::TraitItemFn) {
         let name = method.sig.ident.to_string();
         if method.default.is_some() {
-            self.fn_bodies
+            self.graph
+                .fn_bodies
                 .entry(name.clone())
                 .or_default()
                 .extend(quote::ToTokens::to_token_stream(method));
@@ -3620,61 +3733,110 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
 
     fn visit_item_macro(&mut self, mac: &'ast syn::ItemMacro) {
         if let Some(id) = &mac.ident {
-            self.aux_tokens
+            let ts = quote::ToTokens::to_token_stream(&mac.mac);
+            self.graph
+                .aux_tokens
                 .entry(id.to_string())
                 .or_default()
-                .push(quote::ToTokens::to_token_stream(&mac.mac));
+                .push(ts.clone());
+            self.graph
+                .non_impl_aux_tokens
+                .entry(id.to_string())
+                .or_default()
+                .push(ts);
         }
         syn::visit::visit_item_macro(self, mac);
     }
 
     fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-        self.aux_tokens
+        let ts = quote::ToTokens::to_token_stream(item);
+        self.graph
+            .aux_tokens
             .entry(item.ident.to_string())
             .or_default()
-            .push(quote::ToTokens::to_token_stream(item));
+            .push(ts.clone());
+        self.graph
+            .non_impl_aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(ts);
         syn::visit::visit_item_static(self, item);
     }
 
     fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
         if !item.ident.to_string().starts_with("__ANNEAL_MODEL_") {
-            self.aux_tokens
+            let ts = quote::ToTokens::to_token_stream(item);
+            self.graph
+                .aux_tokens
                 .entry(item.ident.to_string())
                 .or_default()
-                .push(quote::ToTokens::to_token_stream(item));
+                .push(ts.clone());
+            self.graph
+                .non_impl_aux_tokens
+                .entry(item.ident.to_string())
+                .or_default()
+                .push(ts);
         }
         syn::visit::visit_item_const(self, item);
     }
 
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
-        self.aux_tokens
+        let ts = quote::ToTokens::to_token_stream(item);
+        self.graph
+            .aux_tokens
             .entry(item.ident.to_string())
             .or_default()
-            .push(quote::ToTokens::to_token_stream(item));
+            .push(ts.clone());
+        self.graph
+            .non_impl_aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(ts);
         syn::visit::visit_item_struct(self, item);
     }
 
     fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
-        self.aux_tokens
+        let ts = quote::ToTokens::to_token_stream(item);
+        self.graph
+            .aux_tokens
             .entry(item.ident.to_string())
             .or_default()
-            .push(quote::ToTokens::to_token_stream(item));
+            .push(ts.clone());
+        self.graph
+            .non_impl_aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(ts);
         syn::visit::visit_item_enum(self, item);
     }
 
     fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
-        self.aux_tokens
+        let ts = quote::ToTokens::to_token_stream(item);
+        self.graph
+            .aux_tokens
             .entry(item.ident.to_string())
             .or_default()
-            .push(quote::ToTokens::to_token_stream(item));
+            .push(ts.clone());
+        self.graph
+            .non_impl_aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(ts);
         syn::visit::visit_item_union(self, item);
     }
 
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-        self.aux_tokens
+        let ts = quote::ToTokens::to_token_stream(item);
+        self.graph
+            .aux_tokens
             .entry(item.ident.to_string())
             .or_default()
-            .push(quote::ToTokens::to_token_stream(item));
+            .push(ts.clone());
+        self.graph
+            .non_impl_aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(ts);
         syn::visit::visit_item_type(self, item);
     }
 
@@ -3685,17 +3847,73 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
             &mut self_idents,
         );
         let ts = quote::ToTokens::to_token_stream(imp);
+        let is_trait_impl = imp.trait_.is_some();
         for id in &self_idents {
-            self.aux_tokens.entry(id.clone()).or_default().push(ts.clone());
+            self.graph
+                .aux_tokens
+                .entry(id.clone())
+                .or_default()
+                .push(ts.clone());
+            if is_trait_impl {
+                self.graph
+                    .trait_impl_tokens
+                    .entry(id.clone())
+                    .or_default()
+                    .push(ts.clone());
+            }
         }
+        let simple_self_ty = if !is_trait_impl
+            && let syn::Type::Path(tp) = imp.self_ty.as_ref()
+            && tp.qself.is_none()
+            && let Some(last) = tp.path.segments.last()
+            && matches!(last.arguments, syn::PathArguments::None)
+        {
+            Some(last.ident.to_string())
+        } else {
+            None
+        };
         for impl_item in &imp.items {
             if let syn::ImplItem::Fn(method) = impl_item {
-                self.impl_method_names.insert(method.sig.ident.to_string());
+                let method_name = method.sig.ident.to_string();
+                let method_ts = quote::ToTokens::to_token_stream(method);
+                self.graph.impl_method_names.insert(method_name.clone());
                 if self_idents.is_empty() {
-                    self.fn_bodies
-                        .entry(method.sig.ident.to_string())
+                    self.graph
+                        .fn_bodies
+                        .entry(method_name.clone())
                         .or_default()
-                        .extend(quote::ToTokens::to_token_stream(method));
+                        .extend(method_ts.clone());
+                } else if !is_trait_impl {
+                    for id in &self_idents {
+                        self.graph
+                            .inherent_impl_methods
+                            .entry(id.clone())
+                            .or_default()
+                            .push((method_name.clone(), method_ts.clone()));
+                    }
+                    if self.in_impl_depth == 0
+                        && self.top_fn_stack.is_empty()
+                        && let Some(ty_ident) = simple_self_ty.as_ref()
+                    {
+                        let mut parts = self.path_stack.clone();
+                        parts.push(ty_ident.clone());
+                        parts.push(method_name.clone());
+                        let owner = InherentMethodOwner {
+                            self_ty: ty_ident.clone(),
+                            method: method_name,
+                            containers: self.container_stack.clone(),
+                        };
+                        for stem in [parts.join("_"), parts.join(".")] {
+                            let entries = self
+                                .graph
+                                .inherent_impl_method_stems
+                                .entry(stem)
+                                .or_default();
+                            if !entries.contains(&owner) {
+                                entries.push(owner.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3705,19 +3923,11 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
     }
 }
 
-fn collect_fn_and_aux_items(
-    items: &[syn::Item],
-    fn_bodies: &mut BTreeMap<String, proc_macro2::TokenStream>,
-    aux_tokens: &mut BTreeMap<String, Vec<proc_macro2::TokenStream>>,
-    impl_method_names: &mut BTreeSet<String>,
-    nested_fn_stems: &mut BTreeMap<String, Vec<(Option<String>, String)>>,
-) {
+fn collect_fn_and_aux_items(items: &[syn::Item], graph: &mut ScopeGraphData) {
     let mut collector = FnAndAuxCollector {
-        fn_bodies,
-        aux_tokens,
-        impl_method_names,
-        nested_fn_stems,
+        graph,
         path_stack: Vec::new(),
+        container_stack: Vec::new(),
         top_fn_stack: Vec::new(),
         in_impl_depth: 0,
     };
@@ -3730,8 +3940,13 @@ fn collect_fn_and_aux_items(
 struct ScopeGraphData {
     fn_bodies: BTreeMap<String, proc_macro2::TokenStream>,
     aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>>,
+    non_impl_aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>>,
+    trait_impl_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>>,
+    inherent_impl_methods: BTreeMap<String, Vec<(String, proc_macro2::TokenStream)>>,
     impl_method_names: BTreeSet<String>,
-    nested_fn_stems: BTreeMap<String, Vec<(Option<String>, String)>>,
+    nested_fn_stems: BTreeMap<String, Vec<NestedFnOwner>>,
+    inherent_impl_method_stems: BTreeMap<String, Vec<InherentMethodOwner>>,
+    imported_idents: BTreeSet<String>,
     top_level_fns: BTreeSet<String>,
     defined_value_names: BTreeSet<String>,
     defined_type_names: BTreeSet<String>,
@@ -3762,6 +3977,8 @@ struct ScopedReachability {
     reexports: BTreeMap<String, String>,
     reached_fns_by_scope: BTreeMap<Option<String>, BTreeSet<String>>,
     reached_aux_by_scope: BTreeMap<Option<String>, BTreeSet<String>>,
+    reached_idents_by_scope: BTreeMap<Option<String>, BTreeSet<String>>,
+    reached_inherent_methods_by_scope: BTreeMap<Option<String>, BTreeSet<(String, String)>>,
     active_scopes: BTreeSet<Option<String>>,
 }
 
@@ -3798,13 +4015,7 @@ fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> Scoped
                         ..ScopeGraphData::default()
                     };
                     record_scope_defined_names(&sub_items, &mut ns_data);
-                    collect_fn_and_aux_items(
-                        &sub_items,
-                        &mut ns_data.fn_bodies,
-                        &mut ns_data.aux_tokens,
-                        &mut ns_data.impl_method_names,
-                        &mut ns_data.nested_fn_stems,
-                    );
+                    collect_fn_and_aux_items(&sub_items, &mut ns_data);
                     stage_ns.insert(mod_name, ns_data);
                 }
                 other => {
@@ -3813,13 +4024,7 @@ fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> Scoped
             }
         }
         record_scope_defined_names(&root_items, &mut root);
-        collect_fn_and_aux_items(
-            &root_items,
-            &mut root.fn_bodies,
-            &mut root.aux_tokens,
-            &mut root.impl_method_names,
-            &mut root.nested_fn_stems,
-        );
+        collect_fn_and_aux_items(&root_items, &mut root);
     }
 
     let mut worklist: Vec<(Option<String>, String)> = Vec::new();
@@ -3947,12 +4152,119 @@ fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> Scoped
         }
     }
 
+    let empty_set: BTreeSet<String> = BTreeSet::new();
+    let mut reached_idents_by_scope: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+    let mut reached_inherent_methods_by_scope: BTreeMap<
+        Option<String>,
+        BTreeSet<(String, String)>,
+    > = BTreeMap::new();
+
+    let collect_seed_idents = |graph: &ScopeGraphData,
+                               scope_fns: &BTreeSet<String>,
+                               scope_aux: &BTreeSet<String>,
+                               seed_out: &mut BTreeSet<String>,
+                               all_idents_out: &mut BTreeSet<String>| {
+        for f in scope_fns {
+            seed_out.insert(f.clone());
+            all_idents_out.insert(f.clone());
+            if let Some(ts) = graph.fn_bodies.get(f) {
+                collect_ident_tokens(ts.clone(), seed_out);
+                collect_ident_tokens(ts.clone(), all_idents_out);
+            }
+        }
+        for a in scope_aux {
+            seed_out.insert(a.clone());
+            all_idents_out.insert(a.clone());
+            if let Some(non_impls) = graph.non_impl_aux_tokens.get(a) {
+                for ts in non_impls {
+                    collect_ident_tokens(ts.clone(), seed_out);
+                }
+            }
+            if let Some(trait_impls) = graph.trait_impl_tokens.get(a) {
+                for ts in trait_impls {
+                    collect_ident_tokens(ts.clone(), seed_out);
+                }
+            }
+            if let Some(aux_list) = graph.aux_tokens.get(a) {
+                for ts in aux_list {
+                    collect_ident_tokens(ts.clone(), all_idents_out);
+                }
+            }
+        }
+    };
+
+    let root_aux = reached_aux_by_scope.get(&None).unwrap_or(&empty_set);
+    for scope in &active_scopes {
+        let Some(graph) = (match scope {
+            Some(ns) => stage_ns.get(ns),
+            None => Some(&root),
+        }) else {
+            continue;
+        };
+        let scope_fns = reached_fns_by_scope.get(scope).unwrap_or(&empty_set);
+        let scope_aux = reached_aux_by_scope.get(scope).unwrap_or(&empty_set);
+        let mut seed_idents: BTreeSet<String> = BTreeSet::new();
+        let mut all_idents: BTreeSet<String> = BTreeSet::new();
+        collect_seed_idents(graph, scope_fns, scope_aux, &mut seed_idents, &mut all_idents);
+        if scope.is_none() {
+            // An active `stage_ns_<n>` with `use super::*` can call inherent
+            // methods or module-nested helpers defined in crate root.
+            for (child_ns, child_graph) in &stage_ns {
+                if !child_graph.inherits_super {
+                    continue;
+                }
+                let child_key = Some(child_ns.clone());
+                if !active_scopes.contains(&child_key) {
+                    continue;
+                }
+                let child_fns = reached_fns_by_scope.get(&child_key).unwrap_or(&empty_set);
+                let child_aux = reached_aux_by_scope.get(&child_key).unwrap_or(&empty_set);
+                collect_seed_idents(
+                    child_graph,
+                    child_fns,
+                    child_aux,
+                    &mut seed_idents,
+                    &mut all_idents,
+                );
+            }
+        }
+        let mut reached_methods: BTreeSet<(String, String)> = BTreeSet::new();
+        loop {
+            let mut changed = false;
+            for (self_ty, methods) in &graph.inherent_impl_methods {
+                let ty_reached = scope_aux.contains(self_ty)
+                    || (scope.is_some()
+                        && graph.inherits_super
+                        && !graph.defined_type_names.contains(self_ty)
+                        && root_aux.contains(self_ty));
+                if !ty_reached {
+                    continue;
+                }
+                for (method_name, method_ts) in methods {
+                    if seed_idents.contains(method_name)
+                        && reached_methods.insert((self_ty.clone(), method_name.clone()))
+                    {
+                        collect_ident_tokens(method_ts.clone(), &mut seed_idents);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        reached_idents_by_scope.insert(scope.clone(), all_idents);
+        reached_inherent_methods_by_scope.insert(scope.clone(), reached_methods);
+    }
+
     ScopedReachability {
         root,
         stage_ns,
         reexports,
         reached_fns_by_scope,
         reached_aux_by_scope,
+        reached_idents_by_scope,
+        reached_inherent_methods_by_scope,
         active_scopes,
     }
 }
@@ -4676,17 +4988,16 @@ fn strip_one_trailing_closure_segment<'a>(s: &'a str) -> Vec<&'a str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClosureOwner {
     TopFn(String),
-    NestedFn {
-        top_fn: Option<String>,
-        leaf_fn: String,
-    },
+    NestedFn(NestedFnOwner),
+    InherentImplMethod(InherentMethodOwner),
 }
 
-/// Resolve the enclosing function owner(s) of a closure's relative stem inside
-/// `scope_graph` by peeling closure segments one level at a time (breadth-first),
-/// stopping at the shallowest depth that matches a known top-level or nested
-/// function so `fn foo_closure` never over-strips to `fn foo`, while nested
-/// closures (`foo::{closure#0}::{closure#0}`) peel back to `foo`.
+/// Resolve the enclosing function or inherent-method owner(s) of a closure's
+/// relative stem inside `scope_graph` by peeling closure segments one level at
+/// a time (breadth-first), stopping at the shallowest depth that matches a
+/// known top-level function, nested function, or inherent `impl` method so
+/// `fn foo_closure` never over-strips to `fn foo`, while nested closures
+/// (`foo::{closure#0}::{closure#0}`) peel back to `foo`.
 ///
 /// Note: `anneal-rustc-capture` V2026_06_01 (`should_capture_mir_item`) does
 /// not capture local `DefKind::Closure` bodies as separate `Mir.<Crate>.*`
@@ -4719,13 +5030,22 @@ fn resolve_closure_owners_in_scope(rel: &str, scope_graph: &ScopeGraphData) -> V
                 && !nested_list.is_empty()
             {
                 let mut matched: Vec<ClosureOwner> = Vec::new();
-                for (top_fn, leaf_fn) in nested_list {
-                    let owner = ClosureOwner::NestedFn {
-                        top_fn: top_fn.clone(),
-                        leaf_fn: leaf_fn.clone(),
-                    };
-                    if !matched.contains(&owner) {
-                        matched.push(owner);
+                for owner in nested_list {
+                    let wrapped = ClosureOwner::NestedFn(owner.clone());
+                    if !matched.contains(&wrapped) {
+                        matched.push(wrapped);
+                    }
+                }
+                return matched;
+            }
+            if let Some(method_list) = scope_graph.inherent_impl_method_stems.get(cand)
+                && !method_list.is_empty()
+            {
+                let mut matched: Vec<ClosureOwner> = Vec::new();
+                for owner in method_list {
+                    let wrapped = ClosureOwner::InherentImplMethod(owner.clone());
+                    if !matched.contains(&wrapped) {
+                        matched.push(wrapped);
                     }
                 }
                 return matched;
@@ -4757,6 +5077,7 @@ fn confirm_helper_module_suffixes(
     let scoped = compute_scoped_reachability(lib_rs, entries);
     let crate_prefix = format!("{crate_camel}.");
     let empty_set: BTreeSet<String> = BTreeSet::new();
+    let empty_method_set: BTreeSet<(String, String)> = BTreeSet::new();
 
     helper_module_suffixes
         .iter()
@@ -4782,6 +5103,14 @@ fn confirm_helper_module_suffixes(
                 .reached_aux_by_scope
                 .get(&target_scope)
                 .unwrap_or(&empty_set);
+            let scope_idents = scoped
+                .reached_idents_by_scope
+                .get(&target_scope)
+                .unwrap_or(&empty_set);
+            let scope_inherent_methods = scoped
+                .reached_inherent_methods_by_scope
+                .get(&target_scope)
+                .unwrap_or(&empty_method_set);
 
             fn strip_scope_rel<'a>(
                 suf: &'a str,
@@ -4870,6 +5199,14 @@ fn confirm_helper_module_suffixes(
                     || scope_fns.contains(fn_name)
             };
 
+            let containers_reachable = |containers: &[String]| -> bool {
+                containers.iter().all(|c| {
+                    scope_idents.contains(c)
+                        || scope_aux.contains(c)
+                        || scope_graph.imported_idents.contains(c)
+                })
+            };
+
             subject_pairs
                 .iter()
                 .filter(|(_, s)| s == *suffix)
@@ -4884,11 +5221,17 @@ fn confirm_helper_module_suffixes(
                         if !owners.is_empty() {
                             return owners.iter().any(|owner| match owner {
                                 ClosureOwner::TopFn(f) => top_fn_is_reached(f),
-                                ClosureOwner::NestedFn { top_fn, leaf_fn } => {
-                                    scope_fns.contains(leaf_fn)
-                                        && top_fn
+                                ClosureOwner::NestedFn(n) => {
+                                    scope_fns.contains(&n.leaf_fn)
+                                        && n.top_fn
                                             .as_deref()
                                             .is_none_or(|top| top_fn_is_reached(top))
+                                        && containers_reachable(&n.containers)
+                                }
+                                ClosureOwner::InherentImplMethod(m) => {
+                                    scope_inherent_methods
+                                        .contains(&(m.self_ty.clone(), m.method.clone()))
+                                        && containers_reachable(&m.containers)
                                 }
                             });
                         }
@@ -15385,6 +15728,188 @@ def body : CapturedMir :=
             extract_failing_construct_hint_from_mir(mir_transmute, &["src/lib.rs:20:5: 20:40"])
                 .as_deref(),
             Some("CastKind::Transmute")
+        );
+
+        // Indirect `TerminatorKind.call` whose argument has a `RigidTy.fnDef`
+        // type must report `TerminatorKind::Call`, never the argument's `fnDef`.
+        let mir_indirect_call_with_fn_arg = "\
+{ kind := (TerminatorKind.call (Operand.copy { local_ := 5, projection := List.nil }) (List.cons (Operand.constant { ty := { kind := (RigidTy.fnDef \"miri_diff_corpus::arg_fn\" List.nil), layoutIdx := 1 }, val := ConstValue.zeroSized }) List.nil) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := \"src/lib.rs:60:5: 60:25\" }
+";
+        assert_eq!(
+            extract_failing_construct_hint_from_mir(
+                mir_indirect_call_with_fn_arg,
+                &["src/lib.rs:60:5: 60:25"]
+            )
+            .as_deref(),
+            Some("TerminatorKind::Call")
+        );
+
+        let mir_direct_call = "\
+{ kind := (TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.fnDef \"miri_diff_corpus::direct_fn\" List.nil), layoutIdx := 1 }, val := ConstValue.zeroSized }) List.nil { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := \"src/lib.rs:61:5: 61:25\" }
+";
+        assert_eq!(
+            extract_failing_construct_hint_from_mir(mir_direct_call, &["src/lib.rs:61:5: 61:25"])
+                .as_deref(),
+            Some("Call::miri_diff_corpus::direct_fn")
+        );
+
+        // Multi-line `prettyplease`-wrapped `&dyn` cast spans two lines;
+        // `extract_rust_span_snippet` joins `start_line..=end_line`.
+        let wrapped_src = "\
+fn driver() {
+    let __vt_rec_dyn: &dyn __AnnealVtableTrait1 = &__vt_rec
+        as &dyn __AnnealVtableTrait1;
+    let implicit_dyn: &dyn __AnnealVtableTrait1 = &__vt_rec;
+}
+";
+        let wrapped_snippet = extract_rust_span_snippet(wrapped_src, "src/lib.rs:2:51: 3:37")
+            .expect("multi-line snippet");
+        assert_eq!(
+            extract_failing_construct_hint_from_rust_line(&wrapped_snippet).as_deref(),
+            Some("PointerCoercion::Unsize")
+        );
+        let implicit_snippet = extract_rust_span_snippet(wrapped_src, "src/lib.rs:4:51: 4:60")
+            .expect("implicit dyn snippet");
+        assert_eq!(
+            extract_failing_construct_hint_from_rust_line(&implicit_snippet).as_deref(),
+            Some("PointerCoercion::Unsize")
+        );
+    }
+
+    #[test]
+    fn confirm_helper_module_suffixes_isolates_mod_containers_inherent_impl_methods_and_super_inheritance()
+    {
+        let lib_rs = "\
+mod live_mod {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x + v;
+        f(1u32)
+    }
+}
+mod dead_mod {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x + v;
+        f(2u32)
+    }
+}
+mod imported_mod {
+    pub fn imported_helper(v: u32) -> u32 {
+        let f = |x: u32| x ^ v;
+        f(3u32)
+    }
+}
+use imported_mod::imported_helper;
+
+struct Holder(u32);
+impl Holder {
+    fn live(&self) -> u32 {
+        let f = |x: u32| x + self.0;
+        self.transitive(f(1u32))
+    }
+    fn transitive(&self, v: u32) -> u32 {
+        let f = |x: u32| x ^ v;
+        f(2u32)
+    }
+    fn cleanup(&self) -> u32 {
+        let f = |x: u32| x + 9u32;
+        f(self.0)
+    }
+    fn dead_recursive(&self) -> u32 {
+        let f = |x: u32| x + 42u32;
+        if self.0 == 0 { f(1u32) } else { self.dead_recursive() }
+    }
+}
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+fn root_shared(v: u32) -> u32 {
+    let f = |x: u32| x + v;
+    f(7u32)
+}
+pub fn root_entry() -> u32 {
+    let h = Holder(5u32);
+    live_mod::helper(1u32) ^ imported_helper(2u32) ^ h.live()
+}
+pub mod stage_ns_0 {
+    use super::*;
+    pub fn ns0_inherits() -> u32 {
+        let h = Holder(3u32);
+        root_shared(1u32) ^ h.live()
+    }
+}
+pub use stage_ns_0::ns0_inherits;
+pub mod stage_ns_1 {
+    use super::*;
+    fn root_shared(v: u32) -> u32 {
+        let f = |x: u32| x ^ v;
+        f(8u32)
+    }
+    pub fn ns1_shadows() -> u32 {
+        root_shared(2u32)
+    }
+}
+pub use stage_ns_1::ns1_shadows;
+";
+        let pairs: Vec<(String, String)> = [
+            ("{closure#0}", "X.live_mod_helper_closure_0"),
+            ("{closure#0}", "X.dead_mod_helper_closure_0"),
+            ("{closure#0}", "X.imported_mod_imported_helper_closure_0"),
+            ("{closure#0}", "X.Holder_live_closure_0"),
+            ("{closure#0}", "X.Holder_transitive_closure_0"),
+            ("{closure#0}", "X.Holder_cleanup_closure_0"),
+            ("{closure#0}", "X.Holder_dead_recursive_closure_0"),
+            ("{closure#0}", "X.root_shared_closure_0"),
+            ("{closure#0}", "X.stage_ns_1_root_shared_closure_0"),
+        ]
+        .iter()
+        .map(|(s, suf)| ((*s).to_string(), (*suf).to_string()))
+        .collect();
+        let helpers: Vec<String> = pairs.iter().map(|(_, suf)| suf.clone()).collect();
+        let linked_for = |entry: &str| {
+            confirm_helper_module_suffixes(
+                lib_rs,
+                "X",
+                &pairs,
+                &helpers,
+                &[OracleItemSpec::with_fuel(entry.to_string(), 200)],
+            )
+        };
+
+        // 1. Root entry links live_mod, use-imported imported_mod, reached
+        //    Holder::{live, transitive, cleanup (via Drop)}, and excludes
+        //    dead_mod::helper and Holder::dead_recursive (even though it mentions
+        //    itself recursively) and unreached root_shared / stage_ns_1.
+        assert_eq!(
+            linked_for("root_entry"),
+            vec![
+                "X.live_mod_helper_closure_0",
+                "X.imported_mod_imported_helper_closure_0",
+                "X.Holder_live_closure_0",
+                "X.Holder_transitive_closure_0",
+                "X.Holder_cleanup_closure_0",
+            ],
+        );
+
+        // 2. stage_ns_0 (`use super::*`) reaches root_shared and root Holder's
+        //    live/transitive/cleanup methods, never Holder::dead_recursive or
+        //    stage_ns_1's shadowed root_shared.
+        assert_eq!(
+            linked_for("ns0_inherits"),
+            vec![
+                "X.Holder_live_closure_0",
+                "X.Holder_transitive_closure_0",
+                "X.Holder_cleanup_closure_0",
+                "X.root_shared_closure_0",
+            ],
+        );
+
+        // 3. stage_ns_1 shadows `root_shared`, so only its own closure links —
+        //    crate-root `root_shared`'s closure is never leaked across shadowing.
+        assert_eq!(
+            linked_for("ns1_shadows"),
+            vec!["X.stage_ns_1_root_shared_closure_0"],
         );
     }
 
