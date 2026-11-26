@@ -49,6 +49,12 @@ every divergence witness evaluates the real, unmodified live definitions.
   hardcoding `layoutIdx := 0` and `validateValueForTy?` ignoring `.adt`) stores an invalid
   payload that reads back as `2` without UB, while foreign-frame copy stores `2u8` into a
   caller `bool` local unchecked.
+* **Provenance through integer storage and union overlays (`rust#148259`).** End to end,
+  `copy_nonoverlapping::<*const u8>` out of a `MaybeUninit<*const u8>` holding plain integer
+  bytes FORGES a pointer (`evalCopyUnionBytes` → `decodeValueFromBytes`:
+  `allocId := bits / 65536`), while a `*const u8 → usize` copy keeps the full `.ptr` inside the
+  `usize` local (reads return the pointer). The in-order bytewise pointer copy
+  (`copy_nonoverlapping::<u8>`, `count > 1`) is `.unsupported` in live.
 
 ## Prototype
 
@@ -2290,6 +2296,32 @@ theorem kani_nested_maybeUninit_unaligned_bool_univ (ptrBytes : Nat) (b : UInt8)
       Nat.zero_add, Nat.ble_eq_true_of_le (Nat.le_refl 1), List.drop_zero, List.take_succ_cons,
       List.take_zero, readBool_invalid_none ptrBytes b hb]
 
+/-- **No provenance forging from integers (universal, `0 < ptrBytes`):** plain integer bytes
+(e.g. a `MaybeUninit<*const T>` raw overlay or a `usize` transmuted to a pointer) decode at a
+raw-pointer type to the provenance-less address and at a reference / `fn` pointer type to UB;
+they never become `.ptr` (contrast live `k_gap_union_to_ptr_forges_provenance`). -/
+theorem decode_plain_no_forge (bits n : Nat) (hn : 0 < n) (hbits : bits < 256 ^ n) :
+    decodeTypedValueFromBytesProto n (.rawPtr .thin) (encodeLittleEndianBytesProto bits n) =
+      some (.scalar bits n) ∧
+    decodeTypedValueFromBytesProto n (.ref .thin) (encodeLittleEndianBytesProto bits n) = none ∧
+    decodeTypedValueFromBytesProto n .fnPtr (encodeLittleEndianBytesProto bits n) = none := by
+  have h0 : (encodeLittleEndianBytesProto bits n)[0]? = some (.init (UInt8.ofNat bits) none) := by
+    simp [encodeLittleEndianBytesProto, leImage_getElem?, hn]
+  have hc := coherent_none_of_no_frag n _ 0 _ h0
+  refine ⟨?_, ?_, ?_⟩ <;>
+    simp only [decodeTypedValueFromBytesProto, decodePtrBytesNoForgeProto, decodeThinPtrBytesProto,
+      plain_length, Nat.beq_refl, dataBytesProto_plain, hc, leValue_leImage, Nat.mod_eq_of_lt hbits]
+
+/-- **Pointer bytes never decode as integers (universal, `0 < ptrBytes`):** a `ptr → usize`
+typed read of an intact pointer image is UB (fail-closed, matching live `NoForge` integer
+decoding and CTFE), so provenance can never hide inside integer-typed values. -/
+theorem decode_ptr_as_int_none (p : ProvenancePtrProto) (n : Nat) (hn : 0 < n) :
+    decodeTypedValueFromBytesProto n (.uint n) (encodePtrBytesProto p n) = none := by
+  have hf : abstractBytesHaveFragProto (encodePtrBytesProto p n) = true :=
+    haveFrag_of_getElem?_some _ 0 _ _ (encodePtrBytesProto_getElem? p n 0 hn)
+  simp only [decodeTypedValueFromBytesProto, decodePlainIntProto, hf, Bool.not_true,
+    Bool.and_false]
+
 /-! ## 10. Projections onto the live `AbstractByte` (both rustc snapshots) -/
 
 def AbstractByteProto.toLive06 : AbstractByteProto →
@@ -2573,7 +2605,7 @@ def u8SL : ScalarLayout := .initialized (.int 8 false) ⟨0, 255⟩
 /-- Layouts: `0 ()`, `1 MaybeUninit<bool>`, `2 [u8; 1]`, `3 bool`, `4 u8`,
 `5 Unaligned<bool>` (`#[repr(packed)]`, align 1), `6 MaybeUninit<Unaligned<bool>>`,
 `7 [u8; 4]`, `8 char`, `9 u32`, `10 *mut _`, `11 [u8; 2]`, `12 [bool; 2]`,
-`13 MaybeUninit<MaybeUninit<bool>>`.
+`13 MaybeUninit<MaybeUninit<bool>>`, `14 MaybeUninit<*const u8>`.
 Note: placing `()` (ZST) at index `0` avoids accidentally masking `Bytes.lean:1697`'s
 hardcoded `layoutIdx := 0` lookup inside `decodeValueFromBytes` for `.union`. -/
 def kLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [
@@ -2590,7 +2622,8 @@ def kLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entri
   tl 8 8 (.scalar ptrScalarInit) .primitive [],
   tl 2 1 .memory (.array ⟨1⟩ 2) [4],
   tl 2 1 .memory (.array ⟨1⟩ 2) [3],
-  tl 1 1 .memory (.union 2) [0, 1]] }
+  tl 1 1 .memory (.union 2) [0, 1],
+  tl 8 8 .memory (.union 2) [0, 10]] }
 
 def tyUnit : Ty := { kind := .tuple [], layoutIdx := 0 }
 def tyMUBool : Ty := { kind := .adt "core::mem::MaybeUninit" [.bool], layoutIdx := 1 }
@@ -2609,6 +2642,11 @@ def tyU8A2 : Ty := { kind := .array (.uint .u8) 2, layoutIdx := 11 }
 def tyBoolA2 : Ty := { kind := .array .bool 2, layoutIdx := 12 }
 def tyMUMUBool : Ty :=
   { kind := .adt "core::mem::MaybeUninit" [.adt "core::mem::MaybeUninit" [.bool]], layoutIdx := 13 }
+def tyUsize : Ty := { kind := .uint .usize, layoutIdx := 10 }
+def tyRawU8 : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 10 }
+def tyPtrRawU8 : Ty := { kind := .rawPtr .mut (.rawPtr .not (.uint .u8)), layoutIdx := 10 }
+def tyMUPtr : Ty :=
+  { kind := .adt "core::mem::MaybeUninit" [.rawPtr .not (.uint .u8)], layoutIdx := 14 }
 
 theorem k_decode_bool_2_none : decodeTypedValueFromBytes 16 kLayouts tyBool [.init 2 none] = none :=
   rfl
@@ -2828,6 +2866,54 @@ theorem k_maybeUninitUnaligned_inner_field_ub :
 theorem k_bool_local_holding_2_reads_ok :
     readOutcome (evalOperand [.init .unit, .uninit, .init (.scalar ⟨2, 1⟩)] (.copy (lc 2)) [] []
       kLayouts [] [decl tyUnit, decl tyU8A1, decl tyBool] []) = .ok (.scalar ⟨2, 1⟩) := rfl
+
+/-! ### Provenance through integer-typed storage and union raw overlays (`rust#148259`) -/
+
+/-- A `MaybeUninit<*const u8>` whose raw-byte overlay holds the plain integer `0x20004`
+(no provenance on any byte). -/
+def muPtrPlain : LocalSlot :=
+  .init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨4, 1⟩, .scalar ⟨0, 1⟩,
+    .scalar ⟨2, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩,
+    .scalar ⟨0, 1⟩]])
+
+/-- **GAP (provenance forging, end to end):** `copy_nonoverlapping::<*const u8>` from a
+`MaybeUninit<*const u8>` holding plain integer bytes into a `*const u8` local
+(`evalCopyUnionBytes` → `decodeValueFromBytes`, `Bytes.lean:1447-1451`) fabricates the pointer
+`{ allocId := 0x20004 / 65536 = 2, offsetBytes := 4 }` out of an integer. -/
+theorem k_gap_union_to_ptr_forges_provenance :
+    stepOutcome (copyActiveEx tyMUPtr tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1 muPtrPlain .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8)) muPtrPlain) [] := rfl
+
+/-- The single-direct `usize → *const u8` copy does NOT forge: the integer is stored as a
+provenance-less `.scalar`. -/
+theorem k_copy_usize_to_ptr_no_forge :
+    stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.scalar ⟨0x20004, 8⟩)) (.init (.scalar ⟨0x20004, 8⟩))) [] := rfl
+
+/-- **GAP (permissive):** copying a `*const u8` into a `usize` local keeps the full `.ptr`
+(provenance survives inside integer-typed storage), and reading the `usize` local returns the
+pointer, so a `ptr → usize → ptr` transmute round trip never loses provenance. -/
+theorem k_gap_ptr_to_usize_keeps_provenance :
+    stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrRawU8 0 0 1
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))
+        (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))) [] ∧
+    readOutcome (evalOperand [.init .unit, .uninit,
+        .init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)] (.copy (lc 2)) [] [] kLayouts []
+      [decl tyUnit, decl tyUnit, decl tyUsize] []) =
+      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) := ⟨rfl, rfl⟩
+
+/-- Live cannot model the in-order byte-by-byte copy of a pointer: `copy_nonoverlapping::<u8>`
+with `count = 8` from a `*const u8` local into `[u8; 8]` or into another `*const u8` local is
+`.unsupported` (fail-closed incompleteness; the prototype's `copyBytewise_preserves_ptr` and
+`copyNonOverlapping_preserves_ptr` cover it). -/
+theorem k_copy_ptr_bytewise_unsupported :
+    stepOutcome (copyActiveEx tyRawU8 tyU8A4 tyPtrU8 tyPtrU8 0 0 4
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported ∧
+    stepOutcome (copyActiveEx tyRawU8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported :=
+  ⟨rfl, rfl⟩
 
 def wFnAbi : FnAbi :=
   { args := [], ret := { layout := tl 0 1 .memory (.arbitrary [] []) [], mode := .direct },
@@ -3159,7 +3245,7 @@ def u8SL : ScalarLayout := .initialized (.int 8 false) ⟨0, 255⟩
 /-- Layouts: `0 ()`, `1 MaybeUninit<bool>`, `2 [u8; 1]`, `3 bool`, `4 u8`,
 `5 Unaligned<bool>` (`#[repr(packed)]`, align 1), `6 MaybeUninit<Unaligned<bool>>`,
 `7 [u8; 4]`, `8 char`, `9 u32`, `10 *mut _`, `11 [u8; 2]`, `12 [bool; 2]`,
-`13 MaybeUninit<MaybeUninit<bool>>`.
+`13 MaybeUninit<MaybeUninit<bool>>`, `14 MaybeUninit<*const u8>`.
 Note: placing `()` (ZST) at index `0` avoids accidentally masking `Bytes.lean:1697`'s
 hardcoded `layoutIdx := 0` lookup inside `decodeValueFromBytes` for `.union`. -/
 def kLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [
@@ -3176,7 +3262,8 @@ def kLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entri
   tl 8 8 (.scalar ptrScalarInit) .primitive [],
   tl 2 1 .memory (.array ⟨1⟩ 2) [4],
   tl 2 1 .memory (.array ⟨1⟩ 2) [3],
-  tl 1 1 .memory (.union 2) [0, 1]] }
+  tl 1 1 .memory (.union 2) [0, 1],
+  tl 8 8 .memory (.union 2) [0, 10]] }
 
 def tyUnit : Ty := { kind := .tuple [], layoutIdx := 0 }
 def tyMUBool : Ty := { kind := .adt "core::mem::MaybeUninit" [.bool], layoutIdx := 1 }
@@ -3195,6 +3282,11 @@ def tyU8A2 : Ty := { kind := .array (.uint .u8) 2, layoutIdx := 11 }
 def tyBoolA2 : Ty := { kind := .array .bool 2, layoutIdx := 12 }
 def tyMUMUBool : Ty :=
   { kind := .adt "core::mem::MaybeUninit" [.adt "core::mem::MaybeUninit" [.bool]], layoutIdx := 13 }
+def tyUsize : Ty := { kind := .uint .usize, layoutIdx := 10 }
+def tyRawU8 : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 10 }
+def tyPtrRawU8 : Ty := { kind := .rawPtr .mut (.rawPtr .not (.uint .u8)), layoutIdx := 10 }
+def tyMUPtr : Ty :=
+  { kind := .adt "core::mem::MaybeUninit" [.rawPtr .not (.uint .u8)], layoutIdx := 14 }
 
 theorem k_decode_bool_2_none : decodeTypedValueFromBytes 16 kLayouts tyBool [.init 2 none] = none :=
   rfl
@@ -3414,6 +3506,54 @@ theorem k_maybeUninitUnaligned_inner_field_ub :
 theorem k_bool_local_holding_2_reads_ok :
     readOutcome (evalOperand [.init .unit, .uninit, .init (.scalar ⟨2, 1⟩)] (.copy (lc 2)) [] []
       kLayouts [] [decl tyUnit, decl tyU8A1, decl tyBool] []) = .ok (.scalar ⟨2, 1⟩) := rfl
+
+/-! ### Provenance through integer-typed storage and union raw overlays (`rust#148259`) -/
+
+/-- A `MaybeUninit<*const u8>` whose raw-byte overlay holds the plain integer `0x20004`
+(no provenance on any byte). -/
+def muPtrPlain : LocalSlot :=
+  .init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨4, 1⟩, .scalar ⟨0, 1⟩,
+    .scalar ⟨2, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩,
+    .scalar ⟨0, 1⟩]])
+
+/-- **GAP (provenance forging, end to end):** `copy_nonoverlapping::<*const u8>` from a
+`MaybeUninit<*const u8>` holding plain integer bytes into a `*const u8` local
+(`evalCopyUnionBytes` → `decodeValueFromBytes`, `Bytes.lean:1447-1451`) fabricates the pointer
+`{ allocId := 0x20004 / 65536 = 2, offsetBytes := 4 }` out of an integer. -/
+theorem k_gap_union_to_ptr_forges_provenance :
+    stepOutcome (copyActiveEx tyMUPtr tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1 muPtrPlain .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8)) muPtrPlain) [] := rfl
+
+/-- The single-direct `usize → *const u8` copy does NOT forge: the integer is stored as a
+provenance-less `.scalar`. -/
+theorem k_copy_usize_to_ptr_no_forge :
+    stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.scalar ⟨0x20004, 8⟩)) (.init (.scalar ⟨0x20004, 8⟩))) [] := rfl
+
+/-- **GAP (permissive):** copying a `*const u8` into a `usize` local keeps the full `.ptr`
+(provenance survives inside integer-typed storage), and reading the `usize` local returns the
+pointer, so a `ptr → usize → ptr` transmute round trip never loses provenance. -/
+theorem k_gap_ptr_to_usize_keeps_provenance :
+    stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrRawU8 0 0 1
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))
+        (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))) [] ∧
+    readOutcome (evalOperand [.init .unit, .uninit,
+        .init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)] (.copy (lc 2)) [] [] kLayouts []
+      [decl tyUnit, decl tyUnit, decl tyUsize] []) =
+      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) := ⟨rfl, rfl⟩
+
+/-- Live cannot model the in-order byte-by-byte copy of a pointer: `copy_nonoverlapping::<u8>`
+with `count = 8` from a `*const u8` local into `[u8; 8]` or into another `*const u8` local is
+`.unsupported` (fail-closed incompleteness; the prototype's `copyBytewise_preserves_ptr` and
+`copyNonOverlapping_preserves_ptr` cover it). -/
+theorem k_copy_ptr_bytewise_unsupported :
+    stepOutcome (copyActiveEx tyRawU8 tyU8A4 tyPtrU8 tyPtrU8 0 0 4
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported ∧
+    stepOutcome (copyActiveEx tyRawU8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported :=
+  ⟨rfl, rfl⟩
 
 def wFnAbi : FnAbi :=
   { args := [], ret := { layout := tl 0 1 .memory (.arbitrary [] []) [], mode := .direct },

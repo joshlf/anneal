@@ -706,6 +706,28 @@ theorem t_toLive08_encode :
 theorem t_ite_pos : (if 1 < 2 then 3 else 4) = 3 := ite_pos' (by decide)
 theorem t_ite_neg : (if 2 < 1 then 3 else 4) = 4 := ite_neg' (by decide)
 
+theorem t_decode_plain_no_forge :
+    decodeTypedValueFromBytesProto 8 (.rawPtr .thin) (encodeLittleEndianBytesProto 0x20004 8) =
+      some (.scalar 0x20004 8) ∧
+    decodeTypedValueFromBytesProto 8 (.ref .thin) (encodeLittleEndianBytesProto 0x20004 8) = none ∧
+    decodeTypedValueFromBytesProto 8 .fnPtr (encodeLittleEndianBytesProto 0x20004 8) = none :=
+  decode_plain_no_forge 0x20004 8 (by decide) (by decide)
+
+theorem t_decode_plain_no_forge_32 :
+    decodeTypedValueFromBytesProto 4 (.rawPtr .thin) (encodeLittleEndianBytesProto 0 4) =
+      some (.scalar 0 4) ∧
+    decodeTypedValueFromBytesProto 4 (.ref .thin) (encodeLittleEndianBytesProto 0 4) = none ∧
+    decodeTypedValueFromBytesProto 4 .fnPtr (encodeLittleEndianBytesProto 0 4) = none :=
+  decode_plain_no_forge 0 4 (by decide) (by decide)
+
+theorem t_decode_ptr_as_int_none :
+    decodeTypedValueFromBytesProto 8 (.uint 8) (encodePtrBytesProto pTag 8) = none :=
+  decode_ptr_as_int_none pTag 8 (by decide)
+
+theorem t_decode_ptr_as_int_none_32 :
+    decodeTypedValueFromBytesProto 4 (.uint 4) (encodePtrBytesProto pBig4 4) = none :=
+  decode_ptr_as_int_none pBig4 4 (by decide)
+
 /-! ## 2. Prototype decoders on the adversarial inputs (independent `rfl` checks) -/
 
 /-- Live keeps provenance on these images (`LiveV06.w1_*` / `w2_*`); the prototype on the
@@ -1253,6 +1275,35 @@ theorem t_proto_projects_to_liveEnc :
       liveEnc 1 1 0x1122334455667788 8 :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.proto_projects_to_liveEnc
 
+theorem t_k_gap_union_to_ptr_forges_provenance :
+    stepOutcome (copyActiveEx tyMUPtr tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1 muPtrPlain .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8)) muPtrPlain) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_gap_union_to_ptr_forges_provenance
+
+theorem t_k_copy_usize_to_ptr_no_forge :
+    stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.scalar ⟨0x20004, 8⟩)) (.init (.scalar ⟨0x20004, 8⟩))) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_usize_to_ptr_no_forge
+
+theorem t_k_gap_ptr_to_usize_keeps_provenance :
+    stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrRawU8 0 0 1
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))
+        (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))) [] ∧
+    readOutcome (evalOperand [.init .unit, .uninit,
+        .init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)] (.copy (lc 2)) [] [] kLayouts []
+      [decl tyUnit, decl tyUnit, decl tyUsize] []) =
+      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_gap_ptr_to_usize_keeps_provenance
+
+theorem t_k_copy_ptr_bytewise_unsupported :
+    stepOutcome (copyActiveEx tyRawU8 tyU8A4 tyPtrU8 tyPtrU8 0 0 4
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported ∧
+    stepOutcome (copyActiveEx tyRawU8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_ptr_bytewise_unsupported
+
 end RestateLiveV06
 
 namespace RestateLiveV08
@@ -1602,6 +1653,35 @@ theorem t_proto_projects_to_liveEnc :
     (encodePtrBytesProto ⟨1, 1, 0x1122334455667788⟩ 8).map AbstractByteProto.toLive08 =
       liveEnc 1 1 0x1122334455667788 8 :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.proto_projects_to_liveEnc
+
+theorem t_k_gap_union_to_ptr_forges_provenance :
+    stepOutcome (copyActiveEx tyMUPtr tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1 muPtrPlain .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8)) muPtrPlain) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_gap_union_to_ptr_forges_provenance
+
+theorem t_k_copy_usize_to_ptr_no_forge :
+    stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.scalar ⟨0x20004, 8⟩)) (.init (.scalar ⟨0x20004, 8⟩))) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_usize_to_ptr_no_forge
+
+theorem t_k_gap_ptr_to_usize_keeps_provenance :
+    stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrRawU8 0 0 1
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))
+        (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))) [] ∧
+    readOutcome (evalOperand [.init .unit, .uninit,
+        .init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)] (.copy (lc 2)) [] [] kLayouts []
+      [decl tyUnit, decl tyUnit, decl tyUsize] []) =
+      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_gap_ptr_to_usize_keeps_provenance
+
+theorem t_k_copy_ptr_bytewise_unsupported :
+    stepOutcome (copyActiveEx tyRawU8 tyU8A4 tyPtrU8 tyPtrU8 0 0 4
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported ∧
+    stepOutcome (copyActiveEx tyRawU8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_ptr_bytewise_unsupported
 
 end RestateLiveV08
 
