@@ -810,6 +810,49 @@ def returnFrameMem (mem : Memory) (calleeNumLocals : Nat)
     activeProtectors := restoreCallerProtectors caller }
 
 /--
+Signature check `evalReifyFnPointer` performs for the reifying coercion tag
+`coercionKind`: `checkClosureCalleeSig` (which must return `.ok`) for a
+`ClosureFnPointer` tag, `checkCalleeSig` otherwise.
+-/
+def reifyCoercionSigCheck (coercionKind : String) (callees : List CapturedMir)
+    (p : DefPath) (fnInputs : List RigidTy) (fnOutput : RigidTy) (fnAbi : CallConv)
+    (typeArgs : List RigidTy) (traitImpls : List TraitImplEntry) : Bool :=
+  match isClosureFnPointerCoercion coercionKind with
+  | true =>
+    match checkClosureCalleeSig callees p fnInputs fnOutput fnAbi with
+    | .ok => true
+    | .ub => false
+    | .unsupported => false
+  | false => checkCalleeSig callees p fnInputs fnOutput fnAbi typeArgs traitImpls
+
+/-- A successful `ClosureFnPointer` signature check. -/
+theorem checkClosureCalleeSig_ok_of_reifyCoercionSigCheck
+    {coercionKind : String} {callees : List CapturedMir} {p : DefPath}
+    {fnInputs : List RigidTy} {fnOutput : RigidTy} {fnAbi : CallConv}
+    {typeArgs : List RigidTy} {traitImpls : List TraitImplEntry}
+    (h_c : isClosureFnPointerCoercion coercionKind = true)
+    (h : reifyCoercionSigCheck coercionKind callees p fnInputs fnOutput fnAbi typeArgs
+      traitImpls = true) :
+    checkClosureCalleeSig callees p fnInputs fnOutput fnAbi = .ok := by
+  unfold reifyCoercionSigCheck at h
+  rw [h_c] at h
+  revert h
+  cases checkClosureCalleeSig callees p fnInputs fnOutput fnAbi <;> simp
+
+/-- A successful function-item signature check. -/
+theorem checkCalleeSig_of_reifyCoercionSigCheck
+    {coercionKind : String} {callees : List CapturedMir} {p : DefPath}
+    {fnInputs : List RigidTy} {fnOutput : RigidTy} {fnAbi : CallConv}
+    {typeArgs : List RigidTy} {traitImpls : List TraitImplEntry}
+    (h_c : isClosureFnPointerCoercion coercionKind = false)
+    (h : reifyCoercionSigCheck coercionKind callees p fnInputs fnOutput fnAbi typeArgs
+      traitImpls = true) :
+    checkCalleeSig callees p fnInputs fnOutput fnAbi typeArgs traitImpls = true := by
+  unfold reifyCoercionSigCheck at h
+  rw [h_c] at h
+  exact h
+
+/--
 Memory-carrying one-statement judgment: executing `stmt` at `(bbIdx, stmtIdx)`
 of the active body `cur` from `(env, mem)` steps to `(env', mem')` with
 `post env' mem'`.
@@ -858,8 +901,8 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       extractReifyCoercionTarget? coercionKind
           (operandTy cur.localDecls cur.layouts op) =
         some (defPath, typeArgs) →
-      checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs
-          mem.traitImpls = true →
+      reifyCoercionSigCheck coercionKind mem.callees defPath fnInputs fnOutput fnAbi
+          typeArgs mem.traitImpls = true →
       internFnPtr mem defPath typeArgs (some targetTy.kind) = (allocId, mem₁) →
       assignLocalPlace env₁ mem₁.borrows dst
           (.ptr { allocId := allocId, offsetBytes := 0 } 8)
@@ -965,8 +1008,8 @@ theorem LiftStmtMem.reifyFnPointer {cur : CapturedMir} {bbIdx : BasicBlockIdx}
           (operandTy cur.localDecls cur.layouts op) =
         some (defPath, typeArgs))
     (h_sig :
-      checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs
-          mem.traitImpls = true)
+      reifyCoercionSigCheck coercionKind mem.callees defPath fnInputs fnOutput fnAbi
+          typeArgs mem.traitImpls = true)
     (h_intern :
       internFnPtr mem defPath typeArgs (some targetTy.kind) = (allocId, mem₁))
     (h_proj : dst.projection = [])
@@ -1226,7 +1269,12 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs,
             fnSig := fnEntry.fnSig, isIndirect := true }
           calleeBody (length argVals) = true →
-      post (.frame 0 0 (initLocals calleeBody argVals)
+      post (.frame 0 0
+        (initLocals calleeBody
+          (calleeEntryArgs
+            { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs,
+              fnSig := fnEntry.fnSig, isIndirect := true }
+            calleeBody argVals))
         (callFrameMem cur bbIdx stmtIdx env' mem destination targetBb unwind
           calleeBody)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
@@ -1334,8 +1382,17 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           calleeBody (length argVals) = true →
       hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
           (length mem.callStack) (length env) = false →
-      post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem (length env) calleeBody argVals)) →
+      post (.frame 0 0
+        (initLocals calleeBody
+          (calleeEntryArgs
+            { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs,
+              fnSig := fnEntry.fnSig, isIndirect := true }
+            calleeBody argVals))
+        (tailCallFrameMem mem (length env) calleeBody
+          (calleeEntryArgs
+            { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs,
+              fnSig := fnEntry.fnSig, isIndirect := true }
+            calleeBody argVals))) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
 
@@ -1645,8 +1702,8 @@ theorem evalRvalue_reifyFnPointer {env env₁ : PureEnv} {mem mem₁ : Memory}
     (h_safety : reifyCoercionSafetyCompatible coercionKind fnSafety = true)
     (h_target : extractReifyCoercionTarget? coercionKind
         (operandTy localDecls layouts op) = some (defPath, typeArgs))
-    (h_sig : checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs
-        mem.traitImpls = true)
+    (h_sig : reifyCoercionSigCheck coercionKind mem.callees defPath fnInputs fnOutput fnAbi
+        typeArgs mem.traitImpls = true)
     (h_intern : internFnPtr mem defPath typeArgs (some targetTy.kind) =
       (allocId, mem₁)) :
     evalRvalue env (.cast (.pointerCoercion coercionKind) op targetTy) mem
@@ -1657,9 +1714,17 @@ theorem evalRvalue_reifyFnPointer {env env₁ : PureEnv} {mem mem₁ : Memory}
   have h_snd : (internFnPtr mem defPath typeArgs (some targetTy.kind)).2 = mem₁ := by
     rw [h_intern]
   rw [← h_fst, ← h_snd]
-  rcases isZstFnItemValue_eq_true h_zst with rfl | rfl <;>
-    simp only [evalRvalue, evalReifyFnPointer, h_kind, h_unsafe, h_op, h_ty, h_abi,
-      h_safety, h_target, h_sig, Bool.not_false, Bool.true_and]
+  cases h_c : isClosureFnPointerCoercion coercionKind with
+  | true =>
+    have h_sig' := checkClosureCalleeSig_ok_of_reifyCoercionSigCheck h_c h_sig
+    rcases isZstFnItemValue_eq_true h_zst with rfl | rfl <;>
+      simp only [evalRvalue, evalReifyFnPointer, h_kind, h_unsafe, h_op, h_ty, h_abi,
+        h_safety, h_target, h_c, h_sig', Bool.not_false, Bool.true_and]
+  | false =>
+    have h_sig' := checkCalleeSig_of_reifyCoercionSigCheck h_c h_sig
+    rcases isZstFnItemValue_eq_true h_zst with rfl | rfl <;>
+      simp only [evalRvalue, evalReifyFnPointer, h_kind, h_unsafe, h_op, h_ty, h_abi,
+        h_safety, h_target, h_c, h_sig', Bool.not_false, Bool.true_and]
 
 /--
 Soundness of `LiftStmtMem`: the trusted `evalStmt` transition satisfies the
@@ -9386,10 +9451,19 @@ theorem evalReifyFnPointer_rvCS (locals : List LocalSlot) (op : Operand) (target
               | some pair =>
                 rcases pair with ⟨defPath, typeArgs⟩
                 dsimp only
-                cases checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs mem.traitImpls with
-                | false => exact rvCS_ub
+                cases isClosureFnPointerCoercion coercionKind with
                 | true =>
-                  exact rvCS_ok (internFnPtr_callStack mem defPath typeArgs (.some _))
+                  dsimp only
+                  cases checkClosureCalleeSig mem.callees defPath fnInputs fnOutput fnAbi with
+                  | ub => exact rvCS_ub
+                  | unsupported => exact rvCS_unsupported
+                  | ok => exact rvCS_ok (internFnPtr_callStack mem defPath typeArgs (.some _))
+                | false =>
+                  dsimp only
+                  cases checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs mem.traitImpls with
+                  | false => exact rvCS_ub
+                  | true =>
+                    exact rvCS_ok (internFnPtr_callStack mem defPath typeArgs (.some _))
           | _ => exact rvCS_ub
 
 private theorem evalFnPtrToPtr_rvCtxCS

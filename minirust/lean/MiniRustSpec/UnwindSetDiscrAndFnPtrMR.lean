@@ -2530,7 +2530,9 @@ theorem reify_and_closure_fnPointer_lockstep_M {M : Type} [Gen.Memory M] [Memory
       stringEq ck "UnsafeFnPointer" = false → evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
         (callStack := mem.callStack) = .ok zstVal locals' → callConvEq fnAbi .rustIntrinsic = false →
       reifyCoercionSafetyCompatible ck fnSaf = true → extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) →
-      checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true → mapIndex m.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok mrPtr →
+      (match isClosureFnPointerCoercion ck with
+        | true => checkClosureCalleeSig mem.callees dp fnIns fnOut fnAbi = .ok
+        | false => checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true) → mapIndex m.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok mrPtr →
       let (allocId, mem') := internFnPtr mem dp targs (some targetTy.kind)
       evalRvalue locals (.cast (.pointerCoercion ck) op targetTy) mem decls layouts = .ok (.ptr { allocId := allocId, offsetBytes := 0 } 8) locals' mem' ∧
       evalConstantM m (.FnPointer fnNm) = .ok (.Ptr (ThinPointer.widen mrPtr none)) ∧
@@ -2547,8 +2549,9 @@ theorem reify_and_closure_fnPointer_lockstep_M {M : Type} [Gen.Memory M] [Memory
     refine ⟨?_, ?_⟩
     · show evalReifyFnPointer locals op targetTy mem decls layouts ck = _
       unfold evalReifyFnPointer
+      cases hC : isClosureFnPointerCoercion ck <;> simp only [hC] at hSig <;>
       rcases hZst with rfl | rfl <;>
-        simp only [hReify, hNotUnsafe, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hSig]
+        simp only [hReify, hNotUnsafe, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hC, hSig]
     · unfold evalValueM evalConstantM
       simp only [hLookup, bind, Except.bind, pure, Except.pure, and_self]
   · intro hOp
@@ -2688,7 +2691,9 @@ theorem reify_unsafe_fnPtrToPtr_pipeline (locals locals1 locals2 locals3 : List 
     (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance) (mBM : Mach) (mTB : MachTB) (hZst : zstVal = .unit ∨ zstVal = .aggregate 0 [])
     (hReify : isReifyFnPointerCoercion ck = true) (hNotUnsafe : stringEq ck "UnsafeFnPointer" = false) (hSaf : reifyCoercionSafetyCompatible ck .safe = true)
     (hExt : extractReifyCoercionTarget? ck (operandTy decls layouts opReify) = some (dp, targs))
-    (hSig : checkCalleeSig mem.callees dp [.uint .u32] (.uint .u32) .rust targs mem.traitImpls = true)
+    (hSig : match isClosureFnPointerCoercion ck with
+      | true => checkClosureCalleeSig mem.callees dp [.uint .u32] (.uint .u32) .rust = .ok
+      | false => checkCalleeSig mem.callees dp [.uint .u32] (.uint .u32) .rust targs mem.traitImpls = true)
     (hFresh : findFnPtrEntry? mem.fnPtrs dp targs (some fnPtrSafeU32MirTy.kind) = none) (hNoB : lookupBorrow mem.borrows (nextFnPtrAllocId mem.fnPtrs) = none)
     (hMapBM : mapIndex mBM.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok { addr := addr, provenance := provBM })
     (hMapTB : mapIndex mTB.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok { addr := addr, provenance := provTB })
@@ -2752,7 +2757,10 @@ theorem reify_cached_and_fnFromPtrM_roundtrip {M : Type} [Gen.Memory M] [MemoryO
       ∀ zstVal, (zstVal = .unit ∨ zstVal = .aggregate 0 []) → isReifyFnPointerCoercion ck = true → stringEq ck "UnsafeFnPointer" = false →
         evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals (callStack := mem.callStack) = .ok zstVal locals' →
         callConvEq fnAbi .rustIntrinsic = false → reifyCoercionSafetyCompatible ck fnSaf = true →
-        extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) → checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true →
+        extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) →
+        (match isClosureFnPointerCoercion ck with
+          | true => checkClosureCalleeSig mem.callees dp fnIns fnOut fnAbi = .ok
+          | false => checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true) →
         evalRvalue locals (.cast (.pointerCoercion ck) op targetTy) mem decls layouts = .ok (.ptr { allocId := existing.allocId, offsetBytes := 0 } 8) locals' mem) ∧
     (m.fn_ptrs.entries.find? (fun x => decide (x.2 = mrPtr)) = some (fnNm, mrPtr) →
       mapIndex m.prog.functions fnNm "self.prog.functions[func_name]" = .ok calleeFn → fnFromPtrM m (.Ptr (ThinPointer.widen mrPtr none)) = .ok calleeFn) ∧
@@ -2764,8 +2772,9 @@ theorem reify_cached_and_fnFromPtrM_roundtrip {M : Type} [Gen.Memory M] [MemoryO
   · intro zstVal hZst hReify hNotU hOp hAbi hSaf hExt hSig
     have hInt : internFnPtr mem dp targs (some targetTy.kind) = (existing.allocId, mem) := by unfold internFnPtr; simp [hHit]
     show evalReifyFnPointer locals op targetTy mem decls layouts ck = _; unfold evalReifyFnPointer
+    cases hC : isClosureFnPointerCoercion ck <;> simp only [hC] at hSig <;>
     rcases hZst with rfl | rfl <;>
-      simp only [hReify, hNotU, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hSig, hInt]
+      simp only [hReify, hNotU, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hC, hSig, hInt]
   · intro hFind hFn; unfold fnFromPtrM
     have hF' : List.find? (fun x : Gen.FnName × ThinPointer (Gen.Memory.Provenance M) => decide (x.2 = mrPtr)) m.fn_ptrs.entries = some (fnNm, mrPtr) := hFind
     dsimp only [ThinPointer.widen, Option.isSome, Bool.false_eq_true, ↓reduceIte]; rw [hF']; exact hFn

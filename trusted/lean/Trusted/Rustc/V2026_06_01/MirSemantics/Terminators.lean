@@ -398,21 +398,136 @@ def resolveCallee? := resolveCallTarget
 
 /--
 Validate that a linked `calleeBody : CapturedMir` in `s.memory.callees` is
-compatible with `target` and `argCount` on an indirect function-pointer call.
-
-For direct calls (`target.isIndirect == false`), reduces definitionally to
-`true`.
-For indirect calls (`target.isIndirect == true`), checks that
+compatible with an indirect function-pointer `target` and `argCount` when
+`calleeBody` is not a closure body (`calleeOwnClosureShape? calleeBody = .none`):
 `calleeBody.fnAbi.conv != .rustIntrinsic`, `calleeBody.argCount == argCount`,
-and that `target.fnSig` (when present) matches `calleeBody.argCount`,
+and `target.fnSig` (when present) matches `calleeBody.argCount`,
 `calleeBody.fnAbi.conv`, and `calleeLocalDeclsCompatible` on
 `calleeBody.localDecls`.
 
-Reference (The Rust Reference, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.call>
 
-> "- Calling a function with the wrong call ABI or unwinding from a function
->   with the wrong unwind ABI."
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function
+> imported or transmuted as a "C" function or function pointer)."
+-/
+def checkFnPtrTargetCompatible
+    (target : ResolvedCallTarget)
+    (calleeBody : CapturedMir)
+    (argCount : Nat) :
+    Bool :=
+  Bool.and
+    (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+    (Bool.and
+      (Nat.beq calleeBody.argCount argCount)
+      (match target.fnSig with
+       | .none => true
+       | .some (.fnPtr sigInputs sigOut _ sigAbi) =>
+         Bool.and
+           (Nat.beq (length sigInputs) calleeBody.argCount)
+           (Bool.and
+             (callConvEq sigAbi calleeBody.fnAbi.conv)
+             (calleeLocalDeclsCompatible
+               target.typeArgs
+               calleeBody.localDecls
+               calleeBody.argCount
+               sigInputs
+               sigOut))
+       | .some _ => false))
+
+/--
+Validate that a linked non-capturing closure body `calleeBody`
+(`calleeOwnClosureShape? calleeBody = .some (.nonCapturing _)`) is compatible
+with an indirect function-pointer `target` called with `argCount` arguments:
+`calleeBody.fnAbi.conv = .rust`, `calleeBody.argCount = argCount + 1` (the
+environment `_1` precedes the `argCount` declared parameters), and
+`target.fnSig` (when present) is a Rust-ABI function pointer with `argCount`
+inputs whose parameter and return types match `_0 :: _1 :: params`
+(`closureCalleeDeclsCompatible`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.call>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function
+> imported or transmuted as a "C" function or function pointer)."
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-async, non-capturing closures can be coerced to function pointers
+> (e.g., `fn()`) with the matching signature."
+
+Reference (`compiler/rustc_target/src/spec/abi_map.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_target/src/spec/abi_map.rs#L94-L97>
+
+> "(ExternAbi::Rust | ExternAbi::RustCall, _) => CanonAbi::Rust,"
+
+Justification: a function pointer to a non-capturing closure has the closure's
+declared signature with the Rust ABI; calling it through a pointer of any
+other arity, ABI, or parameter/return types calls the closure "with the wrong
+call ABI".
+-/
+def checkClosureTargetCompatible
+    (target : ResolvedCallTarget)
+    (calleeBody : CapturedMir)
+    (argCount : Nat) :
+    Bool :=
+  Bool.and
+    (callConvEq calleeBody.fnAbi.conv .rust)
+    (Bool.and
+      (Nat.beq calleeBody.argCount (Nat.succ argCount))
+      (match target.fnSig with
+       | .none => true
+       | .some (.fnPtr sigInputs sigOut _ sigAbi) =>
+         Bool.and
+           (Nat.beq (length sigInputs) argCount)
+           (Bool.and
+             (callConvEq sigAbi .rust)
+             (closureCalleeDeclsCompatible
+               target.typeArgs
+               calleeBody.localDecls
+               argCount
+               sigInputs
+               sigOut))
+       | .some _ => false))
+
+/--
+Validate that a linked `calleeBody : CapturedMir` in `s.memory.callees` is
+compatible with `target` and `argCount`.
+
+For direct calls (`target.isIndirect == false`), reduces definitionally to
+`true`: a direct call names its callee, and a direct call to a closure body
+passes the environment `_1` explicitly.
+For indirect calls (`target.isIndirect == true`), first classifies the callee
+by its own environment parameter (`calleeOwnClosureShape? calleeBody`,
+independently of `argCount`):
+- `.none` (not a closure body): `checkFnPtrTargetCompatible`.
+- `.some (.nonCapturing _)`: `checkClosureTargetCompatible` (the caller
+  prepends the environment, see `calleeEntryArgs`).
+- `.some .capturing`: `false`; no function pointer to a capturing closure
+  exists, so the pointer was forged.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.call>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function
+> imported or transmuted as a "C" function or function pointer)."
+
+Reference (The Rust Reference 1.98.0, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html#r-type.fn-pointer.coercion>
+
+> "Function pointers can be created via a coercion from both function items
+> and non-capturing, non-async closures."
+
+Justification: an indirect call reaches a closure body only through a pointer
+reified from a non-capturing closure, whose ABI excludes the environment;
+every other way of reaching a closure body (including forged `(N + 1)`-argument
+pointers that pass `_1` explicitly, and pointers to capturing closures) calls
+it with the wrong call ABI.
 -/
 def checkCalleeTargetCompatible
     (target : ResolvedCallTarget)
@@ -422,24 +537,10 @@ def checkCalleeTargetCompatible
   match target.isIndirect with
   | false => true
   | true =>
-    Bool.and
-      (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
-      (Bool.and
-        (Nat.beq calleeBody.argCount argCount)
-        (match target.fnSig with
-         | .none => true
-         | .some (.fnPtr sigInputs sigOut _ sigAbi) =>
-           Bool.and
-             (Nat.beq (length sigInputs) calleeBody.argCount)
-             (Bool.and
-               (callConvEq sigAbi calleeBody.fnAbi.conv)
-               (calleeLocalDeclsCompatible
-                 target.typeArgs
-                 calleeBody.localDecls
-                 calleeBody.argCount
-                 sigInputs
-                 sigOut))
-         | .some _ => false))
+    match calleeOwnClosureShape? calleeBody with
+    | .none => checkFnPtrTargetCompatible target calleeBody argCount
+    | .some (.nonCapturing _) => checkClosureTargetCompatible target calleeBody argCount
+    | .some .capturing => false
 
 /--
 Direct calls (`isIndirect = false`) are unconditionally compatible with their
@@ -456,6 +557,70 @@ theorem checkCalleeTargetCompatible_direct
       { defPath := defPath, typeArgs := typeArgs, fnSig := fnSig, isIndirect := false }
       calleeBody
       argCount = true :=
+  rfl
+
+/--
+Argument values used to enter `calleeBody` for a call to `target` with
+evaluated arguments `argVals`: for an indirect call to a non-capturing closure
+body (`calleeOwnClosureShape? calleeBody = .some (.nonCapturing mode)`),
+the synthesized environment `synthesizeClosureEnvArg mode ptrBytes` (with
+`ptrBytes := layoutPointerBytes calleeBody.layouts`) followed by `argVals`;
+otherwise `argVals` unchanged. Direct calls reduce definitionally to
+`argVals`.
+
+Reference (`compiler/rustc_ty_utils/src/abi.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_ty_utils/src/abi.rs#L61-L73>
+
+> "tcx.mk_fn_sig(
+>     iter::once(env_ty).chain(sig.inputs().iter().cloned()),
+>     sig.output(),
+>     sig.fn_sig_kind,
+> )"
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-async, non-capturing closures can be coerced to function pointers
+> (e.g., `fn()`) with the matching signature."
+
+Justification: the closure body's parameters are the environment followed by
+the declared inputs, while the function pointer passes only the declared
+inputs. Modeling choice (not a Rust guarantee): the `ClosureOnceShim` that
+`rustc` interposes for `Fn` / `FnMut` closures is elided and its zero-sized
+environment borrow is replaced by `synthesizeClosureEnvArg`; for `FnOnce`
+bodies `rustc` calls the body directly with the empty closure value, which
+`synthesizeClosureEnvArg .byValue` reproduces.
+-/
+def calleeEntryArgs
+    (target : ResolvedCallTarget)
+    (calleeBody : CapturedMir)
+    (argVals : List Value) :
+    List Value :=
+  match target.isIndirect with
+  | false => argVals
+  | true =>
+    match calleeOwnClosureShape? calleeBody with
+    | .some (.nonCapturing mode) =>
+      synthesizeClosureEnvArg mode (layoutPointerBytes calleeBody.layouts) :: argVals
+    | .some .capturing => argVals
+    | .none => argVals
+
+/--
+Direct calls (`isIndirect = false`) enter their callee with the evaluated
+arguments unchanged.
+-/
+@[simp]
+theorem calleeEntryArgs_direct
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (fnSig : Option RigidTy)
+    (calleeBody : CapturedMir)
+    (argVals : List Value) :
+    calleeEntryArgs
+      { defPath := defPath, typeArgs := typeArgs, fnSig := fnSig, isIndirect := false }
+      calleeBody
+      argVals = argVals :=
   rfl
 
 /--
@@ -2668,12 +2833,48 @@ def unpackConstEvalSelectArgs?
   | _ => .none
 
 /--
+Resolve the closure type `RigidTy.closure defPath .nil` of a non-capturing
+`const_eval_select` runtime target to the callee `(defPath, .nil)`, unless the
+linked closure body `defPath` in `callees` is generic (`typeParamCount > 0`),
+in which case `.none`: the closure type carries no parent generic arguments,
+so its instantiation is unknown (see `constEvalSelectUnresolvedFailure`).
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Justification: `rustc-capture` lowers closure types with their captured-path
+types only (`ClosureArgs::upvar_tys`), so a non-capturing closure type names
+its body and no type arguments; parent generic arguments are dropped (a
+modeling choice), which is why a generic body cannot be instantiated here.
+-/
+@[reducible]
+def nonGenericClosureTarget?
+    (callees : List CapturedMir)
+    (defPath : DefPath) :
+    Option (DefPath × List RigidTy) :=
+  match findCallee? callees defPath with
+  | .none => .some (defPath, .nil)
+  | .some c =>
+    match c.typeParamCount with
+    | 0 => .some (defPath, .nil)
+    | .succ _ => .none
+
+/--
 Resolve the runtime target function `called_at_rt : G` (the 3rd argument) of
 `core::intrinsics::const_eval_select(arg, called_in_const, called_at_rt)`:
 - Direct constant function item on `rtFnOp` (`extractCalleeDefPath? rtFnOp`),
 - Zero-sized function item (`Value.unit` or `Value.aggregate 0 .nil`) whose
   `DefPath` is carried by `operandTy bodyLocalDecls bodyLayouts rtFnOp` or by
-  the 3rd type argument `G` in `target.typeArgs`, or
+  the 3rd type argument `G` in `target.typeArgs` (a function item
+  `RigidTy.fnDef defPath typeArgs`, or a non-capturing closure type
+  `RigidTy.closure defPath .nil`, which resolves to `(defPath, .nil)` unless
+  its linked body is generic, see `nonGenericClosureTarget?`; a closure type's
+  payload lists its captured-path types, never generic arguments, so a
+  capturing closure type `RigidTy.closure _ (_ :: _)` resolves to `.none`), or
 - Reified 8-byte function pointer (`Value.ptr ptrVal 8` at offset `0`, not
   aliasing any stack borrow in `s.memory.borrows`, and compatible with
   `unpackedArgCount`).
@@ -2688,6 +2889,17 @@ Reference (`library/core/src/intrinsics/mod.rs` at commit
 >     _called_in_const: F,
 >     _called_at_rt: G,
 > ) -> RET"
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Justification: `rustc-capture` lowers closure types with their captured-path
+types only (`ClosureArgs::upvar_tys`), so forwarding that list as callee type
+arguments would misread captures as generics.
 -/
 @[reducible]
 def resolveConstEvalSelectTarget?
@@ -2722,12 +2934,12 @@ def resolveConstEvalSelectTarget?
         | .none =>
           match get? target.typeArgs 2 with
           | .some (.fnDef defPath typeArgs) => .some (defPath, typeArgs)
-          | .some (.closure defPath typeArgs) => .some (defPath, typeArgs)
+          | .some (.closure defPath .nil) => nonGenericClosureTarget? s.memory.callees defPath
           | _ => .none
       | .none =>
         match get? target.typeArgs 2 with
         | .some (.fnDef defPath typeArgs) => .some (defPath, typeArgs)
-        | .some (.closure defPath typeArgs) => .some (defPath, typeArgs)
+        | .some (.closure defPath .nil) => nonGenericClosureTarget? s.memory.callees defPath
         | _ => .none
     match rtFnVal with
     | .unit =>
@@ -2776,6 +2988,125 @@ def resolveConstEvalSelectTarget?
                 isIndirect := true }
           | false => .none
     | _ => .none
+
+/--
+Failure reported when `resolveConstEvalSelectTarget?` cannot resolve the
+runtime target `called_at_rt` of a `const_eval_select` call: `.unsupported`
+when the target's type (`operandTy` of `rtFnOpOpt`, or the 3rd type argument
+`G` of `target.typeArgs`) is a closure type that the model cannot dispatch:
+- a capturing closure type `RigidTy.closure _ (_ :: _)` whose value `rtFnVal`
+  is a closure value (`.unit` or `.aggregate 0 _`), or
+- a non-capturing closure type `RigidTy.closure p .nil` whose linked body `p`
+  is generic (`typeParamCount > 0`);
+
+and `.ub` otherwise (as before closures were modeled).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Call traits and coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.intro>
+
+> "Closure types all implement `FnOnce`, indicating that they can be called
+> once by consuming ownership of the closure. Additionally, some closures
+> implement more specific call traits:"
+
+Justification: a closure runtime target is called through its own call
+method; a capturing closure needs its captured state, which the modeled
+dispatch (a call of the closure body with a synthesized environment) does not
+provide, and a generic closure body cannot be instantiated because closure
+types carry no parent generic arguments. Both are modeling gaps, so they are
+reported as `.unsupported`, never `.ub`.
+-/
+@[reducible]
+def constEvalSelectUnresolvedFailure
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (rtFnOpOpt : Option Operand)
+    (rtFnVal : Value) :
+    FailureKind :=
+  let rtTyOpt : Option RigidTy :=
+    match rtFnOpOpt with
+    | .some rtFnOp =>
+      match operandTy bodyLocalDecls bodyLayouts rtFnOp with
+      | .some ty => .some ty.kind
+      | .none => get? target.typeArgs 2
+    | .none => get? target.typeArgs 2
+  match rtTyOpt with
+  | .some (.closure _ (_ :: _)) =>
+    match rtFnVal with
+    | .unit => .unsupported
+    | .aggregate 0 _ => .unsupported
+    | _ => .ub
+  | .some (.closure p .nil) =>
+    match nonGenericClosureTarget? s.memory.callees p with
+    | .none => .unsupported
+    | .some _ => .ub
+  | _ => .ub
+
+/--
+Argument values used to enter the linked body `calleeBody` of a resolved
+`const_eval_select` runtime target with unpacked arguments `unpackedArgs`: for
+a non-capturing closure body (`calleeOwnClosureShape? calleeBody =
+.some (.nonCapturing mode)`), whether reached directly through the closure
+value or indirectly through a function pointer, the synthesized environment
+`synthesizeClosureEnvArg mode (layoutPointerBytes calleeBody.layouts)`
+followed by `unpackedArgs`; otherwise `unpackedArgs` unchanged.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Call traits and coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.intro>
+
+> "Closure types all implement `FnOnce`, indicating that they can be called
+> once by consuming ownership of the closure. Additionally, some closures
+> implement more specific call traits:"
+
+Reference (`compiler/rustc_ty_utils/src/abi.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_ty_utils/src/abi.rs#L61-L73>
+
+> "tcx.mk_fn_sig(
+>     iter::once(env_ty).chain(sig.inputs().iter().cloned()),
+>     sig.output(),
+>     sig.fn_sig_kind,
+> )"
+
+Justification: `const_eval_select` passes only the unpacked `ARG` tuple to
+`called_at_rt`, never the closure environment, while the closure body's
+parameters are the environment followed by the declared inputs. Modeling
+choice (not a Rust guarantee): as in `calleeEntryArgs`, the `FnOnce` call
+shim is elided and the zero-sized environment is synthesized. A capturing
+closure body receives no environment, so its arity check fails closed.
+-/
+def constEvalSelectEntryArgs
+    (calleeBody : CapturedMir)
+    (unpackedArgs : List Value) :
+    List Value :=
+  match calleeOwnClosureShape? calleeBody with
+  | .some (.nonCapturing mode) =>
+    synthesizeClosureEnvArg mode (layoutPointerBytes calleeBody.layouts) :: unpackedArgs
+  | .some .capturing => unpackedArgs
+  | .none => unpackedArgs
 
 /--
 Write an inline compiler intrinsic's return value `retVal` to `destination` and
@@ -6050,11 +6381,44 @@ intrinsic (`evalNonSelectIntrinsicCall`).
 Returns `.none` when `target.defPath` is not an inline-modeled intrinsic so
 `evalTerminator` falls through to `MirStepNode.extCall`.
 
+Closure runtime targets of `const_eval_select`: a linked non-capturing closure
+body is entered with its synthesized environment prepended
+(`constEvalSelectEntryArgs`) after `checkCalleeTargetCompatible` (which, for a
+function pointer, requires a closure-compatible signature and rejects
+capturing closure bodies); a capturing closure value or a generic closure body
+that cannot be resolved is `.unsupported` (`constEvalSelectUnresolvedFailure`).
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
 
 > "Compiler intrinsics."
+Indirect calls to closure bodies (`target.isIndirect = true`): the callee is
+classified by its own environment parameter (`checkCalleeTargetCompatible`);
+a non-capturing closure body is entered with the synthesized environment
+prepended (`calleeEntryArgs`), and a capturing closure body faults with `.ub`.
+Direct calls are unchanged.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.call>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function
+> imported or transmuted as a "C" function or function pointer)."
 -/
 @[reducible]
 def evalDirectRustIntrinsic?
@@ -6097,13 +6461,23 @@ def evalDirectRustIntrinsic?
                rtFnVal
                (length unpackedArgs)
            with
-           | .none => MirStepNode.fail .ub
+           | .none =>
+             MirStepNode.fail
+               (constEvalSelectUnresolvedFailure
+                 s
+                 target
+                 bodyLocalDecls
+                 bodyLayouts
+                 rtFnOpOpt
+                 rtFnVal)
            | .some rtTarget =>
              match lookupCallee s.memory.callees bodyLayouts rtTarget.defPath rtTarget.typeArgs s.memory.traitImpls with
              | .some calleeBody =>
                match
                  Bool.and
-                   (Nat.beq calleeBody.argCount (length unpackedArgs))
+                   (Nat.beq
+                     calleeBody.argCount
+                     (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
                    (Bool.and
                      (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
                      (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs)))
@@ -6121,7 +6495,7 @@ def evalDirectRustIntrinsic?
                        destination
                        targetBb
                        calleeBody
-                       unpackedArgs
+                       (constEvalSelectEntryArgs calleeBody unpackedArgs)
                        unwind)
              | .none =>
                match rtTarget.isIndirect with
@@ -6306,6 +6680,25 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 >     call_source: CallSource,
 >     fn_span: Span,
 > },"
+Indirect calls to closure bodies (`target.isIndirect = true`): the callee is
+classified by its own environment parameter (`checkCalleeTargetCompatible`);
+a non-capturing closure body is entered with the synthesized environment
+prepended (`calleeEntryArgs`), and a capturing closure body faults with `.ub`.
+Direct calls are unchanged.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.call>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function
+> imported or transmuted as a "C" function or function pointer)."
 -/
 def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operand) (destination : Place) (target : Option BasicBlockIdx) (unwind : UnwindAction) (currentBody : Option CapturedMir) : MirStepNode :=
   let bodyLocalDecls := bodyLocalDeclsOf currentBody
@@ -6356,7 +6749,7 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
                   destination
                   unwind
                   calleeBody
-                  argVals)
+                  (calleeEntryArgs resolvedTarget calleeBody argVals))
         | .none =>
           match resolvedTarget.isIndirect with
           | false =>
@@ -6411,7 +6804,7 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
                   destination
                   targetBb
                   calleeBody
-                  argVals
+                  (calleeEntryArgs resolvedTarget calleeBody argVals)
                   unwind)
         | .none =>
           match isDirectExactDivTarget resolvedTarget with
@@ -6481,6 +6874,25 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > /// Roughly speaking this is a chimera of [`Call`] and [`Return`], with some caveats.
 > ...
 > TailCall {"
+Indirect calls to closure bodies (`target.isIndirect = true`): the callee is
+classified by its own environment parameter (`checkCalleeTargetCompatible`);
+a non-capturing closure body is entered with the synthesized environment
+prepended (`calleeEntryArgs`), and a capturing closure body faults with `.ub`.
+Direct calls are unchanged.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.call>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function
+> imported or transmuted as a "C" function or function pointer)."
 -/
 def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Operand) (currentBody : Option CapturedMir) : MirStepNode :=
   let bodyLocalDecls := bodyLocalDeclsOf currentBody
@@ -6537,9 +6949,9 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
                   s.memory.callStack
                   memAfterTeardown
                   nLocals
-                  (length (initLocals calleeBody argVals)))
+                  (length (initLocals calleeBody (calleeEntryArgs target calleeBody argVals))))
                 calleeBody
-                argVals)
+                (calleeEntryArgs target calleeBody argVals))
         | .none =>
           MirStepNode.extCall
             { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
@@ -6984,7 +7396,7 @@ def evalTerminator
                   destination
                   targetBb
                   calleeBody
-                  argVals
+                  (calleeEntryArgs target calleeBody argVals)
                   unwind)
         | .none =>
           match isDirectExactDivTarget target with
@@ -7079,7 +7491,7 @@ def evalTerminator
                   destination
                   unwind
                   calleeBody
-                  argVals)
+                  (calleeEntryArgs target calleeBody argVals))
         | .none =>
           -- A diverging call to `core::intrinsics::const_eval_select` (one whose
           -- `called_at_rt` returns `!`) fails closed with `MirStepNode.unsupported`

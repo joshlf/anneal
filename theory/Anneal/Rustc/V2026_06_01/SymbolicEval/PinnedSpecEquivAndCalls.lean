@@ -2297,7 +2297,8 @@ theorem evalTerminatorSymTree_call_inlined_of_calleeCtx
     .leaf
       (MirStepNode.step
         (pushCalleeFrame
-          s currentBody locals' destination targetBb calleeBody argVals unwind)) := by
+          s currentBody locals' destination targetBb calleeBody
+          (calleeEntryArgs resolvedTarget calleeBody argVals) unwind)) := by
   dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
   rw [h_res]
   dsimp only []
@@ -2377,8 +2378,8 @@ theorem evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
                   (length s.memory.callStack)
                   (length s.frame.locals) }
             (length s.frame.locals)
-            (length (initLocals calleeBody argVals)))
-          calleeBody argVals)) := by
+            (length (initLocals calleeBody (calleeEntryArgs resolvedTarget calleeBody argVals))))
+          calleeBody (calleeEntryArgs resolvedTarget calleeBody argVals))) := by
   dsimp only [evalTerminatorSymTree, evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
   rw [h_res]
   dsimp only []
@@ -2488,7 +2489,8 @@ theorem evalTerminatorSymTree_diverging_call_inlined_of_calleeCtx
     .leaf
       (MirStepNode.step
         (pushDivergingCalleeFrame
-          s currentBody locals' destination unwind calleeBody argVals)) := by
+          s currentBody locals' destination unwind calleeBody
+          (calleeEntryArgs resolvedTarget calleeBody argVals))) := by
   dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
   rw [h_res]
   dsimp only []

@@ -173,6 +173,384 @@ mod tests {
         assert_eq!(model_fn.item_kind, CapturedItemKind::Model);
     }
 
+    /// Returns the manifest record for `def_id` in `manifest`, panicking with
+    /// the list of captured items if it is absent.
+    fn find_target<'m>(
+        manifest: &'m UnitCaptureManifest,
+        def_id: &str,
+    ) -> &'m crate::manifest::UnitTargetRecord {
+        manifest
+            .unit_targets
+            .iter()
+            .find(|t| t.target.def_id == def_id)
+            .unwrap_or_else(|| {
+                let ids: Vec<&str> = manifest
+                    .unit_targets
+                    .iter()
+                    .map(|t| t.target.def_id.as_str())
+                    .collect();
+                panic!("expected {def_id} in manifest, found {ids:?}")
+            })
+    }
+
+    /// Reads the emitted Lean module of `record` below `unit_dir`.
+    fn read_target_lean(unit_dir: &Path, record: &crate::manifest::UnitTargetRecord) -> String {
+        fs::read_to_string(unit_dir.join(&record.target.mir_module_path))
+            .expect("read emitted closure Lean module")
+    }
+
+    /// Captures `sample_rust` as crate `crate_name` with the difftest capture
+    /// flags (`-Zmir-opt-level=0 -C debug-assertions=off -C overflow-checks=on
+    /// --cfg anodized_embed_specs`) and an optional `ANNEAL_CAPTURE_FILTER`,
+    /// returning the unit directory and its parsed manifest.
+    fn capture_with_difftest_flags(
+        label: &str,
+        crate_name: &str,
+        edition: &str,
+        sample_rust: &str,
+        filter: Option<&str>,
+    ) -> (PathBuf, PathBuf, UnitCaptureManifest) {
+        let temp_root = unique_temp_dir(label);
+        let capture_dir = temp_root.join("capture");
+        let out_dir = temp_root.join("out");
+        fs::create_dir_all(&capture_dir).expect("create capture dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        let src_path = temp_root.join("lib.rs");
+        fs::write(&src_path, sample_rust.as_bytes()).expect("write sample rust source");
+        let args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            crate_name.to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            format!("--edition={edition}"),
+            "-Zmir-opt-level=0".to_owned(),
+            "-C".to_owned(),
+            "debug-assertions=off".to_owned(),
+            "-C".to_owned(),
+            "overflow-checks=on".to_owned(),
+            "--cfg".to_owned(),
+            "anodized_embed_specs".to_owned(),
+            "--out-dir".to_owned(),
+            out_dir.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+        let code = run_with_args_and_filter(
+            &args,
+            Some(capture_dir.clone()),
+            None,
+            filter.map(str::to_owned),
+        );
+        assert_eq!(code, 0, "closure capture of {crate_name} must succeed without ICE");
+        let unit_dir = capture_dir.join(crate_name);
+        let manifest_json = fs::read_to_string(unit_dir.join("UnitCaptureManifest.json"))
+            .expect("read UnitCaptureManifest.json");
+        let manifest =
+            UnitCaptureManifest::from_json_str(&manifest_json).expect("parse UnitCaptureManifest");
+        assert!(manifest.compilation_succeeded);
+        (temp_root, unit_dir, manifest)
+    }
+
+    #[test]
+    fn driver_captures_closure_bodies_as_callees_with_upvar_types_and_rust_abi() {
+        let sample_rust = r#"#![allow(dead_code)]
+
+pub fn id_mut<F: FnMut(u32) -> u32>(f: F) -> F {
+    f
+}
+
+pub fn id_once<F: FnOnce(u32) -> u32>(f: F) -> F {
+    f
+}
+
+pub fn kinds(x: u32) -> u32 {
+    let shared: fn(u32) -> u32 = |a: u32| a.wrapping_add(1);
+    let mut_closure = id_mut(|a: u32| a.wrapping_add(2));
+    let by_mut: fn(u32) -> u32 = mut_closure;
+    let once_closure = id_once(|a: u32| a.wrapping_add(3));
+    let by_once: fn(u32) -> u32 = once_closure;
+    let zero_arg: fn() -> u32 = || 7;
+    let two_arg: fn(u32, u32) -> u32 = |a: u32, b: u32| a ^ b;
+    let unsafe_ptr: unsafe fn(u32) -> u32 = |a: u32| a;
+    shared(x) ^ by_mut(x) ^ by_once(x) ^ zero_arg() ^ two_arg(x, x) ^ unsafe { unsafe_ptr(x) }
+}
+
+pub fn capturing(x: u32, y: u32) -> u32 {
+    let unit = ();
+    let add_y = move |a: u32| a.wrapping_add(y);
+    let zst = move |a: u32| {
+        let _keep = unit;
+        a
+    };
+    add_y(x) ^ zst(x)
+}
+
+pub fn generic_closure<T: Copy>(x: T) -> T {
+    let c = |y: T| y;
+    c(x)
+}
+
+pub fn call_generic(x: u32) -> u32 {
+    generic_closure::<u32>(x)
+}
+
+pub fn sum3(a: u32, b: u32, c: u32) -> u32 {
+    [a, b, c].iter().copied().sum::<u32>()
+}
+"#;
+        let (temp_root, unit_dir, manifest) = capture_with_difftest_flags(
+            "closure-callees",
+            "closure_demo",
+            "2024",
+            sample_rust,
+            None,
+        );
+
+        // No closure body is ever a top-level subject (no `Verify/` obligations).
+        for t in &manifest.unit_targets {
+            if t.target.def_id.contains("{closure#") {
+                assert_eq!(
+                    t.item_kind,
+                    CapturedItemKind::Callee,
+                    "closure {} must be captured as a callee",
+                    t.target.def_id
+                );
+                assert_eq!(t.associated_subject_def_id, None);
+            }
+        }
+
+        // Non-capturing `Fn` / `FnMut` / `FnOnce`, zero-arg, two-arg, and
+        // `ClosureFnPointer(Unsafe)` closures: empty upvars, no type
+        // parameters, Rust instance ABI that can unwind.
+        let receivers = [
+            ("closure_demo::kinds::{closure#0}", "RigidTy.ref Mutability.not"),
+            ("closure_demo::kinds::{closure#1}", "RigidTy.ref Mutability.mut"),
+            ("closure_demo::kinds::{closure#2}", "(RigidTy.closure"),
+            ("closure_demo::kinds::{closure#3}", "RigidTy.ref Mutability.not"),
+            ("closure_demo::kinds::{closure#4}", "RigidTy.ref Mutability.not"),
+            ("closure_demo::kinds::{closure#5}", "RigidTy.ref Mutability.not"),
+        ];
+        for (def_id, receiver) in receivers {
+            let rec = find_target(&manifest, def_id);
+            assert_eq!(rec.item_kind, CapturedItemKind::Callee);
+            let lean = read_target_lean(&unit_dir, rec);
+            let own_ty = format!("RigidTy.closure \"{def_id}\" List.nil");
+            assert!(lean.contains(&own_ty), "{def_id}: expected `{own_ty}` in\n{lean}");
+            assert!(
+                lean.contains(&format!("{receiver} ({own_ty})"))
+                    || lean.contains(&format!("{receiver} {own_ty}"))
+                    || (receiver == "(RigidTy.closure" && lean.contains(&format!("({own_ty})"))),
+                "{def_id}: expected receiver `{receiver}` of `{own_ty}` in\n{lean}"
+            );
+            assert!(
+                !lean.contains("typeParamCount :="),
+                "{def_id}: non-generic closure must report typeParamCount = 0\n{lean}"
+            );
+            assert!(
+                lean.contains("conv := CallConv.rust, canUnwind := true"),
+                "{def_id}: closure body ABI must be Rust / can unwind\n{lean}"
+            );
+            assert!(!lean.contains("rust-call"), "{def_id}: no rust-call ABI may leak\n{lean}");
+        }
+        let kinds_rec = find_target(&manifest, "closure_demo::kinds");
+        assert_eq!(kinds_rec.item_kind, CapturedItemKind::Subject);
+        let kinds_lean = read_target_lean(&unit_dir, kinds_rec);
+        assert!(kinds_lean.contains("ClosureFnPointer(Safe)"));
+        assert!(kinds_lean.contains("ClosureFnPointer(Unsafe)"));
+        assert!(
+            kinds_lean.contains("RigidTy.closure \"closure_demo::kinds::{closure#0}\" List.nil"),
+            "coercion operand type must carry empty upvars\n{kinds_lean}"
+        );
+
+        // Capturing closures: exact upvar types, including a zero-sized `()`.
+        let add_y = read_target_lean(
+            &unit_dir,
+            find_target(&manifest, "closure_demo::capturing::{closure#0}"),
+        );
+        assert!(
+            add_y.contains(
+                "RigidTy.closure \"closure_demo::capturing::{closure#0}\" \
+                 (List.cons (RigidTy.uint UintTy.u32) List.nil)"
+            ),
+            "u32 capture must lower to upvars [u32]\n{add_y}"
+        );
+        let zst = read_target_lean(
+            &unit_dir,
+            find_target(&manifest, "closure_demo::capturing::{closure#1}"),
+        );
+        assert!(
+            zst.contains(
+                "RigidTy.closure \"closure_demo::capturing::{closure#1}\" \
+                 (List.cons (RigidTy.tuple List.nil) List.nil)"
+            ),
+            "() capture must lower to upvars [()]\n{zst}"
+        );
+
+        // Generic closure: only the parent's type parameter survives.
+        let generic = read_target_lean(
+            &unit_dir,
+            find_target(&manifest, "closure_demo::generic_closure::{closure#0}"),
+        );
+        assert!(
+            generic.contains("typeParamCount := 1,"),
+            "generic closure must report the parent's single type parameter\n{generic}"
+        );
+        assert!(
+            generic.contains("RigidTy.closure \"closure_demo::generic_closure::{closure#0}\" List.nil"),
+            "generic non-capturing closure type must carry empty upvars\n{generic}"
+        );
+
+        // Non-local stdlib closures reached from `sum3` are captured as callees
+        // without the `item_name: no name` ICE.
+        let stdlib_closures: Vec<&str> = manifest
+            .unit_targets
+            .iter()
+            .map(|t| t.target.def_id.as_str())
+            .filter(|d| d.contains("{closure#") && !d.starts_with("closure_demo::"))
+            .collect();
+        assert!(
+            !stdlib_closures.is_empty(),
+            "expected non-local stdlib closures reachable from sum3 to be captured"
+        );
+
+        // No duplicate `def_path` or Lean module paths.
+        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut seen_paths = std::collections::BTreeSet::new();
+        for t in &manifest.unit_targets {
+            assert!(seen_ids.insert(t.target.def_id.clone()), "duplicate def_path {}", t.target.def_id);
+            assert!(
+                seen_paths.insert(t.target.mir_module_path.clone()),
+                "duplicate module path {}",
+                t.target.mir_module_path
+            );
+        }
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn driver_captures_referenced_local_closures_under_capture_filter() {
+        let sample_rust = r#"#![allow(dead_code)]
+
+pub fn keep_me(x: u32) -> u32 {
+    let f: fn(u32) -> u32 = |a: u32| a.wrapping_add(17);
+    f(x)
+}
+
+pub fn drop_me(x: u32) -> u32 {
+    let g: fn(u32) -> u32 = |a: u32| a ^ 17;
+    g(x)
+}
+"#;
+        let (temp_root, _unit_dir, manifest) = capture_with_difftest_flags(
+            "closure-filter",
+            "filter_demo",
+            "2024",
+            sample_rust,
+            Some("keep_me"),
+        );
+        let ids: Vec<(&str, CapturedItemKind)> = manifest
+            .unit_targets
+            .iter()
+            .map(|t| (t.target.def_id.as_str(), t.item_kind))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                // Non-local callee reached only through the closure body:
+                // the closure body joins the same callee worklist.
+                ("core::num::<impl u32>::wrapping_add", CapturedItemKind::Callee),
+                ("filter_demo::keep_me", CapturedItemKind::Subject),
+                ("filter_demo::keep_me::{closure#0}", CapturedItemKind::Callee),
+            ],
+            "ANNEAL_CAPTURE_FILTER must keep the referenced closure (and its \
+             callees) as callees only, and drop the unselected item's closure"
+        );
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn driver_captures_difftest_closure_fn_pointer_driver_and_both_closures() {
+        // Verbatim excerpt of a difftest reproducer (crate `miri_diff_corpus`,
+        // edition 2021) coercing two non-capturing closures to `fn` and
+        // `unsafe fn` pointers.
+        let sample_rust = r#"#![no_std]
+#![allow(dead_code, internal_features, unused_variables)]
+#![feature(core_intrinsics)]
+
+use core::intrinsics::wrapping_add;
+
+#[repr(C)]
+pub struct PairU32 {
+    pub a: u32,
+    pub b: u32,
+}
+
+#[inline(never)]
+fn __anneal_vt_driver_61873(__vt_seed: u32, __vt_bias: u32) -> u32 {
+    let __vt_cfp: fn(u32) -> u32 = |__vt_z: u32| wrapping_add(__vt_z, 17u32);
+    let __vt_cufp: unsafe fn(u32) -> u32 = __vt_cfp;
+    let __vt_cufp_direct: unsafe fn(u32) -> u32 = |__vt_z: u32| __vt_z ^ 17u32;
+    let __vt_raw_c: *const () = __vt_cfp as *const ();
+    let __vt_raw_d: *const () = __vt_cufp as *const ();
+    let __vt_first: u32 = __vt_cfp(__vt_seed);
+    let __vt_second: u32 = unsafe { __vt_cufp(__vt_first ^ __vt_bias) };
+    let __vt_third: u32 = unsafe { __vt_cufp_direct(__vt_second ^ 24u32) };
+    let __vt_same: u32 = if __vt_raw_c == __vt_raw_d { 1u32 } else { 0u32 };
+    __vt_first ^ (__vt_second << 1u32) ^ (__vt_third << 2u32) ^ __vt_same
+}
+
+pub fn pass_shared_temp_const_raw_ptr_read_and_freeze_retag__b22_c27() -> u32 {
+    let pair: PairU32 = PairU32 { a: 7u32, b: 35u32 };
+    let tmp: &PairU32 = &pair;
+    let raw: *const u32 = &raw const (*tmp).b;
+    let shared: &PairU32 = &*tmp;
+    let first: u32 = unsafe { *raw };
+    let again: u32 = unsafe { *raw };
+    let __tail___miri_vt_61873: u32 = first ^ shared.a ^ (again << 8u32);
+    let __miri_vt_61873: u32 = __anneal_vt_driver_61873(
+        (first as u32) & 0xFFFFu32,
+        24u32,
+    );
+    __tail___miri_vt_61873 ^ (__miri_vt_61873 as u32)
+}
+"#;
+        let (temp_root, unit_dir, manifest) = capture_with_difftest_flags(
+            "closure-difftest",
+            "miri_diff_corpus",
+            "2021",
+            sample_rust,
+            None,
+        );
+        let driver = find_target(&manifest, "miri_diff_corpus::__anneal_vt_driver_61873");
+        assert_eq!(driver.item_kind, CapturedItemKind::Subject);
+        let driver_lean = read_target_lean(&unit_dir, driver);
+        for idx in 0..2 {
+            let def_id = format!("miri_diff_corpus::__anneal_vt_driver_61873::{{closure#{idx}}}");
+            let rec = find_target(&manifest, &def_id);
+            assert_eq!(rec.item_kind, CapturedItemKind::Callee);
+            assert_eq!(
+                rec.lean_module_name,
+                format!("Mir.MiriDiffCorpus.__anneal_vt_driver_61873_closure_{idx}")
+            );
+            let own_ty = format!("RigidTy.closure \"{def_id}\" List.nil");
+            assert!(driver_lean.contains(&own_ty), "driver must coerce `{own_ty}`");
+            let lean = read_target_lean(&unit_dir, rec);
+            assert!(lean.contains("argCount := 2,"), "{def_id}: env + 1 argument\n{lean}");
+            assert!(
+                lean.contains(&format!("RigidTy.ref Mutability.not ({own_ty})")),
+                "{def_id}: `Fn` receiver `&{{closure}}`\n{lean}"
+            );
+            assert!(lean.contains("conv := CallConv.rust, canUnwind := true"));
+            assert!(!lean.contains("typeParamCount :="));
+        }
+        assert!(driver_lean.contains("ClosureFnPointer(Safe)"));
+        assert!(driver_lean.contains("ClosureFnPointer(Unsafe)"));
+        assert!(driver_lean.contains("UnsafeFnPointer"));
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
     #[test]
     fn driver_captures_unit_manifest_and_mir_lean_modules() {
         let temp_root = unique_temp_dir("integration");

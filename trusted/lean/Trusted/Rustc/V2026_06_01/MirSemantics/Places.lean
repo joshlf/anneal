@@ -14757,18 +14757,19 @@ non-capturing closure reification to a function pointer
 
 Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L11-L21>
 
 > "pub enum PointerCoercion {
->     /// Go from a fn-item type to a fn-pointer type.
->     ReifyFnPointer(Safety),
+>     /// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert an unsafe fn-item to a safe fn pointer.
+>     ReifyFnPointer(hir::Safety),
 >
 >     /// Go from a safe fn pointer to an unsafe fn pointer.
 >     UnsafeFnPointer,
 >
->     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
 >     /// It cannot convert a closure that requires unsafe.
->     ClosureFnPointer(Safety),"
+>     ClosureFnPointer(hir::Safety),"
 -/
 def isReifyFnPointerCoercion (coercionKind : String) : Bool :=
   Bool.or
@@ -14825,18 +14826,19 @@ reified into a function pointer via `coercionKind`:
 
 Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L11-L21>
 
 > "pub enum PointerCoercion {
->     /// Go from a fn-item type to a fn-pointer type.
->     ReifyFnPointer(Safety),
+>     /// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert an unsafe fn-item to a safe fn pointer.
+>     ReifyFnPointer(hir::Safety),
 >
 >     /// Go from a safe fn pointer to an unsafe fn pointer.
 >     UnsafeFnPointer,
 >
->     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
 >     /// It cannot convert a closure that requires unsafe.
->     ClosureFnPointer(Safety),"
+>     ClosureFnPointer(hir::Safety),"
 -/
 @[reducible]
 def extractReifyCoercionTarget?
@@ -15240,18 +15242,19 @@ require `fnSafety = .safe`; `"ReifyFnPointer(Unsafe)"` /
 
 Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L11-L21>
 
 > "pub enum PointerCoercion {
->     /// Go from a fn-item type to a fn-pointer type.
->     ReifyFnPointer(Safety),
+>     /// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert an unsafe fn-item to a safe fn pointer.
+>     ReifyFnPointer(hir::Safety),
 >
 >     /// Go from a safe fn pointer to an unsafe fn pointer.
 >     UnsafeFnPointer,
 >
->     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
 >     /// It cannot convert a closure that requires unsafe.
->     ClosureFnPointer(Safety),"
+>     ClosureFnPointer(hir::Safety),"
 -/
 def reifyCoercionSafetyCompatible
     (coercionKind : String)
@@ -15817,6 +15820,364 @@ def instantiateLocalDeclKinds
   | d :: rest =>
     { d with ty := { d.ty with kind := d.ty.kind.instantiate subst } } ::
       instantiateLocalDeclKinds subst rest
+
+/--
+Receiver mode of a closure body's environment parameter `_1`: a shared
+reference `&{closure}` (`.sharedRef`, an `Fn` body), a mutable reference
+`&mut {closure}` (`.mutRef`, an `FnMut` body), or the closure value itself
+(`.byValue`, an `FnOnce` body).
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Call traits and coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.intro>
+
+> "Closure types all implement `FnOnce`, indicating that they can be called
+> once by consuming ownership of the closure. Additionally, some closures
+> implement more specific call traits:"
+>
+> "A closure which does not move out of any captured variables implements
+> `FnMut`, indicating that it can be called by mutable reference."
+>
+> "A closure which does not mutate or move out of any captured variables
+> implements `Fn`, indicating that it can be called by shared reference."
+
+Reference (`library/core/src/ops/function.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, lines 77–79, 164–166, and 248–250):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L77-L79>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L164-L166>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L248-L250>
+
+> "/// Performs the call operation.
+> #[unstable(feature = "fn_traits", issue = "29625")]
+> extern "rust-call" fn call(&self, args: Args) -> Self::Output;"
+>
+> "/// Performs the call operation.
+> #[unstable(feature = "fn_traits", issue = "29625")]
+> extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;"
+>
+> "/// Performs the call operation.
+> #[unstable(feature = "fn_traits", issue = "29625")]
+> extern "rust-call" fn call_once(self, args: Args) -> Self::Output;"
+
+The three receivers `&self`, `&mut self`, and `self` are the three shapes a
+captured closure body gives its environment local `_1`. Which one a body uses
+is a compiler fact recorded in the captured `_1` declaration; the semantics
+reads it from there and never infers it.
+-/
+inductive ClosureEnvMode : Type where
+  /-- `_1 : &{closure}` (`Fn::call`). -/
+  | sharedRef : ClosureEnvMode
+  /-- `_1 : &mut {closure}` (`FnMut::call_mut`). -/
+  | mutRef : ClosureEnvMode
+  /-- `_1 : {closure}` (`FnOnce::call_once`). -/
+  | byValue : ClosureEnvMode
+
+/--
+Classification of a linked callee body by the type of its own environment
+parameter `_1` (`calleeOwnClosureShape?`):
+- `.nonCapturing mode`: `_1` is `mode` applied to the body's **own** closure
+  type `RigidTy.closure c.defPath .nil` (no captured paths).
+- `.capturing`: `_1` is a receiver of the body's own closure type with at
+  least one captured-path type (`RigidTy.closure c.defPath (_ :: _)`).
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Modeling choice: `rustc-capture` lowers a closure type to
+`RigidTy.closure defPath upvars` with `upvars = ClosureArgs::upvar_tys()`
+(see `trusted/rustc-capture/src/rustc_2026_06_01/mir_lower.rs`), so "captures
+nothing" is exactly `upvars = .nil`; a zero-sized capture such as `()` still
+yields a non-empty `upvars` list and is `.capturing`.
+-/
+inductive CalleeClosureShape : Type where
+  /-- Non-capturing closure body whose environment is received in `mode`. -/
+  | nonCapturing (mode : ClosureEnvMode) : CalleeClosureShape
+  /-- Closure body whose own closure type captures at least one path. -/
+  | capturing : CalleeClosureShape
+
+/--
+Map a closure receiver mode and the closure type's captured-path types
+`upvars` to a `CalleeClosureShape`: `.nil` is `.nonCapturing mode`, any
+non-empty list is `.capturing`.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment."
+-/
+@[reducible]
+def closureShapeOfUpvars (mode : ClosureEnvMode) : List RigidTy → CalleeClosureShape
+  | .nil => .nonCapturing mode
+  | _ :: _ => .capturing
+
+/--
+Classify the type `envTy` of a body's local `_1` against the body's own
+closure path `ownPath`: `&{closure ownPath upvars}`, `&mut {closure ownPath upvars}`,
+or `{closure ownPath upvars}` yield `closureShapeOfUpvars mode upvars`; every
+other type (including a closure type with a different path, e.g. a generic
+`fn` item instantiated at some closure type) yields `.none`.
+
+Reference (`library/core/src/ops/function.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, lines 77–79, 164–166, and 248–250):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L77-L79>
+
+> "extern "rust-call" fn call(&self, args: Args) -> Self::Output;"
+> "extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;"
+> "extern "rust-call" fn call_once(self, args: Args) -> Self::Output;"
+
+Justification: a closure body is the body of the closure type's own call
+method, so its receiver `_1` has that closure type (behind `&`, `&mut`, or by
+value). Comparing the path with the body's own `defPath` is a modeling choice
+that never matches a non-closure item: a `fn` item's own path is never the
+path of a closure type.
+-/
+def classifyOwnClosureEnvTy? (ownPath : DefPath) : RigidTy → Option CalleeClosureShape
+  | .ref .not (.closure p upvars) =>
+    match stringEq p ownPath with
+    | true => .some (closureShapeOfUpvars .sharedRef upvars)
+    | false => .none
+  | .ref .mut (.closure p upvars) =>
+    match stringEq p ownPath with
+    | true => .some (closureShapeOfUpvars .mutRef upvars)
+    | false => .none
+  | .closure p upvars =>
+    match stringEq p ownPath with
+    | true => .some (closureShapeOfUpvars .byValue upvars)
+    | false => .none
+  | _ => .none
+
+/--
+Three-way closure classification of a linked callee body `c` from its **own**
+environment parameter `_1` (`c.argCount ≥ 1` and the type of
+`c.localDecls[1]`), independently of any call site's argument count:
+`.some (.nonCapturing mode)`, `.some .capturing`, or `.none` (not a closure
+body).
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L235-L240>
+
+> "/// Declarations of locals.
+> ///
+> /// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries.
+> pub local_decls: IndexVec<Local, LocalDecl<'tcx>>,"
+
+Reference (`compiler/rustc_ty_utils/src/abi.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_ty_utils/src/abi.rs#L61-L73>
+
+> "ty::Closure(def_id, args) => {
+>     let sig = tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
+>     let env_ty = tcx.closure_env_ty(
+>         Ty::new_closure(tcx, def_id, args),
+>         args.as_closure().kind(),
+>         tcx.lifetimes.re_erased,
+>     );
+>
+>     tcx.mk_fn_sig(
+>         iter::once(env_ty).chain(sig.inputs().iter().cloned()),
+>         sig.output(),
+>         sig.fn_sig_kind,
+>     )"
+
+Justification: a closure body's first argument local `_1` is its environment
+(`env_ty`), followed by the closure's declared parameters. Compiler-behavior
+citations (MIR layout and closure instance signatures) are supplied compiler
+facts, not Reference guarantees.
+-/
+def calleeOwnClosureShape? (c : CapturedMir) : Option CalleeClosureShape :=
+  match c.argCount with
+  | 0 => .none
+  | .succ _ =>
+    match c.localDecls with
+    | _ :: envDecl :: _ => classifyOwnClosureEnvTy? c.defPath envDecl.ty.kind
+    | _ => .none
+
+/--
+Synthesize the environment argument `_1` passed to a non-capturing closure
+body entered through a function pointer: `.scalar ⟨1, ptrBytes⟩` (a non-null,
+1-aligned address without provenance) for `.sharedRef` / `.mutRef`, and the
+empty aggregate `.aggregate 0 .nil` for `.byValue`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.reference-box>
+
+> "A reference or `Box<T>` must be aligned and non-null, it cannot be
+> dangling, and it must point to a valid value (in case of dynamically sized
+> types, using the actual dynamic type of the pointee as determined by the
+> metadata). Note that the last point (about pointing to a valid value)
+> remains a subject of some debate."
+
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.dangling.zero-size>
+
+> "If the size is 0, then the pointer is trivially never “dangling” (even if
+> it is a null pointer)."
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment."
+
+Justification: a non-capturing closure type has no fields (zero size,
+alignment 1), so address `1` is aligned, non-null, and never dangling for it,
+and the empty aggregate is its only value.
+
+Modeling choices (not Rust guarantees): `rustc` reaches a closure body from a
+`ClosureFnPointer` through a `ClosureOnceShim` that borrows its own
+zero-sized local; that shim frame is elided here, and the borrowed address is
+replaced by the provenance-free address `1`. The substitution is unobservable
+for well-formed non-capturing bodies, which never access the fields of `_1`;
+a forged body that dereferences `_1` faults, because the scalar carries no
+provenance.
+-/
+def synthesizeClosureEnvArg (mode : ClosureEnvMode) (ptrBytes : Nat) : Value :=
+  match mode with
+  | .sharedRef => .scalar ⟨1, ptrBytes⟩
+  | .mutRef => .scalar ⟨1, ptrBytes⟩
+  | .byValue => .aggregate 0 .nil
+
+/--
+Validate a closure body's local declarations against a function-pointer
+signature `(fnInputs, fnOutput)`: `localDecls = _0 :: _1 :: params`, where the
+environment local `_1` is skipped, `_0` matches `fnOutput`, and the first
+`argCount` declarations of `params` match `fnInputs`
+(`calleeLocalDeclsCompatible` on `_0 :: params`). Fails closed when `_1` is
+absent.
+
+Reference (The Rust Reference 1.98.0, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html#r-type.fn-pointer.coercion>
+
+> "Function pointers can be created via a coercion from both function items
+> and non-capturing, non-async closures."
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-async, non-capturing closures can be coerced to function pointers
+> (e.g., `fn()`) with the matching signature."
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L235-L240>
+
+> "/// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries."
+
+Justification: "the matching signature" relates the pointer's parameters to
+the closure's declared parameters, which follow the environment local `_1`.
+-/
+def closureCalleeDeclsCompatible
+    (typeArgs : List RigidTy)
+    (localDecls : List LocalDecl)
+    (argCount : Nat)
+    (fnInputs : List RigidTy)
+    (fnOutput : RigidTy) :
+    Bool :=
+  match localDecls with
+  | retDecl :: _ :: paramDecls =>
+    calleeLocalDeclsCompatible typeArgs (retDecl :: paramDecls) argCount fnInputs fnOutput
+  | _ => false
+
+/--
+Outcome of validating a `ClosureFnPointer` coercion target against its
+linked closure body (`checkClosureCalleeSig`).
+-/
+inductive ClosureCoercionCheck : Type where
+  /-- The coercion is well formed; intern the function pointer. -/
+  | ok : ClosureCoercionCheck
+  /-- The coercion is ill formed (undefined behavior). -/
+  | ub : ClosureCoercionCheck
+  /-- The coercion depends on information the captured MIR does not carry. -/
+  | unsupported : ClosureCoercionCheck
+
+/--
+Validate a `PointerCoercion::ClosureFnPointer` reification of the closure
+`p` to the function-pointer type `fn(fnInputs) -> fnOutput` with ABI `fnAbi`:
+1. `fnAbi` must be `CallConv.rust`, otherwise `.ub`.
+2. If no closure body `p` is linked in `callees`, `.ok` (as for unlinked
+   function items in `checkCalleeSig`).
+3. A linked body with `typeParamCount > 0` is `.unsupported`: the closure type
+   carries no parent generic arguments, so the instantiation is unknown.
+4. A linked body must be a non-capturing closure body of `p`
+   (`calleeOwnClosureShape? = .some (.nonCapturing _)`) with
+   `fnAbi.conv = .rust`, `argCount = length fnInputs + 1`, and declarations
+   `_0 :: _1 :: params` matching `(fnInputs, fnOutput)`
+   (`closureCalleeDeclsCompatible`); a capturing or non-closure body, or any
+   mismatch, is `.ub`.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L19-L21>
+
+> "/// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
+> /// It cannot convert a closure that requires unsafe.
+> ClosureFnPointer(hir::Safety),"
+
+Reference (`compiler/rustc_target/src/spec/abi_map.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_target/src/spec/abi_map.rs#L94-L97>
+
+> "(ExternAbi::Rust | ExternAbi::RustCall, _) => CanonAbi::Rust,"
+
+Justification: the Reference admits the coercion only for non-capturing
+closures, to `fn` pointers (the Rust ABI) "with the matching signature"; the
+closure body's own ABI is the Rust calling convention (the `rust-call`
+closure signature canonicalizes to `CanonAbi::Rust`). Step 2 keeps the existing
+leniency for unlinked bodies, which are only reached through external calls.
+Step 3 is a modeling choice that fails closed with `.unsupported`, never
+`.ub`, because a generic closure is well formed in Rust. The `Safety`
+compatibility of the coercion tag is checked by the caller
+(`reifyCoercionSafetyCompatible`).
+-/
+def checkClosureCalleeSig
+    (callees : List CapturedMir)
+    (p : DefPath)
+    (fnInputs : List RigidTy)
+    (fnOutput : RigidTy)
+    (fnAbi : CallConv) :
+    ClosureCoercionCheck :=
+  match callConvEq fnAbi .rust with
+  | false => .ub
+  | true =>
+    match findCallee? callees p with
+    | .none => .ok
+    | .some c =>
+      match c.typeParamCount with
+      | .succ _ => .unsupported
+      | 0 =>
+        match calleeOwnClosureShape? c with
+        | .some (.nonCapturing _) =>
+          match
+            Bool.and
+              (callConvEq c.fnAbi.conv .rust)
+              (Bool.and
+                (Nat.beq c.argCount (Nat.succ (length fnInputs)))
+                (closureCalleeDeclsCompatible
+                  .nil
+                  c.localDecls
+                  (length fnInputs)
+                  fnInputs
+                  fnOutput))
+          with
+          | true => .ok
+          | false => .ub
+        | .some .capturing => .ub
+        | .none => .ub
 
 /--
 Validate that a linked callee `p` in `callees` or `extraTraitImpls` (when
@@ -16495,12 +16856,38 @@ Evaluate `CastKind.pointerCoercion` for function-pointer reification
 (`"Unsize"`), or pointer-preserving coercions (`"MutToConstPointer"`,
 `"ArrayToPointer"`).
 
-Reference (The Rust Reference, "Function pointer types"):
-<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+Reference (The Rust Reference 1.98.0, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html#r-type.fn-pointer.coercion>
 
-> "Function pointer types, written using the `fn` keyword, refer to a function
-> whose identity is not necessarily known at compile-time. They can be created
-> via a coercion from both function items and non-capturing closures."
+> "Function pointers can be created via a coercion from both function items
+> and non-capturing, non-async closures."
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L19-L21>
+
+> "/// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
+> /// It cannot convert a closure that requires unsafe.
+> ClosureFnPointer(hir::Safety),"
+
+Function-item reification (`"ReifyFnPointer*"`) validates a linked callee with
+`checkCalleeSig`. Closure reification (`"ClosureFnPointer*"`) requires a
+zero-sized operand of a non-capturing closure type
+(`extractReifyCoercionTarget?`, `RigidTy.closure defPath .nil`) and validates a
+linked closure body with `checkClosureCalleeSig`: a non-Rust target ABI, a
+capturing or non-closure body, or a signature mismatch against the body's
+`_0 :: _1 :: params` declarations is `.ub`; a generic closure body
+(`typeParamCount > 0`, whose parent generic arguments the closure type does
+not carry) is `.unsupported`. The coercion tag's `Safety` is checked by
+`reifyCoercionSafetyCompatible` for both kinds, and both intern the pointer
+through the unchanged `internFnPtr`.
 -/
 def evalReifyFnPointer
     (locals : List LocalSlot)
@@ -16624,25 +17011,39 @@ def evalReifyFnPointer
                   (operandTy localDecls layouts op)
               with
               | .some (defPath, typeArgs) =>
-                match
-                  checkCalleeSig
-                    mem.callees
-                    defPath
-                    fnInputs
-                    fnOutput
-                    fnAbi
-                    typeArgs
-                    mem.traitImpls
-                with
-                | false => .ub
+                match isClosureFnPointerCoercion coercionKind with
                 | true =>
-                  let (allocId, mem') :=
-                    internFnPtr mem defPath typeArgs (.some targetTy.kind)
-                  let p : ProvenancePtr := {
-                    allocId := allocId
-                    offsetBytes := 0
-                  }
-                  .ok (.ptr p 8) locals' mem'
+                  match checkClosureCalleeSig mem.callees defPath fnInputs fnOutput fnAbi with
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                  | .ok =>
+                    let (allocId, mem') :=
+                      internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                    let p : ProvenancePtr := {
+                      allocId := allocId
+                      offsetBytes := 0
+                    }
+                    .ok (.ptr p 8) locals' mem'
+                | false =>
+                  match
+                    checkCalleeSig
+                      mem.callees
+                      defPath
+                      fnInputs
+                      fnOutput
+                      fnAbi
+                      typeArgs
+                      mem.traitImpls
+                  with
+                  | false => .ub
+                  | true =>
+                    let (allocId, mem') :=
+                      internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                    let p : ProvenancePtr := {
+                      allocId := allocId
+                      offsetBytes := 0
+                    }
+                    .ok (.ptr p 8) locals' mem'
               | .none => .ub
           | _ => .ub
 

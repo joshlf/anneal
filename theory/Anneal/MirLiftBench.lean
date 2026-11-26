@@ -945,24 +945,28 @@ def liftPolyIdU32FnDefTy : Ty :=
 
 /--
 Non-capturing closure body `|x: u32| -> u32 { lift_poly_id(x) }`
-(`ff33::closure_id`), which stores the function item `lift_poly_id::<u32>` in a
-local `_2` and tail-calls `move _2(move _1)` via
+(`ff33::closure_id`, an `Fn` body whose environment parameter is
+`_1 : &{closure}`), which stores the function item `lift_poly_id::<u32>` in a
+local `_3` and tail-calls `move _3(move _2)` via
 `LiftTerminator.tailCallFnItem`.
 -/
 def liftClosureIdMir : CapturedMir :=
-  mkMirBody "ff33::closure_id" 1
+  mkMirBody "ff33::closure_id" 2
     [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" }
+    , { mutability := .mut
+        ty := { kind := .ref .not liftClosureIdTy.kind, layoutIdx := liftU32FnPtrTy.layoutIdx }
+        debugName := none }
     , { mutability := .not, ty := liftU32Ty, debugName := some "x" }
     , { mutability := .mut, ty := liftPolyIdU32FnDefTy, debugName := some "id_item" } ]
     [ { statements :=
-          [ { kind := .storageLive 2, span := "live id_item" }
-          , { kind := .assign { local_ := 2, projection := [] }
+          [ { kind := .storageLive 3, span := "live id_item" }
+          , { kind := .assign { local_ := 3, projection := [] }
                 (.use (.constant { ty := liftPolyIdU32FnDefTy, val := .zeroSized }))
               span := "assign id_item" } ]
         terminator :=
           { kind := .tailCall
-              (.move { local_ := 2, projection := [] })
-              [.move { local_ := 1, projection := [] }]
+              (.move { local_ := 3, projection := [] })
+              [.move { local_ := 2, projection := [] }]
             span := "tailcall id_item(x)" }
         isCleanup := false } ]
 
@@ -1100,15 +1104,15 @@ theorem liftClosureAndTraitCaller_lift :
   apply LiftTerminator.callIndirect (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
-  -- `closure_id` bb0[0]: `StorageLive(_2)`.
+  -- `closure_id` bb0[0]: `StorageLive(_3)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
-  -- `closure_id` bb0[1]: `_2 = const FnDef("ff33::lift_poly_id", [u32])`.
+  -- `closure_id` bb0[1]: `_3 = const FnDef("ff33::lift_poly_id", [u32])`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
-  -- `closure_id` bb0 terminator: `tailCall move _2(move _1)`
+  -- `closure_id` bb0 terminator: `tailCall move _3(move _2)`
   -- (`tailCallFnItem`).
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.tailCallFnItem (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)

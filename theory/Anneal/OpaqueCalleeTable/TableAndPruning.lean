@@ -1622,9 +1622,9 @@ def tailCallWith (resolve : CalleeResolver) (s : MachineState) (func : Operand) 
                   s.memory.callStack
                   memAfterTeardown
                   nLocals
-                  (length (initLocals calleeBody argVals)))
+                  (length (initLocals calleeBody (calleeEntryArgs target calleeBody argVals))))
                 calleeBody
-                argVals)
+                (calleeEntryArgs target calleeBody argVals))
         | .none =>
           MirStepNode.extCall
             { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
@@ -1700,7 +1700,7 @@ def stepTerminatorWith (prune : Bool) (resolve : CalleeResolver) (s : MachineSta
                   destination
                   targetBb
                   calleeBody
-                  argVals
+                  (calleeEntryArgs target calleeBody argVals)
                   unwind)
         | .none =>
           match isDirectExactDivTarget target with
@@ -1795,14 +1795,14 @@ def stepTerminatorWith (prune : Bool) (resolve : CalleeResolver) (s : MachineSta
                   destination
                   unwind
                   calleeBody
-                  argVals)
+                  (calleeEntryArgs target calleeBody argVals))
         | .none =>
           -- A diverging call to `core::intrinsics::const_eval_select` (one whose
-          -- `called_at_rt` returns `!`) is not unpacked here; like any other
-          -- unlinked callee it becomes an external call, which constrains
-          -- nothing. Captured MIR never contains one, because `rustc` replaces
-          -- every `const_eval_select` call with a direct call to `called_at_rt`
-          -- before `optimized_mir` (`withConstEvalSelectIntrinsicTypeArgs`).
+          -- `called_at_rt` returns `!`) fails closed with `MirStepNode.unsupported`
+          -- inside `evalDivergingRustIntrinsic?`, while diverging calls to
+          -- returning intrinsics turn normal returns into `MirStepNode.fail .ub`.
+          -- Captured MIR never contains `const_eval_select`, because `rustc`
+          -- replaces it with a direct call to `called_at_rt` before `optimized_mir`.
           match target.isIndirect with
           | false =>
             match isUnreachableCallTarget target.defPath with
@@ -1818,9 +1818,22 @@ def stepTerminatorWith (prune : Bool) (resolve : CalleeResolver) (s : MachineSta
                   | .halted out => MirStepNode.retOutcome out
                   | .faulted fk => MirStepNode.fail fk
                 | false =>
-                  MirStepNode.extCall
-                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                    (resumeExternalDivergingCall s locals' unwind)
+                  match
+                    evalDivergingRustIntrinsic?
+                      s
+                      target
+                      bodyLocalDecls
+                      bodyLayouts
+                      argOps
+                      argVals
+                      locals'
+                      destination
+                  with
+                  | .some stepNode => stepNode
+                  | .none =>
+                    MirStepNode.extCall
+                      { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                      (resumeExternalDivergingCall s locals' unwind)
           | true =>
             MirStepNode.extCall
               { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }

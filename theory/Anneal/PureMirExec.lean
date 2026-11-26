@@ -2850,12 +2850,15 @@ def evalConstEvalSelectThree
       resolveConstEvalSelectTarget? s target bodyLocalDecls bodyLayouts
         (selectRtFnOpOpt argOps) rtFnVal (length unpackedArgs)
     with
-    | .none => MirStepNode.fail .ub
+    | .none =>
+      MirStepNode.fail
+        (constEvalSelectUnresolvedFailure s target bodyLocalDecls bodyLayouts
+          (selectRtFnOpOpt argOps) rtFnVal)
     | .some rtTarget =>
       match lookupCallee s.memory.callees bodyLayouts rtTarget.defPath rtTarget.typeArgs s.memory.traitImpls with
       | .some calleeBody =>
         match
-          Bool.and (Nat.beq calleeBody.argCount (length unpackedArgs))
+          Bool.and (Nat.beq calleeBody.argCount (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
             (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
               (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs)))
         with
@@ -2865,7 +2868,8 @@ def evalConstEvalSelectThree
           | .none => MirStepNode.unsupported
           | .some callerBody =>
             MirStepNode.step
-              (pushCalleeFrame s callerBody locals' destination targetBb calleeBody unpackedArgs unwind)
+              (pushCalleeFrame s callerBody locals' destination targetBb calleeBody
+                (constEvalSelectEntryArgs calleeBody unpackedArgs) unwind)
       | .none =>
         match rtTarget.isIndirect with
         | true =>
@@ -3080,14 +3084,14 @@ theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
             | some subCallee =>
               dsimp only
               cases
-                Bool.and (Nat.beq subCallee.argCount (length unpackedArgs))
+                Bool.and (Nat.beq subCallee.argCount (length (constEvalSelectEntryArgs subCallee unpackedArgs)))
                   (Bool.and (Bool.not (callConvEq subCallee.fnAbi.conv .rustIntrinsic))
                     (checkCalleeTargetCompatible rtTarget subCallee (length unpackedArgs))) with
               | false => intro h_st; exact False.elim h_st
               | true =>
                 intro _
                 refine ⟨pushCalleeFrame ms curBody locals' destination targetBb
-                  subCallee unpackedArgs unwind, rfl, ?_⟩
+                  subCallee (constEvalSelectEntryArgs subCallee unpackedArgs) unwind, rfl, ?_⟩
                 rcases baseStack with _ | ⟨_, _⟩ <;> rfl
             | none =>
               dsimp only
@@ -6110,13 +6114,14 @@ private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
             cases lookupCallee ms.memory.callees curBody.layouts rtTarget.defPath rtTarget.typeArgs ms.memory.traitImpls with
             | some subCallee =>
               dsimp only
-              cases Bool.and (Nat.beq subCallee.argCount (length unpackedArgs))
+              cases Bool.and (Nat.beq subCallee.argCount (length (constEvalSelectEntryArgs subCallee unpackedArgs)))
                   (Bool.and (Bool.not (callConvEq subCallee.fnAbi.conv .rustIntrinsic))
                     (checkCalleeTargetCompatible rtTarget subCallee (length unpackedArgs))) with
               | false => intro h_st; exact False.elim h_st
               | true =>
                 intro _
-                exact ⟨pushCalleeFrame ms curBody locals' destination targetBb subCallee unpackedArgs unwind, rfl, h_ne⟩
+                exact ⟨pushCalleeFrame ms curBody locals' destination targetBb subCallee
+                  (constEvalSelectEntryArgs subCallee unpackedArgs) unwind, rfl, h_ne⟩
             | none =>
               dsimp only
               cases rtTarget.isIndirect with
@@ -7077,7 +7082,7 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                       | true =>
                         rw [h_ck] at h_st h_step_body
                         dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_st h_step_body
-                        have h_st' : wpMirExecNoCallSym f' calleeBody (.running (enterTailCalleeFrame ms.memory subCallee aVals)) (mirNormalPost P) :=
+                        have h_st' : wpMirExecNoCallSym f' calleeBody (.running (enterTailCalleeFrame ms.memory subCallee (calleeEntryArgs rTarget subCallee aVals))) (mirNormalPost P) :=
                           Eq.mp (by
                             rcases ms with ⟨msFr, ⟨_, _, bor, _, _, _, cs, _, _, _, _, _, _, _⟩⟩
                             dsimp only at h_ms_bor ⊢; subst h_ms_bor
@@ -7085,12 +7090,12 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                             | cons _ _ => rfl
                             | nil =>
                               dsimp only [tailCalleeEntryMemory, relocateRootCallerReferents, hasAnyRootCallerReferent]
-                              cases Nat.blt (length msFr.locals) (length (initLocals subCallee aVals)) <;> rfl) h_st
+                              cases Nat.blt (length msFr.locals) (length (initLocals subCallee (calleeEntryArgs rTarget subCallee aVals))) <;> rfl) h_st
                         have h_step_body' :
                             stepMirFn outerBody (MachineState.pushBaseStack calleeBody baseStack ms) =
                               Trusted.ITree.ITreeF.tau
                                 (MirExecState.pushBaseStack calleeBody baseStack
-                                  (.running (enterTailCalleeFrame ms.memory subCallee aVals))) :=
+                                  (.running (enterTailCalleeFrame ms.memory subCallee (calleeEntryArgs rTarget subCallee aVals)))) :=
                           h_step_body.trans (by
                             rcases ms with ⟨_, ⟨_, _, bor, _, _, _, cs, ac, _, _, _, _, _, ruc⟩⟩
                             dsimp only [baseStack, enterTailCalleeFrame, MachineState.pushBaseStack,
@@ -7099,7 +7104,7 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                             subst h_ms_bor
                             cases cs <;> cases ruc <;> cases subCallee.fnAbi.canUnwind <;> cases ac <;> rfl)
                         exact liftTau
-                          (st_un := .running (enterTailCalleeFrame ms.memory subCallee aVals))
+                          (st_un := .running (enterTailCalleeFrame ms.memory subCallee (calleeEntryArgs rTarget subCallee aVals)))
                           h_step_body' h_st' (fun _ _ h => by cases h)
               | call func argOps cDest cTarget cUnwind =>
                 cases cTarget with
@@ -7136,7 +7141,7 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                           dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_st h_step_body
                           exact liftTau
                             (st_un := .running (pushDivergingCalleeFrame ms curBody cLocals'
-                              cDest cUnwind subCallee aVals))
+                              cDest cUnwind subCallee (calleeEntryArgs rTarget subCallee aVals)))
                             h_step_body h_st (fun _ _ h => by cases h)
                       | none =>
                         rw [h_lk] at h_st h_step_body
@@ -7225,7 +7230,7 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                           dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_st h_step_body
                           exact liftTau
                             (st_un := .running (pushCalleeFrame ms curBody cLocals'
-                              cDest cTargetBb subCallee aVals cUnwind))
+                              cDest cTargetBb subCallee (calleeEntryArgs rTarget subCallee aVals) cUnwind))
                             h_step_body h_st (fun _ _ h => by cases h)
                       | none =>
                         rw [h_lk] at h_st h_step_body
@@ -7677,7 +7682,7 @@ theorem extCallAbortsProp_evalDirectRustIntrinsic?
                 rtTarget.typeArgs s.memory.traitImpls with
             | some calleeBody =>
               dsimp only
-              cases Bool.and (Nat.beq calleeBody.argCount (length unpackedArgs))
+              cases Bool.and (Nat.beq calleeBody.argCount (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
                   (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
                     (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) with
               | false => trivial
@@ -8641,7 +8646,7 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                               have h_len0 : length ([] : List SavedCallerFrame) = 0 := rfl
                               rw [h_len0]
                               dsimp only
-                              cases Nat.blt (length msFr.locals) (length (initLocals nextCallee avs)) <;>
+                              cases Nat.blt (length msFr.locals) (length (initLocals nextCallee (calleeEntryArgs target nextCallee avs))) <;>
                                 (try dsimp only) <;>
                                 cases hasAnyRootCallerReferent (disableFrameBorrows bor 0 (length msFr.locals)) (length msFr.locals) <;>
                                 (try dsimp only) <;>
@@ -8678,8 +8683,8 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                           rw [h_ok] at h_st h_step_body
                           rw [h_step_body]
                           have h_eq_dc :
-                              pushDivergingCalleeFrame (MachineState.pushBaseStack body [] ms) curBody cLocals' cDest cUnw nextCallee avs =
-                                MachineState.pushBaseStack body [] (pushDivergingCalleeFrame ms curBody cLocals' cDest cUnw nextCallee avs) := by
+                              pushDivergingCalleeFrame (MachineState.pushBaseStack body [] ms) curBody cLocals' cDest cUnw nextCallee (calleeEntryArgs target nextCallee avs) =
+                                MachineState.pushBaseStack body [] (pushDivergingCalleeFrame ms curBody cLocals' cDest cUnw nextCallee (calleeEntryArgs target nextCallee avs)) := by
                             simp [pushDivergingCalleeFrame, MachineState.pushBaseStack, Memory.pushBaseStack]
                           dsimp only
                           rw [h_eq_dc]
@@ -8757,8 +8762,8 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                           rw [h_ok] at h_st h_step_body
                           rw [h_step_body]
                           have h_eq_pc :
-                              pushCalleeFrame (MachineState.pushBaseStack body [] ms) curBody cLocals' cDest cTargetBb nextCallee avs cUnw =
-                                MachineState.pushBaseStack body [] (pushCalleeFrame ms curBody cLocals' cDest cTargetBb nextCallee avs cUnw) := by
+                              pushCalleeFrame (MachineState.pushBaseStack body [] ms) curBody cLocals' cDest cTargetBb nextCallee (calleeEntryArgs target nextCallee avs) cUnw =
+                                MachineState.pushBaseStack body [] (pushCalleeFrame ms curBody cLocals' cDest cTargetBb nextCallee (calleeEntryArgs target nextCallee avs) cUnw) := by
                             simp [pushCalleeFrame, MachineState.pushBaseStack, Memory.pushBaseStack]
                           dsimp only
                           rw [h_eq_pc]
@@ -9409,7 +9414,9 @@ theorem MirWpConverges.call_summary
             { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
               memory := memResumed }
             post)
-    (h_ceil : s.memory.rootUnwindCeiling = true := by rfl) :
+    (h_ceil : s.memory.rootUnwindCeiling = true := by rfl)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     MirWpConverges outerBody s post := by
   let _ := h_depth
   let curBody := s.memory.activeCallee.getD outerBody
@@ -9444,7 +9451,7 @@ theorem MirWpConverges.call_summary
       dsimp only
       rw [h_lookup]
       dsimp only
-      rw [h_compat]
+      rw [h_compat, h_entry]
   have h_callee_nc := mirNoCallWpConverges_of_mirWpConverges_normal h_callee_summary
   have h_bor_out :
       ∀ retVal memOut,
@@ -9572,7 +9579,9 @@ theorem MirWpConverges.tailCall_summary
             activeCallee := none
             rootUnwindCeiling := Bool.and s.memory.rootUnwindCeiling calleeBody.fnAbi.canUnwind } memOut →
         calleePost retVal →
-        post (.normal (retVal, memOut))) :
+        post (.normal (retVal, memOut)))
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     MirWpConverges outerBody s post := by
   let _ := h_depth
   let curBody := s.memory.activeCallee.getD outerBody
@@ -9611,7 +9620,7 @@ theorem MirWpConverges.tailCall_summary
       dsimp only
       rw [h_lookup]
       dsimp only
-      rw [h_compat]
+      rw [h_compat, h_entry]
       rcases s with ⟨sFrame, sMem⟩
       cases sMem
       dsimp only [memPopped] at h_stack ⊢
@@ -9779,7 +9788,9 @@ theorem MirWpConverges.tailCall_nested_summary
                 locals := updatedLocals }
               memory := memResumed }
             post)
-    (h_ceil : s.memory.rootUnwindCeiling = true := by rfl) :
+    (h_ceil : s.memory.rootUnwindCeiling = true := by rfl)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     MirWpConverges outerBody s post := by
   let _ := h_depth
   let curBody := s.memory.activeCallee.getD outerBody
@@ -9814,7 +9825,7 @@ theorem MirWpConverges.tailCall_nested_summary
       dsimp only
       rw [h_lookup]
       dsimp only
-      rw [h_compat]
+      rw [h_compat, h_entry]
       rcases s with ⟨sFrame, sMem⟩
       cases sMem
       dsimp only at h_borrows h_stack ⊢
@@ -9980,7 +9991,9 @@ theorem PureMirConvergesWithCallees.call_summary
             body.localDecls body.layouts = .ok updatedEnv ∧
           PureMirConvergesWithCallees body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl) :
+    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     PureMirConvergesWithCallees body callees ps post traitImpls := by
   let _ := h_depth
   let m0 := pureCalleeMemory callees traitImpls
@@ -10021,7 +10034,7 @@ theorem PureMirConvergesWithCallees.call_summary
       dsimp only
       rw [h_lookup]
       dsimp only
-      rw [h_compat]
+      rw [h_compat, h_entry]
   have h_init_eq :
       initMachineStateWithMemory calleeBody argVals
         { s0.memory with callStack := [], activeCallee := none } =
@@ -10137,11 +10150,13 @@ theorem PureMirConverges.call_summary
             body.localDecls body.layouts = .ok updatedEnv ∧
           PureMirConvergesWithCallees body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl) :
+    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     PureMirConvergesWithCallees body callees ps post traitImpls :=
   PureMirConvergesWithCallees.call_summary
     h_phase h_bb h_end h_term h_depth h_resolve h_args h_lookup h_compat
-    h_callee_summary h_after h_no_cast
+    h_callee_summary h_after h_no_cast h_entry
 
 /--
 Leaf specialization of `PureMirConverges.call_summary` accepting an `FF-2.1`
@@ -10198,12 +10213,14 @@ theorem PureMirConverges.call_leaf_summary
             body.localDecls body.layouts = .ok updatedEnv ∧
           PureMirConvergesWithCallees body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl) :
+    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     PureMirConvergesWithCallees body callees ps post traitImpls :=
   PureMirConverges.call_summary
     h_phase h_bb h_end h_term h_depth h_resolve h_args h_lookup h_compat
     (PureMirConvergesWithCallees.of_pureMirConverges h_callee_pure h_callee_summary)
-    h_after h_no_cast
+    h_after h_no_cast h_entry
 
 /--
 Compositional 1-step `tailCall` summary rule on `PureState`
@@ -10255,7 +10272,9 @@ theorem PureMirConvergesWithCallees.tailCall_summary
         (initPureState calleeBody argVals) calleePost traitImpls)
     (h_imp : ∀ retVal : Value, calleePost retVal → post retVal)
     (h_unwind : calleeBody.fnAbi.canUnwind = true := by rfl)
-    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl) :
+    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     PureMirConvergesWithCallees body callees ps post traitImpls := by
   let _ := h_depth
   let m0 := pureCalleeMemory callees traitImpls
@@ -10295,7 +10314,7 @@ theorem PureMirConvergesWithCallees.tailCall_summary
       dsimp only
       rw [h_lookup]
       dsimp only
-      rw [h_compat]
+      rw [h_compat, h_entry]
       dsimp only [tailCalleeEntryMemory, relocateRootCallerReferents, hasAnyRootCallerReferent]
       cases Nat.blt (length ps.env) (length (initLocals calleeBody argVals)) <;> rfl
   rcases h_callee_summary with ⟨fuel_c, h_wp_c⟩
@@ -10388,11 +10407,13 @@ theorem PureMirConverges.tailCall_summary
         (initPureState calleeBody argVals) calleePost traitImpls)
     (h_imp : ∀ retVal : Value, calleePost retVal → post retVal)
     (h_unwind : calleeBody.fnAbi.canUnwind = true := by rfl)
-    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl) :
+    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     PureMirConvergesWithCallees body callees ps post traitImpls :=
   PureMirConvergesWithCallees.tailCall_summary
     h_phase h_bb h_end h_term h_depth h_resolve h_args h_lookup h_compat
-    h_callee_summary h_imp h_unwind h_no_cast
+    h_callee_summary h_imp h_unwind h_no_cast h_entry
 
 /--
 Leaf specialization of `PureMirConverges.tailCall_summary` accepting an `FF-2.1`
@@ -10664,7 +10685,9 @@ theorem PureMirConverges.tailCall_leaf_summary
     (h_callee_summary :
       PureMirConverges calleeBody (initPureState calleeBody argVals) calleePost)
     (h_imp : ∀ retVal : Value, calleePost retVal → post retVal)
-    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl) :
+    (h_no_cast : operandsHaveLeadingOpaqueCastMove argOps = false := by rfl)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     PureMirConvergesWithCallees body callees ps post traitImpls := by
   let _ := h_depth
   let m0 := pureCalleeMemory callees traitImpls
@@ -10694,7 +10717,7 @@ theorem PureMirConverges.tailCall_leaf_summary
         pureCalleeMemory_activeProtectors]
       rw [h_resolve]; dsimp only
       rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ h_no_cast, h_args]
-      dsimp only; rw [h_lookup]; dsimp only; rw [h_compat]
+      dsimp only; rw [h_lookup]; dsimp only; rw [h_compat, h_entry]
       dsimp only [tailCalleeEntryMemory, relocateRootCallerReferents, hasAnyRootCallerReferent]
       cases Nat.blt (length ps.env) (length (initLocals calleeBody argVals)) <;> rfl
   rcases h_callee_summary with ⟨fuel_c, h_wp_sym⟩
@@ -11927,7 +11950,7 @@ def evalCallTerminatorUnified
             | .none => MirStepNode.unsupported
             | .some callerBody =>
               MirStepNode.step
-                (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind)
+                (pushCalleeFrame s callerBody locals' destination targetBb calleeBody (calleeEntryArgs target calleeBody argVals) unwind)
         | .none =>
           match checkCalleeTargetCompatible target calleeBody (length argVals) with
           | false => MirStepNode.fail .ub
@@ -11936,7 +11959,7 @@ def evalCallTerminatorUnified
             | .none => MirStepNode.unsupported
             | .some callerBody =>
               MirStepNode.step
-                (pushDivergingCalleeFrame s callerBody locals' destination unwind calleeBody argVals)
+                (pushDivergingCalleeFrame s callerBody locals' destination unwind calleeBody (calleeEntryArgs target calleeBody argVals))
       | .none =>
         match targetOpt with
         | .some targetBb =>
@@ -12682,7 +12705,7 @@ theorem stepMirFn_pureCallee_step_and_replaceRoot
                         | isFalse _ =>
                           rw [h_dec] at h_ext
                           exact False.elim (Bool.false_ne_true h_ext)
-                      dsimp only [checkCalleeTargetCompatible]
+                      dsimp only [checkCalleeTargetCompatible, calleeEntryArgs]
                       have h_stk_narrow :
                           ∀ f' ∈ narrowCallStackForTailCallee s.memory.callStack calleeBody.fnAbi.canUnwind,
                             f'.callerProtector = none ∧
@@ -13512,7 +13535,7 @@ private theorem evalDirectRustIntrinsic?_ne_ret_normal
                 rtTarget.typeArgs s.memory.traitImpls with
             | some calleeBody =>
               dsimp only
-              cases Bool.and (Nat.beq calleeBody.argCount (length unpackedArgs))
+              cases Bool.and (Nat.beq calleeBody.argCount (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
                   (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
                     (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) with
               | false => rintro ⟨⟩
@@ -23841,7 +23864,9 @@ theorem PureMirModularConverges.call_summary_resolved
         ∃ updatedEnv : List SlotState,
           writePureReturnDestination envAfterArgs destination retVal body.localDecls body.layouts = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   let _ := h_depth
   intro m hm h_ruc
@@ -23880,7 +23905,7 @@ theorem PureMirModularConverges.call_summary_resolved
       dsimp only
       rw [hm.1, hm.2.1, h_lookup]
       dsimp only
-      rw [h_compat]
+      rw [h_compat, h_entry]
   change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) (.running s0)) _ _
   rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
   dsimp only [stepMirState]
@@ -23955,7 +23980,7 @@ theorem PureMirModularConverges.call_const_eval_select_summary
       lookupCallee callees body.layouts rtTarget.defPath rtTarget.typeArgs traitImpls =
         some calleeBody)
     (h_compat_rt :
-      Bool.and (Nat.beq calleeBody.argCount (length unpackedArgs))
+      Bool.and (Nat.beq calleeBody.argCount (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
         (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
           (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) = true := by rfl)
     (h_callee_pure :
@@ -23969,7 +23994,9 @@ theorem PureMirModularConverges.call_const_eval_select_summary
         ∃ updatedEnv : List SlotState,
           writePureReturnDestination envAfterArgs destination retVal body.localDecls body.layouts = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_entry :
+      constEvalSelectEntryArgs calleeBody unpackedArgs = unpackedArgs := by rfl) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   let _ := h_depth
   intro m hm h_ruc
@@ -24019,7 +24046,7 @@ theorem PureMirModularConverges.call_const_eval_select_summary
       dsimp only
       rw [hm.1, hm.2.1, h_lookup_rt]
       dsimp only
-      rw [h_compat_rt]
+      rw [h_compat_rt, h_entry]
   change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) (.running s0)) _ _
   rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
   dsimp only [stepMirState]
@@ -24179,7 +24206,9 @@ theorem PureMirModularConverges.tailCall_summary_resolved
     (h_callee_summary :
       PureMirConvergesWithCallees calleeBody callees
         (initPureState calleeBody argVals) calleePost traitImpls)
-    (h_imp : ∀ retVal : Value, calleePost retVal → post retVal) :
+    (h_imp : ∀ retVal : Value, calleePost retVal → post retVal)
+    (h_entry :
+      calleeEntryArgs resolvedTarget calleeBody argVals = argVals := by rfl) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   let _ := h_depth
   intro m hm h_ruc
@@ -24224,7 +24253,7 @@ theorem PureMirModularConverges.tailCall_summary_resolved
         rw [hm.1, hm.2.1, h_lookup]
       rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, h_lk_m]
       dsimp only
-      rw [h_compat]
+      rw [h_compat, h_entry]
   rcases h_callee_summary with ⟨fuel_c, h_wp_c⟩
   have h_mtd_fields :
       mTd.callees = callees ∧ mTd.traitImpls = traitImpls ∧

@@ -36,7 +36,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics (tyByteSize tyByteSizeAndAlignAux
   unresolvedLayoutIdx decodeUnionBytesWithCountOpt finalizeUnionFieldsWithRawOverlayOpt
   forceValueListOpt abstractByteListEq abstractByteEq replicateBool readProjectedForLocal
   readProjectedValueUnionAware unionNeedsConsistencyCheck placeTouchesUnion tyProjTouchesUnion
-  validateValueForTy? placeTyResolved resolveProjectedTyResolved)
+  validateValueForTy? placeTyResolved resolveProjectedTyResolved checkClosureCalleeSig)
 open Anneal.BitValidity
 open Anneal.MirFuelFree
 
@@ -5198,8 +5198,6 @@ def CastOutcome.toTrustedResult (pw : PtrWidth) (dst : ScalarTy) (locals : List 
   | .ub => .ub
   | .unsupported => .unsupported
 
-/-- On every non-pointer integral/`bool`/`char` type, `decodeTypedValueFromBytes` rejects
-provenance-carrying bytes and otherwise coincides with the layout-free `decodeValueFromBytes`. -/
 /-- `decodeTypedValueFromBytes` at any non-pointer scalar descriptor rejects every
 provenance-carrying byte image unconditionally (including on 32-bit targets). -/
 theorem trusted_decodeTypedValueFromBytes_toTrustedRigidTy_of_not_isPtr_of_prov
@@ -5214,12 +5212,14 @@ theorem trusted_decodeTypedValueFromBytes_toTrustedRigidTy_of_not_isPtr_of_prov
   | uint w => cases w <;> (unfold decodeTypedValueFromBytes; dsimp only; rw [h_prov])
   | rawPtr | refPtr => contradiction
 
+/-- On every non-pointer integral/`bool`/`char` type, `decodeTypedValueFromBytes` rejects
+provenance-carrying bytes and otherwise coincides with the layout-free `decodeValueFromBytes`. -/
 theorem trusted_decodeTypedValueFromBytes_toTrustedRigidTy_of_not_isPtr
     (fuel : Nat) (layouts : LayoutTable) (m : Mutability) (pointee : RigidTy) (ty : ScalarTy)
     (lIdx : Nat) (bs : List AbstractByte) (h_np : ty.isPtr = false)
     (hNot32 : (ty = .uint .wsize ∨ ty = .int .wsize) →
-      Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+      Nat.beq (layoutPointerBytes layouts) 4 = false := by
+        intro h; rcases h with h | h <;> nomatch h) :
     decodeTypedValueFromBytes (fuel + 1) layouts
         { kind := ty.toTrustedRigidTy m pointee, layoutIdx := lIdx } bs =
       (match abstractBytesHaveProv bs with
@@ -5591,8 +5591,8 @@ theorem trusted_evalByteCast_scalar_transmute_correspondence
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
-      Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+      Nat.beq (layoutPointerBytes layouts) 4 = false := by
+        intro h; rcases h with h | h <;> nomatch h) :
     evalByteCast locals op { kind := dst.toTrustedRigidTy m2 pt2, layoutIdx := dstLIdx }
         mem localDecls layouts =
       CastOutcome.toTrustedResult .bits64 dst locals' mem
@@ -5648,8 +5648,8 @@ theorem trusted_evalByteCast_int_uint_roundtrip
       .ok (.scalar ⟨bits, w.byteSize .bits64⟩) locals₂')
     (h_ty₂ : operandTy localDecls layouts op₂ =
       .some { kind := .uint w.toTrustedUintTy, layoutIdx := uintLIdx })
-    (hNot32 : w = .wsize → Nat.beq (layoutPointerBytes layouts) 4 = false :=
-      fun h => by nomatch h) :
+    (hNot32 : w = .wsize → Nat.beq (layoutPointerBytes layouts) 4 = false := by
+      intro h; nomatch h) :
     evalByteCast locals₁ op₁ { kind := .uint w.toTrustedUintTy, layoutIdx := uintLIdx }
         mem localDecls layouts = ok (.scalar ⟨bits, w.byteSize .bits64⟩) locals₁' mem ∧
     evalByteCast locals₂ op₂ { kind := .int w.toTrustedIntTy, layoutIdx := intLIdx }
@@ -5659,12 +5659,12 @@ theorem trusted_evalByteCast_int_uint_roundtrip
   · rw [trusted_evalByteCast_scalar_transmute_correspondence .rejectPtrToInt (.int w) (.uint w)
       .not .not .bool .bool bits [] locals₁ locals₁' op₁ mem localDecls layouts intLIdx uintLIdx
       rfl rfl ⟨h_bits, trivial⟩ h_op₁ h_ty₁
-      (fun h => by rcases h with h | h; · cases h; exact hNot32 rfl; · nomatch h), h_rt.1]
+      (fun h => by rcases h with h | h <;> cases h <;> exact hNot32 rfl), h_rt.1]
     rfl
   · rw [trusted_evalByteCast_scalar_transmute_correspondence .rejectPtrToInt (.uint w) (.int w)
       .not .not .bool .bool bits [] locals₂ locals₂' op₂ mem localDecls layouts uintLIdx intLIdx
       rfl rfl ⟨h_bits, trivial⟩ h_op₂ h_ty₂
-      (fun h => by rcases h with h | h; · nomatch h; · cases h; exact hNot32 rfl), h_rt.2]
+      (fun h => by rcases h with h | h <;> cases h <;> exact hNot32 rfl), h_rt.2]
     rfl
 
 /-- `Trusted` encoding of a thin pointer at the image of any pointer descriptor. -/
@@ -10176,8 +10176,8 @@ theorem trusted_evalByteCast_provFree_ptr_to_int_transmute_correspondence
     (h_ty : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
-      Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+      Nat.beq (layoutPointerBytes layouts) 4 = false := by
+        intro h; rcases h with h | h <;> nomatch h) :
     evalTransmuteSameSize .bits64 .allowPtrToIntStripProvenance src dst
         (.ptr { allocId := 0, offsetBytes := bits } none) exposed =
       .ok (.scalar bits) exposed ∧
@@ -10503,8 +10503,8 @@ theorem evalTransmuteSameSize_ok_of_checkIntoFromBytes
     (hSz : src.sizeBytes pw = dst.sizeBytes pw)
     (hValid : src.validBits pw bits)
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
-      Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+      Nat.beq (layoutPointerBytes layouts) 4 = false := by
+        intro h; rcases h with h | h <;> nomatch h) :
     evalTransmuteSameSize pw policy src dst (.scalar bits) exposed =
       .ok (.scalar bits) exposed ∧
     CastVal.WellTyped pw dst (.scalar bits) ∧
@@ -12469,8 +12469,8 @@ theorem evalByteCast_adt_primitive_to_scalar_ok
     (hTy : operandTy localDecls layouts op =
       some { kind := .adt defPath args, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
-      Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+      Nat.beq (layoutPointerBytes layouts) 4 = false := by
+        intro h; rcases h with h | h <;> nomatch h) :
     let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
     encodeValueToBytes defaultCodecFuel layouts { kind := .adt defPath args, layoutIdx := srcLIdx }
         (.scalar ⟨bits, dst.sizeBytes .bits64⟩) =
@@ -12562,8 +12562,8 @@ theorem evalByteCast_adt_multiple_enum_explicit_to_scalar_ok
     (hTy : operandTy localDecls layouts op =
       some { kind := .adt defPath args, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
-      Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+      Nat.beq (layoutPointerBytes layouts) 4 = false := by
+        intro h; rcases h with h | h <;> nomatch h) :
     let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
     evalByteCast locals op dstTy mem localDecls layouts =
       ok (.scalar ⟨discrBits, dst.sizeBytes .bits64⟩) locals' mem ∧
@@ -12648,8 +12648,8 @@ theorem evalByteCast_adt_multiple_enum_to_scalar_ok
       some { kind := .adt defPath args, layoutIdx := srcLIdx })
     (hNoDiscr : l.variantDiscriminants = [] := by rfl)
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
-      Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+      Nat.beq (layoutPointerBytes layouts) 4 = false := by
+        intro h; rcases h with h | h <;> nomatch h) :
     let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
     evalByteCast locals op dstTy mem localDecls layouts =
       ok (.scalar ⟨varIdx, dst.sizeBytes .bits64⟩) locals' mem :=
@@ -12730,8 +12730,8 @@ theorem evalByteCast_projected_adt_primitive_to_scalar_ok
     (hTyRes : operandTyResolved localDecls layouts op =
       some { kind := .adt defPath args, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
-      Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+      Nat.beq (layoutPointerBytes layouts) 4 = false := by
+        intro h; rcases h with h | h <;> nomatch h) :
     let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
     resolveByteCastSrcTyAndSize localDecls layouts op { kind := .adt defPath args, layoutIdx := 0 } =
       some ({ kind := .adt defPath args, layoutIdx := srcLIdx }, dst.sizeBytes .bits64) ∧
@@ -17002,14 +17002,24 @@ def reifyFnPointerStep (locals : List LocalSlot) (op : Operand) (targetTy : Ty) 
         | true =>
           match extractReifyCoercionTarget? coercionKind (operandTy localDecls layouts op) with
           | .some (defPath, typeArgs) =>
-            match
-              checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs mem.traitImpls
-            with
-            | false => .ub
+            match isClosureFnPointerCoercion coercionKind with
             | true =>
-              let (allocId, mem') := internFnPtr mem defPath typeArgs (.some targetTy.kind)
-              let p : ProvenancePtr := { allocId := allocId, offsetBytes := 0 }
-              .ok (.ptr p 8) locals' mem'
+              match checkClosureCalleeSig mem.callees defPath fnInputs fnOutput fnAbi with
+              | .ub => .ub
+              | .unsupported => .unsupported
+              | .ok =>
+                let (allocId, mem') := internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                let p : ProvenancePtr := { allocId := allocId, offsetBytes := 0 }
+                .ok (.ptr p 8) locals' mem'
+            | false =>
+              match
+                checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs mem.traitImpls
+              with
+              | false => .ub
+              | true =>
+                let (allocId, mem') := internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                let p : ProvenancePtr := { allocId := allocId, offsetBytes := 0 }
+                .ok (.ptr p 8) locals' mem'
           | .none => .ub
       | _ => .ub
 
@@ -17049,7 +17059,7 @@ theorem evalRvalue_cast_reifyFnPointer_eq_of_isReify
 
 /-- Positive reification step: a ZST operand whose type names `(defPath, typeArgs)` for coercion
 `k` (`extractReifyCoercionTarget?`), coerced to a non-intrinsic, safety-compatible `fn` pointer type
-accepted by `checkCalleeSig`, interns `(defPath, typeArgs, some targetTy.kind)` via `internFnPtr` and
+accepted by `checkCalleeSig` (resp. `checkClosureCalleeSig = .ok` for closure coercions), interns `(defPath, typeArgs, some targetTy.kind)` via `internFnPtr` and
 returns the 8-byte function pointer `⟨allocId, 0⟩` together with the interned memory. -/
 theorem trusted_evalRvalue_reifyFnPointer_ok
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
@@ -17065,8 +17075,11 @@ theorem trusted_evalRvalue_reifyFnPointer_ok
     (hSafe : reifyCoercionSafetyCompatible k fnSafety = true)
     (hTarget : extractReifyCoercionTarget? k (operandTy localDecls layouts op) =
       .some (defPath, typeArgs))
-    (hSig : checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs mem.traitImpls =
-      true) :
+    (hSig : match isClosureFnPointerCoercion k with
+      | true => checkClosureCalleeSig mem.callees defPath fnInputs fnOutput fnAbi = .ok
+      | false =>
+        checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs mem.traitImpls =
+          true) :
     evalRvalue locals (.cast (.pointerCoercion k) op targetTy) mem localDecls layouts =
       .ok (.ptr ⟨(internFnPtr mem defPath typeArgs (.some targetTy.kind)).1, 0⟩ 8)
         locals' (internFnPtr mem defPath typeArgs (.some targetTy.kind)).2 := by
@@ -17087,12 +17100,13 @@ theorem trusted_evalRvalue_reifyFnPointer_ok
   dsimp only
   rw [hTarget]
   dsimp only
-  rw [hSig]
+  cases hC : isClosureFnPointerCoercion k <;> simp only [hC] at hSig ⊢ <;> rw [hSig]
 
 /-- Negative reification step: a reifying coercion faults with `.ub` whenever the operand is not a
 ZST value, the target is not a function pointer, the target ABI is `rustIntrinsic`, the target
 safety is incompatible with `k`, the operand type does not name a reifiable target (e.g. a
-capturing closure `.closure defPath (t :: ts)`), or `checkCalleeSig` rejects the signature. -/
+capturing closure `.closure defPath (t :: ts)`), or the signature check rejects the target
+(`checkCalleeSig` for function items, `checkClosureCalleeSig = .ub` for closure coercions). -/
 theorem trusted_evalRvalue_reifyFnPointer_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (k : String) (v : Value)
@@ -17108,8 +17122,11 @@ theorem trusted_evalRvalue_reifyFnPointer_ub
           (∀ defPath typeArgs,
             extractReifyCoercionTarget? k (operandTy localDecls layouts op) =
               .some (defPath, typeArgs) →
-            checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs
-              mem.traitImpls = false))) :
+            match isClosureFnPointerCoercion k with
+            | true => checkClosureCalleeSig mem.callees defPath fnInputs fnOutput fnAbi = .ub
+            | false =>
+              checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs
+                mem.traitImpls = false))) :
     evalRvalue locals (.cast (.pointerCoercion k) op targetTy) mem localDecls layouts = .ub := by
   rw [evalRvalue_cast_reifyFnPointer_eq locals op targetTy mem localDecls layouts k hReify
     hNotUnsafe]
@@ -17149,7 +17166,8 @@ theorem trusted_evalRvalue_reifyFnPointer_ub
             | some pr =>
               rcases pr with ⟨defPath, typeArgs⟩
               dsimp only
-              rw [hSig defPath typeArgs hT]
+              have hS := hSig defPath typeArgs hT
+              cases hC : isClosureFnPointerCoercion k <;> simp only [hC] at hS ⊢ <;> rw [hS]
       all_goals rfl
 
 /-- Closure reification (`isClosureFnPointerCoercion k = true`) rejects capturing closures: a

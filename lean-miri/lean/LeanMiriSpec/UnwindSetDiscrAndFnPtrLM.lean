@@ -2145,7 +2145,7 @@ theorem step_cast_closureFnPointer_simulation {body : CapturedMir} {s : MachineS
     (hsrc_decl : get? body.localDecls srcIdx = some srcDecl) (hdst_decl : get? body.localDecls dstIdx = some dstDecl) (hsrc_ty : srcDecl.ty.kind = .closure defPath upvars) (hdst_ty : dstDecl.ty.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi) (hne_sd : dstIdx ≠ srcIdx) {slot_d : LocalSlot} {immDst : Miri.Interpreter.Immediate AnnealProv} {cDst : Option Miri.Interpreter.LocalLayout} (hlt_af_d : dstIdx < s.frame.locals.length) (hlt_mf_d : dstIdx < topFrame.locals.size) (hslot_d : get? s.frame.locals dstIdx = some slot_d) (hnot_dead_d : slot_d ≠ .dead) (hmls_d : topFrame.locals[dstIdx]'hlt_mf_d = ⟨.live (.immediate immDst), cDst⟩) (hc_d : ∀ l, cDst = some l → l = translateTy dstDecl.ty body.layouts) (hlt_mf_s : srcIdx < topFrame.locals.size) :
     let hooks := annealStepHooksUnwindFnPtrClosureForState body s
     (∀ cSrc, get? s.frame.locals srcIdx = some .dead → topFrame.locals[srcIdx]'hlt_mf_s = ⟨.dead, cSrc⟩ → (∀ l, cSrc = some l → l = translateTy srcDecl.ty body.layouts) → StepRel body m (stepMirFn body s) (Miri.Interpreter.Step.step hooks () m)) ∧ (∀ u0 urest vals cSrc immSrc, upvars = u0 :: urest → get? s.frame.locals srcIdx = some (.init (.aggregate 0 vals)) → topFrame.locals[srcIdx]'hlt_mf_s = ⟨.live (.immediate immSrc), cSrc⟩ → (∀ l, cSrc = some l → l = translateTy srcDecl.ty body.layouts) → stepMirFn body s = .fail .ub ∧ (Miri.Interpreter.Step.step hooks () m).2 = .error (.invalidProgram "capturing closure in pointer cast")) ∧
-    (∀ (allocId : Nat) (mAllocId : Miri.Memory.AllocId) (baseAddr : UInt64) (cSrc : Option Miri.Interpreter.LocalLayout) (immSrc : Miri.Interpreter.Immediate AnnealProv), upvars = .nil → get? s.frame.locals srcIdx = some (.init (.aggregate 0 .nil)) → topFrame.locals[srcIdx]'hlt_mf_s = ⟨.live (.immediate immSrc), cSrc⟩ → (∀ l, cSrc = some l → l = translateTy srcDecl.ty body.layouts) → callConvEq fnAbi .rustIntrinsic = false → reifyCoercionSafetyCompatible coercionTag fnSafety = true → checkCalleeSig s.memory.callees defPath fnInputs fnOutput fnAbi .nil s.memory.traitImpls = true →
+    (∀ (allocId : Nat) (mAllocId : Miri.Memory.AllocId) (baseAddr : UInt64) (cSrc : Option Miri.Interpreter.LocalLayout) (immSrc : Miri.Interpreter.Immediate AnnealProv), upvars = .nil → get? s.frame.locals srcIdx = some (.init (.aggregate 0 .nil)) → topFrame.locals[srcIdx]'hlt_mf_s = ⟨.live (.immediate immSrc), cSrc⟩ → (∀ l, cSrc = some l → l = translateTy srcDecl.ty body.layouts) → callConvEq fnAbi .rustIntrinsic = false → reifyCoercionSafetyCompatible coercionTag fnSafety = true → checkClosureCalleeSig s.memory.callees defPath fnInputs fnOutput fnAbi = .ok →
       (match findFnPtrEntry? s.memory.fnPtrs defPath .nil (some dstDecl.ty.kind) with
        | some e => e.allocId | none => nextFnPtrAllocId s.memory.fnPtrs) = allocId →
       mAllocId.value.toNat = allocId → m.machine.lookupBaseAddr mAllocId = some baseAddr →
@@ -2221,7 +2221,9 @@ theorem step_cast_closureFnPointer_simulation {body : CapturedMir} {s : MachineS
         cases hmk : srcDecl.ty with | mk sk sl =>
         rw [hmk] at hsrc_ty; dsimp at hsrc_ty; subst hsrc_ty; subst hup
         rcases htag with rfl | rfl <;> rfl
-      rw [hextr]; dsimp only; rw [hsig_ok]; dsimp only
+      rw [hextr]; dsimp only
+      have hcc : isClosureFnPointerCoercion coercionTag = true := by rcases htag with rfl | rfl <;> rfl
+      rw [hcc]; dsimp only; rw [hsig_ok]; dsimp only
       have hfst : (internFnPtr s.memory defPath .nil (some dstDecl.ty.kind)).1 = allocId := by unfold internFnPtr; cases hfd : findFnPtrEntry? s.memory.fnPtrs defPath .nil (some dstDecl.ty.kind) <;> (rw [hfd] at haid_eq; exact haid_eq)
       rw [← hdst_ty, hfst]
     have hmem_bor : (internFnPtr s.memory defPath .nil (some dstDecl.ty.kind)).2.borrows = .nil := by unfold internFnPtr; cases findFnPtrEntry? s.memory.fnPtrs defPath .nil (some dstDecl.ty.kind) <;> simpa using hbor_nil
@@ -2709,6 +2711,14 @@ private def c8UnsafeFnTy : Ty := { kind := .fnPtr [.uint .u32] (.uint .u32) .uns
 private def c8IntrFnTy : Ty := { kind := .fnPtr [.uint .u32] (.uint .u32) .safe .rustIntrinsic, layoutIdx := 0 }
 private def c8BadSigFnTy : Ty := { kind := .fnPtr .nil (.uint .u32) .unsafe_ .rust, layoutIdx := 0 }
 private def c8ClosCallee : CapturedMir := mkEp2Body "c8_zst_clos" [ep2U32Ty, ep2U32Ty] [.assign ⟨0, .nil⟩ (.use (.copy ⟨1, .nil⟩))]
+/-- Closure-shaped linked body for `"c8_zst_clos"`: `_1 : &{closure "c8_zst_clos"}`
+is the (non-capturing) environment parameter and `_2 : u32` the sole
+user-visible argument, matching the shape `rustc-capture` emits for closure
+bodies. Used by the `ClosureFnPointer` witnesses, whose Trusted
+reification (`checkClosureCalleeSig`) and indirect dispatch
+(`checkCalleeTargetCompatible` / `calleeEntryArgs`) are callee-directed. -/
+private def c8ClosEnvCallee : CapturedMir :=
+  { mkEp2Body "c8_zst_clos" [ep2U32Ty, { kind := .ref .not c8ClosTy.kind, layoutIdx := 0 }, ep2U32Ty] [.assign ⟨0, .nil⟩ (.use (.copy ⟨2, .nil⟩))] with argCount := 2 }
 private def c8Aid : Miri.Memory.AllocId := ⟨65536, by decide⟩
 private def c8Base : UInt64 := annealStackBaseAddr c8Aid
 private def c8PtrSc : Miri.Memory.Scalar AnnealProv := Miri.Memory.Scalar.fromPointer annealTargetDataLayout ⟨Miri.ABI.Size.ofBytes c8Base, .concrete c8Aid .one⟩
@@ -2730,7 +2740,7 @@ theorem w_c8_1_reifyFnPointer_overlay_safe_unsafe_and_abi :
 closure rejection, `.uninit` ZST divergence, and
 `"ClosureFnPointer(Normal)"` divergence. -/
 theorem w_c8_2_closureFnPointer_simulation_capturing_and_divergences :
-    let mach := mkEp2AddrMachine c8Aid c8Base; let mem0 : Memory := { emptyMemory with nextAllocId := 65536, callees := [{ c8ClosCallee with argCount := 1 }] }
+    let mach := mkEp2AddrMachine c8Aid c8Base; let mem0 : Memory := { emptyMemory with nextAllocId := 65536, callees := [c8ClosEnvCallee] }
     let bOk := mkEp2Body "c8_2_ok" [c8SafeFnTy, c8ClosTy] [.assign ⟨0, .nil⟩ (.cast (.pointerCoercion "ClosureFnPointer(Safe)") (.copy ⟨1, .nil⟩) c8SafeFnTy)] c8ClosureLayouts
     let bUnsaf := mkEp2Body "c8_2_unsaf" [c8UnsafeFnTy, c8ClosTy] [.assign ⟨0, .nil⟩ (.cast (.pointerCoercion "ClosureFnPointer(Unsafe)") (.copy ⟨1, .nil⟩) c8UnsafeFnTy)] c8ClosureLayouts
     let sOk : MachineState := { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.aggregate 0 .nil)] }, memory := mem0 }
@@ -2844,7 +2854,16 @@ theorem w_c8_5_arrayToPointer_borrows_and_disabled_divergence :
     (∃ s', stepMirFn bArr sUntracked = .step s' ∧ get? s'.frame.locals 0 = some (.init (.ptr ⟨65536, 0⟩ 8))) ∧ rPtr.2 = .ok true ∧ miriLocalVal? rPtr.1 0 = some (.live (.immediate (.scalar c8PtrSc))) ∧ (∃ s', stepMirFn bArr sAddr = .step s' ∧ get? s'.frame.locals 0 = some (.init (.scalar ⟨0x4000, 8⟩))) ∧ rAddr.2 = .ok true ∧ miriLocalVal? rAddr.1 0 = some (.live (.immediate (.scalar (miriScalarUInt 0x4000 8)))) ∧ (∃ s', stepMirFn bArr sBorrowed = .step s' ∧ get? s'.frame.locals 0 = some (.init (.ptr ⟨2, 0⟩ 8)) ∧ s'.memory.borrows.length = 2 ∧ (lookupBorrow s'.memory.borrows 2).map (fun e => (e.targetLocal, e.targetProjection, e.perm)) = some (2, [.subslice 0 2 false], .frozen)) ∧ stepMirFn bArr sDisabled = .fail .ub ∧ rDis.2 = .ok true ∧ miriLocalVal? rDis.1 0 = some (.live (.immediate (.scalar disSc))) := by
   refine ⟨⟨_, rfl, rfl⟩, ?_, ?_, ⟨_, rfl, rfl⟩, ?_, ?_, ⟨_, rfl, rfl, rfl, rfl⟩, rfl, ?_, ?_⟩ <;> (with_unfolding_all rfl)
 /-- **`C8` End-to-End 5-Step Witness**: closure construction ->
-`ClosureFnPointer(Safe)` -> indirect call -> callee body -> `return_`. -/
+`ClosureFnPointer(Safe)` -> indirect call -> callee body -> `return_`.
+Trusted reifies the closure against its closure-shaped linked body
+(`c8ClosEnvCallee`), enters it with the synthesized ZST environment reference
+as `_1` and `42` as `_2`, and returns `42` (5 steps). Contrast: the same
+program linked against an env-less body (`c8ClosCallee`, not a closure body)
+faults with UB at the coercion. The overlay steps construction and coercion in
+lockstep, but at the indirect call it compares the fn-pointer arity (`1`)
+against the closure body's `argCount` (`2`) and reports
+`callee ABI mismatch`: it does not yet model Miri's `ClosureOnceShim`
+reification, which is the stuttering simulation deferred to Episode 2. -/
 theorem w_c8_end_to_end_closure_coercion_and_indirect_call :
     let callerBody : CapturedMir :=
       { defPath := "c8_e2e_caller", phase := .runtimePostCleanup, role := .subject, argCount := 0, localDecls := [ep2U32Ty, c8SafeFnTy, c8ClosTy].map mkEp2Decl, basicBlocks :=
@@ -2852,13 +2871,13 @@ theorem w_c8_end_to_end_closure_coercion_and_indirect_call :
              terminator := mkEp2Term (.call (.move ⟨1, .nil⟩) [.constant { ty := ep2U32Ty, val := .scalar (.int ⟨42, 4⟩) }] ⟨0, .nil⟩ (some 1) .continue_), isCleanup := false },
            { statements := .nil, terminator := mkEp2Term .return_, isCleanup := false }],
         fnAbi := Witness.fnAbi0, layouts := c8ClosureLayouts, allocations := .nil }
-    let s0 : MachineState := { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit, .uninit] }, memory := { emptyMemory with nextAllocId := 65536, callees := [{ c8ClosCallee with argCount := 1 }] } }
+    let s0 : MachineState := { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit, .uninit] }, memory := { emptyMemory with nextAllocId := 65536, callees := [c8ClosEnvCallee] } }
     let m0 := mkEp2MiriState callerBody ep2U32Ty #[⟨.live (.immediate .uninit), some (translateTy ep2U32Ty c8ClosureLayouts)⟩, ⟨.live (.immediate .uninit), some (translateTy c8SafeFnTy c8ClosureLayouts)⟩, ⟨.live (.immediate .uninit), some (translateTy c8ClosTy c8ClosureLayouts)⟩] (mkEp2AddrMachine c8Aid c8Base)
     ∃ s1 s2 s3 s4 s5, stepMirFn callerBody s0 = .step s1 ∧ stepMirFn callerBody s1 = .step s2 ∧ stepMirFn callerBody s2 = .step s3 ∧ stepMirFn callerBody s3 = .step s4 ∧ stepMirFn callerBody s4 = .step s5 ∧ s5.frame.blockIdx = 1 ∧ get? s5.frame.locals 0 = some (.init (.scalar ⟨42, 4⟩)) ∧
+      (∃ t1, stepMirFn callerBody { s0 with memory := { s0.memory with callees := [{ c8ClosCallee with argCount := 1 }] } } = .step t1 ∧ stepMirFn callerBody t1 = .fail .ub) ∧
       let r1 := Miri.Interpreter.Step.step (annealStepHooksUnwindFnPtrClosureForState callerBody s0) () m0; let r2 := Miri.Interpreter.Step.step (annealStepHooksUnwindFnPtrClosureForState callerBody s1) () r1.1; let r3 := Miri.Interpreter.Step.step (annealStepHooksUnwindFnPtrClosureForState callerBody s2) () r2.1
-      let r4 := Miri.Interpreter.Step.step (annealStepHooksUnwindFnPtrClosureForState callerBody s3) () r3.1; let r5 := Miri.Interpreter.Step.step (annealStepHooksUnwindFnPtrClosureForState callerBody s4) () r4.1
-      r1.2 = .ok true ∧ r2.2 = .ok true ∧ r3.2 = .ok true ∧ r4.2 = .ok true ∧ r5.2 = .ok true ∧ r5.1.stack.frames.size = 1 ∧ miriLocalVal? r5.1 0 = some (.live (.immediate (.scalar (miriScalarUInt 42 4)))) := by
-  refine ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩; with_unfolding_all exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      r1.2 = .ok true ∧ r2.2 = .ok true ∧ r3.2 = .error (.undefinedBehavior "callee ABI mismatch") := by
+  refine ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl⟩, ?_⟩; with_unfolding_all exact ⟨rfl, rfl, rfl⟩
 end C8SimulationsAndWitnesses
 
 /-! ## Section 7. `C9` (`ProjectionElem.unwrapUnsafeBinder`) -/
@@ -3764,7 +3783,7 @@ simulation hypotheses: lockstep UB on `unwrapUnsafeBinder` reads of invalid
 pointee mismatches; Trusted-only success on a null `&u32` binder read and
 on bare `"ClosureFnPointer"` (overlay `.invalidProgram`). -/
 theorem w_ep2_strictCheck_and_validity :
-    let mem0 : Memory := { emptyMemory with nextAllocId := 65536, callees := [{ c8ClosCallee with argCount := 1 }] }; let U : Miri.Interpreter.LocalValue AnnealProv := .live (.immediate .uninit); let I (sc : Miri.Memory.Scalar AnnealProv) : Miri.Interpreter.LocalValue AnnealProv := .live (.immediate (.scalar sc))
+    let mem0 : Memory := { emptyMemory with nextAllocId := 65536, callees := [c8ClosEnvCallee] }; let U : Miri.Interpreter.LocalValue AnnealProv := .live (.immediate .uninit); let I (sc : Miri.Memory.Scalar AnnealProv) : Miri.Interpreter.LocalValue AnnealProv := .live (.immediate (.scalar sc))
     let run (tys : List Ty) (lays : LayoutTable) (st : StatementKind) (aLocs : List LocalSlot) (mVals : List (Miri.Interpreter.LocalValue AnnealProv)) :=
       let b := mkEp2Body "ep2_div" tys [st] lays; let s : MachineState := { frame := { blockIdx := 0, stmtIdx := 0, locals := aLocs }, memory := mem0 }
       (stepMirFn b s, Miri.Interpreter.Step.step (annealStepHooksUnwindFnPtrClosureForState b s) () (mkEp2MiriState b (tys.headD ep2U8Ty) ((tys.zip mVals).map (fun (ty, v) => ⟨v, some (translateTyOverlay ty lays)⟩)).toArray (mkEp2AddrMachine c8Aid c8Base)))

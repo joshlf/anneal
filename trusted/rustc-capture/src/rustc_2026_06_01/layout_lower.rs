@@ -883,6 +883,45 @@ pub fn lower_fn_abi<'tcx>(abi: &FnAbi<'tcx, Ty<'tcx>>) -> IrFnAbi {
 
 /// Extracts the calling convention and unwind capability declared on `def_id`
 /// (including foreign `extern "C"` items and generic functions).
+///
+/// Closure-like items (`DefKind::Closure`) are answered without querying
+/// `tcx.fn_sig`, which is not defined for closures (their signature lives in
+/// the closure type's `ClosureArgs`). The closure *instance* ABI is the Rust ABI:
+/// `rustc` (`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) builds a closure
+/// instance's ABI signature from its `rust-call` closure signature with the
+/// environment prepended, in
+/// [`compiler/rustc_ty_utils/src/abi.rs` lines 61–73](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_ty_utils/src/abi.rs#L61-L73):
+///
+/// >```text
+/// >        ty::Closure(def_id, args) => {
+/// >            let sig = tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
+/// >            let env_ty = tcx.closure_env_ty(
+/// >                Ty::new_closure(tcx, def_id, args),
+/// >                args.as_closure().kind(),
+/// >                tcx.lifetimes.re_erased,
+/// >            );
+/// >
+/// >            tcx.mk_fn_sig(
+/// >                iter::once(env_ty).chain(sig.inputs().iter().cloned()),
+/// >                sig.output(),
+/// >                sig.fn_sig_kind,
+/// >            )
+/// >```
+///
+/// and canonicalizes the `rust-call` ABI to the Rust calling convention in
+/// [`compiler/rustc_target/src/spec/abi_map.rs` lines 94–97](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_target/src/spec/abi_map.rs#L94-L97):
+///
+/// >```text
+/// >        let canon_abi = match (extern_abi, arch) {
+/// >            // infallible lowerings
+/// >            (ExternAbi::C { .. }, _) => CanonAbi::C,
+/// >            (ExternAbi::Rust | ExternAbi::RustCall, _) => CanonAbi::Rust,
+/// >```
+///
+/// so a closure body's `fn_abi.conv` lowers to `IrCallConv::Rust` (never to the
+/// closure signature's `extern "rust-call"`). Unwind capability is reported as
+/// `true`, matching the existing fallback for Rust-ABI items below; this is a
+/// modeling choice that ignores `-C panic=abort` exactly as that fallback does.
 pub fn extract_fn_conv_and_unwind<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
@@ -890,6 +929,9 @@ pub fn extract_fn_conv_and_unwind<'tcx>(
 ) -> Option<(IrCallConv, bool)> {
     if !tcx.def_kind(def_id).is_fn_like() {
         return None;
+    }
+    if tcx.is_closure_like(def_id) {
+        return Some((IrCallConv::Rust, true));
     }
     let generics = tcx.generics_of(def_id);
     if generics.count() == 0 {

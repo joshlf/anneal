@@ -2312,6 +2312,100 @@ theorem unsize_untyped_global_div_ok_witness_64 :
 
 end IllTypedAndExposedWitnesses
 
+section FloatCastWitnesses
+
+/-! Concrete instantiations of the `Anneal.Mir.Cast` IEEE-754 float-cast refinement theorems:
+`2.1f64 as i32`, `5u32 as f32`, `1.0f32 as f64`, and the `f16` fail-closed boundary. -/
+
+/-- `2.1f64 as i32` through `evalRvalue_cast_floatToInt_eq` / `_sound` (64-bit layouts). -/
+theorem floatToInt_eq_and_sound_witness :
+    evalRvalue [.init (.scalar ⟨0x400599999999999A, 8⟩)]
+        (.cast .floatToInt (.copy ⟨0, []⟩) floatCastI32Ty) emptyMemory
+        (floatCastDecls floatCastF64Ty) emptyLayoutTable =
+      .ok (.scalar (evalFloatToIntSaturating .binary64 0x400599999999999A (.signed .i32)
+          (floatPtrWidthOfLayouts emptyLayoutTable)))
+        [.init (.scalar ⟨0x400599999999999A, 8⟩)] emptyMemory ∧
+    ∃ out : ScalarInt,
+      evalRvalue [.init (.scalar ⟨0x400599999999999A, 8⟩)]
+          (.cast .floatToInt (.copy ⟨0, []⟩) floatCastI32Ty) emptyMemory
+          (floatCastDecls floatCastF64Ty) emptyLayoutTable =
+        .ok (.scalar out) [.init (.scalar ⟨0x400599999999999A, 8⟩)] emptyMemory :=
+  ⟨evalRvalue_cast_floatToInt_eq (locals := [.init (.scalar ⟨0x400599999999999A, 8⟩)])
+      (op := .copy ⟨0, []⟩) (dstTy := floatCastI32Ty) (srcTy := floatCastF64Ty)
+      (mem := emptyMemory) (localDecls := floatCastDecls floatCastF64Ty)
+      (layouts := emptyLayoutTable) (sc := ⟨0x400599999999999A, 8⟩) (fmt := .binary64)
+      (tgt := .signed .i32) rfl rfl rfl rfl rfl,
+    let ⟨out, h, _⟩ := evalRvalue_cast_floatToInt_sound
+      (locals := [.init (.scalar ⟨0x400599999999999A, 8⟩)])
+      (op := .copy ⟨0, []⟩) (dstTy := floatCastI32Ty) (srcTy := floatCastF64Ty)
+      (mem := emptyMemory) (localDecls := floatCastDecls floatCastF64Ty)
+      (layouts := emptyLayoutTable) (sc := ⟨0x400599999999999A, 8⟩) (fmt := .binary64)
+      (tgt := .signed .i32) rfl rfl rfl rfl rfl
+    ⟨out, h⟩⟩
+
+/-- `5u32 as f32` through `evalRvalue_cast_intToFloat_eq` / `_exact`. -/
+theorem intToFloat_eq_and_exact_witness :
+    evalRvalue [.init (.scalar ⟨5, 4⟩)] (.cast .intToFloat (.copy ⟨0, []⟩) floatCastF32Ty)
+        emptyMemory (floatCastDecls floatCastU32Ty) emptyLayoutTable =
+      .ok (.scalar ⟨evalIntToFloatRoundTiesToEven false 32 5 .binary32, 4⟩)
+        [.init (.scalar ⟨5, 4⟩)] emptyMemory ∧
+    ∃ out : ScalarInt,
+      evalRvalue [.init (.scalar ⟨5, 4⟩)] (.cast .intToFloat (.copy ⟨0, []⟩) floatCastF32Ty)
+          emptyMemory (floatCastDecls floatCastU32Ty) emptyLayoutTable =
+        .ok (.scalar out) [.init (.scalar ⟨5, 4⟩)] emptyMemory :=
+  ⟨evalRvalue_cast_intToFloat_eq (locals := [.init (.scalar ⟨5, 4⟩)]) (op := .copy ⟨0, []⟩)
+      (dstTy := floatCastF32Ty) (srcTy := floatCastU32Ty) (mem := emptyMemory)
+      (localDecls := floatCastDecls floatCastU32Ty) (layouts := emptyLayoutTable)
+      (sc := ⟨5, 4⟩) (fmt := .binary32) (src := .unsigned .u32) rfl rfl rfl rfl rfl,
+    let ⟨out, h, _⟩ := evalRvalue_cast_intToFloat_exact (locals := [.init (.scalar ⟨5, 4⟩)])
+      (op := .copy ⟨0, []⟩) (dstTy := floatCastF32Ty) (srcTy := floatCastU32Ty)
+      (mem := emptyMemory) (localDecls := floatCastDecls floatCastU32Ty)
+      (layouts := emptyLayoutTable) (sc := ⟨5, 4⟩) (fmt := .binary32) (src := .unsigned .u32)
+      rfl rfl rfl rfl rfl (by decide)
+    ⟨out, h⟩⟩
+
+/-- `1.0f32 as f64` through `evalRvalue_cast_floatToFloat_eq` / `_sound`. -/
+theorem floatToFloat_eq_and_sound_witness :
+    evalRvalue [.init (.scalar ⟨0x3F800000, 4⟩)] (.cast .floatToFloat (.copy ⟨0, []⟩) floatCastF64Ty)
+        emptyMemory (floatCastDecls floatCastF32Ty) emptyLayoutTable =
+      .ok (.scalar ⟨evalFloatToFloatRoundTiesToEven .binary32 .binary64 0x3F800000, 8⟩)
+        [.init (.scalar ⟨0x3F800000, 4⟩)] emptyMemory ∧
+    ∃ out : ScalarInt,
+      evalRvalue [.init (.scalar ⟨0x3F800000, 4⟩)]
+          (.cast .floatToFloat (.copy ⟨0, []⟩) floatCastF64Ty) emptyMemory
+          (floatCastDecls floatCastF32Ty) emptyLayoutTable =
+        .ok (.scalar out) [.init (.scalar ⟨0x3F800000, 4⟩)] emptyMemory :=
+  ⟨evalRvalue_cast_floatToFloat_eq (locals := [.init (.scalar ⟨0x3F800000, 4⟩)])
+      (op := .copy ⟨0, []⟩) (dstTy := floatCastF64Ty) (srcTy := floatCastF32Ty)
+      (mem := emptyMemory) (localDecls := floatCastDecls floatCastF32Ty)
+      (layouts := emptyLayoutTable) (sc := ⟨0x3F800000, 4⟩) (src := .binary32)
+      (dst := .binary64) rfl rfl rfl rfl rfl,
+    let ⟨out, h, _⟩ := evalRvalue_cast_floatToFloat_sound
+      (locals := [.init (.scalar ⟨0x3F800000, 4⟩)])
+      (op := .copy ⟨0, []⟩) (dstTy := floatCastF64Ty) (srcTy := floatCastF32Ty)
+      (mem := emptyMemory) (localDecls := floatCastDecls floatCastF32Ty)
+      (layouts := emptyLayoutTable) (sc := ⟨0x3F800000, 4⟩) (src := .binary32)
+      (dst := .binary64) rfl rfl rfl rfl rfl
+    ⟨out, h⟩⟩
+
+/-- `f16` operands are fail-closed (`evalRvalue_cast_float_unsupported_of_no_format`), plus the
+closed-term end-to-end and unsupported-boundary runs. -/
+theorem floatCast_unsupported_and_end_to_end_witness :
+    evalRvalue [.init (.scalar ⟨0x3C00, 2⟩)] (.cast .floatToInt (.copy ⟨0, []⟩) floatCastI32Ty)
+        emptyMemory (floatCastDecls floatCastF16Ty) emptyLayoutTable = .unsupported ∧
+    floatCastRun .floatToInt floatCastF64Ty floatCastI32Ty 0x400599999999999A 8 =
+      .ok (.scalar ⟨2, 4⟩) [.init (.scalar ⟨0x400599999999999A, 8⟩)] emptyMemory ∧
+    floatCastRun .intToFloat floatCastU32Ty floatCastF16Ty 1 4 = .unsupported :=
+  ⟨((evalRvalue_cast_float_unsupported_of_no_format (locals := [.init (.scalar ⟨0x3C00, 2⟩)])
+      (locals' := [.init (.scalar ⟨0x3C00, 2⟩)]) (op := .copy ⟨0, []⟩)
+      (dstTy := floatCastI32Ty) (srcTy := floatCastF16Ty) (mem := emptyMemory)
+      (localDecls := floatCastDecls floatCastF16Ty) (layouts := emptyLayoutTable)
+      (v := .scalar ⟨0x3C00, 2⟩) rfl rfl).1 rfl).1,
+    evalRvalue_float_cast_end_to_end.1,
+    evalRvalue_float_cast_unsupported_witnesses.2.2.1⟩
+
+end FloatCastWitnesses
+
 /-! ## Kernel axiom audit -/
 
 /-! Audits every declaration added by Episode 2 to `Anneal.Mir.Cast` (Section 9, starting at
