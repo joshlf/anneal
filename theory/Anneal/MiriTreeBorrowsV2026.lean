@@ -1214,6 +1214,10 @@ def miriRangesDisjointBool (off₁ sz₁ off₂ sz₂ : Nat) : Bool :=
 def MiriAllocTreeFrameEq (allocId : AllocId) (st₁ st₂ : MiriTbState) : Prop :=
   miriFindAllocTree? allocId st₁.allocTrees = miriFindAllocTree? allocId st₂.allocTrees
 
+/-- Uniqueness invariant on `MiriTbState.allocTrees`: no two entries share an `allocId`. -/
+def MiriAllocIdsNoDup (trees : List MiriAllocTree) : Prop :=
+  List.Pairwise (fun a b => a.allocId ≠ b.allocId) trees
+
 /-- Shared segment non-overlap framing predicate. -/
 def MiriSegmentUntouched (off sz : Nat) (seg : MiriSegment) : Prop :=
   miriSegmentOverlaps off sz seg = false
@@ -1467,6 +1471,178 @@ theorem miriFindAllocTree?_replace_other (a₂ : AllocId) (t' : MiriAllocTree)
     (trees : List MiriAllocTree) (hNe : t'.allocId ≠ a₂) :
     miriFindAllocTree? a₂ (miriReplaceAllocTree t' trees) = miriFindAllocTree? a₂ trees :=
   foldl_findAllocTree_replace_other a₂ t' hNe trees none
+
+private theorem foldl_findAllocTree_replace_self (t' : MiriAllocTree) :
+    ∀ (trees : List MiriAllocTree) (init₁ init₂ : Option MiriAllocTree),
+      (match init₁ with | none => init₂ = none | some _ => init₂ = some t') →
+      match trees.foldl (fun acc t => if Nat.beq t.allocId t'.allocId then some t else acc) init₁ with
+      | none =>
+        (miriReplaceAllocTree t' trees).foldl
+          (fun acc t => if Nat.beq t.allocId t'.allocId then some t else acc) init₂ = none
+      | some _ =>
+        (miriReplaceAllocTree t' trees).foldl
+          (fun acc t => if Nat.beq t.allocId t'.allocId then some t else acc) init₂ = some t'
+  | [], init₁, _, hInit => by
+    cases init₁ with
+    | none => exact hInit
+    | some _ => exact hInit
+  | t :: rest, init₁, init₂, hInit => by
+    dsimp only [miriReplaceAllocTree, List.map, List.foldl]
+    cases hEq : Nat.beq t.allocId t'.allocId with
+    | true =>
+      have hSelf : Nat.beq t'.allocId t'.allocId = true := Nat.beq_refl t'.allocId
+      simp only [hSelf, ↓reduceIte]
+      exact foldl_findAllocTree_replace_self t' rest (some t) (some t') rfl
+    | false =>
+      simp only [hEq, Bool.false_eq_true, ↓reduceIte]
+      exact foldl_findAllocTree_replace_self t' rest init₁ init₂ hInit
+
+/-- Replacing `t'.allocId` when present always causes `miriFindAllocTree? t'.allocId` to return
+`some t'` (even without a uniqueness precondition, because `miriReplaceAllocTree` updates every
+matching entry). -/
+theorem miriFindAllocTree?_replace_self (t' old : MiriAllocTree)
+    (trees : List MiriAllocTree)
+    (hFind : miriFindAllocTree? t'.allocId trees = some old) :
+    miriFindAllocTree? t'.allocId (miriReplaceAllocTree t' trees) = some t' := by
+  have h := foldl_findAllocTree_replace_self t' trees none none rfl
+  unfold miriFindAllocTree? at hFind ⊢
+  rw [hFind] at h
+  exact h
+
+private theorem foldl_findAllocTree_eq_init_of_forall_ne (a : AllocId) :
+    ∀ (trees : List MiriAllocTree) (init : Option MiriAllocTree),
+      (∀ t ∈ trees, a ≠ t.allocId) →
+      trees.foldl (fun acc t => if Nat.beq t.allocId a then some t else acc) init = init
+  | [], _, _ => rfl
+  | t :: rest, init, hAll => by
+    dsimp only [List.foldl]
+    have hNe : t.allocId ≠ a := fun h => hAll t List.mem_cons_self h.symm
+    have hF : Nat.beq t.allocId a = false := natBeq_false_of_ne hNe
+    simp only [hF, Bool.false_eq_true, ↓reduceIte]
+    exact foldl_findAllocTree_eq_init_of_forall_ne a rest init
+      (fun u hu => hAll u (List.mem_cons_of_mem t hu))
+
+/-- Under `MiriAllocIdsNoDup trees`, `miriFindAllocTree?` (last-match `foldl`) coincides
+identically with `List.find?` (first-match), eliminating any duplicate-key discrepancy with
+`miriReplaceAllocTree`! -/
+theorem miriFindAllocTree?_eq_find?_of_noDup (a : AllocId) :
+    ∀ (trees : List MiriAllocTree),
+      MiriAllocIdsNoDup trees →
+      miriFindAllocTree? a trees = trees.find? (fun t => Nat.beq t.allocId a)
+  | [], _ => rfl
+  | t :: rest, hNoDup => by
+    cases hNoDup with
+    | cons hHead hTail =>
+      unfold miriFindAllocTree?
+      dsimp only [List.foldl, List.find?]
+      cases hEq : Nat.beq t.allocId a with
+      | true =>
+        simp only [↓reduceIte]
+        have hTid : t.allocId = a := Nat.eq_of_beq_eq_true hEq
+        exact foldl_findAllocTree_eq_init_of_forall_ne a rest (some t)
+          (fun u hu => by rw [← hTid]; exact hHead u hu)
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        exact miriFindAllocTree?_eq_find?_of_noDup a rest hTail
+
+private theorem mem_replaceAllocTree_allocId (t' : MiriAllocTree) :
+    ∀ (trees : List MiriAllocTree) (u : MiriAllocTree),
+      u ∈ miriReplaceAllocTree t' trees →
+      ∃ v ∈ trees, u.allocId = v.allocId
+  | [], _, hMem => by cases hMem
+  | t :: rest, u, hMem => by
+    cases hMem with
+    | head _ =>
+      refine ⟨t, List.mem_cons_self, ?_⟩
+      dsimp only
+      cases hEq : Nat.beq t.allocId t'.allocId with
+      | true =>
+        simp only [↓reduceIte]
+        exact (Nat.eq_of_beq_eq_true hEq).symm
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte]
+    | tail _ hTail =>
+      match mem_replaceAllocTree_allocId t' rest u hTail with
+      | ⟨v, hv, hId⟩ => exact ⟨v, List.mem_cons_of_mem t hv, hId⟩
+
+/-- `miriReplaceAllocTree` strictly preserves `MiriAllocIdsNoDup` (every element keeps its exact
+`allocId`). -/
+theorem miriReplaceAllocTree_preserves_noDup (t' : MiriAllocTree) :
+    ∀ (trees : List MiriAllocTree),
+      MiriAllocIdsNoDup trees →
+      MiriAllocIdsNoDup (miriReplaceAllocTree t' trees)
+  | [], _ => List.Pairwise.nil
+  | t :: rest, hNoDup => by
+    cases hNoDup with
+    | cons hHead hTail =>
+      dsimp only [miriReplaceAllocTree, List.map]
+      refine List.Pairwise.cons ?_ (miriReplaceAllocTree_preserves_noDup t' rest hTail)
+      intro u hu
+      match mem_replaceAllocTree_allocId t' rest u hu with
+      | ⟨v, hv, hId⟩ =>
+        have hSelfId : (if Nat.beq t.allocId t'.allocId then t' else t).allocId = t.allocId := by
+          cases hEq : Nat.beq t.allocId t'.allocId with
+          | true => simp only [↓reduceIte]; exact (Nat.eq_of_beq_eq_true hEq).symm
+          | false => simp only [Bool.false_eq_true, ↓reduceIte]
+        rw [hSelfId, hId]
+        exact hHead v hv
+
+/-- `miriPerformRangedAccess` preserves `MiriAllocIdsNoDup` on BOTH `.ok` and `.err` outcomes! -/
+theorem miriPerformRangedAccess_preserves_noDup (st : MiriTbState)
+    (allocId : AllocId) (accessedTag off size : Nat)
+    (kind : MiriAccessKind) (mode : MiriVisitMode)
+    (hNoDup : MiriAllocIdsNoDup st.allocTrees) :
+    match miriPerformRangedAccess st allocId accessedTag off size kind mode with
+    | .ok st' => MiriAllocIdsNoDup st'.allocTrees
+    | .err st' _ => MiriAllocIdsNoDup st'.allocTrees := by
+  unfold miriPerformRangedAccess
+  cases miriFindAllocTree? allocId st.allocTrees with
+  | none => exact hNoDup
+  | some atree =>
+    dsimp only
+    cases miriFindTopoNode? accessedTag atree.tree with
+    | none => exact hNoDup
+    | some _ =>
+      dsimp only
+      generalize hFold :
+        (miriSplitSegmentsAt off size atree.segments).foldl _ ([], 0, none) = foldRes
+      cases foldRes with
+      | mk segs rest =>
+        cases rest with
+        | mk cov errOpt =>
+          have hRep := miriReplaceAllocTree_preserves_noDup
+            { allocId := allocId, tree := atree.tree, segments := segs } st.allocTrees hNoDup
+          cases errOpt with
+          | some _ => exact hRep
+          | none =>
+            dsimp only
+            cases Nat.beq cov size with
+            | true => exact hRep
+            | false => exact hRep
+
+/-- `miriReleaseOneProtector` preserves `MiriAllocIdsNoDup` on BOTH `.ok` and `.err` outcomes! -/
+theorem miriReleaseOneProtector_preserves_noDup (st : MiriTbState)
+    (allocId : AllocId) (tag : Nat) (hNoDup : MiriAllocIdsNoDup st.allocTrees) :
+    match miriReleaseOneProtector st allocId tag with
+    | .ok st' => MiriAllocIdsNoDup st'.allocTrees
+    | .err st' _ => MiriAllocIdsNoDup st'.allocTrees := by
+  unfold miriReleaseOneProtector
+  cases miriFindAllocTree? allocId st.allocTrees with
+  | none => exact hNoDup
+  | some atree =>
+    dsimp only
+    cases miriFindTopoNode? tag atree.tree with
+    | none => exact hNoDup
+    | some _ =>
+      dsimp only
+      generalize hFold : atree.segments.foldl _ ([], none) = foldRes
+      cases foldRes with
+      | mk segs errOpt =>
+        have hRep := miriReplaceAllocTree_preserves_noDup
+          { allocId := allocId, tree := atree.tree, segments := segs } st.allocTrees hNoDup
+        cases errOpt with
+        | some _ => exact hRep
+        | none => exact hRep
 
 /-- Disjoint-allocation frame preservation for `miriPerformRangedAccess`: accessing `a₁` leaves
 `a₂ ≠ a₁` completely untouched on BOTH `.ok` and `.err` outcomes! -/
@@ -2100,6 +2276,43 @@ theorem miriInspectAllocV2026_live_borrow_shadows_globals (allocId : AllocId) (m
   rw [hB]
   dsimp only
   rw [hLive]
+
+/-- **Global fallback law**: whenever no stack borrow shadows `allocId`, `miriInspectAllocV2026`
+falls back identically to unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.lookupGlobalAlloc`. -/
+theorem miriInspectAllocV2026_global_fallback_eq (allocId : AllocId) (mem : Memory)
+    (hNoB : lookupBorrow mem.borrows allocId = .none) :
+    miriInspectAllocV2026 allocId mem =
+      match lookupGlobalAlloc mem.globals allocId with
+      | .some ga => .live ga.mutability
+      | .none => .missing := by
+  unfold miriInspectAllocV2026
+  rw [hNoB]
+
+/-- **Exact missing-allocation characterization**: `miriInspectAllocV2026 allocId mem = .missing`
+iff BOTH `lookupBorrow mem.borrows allocId = .none` AND `lookupGlobalAlloc mem.globals allocId = .none`. -/
+theorem miriInspectAllocV2026_missing_iff (allocId : AllocId) (mem : Memory) :
+    miriInspectAllocV2026 allocId mem = .missing ↔
+      lookupBorrow mem.borrows allocId = .none ∧
+      lookupGlobalAlloc mem.globals allocId = .none := by
+  unfold miriInspectAllocV2026
+  cases hB : lookupBorrow mem.borrows allocId with
+  | some be =>
+    dsimp only
+    constructor
+    · intro hM
+      cases hD : be.allocDead with
+      | true => rw [hD] at hM; cases hM
+      | false => rw [hD] at hM; cases hM
+    · intro hPair; cases hPair.1
+  | none =>
+    dsimp only
+    cases hG : lookupGlobalAlloc mem.globals allocId with
+    | some ga =>
+      constructor
+      · intro hM; cases hM
+      · intro hPair; cases hPair.2
+    | none =>
+      exact ⟨fun _ => ⟨rfl, rfl⟩, fun _ => rfl⟩
 
 /-- **Exact retag initial-permission bridge** to unmodified
 `Trusted.Rustc.V2026_06_01.MirSemantics.retagPerm` and `fnEntryRetagPerm` across all four

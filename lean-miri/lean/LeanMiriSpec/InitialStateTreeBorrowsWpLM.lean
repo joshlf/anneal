@@ -117,6 +117,16 @@ local elab "kernel_rfl" : tactic => do
   mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
   Lean.Elab.Tactic.replaceMainGoal []
 
+/-- Definitionally unfold private helper lemmas in `Miri.TreeBorrows.MachineMemoryHooks`
+(purely definitional `replaceTargetDefEq`; zero extra axioms). -/
+local elab "unfold_mmh" : tactic => do
+  let g ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← g.getType
+  let tgt' ← Lean.Meta.deltaExpand tgt (fun n =>
+    n.toString.startsWith "_private.Miri.TreeBorrows.MachineMemoryHooks.")
+  let g' ← g.replaceTargetDefEq tgt'
+  Lean.Elab.Tactic.replaceMainGoal [g']
+
 /-! ## §1. Compositional Initial-State Tree Borrows Range WP (`miriTreeRangeExactWP_iff`) -/
 
 section InitialStateTreeRangeWP
@@ -526,6 +536,180 @@ theorem miriEndCall_preserves_unlisted_protector (gs : GlobalState) (frame : Fra
     rw [ih (fun q hq => hNotIn q (List.mem_cons_of_mem p hq)) (pt.remove p.2)]
     exact (miriProtectedTags_remove_ne pt p.2 t hp).1
 
+/-! ### §1.2. Real Vendored `Miri.TreeBorrows.MachineMemoryHooks.{beforeMemoryRead, beforeMemoryWrite}` Exact WP -/
+
+/-- State-retaining `ExactAction` wrapping unmodified
+`Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryRead` over
+`(MemoryState Provenance BorrowTree K × MachineMemoryHooks.Context S Obj)`. -/
+def miriBeforeMemoryReadAction {S Obj K : Type} [DecidableEq K]
+    (hooks : MachineMemoryHooks.Hooks S Obj K)
+    (allocation : Allocation Provenance BorrowTree)
+    (pointer : Pointer (Option Provenance)) (allocId : Miri.Memory.AllocId)
+    (provenance : ProvenanceExtra) (range : AllocRange) :
+    ExactAction (MemoryState Provenance BorrowTree K × MachineMemoryHooks.Context S Obj)
+      String Unit :=
+  fun ⟨mem, ctx⟩ =>
+    let res := MachineMemoryHooks.beforeMemoryRead mem ctx hooks allocation pointer allocId
+      provenance range
+    match res.outcome with
+    | .ok () => .ok () (res.memory, res.context)
+    | .error msg => .error msg (res.memory, res.context)
+
+/-- State-retaining `ExactAction` wrapping unmodified
+`Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite` over
+`(MemoryState Provenance BorrowTree K × MachineMemoryHooks.Context S Obj)`. -/
+def miriBeforeMemoryWriteAction {S Obj K : Type} [DecidableEq K]
+    (hooks : MachineMemoryHooks.Hooks S Obj K)
+    (allocation : Allocation Provenance BorrowTree)
+    (pointer : Pointer (Option Provenance)) (allocId : Miri.Memory.AllocId)
+    (provenance : ProvenanceExtra) (range : AllocRange) :
+    ExactAction (MemoryState Provenance BorrowTree K × MachineMemoryHooks.Context S Obj)
+      String Unit :=
+  fun ⟨mem, ctx⟩ =>
+    let res := MachineMemoryHooks.beforeMemoryWrite mem ctx hooks allocation pointer allocId
+      provenance range
+    match res.outcome with
+    | .ok () => .ok () (res.memory, res.context)
+    | .error msg => .error msg (res.memory, res.context)
+
+/-- **Exact bidirectional `↔` theorem `miriBeforeMemoryReadExactWP_iff`**: when allocation
+diagnostics are disabled, `dataRaceRead` succeeds without altering `ctx.state`, sync objects are
+empty, and `setLiveAllocation` commits the updated `BorrowTree` extra back to `mem`, unmodified
+vendored `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryRead` reduces EXACTLY to
+`tbAccessPre` (`BorrowTree.performBorrowAccessRange ... .Read hooks.protectedTags .VisitChildrenOfAccessed`),
+retaining the committed `BorrowTree` in `mem'` on BOTH `.Completed` and Tree Borrows error! -/
+theorem miriBeforeMemoryReadExactWP_iff {S Obj K : Type} [DecidableEq K]
+    (hooks : MachineMemoryHooks.Hooks S Obj K)
+    (allocation : Allocation Provenance BorrowTree)
+    (pointer : Pointer (Option Provenance)) (allocId : Miri.Memory.AllocId)
+    (provenance : ProvenanceExtra) (range : AllocRange) (endOff : Size)
+    (mem mem' : MemoryState Provenance BorrowTree K)
+    (ctx : MachineMemoryHooks.Context S Obj)
+    (post : Unit → MemoryState Provenance BorrowTree K × MachineMemoryHooks.Context S Obj → Prop)
+    (onError : String → MemoryState Provenance BorrowTree K × MachineMemoryHooks.Context S Obj → Prop)
+    (hNoDiag : ctx.trackAllocAccesses = false)
+    (hRace : hooks.dataRaceRead ctx.state pointer allocId range = ⟨ctx.state, .ok ()⟩)
+    (hNoSync : ctx.syncObjects.get allocId = .empty)
+    (hRangeOk : range.endExclusive = .ok endOff)
+    (hSetMem :
+      mem.setLiveAllocation allocId
+        (allocation.setExtra
+          (allocation.extra.performBorrowAccessRange provenance range.start range.size
+            .Read hooks.protectedTags .VisitChildrenOfAccessed).tree) = .ok mem') :
+    AnnealExactWP
+      (miriBeforeMemoryReadAction hooks allocation pointer allocId provenance range)
+      post onError (mem, ctx) ↔
+      tbAccessPre allocation.extra provenance range.start range.size .Read
+        hooks.protectedTags .VisitChildrenOfAccessed
+        (fun _ _ => post () (mem', ctx))
+        (fun errPair _ => onError s!"Tree Borrows read failed: {reprStr errPair.1}" (mem', ctx)) := by
+  rcases ctx with ⟨ctxSt, ctxSync, ctxTrack, ctxIds⟩
+  dsimp only at hNoDiag hRace hNoSync ⊢
+  subst hNoDiag
+  have hRes :
+      MachineMemoryHooks.beforeMemoryRead mem ⟨ctxSt, ctxSync, false, ctxIds⟩ hooks
+          allocation pointer allocId provenance range =
+        let res := allocation.extra.performBorrowAccessRange provenance range.start range.size
+          .Read hooks.protectedTags .VisitChildrenOfAccessed
+        match res.status with
+        | .Completed => ⟨mem', ⟨ctxSt, ctxSync, false, ctxIds⟩, .ok ()⟩
+        | st => ⟨mem', ⟨ctxSt, ctxSync, false, ctxIds⟩,
+            .error s!"Tree Borrows read failed: {reprStr st}"⟩ := by
+    unfold MachineMemoryHooks.beforeMemoryRead
+    simp only [Id.run, Bool.false_and, Bool.false_eq_true, ↓reduceIte, hRace, pure, Pure.pure,
+      bind, Bind.bind]
+    unfold_mmh
+    simp only [hSetMem, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    generalize allocation.extra.performBorrowAccessRange provenance range.start range.size
+        .Read hooks.protectedTags .VisitChildrenOfAccessed = res
+    cases res.status with
+    | Completed =>
+      simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hNoSync,
+        MachineMemoryHooks.SyncObjectMap.inRange, MachineMemoryHooks.SyncObjectMap.empty,
+        hRangeOk, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure,
+        Array.filter_empty]
+      rfl
+    | _ =>
+      simp only [bne_iff_ne, ne_eq, reduceCtorEq, not_false_eq_true, ↓reduceIte]
+  unfold AnnealExactWP miriBeforeMemoryReadAction tbAccessPre
+  dsimp only
+  rw [hRes]
+  dsimp only
+  generalize allocation.extra.performBorrowAccessRange provenance range.start range.size
+      .Read hooks.protectedTags .VisitChildrenOfAccessed = res
+  cases res.status <;> rfl
+
+/-- **Exact bidirectional `↔` theorem `miriBeforeMemoryWriteExactWP_iff`**: exact two-continuation
+WP characterization of unmodified vendored `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite`
+reducing directly to `tbAccessPre` (`.Write`) with committed post-tree retention on error! -/
+theorem miriBeforeMemoryWriteExactWP_iff {S Obj K : Type} [DecidableEq K]
+    (hooks : MachineMemoryHooks.Hooks S Obj K)
+    (allocation : Allocation Provenance BorrowTree)
+    (pointer : Pointer (Option Provenance)) (allocId : Miri.Memory.AllocId)
+    (provenance : ProvenanceExtra) (range : AllocRange) (endOff : Size)
+    (mem mem' : MemoryState Provenance BorrowTree K)
+    (ctx : MachineMemoryHooks.Context S Obj)
+    (post : Unit → MemoryState Provenance BorrowTree K × MachineMemoryHooks.Context S Obj → Prop)
+    (onError : String → MemoryState Provenance BorrowTree K × MachineMemoryHooks.Context S Obj → Prop)
+    (hNoDiag : ctx.trackAllocAccesses = false)
+    (hRace : hooks.dataRaceWrite ctx.state pointer allocId range = ⟨ctx.state, .ok ()⟩)
+    (hNoSync : ctx.syncObjects.get allocId = .empty)
+    (hRangeOk : range.endExclusive = .ok endOff)
+    (hSetMem :
+      mem.setLiveAllocation allocId
+        (allocation.setExtra
+          (allocation.extra.performBorrowAccessRange provenance range.start range.size
+            .Write hooks.protectedTags .VisitChildrenOfAccessed).tree) = .ok mem') :
+    AnnealExactWP
+      (miriBeforeMemoryWriteAction hooks allocation pointer allocId provenance range)
+      post onError (mem, ctx) ↔
+      tbAccessPre allocation.extra provenance range.start range.size .Write
+        hooks.protectedTags .VisitChildrenOfAccessed
+        (fun _ _ =>
+          post () (mem', { ctx with syncObjects := ctx.syncObjects.set allocId .empty }))
+        (fun errPair _ => onError s!"Tree Borrows write failed: {reprStr errPair.1}" (mem', ctx)) := by
+  rcases ctx with ⟨ctxSt, ctxSync, ctxTrack, ctxIds⟩
+  dsimp only at hNoDiag hRace hNoSync ⊢
+  subst hNoDiag
+  have hRes :
+      MachineMemoryHooks.beforeMemoryWrite mem ⟨ctxSt, ctxSync, false, ctxIds⟩ hooks
+          allocation pointer allocId provenance range =
+        let res := allocation.extra.performBorrowAccessRange provenance range.start range.size
+          .Write hooks.protectedTags .VisitChildrenOfAccessed
+        match res.status with
+        | .Completed =>
+          ⟨mem', ⟨ctxSt, ctxSync.set allocId .empty, false, ctxIds⟩, .ok ()⟩
+        | st => ⟨mem', ⟨ctxSt, ctxSync, false, ctxIds⟩,
+            .error s!"Tree Borrows write failed: {reprStr st}"⟩ := by
+    unfold MachineMemoryHooks.beforeMemoryWrite
+    simp only [Id.run, Bool.false_and, Bool.false_eq_true, ↓reduceIte, hRace, pure, Pure.pure,
+      bind, Bind.bind]
+    unfold_mmh
+    simp only [hSetMem, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    generalize allocation.extra.performBorrowAccessRange provenance range.start range.size
+        .Write hooks.protectedTags .VisitChildrenOfAccessed = res
+    cases res.status with
+    | Completed =>
+      simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hNoSync,
+        MachineMemoryHooks.SyncObjectMap.inRange, MachineMemoryHooks.SyncObjectMap.empty,
+        hRangeOk, bind, Bind.bind, Except.bind, pure, Pure.pure,
+        Except.pure, Array.filter_empty]
+      change MachineMemoryHooks.AccessResult.mk mem'
+               (MachineMemoryHooks.Context.mk ctxSt
+                 (ctxSync.set allocId (ctxSync.get allocId)) false ctxIds)
+               (Except.ok ()) = _
+      rw [hNoSync]
+      rfl
+    | _ =>
+      simp only [bne_iff_ne, ne_eq, reduceCtorEq, not_false_eq_true, ↓reduceIte]
+  unfold AnnealExactWP miriBeforeMemoryWriteAction tbAccessPre
+  dsimp only
+  rw [hRes]
+  dsimp only
+  generalize allocation.extra.performBorrowAccessRange provenance range.start range.size
+      .Write hooks.protectedTags .VisitChildrenOfAccessed = res
+  cases res.status <;> rfl
+
 end InitialStateTreeRangeWP
 
 /-! ## §2. Initial-State Instruction & Call-Dispatch WP (`miriInstructionExactWP_iff`, `miriCallDispatchExactWP_iff`) -/
@@ -652,6 +836,62 @@ theorem miriInstructionExactWP_nop_frame (hooks : StepHooks P L E M C V) (choice
       post () state :=
   miriInstructionExactWP_iff hooks choice ⟨sourceInfo, .Nop⟩ post onError state
 
+/-- **Unified metadata/no-op framing law (`miriInstructionExactWP_meta_frame`)**: ALL FIVE MIR
+no-op/metadata statement constructors (`.Nop`, `.FakeRead`, `.AscribeUserType`, `.Coverage`,
+`.BackwardIncompatibleDropHint`) leave the ENTIRE `StepState` identically untouched and frame
+ANY state invariant `Inv`! -/
+theorem miriInstructionExactWP_meta_frame (hooks : StepHooks P L E M C V) (choice : C)
+    (stmt : Miri.MIR.Statement)
+    (hMeta : match stmt.kind with
+      | .FakeRead .. | .AscribeUserType .. | .Coverage .. | .Nop
+      | .BackwardIncompatibleDropHint .. => True
+      | _ => False)
+    (Inv : StepState P L E M → Prop)
+    (post : Unit → StepState P L E M → Prop)
+    (onError : StepError → StepState P L E M → Prop)
+    (state : StepState P L E M) :
+    AnnealExactWP (miriInstructionAction hooks choice stmt)
+        (fun u s' => post u s' ∧ Inv s') onError state ↔
+      post () state ∧ Inv state := by
+  rw [miriInstructionExactWP_iff]
+  unfold miriInstructionPre
+  cases hk : stmt.kind <;> rw [hk] at hMeta <;> first | exact False.elim hMeta | exact Iff.rfl
+
+/-- **Concrete `annealStepHooks` fail-closed `StorageDead 0` law
+(`annealInstruction_storageDead_returnPlace_err_exactWP`)**: executing `StorageDead 0` on ANY
+non-empty active stack frame with `annealStepHooks` ALWAYS faults with
+`StepError.stack .cannotMakeReturnPlaceDead` (rustc MIR forbids killing return place `_0`), and
+via `↔` refutes pure safety! -/
+theorem annealInstruction_storageDead_returnPlace_err_exactWP
+    (localDecls : List LocalDecl) (layouts : AnnealLayoutTable)
+    (sourceInfo : Miri.MIR.SourceInfo)
+    (post : Unit → AnnealStepState → Prop)
+    (onError : StepError → AnnealStepState → Prop)
+    (state : AnnealStepState) (frame : Frame AnnealProv LocalLayout Unit)
+    (hFrame : state.stack.currentFrame? = some frame) :
+    AnnealExactWP
+      (miriInstructionAction (annealStepHooks localDecls layouts) () ⟨sourceInfo, .StorageDead 0⟩)
+      post onError state ↔
+      onError (.stack .cannotMakeReturnPlaceDead)
+        { stack :=
+            { frames := state.stack.frames.set (state.stack.frames.size - 1) frame
+                (by
+                  unfold Stack.currentFrame? at hFrame
+                  cases hSz : state.stack.frames.size with
+                  | zero => simp [Array.back?, hSz] at hFrame
+                  | succ k => omega) }
+          machine := state.machine } := by
+  rw [miriInstructionExactWP_iff]
+  unfold miriInstructionPre
+  dsimp only [annealStepHooks, annealRunFrameStorage, Frame.storageDead]
+  rw [hFrame]
+  have hLt : state.stack.frames.size - 1 < state.stack.frames.size := by
+    unfold Stack.currentFrame? at hFrame
+    cases hSz : state.stack.frames.size with
+    | zero => simp [Array.back?, hSz] at hFrame
+    | succ k => omega
+  simp only [Id.run, pure, Pure.pure, beq_self_eq_true, ↓reduceIte, hLt, ↓reduceDIte]
+
 /-- Exact `.SetDiscriminant` compositional two-stage law: evaluates `place` first (committing
 its state on error) and then writes `variant`. -/
 theorem miriInstructionExactWP_setDiscriminant_iff (hooks : StepHooks P L E M C V) (choice : C)
@@ -743,6 +983,54 @@ theorem miriStepStmt_callerFrames_preserved (frames : Array (Frame P L E))
     (frames.set (frames.size - 1) updatedTop hTop)[i]? = frames[i]? := by
   have hNe : frames.size - 1 ≠ i := by omega
   simp [hNe]
+
+/-- **Compositional caller-stack frame law (`miriStepStmt_frame_callerStack`)**: if a statement
+executes cleanly to `after` without altering stack depth or any suspended caller frame
+(`i < frames.size - 1`), then `Step.step` advances ONLY the top frame's `statementIndex` and
+frames EVERY suspended caller frame identically! -/
+theorem miriStepStmt_frame_callerStack (hooks : StepHooks P L E M C V) (choice : C)
+    (post : Bool → StepState P L E M → Prop)
+    (onError : StepError → StepState P L E M → Prop)
+    (state after : StepState P L E M) (frame current : Frame P L E)
+    (loc currentLoc : Miri.MIR.Location) (bb : Miri.MIR.BasicBlock) (stmt : Miri.MIR.Statement)
+    (hFrame : state.stack.currentFrame? = some frame)
+    (hLoc : frame.location = .mir loc)
+    (hBlock : frame.body.basicBlocks[loc.block]? = some bb)
+    (hStmt : bb.statements[loc.statementIndex]? = some stmt)
+    (hEval : Step.evalStatement hooks choice stmt state = (after, .ok ()))
+    (hSameDepth : after.stack.frames.size = state.stack.frames.size)
+    (hAfterTop : after.stack.currentFrame? = some current)
+    (hAfterLoc : current.location = .mir currentLoc)
+    (hCallerFrames : ∀ i, i < state.stack.frames.size - 1 →
+      after.stack.frames[i]? = state.stack.frames[i]?) :
+    ∃ hTop : after.stack.frames.size - 1 < after.stack.frames.size,
+      let nextState : StepState P L E M :=
+        { after with
+          stack :=
+            { frames := after.stack.frames.set (after.stack.frames.size - 1)
+                { current with location := .mir { currentLoc with statementIndex := currentLoc.statementIndex + 1 } }
+                hTop } }
+      (∀ i, i < state.stack.frames.size - 1 → nextState.stack.frames[i]? = state.stack.frames[i]?) ∧
+      (AnnealExactWP (miriStepAction hooks choice) post onError state ↔ post true nextState) := by
+  have hTop : after.stack.frames.size - 1 < after.stack.frames.size := by
+    unfold Stack.currentFrame? at hAfterTop
+    cases hSz : after.stack.frames.size with
+    | zero => simp [Array.back?, hSz] at hAfterTop
+    | succ k => omega
+  refine ⟨hTop, ?_, ?_⟩
+  · intro i hi
+    have hi' : i < after.stack.frames.size - 1 := by omega
+    rw [miriStepStmt_callerFrames_preserved after.stack.frames _ hTop i hi']
+    exact hCallerFrames i hi
+  · rw [miriStepStmtExactWP_iff hooks choice post onError state frame loc bb stmt
+      hFrame hLoc hBlock hStmt]
+    unfold AnnealExactWP miriInstructionAction
+    rw [hEval]
+    dsimp only
+    simp only [hSameDepth, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+      hAfterTop, hAfterLoc]
+    have hTop' : state.stack.frames.size - 1 < state.stack.frames.size := by omega
+    simp only [hTop', ↓reduceDIte]
 
 /-! ### §2.1. Call-Dispatch WP (`CallDispatchMachine.findMirOrEvalFn` & `callExtra` & `.Call` Terminator) -/
 
@@ -895,6 +1183,36 @@ theorem miriCallDispatch_loadMir_exactWP (h : CallDispatchMachine.Hooks S C Othe
   rw [hNotF]; dsimp only
   rw [hBackOk]; dsimp only
   rw [hLoadOk]
+
+/-- Specialized branch corollary: foreign item with configured `h.foreign = some foreignAction`
+routes directly into unmodified vendored `Miri.Interpreter.ForeignItems.emulate`! -/
+theorem miriCallDispatch_foreignEmulate_exactWP (h : CallDispatchMachine.Hooks S C Other)
+    (choice : C) (callee : CallInstance) (abi : FnAbi Miri.MIR.TyId)
+    (args : Array (FnArg Provenance)) (destination : RuntimeStackPlace Provenance)
+    (ret : Option Miri.MIR.BasicBlockId) (unwind : Miri.MIR.UnwindAction)
+    (post : Option (LoadedBody × CallInstance) → S → Prop)
+    (onError : StepError → S → Prop)
+    (state s1 s2 : S) (name : String)
+    (foreignAction : CallDispatchMachine.M S
+      (ForeignItems.Hooks Provenance S (RuntimePlace Provenance) (RuntimePlace Provenance)
+        (Pointer (Option Provenance)) LoadedBody CallInstance))
+    (hIsF : h.isForeignItem callee state = .ok true s1)
+    (hSym : h.symbolName callee s1 = .ok name s2)
+    (hFor : h.foreign = some foreignAction) :
+    AnnealExactWP (miriCallDispatchAction h choice callee abi args destination ret unwind)
+        post onError state ↔
+      AnnealExactWP
+        (ExactAction.ofEStateM
+          (h.foreignScope (do
+            let foreign ← foreignAction
+            ForeignItems.emulate foreign name abi (args.map FnArg.copyFnArg)
+              destination.toRuntimePlace ret unwind)))
+        post onError s2 := by
+  rw [miriCallDispatchExactWP_iff]
+  unfold miriCallDispatchPre
+  rw [hIsF]; dsimp only
+  rw [hSym]; dsimp only
+  rw [hFor]
 
 /-- Lift unmodified `Miri.Interpreter.CallDispatchMachine.callExtra` into `ExactAction`. -/
 def miriCallExtraAction (h : CallDispatchMachine.Hooks S C Other) (choice : C)
@@ -1358,6 +1676,93 @@ theorem miriObserveMemory_agrees_getAllocRaw [DecidableEq P] [PointerProvenance 
   refine ⟨rfl, rfl, ?_⟩
   unfold miriObserveMemoryAction
   rw [hLive]
+
+/-- **Universal invariant-framing WP law (`miriObserveMemory_frame_invariant_iff`)**: because
+`miriObserveMemoryAction` is strictly state-immutable on BOTH `.ok` and `.error`, ANY state
+invariant `Inv : MiriObservedState P → Prop` factors cleanly out of BOTH postcondition and error
+continuation! -/
+theorem miriObserveMemory_frame_invariant_iff [DecidableEq P] [PointerProvenance P]
+    (layout : TargetDataLayout) (allocId : Miri.Memory.AllocId) (query : MiriObserveQuery)
+    (Inv : MiriObservedState P → Prop)
+    (post : MiriObservedValue P → MiriObservedState P → Prop)
+    (onError : MiriObserveError → MiriObservedState P → Prop)
+    (st : MiriObservedState P) :
+    AnnealExactWP (miriObserveMemoryAction layout allocId query)
+        (fun val st' => post val st' ∧ Inv st')
+        (fun err st' => onError err st' ∧ Inv st') st ↔
+      Inv st ∧ AnnealExactWP (miriObserveMemoryAction layout allocId query) post onError st := by
+  have ⟨hOkImm, hErrImm⟩ := miriObserveMemory_state_immutable layout allocId query st
+  unfold AnnealExactWP
+  cases hAct : miriObserveMemoryAction layout allocId query st with
+  | ok val st' =>
+    have hEq : st' = st := hOkImm val st' hAct
+    subst hEq
+    exact ⟨fun ⟨hp, hi⟩ => ⟨hi, hp⟩, fun ⟨hi, hp⟩ => ⟨hp, hi⟩⟩
+  | error err st' =>
+    have hEq : st' = st := hErrImm err st' hAct
+    subst hEq
+    exact ⟨fun ⟨he, hi⟩ => ⟨hi, he⟩, fun ⟨hi, he⟩ => ⟨he, hi⟩⟩
+
+/-- **Miss / dangling-allocation bridge to real vendored `MemoryLifecycle.getAllocRaw`**:
+whenever `lookupLiveAlloc st allocId = none` and global-allocation fallback fails with `gErr`
+(e.g., `.unavailable` or `.dangling`), real `MemoryLifecycle.getAllocRaw` faults with
+`.error (.globalAccess gErr)` — matching `miriObserveMemoryAction`'s `.error (.missingAlloc allocId)`! -/
+theorem lookupLiveAlloc_none_agrees_getAllocRaw_error [DecidableEq P] [PointerProvenance P]
+    {HookState : Type}
+    (st : MiriObservedState P) (allocId : Miri.Memory.AllocId)
+    (hooksState : HookState) (globalKind : Option Unit)
+    (hooks : GlobalAllocationHooks P BorrowTree Unit HookState)
+    (gMem : MemoryState P BorrowTree Unit) (gHooks : HookState)
+    (gErr : GlobalAccessError)
+    (hMiss : lookupLiveAlloc st allocId = none)
+    (hGlobErr : MemoryLifecycle.getGlobalAlloc st.memory hooksState allocId false hooks =
+      ⟨gMem, gHooks, .error gErr⟩) :
+    (MemoryLifecycle.getAllocRaw st.memory hooksState allocId globalKind hooks).outcome =
+      .error (.globalAccess gErr) ∧
+    ∀ layout query,
+      miriObserveMemoryAction layout allocId query st = .error (.missingAlloc allocId) st := by
+  unfold lookupLiveAlloc at hMiss
+  cases hF : st.memory.live.find? (fun old => old.1 == allocId) with
+  | some entry => rw [hF] at hMiss; cases hMiss
+  | none =>
+    constructor
+    · unfold MemoryLifecycle.getAllocRaw
+      simp only [Id.run, hF, hGlobErr, pure, Pure.pure]
+    · intro layout query
+      unfold miriObserveMemoryAction lookupLiveAlloc
+      rw [hF]
+      rfl
+
+/-- Lift unmodified vendored `Miri.Interpreter.RawMemoryMachine.readBytes` into `ExactAction`. -/
+def miriRawMemoryReadBytesAction {K User : Type} [DecidableEq K]
+    (config : PlaceMachine.AccessConfig K User)
+    (arithmetic : PointerArithmetic) (pointer : Pointer (Option Provenance)) (length : UInt64) :
+    ExactAction (MachineHooks.State K User) StepError ByteArray :=
+  ExactAction.ofEStateM (RawMemoryMachine.readBytes config arithmetic pointer length)
+
+/-- **Exact bidirectional `↔` bridge to real vendored `Miri.Interpreter.RawMemoryMachine.readBytes`**:
+once `RawMemoryMachine.reference` resolves `some ref` in post-state `s1`, unmodified
+`RawMemoryMachine.readBytes` evaluates `ref.allocation.getBytesStripProvenance config.runtime.base ref.range`
+— directly connecting real Miri's raw-memory byte reader to `miriObserveBytesExactWP_iff`! -/
+theorem miriRawMemoryReadBytesExactWP_iff {K User : Type} [DecidableEq K]
+    (config : PlaceMachine.AccessConfig K User)
+    (arithmetic : PointerArithmetic) (pointer : Pointer (Option Provenance)) (length : UInt64)
+    (post : ByteArray → MachineHooks.State K User → Prop)
+    (onError : StepError → MachineHooks.State K User → Prop)
+    (state s1 : MachineHooks.State K User)
+    (ref : AllocationAccessRef Provenance BorrowTree)
+    (hRef : RawMemoryMachine.reference config arithmetic false pointer (Size.ofBytes length) state =
+      .ok (some ref) s1) :
+    AnnealExactWP (miriRawMemoryReadBytesAction config arithmetic pointer length) post onError state ↔
+      AnnealExactWP (miriObserveBytesAction config.runtime.base ref.range)
+        (fun bs _ => post ⟨bs⟩ s1)
+        (fun err _ => onError (config.memoryError (.allocation err)) s1)
+        ref.allocation := by
+  rw [miriObserveBytesExactWP_iff]
+  unfold AnnealExactWP miriRawMemoryReadBytesAction ExactAction.ofEStateM RawMemoryMachine.readBytes
+  simp only [bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure, hRef]
+  dsimp only [Except.mapError]
+  cases ref.allocation.getBytesStripProvenance config.runtime.base ref.range <;> rfl
 
 /-! ### §3.1. Composing `miriObserveMemoryExactWP_iff` with Tree Borrows Range, Instruction & Call-Dispatch WP -/
 
@@ -2230,6 +2635,174 @@ theorem witness_call_dispatch_positive_and_negative_refutations :
   · rw [miriCallExtraExactWP_iff]; exact ⟨rfl, rfl⟩
   · intro hSafe; rw [miriCallExtraExactWP_iff] at hSafe; exact hSafe
 
+private def ep1ForeignHooks (retLog : Option Miri.MIR.BasicBlockId → Nat → Nat) :
+    ForeignItems.Hooks Provenance Nat (RuntimePlace Provenance) (RuntimePlace Provenance)
+      (Pointer (Option Provenance)) LoadedBody CallInstance :=
+  { family := .unix
+    os := "linux"
+    arch := "x86_64"
+    maximumSize := 1024
+    noAllocShimSymbol := "__rust_no_alloc_shim_is_unstable_v2"
+    allocatorSymbol := fun _ => pure none
+    lookupFunction := fun _ => pure none
+    forceAllocation := fun d => pure d
+    returnToBlock := fun ret s => .ok () (retLog ret s)
+    unwindToBlock := fun _ => pure ()
+    nativeEnabled := false
+    callNative := fun _ _ _ => pure false
+    expectedAbi := fun sig => pure { ep1SampleFnAbi with conv := sig.conv }
+    argumentCompat := fun _ _ => pure true
+    checkSymbolClash := fun _ => pure ()
+    transmute := fun op _ => pure op
+    readUsize := fun _ => pure 0
+    readPointer := fun _ => pure ⟨Size.ZERO, none⟩
+    readI32 := fun _ => pure 0
+    isNull := fun _ => pure true
+    allocate := fun _ _ _ _ => pure ⟨Size.ZERO, none⟩
+    deallocate := fun _ _ _ => pure ()
+    reallocate := fun _ _ _ _ _ => pure ⟨Size.ZERO, none⟩
+    writePointer := fun _ _ => pure ()
+    writeNull := fun _ => pure ()
+    setEnomem := pure ()
+    startExit := fun _ => pure ()
+    specialDestination := fun d => pure d
+    math := fun _ _ _ _ => pure .NotSupported
+    unix := fun _ _ _ _ => pure .NotSupported
+    windows := fun _ _ _ _ => pure .NotSupported
+    otherPortable := fun _ _ _ _ => pure none }
+
+private def ep1CallHooksWithForeign (sym : String) :
+    CallDispatchMachine.Hooks Nat Unit String :=
+  { ep1CallHooks true (.ok .none) with
+    symbolName := fun _ => pure sym
+    foreign := some (pure (ep1ForeignHooks (fun ret s => (ret.getD 0) + s))) }
+
+private def ep1NoProgressCallBody : Miri.MIR.Body :=
+  { phase := .Built
+    argumentCount := 0
+    spreadArgument := none
+    locals := #[]
+    basicBlocks :=
+      #[{ statements := #[]
+          terminator :=
+            ⟨⟨defaultSpanRef, 0⟩,
+             .Call (.Copy ⟨0, #[]⟩) #[] ⟨0, #[]⟩ (some 0) .Continue .Normal defaultSpanRef⟩
+          cleanup := false }] }
+
+private def ep1NoProgressState : AnnealStepState :=
+  let frame : Frame AnnealProv LocalLayout Unit :=
+    { body := ep1NoProgressCallBody
+      bodyIdentity := BodyIdentity.ofCanonicalIndex 0
+      functionInstance := ⟨.Item 0, #[]⟩
+      extra := ()
+      returnContinuation := .stop false
+      returnPlace := .frameLocal 0 0 none { ty := 0, layout := zstLayoutData }
+        (LocalsIdentity.ofAllocationToken 0)
+      localsIdentity := LocalsIdentity.ofAllocationToken 0
+      locals := #[]
+      vaList := #[]
+      trackCallerArg := none
+      location := .mir ⟨0, 0⟩ }
+  { stack := { frames := #[frame] }, machine := AnnealMachine.empty }
+
+private def ep1NoProgressTermHooks :
+    TerminatorHooks AnnealProv LocalLayout Unit AnnealMachine Unit
+      (Miri.Interpreter.Operand AnnealProv) (RvalueImmTy AnnealProv) :=
+  { annealTerminatorHooks [] emptyLayoutTable with
+    call := fun _ _ st => (st, .ok ()) }
+
+private def ep1NoProgressStepHooks :
+    StepHooks AnnealProv LocalLayout Unit AnnealMachine Unit (RuntimePlace AnnealProv) :=
+  { annealStepHooks [] emptyLayoutTable with
+    terminator := ControlFlow.evalTerminator ep1NoProgressTermHooks }
+
+/-- **Real `ForeignItems.emulate` Positive & Negative Dispatch + `.Call` Terminator No-Progress
+Guard Witness**:
+1. Positive (`ForeignItems.emulate`): calling foreign shim `"__rust_no_alloc_shim_is_unstable_v2"`
+   through real `CallDispatchMachine.findMirOrEvalFn` → `ForeignItems.emulate` checks the Rust ABI
+   via `ForeignItems.checkSignature`, invokes `returnToBlock (some 5)` (`7 ↦ 12`), and returns `none`!
+2. Negative #1 (`ForeignItems.emulate` `"abort"` + `↔` refutation): calling `"abort"` with C ABI
+   faults with `.machineStop "the program aborted execution"`, refuting pure safety via `↔`!
+3. Negative #2 (`miriStepCallTerminatorExactWP_iff` no-progress guard + `↔` refutation): a `.Call`
+   terminator with `target = some 0` whose `hooks.call` leaves frame count and location unchanged
+   triggers rustc's real no-progress guard `.invalidProgram "evaluating this call made no progress"`,
+   refuting pure safety via `↔`! -/
+theorem witness_call_dispatch_foreign_emulate_and_call_terminator :
+    let abiC : FnAbi Miri.MIR.TyId := { ep1SampleFnAbi with conv := .C }
+    AnnealExactWP
+      (miriCallDispatchAction (ep1CallHooksWithForeign "__rust_no_alloc_shim_is_unstable_v2") ()
+        ep1SampleCallee ep1SampleFnAbi #[] ep1SampleDest (some 5) .Continue)
+      (fun res s' => res = none ∧ s' = 12)
+      (fun _ _ => False) 7 ∧
+    AnnealExactWP
+      (miriCallDispatchAction (ep1CallHooksWithForeign "abort") ()
+        ep1SampleCallee abiC #[] ep1SampleDest (some 5) .Continue)
+      (fun _ _ => False)
+      (fun err s' => err = .machineStop "the program aborted execution" ∧ s' = 7) 7 ∧
+    ¬ AnnealExactWP
+      (miriCallDispatchAction (ep1CallHooksWithForeign "abort") ()
+        ep1SampleCallee abiC #[] ep1SampleDest (some 5) .Continue)
+      (fun _ _ => True) (fun _ _ => False) 7 ∧
+    AnnealExactWP (miriStepAction ep1NoProgressStepHooks ())
+      (fun _ _ => False)
+      (fun err s' =>
+        err = .invalidProgram "evaluating this call made no progress" ∧
+        s' = ep1NoProgressState)
+      ep1NoProgressState ∧
+    ¬ AnnealExactWP (miriStepAction ep1NoProgressStepHooks ())
+      (fun _ _ => True) (fun _ _ => False) ep1NoProgressState := by
+  let abiC : FnAbi Miri.MIR.TyId := { ep1SampleFnAbi with conv := .C }
+  have hNoProg :
+      ∀ (post : Bool → AnnealStepState → Prop) (onError : StepError → AnnealStepState → Prop),
+        AnnealExactWP (miriStepAction ep1NoProgressStepHooks ()) post onError ep1NoProgressState ↔
+          onError (.invalidProgram "evaluating this call made no progress") ep1NoProgressState := by
+    intro post onError
+    have hStep := miriStepCallTerminatorExactWP_iff ep1NoProgressStepHooks ep1NoProgressTermHooks () rfl
+      post onError ep1NoProgressState (ep1NoProgressState.stack.frames[0]'(by decide))
+      ⟨0, 0⟩ (ep1NoProgressCallBody.basicBlocks[0]'(by decide))
+      (.Copy ⟨0, #[]⟩) #[] ⟨0, #[]⟩ (some 0) .Continue .Normal defaultSpanRef ⟨defaultSpanRef, 0⟩
+      rfl rfl rfl rfl rfl
+    dsimp only at hStep
+    rw [hStep]
+    rfl
+  have hNoAllocEval :
+      ((ep1CallHooksWithForeign "__rust_no_alloc_shim_is_unstable_v2").foreignScope (do
+        let foreign ← pure (ep1ForeignHooks (fun ret s => (ret.getD 0) + s))
+        ForeignItems.emulate foreign "__rust_no_alloc_shim_is_unstable_v2" ep1SampleFnAbi
+          (#[].map FnArg.copyFnArg) ep1SampleDest.toRuntimePlace (some 5) .Continue)) 7 =
+      .ok none 12 := by kernel_rfl
+  have hAbortEval :
+      ((ep1CallHooksWithForeign "abort").foreignScope (do
+        let foreign ← pure (ep1ForeignHooks (fun ret s => (ret.getD 0) + s))
+        ForeignItems.emulate foreign "abort" abiC
+          (#[].map FnArg.copyFnArg) ep1SampleDest.toRuntimePlace (some 5) .Continue)) 7 =
+      .error (.machineStop "the program aborted execution") 7 := by kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · rw [miriCallDispatch_foreignEmulate_exactWP
+      (ep1CallHooksWithForeign "__rust_no_alloc_shim_is_unstable_v2") ()
+      ep1SampleCallee ep1SampleFnAbi #[] ep1SampleDest (some 5) .Continue _ _ 7 7 7
+      "__rust_no_alloc_shim_is_unstable_v2" _ rfl rfl rfl]
+    unfold AnnealExactWP ExactAction.ofEStateM
+    rw [hNoAllocEval]
+    exact ⟨rfl, rfl⟩
+  · rw [miriCallDispatch_foreignEmulate_exactWP
+      (ep1CallHooksWithForeign "abort") ()
+      ep1SampleCallee abiC #[] ep1SampleDest (some 5) .Continue _ _ 7 7 7
+      "abort" _ rfl rfl rfl]
+    unfold AnnealExactWP ExactAction.ofEStateM
+    rw [hAbortEval]
+    exact ⟨rfl, rfl⟩
+  · intro hSafe
+    rw [miriCallDispatch_foreignEmulate_exactWP
+      (ep1CallHooksWithForeign "abort") ()
+      ep1SampleCallee abiC #[] ep1SampleDest (some 5) .Continue _ _ 7 7 7
+      "abort" _ rfl rfl rfl] at hSafe
+    unfold AnnealExactWP ExactAction.ofEStateM at hSafe
+    rw [hAbortEval] at hSafe
+    exact hSafe
+  · rw [hNoProg]; exact ⟨rfl, rfl⟩
+  · intro hSafe; rw [hNoProg] at hSafe; exact hSafe
+
 private def ep1U32Ty : Trusted.Rustc.V2026_06_01.MirAst.Ty := ⟨.uint .u32, 0⟩
 private def ep1U32Decl : LocalDecl := ⟨.mut, ep1U32Ty, some "ret"⟩
 private def ep1TmpDecl : LocalDecl := ⟨.mut, ep1U32Ty, some "tmp"⟩
@@ -2463,6 +3036,322 @@ theorem witness_v2026_capturedMir_tree_borrows_ub_triangle :
 
 end V2026CapturedMirTreeBorrowsUB
 
+/-! ### §4.3. Tree-Borrows-Enabled Miri-Side (`borrowTracker := some`) `Step.step` + `translateBody` Execution & `↔` UB Refutation -/
+
+section TbEnabledTranslateBodyMiriExecution
+
+/-- Total, kernel-reducible diagnostic label for `BorrowTree.BorrowTreeAccessStatus` (avoids
+`Std.Format.pretty` partial functions during kernel-checked proofs). -/
+def formatTbAccessStatus : BorrowTree.BorrowTreeAccessStatus → String
+  | .Completed => "Completed"
+  | .MissingTag _ => "MissingTag"
+  | .RangeMapFailure _ => "RangeMapFailure"
+  | .LocationMapFailure _ _ => "LocationMapFailure"
+  | .AccessFailure _ (.TransitionError _ (.ProtectedDisabled .Frozen)) =>
+      "Tree Borrows UB: ProtectedDisabled Frozen"
+  | .AccessFailure _ (.TransitionError _ (.ProtectedDisabled .Unique)) =>
+      "Tree Borrows UB: ProtectedDisabled Unique"
+  | .AccessFailure _ (.TransitionError _ (.ChildAccessForbidden .Frozen)) =>
+      "Tree Borrows UB: ChildAccessForbidden Frozen"
+  | .AccessFailure _ (.TransitionError _ (.ChildAccessForbidden _)) =>
+      "Tree Borrows UB: ChildAccessForbidden"
+  | .AccessFailure _ (.TransitionError _ (.ProtectedDisabled _)) =>
+      "Tree Borrows UB: ProtectedDisabled"
+  | .AccessFailure _ (.TransitionError _ .ProtectedDealloc) =>
+      "Tree Borrows UB: ProtectedDealloc"
+  | .AccessFailure _ _ => "Tree Borrows UB: AccessFailure"
+  | .WildcardFailure _ _ => "Tree Borrows UB: WildcardFailure"
+  | .MultipleRoots _ => "Tree Borrows UB: MultipleRoots"
+  | .CacheFailure _ _ => "Tree Borrows UB: CacheFailure"
+
+/-- Run unmodified vendored `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange` on the live
+`Allocation AnnealProv (Option BorrowTree)` targeted by `mplace` whenever `st.machine.borrowTracker`
+is active (`some bs`), committing the updated `BorrowTree` back into `st.machine.memory.live` on
+BOTH `.Completed` and Tree Borrows error (mirroring `MachineMemoryHooks.commitTreeAccess`)! -/
+def annealTbCheckMemAccess (mplace : Miri.Interpreter.MemPlace AnnealProv)
+    (size : Size) (kind : AccessKind) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit := do
+  let st ← get
+  let some bs := st.machine.borrowTracker | return ()
+  let some (.concrete allocId tag) := mplace.ptr.provenance | return ()
+  let some base := st.machine.lookupBaseAddr allocId
+    | throw (.undefinedBehavior "Tree Borrows access on allocation without base address")
+  let offset := Size.ofBytes (mplace.ptr.offset.bytes - base)
+  match st.machine.memory.live.find? (fun row => row.1 == allocId) with
+  | none => throw (.undefinedBehavior "Tree Borrows access on dangling allocation")
+  | some (_, ⟨_, alloc⟩) =>
+    match alloc.extra with
+    | none => return ()
+    | some tree =>
+      let res := tree.performBorrowAccessRange (.concrete tag) offset size kind
+        bs.global.protectedTags .VisitChildrenOfAccessed
+      let alloc' := alloc.setExtra (some res.tree)
+      match st.machine.memory.setLiveAllocation allocId alloc' with
+      | .error _ => throw (.undefinedBehavior "Tree Borrows allocation update failed")
+      | .ok mem' =>
+        set { st with machine := { st.machine with memory := mem' } }
+        match res.status with
+        | .Completed => return ()
+        | errStatus =>
+          throw (.undefinedBehavior (formatTbAccessStatus errStatus))
+
+/-- Tree-Borrows-enforcing `StepHooks` extending unmodified `annealStepHooks`: before any dereference
+memory write (`*p = rvalue`) or dereference memory read (`_d = copy/move (*p)`), enforces real
+vendored `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange` against
+`state.machine.borrowTracker.global.protectedTags` and live allocation `BorrowTree`s, then executes
+unmodified `annealStepHooks.assign`! -/
+def annealTbStepHooks (localDecls : List LocalDecl := .nil)
+    (layouts : AnnealLayoutTable := emptyLayoutTable) :
+    StepHooks AnnealProv LocalLayout Unit AnnealMachine Unit (RuntimePlace AnnealProv) :=
+  { annealStepHooks localDecls layouts with
+    assign := fun choice place rvalue state =>
+      Miri.Interpreter.runRvalue (do
+        match rvalue with
+        | .Use (.Copy srcPlace) _ | .Use (.Move srcPlace) _ =>
+          if !srcPlace.projection.isEmpty then
+            let srcRt ← annealEvalPlace localDecls layouts srcPlace
+            match srcRt.ref with
+            | .memory mp => annealTbCheckMemAccess mp srcRt.layout.layout.size .Read
+            | _ => pure ()
+        | _ => pure ()
+        if !place.projection.isEmpty then
+          let dstRt ← annealEvalPlace localDecls layouts place
+          match dstRt.ref with
+          | .memory mp => annealTbCheckMemAccess mp dstRt.layout.layout.size .Write
+          | _ => pure ()
+        Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks localDecls layouts) choice rvalue place)
+        state }
+
+private def ep1MutPtrU32Ty : Trusted.Rustc.V2026_06_01.MirAst.Ty := ⟨.rawPtr .mut (.uint .u32), 0⟩
+private def ep1Ptr1Decl : LocalDecl := ⟨.mut, ep1MutPtrU32Ty, some "p_write"⟩
+private def ep1Ptr2Decl : LocalDecl := ⟨.mut, ep1MutPtrU32Ty, some "p_read"⟩
+
+/-- Real `V2026_06_01` `CapturedMir` body lowered through `LeanMiriSpec.Correspondence.translateBody`:
+`bb0: (*_1) = const 99u32; _0 = copy (*_2); return`. -/
+def ep1BodyTbDerefWriteAndRead : CapturedMir :=
+  mkEp1Body "ep1::tb_deref_write_and_read" [ep1U32Decl, ep1Ptr1Decl, ep1Ptr2Decl]
+    [ { statements :=
+          [ { kind := .assign ⟨1, [.deref]⟩ (.use (.constant ⟨ep1U32Ty, .scalar (.int ⟨99, 4⟩)⟩)),
+              span := "s0" },
+            { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)),
+              span := "s1" } ],
+        terminator := { kind := .return_, span := "t0" },
+        isCleanup := false } ]
+
+private def ep1TbBaseAddr : UInt64 := 0x1000
+
+private def ep1PtrScalar (tag : BorTag) (off : UInt64) : Miri.Memory.Scalar AnnealProv :=
+  Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+    ⟨Size.ofBytes (ep1TbBaseAddr + off), Provenance.concrete ep1AllocId tag⟩
+
+private noncomputable def ep1InitTbMiriState (writeTag : BorTag) (writeOff : UInt64) :
+    AnnealStepState :=
+  let base := initMiriStateForBody ep1BodyTbDerefWriteAndRead emptyLayoutTable
+  let allocWithTree : Allocation AnnealProv (Option BorrowTree) :=
+    ep1BaseAlloc16.withExtra (some ep1DisjointTwoChildTree)
+  let mem : AnnealMemory :=
+    { (MemoryState.empty : AnnealMemory) with
+      nextAllocId := 2
+      live := #[(ep1AllocId, { kind := .stack, allocation := allocWithTree })] }
+  let addrs : AllocAddresses.GlobalAddressState :=
+    { provenanceMode := .default
+      addressMode := .managed
+      generation := none
+      baseAddr := #[⟨ep1AllocId, ep1TbBaseAddr⟩] }
+  let bt : MachineHooks.BorrowState :=
+    { global := { GlobalState.new with protectedTags := ep1Prot23 }
+      retagMode := .Default }
+  let pLay := some (translateTy ep1MutPtrU32Ty emptyLayoutTable)
+  let u32Lay := some (translateTy ep1U32Ty emptyLayoutTable)
+  let locals : Array (LocalState AnnealProv LocalLayout) :=
+    #[ { value := .live (.immediate .uninit), layout := u32Lay },
+       { value := .live (.immediate (.scalar (ep1PtrScalar writeTag writeOff))), layout := pLay },
+       { value := .live (.immediate (.scalar (ep1PtrScalar ep1Tag2 0))), layout := pLay } ]
+  let frame' : Frame AnnealProv LocalLayout Unit :=
+    match base.stack.frames[0]? with
+    | some fr => { fr with locals := locals }
+    | none =>
+      { body := translateBody ep1BodyTbDerefWriteAndRead
+        bodyIdentity := BodyIdentity.ofCanonicalIndex 0
+        functionInstance := ⟨.Item 0, #[]⟩
+        extra := ()
+        returnContinuation := .stop false
+        returnPlace := .frameLocal 0 0 none (translateTy ep1U32Ty emptyLayoutTable)
+          (LocalsIdentity.ofAllocationToken 0)
+        localsIdentity := LocalsIdentity.ofAllocationToken 0
+        locals := locals
+        vaList := #[]
+        trackCallerArg := none
+        location := .mir ⟨0, 0⟩ }
+  { stack := { frames := #[frame'] }
+    machine := { memory := mem, addresses := addrs, borrowTracker := some bt } }
+
+private noncomputable def annealTbCheckMemAccessLMU (mplace : Miri.Interpreter.MemPlace AnnealProv)
+    (size : Size) (kind : AccessKind) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit := do
+  let st ← get
+  let some bs := st.machine.borrowTracker | return ()
+  let some (.concrete allocId tag) := mplace.ptr.provenance | return ()
+  let some base := st.machine.lookupBaseAddr allocId
+    | throw (.undefinedBehavior "Tree Borrows access on allocation without base address")
+  let offset := Size.ofBytes (mplace.ptr.offset.bytes - base)
+  match st.machine.memory.live.find? (fun row => row.1 == allocId) with
+  | none => throw (.undefinedBehavior "Tree Borrows access on dangling allocation")
+  | some (_, ⟨_, alloc⟩) =>
+    match alloc.extra with
+    | none => return ()
+    | some tree =>
+      let res := performBorrowAccessRangeLMU tree (.concrete tag) offset size kind
+        bs.global.protectedTags .VisitChildrenOfAccessed
+      let alloc' := alloc.setExtra (some res.tree)
+      match st.machine.memory.setLiveAllocation allocId alloc' with
+      | .error _ => throw (.undefinedBehavior "Tree Borrows allocation update failed")
+      | .ok mem' =>
+        set { st with machine := { st.machine with memory := mem' } }
+        match res.status with
+        | .Completed => return ()
+        | errStatus =>
+          throw (.undefinedBehavior (formatTbAccessStatus errStatus))
+
+private noncomputable def annealTbStepHooksLMU (localDecls : List LocalDecl := .nil)
+    (layouts : AnnealLayoutTable := emptyLayoutTable) :
+    StepHooks AnnealProv LocalLayout Unit AnnealMachine Unit (RuntimePlace AnnealProv) :=
+  { annealStepHooks localDecls layouts with
+    assign := fun choice place rvalue state =>
+      Miri.Interpreter.runRvalue (do
+        match rvalue with
+        | .Use (.Copy srcPlace) _ | .Use (.Move srcPlace) _ =>
+          if !srcPlace.projection.isEmpty then
+            let srcRt ← annealEvalPlace localDecls layouts srcPlace
+            match srcRt.ref with
+            | .memory mp => annealTbCheckMemAccessLMU mp srcRt.layout.layout.size .Read
+            | _ => pure ()
+        | _ => pure ()
+        if !place.projection.isEmpty then
+          let dstRt ← annealEvalPlace localDecls layouts place
+          match dstRt.ref with
+          | .memory mp => annealTbCheckMemAccessLMU mp dstRt.layout.layout.size .Write
+          | _ => pure ()
+        Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks localDecls layouts) choice rvalue place)
+        state }
+
+private theorem annealTbCheckMemAccess_eq_LMU :
+    @annealTbCheckMemAccess = @annealTbCheckMemAccessLMU := by
+  funext mp sz kind
+  unfold annealTbCheckMemAccess annealTbCheckMemAccessLMU
+  rw [performBorrowAccessRangeLMU.eq_src]
+
+private theorem annealTbStepHooks_eq_LMU (localDecls : List LocalDecl) (layouts : AnnealLayoutTable) :
+    annealTbStepHooks localDecls layouts = annealTbStepHooksLMU localDecls layouts := by
+  unfold annealTbStepHooks annealTbStepHooksLMU
+  rw [annealTbCheckMemAccess_eq_LMU]
+
+/-- **End-to-End Tree-Borrows-Enabled (`borrowTracker := some`) Miri-Side `translateBody` +
+`Step.step` + `AnnealExactWP` Witness (Positive + 2 Bidirectional `↔` Negative UB Refutations)**:
+Runs real `LeanMiriSpec.Correspondence.translateBody ep1BodyTbDerefWriteAndRead` through unmodified
+`Miri.Interpreter.Step.step` (`miriRunFuelAction`) with live `Allocation AnnealProv (Option BorrowTree)`
+and `borrowTracker := some { protectedTags := ep1Prot23 }`:
+1. **Positive**: `_1` carries `tag 3` (`Unique` on `[8..16)`) at offset `8` and `_2` carries
+   `tag 2` (`Frozen` on `[0..8)`) at offset `0`. Executing `(*_1) = 99u32; _0 = copy (*_2); return`:
+   - passes real `BorrowTree.performBorrowAccessRange` for BOTH the write and the read,
+   - writes `99u32` at `[8..12)` while preserving `42u32` at `[0..4)` (`activeLocal0Bits mid = some 42`),
+   - terminates cleanly with empty stack (`final.stack.frames = #[]`)!
+2. **Negative #1 (Protected Foreign Write UB + `↔` Refutation)**: `_1` carries root `tag 1` at
+   offset `0` — step 1 faults in real `BorrowTree.performBorrowAccessRange` with
+   `.ProtectedDisabled .Frozen` AND via `↔` refutes `¬ AnnealExactWP ... (fun _ _ => True) (fun _ _ => False)`!
+3. **Negative #2 (Frozen Local Write UB + `↔` Refutation)**: `_1` carries `tag 2` (`Frozen`) at
+   offset `0` — step 1 faults in real `BorrowTree.performBorrowAccessRange` with
+   `.ChildAccessForbidden .Frozen` AND via `↔` refutes `¬ AnnealExactWP ... (fun _ _ => True) (fun _ _ => False)`! -/
+theorem witness_tb_enabled_translateBody_positive_and_negative_ub_refutations :
+    let hooks := annealTbStepHooks ep1BodyTbDerefWriteAndRead.localDecls emptyLayoutTable
+    let initOk := ep1InitTbMiriState ep1Tag3 8
+    let initProtUB := ep1InitTbMiriState ep1Tag1 0
+    let initFrozUB := ep1InitTbMiriState ep1Tag2 0
+    AnnealExactWP
+      (ExactAction.seq (miriStepAction hooks ()) (miriStepAction hooks ()))
+      (fun more mid => more = true ∧ activeLocal0Bits mid = some 42)
+      (fun _ _ => False) initOk ∧
+    AnnealExactWP (miriRunFuelAction hooks () 6)
+      (fun _ final => final.stack.frames = #[])
+      (fun _ _ => False) initOk ∧
+    AnnealExactWP (miriRunFuelAction hooks () 4)
+      (fun _ _ => False)
+      (fun err _ => err = .undefinedBehavior "Tree Borrows UB: ProtectedDisabled Frozen")
+      initProtUB ∧
+    ¬ AnnealExactWP (miriRunFuelAction hooks () 4)
+      (fun _ _ => True) (fun _ _ => False) initProtUB ∧
+    AnnealExactWP (miriRunFuelAction hooks () 4)
+      (fun _ _ => False)
+      (fun err _ => err = .undefinedBehavior "Tree Borrows UB: ChildAccessForbidden Frozen")
+      initFrozUB ∧
+    ¬ AnnealExactWP (miriRunFuelAction hooks () 4)
+      (fun _ _ => True) (fun _ _ => False) initFrozUB := by
+  let hooksLMU := annealTbStepHooksLMU ep1BodyTbDerefWriteAndRead.localDecls emptyLayoutTable
+  let initOk := ep1InitTbMiriState ep1Tag3 8
+  let initProtUB := ep1InitTbMiriState ep1Tag1 0
+  let initFrozUB := ep1InitTbMiriState ep1Tag2 0
+  have hHooksEq :
+      annealTbStepHooks ep1BodyTbDerefWriteAndRead.localDecls emptyLayoutTable = hooksLMU :=
+    annealTbStepHooks_eq_LMU ep1BodyTbDerefWriteAndRead.localDecls emptyLayoutTable
+  have hStep2 :
+      (match ExactAction.seq (miriStepAction hooksLMU ()) (miriStepAction hooksLMU ()) initOk with
+       | .ok more mid => more == true && activeLocal0Bits mid == some 42
+       | .error _ _ => false) = true := by kernel_rfl
+  have hOkRun :
+      (match miriRunFuelAction hooksLMU () 6 initOk with
+       | .ok () final => final.stack.frames.isEmpty
+       | .error _ _ => false) = true := by kernel_rfl
+  have hProtRun :
+      (match miriRunFuelAction hooksLMU () 4 initProtUB with
+       | .ok _ _ => false
+       | .error err _ => err == .undefinedBehavior "Tree Borrows UB: ProtectedDisabled Frozen") =
+        true := by kernel_rfl
+  have hFrozRun :
+      (match miriRunFuelAction hooksLMU () 4 initFrozUB with
+       | .ok _ _ => false
+       | .error err _ => err == .undefinedBehavior "Tree Borrows UB: ChildAccessForbidden Frozen") =
+        true := by kernel_rfl
+  dsimp only
+  rw [hHooksEq]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold AnnealExactWP
+    cases hR : ExactAction.seq (miriStepAction hooksLMU ()) (miriStepAction hooksLMU ()) initOk with
+    | error _ _ => rw [hR] at hStep2; cases hStep2
+    | ok more mid =>
+      rw [hR] at hStep2
+      simp only [Bool.and_eq_true, beq_iff_eq] at hStep2
+      exact hStep2
+  · unfold AnnealExactWP
+    cases hR : miriRunFuelAction hooksLMU () 6 initOk with
+    | error _ _ => rw [hR] at hOkRun; cases hOkRun
+    | ok u final =>
+      rw [hR] at hOkRun
+      exact Array.isEmpty_iff.mp hOkRun
+  · unfold AnnealExactWP
+    cases hR : miriRunFuelAction hooksLMU () 4 initProtUB with
+    | ok _ _ => rw [hR] at hProtRun; cases hProtRun
+    | error err _ =>
+      rw [hR] at hProtRun
+      exact beq_iff_eq.mp hProtRun
+  · intro hSafe
+    unfold AnnealExactWP at hSafe
+    cases hR : miriRunFuelAction hooksLMU () 4 initProtUB with
+    | ok _ _ => rw [hR] at hProtRun; cases hProtRun
+    | error _ _ => rw [hR] at hSafe; exact hSafe
+  · unfold AnnealExactWP
+    cases hR : miriRunFuelAction hooksLMU () 4 initFrozUB with
+    | ok _ _ => rw [hR] at hFrozRun; cases hFrozRun
+    | error err _ =>
+      rw [hR] at hFrozRun
+      exact beq_iff_eq.mp hFrozRun
+  · intro hSafe
+    unfold AnnealExactWP at hSafe
+    cases hR : miriRunFuelAction hooksLMU () 4 initFrozUB with
+    | ok _ _ => rw [hR] at hFrozRun; cases hFrozRun
+    | error _ _ => rw [hR] at hSafe; exact hSafe
+
+end TbEnabledTranslateBodyMiriExecution
+
 end CrossLayerCorrespondence
 
 /-! ## §5. Episode 1 Capstone & Silent Import-Isolation / Bridge-Reality / 3-Axiom Audit -/
@@ -2489,15 +3378,21 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
     (type_of% @miriProtectedTags_remove_ne) ∧
     (type_of% @miriProtectedTags_insert_ne) ∧
     (type_of% @miriEndCall_preserves_unlisted_protector) ∧
+    (type_of% @miriBeforeMemoryReadExactWP_iff) ∧
+    (type_of% @miriBeforeMemoryWriteExactWP_iff) ∧
     (type_of% @miriInstructionExactWP_iff) ∧
     (type_of% @miriInstructionExactWP_nop_frame) ∧
+    (type_of% @miriInstructionExactWP_meta_frame) ∧
+    (type_of% @annealInstruction_storageDead_returnPlace_err_exactWP) ∧
     (type_of% @miriInstructionExactWP_setDiscriminant_iff) ∧
     (type_of% @miriStepStmtExactWP_iff) ∧
     (type_of% @miriStepStmt_callerFrames_preserved) ∧
+    (type_of% @miriStepStmt_frame_callerStack) ∧
     (type_of% @miriCallDispatchExactWP_iff) ∧
     (type_of% @miriCallDispatch_missingForeign_exactWP) ∧
     (type_of% @miriCallDispatch_backendError_exactWP) ∧
     (type_of% @miriCallDispatch_loadMir_exactWP) ∧
+    (type_of% @miriCallDispatch_foreignEmulate_exactWP) ∧
     (type_of% @miriCallExtraExactWP_iff) ∧
     (type_of% @miriCallTerminatorExactWP_iff) ∧
     (type_of% @miriStepCallTerminatorExactWP_iff) ∧
@@ -2512,6 +3407,9 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
     (type_of% @miriObserveMemory_state_immutable) ∧
     (type_of% @lookupLiveAlloc_eq_getAllocRaw_live) ∧
     (type_of% @miriObserveMemory_agrees_getAllocRaw) ∧
+    (type_of% @miriObserveMemory_frame_invariant_iff) ∧
+    (type_of% @lookupLiveAlloc_none_agrees_getAllocRaw_error) ∧
+    (type_of% @miriRawMemoryReadBytesExactWP_iff) ∧
     (type_of% @miriObserveMemory_then_treeRange_exactWP_iff) ∧
     (type_of% @miriTreeRange_preserves_allocObservation) ∧
     (type_of% @miriObserveMemory_then_instruction_exactWP_iff) ∧
@@ -2528,25 +3426,34 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
     (type_of% @witness_negative_tree_protected_foreign_and_frozen_local_write_ub) ∧
     (type_of% @witness_negative_uninit_memory_observation_refutation) ∧
     (type_of% @witness_call_dispatch_positive_and_negative_refutations) ∧
+    (type_of% @witness_call_dispatch_foreign_emulate_and_call_terminator) ∧
     (type_of% @witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub) ∧
-    (type_of% @witness_v2026_capturedMir_tree_borrows_ub_triangle) :=
+    (type_of% @witness_v2026_capturedMir_tree_borrows_ub_triangle) ∧
+    (type_of% @witness_tb_enabled_translateBody_positive_and_negative_ub_refutations) :=
   ⟨@miriTreeNewChildExactWP_iff, @miriTreeInitialSetupExactWP_iff, @miriTreeRangeExactWP_iff,
    @miriTreeRangeSymbolicExactWP_iff, @miriTreeInitAndRangeExactWP_iff,
    @miriTreeRangeSeqExactWP_iff, @miriTreeRangeChainExactWP_iff,
    @miriTreeRangeThenReleaseExactWP_iff, @miriTreeRange_preserves_topology,
    @miriTreeRange_missingTag_frame_exactWP, @miriProtectedTags_remove_ne,
    @miriProtectedTags_insert_ne, @miriEndCall_preserves_unlisted_protector,
+   @miriBeforeMemoryReadExactWP_iff, @miriBeforeMemoryWriteExactWP_iff,
    @miriInstructionExactWP_iff, @miriInstructionExactWP_nop_frame,
+   @miriInstructionExactWP_meta_frame,
+   @annealInstruction_storageDead_returnPlace_err_exactWP,
    @miriInstructionExactWP_setDiscriminant_iff, @miriStepStmtExactWP_iff,
-   @miriStepStmt_callerFrames_preserved, @miriCallDispatchExactWP_iff,
+   @miriStepStmt_callerFrames_preserved, @miriStepStmt_frame_callerStack,
+   @miriCallDispatchExactWP_iff,
    @miriCallDispatch_missingForeign_exactWP, @miriCallDispatch_backendError_exactWP,
-   @miriCallDispatch_loadMir_exactWP, @miriCallExtraExactWP_iff,
+   @miriCallDispatch_loadMir_exactWP, @miriCallDispatch_foreignEmulate_exactWP,
+   @miriCallExtraExactWP_iff,
    @miriCallTerminatorExactWP_iff, @miriStepCallTerminatorExactWP_iff,
    @miriObserveScalarExactWP_iff, @miriObserveBytesExactWP_iff, @miriObserveRawBytesExactWP_iff,
    @miriObserveBytes_uninit_err_exactWP, @miriObserveBytes_ok_exactWP,
    @miriObserveScalar_state_immutable, @miriObserveBytes_state_immutable,
    @miriObserveMemoryExactWP_iff, @miriObserveMemory_state_immutable,
    @lookupLiveAlloc_eq_getAllocRaw_live, @miriObserveMemory_agrees_getAllocRaw,
+   @miriObserveMemory_frame_invariant_iff, @lookupLiveAlloc_none_agrees_getAllocRaw_error,
+   @miriRawMemoryReadBytesExactWP_iff,
    @miriObserveMemory_then_treeRange_exactWP_iff, @miriTreeRange_preserves_allocObservation,
    @miriObserveMemory_then_instruction_exactWP_iff,
    @miriObserveMemory_then_callDispatch_exactWP_iff,
@@ -2560,8 +3467,10 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
    @witness_negative_tree_protected_foreign_and_frozen_local_write_ub,
    @witness_negative_uninit_memory_observation_refutation,
    @witness_call_dispatch_positive_and_negative_refutations,
+   @witness_call_dispatch_foreign_emulate_and_call_terminator,
    @witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub,
-   @witness_v2026_capturedMir_tree_borrows_ub_triangle⟩
+   @witness_v2026_capturedMir_tree_borrows_ub_triangle,
+   @witness_tb_enabled_translateBody_positive_and_negative_ub_refutations⟩
 
 section AxiomAndIsolationAudit
 open Lean Elab Command
@@ -2611,13 +3520,13 @@ run_cmd do
           todoM := todoM.push imp.module
   unless seenM.contains `Trusted.Rustc.V2026_06_01.MirSemantics.Statements do
     throwError "Anneal.MiriTreeBorrowsV2026 import-closure audit vacuous"
-  -- 2. (d) The full transitive CONSTANT-dependency closure (types AND values) of every
-  --        declaration of this module contains ZERO Std.Do / Std.Tactic.Do / Std.WP /
-  --        MiniRustSpec constants.
+  -- 2. (d) The full transitive CONSTANT-dependency closure (types AND values) of EVERY declaration
+  --        defined in this module (both public AND private `_private.*` helpers in `map₂`)
+  --        contains ZERO Std.Do / Std.Tactic.Do / Std.WP / MiniRustSpec constants.
   let mut seenC : Lean.NameSet := {}
   let mut todoC : Array Lean.Name := #[]
   for (c, _) in env.constants.map₂.toList do
-    if ns.isPrefixOf c then todoC := todoC.push c
+    todoC := todoC.push c
   while !todoC.isEmpty do
     let n := todoC.back!
     todoC := todoC.pop
@@ -2632,7 +3541,11 @@ run_cmd do
         for u in v.getUsedConstants do
           unless seenC.contains u do todoC := todoC.push u
   unless seenC.contains `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange &&
+      seenC.contains `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryRead &&
+      seenC.contains `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite &&
       seenC.contains `Miri.Interpreter.Step.step &&
+      seenC.contains `Miri.Interpreter.ForeignItems.emulate &&
+      seenC.contains `Miri.Interpreter.RawMemoryMachine.readBytes &&
       seenC.contains `Miri.Memory.MemoryLifecycle.getAllocRaw do
     throwError "constant-closure isolation audit vacuous"
   -- 3. Bridge-reality audit: confirm our theorems genuinely reach REAL vendored Miri,
@@ -2642,16 +3555,21 @@ run_cmd do
       (ns ++ `miriTreeInitialSetupExactWP_iff, `Miri.TreeBorrows.BorrowTree.new),
       (ns ++ `miriTreeRangeExactWP_iff, `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange),
       (ns ++ `miriTreeRangeThenReleaseExactWP_iff, `Miri.TreeBorrows.BorrowTree.releaseProtector),
+      (ns ++ `miriBeforeMemoryReadExactWP_iff, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryRead),
+      (ns ++ `miriBeforeMemoryWriteExactWP_iff, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
       (ns ++ `miriInstructionExactWP_iff, `Miri.Interpreter.Step.evalStatement),
       (ns ++ `miriStepStmtExactWP_iff, `Miri.Interpreter.Step.step),
       (ns ++ `miriCallDispatchExactWP_iff, `Miri.Interpreter.CallDispatchMachine.findMirOrEvalFn),
+      (ns ++ `miriCallDispatch_foreignEmulate_exactWP, `Miri.Interpreter.ForeignItems.emulate),
       (ns ++ `miriCallExtraExactWP_iff, `Miri.Interpreter.CallDispatchMachine.callExtra),
       (ns ++ `miriCallTerminatorExactWP_iff, `Miri.Interpreter.ControlFlow.evalTerminator),
       (ns ++ `miriObserveScalarExactWP_iff, `Miri.Memory.Allocation.readScalar),
       (ns ++ `miriObserveBytesExactWP_iff, `Miri.Memory.Allocation.getBytesStripProvenance),
       (ns ++ `miriObserveMemoryExactWP_iff, `Miri.Memory.Allocation.readScalar),
       (ns ++ `lookupLiveAlloc_eq_getAllocRaw_live, `Miri.Memory.MemoryLifecycle.getAllocRaw),
+      (ns ++ `lookupLiveAlloc_none_agrees_getAllocRaw_error, `Miri.Memory.MemoryLifecycle.getAllocRaw),
       (ns ++ `miriObserveMemory_agrees_getAllocRaw, `Miri.Memory.MemoryLifecycle.getAllocRaw),
+      (ns ++ `miriRawMemoryReadBytesExactWP_iff, `Miri.Interpreter.RawMemoryMachine.readBytes),
       (ns ++ `miriV2026_performPermAccess_eq_vendored_performAccess,
         `Anneal.MiriTreeBorrowsV2026.miriPerformPermAccess),
       (ns ++ `miriV2026_performPermAccess_eq_vendored_performAccess,
@@ -2666,6 +3584,12 @@ run_cmd do
         `Anneal.MiriTreeBorrowsV2026.miriPerformLocAccess),
       (ns ++ `witness_v2026_capturedMir_tree_borrows_ub_triangle,
         `Miri.TreeBorrows.performAccess),
+      (ns ++ `witness_tb_enabled_translateBody_positive_and_negative_ub_refutations,
+        `LeanMiriSpec.Correspondence.translateBody),
+      (ns ++ `witness_tb_enabled_translateBody_positive_and_negative_ub_refutations,
+        `Miri.Interpreter.Step.step),
+      (ns ++ `witness_tb_enabled_translateBody_positive_and_negative_ub_refutations,
+        `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange),
       (ns ++ `miriTreeRangeExactWP_iff, `Anneal.ExactWpAndSmartCtors.AnnealExactWP) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
@@ -2677,7 +3601,8 @@ run_cmd do
       if seen.contains n then continue
       seen := seen.insert n
       if n == req then break
-      if ns.isPrefixOf n || (`LeanMiriSpec.ExactWpAndMemoryFrameLM).isPrefixOf n then
+      if env.constants.map₂.contains n ||
+          ns.isPrefixOf n || (`LeanMiriSpec.ExactWpAndMemoryFrameLM).isPrefixOf n then
         if let some (.defnInfo v) := env.find? n then
           todo := todo ++ v.value.getUsedConstants
     unless seen.contains req do
