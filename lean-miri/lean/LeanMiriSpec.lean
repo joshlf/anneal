@@ -510,7 +510,8 @@ import LeanMiriSpec.Audit
   `w1_lm_finite_subnormal_overflow` .. `w12_lm_copy_const_nondet_sub_and_order_flip`
   (including the `%` dividend sign on exactly-zero remainders, all five
   IEEE-754 indeterminate forms, real `binary64` `Step.step`, and the mixed
-  `const/copy` vs. `copy/const` `.sub` candidate order).
+  `const/copy` vs. `copy/const` `.sub` candidate order; 71 public theorems, all
+  pinned by `axiomAudit_floatArithLM` and `#assert_float_arith_lm_standard_axioms`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

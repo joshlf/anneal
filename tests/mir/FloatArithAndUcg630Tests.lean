@@ -20,7 +20,7 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
 (`Trusted.Rustc.{V2026_06_01,V2026_08_01}.MirSemantics`, pinned `MiniRustSpec`, and vendored
 `lean-miri`):
 
-1. **Direct Root-Lake Witnesses (`W1`–`W6` & `V2026_06_01` <-> `V2026_08_01` Dialect Parity)**:
+1. **Direct Root-Lake Witnesses (`W1`–`W17` & `V2026_06_01` <-> `V2026_08_01` Dialect Parity)**:
    - `W1`: finite `1.0 + 2.0 = 3.0`, subnormal `0x00000001 + 0x00000001 = 0x00000002`, overflow
      `f32::MAX + f32::MAX = +Inf` & ties-to-even boundaries, signed-zero sums/products, exact
      `rem`, and `w1_mr_finite_subnormal_overflow`;
@@ -100,8 +100,8 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      an ordered pair) and every float bitwise / shift operator (`bitXor`, `bitAnd`, `bitOr`, `shl`,
      `shr` fail closed in `evalFloatBinOp` rather than computing the integer result);
    - Structural inspection of the MiniRust `Gen.Type` / `Gen.Value` / operator inductives (no float
-     constructor) and automated `axiomAudit_*` bundle coverage of every public `FloatArithMR` /
-     `FloatArithLM` theorem;
+     constructor) and automated `axiomAudit_*` bundle coverage of all 68 public `FloatArithMR` and
+     all 71 public `FloatArithLM` theorems;
    - Exhaustive zero-host-`Float`, constructive (`[propext, Quot.sound]`) axiom audit on
      `Anneal.Mir.IeeeFloatArith`, standard-axiom & non-triviality audit on `FloatArithMR` +
      `FloatArithLM` + cross-root theorems, module-import isolation (zero `MiniRustSpec.*`
@@ -109,12 +109,14 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      `isTrivialProp` (recursive over `∀`, `∧`, `∨`, `↔`, so `True ∧ True` or `x = x ∧ y = y` cannot
      evade the non-triviality audit, whose auto-generated-name exemption is keyed on the
      USER-FACING name so that `private` theorems are audited too);
-   - Transitive constant reachability from `unifiedFloatArithAndUcg630DualBundle` to `Trusted`
-     (BOTH `V2026_06_01` and `V2026_08_01`), `MiniRustSpec` (`Interp` + translation gates), and
-     vendored `Miri.Interpreter` / `Miri.Memory`.
-3. **Local Test-Module Axiom Audit**:
+   - Transitive constant reachability from `unifiedFloatArithAndUcg630DualBundle` to all 53 pinned
+     `Trusted` (BOTH `V2026_06_01` and `V2026_08_01`), `MiniRustSpec` (`Interp` + translation
+     gates), and vendored `Miri.Interpreter` / `Miri.Memory` constants.
+3. **Local Test-Module Axiom, Host-`Float`, & Non-Triviality Audit**:
    Verifies every declaration in `tests/mir/FloatArithAndUcg630Tests.lean` uses only standard
-   Lean axioms with zero `sorryAx`, zero `Lean.ofReduceBool`, and zero host `Float`.
+   Lean axioms with zero `sorryAx`, zero `Lean.ofReduceBool`, zero host `Float`, and that every
+   local theorem (public and `private`, keyed on `privateToUserName`) passes the recursive
+   `isTrivialProp` non-triviality audit (with self-tests).
 -/
 
 namespace Anneal.Mir.FloatArithAndUcg630Tests
@@ -1391,9 +1393,10 @@ open MiniRustSpec.Correspondence.RefWitness MiniRustSpec.Correspondence.FloatCas
    BOTH `EvalFloatBinOpRel .nondeterministic .div .binary32 0.0 0.0` outcomes (`+qNaN`, `-qNaN`, taken
    from the exact outcome set of `W15`): the 4-byte `Mach` carrier reaches the exact 4-byte image, and
    the ZERO-EXTENDED 64-bit carrier runs on `MachTB` (`Interp.stepsTB 3` + `MachTB.wfLive`);
-2. the 4-byte-WIDE `MachTB` carrier (`retAfterTB fcCarrierBody`, kernel-evaluated per candidate — the
-   symbolic 4-byte `MachTB` run is the open scope item recorded on the `f32` bridge) round-trips both
-   candidates bit-for-bit, and its `-qNaN` run preserves `MachTB.wfLive`. -/
+2. the 4-byte-WIDE `MachTB` carrier (`retAfterTB fcCarrierBody`, kernel-evaluated per candidate —
+   the universal native 4-byte `MachTB.wfLive` bridge `fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive`
+   is instantiated in `W17` below) round-trips both candidates bit-for-bit, and its `-qNaN` run
+   preserves `MachTB.wfLive`. -/
 theorem w16_b3_f32_indeterminate_nan_outcomes_mach_and_machTB_carriers :
     (∀ cand ∈ [(0x7FC00000 : Nat), 0xFFC00000],
       (∃ (m : Mach) (n : Nat) (m' : Mach), startMachine fcCarrierCastBody [.scalar ⟨cand, 4⟩] = some m ∧
@@ -2158,16 +2161,59 @@ run_cmd do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount}, accepted={acceptedCount}, ieee={ieeeThms}, mr={mrThms}, lm={lmThms}, mrPublic={mrPublic}, lmPublic={lmPublic}, reached={reachedCount})"
   logInfo m!"ep2 float-arith cross-root kernel bridge: added {addedCount} dual theorems, rejected {rejectedCount} forged controls (paired with {acceptedCount} accepted positive controls), audited {ieeeThms} constructive IeeeFloatArith + {mrThms} MR + {lmThms} LM theorems (0 host Float, 0 MiniRustSpec imports in LM, {mrPublic} MR + {lmPublic} LM public theorems all covered by axiomAudit bundles, MiniRust Gen.Type has no float constructor), reached all {reachedCount} Trusted(06+08)+MiniRust+Miri constants, axioms {crAxioms}"
 
-/-! ## §3. Local Test-Module Axiom & Host-`Float` Audit -/
+/-! ## §3. Local Test-Module Axiom, Host-`Float`, & Non-Triviality Audit -/
 
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
+  let rec isTrivialProp : Expr → Bool
+    | .forallE _ _ body _ => isTrivialProp body
+    | .letE _ _ _ body _ => isTrivialProp body
+    | .mdata _ e => isTrivialProp e
+    | e =>
+      if e.isConstOf ``True then true
+      else if e.isAppOfArity ``Eq 3 then e.appFn!.appArg! == e.appArg!
+      else if e.isAppOfArity ``HEq 4 then e.appFn!.appFn!.appArg! == e.appArg!
+      else if e.isAppOfArity ``Iff 2 then
+        e.appFn!.appArg! == e.appArg! || (isTrivialProp e.appFn!.appArg! && isTrivialProp e.appArg!)
+      else if e.isAppOfArity ``And 2 then isTrivialProp e.appFn!.appArg! && isTrivialProp e.appArg!
+      else if e.isAppOfArity ``Or 2 then isTrivialProp e.appFn!.appArg! || isTrivialProp e.appArg!
+      else false
+  -- Self-test (Round-4 `A4`): recursive `isTrivialProp` and `privateToUserName` non-triviality check
+  let natTy := mkConst ``Nat
+  let trivEq := mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit 1) (mkNatLit 1)
+  let nonTrivEq := mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit 1) (mkNatLit 2)
+  let mkAnd (a b : Expr) : Expr := mkApp2 (mkConst ``And) a b
+  let mkOr (a b : Expr) : Expr := mkApp2 (mkConst ``Or) a b
+  let bvarEq := mkApp3 (mkConst ``Eq [1]) natTy (mkBVar 0) (mkBVar 0)
+  unless isTrivialProp (mkConst ``True) && isTrivialProp trivEq && !isTrivialProp nonTrivEq
+      && isTrivialProp (mkAnd (mkConst ``True) (mkConst ``True))
+      && isTrivialProp (mkAnd trivEq (mkAnd trivEq (mkConst ``True)))
+      && isTrivialProp (.forallE `n natTy (mkAnd bvarEq (mkConst ``True)) .default)
+      && isTrivialProp (mkOr nonTrivEq trivEq)
+      && isTrivialProp (mkApp2 (mkConst ``Iff) (mkAnd trivEq trivEq) (mkConst ``True))
+      && !isTrivialProp (mkAnd trivEq nonTrivEq)
+      && !isTrivialProp (mkOr nonTrivEq nonTrivEq) do
+    throwError "test audit self-test failed: isTrivialProp detector failed"
+  let privProbe := mkPrivateNameCore `Probe.Module `Probe.userTheorem
+  let privAuxProbe := mkPrivateNameCore `Probe.Module (`Probe.userTheorem ++ `_proof_1)
+  unless privProbe.isInternalDetail && !(privateToUserName privProbe).isInternalDetail
+      && (privateToUserName privAuxProbe).isInternalDetail
+      && !(`Probe.userTheorem).isInternalDetail do
+    throwError "test audit self-test failed: privateToUserName non-triviality exemption probe failed"
   let mut checked : Nat := 0
+  let mut thmChecked : Nat := 0
   for (c, ci) in env.constants.map₂.toList do
     for d in ci.getUsedConstantsAsSet do
       if d == ``Float || (`Float).isPrefixOf d || d == ``Float32 || (`Float32).isPrefixOf d then
         throwError "test audit failure: {c} references host float {d}"
+    match ci with
+    | .thmInfo v =>
+      if !(privateToUserName c).isInternalDetail then
+        if isTrivialProp v.type then
+          throwError "test audit failure: {c} has trivial type"
+        thmChecked := thmChecked + 1
+    | _ => pure ()
     let axs ← liftCoreM <| Lean.collectAxioms c
     for a in axs do
       if a == ``sorryAx then throwError "test audit failure: {c} uses sorryAx"
@@ -2175,8 +2221,8 @@ run_cmd do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "test audit failure: {c} uses non-standard axiom {a}"
     checked := checked + 1
-  if checked == 0 then
-    throwError "test audit failure: found 0 local declarations"
-  logInfo m!"ep2 float-arith test audit: verified {checked} local declarations (standard axioms only, 0 sorryAx, 0 ofReduceBool, 0 host Float)"
+  if checked == 0 || thmChecked < 25 then
+    throwError "test audit failure: unexpected local counts (checked={checked}, thmChecked={thmChecked})"
+  logInfo m!"ep2 float-arith test audit: verified {checked} local declarations ({thmChecked} non-trivial theorems, standard axioms only, 0 sorryAx, 0 ofReduceBool, 0 host Float)"
 
 end Anneal.Mir.FloatArithAndUcg630Tests

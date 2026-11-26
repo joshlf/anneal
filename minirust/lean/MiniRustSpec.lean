@@ -98,7 +98,8 @@ import MiniRustSpec.Audit
   `reference#1752`) scalar and composite `(*const u8, usize)` / `struct Mixed`
   correspondence across `BasicMemory` and `TreeBorrowsMemory`, shared UB /
   no-forgery (`usize → &u8`, `MaybeUninit` uninit → `u64`, size mismatch), and
-  shared concrete witnesses `W1–W6`.
+  shared concrete witnesses `W1–W6` (68 public theorems, all pinned by
+  `axiomAudit_choiceFree` and `axiomAudit_machine`).
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 
