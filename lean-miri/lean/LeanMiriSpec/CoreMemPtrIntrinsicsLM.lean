@@ -2248,6 +2248,247 @@ theorem cm_miri_compareBytes_eval_universal {P S C V : Type} [Miri.Memory.Pointe
     EStateM.pure, hRdL, hScL, hPtrL, hRdR, hScR, hPtrR, hRdC, hScC, hUsize, hBytesL, hBytesR,
     Except.mapError]
 
+private theorem cm_miri_ofUInt64_toTargetUsize (u : UInt64) :
+    (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) (.ofUInt64 u)).toTargetUsize
+      (Miri.ABI.Size.fromBits annealTargetDataLayout.pointerWidth.bits) = .ok u := by
+  have hLt : u.toNat < 2 ^ 64 := u.toBitVec.isLt
+  have hNotGt : ¬ (u.toNat > 18446744073709551615) := by omega
+  have hBitsEq : (BitVec.ofNat 128 u.toNat).toNat = u.toNat := by
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega)]
+  have hOfNat : UInt64.ofNat u.toNat = u := by
+    apply UInt64.eq_of_toBitVec_eq; apply BitVec.eq_of_toNat_eq
+    change u.toNat % 2 ^ 64 = u.toNat
+    exact Nat.mod_eq_of_lt hLt
+  change (if (BitVec.ofNat 128 u.toNat).toNat > 18446744073709551615 then
+      Except.error (Miri.Memory.ScalarError.integerConversionOverflow (BitVec.ofNat 128 u.toNat))
+    else Except.ok (UInt64.ofNat (BitVec.ofNat 128 u.toNat).toNat)) = Except.ok u
+  rw [hBitsEq, hOfNat]
+  simp only [hNotGt, ↓reduceIte]
+
+/-- **Concrete `cmIntrinsicHooks`-instantiated `compare_bytes` universal
+Trusted ↔ vendored correspondence**: for ALL `ld`, `ly`, `tb`, `tyArg`, pointer
+scalars `lSc`/`rSc`, `count : UInt64`, and equal-length `lBytes`/`rBytes` read
+via `cmReadBytesStripProvenance tb`, unmodified vendored
+`Miri.Interpreter.Intrinsics.compareBytes (cmIntrinsicHooks ld ly tb tyArg) ()`
+returns a 32-bit `ScalarInt` whose bit pattern equals Trusted's
+`compareUnsignedBytesI32 lBytes.toList rBytes.toList`. -/
+theorem cm_miri_compareBytes_cmHooks_universal (ld : List LocalDecl) (ly : LayoutTable)
+    (tb : Bool) (tyArg : Miri.MIR.TyId)
+    (lSc rSc : Miri.Memory.Scalar AnnealProv) (lPtr rPtr : Miri.Memory.Pointer (Option AnnealProv))
+    (count : UInt64) (lLay rLay cLay : Miri.Interpreter.LocalLayout)
+    (st0 st1 st2 : AnnealStepState) (lBytes rBytes : Array UInt8)
+    (hPtrL : lSc.toPointer annealTargetDataLayout = .ok lPtr)
+    (hPtrR : rSc.toPointer annealTargetDataLayout = .ok rPtr)
+    (hRdL : cmReadBytesStripProvenance tb lPtr (Miri.ABI.Size.ofBytes count) st0 = .ok lBytes st1)
+    (hRdR : cmReadBytesStripProvenance tb rPtr (Miri.ABI.Size.ofBytes count) st1 = .ok rBytes st2)
+    (hLen : lBytes.size = rBytes.size) :
+    let qSc := Miri.Memory.ScalarInt.ofInt32 (cmMiriOrderingI32
+      (cmVendoredBytesCompare lBytes.toList rBytes.toList))
+    Miri.Interpreter.Intrinsics.compareBytes (cmIntrinsicHooks ld ly tb tyArg) ()
+      ⟨.immediate (.scalar lSc), lLay⟩ ⟨.immediate (.scalar rSc), rLay⟩
+      ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 count))), cLay⟩ st0 =
+      .ok (.fromScalarInt qSc) st2 ∧
+    qSc.data.toNat = compareUnsignedBytesI32 lBytes.toList rBytes.toList := by
+  refine ⟨?_, cm_compareUnsignedBytesI32_eq_vendored lBytes.toList rBytes.toList hLen⟩
+  exact cm_miri_compareBytes_eval_universal (cmIntrinsicHooks ld ly tb tyArg) ()
+    ⟨.immediate (.scalar lSc), lLay⟩ ⟨.immediate (.scalar rSc), rLay⟩
+    ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 count))), cLay⟩
+    st0 st0 st0 st0 st1 st2
+    ⟨.scalar lSc, lLay⟩ ⟨.scalar rSc, rLay⟩ ⟨.scalar (.fromScalarInt (.ofUInt64 count)), cLay⟩
+    lSc rSc (.fromScalarInt (.ofUInt64 count)) lPtr rPtr count lBytes rBytes
+    rfl rfl hPtrL rfl rfl hPtrR rfl rfl (cm_miri_ofUInt64_toTargetUsize count) hRdL hRdR
+
+/-- **Concrete `cmIntrinsicHooks`-instantiated `raw_eq` universal Trusted ↔
+vendored correspondence**: for ALL `ld`, `ly`, `tb`, `tyArg`, sized pointee
+type `ptTy`, aligned pointers `lPtr`/`rPtr` whose `cmReadBytesStripProvenance tb`
+reads `lBytes`/`rBytes`, unmodified vendored
+`Miri.Interpreter.Intrinsics.rawEq (cmIntrinsicHooks ld ly tb tyArg) ()` returns
+`lBytes == rBytes`, which equals Trusted's initialized bytewise equality
+`lBytes.toList.map some == rBytes.toList.map some`. -/
+theorem cm_miri_rawEq_cmHooks_universal (ld : List LocalDecl) (ly : LayoutTable)
+    (tb : Bool) (tyArg : Miri.MIR.TyId)
+    (lSc rSc : Miri.Memory.Scalar AnnealProv) (lPtr rPtr : Miri.Memory.Pointer (Option AnnealProv))
+    (lLay rLay : Miri.Interpreter.LocalLayout) (ptTy : Miri.MIR.TyId)
+    (ptLay : Miri.ABI.TyAndLayout Miri.MIR.TyId) (st0 st1 st2 : AnnealStepState)
+    (lBytes rBytes : Array UInt8)
+    (hPt : (cmIntrinsicHooks ld ly tb tyArg).pointeeType () lLay.ty st0 = .ok ptTy st0)
+    (hLay : (cmIntrinsicHooks ld ly tb tyArg).layoutOf () ptTy st0 = .ok ptLay st0)
+    (hSized : ptLay.layout.isSized = true)
+    (hPtrL : lSc.toPointer annealTargetDataLayout = .ok lPtr)
+    (hAlL : (cmIntrinsicHooks ld ly tb tyArg).checkAlign () lPtr ptLay.layout.align.abi st0 = .ok () st0)
+    (hRdL : cmReadBytesStripProvenance tb lPtr ptLay.layout.size st0 = .ok lBytes st1)
+    (hPtrR : rSc.toPointer annealTargetDataLayout = .ok rPtr)
+    (hAlR : (cmIntrinsicHooks ld ly tb tyArg).checkAlign () rPtr ptLay.layout.align.abi st1 = .ok () st1)
+    (hRdR : cmReadBytesStripProvenance tb rPtr ptLay.layout.size st1 = .ok rBytes st2) :
+    Miri.Interpreter.Intrinsics.rawEq (cmIntrinsicHooks ld ly tb tyArg) ()
+      ⟨.immediate (.scalar lSc), lLay⟩ ⟨.immediate (.scalar rSc), rLay⟩ st0 =
+      .ok (lBytes == rBytes) st2 ∧
+    (lBytes == rBytes) = (lBytes.toList.map Option.some == rBytes.toList.map Option.some) := by
+  refine ⟨?_, ?_⟩
+  · exact cm_miri_rawEq_eval_universal (cmIntrinsicHooks ld ly tb tyArg) ()
+      ⟨.immediate (.scalar lSc), lLay⟩ ⟨.immediate (.scalar rSc), rLay⟩
+      st0 st0 st0 st0 st0 st1 st1 st1 st2 ptTy ptLay
+      ⟨.scalar lSc, lLay⟩ ⟨.scalar rSc, rLay⟩ lSc rSc lPtr rPtr lBytes rBytes
+      hPt hLay hSized rfl rfl hPtrL hAlL hRdL rfl rfl hPtrR hAlR hRdR
+  · cases hEq : (lBytes == rBytes) with
+    | true =>
+      have hArr : lBytes = rBytes := eq_of_beq hEq
+      subst hArr; simp
+    | false =>
+      symm
+      apply beq_false_of_ne
+      intro hMap
+      have hMapInj : ∀ (a b : List UInt8), a.map Option.some = b.map Option.some → a = b := by
+        intro a; induction a with
+        | nil => intro b hb; cases b with | nil => rfl | cons _ _ => cases hb
+        | cons x xs ih =>
+          intro b hb; cases b with
+          | nil => cases hb
+          | cons y ys =>
+            simp only [List.map_cons, List.cons.injEq, Option.some.injEq] at hb
+            rw [hb.1, ih ys hb.2]
+      have hList : lBytes.toList = rBytes.toList := hMapInj lBytes.toList rBytes.toList hMap
+      have hArr : lBytes = rBytes := Array.ext' hList
+      subst hArr
+      simp at hEq
+
+/-- **Concrete `cmIntrinsicHooks`-instantiated `copy` universal zero-count &
+overflow-UB laws**:
+1. At `count = 0`, for ANY aligned pointers `sPtr`/`dPtr` (including NULL
+   `offset = 0, provenance = none`), unmodified vendored
+   `Miri.Interpreter.Intrinsics.copy (cmIntrinsicHooks ld ly tb tyArg)`
+   (= `copyWith (cmIntrinsicHooks ld ly tb tyArg).memory`) computes `size = 0`
+   and succeeds via `cmMemCopy tb sPtr dPtr (Size.ofBytes 0) nonov`;
+2. Whenever `ptLay.layout.size.bytes.toNat * count.toNat` overflows `u64` or
+   exceeds `maxSizeOfVal`, `copy` deterministically faults
+   `.undefinedBehavior "overflow computing total size of copy"`. -/
+theorem cm_miri_copyWith_cmHooks_zero_count_and_overflow_universal (ld : List LocalDecl)
+    (ly : LayoutTable) (tb : Bool) (tyArg : Miri.MIR.TyId) (nonov : Bool)
+    (sSc dSc : Miri.Memory.Scalar AnnealProv) (sPtr dPtr : Miri.Memory.Pointer (Option AnnealProv))
+    (sLay dLay cLay : Miri.Interpreter.LocalLayout) (ptTy : Miri.MIR.TyId)
+    (ptLay : Miri.ABI.TyAndLayout Miri.MIR.TyId) (st0 st1 : AnnealStepState)
+    (hPt : (cmIntrinsicHooks ld ly tb tyArg).pointeeType () sLay.ty st0 = .ok ptTy st0)
+    (hLay : (cmIntrinsicHooks ld ly tb tyArg).layoutOf () ptTy st0 = .ok ptLay st0) :
+    (sSc.toPointer annealTargetDataLayout = .ok sPtr →
+     dSc.toPointer annealTargetDataLayout = .ok dPtr →
+     (cmIntrinsicHooks ld ly tb tyArg).checkAlign () sPtr ptLay.layout.align.abi st0 = .ok () st0 →
+     (cmIntrinsicHooks ld ly tb tyArg).checkAlign () dPtr ptLay.layout.align.abi st0 = .ok () st0 →
+     cmMemCopy tb sPtr dPtr (Miri.ABI.Size.ofBytes 0) nonov st0 = .ok () st1 →
+     Miri.Interpreter.Intrinsics.copy (cmIntrinsicHooks ld ly tb tyArg) ()
+       ⟨.immediate (.scalar sSc), sLay⟩ ⟨.immediate (.scalar dSc), dLay⟩
+       ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 0))), cLay⟩ nonov st0 = .ok () st1) ∧
+    (∀ count : UInt64,
+     (ptLay.layout.size.bytes.toNat * count.toNat ≥ 2 ^ 64 ∨
+      ptLay.layout.size.bytes.toNat * count.toNat >
+        (cmIntrinsicHooks ld ly tb tyArg).memory.maxSizeOfVal.bytes.toNat) →
+     Miri.Interpreter.Intrinsics.copy (cmIntrinsicHooks ld ly tb tyArg) ()
+       ⟨.immediate (.scalar sSc), sLay⟩ ⟨.immediate (.scalar dSc), dLay⟩
+       ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 count))), cLay⟩ nonov st0 =
+       .error (.undefinedBehavior "overflow computing total size of copy") st0) := by
+  constructor
+  · intro hPtrS hPtrD hAlS hAlD hMem
+    have hMul0 : Miri.Interpreter.IntegerOps.computeSizeInBytes ptLay.layout.size 0
+        (cmIntrinsicHooks ld ly tb tyArg).memory.maxSizeOfVal =
+        some (Miri.ABI.Size.ofBytes 0) := by
+      unfold Miri.Interpreter.IntegerOps.computeSizeInBytes
+      have h0 : ptLay.layout.size.bytes.toNat * (0 : UInt64).toNat = 0 := Nat.mul_zero _
+      rw [h0]
+      simp only [show (0 : Nat) < 2 ^ 64 by decide, decide_true, Nat.zero_le, Bool.and_self, ↓reduceIte]
+      rfl
+    exact (cm_miri_copyWith_eval_universal (cmIntrinsicHooks ld ly tb tyArg).memory ()
+      ⟨.immediate (.scalar sSc), sLay⟩ ⟨.immediate (.scalar dSc), dLay⟩
+      ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 0))), cLay⟩ nonov
+      st0 st0 st0 st0 st0 st0 st0 st0 st1
+      ⟨.scalar (.fromScalarInt (.ofUInt64 0)), cLay⟩ ⟨.scalar sSc, sLay⟩ ⟨.scalar dSc, dLay⟩
+      (.fromScalarInt (.ofUInt64 0)) sSc dSc 0 ptTy ptLay sPtr dPtr
+      rfl rfl (cm_miri_ofUInt64_toTargetUsize 0) hPt hLay).1
+      (Miri.ABI.Size.ofBytes 0) hMul0 rfl rfl hPtrS rfl rfl hPtrD hAlS hAlD hMem
+  · intro count hOv
+    have hNone : Miri.Interpreter.IntegerOps.computeSizeInBytes ptLay.layout.size count
+        (cmIntrinsicHooks ld ly tb tyArg).memory.maxSizeOfVal = none := by
+      unfold Miri.Interpreter.IntegerOps.computeSizeInBytes
+      have hF : (decide (ptLay.layout.size.bytes.toNat * count.toNat < 2 ^ 64) &&
+          decide (ptLay.layout.size.bytes.toNat * count.toNat ≤
+            (cmIntrinsicHooks ld ly tb tyArg).memory.maxSizeOfVal.bytes.toNat)) = false := by
+        rcases hOv with h | h
+        · have h1 : ¬ (ptLay.layout.size.bytes.toNat * count.toNat < 2 ^ 64) := by omega
+          simp only [h1, decide_false, Bool.false_and]
+        · have h2 : ¬ (ptLay.layout.size.bytes.toNat * count.toNat ≤
+              (cmIntrinsicHooks ld ly tb tyArg).memory.maxSizeOfVal.bytes.toNat) := by omega
+          simp only [h2, decide_false, Bool.and_false]
+      simp only [hF, Bool.false_eq_true, ↓reduceIte]
+    exact (cm_miri_copyWith_eval_universal (cmIntrinsicHooks ld ly tb tyArg).memory ()
+      ⟨.immediate (.scalar sSc), sLay⟩ ⟨.immediate (.scalar dSc), dLay⟩
+      ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 count))), cLay⟩ nonov
+      st0 st0 st0 st0 st0 st0 st0 st0 st1
+      ⟨.scalar (.fromScalarInt (.ofUInt64 count)), cLay⟩ ⟨.scalar sSc, sLay⟩ ⟨.scalar dSc, dLay⟩
+      (.fromScalarInt (.ofUInt64 count)) sSc dSc count ptTy ptLay sPtr dPtr
+      rfl rfl (cm_miri_ofUInt64_toTargetUsize count) hPt hLay).2 hNone
+
+/-- **Concrete `cmIntrinsicHooks`-instantiated `typedSwap` & `validatePlace`
+universal laws**:
+1. Instantiates unmodified vendored `Miri.Interpreter.Intrinsics.typedSwap`
+   directly on `cmIntrinsicHooks ld ly tb tyArg` (`cmDerefPointer`,
+   `cmAllocateStack`, `cmCopyOp`, `cmMemCopy`, `validatePlace`,
+   `cmDeallocateStack`);
+2. Proves `(cmIntrinsicHooks ld ly tb tyArg).validatePlace` universally rejects
+   BOTH uninhabited layouts AND invalid scalars (`annealValidateScalarForTyId = false`)
+   with `.undefinedBehavior` (preventing any regression of the `right`-hand
+   invalid-scalar swap defect). -/
+theorem cm_miri_typedSwap_and_validatePlace_cmHooks_universal (ld : List LocalDecl)
+    (ly : LayoutTable) (tb : Bool) (tyArg : Miri.MIR.TyId) :
+    (∀ (mp : Miri.Interpreter.MemPlace AnnealProv) (lay : Miri.Interpreter.LocalLayout)
+       (recFlag isWrite : Bool) (st : AnnealStepState),
+      (lay.layout.uninhabited = true →
+        (cmIntrinsicHooks ld ly tb tyArg).validatePlace () ⟨.memory mp, lay⟩ recFlag isWrite st =
+          .error (.undefinedBehavior "validatePlace of uninhabited type") st) ∧
+      (∀ (sc : Miri.Memory.Scalar AnnealProv) (st1 : AnnealStepState),
+        lay.layout.uninhabited = false →
+        annealReadImmediate ⟨.indirect mp, lay⟩ st = .ok ⟨.scalar sc, lay⟩ st1 →
+        annealValidateScalarForTyId lay.ty sc = false →
+        (cmIntrinsicHooks ld ly tb tyArg).validatePlace () ⟨.memory mp, lay⟩ recFlag isWrite st =
+          .error (.undefinedBehavior "validatePlace of invalid scalar value") st1)) ∧
+    (∀ (leftOp rightOp : Miri.Interpreter.OpTy AnnealProv)
+       (st0 st1 st2 st3 st4 st5 st6 st7 st8 st9 st10 st11 st12 : AnnealStepState)
+       (leftP rightP tempP : Miri.Interpreter.RuntimePlace AnnealProv)
+       (leftValOp tempValOp : Miri.Interpreter.OpTy AnnealProv)
+       (leftPtr rightPtr tempPtr : Miri.Memory.Pointer (Option AnnealProv)) (recFlag : Bool),
+      cmDerefPointer tyArg ly leftOp st0 = .ok leftP st1 →
+      cmDerefPointer tyArg ly rightOp st1 = .ok rightP st2 →
+      leftP.layout = rightP.layout →
+      leftP.layout.layout.isSized = true →
+      cmAllocateStack leftP.layout st2 = .ok tempP st3 →
+      (cmIntrinsicHooks ld ly tb tyArg).placeToOp () leftP st3 = .ok leftValOp st4 →
+      cmCopyOp tb leftValOp tempP st4 = .ok () st5 →
+      (cmIntrinsicHooks ld ly tb tyArg).placePointer rightP = .ok rightPtr →
+      (cmIntrinsicHooks ld ly tb tyArg).placePointer leftP = .ok leftPtr →
+      cmMemCopy tb rightPtr leftPtr leftP.layout.layout.size true st5 = .ok () st6 →
+      (cmIntrinsicHooks ld ly tb tyArg).enforceValidity () leftP.layout st6 = .ok true st7 →
+      (cmIntrinsicHooks ld ly tb tyArg).enforceValidityRecursively () leftP.layout st7 = .ok recFlag st8 →
+      (cmIntrinsicHooks ld ly tb tyArg).validatePlace () leftP recFlag true st8 = .ok () st9 →
+      (cmIntrinsicHooks ld ly tb tyArg).placeToOp () tempP st9 = .ok tempValOp st10 →
+      cmCopyOp tb tempValOp rightP st10 = .ok () st11 →
+      (cmIntrinsicHooks ld ly tb tyArg).placePointer tempP = .ok tempPtr →
+      cmDeallocateStack tempPtr st11 = .ok () st12 →
+      Miri.Interpreter.Intrinsics.typedSwap (cmIntrinsicHooks ld ly tb tyArg) () leftOp rightOp st0 =
+        .ok () st12) := by
+  constructor
+  · intro mp lay recFlag isWrite st
+    constructor
+    · intro hUninh
+      simp [cmIntrinsicHooks, hUninh, bind, EStateM.bind,
+        throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+    · intro sc st1 hInh hRd hInval
+      simp [cmIntrinsicHooks, hInh, hRd, hInval, bind, EStateM.bind,
+        throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+  · intro leftOp rightOp st0 st1 st2 st3 st4 st5 st6 st7 st8 st9 st10 st11 st12
+      leftP rightP tempP leftValOp tempValOp leftPtr rightPtr tempPtr recFlag
+      hDL hDR hLayEq hSized hAlloc hToL hCopyL hPtrR hPtrL hMem hEnf hRec hValP hToT hCopyR hPtrT hDealloc
+    exact cm_miri_typedSwap_eval_universal (cmIntrinsicHooks ld ly tb tyArg) () leftOp rightOp
+      st0 st1 st2 st3 st4 st5 st6 st7 st8 st9 st10 st11 st12
+      leftP rightP tempP leftValOp tempValOp leftPtr rightPtr tempPtr recFlag
+      hDL hDR hLayEq hSized hAlloc hToL hCopyL hPtrR hPtrL hMem hEnf hRec hValP hToT hCopyR hPtrT hDealloc
+
 /-! ## §3. LeanMiri Observations, States, and the Corpus Observation (`cmLmObserve`) -/
 
 /-- Normalized observation of a vendored `Miri.Interpreter.Step.step` run: the

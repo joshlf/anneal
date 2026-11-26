@@ -201,6 +201,83 @@ def maskWith08 (mask : Nat) : CapturedMir :=
 /-- `black_box::<bool>(_1)`. -/
 def bbBool08 : CapturedMir :=
   body08 "cm::black_box_bool" [ty .bool, ty .bool] 1 "core::intrinsics::black_box" [.bool] [.copy (loc 1)] 0 [] []
+/-- Diverging (`target = none`) call to returning intrinsic `raw_eq::<u32>` (parity for `cmRawEqDivergingMir`). -/
+def rawEqDiv08 : CapturedMir :=
+  { body08 "cm::raw_eq_diverging" [ty .bool, ty (.ref .not (.uint .u32)), ty (.ref .not (.uint .u32))] 2
+      "core::intrinsics::raw_eq" [.uint .u32] [.copy (loc 1), .copy (loc 2)] 0 []
+      [glob 100 [some 7, some 0, some 0, some 0], glob 101 [some 7, some 0, some 0, some 0]] with
+    basicBlocks :=
+      [{ statements := [],
+         terminator := { kind := .call (.constant { ty := ty (.fnDef "core::intrinsics::raw_eq" [.uint .u32]),
+                                                    val := .zeroSized })
+                           [.copy (loc 1), .copy (loc 2)] (loc 0) none .continue_,
+                         span := "ep2.rs:1:1" },
+         isCleanup := false }] }
+/-- `raw_eq::<&!>` (layout-inhabited reference to `!`). -/
+def rawEqRefNever08 : CapturedMir :=
+  body08 "cm::raw_eq_ref_never" [ty .bool, ty (.ref .not (.ref .not .never)), ty (.ref .not (.ref .not .never))] 2
+    "core::intrinsics::raw_eq" [.ref .not .never] [.copy (loc 1), .copy (loc 2)] 0 []
+    [glob 100 [some 0x20, some 0, some 0, some 0, some 0, some 0, some 0, some 0] 8,
+     glob 101 [some 0x20, some 0, some 0, some 0, some 0, some 0, some 0, some 0] 8]
+/-- `raw_eq::<!>` (layout-uninhabited `!` -> `.ub`). -/
+def rawEqNever08 : CapturedMir :=
+  body08 "cm::raw_eq_never" [ty .bool, ty (.ref .not .never), ty (.ref .not .never)] 2
+    "core::intrinsics::raw_eq" [.never] [.copy (loc 1), .copy (loc 2)] 0 [] []
+/-- `black_box::<&!>(_1)` (uninhabited pointee -> `.ub`). -/
+def bbRefNever08 : CapturedMir :=
+  body08 "cm::bb_ref_never" [ty (.ref .not .never), ty (.ref .not .never)] 1
+    "core::intrinsics::black_box" [.ref .not .never] [.copy (loc 1)] 0 [] []
+/-- `black_box::<&&!>(_1)` (pointer to `&!` -> accepted). -/
+def bbRefRefNever08 : CapturedMir :=
+  body08 "cm::bb_ref_ref_never" [ty (.ref .not (.ref .not .never)), ty (.ref .not (.ref .not .never))] 1
+    "core::intrinsics::black_box" [.ref .not (.ref .not .never)] [.copy (loc 1)] 0 [] []
+/-- `black_box::<&[u8]>(_1)` (null wide ref -> `.ub`). -/
+def bbWideNull08 : CapturedMir :=
+  body08 "cm::bb_wide_null" [ty (.ref .not (.slice (.uint .u8))), ty (.ref .not (.slice (.uint .u8)))] 1
+    "core::intrinsics::black_box" [.ref .not (.slice (.uint .u8))] [.copy (loc 1)] 0 [] []
+/-- `black_box::<fn()>(_1)` (null fn ptr -> `.ub`). -/
+def bbFnNull08 : CapturedMir :=
+  body08 "cm::bb_fn_null"
+    [ty (.fnPtr [] (.tuple []) .safe .rust), ty (.fnPtr [] (.tuple []) .safe .rust)] 1
+    "core::intrinsics::black_box" [.fnPtr [] (.tuple []) .safe .rust] [.copy (loc 1)] 0 [] []
+def ctFn08 : Operand := .constant { ty := ty (.fnDef "cm::ct_dummy" []), val := .zeroSized }
+/-- `const_eval_select` forwarding to `raw_eq::<u32>`, `ptr_mask::<u32>`, `black_box::<u32>`, and diverging. -/
+def cesRawEq08 : CapturedMir :=
+  body08 "cm::ces_raw_eq" [ty .bool, ty (.tuple [.ref .not (.uint .u32), .ref .not (.uint .u32)])] 1
+    "core::intrinsics::const_eval_select"
+    [.tuple [.ref .not (.uint .u32), .ref .not (.uint .u32)], .fnDef "cm::ct_dummy" [],
+     .fnDef "core::intrinsics::raw_eq" [.uint .u32], .bool]
+    [.copy (loc 1), ctFn08, .constant { ty := ty (.fnDef "core::intrinsics::raw_eq" [.uint .u32]), val := .zeroSized }]
+    0 [] [glob 100 [some 7, some 0, some 0, some 0], glob 101 [some 7, some 0, some 0, some 0]]
+def cesMask08 : CapturedMir :=
+  body08 "cm::ces_ptr_mask" [ty (.rawPtr .not (.uint .u32)), ty (.tuple [.rawPtr .not (.uint .u32), .uint .usize])] 1
+    "core::intrinsics::const_eval_select"
+    [.tuple [.rawPtr .not (.uint .u32), .uint .usize], .fnDef "cm::ct_dummy" [],
+     .fnDef "core::intrinsics::ptr_mask" [.uint .u32], .rawPtr .not (.uint .u32)]
+    [.copy (loc 1), ctFn08, .constant { ty := ty (.fnDef "core::intrinsics::ptr_mask" [.uint .u32]), val := .zeroSized }]
+    0 [] [glob 100 (List.replicate 16 (some 0)) 16]
+def cesBb08 : CapturedMir :=
+  body08 "cm::ces_black_box" [ty (.uint .u32), ty (.tuple [.uint .u32])] 1
+    "core::intrinsics::const_eval_select"
+    [.tuple [.uint .u32], .fnDef "cm::ct_dummy" [],
+     .fnDef "core::intrinsics::black_box" [.uint .u32], .uint .u32]
+    [.copy (loc 1), ctFn08, .constant { ty := ty (.fnDef "core::intrinsics::black_box" [.uint .u32]), val := .zeroSized }]
+    0 [] []
+def cesDiv08 : CapturedMir :=
+  { body08 "cm::ces_diverging" [ty .never, ty (.tuple [])] 1
+      "core::intrinsics::const_eval_select" [.tuple [], .fnDef "cm::ct_dummy" [], .fnDef "cm::rt_div" [], .never]
+      [.copy (loc 1), ctFn08, .constant { ty := ty (.fnDef "cm::rt_div" []), val := .zeroSized }] 0 [] [] with
+    basicBlocks :=
+      [{ statements := [],
+         terminator := { kind := .call
+                           (.constant { ty := ty (.fnDef "core::intrinsics::const_eval_select"
+                                          [.tuple [], .fnDef "cm::ct_dummy" [], .fnDef "cm::rt_div" [], .never]),
+                                        val := .zeroSized })
+                           [.copy (loc 1), ctFn08,
+                            .constant { ty := ty (.fnDef "cm::rt_div" []), val := .zeroSized }]
+                           (loc 0) none .continue_,
+                         span := "ep2.rs:1:1" },
+         isCleanup := false }] }
 
 end Anneal.Mir.CoreMemPtrIntrinsicsTests.V08
 
@@ -313,6 +390,15 @@ theorem cm_mr_deep_theorems_used :
   have _ := @cm_evalBlackBoxCall_u32_valid
   have _ := @cm_evalBlackBoxCall_invalid_bool_ub
   have _ := @cm_evalBlackBoxCall_rawPtr_preserves_prov
+  have _ := @cm_minirust_loadRawDataM_tb_wfLive
+  have _ := @cm_minirust_rawEq_evalIntrinsicM
+  have _ := @cm_minirust_rawEq_evalIntrinsicM_tb_wfLive
+  have _ := @cm_minirust_evalPtrOffsetFromM_pos_neg_underflow_agree
+  have _ := @cm_minirust_evalPtrOffsetM_wrapping_preserves_prov
+  have _ := @cm_minirust_copy_snapshot_memmove_tb_wfLive
+  have _ := @cm_minirust_typedSwap_four_access_tb_wfLive
+  have _ := @cm_minirust_compareBytes_uninit_and_eq_iff
+  have _ := @cm_minirust_stepsTB_wfLive_all_ok
   have _ := @cm_copy_three_way_witness
   have _ := @cm_compareBytes_three_way_witness
   have _ := @cm_rawEq_three_way_witness
@@ -929,9 +1015,23 @@ theorem cm_v2026_08_01_hardened_parity :
     cmRunTrusted cmBlackBoxBoolMir 8 (cmInitLiveState cmBlackBoxBoolMir [.scalar ⟨2, 1⟩]) = .ub ∧
     V08.run08 V08.bbBool08 8 (V08.init08 V08.bbBool08 [.scalar ⟨1, 1⟩]) =
       cmRunTrusted cmBlackBoxBoolMir 8 (cmInitLiveState cmBlackBoxBoolMir [.scalar ⟨1, 1⟩]) ∧
-    cmRunTrusted cmBlackBoxBoolMir 8 (cmInitLiveState cmBlackBoxBoolMir [.scalar ⟨1, 1⟩]) = .scalar 1 1 := by
+    cmRunTrusted cmBlackBoxBoolMir 8 (cmInitLiveState cmBlackBoxBoolMir [.scalar ⟨1, 1⟩]) = .scalar 1 1 ∧
+    V08.run08 V08.rawEqDiv08 8 (V08.init08 V08.rawEqDiv08 [V08.gp 100 0, V08.gp 101 0]) =
+      cmRunTrusted cmRawEqDivergingMir 8 (cmInitLiveState cmRawEqDivergingMir [cmGPtr 100 0, cmGPtr 101 0]) ∧
+    cmRunTrusted cmRawEqDivergingMir 8 (cmInitLiveState cmRawEqDivergingMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    V08.run08 V08.rawEqRefNever08 8 (V08.init08 V08.rawEqRefNever08 [V08.gp 100 0, V08.gp 101 0]) = .scalar 1 1 ∧
+    V08.run08 V08.rawEqNever08 8 (V08.init08 V08.rawEqNever08 [V08.ip 4096, V08.ip 4096]) = .ub ∧
+    V08.run08 V08.bbRefNever08 8 (V08.init08 V08.bbRefNever08 [V08.ip 4096]) = .ub ∧
+    V08.run08 V08.bbRefRefNever08 8 (V08.init08 V08.bbRefRefNever08 [V08.ip 4096]) = .ptr 0 4096 ∧
+    V08.run08 V08.bbWideNull08 8 (V08.init08 V08.bbWideNull08 [.aggregate 0 [V08.ip 0, .scalar ⟨0, 8⟩]]) = .ub ∧
+    V08.run08 V08.bbFnNull08 8 (V08.init08 V08.bbFnNull08 [V08.ip 0]) = .ub ∧
+    V08.run08 V08.cesRawEq08 8 (V08.init08 V08.cesRawEq08 [.aggregate 0 [V08.gp 100 0, V08.gp 101 0]]) = .scalar 1 1 ∧
+    V08.run08 V08.cesMask08 8 (V08.init08 V08.cesMask08 [.aggregate 0 [V08.gp 100 12, .scalar ⟨2 ^ 64 - 8, 8⟩]]) =
+      .ptr 100 8 ∧
+    V08.run08 V08.cesBb08 8 (V08.init08 V08.cesBb08 [.aggregate 0 [.scalar ⟨77, 4⟩]]) = .scalar 77 4 ∧
+    V08.run08 V08.cesDiv08 8 (V08.init08 V08.cesDiv08 [.unit]) = .unsupported := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
-    ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+    ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- **Episode 2 Root Capstone**: the root-Lake projection of
 `ep2_core_mem_ptr_intrinsics_capstone` for EVERY LeanMiri authority passing the
@@ -1275,6 +1375,10 @@ run_cmd do
         lmNs ++ `cm_miri_copyWith_eval_universal,
         lmNs ++ `cm_miri_typedSwap_eval_universal,
         lmNs ++ `cm_miri_rawEq_eval_universal,
+        lmNs ++ `cm_miri_compareBytes_cmHooks_universal,
+        lmNs ++ `cm_miri_rawEq_cmHooks_universal,
+        lmNs ++ `cm_miri_copyWith_cmHooks_zero_count_and_overflow_universal,
+        lmNs ++ `cm_miri_typedSwap_and_validatePlace_cmHooks_universal,
         lmNs ++ `cmLmTableCheck_true, lmNs ++ `cmLmObserve_table,
         lmNs ++ `cmLmObserve_copy_mode_sensitivity,
         lmNs ++ `cmLmObserve_typedSwap_mode_sensitivity,
@@ -1361,9 +1465,18 @@ run_cmd do
         (lmNs ++ `cm_compareUnsignedBytesI32_eq_vendored, privBytesCompare),
         (lmNs ++ `cm_miri_compareBytes_eval_universal, `Miri.Interpreter.Intrinsics.compareBytes),
         (lmNs ++ `cm_miri_compareBytes_eval_universal, privBytesCompare),
+        (lmNs ++ `cm_miri_compareBytes_cmHooks_universal, `Miri.Interpreter.Intrinsics.compareBytes),
+        (lmNs ++ `cm_miri_compareBytes_cmHooks_universal, lmNs ++ `cmIntrinsicHooks),
+        (lmNs ++ `cm_miri_compareBytes_cmHooks_universal, `Trusted.Rustc.V2026_06_01.MirSemantics.compareUnsignedBytesI32),
         (lmNs ++ `cm_miri_copyWith_eval_universal, `Miri.Interpreter.Intrinsics.copyWith),
+        (lmNs ++ `cm_miri_copyWith_cmHooks_zero_count_and_overflow_universal, `Miri.Interpreter.Intrinsics.copyWith),
+        (lmNs ++ `cm_miri_copyWith_cmHooks_zero_count_and_overflow_universal, lmNs ++ `cmIntrinsicHooks),
         (lmNs ++ `cm_miri_typedSwap_eval_universal, `Miri.Interpreter.Intrinsics.typedSwap),
+        (lmNs ++ `cm_miri_typedSwap_and_validatePlace_cmHooks_universal, `Miri.Interpreter.Intrinsics.typedSwap),
+        (lmNs ++ `cm_miri_typedSwap_and_validatePlace_cmHooks_universal, lmNs ++ `cmIntrinsicHooks),
         (lmNs ++ `cm_miri_rawEq_eval_universal, `Miri.Interpreter.Intrinsics.rawEq),
+        (lmNs ++ `cm_miri_rawEq_cmHooks_universal, `Miri.Interpreter.Intrinsics.rawEq),
+        (lmNs ++ `cm_miri_rawEq_cmHooks_universal, lmNs ++ `cmIntrinsicHooks),
         (lmNs ++ `cm_miri_ptrMask_eval_universal, `Miri.Interpreter.Intrinsics.eval),
         (lmNs ++ `cm_miri_blackBox_eval_universal, `Miri.Interpreter.Intrinsics.eval),
         (lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix, `Miri.Interpreter.IntegerOps.binary),

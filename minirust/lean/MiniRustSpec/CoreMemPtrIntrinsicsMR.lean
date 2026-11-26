@@ -1509,6 +1509,366 @@ theorem cm_evalBlackBoxCall_rawPtr_preserves_prov (s : MachineState) (decls : Li
   unfold validateBlackBoxValue
   simp only [knownWidePointeeTailAux?, ptrPointeeMayBeUnsizedAux, hb]
 
+/-! ### Universal `MachTB` (`TreeBorrowsMemory`) & Polymorphic `MiniRustSpec.Interp` Laws -/
+
+private theorem cm_ptrTypeEq_refl (ptrTy : PtrType) : ptrTypeEq ptrTy ptrTy = true := by
+  have hLayRefl : ∀ lay : LayoutStrategy, layoutStrategyEq lay lay = true := by
+    intro lay
+    induction lay with
+    | Sized s a => simp [layoutStrategyEq]
+    | Slice s a => simp [layoutStrategyEq]
+    | TraitObject t => simp [layoutStrategyEq]
+    | Tuple h t ih => simp [layoutStrategyEq, ih]
+  have hUcRefl : ∀ uc : UnsafeCellStrategy, unsafeCellStrategyEq uc uc = true := by
+    intro uc
+    induction uc with
+    | Sized c => simp [unsafeCellStrategyEq]
+    | Slice c => simp [unsafeCellStrategyEq]
+    | TraitObject => simp [unsafeCellStrategyEq]
+    | Tuple h t ih => simp [unsafeCellStrategyEq, ih]
+  cases ptrTy with
+  | Ref mutbl pt =>
+    rcases pt with ⟨lay, inh, uc, frz, unp⟩
+    simp [ptrTypeEq, pointeeInfoEq, hLayRefl lay, hUcRefl uc]
+  | Box pt =>
+    rcases pt with ⟨lay, inh, uc, frz, unp⟩
+    simp [ptrTypeEq, pointeeInfoEq, hLayRefl lay, hUcRefl uc]
+  | Raw k => simp [ptrTypeEq]
+  | FnPtr => rfl
+  | VTablePtr t => simp [ptrTypeEq]
+
+private theorem cm_tb_cm_load_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {len : LibSpecr.Size}
+    {align : LibSpecr.Align} {atomicity : Gen.Atomicity}
+    {bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.load cm ptr len align atomicity = .ok (bytes, cm')) :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  dsimp only [ConcurrentMemory.load, MemoryOps.load] at h
+  cases hLoad : TreeBorrowsMemory.load cm.memory ptr len align with
+  | error e => simp [hLoad, bind, Except.bind] at h
+  | ok p =>
+    rcases p with ⟨bs, mem'⟩
+    simp only [hLoad, bind, Except.bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+    rcases h with ⟨_, rfl⟩
+    exact TreeBorrowsMemory.load_wfLive hwf hLoad
+
+private theorem cm_tb_cm_store_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance}
+    {bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)}
+    {align : LibSpecr.Align} {atomicity : Gen.Atomicity}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.store cm ptr bytes align atomicity = .ok cm') :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  dsimp only [ConcurrentMemory.store, MemoryOps.store] at h
+  cases hStore : TreeBorrowsMemory.store cm.memory ptr bytes align with
+  | error e => simp [hStore, bind, Except.bind] at h
+  | ok mem' =>
+    simp only [hStore, bind, Except.bind, pure, Except.pure, Except.ok.injEq] at h
+    subst h
+    exact TreeBorrowsMemory.store_wfLive hwf hStore
+
+/-- **Universal `MachTB.wfLive` preservation for `loadRawDataM`**: loading raw
+bytes for `raw_eq` over `TreeBorrowsMemory<x86_64>` preserves `MachTB.wfLive`. -/
+theorem cm_minirust_loadRawDataM_tb_wfLive {m m' : MachTB}
+    {lp : Pointer Gen.TreeBorrowsProvenance} {ptrTy : PtrType} {bs : List UInt8}
+    (hwf : MachTB.wfLive m)
+    (h : loadRawDataM m lp ptrTy = .ok (bs, m')) :
+    MachTB.wfLive m' := by
+  unfold loadRawDataM at h
+  cases ptrTy with
+  | Ref mutbl pt =>
+    cases hLay : pt.layout with
+    | Sized sz al =>
+      simp only [hLay] at h
+      cases hLoad : ConcurrentMemory.load m.mem lp.thin_pointer sz al .None with
+      | error e => simp [hLoad, bind, Except.bind] at h
+      | ok p =>
+        rcases p with ⟨rawBs, cm'⟩
+        simp only [hLoad, bind, Except.bind] at h
+        cases hMap : rawBs.mapM AbstractByte.dataM with
+        | none => simp [hMap, ub] at h
+        | some data =>
+          simp only [hMap, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+          rcases h with ⟨_, rfl⟩
+          exact cm_tb_cm_load_wfLive hwf hLoad
+    | Slice _ _ => simp [hLay, ub] at h
+    | TraitObject _ => simp [hLay, ub] at h
+    | Tuple _ _ => simp [hLay, ub] at h
+  | Box _ => simp [ub] at h
+  | Raw _ => simp [ub] at h
+  | FnPtr => simp [ub] at h
+  | VTablePtr _ => simp [ub] at h
+
+/-- **Universal polymorphic `evalIntrinsicM .RawEq` law (both `Mach` and `MachTB`)**:
+for EVERY memory model `M` (`BasicMemory` or `TreeBorrowsMemory`), whenever
+`loadRawDataM` loads `lBytes` and `rBytes`, `evalIntrinsicM m .RawEq` returns
+`.Bool (lBytes == rBytes)`. -/
+theorem cm_minirust_rawEq_evalIntrinsicM {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 m2 : Machine M) (lp rp : Pointer (Gen.Memory.Provenance M))
+    (ptrTy : PtrType) (lBytes rBytes : List UInt8)
+    (hL : loadRawDataM m lp ptrTy = .ok (lBytes, m1))
+    (hR : loadRawDataM m1 rp ptrTy = .ok (rBytes, m2)) :
+    evalIntrinsicM m .RawEq [(.Ptr lp, .Ptr ptrTy), (.Ptr rp, .Ptr ptrTy)] .Bool =
+      .ok (.Bool (lBytes == rBytes), m2) := by
+  simp [evalIntrinsicM, typeEq, cm_ptrTypeEq_refl ptrTy, hL, hR, bind, Except.bind, pure]
+  rfl
+
+/-- **Universal `MachTB.wfLive` preservation for `evalIntrinsicM .RawEq`**: every
+successful `RawEq` step on `TreeBorrowsMemory<x86_64>` preserves `MachTB.wfLive`. -/
+theorem cm_minirust_rawEq_evalIntrinsicM_tb_wfLive {m m' : MachTB}
+    {args : List (Value TBM × Gen.Type)} {retTy : Gen.Type} {v : Value TBM}
+    (hwf : MachTB.wfLive m)
+    (h : evalIntrinsicM m .RawEq args retTy = .ok (v, m')) :
+    MachTB.wfLive m' := by
+  unfold evalIntrinsicM at h
+  match args with
+  | [(leftV, lTy), (rightV, rTy)] =>
+    cases retTy with
+    | Bool =>
+      dsimp only at h
+      cases hEq : typeEq lTy rTy with
+      | false => simp [hEq, ub] at h
+      | true =>
+        simp only [hEq, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+        cases leftV with
+        | Ptr leftPtr =>
+          cases rightV with
+          | Ptr rightPtr =>
+            cases lTy with
+            | Ptr lPtrTy =>
+              dsimp only at h
+              cases hL : loadRawDataM m leftPtr lPtrTy with
+              | error e => simp [hL, bind, Except.bind] at h
+              | ok p1 =>
+                rcases p1 with ⟨lData, m1⟩
+                simp only [hL, bind, Except.bind] at h
+                cases hR : loadRawDataM m1 rightPtr lPtrTy with
+                | error e => simp [hR, bind, Except.bind] at h
+                | ok p2 =>
+                  rcases p2 with ⟨rData, m2⟩
+                  simp only [hR, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+                  rcases h with ⟨_, rfl⟩
+                  exact cm_minirust_loadRawDataM_tb_wfLive
+                    (cm_minirust_loadRawDataM_tb_wfLive hwf hL) hR
+            | _ => simp [ub] at h
+          | _ => simp [ub] at h
+        | _ => simp [ub] at h
+    | _ => simp [ub] at h
+  | [] | [_] | _ :: _ :: _ :: _ => simp [ub] at h
+
+/-- **Universal polymorphic `evalPtrOffsetFromM` + `DivExact` correspondence
+(both `Mach` and `MachTB`)**: covers positive signed/unsigned, negative signed,
+and unsigned underflow UB across EVERY memory model `M` (`BasicMemory` and
+`TreeBorrowsMemory`). -/
+theorem cm_minirust_evalPtrOffsetFromM_pos_neg_underflow_agree
+    {M : Type} [Gen.Memory M] [MemoryOps M] (m : Machine M)
+    (left right : ThinPointer (Gen.Memory.Provenance M)) (tl tr : Gen.Type)
+    (elemSize k : Nat)
+    (hPos : 0 < elemSize) (hLe : elemSize ≤ scalarModulus 8 / 2 - 1)
+    (hDist : k * elemSize ≤ scalarModulus 8 / 2 - 1)
+    (hD1 : ConcurrentMemory.signed_dereferenceable m.mem left (-(left.addr - right.addr)) = .ok ())
+    (hD2 : ConcurrentMemory.signed_dereferenceable m.mem right (left.addr - right.addr) = .ok ()) :
+    (∀ (nonneg : Bool), left.addr = right.addr + Int.ofNat (k * elemSize) →
+      evalPtrOffsetFromM m true nonneg (.Ptr ⟨left, none⟩, tl) (.Ptr ⟨right, none⟩, tr) =
+        .ok (.Int (Int.ofNat (k * elemSize)), .Int ⟨.Signed, x86_64.PTR_SIZE⟩) ∧
+      evalIntBinOp .DivExact (Int.ofNat (k * elemSize)) (Int.ofNat elemSize) ⟨.Signed, x86_64.PTR_SIZE⟩ =
+        .ok (Int.ofNat k) ∧
+      evalPtrOffsetFromDistance 8 nonneg elemSize (right.addr.toNat + k * elemSize) right.addr.toNat =
+        some ⟨k, 8⟩) ∧
+    (0 < k → right.addr = left.addr + Int.ofNat (k * elemSize) →
+      evalPtrOffsetFromM m true false (.Ptr ⟨left, none⟩, tl) (.Ptr ⟨right, none⟩, tr) =
+        .ok (.Int (-(Int.ofNat (k * elemSize))), .Int ⟨.Signed, x86_64.PTR_SIZE⟩) ∧
+      evalIntBinOp .DivExact (-(Int.ofNat (k * elemSize))) (Int.ofNat elemSize) ⟨.Signed, x86_64.PTR_SIZE⟩ =
+        .ok (-(Int.ofNat k)) ∧
+      evalPtrOffsetFromDistance 8 false elemSize left.addr.toNat (left.addr.toNat + k * elemSize) =
+        some ⟨scalarModulus 8 - k, 8⟩) ∧
+    (left.addr < right.addr → left.addr.toNat < right.addr.toNat →
+      evalPtrOffsetFromM m true true (.Ptr ⟨left, none⟩, tl) (.Ptr ⟨right, none⟩, tr) =
+        .error (.ub "PtrOffsetFrom: negative result with `nonneg` flag set") ∧
+      evalPtrOffsetFromDistance 8 true elemSize left.addr.toNat right.addr.toNat = none) := by
+  have hkLe : k ≤ scalarModulus 8 / 2 - 1 := by
+    have : k ≤ k * elemSize := Nat.le_mul_of_pos_right k hPos
+    omega
+  have hMod : scalarModulus 8 / 2 - 1 = 2 ^ 63 - 1 := by decide
+  have hk63 : k ≤ 2 ^ 63 - 1 := by omega
+  have hElemNe : Int.ofNat elemSize ≠ 0 := by intro h; cases h; omega
+  have hBits : MiniRustSpec.Interp.Size.bits x86_64.PTR_SIZE = 64 := rfl
+  refine ⟨?_, ?_, ?_⟩
+  · intro nonneg hAddr
+    have hDiff : left.addr - right.addr = Int.ofNat (k * elemSize) := by
+      rw [hAddr, Int.add_comm, Int.add_sub_cancel]
+    have hNonneg : ¬ (Int.ofNat (k * elemSize) < 0) :=
+      Int.not_lt.mpr (Int.natCast_nonneg (k * elemSize))
+    have hCanRep : IntType.can_represent ⟨.Signed, x86_64.PTR_SIZE⟩ (Int.ofNat k) = true := by
+      unfold IntType.can_represent inBounds
+      dsimp only; rw [hBits]
+      have hMin : -((2 : Int) ^ (64 - 1)) ≤ Int.ofNat k := by rw [Int.ofNat_eq_natCast]; omega
+      have hMax : Int.ofNat k < (2 : Int) ^ (64 - 1) := by rw [Int.ofNat_eq_natCast]; omega
+      simp [hMin, hMax]; omega
+    refine ⟨?_, ?_, cm_evalPtrOffsetFromDistance_exact 8 nonneg elemSize right.addr.toNat k hPos hLe hDist⟩
+    · unfold evalPtrOffsetFromM
+      dsimp only [bind, Except.bind, pure, Except.pure]
+      rw [hD1, hD2, hDiff]
+      have hd : decide (Int.ofNat (k * elemSize) < 0) = false := decide_eq_false hNonneg
+      simp only [hd, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+    · have hTdiv : Int.tdiv (Int.ofNat (k * elemSize)) (Int.ofNat elemSize) = Int.ofNat k := by
+        change Int.ofNat ((k * elemSize) / elemSize) = Int.ofNat k
+        rw [Nat.mul_div_cancel k hPos]
+      have hTmod : Int.tmod (Int.ofNat (k * elemSize)) (Int.ofNat elemSize) = 0 := by
+        change Int.ofNat ((k * elemSize) % elemSize) = 0
+        rw [Nat.mul_mod_left k elemSize]; rfl
+      unfold evalIntBinOp
+      dsimp only
+      simp only [hElemNe, ↓reduceIte, hTdiv, hCanRep, Bool.not_true, Bool.false_eq_true,
+        hTmod, ne_eq, not_true_eq_false, pure, Except.pure]
+  · intro hKPos hAddr
+    have hDiff : left.addr - right.addr = -(Int.ofNat (k * elemSize)) := by
+      rw [hAddr, Int.sub_eq_add_neg, Int.neg_add, ← Int.add_assoc, Int.add_right_neg, Int.zero_add]
+    have hCanRep : IntType.can_represent ⟨.Signed, x86_64.PTR_SIZE⟩ (-(Int.ofNat k)) = true := by
+      unfold IntType.can_represent inBounds
+      dsimp only; rw [hBits]
+      have hMin : -((2 : Int) ^ (64 - 1)) ≤ -(Int.ofNat k) := by rw [Int.ofNat_eq_natCast]; omega
+      have hMax : -(Int.ofNat k) < (2 : Int) ^ (64 - 1) := by rw [Int.ofNat_eq_natCast]; omega
+      simp [hMin, hMax]; omega
+    refine ⟨?_, ?_, cm_evalPtrOffsetFromDistance_neg_exact 8 elemSize left.addr.toNat k hPos hKPos hLe hDist⟩
+    · unfold evalPtrOffsetFromM
+      dsimp only [bind, Except.bind, pure, Except.pure]
+      rw [hD1, hD2, hDiff]
+      simp only [Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+    · have hTdiv : Int.tdiv (-(Int.ofNat (k * elemSize))) (Int.ofNat elemSize) = -(Int.ofNat k) := by
+        rw [Int.neg_tdiv]
+        change -(Int.ofNat ((k * elemSize) / elemSize)) = -(Int.ofNat k)
+        rw [Nat.mul_div_cancel k hPos]
+      have hTmod : Int.tmod (-(Int.ofNat (k * elemSize))) (Int.ofNat elemSize) = 0 := by
+        rw [Int.neg_tmod]
+        change -(Int.ofNat ((k * elemSize) % elemSize)) = 0
+        rw [Nat.mul_mod_left k elemSize]; rfl
+      unfold evalIntBinOp
+      dsimp only
+      simp only [hElemNe, ↓reduceIte, hTdiv, hCanRep, Bool.not_true, Bool.false_eq_true,
+        hTmod, ne_eq, not_true_eq_false, pure, Except.pure]
+  · intro hLt hNatLt
+    refine ⟨?_, cm_evalPtrOffsetFromDistance_unsigned_negative 8 elemSize left.addr.toNat right.addr.toNat hNatLt⟩
+    have hDiffNeg : left.addr - right.addr < 0 := by
+      let x : Int := left.addr
+      let y : Int := right.addr
+      have hxy : x < y := hLt
+      change x - y < 0
+      omega
+    unfold evalPtrOffsetFromM
+    dsimp only [bind, Except.bind, pure, Except.pure, ub]
+    rw [hD1, hD2]
+    simp only [hDiffNeg, decide_true, Bool.and_self, ↓reduceIte]
+
+/-- **Universal polymorphic strict-provenance `ptr_mask` offset law (both `Mach`
+and `MachTB`)**: wrapping `evalPtrOffsetM m false` shifts `p.addr` by `delta`
+modulo `2^64` while preserving `p.provenance` identically (no `expose`, zero
+memory mutation). -/
+theorem cm_minirust_evalPtrOffsetM_wrapping_preserves_prov
+    {M : Type} [Gen.Memory M] [MemoryOps M] (m : Machine M)
+    (p : ThinPointer (Gen.Memory.Provenance M)) (ptrTy deltaTy : Gen.Type) (delta : Int) :
+    evalPtrOffsetM m false (.Ptr ⟨p, none⟩, ptrTy) (.Int delta, deltaTy) =
+      .ok (.Ptr ⟨{ addr := bringInBounds (p.addr + delta) .Unsigned x86_64.PTR_SIZE,
+                   provenance := p.provenance }, none⟩, ptrTy) := by
+  simp [evalPtrOffsetM, ptrOffsetWrappingM, ThinPointer.wrapping_offsetM, ThinPointer.widen,
+    bind, Except.bind, pure, Except.pure]
+
+/-- **Universal `copy` snapshot `memmove` `MachTB.wfLive` preservation**:
+loading `sz` bytes (`ConcurrentMemory.load`) from `src` and storing the exact
+snapshot byte slice (`ConcurrentMemory.store`) to `dst` — whether disjoint OR
+overlapping — preserves `MachTB.wfLive` across both Tree Borrows transitions. -/
+theorem cm_minirust_copy_snapshot_memmove_tb_wfLive {m : MachTB}
+    {src dst : ThinPointer Gen.TreeBorrowsProvenance}
+    {sz : LibSpecr.Size} {al : LibSpecr.Align}
+    {bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)}
+    {cm1 cm2 : Gen.ConcurrentMemory TBM}
+    (hwf : MachTB.wfLive m)
+    (hLoad : ConcurrentMemory.load m.mem src sz al .None = .ok (bs, cm1))
+    (hStore : ConcurrentMemory.store cm1 dst bs al .None = .ok cm2) :
+    MachTB.wfLive { m with mem := cm1 } ∧ MachTB.wfLive { m with mem := cm2 } := by
+  have hwf1 : MachTB.wfLive { m with mem := cm1 } := cm_tb_cm_load_wfLive hwf hLoad
+  exact ⟨hwf1, cm_tb_cm_store_wfLive hwf1 hStore⟩
+
+/-- **Universal `typed_swap_nonoverlapping` 4-access `MachTB.wfLive` preservation**:
+for ANY `x`, `y` on `TreeBorrowsMemory<x86_64>`, the 4-access swap sequence
+`read(x) -> read(y) -> write(x, yBs) -> write(y, xBs)` preserves `MachTB.wfLive`
+at EVERY intermediate and final machine. -/
+theorem cm_minirust_typedSwap_four_access_tb_wfLive {m : MachTB}
+    {x y : ThinPointer Gen.TreeBorrowsProvenance}
+    {sz : LibSpecr.Size} {al : LibSpecr.Align}
+    {xBs yBs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)}
+    {cm1 cm2 cm3 cm4 : Gen.ConcurrentMemory TBM}
+    (hwf : MachTB.wfLive m)
+    (hRdX : ConcurrentMemory.load m.mem x sz al .None = .ok (xBs, cm1))
+    (hRdY : ConcurrentMemory.load cm1 y sz al .None = .ok (yBs, cm2))
+    (hWrX : ConcurrentMemory.store cm2 x yBs al .None = .ok cm3)
+    (hWrY : ConcurrentMemory.store cm3 y xBs al .None = .ok cm4) :
+    MachTB.wfLive { m with mem := cm1 } ∧
+    MachTB.wfLive { m with mem := cm2 } ∧
+    MachTB.wfLive { m with mem := cm3 } ∧
+    MachTB.wfLive { m with mem := cm4 } := by
+  have h1 := cm_tb_cm_load_wfLive hwf hRdX
+  have h2 := cm_tb_cm_load_wfLive h1 hRdY
+  have h3 := cm_tb_cm_store_wfLive h2 hWrX
+  have h4 := cm_tb_cm_store_wfLive h3 hWrY
+  exact ⟨h1, h2, h3, h4⟩
+
+/-- **Universal polymorphic `compare_bytes` byte-slice uninit + equality law
+(both `Mach` and `MachTB`)**:
+1. `bs.mapM AbstractByte.dataM = none ↔ ∃ b ∈ bs, b = .Uninit` (eager uninit UB);
+2. For equal-length initialized slices `l`, `r`, `compareUnsignedBytesI32 l r = 0 ↔ l = r`. -/
+theorem cm_minirust_compareBytes_uninit_and_eq_iff {M : Type} [Gen.Memory M]
+    (bs : List (Gen.AbstractByte (Gen.Memory.Provenance M)))
+    (l r : List UInt8) (hLen : l.length = r.length) :
+    (bs.mapM AbstractByte.dataM = none ↔ ∃ b ∈ bs, b = .Uninit) ∧
+    (compareUnsignedBytesI32 l r = 0 ↔ l = r) := by
+  constructor
+  · induction bs with
+    | nil => simp
+    | cons b rest ih =>
+      cases b with
+      | Uninit => simp [AbstractByte.dataM, bind, Option.bind]
+      | Init d prov =>
+        simp only [List.mapM_cons, AbstractByte.dataM, bind, Option.bind, List.mem_cons,
+          reduceCtorEq, false_and, exists_eq_or_imp, false_or]
+        constructor
+        · intro h
+          cases hm : rest.mapM AbstractByte.dataM with
+          | none => exact ih.mp hm
+          | some rs => rw [hm] at h; cases h
+        · intro h
+          rw [ih.mpr h]
+  · constructor
+    · intro hEq0
+      induction l generalizing r with
+      | nil => cases r with | nil => rfl | cons _ _ => simp at hLen
+      | cons a l' ih =>
+        cases r with
+        | nil => simp at hLen
+        | cons b r' =>
+          simp only [List.length_cons, Nat.succ.injEq] at hLen
+          unfold compareUnsignedBytesI32 at hEq0
+          dsimp only at hEq0
+          cases h1 : a.toBitVec.toNat.blt b.toBitVec.toNat with
+          | true => rw [h1] at hEq0; cases hEq0
+          | false =>
+            cases h2 : b.toBitVec.toNat.blt a.toBitVec.toNat with
+            | true => rw [h1, h2] at hEq0; cases hEq0
+            | false =>
+              rw [h1, h2] at hEq0
+              dsimp only at hEq0
+              have hab : a.toBitVec.toNat = b.toBitVec.toNat := by
+                have hle1 : b.toBitVec.toNat ≤ a.toBitVec.toNat :=
+                  Nat.not_lt.mp (fun hc => by rw [Nat.blt_eq.mpr hc] at h1; cases h1)
+                have hle2 : a.toBitVec.toNat ≤ b.toBitVec.toNat :=
+                  Nat.not_lt.mp (fun hc => by rw [Nat.blt_eq.mpr hc] at h2; cases h2)
+                omega
+              have haEqB : a = b := by
+                apply UInt8.eq_of_toBitVec_eq; apply BitVec.eq_of_toNat_eq; exact hab
+              rw [haEqB, ih r' hLen hEq0]
+    · intro hEq; subst hEq; exact cm_compareUnsignedBytesI32_refl l
+
 /-! ## §3. MiniRust Reference Programs (`Mach` & `MachTB`)
 
 Each intrinsic is executed in `MiniRustSpec.Interp` as its MiniRust reference
@@ -1831,6 +2191,22 @@ theorem cmMrObserve_typedSwap_mode_sensitivity :
       .retBytes ((scalarBytes cmU32It 9).map (projByteTB ∘ liftByteTB)) ∧
     cmMrObserve .treeBorrows .typedSwap .modeCase = .ub :=
   ⟨by decide +kernel, by decide +kernel⟩
+
+/-- **Universal corpus-wide `MachTB.wfLive` preservation**: for EVERY `(v, c)`
+across all 8 intrinsics where `cmMrObserve .treeBorrows v c` returns bytes
+(every non-UB execution in the 32-key `TreeBorrowsMemory` matrix), the resulting
+`MachTB` state satisfies `MachTB.wfLive`. -/
+theorem cm_minirust_stepsTB_wfLive_all_ok (v : CmVariant) (c : CmCase)
+    (bs : List TBByteOutcome)
+    (hOk : cmMrObserve .treeBorrows v c = .retBytes bs) :
+    ∃ m' : MachTB,
+      Interp.stepsTB cmMrFuel (liftMachToTB (cmMrMachine v c)) = .ok m' ∧
+      MachTB.wfLive m' := by
+  unfold cmMrObserve cmRunMrObs at hOk
+  dsimp only at hOk
+  cases hSt : Interp.stepsTB cmMrFuel (liftMachToTB (cmMrMachine v c)) with
+  | ok m' => exact ⟨m', rfl, TbWitness.liftMachToTB_stepsTB_wfLive hSt⟩
+  | error e => cases e <;> simp [hSt] at hOk
 
 /-- The raw observation of a `BasicMemory` byte list. -/
 def cmMrBytesObs (bs : List Byte) : CmMrObs :=
