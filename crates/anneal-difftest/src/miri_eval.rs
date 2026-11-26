@@ -5319,8 +5319,22 @@ fn confirm_helper_module_suffixes(
                 if containers.iter().all(named) {
                     return true;
                 }
+                // A `mod` holding a module-level `use` is live when a reached
+                // body names it, or when a live import (one level, no
+                // recursion) pulls a reached item out of it, e.g.
+                // `use live_holder::entry_inner;` + `entry_inner()`.
+                let enclosing_live = |chain: &[String]| -> bool {
+                    chain.last().is_none_or(named)
+                        || scope_graph.imported_paths.iter().any(|o| {
+                            o.enclosing_containers.last().is_none_or(named)
+                                && o.enclosing_fns.iter().all(|f| top_fn_is_reached(f))
+                                && o.path.len() > chain.len()
+                                && o.path[..chain.len()] == *chain
+                                && scope_idents.contains(&o.used)
+                        })
+                };
                 scope_graph.imported_paths.iter().any(|imp| {
-                    if !imp.enclosing_containers.last().is_none_or(named)
+                    if !enclosing_live(&imp.enclosing_containers)
                         || !imp.enclosing_fns.iter().all(|f| top_fn_is_reached(f))
                     {
                         return false;
@@ -16025,9 +16039,22 @@ mod live_wrapper {
         helper(13u32)
     }
 }
+mod local_mod2 {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x & v;
+        f(16u32)
+    }
+}
+mod live_holder {
+    use super::local_mod2::helper;
+    pub fn entry_inner() -> u32 {
+        helper(17u32)
+    }
+}
+use live_holder::entry_inner;
 pub fn root_entry() -> u32 {
     live_mod::helper(1u32) ^ inner_mod::deep(2u32) ^ globbed(3u32) ^ sub::run(4u32)
-        ^ live_wrapper::shared_inner()
+        ^ live_wrapper::shared_inner() ^ entry_inner()
 }
 ";
         let pairs: Vec<(String, String)> = [
@@ -16039,6 +16066,9 @@ pub fn root_entry() -> u32 {
             ("{closure#0}", "X.dead_mod2_helper_closure_0"),
             ("{closure#0}", "X.dead_mod3_helper_closure_0"),
             ("{closure#0}", "X.local_mod_helper_closure_0"),
+            // Module-level `use` inside a `mod` reached only through a root
+            // `use live_holder::entry_inner;` import still links.
+            ("{closure#0}", "X.local_mod2_helper_closure_0"),
             ("{closure#0}", "X.outer_mod_inner_mod_deep_closure_0"),
             ("{closure#0}", "X.glob_mod_globbed_closure_0"),
             ("{closure#0}", "X.self_mod_sub_run_closure_0"),
@@ -16058,6 +16088,7 @@ pub fn root_entry() -> u32 {
             vec![
                 "X.live_mod_helper_closure_0",
                 "X.local_mod_helper_closure_0",
+                "X.local_mod2_helper_closure_0",
                 "X.outer_mod_inner_mod_deep_closure_0",
                 "X.glob_mod_globbed_closure_0",
                 "X.self_mod_sub_run_closure_0",
