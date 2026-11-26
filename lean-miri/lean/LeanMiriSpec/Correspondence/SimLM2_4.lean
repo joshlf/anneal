@@ -945,7 +945,8 @@ theorem decodeTypedValueFromBytes_primScalar {layouts : LayoutTable} {fty rTy : 
     (hsz : (translateTy fty layouts).layout.size = translateSizeBytes w)
     (hrk : rTy.kind = fty.kind)
     (hbool : fty.kind = .bool → x % scalarModulus w = 0 ∨ x % scalarModulus w = 1)
-    (hchar : fty.kind = .char → isValidCharCode (x % scalarModulus w) = true) :
+    (hchar : fty.kind = .char → isValidCharCode (x % scalarModulus w) = true)
+    (hptr8 : layoutPointerBytes layouts = 8 := by rfl) :
     decodeTypedValueFromBytes defaultCodecFuel layouts rTy
         (encodeLittleEndianBytes x w none) =
       some (.scalar ⟨x % scalarModulus w, w⟩) := by
@@ -959,6 +960,7 @@ theorem decodeTypedValueFromBytes_primScalar {layouts : LayoutTable} {fty rTy : 
       some (⟨x % scalarModulus w, w⟩, none) := by
     intro s; unfold decodeScalarBytes; dsimp only
     rw [hlen, hw0, hdec]
+  have h4 : Nat.beq (layoutPointerBytes layouts) 4 = false := by rw [hptr8]; rfl
   cases rTy with | mk rk rl =>
   dsimp only at hrk
   show decodeTypedValueFromBytes (15 + 1) layouts ⟨rk, rl⟩ (encodeLittleEndianBytes x w none) =
@@ -985,21 +987,41 @@ theorem decodeTypedValueFromBytes_primScalar {layouts : LayoutTable} {fty rTy : 
     rw [hdec_sc]; dsimp only
     rw [hchar hk]
   · have hrk' : rk = .int it := hrk.trans hk; subst hrk'
-    dsimp only [normalizeCodecTy]
-    rw [hprov]; dsimp only
-    unfold decodeValueFromBytes
-    dsimp only
-    rw [hint_w it hk]; dsimp only
-    rw [hlen, Nat.beq_refl]; dsimp only
-    rw [hdec_sc]
+    have hdv : decodeValueFromBytes (15 + 1) layouts ⟨.int it, rl⟩
+        (encodeLittleEndianBytes x w none) =
+        some (.scalar ⟨x % scalarModulus w, w⟩) := by
+      unfold decodeValueFromBytes; dsimp only
+      rw [hint_w it hk]; dsimp only
+      rw [hlen, Nat.beq_refl]; dsimp only
+      rw [hdec_sc]
+    cases it with
+    | isize =>
+      dsimp only [normalizeCodecTy]
+      rw [hprov]; dsimp only
+      rw [h4]; dsimp only
+      exact hdv
+    | i8 | i16 | i32 | i64 | i128 =>
+      dsimp only [normalizeCodecTy]
+      rw [hprov]; dsimp only
+      exact hdv
   · have hrk' : rk = .uint ut := hrk.trans hk; subst hrk'
-    dsimp only [normalizeCodecTy]
-    rw [hprov]; dsimp only
-    unfold decodeValueFromBytes
-    dsimp only
-    rw [huint_w ut hk]; dsimp only
-    rw [hlen, Nat.beq_refl]; dsimp only
-    rw [hdec_sc]
+    have hdv : decodeValueFromBytes (15 + 1) layouts ⟨.uint ut, rl⟩
+        (encodeLittleEndianBytes x w none) =
+        some (.scalar ⟨x % scalarModulus w, w⟩) := by
+      unfold decodeValueFromBytes; dsimp only
+      rw [huint_w ut hk]; dsimp only
+      rw [hlen, Nat.beq_refl]; dsimp only
+      rw [hdec_sc]
+    cases ut with
+    | usize =>
+      dsimp only [normalizeCodecTy]
+      rw [hprov]; dsimp only
+      rw [h4]; dsimp only
+      exact hdv
+    | u8 | u16 | u32 | u64 | u128 =>
+      dsimp only [normalizeCodecTy]
+      rw [hprov]; dsimp only
+      exact hdv
 
 theorem decodeTypedValueFromBytes_primScalar_uninit {layouts : LayoutTable} {fty rTy : Ty}
     (hprim : IsPrimScalarTy fty) (hrk : rTy.kind = fty.kind)
@@ -1024,29 +1046,65 @@ theorem decodeTypedValueFromBytes_primScalar_uninit {layouts : LayoutTable} {fty
       · dsimp only; rw [hdec_sc]
     · rfl
   · have hrk' : rk = .int it := hrk.trans hk; subst hrk'
-    dsimp only [normalizeCodecTy]
-    cases hp : abstractBytesHaveProv (xs ++ .uninit :: ys)
-    · dsimp only; unfold decodeValueFromBytes; dsimp only
+    have hdv : decodeValueFromBytes (15 + 1) layouts ⟨.int it, rl⟩
+        (xs ++ .uninit :: ys) = none := by
+      unfold decodeValueFromBytes; dsimp only
       cases intCastTargetBytes (.int it) with
       | none => rfl
       | some eb =>
         dsimp only
-        cases Nat.beq (length (xs ++ .uninit :: ys)) eb
-        · rfl
-        · dsimp only; rw [hdec_sc]
-    · rfl
+        cases Nat.beq (length (xs ++ .uninit :: ys)) eb with
+        | false => rfl
+        | true => dsimp only; rw [hdec_sc]
+    cases it with
+    | isize =>
+      dsimp only [normalizeCodecTy]
+      cases abstractBytesHaveProv (xs ++ .uninit :: ys) with
+      | true => rfl
+      | false =>
+        dsimp only
+        cases Nat.beq (layoutPointerBytes layouts) 4 with
+        | false => exact hdv
+        | true =>
+          dsimp only
+          cases Nat.beq (length (xs ++ .uninit :: ys)) 4 with
+          | false => rfl
+          | true => dsimp only; rw [hdec_sc]
+    | i8 | i16 | i32 | i64 | i128 =>
+      dsimp only [normalizeCodecTy]
+      cases abstractBytesHaveProv (xs ++ .uninit :: ys) with
+      | true => rfl
+      | false => exact hdv
   · have hrk' : rk = .uint ut := hrk.trans hk; subst hrk'
-    dsimp only [normalizeCodecTy]
-    cases hp : abstractBytesHaveProv (xs ++ .uninit :: ys)
-    · dsimp only; unfold decodeValueFromBytes; dsimp only
+    have hdv : decodeValueFromBytes (15 + 1) layouts ⟨.uint ut, rl⟩
+        (xs ++ .uninit :: ys) = none := by
+      unfold decodeValueFromBytes; dsimp only
       cases intCastTargetBytes (.uint ut) with
       | none => rfl
       | some eb =>
         dsimp only
-        cases Nat.beq (length (xs ++ .uninit :: ys)) eb
-        · rfl
-        · dsimp only; rw [hdec_sc]
-    · rfl
+        cases Nat.beq (length (xs ++ .uninit :: ys)) eb with
+        | false => rfl
+        | true => dsimp only; rw [hdec_sc]
+    cases ut with
+    | usize =>
+      dsimp only [normalizeCodecTy]
+      cases abstractBytesHaveProv (xs ++ .uninit :: ys) with
+      | true => rfl
+      | false =>
+        dsimp only
+        cases Nat.beq (layoutPointerBytes layouts) 4 with
+        | false => exact hdv
+        | true =>
+          dsimp only
+          cases Nat.beq (length (xs ++ .uninit :: ys)) 4 with
+          | false => rfl
+          | true => dsimp only; rw [hdec_sc]
+    | u8 | u16 | u32 | u64 | u128 =>
+      dsimp only [normalizeCodecTy]
+      cases abstractBytesHaveProv (xs ++ .uninit :: ys) with
+      | true => rfl
+      | false => exact hdv
 
 private theorem mergeMaskedAbstractBytes_fresh :
     ∀ (bs : List AbstractByte) (S : Nat) (bmList : List Bool),
@@ -1599,7 +1657,7 @@ theorem evalOperand_unionFieldRead_spec
       evalOperand locals (unionFieldReadOperand isMove u j fty) .nil globals body.layouts .nil
           body.localDecls = .ub) := by
   have htouch := placeTouchesUnion_union_field hdecl_u hwt j fty
-  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, _, _, _, _, _⟩ := hwt.adt_spec
+  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, _, _, hptr, _, _⟩ := hwt.adt_spec
   have hn_eq : n' = n := by
     unfold translateTy at hfields
     dsimp only at hfields
@@ -1688,11 +1746,13 @@ theorem evalOperand_unionFieldRead_spec
       rw [takeAbstractBytes_eq_take,
         List.take_append_of_le_length (by rw [encodeLittleEndianBytes_length]; exact hw_le),
         ← takeAbstractBytes_eq_take, takeAbstractBytes_encodeLittleEndianBytes w sc.sizeBytes _ _ hw_le]
+    have hptr8 : layoutPointerBytes body.layouts = 8 := by
+      unfold layoutPointerBytes; rw [hptr]
     have hdec : ∀ {rTy : Ty}, rTy.kind = fty.kind →
         decodeTypedValueFromBytes defaultCodecFuel body.layouts rTy
           (encodeLittleEndianBytes sc.bits w none) =
           some (.scalar ⟨sc.bits % scalarModulus w, w⟩) := fun hrk =>
-      decodeTypedValueFromBytes_primScalar hprim hw hsz hrk hbool hchar
+      decodeTypedValueFromBytes_primScalar hprim hw hsz hrk hbool hchar hptr8
     have hrp : readProjectedValueUnionAware locals body.localDecls body.layouts
         (.aggregate 0 (unionSlotFields n f (.scalar sc))) uDecl.ty [.field j fty] =
         .ok (.scalar ⟨sc.bits % scalarModulus w, w⟩) := by
@@ -8447,7 +8507,7 @@ theorem evalOperand_unionOverlayFieldRead_ne_spec
     evalOperand locals (unionFieldReadOperand isMove u j fty) .nil globals body.layouts .nil
         body.localDecls = .ok (.scalar ⟨sc.bits % scalarModulus w, w⟩) locals := by
   have htouch := placeTouchesUnion_union_field hdecl_u hwt j fty
-  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, _, hfl_len, _, _, _⟩ := hwt.adt_spec
+  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, _, hfl_len, hptr, _, _⟩ := hwt.adt_spec
   have hn_eq : n' = n := by
     unfold translateTy at hfields
     dsimp only at hfields
@@ -8501,11 +8561,13 @@ theorem evalOperand_unionOverlayFieldRead_ne_spec
       List.take_append_of_le_length (by rw [encodeLittleEndianBytes_length]; exact hw_le),
       ← takeAbstractBytes_eq_take,
       takeAbstractBytes_encodeLittleEndianBytes w sc.sizeBytes _ _ hw_le]
+  have hptr8 : layoutPointerBytes body.layouts = 8 := by
+    unfold layoutPointerBytes; rw [hptr]
   have hdec : ∀ {rTy : Ty}, rTy.kind = fty.kind →
       decodeTypedValueFromBytes defaultCodecFuel body.layouts rTy
         (encodeLittleEndianBytes sc.bits w none) =
         some (.scalar ⟨sc.bits % scalarModulus w, w⟩) := fun hrk =>
-    decodeTypedValueFromBytes_primScalar hprim hw hsz hrk hbool hchar
+    decodeTypedValueFromBytes_primScalar hprim hw hsz hrk hbool hchar hptr8
   have hrp : readProjectedValueUnionAware locals body.localDecls body.layouts
       (.aggregate 0 fields) uDecl.ty [.field j fty] =
       .ok (.scalar ⟨sc.bits % scalarModulus w, w⟩) := by

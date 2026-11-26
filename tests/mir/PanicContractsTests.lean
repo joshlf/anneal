@@ -2954,7 +2954,16 @@ private theorem evalRvalue_addWithOverflow_mem {locals : List LocalSlot}
       cases lv with
       | scalar ls =>
         cases rv with
-        | scalar rs => exact evalScalarBinOp_addWithOverflow_mem h
+        | scalar rs =>
+          cases hFl : Bool.or (isFloatOptTy (operandTy decls layouts lhs))
+              (isFloatOptTy (operandTy decls layouts rhs)) with
+          | true =>
+            simp only [hFl, evalFloatScalarBinOp] at h
+            repeat' split at h
+            all_goals nomatch h
+          | false =>
+            simp only [hFl] at h
+            exact evalScalarBinOp_addWithOverflow_mem h
         | ptr _ _ => nomatch h
         | _ => nomatch h
       | ptr _ _ =>
