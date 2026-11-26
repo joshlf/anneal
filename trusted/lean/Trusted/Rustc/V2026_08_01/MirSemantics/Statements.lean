@@ -3973,16 +3973,65 @@ def copyPtrIsWide? : Nat → RigidTy → Option Bool
     | _ => .some false
 
 /--
-Whether the compiler-supplied layout `l` (found at index `layoutIdx`) is shape-
-and size-consistent with the type `kind` it is used for, on target `layouts`:
-primitive sizes, `!` / function-item / `()` zero-sized shapes, thin
-(`ptrBytes`) or wide (`2 * ptrBytes`) pointers with alignment at most
-`ptrBytes`, arrays with `count = N` and `size = stride * N`, tuples with one
-offset per field, ADT/closure plausibility (`copyLayoutValidForResolvedAdt`),
-and — for compound types — no generic placeholder (`copyLayoutHasPlaceholder`)
-and no truncated parametric template (`copyLayoutTruncatedParametric`). This
-rejects mislabeled indices (for example an unrelated `entries[0]` reached
-through a synthesized `layoutIdx = 0`).
+Validate that a tuple's `fieldLayouts` and `offsets` match its field types `ks`
+pairwise, with each field well-formed, aligned to at most `tupleAlign`, and
+contained within `tupleSize` bytes (helper for `copyLayoutMatchesRigidTyAux`).
+
+Reference (The Rust Reference 1.98.0, "The Rust representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.repr.rust.layout>
+
+> "The alignment of the type is at least the maximum alignment of its fields."
+-/
+def copyTupleFieldLayoutsMatch
+    (check : Nat → RigidTy → TypeLayout → Bool)
+    (layouts : LayoutTable)
+    (tupleSize tupleAlign : Nat) :
+    List RigidTy → List Nat → List Size → Bool
+  | .nil, .nil, .nil => true
+  | k :: ks', fIdx :: fIdxs', off :: offs' =>
+    match LayoutTable.lookup layouts fIdx with
+    | .none => false
+    | .some fl =>
+      match
+        Bool.and (TypeLayout.isWellFormed fl)
+          (Bool.and (check fIdx k fl)
+            (Bool.and (Nat.ble fl.align.bytes tupleAlign)
+              (Nat.ble (Nat.add off.bytes fl.size.bytes) tupleSize)))
+      with
+      | false => false
+      | true => copyTupleFieldLayoutsMatch check layouts tupleSize tupleAlign ks' fIdxs' offs'
+  | _, _, _ => false
+
+/--
+Sum of known primitive byte sizes (`copyPrimByteSize?`) across a tuple's field
+types `ks`: a sound lower bound on the byte size of any tuple with fields `ks`
+when `fieldLayouts` is absent (helper for `copyLayoutMatchesRigidTyAux`).
+
+Modeling choice: non-primitive fields contribute `0`, so the sum never exceeds
+the tuple's actual size.
+-/
+def copyTupleMinPrimBytes (ptrBytes : Nat) : List RigidTy → Nat
+  | .nil => 0
+  | k :: rest =>
+    let kSz : Nat :=
+      match copyPrimByteSize? ptrBytes k with
+      | .some sz => sz
+      | .none => 0
+    Nat.add kSz (copyTupleMinPrimBytes ptrBytes rest)
+
+/--
+Fuel-bounded structural consistency check between a compiler-supplied layout `l`
+(at index `layoutIdx`) and the type `kind` on target `layouts`: primitive sizes,
+`!` / function-item / `()` zero-sized shapes, thin (`ptrBytes`, scalar-pointer
+repr, `.primitive` fields) or wide (`2 * ptrBytes`, scalar-pair-pointer repr)
+pointers with alignment at most `ptrBytes`, arrays with `count = N`,
+`size = stride * N`, and element-layout consistency (validating `fieldLayouts`
+recursively when present and primitive element strides otherwise), tuples with
+one offset per field and pairwise field-layout / alignment / size consistency,
+ADT/closure plausibility (`copyLayoutValidForResolvedAdt`), and — for compound
+types — no generic placeholder (`copyLayoutHasPlaceholder`) and no truncated
+parametric template (`copyLayoutTruncatedParametric`). Exhausting `fuel` fails
+closed (`false`).
 
 Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -4000,61 +4049,99 @@ Reference (The Rust Reference 1.98.0, "Dynamically Sized Types"):
 > "Pointer types to DSTs are sized but have twice the size of pointers to sized
 > types, since they also store metadata:"
 -/
+def copyLayoutMatchesRigidTyAux :
+    Nat → LayoutTable → Nat → RigidTy → TypeLayout → Bool
+  | .zero, _, _, _, _ => false
+  | .succ fuel', layouts, layoutIdx, kind, l =>
+    let ptrBytes := layoutPointerBytes layouts
+    let compoundOk : Bool :=
+      Bool.and
+        (Bool.not (copyLayoutHasPlaceholder layouts 32 l))
+        (Bool.not (copyLayoutTruncatedParametric l))
+    let zstOk : Bool :=
+      Bool.and (Bool.not l.isUninhabited)
+        (Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1))
+    let ptrOk : RigidTy → Bool := fun pt =>
+      let thinOk : Bool :=
+        Bool.and (Nat.beq l.size.bytes ptrBytes)
+          (Bool.and (copyIsThinPtrBackendRepr l.backendRepr)
+            (match l.fields with | .primitive => true | _ => false))
+      let wideOk : Bool :=
+        Bool.and (Nat.beq l.size.bytes (Nat.mul 2 ptrBytes))
+          (copyIsWidePtrBackendRepr l.backendRepr)
+      let shapeOk : Bool :=
+        match copyPtrIsWide? 8 pt with
+        | .some true => wideOk
+        | .some false => thinOk
+        | .none => Bool.or thinOk wideOk
+      Bool.and (Bool.not l.isUninhabited) (Bool.and (Nat.ble l.align.bytes ptrBytes) shapeOk)
+    match kind with
+    | .never =>
+      Bool.and l.isUninhabited (Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1))
+    | .fnDef _ _ => zstOk
+    | .ref _ pt => ptrOk pt
+    | .rawPtr _ pt => ptrOk pt
+    | .array elem n =>
+      match l.fields with
+      | .array stride count =>
+        let elemOk : Bool :=
+          match l.fieldLayouts with
+          | elemIdx :: .nil =>
+            match LayoutTable.lookup layouts elemIdx with
+            | .none => false
+            | .some elemL =>
+              Bool.and (TypeLayout.isWellFormed elemL)
+                (Bool.and (copyLayoutMatchesRigidTyAux fuel' layouts elemIdx elem elemL)
+                  (Bool.and (Nat.beq stride.bytes elemL.size.bytes)
+                    (Nat.beq l.align.bytes elemL.align.bytes)))
+          | .nil =>
+            match copyPrimByteSize? ptrBytes elem with
+            | .some esz => Bool.and (Nat.beq stride.bytes esz) (Nat.ble l.align.bytes esz)
+            | .none => true
+          | _ => false
+        Bool.and compoundOk
+          (Bool.and elemOk
+            (Bool.and (Nat.beq count n) (Nat.beq l.size.bytes (Nat.mul stride.bytes n))))
+      | _ => false
+    | .tuple ks =>
+      match ks with
+      | .nil => zstOk
+      | _ :: _ =>
+        match l.fields with
+        | .arbitrary offsets _ =>
+          let fieldsOk : Bool :=
+            match l.fieldLayouts with
+            | .nil => Nat.ble (copyTupleMinPrimBytes ptrBytes ks) l.size.bytes
+            | fIdxs =>
+              copyTupleFieldLayoutsMatch
+                (copyLayoutMatchesRigidTyAux fuel' layouts)
+                layouts l.size.bytes l.align.bytes ks fIdxs offsets
+          Bool.and compoundOk (Bool.and (Nat.beq (length offsets) (length ks)) fieldsOk)
+        | _ => false
+    | .adt _ _ => Bool.and compoundOk (copyLayoutValidForResolvedAdt layoutIdx l)
+    | .closure _ _ => Bool.and compoundOk (copyLayoutValidForResolvedAdt layoutIdx l)
+    | _ =>
+      match copyPrimByteSize? ptrBytes kind, l.fields with
+      | .some sz, .primitive =>
+        Bool.and (Bool.not l.isUninhabited)
+          (Bool.and (Nat.beq l.size.bytes sz) (Nat.ble l.align.bytes sz))
+      | _, _ => false
+
+/--
+Whether the compiler-supplied layout `l` (found at index `layoutIdx`) is shape-
+and size-consistent with `kind` on target `layouts` (depth fuel `16`, exceeding
+the nesting depth of concrete captured compounds).
+
+Modeling choice: wrapper calling `copyLayoutMatchesRigidTyAux` with fuel `16`.
+-/
+@[reducible]
 def copyLayoutMatchesRigidTy
     (layouts : LayoutTable)
     (layoutIdx : Nat)
     (kind : RigidTy)
     (l : TypeLayout) :
     Bool :=
-  let ptrBytes := layoutPointerBytes layouts
-  let compoundOk : Bool :=
-    Bool.and
-      (Bool.not (copyLayoutHasPlaceholder layouts 32 l))
-      (Bool.not (copyLayoutTruncatedParametric l))
-  let zstOk : Bool :=
-    Bool.and (Bool.not l.isUninhabited)
-      (Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1))
-  let ptrOk : RigidTy → Bool := fun pt =>
-    let thinOk : Bool :=
-      Bool.and (Nat.beq l.size.bytes ptrBytes)
-        (Bool.and (copyIsThinPtrBackendRepr l.backendRepr)
-          (match l.fields with | .primitive => true | _ => false))
-    let wideOk : Bool :=
-      Bool.and (Nat.beq l.size.bytes (Nat.mul 2 ptrBytes))
-        (copyIsWidePtrBackendRepr l.backendRepr)
-    let shapeOk : Bool :=
-      match copyPtrIsWide? 8 pt with
-      | .some true => wideOk
-      | .some false => thinOk
-      | .none => Bool.or thinOk wideOk
-    Bool.and (Bool.not l.isUninhabited) (Bool.and (Nat.ble l.align.bytes ptrBytes) shapeOk)
-  match kind with
-  | .never =>
-    Bool.and l.isUninhabited (Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1))
-  | .fnDef _ _ => zstOk
-  | .ref _ pt => ptrOk pt
-  | .rawPtr _ pt => ptrOk pt
-  | .array _ n =>
-    match l.fields with
-    | .array stride count =>
-      Bool.and compoundOk
-        (Bool.and (Nat.beq count n) (Nat.beq l.size.bytes (Nat.mul stride.bytes n)))
-    | _ => false
-  | .tuple ks =>
-    match ks with
-    | .nil => zstOk
-    | _ :: _ =>
-      match l.fields with
-      | .arbitrary offsets _ => Bool.and compoundOk (Nat.beq (length offsets) (length ks))
-      | _ => false
-  | .adt _ _ => Bool.and compoundOk (copyLayoutValidForResolvedAdt layoutIdx l)
-  | .closure _ _ => Bool.and compoundOk (copyLayoutValidForResolvedAdt layoutIdx l)
-  | _ =>
-    match copyPrimByteSize? ptrBytes kind, l.fields with
-    | .some sz, .primitive =>
-      Bool.and (Bool.not l.isUninhabited)
-        (Bool.and (Nat.beq l.size.bytes sz) (Nat.ble l.align.bytes sz))
-    | _, _ => false
+  copyLayoutMatchesRigidTyAux 16 layouts layoutIdx kind l
 
 /--
 `(size, align)` of a compiler-supplied layout `l` at `layoutIdx` used for the
@@ -4086,7 +4173,9 @@ def copyValidatedLayoutFor?
 
 /--
 `(size, align)` of `kind` from the first `LocalDecl` of structurally equal type
-(`rigidTyEq`) whose captured layout passes `copyValidatedLayoutFor?`.
+(`rigidTyEq`) whose `layoutIdx` is resolved (`isUnresolvedLayoutIdx = false`, so
+a default `layoutIdx = 0` never aliases an unrelated `entries[0]`) and whose
+captured layout passes `copyValidatedLayoutFor?`.
 
 Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -4106,12 +4195,15 @@ def copyFindDeclLayout?
     match rigidTyEq decl.ty.kind kind with
     | false => copyFindDeclLayout? layouts kind rest
     | true =>
-      match LayoutTable.lookup layouts decl.ty.layoutIdx with
-      | .some l =>
-        match copyValidatedLayoutFor? layouts decl.ty.layoutIdx kind l with
-        | .some r => .some r
+      match isUnresolvedLayoutIdx layouts decl.ty.layoutIdx with
+      | true => copyFindDeclLayout? layouts kind rest
+      | false =>
+        match LayoutTable.lookup layouts decl.ty.layoutIdx with
+        | .some l =>
+          match copyValidatedLayoutFor? layouts decl.ty.layoutIdx kind l with
+          | .some r => .some r
+          | .none => copyFindDeclLayout? layouts kind rest
         | .none => copyFindDeclLayout? layouts kind rest
-      | .none => copyFindDeclLayout? layouts kind rest
 
 /--
 Fuel-bounded exact `(size_of::<T>(), align_of::<T>())` of a sized type `kind`:
@@ -4643,11 +4735,13 @@ def copyKindDefinitelyNonPtr : RigidTy → Bool
 /--
 Classify the `copy_nonoverlapping` operand `op` (`OperandPointeeLookup`) from
 its resolved declared type (`operandTyResolved`, so projected places never
-synthesize `layoutIdx = 0` and alias `entries[0]`) and, for pointer types, the
-pointer type's captured layout: when that layout is a thin pointer
+synthesize `layoutIdx = 0` and alias `entries[0]`) and, for pointer types whose
+own `layoutIdx` is resolved (`isUnresolvedLayoutIdx = false`; in `rustc-capture`
+a pointer's pointee is always interned first so pointer layouts have index
+`≥ 1`), the pointer type's captured layout: when that layout is a thin pointer
 representation (`copyIsThinPtrBackendRepr`) with exactly one `fieldLayouts`
 entry `ptLayoutIdx`, `ptLayoutIdx` is the authoritative pointee layout index
-(also when it is `0`).
+(also when `ptLayoutIdx = 0`).
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -4669,12 +4763,15 @@ def operandPointeeLookup
   | .none => .unknown
   | .some ty =>
     let auth : Option Nat :=
-      match LayoutTable.lookup layouts ty.layoutIdx with
-      | .some ptrLayout =>
-        match copyIsThinPtrBackendRepr ptrLayout.backendRepr, ptrLayout.fieldLayouts with
-        | true, ptLayoutIdx :: .nil => .some ptLayoutIdx
-        | _, _ => .none
-      | .none => .none
+      match isUnresolvedLayoutIdx layouts ty.layoutIdx with
+      | true => .none
+      | false =>
+        match LayoutTable.lookup layouts ty.layoutIdx with
+        | .some ptrLayout =>
+          match copyIsThinPtrBackendRepr ptrLayout.backendRepr, ptrLayout.fieldLayouts with
+          | true, ptLayoutIdx :: .nil => .some ptLayoutIdx
+          | _, _ => .none
+        | .none => .none
     match ty.kind with
     | .rawPtr _ pt => .pointee pt auth
     | .ref _ pt => .pointee pt auth

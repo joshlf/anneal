@@ -127,8 +127,8 @@ theorem out_of_range_count_ub_univ (s : MachineState) (src dst : Operand) (ld : 
     | succ k ih => exact Nat.mul_pos (by decide) ih
   have hRange : Bool.or (Nat.beq count 0)
       (Nat.blt count (scalarModulus (layoutPointerBytes ly))) = false := by
-    have h1 : count ≠ 0 := by omega
-    have h2 : ¬ count < scalarModulus (layoutPointerBytes ly) := by omega
+    have h1 : count ≠ 0 := Nat.ne_of_gt (Nat.lt_of_lt_of_le hPos hCnt)
+    have h2 : ¬ count < scalarModulus (layoutPointerBytes ly) := Nat.not_lt.mpr hCnt
     have e1 : Nat.beq count 0 = false :=
       Bool.eq_false_iff.mpr (fun h => h1 (Nat.eq_of_beq_eq_true h))
     have e2 : Nat.blt count (scalarModulus (layoutPointerBytes ly)) = false :=
@@ -706,6 +706,71 @@ theorem cross_frame_borrow_misaligned_ub :
     evalCopyNonOverlappingWithCount S64_crossFrame (cp 2) (cp 3) D64 L64 (pv 1 1) (av 8) 0
       locals64 = MirStepNode.fail .ub := rfl
 
+/-! ### B2 soundness regressions (layout-index & compound field-layout validation) -/
+
+/-- `entries[0] = ()` must NOT hijack an unresolved `_1 : Opaque` (`layoutIdx = 0`) into a ZST
+`(0, 1)` layout (which would turn `count = 5` on misaligned pointers into a no-op). -/
+def D64_unresAdt : List LocalDecl :=
+  [decl (.tuple []) 0, decl opaqueK 0, decl (ptrK opaqueK) 0]
+
+theorem unit0_cannot_hijack_unresolved_adt_decl :
+    resolveCopyElemLayout D64_unresAdt L64 (cp 2) (cp 2) = .unsupported := rfl
+theorem unit0_unresolved_adt_count5_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 2) (cp 2) D64_unresAdt L64 (av 1) (av 1) 5
+      locals64 = MirStepNode.fail .ub := rfl
+
+/-- `entries[0] = *mut Packed` must NOT hijack an unresolved `_1 : *mut Align8` (`layoutIdx = 0`)
+into `Packed`'s align-1 layout. -/
+def D64_unresPtr : List LocalDecl :=
+  [decl (ptrK packedK) 0, decl (ptrK align8K) 0]
+
+theorem entry0_packed_ptr_cannot_hijack_unresolved_ptr_decl :
+    resolveCopyElemLayout D64_unresPtr L64_projHijack (cp 1) (cp 1) = .unsupported := rfl
+
+/-- `[u8; 4]` layout (`stride = 1, align = 1, fieldLayouts = [u8]`) must NOT validate as the
+layout of `[u64; 4]`; `[u64; 4]` falls back to exact `.ok 32 8`, rejecting misaligned `av 1`
+and `2^58 * 32 > isize::MAX` overflow. -/
+def L64_arrHijack : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 1 1 .primitive
+      , lay 4 1 (.array ⟨1⟩ 4) [1]
+      , ptrLay 8 2 ] }
+def D64_arrHijack : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK (.array (.uint .u64) 4)) 3]
+
+theorem u8_arr4_cannot_hijack_u64_arr4_resolve :
+    resolveCopyElemLayout D64_arrHijack L64_arrHijack (cp 1) (cp 1) = .ok 32 8 := rfl
+theorem u8_arr4_cannot_hijack_u64_arr4_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_arrHijack L64_arrHijack (av 1) (av 1) 0
+      locals64 = MirStepNode.fail .ub := rfl
+theorem u8_arr4_cannot_hijack_u64_arr4_overflow_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_arrHijack L64_arrHijack (av 8) (av 8)
+      (2 ^ 58) locals64 = MirStepNode.fail .ub := rfl
+
+/-- `(u8, u8)` layout (`size = 2, align = 1, fieldLayouts = [u8, u8]`) must NOT validate as the
+layout of `(u64, u64)`; a valid `(u64, u8)` layout (`size = 16, align = 8`) resolves cleanly. -/
+def L64_tupHijack : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 1 1 .primitive
+      , lay 8 8 .primitive
+      , lay 2 1 (.arbitrary [⟨0⟩, ⟨1⟩] [0, 1]) [1, 1]
+      , ptrLay 8 3
+      , lay 16 8 (.arbitrary [⟨0⟩, ⟨8⟩] [0, 1]) [2, 1]
+      , ptrLay 8 5 ] }
+def D64_tupHijack : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.tuple [.uint .u64, .uint .u64])) 4
+  , decl (ptrK (.tuple [.uint .u64, .uint .u8])) 6 ]
+
+theorem u8_tuple_cannot_hijack_u64_tuple_unresolved :
+    resolveCopyElemLayout D64_tupHijack L64_tupHijack (cp 1) (cp 1) = .unsupported := rfl
+theorem valid_u64_u8_tuple_resolves :
+    resolveCopyElemLayout D64_tupHijack L64_tupHijack (cp 2) (cp 2) = .ok 16 8 := rfl
+
 end Anneal.Tests.ZeroCountCopyAlign.V06
 
 /-! ## §2. `V2026_08_01` (same fixtures; `Value` has no `uninit`) -/
@@ -790,8 +855,8 @@ theorem out_of_range_count_ub_univ (s : MachineState) (src dst : Operand) (ld : 
     | succ k ih => exact Nat.mul_pos (by decide) ih
   have hRange : Bool.or (Nat.beq count 0)
       (Nat.blt count (scalarModulus (layoutPointerBytes ly))) = false := by
-    have h1 : count ≠ 0 := by omega
-    have h2 : ¬ count < scalarModulus (layoutPointerBytes ly) := by omega
+    have h1 : count ≠ 0 := Nat.ne_of_gt (Nat.lt_of_lt_of_le hPos hCnt)
+    have h2 : ¬ count < scalarModulus (layoutPointerBytes ly) := Nat.not_lt.mpr hCnt
     have e1 : Nat.beq count 0 = false :=
       Bool.eq_false_iff.mpr (fun h => h1 (Nat.eq_of_beq_eq_true h))
     have e2 : Nat.blt count (scalarModulus (layoutPointerBytes ly)) = false :=
@@ -1366,6 +1431,71 @@ theorem cross_frame_borrow_misaligned_ub :
     evalCopyNonOverlappingWithCount S64_crossFrame (cp 2) (cp 3) D64 L64 (pv 1 1) (av 8) 0
       locals64 = MirStepNode.fail .ub := rfl
 
+/-! ### B2 soundness regressions (layout-index & compound field-layout validation) -/
+
+/-- `entries[0] = ()` must NOT hijack an unresolved `_1 : Opaque` (`layoutIdx = 0`) into a ZST
+`(0, 1)` layout (which would turn `count = 5` on misaligned pointers into a no-op). -/
+def D64_unresAdt : List LocalDecl :=
+  [decl (.tuple []) 0, decl opaqueK 0, decl (ptrK opaqueK) 0]
+
+theorem unit0_cannot_hijack_unresolved_adt_decl :
+    resolveCopyElemLayout D64_unresAdt L64 (cp 2) (cp 2) = .unsupported := rfl
+theorem unit0_unresolved_adt_count5_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 2) (cp 2) D64_unresAdt L64 (av 1) (av 1) 5
+      locals64 = MirStepNode.fail .ub := rfl
+
+/-- `entries[0] = *mut Packed` must NOT hijack an unresolved `_1 : *mut Align8` (`layoutIdx = 0`)
+into `Packed`'s align-1 layout. -/
+def D64_unresPtr : List LocalDecl :=
+  [decl (ptrK packedK) 0, decl (ptrK align8K) 0]
+
+theorem entry0_packed_ptr_cannot_hijack_unresolved_ptr_decl :
+    resolveCopyElemLayout D64_unresPtr L64_projHijack (cp 1) (cp 1) = .unsupported := rfl
+
+/-- `[u8; 4]` layout (`stride = 1, align = 1, fieldLayouts = [u8]`) must NOT validate as the
+layout of `[u64; 4]`; `[u64; 4]` falls back to exact `.ok 32 8`, rejecting misaligned `av 1`
+and `2^58 * 32 > isize::MAX` overflow. -/
+def L64_arrHijack : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 1 1 .primitive
+      , lay 4 1 (.array ⟨1⟩ 4) [1]
+      , ptrLay 8 2 ] }
+def D64_arrHijack : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK (.array (.uint .u64) 4)) 3]
+
+theorem u8_arr4_cannot_hijack_u64_arr4_resolve :
+    resolveCopyElemLayout D64_arrHijack L64_arrHijack (cp 1) (cp 1) = .ok 32 8 := rfl
+theorem u8_arr4_cannot_hijack_u64_arr4_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_arrHijack L64_arrHijack (av 1) (av 1) 0
+      locals64 = MirStepNode.fail .ub := rfl
+theorem u8_arr4_cannot_hijack_u64_arr4_overflow_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_arrHijack L64_arrHijack (av 8) (av 8)
+      (2 ^ 58) locals64 = MirStepNode.fail .ub := rfl
+
+/-- `(u8, u8)` layout (`size = 2, align = 1, fieldLayouts = [u8, u8]`) must NOT validate as the
+layout of `(u64, u64)`; a valid `(u64, u8)` layout (`size = 16, align = 8`) resolves cleanly. -/
+def L64_tupHijack : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 1 1 .primitive
+      , lay 8 8 .primitive
+      , lay 2 1 (.arbitrary [⟨0⟩, ⟨1⟩] [0, 1]) [1, 1]
+      , ptrLay 8 3
+      , lay 16 8 (.arbitrary [⟨0⟩, ⟨8⟩] [0, 1]) [2, 1]
+      , ptrLay 8 5 ] }
+def D64_tupHijack : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.tuple [.uint .u64, .uint .u64])) 4
+  , decl (ptrK (.tuple [.uint .u64, .uint .u8])) 6 ]
+
+theorem u8_tuple_cannot_hijack_u64_tuple_unresolved :
+    resolveCopyElemLayout D64_tupHijack L64_tupHijack (cp 1) (cp 1) = .unsupported := rfl
+theorem valid_u64_u8_tuple_resolves :
+    resolveCopyElemLayout D64_tupHijack L64_tupHijack (cp 2) (cp 2) = .ok 16 8 := rfl
+
 end Anneal.Tests.ZeroCountCopyAlign.V08
 
 /-! ## §3. Axiom audit (standard axioms only: no `sorryAx`, no `Lean.ofReduceBool`) -/
@@ -1522,7 +1652,7 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.call_zst_out_of_range_count_ub
 
-/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.out_of_range_count_ub_univ' depends on axioms: [propext, Quot.sound] -/
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.out_of_range_count_ub_univ' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.out_of_range_count_ub_univ
 
@@ -2274,3 +2404,69 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.cross_frame_borrow_misaligned_ub' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.cross_frame_borrow_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.unit0_cannot_hijack_unresolved_adt_decl' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.unit0_cannot_hijack_unresolved_adt_decl
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.unit0_unresolved_adt_count5_misaligned_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.unit0_unresolved_adt_count5_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.entry0_packed_ptr_cannot_hijack_unresolved_ptr_decl' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.entry0_packed_ptr_cannot_hijack_unresolved_ptr_decl
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.u8_arr4_cannot_hijack_u64_arr4_resolve' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.u8_arr4_cannot_hijack_u64_arr4_resolve
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.u8_arr4_cannot_hijack_u64_arr4_misaligned_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.u8_arr4_cannot_hijack_u64_arr4_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.u8_arr4_cannot_hijack_u64_arr4_overflow_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.u8_arr4_cannot_hijack_u64_arr4_overflow_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.u8_tuple_cannot_hijack_u64_tuple_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.u8_tuple_cannot_hijack_u64_tuple_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.valid_u64_u8_tuple_resolves' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.valid_u64_u8_tuple_resolves
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.unit0_cannot_hijack_unresolved_adt_decl' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.unit0_cannot_hijack_unresolved_adt_decl
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.unit0_unresolved_adt_count5_misaligned_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.unit0_unresolved_adt_count5_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.entry0_packed_ptr_cannot_hijack_unresolved_ptr_decl' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.entry0_packed_ptr_cannot_hijack_unresolved_ptr_decl
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.u8_arr4_cannot_hijack_u64_arr4_resolve' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.u8_arr4_cannot_hijack_u64_arr4_resolve
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.u8_arr4_cannot_hijack_u64_arr4_misaligned_ub' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.u8_arr4_cannot_hijack_u64_arr4_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.u8_arr4_cannot_hijack_u64_arr4_overflow_ub' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.u8_arr4_cannot_hijack_u64_arr4_overflow_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.u8_tuple_cannot_hijack_u64_tuple_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.u8_tuple_cannot_hijack_u64_tuple_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.valid_u64_u8_tuple_resolves' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.valid_u64_u8_tuple_resolves
