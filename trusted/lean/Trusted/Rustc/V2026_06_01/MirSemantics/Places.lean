@@ -9146,23 +9146,523 @@ def wrapFullWidthInitChain?
   | _, _, _ => .none
 
 /--
+Determine whether a structural `RigidTy` is statically known to be uninhabited
+(has no valid values) in `Runtime(PostCleanup)` MIR (Rust 1.98.0, all editions,
+any target, `rustc 1.98.0-nightly (14210df0e 2026-05-31)`), using bounded
+structural recursion with `fuel`.
+
+Preconditions and scope: applies to monomorphic `RigidTy` values after
+`Runtime(PostCleanup)` lowering. Recognizes `!` (`.never`), tuples and closures
+containing an uninhabited field/upvar, non-empty arrays `[T; N]` (`N > 0`) of
+an uninhabited element `T`, `core::convert::Infallible` /
+`std::convert::Infallible`, and single-field standard-library wrappers
+(`UnsafeCell`, `SyncUnsafeCell`, `Cell`, `RefCell`, `ManuallyDrop`) whose inner
+type argument is uninhabited.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.enum>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.struct>
+
+> "A `!` value must never exist."
+>
+> "An enum must have a valid discriminant, and all fields of the variant
+> indicated by that discriminant must be valid at their respective type."
+>
+> "A `struct`, tuple, and array requires all fields/elements to be valid at
+> their respective type."
+
+Reference (The Rust Reference 1.98.0, "Closure types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.intro>
+
+> "A closure type is approximately equivalent to a struct which contains the
+> captured values."
+
+Reference (`library/core/src/convert/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/convert/mod.rs#L930>
+
+> "pub enum Infallible {}"
+
+Reference (`library/std/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/std/src/lib.rs#L511>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/std/src/lib.rs#L519>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/std/src/lib.rs#L553>
+
+> "pub use core::cell;"
+>
+> "pub use core::convert;"
+>
+> "pub use core::mem;"
+
+Reference (`library/core/src/cell.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L312-L314>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L849-L858>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L2323-L2325>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L2615-L2617>
+
+> "pub struct Cell<T: ?Sized> {
+>     value: UnsafeCell<T>,
+> }"
+>
+> "pub struct RefCell<T: ?Sized> {
+>     borrow: Cell<BorrowCounter>,
+>     // Stores the location of the earliest currently active borrow.
+>     // This gets updated whenever we go from having zero borrows
+>     // to having a single borrow. When a borrow occurs, this gets included
+>     // in the generated `BorrowError`/`BorrowMutError`
+>     #[cfg(feature = "debug_refcell")]
+>     borrowed_at: Cell<Option<&'static crate::panic::Location<'static>>>,
+>     value: UnsafeCell<T>,
+> }"
+>
+> "pub struct UnsafeCell<T: ?Sized> {
+>     value: T,
+> }"
+>
+> "pub struct SyncUnsafeCell<T: ?Sized> {
+>     value: UnsafeCell<T>,
+> }"
+
+Reference (`library/core/src/mem/manually_drop.rs` and
+`library/core/src/mem/maybe_dangling.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/manually_drop.rs#L161-L163>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/maybe_dangling.rs#L74>
+
+> "pub struct ManuallyDrop<T: ?Sized> {
+>     value: MaybeDangling<T>,
+> }"
+>
+> "pub struct MaybeDangling<P: ?Sized>(P);"
+
+Justification: by the quoted validity rules, `!` has no valid value; an enum
+needs a valid discriminant, and `Infallible` (the `std::convert` path is a
+re-export of `core::convert`) declares no variants, so it has no valid
+discriminant and no valid value; and a struct, tuple, or non-empty array has a
+valid value only if every field/element is valid at its respective type.
+`UnsafeCell<T>` has a field of type `T`; `Cell<T>`, `RefCell<T>`, and
+`SyncUnsafeCell<T>` each have a field of type `UnsafeCell<T>`; and
+`ManuallyDrop<T>` has a field of type `MaybeDangling<T>`, a tuple struct whose
+only field has type `T` (the `std::cell` / `std::mem` paths are re-exports of
+the `core` modules). Hence each of these wrappers is uninhabited whenever `T`
+is. Conversely, a zero-length array `[T; 0]` or empty tuple `()` has no
+elements to validate and returns `false`.
+
+Guarantees vs. modeling choices: the `!`, `Infallible`, tuple, array, and
+standard-library wrapper cases follow from the quoted documentation and pinned
+library definitions (private field layouts of the wrappers are taken from the
+pinned `core` source, not from a stable documentation promise). The closure
+case applies the struct rule to a closure's captured values under the
+Reference's "approximately equivalent to a struct" description; that is an
+Anneal modeling assumption, not a documented guarantee. This is a structural
+sufficient condition (returning `false` when `fuel` runs out or for arbitrary
+user-defined uninhabited ADTs); compiler-captured uninhabitedness for arbitrary
+ADTs is supplied separately via `TypeLayout.isUninhabited` in
+`tyIsUninhabited`.
+-/
+@[reducible]
+def rigidTyIsUninhabited : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ _, .never => true
+  | .succ _, .tuple .nil => false
+  | .succ fuel, .tuple (k :: ks) =>
+    Bool.or
+      (rigidTyIsUninhabited fuel k)
+      (rigidTyIsUninhabited fuel (.tuple ks))
+  | .succ _, .array _ .zero => false
+  | .succ fuel, .array elem (.succ _) => rigidTyIsUninhabited fuel elem
+  | .succ _, .closure _ .nil => false
+  | .succ fuel, .closure defPath (u :: us) =>
+    Bool.or
+      (rigidTyIsUninhabited fuel u)
+      (rigidTyIsUninhabited fuel (.closure defPath us))
+  | .succ fuel, .adt defPath args =>
+    match
+      Bool.or
+        (stringEq defPath "core::convert::Infallible")
+        (stringEq defPath "std::convert::Infallible")
+    with
+    | true => true
+    | false =>
+      match
+        Bool.or
+          (Bool.or
+            (stringEq defPath "core::cell::UnsafeCell")
+            (stringEq defPath "std::cell::UnsafeCell"))
+          (Bool.or
+            (Bool.or
+              (stringEq defPath "core::cell::SyncUnsafeCell")
+              (stringEq defPath "std::cell::SyncUnsafeCell"))
+            (Bool.or
+              (Bool.or
+                (stringEq defPath "core::cell::Cell")
+                (stringEq defPath "std::cell::Cell"))
+              (Bool.or
+                (Bool.or
+                  (stringEq defPath "core::cell::RefCell")
+                  (stringEq defPath "std::cell::RefCell"))
+                (Bool.or
+                  (stringEq defPath "core::mem::ManuallyDrop")
+                  (stringEq defPath "std::mem::ManuallyDrop"))))),
+        args
+      with
+      | true, inner :: .nil => rigidTyIsUninhabited fuel inner
+      | _, _ => false
+  | .succ _, _ => false
+
+/--
+Determine whether a `Ty` is uninhabited in `Runtime(PostCleanup)` MIR (Rust
+1.98.0, all editions, any target, `rustc 1.98.0-nightly (14210df0e 2026-05-31)`),
+either structurally (`rigidTyIsUninhabited 16 ty.kind`) or via its
+compiler-captured `TypeLayout.isUninhabited` flag in `layouts`.
+
+Preconditions and scope: `layouts` is the `LayoutTable` captured from `rustc`
+for the current MIR body at `Runtime(PostCleanup)` phase (`TypingMode::PostAnalysis`),
+and `ty.layoutIdx` indexes that table when resolved.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.def>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.bool>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.char>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.scalar>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.reference-box>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "A `!` value must never exist."
+>
+> "A `bool` value must be `false` (`0`) or `true` (`1`)."
+>
+> "A `char` value must not be a surrogate (i.e., must not be in the range
+> `0xD800..=0xDFFF`) and must be equal to or less than `char::MAX`."
+>
+> "An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be
+> initialized, i.e., must not be obtained from uninitialized memory."
+>
+> "A reference or `Box<T>` must be aligned and non-null, it cannot be dangling,
+> and it must point to a valid value (in case of dynamically sized types, using
+> the actual dynamic type of the pointee as determined by the metadata). Note
+> that the last point (about pointing to a valid value) remains a subject of
+> some debate."
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L2127-L2131>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L2170-L2173>
+
+> "/// Is this type known to be uninhabted?
+> ///
+> /// This is separate from BackendRepr because uninhabited return types can affect ABI,
+> /// especially in the case of by-pointer struct returns, which allocate stack even when unused.
+> pub uninhabited: bool,"
+>
+> "/// Returns `true` if this is an uninhabited type
+> pub fn is_uninhabited(&self) -> bool {
+>     self.uninhabited
+> }"
+
+Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L706-L711>
+
+> "pub trait LayoutOf<'tcx>: LayoutOfHelpers<'tcx> {
+>     /// Computes the layout of a type. Note that this implicitly
+>     /// executes in `TypingMode::PostAnalysis`, and will normalize the input type.
+>     #[inline]
+>     fn layout_of(&self, ty: Ty<'tcx>) -> Self::LayoutOfResult {
+>         self.spanned_layout_of(ty, DUMMY_SP)"
+
+Justification: if `rigidTyIsUninhabited 16 ty.kind = true`, `ty` has no valid
+values by the structural validity rules quoted on `rigidTyIsUninhabited`; if
+`LayoutTable.lookup layouts ty.layoutIdx = .some l` with `l.isUninhabited = true`,
+the captured `TypeLayout.isUninhabited` is `rustc`'s `LayoutData::uninhabited`
+flag ("Is this type known to be uninhabted?") computed by `layout_of` in
+`TypingMode::PostAnalysis` for the monomorphic type and target. Primitive
+scalars (`bool`, `char`, integers, floats) and raw pointers short-circuit to
+`false`: each has documented valid values (e.g. `false`, `0`, a null raw
+pointer), so the type is inhabited regardless of any layout-table entry.
+
+Guarantees vs. modeling choices: combines documented Rust validity guarantees
+for structural forms (`rigidTyIsUninhabited`) with compiler-captured layout
+facts (`TypeLayout.isUninhabited`); `rustc`'s flag is a compiler fact, not a
+Reference guarantee, and is trusted as captured. References `&T` / `&mut T`
+also short-circuit to `false` even when `T` is uninhabited: the quoted rule
+that a reference "must point to a valid value" is explicitly marked as
+"a subject of some debate", so Anneal deliberately does not claim UB for loads
+at reference type here (this keeps thin-reference decoding in
+`decodeTypedValueFromBytes` independent of `layoutIdx`). When `ty.layoutIdx`
+is absent from `layouts` and `ty.kind` is an opaque custom ADT,
+`tyIsUninhabited` returns `false` (leaving custom uninhabited ADTs without
+captured layout metadata undetected here rather than over-claiming UB). That
+`false` result does not let `readProjectedValueUnionAware` synthesize a 0-byte
+value of an uninhabited type: for `.adt` / `.closure` types without a
+`layouts` entry, `tyByteSize` is either `.none` (selecting fail-closed
+`.unsupported`) or a positive array stride from `findArrayElemStrideAndAlign?`
+(which requires `stride ≥ 1`), never `.some 0`, so such a read goes through
+byte decoding rather than 0-byte synthesis; for `&T` / `&mut T`,
+`rigidTyKindByteSize` gives a positive size (`8` bytes for thin and `16` for
+wide references) and the read likewise decodes bytes; and `bool`, `char`,
+integers, floats, and raw pointers are inhabited by the quoted validity rules,
+so `false` is exact for them.
+-/
+@[reducible]
+def tyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
+  match ty.kind with
+  | .bool | .char | .uint _ | .int _ | .float _ | .rawPtr _ _ | .ref _ _ => false
+  | _ =>
+    match rigidTyIsUninhabited 16 ty.kind with
+    | true => true
+    | false =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | .some l => l.isUninhabited
+      | .none => false
+
+/--
+`true` when walking the deref-free sub-projection chain `proj` from `curTy`
+encounters an uninhabited intermediate or target type (`tyIsUninhabited`) after
+some projection step in `Runtime(PostCleanup)` MIR (Rust 1.98.0, all editions,
+any target, `rustc 1.98.0-nightly (14210df0e 2026-05-31)`).
+
+Preconditions and scope: called by `readProjectedValueUnionAware` on a
+normalized deref-free sub-projection chain `normRest` after a union `.field`
+projection whose runtime slot is inactive. Each step resolves the next type
+from the resolved current type: `.field` through its `fieldLayouts` (as
+`checkStaticSubProjBounds` does), `.constantIndex` through the array's element
+layout, `.subslice` as the sub-array type resolved through `localDecls` (as
+`resolveProjectedTyResolved` does, continuing at the enclosing array type when
+the window spans the whole array or is followed by a `.constantIndex`, so the
+element layout is never lost), and `.opaqueCast` / `.unwrapUnsafeBinder` as
+their target type. The walk stops with `false` at `.index`, `.downcast`, and
+`.deref` (and at array projections on a non-array type).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.invalid>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.def>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.struct>
+
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+>
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "A `!` value must never exist."
+>
+> "A `struct`, tuple, and array requires all fields/elements to be valid at
+> their respective type."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Places based on misaligned pointers"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.misaligned.load-store>
+
+> "Note that a place based on a misaligned pointer only leads to undefined
+> behavior when it is loaded from or stored to."
+
+Justification: by the quoted rules, UB from an invalid value arises when a
+value is *produced*, i.e. "read from a place"; reading a value at an
+uninhabited **leaf** type (`tyIsUninhabited layouts leafTy = true`) necessarily
+produces an invalid value and is therefore immediate UB. A read of an
+inhabited leaf through an uninhabited intermediate container (e.g.,
+`_u.pair.1 : ()` or `_u.pair_u32.1 : u32` where `pair : (Infallible, ())` or
+`pair_u32 : (Infallible, u32)`) produces only a value of the leaf type, so the
+quoted rules do not make it UB. The misaligned-pointer note is cited only as
+the Reference's analogous statement that computing a place is distinct from
+loading from it; it is not a premise about uninhabited containers.
+
+Documented gap: the 1.98.0 Reference does not state whether computing a place
+whose intermediate type is uninhabited is itself UB. (Miri and MiniRust, which
+compute field/index offsets without validating intermediate container types,
+treat such reads as non-UB; that is interpreter behavior, not a Reference
+premise.) Anneal therefore claims neither `.ok` nor `.ub` for these reads.
+
+Guarantees vs. modeling choices: `readProjectedValueUnionAware` checks
+`tyIsUninhabited layouts leafTy` first to emit `.ub` strictly for uninhabited
+leaf loads (documented Rust UB), and uses `subProjTouchesUninhabited` (together
+with `tyIsUninhabited layouts rFieldTy`) ONLY as a fail-closed **`.unsupported`**
+guard on inhabited-leaf reads through uninhabited intermediate containers. That
+`.unsupported` outcome is an Anneal modeling choice (conservative incompleteness,
+never a false-positive `.ub`). `subProjTouchesUninhabited` itself makes no Rust
+claim: it is a pure walk over captured types whose `true` result only selects
+the fail-closed branch, and whose `false` result (including the early stops at
+`.index`, `.downcast`, and `.deref`) is never used to emit `.ub`.
+-/
+@[reducible]
+def subProjTouchesUninhabited
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Ty → List ProjectionElem → Bool
+  | _, .nil => false
+  | _, .opaqueCast castTy :: rest =>
+    let nextTy := resolveTyWithLocalDecls localDecls layouts castTy
+    Bool.or
+      (tyIsUninhabited layouts nextTy)
+      (subProjTouchesUninhabited localDecls layouts nextTy rest)
+  | _, .unwrapUnsafeBinder innerTy :: rest =>
+    let nextTy := resolveTyWithLocalDecls localDecls layouts innerTy
+    Bool.or
+      (tyIsUninhabited layouts nextTy)
+      (subProjTouchesUninhabited localDecls layouts nextTy rest)
+  | curTy, .field idx fieldTy :: rest =>
+    let rCur := resolveTyWithLocalDecls localDecls layouts curTy
+    let nextTy : Ty :=
+      match isUnresolvedLayoutIdx layouts fieldTy.layoutIdx with
+      | false => fieldTy
+      | true =>
+        match LayoutTable.lookup layouts rCur.layoutIdx with
+        | .some { variants := .single _, fieldLayouts := fls, .. } =>
+          match get? fls idx with
+          | .some flIdx => { fieldTy with layoutIdx := flIdx }
+          | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+        | _ => resolveTyWithLocalDecls localDecls layouts fieldTy
+    Bool.or
+      (tyIsUninhabited layouts nextTy)
+      (subProjTouchesUninhabited localDecls layouts nextTy rest)
+  | curTy, .constantIndex _ _ _ :: rest =>
+    let rCur := resolveTyWithLocalDecls localDecls layouts curTy
+    match rCur.kind with
+    | .array ek _ =>
+      let elemTy : Ty :=
+        match LayoutTable.lookup layouts rCur.layoutIdx with
+        | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+          { kind := ek, layoutIdx := flIdx }
+        | _ =>
+          resolveTyWithLocalDecls
+            localDecls
+            layouts
+            { kind := ek, layoutIdx := synthKindLayoutIdx layouts ek }
+      Bool.or
+        (tyIsUninhabited layouts elemTy)
+        (subProjTouchesUninhabited localDecls layouts elemTy rest)
+    | _ => false
+  | curTy, .subslice fromIdx toIdx fromEnd :: rest =>
+    let rCur := resolveTyWithLocalDecls localDecls layouts curTy
+    match rCur.kind with
+    | .array ek arrLen =>
+      let endIdx :=
+        match fromEnd with
+        | true => Nat.sub arrLen toIdx
+        | false => toIdx
+      let subLen := Nat.sub endIdx fromIdx
+      let subTy : Ty :=
+        match Nat.beq subLen arrLen with
+        | true => rCur
+        | false =>
+          resolveTyWithLocalDecls
+            localDecls
+            layouts
+            { kind := .array ek subLen
+              layoutIdx := unresolvedLayoutIdx layouts }
+      let nextArrTy : Ty :=
+        match rest with
+        | .constantIndex _ _ _ :: _ => rCur
+        | _ => subTy
+      Bool.or
+        (tyIsUninhabited layouts subTy)
+        (subProjTouchesUninhabited localDecls layouts nextArrTy rest)
+    | _ => false
+  | _, _ => false
+
+/--
 Read a deref-free projection chain `proj` on `v` of static type `baseTy` with
-union byte-reinterpretation semantics:
-- Reading a union `.field idx fieldTy` whose runtime slot holds a non-`.unit`
-  value returns/projects that value directly.
-- Reading a union `.field idx fieldTy` whose runtime slot is `.unit` (or beyond
-  `length fields` while `< unionFieldCount`) encodes the union's initialized
-  storage bytes via `encodeByLayoutIdxAux`, slices `[subOff .. subOff + sizeof)`
-  for direct sub-projections (or `[0 .. sizeof(fieldTy))` at the field root),
+union byte-reinterpretation semantics in `Runtime(PostCleanup)` MIR (Rust
+1.98.0, all editions, any target, `rustc 1.98.0-nightly (14210df0e 2026-05-31)`):
+- Reading a union `.field idx fieldTy` whose runtime slot holds a non-`.unit`,
+  non-`.uninit` value (or `.unit` for a `()` / `fnDef` field) projects that
+  value directly when `unionImageOk = true`.
+- Reading a union `.field idx fieldTy` whose runtime slot is inactive (`.uninit`,
+  `.unit` for non-unit/`fnDef` field, or beyond `length fields` while
+  `< unionFieldCount`) encodes the union's initialized storage bytes via
+  `encodeByLayoutIdxAux`, slices `[subOff .. subOff + sizeof)` for statically
+  bounded direct sub-projections (or `[0 .. sizeof(fieldTy))` at the field root),
   and decodes via `decodeTypedValueFromBytes` (faulting with `.ub` on `.uninit`
   or bit-invalid bytes).
+- **Uninhabited leaf loads (`tyIsUninhabited layouts leafTy = true`, or
+  `tyIsUninhabited layouts rFieldTy = true` at the field root `rest = .nil`)**:
+  fault with `.ub` (`kani#5159`), regardless of whether the uninhabited leaf is
+  0-byte (`!`, `Infallible`, `enum Void {}`, `[Infallible; 1]`,
+  `ManuallyDrop<Infallible>`), positive-sized (`(Infallible, u32)`), or an
+  uninhabited aggregate whose layout `tyByteSize` rejects (`(Infallible, ())`).
+- **Inhabited leaf reads through uninhabited intermediate containers**
+  (`tyIsUninhabited layouts leafTy = false`, while either
+  `tyIsUninhabited layouts rFieldTy = true` or
+  `subProjTouchesUninhabited localDecls layouts rFieldTy normRest = true`; or
+  any non-empty `rest = _ :: _` fallthrough where `directSubReadOpt = .none` and
+  `tyIsUninhabited layouts rFieldTy = true` without an uninhabited leaf):
+  fail closed with `.unsupported` (NEVER `.ub`), because loading an inhabited
+  leaf produces only a value of the leaf type (`r-undefined.invalid`) and
+  Anneal chooses not to claim `.ok` or false-positive `.ub` through an
+  uninhabited container.
+- An inhabited 0-byte read (at the field root or at a statically bounded
+  sub-place not passing through an uninhabited container) reads no storage and
+  yields the leaf's unique value decoded from zero bytes.
 
-Reference (The Rust Reference, "Union types"):
+Preconditions and scope: `proj` is deref-free (dereferences are handled by the
+caller before calling `readProjectedValueUnionAware`), `localDecls` and
+`layouts` are captured from `rustc` at `Runtime(PostCleanup)` phase.
+
+Reference (The Rust Reference 1.98.0, "Union types"):
 <https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
 
 > "Unions have no notion of an \"active field\". Instead, every union access
 > just interprets the storage as the type of the field used for the access.
 > Reading a union field reads the bits of the union at the field's type."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.invalid>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.def>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.struct>
+
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+>
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "A `!` value must never exist."
+>
+> "A `struct`, tuple, and array requires all fields/elements to be valid at
+> their respective type."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Places based on misaligned pointers"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.misaligned.load-store>
+
+> "Note that a place based on a misaligned pointer only leads to undefined
+> behavior when it is loaded from or stored to."
+
+Justification: interpreting union storage at a leaf type `leafTy` (or field-root
+`rFieldTy` when `rest = .nil`) reads a value of that type from a place, which
+"produces" it; when `tyIsUninhabited` holds for the loaded leaf, no valid value
+of that type exists, so the read is immediate UB by the quoted rules
+(`kani#5159`). When `rest = _ :: _` reaches an inhabited leaf through an
+uninhabited container, the read produces only a value of the inhabited leaf
+type, so the quoted rules do not make it UB and emitting `.ub` would be a false
+positive. The misaligned-pointer note is cited only as the Reference's
+analogous statement that computing a place is distinct from loading from it.
+The 1.98.0 Reference does not say whether computing a place through an
+uninhabited intermediate type is UB (Miri and MiniRust treat it as non-UB;
+that is interpreter behavior, not a Reference premise), so returning
+`.unsupported` there is a fail-closed modeling choice that claims neither
+`.ok` nor `.ub`. Any `rest = _ :: _` fallthrough where `directSubReadOpt = .none`
+(e.g., non-static bounds, missing byte offset, or unresolved leaf type) through
+an uninhabited field returns `.ub` only when `resolveProjectedTyResolved`
+resolves the loaded leaf itself to an uninhabited type (again a leaf read; an
+uninitialized `.index` local already faults with `.ub` in `directSubReadOpt`).
+
+Guarantees vs. modeling choices: `.ub` on uninhabited leaf loads relies on
+documented Rust validity guarantees plus compiler-captured layout facts
+(`TypeLayout.isUninhabited`). Returning `.unsupported` on inhabited-leaf reads
+through uninhabited containers (or on `rest = _ :: _` fallthroughs where
+`directSubReadOpt = .none` through an uninhabited field) is Anneal's fail-closed
+modeling boundary; such reads remain unmodeled rather than returning `.ok` or
+false-positive `.ub`.
 -/
 def readProjectedValueUnionAware
     (locals : List LocalSlot)
@@ -9295,63 +9795,122 @@ def readProjectedValueUnionAware
                     resolveProjectedTyResolved localDecls layouts rFieldTy normRest
                   with
                   | .some subOff, .some leafTy =>
-                    match tyByteSize localDecls layouts leafTy with
-                    | .none => .none
-                    | .some 0 =>
-                      let zv :=
-                        match decodeTypedValueFromBytes defaultCodecFuel layouts leafTy .nil with
-                        | .some v0 => v0
-                        | .none => .unit
-                      .some (.ok zv)
-                    | .some (.succ leafPred) =>
-                      let leafSz := .succ leafPred
+                    -- Reading a value of an uninhabited leaf type "produces"
+                    -- an invalid value (`r-undefined.invalid`, `kani#5159`),
+                    -- regardless of whether `leafTy` is 0-byte, positive-sized,
+                    -- or lacks a byte size in `tyByteSize`. When `leafTy` is
+                    -- inhabited, the Reference does not establish that
+                    -- projecting through an uninhabited container is UB, so
+                    -- Anneal fails closed with `.unsupported` rather than
+                    -- emitting false-positive `.ub`.
+                    match tyIsUninhabited layouts leafTy with
+                    | true => .some .ub
+                    | false =>
                       match
-                        encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields)
+                        Bool.or
+                          (tyIsUninhabited layouts rFieldTy)
+                          (subProjTouchesUninhabited localDecls layouts rFieldTy normRest)
                       with
-                      | .none => .some .ub
-                      | .some unionBytes =>
-                        match sliceAbstractBytes unionBytes subOff leafSz with
-                        | .none => .some .ub
-                        | .some leafSlice =>
+                      | true => .some .unsupported
+                      | false =>
+                        match tyByteSize localDecls layouts leafTy with
+                        | .none => .none
+                        | .some 0 =>
+                          let zv :=
+                            match decodeTypedValueFromBytes defaultCodecFuel layouts leafTy .nil with
+                            | .some v0 => v0
+                            | .none => .unit
+                          .some (.ok zv)
+                        | .some (.succ leafPred) =>
+                          let leafSz := .succ leafPred
                           match
-                            decodeTypedValueFromBytes defaultCodecFuel layouts leafTy leafSlice
+                            encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields)
                           with
-                          | .some leafVal => .some (.ok leafVal)
                           | .none => .some .ub
+                          | .some unionBytes =>
+                            match sliceAbstractBytes unionBytes subOff leafSz with
+                            | .none => .some .ub
+                            | .some leafSlice =>
+                              match
+                                decodeTypedValueFromBytes defaultCodecFuel layouts leafTy leafSlice
+                              with
+                              | .some leafVal => .some (.ok leafVal)
+                              | .none => .some .ub
                   | _, _ => .none
           match directSubReadOpt with
           | .some res => res
           | .none =>
-            match tyByteSize localDecls layouts rFieldTy with
-            | .none => .unsupported
-            | .some 0 =>
-              let zstVal : Value :=
-                match decodeTypedValueFromBytes defaultCodecFuel layouts rFieldTy .nil with
-                | .some zv => zv
-                | .none => .unit
-              readProjectedValueUnionAware locals localDecls layouts zstVal rFieldTy rest
-            | .some (.succ szPred) =>
-              let fieldSz := .succ szPred
-              match
-                encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields)
-              with
-              | .none => .ub
-              | .some unionBytes =>
-                match sliceAbstractBytes unionBytes 0 fieldSz with
+            -- Distinguish field-root loads (`rest = .nil`, where `rFieldTy` IS
+            -- the leaf being loaded -> `.ub` when uninhabited across `.none`,
+            -- `.some 0`, and `.some (.succ _)`) from non-empty sub-projections
+            -- (`rest = _ :: _`, where `directSubReadOpt = .none` and
+            -- `rFieldTy` is uninhabited): if `rest` still resolves to an
+            -- uninhabited leaf (e.g. `ManuallyDrop<Infallible>.value`, where
+            -- `checkStaticSubProjBounds` rejected the uninhabited `.adt`
+            -- layout), loading that uninhabited leaf is `.ub`; otherwise fail
+            -- closed as `.unsupported` so an inhabited leaf can never fall
+            -- through to a false-positive `.ub`.
+            let uninhabitedFallback : ProjReadResult :=
+              match rest with
+              | .nil => .ub
+              | _ :: _ =>
+                match resolveUnionSubProjIndices locals rest with
                 | .none => .ub
-                | .some fieldSlice =>
-                  match
-                    decodeTypedValueFromBytes defaultCodecFuel layouts rFieldTy fieldSlice
-                  with
-                  | .some decodedFv =>
-                    readProjectedValueUnionAware
-                      locals
-                      localDecls
-                      layouts
-                      decodedFv
-                      rFieldTy
-                      rest
+                | .some idxResolved =>
+                  let normRest :=
+                    normalizeSubsliceProjections (stripTransparentProjections idxResolved)
+                  match resolveProjectedTyResolved localDecls layouts rFieldTy normRest with
+                  | .some leafTy =>
+                    match tyIsUninhabited layouts leafTy with
+                    | true => .ub
+                    | false => .unsupported
+                  | .none => .unsupported
+            match tyByteSize localDecls layouts rFieldTy with
+            | .none =>
+              match tyIsUninhabited layouts rFieldTy with
+              | true => uninhabitedFallback
+              | false => .unsupported
+            | .some 0 =>
+              match tyIsUninhabited layouts rFieldTy with
+              | true => uninhabitedFallback
+              | false =>
+                let zstVal : Value :=
+                  match decodeTypedValueFromBytes defaultCodecFuel layouts rFieldTy .nil with
+                  | .some zv => zv
+                  | .none => .unit
+                readProjectedValueUnionAware locals localDecls layouts zstVal rFieldTy rest
+            | .some (.succ szPred) =>
+              -- Match `rFieldTy.kind` syntactically here (mirroring `tyIsUninhabited`'s
+              -- primitive/pointer short-circuit) so downstream proofs that rewrite
+              -- `rFieldTy.kind` without unfolding `tyIsUninhabited` reduce by `rfl`.
+              let fieldUninhabited : Bool :=
+                match rFieldTy.kind with
+                | .bool | .char | .uint _ | .int _ | .float _ | .rawPtr _ _ | .ref _ _ => false
+                | _ => tyIsUninhabited layouts rFieldTy
+              match fieldUninhabited with
+              | true => uninhabitedFallback
+              | false =>
+                let fieldSz := .succ szPred
+                match
+                  encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields)
+                with
+                | .none => .ub
+                | .some unionBytes =>
+                  match sliceAbstractBytes unionBytes 0 fieldSz with
                   | .none => .ub
+                  | .some fieldSlice =>
+                    match
+                      decodeTypedValueFromBytes defaultCodecFuel layouts rFieldTy fieldSlice
+                    with
+                    | .some decodedFv =>
+                      readProjectedValueUnionAware
+                        locals
+                        localDecls
+                        layouts
+                        decodedFv
+                        rFieldTy
+                        rest
+                    | .none => .ub
       | _, _ => .ub
     | .none =>
       let nextTy : Ty :=
@@ -16906,75 +17465,6 @@ def placeIsZeroSized
   match placeTy localDecls layouts place with
   | .some ty => tyIsZeroSized ty
   | .none => false
-
-/--
-Determine whether a structural `RigidTy` is statically known to be uninhabited
-in `Runtime(PostCleanup)` MIR (`rustc 1.98.0-nightly (14210df0e 2026-05-31)`),
-using bounded recursion with `fuel`.
--/
-@[reducible]
-def rigidTyIsUninhabited : Nat → RigidTy → Bool
-  | .zero, _ => false
-  | .succ _, .never => true
-  | .succ _, .tuple .nil => false
-  | .succ fuel, .tuple (k :: ks) =>
-    Bool.or
-      (rigidTyIsUninhabited fuel k)
-      (rigidTyIsUninhabited fuel (.tuple ks))
-  | .succ _, .array _ .zero => false
-  | .succ fuel, .array elem (.succ _) => rigidTyIsUninhabited fuel elem
-  | .succ _, .closure _ .nil => false
-  | .succ fuel, .closure defPath (u :: us) =>
-    Bool.or
-      (rigidTyIsUninhabited fuel u)
-      (rigidTyIsUninhabited fuel (.closure defPath us))
-  | .succ fuel, .adt defPath args =>
-    match
-      Bool.or
-        (stringEq defPath "core::convert::Infallible")
-        (stringEq defPath "std::convert::Infallible")
-    with
-    | true => true
-    | false =>
-      match
-        Bool.or
-          (Bool.or
-            (stringEq defPath "core::cell::UnsafeCell")
-            (stringEq defPath "std::cell::UnsafeCell"))
-          (Bool.or
-            (Bool.or
-              (stringEq defPath "core::cell::SyncUnsafeCell")
-              (stringEq defPath "std::cell::SyncUnsafeCell"))
-            (Bool.or
-              (Bool.or
-                (stringEq defPath "core::cell::Cell")
-                (stringEq defPath "std::cell::Cell"))
-              (Bool.or
-                (Bool.or
-                  (stringEq defPath "core::cell::RefCell")
-                  (stringEq defPath "std::cell::RefCell"))
-                (Bool.or
-                  (stringEq defPath "core::mem::ManuallyDrop")
-                  (stringEq defPath "std::mem::ManuallyDrop"))))),
-        args
-      with
-      | true, inner :: .nil => rigidTyIsUninhabited fuel inner
-      | _, _ => false
-  | .succ _, _ => false
-
-/--
-Determine whether a `Ty` is uninhabited either structurally
-(`rigidTyIsUninhabited 16 ty.kind`) or via its compiler-captured
-`TypeLayout.isUninhabited` flag in `layouts`.
--/
-@[reducible]
-def tyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
-  match rigidTyIsUninhabited 16 ty.kind with
-  | true => true
-  | false =>
-    match LayoutTable.lookup layouts ty.layoutIdx with
-    | .some l => l.isUninhabited
-    | .none => false
 
 /--
 Determine whether `place`'s resolved type in `localDecls` and `layouts` is

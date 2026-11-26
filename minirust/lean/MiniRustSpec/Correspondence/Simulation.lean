@@ -4953,7 +4953,7 @@ function `translateFn body` satisfies both (`step_correspondence_N`); so does
 the translation of a body that differs from `body` only in statements other
 than the current one (used for projected `Deinit` in
 `MiniRustSpec.Correspondence.DeinitWindow`). -/
-theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
+theorem step_correspondence_NF_at (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
     (hfl : FnLocalsSpec body f) (ctx : Ctx) (s : MachineState) (m : Mach)
     (hblk : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb →
       ∃ tb, mapGet f.blocks (bbName s.frame.blockIdx) = some tb ∧
@@ -4961,7 +4961,8 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
         (∀ st, bb.statements[s.frame.stmtIdx]? = some st →
           ∃ st', translateStatement body.localDecls st body.layouts = some st' ∧
             tb.statements[s.frame.stmtIdx]? = some st') ∧
-        translateTerminator body.layouts body.localDecls bb.terminator = some tb.terminator)
+        (s.frame.stmtIdx = bb.statements.length →
+          translateTerminator body.layouts body.localDecls bb.terminator = some tb.terminator))
     (hrel : StateRelN body f ctx s m) :
     StepRelN body f ctx s (stepMirFn body s) (Interp.step m) := by
   obtain ⟨view, lm, hrel, hthr, hlo, hns, hbo⟩ := hrel
@@ -6745,6 +6746,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
           exact StepRelN.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
   · ----------------------------------------------------------------- terminator
     have heq : s.frame.stmtIdx = bb.statements.length := by omega
+    have htermspec := htermspec heq
     have hif : ((s.frame.stmtIdx : Nat) : Int) = (tb.statements.length : Int) := by rw [hlen, heq]
     rw [stepMirFn_term body s bb hrel.activeCallee hphase hbb heq]
     simp only [hif, ↓reduceIte]
@@ -6872,6 +6874,21 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
           (DeclSlotOk_of_scalarTypeOf hdScalar (.init v)).mp hv0
         exact StepRelN.ret' m' (by simp [htt, Interp.evalTerminator, hm', check_after hs'])
           ⟨r0, a0, d0, R, hd0, hv0', hp, hr0, hs'.threads, hs'.allocs, hR⟩
+
+theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
+    (hfl : FnLocalsSpec body f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hblk : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb →
+      ∃ tb, mapGet f.blocks (bbName s.frame.blockIdx) = some tb ∧
+        tb.statements.length = bb.statements.length ∧
+        (∀ st, bb.statements[s.frame.stmtIdx]? = some st →
+          ∃ st', translateStatement body.localDecls st body.layouts = some st' ∧
+            tb.statements[s.frame.stmtIdx]? = some st') ∧
+        translateTerminator body.layouts body.localDecls bb.terminator = some tb.terminator)
+    (hrel : StateRelN body f ctx s m) :
+    StepRelN body f ctx s (stepMirFn body s) (Interp.step m) :=
+  step_correspondence_NF_at body f hfrag hfl ctx s m
+    (fun bb hbb => let ⟨tb, h1, h2, h3, h4⟩ := hblk bb hbb; ⟨tb, h1, h2, h3, fun _ => h4⟩)
+    hrel
 
 /-- **Correspondence theorem (one step, preserving `StateRelN`).** For a
 fragment body `body`, its `minimize`-style translation `f`, and related states

@@ -11,6 +11,7 @@ those terms.
 import Lean
 import MiniRustSpec.Correspondence.Run
 import MiniRustSpec.Correspondence.DeinitWindow
+import MiniRustSpec.Correspondence.WitnessUnionAssert
 
 /-!
 # Non-vacuity witnesses
