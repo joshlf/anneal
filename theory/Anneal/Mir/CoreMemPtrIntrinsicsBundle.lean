@@ -215,9 +215,12 @@ def cmExpectedVerdict (mode : CmMode) :
   | .rawEq, .ubFault => some .undefinedBehavior
   | .rawEq, .modeCase => some (.returns (.scalar 1 1))
   | .typedSwap, .okPrimary => some (.returns (.scalar 9 4))
-  | .typedSwap, .okSecondary => some (.returns (.scalar 7 4))
+  | .typedSwap, .okSecondary => some (.returns (.scalar 6 4))
   | .typedSwap, .ubFault => some .undefinedBehavior
-  | .typedSwap, .modeCase => some (.returns (.scalar 6 4))
+  | .typedSwap, .modeCase =>
+    match mode with
+    | .basic => some (.returns (.scalar 9 4))
+    | .protectedTB => some .undefinedBehavior
   | .ptrOffsetFrom, .okPrimary => some (.returns (.scalar 2 8))
   | .ptrOffsetFrom, .okSecondary => some (.returns (.scalar (2 ^ 64 - 2) 8))
   | .ptrOffsetFrom, .ubFault => some .undefinedBehavior
@@ -383,6 +386,7 @@ def mrVariantSideOf (v : CmVariant)
   faultChoice := ()
   flip := match v with
     | .copy => some (.basicMemory, .treeBorrows, .copy, .modeCase, ())
+    | .typedSwap => some (.basicMemory, .treeBorrows, .typedSwap, .modeCase, ())
     | _ => none
 
 /-- Per-variant MiniRust side for each of the 8 intrinsics. -/
@@ -454,6 +458,7 @@ def lmVariantSideOf (v : CmVariant) (lmAuth : Corpus.ObsAuthority CmKey CmObsVal
   faultChoice := ()
   flip := match v with
     | .copy => some (false, true, .copy, .modeCase, ())
+    | .typedSwap => some (false, true, .typedSwap, .modeCase, ())
     | _ => none
 
 /-- Per-variant LeanMiri certificate predicate. -/
@@ -531,10 +536,24 @@ theorem mr_modeSensitivity_present : (mrSide.flipW cmModel mrSide_check).isSome 
   unfold Corpus.Side.flipW
   rfl
 
+/-- Non-vacuous MiniRust `ModeSensitivityWitness` on `typedSwap.modeCase`
+(`BasicMemory` returns `9`, `TreeBorrowsMemory` faults with protector UB). -/
+theorem mr_typedSwap_modeSensitivity_present :
+    ((mrVariantSide .typedSwap).flipW cmModel (mrVariantSide_check .typedSwap)).isSome = true := by
+  unfold Corpus.Side.flipW
+  rfl
+
 /-- Non-vacuous LeanMiri `ModeSensitivityWitness` on `copy.modeCase`. -/
 theorem lm_modeSensitivity_present (lmAuth : Corpus.ObsAuthority CmKey CmObsVal)
     (hLM : lmCheckOf lmAuth = true) :
     ((lmSideOf lmAuth).flipW cmModel hLM).isSome = true := by
+  unfold Corpus.Side.flipW
+  rfl
+
+/-- Non-vacuous LeanMiri `ModeSensitivityWitness` on `typedSwap.modeCase`. -/
+theorem lm_typedSwap_modeSensitivity_present (lmAuth : Corpus.ObsAuthority CmKey CmObsVal)
+    (hLM : lmVariantCheckOf .typedSwap lmAuth = true) :
+    ((lmVariantSideOf .typedSwap lmAuth).flipW cmModel hLM).isSome = true := by
   unfold Corpus.Side.flipW
   rfl
 
@@ -581,7 +600,7 @@ def cmOkValues : CmVariant → CmObsVal × CmObsVal
   | .copy => (.scalar 42 4, .scalar 0x08070403 4)
   | .compareBytes => (.scalar 0xFFFFFFFF 4, .scalar 1 4)
   | .rawEq => (.scalar 1 1, .scalar 0 1)
-  | .typedSwap => (.scalar 9 4, .scalar 7 4)
+  | .typedSwap => (.scalar 9 4, .scalar 6 4)
   | .ptrOffsetFrom => (.scalar 2 8, .scalar (2 ^ 64 - 2) 8)
   | .ptrOffsetFromUnsigned => (.scalar 2 8, .scalar 4 8)
   | .ptrMask => (.ptr 100 8, .ptr 100 12)
@@ -590,8 +609,8 @@ def cmOkValues : CmVariant → CmObsVal × CmObsVal
 /-- **Constructive Per-Intrinsic Outcome Distinctness & Non-Degeneracy**: for
 EVERY one of the 8 intrinsics, `okPrimary` and `okSecondary` return strictly
 distinct values (with distinct wire encodings) on BOTH Trusted Anneal and
-MiniRust, `ubFault` is `.undefinedBehavior` on both, and `copy.modeCase` is
-mode-sensitive on both. -/
+MiniRust, `ubFault` is `.undefinedBehavior` on both, and BOTH `copy.modeCase`
+and `typedSwap.modeCase` are mode-sensitive on both. -/
 theorem cm_variant_outcomes_distinct (v : CmVariant) :
     (∃ a b,
       cmAnnealEval .basic v .okPrimary () = some (.returns a) ∧
@@ -604,11 +623,15 @@ theorem cm_variant_outcomes_distinct (v : CmVariant) :
     mrAuthority.verdict (.basic, v, .ubFault) = some .undefinedBehavior ∧
     cmAnnealEval .basic .copy .modeCase () ≠ cmAnnealEval .protectedTB .copy .modeCase () ∧
     mrAuthority.verdict (.basic, .copy, .modeCase) ≠
-      mrAuthority.verdict (.protectedTB, .copy, .modeCase) := by
+      mrAuthority.verdict (.protectedTB, .copy, .modeCase) ∧
+    cmAnnealEval .basic .typedSwap .modeCase () ≠ cmAnnealEval .protectedTB .typedSwap .modeCase () ∧
+    mrAuthority.verdict (.basic, .typedSwap, .modeCase) ≠
+      mrAuthority.verdict (.protectedTB, .typedSwap, .modeCase) := by
   rw [cmAnnealEval_eq, cmAnnealEval_eq, cmAnnealEval_eq, cmAnnealEval_eq, cmAnnealEval_eq,
+    cmAnnealEval_eq, cmAnnealEval_eq,
     mrAuthority_verdict_eq, mrAuthority_verdict_eq, mrAuthority_verdict_eq,
-    mrAuthority_verdict_eq, mrAuthority_verdict_eq]
-  refine ⟨⟨(cmOkValues v).1, (cmOkValues v).2, ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_, ?_⟩ <;>
+    mrAuthority_verdict_eq, mrAuthority_verdict_eq, mrAuthority_verdict_eq, mrAuthority_verdict_eq]
+  refine ⟨⟨(cmOkValues v).1, (cmOkValues v).2, ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
     cases v <;> first | rfl | decide
 
 /-- **Episode 2 Capstone**: for EVERY LeanMiri observation authority `lmAuth`
@@ -675,7 +698,10 @@ theorem ep2_core_mem_ptr_intrinsics_capstone
       mrAuthority.verdict (.basic, v, .ubFault) = some .undefinedBehavior ∧
       cmAnnealEval .basic .copy .modeCase () ≠ cmAnnealEval .protectedTB .copy .modeCase () ∧
       mrAuthority.verdict (.basic, .copy, .modeCase) ≠
-        mrAuthority.verdict (.protectedTB, .copy, .modeCase)) :=
+        mrAuthority.verdict (.protectedTB, .copy, .modeCase) ∧
+      cmAnnealEval .basic .typedSwap .modeCase () ≠ cmAnnealEval .protectedTB .typedSwap .modeCase () ∧
+      mrAuthority.verdict (.basic, .typedSwap, .modeCase) ≠
+        mrAuthority.verdict (.protectedTB, .typedSwap, .modeCase)) :=
   ⟨cmCodec_tight, mrAuthority_denoteConsistent, mrSide_check, mrVariantSide_check,
    threeWayNormalAgreement lmAuth hLM,
    crossAuthorityFaultEquiv lmAuth hLM,

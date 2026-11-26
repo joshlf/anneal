@@ -210,6 +210,19 @@ def cmSwapSameAllocMir : CapturedMir :=
     [mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref]))))]
     [cmGlobal 100 (cmU32Bytes 5 ++ cmU32Bytes 6)]
 
+/-- Mode-sensitive `typed_swap_nonoverlapping`: `_1` points to global `100 = 7u32`
+and `_2` points (through borrow tag `2`) to stack local `_3 = 9u32`, on which a
+sibling `.frozen` borrow (tag `1`) carries an active protector in `protectedTB`
+mode; `_0 = *_1` afterwards (`9` in `basic`, `.ub` in `protectedTB`). -/
+def cmSwapModeMir : CapturedMir :=
+  cmCallBody "cm::typed_swap_mode"
+    [mkDecl u32MirTy, mkDecl rawMutU32MirTy, mkDecl rawMutU32MirTy, mkDecl u32MirTy,
+     mkDecl unitMirTy] 2
+    (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.uint .u32])
+    [.copy (locPlace 1), .copy (locPlace 2)] 4
+    [mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref]))))]
+    [cmGlobal 100 (cmU32Bytes 7)]
+
 -- 5./6. ptr_offset_from[_unsigned]
 /-- `ptr_offset_from::<u32>(_1, _2)` over two 16-byte globals `100`, `101`. -/
 def cmPofMir : CapturedMir :=
@@ -259,6 +272,33 @@ def cmBlackBoxPtrMir : CapturedMir :=
 def cmBlackBoxBoolMir : CapturedMir :=
   cmCallBody "cm::black_box_bool" [mkDecl boolMirTy, mkDecl boolMirTy] 1
     (cmIntrinsicOp "core::intrinsics::black_box" [.bool]) [.copy (locPlace 1)] 0 [] []
+
+-- 9. Zero-size null-pointer delta / agreement fixtures (shared verbatim with LM)
+/-- `compare_bytes(_1, _2, 0)`. -/
+def cmCmpBytes0Mir : CapturedMir :=
+  cmCallBody "cm::compare_bytes_0"
+    [mkDecl i32MirTy, mkDecl cmRawConstU8Ty, mkDecl cmRawConstU8Ty] 2
+    (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
+    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 0] 0 [] []
+
+/-- `typed_swap_nonoverlapping::<()>(_1, _2); _0 = 7u32`. -/
+def cmSwapZstMir : CapturedMir :=
+  cmCallBody "cm::typed_swap_zst"
+    [mkDecl u32MirTy, mkDecl { kind := .rawPtr .mut (.tuple []), layoutIdx := 0 },
+     mkDecl { kind := .rawPtr .mut (.tuple []), layoutIdx := 0 }, mkDecl unitMirTy] 2
+    (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.tuple []])
+    [.copy (locPlace 1), .copy (locPlace 2)] 3
+    [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨7, 4⟩) })))]
+    []
+
+/-- `copy::<u32>(_1, _2, 0); _0 = 7u32`. -/
+def cmCopy0Mir : CapturedMir :=
+  cmCallBody "cm::copy_0"
+    [mkDecl u32MirTy, mkDecl rawConstU32MirTy, mkDecl rawMutU32MirTy, mkDecl unitMirTy] 2
+    (cmIntrinsicOp "core::intrinsics::copy" [.uint .u32])
+    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 0] 3
+    [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨7, 4⟩) })))]
+    []
 
 /-! ## §1. Corpus Keys and the Direct Trusted `stepMirFn` Runner -/
 
@@ -370,6 +410,28 @@ def cmCopyModeInit (protectedMode : Bool) : MachineState :=
       borrows := [b1, b2], nextTag := 3,
       activeProtectors := (if protectedMode then [1] else []) } }
 
+/-- Initial state of `cmSwapModeMir`: global `100 = 7u32`, `_3 = 9u32`, `_2`
+points into `_3` through root borrow tag `2` (`.unique`), and sibling root
+borrow tag `1` (`.frozen`) on `_3` carries active protector `1` iff
+`protectedMode = true`. -/
+def cmSwapModeInit (protectedMode : Bool) : MachineState :=
+  let base := cmInitLiveState cmSwapModeMir [cmGPtr 100 0, .ptr ⟨2, 0⟩ 8]
+  let b1 : BorrowEntry :=
+    { tag := 1, targetLocal := 3, targetProjection := [], perm := TreeBorrowPerm.frozen,
+      rangeOffset := 0, rangeLen := 4, protector := (if protectedMode then some 1 else none),
+      parentTag := none, targetFrameDepth := 0, allocDead := false }
+  let b2 : BorrowEntry :=
+    { tag := 2, targetLocal := 3, targetProjection := [], perm := TreeBorrowPerm.unique,
+      rangeOffset := 0, rangeLen := 4, protector := none, parentTag := none,
+      targetFrameDepth := 0, allocDead := false }
+  { base with
+    frame := { base.frame with
+      locals := [.uninit, .init (cmGPtr 100 0), .init (.ptr ⟨2, 0⟩ 8), .init (.scalar ⟨9, 4⟩),
+                 .uninit] },
+    memory := { base.memory with
+      borrows := [b1, b2], nextTag := 3,
+      activeProtectors := (if protectedMode then [1] else []) } }
+
 /-- The `CapturedMir` fixture executed for each `(variant, case)` key. -/
 def cmTrustedFixture : CmVariant → CmCase → CapturedMir
   | .copy, .okPrimary => cmCopyMir
@@ -385,9 +447,9 @@ def cmTrustedFixture : CmVariant → CmCase → CapturedMir
   | .rawEq, .ubFault => cmRawEqU32Mir
   | .rawEq, .modeCase => cmRawEqZstMir
   | .typedSwap, .okPrimary => cmSwapReadXMir
-  | .typedSwap, .okSecondary => cmSwapReadYMir
+  | .typedSwap, .okSecondary => cmSwapSameAllocMir
   | .typedSwap, .ubFault => cmSwapReadXMir
-  | .typedSwap, .modeCase => cmSwapSameAllocMir
+  | .typedSwap, .modeCase => cmSwapModeMir
   | .ptrOffsetFrom, _ => cmPofMir
   | .ptrOffsetFromUnsigned, _ => cmPofuMir
   | .ptrMask, .okPrimary => cmMaskAlign8Mir
@@ -415,9 +477,9 @@ def cmTrustedInit (protectedMode : Bool) : CmVariant → CmCase → MachineState
   | .rawEq, .ubFault => cmInitLiveState cmRawEqU32Mir [cmGPtr 103 0, cmGPtr 102 0]
   | .rawEq, .modeCase => cmInitLiveState cmRawEqZstMir [cmIntPtr 4096, cmIntPtr 4096]
   | .typedSwap, .okPrimary => cmInitLiveState cmSwapReadXMir [cmGPtr 100 0, cmGPtr 101 0]
-  | .typedSwap, .okSecondary => cmInitLiveState cmSwapReadYMir [cmGPtr 100 0, cmGPtr 101 0]
+  | .typedSwap, .okSecondary => cmInitLiveState cmSwapSameAllocMir [cmGPtr 100 0, cmGPtr 100 4]
   | .typedSwap, .ubFault => cmInitLiveState cmSwapReadXMir [cmIntPtr 0, cmGPtr 101 0]
-  | .typedSwap, .modeCase => cmInitLiveState cmSwapSameAllocMir [cmGPtr 100 0, cmGPtr 100 4]
+  | .typedSwap, .modeCase => cmSwapModeInit protectedMode
   | .ptrOffsetFrom, .okPrimary => cmInitLiveState cmPofMir [cmGPtr 100 12, cmGPtr 100 4]
   | .ptrOffsetFrom, .okSecondary => cmInitLiveState cmPofMir [cmGPtr 100 4, cmGPtr 100 12]
   | .ptrOffsetFrom, .ubFault => cmInitLiveState cmPofMir [cmGPtr 100 4, cmGPtr 101 12]
@@ -461,9 +523,12 @@ def cmTrustedExpected (protectedMode : Bool) : CmVariant → CmCase → CmTruste
   | .rawEq, .ubFault => .ub
   | .rawEq, .modeCase => .scalar 1 1
   | .typedSwap, .okPrimary => .scalar 9 4
-  | .typedSwap, .okSecondary => .scalar 7 4
+  | .typedSwap, .okSecondary => .scalar 6 4
   | .typedSwap, .ubFault => .ub
-  | .typedSwap, .modeCase => .scalar 6 4
+  | .typedSwap, .modeCase =>
+    match protectedMode with
+    | false => .scalar 9 4
+    | true => .ub
   | .ptrOffsetFrom, .okPrimary => .scalar 2 8
   | .ptrOffsetFrom, .okSecondary => .scalar (2 ^ 64 - 2) 8
   | .ptrOffsetFrom, .ubFault => .ub
@@ -667,6 +732,542 @@ theorem cm_divExact_byte_distance (k elemSize : Nat) (hPos : 0 < elemSize) :
     (k * elemSize) % elemSize = 0 ∧ (k * elemSize) / elemSize = k :=
   ⟨Nat.mul_mod_left _ _, Nat.mul_div_cancel _ hPos⟩
 
+private theorem cm_scalarModulus_pos (n : Nat) : 0 < scalarModulus n := by
+  induction n with
+  | zero => decide
+  | succ k ih =>
+    unfold scalarModulus
+    change 0 < 256 * scalarModulus k
+    omega
+
+private theorem cm_scalarModulus_ge_two {n : Nat} (hn : 0 < n) : 2 ≤ scalarModulus n := by
+  cases n with
+  | zero => exact absurd hn (Nat.lt_irrefl 0)
+  | succ k =>
+    have hp := cm_scalarModulus_pos k
+    unfold scalarModulus
+    change 2 ≤ 256 * scalarModulus k
+    omega
+
+/-- **`ptr_offset_from` negative exact-multiple law** (signed): `base = ptr + k * elemSize`
+with `0 < k` and `k * elemSize ≤ isize::MAX` yields two's-complement `modW - k`. -/
+theorem cm_evalPtrOffsetFromDistance_neg_exact (ptrBytes elemSize p k : Nat)
+    (hPos : 0 < elemSize) (hk : 0 < k)
+    (hLe : elemSize ≤ scalarModulus ptrBytes / 2 - 1)
+    (hDist : k * elemSize ≤ scalarModulus ptrBytes / 2 - 1) :
+    evalPtrOffsetFromDistance ptrBytes false elemSize p (p + k * elemSize) =
+      some ⟨scalarModulus ptrBytes - k, ptrBytes⟩ := by
+  have hProd : 0 < k * elemSize := Nat.mul_pos hk hPos
+  have h0 : Nat.beq elemSize 0 = false := by
+    cases elemSize with
+    | zero => exact absurd hPos (Nat.lt_irrefl 0)
+    | succ _ => rfl
+  have h1 : Nat.ble elemSize (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1) = true :=
+    Nat.ble_eq.mpr hLe
+  have h2 : Nat.ble (p + k * elemSize) p = false := by
+    cases hb : Nat.ble (p + k * elemSize) p with
+    | false => rfl
+    | true => exact absurd (Nat.le_of_ble_eq_true hb) (by omega)
+  have h3 : Nat.sub (p + k * elemSize) p = k * elemSize := Nat.add_sub_cancel_left p (k * elemSize)
+  have h4 : Nat.ble (k * elemSize) (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1) = true :=
+    Nat.ble_eq.mpr hDist
+  have h5 : Nat.beq (Nat.mod (k * elemSize) elemSize) 0 = true := by
+    rw [show Nat.mod (k * elemSize) elemSize = 0 from Nat.mul_mod_left k elemSize]; rfl
+  have h6 : Nat.div (k * elemSize) elemSize = k := Nat.mul_div_cancel k hPos
+  unfold evalPtrOffsetFromDistance
+  simp only [h0, h1, h2, h3, h4, h5, h6, Bool.false_or, Bool.not_true, Bool.and_self]
+  rfl
+
+/-- **`ptr_offset_from` `isize::MIN` UB law**: distance `-2^(W-1)` (`isize::MIN`)
+is ALWAYS UB (`none`) for every positive pointer width, signedness, and element size. -/
+theorem cm_evalPtrOffsetFromDistance_isize_min_ub (ptrBytes : Nat) (unsigned : Bool)
+    (elemSize p : Nat) (hW : 0 < ptrBytes) :
+    evalPtrOffsetFromDistance ptrBytes unsigned elemSize p (p + scalarModulus ptrBytes / 2) = none := by
+  have hGe2 : 2 ≤ scalarModulus ptrBytes := cm_scalarModulus_ge_two hW
+  have hHalfPos : 0 < scalarModulus ptrBytes / 2 := by omega
+  unfold evalPtrOffsetFromDistance
+  dsimp only
+  cases hElem : Bool.or (Nat.beq elemSize 0)
+      (Bool.not (Nat.ble elemSize (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1))) with
+  | true => rfl
+  | false =>
+    dsimp only
+    have hble : Nat.ble (p + scalarModulus ptrBytes / 2) p = false := by
+      cases hb : Nat.ble (p + scalarModulus ptrBytes / 2) p with
+      | false => rfl
+      | true => exact absurd (Nat.le_of_ble_eq_true hb) (by omega)
+    rw [hble]
+    cases unsigned with
+    | true => rfl
+    | false =>
+      dsimp only
+      have hSub : Nat.sub (p + scalarModulus ptrBytes / 2) p = scalarModulus ptrBytes / 2 :=
+        Nat.add_sub_cancel_left p _
+      have hGt : Nat.ble (scalarModulus ptrBytes / 2) (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1) = false := by
+        cases hb : Nat.ble (scalarModulus ptrBytes / 2) (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1) with
+        | false => rfl
+        | true =>
+          have hle : scalarModulus ptrBytes / 2 ≤ scalarModulus ptrBytes / 2 - 1 :=
+            Nat.le_of_ble_eq_true hb
+          omega
+      simp only [hSub, hGt, Bool.false_and]
+
+/-- **`ptr_offset_from` non-divisible distance UB law**: if `b ≤ p` and
+`(p - b) % elemSize ≠ 0`, then `evalPtrOffsetFromDistance` returns `none`. -/
+theorem cm_evalPtrOffsetFromDistance_nondiv_ub (ptrBytes : Nat) (unsigned : Bool)
+    (elemSize p b : Nat) (hle : b ≤ p) (hRem : (p - b) % elemSize ≠ 0) :
+    evalPtrOffsetFromDistance ptrBytes unsigned elemSize p b = none := by
+  unfold evalPtrOffsetFromDistance
+  dsimp only
+  cases hElem : Bool.or (Nat.beq elemSize 0)
+      (Bool.not (Nat.ble elemSize (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1))) with
+  | true => rfl
+  | false =>
+    dsimp only
+    have h1 : Nat.ble b p = true := Nat.ble_eq.mpr hle
+    have h2 : Nat.beq (Nat.mod (Nat.sub p b) elemSize) 0 = false := by
+      cases hb : Nat.beq (Nat.mod (Nat.sub p b) elemSize) 0 with
+      | false => rfl
+      | true => exact absurd (Nat.eq_of_beq_eq_true hb) hRem
+    simp only [h1, h2, Bool.and_false]
+
+/-- **`ptr_offset_from` oversized pointee UB law**: `elemSize > isize::MAX` is
+always UB (`none`). -/
+theorem cm_evalPtrOffsetFromDistance_oversized_elem_ub (ptrBytes : Nat) (unsigned : Bool)
+    (elemSize p b : Nat) (hGt : scalarModulus ptrBytes / 2 - 1 < elemSize) :
+    evalPtrOffsetFromDistance ptrBytes unsigned elemSize p b = none := by
+  have hBle : Nat.ble elemSize (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1) = false := by
+    cases hb : Nat.ble elemSize (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1) with
+    | false => rfl
+    | true =>
+      have hle : elemSize ≤ scalarModulus ptrBytes / 2 - 1 := Nat.le_of_ble_eq_true hb
+      omega
+  unfold evalPtrOffsetFromDistance
+  simp only [hBle, Bool.not_false, Bool.or_true]
+
+/-- Bitwise specification of Trusted `bitwiseAndBits`: bit `i` of
+`bitwiseAndBits k a b` is `true` iff `i < k`, bit `i` of `a` is `true`, and
+bit `i` of `b` is `true`. -/
+theorem cm_bitwiseAndBits_testBit (k a b i : Nat) :
+    (bitwiseAndBits k a b).testBit i = (decide (i < k) && a.testBit i && b.testBit i) := by
+  induction k generalizing a b i with
+  | zero => simp [bitwiseAndBits]
+  | succ k ih =>
+    have hbit :
+        (match Bool.and (Nat.beq (Nat.mod a 2) 1) (Nat.beq (Nat.mod b 2) 1) with
+         | true => 1 | false => 0) = if (a.testBit 0 && b.testBit 0) then 1 else 0 := by
+      have ha : a % 2 = 0 ∨ a % 2 = 1 := by omega
+      have hb : b % 2 = 0 ∨ b % 2 = 1 := by omega
+      change (match Bool.and (Nat.beq (a % 2) 1) (Nat.beq (b % 2) 1) with
+         | true => 1 | false => 0) = if (a.testBit 0 && b.testBit 0) then 1 else 0
+      simp only [Nat.testBit_zero]
+      rcases ha with ha | ha <;> rcases hb with hb | hb <;> rw [ha, hb] <;> decide
+    have hUnfold : bitwiseAndBits (k + 1) a b =
+        (if (a.testBit 0 && b.testBit 0) then 1 else 0) + 2 * bitwiseAndBits k (a / 2) (b / 2) := by
+      change (match Bool.and (Nat.beq (Nat.mod a 2) 1) (Nat.beq (Nat.mod b 2) 1) with
+          | true => 1 | false => 0) + 2 * bitwiseAndBits k (a / 2) (b / 2) = _
+      rw [hbit]
+    rw [hUnfold]
+    cases i with
+    | zero =>
+      have h0l : ((if (a.testBit 0 && b.testBit 0) then 1 else 0) +
+          2 * bitwiseAndBits k (a / 2) (b / 2)).testBit 0 = (a.testBit 0 && b.testBit 0) := by
+        cases (a.testBit 0 && b.testBit 0) <;> simp [Nat.testBit_zero]
+      rw [h0l]; simp
+    | succ j =>
+      have hdiv : ((if (a.testBit 0 && b.testBit 0) then 1 else 0) +
+          2 * bitwiseAndBits k (a / 2) (b / 2)) / 2 = bitwiseAndBits k (a / 2) (b / 2) := by
+        cases a.testBit 0 && b.testBit 0 <;> simp <;> omega
+      rw [Nat.testBit_succ, hdiv, ih (a / 2) (b / 2) j, Nat.testBit_succ, Nat.testBit_succ]
+      simp [Nat.succ_lt_succ_iff]
+
+/-- **`ptr_mask` identity-mask algebraic law**: `bitwiseAndBits W x (2^W - 1) = x`
+for every `x < 2^W`. -/
+theorem cm_bitwiseAndBits_allOnes (W x : Nat) (hx : x < 2 ^ W) :
+    bitwiseAndBits W x (2 ^ W - 1) = x := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [cm_bitwiseAndBits_testBit]
+  by_cases hi : i < W
+  · have h1 : (2 ^ W - 1).testBit i = true := by
+      rw [Nat.testBit_two_pow_sub_one]; exact decide_eq_true hi
+    simp [hi, h1]
+  · have hge : W ≤ i := Nat.le_of_not_lt hi
+    have hlt : x < 2 ^ i := Nat.lt_of_lt_of_le hx (Nat.pow_le_pow_right (by decide) hge)
+    have h0 : x.testBit i = false := Nat.testBit_lt_two_pow hlt
+    simp [hi, h0]
+
+/-- **`ptr_mask` exact base-address-invariance theorem** (all pointer widths `W`,
+all alignments `2^m`, all `2^m`-aligned base addresses `baseAddr`, all relative
+offsets `relOff`, and all masks `mask` satisfying `(2^W - 1) - mask < 2^m`):
+masking the concrete address `baseAddr + relOff` equals shifting `baseAddr` by
+the masked relative offset `bitwiseAndBits W relOff mask`. -/
+theorem cm_bitwiseAndBits_baseAddr_invariant (W m baseAddr relOff mask : Nat)
+    (hmW : m ≤ W) (hAlign : 2 ^ m ∣ baseAddr) (hSum : baseAddr + relOff < 2 ^ W)
+    (hMask : mask < 2 ^ W) (hInv : (2 ^ W - 1) - mask < 2 ^ m) :
+    bitwiseAndBits W (baseAddr + relOff) mask = baseAddr + bitwiseAndBits W relOff mask := by
+  have h2mPos : 0 < 2 ^ m := Nat.pow_pos (by decide)
+  rcases hAlign with ⟨q, rfl⟩
+  have hMaskHigh : ∀ i, m ≤ i → i < W → mask.testBit i = true := by
+    intro i hmi hiW
+    have hmul : 2 ^ m * 2 ^ (W - m) = 2 ^ W := by rw [← Nat.pow_add, Nat.add_sub_of_le hmW]
+    have h1 : (2 ^ (W - m) - 1) * 2 ^ m = 2 ^ W - 2 ^ m := by
+      rw [Nat.sub_mul, Nat.one_mul, Nat.mul_comm, hmul]
+    have h2 : 2 ^ (W - m) * 2 ^ m = 2 ^ W := by rw [Nat.mul_comm, hmul]
+    have hPowPos : 0 < 2 ^ (W - m) := Nat.pow_pos (by decide)
+    have hGe : (2 ^ (W - m) - 1) * 2 ^ m ≤ mask := by omega
+    have hLt : mask < (2 ^ (W - m) - 1 + 1) * 2 ^ m := by
+      rw [Nat.sub_add_cancel hPowPos]; omega
+    have hdiv : mask / 2 ^ m = 2 ^ (W - m) - 1 := Nat.div_eq_of_lt_le hGe hLt
+    have hsub : i = (i - m) + m := by omega
+    rw [hsub, ← Nat.testBit_div_two_pow, hdiv, Nat.testBit_two_pow_sub_one]
+    exact decide_eq_true (by omega)
+  have hSplit : ∀ x, x < 2 ^ W →
+      bitwiseAndBits W x mask = 2 ^ m * (x / 2 ^ m) + bitwiseAndBits m (x % 2 ^ m) (mask % 2 ^ m) := by
+    intro x hx
+    have hLowLt : bitwiseAndBits m (x % 2 ^ m) (mask % 2 ^ m) < 2 ^ m := by
+      have : ∀ k a b, bitwiseAndBits k a b < 2 ^ k := by
+        intro k
+        induction k with
+        | zero => intro a b; simp [bitwiseAndBits]
+        | succ k ih =>
+          intro a b
+          change (match Bool.and (Nat.beq (Nat.mod a 2) 1) (Nat.beq (Nat.mod b 2) 1) with
+              | true => 1 | false => 0) + 2 * bitwiseAndBits k (a / 2) (b / 2) < 2 ^ (k + 1)
+          have h1 : bitwiseAndBits k (a / 2) (b / 2) < 2 ^ k := ih (a / 2) (b / 2)
+          cases Bool.and (Nat.beq (Nat.mod a 2) 1) (Nat.beq (Nat.mod b 2) 1)
+          · change 0 + 2 * bitwiseAndBits k (a / 2) (b / 2) < 2 ^ (k + 1)
+            rw [Nat.pow_succ]; omega
+          · change 1 + 2 * bitwiseAndBits k (a / 2) (b / 2) < 2 ^ (k + 1)
+            rw [Nat.pow_succ]; omega
+      exact this m _ _
+    apply Nat.eq_of_testBit_eq
+    intro i
+    rw [cm_bitwiseAndBits_testBit, Nat.testBit_two_pow_mul_add _ hLowLt]
+    by_cases him : i < m
+    · have hiW : i < W := Nat.lt_of_lt_of_le him hmW
+      simp only [him, ↓reduceIte, cm_bitwiseAndBits_testBit, Nat.testBit_mod_two_pow, hiW,
+        decide_true, Bool.true_and]
+    · simp only [him, ↓reduceIte]
+      have hmi : m ≤ i := Nat.le_of_not_lt him
+      have hSubDiv : (x / 2 ^ m).testBit (i - m) = x.testBit i := by
+        rw [Nat.testBit_div_two_pow, Nat.sub_add_cancel hmi]
+      rw [hSubDiv]
+      by_cases hiW : i < W
+      · simp [hiW, hMaskHigh i hmi hiW]
+      · have hge : W ≤ i := Nat.le_of_not_lt hiW
+        have hlt : x < 2 ^ i := Nat.lt_of_lt_of_le hx (Nat.pow_le_pow_right (by decide) hge)
+        simp [hiW, Nat.testBit_lt_two_pow hlt]
+  rw [hSplit (2 ^ m * q + relOff) hSum, hSplit relOff (by omega)]
+  have hDivAdd : (2 ^ m * q + relOff) / 2 ^ m = q + relOff / 2 ^ m := by
+    rw [Nat.mul_add_div h2mPos]
+  have hModAdd : (2 ^ m * q + relOff) % 2 ^ m = relOff % 2 ^ m := by
+    rw [Nat.mul_add_mod]
+  rw [hDivAdd, hModAdd, Nat.mul_add, Nat.add_assoc]
+
+/-- **`ptr_mask` universal identity-mask law** on `evalPtrMaskCall`: for EVERY
+machine state, backed thin pointer `p` with `p.offsetBytes < 2^W`, and identity
+mask `2^W - 1`, `evalPtrMaskCall` returns `.ptr p ptrBytes` unchanged even when
+`allocAlign` is unknown. -/
+theorem cm_evalPtrMaskCall_identity (s : MachineState) (decls : List MirAst.LocalDecl)
+    (lay : LayoutTable) (p : ProvenancePtr) (locals : List LocalSlot) (dest : Place)
+    (tgt : Option BasicBlockIdx)
+    (hBacked : p.allocId ≠ 0 ∨ isBackedPtr s.memory p = true)
+    (hOff : p.offsetBytes < scalarModulus (layoutPointerBytes lay)) :
+    evalPtrMaskCall s decls lay
+      [.ptr p (layoutPointerBytes lay),
+       .scalar ⟨scalarModulus (layoutPointerBytes lay) - 1, layoutPointerBytes lay⟩]
+      locals dest tgt =
+      writeIntrinsicReturnWithProtectors s decls lay locals dest tgt
+        (.ptr p (layoutPointerBytes lay)) := by
+  have hModPos : 0 < scalarModulus (layoutPointerBytes lay) := cm_scalarModulus_pos _
+  have hAllOnesLt : scalarModulus (layoutPointerBytes lay) - 1 < scalarModulus (layoutPointerBytes lay) := by
+    omega
+  have hUnbacked : Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p)) = false := by
+    rcases hBacked with hNe | hB
+    · have h0 : Nat.beq p.allocId 0 = false := by
+        cases hq : Nat.beq p.allocId 0 with
+        | false => rfl
+        | true => exact absurd (Nat.eq_of_beq_eq_true hq) hNe
+      simp [h0]
+    · simp [hB]
+  have hDecode :
+      decodeUsizeArg? s.memory (layoutPointerBytes lay)
+        (.scalar ⟨scalarModulus (layoutPointerBytes lay) - 1, layoutPointerBytes lay⟩) =
+        .ok (scalarModulus (layoutPointerBytes lay) - 1) := by
+    unfold decodeUsizeArg?
+    have hBeq : Nat.beq (layoutPointerBytes lay) (layoutPointerBytes lay) = true := Nat.beq_refl _
+    have hBlt : Nat.blt (scalarModulus (layoutPointerBytes lay) - 1)
+        (scalarModulus (layoutPointerBytes lay)) = true := Nat.blt_eq.mpr hAllOnesLt
+    simp only [hBeq, hBlt, Bool.and_self]
+  have hModEq : Nat.mod (scalarModulus (layoutPointerBytes lay) - 1)
+      (scalarModulus (layoutPointerBytes lay)) = scalarModulus (layoutPointerBytes lay) - 1 :=
+    Nat.mod_eq_of_lt hAllOnesLt
+  have hOffBlt : Nat.blt p.offsetBytes (scalarModulus (layoutPointerBytes lay)) = true :=
+    Nat.blt_eq.mpr hOff
+  have hBeqAll : Nat.beq (scalarModulus (layoutPointerBytes lay) - 1)
+      (Nat.sub (scalarModulus (layoutPointerBytes lay)) 1) = true := Nat.beq_refl _
+  unfold evalPtrMaskCall
+  simp only [Nat.beq_refl, hUnbacked, Bool.false_and, hDecode, hModEq, hBeqAll, hOffBlt, Bool.and_self]
+
+/-- **Universal `ucg#630` / `rust#166220` zero-exposure law for `ptr_mask`**: for
+EVERY state `s`, direct destination `{ local_ := d, projection := [] }`, and
+arbitrary arguments, whenever `evalPtrMaskCall` takes a normal step `.tau (.running s')`,
+`s'.memory.exposedAllocIds = s.memory.exposedAllocIds`. -/
+theorem cm_evalPtrMaskCall_direct_preserves_exposed (s s' : MachineState)
+    (decls : List MirAst.LocalDecl) (lay : LayoutTable) (vals : List Value)
+    (locals : List LocalSlot) (d : Nat) (tgt : Option BasicBlockIdx)
+    (hStep : evalPtrMaskCall s decls lay vals locals (locPlace d) tgt = .tau (.running s')) :
+    s'.memory.exposedAllocIds = s.memory.exposedAllocIds := by
+  have hWrite : ∀ (v : Value),
+      writeIntrinsicReturnWithProtectors s decls lay locals (locPlace d) tgt v = .tau (.running s') →
+      s'.memory.exposedAllocIds = s.memory.exposedAllocIds := by
+    intro v hW
+    have hDest : ∀ (wRes : FrameWriteResult) (bb : BasicBlockIdx),
+        writeReturnDestination locals s.memory (locPlace d) v decls lay = wRes →
+        (match wRes with
+         | .ok updatedLocals mem' =>
+           MirStepNode.step { frame := { s.frame with blockIdx := bb, stmtIdx := 0, locals := updatedLocals },
+                              memory := mem' }
+         | .ub => MirStepNode.fail .ub
+         | .unsupported => MirStepNode.unsupported) = .tau (.running s') →
+        s'.memory.exposedAllocIds = s.memory.exposedAllocIds := by
+      intro wRes bb hw hEq
+      cases wRes with
+      | ub => cases hEq
+      | unsupported => cases hEq
+      | ok updatedLocals mem' =>
+        injection hEq with hSt
+        injection hSt with hSt'
+        have hMem : s'.memory = mem' := by cases hSt'; rfl
+        rw [hMem]
+        unfold writeReturnDestination locPlace at hw
+        dsimp only at hw
+        cases hget : get? locals d <;> rw [hget] at hw
+        · cases hw
+        · rename_i slot
+          cases slot <;> dsimp only at hw
+          · cases hw
+          · cases hConf : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors d
+                .none .nil 0 0 (length s.memory.callStack) <;> rw [hConf] at hw
+            · cases hset : set? locals d (.init v) <;> rw [hset] at hw
+              · cases hw
+              · cases hw; rfl
+            · cases hw
+          · cases hConf : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors d
+                .none .nil 0 0 (length s.memory.callStack) <;> rw [hConf] at hw
+            · cases hset : set? locals d (.init v) <;> rw [hset] at hw
+              · cases hw
+              · cases hw; rfl
+            · cases hw
+    unfold writeIntrinsicReturnWithProtectors at hW
+    cases tgt with
+    | none => cases hW
+    | some bb =>
+      dsimp only at hW
+      cases decls with
+      | nil => exact hDest _ bb rfl hW
+      | cons hd tl =>
+        dsimp only at hW
+        cases hVal : validateValueForTy? lay (placeTy (hd :: tl) lay (locPlace d)) v <;>
+          rw [hVal] at hW
+        · cases hW
+        · exact hDest _ bb rfl hW
+  rcases vals with _ | ⟨ptrVal, _ | ⟨maskVal, _ | _⟩⟩
+  · cases hStep
+  · cases hStep
+  · unfold evalPtrMaskCall at hStep
+    dsimp only at hStep
+    cases ptrVal with
+    | scalar sc =>
+      dsimp only at hStep
+      cases h1 : Bool.and (Nat.beq sc.sizeBytes (layoutPointerBytes lay))
+          (Nat.blt sc.bits (scalarModulus (layoutPointerBytes lay))) <;>
+        rw [h1] at hStep
+      · cases hStep
+      · dsimp only at hStep
+        cases h2 : decodeUsizeArg? s.memory (layoutPointerBytes lay) maskVal <;>
+          rw [h2] at hStep
+        · exact hWrite _ hStep
+        · cases hStep
+        · cases hStep
+    | ptr p sz =>
+      dsimp only at hStep
+      cases h1 : Nat.beq sz (layoutPointerBytes lay) <;> rw [h1] at hStep
+      · cases hStep
+      · dsimp only at hStep
+        cases h2 : Bool.and (Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p)))
+            (Bool.not (Nat.blt p.offsetBytes (scalarModulus (layoutPointerBytes lay)))) <;>
+          rw [h2] at hStep
+        · dsimp only at hStep
+          cases h3 : decodeUsizeArg? s.memory (layoutPointerBytes lay) maskVal <;> rw [h3] at hStep
+          · dsimp only at hStep
+            cases h4 : Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p)) <;>
+              rw [h4] at hStep
+            · dsimp only at hStep
+              cases h5 : Bool.and (Nat.beq (Nat.mod _ (scalarModulus (layoutPointerBytes lay)))
+                  (Nat.sub (scalarModulus (layoutPointerBytes lay)) 1))
+                  (Nat.blt p.offsetBytes (scalarModulus (layoutPointerBytes lay))) <;>
+                rw [h5] at hStep
+              · dsimp only at hStep
+                cases h6 : resolvePtrAllocAlignAndPlaceOff s locals decls lay p <;> rw [h6] at hStep
+                · cases hStep
+                · rename_i pair; rcases pair with ⟨allocAlign, placeOff⟩
+                  dsimp only at hStep
+                  cases h7 : Bool.and (Nat.ble allocAlign (signedHalfModulus (layoutPointerBytes lay)))
+                      (Bool.and (Nat.blt (Nat.sub (Nat.sub (scalarModulus (layoutPointerBytes lay)) 1)
+                        (Nat.mod _ (scalarModulus (layoutPointerBytes lay)))) allocAlign)
+                        (Nat.blt (Nat.add placeOff p.offsetBytes) (scalarModulus (layoutPointerBytes lay)))) <;>
+                    rw [h7] at hStep
+                  · cases hStep
+                  · dsimp only at hStep
+                    cases h8 : Nat.blt (bitwiseAndBits (Nat.mul 8 (layoutPointerBytes lay))
+                        (Nat.add placeOff p.offsetBytes) (Nat.mod _ (scalarModulus (layoutPointerBytes lay))))
+                        placeOff <;>
+                      rw [h8] at hStep
+                    · exact hWrite _ hStep
+                    · cases hStep
+              · exact hWrite _ hStep
+            · exact hWrite _ hStep
+          · cases hStep
+          · cases hStep
+        · cases hStep
+    | aggregate tag fields =>
+      cases tag <;> (try cases hStep)
+      rcases fields with _ | ⟨dVal, _ | ⟨mVal, _ | _⟩⟩ <;> (try cases hStep)
+      simp only [Nat.zero_eq] at hStep
+      cases hA : isNullThinPtr s.memory (layoutPointerBytes lay) dVal <;>
+        cases hB : isValidWidePtrMetaValForWidth s.memory (layoutPointerBytes lay) mVal <;>
+        cases hC : decodeUsizeArg? s.memory (layoutPointerBytes lay) maskVal <;>
+        (rw [hA, hB, hC] at hStep; cases hStep)
+    | unit => cases hStep
+    | uninit => cases hStep
+  · cases hStep
+
+/-- **Universal `MiniRustSpec.Interp.evalIntrinsic .RawEq` law**: for EVERY
+MiniRust machine `m`, reference pointer type `ptrTy = .Ref mut pointee` with
+sized pointee `(size, align)`, and thin pointers `lp`, `rp`,
+`evalIntrinsic m .RawEq [(.Ptr lp, .Ptr ptrTy), (.Ptr rp, .Ptr ptrTy)] .Bool`
+loads both byte slices and returns `.Bool (leftData == rightData)`. -/
+theorem cm_minirust_rawEq_evalIntrinsic (m m1 m2 : Mach) (lp rp : Pointer Prov)
+    (ptrTy : PtrType) (lBytes rBytes : List UInt8)
+    (hL : loadRawData m lp ptrTy = .ok (lBytes, m1))
+    (hR : loadRawData m1 rp ptrTy = .ok (rBytes, m2)) :
+    evalIntrinsic m .RawEq [(.Ptr lp, .Ptr ptrTy), (.Ptr rp, .Ptr ptrTy)] .Bool =
+      .ok (.Bool (lBytes == rBytes), m2) := by
+  have hRefl : ptrTypeEq ptrTy ptrTy = true := by
+    have hLayRefl : ∀ lay : LayoutStrategy, layoutStrategyEq lay lay = true := by
+      intro lay
+      induction lay with
+      | Sized s a => simp [layoutStrategyEq]
+      | Slice s a => simp [layoutStrategyEq]
+      | TraitObject t => simp [layoutStrategyEq]
+      | Tuple h t ih => simp [layoutStrategyEq, ih]
+    have hUcRefl : ∀ uc : UnsafeCellStrategy, unsafeCellStrategyEq uc uc = true := by
+      intro uc
+      induction uc with
+      | Sized c => simp [unsafeCellStrategyEq]
+      | Slice c => simp [unsafeCellStrategyEq]
+      | TraitObject => simp [unsafeCellStrategyEq]
+      | Tuple h t ih => simp [unsafeCellStrategyEq, ih]
+    cases ptrTy with
+    | Ref mutbl pt =>
+      rcases pt with ⟨lay, inh, uc, frz, unp⟩
+      simp [ptrTypeEq, pointeeInfoEq, hLayRefl lay, hUcRefl uc]
+    | Box pt =>
+      rcases pt with ⟨lay, inh, uc, frz, unp⟩
+      simp [ptrTypeEq, pointeeInfoEq, hLayRefl lay, hUcRefl uc]
+    | Raw k => simp [ptrTypeEq]
+    | FnPtr => rfl
+    | VTablePtr t => simp [ptrTypeEq]
+  simp [evalIntrinsic, typeEq, hRefl, hL, hR, bind, Except.bind, pure]
+  rfl
+
+/-- **Universal MiniRust `RawEq` uninit-byte UB law**: whenever `CM.load` yields a
+byte list containing `.Uninit`, `loadRawData` faults with MiniRust's exact UB. -/
+theorem cm_minirust_loadRawData_uninit_ub (m : Mach) (lp : Pointer Prov) (mut_ : LibSpecr.Mutability)
+    (pt : PointeeInfo) (sz : LibSpecr.Size) (al : LibSpecr.Align) (bs : List Byte)
+    (cm : ConcurrentMemory BM)
+    (hLay : pt.layout = .Sized sz al)
+    (hLoad : CM.load m.mem lp.thin_pointer sz al .None = .ok (bs, cm))
+    (hUninit : bs.mapM AbstractByte.data = none) :
+    loadRawData m lp (.Ref mut_ pt) =
+      .error (.ub "invalid argument to `RawEq` intrinsic: byte is uninitialized") := by
+  simp [loadRawData, hLay, hLoad, hUninit, bind, Except.bind, ub]
+
+/-- **Universal `MiniRustSpec.Interp.evalPtrOffsetFrom` + `DivExact` correspondence**:
+whenever `evalPtrOffsetFrom` succeeds on inbounds thin pointers with positive
+multiple `k * elemSize ≤ isize::MAX`, MiniRust's `DivExact` returns `Int.ofNat k`,
+matching Trusted `evalPtrOffsetFromDistance 8 nonneg elemSize ... = some ⟨k, 8⟩`. -/
+theorem cm_minirust_evalPtrOffsetFrom_divExact_agree (m : Mach) (nonneg : Bool)
+    (left right : ThinPointer Prov) (tl tr : Gen.Type) (elemSize k : Nat)
+    (hPos : 0 < elemSize) (hLe : elemSize ≤ scalarModulus 8 / 2 - 1)
+    (hDist : k * elemSize ≤ scalarModulus 8 / 2 - 1)
+    (hAddr : left.addr = right.addr + Int.ofNat (k * elemSize))
+    (hD1 : CM.signed_dereferenceable m.mem left (-(left.addr - right.addr)) = .ok ())
+    (hD2 : CM.signed_dereferenceable m.mem right (left.addr - right.addr) = .ok ()) :
+    evalPtrOffsetFrom m true nonneg (.Ptr ⟨left, none⟩, tl) (.Ptr ⟨right, none⟩, tr) =
+      .ok (.Int (Int.ofNat (k * elemSize)), .Int ⟨.Signed, x86_64.PTR_SIZE⟩) ∧
+    evalIntBinOp .DivExact (Int.ofNat (k * elemSize)) (Int.ofNat elemSize) ⟨.Signed, x86_64.PTR_SIZE⟩ =
+      .ok (Int.ofNat k) ∧
+    evalPtrOffsetFromDistance 8 nonneg elemSize (right.addr.toNat + k * elemSize) right.addr.toNat =
+      some ⟨k, 8⟩ := by
+  have hDiff : left.addr - right.addr = Int.ofNat (k * elemSize) := by
+    rw [hAddr, Int.add_comm, Int.add_sub_cancel]
+  have hNonneg : ¬ (Int.ofNat (k * elemSize) < 0) :=
+    Int.not_lt.mpr (Int.natCast_nonneg (k * elemSize))
+  have hCanRep : IntType.can_represent ⟨.Signed, x86_64.PTR_SIZE⟩ (Int.ofNat k) = true := by
+    have hkLe : k ≤ scalarModulus 8 / 2 - 1 := by
+      have : k ≤ k * elemSize := Nat.le_mul_of_pos_right k hPos
+      omega
+    have hMod : scalarModulus 8 / 2 - 1 = 2 ^ 63 - 1 := by decide
+    have hk63 : k ≤ 2 ^ 63 - 1 := by omega
+    unfold IntType.can_represent inBounds
+    have hBits : MiniRustSpec.Interp.Size.bits x86_64.PTR_SIZE = 64 := rfl
+    dsimp only
+    rw [hBits]
+    have hMin : -((2 : Int) ^ (64 - 1)) ≤ Int.ofNat k := by
+      rw [Int.ofNat_eq_natCast]; omega
+    have hMax : Int.ofNat k < (2 : Int) ^ (64 - 1) := by
+      rw [Int.ofNat_eq_natCast]; omega
+    simp [hMin, hMax]; omega
+  refine ⟨?_, ?_, cm_evalPtrOffsetFromDistance_exact 8 nonneg elemSize right.addr.toNat k hPos hLe hDist⟩
+  · unfold evalPtrOffsetFrom
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    rw [hD1, hD2, hDiff]
+    have hd : decide (Int.ofNat (k * elemSize) < 0) = false := decide_eq_false hNonneg
+    simp only [hd, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+  · have hElemNe : Int.ofNat elemSize ≠ 0 := by intro h; cases h; omega
+    have hTdiv : Int.tdiv (Int.ofNat (k * elemSize)) (Int.ofNat elemSize) = Int.ofNat k := by
+      change Int.ofNat ((k * elemSize) / elemSize) = Int.ofNat k
+      rw [Nat.mul_div_cancel k hPos]
+    have hTmod : Int.tmod (Int.ofNat (k * elemSize)) (Int.ofNat elemSize) = 0 := by
+      change Int.ofNat ((k * elemSize) % elemSize) = 0
+      rw [Nat.mul_mod_left k elemSize]; rfl
+    unfold evalIntBinOp
+    dsimp only
+    simp only [hElemNe, ↓reduceIte, hTdiv, hCanRep, Bool.not_true, Bool.false_eq_true,
+      hTmod, ne_eq, not_true_eq_false, pure, Except.pure]
+
+/-- **Universal `black_box` `u32` identity law**: on ANY state `s` and canonical
+`u32` scalar `n < 2^32`, `evalBlackBoxCall` validates `n` and reduces directly
+to `writeIntrinsicReturnWithProtectors ... (.scalar ⟨n, 4⟩)`. -/
+theorem cm_evalBlackBoxCall_u32_valid (s : MachineState) (decls : List MirAst.LocalDecl)
+    (lay : LayoutTable) (ops : List Operand) (locals : List LocalSlot) (dest : Place)
+    (tgt : Option BasicBlockIdx) (n : Nat) (hn : n < 2 ^ 32)
+    (hTy : resolveBlackBoxTy? { defPath := "core::intrinsics::black_box", typeArgs := [.uint .u32] }
+      decls lay ops = some { kind := .uint .u32, layoutIdx := unresolvedLayoutIdx lay }) :
+    evalBlackBoxCall s { defPath := "core::intrinsics::black_box", typeArgs := [.uint .u32] }
+      decls lay ops [.scalar ⟨n, 4⟩] locals dest tgt =
+      writeIntrinsicReturnWithProtectors s decls lay locals dest tgt (.scalar ⟨n, 4⟩) := by
+  have hMod : scalarModulus 4 = 2 ^ 32 := by decide
+  have hBlt : Nat.blt n (scalarModulus 4) = true := Nat.blt_eq.mpr (by omega)
+  unfold evalBlackBoxCall
+  rw [hTy]
+  dsimp only [defaultCodecFuel]
+  unfold validateBlackBoxValue
+  simp only [intTyTargetBytes, hBlt, Nat.beq_refl, Bool.and_self]
+
 /-! ## §3. MiniRust Reference Programs (`Mach` & `MachTB`)
 
 Each intrinsic is executed in `MiniRustSpec.Interp` as its MiniRust reference
@@ -836,6 +1437,26 @@ def cmMrSwapSameAllocMach : Mach :=
   cmMrSwapMach 1 (cmMrPtr 1024 4) (cmMrPtr 1028 4)
     [(1024, scalarBytes cmU32It 5 ++ scalarBytes cmU32It 6, 4)]
 
+/-- Mode-sensitive `typed_swap_nonoverlapping`: `Validate(_3: &u32 -> y, fn_entry)`
+installs a protected shared reborrow on allocation `6` (`9u32`); swapping `x`
+(alloc `5` = `7u32`) and `y` (alloc `6` = `9u32`) then writes through the root
+provenance `_2` to `y` (returns `9` in `BasicMemory`, `.ub` in `TreeBorrowsMemory`). -/
+def cmMrSwapModeFn : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, cmRawMrTy), (localName 2, cmRawMrTy),
+      (localName 3, cmU32RefMrTy), (localName 4, u32MrTy)]
+    [localName 1, localName 2, localName 3] (localName 0)
+    [(bbName 0, cmBlk [.Validate (cmLc 3) true,
+                       .Assign (cmLc 4) (.Load (.Deref (cmLd 1) u32MrTy)),
+                       .Assign (.Deref (cmLd 1) u32MrTy) (.Load (.Deref (cmLd 2) u32MrTy)),
+                       .Assign (.Deref (cmLd 2) u32MrTy) (cmLd 4),
+                       .Assign (cmLc 0) (.Load (.Deref (cmLd 1) u32MrTy))] (.Goto (bbName 1))),
+     cmLoopBb 1]
+
+def cmMrSwapModeMach : Mach :=
+  cmMrMach cmMrSwapModeFn
+    [(cmUninit 4, 4), (cmMrPtr 1024 5, 8), (cmMrPtr 1088 6, 8), (cmMrPtr 1088 6, 8), (cmUninit 4, 4)]
+    [(1024, scalarBytes cmU32It 7, 4), (1088, scalarBytes cmU32It 9, 4)]
+
 -- 5./6. ptr_offset_from[_unsigned]
 def cmMrPofFn (unsigned : Bool) : Gen.Function :=
   let dist : ValueExpr :=
@@ -927,9 +1548,9 @@ def cmMrMachine : CmVariant → CmCase → Mach
   | .rawEq, .ubFault => cmMrRawEqMach (cmInitBytes [7] ++ cmUninit 1 ++ cmInitBytes [0, 0]) (scalarBytes cmU32It 9)
   | .rawEq, .modeCase => cmMrRawEqZstMach
   | .typedSwap, .okPrimary => cmMrSwapTwoMach 1 (cmMrPtr 1024 4)
-  | .typedSwap, .okSecondary => cmMrSwapTwoMach 2 (cmMrPtr 1024 4)
+  | .typedSwap, .okSecondary => cmMrSwapSameAllocMach
   | .typedSwap, .ubFault => cmMrSwapTwoMach 1 (ptrBytes 0 none)
-  | .typedSwap, .modeCase => cmMrSwapSameAllocMach
+  | .typedSwap, .modeCase => cmMrSwapModeMach
   | .ptrOffsetFrom, .okPrimary => cmMrPofMach false (cmMrPtr 1036 3) (cmMrPtr 1028 3)
   | .ptrOffsetFrom, .okSecondary => cmMrPofMach false (cmMrPtr 1028 3) (cmMrPtr 1036 3)
   | .ptrOffsetFrom, .ubFault => cmMrPofMach false (cmMrPtr 1028 3) (cmMrPtr 2060 4)
@@ -955,11 +1576,19 @@ def cmMrObserve (mode : CmMrMode) (v : CmVariant) (c : CmCase) : CmMrObs :=
   cmRunMrObs mode cmMrFuel (cmMrMachine v c)
 
 /-- Mode sensitivity certified directly on `cmMrObserve`: `copy.modeCase`
-returns `42` under `BasicMemory` and faults `.ub` under `TreeBorrowsMemory`. -/
+returns `42` under `BasicMemory` and faults `.ub` under `TreeBorrowsMemory`,
+and `typedSwap.modeCase` returns `9` under `BasicMemory` and faults `.ub` under
+`TreeBorrowsMemory`. -/
 theorem cmMrObserve_copy_mode_sensitivity :
     cmMrObserve .basicMemory .copy .modeCase =
       .retBytes ((scalarBytes cmU32It 42).map (projByteTB ∘ liftByteTB)) ∧
     cmMrObserve .treeBorrows .copy .modeCase = .ub :=
+  ⟨by decide +kernel, by decide +kernel⟩
+
+theorem cmMrObserve_typedSwap_mode_sensitivity :
+    cmMrObserve .basicMemory .typedSwap .modeCase =
+      .retBytes ((scalarBytes cmU32It 9).map (projByteTB ∘ liftByteTB)) ∧
+    cmMrObserve .treeBorrows .typedSwap .modeCase = .ub :=
   ⟨by decide +kernel, by decide +kernel⟩
 
 /-- The raw observation of a `BasicMemory` byte list. -/
@@ -1056,9 +1685,12 @@ def cmMrExpectedClass (mode : CmMrMode) : CmVariant → CmCase → Nat
   | .rawEq, .ubFault => 18
   | .rawEq, .modeCase => 5
   | .typedSwap, .okPrimary => 7
-  | .typedSwap, .okSecondary => 8
+  | .typedSwap, .okSecondary => 9
   | .typedSwap, .ubFault => 18
-  | .typedSwap, .modeCase => 9
+  | .typedSwap, .modeCase =>
+    match mode with
+    | .basicMemory => 7
+    | .treeBorrows => 18
   | .ptrOffsetFrom, .okPrimary => 10
   | .ptrOffsetFrom, .okSecondary => 11
   | .ptrOffsetFrom, .ubFault => 18
@@ -1156,21 +1788,30 @@ theorem cm_rawEq_three_way_witness :
    by decide +kernel⟩
 
 /-- **`typed_swap_nonoverlapping` three-way witness**: `*x` and `*y` after
-swapping two allocations, null UB, and disjoint elements of one allocation. -/
+swapping two allocations, disjoint elements of one allocation (`6`), null UB,
+and genuine `basic`/`Mach` (`9`) vs. `protectedTB`/`MachTB` (`.ub`) mode sensitivity. -/
 theorem cm_typedSwap_three_way_witness :
     cmTrustedObserve false .typedSwap .okPrimary = .scalar 9 4 ∧
     (∃ m', Interp.stepsTB cmMrFuel (liftMachToTB (cmMrMachine .typedSwap .okPrimary)) = .ok m' ∧
       MachTB.wfLive m' ∧
       m'.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
         some (cmProjBM (scalarBytes cmU32It 9))) ∧
-    cmTrustedObserve false .typedSwap .okSecondary = .scalar 7 4 ∧
-    cmMrObserve .basicMemory .typedSwap .okSecondary = cmMrBytesObs (scalarBytes cmU32It 7) ∧
+    cmRunTrusted cmSwapReadYMir cmTrustedFuel (cmInitLiveState cmSwapReadYMir [cmGPtr 100 0, cmGPtr 101 0]) =
+      .scalar 7 4 ∧
+    cmRunMrObs .basicMemory cmMrFuel (cmMrSwapTwoMach 2 (cmMrPtr 1024 4)) =
+      cmMrBytesObs (scalarBytes cmU32It 7) ∧
+    cmTrustedObserve false .typedSwap .okSecondary = .scalar 6 4 ∧
+    cmMrObserve .basicMemory .typedSwap .okSecondary = cmMrBytesObs (scalarBytes cmU32It 6) ∧
     cmTrustedObserve false .typedSwap .ubFault = .ub ∧
     cmMrObserve .basicMemory .typedSwap .ubFault = .ub ∧
-    cmTrustedObserve false .typedSwap .modeCase = .scalar 6 4 ∧
-    cmMrObserve .treeBorrows .typedSwap .modeCase = .retBytes (cmProjBM (scalarBytes cmU32It 6)) :=
+    cmTrustedObserve false .typedSwap .modeCase = .scalar 9 4 ∧
+    cmTrustedObserve true .typedSwap .modeCase = .ub ∧
+    (∃ m', Interp.steps cmMrFuel (cmMrMachine .typedSwap .modeCase) = .ok m' ∧
+      m'.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes cmU32It 9)) ∧
+    (interpUbMsg (Interp.stepsTB cmMrFuel (liftMachToTB (cmMrMachine .typedSwap .modeCase)))).isSome = true :=
   ⟨by decide +kernel, ok_stepsTB_wfLive (by decide +kernel), by decide +kernel, by decide +kernel,
-   by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+   by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+   by decide +kernel, by decide +kernel, ok_of_map_toOption (by decide +kernel), by decide +kernel⟩
 
 /-- **`ptr_offset_from` three-way witness** (`BinOp::PtrOffsetFrom { inbounds:
 true, nonneg: false }`): `2`, `-2`, cross-allocation UB, dangling same-address
@@ -1254,6 +1895,118 @@ theorem cm_blackBox_three_way_witness :
   ⟨by decide +kernel, ok_stepsTB_wfLive (by decide +kernel), by decide +kernel, by decide +kernel,
    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
 
+/-- MiniRust reference type `&(u8, u32)` (size 8, align 4, padding bytes `1..3`). -/
+@[reducible] def cmPaddedPointee : PointeeInfo :=
+  { layout := .Sized ⟨8⟩ ⟨4⟩, inhabited := true, unsafe_cells := .Sized [], freeze := true,
+    unpin := true }
+@[reducible] def cmPaddedRefMrTy : Gen.Type := .Ptr (.Ref .Immutable cmPaddedPointee)
+
+/-- Padded-struct `(u8, u32)` `raw_eq` fixture in Trusted (layout entry 0: size 8,
+align 4, fields `[0, 4]`), with globals `100 = [1, U, U, U, 5, 0, 0, 0]` (uninit padding)
+and `101 = [1, 0, 0, 0, 5, 0, 0, 0]` (fully initialized). -/
+def cmPaddedU8U32Layouts : LayoutTable :=
+  { entries := [{
+      size := ⟨8⟩, align := ⟨4⟩,
+      fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+      variants := .single 0,
+      backendRepr := .scalarPair (.initialized (.int 8 false) ⟨0, 255⟩)
+        (.initialized (.int 32 false) ⟨0, 0xFFFFFFFF⟩),
+      isUninhabited := false,
+      fieldLayouts := [] }],
+    pointerBits := 64, isLittleEndian := true }
+
+def cmRawEqPaddedMir : CapturedMir :=
+  let padTy : MirAst.Ty := { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 0 }
+  let refPadTy : MirAst.Ty := { kind := .ref .not (.tuple [.uint .u8, .uint .u32]), layoutIdx := 1 }
+  { cmCallBody "cm::raw_eq_padded"
+      [mkDecl boolMirTy, mkDecl refPadTy, mkDecl refPadTy, mkDecl padTy] 2
+      (cmIntrinsicOp "core::intrinsics::raw_eq" [.tuple [.uint .u8, .uint .u32]])
+      [.copy (locPlace 1), .copy (locPlace 2)] 0 []
+      [cmGlobal 100 [some 1, none, none, none, some 5, some 0, some 0, some 0] 4,
+       cmGlobal 101 [some 1, some 0, some 0, some 0, some 5, some 0, some 0, some 0] 4] with
+    layouts := cmPaddedU8U32Layouts }
+
+/-- **Padded-struct `raw_eq` three-way witness**: `(u8, u32)` with `.Uninit`
+padding bytes `1..3` faults `.ub` across Trusted `stepMirFn`, MiniRust `Mach`
+(`.Intrinsic .RawEq`), AND `MachTB`, while fully initialized 8-byte images
+compare equal (`true`, with `MachTB.wfLive`). -/
+theorem cm_rawEq_padded_struct_three_way_witness :
+    let padUninit := cmInitBytes [1] ++ cmUninit 3 ++ cmInitBytes [5, 0, 0, 0]
+    let padInit := cmInitBytes [1, 0, 0, 0, 5, 0, 0, 0]
+    let mrUninit := cmMrMach (cmMrRawEqFn cmPaddedRefMrTy)
+      [(cmUninit 1, 1), (cmMrPtr 1024 3, 8), (cmMrPtr 1088 4, 8)] [(1024, padUninit, 4), (1088, padInit, 4)]
+    let mrInit := cmMrMach (cmMrRawEqFn cmPaddedRefMrTy)
+      [(cmUninit 1, 1), (cmMrPtr 1024 3, 8), (cmMrPtr 1088 4, 8)] [(1024, padInit, 4), (1088, padInit, 4)]
+    cmRunTrusted cmRawEqPaddedMir cmTrustedFuel
+      (cmInitLiveState cmRawEqPaddedMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    Interp.steps cmMrFuel mrUninit =
+      .error (.ub "invalid argument to `RawEq` intrinsic: byte is uninitialized") ∧
+    cmRunMrObs .treeBorrows cmMrFuel mrUninit = .ub ∧
+    cmRunTrusted cmRawEqPaddedMir cmTrustedFuel
+      (cmInitLiveState cmRawEqPaddedMir [cmGPtr 101 0, cmGPtr 101 0]) = .scalar 1 1 ∧
+    (∃ m', Interp.stepsTB cmMrFuel (liftMachToTB mrInit) = .ok m' ∧
+      MachTB.wfLive m' ∧
+      m'.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some (cmProjBM (cmInitBytes [1]))) :=
+  ⟨by decide +kernel, eq_error_ub_of_interpUbMsg (by decide +kernel), by decide +kernel,
+   by decide +kernel, ok_stepsTB_wfLive (by decide +kernel)⟩
+
+/-- **`copy` Tree Borrows read-then-write sibling `.unique -> .frozen` UB witness**
+(NO protector): `_1` (tag `1`, `.unique`) and `_2` (tag `2`, `.unique`) are
+unprotected sibling borrows on stack local `_3`; Phase A's read through `src`
+(`tag 1`) freezes sibling `dst` (`tag 2`: `.unique -> .frozen`), so Phase B's
+write through `dst` deterministically faults `.ub` in Trusted `stepMirFn`. -/
+theorem cm_copy_tb_read_then_write_witness :
+    let body := cmCopyModeMir
+    let base := cmInitLiveState body [.ptr ⟨1, 0⟩ 8, .ptr ⟨2, 0⟩ 8]
+    let b1 : BorrowEntry :=
+      { tag := 1, targetLocal := 3, targetProjection := [], perm := TreeBorrowPerm.unique,
+        rangeOffset := 0, rangeLen := 4, protector := none, parentTag := none,
+        targetFrameDepth := 0, allocDead := false }
+    let b2 : BorrowEntry :=
+      { tag := 2, targetLocal := 3, targetProjection := [], perm := TreeBorrowPerm.unique,
+        rangeOffset := 0, rangeLen := 4, protector := none, parentTag := none,
+        targetFrameDepth := 0, allocDead := false }
+    let st : MachineState :=
+      { base with
+        frame := { base.frame with
+          locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8),
+                     .init (.scalar ⟨11, 4⟩), .uninit] },
+        memory := { base.memory with borrows := [b1, b2], nextTag := 3, activeProtectors := [] } }
+    cmRunTrusted body cmTrustedFuel st = .ub := by
+  decide +kernel
+
+/-- **`typed_swap_nonoverlapping` invalid `bool` (`kani#5205`) three-way witness**:
+swapping an invalid `bool` byte `2` faults `.ub` across Trusted `stepMirFn`,
+MiniRust `Mach`, AND `MachTB`. -/
+theorem cm_typedSwap_invalid_bool_three_way_witness :
+    let swapBoolMir :=
+      cmCallBody "cm::typed_swap_bool_mr"
+        [mkDecl boolMirTy, mkDecl { kind := .rawPtr .mut .bool, layoutIdx := 0 },
+         mkDecl { kind := .rawPtr .mut .bool, layoutIdx := 0 }, mkDecl unitMirTy] 2
+        (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.bool])
+        [.copy (locPlace 1), .copy (locPlace 2)] 3
+        [mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref]))))]
+        [cmGlobal 100 [some 2] 1, cmGlobal 101 [some 1] 1]
+    let mrSwapBoolFn :=
+      mkMrFn [(localName 0, .Bool), (localName 1, cmRawMrTy), (localName 2, cmRawMrTy),
+          (localName 3, .Bool)]
+        [localName 1, localName 2] (localName 0)
+        [(bbName 0, cmBlk [.Assign (cmLc 3) (.Load (.Deref (cmLd 1) .Bool)),
+                           .Assign (.Deref (cmLd 1) .Bool) (.Load (.Deref (cmLd 2) .Bool)),
+                           .Assign (.Deref (cmLd 2) .Bool) (cmLd 3),
+                           .Assign (cmLc 0) (.Load (.Deref (cmLd 1) .Bool))] (.Goto (bbName 1))),
+         cmLoopBb 1]
+    let mrSwapBoolMach :=
+      cmMrMach mrSwapBoolFn
+        [(cmUninit 1, 1), (cmMrPtr 1024 4, 8), (cmMrPtr 1088 5, 8), (cmUninit 1, 1)]
+        [(1024, cmInitBytes [2], 1), (1088, cmInitBytes [1], 1)]
+    cmRunTrusted swapBoolMir cmTrustedFuel
+      (cmInitLiveState swapBoolMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunMrObs .basicMemory cmMrFuel mrSwapBoolMach = .ub ∧
+    cmRunMrObs .treeBorrows cmMrFuel mrSwapBoolMach = .ub :=
+  ⟨by decide +kernel, by decide +kernel, by decide +kernel⟩
+
 /-! ## §7. Exhaustive Axiom, Import-Isolation, & `Classical.choice`-Free Codec Audit -/
 
 section AxiomAudit
@@ -1295,7 +2048,8 @@ elab "#assert_core_mem_ptr_mr_audit" : command => do
   let choiceFreeCodecs : List Lean.Name := [
     ``cmTrustedValueObs, ``cmRunTrusted, ``cmTrustedObserve, ``cmTrustedObserve_table,
     ``cmRunMrObs, ``cmMrObserve, ``cmMrObsClass, ``cmMrObserveClass, ``cmMrObsDict_distinct,
-    ``cmMrObserveClass_table, ``cmMrObserve_copy_mode_sensitivity ]
+    ``cmMrObserveClass_table, ``cmMrObserve_copy_mode_sensitivity,
+    ``cmMrObserve_typedSwap_mode_sensitivity ]
   for c in choiceFreeCodecs do
     let axs ← liftCoreM <| Lean.collectAxioms c
     if axs.contains ``Classical.choice then

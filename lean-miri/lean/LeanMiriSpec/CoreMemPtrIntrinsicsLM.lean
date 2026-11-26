@@ -197,6 +197,19 @@ def cmSwapSameAllocMir : CapturedMir :=
     [mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref]))))]
     [cmGlobal 100 (cmU32Bytes 5 ++ cmU32Bytes 6)]
 
+/-- Mode-sensitive `typed_swap_nonoverlapping`: `_1` points to global `100 = 7u32`
+and `_2` points (through borrow tag `2`) to stack local `_3 = 9u32`, on which a
+sibling `.frozen` borrow (tag `1`) carries an active protector in `protectedTB`
+mode; `_0 = *_1` afterwards (`9` in `basic`, `.ub` in `protectedTB`). -/
+def cmSwapModeMir : CapturedMir :=
+  cmCallBody "cm::typed_swap_mode"
+    [mkDecl u32MirTy, mkDecl rawMutU32MirTy, mkDecl rawMutU32MirTy, mkDecl u32MirTy,
+     mkDecl unitMirTy] 2
+    (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.uint .u32])
+    [.copy (locPlace 1), .copy (locPlace 2)] 4
+    [mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref]))))]
+    [cmGlobal 100 (cmU32Bytes 7)]
+
 -- 5./6. ptr_offset_from[_unsigned]
 /-- `ptr_offset_from::<u32>(_1, _2)` over two 16-byte globals `100`, `101`. -/
 def cmPofMir : CapturedMir :=
@@ -246,6 +259,33 @@ def cmBlackBoxPtrMir : CapturedMir :=
 def cmBlackBoxBoolMir : CapturedMir :=
   cmCallBody "cm::black_box_bool" [mkDecl boolMirTy, mkDecl boolMirTy] 1
     (cmIntrinsicOp "core::intrinsics::black_box" [.bool]) [.copy (locPlace 1)] 0 [] []
+
+-- 9. Zero-size null-pointer delta / agreement fixtures (shared verbatim with MR)
+/-- `compare_bytes(_1, _2, 0)`. -/
+def cmCmpBytes0Mir : CapturedMir :=
+  cmCallBody "cm::compare_bytes_0"
+    [mkDecl i32MirTy, mkDecl cmRawConstU8Ty, mkDecl cmRawConstU8Ty] 2
+    (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
+    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 0] 0 [] []
+
+/-- `typed_swap_nonoverlapping::<()>(_1, _2); _0 = 7u32`. -/
+def cmSwapZstMir : CapturedMir :=
+  cmCallBody "cm::typed_swap_zst"
+    [mkDecl u32MirTy, mkDecl { kind := .rawPtr .mut (.tuple []), layoutIdx := 0 },
+     mkDecl { kind := .rawPtr .mut (.tuple []), layoutIdx := 0 }, mkDecl unitMirTy] 2
+    (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.tuple []])
+    [.copy (locPlace 1), .copy (locPlace 2)] 3
+    [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨7, 4⟩) })))]
+    []
+
+/-- `copy::<u32>(_1, _2, 0); _0 = 7u32`. -/
+def cmCopy0Mir : CapturedMir :=
+  cmCallBody "cm::copy_0"
+    [mkDecl u32MirTy, mkDecl rawConstU32MirTy, mkDecl rawMutU32MirTy, mkDecl unitMirTy] 2
+    (cmIntrinsicOp "core::intrinsics::copy" [.uint .u32])
+    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 0] 3
+    [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨7, 4⟩) })))]
+    []
 
 /-! ## §1. Vendored Call Overlay for the 8 Intrinsics (`cmStepHooks`) -/
 
@@ -402,7 +442,45 @@ def cmDerefPointer (tyArg : Miri.MIR.TyId) (ly : LayoutTable) (op : Miri.Interpr
   | .ok sc =>
     match sc.toPointer annealTargetDataLayout with
     | .error e => throw (Miri.Interpreter.ScalarOps.scalarError e)
-    | .ok ptr => pure ⟨.memory ⟨ptr, .none, none⟩, cmPointeeLayout tyArg ly⟩
+    | .ok ptr =>
+      let pointeeLay := cmPointeeLayout tyArg ly
+      let mismatch ←
+        match annealOffsetMisalignment ptr.offset pointeeLay.layout.align.abi with
+        | .ok m => pure m
+        | .error err => throw (.invalidProgram (toString err))
+      pure ⟨.memory ⟨ptr, .none, mismatch⟩, pointeeLay⟩
+
+/-- Typed copy leaf (`copyOp`) enforcing uninhabitedness, immediate scalar
+validity (`bool`/`char`/non-null `&T`/`fn()`/`!`), and (when `tb = true`)
+vendored Tree Borrows read/write transitions on memory-backed sources and
+destinations. -/
+def cmCopyOp (tb : Bool) (src : Miri.Interpreter.OpTy AnnealProv)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv) : LmM Unit := do
+  if src.layout.layout.uninhabited then
+    throw (.undefinedBehavior "copyOp of uninhabited type")
+  if tb then
+    match src.op with
+    | .indirect mp =>
+      let st ← get
+      match npApplyTreeBorrowsReadAt mp.ptr.provenance mp.ptr.offset.bytes src.layout.layout.size st with
+      | .ok st' => set st'
+      | .error e => throw e
+    | _ => pure ()
+  let imm ← annealReadImmediate src
+  match imm.imm with
+  | .scalar sc =>
+    if !annealValidateScalarForTyId src.layout.ty sc then
+      throw (.undefinedBehavior "copyOp of invalid scalar value")
+  | _ => pure ()
+  if tb then
+    match dest.ref with
+    | .memory mp =>
+      let st ← get
+      match npApplyTreeBorrowsWriteAt mp.ptr.provenance mp.ptr.offset.bytes dest.layout.layout.size st with
+      | .ok st' => set st'
+      | .error e => throw e
+    | _ => pure ()
+  annealWriteImmediate imm.imm dest
 
 def cmIntrinsicHooks (ld : List LocalDecl) (ly : LayoutTable) (tb : Bool) (tyArg : Miri.MIR.TyId) :
     Miri.Interpreter.IntrinsicHooks AnnealProv AnnealStepState Unit (Miri.Interpreter.RuntimePlace AnnealProv) :=
@@ -411,9 +489,7 @@ def cmIntrinsicHooks (ld : List LocalDecl) (ly : LayoutTable) (tb : Bool) (tyArg
       match rawPtrPointeeEncodedTyId? tyId with
       | some p => pure p
       | none => pure tyArg
-    copyOp := fun _ src dest => do
-      let imm ← annealReadImmediate src
-      annealWriteImmediate imm.imm dest
+    copyOp := fun _ src dest => cmCopyOp tb src dest
     placeToOp := fun _ place =>
       match place.ref with
       | .memory mp => pure ⟨.indirect mp, place.layout⟩
@@ -533,6 +609,629 @@ theorem cmIntrinsic_names :
     CmIntrinsic.all.map CmIntrinsic.name =
       ["copy", "compare_bytes", "raw_eq", "typed_swap_nonoverlapping", "ptr_offset_from",
        "ptr_offset_from_unsigned", "ptr_mask", "black_box"] := rfl
+
+/-- Exact mirror of vendored `Miri/Interpreter/Intrinsics.lean:174-176` `bytesCompare`. -/
+def cmMiriBytesCompare : List UInt8 → List UInt8 → Ordering
+  | [], [] => .eq
+  | [], _ :: _ => .lt
+  | _ :: _, [] => .gt
+  | a :: as, b :: bs => if a == b then cmMiriBytesCompare as bs else compare a b
+
+/-- The 32-bit `i32` bit pattern produced by vendored `Intrinsics.compareBytes`
+(`Intrinsics.lean:185-186`: `.lt => -1`, `.eq => 0`, `.gt => 1`). -/
+def cmMiriBytesCompareI32Bits (l r : List UInt8) : Nat :=
+  match cmMiriBytesCompare l r with
+  | .lt => 4294967295
+  | .eq => 0
+  | .gt => 1
+
+/-- **Universal `compare_bytes` algebraic correspondence** (`Trusted.compareUnsignedBytesI32`
+= vendored `Miri/Interpreter/Intrinsics.lean:174-186` `bytesCompare`): for ALL
+equal-length byte lists `l` and `r`, Trusted's `compareUnsignedBytesI32 l r`
+equals the exact `Int32` bit pattern returned by `Intrinsics.compareBytes`. -/
+theorem cm_compareUnsignedBytesI32_eq_miriBytesCompare (l r : List UInt8)
+    (hLen : l.length = r.length) :
+    compareUnsignedBytesI32 l r = cmMiriBytesCompareI32Bits l r := by
+  induction l generalizing r with
+  | nil =>
+    cases r with
+    | nil => rfl
+    | cons _ _ => simp at hLen
+  | cons a as ih =>
+    cases r with
+    | nil => simp at hLen
+    | cons b bs =>
+      simp only [List.length_cons, Nat.add_right_cancel_iff] at hLen
+      unfold compareUnsignedBytesI32 cmMiriBytesCompareI32Bits cmMiriBytesCompare
+      by_cases hab : a = b
+      · subst hab
+        have hlt : Nat.blt a.toBitVec.toNat a.toBitVec.toNat = false := by
+          cases h : Nat.blt a.toBitVec.toNat a.toBitVec.toNat with
+          | false => rfl
+          | true => exact absurd (Nat.le_of_ble_eq_true h) (Nat.not_succ_le_self _)
+        simp only [hlt, beq_self_eq_true, ↓reduceIte]
+        exact ih bs hLen
+      · have hne : (a == b) = false := beq_false_of_ne hab
+        have hnatNe : a.toBitVec.toNat ≠ b.toBitVec.toNat := by
+          intro heq
+          apply hab
+          apply UInt8.eq_of_toBitVec_eq
+          exact BitVec.eq_of_toNat_eq heq
+        simp only [hne, Bool.false_eq_true, ↓reduceIte]
+        by_cases hlt : a.toBitVec.toNat < b.toBitVec.toNat
+        · have hblt1 : Nat.blt a.toNat b.toNat = true := Nat.blt_eq.mpr hlt
+          have hltU : a < b := UInt8.lt_iff_toBitVec_lt.mpr (BitVec.lt_def.mpr hlt)
+          have hcmp : compare a b = .lt := by
+            change compareOfLessAndEq a b = .lt
+            simp [compareOfLessAndEq, hltU]
+          simp [hblt1, hcmp]
+        · have hgt : b.toBitVec.toNat < a.toBitVec.toNat := by omega
+          have hblt1 : Nat.blt a.toNat b.toNat = false := by
+            cases h : Nat.blt a.toNat b.toNat with
+            | false => rfl
+            | true => exact absurd (Nat.blt_eq.mp h) hlt
+          have hblt2 : Nat.blt b.toNat a.toNat = true := Nat.blt_eq.mpr hgt
+          have hnotlt : ¬ a < b := fun h => hlt (BitVec.lt_def.mp (UInt8.lt_iff_toBitVec_lt.mp h))
+          have hcmp : compare a b = .gt := by
+            change compareOfLessAndEq a b = .gt
+            simp [compareOfLessAndEq, hnotlt, hab]
+          simp [hblt1, hblt2, hcmp]
+
+/-- Exact specification of vendored `Miri/Interpreter/Intrinsics.lean:239-273`
+`pointerOffsetFrom` arithmetic (64-bit `SubWithOverflow`, signed `Int64`
+distance, `overflow` + `isize::MIN = -2^63` guards, `Scalar.fromInt` bound on
+`elemSize`, and `exactDiv` with truncated signed division `Int.tdiv`/`Int.tmod`). -/
+def cmMiriPtrOffsetFromSpec (unsigned : Bool) (elemSize : Nat) (aOff bOff : UInt64) : Option Nat :=
+  let overflow := aOff.toNat < bOff.toNat
+  let distance : Int :=
+    if overflow then
+      let raw := (2 ^ 64 + aOff.toNat - bOff.toNat)
+      if raw ≥ 2 ^ 63 then Int.ofNat raw - 2 ^ 64 else Int.ofNat raw
+    else
+      let raw := aOff.toNat - bOff.toNat
+      if raw ≥ 2 ^ 63 then Int.ofNat raw - 2 ^ 64 else Int.ofNat raw
+  let minIsize : Int := -(2 ^ 63 : Int)
+  if overflow then
+    if unsigned || distance ≥ 0 || distance == minIsize then none
+    else if elemSize == 0 || elemSize ≥ 2 ^ 63 then none
+    else if Int.tmod distance (Int.ofNat elemSize) != 0 then none
+    else some ((2 ^ 64 + Int.tdiv distance (Int.ofNat elemSize)).toNat)
+  else if distance < 0 then none
+  else if elemSize == 0 || elemSize ≥ 2 ^ 63 then none
+  else if Int.tmod distance (Int.ofNat elemSize) != 0 then none
+  else some ((Int.tdiv distance (Int.ofNat elemSize)).toNat)
+
+/-- Direct invocation of unmodified vendored `Miri.Interpreter.IntegerOps.binary .SubWithOverflow`
+and `Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv` (`Intrinsics.lean:239-273`). -/
+def cmMiriPtrOffsetFromVendored (unsigned : Bool) (elemSize : Nat) (aOff bOff : UInt64) :
+    Option Nat :=
+  let uTy : Miri.Interpreter.IntegerType := ⟨Miri.ABI.Size.ofBytes 8, .usize⟩
+  let sTy : Miri.Interpreter.IntegerType := ⟨Miri.ABI.Size.ofBytes 8, .isize⟩
+  let retTy := if unsigned then uTy else sTy
+  match Miri.Interpreter.IntegerOps.binary .SubWithOverflow
+      ⟨Miri.Memory.ScalarInt.ofUInt64 aOff, uTy⟩
+      ⟨Miri.Memory.ScalarInt.ofUInt64 bOff, uTy⟩ with
+  | .ok (.withOverflow diffSc overflow) =>
+    match diffSc.toTargetIsize (Miri.ABI.Size.ofBytes 8) with
+    | .ok distI64 =>
+      let dist := distI64.toInt
+      let minIsize : Int := -(2 ^ 63 : Int)
+      let okRange : Bool :=
+        if overflow then !unsigned && !(dist ≥ 0 || dist == minIsize)
+        else !(dist < 0)
+      if !okRange then none
+      else
+        match Miri.Memory.ScalarInt.tryFromInt dist (Miri.ABI.Size.ofBytes 8),
+              Miri.Memory.ScalarInt.tryFromInt (Int.ofNat elemSize) (Miri.ABI.Size.ofBytes 8) with
+        | .ok (some aSc), .ok (some bSc) =>
+          match Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv ⟨aSc, retTy⟩ ⟨bSc, retTy⟩ with
+          | .ok qSc => some qSc.data.toNat
+          | .error _ => none
+        | _, _ => none
+    | .error _ => none
+  | _ => none
+
+/-- **Universal `ptr_offset_from` / `ptr_offset_from_unsigned` arithmetic equivalence**:
+for ALL signednesses `unsigned`, ALL element sizes `elemSize`, and ALL 64-bit
+offsets `aOff bOff : UInt64`, Trusted `evalPtrOffsetFromDistance 8` equals the
+exact `SubWithOverflow` / `isize::MIN` / `exactDiv` specification of vendored
+`Miri/Interpreter/Intrinsics.lean:239-273`. -/
+theorem cm_evalPtrOffsetFromDistance_eq_miriSpec (unsigned : Bool) (elemSize : Nat)
+    (aOff bOff : UInt64) :
+    (evalPtrOffsetFromDistance 8 unsigned elemSize aOff.toNat bOff.toNat).map (·.bits) =
+      cmMiriPtrOffsetFromSpec unsigned elemSize aOff bOff := by
+  have ha : aOff.toNat < 2 ^ 64 := aOff.toBitVec.isLt
+  have hb : bOff.toNat < 2 ^ 64 := bOff.toBitVec.isLt
+  have hMod : scalarModulus 8 = 2 ^ 64 := by decide
+  have hHalf : scalarModulus 8 / 2 - 1 = 2 ^ 63 - 1 := by decide
+  unfold evalPtrOffsetFromDistance cmMiriPtrOffsetFromSpec
+  simp only [Int.ofNat_eq_natCast]
+  change (match Bool.or (Nat.beq elemSize 0) (Bool.not (Nat.ble elemSize (2 ^ 63 - 1))) with
+    | true => none
+    | false =>
+      match Nat.ble bOff.toNat aOff.toNat with
+      | true =>
+        let dist := aOff.toNat - bOff.toNat
+        match Bool.and (Nat.ble dist (2 ^ 63 - 1)) (Nat.beq (dist % elemSize) 0) with
+        | true => some (ScalarInt.mk (dist / elemSize) 8)
+        | false => none
+      | false =>
+        match unsigned with
+        | true => none
+        | false =>
+          let negDist := bOff.toNat - aOff.toNat
+          match Bool.and (Nat.ble negDist (2 ^ 63 - 1)) (Nat.beq (negDist % elemSize) 0) with
+          | true => some (ScalarInt.mk (2 ^ 64 - negDist / elemSize) 8)
+          | false => none).map ScalarInt.bits = _
+  by_cases hlt : aOff.toNat < bOff.toNat
+  · have hble : Nat.ble bOff.toNat aOff.toNat = false := by
+      cases h : Nat.ble bOff.toNat aOff.toNat with
+      | false => rfl
+      | true => exact absurd (Nat.le_of_ble_eq_true h) (by omega)
+    simp only [hlt, ↓reduceIte, hble]
+    by_cases hBadElem : elemSize = 0 ∨ 2 ^ 63 ≤ elemSize
+    · have hElemCond : Bool.or (Nat.beq elemSize 0) (Bool.not (Nat.ble elemSize (2 ^ 63 - 1))) = true := by
+        rcases hBadElem with rfl | hge
+        · rfl
+        · have : Nat.ble elemSize (2 ^ 63 - 1) = false := by
+            cases h : Nat.ble elemSize (2 ^ 63 - 1) with
+            | false => rfl
+            | true => exact absurd (Nat.le_of_ble_eq_true h) (by omega)
+          simp [this]
+      have hElemOr : (elemSize == 0 || decide (elemSize ≥ 2 ^ 63)) = true := by
+        rcases hBadElem with rfl | hge
+        · rfl
+        · simp [hge]
+      simp [hElemCond, hElemOr]
+    · have hElemPos : 0 < elemSize := by omega
+      have hElemLe : elemSize ≤ 2 ^ 63 - 1 := by omega
+      have hElemCond : Bool.or (Nat.beq elemSize 0) (Bool.not (Nat.ble elemSize (2 ^ 63 - 1))) = false := by
+        have h1 : Nat.beq elemSize 0 = false := by
+          cases elemSize with | zero => omega | succ _ => rfl
+        have h2 : Nat.ble elemSize (2 ^ 63 - 1) = true := Nat.ble_eq.mpr hElemLe
+        simp [h1, h2]
+      have hElemOr : (elemSize == 0 || decide (elemSize ≥ 2 ^ 63)) = false := by
+        simp [show elemSize ≠ 0 by omega, show ¬ (elemSize ≥ 2 ^ 63) by omega]
+      simp only [hElemCond, hElemOr, Bool.false_eq_true, ↓reduceIte]
+      cases unsigned with
+      | true => simp
+      | false =>
+        simp only [Bool.false_or]
+        by_cases hRange : bOff.toNat - aOff.toNat ≤ 2 ^ 63 - 1
+        · have hRawGe : 2 ^ 64 + aOff.toNat - bOff.toNat ≥ 2 ^ 63 := by omega
+          have hDistEq : ((2 ^ 64 + aOff.toNat - bOff.toNat : Nat) : Int) - 2 ^ 64 =
+              -(((bOff.toNat - aOff.toNat : Nat) : Int)) := by omega
+          have hNotGe0 : ¬ (-(((bOff.toNat - aOff.toNat : Nat) : Int)) ≥ 0) := by omega
+          have hNotMin : (-(((bOff.toNat - aOff.toNat : Nat) : Int)) == -(2 ^ 63 : Int)) = false := by
+            exact beq_false_of_ne (by omega)
+          have hBleNeg : Nat.ble (bOff.toNat - aOff.toNat) (2 ^ 63 - 1) = true :=
+            Nat.ble_eq.mpr hRange
+          have hTmod : Int.tmod (-(((bOff.toNat - aOff.toNat : Nat) : Int))) (elemSize : Int) =
+              -((((bOff.toNat - aOff.toNat) % elemSize : Nat) : Int)) := by
+            rw [Int.neg_tmod]; rfl
+          have hTdiv : Int.tdiv (-(((bOff.toNat - aOff.toNat : Nat) : Int))) (elemSize : Int) =
+              -((((bOff.toNat - aOff.toNat) / elemSize : Nat) : Int)) := by
+            rw [Int.neg_tdiv]; rfl
+          simp only [hRawGe, ↓reduceIte, hDistEq, hNotGe0, hNotMin, decide_false, Bool.or_self,
+            hBleNeg, Bool.true_and, hTmod, hTdiv]
+          by_cases hRem : (bOff.toNat - aOff.toNat) % elemSize = 0
+          · have hBeq0 : Nat.beq ((bOff.toNat - aOff.toNat) % elemSize) 0 = true := by
+              rw [hRem]; rfl
+            have hTmod0 : (-((((bOff.toNat - aOff.toNat) % elemSize : Nat) : Int)) != 0) = false := by
+              rw [hRem]; rfl
+            simp only [hBeq0, hTmod0, Bool.false_eq_true, ↓reduceIte, Option.map_some]
+            have hqLe : (bOff.toNat - aOff.toNat) / elemSize ≤ 2 ^ 63 - 1 :=
+              Nat.le_trans (Nat.div_le_self _ _) hRange
+            congr 1; omega
+          · have hBeq0 : Nat.beq ((bOff.toNat - aOff.toNat) % elemSize) 0 = false := by
+              cases h : Nat.beq ((bOff.toNat - aOff.toNat) % elemSize) 0 with
+              | false => rfl
+              | true => exact absurd (Nat.eq_of_beq_eq_true h) hRem
+            have hTmodNe : (-((((bOff.toNat - aOff.toNat) % elemSize : Nat) : Int)) != 0) = true := by
+              have hEqF : (-((((bOff.toNat - aOff.toNat) % elemSize : Nat) : Int)) == 0) = false :=
+                beq_false_of_ne (by omega)
+              simp only [bne, hEqF, Bool.not_false]
+            simp only [hBeq0, hTmodNe, Bool.false_eq_true, ↓reduceIte, Option.map_none]
+        · have hBleNeg : Nat.ble (bOff.toNat - aOff.toNat) (2 ^ 63 - 1) = false := by
+            cases h : Nat.ble (bOff.toNat - aOff.toNat) (2 ^ 63 - 1) with
+            | false => rfl
+            | true => exact absurd (Nat.le_of_ble_eq_true h) hRange
+          simp only [hBleNeg, Bool.false_and, Option.map_none]
+          by_cases hEqHalf : bOff.toNat - aOff.toNat = 2 ^ 63
+          · have hRawGe : 2 ^ 64 + aOff.toNat - bOff.toNat ≥ 2 ^ 63 := by omega
+            have hMin : (((2 ^ 64 + aOff.toNat - bOff.toNat : Nat) : Int) - 2 ^ 64 == -(2 ^ 63 : Int)) = true := by
+              have : ((2 ^ 64 + aOff.toNat - bOff.toNat : Nat) : Int) - 2 ^ 64 = -(2 ^ 63 : Int) := by omega
+              rw [this]; rfl
+            simp only [hRawGe, hMin, Bool.or_true, ↓reduceIte]
+          · have hRawLt : ¬ (2 ^ 64 + aOff.toNat - bOff.toNat ≥ 2 ^ 63) := by omega
+            have hGe0 : ((2 ^ 64 + aOff.toNat - bOff.toNat : Nat) : Int) ≥ 0 := by omega
+            simp only [hRawLt, hGe0, decide_true, Bool.true_or, ↓reduceIte]
+  · have hle : bOff.toNat ≤ aOff.toNat := by omega
+    have hble : Nat.ble bOff.toNat aOff.toNat = true := Nat.ble_eq.mpr hle
+    simp only [hlt, ↓reduceIte, hble]
+    by_cases hBadElem : elemSize = 0 ∨ 2 ^ 63 ≤ elemSize
+    · have hElemCond : Bool.or (Nat.beq elemSize 0) (Bool.not (Nat.ble elemSize (2 ^ 63 - 1))) = true := by
+        rcases hBadElem with rfl | hge
+        · rfl
+        · have : Nat.ble elemSize (2 ^ 63 - 1) = false := by
+            cases h : Nat.ble elemSize (2 ^ 63 - 1) with
+            | false => rfl
+            | true => exact absurd (Nat.le_of_ble_eq_true h) (by omega)
+          simp [this]
+      have hElemOr : (elemSize == 0 || decide (elemSize ≥ 2 ^ 63)) = true := by
+        rcases hBadElem with rfl | hge
+        · rfl
+        · simp [hge]
+      simp [hElemCond, hElemOr]
+    · have hElemPos : 0 < elemSize := by omega
+      have hElemLe : elemSize ≤ 2 ^ 63 - 1 := by omega
+      have hElemCond : Bool.or (Nat.beq elemSize 0) (Bool.not (Nat.ble elemSize (2 ^ 63 - 1))) = false := by
+        have h1 : Nat.beq elemSize 0 = false := by
+          cases elemSize with | zero => omega | succ _ => rfl
+        have h2 : Nat.ble elemSize (2 ^ 63 - 1) = true := Nat.ble_eq.mpr hElemLe
+        simp [h1, h2]
+      have hElemOr : (elemSize == 0 || decide (elemSize ≥ 2 ^ 63)) = false := by
+        simp [show elemSize ≠ 0 by omega, show ¬ (elemSize ≥ 2 ^ 63) by omega]
+      simp only [hElemCond, hElemOr, Bool.false_eq_true, ↓reduceIte]
+      by_cases hRange : aOff.toNat - bOff.toNat ≤ 2 ^ 63 - 1
+      · have hRawLt : ¬ (aOff.toNat - bOff.toNat ≥ 2 ^ 63) := by omega
+        have hNotNeg : ¬ (((aOff.toNat - bOff.toNat : Nat) : Int) < 0) := by omega
+        have hBlePos : Nat.ble (aOff.toNat - bOff.toNat) (2 ^ 63 - 1) = true :=
+          Nat.ble_eq.mpr hRange
+        have hTmod : Int.tmod ((aOff.toNat - bOff.toNat : Nat) : Int) (elemSize : Int) =
+            (((aOff.toNat - bOff.toNat) % elemSize : Nat) : Int) := rfl
+        have hTdiv : Int.tdiv ((aOff.toNat - bOff.toNat : Nat) : Int) (elemSize : Int) =
+            (((aOff.toNat - bOff.toNat) / elemSize : Nat) : Int) := rfl
+        simp only [hRawLt, ↓reduceIte, hNotNeg, hBlePos, Bool.true_and, hTmod, hTdiv]
+        by_cases hRem : (aOff.toNat - bOff.toNat) % elemSize = 0
+        · have hBeq0 : Nat.beq ((aOff.toNat - bOff.toNat) % elemSize) 0 = true := by
+            rw [hRem]; rfl
+          have hTmod0 : ((((aOff.toNat - bOff.toNat) % elemSize : Nat) : Int) != 0) = false := by
+            rw [hRem]; rfl
+          simp only [hBeq0, hTmod0, Bool.false_eq_true, ↓reduceIte, Option.map_some, Int.toNat_natCast]
+        · have hBeq0 : Nat.beq ((aOff.toNat - bOff.toNat) % elemSize) 0 = false := by
+            cases h : Nat.beq ((aOff.toNat - bOff.toNat) % elemSize) 0 with
+            | false => rfl
+            | true => exact absurd (Nat.eq_of_beq_eq_true h) hRem
+          have hTmodNe : ((((aOff.toNat - bOff.toNat) % elemSize : Nat) : Int) != 0) = true := by
+            have hEqF : ((((aOff.toNat - bOff.toNat) % elemSize : Nat) : Int) == 0) = false :=
+              beq_false_of_ne (by omega)
+            simp only [bne, hEqF, Bool.not_false]
+          simp only [hBeq0, hTmodNe, Bool.false_eq_true, ↓reduceIte, Option.map_none]
+      · have hRawGe : aOff.toNat - bOff.toNat ≥ 2 ^ 63 := by omega
+        have hNeg : ((aOff.toNat - bOff.toNat : Nat) : Int) - 2 ^ 64 < 0 := by omega
+        have hBlePos : Nat.ble (aOff.toNat - bOff.toNat) (2 ^ 63 - 1) = false := by
+          cases h : Nat.ble (aOff.toNat - bOff.toNat) (2 ^ 63 - 1) with
+          | false => rfl
+          | true => exact absurd (Nat.le_of_ble_eq_true h) hRange
+        simp only [hRawGe, hNeg, hBlePos, Bool.false_and, ↓reduceIte, Option.map_none]
+
+/-- **Kernel-checked vendored `SubWithOverflow` + `exactDiv` edge-regime matrix**:
+verifies `cmMiriPtrOffsetFromVendored` (calling unmodified vendored
+`IntegerOps.binary .SubWithOverflow` and `IntegerArithmeticIntrinsic.exactDiv`)
+equals `evalPtrOffsetFromDistance 8` across positive, negative, zero, `isize::MIN`,
+positive overflow, unsigned underflow, ZST div-by-0, oversized `elemSize = 2^63`,
+and non-divisible distances. -/
+theorem cm_miri_ptrOffsetFrom_vendored_matrix :
+    cmMiriPtrOffsetFromVendored false 4 1036 1028 = some 2 ∧
+    cmMiriPtrOffsetFromVendored false 4 1028 1036 = some (2 ^ 64 - 2) ∧
+    cmMiriPtrOffsetFromVendored false 4 4096 4096 = some 0 ∧
+    cmMiriPtrOffsetFromVendored false 4 0 (UInt64.ofNat (2 ^ 63)) = none ∧
+    cmMiriPtrOffsetFromVendored false 4 (UInt64.ofNat (2 ^ 63)) 0 = none ∧
+    cmMiriPtrOffsetFromVendored true 4 1028 1036 = none ∧
+    cmMiriPtrOffsetFromVendored true 4 1040 1024 = some 4 ∧
+    cmMiriPtrOffsetFromVendored false 0 1024 1024 = none ∧
+    cmMiriPtrOffsetFromVendored false (2 ^ 63) 1024 1024 = none ∧
+    cmMiriPtrOffsetFromVendored false 4 1030 1024 = none ∧
+    cmMiriPtrOffsetFromVendored false 4 1024 1030 = none := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+private theorem cm_lm_bitwiseAndBits_testBit (k a b i : Nat) :
+    (bitwiseAndBits k a b).testBit i = (decide (i < k) && a.testBit i && b.testBit i) := by
+  induction k generalizing a b i with
+  | zero => simp [bitwiseAndBits]
+  | succ k ih =>
+    have hbit :
+        (match Bool.and (Nat.beq (Nat.mod a 2) 1) (Nat.beq (Nat.mod b 2) 1) with
+         | true => 1 | false => 0) = if (a.testBit 0 && b.testBit 0) then 1 else 0 := by
+      have ha : a % 2 = 0 ∨ a % 2 = 1 := by omega
+      have hb : b % 2 = 0 ∨ b % 2 = 1 := by omega
+      change (match Bool.and (Nat.beq (a % 2) 1) (Nat.beq (b % 2) 1) with
+         | true => 1 | false => 0) = if (a.testBit 0 && b.testBit 0) then 1 else 0
+      simp only [Nat.testBit_zero]
+      rcases ha with ha | ha <;> rcases hb with hb | hb <;> rw [ha, hb] <;> decide
+    have hUnfold : bitwiseAndBits (k + 1) a b =
+        (if (a.testBit 0 && b.testBit 0) then 1 else 0) + 2 * bitwiseAndBits k (a / 2) (b / 2) := by
+      change (match Bool.and (Nat.beq (Nat.mod a 2) 1) (Nat.beq (Nat.mod b 2) 1) with
+          | true => 1 | false => 0) + 2 * bitwiseAndBits k (a / 2) (b / 2) = _
+      rw [hbit]
+    rw [hUnfold]
+    cases i with
+    | zero =>
+      have h0l : ((if (a.testBit 0 && b.testBit 0) then 1 else 0) +
+          2 * bitwiseAndBits k (a / 2) (b / 2)).testBit 0 = (a.testBit 0 && b.testBit 0) := by
+        cases (a.testBit 0 && b.testBit 0) <;> simp [Nat.testBit_zero]
+      rw [h0l]; simp
+    | succ j =>
+      have hdiv : ((if (a.testBit 0 && b.testBit 0) then 1 else 0) +
+          2 * bitwiseAndBits k (a / 2) (b / 2)) / 2 = bitwiseAndBits k (a / 2) (b / 2) := by
+        cases a.testBit 0 && b.testBit 0 <;> simp <;> omega
+      rw [Nat.testBit_succ, hdiv, ih (a / 2) (b / 2) j, Nat.testBit_succ, Nat.testBit_succ]
+      simp [Nat.succ_lt_succ_iff]
+
+/-- **Universal `ptr_mask` bit-operator correspondence**: Trusted
+`bitwiseAndBits 64` equals unmodified vendored `UInt64.land` (`Intrinsics.lean:508`)
+for EVERY `a b : UInt64`. -/
+theorem cm_bitwiseAndBits_64_eq_u64_land (a b : UInt64) :
+    bitwiseAndBits 64 a.toNat b.toNat = (UInt64.land a b).toNat := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [cm_lm_bitwiseAndBits_testBit]
+  have hland : (UInt64.land a b).toNat = a.toNat &&& b.toNat := by
+    change (a.toBitVec &&& b.toBitVec).toNat = a.toBitVec.toNat &&& b.toBitVec.toNat
+    exact BitVec.toNat_and a.toBitVec b.toBitVec
+  rw [hland, Nat.testBit_and]
+  by_cases hi : i < 64
+  · simp [hi]
+  · have hge : 64 ≤ i := Nat.le_of_not_lt hi
+    have hlt : a.toNat < 2 ^ i := Nat.lt_of_lt_of_le a.toBitVec.isLt (Nat.pow_le_pow_right (by decide) hge)
+    simp [hi, Nat.testBit_lt_two_pow hlt]
+
+/-- **Universal `ptr_mask` `UInt64.land` base-address invariance** (`Intrinsics.lean:508`
+vs. Trusted symbolic `evalPtrMaskCall`): for EVERY `2^m`-aligned base address
+`baseAddr : UInt64`, relative offset `relOff : UInt64` with `baseAddr + relOff < 2^64`,
+and mask `mask : UInt64` satisfying `(2^64 - 1) - mask.toNat < 2^m`, vendored
+`UInt64.land (baseAddr + relOff) mask` equals `baseAddr + UInt64.land relOff mask`,
+so subtracting `baseAddr` yields Trusted's exact symbolic offset
+`bitwiseAndBits 64 relOff.toNat mask.toNat`. -/
+theorem cm_miri_ptrMask_u64_baseAddr_invariant (baseAddr relOff mask : UInt64) (m : Nat)
+    (hm : m ≤ 64) (hAlign : 2 ^ m ∣ baseAddr.toNat)
+    (hSum : baseAddr.toNat + relOff.toNat < 2 ^ 64)
+    (hInv : (2 ^ 64 - 1) - mask.toNat < 2 ^ m) :
+    UInt64.land (baseAddr + relOff) mask = baseAddr + UInt64.land relOff mask ∧
+    ((UInt64.land (baseAddr + relOff) mask) - baseAddr).toNat =
+      bitwiseAndBits 64 relOff.toNat mask.toNat := by
+  have h2mPos : 0 < 2 ^ m := Nat.pow_pos (by decide)
+  rcases hAlign with ⟨q, hBase⟩
+  have hAddNat : (baseAddr + relOff).toNat = baseAddr.toNat + relOff.toNat := by
+    rw [UInt64.toNat_add, Nat.mod_eq_of_lt hSum]
+  have hLandLe : (UInt64.land relOff mask).toNat ≤ relOff.toNat := by
+    have h1 : (UInt64.land relOff mask).toNat = relOff.toNat &&& mask.toNat := by
+      change (relOff.toBitVec &&& mask.toBitVec).toNat = relOff.toBitVec.toNat &&& mask.toBitVec.toNat
+      exact BitVec.toNat_and relOff.toBitVec mask.toBitVec
+    rw [h1]; exact Nat.and_le_left
+  have hMaskHigh : ∀ i, m ≤ i → i < 64 → mask.toNat.testBit i = true := by
+    intro i hmi hi64
+    have hMaskLt : mask.toNat < 2 ^ 64 := mask.toBitVec.isLt
+    have hmul : 2 ^ m * 2 ^ (64 - m) = 2 ^ 64 := by rw [← Nat.pow_add, Nat.add_sub_of_le hm]
+    have h1 : (2 ^ (64 - m) - 1) * 2 ^ m = 2 ^ 64 - 2 ^ m := by
+      rw [Nat.sub_mul, Nat.one_mul, Nat.mul_comm, hmul]
+    have h2 : 2 ^ (64 - m) * 2 ^ m = 2 ^ 64 := by rw [Nat.mul_comm, hmul]
+    have hPowPos : 0 < 2 ^ (64 - m) := Nat.pow_pos (by decide)
+    have hGe : (2 ^ (64 - m) - 1) * 2 ^ m ≤ mask.toNat := by omega
+    have hLt : mask.toNat < (2 ^ (64 - m) - 1 + 1) * 2 ^ m := by
+      rw [Nat.sub_add_cancel hPowPos]; omega
+    have hdiv : mask.toNat / 2 ^ m = 2 ^ (64 - m) - 1 := Nat.div_eq_of_lt_le hGe hLt
+    have hsub : i = (i - m) + m := by omega
+    rw [hsub, ← Nat.testBit_div_two_pow, hdiv, Nat.testBit_two_pow_sub_one]
+    exact decide_eq_true (by omega)
+  have hNatEq : (UInt64.land (baseAddr + relOff) mask).toNat =
+      baseAddr.toNat + (UInt64.land relOff mask).toNat := by
+    rw [← cm_bitwiseAndBits_64_eq_u64_land, ← cm_bitwiseAndBits_64_eq_u64_land, hAddNat]
+    have hSplit : ∀ x, x < 2 ^ 64 →
+        bitwiseAndBits 64 x mask.toNat =
+          2 ^ m * (x / 2 ^ m) + bitwiseAndBits m (x % 2 ^ m) (mask.toNat % 2 ^ m) := by
+      intro x hx
+      have hLowLt : bitwiseAndBits m (x % 2 ^ m) (mask.toNat % 2 ^ m) < 2 ^ m := by
+        have : ∀ k a b, bitwiseAndBits k a b < 2 ^ k := by
+          intro k; induction k with
+          | zero => intro a b; simp [bitwiseAndBits]
+          | succ k ih =>
+            intro a b
+            change (match Bool.and (Nat.beq (Nat.mod a 2) 1) (Nat.beq (Nat.mod b 2) 1) with
+                | true => 1 | false => 0) + 2 * bitwiseAndBits k (a / 2) (b / 2) < 2 ^ (k + 1)
+            have h1 : bitwiseAndBits k (a / 2) (b / 2) < 2 ^ k := ih (a / 2) (b / 2)
+            cases Bool.and (Nat.beq (Nat.mod a 2) 1) (Nat.beq (Nat.mod b 2) 1)
+            · change 0 + 2 * bitwiseAndBits k (a / 2) (b / 2) < 2 ^ (k + 1)
+              rw [Nat.pow_succ]; omega
+            · change 1 + 2 * bitwiseAndBits k (a / 2) (b / 2) < 2 ^ (k + 1)
+              rw [Nat.pow_succ]; omega
+        exact this m _ _
+      apply Nat.eq_of_testBit_eq
+      intro i
+      rw [cm_lm_bitwiseAndBits_testBit, Nat.testBit_two_pow_mul_add _ hLowLt]
+      by_cases him : i < m
+      · have hi64 : i < 64 := Nat.lt_of_lt_of_le him hm
+        simp only [him, ↓reduceIte, cm_lm_bitwiseAndBits_testBit, Nat.testBit_mod_two_pow, hi64,
+          decide_true, Bool.true_and]
+      · simp only [him, ↓reduceIte]
+        have hmi : m ≤ i := Nat.le_of_not_lt him
+        have hSubDiv : (x / 2 ^ m).testBit (i - m) = x.testBit i := by
+          rw [Nat.testBit_div_two_pow, Nat.sub_add_cancel hmi]
+        rw [hSubDiv]
+        by_cases hi64 : i < 64
+        · simp [hi64, hMaskHigh i hmi hi64]
+        · have hlt : x < 2 ^ i := Nat.lt_of_lt_of_le hx (Nat.pow_le_pow_right (by decide) (Nat.le_of_not_lt hi64))
+          simp [hi64, Nat.testBit_lt_two_pow hlt]
+    rw [hBase] at hSum ⊢
+    rw [hSplit (2 ^ m * q + relOff.toNat) hSum, hSplit relOff.toNat (by omega)]
+    rw [Nat.mul_add_div h2mPos, Nat.mul_add_mod, Nat.mul_add, Nat.add_assoc]
+  have hEq : UInt64.land (baseAddr + relOff) mask = baseAddr + UInt64.land relOff mask := by
+    apply UInt64.eq_of_toBitVec_eq; apply BitVec.eq_of_toNat_eq
+    change (UInt64.land (baseAddr + relOff) mask).toNat = (baseAddr + UInt64.land relOff mask).toNat
+    rw [hNatEq, UInt64.toNat_add, Nat.mod_eq_of_lt (by omega)]
+  refine ⟨hEq, ?_⟩
+  rw [hEq, cm_bitwiseAndBits_64_eq_u64_land]
+  have hSub : baseAddr + UInt64.land relOff mask - baseAddr = UInt64.land relOff mask := by
+    apply UInt64.eq_of_toBitVec_eq; apply BitVec.eq_of_toNat_eq
+    change (baseAddr + UInt64.land relOff mask - baseAddr).toNat = (UInt64.land relOff mask).toNat
+    rw [UInt64.toNat_sub_of_le]
+    · rw [UInt64.toNat_add, Nat.mod_eq_of_lt (by omega), Nat.add_sub_cancel_left]
+    · rw [UInt64.le_iff_toNat_le, UInt64.toNat_add, Nat.mod_eq_of_lt (by omega)]; omega
+  rw [hSub]
+
+private def cmLiftRes {S A : Type} (r : Except Miri.Interpreter.StepError A) :
+    Miri.Interpreter.RvalueM S A :=
+  match r with | .ok v => pure v | .error e => throw e
+
+private def cmMirrorScalar {P S C V : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.IntrinsicHooks P S C V) (choice : C) (value : Miri.Interpreter.OpTy P) :
+    Miri.Interpreter.RvalueM S (Miri.Memory.Scalar P) := do
+  let immediate ← h.readImmediate choice value
+  cmLiftRes (immediate.imm.toScalar |>.mapError Miri.Interpreter.ScalarOps.immediateError)
+
+private def cmMirrorPointer {P S C V : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.IntrinsicHooks P S C V) (choice : C) (value : Miri.Interpreter.OpTy P) :
+    Miri.Interpreter.RvalueM S (Miri.Memory.Pointer (Option P)) := do
+  let sc ← cmMirrorScalar h choice value
+  cmLiftRes (sc.toPointer h.target |>.mapError Miri.Interpreter.ScalarOps.scalarError)
+
+private def cmMirrorUsize {P S C V : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.IntrinsicHooks P S C V) (choice : C) (value : Miri.Interpreter.OpTy P) :
+    Miri.Interpreter.RvalueM S UInt64 := do
+  let sc ← cmMirrorScalar h choice value
+  cmLiftRes (sc.toTargetUsize (Miri.ABI.Size.fromBits h.target.pointerWidth.bits)
+    |>.mapError Miri.Interpreter.ScalarOps.scalarError)
+
+/-- **Universal vendored `Miri.Interpreter.Intrinsics.eval` step-simulation for `ptr_mask`**
+(`Intrinsics.lean:504-508`): for EVERY `ld`, `ly`, `tb`, `tyArg`, concrete pointer
+scalar `ptrSc` decoding to `ptr` (with arbitrary provenance `ptr.provenance` and
+address `ptr.offset`), `mask : UInt64`, destination `dest`, successor `ret`, and
+state `st`, calling unmodified vendored `Intrinsics.eval ... "ptr_mask"` preserves
+`ptr.provenance` identically and writes
+`{ ptr with offset := Size.ofBytes (UInt64.land ptr.offset.bytes mask) }` via
+`annealWritePointer` followed by `annealReturnToBlock ret`. -/
+theorem cm_miri_ptrMask_eval_universal (ld : List LocalDecl) (ly : LayoutTable) (tb : Bool)
+    (tyArg : Miri.MIR.TyId) (ptrSc : Miri.Memory.Scalar AnnealProv)
+    (ptr : Miri.Memory.Pointer (Option AnnealProv)) (mask : UInt64)
+    (ptrLay maskLay : Miri.Interpreter.LocalLayout)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv) (ret : Option Miri.MIR.BasicBlockId)
+    (st : AnnealStepState)
+    (hToPtr : ptrSc.toPointer annealTargetDataLayout = .ok ptr) :
+    Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly tb tyArg) () "ptr_mask" #[]
+      #[⟨.immediate (.scalar ptrSc), ptrLay⟩,
+        ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 mask))), maskLay⟩] dest ret st =
+      ((do
+          annealWritePointer { ptr with offset := Miri.ABI.Size.ofBytes (UInt64.land ptr.offset.bytes mask) } dest
+          annealReturnToBlock ret
+          pure true) : LmM Bool) st := by
+  have hMask : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) (.ofUInt64 mask)).toTargetUsize
+      (Miri.ABI.Size.fromBits annealTargetDataLayout.pointerWidth.bits) = .ok mask := by
+    have hMaskLt : mask.toNat < 2 ^ 64 := mask.toBitVec.isLt
+    have hNotGt : ¬ (mask.toNat > 18446744073709551615) := by omega
+    have hBitsEq : (BitVec.ofNat 128 mask.toNat).toNat = mask.toNat := by
+      rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega)]
+    have hOfNat : UInt64.ofNat mask.toNat = mask := by
+      apply UInt64.eq_of_toBitVec_eq; apply BitVec.eq_of_toNat_eq
+      change mask.toNat % 2 ^ 64 = mask.toNat
+      exact Nat.mod_eq_of_lt hMaskLt
+    change (if (BitVec.ofNat 128 mask.toNat).toNat > 18446744073709551615 then
+        Except.error (Miri.Memory.ScalarError.integerConversionOverflow (BitVec.ofNat 128 mask.toNat))
+      else Except.ok (UInt64.ofNat (BitVec.ofNat 128 mask.toNat).toNat)) = Except.ok mask
+    rw [hBitsEq, hOfNat]
+    simp only [hNotGt, ↓reduceIte]
+  have hNA : ("ptr_mask".startsWith "atomic_") = false := by simp
+  have hNS : ("ptr_mask".startsWith "simd_") = false := by simp
+  have hEval :
+      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly tb tyArg) () "ptr_mask" #[]
+        #[⟨.immediate (.scalar ptrSc), ptrLay⟩,
+          ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 mask))), maskLay⟩] dest ret =
+      ((do
+          let p ← cmMirrorPointer (cmIntrinsicHooks ld ly tb tyArg) ()
+            ⟨.immediate (.scalar ptrSc), ptrLay⟩
+          let m ← cmMirrorUsize (cmIntrinsicHooks ld ly tb tyArg) ()
+            ⟨.immediate (.scalar (.fromScalarInt (.ofUInt64 mask))), maskLay⟩
+          annealWritePointer { p with offset := Miri.ABI.Size.ofBytes (UInt64.land p.offset.bytes m) } dest
+          annealReturnToBlock ret
+          pure true) : LmM Bool) := by
+    unfold Miri.Interpreter.Intrinsics.eval
+    simp only [hNA, hNS, Bool.false_eq_true, ↓reduceIte]
+    rfl
+  rw [hEval]
+  simp only [cmMirrorPointer, cmMirrorUsize, cmMirrorScalar, cmLiftRes, cmIntrinsicHooks,
+    annealIntrinsicHooks, annealReadImmediate, Miri.Interpreter.Immediate.toScalar,
+    hToPtr, hMask, Except.mapError, bind, EStateM.bind, pure, EStateM.pure]
+
+/-- **Universal vendored `Miri.Interpreter.Intrinsics.eval` step-simulation for `black_box`**
+(`Intrinsics.lean:441`):
+1. For EVERY valid immediate scalar/pointer `sc` (`!lay.layout.uninhabited` and
+   `annealValidateScalarForTyId lay.ty sc = true`), `Intrinsics.eval ... "black_box"`
+   preserves `sc` identically into `dest` (`tb = false`) and transitions to `ret`.
+2. For EVERY invalid immediate scalar `sc` (`annealValidateScalarForTyId lay.ty sc = false`,
+   e.g. `bool = 2`, surrogate `char`, null `&T`, null `fn()`, `!`),
+   `Intrinsics.eval ... "black_box"` deterministically faults `.undefinedBehavior`. -/
+theorem cm_miri_blackBox_eval_universal (ld : List LocalDecl) (ly : LayoutTable)
+    (tyArg : Miri.MIR.TyId) (sc : Miri.Memory.Scalar AnnealProv)
+    (srcLay : Miri.Interpreter.LocalLayout) (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (ret : Option Miri.MIR.BasicBlockId) (st : AnnealStepState)
+    (hInh : srcLay.layout.uninhabited = false) :
+    (annealValidateScalarForTyId srcLay.ty sc = true →
+      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly false tyArg) () "black_box" #[]
+        #[⟨.immediate (.scalar sc), srcLay⟩] dest ret st =
+      ((do annealWriteImmediate (.scalar sc) dest; annealReturnToBlock ret; pure true) : LmM Bool) st) ∧
+    (annealValidateScalarForTyId srcLay.ty sc = false →
+      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly false tyArg) () "black_box" #[]
+        #[⟨.immediate (.scalar sc), srcLay⟩] dest ret st =
+      .error (.undefinedBehavior "copyOp of invalid scalar value") st) := by
+  have hNA : ("black_box".startsWith "atomic_") = false := by simp
+  have hNS : ("black_box".startsWith "simd_") = false := by simp
+  have hEval :
+      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly false tyArg) () "black_box" #[]
+        #[⟨.immediate (.scalar sc), srcLay⟩] dest ret =
+      ((do cmCopyOp false ⟨.immediate (.scalar sc), srcLay⟩ dest; annealReturnToBlock ret; pure true) : LmM Bool) := by
+    unfold Miri.Interpreter.Intrinsics.eval
+    simp only [hNA, hNS, Bool.false_eq_true, ↓reduceIte]
+    rfl
+  constructor
+  · intro hVal
+    rw [hEval]
+    simp [cmCopyOp, hInh, annealReadImmediate, hVal, bind, EStateM.bind, pure, EStateM.pure]
+  · intro hInval
+    rw [hEval]
+    simp [cmCopyOp, hInh, annealReadImmediate, hInval, bind, EStateM.bind, pure, EStateM.pure,
+      throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+
+/-- **Universal vendored `Miri.Interpreter.Intrinsics.rawEq` step-simulation**
+(`Intrinsics.lean:188-197`): for ANY hooks `h`, whenever pointee layout is sized,
+both pointers align, and `readBytesStripProvenance` yields byte arrays `lBytes`
+and `rBytes`, `Intrinsics.rawEq` returns `lBytes == rBytes`. -/
+theorem cm_miri_rawEq_eval_universal {P S C V : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.IntrinsicHooks P S C V) (choice : C)
+    (leftOp rightOp : Miri.Interpreter.OpTy P) (st0 st1 st2 st3 st4 st5 st6 st7 st8 : S)
+    (ptTy : Miri.MIR.TyId) (ptLay : Miri.ABI.TyAndLayout Miri.MIR.TyId)
+    (lImm rImm : Miri.Interpreter.RvalueImmTy P)
+    (lSc rSc : Miri.Memory.Scalar P) (lPtr rPtr : Miri.Memory.Pointer (Option P))
+    (lBytes rBytes : Array UInt8)
+    (hPt : h.pointeeType choice leftOp.layout.ty st0 = .ok ptTy st1)
+    (hLay : h.layoutOf choice ptTy st1 = .ok ptLay st2)
+    (hSized : ptLay.layout.isSized = true)
+    (hRdL : h.readImmediate choice leftOp st2 = .ok lImm st3)
+    (hScL : lImm.imm.toScalar = .ok lSc)
+    (hPtrL : lSc.toPointer h.target = .ok lPtr)
+    (hAlL : h.checkAlign choice lPtr ptLay.layout.align.abi st3 = .ok () st4)
+    (hBytesL : h.readBytesStripProvenance choice lPtr ptLay.layout.size st4 = .ok lBytes st5)
+    (hRdR : h.readImmediate choice rightOp st5 = .ok rImm st6)
+    (hScR : rImm.imm.toScalar = .ok rSc)
+    (hPtrR : rSc.toPointer h.target = .ok rPtr)
+    (hAlR : h.checkAlign choice rPtr ptLay.layout.align.abi st6 = .ok () st7)
+    (hBytesR : h.readBytesStripProvenance choice rPtr ptLay.layout.size st7 = .ok rBytes st8) :
+    Miri.Interpreter.Intrinsics.rawEq h choice leftOp rightOp st0 = .ok (lBytes == rBytes) st8 := by
+  have hRaw :
+      Miri.Interpreter.Intrinsics.rawEq h choice leftOp rightOp =
+      (do
+        let layout ← h.layoutOf choice (← h.pointeeType choice leftOp.layout.ty)
+        if !layout.layout.isSized then throw (.invalidProgram "raw_eq requires sized pointee")
+        let read := fun (op : Miri.Interpreter.OpTy P) => do
+          let ptr ← cmMirrorPointer h choice op
+          h.checkAlign choice ptr layout.layout.align.abi
+          h.readBytesStripProvenance choice ptr layout.layout.size
+        let left ← read leftOp
+        let right ← read rightOp
+        pure (left == right)) := rfl
+  rw [hRaw]
+  simp only [cmMirrorPointer, cmMirrorScalar, cmLiftRes, bind, EStateM.bind, pure, EStateM.pure,
+    hPt, hLay, hSized, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hRdL, hScL, hPtrL, hAlL,
+    hBytesL, hRdR, hScR, hPtrR, hAlR, hBytesR, Except.mapError]
 
 /-! ## §3. LeanMiri Observations, States, and the Corpus Observation (`cmLmObserve`) -/
 
@@ -698,10 +1397,12 @@ def cmStd (c : CapturedMir) (args : List (Option (Miri.Memory.Scalar AnnealProv)
   cmMkState c retTy locs.toArray (cmGlobalsMach c)
 
 /-- Two-node vendored Tree Borrows tree over the 4 bytes of a `u32`: root
-`retagParentTag` with an accessed child `retagChildTag`. -/
-def cmU32ChildTree : Miri.TreeBorrows.BorrowTree :=
-  { hooksTwoNodeTree .unique with
-    locations := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 4) (hooksLocTree .unique) }
+`retagParentTag` with an accessed child `retagChildTag` carrying `perm`. -/
+def cmU32ChildTreeWith (perm : TreeBorrowPerm) : Miri.TreeBorrows.BorrowTree :=
+  { hooksTwoNodeTree perm with
+    locations := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 4) (hooksLocTree perm) }
+
+def cmU32ChildTree : Miri.TreeBorrows.BorrowTree := cmU32ChildTreeWith .unique
 
 /-- State of `cmCopyModeMir`: `_3 = 11u32` is memory-backed at allocation `1`
 (base `256`) carrying `cmU32ChildTree`; the destination `_2` points at it with
@@ -724,6 +1425,31 @@ def cmCopyModeState : AnnealStepState :=
     ⟨⟨Miri.ABI.Size.ofBytes 256, some (.concrete a1 retagParentTag)⟩, .none, none⟩
   cmMkState cmCopyModeMir u32MirTy
     #[cmUninitLoc u32MirTy, cmScLoc (cmGP 100 0) rawConstU32MirTy,
+      cmScLoc (cmPtrSc a1 256 retagParentTag) rawMutU32MirTy,
+      ⟨.live (.indirect mp), some (translateTyOverlay u32MirTy)⟩, cmUninitLoc unitMirTy] mach
+
+/-- State of `cmSwapModeMir`: `_1` points to global `100 = 7u32` and `_2` points
+(via root tag `retagParentTag`) to memory-backed `_3 = 9u32` at allocation `1`
+carrying a strongly protected `.frozen` child `retagChildTag`. Under `tb = true`,
+`typedSwap`'s read of `_2` (`memCopy`) is allowed on `.frozen`, and step 4's
+write to `_2` (`cmCopyOp` Tree Borrows write) deterministically faults `.ub`. -/
+def cmSwapModeState : AnnealStepState :=
+  let a1 : Miri.Memory.AllocId := cmAid 1
+  let yAlloc :=
+    match Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[9, 0, 0, 0] ⟨2⟩ .Mut with
+    | .ok al => al.withExtra (some (cmU32ChildTreeWith .frozen))
+    | .error _ => cmEmptyAlloc
+  let mach : AnnealMachine :=
+    { memory := { AnnealMachine.empty.memory with
+        live := #[(cmA100, ⟨.stack, cmAlloc (cmU32Bytes 7) 2⟩), (a1, ⟨.stack, yAlloc⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨cmA100, 1024⟩, ⟨a1, 256⟩] },
+      borrowTracker := some
+        { global := { protectedTags := (hooksForChildProtected true).protectedTags },
+          retagMode := .Default } }
+  let mp : Miri.Interpreter.MemPlace AnnealProv :=
+    ⟨⟨Miri.ABI.Size.ofBytes 256, some (.concrete a1 retagParentTag)⟩, .none, none⟩
+  cmMkState cmSwapModeMir u32MirTy
+    #[cmUninitLoc u32MirTy, cmScLoc (cmGP 100 0) rawMutU32MirTy,
       cmScLoc (cmPtrSc a1 256 retagParentTag) rawMutU32MirTy,
       ⟨.live (.indirect mp), some (translateTyOverlay u32MirTy)⟩, cmUninitLoc unitMirTy] mach
 
@@ -755,9 +1481,9 @@ def cmLmObserve (tb : Bool) (variantIdx caseIdx : Nat) : CmLmObs :=
   | 2, 2 => cmRunLm cmRawEqU32Mir tb (cmStd cmRawEqU32Mir [some (cmGP 103 0), some (cmGP 102 0)])
   | 2, 3 => cmRunLm cmRawEqZstMir tb (cmStd cmRawEqZstMir [some (cmIntSc 4096), some (cmIntSc 4096)])
   | 3, 0 => cmRunLm cmSwapReadXMir tb (cmStd cmSwapReadXMir [some (cmGP 100 0), some (cmGP 101 0)])
-  | 3, 1 => cmRunLm cmSwapReadYMir tb (cmStd cmSwapReadYMir [some (cmGP 100 0), some (cmGP 101 0)])
+  | 3, 1 => cmRunLm cmSwapSameAllocMir tb (cmStd cmSwapSameAllocMir [some (cmGP 100 0), some (cmGP 100 4)])
   | 3, 2 => cmRunLm cmSwapReadXMir tb (cmStd cmSwapReadXMir [some (cmIntSc 0), some (cmGP 101 0)])
-  | 3, 3 => cmRunLm cmSwapSameAllocMir tb (cmStd cmSwapSameAllocMir [some (cmGP 100 0), some (cmGP 100 4)])
+  | 3, 3 => cmRunLm cmSwapModeMir tb cmSwapModeState
   | 4, 0 => cmRunLm cmPofMir tb (cmStd cmPofMir [some (cmGP 100 12), some (cmGP 100 4)])
   | 4, 1 => cmRunLm cmPofMir tb (cmStd cmPofMir [some (cmGP 100 4), some (cmGP 100 12)])
   | 4, 2 => cmRunLm cmPofMir tb (cmStd cmPofMir [some (cmGP 100 4), some (cmGP 101 12)])
@@ -791,9 +1517,9 @@ def cmLmExpected (tb : Bool) : Nat → Nat → CmLmObs
   | 2, 2 => .ub
   | 2, 3 => .scalar 1 1
   | 3, 0 => .scalar 9 4
-  | 3, 1 => .scalar 7 4
+  | 3, 1 => .scalar 6 4
   | 3, 2 => .ub
-  | 3, 3 => .scalar 6 4
+  | 3, 3 => if tb then .ub else .scalar 9 4
   | 4, 0 => .scalar 2 8
   | 4, 1 => .scalar (2 ^ 64 - 2) 8
   | 4, 2 => .ub
@@ -831,39 +1557,77 @@ theorem cmLmObserve_table (tb : Bool) (v c : Nat) (hv : v < 8) (hc : c < 4) :
 
 /-- Mode sensitivity certified directly on `cmLmObserve`: `copy.modeCase` (the
 destination's borrow tree has a strongly protected child) returns `42` with
-`treeBorrows = false` and faults `.ub` with `treeBorrows = true` (vendored Tree
-Borrows foreign write to a protected tag). -/
+`treeBorrows = false` and faults `.ub` with `treeBorrows = true`, and
+`typedSwap.modeCase` (strongly protected `.frozen` child on `y`) returns `9`
+with `treeBorrows = false` and faults `.ub` with `treeBorrows = true`. -/
 theorem cmLmObserve_copy_mode_sensitivity :
     cmLmObserve false 0 3 = .scalar 42 4 ∧ cmLmObserve true 0 3 = .ub :=
   ⟨by decide +kernel, by decide +kernel⟩
 
+theorem cmLmObserve_typedSwap_mode_sensitivity :
+    cmLmObserve false 3 3 = .scalar 9 4 ∧ cmLmObserve true 3 3 = .ub :=
+  ⟨by decide +kernel, by decide +kernel⟩
+
+/-- **Hardened vendored hook witnesses** (exercising alignment in `cmDerefPointer`,
+typed validity in `cmCopyOp`, overlap UB in `typedSwap`, TB read-then-write
+`.unique -> .frozen` UB with ZERO protectors in `copy`, and ZST / `isize::MIN` UB
+in `ptr_offset_from`):
+1. `typed_swap_nonoverlapping::<u32>` on misaligned `&G[2]` -> `.ub`;
+2. `typed_swap_nonoverlapping::<u32>` on overlapping `&G[0]`, `&G[2]` -> `.ub`;
+3. `typed_swap_nonoverlapping::<bool>` on invalid `bool = 2` -> `.ub`;
+4. `black_box::<bool>(2)` -> `.ub`;
+5. `black_box::<&u32>(null)` -> `.ub`;
+6. `copy::<u32>` with NO protectors where `src` (`retagParentTag`) reads and
+   freezes child `dst` (`retagChildTag`, `.unique -> .frozen`) before writing
+   `dst`: returns `11` in `tb = false` and faults `.ub` in `tb = true`;
+7. `ptr_offset_from::<()>` (ZST) -> `.ub`;
+8. `ptr_offset_from::<u32>(0, 2^63)` (`isize::MIN`) -> `.ub`. -/
+theorem cmLm_hardened_hooks_witness :
+    let swapBoolMir :=
+      cmCallBody "cm::lm_swap_bool"
+        [mkDecl boolMirTy, mkDecl { kind := .rawPtr .mut .bool, layoutIdx := 0 },
+         mkDecl { kind := .rawPtr .mut .bool, layoutIdx := 0 }, mkDecl unitMirTy] 2
+        (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.bool])
+        [.copy (locPlace 1), .copy (locPlace 2)] 3
+        [mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref]))))]
+        [cmGlobal 100 [some 2] 1, cmGlobal 101 [some 1] 1]
+    let bbRefMir :=
+      cmCallBody "cm::lm_bb_ref" [mkDecl cmRefU32Ty, mkDecl cmRefU32Ty] 1
+        (cmIntrinsicOp "core::intrinsics::black_box" [.ref .not (.uint .u32)])
+        [.copy (locPlace 1)] 0 [] []
+    let pofZstMir :=
+      cmCallBody "cm::lm_pof_zst"
+        [mkDecl cmIsizeTy, mkDecl { kind := .rawPtr .not (.tuple []), layoutIdx := 0 },
+         mkDecl { kind := .rawPtr .not (.tuple []), layoutIdx := 0 }] 2
+        (cmIntrinsicOp "core::intrinsics::ptr_offset_from" [.tuple []])
+        [.copy (locPlace 1), .copy (locPlace 2)] 0 [] []
+    let a1 : Miri.Memory.AllocId := cmAid 1
+    let rwAlloc :=
+      match Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[11, 0, 0, 0] ⟨2⟩ .Mut with
+      | .ok al => al.withExtra (some cmU32ChildTree)
+      | .error _ => cmEmptyAlloc
+    let rwMach : AnnealMachine :=
+      { memory := { AnnealMachine.empty.memory with live := #[(a1, ⟨.stack, rwAlloc⟩)] },
+        addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨a1, 256⟩] },
+        borrowTracker := some { global := { protectedTags := {} }, retagMode := .Default } }
+    let rwMp : Miri.Interpreter.MemPlace AnnealProv :=
+      ⟨⟨Miri.ABI.Size.ofBytes 256, some (.concrete a1 retagParentTag)⟩, .none, none⟩
+    let rwState := cmMkState cmCopyModeMir u32MirTy
+      #[cmUninitLoc u32MirTy, cmScLoc (cmPtrSc a1 256 retagParentTag) rawConstU32MirTy,
+        cmScLoc (cmPtrSc a1 256 retagChildTag) rawMutU32MirTy,
+        ⟨.live (.indirect rwMp), some (translateTyOverlay u32MirTy)⟩, cmUninitLoc unitMirTy] rwMach
+    cmRunLm cmSwapSameAllocMir false (cmStd cmSwapSameAllocMir [some (cmGP 100 2), some (cmGP 100 4)]) = .ub ∧
+    cmRunLm cmSwapSameAllocMir false (cmStd cmSwapSameAllocMir [some (cmGP 100 0), some (cmGP 100 2)]) = .ub ∧
+    cmRunLm swapBoolMir false (cmStd swapBoolMir [some (cmGP 100 0), some (cmGP 101 0)]) = .ub ∧
+    cmRunLm cmBlackBoxBoolMir false (cmStd cmBlackBoxBoolMir [some (cmIntSc 2 1)]) = .ub ∧
+    cmRunLm bbRefMir false (cmStd bbRefMir [some (cmIntSc 0 8)]) = .ub ∧
+    cmRunLm cmCopyModeMir false rwState = .scalar 11 4 ∧
+    cmRunLm cmCopyModeMir true rwState = .ub ∧
+    cmRunLm pofZstMir false (cmStd pofZstMir [some (cmIntSc 4096), some (cmIntSc 4096)]) = .ub ∧
+    cmRunLm cmPofMir false (cmStd cmPofMir [some (cmIntSc 0), some (cmIntSc (2 ^ 63))]) = .ub := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
 /-! ## §4. Deliberate Library-UB Deltas vs. `lean-miri` (and the `copy` Agreement) -/
-
-/-- `compare_bytes(_1, _2, 0)`. -/
-def cmCmpBytes0Mir : CapturedMir :=
-  cmCallBody "cm::compare_bytes_0"
-    [mkDecl i32MirTy, mkDecl cmRawConstU8Ty, mkDecl cmRawConstU8Ty] 2
-    (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
-    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 0] 0 [] []
-
-/-- `typed_swap_nonoverlapping::<()>(_1, _2); _0 = 7u32`. -/
-def cmSwapZstMir : CapturedMir :=
-  cmCallBody "cm::typed_swap_zst"
-    [mkDecl u32MirTy, mkDecl { kind := .rawPtr .mut (.tuple []), layoutIdx := 0 },
-     mkDecl { kind := .rawPtr .mut (.tuple []), layoutIdx := 0 }, mkDecl unitMirTy] 2
-    (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.tuple []])
-    [.copy (locPlace 1), .copy (locPlace 2)] 3
-    [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨7, 4⟩) })))]
-    []
-
-/-- `copy::<u32>(_1, _2, 0); _0 = 7u32`. -/
-def cmCopy0Mir : CapturedMir :=
-  cmCallBody "cm::copy_0"
-    [mkDecl u32MirTy, mkDecl rawConstU32MirTy, mkDecl rawMutU32MirTy, mkDecl unitMirTy] 2
-    (cmIntrinsicOp "core::intrinsics::copy" [.uint .u32])
-    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 0] 3
-    [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨7, 4⟩) })))]
-    []
 
 /-- A bounded Trusted run of `stepMirFn` observed as a `CmLmObs`. -/
 def cmTrustedStepLm (body : CapturedMir) : (Option MachineState) → CmLmObs ⊕ MachineState

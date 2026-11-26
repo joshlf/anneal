@@ -81,6 +81,12 @@ def copy08 : CapturedMir :=
   body08 "cm::copy_u32" [ty (.uint .u32), ty (.rawPtr .not (.uint .u32)), ty (.rawPtr .mut (.uint .u32)),
     ty (.tuple [])] 2 "core::intrinsics::copy" [.uint .u32] [.copy (loc 1), .copy (loc 2), usz 1] 3
     [readDeref 2] [glob 100 [some 42, some 0, some 0, some 0], glob 101 [some 1, some 2, some 3, some 4]]
+def copyMode08 : CapturedMir :=
+  body08 "cm::copy_mode" [ty (.uint .u32), ty (.rawPtr .not (.uint .u32)), ty (.rawPtr .mut (.uint .u32)),
+    ty (.uint .u32), ty (.tuple [])] 2 "core::intrinsics::copy" [.uint .u32]
+    [.copy (loc 1), .copy (loc 2), usz 1] 4
+    [{ kind := .assign (loc 0) (.use (.copy (loc 3))), span := "ep2.rs:1:1" }]
+    [glob 100 [some 42, some 0, some 0, some 0]]
 def cmp08 : CapturedMir :=
   body08 "cm::compare_bytes_3" [ty (.int .i32), ty (.rawPtr .not (.uint .u8)), ty (.rawPtr .not (.uint .u8))] 2
     "core::intrinsics::compare_bytes" [] [.copy (loc 1), .copy (loc 2), usz 3] 0 []
@@ -94,6 +100,10 @@ def swap08 : CapturedMir :=
   body08 "cm::typed_swap_read_x" [ty (.uint .u32), ty (.rawPtr .mut (.uint .u32)), ty (.rawPtr .mut (.uint .u32)),
     ty (.tuple [])] 2 "core::intrinsics::typed_swap_nonoverlapping" [.uint .u32] [.copy (loc 1), .copy (loc 2)] 3
     [readDeref 1] [glob 100 [some 7, some 0, some 0, some 0], glob 101 [some 9, some 0, some 0, some 0]]
+def swapMode08 : CapturedMir :=
+  body08 "cm::typed_swap_mode" [ty (.uint .u32), ty (.rawPtr .mut (.uint .u32)), ty (.rawPtr .mut (.uint .u32)),
+    ty (.uint .u32), ty (.tuple [])] 2 "core::intrinsics::typed_swap_nonoverlapping" [.uint .u32]
+    [.copy (loc 1), .copy (loc 2)] 4 [readDeref 1] [glob 100 [some 7, some 0, some 0, some 0]]
 def pof08 (unsigned : Bool) : CapturedMir :=
   body08 "cm::pof" [ty (if unsigned then .uint .usize else .int .isize), ty (.rawPtr .not (.uint .u32)),
     ty (.rawPtr .not (.uint .u32))] 2
@@ -112,6 +122,25 @@ def init08 (body : CapturedMir) (args : List Value) : MachineState :=
   { base with frame := { base.frame with locals := base.frame.locals.map fun
       | .dead => .uninit
       | slot => slot } }
+
+/-- Mode-sensitive `V2026_08_01` state for `copyMode08` or `swapMode08`. -/
+def modeInit08 (body : CapturedMir) (local3Val : Nat) (protectedMode : Bool) : MachineState :=
+  let base := init08 body [.ptr ⟨100, 0⟩ 8, .ptr ⟨2, 0⟩ 8]
+  let b1 : BorrowEntry :=
+    { tag := 1, targetLocal := 3, targetProjection := [], perm := TreeBorrowPerm.frozen,
+      rangeOffset := 0, rangeLen := 4, protector := (if protectedMode then some 1 else none),
+      parentTag := none, targetFrameDepth := 0, allocDead := false }
+  let b2 : BorrowEntry :=
+    { tag := 2, targetLocal := 3, targetProjection := [], perm := TreeBorrowPerm.unique,
+      rangeOffset := 0, rangeLen := 4, protector := none, parentTag := none,
+      targetFrameDepth := 0, allocDead := false }
+  { base with
+    frame := { base.frame with
+      locals := [.uninit, .init (.ptr ⟨100, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8),
+                 .init (.scalar ⟨local3Val, 4⟩), .uninit] },
+    memory := { base.memory with
+      borrows := [b1, b2], nextTag := 3,
+      activeProtectors := (if protectedMode then [1] else []) } }
 
 /-- Bounded `V2026_08_01` `stepMirFn` run, observed in the shared observation type. -/
 def run08 (body : CapturedMir) : Nat → MachineState → MiniRustSpec.CoreMemPtrIntrinsicsMR.CmTrustedObs
@@ -176,17 +205,24 @@ theorem cm_all_8_intrinsics_flip_verdict :
   | ptrMask => exact ⟨⟨.ptr 100 8, by decide +kernel, by decide +kernel⟩, by decide +kernel, by decide +kernel⟩
   | blackBox => exact ⟨⟨.scalar 77 4, by decide +kernel, by decide +kernel⟩, by decide +kernel, by decide +kernel⟩
 
-/-- Genuine mode sensitivity across Trusted Anneal and MiniRust on `copy`:
-`basic` / `BasicMemory` returns `42` while `protectedTB` / `TreeBorrowsMemory`
-faults. -/
+/-- Genuine mode sensitivity across Trusted Anneal and MiniRust on BOTH `copy`
+and `typed_swap_nonoverlapping`: `basic` / `BasicMemory` returns (`42`, `9`)
+while `protectedTB` / `TreeBorrowsMemory` faults `.undefinedBehavior`. -/
 theorem cm_copy_mode_sensitivity_root :
     cmAnnealEval .basic .copy .modeCase () = some (.returns (.scalar 42 4)) ∧
     mrAuthority.verdict (.basic, .copy, .modeCase) = some (.returns (.scalar 42 4)) ∧
     cmAnnealEval .protectedTB .copy .modeCase () = some .undefinedBehavior ∧
     mrAuthority.verdict (.protectedTB, .copy, .modeCase) = some .undefinedBehavior ∧
-    (mrSide.flipW cmModel mrSide_check).isSome = true :=
+    (mrSide.flipW cmModel mrSide_check).isSome = true ∧
+    cmAnnealEval .basic .typedSwap .modeCase () = some (.returns (.scalar 9 4)) ∧
+    mrAuthority.verdict (.basic, .typedSwap, .modeCase) = some (.returns (.scalar 9 4)) ∧
+    cmAnnealEval .protectedTB .typedSwap .modeCase () = some .undefinedBehavior ∧
+    mrAuthority.verdict (.protectedTB, .typedSwap, .modeCase) = some .undefinedBehavior ∧
+    ((mrVariantSide .typedSwap).flipW cmModel (mrVariantSide_check .typedSwap)).isSome = true :=
   ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
-   mr_modeSensitivity_present⟩
+   mr_modeSensitivity_present,
+   by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+   mr_typedSwap_modeSensitivity_present⟩
 
 /-- Both root-Lake authorities realize the frozen 64-key verdict table. -/
 theorem cm_two_authority_table_root (mode : CmMode) (v : CmVariant) (c : CmCase) :
@@ -199,7 +235,10 @@ theorem cm_mr_deep_theorems_used :
     cmMrObsDictDistinct = true ∧
     cmMrObserve .basicMemory .copy .modeCase =
       .retBytes ((scalarBytes cmU32It 42).map (projByteTB ∘ liftByteTB)) ∧
-    cmMrObserve .treeBorrows .copy .modeCase = .ub := by
+    cmMrObserve .treeBorrows .copy .modeCase = .ub ∧
+    cmMrObserve .basicMemory .typedSwap .modeCase =
+      .retBytes ((scalarBytes cmU32It 9).map (projByteTB ∘ liftByteTB)) ∧
+    cmMrObserve .treeBorrows .typedSwap .modeCase = .ub := by
   have _ := @cm_classify_core_mem_ptr_intrinsics
   have _ := @cm_evalCoreMemPtrIntrinsicCall?_routes
   have _ := @cm_compareUnsignedBytesI32_refl
@@ -209,7 +248,20 @@ theorem cm_mr_deep_theorems_used :
   have _ := @cm_evalPtrOffsetFromDistance_zst
   have _ := @cm_evalPtrOffsetFromDistance_unsigned_negative
   have _ := @cm_evalPtrOffsetFromDistance_exact
+  have _ := @cm_evalPtrOffsetFromDistance_neg_exact
+  have _ := @cm_evalPtrOffsetFromDistance_isize_min_ub
+  have _ := @cm_evalPtrOffsetFromDistance_nondiv_ub
+  have _ := @cm_evalPtrOffsetFromDistance_oversized_elem_ub
   have _ := @cm_divExact_byte_distance
+  have _ := @cm_bitwiseAndBits_testBit
+  have _ := @cm_bitwiseAndBits_allOnes
+  have _ := @cm_bitwiseAndBits_baseAddr_invariant
+  have _ := @cm_evalPtrMaskCall_identity
+  have _ := @cm_evalPtrMaskCall_direct_preserves_exposed
+  have _ := @cm_minirust_rawEq_evalIntrinsic
+  have _ := @cm_minirust_loadRawData_uninit_ub
+  have _ := @cm_minirust_evalPtrOffsetFrom_divExact_agree
+  have _ := @cm_evalBlackBoxCall_u32_valid
   have _ := @cm_copy_three_way_witness
   have _ := @cm_compareBytes_three_way_witness
   have _ := @cm_rawEq_three_way_witness
@@ -218,11 +270,15 @@ theorem cm_mr_deep_theorems_used :
   have _ := @cm_ptrOffsetFromUnsigned_three_way_witness
   have _ := @cm_ptrMask_three_way_witness
   have _ := @cm_blackBox_three_way_witness
+  have _ := @cm_rawEq_padded_struct_three_way_witness
+  have _ := @cm_copy_tb_read_then_write_witness
+  have _ := @cm_typedSwap_invalid_bool_three_way_witness
   have _ := @cmTrustedObserve_table
   have _ := @cmMrObserveClass_table
   have _ := @cm_variant_outcomes_distinct
   exact ⟨cmMrObsDict_distinct, cmMrObserve_copy_mode_sensitivity.1,
-    cmMrObserve_copy_mode_sensitivity.2⟩
+    cmMrObserve_copy_mode_sensitivity.2, cmMrObserve_typedSwap_mode_sensitivity.1,
+    cmMrObserve_typedSwap_mode_sensitivity.2⟩
 
 /-! ### Trusted edge cases (`V2026_06_01`) -/
 
@@ -253,33 +309,18 @@ def cmSwapBoolMir : CapturedMir :=
     [mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref]))))]
     [cmGlobal 100 [some 2] 1, cmGlobal 101 [some 1] 1]
 
-/-- `compare_bytes(_1, _2, 0)`. -/
-def cmCmpBytes0Mir : CapturedMir :=
-  cmCallBody "cm::compare_bytes_0"
-    [mkDecl i32MirTy, mkDecl cmRawConstU8Ty, mkDecl cmRawConstU8Ty] 2
-    (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
-    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 0] 0 [] []
-
-/-- `copy::<u32>(_1, _2, 0); _0 = 7u32`. -/
-def cmCopy0Mir : CapturedMir :=
-  cmCallBody "cm::copy_0"
-    [mkDecl u32MirTy, mkDecl rawConstU32MirTy, mkDecl rawMutU32MirTy, mkDecl unitMirTy] 2
-    (cmIntrinsicOp "core::intrinsics::copy" [.uint .u32])
-    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 0] 3
-    [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨7, 4⟩) })))]
-    []
-
 /-- **Trusted edge cases on `stepMirFn`**:
 1. `copy::<u32>` with null pointers at `count = 0` completes (alignment checked,
    validity exempted); with a misaligned source at `count = 0` it is UB;
 2. `compare_bytes` with null pointers at `bytes = 0` is UB (deliberate delta);
 3. `typed_swap_nonoverlapping::<u32>` on overlapping ranges (`&G[0]`, `&G[2]`)
-   is UB, while disjoint elements of one allocation swap (corpus `modeCase`);
+   is UB, while disjoint elements of one allocation swap (`okSecondary`);
 4. `typed_swap_nonoverlapping::<bool>` with an invalid `bool` (`2`) is UB
    (`kani#5205` typed validity);
-5. `ptr_mask` returns a pointer with the SAME provenance and leaves
+5. `typed_swap_nonoverlapping::<()>` with null pointers is UB (deliberate delta);
+6. `ptr_mask` returns a pointer with the SAME provenance and leaves
    `exposedAllocIds` empty (no `expose`, `ucg#630`);
-6. a diverging (`target = none`) call to the returning intrinsic `raw_eq` is UB. -/
+7. a diverging (`target = none`) call to the returning intrinsic `raw_eq` is UB. -/
 theorem cm_trusted_edge_cases :
     cmRunTrusted cmCopy0Mir 8 (cmInitLiveState cmCopy0Mir [cmIntPtr 0, cmIntPtr 0]) = .scalar 7 4 ∧
     cmRunTrusted cmCopy0Mir 8 (cmInitLiveState cmCopy0Mir [cmIntPtr 2, cmIntPtr 0]) = .ub ∧
@@ -287,23 +328,355 @@ theorem cm_trusted_edge_cases :
     cmRunTrusted cmSwapSameAllocMir 8
       (cmInitLiveState cmSwapSameAllocMir [cmGPtr 100 0, cmGPtr 100 2]) = .ub ∧
     cmRunTrusted cmSwapBoolMir 8 (cmInitLiveState cmSwapBoolMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunTrusted cmSwapZstMir 8 (cmInitLiveState cmSwapZstMir [cmIntPtr 0, cmIntPtr 0]) = .ub ∧
     cmRunTrustedExposed cmMaskAlign8Mir 8 (cmInitLiveState cmMaskAlign8Mir [cmGPtr 100 12]) = some [] ∧
     cmRunTrusted cmRawEqDivergingMir 8
       (cmInitLiveState cmRawEqDivergingMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- Layout table for `MaybeUninit<(u8, u32)>` (entry `0`: `()`, entry `1`: `(u8, u32)`
+size 8 align 4 offsets `[0, 4]`, entry `2`: union `MaybeUninit<(u8, u32)>` with
+`fieldLayouts = [0, 1]`, entry `3`: `MaybeUninit<u8>`, entry `4`: `[MaybeUninit<u8>; 2]`,
+entry `5`: `(u32, MaybeUninit<u32>)`, entry `6`: `MaybeUninit<u32>`, entry `7`: `u8`,
+entry `8`: `u32`, entry `9`: `[u8; 16]` align 4). -/
+def cmHardenedLayouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable :=
+  let u8L : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨1⟩, align := ⟨1⟩, fields := .primitive, variants := .single 0,
+      backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 255⟩),
+      isUninhabited := false, fieldLayouts := [] }
+  let u32L : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨4⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+      backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 0xFFFFFFFF⟩),
+      isUninhabited := false, fieldLayouts := [] }
+  let unitL : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨0⟩, align := ⟨1⟩, fields := .arbitrary [] [], variants := .single 0,
+      backendRepr := .memory, isUninhabited := false, fieldLayouts := [] }
+  let padL : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨8⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+      backendRepr := .scalarPair (.initialized (.int 8 false) ⟨0, 255⟩)
+        (.initialized (.int 32 false) ⟨0, 0xFFFFFFFF⟩),
+      isUninhabited := false, fieldLayouts := [7, 8] }
+  let muPadL : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨8⟩, align := ⟨4⟩, fields := .union 2, variants := .single 0,
+      backendRepr := .memory, isUninhabited := false, fieldLayouts := [0, 1] }
+  let muU8L : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨1⟩, align := ⟨1⟩, fields := .union 2, variants := .single 0,
+      backendRepr := .scalar (.union (.int 8 false)), isUninhabited := false, fieldLayouts := [0, 7] }
+  let arrMuU8L : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨2⟩, align := ⟨1⟩, fields := .array ⟨1⟩ 2, variants := .single 0,
+      backendRepr := .memory, isUninhabited := false, fieldLayouts := [3] }
+  let muU32L : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨4⟩, align := ⟨4⟩, fields := .union 2, variants := .single 0,
+      backendRepr := .scalar (.union (.int 32 false)), isUninhabited := false, fieldLayouts := [0, 8] }
+  let tupMuU32L : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨8⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+      backendRepr := .memory, isUninhabited := false, fieldLayouts := [8, 6] }
+  let buf16L : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+    { size := ⟨16⟩, align := ⟨4⟩, fields := .array ⟨1⟩ 16, variants := .single 0,
+      backendRepr := .memory, isUninhabited := false, fieldLayouts := [7] }
+  Trusted.Rustc.V2026_06_01.Layout.LayoutTable.mk 64 true
+    [unitL, padL, muPadL, muU8L, arrMuU8L, tupMuU32L, muU32L, u8L, u32L, buf16L]
+
+/-- **Hardened Episode 1/2 edge-case witnesses on `V2026_06_01.MirSemantics.stepMirFn`**:
+1. `compare_bytes` eager `.uninit`-before-provenance: a slice carrying a relocated
+   pointer at bytes `0..8` followed by `.uninit` at byte `8` deterministically
+   faults `.ub` (never `.unsupported`);
+2. `raw_eq::<&!>` returns `true` (`&!` is layout-inhabited), while `raw_eq::<!>`
+   faults `.ub` (`!` is layout-uninhabited);
+3. `typed_swap_nonoverlapping`:
+   (a) global padding reset on `(u8, u32)` clears padding bytes `1..3` to `.uninit`
+       (subsequent `compare_bytes(..., 4)` faults `.ub`, while byte `0` equals `2`);
+   (b) stack byte-buffer (`[u8; 16]` align 4) padding reset clears padding bytes
+       `1..3` to `.uninit`;
+   (c) union `MaybeUninit<(u8, u32)>` common-padding reset clears bytes `1..3` to
+       `.uninit`;
+   (d) invalid surrogate `char` (`0xD800`) faults `.ub` (`kani#5205`);
+4. `ptr_offset_from`:
+   (a) `isize::MIN` (`0` vs `2^63`) faults `.ub`;
+   (b) ZST `()` faults `.ub`;
+   (c) dead-tag borrow-first resolution: two distinct dead tags at differing
+       offsets fault `.ub`, at equal offsets fail closed `.unsupported`, and a
+       dead tag colliding with live global id `100` faults `.ub` against live
+       global `100` (never adopts global `100`);
+5. `ptr_mask`:
+   (a) mask `!31` on 16-aligned global `100` fails closed `.unsupported` (touches
+       unknown symbolic base bits);
+   (b) dead tag `100` colliding with live 16-aligned global `100` fails closed
+       `.unsupported` on mask `!7` (never adopts global `100`'s alignment);
+   (c) identity mask `usize::MAX` succeeds even on a dead borrow tag;
+6. `black_box`:
+   (a) `[MaybeUninit<u8>; 2]` with `.uninit` succeeds;
+   (b) `(u32, MaybeUninit<u32>)` with `.uninit` field succeeds;
+   (c) null wide `&[u8]` faults `.ub`;
+   (d) null `fn()` faults `.ub`;
+   (e) `&!` faults `.ub`, while `&&!` succeeds;
+7. `const_eval_select`:
+   (a) runtime forwarding to `raw_eq`, `ptr_mask`, and `black_box` executes inline
+       (never escapes to `extCall`);
+   (b) diverging `const_eval_select` (`target = none`) fails closed `.unsupported`
+       (never `.ub`). -/
+theorem cm_trusted_hardened_edge_cases :
+    -- 1. compare_bytes eager .uninit before provenance
+    let gProvUninit : CapturedAllocation :=
+      { allocId := 100,
+        bytes := [some 0, some 0, some 0, some 0, some 0, some 0, some 0, some 0, none],
+        relocations := [(0, ⟨101, 0⟩)],
+        align := ⟨8⟩, mutability := .mut }
+    let cmpProvUninitMir :=
+      cmCallBody "cm::cmp_uninit_before_prov"
+        [mkDecl i32MirTy, mkDecl cmRawConstU8Ty, mkDecl cmRawConstU8Ty] 2
+        (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
+        [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 9] 0 []
+        [gProvUninit, cmGlobal 101 (List.replicate 9 (some 0)) 8]
+    -- 2. raw_eq::<&!> valid vs raw_eq::<!> UB
+    let rawEqRefNeverMir :=
+      cmCallBody "cm::raw_eq_ref_never"
+        [mkDecl boolMirTy,
+         mkDecl { kind := .ref .not (.ref .not .never), layoutIdx := 0 },
+         mkDecl { kind := .ref .not (.ref .not .never), layoutIdx := 0 }] 2
+        (cmIntrinsicOp "core::intrinsics::raw_eq" [.ref .not .never])
+        [.copy (locPlace 1), .copy (locPlace 2)] 0 []
+        [cmGlobal 100 (List.replicate 8 (some 1)) 8, cmGlobal 101 (List.replicate 8 (some 1)) 8]
+    let rawEqNeverMir :=
+      cmCallBody "cm::raw_eq_never"
+        [mkDecl boolMirTy,
+         mkDecl { kind := .ref .not .never, layoutIdx := 0 },
+         mkDecl { kind := .ref .not .never, layoutIdx := 0 }] 2
+        (cmIntrinsicOp "core::intrinsics::raw_eq" [.never])
+        [.copy (locPlace 1), .copy (locPlace 2)] 0 [] []
+    -- 3a. typed_swap global padding reset
+    let padKind : RigidTy := .tuple [.uint .u8, .uint .u32]
+    let padDeclTy : MirAst.Ty := { kind := padKind, layoutIdx := 1 }
+    let rawMutPadTy : MirAst.Ty := { kind := .rawPtr .mut padKind, layoutIdx := 10 }
+    let swapPadGlobalMir : CapturedMir :=
+      { mkMirBody "cm::swap_pad_global"
+          [mkDecl i32MirTy, mkDecl rawMutPadTy, mkDecl rawMutPadTy, mkDecl padDeclTy, mkDecl unitMirTy] 2
+          [mkBb [] (.call (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [padKind])
+              [.copy (locPlace 1), .copy (locPlace 2)] (locPlace 4) (some 1) .continue_),
+           mkBb [] (.call (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
+              [.copy (locPlace 1), .copy (locPlace 1), cmUsizeConst 4] (locPlace 0) (some 2) .continue_),
+           mkBb [] .return_] with
+        layouts := cmHardenedLayouts,
+        allocations :=
+          [cmGlobal 100 [some 1, some 0xAA, some 0xAA, some 0xAA, some 5, some 0, some 0, some 0] 4,
+           cmGlobal 101 [some 2, some 0xBB, some 0xBB, some 0xBB, some 6, some 0, some 0, some 0] 4] }
+    -- 3b. typed_swap stack byte-buffer padding reset
+    let buf16Ty : MirAst.Ty := { kind := .array (.uint .u8) 16, layoutIdx := 9 }
+    let swapPadStackMir : CapturedMir :=
+      { mkMirBody "cm::swap_pad_stack"
+          [mkDecl i32MirTy, mkDecl rawMutPadTy, mkDecl rawMutPadTy, mkDecl buf16Ty,
+           mkDecl padDeclTy, mkDecl unitMirTy] 2
+          [mkBb [] (.call (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [padKind])
+              [.copy (locPlace 1), .copy (locPlace 2)] (locPlace 5) (some 1) .continue_),
+           mkBb [] (.call (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
+              [.copy (locPlace 1), .copy (locPlace 1), cmUsizeConst 4] (locPlace 0) (some 2) .continue_),
+           mkBb [] .return_] with
+        layouts := cmHardenedLayouts }
+    let buf16Val : Value :=
+      .aggregate 0 ([1, 0xAA, 0xAA, 0xAA, 5, 0, 0, 0, 2, 0xBB, 0xBB, 0xBB, 6, 0, 0, 0].map
+        fun b => Value.scalar ⟨b, 1⟩)
+    let bBuf : BorrowEntry :=
+      { tag := 1, targetLocal := 3, targetProjection := [], perm := .unique,
+        rangeOffset := 0, rangeLen := 16, protector := none, parentTag := none,
+        targetFrameDepth := 0, allocDead := false }
+    let swapPadStackBase := cmInitLiveState swapPadStackMir [.ptr ⟨1, 0⟩ 8, .ptr ⟨1, 8⟩ 8]
+    let swapPadStackSt : MachineState :=
+      { swapPadStackBase with
+        frame := { swapPadStackBase.frame with
+          locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨1, 8⟩ 8),
+                     .init buf16Val, .uninit, .uninit] },
+        memory := { swapPadStackBase.memory with borrows := [bBuf], nextTag := 2 } }
+    -- 3c. typed_swap union MaybeUninit<(u8, u32)> common-padding reset
+    let muPadKind : RigidTy := .adt "core::mem::maybe_uninit::MaybeUninit" [padKind]
+    let muPadDeclTy : MirAst.Ty := { kind := muPadKind, layoutIdx := 2 }
+    let rawMutMuPadTy : MirAst.Ty := { kind := .rawPtr .mut muPadKind, layoutIdx := 10 }
+    let swapUnionPadMir : CapturedMir :=
+      { mkMirBody "cm::swap_union_pad"
+          [mkDecl i32MirTy, mkDecl rawMutMuPadTy, mkDecl rawMutMuPadTy,
+           mkDecl muPadDeclTy, mkDecl unitMirTy] 2
+          [mkBb [] (.call (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [muPadKind])
+              [.copy (locPlace 1), .copy (locPlace 2)] (locPlace 4) (some 1) .continue_),
+           mkBb [] (.call (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
+              [.copy (locPlace 1), .copy (locPlace 1), cmUsizeConst 4] (locPlace 0) (some 2) .continue_),
+           mkBb [] .return_] with
+        layouts := cmHardenedLayouts,
+        allocations :=
+          [cmGlobal 100 [some 1, some 0xAA, some 0xAA, some 0xAA, some 5, some 0, some 0, some 0] 4,
+           cmGlobal 101 [some 2, some 0xBB, some 0xBB, some 0xBB, some 6, some 0, some 0, some 0] 4] }
+    -- 3d. typed_swap invalid char surrogate 0xD800
+    let swapCharMir :=
+      cmCallBody "cm::swap_char_surrogate"
+        [mkDecl u32MirTy, mkDecl { kind := .rawPtr .mut .char, layoutIdx := 0 },
+         mkDecl { kind := .rawPtr .mut .char, layoutIdx := 0 }, mkDecl unitMirTy] 2
+        (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.char])
+        [.copy (locPlace 1), .copy (locPlace 2)] 3
+        [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨1, 4⟩) })))]
+        [cmGlobal 100 [some 0x00, some 0xD8, some 0x00, some 0x00] 4,
+         cmGlobal 101 [some 0x41, some 0x00, some 0x00, some 0x00] 4]
+    -- 4. ptr_offset_from: isize::MIN, ZST, dead-tag borrow-first
+    let pofZstMir :=
+      cmCallBody "cm::pof_zst"
+        [mkDecl cmIsizeTy, mkDecl { kind := .rawPtr .not (.tuple []), layoutIdx := 0 },
+         mkDecl { kind := .rawPtr .not (.tuple []), layoutIdx := 0 }] 2
+        (cmIntrinsicOp "core::intrinsics::ptr_offset_from" [.tuple []])
+        [.copy (locPlace 1), .copy (locPlace 2)] 0 [] []
+    let deadB1 : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := [], perm := .unique,
+        rangeOffset := 0, rangeLen := 4, protector := none, parentTag := none,
+        targetFrameDepth := 0, allocDead := true }
+    let deadB2 : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [], perm := .unique,
+        rangeOffset := 0, rangeLen := 4, protector := none, parentTag := none,
+        targetFrameDepth := 0, allocDead := true }
+    let deadB100 : BorrowEntry :=
+      { tag := 100, targetLocal := 0, targetProjection := [], perm := .unique,
+        rangeOffset := 0, rangeLen := 4, protector := none, parentTag := none,
+        targetFrameDepth := 0, allocDead := true }
+    let pofDeadDiffSt : MachineState :=
+      let b := cmInitLiveState cmPofMir [.ptr ⟨1, 4⟩ 8, .ptr ⟨2, 0⟩ 8]
+      { b with memory := { b.memory with borrows := [deadB1, deadB2], nextTag := 3 } }
+    let pofDeadEqSt : MachineState :=
+      let b := cmInitLiveState cmPofMir [.ptr ⟨1, 0⟩ 8, .ptr ⟨2, 0⟩ 8]
+      { b with memory := { b.memory with borrows := [deadB1, deadB2], nextTag := 3 } }
+    let pofDeadCollideSt : MachineState :=
+      let b := cmInitLiveState cmPofMir [.ptr ⟨100, 4⟩ 8, .ptr ⟨100, 0⟩ 8]
+      { b with memory := { b.memory with borrows := [deadB100], nextTag := 101 } }
+    -- 5. ptr_mask: base-touching mask unsupported, dead-tag colliding with global 100 unsupported, identity mask ok
+    let maskTouchBaseMir := cmMaskMir "cm::ptr_mask_not31" (2 ^ 64 - 32)
+    let maskDeadCollideSt : MachineState :=
+      let b := cmInitLiveState cmMaskAlign8Mir [.ptr ⟨100, 12⟩ 8]
+      { b with memory := { b.memory with borrows := [deadB100], nextTag := 101 } }
+    let maskDeadIdSt : MachineState :=
+      let b := cmInitLiveState cmMaskIdentityMir [.ptr ⟨100, 12⟩ 8]
+      { b with memory := { b.memory with borrows := [deadB100], nextTag := 101 } }
+    -- 6. black_box: nested MaybeUninit, null wide ref, null fn(), &!, &&!
+    let muU8Kind : RigidTy := .adt "core::mem::maybe_uninit::MaybeUninit" [.uint .u8]
+    let arrMuU8Ty : MirAst.Ty := { kind := .array muU8Kind 2, layoutIdx := 4 }
+    let bbArrMuMir : CapturedMir :=
+      { cmCallBody "cm::bb_arr_mu" [mkDecl u32MirTy, mkDecl arrMuU8Ty, mkDecl arrMuU8Ty] 1
+          (cmIntrinsicOp "core::intrinsics::black_box" [.array muU8Kind 2])
+          [.copy (locPlace 1)] 2
+          [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨55, 4⟩) })))]
+          [] with
+        layouts := cmHardenedLayouts }
+    let muU32Kind : RigidTy := .adt "core::mem::maybe_uninit::MaybeUninit" [.uint .u32]
+    let tupMuU32Ty : MirAst.Ty := { kind := .tuple [.uint .u32, muU32Kind], layoutIdx := 5 }
+    let bbTupMuMir : CapturedMir :=
+      { cmCallBody "cm::bb_tup_mu" [mkDecl u32MirTy, mkDecl tupMuU32Ty, mkDecl tupMuU32Ty] 1
+          (cmIntrinsicOp "core::intrinsics::black_box" [.tuple [.uint .u32, muU32Kind]])
+          [.copy (locPlace 1)] 2
+          [mkSt (.assign (locPlace 0) (.use (.constant { ty := u32MirTy, val := .scalar (.int ⟨66, 4⟩) })))]
+          [] with
+        layouts := cmHardenedLayouts }
+    let sliceRefTy : MirAst.Ty := { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 }
+    let bbWideNullMir :=
+      cmCallBody "cm::bb_wide_null" [mkDecl sliceRefTy, mkDecl sliceRefTy] 1
+        (cmIntrinsicOp "core::intrinsics::black_box" [.ref .not (.slice (.uint .u8))])
+        [.copy (locPlace 1)] 0 [] []
+    let fnPtrKind : RigidTy := .fnPtr [] (.tuple []) .safe .rust
+    let fnPtrTy : MirAst.Ty := { kind := fnPtrKind, layoutIdx := 0 }
+    let bbFnNullMir :=
+      cmCallBody "cm::bb_fn_null" [mkDecl fnPtrTy, mkDecl fnPtrTy] 1
+        (cmIntrinsicOp "core::intrinsics::black_box" [fnPtrKind])
+        [.copy (locPlace 1)] 0 [] []
+    let refNeverTy : MirAst.Ty := { kind := .ref .not .never, layoutIdx := 0 }
+    let bbRefNeverMir :=
+      cmCallBody "cm::bb_ref_never" [mkDecl refNeverTy, mkDecl refNeverTy] 1
+        (cmIntrinsicOp "core::intrinsics::black_box" [.ref .not .never])
+        [.copy (locPlace 1)] 0 [] []
+    let refRefNeverTy : MirAst.Ty := { kind := .ref .not (.ref .not .never), layoutIdx := 0 }
+    let bbRefRefNeverMir :=
+      cmCallBody "cm::bb_ref_ref_never" [mkDecl refRefNeverTy, mkDecl refRefNeverTy] 1
+        (cmIntrinsicOp "core::intrinsics::black_box" [.ref .not (.ref .not .never)])
+        [.copy (locPlace 1)] 0 [] []
+    -- 7. const_eval_select forwarding + diverging const_eval_select unsupported
+    let ctFnOp : Operand :=
+      .constant { ty := { kind := .fnDef "cm::ct_dummy" [], layoutIdx := 0 }, val := .zeroSized }
+    let cesRawEqMir :=
+      cmCallBody "cm::ces_raw_eq"
+        [mkDecl boolMirTy, mkDecl { kind := .tuple [.ref .not (.uint .u32), .ref .not (.uint .u32)], layoutIdx := 0 }] 1
+        (cmIntrinsicOp "core::intrinsics::const_eval_select"
+          [.tuple [.ref .not (.uint .u32), .ref .not (.uint .u32)],
+           .fnDef "cm::ct_dummy" [], .fnDef "core::intrinsics::raw_eq" [.uint .u32], .bool])
+        [.copy (locPlace 1), ctFnOp, cmIntrinsicOp "core::intrinsics::raw_eq" [.uint .u32]] 0 []
+        [cmGlobal 100 (cmU32Bytes 7), cmGlobal 101 (cmU32Bytes 7)]
+    let cesMaskMir :=
+      cmCallBody "cm::ces_ptr_mask"
+        [mkDecl rawConstU32MirTy, mkDecl { kind := .tuple [.rawPtr .not (.uint .u32), .uint .usize], layoutIdx := 0 }] 1
+        (cmIntrinsicOp "core::intrinsics::const_eval_select"
+          [.tuple [.rawPtr .not (.uint .u32), .uint .usize],
+           .fnDef "cm::ct_dummy" [], .fnDef "core::intrinsics::ptr_mask" [.uint .u32], .rawPtr .not (.uint .u32)])
+        [.copy (locPlace 1), ctFnOp, cmIntrinsicOp "core::intrinsics::ptr_mask" [.uint .u32]] 0 []
+        [cmGlobal 100 (List.replicate 16 (some 0)) 16]
+    let cesBbMir :=
+      cmCallBody "cm::ces_black_box"
+        [mkDecl u32MirTy, mkDecl { kind := .tuple [.uint .u32], layoutIdx := 0 }] 1
+        (cmIntrinsicOp "core::intrinsics::const_eval_select"
+          [.tuple [.uint .u32], .fnDef "cm::ct_dummy" [],
+           .fnDef "core::intrinsics::black_box" [.uint .u32], .uint .u32])
+        [.copy (locPlace 1), ctFnOp, cmIntrinsicOp "core::intrinsics::black_box" [.uint .u32]] 0 [] []
+    let cesDivMir : CapturedMir :=
+      mkMirBody "cm::ces_diverging"
+        [mkDecl { kind := .never, layoutIdx := 0 }, mkDecl { kind := .tuple [], layoutIdx := 0 }] 1
+        [mkBb [] (.call
+          (cmIntrinsicOp "core::intrinsics::const_eval_select"
+            [.tuple [], .fnDef "cm::ct_dummy" [], .fnDef "cm::rt_div" [], .never])
+          [.copy (locPlace 1), ctFnOp,
+           .constant { ty := { kind := .fnDef "cm::rt_div" [], layoutIdx := 0 }, val := .zeroSized }]
+          (locPlace 0) none .continue_)]
+    -- Assertions
+    cmRunTrusted cmpProvUninitMir 8 (cmInitLiveState cmpProvUninitMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunTrusted rawEqRefNeverMir 8 (cmInitLiveState rawEqRefNeverMir [cmGPtr 100 0, cmGPtr 101 0]) = .scalar 1 1 ∧
+    cmRunTrusted rawEqNeverMir 8 (cmInitLiveState rawEqNeverMir [cmIntPtr 4096, cmIntPtr 4096]) = .ub ∧
+    cmRunTrusted swapPadGlobalMir 10 (cmInitLiveState swapPadGlobalMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunTrusted swapPadStackMir 10 swapPadStackSt = .ub ∧
+    cmRunTrusted swapUnionPadMir 10 (cmInitLiveState swapUnionPadMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunTrusted swapCharMir 8 (cmInitLiveState swapCharMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunTrusted cmPofMir 8 (cmInitLiveState cmPofMir [cmIntPtr 0, cmIntPtr (2 ^ 63)]) = .ub ∧
+    cmRunTrusted pofZstMir 8 (cmInitLiveState pofZstMir [cmIntPtr 4096, cmIntPtr 4096]) = .ub ∧
+    cmRunTrusted cmPofMir 8 pofDeadDiffSt = .ub ∧
+    cmRunTrusted cmPofMir 8 pofDeadEqSt = .unsupported ∧
+    cmRunTrusted cmPofMir 8 pofDeadCollideSt = .ub ∧
+    cmRunTrusted maskTouchBaseMir 8 (cmInitLiveState maskTouchBaseMir [cmGPtr 100 12]) = .unsupported ∧
+    cmRunTrusted cmMaskAlign8Mir 8 maskDeadCollideSt = .unsupported ∧
+    cmRunTrusted cmMaskIdentityMir 8 maskDeadIdSt = .ptr 100 12 ∧
+    cmRunTrusted bbArrMuMir 8
+      (cmInitLiveState bbArrMuMir [.aggregate 0 [.aggregate 0 [.unit], .aggregate 0 [.unit]]]) = .scalar 55 4 ∧
+    validateBlackBoxValue emptyMemory bbArrMuMir.localDecls cmHardenedLayouts defaultCodecFuel arrMuU8Ty .uninit = .valid ∧
+    validateBlackBoxValue emptyMemory bbArrMuMir.localDecls cmHardenedLayouts defaultCodecFuel
+      { kind := .array (.uint .u8) 2, layoutIdx := 0 } .uninit = .ub ∧
+    cmRunTrusted bbTupMuMir 8
+      (cmInitLiveState bbTupMuMir [.aggregate 0 [.scalar ⟨9, 4⟩, .aggregate 0 [.unit]]]) = .scalar 66 4 ∧
+    validateBlackBoxValue emptyMemory bbTupMuMir.localDecls cmHardenedLayouts defaultCodecFuel tupMuU32Ty
+      (.aggregate 0 [.scalar ⟨9, 4⟩, .uninit]) = .valid ∧
+    cmRunTrusted bbWideNullMir 8 (cmInitLiveState bbWideNullMir [.aggregate 0 [cmIntPtr 0, .scalar ⟨0, 8⟩]]) = .ub ∧
+    cmRunTrusted bbFnNullMir 8 (cmInitLiveState bbFnNullMir [cmIntPtr 0]) = .ub ∧
+    cmRunTrusted bbRefNeverMir 8 (cmInitLiveState bbRefNeverMir [cmIntPtr 4096]) = .ub ∧
+    cmRunTrusted bbRefRefNeverMir 8 (cmInitLiveState bbRefRefNeverMir [cmIntPtr 4096]) = .ptr 0 4096 ∧
+    cmRunTrusted cesRawEqMir 8 (cmInitLiveState cesRawEqMir [.aggregate 0 [cmGPtr 100 0, cmGPtr 101 0]]) = .scalar 1 1 ∧
+    cmRunTrusted cesMaskMir 8 (cmInitLiveState cesMaskMir [.aggregate 0 [cmGPtr 100 12, .scalar ⟨2 ^ 64 - 8, 8⟩]]) = .ptr 100 8 ∧
+    cmRunTrusted cesBbMir 8 (cmInitLiveState cesBbMir [.aggregate 0 [.scalar ⟨77, 4⟩]]) = .scalar 77 4 ∧
+    cmRunTrusted cesDivMir 8 (cmInitLiveState cesDivMir [.unit]) = .unsupported := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+    first | rfl | decide +kernel
 
 /-! ### `V2026_06_01` <-> `V2026_08_01` dialect parity -/
 
 
 /-- **`V2026_06_01` <-> `V2026_08_01` parity**: the `V2026_08_01` dialect's
 `stepMirFn`, run on the `V2026_08_01` rendering of the corpus fixtures, yields
-exactly the `V2026_06_01` corpus observations (`cmTrustedObserve`) for all 8
-intrinsics, on positive and UB keys. -/
+exactly the `V2026_06_01` corpus observations (`cmTrustedObserve`) for ALL 8
+intrinsics, on BOTH positive AND UB keys, PLUS `protectedTB` mode sensitivity
+for BOTH `copy` and `typed_swap_nonoverlapping`. -/
 theorem cm_v2026_08_01_parity :
     V08.run08 V08.copy08 8 (V08.init08 V08.copy08 [V08.gp 100 0, V08.gp 101 0]) =
       cmTrustedObserve false .copy .okPrimary ∧
     V08.run08 V08.copy08 8 (V08.init08 V08.copy08 [.ptr ⟨0, 0⟩ 8, V08.gp 101 0]) =
       cmTrustedObserve false .copy .ubFault ∧
+    V08.run08 V08.copyMode08 8 (V08.modeInit08 V08.copyMode08 11 false) =
+      cmTrustedObserve false .copy .modeCase ∧
+    V08.run08 V08.copyMode08 8 (V08.modeInit08 V08.copyMode08 11 true) =
+      cmTrustedObserve true .copy .modeCase ∧
     V08.run08 V08.cmp08 8 (V08.init08 V08.cmp08 [V08.gp 100 0, V08.gp 101 0]) =
       cmTrustedObserve false .compareBytes .okPrimary ∧
     V08.run08 V08.cmp08 8 (V08.init08 V08.cmp08 [V08.gp 102 0, V08.gp 101 0]) =
@@ -314,19 +687,29 @@ theorem cm_v2026_08_01_parity :
       cmTrustedObserve false .rawEq .ubFault ∧
     V08.run08 V08.swap08 8 (V08.init08 V08.swap08 [V08.gp 100 0, V08.gp 101 0]) =
       cmTrustedObserve false .typedSwap .okPrimary ∧
+    V08.run08 V08.swap08 8 (V08.init08 V08.swap08 [.ptr ⟨0, 0⟩ 8, V08.gp 101 0]) =
+      cmTrustedObserve false .typedSwap .ubFault ∧
+    V08.run08 V08.swapMode08 8 (V08.modeInit08 V08.swapMode08 9 false) =
+      cmTrustedObserve false .typedSwap .modeCase ∧
+    V08.run08 V08.swapMode08 8 (V08.modeInit08 V08.swapMode08 9 true) =
+      cmTrustedObserve true .typedSwap .modeCase ∧
     V08.run08 (V08.pof08 false) 8 (V08.init08 (V08.pof08 false) [V08.gp 100 4, V08.gp 100 12]) =
       cmTrustedObserve false .ptrOffsetFrom .okSecondary ∧
     V08.run08 (V08.pof08 false) 8 (V08.init08 (V08.pof08 false) [V08.gp 100 4, V08.gp 101 12]) =
       cmTrustedObserve false .ptrOffsetFrom .ubFault ∧
+    V08.run08 (V08.pof08 true) 8 (V08.init08 (V08.pof08 true) [V08.gp 100 12, V08.gp 100 4]) =
+      cmTrustedObserve false .ptrOffsetFromUnsigned .okPrimary ∧
     V08.run08 (V08.pof08 true) 8 (V08.init08 (V08.pof08 true) [V08.gp 100 4, V08.gp 100 12]) =
       cmTrustedObserve false .ptrOffsetFromUnsigned .ubFault ∧
     V08.run08 V08.mask08 8 (V08.init08 V08.mask08 [V08.gp 100 12]) =
       cmTrustedObserve false .ptrMask .okPrimary ∧
+    V08.run08 V08.mask08 8 (V08.init08 V08.mask08 []) =
+      cmTrustedObserve false .ptrMask .ubFault ∧
     V08.run08 V08.bb08 8 (V08.init08 V08.bb08 [.scalar ⟨77, 4⟩]) =
       cmTrustedObserve false .blackBox .okPrimary ∧
     V08.run08 V08.bb08 8 (V08.init08 V08.bb08 []) =
       cmTrustedObserve false .blackBox .ubFault := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- **Episode 2 Root Capstone**: the root-Lake projection of
 `ep2_core_mem_ptr_intrinsics_capstone` for EVERY LeanMiri authority passing the
@@ -521,13 +904,14 @@ run_cmd do
       addThm (ns ++ `variantProjectFault ++ vc) (← MetaM.run' <| inferType vfVal) vfVal
       added := added.push (ns ++ `variantProjectFault ++ vc)
 
-    -- 3. Definitional `Eq.refl` locks of ALL 18 shared `CapturedMir` fixtures.
+    -- 3. Definitional `Eq.refl` locks of ALL 22 shared `CapturedMir` fixtures.
     let capMirTy := mkConst `Trusted.Rustc.V2026_06_01.MirAst.CapturedMir
     let fixtureNames : List Name :=
       [ `cmCopyMir, `cmCopyOverlapMir, `cmCopyModeMir, `cmCmpBytes3Mir, `cmCmpBytes1Mir,
         `cmRawEqU32Mir, `cmRawEqZstMir, `cmSwapReadXMir, `cmSwapReadYMir, `cmSwapSameAllocMir,
-        `cmPofMir, `cmPofuMir, `cmMaskAlign8Mir, `cmMaskIdentityMir, `cmMaskAlign4Mir,
-        `cmBlackBoxU32Mir, `cmBlackBoxPtrMir, `cmBlackBoxBoolMir ]
+        `cmSwapModeMir, `cmPofMir, `cmPofuMir, `cmMaskAlign8Mir, `cmMaskIdentityMir,
+        `cmMaskAlign4Mir, `cmBlackBoxU32Mir, `cmBlackBoxPtrMir, `cmBlackBoxBoolMir,
+        `cmCmpBytes0Mir, `cmSwapZstMir, `cmCopy0Mir ]
     let mut lockCount : Nat := 0
     for tag in fixtureNames do
       let lockName := ns ++ `fixtureLock ++ tag
@@ -537,8 +921,8 @@ run_cmd do
         (mkApp2 (mkConst ``Eq.refl [1]) capMirTy lhs)
       added := added.push lockName
       lockCount := lockCount + 1
-    unless lockCount = 18 do
-      throwError "cross-root: expected 18 fixture locks, got {lockCount}"
+    unless lockCount = 22 do
+      throwError "cross-root: expected 22 fixture locks, got {lockCount}"
 
     -- 4. Negative controls, each paired with a positive control that the kernel
     -- ACCEPTS in the same scratch environment (so a rejection is never caused by
@@ -603,6 +987,14 @@ run_cmd do
         ("vendored copy mode case under Tree Borrows (UB vs. forged 42)",
           thm `pos.lmCopyModeTbUb (lmObsEq 1 0 3 (mkConst (lmNs ++ `CmLmObs.ub))) (lmObsRefl 1 0 3),
           thm `neg.lmCopyModeTb42 (lmObsEq 1 0 3 (mkScO 42 4)) (lmObsRefl 1 0 3)),
+        ("per-variant typed_swap_nonoverlapping certificate (faithful vs. mode-inverted)",
+          thm `pos.swapVariant (eqTrue (mkApp2 (mkConst (bNs ++ `lmVariantCheckOf))
+            (mkConst (mrNs ++ `CmVariant.typedSwap)) lmAuthC)) reflTrue,
+          thm `neg.swapVariantInverted (eqTrue (mkApp2 (mkConst (bNs ++ `lmVariantCheckOf))
+            (mkConst (mrNs ++ `CmVariant.typedSwap)) invertedAuth)) reflTrue),
+        ("vendored typed_swap mode case under Tree Borrows (UB vs. forged 9)",
+          thm `pos.lmSwapModeTbUb (lmObsEq 1 3 3 (mkConst (lmNs ++ `CmLmObs.ub))) (lmObsRefl 1 3 3),
+          thm `neg.lmSwapModeTb9 (lmObsEq 1 3 3 (mkScO 9 4)) (lmObsRefl 1 3 3)),
         ("Trusted compare_bytes (-1 vs. forged +1)",
           thm `pos.trCmpNeg (trEq false `compareBytes `okPrimary (trSc 0xFFFFFFFF 4)) (trRefl false `compareBytes `okPrimary),
           thm `neg.trCmpPos (trEq false `compareBytes `okPrimary (trSc 1 4)) (trRefl false `compareBytes `okPrimary)) ]
@@ -644,8 +1036,20 @@ run_cmd do
     let lmDeepThms : List Name :=
       [ lmNs ++ `cmMemCopy_basic_mode, lmNs ++ `cmIntrinsic_ofDefId_defId,
         lmNs ++ `cmIntrinsic_ofDefPath_defPath, lmNs ++ `cmDecodeFnItemTyId_cmFnItemTyId,
-        lmNs ++ `cmIntrinsic_names, lmNs ++ `cmLmTableCheck_true, lmNs ++ `cmLmObserve_table,
-        lmNs ++ `cmLmObserve_copy_mode_sensitivity, lmNs ++ `cm_lm_trusted_null_zero_size_deltas,
+        lmNs ++ `cmIntrinsic_names,
+        lmNs ++ `cm_compareUnsignedBytesI32_eq_miriBytesCompare,
+        lmNs ++ `cm_evalPtrOffsetFromDistance_eq_miriSpec,
+        lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix,
+        lmNs ++ `cm_bitwiseAndBits_64_eq_u64_land,
+        lmNs ++ `cm_miri_ptrMask_u64_baseAddr_invariant,
+        lmNs ++ `cm_miri_ptrMask_eval_universal,
+        lmNs ++ `cm_miri_blackBox_eval_universal,
+        lmNs ++ `cm_miri_rawEq_eval_universal,
+        lmNs ++ `cmLmTableCheck_true, lmNs ++ `cmLmObserve_table,
+        lmNs ++ `cmLmObserve_copy_mode_sensitivity,
+        lmNs ++ `cmLmObserve_typedSwap_mode_sensitivity,
+        lmNs ++ `cmLm_hardened_hooks_witness,
+        lmNs ++ `cm_lm_trusted_null_zero_size_deltas,
         lmNs ++ `cm_lm_trusted_side_witness ]
     for n in lmDeepThms do
       let some (.thmInfo v) := env.find? n
@@ -685,12 +1089,19 @@ run_cmd do
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalBlackBoxCall,
         `MiniRustSpec.Interp.steps,
         `MiniRustSpec.Interp.stepsTB,
+        `MiniRustSpec.Interp.evalIntrinsic,
+        `MiniRustSpec.Interp.evalPtrOffsetFrom,
         `MiniRustSpec.CoreMemPtrIntrinsicsMR.cmRunTrusted,
         `MiniRustSpec.CoreMemPtrIntrinsicsMR.cmMrObserve,
         `MiniRustSpec.CoreMemPtrIntrinsicsMR.cmTrustedObserve_table,
         `MiniRustSpec.CoreMemPtrIntrinsicsMR.cmMrObserveClass_table,
         `Miri.Interpreter.Step.step,
         `Miri.Interpreter.Intrinsics.eval,
+        `Miri.Interpreter.Intrinsics.copyWith,
+        `Miri.Interpreter.Intrinsics.compareBytes,
+        `Miri.Interpreter.Intrinsics.rawEq,
+        `Miri.Interpreter.Intrinsics.typedSwap,
+        `Miri.Interpreter.Intrinsics.pointerOffsetFrom,
         `LeanMiriSpec.CoreMemPtrIntrinsicsLM.cmLmObserve,
         `LeanMiriSpec.CoreMemPtrIntrinsicsLM.cmIntrinsicHooks ]
     for req in requiredReach do
@@ -702,9 +1113,9 @@ run_cmd do
     { fileName := "<cm-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, acceptedCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 70 && bundleCount = 9 && acceptedCount = 10 && rejectedCount = 10 do
+  unless addedCount ≥ 74 && bundleCount = 9 && acceptedCount = 12 && rejectedCount = 12 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, accepted={acceptedCount}, rejected={rejectedCount})"
-  logInfo m!"cm cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, 18 fixture locks), {acceptedCount} positive controls accepted / {rejectedCount} paired negative controls rejected, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
+  logInfo m!"cm cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, 22 fixture locks), {acceptedCount} positive controls accepted / {rejectedCount} paired negative controls rejected, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
 /-! ## §3. Constructive Axiom Audit of `Anneal.Mir.CoreMemPtrIntrinsicsBundle` & Test Module -/
 
@@ -736,7 +1147,9 @@ run_cmd do
       ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.crossAuthorityFaultEquiv,
       ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.exactBehaviorEq_both,
       ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.mr_modeSensitivity_present,
+      ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.mr_typedSwap_modeSensitivity_present,
       ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.lm_modeSensitivity_present,
+      ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.lm_typedSwap_modeSensitivity_present,
       ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.variant_bundle_claims,
       ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.cm_variant_outcomes_distinct,
       ``Anneal.Mir.CoreMemPtrIntrinsicsBundle.ep2_core_mem_ptr_intrinsics_capstone ]
@@ -762,8 +1175,8 @@ run_cmd do
           throwError "bundle audit failure: {c} is a trivial theorem"
       for a in ← liftCoreM <| Lean.collectAxioms c do
         if a == ``sorryAx then throwError "bundle audit failure: {c} uses sorryAx"
-        unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
-          throwError "bundle audit failure: {c} uses non-standard axiom {a}"
+        unless a == ``propext || a == ``Quot.sound do
+          throwError "bundle audit failure: {c} uses non-constructive axiom {a}"
       bundleDecls := bundleDecls + 1
   for (c, ci) in env.constants.map₂.toList do
     if let .thmInfo v := ci then
