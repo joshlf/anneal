@@ -45,7 +45,7 @@ that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
    * The call form of `write_bytes` is modeled in `evalDirectRustIntrinsic?`
      (`evalWriteBytesCall`) and fails closed on an untracked destination
      pointer (`bdWriteBytes_untracked_unsupported`).
-   * Unmodeled intrinsics (`raw_eq`, `cold_path`) emit external
+   * Unmodeled intrinsics (`cold_path`; `raw_eq` is modeled inline, `bdRawEq_inline_ub`) emit external
      `MirCallReq` requests carrying `defPath`, `typeArgs`, `args`, and `memory`
      (`bdMirCallReq_fields`). When interpreted via `mirHandledTree`
      (`Trusted.VerificationResult`), `coldPathHandler` corresponds to
@@ -480,17 +480,15 @@ theorem bdWriteBytes_untracked_unsupported :
   rfl
 
 /-- Anneal: unmodeled intrinsics with a return target and no body in
-`Memory.callees` (`raw_eq`, `cold_path`) emit `MirStepNode.extCall` with `typeArgs` preserved,
+`Memory.callees` (`cold_path`) emit `MirStepNode.extCall` with `typeArgs` preserved,
 whereas `ctpop` and `exact_div` evaluate inline via `evalDirectRustIntrinsic?` and `abort` returns
-`MirOutcome.abort`. -/
+`MirOutcome.abort`. Since Episode 1 of `ws-tcb-core-mem-and-ptr-intrinsics`, `raw_eq` is also
+evaluated inline (`evalRawEqCall`); on the dangling, unbacked argument pointers `bdRawEqArgs`
+(allocations `1` and `2` do not exist) it is undefined behavior (`bdRawEq_inline_ub`). -/
 
-theorem bdRawEq_extCall :
-    ∃ k, stepMirFn bdRawEqCaller (initMachineState bdRawEqCaller bdRawEqArgs) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::raw_eq", typeArgs := [.uint .u32],
-          args := bdRawEqArgs,
-          memory := (initMachineState bdRawEqCaller bdRawEqArgs).memory } k :=
-  ⟨_, rfl⟩
+theorem bdRawEq_inline_ub :
+    stepMirFn bdRawEqCaller (initMachineState bdRawEqCaller bdRawEqArgs) = MirStepNode.fail .ub :=
+  rfl
 
 theorem bdColdPath_extCall :
     ∃ k, stepMirFn bdColdPathCaller (initMachineState bdColdPathCaller []) =
@@ -982,9 +980,10 @@ theorem bdPolymorphicCallee_rejected :
 `stepMirFn`:
 1. Even when `Memory.callees` links `fbBlackBoxCallee` (`typeParamCount = 0`),
    a caller passing unmonomorphized `tys = [.param 0 "T"]` (`bdPolyBlackBoxCaller`)
-   is **not** dispatched to `fbBlackBoxCallee` (`lookupCallee = none`); `stepMirFn`
-   emits `MirStepNode.extCall` carrying `typeArgs := [.param 0 "T"]` instead of
-   silently pushing a frame with erased type arguments.
+   is **not** dispatched to `fbBlackBoxCallee` (`lookupCallee = none`); since
+   Episode 1 of `ws-tcb-core-mem-and-ptr-intrinsics` `black_box` is evaluated inline
+   (`evalBlackBoxCall`), which fails closed with `MirStepNode.unsupported` on the
+   unmonomorphized `T` instead of silently pushing a frame with erased type arguments.
 2. Calling `core::intrinsics::exact_div` with unmonomorphized `RigidTy.param` or
    `RigidTy.alias` `typeArgs` fails closed immediately with
    `MirStepNode.unsupported` (`resolveIntrinsicIsSigned = none`). -/
@@ -1001,18 +1000,14 @@ def bdExactDivAliasCaller : CapturedMir :=
     [u32Decl, u32Decl, u32Decl] (some 1)
 
 theorem bdPolymorphicCall_anneal_failClosed :
-    (∃ k, stepMirFn bdPolyBlackBoxCaller
+    stepMirFn bdPolyBlackBoxCaller
         (initMachineStateWithCallees bdPolyBlackBoxCaller [.scalar ⟨7, 4⟩] [fbBlackBoxCallee]) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::black_box", typeArgs := [.param 0 "T"],
-          args := [.scalar ⟨7, 4⟩],
-          memory := (initMachineStateWithCallees bdPolyBlackBoxCaller
-            [.scalar ⟨7, 4⟩] [fbBlackBoxCallee]).memory } k) ∧
+      MirStepNode.unsupported ∧
     stepMirFn bdExactDivParamCaller
         (initMachineState bdExactDivParamCaller bdExactDivArgs) = MirStepNode.unsupported ∧
     stepMirFn bdExactDivAliasCaller
         (initMachineState bdExactDivAliasCaller bdExactDivArgs) = MirStepNode.unsupported :=
-  ⟨⟨_, rfl⟩, rfl, rfl⟩
+  ⟨rfl, rfl, rfl⟩
 
 /-- End-to-end fail-closed rejection of MIR bodies containing unmonomorphized
 `RigidTy.param` or `RigidTy.alias` locals/casts across `inFragment`,

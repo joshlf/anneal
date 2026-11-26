@@ -142,7 +142,7 @@ open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
-open Anneal.Mir.IeeeFloatCast
+open Anneal.Mir.IeeeFloatCast hiding isNaNBits isQuietNaNBits
 
 /-! ## §0. Constructive helpers -/
 

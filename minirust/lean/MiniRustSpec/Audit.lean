@@ -5667,7 +5667,7 @@ open MiniRustSpec.Correspondence in
   bdArithOffset_anneal_ret
   bdMirCallReq_fields
   bdWriteBytes_untracked_unsupported
-  bdRawEq_extCall
+  bdRawEq_inline_ub
   bdColdPath_extCall
   bdCtpop_anneal_ret
   bdExactDivI32_anneal_ret

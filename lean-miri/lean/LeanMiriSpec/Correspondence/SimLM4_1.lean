@@ -7976,7 +7976,10 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
       have hback_tf : m.stack.frames.back? = some topFrame₀ := by rw [harr]; simp
       have htf_eq : topFrame = topFrame₀ := Option.some.inj (hback.symm.trans hback_tf)
       subst htf_eq
-      have ha_base :
+      -- The non-panic (`isUnwindingPanicDefPath defPath = false`) branch is left
+      -- abstract (`rest`): it dispatches `evalDivergingRustIntrinsic?` before the
+      -- external call, and neither conjunct below depends on its shape.
+      obtain ⟨rest, ha_base⟩ : ∃ rest : MirStepNode,
           stepMirFn rootBody s =
             match isAbortingPanicDefPath defPath with
             | true => .retOutcome .abort
@@ -7987,11 +7990,7 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
                 | .running nextState => .step nextState
                 | .halted out => .retOutcome out
                 | .faulted fk => .fail fk
-              | false =>
-                .extCall
-                  { defPath := defPath, typeArgs := extractCalleeTypeArgs func,
-                    args := [], memory := s.memory }
-                  (resumeExternalDivergingCall s s.frame.locals unwind) := by
+              | false => rest := ⟨_, by
         rw [stepMirFn_activeMirBody_eq rootBody s hphase]
         have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
@@ -8002,7 +8001,7 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
         rw [hfunc]
         dsimp only [evalOperandsWithBodyCast, evalOperands]
         rw [hcallee_none, hnot_unreach]
-        rfl
+        rfl⟩
       have htk :
           (translateTerminator bb.terminator).kind =
             .Call (translateCalleeOperand func)
