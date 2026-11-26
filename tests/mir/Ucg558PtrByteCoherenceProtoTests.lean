@@ -826,6 +826,41 @@ theorem t_globalAlloc_32bit_no_bleed :
       [(0, ⟨1, 9, 0x10⟩)] 4 4 =
       some [mkInitByte 0x42, mkInitByte 0, mkInitByte 0, mkInitByte 0] := rfl
 
+/-- Cross-width image (two 32-bit fragments read as 64-bit): ref UB, raw bare address. -/
+theorem t_decode_incoherent_cross_width :
+    decodePtrBytesNoForgeProto true .thin 8
+        (encodePtrBytesProto pBig4 4 ++ encodePtrBytesProto pBig4 4) = none ∧
+    decodeTypedValueFromBytesProto 8 .fnPtr
+        (encodePtrBytesProto pBig4 4 ++ encodePtrBytesProto pBig4 4) = none ∧
+    decodePtrBytesNoForgeProto false .thin 8
+        (encodePtrBytesProto pBig4 4 ++ encodePtrBytesProto pBig4 4) =
+      some (.scalar (leValue (leImage 0x11223344 4 ++ leImage 0x11223344 4)) 8) :=
+  decode_incoherent_ref_none_raw_scalar 8 _ _ rfl rfl (coherent_cross_width_none pBig4 pBig4 4 (by decide))
+
+/-- Mixed plain/pointer bytes: ref UB, raw bare address. -/
+theorem t_decode_incoherent_mixed_plain :
+    decodePtrBytesNoForgeProto true .thin 8 ((encodePtrBytesProto pBig 8).set 3 (mkInitByte 0x55)) =
+      none ∧
+    decodeTypedValueFromBytesProto 8 .fnPtr ((encodePtrBytesProto pBig 8).set 3 (mkInitByte 0x55)) =
+      none ∧
+    decodePtrBytesNoForgeProto false .thin 8 ((encodePtrBytesProto pBig 8).set 3 (mkInitByte 0x55)) =
+      some (.scalar (leValue ((leImage 0x1122334455667788 8).set 3 0x55)) 8) :=
+  decode_incoherent_ref_none_raw_scalar 8 _ _ rfl rfl (coherent_set_plain_none pBig 8 3 0x55 (by decide))
+
+/-- `UCG#558` value-level: `p = 0` / `p + 256` splice is UB as `&T`, address `256` as `*const T`. -/
+theorem t_decode_splice_0_256_value :
+    decodePtrBytesNoForgeProto true .thin 8
+        (spliceBytes 1 (encodePtrBytesProto pZero 8) (encodePtrBytesProto p256 8)) = none ∧
+    decodePtrBytesNoForgeProto false .thin 8
+        (spliceBytes 1 (encodePtrBytesProto pZero 8) (encodePtrBytesProto p256 8)) =
+      some (.scalar (leValue ((leImage (normOffset 8 0) 8).take 1 ++
+        (leImage (normOffset 8 256) 8).drop 1)) 8) :=
+  decode_splice_ref_none_raw_scalar pZero p256 8 1 (by decide) (by decide) (by decide)
+
+theorem t_decode_splice_value_address_256 :
+    leValue ((leImage (normOffset 8 0) 8).take 1 ++ (leImage (normOffset 8 256) 8).drop 1) = 256 :=
+  rfl
+
 /-! ## 2. Prototype decoders on the adversarial inputs (independent `rfl` checks) -/
 
 /-- Live keeps provenance on these images (`LiveV06.w1_*` / `w2_*`); the prototype on the
@@ -1455,6 +1490,21 @@ theorem t_k_gap_foreign_usize_to_ptr_forges_provenance :
         [[.init .unit, .init (.ptr { allocId := 2, offsetBytes := 4 } 8)]] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_gap_foreign_usize_to_ptr_forges_provenance
 
+theorem t_w1_encode_32bit_ptr_none :
+    encodeValueToBytes 16 layouts32 rawPtrTy (.ptr { allocId := 1, offsetBytes := 0x10 } 4) =
+      none :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w1_encode_32bit_ptr_none
+
+theorem t_w3_wide_swapped_halves_matrix :
+    decodePtrBytesNoForge false .str 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true .str 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true (.slice thinTy) 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true .str 8 (liveEnc 1 1 0x10 8 ++ liveEnc 2 2 3 8) = none ∧
+    decodePtrBytesNoForge false (.dynamic "Trait") 8 (liveEnc 2 2 0x40 8 ++ liveEnc 1 1 0x10 8) =
+      some (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0x40 } 8,
+        .ptr { allocId := 1, offsetBytes := 0x10 } 8]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w3_wide_swapped_halves_matrix
+
 end RestateLiveV06
 
 namespace RestateLiveV08
@@ -1886,6 +1936,21 @@ theorem t_k_gap_foreign_usize_to_ptr_forges_provenance :
       .step (foreignActive (.init (.scalar ⟨0x20004, 8⟩)))
         [[.init .unit, .init (.ptr { allocId := 2, offsetBytes := 4 } 8)]] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_gap_foreign_usize_to_ptr_forges_provenance
+
+theorem t_w1_encode_32bit_ptr_none :
+    encodeValueToBytes 16 layouts32 rawPtrTy (.ptr { allocId := 1, offsetBytes := 0x10 } 4) =
+      none :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w1_encode_32bit_ptr_none
+
+theorem t_w3_wide_swapped_halves_matrix :
+    decodePtrBytesNoForge false .str 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true .str 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true (.slice thinTy) 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true .str 8 (liveEnc 1 1 0x10 8 ++ liveEnc 2 2 3 8) = none ∧
+    decodePtrBytesNoForge false (.dynamic "Trait") 8 (liveEnc 2 2 0x40 8 ++ liveEnc 1 1 0x10 8) =
+      some (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0x40 } 8,
+        .ptr { allocId := 1, offsetBytes := 0x10 } 8]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w3_wide_swapped_halves_matrix
 
 end RestateLiveV08
 

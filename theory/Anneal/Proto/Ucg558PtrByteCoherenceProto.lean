@@ -38,7 +38,9 @@ every divergence witness evaluates the real, unmodified live definitions.
   wide `&dyn` value whose vtable half is `.ptr`. Moreover, union raw-byte overlays
   (`encodeRawAbstractByteVals` / `overlayRawAbstractByteVals`, `Places.lean:6953-6982`) pack
   each provenance-bearing byte into `.ptr ⟨a, b⟩ 1`, dropping `tag` and leaving no slot for
-  `PtrByteFrag` metadata. Slice/`str` metadata with provenance is rejected.
+  `PtrByteFrag` metadata. Slice/`str` metadata with provenance and swapped slice/`str` halves
+  are rejected (raw and ref). 32-bit pointers decode (`pointerBits := 32`) but cannot be
+  encoded (`encodeValueToBytes` matches only `.ptr p 8`) nor decoded at a pointer `ScalarLayout`.
 * **`Kani#5205`.** Typed `bool` / `Unaligned<bool>` byte decodes fault at read time, and
   `MaybeUninit<bool>` / `MaybeUninit<MaybeUninit<bool>>` hold `2u8`; but active-frame
   `copy_nonoverlapping` into a `bool` local (or via `*mut Unaligned<bool>`, or union→non-union)
@@ -2596,6 +2598,49 @@ theorem globalAlloc_misaligned_read_strips (n relocOff k : Nat) (hk0 : 0 < k) (h
   simp only [hrel0, Nat.add_sub_cancel_left] at hget
   exact coherent_none_of_byteIdx_ne n out 0 b0 _ hget (Nat.ne_of_gt hk0)
 
+/-- **Value-level stripping for EVERY incoherent initialized image (universal):** whenever a
+fully initialized `n`-byte image fails the fragment-coherence check — byte reversal, any moved
+byte, offset/tag/allocation splice, mixed plain/pointer bytes, cross-width fragments — a thin
+reference (and `fn` pointer) read is UB and a thin raw-pointer read yields exactly the
+provenance-less address of the data bytes. -/
+theorem decode_incoherent_ref_none_raw_scalar (n : Nat) (l : List AbstractByteProto)
+    (d : List UInt8) (hlen : l.length = n) (hd : dataBytesProto l = some d)
+    (hc : abstractBytesCoherentPtrProvProto n l = none) :
+    decodePtrBytesNoForgeProto true .thin n l = none ∧
+    decodeTypedValueFromBytesProto n .fnPtr l = none ∧
+    decodePtrBytesNoForgeProto false .thin n l = some (.scalar (leValue d) n) := by
+  have hb : Nat.beq l.length n = true := by rw [hlen]; exact Nat.beq_refl n
+  refine ⟨?_, ?_, ?_⟩ <;>
+    simp only [decodeTypedValueFromBytesProto, decodePtrBytesNoForgeProto,
+      decodeThinPtrBytesProto, hb, hd, hc]
+
+/-- **Value-level `UCG#558` splice stripping (universal):** the `p₁`-prefix / `p₂`-suffix splice
+(`0 < k < n`, differing allocation, tag, or normalized offset — e.g. `p` / `p + 256`) is UB as
+a reference and a bare address as a raw pointer. -/
+theorem decode_splice_ref_none_raw_scalar (p₁ p₂ : ProvenancePtrProto) (n k : Nat) (hk0 : 0 < k)
+    (hkn : k < n)
+    (hne : (p₁.allocId, p₁.tag, normOffset n p₁.offsetBytes) ≠
+      (p₂.allocId, p₂.tag, normOffset n p₂.offsetBytes)) :
+    decodePtrBytesNoForgeProto true .thin n
+        (spliceBytes k (encodePtrBytesProto p₁ n) (encodePtrBytesProto p₂ n)) = none ∧
+    decodePtrBytesNoForgeProto false .thin n
+        (spliceBytes k (encodePtrBytesProto p₁ n) (encodePtrBytesProto p₂ n)) =
+      some (.scalar (leValue ((leImage (normOffset n p₁.offsetBytes) n).take k ++
+        (leImage (normOffset n p₂.offsetBytes) n).drop k)) n) := by
+  have hl₁ := encodePtrBytesProto_length p₁ n
+  have hl₂ := encodePtrBytesProto_length p₂ n
+  have hlen : (spliceBytes k (encodePtrBytesProto p₁ n) (encodePtrBytesProto p₂ n)).length = n := by
+    simp only [spliceBytes, List.length_append, List.length_take, List.length_drop, hl₁, hl₂,
+      Nat.min_eq_left (Nat.le_of_lt hkn), Nat.add_sub_of_le (Nat.le_of_lt hkn)]
+  have hds := dataBytesProto_append _ _ _ _
+    (dataBytesProto_take _ _ k (dataBytesProto_encode p₁.allocId p₁.tag
+      (normOffset n p₁.offsetBytes) n (normOffset n p₁.offsetBytes) 0 n))
+    (dataBytesProto_drop _ _ k (dataBytesProto_encode p₂.allocId p₂.tag
+      (normOffset n p₂.offsetBytes) n (normOffset n p₂.offsetBytes) 0 n))
+  have h := decode_incoherent_ref_none_raw_scalar n _ _ hlen hds
+    (coherent_splice_none p₁ p₂ n k hk0 hkn hne)
+  exact ⟨h.1, h.2.2⟩
+
 /-! ## 10. Projections onto the live `AbstractByte` (both rustc snapshots) -/
 
 def AbstractByteProto.toLive06 : AbstractByteProto →
@@ -2866,6 +2911,26 @@ theorem w1_decodeValueFromBytes_forges_prov :
 8-byte pointers, so `decodeScalarLayoutBytesNoForge` rejects valid 32-bit pointer images. -/
 theorem w1_scalarLayout_32bit_none :
     decodeScalarLayoutBytesNoForge ptrScalarInit (liveEnc 1 1 0x11223344 4) = none := rfl
+
+/-- **Live 32-bit encoder gap (`Bytes.lean:1146-1174`):** `encodeValueToBytes` only matches
+`.ptr p 8`, so a 32-bit raw pointer value cannot be encoded at all, even though
+`decodeTypedValueFromBytes` decodes 32-bit images under `pointerBits := 32`
+(`w1_typed_rawPtr_rev4_32bit`). -/
+theorem w1_encode_32bit_ptr_none :
+    encodeValueToBytes 16 layouts32 rawPtrTy (.ptr { allocId := 1, offsetBytes := 0x10 } 4) =
+      none := rfl
+
+/-- **W3 swapped-halves matrix (`*const str`, `&str`, `&[u8]`, `*const dyn Trait`):** swapped
+slice/`str` halves (length first) are rejected for raw and ref; swapped intact `*const dyn`
+halves only exchange provenance (no forging; vtable validity is a separate check). -/
+theorem w3_wide_swapped_halves_matrix :
+    decodePtrBytesNoForge false .str 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true .str 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true (.slice thinTy) 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true .str 8 (liveEnc 1 1 0x10 8 ++ liveEnc 2 2 3 8) = none ∧
+    decodePtrBytesNoForge false (.dynamic "Trait") 8 (liveEnc 2 2 0x40 8 ++ liveEnc 1 1 0x10 8) =
+      some (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0x40 } 8,
+        .ptr { allocId := 1, offsetBytes := 0x10 } 8]) := ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Two adjacent identical pointers `[p, p]` (`allocId = 1`, `offsetBytes = 0x10`) in a global
 static `CapturedAllocation` (relocations at byte offsets `0` and `8`). -/
@@ -3606,6 +3671,26 @@ theorem w1_decodeValueFromBytes_forges_prov :
 8-byte pointers, so `decodeScalarLayoutBytesNoForge` rejects valid 32-bit pointer images. -/
 theorem w1_scalarLayout_32bit_none :
     decodeScalarLayoutBytesNoForge ptrScalarInit (liveEnc 1 1 0x11223344 4) = none := rfl
+
+/-- **Live 32-bit encoder gap (`Bytes.lean:1146-1174`):** `encodeValueToBytes` only matches
+`.ptr p 8`, so a 32-bit raw pointer value cannot be encoded at all, even though
+`decodeTypedValueFromBytes` decodes 32-bit images under `pointerBits := 32`
+(`w1_typed_rawPtr_rev4_32bit`). -/
+theorem w1_encode_32bit_ptr_none :
+    encodeValueToBytes 16 layouts32 rawPtrTy (.ptr { allocId := 1, offsetBytes := 0x10 } 4) =
+      none := rfl
+
+/-- **W3 swapped-halves matrix (`*const str`, `&str`, `&[u8]`, `*const dyn Trait`):** swapped
+slice/`str` halves (length first) are rejected for raw and ref; swapped intact `*const dyn`
+halves only exchange provenance (no forging; vtable validity is a separate check). -/
+theorem w3_wide_swapped_halves_matrix :
+    decodePtrBytesNoForge false .str 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true .str 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true (.slice thinTy) 8 (livePlain 3 8 ++ liveEnc 1 1 0x10 8) = none ∧
+    decodePtrBytesNoForge true .str 8 (liveEnc 1 1 0x10 8 ++ liveEnc 2 2 3 8) = none ∧
+    decodePtrBytesNoForge false (.dynamic "Trait") 8 (liveEnc 2 2 0x40 8 ++ liveEnc 1 1 0x10 8) =
+      some (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0x40 } 8,
+        .ptr { allocId := 1, offsetBytes := 0x10 } 8]) := ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Two adjacent identical pointers `[p, p]` (`allocId = 1`, `offsetBytes = 0x10`) in a global
 static `CapturedAllocation` (relocations at byte offsets `0` and `8`). -/
