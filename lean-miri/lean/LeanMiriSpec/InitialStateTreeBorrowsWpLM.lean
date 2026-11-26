@@ -67,7 +67,29 @@ and `LeanMiriSpec.Correspondence.translateBody`-lowered `CapturedMir` bodies —
      correspondence, and full 3-way triangle `MiriTreeBorrowsV2026 ↔ V2026_06_01 ↔ Miri.TreeBorrows`.
    - Concrete positive executions AND bidirectional `↔` negative UB refutations across
      `translateBody`-lowered `CapturedMir`, `BorrowTree`, `Allocation`, and `CallDispatchMachine`.
+   - §4.2: Tree Borrows UB (protected two-phase conflict write, frozen local write) on REAL
+     `V2026_06_01` `CapturedMir` bodies reached by real `stepMirFn` steps from a concrete initial
+     state, with exact per-cell agreement `treeBorrowNodeAccess` ↔ `miriPerformLocAccess` ↔
+     vendored `Miri.TreeBorrows.performAccess`.
 5. **§5 (Capstone & Silent Import-Isolation / Bridge-Reality / 3-Axiom Audit)**.
+
+**Precise import-isolation guarantee (checked by the §5 `run_cmd`).** On toolchain
+`v4.34.1`, the Lean/Std toolchain libraries themselves load `Std.Do.*` / `Std.Tactic.Do.*`
+(`Std` imports `Std.Do`; `Lean.Meta.Sym.Pattern` / `Lean.Parser.Tactic` import
+`Std.Do.Triple.Basic` / `Std.Tactic.Do.Syntax`), and unmodified vendored `Miri.*` imports `Std`
+and `Lean` (e.g. `Miri.ABI.Size`, `Miri.DataStructures.DedupRangeMap`). A module importing vendored
+`Miri.*` therefore CANNOT avoid having `Std.Do` modules in its environment header. The §5 audit
+enforces the strongest achievable form of isolation instead:
+- (a) this module directly imports no `Std.Do` / `Std.Tactic.Do` / `Std.WP` / `MiniRustSpec` module,
+  and no `MiniRustSpec.*` module is loaded transitively at all;
+- (b) toolchain containment: EVERY loaded module that directly imports a `Std.Do` / `Std.Tactic.Do` /
+  `Std.WP` module is itself a toolchain module (`Init.*` / `Std.*` / `Lean.*`) — no project, vendored,
+  or third-party module bridges into `Std.Do`;
+- (c) `Anneal.MiriTreeBorrowsV2026`'s full transitive import closure contains ZERO `Std.Do`, `Lean`,
+  `Miri`, `LeanMiriSpec`, or `MiniRustSpec` modules;
+- (d) the full transitive CONSTANT-dependency closure (types AND values, through vendored `Miri.*`,
+  `Trusted.*`, and the core library) of every declaration of this module contains ZERO `Std.Do.*`,
+  `Std.Tactic.Do.*`, `Std.WP.*`, or `MiniRustSpec.*` constants.
 -/
 
 namespace LeanMiriSpec.InitialStateTreeBorrowsWpLM
@@ -1284,6 +1306,59 @@ theorem miriObserveMemory_state_immutable [DecidableEq P] [PointerProvenance P]
         · intro _ _ h; cases h
         · intro _ _ h; cases h; rfl
 
+/-- **Bridge to real vendored Miri `get_alloc_raw` (`MemoryLifecycle.getAllocRaw`)**:
+`lookupLiveAlloc` is EXACTLY the live-map hit branch of unmodified
+`Miri.Memory.MemoryLifecycle.getAllocRaw`. Whenever `lookupLiveAlloc` finds `alloc`, the real Miri
+lookup returns `.ok alloc` for EVERY hook state, global machine kind, and
+`GlobalAllocationHooks`, leaves `MemoryState` IDENTICALLY unchanged, and only re-synchronizes the
+hook state — so `miriObserveMemoryAction` observes precisely the allocation real Miri reads. -/
+theorem lookupLiveAlloc_eq_getAllocRaw_live [DecidableEq P] [PointerProvenance P]
+    {HookState : Type}
+    (st : MiriObservedState P) (allocId : Miri.Memory.AllocId) (alloc : Allocation P BorrowTree)
+    (hooksState : HookState) (globalKind : Option Unit)
+    (hooks : GlobalAllocationHooks P BorrowTree Unit HookState)
+    (hLive : lookupLiveAlloc st allocId = some alloc) :
+    MemoryLifecycle.getAllocRaw st.memory hooksState allocId globalKind hooks =
+      ⟨st.memory, hooks.synchronizeMemory st.memory hooksState, .ok alloc⟩ := by
+  unfold lookupLiveAlloc at hLive
+  unfold MemoryLifecycle.getAllocRaw
+  cases hF : st.memory.live.find? (fun old => old.1 == allocId) with
+  | none => rw [hF] at hLive; cases hLive
+  | some entry =>
+    rw [hF] at hLive
+    cases hLive
+    simp only [Id.run]
+    rfl
+
+/-- **Observation through real Miri `getAllocRaw` (`miriObserveMemory_agrees_getAllocRaw`)**: on a
+live allocation, `miriObserveMemoryAction` returns EXACTLY the unmodified
+`Allocation.readScalar` / `Allocation.getBytesStripProvenance` result on the allocation returned
+by real `MemoryLifecycle.getAllocRaw`, whose memory component equals the input memory. -/
+theorem miriObserveMemory_agrees_getAllocRaw [DecidableEq P] [PointerProvenance P]
+    {HookState : Type}
+    (layout : TargetDataLayout) (allocId : Miri.Memory.AllocId) (query : MiriObserveQuery)
+    (st : MiriObservedState P) (alloc : Allocation P BorrowTree)
+    (hooksState : HookState) (globalKind : Option Unit)
+    (hooks : GlobalAllocationHooks P BorrowTree Unit HookState)
+    (hLive : lookupLiveAlloc st allocId = some alloc) :
+    let r := MemoryLifecycle.getAllocRaw st.memory hooksState allocId globalKind hooks
+    r.memory = st.memory ∧ r.outcome = .ok alloc ∧
+    miriObserveMemoryAction layout allocId query st =
+      (match query with
+       | .scalar range readProv =>
+         match alloc.readScalar layout range readProv with
+         | .ok sc => .ok (.scalar sc) st
+         | .error err => .error (.allocError err) st
+       | .bytes range =>
+         match alloc.getBytesStripProvenance layout range with
+         | .ok bs => .ok (.bytes bs) st
+         | .error err => .error (.allocError err) st) := by
+  dsimp only
+  rw [lookupLiveAlloc_eq_getAllocRaw_live st allocId alloc hooksState globalKind hooks hLive]
+  refine ⟨rfl, rfl, ?_⟩
+  unfold miriObserveMemoryAction
+  rw [hLive]
+
 /-! ### §3.1. Composing `miriObserveMemoryExactWP_iff` with Tree Borrows Range, Instruction & Call-Dispatch WP -/
 
 /-- Lift a single-allocation `BorrowTree.performBorrowAccessRange` onto `MiriObservedState P`
@@ -2257,6 +2332,137 @@ theorem witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub :
     intro hFalse
     exact hFalse
 
+/-! ### §4.2. Real `V2026_06_01` `CapturedMir` Tree Borrows UB ↔ `Anneal.MiriTreeBorrowsV2026` ↔ Vendored `Miri.TreeBorrows` -/
+
+section V2026CapturedMirTreeBorrowsUB
+
+open Trusted.Rustc.V2026_06_01.MirSemantics
+  (stepMirFn MachineState MirStepNode treeBorrowNodeAccess emptyMemory)
+
+private def tbStmt (k : Trusted.Rustc.V2026_06_01.MirAst.StatementKind) :
+    Trusted.Rustc.V2026_06_01.MirAst.Statement :=
+  { kind := k, span := "ep1-tb" }
+private def tbLoc (i : Nat) : Trusted.Rustc.V2026_06_01.MirAst.Place :=
+  { local_ := i, projection := [] }
+private def tbDeref (i : Nat) : Trusted.Rustc.V2026_06_01.MirAst.Place :=
+  { local_ := i, projection := [.deref] }
+private def tbU64 : Trusted.Rustc.V2026_06_01.MirAst.Ty := { kind := .uint .u64, layoutIdx := 0 }
+private def tbDecl (ty : Trusted.Rustc.V2026_06_01.MirAst.Ty) : LocalDecl :=
+  { mutability := .mut, ty := ty, debugName := none }
+private def tbConstU64 (n : Nat) : Trusted.Rustc.V2026_06_01.MirAst.Operand :=
+  .constant { ty := tbU64, val := .scalar (.int ⟨n, 8⟩) }
+private def tbU64Layout : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+private def tbBody (name : String) (decls : List LocalDecl)
+    (stmts : List Trusted.Rustc.V2026_06_01.MirAst.Statement) : CapturedMir :=
+  { defPath := name
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 0
+    localDecls := decls
+    basicBlocks :=
+      [{ statements := stmts, terminator := { kind := .return_, span := "ep1-tb" },
+         isCleanup := false }]
+    fnAbi := { args := [], ret := { layout := tbU64Layout, mode := .direct },
+               conv := .rust, canUnwind := false }
+    layouts := emptyLayoutTable
+    allocations := [] }
+
+/-- Satisfiable concrete initial `V2026_06_01` machine state: `_1 = 5_u64`, empty borrow table. -/
+private def tbInit : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨5, 8⟩), .uninit, .uninit] }
+    memory := emptyMemory }
+
+private def tbNext (b : CapturedMir) (s : MachineState) : MachineState :=
+  match stepMirFn b s with
+  | .step s' => s'
+  | _ => s
+
+/-- Real `V2026_06_01` `CapturedMir` (protected two-phase conflict UB):
+```text
+bb0: _2 = &mut _1;           // tag 1, ReservedFrz false
+     Retag([fn entry] _2);   // tag 2, PROTECTED ReservedFrz false (protector 1)
+     _3 = &_1;               // tag 3, Frozen
+     _0 = copy (*_3);        // foreign read for tag 2: conflicted latch set
+     (*_2) = const 9;        // child write through protected conflicted tag 2: UB
+     return
+``` -/
+def ep1BodyProtectedConflictUB : CapturedMir :=
+  tbBody "ep1::protected_conflict_ub"
+    [tbDecl tbU64, tbDecl tbU64,
+     tbDecl { kind := .ref .mut (.uint .u64), layoutIdx := 0 },
+     tbDecl { kind := .ref .not (.uint .u64), layoutIdx := 0 }]
+    [tbStmt (.assign (tbLoc 2) (.ref (.mut false) (tbLoc 1))),
+     tbStmt (.retag .fnEntry (tbLoc 2)),
+     tbStmt (.assign (tbLoc 3) (.ref .shared (tbLoc 1))),
+     tbStmt (.assign (tbLoc 0) (.use (.copy (tbDeref 3)))),
+     tbStmt (.assign (tbDeref 2) (.use (tbConstU64 9)))]
+
+/-- Real `V2026_06_01` `CapturedMir` (frozen local write UB through a `&T`-derived `*mut T`):
+```text
+bb0: _2 = &_1;               // tag 1, Frozen
+     _3 = &raw mut (*_2);    // raw pointer inherits tag 1
+     (*_3) = const 9;        // local write through Frozen tag 1: UB
+     return
+``` -/
+def ep1BodyFrozenWriteUB : CapturedMir :=
+  tbBody "ep1::frozen_write_ub"
+    [tbDecl tbU64, tbDecl tbU64,
+     tbDecl { kind := .ref .not (.uint .u64), layoutIdx := 0 },
+     tbDecl { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }]
+    [tbStmt (.assign (tbLoc 2) (.ref .shared (tbLoc 1))),
+     tbStmt (.assign (tbLoc 3) (.rawPtr .mut (tbDeref 2))),
+     tbStmt (.assign (tbDeref 3) (.use (tbConstU64 9)))]
+
+/-- **End-to-end Tree Borrows UB witnesses on REAL `V2026_06_01` `CapturedMir` bodies, with exact
+3-way cell agreement (`V2026_06_01.MirSemantics` ↔ `Anneal.MiriTreeBorrowsV2026` ↔ vendored
+`Miri.TreeBorrows`)**. Every faulting state is REACHED by real `stepMirFn` steps from the concrete,
+satisfiable initial state `tbInit` (no hypotheses):
+1. Protected two-phase conflict: four real steps build borrow table
+   `[3 ↦ Frozen, 2 ↦ ReservedFrz true (protector 1), 1 ↦ ReservedFrz false]` with protector `1`
+   active, then the child write through tag `2` faults with `.fail .ub`.
+2. Frozen local write: two real steps build `[1 ↦ Frozen]`, then the write through the
+   `&T`-derived `*mut T` (tag `1`) faults with `.fail .ub`.
+3. For both faulting cells, unmodified V2026 `treeBorrowNodeAccess` yields `.ub`,
+   `Anneal.MiriTreeBorrowsV2026.miriPerformLocAccess` faults with `.childAccessForbidden`, and
+   unmodified vendored `Miri.TreeBorrows.performAccess` yields `.UndefinedBehavior`. -/
+theorem witness_v2026_capturedMir_tree_borrows_ub_triangle :
+    (let b := ep1BodyProtectedConflictUB
+     let s1 := tbNext b tbInit
+     let s2 := tbNext b s1
+     let s3 := tbNext b s2
+     let s4 := tbNext b s3
+     stepMirFn b tbInit = .step s1 ∧ stepMirFn b s1 = .step s2 ∧
+     stepMirFn b s2 = .step s3 ∧ stepMirFn b s3 = .step s4 ∧
+     s4.memory.activeProtectors = [1] ∧
+     s4.memory.borrows.map (fun e => (e.tag, e.perm, e.protector)) =
+       [(3, .frozen, none), (2, .reservedFrz true, some 1), (1, .reservedFrz false, none)] ∧
+     stepMirFn b s4 = .fail .ub) ∧
+    (let b := ep1BodyFrozenWriteUB
+     let s1 := tbNext b tbInit
+     let s2 := tbNext b s1
+     stepMirFn b tbInit = .step s1 ∧ stepMirFn b s1 = .step s2 ∧
+     s2.memory.borrows.map (fun e => (e.tag, e.perm, e.protector)) = [(1, .frozen, none)] ∧
+     stepMirFn b s2 = .fail .ub) ∧
+    treeBorrowNodeAccess .write .localAccess (.reservedFrz true) true = .ub ∧
+    miriPerformLocAccess 2 ⟨v2026PermToMiri (.reservedFrz true), true, .none⟩ .write
+        .localAccess true =
+      .err ⟨.reservedFrz true, true, .none⟩ (.childAccessForbidden 2 (.reservedFrz true)) ∧
+    Miri.TreeBorrows.performAccess .Write .LocalAccess (.ReservedFrz true) true =
+      .UndefinedBehavior ∧
+    treeBorrowNodeAccess .write .localAccess .frozen false = .ub ∧
+    miriPerformLocAccess 1 ⟨v2026PermToMiri .frozen, true, .none⟩ .write .localAccess false =
+      .err ⟨.frozen, true, .none⟩ (.childAccessForbidden 1 .frozen) ∧
+    Miri.TreeBorrows.performAccess .Write .LocalAccess .Frozen false = .UndefinedBehavior :=
+  ⟨⟨by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl⟩,
+   ⟨by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+   rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+end V2026CapturedMirTreeBorrowsUB
+
 end CrossLayerCorrespondence
 
 /-! ## §5. Episode 1 Capstone & Silent Import-Isolation / Bridge-Reality / 3-Axiom Audit -/
@@ -2304,6 +2510,8 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
     (type_of% @miriObserveBytes_state_immutable) ∧
     (type_of% @miriObserveMemoryExactWP_iff) ∧
     (type_of% @miriObserveMemory_state_immutable) ∧
+    (type_of% @lookupLiveAlloc_eq_getAllocRaw_live) ∧
+    (type_of% @miriObserveMemory_agrees_getAllocRaw) ∧
     (type_of% @miriObserveMemory_then_treeRange_exactWP_iff) ∧
     (type_of% @miriTreeRange_preserves_allocObservation) ∧
     (type_of% @miriObserveMemory_then_instruction_exactWP_iff) ∧
@@ -2320,7 +2528,8 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
     (type_of% @witness_negative_tree_protected_foreign_and_frozen_local_write_ub) ∧
     (type_of% @witness_negative_uninit_memory_observation_refutation) ∧
     (type_of% @witness_call_dispatch_positive_and_negative_refutations) ∧
-    (type_of% @witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub) :=
+    (type_of% @witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub) ∧
+    (type_of% @witness_v2026_capturedMir_tree_borrows_ub_triangle) :=
   ⟨@miriTreeNewChildExactWP_iff, @miriTreeInitialSetupExactWP_iff, @miriTreeRangeExactWP_iff,
    @miriTreeRangeSymbolicExactWP_iff, @miriTreeInitAndRangeExactWP_iff,
    @miriTreeRangeSeqExactWP_iff, @miriTreeRangeChainExactWP_iff,
@@ -2337,6 +2546,7 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
    @miriObserveBytes_uninit_err_exactWP, @miriObserveBytes_ok_exactWP,
    @miriObserveScalar_state_immutable, @miriObserveBytes_state_immutable,
    @miriObserveMemoryExactWP_iff, @miriObserveMemory_state_immutable,
+   @lookupLiveAlloc_eq_getAllocRaw_live, @miriObserveMemory_agrees_getAllocRaw,
    @miriObserveMemory_then_treeRange_exactWP_iff, @miriTreeRange_preserves_allocObservation,
    @miriObserveMemory_then_instruction_exactWP_iff,
    @miriObserveMemory_then_callDispatch_exactWP_iff,
@@ -2350,47 +2560,81 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
    @witness_negative_tree_protected_foreign_and_frozen_local_write_ub,
    @witness_negative_uninit_memory_observation_refutation,
    @witness_call_dispatch_positive_and_negative_refutations,
-   @witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub⟩
+   @witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub,
+   @witness_v2026_capturedMir_tree_borrows_ub_triangle⟩
 
 section AxiomAndIsolationAudit
 open Lean Elab Command
 
 run_cmd do
   let env ← getEnv
-  -- 1. Strict transitive MiniRustSpec exclusion across ALL loaded modules.
+  let isDoName : Lean.Name → Bool := fun u =>
+    (`Std.Do).isPrefixOf u || (`Std.Tactic.Do).isPrefixOf u || (`Std.WP).isPrefixOf u
+  let isToolchain : Lean.Name → Bool := fun m =>
+    (`Init).isPrefixOf m || (`Std).isPrefixOf m || (`Lean).isPrefixOf m
+  let ns := `LeanMiriSpec.InitialStateTreeBorrowsWpLM
+  -- 1. (a) Strict transitive MiniRustSpec exclusion across ALL loaded modules.
   for modName in env.header.moduleNames do
     if (`MiniRustSpec).isPrefixOf modName then
       throwError "import-isolation violation: {modName} must not be imported"
-  -- 2. Strict Std.Do / Std.Tactic.Do / Std.WP exclusion:
-  --    (a) Zero direct imports by this module;
-  --    (b) Zero direct imports by ANY project module (Anneal.*, LeanMiriSpec.*, Trusted.*, Miri.*)
-  --        in the transitive import graph;
-  --    (c) Zero constant references in ANY declaration of this module.
+  -- 2. (a) Zero direct Std.Do / Std.Tactic.Do / Std.WP imports by this module.
   for imp in env.header.imports do
-    if (`Std.Do).isPrefixOf imp.module || (`Std.Tactic.Do).isPrefixOf imp.module ||
-        (`Std.WP).isPrefixOf imp.module then
+    if isDoName imp.module then
       throwError "Std.Do isolation violation: direct import {imp.module} is forbidden"
+  -- 2. (b) Toolchain containment: EVERY loaded module that directly imports a Std.Do module is
+  --        itself a toolchain module (Init.* / Std.* / Lean.*): no project, vendored, or
+  --        third-party module bridges into Std.Do.
+  let mut idx : Lean.NameMap Nat := {}
   for i in [:env.header.moduleNames.size] do
     let modName := env.header.moduleNames[i]!
-    if (`Anneal).isPrefixOf modName || (`LeanMiriSpec).isPrefixOf modName ||
-        (`Trusted).isPrefixOf modName || (`Miri).isPrefixOf modName then
+    idx := idx.insert modName i
+    unless isToolchain modName do
       if h : i < env.header.moduleData.size then
         for imp in env.header.moduleData[i].imports do
-          if (`Std.Do).isPrefixOf imp.module || (`Std.Tactic.Do).isPrefixOf imp.module ||
-              (`Std.WP).isPrefixOf imp.module then
-            throwError "Std.Do transitive violation: project module {modName} imports {imp.module}"
-  let ns := `LeanMiriSpec.InitialStateTreeBorrowsWpLM
-  for (c, info) in env.constants.map₂.toList do
-    if ns.isPrefixOf c then
-      let used := info.type.getUsedConstants ++
-        match info with
-        | .defnInfo v => v.value.getUsedConstants
-        | .thmInfo v => v.value.getUsedConstants
-        | _ => #[]
-      for u in used do
-        if (`Std.Do).isPrefixOf u || (`Std.Tactic.Do).isPrefixOf u ||
-            (`Std.WP).isPrefixOf u || (`MiniRustSpec).isPrefixOf u then
-          throwError "isolation reference violation: {c} references {u}"
+          if isDoName imp.module then
+            throwError "Std.Do containment violation: non-toolchain module {modName} imports {imp.module}"
+  -- 2. (c) `Anneal.MiriTreeBorrowsV2026`'s full transitive import closure is Std.Do-, Lean-,
+  --        Miri-, LeanMiriSpec-, and MiniRustSpec-free.
+  let mut seenM : Lean.NameSet := {}
+  let mut todoM : Array Lean.Name := #[`Anneal.MiriTreeBorrowsV2026]
+  while !todoM.isEmpty do
+    let m := todoM.back!
+    todoM := todoM.pop
+    if seenM.contains m then continue
+    seenM := seenM.insert m
+    if isDoName m || (`Lean).isPrefixOf m || (`MiniRustSpec).isPrefixOf m ||
+        (`Miri).isPrefixOf m || (`LeanMiriSpec).isPrefixOf m then
+      throwError "Anneal.MiriTreeBorrowsV2026 import-closure violation: reaches {m}"
+    if let some i := idx.find? m then
+      if h : i < env.header.moduleData.size then
+        for imp in env.header.moduleData[i].imports do
+          todoM := todoM.push imp.module
+  unless seenM.contains `Trusted.Rustc.V2026_06_01.MirSemantics.Statements do
+    throwError "Anneal.MiriTreeBorrowsV2026 import-closure audit vacuous"
+  -- 2. (d) The full transitive CONSTANT-dependency closure (types AND values) of every
+  --        declaration of this module contains ZERO Std.Do / Std.Tactic.Do / Std.WP /
+  --        MiniRustSpec constants.
+  let mut seenC : Lean.NameSet := {}
+  let mut todoC : Array Lean.Name := #[]
+  for (c, _) in env.constants.map₂.toList do
+    if ns.isPrefixOf c then todoC := todoC.push c
+  while !todoC.isEmpty do
+    let n := todoC.back!
+    todoC := todoC.pop
+    if seenC.contains n then continue
+    seenC := seenC.insert n
+    if isDoName n || (`MiniRustSpec).isPrefixOf n then
+      throwError "constant-closure isolation violation: {ns} transitively depends on {n}"
+    if let some ci := env.find? n then
+      for u in ci.type.getUsedConstants do
+        unless seenC.contains u do todoC := todoC.push u
+      if let some v := ci.value? (allowOpaque := true) then
+        for u in v.getUsedConstants do
+          unless seenC.contains u do todoC := todoC.push u
+  unless seenC.contains `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange &&
+      seenC.contains `Miri.Interpreter.Step.step &&
+      seenC.contains `Miri.Memory.MemoryLifecycle.getAllocRaw do
+    throwError "constant-closure isolation audit vacuous"
   -- 3. Bridge-reality audit: confirm our theorems genuinely reach REAL vendored Miri,
   --    Anneal.MiriTreeBorrowsV2026, AnnealExactWP, and translateBody.
   let bridgeReq : List (Lean.Name × Lean.Name) :=
@@ -2406,6 +2650,8 @@ run_cmd do
       (ns ++ `miriObserveScalarExactWP_iff, `Miri.Memory.Allocation.readScalar),
       (ns ++ `miriObserveBytesExactWP_iff, `Miri.Memory.Allocation.getBytesStripProvenance),
       (ns ++ `miriObserveMemoryExactWP_iff, `Miri.Memory.Allocation.readScalar),
+      (ns ++ `lookupLiveAlloc_eq_getAllocRaw_live, `Miri.Memory.MemoryLifecycle.getAllocRaw),
+      (ns ++ `miriObserveMemory_agrees_getAllocRaw, `Miri.Memory.MemoryLifecycle.getAllocRaw),
       (ns ++ `miriV2026_performPermAccess_eq_vendored_performAccess,
         `Anneal.MiriTreeBorrowsV2026.miriPerformPermAccess),
       (ns ++ `miriV2026_performPermAccess_eq_vendored_performAccess,
@@ -2414,6 +2660,12 @@ run_cmd do
         `Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowPermTransition),
       (ns ++ `witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub,
         `LeanMiriSpec.Correspondence.translateBody),
+      (ns ++ `witness_v2026_capturedMir_tree_borrows_ub_triangle,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `witness_v2026_capturedMir_tree_borrows_ub_triangle,
+        `Anneal.MiriTreeBorrowsV2026.miriPerformLocAccess),
+      (ns ++ `witness_v2026_capturedMir_tree_borrows_ub_triangle,
+        `Miri.TreeBorrows.performAccess),
       (ns ++ `miriTreeRangeExactWP_iff, `Anneal.ExactWpAndSmartCtors.AnnealExactWP) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"

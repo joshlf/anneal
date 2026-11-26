@@ -802,22 +802,28 @@ inductive MiriV2026AllocInfo : Type where
   | dead : MiriV2026AllocInfo
   | live (mutability : Mutability) : MiriV2026AllocInfo
 
-/-- Inspects `allocId` against unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.Memory`:
-- Global allocations in `mem.globals` (`lookupGlobalAlloc`) are `.live ga.mutability`, unless a
-  matching `BorrowEntry` in `mem.borrows` marks `allocDead = true` (`.dead`).
-- Stack-borrow allocations tracked in `mem.borrows` (`lookupBorrow`) are `.dead` when
-  `allocDead = true` (e.g. after `disableLocalBorrows` / `disableFrameBorrows`), and `.live .mut`
-  otherwise.
+/-- Inspects `allocId` against unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.Memory`, using
+EXACTLY V2026's own pointer-resolution precedence (`ptrAllocByteBound?`, place reads/writes,
+unsizing coercions): `mem.borrows` is consulted FIRST (`lookupBorrow`) and `mem.globals`
+(`lookupGlobalAlloc`) is only a fallback. V2026 numbers stack-borrow tags (`Memory.nextTag`) and
+captured global allocation identifiers from the same origin (`1`), so a stack borrow entry
+SHADOWS a same-numbered global (see the `disableLocalBorrows` documentation in
+`MirSemantics/Statements.lean`):
+- Stack-borrow allocations tracked in `mem.borrows` are `.dead` when `allocDead = true` (set by
+  `StorageDead`, a repeated `StorageLive`, and the owning frame's `return_`) and `.live .mut`
+  otherwise — regardless of any same-numbered global.
+- Otherwise, global allocations in `mem.globals` are `.live ga.mutability` (V2026 never
+  deallocates captured globals).
 - Absent allocations are `.missing`. -/
 def miriInspectAllocV2026 (allocId : AllocId) (mem : Memory) : MiriV2026AllocInfo :=
-  match lookupGlobalAlloc mem.globals allocId with
-  | .some ga =>
-    match lookupBorrow mem.borrows allocId with
-    | .some be => if be.allocDead then .dead else .live ga.mutability
-    | .none => .live ga.mutability
+  match lookupBorrow mem.borrows allocId with
+  | .some be =>
+    match be.allocDead with
+    | true => .dead
+    | false => .live .mut
   | .none =>
-    match lookupBorrow mem.borrows allocId with
-    | .some be => if be.allocDead then .dead else .live .mut
+    match lookupGlobalAlloc mem.globals allocId with
+    | .some ga => .live ga.mutability
     | .none => .missing
 
 /-- Returns `true` iff `allocId` is live in unmodified `V2026_06_01` `Memory`. -/
@@ -2057,6 +2063,44 @@ theorem miriPermPreventsDealloc_eq_v2026_preventsDeallocation (p : MiriPerm) :
     miriPermPreventsDealloc p = preventsDeallocation (miriPermToV2026 p) := by
   cases p <;> rfl
 
+/-- **Exact deallocated-allocation bridge** to unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.ptrAllocByteBound?`: whenever `miriInspectAllocV2026`
+classifies a pointer's provenance tag as `.dead`, V2026's own pointer-bound resolution (which,
+exactly like `miriInspectAllocV2026`, consults `mem.borrows` BEFORE `mem.globals`) assigns that
+pointer the zero byte bound of a deallocated allocation, for EVERY frame, layout, and locals. -/
+theorem miriInspectAllocV2026_dead_eq_v2026_ptrAllocByteBound_zero
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (ptrVal : ProvenancePtr)
+    (hDead : miriInspectAllocV2026 ptrVal.tag mem = .dead) :
+    ptrAllocByteBound? locals mem localDecls layouts ptrVal = .some 0 := by
+  unfold miriInspectAllocV2026 at hDead
+  unfold ptrAllocByteBound?
+  cases hB : lookupBorrow mem.borrows ptrVal.tag with
+  | some be =>
+    rw [hB] at hDead
+    dsimp only at hDead
+    cases hD : be.allocDead with
+    | true => dsimp only; rw [hD]
+    | false => simp only [hD, reduceCtorEq] at hDead
+  | none =>
+    rw [hB] at hDead
+    dsimp only at hDead
+    revert hDead
+    cases lookupGlobalAlloc mem.globals ptrVal.tag <;> intro hDead <;> simp only [reduceCtorEq] at hDead
+
+/-- **Borrow-shadowing law**: whenever `mem.borrows` has a LIVE entry for `allocId`,
+`miriInspectAllocV2026` reports a live mutable stack allocation irrespective of `mem.globals`
+(mirroring V2026's `lookupBorrow`-first resolution), so a same-numbered READ-ONLY global can
+never cause a spurious `.writeToReadOnly` rejection. -/
+theorem miriInspectAllocV2026_live_borrow_shadows_globals (allocId : AllocId) (mem : Memory)
+    (be : BorrowEntry) (hB : lookupBorrow mem.borrows allocId = .some be)
+    (hLive : be.allocDead = false) :
+    miriInspectAllocV2026 allocId mem = .live .mut := by
+  unfold miriInspectAllocV2026
+  rw [hB]
+  dsimp only
+  rw [hLive]
+
 /-- **Exact retag initial-permission bridge** to unmodified
 `Trusted.Rustc.V2026_06_01.MirSemantics.retagPerm` and `fnEntryRetagPerm` across all four
 `RetagKind`s, both `Mutability`s, and every `RigidTy` pointee! -/
@@ -2528,6 +2572,16 @@ def miriMem16Dead : Memory :=
          perm := .disabled
          allocDead := true }] }
 
+/-- V2026 `Memory` fixture in which LIVE stack borrow tag `1` shares its number with READ-ONLY
+global allocation `1` (V2026 numbers both from `1`; `lookupBorrow` wins). -/
+def miriMem16ShadowedGlobal : Memory :=
+  { miriMem16ReadOnly with
+    borrows :=
+      [{ tag := 1
+         targetLocal := 0
+         targetProjection := []
+         perm := .unique }] }
+
 /-- Initial single-root Tree Borrows state on `allocId = 1` (`[0, 16)`). -/
 def miriTbRoot16 : MiriTbState :=
   { frames := []
@@ -2900,6 +2954,30 @@ def twoRootState : MiriTbState :=
               entries :=
                 [{ tag := 0, loc := ⟨.unique, true, .none⟩ },
                  { tag := 5, loc := ⟨.unique, true, .none⟩ }] }] }] }
+
+/-- **Allocation-classification regression witness (`[]`)**: `miriInspectAllocV2026` follows V2026's
+`lookupBorrow`-first precedence — a live stack borrow shadows a same-numbered read-only global
+(`.live .mut`), so a protected `&mut` (`Unique`) `FnEntry` reborrow through it SUCCEEDS, while the
+un-shadowed read-only global still rejects the identical reborrow with `.writeToReadOnly 1`; dead
+borrows are `.dead` (and V2026 bounds them to `0`) and empty memory is `.missing`. -/
+theorem witness_inspectAlloc_borrow_precedence :
+    miriInspectAllocV2026 1 miriMem16ShadowedGlobal = .live .mut ∧
+    miriInspectAllocV2026 1 miriMem16ReadOnly = .live .not ∧
+    miriInspectAllocV2026 1 miriMem16Live = .live .mut ∧
+    miriInspectAllocV2026 1 miriMem16Dead = .dead ∧
+    miriInspectAllocV2026 1 emptyMemory = .missing ∧
+    (match miriRegisterFnEntryArg miriMem16ShadowedGlobal miriTbFrame1 1 1 1 0 .mutable true true
+        0 8 with
+     | .ok stOk => miriProtectedTagsOnAlloc 1 stOk.frames == [1]
+     | .err _ _ => false) = true ∧
+    isWriteToReadOnlyErr 1
+      (miriRegisterFnEntryArg miriMem16ReadOnly miriTbFrame1 1 1 1 0 .mutable true true 0 8) =
+      true ∧
+    ptrAllocByteBound? [] miriMem16Dead [] emptyLayoutTable { allocId := 1, offsetBytes := 0 } =
+      .some 0 :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   miriInspectAllocV2026_dead_eq_v2026_ptrAllocByteBound_zero [] miriMem16Dead [] emptyLayoutTable
+     { allocId := 1, offsetBytes := 0 } rfl⟩
 
 /-- **Comprehensive Fail-Closed Negative UB Regression Suite (`[]`)**:
 exercises genuine `.err ...` outcomes from satisfiable V2026 states for every failure mode:
