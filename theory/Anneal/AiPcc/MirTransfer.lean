@@ -3824,7 +3824,8 @@ theorem sintNoOverflowAdd_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
           have h2 := sintNonneg_sound (bool_and_true_right hO2) hy
           exact signedOverflowAdd_false_of_opp_sign (Or.inr ⟨h1.1, h1.2, h2⟩)
         | false =>
-          simp only [hZ1, hZ2, hO1, hO2, Bool.false_or] at h
+          dsimp only at h
+          rw [hZ1, hZ2, hO1, hO2, Bool.false_or, Bool.false_or, Bool.false_or, Bool.false_or] at h
           cases hU1 : a1.ubound? with
           | none => rw [hU1] at h; nomatch h
           | some hi1 =>
@@ -3865,7 +3866,7 @@ theorem sintNoOverflowSub_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
         (Or.inl ⟨sintNonneg_sound (bool_and_true_left hNN) hx,
           sintNonneg_sound (bool_and_true_right hNN) hy⟩)
     | false =>
-      simp only [hZ2, hNN, Bool.false_or] at h
+      rw [hZ2, hNN, Bool.false_or, Bool.false_or] at h
       have h1 := sintNeg_sound (bool_and_true_left h) hx
       have h2 := sintNeg_sound (bool_and_true_right h) hy
       exact signedOverflowSub_false_of_same_sign
@@ -3898,7 +3899,8 @@ theorem sintNoOverflowMul_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
       subst hy0
       exact signedOverflowMul_false_of_zero_right (absVal_some_elim hx).1
     | false =>
-      simp only [hZ1, hZ2, Bool.false_or] at h
+      dsimp only at h
+      rw [hZ1, hZ2, Bool.false_or, Bool.false_or] at h
       have hNN := bool_and_true_left h
       have hProdB := bool_and_true_right h
       cases hU1 : a1.ubound? with
@@ -3950,7 +3952,8 @@ theorem sintNotMinDivNegOne_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
       rw [hBad.2] at hLt
       exact Nat.not_le_of_gt hLt hGe
     | false =>
-      simp only [hN1, hN2, Bool.false_or] at h
+      rw [hN1, hN2] at h
+      dsimp only at h
       have hCheck2 :
           (match AbsVal.decideEq? (uintWidth (intTwin i)) a2
               (AbsVal.const (uintWidth (intTwin i))
@@ -3986,10 +3989,10 @@ theorem sintNotMinDivNegOne_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
             (absVal_const_denote_lt (uintWidth_valid (intTwin i)) hHalfLt)
           exact nat_ne_of_beq_false hBeq hBad.1
         | true =>
-          simp only [hE1, Bool.false_or] at h
+          rw [hE1] at h
           exact hCheck2 h
       | none =>
-        simp only [hE1, Bool.false_or] at h
+        rw [hE1] at h
         exact hCheck2 h
 
 /-! ### Biased signed checks (`ReducedProduct` signed domain) -/
@@ -4764,18 +4767,13 @@ theorem decideSltAbs_sound {w x y : Nat} {a b : AbsVal} {r : Bool}
   unfold decideSltAbs at h
   cases hD : AbsVal.decideSlt? w a b with
   | some r' =>
-    rw [hD] at h
-    injection h with h
-    subst h
+    rw [hD] at h; cases h
     exact absVal_decideSlt?_sound hD ha hb
   | none =>
-    rw [hD] at h
-    dsimp only at h
+    rw [hD] at h; dsimp only at h
     cases hMin : isSignedMinExact w b with
     | true =>
-      rw [hMin, Bool.true_or] at h
-      injection h with h
-      subst h
+      rw [hMin] at h; cases h
       rw [isSignedMinExact_sound hMin hb]
       exact nat_blt_false_of_le (Nat.zero_le _)
     | false =>
@@ -4783,9 +4781,7 @@ theorem decideSltAbs_sound {w x y : Nat} {a b : AbsVal} {r : Bool}
       cases hMax : isSignedMaxExact w a with
       | false => rw [hMax] at h; nomatch h
       | true =>
-        rw [hMax] at h
-        injection h with h
-        subst h
+        rw [hMax] at h; cases h
         rw [isSignedMaxExact_sound hMax ha]
         exact nat_blt_false_of_le (Nat.le_sub_one_of_lt (signedBias_lt y))
 
@@ -4806,18 +4802,13 @@ theorem decideSleAbs_sound {w x y : Nat} {a b : AbsVal} {r : Bool}
   unfold decideSleAbs at h
   cases hD : AbsVal.decideSle? w a b with
   | some r' =>
-    rw [hD] at h
-    injection h with h
-    subst h
+    rw [hD] at h; cases h
     exact absVal_decideSle?_sound hD ha hb
   | none =>
-    rw [hD] at h
-    dsimp only at h
+    rw [hD] at h; dsimp only at h
     cases hMin : isSignedMinExact w a with
     | true =>
-      rw [hMin, Bool.true_or] at h
-      injection h with h
-      subst h
+      rw [hMin] at h; cases h
       rw [isSignedMinExact_sound hMin ha]
       exact Nat.ble_eq_true_of_le (Nat.zero_le _)
     | false =>
@@ -4825,9 +4816,7 @@ theorem decideSleAbs_sound {w x y : Nat} {a b : AbsVal} {r : Bool}
       cases hMax : isSignedMaxExact w b with
       | false => rw [hMax] at h; nomatch h
       | true =>
-        rw [hMax] at h
-        injection h with h
-        subst h
+        rw [hMax] at h; cases h
         rw [isSignedMaxExact_sound hMax hb]
         exact Nat.ble_eq_true_of_le (Nat.le_sub_one_of_lt (signedBias_lt x))
 
@@ -4866,9 +4855,7 @@ theorem decideSignedCmpAbs_sound {op : BinOp} {w x y : Nat} {a1 a2 : AbsVal}
       cases hD : AbsVal.decideEq? w a1 a2 with
       | none => rw [hD] at h; nomatch h
       | some r' =>
-        rw [hD] at h
-        injection h with h
-        subst h
+        rw [hD] at h; cases h
         exact congrArg Bool.not (Eq.trans hBeq (absVal_decideEq?_sound hD hx hy))
     | lt => exact decideSltAbs_sound h hx hy
     | le => exact decideSleAbs_sound h hx hy
@@ -5487,20 +5474,15 @@ theorem retypeSintResult_denote {i : IntTy} {av0 av : MirAbsVal}
     av.denote locals v := by
   cases av0 with
   | uint u a s =>
-    simp only [retypeSintResult] at h
+    dsimp only [retypeSintResult] at h
     cases hU : uintTyBeq u (intTwin i) with
     | false => rw [hU] at h; nomatch h
     | true =>
-      rw [hU] at h
-      injection h with h
-      subst h
+      rw [hU] at h; cases h
       have hu := uintTy_eq_of_beq hU
       subst hu
       exact hD
-  | bool b =>
-    injection h with h
-    subst h
-    exact hD
+  | bool b => cases h; exact hD
   | unit => nomatch h
   | uintBoolPair _ _ _ => nomatch h
   | sint _ _ _ => nomatch h
@@ -5530,7 +5512,8 @@ theorem sintShrConst_sound (i : IntTy) (c k : Nat) :
   have hEq : Nat.mod (arithmeticShrBits c (uintBytes (intTwin i)) k)
       (modPow2 (uintWidth (intTwin i))) =
       arithmeticShrBits c (uintBytes (intTwin i)) k := Nat.mod_eq_of_lt hLt
-  simp only [wrapVal, hEq] at h
+  unfold wrapVal at h
+  rw [hEq] at h
   exact h
 
 /-- Signed `.shr` evaluates to an arithmetic shift by the wrapped amount. -/
@@ -5741,12 +5724,12 @@ theorem evalSignedDiv_cases (a b sz : Nat) :
         (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)))
       (Nat.beq (wrapScalarBits b (scalarModulus sz))
         (Nat.sub (scalarModulus sz) 1)) with
-  | true => exact Or.inl (fun _ _ => by simp only [evalSignedDiv, h])
+  | true =>
+    exact Or.inl (fun _ _ => by unfold evalSignedDiv; dsimp only; rw [h])
   | false =>
     refine Or.inr ⟨?r, fun l m => ?h⟩
     case h =>
-      simp only [evalSignedDiv, h]
-      rfl
+      unfold evalSignedDiv; dsimp only; rw [h]
 
 /-- Frame independence of `evalSignedRem` (see `evalSignedDiv_cases`). -/
 theorem evalSignedRem_cases (a b sz : Nat) :
@@ -5758,12 +5741,12 @@ theorem evalSignedRem_cases (a b sz : Nat) :
         (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)))
       (Nat.beq (wrapScalarBits b (scalarModulus sz))
         (Nat.sub (scalarModulus sz) 1)) with
-  | true => exact Or.inl (fun _ _ => by simp only [evalSignedRem, h])
+  | true =>
+    exact Or.inl (fun _ _ => by unfold evalSignedRem; dsimp only; rw [h])
   | false =>
     refine Or.inr ⟨?r, fun l m => ?h⟩
     case h =>
-      simp only [evalSignedRem, h]
-      rfl
+      unfold evalSignedRem; dsimp only; rw [h]
 
 /-- A signed `div` / `rem` result computed in the empty frame is the result
 in every frame. -/
@@ -6223,15 +6206,13 @@ theorem applyBoolUnary_sound {locals : List LocalSlot} {b : BoolAbs}
     (applyBoolUnary (f false) (f true) b).denoteBool locals (f x) := by
   cases x with
   | false =>
-    cases hF : f false <;> cases hT : f true <;>
-      simp only [applyBoolUnary]
+    cases hF : f false <;> cases hT : f true
     · exact ⟨rfl, True.intro⟩
     · exact h
     · exact negBoolAbs_sound h
     · exact ⟨rfl, True.intro⟩
   | true =>
-    cases hF : f false <;> cases hT : f true <;>
-      simp only [applyBoolUnary]
+    cases hF : f false <;> cases hT : f true
     · exact ⟨rfl, True.intro⟩
     · exact h
     · exact negBoolAbs_sound h
@@ -6305,33 +6286,26 @@ theorem binOpBoolAbs_sound {op : BinOp} {b1 b2 ba : BoolAbs}
       have hDen : ba.denoteBool locals (f c1 c2) := by
         cases b2 with
         | exact v2 g2 =>
-          dsimp only at h
-          injection h with h
-          subst h
+          cases h
           have hc2 : c2 = v2 := h2.1
           subst hc2
           exact applyBoolUnary_sound (fun x => f x c2) h1
         | top g2 =>
           cases b1 with
           | exact v1 g1 =>
-            dsimp only at h
-            injection h with h
-            subst h
+            cases h
             have hc1 : c1 = v1 := h1.1
             subst hc1
             exact applyBoolUnary_sound (fun y => f c1 y) h2
           | top g1 =>
-            dsimp only at h
-            injection h with h
-            subst h
+            cases h
             exact True.intro
           | bot => exact False.elim h1
-          | uninit =>
-            simp only [BoolAbs.isInit, Bool.false_and] at hI
-            nomatch hI
+          | uninit => nomatch hI
         | bot => exact False.elim h2
         | uninit =>
-          simp only [BoolAbs.isInit, Bool.and_false] at hI
+          have hU : BoolAbs.uninit.isInit = false := rfl
+          rw [hU, Bool.and_false] at hI
           nomatch hI
       exact ⟨_, evalScalarBinOp_bool_of_eval locals mem c1 c2 hEv,
         boolAbs_denote_of_bool hDen⟩
@@ -6795,8 +6769,12 @@ theorem evalRvalue_tuple_pair {locals locals₁ locals₂ : List LocalSlot}
       mem.callerLocals decls mem.callStack = .ok v1 locals₂) :
     evalRvalue locals (.aggregate .tuple [op0, op1]) mem decls layouts =
       .ok (.aggregate 0 [v0, v1]) locals₂ mem := by
+  have hOps : evalOperands locals [op0, op1] mem.borrows mem.globals layouts
+      mem.callerLocals decls mem.callStack = .ok [v0, v1] locals₂ := by
+    unfold evalOperands; rw [hEv0]; dsimp only
+    unfold evalOperands; rw [hEv1]; rfl
   conv => lhs; whnf
-  simp only [evalOperands, hEv0, hEv1]
+  rw [hOps]
 
 theorem unaryNotAbs_sound {av r : MirAbsVal} {locals : List LocalSlot}
     {v : Value} {ty : Ty} (mem : Memory)
@@ -7802,12 +7780,12 @@ theorem filterFeasibleEdges_mem {decls : List LocalDecl}
     List.Mem (tgt, env) (filterFeasibleEdges es) := by
   induction hMem with
   | head rest =>
-    simp only [filterFeasibleEdges]
+    dsimp only [filterFeasibleEdges]
     cases hBot : mirAbsEnvIsBot env with
     | true => exact False.elim (mirAbsEnv_not_isBot hBot hEnv)
     | false => exact List.Mem.head _
   | tail hd _ ih =>
-    simp only [filterFeasibleEdges]
+    dsimp only [filterFeasibleEdges]
     cases mirAbsEnvIsBot hd.2 with
     | true => exact ih
     | false => exact List.Mem.tail _ ih
@@ -8444,7 +8422,8 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                     s.memory.globals lay s.memory.callerLocals bd
                     s.memory.callStack = .ok v locals' := by
                 intro lay bd
-                simp only [evalOperandWithBodyCast, hNoCast]
+                unfold evalOperandWithBodyCast
+                rw [hNoCast]; dsimp only
                 exact hv.1 _ _ _ _ _ _ (Or.inr rfl)
               cases av with
               | bool ba =>
@@ -8544,7 +8523,8 @@ theorem stepTermAbs_sound {decls : List LocalDecl} {env : MirAbsEnv}
                           s.memory.globals lay s.memory.callerLocals bd
                           s.memory.callStack = .ok v locals' := by
                       intro lay bd
-                      simp only [evalOperandWithBodyCast, hNoCast]
+                      unfold evalOperandWithBodyCast
+                      rw [hNoCast]; dsimp only
                       exact hv.1 _ _ _ _ _ _ (Or.inr rfl)
                     cases boolAbs_denote_some hv.2.1 with
                     | intro b hb =>
@@ -8593,7 +8573,7 @@ theorem stepMirFn_root {body : CapturedMir} {s : MachineState}
             MirStepNode.fail .ub := by
   unfold stepMirFn
   rw [hCallee]
-  simp only [Option.getD]
+  dsimp only [Option.getD]
   cases hP : body.phase with
   | other n => rw [hP] at hPhase; nomatch hPhase
   | runtimePostCleanup => rfl
@@ -8616,7 +8596,8 @@ theorem stepMirFn_stmt_sound {body : CapturedMir} {s : MachineState}
       MirMemFrame mem' s.memory ∧
       mirAbsEnvDenote body.localDecls env' locals' := by
   rw [stepMirFn_root hPhase hCallee, hBb]
-  simp only [hSt]
+  dsimp only
+  rw [hSt]
   exact stepStmtAbs_sound (layouts := body.layouts) hEnv hProt hStep
 
 /-- Terminator-position `stepMirFn` soundness: once `stmtIdx` reaches the end
@@ -8671,7 +8652,7 @@ theorem boolAbs_denote_reframe {l1 l2 : List LocalSlot} {ba : BoolAbs}
   cases opt with
   | none => exact h
   | some v =>
-    simp only [BoolAbs.denote] at h ⊢
+    dsimp only [BoolAbs.denote] at h ⊢
     cases hB : boolOfValue? v with
     | none => rw [hB] at h; exact h
     | some b =>
@@ -8680,13 +8661,13 @@ theorem boolAbs_denote_reframe {l1 l2 : List LocalSlot} {ba : BoolAbs}
       | bot => exact h
       | uninit => exact True.intro
       | top g =>
-        simp only [BoolAbs.noRelGuard] at hNoG
-        simp only [BoolAbs.denoteBool]
+        dsimp only [BoolAbs.noRelGuard] at hNoG
+        dsimp only [BoolAbs.denoteBool]
         rw [relGuard_eq_of_beq hNoG]
         exact True.intro
       | exact c g =>
-        simp only [BoolAbs.noRelGuard] at hNoG
-        simp only [BoolAbs.denoteBool] at h ⊢
+        dsimp only [BoolAbs.noRelGuard] at hNoG
+        dsimp only [BoolAbs.denoteBool] at h ⊢
         rw [relGuard_eq_of_beq hNoG]
         exact ⟨h.1, True.intro⟩
 

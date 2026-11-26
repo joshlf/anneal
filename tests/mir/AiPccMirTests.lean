@@ -2817,4 +2817,160 @@ info: 'Anneal.AiPccMirTests.signedNegGuardDiv_verificationResult' depends on axi
 #guard_msgs (whitespace := lax) in
 #print axioms signedNegGuardDiv_verificationResult
 
+/-! ## 9. B4 Adversarial Boundary Falsification & Canary Axiom Guards -/
+
+/-- Exact-constant signed `*WithOverflow` body asserting `ov == expected`. -/
+def signedConstAssertOvExpectedBody (op : BinOp) (c1 c2 : Nat)
+    (expected : Bool) : CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_const_assert_ov_exp" 0
+    [canaryIntTy .i8, intPairTy .i8]
+    [ canaryBlock [.storageLive 1,
+        .assign (canaryPlace 1)
+          (.binaryOp op (canaryIConst .i8 c1) (canaryIConst .i8 c2))]
+        (.assert (.move (fieldPlace 1 1 canaryBoolTy)) expected 1 .continue_),
+      canaryBlock [.assign (canaryPlace 0)
+          (.use (.move (fieldPlace 1 0 (canaryIntTy .i8))))] .return_ ]
+
+/-- `fn(x: i32) -> i8`: when `0 ≤ x ≤ hi`, return `(x as i8) / -1`, else `0`.
+Narrowing `[0, 200]` to `i8` hits `-128` (`128 as i8`), so `/ -1` is UB and
+must fail closed; narrowing `[0, 127]` stays non-negative and certifies. -/
+def narrowThenDivNegOneBody (hi : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::narrow_div_neg1" 1
+    [canaryIntTy .i8, canaryIntTy .i32, canaryBoolTy, canaryBoolTy,
+     canaryIntTy .i8]
+    [ canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.binaryOp .ge (canaryCopy 1) (canaryIConst .i32 0))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 3)], 1⟩),
+      canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.binaryOp .le (canaryCopy 1) (canaryIConst .i32 hi))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 3)], 2⟩),
+      canaryBlock [.storageLive 4,
+        .assign (canaryPlace 4)
+          (.cast .intToInt (canaryCopy 1) (canaryIntTy .i8)),
+        .assign (canaryPlace 0)
+          (.binaryOp .div (canaryCopy 4) (canaryIConst .i8 255))] .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn(y: i128) -> i128`: `0i128.overflowing_sub(y)` with `y / -1` on either
+the `!ov` arm (`divOnOverflowArm = false`) or the `ov` arm (`true`). -/
+def signedNegGuardDivI128Body (divOnOverflowArm : Bool) : CapturedMir :=
+  let negOne128 := modPow2 128 - 1
+  let divStmt : StatementKind :=
+    .assign (canaryPlace 0)
+      (.binaryOp .div (canaryCopy 1) (canaryIConst .i128 negOne128))
+  let zeroStmt : StatementKind :=
+    .assign (canaryPlace 0) (.use (canaryIConst .i128 0))
+  canaryBody "ai_pcc_tests::signed_neg_guard_div_i128" 1
+    [canaryIntTy .i128, canaryIntTy .i128, intPairTy .i128, canaryBoolTy]
+    [ canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 2)
+          (.binaryOp .subWithOverflow (canaryIConst .i128 0) (canaryCopy 1)),
+        .assign (canaryPlace 3)
+          (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+      canaryBlock [if divOnOverflowArm then zeroStmt else divStmt] .return_,
+      canaryBlock [if divOnOverflowArm then divStmt else zeroStmt] .return_ ]
+
+/-- B4 adversarial boundary falsification suite covering:
+- Signed `*WithOverflow` extreme corners (`i8::MIN - i8::MIN` non-overflowing,
+  `(-1) - i8::MIN = 127` non-overflowing, `0 - i8::MIN` / `i8::MAX - (-1)` /
+  `i8::MIN + (-1)` overflowing, `i8::MIN + 0` / `0 + i8::MIN` non-overflowing).
+- `0 - y` overflow (`ov = true`) arm rejecting `y / -1` (`y == MIN`) on both
+  `i8` and `i128`, while `!ov` verifies on both widths.
+- `i128` widths: `i128::MIN / -1` rejected, `(x : i8) as i128` + `1` verified
+  and `+ i128::MAX` rejected, out-of-range shift `shrUnchecked(_, 128i8)` and
+  negative `i32` shift `shlUnchecked(_, -1i32)` rejected.
+- Narrowing sign-flip division hazard (`[0, 200] as i8 / -1` rejected;
+  `[0, 127] as i8 / -1` verified). -/
+theorem signed_b4_boundary_falsification :
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOvExpectedBody .subWithOverflow 128 128 false) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOvExpectedBody .subWithOverflow 128 128 true) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOvExpectedBody .subWithOverflow 255 128 false) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOvExpectedBody .subWithOverflow 0 128 true) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOvExpectedBody .subWithOverflow 127 255 true) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOvExpectedBody .addWithOverflow 128 255 true) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOvExpectedBody .addWithOverflow 128 0 false) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOvExpectedBody .addWithOverflow 0 128 false) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowGuardDivBody true) = false ∧
+    AutoProve.autoVerifyAcyclic (signedNegGuardDivI128Body false) = true ∧
+    AutoProve.autoVerifyAcyclic (signedNegGuardDivI128Body true) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::i128_div_neg1" 1
+        [canaryIntTy .i128, canaryIntTy .i128]
+        [canaryBlock [.assign (canaryPlace 0)
+            (.binaryOp .div (canaryCopy 1)
+              (canaryIConst .i128 (modPow2 128 - 1)))] .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::widen_i8_i128_add1" 1
+        [canaryIntTy .i128, canaryIntTy .i8, canaryIntTy .i128]
+        [canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i128)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 2) (canaryIConst .i128 1)),
+            .storageDead 2] .return_]) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::widen_i8_i128_add_max" 1
+        [canaryIntTy .i128, canaryIntTy .i8, canaryIntTy .i128]
+        [canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i128)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 2)
+                (canaryIConst .i128 (modPow2 127 - 1))),
+            .storageDead 2] .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic (narrowThenDivNegOneBody 200) = false ∧
+    AutoProve.autoVerifyAcyclic (narrowThenDivNegOneBody 127) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::i32_shl_neg1" 1
+        [canaryIntTy .i32, canaryIntTy .i32]
+        [canaryBlock [.assign (canaryPlace 0)
+            (.binaryOp .shlUnchecked (canaryCopy 1)
+              (canaryIConst .i32 (modPow2 32 - 1)))] .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::i128_shr_128" 1
+        [canaryIntTy .i128, canaryIntTy .i128]
+        [canaryBlock [.assign (canaryPlace 0)
+            (.binaryOp .shrUnchecked (canaryCopy 1)
+              (canaryUConst .u8 128))] .return_]) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl, rfl, rfl⟩
+
+/--
+info: 'Anneal.AiPcc.canary_b2_b3_precision_and_fail_closed' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_b2_b3_precision_and_fail_closed
+
+/--
+info: 'Anneal.AiPcc.canary_signed_widen_exact_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_signed_widen_exact_verificationResult
+
+/--
+info: 'Anneal.AiPcc.canary_signed_overflow_guard_div_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_signed_overflow_guard_div_verificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.signed_b4_boundary_falsification' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signed_b4_boundary_falsification
+
 end Anneal.AiPccMirTests

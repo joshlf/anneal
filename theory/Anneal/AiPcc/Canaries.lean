@@ -1218,4 +1218,125 @@ theorem canary_auto_unsupported_signatures_rejected :
         [canaryBlock [] .return_]) = false :=
   ⟨rfl, rfl, rfl, rfl⟩
 
+/-! ## B2/B3 Precision Canaries (Congruence Tightening, Biased Mul, Exact Widening, Signed Overflow Guards) -/
+
+/-- `(i, bool)` checked signed arithmetic tuple type. -/
+def canaryIntPairTy (i : IntTy) : Ty := ⟨.tuple [.int i, .bool], 0⟩
+
+/-- `fn(x: u8) -> u8`: compute `_2 = x.wrapping_mul(4)` (`_2 ≡ 0 (mod 4)`),
+branch `_2 < 252` (tightened by congruence from `≤ 251` to `≤ 248`), then
+`_2.unchecked_add(k)`. Certifies `k = 7` (`248 + 7 = 255`) and rejects `k = 8`
+(`248 + 8 = 256`). -/
+def congruenceTightenBody (k : Nat) : CapturedMir :=
+  canaryBody "ai_pcc::congruence_tighten_u8" 1
+    [canaryUintTy .u8, canaryUintTy .u8, canaryUintTy .u8, canaryBoolTy]
+    [ canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 2)
+          (.binaryOp .mul (canaryCopy 1) (canaryUConst .u8 4)),
+        .assign (canaryPlace 3)
+          (.binaryOp .lt (canaryCopy 2) (canaryUConst .u8 252))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 2)], 1⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .addUnchecked (canaryCopy 2) (canaryUConst .u8 k))]
+        .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryUConst .u8 0))]
+        .return_ ]
+
+/-- `fn(x: i8, y: i8) -> i8`: guard `lo ≤ x ≤ hi` and `lo ≤ y ≤ hi`, then
+`x.mulUnchecked(y)`. Exercises `sintNoOverflowMulBiased` across all 4 sign
+quadrants (`lo = -10, hi = 10` certifies `[-100, 100]`; `lo = -12, hi = 12`
+rejects `144 > 127`). -/
+def signedIntervalMulBody (lo hi : Nat) : CapturedMir :=
+  canaryBody "ai_pcc::signed_interval_mul_i8" 2
+    [canaryIntTy .i8, canaryIntTy .i8, canaryIntTy .i8, canaryBoolTy]
+    [ canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.binaryOp .ge (canaryCopy 1) (canaryIConst .i8 lo))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 5)], 1⟩),
+      canaryBlock [.assign (canaryPlace 3)
+          (.binaryOp .le (canaryCopy 1) (canaryIConst .i8 hi))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 5)], 2⟩),
+      canaryBlock [.assign (canaryPlace 3)
+          (.binaryOp .ge (canaryCopy 2) (canaryIConst .i8 lo))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 5)], 3⟩),
+      canaryBlock [.assign (canaryPlace 3)
+          (.binaryOp .le (canaryCopy 2) (canaryIConst .i8 hi))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 5)], 4⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .mulUnchecked (canaryCopy 1) (canaryCopy 2))] .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn(x: i8) -> i32 { (x as i32).unchecked_add(k) }`: exact biased signed
+widening maps arbitrary `x : i8` into `[-128, 127]` in `i32`. -/
+def signedWidenExactBody (k : Nat) : CapturedMir :=
+  canaryBody "ai_pcc::signed_widen_exact" 1
+    [canaryIntTy .i32, canaryIntTy .i8, canaryIntTy .i32]
+    [canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
+        .assign (canaryPlace 0)
+          (.binaryOp .addUnchecked (canaryCopy 2) (canaryIConst .i32 k)),
+        .storageDead 2] .return_]
+
+/-- `fn(y: i8) -> i8`: computes `(_, ov) = 0i8.overflowing_sub(y)` and executes
+`y / -1` on either the `!ov` arm (`divOnOverflowArm = false`, safe since
+`y ≠ i8::MIN`) or the `ov` arm (`divOnOverflowArm = true`, UB since
+`y == i8::MIN`). -/
+def signedOverflowGuardDivBody (divOnOverflowArm : Bool) : CapturedMir :=
+  let divStmt : StatementKind :=
+    .assign (canaryPlace 0)
+      (.binaryOp .div (canaryCopy 1) (canaryIConst .i8 255))
+  let zeroStmt : StatementKind :=
+    .assign (canaryPlace 0) (.use (canaryIConst .i8 0))
+  canaryBody "ai_pcc::signed_ov_guard_div" 1
+    [canaryIntTy .i8, canaryIntTy .i8, canaryIntPairTy .i8, canaryBoolTy]
+    [ canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 2)
+          (.binaryOp .subWithOverflow (canaryIConst .i8 0) (canaryCopy 1)),
+        .assign (canaryPlace 3)
+          (.use (.copy ⟨2, [.field 1 canaryBoolTy]⟩))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+      canaryBlock [if divOnOverflowArm then zeroStmt else divStmt] .return_,
+      canaryBlock [if divOnOverflowArm then divStmt else zeroStmt] .return_ ]
+
+/-- Trusted `VerificationResult` for exact biased signed widening (`i8 -> i32`
+followed by `unchecked_add(1)`) from one `rfl`. -/
+theorem canary_signed_widen_exact_verificationResult :
+    Trusted.VerificationResult.VerificationResult
+      (AutoProve.autoClaim (signedWidenExactBody 1)) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic rfl
+
+/-- Trusted `VerificationResult` for signed `subWithOverflow` guard refinement
+(`0i8.overflowing_sub(y)` -> `!ov` -> `y / -1`) from one `rfl`. -/
+theorem canary_signed_overflow_guard_div_verificationResult :
+    Trusted.VerificationResult.VerificationResult
+      (AutoProve.autoClaim (signedOverflowGuardDivBody false)) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic rfl
+
+/-- Positive and fail-closed canaries for B2/B3 precision upgrades:
+1. Congruence-aware guard tightening (`x.wrapping_mul(4) < 252` => `≤ 248`):
+   `+ 7` safe, `+ 8` rejected.
+2. Biased signed interval multiplication (`[-10, 10] × [-10, 10]` safe;
+   `[-12, 12] × [-12, 12]` and `i8::MIN * -1` rejected).
+3. Exact biased signed widening (`(x : i8) as i32` + `1` safe; `+ i32::MAX`
+   rejected).
+4. Signed `*WithOverflow` relational guard (`0 - y` `!ov` -> `y / -1` safe;
+   `ov` arm -> `y / -1` rejected). -/
+theorem canary_b2_b3_precision_and_fail_closed :
+    AutoProve.autoVerifyAcyclic (congruenceTightenBody 7) = true ∧
+    AutoProve.autoVerifyAcyclic (congruenceTightenBody 8) = false ∧
+    AutoProve.autoVerifyAcyclic (signedIntervalMulBody 246 10) = true ∧
+    AutoProve.autoVerifyAcyclic (signedIntervalMulBody 244 12) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .mulUnchecked (canaryIConst .i8 128)
+          (canaryIConst .i8 255))] .return_) = false ∧
+    AutoProve.autoVerifyAcyclic (signedWidenExactBody 1) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedWidenExactBody (modPow2 31 - 1)) = false ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowGuardDivBody false) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowGuardDivBody true) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Anneal.AiPcc
