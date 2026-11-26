@@ -101,13 +101,13 @@ private theorem ep2_natLe_of_ble {a b : Nat} (h : Nat.ble a b = true) : a ≤ b 
 /-- **Joint Positive Integration Theorem 1 (`[propext]`)**:
 Couples `MiriTreeBorrowsV2026` and `RangeSpanV2026` on the exact same 24-byte V2026 `Memory`
 (`wfCNode24Mem0`):
-1. Splits `⟨1, 0, 24⟩` via `rangeSplit` / `ownRange_split_iff` into three pairwise-disjoint
-   8-byte subranges `r0 = ⟨1, 0, 8⟩`, `r1 = ⟨1, 8, 8⟩`, `r2 = ⟨1, 16, 8⟩` and verifies
+1. Splits `⟨2, 0, 24⟩` via `rangeSplit` / `ownRange_split_iff` into three pairwise-disjoint
+   8-byte subranges `r0 = ⟨2, 0, 8⟩`, `r1 = ⟨2, 8, 8⟩`, `r2 = ⟨2, 16, 8⟩` and verifies
    `rangeMerge` reassembly;
 2. Pushes call frame `1`, registers three disjoint `FnEntry` borrows (`tag 1: &mut [0, 8)`,
    `tag 2: & [8, 16)`, `tag 3: & [16, 24)`), activates `tag 1` (`ReservedFrz false → Unique`)
    via child write while `tag 2` and `tag 3` stay `Frozen`, and exits frame `1` cleanly;
-3. Writes `ep2Patch8RawBytes` to `r0 = ⟨1, 0, 8⟩` via `writeMemoryBytesV2026` (and via
+3. Writes `ep2Patch8RawBytes` to `r0 = ⟨2, 0, 8⟩` via `writeMemoryBytesV2026` (and via
    `V2026ByteMem.writeV2026Bytes`) and frames `AllocBytesAtV2026` / `AllocBytesAtByteMem` on
    BOTH sibling subranges `r1`, `r2` without re-inspecting `[8, 24)`. -/
 theorem ep2_joint_tb_reborrow_and_rangespan_24byte_frame :
@@ -768,20 +768,31 @@ theorem ep2_b4_wavefrontDrain_bridge_refines_trusted_stepMirState_wp
     (hWfMemFrameIn : MirGlobalSliceAtV2026 wIn.mem frameL frameBs)
     (hLoansDisjIn : allDisjointFromLens frameL wIn.loans)
     (hQueued : (anyTaskHasLoan lid wIn.fifoQueue || anyTaskHasLoan lid wIn.stealDeque) = true) :
+    Anneal.MirFuelFree.MirConverges body ms0 (.normal (retVal, memFinal)) ∧
     Anneal.MirFuelFree.MirWpConverges body ms0 (fun out =>
-      ∃ (rv : Value) (mf : Memory), out = .normal (rv, mf) ∧
-        mf.globals = ms0.memory.globals ∧ mf.activeCallee = none ∧ mf.callStack = [] ∧
-        MirGlobalSliceAtV2026 mf frameL frameBs) ∧
-    ∃ (wDrained : WavefrontWorldV2026) (e0 : WfLoanEntryV2026),
+      out = .normal (retVal, memFinal) ∧
+      memFinal.globals = ms0.memory.globals ∧ memFinal.activeCallee = none ∧
+      memFinal.callStack = [] ∧ MirGlobalSliceAtV2026 memFinal frameL frameBs) ∧
+    ∃ (wDrained : WavefrontWorldV2026) (rOut : ResTrie ResElem) (vOut : View)
+      (e0 : WfLoanEntryV2026),
       WavefrontConvergesV2026 pol wIn wDrained ∧
       worldMeasureV2026 wDrained = [] ∧
       ActivePureLoanAtV2026 lid e0.lens
         (wrapU32 (e0.val + worldLoanDeltaSum pol lid wIn)) wDrained ∧
-      MirGlobalSliceAtV2026 wDrained.mem frameL frameBs := by
+      (∃ bs : List AbstractByte,
+        v2026SubLensGet e0.lens wDrained.mem = some bs ∧
+        ∀ decFuel : Nat,
+          decodeValueFromBytes (decFuel + 1) body.layouts wfU32Ty bs =
+            some (.scalar ⟨wrapU32 (e0.val + worldLoanDeltaSum pol lid wIn), 4⟩)) ∧
+      (vsep (vMinStep wDrained.stepCount) F).holds vOut rOut ∧
+      MirGlobalSliceAtV2026 wDrained.mem frameL frameBs ∧
+      IndexedCut (mirWavefrontCutAt pol F frameL frameBs) 0
+        ({ ms0 with memory := memFinal }, vOut, rOut, wDrained) := by
   have hRoot := runCfgSteps_preserves_rootFrame_and_globals_of_wavefrontCfgBody hBody hCfgRun
-  refine ⟨mirWpConverges_of_runCfgSteps_none body _ hPhase cfgFuel ms0 _ hCfgRun
-    ⟨retVal, memFinal, rfl, hRoot.1, hRoot.2.1, hRoot.2.2,
-      mirGlobalSliceAtV2026_of_globals_eq hRoot.1 hMemFrameIn⟩, ?_⟩
+  refine ⟨mirWpConverges_of_runCfgSteps_none body _ hPhase cfgFuel ms0 _ hCfgRun rfl,
+    mirWpConverges_of_runCfgSteps_none body _ hPhase cfgFuel ms0 _ hCfgRun
+      ⟨rfl, hRoot.1, hRoot.2.1, hRoot.2.2,
+        mirGlobalSliceAtV2026_of_globals_eq hRoot.1 hMemFrameIn⟩, ?_⟩
   cases runCfgSteps_wavefrontDrain_indexedCut_bridge body pol hPol F frameL frameBs ms0 cfgFuel
       retVal memFinal vIn rIn wIn lid hBody hCfgRun hPre hMIn hMemFrameIn hWfMemFrameIn
       hLoansDisjIn hQueued with
@@ -792,8 +803,216 @@ theorem ep2_b4_wavefrontDrain_bridge_refines_trusted_stepMirState_wp
       | intro vOut h3 =>
         cases h3 with
         | intro e0 h =>
-          exact ⟨wD, e0, h.2.1, h.2.2.1, h.2.2.2.1,
-            (open_cut h.2.2.2.2.2.2.2.2).2.2.2.1⟩
+          exact ⟨wD, rOut, vOut, e0, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.2.1,
+            h.2.2.2.2.2.2.1,
+            (mirWavefrontCutAt_dual_mem_frame h.2.2.2.2.2.2.2.2).2.1,
+            h.2.2.2.2.2.2.2.2⟩
+
+/-- Every loan in `loans` has a `ByteRange` footprint disjoint from `fp : ByteFootprint`. -/
+def ep2AllLoansFpDisjoint (fp : ByteFootprint) : List WfLoanEntryV2026 → Prop
+  | [] => True
+  | e :: rest =>
+    fpDisjoint (InRange ⟨e.lens.allocId, e.lens.offset, e.lens.size⟩) fp ∧
+    ep2AllLoansFpDisjoint fp rest
+
+private theorem ep2AllLoansFpDisjoint_wfFindLoan (fp : ByteFootprint) :
+    ∀ (loans : List WfLoanEntryV2026) (lid : Pos4) (e : WfLoanEntryV2026),
+      ep2AllLoansFpDisjoint fp loans →
+      wfFindLoan lid loans = some e →
+      fpDisjoint (InRange ⟨e.lens.allocId, e.lens.offset, e.lens.size⟩) fp
+  | [], _, _, _, hF => nomatch hF
+  | hd :: tl, lid, e, hD, hF => by
+    dsimp only [wfFindLoan, List.foldr] at hF
+    cases hb : Pos4.beq hd.id lid with
+    | true =>
+      rw [hb] at hF
+      injection hF with hEq
+      rw [← hEq]
+      exact hD.1
+    | false =>
+      rw [hb] at hF
+      exact ep2AllLoansFpDisjoint_wfFindLoan fp tl lid e hD.2 hF
+
+private theorem ep2AllLoansFpDisjoint_wfSetLoanEntryAt (fp : ByteFootprint) :
+    ∀ (loans : List WfLoanEntryV2026) (lid : Pos4) (ph : WfLoanPhase) (v : Nat),
+      ep2AllLoansFpDisjoint fp loans →
+      ep2AllLoansFpDisjoint fp (wfSetLoanEntryAt loans lid ph v)
+  | [], _, _, _, _ => True.intro
+  | hd :: tl, lid, ph, v, hD => by
+    dsimp only [wfSetLoanEntryAt, List.map]
+    cases Pos4.beq hd.id lid with
+    | true => exact ⟨hD.1, ep2AllLoansFpDisjoint_wfSetLoanEntryAt fp tl lid ph v hD.2⟩
+    | false => exact ⟨hD.1, ep2AllLoansFpDisjoint_wfSetLoanEntryAt fp tl lid ph v hD.2⟩
+
+/-- **Cross-Module Multi-Step Wavefront Drain ↔ `V2026RangeProp` Separating-Conjunction Frame Law
+(`[propext]`-only)**:
+lifts `ep2_v2026SubLensPut_implies_writeMemoryBytesV2026` across arbitrary-depth `< ω^ω`
+`WavefrontConvergesV2026` drains: ANY `V2026WriteFrameSafe` assertion `F : V2026RangeProp` (including
+arbitrary `evalSepExprFuel` separating conjunctions!) over `w.mem` whose `fp` is disjoint from
+tracked loan slices survives ALL `.activeMut` leaf writebacks into `wF.mem`! -/
+theorem ep2_wavefrontConverges_preserves_v2026RangeProp
+    (pol : SpawnPolicy) {w wF : WavefrontWorldV2026}
+    {F : V2026RangeProp} {fp : ByteFootprint}
+    (hSafeF : V2026WriteFrameSafe F)
+    (hConv : WavefrontConvergesV2026 pol w wF)
+    (hDisj : ep2AllLoansFpDisjoint fp w.loans)
+    (hHold : F.pred w.mem fp) :
+    F.pred wF.mem fp ∧ ep2AllLoansFpDisjoint fp wF.loans := by
+  induction hConv with
+  | quiescent _ _ => exact ⟨hHold, hDisj⟩
+  | step w0 w1 _ _ hSt _ _ ih =>
+    cases wavefrontStep_mem_eq_or_loan_put pol w0 w1 hSt with
+    | inl hEq =>
+      have hHold1 : F.pred w1.mem fp := by rw [hEq.1]; exact hHold
+      have hDisj1 : ep2AllLoansFpDisjoint fp w1.loans := by rw [hEq.2]; exact hDisj
+      exact ih hDisj1 hHold1
+    | inr hPutEx =>
+      cases hPutEx with
+      | intro lid h1 =>
+        cases h1 with
+        | intro e h2 =>
+          cases h2 with
+          | intro nextPh h3 =>
+            cases h3 with
+            | intro nextVal hP =>
+              have hFpE := ep2AllLoansFpDisjoint_wfFindLoan fp w0.loans lid e hDisj hP.1
+              have hWr := ep2_v2026SubLensPut_implies_writeMemoryBytesV2026 hP.2.1
+              have hHold1 : F.pred w1.mem fp := hSafeF hFpE hWr hHold
+              have hDisj1 : ep2AllLoansFpDisjoint fp w1.loans := by
+                rw [hP.2.2]
+                exact ep2AllLoansFpDisjoint_wfSetLoanEntryAt fp w0.loans lid nextPh nextVal hDisj
+              exact ih hDisj1 hHold1
+
+/-- Top-level `Trusted.VerificationResult.StatefulClaim` for `wfPtrReadReclaimLoopBody` over
+the coinductive TCB interaction tree `mirStatefulTree`: for both initial memories
+`wfCNode24Mem0` (`epoch = 10`) and `wfCNodeMem100` (`epoch = 100`), execution is UB-free
+(`MirNoUBTree`), preserves `Memory` identically, and returns `42` and `132` respectively. -/
+def ep2PtrLoopStatefulClaim : Trusted.VerificationResult.StatefulClaim :=
+  { body := wfPtrReadReclaimLoopBody
+    callees := []
+    pre := fun args mem =>
+      args = wfPtrLoopArgs ∧ (mem = wfCNode24Mem0 ∨ mem = wfCNodeMem100)
+    post := fun _ mem retVal memOut =>
+      memOut = mem ∧
+      ((mem = wfCNode24Mem0 ∧ retVal = .scalar ⟨42, 4⟩) ∨
+       (mem = wfCNodeMem100 ∧ retVal = .scalar ⟨132, 4⟩)) }
+
+/-- Atom environment over `wfCNode24Mem0` allocation `2` mapping `0` -> `[8, 16)` and `1+` ->
+`[16, 24)` (`0` `._unsafe_rec`). -/
+def ep2CNodeTailEnv : Nat → V2026RangeProp
+  | 0 => v2026RangePointsTo ⟨2, 8, 8⟩
+      (wfEncodeU32LeAbsBytes 0 ++ wfEncodeU32LeAbsBytes 77)
+  | _ => v2026RangePointsTo ⟨2, 16, 8⟩
+      (wfEncodeU32LeAbsBytes 0 ++ wfEncodeU32LeAbsBytes 99)
+
+/-- **Pass A4 Final Unification (`ep2-A4`)**:
+1. Discharges the top-level TCB gate `Trusted.VerificationResult.StatefulVerificationResult ep2PtrLoopStatefulClaim`
+   via `verifyStatefulMirBounded` + `[propext]`-only `witness_trusted_stepMirState_wpMirBounded_and_postCleanup_v2026`;
+2. Certifies `wpMirBounded` directly over `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState`
+   on `.runtimePostCleanup` `wfPtrReadReclaimPostCleanupBody` (`[propext]`-only, zero `hPhase = .runtimeOptimized` restriction!);
+3. Composes reflective `v2026Range_norm_write_frame` (`RangeSpanV2026`) AND multi-step
+   `ep2_wavefrontConverges_preserves_v2026RangeProp`: across the full 10-step `< ω^ω` drain of
+   `wfLoopBridgeWorld0` (whose `.activeMut` writeback mutates `[0, 4)` from `10` to `42` in
+   `wFinal.mem`), the scrambled `SepExpr` `(.emp ∗ [16, 24)) ∗ (.emp ∗ [8, 16))` is preserved
+   in `wFinal.mem` AND normalized to `[8, 16) ∗ [16, 24)` by `rfl`! -/
+theorem ep2_a4_statefulVerificationResult_and_four_way_unification :
+    Trusted.VerificationResult.StatefulVerificationResult ep2PtrLoopStatefulClaim ∧
+    Anneal.Rustc.V2026_06_01.Lower.wpMirBounded 15 wfPtrReadReclaimPostCleanupBody wfPtrLoopInitMs10
+      (fun out =>
+        out = .normal (.scalar ⟨42, 4⟩, wfCNode24Mem0) ∧
+        MirGlobalSliceAtV2026 wfCNode24Mem0 wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) ∧
+    (∃ m' : Memory,
+      writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 4⟩ rsPatchBytes = some m' ∧
+      (v2026RangeSepConj (v2026RangePointsTo ⟨1, 4, 4⟩ rsPatchAbsBytes)
+        (evalSepExprFuel v2026RangeSepConj v2026RangeEmp rsNormFrameEnv 6
+          (.sep (.atom 0) (.sep (.atom 1) (.atom 2))))).pred m' (InRange ⟨1, 0, 16⟩)) ∧
+    (∃ wFinal : WavefrontWorldV2026,
+      WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld0 wFinal ∧
+      ActivePureLoanAtV2026 path0 wfCNodeEpochLens 42 wFinal ∧
+      (evalSepExprFuel v2026RangeSepConj v2026RangeEmp ep2CNodeTailEnv 6
+        (.sep (.atom 0) (.atom 1))).pred wFinal.mem
+        (fun aid off => InRange ⟨2, 8, 8⟩ aid off ∨ InRange ⟨2, 16, 8⟩ aid off)) := by
+  have hWit11 := witness_trusted_stepMirState_wpMirBounded_and_postCleanup_v2026
+  have hNormWit := witness_v2026Range_norm_write_frame
+  have hStateful : Trusted.VerificationResult.StatefulVerificationResult ep2PtrLoopStatefulClaim := by
+    apply Anneal.Rustc.V2026_06_01.Lower.verifyStatefulMirBounded ep2PtrLoopStatefulClaim 15
+    intro args mem hPre
+    have hArgs := hPre.1
+    subst hArgs
+    cases hPre.2 with
+    | inl hM10 =>
+      subst hM10
+      exact Anneal.MirFuelFree.wpCoalBounded_mono_both (Nat.le_refl 15)
+        (fun out _ hEq retVal mem' hOut => by
+          rw [hOut] at hEq
+          injection hEq with hPair
+          injection hPair with hRv hMem
+          exact ⟨hMem, Or.inl ⟨rfl, hRv⟩⟩)
+        hWit11.1
+    | inr hM100 =>
+      subst hM100
+      exact Anneal.MirFuelFree.wpCoalBounded_mono_both (Nat.le_refl 15)
+        (fun out _ hEq retVal mem' hOut => by
+          rw [hOut] at hEq
+          injection hEq with hPair
+          injection hPair with hRv hMem
+          exact ⟨hMem, Or.inr ⟨rfl, hRv⟩⟩)
+        hWit11.2.1
+  refine ⟨hStateful, hWit11.2.2.1, hNormWit.2, ?_⟩
+  cases hWit11.2.2.2 with
+  | intro _ hms =>
+    cases hms with
+    | intro wFinal hw =>
+      cases hw with
+      | intro _ hr =>
+        cases hr with
+        | intro _ hv =>
+          let fpTail : ByteFootprint :=
+            fun aid off => InRange ⟨2, 8, 8⟩ aid off ∨ InRange ⟨2, 16, 8⟩ aid off
+          let scramTail : SepExpr := .sep (.sep .emp (.atom 1)) (.sep .emp (.atom 0))
+          let canonTail : SepExpr := .sep (.atom 0) (.atom 1)
+          have hEnvSafe : ∀ i, V2026WriteFrameSafe (ep2CNodeTailEnv i) := fun i => by
+            cases i with
+            | zero => exact v2026WriteFrameSafe_pointsTo _ _
+            | succ _ => exact v2026WriteFrameSafe_pointsTo _ _
+          have hAt8 : AllocBytesAtV2026 wfCNode24Mem0 ⟨2, 8, 8⟩
+              (wfEncodeU32LeAbsBytes 0 ++ wfEncodeU32LeAbsBytes 77) :=
+            ⟨{ allocId := 2, align := ⟨4⟩, mutability := .mut,
+               bytes := wfEncodeU32LeRawBytes 10 ++ wfEncodeU32LeRawBytes 0 ++
+                 wfEncodeU32LeRawBytes 0 ++ wfEncodeU32LeRawBytes 77 ++
+                 wfEncodeU32LeRawBytes 0 ++ wfEncodeU32LeRawBytes 99,
+               relocations := [] }, rfl, ep2_natLe_of_ble rfl, rfl, rfl⟩
+          have hAt16 : AllocBytesAtV2026 wfCNode24Mem0 ⟨2, 16, 8⟩
+              (wfEncodeU32LeAbsBytes 0 ++ wfEncodeU32LeAbsBytes 99) :=
+            ⟨{ allocId := 2, align := ⟨4⟩, mutability := .mut,
+               bytes := wfEncodeU32LeRawBytes 10 ++ wfEncodeU32LeRawBytes 0 ++
+                 wfEncodeU32LeRawBytes 0 ++ wfEncodeU32LeRawBytes 77 ++
+                 wfEncodeU32LeRawBytes 0 ++ wfEncodeU32LeRawBytes 99,
+               relocations := [] }, rfl, ep2_natLe_of_ble rfl, rfl, rfl⟩
+          have hCanon0 : (evalSepExprFuel v2026RangeSepConj v2026RangeEmp ep2CNodeTailEnv 6
+              canonTail).pred wfLoopBridgeWorld0.mem fpTail := by
+            refine ⟨InRange ⟨2, 8, 8⟩, InRange ⟨2, 16, 8⟩, ?_, fun _ _ => Iff.rfl,
+              ⟨hAt8, fun _ _ => Iff.rfl⟩, ⟨hAt16, fun _ _ => Iff.rfl⟩⟩
+            intro aid off hb
+            have hD : RangeDisjoint ⟨2, 8, 8⟩ ⟨2, 16, 8⟩ := (rangeDisjointBool_iff _ _).mp rfl
+            exact rangeDisjoint_no_shared_offset hD hb.1 hb.2
+          have hBi := sepAC_bientails_of_norm_eq v2026RangeProp_sepACULaws ep2CNodeTailEnv
+            (fuel := 6) (e₁ := scramTail) (e₂ := canonTail) rfl
+          have hScram0 := hBi.2 wfLoopBridgeWorld0.mem fpTail hCanon0
+          have hDisj0 : ep2AllLoansFpDisjoint fpTail wfLoopBridgeWorld0.loans := by
+            refine ⟨?_, True.intro⟩
+            intro aid off hb
+            cases hb.2 with
+            | inl h8 =>
+              have hD : RangeDisjoint ⟨2, 0, 4⟩ ⟨2, 8, 8⟩ := (rangeDisjointBool_iff _ _).mp rfl
+              exact rangeDisjoint_no_shared_offset hD hb.1 h8
+            | inr h16 =>
+              have hD : RangeDisjoint ⟨2, 0, 4⟩ ⟨2, 16, 8⟩ := (rangeDisjointBool_iff _ _).mp rfl
+              exact rangeDisjoint_no_shared_offset hD hb.1 h16
+          have hScramFinal := (ep2_wavefrontConverges_preserves_v2026RangeProp
+            wfPolicyTower53210 (v2026WriteFrameSafe_evalSepExprFuel ep2CNodeTailEnv hEnvSafe 6 scramTail)
+            hv.2.1 hDisj0 hScram0).1
+          exact ⟨wFinal, hv.2.1, hv.2.2.2.1, hBi.1 wFinal.mem fpTail hScramFinal⟩
 
 /-- **Pass B4 concrete instance (3-axiom test ceiling)**: under the TRUSTED `stepMirState` WP
 (`MirWpConverges`), the SAME pointer-dereferencing `wfPtrReadReclaimLoopBody` returns
@@ -1073,6 +1292,14 @@ run_cmd do
         ``Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState),
       (``Anneal.Mir.InitialStateWpAndSepAcTests.ep2_b4_trusted_stepMirState_wp_return_eq_reclaimed_loan,
         ``Anneal.MirFuelFree.MirWpConverges),
+      (``Anneal.SepAC.RangeSpanV2026.v2026Range_norm_write_frame,
+        ``Anneal.SepAC.normSepFuel),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.stepMirFn_lockstep_return_wavefrontDrain_bridge,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState),
+      (``Anneal.Mir.InitialStateWpAndSepAcTests.ep2_wavefrontConverges_preserves_v2026RangeProp,
+        ``Anneal.WavefrontReclaim.WavefrontV2026.v2026SubLensPut),
+      (``Anneal.Mir.InitialStateWpAndSepAcTests.ep2_a4_statefulVerificationResult_and_four_way_unification,
+        ``Trusted.VerificationResult.StatefulVerificationResult),
       (``Anneal.WavefrontReclaim.WavefrontV2026.wavefrontConverges_preserves_disjoint_mem_frame,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes),
       (``Anneal.WavefrontReclaim.WavefrontV2026.wavefrontConverges_preserves_disjoint_mem_frame,

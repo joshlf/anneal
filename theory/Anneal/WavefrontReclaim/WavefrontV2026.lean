@@ -69,6 +69,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open Anneal.CnfOrd
 open Anneal.Firewall
 open Anneal.WavefrontReclaim
+open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.PureMirExec
 
 /-! ## 1. Internal Arithmetic, Rank-Tower `SpawnPolicy`, and `CnfOrd` Helpers -/
@@ -4614,6 +4615,89 @@ theorem wavefrontConverges_preserves_disjoint_mem_frame (pol : SpawnPolicy)
     have h2 := ih h1.2
     exact ⟨h2.1.trans h1.1, h2.2⟩
 
+private theorem execWavefrontPopped_mem_eq_or_loan_put (pol : SpawnPolicy) (hd : WorkerTask)
+    (remFifo remSteal : List WorkerTask) (w wOut : WavefrontWorldV2026)
+    (hExec : execWavefrontPoppedV2026 pol hd remFifo remSteal w = .returned wOut) :
+    (wOut.mem = w.mem ∧ wOut.loans = w.loans) ∨
+    ∃ (lid : Pos4) (e : WfLoanEntryV2026) (nextPh : WfLoanPhase) (nextVal : Nat),
+      wfFindLoan lid w.loans = some e ∧
+      v2026SubLensPut e.lens w.mem (wfEncodeU32LeRawBytes nextVal) = some wOut.mem ∧
+      wOut.loans = wfSetLoanEntryAt w.loans lid nextPh nextVal := by
+  unfold execWavefrontPoppedV2026 at hExec
+  dsimp only at hExec
+  cases hAdm : spawnAdmissible hd.rank (pol hd.rank).1 (pol hd.rank).2.1 with
+  | false => rw [hAdm] at hExec; nomatch hExec
+  | true =>
+    rw [hAdm] at hExec
+    dsimp only at hExec
+    cases hY : hd.remYields with
+    | succ y' =>
+      rw [hY] at hExec
+      injection hExec with hW
+      subst hW
+      exact Or.inl ⟨rfl, rfl⟩
+    | zero =>
+      rw [hY] at hExec
+      dsimp only at hExec
+      cases hK : (pol hd.rank).1 with
+      | succ k' =>
+        rw [hK] at hExec
+        injection hExec with hW
+        subst hW
+        exact Or.inl ⟨rfl, rfl⟩
+      | zero =>
+        rw [hK] at hExec
+        dsimp only at hExec
+        cases hF : wfFindLoan hd.loanId w.loans with
+        | none => rw [hF] at hExec; nomatch hExec
+        | some e =>
+          rw [hF] at hExec
+          dsimp only at hExec
+          cases hSc : loanPhaseMatchesScope e.phase hd.scopeId with
+          | false => rw [hSc] at hExec; nomatch hExec
+          | true =>
+            rw [hSc] at hExec
+            dsimp only at hExec
+            cases hPut : v2026SubLensPut e.lens w.mem
+                (wfEncodeU32LeRawBytes (wrapU32 (e.val + hd.writeDelta))) with
+            | none => rw [hPut] at hExec; nomatch hExec
+            | some memOut =>
+              rw [hPut] at hExec
+              injection hExec with hW
+              subst hW
+              exact Or.inr ⟨hd.loanId, e, _, wrapU32 (e.val + hd.writeDelta), hF, hPut, rfl⟩
+
+/-- Exact memory/loan transition dichotomy for `.poolWavefrontStep` (`[propext]`-only): every
+successful wavefront step either leaves `(w.mem, w.loans)` unchanged (yield / child spawn) or
+performs a single tracked loan writeback `v2026SubLensPut e.lens w.mem ... = some wOut.mem` and
+updates `wOut.loans = wfSetLoanEntryAt w.loans lid nextPh nextVal` without changing any loan's
+`V2026SubLens`. -/
+theorem wavefrontStep_mem_eq_or_loan_put (pol : SpawnPolicy) (w wOut : WavefrontWorldV2026)
+    (hStep : evalHybridCmdV2026 (.poolWavefrontStep pol) w = .returned wOut) :
+    (wOut.mem = w.mem ∧ wOut.loans = w.loans) ∨
+    ∃ (lid : Pos4) (e : WfLoanEntryV2026) (nextPh : WfLoanPhase) (nextVal : Nat),
+      wfFindLoan lid w.loans = some e ∧
+      v2026SubLensPut e.lens w.mem (wfEncodeU32LeRawBytes nextVal) = some wOut.mem ∧
+      wOut.loans = wfSetLoanEntryAt w.loans lid nextPh nextVal := by
+  change (match w.fifoQueue with
+    | hd :: ft => execWavefrontPoppedV2026 pol hd ft w.stealDeque w
+    | [] =>
+      match w.stealDeque with
+      | [] => .faultInvalidSpawn
+      | hd :: stTail => execWavefrontPoppedV2026 pol hd [] stTail w) = .returned wOut at hStep
+  cases hFq : w.fifoQueue with
+  | cons hd ft =>
+    rw [hFq] at hStep
+    exact execWavefrontPopped_mem_eq_or_loan_put pol hd ft w.stealDeque w wOut hStep
+  | nil =>
+    rw [hFq] at hStep
+    dsimp only at hStep
+    cases hSd : w.stealDeque with
+    | nil => rw [hSd] at hStep; nomatch hStep
+    | cons hd st =>
+      rw [hSd] at hStep
+      exact execWavefrontPopped_mem_eq_or_loan_put pol hd [] st w wOut hStep
+
 /-! ## 5. `Firewall` / `IndexedCut`-Shielded `stepMirFn` & `runCfgSteps` Operational Bridge -/
 
 /-- `Anneal.Firewall`-shielded assertion that `m : Memory` owns `bs` at `L : V2026SubLens`,
@@ -5921,6 +6005,454 @@ theorem mirStepTrace_sound (body : CapturedMir) :
         subst hFin
         have ih := mirStepTrace_sound body n nxt p.1 p.2 hR
         exact ⟨MirTraceStepsTo.step (mirNodeNext?_sound hN) ih.1, congrArg Nat.succ ih.2⟩
+
+/-- Terminal normal-return step of unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`
+(`MirStepNode.retNormal retVal memOut`). -/
+def MirHaltsNormalStep (body : CapturedMir) (ms : MachineState)
+    (retVal : Value) (memOut : Memory) : Prop :=
+  stepMirFn body ms = MirStepNode.retNormal retVal memOut
+
+private theorem condBool_if_true_wf {α : Type} {c : Bool} {a b : α} (hc : c = true) :
+    (if c then a else b) = a := by
+  cases c with
+  | true => rfl
+  | false => nomatch hc
+
+private theorem condBool_if_false_wf {α : Type} {c : Bool} {a b : α} (hc : c = false) :
+    (if c then a else b) = b := by
+  cases c with
+  | false => rfl
+  | true => nomatch hc
+
+/-- Operational root-frame memory-shape preservation across `TerminatorKind.return_` in unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn` (`[propext]`-only): even though `return_`
+mutates `memOut.borrows := disableFrameBorrows ...`, it preserves ALL THREE components of
+`wfMemShape = (globals, callStack, activeCallee)`! -/
+theorem mirHaltsNormalStep_preserves_memShape_of_wavefrontCfgBody
+    {body : CapturedMir} {ms : MachineState} {retVal : Value} {memOut : Memory}
+    (hBody : isWavefrontCfgBody body = true)
+    (hNoCallee : ms.memory.activeCallee = none)
+    (hNoStack : ms.memory.callStack = [])
+    (hRet : MirHaltsNormalStep body ms retVal memOut) :
+    wfMemShape memOut = wfMemShape ms.memory := by
+  have hBbs : body.basicBlocks.all (fun bb =>
+      bb.statements.all isWavefrontCfgStmt && isWavefrontCfgTerminator bb.terminator) = true :=
+    bandRight hBody
+  unfold MirHaltsNormalStep stepMirFn at hRet
+  rw [hNoCallee] at hRet
+  dsimp only [Option.getD] at hRet
+  cases hPh : body.phase with
+  | other _ => rw [hPh] at hRet; nomatch hRet
+  | runtimePostCleanup | runtimeOptimized =>
+    rw [hPh] at hRet
+    dsimp only at hRet
+    cases hBb : Trusted.Sequence.get? body.basicBlocks ms.frame.blockIdx with
+    | none => rw [hBb] at hRet; nomatch hRet
+    | some bb =>
+      rw [hBb] at hRet
+      dsimp only at hRet
+      have hBbOk := listAll_get?_wf _ body.basicBlocks ms.frame.blockIdx bb hBbs hBb
+      cases hStOpt : Trusted.Sequence.get? bb.statements ms.frame.stmtIdx with
+      | some stmt =>
+        rw [hStOpt] at hRet
+        dsimp only at hRet
+        have hStOk := listAll_get?_wf isWavefrontCfgStmt bb.statements ms.frame.stmtIdx stmt
+          (bandLeft hBbOk) hStOpt
+        rw [← evalStmtFast_eq body ms stmt] at hRet
+        cases hStmtEq : stmt with
+        | mk sk _ =>
+          rw [hStmtEq] at hRet hStOk
+          cases sk with
+          | nop => nomatch hRet
+          | storageLive loc =>
+            dsimp only [evalStmtFast] at hRet
+            cases hG : Trusted.Sequence.get? ms.frame.locals loc with
+            | none => rw [hG] at hRet; nomatch hRet
+            | some _ =>
+              rw [hG] at hRet; dsimp only at hRet
+              cases hS : Trusted.Sequence.set? ms.frame.locals loc .uninit with
+              | none => rw [hS] at hRet; nomatch hRet
+              | some _ =>
+                rw [hS] at hRet; dsimp only at hRet
+                cases hAp : ms.memory.activeProtectors with
+                | nil => rw [hAp] at hRet; nomatch hRet
+                | cons ph pt =>
+                  rw [hAp] at hRet; dsimp only at hRet
+                  cases hPr : hasProtectedLocalBorrow ms.memory.borrows (ph :: pt) loc
+                      (Trusted.Sequence.length ms.memory.callStack) with
+                  | true => rw [hPr] at hRet; nomatch hRet
+                  | false => rw [hPr] at hRet; nomatch hRet
+          | storageDead loc =>
+            dsimp only [evalStmtFast] at hRet
+            cases hG : Trusted.Sequence.get? ms.frame.locals loc with
+            | none => rw [hG] at hRet; nomatch hRet
+            | some _ =>
+              rw [hG] at hRet; dsimp only at hRet
+              cases hS : Trusted.Sequence.set? ms.frame.locals loc .dead with
+              | none => rw [hS] at hRet; nomatch hRet
+              | some _ =>
+                rw [hS] at hRet; dsimp only at hRet
+                cases hAp : ms.memory.activeProtectors with
+                | nil => rw [hAp] at hRet; nomatch hRet
+                | cons ph pt =>
+                  rw [hAp] at hRet; dsimp only at hRet
+                  cases hPr : hasProtectedLocalBorrow ms.memory.borrows (ph :: pt) loc
+                      (Trusted.Sequence.length ms.memory.callStack) with
+                  | true => rw [hPr] at hRet; nomatch hRet
+                  | false => rw [hPr] at hRet; nomatch hRet
+          | assign dst rv =>
+            cases dst with
+            | mk loc proj =>
+              cases proj with
+              | cons _ _ =>
+                dsimp only [isWavefrontCfgStmt] at hStOk
+                nomatch hStOk
+              | nil =>
+                dsimp only [evalStmtFast] at hRet
+                cases hRv : evalRvalueFast body ms.frame.locals rv ms.memory with
+                | ub => rw [hRv] at hRet; nomatch hRet
+                | unsupported => rw [hRv] at hRet; nomatch hRet
+                | ok val l1 m1 =>
+                  rw [hRv] at hRet
+                  dsimp only [finishAssignStmtNodeFast] at hRet
+                  cases hG : Trusted.Sequence.get? l1 loc with
+                  | none => rw [hG] at hRet; nomatch hRet
+                  | some sl =>
+                    rw [hG] at hRet
+                    cases sl with
+                    | dead => nomatch hRet
+                    | uninit =>
+                      dsimp only at hRet
+                      cases hS : Trusted.Sequence.set? l1 loc (.init val) with
+                      | none => rw [hS] at hRet; nomatch hRet
+                      | some _ =>
+                        rw [hS] at hRet; dsimp only at hRet
+                        cases hC : hasProtectedWriteConflict m1.borrows m1.activeProtectors loc
+                            .none .nil 0 0 (Trusted.Sequence.length m1.callStack) with
+                        | true => rw [hC] at hRet; nomatch hRet
+                        | false => rw [hC] at hRet; nomatch hRet
+                    | init _ =>
+                      dsimp only at hRet
+                      cases hS : Trusted.Sequence.set? l1 loc (.init val) with
+                      | none => rw [hS] at hRet; nomatch hRet
+                      | some _ =>
+                        rw [hS] at hRet; dsimp only at hRet
+                        cases hC : hasProtectedWriteConflict m1.borrows m1.activeProtectors loc
+                            .none .nil 0 0 (Trusted.Sequence.length m1.callStack) with
+                        | true => rw [hC] at hRet; nomatch hRet
+                        | false => rw [hC] at hRet; nomatch hRet
+          | _ =>
+            dsimp only [isWavefrontCfgStmt] at hStOk
+            nomatch hStOk
+      | none =>
+        rw [hStOpt] at hRet
+        dsimp only at hRet
+        cases hEqLen : (ms.frame.stmtIdx == Trusted.Sequence.length bb.statements) with
+        | false =>
+          rw [condBool_if_false_wf hEqLen] at hRet
+          nomatch hRet
+        | true =>
+          rw [condBool_if_true_wf hEqLen] at hRet
+          have hTmOk := bandRight hBbOk
+          cases hTerm : bb.terminator with
+          | mk tk _ =>
+            rw [hTerm] at hRet hTmOk
+            cases tk with
+            | goto _ => nomatch hRet
+            | switchInt discr _ =>
+              unfold evalTerminator at hRet
+              dsimp only at hRet
+              cases hD : evalOperandWithBodyCast ms.frame.locals discr ms.memory.borrows
+                  ms.memory.globals body.layouts ms.memory.callerLocals
+                  (bodyLocalDeclsOf (some body)) ms.memory.callStack with
+              | ub => rw [hD] at hRet; nomatch hRet
+              | unsupported => rw [hD] at hRet; nomatch hRet
+              | ok v _ => rw [hD] at hRet; cases v <;> nomatch hRet
+            | return_ =>
+              unfold evalTerminator at hRet
+              cases hG : Trusted.Sequence.get? ms.frame.locals 0 with
+              | none => rw [hG] at hRet; nomatch hRet
+              | some sl =>
+                rw [hG] at hRet
+                cases sl with
+                | dead | uninit => nomatch hRet
+                | init rv =>
+                  dsimp only at hRet
+                  cases hC : hasFrameDeallocProtectorConflict ms.memory.borrows
+                      ms.memory.activeProtectors (Trusted.Sequence.length ms.memory.callStack)
+                      (Trusted.Sequence.length ms.frame.locals) with
+                  | true => rw [hC] at hRet; nomatch hRet
+                  | false =>
+                    rw [hC, hNoStack] at hRet
+                    dsimp only at hRet
+                    cases hU : valueContainsUninit rv with
+                    | true => rw [hU] at hRet; nomatch hRet
+                    | false =>
+                      rw [hU] at hRet
+                      dsimp only [MirStepNode.retNormal] at hRet
+                      injection hRet with hOutEq
+                      injection hOutEq with hPairEq
+                      injection hPairEq with _ hMemEq
+                      dsimp only [wfMemShape]
+                      rw [← hMemEq]
+                      dsimp only
+                      rw [hNoStack]
+            | _ =>
+              dsimp only [isWavefrontCfgTerminator] at hTmOk
+              nomatch hTmOk
+
+/-- **Direct `[propext]`-only Trusted `stepMirState` Refinement (`0` `runCfgSteps`)**:
+every `MirTraceStepsTo` execution followed by `MirHaltsNormalStep` over unmodified `stepMirFn`
+evaluates to `some (.normal (retVal, memOut))` under `runMirBounded (trace.length + 1)` AND
+establishes the trusted coalgebra weakest precondition `wpMirBounded (trace.length + 1)` directly
+over unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState`! -/
+theorem mirTraceStepsTo_and_return_implies_runMirBounded_and_wpMirBounded
+    {body : CapturedMir} {ms0 msRet : MachineState} {trace : List MachineState}
+    {retVal : Value} {memOut : Memory}
+    (hTrace : MirTraceStepsTo body ms0 trace msRet)
+    (hRet : MirHaltsNormalStep body msRet retVal memOut) :
+    Anneal.MirFuelFree.runMirBounded (trace.length + 1) body ms0 =
+      some (.normal (retVal, memOut)) ∧
+    (∀ post : MirOutcome → Prop,
+      post (.normal (retVal, memOut)) →
+      Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (trace.length + 1) body ms0 post) := by
+  induction hTrace with
+  | refl _ =>
+    refine ⟨?_, fun _ hP => ?_⟩
+    · unfold Anneal.MirFuelFree.runMirBounded Anneal.MirFuelFree.runMirExecBounded
+      dsimp only [stepMirState]
+      rw [hRet]
+      rfl
+    · unfold Anneal.Rustc.V2026_06_01.Lower.wpMirBounded Anneal.ITreeWP.wpCoalBounded
+      dsimp only [stepMirState]
+      rw [hRet]
+      exact hP
+  | @step _ _ _ _ hStep _ ih =>
+    have hNext := ih hRet
+    refine ⟨?_, fun post hP => ?_⟩
+    · unfold Anneal.MirFuelFree.runMirBounded at hNext ⊢
+      unfold Anneal.MirFuelFree.runMirExecBounded
+      dsimp only [stepMirState]
+      cases hStep with
+      | inl hTau => rw [hTau]; exact hNext.1
+      | inr hVis =>
+        cases hVis with
+        | intro _ hEm => rw [hEm]; exact hNext.1
+    · unfold Anneal.Rustc.V2026_06_01.Lower.wpMirBounded at hNext ⊢
+      unfold Anneal.ITreeWP.wpCoalBounded
+      dsimp only [stepMirState]
+      cases hStep with
+      | inl hTau => rw [hTau]; exact hNext.2 post hP
+      | inr hVis =>
+        cases hVis with
+        | intro _ hEm => rw [hEm]; exact hNext.2 post hP
+
+/-- Computable `stepMirFn` trace-to-normal-return extractor (`@Nat.rec`, `0` `._unsafe_rec`):
+steps unmodified `stepMirFn` until `.ret (.normal (rv, memOut))` (`MirStepNode.retNormal`)
+and returns `some (trace, msAtRet, rv, memOut)`. -/
+def mirStepTraceToNormalReturn (body : CapturedMir) (fuel : Nat) (ms : MachineState) :
+    Option (List MachineState × MachineState × Value × Memory) :=
+  @Nat.rec (fun _ => MachineState → Option (List MachineState × MachineState × Value × Memory))
+    (fun _ => none)
+    (fun _ ih cur =>
+      match stepMirFn body cur with
+      | .ret (.normal (rv, memOut)) => some ([], cur, rv, memOut)
+      | node =>
+        match mirNodeNext? node with
+        | none => none
+        | some nxt =>
+          match ih nxt with
+          | none => none
+          | some p => some (nxt :: p.1, p.2))
+    fuel ms
+
+/-- Soundness of `mirStepTraceToNormalReturn` (`[propext]`-only): every extracted tuple is a
+genuine `MirTraceStepsTo` trace followed by a `MirHaltsNormalStep` return of unmodified `stepMirFn`. -/
+theorem mirStepTraceToNormalReturn_sound (body : CapturedMir) :
+    ∀ (fuel : Nat) (ms : MachineState) (tr : List MachineState)
+      (msRet : MachineState) (rv : Value) (memOut : Memory),
+      mirStepTraceToNormalReturn body fuel ms = some (tr, msRet, rv, memOut) →
+      MirTraceStepsTo body ms tr msRet ∧ MirHaltsNormalStep body msRet rv memOut
+  | 0, _, _, _, _, _, h => nomatch h
+  | fuel + 1, ms, tr, msRet, rv, memOut, h => by
+    change (match stepMirFn body ms with
+      | .ret (.normal (rv0, m0)) => some ([], ms, rv0, m0)
+      | node =>
+        match mirNodeNext? node with
+        | none => none
+        | some nxt =>
+          match mirStepTraceToNormalReturn body fuel nxt with
+          | none => none
+          | some p => some (nxt :: p.1, p.2)) = some (tr, msRet, rv, memOut) at h
+    cases hNd : stepMirFn body ms with
+    | ret out =>
+      rw [hNd] at h
+      cases out with
+      | normal pair =>
+        cases pair with
+        | mk rv0 m0 =>
+          dsimp only at h
+          injection h with hTup
+          injection hTup with hTr hRest1
+          injection hRest1 with hMs hRest2
+          injection hRest2 with hRv hMem
+          subst hTr; subst hMs; subst hRv; subst hMem
+          exact ⟨MirTraceStepsTo.refl ms, hNd⟩
+      | panic => nomatch h
+      | abort => nomatch h
+    | tau t =>
+      rw [hNd] at h
+      dsimp only at h
+      cases hN : mirNodeNext? (.tau t) with
+      | none => rw [hN] at h; nomatch h
+      | some nxt =>
+        rw [hN] at h
+        dsimp only at h
+        cases hR : mirStepTraceToNormalReturn body fuel nxt with
+        | none => rw [hR] at h; nomatch h
+        | some p =>
+          rw [hR] at h
+          dsimp only at h
+          cases p with
+          | mk trTail p2 =>
+            cases p2 with
+            | mk msR p3 =>
+              cases p3 with
+              | mk rvR mR =>
+                injection h with hTup
+                injection hTup with hTr hRest1
+                injection hRest1 with hMs hRest2
+                injection hRest2 with hRv hMem
+                subst hTr; subst hMs; subst hRv; subst hMem
+                have hStep : MirSingleStepTo body ms nxt := by
+                  apply mirNodeNext?_sound
+                  rw [hNd]
+                  exact hN
+                have ih := mirStepTraceToNormalReturn_sound body fuel nxt trTail msR rvR mR hR
+                exact ⟨MirTraceStepsTo.step hStep ih.1, ih.2⟩
+    | vis i k =>
+      rw [hNd] at h
+      dsimp only at h
+      cases hN : mirNodeNext? (.vis i k) with
+      | none => rw [hN] at h; nomatch h
+      | some nxt =>
+        rw [hN] at h
+        dsimp only at h
+        cases hR : mirStepTraceToNormalReturn body fuel nxt with
+        | none => rw [hR] at h; nomatch h
+        | some p =>
+          rw [hR] at h
+          dsimp only at h
+          cases p with
+          | mk trTail p2 =>
+            cases p2 with
+            | mk msR p3 =>
+              cases p3 with
+              | mk rvR mR =>
+                injection h with hTup
+                injection hTup with hTr hRest1
+                injection hRest1 with hMs hRest2
+                injection hRest2 with hRv hMem
+                subst hTr; subst hMs; subst hRv; subst hMem
+                have hStep : MirSingleStepTo body ms nxt := by
+                  apply mirNodeNext?_sound
+                  rw [hNd]
+                  exact hN
+                have ih := mirStepTraceToNormalReturn_sound body fuel nxt trTail msR rvR mR hR
+                exact ⟨MirTraceStepsTo.step hStep ih.1, ih.2⟩
+
+/-- **General `[propext]`-only Trusted `stepMirFn`/`stepMirState` Lockstep-to-Return Wavefront
+Drain Bridge (`0` `runCfgSteps`)**:
+chains an arbitrary multi-step unmodified `stepMirFn` execution (`MirTraceStepsTo`) AND its
+terminal `TerminatorKind.return_` transition (`MirHaltsNormalStep`) directly to:
+1. `runMirBounded` AND `wpMirBounded` over unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState`
+   (for BOTH `.runtimeOptimized` and `.runtimePostCleanup` bodies!), certifying exact return
+   `(retVal, memOut)`, `memOut.globals = ms0.memory.globals`, root-frame exit, and `Firewall`-shielded
+   `MirGlobalSliceAtV2026 memOut frameL frameBs`;
+2. `< ω^ω` wavefront convergence (`worldMeasureV2026 wFinal = []`), universal `.activeMut`
+   loan reclamation, unconditional `decodeValueFromBytes` agreement, spatial `VProp` frame
+   preservation, and a quiescent stage-`0` dual-memory `IndexedCut`! -/
+theorem stepMirFn_lockstep_return_wavefrontDrain_bridge
+    (body : CapturedMir) (pol : SpawnPolicy) (hPol : PolicyAdmissible pol)
+    (F : VProp) (frameL : V2026SubLens) (frameBs : List AbstractByte)
+    {ms0 msRet : MachineState} {trace : List MachineState}
+    {retVal : Value} {memOut : Memory}
+    (v0 : View) (r0 : ResTrie ResElem) (w0 : WavefrontWorldV2026) (lid : Pos4)
+    (hBody : isWavefrontCfgBody body = true)
+    (hNoCallee0 : ms0.memory.activeCallee = none)
+    (hNoStack0 : ms0.memory.callStack = [])
+    (hTrace : MirTraceStepsTo body ms0 trace msRet)
+    (hRet : MirHaltsNormalStep body msRet retVal memOut)
+    (hCut0 : IndexedCut (mirWavefrontCutAt pol F frameL frameBs) trace.length (ms0, v0, r0, w0))
+    (hQueued : (anyTaskHasLoan lid w0.fifoQueue || anyTaskHasLoan lid w0.stealDeque) = true) :
+    Anneal.MirFuelFree.runMirBounded (trace.length + 1) body ms0 =
+      some (.normal (retVal, memOut)) ∧
+    Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (trace.length + 1) body ms0 (fun out =>
+      out = .normal (retVal, memOut) ∧
+      memOut.globals = ms0.memory.globals ∧
+      memOut.activeCallee = none ∧
+      memOut.callStack = [] ∧
+      MirGlobalSliceAtV2026 memOut frameL frameBs) ∧
+    ∃ (wFinal : WavefrontWorldV2026) (rFinal : ResTrie ResElem) (vFinal : View)
+      (e0 : WfLoanEntryV2026),
+      WavefrontConvergesV2026 pol w0 wFinal ∧
+      worldMeasureV2026 wFinal = [] ∧
+      ActivePureLoanAtV2026 lid e0.lens
+        (wrapU32 (e0.val + worldLoanDeltaSum pol lid w0)) wFinal ∧
+      v2026SubLensGet e0.lens wFinal.mem =
+        some (wfEncodeU32LeAbsBytes (wrapU32 (e0.val + worldLoanDeltaSum pol lid w0))) ∧
+      (∃ bs : List AbstractByte,
+        v2026SubLensGet e0.lens wFinal.mem = some bs ∧
+        ∀ decFuel : Nat,
+          decodeValueFromBytes (decFuel + 1) body.layouts wfU32Ty bs =
+            some (.scalar ⟨wrapU32 (e0.val + worldLoanDeltaSum pol lid w0), 4⟩)) ∧
+      (vsep (vMinStep wFinal.stepCount) F).holds vFinal rFinal ∧
+      IndexedCut (mirWavefrontCutAt pol F frameL frameBs) 0
+        ({ msRet with memory := memOut }, vFinal, rFinal, wFinal) := by
+  have hM0 := (open_cut hCut0).1
+  have hRunWp := mirTraceStepsTo_and_return_implies_runMirBounded_and_wpMirBounded hTrace hRet
+  cases stepMirFn_lockstep_chain_indexedCut body pol hPol F frameL frameBs hBody hTrace
+      v0 r0 w0 hNoCallee0 hNoStack0 hCut0 with
+  | intro wFinal hw =>
+    cases hw with
+    | intro rFinal hr =>
+      cases hr with
+      | intro vFinal hv =>
+        have hShapeRet := mirHaltsNormalStep_preserves_memShape_of_wavefrontCfgBody
+          hBody hv.2.2.2.2.2.2.2.1 hv.2.2.2.2.2.2.2.2 hRet
+        have hGlobOut : memOut.globals = ms0.memory.globals :=
+          Eq.trans (congrArg Prod.fst hShapeRet) hv.1
+        have hCalleeOut : memOut.activeCallee = none :=
+          Eq.trans (congrArg (fun p => p.2.2) hShapeRet) hv.2.2.2.2.2.2.2.1
+        have hStackOut : memOut.callStack = [] :=
+          Eq.trans (congrArg (fun p => p.2.1) hShapeRet) hv.2.2.2.2.2.2.2.2
+        have hMemSliceOut : MirGlobalSliceAtV2026 memOut frameL frameBs :=
+          mirGlobalSliceAtV2026_of_globals_eq (congrArg Prod.fst hShapeRet) hv.2.2.2.2.2.1
+        have hOpF := open_cut hv.2.2.2.2.2.2.1
+        have hCutOut :
+            IndexedCut (mirWavefrontCutAt pol F frameL frameBs) 0
+              ({ msRet with memory := memOut }, vFinal, rFinal, wFinal) :=
+          seal_cut ⟨hOpF.1, hOpF.2.1, hMemSliceOut, hOpF.2.2.2.1, hOpF.2.2.2.2.1,
+            hOpF.2.2.2.2.2⟩
+        cases universal_post_drain_activeMut_reclaim pol hPol w0 wFinal
+            hM0.loansMemOk hM0.queueLoansOk hv.2.1 lid hQueued with
+        | intro e0 he0 =>
+          have hDecAgree :
+              ∃ bs : List AbstractByte,
+                v2026SubLensGet e0.lens wFinal.mem = some bs ∧
+                ∀ decFuel : Nat,
+                  decodeValueFromBytes (decFuel + 1) body.layouts wfU32Ty bs =
+                    some (.scalar ⟨wrapU32 (e0.val + worldLoanDeltaSum pol lid w0), 4⟩) := by
+            refine ⟨_, he0.2.2.2, fun decFuel => ?_⟩
+            have hDec :=
+              decodeValueFromBytes_wfEncodeU32LeAbsBytes decFuel body.layouts
+                (wrapU32 (e0.val + worldLoanDeltaSum pol lid w0))
+            rw [wrapU32_idem] at hDec
+            exact hDec
+          exact ⟨hRunWp.1,
+            hRunWp.2 _ ⟨rfl, hGlobOut, hCalleeOut, hStackOut, hMemSliceOut⟩,
+            wFinal, rFinal, vFinal, e0,
+            hv.2.1, hv.2.2.2.2.1, he0.2.2.1, he0.2.2.2, hDecAgree, hOpF.2.1, hCutOut⟩
 
 /-- Multi-step `V2026_06_01` `runCfgSteps` ↔ `< ω^ω` wavefront drain & universal
 `.activeMut` loan reclamation bridge (`[propext]`):
@@ -7476,5 +8008,146 @@ theorem witness_wavefrontV2026_negative_fail_closed_suite :
         [WorkerTask.mk 0 0 0 path0 77 5]) =
         .faultLoanViolation :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `.runtimePostCleanup` copy of `wfPtrReadReclaimLoopBody`, demonstrating that our
+`[propext]`-only `stepMirFn_lockstep_return_wavefrontDrain_bridge` certifies BOTH
+`MirPhaseTag.runtimeOptimized` AND `MirPhaseTag.runtimePostCleanup` bodies! -/
+def wfPtrReadReclaimPostCleanupBody : CapturedMir :=
+  { wfPtrReadReclaimLoopBody with phase := .runtimePostCleanup }
+
+/-- **Positive Witness 11 — `[propext]`-only Trusted `stepMirState` `wpMirBounded` &
+`.runtimePostCleanup` Witness (`0` `runCfgSteps`)**:
+instantiates `mirStepTraceToNormalReturn_sound` + `stepMirFn_lockstep_return_wavefrontDrain_bridge`
+directly inside `[propext]`-only `WavefrontV2026` on BOTH:
+1. `wfPtrReadReclaimLoopBody` (`phase = .runtimeOptimized`) at `epoch = 10 -> 42` AND `epoch = 100 -> 132`,
+   proving `wpMirBounded 15` directly over
+   `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState` coupled with `< ω^ω` drain, `.activeMut`
+   reclamation, and dual-memory `Firewall`-shielded `IndexedCut`;
+2. `wfPtrReadReclaimPostCleanupBody` (`phase = .runtimePostCleanup`), where `MirLoops.mirWpConverges_of_runCfgSteps_none`
+   cannot even apply because of its `body.phase = .runtimeOptimized` restriction! -/
+theorem witness_trusted_stepMirState_wpMirBounded_and_postCleanup_v2026 :
+    wpMirBounded 15 wfPtrReadReclaimLoopBody wfPtrLoopInitMs10
+      (fun out => out = .normal (.scalar ⟨42, 4⟩, wfCNode24Mem0)) ∧
+    wpMirBounded 15 wfPtrReadReclaimLoopBody wfPtrLoopInitMs100
+      (fun out => out = .normal (.scalar ⟨132, 4⟩, wfCNodeMem100)) ∧
+    wpMirBounded 15 wfPtrReadReclaimPostCleanupBody wfPtrLoopInitMs10
+      (fun out =>
+        out = .normal (.scalar ⟨42, 4⟩, wfCNode24Mem0) ∧
+        MirGlobalSliceAtV2026 wfCNode24Mem0 wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) ∧
+    ∃ (msRetPc : MachineState) (wFinal : WavefrontWorldV2026)
+      (rFinal : ResTrie ResElem) (vFinal : View),
+      MirHaltsNormalStep wfPtrReadReclaimPostCleanupBody msRetPc (.scalar ⟨42, 4⟩) wfCNode24Mem0 ∧
+      WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld0 wFinal ∧
+      worldMeasureV2026 wFinal = [] ∧
+      ActivePureLoanAtV2026 path0 wfCNodeEpochLens 42 wFinal ∧
+      IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
+        wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) 0
+        ({ msRetPc with memory := wfCNode24Mem0 }, vFinal, rFinal, wFinal) := by
+  have hPol : PolicyAdmissible wfPolicyTower53210 :=
+    towerLookupNext_admissible wfTower53210 1 0 rfl
+  -- 1. Optimized epoch = 10
+  let p10 :=
+    match mirStepTraceToNormalReturn wfPtrReadReclaimLoopBody 15 wfPtrLoopInitMs10 with
+    | some q => q
+    | none => ([], wfPtrLoopInitMs10, .unit, wfCNode24Mem0)
+  have hEx10 : mirStepTraceToNormalReturn wfPtrReadReclaimLoopBody 15 wfPtrLoopInitMs10 =
+      some (p10.1, p10.2.1, p10.2.2.1, p10.2.2.2) := rfl
+  have hSnd10 := mirStepTraceToNormalReturn_sound wfPtrReadReclaimLoopBody 15
+    wfPtrLoopInitMs10 p10.1 p10.2.1 p10.2.2.1 p10.2.2.2 hEx10
+  have hWp10 := (mirTraceStepsTo_and_return_implies_runMirBounded_and_wpMirBounded
+    hSnd10.1 hSnd10.2).2 (fun out => out = .normal (.scalar ⟨42, 4⟩, wfCNode24Mem0)) rfl
+  -- 2. Optimized epoch = 100
+  let p100 :=
+    match mirStepTraceToNormalReturn wfPtrReadReclaimLoopBody 15 wfPtrLoopInitMs100 with
+    | some q => q
+    | none => ([], wfPtrLoopInitMs100, .unit, wfCNodeMem100)
+  have hEx100 : mirStepTraceToNormalReturn wfPtrReadReclaimLoopBody 15 wfPtrLoopInitMs100 =
+      some (p100.1, p100.2.1, p100.2.2.1, p100.2.2.2) := rfl
+  have hSnd100 := mirStepTraceToNormalReturn_sound wfPtrReadReclaimLoopBody 15
+    wfPtrLoopInitMs100 p100.1 p100.2.1 p100.2.2.1 p100.2.2.2 hEx100
+  have hWp100 := (mirTraceStepsTo_and_return_implies_runMirBounded_and_wpMirBounded
+    hSnd100.1 hSnd100.2).2 (fun out => out = .normal (.scalar ⟨132, 4⟩, wfCNodeMem100)) rfl
+  -- 3. PostCleanup epoch = 10 via full stepMirFn_lockstep_return_wavefrontDrain_bridge
+  let pPc :=
+    match mirStepTraceToNormalReturn wfPtrReadReclaimPostCleanupBody 15 wfPtrLoopInitMs10 with
+    | some q => q
+    | none => ([], wfPtrLoopInitMs10, .unit, wfCNode24Mem0)
+  have hExPc : mirStepTraceToNormalReturn wfPtrReadReclaimPostCleanupBody 15 wfPtrLoopInitMs10 =
+      some (pPc.1, pPc.2.1, pPc.2.2.1, pPc.2.2.2) := rfl
+  have hSndPc := mirStepTraceToNormalReturn_sound wfPtrReadReclaimPostCleanupBody 15
+    wfPtrLoopInitMs10 pPc.1 pPc.2.1 pPc.2.2.1 pPc.2.2.2 hExPc
+  have hM0 : WorldMatchesV2026 [0] wfLoopBridgeRes0 wfLoopBridgeWorld0 :=
+    WorldMatchesV2026.mk rfl
+      (seal_loansSyncedWithMemV2026
+        ⟨rfl, True.intro, rfl, rfl, wfCNode24Mem0_get_epoch, True.intro⟩)
+      rfl rfl
+      (fun cid => by
+        cases hEq2 : Pos4.beq path2 cid with
+        | true => rw [← pos4_eq_of_beq path2 cid hEq2]; rfl
+        | false =>
+          have hNeCell : listBoolBeq (cellPath path2) (cellPath cid) = false := by
+            dsimp only [cellPath, listBoolBeq, Bool.and]; exact hEq2
+          dsimp only [wfLoopBridgeRes0]
+          rw [resTrie_getBits_modifyBits_ne (cellPath path2) (cellPath cid) rfl hNeCell,
+            singleRes_getBits_ne poolPath (cellPath cid) _ rfl rfl]
+          exact True.intro)
+      (fun lid2 => by
+        dsimp only [wfLoopBridgeRes0]
+        rw [resTrie_getBits_modifyBits_ne (cellPath path2) (checkedLoanPath lid2) rfl rfl,
+          singleRes_getBits_ne poolPath (checkedLoanPath lid2) _ rfl rfl]
+        exact True.intro)
+  have hCellHold0 : (cellAuthProp path2 99).holds [0] wfLoopBridgeRes0 :=
+    ResTrieSub.mk
+      ⟨ResTrie.modifyBits (cellPath path2) (fun _ => some (.cell .capOnly))
+        (singleRes poolPath (.pool [(11, 2)])), rfl⟩
+  have hMinHold0 : (vsep (vMinStep wfLoopBridgeWorld0.stepCount) (cellAuthProp path2 99)).holds
+      [0] wfLoopBridgeRes0 :=
+    ⟨.empty, wfLoopBridgeRes0, rfl, rfl, hCellHold0⟩
+  have hMemFr0 :
+      MirGlobalSliceAtV2026 wfPtrLoopInitMs10.memory wfCNodeFrameSlotLens
+        (wfEncodeU32LeAbsBytes 99) :=
+    seal_mirGlobalSliceAtV2026 wfCNode24Mem0_get_frameSlot
+  have hLenPc : pPc.1.length = 14 := rfl
+  have hCutPc :
+      IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
+        wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) pPc.1.length
+        (wfPtrLoopInitMs10, [0], wfLoopBridgeRes0, wfLoopBridgeWorld0) := by
+    rw [hLenPc]
+    exact seal_cut ⟨hM0, hMinHold0, hMemFr0, hMemFr0, ⟨rfl, True.intro⟩,
+      wfWithBridgeCells mwW10, wfLoopBridge_run15⟩
+  have hBr := stepMirFn_lockstep_return_wavefrontDrain_bridge wfPtrReadReclaimPostCleanupBody
+    wfPolicyTower53210 hPol (cellAuthProp path2 99) wfCNodeFrameSlotLens
+    (wfEncodeU32LeAbsBytes 99) [0] wfLoopBridgeRes0 wfLoopBridgeWorld0 path0
+    rfl rfl rfl hSndPc.1 hSndPc.2 hCutPc rfl
+  have hWpPc15 : Anneal.Rustc.V2026_06_01.Lower.wpMirBounded 15 wfPtrReadReclaimPostCleanupBody
+      wfPtrLoopInitMs10 (fun out =>
+        out = .normal (.scalar ⟨42, 4⟩, wfCNode24Mem0) ∧
+        MirGlobalSliceAtV2026 wfCNode24Mem0 wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) :=
+    (mirTraceStepsTo_and_return_implies_runMirBounded_and_wpMirBounded hSndPc.1 hSndPc.2).2 _
+      ⟨rfl, hMemFr0⟩
+  refine ⟨hWp10, hWp100, hWpPc15, ?_⟩
+  cases hBr.2.2 with
+  | intro wF hw =>
+    cases hw with
+    | intro rF hr =>
+      cases hr with
+      | intro vF hv =>
+        cases hv with
+        | intro e0 he =>
+          have hReclaim := universal_post_drain_activeMut_reclaim wfPolicyTower53210 hPol
+            wfLoopBridgeWorld0 wF hM0.loansMemOk hM0.queueLoansOk he.1 path0 rfl
+          cases hReclaim with
+          | intro e0' he0' =>
+            have hFind0 : wfFindLoan path0 wfLoopBridgeWorld0.loans =
+                some (WfLoanEntryV2026.mk path0 (.spatialCheckedOut 1) wfCNodeEpochLens 10) := rfl
+            rw [hFind0] at he0'
+            injection he0'.1 with hSameE
+            rw [← hSameE] at he0'
+            dsimp only at he0'
+            have hSum42 :
+                wrapU32 (10 + worldLoanDeltaSum wfPolicyTower53210 path0 wfLoopBridgeWorld0) =
+                  42 := rfl
+            rw [hSum42] at he0'
+            exact ⟨pPc.2.1, wF, rF, vF, hSndPc.2, he.1, he.2.1, he0'.2.2.1, he.2.2.2.2.2.2⟩
 
 end Anneal.WavefrontReclaim.WavefrontV2026

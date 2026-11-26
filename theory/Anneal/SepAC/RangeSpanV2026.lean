@@ -3235,6 +3235,57 @@ theorem v2026RangeSepConj_write_frame
         ⟨allocBytesAtV2026_of_write_self hWrite, hC.2.2.1.2⟩,
         hSafeF hDisjW2 hWrite hC.2.2.2⟩
 
+/-- `evalAtomList` over `V2026RangeProp` preserves `V2026WriteFrameSafe` whenever every atom in
+`env` is `V2026WriteFrameSafe` (`[]` zero axioms). -/
+theorem v2026WriteFrameSafe_evalAtomList (env : Nat → V2026RangeProp)
+    (hEnv : ∀ i, V2026WriteFrameSafe (env i)) :
+    ∀ atoms : List Nat,
+      V2026WriteFrameSafe (evalAtomList v2026RangeSepConj v2026RangeEmp env atoms)
+  | [] => v2026WriteFrameSafe_emp
+  | a :: rest =>
+    v2026WriteFrameSafe_sepConj (hEnv a)
+      (v2026WriteFrameSafe_evalAtomList env hEnv rest)
+
+/-- `evalSepExprFuel` over `V2026RangeProp` preserves `V2026WriteFrameSafe` whenever every atom
+in `env` is `V2026WriteFrameSafe` (`[]` zero axioms). -/
+theorem v2026WriteFrameSafe_evalSepExprFuel (env : Nat → V2026RangeProp)
+    (hEnv : ∀ i, V2026WriteFrameSafe (env i)) :
+    ∀ (fuel : Nat) (e : SepExpr),
+      V2026WriteFrameSafe (evalSepExprFuel v2026RangeSepConj v2026RangeEmp env fuel e)
+  | 0, _ => v2026WriteFrameSafe_emp
+  | _ + 1, .emp => v2026WriteFrameSafe_emp
+  | _ + 1, .atom n => hEnv n
+  | fuel + 1, .sep l r =>
+    v2026WriteFrameSafe_sepConj
+      (v2026WriteFrameSafe_evalSepExprFuel env hEnv fuel l)
+      (v2026WriteFrameSafe_evalSepExprFuel env hEnv fuel r)
+
+/-- **Reflective ACU Normalization + `Memory` Write Framing (`[propext]` only)**:
+composes `SepAC.Normalize` (`normSepFuel` ACU re-association, commutativity, and `.emp`
+elimination) directly with `v2026RangeSepConj_write_frame` over unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.Memory`: mutating `rW` updates
+`v2026RangePointsTo rW` in place while simultaneously rewriting any arbitrary `SepExpr` frame
+from `framePre` to `framePost` whenever `normSepFuel fuel framePre = normSepFuel fuel framePost`. -/
+theorem v2026Range_norm_write_frame
+    (env : Nat → V2026RangeProp)
+    (hEnv : ∀ i, V2026WriteFrameSafe (env i))
+    {fuel : Nat} {framePre framePost : SepExpr}
+    {m m' : Memory} {rW : ByteRange} {bsOld : List AbstractByte}
+    {patch : List (Option UInt8)} {fp : ByteFootprint}
+    (hNormEq : normSepFuel fuel framePre = normSepFuel fuel framePost)
+    (hWrite : writeMemoryBytesV2026 m rW patch = some m')
+    (hPre : (v2026RangeSepConj (v2026RangePointsTo rW bsOld)
+      (evalSepExprFuel v2026RangeSepConj v2026RangeEmp env fuel framePre)).pred m fp) :
+    (v2026RangeSepConj (v2026RangePointsTo rW (rawToAbstractBytes patch))
+      (evalSepExprFuel v2026RangeSepConj v2026RangeEmp env fuel framePost)).pred m' fp := by
+  have hSafePre : V2026WriteFrameSafe
+      (evalSepExprFuel v2026RangeSepConj v2026RangeEmp env fuel framePre) :=
+    v2026WriteFrameSafe_evalSepExprFuel env hEnv fuel framePre
+  have hPostPre := v2026RangeSepConj_write_frame hSafePre hWrite hPre
+  have hBi := sepAC_bientails_of_norm_eq v2026RangeProp_sepACULaws env hNormEq
+  exact v2026RangeProp_sepACULaws.monoRight
+    (v2026RangePointsTo rW (rawToAbstractBytes patch)) _ _ hBi.1 m' fp hPostPre
+
 /-! ## Part V: Concrete Positive & Fail-Closed Negative Witnesses -/
 
 /-- Scrambled 6-atom `SepExpr` with nested `.emp` units. -/
@@ -3764,5 +3815,88 @@ theorem witness_memGlobals_write_commutes_and_shadowed_allocId :
       rw [hM]
       rfl
     exact ⟨m', rfl, hComm, hReadPtr⟩
+
+/-- Atom environment mapping `0, 1, 2+` to disjoint 4-byte `V2026RangeProp` sub-slices `[0, 4)`,
+`[8, 12)`, and `[12, 16)` of allocation `1` (`0` `._unsafe_rec`). -/
+def rsNormFrameEnv : Nat → V2026RangeProp
+  | 0 => v2026RangePointsTo ⟨1, 0, 4⟩ (List.replicate 4 (.init 0x11 none))
+  | 1 => v2026RangePointsTo ⟨1, 8, 4⟩ (List.replicate 4 (.init 0x11 none))
+  | _ => v2026RangePointsTo ⟨1, 12, 4⟩ (List.replicate 4 (.init 0x11 none))
+
+/-- **Reflective `SepAC.Normalize` + `Memory` Write-Frame Witness (`[propext]` only)**:
+composes `v2026Range_norm_write_frame` directly over `rsInitMemoryV2026`: mutating `[4, 8)` via
+`writeMemoryBytesV2026` updates `v2026RangePointsTo ⟨1, 4, 4⟩` in place while simultaneously
+normalizing the scrambled `.emp`-padded frame `(.emp ∗ [12,16)) ∗ ([0,4) ∗ (.emp ∗ [8,12)))` into
+canonical `[0,4) ∗ ([8,12) ∗ [12,16))` by `rfl`! -/
+theorem witness_v2026Range_norm_write_frame :
+    let framePre : SepExpr :=
+      .sep (.sep .emp (.atom 2)) (.sep (.atom 0) (.sep .emp (.atom 1)))
+    let framePost : SepExpr :=
+      .sep (.atom 0) (.sep (.atom 1) (.atom 2))
+    normSepFuel 6 framePre = normSepFuel 6 framePost ∧
+    ∃ m' : Memory,
+      writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 4⟩ rsPatchBytes = some m' ∧
+      (v2026RangeSepConj (v2026RangePointsTo ⟨1, 4, 4⟩ rsPatchAbsBytes)
+        (evalSepExprFuel v2026RangeSepConj v2026RangeEmp rsNormFrameEnv 6 framePost)).pred m'
+        (InRange ⟨1, 0, 16⟩) := by
+  intro framePre framePost
+  have hEnv : ∀ i, V2026WriteFrameSafe (rsNormFrameEnv i) := fun i => by
+    cases i with
+    | zero => exact v2026WriteFrameSafe_pointsTo _ _
+    | succ j =>
+      cases j with
+      | zero => exact v2026WriteFrameSafe_pointsTo _ _
+      | succ _ => exact v2026WriteFrameSafe_pointsTo _ _
+  refine ⟨rfl, ?_⟩
+  cases hW : writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 4⟩ rsPatchBytes with
+  | none => nomatch hW
+  | some m' =>
+    have hAt16 : AllocBytesAtV2026 rsInitMemoryV2026 ⟨1, 0, 16⟩
+        (List.replicate 16 (.init 0x11 none)) :=
+      ⟨{ allocId := 1, align := ⟨4⟩, mutability := .mut,
+         bytes := List.replicate 16 (some 0x11), relocations := [] },
+       rfl, Nat.le_refl 16, rfl, rfl⟩
+    have hPt16 : (v2026RangePointsTo ⟨1, 0, 16⟩
+        (List.replicate 16 (.init 0x11 none))).pred rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) :=
+      ⟨hAt16, fun _ _ => Iff.rfl⟩
+    have hLR := v2026RangeProp_sepACULaws
+    have hSp1 := (v2026RangePointsTo_split_bientails ⟨1, 0, 16⟩
+      (List.replicate 16 (.init 0x11 none)) (k := 4) (natLe_of_ble_rs rfl)).1
+      rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hPt16
+    have hSp2 := (v2026RangePointsTo_split_bientails ⟨1, 4, 12⟩
+      (List.replicate 12 (.init 0x11 none)) (k := 4) (natLe_of_ble_rs rfl)).1
+    have hSp3 := (v2026RangePointsTo_split_bientails ⟨1, 8, 8⟩
+      (List.replicate 8 (.init 0x11 none)) (k := 4) (natLe_of_ble_rs rfl)).1
+    let P0 := rsNormFrameEnv 0
+    let P4 := v2026RangePointsTo ⟨1, 4, 4⟩ (List.replicate 4 (.init 0x11 none))
+    let P8 := rsNormFrameEnv 1
+    let P12 := rsNormFrameEnv 2
+    have h4_16 : V2026RangeEntails
+        (v2026RangePointsTo ⟨1, 4, 12⟩ (List.replicate 12 (.init 0x11 none)))
+        (v2026RangeSepConj P4 (v2026RangeSepConj P8 P12)) :=
+      hLR.trans _ _ _ hSp2 (hLR.monoRight P4 _ _ hSp3)
+    have hOrd0 : (v2026RangeSepConj P0 (v2026RangeSepConj P4 (v2026RangeSepConj P8 P12))).pred
+        rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) :=
+      hLR.monoRight P0 _ _ h4_16 rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hSp1
+    have hAssocL := (hLR.assoc P0 P4 (v2026RangeSepConj P8 P12)).2
+      rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hOrd0
+    have hSwap04 : V2026RangeEntails
+        (v2026RangeSepConj (v2026RangeSepConj P0 P4) (v2026RangeSepConj P8 P12))
+        (v2026RangeSepConj (v2026RangeSepConj P4 P0) (v2026RangeSepConj P8 P12)) := by
+      intro m0 fp0 hS
+      have h1 := (hLR.comm (v2026RangeSepConj P0 P4) (v2026RangeSepConj P8 P12)).1 m0 fp0 hS
+      have h2 := hLR.monoRight (v2026RangeSepConj P8 P12) _ _ (hLR.comm P0 P4).1 m0 fp0 h1
+      exact (hLR.comm (v2026RangeSepConj P8 P12) (v2026RangeSepConj P4 P0)).1 m0 fp0 h2
+    have hCanonPre : (v2026RangeSepConj P4
+        (evalSepExprFuel v2026RangeSepConj v2026RangeEmp rsNormFrameEnv 6 framePost)).pred
+        rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) :=
+      (hLR.assoc P4 P0 (v2026RangeSepConj P8 P12)).1 rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩)
+        (hSwap04 rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hAssocL)
+    have hBi := sepAC_bientails_of_norm_eq hLR rsNormFrameEnv
+      (fuel := 6) (e₁ := framePre) (e₂ := framePost) rfl
+    have hScramPre := hLR.monoRight P4 _ _ hBi.2 rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hCanonPre
+    exact ⟨m', rfl,
+      v2026Range_norm_write_frame rsNormFrameEnv (framePre := framePre) (framePost := framePost)
+        hEnv rfl hW hScramPre⟩
 
 end Anneal.SepAC.RangeSpanV2026
