@@ -65,7 +65,7 @@ class SyncMiriSuiteTests(unittest.TestCase):
             REPO_ROOT / "tests" / "miri-diff" / "manifest.toml",
             REPO_ROOT / "tests" / "miri-diff" / "corpus",
         )
-        self.assertEqual(len(manifest["tests"]), 112)
+        self.assertEqual(len(manifest["tests"]), 116)
 
     def test_accepts_str_and_unit_model_markers_and_ignores_commented_items(self) -> None:
         lib_rs = """\
