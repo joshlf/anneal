@@ -918,6 +918,34 @@ theorem corrupt_ptr_tuple_small_size_rejected :
 theorem corrupt_param_tuple_nil_fl_rejected :
     resolveCopyElemLayout D64_b4 L64_b4 (cp 6) (cp 6) = .unsupported := rfl
 
+/-! ### A4 regressions: arrays / non-empty tuples without `fieldLayouts` fail closed -/
+
+/-- `rustc-capture` interns element / field layouts for every array and non-empty tuple above
+its depth-16 limit, so an absent `fieldLayouts` list never determines a layout: a `(u64, u8)`
+layout with `size = 9, align = 1` (whose primitive sizes sum to `9`) and a `[u64; 2]` layout
+with `align = 1` are rejected; the tuple is then `.unsupported` and the array falls back to the
+exact structural `(16, 8)`, so a 4-aligned dangling pointer is `.ub`. -/
+def L64_a4 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 9 1 (.arbitrary [⟨0⟩, ⟨8⟩] [0, 1])
+      , ptrLay 8 1
+      , lay 16 1 (.array ⟨8⟩ 2)
+      , ptrLay 8 3 ] }
+def D64_a4 : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.tuple [.uint .u64, .uint .u8])) 2
+  , decl (ptrK (.array (.uint .u64) 2)) 4 ]
+
+theorem nil_fl_tuple_size9_align1_rejected :
+    resolveCopyElemLayout D64_a4 L64_a4 (cp 1) (cp 1) = .unsupported := rfl
+theorem nil_fl_u64_array_align1_falls_back_exact :
+    resolveCopyElemLayout D64_a4 L64_a4 (cp 2) (cp 2) = .ok 16 8 := rfl
+theorem nil_fl_u64_array_align1_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 2) (cp 2) D64_a4 L64_a4 (av 4) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+
 end Anneal.Tests.ZeroCountCopyAlign.V06
 
 /-! ## §2. `V2026_08_01` (same fixtures; `Value` has no `uninit`) -/
@@ -1789,6 +1817,34 @@ theorem corrupt_ptr_tuple_small_size_rejected :
     resolveCopyElemLayout D64_b4 L64_b4 (cp 5) (cp 5) = .unsupported := rfl
 theorem corrupt_param_tuple_nil_fl_rejected :
     resolveCopyElemLayout D64_b4 L64_b4 (cp 6) (cp 6) = .unsupported := rfl
+
+/-! ### A4 regressions: arrays / non-empty tuples without `fieldLayouts` fail closed -/
+
+/-- `rustc-capture` interns element / field layouts for every array and non-empty tuple above
+its depth-16 limit, so an absent `fieldLayouts` list never determines a layout: a `(u64, u8)`
+layout with `size = 9, align = 1` (whose primitive sizes sum to `9`) and a `[u64; 2]` layout
+with `align = 1` are rejected; the tuple is then `.unsupported` and the array falls back to the
+exact structural `(16, 8)`, so a 4-aligned dangling pointer is `.ub`. -/
+def L64_a4 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 9 1 (.arbitrary [⟨0⟩, ⟨8⟩] [0, 1])
+      , ptrLay 8 1
+      , lay 16 1 (.array ⟨8⟩ 2)
+      , ptrLay 8 3 ] }
+def D64_a4 : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.tuple [.uint .u64, .uint .u8])) 2
+  , decl (ptrK (.array (.uint .u64) 2)) 4 ]
+
+theorem nil_fl_tuple_size9_align1_rejected :
+    resolveCopyElemLayout D64_a4 L64_a4 (cp 1) (cp 1) = .unsupported := rfl
+theorem nil_fl_u64_array_align1_falls_back_exact :
+    resolveCopyElemLayout D64_a4 L64_a4 (cp 2) (cp 2) = .ok 16 8 := rfl
+theorem nil_fl_u64_array_align1_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 2) (cp 2) D64_a4 L64_a4 (av 4) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
 
 end Anneal.Tests.ZeroCountCopyAlign.V08
 
@@ -2862,6 +2918,18 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_param_tuple_nil_fl_rejected
 
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.nil_fl_tuple_size9_align1_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.nil_fl_tuple_size9_align1_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.nil_fl_u64_array_align1_falls_back_exact' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.nil_fl_u64_array_align1_falls_back_exact
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.nil_fl_u64_array_align1_misaligned_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.nil_fl_u64_array_align1_misaligned_ub
+
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_unit_arr0_align8_no_false_ub' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_unit_arr0_align8_no_false_ub
@@ -2885,3 +2953,15 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_param_tuple_nil_fl_rejected' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_param_tuple_nil_fl_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.nil_fl_tuple_size9_align1_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.nil_fl_tuple_size9_align1_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.nil_fl_u64_array_align1_falls_back_exact' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.nil_fl_u64_array_align1_falls_back_exact
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.nil_fl_u64_array_align1_misaligned_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.nil_fl_u64_array_align1_misaligned_ub

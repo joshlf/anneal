@@ -4013,61 +4013,25 @@ def copyTupleFieldLayoutsMatch
   | _, _, _, _ => false
 
 /--
-Minimum known byte size of a tuple with field types `ks` when `fieldLayouts` is
-absent (helper for `copyLayoutMatchesRigidTyAux`): sums known primitive sizes
-(`copyPrimByteSize?`) and pointer sizes (`2 * ptrBytes` for wide pointers via
-`copyPtrIsWide?`, `ptrBytes` for thin or unknown-sizedness pointers), returning
-`.none` if any field is an uninstantiated generic parameter `.param` (whose
-concrete size is unknown when `fieldLayouts` is absent).
-
-Reference (The Rust Reference 1.98.0, "Pointer types" and "Dynamically Sized Types"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.pointer.thin>
-<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html#r-dynamic-sized.pointer-types>
-
-> "Pointers to sized types have the same size and alignment as `usize`."
-> "Pointer types to DSTs are sized but have twice the size of pointers to sized
-> types, since they also store metadata:"
-
-Modeling choice: non-primitive, non-pointer, non-`.param` fields contribute `0`,
-so `.some minSz` never exceeds the tuple's actual size.
--/
-def copyTupleMinBytes? (ptrBytes : Nat) : List RigidTy → Option Nat
-  | .nil => .some 0
-  | k :: rest =>
-    match k with
-    | .param _ _ => .none
-    | _ =>
-      match copyTupleMinBytes? ptrBytes rest with
-      | .none => .none
-      | .some restSz =>
-        let kSz : Nat :=
-          match copyPrimByteSize? ptrBytes k with
-          | .some sz => sz
-          | .none =>
-            match k with
-            | .ref _ pt | .rawPtr _ pt =>
-              match copyPtrIsWide? 8 pt with
-              | .some true => Nat.mul 2 ptrBytes
-              | _ => ptrBytes
-            | _ => 0
-        .some (Nat.add kSz restSz)
-
-/--
 Fuel-bounded structural consistency check between a compiler-supplied layout `l`
 (at index `layoutIdx`) and the type `kind` on target `layouts`: primitive sizes,
 `!` / function-item / `()` zero-sized shapes, thin (`ptrBytes`, scalar-pointer
 repr, `.primitive` fields) or wide (`2 * ptrBytes`, scalar-pair-pointer repr)
 pointers with alignment at most `ptrBytes`, arrays with `count = N`,
 `size = stride * N`, and element-layout consistency (validating `fieldLayouts`
-recursively when present, and validating ZST / pointer / primitive element
-strides and rejecting uninstantiated `.param` elements when `fieldLayouts` is
-absent; in every case the stride, which is the element size, must be a multiple
-of the array's alignment, which is the element alignment), tuples with one
-offset per field and pairwise field-layout / alignment / size consistency (or
-`copyTupleMinBytes?` when `fieldLayouts` is absent), ADT/closure plausibility
-(`copyLayoutValidForResolvedAdt`), and — for compound types — no generic
-placeholder (`copyLayoutHasPlaceholder`) and no truncated parametric template
-(`copyLayoutTruncatedParametric`). Exhausting `fuel` fails closed (`false`).
+recursively; the stride, which is the element size, must be a multiple of the
+array's alignment, which is the element alignment), tuples with one offset per
+field and pairwise field-layout / alignment / size consistency, ADT/closure
+plausibility (`copyLayoutValidForResolvedAdt`), and — for compound types — no
+generic placeholder (`copyLayoutHasPlaceholder`) and no truncated parametric
+template (`copyLayoutTruncatedParametric`). An array or non-empty tuple layout
+without `fieldLayouts` is rejected: `rustc-capture` interns the element / field
+layouts of every array and non-empty tuple above its depth-16 truncation limit
+(`trusted/rustc-capture/src/rustc_2026_06_01/layout_lower.rs`,
+`intern_ty_layout_depth` / `intern_field_tys`), so an absent list marks a
+truncated (or hand-built) layout whose element or field shapes cannot be
+validated (modeling choice: fail closed, costing only precision). Exhausting
+`fuel` fails closed (`false`).
 
 Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -4132,31 +4096,7 @@ def copyLayoutMatchesRigidTyAux :
                 (Bool.and (copyLayoutMatchesRigidTyAux fuel' layouts elemIdx elem elemL)
                   (Bool.and (Nat.beq stride.bytes elemL.size.bytes)
                     (Nat.beq l.align.bytes elemL.align.bytes)))
-          | .nil =>
-            match elem with
-            | .tuple .nil | .fnDef _ _ =>
-              Bool.and (Bool.not l.isUninhabited)
-                (Bool.and (Nat.beq stride.bytes 0) (Nat.beq l.align.bytes 1))
-            | .never =>
-              Bool.and (Bool.or (Nat.beq n 0) l.isUninhabited)
-                (Bool.and (Nat.beq stride.bytes 0) (Nat.beq l.align.bytes 1))
-            | .ref _ pt | .rawPtr _ pt =>
-              let strideOk : Bool :=
-                match copyPtrIsWide? 8 pt with
-                | .some true => Nat.beq stride.bytes (Nat.mul 2 ptrBytes)
-                | .some false => Nat.beq stride.bytes ptrBytes
-                | .none =>
-                  Bool.or (Nat.beq stride.bytes ptrBytes)
-                    (Nat.beq stride.bytes (Nat.mul 2 ptrBytes))
-              Bool.and (Bool.not l.isUninhabited)
-                (Bool.and (Nat.ble l.align.bytes ptrBytes) strideOk)
-            | .param _ _ => false
-            | _ =>
-              match copyPrimByteSize? ptrBytes elem with
-              | .some esz =>
-                Bool.and (Bool.not l.isUninhabited)
-                  (Bool.and (Nat.beq stride.bytes esz) (Nat.ble l.align.bytes esz))
-              | .none => true
+          | .nil => false
           | _ => false
         Bool.and (Bool.and compoundOk singleOrEmptyVariant)
           (Bool.and elemOk
@@ -4171,10 +4111,7 @@ def copyLayoutMatchesRigidTyAux :
         | .arbitrary offsets _ =>
           let fieldsOk : Bool :=
             match l.fieldLayouts with
-            | .nil =>
-              match copyTupleMinBytes? ptrBytes ks with
-              | .some minSz => Nat.ble minSz l.size.bytes
-              | .none => false
+            | .nil => false
             | fIdxs =>
               copyTupleFieldLayoutsMatch
                 (copyLayoutMatchesRigidTyAux fuel' layouts)
