@@ -742,6 +742,85 @@ theorem ep2_a3_commuting_write_square_dual_cut_and_sublens_unification :
             have hDual := mirWavefrontCutAt_dual_mem_frame hv.2.2.2.2.2
             exact ⟨msAtRet10, wFinal, h.2.2.1, hv.2.2.2.1, hDual.1, hDual.2.1, hDual.2.2⟩
 
+/-- **Pass B4 — Trusted-Semantics Refinement of the `runCfgSteps` Drain Bridge**
+(3-axiom test ceiling, because the pre-existing refinement lemma
+`Anneal.PureMirExec.mirWpConverges_of_runCfgSteps_none` uses `Classical.choice`/`Quot.sound`;
+the theory modules themselves stay `[propext]`-only):
+`runCfgSteps_wavefrontDrain_indexedCut_bridge` is stated over Anneal's CFG executor
+`runCfgSteps`. Composing it with `mirWpConverges_of_runCfgSteps_none` transports the MIR half of
+the bridge to the fuel-free WP `MirWpConverges` over the TRUSTED
+`Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState`/`stepMirFn` semantics: every normal halt
+of the trusted machine preserves globals, exits root-frame, and keeps the `Firewall`-sealed frame
+slice, while the wavefront drain reclaims the loan and preserves the SAME frame slice in its own
+mutated `V2026_06_01` `Memory`. -/
+theorem ep2_b4_wavefrontDrain_bridge_refines_trusted_stepMirState_wp
+    (body : CapturedMir) (pol : SpawnPolicy) (hPol : PolicyAdmissible pol)
+    (F : VProp) (frameL : V2026SubLens) (frameBs : List AbstractByte)
+    (ms0 : MachineState) (cfgFuel : Nat) (retVal : Value) (memFinal : Memory)
+    (vIn : View) (rIn : ResTrie ResElem) (wIn : WavefrontWorldV2026) (lid : Pos4)
+    (hPhase : body.phase = .runtimeOptimized)
+    (hBody : isWavefrontCfgBody body = true)
+    (hCfgRun : runCfgSteps body (.running true .none ms0) cfgFuel =
+      .halted true (.normal (retVal, memFinal)))
+    (hPre : (vsep vemp F).holds vIn rIn)
+    (hMIn : WorldMatchesV2026 vIn rIn wIn)
+    (hMemFrameIn : MirGlobalSliceAtV2026 ms0.memory frameL frameBs)
+    (hWfMemFrameIn : MirGlobalSliceAtV2026 wIn.mem frameL frameBs)
+    (hLoansDisjIn : allDisjointFromLens frameL wIn.loans)
+    (hQueued : (anyTaskHasLoan lid wIn.fifoQueue || anyTaskHasLoan lid wIn.stealDeque) = true) :
+    Anneal.MirFuelFree.MirWpConverges body ms0 (fun out =>
+      ∃ (rv : Value) (mf : Memory), out = .normal (rv, mf) ∧
+        mf.globals = ms0.memory.globals ∧ mf.activeCallee = none ∧ mf.callStack = [] ∧
+        MirGlobalSliceAtV2026 mf frameL frameBs) ∧
+    ∃ (wDrained : WavefrontWorldV2026) (e0 : WfLoanEntryV2026),
+      WavefrontConvergesV2026 pol wIn wDrained ∧
+      worldMeasureV2026 wDrained = [] ∧
+      ActivePureLoanAtV2026 lid e0.lens
+        (wrapU32 (e0.val + worldLoanDeltaSum pol lid wIn)) wDrained ∧
+      MirGlobalSliceAtV2026 wDrained.mem frameL frameBs := by
+  have hRoot := runCfgSteps_preserves_rootFrame_and_globals_of_wavefrontCfgBody hBody hCfgRun
+  refine ⟨mirWpConverges_of_runCfgSteps_none body _ hPhase cfgFuel ms0 _ hCfgRun
+    ⟨retVal, memFinal, rfl, hRoot.1, hRoot.2.1, hRoot.2.2,
+      mirGlobalSliceAtV2026_of_globals_eq hRoot.1 hMemFrameIn⟩, ?_⟩
+  cases runCfgSteps_wavefrontDrain_indexedCut_bridge body pol hPol F frameL frameBs ms0 cfgFuel
+      retVal memFinal vIn rIn wIn lid hBody hCfgRun hPre hMIn hMemFrameIn hWfMemFrameIn
+      hLoansDisjIn hQueued with
+  | intro wD h1 =>
+    cases h1 with
+    | intro rOut h2 =>
+      cases h2 with
+      | intro vOut h3 =>
+        cases h3 with
+        | intro e0 h =>
+          exact ⟨wD, e0, h.2.1, h.2.2.1, h.2.2.2.1,
+            (open_cut h.2.2.2.2.2.2.2.2).2.2.2.1⟩
+
+/-- **Pass B4 concrete instance (3-axiom test ceiling)**: under the TRUSTED `stepMirState` WP
+(`MirWpConverges`), the SAME pointer-dereferencing `wfPtrReadReclaimLoopBody` returns
+`.scalar ⟨42, 4⟩` from `epoch = 10` memory and `.scalar ⟨132, 4⟩` from `epoch = 100` memory, and
+the `epoch = 100` wavefront drain reclaims exactly `132` into its own `V2026_06_01` `Memory`,
+read back by unmodified `decodeValueFromBytes` as the trusted machine's return value. -/
+theorem ep2_b4_trusted_stepMirState_wp_return_eq_reclaimed_loan :
+    Anneal.MirFuelFree.MirWpConverges wfPtrReadReclaimLoopBody wfPtrLoopInitMs10
+      (fun out => out = .normal (.scalar ⟨42, 4⟩, wfCNode24Mem0)) ∧
+    Anneal.MirFuelFree.MirWpConverges wfPtrReadReclaimLoopBody wfPtrLoopInitMs100
+      (fun out => out = .normal (.scalar ⟨132, 4⟩, wfCNodeMem100)) ∧
+    (∃ wD : WavefrontWorldV2026,
+      WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld100 wD ∧
+      v2026SubLensGet wfCNodeEpochLens wD.mem = some (wfEncodeU32LeAbsBytes 132) ∧
+      decodeValueFromBytes 1 wfPtrLoopLayouts wfU32Ty (wfEncodeU32LeAbsBytes 132) =
+        some (.scalar ⟨132, 4⟩)) := by
+  have hPtr := witness_v2026_ptrDeref_mir_loop_input_sensitive
+  refine ⟨mirWpConverges_of_runCfgSteps_none _ _ rfl 15 _ _ hPtr.2.1 rfl,
+    mirWpConverges_of_runCfgSteps_none _ _ rfl 15 _ _ hPtr.2.2.1 rfl, ?_⟩
+  cases hPtr.2.2.2 with
+  | intro wD hw =>
+    cases hw with
+    | intro _ hr =>
+      cases hr with
+      | intro _ hv =>
+        exact ⟨wD, hv.1, hv.2.2.2.1, hv.2.2.2.2.1⟩
+
 /-- **Unified Episode 2 Cross-Module Master Capstone (`[propext]`)**:
 Bundles the positive and fail-closed negative witnesses from ALL THREE root modules:
 `Anneal.MiriTreeBorrowsV2026`, `Anneal.SepAC.RangeSpanV2026`, and
@@ -990,6 +1069,10 @@ run_cmd do
         ``Anneal.WavefrontReclaim.WavefrontV2026.mirSingleStepTo_preserves_rootFrame_of_wavefrontCfgBody),
       (``Anneal.WavefrontReclaim.WavefrontV2026.mirNodeNext?_sound,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode.emitStep),
+      (``Anneal.Mir.InitialStateWpAndSepAcTests.ep2_b4_wavefrontDrain_bridge_refines_trusted_stepMirState_wp,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState),
+      (``Anneal.Mir.InitialStateWpAndSepAcTests.ep2_b4_trusted_stepMirState_wp_return_eq_reclaimed_loan,
+        ``Anneal.MirFuelFree.MirWpConverges),
       (``Anneal.WavefrontReclaim.WavefrontV2026.wavefrontConverges_preserves_disjoint_mem_frame,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes),
       (``Anneal.WavefrontReclaim.WavefrontV2026.wavefrontConverges_preserves_disjoint_mem_frame,
