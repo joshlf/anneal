@@ -23,6 +23,8 @@ import Anneal.MirLiftBench
 import Anneal.SepLogicLenses
 import Anneal.PureLift
 import Anneal.OleanSpecStrengthAuditor
+import Anneal.OpaqueCalleeTable
+import Anneal.CompilerQueryEnv
 
 namespace Anneal
 

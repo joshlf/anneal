@@ -2298,6 +2298,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_adt_and_control",
             "tests_mir_slice_wide_ptr_lens",
             "tests_mir_untested_variant_correspondence",
+            "tests_mir_compiler_query_and_opaque_callee",
             "lake_build_correspondence",
             "lake_build_minirust_spec_core",
             "lake_build_minirust_spec",
@@ -2369,6 +2370,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "AdtAndControlTests",
                     "MirSliceWidePtrLensTests",
                     "MirUntestedVariantCorrespondenceTests",
+                    "CompilerQueryAndOpaqueCalleeTests",
                 )
             ),
         )
@@ -2868,7 +2870,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertTrue(miri_olean.exists())
 
             # 2. `run_suite_and_generate_dashboard` records the new steps and reconciled 90/94
-            #    MIR matrix in both JSON and Markdown outputs for `quick` (13) and `nightly` (33).
+            #    MIR matrix in both JSON and Markdown outputs for `quick` (13) and `nightly` (34).
             #    Stub Stage B corpus scanning and divergence discovery (covered by their own
             #    end-to-end tests) so running both profiles stays fast while Stage A, step
             #    planning, Markdown rendering, and JSON persistence remain real.
@@ -2915,7 +2917,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 ),
                 (
                     "nightly",
-                    33,
+                    34,
                     (
                         "lake_build_core_theory",
                         "check_trusted_fast",
@@ -3021,6 +3023,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_adt_and_control": 300,
             "tests_mir_slice_wide_ptr_lens": 300,
             "tests_mir_untested_variant_correspondence": 300,
+            "tests_mir_compiler_query_and_opaque_callee": 300,
             "lake_build_correspondence": 900,
             "lake_build_minirust_spec_core": 900,
             "lake_build_minirust_spec": 1200,
@@ -6971,8 +6974,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             canonical_wrapped = {
                 name for name, (cmd, _t) in canonical.items() if Path(cmd[0]).name == "anneal-lean-run"
             }
-            self.assertEqual(len(canonical), 33)
-            self.assertEqual(len(canonical_wrapped), 24)
+            self.assertEqual(len(canonical), 34)
+            self.assertEqual(len(canonical_wrapped), 25)
 
             with mock.patch.dict(os.environ, {"ANNEAL_LEAN_RUN": os.fspath(renamed), "LEAN_NUM_THREADS": "7"}):
                 steps = suite.build_suite_steps(REPO_ROOT, "nightly")
@@ -7587,7 +7590,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
 
     def test_domain_integration_tests_anneal_difftest_config_and_timeout_invariants(self) -> None:
         nightly_steps = suite.build_suite_steps(REPO_ROOT, "nightly")
-        self.assertEqual(len(nightly_steps), 33)
+        self.assertEqual(len(nightly_steps), 34)
         for step in nightly_steps:
             self.assertEqual(len(step), 4)
         by_name = {name: (cat, cmd, timeout) for name, cat, cmd, timeout in nightly_steps}

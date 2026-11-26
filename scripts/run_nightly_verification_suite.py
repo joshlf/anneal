@@ -5363,6 +5363,7 @@ _LEAN_RUN_VALUE_OPTS: frozenset[str] = frozenset(
         "--mode",
         "--memory-max-mb",
         "--timeout",
+        "--replay-threads",
     )
 )
 _LEAN_RUN_BOOL_OPTS: frozenset[str] = frozenset(
@@ -5376,6 +5377,7 @@ _LEAN_RUN_BOOL_OPTS: frozenset[str] = frozenset(
         "--no-oom-retry",
         "--unsafe-ignore-cgroup",
         "--ensure-slice",
+        "--self-test",
         "-h",
         "--help",
     )
@@ -7297,7 +7299,8 @@ def _run_step(
 # `Anneal.Mir.Cast` and `Anneal.Mir.AdtAndControl` are outside the
 # `Trusted`/`Anneal`/`MiniRust` import closure, and so are the `Correspondence` /
 # `MiniRustSpec` modules imported by `MirUntestedVariantCorrespondenceTests.lean`
-# (`Anneal.SepLogicLenses`, `Anneal.MirLoops` and `Anneal.MirFuelFree` are inside it).
+# (`Anneal.SepLogicLenses`, `Anneal.MirLoops` and `Anneal.MirFuelFree` are inside it, as are
+# `Anneal.OpaqueCalleeTable` / `Anneal.CompilerQueryEnv` of `CompilerQueryAndOpaqueCalleeTests.lean`).
 MIR_STANDALONE_LEAN_TESTS: tuple[tuple[str, str], ...] = (
     ("tests_mir_bit_validity_stage1", "tests/mir/BitValidityStage1Tests.lean"),
     ("tests_mir_byte_codec", "tests/mir/ByteCodecTests.lean"),
@@ -7305,6 +7308,7 @@ MIR_STANDALONE_LEAN_TESTS: tuple[tuple[str, str], ...] = (
     ("tests_mir_adt_and_control", "tests/mir/AdtAndControlTests.lean"),
     ("tests_mir_slice_wide_ptr_lens", "tests/mir/MirSliceWidePtrLensTests.lean"),
     ("tests_mir_untested_variant_correspondence", "tests/mir/MirUntestedVariantCorrespondenceTests.lean"),
+    ("tests_mir_compiler_query_and_opaque_callee", "tests/mir/CompilerQueryAndOpaqueCalleeTests.lean"),
 )
 CORE_THEORY_LIBS: tuple[str, ...] = ("Trusted", "Anneal", "MiniRust")
 _LOCAL_LEAN_LIB_FALLBACK: tuple[str, ...] = (
@@ -7328,6 +7332,9 @@ _MIR_TEST_MODULE_FALLBACK: tuple[str, ...] = (
     "Correspondence.V2026_06_01.L3_PlacesAndBasicMem",
     "Correspondence.V2026_06_01.L5_ControlAndCalls",
     "MiniRustSpec.Correspondence.Translate",
+    "Anneal",
+    "Anneal.OpaqueCalleeTable",
+    "Anneal.CompilerQueryEnv",
 )
 _LEAN_HEADER_TOKEN_RE = re.compile(r"(?:«[^»\n]*»|[^\s«])+")
 

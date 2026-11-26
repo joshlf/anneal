@@ -39,6 +39,12 @@ the `BEGIN/END SHARED WAIVER-PIN & 3-AXIS AUDITOR` banners, byte-identical in
    mismatches, witness-shape mismatches, trivial conclusions, tautological implications and
    unused subjects. `include_unannotated_vacuity=True` (`--all-theorems`) applies every
    check to every theorem.
+8. `redundant_beq_decidable_eq` (Lean): a `deriving` clause on an `inductive` / `structure` /
+   `class` / `def` / `abbrev` declaration or a standalone `deriving [noncomputable] instance
+   ... for ...` command whose derived class list contains both `BEq` and `DecidableEq`
+   (including qualified `_root_.BEq`, guillemets `«BEq»`, parenthesized `(BEq)`, and
+   `@[expose] BEq`). Deriving structural `BEq` alongside `DecidableEq` shadows core's
+   `instBEqOfDecidableEq` and breaks `LawfulBEq` (`beq_iff_eq`) synthesis.
 
 Two advisory rules (`ADVISORY_RULES`) are opt-in (`include_advisories=True`, CLI
 `--advisories`) and never part of `ALL_RULES` or of a default scan; they point at proof-scaling
@@ -100,6 +106,7 @@ RULE_LOW_PROFILER_THRESHOLD = "low_profiler_threshold"
 RULE_DUPLICATE_PRIVATE_LEMMA = "duplicate_private_lemma"
 RULE_UNPINNED_OR_DRIFTED_WAIVER = "unpinned_or_drifted_waiver"
 RULE_TRIVIAL_OR_VACUOUS_CLAIM = "trivial_or_vacuous_claim"
+RULE_REDUNDANT_BEQ_DECIDABLE_EQ = "redundant_beq_decidable_eq"
 
 ALL_RULES: tuple[str, ...] = (
     RULE_DSIMP_FORBIDDEN_SYM,
@@ -109,6 +116,7 @@ ALL_RULES: tuple[str, ...] = (
     RULE_DUPLICATE_PRIVATE_LEMMA,
     RULE_UNPINNED_OR_DRIFTED_WAIVER,
     RULE_TRIVIAL_OR_VACUOUS_CLAIM,
+    RULE_REDUNDANT_BEQ_DECIDABLE_EQ,
 )
 
 # Advisory rules: reported only on request (`include_advisories=True` / `--advisories`),
@@ -1448,10 +1456,11 @@ def _put_file_texts_cache(key: str, val: tuple[Any, ...]) -> None:
 COUNT_CACHE_MAX_FILES = 1024
 # Bump whenever rule semantics, signature normalization, or index layout change:
 # count entries and sibling indexes written under another version are ignored.
-# Version 7 added rules 6 (`unpinned_or_drifted_waiver`) and 7 (`trivial_or_vacuous_claim`):
-# a version-6 count entry has no counts for them, and reading its missing keys as `0`
-# would report every pre-existing rule 6 / rule 7 finding as newly introduced.
-CACHE_FORMAT_VERSION = 7
+# Version 7 added rules 6 (`unpinned_or_drifted_waiver`) and 7 (`trivial_or_vacuous_claim`);
+# Version 8 adds rule 8 (`redundant_beq_decidable_eq`): an older count entry has no count
+# for newly added rules, and reading missing keys as `0` would report pre-existing findings
+# as newly introduced.
+CACHE_FORMAT_VERSION = 8
 
 
 def sibling_index_path(cache_path: str | Path, directory: str | Path) -> Path:
@@ -2163,6 +2172,7 @@ def scan_lean_text(
                     _LAST_LEAN_SCAN[true_scan_key] = (
                         *base_prev[:6],
                         merged_tup,
+                        base_prev[7],
                     )
                 return merged
         else:
@@ -2188,6 +2198,7 @@ def scan_lean_text(
                     _LAST_LEAN_SCAN[false_scan_key] = (
                         *adv_prev[:6],
                         filtered_tup,
+                        adv_prev[7],
                     )
                 return filtered
     findings = _scan_lean_text_uncached(
@@ -2238,7 +2249,16 @@ def _scan_lean_text_uncached(
     if INCREMENTAL_SPLICING and _preparsed is None and len(text) >= 32768:
         prev_scan = _LAST_LEAN_SCAN.get(scan_key)
         if prev_scan is not None:
-            old_text, old_code, c_starts, c_ends, col0_thms, old_sibs, old_findings = prev_scan
+            (
+                old_text,
+                old_code,
+                c_starts,
+                c_ends,
+                col0_thms,
+                old_sibs,
+                old_findings,
+                old_rbd_clean,
+            ) = prev_scan
             cur_sibs: list[PrivateDecl] | None = None
             if sibling_decls is not None:
                 cur_sibs = list(sibling_decls)
@@ -2253,6 +2273,18 @@ def _scan_lean_text_uncached(
                     old_text, old_code, c_starts, c_ends, col0_thms, text
                 )
                 if win_info is not None:
+                    if old_rbd_clean is None:
+                        old_rbd_clean = not _needs_exact_rbd_blank(old_text)
+                        _LAST_LEAN_SCAN[scan_key] = (
+                            old_text,
+                            old_code,
+                            c_starts,
+                            c_ends,
+                            col0_thms,
+                            old_sibs,
+                            old_findings,
+                            old_rbd_clean,
+                        )
                     (
                         safe_lo,
                         safe_hi_old,
@@ -2265,9 +2297,13 @@ def _scan_lean_text_uncached(
                         win_code,
                         win_comments,
                     ) = win_info
+                    win_pad_lo = max(0, safe_lo - 4)
+                    win_pad_hi = min(len(text), safe_hi_new + 4)
                     if (
-                        "private" not in old_code[safe_lo:safe_hi_old]
+                        old_rbd_clean
+                        and "private" not in old_code[safe_lo:safe_hi_old]
                         and "private" not in win_code
+                        and not _needs_exact_rbd_blank(text[win_pad_lo:win_pad_hi])
                         and not (
                             delta_lines != 0
                             and any(f.rule == RULE_DUPLICATE_PRIVATE_LEMMA for f in old_findings)
@@ -2546,6 +2582,25 @@ def _scan_lean_text_uncached(
         )
     )
 
+    # Rule 8: `redundant_beq_decidable_eq` (single C substring gate skips clean files in ~0.04 ms)
+    rbd_clean: bool | None = None
+    if "BEq" in text and "deriving" in text and "DecidableEq" in text:
+        if "BEq" in stripped and "deriving" in stripped and "DecidableEq" in stripped:
+            needs_exact = _needs_exact_rbd_blank(text)
+            rbd_clean = not needs_exact
+            findings.extend(
+                _scan_redundant_beq_decidable_eq(
+                    text, stripped, line_of, needs_exact=needs_exact
+                )
+            )
+        else:
+            needs_exact = _needs_exact_rbd_blank(text)
+            rbd_clean = not needs_exact
+            if needs_exact:
+                findings.extend(
+                    _scan_redundant_beq_decidable_eq(text, stripped, line_of, needs_exact=True)
+                )
+
     if include_advisories:
         findings.extend(scan_projection_and_rewrite_order_hazards(text, stripped=stripped))
 
@@ -2564,6 +2619,7 @@ def _scan_lean_text_uncached(
                 col0_thms,
                 tuple(ext_decls),
                 tuple(findings),
+                rbd_clean,
             )
     return findings
 
@@ -2578,6 +2634,7 @@ _LAST_LEAN_SCAN: dict[
         list[int],
         tuple[PrivateDecl, ...],
         tuple[ProofHealthFinding, ...],
+        bool | None,
     ],
 ] = {}
 
@@ -11518,7 +11575,7 @@ def count_audit_findings_by_rule(findings: Iterable[WaiverPinFinding]) -> dict[s
 
 
 # ---------------------------------------------------------------------------
-# Rules 6 & 7 on top of the shared auditor, Rust scanning, cache control, and CLI
+# Rules 6, 7 & 8 on top of the shared auditor, Rust scanning, cache control, and CLI
 # ---------------------------------------------------------------------------
 
 _WAIVER_SUBRULE_SET: frozenset[str] = frozenset(ALL_WAIVER_RULES)
@@ -11566,6 +11623,990 @@ def _lean_waiver_and_vacuity_findings(
     ]
 
 
+_RBD_HEX_CHARS: frozenset[str] = frozenset("0123456789abcdefABCDEF")
+_RBD_BRACKETS: dict[str, str] = {"(": ")", "[": "]", "{": "}", "⟨": "⟩", "⦃": "⦄"}
+_RBD_CLOSING_BRACKETS: frozenset[str] = frozenset(_RBD_BRACKETS.values())
+_DERIVING_STOP_WORDS: frozenset[str] = frozenset(
+    (
+        "deriving",
+        "inductive",
+        "coinductive",
+        "structure",
+        "class",
+        "def",
+        "abbrev",
+        "opaque",
+        "theorem",
+        "example",
+        "instance",
+        "axiom",
+        "variable",
+        "universe",
+        "namespace",
+        "section",
+        "end",
+        "open",
+        "export",
+        "import",
+        "prelude",
+        "mutual",
+        "attribute",
+        "local",
+        "scoped",
+        "private",
+        "protected",
+        "public",
+        "noncomputable",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "meta",
+        "elab",
+        "elab_rules",
+        "macro",
+        "macro_rules",
+        "syntax",
+        "declare_syntax_cat",
+        "notation",
+        "infix",
+        "infixl",
+        "infixr",
+        "prefix",
+        "postfix",
+        "run_cmd",
+        "run_elab",
+        "run_meta",
+        "set_option",
+        "register_option",
+        "initialize",
+        "builtin_initialize",
+        "omit",
+        "include",
+        "where",
+        "in",
+        "by",
+    )
+)
+_DERIVING_INLINE_DECL_KWS: frozenset[str] = frozenset(
+    ("inductive", "coinductive", "structure", "class", "def", "abbrev")
+)
+_DERIVING_DECL_MODIFIERS: frozenset[str] = frozenset(
+    (
+        "private",
+        "protected",
+        "public",
+        "scoped",
+        "local",
+        "noncomputable",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "meta",
+    )
+)
+_DERIVING_ENCLOSING_RESET_KWS: frozenset[str] = (
+    _DERIVING_STOP_WORDS
+    - _DERIVING_INLINE_DECL_KWS
+    - _DERIVING_DECL_MODIFIERS
+    - frozenset(("where", "in", "by", "open", "set_option"))
+)
+
+
+def _is_rbd_ident_start(ch: str) -> bool:
+    return ch.isalpha() or ch == "_"
+
+
+def _is_rbd_ident_char(ch: str) -> bool:
+    return ch.isalnum() or ch in "_'!?₀₁₂₃₄₅₆₇₈₉ₐₑₒₓₔₕₖₗₘₙₚₛₜᵢᵣᵤᵥⱼ"
+
+
+def _skip_lean_char_lit(text: str, j: int, limit: int) -> int | None:
+    """End offset of a Lean 4 character literal starting at `j` (`text[j] == "'"`), or `None`."""
+    if j + 2 < limit and text[j + 1] not in "\\\r\n'" and text[j + 2] == "'":
+        return j + 3
+    if j + 3 < limit and text[j + 1] == "\\":
+        esc = text[j + 2]
+        if esc in "\\'\"nrt0" and text[j + 3] == "'":
+            return j + 4
+        if (
+            esc == "x"
+            and j + 5 < limit
+            and text[j + 5] == "'"
+            and all(c in _RBD_HEX_CHARS for c in text[j + 3 : j + 5])
+        ):
+            return j + 6
+        if esc == "u":
+            if text[j + 3] == "{":
+                k = text.find("}", j + 4, min(limit, j + 15))
+                if (
+                    k != -1
+                    and k > j + 4
+                    and k + 1 < limit
+                    and text[k + 1] == "'"
+                    and all(c in _RBD_HEX_CHARS for c in text[j + 4 : k])
+                ):
+                    return k + 2
+            elif (
+                j + 7 < limit
+                and text[j + 7] == "'"
+                and all(c in _RBD_HEX_CHARS for c in text[j + 3 : j + 7])
+            ):
+                return j + 8
+    return None
+
+
+def _skip_lean_raw_str(text: str, j: int, limit: int) -> int | None:
+    """End offset of a Lean 4 raw string `r"..."` / `r#"..."#` at `j` (`text[j] == "r"`), or `None`."""
+    k = j + 1
+    while k < limit and text[k] == "#":
+        k += 1
+    if k >= limit or text[k] != '"':
+        return None
+    close = '"' + "#" * (k - j - 1)
+    end = text.find(close, k + 1, limit)
+    return limit if end == -1 else end + len(close)
+
+
+def _skip_lean_block_comment(text: str, j: int, limit: int) -> int:
+    """End offset of a nested `/- ... -/` block comment starting at `j`."""
+    depth = 1
+    cur = j + 2
+    find = text.find
+    while depth > 0 and cur < limit:
+        c = find("-/", cur, limit)
+        if c == -1:
+            return limit
+        o = find("/-", cur, c)
+        if o != -1:
+            depth += 1
+            cur = o + 2
+        else:
+            depth -= 1
+            cur = c + 2
+    return cur
+
+
+def _read_lean_dotted_ident(text: str, i: int, limit: int) -> tuple[str, int, bool]:
+    """Read a dotted/guillemet Lean 4 identifier at `i`, returning `(name, end_off, plain_bang_tail)`.
+
+    Guillemet-quoted components retain their `«...»` delimiters so escaped names (`«for»`,
+    `«end»`, `«def»`, `«theorem»`, `«Not.BEq»`) never collide with bare Lean keywords or split on
+    embedded dots. `plain_bang_tail` is `True` when the final component is an unquoted identifier
+    ending in `!` (so an immediately following `"` forms an `<ident>!"..."` interpolated string).
+    """
+    parts: list[str] = []
+    plain_bang = False
+    j = i
+    while True:
+        if j < limit and text[j] == "«":
+            nl = text.find("\n", j + 1, limit)
+            g_lim = limit if nl == -1 else nl
+            k = text.find("»", j + 1, g_lim)
+            if k == -1:
+                parts.append("«")
+                j += 1
+                plain_bang = False
+                break
+            part = text[j + 1 : k]
+            j = k + 1
+            parts.append(f"«{part}»")
+            plain_bang = False
+        elif j < limit and _is_rbd_ident_start(text[j]):
+            k = j + 1
+            while k < limit and _is_rbd_ident_char(text[k]):
+                k += 1
+            part = text[j:k]
+            parts.append(part)
+            plain_bang = part.endswith("!")
+            j = k
+        else:
+            break
+        if j + 1 < limit and text[j] == "." and (text[j + 1] == "«" or _is_rbd_ident_start(text[j + 1])):
+            j += 1
+            continue
+        break
+    return ".".join(parts), j, plain_bang
+
+
+def _unquote_lean_ident(name: str) -> str:
+    """Strip `«...»` quotes from each `.`-separated component of `name`."""
+    if "«" not in name:
+        return name
+    out: list[str] = []
+    i = 0
+    n = len(name)
+    while i < n:
+        if name[i] == "«":
+            k = name.find("»", i + 1)
+            if k == -1:
+                out.append(name[i + 1 :])
+                break
+            out.append(name[i + 1 : k])
+            i = k + 1
+            if i < n and name[i] == ".":
+                out.append(".")
+                i += 1
+        else:
+            k = name.find(".", i)
+            if k == -1:
+                out.append(name[i:])
+                break
+            out.append(name[i : k + 1])
+            i = k + 1
+    return "".join(out)
+
+
+def _last_unquoted_component(name: str) -> str:
+    """Unquoted final component of a dotted Lean identifier (`«Not.BEq»` -> `Not.BEq`,
+    `_root_.«BEq»` -> `BEq`, `Foo.DecidableEq` -> `DecidableEq`)."""
+    if "«" not in name:
+        return name.rsplit(".", 1)[-1]
+    last_dot = -1
+    in_gui = False
+    for idx, ch in enumerate(name):
+        if in_gui:
+            if ch == "»":
+                in_gui = False
+        elif ch == "«":
+            in_gui = True
+        elif ch == ".":
+            last_dot = idx
+    comp = name[last_dot + 1 :]
+    if comp.startswith("«") and comp.endswith("»") and len(comp) >= 2:
+        return comp[1:-1]
+    return comp
+
+
+def _skip_lean_str_or_interp(text: str, quote_pos: int, limit: int, interpolated: bool) -> int:
+    """End offset of a string literal whose opening `"` is at `quote_pos`."""
+    if not interpolated:
+        find = text.find
+        cur = quote_pos + 1
+        while cur < limit:
+            q = find('"', cur, limit)
+            if q == -1:
+                return limit
+            bs = 0
+            k = q - 1
+            while k > quote_pos and text[k] == "\\":
+                bs += 1
+                k -= 1
+            cur = q + 1
+            if bs % 2 == 0:
+                return cur
+        return limit
+
+    j = quote_pos + 1
+    while j < limit:
+        c = text[j]
+        if c == "\\":
+            j = min(limit, j + 2)
+        elif c == '"':
+            return j + 1
+        elif c == "{":
+            j = _skip_lean_interp_hole(text, j + 1, limit)
+        else:
+            j += 1
+    return limit
+
+
+def _skip_lean_interp_hole(text: str, j: int, limit: int) -> int:
+    """Advance past `{ ... }` inside an interpolated string literal (`depth = 1` after `{`)."""
+    depth = 1
+    while j < limit and depth > 0:
+        c = text[j]
+        if c == "-" and j + 1 < limit and text[j + 1] == "-":
+            nl = text.find("\n", j + 2, limit)
+            j = limit if nl == -1 else nl + 1
+        elif c == "/" and j + 1 < limit and text[j + 1] == "-":
+            j = _skip_lean_block_comment(text, j, limit)
+        elif (
+            c == "r"
+            and (
+                j == 0
+                or not (_is_rbd_ident_char(text[j - 1]) or text[j - 1] == ".")
+                or text[j - 1] == "'"
+            )
+            and j + 1 < limit
+            and text[j + 1] in '"#'
+        ):
+            end = _skip_lean_raw_str(text, j, limit)
+            j = j + 1 if end is None else end
+        elif c == '"':
+            j = _skip_lean_str_or_interp(text, j, limit, False)
+        elif c == "'":
+            end = (
+                _skip_lean_char_lit(text, j, limit)
+                if (j == 0 or not _is_rbd_ident_char(text[j - 1]))
+                else (_is_char_lit_at(text, j, limit) if text[j - 1] == "'" else None)
+            )
+            j = j + 1 if end is None else end
+        elif c == "«" or _is_rbd_ident_start(c):
+            _, k, plain_bang = _read_lean_dotted_ident(text, j, limit)
+            if plain_bang and k < limit and text[k] == '"':
+                j = _skip_lean_str_or_interp(text, k, limit, True)
+            else:
+                j = max(k, j + 1)
+        elif c == "{":
+            depth += 1
+            j += 1
+        elif c == "}":
+            depth -= 1
+            j += 1
+        else:
+            j += 1
+    return j
+
+
+def _line_start_before(s: str, pos: int) -> int:
+    """Start offset of `pos`'s line in `s`, scanning a 4 KiB window before falling back."""
+    lo = pos - 4096 if pos > 4096 else 0
+    nl = s.rfind("\n", lo, pos)
+    if nl == -1 and lo > 0:
+        nl = s.rfind("\n", 0, lo)
+    return nl + 1
+
+
+def _is_char_lit_at(text: str, quote_open: int, n: int) -> int | None:
+    """If `quote_open` (`text[quote_open] == "'"`) genuinely opens a Lean 4 char literal (not an
+    identifier prime `x'` or the closing `'` of a preceding char literal `'a'`), return its end
+    offset; otherwise `None`."""
+    if quote_open < 0 or quote_open >= n or text[quote_open] != "'":
+        return None
+    line_start = _line_start_before(text, quote_open)
+    p = quote_open
+    while p > line_start and (text[p - 1] == "'" or _is_rbd_ident_char(text[p - 1]) or text[p - 1] == "\\"):
+        p -= 1
+    while p < quote_open:
+        if text[p] == "'":
+            end = _skip_lean_char_lit(text, p, n)
+            if end is not None and end <= quote_open:
+                p = end
+                continue
+            return None
+        if _is_rbd_ident_start(text[p]):
+            p += 1
+            while p < n and _is_rbd_ident_char(text[p]):
+                p += 1
+            if p > quote_open:
+                return None
+            continue
+        p += 1
+    if p != quote_open:
+        return None
+    return _skip_lean_char_lit(text, quote_open, n)
+
+
+def _blank_lean_exact(text: str) -> str:
+    """`str.find`-accelerated blanker handling `<ident>!"..."` string interpolations and
+    back-to-back char literals (`'a''\"'`), preserving exact byte length and `\\n`."""
+    n = len(text)
+    if n == 0:
+        return ""
+    out: list[str] = []
+    app = out.append
+    find = text.find
+    pos = 0
+    i_lin = find("--", 0)
+    i_blk = find("/-", 0)
+    i_str = find('"', 0)
+    i_gui = find("«", 0)
+
+    while pos < n:
+        if 0 <= i_lin < pos:
+            i_lin = find("--", pos)
+        if 0 <= i_blk < pos:
+            i_blk = find("/-", pos)
+        if 0 <= i_str < pos:
+            i_str = find('"', pos)
+        if 0 <= i_gui < pos:
+            i_gui = find("«", pos)
+
+        nxt = n
+        kind = 0
+        if 0 <= i_blk < nxt:
+            nxt, kind = i_blk, 1
+        if 0 <= i_lin < nxt:
+            nxt, kind = i_lin, 2
+        if 0 <= i_str < nxt:
+            nxt, kind = i_str, 3
+        if 0 <= i_gui < nxt:
+            nxt, kind = i_gui, 4
+
+        if kind == 0:
+            app(text[pos:])
+            break
+
+        if kind == 4:
+            # Check `'«'` character literal vs `«...»` guillemet identifier.
+            if nxt > 0 and text[nxt - 1] == "'":
+                cl_end = _is_char_lit_at(text, nxt - 1, n)
+                if cl_end is not None and cl_end > nxt:
+                    if nxt - 1 > pos:
+                        app(text[pos : nxt - 1])
+                    app(" " * (cl_end - (nxt - 1)))
+                    pos = cl_end
+                    continue
+            if nxt > pos:
+                app(text[pos:nxt])
+            g_end = find("»", nxt + 1)
+            if g_end != -1 and find("\n", nxt + 1, g_end) == -1:
+                app(text[nxt : g_end + 1])
+                pos = g_end + 1
+            else:
+                app("«")
+                pos = nxt + 1
+            continue
+
+        if kind == 2:
+            if nxt > pos:
+                app(text[pos:nxt])
+            nl = find("\n", nxt + 2)
+            end = n if nl == -1 else nl
+            app(" " * (end - nxt))
+            pos = end
+            continue
+
+        if kind == 1:
+            if nxt > pos:
+                app(text[pos:nxt])
+            end = _skip_lean_block_comment(text, nxt, n)
+            app(_blank(text[nxt:end]))
+            pos = end
+            continue
+
+        # kind == 3: `"` at `nxt` — check `'"'` / `'\"'` char literal, `r#"..."#`, or `<ident>!"..."`.
+        if nxt >= 1 and text[nxt - 1] == "'":
+            cl_end = _is_char_lit_at(text, nxt - 1, n)
+            if cl_end is not None and cl_end > nxt:
+                if nxt - 1 > pos:
+                    app(text[pos : nxt - 1])
+                app(" " * (cl_end - (nxt - 1)))
+                pos = cl_end
+                continue
+        if nxt >= 2 and text[nxt - 2 : nxt] == "'\\":
+            cl_end = _is_char_lit_at(text, nxt - 2, n)
+            if cl_end is not None and cl_end > nxt:
+                if nxt - 2 > pos:
+                    app(text[pos : nxt - 2])
+                app(" " * (cl_end - (nxt - 2)))
+                pos = cl_end
+                continue
+
+        if nxt > 0 and text[nxt - 1] in "#r":
+            h = nxt
+            while h > 0 and text[h - 1] == "#":
+                h -= 1
+            r_pos = h - 1
+            if r_pos >= pos and text[r_pos] == "r":
+                prev_ok = r_pos == 0 or (
+                    not (_is_rbd_ident_char(text[r_pos - 1]) or text[r_pos - 1] == ".")
+                    or (
+                        text[r_pos - 1] == "'"
+                        and any(
+                            _is_char_lit_at(text, r_pos - cl_len, r_pos) == r_pos
+                            for cl_len in range(3, 16)
+                            if r_pos >= cl_len and text[r_pos - cl_len] == "'"
+                        )
+                    )
+                )
+                if prev_ok:
+                    end = _skip_lean_raw_str(text, r_pos, n)
+                    if end is not None:
+                        if r_pos > pos:
+                            app(text[pos:r_pos])
+                        app(_blank(text[r_pos:end]))
+                        pos = end
+                        continue
+
+        is_interp = nxt >= 2 and _has_interp_ident_before(text, nxt - 1)
+        if nxt > pos:
+            app(text[pos:nxt])
+        end = _skip_lean_str_or_interp(text, nxt, n, is_interp)
+        app(_blank(text[nxt:end]))
+        pos = end
+
+    return "".join(out)
+
+
+def _has_interp_ident_before(text: str, bang_pos: int) -> bool:
+    """True iff `text[bang_pos] == "!"` ends an unquoted Lean identifier `<ident>!`
+    (rather than a numeric literal `123!` or character literal `'a'!`)."""
+    if bang_pos <= 0 or text[bang_pos] != "!" or text[bang_pos - 1] == "»":
+        return False
+    p = bang_pos - 1
+    if not _is_rbd_ident_char(text[p]):
+        return False
+    while p > 0 and _is_rbd_ident_char(text[p - 1]):
+        p -= 1
+    return _is_rbd_ident_start(text[p])
+
+
+class _LeanCursor:
+    """Streaming Lean 4.34.1 token cursor over `text[start:end]`.
+
+    Tokens are `(kind, val, tok_start, tok_end, has_nl_before, col)` with `kind` in
+    `("ident", "lit", "punct", "eof")`. Only `col` on newline-preceded tokens is computed,
+    so lexing a single `deriving` clause inspects only its handful of tokens (`O(clause)`).
+    """
+
+    __slots__ = ("text", "pos", "limit", "_buf")
+
+    def __init__(self, text: str, start: int = 0, end: int | None = None) -> None:
+        self.text = text
+        self.pos = start
+        self.limit = len(text) if end is None else min(end, len(text))
+        self._buf: tuple[str, str, int, int, bool, int] | None = None
+
+    def _read_next(self) -> tuple[str, str, int, int, bool, int]:
+        text = self.text
+        limit = self.limit
+        i = self.pos
+        has_nl = False
+        while i < limit:
+            c = text[i]
+            if c == "\n":
+                has_nl = True
+                i += 1
+            elif c.isspace():
+                i += 1
+            elif c == "-" and i + 1 < limit and text[i + 1] == "-":
+                nl = text.find("\n", i + 2, limit)
+                if nl == -1:
+                    i = limit
+                else:
+                    has_nl = True
+                    i = nl + 1
+            elif c == "/" and i + 1 < limit and text[i + 1] == "-":
+                end = _skip_lean_block_comment(text, i, limit)
+                if text.find("\n", i, end) != -1:
+                    has_nl = True
+                i = end
+            else:
+                break
+
+        if i >= limit:
+            self.pos = limit
+            return ("eof", "", limit, limit, has_nl, 0)
+
+        col = i - _line_start_before(text, i) if has_nl else -1
+        c = text[i]
+
+        if (
+            c == "r"
+            and (
+                i == 0
+                or not (_is_rbd_ident_char(text[i - 1]) or text[i - 1] == ".")
+                or text[i - 1] == "'"
+            )
+            and i + 1 < limit
+            and text[i + 1] in '"#'
+        ):
+            end = _skip_lean_raw_str(text, i, limit)
+            if end is not None:
+                self.pos = end
+                return ("lit", "", i, end, has_nl, col)
+
+        if c == '"':
+            end = _skip_lean_str_or_interp(text, i, limit, False)
+            self.pos = end
+            return ("lit", "", i, end, has_nl, col)
+
+        if c == "'":
+            end = _skip_lean_char_lit(text, i, limit)
+            if end is not None:
+                self.pos = end
+                return ("lit", "", i, end, has_nl, col)
+            self.pos = i + 1
+            return ("punct", "'", i, i + 1, has_nl, col)
+
+        if c == "`":
+            k = i + 1
+            if k < limit and text[k] == "`":
+                k += 1
+            if k < limit and (text[k] == "«" or _is_rbd_ident_start(text[k])):
+                _, end, _ = _read_lean_dotted_ident(text, k, limit)
+                self.pos = end
+                return ("lit", "", i, end, has_nl, col)
+            self.pos = i + 1
+            return ("punct", "`", i, i + 1, has_nl, col)
+
+        if c == "«" or _is_rbd_ident_start(c):
+            ident, end, plain_bang = _read_lean_dotted_ident(text, i, limit)
+            if plain_bang and end < limit and text[end] == '"':
+                str_end = _skip_lean_str_or_interp(text, end, limit, True)
+                self.pos = str_end
+                return ("lit", "", i, str_end, has_nl, col)
+            self.pos = max(end, i + 1)
+            return ("ident", ident, i, self.pos, has_nl, col)
+
+        if c.isdigit():
+            k = i + 1
+            while k < limit and (text[k].isalnum() or text[k] in "_."):
+                if text[k] == "." and not (k + 1 < limit and text[k + 1].isdigit()):
+                    break
+                k += 1
+            self.pos = k
+            return ("lit", "", i, k, has_nl, col)
+
+        if c == "@" and i + 1 < limit and text[i + 1] == "[":
+            self.pos = i + 2
+            return ("punct", "@[", i, i + 2, has_nl, col)
+        if c == ":" and i + 1 < limit and text[i + 1] == "=":
+            self.pos = i + 2
+            return ("punct", ":=", i, i + 2, has_nl, col)
+
+        self.pos = i + 1
+        return ("punct", c, i, i + 1, has_nl, col)
+
+    def peek(self) -> tuple[str, str, int, int, bool, int]:
+        if self._buf is None:
+            self._buf = self._read_next()
+        return self._buf
+
+    def next(self) -> tuple[str, str, int, int, bool, int]:
+        tok = self._buf
+        if tok is not None:
+            self._buf = None
+            return tok
+        return self._read_next()
+
+
+def _consume_balanced_group(cur: _LeanCursor) -> None:
+    """Consume an opening bracket token on `cur` through its balanced closing bracket."""
+    cur.next()
+    depth = 1
+    while depth > 0:
+        kind, val, *_ = cur.next()
+        if kind == "eof":
+            break
+        if kind == "punct":
+            if val in _RBD_BRACKETS or val == "@[":
+                depth += 1
+            elif val in _RBD_CLOSING_BRACKETS:
+                depth -= 1
+
+
+def _parse_deriving_instance_targets_cursor(cur: _LeanCursor) -> list[str]:
+    """Parse comma-separated target types after `deriving [noncomputable] instance ... for`."""
+    targets: list[str] = []
+    while True:
+        tp_depth = 0
+        while True:
+            tk = cur.peek()
+            if tk[0] == "punct" and tk[1] == "(":
+                tp_depth += 1
+                cur.next()
+            elif tk[0] == "punct" and tk[1] == "@":
+                cur.next()
+            else:
+                break
+        tk = cur.peek()
+        if tk[0] != "ident" or tk[1] in _DERIVING_STOP_WORDS or tk[1] == "for" or (tk[1] == "lemma" and tk[4]):
+            break
+        targets.append(_unquote_lean_ident(tk[1]))
+        cur.next()
+
+        # Consume remaining outer parens from `(Foo α)` and optional type arguments.
+        prev_dot = False
+        while True:
+            tk = cur.peek()
+            kind, val, _, _, has_nl, col = tk
+            if kind == "eof":
+                break
+            if tp_depth > 0:
+                if kind == "punct" and val == ")":
+                    tp_depth -= 1
+                    cur.next()
+                elif kind == "punct" and (val in _RBD_BRACKETS or val == "@["):
+                    _consume_balanced_group(cur)
+                else:
+                    cur.next()
+                prev_dot = False
+                continue
+            if has_nl and col == 0:
+                break
+            if kind == "punct" and val == ",":
+                break
+            if (
+                kind == "ident"
+                and not prev_dot
+                and (val in _DERIVING_STOP_WORDS or val == "for" or (val == "lemma" and has_nl))
+            ):
+                break
+            if kind == "punct" and (val in ("@[", "#", ":=", ":", "|") or val in _RBD_CLOSING_BRACKETS):
+                break
+            if kind == "punct" and val in _RBD_BRACKETS:
+                _consume_balanced_group(cur)
+                prev_dot = False
+            elif kind in ("ident", "lit") or (kind == "punct" and val in ("@", ".")):
+                prev_dot = kind == "punct" and val == "."
+                cur.next()
+            else:
+                break
+
+        if cur.peek()[:2] == ("punct", ","):
+            cur.next()
+            continue
+        break
+    return targets
+
+
+def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, list[str], list[str]]:
+    """Parse a Lean 4.34.1 `deriving` clause or `deriving [noncomputable] instance` command
+    beginning right after the `deriving` keyword at `after_deriving`.
+
+    Returns `(is_instance, unary_classes, targets)`. Multi-argument class applications such as
+    `CustomPkg.BEq opt` or `(BEq a) b` are excluded from `unary_classes` (matching `lean_emit.rs`
+    `deriving_unary_class_core`), while universe-annotated `BEq.{0}` / `DecidableEq.{0}`,
+    parenthesized `(BEq)`, and `@[...]`-attributed entries remain unary.
+    """
+    cur = _LeanCursor(text, start=after_deriving)
+    is_instance = False
+    t0 = cur.peek()
+    if t0[:2] == ("ident", "instance"):
+        is_instance = True
+        cur.next()
+    elif t0[:2] == ("ident", "noncomputable"):
+        cur.next()
+        if cur.peek()[:2] == ("ident", "instance"):
+            is_instance = True
+            cur.next()
+        else:
+            return False, [], []
+
+    unary_classes: list[str] = []
+    saw_any_class = False
+    while True:
+        while cur.peek()[:2] == ("punct", "@["):
+            if not saw_any_class and cur.peek()[4] and cur.peek()[5] == 0:
+                break
+            _consume_balanced_group(cur)
+
+        paren_depth = 0
+        while cur.peek()[:2] == ("punct", "("):
+            paren_depth += 1
+            cur.next()
+            while cur.peek()[:2] == ("punct", "@["):
+                _consume_balanced_group(cur)
+
+        tk = cur.peek()
+        if tk[0] != "ident" or tk[1] in _DERIVING_STOP_WORDS or tk[1] == "for" or (tk[1] == "lemma" and tk[4]):
+            break
+        head_name = tk[1]
+        saw_any_class = True
+        cur.next()
+
+        has_term_arg = False
+        prev_dot = False
+        if cur.peek()[:2] == ("punct", "."):
+            cur.next()
+            if cur.peek()[:2] == ("punct", "{"):
+                _consume_balanced_group(cur)
+            else:
+                has_term_arg = True
+                prev_dot = True
+
+        while True:
+            tk = cur.peek()
+            kind, val, _, _, has_nl, col = tk
+            if kind == "eof":
+                break
+            if paren_depth > 0:
+                if kind == "punct" and val == ")":
+                    paren_depth -= 1
+                    cur.next()
+                elif kind == "punct" and (val in _RBD_BRACKETS or val == "@["):
+                    has_term_arg = True
+                    _consume_balanced_group(cur)
+                else:
+                    has_term_arg = True
+                    cur.next()
+                prev_dot = False
+                continue
+            if has_nl and col == 0:
+                break
+            if kind == "punct" and val == ",":
+                break
+            if (
+                kind == "ident"
+                and not prev_dot
+                and (val in _DERIVING_STOP_WORDS or val == "for" or (val == "lemma" and has_nl))
+            ):
+                break
+            if kind == "punct" and (val in ("@[", "#", ":=", ":", "|") or val in _RBD_CLOSING_BRACKETS):
+                break
+            if kind == "punct" and val in _RBD_BRACKETS:
+                has_term_arg = True
+                _consume_balanced_group(cur)
+                prev_dot = False
+            elif kind in ("ident", "lit") or (kind == "punct" and val in ("@", ".")):
+                has_term_arg = True
+                prev_dot = kind == "punct" and val == "."
+                cur.next()
+            else:
+                break
+
+        if not has_term_arg and paren_depth == 0:
+            unary_classes.append(head_name)
+
+        if cur.peek()[:2] == ("punct", ","):
+            cur.next()
+            continue
+        break
+
+    targets: list[str] = []
+    if is_instance and cur.peek()[:2] == ("ident", "for"):
+        cur.next()
+        targets = _parse_deriving_instance_targets_cursor(cur)
+    return is_instance, unary_classes, targets
+
+
+def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str | None:
+    """Return the enclosing `inductive` / `structure` / `class` / `def` / `abbrev` name for an
+    inline `deriving` at `deriving_pos`, scanning forward from the latest column-0 `theorem` /
+    `lemma` header before `deriving_pos` (so cold full scans and `INCREMENTAL_SPLICING` windows
+    always scan byte-for-byte identical slices)."""
+    best_anchor = 0
+    for needle, kw_len in (("\ntheorem", 7), ("\nlemma", 5)):
+        p = code.rfind(needle, 0, deriving_pos)
+        while p != -1:
+            kw_off = p + 1
+            if _LEAN_THM_NAME_RE.match(code, kw_off + kw_len) is not None:
+                if kw_off > best_anchor:
+                    best_anchor = kw_off
+                break
+            p = code.rfind(needle, 0, p)
+
+    cur = _LeanCursor(text, start=best_anchor, end=deriving_pos)
+    depth = 0
+    prev_bar = False
+    prev_dot = False
+    enclosing: str | None = None
+    while True:
+        kind, val, _, _, has_nl, col = cur.next()
+        if kind == "eof":
+            break
+        if kind == "punct":
+            if val in _RBD_BRACKETS or val == "@[":
+                depth += 1
+            elif val in _RBD_CLOSING_BRACKETS and depth > 0:
+                depth -= 1
+            elif val == "#" and depth == 0:
+                enclosing = None
+            prev_bar = val == "|" and depth == 0
+            prev_dot = val == "." and depth == 0
+        elif kind == "ident" and depth == 0:
+            if prev_dot:
+                prev_dot = False
+                prev_bar = False
+                continue
+            if val in _DERIVING_INLINE_DECL_KWS:
+                nxt = cur.peek()
+                if val == "class" and nxt[:2] == ("ident", "inductive"):
+                    cur.next()
+                    nxt = cur.peek()
+                if nxt[0] == "ident" and nxt[1] not in _DERIVING_STOP_WORDS and nxt[1] != "for":
+                    enclosing = _unquote_lean_ident(nxt[1])
+                    cur.next()
+            elif val in _DERIVING_ENCLOSING_RESET_KWS:
+                enclosing = None
+            elif val == "lemma" and has_nl and not prev_bar and cur.peek()[:2] != ("punct", ":"):
+                enclosing = None
+            elif val in ("open", "set_option") and has_nl and col == 0:
+                # Top-level `open` / `set_option` without an `in` continuation resets any prior
+                # declaration; if `in <decl>` follows, `<decl>` immediately sets `enclosing`.
+                enclosing = None
+            prev_bar = False
+            prev_dot = False
+        else:
+            prev_bar = False
+            prev_dot = False
+    return enclosing
+
+
+def _needs_exact_rbd_blank(text: str) -> bool:
+    """True when `text` contains `<ident>!"..."` interpolation or adjacent char literals (`'a''\"'`)
+    where `_scan_lean_comments_and_strings` is conservative and `_blank_lean_exact` is needed."""
+    return (
+        '!"' in text
+        or "''\"" in text
+        or "''\\" in text
+        or "''«" in text
+        or "'r\"" in text
+        or "'r#" in text
+    )
+
+
+def _scan_redundant_beq_decidable_eq(
+    text: str,
+    stripped: str,
+    line_of: _LineCounter,
+    *,
+    needs_exact: bool | None = None,
+) -> list[ProofHealthFinding]:
+    """Rule 8 (`redundant_beq_decidable_eq`) on Lean `text`."""
+    use_exact = _needs_exact_rbd_blank(text) if needs_exact is None else needs_exact
+    if use_exact:
+        code = _blank_lean_exact(text)
+        if not ("BEq" in code and "deriving" in code and "DecidableEq" in code):
+            return []
+    else:
+        code = stripped
+        if needs_exact is None and not (
+            "BEq" in code and "deriving" in code and "DecidableEq" in code
+        ):
+            return []
+
+    n = len(code)
+    findings: list[ProofHealthFinding] = []
+    pos = code.find("deriving", 0)
+    while pos != -1:
+        end_kw = pos + 8
+        valid_kw = (
+            (pos == 0 or (not _is_rbd_ident_char(code[pos - 1]) and code[pos - 1] not in ".`'"))
+            and (end_kw >= n or (not _is_rbd_ident_char(code[end_kw]) and code[end_kw] != "."))
+        )
+        if valid_kw:
+            line_start = _line_start_before(code, pos)
+            if code.find("«", line_start, pos) != -1 and (
+                code.rfind("«", line_start, pos) > code.rfind("»", line_start, pos)
+            ):
+                line_nl = code.find("\n", end_kw)
+                line_end = n if line_nl == -1 else line_nl
+                if code.find("»", end_kw, line_end) != -1:
+                    valid_kw = False
+        if valid_kw:
+            is_instance, classes, targets = _parse_deriving_clause_at(text, end_kw)
+            if classes:
+                last_names = {_last_unquoted_component(c) for c in classes}
+                if "BEq" in last_names and "DecidableEq" in last_names:
+                    if is_instance:
+                        sym = ",".join(targets) if targets else "BEq,DecidableEq"
+                    else:
+                        sym = _extract_enclosing_decl_name(text, code, pos) or "BEq,DecidableEq"
+                    findings.append(
+                        ProofHealthFinding(
+                            rule=RULE_REDUNDANT_BEQ_DECIDABLE_EQ,
+                            line=line_of(pos),
+                            symbol=sym,
+                            message=(
+                                f"`deriving` on `{sym}` lists both `BEq` and `DecidableEq`, "
+                                "generating a structural `BEq` instance that shadows "
+                                "`instBEqOfDecidableEq` and breaks `LawfulBEq` (`beq_iff_eq`) "
+                                "synthesis."
+                            ),
+                            suggestion=(
+                                "Remove `BEq` from the `deriving` clause and keep `DecidableEq` "
+                                "only (core synthesizes `BEq` and `LawfulBEq` automatically from "
+                                "`DecidableEq`)."
+                            ),
+                        )
+                    )
+        pos = code.find("deriving", end_kw)
+    return findings
+
+
 def scan_rust_text(text: str, *, file_path: str | Path | None = None) -> list[ProofHealthFinding]:
     """Rule 6 on Rust source: waivers in `///`, `/** */` and literal `#[doc = "..."]` docs.
 
@@ -11592,7 +12633,7 @@ def scan_file(
     include_unannotated_vacuity: bool = False,
     include_advisories: bool = False,
 ) -> list[ProofHealthFinding]:
-    """Scan one `.lean` (rules 1-7, plus advisory rules with `include_advisories`) or
+    """Scan one `.lean` (rules 1-8, plus advisory rules with `include_advisories`) or
     `.rs` (rule 6) file."""
     path = Path(file_path)
     if path.suffix == ".rs":
@@ -11646,7 +12687,7 @@ def _iter_cli_files(raw: str) -> list[Path]:
 _CLI_USAGE = (
     "Usage: proof_health.py [--json] [--all-theorems] [--advisories] [--compute-pins] "
     "[--no-siblings] <file.lean|file.rs|directory> [...]\n"
-    "  Scans Lean files for rules 1-7 and Rust files for rule 6; exits 0 when clean,\n"
+    "  Scans Lean files for rules 1-8 and Rust files for rule 6; exits 0 when clean,\n"
     "  1 on findings, 2 on usage or I/O errors.\n"
     "  --json          machine-readable report ({ok, finding_count, files_scanned, counts, findings})\n"
     "  --all-theorems  apply every rule 7 check to every theorem (include_unannotated_vacuity)\n"
