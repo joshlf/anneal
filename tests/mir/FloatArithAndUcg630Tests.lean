@@ -68,7 +68,14 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      universal `f64` `Mach` + `MachTB.wfLive` carrier bridge (`fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive`)
      instantiated on `f64` subnormal, overflow, and all 6 nondeterministic `sNaN + 1.0` outcomes, and the
      explicit `evalByteCastRichWithPolicy` contrast rejecting forged `Tagged::B(&u8)` while accepting `Tagged::A`
-     under BOTH policies.
+     under BOTH policies;
+   - Round-3 audit (`W15` & `W16`, `B3`): ALL FIVE IEEE-754 indeterminate forms (`0 / 0`, `∞ / ∞`, `0 × ∞`,
+     `x % 0`, `∞ % y`, every signed variant) yield the POSITIVE-sign `preferredNaNBits` on `f32` AND `f64` in
+     BOTH trusted dialects, with EXACT two-sided `EvalFloatBinOpRel` outcome sets (`[pref]` deterministic,
+     `[pref, -pref]` nondeterministic); the universal `f32` `Mach` + `MachTB.wfLive` carrier bridge
+     (`fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive`) and kernel-evaluated 4-byte-wide `MachTB`
+     carrier runs on BOTH `0.0 / 0.0` outcomes (paired in §2 with `W10` & `W11` of `FloatArithLM`: both
+     engines on all five forms, real `binary64` `Step.step`, and mixed `const - copy qNaN` `.sub` order).
 2. **Cross-Root Dual-Authority Kernel Bridge (`run_cmd`)**:
    Loads BOTH `.lake/build/lib/lean` (`Anneal.Mir.IeeeFloatArith`, `MiniRustSpec.FloatArithMR`)
    and `examples/.lake/build/lib/lean` (`LeanMiriSpec.FloatArithLM`) into a fresh Lean kernel
@@ -1230,6 +1237,180 @@ theorem w14_a2_mixed_step_f64_machTB_and_richAdt_tagged_no_forge :
 
 end Round2A2
 
+/-! ### §1.4 Round-3 Hardening (`B3`): IEEE-754 Indeterminate Forms (`0/0`, `∞/∞`, `0×∞`, `x % 0`, `∞ % y`) -/
+
+/-- **`W15` Witness (Round-3 `B3`: IEEE-754 indeterminate forms, function level)**: ALL FIVE
+NaN-producing indeterminate forms on NON-NaN operands — `0/0`, `∞/∞`, `0×∞`, `x % 0`, `∞ % y`,
+including every signed variant (`-0.0 / +0.0`, `-∞ / -∞`, `-0.0 × +∞`, `-∞ × -0.0`, `1.0 % -0.0`,
+`-∞ % 1.0`, `∞ % ∞`, …) — on `f32` AND `f64`, in BOTH trusted dialects:
+1. the deterministic base result (`evalFloatArithBase` / `evalFloatBinOp`) is the POSITIVE-sign
+   canonical quiet NaN `preferredNaNBits` (`0x7FC00000` / `0x7FF8000000000000`) — never the x86
+   "default NaN" `0xFFC00000` and never a sign derived from the operands' signs;
+2. `nanChoices` is `[pref]` in `.deterministic` mode and EXACTLY the 2-element `[pref, -pref]` set in
+   `.nondeterministic` mode (ZERO input NaNs contribute no quieted / signaling candidates).
+Kernel-evaluated complement of the general `Trusted`-side laws of `Anneal.Mir.IeeeFloatArith`
+(`evalFloatArithBase_invalid_operations` covers the `×`, `+`, `-`, `/` forms; this witness also pins the
+two `%` forms `x % 0` and `∞ % y`, the `V2026_08_01` dialect, and concrete `f64` bit patterns); the
+vendored-Miri side of the SAME operand lists is `w10_lm_indeterminate_forms_preferredNaN`. -/
+theorem w15_b3_indeterminate_forms_preferredNaN_both_dialects :
+    (∀ p ∈ ([(BinOp.div, Trusted.Rustc.V2026_08_01.MirAst.BinOp.div, 0x00000000, 0x00000000), (.div, .div, 0x80000000, 0x00000000),
+        (.div, .div, 0x00000000, 0x80000000), (.div, .div, 0x80000000, 0x80000000), (.div, .div, 0x7F800000, 0x7F800000),
+        (.div, .div, 0xFF800000, 0x7F800000), (.div, .div, 0x7F800000, 0xFF800000), (.div, .div, 0xFF800000, 0xFF800000),
+        (.mul, .mul, 0x00000000, 0x7F800000), (.mul, .mul, 0x80000000, 0x7F800000), (.mul, .mul, 0x7F800000, 0x00000000),
+        (.mul, .mul, 0xFF800000, 0x80000000), (.mul, .mul, 0x00000000, 0xFF800000), (.rem, .rem, 0x3F800000, 0x00000000),
+        (.rem, .rem, 0x3F800000, 0x80000000), (.rem, .rem, 0xBF800000, 0x00000000), (.rem, .rem, 0x00000000, 0x00000000),
+        (.rem, .rem, 0x7F800000, 0x3F800000), (.rem, .rem, 0xFF800000, 0x3F800000), (.rem, .rem, 0x7F800000, 0xBF800000),
+        (.rem, .rem, 0x7F800000, 0x7F800000), (.rem, .rem, 0xFF800000, 0x00000000)] :
+          List (BinOp × Trusted.Rustc.V2026_08_01.MirAst.BinOp × Nat × Nat)),
+      evalFloatArithBase p.1 .binary32 p.2.2.1 p.2.2.2 = .some 0x7FC00000 ∧
+      (evalFloatBinOp p.1 .binary32 p.2.2.1 p.2.2.2).map (fun sc => (sc.bits, sc.sizeBytes)) = .some (0x7FC00000, 4) ∧
+      Trusted.Rustc.V2026_08_01.MirSemantics.evalFloatArithBase p.2.1 .binary32 p.2.2.1 p.2.2.2 = .some 0x7FC00000 ∧
+      nanChoices .binary32 [(.binary32, p.2.2.1), (.binary32, p.2.2.2)] .deterministic = [0x7FC00000] ∧
+      nanChoices .binary32 [(.binary32, p.2.2.1), (.binary32, p.2.2.2)] .nondeterministic = [0x7FC00000, 0xFFC00000] ∧
+      Trusted.Rustc.V2026_08_01.MirSemantics.nanChoices .binary32 [(.binary32, p.2.2.1), (.binary32, p.2.2.2)]
+        .nondeterministic = [0x7FC00000, 0xFFC00000]) ∧
+    (∀ p ∈ ([(BinOp.div, Trusted.Rustc.V2026_08_01.MirAst.BinOp.div, 0x0000000000000000, 0x0000000000000000),
+        (.div, .div, 0x8000000000000000, 0x0000000000000000), (.div, .div, 0x8000000000000000, 0x8000000000000000),
+        (.div, .div, 0x7FF0000000000000, 0x7FF0000000000000), (.div, .div, 0xFFF0000000000000, 0x7FF0000000000000),
+        (.div, .div, 0xFFF0000000000000, 0xFFF0000000000000), (.mul, .mul, 0x0000000000000000, 0x7FF0000000000000),
+        (.mul, .mul, 0x8000000000000000, 0x7FF0000000000000), (.mul, .mul, 0x7FF0000000000000, 0x0000000000000000),
+        (.mul, .mul, 0xFFF0000000000000, 0x8000000000000000), (.rem, .rem, 0x3FF0000000000000, 0x0000000000000000),
+        (.rem, .rem, 0x3FF0000000000000, 0x8000000000000000), (.rem, .rem, 0xBFF0000000000000, 0x0000000000000000),
+        (.rem, .rem, 0x7FF0000000000000, 0x3FF0000000000000), (.rem, .rem, 0xFFF0000000000000, 0x3FF0000000000000),
+        (.rem, .rem, 0x7FF0000000000000, 0x7FF0000000000000)] :
+          List (BinOp × Trusted.Rustc.V2026_08_01.MirAst.BinOp × Nat × Nat)),
+      evalFloatArithBase p.1 .binary64 p.2.2.1 p.2.2.2 = .some 0x7FF8000000000000 ∧
+      (evalFloatBinOp p.1 .binary64 p.2.2.1 p.2.2.2).map (fun sc => (sc.bits, sc.sizeBytes)) = .some (0x7FF8000000000000, 8) ∧
+      Trusted.Rustc.V2026_08_01.MirSemantics.evalFloatArithBase p.2.1 .binary64 p.2.2.1 p.2.2.2 = .some 0x7FF8000000000000 ∧
+      nanChoices .binary64 [(.binary64, p.2.2.1), (.binary64, p.2.2.2)] .deterministic = [0x7FF8000000000000] ∧
+      nanChoices .binary64 [(.binary64, p.2.2.1), (.binary64, p.2.2.2)] .nondeterministic =
+        [0x7FF8000000000000, 0xFFF8000000000000] ∧
+      Trusted.Rustc.V2026_08_01.MirSemantics.nanChoices .binary64 [(.binary64, p.2.2.1), (.binary64, p.2.2.2)]
+        .nondeterministic = [0x7FF8000000000000, 0xFFF8000000000000]) := by
+  decide +kernel
+
+/-- Exact `EvalFloatBinOpRel` outcome sets of a NaN-producing arithmetic operation whose
+`nanChoices` are `[pref]` (`.deterministic`) / `[pref, negPref]` (`.nondeterministic`): unfolds the
+trusted relation directly (generic in `f`, so no `binary64` literal arithmetic is ever reduced). -/
+private theorem tIndetRel_of (f : IeeeFormat) (op : BinOp) (a b pref negPref : Nat)
+    (hcmp : evalFloatCmp op f a b = .none) (hbase : evalFloatArithBase op f a b = .some pref)
+    (hnan : isNaNBits f pref = true)
+    (hdet : nanChoices f [(f, a % 2 ^ f.width), (f, b % 2 ^ f.width)] .deterministic = [pref])
+    (hnd : nanChoices f [(f, a % 2 ^ f.width), (f, b % 2 ^ f.width)] .nondeterministic = [pref, negPref]) :
+    ∀ out, (EvalFloatBinOpRel .deterministic op f a b out ↔ out = ⟨pref, f.byteWidth⟩) ∧
+      (EvalFloatBinOpRel .nondeterministic op f a b out ↔
+        ∃ cand, cand ∈ [pref, negPref] ∧ out = ⟨cand, f.byteWidth⟩) := by
+  intro out
+  unfold EvalFloatBinOpRel
+  rw [hcmp]; dsimp only; rw [hbase]; dsimp only; simp only [hnan, ↓reduceIte]; rw [hdet, hnd]
+  refine ⟨⟨?_, fun h => ⟨pref, List.mem_singleton.mpr rfl, h⟩⟩, Iff.rfl⟩
+  rintro ⟨cand, hc, rfl⟩
+  rw [List.mem_singleton.mp hc]
+
+/-- **`W15` Witness (Round-3 `B3`: indeterminate forms, relational level)**: for one representative
+of each of the FIVE indeterminate forms on `f32` AND `f64` (`0 / 0`, `-∞ / -∞`, `-0.0 × +∞`, `1.0 % 0`,
+`∞ % 1.0`), `EvalFloatBinOpRel .deterministic` admits EXACTLY the positive-sign canonical qNaN and
+`EvalFloatBinOpRel .nondeterministic` admits EXACTLY the two outcomes `[pref, -pref]` (two-sided
+`↔`: a payload-carrying NaN, the operands' own bits, or any third candidate is REJECTED), proved by
+unfolding the trusted relation directly (independently of `EvalFloatBinOpRel.nondet_invalid_operation_iff`),
+with three explicit negative instances: deterministic `0.0 / 0.0` rejects `-qNaN`, nondeterministic
+`0.0 / 0.0` rejects the payload NaN `0x7FC00001`, and nondeterministic `-0.0 × +∞` rejects `-∞`. -/
+theorem w15_b3_indeterminate_forms_exact_relational_outcomes :
+    (∀ p ∈ ([(BinOp.div, 0x00000000, 0x00000000), (.div, 0xFF800000, 0xFF800000), (.mul, 0x80000000, 0x7F800000),
+        (.rem, 0x3F800000, 0x00000000), (.rem, 0x7F800000, 0x3F800000)] : List (BinOp × Nat × Nat)), ∀ out,
+      (EvalFloatBinOpRel .deterministic p.1 .binary32 p.2.1 p.2.2 out ↔ out = ⟨0x7FC00000, 4⟩) ∧
+      (EvalFloatBinOpRel .nondeterministic p.1 .binary32 p.2.1 p.2.2 out ↔
+        ∃ cand, cand ∈ [0x7FC00000, 0xFFC00000] ∧ out = ⟨cand, 4⟩)) ∧
+    (∀ p ∈ ([(BinOp.div, 0x0000000000000000, 0x0000000000000000), (.div, 0xFFF0000000000000, 0xFFF0000000000000),
+        (.mul, 0x8000000000000000, 0x7FF0000000000000), (.rem, 0x3FF0000000000000, 0x0000000000000000),
+        (.rem, 0x7FF0000000000000, 0x3FF0000000000000)] : List (BinOp × Nat × Nat)), ∀ out,
+      (EvalFloatBinOpRel .deterministic p.1 .binary64 p.2.1 p.2.2 out ↔ out = ⟨0x7FF8000000000000, 8⟩) ∧
+      (EvalFloatBinOpRel .nondeterministic p.1 .binary64 p.2.1 p.2.2 out ↔
+        ∃ cand, cand ∈ [0x7FF8000000000000, 0xFFF8000000000000] ∧ out = ⟨cand, 8⟩)) ∧
+    ¬ EvalFloatBinOpRel .deterministic .div .binary32 0x00000000 0x00000000 ⟨0xFFC00000, 4⟩ ∧
+    ¬ EvalFloatBinOpRel .nondeterministic .div .binary32 0x00000000 0x00000000 ⟨0x7FC00001, 4⟩ ∧
+    ¬ EvalFloatBinOpRel .nondeterministic .mul .binary64 0x8000000000000000 0x7FF0000000000000 ⟨0xFFF0000000000000, 8⟩ := by
+  refine ⟨fun p hp => ?_, fun p hp => ?_, ?_, ?_, ?_⟩
+  · have hall : ∀ q ∈ ([(BinOp.div, 0x00000000, 0x00000000), (.div, 0xFF800000, 0xFF800000), (.mul, 0x80000000, 0x7F800000),
+        (.rem, 0x3F800000, 0x00000000), (.rem, 0x7F800000, 0x3F800000)] : List (BinOp × Nat × Nat)),
+        evalFloatCmp q.1 .binary32 q.2.1 q.2.2 = .none ∧ evalFloatArithBase q.1 .binary32 q.2.1 q.2.2 = .some 0x7FC00000 ∧
+        nanChoices .binary32 [(.binary32, q.2.1 % 2 ^ IeeeFormat.width .binary32), (.binary32, q.2.2 % 2 ^ IeeeFormat.width .binary32)]
+          .deterministic = [0x7FC00000] ∧
+        nanChoices .binary32 [(.binary32, q.2.1 % 2 ^ IeeeFormat.width .binary32), (.binary32, q.2.2 % 2 ^ IeeeFormat.width .binary32)]
+          .nondeterministic = [0x7FC00000, 0xFFC00000] := by decide +kernel
+    obtain ⟨h1, h2, h3, h4⟩ := hall p hp
+    exact tIndetRel_of .binary32 p.1 p.2.1 p.2.2 0x7FC00000 0xFFC00000 h1 h2 (by decide +kernel) h3 h4
+  · have hall : ∀ q ∈ ([(BinOp.div, 0x0000000000000000, 0x0000000000000000), (.div, 0xFFF0000000000000, 0xFFF0000000000000),
+        (.mul, 0x8000000000000000, 0x7FF0000000000000), (.rem, 0x3FF0000000000000, 0x0000000000000000),
+        (.rem, 0x7FF0000000000000, 0x3FF0000000000000)] : List (BinOp × Nat × Nat)),
+        evalFloatCmp q.1 .binary64 q.2.1 q.2.2 = .none ∧
+        evalFloatArithBase q.1 .binary64 q.2.1 q.2.2 = .some 0x7FF8000000000000 ∧
+        nanChoices .binary64 [(.binary64, q.2.1 % 2 ^ IeeeFormat.width .binary64), (.binary64, q.2.2 % 2 ^ IeeeFormat.width .binary64)]
+          .deterministic = [0x7FF8000000000000] ∧
+        nanChoices .binary64 [(.binary64, q.2.1 % 2 ^ IeeeFormat.width .binary64), (.binary64, q.2.2 % 2 ^ IeeeFormat.width .binary64)]
+          .nondeterministic = [0x7FF8000000000000, 0xFFF8000000000000] := by decide +kernel
+    obtain ⟨h1, h2, h3, h4⟩ := hall p hp
+    exact tIndetRel_of .binary64 p.1 p.2.1 p.2.2 0x7FF8000000000000 0xFFF8000000000000 h1 h2 (by decide +kernel) h3 h4
+  · exact fun h => absurd (congrArg ScalarInt.bits ((tIndetRel_of .binary32 .div 0x00000000 0x00000000 0x7FC00000 0xFFC00000
+      (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel) ⟨0xFFC00000, 4⟩).1.mp h)) (by decide)
+  · exact fun h => by
+      obtain ⟨cand, hc, he⟩ := (tIndetRel_of .binary32 .div 0x00000000 0x00000000 0x7FC00000 0xFFC00000 (by decide +kernel)
+        (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel) ⟨0x7FC00001, 4⟩).2.mp h
+      have hb : cand = 0x7FC00001 := (congrArg ScalarInt.bits he).symm
+      subst hb; revert hc; decide
+  · exact fun h => by
+      obtain ⟨cand, hc, he⟩ := (tIndetRel_of .binary64 .mul 0x8000000000000000 0x7FF0000000000000 0x7FF8000000000000
+        0xFFF8000000000000 (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel)
+        (by decide +kernel) ⟨0xFFF0000000000000, 8⟩).2.mp h
+      have hb : cand = 0xFFF0000000000000 := (congrArg ScalarInt.bits he).symm
+      subst hb; revert hc; decide
+
+/-! ### §1.5 Round-3 Hardening (`B3`): `f32` `Mach` + `MachTB` Carriers of Indeterminate-Form NaN Outcomes -/
+
+section Round3B3
+
+open MiniRustSpec MiniRustSpec.LibSpecr MiniRustSpec.Interp MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness MiniRustSpec.Correspondence.PointerWitness
+open MiniRustSpec.Correspondence.RefWitness MiniRustSpec.Correspondence.FloatCastMR
+
+/-- **`W16` Witness (Round-3 `B3`: `f32` carriers of the indeterminate-form outcomes)**:
+1. the universal `f32` bridge `fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive` instantiated on
+   BOTH `EvalFloatBinOpRel .nondeterministic .div .binary32 0.0 0.0` outcomes (`+qNaN`, `-qNaN`, taken
+   from the exact outcome set of `W15`): the 4-byte `Mach` carrier reaches the exact 4-byte image, and
+   the ZERO-EXTENDED 64-bit carrier runs on `MachTB` (`Interp.stepsTB 3` + `MachTB.wfLive`);
+2. the 4-byte-WIDE `MachTB` carrier (`retAfterTB fcCarrierBody`, kernel-evaluated per candidate — the
+   symbolic 4-byte `MachTB` run is the open scope item recorded on the `f32` bridge) round-trips both
+   candidates bit-for-bit, and its `-qNaN` run preserves `MachTB.wfLive`. -/
+theorem w16_b3_f32_indeterminate_nan_outcomes_mach_and_machTB_carriers :
+    (∀ cand ∈ [(0x7FC00000 : Nat), 0xFFC00000],
+      (∃ (m : Mach) (n : Nat) (m' : Mach), startMachine fcCarrierCastBody [.scalar ⟨cand, 4⟩] = some m ∧
+        Interp.steps n m = .ok m' ∧
+        m'.mem.memory.allocations[0]? =
+          some { retAlloc with data := (encodeLittleEndianBytes cand 4 none).map fcByteToMR }) ∧
+      (∃ (m0 m' : MachTB), fcStartMachineTB8 fcCarrier64Body [.scalar ⟨cand, 8⟩] = some m0 ∧
+        Interp.stepsTB 3 m0 = .ok m' ∧ MachTB.wfLive m' ∧
+        m'.threads.map (·.stack.length) = [1] ∧
+        m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) =
+          some (true, ((encodeLittleEndianBytes cand 8 none).map fcByteToMR).map liftByteTB)) ∧
+      fcRetAfterTB8 fcCarrier64Body [.scalar ⟨cand, 8⟩] 3 = tbRetU64 cand) ∧
+    retAfterTB fcCarrierBody [.scalar ⟨0x7FC00000, 4⟩] 3 = tbRetU32 0x7FC00000 ∧
+    retAfterTB fcCarrierBody [.scalar ⟨0xFFC00000, 4⟩] 3 = tbRetU32 0xFFC00000 ∧
+    (∃ m0 m', startMachineTB fcCarrierBody [.scalar ⟨0xFFC00000, 4⟩] = some m0 ∧
+      Interp.stepsTB 3 m0 = .ok m' ∧ MachTB.wfLive m') := by
+  refine ⟨fun cand hc => ?_, by decide +kernel, by decide +kernel, ?_⟩
+  · have hbr := fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive .nondeterministic .div 0x00000000 0x00000000
+      ⟨cand, 4⟩ rfl
+      ((tIndetRel_of .binary32 .div 0x00000000 0x00000000 0x7FC00000 0xFFC00000 (by decide +kernel) (by decide +kernel)
+        (by decide +kernel) (by decide +kernel) (by decide +kernel) ⟨cand, 4⟩).2.mpr ⟨cand, hc, rfl⟩)
+    exact ⟨hbr.2.2.1, hbr.2.2.2.1, hbr.2.2.2.2.2⟩
+  · simp only [startMachineTB, startMachine, fc_translateFn_carrier, Option.map]
+    exact tb_wfLive_of_stepsTB_isOk
+      (machine fcCarrierBody fcCarrierFn
+        (initMachineState fcCarrierBody [.scalar ⟨0xFFC00000, 4⟩]).frame.locals fcCarrierFn.start)
+      3 (by decide +kernel)
+
+end Round3B3
+
 /-! ## §2. Cross-Root Dual-Authority Kernel Bridge (`IeeeFloatArith` + `FloatArithMR` + `FloatArithLM`) -/
 
 open Lean Elab Command Meta in
@@ -1320,7 +1501,12 @@ run_cmd do
         lmNs ++ `w9_lm_rem_dividend_sign_and_zero_remainder,
         -- Round-2 counter-audit (`A2`): mixed `copy/const` & `const/copy` real `Step.step` simulations.
         lmNs ++ `step_float_arith_copy_const_deterministic_simulation,
-        lmNs ++ `step_float_arith_const_copy_deterministic_simulation ]
+        lmNs ++ `step_float_arith_const_copy_deterministic_simulation,
+        -- Round-3 (`B3`): index-exact nondeterministic mixed `const/copy` real `Step.step`, all five
+        -- IEEE-754 indeterminate forms on BOTH engines (`W10`), and real `binary64` `Step.step` (`W11`).
+        lmNs ++ `step_float_arith_const_copy_nondet_index_exact,
+        lmNs ++ `w10_lm_indeterminate_forms_preferredNaN,
+        lmNs ++ `w11_lm_f64_step_and_const_copy_nondet_sub_order ]
     let generalMrThms : List Name :=
       [ mrNs ++ `fa_no_fragment_admits_float_arith_or_cmp,
         mrNs ++ `fa_projected_float_place_rejection,
@@ -1330,6 +1516,7 @@ run_cmd do
         mrNs ++ `fa_sym_mr_negXor_f64_lockstep,
         mrNs ++ `fa_bridge_evalFloatBinOpRel_mach_steps,
         mrNs ++ `fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive,
+        mrNs ++ `fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive,
         mrNs ++ `fa_ptr2int_live_mach_and_machTB_wfLive,
         mrNs ++ `fa_composite_tuple_struct_policy_correspondence,
         mrNs ++ `fa_no_forge_ref_and_uninit_live_mach_and_machTB_wfLive ]
@@ -1391,8 +1578,9 @@ run_cmd do
       mkApp2 (mkConst (tSem ++ `policyRejectsProv)) (mkConst (tSem ++ p)) provBytes
     let optNatTy := mkApp (mkConst ``Option [0]) natTy
     let someNat (n : Nat) : Expr := mkApp2 (mkConst ``Option.some [0]) natTy (mkNatLit n)
-    let mkRem (f : Expr) (a b : Nat) : Expr :=
-      mkApp4 (mkConst (tSem ++ `evalFloatArithBase)) (mkConst (tAst ++ `BinOp.rem)) f (mkNatLit a) (mkNatLit b)
+    let mkArith (op : Name) (f : Expr) (a b : Nat) : Expr :=
+      mkApp4 (mkConst (tSem ++ `evalFloatArithBase)) (mkConst (tAst ++ op)) f (mkNatLit a) (mkNatLit b)
+    let mkRem := mkArith `BinOp.rem
     -- (description, type, LHS, TRUE RHS, FORGED RHS)
     let controls : List (String × Expr × Expr × Expr × Expr) :=
       [ ("f32 qNaN == qNaN", optBoolTy, mkCmp f32 0x7FC00000 0x7FC00000, someFalse, someTrue),
@@ -1421,7 +1609,39 @@ run_cmd do
         ("f32 -2.0 % 2.0 is -0.0 (dividend sign on an exactly-zero remainder)", optNatTy,
           mkRem f32 0xC0000000 0x40000000, someNat 0x80000000, someNat 0),
         ("f64 -2.0 % 2.0 is -0.0 (dividend sign on an exactly-zero remainder)", optNatTy,
-          mkRem f64 0xC000000000000000 0x4000000000000000, someNat 0x8000000000000000, someNat 0) ]
+          mkRem f64 0xC000000000000000 0x4000000000000000, someNat 0x8000000000000000, someNat 0),
+        -- Round-3 (`B3`): ALL FIVE indeterminate forms (`0/0`, `∞/∞`, `0×∞`, `x % 0`, `∞ % y`) yield the
+        -- POSITIVE-sign canonical qNaN on `f32` AND `f64` (FORGED: the sign-flipped x86 "default NaN", the
+        -- dividend, or `∞`), and `nanChoices` with ZERO NaN inputs has EXACTLY the 2 members `[pref, -pref]`.
+        ("f32 0.0 / 0.0 is the positive-sign canonical qNaN", optNatTy,
+          mkArith `BinOp.div f32 0 0, someNat 0x7FC00000, someNat 0xFFC00000),
+        ("f32 -Inf / -Inf is the positive-sign canonical qNaN", optNatTy,
+          mkArith `BinOp.div f32 0xFF800000 0xFF800000, someNat 0x7FC00000, someNat 0xFFC00000),
+        ("f32 -0.0 * +Inf is the positive-sign canonical qNaN", optNatTy,
+          mkArith `BinOp.mul f32 0x80000000 0x7F800000, someNat 0x7FC00000, someNat 0xFFC00000),
+        ("f32 1.0 % 0.0 is the positive-sign canonical qNaN (not the dividend)", optNatTy,
+          mkRem f32 0x3F800000 0, someNat 0x7FC00000, someNat 0x3F800000),
+        ("f32 -Inf % 1.0 is the positive-sign canonical qNaN", optNatTy,
+          mkRem f32 0xFF800000 0x3F800000, someNat 0x7FC00000, someNat 0xFFC00000),
+        ("f64 0.0 / 0.0 is the positive-sign canonical qNaN", optNatTy,
+          mkArith `BinOp.div f64 0 0, someNat 0x7FF8000000000000, someNat 0xFFF8000000000000),
+        ("f64 +Inf / -Inf is the positive-sign canonical qNaN", optNatTy,
+          mkArith `BinOp.div f64 0x7FF0000000000000 0xFFF0000000000000, someNat 0x7FF8000000000000,
+          someNat 0xFFF8000000000000),
+        ("f64 +Inf * -0.0 is the positive-sign canonical qNaN", optNatTy,
+          mkArith `BinOp.mul f64 0x7FF0000000000000 0x8000000000000000, someNat 0x7FF8000000000000,
+          someNat 0xFFF8000000000000),
+        ("f64 -1.0 % 0.0 is the positive-sign canonical qNaN", optNatTy,
+          mkRem f64 0xBFF0000000000000 0, someNat 0x7FF8000000000000, someNat 0xFFF8000000000000),
+        ("f64 +Inf % +Inf is the positive-sign canonical qNaN (not +Inf)", optNatTy,
+          mkRem f64 0x7FF0000000000000 0x7FF0000000000000, someNat 0x7FF8000000000000,
+          someNat 0x7FF0000000000000),
+        ("f32 nondet nanChoices of 0.0 / 0.0 (zero NaN inputs) is exactly [+qNaN, -qNaN]", listNatTy,
+          mkChoices f32 [(f32, 0), (f32, 0)], mkNatList [0x7FC00000, 0xFFC00000], mkNatList [0x7FC00000]),
+        ("f64 nondet nanChoices of +Inf % 1.0 (zero NaN inputs) is exactly [+qNaN, -qNaN]", listNatTy,
+          mkChoices f64 [(f64, 0x7FF0000000000000), (f64, 0x3FF0000000000000)],
+          mkNatList [0x7FF8000000000000, 0xFFF8000000000000],
+          mkNatList [0x7FF8000000000000, 0xFFF8000000000000, 0x7FF0000000000000, 0xFFF0000000000000]) ]
 
     let saved ← getEnv
     let mkEqDecl (name : Name) (ty lhs rhs : Expr) : Declaration := .thmDecl {
@@ -1686,7 +1906,13 @@ run_cmd do
         -- and universal `f64` (`binary64`) `Mach` + `MachTB.wfLive` relational carrier bridge.
         `LeanMiriSpec.FloatArithLM.step_float_arith_copy_const_deterministic_simulation,
         `LeanMiriSpec.FloatArithLM.step_float_arith_const_copy_deterministic_simulation,
-        `MiniRustSpec.FloatArithMR.fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive ]
+        `MiniRustSpec.FloatArithMR.fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive,
+        -- Round-3 (`B3`): index-exact nondeterministic `const/copy` `Step.step`, the indeterminate-form
+        -- (`W10`) and `binary64` `Step.step` (`W11`) witnesses, and the universal `f32` carrier bridge.
+        `LeanMiriSpec.FloatArithLM.step_float_arith_const_copy_nondet_index_exact,
+        `LeanMiriSpec.FloatArithLM.w10_lm_indeterminate_forms_preferredNaN,
+        `LeanMiriSpec.FloatArithLM.w11_lm_f64_step_and_const_copy_nondet_sub_order,
+        `MiniRustSpec.FloatArithMR.fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive ]
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: unifiedFloatArithAndUcg630DualBundle does not reach {req}"
@@ -1699,8 +1925,8 @@ run_cmd do
   let ((addedCount, rejectedCount, acceptedCount, ieeeThms, mrThms, lmThms, mrPublic, lmPublic,
       reachedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount == 7 && rejectedCount == 12 && acceptedCount == 11 && ieeeThms ≥ 300 &&
-      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 66 && lmPublic ≥ 66 && reachedCount == 46 do
+  unless addedCount == 7 && rejectedCount == 24 && acceptedCount == 23 && ieeeThms ≥ 300 &&
+      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 67 && lmPublic ≥ 69 && reachedCount == 50 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount}, accepted={acceptedCount}, ieee={ieeeThms}, mr={mrThms}, lm={lmThms}, mrPublic={mrPublic}, lmPublic={lmPublic}, reached={reachedCount})"
   logInfo m!"ep2 float-arith cross-root kernel bridge: added {addedCount} dual theorems, rejected {rejectedCount} forged controls (paired with {acceptedCount} accepted positive controls), audited {ieeeThms} constructive IeeeFloatArith + {mrThms} MR + {lmThms} LM theorems (0 host Float, 0 MiniRustSpec imports in LM, {mrPublic} MR + {lmPublic} LM public theorems all covered by axiomAudit bundles, MiniRust Gen.Type has no float constructor), reached all {reachedCount} Trusted(06+08)+MiniRust+Miri constants, axioms {crAxioms}"
 

@@ -15,7 +15,7 @@ import MiniRustSpec.FloatCastMR
 # IEEE-754 Float Arithmetic, Comparisons, Negation, and `Ptr2IntTransmutePolicy` at `MiniRustSpec`
 Episode 2 Shard B correspondence module pairing Anneal's trusted MIR semantics (`Trusted.Rustc.V2026_06_01.MirSemantics` + `Anneal.Mir.IeeeFloatArith`) against pinned MiniRust (`MiniRustSpec.{Gen,Interp,Correspondence.Translate}`) across `BasicMemory<x86_64>` (`Mach`) and `TreeBorrowsMemory<x86_64>` (`MachTB` with `MachTB.wfLive`):
 - **§1**: Two-sided fail-closed translation boundary on float unary/binary ops (including no-float-local comparisons and arbitrary projected float places `*p`, `_s.0`, `_a[i]`, `_a[0]`) across `translate*`, `statementOk*`, `inFragment*`, and `progInFragment*`.
-- **§2**: IEEE-754 bit-carrier bridges (`UnOp.neg ↔ BitXor` sign-bit flip, `Bool` comparisons, and universal `EvalFloatBinOpRel` / `nanChoices` carriers, including universal `f64` `Mach` + `MachTB.wfLive` carrier execution) across `BM`, `TBM`, `Mach`, and `MachTB`.
+- **§2**: IEEE-754 bit-carrier bridges (`UnOp.neg ↔ BitXor` sign-bit flip, `Bool` comparisons, and universal `EvalFloatBinOpRel` / `nanChoices` carriers, including universal `f64` `Mach` + `MachTB.wfLive` carrier execution and its `f32` companion over the zero-extended 64-bit carrier) across `BM`, `TBM`, `Mach`, and `MachTB`.
 - **§3**: Mode-parametric `Ptr2IntTransmutePolicy` (`.strictUcg630Ub` vs. `.stripProvenance`) correspondence on scalars, composites (`(*const u8, usize)` & `struct Mixed`), provenance-free equivalence, shared no-forgery (`usize → &u8`), and uninit-byte UB across `Mach` & `MachTB`.
 - **§4**: Shared concrete witnesses `W1–W6` and complete `#guard_msgs` `#print axioms` audit covering 100% of public theorems (`[propext, Quot.sound]` / `[propext, Classical.choice, Quot.sound]`). -/
 namespace MiniRustSpec.FloatArithMR
@@ -1857,25 +1857,15 @@ theorem fa_bridge_evalFloatBinOpRel_carriers (mode : FloatArithMode) (op : BinOp
       fc_mrBM_transmute_int .Unsigned .Signed f.byteWidth outSc.bits hgood hlt none,
       fc_mrTB_transmute_int .Unsigned .Signed f.byteWidth outSc.bits hgood hlt none,
       harr⟩
-/-- **Symbolic `BasicMemory` machine carrier execution for EVERY arithmetic `EvalFloatBinOpRel` outcome** (both `.deterministic` and `.nondeterministic`, including every `nanChoices` candidate): for `f32` (`f = .binary32`) the MiniRust 32-bit carrier runs via `Interp.steps` to Anneal's exact 4-byte image in `retAlloc`; for `f64` (`f = .binary64`) the MiniRust 64-bit carrier runs via `Interp.steps` under `fcCtx8` to Anneal's exact 8-byte image in `fcRetAlloc8`. `TreeBorrowsMemory` (`Interp.stepsTB` + `MachTB.wfLive`) runs on every `binary64` `nanChoices` outcome of a concrete sNaN addition are kernel-checked by `w11_mr_*` in `tests/mir/FloatArithAndUcg630Tests.lean`. -/
+/-- **Symbolic `BasicMemory` machine carrier execution for EVERY arithmetic `EvalFloatBinOpRel` outcome** (both `.deterministic` and `.nondeterministic`, including every `nanChoices` candidate): for `f32` (`f = .binary32`) the MiniRust 32-bit carrier runs via `Interp.steps` to Anneal's exact 4-byte image in `retAlloc`; for `f64` (`f = .binary64`) the MiniRust 64-bit carrier runs via `Interp.steps` under `fcCtx8` to Anneal's exact 8-byte image in `fcRetAlloc8`. The universal `TreeBorrowsMemory` (`Interp.stepsTB` + `MachTB.wfLive`) statements are `fa_bridge_evalFloatBinOpRel_{f64,f32}_mach_and_machTB_wfLive` below. -/
 theorem fa_bridge_evalFloatBinOpRel_mach_steps (mode : FloatArithMode) (op : BinOp)
     (a b : Nat) (outSc : ScalarInt) (hop : isFloatArithBinOp op = true) : (EvalFloatBinOpRel mode op .binary32 a b outSc →
-      outSc.sizeBytes = 4 ∧
-      ∃ (m : Mach) (n : Nat) (m' : Mach),
-        startMachine fcCarrierCastBody [.scalar ⟨outSc.bits, 4⟩] = some m ∧
-        Interp.steps n m = .ok m' ∧
-        m'.mem.memory.allocations[0]? =
-          some { retAlloc with data := (encodeLittleEndianBytes outSc.bits 4 none).map fcByteToMR }) ∧
+      outSc.sizeBytes = 4 ∧ ∃ (m : Mach) (n : Nat) (m' : Mach), startMachine fcCarrierCastBody [.scalar ⟨outSc.bits, 4⟩] = some m ∧ Interp.steps n m = .ok m' ∧
+        m'.mem.memory.allocations[0]? = some { retAlloc with data := (encodeLittleEndianBytes outSc.bits 4 none).map fcByteToMR }) ∧
     (EvalFloatBinOpRel mode op .binary64 a b outSc →
-      outSc.sizeBytes = 8 ∧
-      ∃ (f : Gen.Function) (n : Nat) (m' : Mach),
-        translateFn fcCarrierCast64Body = some f ∧
-        Interp.steps n (machineWithCtx fcCtx8 fcCarrierCast64Body f
-          (initMachineState fcCarrierCast64Body [.scalar ⟨outSc.bits, 8⟩]).frame.locals f.start) =
-          .ok m' ∧
-        m'.mem.memory.allocations[0]? =
-          some { fcRetAlloc8 with
-            data := (encodeLittleEndianBytes outSc.bits 8 none).map fcByteToMR }) := by
+      outSc.sizeBytes = 8 ∧ ∃ (f : Gen.Function) (n : Nat) (m' : Mach), translateFn fcCarrierCast64Body = some f ∧
+        Interp.steps n (machineWithCtx fcCtx8 fcCarrierCast64Body f (initMachineState fcCarrierCast64Body [.scalar ⟨outSc.bits, 8⟩]).frame.locals f.start) = .ok m' ∧
+        m'.mem.memory.allocations[0]? = some { fcRetAlloc8 with data := (encodeLittleEndianBytes outSc.bits 8 none).map fcByteToMR }) := by
   refine ⟨fun hrel => ?_, fun hrel => ?_⟩
   · rcases EvalFloatBinOpRel_out_wf mode op .binary32 a b outSc hrel with
       ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
@@ -2283,6 +2273,23 @@ theorem fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive (mode : FloatArit
   rcases EvalFloatBinOpRel_out_wf mode bop .binary64 lhsBits rhsBits outSc hrel with ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
   · rw [evalFloatCmp_of_arith bop .binary64 lhsBits rhsBits hbop] at hc; cases hc
   · exact ⟨hsz, hlt, fa_sym_carrier64_steps_bm_and_tb outSc.bits hlt⟩
+/-- **Universal `f32` (`binary32`) `Mach` + `MachTB` (`MachTB.wfLive`) relational carrier bridge** (Round-3 `B3` companion of the `f64` bridge above): for EVERY `mode`, arithmetic `bop`, `lhsBits`, `rhsBits`, and `outSc` with `EvalFloatBinOpRel mode bop .binary32 lhsBits rhsBits outSc`: `outSc.sizeBytes = 4 ∧ outSc.bits < 2 ^ 32`, the 4-byte `Mach` carrier (`fcCarrierCastBody`, `Interp.steps`) reaches `outSc`'s exact 4 little-endian bytes, AND the ZERO-EXTENDED 64-bit carrier (`fcCarrier64Body` on `outSc.bits : u64`, i.e. `x.to_bits() as u64`) steps cleanly in 3 steps on BOTH `Mach` AND `MachTB` (`Interp.stepsTB 3` + `MachTB.wfLive`) to `outSc.bits`' exact 8 little-endian bytes (low 4 bytes = the `f32` image, high 4 bytes = `0`). SCOPE (`B3` finding): a SYMBOLIC 4-byte-WIDE `MachTB` run is NOT proved (it needs 4-byte analogues of the `fa_*_8` memory lemmas); 4-byte `retAfterTB fcCarrierBody` runs stay kernel-checked per NaN candidate (`w16_b3_*` in `tests/mir/FloatArithAndUcg630Tests.lean`). -/
+theorem fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive (mode : FloatArithMode) (bop : BinOp)
+    (lhsBits rhsBits : Nat) (outSc : ScalarInt) (hbop : isFloatArithBinOp bop = true)
+    (hrel : EvalFloatBinOpRel mode bop .binary32 lhsBits rhsBits outSc) :
+    outSc.sizeBytes = 4 ∧ outSc.bits < 2 ^ 32 ∧
+    (∃ (m : Mach) (n : Nat) (m' : Mach), startMachine fcCarrierCastBody [.scalar ⟨outSc.bits, 4⟩] = some m ∧ Interp.steps n m = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := (encodeLittleEndianBytes outSc.bits 4 none).map fcByteToMR }) ∧
+    (∃ (m0 m' : MachTB), fcStartMachineTB8 fcCarrier64Body [.scalar ⟨outSc.bits, 8⟩] = some m0 ∧ Interp.stepsTB 3 m0 = .ok m' ∧ MachTB.wfLive m' ∧
+      m'.threads.map (·.stack.length) = [1] ∧
+      m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) = some (true, ((encodeLittleEndianBytes outSc.bits 8 none).map fcByteToMR).map liftByteTB)) ∧
+    fcRetAfter8 fcCarrier64Body [.scalar ⟨outSc.bits, 8⟩] 3 = some (some { fcRetAlloc8 with data := (encodeLittleEndianBytes outSc.bits 8 none).map fcByteToMR }, [1]) ∧
+    fcRetAfterTB8 fcCarrier64Body [.scalar ⟨outSc.bits, 8⟩] 3 = tbRetU64 outSc.bits := by
+  rcases EvalFloatBinOpRel_out_wf mode bop .binary32 lhsBits rhsBits outSc hrel with ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
+  · rw [evalFloatCmp_of_arith bop .binary32 lhsBits rhsBits hbop] at hc; cases hc
+  · obtain ⟨m, n, m', hm, hs, _, ha⟩ := fc_sym_mr_carrier_steps outSc.bits hlt
+    have h64 := fa_sym_carrier64_steps_bm_and_tb outSc.bits (Nat.lt_of_lt_of_le hlt (by decide))
+    exact ⟨hsz, hlt, ⟨m, n, m', hm, hs, ha⟩, h64.2.1, h64.2.2⟩
 /-! ## §3. Mode-Parametric `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) Correspondence Across `Mach` & `MachTB` -/
 /-- Policy-parametric step-level reduction of `evalByteCast`. -/
 theorem fa_evalByteCast_eq
@@ -3449,9 +3456,7 @@ def axiomAudit_choiceFree :=
   And.intro (@fa_shared_ub_no_forge_both_policies) <| And.intro (@fa_ptrToU64_translate) <| And.intro (@fa_usizeToRefU8_translate) <|
   And.intro (@fa_uninitTransmuteU64_translate) <| And.intro (@fa_intDivZero_translate) <|
   And.intro (@w1_mr_finite_subnormal_overflow) <| @w4_mr_uninit_divzero_and_no_float_local_rejection
-/--
-info: 'MiniRustSpec.FloatArithMR.axiomAudit_choiceFree' depends on axioms: [propext, Quot.sound]
--/
+/-- info: 'MiniRustSpec.FloatArithMR.axiomAudit_choiceFree' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms axiomAudit_choiceFree
 set_option linter.defProp false in
@@ -3459,13 +3464,11 @@ set_option linter.defProp false in
 def axiomAudit_machine :=
   And.intro (@fa_sym_mr_negXor_f32_lockstep) <| And.intro (@fa_sym_mr_negXor_f64_lockstep) <|
   And.intro (@fa_negXor_f32_f64_machTB_wfLive) <| And.intro (@fa_bridge_evalFloatBinOpRel_mach_steps) <|
-  And.intro (@fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive) <|
+  And.intro (@fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive) <| And.intro (@fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive) <|
   And.intro (@fa_ptr2int_live_mach_and_machTB_wfLive) <| And.intro (@fa_no_forge_ref_and_uninit_live_mach_and_machTB_wfLive) <|
   And.intro (@w2_mr_cmp_and_snan_neg_xor_carrier) <| And.intro (@w3_mr_nanChoices_det_vs_nondet) <|
   And.intro (@w5_mr_ptr2int_policy_flip_mach_and_machTB) <| @w6_mr_no_forge_ref_uninit
-/--
-info: 'MiniRustSpec.FloatArithMR.axiomAudit_machine' depends on axioms: [propext, Classical.choice, Quot.sound]
--/
+/-- info: 'MiniRustSpec.FloatArithMR.axiomAudit_machine' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms axiomAudit_machine
 end AxiomGuards
