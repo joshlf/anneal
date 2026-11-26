@@ -875,6 +875,49 @@ theorem valid_tuple_with_zst_shared_offset0_resolves :
 theorem multivariant_tuple_rejected :
     resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 3) (cp 3) = .unsupported := rfl
 
+/-! ### B4 soundness regressions (absent-`fieldLayouts` ZST/pointer/param arrays and tuples) -/
+
+/-- When `fieldLayouts = []`, corrupted layouts for `[(); 0]` (align 8), `[*mut u64; 4]` (stride 1),
+`[*const (u8, [u8]); 4]` (thin stride 8), `[T; 4]`, `(*mut u64, *mut u64)` (size 4), and `(T, u64)`
+(size 8) must all be rejected rather than accepted as authoritative. -/
+def L64_b4 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])                           -- 0: ()
+      , lay 0 8 (.array ⟨8⟩ 0)                               -- 1: corrupt [(); 0] align 8
+      , ptrLay 8 1                                           -- 2: *mut [(); 0]
+      , lay 4 1 (.array ⟨1⟩ 4)                               -- 3: corrupt [*mut u64; 4] stride 1
+      , ptrLay 8 3                                           -- 4: *mut [*mut u64; 4]
+      , lay 32 8 (.array ⟨8⟩ 4)                              -- 5: corrupt wide-ptr / [T; 4] array
+      , ptrLay 8 5                                           -- 6: *mut [widePtr; 4] / *mut [T; 4]
+      , lay 4 1 (.arbitrary [⟨0⟩, ⟨2⟩] [0, 1])              -- 7: corrupt (*mut u64, *mut u64) sz 4
+      , ptrLay 8 7                                           -- 8: *mut (*mut u64, *mut u64)
+      , lay 8 8 (.arbitrary [⟨0⟩, ⟨0⟩] [0, 1])              -- 9: corrupt (T, u64) sz 8
+      , ptrLay 8 9 ] }                                       -- 10: *mut (T, u64)
+def D64_b4 : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.array (.tuple []) 0)) 2
+  , decl (ptrK (.array (ptrK (.uint .u64)) 4)) 4
+  , decl (ptrK (.array widePtrK 4)) 6
+  , decl (ptrK arrT4) 6
+  , decl (ptrK (.tuple [ptrK (.uint .u64), ptrK (.uint .u64)])) 8
+  , decl (ptrK (.tuple [paramT, .uint .u64])) 10 ]
+
+theorem corrupt_unit_arr0_align8_no_false_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_b4 L64_b4 (av 1) (av 1) 5 locals64 =
+      noop := rfl
+theorem corrupt_ptr_arr4_stride1_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 2) (cp 2) D64_b4 L64_b4 (av 1) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+theorem corrupt_wide_ptr_arr4_stride8_rejected :
+    resolveCopyElemLayout D64_b4 L64_b4 (cp 3) (cp 3) = .ok 64 8 := rfl
+theorem corrupt_param_arr4_nil_fl_rejected :
+    resolveCopyElemLayout D64_b4 L64_b4 (cp 4) (cp 4) = .unsupported := rfl
+theorem corrupt_ptr_tuple_small_size_rejected :
+    resolveCopyElemLayout D64_b4 L64_b4 (cp 5) (cp 5) = .unsupported := rfl
+theorem corrupt_param_tuple_nil_fl_rejected :
+    resolveCopyElemLayout D64_b4 L64_b4 (cp 6) (cp 6) = .unsupported := rfl
+
 end Anneal.Tests.ZeroCountCopyAlign.V06
 
 /-! ## §2. `V2026_08_01` (same fixtures; `Value` has no `uninit`) -/
@@ -1703,6 +1746,49 @@ theorem valid_tuple_with_zst_shared_offset0_resolves :
     resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 2) (cp 2) = .ok 8 8 := rfl
 theorem multivariant_tuple_rejected :
     resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 3) (cp 3) = .unsupported := rfl
+
+/-! ### B4 soundness regressions (absent-`fieldLayouts` ZST/pointer/param arrays and tuples) -/
+
+/-- When `fieldLayouts = []`, corrupted layouts for `[(); 0]` (align 8), `[*mut u64; 4]` (stride 1),
+`[*const (u8, [u8]); 4]` (thin stride 8), `[T; 4]`, `(*mut u64, *mut u64)` (size 4), and `(T, u64)`
+(size 8) must all be rejected rather than accepted as authoritative. -/
+def L64_b4 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])                           -- 0: ()
+      , lay 0 8 (.array ⟨8⟩ 0)                               -- 1: corrupt [(); 0] align 8
+      , ptrLay 8 1                                           -- 2: *mut [(); 0]
+      , lay 4 1 (.array ⟨1⟩ 4)                               -- 3: corrupt [*mut u64; 4] stride 1
+      , ptrLay 8 3                                           -- 4: *mut [*mut u64; 4]
+      , lay 32 8 (.array ⟨8⟩ 4)                              -- 5: corrupt wide-ptr / [T; 4] array
+      , ptrLay 8 5                                           -- 6: *mut [widePtr; 4] / *mut [T; 4]
+      , lay 4 1 (.arbitrary [⟨0⟩, ⟨2⟩] [0, 1])              -- 7: corrupt (*mut u64, *mut u64) sz 4
+      , ptrLay 8 7                                           -- 8: *mut (*mut u64, *mut u64)
+      , lay 8 8 (.arbitrary [⟨0⟩, ⟨0⟩] [0, 1])              -- 9: corrupt (T, u64) sz 8
+      , ptrLay 8 9 ] }                                       -- 10: *mut (T, u64)
+def D64_b4 : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.array (.tuple []) 0)) 2
+  , decl (ptrK (.array (ptrK (.uint .u64)) 4)) 4
+  , decl (ptrK (.array widePtrK 4)) 6
+  , decl (ptrK arrT4) 6
+  , decl (ptrK (.tuple [ptrK (.uint .u64), ptrK (.uint .u64)])) 8
+  , decl (ptrK (.tuple [paramT, .uint .u64])) 10 ]
+
+theorem corrupt_unit_arr0_align8_no_false_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_b4 L64_b4 (av 1) (av 1) 5 locals64 =
+      noop := rfl
+theorem corrupt_ptr_arr4_stride1_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 2) (cp 2) D64_b4 L64_b4 (av 1) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+theorem corrupt_wide_ptr_arr4_stride8_rejected :
+    resolveCopyElemLayout D64_b4 L64_b4 (cp 3) (cp 3) = .ok 64 8 := rfl
+theorem corrupt_param_arr4_nil_fl_rejected :
+    resolveCopyElemLayout D64_b4 L64_b4 (cp 4) (cp 4) = .unsupported := rfl
+theorem corrupt_ptr_tuple_small_size_rejected :
+    resolveCopyElemLayout D64_b4 L64_b4 (cp 5) (cp 5) = .unsupported := rfl
+theorem corrupt_param_tuple_nil_fl_rejected :
+    resolveCopyElemLayout D64_b4 L64_b4 (cp 6) (cp 6) = .unsupported := rfl
 
 end Anneal.Tests.ZeroCountCopyAlign.V08
 
@@ -2751,3 +2837,51 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.multivariant_tuple_rejected' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.multivariant_tuple_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_unit_arr0_align8_no_false_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_unit_arr0_align8_no_false_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_ptr_arr4_stride1_misaligned_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_ptr_arr4_stride1_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_wide_ptr_arr4_stride8_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_wide_ptr_arr4_stride8_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_param_arr4_nil_fl_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_param_arr4_nil_fl_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_ptr_tuple_small_size_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_ptr_tuple_small_size_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_param_tuple_nil_fl_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_param_tuple_nil_fl_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_unit_arr0_align8_no_false_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_unit_arr0_align8_no_false_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_ptr_arr4_stride1_misaligned_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_ptr_arr4_stride1_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_wide_ptr_arr4_stride8_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_wide_ptr_arr4_stride8_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_param_arr4_nil_fl_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_param_arr4_nil_fl_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_ptr_tuple_small_size_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_ptr_tuple_small_size_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_param_tuple_nil_fl_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_param_tuple_nil_fl_rejected
