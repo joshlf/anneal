@@ -3987,7 +3987,6 @@ def v26FfiReadRegClaim : Claim where
 theorem v26FfiReadRegPinnedAuto_verified : VerificationResult v26FfiReadRegClaim :=
   dischargeRustPinnedContractAuto
     v26FfiReadRegClaim 64 64 (.some v26FfiReadRegReqMir) (.some v26FfiReadRegEnsMir)
-    (h_check := by decide +kernel)
 
 theorem v26FfiReadRegEqU32_verified : VerificationResult v26FfiReadRegClaim :=
   dischargeRustEqU32FuelFree
@@ -4006,7 +4005,6 @@ def v26FfiReadRegTotalClaim : TotalClaim where
 theorem v26FfiReadRegTotalPinnedAuto_verified : TotalVerificationResult v26FfiReadRegTotalClaim :=
   dischargeRustTotalPinnedContractAuto
     v26FfiReadRegTotalClaim 64 64 (.some v26FfiReadRegReqMir) (.some v26FfiReadRegEnsMir)
-    (h_check := by decide +kernel)
 
 /-- Soundness canary (Pitfall A): without `argsMatchCalleeParamTys` / `argsMatchSignature`,
 an untyped aggregate `[.aggregate 0 [.scalar ⟨10, 4⟩]]` satisfies the closure-deref `requires`
@@ -4049,7 +4047,6 @@ theorem v26ClampAddOneSymRange_verified : VerificationResult v26ClampAddOneClaim
 theorem v26ClampAddOneBoundedRange_verified : VerificationResult v26ClampAddOneClaim :=
   dischargeRustBoundedRange1Auto
     v26ClampAddOneClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
-    (h_check := by decide +kernel)
 
 def v26ClampAddOneTotalClaim : TotalClaim where
   body := v26ClampAddOneMir
@@ -4065,7 +4062,6 @@ theorem v26ClampAddOneTotalBoundedRange_verified :
     TotalVerificationResult v26ClampAddOneTotalClaim :=
   dischargeRustTotalBoundedRange1Auto
     v26ClampAddOneTotalClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
-    (h_check := by decide +kernel)
 
 def v26ZeroArgConstMir : CapturedMir :=
   mkMirBody "sym_test::zero_arg_const" 0
@@ -4257,8 +4253,7 @@ theorem v26FfiReadRegReversedPinnedAuto_verified :
     VerificationResult v26FfiReadRegReversedClaim :=
   ⟨rfl, rfl, rfl,
     dischargeRustPinnedContractAuto
-      v26FfiReadRegReversedClaim 64 64 (.some v26FfiReadRegReversedReqMir) (.some v26FfiReadRegEnsMir)
-      (h_check := by decide +kernel)⟩
+      v26FfiReadRegReversedClaim 64 64 (.some v26FfiReadRegReversedReqMir) (.some v26FfiReadRegEnsMir)⟩
 
 theorem v26FfiReadRegReversedEqU32_verified : VerificationResult v26FfiReadRegReversedClaim :=
   dischargeRustEqU32FuelFree
@@ -4323,7 +4318,6 @@ theorem v26FfiReadRegIntermMoveTotal_verified :
     TotalVerificationResult v26FfiReadRegIntermMoveTotalClaim :=
   dischargeRustTotalPinnedContractAuto
     v26FfiReadRegIntermMoveTotalClaim 64 64 (.some v26FfiReadRegIntermMoveReqMir) (.some v26FfiReadRegEnsMir)
-    (h_check := by decide +kernel)
 
 /-- Two-parameter `u32` closure-deref short-circuit `requires` (`a == 10 && 20 == b`)
 and `ensures` (`30 == result`), discharged via both `dischargeRustPinnedContractAuto`
@@ -4464,8 +4458,7 @@ theorem v26AddTwoRegsPinnedAuto_verified :
     VerificationResult v26AddTwoRegsClaim :=
   ⟨rfl,
     dischargeRustPinnedContractAuto
-      v26AddTwoRegsClaim 64 64 (.some v26AddTwoRegsReqMir) (.some v26AddTwoRegsEnsMir)
-      (h_check := by decide +kernel)⟩
+      v26AddTwoRegsClaim 64 64 (.some v26AddTwoRegsReqMir) (.some v26AddTwoRegsEnsMir)⟩
 
 theorem v26AddTwoRegsEq2U32_verified : VerificationResult v26AddTwoRegsClaim :=
   dischargeRustEq2U32FuelFree
@@ -4721,6 +4714,795 @@ theorem extCallBOfA_externalSpecContractPair_verified :
     · rintro _ _ ⟨⟩
   · exact False.elim (h_a ⟨rfl, rfl, ⟨⟨x, hx, rfl⟩, trivial⟩, trivial⟩)
   · rintro _ _ ⟨⟩
+
+/-! ## 17. Suspended `SavedCallerFrame` Spine Normalization & Pure `by rfl` Regressions
+
+Regression suite for `Lower.strictSavedCallerFrame` / `strictCallStack` /
+`strictMemory` and the call-by-name-forcing closed-term checkers in `SymReflect`:
+
+a. **Periodic normalization across suspended frames**: `s17CallerMir` calls
+   `s17_mid` twice and `s17LoopCallerMir` runs a 3-iteration `switchInt` loop
+   calling `s17_mid` on every iteration; each `s17_mid` call nests a `s17_leaf`
+   call (`callStack` depth `2`), and both callees write through `&mut` into the
+   *suspended* caller's local `_2` while even-`fuel'` `stepMirStatePeriodic`
+   ticks normalize the caller frame on `Memory.callStack`. Discharged by pure
+   `by rfl` via `checkMirBoolWithCalleesBounded`, `dischargeRustPinnedContractAuto`,
+   and `dischargeRustEqU32FuelFree` (the strict
+   `checkMirRustPinnedSpecOptWithSpecCallees` branch, since `callees ≠ []`),
+   with `proveNonVacuousPre` witnesses and `= false` refutation canaries.
+b. **Structural reductions**: closed-term `rfl` checks that
+   `strictSavedCallerFrame`, `strictCallStack`, `strictMemory`, and
+   `strictBits 0` collapse arithmetic / update thunks (`Nat.add`, `Nat.sub`,
+   `.constantIndex`, `.subslice`, `.index`, `normalizeSubsliceProjections`,
+   `narrowCallStackForTailCallee`, `internFnPtr`) to canonical literals while
+   leaving universally quantified static payloads (`callerBody`, `Ty`,
+   `Option String`, `DefPath`, `RigidTy`) and symbolic caller parameters
+   untouched, plus a public API smoke check for all 8 `_eq` theorems.
+c. **Open-term symbolic caller parameters across inline calls**: `s17SymPred_holds`
+   (even fuel `64`) and `s17SymPred_holds_oddFuel` (odd fuel `65`) keep
+   `(x : Nat)` in caller parameter slot `1 ≤ idx ≤ callerBody.argCount` while
+   `s17_mid` / `s17_leaf` run with the caller frame suspended across both
+   parities of `stepMirStatePeriodic` ticks.
+d. **Periodic-tick traces**: `s17PeriodicTrace` replays the exact
+   `stepMirStatePeriodic` schedule and records every even-`fuel'` normalization
+   tick taken at `callStack` depth `2`, together with the suspended root
+   caller's `acc` slot; `s17*_periodicTrace` pin by `rfl` (closed and open-term
+   with symbolic `x`) that such ticks occur *after* cross-frame `&mut` writes
+   (`40`, `72`, `104`) landed two frames up, so the suspended `SavedCallerFrame`
+   normalization path is genuinely exercised rather than vacuously skipped.
+e. **Open-term loop**: `s17SymLoopPred_holds` / `_refutes` combine (c) with the
+   `switchInt` back-edge loop (three `loop -> mid -> leaf` round trips with `x`
+   symbolic in caller slot `1`).
+f. **Modular external calls with computed arguments** (§17f): forced
+   `req.args` / `expectedRet` in `checkMirRustModularPinnedSpecLoop` via
+   `dischargeRustModularContractAuto` and `dischargeRustModularBoundedRange1Auto`,
+   with out-of-contract and wrong-`defPath` `= false` canaries.
+-/
+private def s17U32MutRefTy : Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
+private def s17UnitTy : Ty := { kind := .tuple [], layoutIdx := 0 }
+
+/-- `fn s17_leaf(q: &mut u32) { *q = *q + 30; }` -/
+def s17LeafMir : CapturedMir :=
+  mkMirBody "sym_test::s17_leaf" 1
+    [mkDecl .mut s17UnitTy, mkDecl .not s17U32MutRefTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨1, [.deref]⟩
+              (.binaryOp .add (.copy ⟨1, [.deref]⟩) (u32ConstOperand 30)))
+          , mkStmt (.assign ⟨0, []⟩ (.aggregate .tuple [])) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- `fn s17_mid(p: &mut u32) { s17_leaf(p); *p = *p + 2; }` -/
+def s17MidMir : CapturedMir :=
+  mkMirBody "sym_test::s17_mid" 1
+    [mkDecl .mut s17UnitTy, mkDecl .not s17U32MutRefTy, mkDecl .mut s17UnitTy]
+    [ { statements := [mkStmt (.storageLive 2)]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_leaf")
+            [.copy ⟨1, []⟩] ⟨2, []⟩ (.some 1) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 2)
+          , mkStmt (.assign ⟨1, [.deref]⟩
+              (.binaryOp .add (.copy ⟨1, [.deref]⟩) (u32ConstOperand 2)))
+          , mkStmt (.assign ⟨0, []⟩ (.aggregate .tuple [])) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def s17Callees : List CapturedMir := [s17MidMir, s17LeafMir]
+
+/-- `fn s17_caller(x: u32) -> u32 { let mut acc = x; s17_mid(&mut acc); s17_mid(&mut acc); acc }` -/
+def s17CallerMir : CapturedMir :=
+  mkMirBody "sym_test::s17_caller" 1
+    [ mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy
+    , mkDecl .mut s17U32MutRefTy, mkDecl .mut s17UnitTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 2)
+          , mkStmt (.assign ⟨2, []⟩ (.use (.copy ⟨1, []⟩)))
+          , mkStmt (.storageLive 3)
+          , mkStmt (.assign ⟨3, []⟩ (.ref (.mut false) ⟨2, []⟩))
+          , mkStmt (.storageLive 4) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_mid")
+            [.move ⟨3, []⟩] ⟨4, []⟩ (.some 1) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 4)
+          , mkStmt (.storageDead 3)
+          , mkStmt (.storageLive 3)
+          , mkStmt (.assign ⟨3, []⟩ (.ref (.mut false) ⟨2, []⟩))
+          , mkStmt (.storageLive 4) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_mid")
+            [.move ⟨3, []⟩] ⟨4, []⟩ (.some 2) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 4)
+          , mkStmt (.storageDead 3)
+          , mkStmt (.assign ⟨0, []⟩ (.use (.copy ⟨2, []⟩)))
+          , mkStmt (.storageDead 2) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def s17ReqMir : CapturedMir :=
+  mkMirBody "sym_test::req_s17_caller" 1
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨1, []⟩) (u32ConstOperand 10))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.requires "sym_test::s17_caller")
+
+def s17EnsMir : CapturedMir :=
+  mkMirBody "sym_test::ens_s17_caller" 2
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨2, []⟩) (u32ConstOperand 74))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.ensures "sym_test::s17_caller")
+
+
+/-- Predicate `fn s17_sym_pred(unused: u32, y: u32) -> bool { let mut acc = y; s17_mid(&mut acc); acc == 42 }`.
+Parameter slot `1` (`unused`) is left symbolic in Part (c) below. -/
+def s17SymPredMir : CapturedMir :=
+  mkMirBody "sym_test::s17_sym_pred" 2
+    [ mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy
+    , mkDecl .mut u32MirTy, mkDecl .mut s17U32MutRefTy, mkDecl .mut s17UnitTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 3)
+          , mkStmt (.assign ⟨3, []⟩ (.use (.copy ⟨2, []⟩)))
+          , mkStmt (.storageLive 4)
+          , mkStmt (.assign ⟨4, []⟩ (.ref (.mut false) ⟨3, []⟩))
+          , mkStmt (.storageLive 5) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_mid")
+            [.move ⟨4, []⟩] ⟨5, []⟩ (.some 1) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 5)
+          , mkStmt (.storageDead 4)
+          , mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨3, []⟩) (u32ConstOperand 42)))
+          , mkStmt (.storageDead 3) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+
+
+/-- `fn s17_pin(x: u32) -> u32 { let mut acc = x; s17_mid(&mut acc); acc }` (`14` subject steps). -/
+def s17PinMir : CapturedMir :=
+  mkMirBody "sym_test::s17_pin" 1
+    [ mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy
+    , mkDecl .mut s17U32MutRefTy, mkDecl .mut s17UnitTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 2)
+          , mkStmt (.assign ⟨2, []⟩ (.use (.copy ⟨1, []⟩)))
+          , mkStmt (.storageLive 3)
+          , mkStmt (.assign ⟨3, []⟩ (.ref (.mut false) ⟨2, []⟩))
+          , mkStmt (.storageLive 4) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_mid")
+            [.move ⟨3, []⟩] ⟨4, []⟩ (.some 1) .continue_)
+        isCleanup := false }
+    , { statements := [ mkStmt (.assign ⟨0, []⟩ (.use (.copy ⟨2, []⟩))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- `fn s17_mid_fast(p: &mut u32) { s17_leaf(p); *p = *p + 2; }` writing the leaf's unit result into `_0`. -/
+def s17MidFastMir : CapturedMir :=
+  mkMirBody "sym_test::s17_mid" 1
+    [mkDecl .mut s17UnitTy, mkDecl .not s17U32MutRefTy]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_leaf")
+            [.copy ⟨1, []⟩] ⟨0, []⟩ (.some 1) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.assign ⟨1, [.deref]⟩
+              (.binaryOp .add (.copy ⟨1, [.deref]⟩) (u32ConstOperand 2))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def s17FastCallees : List CapturedMir := [s17MidFastMir, s17LeafMir]
+
+def s17PinEnsMir : CapturedMir :=
+  mkMirBody "sym_test::ens_s17_pin" 2
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨2, []⟩) (u32ConstOperand 42))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.ensures "sym_test::s17_pin")
+
+
+def s17PinEqClaim : Claim where
+  body := s17PinMir
+  callees := s17FastCallees
+  pre args := And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ReqMir args)
+  post args ret := MirBoolPredicateHoldsWithCallees s17PinEnsMir s17FastCallees (args ++ [ret])
+
+theorem s17PinEqU32_verified : VerificationResult s17PinEqClaim :=
+  dischargeRustEqU32FuelFree s17PinEqClaim s17ReqMir s17PinEnsMir 10
+
+def s17CallerClaim : Claim where
+  body := s17CallerMir
+  callees := s17Callees
+  pre args := And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ReqMir args)
+  post args ret := MirBoolPredicateHolds s17EnsMir (args ++ [ret])
+
+theorem s17CallerPinnedAuto_verified : VerificationResult s17CallerClaim :=
+  dischargeRustPinnedContractAuto s17CallerClaim 64 64 (.some s17ReqMir) (.some s17EnsMir)
+
+theorem s17CallerClaim_nonVacuous : ∃ args, s17CallerClaim.pre args :=
+  proveNonVacuousPre [.scalar ⟨10, 4⟩] ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree s17ReqMir _⟩
+
+theorem s17SymPred_holds (x : Nat) :
+    MirBoolPredicateHoldsWithCallees s17SymPredMir s17Callees [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] :=
+  mirBoolPredicateHoldsWithCallees_of_checkBounded 64 _ _ _
+
+/-- Complementary odd-fuel parity check: shifts which statements/calls land on
+even-`fuel'` `stepMirStatePeriodic` normalization ticks while `x` sits in
+suspended caller parameter slot `1`. -/
+theorem s17SymPred_holds_oddFuel (x : Nat) :
+    MirBoolPredicateHoldsWithCallees s17SymPredMir s17Callees [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] :=
+  mirBoolPredicateHoldsWithCallees_of_checkBounded 65 _ _ _
+
+theorem s17SymPred_refutes (x : Nat) :
+    checkMirBoolWithCalleesBounded 64 s17SymPredMir s17Callees [.scalar ⟨x, 4⟩, .scalar ⟨11, 4⟩] = false :=
+  rfl
+
+/-- Looped multi-call fixture:
+`fn s17_loop_caller(x: u32) -> u32 { let mut acc = x; let mut i = 0; while i < 3 { s17_mid(&mut acc); i += 1; } acc }`
+Exercises a `switchInt` back-edge pushing `SavedCallerFrame` onto `Memory.callStack`
+at depth `2` (`loop_caller -> mid -> leaf`) across 3 loop iterations (`76` steps,
+`10 + 3 * 32 = 106`). -/
+def s17LoopCallerMir : CapturedMir :=
+  mkMirBody "sym_test::s17_loop_caller" 1
+    [ mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy
+    , mkDecl .mut u32MirTy, mkDecl .mut boolMirTy
+    , mkDecl .mut s17U32MutRefTy, mkDecl .mut s17UnitTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 2)
+          , mkStmt (.assign ⟨2, []⟩ (.use (.copy ⟨1, []⟩)))
+          , mkStmt (.storageLive 3)
+          , mkStmt (.assign ⟨3, []⟩ (.use (u32ConstOperand 0))) ]
+        terminator := mkTerm (.goto 1)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageLive 4)
+          , mkStmt (.assign ⟨4, []⟩ (.binaryOp .lt (.copy ⟨3, []⟩) (u32ConstOperand 3))) ]
+        terminator :=
+          mkTerm (.switchInt (.copy ⟨4, []⟩) { branches := [(0, 4)], otherwise := 2 })
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 4)
+          , mkStmt (.storageLive 5)
+          , mkStmt (.assign ⟨5, []⟩ (.ref (.mut false) ⟨2, []⟩))
+          , mkStmt (.storageLive 6) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_mid")
+            [.move ⟨5, []⟩] ⟨6, []⟩ (.some 3) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 6)
+          , mkStmt (.storageDead 5)
+          , mkStmt (.assign ⟨3, []⟩ (.binaryOp .add (.copy ⟨3, []⟩) (u32ConstOperand 1))) ]
+        terminator := mkTerm (.goto 1)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 4)
+          , mkStmt (.assign ⟨0, []⟩ (.use (.copy ⟨2, []⟩)))
+          , mkStmt (.storageDead 3)
+          , mkStmt (.storageDead 2) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def s17LoopEnsMir : CapturedMir :=
+  mkMirBody "sym_test::ens_s17_loop_caller" 2
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨2, []⟩) (u32ConstOperand 106))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.ensures "sym_test::s17_loop_caller")
+
+def s17LoopCallerClaim : Claim where
+  body := s17LoopCallerMir
+  callees := s17Callees
+  pre args := And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ReqMir args)
+  post args ret := MirBoolPredicateHolds s17LoopEnsMir (args ++ [ret])
+
+theorem s17LoopCallerPinnedAuto_verified : VerificationResult s17LoopCallerClaim :=
+  dischargeRustPinnedContractAuto s17LoopCallerClaim 96 64 (.some s17ReqMir) (.some s17LoopEnsMir)
+
+theorem s17LoopCallerClaim_nonVacuous : ∃ args, s17LoopCallerClaim.pre args :=
+  proveNonVacuousPre [.scalar ⟨10, 4⟩] ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree s17ReqMir _⟩
+
+/-- Refutation canary for the looped fixture: input `11` yields `11 + 3 * 32 = 107 ≠ 106`. -/
+theorem s17LoopCaller_refutes : checkMirRustPinnedSpecOptWithCallees 96 64 s17LoopCallerMir s17Callees
+    (.some s17LoopEnsMir) [.scalar ⟨11, 4⟩] = false := rfl
+
+/-- Open-term definitional preservation: `strictBits 0 x = .some x` by `rfl`. -/
+theorem s17_strictBits_zero_sym (x : Nat) : strictBits 0 x = .some x := rfl
+
+theorem s17_strictSavedCallerFrame_normalizes
+    (body : CapturedMir) (x : Nat) (ty : Ty) (name : Option String) :
+    strictSavedCallerFrame
+      { callerBody := { body with argCount := 1 }
+        frame :=
+          { blockIdx := Nat.add 0 1
+            stmtIdx := Nat.sub 3 1
+            locals :=
+              [ .uninit
+              , .init (.scalar ⟨x, 4⟩)
+              , .init (.scalar ⟨Nat.mul 6 7, Nat.add 2 2⟩)
+              , .init (.ptr ⟨Nat.add 1 1, Nat.sub 9 1⟩ (Nat.add 4 4))
+              , .dead ] }
+        destination :=
+          { local_ := Nat.add 2 2
+            projection :=
+              [ .deref
+              , .field (Nat.add 0 1) ty
+              , .index (Nat.add 1 2)
+              , .downcast name (Nat.add 1 1)
+              , .constantIndex (Nat.add 1 2) (Nat.add 1 3) (Bool.not true)
+              , .subslice (Nat.sub 5 1) (Nat.add 4 2) (Bool.not true)
+              , .opaqueCast ty
+              , .unwrapUnsafeBinder ty ] }
+        returnTarget := Nat.add 1 1
+        callerProtector := .some (Nat.add 3 4)
+        calleeProtectors := [Nat.add 1 0, Nat.succ 4]
+        returnUnwind := .cleanup (Nat.add 2 1)
+        isDiverging := Bool.not true } =
+    .some
+      { callerBody := { body with argCount := 1 }
+        frame :=
+          { blockIdx := 1
+            stmtIdx := 2
+            locals :=
+              [ .uninit
+              , .init (.scalar ⟨x, 4⟩)
+              , .init (.scalar ⟨42, 4⟩)
+              , .init (.ptr ⟨2, 8⟩ 8)
+              , .dead ] }
+        destination :=
+          { local_ := 4
+            projection :=
+              [ .deref, .field 1 ty, .index 3, .downcast name 2, .constantIndex 3 4 false
+              , .subslice 4 6 false, .opaqueCast ty, .unwrapUnsafeBinder ty ] }
+        returnTarget := 2
+        callerProtector := .some 7
+        calleeProtectors := [1, 5]
+        returnUnwind := .cleanup 3
+        isDiverging := false } :=
+  rfl
+
+/-- Direct depth-2 `strictCallStack` normalization check covering symbolic caller
+parameters alongside `narrowCallStackForTailCallee` and all non-cleanup `UnwindAction`s. -/
+theorem s17_strictCallStack_normalizes (body : CapturedMir) (x : Nat) :
+    strictCallStack
+      (narrowCallStackForTailCallee
+        [ { callerBody := { body with argCount := 1 }
+            frame :=
+              { blockIdx := Nat.add 0 1
+                stmtIdx := Nat.succ 0
+                locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨Nat.add 20 22, 4⟩)] }
+            destination := { local_ := Nat.add 1 1, projection := [.constantIndex (Nat.add 1 2) 0 false] }
+            returnTarget := Nat.add 1 1
+            returnUnwind := .cleanup (Nat.add 2 1)
+            isDiverging := Bool.not false }
+        , { callerBody := { body with argCount := 0 }
+            frame := { blockIdx := Nat.add 1 1, stmtIdx := 0, locals := [.init (.scalar ⟨Nat.mul 3 3, 4⟩)] }
+            destination := { local_ := 0, projection := [] }
+            returnTarget := Nat.succ 0
+            returnUnwind := .terminate
+            isDiverging := Bool.not true } ]
+        false) =
+    .some
+      [ { callerBody := { body with argCount := 1 }
+          frame :=
+            { blockIdx := 1
+              stmtIdx := 1
+              locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨42, 4⟩)] }
+          destination := { local_ := 2, projection := [.constantIndex 3 0 false] }
+          returnTarget := 2
+          returnUnwind := .unreachable
+          isDiverging := true }
+      , { callerBody := { body with argCount := 0 }
+          frame := { blockIdx := 2, stmtIdx := 0, locals := [.init (.scalar ⟨9, 4⟩)] }
+          destination := { local_ := 0, projection := [] }
+          returnTarget := 1
+          returnUnwind := .terminate
+          isDiverging := false } ] :=
+  rfl
+
+def s17ThunkedBorrow : BorrowEntry where
+  tag := Nat.add 1 1
+  perm := .reservedFrz (Bool.not true)
+  targetLocal := Nat.add 1 1
+  targetProjection := normalizeSubsliceProjections [.subslice 1 6 false, .subslice 1 3 false]
+  rangeOffset := Nat.mul 2 2
+  rangeLen := Nat.sub 5 1
+  targetFrameDepth := Nat.succ 0
+
+theorem s17_strictMemory_normalizes (body : CapturedMir) (x : Nat) (defPath : DefPath) (sig : RigidTy) :
+    strictMemory
+      { (internFnPtr {} defPath [] (.some sig)).2 with
+        nextTag := Nat.add 2 1
+        borrows := [s17ThunkedBorrow]
+        callees := [body]
+        activeCallee := .some body
+        callStack :=
+          narrowCallStackForTailCallee
+            [ { callerBody := { body with argCount := 1 }
+                frame :=
+                  { blockIdx := Nat.add 1 1
+                    stmtIdx := 0
+                    locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨Nat.add 40 2, 4⟩)] }
+                destination := { local_ := 0, projection := [.constantIndex (Nat.add 1 2) 0 false] }
+                returnUnwind := .cleanup (Nat.add 2 1) }
+            , { callerBody := { body with argCount := 0 }
+                frame := { blockIdx := Nat.add 0 1, stmtIdx := Nat.succ 0, locals := [.init (.scalar ⟨Nat.add 5 5, 4⟩)] }
+                destination := { local_ := 0, projection := [] }
+                returnUnwind := .continue_ } ]
+            false
+        activeProtectors := [Nat.add 1 1, Nat.add 2 1]
+        nextProtector := Nat.succ 3
+        exposedAllocIds := [Nat.add 65535 1, Nat.mul 3 3] } =
+    .some
+      { nextTag := 3
+        borrows :=
+          [ { tag := 2, perm := .reservedFrz false, targetLocal := 2
+              targetProjection := [.subslice 2 4 false], rangeOffset := 4, rangeLen := 4
+              targetFrameDepth := 1 } ]
+        callees := [body]
+        activeCallee := .some body
+        callStack :=
+          [ { callerBody := { body with argCount := 1 }
+              frame :=
+                { blockIdx := 2
+                  stmtIdx := 0
+                  locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨42, 4⟩)] }
+              destination := { local_ := 0, projection := [.constantIndex 3 0 false] }
+              returnUnwind := .unreachable }
+          , { callerBody := { body with argCount := 0 }
+              frame := { blockIdx := 1, stmtIdx := 1, locals := [.init (.scalar ⟨10, 4⟩)] }
+              destination := { local_ := 0, projection := [] }
+              returnUnwind := .continue_ } ]
+        activeProtectors := [2, 3]
+        nextProtector := 4
+        fnPtrs := [{ allocId := 65536, defPath := defPath, fnSig := .some sig }]
+        exposedAllocIds := [65536, 9] } :=
+  rfl
+
+/-- Public API visibility check for all key `Lower` spine-normalizer `_eq` theorems. -/
+theorem s17_public_eq_theorems
+    (pe : ProjectionElem) (p : Place) (u : UnwindAction) (b : CapturedMir)
+    (ob : Option CapturedMir) (sf : SavedCallerFrame) (cs : List SavedCallerFrame)
+    (fp : FnPtrEntry) (m : Memory) (argCount : Nat) (s : MachineState) :
+    strictProjectionElem pe = .some pe ∧
+    strictPlace p = .some p ∧
+    strictUnwindAction u = .some u ∧
+    strictCapturedMirHead b = .some b ∧
+    strictOptCapturedMirHead ob = .some ob ∧
+    strictSavedCallerFrame sf = .some sf ∧
+    strictCallStack cs = .some cs ∧
+    strictFnPtrEntry fp = .some fp ∧
+    strictMemory m = .some m ∧
+    strictMachineState argCount s = .some s :=
+  ⟨strictProjectionElem_eq pe, strictPlace_eq p, strictUnwindAction_eq u,
+   strictCapturedMirHead_eq b, strictOptCapturedMirHead_eq ob,
+   strictSavedCallerFrame_eq sf, strictCallStack_eq cs, strictFnPtrEntry_eq fp,
+   strictMemory_eq m, strictMachineState_eq argCount s⟩
+
+theorem s17Caller_check : checkMirRustPinnedSpecOptWithCallees 64 64 s17CallerMir s17Callees
+    (.some s17EnsMir) [.scalar ⟨10, 4⟩] = true := rfl
+
+/-- Refutation canary: the unpinned input `11` returns `11 + 64 = 75 ≠ 74`. -/
+theorem s17Caller_refutes : checkMirRustPinnedSpecOptWithCallees 64 64 s17CallerMir s17Callees
+    (.some s17EnsMir) [.scalar ⟨11, 4⟩] = false := rfl
+
+theorem s17SymPred_checkConcrete : checkMirBoolWithCalleesBounded 64 s17SymPredMir s17Callees
+    [.scalar ⟨5, 4⟩, .scalar ⟨10, 4⟩] = true := rfl
+
+/-- Fuel canary: the `s17_pin` run needs `14` subject steps (fits `FuelFree`'s `16`). -/
+theorem s17Pin_fuelBoundary :
+    checkMirRustPinnedSpecOptWithSpecCallees 13 64 s17PinMir s17FastCallees s17FastCallees
+        (.some s17PinEnsMir) [.scalar ⟨10, 4⟩] = false ∧
+    checkMirRustPinnedSpecOptWithSpecCallees 14 64 s17PinMir s17FastCallees s17FastCallees
+        (.some s17PinEnsMir) [.scalar ⟨10, 4⟩] = true :=
+  ⟨rfl, rfl⟩
+
+theorem s17PinEqClaim_nonVacuous : ∃ args, s17PinEqClaim.pre args :=
+  proveNonVacuousPre [.scalar ⟨10, 4⟩] ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree s17ReqMir _⟩
+
+/-- Open-term looped predicate:
+`fn s17_sym_loop_pred(unused: u32, y: u32) -> bool { let mut acc = y; let mut i = 0; while i < 3 { s17_mid(&mut acc); i += 1; } acc == 106 }`.
+Combines Part (c) with the `switchInt` back-edge loop: `unused` stays symbolic in
+caller parameter slot `1` across three `loop -> mid -> leaf` round trips, so every
+`Memory.activeCallee := .some sf.callerBody` restore and every even-`fuel'`
+normalization of the suspended caller frame must avoid both the callee-body
+projection leak and `Nat.div` on fvar-mentioning counter thunks. -/
+def s17SymLoopPredMir : CapturedMir :=
+  mkMirBody "sym_test::s17_sym_loop_pred" 2
+    [ mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy
+    , mkDecl .mut u32MirTy, mkDecl .mut u32MirTy, mkDecl .mut boolMirTy
+    , mkDecl .mut s17U32MutRefTy, mkDecl .mut s17UnitTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 3)
+          , mkStmt (.assign ⟨3, []⟩ (.use (.copy ⟨2, []⟩)))
+          , mkStmt (.storageLive 4)
+          , mkStmt (.assign ⟨4, []⟩ (.use (u32ConstOperand 0))) ]
+        terminator := mkTerm (.goto 1)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageLive 5)
+          , mkStmt (.assign ⟨5, []⟩ (.binaryOp .lt (.copy ⟨4, []⟩) (u32ConstOperand 3))) ]
+        terminator :=
+          mkTerm (.switchInt (.copy ⟨5, []⟩) { branches := [(0, 4)], otherwise := 2 })
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 5)
+          , mkStmt (.storageLive 6)
+          , mkStmt (.assign ⟨6, []⟩ (.ref (.mut false) ⟨3, []⟩))
+          , mkStmt (.storageLive 7) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_mid")
+            [.move ⟨6, []⟩] ⟨7, []⟩ (.some 3) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 7)
+          , mkStmt (.storageDead 6)
+          , mkStmt (.assign ⟨4, []⟩ (.binaryOp .add (.copy ⟨4, []⟩) (u32ConstOperand 1))) ]
+        terminator := mkTerm (.goto 1)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 5)
+          , mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨3, []⟩) (u32ConstOperand 106)))
+          , mkStmt (.storageDead 4)
+          , mkStmt (.storageDead 3) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- Part (c) + loop: symbolic `x` in suspended caller slot `1` across three looped
+`loop -> mid -> leaf` call round trips (default `by rfl`). -/
+theorem s17SymLoopPred_holds (x : Nat) :
+    MirBoolPredicateHoldsWithCallees s17SymLoopPredMir s17Callees
+      [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] :=
+  mirBoolPredicateHoldsWithCallees_of_checkBounded 128 _ _ _
+
+/-- Complementary odd-fuel parity check for the looped fixtures (both closed and
+open-term with symbolic `x`), ensuring neither `stepMirStatePeriodic` parity
+regresses across multi-iteration `activeCallee` restores. -/
+theorem s17LoopCaller_oddFuel :
+    checkMirRustPinnedSpecOptWithCallees 97 64 s17LoopCallerMir s17Callees
+      (.some s17LoopEnsMir) [.scalar ⟨10, 4⟩] = true :=
+  rfl
+
+theorem s17SymLoopPred_holds_oddFuel (x : Nat) :
+    MirBoolPredicateHoldsWithCallees s17SymLoopPredMir s17Callees
+      [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] :=
+  mirBoolPredicateHoldsWithCallees_of_checkBounded 129 _ _ _
+
+/-- Refutation canary for `s17SymLoopPred_holds`: `y = 11` yields `107 ≠ 106`. -/
+theorem s17SymLoopPred_refutes (x : Nat) :
+    checkMirBoolWithCalleesBounded 128 s17SymLoopPredMir s17Callees
+      [.scalar ⟨x, 4⟩, .scalar ⟨11, 4⟩] = false :=
+  rfl
+
+/-- Bits of the scalar in local slot `i` (sentinels `1000000` / `2000000` for a
+missing slot / non-scalar), used by `s17PeriodicTrace`. -/
+def s17SlotBits : Nat → List LocalSlot → Nat
+  | _, .nil => 1000000
+  | .zero, .init (.scalar sc) :: _ => sc.bits
+  | .zero, _ :: _ => 2000000
+  | .succ i, _ :: rest => s17SlotBits i rest
+
+/-- Executable trace of exactly the `stepMirStatePeriodic` schedule used by every
+closed-term checker: at each even-`fuel'` (normalizing) tick on a running state
+whose `Memory.callStack` has depth exactly `2` (`[mid, root]` suspended while
+`leaf` runs), record `(2, bits of local `slot` in the bottom-most suspended root
+caller frame)`. A `(2, v)` entry with `v` differing from the caller's pre-call
+value certifies that a normalization tick ran at `callStack` depth `2` *after* a
+cross-frame `&mut` write landed in the suspended root caller's frame (two frames
+up from the writer). -/
+def s17PeriodicTrace (body : CapturedMir) (slot : Nat) :
+    Nat → MirExecState → List (Nat × Nat) → List (Nat × Nat)
+  | 0, _, acc => acc.reverse
+  | fuel' + 1, st, acc =>
+    -- Force the tick entry with an outer `match` so the accumulator stays a
+    -- concrete cons spine (tail-recursive like `checkMirBoolExecBounded`).
+    match
+      (match Nat.beq (fuel' % 2) 0, st with
+       | true, .running s =>
+         match s.memory.callStack with
+         | [_, sf] => Option.some (2, s17SlotBits slot sf.frame.locals)
+         | _ => Option.none
+       | _, _ => Option.none)
+    with
+    | .some e =>
+      match stepMirStatePeriodic fuel' body st with
+      | .tau st' => s17PeriodicTrace body slot fuel' st' (e :: acc)
+      | .vis (.inr (.inl _)) k => s17PeriodicTrace body slot fuel' (k PUnit.unit) (e :: acc)
+      | _ => (e :: acc).reverse
+    | .none =>
+      match stepMirStatePeriodic fuel' body st with
+      | .tau st' => s17PeriodicTrace body slot fuel' st' acc
+      | .vis (.inr (.inl _)) k => s17PeriodicTrace body slot fuel' (k PUnit.unit) acc
+      | _ => acc.reverse
+
+/-- `s17PinMir` at `dischargeRustEqU32FuelFree`'s exact fuel (`16`): depth-`2`
+normalization ticks fire at entry to `s17_leaf` (`10`) and after `s17_leaf`'s
+cross-frame `&mut` write (`40`). -/
+theorem s17Pin_periodicTrace :
+    s17PeriodicTrace s17PinMir 2 16
+        (.running (initMachineStateWithCallees s17PinMir [.scalar ⟨10, 4⟩] s17FastCallees)) [] =
+      [(2, 10), (2, 40)] :=
+  rfl
+
+/-- Two `s17_mid` calls: depth-`2` normalization ticks observe the suspended
+root caller's `acc` after the first `s17_leaf` write (`40`), upon entering the
+second `s17_leaf` call after the first `s17_mid` returned (`42`), and after the
+second `s17_leaf` write (`72`). -/
+theorem s17Caller_periodicTrace :
+    s17PeriodicTrace s17CallerMir 2 64
+        (.running (initMachineStateWithCallees s17CallerMir [.scalar ⟨10, 4⟩] s17Callees)) [] =
+      [(2, 40), (2, 42), (2, 72)] :=
+  rfl
+
+/-- Three looped `s17_mid` calls: depth-`2` ticks observe iter 0 pre/post leaf
+(`10`, `40`), iter 1 post leaf (`72`), and iter 2 pre/post leaf (`74`, `104`). -/
+theorem s17LoopCaller_periodicTrace :
+    s17PeriodicTrace s17LoopCallerMir 2 96
+        (.running (initMachineStateWithCallees s17LoopCallerMir [.scalar ⟨10, 4⟩] s17Callees)) [] =
+      [(2, 10), (2, 40), (2, 72), (2, 74), (2, 104)] :=
+  rfl
+
+/-- Open-term trace: with `x` symbolic in caller slot `1`, the depth-`2`
+normalization tick still observes the cross-frame write (`acc = 40`). -/
+theorem s17SymPred_periodicTrace (x : Nat) :
+    s17PeriodicTrace s17SymPredMir 3 64
+        (.running (initMachineStateWithCallees s17SymPredMir
+          [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] s17Callees)) [] =
+      [(2, 40)] :=
+  rfl
+
+/-- Open-term looped trace: three depth-`2` round trips with symbolic `x`. -/
+theorem s17SymLoopPred_periodicTrace (x : Nat) :
+    s17PeriodicTrace s17SymLoopPredMir 3 128
+        (.running (initMachineStateWithCallees s17SymLoopPredMir
+          [.scalar ⟨x, 4⟩, .scalar ⟨10, 4⟩] s17Callees)) [] =
+      [(2, 10), (2, 40), (2, 72), (2, 74), (2, 104)] :=
+  rfl
+
+/-! ### 17f. Modular external calls with computed (thunked) arguments
+
+`s17ModCallerMir` passes a *computed* argument (`x + 3`, an arithmetic thunk over
+the running state) to the uninterpreted external callee `sym_test::s17_ext`, and
+then computes on the contract-pinned return value. `checkMirRustModularPinnedSpecLoop`
+must force `req.args` (`mapStrictList (strictValue 16)`) before feeding it to the
+callee `requires` / `ensures` pin extraction, and force the extracted
+`expectedRet` (`strictScalarInt`) before resuming the continuation. Covers both
+`dischargeRustModularContractAuto` (pinned caller) and
+`dischargeRustModularBoundedRange1Auto` (bounded caller, `x < 4`), which had no
+`by rfl` regression coverage before. -/
+
+/-- External callee `requires`: `a < 16`. -/
+def s17ExtReqMir : CapturedMir :=
+  mkMirBody "sym_test::req_s17_ext" 1
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .lt (.copy ⟨1, []⟩) (u32ConstOperand 16))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.requires "sym_test::s17_ext")
+
+/-- External callee `ensures`: `ret == 42`. -/
+def s17ExtEnsMir : CapturedMir :=
+  mkMirBody "sym_test::ens_s17_ext" 2
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨2, []⟩) (u32ConstOperand 42))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.ensures "sym_test::s17_ext")
+
+def s17ExtContract : MirCallContract where
+  pre req :=
+    And (req.defPath = "sym_test::s17_ext")
+      (And (Trusted.Sequence.length req.args = 1) (MirBoolPredicateHolds s17ExtReqMir req.args))
+  post req ans :=
+    ∃ retVal,
+      And (ans = .returned retVal req.memory)
+        (MirBoolPredicateHolds s17ExtEnsMir (req.args ++ [retVal]))
+
+/-- `fn s17_mod_caller(x: u32) -> u32 { s17_ext(x + 3) + 1 }` (unchecked adds). -/
+def s17ModCallerMir : CapturedMir :=
+  mkMirBody "sym_test::s17_mod_caller" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy, mkDecl .mut u32MirTy]
+    [ { statements :=
+          [ mkStmt (.storageLive 2)
+          , mkStmt (.assign ⟨2, []⟩ (.binaryOp .add (.copy ⟨1, []⟩) (u32ConstOperand 3)))
+          , mkStmt (.storageLive 3) ]
+        terminator :=
+          mkTerm (.call (fnConstOp "sym_test::s17_ext")
+            [.move ⟨2, []⟩] ⟨3, []⟩ (.some 1) .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .add (.copy ⟨3, []⟩) (u32ConstOperand 1)))
+          , mkStmt (.storageDead 3)
+          , mkStmt (.storageDead 2) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- Caller `ensures`: `ret == 43`. -/
+def s17ModEnsMir : CapturedMir :=
+  mkMirBody "sym_test::ens_s17_mod_caller" 2
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .eq (.copy ⟨2, []⟩) (u32ConstOperand 43))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.ensures "sym_test::s17_mod_caller")
+
+/-- Caller `requires` for the bounded variant: `x < 4`. -/
+def s17ModBoundReqMir : CapturedMir :=
+  mkMirBody "sym_test::req_s17_mod_caller" 1
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩ (.binaryOp .lt (.copy ⟨1, []⟩) (u32ConstOperand 4))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.requires "sym_test::s17_mod_caller")
+
+/-- Direct checker receipts: the forced `req.args = [x + 3]` satisfies the callee
+`requires` and pins `ret = 42` (`x = 10`); the out-of-contract argument `x = 13`
+(`req.args = [16]`) violates the callee `requires`, so the modular check fails. -/
+theorem s17ModCaller_check :
+    checkMirRustModularPinnedSpec 32 64 s17ModCallerMir (.some s17ModEnsMir)
+        "sym_test::s17_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir [.scalar ⟨10, 4⟩] = true ∧
+    checkMirRustModularPinnedSpec 32 64 s17ModCallerMir (.some s17ModEnsMir)
+        "sym_test::s17_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir [.scalar ⟨13, 4⟩] = false ∧
+    checkMirRustModularPinnedSpec 32 64 s17ModCallerMir (.some s17ModEnsMir)
+        "sym_test::s17_wrong_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir [.scalar ⟨10, 4⟩] = false :=
+  ⟨rfl, rfl, rfl⟩
+
+theorem s17ModCallerPinned_verified :
+    ModularVerificationResult
+      { body := s17ModCallerMir
+        envAssumed := s17ExtContract.holdsOn
+        pre := fun args mem =>
+          And
+            (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ReqMir args))
+            (mem = (initMachineState s17ModCallerMir args).memory)
+        post := fun args _ ret _ => MirBoolPredicateHolds s17ModEnsMir (args ++ [ret])
+        callees := [] } :=
+  dischargeRustModularContractAuto
+    s17ExtContract s17ModCallerMir _ _ 32 64
+    (.some s17ReqMir) (.some s17ModEnsMir)
+    "sym_test::s17_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir []
+
+theorem s17ModCallerBounded_verified :
+    ModularVerificationResult
+      { body := s17ModCallerMir
+        envAssumed := s17ExtContract.holdsOn
+        pre := fun args mem =>
+          And
+            (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ModBoundReqMir args))
+            (mem = (initMachineState s17ModCallerMir args).memory)
+        post := fun args _ ret _ => MirBoolPredicateHolds s17ModEnsMir (args ++ [ret])
+        callees := [] } :=
+  dischargeRustModularBoundedRange1Auto
+    s17ExtContract s17ModCallerMir _ _ 32 64
+    s17ModBoundReqMir (.some s17ModEnsMir)
+    "sym_test::s17_ext" 1 (.some s17ExtReqMir) s17ExtEnsMir []
+
+theorem s17ModCallerBounded_nonVacuous :
+    ∃ args mem, (fun args mem =>
+      And
+        (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds s17ModBoundReqMir args))
+        (mem = (initMachineState s17ModCallerMir args).memory)) args mem :=
+  ⟨[.scalar ⟨3, 4⟩], _, ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree s17ModBoundReqMir _⟩, rfl⟩
 
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 

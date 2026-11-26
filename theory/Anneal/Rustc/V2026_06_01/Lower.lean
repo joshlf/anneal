@@ -2237,30 +2237,36 @@ def strictBool : Bool → Option Bool
   | false => .some false
   | true => .some true
 
-private theorem strictBool_eq : ∀ (b : Bool), strictBool b = .some b
+theorem strictBool_eq : ∀ (b : Bool), strictBool b = .some b
   | false => rfl
   | true => rfl
 
+/--
+Binary spine normalizer for `Nat` (`k` halving rounds via `Nat.div` / `Nat.mod`).
+Kernel and `Meta.whnf` only reduce `Nat.div` / `Nat.mod` when their argument is
+closed, so callers should go through `strictBits`, which first peels a few
+successor layers structurally.
+-/
 @[reducible]
-def strictBits : Nat → Nat → Option Nat
+def strictBitsCore : Nat → Nat → Option Nat
   | .zero, n => .some n
   | .succ _, .zero => .some .zero
   | .succ _, .succ .zero => .some (.succ .zero)
   | .succ k, .succ (.succ m) =>
     let n := .succ (.succ m)
-    match strictBits k (Nat.div n 2), Nat.beq (Nat.mod n 2) 0 with
+    match strictBitsCore k (Nat.div n 2), Nat.beq (Nat.mod n 2) 0 with
     | .some q, true => .some (Nat.mul 2 q)
     | .some q, false => .some (.succ (Nat.mul 2 q))
     | .none, _ => .none
 
-theorem strictBits_eq : ∀ (k n : Nat), strictBits k n = .some n
+theorem strictBitsCore_eq : ∀ (k n : Nat), strictBitsCore k n = .some n
   | .zero, _ => rfl
   | .succ _, .zero => rfl
   | .succ _, .succ .zero => rfl
   | .succ k, .succ (.succ m) => by
-    unfold strictBits
+    unfold strictBitsCore
     dsimp only
-    rw [strictBits_eq k (Nat.div (.succ (.succ m)) 2)]
+    rw [strictBitsCore_eq k (Nat.div (.succ (.succ m)) 2)]
     cases hm : Nat.beq (Nat.mod (.succ (.succ m)) 2) 0
     · dsimp only
       have hm' : (.succ (.succ m)) % 2 ≠ 0 := fun hc => by
@@ -2274,12 +2280,52 @@ theorem strictBits_eq : ∀ (k n : Nat), strictBits k n = .some n
       change Option.some (2 * ((m + 2) / 2)) = Option.some (m + 2)
       exact congrArg Option.some (by omega)
 
+/--
+Spine-normalize a `Nat` to a canonical literal, with `k` binary halving rounds.
+
+Open-term robustness: periodic closed-term stepping (`stepMirStatePeriodic`)
+leaves up to two raw `stepMirState` increments between normalizations, so
+counters such as `StackFrame.stmtIdx`, `Memory.nextTag`, or
+`BorrowEntry.targetFrameDepth` arrive here as `Nat.succ (Nat.add (s.frame.stmtIdx) 0)`
+thunks whose *syntax* still mentions the previous state `s`. When `s` contains a
+free variable (an unused symbolic caller parameter `x`), `Meta.whnf` refuses to
+evaluate `Nat.div` / `Nat.mod` on such terms (`hasFVar`), stalling `by rfl`.
+Matching `k` first preserves `strictBits 0 x = .some x` definitionally on open
+`x`, and for `k = .succ _` `strictBits` peels up to eight `Nat.succ` layers
+structurally (covering up to seven stacked increments over an fvar-bearing
+state projection and rebinding the closed sub-numeral) before handing the
+closed remainder to `strictBitsCore`.
+-/
+@[reducible]
+def strictBits : Nat → Nat → Option Nat
+  | .zero, n => .some n
+  | .succ k, n =>
+    match n with
+    | .zero => .some .zero
+    | .succ .zero => .some 1
+    | .succ (.succ .zero) => .some 2
+    | .succ (.succ (.succ .zero)) => .some 3
+    | .succ (.succ (.succ (.succ .zero))) => .some 4
+    | .succ (.succ (.succ (.succ (.succ .zero)))) => .some 5
+    | .succ (.succ (.succ (.succ (.succ (.succ .zero))))) => .some 6
+    | .succ (.succ (.succ (.succ (.succ (.succ (.succ .zero)))))) => .some 7
+    | .succ (.succ (.succ (.succ (.succ (.succ (.succ (.succ m))))))) =>
+      strictBitsCore (.succ k) (.succ (.succ (.succ (.succ (.succ (.succ (.succ (.succ m))))))))
+
+theorem strictBits_eq : ∀ (k n : Nat), strictBits k n = .some n
+  | .zero, _ => rfl
+  | .succ k, n => by
+    rcases n with _ | _ | _ | _ | _ | _ | _ | _ | m
+    all_goals first
+      | rfl
+      | exact strictBitsCore_eq (.succ k) _
+
 @[reducible]
 def strictOpt {α : Type} : Option α → Option (Option α)
   | .none => .some .none
   | .some x => .some (.some x)
 
-private theorem strictOpt_eq {α : Type} : ∀ (o : Option α), strictOpt o = .some o
+theorem strictOpt_eq {α : Type} : ∀ (o : Option α), strictOpt o = .some o
   | .none => rfl
   | .some _ => rfl
 
@@ -2291,7 +2337,7 @@ def strictOptNat : Option Nat → Option (Option Nat)
     | .some n' => .some (.some n')
     | .none => .none
 
-private theorem strictOptNat_eq : ∀ (o : Option Nat), strictOptNat o = .some o
+theorem strictOptNat_eq : ∀ (o : Option Nat), strictOptNat o = .some o
   | .none => rfl
   | .some n => by
     unfold strictOptNat
@@ -2306,11 +2352,26 @@ def strictList {α : Type} : List α → Option (List α)
     | .some xs' => .some (x :: xs')
     | .none => .none
 
-private theorem strictList_eq {α : Type} : ∀ (xs : List α), strictList xs = .some xs
+theorem strictList_eq {α : Type} : ∀ (xs : List α), strictList xs = .some xs
   | .nil => rfl
   | _ :: xs => by
     unfold strictList
     rw [strictList_eq xs]
+
+@[reducible]
+def mapStrictList {α : Type} (f : α → Option α) : List α → Option (List α)
+  | .nil => .some .nil
+  | x :: xs =>
+    match f x, mapStrictList f xs with
+    | .some x', .some xs' => .some (x' :: xs')
+    | _, _ => .none
+
+theorem mapStrictList_eq {α : Type} (f : α → Option α) (hf : ∀ x, f x = .some x) :
+    ∀ (xs : List α), mapStrictList f xs = .some xs
+  | .nil => rfl
+  | x :: xs => by
+    unfold mapStrictList
+    rw [hf x, mapStrictList_eq f hf xs]
 
 @[reducible]
 def strictPerm : TreeBorrowPerm → Option TreeBorrowPerm
@@ -2324,7 +2385,7 @@ def strictPerm : TreeBorrowPerm → Option TreeBorrowPerm
   | .frozen => .some .frozen
   | .disabled => .some .disabled
 
-private theorem strictPerm_eq : ∀ (p : TreeBorrowPerm), strictPerm p = .some p
+theorem strictPerm_eq : ∀ (p : TreeBorrowPerm), strictPerm p = .some p
   | .cell => rfl
   | .reservedFrz b => by
     unfold strictPerm
@@ -2335,9 +2396,105 @@ private theorem strictPerm_eq : ∀ (p : TreeBorrowPerm), strictPerm p = .some p
   | .frozen => rfl
   | .disabled => rfl
 
+/--
+Spine-normalize a `ProjectionElem`: collapse `Nat` field/local/variant indices
+(`strictBits 16`), constant-index / subslice offsets and lengths (`strictBits 64`),
+and `fromEnd` flags (`strictBool`) to canonical literals, while leaving static
+`Ty` and `Option String` payloads untouched. Collapses runtime
+`.constantIndex sc.bits 0 false` and `normalizeSubsliceProjections` `Nat.add` /
+`Nat.sub` thunks before they are copied into `BorrowEntry.targetProjection`,
+`SavedCallerFrame.destination`, or subsequent `Place`s.
+-/
+@[reducible]
+def strictProjectionElem : ProjectionElem → Option ProjectionElem
+  | .deref => .some .deref
+  | .field f ty =>
+    match strictBits 16 f with
+    | .some f' => .some (.field f' ty)
+    | .none => .none
+  | .index i =>
+    match strictBits 16 i with
+    | .some i' => .some (.index i')
+    | .none => .none
+  | .constantIndex off minLen fromEnd =>
+    match strictBits 64 off, strictBits 64 minLen, strictBool fromEnd with
+    | .some off', .some minLen', .some fromEnd' => .some (.constantIndex off' minLen' fromEnd')
+    | _, _, _ => .none
+  | .subslice fromIdx toIdx fromEnd =>
+    match strictBits 64 fromIdx, strictBits 64 toIdx, strictBool fromEnd with
+    | .some fromIdx', .some toIdx', .some fromEnd' => .some (.subslice fromIdx' toIdx' fromEnd')
+    | _, _, _ => .none
+  | .downcast name v =>
+    match strictBits 16 v with
+    | .some v' => .some (.downcast name v')
+    | .none => .none
+  | .opaqueCast ty => .some (.opaqueCast ty)
+  | .unwrapUnsafeBinder ty => .some (.unwrapUnsafeBinder ty)
+
+theorem strictProjectionElem_eq : ∀ (pe : ProjectionElem), strictProjectionElem pe = .some pe
+  | .deref => rfl
+  | .field f ty => by
+    unfold strictProjectionElem
+    dsimp only
+    rw [strictBits_eq 16 f]
+  | .index i => by
+    unfold strictProjectionElem
+    dsimp only
+    rw [strictBits_eq 16 i]
+  | .constantIndex off minLen fromEnd => by
+    unfold strictProjectionElem
+    dsimp only
+    rw [strictBits_eq 64 off, strictBits_eq 64 minLen, strictBool_eq fromEnd]
+  | .subslice fromIdx toIdx fromEnd => by
+    unfold strictProjectionElem
+    dsimp only
+    rw [strictBits_eq 64 fromIdx, strictBits_eq 64 toIdx, strictBool_eq fromEnd]
+  | .downcast name v => by
+    unfold strictProjectionElem
+    dsimp only
+    rw [strictBits_eq 16 v]
+  | .opaqueCast _ => rfl
+  | .unwrapUnsafeBinder _ => rfl
+
+/-- Spine-normalize a `Place`: root local (`strictBits 16`) and every projection
+element (`mapStrictList strictProjectionElem`). -/
+@[reducible]
+def strictPlace (p : Place) : Option Place :=
+  match strictBits 16 p.local_, mapStrictList strictProjectionElem p.projection with
+  | .some loc', .some proj' => .some { local_ := loc', projection := proj' }
+  | _, _ => .none
+
+theorem strictPlace_eq (p : Place) : strictPlace p = .some p := by
+  cases p
+  unfold strictPlace
+  dsimp only
+  rw [strictBits_eq, mapStrictList_eq strictProjectionElem strictProjectionElem_eq]
+
+/-- Spine-normalize an `UnwindAction` (collapsing `narrowCallStackForTailCallee`
+head-update thunks and `.cleanup` block-index arithmetic). -/
+@[reducible]
+def strictUnwindAction : UnwindAction → Option UnwindAction
+  | .cleanup bb =>
+    match strictBits 16 bb with
+    | .some bb' => .some (.cleanup bb')
+    | .none => .none
+  | .unreachable => .some .unreachable
+  | .terminate => .some .terminate
+  | .continue_ => .some .continue_
+
+theorem strictUnwindAction_eq : ∀ (u : UnwindAction), strictUnwindAction u = .some u
+  | .cleanup bb => by
+    unfold strictUnwindAction
+    dsimp only
+    rw [strictBits_eq 16 bb]
+  | .unreachable => rfl
+  | .terminate => rfl
+  | .continue_ => rfl
+
 @[reducible]
 def strictBorrowEntry (e : BorrowEntry) : Option BorrowEntry :=
-  match strictBits 32 e.tag, strictBits 16 e.targetLocal, strictList e.targetProjection, strictPerm e.perm with
+  match strictBits 32 e.tag, strictBits 16 e.targetLocal,
+      mapStrictList strictProjectionElem e.targetProjection, strictPerm e.perm with
   | .some tag', .some loc', .some proj', .some perm' =>
     match strictBits 64 e.rangeOffset, strictBits 64 e.rangeLen, strictOptNat e.protector with
     | .some roff', .some rlen', .some prot' =>
@@ -2358,11 +2515,12 @@ def strictBorrowEntry (e : BorrowEntry) : Option BorrowEntry :=
     | _, _, _ => .none
   | _, _, _, _ => .none
 
-private theorem strictBorrowEntry_eq (e : BorrowEntry) : strictBorrowEntry e = .some e := by
+theorem strictBorrowEntry_eq (e : BorrowEntry) : strictBorrowEntry e = .some e := by
   cases e
   unfold strictBorrowEntry
   dsimp only
-  rw [strictBits_eq, strictBits_eq, strictList_eq, strictPerm_eq,
+  rw [strictBits_eq, strictBits_eq,
+      mapStrictList_eq strictProjectionElem strictProjectionElem_eq, strictPerm_eq,
       strictBits_eq, strictBits_eq, strictOptNat_eq, strictOptNat_eq,
       strictBits_eq, strictBool_eq]
 
@@ -2379,21 +2537,6 @@ theorem strictBorrows_eq : ∀ (bs : List BorrowEntry), strictBorrows bs = .some
   | e :: rest => by
     unfold strictBorrows
     rw [strictBorrowEntry_eq e, strictBorrows_eq rest]
-
-@[reducible]
-def mapStrictList {α : Type} (f : α → Option α) : List α → Option (List α)
-  | .nil => .some .nil
-  | x :: xs =>
-    match f x, mapStrictList f xs with
-    | .some x', .some xs' => .some (x' :: xs')
-    | _, _ => .none
-
-theorem mapStrictList_eq {α : Type} (f : α → Option α) (hf : ∀ x, f x = .some x) :
-    ∀ (xs : List α), mapStrictList f xs = .some xs
-  | .nil => rfl
-  | x :: xs => by
-    unfold mapStrictList
-    rw [hf x, mapStrictList_eq f hf xs]
 
 @[reducible]
 def strictValue : Nat → Value → Option Value
@@ -2466,7 +2609,7 @@ def strictSlotsAt (argCount idx : Nat) : List LocalSlot → Option (List LocalSl
       | .some v', .some rest' => .some (.init v' :: rest')
       | _, _ => .none
 
-private theorem strictSlotsAt_eq (argCount : Nat) :
+theorem strictSlotsAt_eq (argCount : Nat) :
     ∀ (idx : Nat) (ls : List LocalSlot), strictSlotsAt argCount idx ls = .some ls
   | _, .nil => rfl
   | idx, slot :: rest => by
@@ -2490,22 +2633,141 @@ def strictFrame (argCount : Nat) (f : StackFrame) : Option StackFrame :=
     .some { blockIdx := blk, stmtIdx := idx, locals := locs }
   | _, _, _ => .none
 
-private theorem strictFrame_eq (argCount : Nat) (f : StackFrame) :
+theorem strictFrame_eq (argCount : Nat) (f : StackFrame) :
     strictFrame argCount f = .some f := by
   cases f
   unfold strictFrame
   dsimp only
   rw [strictBits_eq, strictBits_eq, strictSlotsAt_eq]
 
+/--
+Force the outer `CapturedMir.mk` constructor head in O(1) without traversing
+any static MIR payloads (`basicBlocks`, `localDecls`, `layouts`, `allocations`,
+`fnAbi`, etc.).
+
+Call-by-name `whnf` leak prevention: when an inline callee returns, `MirSemantics`
+sets `Memory.activeCallee := .some sf.callerBody`. Leaving `sf.callerBody` or
+`m.activeCallee` unforced keeps a projection thunk `SavedCallerFrame.callerBody s_prev`
+that retains the entire prior `MachineState`, causing exponential blowup across
+multi-iteration inline-call loops (`loop -> mid -> leaf`). Matching the outer
+`CapturedMir.mk` constructor collapses that projection immediately to the static
+body record while leaving every field payload untouched.
+-/
+@[reducible]
+def strictCapturedMirHead (b : CapturedMir) : Option CapturedMir :=
+  CapturedMir.casesOn (motive := fun _ => Option CapturedMir) b
+    (fun defPath phase role argCount localDecls basicBlocks fnAbi layouts allocations
+        typeParamCount genericParams traitImpls =>
+      .some (.mk defPath phase role argCount localDecls basicBlocks fnAbi layouts allocations
+        typeParamCount genericParams traitImpls))
+
+theorem strictCapturedMirHead_eq (b : CapturedMir) : strictCapturedMirHead b = .some b :=
+  rfl
+
+/-- Spine-normalize `Option CapturedMir` by forcing the outer `CapturedMir.mk`
+constructor head on `.some b` without traversing static payloads. -/
+@[reducible]
+def strictOptCapturedMirHead : Option CapturedMir → Option (Option CapturedMir)
+  | .none => .some .none
+  | .some b =>
+    match strictCapturedMirHead b with
+    | .some b' => .some (.some b')
+    | .none => .none
+
+theorem strictOptCapturedMirHead_eq :
+    ∀ (o : Option CapturedMir), strictOptCapturedMirHead o = .some o
+  | .none => rfl
+  | .some _ => rfl
+
+/--
+Spine-normalize a suspended caller frame on `Memory.callStack`.
+
+The caller `StackFrame` is normalized with `strictFrame cb'.argCount`
+(NOT `strictFrame 0`), matching `stepMirStateStrict`'s `callee.argCount` /
+`body.argCount` invariant: caller parameter slots `1 ≤ idx ≤ argCount` are left
+untouched so open-term calls with unused symbolic caller parameters never stall
+on `strictBits 128 x` in WHNF while the caller frame is suspended. The outer
+`CapturedMir.mk` head of `sf.callerBody` is forced in O(1) via
+`strictCapturedMirHead` to prevent `SavedCallerFrame.callerBody` projection
+thunks from retaining prior `MachineState`s across repeated inline calls, while
+preserving all static body fields verbatim.
+-/
+@[reducible]
+def strictSavedCallerFrame (sf : SavedCallerFrame) : Option SavedCallerFrame :=
+  match strictCapturedMirHead sf.callerBody with
+  | .none => .none
+  | .some cb' =>
+    match strictFrame cb'.argCount sf.frame, strictPlace sf.destination,
+        strictBits 16 sf.returnTarget, strictOptNat sf.callerProtector with
+    | .some fr', .some dest', .some rt', .some cp' =>
+      match mapStrictList (strictBits 32) sf.calleeProtectors,
+          strictUnwindAction sf.returnUnwind, strictBool sf.isDiverging with
+      | .some cps', .some ru', .some div' =>
+        .some
+          { callerBody := cb'
+            frame := fr'
+            destination := dest'
+            returnTarget := rt'
+            callerProtector := cp'
+            calleeProtectors := cps'
+            returnUnwind := ru'
+            isDiverging := div' }
+      | _, _, _ => .none
+    | _, _, _, _ => .none
+
+theorem strictSavedCallerFrame_eq (sf : SavedCallerFrame) :
+    strictSavedCallerFrame sf = .some sf := by
+  cases sf
+  unfold strictSavedCallerFrame
+  dsimp only
+  rw [strictFrame_eq, strictPlace_eq, strictBits_eq, strictOptNat_eq,
+      mapStrictList_eq (strictBits 32) (strictBits_eq 32),
+      strictUnwindAction_eq, strictBool_eq]
+
+/-- Spine-normalize every suspended caller frame on `Memory.callStack`. -/
+@[reducible]
+def strictCallStack : List SavedCallerFrame → Option (List SavedCallerFrame)
+  | .nil => .some .nil
+  | sf :: rest =>
+    match strictSavedCallerFrame sf, strictCallStack rest with
+    | .some sf', .some rest' => .some (sf' :: rest')
+    | _, _ => .none
+
+theorem strictCallStack_eq :
+    ∀ (cs : List SavedCallerFrame), strictCallStack cs = .some cs
+  | .nil => rfl
+  | sf :: rest => by
+    unfold strictCallStack
+    rw [strictSavedCallerFrame_eq sf, strictCallStack_eq rest]
+
+/-- Spine-normalize a reified function-pointer table entry (collapsing
+`nextFnPtrAllocId` arithmetic thunks from `internFnPtr`) while keeping the
+static `defPath`. -/
+@[reducible]
+def strictFnPtrEntry (e : FnPtrEntry) : Option FnPtrEntry :=
+  match strictBits 64 e.allocId, strictList e.typeArgs, strictOpt e.fnSig with
+  | .some aid', .some targs', .some sig' =>
+    .some { allocId := aid', defPath := e.defPath, typeArgs := targs', fnSig := sig' }
+  | _, _, _ => .none
+
+theorem strictFnPtrEntry_eq (e : FnPtrEntry) : strictFnPtrEntry e = .some e := by
+  cases e
+  unfold strictFnPtrEntry
+  dsimp only
+  rw [strictBits_eq, strictList_eq, strictOpt_eq]
+
 @[reducible]
 def strictMemory (m : Memory) : Option Memory :=
   match strictBits 32 m.nextAllocId, strictList m.globals, strictBorrows m.borrows, strictBits 32 m.nextTag with
   | .some naid, .some glob, .some bor, .some nt =>
-    match strictList m.callees, strictList m.traitImpls, strictList m.callStack, strictOpt m.activeCallee with
+    match strictList m.callees, strictList m.traitImpls, strictCallStack m.callStack,
+        strictOptCapturedMirHead m.activeCallee with
     | .some cal, .some ti, .some cs, .some ac =>
-      match strictList m.activeProtectors, strictBits 32 m.nextProtector, strictSlotsAt 0 0 m.callerLocals with
+      match mapStrictList (strictBits 32) m.activeProtectors, strictBits 32 m.nextProtector,
+          strictSlotsAt 0 0 m.callerLocals with
       | .some ap, .some np, .some cl =>
-        match strictList m.fnPtrs, strictList m.exposedAllocIds, strictBool m.rootUnwindCeiling with
+        match mapStrictList strictFnPtrEntry m.fnPtrs, mapStrictList (strictBits 64) m.exposedAllocIds,
+            strictBool m.rootUnwindCeiling with
         | .some fp, .some ea, .some ruc =>
           .some
             { nextAllocId := naid, globals := glob, borrows := bor, nextTag := nt,
@@ -2518,13 +2780,15 @@ def strictMemory (m : Memory) : Option Memory :=
     | _, _, _, _ => .none
   | _, _, _, _ => .none
 
-private theorem strictMemory_eq (m : Memory) : strictMemory m = .some m := by
+theorem strictMemory_eq (m : Memory) : strictMemory m = .some m := by
   cases m
   unfold strictMemory
   dsimp only
   rw [strictBits_eq, strictList_eq, strictBorrows_eq, strictBits_eq,
-      strictList_eq, strictList_eq, strictList_eq, strictOpt_eq,
-      strictList_eq, strictBits_eq, strictSlotsAt_eq, strictList_eq, strictList_eq,
+      strictList_eq, strictList_eq, strictCallStack_eq, strictOptCapturedMirHead_eq,
+      mapStrictList_eq (strictBits 32) (strictBits_eq 32), strictBits_eq, strictSlotsAt_eq,
+      mapStrictList_eq strictFnPtrEntry strictFnPtrEntry_eq,
+      mapStrictList_eq (strictBits 64) (strictBits_eq 64),
       strictBool_eq]
 
 @[reducible]
@@ -2533,7 +2797,7 @@ def strictMachineState (argCount : Nat) (s : MachineState) : Option MachineState
   | .some f', .some m' => .some { frame := f', memory := m' }
   | _, _ => .none
 
-private theorem strictMachineState_eq (argCount : Nat) (s : MachineState) :
+theorem strictMachineState_eq (argCount : Nat) (s : MachineState) :
     strictMachineState argCount s = .some s := by
   cases s
   unfold strictMachineState
