@@ -5194,7 +5194,6 @@ theorem absVal_refineSgtConst_sound_any {w x boundBits : Nat} {a : AbsVal}
     dsimp only [AbsVal.refineSgtConst]
     rw [hw, hai, hB]
     exact ha
---END
 
 /-- Refine `env` using `RelGuard` `g` assuming boolean outcome `branchVal`.
 Register-register guards refine both operands symmetrically (across `.uint`,

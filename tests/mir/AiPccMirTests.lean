@@ -1460,6 +1460,290 @@ theorem stride4_auto_verificationResult :
         subst hD
         exact uint_valDenote_exact rfl hDen)
 
+/-- Stateful audited claim for `signedClampAddBody` via `AutoProve`:
+any root-entry memory and valid `i32` argument preserves `MirMemFrame` and
+returns an in-range `i32` (`AutoRetOk`). -/
+def signedClampAddStatefulClaim : Trusted.VerificationResult.StatefulClaim where
+  body := signedClampAddBody
+  pre args mem :=
+    mem.callStack = [] ∧ mem.activeCallee = none ∧
+    mem.activeProtectors = [] ∧ AutoProve.ValidEntryArgs signedClampAddBody args
+  post _ mem retVal mem' :=
+    MirMemFrame mem' mem ∧ AutoProve.AutoRetOk signedClampAddBody retVal
+
+/-- `StatefulVerificationResult signedClampAddStatefulClaim` by one `rfl`. -/
+theorem signedClampAdd_statefulVerificationResult :
+    Trusted.VerificationResult.StatefulVerificationResult
+      signedClampAddStatefulClaim :=
+  AutoProve.statefulVerificationResult_of_autoVerifyAcyclic rfl
+    (fun _ _ h => h)
+    (fun _ _ _ _ _ hFrame hRet => ⟨hFrame, hRet⟩)
+
+/-- Trace audited claim for `signedClampAddBody` via `AutoProve`: every
+reachable return is `.normal (retVal, mem')` along an observation-only trace
+preserving `MirMemFrame`. -/
+def signedClampAddTraceClaim : Trusted.VerificationResult.TraceClaim where
+  body := signedClampAddBody
+  pre args mem :=
+    mem.callStack = [] ∧ mem.activeCallee = none ∧
+    mem.activeProtectors = [] ∧ AutoProve.ValidEntryArgs signedClampAddBody args
+  post _ mem tr out :=
+    TraceObsOnly tr ∧
+    ∃ retVal mem', out = .normal (retVal, mem') ∧
+      MirMemFrame mem' mem ∧ AutoProve.AutoRetOk signedClampAddBody retVal
+
+/-- `TraceVerificationResult signedClampAddTraceClaim` by one `rfl`. -/
+theorem signedClampAdd_traceVerificationResult :
+    Trusted.VerificationResult.TraceVerificationResult
+      signedClampAddTraceClaim :=
+  AutoProve.traceVerificationResult_of_autoVerifyAcyclic rfl
+    (fun _ _ h => h)
+    (fun _ _ _ retVal mem' _ hTr hFrame hRet =>
+      ⟨hTr, retVal, mem', rfl, hFrame, hRet⟩)
+
+/-- `VerificationResult` for `lateJoinDiamondBody` using an explicit
+non-default topological schedule `[0, 2, 3, 1]` via
+`AutoProve.bodyVerified_of_autoVerifyAcyclicOrder`. -/
+theorem lateJoinDiamond_explicitOrder_verificationResult :
+    Trusted.VerificationResult.VerificationResult
+      (AutoProve.autoClaim lateJoinDiamondBody) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclicOrder (rpoOrder := [0, 2, 3, 1]) rfl
+
+/-- `fn(b: bool) -> bool { !b }` exercising `AutoProve` on `bool` arguments
+and return values. -/
+def boolNotBody : CapturedMir :=
+  canaryBody "ai_pcc_tests::bool_not" 1 [canaryBoolTy, canaryBoolTy]
+    [canaryBlock [.assign (canaryPlace 0) (.unaryOp .not (canaryCopy 1))]
+      .return_]
+
+/-- `boolNotBody` is verified for every `bool` argument (witnessing non-vacuity
+of `ValidEntryArgs` on `bool`). -/
+theorem boolNot_auto_safe (b : Bool) :
+    SafeFrom boolNotBody (initMachineState boolNotBody [.scalar (boolToScalar b)]) ∧
+    (∀ v, ReturnsFrom boolNotBody
+        (initMachineState boolNotBody [.scalar (boolToScalar b)]) v →
+      AutoProve.AutoRetOk boolNotBody v) ∧
+    MirNoUBTree (mirCallTree boolNotBody [.scalar (boolToScalar b)]) :=
+  AutoProve.autoVerifyAcyclic_sound rfl ⟨⟨b, rfl⟩, rfl⟩
+
+/-- Trusted `VerificationResult` for `boolNotBody` by one `rfl`. -/
+theorem boolNot_verificationResult :
+    Trusted.VerificationResult.VerificationResult (AutoProve.autoClaim boolNotBody) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic rfl
+
+/-- `fn(u: ()) -> () { u }` exercising `AutoProve` on unit `()` arguments and
+return values. -/
+def unitIdBody : CapturedMir :=
+  let unitTy : Ty := { kind := .tuple [], layoutIdx := 0 }
+  canaryBody "ai_pcc_tests::unit_id" 1 [unitTy, unitTy]
+    [canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1))] .return_]
+
+/-- `unitIdBody` is verified for both `Value.unit` and `Value.aggregate 0 []`
+(witnessing non-vacuity of `ValidEntryArgs` on `()`). -/
+theorem unitId_auto_safe :
+    (SafeFrom unitIdBody (initMachineState unitIdBody [.unit]) ∧
+      (∀ v, ReturnsFrom unitIdBody (initMachineState unitIdBody [.unit]) v →
+        AutoProve.AutoRetOk unitIdBody v) ∧
+      MirNoUBTree (mirCallTree unitIdBody [.unit])) ∧
+    (SafeFrom unitIdBody (initMachineState unitIdBody [.aggregate 0 []]) ∧
+      (∀ v, ReturnsFrom unitIdBody
+          (initMachineState unitIdBody [.aggregate 0 []]) v →
+        AutoProve.AutoRetOk unitIdBody v) ∧
+      MirNoUBTree (mirCallTree unitIdBody [.aggregate 0 []])) :=
+  ⟨AutoProve.autoVerifyAcyclic_sound rfl ⟨Or.inl rfl, rfl⟩,
+   AutoProve.autoVerifyAcyclic_sound rfl ⟨Or.inr rfl, rfl⟩⟩
+
+/-- Trusted `VerificationResult` for `unitIdBody` by one `rfl`. -/
+theorem unitId_verificationResult :
+    Trusted.VerificationResult.VerificationResult (AutoProve.autoClaim unitIdBody) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic rfl
+
+/-- `fn(x: i8) -> i8`: if `-100 <= x && hi >= x` (using constant-on-left
+comparison `hi >= x`), compute `(res, ov) = x.overflowing_add(10)`,
+`assert(!ov)`, and return `res`. -/
+def straddlingCheckedAddConstLBody (hi : Nat) : CapturedMir :=
+  let pairTy : Ty := { kind := .tuple [.int .i8, .bool], layoutIdx := 0 }
+  canaryBody "ai_pcc_tests::straddling_checked_add_const_l" 1
+    [canaryIntTy .i8, canaryIntTy .i8, canaryBoolTy, canaryBoolTy, pairTy, canaryBoolTy]
+    [ canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.binaryOp .le (canaryIConst .i8 156) (canaryCopy 1))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 4)], 1⟩),
+      canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.binaryOp .ge (canaryIConst .i8 hi) (canaryCopy 1))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 4)], 2⟩),
+      canaryBlock [.storageLive 4, .storageLive 5,
+        .assign (canaryPlace 4)
+          (.binaryOp .addWithOverflow (canaryCopy 1) (canaryIConst .i8 10)),
+        .assign (canaryPlace 5)
+          (.use (.copy { local_ := 4, projection := [.field 1 canaryBoolTy] }))]
+        (.assert (canaryCopy 5) false 3 .continue_),
+      canaryBlock [
+        .assign (canaryPlace 0)
+          (.use (.copy { local_ := 4, projection := [.field 0 (canaryIntTy .i8)] }))]
+        .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn(x: i8, y: i8) -> i8`: when `loX <= x` and `loY <= y <= hiY`, compute
+`x / y`. -/
+def guardedSignedDivRangeBody (loX loY hiY : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::guarded_signed_div_range" 2
+    [canaryIntTy .i8, canaryIntTy .i8, canaryIntTy .i8,
+     canaryBoolTy, canaryBoolTy, canaryBoolTy]
+    [ canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.binaryOp .ge (canaryCopy 1) (canaryIConst .i8 loX))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 4)], 1⟩),
+      canaryBlock [.storageLive 4,
+        .assign (canaryPlace 4)
+          (.binaryOp .ge (canaryCopy 2) (canaryIConst .i8 loY))]
+        (.switchInt (canaryCopy 4) ⟨[(0, 4)], 2⟩),
+      canaryBlock [.storageLive 5,
+        .assign (canaryPlace 5)
+          (.binaryOp .le (canaryCopy 2) (canaryIConst .i8 hiY))]
+        (.switchInt (canaryCopy 5) ⟨[(0, 4)], 3⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .div (canaryCopy 1) (canaryCopy 2))] .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- Adversarial edge-case regression suite: sign-straddling checked arithmetic
+with constant-on-left guards, extreme `INT_MIN`/`INT_MAX` comparison trap
+pruning, signed division by negative intervals, `i8::MIN * -1`, mixed
+`u128 << i8` negative shifts, missing lower-bound shift guards, non-exact
+negative widening, `(-i8::MIN) - 1`, `!0i8 + i8::MIN`, unsigned `.neg`, and
+disconnected cycles. -/
+theorem signed_adversarial_edge_cases :
+    -- Sign-straddling `[-100, 117] + 10` passes `addWithOverflow` + `assert(!.1)`;
+    -- `[-100, 118] + 10` can overflow `128` and is rejected.
+    AutoProve.autoVerifyAcyclic (straddlingCheckedAddConstLBody 117) = true ∧
+    AutoProve.autoVerifyAcyclic (straddlingCheckedAddConstLBody 118) = false ∧
+    -- Extreme comparisons `x < i8::MIN` and `x > i8::MAX` are statically false,
+    -- pruning unreachable trap blocks.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::extreme_lt_min" 1
+        [canaryIntTy .i8, canaryIntTy .i8, canaryBoolTy]
+        [ canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.binaryOp .lt (canaryCopy 1) (canaryIConst .i8 128))]
+            (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+          canaryBlock [] .unreachable,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+            .return_ ]) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::extreme_gt_max" 1
+        [canaryIntTy .i8, canaryIntTy .i8, canaryBoolTy]
+        [ canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.binaryOp .gt (canaryCopy 1) (canaryIConst .i8 127))]
+            (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+          canaryBlock [] .unreachable,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+            .return_ ]) = true ∧
+    -- Signed division by negative intervals:
+    -- `[-128, 127] / [-2, -1]` admits `MIN / -1` -> false;
+    -- `[-127, 127] / [-2, -1]` excludes `MIN` -> true;
+    -- `[-128, 127] / [-3, -2]` excludes `-1` and `0` -> true;
+    -- `[-128, 127] / [-1, 1]` admits `0` -> false.
+    AutoProve.autoVerifyAcyclic (guardedSignedDivRangeBody 128 254 255) = false ∧
+    AutoProve.autoVerifyAcyclic (guardedSignedDivRangeBody 129 254 255) = true ∧
+    AutoProve.autoVerifyAcyclic (guardedSignedDivRangeBody 128 253 254) = true ∧
+    AutoProve.autoVerifyAcyclic (guardedSignedDivRangeBody 128 255 1) = false ∧
+    -- `i8::MIN.unchecked_mul(-1)` overflows.
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .mulUnchecked (canaryIConst .i8 128) (canaryIConst .i8 255))]
+        .return_) = false ∧
+    -- Mixed `u128.unchecked_shl(-128i8)` and `u128.unchecked_shl(-1i8)` fail closed.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::u128_shl_i8min" 1
+        [canaryUintTy .u128, canaryUintTy .u128]
+        [canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .shlUnchecked (canaryCopy 1) (canaryIConst .i8 128))]
+          .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::u128_shl_i8neg1" 1
+        [canaryUintTy .u128, canaryUintTy .u128]
+        [canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .shlUnchecked (canaryCopy 1) (canaryIConst .i8 255))]
+          .return_]) = false ∧
+    -- Signed shift guard `y < 8` without `y >= 0` allows negative `y` -> rejected.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::shl_lt8_only" 2
+        [canaryIntTy .i8, canaryIntTy .i8, canaryIntTy .i8, canaryBoolTy]
+        [ canaryBlock [.storageLive 3,
+            .assign (canaryPlace 3)
+              (.binaryOp .lt (canaryCopy 2) (canaryIConst .i8 8))]
+            (.switchInt (canaryCopy 3) ⟨[(0, 2)], 1⟩),
+          canaryBlock [.assign (canaryPlace 0)
+            (.binaryOp .shlUnchecked (canaryCopy 1) (canaryCopy 2))] .return_,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+            .return_ ]) = false ∧
+    -- Non-exact negative `i8 -> i32` widening falls back to `topInit`, so a
+    -- subsequent `unchecked_add(1)` is soundly rejected.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::neg_widen_add" 1
+        [canaryIntTy .i32, canaryIntTy .i8, canaryBoolTy, canaryIntTy .i32]
+        [ canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.binaryOp .lt (canaryCopy 1) (canaryIConst .i8 0))]
+            (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+          canaryBlock [.storageLive 3,
+            .assign (canaryPlace 3)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 3) (canaryIConst .i32 1))]
+            .return_,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i32 0))]
+            .return_ ]) = false ∧
+    -- `(-i8::MIN).unchecked_sub(1)` wraps `-i8::MIN` to `i8::MIN` and overflows.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::neg_min_sub1" 0
+        [canaryIntTy .i8, canaryIntTy .i8]
+        [canaryBlock [.storageLive 1,
+          .assign (canaryPlace 1) (.unaryOp .neg (canaryIConst .i8 128)),
+          .assign (canaryPlace 0)
+            (.binaryOp .subUnchecked (canaryCopy 1) (canaryIConst .i8 1))]
+          .return_]) = false ∧
+    -- `(!0i8).unchecked_add(i8::MIN)` overflows (`-1 + -128`), whereas
+    -- `(!(-1i8)).unchecked_add(i8::MAX)` is `0 + 127` and succeeds.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::not0_add_min" 0
+        [canaryIntTy .i8, canaryIntTy .i8]
+        [canaryBlock [.storageLive 1,
+          .assign (canaryPlace 1) (.unaryOp .not (canaryIConst .i8 0)),
+          .assign (canaryPlace 0)
+            (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i8 128))]
+          .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::not_neg1_add_max" 0
+        [canaryIntTy .i8, canaryIntTy .i8]
+        [canaryBlock [.storageLive 1,
+          .assign (canaryPlace 1) (.unaryOp .not (canaryIConst .i8 255)),
+          .assign (canaryPlace 0)
+            (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i8 127))]
+          .return_]) = true ∧
+    -- Unsigned `.neg` on `u32` and `usize` fails closed.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::neg_u32" 1 [canaryUintTy .u32, canaryUintTy .u32]
+        [canaryBlock [.assign (canaryPlace 0) (.unaryOp .neg (canaryCopy 1))]
+          .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::neg_usize" 1 [canaryUintTy .usize, canaryUintTy .usize]
+        [canaryBlock [.assign (canaryPlace 0) (.unaryOp .neg (canaryCopy 1))]
+          .return_]) = false ∧
+    -- A body containing a disconnected cycle (`bb1 <-> bb2`) is rejected by
+    -- `autoVerifyAcyclic` (`validRpoSchedule` requires a full DAG order).
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::disconnected_cycle" 0 [canaryUintTy .u8]
+        [ canaryBlock [.assign (canaryPlace 0) (.use (canaryUConst .u8 0))] .return_,
+          canaryBlock [] (.goto 2),
+          canaryBlock [] (.goto 1) ]) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl, rfl, rfl, rfl⟩
+
 /--
 info: 'Anneal.AiPccMirTests.signedClampAdd_auto_safe' depends on axioms:
 [propext, Quot.sound]
@@ -1473,6 +1757,41 @@ info: 'Anneal.AiPccMirTests.signedClampAdd_verificationResult' depends on axioms
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms signedClampAdd_verificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.signedClampAdd_statefulVerificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedClampAdd_statefulVerificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.signedClampAdd_traceVerificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedClampAdd_traceVerificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.lateJoinDiamond_explicitOrder_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms lateJoinDiamond_explicitOrder_verificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.boolNot_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms boolNot_verificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.unitId_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms unitId_verificationResult
 
 /--
 info: 'Anneal.AiPccMirTests.stride4_auto_verificationResult' depends on axioms:
