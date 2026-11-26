@@ -1030,7 +1030,7 @@ theorem bitwiseOrBits_aligned_bounded_injective {w k a₁ b₁ a₂ b₂ : Nat} 
   rw [bitwiseOrBits_eq_or, bitwiseOrBits_eq_or] at h
   have r := Anneal.BitVec.aligned_or_bounded_injective
     (a₁ := BitVec.ofNat w a₁) (b₁ := BitVec.ofNat w b₁)
-    (a₂ := BitVec.ofNat w a₂) (b₂ := BitVec.ofNat w b₂) hk
+    (a₂ := BitVec.ofNat w a₂) (b₂ := BitVec.ofNat w b₂)
     (by rw [t ha₁]; exact hal₁) (by rw [t ha₂]; exact hal₂)
     (by rw [t hb₁w]; exact hb₁) (by rw [t hb₂w]; exact hb₂)
     (Anneal.BitVec.eq_of_toNat_eq h)
