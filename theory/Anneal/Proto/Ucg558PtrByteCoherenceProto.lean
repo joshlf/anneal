@@ -1362,7 +1362,7 @@ theorem coherentOpt2_none_of_missing_frag (n : Nat) (l : List AbstractByteOpt2) 
   | some q => cases q; rfl
 
 /-- **Option 2 fails closed on orphan fragment without provenance (universal):** the
-incoherent state `.init b none (some m)` admitted by Option 2 strips provenance. -/
+incoherent state `.init b none (some m)` permitted by Option 2 strips provenance. -/
 theorem coherentOpt2_none_of_orphan_frag (n : Nat) (l : List AbstractByteOpt2) (i : Nat)
     (b : UInt8) (m : PtrByteFragMeta) (hx : l[i]? = some (.init b none (some m))) :
     abstractBytesCoherentPtrProvOpt2 n l = none := by
@@ -2740,6 +2740,65 @@ theorem typed_encode_decode_roundtrip (n : Nat) (hn : 0 < n) (bits len : Nat)
       haveFrag_plain, Bool.not_false, dataBytesProto_plain, leValue_leImage, Nat.pow_one,
       Nat.mod_eq_of_lt hb1]
 
+/-- **Universal typed codec round-trip for remaining `TyProto` constructors:** covers raw thin
+pointers (both provenance-carrying `.ptr` and provenance-less `.scalar`), wide `&str` and
+`*const dyn Trait`, `[u8; 2]` arrays, and `MaybeUninit<inner>` raw byte overlays (including
+uninitialized or invalid bit patterns of exact width). -/
+theorem typed_encode_decode_roundtrip_ext (n : Nat) (hn : 0 < n) (bits len : Nat)
+    (p vt : ProvenancePtrProto) (b₀ b₁ : UInt8) (inner : TyProto) (bs : List AbstractByteProto)
+    (hbits : bits < 256 ^ n) (hlen : len < 256 ^ n)
+    (hp : p.offsetBytes < 256 ^ n) (hvt : vt.offsetBytes < 256 ^ n)
+    (hbs : bs.length = inner.sizeBytes n) :
+    (encodeValueToBytesProto n (.rawPtr .thin) (.ptr p n)).bind
+        (decodeTypedValueFromBytesProto n (.rawPtr .thin)) = some (.ptr p n) ∧
+    (encodeValueToBytesProto n (.rawPtr .thin) (.scalar bits n)).bind
+        (decodeTypedValueFromBytesProto n (.rawPtr .thin)) = some (.scalar bits n) ∧
+    (encodeValueToBytesProto n (.ref .str) (.aggregate [.ptr p n, .scalar len n])).bind
+        (decodeTypedValueFromBytesProto n (.ref .str)) =
+      some (.aggregate [.ptr p n, .scalar len n]) ∧
+    (encodeValueToBytesProto n (.rawPtr .dyn) (.aggregate [.ptr p n, .ptr vt n])).bind
+        (decodeTypedValueFromBytesProto n (.rawPtr .dyn)) =
+      some (.aggregate [.ptr p n, .ptr vt n]) ∧
+    (encodeValueToBytesProto n (.array (.uint 1) 2)
+        (.aggregate [.scalar b₀.toNat 1, .scalar b₁.toNat 1])).bind
+        (decodeTypedValueFromBytesProto n (.array (.uint 1) 2)) =
+      some (.aggregate [.scalar b₀.toNat 1, .scalar b₁.toNat 1]) ∧
+    (encodeValueToBytesProto n (.maybeUninit inner) (.rawBytes bs)).bind
+        (decodeTypedValueFromBytesProto n (.maybeUninit inner)) = some (.rawBytes bs) := by
+  have hb₀ : b₀.toNat < 256 := UInt8.toNat_lt b₀
+  have hb₁ : b₁.toNat < 256 := UInt8.toNat_lt b₁
+  have hraw_sc := (decode_plain_no_forge bits n hn hbits).1
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp only [encodeValueToBytesProto, encodePtrValueProto, encodeThinPtrValueProto,
+      nat_beq_zero_of_pos hn, Bool.not_false, Nat.beq_refl, Bool.and_self, Option.bind_some,
+      decodeTypedValueFromBytesProto, decode_encode_thin_exact false p n hn hp]
+  · simp only [encodeValueToBytesProto, encodePtrValueProto, encodeThinPtrValueProto,
+      nat_beq_zero_of_pos hn, Bool.not_false, Nat.beq_refl, nat_blt_eq_true_of_lt hbits,
+      Bool.and_self, Option.bind_some, hraw_sc]
+  · simp only [encodeValueToBytesProto, encodePtrValueProto, encodeThinPtrValueProto,
+      nat_beq_zero_of_pos hn, Bool.not_false, Nat.beq_refl, nat_blt_eq_true_of_lt hlen,
+      Bool.and_self, Option.bind_some, decodeTypedValueFromBytesProto,
+      decode_encode_str_exact true p len n hn hp hlen]
+  · simp only [encodeValueToBytesProto, encodePtrValueProto, encodeThinPtrValueProto,
+      nat_beq_zero_of_pos hn, Bool.not_false, Nat.beq_refl, Bool.and_self, Option.bind_some,
+      decodeTypedValueFromBytesProto, decode_encode_dyn_exact false p vt n hn hp hvt]
+  · have hu₀ : UInt8.ofNat b₀.toNat = b₀ :=
+      UInt8.toNat_inj.mp (by rw [UInt8.toNat_ofNat', Nat.mod_eq_of_lt hb₀])
+    have hu₁ : UInt8.ofNat b₁.toNat = b₁ :=
+      UInt8.toNat_inj.mp (by rw [UInt8.toNat_ofNat', Nat.mod_eq_of_lt hb₁])
+    simp only [encodeValueToBytesProto, encodeListProto, List.length_cons, List.length_nil,
+      Nat.pow_one, Nat.beq_refl, nat_blt_eq_true_of_lt hb₀, nat_blt_eq_true_of_lt hb₁,
+      Bool.and_self, encodeLittleEndianBytesProto, leImage, List.map_cons, List.map_nil,
+      List.cons_append, List.nil_append, hu₀, hu₁, Option.bind_some]
+    simp only [decodeTypedValueFromBytesProto, TyProto.sizeBytes, decodeChunksProto,
+      List.take_succ_cons, List.take_zero, List.drop_succ_cons, List.drop_zero,
+      show AbstractByteProto.init b₀ none = mkInitByte b₀ from rfl,
+      show AbstractByteProto.init b₁ none = mkInitByte b₁ from rfl,
+      decodePlainInt_byte]
+    rfl
+  · simp only [encodeValueToBytesProto, hbs, Nat.beq_refl, Option.bind_some,
+      decodeTypedValueFromBytesProto]
+
 /-! ### Global allocation relocation fragment prototype (`globalAllocBytesAux` fix) -/
 
 /-- Parameterized global relocation lookup returning `(relocStartOffset, targetPtr)` when
@@ -2912,7 +2971,7 @@ theorem decode_splice_ref_none_raw_scalar (p₁ p₂ : ProvenancePtrProto) (n k 
 ANY single byte `k < n` of an encoded pointer with a plain `u8` (e.g. via `union { p: *const u8,
 b: [u8; 8] }`, even writing back the identical numeric byte value!) strips provenance: reading as
 `&T` / `fnPtr` is UB and reading as `*const T` yields only the bare scalar address. -/
-theorem partial_byte_overwrite_strips_ptr (p : ProvenancePtrProto) (n k : Nat) (b : UInt8)
+theorem single_byte_overwrite_strips_ptr (p : ProvenancePtrProto) (n k : Nat) (b : UInt8)
     (hk : k < n) :
     ∃ buf₁,
       writeBytesProto (encodePtrBytesProto p n) k [mkInitByte b] = some buf₁ ∧
@@ -3108,6 +3167,173 @@ theorem coherent_none_of_live06_ref_none (n : Nat) (l : List AbstractByteProto)
   | none => rfl
   | some p => rw [live06_accepts_of_coherent true n l p hc] at h; exact absurd h (by simp)
 
+theorem toLive06_plain (bits k : Nat) :
+    (encodeLittleEndianBytesProto bits k).map AbstractByteProto.toLive06 =
+      Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes bits k none := by
+  induction k generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp only [encodeLittleEndianBytesProto, leImage, List.map_cons, AbstractByteProto.toLive06,
+      provPair?, Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes] at ih ⊢
+    rw [ih]
+    rfl
+
+theorem live06_takeAbstractBytes_append (n : Nat)
+    (l₁ l₂ : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) (h : l₁.length = n) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.takeAbstractBytes n (l₁ ++ l₂) = l₁ := by
+  subst h
+  induction l₁ with
+  | nil => rfl
+  | cons x rest ih =>
+    simp only [List.length_cons, List.cons_append,
+      Trusted.Rustc.V2026_06_01.MirSemantics.takeAbstractBytes, ih]
+
+theorem live06_dropAbstractBytes_append (n : Nat)
+    (l₁ l₂ : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) (h : l₁.length = n) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.dropAbstractBytes n (l₁ ++ l₂) = l₂ := by
+  subst h
+  induction l₁ with
+  | nil => rfl
+  | cons x rest ih =>
+    simp only [List.length_cons, List.cons_append, ih]
+
+theorem live06_haveProv_plain (bits k : Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesHaveProv
+      (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes bits k none) = false := by
+  induction k generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesHaveProv, ih]
+
+theorem live06_decodeLE_plain (bits k : Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeLittleEndianBytes
+      (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes bits k none) =
+      some (bits % 256 ^ k, none) := by
+  induction k generalizing bits with
+  | zero =>
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodeLittleEndianBytes, Nat.pow_zero,
+      Nat.mod_one]
+  | succ k ih =>
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodeLittleEndianBytes, ih,
+      Trusted.Rustc.V2026_06_01.MirSemantics.mergeByteProvenance]
+    rw [show (UInt8.ofNat bits).toBitVec.toNat = bits % 256 from UInt8.toNat_ofNat',
+      Nat.pow_succ' (n := k), Nat.mod_mul]
+    rfl
+
+/-- **Backward compatibility for live `V2026_06_01` `decodeScalarLayoutBytesNoForge` (universal,
+64-bit):** every coherent 8-byte pointer is accepted by live `ScalarLayout` decoding (both
+`.initialized (.pointer _)` and `.union (.pointer _)`). -/
+theorem live06_scalarLayout_accepts_of_coherent_8 (as : Nat)
+    (vr : Trusted.Rustc.V2026_06_01.Layout.WrappingRange)
+    (l : List AbstractByteProto) (p : ProvenancePtrProto)
+    (h : abstractBytesCoherentPtrProvProto 8 l = some p) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (.initialized (.pointer as) vr) (l.map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (.union (.pointer as)) (l.map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8) := by
+  obtain ⟨_, hoff, rfl⟩ := (coherent_iff_encode 8 l p).mp h
+  rw [toLive06_encode]
+  simp only [normOffset, Nat.mod_eq_of_lt hoff]
+  have hL := live06_encodeLE_length p.offsetBytes 8 (some (p.allocId, p.tag))
+  have hD := live06_decodeLE_encodeLE p.offsetBytes 7 (p.allocId, p.tag)
+  have hU := live06_uniform_encodeLE p.allocId p.tag p.offsetBytes 7
+  generalize Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes 8
+    (some (p.allocId, p.tag)) = bs at hL hD hU ⊢
+  refine ⟨?_, ?_⟩ <;> (
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarLayoutBytesNoForge,
+      Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length]
+    simp only [hL, hD, hU, Nat.beq_refl, Nat.mod_eq_of_lt hoff])
+
+theorem coherent_none_of_live06_scalarLayout_none_8 (as : Nat)
+    (vr : Trusted.Rustc.V2026_06_01.Layout.WrappingRange) (l : List AbstractByteProto)
+    (h : Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarLayoutBytesNoForge
+      (.initialized (.pointer as) vr) (l.map AbstractByteProto.toLive06) = none) :
+    abstractBytesCoherentPtrProvProto 8 l = none := by
+  cases hc : abstractBytesCoherentPtrProvProto 8 l with
+  | none => rfl
+  | some p =>
+    rw [(live06_scalarLayout_accepts_of_coherent_8 as vr l p hc).1] at h
+    exact absurd h (by simp)
+
+/-- **Backward compatibility for live `V2026_06_01` wide slice/`str` pointers (universal, any
+`ptrBytes > 0`):** every coherent data pointer plus plain length is accepted by live
+`decodePtrBytesNoForge` at both `.slice` and `.str`. -/
+theorem live06_accepts_of_coherent_slice_str (isRef : Bool) (n : Nat)
+    (l : List AbstractByteProto) (p : ProvenancePtrProto) (len : Nat)
+    (h : abstractBytesCoherentPtrProvProto n l = some p) (hlen : len < 256 ^ n) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge isRef (.slice (.uint .u8)) n
+        ((l ++ encodeLittleEndianBytesProto len n).map AbstractByteProto.toLive06) =
+      some (.aggregate 0 [.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n,
+        .scalar ⟨len, n⟩]) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge isRef .str n
+        ((l ++ encodeLittleEndianBytesProto len n).map AbstractByteProto.toLive06) =
+      some (.aggregate 0 [.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n,
+        .scalar ⟨len, n⟩]) := by
+  obtain ⟨hn, hoff, rfl⟩ := (coherent_iff_encode n l p).mp h
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, (Nat.sub_add_cancel hn).symm⟩
+  rw [List.map_append, toLive06_encode, toLive06_plain]
+  simp only [normOffset, Nat.mod_eq_of_lt hoff]
+  have hLd := live06_encodeLE_length p.offsetBytes (k + 1) (some (p.allocId, p.tag))
+  have hLm := live06_encodeLE_length len (k + 1) none
+  have hDd := live06_decodeLE_encodeLE p.offsetBytes k (p.allocId, p.tag)
+  have hDm := live06_decodeLE_plain len (k + 1)
+  have hUd := live06_uniform_encodeLE p.allocId p.tag p.offsetBytes k
+  have hHp := live06_haveProv_plain len (k + 1)
+  have htk := live06_takeAbstractBytes_append (k + 1)
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes (k + 1)
+      (some (p.allocId, p.tag)))
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes len (k + 1) none) hLd
+  have hdr := live06_dropAbstractBytes_append (k + 1)
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes (k + 1)
+      (some (p.allocId, p.tag)))
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes len (k + 1) none) hLd
+  have hadd : Nat.add (k + 1) (k + 1) = (k + 1) + (k + 1) := rfl
+  refine ⟨?_, ?_⟩ <;> (
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
+      Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length,
+      List.length_append, hLd, hLm, htk, hdr, hDd, hDm, hUd, hHp, hadd,
+      Nat.beq_refl, Nat.mod_eq_of_lt hoff, Nat.mod_eq_of_lt hlen, nat_beq_zero_of_pos hn])
+
+/-- **Backward compatibility for live `V2026_06_01` wide `dyn` pointers (universal, any
+`ptrBytes > 0`):** every pair of coherent data and vtable pointer halves is accepted by live
+`decodePtrBytesNoForge` at `.dynamic "Trait"`. -/
+theorem live06_accepts_of_coherent_dyn (isRef : Bool) (n : Nat)
+    (ld lv : List AbstractByteProto) (p vt : ProvenancePtrProto)
+    (hd : abstractBytesCoherentPtrProvProto n ld = some p)
+    (hv : abstractBytesCoherentPtrProvProto n lv = some vt) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge isRef (.dynamic "Trait") n
+        ((ld ++ lv).map AbstractByteProto.toLive06) =
+      some (.aggregate 0 [.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n,
+        .ptr { allocId := vt.allocId, offsetBytes := vt.offsetBytes } n]) := by
+  obtain ⟨hn, hp, rfl⟩ := (coherent_iff_encode n ld p).mp hd
+  obtain ⟨_, hvt, rfl⟩ := (coherent_iff_encode n lv vt).mp hv
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, (Nat.sub_add_cancel hn).symm⟩
+  rw [List.map_append, toLive06_encode, toLive06_encode]
+  simp only [normOffset, Nat.mod_eq_of_lt hp, Nat.mod_eq_of_lt hvt]
+  have hLd := live06_encodeLE_length p.offsetBytes (k + 1) (some (p.allocId, p.tag))
+  have hLv := live06_encodeLE_length vt.offsetBytes (k + 1) (some (vt.allocId, vt.tag))
+  have hDd := live06_decodeLE_encodeLE p.offsetBytes k (p.allocId, p.tag)
+  have hDv := live06_decodeLE_encodeLE vt.offsetBytes k (vt.allocId, vt.tag)
+  have hUd := live06_uniform_encodeLE p.allocId p.tag p.offsetBytes k
+  have hUv := live06_uniform_encodeLE vt.allocId vt.tag vt.offsetBytes k
+  have htk := live06_takeAbstractBytes_append (k + 1)
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes (k + 1)
+      (some (p.allocId, p.tag)))
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes vt.offsetBytes (k + 1)
+      (some (vt.allocId, vt.tag))) hLd
+  have hdr := live06_dropAbstractBytes_append (k + 1)
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes (k + 1)
+      (some (p.allocId, p.tag)))
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes vt.offsetBytes (k + 1)
+      (some (vt.allocId, vt.tag))) hLd
+  have hadd : Nat.add (k + 1) (k + 1) = (k + 1) + (k + 1) := rfl
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length,
+    List.length_append, hLd, hLv, htk, hdr, hDd, hDv, hUd, hUv, hadd,
+    Nat.beq_refl, Nat.mod_eq_of_lt hp, Nat.mod_eq_of_lt hvt, nat_beq_zero_of_pos hn]
+
 
 theorem live08_encodeLE_length (bits k : Nat) (prov : Option (Nat × Nat)) :
     (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes bits k prov).length = k := by
@@ -3179,6 +3405,170 @@ theorem coherent_none_of_live08_ref_none (n : Nat) (l : List AbstractByteProto)
   cases hc : abstractBytesCoherentPtrProvProto n l with
   | none => rfl
   | some p => rw [live08_accepts_of_coherent true n l p hc] at h; exact absurd h (by simp)
+
+theorem toLive08_plain (bits k : Nat) :
+    (encodeLittleEndianBytesProto bits k).map AbstractByteProto.toLive08 =
+      Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes bits k none := by
+  induction k generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp only [encodeLittleEndianBytesProto, leImage, List.map_cons, AbstractByteProto.toLive08,
+      provPair?, Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes] at ih ⊢
+    rw [ih]
+    rfl
+
+theorem live08_takeAbstractBytes_append (n : Nat)
+    (l₁ l₂ : List Trusted.Rustc.V2026_08_01.MirSemantics.AbstractByte) (h : l₁.length = n) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.takeAbstractBytes n (l₁ ++ l₂) = l₁ := by
+  subst h
+  induction l₁ with
+  | nil => rfl
+  | cons x rest ih =>
+    simp only [List.length_cons, List.cons_append,
+      Trusted.Rustc.V2026_08_01.MirSemantics.takeAbstractBytes, ih]
+
+theorem live08_dropAbstractBytes_append (n : Nat)
+    (l₁ l₂ : List Trusted.Rustc.V2026_08_01.MirSemantics.AbstractByte) (h : l₁.length = n) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.dropAbstractBytes n (l₁ ++ l₂) = l₂ := by
+  subst h
+  induction l₁ with
+  | nil => rfl
+  | cons x rest ih =>
+    simp only [List.length_cons, List.cons_append, ih]
+
+theorem live08_haveProv_plain (bits k : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesHaveProv
+      (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes bits k none) = false := by
+  induction k generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesHaveProv, ih]
+
+theorem live08_decodeLE_plain (bits k : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodeLittleEndianBytes
+      (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes bits k none) =
+      some (bits % 256 ^ k, none) := by
+  induction k generalizing bits with
+  | zero =>
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodeLittleEndianBytes, Nat.pow_zero,
+      Nat.mod_one]
+  | succ k ih =>
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodeLittleEndianBytes, ih,
+      Trusted.Rustc.V2026_08_01.MirSemantics.mergeByteProvenance]
+    rw [show (UInt8.ofNat bits).toBitVec.toNat = bits % 256 from UInt8.toNat_ofNat',
+      Nat.pow_succ' (n := k), Nat.mod_mul]
+    rfl
+
+/-- **Backward compatibility for live `V2026_08_01` `decodeScalarLayoutBytesNoForge` (universal,
+64-bit):** parity with `V2026_06_01`. -/
+theorem live08_scalarLayout_accepts_of_coherent_8 (as : Nat)
+    (vr : Trusted.Rustc.V2026_08_01.Layout.WrappingRange)
+    (l : List AbstractByteProto) (p : ProvenancePtrProto)
+    (h : abstractBytesCoherentPtrProvProto 8 l = some p) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (.initialized (.pointer as) vr) (l.map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (.union (.pointer as)) (l.map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8) := by
+  obtain ⟨_, hoff, rfl⟩ := (coherent_iff_encode 8 l p).mp h
+  rw [toLive08_encode]
+  simp only [normOffset, Nat.mod_eq_of_lt hoff]
+  have hL := live08_encodeLE_length p.offsetBytes 8 (some (p.allocId, p.tag))
+  have hD := live08_decodeLE_encodeLE p.offsetBytes 7 (p.allocId, p.tag)
+  have hU := live08_uniform_encodeLE p.allocId p.tag p.offsetBytes 7
+  generalize Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes 8
+    (some (p.allocId, p.tag)) = bs at hL hD hU ⊢
+  refine ⟨?_, ?_⟩ <;> (
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarLayoutBytesNoForge,
+      Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length]
+    simp only [hL, hD, hU, Nat.beq_refl, Nat.mod_eq_of_lt hoff])
+
+theorem coherent_none_of_live08_scalarLayout_none_8 (as : Nat)
+    (vr : Trusted.Rustc.V2026_08_01.Layout.WrappingRange) (l : List AbstractByteProto)
+    (h : Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarLayoutBytesNoForge
+      (.initialized (.pointer as) vr) (l.map AbstractByteProto.toLive08) = none) :
+    abstractBytesCoherentPtrProvProto 8 l = none := by
+  cases hc : abstractBytesCoherentPtrProvProto 8 l with
+  | none => rfl
+  | some p =>
+    rw [(live08_scalarLayout_accepts_of_coherent_8 as vr l p hc).1] at h
+    exact absurd h (by simp)
+
+/-- **Backward compatibility for live `V2026_08_01` wide slice/`str` pointers (universal, any
+`ptrBytes > 0`):** parity with `V2026_06_01`. -/
+theorem live08_accepts_of_coherent_slice_str (isRef : Bool) (n : Nat)
+    (l : List AbstractByteProto) (p : ProvenancePtrProto) (len : Nat)
+    (h : abstractBytesCoherentPtrProvProto n l = some p) (hlen : len < 256 ^ n) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge isRef (.slice (.uint .u8)) n
+        ((l ++ encodeLittleEndianBytesProto len n).map AbstractByteProto.toLive08) =
+      some (.aggregate 0 [.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n,
+        .scalar ⟨len, n⟩]) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge isRef .str n
+        ((l ++ encodeLittleEndianBytesProto len n).map AbstractByteProto.toLive08) =
+      some (.aggregate 0 [.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n,
+        .scalar ⟨len, n⟩]) := by
+  obtain ⟨hn, hoff, rfl⟩ := (coherent_iff_encode n l p).mp h
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, (Nat.sub_add_cancel hn).symm⟩
+  rw [List.map_append, toLive08_encode, toLive08_plain]
+  simp only [normOffset, Nat.mod_eq_of_lt hoff]
+  have hLd := live08_encodeLE_length p.offsetBytes (k + 1) (some (p.allocId, p.tag))
+  have hLm := live08_encodeLE_length len (k + 1) none
+  have hDd := live08_decodeLE_encodeLE p.offsetBytes k (p.allocId, p.tag)
+  have hDm := live08_decodeLE_plain len (k + 1)
+  have hUd := live08_uniform_encodeLE p.allocId p.tag p.offsetBytes k
+  have hHp := live08_haveProv_plain len (k + 1)
+  have htk := live08_takeAbstractBytes_append (k + 1)
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes (k + 1)
+      (some (p.allocId, p.tag)))
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes len (k + 1) none) hLd
+  have hdr := live08_dropAbstractBytes_append (k + 1)
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes (k + 1)
+      (some (p.allocId, p.tag)))
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes len (k + 1) none) hLd
+  have hadd : Nat.add (k + 1) (k + 1) = (k + 1) + (k + 1) := rfl
+  refine ⟨?_, ?_⟩ <;> (
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge,
+      Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length,
+      List.length_append, hLd, hLm, htk, hdr, hDd, hDm, hUd, hHp, hadd,
+      Nat.beq_refl, Nat.mod_eq_of_lt hoff, Nat.mod_eq_of_lt hlen, nat_beq_zero_of_pos hn])
+
+/-- **Backward compatibility for live `V2026_08_01` wide `dyn` pointers (universal, any
+`ptrBytes > 0`):** parity with `V2026_06_01`. -/
+theorem live08_accepts_of_coherent_dyn (isRef : Bool) (n : Nat)
+    (ld lv : List AbstractByteProto) (p vt : ProvenancePtrProto)
+    (hd : abstractBytesCoherentPtrProvProto n ld = some p)
+    (hv : abstractBytesCoherentPtrProvProto n lv = some vt) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge isRef (.dynamic "Trait") n
+        ((ld ++ lv).map AbstractByteProto.toLive08) =
+      some (.aggregate 0 [.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n,
+        .ptr { allocId := vt.allocId, offsetBytes := vt.offsetBytes } n]) := by
+  obtain ⟨hn, hp, rfl⟩ := (coherent_iff_encode n ld p).mp hd
+  obtain ⟨_, hvt, rfl⟩ := (coherent_iff_encode n lv vt).mp hv
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, (Nat.sub_add_cancel hn).symm⟩
+  rw [List.map_append, toLive08_encode, toLive08_encode]
+  simp only [normOffset, Nat.mod_eq_of_lt hp, Nat.mod_eq_of_lt hvt]
+  have hLd := live08_encodeLE_length p.offsetBytes (k + 1) (some (p.allocId, p.tag))
+  have hLv := live08_encodeLE_length vt.offsetBytes (k + 1) (some (vt.allocId, vt.tag))
+  have hDd := live08_decodeLE_encodeLE p.offsetBytes k (p.allocId, p.tag)
+  have hDv := live08_decodeLE_encodeLE vt.offsetBytes k (vt.allocId, vt.tag)
+  have hUd := live08_uniform_encodeLE p.allocId p.tag p.offsetBytes k
+  have hUv := live08_uniform_encodeLE vt.allocId vt.tag vt.offsetBytes k
+  have htk := live08_takeAbstractBytes_append (k + 1)
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes (k + 1)
+      (some (p.allocId, p.tag)))
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes vt.offsetBytes (k + 1)
+      (some (vt.allocId, vt.tag))) hLd
+  have hdr := live08_dropAbstractBytes_append (k + 1)
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes p.offsetBytes (k + 1)
+      (some (p.allocId, p.tag)))
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes vt.offsetBytes (k + 1)
+      (some (vt.allocId, vt.tag))) hLd
+  have hadd : Nat.add (k + 1) (k + 1) = (k + 1) + (k + 1) := rfl
+  simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge,
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length,
+    List.length_append, hLd, hLv, htk, hdr, hDd, hDv, hUd, hUv, hadd,
+    Nat.beq_refl, Nat.mod_eq_of_lt hp, Nat.mod_eq_of_lt hvt, nat_beq_zero_of_pos hn]
 
 
 /-! ## 11. Live `Trusted.Rustc.V2026_06_01.MirSemantics` witnesses -/

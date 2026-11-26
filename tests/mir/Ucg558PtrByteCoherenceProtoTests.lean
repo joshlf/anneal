@@ -946,9 +946,9 @@ theorem t_mr_encodePtr_decodePtr_roundtrip_8 :
       .ok (some { addr := (0x40 : Int), provenance := some (mrProv 5) }) :=
   mr_encodePtr_decodePtr_roundtrip_8 pTag (by decide)
 
-/-- Custom union / partial byte overwrite: even overwriting byte `0` of `pTag` (`offset = 0x40`)
+/-- Custom union / single-byte overwrite: even overwriting byte `0` of `pTag` (`offset = 0x40`)
 with the IDENTICAL numeric byte `0x40` strips provenance (UB as `&T`/`fnPtr`, `.scalar` as `*const T`). -/
-theorem t_partial_byte_overwrite_strips_ptr :
+theorem t_single_byte_overwrite_strips_ptr :
     ∃ buf₁,
       writeBytesProto (encodePtrBytesProto pTag 8) 0 [mkInitByte 0x40] = some buf₁ ∧
       readTypedFromBytesProto 8 (.ref .thin) buf₁ 0 = none ∧
@@ -956,7 +956,7 @@ theorem t_partial_byte_overwrite_strips_ptr :
       readTypedFromBytesProto 8 (.rawPtr .thin) buf₁ 0 =
         some (.scalar (leValue ((leImage (normOffset 8 0x40) 8).take 0 ++
           [0x40] ++ (leImage (normOffset 8 0x40) 8).drop 1)) 8) :=
-  partial_byte_overwrite_strips_ptr pTag 8 0 0x40 (by decide)
+  single_byte_overwrite_strips_ptr pTag 8 0 0x40 (by decide)
 
 /-- Disjoint byte write at offset `8` preserves the pointer `pTag` at offset `0` with exact `tag`. -/
 theorem t_disjoint_byte_overwrite_preserves_ptr :
@@ -966,6 +966,29 @@ theorem t_disjoint_byte_overwrite_preserves_ptr :
       readTypedFromBytesProto 8 (.ref .thin) buf₁ 0 = some (.ptr pTag 8) :=
   disjoint_byte_overwrite_preserves_ptr true pTag 8 (by decide) (by decide)
     [mkInitByte 0xAA] 0x55 (by decide)
+
+/-- Extended universal `TyProto` round-trip: raw thin (`.ptr` and provenance-less `.scalar`),
+`&str`, `*const dyn Trait`, `[u8; 2]`, and `MaybeUninit<bool>` holding invalid `2u8`. -/
+theorem t_typed_encode_decode_roundtrip_ext :
+    (encodeValueToBytesProto 8 (.rawPtr .thin) (.ptr pTag 8)).bind
+        (decodeTypedValueFromBytesProto 8 (.rawPtr .thin)) = some (.ptr pTag 8) ∧
+    (encodeValueToBytesProto 8 (.rawPtr .thin) (.scalar 0x20004 8)).bind
+        (decodeTypedValueFromBytesProto 8 (.rawPtr .thin)) = some (.scalar 0x20004 8) ∧
+    (encodeValueToBytesProto 8 (.ref .str) (.aggregate [.ptr pTag 8, .scalar 7 8])).bind
+        (decodeTypedValueFromBytesProto 8 (.ref .str)) =
+      some (.aggregate [.ptr pTag 8, .scalar 7 8]) ∧
+    (encodeValueToBytesProto 8 (.rawPtr .dyn) (.aggregate [.ptr pTag 8, .ptr pVt 8])).bind
+        (decodeTypedValueFromBytesProto 8 (.rawPtr .dyn)) =
+      some (.aggregate [.ptr pTag 8, .ptr pVt 8]) ∧
+    (encodeValueToBytesProto 8 (.array (.uint 1) 2)
+        (.aggregate [.scalar 0x2A 1, .scalar 0xFF 1])).bind
+        (decodeTypedValueFromBytesProto 8 (.array (.uint 1) 2)) =
+      some (.aggregate [.scalar 0x2A 1, .scalar 0xFF 1]) ∧
+    (encodeValueToBytesProto 8 (.maybeUninit .bool) (.rawBytes [mkInitByte 2])).bind
+        (decodeTypedValueFromBytesProto 8 (.maybeUninit .bool)) =
+      some (.rawBytes [mkInitByte 2]) :=
+  typed_encode_decode_roundtrip_ext 8 (by decide) 0x20004 7 pTag pVt 0x2A 0xFF .bool
+    [mkInitByte 2] (by decide) (by decide) (by decide) (by decide) rfl
 
 theorem t_live06_accepts_of_coherent :
     Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge true (.uint .u8) 8
@@ -983,6 +1006,44 @@ theorem t_coherent_none_of_live06_ref_none :
     abstractBytesCoherentPtrProvProto 8 (encodeLittleEndianBytesProto 0x20004 8) = none :=
   coherent_none_of_live06_ref_none 8 _ rfl
 
+theorem t_live06_scalarLayout_accepts_of_coherent_8 :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩)
+        ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := 5, offsetBytes := 0x40 } 8) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (.union (.pointer 0))
+        ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := 5, offsetBytes := 0x40 } 8) :=
+  live06_scalarLayout_accepts_of_coherent_8 0 ⟨1, 0xFFFFFFFFFFFFFFFF⟩ _ pTag
+    ((coherent_encode pTag 8 (by decide)).trans rfl)
+
+theorem t_coherent_none_of_live06_scalarLayout_none_8 :
+    abstractBytesCoherentPtrProvProto 8 (encodeLittleEndianBytesProto 0 8) = none :=
+  coherent_none_of_live06_scalarLayout_none_8 0 ⟨1, 0xFFFFFFFFFFFFFFFF⟩ _ rfl
+
+theorem t_live06_accepts_of_coherent_slice_str :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge true (.slice (.uint .u8)) 8
+        ((encodePtrBytesProto pTag 8 ++ encodeLittleEndianBytesProto 7 8).map
+          AbstractByteProto.toLive06) =
+      some (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0x40 } 8, .scalar ⟨7, 8⟩]) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge true .str 8
+        ((encodePtrBytesProto pTag 8 ++ encodeLittleEndianBytesProto 7 8).map
+          AbstractByteProto.toLive06) =
+      some (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0x40 } 8, .scalar ⟨7, 8⟩]) :=
+  live06_accepts_of_coherent_slice_str true 8 _ pTag 7
+    ((coherent_encode pTag 8 (by decide)).trans rfl) (by decide)
+
+theorem t_live06_accepts_of_coherent_dyn :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge true (.dynamic "Trait") 8
+        ((encodePtrBytesProto pTag 8 ++ encodePtrBytesProto pVt 8).map
+          AbstractByteProto.toLive06) =
+      some (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0x40 } 8,
+        .ptr { allocId := 2, offsetBytes := 0x1000 } 8]) :=
+  live06_accepts_of_coherent_dyn true 8 _ _ pTag pVt
+    ((coherent_encode pTag 8 (by decide)).trans rfl)
+    ((coherent_encode pVt 8 (by decide)).trans rfl)
+
 theorem t_live08_accepts_of_coherent :
     Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge true (.uint .u8) 8
       ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive08) =
@@ -998,6 +1059,44 @@ theorem t_live08_accepts_of_coherent_32 :
 theorem t_coherent_none_of_live08_ref_none :
     abstractBytesCoherentPtrProvProto 8 (encodeLittleEndianBytesProto 0x20004 8) = none :=
   coherent_none_of_live08_ref_none 8 _ rfl
+
+theorem t_live08_scalarLayout_accepts_of_coherent_8 :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩)
+        ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := 5, offsetBytes := 0x40 } 8) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarLayoutBytesNoForge
+        (.union (.pointer 0))
+        ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := 5, offsetBytes := 0x40 } 8) :=
+  live08_scalarLayout_accepts_of_coherent_8 0 ⟨1, 0xFFFFFFFFFFFFFFFF⟩ _ pTag
+    ((coherent_encode pTag 8 (by decide)).trans rfl)
+
+theorem t_coherent_none_of_live08_scalarLayout_none_8 :
+    abstractBytesCoherentPtrProvProto 8 (encodeLittleEndianBytesProto 0 8) = none :=
+  coherent_none_of_live08_scalarLayout_none_8 0 ⟨1, 0xFFFFFFFFFFFFFFFF⟩ _ rfl
+
+theorem t_live08_accepts_of_coherent_slice_str :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge true (.slice (.uint .u8)) 8
+        ((encodePtrBytesProto pTag 8 ++ encodeLittleEndianBytesProto 7 8).map
+          AbstractByteProto.toLive08) =
+      some (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0x40 } 8, .scalar ⟨7, 8⟩]) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge true .str 8
+        ((encodePtrBytesProto pTag 8 ++ encodeLittleEndianBytesProto 7 8).map
+          AbstractByteProto.toLive08) =
+      some (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0x40 } 8, .scalar ⟨7, 8⟩]) :=
+  live08_accepts_of_coherent_slice_str true 8 _ pTag 7
+    ((coherent_encode pTag 8 (by decide)).trans rfl) (by decide)
+
+theorem t_live08_accepts_of_coherent_dyn :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge true (.dynamic "Trait") 8
+        ((encodePtrBytesProto pTag 8 ++ encodePtrBytesProto pVt 8).map
+          AbstractByteProto.toLive08) =
+      some (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0x40 } 8,
+        .ptr { allocId := 2, offsetBytes := 0x1000 } 8]) :=
+  live08_accepts_of_coherent_dyn true 8 _ _ pTag pVt
+    ((coherent_encode pTag 8 (by decide)).trans rfl)
+    ((coherent_encode pVt 8 (by decide)).trans rfl)
 
 /-! ## 2. Prototype decoders on the adversarial inputs (independent `rfl` checks) -/
 
