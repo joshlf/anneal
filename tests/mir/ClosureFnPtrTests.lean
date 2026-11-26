@@ -4540,6 +4540,25 @@ theorem inline_ces_generic_capturing_is_unsupported_not_ub :
       (.unsupported, .ub) := by
   rfl
 
+/-- Untyped `FnPtrEntry` (`fnSig = .none`) targeting a closure body: `N`-arg Rust-ABI call dispatches (`22`), while forged `(N + 1)`-arg call, capturing body, and non-Rust ABI body all fault with `.ub` (C10 without `fnSig`). -/
+theorem untyped_fnptr_entry_closure_dispatch_and_c10 :
+    let untypedEntry (p : DefPath) : FnPtrEntry :=
+      { allocId := 65536, defPath := p, typeArgs := .nil, fnSig := .none }
+    let cAbiClosure :=
+      { Mir.ClosureMatrix.fn_shared_closure_0.body with
+        fnAbi := { Mir.ClosureMatrix.fn_shared_closure_0.body.fnAbi with conv := .c } }
+    (runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [Mir.ClosureMatrix.fn_shared_closure_0.body]
+       [untypedEntry sharedPath],
+     runWith (envPtrCaller (.fnPtr [.ref .not sharedClo, u32K] u32K .safe .rust) (.ref .not sharedClo))
+       [fnPtrVal, envScalar, u32v 5] [Mir.ClosureMatrix.fn_shared_closure_0.body]
+       [untypedEntry sharedPath],
+     runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [Mir.ClosureMatrix.capturing_direct_closure_0.body]
+       [untypedEntry capPath],
+     runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [cAbiClosure]
+       [untypedEntry sharedPath]) =
+      (.normalScalar 22 4, .ub, .ub, .ub) := by
+  rfl
+
 end Anneal.ClosureFnPtrTests.V06
 
 /-! ## 6. Closure function-pointer matrix on `V2026_08_01` -/
@@ -6094,6 +6113,25 @@ theorem inline_ces_generic_capturing_is_unsupported_not_ub :
       (.unsupported, .ub) := by
   rfl
 
+/-- Untyped `FnPtrEntry` (`fnSig = .none`) targeting a closure body: `N`-arg Rust-ABI call dispatches (`22`), while forged `(N + 1)`-arg call, capturing body, and non-Rust ABI body all fault with `.ub` (C10 without `fnSig`). -/
+theorem untyped_fnptr_entry_closure_dispatch_and_c10 :
+    let untypedEntry (p : DefPath) : FnPtrEntry :=
+      { allocId := 65536, defPath := p, typeArgs := .nil, fnSig := .none }
+    let cAbiClosure :=
+      { V08.Mir.ClosureMatrix.fn_shared_closure_0.body with
+        fnAbi := { V08.Mir.ClosureMatrix.fn_shared_closure_0.body.fnAbi with conv := .c } }
+    (runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [V08.Mir.ClosureMatrix.fn_shared_closure_0.body]
+       [untypedEntry sharedPath],
+     runWith (envPtrCaller (.fnPtr [.ref .not sharedClo, u32K] u32K .safe .rust) (.ref .not sharedClo))
+       [fnPtrVal, envScalar, u32v 5] [V08.Mir.ClosureMatrix.fn_shared_closure_0.body]
+       [untypedEntry sharedPath],
+     runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [V08.Mir.ClosureMatrix.capturing_direct_closure_0.body]
+       [untypedEntry capPath],
+     runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [cAbiClosure]
+       [untypedEntry sharedPath]) =
+      (.normalScalar 22 4, .ub, .ub, .ub) := by
+  rfl
+
 end Anneal.ClosureFnPtrTests.V08
 
 /-! ## 7. Axiom audit -/
@@ -6111,3 +6149,9 @@ end Anneal.ClosureFnPtrTests.V08
 #print axioms Anneal.ClosureFnPtrTests.V08.concrete_trait_impl_closure_is_28
 #print axioms Anneal.ClosureFnPtrTests.V06.closure_body_fn_entry_retag_succeeds
 #print axioms Anneal.ClosureFnPtrTests.V08.closure_body_fn_entry_retag_succeeds
+#print axioms Anneal.ClosureFnPtrTests.V06.coerce_wrong_coercion_kind_is_ub
+#print axioms Anneal.ClosureFnPtrTests.V08.coerce_wrong_coercion_kind_is_ub
+#print axioms Anneal.ClosureFnPtrTests.V06.inline_ces_forged_closure_ty_on_non_closure_is_ub
+#print axioms Anneal.ClosureFnPtrTests.V08.inline_ces_forged_closure_ty_on_non_closure_is_ub
+#print axioms Anneal.ClosureFnPtrTests.V06.untyped_fnptr_entry_closure_dispatch_and_c10
+#print axioms Anneal.ClosureFnPtrTests.V08.untyped_fnptr_entry_closure_dispatch_and_c10
