@@ -16,23 +16,23 @@
 //!    spurious `miri_ub_span` fields, and `ub_location_mismatch` entries whose
 //!    `observed_anneal_ub_span` already contains `miri_ub_span`, plus live Miri
 //!    oracle verification via `tests/miri-diff/sync_miri_suite.py --eval-miri`.
-//! 2. Full 89-test differential execution (`run_miri_diff_suite`):
+//! 2. Full 116-test differential execution (`run_miri_diff_suite`):
 //!    - Captures MIR from `tests/miri-diff/corpus` with Miri-matching flags
 //!      (`-Zmir-opt-level=0 -C debug-assertions=off -C overflow-checks=on`).
-//!    - Proves `TotalVerificationResult` for all 41 non-bug `pass` tests,
+//!    - Proves `TotalVerificationResult` for all 54 non-bug `pass` tests,
 //!      including `pass_direct_fn_call`, whose claim links the captured
 //!      `helper_add_ten` body as a callee.
 //!    - Proves `StatefulVerificationResult` (`post := False`) and
-//!      `¬ TotalClaim.holds` for the 9 `panic` tests that panic without an
+//!      `¬ TotalClaim.holds` for the 11 `panic` tests that panic without an
 //!      external call, and `ModularVerificationResult` (`post := False` under
 //!      a frame-preserving rely contract on external calls) and
 //!      `¬ TotalClaim.holds` for `panic_explicit_macro`, which panics after
 //!      calling the uncaptured `core::fmt::Arguments::<'a>::from_str`.
 //!    - Proves `¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` via
 //!      `refuteMirPointByStrictUB` and verifies Miri UB fault locations via
-//!      `MiriOracleProbe.lean` for all 38 non-bug `ub` tests.
+//!      `MiriOracleProbe.lean` for all 50 non-bug `ub` tests.
 //!    - Records no open Anneal bug (`[tests.known_anneal_bug]`), so the
-//!      corpus agrees with Miri on all 89 tests.
+//!      corpus agrees with Miri on all 116 tests.
 //!    - Runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode
 //!      (statement-origin isolation, zero `sorryAx`, zero `axiom`, and full
 //!      Lean 4 kernel replay at `trustLevel := 0`).
@@ -56,6 +56,15 @@
 //! 4. Callee-linked certificate shapes: stateful and modular `panic` and `ub`
 //!    certificates rendered with a linked (unused) intra-crate callee still
 //!    build in Lake.
+//! 5. Targeted Category 12 run
+//!    (`end_to_end_miri_diff_category12_zero_count_copy_align_and_null`):
+//!    stages the corpus, checks that the 4 zero-count `copy_nonoverlapping`
+//!    alignment / null seeds lower to `NonDivergingIntrinsic.copyNonOverlapping`
+//!    and carry no `known_anneal_bug`, kernel-checks their 4
+//!    `Verify.MiriDiffCorpus.*` modules in Lake, and verifies their exact Miri
+//!    UB fault spans. Unlike item 2, it does not build the Category 9
+//!    multi-callee modules, so it also runs on hosts where those modules
+//!    exceed the available memory.
 
 use std::env;
 use std::fs;
