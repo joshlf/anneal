@@ -1010,21 +1010,93 @@ theorem cm_evalPtrMaskCall_identity (s : MachineState) (decls : List MirAst.Loca
   unfold evalPtrMaskCall
   simp only [Nat.beq_refl, hUnbacked, Bool.false_and, hDecode, hModEq, hBeqAll, hOffBlt, Bool.and_self]
 
+private theorem cm_commitForeignFrameLocals_preserves_exposed (mem mem' : Memory)
+    (tgt : ForeignFrameTarget) (ls : List LocalSlot)
+    (h : commitForeignFrameLocals mem tgt ls = .some mem') :
+    mem'.exposedAllocIds = mem.exposedAllocIds := by
+  unfold commitForeignFrameLocals at h
+  split at h
+  · cases h; rfl
+  · split at h
+    · split at h
+      · cases h; rfl
+      · cases h
+    · cases h
+
+private theorem cm_foreignFrameDerefWrite_preserves_exposed (locals₁ locals₂ : List LocalSlot)
+    (mem₁ mem₂ : Memory) (dst : Place) (restProj : List ProjectionElem) (val : Value)
+    (localDecls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (h : foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts = .ok locals₂ mem₂) :
+    mem₂.exposedAllocIds = mem₁.exposedAllocIds := by
+  unfold foreignFrameDerefWrite at h
+  dsimp only at h
+  split at h <;> try cases h
+  split at h <;> try cases h
+  split at h <;> try cases h
+  split at h <;> try cases h
+  split at h <;> try cases h
+  try dsimp only at h
+  split at h <;> try cases h
+  try dsimp only at h
+  split at h <;> try cases h
+  try dsimp only at h
+  split at h
+  · rename_i m2 hC
+    cases h
+    exact cm_commitForeignFrameLocals_preserves_exposed mem₁ m2 _ _ hC
+  · cases h
+
+/-- **Universal `writeReturnDestination` zero-exposure law**: for EVERY destination
+`dst : Place` (direct local, arbitrary field/index/downcast/subslice projections,
+opaque casts, active-frame derefs, and foreign-frame derefs), `writeReturnDestination`
+never modifies `mem.exposedAllocIds`. -/
+theorem cm_writeReturnDestination_preserves_exposed (locals locals' : List LocalSlot)
+    (mem mem' : Memory) (dst : Place) (retVal : Value)
+    (decls : List MirAst.LocalDecl) (lay : LayoutTable)
+    (h : writeReturnDestination locals mem dst retVal decls lay = .ok locals' mem') :
+    mem'.exposedAllocIds = mem.exposedAllocIds := by
+  unfold writeReturnDestination at h
+  dsimp only at h
+  split at h
+  · split at h <;> try cases h
+    split at h <;> try cases h
+    split at h <;> try cases h
+    rfl
+  · split at h
+    · split at h <;> try cases h
+      rfl
+    · exact cm_foreignFrameDerefWrite_preserves_exposed locals locals' mem mem' dst _ retVal decls lay h
+    · cases h
+  · try dsimp only at h
+    split at h <;> try cases h
+    split at h <;> try cases h
+    split at h <;> try cases h
+    split at h <;> try cases h
+    rfl
+  · try dsimp only at h
+    split at h <;> try cases h
+    try dsimp only at h
+    split at h <;> try cases h
+    split at h <;> try cases h
+    split at h <;> try cases h
+    rfl
+
 /-- **Universal `ucg#630` / `rust#166220` zero-exposure law for `ptr_mask`**: for
-EVERY state `s`, direct destination `{ local_ := d, projection := [] }`, and
-arbitrary arguments, whenever `evalPtrMaskCall` takes a normal step `.tau (.running s')`,
+EVERY state `s`, ARBITRARY destination `dest : Place` (direct local, projected
+field/index/opaque-cast, or active/foreign deref), and arbitrary arguments,
+whenever `evalPtrMaskCall` takes a normal step `.tau (.running s')`,
 `s'.memory.exposedAllocIds = s.memory.exposedAllocIds`. -/
-theorem cm_evalPtrMaskCall_direct_preserves_exposed (s s' : MachineState)
+theorem cm_evalPtrMaskCall_preserves_exposed (s s' : MachineState)
     (decls : List MirAst.LocalDecl) (lay : LayoutTable) (vals : List Value)
-    (locals : List LocalSlot) (d : Nat) (tgt : Option BasicBlockIdx)
-    (hStep : evalPtrMaskCall s decls lay vals locals (locPlace d) tgt = .tau (.running s')) :
+    (locals : List LocalSlot) (dest : Place) (tgt : Option BasicBlockIdx)
+    (hStep : evalPtrMaskCall s decls lay vals locals dest tgt = .tau (.running s')) :
     s'.memory.exposedAllocIds = s.memory.exposedAllocIds := by
   have hWrite : ∀ (v : Value),
-      writeIntrinsicReturnWithProtectors s decls lay locals (locPlace d) tgt v = .tau (.running s') →
+      writeIntrinsicReturnWithProtectors s decls lay locals dest tgt v = .tau (.running s') →
       s'.memory.exposedAllocIds = s.memory.exposedAllocIds := by
     intro v hW
     have hDest : ∀ (wRes : FrameWriteResult) (bb : BasicBlockIdx),
-        writeReturnDestination locals s.memory (locPlace d) v decls lay = wRes →
+        writeReturnDestination locals s.memory dest v decls lay = wRes →
         (match wRes with
          | .ok updatedLocals mem' =>
            MirStepNode.step { frame := { s.frame with blockIdx := bb, stmtIdx := 0, locals := updatedLocals },
@@ -1041,38 +1113,26 @@ theorem cm_evalPtrMaskCall_direct_preserves_exposed (s s' : MachineState)
         injection hSt with hSt'
         have hMem : s'.memory = mem' := by cases hSt'; rfl
         rw [hMem]
-        unfold writeReturnDestination locPlace at hw
-        dsimp only at hw
-        cases hget : get? locals d <;> rw [hget] at hw
-        · cases hw
-        · rename_i slot
-          cases slot <;> dsimp only at hw
-          · cases hw
-          · cases hConf : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors d
-                .none .nil 0 0 (length s.memory.callStack) <;> rw [hConf] at hw
-            · cases hset : set? locals d (.init v) <;> rw [hset] at hw
-              · cases hw
-              · cases hw; rfl
-            · cases hw
-          · cases hConf : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors d
-                .none .nil 0 0 (length s.memory.callStack) <;> rw [hConf] at hw
-            · cases hset : set? locals d (.init v) <;> rw [hset] at hw
-              · cases hw
-              · cases hw; rfl
-            · cases hw
+        exact cm_writeReturnDestination_preserves_exposed locals updatedLocals s.memory mem' dest v decls lay hw
     unfold writeIntrinsicReturnWithProtectors at hW
     cases tgt with
     | none => cases hW
     | some bb =>
       dsimp only at hW
-      cases decls with
-      | nil => exact hDest _ bb rfl hW
-      | cons hd tl =>
-        dsimp only at hW
-        cases hVal : validateValueForTy? lay (placeTy (hd :: tl) lay (locPlace d)) v <;>
-          rw [hVal] at hW
-        · cases hW
-        · exact hDest _ bb rfl hW
+      cases hP : dest.projection with
+      | nil =>
+        rw [hP] at hW
+        cases decls with
+        | nil => exact hDest _ bb rfl hW
+        | cons hd tl =>
+          dsimp only at hW
+          cases hVal : validateValueForTy? lay (placeTy (hd :: tl) lay dest) v <;>
+            rw [hVal] at hW
+          · cases hW
+          · exact hDest _ bb rfl hW
+      | cons _ _ =>
+        rw [hP] at hW
+        exact hDest _ bb rfl hW
   rcases vals with _ | ⟨ptrVal, _ | ⟨maskVal, _ | _⟩⟩
   · cases hStep
   · cases hStep
@@ -1143,6 +1203,14 @@ theorem cm_evalPtrMaskCall_direct_preserves_exposed (s s' : MachineState)
     | unit => cases hStep
     | uninit => cases hStep
   · cases hStep
+
+/-- Direct-destination specialization of `cm_evalPtrMaskCall_preserves_exposed`. -/
+theorem cm_evalPtrMaskCall_direct_preserves_exposed (s s' : MachineState)
+    (decls : List MirAst.LocalDecl) (lay : LayoutTable) (vals : List Value)
+    (locals : List LocalSlot) (d : Nat) (tgt : Option BasicBlockIdx)
+    (hStep : evalPtrMaskCall s decls lay vals locals (locPlace d) tgt = .tau (.running s')) :
+    s'.memory.exposedAllocIds = s.memory.exposedAllocIds :=
+  cm_evalPtrMaskCall_preserves_exposed s s' decls lay vals locals (locPlace d) tgt hStep
 
 /-- **Universal `MiniRustSpec.Interp.evalIntrinsic .RawEq` law**: for EVERY
 MiniRust machine `m`, reference pointer type `ptrTy = .Ref mut pointee` with
@@ -1267,6 +1335,179 @@ theorem cm_evalBlackBoxCall_u32_valid (s : MachineState) (decls : List MirAst.Lo
   dsimp only [defaultCodecFuel]
   unfold validateBlackBoxValue
   simp only [intTyTargetBytes, hBlt, Nat.beq_refl, Bool.and_self]
+
+/-- **Universal `MiniRustSpec.Interp.evalPtrOffsetFrom` negative signed + `DivExact`
+correspondence**: whenever `right.addr = left.addr + k * elemSize` with
+`0 < k` and `k * elemSize ≤ isize::MAX`, MiniRust's `evalPtrOffsetFrom ... false`
++ `DivExact` yields `-k`, matching Trusted `evalPtrOffsetFromDistance 8 false`
+returning the two's-complement scalar `2^64 - k`. -/
+theorem cm_minirust_evalPtrOffsetFrom_neg_divExact_agree (m : Mach)
+    (left right : ThinPointer Prov) (tl tr : Gen.Type) (elemSize k : Nat)
+    (hPos : 0 < elemSize) (hKPos : 0 < k) (hLe : elemSize ≤ scalarModulus 8 / 2 - 1)
+    (hDist : k * elemSize ≤ scalarModulus 8 / 2 - 1)
+    (hAddr : right.addr = left.addr + Int.ofNat (k * elemSize))
+    (hD1 : CM.signed_dereferenceable m.mem left (-(left.addr - right.addr)) = .ok ())
+    (hD2 : CM.signed_dereferenceable m.mem right (left.addr - right.addr) = .ok ()) :
+    evalPtrOffsetFrom m true false (.Ptr ⟨left, none⟩, tl) (.Ptr ⟨right, none⟩, tr) =
+      .ok (.Int (-(Int.ofNat (k * elemSize))), .Int ⟨.Signed, x86_64.PTR_SIZE⟩) ∧
+    evalIntBinOp .DivExact (-(Int.ofNat (k * elemSize))) (Int.ofNat elemSize) ⟨.Signed, x86_64.PTR_SIZE⟩ =
+      .ok (-(Int.ofNat k)) ∧
+    evalPtrOffsetFromDistance 8 false elemSize left.addr.toNat (left.addr.toNat + k * elemSize) =
+      some ⟨scalarModulus 8 - k, 8⟩ := by
+  have hDiff : left.addr - right.addr = -(Int.ofNat (k * elemSize)) := by
+    rw [hAddr, Int.sub_eq_add_neg, Int.neg_add, ← Int.add_assoc, Int.add_right_neg, Int.zero_add]
+  have hCanRep : IntType.can_represent ⟨.Signed, x86_64.PTR_SIZE⟩ (-(Int.ofNat k)) = true := by
+    have hkLe : k ≤ scalarModulus 8 / 2 - 1 := by
+      have : k ≤ k * elemSize := Nat.le_mul_of_pos_right k hPos
+      omega
+    have hMod : scalarModulus 8 / 2 - 1 = 2 ^ 63 - 1 := by decide
+    have hk63 : k ≤ 2 ^ 63 - 1 := by omega
+    unfold IntType.can_represent inBounds
+    have hBits : MiniRustSpec.Interp.Size.bits x86_64.PTR_SIZE = 64 := rfl
+    dsimp only
+    rw [hBits]
+    have hMin : -((2 : Int) ^ (64 - 1)) ≤ -(Int.ofNat k) := by
+      rw [Int.ofNat_eq_natCast]; omega
+    have hMax : -(Int.ofNat k) < (2 : Int) ^ (64 - 1) := by
+      rw [Int.ofNat_eq_natCast]; omega
+    simp [hMin, hMax]; omega
+  refine ⟨?_, ?_, cm_evalPtrOffsetFromDistance_neg_exact 8 elemSize left.addr.toNat k hPos hKPos hLe hDist⟩
+  · unfold evalPtrOffsetFrom
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    rw [hD1, hD2, hDiff]
+    simp only [Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+  · have hElemNe : Int.ofNat elemSize ≠ 0 := by intro h; cases h; omega
+    have hTdiv : Int.tdiv (-(Int.ofNat (k * elemSize))) (Int.ofNat elemSize) = -(Int.ofNat k) := by
+      rw [Int.neg_tdiv]
+      change -(Int.ofNat ((k * elemSize) / elemSize)) = -(Int.ofNat k)
+      rw [Nat.mul_div_cancel k hPos]
+    have hTmod : Int.tmod (-(Int.ofNat (k * elemSize))) (Int.ofNat elemSize) = 0 := by
+      rw [Int.neg_tmod]
+      change -(Int.ofNat ((k * elemSize) % elemSize)) = 0
+      rw [Nat.mul_mod_left k elemSize]; rfl
+    unfold evalIntBinOp
+    dsimp only
+    simp only [hElemNe, ↓reduceIte, hTdiv, hCanRep, Bool.not_true, Bool.false_eq_true,
+      hTmod, ne_eq, not_true_eq_false, pure, Except.pure]
+
+/-- **Universal `MiniRustSpec.Interp.evalPtrOffsetFrom` unsigned-underflow UB law**:
+whenever `left.addr < right.addr` and inbounds checks succeed, `evalPtrOffsetFrom`
+with `nonneg = true` deterministically faults `.ub`, matching Trusted
+`evalPtrOffsetFromDistance ... true ... = none`. -/
+theorem cm_minirust_evalPtrOffsetFrom_unsigned_underflow_ub (m : Mach)
+    (left right : ThinPointer Prov) (tl tr : Gen.Type) (elemSize : Nat)
+    (hLt : left.addr < right.addr) (hNatLt : left.addr.toNat < right.addr.toNat)
+    (hD1 : CM.signed_dereferenceable m.mem left (-(left.addr - right.addr)) = .ok ())
+    (hD2 : CM.signed_dereferenceable m.mem right (left.addr - right.addr) = .ok ()) :
+    evalPtrOffsetFrom m true true (.Ptr ⟨left, none⟩, tl) (.Ptr ⟨right, none⟩, tr) =
+      .error (.ub "PtrOffsetFrom: negative result with `nonneg` flag set") ∧
+    evalPtrOffsetFromDistance 8 true elemSize left.addr.toNat right.addr.toNat = none := by
+  refine ⟨?_, cm_evalPtrOffsetFromDistance_unsigned_negative 8 elemSize left.addr.toNat right.addr.toNat hNatLt⟩
+  have hDiffNeg : left.addr - right.addr < 0 := by
+    let x : Int := left.addr
+    let y : Int := right.addr
+    have hxy : x < y := hLt
+    change x - y < 0
+    omega
+  unfold evalPtrOffsetFrom
+  dsimp only [bind, Except.bind, pure, Except.pure, ub]
+  rw [hD1, hD2]
+  simp only [hDiffNeg, decide_true, Bool.and_self, ↓reduceIte]
+
+/-- **Universal MiniRust strict-provenance `ptr_mask` offset law**: wrapping
+`evalPtrOffset m false` shifts `p.addr` by `delta` modulo `2^64` while preserving
+`p.provenance` identically (no `IntPtrCast::expose`, zero memory mutation). -/
+theorem cm_minirust_evalPtrOffset_wrapping_preserves_prov (m : Mach)
+    (p : ThinPointer Prov) (ptrTy deltaTy : Gen.Type) (delta : Int) :
+    evalPtrOffset m false (.Ptr ⟨p, none⟩, ptrTy) (.Int delta, deltaTy) =
+      .ok (.Ptr ⟨{ addr := bringInBounds (p.addr + delta) .Unsigned x86_64.PTR_SIZE,
+                   provenance := p.provenance }, none⟩, ptrTy) := by
+  simp [evalPtrOffset, ptrOffsetWrapping, ThinPointer.wrapping_offset, ThinPointer.widen,
+    bind, Except.bind, pure, Except.pure]
+
+/-- **Universal MiniRust byte-slice uninit law** (for `compare_bytes` & `raw_eq`):
+`bs.mapM AbstractByte.data = none` iff `bs` contains an `.Uninit` byte, matching
+Trusted `hasUninitByte` eager uninit rejection. -/
+theorem cm_minirust_bytes_uninit_iff (bs : List Byte) :
+    bs.mapM AbstractByte.data = none ↔ ∃ b ∈ bs, b = .Uninit := by
+  induction bs with
+  | nil => simp
+  | cons b rest ih =>
+    cases b with
+    | Uninit =>
+      simp [AbstractByte.data, bind, Option.bind]
+    | Init d prov =>
+      simp only [List.mapM_cons, AbstractByte.data, bind, Option.bind, List.mem_cons,
+        reduceCtorEq, false_and, exists_eq_or_imp, false_or]
+      constructor
+      · intro h
+        cases hm : rest.mapM AbstractByte.data with
+        | none => exact ih.mp hm
+        | some rs => rw [hm] at h; cases h
+      · intro h
+        rw [ih.mpr h]
+
+/-- **Universal `black_box` invalid-`bool` UB law**: for EVERY `b ≥ 2`,
+`evalBlackBoxCall` on `bool` with `.scalar ⟨b, 1⟩` deterministically faults `.ub`. -/
+theorem cm_evalBlackBoxCall_invalid_bool_ub (s : MachineState) (decls : List MirAst.LocalDecl)
+    (lay : LayoutTable) (ops : List Operand) (locals : List LocalSlot) (dest : Place)
+    (tgt : Option BasicBlockIdx) (b : Nat) (hb : 2 ≤ b)
+    (hTy : resolveBlackBoxTy? { defPath := "core::intrinsics::black_box", typeArgs := [.bool] }
+      decls lay ops = some { kind := .bool, layoutIdx := unresolvedLayoutIdx lay }) :
+    evalBlackBoxCall s { defPath := "core::intrinsics::black_box", typeArgs := [.bool] }
+      decls lay ops [.scalar ⟨b, 1⟩] locals dest tgt = MirStepNode.fail .ub := by
+  have hBle : Nat.ble b 1 = false := by
+    cases h : Nat.ble b 1 with
+    | false => rfl
+    | true => exact absurd (Nat.le_of_ble_eq_true h) (by omega)
+  unfold evalBlackBoxCall
+  rw [hTy]
+  dsimp only [defaultCodecFuel]
+  unfold validateBlackBoxValue
+  simp only [Nat.beq_refl, hBle, Bool.true_and]
+
+/-- **Universal `black_box` raw-pointer provenance-preservation law**: for EVERY
+state `s`, raw pointer type `*const u32` / `*mut u32`, and thin pointer `p`
+(backed or with in-range integer address), `evalBlackBoxCall` preserves
+`.ptr p (layoutPointerBytes lay)` (exact `allocId`, `tag`, `offsetBytes`)
+identically into `writeIntrinsicReturnWithProtectors`. -/
+theorem cm_evalBlackBoxCall_rawPtr_preserves_prov (s : MachineState) (decls : List MirAst.LocalDecl)
+    (lay : LayoutTable) (ops : List Operand) (locals : List LocalSlot) (dest : Place)
+    (tgt : Option BasicBlockIdx) (mutbl : MirAst.Mutability) (p : ProvenancePtr)
+    (hValid : p.allocId ≠ 0 ∨ isBackedPtr s.memory p = true ∨
+      p.offsetBytes < scalarModulus (layoutPointerBytes lay))
+    (hTy : resolveBlackBoxTy?
+        { defPath := "core::intrinsics::black_box", typeArgs := [.rawPtr mutbl (.uint .u32)] }
+        decls lay ops =
+      some { kind := .rawPtr mutbl (.uint .u32), layoutIdx := unresolvedLayoutIdx lay }) :
+    evalBlackBoxCall s
+      { defPath := "core::intrinsics::black_box", typeArgs := [.rawPtr mutbl (.uint .u32)] }
+      decls lay ops [.ptr p (layoutPointerBytes lay)] locals dest tgt =
+      writeIntrinsicReturnWithProtectors s decls lay locals dest tgt
+        (.ptr p (layoutPointerBytes lay)) := by
+  have hNull : ∃ b, isNullThinPtr s.memory (layoutPointerBytes lay) (.ptr p (layoutPointerBytes lay)) = .some b := by
+    unfold isNullThinPtr
+    simp only [Nat.beq_refl]
+    cases hUnb : Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p)) with
+    | false => exact ⟨false, rfl⟩
+    | true =>
+      have h0 : p.allocId = 0 := Nat.eq_of_beq_eq_true (Bool.and_eq_true_iff.mp hUnb).1
+      have hnb : isBackedPtr s.memory p = false :=
+        Bool.not_eq_true' _ |>.mp (Bool.and_eq_true_iff.mp hUnb).2
+      have hlt : p.offsetBytes < scalarModulus (layoutPointerBytes lay) := by
+        rcases hValid with hne | hb | hlt
+        · exact absurd h0 hne
+        · rw [hnb] at hb; cases hb
+        · exact hlt
+      have hblt : Nat.blt p.offsetBytes (scalarModulus (layoutPointerBytes lay)) = true :=
+        Nat.blt_eq.mpr hlt
+      exact ⟨Nat.beq p.offsetBytes 0, by simp [hblt]⟩
+  rcases hNull with ⟨b, hb⟩
+  unfold evalBlackBoxCall
+  rw [hTy]
+  dsimp only [defaultCodecFuel]
+  unfold validateBlackBoxValue
+  simp only [knownWidePointeeTailAux?, ptrPointeeMayBeUnsizedAux, hb]
 
 /-! ## §3. MiniRust Reference Programs (`Mach` & `MachTB`)
 

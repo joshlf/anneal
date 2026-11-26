@@ -505,7 +505,15 @@ def cmIntrinsicHooks (ld : List LocalDecl) (ly : LayoutTable) (tb : Bool) (tyArg
     deallocateStack := fun _ ptr => cmDeallocateStack ptr
     validatePlace := fun _ place _ _ =>
       match place.ref with
-      | .memory mp => do let _ ← annealReadImmediate ⟨.indirect mp, place.layout⟩; pure ()
+      | .memory mp => do
+        if place.layout.layout.uninhabited then
+          throw (.undefinedBehavior "validatePlace of uninhabited type")
+        let imm ← annealReadImmediate ⟨.indirect mp, place.layout⟩
+        match imm.imm with
+        | .scalar sc =>
+          if !annealValidateScalarForTyId place.layout.ty sc then
+            throw (.undefinedBehavior "validatePlace of invalid scalar value")
+        | _ => pure ()
       | _ => throw (.unsupported "validatePlace of a local place")
     tryAllocId := fun _ ptr => cmTryAllocId ptr
     checkSignedAccess := fun _ ptr dist => cmCheckSignedAccess ptr dist }
@@ -926,6 +934,784 @@ theorem cm_miri_ptrOffsetFrom_vendored_matrix :
     cmMiriPtrOffsetFromVendored false 4 1024 1030 = none := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
+private theorem cm_miri_size8_truncate_bv (v : Miri.ABI.U128) :
+    BitVec.zeroExtend 128 (BitVec.extractLsb (64 - 1) 0 v) =
+      BitVec.ofNat 128 (v.toNat % 2 ^ 64) := by
+  apply BitVec.eq_of_toNat_eq
+  simp only [BitVec.zeroExtend, BitVec.extractLsb, BitVec.extractLsb',
+    BitVec.toNat_setWidth, BitVec.toNat_ofNat, Nat.shiftRight_zero]
+
+private theorem cm_miri_size8_signExtend (v : Miri.ABI.U128) :
+    (Miri.ABI.Size.ofBytes 8).signExtend v =
+      .ok (if v.toNat % 2 ^ 64 ≥ 2 ^ 63 then ((v.toNat % 2 ^ 64 : Nat) : Int) - 2 ^ 64
+           else ((v.toNat % 2 ^ 64 : Nat) : Int)) := by
+  change Except.ok (BitVec.signExtend 128 (BitVec.extractLsb (64 - 1) 0 v)).toInt = _
+  congr 1
+  have hExt : (BitVec.signExtend 128 (BitVec.extractLsb (64 - 1) 0 v)).toInt =
+      (BitVec.extractLsb (64 - 1) 0 v).toInt := by
+    rw [BitVec.toInt_signExtend]; simp
+  rw [hExt, BitVec.toInt_eq_toNat_cond]
+  have hToNat : (BitVec.extractLsb (64 - 1) 0 v).toNat = v.toNat % 2 ^ 64 := by
+    simp only [BitVec.extractLsb, BitVec.extractLsb', BitVec.toNat_ofNat, Nat.shiftRight_zero]
+  rw [hToNat]
+  by_cases h : v.toNat % 2 ^ 64 ≥ 2 ^ 63
+  · have h2 : ¬ (2 * (v.toNat % 2 ^ 64) < 2 ^ (64 - 1 - 0 + 1)) := by omega
+    simp only [h, h2, ↓reduceIte]
+    have hpow : (2 ^ (64 - 1 - 0 + 1) : Nat) = 2 ^ 64 := by decide
+    rw [hpow]; rfl
+  · have h2 : 2 * (v.toNat % 2 ^ 64) < 2 ^ (64 - 1 - 0 + 1) := by omega
+    simp only [h, h2, ↓reduceIte]
+
+private theorem cm_miri_toBits_8 (sc : Miri.Memory.ScalarInt)
+    (hSz : sc.size = Miri.ABI.Size.ofBytes 8) :
+    sc.toBits (Miri.ABI.Size.ofBytes 8) = .ok sc.data := by
+  change (if (Miri.ABI.Size.ofBytes 8 != sc.size) = true then
+      Except.error (Miri.Memory.ScalarIntError.sizeMismatch (Miri.ABI.Size.ofBytes 8) sc.size)
+    else Except.ok sc.data) = Except.ok sc.data
+  rw [hSz]; rfl
+
+private theorem cm_miri_truncateFromUInt_8 (v : Miri.ABI.U128) :
+    ∃ sc : Miri.Memory.ScalarInt,
+      Miri.Memory.ScalarInt.truncateFromUInt v (Miri.ABI.Size.ofBytes 8) =
+        .ok (sc, BitVec.ofNat 128 (v.toNat % 2 ^ 64) != v) ∧
+      sc.size = Miri.ABI.Size.ofBytes 8 ∧
+      sc.data = BitVec.ofNat 128 (v.toNat % 2 ^ 64) := by
+  let sc : Miri.Memory.ScalarInt :=
+    match Miri.Memory.ScalarInt.truncateFromUInt v (Miri.ABI.Size.ofBytes 8) with
+    | .ok (s, _) => s
+    | .error _ => Miri.Memory.ScalarInt.ofUInt64 0
+  refine ⟨sc, ?_, rfl, ?_⟩
+  · have hLow := cm_miri_size8_truncate_bv v
+    change Except.ok (sc, BitVec.zeroExtend 128 (BitVec.extractLsb (64 - 1) 0 v) != v) =
+      Except.ok (sc, BitVec.ofNat 128 (v.toNat % 2 ^ 64) != v)
+    rw [hLow]
+  · exact cm_miri_size8_truncate_bv v
+
+private theorem cm_miri_truncateFromInt_8 (n : Int)
+    (hLo : -(2 ^ 127 : Int) ≤ n) (hHi : n < (2 ^ 127 : Int)) :
+    ∃ sc : Miri.Memory.ScalarInt,
+      Miri.Memory.ScalarInt.truncateFromInt n (Miri.ABI.Size.ofBytes 8) =
+        .ok (sc,
+          (if (BitVec.ofInt 128 n).toNat % 2 ^ 64 ≥ 2 ^ 63 then
+             (((BitVec.ofInt 128 n).toNat % 2 ^ 64 : Nat) : Int) - 2 ^ 64
+           else (((BitVec.ofInt 128 n).toNat % 2 ^ 64 : Nat) : Int)) != n) ∧
+      sc.size = Miri.ABI.Size.ofBytes 8 ∧
+      sc.data = BitVec.ofNat 128 ((BitVec.ofInt 128 n).toNat % 2 ^ 64) := by
+  obtain ⟨sc, hTr, hSz, hDat⟩ := cm_miri_truncateFromUInt_8 (BitVec.ofInt 128 n)
+  refine ⟨sc, ?_, hSz, hDat⟩
+  have h1 : ¬ (n < -(2 ^ 127 : Int)) := by omega
+  have h2 : ¬ (n ≥ (2 ^ 127 : Int)) := by omega
+  have hNotOut : (decide (n < -(2 ^ 127 : Int)) || decide (n ≥ (2 ^ 127 : Int))) = false := by
+    simp only [h1, h2, decide_false, Bool.or_self]
+  unfold Miri.Memory.ScalarInt.truncateFromInt
+  simp only [hNotOut, Bool.false_eq_true, ↓reduceIte]
+  change (do
+    let (result, _) ← Miri.Memory.ScalarInt.truncateFromUInt (BitVec.ofInt 128 n) (Miri.ABI.Size.ofBytes 8)
+    let decoded ← (Miri.ABI.Size.ofBytes 8).signExtend result.data |>.mapError Miri.Memory.ScalarIntError.sizeError
+    pure (result, decoded != n)) = _
+  rw [hTr]
+  simp only [bind, Except.bind, pure, Except.pure, Except.mapError, hDat, cm_miri_size8_signExtend]
+  have hModEq : (BitVec.ofNat 128 ((BitVec.ofInt 128 n).toNat % 2 ^ 64)).toNat % 2 ^ 64 =
+      (BitVec.ofInt 128 n).toNat % 2 ^ 64 := by
+    have hlt := Nat.mod_lt (BitVec.ofInt 128 n).toNat (show 0 < 2 ^ 64 by decide)
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (Nat.lt_trans hlt (by decide)), Nat.mod_eq_of_lt hlt]
+  rw [hModEq]
+
+private theorem cm_miri_subWithOverflow_u64 (aOff bOff : UInt64) :
+    ∃ sc : Miri.Memory.ScalarInt,
+      Miri.Interpreter.IntegerOps.binary .SubWithOverflow
+        ⟨Miri.Memory.ScalarInt.ofUInt64 aOff, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+        ⟨Miri.Memory.ScalarInt.ofUInt64 bOff, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ =
+        .ok (.withOverflow sc (decide (aOff.toNat < bOff.toNat))) ∧
+      sc.size = Miri.ABI.Size.ofBytes 8 ∧
+      sc.data = BitVec.ofNat 128
+        (if aOff.toNat < bOff.toNat then 2 ^ 64 + aOff.toNat - bOff.toNat
+         else aOff.toNat - bOff.toNat) := by
+  have ha : aOff.toNat < 2 ^ 64 := aOff.toBitVec.isLt
+  have hb : bOff.toNat < 2 ^ 64 := bOff.toBitVec.isLt
+  have hA128 : (BitVec.ofNat 128 aOff.toNat).toNat = aOff.toNat := by
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega)]
+  have hB128 : (BitVec.ofNat 128 bOff.toNat).toNat = bOff.toNat := by
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega)]
+  have hBin :
+      Miri.Interpreter.IntegerOps.binary .SubWithOverflow
+        ⟨Miri.Memory.ScalarInt.ofUInt64 aOff, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+        ⟨Miri.Memory.ScalarInt.ofUInt64 bOff, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ =
+      (do
+        let l : Int := Int.ofNat (BitVec.ofNat 128 aOff.toNat).toNat
+        let r : Int := Int.ofNat (BitVec.ofNat 128 bOff.toNat).toNat
+        if r == 0 then pure () else pure ()
+        let result : Int := l - r
+        let hostOverflow := decide (result < 0) || decide (result ≥ (2 ^ 128 : Int))
+        let (value, lossy) ←
+          (Miri.Memory.ScalarInt.truncateFromUInt (BitVec.ofInt 128 result) (Miri.ABI.Size.ofBytes 8)).mapError
+            Miri.Interpreter.IntegerOpError.scalar
+        if (hostOverflow || lossy) && false then
+          throw (Miri.Interpreter.IntegerOpError.undefinedBehavior (.arithmeticOverflow .SubWithOverflow))
+        pure (Miri.Interpreter.IntegerResult.withOverflow value (hostOverflow || lossy))) := rfl
+  obtain ⟨sc, hTr, hSz, hDat⟩ :=
+    cm_miri_truncateFromUInt_8 (BitVec.ofInt 128 ((aOff.toNat : Int) - (bOff.toNat : Int)))
+  refine ⟨sc, ?_, hSz, ?_⟩
+  · rw [hBin, hA128, hB128]
+    simp only [Int.ofNat_eq_natCast, ite_self, bind, Except.bind, pure, Except.pure,
+      Except.mapError, hTr, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+    by_cases hlt : aOff.toNat < bOff.toNat
+    · have hNeg : ((aOff.toNat : Int) - (bOff.toNat : Int)) < 0 := by omega
+      simp only [hlt, hNeg, decide_true, Bool.true_or]
+    · have hNonneg : ¬ (((aOff.toNat : Int) - (bOff.toNat : Int)) < 0) := by omega
+      have hNotGe : ¬ (((aOff.toNat : Int) - (bOff.toNat : Int)) ≥ (2 ^ 128 : Int)) := by omega
+      have hBvNat : (BitVec.ofInt 128 ((aOff.toNat : Int) - (bOff.toNat : Int))).toNat =
+          aOff.toNat - bOff.toNat := by
+        rw [BitVec.toNat_ofInt]
+        have hP : (↑(2 ^ 128 : Nat) : Int) = (2 ^ 128 : Int) := by decide
+        rw [hP]
+        have h1 : (((aOff.toNat : Int) - (bOff.toNat : Int)) % (2 ^ 128 : Int)) =
+            ((aOff.toNat - bOff.toNat : Nat) : Int) := by omega
+        rw [h1]; rfl
+      have hMod64 : (aOff.toNat - bOff.toNat) % 2 ^ 64 = aOff.toNat - bOff.toNat :=
+        Nat.mod_eq_of_lt (by omega)
+      have hBvEq : BitVec.ofNat 128 (aOff.toNat - bOff.toNat) =
+          BitVec.ofInt 128 ((aOff.toNat : Int) - (bOff.toNat : Int)) := by
+        apply BitVec.eq_of_toNat_eq
+        rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega), hBvNat]
+      simp only [hlt, hNonneg, hNotGe, decide_false, Bool.false_or, hBvNat, hMod64,
+        hBvEq, bne_self_eq_false]
+  · rw [hDat]
+    by_cases hlt : aOff.toNat < bOff.toNat
+    · have hBvNat : (BitVec.ofInt 128 ((aOff.toNat : Int) - (bOff.toNat : Int))).toNat =
+          2 ^ 128 + aOff.toNat - bOff.toNat := by
+        rw [BitVec.toNat_ofInt]
+        have hP : (↑(2 ^ 128 : Nat) : Int) = (2 ^ 128 : Int) := by decide
+        rw [hP]
+        have h1 : (((aOff.toNat : Int) - (bOff.toNat : Int)) % (2 ^ 128 : Int)) =
+            ((2 ^ 128 + aOff.toNat - bOff.toNat : Nat) : Int) := by omega
+        rw [h1]; rfl
+      have hMod64 : (2 ^ 128 + aOff.toNat - bOff.toNat) % 2 ^ 64 = 2 ^ 64 + aOff.toNat - bOff.toNat := by
+        have hSplit : 2 ^ 128 + aOff.toNat - bOff.toNat =
+            (2 ^ 64 - 1) * 2 ^ 64 + (2 ^ 64 + aOff.toNat - bOff.toNat) := by omega
+        rw [hSplit, Nat.mul_add_mod_self_right, Nat.mod_eq_of_lt (by omega)]
+      simp only [hlt, ↓reduceIte, hBvNat, hMod64]
+    · have hBvNat : (BitVec.ofInt 128 ((aOff.toNat : Int) - (bOff.toNat : Int))).toNat =
+          aOff.toNat - bOff.toNat := by
+        rw [BitVec.toNat_ofInt]
+        have hP : (↑(2 ^ 128 : Nat) : Int) = (2 ^ 128 : Int) := by decide
+        rw [hP]
+        have h1 : (((aOff.toNat : Int) - (bOff.toNat : Int)) % (2 ^ 128 : Int)) =
+            ((aOff.toNat - bOff.toNat : Nat) : Int) := by omega
+        rw [h1]; rfl
+      have hMod64 : (aOff.toNat - bOff.toNat) % 2 ^ 64 = aOff.toNat - bOff.toNat :=
+        Nat.mod_eq_of_lt (by omega)
+      simp only [hlt, ↓reduceIte, hBvNat, hMod64]
+
+private theorem cm_miri_toTargetIsize_8 (sc : Miri.Memory.ScalarInt) (raw : Nat)
+    (hSz : sc.size = Miri.ABI.Size.ofBytes 8)
+    (hDat : sc.data = BitVec.ofNat 128 raw) (hRaw : raw < 2 ^ 64) :
+    sc.toTargetIsize (Miri.ABI.Size.ofBytes 8) =
+      .ok (Int64.ofInt (if raw ≥ 2 ^ 63 then (raw : Int) - 2 ^ 64 else (raw : Int))) := by
+  have hBv : (BitVec.ofNat 128 raw).toNat % 2 ^ 64 = raw := by
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (show raw < 2 ^ 128 by omega), Nat.mod_eq_of_lt hRaw]
+  unfold Miri.Memory.ScalarInt.toTargetIsize Miri.Memory.ScalarInt.toInt
+  rw [cm_miri_toBits_8 sc hSz, hDat]
+  simp only [bind, Except.bind, pure, Except.pure, Except.mapError, cm_miri_size8_signExtend, hBv]
+  by_cases h : raw ≥ 2 ^ 63
+  · have hRng1 : ¬ (((raw : Int) - 2 ^ 64) < -(2 ^ 63 : Int)) := by omega
+    have hRng2 : ¬ (((raw : Int) - 2 ^ 64) ≥ (2 ^ 63 : Int)) := by omega
+    simp only [h, hRng1, hRng2, decide_false, Bool.or_self, Bool.false_eq_true, ↓reduceIte]
+  · have hRng1 : ¬ ((raw : Int) < -(2 ^ 63 : Int)) := by omega
+    have hRng2 : ¬ ((raw : Int) ≥ (2 ^ 63 : Int)) := by omega
+    simp only [h, hRng1, hRng2, decide_false, Bool.or_self, Bool.false_eq_true, ↓reduceIte]
+
+private theorem cm_miri_tryFromInt_8_in (n : Int)
+    (hLo : -(2 ^ 63 : Int) ≤ n) (hHi : n < (2 ^ 63 : Int)) :
+    ∃ sc : Miri.Memory.ScalarInt,
+      Miri.Memory.ScalarInt.tryFromInt n (Miri.ABI.Size.ofBytes 8) = .ok (some sc) ∧
+      sc.size = Miri.ABI.Size.ofBytes 8 ∧
+      sc.data = BitVec.ofNat 128 (if n < 0 then (n + 2 ^ 64).toNat else n.toNat) := by
+  obtain ⟨sc, hTr, hSz, hDat⟩ := cm_miri_truncateFromInt_8 n (by omega) (by omega)
+  have hBvMod : (BitVec.ofInt 128 n).toNat % 2 ^ 64 =
+      if n < 0 then (n + 2 ^ 64).toNat else n.toNat := by
+    have hP : (↑(2 ^ 128 : Nat) : Int) = (2 ^ 128 : Int) := by decide
+    by_cases hn : n < 0
+    · simp only [hn, ↓reduceIte]
+      rw [BitVec.toNat_ofInt, hP]
+      have h1 : (n % (2 ^ 128 : Int)).toNat = 2 ^ 128 - (-n).toNat := by omega
+      rw [h1]
+      have hSplit : 2 ^ 128 - (-n).toNat = (2 ^ 64 - 1) * 2 ^ 64 + (n + 2 ^ 64).toNat := by omega
+      rw [hSplit, Nat.mul_add_mod_self_right, Nat.mod_eq_of_lt (by omega)]
+    · simp only [hn, ↓reduceIte]
+      rw [BitVec.toNat_ofInt, hP]
+      have h1 : (n % (2 ^ 128 : Int)).toNat = n.toNat := by omega
+      rw [h1, Nat.mod_eq_of_lt (by omega)]
+  have hDecEq : (if (BitVec.ofInt 128 n).toNat % 2 ^ 64 ≥ 2 ^ 63 then
+      (((BitVec.ofInt 128 n).toNat % 2 ^ 64 : Nat) : Int) - 2 ^ 64
+    else (((BitVec.ofInt 128 n).toNat % 2 ^ 64 : Nat) : Int)) = n := by
+    rw [hBvMod]
+    by_cases hn : n < 0
+    · have hGe : (n + 2 ^ 64).toNat ≥ 2 ^ 63 := by omega
+      simp only [hn, hGe, ↓reduceIte]; omega
+    · have hLt : ¬ (n.toNat ≥ 2 ^ 63) := by omega
+      simp only [hn, hLt, ↓reduceIte]; omega
+  refine ⟨sc, ?_, hSz, by rw [hDat, hBvMod]⟩
+  unfold Miri.Memory.ScalarInt.tryFromInt
+  rw [hTr, hDecEq]
+  simp only [bne_self_eq_false, bind, Except.bind, pure, Except.pure, Bool.false_eq_true, ↓reduceIte]
+
+private theorem cm_miri_tryFromInt_8_not_some (n : Int)
+    (hOut : n < -(2 ^ 63 : Int) ∨ n ≥ (2 ^ 63 : Int)) :
+    Miri.Memory.ScalarInt.tryFromInt n (Miri.ABI.Size.ofBytes 8) = .ok none ∨
+    Miri.Memory.ScalarInt.tryFromInt n (Miri.ABI.Size.ofBytes 8) = .error (.integerOutsideI128 n) := by
+  by_cases h128 : n < -(2 ^ 127 : Int) ∨ n ≥ (2 ^ 127 : Int)
+  · right
+    have hCond : (decide (n < -(2 ^ 127 : Int)) || decide (n ≥ (2 ^ 127 : Int))) = true := by
+      rcases h128 with h | h
+      · simp only [h, decide_true, Bool.true_or]
+      · simp only [h, decide_true, Bool.or_true]
+    unfold Miri.Memory.ScalarInt.tryFromInt Miri.Memory.ScalarInt.truncateFromInt
+    simp only [hCond, ↓reduceIte, bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+  · left
+    obtain ⟨sc, hTr, _, _⟩ := cm_miri_truncateFromInt_8 n (by omega) (by omega)
+    let dec : Int := if (BitVec.ofInt 128 n).toNat % 2 ^ 64 ≥ 2 ^ 63 then
+        (((BitVec.ofInt 128 n).toNat % 2 ^ 64 : Nat) : Int) - 2 ^ 64
+      else (((BitVec.ofInt 128 n).toNat % 2 ^ 64 : Nat) : Int)
+    have hDecRange : -(2 ^ 63 : Int) ≤ dec ∧ dec < (2 ^ 63 : Int) := by
+      have hlt := Nat.mod_lt (BitVec.ofInt 128 n).toNat (show 0 < 2 ^ 64 by decide)
+      dsimp only [dec]
+      by_cases h : (BitVec.ofInt 128 n).toNat % 2 ^ 64 ≥ 2 ^ 63 <;> simp only [h, ↓reduceIte] <;> omega
+    have hNe : (dec != n) = true := by
+      have hEqF : (dec == n) = false := beq_false_of_ne (by omega)
+      simp only [bne, hEqF, Bool.not_false]
+    unfold Miri.Memory.ScalarInt.tryFromInt
+    rw [hTr]
+    change (do let (result, overflow) ← Except.ok (sc, dec != n); if overflow then pure none else pure (some result)) = _
+    simp only [hNe, bind, Except.bind, pure, Except.pure, ↓reduceIte]
+
+private theorem cm_miri_decode_8 (unsigned : Bool) (sc : Miri.Memory.ScalarInt) (a : Int)
+    (hSz : sc.size = Miri.ABI.Size.ofBytes 8)
+    (hDat : sc.data = BitVec.ofNat 128 (if a < 0 then (a + 2 ^ 64).toNat else a.toNat))
+    (hA : if unsigned then 0 ≤ a ∧ a < 2 ^ 63 else -(2 ^ 63 : Int) < a ∧ a < 2 ^ 63) :
+    Miri.Interpreter.IntegerOps.decode
+      ⟨sc, if unsigned then ⟨Miri.ABI.Size.ofBytes 8, .usize⟩ else ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩ =
+      .ok a := by
+  cases unsigned with
+  | true =>
+    simp only [↓reduceIte] at hA ⊢
+    have haNotNeg : ¬ (a < 0) := by omega
+    simp only [haNotNeg, ↓reduceIte] at hDat
+    unfold Miri.Interpreter.IntegerOps.decode Miri.Interpreter.IntegerType.signed Miri.MIR.IntegerKind.signed
+      Miri.Memory.ScalarInt.toUInt
+    simp only [Bool.false_eq_true, ↓reduceIte, cm_miri_toBits_8 sc hSz, hDat, Except.mapError,
+      bind, Except.bind, pure, Except.pure, BitVec.toNat_ofNat,
+      Nat.mod_eq_of_lt (show a.toNat < 2 ^ 128 by omega), Int.ofNat_eq_natCast]
+    congr 1; omega
+  | false =>
+    simp only [Bool.false_eq_true, ↓reduceIte] at hA ⊢
+    unfold Miri.Interpreter.IntegerOps.decode Miri.Interpreter.IntegerType.signed Miri.MIR.IntegerKind.signed
+      Miri.Memory.ScalarInt.toInt
+    simp only [↓reduceIte, cm_miri_toBits_8 sc hSz, hDat, bind, Except.bind, Except.mapError,
+      cm_miri_size8_signExtend]
+    by_cases haNeg : a < 0
+    · have hBv : (BitVec.ofNat 128 (a + 2 ^ 64).toNat).toNat % 2 ^ 64 = (a + 2 ^ 64).toNat := by
+        rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega), Nat.mod_eq_of_lt (by omega)]
+      have hGe : (a + 2 ^ 64).toNat ≥ 2 ^ 63 := by omega
+      simp only [haNeg, ↓reduceIte, hBv, hGe]
+      congr 1; omega
+    · have hBv : (BitVec.ofNat 128 a.toNat).toNat % 2 ^ 64 = a.toNat := by
+        rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega), Nat.mod_eq_of_lt (by omega)]
+      have hLt : ¬ (a.toNat ≥ 2 ^ 63) := by omega
+      simp only [haNeg, ↓reduceIte, hBv, hLt]
+      congr 1; omega
+
+private theorem cm_miri_binary_divrem_8 (isDiv unsigned : Bool)
+    (aSc bSc : Miri.Memory.ScalarInt) (a b : Int)
+    (hASz : aSc.size = Miri.ABI.Size.ofBytes 8)
+    (hADat : aSc.data = BitVec.ofNat 128 (if a < 0 then (a + 2 ^ 64).toNat else a.toNat))
+    (hBSz : bSc.size = Miri.ABI.Size.ofBytes 8)
+    (hBDat : bSc.data = BitVec.ofNat 128 b.toNat)
+    (hA : if unsigned then 0 ≤ a ∧ a < 2 ^ 63 else -(2 ^ 63 : Int) < a ∧ a < 2 ^ 63)
+    (hB : 0 < b ∧ b < 2 ^ 63) :
+    let retTy : Miri.Interpreter.IntegerType :=
+      if unsigned then ⟨Miri.ABI.Size.ofBytes 8, .usize⟩ else ⟨Miri.ABI.Size.ofBytes 8, .isize⟩
+    let q := if isDiv then Int.tdiv a b else Int.tmod a b
+    ∃ qSc : Miri.Memory.ScalarInt,
+      Miri.Interpreter.IntegerOps.binary (if isDiv then .Div else .Rem) ⟨aSc, retTy⟩ ⟨bSc, retTy⟩ =
+        .ok (.scalar qSc) ∧
+      qSc.size = Miri.ABI.Size.ofBytes 8 ∧
+      qSc.data = BitVec.ofNat 128 (if q < 0 then (q + 2 ^ 64).toNat else q.toNat) := by
+  have hbNotNeg : ¬ (b < 0) := by omega
+  have hBDatIf : bSc.data = BitVec.ofNat 128 (if b < 0 then (b + 2 ^ 64).toNat else b.toNat) := by
+    simp only [hbNotNeg, ↓reduceIte]; exact hBDat
+  have hBIn : if unsigned then 0 ≤ b ∧ b < 2 ^ 63 else -(2 ^ 63 : Int) < b ∧ b < 2 ^ 63 := by
+    cases unsigned <;> simp only [Bool.false_eq_true, ↓reduceIte] <;> omega
+  have hDecA := cm_miri_decode_8 unsigned aSc a hASz hADat hA
+  have hDecB := cm_miri_decode_8 unsigned bSc b hBSz hBDatIf hBIn
+  have hBNe : (b == 0) = false := beq_false_of_ne (by omega)
+  have hQBounds :
+      (if unsigned then 0 ≤ (if isDiv then Int.tdiv a b else Int.tmod a b) ∧
+          (if isDiv then Int.tdiv a b else Int.tmod a b) < 2 ^ 63
+       else -(2 ^ 63 : Int) < (if isDiv then Int.tdiv a b else Int.tmod a b) ∧
+          (if isDiv then Int.tdiv a b else Int.tmod a b) < 2 ^ 63) := by
+    cases unsigned with
+    | true =>
+      simp only [↓reduceIte] at hA ⊢
+      have haEq : a = (a.toNat : Int) := by omega
+      have hbEq : b = (b.toNat : Int) := by omega
+      cases isDiv with
+      | true =>
+        simp only [↓reduceIte]; rw [haEq, hbEq]
+        have h1 : Int.tdiv (a.toNat : Int) (b.toNat : Int) = ((a.toNat / b.toNat : Nat) : Int) := rfl
+        rw [h1]
+        have hle : ((a.toNat / b.toNat : Nat) : Int) ≤ (a.toNat : Int) :=
+          Int.ofNat_le.mpr (Nat.div_le_self a.toNat b.toNat)
+        have hnn : (0 : Int) ≤ ((a.toNat / b.toNat : Nat) : Int) := Int.natCast_nonneg _
+        generalize ((a.toNat / b.toNat : Nat) : Int) = qn at hle hnn ⊢
+        omega
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte]; rw [haEq, hbEq]
+        have h1 : Int.tmod (a.toNat : Int) (b.toNat : Int) = ((a.toNat % b.toNat : Nat) : Int) := rfl
+        rw [h1]; have hlt := Nat.mod_lt a.toNat (show 0 < b.toNat by omega); omega
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte] at hA ⊢
+      have hbEq : b = (b.toNat : Int) := by omega
+      by_cases haNeg : a < 0
+      · have haEq : a = -((-a).toNat : Int) := by omega
+        cases isDiv with
+        | true =>
+          simp only [↓reduceIte]; rw [haEq, hbEq, Int.neg_tdiv]
+          have h1 : Int.tdiv ((-a).toNat : Int) (b.toNat : Int) = (((-a).toNat / b.toNat : Nat) : Int) := rfl
+          rw [h1]
+          have hle : (((-a).toNat / b.toNat : Nat) : Int) ≤ ((-a).toNat : Int) :=
+            Int.ofNat_le.mpr (Nat.div_le_self (-a).toNat b.toNat)
+          have hnn : (0 : Int) ≤ (((-a).toNat / b.toNat : Nat) : Int) := Int.natCast_nonneg _
+          generalize (((-a).toNat / b.toNat : Nat) : Int) = qn at hle hnn ⊢
+          omega
+        | false =>
+          simp only [Bool.false_eq_true, ↓reduceIte]; rw [haEq, hbEq, Int.neg_tmod]
+          have h1 : Int.tmod ((-a).toNat : Int) (b.toNat : Int) = (((-a).toNat % b.toNat : Nat) : Int) := rfl
+          rw [h1]; have hlt := Nat.mod_lt (-a).toNat (show 0 < b.toNat by omega); omega
+      · have haEq : a = (a.toNat : Int) := by omega
+        cases isDiv with
+        | true =>
+          simp only [↓reduceIte]; rw [haEq, hbEq]
+          have h1 : Int.tdiv (a.toNat : Int) (b.toNat : Int) = ((a.toNat / b.toNat : Nat) : Int) := rfl
+          rw [h1]
+          have hle : ((a.toNat / b.toNat : Nat) : Int) ≤ (a.toNat : Int) :=
+            Int.ofNat_le.mpr (Nat.div_le_self a.toNat b.toNat)
+          have hnn : (0 : Int) ≤ ((a.toNat / b.toNat : Nat) : Int) := Int.natCast_nonneg _
+          generalize ((a.toNat / b.toNat : Nat) : Int) = qn at hle hnn ⊢
+          omega
+        | false =>
+          simp only [Bool.false_eq_true, ↓reduceIte]; rw [haEq, hbEq]
+          have h1 : Int.tmod (a.toNat : Int) (b.toNat : Int) = ((a.toNat % b.toNat : Nat) : Int) := rfl
+          rw [h1]; have hlt := Nat.mod_lt a.toNat (show 0 < b.toNat by omega); omega
+  cases unsigned with
+  | true =>
+    simp only [↓reduceIte] at hA hQBounds hDecA hDecB ⊢
+    let q : Int := if isDiv then Int.tdiv a b else Int.tmod a b
+    have hqNotNeg : ¬ (q < 0) := by dsimp only [q]; omega
+    have hqLt : q < 2 ^ 63 := hQBounds.2
+    have hqGe : 0 ≤ q := hQBounds.1
+    obtain ⟨qSc, hTr, hQSz, hQDat⟩ := cm_miri_truncateFromUInt_8 (BitVec.ofInt 128 q)
+    have hBvMod : (BitVec.ofInt 128 q).toNat % 2 ^ 64 = q.toNat := by
+      have hP : (↑(2 ^ 128 : Nat) : Int) = (2 ^ 128 : Int) := by decide
+      rw [BitVec.toNat_ofInt, hP]
+      have h1 : (q % (2 ^ 128 : Int)).toNat = q.toNat := by omega
+      rw [h1, Nat.mod_eq_of_lt (by omega)]
+    refine ⟨qSc, ?_, hQSz, ?_⟩
+    · cases isDiv with
+      | true =>
+        simp only [q, ↓reduceIte] at hTr ⊢
+        have hBin :
+            Miri.Interpreter.IntegerOps.binary .Div
+              ⟨aSc, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ ⟨bSc, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ =
+            (do
+              let l ← Miri.Interpreter.IntegerOps.decode ⟨aSc, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+              let r ← Miri.Interpreter.IntegerOps.decode ⟨bSc, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+              if r == 0 then throw (Miri.Interpreter.IntegerOpError.undefinedBehavior .divisionByZero)
+              let result := Int.tdiv l r
+              let hostOverflow := decide (result < 0) || decide (result ≥ (2 ^ 128 : Int))
+              let (value, lossy) ←
+                (Miri.Memory.ScalarInt.truncateFromUInt (BitVec.ofInt 128 result) (Miri.ABI.Size.ofBytes 8)).mapError
+                  Miri.Interpreter.IntegerOpError.scalar
+              if (hostOverflow || lossy) && false then
+                throw (Miri.Interpreter.IntegerOpError.undefinedBehavior (.arithmeticOverflow .Div))
+              pure (Miri.Interpreter.IntegerResult.scalar value)) := rfl
+        rw [hBin, hDecA, hDecB]
+        simp only [bind, Except.bind, pure, Except.pure, Except.mapError, hBNe,
+          Bool.false_eq_true, ↓reduceIte, hTr, Bool.and_false]
+      | false =>
+        simp only [q, Bool.false_eq_true, ↓reduceIte] at hTr ⊢
+        have hBin :
+            Miri.Interpreter.IntegerOps.binary .Rem
+              ⟨aSc, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ ⟨bSc, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ =
+            (do
+              let l ← Miri.Interpreter.IntegerOps.decode ⟨aSc, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+              let r ← Miri.Interpreter.IntegerOps.decode ⟨bSc, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+              if r == 0 then throw (Miri.Interpreter.IntegerOpError.undefinedBehavior .remainderByZero)
+              let result := Int.tmod l r
+              let hostOverflow := decide (result < 0) || decide (result ≥ (2 ^ 128 : Int))
+              let (value, lossy) ←
+                (Miri.Memory.ScalarInt.truncateFromUInt (BitVec.ofInt 128 result) (Miri.ABI.Size.ofBytes 8)).mapError
+                  Miri.Interpreter.IntegerOpError.scalar
+              if (hostOverflow || lossy) && false then
+                throw (Miri.Interpreter.IntegerOpError.undefinedBehavior (.arithmeticOverflow .Rem))
+              pure (Miri.Interpreter.IntegerResult.scalar value)) := rfl
+        rw [hBin, hDecA, hDecB]
+        simp only [bind, Except.bind, pure, Except.pure, Except.mapError, hBNe,
+          Bool.false_eq_true, ↓reduceIte, hTr, Bool.and_false]
+    · rw [hQDat, hBvMod]
+      change BitVec.ofNat 128 q.toNat = BitVec.ofNat 128 (if q < 0 then (q + 2 ^ 64).toNat else q.toNat)
+      simp only [hqNotNeg, ↓reduceIte]
+  | false =>
+    simp only [Bool.false_eq_true, ↓reduceIte] at hA hQBounds hDecA hDecB ⊢
+    let q : Int := if isDiv then Int.tdiv a b else Int.tmod a b
+    have hqLo : -(2 ^ 63 : Int) < q := hQBounds.1
+    have hqHi : q < (2 ^ 63 : Int) := hQBounds.2
+    have hNoOv : (a == -(Int.ofNat (2 ^ (64 - 1))) && b == -1) = false := by
+      have hBNotNeg1 : (b == -1) = false := beq_false_of_ne (by omega)
+      simp only [hBNotNeg1, Bool.and_false]
+    have hP128 : (↑(2 ^ 128 : Nat) : Int) = (2 ^ 128 : Int) := by decide
+    have hWrap : (BitVec.ofInt 128 q).toInt = q := by
+      rw [BitVec.toInt_ofInt, Int.bmod_def, hP128]
+      have hMod : q % (2 ^ 128 : Int) = if q < 0 then q + 2 ^ 128 else q := by omega
+      by_cases hqn : q < 0 <;> simp only [hqn, ↓reduceIte] at hMod <;> rw [hMod] <;> omega
+    obtain ⟨qSc, hTr, hQSz, hQDat⟩ := cm_miri_truncateFromInt_8 q (by omega) (by omega)
+    have hBvMod : (BitVec.ofInt 128 q).toNat % 2 ^ 64 =
+        if q < 0 then (q + 2 ^ 64).toNat else q.toNat := by
+      by_cases hqn : q < 0
+      · simp only [hqn, ↓reduceIte]
+        rw [BitVec.toNat_ofInt, hP128]
+        have h1 : (q % (2 ^ 128 : Int)).toNat = 2 ^ 128 - (-q).toNat := by omega
+        rw [h1]
+        have hSplit : 2 ^ 128 - (-q).toNat = (2 ^ 64 - 1) * 2 ^ 64 + (q + 2 ^ 64).toNat := by omega
+        rw [hSplit, Nat.mul_add_mod_self_right, Nat.mod_eq_of_lt (by omega)]
+      · simp only [hqn, ↓reduceIte]
+        rw [BitVec.toNat_ofInt, hP128]
+        have h1 : (q % (2 ^ 128 : Int)).toNat = q.toNat := by omega
+        rw [h1, Nat.mod_eq_of_lt (by omega)]
+    refine ⟨qSc, ?_, hQSz, by rw [hQDat, hBvMod]⟩
+    cases isDiv with
+    | true =>
+      simp only [q, ↓reduceIte] at hWrap hTr ⊢
+      have hBin :
+          Miri.Interpreter.IntegerOps.binary .Div
+            ⟨aSc, ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩ ⟨bSc, ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩ =
+          (do
+            let l ← Miri.Interpreter.IntegerOps.decode ⟨aSc, ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩
+            let r ← Miri.Interpreter.IntegerOps.decode ⟨bSc, ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩
+            if r == 0 then throw (Miri.Interpreter.IntegerOpError.undefinedBehavior .divisionByZero)
+            if l == -(Int.ofNat (2 ^ (64 - 1))) && r == -1 then
+              throw (Miri.Interpreter.IntegerOpError.undefinedBehavior .divisionOverflow)
+            let result := Int.tdiv l r
+            let hostOverflow := decide (result < -(2 ^ 127 : Int)) || decide (result ≥ (2 ^ 127 : Int))
+            let (value, lossy) ←
+              (Miri.Memory.ScalarInt.truncateFromInt (BitVec.ofInt 128 result).toInt (Miri.ABI.Size.ofBytes 8)).mapError
+                Miri.Interpreter.IntegerOpError.scalar
+            if (hostOverflow || lossy) && false then
+              throw (Miri.Interpreter.IntegerOpError.undefinedBehavior (.arithmeticOverflow .Div))
+            pure (Miri.Interpreter.IntegerResult.scalar value)) := rfl
+      rw [hBin, hDecA, hDecB]
+      simp only [bind, Except.bind, pure, Except.pure, Except.mapError, hBNe, hNoOv,
+        Bool.false_eq_true, ↓reduceIte, hWrap, hTr, Bool.and_false]
+    | false =>
+      simp only [q, Bool.false_eq_true, ↓reduceIte] at hWrap hTr ⊢
+      have hBin :
+          Miri.Interpreter.IntegerOps.binary .Rem
+            ⟨aSc, ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩ ⟨bSc, ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩ =
+          (do
+            let l ← Miri.Interpreter.IntegerOps.decode ⟨aSc, ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩
+            let r ← Miri.Interpreter.IntegerOps.decode ⟨bSc, ⟨Miri.ABI.Size.ofBytes 8, .isize⟩⟩
+            if r == 0 then throw (Miri.Interpreter.IntegerOpError.undefinedBehavior .remainderByZero)
+            if l == -(Int.ofNat (2 ^ (64 - 1))) && r == -1 then
+              throw (Miri.Interpreter.IntegerOpError.undefinedBehavior .remainderOverflow)
+            let result := Int.tmod l r
+            let hostOverflow := decide (result < -(2 ^ 127 : Int)) || decide (result ≥ (2 ^ 127 : Int))
+            let (value, lossy) ←
+              (Miri.Memory.ScalarInt.truncateFromInt (BitVec.ofInt 128 result).toInt (Miri.ABI.Size.ofBytes 8)).mapError
+                Miri.Interpreter.IntegerOpError.scalar
+            if (hostOverflow || lossy) && false then
+              throw (Miri.Interpreter.IntegerOpError.undefinedBehavior (.arithmeticOverflow .Rem))
+            pure (Miri.Interpreter.IntegerResult.scalar value)) := rfl
+      rw [hBin, hDecA, hDecB]
+      simp only [bind, Except.bind, pure, Except.pure, Except.mapError, hBNe, hNoOv,
+        Bool.false_eq_true, ↓reduceIte, hWrap, hTr, Bool.and_false]
+
+private theorem cm_miri_binary_rem_zero_8 (unsigned : Bool)
+    (aSc bSc : Miri.Memory.ScalarInt) (a : Int)
+    (hASz : aSc.size = Miri.ABI.Size.ofBytes 8)
+    (hADat : aSc.data = BitVec.ofNat 128 (if a < 0 then (a + 2 ^ 64).toNat else a.toNat))
+    (hBSz : bSc.size = Miri.ABI.Size.ofBytes 8)
+    (hBDat : bSc.data = BitVec.ofNat 128 0)
+    (hA : if unsigned then 0 ≤ a ∧ a < 2 ^ 63 else -(2 ^ 63 : Int) < a ∧ a < 2 ^ 63) :
+    let retTy : Miri.Interpreter.IntegerType :=
+      if unsigned then ⟨Miri.ABI.Size.ofBytes 8, .usize⟩ else ⟨Miri.ABI.Size.ofBytes 8, .isize⟩
+    Miri.Interpreter.IntegerOps.binary .Rem ⟨aSc, retTy⟩ ⟨bSc, retTy⟩ =
+      .error (.undefinedBehavior .remainderByZero) := by
+  have hDecA := cm_miri_decode_8 unsigned aSc a hASz hADat hA
+  have h0In : if unsigned then 0 ≤ (0 : Int) ∧ (0 : Int) < 2 ^ 63
+      else -(2 ^ 63 : Int) < (0 : Int) ∧ (0 : Int) < 2 ^ 63 := by
+    cases unsigned <;> simp only [Bool.false_eq_true, ↓reduceIte] <;> omega
+  have hBDatIf : bSc.data = BitVec.ofNat 128 (if (0 : Int) < 0 then ((0 : Int) + 2 ^ 64).toNat else (0 : Int).toNat) :=
+    hBDat
+  have hDecB := cm_miri_decode_8 unsigned bSc 0 hBSz hBDatIf h0In
+  exact Miri.Interpreter.IntegerOps.binary_remainder_by_zero _ _ a hDecA hDecB rfl
+
+/-- **Universal vendored-mirror faithfulness for `ptr_offset_from[_unsigned]`**:
+for ALL `unsigned : Bool`, ALL `elemSize : Nat`, and ALL 64-bit offsets
+`aOff bOff : UInt64`, `cmMiriPtrOffsetFromVendored` (calling UNMODIFIED vendored
+`Miri.Interpreter.IntegerOps.binary .SubWithOverflow`, `ScalarInt.toTargetIsize`,
+`ScalarInt.tryFromInt`, and `Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv`)
+equals `cmMiriPtrOffsetFromSpec`. -/
+theorem cm_miriPtrOffsetFromVendored_eq_spec (unsigned : Bool) (elemSize : Nat)
+    (aOff bOff : UInt64) :
+    cmMiriPtrOffsetFromVendored unsigned elemSize aOff bOff =
+      cmMiriPtrOffsetFromSpec unsigned elemSize aOff bOff := by
+  have ha : aOff.toNat < 2 ^ 64 := aOff.toBitVec.isLt
+  have hb : bOff.toNat < 2 ^ 64 := bOff.toBitVec.isLt
+  let raw : Nat := if aOff.toNat < bOff.toNat then 2 ^ 64 + aOff.toNat - bOff.toNat else aOff.toNat - bOff.toNat
+  let dist : Int := if raw ≥ 2 ^ 63 then (raw : Int) - 2 ^ 64 else (raw : Int)
+  have hRawLt : raw < 2 ^ 64 := by
+    dsimp only [raw]; by_cases h : aOff.toNat < bOff.toNat <;> simp only [h, ↓reduceIte] <;> omega
+  have hDistRng : -(2 ^ 63 : Int) ≤ dist ∧ dist < (2 ^ 63 : Int) := by
+    dsimp only [dist]; by_cases h : raw ≥ 2 ^ 63 <;> simp only [h, ↓reduceIte] <;> omega
+  obtain ⟨diffSc, hSub, hDiffSz, hDiffDat⟩ := cm_miri_subWithOverflow_u64 aOff bOff
+  have hToIsize := cm_miri_toTargetIsize_8 diffSc raw hDiffSz hDiffDat hRawLt
+  have hI64ToInt : (Int64.ofInt dist).toInt = dist := by
+    have hP64 : (↑(2 ^ 64 : Nat) : Int) = (2 ^ 64 : Int) := by decide
+    rw [Int64.toInt_ofInt, Int.bmod_def, hP64]
+    have h1 : dist % (2 ^ 64 : Int) = if dist < 0 then dist + 2 ^ 64 else dist := by omega
+    by_cases hdn : dist < 0 <;> simp only [hdn, ↓reduceIte] at h1 <;> rw [h1] <;> omega
+  have hDistEqSpec :
+      (if aOff.toNat < bOff.toNat then
+        if 2 ^ 64 + aOff.toNat - bOff.toNat ≥ 2 ^ 63 then
+          Int.ofNat (2 ^ 64 + aOff.toNat - bOff.toNat) - 2 ^ 64
+        else Int.ofNat (2 ^ 64 + aOff.toNat - bOff.toNat)
+      else
+        if aOff.toNat - bOff.toNat ≥ 2 ^ 63 then
+          Int.ofNat (aOff.toNat - bOff.toNat) - 2 ^ 64
+        else Int.ofNat (aOff.toNat - bOff.toNat)) = dist := by
+    dsimp only [dist, raw]
+    by_cases h : aOff.toNat < bOff.toNat <;> simp only [h, ↓reduceIte, Int.ofNat_eq_natCast]
+  unfold cmMiriPtrOffsetFromVendored cmMiriPtrOffsetFromSpec
+  dsimp only
+  rw [hSub]
+  dsimp only
+  rw [hToIsize]
+  dsimp only
+  rw [hI64ToInt, hDistEqSpec]
+  have hRangeCheck :
+      (if (decide (aOff.toNat < bOff.toNat)) = true then
+        !unsigned && !(decide (dist ≥ 0) || dist == -(2 ^ 63 : Int))
+      else !decide (dist < 0)) =
+      !(if aOff.toNat < bOff.toNat then
+          unsigned || decide (dist ≥ 0) || dist == -(2 ^ 63 : Int)
+        else decide (dist < 0)) := by
+    by_cases h : aOff.toNat < bOff.toNat <;> simp [h, Bool.and_assoc]
+  by_cases hBadRange :
+      (if aOff.toNat < bOff.toNat then
+        unsigned || decide (dist ≥ 0) || dist == -(2 ^ 63 : Int)
+      else decide (dist < 0)) = true
+  · rw [hRangeCheck, hBadRange]
+    simp only [Bool.not_true, Bool.not_false, ↓reduceIte]
+    by_cases h : aOff.toNat < bOff.toNat
+    · simp only [h, ↓reduceIte] at hBadRange ⊢
+      rw [hBadRange]; rfl
+    · simp only [h, ↓reduceIte] at hBadRange ⊢
+      simp only [decide_eq_true_eq.mp hBadRange, ↓reduceIte]
+  · have hBadFalse :
+        (if aOff.toNat < bOff.toNat then
+          unsigned || decide (dist ≥ 0) || dist == -(2 ^ 63 : Int)
+        else decide (dist < 0)) = false := Bool.eq_false_iff.mpr hBadRange
+    rw [hRangeCheck, hBadFalse]
+    simp only [Bool.not_true, Bool.not_false, Bool.false_eq_true, ↓reduceIte]
+    have hDistGood : if unsigned then 0 ≤ dist ∧ dist < 2 ^ 63 else -(2 ^ 63 : Int) < dist ∧ dist < 2 ^ 63 := by
+      by_cases h : aOff.toNat < bOff.toNat
+      · simp only [h, ↓reduceIte] at hBadFalse
+        have hU : unsigned = false := by cases unsigned <;> simp_all
+        have hNotGe0 : ¬ (dist ≥ 0) := by
+          intro hc; simp [hU, hc] at hBadFalse
+        have hNotMin : dist ≠ -(2 ^ 63 : Int) := by
+          intro hc; simp [hU, hc] at hBadFalse
+        simp only [hU, Bool.false_eq_true, ↓reduceIte]; omega
+      · simp only [h, ↓reduceIte] at hBadFalse
+        have hGe0 : 0 ≤ dist := by
+          have : ¬ (dist < 0) := decide_eq_false_iff_not.mp hBadFalse
+          omega
+        cases unsigned <;> simp only [Bool.false_eq_true, ↓reduceIte] <;> omega
+    obtain ⟨aSc, hTryA, hASz, hADat⟩ := cm_miri_tryFromInt_8_in dist hDistRng.1 hDistRng.2
+    rw [hTryA]
+    by_cases hElemBig : elemSize ≥ 2 ^ 63
+    · have hElemCond : (elemSize == 0 || decide (elemSize ≥ 2 ^ 63)) = true := by simp [hElemBig]
+      have hOut : Int.ofNat elemSize < -(2 ^ 63 : Int) ∨ Int.ofNat elemSize ≥ (2 ^ 63 : Int) := by
+        right; rw [Int.ofNat_eq_natCast]; omega
+      rcases cm_miri_tryFromInt_8_not_some (Int.ofNat elemSize) hOut with hBNone | hBErr
+      · rw [hBNone]; dsimp only
+        by_cases h : aOff.toNat < bOff.toNat
+        · simp only [h, ↓reduceIte] at hBadFalse ⊢
+          simp [hBadFalse, hElemCond]
+        · simp only [h, ↓reduceIte] at hBadFalse ⊢
+          have hNotNeg : ¬ (dist < 0) := decide_eq_false_iff_not.mp hBadFalse
+          simp [hNotNeg, hElemCond]
+      · rw [hBErr]; dsimp only
+        by_cases h : aOff.toNat < bOff.toNat
+        · simp only [h, ↓reduceIte] at hBadFalse ⊢
+          simp [hBadFalse, hElemCond]
+        · simp only [h, ↓reduceIte] at hBadFalse ⊢
+          have hNotNeg : ¬ (dist < 0) := decide_eq_false_iff_not.mp hBadFalse
+          simp [hNotNeg, hElemCond]
+    · have hElemLt : elemSize < 2 ^ 63 := by omega
+      have hElemLo : -(2 ^ 63 : Int) ≤ Int.ofNat elemSize := by rw [Int.ofNat_eq_natCast]; omega
+      have hElemHi : Int.ofNat elemSize < (2 ^ 63 : Int) := by rw [Int.ofNat_eq_natCast]; omega
+      obtain ⟨bSc, hTryB, hBSz, hBDatRaw⟩ := cm_miri_tryFromInt_8_in (Int.ofNat elemSize) hElemLo hElemHi
+      have hElemNotNeg : ¬ (Int.ofNat elemSize < 0) := by rw [Int.ofNat_eq_natCast]; omega
+      have hBDat : bSc.data = BitVec.ofNat 128 elemSize := by
+        simp only [hElemNotNeg, ↓reduceIte] at hBDatRaw; exact hBDatRaw
+      rw [hTryB]
+      dsimp only
+      by_cases hElem0 : elemSize = 0
+      · subst hElem0
+        unfold Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv
+        simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, bind, Except.bind,
+          Except.mapError, cm_miri_binary_rem_zero_8 unsigned aSc bSc dist hASz hADat hBSz hBDat hDistGood]
+        by_cases h : aOff.toNat < bOff.toNat
+        · simp only [h, ↓reduceIte] at hBadFalse ⊢
+          simp [hBadFalse]
+        · simp only [h, ↓reduceIte] at hBadFalse ⊢
+          have hNotNeg : ¬ (dist < 0) := decide_eq_false_iff_not.mp hBadFalse
+          simp [hNotNeg]
+      · have hElemPos : 0 < elemSize := by omega
+        have hElemB : 0 < (elemSize : Int) ∧ (elemSize : Int) < 2 ^ 63 := by omega
+        have hElemCondF : (elemSize == 0 || decide (elemSize ≥ 2 ^ 63)) = false := by
+          simp [hElem0, show ¬ (elemSize ≥ 2 ^ 63) by omega]
+        unfold Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv
+        simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, bind, Except.bind,
+          Except.mapError]
+        obtain ⟨rSc, hRemStep, _, hRDat⟩ :=
+          cm_miri_binary_divrem_8 false unsigned aSc bSc dist (elemSize : Int) hASz hADat hBSz hBDat hDistGood hElemB
+        obtain ⟨qSc, hDivStep, _, hQDat⟩ :=
+          cm_miri_binary_divrem_8 true unsigned aSc bSc dist (elemSize : Int) hASz hADat hBSz hBDat hDistGood hElemB
+        simp only [Bool.false_eq_true, ↓reduceIte] at hRemStep hDivStep hRDat hQDat
+        rw [hRemStep]
+        dsimp only
+        by_cases hRem0 : Int.tmod dist (elemSize : Int) = 0
+        · have hRemNotNeg : ¬ (Int.tmod dist (elemSize : Int) < 0) := by omega
+          have hRemNull : rSc.isNull = true := by
+            change (rSc.data == (0 : Miri.ABI.U128)) = true
+            rw [hRDat]
+            simp only [hRemNotNeg, ↓reduceIte, hRem0]; rfl
+          simp only [hRemNull, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hDivStep, pure, Except.pure]
+          have hTdivRng : -(2 ^ 63 : Int) < Int.tdiv dist (elemSize : Int) ∧
+              Int.tdiv dist (elemSize : Int) < (2 ^ 63 : Int) := by
+            by_cases hdn : dist < 0
+            · have hde : dist = -((-dist).toNat : Int) := by omega
+              rw [hde, Int.neg_tdiv]
+              have h1 : Int.tdiv ((-dist).toNat : Int) (elemSize : Int) =
+                  (((-dist).toNat / elemSize : Nat) : Int) := rfl
+              rw [h1]
+              have hle : (((-dist).toNat / elemSize : Nat) : Int) ≤ ((-dist).toNat : Int) :=
+                Int.ofNat_le.mpr (Nat.div_le_self _ _)
+              have hnn : (0 : Int) ≤ (((-dist).toNat / elemSize : Nat) : Int) := Int.natCast_nonneg _
+              generalize (((-dist).toNat / elemSize : Nat) : Int) = qn at hle hnn ⊢
+              cases unsigned <;> simp only [Bool.false_eq_true, ↓reduceIte] at hDistGood <;> omega
+            · have hde : dist = (dist.toNat : Int) := by omega
+              rw [hde]
+              have h1 : Int.tdiv (dist.toNat : Int) (elemSize : Int) =
+                  ((dist.toNat / elemSize : Nat) : Int) := rfl
+              rw [h1]
+              have hle : ((dist.toNat / elemSize : Nat) : Int) ≤ (dist.toNat : Int) :=
+                Int.ofNat_le.mpr (Nat.div_le_self _ _)
+              have hnn : (0 : Int) ≤ ((dist.toNat / elemSize : Nat) : Int) := Int.natCast_nonneg _
+              generalize ((dist.toNat / elemSize : Nat) : Int) = qn at hle hnn ⊢
+              omega
+          have hQDataNat : qSc.data.toNat =
+              if Int.tdiv dist (elemSize : Int) < 0 then (Int.tdiv dist (elemSize : Int) + 2 ^ 64).toNat
+              else (Int.tdiv dist (elemSize : Int)).toNat := by
+            rw [hQDat, BitVec.toNat_ofNat]
+            by_cases hqn : Int.tdiv dist (elemSize : Int) < 0 <;>
+              simp only [hqn, ↓reduceIte] <;> exact Nat.mod_eq_of_lt (by omega)
+          rw [hQDataNat]
+          by_cases h : aOff.toNat < bOff.toNat
+          · simp only [h, ↓reduceIte] at hBadFalse ⊢
+            have hU : unsigned = false := by cases unsigned <;> simp_all
+            have hDistNeg : dist < 0 := by
+              have : ¬ (dist ≥ 0) := by intro hc; simp [hU, hc] at hBadFalse
+              omega
+            have hQNeg : Int.tdiv dist (elemSize : Int) < 0 := by
+              have hde : dist = -((-dist).toNat : Int) := by omega
+              rw [hde, Int.neg_tmod] at hRem0
+              have hm0 : (-dist).toNat % elemSize = 0 := by
+                change -(((-dist).toNat % elemSize : Nat) : Int) = 0 at hRem0; omega
+              have hGe : elemSize ≤ (-dist).toNat := Nat.le_of_dvd (by omega) (Nat.dvd_of_mod_eq_zero hm0)
+              have hPosQ : (0 : Int) < (((-dist).toNat / elemSize : Nat) : Int) :=
+                Int.ofNat_lt.mpr (Nat.div_pos hGe hElemPos)
+              rw [hde, Int.neg_tdiv]
+              change -(((-dist).toNat / elemSize : Nat) : Int) < 0
+              omega
+            have hModEq : Int.tmod dist (Int.ofNat elemSize) = 0 := hRem0
+            simp only [hBadFalse, hElemCondF, hModEq, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hQNeg]
+            congr 1; rw [Int.add_comm]; rfl
+          · simp only [h, ↓reduceIte] at hBadFalse ⊢
+            have hNotNeg : ¬ (dist < 0) := decide_eq_false_iff_not.mp hBadFalse
+            have hQNotNeg : ¬ (Int.tdiv dist (elemSize : Int) < 0) := by
+              have hde : dist = (dist.toNat : Int) := by omega
+              rw [hde]; change ¬ (((dist.toNat / elemSize : Nat) : Int) < 0)
+              exact Int.not_lt.mpr (Int.natCast_nonneg _)
+            have hModEq : Int.tmod dist (Int.ofNat elemSize) = 0 := hRem0
+            simp only [hNotNeg, hElemCondF, hModEq, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hQNotNeg]
+            rfl
+        · have hRemRng : -(2 ^ 63 : Int) < Int.tmod dist (elemSize : Int) ∧
+              Int.tmod dist (elemSize : Int) < (2 ^ 63 : Int) := by
+            by_cases hdn : dist < 0
+            · have hde : dist = -((-dist).toNat : Int) := by omega
+              rw [hde, Int.neg_tmod]
+              have h1 : Int.tmod ((-dist).toNat : Int) (elemSize : Int) =
+                  (((-dist).toNat % elemSize : Nat) : Int) := rfl
+              rw [h1]
+              have hlt := Nat.mod_lt (-dist).toNat hElemPos
+              omega
+            · have hde : dist = (dist.toNat : Int) := by omega
+              rw [hde]
+              have h1 : Int.tmod (dist.toNat : Int) (elemSize : Int) =
+                  ((dist.toNat % elemSize : Nat) : Int) := rfl
+              rw [h1]
+              have hlt := Nat.mod_lt dist.toNat hElemPos
+              omega
+          have hRemNotNull : rSc.isNull = false := by
+            change (rSc.data == (0 : Miri.ABI.U128)) = false
+            rw [hRDat]
+            apply beq_false_of_ne
+            intro hEq
+            have hNat := congrArg BitVec.toNat hEq
+            have h0 : (0 : Miri.ABI.U128).toNat = 0 := rfl
+            rw [BitVec.toNat_ofNat, h0] at hNat
+            by_cases hrn : Int.tmod dist (elemSize : Int) < 0
+            · simp only [hrn, ↓reduceIte] at hNat
+              rw [Nat.mod_eq_of_lt (by omega)] at hNat; omega
+            · simp only [hrn, ↓reduceIte] at hNat
+              rw [Nat.mod_eq_of_lt (by omega)] at hNat; omega
+          have hBneTrue : (Int.tmod dist (Int.ofNat elemSize) != 0) = true := by
+            have hf : (Int.tmod dist (Int.ofNat elemSize) == 0) = false := beq_false_of_ne hRem0
+            simp only [bne, hf, Bool.not_false]
+          simp only [pure, Except.pure, hRemNotNull, Bool.not_false, ↓reduceIte, throw, throwThe, MonadExceptOf.throw]
+          by_cases h : aOff.toNat < bOff.toNat
+          · simp only [h, ↓reduceIte] at hBadFalse ⊢
+            simp [hBadFalse, hElemCondF, hBneTrue, hRem0]
+          · simp only [h, ↓reduceIte] at hBadFalse ⊢
+            have hNotNeg : ¬ (dist < 0) := decide_eq_false_iff_not.mp hBadFalse
+            simp [hNotNeg, hElemCondF, hBneTrue, hRem0]
+
+/-- **Universal Trusted ↔ unmodified vendored `ptr_offset_from[_unsigned]`
+correspondence**: for ALL `unsigned : Bool`, ALL `elemSize : Nat`, and ALL
+64-bit offsets `aOff bOff : UInt64`, Trusted `evalPtrOffsetFromDistance 8` agrees
+bit-for-bit with UNMODIFIED vendored `Miri.Interpreter.IntegerOps.binary .SubWithOverflow`
++ `ScalarInt.toTargetIsize` + `ScalarInt.tryFromInt` +
+`Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv`. -/
+theorem cm_evalPtrOffsetFromDistance_eq_vendored (unsigned : Bool) (elemSize : Nat)
+    (aOff bOff : UInt64) :
+    (evalPtrOffsetFromDistance 8 unsigned elemSize aOff.toNat bOff.toNat).map ScalarInt.bits =
+      cmMiriPtrOffsetFromVendored unsigned elemSize aOff bOff := by
+  rw [cm_miriPtrOffsetFromVendored_eq_spec]
+  exact cm_evalPtrOffsetFromDistance_eq_miriSpec unsigned elemSize aOff bOff
+
 private theorem cm_lm_bitwiseAndBits_testBit (k a b i : Nat) :
     (bitwiseAndBits k a b).testBit i = (decide (i < k) && a.testBit i && b.testBit i) := by
   induction k generalizing a b i with
@@ -1153,43 +1939,170 @@ theorem cm_miri_ptrMask_eval_universal (ld : List LocalDecl) (ly : LayoutTable) 
     hToPtr, hMask, Except.mapError, bind, EStateM.bind, pure, EStateM.pure]
 
 /-- **Universal vendored `Miri.Interpreter.Intrinsics.eval` step-simulation for `black_box`**
-(`Intrinsics.lean:441`):
-1. For EVERY valid immediate scalar/pointer `sc` (`!lay.layout.uninhabited` and
-   `annealValidateScalarForTyId lay.ty sc = true`), `Intrinsics.eval ... "black_box"`
-   preserves `sc` identically into `dest` (`tb = false`) and transitions to `ret`.
-2. For EVERY invalid immediate scalar `sc` (`annealValidateScalarForTyId lay.ty sc = false`,
+(`Intrinsics.lean:441`), for **ALL `tb : Bool`** (both `basic` and `protectedTB`)
+on any non-memory destination `dest` (`∀ mp, dest.ref ≠ .memory mp`):
+1. For EVERY valid immediate scalar/pointer `sc` (`!srcLay.layout.uninhabited` and
+   `annealValidateScalarForTyId srcLay.ty sc = true`), `Intrinsics.eval ... "black_box"`
+   preserves `sc` identically into `dest` and transitions to `ret`.
+2. For EVERY invalid immediate scalar `sc` (`annealValidateScalarForTyId srcLay.ty sc = false`,
    e.g. `bool = 2`, surrogate `char`, null `&T`, null `fn()`, `!`),
    `Intrinsics.eval ... "black_box"` deterministically faults `.undefinedBehavior`. -/
-theorem cm_miri_blackBox_eval_universal (ld : List LocalDecl) (ly : LayoutTable)
+theorem cm_miri_blackBox_eval_universal (ld : List LocalDecl) (ly : LayoutTable) (tb : Bool)
     (tyArg : Miri.MIR.TyId) (sc : Miri.Memory.Scalar AnnealProv)
     (srcLay : Miri.Interpreter.LocalLayout) (dest : Miri.Interpreter.RuntimePlace AnnealProv)
     (ret : Option Miri.MIR.BasicBlockId) (st : AnnealStepState)
-    (hInh : srcLay.layout.uninhabited = false) :
+    (hInh : srcLay.layout.uninhabited = false)
+    (hDest : ∀ mp, dest.ref ≠ .memory mp) :
     (annealValidateScalarForTyId srcLay.ty sc = true →
-      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly false tyArg) () "black_box" #[]
+      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly tb tyArg) () "black_box" #[]
         #[⟨.immediate (.scalar sc), srcLay⟩] dest ret st =
       ((do annealWriteImmediate (.scalar sc) dest; annealReturnToBlock ret; pure true) : LmM Bool) st) ∧
     (annealValidateScalarForTyId srcLay.ty sc = false →
-      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly false tyArg) () "black_box" #[]
+      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly tb tyArg) () "black_box" #[]
         #[⟨.immediate (.scalar sc), srcLay⟩] dest ret st =
       .error (.undefinedBehavior "copyOp of invalid scalar value") st) := by
   have hNA : ("black_box".startsWith "atomic_") = false := by simp
   have hNS : ("black_box".startsWith "simd_") = false := by simp
   have hEval :
-      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly false tyArg) () "black_box" #[]
+      Miri.Interpreter.Intrinsics.eval (cmIntrinsicHooks ld ly tb tyArg) () "black_box" #[]
         #[⟨.immediate (.scalar sc), srcLay⟩] dest ret =
-      ((do cmCopyOp false ⟨.immediate (.scalar sc), srcLay⟩ dest; annealReturnToBlock ret; pure true) : LmM Bool) := by
+      ((do cmCopyOp tb ⟨.immediate (.scalar sc), srcLay⟩ dest;
+           annealReturnToBlock ret; pure true) : LmM Bool) := by
     unfold Miri.Interpreter.Intrinsics.eval
     simp only [hNA, hNS, Bool.false_eq_true, ↓reduceIte]
     rfl
   constructor
   · intro hVal
     rw [hEval]
-    simp [cmCopyOp, hInh, annealReadImmediate, hVal, bind, EStateM.bind, pure, EStateM.pure]
+    cases hRef : dest.ref with
+    | memory mp => exact absurd hRef (hDest mp)
+    | _ =>
+      cases tb <;>
+        simp [cmCopyOp, hInh, annealReadImmediate, hVal, hRef, bind, EStateM.bind, pure, EStateM.pure]
   · intro hInval
     rw [hEval]
-    simp [cmCopyOp, hInh, annealReadImmediate, hInval, bind, EStateM.bind, pure, EStateM.pure,
-      throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+    cases hRef : dest.ref with
+    | memory mp => exact absurd hRef (hDest mp)
+    | _ =>
+      cases tb <;>
+        simp [cmCopyOp, hInh, annealReadImmediate, hInval, hRef, bind, EStateM.bind, pure, EStateM.pure,
+          throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+
+/-- **Universal vendored `Miri.Interpreter.Intrinsics.copyWith` step-simulation**
+(`Intrinsics.lean:143-158`): for ANY hooks `h`, proves BOTH:
+1. When `IntegerOps.computeSizeInBytes` succeeds with `size`, `copyWith` aligns
+   both pointers and delegates to `h.memCopy choice srcPtr dstPtr size nonov`;
+2. When `IntegerOps.computeSizeInBytes` overflows (`none`), `copyWith`
+   deterministically faults `.undefinedBehavior "overflow computing total size of copy"`. -/
+theorem cm_miri_copyWith_eval_universal {P S C : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.MemoryIntrinsicHooks P S C) (choice : C)
+    (srcOp dstOp cntOp : Miri.Interpreter.OpTy P) (nonov : Bool)
+    (st0 st1 st2 st3 st4 st5 st6 st7 st8 : S)
+    (cImm sImm dImm : Miri.Interpreter.RvalueImmTy P)
+    (cSc sSc dSc : Miri.Memory.Scalar P) (count : UInt64)
+    (ptTy : Miri.MIR.TyId) (ptLay : Miri.ABI.TyAndLayout Miri.MIR.TyId)
+    (sPtr dPtr : Miri.Memory.Pointer (Option P))
+    (hRdC : h.readImmediate choice cntOp st0 = .ok cImm st1)
+    (hScC : cImm.imm.toScalar = .ok cSc)
+    (hCnt : cSc.toTargetUsize (Miri.ABI.Size.fromBits h.target.pointerWidth.bits) = .ok count)
+    (hPt : h.pointeeType choice srcOp.layout.ty st1 = .ok ptTy st2)
+    (hLay : h.layoutOf choice ptTy st2 = .ok ptLay st3) :
+    (∀ size,
+      Miri.Interpreter.IntegerOps.computeSizeInBytes ptLay.layout.size count h.maxSizeOfVal = some size →
+      h.readImmediate choice srcOp st3 = .ok sImm st4 →
+      sImm.imm.toScalar = .ok sSc →
+      sSc.toPointer h.target = .ok sPtr →
+      h.readImmediate choice dstOp st4 = .ok dImm st5 →
+      dImm.imm.toScalar = .ok dSc →
+      dSc.toPointer h.target = .ok dPtr →
+      h.checkAlign choice sPtr ptLay.layout.align.abi st5 = .ok () st6 →
+      h.checkAlign choice dPtr ptLay.layout.align.abi st6 = .ok () st7 →
+      h.memCopy choice sPtr dPtr size nonov st7 = .ok () st8 →
+      Miri.Interpreter.Intrinsics.copyWith h choice srcOp dstOp cntOp nonov st0 = .ok () st8) ∧
+    (Miri.Interpreter.IntegerOps.computeSizeInBytes ptLay.layout.size count h.maxSizeOfVal = none →
+      Miri.Interpreter.Intrinsics.copyWith h choice srcOp dstOp cntOp nonov st0 =
+        .error (.undefinedBehavior "overflow computing total size of copy") st3) := by
+  have hCopy :
+      Miri.Interpreter.Intrinsics.copyWith h choice srcOp dstOp cntOp nonov =
+      (do
+        let read := fun operand => do
+          let value ← h.readImmediate choice operand
+          cmLiftRes (value.imm.toScalar |>.mapError Miri.Interpreter.ScalarOps.immediateError)
+        let count ← cmLiftRes ((← read cntOp).toTargetUsize
+          (Miri.ABI.Size.fromBits h.target.pointerWidth.bits) |>.mapError Miri.Interpreter.ScalarOps.scalarError)
+        let ty ← h.pointeeType choice srcOp.layout.ty
+        let layout ← h.layoutOf choice ty
+        let some size := Miri.Interpreter.IntegerOps.computeSizeInBytes layout.layout.size count h.maxSizeOfVal
+          | throw (.undefinedBehavior "overflow computing total size of copy")
+        let source ← cmLiftRes ((← read srcOp).toPointer h.target |>.mapError Miri.Interpreter.ScalarOps.scalarError)
+        let dest ← cmLiftRes ((← read dstOp).toPointer h.target |>.mapError Miri.Interpreter.ScalarOps.scalarError)
+        h.checkAlign choice source layout.layout.align.abi
+        h.checkAlign choice dest layout.layout.align.abi
+        h.memCopy choice source dest size nonov) := rfl
+  constructor
+  · intro size hMul hRdS hScS hPtrS hRdD hScD hPtrD hAlS hAlD hMem
+    rw [hCopy]
+    simp only [cmLiftRes, bind, EStateM.bind, pure, EStateM.pure, Except.mapError,
+      hRdC, hScC, hCnt, hPt, hLay, hMul, hRdS, hScS, hPtrS, hRdD, hScD, hPtrD, hAlS, hAlD, hMem]
+  · intro hOv
+    rw [hCopy]
+    simp only [cmLiftRes, bind, EStateM.bind, pure, EStateM.pure, Except.mapError,
+      throw, throwThe, MonadExceptOf.throw, EStateM.throw, hRdC, hScC, hCnt, hPt, hLay, hOv]
+
+/-- **Universal vendored `Miri.Interpreter.Intrinsics.typedSwap` step-simulation**
+(`Intrinsics.lean:199-214`): for ANY hooks `h`, traces the full vendored swap
+(`derefPointer` left/right -> layout/sized check -> `allocateStack` -> `copyOp`
+left→temp -> nonoverlapping `memCopy` right→left -> `validatePlace` when
+`enforceValidity = true` -> `copyOp` temp→right -> `deallocateStack`). -/
+theorem cm_miri_typedSwap_eval_universal {P S C V : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.IntrinsicHooks P S C V) (choice : C)
+    (leftOp rightOp : Miri.Interpreter.OpTy P)
+    (st0 st1 st2 st3 st4 st5 st6 st7 st8 st9 st10 st11 st12 : S)
+    (leftP rightP tempP : V) (leftValOp tempValOp : Miri.Interpreter.OpTy P)
+    (leftPtr rightPtr tempPtr : Miri.Memory.Pointer (Option P)) (recFlag : Bool)
+    (hDerefL : h.derefPointer choice leftOp st0 = .ok leftP st1)
+    (hDerefR : h.derefPointer choice rightOp st1 = .ok rightP st2)
+    (hLayEq : h.destLayout leftP = h.destLayout rightP)
+    (hSized : (h.destLayout leftP).layout.isSized = true)
+    (hAlloc : h.allocateStack choice (h.destLayout leftP) st2 = .ok tempP st3)
+    (hToOpL : h.placeToOp choice leftP st3 = .ok leftValOp st4)
+    (hCopyL : h.copyOp choice leftValOp tempP st4 = .ok () st5)
+    (hPtrR : h.placePointer rightP = .ok rightPtr)
+    (hPtrL : h.placePointer leftP = .ok leftPtr)
+    (hMem : h.memCopy choice rightPtr leftPtr (h.destLayout leftP).layout.size true st5 = .ok () st6)
+    (hEnf : h.enforceValidity choice (h.destLayout leftP) st6 = .ok true st7)
+    (hRec : h.enforceValidityRecursively choice (h.destLayout leftP) st7 = .ok recFlag st8)
+    (hValP : h.validatePlace choice leftP recFlag true st8 = .ok () st9)
+    (hToOpT : h.placeToOp choice tempP st9 = .ok tempValOp st10)
+    (hCopyR : h.copyOp choice tempValOp rightP st10 = .ok () st11)
+    (hPtrT : h.placePointer tempP = .ok tempPtr)
+    (hDealloc : h.deallocateStack choice tempPtr st11 = .ok () st12) :
+    Miri.Interpreter.Intrinsics.typedSwap h choice leftOp rightOp st0 = .ok () st12 := by
+  have hSwap :
+      Miri.Interpreter.Intrinsics.typedSwap h choice leftOp rightOp =
+      (do
+        let left ← h.derefPointer choice leftOp
+        let right ← h.derefPointer choice rightOp
+        let layout := h.destLayout left
+        if layout != h.destLayout right || !layout.layout.isSized then
+          throw (.invalidProgram "typed swap layout mismatch or unsized type")
+        let temp ← h.allocateStack choice layout
+        h.copyOp choice (← h.placeToOp choice left) temp
+        let rightPtr ← cmLiftRes (h.placePointer right)
+        let leftPtr ← cmLiftRes (h.placePointer left)
+        h.memCopy choice rightPtr leftPtr layout.layout.size true
+        if ← h.enforceValidity choice layout then
+          let recursive ← h.enforceValidityRecursively choice layout
+          h.validatePlace choice left recursive true
+        h.copyOp choice (← h.placeToOp choice temp) right
+        h.deallocateStack choice (← cmLiftRes (h.placePointer temp))) := rfl
+  have hNe : (h.destLayout leftP != h.destLayout rightP) = false := by
+    rw [hLayEq]; exact bne_self_eq_false _
+  rw [hSwap]
+  simp only [cmLiftRes, bind, EStateM.bind, pure, EStateM.pure,
+    hDerefL, hDerefR, hNe, hSized, Bool.not_true, Bool.or_self,
+    Bool.false_eq_true, ↓reduceIte, hAlloc, hToOpL, hCopyL, hPtrR, hPtrL, hMem,
+    hEnf, hRec, hValP, hToOpT, hCopyR, hPtrT, hDealloc]
 
 /-- **Universal vendored `Miri.Interpreter.Intrinsics.rawEq` step-simulation**
 (`Intrinsics.lean:188-197`): for ANY hooks `h`, whenever pointee layout is sized,
@@ -1692,7 +2605,7 @@ theorem cmLm_hardened_hooks_witness :
         (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [.bool])
         [.copy (locPlace 1), .copy (locPlace 2)] 3
         [mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref]))))]
-        [cmGlobal 100 [some 2] 1, cmGlobal 101 [some 1] 1]
+        [cmGlobal 100 [some 2] 1, cmGlobal 101 [some 1] 1, cmGlobal 102 [some 0] 1]
     let bbRefMir :=
       cmCallBody "cm::lm_bb_ref" [mkDecl cmRefU32Ty, mkDecl cmRefU32Ty] 1
         (cmIntrinsicOp "core::intrinsics::black_box" [.ref .not (.uint .u32)])
@@ -1720,14 +2633,16 @@ theorem cmLm_hardened_hooks_witness :
         ⟨.live (.indirect rwMp), some (translateTyOverlay u32MirTy)⟩, cmUninitLoc unitMirTy] rwMach
     cmRunLm cmSwapSameAllocMir false (cmStd cmSwapSameAllocMir [some (cmGP 100 2), some (cmGP 100 4)]) = .ub ∧
     cmRunLm cmSwapSameAllocMir false (cmStd cmSwapSameAllocMir [some (cmGP 100 0), some (cmGP 100 2)]) = .ub ∧
+    cmRunLm swapBoolMir false (cmStd swapBoolMir [some (cmGP 101 0), some (cmGP 102 0)]) = .scalar 0 1 ∧
     cmRunLm swapBoolMir false (cmStd swapBoolMir [some (cmGP 100 0), some (cmGP 101 0)]) = .ub ∧
+    cmRunLm swapBoolMir false (cmStd swapBoolMir [some (cmGP 101 0), some (cmGP 100 0)]) = .ub ∧
     cmRunLm cmBlackBoxBoolMir false (cmStd cmBlackBoxBoolMir [some (cmIntSc 2 1)]) = .ub ∧
     cmRunLm bbRefMir false (cmStd bbRefMir [some (cmIntSc 0 8)]) = .ub ∧
     cmRunLm cmCopyModeMir false rwState = .scalar 11 4 ∧
     cmRunLm cmCopyModeMir true rwState = .ub ∧
     cmRunLm pofZstMir false (cmStd pofZstMir [some (cmIntSc 4096), some (cmIntSc 4096)]) = .ub ∧
     cmRunLm cmPofMir false (cmStd cmPofMir [some (cmIntSc 0), some (cmIntSc (2 ^ 63))]) = .ub := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-! ## §4. Deliberate Library-UB Deltas vs. `lean-miri` (and the `copy` Agreement) -/
 

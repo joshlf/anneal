@@ -257,11 +257,19 @@ theorem cm_mr_deep_theorems_used :
   have _ := @cm_bitwiseAndBits_allOnes
   have _ := @cm_bitwiseAndBits_baseAddr_invariant
   have _ := @cm_evalPtrMaskCall_identity
+  have _ := @cm_writeReturnDestination_preserves_exposed
+  have _ := @cm_evalPtrMaskCall_preserves_exposed
   have _ := @cm_evalPtrMaskCall_direct_preserves_exposed
   have _ := @cm_minirust_rawEq_evalIntrinsic
   have _ := @cm_minirust_loadRawData_uninit_ub
   have _ := @cm_minirust_evalPtrOffsetFrom_divExact_agree
+  have _ := @cm_minirust_evalPtrOffsetFrom_neg_divExact_agree
+  have _ := @cm_minirust_evalPtrOffsetFrom_unsigned_underflow_ub
+  have _ := @cm_minirust_evalPtrOffset_wrapping_preserves_prov
+  have _ := @cm_minirust_bytes_uninit_iff
   have _ := @cm_evalBlackBoxCall_u32_valid
+  have _ := @cm_evalBlackBoxCall_invalid_bool_ub
+  have _ := @cm_evalBlackBoxCall_rawPtr_preserves_prov
   have _ := @cm_copy_three_way_witness
   have _ := @cm_compareBytes_three_way_witness
   have _ := @cm_rawEq_three_way_witness
@@ -1153,10 +1161,14 @@ run_cmd do
         lmNs ++ `cm_miri_compareBytes_eval_universal,
         lmNs ++ `cm_evalPtrOffsetFromDistance_eq_miriSpec,
         lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix,
+        lmNs ++ `cm_miriPtrOffsetFromVendored_eq_spec,
+        lmNs ++ `cm_evalPtrOffsetFromDistance_eq_vendored,
         lmNs ++ `cm_bitwiseAndBits_64_eq_u64_land,
         lmNs ++ `cm_miri_ptrMask_u64_baseAddr_invariant,
         lmNs ++ `cm_miri_ptrMask_eval_universal,
         lmNs ++ `cm_miri_blackBox_eval_universal,
+        lmNs ++ `cm_miri_copyWith_eval_universal,
+        lmNs ++ `cm_miri_typedSwap_eval_universal,
         lmNs ++ `cm_miri_rawEq_eval_universal,
         lmNs ++ `cmLmTableCheck_true, lmNs ++ `cmLmObserve_table,
         lmNs ++ `cmLmObserve_copy_mode_sensitivity,
@@ -1244,11 +1256,19 @@ run_cmd do
         (lmNs ++ `cm_compareUnsignedBytesI32_eq_vendored, privBytesCompare),
         (lmNs ++ `cm_miri_compareBytes_eval_universal, `Miri.Interpreter.Intrinsics.compareBytes),
         (lmNs ++ `cm_miri_compareBytes_eval_universal, privBytesCompare),
+        (lmNs ++ `cm_miri_copyWith_eval_universal, `Miri.Interpreter.Intrinsics.copyWith),
+        (lmNs ++ `cm_miri_typedSwap_eval_universal, `Miri.Interpreter.Intrinsics.typedSwap),
         (lmNs ++ `cm_miri_rawEq_eval_universal, `Miri.Interpreter.Intrinsics.rawEq),
         (lmNs ++ `cm_miri_ptrMask_eval_universal, `Miri.Interpreter.Intrinsics.eval),
         (lmNs ++ `cm_miri_blackBox_eval_universal, `Miri.Interpreter.Intrinsics.eval),
         (lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix, `Miri.Interpreter.IntegerOps.binary),
         (lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix,
+          `Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv),
+        (lmNs ++ `cm_miriPtrOffsetFromVendored_eq_spec, `Miri.Interpreter.IntegerOps.binary),
+        (lmNs ++ `cm_miriPtrOffsetFromVendored_eq_spec,
+          `Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv),
+        (lmNs ++ `cm_evalPtrOffsetFromDistance_eq_vendored, `Miri.Interpreter.IntegerOps.binary),
+        (lmNs ++ `cm_evalPtrOffsetFromDistance_eq_vendored,
           `Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv),
         (lmNs ++ `cm_bitwiseAndBits_64_eq_u64_land, `UInt64.land),
         (lmNs ++ `cmLmObserve_table, `Miri.Interpreter.Step.step),
@@ -1256,10 +1276,14 @@ run_cmd do
     for (thm, anchor) in vendoredAnchors do
       unless (closureOf thm).contains anchor do
         throwError "cross-root vendored-anchor failure: {thm} does not reach {anchor}"
-    -- Discrimination self-test: the documented local mirror alone does NOT reach
-    -- the vendored constant, so the anchor check above is not vacuous.
+    -- Discrimination self-tests: the documented local mirrors alone do NOT reach
+    -- the vendored constants, so the anchor checks above are not vacuous.
     if (closureOf (lmNs ++ `cmMiriBytesCompare)).contains privBytesCompare then
-      throwError "cross-root self-test: local mirror unexpectedly reaches vendored bytesCompare"
+      throwError "cross-root self-test: local bytesCompare mirror unexpectedly reaches vendored bytesCompare"
+    if (closureOf (lmNs ++ `cmMiriPtrOffsetFromSpec)).contains `Miri.Interpreter.IntegerOps.binary then
+      throwError "cross-root self-test: local ptrOffsetFrom spec unexpectedly reaches vendored IntegerOps.binary"
+    if (closureOf (lmNs ++ `cmMiriPtrOffsetFromSpec)).contains `Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv then
+      throwError "cross-root self-test: local ptrOffsetFrom spec unexpectedly reaches vendored exactDiv"
     return (added.size, bundleCount, acceptedPos, rejected, crAxioms.toArray)
 
   let ctx : Core.Context :=
