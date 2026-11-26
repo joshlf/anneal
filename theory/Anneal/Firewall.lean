@@ -18,7 +18,7 @@ Pass-1-portable (`prelude` + `Init.Core` only, zero axioms, zero
 and tactic `rw` / `simp` traversals from penetrating large symbolic
 weakest-precondition or MIR state expressions.
 
-Two complementary mechanisms are provided:
+Three complementary mechanisms are provided:
 
 1. **`Firewall tag P` (1-Field `Prop` Structure):**
    In Lean 4's kernel, a structure type constructor is never delta-unfolded,
@@ -34,6 +34,14 @@ Two complementary mechanisms are provided:
    `IndexedCut` (or marking a concrete `def myCut (stage : Nat) (st : σ) : Prop`
    `@[irreducible]` *after* proving its `seal`/`open`/`step` lemmas) keeps the
    expanded `Prop` expression out of the outer goal signature.
+
+3. **Goal-Directed `ite` Branch Eliminators (`ite_*_imp`, `ite_eq_*_imp`):**
+   Elaborating an applied hypothesis `have h' := elim h` (or `rw [...] at h`)
+   when `h : if P then T else F` forces Lean's elaborator to put `h`'s type in
+   WHNF, evaluating expensive symbolic guards `P` (e.g., `15s+` on nested type
+   normalization or `checkVal` evaluators). Using `revert h; refine
+   ite_absurd_left_imp ... ?_; intro h` unifies `@ite` structurally against the
+   goal without reducing `P`.
 -/
 
 namespace Anneal.Firewall
@@ -109,7 +117,64 @@ theorem finish_cut {σ : Type u} {cutAt : Nat → σ → Prop}
     (hCut : IndexedCut cutAt stage st) : post :=
   hDone hCut.runCut
 
-/-! ## 3. Kernel-Checked Canaries -/
+/-! ## 3. Goal-Directed `ite` Branch Eliminators (No Guard WHNF Reduction) -/
+
+/-- Goal-directed case split on `@ite Prop P inst T F` in the goal head. Use via
+`revert h; refine ite_elim_imp ?_ ?_` when `P` is expensive to reduce so Lean
+matches `@ite` structurally without forcing WHNF on `P`. -/
+theorem ite_elim_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hT : P → T → G) (hF : ¬ P → F → G) : @ite Prop P inst T F → G :=
+  @Decidable.casesOn P (fun d => @ite Prop P d T F → G) inst hF hT
+
+theorem ite_true_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hP : P) (hT : T → G) : @ite Prop P inst T F → G :=
+  ite_elim_imp (fun _ h => hT h) (fun hNP _ => False.elim (hNP hP))
+
+theorem ite_false_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hNP : ¬ P) (hF : F → G) : @ite Prop P inst T F → G :=
+  ite_elim_imp (fun hP _ => False.elim (hNP hP)) (fun _ h => hF h)
+
+/-- Eliminate `@ite Prop P inst T F → G` when the `then`-branch `T` is absurd,
+without reducing the guard `P`. -/
+theorem ite_absurd_left_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hAbs : T → False) (hF : F → G) : @ite Prop P inst T F → G :=
+  ite_elim_imp (fun _ h => False.elim (hAbs h)) (fun _ h => hF h)
+
+/-- Eliminate `@ite Prop P inst T F → G` when the `else`-branch `F` is absurd,
+without reducing the guard `P`. -/
+theorem ite_absurd_right_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
+    (hT : T → G) (hAbs : F → False) : @ite Prop P inst T F → G :=
+  ite_elim_imp (fun _ h => hT h) (fun _ h => False.elim (hAbs h))
+
+/-- Value-level counterpart of `ite_elim_imp` for `@ite α P inst t f = r → G`,
+useful for `Except` / `StepResult` / `Option` branch hypotheses. -/
+theorem ite_eq_elim_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop}
+    (hT : P → t = r → G) (hF : ¬ P → f = r → G) :
+    @ite α P inst t f = r → G :=
+  @Decidable.casesOn P (fun d => @ite α P d t f = r → G) inst hF hT
+
+theorem ite_eq_true_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop} (hP : P) (hT : t = r → G) :
+    @ite α P inst t f = r → G :=
+  ite_eq_elim_imp (fun _ h => hT h) (fun hNP _ => False.elim (hNP hP))
+
+theorem ite_eq_false_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop} (hNP : ¬ P) (hF : f = r → G) :
+    @ite α P inst t f = r → G :=
+  ite_eq_elim_imp (fun hP _ => False.elim (hNP hP)) (fun _ h => hF h)
+
+theorem ite_eq_absurd_left_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop} (hNe : t ≠ r) (hF : f = r → G) :
+    @ite α P inst t f = r → G :=
+  ite_eq_elim_imp (fun _ h => False.elim (hNe h)) (fun _ h => hF h)
+
+theorem ite_eq_absurd_right_imp {α : Type u} {P : Prop} {inst : Decidable P}
+    {t f r : α} {G : Prop} (hT : t = r → G) (hNe : f ≠ r) :
+    @ite α P inst t f = r → G :=
+  ite_eq_elim_imp (fun _ h => hT h) (fun _ h => False.elim (hNe h))
+
+/-! ## 4. Kernel-Checked Canaries -/
 
 /-- Exercise `wrap`, `trans_tag`, and `unwrap` on a conjunctive proposition. -/
 theorem canary_wrap_unwrap_tag {P Q : Prop} (hp : P) (hq : Q) : P ∧ Q :=
@@ -169,5 +234,29 @@ theorem canary_irreducible_indexed_cut {st : Nat} (h : st = 0) : st = 0 :=
   let h0 : IndexedCut sampleIrrCut 0 st := step_cut sampleIrrCut_step h1
   let _opened : sampleIrrCut 0 st := open_cut h0
   finish_cut sampleIrrCut_done h0
+
+/-- Exercise `ite_absurd_left_imp`, `ite_absurd_right_imp`,
+`ite_eq_absurd_left_imp`, and `ite_eq_absurd_right_imp` via goal-directed
+`refine` without reducing an abstract guard `P`. -/
+theorem canary_ite_branch_eliminators {P : Prop} [Decidable P] {G : Prop}
+    (hTrueG : true = true → G)
+    (h1 : if P then False else G)
+    (h2 : if P then G else False)
+    (h3 : (if P then false else true) = true)
+    (h4 : (if P then true else false) = true) :
+    G ∧ G ∧ G ∧ G := by
+  have g1 : G := by
+    revert h1
+    refine ite_absurd_left_imp (fun hf => hf) (fun hg => hg)
+  have g2 : G := by
+    revert h2
+    refine ite_absurd_right_imp (fun hg => hg) (fun hf => hf)
+  have g3 : G := by
+    revert h3
+    refine ite_eq_absurd_left_imp Bool.noConfusion hTrueG
+  have g4 : G := by
+    revert h4
+    refine ite_eq_absurd_right_imp hTrueG Bool.noConfusion
+  exact ⟨g1, g2, g3, g4⟩
 
 end Anneal.Firewall
