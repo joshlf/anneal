@@ -465,6 +465,32 @@ theorem call_aligned_null_count0_steps :
 theorem call_live_aligned_count0_steps :
     runCall (pv 1 0) (pv 1 0) 0 = finishMemIntrinsicCall S64 noop (loc 0) 1 := rfl
 
+/-- **The terminator path inherits the guard (universal)**: every well-formed-width
+`copy_nonoverlapping::<T>(src, dst, count)` call is exactly `finishMemIntrinsicCall` of the
+hardened statement-level `evalCopyNonOverlappingWithCount` on the same operands and values. -/
+theorem call_inherits_withCount_univ (s : MachineState) (ld : List LocalDecl) (ly : LayoutTable)
+    (srcOp dstOp cntOp : Operand) (sv dv : Value) (countSc : ScalarInt) (l' : List LocalSlot)
+    (dest : Place) (bb : BasicBlockIdx)
+    (hW : Nat.beq countSc.sizeBytes (layoutPointerBytes ly) = true) :
+    evalCopyNonOverlappingCall s ld ly [srcOp, dstOp, cntOp] [sv, dv, .scalar countSc] l' dest bb =
+      finishMemIntrinsicCall s
+        (evalCopyNonOverlappingWithCount s srcOp dstOp ld ly sv dv countSc.bits l') dest bb := by
+  unfold evalCopyNonOverlappingCall
+  simp only [hW]
+
+/-- ... so a definitely misaligned zero-byte call faults for every state, layout table, and
+destination (lifting `zero_count_src_violation_ub_univ`). -/
+theorem call_zero_count_src_violation_ub_univ (s : MachineState) (ld : List LocalDecl)
+    (ly : LayoutTable) (srcOp dstOp cntOp : Operand) (sv dv : Value) (l' : List LocalSlot)
+    (dest : Place) (bb : BasicBlockIdx) (sz al : Nat)
+    (hElem : resolveCopyElemLayout ld ly srcOp dstOp = .ok sz al)
+    (hSrc : checkZeroCountCopyPtr s l' ld ly al sv = .ub) :
+    evalCopyNonOverlappingCall s ld ly [srcOp, dstOp, cntOp]
+        [sv, dv, .scalar ⟨0, layoutPointerBytes ly⟩] l' dest bb = MirStepNode.fail .ub := by
+  rw [call_inherits_withCount_univ s ld ly srcOp dstOp cntOp sv dv _ l' dest bb (Nat.beq_refl _),
+    zero_count_src_violation_ub_univ s srcOp dstOp ld ly sv dv l' sz al hElem hSrc]
+  rfl
+
 /-! ### B1 soundness regressions & full-branch coverage -/
 
 /-- `[u8; 8]` at `entries[0]` must NOT hijack `*mut u64` (`layoutIdx = 0`) to align 1. -/
@@ -1268,6 +1294,32 @@ theorem call_aligned_null_count0_steps :
 theorem call_live_aligned_count0_steps :
     runCall (pv 1 0) (pv 1 0) 0 = finishMemIntrinsicCall S64 noop (loc 0) 1 := rfl
 
+/-- **The terminator path inherits the guard (universal)**: every well-formed-width
+`copy_nonoverlapping::<T>(src, dst, count)` call is exactly `finishMemIntrinsicCall` of the
+hardened statement-level `evalCopyNonOverlappingWithCount` on the same operands and values. -/
+theorem call_inherits_withCount_univ (s : MachineState) (ld : List LocalDecl) (ly : LayoutTable)
+    (srcOp dstOp cntOp : Operand) (sv dv : Value) (countSc : ScalarInt) (l' : List LocalSlot)
+    (dest : Place) (bb : BasicBlockIdx)
+    (hW : Nat.beq countSc.sizeBytes (layoutPointerBytes ly) = true) :
+    evalCopyNonOverlappingCall s ld ly [srcOp, dstOp, cntOp] [sv, dv, .scalar countSc] l' dest bb =
+      finishMemIntrinsicCall s
+        (evalCopyNonOverlappingWithCount s srcOp dstOp ld ly sv dv countSc.bits l') dest bb := by
+  unfold evalCopyNonOverlappingCall
+  simp only [hW]
+
+/-- ... so a definitely misaligned zero-byte call faults for every state, layout table, and
+destination (lifting `zero_count_src_violation_ub_univ`). -/
+theorem call_zero_count_src_violation_ub_univ (s : MachineState) (ld : List LocalDecl)
+    (ly : LayoutTable) (srcOp dstOp cntOp : Operand) (sv dv : Value) (l' : List LocalSlot)
+    (dest : Place) (bb : BasicBlockIdx) (sz al : Nat)
+    (hElem : resolveCopyElemLayout ld ly srcOp dstOp = .ok sz al)
+    (hSrc : checkZeroCountCopyPtr s l' ld ly al sv = .ub) :
+    evalCopyNonOverlappingCall s ld ly [srcOp, dstOp, cntOp]
+        [sv, dv, .scalar ⟨0, layoutPointerBytes ly⟩] l' dest bb = MirStepNode.fail .ub := by
+  rw [call_inherits_withCount_univ s ld ly srcOp dstOp cntOp sv dv _ l' dest bb (Nat.beq_refl _),
+    zero_count_src_violation_ub_univ s srcOp dstOp ld ly sv dv l' sz al hElem hSrc]
+  rfl
+
 /-! ### B1 soundness regressions & full-branch coverage -/
 
 /-- `[u8; 8]` at `entries[0]` must NOT hijack `*mut u64` (`layoutIdx = 0`) to align 1. -/
@@ -1972,6 +2024,14 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.call_live_aligned_count0_steps
 
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.call_inherits_withCount_univ' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.call_inherits_withCount_univ
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.call_zero_count_src_violation_ub_univ' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.call_zero_count_src_violation_ub_univ
+
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.uninit_value_ub' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.uninit_value_ub
@@ -2295,6 +2355,14 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.call_live_aligned_count0_steps' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.call_live_aligned_count0_steps
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.call_inherits_withCount_univ' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.call_inherits_withCount_univ
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.call_zero_count_src_violation_ub_univ' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.call_zero_count_src_violation_ub_univ
 
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.placeholder_wrapper_count0_unsupported' depends on axioms: [propext] -/
 #guard_msgs in
