@@ -404,7 +404,8 @@ const CLOSURE_TEMPLATES: &[MiriTemplate] = &[
             "__clos_cfp(__clos_seed)",
             "unsafe { __clos_cufp_direct(",
         ],
-        lacks: "__AnnealVtable",
+        // Zero `VTableAndFnPtrMutator` tokens (`__vt_*`, `__AnnealVtable*`).
+        lacks: "__vt_",
         expect: Expect::AgreeOrFalsePositiveUb,
     },
     MiriTemplate {
@@ -2667,6 +2668,27 @@ fn indirect_call_templates_run_through_live_miri_and_anneal_oracles() {
     // Verify `&dyn Trait` (`VTableAndFnPtrMutator`) and `ClosureFnPointer`
     // (`ClosureAndAddrEqMutator`) remain attributed to their distinct mutators
     // and surface distinct `failing_construct_hint` values when they diverge.
+    // A conservative `FalsePositiveUb` verdict on either template MUST produce
+    // its finding bundle, so the hint checks below can never pass vacuously.
+    for (fn_name, expected_hint) in [
+        ("vt_dyn_dispatch", "PointerCoercion::Unsize"),
+        ("clos_closure_fn_ptr", "PointerCoercion::ClosureFnPointer"),
+    ] {
+        let diverged = report.item_reports.iter().any(|r| {
+            r.name == fn_name
+                && matches!(
+                    r.verdict,
+                    ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+                )
+        });
+        let finding = report.findings.iter().find(|f| f.fn_name == fn_name);
+        if diverged && finding.is_none() {
+            problems.push(format!(
+                "`{fn_name}` diverged with FalsePositiveUb but produced no finding bundle \
+                 (expected failing_construct_hint {expected_hint})"
+            ));
+        }
+    }
     for finding in &report.findings {
         if finding.fn_name == "vt_dyn_dispatch" {
             if finding.applied_mutators != vec!["VTableAndFnPtrMutator".to_string()] {

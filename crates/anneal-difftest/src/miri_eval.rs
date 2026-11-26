@@ -4687,6 +4687,13 @@ enum ClosureOwner {
 /// stopping at the shallowest depth that matches a known top-level or nested
 /// function so `fn foo_closure` never over-strips to `fn foo`, while nested
 /// closures (`foo::{closure#0}::{closure#0}`) peel back to `foo`.
+///
+/// Note: `anneal-rustc-capture` V2026_06_01 (`should_capture_mir_item`) does
+/// not capture local `DefKind::Closure` bodies as separate `Mir.<Crate>.*`
+/// modules (a closure reified through `PointerCoercion::ClosureFnPointer`
+/// appears only as `AggregateKind.closure` / `RigidTy.closure` inside its
+/// enclosing function's module), so this resolver only governs closure
+/// suffixes that a capture backend actually emits; it never fabricates them.
 fn resolve_closure_owners_in_scope(rel: &str, scope_graph: &ScopeGraphData) -> Vec<ClosureOwner> {
     const MAX_CLOSURE_DEPTH: usize = 16;
     let mut visited: BTreeSet<&str> = BTreeSet::new();
@@ -4700,14 +4707,18 @@ fn resolve_closure_owners_in_scope(rel: &str, scope_graph: &ScopeGraphData) -> V
         if frontier.is_empty() {
             break;
         }
-        let mut matched: Vec<ClosureOwner> = Vec::new();
+        // `frontier` is in priority order (exact single-`_` stem before the
+        // legacy double-`__` stem), so the FIRST matching candidate wins: the
+        // closure stem `foo__closure_0` of `fn foo_` must never also resolve to
+        // a reached `fn foo` and be linked through `foo`'s reachability.
         for &cand in &frontier {
             if scope_graph.top_level_fns.contains(cand) {
-                let owner = ClosureOwner::TopFn(cand.to_string());
-                if !matched.contains(&owner) {
-                    matched.push(owner);
-                }
-            } else if let Some(nested_list) = scope_graph.nested_fn_stems.get(cand) {
+                return vec![ClosureOwner::TopFn(cand.to_string())];
+            }
+            if let Some(nested_list) = scope_graph.nested_fn_stems.get(cand)
+                && !nested_list.is_empty()
+            {
+                let mut matched: Vec<ClosureOwner> = Vec::new();
                 for (top_fn, leaf_fn) in nested_list {
                     let owner = ClosureOwner::NestedFn {
                         top_fn: top_fn.clone(),
@@ -4717,10 +4728,8 @@ fn resolve_closure_owners_in_scope(rel: &str, scope_graph: &ScopeGraphData) -> V
                         matched.push(owner);
                     }
                 }
+                return matched;
             }
-        }
-        if !matched.is_empty() {
-            return matched;
         }
         let mut next_frontier: Vec<&str> = Vec::new();
         for cand in frontier {
@@ -15255,6 +15264,75 @@ pub use stage_ns_1::ns1_entry;
     }
 
     #[test]
+    fn confirm_helper_module_suffixes_never_links_trailing_underscore_or_nested_fn_closures_through_a_colliding_reached_owner()
+    {
+        // `sanitize_item_module_stem` renders `foo::{closure#0}` as
+        // `foo_closure_0` and `foo_::{closure#0}` as `foo__closure_0`; the
+        // latter must resolve ONLY to `fn foo_`, never also to `fn foo`.
+        // Nested fns `outer::inner` / `outer2::inner` render as
+        // `outer_inner_closure_0` / `outer2_inner_closure_0` and must follow
+        // their own enclosing top-level fn's reachability, not the shared leaf
+        // name `inner`.
+        let lib_rs = "\
+fn foo(seed: u32) -> u32 {
+    let f = |z: u32| z + 1u32;
+    f(seed)
+}
+fn foo_(seed: u32) -> u32 {
+    let f = |z: u32| z + 2u32;
+    f(seed)
+}
+fn outer(seed: u32) -> u32 {
+    fn inner(v: u32) -> u32 {
+        let g = |w: u32| w ^ 5u32;
+        g(v)
+    }
+    inner(seed)
+}
+fn outer2(seed: u32) -> u32 {
+    fn inner(v: u32) -> u32 {
+        let g = |w: u32| w ^ 6u32;
+        g(v)
+    }
+    inner(seed)
+}
+pub fn calls_foo() -> u32 {
+    foo(1u32) ^ outer(2u32)
+}
+pub fn calls_foo_underscore() -> u32 {
+    foo_(1u32) ^ outer2(2u32)
+}
+";
+        let pairs: Vec<(String, String)> = [
+            ("{closure#0}", "X.foo_closure_0"),
+            ("{closure#0}", "X.foo__closure_0"),
+            ("{closure#0}", "X.outer_inner_closure_0"),
+            ("{closure#0}", "X.outer2_inner_closure_0"),
+        ]
+        .iter()
+        .map(|(s, suf)| ((*s).to_string(), (*suf).to_string()))
+        .collect();
+        let helpers: Vec<String> = pairs.iter().map(|(_, suf)| suf.clone()).collect();
+        let linked_for = |entry: &str| {
+            confirm_helper_module_suffixes(
+                lib_rs,
+                "X",
+                &pairs,
+                &helpers,
+                &[OracleItemSpec::with_fuel(entry.to_string(), 200)],
+            )
+        };
+        assert_eq!(
+            linked_for("calls_foo"),
+            vec!["X.foo_closure_0", "X.outer_inner_closure_0"],
+        );
+        assert_eq!(
+            linked_for("calls_foo_underscore"),
+            vec!["X.foo__closure_0", "X.outer2_inner_closure_0"],
+        );
+    }
+
+    #[test]
     fn extract_failing_construct_hint_distinguishes_unsize_closure_fn_ptr_and_other_mir_ops() {
         let mir_unsize = "\
 def body : CapturedMir :=
@@ -15319,6 +15397,14 @@ def body : CapturedMir :=
         // `-Zmir-opt-level=0`, which exhausted the previous `512`-step bound
         // (`DEFAULT_ORACLE_FUEL * 4`) and now completes within
         // `MIRI_DIFFTEST_CANDIDATE_FUEL` (`1024`).
+        //
+        // `b24_c17_fn_src` is byte-identical to
+        // `generate_miri_corpus_batch(32, 0xd257e312 + 24 * 0x9E3779B97F4A7C15, 24)[17]`
+        // under the Campaign #23 generator (`ClosureAndAddrEqMutator` drawing
+        // `gen_range(5)`). It is pinned verbatim because moving `closure_fn_ptr`
+        // into `ClosureAndAddrEqMutator` (`gen_range(6)`) changes that draw, so
+        // today's generator emits a different `ClosureAndAddrEqMutator` arm for
+        // this slot.
         let b24_c17_fn_src = r#"#[inline(never)]
 fn __anneal_wide_slice_addr_eq_43987(
     __clos_p: *const [u32],
@@ -15382,6 +15468,7 @@ fn __anneal_clos_driver_43987(__clos_seed: u32, __clos_bias: u32) -> u32 {
         ^ ((__clos_agg_bytes as u32) << 24u32);
     __clos_acc
 }
+/// Upstream source: `tests/pass/binops.rs`
 pub fn pass_bitwise_and_or_xor_not__b24_c17() -> u32 {
     let x: u32 = 0x0F0F_00FF;
     let y: u32 = 0x00FF_0F0F;

@@ -9684,6 +9684,116 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
             self.assertFalse(ok_bad)
             self.assertIn("failing_construct_hint", msg_bad)
 
+    def test_stacked_vtable_and_closure_mutators_attribute_by_fault_line_with_derived_hints(
+        self,
+    ) -> None:
+        """A candidate stacking BOTH `VTableAndFnPtrMutator` and
+        `ClosureAndAddrEqMutator` attributes a `ClosureFnPointer` false-positive
+        UB to `ClosureAndAddrEqMutator` (via its `__clos_*` fault line) and a
+        `&dyn Trait` false-positive UB to `VTableAndFnPtrMutator`, independent
+        of `applied_mutators` order, and derives distinct construct hints from
+        the fault lines alone for legacy findings lacking both
+        `failing_construct_hint` and `mir_neighborhood`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            stacked_src = "\n".join(
+                [
+                    "trait __AnnealVtableTrait7 { fn eval_vt(&self, x: u32) -> u32; }",
+                    "struct __AnnealVtableReceiver7 { pub bias: u32 }",
+                    "impl __AnnealVtableTrait7 for __AnnealVtableReceiver7 {",
+                    "    fn eval_vt(&self, x: u32) -> u32 { x ^ self.bias }",
+                    "}",
+                    "fn __anneal_vt_driver_7(__vt_seed: u32, __vt_bias: u32) -> u32 {",
+                    "    let __vt_rec = __AnnealVtableReceiver7 { bias: __vt_bias };",
+                    "    let __vt_rec_dyn: &dyn __AnnealVtableTrait7 = &__vt_rec as &dyn __AnnealVtableTrait7;",
+                    "    __vt_rec_dyn.eval_vt(__vt_seed)",
+                    "}",
+                    "fn __anneal_clos_driver_9(__clos_seed: u32, __clos_bias: u32) -> u32 {",
+                    "    let __clos_cfp: fn(u32) -> u32 = |__clos_z: u32| __clos_z ^ 17u32;",
+                    "    __clos_cfp(__clos_seed ^ __clos_bias)",
+                    "}",
+                    "pub fn pass_seed__b0_c0() -> u32 {",
+                    "    let __miri_vt_7: u32 = __anneal_vt_driver_7(1u32, 2u32);",
+                    "    let __miri_clos_9: u32 = __anneal_clos_driver_9(3u32, 4u32);",
+                    "    __miri_vt_7 ^ __miri_clos_9",
+                    "}",
+                ]
+            ) + "\n"
+            self.assertIn("as &dyn", stacked_src.splitlines()[7])
+            self.assertIn("__clos_cfp: fn(u32)", stacked_src.splitlines()[11])
+
+            def finding(idx: int, mutators: list[str], span: str) -> dict[str, Any]:
+                repro = tmp_path / f"repro_{idx}.rs"
+                repro.write_text(stacked_src, encoding="utf-8")
+                return {
+                    "finding_id": f"finding_000{idx}_pass_seed__b0_c0",
+                    "fn_name": "pass_seed__b0_c0",
+                    "seed_name": "pass_seed",
+                    "applied_mutators": mutators,
+                    "divergence_class": "false_positive_ub",
+                    "witness_polarity": "sound_conservative_abstraction",
+                    "miri_outcome": "pass:scalar:7:4",
+                    "anneal_outcome": f"ub@{span}",
+                    "anneal_lean_tag": "MirDiffTag.ub",
+                    "anneal_span": span,
+                    "miri_excerpt": "MIRI_PASS:scalar:7:4",
+                    "mutant_source": stacked_src,
+                    "repro_path": str(repro),
+                    "kernel_confirmed": True,
+                }
+
+            vt_first = ["VTableAndFnPtrMutator", "ClosureAndAddrEqMutator"]
+            clos_first = ["ClosureAndAddrEqMutator", "VTableAndFnPtrMutator"]
+            dyn_span = "src/lib.rs:8:51: 8:88"
+            clos_span = "src/lib.rs:12:38: 12:71"
+            findings = [
+                finding(0, vt_first, clos_span),
+                finding(1, clos_first, dyn_span),
+                finding(2, clos_first, clos_span),
+                finding(3, vt_first, dyn_span),
+            ]
+            self.assertEqual(
+                [campaign.infer_finding_cause(f, set()) for f in findings],
+                [
+                    "ClosureAndAddrEqMutator",
+                    "VTableAndFnPtrMutator",
+                    "ClosureAndAddrEqMutator",
+                    "VTableAndFnPtrMutator",
+                ],
+            )
+            self.assertEqual(
+                [campaign.extract_failing_construct_hint(f) for f in findings],
+                [
+                    "PointerCoercion::ClosureFnPointer",
+                    "PointerCoercion::Unsize",
+                    "PointerCoercion::ClosureFnPointer",
+                    "PointerCoercion::Unsize",
+                ],
+            )
+            all_dedup, unq, quar = campaign.deduplicate_and_quarantine_findings(
+                findings, set(), {"VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub"}
+            )
+            by_fp = {d.fingerprint: d for d in all_dedup}
+            self.assertEqual(
+                sorted(by_fp),
+                [
+                    "ClosureAndAddrEqMutator:false_positive_ub:MirDiffTag.ub",
+                    "VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub",
+                ],
+            )
+            d_clos = by_fp["ClosureAndAddrEqMutator:false_positive_ub:MirDiffTag.ub"]
+            d_dyn = by_fp["VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub"]
+            self.assertEqual(d_clos.occurrences, 2)
+            self.assertEqual(d_dyn.occurrences, 2)
+            self.assertEqual(d_clos.failing_construct_hints, ["PointerCoercion::ClosureFnPointer"])
+            self.assertEqual(d_dyn.failing_construct_hints, ["PointerCoercion::Unsize"])
+            # Quarantining the `&dyn Trait` fingerprint must NOT hide the
+            # `ClosureFnPointer` fingerprint (the Campaign #23 masking bug).
+            self.assertEqual([d.fingerprint for d in quar], [d_dyn.fingerprint])
+            self.assertEqual([d.fingerprint for d in unq], [d_clos.fingerprint])
+            for d in all_dedup:
+                self.assertTrue(campaign._is_well_formed_quarantine_token(d.fingerprint))
+
 
 if __name__ == "__main__":
     unittest.main()

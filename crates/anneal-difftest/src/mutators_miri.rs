@@ -9883,7 +9883,7 @@ pub fn indirect_seed() -> u32 {
                     "__clos_cfp: fn(u32) -> u32 = |__clos_z: u32|",
                     "__clos_cufp_direct: unsafe fn(u32) -> u32 = |__clos_z: u32|",
                 ],
-                "__AnnealVtable",
+                "__vt_",
             ),
         ];
         const CLOS_PANIC: &[Template] = &[
