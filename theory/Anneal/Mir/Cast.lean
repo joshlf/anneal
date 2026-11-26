@@ -8658,13 +8658,13 @@ private theorem valueListContainsUninit_encodeRawAbstractByteVals :
     ∀ (bs : List AbstractByte), valueListContainsUninit (encodeRawAbstractByteVals bs) = false
   | .nil => rfl
   | .uninit :: rest => by
-    simp [encodeRawAbstractByteVals, valueListContainsUninit, valueContainsUninit,
+    simp [encodeRawAbstractByteVals,
       valueListContainsUninit_encodeRawAbstractByteVals rest]
   | .init _ .none :: rest => by
-    simp [encodeRawAbstractByteVals, valueListContainsUninit, valueContainsUninit,
+    simp [encodeRawAbstractByteVals,
       valueListContainsUninit_encodeRawAbstractByteVals rest]
   | .init _ (.some (_, _)) :: rest => by
-    simp [encodeRawAbstractByteVals, valueListContainsUninit, valueContainsUninit,
+    simp [encodeRawAbstractByteVals,
       valueListContainsUninit_encodeRawAbstractByteVals rest]
 
 private theorem valueListContainsUninit_append_units_overlay
@@ -8677,14 +8677,14 @@ private theorem valueListContainsUninit_append_units_overlay
     simp [replicateValue, appendValueList, valueListContainsUninit, valueContainsUninit,
       valueListContainsUninit_encodeRawAbstractByteVals bs]
   | k + 1 => by
-    simp [replicateValue, appendValueList, valueListContainsUninit, valueContainsUninit,
+    simp [replicateValue, appendValueList,
       valueListContainsUninit_append_units_overlay bs k]
 
 private theorem readProjectedValue_unionRawOverlayValue_nil
     (locals : List LocalSlot) (count : Nat) (bs : List AbstractByte) :
     readProjectedValue locals (unionRawOverlayValue count bs) [] =
       .ok (unionRawOverlayValue count bs) := by
-  simp [readProjectedValue, unionRawOverlayValue, valueContainsUninit,
+  simp [readProjectedValue, unionRawOverlayValue,
     valueListContainsUninit_append_units_overlay bs count]
 
 private theorem readProjectedValueUnionAware_of_decodePtrBytesNoForge_thin
