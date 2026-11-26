@@ -1,0 +1,2320 @@
+/-
+Copyright 2026 The Fuchsia Authors
+
+Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+<LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+This file may not be copied, modified, or distributed except according to
+those terms.
+-/
+
+import Lean
+import Miri.TreeBorrows.MachineMemoryHooks
+import Miri.TreeBorrows.RetagPipeline
+import Miri.Interpreter.Unwind
+import Miri.Interpreter.PointerOffset
+import LeanMiriSpec.Correspondence.SimLM4_1
+import LeanMiriSpec.Correspondence.OffsetLM4_2
+
+/-!
+# Episode 1 LeanMiri Authority: Cross-Frame References, Pointer Arithmetic, & 4-Way Panic Unwinding (`LeanMiriSpec.CrossFrameRefAndPanicLM`)
+
+Operational correspondence between vendored unmodified `lean-miri` (`Miri.Interpreter.Step`,
+`Miri.Interpreter.ControlFlow`, `Miri.Interpreter.Unwind`, `Miri.Interpreter.PointerOffset`,
+`Miri.Memory.MemoryLifecycle`, `Miri.TreeBorrows.{BorrowTree, RetagPipeline, MachineMemoryHooks}`)
+and Anneal's unmodified trusted MIR semantics (`Trusted.Rustc.V2026_06_01.MirSemantics`) across
+the frozen 28-scenario (`0..27`) × 2-mode (`treeBorrows = false` vs `true`) matrix:
+
+1. **Kernel-certified evaluation of vendored `Miri` code (`§0–§2`)**: derives loop-unrolled and
+   row-scan twins with kernel-checked `@F = @T` equations (`loopReal_eq_unrolled`,
+   `KeyedArray.contains_rows`) so every scenario runs on the REAL vendored `Miri` definitions
+   with zero `native_decide` and zero `sorry`.
+2. **Universal vendored `Miri` laws (`§3`)**:
+   - `Pointer.wrappingSignedOffset` `+delta` / `-delta` round-trip and `ptrOffsetInbounds` OOB
+     rejection;
+   - `Miri.TreeBorrows.BorrowTree` `FnEntry` strong-protector foreign-write conflict vs.
+     post-`releaseProtector` parent access success, `Frozen` local-write UB, and 2-frame LIFO
+     protector release ordering;
+   - `Miri.Interpreter.Unwind` payload push/pop LIFO invariants & empty-payload error;
+   - `Miri.Interpreter.ControlFlow` `Unreachable` UB, 4-way `unwindToBlock`, and root-frame
+     `returnFromCurrentFrame(..., unwinding := true)` UB.
+3. **Direct two-sided `stepMirFn` ↔ `Miri.Interpreter.Step.step` simulations (`§4`)**:
+   packages lockstep simulations for `TerminatorKind.assert` (pass & fail across all 4 unwind
+   actions), `TerminatorKind.unreachable`, cross-frame `Call` / `Return` / multi-frame LIFO
+   `UnwindResume` (including root-ceiling divergence vs. cleared-ceiling agreement), safe
+   references, `BinOp.offset`, `core::intrinsics::arith_offset`, and six-state Tree Borrows.
+4. **Frozen 56-cell observation table (`lmCrossFramePanicObserve_table`), out-of-range
+   fail-closed guard, mode-sensitivity `↔`, capstone, and silent axiom/import-isolation audit
+   (`§5–§6`)** verifying ZERO `MiniRustSpec.*` and ZERO `Anneal.*` imports.
+-/
+
+namespace LeanMiriSpec.CrossFrameRefAndPanicLM
+
+set_option Elab.async false
+
+open Miri.ABI Miri.Memory Miri.TreeBorrows Miri.DataStructures Miri.Interpreter
+open LeanMiriSpec.Correspondence
+
+/-! ## §0. Frozen Observation Interface & Kernel-Certified Evaluation of Vendored `Miri` -/
+
+/-- Frozen cross-authority observation domain for Episode 1 scenarios (constructor order
+identical to `MrCrossFramePanicObs` and `CrossFramePanicObs`). -/
+inductive LmCrossFramePanicObs : Type where
+  | okVal (retVal : Nat) (referentVal : Nat)
+  | okCleanupRecovered (retVal : Nat) (referentVal : Nat)
+  | unwound (referentVal : Nat)
+  | abort
+  | ub
+  | specPanic
+  | invalidOrUnsupported
+  deriving DecidableEq, Repr
+
+/-- Number of canonical Episode 1 scenarios (`0..27`, 56 mode cells). -/
+def lmCanonicalCaseCount : Nat := 28
+
+/-- 4-byte alignment (`2^2 = 4`) for `u32` and `[u32; 2]` stack locals. -/
+@[reducible] def align4 : Align := ⟨2⟩
+
+/-- Close an equality goal via kernel definitional reduction (no `Lean.ofReduceBool`). -/
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq?
+    | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+/-- Bounded unrolling of a `while` loop (`Lean.Loop`) in `Id`. -/
+def loopFuelK {β : Type} (f : Unit → β → Id (ForInStep β)) : Nat → β → (β → β) → β
+  | 0, b, k => k b
+  | n + 1, b, k =>
+    match f () b with
+    | .done v => v
+    | .yield v => loopFuelK f n v k
+
+def loopReal : (β : Type) → β → (Unit → β → Id (ForInStep β)) → β :=
+  fun _ init f => forIn (m := Id) Lean.Loop.mk init f
+
+def loopUnrolled (fuel : Nat) : (β : Type) → β → (Unit → β → Id (ForInStep β)) → β :=
+  fun β init f => loopFuelK f fuel init (fun b => loopReal β b f)
+
+theorem loopReal_eq_unrolled (fuel : Nat) : loopReal = loopUnrolled fuel := by
+  funext β init f
+  induction fuel generalizing init with
+  | zero => rfl
+  | succ n ih =>
+    show Lean.Loop.forIn Lean.Loop.mk init f = loopFuelK f (n + 1) init (fun b => loopReal β b f)
+    rw [Lean.Loop.forIn_eq_of_monadTail]
+    show (match f () init with
+      | .done val => val
+      | .yield val => Lean.Loop.forIn Lean.Loop.mk val f) = _
+    simp only [loopFuelK]
+    cases f () init with
+    | done v => rfl
+    | yield v => exact ih v
+
+open Lean Meta Elab Command in
+private def resolveMaybePrivate (n : Name) : CoreM Name := do
+  let env ← getEnv
+  if env.contains n then return n
+  let found := env.constants.fold (init := (none : Option Name)) fun acc c _ =>
+    if privateToUserName? c == some n then some c else acc
+  match found with
+  | some c => return c
+  | none => throwError "unknown constant {n}"
+
+open Lean Meta Elab Command in
+/-- Derive a kernel-evaluable twin `T` of a vendored definition `F` with a kernel-checked
+equality theorem `T.eq_src : @F = @T` (zero axioms, zero compiler trust). -/
+local elab "unroll_loops " newId:ident " := " srcId:ident " fuel " n:num
+    deps:((" with " ident,*)?) : command => do
+  liftTermElabM do
+    let src ← (try resolveGlobalConstNoOverload srcId catch _ => resolveMaybePrivate srcId.getId)
+    let .defnInfo dinfo ← getConstInfo src | throwError "{src} is not a definition"
+    let lvls := dinfo.levelParams
+    let newName := (← getCurrNamespace) ++ newId.getId
+    let depIds : Array Syntax := match deps.raw with
+      | .node _ _ args => if args.size == 0 then #[] else args[1]!.getSepArgs
+      | _ => #[]
+    let mut depInfo : Array (Name × Expr × Name × Nat × Array Expr) := #[]
+    for d in depIds do
+      let t ← resolveGlobalConstNoOverload d
+      let thm ← getConstInfo (t ++ `eq_src)
+      let some (_, lhs, _) := thm.type.eq? | throwError "{t}.eq_src is not an equation"
+      let rec strip (e : Expr) (k : Nat) : Expr × Nat :=
+        match e with
+        | .lam _ _ b _ => strip b (k + 1)
+        | e => (e, k)
+      let (body, nb) := strip lhs 0
+      let .const head _ := body.getAppFn | throwError "{t}.eq_src: unsupported source {lhs}"
+      depInfo := depInfo.push (t, lhs, head, nb, body.getAppArgs)
+    let loopTy ← inferType (mkConst ``LeanMiriSpec.CrossFrameRefAndPanicLM.loopReal)
+    let depTys ← depInfo.mapM fun (_, lhs, _, _, _) => inferType lhs
+    let fuel := mkNatLit n.getNat
+    withLocalDeclD `L loopTy fun L => do
+    let rec withDeps (i : Nat) (gs : Array Expr) (k : Array Expr → MetaM Unit) : MetaM Unit :=
+      if h : i < depTys.size then
+        withLocalDeclD ((`g).appendIndexAfter i) depTys[i] fun g => withDeps (i + 1) (gs.push g) k
+      else k gs
+    withDeps 0 #[] fun gs => do
+      let body ← Core.transform dinfo.value (post := fun e => do
+        if e.isAppOfArity ``ForIn.forIn 8 && (e.getArg! 1).isConstOf ``Lean.Loop &&
+            (e.getArg! 0).isConstOf ``Id then
+          return .done (mkApp3 L (e.getArg! 4) (e.getArg! 6) (e.getArg! 7))
+        let fn := e.getAppFn
+        if let .const c _ := fn then
+          let args := e.getAppArgs
+          for i in [:depInfo.size] do
+            let (_, _, head, nb, pat) := depInfo[i]!
+            if c == head && args.size ≥ pat.size then
+              let mut binds : Array (Option Expr) := Array.replicate nb none
+              let mut ok := true
+              for j in [:pat.size] do
+                match pat[j]! with
+                | .bvar k =>
+                  if k < nb then binds := binds.set! (nb - 1 - k) (some args[j]!) else ok := false
+                | p => if p != args[j]! then ok := false
+              if ok && binds.all Option.isSome then
+                let g := mkAppN gs[i]! (binds.map Option.get!)
+                return .done (mkAppN g (args.extract pat.size args.size))
+        return .continue)
+      let ctx ← mkLambdaFVars (#[L] ++ gs) body
+      let twinVal := mkAppN ctx
+        (#[mkApp (mkConst ``LeanMiriSpec.CrossFrameRefAndPanicLM.loopUnrolled) fuel] ++
+          depInfo.map fun (t, _, _, _, _) => mkConst t)
+      let twinVal ← Core.betaReduce twinVal.headBeta
+      addDecl <| .defnDecl {
+        name := newName, levelParams := lvls, type := dinfo.type, value := twinVal,
+        hints := .abbrev, safety := .safe }
+      let mut proof ← mkCongrArg ctx
+        (mkApp (mkConst ``LeanMiriSpec.CrossFrameRefAndPanicLM.loopReal_eq_unrolled) fuel)
+      for (t, _, _, _, _) in depInfo do
+        proof ← mkCongr proof (mkConst (t ++ `eq_src))
+      let us := lvls.map mkLevelParam
+      let stmt ← mkEq (mkConst src us) (mkConst newName us)
+      addDecl <| .thmDecl {
+        name := newName ++ `eq_src, levelParams := lvls, type := stmt, value := proof }
+
+/-! ### `KeyedArray` row-scan twins (`KeyedArray.contains_rows`) -/
+
+def containsU64 : (V : Type) → (keyFn : V → UInt64) → KeyedArray UInt64 V keyFn → UInt64 → Bool :=
+  fun _ keyFn table key => (table.toArray.map keyFn).contains key
+
+theorem containsU64.eq_src :
+    (fun (V : Type) (keyFn : V → UInt64) => @KeyedArray.contains UInt64 V _ _ keyFn) =
+      containsU64 := by
+  funext V keyFn table key
+  exact KeyedArray.contains_rows table key
+
+private theorem keyedArray_find?_eq_none_of_contains_false {V : Type} {keyFn : V → UInt64}
+    (table : KeyedArray UInt64 V keyFn) (key : UInt64) (h : table.contains key = false) :
+    table.find? key = none := by
+  cases hf : table.find? key with
+  | none => rfl
+  | some _ =>
+    exfalso
+    unfold KeyedArray.contains at h
+    unfold KeyedArray.find? at hf
+    rw [Std.HashMap.get?_eq_getElem?, Std.HashMap.getElem?_eq_none_of_contains_eq_false h] at hf
+    cases hf
+
+def findU64 : (V : Type) → (keyFn : V → UInt64) → KeyedArray UInt64 V keyFn → UInt64 → Option V :=
+  fun _ keyFn table key =>
+    if (table.toArray.map keyFn).contains key then table.find? key else none
+
+theorem findU64.eq_src :
+    (fun (V : Type) (keyFn : V → UInt64) => @KeyedArray.find? UInt64 V _ _ keyFn) = findU64 := by
+  funext V keyFn table key
+  unfold findU64
+  rw [← KeyedArray.contains_rows table key]
+  cases h : table.contains key with
+  | true => rfl
+  | false => exact keyedArray_find?_eq_none_of_contains_false table key h
+
+private theorem keyedArray_any?_eq_false_of_contains_false {V : Type} {keyFn : V → UInt64}
+    (table : KeyedArray UInt64 V keyFn) (key : UInt64) (p : V → Bool)
+    (h : table.contains key = false) :
+    table.any? key p = false := by
+  unfold KeyedArray.contains at h
+  unfold KeyedArray.any?
+  rw [Std.HashMap.get?_eq_getElem?, Std.HashMap.getElem?_eq_none_of_contains_eq_false h]
+  rfl
+
+def anyU64 : (V : Type) → (keyFn : V → UInt64) → KeyedArray UInt64 V keyFn → UInt64 →
+    (V → Bool) → Bool :=
+  fun _ keyFn table key p =>
+    if (table.toArray.map keyFn).contains key then table.any? key p else false
+
+theorem anyU64.eq_src :
+    (fun (V : Type) (keyFn : V → UInt64) => @KeyedArray.any? UInt64 V _ _ keyFn) = anyU64 := by
+  funext V keyFn table key p
+  unfold anyU64
+  rw [← KeyedArray.contains_rows table key]
+  cases h : table.contains key with
+  | true => rfl
+  | false => exact keyedArray_any?_eq_false_of_contains_false table key p h
+
+/-! ### Evaluable twins of vendored `Miri` lifecycle, Tree Borrows, and retag operations -/
+
+unroll_loops containsIdU := Miri.Memory.MemoryState.containsId fuel 0 with containsU64
+unroll_loops reserveAllocIdU := Miri.Memory.MemoryState.reserveAllocId fuel 0 with containsIdU
+unroll_loops insertAllocationU := Miri.Memory.MemoryLifecycle.insertAllocation fuel 0
+  with reserveAllocIdU
+unroll_loops allocatePtrU := Miri.Memory.MemoryLifecycle.allocatePtr fuel 0 with insertAllocationU
+unroll_loops findGlobalU := Miri.Memory.MemoryState.findGlobal? fuel 0 with findU64
+unroll_loops hasFunctionPointerU := Miri.Memory.MemoryState.hasFunctionPointer fuel 0
+  with containsU64, anyU64
+unroll_loops getAllocInfoU := Miri.Memory.MemoryState.getAllocInfo fuel 0
+  with hasFunctionPointerU, containsU64, findGlobalU
+unroll_loops deallocatePtrWithU := Miri.Memory.MemoryLifecycle.deallocatePtrWith fuel 0
+  with findGlobalU
+unroll_loops findOffsetU := Miri.DataStructures.DedupRangeMap.findOffset fuel 40
+unroll_loops iterMutWithCloneU := Miri.DataStructures.DedupRangeMap.iterMutWithClone fuel 30
+  with findOffsetU
+unroll_loops iterMutU := Miri.DataStructures.DedupRangeMap.iterMut fuel 0 with iterMutWithCloneU
+unroll_loops modifyRangeWithCloneU := Miri.DataStructures.DedupRangeMap.modifyRangeWithClone fuel 0
+  with iterMutWithCloneU
+unroll_loops modifyRangeU := Miri.DataStructures.DedupRangeMap.modifyRange fuel 0
+  with modifyRangeWithCloneU
+unroll_loops updateSifaAfterRetagU := Miri.TreeBorrows.BorrowTree.updateSifaAfterRetag fuel 30
+unroll_loops newChildU := Miri.TreeBorrows.BorrowTree.newChild fuel 0
+  with updateSifaAfterRetagU, modifyRangeU
+unroll_loops minExposedChildU := Miri.TreeBorrows.BorrowTree.minExposedChild fuel 30
+unroll_loops performTreeAccessAtU := Miri.TreeBorrows.BorrowTree.performTreeAccessAt fuel 0
+  with minExposedChildU
+unroll_loops performBorrowAccessRangeU := Miri.TreeBorrows.BorrowTree.performBorrowAccessRange fuel 0
+  with iterMutU, performTreeAccessAtU
+unroll_loops deallocateBorrowRangeU := Miri.TreeBorrows.BorrowTree.deallocateBorrowRange fuel 0
+  with performBorrowAccessRangeU, iterMutU
+unroll_loops releaseProtectorU := Miri.TreeBorrows.BorrowTree.releaseProtector fuel 0
+  with performTreeAccessAtU
+unroll_loops commitTreeAccessU := Miri.TreeBorrows.MachineMemoryHooks.commitTreeAccess fuel 0
+  with performBorrowAccessRangeU
+unroll_loops beforeMemoryReadU := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryRead fuel 0
+  with commitTreeAccessU
+unroll_loops beforeMemoryWriteU := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite fuel 0
+  with commitTreeAccessU
+unroll_loops beforeMemoryDeallocationU :=
+  Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryDeallocation fuel 0 with deallocateBorrowRangeU
+unroll_loops buildInsidePermissionsU := Miri.TreeBorrows.RetagPipeline.buildInsidePermissions fuel 0
+  with modifyRangeU
+unroll_loops accessTreeForReborrowU := Miri.TreeBorrows.RetagPipeline.accessTreeForReborrow fuel 0
+  with performBorrowAccessRangeU, newChildU
+unroll_loops runReborrowU := Miri.TreeBorrows.RetagPipeline.runReborrow fuel 0
+  with getAllocInfoU, buildInsidePermissionsU, accessTreeForReborrowU
+unroll_loops retagPointerValueU := Miri.TreeBorrows.RetagPipeline.retagPointerValue fuel 0
+  with runReborrowU
+
+/-! ## §1. Multi-Frame Vendored `Miri` Execution Harness (Tree Borrows + Pointer Offset + Unwind) -/
+
+/-- Harness memory: vendored `MemoryState` with `Provenance`, `BorrowTree`, and `MiriMemoryKind`. -/
+abbrev LmMem := MemoryState Provenance BorrowTree MiriMemoryKind
+
+/-- Typed failure captured directly from vendored `Miri` operations. -/
+inductive LmExecFailure where
+  | allocLifecycle (error : MemoryLifecycleError)
+  | dealloc (error : MemoryLifecycleError)
+  | treeDealloc (status : BorrowTree.BorrowTreeDeallocStatus)
+  | treeAccess (status : BorrowTree.BorrowTreeAccessStatus)
+  | retag (error : RetagPipeline.Error)
+  | protectorRelease (status : BorrowTree.ProtectorReleaseStatus)
+  | access (error : AccessError)
+  | pointerOffset (error : PointerOffsetError)
+  | pointer (error : PointerError)
+  | allocation (error : AllocError)
+  | scalar (error : ScalarError)
+  | controlFlow (error : StepError)
+  | abort
+  | ub (msg : String)
+  deriving DecidableEq
+
+/-- One stack frame's Tree Borrows `FrameState` and stack-allocated locals (deallocated on exit). -/
+structure LmCallFrame where
+  tbFrame : FrameState := {}
+  stackLocals : List (Pointer (Option Provenance) × Nat × Align) := []
+
+/-- Borrow-tracker and multi-frame call-stack context threaded through vendored `Miri` hooks,
+storing real vendored `ThreadManager` and `Unwind.PayloadStore` for `Unwind.{pushPayload, popPayload}`. -/
+structure LmCtx where
+  treeBorrows : Bool
+  global : GlobalState := GlobalState.new
+  frames : List LmCallFrame := [{}]
+  threads : Miri.Concurrency.ThreadManager := Miri.Concurrency.ThreadManager.initial true
+  payloadStore : Miri.Interpreter.Unwind.PayloadStore := Miri.Interpreter.Unwind.PayloadStore.empty
+  pending : Option LmExecFailure := none
+
+/-- Complete multi-frame vendored `Miri` execution state. -/
+structure LmState where
+  mem : LmMem
+  ctx : LmCtx
+
+def lmInit (tb : Bool) : LmState :=
+  { mem := MemoryState.empty, ctx := { treeBorrows := tb } }
+
+def lmLayout : TargetDataLayout := ⟨.little, .w64⟩
+def lmPtrArith : PointerArithmetic := ⟨Size.ofBytes 8⟩
+def lmBaseAddr (id : AllocId) : UInt64 := id.value * 4294967296
+def lmIsizeMax : Nat := 9223372036854775807
+def lmFrozenFacts : RetagPolicy.TypeFacts := ⟨true, true, true⟩
+
+def lmMachineHooks (protectedTags : ProtectedTags) :
+    MachineMemoryHooks.Hooks Unit Unit MiriMemoryKind :=
+  { protectedTags := protectedTags
+    emitDiagnostic := fun s _ _ => s
+    dataRaceRead := fun s _ _ _ => ⟨s, .ok ()⟩
+    dataRaceWrite := fun s _ _ _ => ⟨s, .ok ()⟩
+    dataRaceDeallocate := fun s _ _ _ _ => ⟨s, .ok ()⟩
+    syncOnAccess := fun s _ _ => ⟨s, .ok ()⟩
+    deleteOnWrite := fun _ => false
+    recordDeallocatedSpan := fun s _ => s
+    freeAllocId := fun s _ _ _ _ => s }
+
+def lmHookContext : MachineMemoryHooks.Context Unit Unit :=
+  { state := (), syncObjects := .empty }
+
+def lmInitExtra (memory : LmMem) (ctx : LmCtx) (id : AllocId) (_kind : MemoryKind MiriMemoryKind)
+    (size : Size) (_align : Align) :
+    MemoryStateHookResult Provenance BorrowTree MiriMemoryKind LmCtx BorrowTree :=
+  match ctx.global.rootPointerTag id with
+  | .ok (global', rootTag) =>
+    ⟨memory, { ctx with global := global' }, .ok (BorrowTree.new rootTag size)⟩
+  | .error e => ⟨memory, ctx, .error (reprStr e)⟩
+
+def lmAdjustRoot (memory : LmMem) (ctx : LmCtx) (id : AllocId)
+    (_kind : MemoryKind MiriMemoryKind) :
+    MemoryStateHookResult Provenance BorrowTree MiriMemoryKind LmCtx (Pointer Provenance) :=
+  match ctx.global.rootPointerTag id with
+  | .ok (global', rootTag) =>
+    ⟨memory, { ctx with global := global' },
+      .ok ⟨Size.ofBytes (lmBaseAddr id), .concrete id rootTag⟩⟩
+  | .error e => ⟨memory, ctx, .error (reprStr e)⟩
+
+def lmResolve (memory : LmMem) (ctx : LmCtx) (ptr : Pointer (Option Provenance)) (_size : Int) :
+    PointerResolutionResult Provenance BorrowTree MiriMemoryKind LmCtx ProvenanceExtra :=
+  match ptr.provenance with
+  | some (.concrete id tag) =>
+    if ptr.offset.bytes < lmBaseAddr id then
+      ⟨memory, ctx, .error ptr.offset.bytes⟩
+    else
+      ⟨memory, ctx, .ok (id, Size.ofBytes (ptr.offset.bytes - lmBaseAddr id), .concrete tag)⟩
+  | _ => ⟨memory, ctx, .error ptr.offset.bytes⟩
+
+def lmResolvePure : PointerResolver Provenance ProvenanceExtra := fun ptr _ =>
+  match ptr.provenance with
+  | some (.concrete id tag) =>
+    if ptr.offset.bytes < lmBaseAddr id then .error ptr.offset.bytes
+    else .ok ⟨id, Size.ofBytes (ptr.offset.bytes - lmBaseAddr id), .concrete tag⟩
+  | _ => .error ptr.offset.bytes
+
+def lmBeforeDeallocation (memory : LmMem) (ctx : LmCtx)
+    (allocation : Allocation Provenance BorrowTree) (pointer : Pointer (Option Provenance))
+    (allocId : AllocId) (provenance : ProvenanceExtra) (size : Size) (align : Align)
+    (kind : MemoryKind MiriMemoryKind) :
+    MemoryStateHookResult Provenance BorrowTree MiriMemoryKind LmCtx Unit :=
+  if ctx.treeBorrows then
+    let r := MachineMemoryHooks.beforeMemoryDeallocation lmHookContext
+      (lmMachineHooks ctx.global.protectedTags) allocation pointer allocId provenance size align kind
+    match r.outcome with
+    | .ok () => ⟨memory, ctx, .ok ()⟩
+    | .error message =>
+      ⟨memory,
+        { ctx with pending := some (.treeDealloc
+            (allocation.extra.deallocateBorrowRange provenance Size.ZERO size
+              ctx.global.protectedTags).status) },
+        .error message⟩
+  else
+    ⟨memory, ctx, .ok ()⟩
+
+def lmDeallocHooks :
+    MemoryDeallocationHooks Provenance BorrowTree MiriMemoryKind LmCtx ProvenanceExtra :=
+  { synchronizeMemory := fun _ ctx => ctx
+    resolvePointer := lmResolve
+    beforeDeallocation := lmBeforeDeallocation }
+
+/-- Allocate a stack local of `(size, align)` in the active top frame via vendored
+`Miri.Memory.MemoryLifecycle.allocatePtr`. -/
+def lmAllocStack (st : LmState) (size : Nat) (align : Align) :
+    Except LmExecFailure (Pointer (Option Provenance) × LmState) :=
+  let r := MemoryLifecycle.allocatePtr st.mem st.ctx (fun _ ctx => ctx)
+    (Size.ofBytes (UInt64.ofNat size)) align .stack .Uninit
+    (Size.ofBytes (UInt64.ofNat lmIsizeMax)) (some (.machine .global))
+    (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) lmInitExtra lmAdjustRoot
+  match r.outcome with
+  | .error e => .error (.allocLifecycle e)
+  | .ok ptr =>
+    let optPtr := ptr.withOptionalProvenance
+    let frames' := match r.hooks.frames with
+      | top :: rest => { top with stackLocals := (optPtr, size, align) :: top.stackLocals } :: rest
+      | [] => [{ stackLocals := [(optPtr, size, align)] }]
+    .ok (optPtr, { mem := r.memory, ctx := { r.hooks with frames := frames' } })
+
+/-- Deallocate one stack local via vendored `Miri.Memory.MemoryLifecycle.deallocatePtrWith`. -/
+def lmDeallocStackOne (st : LmState) (entry : Pointer (Option Provenance) × Nat × Align) :
+    Except LmExecFailure LmState :=
+  let (ptr, size, align) := entry
+  let r := MemoryLifecycle.deallocatePtrWith st.mem st.ctx ptr
+    (some (Size.ofBytes (UInt64.ofNat size), align)) .stack lmDeallocHooks
+  match r.outcome with
+  | .ok () => .ok { mem := r.memory, ctx := r.hooks }
+  | .error e => .error (r.hooks.pending.getD (.dealloc e))
+
+/-- Access target validation via vendored `Miri.Memory.getPtrAccess` and `MemoryState.getAllocInfo`. -/
+def lmAccessTarget (st : LmState) (ptr : Pointer (Option Provenance)) (size : UInt64) :
+    Except LmExecFailure (AllocId × Size × ProvenanceExtra × Allocation Provenance BorrowTree) :=
+  match getPtrAccess lmPtrArith ptr (Size.ofBytes size) .memoryAccess
+      lmResolvePure st.mem.getAllocInfo with
+  | .error e => .error (.access e)
+  | .ok none => .error (.ub "zero-sized scalar access")
+  | .ok (some (_, _, (id, offset, provenance))) =>
+    match st.mem.live.find? (fun entry => entry.1 == id) with
+    | none => .error (.access (.allocationLookup (.unavailable id)))
+    | some (_, entry) => .ok (id, offset, provenance, entry.allocation)
+
+/-- Tree Borrows read/write hook via vendored `MachineMemoryHooks.{beforeMemoryRead, beforeMemoryWrite}`. -/
+def lmTreeAccess (st : LmState) (write : Bool) (allocation : Allocation Provenance BorrowTree)
+    (ptr : Pointer (Option Provenance)) (id : AllocId) (provenance : ProvenanceExtra)
+    (range : AllocRange) : Except LmExecFailure LmState :=
+  if st.ctx.treeBorrows then
+    let r :=
+      if write then
+        MachineMemoryHooks.beforeMemoryWrite st.mem lmHookContext
+          (lmMachineHooks st.ctx.global.protectedTags) allocation ptr id provenance range
+      else
+        MachineMemoryHooks.beforeMemoryRead st.mem lmHookContext
+          (lmMachineHooks st.ctx.global.protectedTags) allocation ptr id provenance range
+    match r.outcome with
+    | .ok () => .ok { st with mem := r.memory }
+    | .error _ =>
+      .error (.treeAccess
+        (allocation.extra.performBorrowAccessRange provenance range.start range.size
+          (if write then .Write else .Read) st.ctx.global.protectedTags
+          .VisitChildrenOfAccessed).status)
+  else
+    .ok st
+
+/-- Store a `u32` scalar through `ptr` via vendored `getPtrAccess`, Tree Borrows hook, and
+`Allocation.writeScalar`. -/
+def lmStoreU32 (st : LmState) (ptr : Pointer (Option Provenance)) (val : Nat) :
+    Except LmExecFailure LmState := do
+  let (id, offset, provenance, allocation) ← lmAccessTarget st ptr 4
+  let range : AllocRange := ⟨offset, Size.ofBytes 4⟩
+  let st ← lmTreeAccess st true allocation ptr id provenance range
+  match st.mem.live.find? (fun entry => entry.1 == id) with
+  | none => .error (.access (.allocationLookup (.unavailable id)))
+  | some (_, entry) =>
+    match Miri.Memory.Scalar.fromUInt (Prov := Provenance) (BitVec.ofNat 128 val)
+        (Size.ofBytes 4) with
+    | .error e => .error (.scalar e)
+    | .ok value =>
+      match Allocation.writeScalar lmLayout range value entry.allocation with
+      | .error e _ => .error (.allocation e)
+      | .ok () written =>
+        match st.mem.setLiveAllocation id written with
+        | .error e => .error (.access (.allocationLookup e))
+        | .ok mem => .ok { st with mem := mem }
+
+/-- Load a `u32` scalar through `ptr` via vendored `getPtrAccess`, Tree Borrows hook, and
+`Allocation.readScalar`. -/
+def lmLoadU32 (st : LmState) (ptr : Pointer (Option Provenance)) :
+    Except LmExecFailure (Nat × LmState) := do
+  let (id, offset, provenance, allocation) ← lmAccessTarget st ptr 4
+  let range : AllocRange := ⟨offset, Size.ofBytes 4⟩
+  let st ← lmTreeAccess st false allocation ptr id provenance range
+  match allocation.readScalar lmLayout range false with
+  | .error e => .error (.allocation e)
+  | .ok value =>
+    match value.toBits (Size.ofBytes 4) with
+    | .error e => .error (.scalar e)
+    | .ok bits => .ok (bits.toNat, st)
+
+/-- In-bounds pointer offset via vendored `Miri.Interpreter.ptrOffsetInbounds`. -/
+def lmPtrOffsetInbounds (st : LmState) (ptr : Pointer (Option Provenance)) (byteDelta : Int) :
+    Except LmExecFailure (Pointer (Option Provenance)) :=
+  match Miri.Interpreter.ptrOffsetInbounds lmPtrArith ptr (Int64.ofInt byteDelta)
+      lmResolvePure st.mem.getAllocInfo with
+  | .ok ptr' => .ok ptr'
+  | .error e => .error (.pointerOffset e)
+
+/-- Wrapping pointer offset via vendored `Miri.Memory.Pointer.wrappingSignedOffset`. -/
+def lmPtrOffsetWrapping (ptr : Pointer (Option Provenance)) (byteDelta : Int) :
+    Except LmExecFailure (Pointer (Option Provenance)) :=
+  match ptr.wrappingSignedOffset (Int64.ofInt byteDelta) lmPtrArith with
+  | .ok ptr' => .ok ptr'
+  | .error e => .error (.pointer e)
+
+/-- Push a new callee call frame onto the stack. -/
+def lmEnterCall (st : LmState) : LmState :=
+  { st with ctx := { st.ctx with frames := {} :: st.ctx.frames } }
+
+/-- Retag a reference argument at `FnEntry` (or `Default`) via vendored
+`Miri.TreeBorrows.RetagPipeline.retagPointerValue`, recording its strong protector in
+`GlobalState` and the active top `LmCallFrame.tbFrame`. -/
+def lmRetagRef (st : LmState) (ptr : Pointer (Option Provenance))
+    (refKind : RetagPolicy.ReferenceKind) (mode : RetagPolicy.RetagMode) :
+    Except LmExecFailure (Pointer (Option Provenance) × LmState) :=
+  if st.ctx.treeBorrows then
+    match lmResolvePure ptr 0 with
+    | .error addr => .error (.access (.danglingIntegerPointer addr 0 .memoryAccess))
+    | .ok resolved =>
+      match st.mem.live.find? (fun entry => entry.1 == resolved.allocId) with
+      | none => .error (.access (.allocationLookup (.deadAllocation resolved.allocId)))
+      | some (_, entry) =>
+        let (topFrame, restFrames) := match st.ctx.frames with
+          | top :: rest => (top, rest)
+          | [] => ({}, [])
+        let req : RetagPipeline.Request := {
+          typeShape := .reference
+          typeFacts := lmFrozenFacts
+          referenceKind := refKind
+          mode := mode
+          config := { implicitWrites := true, rustcNoWritable := false }
+          layoutSize := entry.allocation.byteSize
+          originalProvenance := ptr.provenance
+          pointeeIsFreeze := true
+          preciseInteriorMut := false
+          hooks := {
+            allocationResolution := some ⟨resolved.allocId, resolved.offset, resolved.extra⟩
+          }
+        }
+        let mstate : RetagPipeline.MachineState MiriMemoryKind :=
+          ⟨st.mem, st.ctx.global, topFrame.tbFrame⟩
+        let res := RetagPipeline.retagPointerValue mstate req
+        match res.outcome with
+        | .error e => .error (.retag e)
+        | .ok prov =>
+          let topFrame' : LmCallFrame := { topFrame with tbFrame := res.state.frame }
+          .ok (⟨ptr.offset, prov⟩,
+            { mem := res.state.memory
+              ctx := { st.ctx with
+                global := res.state.global
+                frames := topFrame' :: restFrames } })
+  else
+    .ok (ptr, st)
+
+/-- Release one protector `(id, tag)` via vendored `BorrowTree.releaseProtector`. -/
+def lmReleaseOne (protectedTags : ProtectedTags) (mem : LmMem) (entryPair : AllocId × BorTag) :
+    Except LmExecFailure LmMem :=
+  let (id, tag) := entryPair
+  match mem.live.find? (fun entry => entry.1 == id) with
+  | none => .ok mem
+  | some (_, entry) =>
+    let r := entry.allocation.extra.releaseProtector tag protectedTags
+    if r.status = .Released then
+      match mem.setLiveAllocation id (entry.allocation.setExtra r.tree) with
+      | .error e => .error (.access (.allocationLookup e))
+      | .ok mem' => .ok mem'
+    else
+      .error (.protectorRelease r.status)
+
+/-- Exit the active top call frame (normal return OR panic unwind):
+1. Deallocate all stack locals owned by the top frame (`lmDeallocStackOne`).
+2. Release all `FnEntry` protectors owned by the top frame via vendored
+   `BorrowTree.releaseProtector` and `GlobalState.endCall` (preserving outer frames'
+   protectors in strict LIFO order!). -/
+def lmExitCall (st : LmState) : Except LmExecFailure LmState :=
+  match st.ctx.frames with
+  | [] => .error (.ub "empty call stack on frame exit")
+  | top :: rest => do
+    let st1 ← top.stackLocals.foldlM lmDeallocStackOne st
+    if st1.ctx.treeBorrows then
+      match top.tbFrame.protectedTags.toList.foldlM
+          (lmReleaseOne st1.ctx.global.protectedTags) st1.mem with
+      | .error e => .error e
+      | .ok mem' =>
+        .ok { mem := mem'
+              ctx := { st1.ctx with
+                global := st1.ctx.global.endCall top.tbFrame
+                frames := rest } }
+    else
+      .ok { st1 with ctx := { st1.ctx with frames := rest } }
+
+/-- Vendored `Miri.Interpreter.Unwind.Hooks` lens into `PayloadStore` for real
+`Unwind.{pushPayload, popPayload}` execution. -/
+def lmUnwindHooks :
+    Miri.Interpreter.Unwind.Hooks MiriMemoryKind Miri.Interpreter.Unwind.PayloadStore Unit Unit :=
+  { payloads := id
+    setPayloads := fun store _ => store
+    readImmediate := fun _ _ => throw (.unsupported "harness: Unwind.readImmediate")
+    readPointer := fun _ _ => throw (.unsupported "harness: Unwind.readPointer")
+    forceAllocation := fun _ _ => throw (.unsupported "harness: Unwind.forceAllocation")
+    getPtrFn := fun _ _ => throw (.unsupported "harness: Unwind.getPtrFn")
+    callFunction := fun _ _ _ _ => pure ()
+    writeNull := fun _ _ => pure ()
+    writeScalar := fun _ _ _ => pure ()
+    panicUnwinds := true }
+
+/-- Canonical typed unwind payload pushed by `Miri.Interpreter.Unwind.pushPayload`. -/
+def lmUnwindPayload : Miri.Interpreter.RvalueImmTy Provenance :=
+  { imm := .scalar (Scalar.fromBool true), layout := ⟨0, zstLayoutData⟩ }
+
+/-- Lift `LmState` into vendored `Miri.Interpreter.MachineHooks.State` for `Unwind` shims. -/
+def lmUnwindStepState (st : LmState) :
+    Miri.Interpreter.MachineHooks.State MiriMemoryKind Miri.Interpreter.Unwind.PayloadStore :=
+  { stack := ⟨#[]⟩
+    machine :=
+      { memory := st.mem
+        borrowTracker := none
+        dataRace := none
+        threads := st.ctx.threads
+        raceAllocations := #[]
+        allocationSpans := #[]
+        user := st.ctx.payloadStore } }
+
+/-- Push a typed unwind payload onto the active thread via REAL vendored
+`Miri.Interpreter.Unwind.pushPayload`. -/
+def lmStartUnwind (st : LmState) : Except LmExecFailure LmState :=
+  match (Miri.Interpreter.Unwind.pushPayload lmUnwindHooks lmUnwindPayload).run
+      (lmUnwindStepState st) with
+  | .ok () s' =>
+    .ok { st with ctx := { st.ctx with
+      threads := s'.machine.threads
+      payloadStore := s'.machine.user } }
+  | .error e _ => .error (.controlFlow e)
+
+/-- Pop the top typed unwind payload in an outer catch harness (`catch_unwind`) via REAL vendored
+`Miri.Interpreter.Unwind.popPayload`. -/
+def lmCatchUnwind (st : LmState) : Except LmExecFailure LmState :=
+  match (Miri.Interpreter.Unwind.popPayload lmUnwindHooks).run (lmUnwindStepState st) with
+  | .ok _ s' =>
+    .ok { st with ctx := { st.ctx with
+      threads := s'.machine.threads
+      payloadStore := s'.machine.user } }
+  | .error e _ => .error (.controlFlow e)
+
+/-- Minimal unit ABI layout for `CapturedMir` driver bodies lowered via
+`LeanMiriSpec.Correspondence.translateBody`. -/
+def lmMirUnitLayout : Trusted.Rustc.V2026_06_01.Layout.TypeLayout :=
+  { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [] [], variants := .single 0, isUninhabited := false }
+
+/-- Minimal `CapturedMir` builder for frames lowered through `LeanMiriSpec.Correspondence.translateBody`. -/
+def lmMirBodyOfBlocks (defPath : String)
+    (blocks : List Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData) :
+    Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  { defPath := defPath
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 0
+    localDecls := [{ mutability := .mut, ty := ⟨.tuple [], 0⟩, debugName := none }]
+    basicBlocks := blocks
+    fnAbi := { args := [], ret := { layout := lmMirUnitLayout, mode := .direct },
+               conv := .rust, canUnwind := true }
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [] }
+    allocations := [] }
+
+/-- Real `CapturedMir` body for bare root-frame unwind (`bb0`: cleanup `unwindResume`),
+lowered directly through `LeanMiriSpec.Correspondence.translateBody`. -/
+def lmRootUnwindMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_root_unwind"
+    [{ statements := [], terminator := { kind := .unwindResume, span := "ep1.rs" },
+       isCleanup := true }]
+
+/-- Real `CapturedMir` body for `TerminatorKind.unreachable`, lowered through `translateBody`. -/
+def lmUnreachableMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_unreachable"
+    [{ statements := [], terminator := { kind := .unreachable, span := "ep1.rs" },
+       isCleanup := false }]
+
+/-- Build a vendored `Miri.Interpreter.Frame` whose `body` is genuinely lowered from a
+`CapturedMir` via `LeanMiriSpec.Correspondence.translateBody`. -/
+def lmCfFrameOf (cm : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+    (loc : Miri.Interpreter.FrameLocation) (ret : Miri.Interpreter.ReturnContinuation) :
+    Miri.Interpreter.Frame Provenance Unit Unit :=
+  { body := LeanMiriSpec.Correspondence.translateBody cm
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := ret
+    returnPlace := .frameLocal 0 0 none ⟨0, zstLayoutData⟩ (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[⟨.dead, none⟩]
+    vaList := #[]
+    trackCallerArg := none
+    location := loc }
+
+/-- Canonical `CapturedMir` body lowered via `LeanMiriSpec.Correspondence.translateBody`
+for call/return/unwindResume driver frames (`bb0` `.return_`, `bb1` `.return_`,
+`bb2` cleanup `.unwindResume`). -/
+def lmCfMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_cf_frame"
+    [{ statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .unwindResume, span := "ep1.rs" }, isCleanup := true }]
+
+/-- Real `CapturedMir` body for `TerminatorKind.assert`, lowered through `translateBody`. -/
+def lmAssertMirBody (expected : Bool)
+    (u : Trusted.Rustc.V2026_06_01.MirAst.UnwindAction) :
+    Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_assert"
+    [{ statements := [],
+       terminator := { kind := .assert (.copy ⟨1, []⟩) expected 1 u, span := "ep1.rs" },
+       isCleanup := false },
+     { statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .unwindResume, span := "ep1.rs" }, isCleanup := true }]
+
+/-- Real `CapturedMir` body for cleanup `TerminatorKind.unwindTerminate`, lowered through
+`translateBody`. -/
+def lmUnwindTerminateMirBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  lmMirBodyOfBlocks "ep1::lm_unwind_terminate"
+    [{ statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .return_, span := "ep1.rs" }, isCleanup := false },
+     { statements := [], terminator := { kind := .unwindTerminate, span := "ep1.rs" }, isCleanup := true }]
+
+/-- Map `Miri.MIR.UnwindAction` into `MirAst.UnwindAction` for `translateBody` lowering. -/
+def lmUnwindActionToMir : Miri.MIR.UnwindAction → Trusted.Rustc.V2026_06_01.MirAst.UnwindAction
+  | .Continue => .continue_
+  | .Unreachable => .unreachable
+  | .Terminate _ => .terminate
+  | .Cleanup bb => .cleanup bb
+
+/-- A vendored `Miri.Interpreter.Frame` lowered from `lmCfMirBody` via `translateBody`. -/
+def lmCfFrame (loc : Miri.Interpreter.FrameLocation) (ret : Miri.Interpreter.ReturnContinuation) :
+    Miri.Interpreter.Frame Provenance Unit Unit :=
+  lmCfFrameOf lmCfMirBody loc ret
+
+/-- Vendored `ControlHooks` over the harness machine `LmState`; `cleanupFrame` runs the
+supplied frame-exit operation (instantiated with `lmExitCall`), stashing typed failures in
+`LmCtx.pending` so the classifier sees the genuine root cause. -/
+def lmCfControlHooks (exitCall : LmState → Except LmExecFailure LmState) :
+    Miri.Interpreter.ControlHooks Provenance Unit Unit LmState Unit Unit :=
+  { bodySpan := fun _ => .ok ⟨0⟩
+    returnOperand := fun _ s => (s, .ok ())
+    popFrame := fun _ s =>
+      match s.stack.frames.back? with
+      | none => (s, .error (.stack .emptyStack))
+      | some fr => ({ s with stack := ⟨s.stack.frames.pop⟩ }, .ok fr)
+    copyReturn := fun _ _ _ s => (s, .ok ())
+    cleanupFrame := fun _ _ _ s =>
+      match exitCall s.machine with
+      | .ok m => ({ s with machine := m }, .ok .normal)
+      | .error e =>
+        ({ s with machine := { s.machine with ctx := { s.machine.ctx with pending := some e } } },
+          .error (.callback "frame teardown failed"))
+    unwindTerminate := fun _ _ s =>
+      (s, .error (.termination (.abort "panic in a function that cannot unwind"))) }
+
+/-- Vendored `TerminatorHooks` over `LmState`; `readAssertCondition` yields `cond` (read from
+harness memory by the caller), `assertPanic` follows the asserting frame's unwind action. -/
+def lmCfTermHooks (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool) :
+    Miri.Interpreter.TerminatorHooks Provenance Unit Unit LmState Unit Unit Unit :=
+  { lmCfControlHooks exitCall with
+    evalDiscriminant := fun _ _ s => (s, .error (.unsupported "harness: SwitchInt"))
+    compareSwitchCase := fun _ _ _ s => (s, .error (.unsupported "harness: SwitchInt"))
+    call := fun _ _ s => (s, .error (.unsupported "harness: nested call"))
+    tailCall := fun _ _ s => (s, .error (.unsupported "harness: tail call"))
+    drop := fun _ _ _ _ s => (s, .error (.unsupported "harness: drop"))
+    ignoreOptionalOverflowChecks := fun _ => false
+    readAssertCondition := fun _ _ s => (s, .ok cond)
+    assertPanic := fun _ _ unwind s =>
+      Miri.Interpreter.ControlFlow.unwindToBlock (lmCfControlHooks exitCall) () unwind s }
+
+/-- Vendored `Miri.Interpreter.StepHooks` executing every driver transition through the REAL
+vendored `Miri.Interpreter.Step.step` driver (fetching each terminator from the `translateBody`-
+lowered `Miri.MIR.Body`, or taking the `.unwinding _` branch directly into
+`ControlFlow.returnFromCurrentFrame`). -/
+def lmCfStepHooks (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool) :
+    Miri.Interpreter.StepHooks Provenance Unit Unit LmState Unit Unit :=
+  { assign := fun _ _ _ s => (s, .error (.unsupported "harness: Assign"))
+    evalPlace := fun _ _ _ s => (s, .error (.unsupported "harness: evalPlace"))
+    writeDiscriminant := fun _ _ _ s => (s, .error (.unsupported "harness: SetDiscriminant"))
+    storageLive := fun _ _ s => (s, .error (.unsupported "harness: StorageLive"))
+    storageDead := fun _ _ s => (s, .error (.unsupported "harness: StorageDead"))
+    intrinsic := fun _ _ s => (s, .error (.unsupported "harness: Intrinsic"))
+    incrementConstEvalCounter := fun _ s => (s, .ok ())
+    returnFromCurrentFrame := fun _ unwinding s =>
+      Miri.Interpreter.ControlFlow.returnFromCurrentFrame (lmCfControlHooks exitCall) () unwinding s
+    beforeTerminator := fun _ s => (s, .ok ())
+    terminator := fun _ term s =>
+      Miri.Interpreter.ControlFlow.evalTerminator (lmCfTermHooks exitCall cond) () term s }
+
+/-- Control location reached by the active frame after a vendored `Miri.Interpreter.Step.step`. -/
+inductive LmCfOutcome where
+  | atBlock (bb : Nat)
+  | unwinding
+  deriving DecidableEq, Repr
+
+/-- Run ONE step through REAL vendored `Miri.Interpreter.Step.step` on the `translateBody`-lowered
+driver stack `frames` with machine `st`, returning the resulting active-frame location. -/
+def lmCfRun (exitCall : LmState → Except LmExecFailure LmState) (cond : Bool)
+    (frames : Array (Miri.Interpreter.Frame Provenance Unit Unit)) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  match Miri.Interpreter.Step.step (lmCfStepHooks exitCall cond) ()
+      { stack := ⟨frames⟩, machine := st } with
+  | (s, .error e) => .error (s.machine.ctx.pending.getD (.controlFlow e))
+  | (s, .ok _) =>
+    match s.stack.currentFrame? with
+    | none => .error (.controlFlow (.stack .emptyStack))
+    | some fr =>
+      match fr.location with
+      | .mir loc => .ok (.atBlock loc.block, s.machine)
+      | .unwinding _ => .ok (.unwinding, s.machine)
+
+/-- Root-frame unwind check directly invoking vendored `Miri.Interpreter.Step.step` on a 1-frame
+stack lowered from `lmRootUnwindMirBody` via `translateBody`:
+returns `.error (.controlFlow (.undefinedBehavior "unwinding past the topmost stack frame"))`. -/
+def lmRootUnwindCheck (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
+    Except LmExecFailure Unit :=
+  match lmCfRun exitCall true
+      #[lmCfFrameOf lmRootUnwindMirBody (.mir ⟨0, 0⟩) (.stop false)] st with
+  | .ok _ => .ok ()
+  | .error e => .error e
+
+/-- `TerminatorKind.unreachable` check directly invoking vendored `Miri.Interpreter.Step.step` on
+a frame lowered from `lmUnreachableMirBody` via `translateBody`. -/
+def lmUnreachableCheck (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
+    Except LmExecFailure Unit :=
+  match lmCfRun exitCall true
+      #[lmCfFrameOf lmUnreachableMirBody (.mir ⟨0, 0⟩) (.stop false)] st with
+  | .ok _ => .ok ()
+  | .error e => .error e
+
+/-- Callee normal `TerminatorKind.Return` executed via vendored `Miri.Interpreter.Step.step` from
+a `translateBody`-lowered `lmCfMirBody` non-cleanup block (`bb0`): pops callee, runs `copyReturn`,
+runs `cleanupFrame` (`exitCall`: stack-local deallocation + `FnEntry` protector release), and
+jumps caller to `bb1` (`.atBlock 1`). -/
+def lmCfReturn (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  lmCfRun exitCall true
+    #[lmCfFrame (.mir ⟨0, 0⟩) (.stop false), lmCfFrame (.mir ⟨0, 0⟩) (.goto (some 1) .Continue)] st
+
+/-- `TerminatorKind.assert(cond == expected, target = bb1, unwind)` executed via vendored
+`Miri.Interpreter.Step.step` on a `translateBody`-lowered `lmAssertMirBody` frame. -/
+def lmCfAssert (exitCall : LmState → Except LmExecFailure LmState) (cond expected : Bool)
+    (unwind : Miri.MIR.UnwindAction) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  lmCfRun exitCall cond
+    #[lmCfFrameOf (lmAssertMirBody expected (lmUnwindActionToMir unwind)) (.mir ⟨0, 0⟩) (.stop false)]
+    st
+
+/-- Callee `UnwindResume` executed via vendored `Miri.Interpreter.Step.step` from location
+`calleeLoc` (a `translateBody`-lowered cleanup block or an `.unwinding` location) whose call edge
+in the caller carries `unwind`. -/
+def lmCfUnwindResume (exitCall : LmState → Except LmExecFailure LmState)
+    (calleeLoc : Miri.Interpreter.FrameLocation) (unwind : Miri.MIR.UnwindAction) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  lmCfRun exitCall true
+    #[lmCfFrame (.mir ⟨0, 0⟩) (.stop false), lmCfFrame calleeLoc (.goto (some 1) unwind)] st
+
+/-- `TerminatorKind.unwindTerminate` executed via vendored `Miri.Interpreter.Step.step` from the
+cleanup block of a `translateBody`-lowered `lmUnwindTerminateMirBody` frame. -/
+def lmCfUnwindTerminate (exitCall : LmState → Except LmExecFailure LmState) (st : LmState) :
+    Except LmExecFailure (LmCfOutcome × LmState) :=
+  lmCfRun exitCall true
+    #[lmCfFrameOf lmUnwindTerminateMirBody (.mir ⟨2, 0⟩) (.stop false)] st
+
+/-- Fail-closed expectation on the vendored control-flow location (mismatch ⇒ `invalidProgram`
+⇒ `.invalidOrUnsupported`, never a silent pass). -/
+def lmCfExpect (o expected : LmCfOutcome) : Except LmExecFailure Unit :=
+  if o = expected then .ok ()
+  else .error (.controlFlow (.invalidProgram "harness control-flow location mismatch"))
+
+/-- Map any `LmExecFailure` into the frozen `LmCrossFramePanicObs` domain. -/
+def classifyLmFailure : LmExecFailure → LmCrossFramePanicObs
+  | .abort => .abort
+  | .controlFlow (.termination (.abort _)) => .abort
+  | .controlFlow (.invalidProgram _) => .invalidOrUnsupported
+  | .controlFlow (.unsupported _) => .invalidOrUnsupported
+  | _ => .ub
+
+def observeLm (r : Except LmExecFailure LmCrossFramePanicObs) : LmCrossFramePanicObs :=
+  match r with
+  | .ok o => o
+  | .error e => classifyLmFailure e
+
+/-! ## §2. The 28 Canonical Vendored `Miri` Scenarios (`0..27`) -/
+
+def lmCase (tb : Bool) : Nat → Except LmExecFailure LmCrossFramePanicObs
+  -- Case 0: cross-frame `&mut u32` call, `FnEntry` protector, writeback 42, vendored `.Return`, read 42.
+  | 0 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st ← lmStoreU32 st pr 42
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let (v, _) ← lmLoadU32 st px
+    .ok (.okVal 42 v)
+  -- Case 1: cross-frame `&u32` call, `FnEntry` shared protector, read 77, vendored `.Return`.
+  | 1 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 77
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Shared .FnEntry
+    let (r, st) ← lmLoadU32 st pr
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let (v, _) ← lmLoadU32 st px
+    .ok (.okVal r v)
+  -- Case 2: post-return caller parent write succeeds after `FnEntry` protector release via `.Return`.
+  | 2 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st ← lmStoreU32 st pr 25
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let st ← lmStoreU32 st px 99
+    let (v, _) ← lmLoadU32 st px
+    .ok (.okVal v v)
+  -- Case 3: `&mut [u32; 2] = [10, 20]`, callee `FnEntry`, cast + in-bounds offset(+4), write 88.
+  | 3 => do
+    let st := lmInit tb
+    let (pa, st) ← lmAllocStack st 8 align4
+    let pa1 ← lmPtrOffsetInbounds st pa 4
+    let st ← lmStoreU32 st pa 10
+    let st ← lmStoreU32 st pa1 20
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st pa .Mutable .FnEntry
+    let pr1 ← lmPtrOffsetInbounds st pr 4
+    let st ← lmStoreU32 st pr1 88
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let (e0, st) ← lmLoadU32 st pa
+    let (e1, _) ← lmLoadU32 st pa1
+    .ok (.okVal 88 (e0 * 1000 + e1))
+  -- Case 4: `&mut [u32; 2] = [11, 22]`, in-bounds offset(+4) write 33, offset(-4) write 44.
+  | 4 => do
+    let st := lmInit tb
+    let (pa, st) ← lmAllocStack st 8 align4
+    let pa1 ← lmPtrOffsetInbounds st pa 4
+    let st ← lmStoreU32 st pa 11
+    let st ← lmStoreU32 st pa1 22
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st pa .Mutable .FnEntry
+    let pr1 ← lmPtrOffsetInbounds st pr 4
+    let st ← lmStoreU32 st pr1 33
+    let pr0 ← lmPtrOffsetInbounds st pr1 (-4)
+    let st ← lmStoreU32 st pr0 44
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let (e0, st) ← lmLoadU32 st pa
+    let (e1, _) ← lmLoadU32 st pa1
+    .ok (.okVal 44 (e0 * 1000 + e1))
+  -- Case 5: `&mut [u32; 2] = [5, 6]`, wrapping offset(+4) write 55, wrapping offset(-4) write 66.
+  | 5 => do
+    let st := lmInit tb
+    let (pa, st) ← lmAllocStack st 8 align4
+    let pa1 ← lmPtrOffsetInbounds st pa 4
+    let st ← lmStoreU32 st pa 5
+    let st ← lmStoreU32 st pa1 6
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st pa .Mutable .FnEntry
+    let pr1 ← lmPtrOffsetWrapping pr 4
+    let st ← lmStoreU32 st pr1 55
+    let pr0 ← lmPtrOffsetWrapping pr1 (-4)
+    let st ← lmStoreU32 st pr0 66
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let (e0, st) ← lmLoadU32 st pa
+    let (e1, _) ← lmLoadU32 st pa1
+    .ok (.okVal 66 (e0 * 1000 + e1))
+  -- Case 6: wrapping offset(+400) OOB without deref, then wrapping(-400), write 34 -> valid.
+  | 6 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 12
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let q ← lmPtrOffsetWrapping pr 400
+    let p' ← lmPtrOffsetWrapping q (-400)
+    let st ← lmStoreU32 st p' 34
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let (v, _) ← lmLoadU32 st px
+    .ok (.okVal 34 v)
+  -- Case 7: 2-level nested reborrow call outer -> mid(p1) -> inner(p2) -> LIFO normal `.Return`.
+  | 7 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 1
+    let st := lmEnterCall st
+    let (pm, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st := lmEnterCall st
+    let (pi, st) ← lmRetagRef st pm .Mutable .FnEntry
+    let st ← lmStoreU32 st pi 7
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let st ← lmStoreU32 st pm 10
+    let (vm, st) ← lmLoadU32 st pm
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let st ← lmStoreU32 st px (vm + 10)
+    let (v, _) ← lmLoadU32 st px
+    .ok (.okVal v v)
+  -- Case 8 [MODE-SENSITIVE #1]: foreign write through parent `px` while callee's `FnEntry` strong
+  -- protector on `&mut x` is active (`tb=false => okVal 77 77`, `tb=true => ub`).
+  | 8 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (_pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st ← lmStoreU32 st px 77
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let (v, _) ← lmLoadU32 st px
+    .ok (.okVal 77 v)
+  -- Case 9 [MODE-SENSITIVE #2]: write through `Frozen` `&T` retag (`tb=false => okVal 99 99`,
+  -- `tb=true => ub`).
+  | 9 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Shared .FnEntry
+    let st ← lmStoreU32 st pr 99
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let (v, _) ← lmLoadU32 st px
+    .ok (.okVal 99 v)
+  -- Case 10: callee allocates local `y = 55`, returns `&raw const y`, callee exits via vendored
+  -- `.Return` (deallocating `y`), caller dereferences dangling pointer -> UAR `.ub` in BOTH modes.
+  | 10 => do
+    let st := lmInit tb
+    let st := lmEnterCall st
+    let (py, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st py 55
+    let (o, st) ← lmCfReturn lmExitCall st
+    lmCfExpect o (.atBlock 1)
+    let _ ← lmLoadU32 st py
+    -- Fail-closed: reaching here would mean the dangling deref did NOT fault.
+    .ok .invalidOrUnsupported
+  -- Case 11: in-bounds `ptrOffsetInbounds` past end (+12 on 8-byte array) -> `.ub` in BOTH modes.
+  | 11 => do
+    let st := lmInit tb
+    let (pa, st) ← lmAllocStack st 8 align4
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st pa .Mutable .FnEntry
+    let _ ← lmPtrOffsetInbounds st pr 12
+    -- Fail-closed: reaching here would mean OOB `ptrOffsetInbounds` (+12) did NOT fault.
+    .ok .invalidOrUnsupported
+  -- Case 12: in-bounds `ptrOffsetInbounds` before start (-4) -> `.ub` in BOTH modes.
+  | 12 => do
+    let st := lmInit tb
+    let (pa, st) ← lmAllocStack st 8 align4
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st pa .Mutable .FnEntry
+    let _ ← lmPtrOffsetInbounds st pr (-4)
+    -- Fail-closed: reaching here would mean OOB `ptrOffsetInbounds` (-4) did NOT fault.
+    .ok .invalidOrUnsupported
+  -- Case 13: wrapping offset(+400) OOB followed by deref -> `.ub` in BOTH modes.
+  | 13 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 12
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let q ← lmPtrOffsetWrapping pr 400
+    let _ ← lmLoadU32 st q
+    -- Fail-closed: reaching here would mean OOB deref after wrapping offset did NOT fault.
+    .ok .invalidOrUnsupported
+  -- Case 14: `TerminatorKind.assert(cond == true)` passes: the condition `1` is stored to and
+  -- loaded from vendored `Miri` memory, and vendored `ControlFlow.evalTerminator (.Assert ..)`
+  -- must jump to `target = bb1`.
+  | 14 => do
+    let st := lmInit tb
+    let (pc, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st pc 1
+    let (c, st) ← lmLoadU32 st pc
+    let (o, _) ← lmCfAssert lmExitCall (c == 1) true .Unreachable st
+    lmCfExpect o (.atBlock 1)
+    .ok (.okVal 101 101)
+  -- Case 15: `TerminatorKind.assert(cond == false)` passes (condition `0` loaded from memory).
+  | 15 => do
+    let st := lmInit tb
+    let (pc, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st pc 0
+    let (c, st) ← lmLoadU32 st pc
+    let (o, _) ← lmCfAssert lmExitCall (c == 1) false .Unreachable st
+    lmCfExpect o (.atBlock 1)
+    .ok (.okVal 102 102)
+  -- Case 16: `TerminatorKind.unreachable` via vendored `ControlFlow.evalTerminator`.
+  | 16 => do
+    -- Executed over the mode-`tb` harness state with the REAL frame-exit operation (previously a
+    -- fresh `lmInit false` state with an identity exit, silently ignoring `tb`).
+    lmUnreachableCheck lmExitCall (lmInit tb)
+    -- Fail-closed: reaching here would mean vendored `Unreachable` did NOT fault.
+    .ok .invalidOrUnsupported
+  -- Case 17: callee `FnEntry` + write 15, vendored `Unwind.pushPayload`, failing
+  -- `assert(.., unwind: .Cleanup bb2)` (vendored `assertPanic` -> `unwindToBlock`), cleanup
+  -- mutates `*r = 115`, callee `UnwindResume` (vendored `returnFromCurrentFrame` pops + tears down
+  -- the callee frame + follows caller's `.Cleanup bb2` catch pad), vendored `Unwind.popPayload` ->
+  -- outer harness observes `.unwound 115`.
+  | 17 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st ← lmStoreU32 st pr 15
+    let st ← lmStartUnwind st
+    let (o, st) ← lmCfAssert lmExitCall false true (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let st ← lmStoreU32 st pr 115
+    let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let st ← lmCatchUnwind st
+    let (v, _) ← lmLoadU32 st px
+    .ok (.unwound v)
+  -- Case 18: failing `assert(.., unwind: .Cleanup bb2)`, cleanup mutates `*r = 116`, vendored
+  -- `UnwindTerminate` -> `.abort`.
+  | 18 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st ← lmStartUnwind st
+    let (o, st) ← lmCfAssert lmExitCall false true (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let st ← lmStoreU32 st pr 116
+    let _ ← lmCfUnwindTerminate lmExitCall st
+    .ok .invalidOrUnsupported
+  -- Case 19: failing `assert(.., unwind: .Terminate)` -> vendored `unwindToBlock` -> `unwindTerminate`.
+  | 19 => do
+    let _ ← lmCfAssert lmExitCall false true (.Terminate .Abi) (lmInit tb)
+    .ok .invalidOrUnsupported
+  -- Case 20: failing `assert(.., unwind: .Unreachable)` -> vendored `unwindToBlock` UB.
+  | 20 => do
+    let _ ← lmCfAssert lmExitCall false true .Unreachable (lmInit tb)
+    .ok .invalidOrUnsupported
+  -- Case 21: callee `FnEntry` + partial writeback 55 + vendored `Unwind.pushPayload` + failing
+  -- `assert(.., unwind: .Continue)`; vendored `UnwindResume` pops the callee (releasing `pr` in
+  -- `cleanupFrame`) into the caller's `.Cleanup bb2`; caller cleanup reads 55, writes 65 through
+  -- `pc` (succeeds iff `pr` released), caller `UnwindResume` pops into the outer catch pad,
+  -- vendored `Unwind.popPayload` -> `.okCleanupRecovered 65 65`.
+  | 21 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pc, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st pc .Mutable .FnEntry
+    let st ← lmStoreU32 st pr 55
+    let st ← lmStartUnwind st
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let (vPartial, st) ← lmLoadU32 st pc
+    let st ← lmStoreU32 st pc (vPartial + 10)
+    let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let st ← lmCatchUnwind st
+    let (vFinal, _) ← lmLoadU32 st px
+    .ok (.okCleanupRecovered vFinal vFinal)
+  -- Case 22: same partial writeback + callee protector release, caller cleanup writes 66, then
+  -- vendored `UnwindTerminate` -> `.abort`.
+  | 22 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pc, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st pc .Mutable .FnEntry
+    let st ← lmStoreU32 st pr 55
+    let st ← lmStartUnwind st
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let st ← lmStoreU32 st pc 66
+    let _ ← lmCfUnwindTerminate lmExitCall st
+    .ok .invalidOrUnsupported
+  -- Case 23: 3-frame LIFO unwind `outer(po) -> mid(pm) -> leaf(pl)`: leaf asserts with `.Continue`;
+  -- vendored `UnwindResume` pops leaf (releasing `pl`) into mid's `.Continue` edge (mid becomes
+  -- `.unwinding`), pops mid (releasing `pm`) into outer's `.Cleanup bb2`; outer cleanup reads
+  -- preserved 3 and writes 300 through `po` (succeeds iff BOTH `pl` and `pm` released), outer
+  -- `UnwindResume` pops into the root catch pad, vendored `Unwind.popPayload` ->
+  -- `.okCleanupRecovered 300 300`.
+  | 23 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 1
+    let st := lmEnterCall st
+    let (po, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st := lmEnterCall st
+    let (pm, st) ← lmRetagRef st po .Mutable .FnEntry
+    let st ← lmStoreU32 st pm 2
+    let st := lmEnterCall st
+    let (pl, st) ← lmRetagRef st pm .Mutable .FnEntry
+    let st ← lmStoreU32 st pl 3
+    let st ← lmStartUnwind st
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) .Continue st
+    lmCfExpect o .unwinding
+    let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let (v3, st) ← lmLoadU32 st po
+    let st ← lmStoreU32 st po (v3 * 100)
+    let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+    lmCfExpect o (.atBlock 2)
+    let st ← lmCatchUnwind st
+    let (vFinal, _) ← lmLoadU32 st px
+    .ok (.okCleanupRecovered vFinal vFinal)
+  -- Case 24: callee `FnEntry` + write 44 + `.Continue` panic; vendored `UnwindResume` pops the
+  -- callee into the caller call edge `unwind: .Terminate` -> `unwindTerminate` -> `.abort`.
+  | 24 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st ← lmStoreU32 st pr 44
+    let st ← lmStartUnwind st
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let _ ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Terminate .Abi) st
+    .ok .invalidOrUnsupported
+  -- Case 25: same, caller call edge `unwind: .Unreachable` -> vendored `unwindToBlock` UB.
+  | 25 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 10
+    let st := lmEnterCall st
+    let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+    let st ← lmStoreU32 st pr 44
+    let st ← lmStartUnwind st
+    let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+    lmCfExpect o .unwinding
+    let _ ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) .Unreachable st
+    .ok .invalidOrUnsupported
+  -- Case 26 & 27: bare root frame writes `77` and unwinds via vendored
+  -- `ControlFlow.returnFromCurrentFrame` on the `translateBody`-lowered cleanup frame -> `.ub`.
+  | 26 | 27 => do
+    let st := lmInit tb
+    let (px, st) ← lmAllocStack st 4 align4
+    let st ← lmStoreU32 st px 77
+    let st ← lmStartUnwind st
+    -- The root frame unwinds over the SAME harness state that holds `x = 77` and the pushed
+    -- payload (previously discarded in favour of a fresh `lmInit false` state, ignoring `tb`).
+    lmRootUnwindCheck lmExitCall st
+    -- Fail-closed: reaching here would mean the root-frame unwind did NOT fault.
+    .ok .invalidOrUnsupported
+  | _ => .ok .invalidOrUnsupported
+
+/-- Frozen vendored `Miri` observer (`tb = false` vs `tb = true`), fail-closed
+`.invalidOrUnsupported` for all `idx ≥ 28`. -/
+def lmCrossFramePanicObserve (tb : Bool) (idx : Nat) : LmCrossFramePanicObs :=
+  observeLm (lmCase tb idx)
+
+-- Derive kernel-evaluable twins of the harness helpers and prove exact equality `@F = @F_U`!
+unroll_loops lmAllocStackU := lmAllocStack fuel 0 with allocatePtrU
+unroll_loops lmBeforeDeallocationU := lmBeforeDeallocation fuel 0
+  with beforeMemoryDeallocationU, deallocateBorrowRangeU
+unroll_loops lmDeallocHooksU := lmDeallocHooks fuel 0 with lmBeforeDeallocationU
+unroll_loops lmDeallocStackOneU := lmDeallocStackOne fuel 0 with deallocatePtrWithU, lmDeallocHooksU
+unroll_loops lmAccessTargetU := lmAccessTarget fuel 0 with getAllocInfoU
+unroll_loops lmTreeAccessU := lmTreeAccess fuel 0
+  with beforeMemoryWriteU, beforeMemoryReadU, performBorrowAccessRangeU
+unroll_loops lmStoreU32U := lmStoreU32 fuel 0 with lmAccessTargetU, lmTreeAccessU
+unroll_loops lmLoadU32U := lmLoadU32 fuel 0 with lmAccessTargetU, lmTreeAccessU
+unroll_loops lmPtrOffsetInboundsU := lmPtrOffsetInbounds fuel 0 with getAllocInfoU
+unroll_loops lmRetagRefU := lmRetagRef fuel 0 with retagPointerValueU
+unroll_loops lmReleaseOneU := lmReleaseOne fuel 0 with releaseProtectorU
+unroll_loops lmExitCallU := lmExitCall fuel 0 with lmDeallocStackOneU, lmReleaseOneU
+unroll_loops lmCaseU := lmCase fuel 0 with lmAllocStackU, lmStoreU32U, lmLoadU32U,
+  lmPtrOffsetInboundsU, lmRetagRefU, lmExitCallU
+unroll_loops lmCrossFramePanicObserveU := lmCrossFramePanicObserve fuel 0 with lmCaseU
+
+/-- **Root-unwind body wrapped in an outer catch harness** (LeanMiri mirror of MiniRust
+`mrProgRootUnwindCaught`): the same panicking body as Cases `26`/`27` (write `77`, unwind out of
+a cleanup block), but executed one frame above the root with an `FnEntry`-protected `&mut x`;
+vendored `UnwindResume` pops it into the harness's `.Cleanup bb2` catch pad and vendored
+`Unwind.popPayload` catches -> `.unwound 77`. -/
+def lmRootUnwindCaught (tb : Bool) : Except LmExecFailure LmCrossFramePanicObs := do
+  let st := lmInit tb
+  let (px, st) ← lmAllocStack st 4 align4
+  let st ← lmStoreU32 st px 0
+  let st := lmEnterCall st
+  let (pr, st) ← lmRetagRef st px .Mutable .FnEntry
+  let st ← lmStoreU32 st pr 77
+  let st ← lmStartUnwind st
+  let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+  lmCfExpect o (.atBlock 2)
+  let st ← lmCatchUnwind st
+  let (v, _) ← lmLoadU32 st px
+  .ok (.unwound v)
+
+unroll_loops lmRootUnwindCaughtU := lmRootUnwindCaught fuel 0 with lmAllocStackU, lmStoreU32U,
+  lmLoadU32U, lmRetagRefU, lmExitCallU
+
+/-- **Exact LeanMiri root-frame unwind boundary vs. catch-harness characterization** (both
+`treeBorrows` modes): the bare root unwind (Cases `26`/`27`, vendored `returnFromCurrentFrame`
+on a 1-frame stack) is `.ub`, while the identical panicking body wrapped in an outer catch
+harness is `.unwound 77` — matching Trusted's `rootUnwindCeiling = true` Case `27` verdict and
+MiniRust's `mr_root_unwind_boundary_vs_catch_harness`. -/
+theorem lm_root_unwind_boundary_vs_catch_harness :
+    observeLm (lmCase false 27) = .ub ∧ observeLm (lmCase true 27) = .ub ∧
+    lmRootUnwindCaught false = .ok (.unwound 77) ∧
+    lmRootUnwindCaught true = .ok (.unwound 77) := by
+  rw [lmCaseU.eq_src, lmRootUnwindCaughtU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **Causal protector-release contrast for Case `21` (LeanMiri mirror of MiniRust
+`mrProg21PrematureWrite` and Trusted `mirCase21PrematureWrite`)**: identical to `lmCase 21`
+except the parent write `65` through the caller's tag `pc` happens INSIDE the callee frame,
+BEFORE vendored `UnwindResume` → `cleanupFrame` (`lmExitCall` → `BorrowTree.releaseProtector`)
+has released the callee's `FnEntry` protector on `pr`. -/
+def lmCase21PrematureWrite (tb : Bool) : Except LmExecFailure LmCrossFramePanicObs := do
+  let st := lmInit tb
+  let (px, st) ← lmAllocStack st 4 align4
+  let st ← lmStoreU32 st px 10
+  let st := lmEnterCall st
+  let (pc, st) ← lmRetagRef st px .Mutable .FnEntry
+  let st := lmEnterCall st
+  let (pr, st) ← lmRetagRef st pc .Mutable .FnEntry
+  let st ← lmStoreU32 st pr 55
+  let st ← lmStoreU32 st pc 65
+  let st ← lmStartUnwind st
+  let (o, st) ← lmCfAssert lmExitCall false true .Continue st
+  lmCfExpect o .unwinding
+  let (o, st) ← lmCfUnwindResume lmExitCall (.unwinding ⟨0⟩) (.Cleanup 2) st
+  lmCfExpect o (.atBlock 2)
+  let (v, st) ← lmLoadU32 st pc
+  let st ← lmStoreU32 st pc (v + 10)
+  let (o, st) ← lmCfUnwindResume lmExitCall (.mir ⟨2, 0⟩) (.Cleanup 2) st
+  lmCfExpect o (.atBlock 2)
+  let st ← lmCatchUnwind st
+  let (vFinal, _) ← lmLoadU32 st px
+  .ok (.okCleanupRecovered vFinal vFinal)
+
+unroll_loops lmCase21PrematureWriteU := lmCase21PrematureWrite fuel 0 with lmAllocStackU,
+  lmStoreU32U, lmLoadU32U, lmRetagRefU, lmExitCallU
+
+/-- **Causal unwind protector-release contrast on vendored `Miri` (tri-authority symmetric with
+MiniRust `mr_case21_premature_parent_write_ub_contrast` and Trusted
+`trusted_case21_premature_parent_write_ub_contrast`)**:
+- `treeBorrows = false`: the premature parent write is harmless → `.okCleanupRecovered 75 75`;
+- `treeBorrows = true`: the premature parent write while the callee's `FnEntry` protector is
+  still active faults with a vendored `BorrowTree` protected-access failure (`.treeAccess`), i.e.
+  `.ub`;
+- the SAME parent write performed AFTER vendored `UnwindResume` released the protector
+  (`lmCase true 21`) succeeds → `.okCleanupRecovered 65 65`. -/
+theorem lm_case21_premature_parent_write_ub_contrast :
+    lmCase21PrematureWrite false = .ok (.okCleanupRecovered 75 75) ∧
+    observeLm (lmCase21PrematureWrite true) = .ub ∧
+    lmCase21PrematureWrite true =
+      .error (.treeAccess (.AccessFailure ⟨0, 4⟩ (.TransitionError 2 (.ProtectedDisabled .Unique)))) ∧
+    lmCase true 21 = .ok (.okCleanupRecovered 65 65) := by
+  rw [lmCase21PrematureWriteU.eq_src, lmCaseU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- Frozen expected LeanMiri table for `treeBorrows = false`. -/
+def lmExpectedBasicList : List LmCrossFramePanicObs :=
+  [.okVal 42 42,
+   .okVal 77 77,
+   .okVal 99 99,
+   .okVal 88 10088,
+   .okVal 44 44033,
+   .okVal 66 66055,
+   .okVal 34 34,
+   .okVal 20 20,
+   .okVal 77 77,
+   .okVal 99 99,
+   .ub,
+   .ub,
+   .ub,
+   .ub,
+   .okVal 101 101,
+   .okVal 102 102,
+   .ub,
+   .unwound 115,
+   .abort,
+   .abort,
+   .ub,
+   .okCleanupRecovered 65 65,
+   .abort,
+   .okCleanupRecovered 300 300,
+   .abort,
+   .ub,
+   .ub,
+   .ub]
+
+/-- Frozen expected LeanMiri table for `treeBorrows = true`. -/
+def lmExpectedTbList : List LmCrossFramePanicObs :=
+  [.okVal 42 42,
+   .okVal 77 77,
+   .okVal 99 99,
+   .okVal 88 10088,
+   .okVal 44 44033,
+   .okVal 66 66055,
+   .okVal 34 34,
+   .okVal 20 20,
+   .ub,
+   .ub,
+   .ub,
+   .ub,
+   .ub,
+   .ub,
+   .okVal 101 101,
+   .okVal 102 102,
+   .ub,
+   .unwound 115,
+   .abort,
+   .abort,
+   .ub,
+   .okCleanupRecovered 65 65,
+   .abort,
+   .okCleanupRecovered 300 300,
+   .abort,
+   .ub,
+   .ub,
+   .ub]
+
+/-- **Kernel-checked 56-cell vendored `Miri` execution table (`28 scenarios × 2 modes`)**:
+rewrites through `lmCrossFramePanicObserveU.eq_src` (kernel-checked equality with the real
+vendored `Miri` definitions) and closes purely by kernel reduction (zero `native_decide`). -/
+theorem lmCrossFramePanicObserve_table :
+    (List.range lmCanonicalCaseCount).map (lmCrossFramePanicObserve false) = lmExpectedBasicList ∧
+    (List.range lmCanonicalCaseCount).map (lmCrossFramePanicObserve true) = lmExpectedTbList := by
+  rw [lmCrossFramePanicObserveU.eq_src]
+  constructor <;> kernel_rfl
+
+/-- Out-of-range scenarios are fail-closed `.invalidOrUnsupported` for both modes. -/
+theorem lmCrossFramePanicObserve_out_of_range (tb : Bool) (idx : Nat)
+    (h : lmCanonicalCaseCount ≤ idx) :
+    lmCrossFramePanicObserve tb idx = .invalidOrUnsupported := by
+  unfold lmCanonicalCaseCount at h
+  have hCase : lmCase tb idx = .ok .invalidOrUnsupported := by
+    unfold lmCase
+    split <;> first | rfl | omega
+  unfold lmCrossFramePanicObserve
+  rw [hCase]
+  rfl
+
+/-- Exact typed-failure diagnostics on vendored `Miri` (`tb = true`) confirming genuine root
+causes on Cases `8`, `9`, `10`, `11`, `12`, `13`, `16`, `26`, `27` (memory / Tree Borrows / pointer
+offset / control flow) and on the `assert` / `UnwindAction` / `unwindTerminate` Cases `18`, `19`,
+`20`, `22`, `24`, `25`, whose abort / UB verdicts are produced by vendored
+`Miri.Interpreter.Step.step` → `ControlFlow.{evalTerminator, unwindToBlock, returnFromCurrentFrame}`
+(not harness-hardcoded constants). -/
+theorem lm_tb_exact_failure_diagnostics :
+    lmCase true 8 = .error (.treeAccess (.AccessFailure ⟨0, 4⟩
+      (.TransitionError 1 (.ProtectedDisabled .Unique)))) ∧
+    lmCase true 9 = .error (.treeAccess (.AccessFailure ⟨0, 4⟩
+      (.TransitionError 1 (.ChildAccessForbidden .Frozen)))) ∧
+    lmCase true 10 = .error (.access (.allocationLookup (.deadAllocation ⟨1, by decide⟩))) ∧
+    lmCase true 11 = .error (.pointerOffset (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 12 .inboundsPointerArithmetic))) ∧
+    lmCase true 12 = .error (.pointerOffset (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 (-4) .inboundsPointerArithmetic))) ∧
+    lmCase true 13 = .error (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨4⟩ 400 4 .memoryAccess)) ∧
+    lmCase true 16 = .error (.controlFlow (.undefinedBehavior "Unreachable")) ∧
+    lmCase true 26 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    lmCase true 27 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    -- Control-flow root causes come from vendored `Step.step` -> `ControlFlow`:
+    lmCase true 18 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase true 19 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase true 20 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) ∧
+    lmCase true 22 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase true 24 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase true 25 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
+  rw [lmCaseU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **Exact typed-failure diagnostics in `treeBorrows = false` mode**: every mode-INSENSITIVE UB /
+abort cell of the basic-memory table fails for the SAME genuine vendored root cause as in Tree
+Borrows mode (dead allocation, in-bounds pointer-offset OOB, OOB access, `Unreachable`, root-frame
+unwind, `unwindTerminate`, `.Unreachable` unwind edge) — so the 56-cell agreement on these cells is
+not a coincidental `.ub` / `.abort` collapse of DIFFERENT basic-mode failures. Cases `16` and
+`26`/`27` now run over the mode-`tb` harness state (the root unwind over the SAME state that
+holds `x = 77` and the pushed payload). -/
+theorem lm_basic_exact_failure_diagnostics :
+    lmCase false 10 = .error (.access (.allocationLookup (.deadAllocation ⟨1, by decide⟩))) ∧
+    lmCase false 11 = .error (.pointerOffset (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 12 .inboundsPointerArithmetic))) ∧
+    lmCase false 12 = .error (.pointerOffset (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨8⟩ 0 (-4) .inboundsPointerArithmetic))) ∧
+    lmCase false 13 = .error (.access
+      (.pointerOutOfBounds ⟨1, by decide⟩ ⟨4⟩ 400 4 .memoryAccess)) ∧
+    lmCase false 16 = .error (.controlFlow (.undefinedBehavior "Unreachable")) ∧
+    lmCase false 26 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    lmCase false 27 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    lmCase false 18 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase false 19 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase false 20 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) ∧
+    lmCase false 22 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase false 24 = .error (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCase false 25 = .error (.controlFlow
+      (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
+  rw [lmCaseU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- Exact LeanMiri Tree Borrows mode-sensitivity `↔` theorem: Cases `8` and `9` flip between
+`treeBorrows = false` and `treeBorrows = true`, and every other canonical case agrees. -/
+def lmCaseModeSensitive : Nat → Bool
+  | 8 | 9 => true
+  | _ => false
+
+theorem lmCrossFramePanicObserve_mode_sensitivity :
+    lmCrossFramePanicObserve false 8 = .okVal 77 77 ∧
+    lmCrossFramePanicObserve true 8 = .ub ∧
+    lmCrossFramePanicObserve false 9 = .okVal 99 99 ∧
+    lmCrossFramePanicObserve true 9 = .ub ∧
+    (∀ idx, idx < lmCanonicalCaseCount →
+      (lmCrossFramePanicObserve false idx ≠ lmCrossFramePanicObserve true idx ↔
+        lmCaseModeSensitive idx = true)) := by
+  have hB := lmCrossFramePanicObserve_table.1
+  have hT := lmCrossFramePanicObserve_table.2
+  have hAll : ((List.range lmCanonicalCaseCount).all fun idx =>
+      decide ((lmExpectedBasicList[idx]? ≠ lmExpectedTbList[idx]?) ↔
+        lmCaseModeSensitive idx = true)) = true := by decide
+  have cellB : ∀ idx, idx < lmCanonicalCaseCount →
+      some (lmCrossFramePanicObserve false idx) = lmExpectedBasicList[idx]? := by
+    intro idx hi
+    have h' := congrArg (fun l => l[idx]?) hB
+    simpa [List.getElem?_map, List.getElem?_range hi] using h'
+  have cellT : ∀ idx, idx < lmCanonicalCaseCount →
+      some (lmCrossFramePanicObserve true idx) = lmExpectedTbList[idx]? := by
+    intro idx hi
+    have h' := congrArg (fun l => l[idx]?) hT
+    simpa [List.getElem?_map, List.getElem?_range hi] using h'
+  refine ⟨Option.some.inj (cellB 8 (by decide)), Option.some.inj (cellT 8 (by decide)),
+    Option.some.inj (cellB 9 (by decide)), Option.some.inj (cellT 9 (by decide)), ?_⟩
+  intro idx hi
+  have hIff := of_decide_eq_true (List.all_eq_true.mp hAll idx (List.mem_range.mpr hi))
+  rw [← cellB idx hi, ← cellT idx hi] at hIff
+  simpa [Option.some.injEq] using hIff
+
+/-! ## §3. Universal Vendored `Miri` Laws (Pointer Offset, Tree Borrows Protectors, & Unwind) -/
+
+section MiriUniversalLaws
+
+private theorem truncateToTargetUsize_lmPtrArith (x : UInt64) :
+    lmPtrArith.truncateToTargetUsize x = .ok x := by
+  have hMod : x.toNat < 2 ^ 64 := x.toBitVec.isLt
+  have hBit : (BitVec.zeroExtend 128 (BitVec.extractLsb 63 0 (BitVec.ofNat 128 x.toNat))).toNat = x.toNat := by
+    have h128 : x.toNat < 2 ^ 128 := Nat.lt_trans hMod (by decide)
+    simp only [BitVec.zeroExtend, BitVec.extractLsb, BitVec.extractLsb', BitVec.toNat_setWidth,
+      BitVec.toNat_ofNat, Nat.shiftRight_zero, Nat.mod_eq_of_lt h128, Nat.mod_eq_of_lt hMod]
+  have hOf : UInt64.ofNat x.toNat = x := by
+    cases x; simp [UInt64.ofNat, UInt64.toNat]
+  change (if (BitVec.zeroExtend 128 (BitVec.extractLsb 63 0 (BitVec.ofNat 128 x.toNat))).toNat < 2 ^ 64 then
+      Except.ok (UInt64.ofNat (BitVec.zeroExtend 128 (BitVec.extractLsb 63 0 (BitVec.ofNat 128 x.toNat))).toNat)
+    else Except.error PointerError.unsignedConversionOverflow) = Except.ok x
+  rw [hBit]
+  simp only [hMod, ↓reduceIte, hOf]
+
+/-- **Universal wrapping pointer offset round-trip** on vendored
+`Miri.Memory.Pointer.wrappingSignedOffset`: for EVERY provenance `Prov`, EVERY pointer `ptr`,
+and EVERY signed 64-bit byte offset `delta : Int64`, offsetting by `delta` and then `-delta`
+recovers the EXACT original pointer (both address and provenance). -/
+theorem lm_ptr_wrappingSignedOffset_roundtrip {Prov : Type} (ptr : Pointer Prov) (delta : Int64) :
+    (ptr.wrappingSignedOffset delta lmPtrArith >>=
+      fun p1 => p1.wrappingSignedOffset (-delta) lmPtrArith) = .ok ptr := by
+  cases ptr with
+  | mk off prov =>
+    cases off with
+    | mk bytes =>
+      unfold Miri.Memory.Pointer.wrappingSignedOffset Miri.Memory.Pointer.wrappingOffset
+        Miri.ABI.Size.ofBytes
+      dsimp only [bind, Except.bind, pure, Except.pure]
+      rw [truncateToTargetUsize_lmPtrArith]
+      dsimp only
+      rw [truncateToTargetUsize_lmPtrArith]
+      dsimp only
+      congr 2
+      have hNeg : (-delta).toUInt64 = -delta.toUInt64 := by
+        cases delta; rfl
+      rw [hNeg, UInt64.add_assoc, UInt64.add_right_neg, UInt64.add_zero]
+
+/-- **Universal `Miri.Interpreter.ControlFlow.evalTerminator` `.Unreachable` UB law**:
+holds for EVERY `TerminatorHooks`, `choice`, `SourceInfo`, and `StepState`. -/
+theorem lm_controlFlow_unreachable_ub {P L E M C Op Imm : Type}
+    (hooks : Miri.Interpreter.TerminatorHooks P L E M C Op Imm) (choice : C)
+    (si : Miri.MIR.SourceInfo) (st : Miri.Interpreter.StepState P L E M) :
+    Miri.Interpreter.ControlFlow.evalTerminator hooks choice { sourceInfo := si, kind := .Unreachable } st =
+      (st, .error (.undefinedBehavior "Unreachable")) := rfl
+
+/-- **Universal `Miri.Interpreter.ControlFlow.unwindToBlock` `.Cleanup` & `.Unreachable` laws**:
+for EVERY `ControlHooks`, `choice`, and `StepState`:
+- `.Cleanup blk` jumps directly to `(blk, 0)` on a non-empty stack;
+- `.Unreachable` immediately faults with `"unwinding past a frame that does not allow unwinding"`. -/
+theorem lm_controlFlow_unwindToBlock_laws {P L E M C Op : Type}
+    (hooks : Miri.Interpreter.ControlHooks P L E M C Op) (choice : C)
+    (st : Miri.Interpreter.StepState P L E M) (blk : Miri.MIR.BasicBlockId) :
+    Miri.Interpreter.ControlFlow.unwindToBlock hooks choice (.Cleanup blk) st =
+      Miri.Interpreter.ControlFlow.goToBlock blk st ∧
+    Miri.Interpreter.ControlFlow.unwindToBlock hooks choice .Unreachable st =
+      (st, .error (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) :=
+  ⟨rfl, rfl⟩
+
+/-- **Universal root-frame unwind UB law** on vendored
+`Miri.Interpreter.ControlFlow.returnFromCurrentFrame`: whenever the stack has a single frame
+(`frames = #[fr]`) at a cleanup block (`bb.cleanup = true`), unwinding out of the root frame
+immediately faults with `"unwinding past the topmost stack frame"`. -/
+theorem lm_controlFlow_root_unwind_ub {P L E M C Op : Type}
+    (hooks : Miri.Interpreter.ControlHooks P L E M C Op) (choice : C)
+    (fr : Miri.Interpreter.Frame P L E) (mach : M)
+    (blkIdx stmtIdx : Nat) (bb : Miri.MIR.BasicBlock)
+    (hLoc : fr.location = .mir ⟨blkIdx, stmtIdx⟩)
+    (hBb : fr.body.basicBlocks[blkIdx]? = some bb) (hClean : bb.cleanup = true) :
+    Miri.Interpreter.ControlFlow.returnFromCurrentFrame hooks choice true
+        { stack := ⟨#[fr]⟩, machine := mach } =
+      ({ stack := ⟨#[fr]⟩, machine := mach },
+        .error (.undefinedBehavior "unwinding past the topmost stack frame")) := by
+  unfold Miri.Interpreter.ControlFlow.returnFromCurrentFrame
+  have h0 : (#[fr] : Array (Miri.Interpreter.Frame P L E))[0]? = some fr := rfl
+  simp only [Miri.Interpreter.Stack.currentFrame?, Array.back?, Array.size_singleton,
+    Nat.sub_self, h0, hLoc, hBb, hClean, Id.run, ↓reduceIte, beq_self_eq_true, Bool.and_self]
+  rfl
+
+/-- **Universal 4-way `TerminatorKind.assert` law on vendored `Miri.Interpreter.Step.step`** (driver
+`lmCfAssert` on `translateBody`-lowered `lmAssertMirBody`), for EVERY frame-exit operation, EVERY
+harness state `st` without a pending failure, and EVERY condition bit `b`:
+- `assert(b == b)` jumps to `target = bb1` for every unwind action, leaving `st` untouched;
+- `assert(b == !b, .Cleanup bb)` lands on the cleanup pad `bb`;
+- `assert(b == !b, .Continue)` leaves the frame `.unwinding` (propagating to the caller);
+- `assert(b == !b, .Terminate r)` aborts via `unwindTerminate`;
+- `assert(b == !b, .Unreachable)` faults with vendored `unwindToBlock`'s UB. -/
+theorem lm_cf_assert_four_way (exitCall : LmState → Except LmExecFailure LmState) (st : LmState)
+    (hP : st.ctx.pending = none) (b : Bool) (u : Miri.MIR.UnwindAction) (bb : Nat)
+    (r : Miri.MIR.UnwindTerminateReason) :
+    lmCfAssert exitCall b b u st = .ok (.atBlock 1, st) ∧
+    lmCfAssert exitCall b (!b) (.Cleanup bb) st = .ok (.atBlock bb, st) ∧
+    lmCfAssert exitCall b (!b) .Continue st = .ok (.unwinding, st) ∧
+    lmCfAssert exitCall b (!b) (.Terminate r) st =
+      .error (.controlFlow (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    lmCfAssert exitCall b (!b) .Unreachable st =
+      .error (.controlFlow
+        (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · cases b <;> cases u <;> rfl
+  · cases b <;> rfl
+  · cases b <;> rfl
+  · cases b <;> cases r <;>
+    · show Except.error (st.ctx.pending.getD (.controlFlow
+          (.termination (.abort "panic in a function that cannot unwind")))) = _
+      rw [hP]; rfl
+  · cases b
+    · show Except.error (st.ctx.pending.getD (.controlFlow
+          (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) = _
+      rw [hP]; rfl
+    · show Except.error (st.ctx.pending.getD (.controlFlow
+          (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) = _
+      rw [hP]; rfl
+
+/-- **Universal `lmCfReturn`, `lmCfUnwindResume`, and `lmCfUnwindTerminate` control-flow &
+teardown laws on vendored `Miri.Interpreter.Step.step`** (executing `translateBody`-lowered
+`lmCfMirBody` / `lmUnwindTerminateMirBody` frames through `ControlFlow.evalTerminator` &
+`ControlFlow.returnFromCurrentFrame`):
+1. Normal `.Return` executes `exitCall` inside `cleanupFrame` and jumps the caller to `bb1`.
+2. Callee `.UnwindResume` executes `exitCall` inside `cleanupFrame` and dispatches all 4 caller
+   `UnwindAction` regimes (`.Cleanup bb`, `.Continue`, `.Terminate r`, `.Unreachable`).
+3. Fail-closed teardown propagation: any error `e` from `exitCall` (such as stack-local deallocation
+   or Tree Borrows protector-release UB) surfaces verbatim through `lmCfReturn` and
+   `lmCfUnwindResume`.
+4. `lmCfUnwindTerminate` aborts via vendored `unwindTerminate`. -/
+theorem lm_cf_return_and_unwind_pop_laws (exitCall : LmState → Except LmExecFailure LmState)
+    (st : LmState) (bb : Nat) (r : Miri.MIR.UnwindTerminateReason) :
+    (∀ st', exitCall st = .ok st' → st'.ctx.pending = none →
+      lmCfReturn exitCall st = .ok (.atBlock 1, st') ∧
+      lmCfUnwindResume exitCall (.mir ⟨2, 0⟩) (.Cleanup bb) st = .ok (.atBlock bb, st') ∧
+      lmCfUnwindResume exitCall (.unwinding ⟨0⟩) (.Cleanup bb) st = .ok (.atBlock bb, st') ∧
+      lmCfUnwindResume exitCall (.unwinding ⟨0⟩) .Continue st = .ok (.unwinding, st') ∧
+      lmCfUnwindResume exitCall (.unwinding ⟨0⟩) (.Terminate r) st =
+        .error (.controlFlow (.termination (.abort "panic in a function that cannot unwind"))) ∧
+      lmCfUnwindResume exitCall (.unwinding ⟨0⟩) .Unreachable st =
+        .error (.controlFlow
+          (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) ∧
+    (∀ e, exitCall st = .error e →
+      lmCfReturn exitCall st = .error e ∧
+      lmCfUnwindResume exitCall (.mir ⟨2, 0⟩) (.Cleanup bb) st = .error e ∧
+      lmCfUnwindResume exitCall (.unwinding ⟨0⟩) .Continue st = .error e) ∧
+    (st.ctx.pending = none →
+      lmCfUnwindTerminate exitCall st =
+        .error (.controlFlow (.termination (.abort "panic in a function that cannot unwind")))) := by
+  have hBack2 : ∀ (f0 f1 : Miri.Interpreter.Frame Provenance Unit Unit),
+      (#[f0, f1] : Array _).back? = some f1 := fun _ _ => rfl
+  have hPop2 : ∀ (f0 f1 : Miri.Interpreter.Frame Provenance Unit Unit),
+      (#[f0, f1] : Array _).pop = #[f0] := fun _ _ => rfl
+  have hSize2 : ∀ (f0 f1 : Miri.Interpreter.Frame Provenance Unit Unit),
+      (#[f0, f1] : Array _).size = 2 := fun _ _ => rfl
+  have hBb0 : (LeanMiriSpec.Correspondence.translateBody lmCfMirBody).basicBlocks[0]? =
+      some { statements := #[]
+             terminator := ⟨LeanMiriSpec.Correspondence.defaultSourceInfo, .Return⟩
+             cleanup := false } := rfl
+  have hBb2 : (LeanMiriSpec.Correspondence.translateBody lmCfMirBody).basicBlocks[2]? =
+      some { statements := #[]
+             terminator := ⟨LeanMiriSpec.Correspondence.defaultSourceInfo, .UnwindResume⟩
+             cleanup := true } := rfl
+  have hStmt0 : (#[] : Array Miri.MIR.Statement)[0]? = none := rfl
+  refine ⟨?_, ?_, ?_⟩
+  · intro st' hOk hP
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+    · dsimp only [lmCfReturn, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2, hBb0, hStmt0]
+      rw [hOk]
+      rfl
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2, hBb2, hStmt0]
+      rw [hOk]
+      rfl
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
+      rw [hOk]
+      rfl
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
+      rw [hOk]
+      rfl
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
+      rw [hOk]
+      change Except.error (st'.ctx.pending.getD (.controlFlow
+        (.termination (.abort "panic in a function that cannot unwind")))) = _
+      rw [hP]; rfl
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
+      rw [hOk]
+      change Except.error (st'.ctx.pending.getD (.controlFlow
+        (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) = _
+      rw [hP]; rfl
+  · intro e hErr
+    refine ⟨?_, ?_, ?_⟩
+    · dsimp only [lmCfReturn, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2, hBb0, hStmt0]
+      rw [hErr]
+      rfl
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2, hBb2, hStmt0]
+      rw [hErr]
+      rfl
+    · dsimp only [lmCfUnwindResume, lmCfRun, lmCfStepHooks, lmCfTermHooks, lmCfControlHooks,
+        Miri.Interpreter.Step.step, Miri.Interpreter.ControlFlow.evalTerminator,
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame,
+        Miri.Interpreter.Stack.currentFrame?, lmCfFrame, lmCfFrameOf, Id.run]
+      simp only [hBack2, hSize2, hPop2]
+      rw [hErr]
+      rfl
+  · intro hP
+    show Except.error (st.ctx.pending.getD (.controlFlow
+      (.termination (.abort "panic in a function that cannot unwind")))) = _
+    rw [hP]; rfl
+
+/-- **Universal `Miri.Interpreter.Unwind.{pushPayload, popPayload, afterStackPop}` LIFO &
+catch-unwind laws** directly on vendored `Miri.Interpreter.Unwind` (with canonical `userHooks`
+over arbitrary user extension `Extra`):
+1. `popPayload` on an empty thread payload vector faults with
+   `.invalidProgram "unwind payload vector is empty"` universally over all hooks and states.
+2. Pushing `p1` then `p2` via `pushPayload` and popping twice via `popPayload` returns `(p2, p1)`
+   in strict LIFO order, restoring the empty payload vector so a third pop faults with
+   `"unwind payload vector is empty"`.
+3. `afterStackPop` returns `.normal` whenever `unwinding = false` OR `extra.catchUnwind = none`;
+   when `unwinding = true` and `extra.catchUnwind = some caught` after a `pushPayload h p1`,
+   `afterStackPop` writes `Scalar.fromBool true`, pops `p1` via `popPayload`, invokes
+   `callFunction`, and returns `.noJump`. -/
+theorem lm_unwind_payload_lifo_and_afterStackPop_laws {K Extra C Other : Type}
+    (base : Miri.Interpreter.Unwind.Hooks K (Miri.Interpreter.Unwind.User Extra) C Other)
+    (choice : C) (fixed : Bool)
+    (stack : Miri.Interpreter.Stack Provenance LocalLayout Miri.Interpreter.MachineHooks.FrameExtra)
+    (mem : MemoryState Provenance BorrowTree K)
+    (bt : Option Miri.Interpreter.MachineHooks.BorrowState)
+    (dr : Option Miri.Concurrency.GlobalState)
+    (ra : Array (AllocId × Miri.Concurrency.VClockAlloc))
+    (as : Array (AllocId × Miri.MIR.SpanRef × Option Miri.MIR.SpanRef))
+    (uExtra : Extra)
+    (p1 p2 : Miri.Interpreter.RvalueImmTy Provenance) :
+    let h := Miri.Interpreter.Unwind.userHooks base
+    let st0 : Miri.Interpreter.MachineHooks.State K (Miri.Interpreter.Unwind.User Extra) :=
+      { stack := stack
+        machine :=
+          { memory := mem, borrowTracker := bt, dataRace := dr
+            threads := Miri.Concurrency.ThreadManager.initial fixed
+            raceAllocations := ra, allocationSpans := as
+            user := ⟨Miri.Interpreter.Unwind.PayloadStore.empty, uExtra⟩ } }
+    ((Miri.Interpreter.Unwind.popPayload h).run st0 =
+      .error (.invalidProgram "unwind payload vector is empty") st0) ∧
+    (∃ st2,
+      (do
+        Miri.Interpreter.Unwind.pushPayload h p1
+        Miri.Interpreter.Unwind.pushPayload h p2
+        let first ← Miri.Interpreter.Unwind.popPayload h
+        let second ← Miri.Interpreter.Unwind.popPayload h
+        pure (first, second)).run st0 = .ok (p2, p1) st2 ∧
+      (Miri.Interpreter.Unwind.popPayload h).run st2 =
+        .error (.invalidProgram "unwind payload vector is empty") st2) ∧
+    (∀ frExtra,
+      (Miri.Interpreter.Unwind.afterStackPop h choice frExtra false).run st0 = .ok .normal st0) ∧
+    (∀ frExtra, frExtra.catchUnwind = none →
+      (Miri.Interpreter.Unwind.afterStackPop h choice frExtra true).run st0 = .ok .normal st0) ∧
+    (∀ (caught : Miri.Interpreter.MachineHooks.CatchUnwindData)
+       (frExtra : Miri.Interpreter.MachineHooks.FrameExtra)
+       (fnInst : Miri.Interpreter.CallInstance),
+      frExtra.catchUnwind = some caught →
+      base.writeScalar = (fun _ _ _ => pure ()) →
+      base.getPtrFn = (fun _ _ => pure (.Instance fnInst)) →
+      base.callFunction = (fun _ _ _ _ => pure ()) →
+      ∃ stAfter,
+        (do
+          Miri.Interpreter.Unwind.pushPayload h p1
+          Miri.Interpreter.Unwind.afterStackPop h choice frExtra true).run st0 =
+          .ok .noJump stAfter ∧
+        (Miri.Interpreter.Unwind.popPayload h).run stAfter =
+          .error (.invalidProgram "unwind payload vector is empty") stAfter) := by
+  intro h st0
+  refine ⟨rfl, ?_, (fun _ => rfl), ?_, ?_⟩
+  · refine ⟨{ st0 with machine := { st0.machine with user := ⟨⟨2, #[]⟩, uExtra⟩ } }, ?_, rfl⟩
+    kernel_rfl
+  · intro frExtra hNone
+    unfold Miri.Interpreter.Unwind.afterStackPop
+    rw [hNone]
+    rfl
+  · intro caught frExtra fnInst hSome hWrite hPtr hCall
+    cases base
+    dsimp only at hWrite hPtr hCall
+    subst hWrite hPtr hCall
+    refine ⟨{ st0 with machine := { st0.machine with user := ⟨⟨1, #[]⟩, uExtra⟩ } }, ?_, rfl⟩
+    unfold Miri.Interpreter.Unwind.afterStackPop
+    rw [hSome]
+    kernel_rfl
+
+/-- **Universal vendored `Miri.TreeBorrows.Tree.LocationState.performAccess` protector & `Frozen`
+laws** (exact LeanMiri dual of MiniRust's `tbm_perm_prot_foreign_write_ub_iff_prevents_dealloc`,
+`tbm_perm_unprotect_enables_foreign_write`, and `tbm_perm_frozen_local_write_ub_universal`):
+1. Under an active protector (`isProtected = true`) at any accessed location (`accessed = true`),
+   a foreign write in `LocationState.performAccess` faults with `.ProtectedDisabled p` IF AND ONLY
+   IF `p` is non-interior-mutable (`p ≠ .Cell ∧ p ≠ .ReservedIM`, i.e., `Unique`, `Frozen`,
+   `ReservedFrz _`, or `Disabled`).
+2. Once the protector is released (`isProtected = false`), a foreign write succeeds (`.Success`)
+   for EVERY `p : Permission`, EVERY `accessed : Bool`, and EVERY `sifa : IdempotentForeignAccess`!
+3. A local write through `.Frozen` unconditionally faults with `.ChildAccessForbidden .Frozen`
+   for EVERY `accessed : Bool`, `isProtected : Bool`, and `sifa : IdempotentForeignAccess`. -/
+theorem lm_locationState_protector_and_frozen_laws :
+    (∀ (p : Miri.TreeBorrows.Permission) (sifa : Miri.TreeBorrows.IdempotentForeignAccess),
+      (∃ st', Miri.TreeBorrows.Tree.LocationState.performAccess ⟨p, true, sifa⟩
+          .Write .ForeignAccess true = .Error st' (.ProtectedDisabled p)) ↔
+        (p ≠ .Cell ∧ p ≠ .ReservedIM)) ∧
+    (∀ (p : Miri.TreeBorrows.Permission) (accessed : Bool)
+       (sifa : Miri.TreeBorrows.IdempotentForeignAccess),
+      ∃ st' tr, Miri.TreeBorrows.Tree.LocationState.performAccess ⟨p, accessed, sifa⟩
+        .Write .ForeignAccess false = .Success st' tr) ∧
+    (∀ (accessed isProt : Bool) (sifa : Miri.TreeBorrows.IdempotentForeignAccess),
+      Miri.TreeBorrows.Tree.LocationState.performAccess ⟨.Frozen, accessed, sifa⟩
+        .Write .LocalAccess isProt =
+        .Error ⟨.Frozen, accessed, sifa⟩ (.ChildAccessForbidden .Frozen)) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro p sifa
+    cases p with
+    | Cell =>
+      exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => absurd rfl h.1)⟩
+    | ReservedIM =>
+      exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => absurd rfl h.2)⟩
+    | Disabled =>
+      exact ⟨(fun _ => ⟨(fun h => by cases h), (fun h => by cases h)⟩), (fun _ => ⟨_, rfl⟩)⟩
+    | Unique =>
+      exact ⟨(fun _ => ⟨(fun h => by cases h), (fun h => by cases h)⟩), (fun _ => ⟨_, rfl⟩)⟩
+    | Frozen =>
+      exact ⟨(fun _ => ⟨(fun h => by cases h), (fun h => by cases h)⟩), (fun _ => ⟨_, rfl⟩)⟩
+    | ReservedFrz c =>
+      cases c <;>
+        exact ⟨(fun _ => ⟨(fun h => by cases h), (fun h => by cases h)⟩), (fun _ => ⟨_, rfl⟩)⟩
+  · intro p accessed sifa
+    cases accessed <;> cases p with
+    | Cell => exact ⟨_, _, rfl⟩
+    | ReservedIM => exact ⟨_, _, rfl⟩
+    | Disabled => exact ⟨_, _, rfl⟩
+    | Unique => exact ⟨_, _, rfl⟩
+    | Frozen => exact ⟨_, _, rfl⟩
+    | ReservedFrz c => cases c <;> exact ⟨_, _, rfl⟩
+  · intro accessed isProt sifa
+    cases accessed <;> cases isProt <;> rfl
+
+/-- **Universal `GlobalState.endCall` LIFO protector removal law**:
+1. Calling `endCall` on a frame `f` with `protectedTags = #[(id, tag)]` removes `tag` from
+   `global.protectedTags`;
+2. Any OTHER tag `outerTag ≠ tag` owned by an outer caller frame remains protected in
+   `global.protectedTags` until that outer frame itself exits (`LIFO` stack discipline!). -/
+theorem lm_globalState_endCall_lifo_preservation (gs : GlobalState)
+    (idOuter idInner : AllocId) (tagOuter tagInner : BorTag) (hNe : tagInner ≠ tagOuter) :
+    let gs1 := { gs with protectedTags :=
+      (gs.protectedTags.insert tagOuter .StrongProtector).insert tagInner .StrongProtector }
+    let innerFrame : FrameState := { protectedTags := #[(idInner, tagInner)] }
+    let outerFrame : FrameState := { protectedTags := #[(idOuter, tagOuter)] }
+    let afterInner := gs1.endCall innerFrame
+    let afterOuter := afterInner.endCall outerFrame
+    afterInner.protectedTags.contains tagInner = false ∧
+    afterInner.protectedTags.contains tagOuter = true ∧
+    afterOuter.protectedTags.contains tagOuter = false := by
+  dsimp only [GlobalState.endCall, ProtectedTags.contains, ProtectedTags.get,
+    ProtectedTags.insert, ProtectedTags.remove]
+  have hNe' : tagOuter ≠ tagInner := Ne.symm hNe
+  simp only [Array.foldl]
+  refine ⟨?_, ?_, ?_⟩
+  · simp [hNe']
+    intro a b h
+    rcases h with ⟨_, hne, _⟩ | ⟨rfl, _⟩
+    · exact hne
+    · exact hNe'
+  · simp [hNe']
+  · simp
+    intro _ _ _ h2 _
+    exact h2
+
+/-- Computable kernel-checkable witness verifying both single-frame protector release and
+nested 2-frame LIFO protector ordering directly on vendored `Miri.TreeBorrows.BorrowTree`. -/
+def lmMultiframeLifoCheck : Bool :=
+  let singleOk :=
+    let st0 := lmInit true
+    match lmAllocStack st0 4 align4 with
+    | .ok (px, st1) =>
+      match lmStoreU32 st1 px 10 with
+      | .ok st2 =>
+        let st3 := lmEnterCall st2
+        match lmRetagRef st3 px .Mutable .FnEntry with
+        | .ok (_pr, st4) =>
+          !(lmStoreU32 st4 px 77).isOk &&
+          (match lmExitCall st4 with
+           | .ok st5 => (lmStoreU32 st5 px 99).isOk
+           | .error _ => false)
+        | .error _ => false
+      | .error _ => false
+    | .error _ => false
+  let nestedOk :=
+    let st0 := lmInit true
+    match lmAllocStack st0 4 align4 with
+    | .ok (px, st1) =>
+      match lmStoreU32 st1 px 1 with
+      | .ok st2 =>
+        let st3 := lmEnterCall st2
+        match lmRetagRef st3 px .Mutable .FnEntry with
+        | .ok (pm, st4) =>
+          let st5 := lmEnterCall st4
+          match lmRetagRef st5 pm .Mutable .FnEntry with
+          | .ok (pl, st6) =>
+            match lmStoreU32 st6 pl 3 with
+            | .ok st7 =>
+              match lmExitCall st7 with
+              | .ok stAfterLeaf =>
+                !(lmStoreU32 stAfterLeaf px 88).isOk &&
+                (lmStoreU32 stAfterLeaf pm 20).isOk &&
+                (match lmExitCall stAfterLeaf with
+                 | .ok stAfterMid => (lmStoreU32 stAfterMid px 300).isOk
+                 | .error _ => false)
+              | .error _ => false
+            | .error _ => false
+          | .error _ => false
+        | .error _ => false
+      | .error _ => false
+    | .error _ => false
+  singleOk && nestedOk
+
+/-- **Universal `BorrowTree` `FnEntry` protector activation, foreign-write conflict,
+`releaseProtector`, and post-release parent write success**:
+1. Single frame: foreign write while protected fails, succeeds after `lmExitCall`.
+2. Nested 2-frame LIFO (`outer -> mid -> leaf`): popping `leaf` releases `leaf`'s protector while
+   keeping `mid`'s protector active (blocking grandparent write via `px` while allowing `mid` write
+   via `pm`), and popping `mid` then releases `mid`'s protector allowing grandparent write `300`. -/
+theorem lm_multiframe_lifo_protector_release_witness : lmMultiframeLifoCheck = true := by
+  unfold lmMultiframeLifoCheck
+  rw [lmAllocStackU.eq_src, lmStoreU32U.eq_src, lmRetagRefU.eq_src, lmExitCallU.eq_src]
+  kernel_rfl
+
+end MiriUniversalLaws
+
+/-! ## §4. Direct Two-Sided `stepMirFn` ↔ `Miri.Interpreter.Step.step` Simulation Bridge -/
+
+section StepSimulationBridge
+
+/-- **Unified Episode 1 `TerminatorKind.assert` `stepMirFn` ↔ `Miri.Interpreter.Step.step`
+simulation**: composes `step_terminator_assert_local_simulation` (dead/uninit UB + passing jump)
+with `step_terminator_assert_failed_directUnwind_simulation` (failing assert across ALL 4
+`MirAst.UnwindAction` variants: `.cleanup`, `.unreachable`, `.terminate`, `.continue_`) into a
+single two-sided theorem over unmodified `Trusted.MirSemantics.stepMirFn` and vendored
+`Miri.Interpreter.Step.step`. -/
+theorem lm_ep1_assert_complete_stepMirFn_miri_sim
+    {rootBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {s : Trusted.Rustc.V2026_06_01.MirSemantics.MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData}
+    {condIdx : Trusted.Rustc.V2026_06_01.MirAst.Local}
+    {condDecl : Trusted.Rustc.V2026_06_01.MirAst.LocalDecl}
+    {expected : Bool}
+    {target : Trusted.Rustc.V2026_06_01.MirAst.BasicBlockIdx}
+    {unwind : Trusted.Rustc.V2026_06_01.MirAst.UnwindAction}
+    (hbb : Trusted.Sequence.get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : Trusted.Sequence.get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = Trusted.Sequence.length bb.statements)
+    (hterm : bb.terminator.kind = .assert (.copy ⟨condIdx, .nil⟩) expected target unwind)
+    (hdecl : Trusted.Sequence.get? (activeMirBody rootBody s).localDecls condIdx = some condDecl)
+    (hbool_ty : condDecl.ty.kind = .bool)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf condIdx) :
+    ((Trusted.Sequence.get? s.frame.locals condIdx = some .dead ∨
+        Trusted.Sequence.get? s.frame.locals condIdx = some .uninit) →
+      StepRelMultiFrame rootBody m
+        (Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) ∧
+    (∀ sc, Trusted.Sequence.get? s.frame.locals condIdx = some (.init (.scalar sc)) →
+      decide (sc.bits ≠ 0) = expected →
+      StepRelMultiFrame rootBody m
+        (Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) ∧
+    (∀ sc, Trusted.Sequence.get? s.frame.locals condIdx = some (.init (.scalar sc)) →
+      decide (sc.bits ≠ 0) ≠ expected →
+      (∀ cleanupBb, unwind = .cleanup cleanupBb →
+        StepRelMultiFrame rootBody m
+          (Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn rootBody s)
+          (Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m)) ∧
+      (unwind = .unreachable →
+        StepRelMultiFrame rootBody m
+          (Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn rootBody s)
+          (Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m)) ∧
+      (unwind = .terminate →
+        Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn rootBody s =
+          Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode.retOutcome .abort ∧
+        (Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m).2 =
+          .error (.termination (.abort "panic in a function that cannot unwind"))) ∧
+      (unwind = .continue_ →
+        (∃ m₁,
+          Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m =
+            (m₁, .ok true) ∧
+          UnwindingStateRel rootBody s m₁) ∧
+        Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn rootBody s =
+          (match Trusted.Rustc.V2026_06_01.MirSemantics.unwindFromCallStack
+              s.memory.callStack s.memory with
+           | .running s' => .step s'
+           | .halted out => .retOutcome out
+           | .faulted f => .fail f))) := by
+  have hLoc := step_terminator_assert_local_simulation hstate hphase hbb hstmt_none hstmt_len
+    hterm hdecl hbool_ty himm
+  refine ⟨hLoc.1, hLoc.2.1, ?_⟩
+  intro sc hsc hne
+  have hFail := step_terminator_assert_failed_directUnwind_simulation hstate hphase hbb hstmt_none
+    hstmt_len hterm hdecl hbool_ty himm hsc hne
+  refine ⟨hFail.1, hFail.2.1, hFail.2.2.1, ?_⟩
+  intro hCont
+  have hDirect := hFail.2.2.2 hCont
+  exact ⟨hDirect.2, hDirect.1⟩
+
+/-- **Unified Episode 1 root-frame `TerminatorKind.unwindResume` `rootUnwindCeiling` dichotomy**
+directly on `Trusted.MirSemantics.stepMirFn` vs. vendored `Miri.Interpreter.Step.step`:
+for ANY root frame (`s.memory.callStack = .nil`) at a cleanup `unwindResume` terminator,
+vendored `Miri.Interpreter.Step.step` ALWAYS faults with
+`.error (.undefinedBehavior "unwinding past the topmost stack frame")`, while unmodified
+`stepMirFn` transitions to:
+- `.retOutcome .panic` when `s.memory.rootUnwindCeiling = true` (Case `27`, exact divergence);
+- `.fail .ub` when `s.memory.rootUnwindCeiling = false` (Case `26`, exact agreement). -/
+theorem lm_ep1_unwindResume_ceiling_dichotomy_sim
+    {rootBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {s : Trusted.Rustc.V2026_06_01.MirSemantics.MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = .nil)
+    (hphase : ∀ p, rootBody.phase ≠ .other p)
+    {bb : Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData}
+    (hbb : Trusted.Sequence.get? rootBody.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : Trusted.Sequence.get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = Trusted.Sequence.length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume)
+    (fnPtrs : List Trusted.Rustc.V2026_06_01.MirSemantics.FnPtrEntry := .nil) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn rootBody s =
+      (if s.memory.rootUnwindCeiling then .retOutcome .panic else .fail .ub) ∧
+    (Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+        fnPtrs)
+      () m).2 =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
+  cases hCeil : s.memory.rootUnwindCeiling with
+  | true =>
+    simpa only [↓reduceIte] using
+      step_terminator_unwindResume_root_panic_vs_ub_divergence hstate hstack hCeil hphase hbb
+        hstmt_none hstmt_len hcleanup hterm fnPtrs
+  | false =>
+    simpa only [Bool.false_eq_true, ↓reduceIte] using
+      step_terminator_unwindResume_root_cleared_ceiling_ub_agreement hstate hstack hCeil hphase hbb
+        hstmt_none hstmt_len hcleanup hterm fnPtrs
+
+/-- **Unified Two-Sided `stepMirFn` ↔ `Miri.Interpreter.Step.step` Lockstep Simulation Bundle**:
+packages the Episode 1 unified `assert` & root-ceiling `unwindResume` theorems alongside the exact
+step-level correspondence theorems between `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn` and
+vendored `Miri.Interpreter.Step.step` for `unreachable`, cross-frame `Call`/`Return`/multi-frame
+LIFO `UnwindResume`, safe references, `BinOp.offset`, `arith_offset`, and six-state Tree Borrows. -/
+theorem lm_stepMirFn_miri_lockstep_simulations :
+    (type_of% @lm_ep1_assert_complete_stepMirFn_miri_sim) ∧
+    (type_of% @lm_ep1_unwindResume_ceiling_dichotomy_sim) ∧
+    (type_of% @step_terminator_unreachable_ub_simulation) ∧
+    (type_of% @step_terminator_assert_local_simulation) ∧
+    (type_of% @step_terminator_assert_failed_directUnwind_simulation) ∧
+    (type_of% @step_terminator_call_simulation) ∧
+    (type_of% @step_terminator_return_callee_simulation) ∧
+    (type_of% @step_terminator_call_linked_panic_unwind_simulation) ∧
+    (type_of% @step_terminator_unwindResume_multiFrame_simulation) ∧
+    (type_of% @step_terminator_unwindResume_root_panic_vs_ub_divergence) ∧
+    (type_of% @step_terminator_unwindResume_root_cleared_ceiling_ub_agreement) ∧
+    (type_of% @evalRvalue_ref_simulation) ∧
+    (type_of% @evalRvalue_reborrow_safeRef_simulation) ∧
+    (type_of% @step_safeRef_deref_read_simulation) ∧
+    (type_of% @step_safeRef_deref_write_simulation) ∧
+    (type_of% @step_binOp_offset_simulation) ∧
+    (type_of% @call_intrinsic_arithOffset_stage1_simulation) ∧
+    (type_of% @performAccess_permission_simulation) ∧
+    (type_of% @borrowTree_releaseProtector_full_simulation) :=
+  ⟨@lm_ep1_assert_complete_stepMirFn_miri_sim,
+   @lm_ep1_unwindResume_ceiling_dichotomy_sim,
+   @step_terminator_unreachable_ub_simulation,
+   @step_terminator_assert_local_simulation,
+   @step_terminator_assert_failed_directUnwind_simulation,
+   @step_terminator_call_simulation,
+   @step_terminator_return_callee_simulation,
+   @step_terminator_call_linked_panic_unwind_simulation,
+   @step_terminator_unwindResume_multiFrame_simulation,
+   @step_terminator_unwindResume_root_panic_vs_ub_divergence,
+   @step_terminator_unwindResume_root_cleared_ceiling_ub_agreement,
+   @evalRvalue_ref_simulation,
+   @evalRvalue_reborrow_safeRef_simulation,
+   @step_safeRef_deref_read_simulation,
+   @step_safeRef_deref_write_simulation,
+   @step_binOp_offset_simulation,
+   @call_intrinsic_arithOffset_stage1_simulation,
+   @performAccess_permission_simulation,
+   @borrowTree_releaseProtector_full_simulation⟩
+
+end StepSimulationBridge
+
+/-! ## §5. Episode 1 LeanMiri Capstone & Silent Axiom / Import-Isolation / Bridge-Reality Audit -/
+
+/-- **Episode 1 LeanMiri Cross-Frame Reference & Panic-Unwind Capstone.** -/
+theorem ep1_lean_miri_cross_frame_panic_capstone :
+    (type_of% @lmCrossFramePanicObserve_table) ∧
+    (type_of% @lmCrossFramePanicObserve_out_of_range) ∧
+    (type_of% @lmCrossFramePanicObserve_mode_sensitivity) ∧
+    (type_of% @lm_tb_exact_failure_diagnostics) ∧
+    (type_of% @lm_basic_exact_failure_diagnostics) ∧
+    (type_of% @lm_ptr_wrappingSignedOffset_roundtrip) ∧
+    (type_of% @lm_controlFlow_unreachable_ub) ∧
+    (type_of% @lm_controlFlow_unwindToBlock_laws) ∧
+    (type_of% @lm_controlFlow_root_unwind_ub) ∧
+    (type_of% @lm_cf_assert_four_way) ∧
+    (type_of% @lm_root_unwind_boundary_vs_catch_harness) ∧
+    (type_of% @lm_case21_premature_parent_write_ub_contrast) ∧
+    (type_of% @lm_cf_return_and_unwind_pop_laws) ∧
+    (type_of% @lm_unwind_payload_lifo_and_afterStackPop_laws) ∧
+    (type_of% @lm_locationState_protector_and_frozen_laws) ∧
+    (type_of% @lm_globalState_endCall_lifo_preservation) ∧
+    (type_of% @lm_multiframe_lifo_protector_release_witness) ∧
+    (type_of% @lm_stepMirFn_miri_lockstep_simulations) :=
+  ⟨@lmCrossFramePanicObserve_table, @lmCrossFramePanicObserve_out_of_range,
+   @lmCrossFramePanicObserve_mode_sensitivity, @lm_tb_exact_failure_diagnostics,
+   @lm_basic_exact_failure_diagnostics,
+   @lm_ptr_wrappingSignedOffset_roundtrip, @lm_controlFlow_unreachable_ub,
+   @lm_controlFlow_unwindToBlock_laws, @lm_controlFlow_root_unwind_ub, @lm_cf_assert_four_way,
+   @lm_root_unwind_boundary_vs_catch_harness, @lm_case21_premature_parent_write_ub_contrast,
+   @lm_cf_return_and_unwind_pop_laws, @lm_unwind_payload_lifo_and_afterStackPop_laws,
+   @lm_locationState_protector_and_frozen_laws,
+   @lm_globalState_endCall_lifo_preservation, @lm_multiframe_lifo_protector_release_witness,
+   @lm_stepMirFn_miri_lockstep_simulations⟩
+
+section AxiomAudit
+open Lean Elab Command
+
+run_cmd do
+  let env ← getEnv
+  -- 1. Strict root isolation: ZERO `MiniRustSpec.*` and ZERO `Anneal.*` imports, even transitively!
+  for modName in env.header.moduleNames do
+    if (`MiniRustSpec).isPrefixOf modName || (`Anneal).isPrefixOf modName then
+      throwError "import-isolation violation: {modName} must not be imported by LeanMiriSpec.CrossFrameRefAndPanicLM"
+  let ns := `LeanMiriSpec.CrossFrameRefAndPanicLM
+  -- 2. Bridge-reality audit: confirm our LM theorems transitively reach real vendored Miri & Trusted constants.
+  let bridgeReq : List (Lean.Name × Lean.Name) :=
+    [ (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.Step.step),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.ControlFlow.evalTerminator),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.ControlFlow.returnFromCurrentFrame),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.ControlFlow.unwindToBlock),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.Unwind.pushPayload),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.Unwind.popPayload),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.TreeBorrows.BorrowTree.releaseProtector),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.TreeBorrows.GlobalState.endCall),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.Interpreter.ptrOffsetInbounds),
+      (ns ++ `lmCrossFramePanicObserve_table, `Miri.Memory.Pointer.wrappingSignedOffset),
+      (ns ++ `lmCrossFramePanicObserve_table, `LeanMiriSpec.Correspondence.translateBody),
+      (ns ++ `lm_locationState_protector_and_frozen_laws, `Miri.TreeBorrows.Tree.LocationState.performAccess),
+      (ns ++ `lm_unwind_payload_lifo_and_afterStackPop_laws, `Miri.Interpreter.Unwind.afterStackPop),
+      (ns ++ `lm_ep1_assert_complete_stepMirFn_miri_sim, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `lm_ep1_assert_complete_stepMirFn_miri_sim, `Miri.Interpreter.Step.step),
+      (ns ++ `lm_ep1_unwindResume_ceiling_dichotomy_sim, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `lm_ep1_unwindResume_ceiling_dichotomy_sim, `Miri.Interpreter.Step.step) ]
+  for (thm, req) in bridgeReq do
+    let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
+    let mut seen : NameSet := {}
+    let mut todo : Array Lean.Name := ci.type.getUsedConstants
+    if let .defnInfo v := ci then
+      todo := todo ++ v.value.getUsedConstants
+    while !todo.isEmpty do
+      let n := todo.back!
+      todo := todo.pop
+      if seen.contains n then continue
+      seen := seen.insert n
+      if n == req then break
+      if ns.isPrefixOf n then
+        if let some (.defnInfo v) := env.find? n then
+          todo := todo ++ v.value.getUsedConstants
+    unless seen.contains req do
+      throwError "shadow-evaluator audit: {thm} does not reach real {req}"
+  -- 3. Standard-3-axiom purity & non-vacuous theorem count floor.
+  let mut theorems : Nat := 0
+  for (c, info) in env.constants.map₂.toList do
+    for a in ← liftCoreM <| Lean.collectAxioms c do
+      if a == ``sorryAx then throwError "{c} depends on sorryAx"
+      if a == ``Lean.ofReduceBool || a == ``Lean.trustCompiler then
+        throwError "{c} depends on forbidden axiom {a}"
+      unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+        throwError "{c} depends on non-standard axiom {a}"
+    if ns.isPrefixOf c && !c.isInternal then
+      if let .thmInfo _ := info then theorems := theorems + 1
+  if theorems < 16 then
+    throwError "axiom audit vacuous: only {theorems} theorems seen"
+
+end AxiomAudit
+
+end LeanMiriSpec.CrossFrameRefAndPanicLM
