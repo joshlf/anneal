@@ -83,7 +83,8 @@ its CFG, with no fixed-point iteration in the kernel:
    argument list and the trusted certificate
    `AutoProve.bodyVerified_of_autoVerifyAcyclic`;
    `AutoProve.autoVerifyCutpoints` does the same for loops with Bourdoncle
-   cutpoints.
+   cutpoints (`AutoProve.bodyVerified_of_autoVerifyCutpoints` and its
+   stateful and trace variants).
 
 Every definition is computable and every theorem depends only on `propext`
 and `Quot.sound`.
@@ -2084,6 +2085,55 @@ theorem traceVerificationResult_of_autoVerifyAcyclic
           | ⟨d, hd, hDen⟩ =>
             hPost args mem tr retVal mem' hP hTr hF
               ⟨d, retInv, hd, h.1, hDen⟩)
+
+/-- Trusted `StatefulVerificationResult c` from an `autoVerifyCutpoints` run
+(loops with Bourdoncle cutpoints), for a root-entry memory and valid entry
+arguments. -/
+theorem statefulVerificationResult_of_autoVerifyCutpoints
+    {c : Trusted.VerificationResult.StatefulClaim} {retInv : MirAbsSlot}
+    {cutpoints : List (Nat × MirAbsEnv)} {rpoOrder : List Nat}
+    (hVer : autoVerifyCutpoints c.body retInv cutpoints rpoOrder = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧ ValidEntryArgs c.body args)
+    (hPost : ∀ args mem retVal mem', c.pre args mem →
+      MirMemFrame mem' mem →
+      (∃ d, get? c.body.localDecls 0 = some d ∧
+        retInv.valDenote d.ty retVal) →
+      c.post args mem retVal mem') :
+    Trusted.VerificationResult.StatefulVerificationResult c := by
+  cases autoVerifyCutpoints_elim hVer with
+  | intro argSlots h =>
+    exact verifyMirCutpoints_statefulVerificationResult h.2
+      (fun args mem hP =>
+        have hQ := hPre args mem hP
+        ⟨hQ.1, hQ.2.1, hQ.2.2.1, buildArgSlots?_sound h.1 hQ.2.2.2⟩)
+      hPost
+
+/-- Trusted `TraceVerificationResult c` from an `autoVerifyCutpoints` run
+(loops with Bourdoncle cutpoints): every reachable outcome is a normal return
+along an observation-only trace. -/
+theorem traceVerificationResult_of_autoVerifyCutpoints
+    {c : Trusted.VerificationResult.TraceClaim} {retInv : MirAbsSlot}
+    {cutpoints : List (Nat × MirAbsEnv)} {rpoOrder : List Nat}
+    (hVer : autoVerifyCutpoints c.body retInv cutpoints rpoOrder = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧ ValidEntryArgs c.body args)
+    (hPost : ∀ args mem tr retVal mem', c.pre args mem →
+      TraceObsOnly tr →
+      MirMemFrame mem' mem →
+      (∃ d, get? c.body.localDecls 0 = some d ∧
+        retInv.valDenote d.ty retVal) →
+      c.post args mem tr (.normal (retVal, mem'))) :
+    Trusted.VerificationResult.TraceVerificationResult c := by
+  cases autoVerifyCutpoints_elim hVer with
+  | intro argSlots h =>
+    exact verifyMirCutpoints_traceVerificationResult h.2
+      (fun args mem hP =>
+        have hQ := hPre args mem hP
+        ⟨hQ.1, hQ.2.1, hQ.2.2.1, buildArgSlots?_sound h.1 hQ.2.2.2⟩)
+      hPost
 
 end AutoProve
 

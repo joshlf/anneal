@@ -40,6 +40,10 @@ with the canary helpers of `Anneal.AiPcc.Canaries`:
    narrowing casts, signed shift amounts, unsigned `neg`, signed `switchInt`
    refinement, schedules of CFGs whose numbering is not a topological order,
    and cyclic CFGs.
+6. `AutoProve.ValidEntryArgs` rejections on `bool` and `()`, exact signed
+   constant products, and signed loops (a sign-straddling counter and a count
+   up to `i32::MAX`) certified through `AutoProve.autoVerifyCutpoints` and its
+   `VerificationResult` / stateful / trace certificates.
 -/
 
 namespace Anneal.AiPccMirTests
@@ -1681,8 +1685,9 @@ theorem signed_adversarial_edge_cases :
             (.binaryOp .shlUnchecked (canaryCopy 1) (canaryCopy 2))] .return_,
           canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
             .return_ ]) = false ∧
-    -- Non-exact negative `i8 -> i32` widening falls back to `topInit`, so a
-    -- subsequent `unchecked_add(1)` is soundly rejected.
+    -- Conservative rejection (this body is in fact safe): a non-exact
+    -- negative `i8 -> i32` widening falls back to `topInit`, so the following
+    -- `unchecked_add(1)` cannot be certified.
     AutoProve.autoVerifyAcyclic
       (canaryBody "ai_pcc_tests::neg_widen_add" 1
         [canaryIntTy .i32, canaryIntTy .i8, canaryBoolTy, canaryIntTy .i32]
@@ -1799,5 +1804,335 @@ info: 'Anneal.AiPccMirTests.stride4_auto_verificationResult' depends on axioms:
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms stride4_auto_verificationResult
+
+/-! ## 6. `AutoProve` Argument Validity, Signed Products, and Signed Loops -/
+
+/-- `ValidEntryArgs` is tight on `bool` and `()`: a non-canonical `bool`
+scalar, a `bool` of the wrong byte width, a unit passed for a `bool`, a
+missing argument, a scalar passed for `()`, and a surplus argument are all
+invalid. -/
+theorem validEntryArgs_rejects_bad_bool_and_unit :
+    ¬ AutoProve.ValidEntryArgs boolNotBody [.scalar ⟨2, 1⟩] ∧
+    ¬ AutoProve.ValidEntryArgs boolNotBody [.scalar ⟨1, 4⟩] ∧
+    ¬ AutoProve.ValidEntryArgs boolNotBody [.unit] ∧
+    ¬ AutoProve.ValidEntryArgs boolNotBody [] ∧
+    ¬ AutoProve.ValidEntryArgs unitIdBody [.scalar ⟨0, 1⟩] ∧
+    ¬ AutoProve.ValidEntryArgs unitIdBody [.unit, .unit] := by
+  refine ⟨?_, ?_, ?_, fun h => h, ?_, ?_⟩
+  · intro h
+    match h.1 with
+    | ⟨b, hEq⟩ =>
+      cases b with
+      | false =>
+        have hEq' : Value.scalar ⟨2, 1⟩ = Value.scalar ⟨0, 1⟩ := hEq
+        injection hEq' with h1
+        injection h1 with h2 _
+        exact absurd h2 (by decide)
+      | true =>
+        have hEq' : Value.scalar ⟨2, 1⟩ = Value.scalar ⟨1, 1⟩ := hEq
+        injection hEq' with h1
+        injection h1 with h2 _
+        exact absurd h2 (by decide)
+  · intro h
+    match h.1 with
+    | ⟨b, hEq⟩ =>
+      cases b with
+      | false =>
+        have hEq' : Value.scalar ⟨1, 4⟩ = Value.scalar ⟨0, 1⟩ := hEq
+        injection hEq' with h1
+        injection h1 with h2 _
+        exact absurd h2 (by decide)
+      | true =>
+        have hEq' : Value.scalar ⟨1, 4⟩ = Value.scalar ⟨1, 1⟩ := hEq
+        injection hEq' with h1
+        injection h1 with _ h3
+        exact absurd h3 (by decide)
+  · intro h
+    match h.1 with
+    | ⟨_, hEq⟩ => nomatch hEq
+  · intro h
+    cases h.1 with
+    | inl h1 => nomatch h1
+    | inr h1 => nomatch h1
+  · intro h
+    have h2 : [Value.unit] = ([] : List Value) := h.2
+    nomatch h2
+
+/-- `fn() -> i8 { c1.unchecked_mul(c2) }` on `i8` constants given as
+two's-complement bit patterns. -/
+def signedMulConstBody (c1 c2 : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_mul_const" 0 [canaryIntTy .i8]
+    [canaryBlock [.assign (canaryPlace 0)
+      (.binaryOp .mulUnchecked (canaryIConst .i8 c1) (canaryIConst .i8 c2))]
+      .return_]
+
+/-- `fn() -> i8 { c1 * c2 }` in debug mode: the product goes through
+`MulWithOverflow` into `_1 : (i8, bool)`, and `assert(!move (_1.1))` guards
+the read of `_1.0`.
+- `_0 : i8`; `_1 : (i8, bool)`. -/
+def signedCheckedMulConstBody (c1 c2 : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_checked_mul_const" 0
+    [canaryIntTy .i8, intPairTy .i8]
+    [ canaryBlock [.storageLive 1,
+        .assign (canaryPlace 1)
+          (.binaryOp .mulWithOverflow (canaryIConst .i8 c1)
+            (canaryIConst .i8 c2))]
+        (.assert (.move (fieldPlace 1 1 canaryBoolTy)) false 1 .continue_),
+      canaryBlock [.assign (canaryPlace 0)
+          (.use (.move (fieldPlace 1 0 (canaryIntTy .i8))))] .return_ ]
+
+/-- Products of exact signed constants are decided by the trusted overflow
+test, for operands of either sign. -/
+theorem signed_constant_products :
+    -- `-2 * 3 = -6` and `-1 * -1 = 1`.
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 254 3) = true ∧
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 255 255) = true ∧
+    -- `-64 * 2` is exactly `i8::MIN`; `-64 * -2 = 128` overflows.
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 192 2) = true ∧
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 192 254) = false ∧
+    -- `10 * 12 = 120` fits; `11 * 12 = 132` overflows.
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 10 12) = true ∧
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 11 12) = false ∧
+    -- `i8::MIN * -1` overflows in either operand order; `i8::MIN * 1` fits.
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 128 255) = false ∧
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 255 128) = false ∧
+    AutoProve.autoVerifyAcyclic (signedMulConstBody 128 1) = true ∧
+    -- Checked form: the overflow flag is certified clear exactly when the
+    -- product fits.
+    AutoProve.autoVerifyAcyclic (signedCheckedMulConstBody 254 3) = true ∧
+    AutoProve.autoVerifyAcyclic (signedCheckedMulConstBody 192 2) = true ∧
+    AutoProve.autoVerifyAcyclic (signedCheckedMulConstBody 192 254) = false ∧
+    AutoProve.autoVerifyAcyclic (signedCheckedMulConstBody 128 255) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `fn() -> i32 { let mut i = start; while i op bound { i += 1 }; i }` with
+an unchecked increment (`op` is `Lt` or `Le`; `start` and `bound` are
+two's-complement bit patterns).
+- `_0 : i32`; `_1 : i32` counter; `_2 : bool` guard. -/
+def signedCountLoopBody (op : BinOp) (start bound : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_count_loop" 0
+    [canaryIntTy .i32, canaryIntTy .i32, canaryBoolTy]
+    [ -- bb0: entry
+      canaryBlock [.storageLive 1,
+        .assign (canaryPlace 1) (.use (canaryIConst .i32 start)),
+        .storageLive 2] (.goto 1),
+      -- bb1: loop header (the only cutpoint)
+      canaryBlock [.assign (canaryPlace 2)
+          (.binaryOp op (canaryCopy 1) (canaryIConst .i32 bound))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 3)], 2⟩),
+      -- bb2: loop body
+      canaryBlock [.assign (canaryPlace 1)
+          (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i32 1))]
+        (.goto 1),
+      -- bb3: return `_1`
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1)),
+        .storageDead 2, .storageDead 1] .return_ ]
+
+/-- Loop-header cutpoint of `signedCountLoopBody` with counter value `a`. -/
+def signedCountCutpoints (a : AbsVal) : List (Nat × MirAbsEnv) :=
+  [(1, [.sint .i32 (AbsVal.uninit 32), .sint .i32 a, .bool .uninit])]
+
+/-- `-32` as an `i32` bit pattern. -/
+def i32Neg32 : Nat := modPow2 32 - 32
+
+/-- The loop `i = -32; while i < 32 { i += 1 }`. -/
+def signedCount64Body : CapturedMir := signedCountLoopBody .lt i32Neg32 32
+
+/-- Header invariant of `signedCount64Body`: `-32 <= i <= 32`, a wrapped
+interval of bit patterns. -/
+def signedCount64Cutpoints : List (Nat × MirAbsEnv) :=
+  signedCountCutpoints (ivAbs 32 i32Neg32 32)
+
+/-- Exact return postcondition `_0 = 32`. -/
+def signedCount64RetInv : MirAbsSlot := .sint .i32 (AbsVal.const 32 32)
+
+/-- Signed loops through `AutoProve.autoVerifyCutpoints` on the computed
+default schedule: a sign-straddling counter with an exact exit value, its
+near-miss certificates, and counting up to `i32::MAX`. -/
+theorem signed_loops_via_cutpoints :
+    AutoProve.autoVerifyCutpoints signedCount64Body signedCount64RetInv
+      signedCount64Cutpoints = true ∧
+    -- A wrong return value, a header that is not inductive, a header that
+    -- excludes the entry value, and a missing cutpoint are rejected.
+    AutoProve.autoVerifyCutpoints signedCount64Body
+      (.sint .i32 (AbsVal.const 32 31)) signedCount64Cutpoints = false ∧
+    AutoProve.autoVerifyCutpoints signedCount64Body signedCount64RetInv
+      (signedCountCutpoints (ivAbs 32 i32Neg32 31)) = false ∧
+    AutoProve.autoVerifyCutpoints signedCount64Body signedCount64RetInv
+      (signedCountCutpoints (ivAbs 32 (i32Neg32 + 1) 32)) = false ∧
+    AutoProve.autoVerifyCutpoints signedCount64Body signedCount64RetInv [] =
+      false ∧
+    AutoProve.autoVerifyAcyclic signedCount64Body = false ∧
+    -- `i = i32::MIN; while i < i32::MAX { i += 1 }` never overflows and
+    -- exits at exactly `i32::MAX`, under the trivial header invariant.
+    AutoProve.autoVerifyCutpoints
+      (signedCountLoopBody .lt (modPow2 31) (modPow2 31 - 1))
+      (.sint .i32 (AbsVal.const 32 (modPow2 31 - 1)))
+      (signedCountCutpoints (AbsVal.topInit 32)) = true ∧
+    -- With `<=` the increment overflows at `i32::MAX`.
+    AutoProve.autoVerifyCutpoints
+      (signedCountLoopBody .le (modPow2 31) (modPow2 31 - 1))
+      (.sint .i32 (AbsVal.topInit 32))
+      (signedCountCutpoints (AbsVal.topInit 32)) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- A signed return slot holding an exact constant pins the returned value. -/
+theorem sint_valDenote_exact {ty : Ty} {i : IntTy} {a : AbsVal} {v : Value}
+    {c : Nat} (hEx : a.exactVal? (uintWidth (intTwin i)) = some c)
+    (h : (MirAbsSlot.sint i a).valDenote ty v) :
+    v = .scalar ⟨c, uintBytes (intTwin i)⟩ := by
+  have h2 := h.2
+  cases v
+  case scalar sc =>
+    cases sc with
+    | mk bits sz =>
+      have hBits := (absVal_exactVal?_sound hEx h2.2).1
+      injection hBits with hBits
+      have hSz : sz = uintBytes (intTwin i) := h2.1
+      subst hBits
+      subst hSz
+      rfl
+  all_goals exact False.elim h2
+
+/-- Audited claim for `signedCount64Body`: called with no arguments, it
+returns exactly `32`. -/
+def signedCount64Claim : Trusted.VerificationResult.Claim where
+  body := signedCount64Body
+  pre args := args = []
+  post _ ret := ret = .scalar ⟨32, 4⟩
+
+/-- `VerificationResult signedCount64Claim` from one `rfl` run of
+`AutoProve.autoVerifyCutpoints`. -/
+theorem signedCount64_verificationResult :
+    Trusted.VerificationResult.VerificationResult signedCount64Claim :=
+  AutoProve.bodyVerified_of_autoVerifyCutpoints
+    (retInv := signedCount64RetInv) (cutpoints := signedCount64Cutpoints)
+    (rpoOrder :=
+      AutoProve.defaultRpoOrder signedCount64Body signedCount64Cutpoints)
+    rfl
+    (fun args hPre => by
+      have hArgs : args = [] := hPre
+      subst hArgs
+      exact rfl)
+    (fun _ _ _ hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        exact sint_valDenote_exact rfl hDen)
+
+/-- Stateful audited claim for `signedCount64Body`: from a root-entry memory
+it preserves `MirMemFrame` and returns exactly `32`. -/
+def signedCount64StatefulClaim :
+    Trusted.VerificationResult.StatefulClaim where
+  body := signedCount64Body
+  pre args mem :=
+    mem.callStack = [] ∧ mem.activeCallee = none ∧
+    mem.activeProtectors = [] ∧ args = []
+  post _ mem ret mem' := MirMemFrame mem' mem ∧ ret = .scalar ⟨32, 4⟩
+
+/-- `StatefulVerificationResult signedCount64StatefulClaim` through
+`AutoProve.statefulVerificationResult_of_autoVerifyCutpoints`. -/
+theorem signedCount64_statefulVerificationResult :
+    Trusted.VerificationResult.StatefulVerificationResult
+      signedCount64StatefulClaim :=
+  AutoProve.statefulVerificationResult_of_autoVerifyCutpoints
+    (retInv := signedCount64RetInv) (cutpoints := signedCount64Cutpoints)
+    (rpoOrder :=
+      AutoProve.defaultRpoOrder signedCount64Body signedCount64Cutpoints)
+    rfl
+    (fun args mem hPre => by
+      have hArgs : args = [] := hPre.2.2.2
+      subst hArgs
+      exact ⟨hPre.1, hPre.2.1, hPre.2.2.1, rfl⟩)
+    (fun _ _ _ _ _ hFrame hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        exact ⟨hFrame, sint_valDenote_exact rfl hDen⟩)
+
+/-- Trace audited claim for `signedCount64Body`: every reachable outcome is a
+normal return of exactly `32` along an observation-only trace. -/
+def signedCount64TraceClaim : Trusted.VerificationResult.TraceClaim where
+  body := signedCount64Body
+  pre args mem :=
+    mem.callStack = [] ∧ mem.activeCallee = none ∧
+    mem.activeProtectors = [] ∧ args = []
+  post _ mem tr out :=
+    TraceObsOnly tr ∧
+    ∃ mem', out = .normal (.scalar ⟨32, 4⟩, mem') ∧ MirMemFrame mem' mem
+
+/-- `TraceVerificationResult signedCount64TraceClaim` through
+`AutoProve.traceVerificationResult_of_autoVerifyCutpoints`. -/
+theorem signedCount64_traceVerificationResult :
+    Trusted.VerificationResult.TraceVerificationResult
+      signedCount64TraceClaim :=
+  AutoProve.traceVerificationResult_of_autoVerifyCutpoints
+    (retInv := signedCount64RetInv) (cutpoints := signedCount64Cutpoints)
+    (rpoOrder :=
+      AutoProve.defaultRpoOrder signedCount64Body signedCount64Cutpoints)
+    rfl
+    (fun args mem hPre => by
+      have hArgs : args = [] := hPre.2.2.2
+      subst hArgs
+      exact ⟨hPre.1, hPre.2.1, hPre.2.2.1, rfl⟩)
+    (fun _ _ _ retVal mem' _ hTr hFrame hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        have hV : retVal = .scalar ⟨32, 4⟩ := sint_valDenote_exact rfl hDen
+        subst hV
+        exact ⟨hTr, mem', rfl, hFrame⟩)
+
+/--
+info: 'Anneal.AiPcc.AutoProve.statefulVerificationResult_of_autoVerifyCutpoints' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms AutoProve.statefulVerificationResult_of_autoVerifyCutpoints
+
+/--
+info: 'Anneal.AiPcc.AutoProve.traceVerificationResult_of_autoVerifyCutpoints' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms AutoProve.traceVerificationResult_of_autoVerifyCutpoints
+
+/--
+info: 'Anneal.AiPcc.sintMulOk_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms sintMulOk_sound
+
+/--
+info: 'Anneal.AiPcc.binOpSintAbs_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms binOpSintAbs_sound
+
+/--
+info: 'Anneal.AiPccMirTests.signedCount64_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedCount64_verificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.signedCount64_statefulVerificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedCount64_statefulVerificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.signedCount64_traceVerificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedCount64_traceVerificationResult
 
 end Anneal.AiPccMirTests

@@ -55,6 +55,9 @@ certificate passes if a reachable block uses it):
     `AbsVal.noSignedOverflowAdd` / `AbsVal.noSignedOverflowSub` hold (so
     sign-straddling ranges such as `[-100, 100] + 10` verify), and `div` /
     `rem` when `AbsVal.safeSignedDiv` excludes `/ 0` and `INT_MIN / -1`;
+    `mulUnchecked` is accepted on a zero operand, on non-negative operands
+    with a small product, and on two exact operands whose product fits
+    (`sintMulOk`);
   * `<`, `<=`, `>`, `>=`, `==`, `!=` fold through `AbsVal.decideSlt?` /
     `AbsVal.decideSle?` / `AbsVal.decideEq?` and synthesize
     arbitrary-constant `.sleConst` / `.sgtConst` / `.seqConst` / `.sneConst`
@@ -99,7 +102,9 @@ open definitions with `unfold f at h; dsimp only at h` (one `eq_def` rewrite
 and `iota`/`zeta` steps) rather than `simp only [f]` (which realizes one
 equation lemma and one matcher splitter per constructor), state each trusted
 evaluator arm once as a bridging lemma (`evalRvalue_binaryOp_scalar`,
-`evalRvalue_cast_intToInt_scalar`, ...), and eliminate `ite` through the
+`evalRvalue_cast_intToInt_scalar`, ...) whose proof head-normalizes the
+evaluator with `conv => lhs; whnf` (stopping at the first stuck `match`
+instead of simplifying every arm), and eliminate `ite` through the
 `@Decidable.casesOn` eliminators of `Anneal.Firewall`.
 -/
 
@@ -4223,6 +4228,49 @@ theorem sintDivRemOk_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
     exact ⟨Nat.ne_of_gt (nonzeroDivSafe_sound (bool_and_true_left h) hy),
       sintNotMinDivNegOne_sound (bool_and_true_right h) hx hy⟩
 
+/-- Certifies `signedOverflowMul x y (uintBytes (intTwin i)) = false` either
+by running the trusted overflow test on two exact operands (so constant
+products of either sign, such as `-2 * 3` or `-64 * 2`, are decided exactly)
+or by the range check `sintNoOverflowMul` (a zero operand, or non-negative
+operands with a small product). -/
+def sintMulOk (i : IntTy) (a1 a2 : AbsVal) : Bool :=
+  (match a1.exactVal? (uintWidth (intTwin i)),
+      a2.exactVal? (uintWidth (intTwin i)) with
+    | some c1, some c2 => !(signedOverflowMul c1 c2 (uintBytes (intTwin i)))
+    | _, _ => false) ||
+    sintNoOverflowMul i a1 a2
+
+theorem sintMulOk_sound {i : IntTy} {a1 a2 : AbsVal} {x y : Nat}
+    (h : sintMulOk i a1 a2 = true)
+    (hx : a1.denote (uintWidth (intTwin i)) (some x))
+    (hy : a2.denote (uintWidth (intTwin i)) (some y)) :
+    signedOverflowMul x y (uintBytes (intTwin i)) = false := by
+  unfold sintMulOk at h
+  cases hE1 : a1.exactVal? (uintWidth (intTwin i)) with
+  | none =>
+    rw [hE1] at h
+    exact sintNoOverflowMul_sound h hx hy
+  | some c1 =>
+    cases hE2 : a2.exactVal? (uintWidth (intTwin i)) with
+    | none =>
+      rw [hE1, hE2] at h
+      exact sintNoOverflowMul_sound h hx hy
+    | some c2 =>
+      rw [hE1, hE2] at h
+      have h1 := exactVal?_eq hE1 hx
+      have h2 := exactVal?_eq hE2 hy
+      subst h1
+      subst h2
+      cases hO : signedOverflowMul c1 c2 (uintBytes (intTwin i)) with
+      | false => rfl
+      | true =>
+        have h' : (!(signedOverflowMul c1 c2 (uintBytes (intTwin i))) ||
+            sintNoOverflowMul i a1 a2) = true := h
+        rw [hO] at h'
+        have h3 := sintNoOverflowMul_sound h' hx hy
+        rw [hO] at h3
+        exact h3
+
 /-- Overflow flag of a checked signed operation: exactly `false` when the
 operation is certified overflow-free, otherwise unknown. -/
 def sintOverflowBoolAbs (noOverflow : Bool) : BoolAbs :=
@@ -5532,7 +5580,7 @@ comparisons (`sintCmpAbs`: biased static decision plus `RelGuard` synthesis),
 sign-agnostic operators (the unsigned transfer on the twin type), arithmetic
 right shifts (`shiftSintAbs`), UB-free `div` / `rem` (`sintDivRemAbs`), and
 checked (`*WithOverflow`) / unchecked (`*Unchecked`) arithmetic certified by
-`sintAddOk` / `sintSubOk` / `sintNoOverflowMul`. -/
+`sintAddOk` / `sintSubOk` / `sintMulOk`. -/
 def binOpSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (srcL : Option Nat)
     (a2 : AbsVal) (srcR : Option Nat) : Option MirAbsVal :=
   match op with
@@ -5551,7 +5599,7 @@ def binOpSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (srcL : Option Nat)
     | true => some (mkSintVal i (subUintAbs (uintWidth (intTwin i)) a1 a2))
     | false => none
   | .mulUnchecked =>
-    match sintNoOverflowMul i a1 a2 with
+    match sintMulOk i a1 a2 with
     | true => some (mkSintVal i (mulUintAbs (uintWidth (intTwin i)) a1 a2))
     | false => none
   | .addWithOverflow =>
@@ -5562,7 +5610,7 @@ def binOpSintAbs (op : BinOp) (i : IntTy) (a1 : AbsVal) (srcL : Option Nat)
       (sintOverflowBoolAbs (sintSubOk i a1 a2)))
   | .mulWithOverflow =>
     some (mkSintBoolPairVal i (mulUintAbs (uintWidth (intTwin i)) a1 a2)
-      (sintOverflowBoolAbs (sintNoOverflowMul i a1 a2)))
+      (sintOverflowBoolAbs (sintMulOk i a1 a2)))
   | _ => none
 
 theorem binOpSintAbs_not_offset {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
@@ -5638,14 +5686,14 @@ theorem binOpSintAbs_sound {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
         (sintSubOk_sound hNo hx hy), mkSintVal_denote hSub⟩
   | mulUnchecked =>
     dsimp only at h
-    cases hNo : sintNoOverflowMul i a1 a2 with
+    cases hNo : sintMulOk i a1 a2 with
     | false => rw [hNo] at h; nomatch h
     | true =>
       rw [hNo] at h
       injection h with h
       subst h
       exact ⟨_, evalScalarBinOp_sint_mulUnchecked locals mem
-        (sintNoOverflowMul_sound hNo hx hy),
+        (sintMulOk_sound hNo hx hy),
         mkSintVal_denote (mulUintAbs_sound hw hx hy)⟩
   | addWithOverflow =>
     injection h with h
@@ -5675,9 +5723,9 @@ theorem binOpSintAbs_sound {op : BinOp} {i : IntTy} {a1 a2 : AbsVal}
     injection h with h
     subst h
     refine ⟨_, evalScalarBinOp_sint_mulWithOverflow locals mem, ?_⟩
-    cases hNo : sintNoOverflowMul i a1 a2 with
+    cases hNo : sintMulOk i a1 a2 with
     | true =>
-      rw [sintNoOverflowMul_sound hNo hx hy]
+      rw [sintMulOk_sound hNo hx hy]
       exact mkSintBoolPairVal_denote rfl (mulUintAbs_sound hw hx hy)
         (boolAbs_denote_of_bool (ba := .exact false .none) ⟨rfl, True.intro⟩)
     | false =>
@@ -6219,12 +6267,10 @@ theorem evalRvalue_binaryOp_scalar {locals locals₁ locals₂ : List LocalSlot}
     evalRvalue locals (.binaryOp op lhsOp rhsOp) mem decls layouts =
       evalScalarBinOp op lhs rhs locals₂ mem
         (operandIsSigned decls lhsOp layouts) := by
-  unfold evalRvalue
-  dsimp only
+  conv => lhs; whnf
   rw [hL]
-  dsimp only
+  conv => lhs; whnf
   rw [hR]
-  dsimp only
   cases op with
   | offset => exact absurd rfl hNe
   | _ => rfl
@@ -6239,8 +6285,10 @@ theorem evalRvalue_use_no_deref {locals locals' : List LocalSlot}
     (hNoDeref : ∀ p rest, (op = .copy p ∨ op = .move p) →
       p.projection ≠ .deref :: rest) :
     evalRvalue locals (.use op) mem decls layouts = .ok v locals' mem := by
-  unfold evalRvalue; dsimp only
-  rw [hEv]; dsimp only; rw [hVal]; dsimp only
+  conv => lhs; whnf
+  rw [hEv]
+  conv => lhs; whnf
+  rw [hVal]
   cases op with
   | constant _ => rfl
   | copy p =>
@@ -6303,8 +6351,7 @@ theorem evalRvalue_unaryOp_not_scalar {locals locals' : List LocalSlot}
       mem.callerLocals decls mem.callStack = .ok (.scalar sc) locals') :
     evalRvalue locals (.unaryOp .not op) mem decls layouts =
       evalUnaryNot sc (operandTy decls layouts op) locals' mem := by
-  unfold evalRvalue
-  dsimp only
+  conv => lhs; whnf
   rw [hEv]
 
 /-- `evalRvalue` on `UnOp.neg` of an in-range integer scalar is two's
@@ -6319,12 +6366,11 @@ theorem evalRvalue_unaryOp_neg_scalar {locals locals' : List LocalSlot}
     evalRvalue locals (.unaryOp .neg op) mem decls layouts =
       .ok (.scalar ⟨wrapVal (uintWidth u) (modPow2 (uintWidth u) - x),
         uintBytes u⟩) locals' mem := by
-  unfold evalRvalue
-  dsimp only
+  conv => lhs; whnf
   rw [hEv]
-  dsimp only
+  conv => lhs; whnf
   rw [uintBytes_beq_zero]
-  dsimp only
+  conv => lhs; whnf
   rw [wrapScalarBits_of_lt_uint hx, wrapScalarBits_eq_wrapVal,
     scalarModulus_uintBytes]
   rfl
@@ -6341,12 +6387,11 @@ theorem evalRvalue_cast_intToInt_scalar {locals locals' : List LocalSlot}
     evalRvalue locals (.cast .intToInt op targetTy) mem decls layouts =
       .ok (.scalar ⟨intCastBits (operandIsSigned decls op layouts) uSrc uDst x,
         uintBytes uDst⟩) locals' mem := by
-  unfold evalRvalue
-  dsimp only
+  conv => lhs; whnf
   rw [hEv]
-  dsimp only
+  conv => lhs; whnf
   rw [uintBytes_beq_zero]
-  dsimp only
+  conv => lhs; whnf
   rw [hTgt]
   rfl
 
@@ -6360,8 +6405,7 @@ theorem evalRvalue_tuple_pair {locals locals₁ locals₂ : List LocalSlot}
       mem.callerLocals decls mem.callStack = .ok v1 locals₂) :
     evalRvalue locals (.aggregate .tuple [op0, op1]) mem decls layouts =
       .ok (.aggregate 0 [v0, v1]) locals₂ mem := by
-  unfold evalRvalue
-  dsimp only
+  conv => lhs; whnf
   simp only [evalOperands, hEv0, hEv1]
 
 theorem unaryNotAbs_sound {av r : MirAbsVal} {locals : List LocalSlot}
@@ -7070,7 +7114,10 @@ private theorem evalStmt_retag_scalar {s : MachineState} {span : String}
     (hTy : (∃ u, ty.kind = .uint u) ∨ ty.kind = .bool ∨ (∃ i, ty.kind = .int i)) :
     evalStmt s ⟨.retag rk p, span⟩ decls layouts =
       MirStepNode.step (advanceStmt s s.frame.locals s.memory) := by
-  unfold evalStmt; dsimp only; rw [hEv]; dsimp only; rw [hPl]
+  conv => lhs; whnf
+  rw [hEv]
+  conv => lhs; whnf
+  rw [hPl]
   cases ty with
   | mk k lIdx =>
     cases hTy with
@@ -7090,7 +7137,10 @@ private theorem evalStmt_retag_tuple {s : MachineState} {span : String}
     (hVal : val = .unit ∨ ∃ tag fs, val = .aggregate tag fs) :
     evalStmt s ⟨.retag rk p, span⟩ decls layouts =
       MirStepNode.step (advanceStmt s s.frame.locals s.memory) := by
-  unfold evalStmt; dsimp only; rw [hEv]; dsimp only; rw [hPl]
+  conv => lhs; whnf
+  rw [hEv]
+  conv => lhs; whnf
+  rw [hPl]
   cases ty with
   | mk k lIdx =>
     have hk : k = .tuple ts := hTy; subst hk
@@ -7132,7 +7182,7 @@ private theorem evalStmt_storageLive_noProt {s : MachineState} {span : String}
                   (length s.memory.callStack) })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub) = _
-  rw [hL]; dsimp only; rw [hSet]; dsimp only; rw [hProt]
+  rw [hL]; (conv => lhs; whnf); rw [hSet]; (conv => lhs; whnf); rw [hProt]
 
 private theorem evalStmt_storageDead_noProt {s : MachineState} {span : String}
     {l : Nat} {cs : LocalSlot} {locals' : List LocalSlot}
@@ -7166,7 +7216,7 @@ private theorem evalStmt_storageDead_noProt {s : MachineState} {span : String}
                   (length s.memory.callStack) })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub) = _
-  rw [hL]; dsimp only; rw [hSet]; dsimp only; rw [hProt]
+  rw [hL]; (conv => lhs; whnf); rw [hSet]; (conv => lhs; whnf); rw [hProt]
 
 private theorem evalStmt_deinit_local_noProt {s : MachineState} {span : String}
     {l : Nat} {cs : LocalSlot} {locals' : List LocalSlot}
@@ -7204,8 +7254,8 @@ private theorem evalStmt_deinit_local_noProt {s : MachineState} {span : String}
   rw [hL]
   cases cs with
   | dead => exact absurd rfl hLive
-  | uninit => dsimp only; rw [hSet]; dsimp only; rw [hProt]
-  | init _ => dsimp only; rw [hSet]; dsimp only; rw [hProt]
+  | uninit => (conv => lhs; whnf); rw [hSet]; (conv => lhs; whnf); rw [hProt]
+  | init _ => (conv => lhs; whnf); rw [hSet]; (conv => lhs; whnf); rw [hProt]
 
 private theorem evalStmt_assume_true {s : MachineState} {span : String}
     {op : Operand} {locals' : List LocalSlot}
@@ -8067,11 +8117,11 @@ private theorem evalTerminator_return_root {s : MachineState} {span : String}
               | .ub => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub) = _
-  rw [hL]; dsimp only; rw [hProt]
+  rw [hL]; (conv => lhs; whnf); rw [hProt]
   have hConf : hasFrameDeallocProtectorConflict s.memory.borrows []
       (length s.memory.callStack) (length s.frame.locals) = false := by
     unfold hasFrameDeallocProtectorConflict; rfl
-  rw [hConf]; dsimp only; rw [hStack]; dsimp only; rw [hU]
+  rw [hConf]; (conv => lhs; whnf); rw [hStack]; (conv => lhs; whnf); rw [hU]
 
 private theorem evalTerminator_drop_local_noProt {s : MachineState}
     {span : String} {l target : Nat} {unwind : UnwindAction}
@@ -8116,8 +8166,8 @@ private theorem evalTerminator_drop_local_noProt {s : MachineState}
   rw [hL]
   cases cs with
   | dead => exact absurd rfl hLive
-  | uninit => dsimp only; rw [hSet]; dsimp only; rw [hProt]; rfl
-  | init _ => dsimp only; rw [hSet]; dsimp only; rw [hProt]; rfl
+  | uninit => (conv => lhs; whnf); rw [hSet]; (conv => lhs; whnf); rw [hProt]; rfl
+  | init _ => (conv => lhs; whnf); rw [hSet]; (conv => lhs; whnf); rw [hProt]; rfl
 
 private theorem evalTerminator_switchInt_scalar {s : MachineState}
     {span : String} {discr : Operand} {targets : SwitchTargets}
