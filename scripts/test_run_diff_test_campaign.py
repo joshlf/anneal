@@ -9894,6 +9894,49 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
                 ["PointerCoercion::ClosureFnPointer", "PointerCoercion::Unsize"],
             )
 
+            # Dyn-to-dyn rebinding (`if` or variable copy) must NOT falsely
+            # classify as `PointerCoercion::Unsize`, while a single-line fault
+            # inside `macro_rules! write_bytes` preserves `Intrinsic::CopyNonOverlapping`.
+            self.assertIsNone(
+                campaign._extract_failing_construct_hint_from_fault_line(
+                    "let __vt_dyn: &dyn __AnnealVtableTrait7 = if cond { a } else { b };"
+                )
+            )
+            self.assertIsNone(
+                campaign._extract_failing_construct_hint_from_fault_line(
+                    "let __vt_dyn: &dyn __AnnealVtableTrait7 = __vt_rec_dyn;"
+                )
+            )
+            self.assertEqual(
+                campaign._extract_failing_construct_hint_from_fault_line(
+                    "let __vt_dyn: &dyn __AnnealVtableTrait7 = &__vt_rec;"
+                ),
+                "PointerCoercion::Unsize",
+            )
+            wb_src = "\n".join(
+                [
+                    "macro_rules! write_bytes {",
+                    "    ($dst:expr) => {{",
+                    "        copy_nonoverlapping($dst, $dst, 1);",
+                    "    }};",
+                    "}",
+                    "pub fn pass_wb() -> u32 {",
+                    "    write_bytes!(p);",
+                    "    0u32",
+                    "}",
+                ]
+            ) + "\n"
+            self.assertEqual(
+                campaign.extract_failing_construct_hint(
+                    {
+                        "fn_name": "pass_wb",
+                        "anneal_span": "src/lib.rs:3:9: 3:44",
+                        "mutant_source": wb_src,
+                    }
+                ),
+                "Intrinsic::CopyNonOverlapping",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

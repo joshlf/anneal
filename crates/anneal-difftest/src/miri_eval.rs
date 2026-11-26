@@ -3330,6 +3330,23 @@ fn extract_rust_span_snippet(source: &str, span_str: &str) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
+fn has_implicit_dyn_ref_rhs(stripped: &str) -> bool {
+    let has_dyn_type = stripped.contains(": &dyn ")
+        || stripped.contains(": &mut dyn ")
+        || stripped.contains(": *const dyn ")
+        || stripped.contains(": *mut dyn ");
+    if !has_dyn_type {
+        return false;
+    }
+    let Some((_, rhs)) = stripped.split_once('=') else {
+        return false;
+    };
+    let rhs_trim = rhs.trim_start();
+    // Avoid false positives on `==` comparisons and dyn-to-dyn rebindings like
+    // `let __vt_dyn: &dyn Trait = if cond { a } else { b };` or `= other_dyn;`.
+    !rhs_trim.starts_with('=') && rhs_trim.starts_with('&')
+}
+
 fn extract_failing_construct_hint_from_rust_line(fault_line: &str) -> Option<String> {
     let stripped = fault_line.trim();
     if stripped.is_empty() {
@@ -3339,11 +3356,7 @@ fn extract_failing_construct_hint_from_rust_line(fault_line: &str) -> Option<Str
         || stripped.contains("as &mut dyn ")
         || stripped.contains("as *const dyn ")
         || stripped.contains("as *mut dyn ")
-        || (stripped.contains('=')
-            && (stripped.contains(": &dyn ")
-                || stripped.contains(": &mut dyn ")
-                || stripped.contains(": *const dyn ")
-                || stripped.contains(": *mut dyn ")))
+        || has_implicit_dyn_ref_rhs(stripped)
     {
         return Some("PointerCoercion::Unsize".to_string());
     }
@@ -3708,12 +3721,13 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         // Record each imported path resolved against the enclosing `mod`
-        // containers (`crate::` resets, `super::` pops, `self::` stays), so an
-        // import of `dead_mod::other` never makes every `dead_mod::*` item
-        // reachable.
+        // containers (`crate::` resets, `super::` pops, `self::` stays) and
+        // scoped to any enclosing top-level `fn`, so an import inside an
+        // unreached function or `dead_mod::other` never leaks `dead_mod::*`.
         let mut flat: Vec<(Vec<String>, String)> = Vec::new();
         flatten_use_tree(&item.tree, &mut Vec::new(), &mut flat);
-        for (segments, used_name) in flat {
+        let enclosing_top_fn = self.top_fn_stack.first().cloned();
+        for (segments, mut used_name) in flat {
             let mut base: Vec<String> = self.container_stack.clone();
             let mut leading = true;
             for seg in segments {
@@ -3729,7 +3743,17 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
                     }
                 }
             }
-            let entry = (base, used_name);
+            // Handle `use outer::inner::{self};` (and `self as alias`): a
+            // trailing `"self"` refers to the preceding module segment.
+            if base.last().map(String::as_str) == Some("self") && base.len() >= 2 {
+                base.pop();
+                if used_name == "self"
+                    && let Some(mod_ident) = base.last()
+                {
+                    used_name = mod_ident.clone();
+                }
+            }
+            let entry = (enclosing_top_fn.clone(), base, used_name);
             if !self.graph.imported_paths.contains(&entry) {
                 self.graph.imported_paths.push(entry);
             }
@@ -4007,9 +4031,9 @@ struct ScopeGraphData {
     impl_method_names: BTreeSet<String>,
     nested_fn_stems: BTreeMap<String, Vec<NestedFnOwner>>,
     inherent_impl_method_stems: BTreeMap<String, Vec<InherentMethodOwner>>,
-    /// `(resolved import path, name it is used under)`; a glob import ends in
-    /// `"*"` and is used under `"*"`.
-    imported_paths: Vec<(Vec<String>, String)>,
+    /// `(enclosing top-level fn if local, resolved import path, name it is
+    /// used under)`; a glob import ends in `"*"` and is used under `"*"`.
+    imported_paths: Vec<(Option<String>, Vec<String>, String)>,
     top_level_fns: BTreeSet<String>,
     defined_value_names: BTreeSet<String>,
     defined_type_names: BTreeSet<String>,
@@ -5272,7 +5296,12 @@ fn confirm_helper_module_suffixes(
                 if containers.iter().all(named) {
                     return true;
                 }
-                scope_graph.imported_paths.iter().any(|(path, used)| {
+                scope_graph.imported_paths.iter().any(|(enclosing_fn, path, used)| {
+                    if let Some(top) = enclosing_fn.as_deref()
+                        && !top_fn_is_reached(top)
+                    {
+                        return false;
+                    }
                     let Some((last, prefix)) = path.split_last() else {
                         return false;
                     };
@@ -5282,7 +5311,7 @@ fn confirm_helper_module_suffixes(
                             && containers[prefix.len()..].iter().all(named);
                     }
                     if prefix == containers && last == leaf {
-                        return true;
+                        return scope_idents.contains(used);
                     }
                     path.len() <= containers.len()
                         && containers[..path.len()] == **path
@@ -15844,6 +15873,8 @@ fn driver() {
     let __vt_rec_dyn: &dyn __AnnealVtableTrait1 = &__vt_rec
         as &dyn __AnnealVtableTrait1;
     let implicit_dyn: &dyn __AnnealVtableTrait1 = &__vt_rec;
+    let __vt_dyn: &dyn __AnnealVtableTrait1 = if cond { __vt_rec_dyn } else { __vt_other_dyn };
+    let rebind_dyn: &dyn __AnnealVtableTrait1 = __vt_rec_dyn;
 }
 ";
         let wrapped_snippet = extract_rust_span_snippet(wrapped_src, "src/lib.rs:2:51: 3:37")
@@ -15857,6 +15888,20 @@ fn driver() {
         assert_eq!(
             extract_failing_construct_hint_from_rust_line(&implicit_snippet).as_deref(),
             Some("PointerCoercion::Unsize")
+        );
+        // Dyn-to-dyn rebinding (`if` expression or identifier copy) must NOT
+        // falsely classify as `PointerCoercion::Unsize`.
+        let if_dyn_snippet = extract_rust_span_snippet(wrapped_src, "src/lib.rs:5:5: 5:95")
+            .expect("if dyn snippet");
+        assert_eq!(
+            extract_failing_construct_hint_from_rust_line(&if_dyn_snippet),
+            None
+        );
+        let rebind_snippet = extract_rust_span_snippet(wrapped_src, "src/lib.rs:6:5: 6:60")
+            .expect("rebind dyn snippet");
+        assert_eq!(
+            extract_failing_construct_hint_from_rust_line(&rebind_snippet),
+            None
         );
     }
 
@@ -15897,18 +15942,40 @@ mod glob_mod {
         f(4u32)
     }
 }
+mod dead_fn_mod {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x + v;
+        f(5u32)
+    }
+}
+mod self_mod {
+    pub mod sub {
+        pub fn run(v: u32) -> u32 {
+            let f = |x: u32| x ^ v;
+            f(6u32)
+        }
+    }
+}
 use dead_mod::other;
+use dead_mod::helper as unused_alias;
 use outer_mod::inner_mod;
+use self_mod::sub::{self};
 use glob_mod::*;
+fn dead_fn() -> u32 {
+    use dead_fn_mod::helper;
+    helper(9u32)
+}
 pub fn root_entry() -> u32 {
-    live_mod::helper(1u32) ^ inner_mod::deep(2u32) ^ globbed(3u32)
+    live_mod::helper(1u32) ^ inner_mod::deep(2u32) ^ globbed(3u32) ^ sub::run(4u32)
 }
 ";
         let pairs: Vec<(String, String)> = [
             ("{closure#0}", "X.live_mod_helper_closure_0"),
             ("{closure#0}", "X.dead_mod_helper_closure_0"),
+            ("{closure#0}", "X.dead_fn_mod_helper_closure_0"),
             ("{closure#0}", "X.outer_mod_inner_mod_deep_closure_0"),
             ("{closure#0}", "X.glob_mod_globbed_closure_0"),
+            ("{closure#0}", "X.self_mod_sub_run_closure_0"),
         ]
         .iter()
         .map(|(s, suf)| ((*s).to_string(), (*suf).to_string()))
@@ -15926,6 +15993,7 @@ pub fn root_entry() -> u32 {
                 "X.live_mod_helper_closure_0",
                 "X.outer_mod_inner_mod_deep_closure_0",
                 "X.glob_mod_globbed_closure_0",
+                "X.self_mod_sub_run_closure_0",
             ],
         );
     }

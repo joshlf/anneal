@@ -4524,12 +4524,13 @@ def _extract_failing_construct_hint_from_mir(
     return None
 
 
-def _extract_fault_span_text(finding: dict[str, Any]) -> str:
-    """Returns the source snippet covering `anneal_span` (`start_line..=end_line`,
-    clamped to 6 lines and joined by spaces) so `prettyplease`-wrapped multi-line
-    expressions like `let x: &dyn T = &rec\\n as &dyn T;` are preserved intact.
-    Falls back to reading `repro_path` when inline `mutant_source` is absent,
-    and finally to `extract_fault_line_text(finding)`."""
+def _extract_raw_anneal_span_text(finding: dict[str, Any]) -> str:
+    """Returns the raw source snippet covering `anneal_span` (`start_line..=end_line`,
+    clamped to 6 lines and joined by spaces) without remapping preamble macro/helper
+    lines back to the candidate call site, so both `prettyplease`-wrapped multi-line
+    expressions (`let x: &dyn T = &rec\\n as &dyn T;`) and faulting operations inside
+    preamble macros (`copy_nonoverlapping(...)` inside `write_bytes!`) are preserved.
+    Falls back to reading `repro_path` when inline `mutant_source` is absent."""
     src = finding.get("mutant_source")
     if not isinstance(src, str) or not src:
         repro = finding.get("repro_path")
@@ -4552,12 +4553,6 @@ def _extract_fault_span_text(finding: dict[str, Any]) -> str:
                 start_line = span[1]
                 end_line = min(max(span[3], start_line), start_line + 5)
                 if 1 <= start_line <= num_lines:
-                    if end_line == start_line:
-                        cand_start = _candidate_fn_start_line_no(src_lines, finding)
-                        resolved = _resolve_preamble_fault_line_no(
-                            src_lines, start_line, cand_start
-                        )
-                        return src_lines[resolved - 1]
                     chunk = [
                         line.strip()
                         for line in src_lines[start_line - 1 : min(end_line, num_lines)]
@@ -4565,7 +4560,18 @@ def _extract_fault_span_text(finding: dict[str, Any]) -> str:
                     ]
                     if chunk:
                         return " ".join(chunk)
-    return extract_fault_line_text(finding)
+    return ""
+
+
+def _has_implicit_dyn_ref_rhs(stripped: str) -> bool:
+    if not re.search(r":\s*(?:&(?:mut\s+)?|\*(?:const|mut)\s+)dyn\b", stripped):
+        return False
+    if "=" not in stripped:
+        return False
+    rhs = stripped.split("=", 1)[1].lstrip()
+    # Avoid false positives on `==` comparisons and dyn-to-dyn rebindings like
+    # `let __vt_dyn: &dyn Trait = if cond { a } else { b };` or `= other_dyn;`.
+    return not rhs.startswith("=") and rhs.startswith("&")
 
 
 def _extract_failing_construct_hint_from_fault_line(fault_line: str) -> str | None:
@@ -4573,8 +4579,7 @@ def _extract_failing_construct_hint_from_fault_line(fault_line: str) -> str | No
         return None
     stripped = fault_line.strip()
     if re.search(r"\bas\s+(?:&(?:mut\s+)?|\*(?:const|mut)\s+)dyn\b", stripped) or (
-        "=" in stripped
-        and re.search(r":\s*(?:&(?:mut\s+)?|\*(?:const|mut)\s+)dyn\b", stripped)
+        _has_implicit_dyn_ref_rhs(stripped)
     ):
         return "PointerCoercion::Unsize"
     if (
@@ -4598,8 +4603,9 @@ def extract_failing_construct_hint(finding: dict[str, Any]) -> str | None:
     """Extracts a concise diagnostic hint for the failing MIR/Rust construct.
 
     Prefers `finding["failing_construct_hint"]` emitted by `miri-difftest`,
-    falling back to `mir_neighborhood` at `anneal_span` / `batch_anneal_span`
-    and then the Rust fault span/line so legacy findings without the field still
+    falling back to `mir_neighborhood` at `anneal_span` / `batch_anneal_span`,
+    then the raw `anneal_span` source snippet, and finally the resolved fault
+    line (`extract_fault_line_text`) so legacy findings without the field still
     surface concrete construct hints without changing the 3-part fingerprint.
     """
     raw = finding.get("failing_construct_hint")
@@ -4620,8 +4626,12 @@ def extract_failing_construct_hint(finding: dict[str, Any]) -> str | None:
         hint = _extract_failing_construct_hint_from_mir(mir_text, spans)
         if hint is not None:
             return hint
-    fault_text = _extract_fault_span_text(finding)
-    return _extract_failing_construct_hint_from_fault_line(fault_text)
+    raw_span_text = _extract_raw_anneal_span_text(finding)
+    hint = _extract_failing_construct_hint_from_fault_line(raw_span_text)
+    if hint is not None:
+        return hint
+    fault_line = extract_fault_line_text(finding)
+    return _extract_failing_construct_hint_from_fault_line(fault_line)
 
 
 def infer_finding_cause(
@@ -6913,9 +6923,12 @@ def write_oracle_junit_xml(
     elif len(miri_unquarantined) > 0:
         summary_lines = []
         for d in miri_unquarantined:
+            hints = d.failing_construct_hints or (
+                [d.failing_construct_hint] if d.failing_construct_hint else []
+            )
             hint_suffix = (
-                f", construct_hint={','.join(d.failing_construct_hints)}"
-                if d.failing_construct_hints
+                f", construct_hint={','.join(hints)}"
+                if hints
                 else ""
             )
             summary_lines.append(
