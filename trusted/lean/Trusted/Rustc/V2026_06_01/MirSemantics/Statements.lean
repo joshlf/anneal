@@ -3974,12 +3974,14 @@ def copyPtrIsWide? : Nat → RigidTy → Option Bool
 
 /--
 Validate that a tuple's `fieldLayouts` and `offsets` match its field types `ks`
-pairwise, with each field well-formed, aligned to at most `tupleAlign`, and
-contained within `tupleSize` bytes (helper for `copyLayoutMatchesRigidTyAux`).
+pairwise, with each field well-formed, placed at an offset that is a multiple of
+its own alignment, aligned to at most `tupleAlign`, and contained within
+`tupleSize` bytes (helper for `copyLayoutMatchesRigidTyAux`).
 
 Reference (The Rust Reference 1.98.0, "The Rust representation"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.repr.rust.layout>
 
+> "The fields are properly aligned."
 > "The alignment of the type is at least the maximum alignment of its fields."
 -/
 def copyTupleFieldLayoutsMatch
@@ -3996,7 +3998,8 @@ def copyTupleFieldLayoutsMatch
         Bool.and (TypeLayout.isWellFormed fl)
           (Bool.and (check fIdx k fl)
             (Bool.and (Nat.ble fl.align.bytes tupleAlign)
-              (Nat.ble (Nat.add off.bytes fl.size.bytes) tupleSize)))
+              (Bool.and (Nat.beq (Nat.mod off.bytes fl.align.bytes) 0)
+                (Nat.ble (Nat.add off.bytes fl.size.bytes) tupleSize))))
       with
       | false => false
       | true => copyTupleFieldLayoutsMatch check layouts tupleSize tupleAlign ks' fIdxs' offs'
@@ -4026,7 +4029,9 @@ Fuel-bounded structural consistency check between a compiler-supplied layout `l`
 repr, `.primitive` fields) or wide (`2 * ptrBytes`, scalar-pair-pointer repr)
 pointers with alignment at most `ptrBytes`, arrays with `count = N`,
 `size = stride * N`, and element-layout consistency (validating `fieldLayouts`
-recursively when present and primitive element strides otherwise), tuples with
+recursively when present and primitive element strides otherwise; in every case
+the stride, which is the element size, must be a multiple of the array's
+alignment, which is the element alignment), tuples with
 one offset per field and pairwise field-layout / alignment / size consistency,
 ADT/closure plausibility (`copyLayoutValidForResolvedAdt`), and — for compound
 types — no generic placeholder (`copyLayoutHasPlaceholder`) and no truncated
@@ -4101,7 +4106,8 @@ def copyLayoutMatchesRigidTyAux :
           | _ => false
         Bool.and compoundOk
           (Bool.and elemOk
-            (Bool.and (Nat.beq count n) (Nat.beq l.size.bytes (Nat.mul stride.bytes n))))
+            (Bool.and (Size.isMultipleOfAlign stride l.align)
+              (Bool.and (Nat.beq count n) (Nat.beq l.size.bytes (Nat.mul stride.bytes n)))))
       | _ => false
     | .tuple ks =>
       match ks with

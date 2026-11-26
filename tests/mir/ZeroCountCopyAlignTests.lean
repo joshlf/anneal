@@ -771,6 +771,31 @@ theorem u8_tuple_cannot_hijack_u64_tuple_unresolved :
 theorem valid_u64_u8_tuple_resolves :
     resolveCopyElemLayout D64_tupHijack L64_tupHijack (cp 2) (cp 2) = .ok 16 8 := rfl
 
+/-! ### A2 soundness regressions (field offsets and array strides) -/
+
+/-- A `(u64, u8)` layout placing the `u64` field at the misaligned offset `1` ("The fields are
+properly aligned") and a `[Foo; 2]` layout whose stride `12` is not a multiple of its
+alignment `8` are both rejected (fail closed), instead of resolving `(16, 8)` / `(24, 8)`. -/
+def L64_a2 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 8 8 .primitive
+      , lay 1 1 .primitive
+      , lay 16 8 (.arbitrary [⟨1⟩, ⟨0⟩] [1, 0]) [1, 2]
+      , ptrLay 8 3
+      , lay 24 8 (.array ⟨12⟩ 2)
+      , ptrLay 8 5 ] }
+def D64_a2 : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.tuple [.uint .u64, .uint .u8])) 4
+  , decl (ptrK (.array (.adt "zc::Foo" []) 2)) 6 ]
+
+theorem misaligned_tuple_field_offset_rejected :
+    resolveCopyElemLayout D64_a2 L64_a2 (cp 1) (cp 1) = .unsupported := rfl
+theorem array_stride_not_multiple_of_align_rejected :
+    resolveCopyElemLayout D64_a2 L64_a2 (cp 2) (cp 2) = .unsupported := rfl
+
 end Anneal.Tests.ZeroCountCopyAlign.V06
 
 /-! ## §2. `V2026_08_01` (same fixtures; `Value` has no `uninit`) -/
@@ -1495,6 +1520,31 @@ theorem u8_tuple_cannot_hijack_u64_tuple_unresolved :
     resolveCopyElemLayout D64_tupHijack L64_tupHijack (cp 1) (cp 1) = .unsupported := rfl
 theorem valid_u64_u8_tuple_resolves :
     resolveCopyElemLayout D64_tupHijack L64_tupHijack (cp 2) (cp 2) = .ok 16 8 := rfl
+
+/-! ### A2 soundness regressions (field offsets and array strides) -/
+
+/-- A `(u64, u8)` layout placing the `u64` field at the misaligned offset `1` ("The fields are
+properly aligned") and a `[Foo; 2]` layout whose stride `12` is not a multiple of its
+alignment `8` are both rejected (fail closed), instead of resolving `(16, 8)` / `(24, 8)`. -/
+def L64_a2 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 8 8 .primitive
+      , lay 1 1 .primitive
+      , lay 16 8 (.arbitrary [⟨1⟩, ⟨0⟩] [1, 0]) [1, 2]
+      , ptrLay 8 3
+      , lay 24 8 (.array ⟨12⟩ 2)
+      , ptrLay 8 5 ] }
+def D64_a2 : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.tuple [.uint .u64, .uint .u8])) 4
+  , decl (ptrK (.array (.adt "zc::Foo" []) 2)) 6 ]
+
+theorem misaligned_tuple_field_offset_rejected :
+    resolveCopyElemLayout D64_a2 L64_a2 (cp 1) (cp 1) = .unsupported := rfl
+theorem array_stride_not_multiple_of_align_rejected :
+    resolveCopyElemLayout D64_a2 L64_a2 (cp 2) (cp 2) = .unsupported := rfl
 
 end Anneal.Tests.ZeroCountCopyAlign.V08
 
@@ -2437,6 +2487,14 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.valid_u64_u8_tuple_resolves
 
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.misaligned_tuple_field_offset_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.misaligned_tuple_field_offset_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.array_stride_not_multiple_of_align_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.array_stride_not_multiple_of_align_rejected
+
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.unit0_cannot_hijack_unresolved_adt_decl' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.unit0_cannot_hijack_unresolved_adt_decl
@@ -2470,3 +2528,11 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.valid_u64_u8_tuple_resolves' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.valid_u64_u8_tuple_resolves
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.misaligned_tuple_field_offset_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.misaligned_tuple_field_offset_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.array_stride_not_multiple_of_align_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.array_stride_not_multiple_of_align_rejected
