@@ -9587,6 +9587,55 @@ theorem evalUnaryNot_rvCS (sc : ScalarInt) (optTy : Option Ty) (locals : List Lo
     RvCS mem.callStack (evalUnaryNot sc optTy locals mem) :=
   (evalUnaryNot_rvCtxCS [] none [] sc optTy locals mem).2
 
+private theorem evalFloatUnaryNeg_rvCtxCS
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (sc : ScalarInt) (optTy : Option Ty) (locals : List LocalSlot)
+    (mem : Memory) :
+    RvCtxCS c ac ti mem.callStack
+      (evalFloatUnaryNeg sc optTy locals (Memory.withCalleeCtx c ac ti mem))
+      (evalFloatUnaryNeg sc optTy locals mem) := by
+  unfold evalFloatUnaryNeg
+  repeat' (first
+    | with_reducible (first | exact rvCtxCS_ub | exact rvCtxCS_unsupported | exact rvCtxCS_ok rfl rfl)
+    | split)
+
+private theorem evalFloatScalarBinOp_rvCtxCS
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (op : BinOp) (lhs rhs : ScalarInt) (lhsTy? rhsTy? : Option Ty)
+    (locals : List LocalSlot) (mem : Memory) :
+    RvCtxCS c ac ti mem.callStack
+      (evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals (Memory.withCalleeCtx c ac ti mem))
+      (evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals mem) := by
+  dsimp only [evalFloatScalarBinOp]
+  cases lhsTy? with
+  | none => exact rvCtxCS_unsupported
+  | some lTy =>
+    cases rhsTy? with
+    | none => exact rvCtxCS_unsupported
+    | some rTy =>
+      dsimp only
+      cases ieeeFormatOfTy? lTy with
+      | none => exact rvCtxCS_unsupported
+      | some fL =>
+        cases ieeeFormatOfTy? rTy with
+        | none => exact rvCtxCS_unsupported
+        | some fR =>
+          cases fL <;> cases fR <;> dsimp only
+          · cases (lhs.sizeBytes.beq IeeeFormat.binary32.byteWidth && rhs.sizeBytes.beq IeeeFormat.binary32.byteWidth) with
+            | false => exact rvCtxCS_unsupported
+            | true =>
+              cases evalFloatBinOp op .binary32 lhs.bits rhs.bits with
+              | none => exact rvCtxCS_unsupported
+              | some _ => exact rvCtxCS_ok rfl rfl
+          · exact rvCtxCS_unsupported
+          · exact rvCtxCS_unsupported
+          · cases (lhs.sizeBytes.beq IeeeFormat.binary64.byteWidth && rhs.sizeBytes.beq IeeeFormat.binary64.byteWidth) with
+            | false => exact rvCtxCS_unsupported
+            | true =>
+              cases evalFloatBinOp op .binary64 lhs.bits rhs.bits with
+              | none => exact rvCtxCS_unsupported
+              | some _ => exact rvCtxCS_ok rfl rfl
+
 private theorem evalRvalueRefDeref_rvCtxCS
     (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (borrowKind : BorrowKind) (place : Place)
@@ -10155,8 +10204,13 @@ private theorem evalRvalue_rvCtxCS
                 locals₂ mem localDecls layouts lhsOp lhsSc rhsSc,
                 evalScalarPtrOffsetBinOp_rvCS locals₂ mem localDecls layouts lhsOp lhsSc rhsSc⟩
             | _ =>
-              exact ⟨evalScalarBinOp_withCalleeCtx c ac ti _ lhsSc rhsSc locals₂ mem _,
-                evalScalarBinOp_rvCS _ lhsSc rhsSc locals₂ mem _⟩
+              cases Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                  (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+              | true =>
+                exact evalFloatScalarBinOp_rvCtxCS c ac ti _ lhsSc rhsSc _ _ locals₂ mem
+              | false =>
+                exact ⟨evalScalarBinOp_withCalleeCtx c ac ti _ lhsSc rhsSc locals₂ mem _,
+                  evalScalarBinOp_rvCS _ lhsSc rhsSc locals₂ mem _⟩
           | ptr ptrVal sz =>
             cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
             | false => exact rvCtxCS_unsupported
@@ -10232,6 +10286,7 @@ private theorem evalRvalue_rvCtxCS
       dsimp only [evalRvalue, Memory.withCalleeCtx]
       repeat' (first
         | with_reducible (first | exact rvCtxCS_ub | exact rvCtxCS_unsupported | exact rvCtxCS_ok rfl rfl)
+        | exact evalFloatUnaryNeg_rvCtxCS c ac ti ..
         | split)
     | ptrMetadata =>
       exact ⟨(evalUnaryPtrMetadata_rvCtxCS c ac ti locals op mem localDecls layouts).1,

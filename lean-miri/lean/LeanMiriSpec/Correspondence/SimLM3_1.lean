@@ -12608,11 +12608,20 @@ theorem step_rawPtr_cmp_scalar_lm3_1_simulation
           .ok (.scalar (boolToScalar bRes)) s₂.frame.locals s.memory := by
         have hd₁ : decodeBitsInt false sc₁.sizeBytes sc₁.bits = (sc₁.bits : Int) := rfl
         have hd₂ : decodeBitsInt false sc₁.sizeBytes sc₂.bits = (sc₂.bits : Int) := rfl
+        have hop_nf_l : isFloatOptTy (operandTy body.localDecls body.layouts lhsOp) = false := by
+          rcases hopKind₁ with rfl | rfl <;>
+          · dsimp only [lhsOp]; unfold operandTy placeTy; dsimp only []
+            rw [hdecl_lhs]; dsimp only [resolveProjectedTy, isFloatOptTy, isFloatTy]; rw [hlhs_ty]
+        have hop_nf_r : isFloatOptTy (operandTy body.localDecls body.layouts rhsOp) = false := by
+          rcases hopKind₂ with rfl | rfl <;>
+          · dsimp only [rhsOp]; unfold operandTy placeTy; dsimp only []
+            rw [hdecl_rhs]; dsimp only [resolveProjectedTy, isFloatOptTy, isFloatTy]; rw [hrhs_ty]
         unfold evalRvalue; rw [hstate.callStack_nil]; dsimp only []
         rw [ha_l]; dsimp only []; rw [ha_r]; dsimp only []
         have hbop' := hbop
         rcases hbop' with rfl | rfl | rfl | rfl | rfl | rfl <;>
         · dsimp only [bRes]
+          rw [hop_nf_l, hop_nf_r]; dsimp only [Bool.or]
           rw [hop_signed, evalScalarBinOp_rel_eq hbop hrel₁ hrel₂ (hsz₁.trans hsz₂.symm), hd₁, hd₂]
       have hm_w : Miri.Interpreter.Step.evalStatement
           (annealStepHooks body.localDecls body.layouts) ()

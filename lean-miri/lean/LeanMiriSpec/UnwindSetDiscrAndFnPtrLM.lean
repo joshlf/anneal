@@ -1486,7 +1486,7 @@ theorem step_cast_subtype_scalar_and_ub_simulation {body : CapturedMir} {s : Mac
                 rw [hkD, hd]; cases ut <;> (simp [UintTy.byteWidth, UintTy.bitWidth, intCastTargetBytes] at hsz_ut ⊢; exact hsz_ut.symm)
               have hdec_i := decodeValueFromBytes_encode_int_ep2 emptyLayoutTable rTargetTy sc hint_d hsc_rel.validBytes hsc_rel.canonical
               rcases rTargetTy with ⟨dk, dl⟩; rw [hd] at hkD; dsimp at hkD; subst hkD
-              unfold decodeTypedValueFromBytes; dsimp [defaultCodecFuel, normalizeCodecTy]; rw [hbs_noprov]; exact hdec_i
+              cases ut <;> (unfold decodeTypedValueFromBytes; dsimp [defaultCodecFuel, normalizeCodecTy]; rw [hbs_noprov]; exact hdec_i)
             · have hv_ty : annealValidateScalarForTyId (translateTy dstDecl.ty emptyLayoutTable).ty (.fromScalarInt msc) = true := by
                 cases ut <;> (rw [hd]; rfl)
               unfold annealValidateTransmutedScalar; rw [hv_ty]; simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
@@ -1498,7 +1498,7 @@ theorem step_cast_subtype_scalar_and_ub_simulation {body : CapturedMir} {s : Mac
                 rw [hkD, hd]; cases it <;> (simp [IntTy.byteWidth, IntTy.bitWidth, intCastTargetBytes] at hsz_it ⊢; exact hsz_it.symm)
               have hdec_i := decodeValueFromBytes_encode_int_ep2 emptyLayoutTable rTargetTy sc hint_d hsc_rel.validBytes hsc_rel.canonical
               rcases rTargetTy with ⟨dk, dl⟩; rw [hd] at hkD; dsimp at hkD; subst hkD
-              unfold decodeTypedValueFromBytes; dsimp [defaultCodecFuel, normalizeCodecTy]; rw [hbs_noprov]; exact hdec_i
+              cases it <;> (unfold decodeTypedValueFromBytes; dsimp [defaultCodecFuel, normalizeCodecTy]; rw [hbs_noprov]; exact hdec_i)
             · have hv_ty : annealValidateScalarForTyId (translateTy dstDecl.ty emptyLayoutTable).ty (.fromScalarInt msc) = true := by
                 cases it <;> (rw [hd]; rfl)
               unfold annealValidateTransmutedScalar; rw [hv_ty]; simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]

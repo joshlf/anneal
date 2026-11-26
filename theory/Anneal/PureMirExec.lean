@@ -1379,6 +1379,48 @@ private theorem evalFloatCastRvalue_ne_nil
     | none => exact rok_unsup
     | some v' => exact rok_ok h
 
+private theorem evalFloatUnaryNeg_ne_nil
+    {sc : ScalarInt} {optTy : Option Ty} {locals : List LocalSlot} {mem : Memory}
+    (h : mem.borrows ≠ []) :
+    rvalOkBorrowsNeNil (evalFloatUnaryNeg sc optTy locals mem) := by
+  unfold evalFloatUnaryNeg
+  repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
+
+private theorem evalFloatScalarBinOp_ne_nil
+    {op : BinOp} {lhs rhs : ScalarInt} {lhsTy? rhsTy? : Option Ty}
+    {locals : List LocalSlot} {mem : Memory}
+    (h : mem.borrows ≠ []) :
+    rvalOkBorrowsNeNil (evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? locals mem) := by
+  unfold evalFloatScalarBinOp
+  cases lhsTy? with
+  | none => exact rok_unsup
+  | some lTy =>
+    cases rhsTy? with
+    | none => exact rok_unsup
+    | some rTy =>
+      dsimp only
+      cases ieeeFormatOfTy? lTy with
+      | none => exact rok_unsup
+      | some fL =>
+        cases ieeeFormatOfTy? rTy with
+        | none => exact rok_unsup
+        | some fR =>
+          cases fL <;> cases fR <;> dsimp only
+          · cases (lhs.sizeBytes.beq IeeeFormat.binary32.byteWidth && rhs.sizeBytes.beq IeeeFormat.binary32.byteWidth) with
+            | false => exact rok_unsup
+            | true =>
+              cases evalFloatBinOp op .binary32 lhs.bits rhs.bits with
+              | none => exact rok_unsup
+              | some _ => exact rok_ok h
+          · exact rok_unsup
+          · exact rok_unsup
+          · cases (lhs.sizeBytes.beq IeeeFormat.binary64.byteWidth && rhs.sizeBytes.beq IeeeFormat.binary64.byteWidth) with
+            | false => exact rok_unsup
+            | true =>
+              cases evalFloatBinOp op .binary64 lhs.bits rhs.bits with
+              | none => exact rok_unsup
+              | some _ => exact rok_ok h
+
 private theorem evalRvalue_binaryOp_ne_nil
     {locals : List LocalSlot} {op : BinOp} {lhsOp rhsOp : Operand}
     {mem : Memory} {ld : List LocalDecl} {ly : LayoutTable}
@@ -1399,8 +1441,12 @@ private theorem evalRvalue_binaryOp_ne_nil
       | scalar ls =>
         cases rv2 with
         | scalar rs =>
-          cases op <;> dsimp only
-          all_goals first | exact evalScalarBinOp_ne_nil h | exact evalScalarPtrOffsetBinOp_ne_nil h
+          cases op with
+          | offset => exact evalScalarPtrOffsetBinOp_ne_nil h
+          | _ =>
+            cases Bool.or (isFloatOptTy (operandTy ld ly lhsOp)) (isFloatOptTy (operandTy ld ly rhsOp)) with
+            | true => exact evalFloatScalarBinOp_ne_nil h
+            | false => exact evalScalarBinOp_ne_nil h
         | ptr pv sz =>
           dsimp only
           repeat' (first | exact rok_ub | exact rok_unsup | exact evalScalarBinOp_ne_nil h | split)
@@ -1488,7 +1534,7 @@ theorem evalRvalue_ok_borrows_ne_nil
         | _ => exact rok_unsup
     | neg =>
       dsimp only [evalRvalue]
-      repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
+      repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | exact evalFloatUnaryNeg_ne_nil h | split)
     | ptrMetadata =>
       dsimp only [evalRvalue, evalUnaryPtrMetadata]
       repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
@@ -2288,9 +2334,11 @@ private theorem evalRvalue_binaryOp_cons_nil_rnp
   intro m0
   have h_sb := fun o ls rs l2 isS =>
     evalScalarBinOp_pushBaseStack calleeBody (bHd :: bTl) o ls rs l2 m0 isS
+  have h_fsb := fun o ls rs lt rt l2 =>
+    evalFloatScalarBinOp_pushBaseStack calleeBody (bHd :: bTl) o ls rs lt rt l2 m0
   have h_spo := fun l2 ls rs =>
     evalScalarPtrOffsetBinOp_pushBaseStack calleeBody (bHd :: bTl) l2 m0 localDecls layouts lhsOp ls rs
-  dsimp only [m0, Memory.pushBaseStack] at h_sb h_spo
+  dsimp only [m0, Memory.pushBaseStack] at h_sb h_fsb h_spo
   dsimp only [m0, evalRvalue, Memory.pushBaseStack]
   try simp only [evalOperand_nil_borrows_callStack]
   cases evalOperand locals lhsOp [] gl layouts cl localDecls [] with
@@ -2307,10 +2355,17 @@ private theorem evalRvalue_binaryOp_cons_nil_rnp
       | scalar lhsSc =>
         cases rhsVal with
         | scalar rhsSc =>
-          cases op <;> dsimp only
-          all_goals
+          cases op with
+          | offset =>
+            dsimp only
             try simp only [evalOperand_nil_borrows_callStack]
-            first | exact rnp_of_eq (h_sb ..) | exact rnp_of_eq (h_spo ..)
+            exact rnp_of_eq (h_spo ..)
+          | _ =>
+            dsimp only
+            cases Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+            | true => exact rnp_of_eq (h_fsb ..)
+            | false => exact rnp_of_eq (h_sb ..)
         | ptr ptrVal sz =>
           try simp only [ptrAddressScalar?_nil_borrows]
           repeat' (first | exact rnp_ub | exact rnp_unsup | exact rnp_of_eq (h_sb ..) | split)
@@ -2521,7 +2576,10 @@ theorem evalRvalue_borrows_nil_pushBaseStack
       | neg =>
         dsimp only [m0, evalRvalue, Memory.pushBaseStack]
         try simp only [evalOperand_nil_borrows_callStack]
-        repeat' (first | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | split)
+        repeat' (first
+          | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl
+          | exact rnp_of_eq (evalFloatUnaryNeg_pushBaseStack calleeBody (bHd :: bTl) _ _ _ m0)
+          | split)
       | ptrMetadata =>
         dsimp only [m0, evalRvalue, evalUnaryPtrMetadata, Memory.pushBaseStack]
         try simp only [evalOperand_nil_borrows_callStack]

@@ -50,6 +50,11 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   preferredNaNBits roundRatioTiesToEven FloatIntTarget FloatPtrWidth clampInt
   truncRatio floatToIntValue encodeTwosComplement evalFloatToIntSaturating
   intValueOfBits evalIntToFloatRoundTiesToEven evalFloatToFloatRoundTiesToEven
+  isNaNBits isQuietNaNBits isSignalingNaNBits evalFloatNeg evalFloatAbs
+  signedNum evalFloatPartialCompare evalFloatCmp negateFloatKind exactSumFloat
+  evalFloatArithBase FloatArithMode nanChoicesQuieted nanChoicesSignaling
+  expandNanSigns nanChoices natListMem isAdmissibleQuietNaN evalFloatBinOp
+  EvalFloatBinOpRel Ptr2IntTransmutePolicy
   ScalarVal AbstractByte mergeByteProvenance
   encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBytes
   decodeScalarBytes replicateUninitBytes takeAbstractBytes dropAbstractBytes
@@ -93,6 +98,11 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue
   writePlaceValue derefWriteTreeUB layoutValidForAdt layoutValidForResolvedAdt
   resolveByteCastSrcTyAndSize evalByteCast
+  policyRejectsProv stripAbstractByteProv stripAbstractBytesProv
+  valueHasProv valueListHasProv scalarLayoutIsPointer backendReprHasPointer
+  decodeTypedKindByteSize RichAdtSpec lookupRichAdtSpec decodeRichFieldSpecs
+  findRichTaggedVariant decodePtrBytesRichNoForge decodeTypedValueRichWithPolicy
+  richTyByteSize evalByteCastRichWithPolicy
   evalNullaryOp evalUseRvalue evalShallowInitBox evalWrapUnsafeBinder
   unsizeArrayToSliceSpec? evalUnsizeCoercion deriveStackElemThinPtr
   resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze placeIsFreeze
@@ -108,7 +118,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalGlobalThinPtrDerefBorrow evalPlaceDiscriminant
   activeFrameTargetLocals? ieeeFormatOfTy? floatIntTargetOfTy?
   floatPtrWidthOfLayouts evalFloatCast evalFloatCastRvalue
-  evalRvalue evalRvalueWithMemory advanceStmt
+  isFloatTy isFloatOptTy evalFloatUnaryNeg evalFloatScalarBinOp
+  evalRvalue evalRvalueWithMemory EvalRvalueFloatRel advanceStmt
   normalizeSubsliceProjectionsAux normalizeSubsliceProjections
   projectionsOverlap truncateTyProjAtUnion resolveBorrowWriteLocalProj
   resolveDerefBorrowWriteFullProj derefWriteUnionProtectorUB

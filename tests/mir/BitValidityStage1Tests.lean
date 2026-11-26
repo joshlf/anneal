@@ -274,12 +274,15 @@ theorem char_surrogate_rejected :
   (decodeScalarLayoutBytesNoForge_charLayout_iff false 0xD800 (by decide)).2 (by decide)
     (by decide)
 
-theorem ordering3_stage1_accepts_tag_provenance :
+theorem ordering3_stage1_rejects_tag_provenance :
     decodeTypedValueFromBytes defaultCodecFuel stage1Layouts
         { kind := .adt "Ordering3" [], layoutIdx := 5 }
-        [.init (UInt8.ofNat 1) (some (7, 0))] =
+        [.init (UInt8.ofNat 1) (some (7, 0))] = none ∧
+    decodeTypedValueFromBytes defaultCodecFuel stage1Layouts
+        { kind := .adt "Ordering3" [], layoutIdx := 5 }
+        [.init (UInt8.ofNat 1) (some (7, 0))] .stripProvenance =
       some (.aggregate 1 []) := by
-  rfl
+  exact ⟨rfl, rfl⟩
 
 /-- Every in-range tag of `Ordering3` indexes a fieldless variant. -/
 theorem ordering3_fieldless :
