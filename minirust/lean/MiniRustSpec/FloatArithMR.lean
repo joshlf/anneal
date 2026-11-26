@@ -15,25 +15,12 @@ import MiniRustSpec.FloatCastMR
 # IEEE-754 Float Arithmetic, Comparisons, Negation, and `Ptr2IntTransmutePolicy` at `MiniRustSpec`
 Episode 2 Shard B correspondence module pairing Anneal's trusted MIR semantics (`Trusted.Rustc.V2026_06_01.MirSemantics` + `Anneal.Mir.IeeeFloatArith`) against pinned MiniRust (`MiniRustSpec.{Gen,Interp,Correspondence.Translate}`) across `BasicMemory<x86_64>` (`Mach`) and `TreeBorrowsMemory<x86_64>` (`MachTB` with `MachTB.wfLive`):
 - **§1**: Two-sided fail-closed translation boundary on float unary/binary ops (including no-float-local comparisons and arbitrary projected float places `*p`, `_s.0`, `_a[i]`, `_a[0]`) across `translate*`, `statementOk*`, `inFragment*`, and `progInFragment*`.
-- **§2**: IEEE-754 bit-carrier bridges (`UnOp.neg ↔ BitXor` sign-bit flip, `Bool` comparisons, and universal `EvalFloatBinOpRel` / `nanChoices` carriers, including universal `f64` `Mach` + `MachTB.wfLive` carrier execution and its `f32` companion over the zero-extended 64-bit carrier) across `BM`, `TBM`, `Mach`, and `MachTB`.
+- **§2**: IEEE-754 bit-carrier bridges (`UnOp.neg ↔ BitXor` sign-bit flip, `Bool` comparisons, and universal `EvalFloatBinOpRel` / `nanChoices` carriers, including universal `f64` 8-byte AND native 4-byte `f32` `Mach` + `MachTB.wfLive` carrier execution) across `BM`, `TBM`, `Mach`, and `MachTB`.
 - **§3**: Mode-parametric `Ptr2IntTransmutePolicy` (`.strictUcg630Ub` vs. `.stripProvenance`) correspondence on scalars, composites (`(*const u8, usize)` & `struct Mixed`), provenance-free equivalence, shared no-forgery (`usize → &u8`), and uninit-byte UB across `Mach` & `MachTB`.
 - **§4**: Shared concrete witnesses `W1–W6` and complete `#guard_msgs` `#print axioms` audit covering 100% of public theorems (`[propext, Quot.sound]` / `[propext, Classical.choice, Quot.sound]`). -/
 namespace MiniRustSpec.FloatArithMR
-open Trusted.Effect
-open Trusted.ITree
-open Trusted.Rustc.V2026_06_01
-open Trusted.Rustc.V2026_06_01.MirAst
-open Trusted.Rustc.V2026_06_01.MirSemantics
-open Trusted.Rustc.V2026_06_01.Layout
-open MiniRustSpec
-open MiniRustSpec.LibSpecr
-open MiniRustSpec.Interp
-open MiniRustSpec.Correspondence
-open MiniRustSpec.Correspondence.Witness
-open MiniRustSpec.Correspondence.PointerWitness
-open MiniRustSpec.Correspondence.RefWitness
-open MiniRustSpec.Correspondence.FloatCastMR
-open Anneal.Mir.IeeeFloatArith
+open Trusted.Effect Trusted.ITree Trusted.Rustc.V2026_06_01 Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout Anneal.Mir.IeeeFloatArith
+open MiniRustSpec MiniRustSpec.LibSpecr MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.Witness MiniRustSpec.Correspondence.PointerWitness MiniRustSpec.Correspondence.RefWitness MiniRustSpec.Correspondence.FloatCastMR
 /-! ## §0. Shared Types, Policy Layouts, Builders, and `Classical.choice`-Free Polymorphic Codecs -/
 /-- A typed floating-point constant operand of bit pattern `bits` and byte width `sz`. -/
 def faFloatConst (ty : Ty) (bits sz : Nat) : Operand :=
@@ -1136,19 +1123,11 @@ theorem fa_no_float_local_cmp_two_sided_boundary :
     (∃ mem, ReachesRet (mirCallTree faConstCmpQNaNBody []) []
       (.normal (.scalar (boolToScalar false), mem))) ∧
     MirNoUBTree (mirCallTree faConstCmpQNaNBody []) := by
-  have h1 := fa_no_float_local_cmp_helper faConstCmpOneNegZeroBody 0x3F800000 0x80000000
-    (by rfl)
-  have h2 := fa_no_float_local_cmp_helper faConstCmpSignedZerosBody 0x80000000 0x00000000
-    (by rfl)
-  have h3 := fa_no_float_local_cmp_helper faConstCmpQNaNBody 0x7FC00000 0x7FC00000
-    (by rfl)
-  exact ⟨rfl, rfl, rfl, h1, h2, h3,
-    ⟨_, runA_sound faConstCmpOneNegZeroBody 10 _ _ _ rfl⟩,
-    runA_noUB faConstCmpOneNegZeroBody 10 _ _ _ rfl,
-    ⟨_, runA_sound faConstCmpSignedZerosBody 10 _ _ _ rfl⟩,
-    runA_noUB faConstCmpSignedZerosBody 10 _ _ _ rfl,
-    ⟨_, runA_sound faConstCmpQNaNBody 10 _ _ _ rfl⟩,
-    runA_noUB faConstCmpQNaNBody 10 _ _ _ rfl⟩
+  have h1 := fa_no_float_local_cmp_helper faConstCmpOneNegZeroBody 0x3F800000 0x80000000 rfl
+  have h2 := fa_no_float_local_cmp_helper faConstCmpSignedZerosBody 0x80000000 0x00000000 rfl
+  have h3 := fa_no_float_local_cmp_helper faConstCmpQNaNBody 0x7FC00000 0x7FC00000 rfl
+  exact ⟨rfl, rfl, rfl, h1, h2, h3, ⟨_, runA_sound _ 10 _ _ _ rfl⟩, runA_noUB _ 10 _ _ _ rfl,
+    ⟨_, runA_sound _ 10 _ _ _ rfl⟩, runA_noUB _ 10 _ _ _ rfl, ⟨_, runA_sound _ 10 _ _ _ rfl⟩, runA_noUB _ 10 _ _ _ rfl⟩
 /-- **Anneal's side of the §1 boundary**: 1. `f32`/`f64` `UnOp.neg`, `add`, `sub`, `mul`, `div`, `rem`, and `eq..ge` execute cleanly free of UB in Anneal (`mirCallTree`, `MirNoUBTree`), while MiniRust rejects every one of these bodies; 2. `f16` `add`, `f128` `neg`, and non-float `BinOp`s (`bitXor`, `shl`) on `f32` fail closed with `.unsupported` (and `EvalRvalueFloatRel` admits `.unsupported` in BOTH modes!); 3. Reading an uninitialized `f32` local in `neg` or `add` faults with `.ub` (`faultsA = true`, `¬ MirNoUBTree`, and `EvalRvalueFloatRel` admits `.ub` in BOTH modes!). -/
 theorem fa_anneal_float_ops_and_fail_closed_boundary :
     (∃ mem, ReachesRet (mirCallTree faF32NegBody [.scalar ⟨0x3F800000, 4⟩]) []
@@ -1194,25 +1173,14 @@ theorem fa_anneal_float_ops_and_fail_closed_boundary :
       EvalRvalueFloatRel mode policy [.init (.scalar ⟨0x3F800000, 4⟩), .uninit]
         (.binaryOp .add (.copy (local_ 0)) (.copy (local_ 1)))
         emptyMemory [fcDecl fcF32Ty, fcDecl fcF32Ty] fcLayouts .ub) := by
-  refine ⟨⟨_, runA_sound _ 10 _ _ _ rfl⟩, ⟨_, runA_sound _ 10 _ _ _ rfl⟩,
-    ⟨_, runA_sound _ 10 _ _ _ rfl⟩, ⟨_, runA_sound _ 10 _ _ _ rfl⟩,
-    ⟨_, runA_sound _ 10 _ _ _ rfl⟩, ⟨_, runA_sound _ 10 _ _ _ rfl⟩,
-    ⟨_, runA_sound _ 10 _ _ _ rfl⟩, rfl, rfl, fun mode policy => ⟨?_, ?_⟩,
-    rfl, ?_, rfl, ?_, fun mode policy => ⟨?_, ?_⟩⟩
-  · refine (EvalRvalueFloatRel_unsupported_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;>
-      (intro _ _ h; cases h)
-  · refine (EvalRvalueFloatRel_unsupported_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;>
-      (intro _ _ h; cases h)
-  · obtain ⟨tr, u, hr, hf⟩ := faultsA_sound faUninitFloatNegBody 5
-      (initMachineState faUninitFloatNegBody [.scalar ⟨0, 4⟩]) rfl
-    exact fun hsafe => hsafe tr u hr hf
-  · obtain ⟨tr, u, hr, hf⟩ := faultsA_sound faUninitFloatAddBody 5
-      (initMachineState faUninitFloatAddBody [.scalar ⟨0x3F800000, 4⟩]) rfl
-    exact fun hsafe => hsafe tr u hr hf
-  · refine (EvalRvalueFloatRel_ub_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;>
-      (intro _ _ h; cases h)
-  · refine (EvalRvalueFloatRel_ub_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;>
-      (intro _ _ h; cases h)
+  refine ⟨⟨_, runA_sound _ 10 _ _ _ rfl⟩, ⟨_, runA_sound _ 10 _ _ _ rfl⟩, ⟨_, runA_sound _ 10 _ _ _ rfl⟩, ⟨_, runA_sound _ 10 _ _ _ rfl⟩,
+    ⟨_, runA_sound _ 10 _ _ _ rfl⟩, ⟨_, runA_sound _ 10 _ _ _ rfl⟩, ⟨_, runA_sound _ 10 _ _ _ rfl⟩, rfl, rfl, fun mode policy => ⟨?_, ?_⟩, rfl, ?_, rfl, ?_, fun mode policy => ⟨?_, ?_⟩⟩
+  · refine (EvalRvalueFloatRel_unsupported_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;> (intro _ _ h; cases h)
+  · refine (EvalRvalueFloatRel_unsupported_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;> (intro _ _ h; cases h)
+  · obtain ⟨tr, u, hr, hf⟩ := faultsA_sound faUninitFloatNegBody 5 (initMachineState faUninitFloatNegBody [.scalar ⟨0, 4⟩]) rfl; exact fun hsafe => hsafe tr u hr hf
+  · obtain ⟨tr, u, hr, hf⟩ := faultsA_sound faUninitFloatAddBody 5 (initMachineState faUninitFloatAddBody [.scalar ⟨0x3F800000, 4⟩]) rfl; exact fun hsafe => hsafe tr u hr hf
+  · refine (EvalRvalueFloatRel_ub_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;> (intro _ _ h; cases h)
+  · refine (EvalRvalueFloatRel_ub_iff_evalRvalue mode policy _ _ _ _ _ ?_ ?_).mpr rfl <;> (intro _ _ h; cases h)
 /-! ## §2. IEEE-754 Bit-Carrier Bridges Across `BasicMemory` (`Mach`) & `TreeBorrowsMemory` (`MachTB` + `wfLive`) -/
 private theorem fa_nat_xor_two_pow (k : Nat) :
     ∀ b : Nat, b < 2 ^ (k + 1) →
@@ -1291,29 +1259,23 @@ theorem fa_evalFloatNeg_eq_natXor_f64 (bits : Nat) :
 theorem fa_bitwiseXorBits_two_pow :
     ∀ (k b : Nat), b < 2 ^ (k + 1) →
       bitwiseXorBits (k + 1) b (2 ^ k) = if 2 ^ k ≤ b then b - 2 ^ k else b + 2 ^ k
-  | 0, b, h => by
-    simp only [Nat.pow_zero, Nat.pow_succ] at h ⊢
-    rcases (by omega : b = 0 ∨ b = 1) with rfl | rfl <;> rfl
+  | 0, b, h => by simp only [Nat.pow_zero, Nat.pow_succ] at h ⊢; rcases (by omega : b = 0 ∨ b = 1) with rfl | rfl <;> rfl
   | k + 1, b, h => by
     have hdiv : b / 2 < 2 ^ (k + 1) := by rw [Nat.pow_succ] at h; omega
     have ih := fa_bitwiseXorBits_two_pow k (b / 2) hdiv
     have h2m : 2 ^ (k + 1) % 2 = 0 := by rw [Nat.pow_succ]; exact Nat.mul_mod_left _ 2
-    have h2d : 2 ^ (k + 1) / 2 = 2 ^ k := by
-      rw [Nat.pow_succ]; exact Nat.mul_div_cancel _ (by decide)
-    change Nat.add (match Nat.beq (b % 2) (2 ^ (k + 1) % 2) with | true => 0 | false => 1)
-        (Nat.mul 2 (bitwiseXorBits (k + 1) (b / 2) (2 ^ (k + 1) / 2))) = _
+    have h2d : 2 ^ (k + 1) / 2 = 2 ^ k := by rw [Nat.pow_succ]; exact Nat.mul_div_cancel _ (by decide)
+    change Nat.add (match Nat.beq (b % 2) (2 ^ (k + 1) % 2) with | true => 0 | false => 1) (Nat.mul 2 (bitwiseXorBits (k + 1) (b / 2) (2 ^ (k + 1) / 2))) = _
     rw [h2m, h2d, ih]
     have hpow : 2 ^ (k + 1) = 2 * 2 ^ k := by rw [Nat.pow_succ, Nat.mul_comm]
     rcases (by omega : b % 2 = 0 ∨ b % 2 = 1) with hm | hm
-    · rw [hm]
-      change 0 + 2 * (if 2 ^ k ≤ b / 2 then b / 2 - 2 ^ k else b / 2 + 2 ^ k) = _
+    · rw [hm]; change 0 + 2 * (if 2 ^ k ≤ b / 2 then b / 2 - 2 ^ k else b / 2 + 2 ^ k) = _
       by_cases hge : 2 ^ k ≤ b / 2
       · have hge' : 2 ^ (k + 1) ≤ b := by omega
         simp only [hge, hge', ↓reduceIte]; omega
       · have hlt' : ¬ 2 ^ (k + 1) ≤ b := by omega
         simp only [hge, hlt', ↓reduceIte]; omega
-    · rw [hm]
-      change 1 + 2 * (if 2 ^ k ≤ b / 2 then b / 2 - 2 ^ k else b / 2 + 2 ^ k) = _
+    · rw [hm]; change 1 + 2 * (if 2 ^ k ≤ b / 2 then b / 2 - 2 ^ k else b / 2 + 2 ^ k) = _
       by_cases hge : 2 ^ k ≤ b / 2
       · have hge' : 2 ^ (k + 1) ≤ b := by omega
         simp only [hge, hge', ↓reduceIte]; omega
@@ -1322,37 +1284,23 @@ theorem fa_bitwiseXorBits_two_pow :
 /-- Anneal's `evalFloatNeg .binary32` equals `bitwiseXorBits 32 bits 0x80000000` for every 32-bit pattern. -/
 theorem fa_evalFloatNeg_eq_bitwiseXorBits_f32 (bits : Nat) (h : bits < 2 ^ 32) :
     evalFloatNeg .binary32 bits = bitwiseXorBits 32 bits 0x80000000 := by
-  have h1 : evalFloatNeg .binary32 bits =
-      if 0x80000000 ≤ bits then bits - 0x80000000 else bits + 0x80000000 := by
-    unfold evalFloatNeg IeeeFormat.width
-    rw [Nat.mod_eq_of_lt h]
-    rfl
-  rw [h1]
-  exact (fa_bitwiseXorBits_two_pow 31 bits h).symm
+  have h1 : evalFloatNeg .binary32 bits = if 0x80000000 ≤ bits then bits - 0x80000000 else bits + 0x80000000 := by unfold evalFloatNeg IeeeFormat.width; rw [Nat.mod_eq_of_lt h]; rfl
+  rw [h1]; exact (fa_bitwiseXorBits_two_pow 31 bits h).symm
 /-- Anneal's `evalFloatNeg .binary64` equals `bitwiseXorBits 64 bits 0x8000000000000000` for every 64-bit pattern. -/
 theorem fa_evalFloatNeg_eq_bitwiseXorBits_f64 (bits : Nat) (h : bits < 2 ^ 64) :
     evalFloatNeg .binary64 bits = bitwiseXorBits 64 bits 0x8000000000000000 := by
-  have h1 : evalFloatNeg .binary64 bits =
-      if 0x8000000000000000 ≤ bits then bits - 0x8000000000000000
-      else bits + 0x8000000000000000 := by
-    unfold evalFloatNeg IeeeFormat.width
-    rw [Nat.mod_eq_of_lt h]
-    rfl
-  rw [h1]
-  exact (fa_bitwiseXorBits_two_pow 63 bits h).symm
+  have h1 : evalFloatNeg .binary64 bits = if 0x8000000000000000 ≤ bits then bits - 0x8000000000000000 else bits + 0x8000000000000000 := by unfold evalFloatNeg IeeeFormat.width; rw [Nat.mod_eq_of_lt h]; rfl
+  rw [h1]; exact (fa_bitwiseXorBits_two_pow 63 bits h).symm
 private theorem fa_intBitRec_nat_eq :
     ∀ (fuel : Nat) (a b : Nat), a ≤ fuel →
-      intBitRec (fun y => y) (fun y => -y - 1) (fun x y => if x = y then 0 else 1) fuel
-        (a : Int) (b : Int) = ((Nat.xor a b : Nat) : Int)
+      intBitRec (fun y => y) (fun y => -y - 1) (fun x y => if x = y then 0 else 1) fuel (a : Int) (b : Int) = ((Nat.xor a b : Nat) : Int)
   | 0, a, b, ha => by
     have ha0 : a = 0 := by omega
-    subst ha0
-    simp [intBitRec]
+    subst ha0; simp [intBitRec]
   | fuel + 1, a, b, ha => by
     unfold intBitRec
     by_cases ha0 : a = 0
-    · subst ha0
-      simp
+    · subst ha0; simp
     · have hne0 : ((a : Nat) : Int) ≠ 0 := by omega
       have hne1 : ((a : Nat) : Int) ≠ -1 := by omega
       simp only [hne0, hne1, ↓reduceIte]
@@ -1362,39 +1310,25 @@ private theorem fa_intBitRec_nat_eq :
       have hmod_a : ((a : Nat) : Int) % 2 = ((a % 2 : Nat) : Int) := by omega
       have hmod_b : ((b : Nat) : Int) % 2 = ((b % 2 : Nat) : Int) := by omega
       rw [hdiv_a, hdiv_b, hmod_a, hmod_b, fa_intBitRec_nat_eq fuel (a / 2) (b / 2) hdiv_le]
-      have hnat : Nat.xor a b =
-          2 * Nat.xor (a / 2) (b / 2) + (if a % 2 = b % 2 then 0 else 1) := by
-        apply Nat.eq_of_testBit_eq
-        intro i
+      have hnat : Nat.xor a b = 2 * Nat.xor (a / 2) (b / 2) + (if a % 2 = b % 2 then 0 else 1) := by
+        apply Nat.eq_of_testBit_eq; intro i
         cases i with
         | zero =>
-          change (a ^^^ b).testBit 0 = _
-          rw [Nat.testBit_xor]
-          rcases (by omega : a % 2 = 0 ∨ a % 2 = 1) with h1 | h1 <;>
-            rcases (by omega : b % 2 = 0 ∨ b % 2 = 1) with h2 | h2 <;>
-            simp [Nat.testBit_zero, h1, h2]
+          change (a ^^^ b).testBit 0 = _; rw [Nat.testBit_xor]
+          rcases (by omega : a % 2 = 0 ∨ a % 2 = 1) with h1 | h1 <;> rcases (by omega : b % 2 = 0 ∨ b % 2 = 1) with h2 | h2 <;> simp [Nat.testBit_zero, h1, h2]
         | succ i =>
-          change (a ^^^ b).testBit (i + 1) = _
-          rw [Nat.testBit_xor]
+          change (a ^^^ b).testBit (i + 1) = _; rw [Nat.testBit_xor]
           have hbit : (if a % 2 = b % 2 then 0 else 1) < 2 := by split <;> omega
-          have hsh : (2 * Nat.xor (a / 2) (b / 2) +
-              (if a % 2 = b % 2 then 0 else 1)).testBit (i + 1) =
-              (Nat.xor (a / 2) (b / 2)).testBit i := by
+          have hsh : (2 * Nat.xor (a / 2) (b / 2) + (if a % 2 = b % 2 then 0 else 1)).testBit (i + 1) = (Nat.xor (a / 2) (b / 2)).testBit i := by
             rw [Nat.testBit_succ]
-            have hq : (2 * Nat.xor (a / 2) (b / 2) + (if a % 2 = b % 2 then 0 else 1)) / 2 =
-                Nat.xor (a / 2) (b / 2) := by omega
+            have hq : (2 * Nat.xor (a / 2) (b / 2) + (if a % 2 = b % 2 then 0 else 1)) / 2 = Nat.xor (a / 2) (b / 2) := by omega
             rw [hq]
-          rw [hsh]
-          change _ = ((a / 2) ^^^ (b / 2)).testBit i
-          rw [Nat.testBit_xor, Nat.testBit_succ, Nat.testBit_succ]
+          rw [hsh]; change _ = ((a / 2) ^^^ (b / 2)).testBit i; rw [Nat.testBit_xor, Nat.testBit_succ, Nat.testBit_succ]
       rw [hnat]
       by_cases hmeq : a % 2 = b % 2
-      · simp only [hmeq, ↓reduceIte]
-        omega
-      · have hmeqI : ((a % 2 : Nat) : Int) ≠ ((b % 2 : Nat) : Int) :=
-          fun h => hmeq (Int.ofNat.inj h)
-        simp only [hmeq, hmeqI, ↓reduceIte]
-        omega
+      · simp only [hmeq, ↓reduceIte]; omega
+      · have hmeqI : ((a % 2 : Nat) : Int) ≠ ((b % 2 : Nat) : Int) := fun h => hmeq (Int.ofNat.inj h)
+        simp only [hmeq, hmeqI, ↓reduceIte]; omega
 /-- MiniRust's `intBitXor` on non-negative integers coincides with `Nat.xor` (choice-free). -/
 theorem fa_intBitXor_nat (a b : Nat) :
     intBitXor (a : Int) (b : Int) = ((Nat.xor a b : Nat) : Int) := by
@@ -1857,7 +1791,7 @@ theorem fa_bridge_evalFloatBinOpRel_carriers (mode : FloatArithMode) (op : BinOp
       fc_mrBM_transmute_int .Unsigned .Signed f.byteWidth outSc.bits hgood hlt none,
       fc_mrTB_transmute_int .Unsigned .Signed f.byteWidth outSc.bits hgood hlt none,
       harr⟩
-/-- **Symbolic `BasicMemory` machine carrier execution for EVERY arithmetic `EvalFloatBinOpRel` outcome** (both `.deterministic` and `.nondeterministic`, including every `nanChoices` candidate): for `f32` (`f = .binary32`) the MiniRust 32-bit carrier runs via `Interp.steps` to Anneal's exact 4-byte image in `retAlloc`; for `f64` (`f = .binary64`) the MiniRust 64-bit carrier runs via `Interp.steps` under `fcCtx8` to Anneal's exact 8-byte image in `fcRetAlloc8`. The universal `TreeBorrowsMemory` (`Interp.stepsTB` + `MachTB.wfLive`) statements are `fa_bridge_evalFloatBinOpRel_{f64,f32}_mach_and_machTB_wfLive` below. -/
+/-- **Symbolic `BasicMemory` machine carrier execution for EVERY arithmetic `EvalFloatBinOpRel` outcome** (both `.deterministic` and `.nondeterministic`, including every `nanChoices` candidate): for `f32` (`f = .binary32`) the MiniRust 32-bit carrier runs via `Interp.steps` to Anneal's exact 4-byte image in `retAlloc`; for `f64` (`f = .binary64`) the MiniRust 64-bit carrier runs via `Interp.steps` under `fcCtx8` to Anneal's exact 8-byte image in `fcRetAlloc8`. The universal `TreeBorrowsMemory` (`Interp.stepsTB` + `MachTB.wfLive`) statements are `fa_bridge_evalFloatBinOpRel_{f64,f32}_mach_and_machTB_wfLive` and `fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive` below. -/
 theorem fa_bridge_evalFloatBinOpRel_mach_steps (mode : FloatArithMode) (op : BinOp)
     (a b : Nat) (outSc : ScalarInt) (hop : isFloatArithBinOp op = true) : (EvalFloatBinOpRel mode op .binary32 a b outSc →
       outSc.sizeBytes = 4 ∧ ∃ (m : Mach) (n : Nat) (m' : Mach), startMachine fcCarrierCastBody [.scalar ⟨outSc.bits, 4⟩] = some m ∧ Interp.steps n m = .ok m' ∧
@@ -1867,36 +1801,30 @@ theorem fa_bridge_evalFloatBinOpRel_mach_steps (mode : FloatArithMode) (op : Bin
         Interp.steps n (machineWithCtx fcCtx8 fcCarrierCast64Body f (initMachineState fcCarrierCast64Body [.scalar ⟨outSc.bits, 8⟩]).frame.locals f.start) = .ok m' ∧
         m'.mem.memory.allocations[0]? = some { fcRetAlloc8 with data := (encodeLittleEndianBytes outSc.bits 8 none).map fcByteToMR }) := by
   refine ⟨fun hrel => ?_, fun hrel => ?_⟩
-  · rcases EvalFloatBinOpRel_out_wf mode op .binary32 a b outSc hrel with
-      ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
+  · rcases EvalFloatBinOpRel_out_wf mode op .binary32 a b outSc hrel with ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
     · rw [evalFloatCmp_of_arith op .binary32 a b hop] at hc; cases hc
-    · obtain ⟨m, n, m', hm, hs, _, ha⟩ := fc_sym_mr_carrier_steps outSc.bits hlt
-      exact ⟨hsz, m, n, m', hm, hs, ha⟩
-  · rcases EvalFloatBinOpRel_out_wf mode op .binary64 a b outSc hrel with
-      ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
+    · obtain ⟨m, n, m', hm, hs, _, ha⟩ := fc_sym_mr_carrier_steps outSc.bits hlt; exact ⟨hsz, m, n, m', hm, hs, ha⟩
+  · rcases EvalFloatBinOpRel_out_wf mode op .binary64 a b outSc hrel with ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
     · rw [evalFloatCmp_of_arith op .binary64 a b hop] at hc; cases hc
-    · obtain ⟨fn, n, m', hfn, hs, _, ha⟩ := fc_sym_mr_carrier64_steps outSc.bits hlt
-      exact ⟨hsz, fn, n, m', hfn, hs, ha⟩
-private theorem fa_subslice8 {α : Type} (xs : List α) (h : xs.length = 8) :
-    subsliceWithLength xs ((0 : Nat) : Int) ((8 : Nat) : Int) = .ok xs := by
+    · obtain ⟨fn, n, m', hfn, hs, _, ha⟩ := fc_sym_mr_carrier64_steps outSc.bits hlt; exact ⟨hsz, fn, n, m', hfn, hs, ha⟩
+private theorem fa_subslice {α : Type} (n : Nat) (xs : List α) (h : xs.length = n) :
+    subsliceWithLength xs ((0 : Nat) : Int) (n : Int) = .ok xs := by
   unfold subsliceWithLength
-  have hc : (0 : Int) ≤ ((0 : Nat) : Int) ∧ (0 : Int) ≤ ((8 : Nat) : Int) ∧
-      ((0 : Nat) : Int) + ((8 : Nat) : Int) ≤ (xs.length : Int) := by rw [h]; decide
-  simp only [hc]; change Except.ok (xs.take 8) = Except.ok xs; rw [← h, List.take_length]
-private theorem fa_writeSubslice8 {α : Type} (xs ys : List α) (hx : xs.length = 8) (hy : ys.length = 8) :
+  have hc : (0 : Int) ≤ ((0 : Nat) : Int) ∧ (0 : Int) ≤ (n : Int) ∧ ((0 : Nat) : Int) + (n : Int) ≤ (xs.length : Int) := by rw [h]; omega
+  simp only [hc]; change Except.ok (xs.take n) = Except.ok xs; rw [← h, List.take_length]
+private theorem fa_writeSubslice {α : Type} (n : Nat) (xs ys : List α) (hx : xs.length = n) (hy : ys.length = n) :
     writeSubsliceAtIndex xs ((0 : Nat) : Int) ys = .ok ys := by
   unfold writeSubsliceAtIndex
-  have hc : (0 : Int) ≤ ((0 : Nat) : Int) ∧ ((0 : Nat) : Int) + (ys.length : Int) ≤ (xs.length : Int) := by
-    rw [hx, hy]; decide
-  simp only [hc]
-  have hd : xs.drop (0 + ys.length) = [] := by rw [Nat.zero_add, hy, ← hx, List.drop_length]
-  change Except.ok (xs.take 0 ++ ys ++ xs.drop (0 + ys.length)) = Except.ok ys
-  simp only [List.take_zero, List.nil_append, hd, List.append_nil]
-private def faRoot8 : Gen.Node :=
-  { children := [], permissions := List.replicate 8 (.Unprot .Unique), «protected» := .No }
-private theorem faRoot8_read : Node.access faRoot8 (some []) .Read ⟨0⟩ ⟨8⟩ = .ok faRoot8 := rfl
-private theorem faRoot8_write : Node.access faRoot8 (some []) .Write ⟨0⟩ ⟨8⟩ = .ok faRoot8 := rfl
-private theorem faRoot8_noProt : Node.contains_strong_protector_preventing_deallocation faRoot8 = false := rfl
+  have hc : (0 : Int) ≤ ((0 : Nat) : Int) ∧ ((0 : Nat) : Int) + (ys.length : Int) ≤ (xs.length : Int) := by rw [hx, hy]; omega
+  simp only [hc]; have hd : xs.drop (0 + ys.length) = [] := by rw [Nat.zero_add, hy, ← hx, List.drop_length]
+  change Except.ok (xs.take 0 ++ ys ++ xs.drop (0 + ys.length)) = Except.ok ys; simp only [List.take_zero, List.nil_append, hd, List.append_nil]
+private def faRoot (n : Nat) : Gen.Node := { children := [], permissions := List.replicate n (.Unprot .Unique), «protected» := .No }
+private theorem faRoot4_read : Node.access (faRoot 4) (some []) .Read ⟨0⟩ ⟨4⟩ = .ok (faRoot 4) := rfl
+private theorem faRoot4_write : Node.access (faRoot 4) (some []) .Write ⟨0⟩ ⟨4⟩ = .ok (faRoot 4) := rfl
+private theorem faRoot4_noProt : Node.contains_strong_protector_preventing_deallocation (faRoot 4) = false := rfl
+private theorem faRoot8_read : Node.access (faRoot 8) (some []) .Read ⟨0⟩ ⟨8⟩ = .ok (faRoot 8) := rfl
+private theorem faRoot8_write : Node.access (faRoot 8) (some []) .Write ⟨0⟩ ⟨8⟩ = .ok (faRoot 8) := rfl
+private theorem faRoot8_noProt : Node.contains_strong_protector_preventing_deallocation (faRoot 8) = false := rfl
 private theorem fa_map_liftByteTB_init (xs : List UInt8) :
     (xs.map (fun b => (Gen.AbstractByte.Init b none : Byte))).map liftByteTB =
       xs.map (fun b => (Gen.AbstractByte.Init b none : Gen.AbstractByte Gen.TreeBorrowsProvenance)) := by
@@ -1905,302 +1833,235 @@ private theorem fa_map_projByteTB_init (xs : List UInt8) :
     (xs.map (fun b => (Gen.AbstractByte.Init b none : Gen.AbstractByte Gen.TreeBorrowsProvenance))).map projByteTB =
       (xs.map (fun b => (Gen.AbstractByte.Init b none : Byte))).map (projByteTB ∘ liftByteTB) := by
   induction xs with | nil => rfl | cons _ _ ih => simp only [List.map_cons, Function.comp, liftByteTB, Option.map, ih]
-private theorem fa_scalarBytes_u64_len (bits : Nat) : (scalarBytes fcU64It bits).length = 8 := by
-  simp only [scalarBytes, fcU64It, List.length_map, leBytes_length]
-private theorem fa_liftAllocTB_u64 (bits : Nat) (addr : Int) :
-    liftAllocTB { data := scalarBytes fcU64It bits, addr := addr, align := ⟨8⟩, kind := .Stack, live := true, extra := () } =
-      { data := (leBytes bits 8).map (fun b => Gen.AbstractByte.Init b none),
-        addr := addr, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot8 } } := by
-  unfold liftAllocTB; dsimp only; rw [fa_scalarBytes_u64_len bits]
-  simp only [scalarBytes, fcU64It, fa_map_liftByteTB_init, faRoot8]
-private theorem fa_bm_checkPtr_8 (allocs : List Gen.Allocation) (id addr : Int) (d : List Byte)
-    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨8⟩, .Stack, true, ()⟩) (hSz : d.length = 8) :
-    BM.check_ptr ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ ⟨8⟩ = .ok (some (⟨id⟩, (), ⟨0⟩)) := by
-  unfold BM.check_ptr Allocation.size
-  have hne8 : ¬ ((8 : Nat) = 0) := by decide
-  have hOb : ¬ ((0 : Int) < 0 ∨ (0 : Int) + ((8 : Nat) : Int) > ((8 : Nat) : Int)) := by decide
-  simp only [hne8, ↓reduceIte, bind, Except.bind, pure, Except.pure, hLi, Bool.not_true, Bool.false_eq_true, hSz, Int.sub_self, hOb, Int.toNat_zero]
-private theorem fa_bm_load_8 (allocs : List Gen.Allocation) (id addr : Int) (al : LibSpecr.Align) (d : List Byte)
-    (hAl : Interp.Align.is_aligned al addr = true)
-    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨8⟩, .Stack, true, ()⟩) (hSz : d.length = 8)
-    (hLs : listSet allocs id ⟨d, addr, ⟨8⟩, .Stack, true, ()⟩ "set" = .ok allocs) :
-    BM.load ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ ⟨8⟩ al = .ok (d, ⟨allocs, {}⟩) := by
-  unfold BM.load
-  simp only [hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure,
-    fa_bm_checkPtr_8 allocs id addr d hLi hSz, hLi, hLs, fa_subslice8 d hSz]
-private theorem fa_bm_store_8 (allocs allocs' : List Gen.Allocation) (id addr : Int) (al : LibSpecr.Align) (d bs : List Byte)
-    (hAl : Interp.Align.is_aligned al addr = true)
-    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨8⟩, .Stack, true, ()⟩) (hSz : d.length = 8) (hBs : bs.length = 8)
-    (hLs : listSet allocs id ⟨bs, addr, ⟨8⟩, .Stack, true, ()⟩ "set" = .ok allocs') :
+private theorem fa_scalarBytes_len (s : Signedness) (n bits : Nat) : (scalarBytes ⟨s, ⟨n⟩⟩ bits).length = n := by
+  simp only [scalarBytes, List.length_map, leBytes_length]
+private theorem fa_liftAllocTB_uN (n bits : Nat) (addr : Int) :
+    liftAllocTB { data := scalarBytes ⟨.Unsigned, ⟨n⟩⟩ bits, addr := addr, align := ⟨n⟩, kind := .Stack, live := true, extra := () } =
+      { data := (leBytes bits n).map (fun b => Gen.AbstractByte.Init b none), addr := addr, align := ⟨n⟩, kind := .Stack, live := true, extra := { root := faRoot n } } := by
+  unfold liftAllocTB; dsimp only; rw [fa_scalarBytes_len .Unsigned n bits]; simp only [scalarBytes, fa_map_liftByteTB_init, faRoot]
+private theorem fa_bm_checkPtr (n : Nat) (hn : n ≠ 0) (allocs : List Gen.Allocation) (id addr : Int) (d : List Byte)
+    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨n⟩, .Stack, true, ()⟩) (hSz : d.length = n) :
+    BM.check_ptr ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ ⟨n⟩ = .ok (some (⟨id⟩, (), ⟨0⟩)) := by
+  unfold BM.check_ptr Allocation.size; have hOb : ¬ ((0 : Int) < 0 ∨ (0 : Int) + (n : Int) > (n : Int)) := by omega
+  simp only [hn, ↓reduceIte, bind, Except.bind, pure, Except.pure, hLi, Bool.not_true, Bool.false_eq_true, hSz, Int.sub_self, hOb, Int.toNat_zero]
+private theorem fa_bm_load (n : Nat) (hn : n ≠ 0) (allocs : List Gen.Allocation) (id addr : Int) (al : LibSpecr.Align) (d : List Byte)
+    (hAl : Interp.Align.is_aligned al addr = true) (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨n⟩, .Stack, true, ()⟩) (hSz : d.length = n)
+    (hLs : listSet allocs id ⟨d, addr, ⟨n⟩, .Stack, true, ()⟩ "set" = .ok allocs) :
+    BM.load ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ ⟨n⟩ al = .ok (d, ⟨allocs, {}⟩) := by
+  unfold BM.load; simp only [hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure, fa_bm_checkPtr n hn allocs id addr d hLi hSz, hLi, hLs, fa_subslice n d hSz]
+private theorem fa_bm_store (n : Nat) (hn : n ≠ 0) (allocs allocs' : List Gen.Allocation) (id addr : Int) (al : LibSpecr.Align) (d bs : List Byte)
+    (hAl : Interp.Align.is_aligned al addr = true) (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨n⟩, .Stack, true, ()⟩) (hSz : d.length = n) (hBs : bs.length = n)
+    (hLs : listSet allocs id ⟨bs, addr, ⟨n⟩, .Stack, true, ()⟩ "set" = .ok allocs') :
     BM.store ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ bs al = .ok ⟨allocs', {}⟩ := by
-  unfold BM.store
-  have hChk : BM.check_ptr ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ ⟨bs.length⟩ = .ok (some (⟨id⟩, (), ⟨0⟩)) := by
-    rw [hBs]; exact fa_bm_checkPtr_8 allocs id addr d hLi hSz
-  simp only [hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure,
-    hChk, hLi, fa_writeSubslice8 d bs hSz hBs, hLs]
-private theorem fa_bm_dealloc_8 (allocs allocs' : List Gen.Allocation) (id addr : Int) (d : List Byte)
-    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨8⟩, .Stack, true, ()⟩) (hSz : d.length = 8)
-    (hLs : listSet allocs id ⟨d, addr, ⟨8⟩, .Stack, false, ()⟩ "set" = .ok allocs') :
-    BM.deallocate ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ .Stack ⟨8⟩ ⟨8⟩ = .ok ⟨allocs', {}⟩ := by
-  unfold BM.deallocate Allocation.size
-  simp only [bind, Except.bind, pure, Except.pure, hLi, Bool.not_true, Bool.false_eq_true, hSz, ne_eq, not_true_eq_false, ↓reduceIte, hLs]
-private theorem fa_basic_checkPtr_8 (allocs : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra))
+  unfold BM.store; have hChk : BM.check_ptr ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ ⟨bs.length⟩ = .ok (some (⟨id⟩, (), ⟨0⟩)) := by rw [hBs]; exact fa_bm_checkPtr n hn allocs id addr d hLi hSz
+  simp only [hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure, hChk, hLi, fa_writeSubslice n d bs hSz hBs, hLs]
+private theorem fa_bm_dealloc (n : Nat) (allocs allocs' : List Gen.Allocation) (id addr : Int) (d : List Byte)
+    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨n⟩, .Stack, true, ()⟩) (hSz : d.length = n)
+    (hLs : listSet allocs id ⟨d, addr, ⟨n⟩, .Stack, false, ()⟩ "set" = .ok allocs') :
+    BM.deallocate ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, ())⟩ .Stack ⟨n⟩ ⟨n⟩ = .ok ⟨allocs', {}⟩ := by
+  unfold BM.deallocate Allocation.size; simp only [bind, Except.bind, pure, Except.pure, hLi, Bool.not_true, Bool.false_eq_true, hSz, ne_eq, not_true_eq_false, ↓reduceIte, hLs]
+private theorem fa_basic_checkPtr (n : Nat) (hn : n ≠ 0) (allocs : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra))
     (id addr : Int) (d : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
-    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨8⟩, .Stack, true, { root := faRoot8 }⟩) (hSz : d.length = 8) :
-    BasicMemory.check_ptr ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, [])⟩ ⟨8⟩ = .ok (some (⟨id⟩, [], ⟨0⟩)) := by
-  unfold BasicMemory.check_ptr Allocation.size
-  have hne8 : ¬ ((8 : Nat) = 0) := by decide
-  have hOb : ¬ ((0 : Int) < 0 ∨ (0 : Int) + ((8 : Nat) : Int) > ((8 : Nat) : Int)) := by decide
-  simp only [hne8, ↓reduceIte, bind, Except.bind, pure, Except.pure, hLi, Bool.not_true, Bool.false_eq_true, hSz, Int.sub_self, hOb, Int.toNat_zero]
-private theorem fa_tbm_load_8 (allocs : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra))
-    (id addr : Int) (al : LibSpecr.Align) (d : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) (hAl : Interp.Align.is_aligned al addr = true)
-    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨8⟩, .Stack, true, { root := faRoot8 }⟩) (hSz : d.length = 8)
-    (hLs : listSet allocs id ⟨d, addr, ⟨8⟩, .Stack, true, { root := faRoot8 }⟩ "set" = .ok allocs) :
-    TreeBorrowsMemory.load ⟨⟨true⟩, ⟨allocs, {}⟩⟩ ⟨addr, some (⟨id⟩, [])⟩ ⟨8⟩ al = .ok (d, ⟨⟨true⟩, ⟨allocs, {}⟩⟩) := by
+    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨n⟩, .Stack, true, { root := faRoot n }⟩) (hSz : d.length = n) :
+    BasicMemory.check_ptr ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, [])⟩ ⟨n⟩ = .ok (some (⟨id⟩, [], ⟨0⟩)) := by
+  unfold BasicMemory.check_ptr Allocation.size; have hOb : ¬ ((0 : Int) < 0 ∨ (0 : Int) + (n : Int) > (n : Int)) := by omega
+  simp only [hn, ↓reduceIte, bind, Except.bind, pure, Except.pure, hLi, Bool.not_true, Bool.false_eq_true, hSz, Int.sub_self, hOb, Int.toNat_zero]
+private theorem fa_tbm_load (n : Nat) (hn : n ≠ 0) (hRd : Node.access (faRoot n) (some []) .Read ⟨0⟩ ⟨n⟩ = .ok (faRoot n))
+    (allocs : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)) (id addr : Int) (al : LibSpecr.Align) (d : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (hAl : Interp.Align.is_aligned al addr = true) (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨n⟩, .Stack, true, { root := faRoot n }⟩) (hSz : d.length = n)
+    (hLs : listSet allocs id ⟨d, addr, ⟨n⟩, .Stack, true, { root := faRoot n }⟩ "set" = .ok allocs) :
+    TreeBorrowsMemory.load ⟨⟨true⟩, ⟨allocs, {}⟩⟩ ⟨addr, some (⟨id⟩, [])⟩ ⟨n⟩ al = .ok (d, ⟨⟨true⟩, ⟨allocs, {}⟩⟩) := by
   unfold TreeBorrowsMemory.load BasicMemory.load
-  simp only [hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure,
-    fa_basic_checkPtr_8 allocs id addr d hLi hSz, hLi, faRoot8_read, hLs, fa_subslice8 d hSz]
-private theorem fa_tbm_store_8 (allocs allocs' : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra))
-    (id addr : Int) (al : LibSpecr.Align) (d bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) (hAl : Interp.Align.is_aligned al addr = true)
-    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨8⟩, .Stack, true, { root := faRoot8 }⟩) (hSz : d.length = 8) (hBs : bs.length = 8)
-    (hLs : listSet allocs id ⟨bs, addr, ⟨8⟩, .Stack, true, { root := faRoot8 }⟩ "set" = .ok allocs') :
+  simp only [hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure, fa_basic_checkPtr n hn allocs id addr d hLi hSz, hLi, hRd, hLs, fa_subslice n d hSz]
+private theorem fa_tbm_store (n : Nat) (hn : n ≠ 0) (hWr : Node.access (faRoot n) (some []) .Write ⟨0⟩ ⟨n⟩ = .ok (faRoot n))
+    (allocs allocs' : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)) (id addr : Int) (al : LibSpecr.Align) (d bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (hAl : Interp.Align.is_aligned al addr = true) (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨n⟩, .Stack, true, { root := faRoot n }⟩) (hSz : d.length = n) (hBs : bs.length = n)
+    (hLs : listSet allocs id ⟨bs, addr, ⟨n⟩, .Stack, true, { root := faRoot n }⟩ "set" = .ok allocs') :
     TreeBorrowsMemory.store ⟨⟨true⟩, ⟨allocs, {}⟩⟩ ⟨addr, some (⟨id⟩, [])⟩ bs al = .ok ⟨⟨true⟩, ⟨allocs', {}⟩⟩ := by
   unfold TreeBorrowsMemory.store BasicMemory.store
-  have hChk : BasicMemory.check_ptr ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, [])⟩ ⟨bs.length⟩ = .ok (some (⟨id⟩, [], ⟨0⟩)) := by
-    rw [hBs]; exact fa_basic_checkPtr_8 allocs id addr d hLi hSz
-  have hWr : Node.access faRoot8 (some []) .Write ⟨0⟩ ⟨bs.length⟩ = .ok faRoot8 := by rw [hBs]; exact faRoot8_write
-  simp only [hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure,
-    hChk, hLi, hWr, fa_writeSubslice8 d bs hSz hBs, hLs]
-private theorem fa_tbm_dealloc_8 (allocs allocs' : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra))
-    (id addr : Int) (d : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
-    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨8⟩, .Stack, true, { root := faRoot8 }⟩) (hSz : d.length = 8)
-    (hLs : listSet allocs id ⟨d, addr, ⟨8⟩, .Stack, false, { root := faRoot8 }⟩ "set" = .ok allocs') :
-    TreeBorrowsMemory.deallocate ⟨⟨true⟩, ⟨allocs, {}⟩⟩ ⟨addr, some (⟨id⟩, [])⟩ .Stack ⟨8⟩ ⟨8⟩ = .ok ⟨⟨true⟩, ⟨allocs', {}⟩⟩ := by
+  have hChk : BasicMemory.check_ptr ⟨allocs, {}⟩ ⟨addr, some (⟨id⟩, [])⟩ ⟨bs.length⟩ = .ok (some (⟨id⟩, [], ⟨0⟩)) := by rw [hBs]; exact fa_basic_checkPtr n hn allocs id addr d hLi hSz
+  have hWr' : Node.access (faRoot n) (some []) .Write ⟨0⟩ ⟨bs.length⟩ = .ok (faRoot n) := by rw [hBs]; exact hWr
+  simp only [hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure, hChk, hLi, hWr', fa_writeSubslice n d bs hSz hBs, hLs]
+private theorem fa_tbm_dealloc (n : Nat) (hWr : Node.access (faRoot n) (some []) .Write ⟨0⟩ ⟨n⟩ = .ok (faRoot n))
+    (hNp : Node.contains_strong_protector_preventing_deallocation (faRoot n) = false)
+    (allocs allocs' : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)) (id addr : Int) (d : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (hLi : listIndex allocs id "self.allocations[id.0]" = .ok ⟨d, addr, ⟨n⟩, .Stack, true, { root := faRoot n }⟩) (hSz : d.length = n)
+    (hLs : listSet allocs id ⟨d, addr, ⟨n⟩, .Stack, false, { root := faRoot n }⟩ "set" = .ok allocs') :
+    TreeBorrowsMemory.deallocate ⟨⟨true⟩, ⟨allocs, {}⟩⟩ ⟨addr, some (⟨id⟩, [])⟩ .Stack ⟨n⟩ ⟨n⟩ = .ok ⟨⟨true⟩, ⟨allocs', {}⟩⟩ := by
   unfold TreeBorrowsMemory.deallocate BasicMemory.deallocate Allocation.size
-  simp only [bind, Except.bind, pure, Except.pure, hLi, Bool.not_true, Bool.false_eq_true, hSz,
-    ne_eq, not_true_eq_false, ↓reduceIte, faRoot8_write, faRoot8_noProt, hLs]
-private theorem fa_checkValueM_int64 {M : Type} [Gen.Memory M] [MemoryOps M]
-    (s : Signedness) (bits : Nat) (hbits : bits < 2 ^ 64) (m : Option (Gen.Machine M)) :
-    checkValueM (M := M) (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) (.Int ⟨s, ⟨8⟩⟩) m = .ok () := by
-  have hrep := fc_canRepresent_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits
-  generalize intFromBits bits ⟨s, ⟨8⟩⟩ = v at hrep ⊢
+  simp only [bind, Except.bind, pure, Except.pure, hLi, Bool.not_true, Bool.false_eq_true, hSz, ne_eq, not_true_eq_false, ↓reduceIte, hWr, hNp, hLs]
+private theorem fa_checkValueM_intN {M : Type} [Gen.Memory M] [MemoryOps M] (s : Signedness) (n : Nat) (hgood : GoodSize n) (bits : Nat) (hbits : bits < 2 ^ (8 * n)) (m : Option (Gen.Machine M)) :
+    checkValueM (M := M) (.Int (intFromBits bits ⟨s, ⟨n⟩⟩)) (.Int ⟨s, ⟨n⟩⟩) m = .ok () := by
+  have hrep := fc_canRepresent_intFromBits ⟨s, ⟨n⟩⟩ bits hgood hbits; generalize intFromBits bits ⟨s, ⟨n⟩⟩ = v at hrep ⊢
   simp only [checkValueM, ensureElseUb, hrep, Bool.not_true, Bool.false_eq_true, ↓reduceIte, pure, Except.pure]
-private theorem fa_decodeM_int64 {M : Type} [Gen.Memory M] [MemoryOps M] (s : Signedness) (bits : Nat) (hbits : bits < 2 ^ 64) :
-    Type.decodeM (M := M) (.Int ⟨s, ⟨8⟩⟩) ((leBytes bits 8).map (fun b => Gen.AbstractByte.Init b none)) =
-      .ok (some (.Int (intFromBits bits ⟨s, ⟨8⟩⟩))) := by
-  have hdec := fc_decode_leBytes s 8 bits hbits
-  have hlen : ((leBytes bits 8).map (fun b => (Gen.AbstractByte.Init b none : Gen.AbstractByte (Gen.Memory.Provenance M)))).length = 8 := by
-    rw [List.length_map, leBytes_length]
-  have hmap := fc_mapM_dataM_init (M := M) (leBytes bits 8)
-  generalize leBytes bits 8 = lbs at hdec hlen hmap ⊢
-  generalize intFromBits bits ⟨s, ⟨8⟩⟩ = v at hdec ⊢
-  simp only [Type.decodeM, Type.decodeIntM, hlen, ne_eq, not_true_eq_false, ↓reduceIte,
-    hmap, x86_64.ENDIANNESS, hdec, pure, Except.pure]
-private theorem fa_encodeM_int64 {M : Type} [Gen.Memory M] [MemoryOps M] (s : Signedness) (bits : Nat) (hbits : bits < 2 ^ 64) :
-    Type.encodeM (M := M) (.Int ⟨s, ⟨8⟩⟩) (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) =
-      .ok ((leBytes bits 8).map (fun b => Gen.AbstractByte.Init b none)) := by
-  have hrep := fc_canRepresent_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits
-  have hmod : (intFromBits bits ⟨s, ⟨8⟩⟩ % 2 ^ Size.bits ⟨8⟩).toNat = bits := by
-    have h0 : intFromBits bits ⟨s, ⟨8⟩⟩ % (2 ^ (8 * (⟨8⟩ : LibSpecr.Size).bytes) : Int) = (bits : Int) :=
-      intFromBits_emod bits ⟨s, ⟨8⟩⟩ hbits
-    have hpow : (2 ^ Size.bits ⟨8⟩ : Int) = (2 ^ (8 * (⟨8⟩ : LibSpecr.Size).bytes) : Int) :=
-      congrArg (fun k => (2 : Int) ^ k) (rfl : Size.bits ⟨8⟩ = 8 * (⟨8⟩ : LibSpecr.Size).bytes)
+private theorem fa_decodeM_intN {M : Type} [Gen.Memory M] [MemoryOps M] (s : Signedness) (n bits : Nat) (hbits : bits < 2 ^ (8 * n)) :
+    Type.decodeM (M := M) (.Int ⟨s, ⟨n⟩⟩) ((leBytes bits n).map (fun b => Gen.AbstractByte.Init b none)) = .ok (some (.Int (intFromBits bits ⟨s, ⟨n⟩⟩))) := by
+  have hdec := fc_decode_leBytes s n bits hbits
+  have hlen : ((leBytes bits n).map (fun b => (Gen.AbstractByte.Init b none : Gen.AbstractByte (Gen.Memory.Provenance M)))).length = n := by rw [List.length_map, leBytes_length]
+  have hmap := fc_mapM_dataM_init (M := M) (leBytes bits n); generalize leBytes bits n = lbs at hdec hlen hmap ⊢; generalize intFromBits bits ⟨s, ⟨n⟩⟩ = v at hdec ⊢
+  simp only [Type.decodeM, Type.decodeIntM, hlen, ne_eq, not_true_eq_false, ↓reduceIte, hmap, x86_64.ENDIANNESS, hdec, pure, Except.pure]
+private theorem fa_encodeM_intN {M : Type} [Gen.Memory M] [MemoryOps M] (s : Signedness) (n : Nat) (hgood : GoodSize n) (bits : Nat) (hbits : bits < 2 ^ (8 * n)) :
+    Type.encodeM (M := M) (.Int ⟨s, ⟨n⟩⟩) (.Int (intFromBits bits ⟨s, ⟨n⟩⟩)) = .ok ((leBytes bits n).map (fun b => Gen.AbstractByte.Init b none)) := by
+  have hrep := fc_canRepresent_intFromBits ⟨s, ⟨n⟩⟩ bits hgood hbits
+  have hmod : (intFromBits bits ⟨s, ⟨n⟩⟩ % 2 ^ Size.bits ⟨n⟩).toNat = bits := by
+    have h0 : intFromBits bits ⟨s, ⟨n⟩⟩ % (2 ^ (8 * (⟨n⟩ : LibSpecr.Size).bytes) : Int) = (bits : Int) := intFromBits_emod bits ⟨s, ⟨n⟩⟩ hbits
+    have hpow : (2 ^ Size.bits ⟨n⟩ : Int) = (2 ^ (8 * (⟨n⟩ : LibSpecr.Size).bytes) : Int) := congrArg (fun k => (2 : Int) ^ k) (rfl : Size.bits ⟨n⟩ = 8 * (⟨n⟩ : LibSpecr.Size).bytes)
     rw [hpow, h0]; rfl
-  have henc : Endianness.encode .LittleEndian s ⟨8⟩ (intFromBits bits ⟨s, ⟨8⟩⟩) = some (leBytes bits 8) := by
-    rw [encode_eq s ⟨8⟩ _ hrep, hmod]
-  generalize intFromBits bits ⟨s, ⟨8⟩⟩ = v at henc ⊢
-  generalize leBytes bits 8 = lbs at henc ⊢
+  have henc : Endianness.encode .LittleEndian s ⟨n⟩ (intFromBits bits ⟨s, ⟨n⟩⟩) = some (leBytes bits n) := by rw [encode_eq s ⟨n⟩ _ hrep, hmod]
+  generalize intFromBits bits ⟨s, ⟨n⟩⟩ = v at henc ⊢; generalize leBytes bits n = lbs at henc ⊢
   simp only [Type.encodeM, Type.encodeIntM, x86_64.ENDIANNESS, henc, pure, Except.pure]
-private theorem fa_evalUnOpM_transmute_u64_i64 {M : Type} [Gen.Memory M] [MemoryOps M]
-    (vU vI : Int) (m : Option (Gen.Machine M))
-    (htr : transmuteM (M := M) (.Int vU) (.Int fcU64It) (.Int fcI64It) m = .ok (.Int vI)) :
-    evalUnOpM (M := M) (.Cast (.Transmute (.Int fcI64It))) (.Int vU, .Int fcU64It) m =
-      .ok (.Int vI, .Int fcI64It) := by
-  have hl1 : Type.layout (.Int fcU64It) = .ok (.Sized ⟨8⟩ ⟨8⟩) := layout_eq fcU64It fc_goodSize_8
-  have hl2 : Type.layout (.Int fcI64It) = .ok (.Sized ⟨8⟩ ⟨8⟩) := layout_eq fcI64It fc_goodSize_8
-  unfold evalUnOpM evalCastOpM
-  simp only [hl1, hl2, expect_size_sized, ne_eq, not_true_eq_false, ↓reduceIte, htr, bind, Except.bind, pure, Except.pure]
+private theorem fa_evalUnOpM_transmute_uN_iN {M : Type} [Gen.Memory M] [MemoryOps M] (n : Nat) (hgood : GoodSize n) (vU vI : Int) (m : Option (Gen.Machine M))
+    (htr : transmuteM (M := M) (.Int vU) (.Int ⟨.Unsigned, ⟨n⟩⟩) (.Int ⟨.Signed, ⟨n⟩⟩) m = .ok (.Int vI)) :
+    evalUnOpM (M := M) (.Cast (.Transmute (.Int ⟨.Signed, ⟨n⟩⟩))) (.Int vU, .Int ⟨.Unsigned, ⟨n⟩⟩) m = .ok (.Int vI, .Int ⟨.Signed, ⟨n⟩⟩) := by
+  have hl1 : Type.layout (.Int ⟨.Unsigned, ⟨n⟩⟩) = .ok (.Sized ⟨n⟩ ⟨n⟩) := layout_eq ⟨.Unsigned, ⟨n⟩⟩ hgood
+  have hl2 : Type.layout (.Int ⟨.Signed, ⟨n⟩⟩) = .ok (.Sized ⟨n⟩ ⟨n⟩) := layout_eq ⟨.Signed, ⟨n⟩⟩ hgood
+  unfold evalUnOpM evalCastOpM; simp only [hl1, hl2, expect_size_sized, ne_eq, not_true_eq_false, ↓reduceIte, htr, bind, Except.bind, pure, Except.pure]
 private theorem fa_stepM_stmt {M : Type} [Gen.Memory M] [MemoryOps M]
     (m : Gen.Machine M) {m1 mAfter : Gen.Machine M} (fr : Gen.StackFrame M) (blk : Gen.BasicBlock) (stmt : Gen.Statement)
-    (hEn : m.threads.any (fun th => decide (th.state = .Enabled)) = true)
-    (hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread)
-    (hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok fr)
-    (hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk)
-    (hNe : fr.next_stmt ≠ (blk.statements.length : Int))
-    (hStmt : listIndex blk.statements fr.next_stmt "block.statements[frame.next_stmt]" = .ok stmt)
-    (hEval : evalStatementM { m with mem := { m.mem with accesses := [] } } stmt = .ok m1)
-    (hMut : mutateCurFrameM m1 (fun f => { f with next_stmt := f.next_stmt + 1 }) = .ok mAfter)
-    (hRace : ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread
-      (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) = .ok ()) : stepM m = .ok mAfter := by
-  unfold stepM
-  simp only [hEn, Bool.not_true, Bool.false_eq_true, ↓reduceIte, resetDataRaceTrackingM, hPick, hCur, hBlk, hNe,
-    hStmt, hEval, hMut, hRace, bind, Except.bind, pure, Except.pure]
+    (hEn : m.threads.any (fun th => decide (th.state = .Enabled)) = true) (hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread)
+    (hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok fr) (hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk)
+    (hNe : fr.next_stmt ≠ (blk.statements.length : Int)) (hStmt : listIndex blk.statements fr.next_stmt "block.statements[frame.next_stmt]" = .ok stmt)
+    (hEval : evalStatementM { m with mem := { m.mem with accesses := [] } } stmt = .ok m1) (hMut : mutateCurFrameM m1 (fun f => { f with next_stmt := f.next_stmt + 1 }) = .ok mAfter)
+    (hRace : ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) = .ok ()) : stepM m = .ok mAfter := by
+  unfold stepM; simp only [hEn, Bool.not_true, Bool.false_eq_true, ↓reduceIte, resetDataRaceTrackingM, hPick, hCur, hBlk, hNe, hStmt, hEval, hMut, hRace, bind, Except.bind, pure, Except.pure]
 private theorem fa_stepM_term {M : Type} [Gen.Memory M] [MemoryOps M]
     (m : Gen.Machine M) {mAfter : Gen.Machine M} (fr : Gen.StackFrame M) (blk : Gen.BasicBlock)
-    (hEn : m.threads.any (fun th => decide (th.state = .Enabled)) = true)
-    (hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread)
-    (hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok fr)
-    (hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk)
-    (hEq : fr.next_stmt = (blk.statements.length : Int))
-    (hEval : evalTerminatorM { m with mem := { m.mem with accesses := [] } } blk.terminator = .ok mAfter)
-    (hRace : ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread
-      (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) = .ok ()) : stepM m = .ok mAfter := by
-  unfold stepM
-  simp only [hEn, Bool.not_true, Bool.false_eq_true, ↓reduceIte, resetDataRaceTrackingM, hPick, hCur, hBlk, hEq,
-    hEval, hRace, bind, Except.bind, pure, Except.pure]
+    (hEn : m.threads.any (fun th => decide (th.state = .Enabled)) = true) (hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread)
+    (hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok fr) (hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk)
+    (hEq : fr.next_stmt = (blk.statements.length : Int)) (hEval : evalTerminatorM { m with mem := { m.mem with accesses := [] } } blk.terminator = .ok mAfter)
+    (hRace : ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) = .ok ()) : stepM m = .ok mAfter := by
+  unfold stepM; simp only [hEn, Bool.not_true, Bool.false_eq_true, ↓reduceIte, resetDataRaceTrackingM, hPick, hCur, hBlk, hEq, hEval, hRace, bind, Except.bind, pure, Except.pure]
 private def faMkM {M : Type} [Gen.Memory M] (cm : Gen.ConcurrentMemory M) (st : List (Gen.StackFrame M)) : Gen.Machine M :=
   { prog := emptyProg, mem := cm, intptrcast := ⟨⟨[]⟩⟩, threads := [{ stack := st, state := .Enabled, unwind_payloads := [] }],
     active_thread := 0, synchronized_threads := ⟨[]⟩, locks := [], global_ptrs := ⟨[]⟩, fn_ptrs := ⟨[]⟩, vtable_ptrs := ⟨[]⟩, stdout := ⟨[]⟩, stderr := ⟨[]⟩ }
-private def faCallee64 {M : Type} [Gen.Memory M] (pRet p0 p1 : Gen.ThinPointer (Gen.Memory.Provenance M))
+private def faCarrierFnN (n : Nat) : Gen.Function where
+  locals := ⟨[(localName 0, .Int ⟨.Signed, ⟨n⟩⟩), (localName 1, .Int ⟨.Unsigned, ⟨n⟩⟩)]⟩
+  args := [localName 1]; ret := localName 0; calling_convention := .Rust
+  blocks := ⟨[(bbName 0, ⟨[.Assign (.Local (localName 0)) (.UnOp (.Cast (.Transmute (.Int ⟨.Signed, ⟨n⟩⟩))) (.Load (.Local (localName 1))))], .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1; implicit_writes := true
+private def faCalleeN {M : Type} [Gen.Memory M] (n : Nat) (pRet p0 p1 : Gen.ThinPointer (Gen.Memory.Provenance M))
     (exC : Gen.Memory.FrameExtra M) (b : Gen.BbName) (s : Int) : Gen.StackFrame M :=
-  { func := fcCarrier64Fn, locals := ⟨[(localName 0, p0), (localName 1, p1)]⟩,
+  { func := faCarrierFnN n, locals := ⟨[(localName 0, p0), (localName 1, p1)]⟩,
     stack_pop_action := .BackToCaller (some (bbName 7)) none pRet, next_block := b, next_stmt := s, extra := exC }
-private theorem fa_carrier64_stepsM_3 {M : Type} [Gen.Memory M] [MemoryOps M]
+private theorem fa_carrier_stepsM_3 {M : Type} [Gen.Memory M] [MemoryOps M] (n : Nat) (hgood : GoodSize n)
     (vU vI : Int) (bs : List (Gen.AbstractByte (Gen.Memory.Provenance M)))
     (caller : Gen.StackFrame M) (pRet p0 p1 : Gen.ThinPointer (Gen.Memory.Provenance M))
     (exC : Gen.Memory.FrameExtra M) (mem0 mem1 mem2 mem3 mem4 : M)
-    (hChkU : ∀ m, checkValueM (M := M) (.Int vU) (.Int fcU64It) m = .ok ())
-    (hChkI : ∀ m, checkValueM (M := M) (.Int vI) (.Int fcI64It) m = .ok ())
-    (hDecU : Type.decodeM (M := M) (.Int fcU64It) bs = .ok (some (.Int vU)))
-    (hDecI : Type.decodeM (M := M) (.Int fcI64It) bs = .ok (some (.Int vI)))
-    (hEncI : Type.encodeM (M := M) (.Int fcI64It) (.Int vI) = .ok bs)
-    (htr : ∀ m, transmuteM (M := M) (.Int vU) (.Int fcU64It) (.Int fcI64It) m = .ok (.Int vI))
-    (hLd1 : MemoryOps.load mem0 p1 ⟨8⟩ ⟨1⟩ = .ok (bs, mem0))
-    (hSt0 : MemoryOps.store mem0 p0 bs ⟨1⟩ = .ok mem1)
-    (hLd0 : MemoryOps.load mem1 p0 ⟨8⟩ ⟨8⟩ = .ok (bs, mem1))
-    (hDa0 : MemoryOps.deallocate mem1 p0 .Stack ⟨8⟩ ⟨8⟩ = .ok mem2)
-    (hDa1 : MemoryOps.deallocate mem2 p1 .Stack ⟨8⟩ ⟨8⟩ = .ok mem3)
-    (hEnd : MemoryOps.end_call mem3 exC = .ok mem3)
-    (hStR : MemoryOps.store mem3 pRet bs ⟨8⟩ = .ok mem4) :
-    ∃ acc, stepsM 3 (faMkM ⟨mem0, []⟩ [caller, faCallee64 pRet p0 p1 exC (bbName 1) 0]) =
+    (hChkU : ∀ m, checkValueM (M := M) (.Int vU) (.Int ⟨.Unsigned, ⟨n⟩⟩) m = .ok ()) (hChkI : ∀ m, checkValueM (M := M) (.Int vI) (.Int ⟨.Signed, ⟨n⟩⟩) m = .ok ())
+    (hDecU : Type.decodeM (M := M) (.Int ⟨.Unsigned, ⟨n⟩⟩) bs = .ok (some (.Int vU))) (hDecI : Type.decodeM (M := M) (.Int ⟨.Signed, ⟨n⟩⟩) bs = .ok (some (.Int vI)))
+    (hEncI : Type.encodeM (M := M) (.Int ⟨.Signed, ⟨n⟩⟩) (.Int vI) = .ok bs) (htr : ∀ m, transmuteM (M := M) (.Int vU) (.Int ⟨.Unsigned, ⟨n⟩⟩) (.Int ⟨.Signed, ⟨n⟩⟩) m = .ok (.Int vI))
+    (hLd1 : MemoryOps.load mem0 p1 ⟨n⟩ ⟨1⟩ = .ok (bs, mem0)) (hSt0 : MemoryOps.store mem0 p0 bs ⟨1⟩ = .ok mem1) (hLd0 : MemoryOps.load mem1 p0 ⟨n⟩ ⟨n⟩ = .ok (bs, mem1))
+    (hDa0 : MemoryOps.deallocate mem1 p0 .Stack ⟨n⟩ ⟨n⟩ = .ok mem2) (hDa1 : MemoryOps.deallocate mem2 p1 .Stack ⟨n⟩ ⟨n⟩ = .ok mem3)
+    (hEnd : MemoryOps.end_call mem3 exC = .ok mem3) (hStR : MemoryOps.store mem3 pRet bs ⟨n⟩ = .ok mem4) :
+    ∃ acc, stepsM 3 (faMkM ⟨mem0, []⟩ [caller, faCalleeN n pRet p0 p1 exC (bbName 1) 0]) =
       .ok (faMkM ⟨mem4, acc⟩ [{ caller with next_block := bbName 7, next_stmt := 0 }]) := by
-  let callee := faCallee64 pRet p0 p1 exC
-  have hLayU : Type.layout (.Int fcU64It) = .ok (.Sized ⟨8⟩ ⟨8⟩) := layout_eq fcU64It fc_goodSize_8
-  have hLayI : Type.layout (.Int fcI64It) = .ok (.Sized ⟨8⟩ ⟨8⟩) := layout_eq fcI64It fc_goodSize_8
+  let callee := faCalleeN n pRet p0 p1 exC
+  have hLayU : Type.layout (.Int ⟨.Unsigned, ⟨n⟩⟩) = .ok (.Sized ⟨n⟩ ⟨n⟩) := layout_eq ⟨.Unsigned, ⟨n⟩⟩ hgood
+  have hLayI : Type.layout (.Int ⟨.Signed, ⟨n⟩⟩) = .ok (.Sized ⟨n⟩ ⟨n⟩) := layout_eq ⟨.Signed, ⟨n⟩⟩ hgood
   have hs1 : stepM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 1) 0]) = .ok (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) :=
     fa_stepM_term _ (callee (bbName 1) 0) ⟨[], .Goto (bbName 0), .Regular⟩ rfl rfl rfl rfl rfl rfl rfl
   have hEv2 : evalStatementM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0])
-      (.Assign (.Local (localName 0)) (.UnOp (.Cast (.Transmute (.Int fcI64It))) (.Load (.Local (localName 1))))) =
-      .ok (faMkM ⟨mem1, [⟨.Load, .None, p1.addr, ⟨8⟩⟩, ⟨.Store, .None, p0.addr, ⟨bs.length⟩⟩]⟩ [caller, callee (bbName 0) 0]) := by
-    have hp0 : evalPlaceM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) (.Local (localName 0)) =
-        .ok (({ ptr := ThinPointer.widen p0 none, aligned := true }, .Int fcI64It), faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) := rfl
-    have hp1 : evalPlaceM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) (.Local (localName 1)) =
-        .ok (({ ptr := ThinPointer.widen p1 none, aligned := true }, .Int fcU64It), faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) := rfl
-    have hld : placeLoadM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) { ptr := ThinPointer.widen p1 none, aligned := true } (.Int fcU64It) =
-        .ok (.Int vU, faMkM ⟨mem0, [⟨.Load, .None, p1.addr, ⟨8⟩⟩]⟩ [caller, callee (bbName 0) 0]) := by
-      unfold placeLoadM typedLoadM
-      simp only [faMkM, Bool.not_true, Bool.false_eq_true, ↓reduceIte, ThinPointer.widen, hLayU, expect_size_sized,
-        ConcurrentMemory.load, hLd1, hDecU, hChkU, bind, Except.bind, pure, Except.pure]; rfl
-    have hst : placeStoreM (faMkM ⟨mem0, [⟨.Load, .None, p1.addr, ⟨8⟩⟩]⟩ [caller, callee (bbName 0) 0])
-        { ptr := ThinPointer.widen p0 none, aligned := true } (.Int vI) (.Int fcI64It) =
-        .ok (faMkM ⟨mem1, [⟨.Load, .None, p1.addr, ⟨8⟩⟩, ⟨.Store, .None, p0.addr, ⟨bs.length⟩⟩]⟩ [caller, callee (bbName 0) 0]) := by
-      unfold placeStoreM typedStoreM
-      simp only [faMkM, Bool.not_true, Bool.false_eq_true, ↓reduceIte, ThinPointer.widen,
-        hChkI, hEncI, ConcurrentMemory.store, hSt0, bind, Except.bind, pure, Except.pure]; rfl
+      (.Assign (.Local (localName 0)) (.UnOp (.Cast (.Transmute (.Int ⟨.Signed, ⟨n⟩⟩))) (.Load (.Local (localName 1))))) =
+      .ok (faMkM ⟨mem1, [⟨.Load, .None, p1.addr, ⟨n⟩⟩, ⟨.Store, .None, p0.addr, ⟨bs.length⟩⟩]⟩ [caller, callee (bbName 0) 0]) := by
+    have hp0 : evalPlaceM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) (.Local (localName 0)) = .ok (({ ptr := ThinPointer.widen p0 none, aligned := true }, .Int ⟨.Signed, ⟨n⟩⟩), faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) := rfl
+    have hp1 : evalPlaceM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) (.Local (localName 1)) = .ok (({ ptr := ThinPointer.widen p1 none, aligned := true }, .Int ⟨.Unsigned, ⟨n⟩⟩), faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) := rfl
+    have hld : placeLoadM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) { ptr := ThinPointer.widen p1 none, aligned := true } (.Int ⟨.Unsigned, ⟨n⟩⟩) =
+        .ok (.Int vU, faMkM ⟨mem0, [⟨.Load, .None, p1.addr, ⟨n⟩⟩]⟩ [caller, callee (bbName 0) 0]) := by
+      unfold placeLoadM typedLoadM; simp only [faMkM, Bool.not_true, Bool.false_eq_true, ↓reduceIte, ThinPointer.widen, hLayU, expect_size_sized, ConcurrentMemory.load, hLd1, hDecU, hChkU, bind, Except.bind, pure, Except.pure]; rfl
+    have hst : placeStoreM (faMkM ⟨mem0, [⟨.Load, .None, p1.addr, ⟨n⟩⟩]⟩ [caller, callee (bbName 0) 0]) { ptr := ThinPointer.widen p0 none, aligned := true } (.Int vI) (.Int ⟨.Signed, ⟨n⟩⟩) =
+        .ok (faMkM ⟨mem1, [⟨.Load, .None, p1.addr, ⟨n⟩⟩, ⟨.Store, .None, p0.addr, ⟨bs.length⟩⟩]⟩ [caller, callee (bbName 0) 0]) := by
+      unfold placeStoreM typedStoreM; simp only [faMkM, Bool.not_true, Bool.false_eq_true, ↓reduceIte, ThinPointer.widen, hChkI, hEncI, ConcurrentMemory.store, hSt0, bind, Except.bind, pure, Except.pure]; rfl
     unfold evalStatementM; dsimp only [evalValueM]
-    simp only [hp0, hp1, hld, fa_evalUnOpM_transmute_u64_i64 (M := M) vU vI _ (htr _), hst, bind, Except.bind, pure, Except.pure]
+    simp only [hp0, hp1, hld, fa_evalUnOpM_transmute_uN_iN (M := M) n hgood vU vI _ (htr _), hst, bind, Except.bind, pure, Except.pure]
   have hs2 : stepM (faMkM ⟨mem0, []⟩ [caller, callee (bbName 0) 0]) =
-      .ok (faMkM ⟨mem1, [⟨.Load, .None, p1.addr, ⟨8⟩⟩, ⟨.Store, .None, p0.addr, ⟨bs.length⟩⟩]⟩ [caller, callee (bbName 0) 1]) :=
+      .ok (faMkM ⟨mem1, [⟨.Load, .None, p1.addr, ⟨n⟩⟩, ⟨.Store, .None, p0.addr, ⟨bs.length⟩⟩]⟩ [caller, callee (bbName 0) 1]) :=
     fa_stepM_stmt _ (callee (bbName 0) 0) _ _ rfl rfl rfl rfl (show (0 : Int) ≠ 1 by decide) rfl hEv2 rfl rfl
   have hEv3 : evalTerminatorM (faMkM ⟨mem1, []⟩ [caller, callee (bbName 0) 1]) .Return =
-      .ok (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨8⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩
-        [{ caller with next_block := bbName 7, next_stmt := 0 }]) := by
-    let mPop := faMkM ⟨mem1, []⟩ [caller]; let mLd := faMkM ⟨mem1, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩ [caller]; let mEnd := faMkM ⟨mem3, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩ [caller]
+      .ok (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨n⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [{ caller with next_block := bbName 7, next_stmt := 0 }]) := by
+    let mPop := faMkM ⟨mem1, []⟩ [caller]; let mLd := faMkM ⟨mem1, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩ [caller]; let mEnd := faMkM ⟨mem3, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩ [caller]
     have hAct : activeThreadM (faMkM ⟨mem1, []⟩ [caller, callee (bbName 0) 1]) = .ok { stack := [caller, callee (bbName 0) 1], state := .Enabled, unwind_payloads := [] } := rfl
     have hLast : [caller, callee (bbName 0) 1].getLast? = some (callee (bbName 0) 1) := rfl
-    have hPop : listSet (T := Gen.Thread M) (faMkM ⟨mem1, []⟩ [caller, callee (bbName 0) 1]).threads
-        (faMkM ⟨mem1, []⟩ [caller, callee (bbName 0) 1]).active_thread
+    have hPop : listSet (T := Gen.Thread M) (faMkM ⟨mem1, []⟩ [caller, callee (bbName 0) 1]).threads (faMkM ⟨mem1, []⟩ [caller, callee (bbName 0) 1]).active_thread
         { stack := [caller], state := .Enabled, unwind_payloads := [] } "pop" = .ok [{ stack := [caller], state := .Enabled, unwind_payloads := [] }] := rfl
-    have hCTy : mapIndex (callee (bbName 0) 1).func.locals (callee (bbName 0) 1).func.ret "frame.func.locals[frame.func.ret]" = .ok (.Int fcI64It) := rfl
+    have hCTy : mapIndex (callee (bbName 0) 1).func.locals (callee (bbName 0) 1).func.ret "frame.func.locals[frame.func.ret]" = .ok (.Int ⟨.Signed, ⟨n⟩⟩) := rfl
     have hRPtr : mapIndex (callee (bbName 0) 1).locals (callee (bbName 0) 1).func.ret "frame.locals[frame.func.ret]" = .ok p0 := rfl
-    have hld : typedLoadM mPop p0 (.Int fcI64It) ⟨8⟩ .None = .ok (.Int vI, mLd) := by
+    have hld : typedLoadM mPop p0 (.Int ⟨.Signed, ⟨n⟩⟩) ⟨n⟩ .None = .ok (.Int vI, mLd) := by
       unfold typedLoadM; simp only [mPop, mLd, faMkM, hLayI, expect_size_sized, ConcurrentMemory.load, hLd0, hDecI, hChkI, bind, Except.bind, pure, Except.pure]; rfl
-    have hsd0 : storageDeadM (callee (bbName 0) 1) mLd.mem (localName 0) =
-        .ok ({ callee (bbName 0) 1 with locals := ⟨[(localName 1, p1)]⟩ }, ⟨mem2, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩) := by
-      unfold storageDeadM
-      have h1 : mapIndex fcCarrier64Fn.locals (localName 0) "self.func.locals[local]" = .ok (.Int fcI64It) := rfl
+    have hsd0 : storageDeadM (callee (bbName 0) 1) mLd.mem (localName 0) = .ok ({ callee (bbName 0) 1 with locals := ⟨[(localName 1, p1)]⟩ }, ⟨mem2, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩) := by
+      unfold storageDeadM; have h1 : mapIndex (faCarrierFnN n).locals (localName 0) "self.func.locals[local]" = .ok (.Int ⟨.Signed, ⟨n⟩⟩) := rfl
       have h2 : mapRemove (⟨[(localName 0, p0), (localName 1, p1)]⟩ : Map Gen.LocalName (Gen.ThinPointer (Gen.Memory.Provenance M))) (localName 0) = (some p0, ⟨[(localName 1, p1)]⟩) := rfl
-      simp only [mLd, faMkM, callee, faCallee64, h1, hLayI, expect_size_sized, LayoutStrategy.expect_align, h2, ConcurrentMemory.deallocate, hDa0, bind, Except.bind, pure, Except.pure]
-    have hsd1 : storageDeadM { callee (bbName 0) 1 with locals := ⟨[(localName 1, p1)]⟩ } ⟨mem2, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩ (localName 1) =
-        .ok ({ callee (bbName 0) 1 with locals := ⟨[]⟩ }, ⟨mem3, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩) := by
-      unfold storageDeadM
-      have h1 : mapIndex fcCarrier64Fn.locals (localName 1) "self.func.locals[local]" = .ok (.Int fcU64It) := rfl
+      simp only [mLd, faMkM, callee, faCalleeN, h1, hLayI, expect_size_sized, LayoutStrategy.expect_align, h2, ConcurrentMemory.deallocate, hDa0, bind, Except.bind, pure, Except.pure]
+    have hsd1 : storageDeadM { callee (bbName 0) 1 with locals := ⟨[(localName 1, p1)]⟩ } ⟨mem2, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩ (localName 1) = .ok ({ callee (bbName 0) 1 with locals := ⟨[]⟩ }, ⟨mem3, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩) := by
+      unfold storageDeadM; have h1 : mapIndex (faCarrierFnN n).locals (localName 1) "self.func.locals[local]" = .ok (.Int ⟨.Unsigned, ⟨n⟩⟩) := rfl
       have h2 : mapRemove (⟨[(localName 1, p1)]⟩ : Map Gen.LocalName (Gen.ThinPointer (Gen.Memory.Provenance M))) (localName 1) = (some p1, ⟨[]⟩) := rfl
-      simp only [callee, faCallee64, h1, hLayU, expect_size_sized, LayoutStrategy.expect_align, h2, ConcurrentMemory.deallocate, hDa1, bind, Except.bind, pure, Except.pure]
-    have hda : deallocAllM (callee (bbName 0) 1).locals.entries.length (callee (bbName 0) 1) mLd.mem =
-        .ok ({ callee (bbName 0) 1 with locals := ⟨[]⟩ }, ⟨mem3, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩) := by
-      change (do let (fr, cm) ← storageDeadM (callee (bbName 0) 1) mLd.mem (localName 0); deallocAllM 1 fr cm) = _
-      rw [hsd0]; dsimp only [bind, Except.bind]
-      change (do let (fr, cm) ← storageDeadM { callee (bbName 0) 1 with locals := ⟨[(localName 1, p1)]⟩ } ⟨mem2, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩ (localName 1); deallocAllM 0 fr cm) = _
-      rw [hsd1]; rfl
-    have hend : ConcurrentMemory.end_call ⟨mem3, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩ exC = .ok ⟨mem3, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩ := by
-      unfold ConcurrentMemory.end_call; simp only [hEnd, bind, Except.bind, pure, Except.pure]
+      simp only [callee, faCalleeN, h1, hLayU, expect_size_sized, LayoutStrategy.expect_align, h2, ConcurrentMemory.deallocate, hDa1, bind, Except.bind, pure, Except.pure]
+    have hda : deallocAllM (callee (bbName 0) 1).locals.entries.length (callee (bbName 0) 1) mLd.mem = .ok ({ callee (bbName 0) 1 with locals := ⟨[]⟩ }, ⟨mem3, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩) := by
+      change (do let (fr, cm) ← storageDeadM (callee (bbName 0) 1) mLd.mem (localName 0); deallocAllM 1 fr cm) = _; rw [hsd0]; dsimp only [bind, Except.bind]
+      change (do let (fr, cm) ← storageDeadM { callee (bbName 0) 1 with locals := ⟨[(localName 1, p1)]⟩ } ⟨mem2, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩ (localName 1); deallocAllM 0 fr cm) = _; rw [hsd1]; rfl
+    have hend : ConcurrentMemory.end_call ⟨mem3, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩ exC = .ok ⟨mem3, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩ := by unfold ConcurrentMemory.end_call; simp only [hEnd, bind, Except.bind, pure, Except.pure]
     have hAct2 : activeThreadM mEnd = .ok { stack := [caller], state := .Enabled, unwind_payloads := [] } := rfl
-    have hst : typedStoreM mEnd pRet (.Int vI) (.Int fcI64It) ⟨8⟩ .None =
-        .ok (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨8⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [caller]) := by
+    have hst : typedStoreM mEnd pRet (.Int vI) (.Int ⟨.Signed, ⟨n⟩⟩) ⟨n⟩ .None = .ok (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨n⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [caller]) := by
       unfold typedStoreM; simp only [mEnd, faMkM, hChkI, hEncI, ConcurrentMemory.store, hStR, bind, Except.bind, pure, Except.pure]; rfl
-    have hJmp : jumpToBlockM (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨8⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [caller]) (bbName 7) =
-        .ok (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨8⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [{ caller with next_block := bbName 7, next_stmt := 0 }]) := rfl
+    have hJmp : jumpToBlockM (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨n⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [caller]) (bbName 7) =
+        .ok (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨n⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [{ caller with next_block := bbName 7, next_stmt := 0 }]) := rfl
     have hne1 : ¬ ((1 : Nat) = 0) := by decide
     have hmPop : { faMkM ⟨mem1, []⟩ [caller, callee (bbName 0) 1] with threads := [{ stack := [caller], state := .Enabled, unwind_payloads := [] }] } = mPop := rfl
-    have hmEnd : { mLd with mem := ⟨mem3, [⟨.Load, .None, p0.addr, ⟨8⟩⟩]⟩ } = mEnd := rfl
-    unfold evalTerminatorM evalReturnM
-    rw [hAct]; dsimp only [bind, Except.bind, pure, Except.pure]; rw [hLast]; dsimp only [bind, Except.bind, pure, Except.pure, List.dropLast]
+    have hmEnd : { mLd with mem := ⟨mem3, [⟨.Load, .None, p0.addr, ⟨n⟩⟩]⟩ } = mEnd := rfl
+    unfold evalTerminatorM evalReturnM; rw [hAct]; dsimp only [bind, Except.bind, pure, Except.pure]; rw [hLast]; dsimp only [bind, Except.bind, pure, Except.pure, List.dropLast]
     rw [hPop]; dsimp only [bind, Except.bind, pure, Except.pure]; rw [hCTy]; dsimp only [bind, Except.bind, pure, Except.pure]
     rw [hLayI]; dsimp only [LayoutStrategy.expect_align, bind, Except.bind, pure, Except.pure]; rw [hRPtr]; dsimp only [bind, Except.bind, pure, Except.pure]
-    rw [hmPop, hld]; dsimp only [bind, Except.bind]; rw [hda]; dsimp only [bind, Except.bind, callee, faCallee64]
-    rw [hend]; dsimp only [bind, Except.bind]; rw [hmEnd, hAct2]
-    dsimp only [bind, Except.bind, List.length]; simp only [hne1, ↓reduceIte]
-    rw [hst]; dsimp only [bind, Except.bind]; exact hJmp
-  have hs3 : stepM (faMkM ⟨mem1, [⟨.Load, .None, p1.addr, ⟨8⟩⟩, ⟨.Store, .None, p0.addr, ⟨bs.length⟩⟩]⟩ [caller, callee (bbName 0) 1]) =
-      .ok (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨8⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [{ caller with next_block := bbName 7, next_stmt := 0 }]) :=
-    fa_stepM_term _ (callee (bbName 0) 1) ⟨[.Assign (.Local (localName 0)) (.UnOp (.Cast (.Transmute (.Int fcI64It))) (.Load (.Local (localName 1))))], .Return, .Regular⟩ rfl rfl rfl rfl rfl hEv3 rfl
-  refine ⟨[⟨.Load, .None, p0.addr, ⟨8⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩], ?_⟩
+    rw [hmPop, hld]; dsimp only [bind, Except.bind]; rw [hda]; dsimp only [bind, Except.bind, callee, faCalleeN]; rw [hend]; dsimp only [bind, Except.bind]
+    rw [hmEnd, hAct2]; dsimp only [bind, Except.bind, List.length]; simp only [hne1, ↓reduceIte]; rw [hst]; dsimp only [bind, Except.bind]; exact hJmp
+  have hs3 : stepM (faMkM ⟨mem1, [⟨.Load, .None, p1.addr, ⟨n⟩⟩, ⟨.Store, .None, p0.addr, ⟨bs.length⟩⟩]⟩ [caller, callee (bbName 0) 1]) =
+      .ok (faMkM ⟨mem4, [⟨.Load, .None, p0.addr, ⟨n⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩]⟩ [{ caller with next_block := bbName 7, next_stmt := 0 }]) :=
+    fa_stepM_term _ (callee (bbName 0) 1) ⟨[.Assign (.Local (localName 0)) (.UnOp (.Cast (.Transmute (.Int ⟨.Signed, ⟨n⟩⟩))) (.Load (.Local (localName 1))))], .Return, .Regular⟩ rfl rfl rfl rfl rfl hEv3 rfl
+  refine ⟨[⟨.Load, .None, p0.addr, ⟨n⟩⟩, ⟨.Store, .None, pRet.addr, ⟨bs.length⟩⟩], ?_⟩
   unfold stepsM; rw [hs1]; dsimp only [bind, Except.bind]; unfold stepsM; rw [hs2]; dsimp only [bind, Except.bind]; unfold stepsM; rw [hs3]; rfl
-private theorem fa_fcRetAfter8_of_steps {body : CapturedMir} {args : List Value} {n : Nat} {m0 m' : Mach}
-    (h0 : fcStartMachine8 body args = some m0) (hs : Interp.steps n m0 = .ok m') :
-    fcRetAfter8 body args n = some (m'.mem.memory.allocations[0]?, m'.threads.map (·.stack.length)) := by
-  unfold fcRetAfter8; rw [h0, Option.bind_some, hs]; rfl
-private theorem fa_fcRetAfterTB8_of_steps {body : CapturedMir} {args : List Value} {n : Nat} {m0 m' : MachTB}
-    (h0 : fcStartMachineTB8 body args = some m0) (hs : Interp.stepsTB n m0 = .ok m') :
-    fcRetAfterTB8 body args n =
-      some { retAlloc := m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)),
-             stackDepths := m'.threads.map (·.stack.length) } := by
+private theorem fa_retAfter_of_steps {body : CapturedMir} {args : List Value} {n : Nat} {m0 m' : Mach} (h0 : startMachine body args = some m0) (hs : Interp.steps n m0 = .ok m') :
+    retAfter body args n = some (m'.mem.memory.allocations[0]?, m'.threads.map (·.stack.length)) := by unfold retAfter; rw [h0, Option.bind_some, hs]; rfl
+private theorem fa_retAfterTB_of_steps {body : CapturedMir} {args : List Value} {n : Nat} {m0 m' : MachTB} (h0 : startMachineTB body args = some m0) (hs : Interp.stepsTB n m0 = .ok m') :
+    retAfterTB body args n = some { retAlloc := m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)), stackDepths := m'.threads.map (·.stack.length) } := by
+  unfold retAfterTB; rw [h0, Option.bind_some, hs]; rfl
+private theorem fa_fcRetAfter8_of_steps {body : CapturedMir} {args : List Value} {n : Nat} {m0 m' : Mach} (h0 : fcStartMachine8 body args = some m0) (hs : Interp.steps n m0 = .ok m') :
+    fcRetAfter8 body args n = some (m'.mem.memory.allocations[0]?, m'.threads.map (·.stack.length)) := by unfold fcRetAfter8; rw [h0, Option.bind_some, hs]; rfl
+private theorem fa_fcRetAfterTB8_of_steps {body : CapturedMir} {args : List Value} {n : Nat} {m0 m' : MachTB} (h0 : fcStartMachineTB8 body args = some m0) (hs : Interp.stepsTB n m0 = .ok m') :
+    fcRetAfterTB8 body args n = some { retAlloc := m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)), stackDepths := m'.threads.map (·.stack.length) } := by
   unfold fcRetAfterTB8; rw [h0, Option.bind_some, hs]; rfl
 private theorem fa_carrier64_m0B_eq (bits : Nat) :
     machineWithCtx fcCtx8 fcCarrier64Body fcCarrier64Fn (initMachineState fcCarrier64Body [.scalar ⟨bits, 8⟩]).frame.locals fcCarrier64Fn.start =
       faMkM ⟨⟨[fcRetAlloc8, { data := List.replicate 8 .Uninit, addr := 128, align := ⟨8⟩, kind := .Stack, live := true, extra := () },
         { data := (leBytes bits 8).map (fun b => .Init b none), addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := () }], {}⟩, []⟩
-        [fcCallerFrame8, faCallee64 retPtr (localPtr fcCtx8 0) (localPtr fcCtx8 1) () (bbName 1) 0] := rfl
+        [fcCallerFrame8, faCalleeN 8 retPtr (localPtr fcCtx8 0) (localPtr fcCtx8 1) () (bbName 1) 0] := rfl
 private theorem fa_carrier64_m0TB_eq (bits : Nat) :
     liftMachToTB (machineWithCtx fcCtx8 fcCarrier64Body fcCarrier64Fn (initMachineState fcCarrier64Body [.scalar ⟨bits, 8⟩]).frame.locals fcCarrier64Fn.start) =
-      faMkM ⟨⟨⟨true⟩, ⟨[{ data := List.replicate 8 .Uninit, addr := 64, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot8 } },
-        { data := List.replicate 8 .Uninit, addr := 128, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot8 } },
-        { data := (leBytes bits 8).map (fun b => .Init b none), addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot8 } }], {}⟩⟩, []⟩
-        [liftFrameTB fcCallerFrame8, faCallee64 (liftThinPtrTB retPtr) (liftThinPtrTB (localPtr fcCtx8 0)) (liftThinPtrTB (localPtr fcCtx8 1)) TreeBorrowsMemory.new_call (bbName 1) 0] := by
+      faMkM ⟨⟨⟨true⟩, ⟨[{ data := List.replicate 8 .Uninit, addr := 64, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot 8 } },
+        { data := List.replicate 8 .Uninit, addr := 128, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot 8 } },
+        { data := (leBytes bits 8).map (fun b => .Init b none), addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot 8 } }], {}⟩⟩, []⟩
+        [liftFrameTB fcCallerFrame8, faCalleeN 8 (liftThinPtrTB retPtr) (liftThinPtrTB (localPtr fcCtx8 0)) (liftThinPtrTB (localPtr fcCtx8 1)) TreeBorrowsMemory.new_call (bbName 1) 0] := by
   rw [fa_carrier64_m0B_eq bits]
   let a1B : Gen.Allocation := { data := List.replicate 8 .Uninit, addr := 128, align := ⟨8⟩, kind := .Stack, live := true, extra := () }
   let a2B : Gen.Allocation := { data := (leBytes bits 8).map (fun b => .Init b none), addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := () }
-  change faMkM ⟨⟨⟨true⟩, ⟨[liftAllocTB fcRetAlloc8, liftAllocTB a1B, liftAllocTB a2B], {}⟩⟩, []⟩ [liftFrameTB fcCallerFrame8, faCallee64 (liftThinPtrTB retPtr) (liftThinPtrTB (localPtr fcCtx8 0)) (liftThinPtrTB (localPtr fcCtx8 1)) TreeBorrowsMemory.new_call (bbName 1) 0] = _
-  rw [show liftAllocTB a2B = { data := (leBytes bits 8).map (fun b => .Init b none), addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot8 } } from fa_liftAllocTB_u64 bits 256]; rfl
+  change faMkM ⟨⟨⟨true⟩, ⟨[liftAllocTB fcRetAlloc8, liftAllocTB a1B, liftAllocTB a2B], {}⟩⟩, []⟩ [liftFrameTB fcCallerFrame8, faCalleeN 8 (liftThinPtrTB retPtr) (liftThinPtrTB (localPtr fcCtx8 0)) (liftThinPtrTB (localPtr fcCtx8 1)) TreeBorrowsMemory.new_call (bbName 1) 0] = _
+  rw [show liftAllocTB a2B = { data := (leBytes bits 8).map (fun b => .Init b none), addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot 8 } } from fa_liftAllocTB_uN 8 bits 256]; rfl
 private theorem fa_sym_carrier64_bm (bits : Nat) (hbits : bits < 2 ^ 64) :
     ∃ (m0 m' : Mach), fcStartMachine8 fcCarrier64Body [.scalar ⟨bits, 8⟩] = some m0 ∧ Interp.steps 3 m0 = .ok m' ∧
       m'.threads = [thread1 fcCtx8 [{ fcCtx8.caller with next_block := fcCtx8.nextBlock, next_stmt := 0 }]] ∧
       m'.mem.memory.allocations[0]? = some { fcRetAlloc8 with data := (encodeLittleEndianBytes bits 8 none).map fcByteToMR } := by
-  let bsB : List Byte := (leBytes bits 8).map (fun b => .Init b none)
-  have hBsB : bsB.length = 8 := by simp only [bsB, List.length_map, leBytes_length]
+  let bsB : List Byte := (leBytes bits 8).map (fun b => .Init b none); have hBsB : bsB.length = 8 := by simp only [bsB, List.length_map, leBytes_length]
+  have hn8 : (8 : Nat) ≠ 0 := by decide
   let a1B : Gen.Allocation := { data := List.replicate 8 .Uninit, addr := 128, align := ⟨8⟩, kind := .Stack, live := true, extra := () }
   let a2B : Gen.Allocation := { data := bsB, addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := () }
   let m0B : Mach := machineWithCtx fcCtx8 fcCarrier64Body fcCarrier64Fn (initMachineState fcCarrier64Body [.scalar ⟨bits, 8⟩]).frame.locals fcCarrier64Fn.start
   have hStBM : fcStartMachine8 fcCarrier64Body [.scalar ⟨bits, 8⟩] = some m0B := by unfold fcStartMachine8; rw [fc_translateFn_carrier64]; rfl
-  obtain ⟨accB, hsBM'⟩ := fa_carrier64_stepsM_3 (M := BM) (intFromBits bits ⟨.Unsigned, ⟨8⟩⟩) (intFromBits bits ⟨.Signed, ⟨8⟩⟩) bsB
+  obtain ⟨accB, hsBM'⟩ := fa_carrier_stepsM_3 (M := BM) 8 fc_goodSize_8 (intFromBits bits ⟨.Unsigned, ⟨8⟩⟩) (intFromBits bits ⟨.Signed, ⟨8⟩⟩) bsB
     fcCallerFrame8 retPtr (localPtr fcCtx8 0) (localPtr fcCtx8 1) ()
     ⟨[fcRetAlloc8, a1B, a2B], {}⟩ ⟨[fcRetAlloc8, { a1B with data := bsB }, a2B], {}⟩ ⟨[fcRetAlloc8, { a1B with data := bsB, live := false }, a2B], {}⟩
     ⟨[fcRetAlloc8, { a1B with data := bsB, live := false }, { a2B with live := false }], {}⟩ ⟨[{ fcRetAlloc8 with data := bsB }, { a1B with data := bsB, live := false }, { a2B with live := false }], {}⟩
-    (fa_checkValueM_int64 .Unsigned bits hbits) (fa_checkValueM_int64 .Signed bits hbits) (fa_decodeM_int64 .Unsigned bits hbits) (fa_decodeM_int64 .Signed bits hbits)
-    (fa_encodeM_int64 .Signed bits hbits) (fc_mrM_transmute_int (M := BM) .Unsigned .Signed 8 bits fc_goodSize_8 hbits)
-    (fa_bm_load_8 _ 2 256 ⟨1⟩ bsB rfl rfl hBsB rfl) (fa_bm_store_8 _ _ 1 128 ⟨1⟩ _ bsB rfl rfl rfl hBsB rfl) (fa_bm_load_8 _ 1 128 ⟨8⟩ bsB rfl rfl hBsB rfl)
-    (fa_bm_dealloc_8 _ _ 1 128 bsB rfl hBsB rfl) (fa_bm_dealloc_8 _ _ 2 256 bsB rfl hBsB rfl) rfl (fa_bm_store_8 _ _ 0 64 ⟨8⟩ _ bsB rfl rfl rfl hBsB rfl)
+    (fa_checkValueM_intN .Unsigned 8 fc_goodSize_8 bits hbits) (fa_checkValueM_intN .Signed 8 fc_goodSize_8 bits hbits) (fa_decodeM_intN .Unsigned 8 bits hbits) (fa_decodeM_intN .Signed 8 bits hbits)
+    (fa_encodeM_intN .Signed 8 fc_goodSize_8 bits hbits) (fc_mrM_transmute_int (M := BM) .Unsigned .Signed 8 bits fc_goodSize_8 hbits)
+    (fa_bm_load 8 hn8 _ 2 256 ⟨1⟩ bsB rfl rfl hBsB rfl) (fa_bm_store 8 hn8 _ _ 1 128 ⟨1⟩ _ bsB rfl rfl rfl hBsB rfl) (fa_bm_load 8 hn8 _ 1 128 ⟨8⟩ bsB rfl rfl hBsB rfl)
+    (fa_bm_dealloc 8 _ _ 1 128 bsB rfl hBsB rfl) (fa_bm_dealloc 8 _ _ 2 256 bsB rfl hBsB rfl) rfl (fa_bm_store 8 hn8 _ _ 0 64 ⟨8⟩ _ bsB rfl rfl rfl hBsB rfl)
   have hsBM : Interp.steps 3 m0B = .ok (faMkM ⟨⟨[{ fcRetAlloc8 with data := bsB }, { a1B with data := bsB, live := false }, { a2B with live := false }], {}⟩, accB⟩ [{ fcCallerFrame8 with next_block := bbName 7, next_stmt := 0 }]) := by
     dsimp only [m0B]; rw [fa_carrier64_m0B_eq bits, ← stepsM_bm_eq]; exact hsBM'
   have hEncB : (encodeLittleEndianBytes bits 8 none).map fcByteToMR = bsB := fc_map_encodeLittleEndianBytes .Unsigned none 8 bits
@@ -2211,19 +2072,20 @@ private theorem fa_sym_carrier64_tb (bits : Nat) (hbits : bits < 2 ^ 64) :
       m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) = some (true, ((encodeLittleEndianBytes bits 8 none).map fcByteToMR).map liftByteTB) := by
   let bsB : List Byte := (leBytes bits 8).map (fun b => .Init b none); let bsT : List (Gen.AbstractByte Gen.TreeBorrowsProvenance) := (leBytes bits 8).map (fun b => .Init b none)
   have hBsT : bsT.length = 8 := by simp only [bsT, List.length_map, leBytes_length]
+  have hn8 : (8 : Nat) ≠ 0 := by decide
   let m0B : Mach := machineWithCtx fcCtx8 fcCarrier64Body fcCarrier64Fn (initMachineState fcCarrier64Body [.scalar ⟨bits, 8⟩]).frame.locals fcCarrier64Fn.start
   have hStBM : fcStartMachine8 fcCarrier64Body [.scalar ⟨bits, 8⟩] = some m0B := by unfold fcStartMachine8; rw [fc_translateFn_carrier64]; rfl
-  let a0T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := List.replicate 8 .Uninit, addr := 64, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot8 } }
-  let a1T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := List.replicate 8 .Uninit, addr := 128, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot8 } }
-  let a2T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := bsT, addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot8 } }
-  obtain ⟨accT, hsTB'⟩ := fa_carrier64_stepsM_3 (M := TBM) (intFromBits bits ⟨.Unsigned, ⟨8⟩⟩) (intFromBits bits ⟨.Signed, ⟨8⟩⟩) bsT
+  let a0T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := List.replicate 8 .Uninit, addr := 64, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot 8 } }
+  let a1T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := List.replicate 8 .Uninit, addr := 128, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot 8 } }
+  let a2T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := bsT, addr := 256, align := ⟨8⟩, kind := .Stack, live := true, extra := { root := faRoot 8 } }
+  obtain ⟨accT, hsTB'⟩ := fa_carrier_stepsM_3 (M := TBM) 8 fc_goodSize_8 (intFromBits bits ⟨.Unsigned, ⟨8⟩⟩) (intFromBits bits ⟨.Signed, ⟨8⟩⟩) bsT
     (liftFrameTB fcCallerFrame8) (liftThinPtrTB retPtr) (liftThinPtrTB (localPtr fcCtx8 0)) (liftThinPtrTB (localPtr fcCtx8 1)) TreeBorrowsMemory.new_call
     ⟨⟨true⟩, ⟨[a0T, a1T, a2T], {}⟩⟩ ⟨⟨true⟩, ⟨[a0T, { a1T with data := bsT }, a2T], {}⟩⟩ ⟨⟨true⟩, ⟨[a0T, { a1T with data := bsT, live := false }, a2T], {}⟩⟩
     ⟨⟨true⟩, ⟨[a0T, { a1T with data := bsT, live := false }, { a2T with live := false }], {}⟩⟩ ⟨⟨true⟩, ⟨[{ a0T with data := bsT }, { a1T with data := bsT, live := false }, { a2T with live := false }], {}⟩⟩
-    (fa_checkValueM_int64 .Unsigned bits hbits) (fa_checkValueM_int64 .Signed bits hbits) (fa_decodeM_int64 .Unsigned bits hbits) (fa_decodeM_int64 .Signed bits hbits)
-    (fa_encodeM_int64 .Signed bits hbits) (fc_mrM_transmute_int (M := TBM) .Unsigned .Signed 8 bits fc_goodSize_8 hbits)
-    (fa_tbm_load_8 _ 2 256 ⟨1⟩ bsT rfl rfl hBsT rfl) (fa_tbm_store_8 _ _ 1 128 ⟨1⟩ _ bsT rfl rfl rfl hBsT rfl) (fa_tbm_load_8 _ 1 128 ⟨8⟩ bsT rfl rfl hBsT rfl)
-    (fa_tbm_dealloc_8 _ _ 1 128 bsT rfl hBsT rfl) (fa_tbm_dealloc_8 _ _ 2 256 bsT rfl hBsT rfl) rfl (fa_tbm_store_8 _ _ 0 64 ⟨8⟩ _ bsT rfl rfl rfl hBsT rfl)
+    (fa_checkValueM_intN .Unsigned 8 fc_goodSize_8 bits hbits) (fa_checkValueM_intN .Signed 8 fc_goodSize_8 bits hbits) (fa_decodeM_intN .Unsigned 8 bits hbits) (fa_decodeM_intN .Signed 8 bits hbits)
+    (fa_encodeM_intN .Signed 8 fc_goodSize_8 bits hbits) (fc_mrM_transmute_int (M := TBM) .Unsigned .Signed 8 bits fc_goodSize_8 hbits)
+    (fa_tbm_load 8 hn8 faRoot8_read _ 2 256 ⟨1⟩ bsT rfl rfl hBsT rfl) (fa_tbm_store 8 hn8 faRoot8_write _ _ 1 128 ⟨1⟩ _ bsT rfl rfl rfl hBsT rfl) (fa_tbm_load 8 hn8 faRoot8_read _ 1 128 ⟨8⟩ bsT rfl rfl hBsT rfl)
+    (fa_tbm_dealloc 8 faRoot8_write faRoot8_noProt _ _ 1 128 bsT rfl hBsT rfl) (fa_tbm_dealloc 8 faRoot8_write faRoot8_noProt _ _ 2 256 bsT rfl hBsT rfl) rfl (fa_tbm_store 8 hn8 faRoot8_write _ _ 0 64 ⟨8⟩ _ bsT rfl rfl rfl hBsT rfl)
   have hsTB : Interp.stepsTB 3 (liftMachToTB m0B) = .ok (faMkM ⟨⟨⟨true⟩, ⟨[{ a0T with data := bsT }, { a1T with data := bsT, live := false }, { a2T with live := false }], {}⟩⟩, accT⟩ [{ liftFrameTB fcCallerFrame8 with next_block := bbName 7, next_stmt := 0 }]) := by
     dsimp only [m0B]; rw [fa_carrier64_m0TB_eq bits]; exact hsTB'
   have hEncB : (encodeLittleEndianBytes bits 8 none).map fcByteToMR = bsB := fc_map_encodeLittleEndianBytes .Unsigned none 8 bits
@@ -2238,13 +2100,96 @@ private theorem fa_sym_carrier64_steps_bm_and_tb (bits : Nat) (hbits : bits < 2 
       m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) = some (true, ((encodeLittleEndianBytes bits 8 none).map fcByteToMR).map liftByteTB)) ∧
     fcRetAfter8 fcCarrier64Body [.scalar ⟨bits, 8⟩] 3 = some (some { fcRetAlloc8 with data := (encodeLittleEndianBytes bits 8 none).map fcByteToMR }, [1]) ∧
     fcRetAfterTB8 fcCarrier64Body [.scalar ⟨bits, 8⟩] 3 = tbRetU64 bits := by
-  have hbm := fa_sym_carrier64_bm bits hbits
-  have htb := fa_sym_carrier64_tb bits hbits
+  have hbm := fa_sym_carrier64_bm bits hbits; have htb := fa_sym_carrier64_tb bits hbits
   refine ⟨hbm, htb, ?_, ?_⟩
   · obtain ⟨m0, m', h0, hs, hth, hal⟩ := hbm; rw [fa_fcRetAfter8_of_steps h0 hs, hal, hth]; rfl
   · obtain ⟨m0, m', h0, hs, _, hth, hal⟩ := htb; rw [fa_fcRetAfterTB8_of_steps h0 hs, hth]
     have hEncB : (encodeLittleEndianBytes bits 8 none).map fcByteToMR = (leBytes bits 8).map (fun b => .Init b none) := fc_map_encodeLittleEndianBytes .Unsigned none 8 bits
     have hMap : m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)) = some (true, (scalarBytes fcU64It bits).map (projByteTB ∘ liftByteTB)) := by
+      cases hget : m'.mem.memory.mem.allocations[0]? with
+      | none => rw [hget] at hal; cases hal
+      | some a =>
+        rw [hget] at hal; simp only [Option.map_some, Option.some.injEq, Prod.mk.injEq] at hal ⊢
+        rcases hal with ⟨hlive, hdata⟩; exact ⟨hlive, by rw [hdata, hEncB, fa_map_liftByteTB_init, fa_map_projByteTB_init]; rfl⟩
+    rw [hMap]; rfl
+private theorem fa_carrier32_m0B_eq (bits : Nat) :
+    machine fcCarrierBody fcCarrierFn (initMachineState fcCarrierBody [.scalar ⟨bits, 4⟩]).frame.locals fcCarrierFn.start =
+      faMkM ⟨⟨[retAlloc, { data := List.replicate 4 .Uninit, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+        { data := (leBytes bits 4).map (fun b => .Init b none), addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := () }], {}⟩, []⟩
+        [callerFrame, faCalleeN 4 retPtr (localPtr ctx0 0) (localPtr ctx0 1) () (bbName 1) 0] := rfl
+private theorem fa_carrier32_m0TB_eq (bits : Nat) :
+    liftMachToTB (machine fcCarrierBody fcCarrierFn (initMachineState fcCarrierBody [.scalar ⟨bits, 4⟩]).frame.locals fcCarrierFn.start) =
+      faMkM ⟨⟨⟨true⟩, ⟨[{ data := List.replicate 4 .Uninit, addr := 64, align := ⟨4⟩, kind := .Stack, live := true, extra := { root := faRoot 4 } },
+        { data := List.replicate 4 .Uninit, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := { root := faRoot 4 } },
+        { data := (leBytes bits 4).map (fun b => .Init b none), addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := { root := faRoot 4 } }], {}⟩⟩, []⟩
+        [liftFrameTB callerFrame, faCalleeN 4 (liftThinPtrTB retPtr) (liftThinPtrTB (localPtr ctx0 0)) (liftThinPtrTB (localPtr ctx0 1)) TreeBorrowsMemory.new_call (bbName 1) 0] := by
+  rw [fa_carrier32_m0B_eq bits]
+  let a1B : Gen.Allocation := { data := List.replicate 4 .Uninit, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := () }
+  let a2B : Gen.Allocation := { data := (leBytes bits 4).map (fun b => .Init b none), addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := () }
+  change faMkM ⟨⟨⟨true⟩, ⟨[liftAllocTB retAlloc, liftAllocTB a1B, liftAllocTB a2B], {}⟩⟩, []⟩ [liftFrameTB callerFrame, faCalleeN 4 (liftThinPtrTB retPtr) (liftThinPtrTB (localPtr ctx0 0)) (liftThinPtrTB (localPtr ctx0 1)) TreeBorrowsMemory.new_call (bbName 1) 0] = _
+  rw [show liftAllocTB a2B = { data := (leBytes bits 4).map (fun b => .Init b none), addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := { root := faRoot 4 } } from fa_liftAllocTB_uN 4 bits 256]; rfl
+private theorem fa_sym_carrier32_bm (bits : Nat) (hbits : bits < 2 ^ 32) :
+    ∃ (m0 m' : Mach), startMachine fcCarrierBody [.scalar ⟨bits, 4⟩] = some m0 ∧ Interp.steps 3 m0 = .ok m' ∧
+      m'.threads = [thread1 ctx0 [{ ctx0.caller with next_block := ctx0.nextBlock, next_stmt := 0 }]] ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := (encodeLittleEndianBytes bits 4 none).map fcByteToMR } := by
+  let bsB : List Byte := (leBytes bits 4).map (fun b => .Init b none); have hBsB : bsB.length = 4 := by simp only [bsB, List.length_map, leBytes_length]
+  have hn4 : (4 : Nat) ≠ 0 := by decide
+  let a1B : Gen.Allocation := { data := List.replicate 4 .Uninit, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := () }
+  let a2B : Gen.Allocation := { data := bsB, addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := () }
+  let m0B : Mach := machine fcCarrierBody fcCarrierFn (initMachineState fcCarrierBody [.scalar ⟨bits, 4⟩]).frame.locals fcCarrierFn.start
+  have hStBM : startMachine fcCarrierBody [.scalar ⟨bits, 4⟩] = some m0B := by unfold startMachine; rw [fc_translateFn_carrier]; rfl
+  obtain ⟨accB, hsBM'⟩ := fa_carrier_stepsM_3 (M := BM) 4 fc_goodSize_4 (intFromBits bits ⟨.Unsigned, ⟨4⟩⟩) (intFromBits bits ⟨.Signed, ⟨4⟩⟩) bsB
+    callerFrame retPtr (localPtr ctx0 0) (localPtr ctx0 1) ()
+    ⟨[retAlloc, a1B, a2B], {}⟩ ⟨[retAlloc, { a1B with data := bsB }, a2B], {}⟩ ⟨[retAlloc, { a1B with data := bsB, live := false }, a2B], {}⟩
+    ⟨[retAlloc, { a1B with data := bsB, live := false }, { a2B with live := false }], {}⟩ ⟨[{ retAlloc with data := bsB }, { a1B with data := bsB, live := false }, { a2B with live := false }], {}⟩
+    (fa_checkValueM_intN .Unsigned 4 fc_goodSize_4 bits hbits) (fa_checkValueM_intN .Signed 4 fc_goodSize_4 bits hbits) (fa_decodeM_intN .Unsigned 4 bits hbits) (fa_decodeM_intN .Signed 4 bits hbits)
+    (fa_encodeM_intN .Signed 4 fc_goodSize_4 bits hbits) (fc_mrM_transmute_int (M := BM) .Unsigned .Signed 4 bits fc_goodSize_4 hbits)
+    (fa_bm_load 4 hn4 _ 2 256 ⟨1⟩ bsB rfl rfl hBsB rfl) (fa_bm_store 4 hn4 _ _ 1 128 ⟨1⟩ _ bsB rfl rfl rfl hBsB rfl) (fa_bm_load 4 hn4 _ 1 128 ⟨4⟩ bsB rfl rfl hBsB rfl)
+    (fa_bm_dealloc 4 _ _ 1 128 bsB rfl hBsB rfl) (fa_bm_dealloc 4 _ _ 2 256 bsB rfl hBsB rfl) rfl (fa_bm_store 4 hn4 _ _ 0 64 ⟨4⟩ _ bsB rfl rfl rfl hBsB rfl)
+  have hsBM : Interp.steps 3 m0B = .ok (faMkM ⟨⟨[{ retAlloc with data := bsB }, { a1B with data := bsB, live := false }, { a2B with live := false }], {}⟩, accB⟩ [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]) := by
+    dsimp only [m0B]; rw [fa_carrier32_m0B_eq bits, ← stepsM_bm_eq]; exact hsBM'
+  have hEncB : (encodeLittleEndianBytes bits 4 none).map fcByteToMR = bsB := fc_map_encodeLittleEndianBytes .Unsigned none 4 bits
+  exact ⟨m0B, _, hStBM, hsBM, rfl, by simp only [hEncB]; rfl⟩
+private theorem fa_sym_carrier32_tb (bits : Nat) (hbits : bits < 2 ^ 32) :
+    ∃ (m0 m' : MachTB), startMachineTB fcCarrierBody [.scalar ⟨bits, 4⟩] = some m0 ∧ Interp.stepsTB 3 m0 = .ok m' ∧ MachTB.wfLive m' ∧
+      m'.threads.map (·.stack.length) = [1] ∧
+      m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) = some (true, ((encodeLittleEndianBytes bits 4 none).map fcByteToMR).map liftByteTB) := by
+  let bsB : List Byte := (leBytes bits 4).map (fun b => .Init b none); let bsT : List (Gen.AbstractByte Gen.TreeBorrowsProvenance) := (leBytes bits 4).map (fun b => .Init b none)
+  have hBsT : bsT.length = 4 := by simp only [bsT, List.length_map, leBytes_length]
+  have hn4 : (4 : Nat) ≠ 0 := by decide
+  let m0B : Mach := machine fcCarrierBody fcCarrierFn (initMachineState fcCarrierBody [.scalar ⟨bits, 4⟩]).frame.locals fcCarrierFn.start
+  have hStBM : startMachine fcCarrierBody [.scalar ⟨bits, 4⟩] = some m0B := by unfold startMachine; rw [fc_translateFn_carrier]; rfl
+  let a0T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := List.replicate 4 .Uninit, addr := 64, align := ⟨4⟩, kind := .Stack, live := true, extra := { root := faRoot 4 } }
+  let a1T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := List.replicate 4 .Uninit, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := { root := faRoot 4 } }
+  let a2T : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { data := bsT, addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := { root := faRoot 4 } }
+  obtain ⟨accT, hsTB'⟩ := fa_carrier_stepsM_3 (M := TBM) 4 fc_goodSize_4 (intFromBits bits ⟨.Unsigned, ⟨4⟩⟩) (intFromBits bits ⟨.Signed, ⟨4⟩⟩) bsT
+    (liftFrameTB callerFrame) (liftThinPtrTB retPtr) (liftThinPtrTB (localPtr ctx0 0)) (liftThinPtrTB (localPtr ctx0 1)) TreeBorrowsMemory.new_call
+    ⟨⟨true⟩, ⟨[a0T, a1T, a2T], {}⟩⟩ ⟨⟨true⟩, ⟨[a0T, { a1T with data := bsT }, a2T], {}⟩⟩ ⟨⟨true⟩, ⟨[a0T, { a1T with data := bsT, live := false }, a2T], {}⟩⟩
+    ⟨⟨true⟩, ⟨[a0T, { a1T with data := bsT, live := false }, { a2T with live := false }], {}⟩⟩ ⟨⟨true⟩, ⟨[{ a0T with data := bsT }, { a1T with data := bsT, live := false }, { a2T with live := false }], {}⟩⟩
+    (fa_checkValueM_intN .Unsigned 4 fc_goodSize_4 bits hbits) (fa_checkValueM_intN .Signed 4 fc_goodSize_4 bits hbits) (fa_decodeM_intN .Unsigned 4 bits hbits) (fa_decodeM_intN .Signed 4 bits hbits)
+    (fa_encodeM_intN .Signed 4 fc_goodSize_4 bits hbits) (fc_mrM_transmute_int (M := TBM) .Unsigned .Signed 4 bits fc_goodSize_4 hbits)
+    (fa_tbm_load 4 hn4 faRoot4_read _ 2 256 ⟨1⟩ bsT rfl rfl hBsT rfl) (fa_tbm_store 4 hn4 faRoot4_write _ _ 1 128 ⟨1⟩ _ bsT rfl rfl rfl hBsT rfl) (fa_tbm_load 4 hn4 faRoot4_read _ 1 128 ⟨4⟩ bsT rfl rfl hBsT rfl)
+    (fa_tbm_dealloc 4 faRoot4_write faRoot4_noProt _ _ 1 128 bsT rfl hBsT rfl) (fa_tbm_dealloc 4 faRoot4_write faRoot4_noProt _ _ 2 256 bsT rfl hBsT rfl) rfl (fa_tbm_store 4 hn4 faRoot4_write _ _ 0 64 ⟨4⟩ _ bsT rfl rfl rfl hBsT rfl)
+  have hsTB : Interp.stepsTB 3 (liftMachToTB m0B) = .ok (faMkM ⟨⟨⟨true⟩, ⟨[{ a0T with data := bsT }, { a1T with data := bsT, live := false }, { a2T with live := false }], {}⟩⟩, accT⟩ [{ liftFrameTB callerFrame with next_block := bbName 7, next_stmt := 0 }]) := by
+    dsimp only [m0B]; rw [fa_carrier32_m0TB_eq bits]; exact hsTB'
+  have hEncB : (encodeLittleEndianBytes bits 4 none).map fcByteToMR = bsB := fc_map_encodeLittleEndianBytes .Unsigned none 4 bits
+  have hEncT : ((encodeLittleEndianBytes bits 4 none).map fcByteToMR).map liftByteTB = bsT := by rw [hEncB]; exact fa_map_liftByteTB_init (leBytes bits 4)
+  exact ⟨liftMachToTB m0B, _, by unfold startMachineTB; rw [hStBM]; rfl, hsTB, TbWitness.liftMachToTB_stepsTB_wfLive hsTB, rfl, by simp only [hEncT]; rfl⟩
+private theorem fa_sym_carrier32_steps_bm_and_tb (bits : Nat) (hbits : bits < 2 ^ 32) :
+    (∃ (m0 m' : Mach), startMachine fcCarrierBody [.scalar ⟨bits, 4⟩] = some m0 ∧ Interp.steps 3 m0 = .ok m' ∧
+      m'.threads = [thread1 ctx0 [{ ctx0.caller with next_block := ctx0.nextBlock, next_stmt := 0 }]] ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := (encodeLittleEndianBytes bits 4 none).map fcByteToMR }) ∧
+    (∃ (m0 m' : MachTB), startMachineTB fcCarrierBody [.scalar ⟨bits, 4⟩] = some m0 ∧ Interp.stepsTB 3 m0 = .ok m' ∧ MachTB.wfLive m' ∧
+      m'.threads.map (·.stack.length) = [1] ∧
+      m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) = some (true, ((encodeLittleEndianBytes bits 4 none).map fcByteToMR).map liftByteTB)) ∧
+    retAfter fcCarrierBody [.scalar ⟨bits, 4⟩] 3 = some (some { retAlloc with data := (encodeLittleEndianBytes bits 4 none).map fcByteToMR }, [1]) ∧
+    retAfterTB fcCarrierBody [.scalar ⟨bits, 4⟩] 3 = tbRetU32 bits := by
+  have hbm := fa_sym_carrier32_bm bits hbits; have htb := fa_sym_carrier32_tb bits hbits
+  refine ⟨hbm, htb, ?_, ?_⟩
+  · obtain ⟨m0, m', h0, hs, hth, hal⟩ := hbm; rw [fa_retAfter_of_steps h0 hs, hal, hth]; rfl
+  · obtain ⟨m0, m', h0, hs, _, hth, hal⟩ := htb; rw [fa_retAfterTB_of_steps h0 hs, hth]
+    have hEncB : (encodeLittleEndianBytes bits 4 none).map fcByteToMR = (leBytes bits 4).map (fun b => .Init b none) := fc_map_encodeLittleEndianBytes .Unsigned none 4 bits
+    have hMap : m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)) = some (true, (scalarBytes u32 bits).map (projByteTB ∘ liftByteTB)) := by
       cases hget : m'.mem.memory.mem.allocations[0]? with
       | none => rw [hget] at hal; cases hal
       | some a =>
@@ -2273,7 +2218,7 @@ theorem fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive (mode : FloatArit
   rcases EvalFloatBinOpRel_out_wf mode bop .binary64 lhsBits rhsBits outSc hrel with ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
   · rw [evalFloatCmp_of_arith bop .binary64 lhsBits rhsBits hbop] at hc; cases hc
   · exact ⟨hsz, hlt, fa_sym_carrier64_steps_bm_and_tb outSc.bits hlt⟩
-/-- **Universal `f32` (`binary32`) `Mach` + `MachTB` (`MachTB.wfLive`) relational carrier bridge** (Round-3 `B3` companion of the `f64` bridge above): for EVERY `mode`, arithmetic `bop`, `lhsBits`, `rhsBits`, and `outSc` with `EvalFloatBinOpRel mode bop .binary32 lhsBits rhsBits outSc`: `outSc.sizeBytes = 4 ∧ outSc.bits < 2 ^ 32`, the 4-byte `Mach` carrier (`fcCarrierCastBody`, `Interp.steps`) reaches `outSc`'s exact 4 little-endian bytes, AND the ZERO-EXTENDED 64-bit carrier (`fcCarrier64Body` on `outSc.bits : u64`, i.e. `x.to_bits() as u64`) steps cleanly in 3 steps on BOTH `Mach` AND `MachTB` (`Interp.stepsTB 3` + `MachTB.wfLive`) to `outSc.bits`' exact 8 little-endian bytes (low 4 bytes = the `f32` image, high 4 bytes = `0`). SCOPE (`B3` finding): a SYMBOLIC 4-byte-WIDE `MachTB` run is NOT proved (it needs 4-byte analogues of the `fa_*_8` memory lemmas); 4-byte `retAfterTB fcCarrierBody` runs stay kernel-checked per NaN candidate (`w16_b3_*` in `tests/mir/FloatArithAndUcg630Tests.lean`). -/
+/-- **Universal `f32` (`binary32`) `Mach` + `MachTB` (`MachTB.wfLive`) relational carrier bridge** (Round-3 `B3`, zero-extended 64-bit `MachTB` carrier; see `fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive` below for the native 4-byte `fcCarrierBody` `Mach` + `MachTB.wfLive` bridge): for EVERY `mode`, arithmetic `bop`, `lhsBits`, `rhsBits`, and `outSc` with `EvalFloatBinOpRel mode bop .binary32 lhsBits rhsBits outSc`: `outSc.sizeBytes = 4 ∧ outSc.bits < 2 ^ 32`, the 4-byte `Mach` carrier (`fcCarrierCastBody`, `Interp.steps`) reaches `outSc`'s exact 4 little-endian bytes, AND the zero-extended 64-bit carrier (`fcCarrier64Body` on `outSc.bits : u64`) steps cleanly in 3 steps on BOTH `Mach` AND `MachTB` (`Interp.stepsTB 3` + `MachTB.wfLive`) to `outSc.bits`' exact 8 little-endian bytes. -/
 theorem fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive (mode : FloatArithMode) (bop : BinOp)
     (lhsBits rhsBits : Nat) (outSc : ScalarInt) (hbop : isFloatArithBinOp bop = true)
     (hrel : EvalFloatBinOpRel mode bop .binary32 lhsBits rhsBits outSc) :
@@ -2290,6 +2235,22 @@ theorem fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive (mode : FloatArit
   · obtain ⟨m, n, m', hm, hs, _, ha⟩ := fc_sym_mr_carrier_steps outSc.bits hlt
     have h64 := fa_sym_carrier64_steps_bm_and_tb outSc.bits (Nat.lt_of_lt_of_le hlt (by decide))
     exact ⟨hsz, hlt, ⟨m, n, m', hm, hs, ha⟩, h64.2.1, h64.2.2⟩
+/-- **Universal native 4-byte `f32` (`binary32`) `Mach` + `MachTB` (`MachTB.wfLive`) relational carrier bridge** (Round-3 `A3`, closing the 4-byte `MachTB` scope gap left by `B3`): for EVERY `mode`, arithmetic `bop`, `lhsBits`, `rhsBits`, and `outSc` satisfying `EvalFloatBinOpRel mode bop .binary32 lhsBits rhsBits outSc`, `outSc.sizeBytes = 4 ∧ outSc.bits < 2 ^ 32`, AND the native 4-byte transmute carrier `fcCarrierBody` (`u32 → i32` under 4-byte `ctx0` / `retAlloc`) steps cleanly in 3 steps on BOTH `Mach` (`startMachine` + `Interp.steps 3` + `retAfter`) AND `MachTB` (`startMachineTB` + `Interp.stepsTB 3` + `MachTB.wfLive` + `retAfterTB = tbRetU32 outSc.bits`) to `outSc`'s exact 4 little-endian bytes. -/
+theorem fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive (mode : FloatArithMode) (bop : BinOp)
+    (lhsBits rhsBits : Nat) (outSc : ScalarInt) (hbop : isFloatArithBinOp bop = true)
+    (hrel : EvalFloatBinOpRel mode bop .binary32 lhsBits rhsBits outSc) :
+    outSc.sizeBytes = 4 ∧ outSc.bits < 2 ^ 32 ∧
+    (∃ (m0 m' : Mach), startMachine fcCarrierBody [.scalar ⟨outSc.bits, 4⟩] = some m0 ∧ Interp.steps 3 m0 = .ok m' ∧
+      m'.threads = [thread1 ctx0 [{ ctx0.caller with next_block := ctx0.nextBlock, next_stmt := 0 }]] ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := (encodeLittleEndianBytes outSc.bits 4 none).map fcByteToMR }) ∧
+    (∃ (m0 m' : MachTB), startMachineTB fcCarrierBody [.scalar ⟨outSc.bits, 4⟩] = some m0 ∧ Interp.stepsTB 3 m0 = .ok m' ∧ MachTB.wfLive m' ∧
+      m'.threads.map (·.stack.length) = [1] ∧
+      m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) = some (true, ((encodeLittleEndianBytes outSc.bits 4 none).map fcByteToMR).map liftByteTB)) ∧
+    retAfter fcCarrierBody [.scalar ⟨outSc.bits, 4⟩] 3 = some (some { retAlloc with data := (encodeLittleEndianBytes outSc.bits 4 none).map fcByteToMR }, [1]) ∧
+    retAfterTB fcCarrierBody [.scalar ⟨outSc.bits, 4⟩] 3 = tbRetU32 outSc.bits := by
+  rcases EvalFloatBinOpRel_out_wf mode bop .binary32 lhsBits rhsBits outSc hrel with ⟨c, hc, _⟩ | ⟨_, hsz, hlt⟩
+  · rw [evalFloatCmp_of_arith bop .binary32 lhsBits rhsBits hbop] at hc; cases hc
+  · exact ⟨hsz, hlt, fa_sym_carrier32_steps_bm_and_tb outSc.bits hlt⟩
 /-! ## §3. Mode-Parametric `Ptr2IntTransmutePolicy` (`ucg#630` vs. `reference#1752`) Correspondence Across `Mach` & `MachTB` -/
 /-- Policy-parametric step-level reduction of `evalByteCast`. -/
 theorem fa_evalByteCast_eq
@@ -3277,27 +3238,12 @@ theorem fa_no_forge_ref_and_uninit_live_mach_and_machTB_wfLive :
       some "load at type but the data in memory violates the language invariant" ∧
     (∃ m0 m', fcStartMachineTB8 faUninitTransmuteU64Body [.scalar ⟨0, 8⟩] = some m0 ∧
       Interp.stepsTB 2 m0 = .ok m' ∧ MachTB.wfLive m') := by
-  refine ⟨rfl, ?_, rfl, ?_, rfl, by decide +kernel, by decide +kernel, by decide +kernel,
-    by decide +kernel, ?_, rfl, ?_, rfl, by decide +kernel, by decide +kernel, ?_⟩
-  · obtain ⟨tr, u, hr, hf⟩ :=
-      faultsA_sound faUsizeToRefU8Body 10 (initMachineState faUsizeToRefU8Body [.scalar ⟨0, 8⟩]) rfl
-    exact fun hsafe => hsafe tr u hr hf
-  · obtain ⟨tr, u, hr, hf⟩ :=
-      faultsA_sound faUsizeToRefU8Body 10 (initMachineState faUsizeToRefU8Body [.scalar ⟨256, 8⟩]) rfl
-    exact fun hsafe => hsafe tr u hr hf
-  · exact fa_wfLive_of_stepsTB_isOk
-      (machineWithCtx fcCtx8 faUsizeToRefU8Body faUsizeToRefU8Fn
-        (initMachineState faUsizeToRefU8Body [.scalar ⟨256, 8⟩]).frame.locals faUsizeToRefU8Fn.start)
-      2 (by decide +kernel)
-  · obtain ⟨tr, u, hr, hf⟩ :=
-      faultsA_sound faUninitTransmuteU64Body 10
-        (initMachineState faUninitTransmuteU64Body [.scalar ⟨0, 8⟩]) rfl
-    exact fun hsafe => hsafe tr u hr hf
-  · exact fa_wfLive_of_stepsTB_isOk
-      (machineWithCtx fcCtx8 faUninitTransmuteU64Body faUninitTransmuteU64Fn
-        (initMachineState faUninitTransmuteU64Body [.scalar ⟨0, 8⟩]).frame.locals
-        faUninitTransmuteU64Fn.start)
-      2 (by decide +kernel)
+  refine ⟨rfl, ?_, rfl, ?_, rfl, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, ?_, rfl, ?_, rfl, by decide +kernel, by decide +kernel, ?_⟩
+  · obtain ⟨tr, u, hr, hf⟩ := faultsA_sound faUsizeToRefU8Body 10 (initMachineState faUsizeToRefU8Body [.scalar ⟨0, 8⟩]) rfl; exact fun hsafe => hsafe tr u hr hf
+  · obtain ⟨tr, u, hr, hf⟩ := faultsA_sound faUsizeToRefU8Body 10 (initMachineState faUsizeToRefU8Body [.scalar ⟨256, 8⟩]) rfl; exact fun hsafe => hsafe tr u hr hf
+  · exact fa_wfLive_of_stepsTB_isOk (machineWithCtx fcCtx8 faUsizeToRefU8Body faUsizeToRefU8Fn (initMachineState faUsizeToRefU8Body [.scalar ⟨256, 8⟩]).frame.locals faUsizeToRefU8Fn.start) 2 (by decide +kernel)
+  · obtain ⟨tr, u, hr, hf⟩ := faultsA_sound faUninitTransmuteU64Body 10 (initMachineState faUninitTransmuteU64Body [.scalar ⟨0, 8⟩]) rfl; exact fun hsafe => hsafe tr u hr hf
+  · exact fa_wfLive_of_stepsTB_isOk (machineWithCtx fcCtx8 faUninitTransmuteU64Body faUninitTransmuteU64Fn (initMachineState faUninitTransmuteU64Body [.scalar ⟨0, 8⟩]).frame.locals faUninitTransmuteU64Fn.start) 2 (by decide +kernel)
 /-! ## §4. Shared Concrete Episode 2 Witnesses `W1–W6` & Complete `#guard_msgs` Axiom Audit -/
 /-- **`W1` — Finite, Subnormal, Overflow-Tie, and Signed-Zero Carrier Witness** (choice-free): - Exact `f32`/`f64` subnormal addition (`0x00000001 + 0x00000001 = 0x00000002`, matching `exact_subnormal_add` and executing cleanly in `mirCallTree`); - IEEE-754 ties-to-even overflow boundaries (`f32` `MAX + half-ULP = +Inf` vs `MAX + (half-ULP-1) = MAX`, and `f64` analogue via `evalFloatBinOp_overflow_tie_witness`); - Signed-zero sums (`-0.0 + -0.0 = -0.0`, `-0.0 + +0.0 = +0.0`, `-0.0 - +0.0 = -0.0`); - Canonical MiniRust `Type.encode`/`Type.decode`/`transmuteM (M := BM/TBM)` carrier round-trips for the subnormal (`0x00000002`), overflow (`0x7F800000`, `0x7FF0000000000000`), and `-0.0` (`0x80000000`) results. -/
 theorem w1_mr_finite_subnormal_overflow :
@@ -3465,6 +3411,7 @@ def axiomAudit_machine :=
   And.intro (@fa_sym_mr_negXor_f32_lockstep) <| And.intro (@fa_sym_mr_negXor_f64_lockstep) <|
   And.intro (@fa_negXor_f32_f64_machTB_wfLive) <| And.intro (@fa_bridge_evalFloatBinOpRel_mach_steps) <|
   And.intro (@fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive) <| And.intro (@fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive) <|
+  And.intro (@fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive) <|
   And.intro (@fa_ptr2int_live_mach_and_machTB_wfLive) <| And.intro (@fa_no_forge_ref_and_uninit_live_mach_and_machTB_wfLive) <|
   And.intro (@w2_mr_cmp_and_snan_neg_xor_carrier) <| And.intro (@w3_mr_nanChoices_det_vs_nondet) <|
   And.intro (@w5_mr_ptr2int_policy_flip_mach_and_machTB) <| @w6_mr_no_forge_ref_uninit

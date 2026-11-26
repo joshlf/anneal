@@ -75,7 +75,14 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      `[pref, -pref]` nondeterministic); the universal `f32` `Mach` + `MachTB.wfLive` carrier bridge
      (`fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive`) and kernel-evaluated 4-byte-wide `MachTB`
      carrier runs on BOTH `0.0 / 0.0` outcomes (paired in §2 with `W10` & `W11` of `FloatArithLM`: both
-     engines on all five forms, real `binary64` `Step.step`, and mixed `const - copy qNaN` `.sub` order).
+     engines on all five forms, real `binary64` `Step.step`, and mixed `const - copy qNaN` `.sub` order);
+   - Round-3 counter-audit (`W17`, `A3`): symmetric mixed `copy/const` vs. `const/copy` `.sub`
+     nondeterministic candidate-order contrast (`copy qNaN - const 1.0` vs. `const 1.0 - copy qNaN` at
+     indices `0..3` AND two-NaN operand-order flip swapping indices `2 ↔ 4` without negating rhs, paired in
+     §2 with `step_float_arith_copy_const_nondet_index_exact` & `w12_lm_copy_const_nondet_sub_and_order_flip`),
+     and the universal NATIVE 4-byte `f32` `Mach` + `MachTB.wfLive` bridge
+     (`fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive`) instantiated across finite, subnormal,
+     overflow, indeterminate, and all 6 `sNaN` outcomes.
 2. **Cross-Root Dual-Authority Kernel Bridge (`run_cmd`)**:
    Loads BOTH `.lake/build/lib/lean` (`Anneal.Mir.IeeeFloatArith`, `MiniRustSpec.FloatArithMR`)
    and `examples/.lake/build/lib/lean` (`LeanMiriSpec.FloatArithLM`) into a fresh Lean kernel
@@ -84,7 +91,7 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      `unifiedFloatArithAndUcg630DualBundle` conjoining all `W1`–`W6` MR/LM witnesses plus
      general correspondence/step-simulation theorems from both authorities and the
      `V2026_06_01` <-> `V2026_08_01` dialect-parity theorems;
-   - 12 well-typed negative controls verified to be REJECTED by the Lean kernel, 11 of them paired
+   - 26 well-typed negative controls verified to be REJECTED by the Lean kernel, 25 of them paired
      with a positive control (the TRUE right-hand side for the same left-hand side is ACCEPTED), so
      a rejection is never an artifact of a stuck or failing kernel reduction;
    - Structural inspection of the MiniRust `Gen.Type` / `Gen.Value` / operator inductives (no float
@@ -1411,6 +1418,140 @@ theorem w16_b3_f32_indeterminate_nan_outcomes_mach_and_machTB_carriers :
 
 end Round3B3
 
+/-! ### §1.6 Round-3 Counter-Audit (`A3`): Symmetric `copy/const` Nondet Order & Native 4-Byte `f32` `MachTB.wfLive` -/
+
+section Round3A3
+
+open MiniRustSpec MiniRustSpec.LibSpecr MiniRustSpec.Interp MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness MiniRustSpec.Correspondence.PointerWitness
+open MiniRustSpec.Correspondence.RefWitness MiniRustSpec.Correspondence.FloatCastMR
+
+/-- Shared native 4-byte `f32` `Mach` + `MachTB` (`MachTB.wfLive`) carrier predicate (`fcCarrierBody` under `ctx0`). -/
+private abbrev tF32Native4Both (bits : Nat) : Prop :=
+  (∃ (m0 m' : Mach),
+    startMachine fcCarrierBody [.scalar ⟨bits, 4⟩] = some m0 ∧
+    Interp.steps 3 m0 = .ok m' ∧
+    m'.threads = [thread1 ctx0 [{ ctx0.caller with next_block := ctx0.nextBlock, next_stmt := 0 }]] ∧
+    m'.mem.memory.allocations[0]? = some { retAlloc with data := (encodeLittleEndianBytes bits 4 none).map fcByteToMR }) ∧
+  (∃ (m0 m' : MachTB),
+    startMachineTB fcCarrierBody [.scalar ⟨bits, 4⟩] = some m0 ∧
+    Interp.stepsTB 3 m0 = .ok m' ∧ MachTB.wfLive m' ∧
+    m'.threads.map (·.stack.length) = [1] ∧
+    m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) =
+      some (true, ((encodeLittleEndianBytes bits 4 none).map fcByteToMR).map liftByteTB)) ∧
+  retAfter fcCarrierBody [.scalar ⟨bits, 4⟩] 3 =
+    some (some { retAlloc with data := (encodeLittleEndianBytes bits 4 none).map fcByteToMR }, [1]) ∧
+  retAfterTB fcCarrierBody [.scalar ⟨bits, 4⟩] 3 = tbRetU32 bits
+
+/-- **`W17` Witness (Round-3 counter-audit `A3`)**:
+1. Symmetric mixed `copy/const` vs. `const/copy` `.sub` nondeterministic `EvalRvalueFloatRel` &
+   `nanChoices` candidate-order contrast (paired in §2 with vendored Miri's real `Step.step`
+   `step_float_arith_copy_const_nondet_index_exact` & `w12_lm_copy_const_nondet_sub_and_order_flip`):
+   - `copy qNaN(0x7FC0002A) - const 1.0` vs. `const 1.0 - copy qNaN(0x7FC0002A)` share the exact
+     4-element ordered candidate list `[0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A]` at indices `0..3`
+     (neither negates rhs before `nanChoices` and `1.0` is non-NaN);
+   - two-NaN operand-order flip: `copy qNaN(0x7FC0002A) - const qNaN(0x7FC00007)` places `0x7FC0002A` at
+     index `2` and `0x7FC00007` at index `4`, whereas `const qNaN(0x7FC00007) - copy qNaN(0x7FC0002A)`
+     swaps indices `2` ↔ `4` (`0x7FC00007` then `0x7FC0002A`), with NEITHER rhs negated;
+2. Universal NATIVE 4-byte `f32` `Mach` + `MachTB.wfLive` bridge
+   (`fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive`, closing the 4-byte `MachTB` scope gap left
+   by `B3`) instantiated across finite (`1.0 + 2.0 = 3.0`), subnormal (`0x1 + 0x1 = 0x2`), overflow
+   (`f32::MAX + f32::MAX = +Inf`), indeterminate (`0.0 / 0.0` both outcomes), and all 6 nondeterministic
+   `sNaN(0x7FA00001) + 1.0` outcomes. -/
+theorem w17_a3_copy_const_nondet_order_and_f32_native4_machTB_wfLive :
+    -- (a) Mixed `copy/const` vs. `const/copy` `.sub` ordered `nanChoices` & `EvalRvalueFloatRel`
+    (nanChoices .binary32 [(.binary32, 0x7FC0002A), (.binary32, 0x3F800000)] .nondeterministic =
+        [0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A] ∧
+      nanChoices .binary32 [(.binary32, 0x3F800000), (.binary32, 0x7FC0002A)] .nondeterministic =
+        [0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A] ∧
+      (∀ policy (idx : Nat) cand,
+        ([0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A] : List Nat)[idx]? = some cand →
+        EvalRvalueFloatRel .nondeterministic policy (tF32Slot 0x7FC0002A)
+          (.binaryOp .sub (.copy ⟨0, .nil⟩) (mkFConst tF32Ty 0x3F800000 4))
+          emptyMemory tF32Decls emptyLayoutTable (.ok (.scalar ⟨cand, 4⟩) (tF32Slot 0x7FC0002A) emptyMemory) ∧
+        EvalRvalueFloatRel .nondeterministic policy (tF32Slot 0x7FC0002A)
+          (.binaryOp .sub (mkFConst tF32Ty 0x3F800000 4) (.copy ⟨0, .nil⟩))
+          emptyMemory tF32Decls emptyLayoutTable (.ok (.scalar ⟨cand, 4⟩) (tF32Slot 0x7FC0002A) emptyMemory)) ∧
+      nanChoices .binary32 [(.binary32, 0x7FC0002A), (.binary32, 0x7FC00007)] .nondeterministic =
+        [0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A, 0x7FC00007, 0xFFC00007] ∧
+      nanChoices .binary32 [(.binary32, 0x7FC00007), (.binary32, 0x7FC0002A)] .nondeterministic =
+        [0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0x7FC0002A, 0xFFC0002A] ∧
+      (∀ policy (idx : Nat) cand,
+        ([0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A, 0x7FC00007, 0xFFC00007] : List Nat)[idx]? = some cand →
+        EvalRvalueFloatRel .nondeterministic policy (tF32Slot 0x7FC0002A)
+          (.binaryOp .sub (.copy ⟨0, .nil⟩) (mkFConst tF32Ty 0x7FC00007 4))
+          emptyMemory tF32Decls emptyLayoutTable (.ok (.scalar ⟨cand, 4⟩) (tF32Slot 0x7FC0002A) emptyMemory)) ∧
+      (∀ policy (idx : Nat) cand,
+        ([0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0x7FC0002A, 0xFFC0002A] : List Nat)[idx]? = some cand →
+        EvalRvalueFloatRel .nondeterministic policy (tF32Slot 0x7FC0002A)
+          (.binaryOp .sub (mkFConst tF32Ty 0x7FC00007 4) (.copy ⟨0, .nil⟩))
+          emptyMemory tF32Decls emptyLayoutTable (.ok (.scalar ⟨cand, 4⟩) (tF32Slot 0x7FC0002A) emptyMemory))) ∧
+    -- (b) Universal native 4-byte `f32` `Mach` + `MachTB.wfLive` bridge across finite, subnormal,
+    --     overflow, indeterminate, and all 6 `sNaN` outcomes
+    (tF32Native4Both 0x40400000 ∧
+      tF32Native4Both 0x00000002 ∧
+      tF32Native4Both 0x7F800000 ∧
+      (∀ cand ∈ [(0x7FC00000 : Nat), 0xFFC00000], tF32Native4Both cand) ∧
+      (∀ cand ∈ [(0x7FC00000 : Nat), 0xFFC00000, 0x7FE00001, 0xFFE00001, 0x7FA00001, 0xFFA00001],
+        tF32Native4Both cand)) := by
+  have hck1 : evalFloatArithBase .sub .binary32 0x7FC0002A 0x3F800000 = .some 0x7FC00000 := by decide +kernel
+  have hkc1 : evalFloatArithBase .sub .binary32 0x3F800000 0x7FC0002A = .some 0x7FC00000 := by decide +kernel
+  have hck2 : evalFloatArithBase .sub .binary32 0x7FC0002A 0x7FC00007 = .some 0x7FC00000 := by decide +kernel
+  have hkc2 : evalFloatArithBase .sub .binary32 0x7FC00007 0x7FC0002A = .some 0x7FC00000 := by decide +kernel
+  have hnanT : isNaNBits .binary32 0x7FC00000 = true := by decide +kernel
+  have hlistCK1 : nanChoices .binary32 [(.binary32, 0x7FC0002A), (.binary32, 0x3F800000)] .nondeterministic =
+      [0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A] := by decide +kernel
+  have hlistKC1 : nanChoices .binary32 [(.binary32, 0x3F800000), (.binary32, 0x7FC0002A)] .nondeterministic =
+      [0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A] := by decide +kernel
+  have hlistCK2 : nanChoices .binary32 [(.binary32, 0x7FC0002A), (.binary32, 0x7FC00007)] .nondeterministic =
+      [0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A, 0x7FC00007, 0xFFC00007] := by decide +kernel
+  have hlistKC2 : nanChoices .binary32 [(.binary32, 0x7FC00007), (.binary32, 0x7FC0002A)] .nondeterministic =
+      [0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0x7FC0002A, 0xFFC0002A] := by decide +kernel
+  have hFinEv : evalFloatArithBase .add .binary32 0x3F800000 0x40000000 = .some 0x40400000 := by decide +kernel
+  have hFinNan : isNaNBits .binary32 0x40400000 = false := by decide +kernel
+  have hSubEv : evalFloatArithBase .add .binary32 0x00000001 0x00000001 = .some 0x00000002 := by decide +kernel
+  have hSubNan : isNaNBits .binary32 0x00000002 = false := by decide +kernel
+  have hOvEv : evalFloatArithBase .add .binary32 0x7F7FFFFF 0x7F7FFFFF = .some 0x7F800000 := by decide +kernel
+  have hOvNan : isNaNBits .binary32 0x7F800000 = false := by decide +kernel
+  have hSnEv : evalFloatArithBase .add .binary32 0x7FA00001 0x3F800000 = .some 0x7FC00000 := by decide +kernel
+  have hSnList : nanChoices .binary32 [(.binary32, 0x7FA00001), (.binary32, 0x3F800000)] .nondeterministic =
+      [0x7FC00000, 0xFFC00000, 0x7FE00001, 0xFFE00001, 0x7FA00001, 0xFFA00001] := by decide +kernel
+  refine ⟨⟨hlistCK1, hlistKC1, fun policy idx cand hget => ⟨?_, ?_⟩, hlistCK2, hlistKC2, fun policy idx cand hget => ?_, fun policy idx cand hget => ?_⟩,
+    ⟨?_, ?_, ?_, fun cand hc => ?_, fun cand hc => ?_⟩⟩
+  · exact (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy _ _ _ .sub _ _ ⟨0x7FC0002A, 4⟩ ⟨0x3F800000, 4⟩ tF32Ty tF32Ty .binary32
+        emptyMemory _ emptyLayoutTable _ (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl).mpr
+      (Or.inl ⟨⟨cand, 4⟩, (EvalFloatBinOpRel_arith_iff .nondeterministic .sub .binary32 0x7FC0002A 0x3F800000 ⟨cand, 4⟩ rfl).mpr
+        ⟨0x7FC00000, hck1, Or.inl ⟨hnanT, cand, by rw [hlistCK1]; exact List.mem_of_getElem? hget, rfl⟩⟩, rfl⟩)
+  · exact (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy _ _ _ .sub _ _ ⟨0x3F800000, 4⟩ ⟨0x7FC0002A, 4⟩ tF32Ty tF32Ty .binary32
+        emptyMemory _ emptyLayoutTable _ (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl).mpr
+      (Or.inl ⟨⟨cand, 4⟩, (EvalFloatBinOpRel_arith_iff .nondeterministic .sub .binary32 0x3F800000 0x7FC0002A ⟨cand, 4⟩ rfl).mpr
+        ⟨0x7FC00000, hkc1, Or.inl ⟨hnanT, cand, by rw [hlistKC1]; exact List.mem_of_getElem? hget, rfl⟩⟩, rfl⟩)
+  · exact (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy _ _ _ .sub _ _ ⟨0x7FC0002A, 4⟩ ⟨0x7FC00007, 4⟩ tF32Ty tF32Ty .binary32
+        emptyMemory _ emptyLayoutTable _ (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl).mpr
+      (Or.inl ⟨⟨cand, 4⟩, (EvalFloatBinOpRel_arith_iff .nondeterministic .sub .binary32 0x7FC0002A 0x7FC00007 ⟨cand, 4⟩ rfl).mpr
+        ⟨0x7FC00000, hck2, Or.inl ⟨hnanT, cand, by rw [hlistCK2]; exact List.mem_of_getElem? hget, rfl⟩⟩, rfl⟩)
+  · exact (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy _ _ _ .sub _ _ ⟨0x7FC00007, 4⟩ ⟨0x7FC0002A, 4⟩ tF32Ty tF32Ty .binary32
+        emptyMemory _ emptyLayoutTable _ (fun h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl).mpr
+      (Or.inl ⟨⟨cand, 4⟩, (EvalFloatBinOpRel_arith_iff .nondeterministic .sub .binary32 0x7FC00007 0x7FC0002A ⟨cand, 4⟩ rfl).mpr
+        ⟨0x7FC00000, hkc2, Or.inl ⟨hnanT, cand, by rw [hlistKC2]; exact List.mem_of_getElem? hget, rfl⟩⟩, rfl⟩)
+  · exact (@fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive .deterministic .add 0x3F800000 0x40000000 ⟨0x40400000, 4⟩ rfl
+      ((EvalFloatBinOpRel_arith_iff .deterministic .add .binary32 0x3F800000 0x40000000 ⟨0x40400000, 4⟩ rfl).mpr
+        ⟨0x40400000, hFinEv, Or.inr ⟨hFinNan, rfl⟩⟩)).2.2
+  · exact (@fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive .deterministic .add 0x00000001 0x00000001 ⟨0x00000002, 4⟩ rfl
+      ((EvalFloatBinOpRel_arith_iff .deterministic .add .binary32 0x00000001 0x00000001 ⟨0x00000002, 4⟩ rfl).mpr
+        ⟨0x00000002, hSubEv, Or.inr ⟨hSubNan, rfl⟩⟩)).2.2
+  · exact (@fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive .deterministic .add 0x7F7FFFFF 0x7F7FFFFF ⟨0x7F800000, 4⟩ rfl
+      ((EvalFloatBinOpRel_arith_iff .deterministic .add .binary32 0x7F7FFFFF 0x7F7FFFFF ⟨0x7F800000, 4⟩ rfl).mpr
+        ⟨0x7F800000, hOvEv, Or.inr ⟨hOvNan, rfl⟩⟩)).2.2
+  · exact (@fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive .nondeterministic .div 0x00000000 0x00000000 ⟨cand, 4⟩ rfl
+      ((tIndetRel_of .binary32 .div 0x00000000 0x00000000 0x7FC00000 0xFFC00000 (by decide +kernel) (by decide +kernel)
+        (by decide +kernel) (by decide +kernel) (by decide +kernel) ⟨cand, 4⟩).2.mpr ⟨cand, hc, rfl⟩)).2.2
+  · exact (@fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive .nondeterministic .add 0x7FA00001 0x3F800000 ⟨cand, 4⟩ rfl
+      ((EvalFloatBinOpRel_arith_iff .nondeterministic .add .binary32 0x7FA00001 0x3F800000 ⟨cand, 4⟩ rfl).mpr
+        ⟨0x7FC00000, hSnEv, Or.inl ⟨hnanT, cand, by rw [hSnList]; exact hc, rfl⟩⟩)).2.2
+
+end Round3A3
+
 /-! ## §2. Cross-Root Dual-Authority Kernel Bridge (`IeeeFloatArith` + `FloatArithMR` + `FloatArithLM`) -/
 
 open Lean Elab Command Meta in
@@ -1506,7 +1647,11 @@ run_cmd do
         -- IEEE-754 indeterminate forms on BOTH engines (`W10`), and real `binary64` `Step.step` (`W11`).
         lmNs ++ `step_float_arith_const_copy_nondet_index_exact,
         lmNs ++ `w10_lm_indeterminate_forms_preferredNaN,
-        lmNs ++ `w11_lm_f64_step_and_const_copy_nondet_sub_order ]
+        lmNs ++ `w11_lm_f64_step_and_const_copy_nondet_sub_order,
+        -- Round-3 counter-audit (`A3`): symmetric index-exact nondeterministic mixed `copy/const`
+        -- real `Step.step` and two-NaN operand-order flip (`W12`).
+        lmNs ++ `step_float_arith_copy_const_nondet_index_exact,
+        lmNs ++ `w12_lm_copy_const_nondet_sub_and_order_flip ]
     let generalMrThms : List Name :=
       [ mrNs ++ `fa_no_fragment_admits_float_arith_or_cmp,
         mrNs ++ `fa_projected_float_place_rejection,
@@ -1517,6 +1662,7 @@ run_cmd do
         mrNs ++ `fa_bridge_evalFloatBinOpRel_mach_steps,
         mrNs ++ `fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive,
         mrNs ++ `fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive,
+        mrNs ++ `fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive,
         mrNs ++ `fa_ptr2int_live_mach_and_machTB_wfLive,
         mrNs ++ `fa_composite_tuple_struct_policy_correspondence,
         mrNs ++ `fa_no_forge_ref_and_uninit_live_mach_and_machTB_wfLive ]
@@ -1641,7 +1787,17 @@ run_cmd do
         ("f64 nondet nanChoices of +Inf % 1.0 (zero NaN inputs) is exactly [+qNaN, -qNaN]", listNatTy,
           mkChoices f64 [(f64, 0x7FF0000000000000), (f64, 0x3FF0000000000000)],
           mkNatList [0x7FF8000000000000, 0xFFF8000000000000],
-          mkNatList [0x7FF8000000000000, 0xFFF8000000000000, 0x7FF0000000000000, 0xFFF0000000000000]) ]
+          mkNatList [0x7FF8000000000000, 0xFFF8000000000000, 0x7FF0000000000000, 0xFFF0000000000000]),
+        -- Round-3 counter-audit (`A3`): two-NaN operand-order sensitivity (swapping lhs/rhs swaps indices 2 ↔ 4,
+        -- without negating rhs).
+        ("f32 two-NaN operand order: (0x7FC0002A, 0x7FC00007) places 0x7FC0002A at index 2 and 0x7FC00007 at index 4", listNatTy,
+          mkChoices f32 [(f32, 0x7FC0002A), (f32, 0x7FC00007)],
+          mkNatList [0x7FC00000, 0xFFC00000, 0x7FC0002A, 0xFFC0002A, 0x7FC00007, 0xFFC00007],
+          mkNatList [0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0x7FC0002A, 0xFFC0002A]),
+        ("f32 two-NaN swapped operand order: (0x7FC00007, 0x7FC0002A) swaps index 2 and index 4 without negating rhs", listNatTy,
+          mkChoices f32 [(f32, 0x7FC00007), (f32, 0x7FC0002A)],
+          mkNatList [0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0x7FC0002A, 0xFFC0002A],
+          mkNatList [0x7FC00000, 0xFFC00000, 0x7FC00007, 0xFFC00007, 0xFFC0002A, 0x7FC0002A]) ]
 
     let saved ← getEnv
     let mkEqDecl (name : Name) (ty lhs rhs : Expr) : Declaration := .thmDecl {
@@ -1912,7 +2068,12 @@ run_cmd do
         `LeanMiriSpec.FloatArithLM.step_float_arith_const_copy_nondet_index_exact,
         `LeanMiriSpec.FloatArithLM.w10_lm_indeterminate_forms_preferredNaN,
         `LeanMiriSpec.FloatArithLM.w11_lm_f64_step_and_const_copy_nondet_sub_order,
-        `MiniRustSpec.FloatArithMR.fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive ]
+        `MiniRustSpec.FloatArithMR.fa_bridge_evalFloatBinOpRel_f32_mach_and_machTB_wfLive,
+        -- Round-3 counter-audit (`A3`): symmetric index-exact nondeterministic `copy/const` `Step.step`,
+        -- two-NaN operand-order flip (`W12`), and universal native 4-byte `f32` `MachTB.wfLive` bridge.
+        `LeanMiriSpec.FloatArithLM.step_float_arith_copy_const_nondet_index_exact,
+        `LeanMiriSpec.FloatArithLM.w12_lm_copy_const_nondet_sub_and_order_flip,
+        `MiniRustSpec.FloatArithMR.fa_bridge_evalFloatBinOpRel_f32_native4_machTB_wfLive ]
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: unifiedFloatArithAndUcg630DualBundle does not reach {req}"
@@ -1925,8 +2086,8 @@ run_cmd do
   let ((addedCount, rejectedCount, acceptedCount, ieeeThms, mrThms, lmThms, mrPublic, lmPublic,
       reachedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount == 7 && rejectedCount == 24 && acceptedCount == 23 && ieeeThms ≥ 300 &&
-      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 67 && lmPublic ≥ 69 && reachedCount == 50 do
+  unless addedCount == 7 && rejectedCount == 26 && acceptedCount == 25 && ieeeThms ≥ 300 &&
+      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 68 && lmPublic ≥ 71 && reachedCount == 53 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount}, accepted={acceptedCount}, ieee={ieeeThms}, mr={mrThms}, lm={lmThms}, mrPublic={mrPublic}, lmPublic={lmPublic}, reached={reachedCount})"
   logInfo m!"ep2 float-arith cross-root kernel bridge: added {addedCount} dual theorems, rejected {rejectedCount} forged controls (paired with {acceptedCount} accepted positive controls), audited {ieeeThms} constructive IeeeFloatArith + {mrThms} MR + {lmThms} LM theorems (0 host Float, 0 MiniRustSpec imports in LM, {mrPublic} MR + {lmPublic} LM public theorems all covered by axiomAudit bundles, MiniRust Gen.Type has no float constructor), reached all {reachedCount} Trusted(06+08)+MiniRust+Miri constants, axioms {crAxioms}"
 
