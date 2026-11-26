@@ -159,6 +159,49 @@ def run08 (body : CapturedMir) : Nat → MachineState → MiniRustSpec.CoreMemPt
 
 def gp (aid off : Nat) : Value := .ptr ⟨aid, off⟩ 8
 
+/-! ### `V2026_08_01` renderings of the hardened edge-case fixtures -/
+
+def ip (addr : Nat) : Value := .ptr ⟨0, addr⟩ 8
+def ret7 : MirAst.Statement :=
+  { kind := .assign (loc 0) (.use (.constant { ty := ty (.uint .u32), val := .scalar (.int ⟨7, 4⟩) })),
+    span := "ep2.rs:1:1" }
+/-- `copy::<u32>(_1, _2, 0); _0 = 7u32`. -/
+def copy0_08 : CapturedMir :=
+  body08 "cm::copy_0" [ty (.uint .u32), ty (.rawPtr .not (.uint .u32)), ty (.rawPtr .mut (.uint .u32)),
+    ty (.tuple [])] 2 "core::intrinsics::copy" [.uint .u32] [.copy (loc 1), .copy (loc 2), usz 0] 3 [ret7] []
+/-- `compare_bytes(_1, _2, 0)`. -/
+def cmp0_08 : CapturedMir :=
+  body08 "cm::compare_bytes_0" [ty (.int .i32), ty (.rawPtr .not (.uint .u8)), ty (.rawPtr .not (.uint .u8))] 2
+    "core::intrinsics::compare_bytes" [] [.copy (loc 1), .copy (loc 2), usz 0] 0 [] []
+/-- `typed_swap_nonoverlapping::<()>(_1, _2); _0 = 7u32`. -/
+def swapZst08 : CapturedMir :=
+  body08 "cm::typed_swap_zst" [ty (.uint .u32), ty (.rawPtr .mut (.tuple [])), ty (.rawPtr .mut (.tuple [])),
+    ty (.tuple [])] 2 "core::intrinsics::typed_swap_nonoverlapping" [.tuple []]
+    [.copy (loc 1), .copy (loc 2)] 3 [ret7] []
+/-- `typed_swap_nonoverlapping::<u32>` within one global `100 = [5u32, 6u32]`. -/
+def swapSame08 : CapturedMir :=
+  body08 "cm::typed_swap_same_alloc" [ty (.uint .u32), ty (.rawPtr .mut (.uint .u32)),
+    ty (.rawPtr .mut (.uint .u32)), ty (.tuple [])] 2 "core::intrinsics::typed_swap_nonoverlapping" [.uint .u32]
+    [.copy (loc 1), .copy (loc 2)] 3 [readDeref 1]
+    [glob 100 [some 5, some 0, some 0, some 0, some 6, some 0, some 0, some 0]]
+/-- `typed_swap_nonoverlapping::<bool>` with `100 = 2` (invalid) and `101 = 1`. -/
+def swapBool08 : CapturedMir :=
+  body08 "cm::typed_swap_bool" [ty .bool, ty (.rawPtr .mut .bool), ty (.rawPtr .mut .bool), ty (.tuple [])] 2
+    "core::intrinsics::typed_swap_nonoverlapping" [.bool] [.copy (loc 1), .copy (loc 2)] 3 [readDeref 1]
+    [glob 100 [some 2] 1, glob 101 [some 1] 1]
+/-- `ptr_offset_from::<()>(_1, _2)` (ZST). -/
+def pofZst08 : CapturedMir :=
+  body08 "cm::pof_zst" [ty (.int .isize), ty (.rawPtr .not (.tuple [])), ty (.rawPtr .not (.tuple []))] 2
+    "core::intrinsics::ptr_offset_from" [.tuple []] [.copy (loc 1), .copy (loc 2)] 0 [] []
+/-- `ptr_mask::<u32>(_1, mask)` over the 16-aligned global `100`. -/
+def maskWith08 (mask : Nat) : CapturedMir :=
+  body08 "cm::ptr_mask" [ty (.rawPtr .not (.uint .u32)), ty (.rawPtr .not (.uint .u32))] 1
+    "core::intrinsics::ptr_mask" [.uint .u32] [.copy (loc 1), usz mask] 0 []
+    [glob 100 (List.replicate 16 (some 0)) 16]
+/-- `black_box::<bool>(_1)`. -/
+def bbBool08 : CapturedMir :=
+  body08 "cm::black_box_bool" [ty .bool, ty .bool] 1 "core::intrinsics::black_box" [.bool] [.copy (loc 1)] 0 [] []
+
 end Anneal.Mir.CoreMemPtrIntrinsicsTests.V08
 
 namespace Anneal.Mir.CoreMemPtrIntrinsicsTests
@@ -729,7 +772,7 @@ def cmPadStackMir (doSwap : Bool) (rhs cnt : Nat) : CapturedMir :=
 
 /-- Stack byte buffer `_3 : [u8; 16]` (align 4) holding the two padded images,
 borrowed by unique tag `1`; `_1 = &_3[0]`, `_2 = &_3[8]`. -/
-def cmPadStackState (body : CapturedMir) : MachineState :=
+def cmPadStackState (body : CapturedMir) (yOff : Nat := 8) : MachineState :=
   let buf16Val : Value :=
     .aggregate 0 ([1, 0xAA, 0xAA, 0xAA, 5, 0, 0, 0, 2, 0xBB, 0xBB, 0xBB, 6, 0, 0, 0].map
       fun b => Value.scalar ⟨b, 1⟩)
@@ -737,10 +780,10 @@ def cmPadStackState (body : CapturedMir) : MachineState :=
     { tag := 1, targetLocal := 3, targetProjection := [], perm := .unique,
       rangeOffset := 0, rangeLen := 16, protector := none, parentTag := none,
       targetFrameDepth := 0, allocDead := false }
-  let base := cmInitLiveState body [.ptr ⟨1, 0⟩ 8, .ptr ⟨1, 8⟩ 8]
+  let base := cmInitLiveState body [.ptr ⟨1, 0⟩ 8, .ptr ⟨1, yOff⟩ 8]
   { base with
     frame := { base.frame with
-      locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨1, 8⟩ 8),
+      locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨1, yOff⟩ 8),
                  .init buf16Val, .uninit, .uninit] },
     memory := { base.memory with borrows := [bBuf], nextTag := 2 } }
 
@@ -754,7 +797,9 @@ def cmPadStackState (body : CapturedMir) : MachineState :=
    the swap `compare_bytes(x, x, 4) = 0` (the padding bytes are initialized),
    with the swap `compare_bytes(x, x, 4)` faults `.ub` (the swap reset padding
    bytes `1..3` to `.uninit`), and with the swap `compare_bytes(x, y, 1) = 1`
-   (the swap really exchanged the data byte: `x[0] = 2 > y[0] = 1`). -/
+   (the swap really exchanged the data byte: `x[0] = 2 > y[0] = 1`);
+3. same-tag stack swap: the SAME borrow tag `1` at disjoint offsets `0`/`8`
+   swaps (item 2), while at overlapping offsets `0`/`4` it faults `.ub`. -/
 theorem cm_trusted_hardened_paired_controls :
     cmRunTrusted (cmCmpProvMir true) 8
       (cmInitLiveState (cmCmpProvMir true) [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
@@ -774,8 +819,9 @@ theorem cm_trusted_hardened_paired_controls :
       (cmInitLiveState (cmPadUnionMir true 2 1) [cmGPtr 100 0, cmGPtr 101 0]) = .scalar 1 4 ∧
     cmRunTrusted (cmPadStackMir false 1 4) 10 (cmPadStackState (cmPadStackMir false 1 4)) = .scalar 0 4 ∧
     cmRunTrusted (cmPadStackMir true 1 4) 10 (cmPadStackState (cmPadStackMir true 1 4)) = .ub ∧
-    cmRunTrusted (cmPadStackMir true 2 1) 10 (cmPadStackState (cmPadStackMir true 2 1)) = .scalar 1 4 := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+    cmRunTrusted (cmPadStackMir true 2 1) 10 (cmPadStackState (cmPadStackMir true 2 1)) = .scalar 1 4 ∧
+    cmRunTrusted (cmPadStackMir true 2 1) 10 (cmPadStackState (cmPadStackMir true 2 1) 4) = .ub := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-! ### `V2026_06_01` <-> `V2026_08_01` dialect parity -/
 
@@ -827,6 +873,65 @@ theorem cm_v2026_08_01_parity :
     V08.run08 V08.bb08 8 (V08.init08 V08.bb08 []) =
       cmTrustedObserve false .blackBox .ubFault := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- **`V2026_06_01` <-> `V2026_08_01` parity on the hardened edge cases**: for
+EACH Episode 1/2 hardened case, the `V2026_08_01` `stepMirFn` run equals the
+`V2026_06_01` run AND that shared observation is the documented verdict:
+`copy` null at `count = 0` completes (`7`, agreement with `lean-miri`);
+`compare_bytes` null at `bytes = 0` and `typed_swap_nonoverlapping::<()>` null
+are `.ub` (the two deliberate deltas); `typed_swap_nonoverlapping` overlap and
+misalignment are `.ub` while disjoint same-allocation elements swap (`6`);
+invalid `bool` swap is `.ub` (`kani#5205`); `ptr_offset_from` `isize::MIN` and
+ZST are `.ub`; `ptr_mask` touching unknown base bits fails closed
+`.unsupported` while the identity mask preserves the pointer; `black_box(2u8 as
+bool)` is `.ub`. -/
+theorem cm_v2026_08_01_hardened_parity :
+    V08.run08 V08.copy0_08 8 (V08.init08 V08.copy0_08 [V08.ip 0, V08.ip 0]) =
+      cmRunTrusted cmCopy0Mir 8 (cmInitLiveState cmCopy0Mir [cmIntPtr 0, cmIntPtr 0]) ∧
+    cmRunTrusted cmCopy0Mir 8 (cmInitLiveState cmCopy0Mir [cmIntPtr 0, cmIntPtr 0]) = .scalar 7 4 ∧
+    V08.run08 V08.copy0_08 8 (V08.init08 V08.copy0_08 [V08.ip 2, V08.ip 0]) =
+      cmRunTrusted cmCopy0Mir 8 (cmInitLiveState cmCopy0Mir [cmIntPtr 2, cmIntPtr 0]) ∧
+    cmRunTrusted cmCopy0Mir 8 (cmInitLiveState cmCopy0Mir [cmIntPtr 2, cmIntPtr 0]) = .ub ∧
+    V08.run08 V08.cmp0_08 8 (V08.init08 V08.cmp0_08 [V08.ip 0, V08.ip 0]) =
+      cmRunTrusted cmCmpBytes0Mir 8 (cmInitLiveState cmCmpBytes0Mir [cmIntPtr 0, cmIntPtr 0]) ∧
+    cmRunTrusted cmCmpBytes0Mir 8 (cmInitLiveState cmCmpBytes0Mir [cmIntPtr 0, cmIntPtr 0]) = .ub ∧
+    V08.run08 V08.swapZst08 8 (V08.init08 V08.swapZst08 [V08.ip 0, V08.ip 0]) =
+      cmRunTrusted cmSwapZstMir 8 (cmInitLiveState cmSwapZstMir [cmIntPtr 0, cmIntPtr 0]) ∧
+    cmRunTrusted cmSwapZstMir 8 (cmInitLiveState cmSwapZstMir [cmIntPtr 0, cmIntPtr 0]) = .ub ∧
+    V08.run08 V08.swapZst08 8 (V08.init08 V08.swapZst08 [V08.ip 4096, V08.ip 4096]) =
+      cmRunTrusted cmSwapZstMir 8 (cmInitLiveState cmSwapZstMir [cmIntPtr 4096, cmIntPtr 4096]) ∧
+    cmRunTrusted cmSwapZstMir 8 (cmInitLiveState cmSwapZstMir [cmIntPtr 4096, cmIntPtr 4096]) = .scalar 7 4 ∧
+    V08.run08 V08.swapSame08 8 (V08.init08 V08.swapSame08 [V08.gp 100 0, V08.gp 100 4]) =
+      cmRunTrusted cmSwapSameAllocMir 8 (cmInitLiveState cmSwapSameAllocMir [cmGPtr 100 0, cmGPtr 100 4]) ∧
+    cmRunTrusted cmSwapSameAllocMir 8 (cmInitLiveState cmSwapSameAllocMir [cmGPtr 100 0, cmGPtr 100 4]) =
+      .scalar 6 4 ∧
+    V08.run08 V08.swapSame08 8 (V08.init08 V08.swapSame08 [V08.gp 100 0, V08.gp 100 2]) =
+      cmRunTrusted cmSwapSameAllocMir 8 (cmInitLiveState cmSwapSameAllocMir [cmGPtr 100 0, cmGPtr 100 2]) ∧
+    cmRunTrusted cmSwapSameAllocMir 8 (cmInitLiveState cmSwapSameAllocMir [cmGPtr 100 0, cmGPtr 100 2]) = .ub ∧
+    V08.run08 V08.swapBool08 8 (V08.init08 V08.swapBool08 [V08.gp 100 0, V08.gp 101 0]) =
+      cmRunTrusted cmSwapBoolMir 8 (cmInitLiveState cmSwapBoolMir [cmGPtr 100 0, cmGPtr 101 0]) ∧
+    cmRunTrusted cmSwapBoolMir 8 (cmInitLiveState cmSwapBoolMir [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    V08.run08 (V08.pof08 false) 8 (V08.init08 (V08.pof08 false) [V08.ip 0, V08.ip (2 ^ 63)]) =
+      cmRunTrusted cmPofMir 8 (cmInitLiveState cmPofMir [cmIntPtr 0, cmIntPtr (2 ^ 63)]) ∧
+    cmRunTrusted cmPofMir 8 (cmInitLiveState cmPofMir [cmIntPtr 0, cmIntPtr (2 ^ 63)]) = .ub ∧
+    V08.run08 V08.pofZst08 8 (V08.init08 V08.pofZst08 [V08.ip 4096, V08.ip 4096]) = .ub ∧
+    V08.run08 (V08.maskWith08 (2 ^ 64 - 32)) 8
+      (V08.init08 (V08.maskWith08 (2 ^ 64 - 32)) [V08.gp 100 12]) =
+      cmRunTrusted (cmMaskMir "cm::ptr_mask_not31" (2 ^ 64 - 32)) 8
+        (cmInitLiveState (cmMaskMir "cm::ptr_mask_not31" (2 ^ 64 - 32)) [cmGPtr 100 12]) ∧
+    cmRunTrusted (cmMaskMir "cm::ptr_mask_not31" (2 ^ 64 - 32)) 8
+      (cmInitLiveState (cmMaskMir "cm::ptr_mask_not31" (2 ^ 64 - 32)) [cmGPtr 100 12]) = .unsupported ∧
+    V08.run08 (V08.maskWith08 (2 ^ 64 - 1)) 8 (V08.init08 (V08.maskWith08 (2 ^ 64 - 1)) [V08.gp 100 12]) =
+      cmRunTrusted cmMaskIdentityMir 8 (cmInitLiveState cmMaskIdentityMir [cmGPtr 100 12]) ∧
+    cmRunTrusted cmMaskIdentityMir 8 (cmInitLiveState cmMaskIdentityMir [cmGPtr 100 12]) = .ptr 100 12 ∧
+    V08.run08 V08.bbBool08 8 (V08.init08 V08.bbBool08 [.scalar ⟨2, 1⟩]) =
+      cmRunTrusted cmBlackBoxBoolMir 8 (cmInitLiveState cmBlackBoxBoolMir [.scalar ⟨2, 1⟩]) ∧
+    cmRunTrusted cmBlackBoxBoolMir 8 (cmInitLiveState cmBlackBoxBoolMir [.scalar ⟨2, 1⟩]) = .ub ∧
+    V08.run08 V08.bbBool08 8 (V08.init08 V08.bbBool08 [.scalar ⟨1, 1⟩]) =
+      cmRunTrusted cmBlackBoxBoolMir 8 (cmInitLiveState cmBlackBoxBoolMir [.scalar ⟨1, 1⟩]) ∧
+    cmRunTrusted cmBlackBoxBoolMir 8 (cmInitLiveState cmBlackBoxBoolMir [.scalar ⟨1, 1⟩]) = .scalar 1 1 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
+    ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- **Episode 2 Root Capstone**: the root-Lake projection of
 `ep2_core_mem_ptr_intrinsics_capstone` for EVERY LeanMiri authority passing the
