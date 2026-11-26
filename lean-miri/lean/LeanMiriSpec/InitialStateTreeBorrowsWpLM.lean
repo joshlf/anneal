@@ -23,6 +23,7 @@ import LeanMiriSpec.Correspondence.Translate
 import Miri.Interpreter.CallDispatchMachine
 import Miri.Interpreter.PlaceMachine
 import Miri.Interpreter.MemoryErrors
+import Miri.Memory.AllocAddresses.GlobalState
 
 /-!
 # Episode 1 LeanMiri Bridge: Initial-State Tree Borrows, Instruction, Call-Dispatch & Memory-Observation `ExactWP` (`LeanMiriSpec.InitialStateTreeBorrowsWpLM`)
@@ -162,6 +163,28 @@ local elab "unfold_mo" : tactic => do
   let tgt' ← Lean.Meta.deltaExpand tgt (fun n =>
     !n.components.any (fun c => c.toString.startsWith "match_") &&
     n.toString.startsWith "_private.Miri.Interpreter.MemoryOperand.")
+  let g' ← g.replaceTargetDefEq tgt'
+  Lean.Elab.Tactic.replaceMainGoal [g']
+
+/-- Definitionally unfold private helpers in `Miri.Interpreter.MachineHooks` only
+(excluding compiler `.match_` auxiliaries). -/
+local elab "unfold_mh" : tactic => do
+  let g ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← g.getType
+  let tgt' ← Lean.Meta.deltaExpand tgt (fun n =>
+    !n.components.any (fun c => c.toString.startsWith "match_") &&
+    n.toString.startsWith "_private.Miri.Interpreter.MachineHooks.")
+  let g' ← g.replaceTargetDefEq tgt'
+  Lean.Elab.Tactic.replaceMainGoal [g']
+
+/-- Definitionally unfold private helpers in `Miri.Interpreter.Place` only
+(excluding compiler `.match_` auxiliaries). -/
+local elab "unfold_pl" : tactic => do
+  let g ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← g.getType
+  let tgt' ← Lean.Meta.deltaExpand tgt (fun n =>
+    !n.components.any (fun c => c.toString.startsWith "match_") &&
+    n.toString.startsWith "_private.Miri.Interpreter.Place.")
   let g' ← g.replaceTargetDefEq tgt'
   Lean.Elab.Tactic.replaceMainGoal [g']
 
@@ -2316,6 +2339,107 @@ theorem miriTerminatorExactWP_iff {Op Imm : Type}
         · simp only [hPass, Bool.false_eq_true, ↓reduceIte]
           cases hooks.assertPanic choice message unwind s1 with
           | mk after r2 => cases r2 with | ok u => cases u; rfl | error _ => rfl
+
+/-- `ExactAction` wrapping unmodified vendored `Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure`
+(retaining all committed Tree Borrows release mutations on both success and failure). -/
+def miriBeforeStackPopAction {K User : Type} [DecidableEq K]
+    (ensureTreeExtra : Miri.Memory.AllocId → MachineHooks.M K User Unit) :
+    ExactAction (MachineHooks.State K User) StepError Unit :=
+  fun state =>
+    match MachineHooks.run (MachineHooks.beforeStackPopWithEnsure ensureTreeExtra) state with
+    | (after, .ok u) => .ok u after
+    | (after, .error err) => .error err after
+
+/-- **Exact bidirectional `↔` WP for `MachineHooks.beforeStackPopWithEnsure` when Tree Borrows is
+disabled (`borrowTracker = none`)**: guaranteed state-preserving no-op! -/
+theorem miriBeforeStackPopWithEnsure_disabled_exactWP_iff {K User : Type} [DecidableEq K]
+    (ensureTreeExtra : Miri.Memory.AllocId → MachineHooks.M K User Unit)
+    (post : Unit → MachineHooks.State K User → Prop)
+    (onError : StepError → MachineHooks.State K User → Prop)
+    (state : MachineHooks.State K User)
+    (hDisabled : state.machine.borrowTracker = none) :
+    AnnealExactWP (miriBeforeStackPopAction ensureTreeExtra) post onError state ↔
+      post () state := by
+  unfold AnnealExactWP miriBeforeStackPopAction MachineHooks.run Call.run
+    MachineHooks.beforeStackPopWithEnsure
+  simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, Bind.bind, EStateM.bind,
+    pure, Pure.pure, EStateM.pure, hDisabled, Option.isSome_none, Bool.false_eq_true, ↓reduceIte]
+
+/-- **Exact bidirectional `↔` WP for `MachineHooks.beforeStackPopWithEnsure` on a single-protector
+live allocation frame**: characterizes unmodified vendored `BorrowTree.releaseProtector` +
+`MemoryState.setLiveAllocation` + `GlobalState.endCall` (on `.Released`) and committed-tree
+`placeMachineTreeError` UB (on `.AccessFailure`)! -/
+theorem miriBeforeStackPopWithEnsure_singleLive_exactWP_iff {K User : Type} [DecidableEq K]
+    (ensureTreeExtra : Miri.Memory.AllocId → MachineHooks.M K User Unit)
+    (post : Unit → MachineHooks.State K User → Prop)
+    (onError : StepError → MachineHooks.State K User → Prop)
+    (state : MachineHooks.State K User)
+    (tracker : MachineHooks.BorrowState)
+    (frame : Frame Provenance LocalLayout MachineHooks.FrameExtra)
+    (allocId : Miri.Memory.AllocId) (tag : BorTag) (kind : MemoryKind K)
+    (alloc : Allocation Provenance BorrowTree)
+    (hBt : state.machine.borrowTracker = some tracker)
+    (hCur : state.stack.currentFrame? = some frame)
+    (hFrameBt : frame.extra.borrowTracker = some { protectedTags := #[(allocId, tag)] })
+    (hFind : state.machine.memory.live.find? (fun e => e.1 == allocId) =
+      some (allocId, LocalAllocation.mk kind alloc))
+    (hEnsure : ensureTreeExtra allocId state = .ok () state) :
+    let released := alloc.extra.releaseProtector tag tracker.global.protectedTags
+    let mem' : MemoryState Provenance BorrowTree K :=
+      { state.machine.memory with
+        live := (state.machine.memory.live.filter fun r => r.1 != allocId).push
+          (allocId, LocalAllocation.mk kind (alloc.setExtra released.tree)) }
+    let stateRel : MachineHooks.State K User :=
+      { state with machine := { state.machine with memory := mem' } }
+    AnnealExactWP (miriBeforeStackPopAction ensureTreeExtra) post onError state ↔
+      match released.status with
+      | .Released =>
+        post ()
+          { stateRel with
+            machine :=
+              { stateRel.machine with
+                borrowTracker :=
+                  some { tracker with global := tracker.global.endCall { protectedTags := #[(allocId, tag)] } } } }
+      | .AccessFailure _ status =>
+        onError (placeMachineTreeError status) stateRel
+      | other =>
+        onError (.invalidProgram s!"protector release invariant: {reprStr other}") stateRel := by
+  dsimp only
+  have hInfo : state.machine.memory.getAllocInfo allocId =
+      .ok ⟨alloc.byteSize, alloc.align, .liveData, alloc.mutability⟩ := by
+    unfold MemoryState.getAllocInfo
+    simp only [hFind, pure, Pure.pure, Except.pure]
+  have hSet :
+      state.machine.memory.setLiveAllocation allocId
+        (alloc.setExtra (alloc.extra.releaseProtector tag tracker.global.protectedTags).tree) =
+      .ok { state.machine.memory with
+            live := (state.machine.memory.live.filter fun r => r.1 != allocId).push
+              (allocId, LocalAllocation.mk kind
+                (alloc.setExtra (alloc.extra.releaseProtector tag tracker.global.protectedTags).tree)) } :=
+    MemoryState.setLiveAllocation_of_find state.machine.memory allocId
+      (LocalAllocation.mk kind alloc) _ hFind
+  unfold AnnealExactWP miriBeforeStackPopAction MachineHooks.run Call.run
+    MachineHooks.beforeStackPopWithEnsure MachineHooks.currentFrame
+  simp only [get, getThe, MonadStateOf.get, EStateM.get, set, MonadStateOf.set,
+    modify, modifyGet, MonadStateOf.modifyGet,
+    bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+    hBt, Option.isSome_some, ↓reduceIte, hCur, hFrameBt]
+  simp only [← Array.forIn_toList, List.forIn_cons, List.forIn_nil,
+    EStateM.get, EStateM.modifyGet, bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+    hInfo, beq_self_eq_true, ↓reduceIte, hEnsure, hFind, hSet, hBt]
+  generalize alloc.extra.releaseProtector tag tracker.global.protectedTags = rel
+  rcases rel with ⟨relTree, relStatus⟩
+  cases relStatus with
+  | Released =>
+    simp only [EStateM.bind, EStateM.pure, EStateM.set]
+  | AccessFailure r status =>
+    unfold_mh
+    simp only [throw, throwThe, MonadExceptOf.throw, EStateM.throw, EStateM.bind, placeMachineTreeError]
+    cases status <;> rfl
+  | MissingTag =>
+    simp only [throw, throwThe, MonadExceptOf.throw, EStateM.throw, EStateM.bind]
+  | _ =>
+    simp only [throw, throwThe, MonadExceptOf.throw, EStateM.throw, EStateM.bind]
 
 end InstructionAndCallDispatchWP
 
@@ -4558,11 +4682,34 @@ end TbEnabledTranslateBodyMiriExecution
 
 section VendoredNativePlaceMachineTbExecution
 
-/-- Vendored `PlaceMachine.AccessConfig Unit Unit` backed by checked pointer resolution (returning
-`.ok (.error addr)` → `.danglingIntegerPointer` for provenance-free, wildcard, unknown-alloc, or
-below-base pointers), `ghostMode := false`, and unmodified `MemoryErrors.operand`. ALL Tree Borrows
-checks run inside unmodified vendored `PlaceMachine.accessHooks` → `AllocationAccess.getPtrAlloc{Mut}`
-→ `PlaceMachine.memoryAccess` → `BorrowTree.performBorrowAccessRange`! -/
+/-- Concrete unmodified vendored `Miri.Memory.AllocAddresses.GlobalAddressState` registering
+`ep1AllocId` at `ep1TbBaseAddr` under strict provenance mode (so concrete provenance resolves via
+vendored `GlobalAddressState.ptrGetAlloc`, while wildcard provenance fails closed with
+`.strictAddressLookup`). -/
+def ep1GlobalAddressState : Miri.Memory.AllocAddresses.GlobalAddressState :=
+  { intToPtrMap := #[⟨ep1TbBaseAddr, ep1AllocId⟩]
+    baseAddr := #[⟨ep1AllocId, ep1TbBaseAddr⟩]
+    exposed := #[]
+    provenanceMode := .strict
+    addressMode := .managed
+    generation := none }
+
+/-- Under `.strict` provenance mode, unmodified vendored `GlobalAddressState.ptrGetAlloc` rejects
+wildcard pointers fail-closed with `.strictAddressLookup`! -/
+theorem ep1GlobalAddressState_ptrGetAlloc_wildcard_strict (addr : UInt64) (sz : Int64)
+    (hooks : Miri.Memory.AllocAddresses.AddressLookupHooks) :
+    ep1GlobalAddressState.ptrGetAlloc
+      ⟨Size.ofBytes addr, .wildcard⟩ sz hooks
+      { pointerSize := Size.ofBytes 8 } =
+    .error .strictAddressLookup := by
+  rfl
+
+/-- Vendored `PlaceMachine.AccessConfig Unit Unit` backed by **unmodified vendored
+`Miri.Memory.AllocAddresses.GlobalAddressState.ptrGetAlloc`** (`ep1GlobalAddressState`, returning
+`.ok (.error addr)` → `.danglingIntegerPointer` for provenance-free, strict-wildcard, or uncached
+pointers), `ghostMode := false`, and unmodified `MemoryErrors.operand`. ALL Tree Borrows checks run
+inside unmodified vendored `PlaceMachine.accessHooks` → `AllocationAccess.getPtrAlloc{Mut}` →
+`PlaceMachine.memoryAccess` → `BorrowTree.performBorrowAccessRange`! -/
 def ep1PlaceAccessConfig : PlaceMachine.AccessConfig Unit Unit :=
   { runtime := annealRuntimeDataLayout
     ghostMode := false
@@ -4575,20 +4722,72 @@ def ep1PlaceAccessConfig : PlaceMachine.AccessConfig Unit Unit :=
         adjustGlobalAllocation := fun mem hs _ _ =>
           ⟨mem, hs, .error "ep1 vendored witness has no global allocations"⟩ }
     dynamicLayout := fun mem hs _ => ⟨mem, hs, .ok none⟩
-    resolvePointer := fun _ ptr _ mach =>
+    resolvePointer := fun mem ptr sz mach =>
       match ptr.provenance with
-      | some (.concrete aid tag) =>
-        if aid == ep1AllocId && ep1TbBaseAddr ≤ ptr.offset.bytes then
-          .ok (.ok ⟨aid, Size.ofBytes (ptr.offset.bytes - ep1TbBaseAddr), .concrete tag⟩) mach
-        else
-          .ok (.error ptr.offset.bytes) mach
-      | _ => .ok (.error ptr.offset.bytes) mach
+      | none => .ok (.error ptr.offset.bytes) mach
+      | some prov =>
+        let lookup : Miri.Memory.AllocAddresses.AddressLookupHooks :=
+          { sizeOf := fun id => (mem.getAllocInfo id).toOption.map (·.size)
+            isLive := fun id => some (mem.isAllocLive id) }
+        let cx : Miri.Memory.PointerArithmetic := { pointerSize := Size.ofBytes 8 }
+        match ep1GlobalAddressState.ptrGetAlloc ⟨ptr.offset, prov⟩ (Int64.ofInt sz) lookup cx with
+        | .ok (some (aid, relOff)) =>
+          let provExtra : ProvenanceExtra := match prov with
+            | .concrete _ tag => .concrete tag
+            | .wildcard => .wildcard
+          .ok (.ok ⟨aid, relOff, provExtra⟩) mach
+        | .ok none | .error _ => .ok (.error ptr.offset.bytes) mach
     beforeAllocationAccess := fun _ => pure ()
     diagnostic := fun _ _ _ => pure ()
     weakMemoryWrite := fun _ _ => pure ()
     syncAccess := fun _ _ _ => pure ()
     retainTouched := fun m _ => m
     memoryError := MemoryErrors.operand }
+
+private def ep1PlaceAllocConfig : PlaceMachine.AllocationConfig Unit Unit :=
+  { maximumObjectSize := Size.ofBytes 0x100000
+    zeroedStorage := fun _ _ => none
+    diagnostic := fun _ _ _ => pure ()
+    allocationTail := fun _ _ _ => pure ()
+    adjustRootAddress := fun _ _ => throw (.unsupported "ep1 stack alloc unused") }
+
+private def ep1PlaceCompilerHooks : PlaceMachine.CompilerHooks Unit Unit Unit :=
+  { debugAssertions := false
+    layout := fun _ _ => throw (.unsupported "ep1 uncached local layout unused")
+    validationInProgress := pure false
+    projection := fun _ => throw (.unsupported "ep1 non-deref projection unused")
+    deref := fun _ base _ => do
+      match base.ref with
+      | .local _ localId none _ =>
+        let op ← PlaceMachine.localToOpCore
+          (fun id => do
+            let slot ← match (← MachineHooks.currentFrame).getLocal id with
+              | .ok s => pure s | .error e => throw (.stack e)
+            match slot.layout with
+            | some lay => pure lay
+            | none => throw (.unsupported "ep1 uncached local layout"))
+          (pure false) localId
+        let sc ← match op.op with
+          | .immediate (.scalar sc) => pure sc
+          | _ => throw (.invalidProgram "expected pointer scalar local for deref")
+        let ptr ← match sc.toPointer annealTargetDataLayout with
+          | .ok ptr => pure ptr
+          | .error e => throw (MemoryErrors.allocation (.scalar e))
+        return ⟨.memory ⟨ptr, .none, none⟩, translateTy ep1U32Ty emptyLayoutTable⟩
+      | _ => throw (.unsupported "ep1 deref only supports whole pointer locals")
+    checkPlaceType := fun _ _ _ => pure ()
+    memoryOffset := fun _ _ _ _ _ => throw (.unsupported "ep1 memoryOffset unused")
+    debugAbiCheck := fun _ _ => pure ()
+    localSpan := fun _ _ => pure defaultSpanRef
+    enforceValidity := fun _ _ => pure false
+    validate := fun _ _ => pure ()
+    willValidateMemory := fun _ => false }
+
+/-- Unmodified vendored `PlaceMachine.placeHooks` instantiated with `ep1PlaceAccessConfig`
+(backed by vendored `GlobalAddressState.ptrGetAlloc`). -/
+def ep1VendoredPlaceHooks :
+    PlaceHooks Provenance (PlaceMachine.State Unit Unit) Unit MachineHooks.FrameExtra :=
+  PlaceMachine.placeHooks ep1PlaceAccessConfig ep1PlaceAllocConfig ep1PlaceCompilerHooks
 
 private def ep1PlaceStorageHooks : MachineHooks.StorageHooks Unit Unit :=
   { veryTriviallySized := fun _ => .ok true
@@ -4610,11 +4809,15 @@ private def ep1VendoredControlHooks :
         | .error e => (st, .error (.stack e))
         | .ok (.immediate imm) => (st, .ok imm)
         | .ok _ => (st, .error (.invalidProgram "ep1 witness: non-immediate return local"))
-    -- Frame pop: vendored `Stack.popFrame`.
+    -- Frame pop: vendored `MachineHooks.beforeStackPopWithEnsure` (Tree Borrows protector release
+    -- + `GlobalState.endCall`) BEFORE vendored `Stack.popFrame`, matching Miri's `on_stack_pop`.
     popFrame := fun _ st =>
-      match st.stack.popFrame with
-      | .error e => (st, .error (.stack e))
-      | .ok (stk, fr) => ({ st with stack := stk }, .ok fr)
+      match MachineHooks.run (MachineHooks.beforeStackPopWithEnsure (fun _ => pure ())) st with
+      | (st', .error e) => (st', .error e)
+      | (st', .ok ()) =>
+        match st'.stack.popFrame with
+        | .error e => (st', .error (.stack e))
+        | .ok (stk, fr) => ({ st' with stack := stk }, .ok fr)
     copyReturn := fun _ _ _ st => (st, .ok ())
     cleanupFrame := fun _ _ _ st => (st, .ok .normal)
     unwindTerminate := fun _ _ st => (st, .error (.machineStop "unwind terminate")) }
@@ -4632,77 +4835,66 @@ private def ep1VendoredTermHooks :
     readAssertCondition := fun _ _ st => (st, .error (.unsupported "assert unused"))
     assertPanic := fun _ _ _ st => (st, .error (.unsupported "assert unused")) }
 
-private def ep1EvalDerefLocal (localId : Miri.MIR.LocalId) :
-    PlaceMachine.M Unit Unit (MPlaceTy Provenance) := do
-  let frame ← MachineHooks.currentFrame
-  let op ← match frame.getLocalOperand localId with
-    | .ok op => pure op
-    | .error e => throw (.stack e)
-  let sc ← match op with
-    | .immediate (.scalar sc) => pure sc
-    | _ => throw (.invalidProgram "expected pointer scalar local for deref")
-  let ptr ← match sc.toPointer annealTargetDataLayout with
-    | .ok ptr => pure ptr
-    | .error e => throw (MemoryErrors.allocation (.scalar e))
-  return ⟨⟨ptr, .none, none⟩, translateTy ep1U32Ty emptyLayoutTable⟩
-
 /-- **Vendored-Native Tree-Borrows `StepHooks` (`ep1VendoredPlaceStepHooks`)**:
 operates directly on vendored `PlaceMachine.State Unit Unit` (`MemoryState Provenance BorrowTree Unit`
 with NON-OPTIONAL `BorrowTree` extras) and delegates:
-- dereference writes (`(*p) = const`) directly to **unmodified vendored `PlaceMachine.writeMemory`**
-  (which executes `PlaceMachine.accessHooks` → `AllocationAccess.getPtrAllocMut` →
-  `PlaceMachine.memoryAccess` → `BorrowTree.performBorrowAccessRange` → `Allocation.writeScalar`);
-- dereference reads (`_d = copy/move (*p)`) directly to **unmodified vendored
-  `PlaceMachine.readImmediate`** (which executes `PlaceMachine.accessHooks` →
-  `AllocationAccess.getPtrAlloc` → `PlaceMachine.memoryAccess` →
-  `BorrowTree.performBorrowAccessRange` → `Allocation.readScalar`);
+- place evaluation, dereference local reads, operand conversion, and destination writes directly to
+  **unmodified vendored `Miri.Interpreter.{evalPlace, placeToOp, writePlaceImmediate}`** via
+  **`PlaceMachine.placeHooks`** (`PlaceMachine.{localToOpCore, writeMemory, readImmediate}`,
+  `placeWriteLocalImmediate`, `MachineHooks.{afterLocalRead, afterLocalWrite}`);
+- pointer address resolution directly to **unmodified vendored
+  `Miri.Memory.AllocAddresses.GlobalAddressState.ptrGetAlloc`** (`ep1GlobalAddressState`);
+- memory accesses directly to **unmodified vendored `PlaceMachine.accessHooks` →
+  `AllocationAccess.getPtrAlloc{Mut}` → `PlaceMachine.memoryAccess` →
+  `BorrowTree.performBorrowAccessRange` → `Allocation.{writeScalar, readScalar}`**;
 - `StorageDead` directly to **unmodified vendored `MachineHooks.storageDead`**;
-- terminators and returns directly to **unmodified vendored `ControlFlow.{evalTerminator, returnFromCurrentFrame}`**.
+- terminators, returns, and `FnEntry` protector release directly to **unmodified vendored
+  `ControlFlow.{evalTerminator, returnFromCurrentFrame}` → `Frame.getLocalOperand 0` →
+  `MachineHooks.beforeStackPopWithEnsure` (`BorrowTree.releaseProtector` + `GlobalState.endCall`) →
+  `Stack.popFrame`**.
 ZERO custom TB-check instrumentation (`annealTbCheckMemAccess`) is used anywhere in this path!
 
 **Precise trust boundary (what is vendored vs. witness-local).** Vendored and unmodified:
-`Step.step`, `ControlFlow.{evalTerminator, returnFromCurrentFrame}`, `PlaceMachine.{writeMemory,
-readImmediate, accessHooks, memoryAccess}`, `AllocationAccess.getPtrAlloc{,Mut}`,
-`BorrowTree.performBorrowAccessRange`, `MachineHooks.storageDead`, `Frame.getLocalOperand`,
-`Stack.popFrame`. Witness-local (authored, scoped to `ep1BodyTbDerefWriteAndRead`):
-- the `assign` dispatcher (only `(*_i) = const int` and `_d = copy/move (*_i)`; every other shape
-  fails closed with `.unsupported`) and `ep1EvalDerefLocal` (deref place evaluation with a fixed
-  `u32` layout) — vendored `PlaceHooks`/`evalRvalueIntoPlace` wiring is NOT used;
-- `ep1PlaceAccessConfig.resolvePointer` (single-allocation base-address resolution, fail closed on
-  every other pointer) instead of vendored `AllocAddresses.GlobalAddressState.ptrGetAlloc`;
-- `ep1VendoredControlHooks.{copyReturn, cleanupFrame}` are no-ops: the root `.stop` frame's return
-  value is read (vendored `getLocalOperand 0`) but not copied anywhere, and NO
-  `MachineHooks.beforeStackPop` protector release runs (the witness registers no frame protectors).
-Hence these witnesses certify vendored Tree Borrows/memory semantics on the exercised accesses, not
-a full vendored `ExecutionControl.hooks` machine. -/
+`Step.step`, `ControlFlow.{evalTerminator, returnFromCurrentFrame}`,
+`PlaceMachine.{placeHooks, writeMemory, readImmediate, accessHooks, memoryAccess, localToOpCore}`,
+`Miri.Interpreter.{evalPlace, placeToOp, writePlaceImmediate, placeWriteLocalImmediate}`,
+`AllocationAccess.getPtrAlloc{,Mut}`, `AllocAddresses.GlobalAddressState.ptrGetAlloc`,
+`BorrowTree.{performBorrowAccessRange, releaseProtector}`, `GlobalState.endCall`,
+`MachineHooks.{beforeStackPopWithEnsure, storageDead, afterLocalRead, afterLocalWrite}`,
+`Frame.{getLocalOperand, setLocalOperand}`, `Stack.popFrame`.
+Witness-local (authored, scoped to `ep1BodyTbDerefWriteAndRead`):
+- the 2-arm `assign` rvalue dispatcher (`.Use (.Constant (.Val (.Scalar (.Int ...))))` and
+  `.Use (.Copy/.Move srcPlace)`; every other rvalue shape fails closed with `.unsupported`);
+- `ep1PlaceCompilerHooks.deref` (resolves whole-local pointer dereferences via vendored
+  `PlaceMachine.localToOpCore` with fixed `u32` pointee layout; non-deref projections fail closed);
+- `ep1VendoredControlHooks.copyReturn` is a no-op because the root `.stop` frame has no caller
+  return destination (`returnOperand` still reads `_0` via vendored `Frame.getLocalOperand 0` and
+  `popFrame` runs vendored `MachineHooks.beforeStackPopWithEnsure` before `Stack.popFrame`).
+Hence these witnesses certify vendored PlaceHooks, GlobalAddressState, Tree Borrows, memory, and
+protector-release semantics on the exercised accesses, not a full vendored `ExecutionControl.hooks`
+machine. -/
 def ep1VendoredPlaceStepHooks :
     StepHooks Provenance LocalLayout MachineHooks.FrameExtra (PlaceMachine.Machine Unit Unit)
       Unit (RuntimePlace Provenance) :=
   { assign := fun _ place rvalue state =>
       Miri.Interpreter.runRvalue (do
-        match place.projection.toList, rvalue with
-        | [.Deref], .Use (.Constant c) _ =>
-          let mp ← ep1EvalDerefLocal place.localId
+        let rtDest ← Miri.Interpreter.evalPlace ep1VendoredPlaceHooks () place false
+        match rvalue with
+        | .Use (.Constant c) _ =>
           match c.value with
           | .Val (.Scalar (.Int bits szBytes)) _ =>
             let sc ← match Miri.Memory.Scalar.fromUInt (BitVec.ofNat 128 bits)
                 (Size.ofBytes szBytes.toUInt64) with
               | .ok sc => pure sc
               | .error e => throw (MemoryErrors.allocation (.scalar e))
-            PlaceMachine.writeMemory ep1PlaceAccessConfig (fun _ => false) (.scalar sc) mp
+            Miri.Interpreter.writePlaceImmediate ep1VendoredPlaceHooks () (.scalar sc) rtDest
           | _ => throw (.unsupported "non-int constant in ep1 vendored PlaceMachine witness")
-        | [], .Use (.Copy srcPlace) _ | [], .Use (.Move srcPlace) _ =>
-          match srcPlace.projection.toList with
-          | [.Deref] =>
-            let mp ← ep1EvalDerefLocal srcPlace.localId
-            let readVal ← PlaceMachine.readImmediate ep1PlaceAccessConfig ⟨.indirect mp.mplace, mp.layout⟩
-            let frame ← MachineHooks.currentFrame
-            let frame' ← match frame.replaceLocalValue place.localId (.live (.immediate readVal.imm)) with
-              | .ok f => pure f
-              | .error e => throw (.stack e)
-            MachineHooks.setCurrentFrame frame'
-          | _ => throw (.unsupported "non-deref copy in ep1 vendored PlaceMachine witness")
-        | _, _ => throw (.unsupported "assign shape outside ep1 vendored PlaceMachine witness"))
+        | .Use (.Copy srcPlace) _ | .Use (.Move srcPlace) _ =>
+          let rtSrc ← Miri.Interpreter.evalPlace ep1VendoredPlaceHooks () srcPlace false
+          let opSrc ← Miri.Interpreter.placeToOp ep1VendoredPlaceHooks () rtSrc
+          let readVal ← PlaceMachine.readImmediate ep1PlaceAccessConfig opSrc
+          Miri.Interpreter.writePlaceImmediate ep1VendoredPlaceHooks () readVal.imm rtDest
+        | _ => throw (.unsupported "rvalue shape outside ep1 vendored PlaceMachine witness"))
         state
     evalPlace := fun _ _ _ st => (st, .error (.unsupported "evalPlace unused"))
     writeDiscriminant := fun _ _ _ st => (st, .error (.unsupported "writeDiscriminant unused"))
@@ -4725,9 +4917,15 @@ private def ep1VendoredPtrScalar (prov : Option Provenance) (off : UInt64) :
     | .error _ => Miri.Memory.Scalar.fromPointer annealTargetDataLayout
         ⟨Size.ofBytes (ep1TbBaseAddr + off), .concrete ep1AllocId ep1Tag1⟩
 
+/-- Active `FnEntry` frame protectors (`ep1Tag2` and `ep1Tag3` on `ep1AllocId`), released by
+unmodified vendored `MachineHooks.beforeStackPopWithEnsure` when the frame returns. -/
+private def ep1FrameBorrowState : Miri.TreeBorrows.FrameState :=
+  { protectedTags := #[(ep1AllocId, ep1Tag2), (ep1AllocId, ep1Tag3)] }
+
 /-- Initial vendored `PlaceMachine.State Unit Unit` loaded with
 `LeanMiriSpec.Correspondence.translateBody ep1BodyTbDerefWriteAndRead`, live `ep1VendoredTbAlloc`
-(`Allocation Provenance BorrowTree` at `ep1AllocId`), and `borrowTracker := some` with `ep1Prot23`. -/
+(`Allocation Provenance BorrowTree` at `ep1AllocId`), `FnEntry` frame protectors
+`ep1FrameBorrowState`, and global `borrowTracker := some` with `ep1Prot23`. -/
 noncomputable def ep1InitVendoredPlaceState (writeProv : Option Provenance) (writeOff : UInt64) :
     PlaceMachine.State Unit Unit :=
   let pLay := some (translateTy ep1MutPtrU32Ty emptyLayoutTable)
@@ -4741,7 +4939,8 @@ noncomputable def ep1InitVendoredPlaceState (writeProv : Option Provenance) (wri
     { body := translateBody ep1BodyTbDerefWriteAndRead
       bodyIdentity := BodyIdentity.ofCanonicalIndex 0
       functionInstance := ⟨.Item 0, #[]⟩
-      extra := { borrowTracker := some {}, catchUnwind := none, userRelevance := 0, dataRace := none }
+      extra := { borrowTracker := some ep1FrameBorrowState, catchUnwind := none,
+                 userRelevance := 0, dataRace := none }
       returnContinuation := .stop false
       returnPlace := .frameLocal 0 0 none (translateTy ep1U32Ty emptyLayoutTable)
         (LocalsIdentity.ofAllocationToken 0)
@@ -4830,7 +5029,12 @@ private theorem ep1GetPtrAllocMut_eq
       (ep1TbBaseAddr + off - ep1TbBaseAddr) = off ∧
       off.toNat + 4 ≤ 16 ∧
       checkedBounds ⟨Size.ofBytes 8⟩ ep1AllocId (Size.ofBytes 16) (Size.ofBytes off) 4 .memoryAccess =
-        .ok ()) :
+        .ok ())
+    (hPtrGetAlloc : ∀ (hooks : Miri.Memory.AllocAddresses.AddressLookupHooks),
+      ep1GlobalAddressState.ptrGetAlloc
+        ⟨Size.ofBytes (ep1TbBaseAddr + off), .concrete ep1AllocId tag⟩ (Int64.ofInt 4) hooks
+        { pointerSize := Size.ofBytes 8 } =
+      .ok (some (ep1AllocId, Size.ofBytes off))) :
     let ptr : Pointer (Option Provenance) :=
       ⟨Size.ofBytes (ep1TbBaseAddr + off), some (.concrete ep1AllocId tag)⟩
     let accessed := alloc.extra.performBorrowAccessRange (.concrete tag) (Size.ofBytes off)
@@ -4851,7 +5055,6 @@ private theorem ep1GetPtrAllocMut_eq
         ⟨memTB, ⟨mach, some err⟩, some refTB,
           .error (.hookFailure "beforeMemoryWrite" (reprStr err))⟩ := by
   dsimp only
-  have hLe : ep1TbBaseAddr ≤ ep1TbBaseAddr + off := UInt64.le_iff_toNat_le.mpr hOffBounds.1
   have hSize4 : sizeAsI64 (Size.ofBytes 4) = .ok 4 := by decide
   have hResPtr :
       (PlaceMachine.accessHooks ep1PlaceAccessConfig).resolvePointer mach.memory ⟨mach, none⟩
@@ -4859,10 +5062,8 @@ private theorem ep1GetPtrAllocMut_eq
       ⟨⟨mach, none⟩, .ok (.ok ⟨ep1AllocId, Size.ofBytes off, .concrete tag⟩)⟩ := by
     unfold PlaceMachine.accessHooks ep1PlaceAccessConfig
     unfold_pm
-    dsimp only [Size.ofBytes]
-    have hCond : ((ep1AllocId == ep1AllocId) && decide (ep1TbBaseAddr ≤ ep1TbBaseAddr + off)) = true := by
-      simp [hLe]
-    simp only [hCond, ↓reduceIte, hOffBounds.2.1]
+    dsimp only
+    rw [hPtrGetAlloc]
   have hRaw :
       MemoryLifecycle.getAllocRawMut mach.memory ⟨mach, none⟩ ep1AllocId none
         ep1PlaceAccessConfig.globalHooks = ⟨mach.memory, ⟨mach, none⟩, .ok alloc⟩ := by
@@ -4921,6 +5122,11 @@ private theorem ep1PlaceWriteMemory_u32_concrete_eq
       off.toNat + 4 ≤ 16 ∧
       checkedBounds ⟨Size.ofBytes 8⟩ ep1AllocId (Size.ofBytes 16) (Size.ofBytes off) 4 .memoryAccess =
         .ok ())
+    (hPtrGetAlloc : ∀ (hooks : Miri.Memory.AllocAddresses.AddressLookupHooks),
+      ep1GlobalAddressState.ptrGetAlloc
+        ⟨Size.ofBytes (ep1TbBaseAddr + off), .concrete ep1AllocId tag⟩ (Int64.ofInt 4) hooks
+        { pointerSize := Size.ofBytes 8 } =
+      .ok (some (ep1AllocId, Size.ofBytes off)))
     (hSub4 : (allocRange (Size.ofBytes off) (Size.ofBytes 4)).subrange
       (allocRange Size.ZERO (Size.ofBytes 4)) =
       .ok (allocRange (Size.ofBytes off) (Size.ofBytes 4)))
@@ -4974,7 +5180,7 @@ private theorem ep1PlaceWriteMemory_u32_concrete_eq
     rw [Array.find?_push, hFilterNone]
     simp
   have hGetPtr := ep1GetPtrAllocMut_eq st.machine alloc tag off bt hNoRace hBt hFind hAny hMut
-    hByteSz hOffBounds
+    hByteSz hOffBounds hPtrGetAlloc
   dsimp only at hGetPtr
   have hGhost : ep1PlaceAccessConfig.ghostMode = false := rfl
   have hGlobKind : ep1PlaceAccessConfig.globalKind = none := rfl
@@ -5115,7 +5321,12 @@ private theorem ep1GetPtrAlloc_eq
       (ep1TbBaseAddr + off - ep1TbBaseAddr) = off ∧
       off.toNat + 4 ≤ 16 ∧
       checkedBounds ⟨Size.ofBytes 8⟩ ep1AllocId (Size.ofBytes 16) (Size.ofBytes off) 4 .memoryAccess =
-        .ok ()) :
+        .ok ())
+    (hPtrGetAlloc : ∀ (hooks : Miri.Memory.AllocAddresses.AddressLookupHooks),
+      ep1GlobalAddressState.ptrGetAlloc
+        ⟨Size.ofBytes (ep1TbBaseAddr + off), .concrete ep1AllocId tag⟩ (Int64.ofInt 4) hooks
+        { pointerSize := Size.ofBytes 8 } =
+      .ok (some (ep1AllocId, Size.ofBytes off))) :
     let ptr : Pointer (Option Provenance) :=
       ⟨Size.ofBytes (ep1TbBaseAddr + off), some (.concrete ep1AllocId tag)⟩
     let accessed := alloc.extra.performBorrowAccessRange (.concrete tag) (Size.ofBytes off)
@@ -5136,7 +5347,6 @@ private theorem ep1GetPtrAlloc_eq
         ⟨memTB, ⟨mach, some err⟩, some refTB,
           .error (.hookFailure "beforeMemoryRead" (reprStr err))⟩ := by
   dsimp only
-  have hLe : ep1TbBaseAddr ≤ ep1TbBaseAddr + off := UInt64.le_iff_toNat_le.mpr hOffBounds.1
   have hSize4 : sizeAsI64 (Size.ofBytes 4) = .ok 4 := by decide
   have hResPtr :
       (PlaceMachine.accessHooks ep1PlaceAccessConfig).resolvePointer mach.memory ⟨mach, none⟩
@@ -5144,10 +5354,8 @@ private theorem ep1GetPtrAlloc_eq
       ⟨⟨mach, none⟩, .ok (.ok ⟨ep1AllocId, Size.ofBytes off, .concrete tag⟩)⟩ := by
     unfold PlaceMachine.accessHooks ep1PlaceAccessConfig
     unfold_pm
-    dsimp only [Size.ofBytes]
-    have hCond : ((ep1AllocId == ep1AllocId) && decide (ep1TbBaseAddr ≤ ep1TbBaseAddr + off)) = true := by
-      simp [hLe]
-    simp only [hCond, ↓reduceIte, hOffBounds.2.1]
+    dsimp only
+    rw [hPtrGetAlloc]
   have hRaw :
       MemoryLifecycle.getAllocRaw mach.memory ⟨mach, none⟩ ep1AllocId none
         ep1PlaceAccessConfig.globalHooks = ⟨mach.memory, ⟨mach, none⟩, .ok alloc⟩ := by
@@ -5204,6 +5412,11 @@ private theorem ep1PlaceReadImmediate_u32_concrete_eq
       off.toNat + 4 ≤ 16 ∧
       checkedBounds ⟨Size.ofBytes 8⟩ ep1AllocId (Size.ofBytes 16) (Size.ofBytes off) 4 .memoryAccess =
         .ok ())
+    (hPtrGetAlloc : ∀ (hooks : Miri.Memory.AllocAddresses.AddressLookupHooks),
+      ep1GlobalAddressState.ptrGetAlloc
+        ⟨Size.ofBytes (ep1TbBaseAddr + off), .concrete ep1AllocId tag⟩ (Int64.ofInt 4) hooks
+        { pointerSize := Size.ofBytes 8 } =
+      .ok (some (ep1AllocId, Size.ofBytes off)))
     (hSub4 : (allocRange (Size.ofBytes off) (Size.ofBytes 4)).subrange
       (allocRange Size.ZERO (Size.ofBytes 4)) =
       .ok (allocRange (Size.ofBytes off) (Size.ofBytes 4))) :
@@ -5231,7 +5444,7 @@ private theorem ep1PlaceReadImmediate_u32_concrete_eq
           { st with machine := { st.machine with memory := memTB } } := by
   dsimp only
   have hGetPtr := ep1GetPtrAlloc_eq st.machine alloc tag off bt hNoRace hBt hFind hAny hByteSz
-    hOffBounds
+    hOffBounds hPtrGetAlloc
   dsimp only at hGetPtr
   have hGhost : ep1PlaceAccessConfig.ghostMode = false := rfl
   have hGlobKind : ep1PlaceAccessConfig.globalKind = none := rfl
@@ -5429,43 +5642,179 @@ private def vendoredActiveLocal0Bits (st : PlaceMachine.State Unit Unit) : Optio
         | .error _ => none
       | _ => none
 
-/-- **Vendored-Native Tree-Borrows `PlaceMachine` + `Step.step` + `translateBody` End-to-End Witness
+/-- Modular helper: exact reduction of unmodified vendored `Miri.Interpreter.evalPlace`
+under `ep1VendoredPlaceHooks` (`PlaceMachine.placeHooks`) on a dereferenced pointer local
+`(*_lid)`. -/
+private theorem ep1EvalPlace_deref_local_eq
+    (st : PlaceMachine.State Unit Unit) (fr : Frame Provenance LocalLayout MachineHooks.FrameExtra)
+    (lid : Miri.MIR.LocalId) (sc : Miri.Memory.Scalar Provenance)
+    (ptr : Pointer (Option Provenance)) (lay : LocalLayout)
+    (hFrames : st.stack.frames = #[fr])
+    (hNoRace : fr.extra.dataRace = none)
+    (hGetLocal : fr.getLocal lid = .ok { value := .live (.immediate (.scalar sc)), layout := some lay })
+    (hSized : lay.layout.isSized = true)
+    (hPtr : sc.toPointer annealTargetDataLayout = .ok ptr) :
+    Miri.Interpreter.evalPlace ep1VendoredPlaceHooks () ⟨lid, #[.Deref]⟩ false st =
+      .ok ⟨.memory ⟨ptr, .none, none⟩, translateTy ep1U32Ty emptyLayoutTable⟩ st := by
+  have hCur : st.stack.currentFrame? = some fr := by
+    unfold Stack.currentFrame?; rw [hFrames]; rfl
+  have hIdx : st.stack.frameIndex = .ok 0 := by
+    unfold Stack.frameIndex; rw [hFrames]; rfl
+  have hGetOp : fr.getLocalOperand lid = .ok (.immediate (.scalar sc)) := by
+    unfold Frame.getLocalOperand
+    simp only [hGetLocal]
+    rfl
+  unfold Miri.Interpreter.evalPlace Miri.Interpreter.localToPlace Miri.Interpreter.placeLayoutOfLocal
+    Miri.Interpreter.projectRuntimePlace ep1VendoredPlaceHooks PlaceMachine.placeHooks
+    ep1PlaceCompilerHooks PlaceMachine.localToOpCore MachineHooks.afterLocalRead
+  unfold MachineHooks.currentFrame
+  unfold_pl
+  simp only [get, getThe, MonadStateOf.get, EStateM.get,
+    bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+    Except.mapError, hCur, hGetLocal, hSized, ↓reduceIte, hIdx,
+    Bool.false_and, Bool.false_eq_true, ← Array.forIn_toList, List.forIn_cons, List.forIn_nil,
+    beq_self_eq_true, hGetOp, Bool.not_true, hNoRace, hPtr]
+
+/-- Modular helper: exact reduction of unmodified vendored `Miri.Interpreter.evalPlace`
+under `ep1VendoredPlaceHooks` (`PlaceMachine.placeHooks`) on a whole sized local `⟨lid, #[]⟩`. -/
+private theorem ep1EvalPlace_whole_local_eq
+    (st : PlaceMachine.State Unit Unit) (fr : Frame Provenance LocalLayout MachineHooks.FrameExtra)
+    (lid : Miri.MIR.LocalId) (v : LocalValue Provenance) (lay : LocalLayout)
+    (hFrames : st.stack.frames = #[fr])
+    (hGetLocal : fr.getLocal lid = .ok { value := v, layout := some lay })
+    (hSized : lay.layout.isSized = true) :
+    Miri.Interpreter.evalPlace ep1VendoredPlaceHooks () ⟨lid, #[]⟩ false st =
+      .ok ⟨.local 0 lid none fr.localsIdentity, lay⟩ st := by
+  have hCur : st.stack.currentFrame? = some fr := by
+    unfold Stack.currentFrame?; rw [hFrames]; rfl
+  have hIdx : st.stack.frameIndex = .ok 0 := by
+    unfold Stack.frameIndex; rw [hFrames]; rfl
+  unfold Miri.Interpreter.evalPlace Miri.Interpreter.localToPlace Miri.Interpreter.placeLayoutOfLocal
+    ep1VendoredPlaceHooks PlaceMachine.placeHooks ep1PlaceCompilerHooks MachineHooks.currentFrame
+  unfold_pl
+  simp only [get, getThe, MonadStateOf.get, EStateM.get,
+    bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+    Except.mapError, hCur, hGetLocal, hSized, ↓reduceIte, hIdx,
+    Bool.false_and, Bool.false_eq_true, ← Array.forIn_toList, List.forIn_nil]
+
+/-- Modular helper: exact reduction of unmodified vendored `Miri.Interpreter.writePlaceImmediate`
+under `ep1VendoredPlaceHooks` on a sized memory place (delegates directly to
+`PlaceMachine.writeMemory ep1PlaceAccessConfig`). -/
+private theorem ep1WritePlaceImmediate_memory_eq
+    (st : PlaceMachine.State Unit Unit) (val : Immediate Provenance)
+    (mp : MemPlace Provenance) (lay : LocalLayout)
+    (hSized : lay.layout.isSized = true) :
+    Miri.Interpreter.writePlaceImmediate ep1VendoredPlaceHooks () val ⟨.memory mp, lay⟩ st =
+      PlaceMachine.writeMemory ep1PlaceAccessConfig (fun _ => false) val ⟨mp, lay⟩ st := by
+  unfold Miri.Interpreter.writePlaceImmediate Miri.Interpreter.writePlaceImmediateNoValidate
+    Miri.Interpreter.asMplaceOrMutableLocal ep1VendoredPlaceHooks PlaceMachine.placeHooks
+    ep1PlaceCompilerHooks
+  simp only [hSized, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure]
+  cases PlaceMachine.writeMemory ep1PlaceAccessConfig (fun _ => false) val ⟨mp, lay⟩ st with
+  | ok u s => cases u; rfl
+  | error e s => rfl
+
+/-- Modular helper: exact reduction of unmodified vendored `Miri.Interpreter.writePlaceImmediate`
+under `ep1VendoredPlaceHooks` on a whole sized immediate local (delegates directly to
+`placeWriteLocalImmediate` → `Frame.setLocalOperand` → `MachineHooks.afterLocalWrite`). -/
+private theorem ep1WritePlaceImmediate_local_eq
+    (st : PlaceMachine.State Unit Unit) (fr fr' : Frame Provenance LocalLayout MachineHooks.FrameExtra)
+    (lid : Miri.MIR.LocalId) (oldImm val : Immediate Provenance) (lay : LocalLayout)
+    (hFrames : st.stack.frames = #[fr])
+    (hNoRace : fr'.extra.dataRace = none)
+    (hSized : lay.layout.isSized = true)
+    (hGetOp : fr.getLocalOperand lid = .ok (.immediate oldImm))
+    (hSetOp : fr.setLocalOperand lid (.immediate val) = .ok fr') :
+    Miri.Interpreter.writePlaceImmediate ep1VendoredPlaceHooks () val
+        ⟨.local 0 lid none fr.localsIdentity, lay⟩ st =
+      .ok () { st with stack := { frames := #[fr'] } } := by
+  have hCur : st.stack.currentFrame? = some fr := by
+    unfold Stack.currentFrame?; rw [hFrames]; rfl
+  have hIdx : st.stack.frameIndex = .ok 0 := by
+    unfold Stack.frameIndex; rw [hFrames]; rfl
+  have hSetFr :
+      MachineHooks.setCurrentFrame fr' st = .ok () { st with stack := { frames := #[fr'] } } := by
+    unfold MachineHooks.setCurrentFrame
+    simp only [get, getThe, MonadStateOf.get, set, MonadStateOf.set,
+      bind, Bind.bind, EStateM.bind, EStateM.get, hFrames]
+    rfl
+  have hBackFr : #[fr][#[fr].size - 1]? = some fr := rfl
+  have hBackFr' : #[fr'][#[fr'].size - 1]? = some fr' := rfl
+  unfold Miri.Interpreter.writePlaceImmediate Miri.Interpreter.writePlaceImmediateNoValidate
+    Miri.Interpreter.asMplaceOrMutableLocal ep1VendoredPlaceHooks PlaceMachine.placeHooks
+    ep1PlaceCompilerHooks
+  unfold Miri.Interpreter.placeWriteLocalImmediate MachineHooks.afterLocalWrite
+  unfold MachineHooks.currentFrame
+  unfold_pl
+  simp only [get, getThe, MonadStateOf.get, EStateM.get,
+    bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+    Except.mapError, hSized, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    Option.isSome_none, hIdx, bne_self_eq_false, hFrames, hBackFr, hGetOp, hSetOp, hSetFr,
+    Stack.currentFrame?, Array.back?, hBackFr', hNoRace]
+
+/-- **Vendored-Native Tree-Borrows `PlaceMachine` + `PlaceHooks` + `GlobalAddressState` +
+`beforeStackPopWithEnsure` + `Step.step` + `translateBody` End-to-End Witness
 (`witness_vendored_placeMachine_tb_step_positive_and_ub_refutations`)**:
 Executes REAL `LeanMiriSpec.Correspondence.translateBody ep1BodyTbDerefWriteAndRead`
 (`(*_1) = 99u32; _0 = copy (*_2); return`) through **unmodified `Miri.Interpreter.Step.step`**
-with **unmodified vendored `PlaceMachine.writeMemory` / `PlaceMachine.readImmediate` /
-`PlaceMachine.accessHooks` / `PlaceMachine.memoryAccess` / `ControlFlow.evalTerminator`** over
-`PlaceMachine.State Unit Unit` (`MemoryState Provenance BorrowTree Unit`, ZERO custom TB hooks):
-1. **Positive (`_1 = tag 3 @ 8`, `_2 = tag 2 @ 0`)**:
-   - Step 1 (`(*_1) = 99u32`) passes real vendored `PlaceMachine.writeMemory` + `PlaceMachine.memoryAccess`
-     and writes `99u32` into `[8..12)`.
-   - Step 2 (`_0 = copy (*_2)`) passes real vendored `PlaceMachine.readImmediate` + `PlaceMachine.memoryAccess`
-     and loads `42u32` into `_0` (`vendoredActiveLocal0Bits mid = some 42`).
-   - Step 3 (`return`) pops the stack cleanly (`final.stack.frames = #[]`), AND read-only
-     `miriObserveScalarAction` confirms live memory at `[8..12)` is `99u32` and `[0..4)` is `42u32`!
+with **unmodified vendored `PlaceMachine.placeHooks` / `evalPlace` / `placeToOp` /
+`writePlaceImmediate` / `GlobalAddressState.ptrGetAlloc` / `PlaceMachine.{writeMemory,
+readImmediate, accessHooks, memoryAccess}` / `MachineHooks.beforeStackPopWithEnsure` /
+`ControlFlow.{evalTerminator, returnFromCurrentFrame}` / `Frame.getLocalOperand` /
+`Stack.popFrame`** over `PlaceMachine.State Unit Unit` (ZERO custom TB hooks):
+1. **Positive (`_1 = tag 3 @ 8`, `_2 = tag 2 @ 0`, active `FnEntry` frame protectors `tag 2`, `tag 3`)**:
+   - Step 1 (`(*_1) = 99u32`) evaluates `(*_1)` via `evalPlace` (`PlaceMachine.placeHooks`), resolves
+     pointer via `GlobalAddressState.ptrGetAlloc`, passes `PlaceMachine.writeMemory` +
+     `PlaceMachine.memoryAccess`, and writes `99u32` into `[8..12)`.
+   - Step 2 (`_0 = copy (*_2)`) evaluates `_0` and `(*_2)` via `evalPlace` + `placeToOp`, passes
+     `PlaceMachine.readImmediate` + `PlaceMachine.memoryAccess`, and writes `42u32` into `_0` via
+     `writePlaceImmediate` (`vendoredActiveLocal0Bits mid = some 42`).
+   - Step 3 (`return`) reads `_0` via `Frame.getLocalOperand 0`, releases BOTH `FnEntry` protectors
+     (`tag 2`, `tag 3`) via **unmodified `MachineHooks.beforeStackPopWithEnsure`** (`releaseProtector`
+     + `GlobalState.endCall`), and pops the frame via `Stack.popFrame` (`final.stack.frames = #[]`).
+   - Post-return observations confirm: live bytes `[8..12)` = `99u32` and `[0..4)` = `42u32`,
+     `protectedTags` no longer protects `tag 2` or `tag 3`, AND a subsequent foreign write by
+     `tag 1 @ [0..4)` via unmodified `BorrowTree.performBorrowAccessRange` NOW SUCCEEDS
+     (`.Completed`) — whereas the exact same foreign write before return was `ProtectedDisabled` UB!
 2. **Negative #1 (Protected Foreign Write UB + Committed Tree + `↔` Refutation)**:
    `_1 = tag 1 @ 0` faults INSIDE unmodified `PlaceMachine.writeMemory` → `PlaceMachine.accessHooks`
-   → `PlaceMachine.memoryAccess` with exact
-   `StepError.undefinedBehavior s!"Tree Borrows: {reprStr (.AccessFailure ⟨0, 4⟩ (.TransitionError 1 (.ProtectedDisabled .Frozen)))}"`,
-   commits the updated `BorrowTree` into `after.machine.memory`, AND refutes
-   `¬ AnnealExactWP ... (fun _ _ => True) (fun _ _ => False)`!
+   → `PlaceMachine.memoryAccess` with exact `ProtectedDisabled .Frozen` UB and committed tree.
 3. **Negative #2 (Frozen Local Write UB + Committed Tree + `↔` Refutation)**:
    `_1 = tag 2 @ 0` faults INSIDE unmodified `PlaceMachine.writeMemory` → `PlaceMachine.accessHooks`
-   → `PlaceMachine.memoryAccess` with exact
-   `StepError.undefinedBehavior s!"Tree Borrows: {reprStr (.AccessFailure ⟨0, 4⟩ (.TransitionError 1 (.ChildAccessForbidden .Frozen)))}"`,
-   commits the updated `BorrowTree`, AND refutes
-   `¬ AnnealExactWP ... (fun _ _ => True) (fun _ _ => False)`!
+   → `PlaceMachine.memoryAccess` with exact `ChildAccessForbidden .Frozen` UB and committed tree.
 4. **Negative #3 (Provenance-Free Dangling Integer Pointer UB + `↔` Refutation)**:
    `_1 = ⟨0x1000, none⟩` faults INSIDE unmodified `PlaceMachine.writeMemory` →
-   `PlaceMachine.accessHooks.resolvePointer` → `AllocationAccess.getPtrAllocMut` with
-   `MemoryErrors.operand (.pointerAccess (.access (.danglingIntegerPointer 0x1000 4 .memoryAccess)))`
-   (which is `.undefinedBehavior ...`) AND refutes
-   `¬ AnnealExactWP ... (fun _ _ => True) (fun _ _ => False)`! -/
+   `AllocationAccess.getPtrAllocMut` with `danglingIntegerPointer`.
+5. **Negative #4 (Dead Return Local `_0` on `return` + `↔` Refutation)**:
+   At the `return` terminator with `_0 = .dead`, `Step.step` → `ControlFlow.returnFromCurrentFrame`
+   → `Frame.getLocalOperand 0` fails closed with `.stack (.localExpectedLive 0)`. -/
 theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
     let initOk := ep1InitVendoredPlaceState (some (.concrete ep1AllocId ep1Tag3)) 8
     let initProtUB := ep1InitVendoredPlaceState (some (.concrete ep1AllocId ep1Tag1)) 0
     let initFrozUB := ep1InitVendoredPlaceState (some (.concrete ep1AllocId ep1Tag2)) 0
     let initDanglingUB := ep1InitVendoredPlaceState none 0
+    let deadRetFrame : Frame Provenance LocalLayout MachineHooks.FrameExtra :=
+      { body := translateBody ep1BodyTbDerefWriteAndRead
+        bodyIdentity := BodyIdentity.ofCanonicalIndex 0
+        functionInstance := ⟨.Item 0, #[]⟩
+        extra := { borrowTracker := some ep1FrameBorrowState, catchUnwind := none,
+                   userRelevance := 0, dataRace := none }
+        returnContinuation := .stop false
+        returnPlace := .frameLocal 0 0 none (translateTy ep1U32Ty emptyLayoutTable)
+          (LocalsIdentity.ofAllocationToken 0)
+        localsIdentity := LocalsIdentity.ofAllocationToken 0
+        locals :=
+          #[ { value := .dead, layout := some (translateTy ep1U32Ty emptyLayoutTable) },
+             { value := .live (.immediate (.scalar (ep1VendoredPtrScalar (some (.concrete ep1AllocId ep1Tag3)) 8))),
+               layout := some (translateTy ep1MutPtrU32Ty emptyLayoutTable) },
+             { value := .live (.immediate (.scalar (ep1VendoredPtrScalar (some (.concrete ep1AllocId ep1Tag2)) 0))),
+               layout := some (translateTy ep1MutPtrU32Ty emptyLayoutTable) } ]
+        vaList := #[]
+        trackCallerArg := none
+        location := .mir ⟨0, 2⟩ }
+    let initDeadRetUB : PlaceMachine.State Unit Unit :=
+      { initOk with stack := { frames := #[deadRetFrame] } }
     let stProt := BorrowTree.BorrowTreeAccessStatus.AccessFailure ⟨0, 4⟩
       (.TransitionError 1 (.ProtectedDisabled .Frozen))
     let stFroz := BorrowTree.BorrowTreeAccessStatus.AccessFailure ⟨0, 4⟩
@@ -5482,15 +5831,20 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
     AnnealExactWP (miriRunFuelAction ep1VendoredPlaceStepHooks () 4)
       (fun _ final =>
         final.stack.frames = #[] ∧
-        ∃ a, lookupLiveAllocMem final.machine.memory ep1AllocId = some a ∧
-          AnnealExactWP (miriObserveScalarAction annealTargetDataLayout
-              (allocRange (Size.ofBytes 8) (Size.ofBytes 4)) false)
-            (fun sc _ => sc.toBits (Size.ofBytes 4) = .ok (BitVec.ofNat 128 99))
-            (fun _ _ => False) a ∧
-          AnnealExactWP (miriObserveScalarAction annealTargetDataLayout
-              (allocRange Size.ZERO (Size.ofBytes 4)) false)
-            (fun sc _ => sc.toBits (Size.ofBytes 4) = .ok (BitVec.ofNat 128 42))
-            (fun _ _ => False) a)
+        (∃ bt, final.machine.borrowTracker = some bt ∧
+          bt.global.protectedTags.contains ep1Tag2 = false ∧
+          bt.global.protectedTags.contains ep1Tag3 = false ∧
+          ∃ a, lookupLiveAllocMem final.machine.memory ep1AllocId = some a ∧
+            (a.extra.performBorrowAccessRange (.concrete ep1Tag1) Size.ZERO (Size.ofBytes 4)
+              .Write bt.global.protectedTags .VisitChildrenOfAccessed).status = .Completed ∧
+            AnnealExactWP (miriObserveScalarAction annealTargetDataLayout
+                (allocRange (Size.ofBytes 8) (Size.ofBytes 4)) false)
+              (fun sc _ => sc.toBits (Size.ofBytes 4) = .ok (BitVec.ofNat 128 99))
+              (fun _ _ => False) a ∧
+            AnnealExactWP (miriObserveScalarAction annealTargetDataLayout
+                (allocRange Size.ZERO (Size.ofBytes 4)) false)
+              (fun sc _ => sc.toBits (Size.ofBytes 4) = .ok (BitVec.ofNat 128 42))
+              (fun _ _ => False) a))
       (fun _ _ => False) initOk ∧
     AnnealExactWP (miriStepAction ep1VendoredPlaceStepHooks ())
       (fun _ _ => False)
@@ -5517,7 +5871,13 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
           (.pointerAccess (.access (.danglingIntegerPointer ep1TbBaseAddr 4 .memoryAccess))))
       initDanglingUB ∧
     ¬ AnnealExactWP (miriStepAction ep1VendoredPlaceStepHooks ())
-      (fun _ _ => True) (fun _ _ => False) initDanglingUB := by
+      (fun _ _ => True) (fun _ _ => False) initDanglingUB ∧
+    AnnealExactWP (miriStepAction ep1VendoredPlaceStepHooks ())
+      (fun _ _ => False)
+      (fun err _ => err = .stack (.localExpectedLive 0))
+      initDeadRetUB ∧
+    ¬ AnnealExactWP (miriStepAction ep1VendoredPlaceStepHooks ())
+      (fun _ _ => True) (fun _ _ => False) initDeadRetUB := by
   dsimp only
   have hW1 :
       (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag1) Size.ZERO
@@ -5539,6 +5899,41 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
         (.concrete ep1Tag2) Size.ZERO (Size.ofBytes 4) .Read ep1Prot23
         .VisitChildrenOfAccessed).status = .Completed := by
     rw [performBorrowAccessRangeLMU.eq_src]; kernel_rfl
+  have hRel2StatusClosed :
+      (((ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag3) (Size.ofBytes 8)
+          (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).tree.performBorrowAccessRange
+        (.concrete ep1Tag2) (Size.ofBytes 0) (Size.ofBytes 4) .Read ep1Prot23
+        .VisitChildrenOfAccessed).tree.releaseProtector ep1Tag2 ep1Prot23).status = .Released := by
+    rw [releaseProtectorLMU.eq_src, performBorrowAccessRangeLMU.eq_src]
+    kernel_rfl
+  have hRel3StatusClosed :
+      ((((ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag3) (Size.ofBytes 8)
+          (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).tree.performBorrowAccessRange
+        (.concrete ep1Tag2) (Size.ofBytes 0) (Size.ofBytes 4) .Read ep1Prot23
+        .VisitChildrenOfAccessed).tree.releaseProtector ep1Tag2 ep1Prot23).tree.releaseProtector
+        ep1Tag3 ep1Prot23).status = .Released := by
+    rw [releaseProtectorLMU.eq_src, performBorrowAccessRangeLMU.eq_src]
+    kernel_rfl
+  have hPostRetW1Closed :
+      (((((ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag3) (Size.ofBytes 8)
+          (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).tree.performBorrowAccessRange
+        (.concrete ep1Tag2) (Size.ofBytes 0) (Size.ofBytes 4) .Read ep1Prot23
+        .VisitChildrenOfAccessed).tree.releaseProtector ep1Tag2 ep1Prot23).tree.releaseProtector
+        ep1Tag3 ep1Prot23).tree.performBorrowAccessRange (.concrete ep1Tag1) Size.ZERO
+        (Size.ofBytes 4) .Write ((ep1Prot23.remove ep1Tag2).remove ep1Tag3)
+        .VisitChildrenOfAccessed).status = .Completed := by
+    rw [performBorrowAccessRangeLMU.eq_src, releaseProtectorLMU.eq_src]
+    kernel_rfl
+  have hPtrGet0 : ∀ (tag : BorTag) (hooks : Miri.Memory.AllocAddresses.AddressLookupHooks),
+      ep1GlobalAddressState.ptrGetAlloc
+        ⟨Size.ofBytes (ep1TbBaseAddr + 0), .concrete ep1AllocId tag⟩ (Int64.ofInt 4) hooks
+        { pointerSize := Size.ofBytes 8 } =
+      .ok (some (ep1AllocId, Size.ofBytes 0)) := fun _ _ => by kernel_rfl
+  have hPtrGet8 : ∀ (tag : BorTag) (hooks : Miri.Memory.AllocAddresses.AddressLookupHooks),
+      ep1GlobalAddressState.ptrGetAlloc
+        ⟨Size.ofBytes (ep1TbBaseAddr + 8), .concrete ep1AllocId tag⟩ (Int64.ofInt 4) hooks
+        { pointerSize := Size.ofBytes 8 } =
+      .ok (some (ep1AllocId, Size.ofBytes 8)) := fun _ _ => by kernel_rfl
   have hBounds0 :
       (ep1TbBaseAddr + 0).toNat ≥ ep1TbBaseAddr.toNat ∧
       (ep1TbBaseAddr + 0 - ep1TbBaseAddr) = 0 ∧
@@ -5556,6 +5951,8 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
       .ok (mkMiriU32Scalar 99) := by kernel_rfl
   have hSc99Sz : (mkMiriU32Scalar 99).size = Size.ofBytes 4 := by kernel_rfl
   have hSc99Int : (mkMiriU32Scalar 99).isPointer = false := by kernel_rfl
+  have hPtrLaySized : (translateTy ep1MutPtrU32Ty emptyLayoutTable).layout.isSized = true := by decide
+  have hU32LaySized : (translateTy ep1U32Ty emptyLayoutTable).layout.isSized = true := by decide
   have hWrite99OnBase :
       ∃ (alloc99 : Allocation Provenance BorrowTree),
         Allocation.writeScalar annealTargetDataLayout
@@ -5694,7 +6091,8 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
           { body := translateBody ep1BodyTbDerefWriteAndRead
             bodyIdentity := BodyIdentity.ofCanonicalIndex 0
             functionInstance := ⟨.Item 0, #[]⟩
-            extra := { borrowTracker := some {}, catchUnwind := none, userRelevance := 0, dataRace := none }
+            extra := { borrowTracker := some ep1FrameBorrowState, catchUnwind := none,
+                       userRelevance := 0, dataRace := none }
             returnContinuation := .stop false
             returnPlace := .frameLocal 0 0 none (translateTy ep1U32Ty emptyLayoutTable)
               (LocalsIdentity.ofAllocationToken 0)
@@ -5742,6 +6140,19 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
                 | .unwinding _ => (after, .error .expectedMirLocation)
               | none => (after, .error (.stack .emptyStack)) := by
     intro tag off res hPtr hPM
+    have hEvalDest :
+        Miri.Interpreter.evalPlace ep1VendoredPlaceHooks () ⟨1, #[.Deref]⟩ false
+          (ep1InitVendoredPlaceState (some (.concrete ep1AllocId tag)) off) =
+        .ok ⟨.memory ⟨⟨Size.ofBytes (ep1TbBaseAddr + off), some (.concrete ep1AllocId tag)⟩, .none, none⟩,
+             translateTy ep1U32Ty emptyLayoutTable⟩
+          (ep1InitVendoredPlaceState (some (.concrete ep1AllocId tag)) off) :=
+      ep1EvalPlace_deref_local_eq _ _ 1 _ _ (translateTy ep1MutPtrU32Ty emptyLayoutTable)
+        rfl rfl rfl hPtrLaySized hPtr
+    have hWriteMem := ep1WritePlaceImmediate_memory_eq
+      (ep1InitVendoredPlaceState (some (.concrete ep1AllocId tag)) off)
+      (.scalar (mkMiriU32Scalar 99))
+      ⟨⟨Size.ofBytes (ep1TbBaseAddr + off), some (.concrete ep1AllocId tag)⟩, .none, none⟩
+      (translateTy ep1U32Ty emptyLayoutTable) hU32LaySized
     cases res with
     | error err after =>
       have hAssign :
@@ -5752,12 +6163,9 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
         dsimp only [stmt0, translateStmt, translateStmtKind, translatePlace, translateProjectionElem,
           translateRvalue, translateOperand, translateConstOperand, translateConstValue,
           translateConstScalar, List.map]
-        unfold ep1VendoredPlaceStepHooks ep1EvalDerefLocal MachineHooks.currentFrame
-        simp only [Miri.Interpreter.runRvalue, get, getThe, MonadStateOf.get, EStateM.get,
-          bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure, hInitFr]
-        rw [hLoc1 _ _ _ _ _ rfl]
-        simp only [EStateM.bind, EStateM.pure, hPtr, hFourU64, hSc99]
-        rw [hPM]
+        unfold ep1VendoredPlaceStepHooks
+        simp only [Miri.Interpreter.runRvalue, bind, Bind.bind, EStateM.bind,
+          pure, Pure.pure, EStateM.pure, hEvalDest, hFourU64, hSc99, hWriteMem, hPM]
       unfold Step.step
       simp only [Id.run, hInitFr, hBb0, hS0, hAssign]
       rfl
@@ -5771,12 +6179,9 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
         dsimp only [stmt0, translateStmt, translateStmtKind, translatePlace, translateProjectionElem,
           translateRvalue, translateOperand, translateConstOperand, translateConstValue,
           translateConstScalar, List.map]
-        unfold ep1VendoredPlaceStepHooks ep1EvalDerefLocal MachineHooks.currentFrame
-        simp only [Miri.Interpreter.runRvalue, get, getThe, MonadStateOf.get, EStateM.get,
-          bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure, hInitFr]
-        rw [hLoc1 _ _ _ _ _ rfl]
-        simp only [EStateM.bind, EStateM.pure, hPtr, hFourU64, hSc99]
-        rw [hPM]
+        unfold ep1VendoredPlaceStepHooks
+        simp only [Miri.Interpreter.runRvalue, bind, Bind.bind, EStateM.bind,
+          pure, Pure.pure, EStateM.pure, hEvalDest, hFourU64, hSc99, hWriteMem, hPM]
       have hInitSz :
           (ep1InitVendoredPlaceState (some (.concrete ep1AllocId tag)) off).stack.frames.size - 1 = 0 :=
         rfl
@@ -5797,7 +6202,8 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
     { body := translateBody ep1BodyTbDerefWriteAndRead
       bodyIdentity := BodyIdentity.ofCanonicalIndex 0
       functionInstance := ⟨.Item 0, #[]⟩
-      extra := { borrowTracker := some {}, catchUnwind := none, userRelevance := 0, dataRace := none }
+      extra := { borrowTracker := some ep1FrameBorrowState, catchUnwind := none,
+                 userRelevance := 0, dataRace := none }
       returnContinuation := .stop false
       returnPlace := .frameLocal 0 0 none (translateTy ep1U32Ty emptyLayoutTable)
         (LocalsIdentity.ofAllocationToken 0)
@@ -5827,7 +6233,7 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
     have hPM := ep1PlaceWriteMemory_u32_concrete_eq initOk
       ep1VendoredTbAlloc ep1Tag3 8 (mkMiriU32Scalar 99)
       { global := { GlobalState.new with protectedTags := ep1Prot23 }, retagMode := .Default }
-      rfl rfl rfl hAnyObs rfl (by kernel_rfl) hBounds8 hSub8 hSc99Sz hSc99Int
+      rfl rfl rfl hAnyObs rfl (by kernel_rfl) hBounds8 (hPtrGet8 ep1Tag3) hSub8 hSc99Sz hSc99Int
     dsimp only at hPM
     rw [hEx, hW3] at hPM
     dsimp only at hPM
@@ -5858,6 +6264,7 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
         fr2.location = .mir ⟨0, 2⟩ ∧
         fr2.body = translateBody ep1BodyTbDerefWriteAndRead ∧
         fr2.returnContinuation = .stop false ∧
+        fr2.extra.borrowTracker = some ep1FrameBorrowState ∧
         fr2.locals[0]? =
           some { value := .live (.immediate (.scalar (mkMiriU32Scalar 42))),
                  layout := some (translateTy ep1U32Ty emptyLayoutTable) } ∧
@@ -5872,7 +6279,7 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
            .ok true) := by
     have hPMRead := ep1PlaceReadImmediate_u32_concrete_eq stMid1 alloc99 ep1Tag2 0
       { global := { GlobalState.new with protectedTags := ep1Prot23 }, retagMode := .Default }
-      rfl rfl rfl (by simp [stMid1]) hAlloc99Sz hBounds0 hSub0
+      rfl rfl rfl (by simp [stMid1]) hAlloc99Sz hBounds0 (hPtrGet0 ep1Tag2) hSub0
     dsimp only at hPMRead
     rw [hR2Status] at hPMRead
     dsimp only at hPMRead
@@ -5887,32 +6294,66 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
     have hStMid1Fr : stMid1.stack.currentFrame? = some fr1Ok := rfl
     have hFr1Loc : fr1Ok.location = .mir ⟨0, 1⟩ := rfl
     have hFr1Body : fr1Ok.body = translateBody ep1BodyTbDerefWriteAndRead := rfl
-    have hL2 := hLoc2 fr1Ok _ _ _ _ rfl
+    have hEvalDest0 :
+        Miri.Interpreter.evalPlace ep1VendoredPlaceHooks () ⟨0, #[]⟩ false stMid1 =
+          .ok ⟨.local 0 0 none (LocalsIdentity.ofAllocationToken 0),
+               translateTy ep1U32Ty emptyLayoutTable⟩ stMid1 :=
+      ep1EvalPlace_whole_local_eq stMid1 fr1Ok 0 _ (translateTy ep1U32Ty emptyLayoutTable)
+        rfl rfl hU32LaySized
+    have hEvalSrc2 :
+        Miri.Interpreter.evalPlace ep1VendoredPlaceHooks () ⟨2, #[.Deref]⟩ false stMid1 =
+          .ok ⟨.memory ⟨⟨Size.ofBytes (ep1TbBaseAddr + 0), some (.concrete ep1AllocId ep1Tag2)⟩, .none, none⟩,
+               translateTy ep1U32Ty emptyLayoutTable⟩ stMid1 :=
+      ep1EvalPlace_deref_local_eq stMid1 fr1Ok 2 _ _ (translateTy ep1MutPtrU32Ty emptyLayoutTable)
+        rfl rfl rfl hPtrLaySized (hPtrConcrete0 ep1Tag2)
+    have hPlaceToOp2 :
+        Miri.Interpreter.placeToOp ep1VendoredPlaceHooks ()
+          ⟨.memory ⟨⟨Size.ofBytes (ep1TbBaseAddr + 0), some (.concrete ep1AllocId ep1Tag2)⟩, .none, none⟩,
+           translateTy ep1U32Ty emptyLayoutTable⟩ stMid1 =
+        .ok ⟨.indirect ⟨⟨Size.ofBytes (ep1TbBaseAddr + 0), some (.concrete ep1AllocId ep1Tag2)⟩, .none, none⟩,
+             translateTy ep1U32Ty emptyLayoutTable⟩ stMid1 := rfl
+    let stAfterRead : PlaceMachine.State Unit Unit :=
+      { stMid1 with
+        machine :=
+          { stMid1.machine with
+            memory :=
+              { ep1ObsState.memory with
+                live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterR2)] } } }
+    have hWriteLocal0 :
+        Miri.Interpreter.writePlaceImmediate ep1VendoredPlaceHooks () (.scalar (mkMiriU32Scalar 42))
+          ⟨.local 0 0 none (LocalsIdentity.ofAllocationToken 0),
+           translateTy ep1U32Ty emptyLayoutTable⟩ stAfterRead =
+        .ok () { stAfterRead with stack := { frames := #[{ fr2Ok with location := .mir ⟨0, 1⟩ }] } } :=
+      ep1WritePlaceImmediate_local_eq stAfterRead fr1Ok { fr2Ok with location := .mir ⟨0, 1⟩ } 0
+        .uninit (.scalar (mkMiriU32Scalar 42)) (translateTy ep1U32Ty emptyLayoutTable)
+        rfl rfl hU32LaySized rfl rfl
     have hAssign2 :
         Step.evalStatement ep1VendoredPlaceStepHooks () stmt1 stMid1 =
-          ({ stMid1 with
-             stack := { frames := #[{ fr2Ok with location := .mir ⟨0, 1⟩ }] }
-             machine :=
-               { stMid1.machine with
-                 memory :=
-                   { ep1ObsState.memory with
-                     live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterR2)] } } },
+          ({ stAfterRead with stack := { frames := #[{ fr2Ok with location := .mir ⟨0, 1⟩ }] } },
            .ok ()) := by
       unfold Step.evalStatement
       dsimp only [stmt1, translateStmt, translateStmtKind, translatePlace, translateProjectionElem,
         translateRvalue, translateOperand, List.map]
-      unfold ep1VendoredPlaceStepHooks ep1EvalDerefLocal MachineHooks.currentFrame
-        MachineHooks.setCurrentFrame
-      simp only [Miri.Interpreter.runRvalue, get, getThe, MonadStateOf.get, EStateM.get,
-        set, MonadStateOf.set, bind, Bind.bind, EStateM.bind,
-        pure, Pure.pure, EStateM.pure, hStMid1Fr, hL2, hPtrConcrete0]
+      unfold ep1VendoredPlaceStepHooks
+      simp only [Miri.Interpreter.runRvalue, bind, Bind.bind, EStateM.bind,
+        hEvalDest0, hEvalSrc2, hPlaceToOp2]
       rw [hPMRead]
-      rfl
-    refine ⟨fr2Ok, rfl, rfl, rfl, rfl, ?_⟩
+      have hStAfterEq :
+          ({ stMid1 with
+             machine :=
+               { stMid1.machine with
+                 memory :=
+                   { stMid1.machine.memory with
+                     live := (stMid1.machine.memory.live.filter fun row => row.1 != ep1AllocId).push
+                       (ep1AllocId, LocalAllocation.mk .stack allocAfterR2) } } } :
+              PlaceMachine.State Unit Unit) = stAfterRead := rfl
+      dsimp only
+      rw [hStAfterEq, hWriteLocal0]
+    refine ⟨fr2Ok, rfl, rfl, rfl, rfl, rfl, ?_⟩
     unfold Step.step
     simp only [Id.run, hStMid1Fr, hFr1Loc, hFr1Body, hBb0, hS1, hAssign2]
     rfl
-  rcases hStep2Ok with ⟨fr2, hFr2Loc, hFr2Body, hFr2Cont, hFr2Loc0, hStep2Eq⟩
+  rcases hStep2Ok with ⟨fr2, hFr2Loc, hFr2Body, hFr2Cont, hFr2Bt, hFr2Loc0, hStep2Eq⟩
   let stMid2 : PlaceMachine.State Unit Unit :=
     { stMid1 with
       stack := { frames := #[fr2] }
@@ -5921,27 +6362,131 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
           memory :=
             { ep1ObsState.memory with
               live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterR2)] } } }
+  let tAfterRel2 := (tAfterR2.releaseProtector ep1Tag2 ep1Prot23).tree
+  let allocAfterRel2 : Allocation Provenance BorrowTree := allocAfterR2.setExtra tAfterRel2
+  let tAfterRel3 := (tAfterRel2.releaseProtector ep1Tag3 ep1Prot23).tree
+  let allocAfterRel3 : Allocation Provenance BorrowTree := allocAfterRel2.setExtra tAfterRel3
+  let btAfterEndCall : MachineHooks.BorrowState :=
+    { global := { GlobalState.new with protectedTags := (ep1Prot23.remove ep1Tag2).remove ep1Tag3 },
+      retagMode := .Default }
+  let stFinal : PlaceMachine.State Unit Unit :=
+    { stMid2 with
+      stack := { frames := #[] }
+      machine :=
+        { stMid2.machine with
+          memory :=
+            { ep1ObsState.memory with
+              live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel3)] }
+          borrowTracker := some btAfterEndCall } }
+  have hRel2Status : (tAfterR2.releaseProtector ep1Tag2 ep1Prot23).status = .Released := by
+    dsimp only [tAfterR2]; rw [hAlloc99Ex]; exact hRel2StatusClosed
+  have hRel3Status : (tAfterRel2.releaseProtector ep1Tag3 ep1Prot23).status = .Released := by
+    dsimp only [tAfterRel2, tAfterR2]; rw [hAlloc99Ex]; exact hRel3StatusClosed
+  have hPostRetW1 :
+      (tAfterRel3.performBorrowAccessRange (.concrete ep1Tag1) Size.ZERO (Size.ofBytes 4)
+        .Write btAfterEndCall.global.protectedTags .VisitChildrenOfAccessed).status = .Completed := by
+    dsimp only [tAfterRel3, tAfterRel2, tAfterR2, btAfterEndCall]
+    rw [hAlloc99Ex]; exact hPostRetW1Closed
   have hStep3Ok :
-      Step.step ep1VendoredPlaceStepHooks () stMid2 =
-        ({ stMid2 with stack := { frames := #[] } }, .ok true) := by
+      Step.step ep1VendoredPlaceStepHooks () stMid2 = (stFinal, .ok true) := by
     have hOp0 : fr2.getLocalOperand 0 =
         .ok (.immediate (.scalar (mkMiriU32Scalar 42))) := by
       obtain ⟨hLt, hEq⟩ := Array.getElem?_eq_some_iff.mp hFr2Loc0
       unfold Frame.getLocalOperand Frame.getLocal
       simp only [hLt, ↓reduceDIte, hEq, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
       rfl
+    have hFind1 :
+        (#[(ep1AllocId, LocalAllocation.mk (MachineKind := Unit) .stack allocAfterR2)]).find?
+          (fun entry => entry.1 == ep1AllocId) =
+        some (ep1AllocId, LocalAllocation.mk .stack allocAfterR2) := by simp
+    have hFind2 :
+        (#[(ep1AllocId, LocalAllocation.mk (MachineKind := Unit) .stack allocAfterRel2)]).find?
+          (fun entry => entry.1 == ep1AllocId) =
+        some (ep1AllocId, LocalAllocation.mk .stack allocAfterRel2) := by simp
+    have hInfoRel1 :
+        ({ ep1ObsState.memory with
+           live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterR2)] } :
+            MemoryState Provenance BorrowTree Unit).getAllocInfo ep1AllocId =
+        .ok ⟨allocAfterR2.byteSize, allocAfterR2.align, .liveData, allocAfterR2.mutability⟩ := by
+      unfold MemoryState.getAllocInfo
+      simp only [hFind1, pure, Pure.pure, Except.pure]
+    have hInfoRel2 :
+        ({ ep1ObsState.memory with
+           live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel2)] } :
+            MemoryState Provenance BorrowTree Unit).getAllocInfo ep1AllocId =
+        .ok ⟨allocAfterRel2.byteSize, allocAfterRel2.align, .liveData, allocAfterRel2.mutability⟩ := by
+      unfold MemoryState.getAllocInfo
+      simp only [hFind2, pure, Pure.pure, Except.pure]
+    have hSetRel1 :
+        ({ ep1ObsState.memory with
+           live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterR2)] } :
+            MemoryState Provenance BorrowTree Unit).setLiveAllocation ep1AllocId allocAfterRel2 =
+        .ok { ep1ObsState.memory with
+              live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel2)] } := by
+      have hS := MemoryState.setLiveAllocation_of_find
+        ({ ep1ObsState.memory with
+           live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterR2)] })
+        ep1AllocId (LocalAllocation.mk .stack allocAfterR2) allocAfterRel2 hFind1
+      simpa using hS
+    have hSetRel2 :
+        ({ ep1ObsState.memory with
+           live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel2)] } :
+            MemoryState Provenance BorrowTree Unit).setLiveAllocation ep1AllocId allocAfterRel3 =
+        .ok { ep1ObsState.memory with
+              live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel3)] } := by
+      have hS := MemoryState.setLiveAllocation_of_find
+        ({ ep1ObsState.memory with
+           live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel2)] })
+        ep1AllocId (LocalAllocation.mk .stack allocAfterRel2) allocAfterRel3 hFind2
+      simpa using hS
+    have hBeforePop :
+        MachineHooks.run (MachineHooks.beforeStackPopWithEnsure (fun _ => pure ())) stMid2 =
+          ({ stFinal with stack := { frames := #[fr2] } }, .ok ()) := by
+      unfold MachineHooks.run Call.run MachineHooks.beforeStackPopWithEnsure MachineHooks.currentFrame
+      simp only [stMid2, stMid1, initOk, ep1InitVendoredPlaceState,
+        get, getThe, MonadStateOf.get, EStateM.get, set, MonadStateOf.set,
+        modify, modifyGet, MonadStateOf.modifyGet,
+        bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+        Option.isSome_some, ↓reduceIte, Stack.currentFrame?, hBack1, hFr2Bt, ep1FrameBorrowState]
+      simp only [← Array.forIn_toList, List.forIn_cons, List.forIn_nil,
+        EStateM.get, bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+        hInfoRel1, beq_self_eq_true, ↓reduceIte, hFind1]
+      have hExAfterR2 : allocAfterR2.extra = tAfterR2 := rfl
+      rw [hExAfterR2]
+      have hSetRel1' :
+          ({ ep1ObsState.memory with
+             live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterR2)] } :
+              MemoryState Provenance BorrowTree Unit).setLiveAllocation ep1AllocId
+              (allocAfterR2.setExtra (tAfterR2.releaseProtector ep1Tag2 ep1Prot23).tree) =
+          .ok { ep1ObsState.memory with
+                live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel2)] } := hSetRel1
+      rw [hSetRel1']
+      simp only [EStateM.get, EStateM.modifyGet, EStateM.bind,
+        EStateM.pure, hRel2Status, hInfoRel2, beq_self_eq_true, ↓reduceIte, hFind2]
+      have hExAfterRel2 : allocAfterRel2.extra = tAfterRel2 := rfl
+      rw [hExAfterRel2]
+      have hSetRel2' :
+          ({ ep1ObsState.memory with
+             live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel2)] } :
+              MemoryState Provenance BorrowTree Unit).setLiveAllocation ep1AllocId
+              (allocAfterRel2.setExtra (tAfterRel2.releaseProtector ep1Tag3 ep1Prot23).tree) =
+          .ok { ep1ObsState.memory with
+                live := #[(ep1AllocId, LocalAllocation.mk .stack allocAfterRel3)] } := hSetRel2
+      rw [hSetRel2']
+      simp only [EStateM.modifyGet, EStateM.set, EStateM.bind, EStateM.pure, hRel3Status]
+      rfl
+    have hStMid2Cur : stMid2.stack.currentFrame? = some fr2 := by
+      simp only [stMid2, Stack.currentFrame?, hBack1]
     unfold Step.step ep1VendoredPlaceStepHooks ControlFlow.evalTerminator
       ControlFlow.returnFromCurrentFrame ep1VendoredTermHooks ep1VendoredControlHooks
-    simp only [stMid2, Id.run, Stack.currentFrame?, hBack1, hFr2Loc, hFr2Body, hBb0, hS2, hOp0,
-      Stack.popFrame]
+    simp only [Id.run, hStMid2Cur, hFr2Loc, hFr2Body, hBb0, hS2, hOp0]
     dsimp only [bb0, term0, translateTerminator, translateTerminatorKind]
-    simp only [bind, Bind.bind, pure, Pure.pure, Except.pure, bne_self_eq_false, Bool.false_eq_true,
-      Bool.false_and, ↓reduceIte]
-    simp only [hFr2Cont]
+    rw [hBeforePop]
+    simp only [bind, Bind.bind, pure, Pure.pure, bne_self_eq_false, Bool.false_eq_true,
+      Bool.false_and, ↓reduceIte, Stack.popFrame, hBack1, Except.pure, hFr2Cont]
     rfl
   have hStep4Done :
-      Step.step ep1VendoredPlaceStepHooks () { stMid2 with stack := { frames := #[] } } =
-        ({ stMid2 with stack := { frames := #[] } }, .ok false) := rfl
+      Step.step ep1VendoredPlaceStepHooks () stFinal = (stFinal, .ok false) := rfl
   let tProtTree := (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag1) Size.ZERO
     (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).tree
   let tFrozTree := (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag2) Size.ZERO
@@ -5961,7 +6506,7 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
       (ep1InitVendoredPlaceState (some (.concrete ep1AllocId ep1Tag1)) 0)
       ep1VendoredTbAlloc ep1Tag1 0 (mkMiriU32Scalar 99)
       { global := { GlobalState.new with protectedTags := ep1Prot23 }, retagMode := .Default }
-      rfl rfl rfl hAnyObs rfl (by kernel_rfl) hBounds0 hSub0 hSc99Sz hSc99Int
+      rfl rfl rfl hAnyObs rfl (by kernel_rfl) hBounds0 (hPtrGet0 ep1Tag1) hSub0 hSc99Sz hSc99Int
     dsimp only at hPM
     have hW1' :
         (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag1) (Size.ofBytes 0)
@@ -5988,7 +6533,7 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
       (ep1InitVendoredPlaceState (some (.concrete ep1AllocId ep1Tag2)) 0)
       ep1VendoredTbAlloc ep1Tag2 0 (mkMiriU32Scalar 99)
       { global := { GlobalState.new with protectedTags := ep1Prot23 }, retagMode := .Default }
-      rfl rfl rfl hAnyObs rfl (by kernel_rfl) hBounds0 hSub0 hSc99Sz hSc99Int
+      rfl rfl rfl hAnyObs rfl (by kernel_rfl) hBounds0 (hPtrGet0 ep1Tag2) hSub0 hSc99Sz hSc99Int
     dsimp only at hPM
     have hW2' :
         (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag2) (Size.ofBytes 0)
@@ -6011,6 +6556,18 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
     have hPtrNone :
         (ep1VendoredPtrScalar none 0).toPointer annealTargetDataLayout =
           .ok ⟨Size.ofBytes ep1TbBaseAddr, none⟩ := by kernel_rfl
+    have hEvalDestDang :
+        Miri.Interpreter.evalPlace ep1VendoredPlaceHooks () ⟨1, #[.Deref]⟩ false
+          (ep1InitVendoredPlaceState none 0) =
+        .ok ⟨.memory ⟨⟨Size.ofBytes ep1TbBaseAddr, none⟩, .none, none⟩,
+             translateTy ep1U32Ty emptyLayoutTable⟩
+          (ep1InitVendoredPlaceState none 0) :=
+      ep1EvalPlace_deref_local_eq _ _ 1 _ _ (translateTy ep1MutPtrU32Ty emptyLayoutTable)
+        rfl rfl rfl hPtrLaySized hPtrNone
+    have hWriteDang := ep1WritePlaceImmediate_memory_eq
+      (ep1InitVendoredPlaceState none 0) (.scalar (mkMiriU32Scalar 99))
+      ⟨⟨Size.ofBytes ep1TbBaseAddr, none⟩, .none, none⟩
+      (translateTy ep1U32Ty emptyLayoutTable) hU32LaySized
     have hAssignDang :
         Step.evalStatement ep1VendoredPlaceStepHooks () stmt0 (ep1InitVendoredPlaceState none 0) =
           (ep1InitVendoredPlaceState none 0,
@@ -6020,16 +6577,45 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
       dsimp only [stmt0, translateStmt, translateStmtKind, translatePlace, translateProjectionElem,
         translateRvalue, translateOperand, translateConstOperand, translateConstValue,
         translateConstScalar, List.map]
-      unfold ep1VendoredPlaceStepHooks ep1EvalDerefLocal MachineHooks.currentFrame
-      simp only [Miri.Interpreter.runRvalue, get, getThe, MonadStateOf.get, EStateM.get,
-        bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure, hInitFr]
-      rw [hLoc1 _ _ _ _ _ rfl]
-      simp only [EStateM.bind, EStateM.pure, hPtrNone, hFourU64, hSc99]
-      rw [hPM]
+      unfold ep1VendoredPlaceStepHooks
+      simp only [Miri.Interpreter.runRvalue, bind, Bind.bind, EStateM.bind,
+        pure, Pure.pure, EStateM.pure, hEvalDestDang, hFourU64, hSc99, hWriteDang, hPM]
     unfold Step.step
     simp only [Id.run, hInitFr, hBb0, hS0, hAssignDang]
     rfl
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  let deadRetFrame : Frame Provenance LocalLayout MachineHooks.FrameExtra :=
+    { body := translateBody ep1BodyTbDerefWriteAndRead
+      bodyIdentity := BodyIdentity.ofCanonicalIndex 0
+      functionInstance := ⟨.Item 0, #[]⟩
+      extra := { borrowTracker := some ep1FrameBorrowState, catchUnwind := none,
+                 userRelevance := 0, dataRace := none }
+      returnContinuation := .stop false
+      returnPlace := .frameLocal 0 0 none (translateTy ep1U32Ty emptyLayoutTable)
+        (LocalsIdentity.ofAllocationToken 0)
+      localsIdentity := LocalsIdentity.ofAllocationToken 0
+      locals :=
+        #[ { value := .dead, layout := some (translateTy ep1U32Ty emptyLayoutTable) },
+           { value := .live (.immediate (.scalar (ep1VendoredPtrScalar (some (.concrete ep1AllocId ep1Tag3)) 8))),
+             layout := some (translateTy ep1MutPtrU32Ty emptyLayoutTable) },
+           { value := .live (.immediate (.scalar (ep1VendoredPtrScalar (some (.concrete ep1AllocId ep1Tag2)) 0))),
+             layout := some (translateTy ep1MutPtrU32Ty emptyLayoutTable) } ]
+      vaList := #[]
+      trackCallerArg := none
+      location := .mir ⟨0, 2⟩ }
+  let initDeadRetUB : PlaceMachine.State Unit Unit :=
+    { initOk with stack := { frames := #[deadRetFrame] } }
+  have hStepDeadRetUB :
+      Step.step ep1VendoredPlaceStepHooks () initDeadRetUB =
+        (initDeadRetUB, .error (.stack (.localExpectedLive 0))) := by
+    have hDead0 : deadRetFrame.getLocalOperand 0 = .error (.localExpectedLive 0) := rfl
+    unfold Step.step ep1VendoredPlaceStepHooks ControlFlow.evalTerminator
+      ControlFlow.returnFromCurrentFrame ep1VendoredTermHooks ep1VendoredControlHooks
+    simp only [initDeadRetUB, Id.run, Stack.currentFrame?, hBack1, deadRetFrame, hBb0, hS2, hDead0]
+    dsimp only [bb0, term0, translateTerminator, translateTerminatorKind]
+    simp only [bind, Bind.bind, pure, Pure.pure, bne_self_eq_false, Bool.false_eq_true,
+      Bool.false_and, ↓reduceIte]
+    rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · rw [exactWP_seq]
     unfold AnnealExactWP miriStepAction
     rw [hStep1Ok]
@@ -6044,13 +6630,13 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
     dsimp only [stMid2] at hStep3Ok hStep4Done
     simp only [miriBodySafetyVC, AnnealExactWP, miriStepAction, hStep1Ok, hStep2Eq, hStep3Ok,
       hStep4Done, ↓reduceIte]
-    refine ⟨trivial, allocAfterR2, rfl, ?_, ?_⟩
+    refine ⟨rfl, btAfterEndCall, rfl, (by decide), (by decide), allocAfterRel3, rfl, hPostRetW1, ?_, ?_⟩
     · unfold miriObserveScalarAction allocReadScalarAction
       have hRead8 :
-          allocAfterR2.readScalar annealTargetDataLayout
+          allocAfterRel3.readScalar annealTargetDataLayout
             (allocRange (Size.ofBytes 8) (Size.ofBytes 4)) false =
           .ok (mkMiriU32Scalar 99) := by
-        have : allocAfterR2.readScalar annealTargetDataLayout
+        have : allocAfterRel3.readScalar annealTargetDataLayout
             (allocRange (Size.ofBytes 8) (Size.ofBytes 4)) false =
           alloc99.readScalar annealTargetDataLayout
             (allocRange (Size.ofBytes 8) (Size.ofBytes 4)) false := by cases alloc99; rfl
@@ -6058,10 +6644,10 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
       rw [hRead8]; kernel_rfl
     · unfold miriObserveScalarAction allocReadScalarAction
       have hRead0 :
-          allocAfterR2.readScalar annealTargetDataLayout
+          allocAfterRel3.readScalar annealTargetDataLayout
             (allocRange Size.ZERO (Size.ofBytes 4)) false =
           .ok (mkMiriU32Scalar 42) := by
-        have : allocAfterR2.readScalar annealTargetDataLayout
+        have : allocAfterRel3.readScalar annealTargetDataLayout
             (allocRange Size.ZERO (Size.ofBytes 4)) false =
           alloc99.readScalar annealTargetDataLayout
             (allocRange Size.ZERO (Size.ofBytes 4)) false := by cases alloc99; rfl
@@ -6083,6 +6669,11 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
     rw [hStepDangUB]
   · unfold AnnealExactWP miriStepAction
     rw [hStepDangUB]
+    intro hF; exact hF
+  · unfold AnnealExactWP miriStepAction
+    rw [hStepDeadRetUB]
+  · unfold AnnealExactWP miriStepAction
+    rw [hStepDeadRetUB]
     intro hF; exact hF
 
 end VendoredNativePlaceMachineTbExecution
@@ -6143,6 +6734,8 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
     (type_of% @miriCallTerminatorExactWP_iff) ∧
     (type_of% @miriStepCallTerminatorExactWP_iff) ∧
     (type_of% @miriTerminatorExactWP_iff) ∧
+    (type_of% @miriBeforeStackPopWithEnsure_disabled_exactWP_iff) ∧
+    (type_of% @miriBeforeStackPopWithEnsure_singleLive_exactWP_iff) ∧
     (type_of% @miriObserveScalarExactWP_iff) ∧
     (type_of% @miriObserveBytesExactWP_iff) ∧
     (type_of% @miriObserveRawBytesExactWP_iff) ∧
@@ -6178,6 +6771,7 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
     (type_of% @witness_v2026_capturedMir_tree_borrows_ub_triangle) ∧
     (type_of% @witness_tb_enabled_translateBody_positive_and_negative_ub_refutations) ∧
     (type_of% @witness_tb_hooks_agree_vendored_machineMemoryHooks) ∧
+    (type_of% @ep1GlobalAddressState_ptrGetAlloc_wildcard_strict) ∧
     (type_of% @witness_vendored_placeMachine_tb_step_positive_and_ub_refutations) :=
   ⟨@miriTreeNewChildExactWP_iff, @miriTreeInitialSetupExactWP_iff, @miriTreeRangeExactWP_iff,
    @miriTreeRangeSymbolicExactWP_iff, @miriTreeInitAndRangeExactWP_iff,
@@ -6204,6 +6798,8 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
    @miriForeignEmulate_abort_exactWP, @miriForeignEmulate_noAllocShim_exactWP,
    @miriCallTerminatorExactWP_iff, @miriStepCallTerminatorExactWP_iff,
    @miriTerminatorExactWP_iff,
+   @miriBeforeStackPopWithEnsure_disabled_exactWP_iff,
+   @miriBeforeStackPopWithEnsure_singleLive_exactWP_iff,
    @miriObserveScalarExactWP_iff, @miriObserveBytesExactWP_iff, @miriObserveRawBytesExactWP_iff,
    @miriObserveBytes_uninit_err_exactWP, @miriObserveBytes_ok_exactWP,
    @miriObserveScalar_state_immutable, @miriObserveBytes_state_immutable,
@@ -6229,6 +6825,7 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
    @witness_v2026_capturedMir_tree_borrows_ub_triangle,
    @witness_tb_enabled_translateBody_positive_and_negative_ub_refutations,
    @witness_tb_hooks_agree_vendored_machineMemoryHooks,
+   @ep1GlobalAddressState_ptrGetAlloc_wildcard_strict,
    @witness_vendored_placeMachine_tb_step_positive_and_ub_refutations⟩
 
 section AxiomAndIsolationAudit
@@ -6306,6 +6903,12 @@ run_cmd do
       seenC.contains `Miri.Interpreter.PlaceMachine.accessHooks &&
       seenC.contains `Miri.Interpreter.PlaceMachine.writeMemory &&
       seenC.contains `Miri.Interpreter.PlaceMachine.readImmediate &&
+      seenC.contains `Miri.Interpreter.PlaceMachine.placeHooks &&
+      seenC.contains `Miri.Interpreter.evalPlace &&
+      seenC.contains `Miri.Interpreter.placeToOp &&
+      seenC.contains `Miri.Interpreter.writePlaceImmediate &&
+      seenC.contains `Miri.Memory.AllocAddresses.GlobalAddressState.ptrGetAlloc &&
+      seenC.contains `Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure &&
       seenC.contains `Miri.Interpreter.evalRvalueIntoPlace &&
       seenC.contains `Miri.Interpreter.MachineHooks.storageDead &&
       seenC.contains `Miri.Interpreter.Step.step &&
@@ -6372,13 +6975,25 @@ run_cmd do
       (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
         `Miri.Interpreter.Step.step),
       (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
-        `Miri.Interpreter.PlaceMachine.writeMemory),
-      (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
         `Miri.Interpreter.PlaceMachine.readImmediate),
       (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
         `Miri.Interpreter.MachineHooks.storageDead),
       (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
         `Miri.Interpreter.ControlFlow.evalTerminator),
+      (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
+        `Miri.Memory.AllocAddresses.GlobalAddressState.ptrGetAlloc),
+      (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
+        `Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure),
+      (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
+        `Miri.Interpreter.PlaceMachine.placeHooks),
+      (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
+        `Miri.Interpreter.evalPlace),
+      (ns ++ `witness_vendored_placeMachine_tb_step_positive_and_ub_refutations,
+        `Miri.Interpreter.writePlaceImmediate),
+      (ns ++ `miriBeforeStackPopWithEnsure_singleLive_exactWP_iff,
+        `Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure),
+      (ns ++ `ep1GlobalAddressState_ptrGetAlloc_wildcard_strict,
+        `Miri.Memory.AllocAddresses.GlobalAddressState.ptrGetAlloc),
       (ns ++ `miriTreeRangeExactWP_iff, `Anneal.ExactWpAndSmartCtors.AnnealExactWP) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
