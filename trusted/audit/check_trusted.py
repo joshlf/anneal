@@ -26,7 +26,8 @@ sys.dont_write_bytecode = True  # Public self-test imports must not write checko
 
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
-MAX_BYTES = 512 * 1024 * 1024
+MAX_BYTES = 1024 * 1024 * 1024
+MAX_TRUSTED_INPUT_BYTES = 64 * 1024 * 1024
 CHILD_TIMEOUT_SECS = 300  # The -j1 compile of Anneal.PureMirExec takes 165-197 s under load.
 AUDIT_LEAN_THREADS_ENV, DEFAULT_AUDIT_LEAN_THREADS, MAX_AUDIT_LEAN_THREADS = "ANNEAL_AUDIT_LEAN_THREADS", 2, 64  # Lean children's LEAN_NUM_THREADS.
 # The compiled-environment auditor re-checks every non-toolchain declaration in the kernel (the
@@ -397,7 +398,7 @@ def snapshot(root: Path) -> tuple[dict, dict[str, str]]:
                     raise Failure(1, "snapshot", f"unexpected file in locks/: {relative}")
     if "Trusted" not in modules:
         raise Failure(1, "snapshot", "missing Trusted.lean umbrella")
-    if sum(e.get("bytes", 0) for e in inventory.values()) > MAX_BYTES // 8:
+    if sum(e.get("bytes", 0) for e in inventory.values()) > MAX_TRUSTED_INPUT_BYTES:
         raise Failure(2, "snapshot", "Trusted input exceeds the small-check resource envelope")
     return inventory, dict(sorted(modules.items()))
 
@@ -538,7 +539,7 @@ class Checker:
     def budget(self) -> None:
         size = sum(p.stat().st_size for p in self.stage.rglob("*") if p.is_file())
         if size > MAX_BYTES:
-            raise Failure(2, self.phase, "512 MiB retained-build envelope exceeded")
+            raise Failure(2, self.phase, "1024 MiB retained-build envelope exceeded")
 
     def process(self, label: str, arguments: list[str], *, executable: Path | None = None,
                 timeout: int = CHILD_TIMEOUT_SECS) -> str:

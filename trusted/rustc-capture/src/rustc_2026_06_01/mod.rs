@@ -552,6 +552,65 @@ pub fn pass_shared_temp_const_raw_ptr_read_and_freeze_retag__b22_c27() -> u32 {
     }
 
     #[test]
+    fn driver_captures_nested_const_and_generic_impl_closures() {
+        let sample_rust = r#"#![allow(dead_code)]
+
+pub fn nested_closures(x: u32) -> u32 {
+    let outer: fn(u32) -> u32 = |a: u32| {
+        let inner: fn(u32) -> u32 = |b: u32| b.wrapping_add(1);
+        inner(a).wrapping_add(2)
+    };
+    outer(x)
+}
+
+pub const CONST_FP: fn(u32) -> u32 = |x: u32| x.wrapping_add(5);
+pub static STATIC_FP: fn(u32) -> u32 = |x: u32| x.wrapping_add(9);
+
+pub fn use_const_static(x: u32) -> u32 {
+    CONST_FP(x) ^ STATIC_FP(x)
+}
+
+pub struct Wrapper<T>(pub T);
+impl<T: Copy> Wrapper<T> {
+    pub fn get_via_fp(&self) -> T {
+        let f: fn(T) -> T = |x: T| x;
+        f(self.0)
+    }
+}
+"#;
+        let (temp_root, unit_dir, manifest) = capture_with_difftest_flags(
+            "closure-nested-filtered",
+            "nested_demo",
+            "2024",
+            sample_rust,
+            Some("nested_closures,use_const_static,get_via_fp"),
+        );
+
+        for def_id in [
+            "nested_demo::nested_closures::{closure#0}",
+            "nested_demo::nested_closures::{closure#0}::{closure#0}",
+            "nested_demo::CONST_FP::{closure#0}",
+            "nested_demo::STATIC_FP::{closure#0}",
+        ] {
+            let rec = find_target(&manifest, def_id);
+            assert_eq!(rec.item_kind, CapturedItemKind::Callee);
+            let lean = read_target_lean(&unit_dir, rec);
+            assert!(!lean.contains("typeParamCount :="), "{def_id} must have typeParamCount = 0");
+            assert!(lean.contains("conv := CallConv.rust, canUnwind := true"));
+        }
+
+        let impl_clo = find_target(&manifest, "nested_demo::Wrapper::<T>::get_via_fp::{closure#0}");
+        assert_eq!(impl_clo.item_kind, CapturedItemKind::Callee);
+        let impl_lean = read_target_lean(&unit_dir, impl_clo);
+        assert!(
+            impl_lean.contains("typeParamCount := 1,"),
+            "closure inside generic impl must retain only the impl's type param\n{impl_lean}"
+        );
+        assert!(impl_lean.contains("RigidTy.closure \"nested_demo::Wrapper::<T>::get_via_fp::{closure#0}\" List.nil"));
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn driver_captures_unit_manifest_and_mir_lean_modules() {
         let temp_root = unique_temp_dir("integration");
         let capture_dir = temp_root.join("capture");

@@ -15829,6 +15829,8 @@ reference `&{closure}` (`.sharedRef`, an `Fn` body), a mutable reference
 
 Reference (The Rust Reference 1.98.0, "Closure types", "Call traits and coercions"):
 <https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.intro>
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.fn-mut>
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.fn>
 
 > "Closure types all implement `FnOnce`, indicating that they can be called
 > once by consuming ownership of the closure. Additionally, some closures
@@ -15924,6 +15926,8 @@ other type (including a closure type with a different path, e.g. a generic
 Reference (`library/core/src/ops/function.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, lines 77–79, 164–166, and 248–250):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L77-L79>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L164-L166>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L248-L250>
 
 > "extern "rust-call" fn call(&self, args: Args) -> Self::Output;"
 > "extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;"

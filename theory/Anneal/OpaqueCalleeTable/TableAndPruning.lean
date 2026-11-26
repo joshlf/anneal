@@ -1626,12 +1626,15 @@ def tailCallWith (resolve : CalleeResolver) (s : MachineState) (func : Operand) 
                 calleeBody
                 (calleeEntryArgs target calleeBody argVals))
         | .none =>
-          MirStepNode.extCall
-            { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
-              memory := memAfterTeardown }
-            (resumeExternalTailCallWithAbi
-              s.memory.rootUnwindCeiling
-              (externalTargetCanUnwind target (operandTy bodyLocalDecls bodyLayouts func)))
+          match Bool.and target.isIndirect (isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs) with
+          | true => MirStepNode.unsupported
+          | false =>
+            MirStepNode.extCall
+              { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
+                memory := memAfterTeardown }
+              (resumeExternalTailCallWithAbi
+                s.memory.rootUnwindCeiling
+                (externalTargetCanUnwind target (operandTy bodyLocalDecls bodyLayouts func)))
 
 /-- Resolver-parametric copy of the trusted `evalTerminator`: the `.call` and
 `.tailCall` arms are the trusted arms verbatim with `resolve` in place of
@@ -1724,9 +1727,12 @@ def stepTerminatorWith (prune : Bool) (resolve : CalleeResolver) (s : MachineSta
           | false =>
             match target.isIndirect with
             | true =>
-              MirStepNode.extCall
-                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                (resumeExternalCall s locals' destination targetBb unwind)
+              match isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+              | true => MirStepNode.unsupported
+              | false =>
+                MirStepNode.extCall
+                  { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                  (resumeExternalCall s locals' destination targetBb unwind)
             | false =>
               match
                 evalDirectRustIntrinsic?
@@ -1835,9 +1841,12 @@ def stepTerminatorWith (prune : Bool) (resolve : CalleeResolver) (s : MachineSta
                       { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
                       (resumeExternalDivergingCall s locals' unwind)
           | true =>
-            MirStepNode.extCall
-              { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-              (resumeExternalDivergingCall s locals' unwind)
+            match isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+            | true => MirStepNode.unsupported
+            | false =>
+              MirStepNode.extCall
+                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                (resumeExternalDivergingCall s locals' unwind)
   | .tailCall func argOps =>
     tailCallWith resolve s func argOps currentBody
   | _ => evalTerminator s term currentBody

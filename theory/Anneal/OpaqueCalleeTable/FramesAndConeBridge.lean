@@ -2109,7 +2109,8 @@ theorem nodeSuccs_evalTerminatorLookup {cone : List DefPath} {root : CapturedMir
           rw [h_ta]
           cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
               tgt.defPath [] s.memory.traitImpls with
-          | none => trivial
+          | none =>
+            cases tgt.isIndirect && isGenericClosureArityMismatch s.memory.callees tgt.defPath [] <;> trivial
           | some calleeBody =>
             dsimp only
             rw [h_inv.1] at h_lk
@@ -2732,7 +2733,8 @@ theorem nodeSuccs_evalTerminatorLookupPoly {cone : List DefPath} {root : Capture
           dsimp only
           cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
               tgt.defPath tgt.typeArgs s.memory.traitImpls with
-          | none => trivial
+          | none =>
+            cases tgt.isIndirect && isGenericClosureArityMismatch s.memory.callees tgt.defPath tgt.typeArgs <;> trivial
           | some calleeBody =>
             dsimp only
             rw [h_inv.1, h_inv.2.1] at h_lk h_no₁

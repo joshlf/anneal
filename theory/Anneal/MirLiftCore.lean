@@ -2374,7 +2374,11 @@ theorem PureMirModularConverges.call_modular_resolved
     (h_not_intrinsic :
       resolvedTarget.isIndirect = true ∨
       classifyRustIntrinsic? resolvedTarget.defPath = none := by
-      first | exact Or.inr (by decide) | exact Or.inl (by decide)) :
+      first | exact Or.inr (by decide) | exact Or.inl (by decide))
+    (h_not_gen_clos :
+      resolvedTarget.isIndirect = false ∨
+      isGenericClosureArityMismatch callees resolvedTarget.defPath resolvedTarget.typeArgs = false := by
+      first | exact Or.inl rfl | exact Or.inr rfl | exact Or.inl (by decide) | exact Or.inr (by decide)) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm h_ruc
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
@@ -2421,7 +2425,10 @@ theorem PureMirModularConverges.call_modular_resolved
       rw [h_not_exact]
       dsimp only
       cases h_ind : resolvedTarget.isIndirect with
-      | true => rfl
+      | true =>
+        rcases h_not_gen_clos with h_ind_f | h_ngc
+        · rw [h_ind] at h_ind_f; exact False.elim (Bool.noConfusion h_ind_f)
+        · rw [h_ngc]
       | false =>
         rcases h_not_intrinsic with h_ind_t | h_ni
         · rw [h_ind] at h_ind_t
@@ -2841,7 +2848,11 @@ theorem PureMirModularConverges.tailCall_modular_resolved
             args := argVals
             memory := m }
           (.panicked panicMem) := by
-      first | exact Or.inl rfl | exact Or.inl (by decide)) :
+      first | exact Or.inl rfl | exact Or.inl (by decide))
+    (h_not_gen_clos :
+      resolvedTarget.isIndirect = false ∨
+      isGenericClosureArityMismatch callees resolvedTarget.defPath resolvedTarget.typeArgs = false := by
+      first | exact Or.inl rfl | exact Or.inr rfl | exact Or.inl (by decide) | exact Or.inr (by decide)) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm h_ruc
   let mTd : Memory :=
@@ -2893,6 +2904,13 @@ theorem PureMirModularConverges.tailCall_modular_resolved
             resolvedTarget.typeArgs m.traitImpls = none := by
         rw [hm.1, hm.2.1, h_lookup]
       rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, h_lk_m]
+      rcases h_not_gen_clos with h_ind_f | h_ngc
+      · rw [h_ind_f]; rfl
+      · have h_ngc_m :
+            isGenericClosureArityMismatch m.callees resolvedTarget.defPath
+              resolvedTarget.typeArgs = false := by
+          rw [hm.1]; exact h_ngc
+        rw [h_ngc_m]; cases resolvedTarget.isIndirect <;> rfl
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -13080,7 +13098,11 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
         | unsupported => rfl
         | ok argVals locals' =>
           dsimp only
-          rw [h_ta, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
+          have h_gc_eq :
+              isGenericClosureArityMismatch c₂ tgt.defPath [] =
+                isGenericClosureArityMismatch s.memory.callees tgt.defPath [] := by
+            unfold isGenericClosureArityMismatch; rw [(h_agree tgt.defPath h_dp).symm]
+          rw [h_ta, h_gc_eq, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
               (h_agree tgt.defPath h_dp).symm,
             evalDirectRustIntrinsic?_withCallees_of_nonSelect c₂ s (some cur) tgt
               (bodyLocalDeclsOf (some cur)) cur.layouts argOps argVals locals' destination
@@ -13111,7 +13133,11 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
         | unsupported => rfl
         | ok argVals locals' =>
           dsimp only
-          rw [h_ta, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
+          have h_gc_eq :
+              isGenericClosureArityMismatch c₂ tgt.defPath [] =
+                isGenericClosureArityMismatch s.memory.callees tgt.defPath [] := by
+            unfold isGenericClosureArityMismatch; rw [(h_agree tgt.defPath h_dp).symm]
+          rw [h_ta, h_gc_eq, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
               (h_agree tgt.defPath h_dp).symm,
             evalDivergingRustIntrinsic?_withCallees c₂ s tgt (bodyLocalDeclsOf (some cur))
               cur.layouts argOps argVals locals' destination]
@@ -13150,10 +13176,15 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
         | true => rfl
         | false =>
           dsimp only
-          rw [h_ta, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
+          have h_gc_eq :
+              isGenericClosureArityMismatch c₂ tgt.defPath [] =
+                isGenericClosureArityMismatch s.memory.callees tgt.defPath [] := by
+            unfold isGenericClosureArityMismatch; rw [(h_agree tgt.defPath h_dp).symm]
+          rw [h_ta, h_gc_eq, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
               (h_agree tgt.defPath h_dp).symm]
           cases lookupCallee s.memory.callees cur.layouts tgt.defPath [] s.memory.traitImpls with
-          | none => rfl
+          | none =>
+            cases tgt.isIndirect && isGenericClosureArityMismatch s.memory.callees tgt.defPath [] <;> rfl
           | some calleeBody =>
             dsimp only
             cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
@@ -14307,7 +14338,8 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
           rw [h_ta]
           cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
               tgt.defPath [] s.memory.traitImpls with
-          | none => trivial
+          | none =>
+            cases tgt.isIndirect && isGenericClosureArityMismatch s.memory.callees tgt.defPath [] <;> trivial
           | some calleeBody =>
             dsimp only
             rw [h_inv.1] at h_lk
@@ -14724,7 +14756,11 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
         | unsupported => rfl
         | ok argVals locals' =>
           dsimp only
-          rw [lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
+          have h_gc_eq :
+              isGenericClosureArityMismatch c₂ tgt.defPath tgt.typeArgs =
+                isGenericClosureArityMismatch s.memory.callees tgt.defPath tgt.typeArgs := by
+            unfold isGenericClosureArityMismatch; rw [(h_agree tgt.defPath h_dp).symm]
+          rw [h_gc_eq, lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
               s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁,
             evalDirectRustIntrinsic?_withCallees_of_nonSelect c₂ s (some cur) tgt
               (bodyLocalDeclsOf (some cur)) cur.layouts argOps argVals locals' destination
@@ -14755,7 +14791,11 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
         | unsupported => rfl
         | ok argVals locals' =>
           dsimp only
-          rw [lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
+          have h_gc_eq :
+              isGenericClosureArityMismatch c₂ tgt.defPath tgt.typeArgs =
+                isGenericClosureArityMismatch s.memory.callees tgt.defPath tgt.typeArgs := by
+            unfold isGenericClosureArityMismatch; rw [(h_agree tgt.defPath h_dp).symm]
+          rw [h_gc_eq, lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
               s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁,
             evalDivergingRustIntrinsic?_withCallees c₂ s tgt (bodyLocalDeclsOf (some cur))
               cur.layouts argOps argVals locals' destination]
@@ -14794,10 +14834,15 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
         | true => rfl
         | false =>
           dsimp only
-          rw [lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
+          have h_gc_eq :
+              isGenericClosureArityMismatch c₂ tgt.defPath tgt.typeArgs =
+                isGenericClosureArityMismatch s.memory.callees tgt.defPath tgt.typeArgs := by
+            unfold isGenericClosureArityMismatch; rw [(h_agree tgt.defPath h_dp).symm]
+          rw [h_gc_eq, lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
               s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁]
           cases lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs s.memory.traitImpls with
-          | none => rfl
+          | none =>
+            cases tgt.isIndirect && isGenericClosureArityMismatch s.memory.callees tgt.defPath tgt.typeArgs <;> rfl
           | some calleeBody =>
             dsimp only
             cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
@@ -15527,7 +15572,8 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
           dsimp only
           cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
               tgt.defPath tgt.typeArgs s.memory.traitImpls with
-          | none => trivial
+          | none =>
+            cases tgt.isIndirect && isGenericClosureArityMismatch s.memory.callees tgt.defPath tgt.typeArgs <;> trivial
           | some calleeBody =>
             dsimp only
             rw [h_inv.1, h_inv.2.1] at h_lk h_no₁

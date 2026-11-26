@@ -2857,11 +2857,7 @@ def evalConstEvalSelectThree
     | .some rtTarget =>
       match lookupCallee s.memory.callees bodyLayouts rtTarget.defPath rtTarget.typeArgs s.memory.traitImpls with
       | .some calleeBody =>
-        match
-          Bool.and (Nat.beq calleeBody.argCount (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
-            (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
-              (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs)))
-        with
+        match constEvalSelectCalleeCompatible rtTarget calleeBody (length unpackedArgs) with
         | false => MirStepNode.fail .ub
         | true =>
           match currentBody with
@@ -2873,9 +2869,12 @@ def evalConstEvalSelectThree
       | .none =>
         match rtTarget.isIndirect with
         | true =>
-          MirStepNode.extCall
-            { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
-            (resumeExternalCall s locals' destination targetBb unwind)
+          match isGenericClosureArityMismatch s.memory.callees rtTarget.defPath rtTarget.typeArgs with
+          | true => MirStepNode.unsupported
+          | false =>
+            MirStepNode.extCall
+              { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
+              (resumeExternalCall s locals' destination targetBb unwind)
         | false =>
           let selectArgOps := constEvalSelectTupleArgOps tupleTyOpt
           match isDirectExactDivTarget rtTarget with
@@ -3083,10 +3082,7 @@ theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
                 rtTarget.defPath rtTarget.typeArgs ms.memory.traitImpls with
             | some subCallee =>
               dsimp only
-              cases
-                Bool.and (Nat.beq subCallee.argCount (length (constEvalSelectEntryArgs subCallee unpackedArgs)))
-                  (Bool.and (Bool.not (callConvEq subCallee.fnAbi.conv .rustIntrinsic))
-                    (checkCalleeTargetCompatible rtTarget subCallee (length unpackedArgs))) with
+              cases constEvalSelectCalleeCompatible rtTarget subCallee (length unpackedArgs) with
               | false => intro h_st; exact False.elim h_st
               | true =>
                 intro _
@@ -3096,7 +3092,9 @@ theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
             | none =>
               dsimp only
               cases rtTarget.isIndirect with
-              | true => intro h_st; exact False.elim h_st
+              | true =>
+                cases isGenericClosureArityMismatch ms.memory.callees rtTarget.defPath rtTarget.typeArgs <;>
+                  (intro h_st; exact False.elim h_st)
               | false =>
                 dsimp only
                 cases isDirectExactDivTarget rtTarget with
@@ -6114,9 +6112,7 @@ private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
             cases lookupCallee ms.memory.callees curBody.layouts rtTarget.defPath rtTarget.typeArgs ms.memory.traitImpls with
             | some subCallee =>
               dsimp only
-              cases Bool.and (Nat.beq subCallee.argCount (length (constEvalSelectEntryArgs subCallee unpackedArgs)))
-                  (Bool.and (Bool.not (callConvEq subCallee.fnAbi.conv .rustIntrinsic))
-                    (checkCalleeTargetCompatible rtTarget subCallee (length unpackedArgs))) with
+              cases constEvalSelectCalleeCompatible rtTarget subCallee (length unpackedArgs) with
               | false => intro h_st; exact False.elim h_st
               | true =>
                 intro _
@@ -6125,7 +6121,9 @@ private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
             | none =>
               dsimp only
               cases rtTarget.isIndirect with
-              | true => intro h_st; exact False.elim h_st
+              | true =>
+                cases isGenericClosureArityMismatch ms.memory.callees rtTarget.defPath rtTarget.typeArgs <;>
+                  (intro h_st; exact False.elim h_st)
               | false =>
                 dsimp only
                 cases isDirectExactDivTarget rtTarget with
@@ -6449,7 +6447,10 @@ theorem wpMirExecNoCallSym_borrows_nil
                   | false =>
                     rw [h_p] at h_wp; dsimp only at h_wp
                     cases h_lk : lookupCallee ms.memory.callees curBody.layouts rTarget.defPath rTarget.typeArgs ms.memory.traitImpls with
-                    | none => rw [h_lk] at h_wp; exact h_wp
+                    | none =>
+                      rw [h_lk] at h_wp; dsimp only at h_wp
+                      cases h_gc : rTarget.isIndirect && isGenericClosureArityMismatch ms.memory.callees rTarget.defPath rTarget.typeArgs <;>
+                        (rw [h_gc] at h_wp; exact h_wp)
                     | some subCallee =>
                       rw [h_lk] at h_wp; dsimp only at h_wp
                       cases h_ck : checkCalleeTargetCompatible rTarget subCallee (length aVals) with
@@ -6483,7 +6484,10 @@ theorem wpMirExecNoCallSym_borrows_nil
                     | none =>
                       rw [h_lk] at h_wp; dsimp only at h_wp
                       cases h_ind : rTarget.isIndirect with
-                      | true => rw [h_ind] at h_wp; exact h_wp
+                      | true =>
+                        rw [h_ind] at h_wp; dsimp only at h_wp
+                        cases h_gc : isGenericClosureArityMismatch ms.memory.callees rTarget.defPath rTarget.typeArgs <;>
+                          (rw [h_gc] at h_wp; exact h_wp)
                       | false =>
                         rw [h_ind] at h_wp; dsimp only at h_wp
                         cases h_unr : isUnreachableCallTarget rTarget.defPath with
@@ -6540,7 +6544,10 @@ theorem wpMirExecNoCallSym_borrows_nil
                       | false =>
                         rw [h_ed] at h_wp; dsimp only at h_wp
                         cases h_ind : rTarget.isIndirect with
-                        | true => rw [h_ind] at h_wp; exact h_wp
+                        | true =>
+                          rw [h_ind] at h_wp; dsimp only at h_wp
+                          cases h_gc : isGenericClosureArityMismatch ms.memory.callees rTarget.defPath rTarget.typeArgs <;>
+                            (rw [h_gc] at h_wp; exact h_wp)
                         | false =>
                           rw [h_ind] at h_wp; dsimp only at h_wp
                           cases h_di : evalDirectRustIntrinsic? ms (some curBody) rTarget
@@ -7073,7 +7080,10 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                     dsimp only at h_st h_step_body
                     cases h_lk : lookupCallee ms.memory.callees curBody.layouts
                         rTarget.defPath rTarget.typeArgs ms.memory.traitImpls with
-                    | none => rw [h_lk] at h_st; exact False.elim h_st
+                    | none =>
+                      rw [h_lk] at h_st; dsimp only at h_st
+                      cases h_gc : rTarget.isIndirect && isGenericClosureArityMismatch ms.memory.callees rTarget.defPath rTarget.typeArgs <;>
+                        (rw [h_gc] at h_st; exact False.elim h_st)
                     | some subCallee =>
                       rw [h_lk] at h_st h_step_body
                       dsimp only at h_st h_step_body
@@ -7146,7 +7156,10 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                       | none =>
                         rw [h_lk] at h_st h_step_body
                         cases h_ind : rTarget.isIndirect with
-                        | true => rw [h_ind] at h_st; exact False.elim h_st
+                        | true =>
+                          rw [h_ind] at h_st; dsimp only at h_st
+                          cases h_gc : isGenericClosureArityMismatch ms.memory.callees rTarget.defPath rTarget.typeArgs <;>
+                            (rw [h_gc] at h_st; exact False.elim h_st)
                         | false =>
                           rw [h_ind] at h_st h_step_body
                           dsimp only at h_st h_step_body
@@ -7240,7 +7253,10 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                           rw [h_ed] at h_st h_step_body
                           dsimp only at h_st h_step_body
                           cases h_ind : rTarget.isIndirect with
-                          | true => rw [h_ind] at h_st; exact False.elim h_st
+                          | true =>
+                            rw [h_ind] at h_st; dsimp only at h_st
+                            cases h_gc : isGenericClosureArityMismatch ms.memory.callees rTarget.defPath rTarget.typeArgs <;>
+                              (rw [h_gc] at h_st; exact False.elim h_st)
                           | false =>
                             rw [h_ind] at h_st h_step_body
                             dsimp only at h_st h_step_body
@@ -7682,15 +7698,16 @@ theorem extCallAbortsProp_evalDirectRustIntrinsic?
                 rtTarget.typeArgs s.memory.traitImpls with
             | some calleeBody =>
               dsimp only
-              cases Bool.and (Nat.beq calleeBody.argCount (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
-                  (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
-                    (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) with
+              cases constEvalSelectCalleeCompatible rtTarget calleeBody (length unpackedArgs) with
               | false => trivial
               | true => dsimp only; cases currentBody <;> trivial
             | none =>
               dsimp only
               cases rtTarget.isIndirect with
-              | true => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
+              | true =>
+                cases isGenericClosureArityMismatch s.memory.callees rtTarget.defPath rtTarget.typeArgs with
+                | true => trivial
+                | false => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
               | false =>
                 dsimp only
                 cases isDirectExactDivTarget rtTarget with
@@ -7888,7 +7905,10 @@ theorem stepMirFn_extCall_aborts_prop
                   | none =>
                     dsimp only
                     cases target.isIndirect with
-                    | true => exact extCallAbortsProp_extCall_diverging _ _ _ _
+                    | true =>
+                      cases isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+                      | true => trivial
+                      | false => exact extCallAbortsProp_extCall_diverging _ _ _ _
                     | false =>
                       dsimp only
                       cases isUnreachableCallTarget target.defPath with
@@ -7946,7 +7966,10 @@ theorem stepMirFn_extCall_aborts_prop
                     | false =>
                       dsimp only
                       cases target.isIndirect with
-                      | true => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
+                      | true =>
+                        cases isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+                        | true => trivial
+                        | false => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
                       | false =>
                         dsimp only
                         cases h_di :
@@ -8027,7 +8050,10 @@ theorem stepMirFn_extCall_aborts_prop
                   | some calleeBody =>
                     dsimp only
                     cases checkCalleeTargetCompatible target calleeBody (length argVals) <;> trivial
-                  | none => exact extCallAbortsProp_extCall_tail _ _ _
+                  | none =>
+                    cases target.isIndirect && isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+                    | true => trivial
+                    | false => exact extCallAbortsProp_extCall_tail _ _ _
           | assert cond expected _ unwind =>
             dsimp only [evalTerminator, bodyLocalDeclsOf]
             cases evalOperandWithBodyCast s.frame.locals cond s.memory.borrows
@@ -8624,7 +8650,10 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                       rw [h_pc] at h_st h_step_body
                       dsimp only at h_st h_step_body
                       cases h_lk : lookupCallee ms.memory.callees curBody.layouts target.defPath target.typeArgs ms.memory.traitImpls with
-                      | none => rw [h_lk] at h_st; exact False.elim h_st
+                      | none =>
+                        rw [h_lk] at h_st; dsimp only at h_st
+                        cases h_gc : target.isIndirect && isGenericClosureArityMismatch ms.memory.callees target.defPath target.typeArgs <;>
+                          (rw [h_gc] at h_st; exact False.elim h_st)
                       | some nextCallee =>
                         rw [h_lk] at h_st h_step_body
                         dsimp only at h_st h_step_body
@@ -8693,7 +8722,10 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                         rw [h_lk] at h_st h_step_body
                         dsimp only at h_st h_step_body
                         cases h_ind : target.isIndirect with
-                        | true => rw [h_ind] at h_st; exact False.elim h_st
+                        | true =>
+                          rw [h_ind] at h_st; dsimp only at h_st
+                          cases h_gc : isGenericClosureArityMismatch ms.memory.callees target.defPath target.typeArgs <;>
+                            (rw [h_gc] at h_st; exact False.elim h_st)
                         | false =>
                           rw [h_ind] at h_st h_step_body
                           dsimp only at h_st h_step_body
@@ -8776,7 +8808,10 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                           rw [h_ed] at h_st h_step_body
                           dsimp only at h_st h_step_body
                           cases h_ind : target.isIndirect with
-                          | true => rw [h_ind] at h_st; exact False.elim h_st
+                          | true =>
+                            rw [h_ind] at h_st; dsimp only at h_st
+                            cases h_gc : isGenericClosureArityMismatch ms.memory.callees target.defPath target.typeArgs <;>
+                              (rw [h_gc] at h_st; exact False.elim h_st)
                           | false =>
                             rw [h_ind] at h_st h_step_body
                             dsimp only at h_st h_step_body
@@ -11978,9 +12013,12 @@ def evalCallTerminatorUnified
           | false =>
             match target.isIndirect with
             | true =>
-              MirStepNode.extCall
-                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                (resumeExternalCall s locals' destination targetBb unwind)
+              match isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+              | true => MirStepNode.unsupported
+              | false =>
+                MirStepNode.extCall
+                  { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                  (resumeExternalCall s locals' destination targetBb unwind)
             | false =>
               match
                 evalDirectRustIntrinsic? s currentBody target bodyLocalDecls
@@ -12017,9 +12055,12 @@ def evalCallTerminatorUnified
                       { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
                       (resumeExternalDivergingCall s locals' unwind)
           | true =>
-            MirStepNode.extCall
-              { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-              (resumeExternalDivergingCall s locals' unwind)
+            match isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+            | true => MirStepNode.unsupported
+            | false =>
+              MirStepNode.extCall
+                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                (resumeExternalDivergingCall s locals' unwind)
 
 theorem evalTerminator_call_eq_unified
     (s : MachineState) (func : Operand) (argOps : List Operand)
@@ -13535,15 +13576,15 @@ private theorem evalDirectRustIntrinsic?_ne_ret_normal
                 rtTarget.typeArgs s.memory.traitImpls with
             | some calleeBody =>
               dsimp only
-              cases Bool.and (Nat.beq calleeBody.argCount (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
-                  (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
-                    (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) with
+              cases constEvalSelectCalleeCompatible rtTarget calleeBody (length unpackedArgs) with
               | false => rintro ⟨⟩
               | true => dsimp only; cases currentBody <;> rintro ⟨⟩
             | none =>
               dsimp only
               cases rtTarget.isIndirect with
-              | true => rintro ⟨⟩
+              | true =>
+                cases isGenericClosureArityMismatch s.memory.callees rtTarget.defPath rtTarget.typeArgs <;>
+                  rintro ⟨⟩
               | false =>
                 dsimp only
                 cases isDirectExactDivTarget rtTarget with
@@ -13796,7 +13837,7 @@ private theorem stepMirFn_ret_normal_activeCallee_ceil
                     | false =>
                       dsimp only
                       cases target.isIndirect with
-                      | true => rintro ⟨⟩
+                      | true => cases isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs <;> rintro ⟨⟩
                       | false =>
                         dsimp only
                         cases h_di : evalDirectRustIntrinsic? s (some (s.memory.activeCallee.getD body))
@@ -13810,7 +13851,7 @@ private theorem stepMirFn_ret_normal_activeCallee_ceil
                   | none =>
                     dsimp only
                     cases target.isIndirect with
-                    | true => rintro ⟨⟩
+                    | true => cases isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs <;> rintro ⟨⟩
                     | false =>
                       dsimp only
                       cases isUnreachableCallTarget target.defPath with
@@ -23980,9 +24021,7 @@ theorem PureMirModularConverges.call_const_eval_select_summary
       lookupCallee callees body.layouts rtTarget.defPath rtTarget.typeArgs traitImpls =
         some calleeBody)
     (h_compat_rt :
-      Bool.and (Nat.beq calleeBody.argCount (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
-        (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
-          (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) = true := by rfl)
+      constEvalSelectCalleeCompatible rtTarget calleeBody (length unpackedArgs) = true := by rfl)
     (h_callee_pure :
       checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true)
     (h_callee_summary :
@@ -24432,6 +24471,7 @@ theorem PureMirModularConverges.tailCall_modular
             none := by
         rw [hm.1, hm.2.1, h_lookup]
       rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, h_lk_m]
+      rfl
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]

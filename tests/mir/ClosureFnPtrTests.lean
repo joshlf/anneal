@@ -3502,6 +3502,173 @@ theorem inline_ces_extern_c_is_ub :
       .ub := by
   rfl
 
+/-- `fn(_1 : sigKind, _2 : u32) -> ! { _0 = _1(_2) }` (diverging indirect call). -/
+def divPtrCaller (sigKind : RigidTy) : CapturedMir :=
+  { Mir.ClosureMatrix.fn_shared.body with
+    defPath := "tests::div_ptr_caller"
+    argCount := 2
+    localDecls := [decl .never 2, decl sigKind 1, decl u32K 0]
+    basicBlocks :=
+      [{ statements := .nil
+         terminator :=
+           { kind := .call (.copy (plc 1)) [.copy (plc 2)] (plc 0) .none .continue_
+             span := "div_ptr_call" }
+         isCleanup := false }] }
+
+/-- `fn(_1 : sigKind, _2 : u32) -> u32 { become _1(_2) }` (indirect tail call). -/
+def tailPtrCaller (sigKind : RigidTy) : CapturedMir :=
+  { Mir.ClosureMatrix.fn_shared.body with
+    defPath := "tests::tail_ptr_caller"
+    argCount := 2
+    localDecls := [decl u32K 0, decl sigKind 1, decl u32K 0]
+    basicBlocks :=
+      [{ statements := .nil
+         terminator :=
+           { kind := .tailCall (.copy (plc 1)) [.copy (plc 2)]
+             span := "tail_ptr_call" }
+         isCleanup := false }] }
+
+/-- `fn(_1 : sigKind, _2 : envKind, _3 : u32) -> u32 { become _1(_2, _3) }`: forged `(N + 1)`-arg indirect tail call. -/
+def tailEnvPtrCaller (sigKind envKind : RigidTy) : CapturedMir :=
+  { Mir.ClosureMatrix.fn_shared.body with
+    defPath := "tests::tail_env_ptr_caller"
+    argCount := 3
+    localDecls := [decl u32K 0, decl sigKind 1, decl envKind 1, decl u32K 0]
+    basicBlocks :=
+      [{ statements := .nil
+         terminator :=
+           { kind := .tailCall (.copy (plc 1)) [.copy (plc 2), .copy (plc 3)]
+             span := "tail_env_ptr_call" }
+         isCleanup := false }] }
+
+/-- Inline `const_eval_select` carrying `rtKind` solely on the operand local `_2` (`target.typeArgs = []`). -/
+def cesOperandTyOnlyCaller (rtKind : RigidTy) : CapturedMir :=
+  { Mir.ClosureMatrix.fn_shared.body with
+    defPath := "tests::ces_op_ty_only_caller"
+    argCount := 2
+    localDecls := [decl u32K 0, decl u32K 0, decl rtKind 1, decl (.tuple [u32K]) 0]
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .storageLive 3, span := "ces_live" },
+            { kind := .assign (plc 3) (.aggregate .tuple [.copy (plc 1)]), span := "ces_args" }]
+         terminator :=
+           { kind :=
+               .call
+                 (.constant
+                   { ty := { kind := .fnDef "core::intrinsics::const_eval_select" .nil
+                             layoutIdx := 2 }
+                     val := .zeroSized })
+                 [.move (plc 3),
+                  .constant { ty := { kind := .fnDef "closure_matrix::ct_add" .nil, layoutIdx := 2 }
+                              val := .zeroSized },
+                  .copy (plc 2)]
+                 (plc 0) (.some 1) .continue_
+             span := "ces_call" }
+         isCleanup := false },
+       retBlock] }
+
+/-- C5: indirect normal call, diverging call, tail call, and indirect `const_eval_select` to a linked generic closure body all report `.unsupported` (never `.ub` or `.ext`). -/
+theorem indirect_generic_closure_all_sites_unsupported :
+    (runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [Mir.ClosureMatrix.generic_closure_closure_0.body] [entry genericPath fnU32],
+     runWith (divPtrCaller (.fnPtr [u32K] .never .safe .rust)) [fnPtrVal, u32v 5] [Mir.ClosureMatrix.generic_closure_closure_0.body] [entry genericPath (.fnPtr [u32K] .never .safe .rust)],
+     runWith (tailPtrCaller fnU32) [fnPtrVal, u32v 5] [Mir.ClosureMatrix.generic_closure_closure_0.body] [entry genericPath fnU32],
+     runWith (cesCaller fnU32) [u32v 5, fnPtrVal] [Mir.ClosureMatrix.generic_closure_closure_0.body] [entry genericPath fnU32]) =
+      (.unsupported, .unsupported, .unsupported, .unsupported) := by
+  rfl
+
+/-- Direct `const_eval_select` resolves a non-capturing closure type carried on `operandTy` even when `target.typeArgs` is empty. -/
+theorem inline_ces_direct_closure_from_operand_ty_only_is_22 :
+    runWith (cesOperandTyOnlyCaller sharedClo) [u32v 5, .aggregate 0 .nil] [Mir.ClosureMatrix.fn_shared_closure_0.body] =
+      .normalScalar 22 4 := by
+  rfl
+
+/-- Forged scalar runtime target for a generic closure type in `const_eval_select` faults with `.ub` (never `.unsupported`). -/
+theorem inline_ces_forged_scalar_generic_closure_is_ub :
+    runWith (cesCaller (.closure genericPath .nil)) [u32v 5, u32v 99] [Mir.ClosureMatrix.generic_closure_closure_0.body] =
+      .ub := by
+  rfl
+
+/-- Direct `const_eval_select` rejects a non-Rust ABI closure body with `.ub`. -/
+theorem inline_ces_direct_non_rust_abi_closure_is_ub :
+    let cAbiClosure :=
+      { Mir.ClosureMatrix.fn_shared_closure_0.body with
+        fnAbi := { Mir.ClosureMatrix.fn_shared_closure_0.body.fnAbi with conv := .c } }
+    runWith (cesCaller sharedClo) [u32v 5, .aggregate 0 .nil] [cAbiClosure] =
+      .ub := by
+  rfl
+
+/-- Inline `const_eval_select` rejects a transmuted `fn(u64) -> u32` pointer to a closure with `.ub`. -/
+theorem inline_ces_transmuted_signature_is_ub :
+    let caller :=
+      { Mir.ClosureMatrix.fn_shared.body with
+        defPath := "tests::ces_transmute_caller"
+        argCount := 2
+        localDecls := [decl u32K 0, decl (.uint .u64) 1, decl (.fnPtr [.uint .u64] u32K .safe .rust) 1, decl (.tuple [.uint .u64]) 1]
+        basicBlocks :=
+          [{ statements :=
+               [{ kind := .storageLive 3, span := "ces_live" },
+                { kind := .assign (plc 3) (.aggregate .tuple [.copy (plc 1)]), span := "ces_args" }]
+             terminator :=
+               { kind :=
+                   .call
+                     (.constant
+                       { ty := { kind := .fnDef "core::intrinsics::const_eval_select"
+                                   [.tuple [.uint .u64], .fnDef "closure_matrix::ct_add" .nil, .fnPtr [.uint .u64] u32K .safe .rust, u32K]
+                                 layoutIdx := 2 }
+                         val := .zeroSized })
+                     [.move (plc 3),
+                      .constant { ty := { kind := .fnDef "closure_matrix::ct_add" .nil, layoutIdx := 2 }
+                                  val := .zeroSized },
+                      .copy (plc 2)]
+                     (plc 0) (.some 1) .continue_
+                 span := "ces_call" }
+             isCleanup := false },
+           retBlock] }
+    runWith caller [.scalar ⟨5, 8⟩, fnPtrVal] [Mir.ClosureMatrix.fn_shared_closure_0.body] [entry sharedPath (.fnPtr [.uint .u64] u32K .safe .rust)] =
+      .ub := by
+  rfl
+
+/-- C10 on `tailCall`: forged `(N + 1)`-arg tail call to non-capturing closure and tail call to capturing closure both fault with `.ub`. -/
+theorem tail_call_forged_env_and_capturing_is_ub :
+    (runWith (tailEnvPtrCaller (.fnPtr [.ref .not sharedClo, u32K] u32K .safe .rust) (.ref .not sharedClo))
+       [fnPtrVal, envScalar, u32v 5] [Mir.ClosureMatrix.fn_shared_closure_0.body]
+       [entry sharedPath (.fnPtr [.ref .not sharedClo, u32K] u32K .safe .rust)],
+     runWith (tailPtrCaller fnU32) [fnPtrVal, u32v 5] [Mir.ClosureMatrix.capturing_direct_closure_0.body]
+       [entry capPath fnU32]) =
+      (.ub, .ub) := by
+  rfl
+
+/-- `tailCall` through a closure pointer preserves frame-deallocation protector-conflict `.ub`. -/
+theorem tail_call_protector_conflict_is_ub :
+    let caller := tailPtrCaller fnU32
+    let st : MirExecState :=
+      .running
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := initLocalsAux 0 caller.localDecls [fnPtrVal, u32v 5] }
+          memory :=
+            { memWith caller [Mir.ClosureMatrix.fn_shared_closure_0.body] [entry sharedPath fnU32] with
+              borrows :=
+                [{ tag := 1
+                   targetLocal := 2
+                   targetProjection := .nil
+                   perm := .unique
+                   rangeOffset := 0
+                   rangeLen := 4
+                   protector := .some 1
+                   parentTag := .none
+                   targetFrameDepth := 0
+                   allocDead := false }]
+              activeProtectors := [1]
+              nextTag := 2
+              nextProtector := 2 } }
+    run 400 caller st = .ub := by
+  rfl
+
+/-- Unlinked closure coercion still rejects non-Rust target ABI (`extern "C"`) with `.ub`. -/
+theorem coerce_unlinked_extern_c_is_ub :
+    coerce "ClosureFnPointer(Safe)" sharedClo (.aggregate 0 .nil) (.fnPtr [u32K] u32K .safe .c) [] =
+      .ub := by
+  rfl
+
 end Anneal.ClosureFnPtrTests.V06
 
 /-! ## 6. Closure function-pointer matrix on `V2026_08_01` -/
@@ -4743,6 +4910,173 @@ theorem inline_ces_indirect_capturing_is_ub :
 /-- Inline `const_eval_select` through an `extern "C"` pointer to the closure is `.ub`. -/
 theorem inline_ces_extern_c_is_ub :
     runWith (cesCaller (.fnPtr [u32K] u32K .safe .c)) [u32v 5, fnPtrVal] [V08.Mir.ClosureMatrix.fn_shared_closure_0.body] [entry sharedPath (.fnPtr [u32K] u32K .safe .c)] =
+      .ub := by
+  rfl
+
+/-- `fn(_1 : sigKind, _2 : u32) -> ! { _0 = _1(_2) }` (diverging indirect call). -/
+def divPtrCaller (sigKind : RigidTy) : CapturedMir :=
+  { V08.Mir.ClosureMatrix.fn_shared.body with
+    defPath := "tests::div_ptr_caller"
+    argCount := 2
+    localDecls := [decl .never 2, decl sigKind 1, decl u32K 0]
+    basicBlocks :=
+      [{ statements := .nil
+         terminator :=
+           { kind := .call (.copy (plc 1)) [.copy (plc 2)] (plc 0) .none .continue_
+             span := "div_ptr_call" }
+         isCleanup := false }] }
+
+/-- `fn(_1 : sigKind, _2 : u32) -> u32 { become _1(_2) }` (indirect tail call). -/
+def tailPtrCaller (sigKind : RigidTy) : CapturedMir :=
+  { V08.Mir.ClosureMatrix.fn_shared.body with
+    defPath := "tests::tail_ptr_caller"
+    argCount := 2
+    localDecls := [decl u32K 0, decl sigKind 1, decl u32K 0]
+    basicBlocks :=
+      [{ statements := .nil
+         terminator :=
+           { kind := .tailCall (.copy (plc 1)) [.copy (plc 2)]
+             span := "tail_ptr_call" }
+         isCleanup := false }] }
+
+/-- `fn(_1 : sigKind, _2 : envKind, _3 : u32) -> u32 { become _1(_2, _3) }`: forged `(N + 1)`-arg indirect tail call. -/
+def tailEnvPtrCaller (sigKind envKind : RigidTy) : CapturedMir :=
+  { V08.Mir.ClosureMatrix.fn_shared.body with
+    defPath := "tests::tail_env_ptr_caller"
+    argCount := 3
+    localDecls := [decl u32K 0, decl sigKind 1, decl envKind 1, decl u32K 0]
+    basicBlocks :=
+      [{ statements := .nil
+         terminator :=
+           { kind := .tailCall (.copy (plc 1)) [.copy (plc 2), .copy (plc 3)]
+             span := "tail_env_ptr_call" }
+         isCleanup := false }] }
+
+/-- Inline `const_eval_select` carrying `rtKind` solely on the operand local `_2` (`target.typeArgs = []`). -/
+def cesOperandTyOnlyCaller (rtKind : RigidTy) : CapturedMir :=
+  { V08.Mir.ClosureMatrix.fn_shared.body with
+    defPath := "tests::ces_op_ty_only_caller"
+    argCount := 2
+    localDecls := [decl u32K 0, decl u32K 0, decl rtKind 1, decl (.tuple [u32K]) 0]
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .storageLive 3, span := "ces_live" },
+            { kind := .assign (plc 3) (.aggregate .tuple [.copy (plc 1)]), span := "ces_args" }]
+         terminator :=
+           { kind :=
+               .call
+                 (.constant
+                   { ty := { kind := .fnDef "core::intrinsics::const_eval_select" .nil
+                             layoutIdx := 2 }
+                     val := .zeroSized })
+                 [.move (plc 3),
+                  .constant { ty := { kind := .fnDef "closure_matrix::ct_add" .nil, layoutIdx := 2 }
+                              val := .zeroSized },
+                  .copy (plc 2)]
+                 (plc 0) (.some 1) .continue_
+             span := "ces_call" }
+         isCleanup := false },
+       retBlock] }
+
+/-- C5: indirect normal call, diverging call, tail call, and indirect `const_eval_select` to a linked generic closure body all report `.unsupported` (never `.ub` or `.ext`). -/
+theorem indirect_generic_closure_all_sites_unsupported :
+    (runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [V08.Mir.ClosureMatrix.generic_closure_closure_0.body] [entry genericPath fnU32],
+     runWith (divPtrCaller (.fnPtr [u32K] .never .safe .rust)) [fnPtrVal, u32v 5] [V08.Mir.ClosureMatrix.generic_closure_closure_0.body] [entry genericPath (.fnPtr [u32K] .never .safe .rust)],
+     runWith (tailPtrCaller fnU32) [fnPtrVal, u32v 5] [V08.Mir.ClosureMatrix.generic_closure_closure_0.body] [entry genericPath fnU32],
+     runWith (cesCaller fnU32) [u32v 5, fnPtrVal] [V08.Mir.ClosureMatrix.generic_closure_closure_0.body] [entry genericPath fnU32]) =
+      (.unsupported, .unsupported, .unsupported, .unsupported) := by
+  rfl
+
+/-- Direct `const_eval_select` resolves a non-capturing closure type carried on `operandTy` even when `target.typeArgs` is empty. -/
+theorem inline_ces_direct_closure_from_operand_ty_only_is_22 :
+    runWith (cesOperandTyOnlyCaller sharedClo) [u32v 5, .aggregate 0 .nil] [V08.Mir.ClosureMatrix.fn_shared_closure_0.body] =
+      .normalScalar 22 4 := by
+  rfl
+
+/-- Forged scalar runtime target for a generic closure type in `const_eval_select` faults with `.ub` (never `.unsupported`). -/
+theorem inline_ces_forged_scalar_generic_closure_is_ub :
+    runWith (cesCaller (.closure genericPath .nil)) [u32v 5, u32v 99] [V08.Mir.ClosureMatrix.generic_closure_closure_0.body] =
+      .ub := by
+  rfl
+
+/-- Direct `const_eval_select` rejects a non-Rust ABI closure body with `.ub`. -/
+theorem inline_ces_direct_non_rust_abi_closure_is_ub :
+    let cAbiClosure :=
+      { V08.Mir.ClosureMatrix.fn_shared_closure_0.body with
+        fnAbi := { V08.Mir.ClosureMatrix.fn_shared_closure_0.body.fnAbi with conv := .c } }
+    runWith (cesCaller sharedClo) [u32v 5, .aggregate 0 .nil] [cAbiClosure] =
+      .ub := by
+  rfl
+
+/-- Inline `const_eval_select` rejects a transmuted `fn(u64) -> u32` pointer to a closure with `.ub`. -/
+theorem inline_ces_transmuted_signature_is_ub :
+    let caller :=
+      { V08.Mir.ClosureMatrix.fn_shared.body with
+        defPath := "tests::ces_transmute_caller"
+        argCount := 2
+        localDecls := [decl u32K 0, decl (.uint .u64) 1, decl (.fnPtr [.uint .u64] u32K .safe .rust) 1, decl (.tuple [.uint .u64]) 1]
+        basicBlocks :=
+          [{ statements :=
+               [{ kind := .storageLive 3, span := "ces_live" },
+                { kind := .assign (plc 3) (.aggregate .tuple [.copy (plc 1)]), span := "ces_args" }]
+             terminator :=
+               { kind :=
+                   .call
+                     (.constant
+                       { ty := { kind := .fnDef "core::intrinsics::const_eval_select"
+                                   [.tuple [.uint .u64], .fnDef "closure_matrix::ct_add" .nil, .fnPtr [.uint .u64] u32K .safe .rust, u32K]
+                                 layoutIdx := 2 }
+                         val := .zeroSized })
+                     [.move (plc 3),
+                      .constant { ty := { kind := .fnDef "closure_matrix::ct_add" .nil, layoutIdx := 2 }
+                                  val := .zeroSized },
+                      .copy (plc 2)]
+                     (plc 0) (.some 1) .continue_
+                 span := "ces_call" }
+             isCleanup := false },
+           retBlock] }
+    runWith caller [.scalar ⟨5, 8⟩, fnPtrVal] [V08.Mir.ClosureMatrix.fn_shared_closure_0.body] [entry sharedPath (.fnPtr [.uint .u64] u32K .safe .rust)] =
+      .ub := by
+  rfl
+
+/-- C10 on `tailCall`: forged `(N + 1)`-arg tail call to non-capturing closure and tail call to capturing closure both fault with `.ub`. -/
+theorem tail_call_forged_env_and_capturing_is_ub :
+    (runWith (tailEnvPtrCaller (.fnPtr [.ref .not sharedClo, u32K] u32K .safe .rust) (.ref .not sharedClo))
+       [fnPtrVal, envScalar, u32v 5] [V08.Mir.ClosureMatrix.fn_shared_closure_0.body]
+       [entry sharedPath (.fnPtr [.ref .not sharedClo, u32K] u32K .safe .rust)],
+     runWith (tailPtrCaller fnU32) [fnPtrVal, u32v 5] [V08.Mir.ClosureMatrix.capturing_direct_closure_0.body]
+       [entry capPath fnU32]) =
+      (.ub, .ub) := by
+  rfl
+
+/-- `tailCall` through a closure pointer preserves frame-deallocation protector-conflict `.ub`. -/
+theorem tail_call_protector_conflict_is_ub :
+    let caller := tailPtrCaller fnU32
+    let st : MirExecState :=
+      .running
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := initLocalsAux 0 caller.localDecls [fnPtrVal, u32v 5] }
+          memory :=
+            { memWith caller [V08.Mir.ClosureMatrix.fn_shared_closure_0.body] [entry sharedPath fnU32] with
+              borrows :=
+                [{ tag := 1
+                   targetLocal := 2
+                   targetProjection := .nil
+                   perm := .unique
+                   rangeOffset := 0
+                   rangeLen := 4
+                   protector := .some 1
+                   parentTag := .none
+                   targetFrameDepth := 0
+                   allocDead := false }]
+              activeProtectors := [1]
+              nextTag := 2
+              nextProtector := 2 } }
+    run 400 caller st = .ub := by
+  rfl
+
+/-- Unlinked closure coercion still rejects non-Rust target ABI (`extern "C"`) with `.ub`. -/
+theorem coerce_unlinked_extern_c_is_ub :
+    coerce "ClosureFnPointer(Safe)" sharedClo (.aggregate 0 .nil) (.fnPtr [u32K] u32K .safe .c) [] =
       .ub := by
   rfl
 

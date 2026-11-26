@@ -7036,9 +7036,9 @@ def prepResolveAndArgs (callerBody : CapturedMir) (func : Operand)
   | .unsupported => .error (.fail .unsupported) s
   | .ok target localsAfterFunc =>
     match
-      evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-        callerBody.layouts s.memory.callerLocals
-        (callStack := s.memory.callStack)
+      evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+        callerBody.layouts s.memory.callerLocals callerBody.localDecls
+        s.memory.callStack
     with
     | .ub => .error (.fail .ub) s
     | .unsupported => .error (.fail .unsupported) s
@@ -7053,7 +7053,7 @@ def prepResolveAndArgs (callerBody : CapturedMir) (func : Operand)
           checkCalleeTargetCompatible target calleeBody (length argVals)
         with
         | false => .error (.fail .ub) s
-        | true => .ok ⟨calleeBody, argVals, locals'⟩ s
+        | true => .ok ⟨calleeBody, calleeEntryArgs target calleeBody argVals, locals'⟩ s
 
 /--
 Stage 2 (push the callee frame): the trusted `pushCalleeFrame`, which saves
@@ -7168,17 +7168,18 @@ theorem prepResolveAndArgs_ok {callerBody : CapturedMir} {func : Operand}
     {argOps : List Operand} {s s' : MachineState} {call : PreparedCall}
     (h : (prepResolveAndArgs callerBody func argOps).run s = .ok call s') :
     s' = s ∧
-    ∃ (target : ResolvedCallTarget) (localsAfterFunc : List LocalSlot),
+    ∃ (target : ResolvedCallTarget) (localsAfterFunc : List LocalSlot) (rawArgVals : List Value),
       resolveCallTarget s func (length argOps) callerBody.localDecls
           callerBody.layouts = .ok target localsAfterFunc ∧
-      evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-          callerBody.layouts s.memory.callerLocals
-          (callStack := s.memory.callStack) =
-        .ok call.argVals call.localsAfterArgs ∧
+      evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+          callerBody.layouts s.memory.callerLocals callerBody.localDecls
+          s.memory.callStack =
+        .ok rawArgVals call.localsAfterArgs ∧
       lookupCallee s.memory.callees callerBody.layouts target.defPath
           target.typeArgs s.memory.traitImpls = some call.calleeBody ∧
-      checkCalleeTargetCompatible target call.calleeBody (length call.argVals) =
-        true := by
+      checkCalleeTargetCompatible target call.calleeBody (length rawArgVals) =
+        true ∧
+      call.argVals = calleeEntryArgs target call.calleeBody rawArgVals := by
   unfold prepResolveAndArgs EStateM.run at h
   dsimp only [] at h
   cases hRes : resolveCallTarget s func (length argOps) callerBody.localDecls
@@ -7192,9 +7193,9 @@ theorem prepResolveAndArgs_ok {callerBody : CapturedMir} {func : Operand}
   | ok target localsAfterFunc =>
     rw [hRes] at h
     dsimp only [] at h
-    cases hArgs : evalOperands localsAfterFunc argOps s.memory.borrows
-        s.memory.globals callerBody.layouts s.memory.callerLocals
-        (callStack := s.memory.callStack) with
+    cases hArgs : evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows
+        s.memory.globals callerBody.layouts s.memory.callerLocals callerBody.localDecls
+        s.memory.callStack with
     | ub =>
       rw [hArgs] at h
       cases h
@@ -7220,7 +7221,7 @@ theorem prepResolveAndArgs_ok {callerBody : CapturedMir} {func : Operand}
         | true =>
           rw [hCompat] at h
           cases h
-          exact ⟨rfl, target, localsAfterFunc, rfl, hArgs, hLookup, hCompat⟩
+          exact ⟨rfl, target, localsAfterFunc, argVals, rfl, hArgs, hLookup, hCompat, rfl⟩
 
 /--
 A successful call entry is the trusted `pushCalleeFrame` applied to the
@@ -7234,17 +7235,18 @@ theorem prepCallEntry_ok {callerBody : CapturedMir} {func : Operand}
     s₁ =
         pushCalleeFrame s callerBody call.localsAfterArgs destination targetBb
           call.calleeBody call.argVals unwind ∧
-    ∃ (target : ResolvedCallTarget) (localsAfterFunc : List LocalSlot),
+    ∃ (target : ResolvedCallTarget) (localsAfterFunc : List LocalSlot) (rawArgVals : List Value),
       resolveCallTarget s func (length argOps) callerBody.localDecls
           callerBody.layouts = .ok target localsAfterFunc ∧
-      evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-          callerBody.layouts s.memory.callerLocals
-          (callStack := s.memory.callStack) =
-        .ok call.argVals call.localsAfterArgs ∧
+      evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+          callerBody.layouts s.memory.callerLocals callerBody.localDecls
+          s.memory.callStack =
+        .ok rawArgVals call.localsAfterArgs ∧
       lookupCallee s.memory.callees callerBody.layouts target.defPath
           target.typeArgs s.memory.traitImpls = some call.calleeBody ∧
-      checkCalleeTargetCompatible target call.calleeBody (length call.argVals) =
-        true := by
+      checkCalleeTargetCompatible target call.calleeBody (length rawArgVals) =
+        true ∧
+      call.argVals = calleeEntryArgs target call.calleeBody rawArgVals := by
   unfold prepCallEntry at h
   obtain ⟨call', s', hx, hrest⟩ := run_bind_ok_inv h
   obtain ⟨hs, hres⟩ := prepResolveAndArgs_ok hx
@@ -7270,13 +7272,13 @@ theorem evalTerminator_call_of_prepCallEntry {callerBody : CapturedMir}
     (h : (prepCallEntry callerBody func argOps destination targetBb unwind).run
       s = .ok call s₁) :
     evalTerminator s term (some callerBody) = MirStepNode.step s₁ := by
-  obtain ⟨hs₁, target, localsAfterFunc, hRes, hArgs, hLookup, hCompat⟩ :=
+  obtain ⟨hs₁, target, localsAfterFunc, rawArgVals, hRes, hArgs, hLookup, hCompat, hEntry⟩ :=
     prepCallEntry_ok h
   cases term with
   | mk kind span =>
     have hKind' : kind = .call func argOps destination (some targetBb) unwind :=
       hKind
-    rw [hKind', hs₁]
+    rw [hKind', hs₁, hEntry]
     unfold evalTerminator
     dsimp only [bodyLocalDeclsOf]
     rw [hRes]

@@ -624,6 +624,51 @@ theorem calleeEntryArgs_direct
   rfl
 
 /--
+Test whether `defPath` names a linked closure body in `callees` whose generic
+type-parameter count (`c.typeParamCount`) disagrees with the call target's
+`typeArgs` length.
+
+Under `rustc-capture`'s closure-type lowering (`ClosureArgs::upvar_tys`),
+parent generic arguments of a closure inside a generic item are dropped, so
+`typeArgs` is `.nil` while the linked closure body has `typeParamCount > 0`.
+`lookupCallee` returns `.none` on that arity mismatch; an indirect call or
+`const_eval_select` to such a closure body must report `MirStepNode.unsupported`
+rather than `MirStepNode.extCall` or `.ub`.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Modeling choice (not a Rust guarantee): closures inside generic items are well
+formed in Rust, so dropping parent generic arguments during lowering is a
+modeling limitation that fails closed with `.unsupported`, never `.ub`.
+-/
+def isGenericClosureArityMismatch
+    (callees : List CapturedMir)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy) :
+    Bool :=
+  match findCallee? callees defPath with
+  | .none => false
+  | .some c =>
+    match calleeOwnClosureShape? c with
+    | .none => false
+    | .some _ => Bool.not (Nat.beq (length typeArgs) c.typeParamCount)
+
+@[simp]
+theorem isGenericClosureArityMismatch_of_findCallee_none
+    (callees : List CapturedMir)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (h : findCallee? callees defPath = .none) :
+    isGenericClosureArityMismatch callees defPath typeArgs = false := by
+  unfold isGenericClosureArityMismatch
+  rw [h]
+
+/--
 Restore the caller frame's active function-entry lifetime protectors upon
 popping `caller` from `Memory.callStack`.
 
@@ -2929,9 +2974,12 @@ def resolveConstEvalSelectTarget?
     let fallbackFnItemTarget? : Option (DefPath × List RigidTy) :=
       match rtFnOpOpt with
       | .some rtFnOp =>
-        match extractFnItemTarget? (operandTy bodyLocalDecls bodyLayouts rtFnOp) with
-        | .some pair => .some pair
-        | .none =>
+        match operandTy bodyLocalDecls bodyLayouts rtFnOp with
+        | .some { kind := .fnDef defPath typeArgs, .. } => .some (defPath, typeArgs)
+        | .some { kind := .closure defPath .nil, .. } =>
+          nonGenericClosureTarget? s.memory.callees defPath
+        | .some { kind := .closure _ (_ :: _), .. } => .none
+        | _ =>
           match get? target.typeArgs 2 with
           | .some (.fnDef defPath typeArgs) => .some (defPath, typeArgs)
           | .some (.closure defPath .nil) => nonGenericClosureTarget? s.memory.callees defPath
@@ -3049,9 +3097,16 @@ def constEvalSelectUnresolvedFailure
     | .aggregate 0 _ => .unsupported
     | _ => .ub
   | .some (.closure p .nil) =>
-    match nonGenericClosureTarget? s.memory.callees p with
-    | .none => .unsupported
-    | .some _ => .ub
+    match rtFnVal with
+    | .unit =>
+      match nonGenericClosureTarget? s.memory.callees p with
+      | .none => .unsupported
+      | .some _ => .ub
+    | .aggregate 0 .nil =>
+      match nonGenericClosureTarget? s.memory.callees p with
+      | .none => .unsupported
+      | .some _ => .ub
+    | _ => .ub
   | _ => .ub
 
 /--
@@ -3107,6 +3162,66 @@ def constEvalSelectEntryArgs
     synthesizeClosureEnvArg mode (layoutPointerBytes calleeBody.layouts) :: unpackedArgs
   | .some .capturing => unpackedArgs
   | .none => unpackedArgs
+
+/--
+Validate that a linked `calleeBody` resolved as the runtime target `rtTarget` of
+`core::intrinsics::const_eval_select` is compatible with `unpackedArgCount`
+unpacked tuple arguments:
+- `.none` (non-closure body): requires `calleeBody.argCount = unpackedArgCount`,
+  non-intrinsic ABI, and `checkCalleeTargetCompatible`.
+- `.some (.nonCapturing _)`: for an indirect function pointer, delegates to
+  `checkClosureTargetCompatible`; for a direct closure target, requires
+  `calleeBody.fnAbi.conv = .rust` and
+  `calleeBody.argCount = unpackedArgCount + 1` (since `constEvalSelectEntryArgs`
+  prepends the synthesized zero-sized environment).
+- `.some .capturing`: `false`, because `const_eval_select` unpacks only the
+  user argument tuple `ARG` and never passes a captured environment.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.call>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function
+> imported or transmuted as a "C" function or function pointer)."
+
+Reference (`compiler/rustc_target/src/spec/abi_map.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_target/src/spec/abi_map.rs#L94-L97>
+
+> "(ExternAbi::Rust | ExternAbi::RustCall, _) => CanonAbi::Rust,"
+-/
+@[reducible]
+def constEvalSelectCalleeCompatible
+    (rtTarget : ResolvedCallTarget)
+    (calleeBody : CapturedMir)
+    (unpackedArgCount : Nat) :
+    Bool :=
+  match calleeOwnClosureShape? calleeBody with
+  | .none =>
+    Bool.and
+      (Nat.beq calleeBody.argCount unpackedArgCount)
+      (Bool.and
+        (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+        (checkCalleeTargetCompatible rtTarget calleeBody unpackedArgCount))
+  | .some (.nonCapturing _) =>
+    match rtTarget.isIndirect with
+    | true => checkClosureTargetCompatible rtTarget calleeBody unpackedArgCount
+    | false =>
+      Bool.and
+        (callConvEq calleeBody.fnAbi.conv .rust)
+        (Nat.beq calleeBody.argCount (Nat.succ unpackedArgCount))
+  | .some .capturing => false
 
 /--
 Write an inline compiler intrinsic's return value `retVal` to `destination` and
@@ -6383,28 +6498,11 @@ Returns `.none` when `target.defPath` is not an inline-modeled intrinsic so
 
 Closure runtime targets of `const_eval_select`: a linked non-capturing closure
 body is entered with its synthesized environment prepended
-(`constEvalSelectEntryArgs`) after `checkCalleeTargetCompatible` (which, for a
-function pointer, requires a closure-compatible signature and rejects
-capturing closure bodies); a capturing closure value or a generic closure body
-that cannot be resolved is `.unsupported` (`constEvalSelectUnresolvedFailure`).
-
-Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
-<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
-
-> "Non-capturing closures are closures that don’t capture anything from their
-> environment. Non-async, non-capturing closures can be coerced to function
-> pointers (e.g., `fn()`) with the matching signature."
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
-
-> "Compiler intrinsics."
-Indirect calls to closure bodies (`target.isIndirect = true`): the callee is
-classified by its own environment parameter (`checkCalleeTargetCompatible`);
-a non-capturing closure body is entered with the synthesized environment
-prepended (`calleeEntryArgs`), and a capturing closure body faults with `.ub`.
-Direct calls are unchanged.
+(`constEvalSelectEntryArgs`) after `constEvalSelectCalleeCompatible` (requiring
+Rust ABI, matching arity/signature, and rejecting capturing closure bodies); a
+capturing closure value or a generic closure body that cannot be resolved is
+`.unsupported` (`constEvalSelectUnresolvedFailure` /
+`isGenericClosureArityMismatch`).
 
 Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
 <https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
@@ -6419,6 +6517,12 @@ Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
 > "Calling a function with the wrong call ABI, or unwinding past a stack frame
 > that does not allow unwinding (e.g. by calling a "C-unwind" function
 > imported or transmuted as a "C" function or function pointer)."
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
+
+> "Compiler intrinsics."
 -/
 @[reducible]
 def evalDirectRustIntrinsic?
@@ -6473,15 +6577,7 @@ def evalDirectRustIntrinsic?
            | .some rtTarget =>
              match lookupCallee s.memory.callees bodyLayouts rtTarget.defPath rtTarget.typeArgs s.memory.traitImpls with
              | .some calleeBody =>
-               match
-                 Bool.and
-                   (Nat.beq
-                     calleeBody.argCount
-                     (length (constEvalSelectEntryArgs calleeBody unpackedArgs)))
-                   (Bool.and
-                     (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
-                     (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs)))
-               with
+               match constEvalSelectCalleeCompatible rtTarget calleeBody (length unpackedArgs) with
                | false => MirStepNode.fail .ub
                | true =>
                  match currentBody with
@@ -6500,9 +6596,12 @@ def evalDirectRustIntrinsic?
              | .none =>
                match rtTarget.isIndirect with
                | true =>
-                 MirStepNode.extCall
-                   { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
-                   (resumeExternalCall s locals' destination targetBb unwind)
+                 match isGenericClosureArityMismatch s.memory.callees rtTarget.defPath rtTarget.typeArgs with
+                 | true => MirStepNode.unsupported
+                 | false =>
+                   MirStepNode.extCall
+                     { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
+                     (resumeExternalCall s locals' destination targetBb unwind)
                | false =>
                  let selectArgOps := constEvalSelectTupleArgOps tupleTyOpt
                  match isDirectExactDivTarget rtTarget with
@@ -6680,11 +6779,13 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 >     call_source: CallSource,
 >     fn_span: Span,
 > },"
+
 Indirect calls to closure bodies (`target.isIndirect = true`): the callee is
 classified by its own environment parameter (`checkCalleeTargetCompatible`);
 a non-capturing closure body is entered with the synthesized environment
-prepended (`calleeEntryArgs`), and a capturing closure body faults with `.ub`.
-Direct calls are unchanged.
+prepended (`calleeEntryArgs`), a capturing closure body faults with `.ub`, and
+a linked generic closure body with mismatched type-argument arity reports
+`.unsupported` (`isGenericClosureArityMismatch`). Direct calls are unchanged.
 
 Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
 <https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
@@ -6770,9 +6871,12 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
                     { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
                     (resumeExternalDivergingCall s locals' unwind)
           | true =>
-            MirStepNode.extCall
-              { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
-              (resumeExternalDivergingCall s locals' unwind)
+            match isGenericClosureArityMismatch s.memory.callees resolvedTarget.defPath resolvedTarget.typeArgs with
+            | true => MirStepNode.unsupported
+            | false =>
+              MirStepNode.extCall
+                { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
+                (resumeExternalDivergingCall s locals' unwind)
     | .some targetBb =>
       match
         evalOperandsWithBodyCast
@@ -6825,9 +6929,12 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
               | .none => MirStepNode.fail .ub
             | _ => MirStepNode.unsupported
           | false =>
-            MirStepNode.extCall
-              { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
-              (resumeExternalCall s locals' destination targetBb unwind)
+            match Bool.and resolvedTarget.isIndirect (isGenericClosureArityMismatch s.memory.callees resolvedTarget.defPath resolvedTarget.typeArgs) with
+            | true => MirStepNode.unsupported
+            | false =>
+              MirStepNode.extCall
+                { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
+                (resumeExternalCall s locals' destination targetBb unwind)
 
 /--
 Evaluate a `TerminatorKind.tailCall` terminator, resolving direct or indirect
@@ -6874,11 +6981,14 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > /// Roughly speaking this is a chimera of [`Call`] and [`Return`], with some caveats.
 > ...
 > TailCall {"
+
 Indirect calls to closure bodies (`target.isIndirect = true`): the callee is
 classified by its own environment parameter (`checkCalleeTargetCompatible`);
 a non-capturing closure body is entered with the synthesized environment
-prepended (`calleeEntryArgs`), and a capturing closure body faults with `.ub`.
-Direct calls are unchanged.
+prepended (`calleeEntryArgs`), a capturing closure body faults with `.ub`, and
+a linked generic closure body with mismatched type-argument arity reports
+`.unsupported` (`isGenericClosureArityMismatch`, after checking frame
+deallocation protector conflicts). Direct calls are unchanged.
 
 Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
 <https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
@@ -6953,12 +7063,15 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
                 calleeBody
                 (calleeEntryArgs target calleeBody argVals))
         | .none =>
-          MirStepNode.extCall
-            { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
-              memory := memAfterTeardown }
-            (resumeExternalTailCallWithAbi
-              s.memory.rootUnwindCeiling
-              (externalTargetCanUnwind target (operandTy bodyLocalDecls bodyLayouts func)))
+          match Bool.and target.isIndirect (isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs) with
+          | true => MirStepNode.unsupported
+          | false =>
+            MirStepNode.extCall
+              { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
+                memory := memAfterTeardown }
+              (resumeExternalTailCallWithAbi
+                s.memory.rootUnwindCeiling
+                (externalTargetCanUnwind target (operandTy bodyLocalDecls bodyLayouts func)))
 
 /--
 Evaluate basic-block `Terminator` `term` in `s`, producing the next
@@ -7039,6 +7152,29 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > /// the referred to function.
 > ...
 > Call {"
+
+Indirect `.call` and `.tailCall` terminators to closure bodies
+(`target.isIndirect = true`): `checkCalleeTargetCompatible` classifies the
+linked body by its own environment parameter (`calleeOwnClosureShape?`),
+entering non-capturing closure bodies with `calleeEntryArgs` prepending
+`synthesizeClosureEnvArg`, rejecting capturing closure bodies with `.ub`, and
+reporting `.unsupported` when a linked generic closure body's `typeParamCount`
+disagrees with `target.typeArgs` (`isGenericClosureArityMismatch`). Direct
+calls (`target.isIndirect = false`) are unchanged.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.call>
+
+> "Calling a function with the wrong call ABI, or unwinding past a stack frame
+> that does not allow unwinding (e.g. by calling a "C-unwind" function
+> imported or transmuted as a "C" function or function pointer)."
 -/
 def evalTerminator
     (s : MachineState)
@@ -7420,9 +7556,12 @@ def evalTerminator
           | false =>
             match target.isIndirect with
             | true =>
-              MirStepNode.extCall
-                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                (resumeExternalCall s locals' destination targetBb unwind)
+              match isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+              | true => MirStepNode.unsupported
+              | false =>
+                MirStepNode.extCall
+                  { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                  (resumeExternalCall s locals' destination targetBb unwind)
             | false =>
               match
                 evalDirectRustIntrinsic?
@@ -7531,9 +7670,12 @@ def evalTerminator
                       { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
                       (resumeExternalDivergingCall s locals' unwind)
           | true =>
-            MirStepNode.extCall
-              { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-              (resumeExternalDivergingCall s locals' unwind)
+            match isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs with
+            | true => MirStepNode.unsupported
+            | false =>
+              MirStepNode.extCall
+                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                (resumeExternalDivergingCall s locals' unwind)
   | .tailCall func argOps =>
     evalTailCallTerminator s func argOps currentBody
   | .assert cond expected target unwind =>
