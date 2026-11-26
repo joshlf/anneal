@@ -796,6 +796,59 @@ theorem misaligned_tuple_field_offset_rejected :
 theorem array_stride_not_multiple_of_align_rejected :
     resolveCopyElemLayout D64_a2 L64_a2 (cp 2) (cp 2) = .unsupported := rfl
 
+/-! ### B3 soundness regressions (nested depth-16 truncation, overlapping tuple fields, multivariant tuples) -/
+
+/-- Real `rustc-capture` depth-16 truncation occurs *nested* inside `fieldLayouts` (`Outer<Deep16<T>>`):
+`Outer` has non-empty `fieldLayouts = [deep16Idx]` while `Deep16<T>` has empty `fieldLayouts = []`.
+`copyLayoutHasPlaceholder` must reject truncated templates transitively, not only at the root. -/
+def L64_nestedTrunc : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 0 1 (.arbitrary [⟨0⟩] [0])         -- 1: depth-16 truncated Deep16<T> (fieldLayouts = [])
+      , lay 0 1 (.arbitrary [⟨0⟩] [0]) [1]     -- 2: Outer<Deep16<T>> (non-empty fieldLayouts!)
+      , ptrLay 8 2 ] }
+def D64_nestedTrunc : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK (.adt "zc::OuterDeep" [paramT])) 3]
+
+theorem nested_truncated_param_wrapper_unresolved :
+    resolveCopyElemLayout D64_nestedTrunc L64_nestedTrunc (cp 1) (cp 1) = .unsupported := rfl
+theorem nested_truncated_param_wrapper_count5_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_nestedTrunc L64_nestedTrunc (av 1)
+      (av 1) 5 locals64 = MirStepNode.fail .ub := rfl
+
+/-- Overlapping tuple fields (`(u64, u64)` with `size = 8`, both at offset `0`) must be rejected,
+while valid ZST sharing (`(u64, ())` with `size = 8`, both at offset `0`) remains accepted; a
+multi-variant enum layout (`.multiple`) must be rejected for a tuple. -/
+def L64_b3Tup : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])                                  -- 0: ()
+      , lay 8 8 .primitive                                          -- 1: u64
+      , lay 8 8 (.arbitrary [⟨0⟩, ⟨0⟩] [0, 1]) [1, 1]              -- 2: corrupt overlapping (u64, u64)
+      , ptrLay 8 2                                                  -- 3: *mut (u64, u64)
+      , lay 8 8 (.arbitrary [⟨0⟩, ⟨0⟩] [0, 1]) [1, 0]              -- 4: valid (u64, ())
+      , ptrLay 8 4                                                  -- 5: *mut (u64, ())
+      , { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1],
+          variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+            [.arbitrary [] [], .arbitrary [⟨1⟩] [0]],
+          isUninhabited := false, fieldLayouts := [7, 7] }          -- 6: multivariant enum
+      , lay 1 1 .primitive                                          -- 7: u8
+      , ptrLay 8 6 ] }                                              -- 8: *mut (u8, u8)
+def D64_b3Tup : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.tuple [.uint .u64, .uint .u64])) 3
+  , decl (ptrK (.tuple [.uint .u64, .tuple []])) 5
+  , decl (ptrK (.tuple [.uint .u8, .uint .u8])) 8 ]
+
+theorem overlapping_tuple_fields_size8_rejected :
+    resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 1) (cp 1) = .unsupported := rfl
+theorem valid_tuple_with_zst_shared_offset0_resolves :
+    resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 2) (cp 2) = .ok 8 8 := rfl
+theorem multivariant_tuple_rejected :
+    resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 3) (cp 3) = .unsupported := rfl
+
 end Anneal.Tests.ZeroCountCopyAlign.V06
 
 /-! ## §2. `V2026_08_01` (same fixtures; `Value` has no `uninit`) -/
@@ -1545,6 +1598,59 @@ theorem misaligned_tuple_field_offset_rejected :
     resolveCopyElemLayout D64_a2 L64_a2 (cp 1) (cp 1) = .unsupported := rfl
 theorem array_stride_not_multiple_of_align_rejected :
     resolveCopyElemLayout D64_a2 L64_a2 (cp 2) (cp 2) = .unsupported := rfl
+
+/-! ### B3 soundness regressions (nested depth-16 truncation, overlapping tuple fields, multivariant tuples) -/
+
+/-- Real `rustc-capture` depth-16 truncation occurs *nested* inside `fieldLayouts` (`Outer<Deep16<T>>`):
+`Outer` has non-empty `fieldLayouts = [deep16Idx]` while `Deep16<T>` has empty `fieldLayouts = []`.
+`copyLayoutHasPlaceholder` must reject truncated templates transitively, not only at the root. -/
+def L64_nestedTrunc : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 0 1 (.arbitrary [⟨0⟩] [0])         -- 1: depth-16 truncated Deep16<T> (fieldLayouts = [])
+      , lay 0 1 (.arbitrary [⟨0⟩] [0]) [1]     -- 2: Outer<Deep16<T>> (non-empty fieldLayouts!)
+      , ptrLay 8 2 ] }
+def D64_nestedTrunc : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK (.adt "zc::OuterDeep" [paramT])) 3]
+
+theorem nested_truncated_param_wrapper_unresolved :
+    resolveCopyElemLayout D64_nestedTrunc L64_nestedTrunc (cp 1) (cp 1) = .unsupported := rfl
+theorem nested_truncated_param_wrapper_count5_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_nestedTrunc L64_nestedTrunc (av 1)
+      (av 1) 5 locals64 = MirStepNode.fail .ub := rfl
+
+/-- Overlapping tuple fields (`(u64, u64)` with `size = 8`, both at offset `0`) must be rejected,
+while valid ZST sharing (`(u64, ())` with `size = 8`, both at offset `0`) remains accepted; a
+multi-variant enum layout (`.multiple`) must be rejected for a tuple. -/
+def L64_b3Tup : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])                                  -- 0: ()
+      , lay 8 8 .primitive                                          -- 1: u64
+      , lay 8 8 (.arbitrary [⟨0⟩, ⟨0⟩] [0, 1]) [1, 1]              -- 2: corrupt overlapping (u64, u64)
+      , ptrLay 8 2                                                  -- 3: *mut (u64, u64)
+      , lay 8 8 (.arbitrary [⟨0⟩, ⟨0⟩] [0, 1]) [1, 0]              -- 4: valid (u64, ())
+      , ptrLay 8 4                                                  -- 5: *mut (u64, ())
+      , { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1],
+          variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+            [.arbitrary [] [], .arbitrary [⟨1⟩] [0]],
+          isUninhabited := false, fieldLayouts := [7, 7] }          -- 6: multivariant enum
+      , lay 1 1 .primitive                                          -- 7: u8
+      , ptrLay 8 6 ] }                                              -- 8: *mut (u8, u8)
+def D64_b3Tup : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.tuple [.uint .u64, .uint .u64])) 3
+  , decl (ptrK (.tuple [.uint .u64, .tuple []])) 5
+  , decl (ptrK (.tuple [.uint .u8, .uint .u8])) 8 ]
+
+theorem overlapping_tuple_fields_size8_rejected :
+    resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 1) (cp 1) = .unsupported := rfl
+theorem valid_tuple_with_zst_shared_offset0_resolves :
+    resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 2) (cp 2) = .ok 8 8 := rfl
+theorem multivariant_tuple_rejected :
+    resolveCopyElemLayout D64_b3Tup L64_b3Tup (cp 3) (cp 3) = .unsupported := rfl
 
 end Anneal.Tests.ZeroCountCopyAlign.V08
 
@@ -2536,3 +2642,44 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.array_stride_not_multiple_of_align_rejected' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.array_stride_not_multiple_of_align_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.nested_truncated_param_wrapper_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.nested_truncated_param_wrapper_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.nested_truncated_param_wrapper_count5_misaligned_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.nested_truncated_param_wrapper_count5_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.overlapping_tuple_fields_size8_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.overlapping_tuple_fields_size8_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.valid_tuple_with_zst_shared_offset0_resolves' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.valid_tuple_with_zst_shared_offset0_resolves
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.multivariant_tuple_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.multivariant_tuple_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.nested_truncated_param_wrapper_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.nested_truncated_param_wrapper_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.nested_truncated_param_wrapper_count5_misaligned_ub' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.nested_truncated_param_wrapper_count5_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.overlapping_tuple_fields_size8_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.overlapping_tuple_fields_size8_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.valid_tuple_with_zst_shared_offset0_resolves' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.valid_tuple_with_zst_shared_offset0_resolves
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.multivariant_tuple_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.multivariant_tuple_rejected

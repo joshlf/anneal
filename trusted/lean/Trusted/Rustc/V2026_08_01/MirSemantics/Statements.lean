@@ -3843,48 +3843,17 @@ def copyAnyFieldLayoutHasPlaceholder
       | false => copyAnyFieldLayoutHasPlaceholder layouts check rest
 
 /--
-Fuel-bounded test whether the layout `l` is, or transitively (through
-`fieldLayouts`) contains, a pre-monomorphization generic placeholder layout
-(`TypeLayout.isParamPlaceholder`): the synthetic `size = 0, align = 1`
-`.primitive` layout that `rustc-capture` emits for a type parameter `T` before
-`LayoutTable.appendParamLayouts` substitutes the instantiated layouts.
-Recursion stops at pointer layouts (`copyIsPtrBackendRepr`), whose single
-`fieldLayouts` entry names the pointee rather than a field, so recursive types
-such as `struct Node { next: *mut Node }` never cycle.
-
-Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L706-L712>
-
-> "fn layout_of(&self, ty: Ty<'tcx>) -> Self::LayoutOfResult"
-
-Modeling choice: a placeholder-bearing layout is a template, not the layout of
-any concrete type, so it never determines `size_of::<T>()` or
-`align_of::<T>()`. Exhausting `fuel` answers `true` (fail closed; `32` exceeds
-the depth-16 `rustc-capture` field-interning limit).
--/
-def copyLayoutHasPlaceholder (layouts : LayoutTable) : Nat → TypeLayout → Bool
-  | .zero, _ => true
-  | .succ fuel', l =>
-    match TypeLayout.isParamPlaceholder l with
-    | true => true
-    | false =>
-      match copyIsPtrBackendRepr l.backendRepr with
-      | true => false
-      | false =>
-        copyAnyFieldLayoutHasPlaceholder layouts (copyLayoutHasPlaceholder layouts fuel')
-          l.fieldLayouts
-
-/--
 Whether `l` matches the synthetic template `rustc-capture` emits for a
 parametric compound type whose field layouts were not interned (field depth
 `≥ 16`): `align = 1`, `size ≤ 1`, at least one field, and no `fieldLayouts`.
 
 Modeling choice (supplied `rustc-capture` fact, not a documented Rust
 guarantee): such a template does not determine the size or alignment of the
-instantiated type, so it is rejected (fail closed). A genuine concrete
-`align = 1, size ≤ 1` compound layout captured without `fieldLayouts` is also
-rejected; this only costs precision (`.unsupported`), never soundness.
+instantiated type, so it is rejected (fail closed) both at the root and when
+reached transitively through `fieldLayouts` in `copyLayoutHasPlaceholder`. A
+genuine concrete `align = 1, size ≤ 1` compound layout captured without
+`fieldLayouts` is also rejected; this only costs precision (`.unsupported`),
+never soundness.
 -/
 @[reducible]
 def copyLayoutTruncatedParametric (l : TypeLayout) : Bool :=
@@ -3900,6 +3869,40 @@ def copyLayoutTruncatedParametric (l : TypeLayout) : Bool :=
   match l.fieldLayouts with
   | _ :: _ => false
   | .nil => Bool.and hasFields (Bool.and (Nat.beq l.align.bytes 1) (Nat.ble l.size.bytes 1))
+
+/--
+Fuel-bounded test whether the layout `l` is, or transitively (through
+`fieldLayouts`) contains, a pre-monomorphization generic placeholder layout
+(`TypeLayout.isParamPlaceholder`) or a depth-16 truncated parametric template
+(`copyLayoutTruncatedParametric`): the synthetic layouts that `rustc-capture`
+emits for type parameters `T` and nested parametric compounds before
+`LayoutTable.appendParamLayouts` substitutes the instantiated layouts.
+Recursion stops at pointer layouts (`copyIsPtrBackendRepr`), whose single
+`fieldLayouts` entry names the pointee rather than a field, so recursive types
+such as `struct Node { next: *mut Node }` never cycle.
+
+Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L706-L712>
+
+> "fn layout_of(&self, ty: Ty<'tcx>) -> Self::LayoutOfResult"
+
+Modeling choice: a placeholder-bearing or truncated-parametric layout is a
+template, not the layout of any concrete type, so it never determines
+`size_of::<T>()` or `align_of::<T>()`. Exhausting `fuel` answers `true` (fail
+closed; `32` exceeds the depth-16 `rustc-capture` field-interning limit).
+-/
+def copyLayoutHasPlaceholder (layouts : LayoutTable) : Nat → TypeLayout → Bool
+  | .zero, _ => true
+  | .succ fuel', l =>
+    match Bool.or (TypeLayout.isParamPlaceholder l) (copyLayoutTruncatedParametric l) with
+    | true => true
+    | false =>
+      match copyIsPtrBackendRepr l.backendRepr with
+      | true => false
+      | false =>
+        copyAnyFieldLayoutHasPlaceholder layouts (copyLayoutHasPlaceholder layouts fuel')
+          l.fieldLayouts
 
 /--
 Target byte size of a primitive scalar or pointer-width `RigidTy` on a target
@@ -3975,22 +3978,24 @@ def copyPtrIsWide? : Nat → RigidTy → Option Bool
 /--
 Validate that a tuple's `fieldLayouts` and `offsets` match its field types `ks`
 pairwise, with each field well-formed, placed at an offset that is a multiple of
-its own alignment, aligned to at most `tupleAlign`, and contained within
-`tupleSize` bytes (helper for `copyLayoutMatchesRigidTyAux`).
+its own alignment, aligned to at most `tupleAlign`, contained within `tupleSize`
+bytes, and with the sum of all field sizes at most `tupleSize` (rejecting
+overlapping non-ZST field layouts; helper for `copyLayoutMatchesRigidTyAux`).
 
 Reference (The Rust Reference 1.98.0, "The Rust representation"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.repr.rust.layout>
 
 > "The fields are properly aligned."
+> "The fields do not overlap."
 > "The alignment of the type is at least the maximum alignment of its fields."
 -/
 def copyTupleFieldLayoutsMatch
     (check : Nat → RigidTy → TypeLayout → Bool)
     (layouts : LayoutTable)
     (tupleSize tupleAlign : Nat) :
-    List RigidTy → List Nat → List Size → Bool
-  | .nil, .nil, .nil => true
-  | k :: ks', fIdx :: fIdxs', off :: offs' =>
+    Nat → List RigidTy → List Nat → List Size → Bool
+  | sumSz, .nil, .nil, .nil => Nat.ble sumSz tupleSize
+  | sumSz, k :: ks', fIdx :: fIdxs', off :: offs' =>
     match LayoutTable.lookup layouts fIdx with
     | .none => false
     | .some fl =>
@@ -4002,8 +4007,10 @@ def copyTupleFieldLayoutsMatch
                 (Nat.ble (Nat.add off.bytes fl.size.bytes) tupleSize))))
       with
       | false => false
-      | true => copyTupleFieldLayoutsMatch check layouts tupleSize tupleAlign ks' fIdxs' offs'
-  | _, _, _ => false
+      | true =>
+        copyTupleFieldLayoutsMatch check layouts tupleSize tupleAlign
+          (Nat.add sumSz fl.size.bytes) ks' fIdxs' offs'
+  | _, _, _, _ => false
 
 /--
 Sum of known primitive byte sizes (`copyPrimByteSize?`) across a tuple's field
@@ -4060,9 +4067,11 @@ def copyLayoutMatchesRigidTyAux :
   | .succ fuel', layouts, layoutIdx, kind, l =>
     let ptrBytes := layoutPointerBytes layouts
     let compoundOk : Bool :=
-      Bool.and
-        (Bool.not (copyLayoutHasPlaceholder layouts 32 l))
-        (Bool.not (copyLayoutTruncatedParametric l))
+      Bool.not (copyLayoutHasPlaceholder layouts 32 l)
+    let singleOrEmptyVariant : Bool :=
+      match l.variants with
+      | .multiple _ _ _ => false
+      | _ => true
     let zstOk : Bool :=
       Bool.and (Bool.not l.isUninhabited)
         (Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1))
@@ -4104,7 +4113,7 @@ def copyLayoutMatchesRigidTyAux :
             | .some esz => Bool.and (Nat.beq stride.bytes esz) (Nat.ble l.align.bytes esz)
             | .none => true
           | _ => false
-        Bool.and compoundOk
+        Bool.and (Bool.and compoundOk singleOrEmptyVariant)
           (Bool.and elemOk
             (Bool.and (Size.isMultipleOfAlign stride l.align)
               (Bool.and (Nat.beq count n) (Nat.beq l.size.bytes (Nat.mul stride.bytes n)))))
@@ -4121,8 +4130,9 @@ def copyLayoutMatchesRigidTyAux :
             | fIdxs =>
               copyTupleFieldLayoutsMatch
                 (copyLayoutMatchesRigidTyAux fuel' layouts)
-                layouts l.size.bytes l.align.bytes ks fIdxs offsets
-          Bool.and compoundOk (Bool.and (Nat.beq (length offsets) (length ks)) fieldsOk)
+                layouts l.size.bytes l.align.bytes 0 ks fIdxs offsets
+          Bool.and (Bool.and compoundOk singleOrEmptyVariant)
+            (Bool.and (Nat.beq (length offsets) (length ks)) fieldsOk)
         | _ => false
     | .adt _ _ => Bool.and compoundOk (copyLayoutValidForResolvedAdt layoutIdx l)
     | .closure _ _ => Bool.and compoundOk (copyLayoutValidForResolvedAdt layoutIdx l)
