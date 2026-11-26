@@ -1930,8 +1930,8 @@ private theorem evalRvalue_memPreserved
     simp only [evalRvalue] at h
     repeat' (first | contradiction | (cases h; exact ⟨rfl, rfl, rfl⟩) | split at h | dsimp only at h)
   | binaryOp _ _ _ =>
-    simp only [evalRvalue, evalScalarPtrOffsetBinOp, evalScalarBinOp, evalPtrOffsetBinOp,
-      evalWidePtrAggregateRelBinOp, evalWidePtrRelBinOp, evalSignedDiv, evalSignedRem] at h
+    simp only [evalRvalue, evalFloatScalarBinOp, evalScalarPtrOffsetBinOp, evalScalarBinOp,
+      evalPtrOffsetBinOp, evalWidePtrAggregateRelBinOp, evalWidePtrRelBinOp, evalSignedDiv, evalSignedRem] at h
     repeat' (first | contradiction | (cases h; exact ⟨rfl, rfl, rfl⟩) | split at h | dsimp only at h)
   | ref _ _ =>
     simp only [evalRvalue] at h
@@ -1951,7 +1951,7 @@ private theorem evalRvalue_memPreserved
       repeat' (first | contradiction | (cases h; exact ⟨rfl, rfl, rfl⟩) | split at h | dsimp only at h)
     | _ => simp [copyRv, translateRvalue] at ht
   | unaryOp _ _ =>
-    simp only [evalRvalue, evalUnaryNot, evalUnaryPtrMetadata] at h
+    simp only [evalRvalue, evalFloatUnaryNeg, evalUnaryNot, evalUnaryPtrMetadata] at h
     repeat' (first | contradiction | (cases h; exact ⟨rfl, rfl, rfl⟩) | split at h | dsimp only at h)
   | discriminant _ =>
     simp only [evalRvalue, evalPlaceDiscriminant] at h

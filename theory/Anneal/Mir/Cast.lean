@@ -5198,8 +5198,6 @@ def CastOutcome.toTrustedResult (pw : PtrWidth) (dst : ScalarTy) (locals : List 
   | .ub => .ub
   | .unsupported => .unsupported
 
-/-- On every non-pointer integral/`bool`/`char` type, `decodeTypedValueFromBytes` rejects
-provenance-carrying bytes and otherwise coincides with the layout-free `decodeValueFromBytes`. -/
 /-- `decodeTypedValueFromBytes` at any non-pointer scalar descriptor rejects every
 provenance-carrying byte image unconditionally (including on 32-bit targets). -/
 theorem trusted_decodeTypedValueFromBytes_toTrustedRigidTy_of_not_isPtr_of_prov
@@ -5214,12 +5212,15 @@ theorem trusted_decodeTypedValueFromBytes_toTrustedRigidTy_of_not_isPtr_of_prov
   | uint w => cases w <;> (unfold decodeTypedValueFromBytes; dsimp only; rw [h_prov])
   | rawPtr | refPtr => contradiction
 
+/-- On every non-pointer integral/`bool`/`char` type, `decodeTypedValueFromBytes` rejects
+provenance-carrying bytes and otherwise coincides with the layout-free `decodeValueFromBytes`
+(on non-32-bit targets for `usize`/`isize`). -/
 theorem trusted_decodeTypedValueFromBytes_toTrustedRigidTy_of_not_isPtr
     (fuel : Nat) (layouts : LayoutTable) (m : Mutability) (pointee : RigidTy) (ty : ScalarTy)
     (lIdx : Nat) (bs : List AbstractByte) (h_np : ty.isPtr = false)
     (hNot32 : (ty = .uint .wsize ∨ ty = .int .wsize) →
       Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+        by intro h; rcases h with h | h <;> first | nomatch h | rfl) :
     decodeTypedValueFromBytes (fuel + 1) layouts
         { kind := ty.toTrustedRigidTy m pointee, layoutIdx := lIdx } bs =
       (match abstractBytesHaveProv bs with
@@ -5592,7 +5593,7 @@ theorem trusted_evalByteCast_scalar_transmute_correspondence
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
       Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+        by intro h; rcases h with h | h <;> first | nomatch h | rfl) :
     evalByteCast locals op { kind := dst.toTrustedRigidTy m2 pt2, layoutIdx := dstLIdx }
         mem localDecls layouts =
       CastOutcome.toTrustedResult .bits64 dst locals' mem
@@ -5649,7 +5650,7 @@ theorem trusted_evalByteCast_int_uint_roundtrip
     (h_ty₂ : operandTy localDecls layouts op₂ =
       .some { kind := .uint w.toTrustedUintTy, layoutIdx := uintLIdx })
     (hNot32 : w = .wsize → Nat.beq (layoutPointerBytes layouts) 4 = false :=
-      fun h => by nomatch h) :
+      by intro h; first | nomatch h | rfl) :
     evalByteCast locals₁ op₁ { kind := .uint w.toTrustedUintTy, layoutIdx := uintLIdx }
         mem localDecls layouts = ok (.scalar ⟨bits, w.byteSize .bits64⟩) locals₁' mem ∧
     evalByteCast locals₂ op₂ { kind := .int w.toTrustedIntTy, layoutIdx := intLIdx }
@@ -5659,12 +5660,12 @@ theorem trusted_evalByteCast_int_uint_roundtrip
   · rw [trusted_evalByteCast_scalar_transmute_correspondence .rejectPtrToInt (.int w) (.uint w)
       .not .not .bool .bool bits [] locals₁ locals₁' op₁ mem localDecls layouts intLIdx uintLIdx
       rfl rfl ⟨h_bits, trivial⟩ h_op₁ h_ty₁
-      (fun h => by rcases h with h | h; · cases h; exact hNot32 rfl; · nomatch h), h_rt.1]
+      (fun h => match h with | .inl h => by cases h; exact hNot32 rfl | .inr h => nomatch h), h_rt.1]
     rfl
   · rw [trusted_evalByteCast_scalar_transmute_correspondence .rejectPtrToInt (.uint w) (.int w)
       .not .not .bool .bool bits [] locals₂ locals₂' op₂ mem localDecls layouts uintLIdx intLIdx
       rfl rfl ⟨h_bits, trivial⟩ h_op₂ h_ty₂
-      (fun h => by rcases h with h | h; · nomatch h; · cases h; exact hNot32 rfl), h_rt.2]
+      (fun h => match h with | .inl h => nomatch h | .inr h => by cases h; exact hNot32 rfl), h_rt.2]
     rfl
 
 /-- `Trusted` encoding of a thin pointer at the image of any pointer descriptor. -/
@@ -10177,7 +10178,7 @@ theorem trusted_evalByteCast_provFree_ptr_to_int_transmute_correspondence
       some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
       Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+        by intro h; rcases h with h | h <;> first | nomatch h | rfl) :
     evalTransmuteSameSize .bits64 .allowPtrToIntStripProvenance src dst
         (.ptr { allocId := 0, offsetBytes := bits } none) exposed =
       .ok (.scalar bits) exposed ∧
@@ -10504,7 +10505,7 @@ theorem evalTransmuteSameSize_ok_of_checkIntoFromBytes
     (hValid : src.validBits pw bits)
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
       Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+        by intro h; rcases h with h | h <;> first | nomatch h | rfl) :
     evalTransmuteSameSize pw policy src dst (.scalar bits) exposed =
       .ok (.scalar bits) exposed ∧
     CastVal.WellTyped pw dst (.scalar bits) ∧
@@ -12470,7 +12471,7 @@ theorem evalByteCast_adt_primitive_to_scalar_ok
       some { kind := .adt defPath args, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
       Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+        by intro h; rcases h with h | h <;> first | nomatch h | rfl) :
     let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
     encodeValueToBytes defaultCodecFuel layouts { kind := .adt defPath args, layoutIdx := srcLIdx }
         (.scalar ⟨bits, dst.sizeBytes .bits64⟩) =
@@ -12563,7 +12564,7 @@ theorem evalByteCast_adt_multiple_enum_explicit_to_scalar_ok
       some { kind := .adt defPath args, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
       Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+        by intro h; rcases h with h | h <;> first | nomatch h | rfl) :
     let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
     evalByteCast locals op dstTy mem localDecls layouts =
       ok (.scalar ⟨discrBits, dst.sizeBytes .bits64⟩) locals' mem ∧
@@ -12649,7 +12650,7 @@ theorem evalByteCast_adt_multiple_enum_to_scalar_ok
     (hNoDiscr : l.variantDiscriminants = [] := by rfl)
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
       Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+        by intro h; rcases h with h | h <;> first | nomatch h | rfl) :
     let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
     evalByteCast locals op dstTy mem localDecls layouts =
       ok (.scalar ⟨varIdx, dst.sizeBytes .bits64⟩) locals' mem :=
@@ -12731,7 +12732,7 @@ theorem evalByteCast_projected_adt_primitive_to_scalar_ok
       some { kind := .adt defPath args, layoutIdx := srcLIdx })
     (hNot32 : (dst = .uint .wsize ∨ dst = .int .wsize) →
       Nat.beq (layoutPointerBytes layouts) 4 = false :=
-        fun h => by rcases h with h | h <;> nomatch h) :
+        by intro h; rcases h with h | h <;> first | nomatch h | rfl) :
     let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
     resolveByteCastSrcTyAndSize localDecls layouts op { kind := .adt defPath args, layoutIdx := 0 } =
       some ({ kind := .adt defPath args, layoutIdx := srcLIdx }, dst.sizeBytes .bits64) ∧

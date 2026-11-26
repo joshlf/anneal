@@ -583,13 +583,69 @@ theorem valueContainsUninit_decodeTypedValueFromBytes :
                  valueContainsUninit_decodeScalarLayoutBytesNoForge _ _ _ h2]; done)
             | (rename_i h1; simp only [valueListContainsUninit,
                  valueContainsUninit_decodeScalarLayoutBytesNoForge _ _ _ h1]; done)))
-    | bool | char | int _ | uint _ =>
+    | bool | char =>
       rw [hk] at h; dsimp at h
       cases hP : abstractBytesHaveProv bs with
       | true => rw [hP] at h; cases h
       | false =>
         rw [hP] at h
         exact valueContainsUninit_decodeValueFromBytes (fuel' + 1) layouts _ bs v h
+    | int w =>
+      cases w with
+      | isize =>
+        rw [hk] at h; dsimp at h
+        cases hP : abstractBytesHaveProv bs with
+        | true => rw [hP] at h; cases h
+        | false =>
+          rw [hP] at h; dsimp at h
+          cases h4 : Nat.beq (layoutPointerBytes layouts) 4 with
+          | false =>
+            rw [h4] at h; dsimp at h
+            exact valueContainsUninit_decodeValueFromBytes (fuel' + 1) layouts _ bs v h
+          | true =>
+            rw [h4] at h; dsimp at h
+            cases hL : bs.length.beq 4 with
+            | false => rw [hL] at h; cases h
+            | true =>
+              rw [hL] at h; dsimp at h
+              cases hS : decodeScalarBytes bs true with
+              | none => rw [hS] at h; cases h
+              | some p => rw [hS] at h; cases h; rfl
+      | i8 | i16 | i32 | i64 | i128 =>
+        rw [hk] at h; dsimp at h
+        cases hP : abstractBytesHaveProv bs with
+        | true => rw [hP] at h; cases h
+        | false =>
+          rw [hP] at h
+          exact valueContainsUninit_decodeValueFromBytes (fuel' + 1) layouts _ bs v h
+    | uint w =>
+      cases w with
+      | usize =>
+        rw [hk] at h; dsimp at h
+        cases hP : abstractBytesHaveProv bs with
+        | true => rw [hP] at h; cases h
+        | false =>
+          rw [hP] at h; dsimp at h
+          cases h4 : Nat.beq (layoutPointerBytes layouts) 4 with
+          | false =>
+            rw [h4] at h; dsimp at h
+            exact valueContainsUninit_decodeValueFromBytes (fuel' + 1) layouts _ bs v h
+          | true =>
+            rw [h4] at h; dsimp at h
+            cases hL : bs.length.beq 4 with
+            | false => rw [hL] at h; cases h
+            | true =>
+              rw [hL] at h; dsimp at h
+              cases hS : decodeScalarBytes bs false with
+              | none => rw [hS] at h; cases h
+              | some p => rw [hS] at h; cases h; rfl
+      | u8 | u16 | u32 | u64 | u128 =>
+        rw [hk] at h; dsimp at h
+        cases hP : abstractBytesHaveProv bs with
+        | true => rw [hP] at h; cases h
+        | false =>
+          rw [hP] at h
+          exact valueContainsUninit_decodeValueFromBytes (fuel' + 1) layouts _ bs v h
     | fnPtr _ _ _ _ | rawPtr _ _ | ref _ _ =>
       rw [hk] at h; dsimp at h
       exact valueContainsUninit_decodePtrBytesNoForge _ _ _ bs v h
@@ -2218,21 +2274,45 @@ theorem decodeTypedValueFromBytes_int_uninit (layouts : LayoutTable) (ty : Ty) (
   rw [show defaultCodecFuel = 15 + 1 from rfl]
   rcases hInt with ⟨w, hw⟩ | ⟨w, hw⟩
   · unfold decodeTypedValueFromBytes
-    simp only [normalizeCodecTy, hw]
-    rw [hP]
-    simp only []
-    unfold decodeValueFromBytes
-    simp only [hw, hD]
-    split <;> (try rfl)
-    split <;> rfl
+    cases w with
+    | usize =>
+      simp only [normalizeCodecTy, hw, hP]
+      cases Nat.beq (layoutPointerBytes layouts) 4 with
+      | true =>
+        cases Nat.beq (Trusted.Sequence.length (List.replicate (n + 1) AbstractByte.uninit)) 4 with
+        | false => rfl
+        | true => simp only [hD]
+      | false =>
+        unfold decodeValueFromBytes
+        simp only [hw, hD]
+        split <;> (try rfl)
+        split <;> rfl
+    | u8 | u16 | u32 | u64 | u128 =>
+      simp only [normalizeCodecTy, hw, hP]
+      unfold decodeValueFromBytes
+      simp only [hw, hD]
+      split <;> (try rfl)
+      split <;> rfl
   · unfold decodeTypedValueFromBytes
-    simp only [normalizeCodecTy, hw]
-    rw [hP]
-    simp only []
-    unfold decodeValueFromBytes
-    simp only [hw, hD]
-    split <;> (try rfl)
-    split <;> rfl
+    cases w with
+    | isize =>
+      simp only [normalizeCodecTy, hw, hP]
+      cases Nat.beq (layoutPointerBytes layouts) 4 with
+      | true =>
+        cases Nat.beq (Trusted.Sequence.length (List.replicate (n + 1) AbstractByte.uninit)) 4 with
+        | false => rfl
+        | true => simp only [hD]
+      | false =>
+        unfold decodeValueFromBytes
+        simp only [hw, hD]
+        split <;> (try rfl)
+        split <;> rfl
+    | i8 | i16 | i32 | i64 | i128 =>
+      simp only [normalizeCodecTy, hw, hP]
+      unfold decodeValueFromBytes
+      simp only [hw, hD]
+      split <;> (try rfl)
+      split <;> rfl
 
 /-- **`kani#5176`, 0-byte arm.** From all-`.uninit` storage (every slot inactive, as for
 `MaybeUninit::uninit()` or a union decoded from uninitialized bytes), an inhabited 0-byte arm such

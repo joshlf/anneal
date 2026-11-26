@@ -274,27 +274,45 @@ private theorem decodeTypedValueFromBytes_int_uninit_lm24 (layouts : LayoutTable
   rw [show defaultCodecFuel = 15 + 1 from rfl]
   rcases hInt with ⟨w, hw⟩ | ⟨w, hw⟩
   · unfold decodeTypedValueFromBytes
-    simp only [normalizeCodecTy, hw]
-    rw [hP]
-    simp only []
-    unfold decodeValueFromBytes
-    simp only [hw, hD]
-    cases intCastTargetBytes (RigidTy.uint w) with
-    | none => simp only []
-    | some eb =>
-      cases h2 : Nat.beq (Trusted.Sequence.length (List.replicate (n + 1) AbstractByte.uninit)) eb <;>
-        simp only [h2]
+    cases w with
+    | usize =>
+      simp only [normalizeCodecTy, hw, hP]
+      cases Nat.beq (layoutPointerBytes layouts) 4 with
+      | true =>
+        cases Nat.beq (Trusted.Sequence.length (List.replicate (n + 1) AbstractByte.uninit)) 4 with
+        | false => rfl
+        | true => simp only [hD]
+      | false =>
+        unfold decodeValueFromBytes
+        simp only [hw, hD]
+        split <;> (try rfl)
+        split <;> rfl
+    | u8 | u16 | u32 | u64 | u128 =>
+      simp only [normalizeCodecTy, hw, hP]
+      unfold decodeValueFromBytes
+      simp only [hw, hD]
+      split <;> (try rfl)
+      split <;> rfl
   · unfold decodeTypedValueFromBytes
-    simp only [normalizeCodecTy, hw]
-    rw [hP]
-    simp only []
-    unfold decodeValueFromBytes
-    simp only [hw, hD]
-    cases intCastTargetBytes (RigidTy.int w) with
-    | none => simp only []
-    | some eb =>
-      cases h2 : Nat.beq (Trusted.Sequence.length (List.replicate (n + 1) AbstractByte.uninit)) eb <;>
-        simp only [h2]
+    cases w with
+    | isize =>
+      simp only [normalizeCodecTy, hw, hP]
+      cases Nat.beq (layoutPointerBytes layouts) 4 with
+      | true =>
+        cases Nat.beq (Trusted.Sequence.length (List.replicate (n + 1) AbstractByte.uninit)) 4 with
+        | false => rfl
+        | true => simp only [hD]
+      | false =>
+        unfold decodeValueFromBytes
+        simp only [hw, hD]
+        split <;> (try rfl)
+        split <;> rfl
+    | i8 | i16 | i32 | i64 | i128 =>
+      simp only [normalizeCodecTy, hw, hP]
+      unfold decodeValueFromBytes
+      simp only [hw, hD]
+      split <;> (try rfl)
+      split <;> rfl
 
 private theorem get?_replicate_unit_lm24 :
     ∀ (count i : Nat), i < count → get? (List.replicate count Value.unit) i = some .unit
