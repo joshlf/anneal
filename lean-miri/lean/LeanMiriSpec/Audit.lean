@@ -23750,6 +23750,152 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     hstate hphase hbb hstmt hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
     hcountInt hcountOp hpt helem_pos hzero_align htgt_same hptr_single hlive_ok hres hptr8
 
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : MirAst.LocalDecl} {srcMut dstMut : Mutability} {pointeeTy countTy : Ty}
+    {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (helem_pos : 0 < elemBytes)
+    (hexp : s.memory.exposedAllocIds = [])
+    (hzero_live : ∀ p countSc e decl,
+      (get? s.frame.locals srcIdx = some (.init (.ptr p 8)) ∨
+        get? s.frame.locals dstIdx = some (.init (.ptr p 8))) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      countSc.bits = 0 →
+      e ∈ allocMap → e.tag = p.tag →
+      get? body.localDecls e.localIdx = some decl →
+      e.toBorrowEntry.allocDead = false ∧
+        ∃ bound, copyTyAlignBound? body.localDecls body.layouts 32 decl.ty = some bound ∧
+          0 < bound.val ∧ bound.val % elemAlign = 0)
+    (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      decl_s.ty.kind = pointeeTy.kind ∧
+        decl_d.ty.kind = pointeeTy.kind ∧
+        unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none ∧
+        unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
+    (hptr_single : ∀ srcPtr dstPtr countSc,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      countSc.bits = 1 ∧
+        srcPtr.offsetBytes = 0 ∧
+        dstPtr.offsetBytes = 0)
+    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? s.frame.locals e_s.localIdx ≠ some .dead →
+      get? s.frame.locals e_d.localIdx ≠ some .dead →
+      e_s.perm ≠ .disabled ∧
+        (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
+        get? s.frame.locals e_s.localIdx ≠ some .uninit)
+    (hres : resolveCopyElemLayout body.localDecls body.layouts (.copy ⟨srcIdx, []⟩)
+      (.copy ⟨dstIdx, []⟩) = .ok elemBytes elemAlign)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
+    StepRelLM3_1 body m
+      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets
+    hstate hphase hbb hstmt hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
+    hcountInt hcountOp hpt helem_pos hexp hzero_live htgt_same hptr_single hlive_ok hres hptr8
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : MirAst.LocalDecl} {srcMut dstMut : Mutability} {pointeeTy countTy : Ty}
+    {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (helem_pos : 0 < elemBytes)
+    (hlay : body.layouts = emptyLayoutTable)
+    (hexp : s.memory.exposedAllocIds = [])
+    (hsa : copyTySizeAndAlign? body.localDecls emptyLayoutTable 32 pointeeTy.kind =
+      some (elemBytes, elemAlign))
+    (hzero_live : ∀ p countSc e decl,
+      (get? s.frame.locals srcIdx = some (.init (.ptr p 8)) ∨
+        get? s.frame.locals dstIdx = some (.init (.ptr p 8))) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      countSc.bits = 0 →
+      e ∈ allocMap → e.tag = p.tag →
+      get? body.localDecls e.localIdx = some decl →
+      e.toBorrowEntry.allocDead = false ∧ decl.ty.kind = pointeeTy.kind)
+    (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      decl_s.ty.kind = pointeeTy.kind ∧
+        decl_d.ty.kind = pointeeTy.kind ∧
+        unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none ∧
+        unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
+    (hptr_single : ∀ srcPtr dstPtr countSc,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      countSc.bits = 1 ∧
+        srcPtr.offsetBytes = 0 ∧
+        dstPtr.offsetBytes = 0)
+    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? s.frame.locals e_s.localIdx ≠ some .dead →
+      get? s.frame.locals e_d.localIdx ≠ some .dead →
+      e_s.perm ≠ .disabled ∧
+        (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
+        get? s.frame.locals e_s.localIdx ≠ some .uninit) :
+    StepRelLM3_1 body m
+      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets_emptyLayout
+    hstate hphase hbb hstmt hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
+    hcountInt hcountOp hpt helem_pos hlay hexp hsa hzero_live htgt_same hptr_single hlive_ok
+
 open WitnessLM4_2 in
 example :
     let b := arithOffsetScalarPtrBody
@@ -24082,6 +24228,8 @@ open LeanMiriSpec.Correspondence in
   copyZeroPtrAgree_ptr_root
   isUnresolvedLayoutIdx_emptyLayoutTable
   resolveCopyElemLayout_of_unresolved_ptrs
+  resolveCopyElemLayout_of_valid_ptrs
+  copyZeroPtrAgree_populated_layout_example
   copyZeroAlign_of_agree
   copyZeroPtrAgree_lm3_1
   stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets

@@ -8014,6 +8014,95 @@ theorem resolveCopyElemLayout_of_unresolved_ptrs
   rw [hopS, hopD]; dsimp only; rw [hsingle]
   simp only [Nat.beq_refl, Bool.and_self]
 
+/-- When both pointer operands carry resolved thin-pointer `TypeLayout` entries in
+a populated `LayoutTable` whose single `fieldLayouts` slot validates
+`pointeeKind` to `(elemBytes, elemAlign)` with power-of-two `elemAlign`, Stage-1
+`resolveCopyElemLayout` returns `.ok elemBytes elemAlign`. -/
+theorem resolveCopyElemLayout_of_valid_ptrs
+    {decls : List LocalDecl} {layouts : LayoutTable}
+    {srcIdx dstIdx : Local} {srcDecl dstDecl : LocalDecl}
+    {srcMut dstMut : Mutability} {pointeeKind : RigidTy}
+    {srcPtrL dstPtrL ptL : TypeLayout} {ptIdx elemBytes elemAlign : Nat}
+    (hns : copyIsUnsizedRigidTy 8 pointeeKind = false)
+    (hsrcDecl : get? decls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeKind)
+    (hsrcRes : isUnresolvedLayoutIdx layouts srcDecl.ty.layoutIdx = false)
+    (hsrcLook : LayoutTable.lookup layouts srcDecl.ty.layoutIdx = some srcPtrL)
+    (hsrcThin : copyIsThinPtrBackendRepr srcPtrL.backendRepr = true)
+    (hsrcFl : srcPtrL.fieldLayouts = [ptIdx])
+    (hdstDecl : get? decls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hdstRes : isUnresolvedLayoutIdx layouts dstDecl.ty.layoutIdx = false)
+    (hdstLook : LayoutTable.lookup layouts dstDecl.ty.layoutIdx = some dstPtrL)
+    (hdstThin : copyIsThinPtrBackendRepr dstPtrL.backendRepr = true)
+    (hdstFl : dstPtrL.fieldLayouts = [ptIdx])
+    (hptLook : LayoutTable.lookup layouts ptIdx = some ptL)
+    (hptVal : copyValidatedLayoutFor? layouts ptIdx pointeeKind ptL = some (elemBytes, elemAlign))
+    (hpow2 : Align.isPowerOfTwoBytes { bytes := elemAlign } = true) :
+    resolveCopyElemLayout decls layouts (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) =
+      .ok elemBytes elemAlign := by
+  have hopS : operandPointeeLookup decls layouts (.copy ⟨srcIdx, []⟩) =
+      .pointee pointeeKind (.some ptIdx) := by
+    unfold operandPointeeLookup operandTyResolved placeTyResolved
+    dsimp only; rw [hsrcDecl]; dsimp only [resolveProjectedTyResolved]
+    rw [hsrcRes]; dsimp only; rw [hsrcLook]; dsimp only
+    rw [hsrcThin, hsrcFl]; dsimp only; rw [hsrcTy]
+  have hopD : operandPointeeLookup decls layouts (.copy ⟨dstIdx, []⟩) =
+      .pointee pointeeKind (.some ptIdx) := by
+    unfold operandPointeeLookup operandTyResolved placeTyResolved
+    dsimp only; rw [hdstDecl]; dsimp only [resolveProjectedTyResolved]
+    rw [hdstRes]; dsimp only; rw [hdstLook]; dsimp only
+    rw [hdstThin, hdstFl]; dsimp only; rw [hdstTy]
+  have hsingle : resolveSinglePointeeLayout decls layouts pointeeKind (.some ptIdx) =
+      .ok elemBytes elemAlign := by
+    unfold resolveSinglePointeeLayout
+    rw [hns]; dsimp only; rw [hptLook]; dsimp only; rw [hptVal]; dsimp only; rw [hpow2]
+  unfold resolveCopyElemLayout
+  rw [hopS, hopD]; dsimp only; rw [hsingle]
+  simp only [Nat.beq_refl, Bool.and_self]
+
+/-- Non-vacuity witness exercising `copyTyAlignBound?_exact_of_validLayout`,
+`resolveCopyElemLayout_of_valid_ptrs`, and `copyZeroPtrAgree_ptr_root` on a
+populated `rustc-capture`-shaped `LayoutTable` (`entries = [(), u64, *mut u64]`,
+with `layoutIdx = 1` on `_1 : u64` and `layoutIdx = 2` on `_2 : *mut u64`). -/
+theorem copyZeroPtrAgree_populated_layout_example (off : Nat) :
+    let u64Lay : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory, fields := .primitive,
+        variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+    let ptrLay : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨8⟩,
+        backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 2 ^ 64 - 1⟩),
+        fields := .primitive, variants := .single 0, isUninhabited := false,
+        fieldLayouts := [1] }
+    let unitLay : TypeLayout :=
+      { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .arbitrary [] [],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+    let layouts : LayoutTable :=
+      { pointerBits := 64, isLittleEndian := true, entries := [unitLay, u64Lay, ptrLay] }
+    let decls : List LocalDecl :=
+      [ { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := none },
+        { mutability := .mut, ty := { kind := .uint .u64, layoutIdx := 1 }, debugName := none },
+        { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 2 },
+          debugName := none } ]
+    let e : AllocMapEntry :=
+      { tag := 1, localIdx := 1, allocId := ⟨1, by decide⟩, perm := .active }
+    let s : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨42, 8⟩), .uninit] }
+        memory := { emptyMemory with borrows := [e.toBorrowEntry], nextTag := 2 } }
+    resolveCopyElemLayout decls layouts (.copy ⟨2, []⟩) (.copy ⟨2, []⟩) = .ok 8 8 ∧
+    CopyZeroPtrAgree s s.frame.locals decls layouts 8 (.ptr { allocId := 1, offsetBytes := off } 8) := by
+  intro u64Lay ptrLay unitLay layouts decls e s
+  have hres : resolveCopyElemLayout decls layouts (.copy ⟨2, []⟩) (.copy ⟨2, []⟩) = .ok 8 8 :=
+    resolveCopyElemLayout_of_valid_ptrs
+      (srcPtrL := ptrLay) (dstPtrL := ptrLay) (ptL := u64Lay) (ptIdx := 1)
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+      (by dsimp +zetaDelta only; rfl) rfl
+  have hbound : copyTyAlignBound? decls layouts 32 { kind := .uint .u64, layoutIdx := 1 } =
+      some (.exact 8) :=
+    copyTyAlignBound?_exact_of_validLayout (l := u64Lay) rfl rfl rfl
+      (by dsimp +zetaDelta only; rfl)
+  exact ⟨hres, copyZeroPtrAgree_ptr_root rfl rfl rfl rfl rfl hbound (by decide) (by decide) (by decide)⟩
+
 /-- Per-pointer agreement on both `src` and `dst` yields the zero-count hypothesis
 `hzero_align` of `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`. -/
 theorem copyZeroAlign_of_agree

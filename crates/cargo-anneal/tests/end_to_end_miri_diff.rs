@@ -69,7 +69,7 @@ use cargo_anneal::{
     parse_miri_diff_manifest, render_miri_diff_report, render_miri_diff_verify_module,
     render_miri_diff_verify_module_with_callees,
     render_miri_diff_verify_module_with_panic_certificate, run_lake_verify_targets,
-    run_miri_diff_suite, verify_miri_diff_ub_locations,
+    run_miri_diff_suite, stage_miri_diff_workspace, verify_miri_diff_ub_locations,
 };
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -1135,4 +1135,92 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     }
 
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn end_to_end_miri_diff_category12_zero_count_copy_align_and_null() {
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let checkout_root = anneal_checkout_root();
+    let wrapper_bin = ensure_rustc_capture_binary(&checkout_root);
+
+    let checked_in_corpus = checkout_root.join("tests/miri-diff/corpus");
+    let manifest_path = checkout_root.join("tests/miri-diff/manifest.toml");
+    let full_manifest = load_miri_diff_manifest(&manifest_path).expect("load checked-in manifest");
+
+    let cat12_names = [
+        ("ub_copy_nonoverlapping_zero_misaligned", 1usize),
+        ("pass_copy_nonoverlapping_zero_dangling", 2usize),
+        ("pass_copy_nonoverlapping_zero_null", 2usize),
+        ("ub_copy_nonoverlapping_nonzero_null", 1usize),
+    ];
+    let mut cat12_manifest = full_manifest.clone();
+    cat12_manifest.tests.retain(|entry| {
+        cat12_names
+            .iter()
+            .any(|(name, _)| entry.name == *name)
+    });
+    assert_eq!(
+        cat12_manifest.tests.len(),
+        cat12_names.len(),
+        "manifest.toml must contain all 4 Category 12 zero-count copy seeds"
+    );
+    for entry in &cat12_manifest.tests {
+        assert!(
+            entry.known_anneal_bug.is_none(),
+            "Category 12 seed `{}` must not carry a known_anneal_bug",
+            entry.name
+        );
+    }
+
+    let temp_guard = TempDirGuard(unique_temp_dir("cat12"));
+    let temp_corpus = temp_guard.0.join("corpus");
+    fs::create_dir_all(temp_corpus.join("src")).expect("create temp corpus src");
+    fs::copy(
+        checked_in_corpus.join("Cargo.toml"),
+        temp_corpus.join("Cargo.toml"),
+    )
+    .expect("copy Cargo.toml");
+    fs::copy(
+        checked_in_corpus.join("src/lib.rs"),
+        temp_corpus.join("src/lib.rs"),
+    )
+    .expect("copy src/lib.rs");
+
+    let config = MiriDiffConfig {
+        corpus_root: temp_corpus.clone(),
+        manifest_path: manifest_path.clone(),
+        anneal_repo_root: Some(checkout_root.clone()),
+        rustc_wrapper: Some(wrapper_bin),
+    };
+    let (_report, _certs) =
+        stage_miri_diff_workspace(&config, &full_manifest).expect("stage miri-diff workspace");
+
+    let dot_anneal = temp_corpus.join(".anneal");
+    let mir_dir = dot_anneal.join("generated/Mir/MiriDiffCorpus");
+    for (name, min_copy_stmts) in cat12_names {
+        let mir = fs::read_to_string(mir_dir.join(format!("{name}.lean")))
+            .unwrap_or_else(|e| panic!("read captured MIR of `{name}`: {e}"));
+        let found = mir.matches("NonDivergingIntrinsic.copyNonOverlapping").count();
+        assert!(
+            found >= min_copy_stmts,
+            "`{name}` must lower at least {min_copy_stmts} `NonDivergingIntrinsic.copyNonOverlapping` \
+             statement(s) in captured MIR (found {found}):\n{mir}"
+        );
+    }
+
+    let targets: Vec<String> = cat12_names
+        .iter()
+        .map(|(name, _)| format!("Verify.MiriDiffCorpus.{name}"))
+        .collect();
+    run_lake_verify_targets(&dot_anneal, &targets)
+        .expect("all 4 Category 12 Verify.MiriDiffCorpus.* modules must kernel-check in Lake");
+
+    verify_miri_diff_ub_locations(&dot_anneal, "MiriDiffCorpus", &cat12_manifest)
+        .expect("Category 12 UB fault spans must match live Miri spans");
 }

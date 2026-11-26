@@ -2758,7 +2758,8 @@ from a `StateRelLM3_1`-related pre-state with `_2 : *mut u64` holding the aligne
 null address `0` (`0 as *mut u64`), real 2-step lockstep execution of
 `_3 = &raw mut _1` and `copy_nonoverlapping(copy _3, copy _2, 0_usize)`: both
 Stage-1 `stepMirFn` (`0 % align_of::<u64>() = 0`, so the zero-byte precheck
-accepts the null destination; matching `Terminators.evalCopyCall`, live Miri, and
+accepts the null destination while no provenance has been exposed, matching
+`Terminators.evalCopyCall`, live Miri, and
 `CoreMemPtrIntrinsicsLM.cm_lm_trusted_null_zero_size_deltas`) and `lean-miri`
 (`checkAlign` accepts address `0`; `checkAndDerefPtr` returns `.ok none` for size
 `0`) step with `.ok true` to `StateRelLM3_1`-related states, leaving `_1 = 42_u64`
