@@ -4600,11 +4600,21 @@ private def ep1VendoredControlHooks :
     ControlHooks Provenance LocalLayout MachineHooks.FrameExtra (PlaceMachine.Machine Unit Unit)
       Unit (Immediate Provenance) :=
   { bodySpan := fun _ => .ok defaultSpanRef
-    returnOperand := fun _ st => (st, .ok .uninit)
-    popFrame := fun _ st =>
+    -- Return value: the ACTUAL `_0` immediate via vendored `Frame.getLocalOperand` (fail closed on
+    -- dead / missing / non-immediate `_0`), not a constant placeholder.
+    returnOperand := fun _ st =>
       match st.stack.currentFrame? with
       | none => (st, .error (.stack .emptyStack))
-      | some fr => ({ st with stack := ⟨st.stack.frames.pop⟩ }, .ok fr)
+      | some fr =>
+        match fr.getLocalOperand 0 with
+        | .error e => (st, .error (.stack e))
+        | .ok (.immediate imm) => (st, .ok imm)
+        | .ok _ => (st, .error (.invalidProgram "ep1 witness: non-immediate return local"))
+    -- Frame pop: vendored `Stack.popFrame`.
+    popFrame := fun _ st =>
+      match st.stack.popFrame with
+      | .error e => (st, .error (.stack e))
+      | .ok (stk, fr) => ({ st with stack := stk }, .ok fr)
     copyReturn := fun _ _ _ st => (st, .ok ())
     cleanupFrame := fun _ _ _ st => (st, .ok .normal)
     unwindTerminate := fun _ _ st => (st, .error (.machineStop "unwind terminate")) }
@@ -4648,7 +4658,23 @@ with NON-OPTIONAL `BorrowTree` extras) and delegates:
   `BorrowTree.performBorrowAccessRange` → `Allocation.readScalar`);
 - `StorageDead` directly to **unmodified vendored `MachineHooks.storageDead`**;
 - terminators and returns directly to **unmodified vendored `ControlFlow.{evalTerminator, returnFromCurrentFrame}`**.
-ZERO custom TB-check instrumentation (`annealTbCheckMemAccess`) is used anywhere in this path! -/
+ZERO custom TB-check instrumentation (`annealTbCheckMemAccess`) is used anywhere in this path!
+
+**Precise trust boundary (what is vendored vs. witness-local).** Vendored and unmodified:
+`Step.step`, `ControlFlow.{evalTerminator, returnFromCurrentFrame}`, `PlaceMachine.{writeMemory,
+readImmediate, accessHooks, memoryAccess}`, `AllocationAccess.getPtrAlloc{,Mut}`,
+`BorrowTree.performBorrowAccessRange`, `MachineHooks.storageDead`, `Frame.getLocalOperand`,
+`Stack.popFrame`. Witness-local (authored, scoped to `ep1BodyTbDerefWriteAndRead`):
+- the `assign` dispatcher (only `(*_i) = const int` and `_d = copy/move (*_i)`; every other shape
+  fails closed with `.unsupported`) and `ep1EvalDerefLocal` (deref place evaluation with a fixed
+  `u32` layout) — vendored `PlaceHooks`/`evalRvalueIntoPlace` wiring is NOT used;
+- `ep1PlaceAccessConfig.resolvePointer` (single-allocation base-address resolution, fail closed on
+  every other pointer) instead of vendored `AllocAddresses.GlobalAddressState.ptrGetAlloc`;
+- `ep1VendoredControlHooks.{copyReturn, cleanupFrame}` are no-ops: the root `.stop` frame's return
+  value is read (vendored `getLocalOperand 0`) but not copied anywhere, and NO
+  `MachineHooks.beforeStackPop` protector release runs (the witness registers no frame protectors).
+Hence these witnesses certify vendored Tree Borrows/memory semantics on the exercised accesses, not
+a full vendored `ExecutionControl.hooks` machine. -/
 def ep1VendoredPlaceStepHooks :
     StepHooks Provenance LocalLayout MachineHooks.FrameExtra (PlaceMachine.Machine Unit Unit)
       Unit (RuntimePlace Provenance) :=
@@ -5898,12 +5924,20 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
   have hStep3Ok :
       Step.step ep1VendoredPlaceStepHooks () stMid2 =
         ({ stMid2 with stack := { frames := #[] } }, .ok true) := by
+    have hOp0 : fr2.getLocalOperand 0 =
+        .ok (.immediate (.scalar (mkMiriU32Scalar 42))) := by
+      obtain ⟨hLt, hEq⟩ := Array.getElem?_eq_some_iff.mp hFr2Loc0
+      unfold Frame.getLocalOperand Frame.getLocal
+      simp only [hLt, ↓reduceDIte, hEq, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+      rfl
     unfold Step.step ep1VendoredPlaceStepHooks ControlFlow.evalTerminator
       ControlFlow.returnFromCurrentFrame ep1VendoredTermHooks ep1VendoredControlHooks
-    simp only [stMid2, Id.run, Stack.currentFrame?, hBack1, hFr2Loc, hFr2Body, hBb0, hS2]
+    simp only [stMid2, Id.run, Stack.currentFrame?, hBack1, hFr2Loc, hFr2Body, hBb0, hS2, hOp0,
+      Stack.popFrame]
     dsimp only [bb0, term0, translateTerminator, translateTerminatorKind]
-    simp only [bind, Bind.bind, pure, Pure.pure, bne_self_eq_false, Bool.false_eq_true,
-      ↓reduceIte, hFr2Cont]
+    simp only [bind, Bind.bind, pure, Pure.pure, Except.pure, bne_self_eq_false, Bool.false_eq_true,
+      Bool.false_and, ↓reduceIte]
+    simp only [hFr2Cont]
     rfl
   have hStep4Done :
       Step.step ep1VendoredPlaceStepHooks () { stMid2 with stack := { frames := #[] } } =
