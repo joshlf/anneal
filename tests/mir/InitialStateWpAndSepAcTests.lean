@@ -463,6 +463,8 @@ theorem ep2_a1_zero_len_reloc_checked_merge_and_ptr_loop_integration :
     (∀ (ms0 msFinal : MachineState) (trace : List MachineState)
        (v0 : View) (r0 : ResTrie ResElem) (w0 : WavefrontWorldV2026),
       MirTraceStepsTo wfPtrReadReclaimLoopBody ms0 trace msFinal →
+      ms0.memory.activeCallee = none →
+      ms0.memory.callStack = [] →
       IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
         wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) trace.length
         (ms0, v0, r0, w0) →
@@ -491,17 +493,18 @@ theorem ep2_a1_zero_len_reloc_checked_merge_and_ptr_loop_integration :
     towerLookupNext_admissible wfTower53210 1 0 rfl
   refine ⟨relocsAvoidRange_zero_len, hGuard.2.2.2.1, rfl, rfl, rfl, ?_,
     hPtrLoop.2.1, hPtrLoop.2.2.1, ?_⟩
-  · intro ms0 msFinal trace v0 r0 w0 hTr hCut
+  · intro ms0 msFinal trace v0 r0 w0 hTr hNoCallee hNoStack hCut
     cases stepMirFn_lockstep_chain_indexedCut wfPtrReadReclaimLoopBody
         wfPolicyTower53210 hPol (cellAuthProp path2 99)
-        wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) rfl hTr v0 r0 w0 hCut with
+        wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) rfl hTr v0 r0 w0 hNoCallee hNoStack
+        hCut with
     | intro wF hwF =>
       cases hwF with
       | intro rF hrF =>
         cases hrF with
         | intro vF hvF =>
           exact ⟨wF, rF, vF, hvF.1, hvF.2.1, hvF.2.2.1, hvF.2.2.2.1, hvF.2.2.2.2.1,
-            hvF.2.2.2.2.2.2⟩
+            hvF.2.2.2.2.2.2.1⟩
   · cases hPtrLoop.2.2.2 with
     | intro wD100 hw =>
       cases hw with
@@ -509,6 +512,37 @@ theorem ep2_a1_zero_len_reloc_checked_merge_and_ptr_loop_integration :
         cases hr with
         | intro _ hv =>
           exact ⟨wD100, hv.1, hv.2.2.1, hv.2.2.2.1, hv.2.2.2.2.1⟩
+
+/-- **Pass B2 Integration (`[propext]`)**: (1) the inductive lockstep theorem is NON-VACUOUS —
+a real 10-step `stepMirFn` trace of `wfPtrReadReclaimLoopBody` (computed by `mirStepTrace`,
+certified by `mirStepTrace_sound`) drives the stage-`10` `wfLoopBridgeWorld0` cut to quiescence
+with root-frame status derived (not assumed) at the final state; (2) the `runCfgSteps` bridge's
+decode conjunct is UNCONDITIONAL: unmodified `decodeValueFromBytes` of the bytes actually
+read back from the drained world's reclaimed lens yields the reclaimed scalar. -/
+theorem ep2_b2_lockstep_trace_and_unconditional_reclaim_decode :
+    (∃ (trace : List MachineState) (msF : MachineState),
+      trace.length = 10 ∧
+      MirTraceStepsTo wfPtrReadReclaimLoopBody wfPtrLoopInitMs10 trace msF ∧
+      msF.memory.globals = wfCNode24Mem0.globals ∧
+      msF.memory.activeCallee = none ∧ msF.memory.callStack = []) ∧
+    (∀ (ms ms' : MachineState),
+      isWavefrontCfgBody wfPtrReadReclaimLoopBody = true →
+      ms.memory.activeCallee = none → ms.memory.callStack = [] →
+      MirSingleStepTo wfPtrReadReclaimLoopBody ms ms' →
+      ms'.memory.activeCallee = none ∧ ms'.memory.callStack = []) := by
+  refine ⟨?_, fun _ _ hB hC hS hStep =>
+    mirSingleStepTo_preserves_rootFrame_of_wavefrontCfgBody hB hC hS hStep⟩
+  cases witness_stepMirFn_lockstep_trace10_ptrLoop_v2026 with
+  | intro tr h1 =>
+    cases h1 with
+    | intro msF h =>
+      cases h.2.2.2 with
+      | intro wF hw =>
+        cases hw with
+        | intro rF hr =>
+          cases hr with
+          | intro vF hv =>
+            exact ⟨tr, msF, h.2.1, h.2.2.1, hv.1, hv.2.2.2.2.2.1, hv.2.2.2.2.2.2⟩
 
 /-- **Unified Episode 2 Cross-Module Master Capstone (`[propext]`)**:
 Bundles the positive and fail-closed negative witnesses from ALL THREE root modules:
@@ -738,6 +772,12 @@ run_cmd do
         ``Anneal.Firewall.Firewall),
       (``Anneal.WavefrontReclaim.WavefrontV2026.stepMirFn_lockstep_chain_indexedCut,
         ``Anneal.WavefrontReclaim.WavefrontV2026.mirWavefrontCutAt_zero_quiescent),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.stepMirFn_lockstep_chain_indexedCut,
+        ``Anneal.WavefrontReclaim.WavefrontV2026.mirSingleStepTo_preserves_rootFrame_of_wavefrontCfgBody),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.mirNodeNext?_sound,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode.emitStep),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.witness_stepMirFn_lockstep_trace10_ptrLoop_v2026,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (``Anneal.WavefrontReclaim.WavefrontV2026.runCfgSteps_wavefrontDrain_indexedCut_bridge,
         ``Anneal.PureMirExec.runCfgSteps),
       (``Anneal.WavefrontReclaim.WavefrontV2026.runCfgSteps_wavefrontDrain_indexedCut_bridge,
