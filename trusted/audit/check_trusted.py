@@ -11,7 +11,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -28,6 +28,56 @@ TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
 CHILD_TIMEOUT_SECS = 180
+# The compiled-environment auditor re-checks every non-toolchain declaration in the kernel (the
+# downstream environment holds ~50k declarations), so it gets a longer, still bounded, envelope.
+OLEAN_CHILD_TIMEOUT_SECS = 900
+# Natively compiled auditor binaries built by this process without `--fast` (never shared between
+# processes; `main()` removes them on exit): `{binary key: path}`.
+_PROCESS_OLEAN_BINARIES: dict[str, Path] = {}
+
+
+def remove_process_binaries() -> None:
+    """Remove the per-process auditor binaries built without `--fast`."""
+    for path in _PROCESS_OLEAN_BINARIES.values():
+        shutil.rmtree(path.parent, ignore_errors=True)
+    _PROCESS_OLEAN_BINARIES.clear()
+
+
+OLEAN_AUDITOR = "trusted/audit/OleanEnvAuditor.lean"
+OLEAN_AUDIT_MODES = ("olean-audit", "olean-downstream-audit")
+ROOT_MANIFEST = "trusted/root-manifest.sha256"
+ROOT_MANIFEST_PHASE = "root-manifest"
+# The trusted checker and the compiled environment auditor must always be covered by the root
+# manifest, next to the root build inputs it already pins.
+ROOT_MANIFEST_REQUIRED = ("trusted/audit/check_trusted.py", OLEAN_AUDITOR)
+ROOT_MANIFEST_REPO_REQUIRED = (
+    "Cargo.toml",
+    "Cargo.lock",
+    "flake.nix",
+    "flake.lock",
+    "trusted/audit/check_trusted.py",
+    OLEAN_AUDITOR,
+)
+OLEAN_RESULT_KEYS = frozenset({
+    "auditor", "schema", "scope", "modules", "loadedModules", "artifactPartsChecked",
+    "auditedDeclarations", "reachableDeclarations", "codegenCompanions", "irDeclarationsChecked",
+    "intrinsicTagsChecked", "kernelTagConfirmations", "constructiveModulesChecked",
+    "specStrengthChecksPassed", "axioms", "localTestAxioms",
+    "kernelConfirmedNativeAxioms", "provisionalNativeAxioms", "replayedDeclarations", "replay",
+    "importMicros", "elapsedMicros"})
+OLEAN_COUNT_KEYS = ("loadedModules", "artifactPartsChecked", "auditedDeclarations", "reachableDeclarations",
+                    "codegenCompanions", "irDeclarationsChecked", "intrinsicTagsChecked",
+                    "kernelTagConfirmations", "constructiveModulesChecked", "specStrengthChecksPassed",
+                    "localTestAxioms", "replayedDeclarations", "importMicros", "elapsedMicros")
+SPEC_CHECK_ALLOWED_KEYS = frozenset({
+    "kind", "claim", "defId", "cert", "requiredCategories",
+    "requireDeterministic", "requireInputSensitive"})
+SPEC_CHECK_SYNTH_KINDS = frozenset({
+    "itemSynth", "statefulItemSynth", "totalItemSynth", "modularItemSynth"})
+# The specification-strength gate trusts the certificate types and `coversCategory` of this module
+# (OleanEnvAuditor matches them by declaring module). Like `Trusted`, it is therefore always compiled
+# from the checkout by this checker and can never be supplied or named by an `--audit-olean` caller.
+SPEC_LIB_MODULE = "Anneal.OleanSpecStrengthAuditor"
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -70,7 +120,8 @@ DOWNSTREAM_TARGETS = [
     ("Anneal.PureLift.MirLiftCoreInterop", "theory/Anneal/PureLift/MirLiftCoreInterop.lean", ["Anneal.BitValidity", "Anneal.MirLiftCore", "Anneal.SepLogicLenses", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Canaries"], "theory"),
     ("Anneal.PureLift.V2026_06_01Bridge", "theory/Anneal/PureLift/V2026_06_01Bridge.lean", ["Anneal.PureLift.MirLiftCoreInterop"], "theory"),
     ("Anneal.PureLift", "theory/Anneal/PureLift.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph", "Anneal.PureLift.SpatialPin", "Anneal.PureLift.Plan", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Adapter", "Anneal.PureLift.Canaries", "Anneal.PureLift.MirLiftCoreInterop", "Anneal.PureLift.V2026_06_01Bridge"], "theory"),
-    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.MirLoops", "Anneal.Scalars", "Anneal.Memory", "Anneal.BitValidity", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect", "Anneal.Rustc.V2026_06_01.TraceCheck", "Anneal.FunctionalTranslation", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore", "Anneal.MirLiftBench", "Anneal.SepLogicLenses", "Anneal.PureLift"], "theory"),
+    ("Anneal.OleanSpecStrengthAuditor", "theory/Anneal/OleanSpecStrengthAuditor.lean", ["Trusted"], "theory"),
+    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.MirLoops", "Anneal.Scalars", "Anneal.Memory", "Anneal.BitValidity", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect", "Anneal.Rustc.V2026_06_01.TraceCheck", "Anneal.FunctionalTranslation", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore", "Anneal.MirLiftBench", "Anneal.SepLogicLenses", "Anneal.PureLift", "Anneal.OleanSpecStrengthAuditor"], "theory"),
     ("Smoke", "examples/Smoke.lean", ["Anneal"], "examples"),
     ("ToyYDiagram", "examples/refinement/ToyYDiagram.lean", ["Anneal.Refinement"], "examples"),
     ("ToyMachine", "examples/step-result/ToyMachine.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass"], "examples"),
@@ -335,6 +386,87 @@ def snapshot(root: Path) -> tuple[dict, dict[str, str]]:
     return inventory, dict(sorted(modules.items()))
 
 
+def _trusted_cache_file(path: Path) -> bool:
+    """A cache entry is used only if it is a regular file owned by this user and writable by no
+    one else; anything else is a cache miss (the gate recomputes, it never trusts the entry)."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+            and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _trusted_cache_dir(path: Path) -> bool:
+    """A cache directory is trusted only if it is a regular directory owned by this user and
+    writable by no one else."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()
+            and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _trusted_cache_tree(cache_root: Path, target: Path, *, is_dir: bool = False) -> bool:
+    """Verify `cache_root`, every intermediate directory down to `target`, and `target` itself
+    contain no symlinks and are owned by this user with no group/world write permission."""
+    try:
+        rel = target.relative_to(cache_root)
+    except ValueError:
+        return False
+    cur = cache_root
+    if not _trusted_cache_dir(cur):
+        return False
+    parts = rel.parts
+    for part in parts[:-1]:
+        cur = cur / part
+        if not _trusted_cache_dir(cur):
+            return False
+    if not parts:
+        return is_dir
+    return _trusted_cache_dir(target) if is_dir else _trusted_cache_file(target)
+
+
+def _ensure_trusted_cache_dir(cache_root: Path, target_dir: Path) -> bool:
+    """Create `cache_root`..`target_dir` with private permissions if absent, and confirm every
+    directory in the chain satisfies `_trusted_cache_dir` (refusing symlinks or shared dirs)."""
+    try:
+        rel = target_dir.relative_to(cache_root)
+    except ValueError:
+        return False
+    try:
+        if not cache_root.exists() and not cache_root.is_symlink():
+            cache_root.mkdir(parents=True, exist_ok=True)
+            cache_root.chmod(0o700)
+        if not _trusted_cache_dir(cache_root):
+            return False
+        cur = cache_root
+        for part in rel.parts:
+            cur = cur / part
+            if not cur.exists() and not cur.is_symlink():
+                cur.mkdir(mode=0o700)
+            if not _trusted_cache_dir(cur):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _canonical_regular(path: Path) -> bool:
+    """True iff `path` is an absolute, canonical, non-symlinked regular file whose containing
+    directory also resolves to itself."""
+    if not path.is_absolute():
+        return False
+    try:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        return path.resolve() == path and path.parent.resolve() == path.parent
+    except OSError:
+        return False
+
+
 class Checker:
     def __init__(
         self,
@@ -356,6 +488,8 @@ class Checker:
         self.cache_dir: Path | None = None
         self.expected_lean_sha: str | None = None
         self._compiled_inspector: Path | None = None
+        self._compiled_olean_auditor: Path | None = None
+        self.root_manifest: dict[str, str] | None = None
         if self.fast:
             env_cache = os.environ.get("ANNEAL_TRUSTED_CACHE_DIR")
             raw_cache = (
@@ -370,7 +504,7 @@ class Checker:
             self.cache_dir = raw_cache.resolve()
             if self.cache_dir == self.checkout or self.checkout in self.cache_dir.parents:
                 raise Failure(2, "admission", f"cache directory must reside outside checkout: {self.cache_dir}")
-        self.stage = Path(tempfile.mkdtemp(prefix="anneal-trusted-", dir=temp_parent))
+        self.stage = Path(tempfile.mkdtemp(prefix="anneal-trusted-", dir=temp_parent)).resolve()
         self.phase, self.execution_began, self.counter = "admission", False, 0
         self.environment = {k: v for k, v in os.environ.items()
                             if not k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_"))}
@@ -378,6 +512,9 @@ class Checker:
         self.artifacts: dict[str, list[list[str]]] = {}
         self.graph: dict = {}
         self.expected_artifacts: dict[str, str] = {}
+        # Set once this checker has compiled `SPEC_LIB_MODULE` from the checkout and audited it
+        # (constructive policy + live model certificates).
+        self.spec_lib_owned = False
         self.last_status = None
 
     def budget(self) -> None:
@@ -385,7 +522,8 @@ class Checker:
         if size > MAX_BYTES:
             raise Failure(2, self.phase, "512 MiB retained-build envelope exceeded")
 
-    def process(self, label: str, arguments: list[str], *, executable: Path | None = None) -> str:
+    def process(self, label: str, arguments: list[str], *, executable: Path | None = None,
+                timeout: int = CHILD_TIMEOUT_SECS) -> str:
         self.phase = label
         self.counter += 1
         stem = self.stage / f"{self.counter:03d}-{label}"
@@ -396,7 +534,7 @@ class Checker:
             with stdout.open("xb") as out, stderr.open("xb") as err:
                 try:
                     completed = subprocess.run(command, cwd=self.stage, env=self.environment,
-                                               stdout=out, stderr=err, timeout=CHILD_TIMEOUT_SECS, check=False)
+                                               stdout=out, stderr=err, timeout=timeout, check=False)
                     code = completed.returncode
                 except subprocess.TimeoutExpired:
                     timed_out = True
@@ -409,7 +547,7 @@ class Checker:
         self.last_status = observation
         self.budget()
         if timed_out:
-            raise Failure(2, label, f"direct Lean child exceeded {CHILD_TIMEOUT_SECS} seconds; no retry")
+            raise Failure(2, label, f"direct Lean child exceeded {timeout} seconds; no retry")
         if code != 0:
             raise Failure(2, label, f"Lean exited {code}; see {stem}.stdout/.stderr")
         return stdout.read_text(encoding="utf-8", errors="strict")
@@ -417,7 +555,7 @@ class Checker:
     def _get_compiled_inspector(self) -> Path | None:
         if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
             return None
-        if self._compiled_inspector is not None and self._compiled_inspector.is_file():
+        if self._compiled_inspector is not None and _trusted_cache_tree(self.cache_dir, self._compiled_inspector):
             return self._compiled_inspector
         leanc = self.lean.parent / "leanc"
         if not leanc.is_file():
@@ -431,11 +569,12 @@ class Checker:
         })
         bin_dir = self.cache_dir / "inspector-bin"
         bin_path = bin_dir / f"TrustedBoundary-{bin_key}"
-        if bin_path.is_file() and os.access(bin_path, os.X_OK):
+        if _trusted_cache_tree(self.cache_dir, bin_path) and os.access(bin_path, os.X_OK):
             self._compiled_inspector = bin_path
             return bin_path
+        if not _ensure_trusted_cache_dir(self.cache_dir, bin_dir):
+            return None
         try:
-            bin_dir.mkdir(parents=True, exist_ok=True)
             tmp_dir = Path(tempfile.mkdtemp(prefix=f"tmp-insp-{bin_key[:12]}-", dir=bin_dir))
         except OSError:
             return None
@@ -473,6 +612,92 @@ class Checker:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def _get_compiled_olean_auditor(self) -> Path | None:
+        """Native `OleanEnvAuditor-<key>` binary, content-addressed by the staged auditor source,
+        `lean`, and `leanc`: cached under `--fast`, otherwise built once per process in a private
+        temporary directory. `None` falls back to running the staged auditor source with
+        `lean --run`, so the gate itself never depends on a cache."""
+        if self.expected_lean_sha is None or not hasattr(self, "olean_auditor_hash"):
+            return None
+        if self._compiled_olean_auditor is not None:
+            root_for_bin = self.cache_dir if (self.fast and self.cache_dir is not None) else self._compiled_olean_auditor.parent
+            if _trusted_cache_tree(root_for_bin, self._compiled_olean_auditor):
+                return self._compiled_olean_auditor
+        leanc = self.lean.parent / "leanc"
+        if not leanc.is_file():
+            return None
+        bin_key = fingerprint({
+            "schema": 1,
+            "tool": "OleanEnvAuditor",
+            "toolchain": TOOLCHAIN,
+            "leanSha256": self.expected_lean_sha,
+            "leancSha256": digest(leanc),
+            "auditorSha256": self.olean_auditor_hash,
+        })
+        created_bin_dir = False
+        if self.fast and self.cache_dir is not None:
+            cache_root = self.cache_dir
+            bin_dir = self.cache_dir / "inspector-bin"
+        else:
+            # Without `--fast` nothing is shared across runs: the binary is built from the staged,
+            # hashed source once per process in a private temporary directory.
+            known = _PROCESS_OLEAN_BINARIES.get(bin_key)
+            if known is not None and _trusted_cache_tree(known.parent, known) and os.access(known, os.X_OK):
+                self._compiled_olean_auditor = known
+                return known
+            try:
+                bin_dir = Path(tempfile.mkdtemp(prefix="anneal-trusted-olean-bin-"))
+                created_bin_dir = True
+            except OSError:
+                return None
+            cache_root = bin_dir
+        bin_path = bin_dir / f"OleanEnvAuditor-{bin_key}"
+        if _trusted_cache_tree(cache_root, bin_path) and os.access(bin_path, os.X_OK):
+            self._compiled_olean_auditor = bin_path
+            return bin_path
+        if not _ensure_trusted_cache_dir(cache_root, bin_dir):
+            if created_bin_dir:
+                shutil.rmtree(bin_dir, ignore_errors=True)
+            return None
+        try:
+            tmp_dir = Path(tempfile.mkdtemp(prefix=f"tmp-olean-{bin_key[:12]}-", dir=bin_dir))
+        except OSError:
+            if created_bin_dir:
+                shutil.rmtree(bin_dir, ignore_errors=True)
+            return None
+        stored = False
+        try:
+            c_path = tmp_dir / "OleanEnvAuditor.c"
+            tmp_bin = tmp_dir / "OleanEnvAuditor"
+            # No status files: the warm-cache contract counts only checked Lean children.
+            res_c = subprocess.run(
+                [str(self.lean), "-c", str(c_path), str(self.olean_auditor)],
+                cwd=self.stage, env=self.environment, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=CHILD_TIMEOUT_SECS, check=False)
+            if res_c.returncode != 0 or not c_path.is_file():
+                return None
+            if digest(self.olean_auditor) != self.olean_auditor_hash:
+                raise Failure(2, "freshness", "staged OleanEnvAuditor changed while compiling")
+            res_bin = subprocess.run(
+                [str(leanc), "-O3", "-rdynamic", "-o", str(tmp_bin), str(c_path)],
+                cwd=self.stage, env=self.environment, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=CHILD_TIMEOUT_SECS, check=False)
+            if res_bin.returncode != 0 or not tmp_bin.is_file():
+                return None
+            tmp_bin.chmod(0o755)
+            os.replace(tmp_bin, bin_path)
+            self._compiled_olean_auditor = bin_path
+            if not self.fast:
+                _PROCESS_OLEAN_BINARIES[bin_key] = bin_path
+            stored = True
+            return bin_path
+        except (OSError, subprocess.SubprocessError):
+            return None
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if created_bin_dir and not stored:
+                shutil.rmtree(bin_dir, ignore_errors=True)
+
     def _inspect_cache_key(self, mode: str, fields: dict) -> str | None:
         if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
             return None
@@ -500,18 +725,62 @@ class Checker:
                 "allowedAxiomModules": fields.get("allowedAxiomModules", []),
                 "sources": source_digests,
             })
-        if mode in ("audit", "downstream-audit"):
-            artifact_hashes = [
-                (
-                    mod,
-                    [
-                        (Path(p).name, self.expected_artifacts.get(p) or digest(Path(p)))
-                        for group in self.artifacts[mod]
-                        for p in group
-                    ],
-                )
-                for mod in sorted(self.artifacts)
-            ]
+        if mode in ("audit", "downstream-audit", *OLEAN_AUDIT_MODES):
+            if mode in OLEAN_AUDIT_MODES:
+                # Never satisfy an OleanEnvAuditor audit from cache if any artifact or source path
+                # is non-canonical, splits base directories, mismatches its module path, swaps
+                # olean/IR groups, or omits an on-disk companion: let the auditor run and reject it.
+                for mod, groups in self.artifacts.items():
+                    if not isinstance(groups, list) or len(groups) != 2:
+                        return None
+                    olean_parts, ir_parts = groups
+                    if len(olean_parts) not in (1, 3) or len(ir_parts) not in (0, 2):
+                        return None
+                    rel_suffix = "/" + mod.replace(".", "/") + ".olean"
+                    if not isinstance(olean_parts[0], str) or not olean_parts[0].endswith(rel_suffix):
+                        return None
+                    base = olean_parts[0][:-6]
+                    expected_olean = PARTS[:3] if len(olean_parts) == 3 else PARTS[:1]
+                    for p, ext in zip(olean_parts, expected_olean):
+                        if p != f"{base}.{ext}" or not _canonical_regular(Path(p)):
+                            return None
+                    for p, ext in zip(ir_parts, PARTS[3:]):
+                        if p != f"{base}.{ext}" or not _canonical_regular(Path(p)):
+                            return None
+                    listed = set(olean_parts) | set(ir_parts)
+                    for ext in PARTS:
+                        cand = Path(f"{base}.{ext}")
+                        if str(cand) not in listed and (cand.exists() or cand.is_symlink()):
+                            return None
+                for _, p in fields.get("sources", []):
+                    if not _canonical_regular(Path(p)):
+                        return None
+                # Staged source paths differ per run; key them by module and content instead.
+                fields = {**fields, "sources": [(m, digest(Path(p))) for m, p in fields.get("sources", [])]}
+                inspector_sha = {"trustedBoundary": inspector_sha,
+                                 "oleanEnvAuditor": getattr(self, "olean_auditor_hash", None)}
+                artifact_hashes = [
+                    (
+                        mod,
+                        [
+                            [(Path(p).name, digest(Path(p))) for p in group]
+                            for group in self.artifacts[mod]
+                        ],
+                    )
+                    for mod in sorted(self.artifacts)
+                ]
+            else:
+                artifact_hashes = [
+                    (
+                        mod,
+                        [
+                            (Path(p).name, self.expected_artifacts.get(p) or digest(Path(p)))
+                            for group in self.artifacts[mod]
+                            for p in group
+                        ],
+                    )
+                    for mod in sorted(self.artifacts)
+                ]
             return fingerprint({
                 "schema": 1,
                 "mode": mode,
@@ -519,7 +788,7 @@ class Checker:
                 "leanSha256": self.expected_lean_sha,
                 "inspectorSha256": inspector_sha,
                 "lock": self.lock,
-                "graph": self.graph,
+                "graph": fields["graph"] if "graph" in fields else self.graph,
                 "artifactHashes": artifact_hashes,
                 "fields": fields,
             })
@@ -579,7 +848,7 @@ class Checker:
             return False
         entry_dir = self.cache_dir / "olean" / cache_key
         meta_path = entry_dir / "meta.json"
-        if not meta_path.is_file():
+        if not _trusted_cache_tree(self.cache_dir, meta_path):
             return False
         try:
             meta = json.loads(meta_path.read_text())
@@ -589,7 +858,7 @@ class Checker:
             return False
         for part, expected_sha in meta.items():
             cached_part = entry_dir / f"artifact.{part}"
-            if not cached_part.is_file() or digest(cached_part) != expected_sha:
+            if not _trusted_cache_tree(self.cache_dir, cached_part) or digest(cached_part) != expected_sha:
                 return False
         output.parent.mkdir(parents=True, exist_ok=True)
         available = {}
@@ -610,11 +879,12 @@ class Checker:
         if not self.fast or self.cache_dir is None:
             return
         olean_root = self.cache_dir / "olean"
+        if not _ensure_trusted_cache_dir(self.cache_dir, olean_root):
+            return
         entry_dir = olean_root / cache_key
-        if entry_dir.exists():
+        if entry_dir.exists() or entry_dir.is_symlink():
             return
         try:
-            olean_root.mkdir(parents=True, exist_ok=True)
             tmp_dir = Path(tempfile.mkdtemp(prefix=f"tmp-{cache_key[:12]}-", dir=olean_root))
         except OSError:
             return
@@ -624,7 +894,7 @@ class Checker:
                 shutil.copyfile(path_str, tmp_dir / f"artifact.{part}")
                 meta[part] = self.expected_artifacts[path_str]
             (tmp_dir / "meta.json").write_text(json.dumps(meta, sort_keys=True))
-            if entry_dir.exists():
+            if entry_dir.exists() or entry_dir.is_symlink():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             else:
                 os.replace(tmp_dir, entry_dir)
@@ -636,7 +906,7 @@ class Checker:
         cache_key = self._inspect_cache_key(mode, fields)
         if cache_key is not None and self.cache_dir is not None:
             cache_file = self.cache_dir / "inspect" / f"{mode}-{cache_key}.json"
-            if cache_file.is_file():
+            if _trusted_cache_tree(self.cache_dir, cache_file):
                 try:
                     cached_result = json.loads(cache_file.read_text())
                     if isinstance(cached_result, dict):
@@ -648,14 +918,21 @@ class Checker:
                    "artifacts": sorted(self.artifacts.items()),
                    "foundation": self.foundation, "graph": self.graph,
                    "axioms": self.lock["axioms"], **fields}
+        if mode in OLEAN_AUDIT_MODES and "graph" in fields and fields["graph"] is None:
+            del request["graph"]
         stem = self.stage / f"request-{self.counter + 1:03d}-{mode}"
         request_path, result_path = Path(str(stem) + ".json"), Path(str(stem) + ".result.json")
         request_path.write_text(json.dumps(request, sort_keys=True))
         self.last_status = None
-        compiled_inspector = self._get_compiled_inspector()
+        olean_mode = mode in OLEAN_AUDIT_MODES
+        compiled_inspector = self._get_compiled_olean_auditor() if olean_mode else self._get_compiled_inspector()
         try:
             if compiled_inspector is not None:
-                self.process(mode, [str(request_path), str(result_path)], executable=compiled_inspector)
+                self.process(mode, [str(request_path), str(result_path)], executable=compiled_inspector,
+                             timeout=OLEAN_CHILD_TIMEOUT_SECS if olean_mode else CHILD_TIMEOUT_SECS)
+            elif olean_mode:
+                self.process(mode, ["-j1", "--run", str(self.olean_auditor), str(request_path), str(result_path)],
+                             timeout=OLEAN_CHILD_TIMEOUT_SECS)
             else:
                 self.process(mode, ["-j1", "-M2048", "--run", str(self.inspector), str(request_path), str(result_path)])
         except Failure as failure:
@@ -680,14 +957,14 @@ class Checker:
         self.validate_result(mode, result, fields)
         if cache_key is not None and self.cache_dir is not None:
             inspect_dir = self.cache_dir / "inspect"
-            try:
-                inspect_dir.mkdir(parents=True, exist_ok=True)
-                tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"tmp-{mode}-", dir=inspect_dir)
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
-                    json.dump(result, handle, sort_keys=True)
-                os.replace(tmp_name, inspect_dir / f"{mode}-{cache_key}.json")
-            except OSError:
-                pass
+            if _ensure_trusted_cache_dir(self.cache_dir, inspect_dir):
+                try:
+                    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"tmp-{mode}-", dir=inspect_dir)
+                    with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                        json.dump(result, handle, sort_keys=True)
+                    os.replace(tmp_name, inspect_dir / f"{mode}-{cache_key}.json")
+                except OSError:
+                    pass
         return result
 
     def validate_result(self, mode, result, fields):
@@ -744,14 +1021,214 @@ class Checker:
                     and all(type(result[k]) is int and result[k] >= 0
                             for k in ("replayedDeclarations", "claimTheoremsChecked", "localTestAxioms")),
                     mode, "invalid downstream-audit observation")
+        elif mode in OLEAN_AUDIT_MODES:
+            require(set(result) == OLEAN_RESULT_KEYS
+                    and result["auditor"] == "OleanEnvAuditor" and result["schema"] == 1
+                    and result["scope"] == fields["scope"]
+                    and result["replay"] is True
+                    and result["modules"] == sorted(fields["modules"])
+                    and all(type(result[k]) is int and result[k] >= 0 for k in OLEAN_COUNT_KEYS)
+                    and result["auditedDeclarations"] >= result["replayedDeclarations"]
+                    and result["constructiveModulesChecked"] == len(fields.get("constructiveModules", []))
+                    and result["specStrengthChecksPassed"] == len(fields.get("specStrengthChecks", []))
+                    and result["provisionalNativeAxioms"] == []
+                    and result["kernelConfirmedNativeAxioms"] == []
+                    and isinstance(result["axioms"], list)
+                    and all(isinstance(n, str) and n in {a[0] for a in self.lock["axioms"]} for n in result["axioms"])
+                    and (fields.get("allowClassicalChoice", True) or "Classical.choice" not in result["axioms"])
+                    and len(result["axioms"]) == len(set(result["axioms"]))
+                    and (result["localTestAxioms"] == 0 or bool(fields.get("localAxiomModules"))),
+                    mode, "invalid compiled-environment audit observation")
         else:
             raise Failure(2, mode, "unknown inspector result mode")
 
+    def olean_audit(self, mode: str, **fields) -> dict:
+        """Run the compiled-environment auditor (`OleanEnvAuditor`) fail-closed: any violation,
+        provisional native axiom, missing artifact, or malformed verdict is a `Failure`."""
+        if mode not in OLEAN_AUDIT_MODES:
+            raise Failure(2, mode, "unknown compiled-environment audit mode")
+        regular(self.olean_auditor, "tool-snapshot")
+        result = self.inspect(mode, **fields)
+        if result.get("replay") is not True or result.get("provisionalNativeAxioms") != []:
+            raise Failure(2, mode, "incomplete compiled-environment audit evidence")
+        return result
+
+    def audit_olean_request(self, request: dict) -> dict:
+        """`--audit-olean`: audit caller-supplied compiled modules with the trust-gating policy.
+
+        Call after `tool_admission()` (and after `run()` when the audited modules import
+        `Trusted`: the checker's own audited `Trusted` artifacts are then added to the roots and
+        modules; callers can neither supply nor name `Trusted` modules). `request` names `roots`
+        and the exact other non-toolchain `modules`, their `artifacts`
+        (`[[module, [[olean parts], [ir parts]]], ...]`) and
+        optionally `graph`, `localAxiomModules`, `claimModules`, `statementForbidden`,
+        `statementUnfold`, `sources` and `scope`. Provisional native evaluation and extra
+        toolchain roots cannot be requested here."""
+        allowed = {"roots", "modules", "artifacts", "graph", "localAxiomModules", "claimModules",
+                   "statementForbidden", "statementUnfold", "sources", "scope",
+                   "allowClassicalChoice", "constructiveModules", "specStrengthChecks"}
+        phase = "olean-audit"
+        require(isinstance(request, dict) and set(request) <= allowed
+                and {"roots", "modules", "artifacts"} <= set(request), phase, "malformed --audit-olean request")
+        for key in ("roots", "modules", "localAxiomModules", "claimModules", "statementForbidden",
+                    "statementUnfold", "constructiveModules"):
+            value = request.get(key, [])
+            require(isinstance(value, list) and all(isinstance(m, str) and m for m in value), phase,
+                    f"malformed --audit-olean field {key}")
+        allow_classical = request.get("allowClassicalChoice", True)
+        require(type(allow_classical) is bool, phase, "malformed --audit-olean field allowClassicalChoice")
+        constructive_mods = request.get("constructiveModules", [])
+        require(len(constructive_mods) == len(set(constructive_mods)), phase,
+                "malformed --audit-olean field constructiveModules")
+        spec_checks = request.get("specStrengthChecks", [])
+        require(isinstance(spec_checks, list), phase, "malformed --audit-olean field specStrengthChecks")
+        for entry in spec_checks:
+            require(isinstance(entry, dict) and set(entry) <= SPEC_CHECK_ALLOWED_KEYS
+                    and {"kind", "cert"} <= set(entry)
+                    and isinstance(entry["kind"], str) and isinstance(entry["cert"], str) and bool(entry["cert"]),
+                    phase, "malformed --audit-olean specStrengthChecks entry")
+            if entry["kind"] == "claim":
+                require("claim" in entry and "defId" not in entry
+                        and isinstance(entry["claim"], str) and bool(entry["claim"]),
+                        phase, "malformed --audit-olean claim specStrengthChecks entry")
+            elif entry["kind"] in SPEC_CHECK_SYNTH_KINDS:
+                require("defId" in entry and "claim" not in entry
+                        and isinstance(entry["defId"], str) and bool(entry["defId"]),
+                        phase, "malformed --audit-olean synth specStrengthChecks entry")
+            else:
+                raise Failure(2, phase, f"unsupported --audit-olean specStrengthChecks kind: {entry['kind']}")
+            if "requiredCategories" in entry:
+                cats = entry["requiredCategories"]
+                require(isinstance(cats, list) and all(isinstance(c, str) and bool(c) for c in cats),
+                        phase, "malformed --audit-olean requiredCategories")
+            for bkey in ("requireDeterministic", "requireInputSensitive"):
+                if bkey in entry:
+                    require(type(entry[bkey]) is bool, phase, f"malformed --audit-olean {bkey}")
+        require(bool(request["roots"]) and len(request["roots"]) == len(set(request["roots"])), phase,
+                "malformed --audit-olean field roots")
+        require(bool(request["modules"]) and len(request["modules"]) == len(set(request["modules"])), phase,
+                "malformed --audit-olean field modules")
+        artifacts = request["artifacts"]
+        require(isinstance(artifacts, list), phase, "malformed --audit-olean artifacts")
+        # `Trusted` modules are compiled from the checkout by this checker (`run()`), never taken
+        # from the caller: a caller-supplied `Trusted` could redefine `VerificationResult`.
+        trusted_names = set(getattr(self, "modules", {}))
+
+        def is_trusted_name(name: str) -> bool:
+            return name in trusted_names or name == "Trusted" or name.startswith("Trusted.")
+
+        named = [*request["roots"], *request["modules"],
+                 *request.get("localAxiomModules", []), *request.get("claimModules", []),
+                 *constructive_mods,
+                 *(e[0] for e in artifacts if isinstance(e, list) and e and isinstance(e[0], str)),
+                 *(s[0] for s in (request.get("sources") if isinstance(request.get("sources"), list) else [])
+                   if isinstance(s, list) and s and isinstance(s[0], str)),
+                 *(request.get("graph", {}) if isinstance(request.get("graph"), dict) else {})]
+        spoofed = sorted({n for n in named if is_trusted_name(n)})
+        if spoofed:
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name Trusted modules "
+                                    f"({', '.join(spoofed)}); they come from the checker's own compilation")
+        # The certificate types the spec-strength gate recognizes live in `SPEC_LIB_MODULE`, and the
+        # auditor identifies them by that module name: a caller-supplied module of that name (or a
+        # submodule under it) could declare `SpecStrengthCert` as a one-field structure and
+        # "certify" a vacuous claim.
+        spec_spoofed = sorted({n for n in named if n == SPEC_LIB_MODULE or n.startswith(SPEC_LIB_MODULE + ".")})
+        if spec_spoofed:
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name {SPEC_LIB_MODULE} "
+                                    f"({', '.join(spec_spoofed)}); it comes from the checker's own compilation")
+        spec_lib_owned = bool(self.spec_lib_owned and SPEC_LIB_MODULE in self.artifacts)
+        if spec_checks and not spec_lib_owned:
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] specStrengthChecks need the checker's own compiled "
+                                    f"{SPEC_LIB_MODULE} (compile_spec_library()); none is available")
+        sources = request.get("sources", [])
+        require(isinstance(sources, list) and all(
+            isinstance(s, list) and len(s) == 2 and all(isinstance(x, str) and x for x in s) for s in sources)
+            and len({s[0] for s in sources}) == len(sources),
+            phase, "malformed --audit-olean sources")
+        source_hashes: dict[str, str] = {}
+        for _, path in sources:
+            regular(Path(path), phase)
+            if not _canonical_regular(Path(path)):
+                raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical source path: {path}")
+            source_hashes[path] = digest(Path(path))
+        scope = request.get("scope", "request")
+        require(isinstance(scope, str) and bool(scope), phase, "malformed --audit-olean scope")
+        if "graph" in request:
+            graph = request["graph"]
+            require(valid_graph(graph), phase, "malformed --audit-olean graph")
+            for mod, edges in graph.items():
+                if mod in self.foundation and edges != self.lock["graph"].get(mod):
+                    raise Failure(1, phase, f"[graphMismatch] --audit-olean cannot override locked foundation DAG for {mod}")
+            merged_graph: dict | None = {**self.graph, **graph}
+        else:
+            merged_graph = None
+        compiled_trusted = [m for m in getattr(self, "modules", {}) if m in self.artifacts]
+        # The checker's own spec library joins every request once compiled (callers may import it),
+        # always under the constructive policy.
+        compiled_own = [*compiled_trusted, *([SPEC_LIB_MODULE] if spec_lib_owned else [])]
+        owned_constructive = [SPEC_LIB_MODULE] if spec_lib_owned else []
+        # When `Trusted` was compiled by this checker (`run()`), `Trusted` itself legitimately uses
+        # `Classical.choice`. Setting `allowClassicalChoice=False` on a caller request therefore
+        # enforces the constructive policy on all caller `modules` (including their full transitive
+        # dependency closure into `Trusted`), rather than rejecting unused `Classical.choice`
+        # declarations inside `Trusted` (`A1-5a`).
+        if not allow_classical and compiled_trusted:
+            effective_allow_classical = True
+            effective_constructive = list(dict.fromkeys([*request["modules"], *constructive_mods, *owned_constructive]))
+        else:
+            effective_allow_classical = allow_classical
+            effective_constructive = list(dict.fromkeys([*constructive_mods, *owned_constructive]))
+        saved_artifacts = dict(self.artifacts)
+        saved_expected = dict(self.expected_artifacts)
+        saved_graph = dict(self.graph)
+        caller_hashes: dict[str, str] = {}
+        try:
+            for entry in artifacts:
+                require(isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str) and bool(entry[0])
+                        and entry[0] not in self.artifacts and isinstance(entry[1], list) and len(entry[1]) == 2
+                        and all(isinstance(g, list) and all(isinstance(p, str) and os.path.isabs(p) for p in g)
+                                for g in entry[1]), phase, "malformed --audit-olean artifact entry")
+                for group in entry[1]:
+                    for path in group:
+                        regular(Path(path), phase)
+                        if not _canonical_regular(Path(path)):
+                            raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical artifact path: {path}")
+                        h = digest(Path(path))
+                        self.expected_artifacts[path] = h
+                        caller_hashes[path] = h
+                self.artifacts[entry[0]] = [list(entry[1][0]), list(entry[1][1])]
+            if merged_graph is not None:
+                self.graph = merged_graph
+            verdict = self.olean_audit(
+                "olean-audit", scope=scope, roots=[*request["roots"], *compiled_own],
+                modules=[*request["modules"], *compiled_own],
+                graph=merged_graph,
+                allowClassicalChoice=effective_allow_classical,
+                constructiveModules=effective_constructive,
+                specStrengthChecks=spec_checks,
+                localAxiomModules=request.get("localAxiomModules", []),
+                claimModules=request.get("claimModules", []),
+                statementForbidden=request.get("statementForbidden", []),
+                statementUnfold=request.get("statementUnfold", []),
+                sources=[tuple(s) for s in sources])
+            for path, expected in (*caller_hashes.items(), *source_hashes.items()):
+                regular(Path(path), "freshness")
+                if digest(Path(path)) != expected:
+                    raise Failure(2, "freshness", f"caller input changed during check: {path}")
+            return verdict
+        finally:
+            self.artifacts = saved_artifacts
+            self.expected_artifacts = saved_expected
+            self.graph = saved_graph
+
     def tool_admission(self) -> None:
+        # The root manifest is verified before any Lean child runs.
+        self.root_manifest = verify_root_manifest(self.checkout)
         self.initial, self.modules = snapshot(self.source)
         self.tool_paths = [
             self.checkout / "trusted/audit/check_trusted.py",
             self.checkout / "trusted/audit/TrustedBoundary.lean",
+            self.checkout / OLEAN_AUDITOR,
         ]
         for path in self.tool_paths:
             regular(path, "tool-snapshot")
@@ -762,6 +1239,14 @@ class Checker:
         # process can mutate them in place; freshness() still re-hashes them.
         make_read_only(self.inspector)
         self.inspector_hash = digest(self.inspector)
+        # The compiled-environment auditor is required unconditionally: there is no code path
+        # that skips it when the source is absent (`regular` above already failed closed).
+        self.olean_auditor = self.stage / "OleanEnvAuditor.lean"
+        shutil.copyfile(self.tool_paths[2], self.olean_auditor)
+        make_read_only(self.olean_auditor)
+        self.olean_auditor_hash = digest(self.olean_auditor)
+        if self.olean_auditor_hash != self.tool_hashes[OLEAN_AUDITOR]:
+            raise Failure(2, "tool-snapshot", "OleanEnvAuditor changed while staging")
         source_copy = self.stage / "source"
         source_copy.mkdir()
         for relative, entry in self.initial.items():
@@ -873,6 +1358,10 @@ class Checker:
             raise Failure(2, "freshness", "checker/policy inputs changed during check")
         if digest(self.inspector) != self.inspector_hash:
             raise Failure(2, "freshness", "staged inspector changed")
+        if digest(self.olean_auditor) != self.olean_auditor_hash:
+            raise Failure(2, "freshness", "staged OleanEnvAuditor changed")
+        if verify_root_manifest(self.checkout) != self.root_manifest:
+            raise Failure(2, "freshness", "root manifest coverage changed during check")
         for path, expected in self.expected_artifacts.items():
             regular(Path(path), "freshness")
             if digest(Path(path)) != expected:
@@ -941,8 +1430,11 @@ class Checker:
                     "preflight",
                     f"project imports of {module} ({actual_proj}) differ from DOWNSTREAM_TARGETS ({expected_proj})",
                 )
+        # `--fast` elaborates up to four declarations at once (`-j4`, `Elab.async`), so its peak heap
+        # is several sequential peaks: `-M2048` makes the kernel abort with "excessive memory
+        # consumption" on large theory modules that the sequential `-j1 -M2048` path accepts.
         downstream_flags = (
-            ["-j4", "-M2048", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
+            ["-j4", "-M4096", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
             if self.fast
             else ["-j1", "-M2048", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
         )
@@ -994,8 +1486,82 @@ class Checker:
             claimModules=[m for m, _, _, r in targets if r == "claim"],
             testModules=[m for m, _, _, r in targets if r == "test"],
         ))
+        downstream_modules = [m for m, _, _, _ in targets]
+        has_spec_lib = SPEC_LIB_MODULE in downstream_modules
+        constructive_mods = [SPEC_LIB_MODULE] if has_spec_lib else []
+        downstream_spec_checks = (
+            [
+                {
+                    "kind": "itemSynth",
+                    "defId": "anneal_model::fxfs_storage_boundary::vmo_subslice_bounds_valid",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fxfsModelItemMultiCert",
+                    "requiredCategories": [
+                        "wrongReturn", "wrapOverflow", "truncatedLength",
+                        "swappedByteOrder", "offByOneScalar",
+                    ],
+                },
+                {
+                    "kind": "itemSynth",
+                    "defId": "anneal_model::fxfs_storage_boundary::vmo_subslice_bounds_valid",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fxfsModelItemDetCert",
+                    "requireDeterministic": True,
+                },
+                {
+                    "kind": "itemSynth",
+                    "defId": "anneal_model::fxfs_storage_boundary::vmo_subslice_bounds_valid",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fxfsModelItemInputSensitiveCert",
+                    "requireInputSensitive": True,
+                },
+                {
+                    "kind": "modularItemSynth",
+                    "defId": "anneal_model::fuchsia_usercopy::usercopy_copyin_bracketed",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fuchsiaModelModularItemMultiCert",
+                    "requiredCategories": [
+                        "wrongBranchTag", "truncatedLength",
+                        "offByOneScalar", "unpreservedFrame",
+                    ],
+                },
+                {
+                    "kind": "modularItemSynth",
+                    "defId": "anneal_model::fuchsia_usercopy::usercopy_copyin_bracketed",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fuchsiaModelModularItemDetCert",
+                    "requireDeterministic": True,
+                },
+                {
+                    "kind": "modularItemSynth",
+                    "defId": "anneal_model::fuchsia_usercopy::usercopy_copyin_bracketed",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fuchsiaModelModularItemInputSensitiveCert",
+                    "requireInputSensitive": True,
+                },
+            ]
+            if has_spec_lib
+            else []
+        )
+        result["oleanAudit"] = self.olean_audit(
+            "olean-downstream-audit", scope="downstream",
+            roots=[*self.modules, *downstream_modules], modules=[*self.modules, *downstream_modules],
+            constructiveModules=constructive_mods,
+            specStrengthChecks=downstream_spec_checks,
+            localAxiomModules=allowed_axiom_mods,
+            claimModules=[m for m, _, _, r in targets if r == "claim"],
+            statementForbidden=[m for m, _, _, r in targets if r == "theory"],
+            statementUnfold=[m for m, _, _, r in targets if r in ("claim", "examples", "test")],
+            sources=[*((n, str(self.source_copy / p)) for n, p in self.modules.items()),
+                     *((m, str(copies[m])) for m in downstream_modules)])
         result["waiverVacuityAudit"] = waiver_audit
+        if has_spec_lib:
+            self.spec_lib_owned = True
         return result
+
+    def compile_spec_library(self) -> dict:
+        """Compile `SPEC_LIB_MODULE` from the checkout against the audited `Trusted` artifacts and
+        audit it (TrustedBoundary downstream audit, constructive OleanEnvAuditor policy, and the live
+        model certificates). Call after `run()`; `--audit-olean` requests with `specStrengthChecks`
+        are then judged against this copy, never a caller-supplied one."""
+        target = [t for t in DOWNSTREAM_TARGETS if t[0] == SPEC_LIB_MODULE]
+        if len(target) != 1 or any(n != "Trusted" and not n.startswith("Trusted.") for n in target[0][2]):
+            raise Failure(2, "downstream-input", f"{SPEC_LIB_MODULE} must be a DOWNSTREAM_TARGETS entry importing only Trusted")
+        return self.compile_and_audit_downstream(target)
 
     def run(self, *, check_downstream: bool = False) -> dict:
         base_hashes = (
@@ -1076,6 +1642,9 @@ class Checker:
         report = self.inspect("audit", trusted=list(self.modules))
         if report.get("graph") != self.graph or report.get("replay") is not True:
             raise Failure(2, "audit", "incomplete final audit evidence")
+        report["oleanAudit"] = self.olean_audit(
+            "olean-audit", scope="trusted", roots=list(self.modules), modules=list(self.modules),
+            sources=[(n, str(self.source_copy / p)) for n, p in self.modules.items()])
         if check_downstream:
             downstream = self.compile_and_audit_downstream()
             report["downstream"] = downstream
@@ -7800,11 +8369,12 @@ def make_tree_writable(root: Path) -> None:
 
 def tcb_snapshot_files(root: Path) -> dict[str, Path]:
     """TCB files compared by `--base-snapshot`, keyed by checkout-relative POSIX path:
-    `trusted/audit/{check_trusted.py,TrustedBoundary.lean}`, every non-doc file or symlink
-    under `trusted/lean/`, and `trusted/rustc-capture/Cargo.toml`."""
+    `trusted/audit/{check_trusted.py,TrustedBoundary.lean,OleanEnvAuditor.lean}`,
+    `trusted/root-manifest.sha256`, every non-doc file or symlink under `trusted/lean/`, and
+    `trusted/rustc-capture/Cargo.toml`."""
     out: dict[str, Path] = {}
-    for rel in ("trusted/audit/check_trusted.py", "trusted/audit/TrustedBoundary.lean",
-                "trusted/lean/lean-toolchain", "trusted/rustc-capture/Cargo.toml"):
+    for rel in ("trusted/audit/check_trusted.py", "trusted/audit/TrustedBoundary.lean", OLEAN_AUDITOR,
+                ROOT_MANIFEST, "trusted/lean/lean-toolchain", "trusted/rustc-capture/Cargo.toml"):
         path = root / rel
         if path.exists() or path.is_symlink():
             out[rel] = path
@@ -7825,6 +8395,73 @@ def tcb_snapshot_files(root: Path) -> dict[str, Path]:
                     continue
                 out[rel] = fpath
     return out
+
+
+def verify_root_manifest(checkout: Path) -> dict[str, str] | None:
+    """Verify `trusted/root-manifest.sha256` against the checkout before any Lean child runs.
+
+    The manifest is required whenever it exists or the checkout carries the repository markers
+    (`flake.nix` and `lakefile.toml`); a bare fixture without either has nothing to verify and
+    returns `None`. Every entry must be a canonical relative path naming a regular, non-symlinked
+    file inside the checkout (no symlinked parent directory either) whose SHA-256 matches; the
+    entries must be unique and must include `ROOT_MANIFEST_REQUIRED`. Any violation is
+    `Failure(1, "root-manifest", ...)`. Returns `{path: sha256}` of the covered files.
+    """
+    phase = ROOT_MANIFEST_PHASE
+    manifest = checkout / ROOT_MANIFEST
+    has_markers = any((checkout / m).exists() or (checkout / m).is_symlink()
+                      for m in ("flake.nix", "lakefile.toml"))
+    if not (manifest.exists() or manifest.is_symlink()):
+        if has_markers:
+            raise Failure(1, phase, f"missing {ROOT_MANIFEST} in a repository checkout")
+        return None
+    root = checkout.resolve()
+    for component in (checkout / "trusted", manifest):
+        if component.is_symlink():
+            raise Failure(1, phase, f"symlinked root-manifest path: {component}")
+    try:
+        mode = manifest.lstat().st_mode
+        raw = manifest.read_bytes()
+    except OSError as error:
+        raise Failure(1, phase, f"cannot read {ROOT_MANIFEST}: {error}") from error
+    if not stat.S_ISREG(mode):
+        raise Failure(1, phase, f"{ROOT_MANIFEST} is not a regular file")
+    covered: dict[str, str] = {}
+    for number, line in enumerate(raw.splitlines(), 1):
+        if line.startswith(b"#") or not line.strip():
+            continue
+        match = re.fullmatch(rb"([0-9a-f]{64})( [ *])([^\r\n]+)", line)
+        if match is None:
+            raise Failure(1, phase, f"{ROOT_MANIFEST}:{number}: malformed checksum entry")
+        try:
+            name = match[3].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Failure(1, phase, f"{ROOT_MANIFEST}:{number}: non-UTF-8 path") from error
+        rel = PurePosixPath(name)
+        if rel.is_absolute() or ".." in rel.parts or str(rel) != name or name == ROOT_MANIFEST:
+            raise Failure(1, phase, f"{ROOT_MANIFEST}:{number}: expected a canonical relative path: {name!r}")
+        if name in covered:
+            raise Failure(1, phase, f"{ROOT_MANIFEST}:{number}: duplicate covered file: {name}")
+        path = checkout
+        for part in rel.parts:
+            path = path / part
+            if path.is_symlink():
+                raise Failure(1, phase, f"covered file traverses a symlink: {name}")
+        try:
+            file_mode = path.lstat().st_mode
+        except OSError as error:
+            raise Failure(1, phase, f"missing covered file: {name}") from error
+        if not stat.S_ISREG(file_mode) or not path.resolve().is_relative_to(root):
+            raise Failure(1, phase, f"covered file is not a regular file inside the checkout: {name}")
+        actual = digest(path)
+        if actual != match[1].decode("ascii"):
+            raise Failure(1, phase, f"root-manifest drift: {name} does not match its pinned SHA-256")
+        covered[name] = actual
+    required = ROOT_MANIFEST_REPO_REQUIRED if has_markers else ROOT_MANIFEST_REQUIRED
+    missing = [name for name in required if name not in covered]
+    if missing:
+        raise Failure(1, phase, f"{ROOT_MANIFEST} does not cover required TCB files: {', '.join(missing)}")
+    return covered
 
 
 def verify_base_snapshot(checkout: Path, snapshot: Path, expected_drift=()) -> dict[str, str]:
@@ -7885,6 +8522,13 @@ def waiver_vacuity_gate(checkout: Path) -> dict[str, dict[str, int]]:
 
 
 def main() -> int:
+    try:
+        return _main()
+    finally:
+        remove_process_binaries()
+
+
+def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lean", type=Path, help="absolute path to an already installed pinned Lean executable")
     parser.add_argument("--self-test", action="store_true", help="run the bounded regression fixtures")
@@ -7897,6 +8541,9 @@ def main() -> int:
                              "(default: $ANNEAL_TRUSTED_BASE_SNAPSHOT); any other TCB drift fails")
     parser.add_argument("--expected-tcb-drift", action="append", default=[], metavar="RELPATH",
                         help="checkout-relative TCB path allowed to differ from --base-snapshot (repeatable)")
+    parser.add_argument("--audit-olean", type=Path, metavar="REQUEST",
+                        help="audit the compiled modules named by a JSON request with OleanEnvAuditor "
+                             "(trust-gating policy) and print its verdict")
     args = parser.parse_args()
     checkout = Path(__file__).resolve().parent.parent.parent
     if args.lean is not None and not args.lean.is_absolute():
@@ -7910,6 +8557,7 @@ def main() -> int:
         base_snapshot = Path(os.environ["ANNEAL_TRUSTED_BASE_SNAPSHOT"])
     if args.audit_vacuity:
         try:
+            verify_root_manifest(checkout)
             if base_snapshot is not None:
                 verify_base_snapshot(checkout, base_snapshot, tuple(args.expected_tcb_drift))
             summary = waiver_vacuity_gate(checkout)
@@ -7920,6 +8568,46 @@ def main() -> int:
             print(f"Trusted check failed (waiver-pin): {error}", file=sys.stderr)
             return 2
         print(f"PASS: waiver pins and annotated-claim vacuity; {json.dumps(summary, sort_keys=True)}")
+        return 0
+    if args.audit_olean is not None:
+        try:
+            if base_snapshot is not None:
+                verify_base_snapshot(checkout, base_snapshot, tuple(args.expected_tcb_drift))
+            request = json.loads(args.audit_olean.read_text())
+        except Failure as error:
+            print(f"Trusted check failed ({error.phase}): {error}", file=sys.stderr)
+            return error.code
+        except (OSError, ValueError) as error:
+            print(f"Trusted check failed (olean-audit): cannot read request: {error}", file=sys.stderr)
+            return 2
+        try:
+            olean_checker = Checker(checkout, args.lean, fast=args.fast, cache_dir=args.cache_dir)
+        except (Failure, OSError) as error:
+            print(f"Trusted check failed (admission): {error}", file=sys.stderr)
+            return error.code if isinstance(error, Failure) else 2
+        try:
+            # Compile and audit `Trusted` from the checkout first: requests are audited against
+            # the checker's own `Trusted` artifacts, never caller-supplied ones.
+            olean_checker.run()
+            spec_lib_rel = next((p for m, p, _, _ in DOWNSTREAM_TARGETS if m == SPEC_LIB_MODULE), None)
+            has_checkout_spec_lib = spec_lib_rel is not None and (checkout / spec_lib_rel).is_file()
+            if (isinstance(request, dict) and request.get("specStrengthChecks")) or has_checkout_spec_lib:
+                # Spec-strength checks (and any caller importing `SPEC_LIB_MODULE`) are judged
+                # against the checkout's own specification-strength library, compiled and audited here.
+                olean_checker.compile_spec_library()
+            verdict = olean_checker.audit_olean_request(request)
+            olean_checker.freshness()
+        except (Failure, OSError, ValueError, KeyError, TypeError) as error:
+            code = error.code if isinstance(error, Failure) else 2
+            phase = error.phase if isinstance(error, Failure) else olean_checker.phase
+            print(f"Trusted check failed ({phase}): {error}\npreserved logs: {olean_checker.stage}", file=sys.stderr)
+            return code
+        except KeyboardInterrupt:
+            print(f"Trusted check interrupted; preserved logs: {olean_checker.stage}", file=sys.stderr)
+            return 2
+        print(json.dumps(verdict, indent=2, sort_keys=True))
+        make_tree_writable(olean_checker.stage)
+        shutil.rmtree(olean_checker.stage)
         return 0
     try:
         checker = Checker(checkout, args.lean, fast=args.fast, cache_dir=args.cache_dir,
@@ -7948,7 +8636,13 @@ def main() -> int:
           f"{report['kernelDeclarations']} Trusted kernel declarations; "
           f"{downstream.get('replayedDeclarations', 0)} total replayed declarations; "
           f"{downstream.get('claimTheoremsChecked', 0)} claim theorem statements origin-checked; "
-          f"axioms={report['axioms']}\nSource {report['sourceSha256']}; tools/policy {report['toolsSha256']}\n"
+          f"axioms={report['axioms']}\n"
+          f"OleanEnvAuditor: {report['oleanAudit']['auditedDeclarations']} Trusted / "
+          f"{downstream.get('oleanAudit', {}).get('auditedDeclarations', 0)} downstream declarations audited from "
+          f"compiled artifacts; {downstream.get('oleanAudit', {}).get('intrinsicTagsChecked', 0)} compiler-intrinsic tags, "
+          f"{downstream.get('oleanAudit', {}).get('kernelTagConfirmations', 0)} kernel-confirmed tag equations, "
+          f"replay={report['oleanAudit']['replay'] and downstream.get('oleanAudit', {}).get('replay', False)}\n"
+          f"Source {report['sourceSha256']}; tools/policy {report['toolsSha256']}\n"
           f"Waiver pins and annotated-claim vacuity: {staged_lean} staged Lean files, "
           f"{audited.get('rustcCapture', {}).get('rustFiles', 0)} trusted/rustc-capture Rust files\n"
           f"{report['toolchain']}")
