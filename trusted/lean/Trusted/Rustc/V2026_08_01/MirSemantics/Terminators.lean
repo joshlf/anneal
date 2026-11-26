@@ -2002,6 +2002,36 @@ inductive RustIntrinsicKind : Type where
   | sizeOfVal : RustIntrinsicKind
   /-- `core::intrinsics::align_of_val` dynamic or static pointee alignment. -/
   | alignOfVal : RustIntrinsicKind
+  /-- `core::intrinsics::copy_nonoverlapping` call form: copy `count` elements
+  between non-overlapping regions (`evalCopyNonOverlappingCall`). -/
+  | copyNonOverlapping : RustIntrinsicKind
+  /-- `core::intrinsics::write_bytes` call form: set the bytes of `count`
+  elements to a byte value (`evalWriteBytesCall`). -/
+  | writeBytes : RustIntrinsicKind
+  /-- `core::intrinsics::copy` call form: overlapping `memmove` copy of `count`
+  elements (`evalCopyCall`). -/
+  | copy : RustIntrinsicKind
+  /-- `core::intrinsics::compare_bytes` unsigned lexicographic byte comparison
+  (`evalCompareBytesCall`). -/
+  | compareBytes : RustIntrinsicKind
+  /-- `core::intrinsics::raw_eq` raw bytewise equality of two `&T` referents
+  (`evalRawEqCall`). -/
+  | rawEq : RustIntrinsicKind
+  /-- `core::intrinsics::typed_swap_nonoverlapping` typed non-overlapping swap
+  with validity enforcement and padding reset (`evalTypedSwapNonOverlappingCall`). -/
+  | typedSwapNonOverlapping : RustIntrinsicKind
+  /-- `core::intrinsics::ptr_offset_from` signed element distance within an
+  allocation (`evalPtrOffsetFromCall ... false`). -/
+  | ptrOffsetFrom : RustIntrinsicKind
+  /-- `core::intrinsics::ptr_offset_from_unsigned` non-negative element distance
+  within an allocation (`evalPtrOffsetFromCall ... true`). -/
+  | ptrOffsetFromUnsigned : RustIntrinsicKind
+  /-- `core::intrinsics::ptr_mask` strict-provenance pointer address masking
+  (`evalPtrMaskCall`). -/
+  | ptrMask : RustIntrinsicKind
+  /-- `core::intrinsics::black_box` optimization-barrier identity with typed
+  value validity checking (`evalBlackBoxCall`). -/
+  | blackBox : RustIntrinsicKind
 
 /--
 Classify a canonical `DefPath` into a `RustIntrinsicKind` when it names one of
@@ -2089,7 +2119,37 @@ def classifyRustIntrinsic? (defPath : DefPath) : Option RustIntrinsicKind :=
                                                 | false =>
                                                   match stringEq defPath "core::intrinsics::align_of_val" with
                                                   | true => .some .alignOfVal
-                                                  | false => .none
+                                                  | false =>
+                                                    match stringEq defPath "core::intrinsics::copy_nonoverlapping" with
+                                                    | true => .some .copyNonOverlapping
+                                                    | false =>
+                                                      match stringEq defPath "core::intrinsics::write_bytes" with
+                                                      | true => .some .writeBytes
+                                                      | false =>
+                                                        match stringEq defPath "core::intrinsics::copy" with
+                                                        | true => .some .copy
+                                                        | false =>
+                                                          match stringEq defPath "core::intrinsics::compare_bytes" with
+                                                          | true => .some .compareBytes
+                                                          | false =>
+                                                            match stringEq defPath "core::intrinsics::raw_eq" with
+                                                            | true => .some .rawEq
+                                                            | false =>
+                                                              match stringEq defPath "core::intrinsics::typed_swap_nonoverlapping" with
+                                                              | true => .some .typedSwapNonOverlapping
+                                                              | false =>
+                                                                match stringEq defPath "core::intrinsics::ptr_offset_from" with
+                                                                | true => .some .ptrOffsetFrom
+                                                                | false =>
+                                                                  match stringEq defPath "core::intrinsics::ptr_offset_from_unsigned" with
+                                                                  | true => .some .ptrOffsetFromUnsigned
+                                                                  | false =>
+                                                                    match stringEq defPath "core::intrinsics::ptr_mask" with
+                                                                    | true => .some .ptrMask
+                                                                    | false =>
+                                                                      match stringEq defPath "core::intrinsics::black_box" with
+                                                                      | true => .some .blackBox
+                                                                      | false => .none
 
 /--
 Return `.some true` for signed integer `RigidTy.int _`, `.some false` for
@@ -2214,309 +2274,6 @@ def resolveIntrinsicShiftSigned
       | .some ty => intrinsicIntSignedness? false ty.kind
       | .none => .none
     | _ => .none
-
-/--
-Check whether any element of `ks` satisfies `pred`.
-
-Reference (The Rust Reference, "Dynamically Sized Types"):
-<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
-
-> "Most types have a fixed size that is known at compile time and implement the
-> trait `Sized`."
--/
-@[reducible]
-def anyUnsizedRigidTy (pred : RigidTy → Bool) : List RigidTy → Bool
-  | .nil => false
-  | k :: rest =>
-    match pred k with
-    | true => true
-    | false => anyUnsizedRigidTy pred rest
-
-/--
-Fuel-bounded check for whether `ty` is unsized (`.slice`, `.str`, `.dynamic`,
-`.foreign`) or is a compound array/tuple containing an unsized type.
-
-Reference (The Rust Reference, "Dynamically Sized Types"):
-<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
-
-> "Most types have a fixed size that is known at compile time and implement the
-> trait `Sized`. A type with a size that is known only at run-time is called a
-> dynamically sized type (DST) or, informally, an unsized type."
--/
-@[reducible]
-def isUnsizedRigidTy : Nat → RigidTy → Bool
-  | .zero, _ => false
-  | .succ fuel', ty =>
-    match ty with
-    | .slice _ => true
-    | .str => true
-    | .dynamic _ => true
-    | .foreign _ => true
-    | .array elemTy _ => isUnsizedRigidTy fuel' elemTy
-    | .tuple ks => anyUnsizedRigidTy (isUnsizedRigidTy fuel') ks
-    | _ => false
-
-/--
-Look up a `TypeLayout` for a sized `ty : RigidTy` by scanning `localDecls` for a
-declaration with `rigidTyEq decl.ty.kind ty`, returning `.none` when `ty` is
-unsized (`isUnsizedRigidTy 8 ty = true`) or when no local of type `ty` carries a
-layout. Rejecting unsized types here is essential because `rustc-capture` lowers
-`tcx.layout_of` for unsized locals (recording the static prefix layout or a ZST
-fallback layout), which must never be treated as the complete static layout of
-an unsized type. There is also deliberately no positional fallback: an unrelated
-entry such as `layouts.entries[0]` (often the return place's layout) would
-silently report the wrong size and alignment.
-
-Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L706-L712>
-
-> "fn layout_of(&self, ty: Ty<'tcx>) -> Self::LayoutOfResult"
--/
-@[reducible]
-def findDeclLayoutForRigidTy
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (ty : RigidTy) :
-    Option TypeLayout :=
-  match localDecls with
-  | .nil => .none
-  | decl :: rest =>
-    match Bool.and (Bool.not (isUnsizedRigidTy 8 ty)) (rigidTyEq decl.ty.kind ty) with
-    | true =>
-      match LayoutTable.lookup layouts decl.ty.layoutIdx with
-      | .some l => .some l
-      | .none => findDeclLayoutForRigidTy rest layouts ty
-    | false => findDeclLayoutForRigidTy rest layouts ty
-
-/--
-Compute the ABI byte alignment of a `RigidTy` when determined directly by its
-primitive, pointer, or homogeneous array constructor on a 64-bit target.
-
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
-
-> "The alignment of a value specifies what addresses are valid to store the
-> value at. A value of alignment `n` must only be stored at an address that is a
-> multiple of `n`."
--/
-@[reducible]
-def intrinsicRigidTyKindAlign : RigidTy → Option Nat
-  | .bool => .some 1
-  | .char => .some 4
-  | .never => .some 1
-  | .uint w => intCastTargetBytes (.uint w)
-  | .int w => intCastTargetBytes (.int w)
-  | .float .f16 => .some 2
-  | .float .f32 => .some 4
-  | .float .f64 => .some 8
-  | .float .f128 => .some 16
-  | .tuple .nil => .some 1
-  | .fnDef _ _ => .some 1
-  | .fnPtr _ _ _ _ => .some 8
-  | .ref _ _ => .some 8
-  | .rawPtr _ _ => .some 8
-  | .array elemKind _ => intrinsicRigidTyKindAlign elemKind
-  | _ => .none
-
-/--
-Compute the maximum `fieldAlign k` over the fields `ks` of a tuple, or `1` for
-the unit tuple `()`, faulting with `.none` if any field alignment is unknown.
-
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
-
-> "The only data layout guarantees made by this representation are those
-> required for soundness. They are:
->
-> 1. The fields are properly aligned.
-> 2. The fields do not overlap.
-> 3. The alignment of the type is at least the maximum alignment of its
->    fields."
--/
-@[reducible]
-def tupleFieldsAlign (fieldAlign : RigidTy → Option Nat) : List RigidTy → Option Nat
-  | .nil => .some 1
-  | k :: rest =>
-    match fieldAlign k, tupleFieldsAlign fieldAlign rest with
-    | .some a, .some restA =>
-      match Nat.ble a restA with
-      | true => .some restA
-      | false => .some a
-    | _, _ => .none
-
-/--
-Fuel-bounded recursive helper for `intrinsicRigidTyAlign`, resolving nested
-arrays of tuples/ADTs and nested tuples on a 64-bit target. `fuel` bounds the
-type nesting depth only: `tupleFieldsAlign` folds over tuple fields without
-consuming fuel, so tuples of any arity resolve.
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2863-L2874>
-
-> "pub const unsafe fn align_of_val<T: ?Sized>(ptr: *const T) -> usize;"
--/
-@[reducible]
-def intrinsicRigidTyAlignAux :
-    Nat → List LocalDecl → LayoutTable → RigidTy → Option Nat
-  | .zero, _, _, _ => .none
-  | .succ fuel', localDecls, layouts, ty =>
-    match intrinsicRigidTyKindAlign ty with
-    | .some a => .some a
-    | .none =>
-      match ty with
-      | .array elemKind _ =>
-        match findDeclLayoutForRigidTy localDecls layouts elemKind with
-        | .some l =>
-          match Align.isPowerOfTwoBytes l.align with
-          | true => .some l.align.bytes
-          | false => .none
-        | .none =>
-          match findDeclLayoutForRigidTy localDecls layouts ty with
-          | .some l =>
-            match Align.isPowerOfTwoBytes l.align with
-            | true => .some l.align.bytes
-            | false => .none
-          | .none => intrinsicRigidTyAlignAux fuel' localDecls layouts elemKind
-      | .tuple ks =>
-        match findDeclLayoutForRigidTy localDecls layouts ty with
-        | .some l =>
-          match Align.isPowerOfTwoBytes l.align with
-          | true => .some l.align.bytes
-          | false => .none
-        | .none => tupleFieldsAlign (intrinsicRigidTyAlignAux fuel' localDecls layouts) ks
-      | _ =>
-        match findDeclLayoutForRigidTy localDecls layouts ty with
-        | .some l =>
-          match Align.isPowerOfTwoBytes l.align with
-          | true => .some l.align.bytes
-          | false => .none
-        | .none => .none
-
-/--
-Determine the ABI byte alignment of a sized `RigidTy` on a 64-bit target for
-`align_of_val`, validating that any `LayoutTable` entry alignment is a positive
-power of two.
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2863-L2874>
-
-> "pub const unsafe fn align_of_val<T: ?Sized>(ptr: *const T) -> usize;"
--/
-@[reducible]
-def intrinsicRigidTyAlign
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (ty : RigidTy) :
-    Option Nat :=
-  intrinsicRigidTyAlignAux 8 localDecls layouts ty
-
-/--
-Sum `fieldSize k` over the fields `ks` of a tuple, before the total is padded to
-the tuple's alignment, faulting with `.none` if any field size is unknown.
-
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
-
-> "2. The fields do not overlap."
--/
-@[reducible]
-def tupleFieldsByteSum (fieldSize : RigidTy → Option Nat) : List RigidTy → Option Nat
-  | .nil => .some 0
-  | k :: rest =>
-    match fieldSize k, tupleFieldsByteSum fieldSize rest with
-    | .some sz, .some restSz => .some (Nat.add sz restSz)
-    | _, _ => .none
-
-/--
-Round `bytes` up to the nearest multiple of `alignBytes`.
-
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
-
-> "The size of a value is always a multiple of its alignment."
--/
-@[reducible]
-def roundUpToAlign (bytes alignBytes : Nat) : Nat :=
-  match Nat.beq (Nat.mod bytes alignBytes) 0 with
-  | true => bytes
-  | false => Nat.add bytes (Nat.sub alignBytes (Nat.mod bytes alignBytes))
-
-/--
-Fuel-bounded recursive helper for `intrinsicRigidTyByteSize`, resolving nested
-arrays and tuples of floats, `!`, and nested aggregates on a 64-bit target.
-
-Without a `LayoutTable` entry, a tuple's size is the sum of its field sizes
-rounded up to its alignment (`intrinsicRigidTyAlignAux`): the smallest size the
-`Rust` representation permits, which `rustc` attains by ordering fields by
-decreasing alignment. Summing without padding would give `(u32, u8)` size `5`,
-violating the size/alignment invariant below. `fuel` bounds the type nesting
-depth only: `tupleFieldsByteSum` folds over tuple fields without consuming fuel.
-
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
-
-> "The size of a value is always a multiple of its alignment."
--/
-@[reducible]
-def intrinsicRigidTyByteSizeAux :
-    Nat → List LocalDecl → LayoutTable → RigidTy → Option Nat
-  | .zero, _, _, _ => .none
-  | .succ fuel', localDecls, layouts, ty =>
-    match rigidTyKindByteSize ty with
-    | .some sz => .some sz
-    | .none =>
-      match ty with
-      | .never => .some 0
-      | .float .f16 => .some 2
-      | .float .f32 => .some 4
-      | .float .f64 => .some 8
-      | .float .f128 => .some 16
-      | .array elemKind n =>
-        match findDeclLayoutForRigidTy localDecls layouts elemKind with
-        | .some l => .some (Nat.mul l.size.bytes n)
-        | .none =>
-          match findDeclLayoutForRigidTy localDecls layouts ty with
-          | .some l => .some l.size.bytes
-          | .none =>
-            match intrinsicRigidTyByteSizeAux fuel' localDecls layouts elemKind with
-            | .some elemSz => .some (Nat.mul elemSz n)
-            | .none => .none
-      | .tuple ks =>
-        match findDeclLayoutForRigidTy localDecls layouts ty with
-        | .some l => .some l.size.bytes
-        | .none =>
-          match
-            tupleFieldsByteSum (intrinsicRigidTyByteSizeAux fuel' localDecls layouts) ks,
-            intrinsicRigidTyAlignAux (.succ fuel') localDecls layouts ty
-          with
-          | .some rawBytes, .some alignBytes => .some (roundUpToAlign rawBytes alignBytes)
-          | _, _ => .none
-      | _ =>
-        match findDeclLayoutForRigidTy localDecls layouts ty with
-        | .some l => .some l.size.bytes
-        | .none => .none
-
-/--
-Determine the static byte size of a sized `RigidTy` on a 64-bit target for
-`arith_offset` and `size_of_val`, returning `.none` for unsized types (`.slice`,
-`.str`, `.dynamic`, `.foreign`) or unresolvable ADTs.
-
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
-
-> "The size of a value is the offset in bytes between successive elements in an
-> array with that item type including alignment padding."
--/
-@[reducible]
-def intrinsicRigidTyByteSize
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (ty : RigidTy) :
-    Option Nat :=
-  intrinsicRigidTyByteSizeAux 8 localDecls layouts ty
 
 /--
 Step for a pointer intrinsic whose pointee or slice element type `ty` has no
@@ -3429,12 +3186,24 @@ def evalNonSelectIntrinsicCall
         | false => MirStepNode.fail .ub
         | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
     | _ => MirStepNode.fail .ub
+  | .copyNonOverlapping => MirStepNode.unsupported
+  | .writeBytes => MirStepNode.unsupported
+  | .copy => MirStepNode.unsupported
+  | .compareBytes => MirStepNode.unsupported
+  | .rawEq => MirStepNode.unsupported
+  | .typedSwapNonOverlapping => MirStepNode.unsupported
+  | .ptrOffsetFrom => MirStepNode.unsupported
+  | .ptrOffsetFromUnsigned => MirStepNode.unsupported
+  | .ptrMask => MirStepNode.unsupported
+  | .blackBox => MirStepNode.unsupported
   | .constEvalSelect => MirStepNode.fail .ub
 
 /--
 Test whether `kind` is parameterized by the pointee type `T` of its first
-pointer argument (`arith_offset<T>`, `size_of_val<T>`, `align_of_val<T>`)
-rather than by the value type of its first argument.
+pointer argument (`arith_offset<T>`, `size_of_val<T>`, `align_of_val<T>`,
+`copy<T>`, `raw_eq<T>`, `typed_swap_nonoverlapping<T>`, `ptr_offset_from<T>`,
+`ptr_offset_from_unsigned<T>`, `ptr_mask<T>`) rather than by the value type of
+its first argument.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3447,6 +3216,12 @@ def isPtrPointeeIntrinsicKind : RustIntrinsicKind → Bool
   | .arithOffset => true
   | .sizeOfVal => true
   | .alignOfVal => true
+  | .copy => true
+  | .rawEq => true
+  | .typedSwapNonOverlapping => true
+  | .ptrOffsetFrom => true
+  | .ptrOffsetFromUnsigned => true
+  | .ptrMask => true
   | _ => false
 
 /--
@@ -3718,6 +3493,2472 @@ def isUnwindingPanicDefPath (defPath : DefPath) : Bool :=
                                                     (stringEq defPath "core::panicking::panic_const::panic_const_rem_by_zero")))))))))))))))))))))))))
 
 /--
+Complete a call-form memory intrinsic (`RustIntrinsicKind.copyNonOverlapping`,
+`RustIntrinsicKind.writeBytes`) whose memory effect `node` was computed by the
+statement-level semantics: on `MirStepNode.step s'`, keep the frame
+locals and memory of `s'` and write the intrinsic's `()` return value
+(`Value.unit`) to `destination`, continuing at `targetBb`
+(`writeIntrinsicReturn`); faults and unsupported nodes propagate unchanged.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L800-L814>
+
+> "Call {
+> ...
+>     destination: Place<'tcx>,
+> ...
+>     target: Option<BasicBlock>,"
+-/
+@[reducible]
+def finishMemIntrinsicCall
+    (s : MachineState)
+    (node : MirStepNode)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  match node with
+  | .tau (.running s') =>
+    writeIntrinsicReturn { s with memory := s'.memory } s'.frame.locals destination targetBb .unit
+  | other => other
+
+/--
+Evaluate a direct call `copy_nonoverlapping::<T>(src, dst, count)` whose
+argument operands `argOps` evaluated to `argVals` (with frame `locals'`).
+
+The memory effect is the statement form
+`StatementKind.intrinsic (.copyNonOverlapping src dst count)`
+(`evalCopyNonOverlappingWithCount`, in `Statements.lean`) after checking that
+`count` is a `usize`-width scalar (`countSc.sizeBytes == layoutPointerBytes
+bodyLayouts`): the same pointer, Tree Borrows permission, frame, overlap
+(`projectionsOverlap`), and typed or byte-level copy checks on the same source
+and destination operands. The call then writes `()` to `destination` and
+continues at `targetBb` (`finishMemIntrinsicCall`). An argument list that is not
+two values and a `usize`-width scalar `count` faults with `.ub` (calling a
+function with ABI-incompatible arguments).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L3019-L3028>
+
+> "/// This is an accidentally-stable alias to [`ptr::copy_nonoverlapping`]; use that instead.
+> ...
+> pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize);"
+
+Reference (`core::ptr::copy_nonoverlapping` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L439-L465>
+
+> "/// Copies `count * size_of::<T>()` bytes from `src` to `dst`. The source
+> /// and destination must *not* overlap.
+> ...
+> /// # Safety
+> ///
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * Both `src` and `dst` must be properly aligned.
+> ///
+> /// * The region of memory beginning at `src` with a size of `count *
+> ///   size_of::<T>()` bytes must *not* overlap with the region of memory
+> ///   beginning at `dst` with the same size."
+-/
+def evalCopyNonOverlappingCall
+    (s : MachineState)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  match argOps, argVals with
+  | srcOp :: dstOp :: _ :: .nil, srcVal :: dstVal :: .scalar countSc :: .nil =>
+    match Nat.beq countSc.sizeBytes (layoutPointerBytes bodyLayouts) with
+    | false => MirStepNode.fail .ub
+    | true =>
+      finishMemIntrinsicCall
+        s
+        (evalCopyNonOverlappingWithCount
+          s
+          srcOp
+          dstOp
+          bodyLocalDecls
+          bodyLayouts
+          srcVal
+          dstVal
+          countSc.bits
+          locals')
+        destination
+        targetBb
+  | _, _ => MirStepNode.fail .ub
+
+/--
+Bit pattern of `n` little-endian bytes all equal to `byte % 256` (the value of a
+`T`-sized memory region after `write_bytes(dst, byte, 1)`).
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L646-L650>
+
+> "/// Sets `count * size_of::<T>()` bytes of memory starting at `dst` to
+> /// `val`.
+> ///
+> /// `write_bytes` is similar to C's [`memset`], but sets `count *
+> /// size_of::<T>()` bytes to `val`."
+-/
+def writeBytesFillBits (byte : Nat) : Nat → Nat
+  | .zero => 0
+  | .succ n => Nat.add (Nat.mod byte 256) (Nat.mul 256 (writeBytesFillBits byte n))
+
+/--
+Outcome of the machine-state-independent part of a
+`write_bytes::<T>(dst, val, count)` call (`writeBytesAction`), consumed by
+`evalWriteBytesCall`: a fault (`.fault kind`; `FailureKind.unsupported` is the
+fail-closed `MirStepNode.unsupported`), no memory effect (`.noWrite`, when
+`count * size_of::<T>() = 0`), or a store of the whole element value `newVal`
+at the destination sub-place `dstPlace` (`.store`).
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L646-L650>
+
+> "/// Sets `count * size_of::<T>()` bytes of memory starting at `dst` to
+> /// `val`."
+-/
+inductive WriteBytesAction : Type where
+  /-- The call faults with `kind` (`.unsupported` when the shape is not modeled). -/
+  | fault (kind : FailureKind) : WriteBytesAction
+  /-- Zero bytes are written: memory is unchanged. -/
+  | noWrite : WriteBytesAction
+  /-- Store `newVal` (one whole `T` element) at `dstPlace`, the sub-place of
+  local `dstTargetLocal` that the Tree Borrows tag `dstTag` points to. -/
+  | store (dstPlace : Place) (dstTargetLocal : LocalIdx) (dstTag : Nat) (newVal : Value) :
+      WriteBytesAction
+
+/--
+Address-level alignment of the destination of a `write_bytes::<T>` call whose
+`dst` pointer `dstPtr` carries the active-frame Tree Borrows entry `dstEntry`:
+whether the address `addr(dstEntry.targetLocal, dstEntry.targetProjection) +
+dstPtr.offsetBytes` is a multiple of `elemAlign = align_of::<T>()` in every
+valid placement of the target local, checked by `checkTargetPlaceAlignWalk`
+(the walk used for dereferences, `checkTargetPlaceAlign`) from the target
+local's declared type in `bodyLocalDecls`.
+
+The type of the target place alone does not determine this: a field of a
+`#[repr(packed)]` / `#[repr(packed(N))]` struct can sit at an offset that is not
+a multiple of its type's alignment, so `&raw mut packed.field` is a misaligned
+pointer even though the field's type is aligned. Every enclosing container
+whose exact alignment (`tyExactByteAlign?`) is below `elemAlign` makes the
+address possibly misaligned, and so does an exact byte offset that is not a
+multiple of `elemAlign`.
+
+An element alignment of at most `1` is always satisfied. A target local
+without a declaration skips the check, as in `checkTargetPlaceAlign`
+(unreachable from `writeBytesAction`, which first resolves the target place's
+type through that declaration).
+
+Reference (The Rust Reference, "The alignment modifiers"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-alignment-modifiers>
+
+> "The align and packed modifiers can be used to respectively raise or lower
+> the alignment of structs and unions. packed may also alter the padding
+> between fields (although it will not alter the padding inside of any
+> field)."
+
+> "The alignments of each field, for the purpose of positioning fields, is the
+> smaller of the specified alignment and the alignment of the field’s type."
+
+> "References to unaligned fields are not allowed because it is undefined
+> behavior."
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L656-L666>
+
+> "/// * `dst` must be properly aligned."
+-/
+def writeBytesDstAddrAligned
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (dstEntry : BorrowEntry)
+    (dstPtr : ProvenancePtr)
+    (elemAlign : Nat) :
+    Bool :=
+  match Nat.ble elemAlign 1, get? bodyLocalDecls dstEntry.targetLocal with
+  | true, _ => true
+  | false, .some rootDecl =>
+    checkTargetPlaceAlignWalk
+      bodyLocalDecls
+      bodyLayouts
+      elemAlign
+      dstPtr.offsetBytes
+      (.some rootDecl.ty)
+      .none
+      .none
+      dstEntry.targetProjection
+  | false, .none => true
+
+/--
+Validate a direct call `write_bytes::<T>(dst, val, count)` whose arguments
+evaluated to `argVals`, against the Tree Borrows `borrows` and the active frame
+depth `frameDepth`. The element type `T` is the single type argument in
+`target.typeArgs`, or else the pointee type of the `dst` operand.
+
+Checks, in order:
+1. `dst` is a thin pointer of the target width, `val` is a `u8` scalar, and
+   `count` is a `usize` scalar; otherwise `.ub` (malformed arguments).
+2. `T` must be known (else unsupported) with a known size and alignment;
+   otherwise an unsized `T` is `.ub` and any other unresolved layout is
+   unsupported (as `intrinsicUnresolvedLayoutStep`).
+3. `count * size_of::<T>() <= isize::MAX`, else `.ub`: no allocation is valid
+   for writes of more bytes.
+4. `dst` must carry a Tree Borrows tag of the active frame whose permission
+   allows writes (`.frozen` / `.disabled` are `.ub`); an untracked pointer or a
+   caller-frame target is unsupported (alignment and validity unknown).
+5. Alignment: the tag's target place must have an alignment that is a multiple
+   of `align_of::<T>()` (else unsupported); `dst`'s byte offset must be a
+   multiple of `align_of::<T>()` and the address it denotes must be aligned
+   at the address level (`writeBytesDstAddrAligned`, which rejects pointers to
+   misaligned fields of `#[repr(packed)]` structs), else `.ub` (misaligned),
+   even when no byte is written.
+6. Zero bytes (`count * size_of::<T>() = 0`) leave memory unchanged
+   (`.noWrite`): every non-null pointer is valid for a zero-sized write.
+7. A write whose destination is a whole local (an allocation of its own) and
+   that extends past the end of that local is `.ub`: the pointer is not
+   dereferenceable for `count * size_of::<T>()` bytes.
+8. One element (`count = 1`) at offset `0` of a place of type `T`, where `T` is
+   a primitive scalar type and the filled value `writeBytesFillBits val
+   (size_of::<T>())` satisfies `validateValueForTy?` for `T`, stores that scalar
+   (`.store`). When `T` is `bool` or `char` and the repeated byte pattern is not
+   a valid bit representation of `T` (e.g. `2` in a `bool` or `0xFF` repeated in
+   a `char`), `write_bytes` itself is not immediate UB in Rust unless the bytes
+   are subsequently read at type `T`, whereas Anneal's non-union local slots
+   store typed `Value`s without re-validating root locals on `Operand.copy`;
+   `writeBytesAction` therefore fails closed with `.fault .unsupported` rather
+   than either misreporting immediate `.ub` or storing an unvalidated typed
+   scalar.
+9. Every other shape (multi-element writes, aggregate `T`, interior offsets,
+   bit-invalid `bool`/`char` fills, and writes past the end of a sub-place) is
+   unsupported.
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L656-L666>
+
+> "/// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes.
+> ///
+> /// * `dst` must be properly aligned.
+> ///
+> /// Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> /// `0`, the pointer must be properly aligned.
+> ///
+> /// Additionally, note that changing `*dst` in this way can easily lead to undefined behavior (UB)
+> /// later if the written bytes are not a valid representation of some `T`."
+
+Reference (The Rust Reference, "Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+> "- A bool value must be false (0) or true (1)."
+
+> "- A char value must not be a surrogate (i.e., must not be in the range
+> 0xD800..=0xDFFF) and must be equal to or less than char::MAX."
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L19-L25>
+
+> "//! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes.
+> //!   The following points are only concerned with non-zero-sized accesses.
+> //! * For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that
+> //!   the pointer be *dereferenceable*. The [provenance] of the pointer is used to determine which
+> //!   [allocation] it is derived from; a pointer is dereferenceable if the memory range of the given
+> //!   size starting at the pointer is entirely contained within the bounds of that allocation. Note
+> //!   that in Rust, every (stack-allocated) variable is considered a separate allocation."
+
+Reference (The Rust Reference, "Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "A value of alignment n must only be stored at an address that is a multiple
+> of n."
+-/
+def writeBytesAction
+    (borrows : List BorrowEntry)
+    (frameDepth : Nat)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value) :
+    WriteBytesAction :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match argVals with
+  | .ptr dstPtr dstSz :: .scalar valSc :: .scalar countSc :: .nil =>
+    match
+      Bool.and (Nat.beq dstSz ptrBytes)
+        (Bool.and (Nat.beq valSc.sizeBytes 1)
+          (Bool.and (Nat.blt valSc.bits 256) (Nat.beq countSc.sizeBytes ptrBytes)))
+    with
+    | false => .fault .ub
+    | true =>
+      let elemTyOpt : Option RigidTy :=
+        match target.typeArgs with
+        | elemTy :: .nil => .some elemTy
+        | .nil =>
+          match argOps with
+          | dstOp :: _ =>
+            match operandPointeeTy bodyLocalDecls bodyLayouts dstOp with
+            | .some pt => .some pt.kind
+            | .none => .none
+          | .nil => .none
+        | _ :: _ :: _ => .none
+      match elemTyOpt with
+      | .none => .fault .unsupported
+      | .some elemTy =>
+        match
+          intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
+          intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
+        with
+        | .some elemSize, .some elemAlign =>
+          let byteCount := Nat.mul countSc.bits elemSize
+          match Nat.ble byteCount (Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1) with
+          | false => .fault .ub
+          | true =>
+            match lookupBorrow borrows dstPtr.tag with
+            | .none => .fault .unsupported
+            | .some dstEntry =>
+              match dstEntry.perm with
+              | .frozen => .fault .ub
+              | .disabled => .fault .ub
+              | _ =>
+                match Nat.beq dstEntry.targetFrameDepth frameDepth with
+                | false => .fault .unsupported
+                | true =>
+                  let dstPlace : Place :=
+                    { local_ := dstEntry.targetLocal, projection := dstEntry.targetProjection }
+                  match placeTyResolved bodyLocalDecls bodyLayouts dstPlace with
+                  | .none => .fault .unsupported
+                  | .some dstPlaceTy =>
+                    match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts dstPlaceTy.kind with
+                    | .none => .fault .unsupported
+                    | .some placeAlign =>
+                      match
+                        Bool.and (Bool.not (Nat.beq elemAlign 0))
+                          (Nat.beq (Nat.mod placeAlign elemAlign) 0)
+                      with
+                      | false => .fault .unsupported
+                      | true =>
+                        match Nat.beq (Nat.mod dstPtr.offsetBytes elemAlign) 0 with
+                        | false => .fault .ub
+                        | true =>
+                          match
+                            writeBytesDstAddrAligned bodyLocalDecls bodyLayouts dstEntry dstPtr
+                              elemAlign
+                          with
+                          | false => .fault .ub
+                          | true =>
+                            match Nat.beq byteCount 0 with
+                            | true => .noWrite
+                            | false =>
+                              let rootOutOfBounds : Bool :=
+                                match dstEntry.targetProjection with
+                                | .nil =>
+                                  match
+                                    intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts
+                                      dstPlaceTy.kind
+                                  with
+                                  | .some placeSize =>
+                                    Nat.blt placeSize (Nat.add dstPtr.offsetBytes byteCount)
+                                  | .none => false
+                                | _ :: _ => false
+                              match rootOutOfBounds with
+                              | true => .fault .ub
+                              | false =>
+                                match
+                                  Bool.and (Nat.beq countSc.bits 1)
+                                    (Bool.and (Nat.beq dstPtr.offsetBytes 0)
+                                      (Bool.and (rigidTyEq dstPlaceTy.kind elemTy)
+                                        (isPrimitiveScalarKind elemTy)))
+                                with
+                                | true =>
+                                  let fillVal : Value :=
+                                    .scalar ⟨writeBytesFillBits valSc.bits elemSize, elemSize⟩
+                                  match
+                                    validateValueForTy? bodyLayouts (.some dstPlaceTy) fillVal
+                                  with
+                                  | true =>
+                                    .store dstPlace dstEntry.targetLocal dstPtr.tag fillVal
+                                  | false => .fault .unsupported
+                                | false => .fault .unsupported
+        | _, _ =>
+          match isUnsizedRigidTy 8 elemTy with
+          | true => .fault .ub
+          | false => .fault .unsupported
+  | _ => .fault .ub
+
+/--
+Tree Borrows write check and permission transition for a non-zero `write_bytes`
+store to `(dstTag, dstEntry)` in `Runtime(PostCleanup)` MIR (Rust 1.98.0, paired
+with Anneal's Tree Borrows aliasing model; mirrors the write phase of
+`Statements.borrowsAfterCopySingleDirect`):
+1. Rejects `.frozen`, `.disabled`, and protected conflicted two-phase
+   reservations (`.reservedFrz true` with `isBorrowProtected activeProtectors
+   dstEntry = true`).
+2. Checks ancestor child-write permissions across multi-tag borrow trees
+   (`treeBorrowAncestorsChildAccessUB .write`), rejecting writes through tags
+   reborrowed from `.frozen` or `.disabled` ancestors.
+3. Checks active function-entry lifetime protectors on overlapping foreign
+   borrows (`hasProtectedTreeWriteConflict` / `hasProtectedWriteConflict`),
+   rejecting writes that would disable a protected borrow (`noalias` violation).
+4. Applies the projection- and byte-range-aware Tree Borrows write transition
+   (`invalidateTreeBorrowsAtProj` / `invalidateConflictingBorrowsAtProj` /
+   `invalidateConflictingBorrows`), activating two-phase reservations on the
+   written tag and disabling overlapping foreign borrows without clobbering
+   disjoint sibling sub-place borrows.
+Returns `.none` on any Tree Borrows undefined behavior.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` and `tree.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L179-L198>
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/tree.rs#L157-L159>
+
+> "ReservedFrz { conflicted: true } if protected => return None,
+> ReservedFrz { .. } | ReservedIM | Unique => Unique,
+> Frozen | Disabled => return None,"
+
+> "if protected && self.accessed && transition.produces_disabled() {
+>     return Err(TransitionError::ProtectedDisabled(old_perm));
+> }"
+-/
+def borrowsAfterWriteBytes
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (dstTag : Nat)
+    (dstEntry : BorrowEntry) :
+    Option (List BorrowEntry) :=
+  let childWriteUB : Bool :=
+    match dstEntry.perm with
+    | .frozen | .disabled => true
+    | .reservedFrz true => isBorrowProtected activeProtectors dstEntry
+    | _ => false
+  match childWriteUB with
+  | true => .none
+  | false =>
+    let ancWriteUB : Bool :=
+      match borrows with
+      | _ :: _ :: _ =>
+        treeBorrowAncestorsChildAccessUB .write borrows dstEntry.parentTag
+      | _ => false
+    match ancWriteUB with
+    | true => .none
+    | false =>
+      let protConflict : Bool :=
+        match activeProtectors with
+        | .nil => false
+        | _ :: _ =>
+          match borrows with
+          | b₁ :: b₂ :: restBorrows =>
+            let allBorrows := b₁ :: b₂ :: restBorrows
+            hasProtectedTreeWriteConflict
+              allBorrows
+              allBorrows
+              activeProtectors
+              dstEntry.targetLocal
+              (.some dstTag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+          | _ =>
+            hasProtectedWriteConflict
+              borrows
+              activeProtectors
+              dstEntry.targetLocal
+              (.some dstTag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+      match protConflict with
+      | true => .none
+      | false =>
+        let borrows' : List BorrowEntry :=
+          match borrows with
+          | .nil => .nil
+          | single :: .nil =>
+            let b := single :: .nil
+            match dstEntry.targetProjection with
+            | .nil =>
+              match Nat.beq dstEntry.rangeLen 0 with
+              | true =>
+                invalidateConflictingBorrows
+                  b
+                  dstEntry.targetLocal
+                  (.some dstTag)
+                  dstEntry.targetFrameDepth
+              | false =>
+                invalidateConflictingBorrowsAtProj
+                  b
+                  dstEntry.targetLocal
+                  (.some dstTag)
+                  .nil
+                  dstEntry.rangeOffset
+                  dstEntry.rangeLen
+                  dstEntry.targetFrameDepth
+            | pHead :: pTail =>
+              invalidateConflictingBorrowsAtProj
+                b
+                dstEntry.targetLocal
+                (.some dstTag)
+                (pHead :: pTail)
+                dstEntry.rangeOffset
+                dstEntry.rangeLen
+                dstEntry.targetFrameDepth
+          | b₁ :: b₂ :: restBorrows =>
+            let allBorrows := b₁ :: b₂ :: restBorrows
+            invalidateTreeBorrowsAtProj
+              allBorrows
+              allBorrows
+              dstEntry.targetLocal
+              (.some dstTag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+        .some borrows'
+
+/--
+Commit a non-zero single-element `write_bytes` store of `newVal` to `dstPlace`
+through Tree Borrows tag `dstTag` in active-frame `locals₃`: runs the Tree
+Borrows ancestor, active-protector, and sub-place invalidation transition
+(`borrowsAfterWriteBytes`), writes `newVal` to `dstPlace` (`writePlaceValue`),
+and advances `s` (`advanceStmt`). Missing borrow entries fail closed with
+`MirStepNode.unsupported`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+def commitWriteBytesDstPlaceWrite
+    (s : MachineState)
+    (dstPlace : Place)
+    (dstTag : Nat)
+    (locals₃ : List LocalSlot)
+    (newVal : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    MirStepNode :=
+  match lookupBorrow s.memory.borrows dstTag with
+  | .none => MirStepNode.unsupported
+  | .some dstEntry =>
+    match
+      borrowsAfterWriteBytes
+        s.memory.borrows
+        s.memory.activeProtectors
+        dstTag
+        dstEntry
+    with
+    | .none => MirStepNode.fail .ub
+    | .some borrows' =>
+      match
+        writePlaceValue
+          locals₃
+          s.memory.borrows
+          dstPlace
+          newVal
+          localDecls
+          layouts
+      with
+      | .ok locals₄ =>
+        MirStepNode.step
+          (advanceStmt
+            s
+            locals₄
+            { s.memory with borrows := borrows' })
+      | .unsupported => MirStepNode.unsupported
+      | .ub => MirStepNode.fail .ub
+
+/--
+Evaluate a direct call `write_bytes::<T>(dst, val, count)` whose argument
+operands `argOps` evaluated to `argVals` (with frame `locals'`): validate it
+against the current Tree Borrows state and active frame (`writeBytesAction`),
+then fault, leave memory unchanged, or store the filled element at the
+destination sub-place through `commitWriteBytesDstPlaceWrite` (enforcing Tree
+Borrows ancestor permissions, active function-entry protectors, and sub-place
+borrow invalidation). The call then writes `()` to `destination` and continues
+at `targetBb` (`writeIntrinsicReturn`, `finishMemIntrinsicCall`).
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L646-L650>
+
+> "/// Sets `count * size_of::<T>()` bytes of memory starting at `dst` to
+> /// `val`.
+> ///
+> /// `write_bytes` is similar to C's [`memset`], but sets `count *
+> /// size_of::<T>()` bytes to `val`."
+-/
+def evalWriteBytesCall
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  match
+    writeBytesAction
+      s.memory.borrows
+      (length s.memory.callStack)
+      target
+      bodyLocalDecls
+      bodyLayouts
+      argOps
+      argVals
+  with
+  | .fault kind => MirStepNode.fail kind
+  | .noWrite => writeIntrinsicReturn s locals' destination targetBb .unit
+  | .store dstPlace _ dstTag newVal =>
+    finishMemIntrinsicCall
+      s
+      (commitWriteBytesDstPlaceWrite
+        s
+        dstPlace
+        dstTag
+        locals'
+        newVal
+        bodyLocalDecls
+        bodyLayouts)
+      destination
+      targetBb
+
+/-!
+## Eight Core Memory and Pointer Intrinsics
+
+Ground operational semantics for `core::intrinsics::{copy, compare_bytes,
+raw_eq, typed_swap_nonoverlapping, ptr_offset_from, ptr_offset_from_unsigned,
+ptr_mask, black_box}`, matching `rustc 1.98.0-nightly (14210df0e 2026-05-31)`
+and the Rust Reference 1.98.0.
+-/
+
+/--
+Layout- and protector-aware return-value destination write for inline compiler
+intrinsics:
+- A diverging call (`targetOpt = .none`) to a returning intrinsic faults with
+  `MirStepNode.fail .ub` once the intrinsic itself has completed without
+  faulting or hitting `.unsupported`.
+- A `.deref :: restProj` destination forwards `bodyLocalDecls` and
+  `bodyLayouts` through `evalPlaceWrite`, enforces BOTH `derefWriteTreeUB` and
+  `derefWriteUnionProtectorUB`, invalidates borrows via
+  `invalidateDerefWriteBorrowsWithLayouts`, and handles suspended caller frames
+  via `foreignFrameDerefWrite`.
+- A direct (non-deref) destination checks `hasProtectedWriteConflict` against
+  active function-entry protectors before invalidating borrows with the
+  union-truncated projection `resolveBorrowWriteLocalProj`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L800-L814>
+
+> "Call {
+> ...
+>     destination: Place<'tcx>,
+> ...
+>     target: Option<BasicBlock>,"
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+def writeIntrinsicReturnWithProtectors
+    (s : MachineState)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx)
+    (retVal : Value) :
+    MirStepNode :=
+  match targetOpt with
+  | .none => MirStepNode.fail .ub
+  | .some targetBb =>
+    match destination.projection with
+    | .deref :: restProj =>
+      match
+        evalPlaceWrite
+          locals'
+          s.memory.borrows
+          destination
+          retVal
+          s.memory.activeProtectors
+          bodyLocalDecls
+          bodyLayouts
+          s.memory.callStack
+      with
+      | .ok updatedLocals =>
+        match
+          Bool.or
+            (derefWriteTreeUB locals' s.memory.borrows destination)
+            (derefWriteUnionProtectorUB
+              bodyLocalDecls
+              bodyLayouts
+              locals'
+              s.memory.borrows
+              s.memory.activeProtectors
+              destination
+              restProj
+              s.memory.callStack)
+        with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrows' :=
+            invalidateDerefWriteBorrowsWithLayouts
+              bodyLocalDecls
+              bodyLayouts
+              locals'
+              s.memory.borrows
+              destination
+              restProj
+              s.memory.callStack
+          MirStepNode.step {
+            frame := {
+              s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := updatedLocals
+            }
+            memory := { s.memory with borrows := borrows' }
+          }
+      | .ub =>
+        match
+          foreignFrameDerefWrite
+            locals'
+            s.memory
+            destination
+            restProj
+            retVal
+            bodyLocalDecls
+            bodyLayouts
+        with
+        | .ok updatedLocals mem' =>
+          MirStepNode.step {
+            frame := {
+              s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := updatedLocals
+            }
+            memory := mem'
+          }
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
+      | .unsupported => MirStepNode.unsupported
+    | _ =>
+      match
+        writePlaceValue
+          locals'
+          s.memory.borrows
+          destination
+          retVal
+          bodyLocalDecls
+          bodyLayouts
+          s.memory.callStack
+      with
+      | .ok updatedLocals =>
+        let depth := length s.memory.callStack
+        let resolvedProj :=
+          resolveBorrowWriteLocalProj
+            bodyLocalDecls
+            bodyLayouts
+            locals'
+            destination.local_
+            destination.projection
+        match
+          hasProtectedWriteConflict
+            s.memory.borrows
+            s.memory.activeProtectors
+            destination.local_
+            .none
+            resolvedProj
+            0
+            0
+            depth
+        with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrows' :=
+            match resolvedProj with
+            | .nil =>
+              invalidateConflictingBorrows
+                s.memory.borrows
+                destination.local_
+                .none
+                depth
+            | pHead :: pTail =>
+              invalidateConflictingBorrowsAtProj
+                s.memory.borrows
+                destination.local_
+                .none
+                (pHead :: pTail)
+                0
+                0
+                depth
+          MirStepNode.step {
+            frame := {
+              s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := updatedLocals
+            }
+            memory := { s.memory with borrows := borrows' }
+          }
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+
+/--
+Resolve the pointee `Ty` (preserving a consistent `layoutIdx` from the first
+pointer operand when it matches `elemTy`) for pointer-parameterized memory
+intrinsics (`typed_swap_nonoverlapping<T>`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2569>
+
+> "pub const unsafe fn typed_swap_nonoverlapping<T>(x: *mut T, y: *mut T) {"
+-/
+def resolveIntrinsicPointeeFullTy
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (elemTy : RigidTy) :
+    Ty :=
+  match argOps with
+  | ptrOp :: _ =>
+    match operandPointeeTy bodyLocalDecls bodyLayouts ptrOp with
+    | .some pt =>
+      match rigidTyEq pt.kind elemTy with
+      | true => pt
+      | false => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+    | .none => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+  | .nil => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+
+/--
+Apply an exact-range Tree Borrows read transition for endpoint `ep` over
+`[ep.effOff, ep.effOff + accessLen)`, returning `.some mem.borrows` for global
+endpoints and `.none` on Tree Borrows UB.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+@[reducible]
+def endpointBorrowsAfterRead
+    (mem : Memory)
+    (ep : ResolvedMemEndpoint)
+    (accessLen : Nat) :
+    Option (List BorrowEntry) :=
+  match ep.borrow? with
+  | .none => .some mem.borrows
+  | .some (tag, entry) =>
+    borrowsAfterReadAccess
+      mem.borrows
+      mem.activeProtectors
+      ep.targetDecls
+      ep.targetLayouts
+      tag
+      entry
+      ep.effOff
+      accessLen
+
+/--
+Apply an exact-range Tree Borrows write transition for endpoint `ep` over
+`[ep.effOff, ep.effOff + accessLen)`, returning `.some mem.borrows` for global
+endpoints and `.none` on Tree Borrows UB.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+@[reducible]
+def endpointBorrowsAfterWrite
+    (mem : Memory)
+    (ep : ResolvedMemEndpoint)
+    (accessLen : Nat) :
+    Option (List BorrowEntry) :=
+  match ep.borrow? with
+  | .none => .some mem.borrows
+  | .some (tag, entry) =>
+    borrowsAfterWriteAccess
+      mem.borrows
+      mem.activeProtectors
+      ep.targetDecls
+      ep.targetLayouts
+      tag
+      entry
+      ep.effOff
+      accessLen
+
+/--
+Lexicographically compare two equal-length `List UInt8` slices as unsigned
+bytes, returning two's-complement 32-bit `i32` bits: `0xFFFFFFFF` (`-1`) if
+`left < right`, `0` if equal, or `1` if `left > right`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2320-L2323>
+
+> "/// Lexicographically compare `[left, left + bytes)` and `[right, right + bytes)`
+> /// as unsigned bytes, returning negative if `left` is less, zero if all the
+> /// bytes match, or positive if `left` is greater."
+-/
+def compareUnsignedBytesI32 : List UInt8 → List UInt8 → Nat
+  | .nil, .nil => 0
+  | a :: as, b :: bs =>
+    let an := a.toBitVec.toNat
+    let bn := b.toBitVec.toNat
+    match Nat.blt an bn with
+    | true => 4294967295
+    | false =>
+      match Nat.blt bn an with
+      | true => 1
+      | false => compareUnsignedBytesI32 as bs
+  | _, _ => 0
+
+/--
+Evaluate a direct call to `core::intrinsics::copy<T>(src: *const T, dst: *mut T,
+count: usize) -> ()` (overlapping `memmove`):
+1. Rejects malformed argument lists or non-thin/wrong-width pointer arguments
+   with `.ub` before undetermined layouts or provenance-carrying counts.
+2. Unsized `T` or undetermined layout/alignment (`rigidTyLayoutDeterminedAux`,
+   `exactRigidTyByteSize?`, `exactRigidTyAlign?`) fails closed `.unsupported`.
+3. For ZST `T` (`size_of::<T>() == 0`), `0 * count == 0` for every `count`
+   (including provenance-carrying `usize` counts): checks alignment of `src` and
+   `dst` even at 0 bytes (null allowed at 0 bytes) and returns `()`.
+4. For non-ZST `T`, checks alignment before failing closed on provenance counts,
+   enforces `count * size_of::<T>() <= isize::MAX`, permits aligned null
+   pointers when `byteCount == 0`, and for `byteCount > 0` requires non-null
+   aligned live pointers and executes `evalCopyMemory` (atomic read-snapshot of
+   source `AbstractByte`s preserving provenance and `.uninit`, exact-range Tree
+   Borrows read-then-write on post-read `borrows₁`, and round-trip-guarded
+   commit).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L3030-L3039>
+
+> "/// This is an accidentally-stable alias to [`ptr::copy`]; use that instead.
+> ...
+> pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize);"
+
+Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L554-L589>
+
+> "/// Copies `count * size_of::<T>()` bytes from `src` to `dst`. The source
+> /// and destination may overlap.
+> ...
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0,
+> ///   and `dst` must remain valid even when `src` is read for `count * size_of::<T>()` bytes. (This
+> ///   means if the memory ranges overlap, the `dst` pointer must not be invalidated by `src` reads.)
+> ///
+> /// * Both `src` and `dst` must be properly aligned.
+> ...
+> /// Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> /// `0`, the pointers must be properly aligned."
+-/
+def evalCopyCall
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  let isizeMax := Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1
+  match argVals with
+  | srcVal :: dstVal :: countVal :: .nil =>
+    match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+    | .none =>
+      match
+        isNullThinPtr s.memory ptrBytes srcVal,
+        isNullThinPtr s.memory ptrBytes dstVal,
+        decodeUsizeArg? s.memory ptrBytes countVal
+      with
+      | .none, _, _ => MirStepNode.fail .ub
+      | _, .none, _ => MirStepNode.fail .ub
+      | _, _, .ub => MirStepNode.fail .ub
+      | _, _, _ => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+    | .some elemTy =>
+      match isUnsizedRigidTy 8 elemTy with
+      | true => MirStepNode.unsupported
+      | false =>
+        match
+          isNullThinPtr s.memory ptrBytes srcVal,
+          isNullThinPtr s.memory ptrBytes dstVal,
+          decodeUsizeArg? s.memory ptrBytes countVal
+        with
+        | .none, _, _ => MirStepNode.fail .ub
+        | _, .none, _ => MirStepNode.fail .ub
+        | _, _, .ub => MirStepNode.fail .ub
+        | .some srcNull, .some dstNull, countRes =>
+          match
+            rigidTyLayoutDeterminedAux bodyLocalDecls bodyLayouts true 8 elemTy,
+            exactRigidTyByteSize? bodyLocalDecls bodyLayouts elemTy,
+            exactRigidTyAlign? bodyLocalDecls bodyLayouts elemTy
+          with
+          | true, .some elemSize, .some elemAlign =>
+            match Nat.beq elemSize 0 with
+            | true =>
+              match
+                checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts srcVal elemAlign false
+              with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok () =>
+                match
+                  checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts dstVal elemAlign false
+                with
+                | .ub => MirStepNode.fail .ub
+                | .unsupported => MirStepNode.unsupported
+                | .ok () =>
+                  writeIntrinsicReturnWithProtectors
+                    s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
+            | false =>
+              match countRes with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported =>
+                match
+                  checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts srcVal elemAlign false,
+                  checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts dstVal elemAlign false
+                with
+                | .ub, _ => MirStepNode.fail .ub
+                | _, .ub => MirStepNode.fail .ub
+                | _, _ => MirStepNode.unsupported
+              | .ok count =>
+                let byteCount := Nat.mul count elemSize
+                match Nat.ble byteCount isizeMax with
+                | false => MirStepNode.fail .ub
+                | true =>
+                  match Nat.beq byteCount 0 with
+                  | true =>
+                    match
+                      checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts srcVal elemAlign false
+                    with
+                    | .ub => MirStepNode.fail .ub
+                    | .unsupported => MirStepNode.unsupported
+                    | .ok () =>
+                      match
+                        checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts dstVal elemAlign false
+                      with
+                      | .ub => MirStepNode.fail .ub
+                      | .unsupported => MirStepNode.unsupported
+                      | .ok () =>
+                        writeIntrinsicReturnWithProtectors
+                          s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
+                  | false =>
+                    match Bool.or srcNull dstNull with
+                    | true => MirStepNode.fail .ub
+                    | false =>
+                      match
+                        checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts srcVal elemAlign true
+                      with
+                      | .ub => MirStepNode.fail .ub
+                      | .unsupported => MirStepNode.unsupported
+                      | .ok () =>
+                        match
+                          checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts dstVal elemAlign true
+                        with
+                        | .ub => MirStepNode.fail .ub
+                        | .unsupported => MirStepNode.unsupported
+                        | .ok () =>
+                          match srcVal, dstVal with
+                          | .ptr srcPtr _, .ptr dstPtr _ =>
+                            match
+                              evalCopyMemory
+                                s locals' bodyLocalDecls bodyLayouts srcPtr dstPtr byteCount
+                            with
+                            | .ub => MirStepNode.fail .ub
+                            | .unsupported => MirStepNode.unsupported
+                            | .ok (locals₂, mem₂) =>
+                              writeIntrinsicReturnWithProtectors
+                                { s with memory := mem₂ }
+                                bodyLocalDecls
+                                bodyLayouts
+                                locals₂
+                                destination
+                                targetOpt
+                                .unit
+                          | _, _ => MirStepNode.fail .ub
+          | _, _, _ => MirStepNode.unsupported
+  | _ => MirStepNode.fail .ub
+
+/--
+Evaluate a direct call to `core::intrinsics::compare_bytes(left: *const u8,
+right: *const u8, bytes: usize) -> i32`:
+1. Validates both `left` and `right` as non-null thin pointers BEFORE failing
+   closed on provenance-carrying `bytes` counts (null is UB even at `bytes = 0`
+   per `core::ptr#safety`: "A [null] pointer is *never* valid for
+   reads/writes").
+2. Enforces `bytes <= isize::MAX`; at `bytes = 0`, returns `0i32`.
+3. For `bytes > 0`, resolves live endpoints for `left` then `right`, checks
+   bounds and Tree Borrows tag windows, reads full `[off, off + bytes)` slices,
+   applies exact-range Tree Borrows read transitions, eagerly checks `.uninit`
+   across each full slice BEFORE checking provenance (`stripProvenanceBytes`),
+   and returns `-1`/`0`/`1` as `i32`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2320-L2337>
+
+> "/// Lexicographically compare `[left, left + bytes)` and `[right, right + bytes)`
+> /// as unsigned bytes, returning negative if `left` is less, zero if all the
+> /// bytes match, or positive if `left` is greater.
+> ...
+> /// `left` and `right` must each be [valid] for reads of `bytes` bytes.
+> ///
+> /// Note that this applies to the whole range, not just until the first byte
+> /// that differs.  That allows optimizations that can read in large chunks.
+> ...
+> pub const unsafe fn compare_bytes(left: *const u8, right: *const u8, bytes: usize) -> i32;"
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L20>
+
+> "//! * A [null] pointer is *never* valid for reads/writes.
+> //! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes."
+-/
+def evalCompareBytesCall
+    (s : MachineState)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  let isizeMax := Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1
+  match argVals with
+  | leftVal :: rightVal :: lenVal :: .nil =>
+    match
+      isNullThinPtr s.memory ptrBytes leftVal,
+      isNullThinPtr s.memory ptrBytes rightVal
+    with
+    | .some false, .some false =>
+      match decodeUsizeArg? s.memory ptrBytes lenVal with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok byteCount =>
+        match Nat.ble byteCount isizeMax with
+        | false => MirStepNode.fail .ub
+        | true =>
+          match Nat.beq byteCount 0 with
+          | true =>
+            writeIntrinsicReturnWithProtectors
+              s bodyLocalDecls bodyLayouts locals' destination targetOpt (.scalar ⟨0, 4⟩)
+          | false =>
+            match leftVal, rightVal with
+            | .ptr leftPtr _, .ptr rightPtr _ =>
+              match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts leftPtr with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok leftEp =>
+                match endpointAccessCheck leftEp byteCount with
+                | .ub => MirStepNode.fail .ub
+                | .unsupported => MirStepNode.unsupported
+                | .ok () =>
+                  match readRootAbstractBytes s.memory leftEp with
+                  | .none => MirStepNode.unsupported
+                  | .some leftRootBytes =>
+                    match sliceAbstractBytes leftRootBytes leftEp.effOff byteCount with
+                    | .none => MirStepNode.fail .ub
+                    | .some leftSlice =>
+                      match endpointBorrowsAfterRead s.memory leftEp byteCount with
+                      | .none => MirStepNode.fail .ub
+                      | .some borrows₁ =>
+                        let mem₁ : Memory := { s.memory with borrows := borrows₁ }
+                        match stripProvenanceBytes s.memory leftSlice with
+                        | .ub => MirStepNode.fail .ub
+                        | .unsupported => MirStepNode.unsupported
+                        | .ok leftRaw =>
+                          match
+                            resolveLiveMemEndpoint
+                              { s with memory := mem₁ } locals' bodyLocalDecls bodyLayouts rightPtr
+                          with
+                          | .ub => MirStepNode.fail .ub
+                          | .unsupported => MirStepNode.unsupported
+                          | .ok rightEp =>
+                            match endpointAccessCheck rightEp byteCount with
+                            | .ub => MirStepNode.fail .ub
+                            | .unsupported => MirStepNode.unsupported
+                            | .ok () =>
+                              match readRootAbstractBytes mem₁ rightEp with
+                              | .none => MirStepNode.unsupported
+                              | .some rightRootBytes =>
+                                match
+                                  sliceAbstractBytes rightRootBytes rightEp.effOff byteCount
+                                with
+                                | .none => MirStepNode.fail .ub
+                                | .some rightSlice =>
+                                  match endpointBorrowsAfterRead mem₁ rightEp byteCount with
+                                  | .none => MirStepNode.fail .ub
+                                  | .some borrows₂ =>
+                                    match stripProvenanceBytes mem₁ rightSlice with
+                                    | .ub => MirStepNode.fail .ub
+                                    | .unsupported => MirStepNode.unsupported
+                                    | .ok rightRaw =>
+                                      let cmpBits := compareUnsignedBytesI32 leftRaw rightRaw
+                                      writeIntrinsicReturnWithProtectors
+                                        { s with memory := { mem₁ with borrows := borrows₂ } }
+                                        bodyLocalDecls
+                                        bodyLayouts
+                                        locals'
+                                        destination
+                                        targetOpt
+                                        (.scalar ⟨cmpBits, 4⟩)
+            | _, _ => MirStepNode.fail .ub
+    | _, _ => MirStepNode.fail .ub
+  | _ => MirStepNode.fail .ub
+
+/--
+Evaluate a direct call to `core::intrinsics::raw_eq<T>(a: &T, b: &T) -> bool`:
+1. Unsized `T` fails closed `.unsupported`.
+2. Rejects malformed/null pointer arguments and layout-uninhabited `T` (for
+   both ZST and non-ZST `T`, while `&!` is layout-inhabited so `raw_eq::<&!>`
+   proceeds) with `.ub` BEFORE failing closed on undetermined layout/alignment.
+3. Checks alignment of `a` and `b` against `align_of::<T>()`; ZST returns `true`.
+4. For `size_of::<T>() > 0`, resolves live endpoints, checks bounds and Tree
+   Borrows tag windows, applies exact-range Tree Borrows read transitions,
+   eagerly checks `.uninit` (including padding!) across each full slice BEFORE
+   provenance (`stripProvenanceBytes`), and returns `bool` bytewise equality.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2293-L2318>
+
+> "/// Determines whether the raw bytes of the two values are equal.
+> ...
+> /// Since this works by comparing the underlying bytes, the actual `T` is
+> /// not particularly important.  It will be used for its size and alignment,
+> /// but any validity restrictions will be ignored, not enforced.
+> ///
+> /// # Safety
+> ///
+> /// It's UB to call this if any of the *bytes* in `*a` or `*b` are uninitialized.
+> /// Note that this is a stricter criterion than just the *values* being
+> /// fully-initialized: if `T` has padding, it's UB to call this intrinsic.
+> ...
+> pub const unsafe fn raw_eq<T>(a: &T, b: &T) -> bool;"
+-/
+def evalRawEqCall
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  let isizeMax := Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1
+  match argVals with
+  | aVal :: bVal :: .nil =>
+    match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+    | .none =>
+      match
+        isNullThinPtr s.memory ptrBytes aVal,
+        isNullThinPtr s.memory ptrBytes bVal
+      with
+      | .some false, .some false =>
+        intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+      | _, _ => MirStepNode.fail .ub
+    | .some elemTy =>
+      match isUnsizedRigidTy 8 elemTy with
+      | true => MirStepNode.unsupported
+      | false =>
+        match
+          isNullThinPtr s.memory ptrBytes aVal,
+          isNullThinPtr s.memory ptrBytes bVal
+        with
+        | .some false, .some false =>
+          match isUninhabitedRigidTy bodyLocalDecls bodyLayouts 8 elemTy with
+          | true => MirStepNode.fail .ub
+          | false =>
+            match
+              rigidTyLayoutDeterminedAux bodyLocalDecls bodyLayouts true 8 elemTy,
+              exactRigidTyByteSize? bodyLocalDecls bodyLayouts elemTy,
+              exactRigidTyAlign? bodyLocalDecls bodyLayouts elemTy
+            with
+            | true, .some elemSize, .some elemAlign =>
+              let isZero := Nat.beq elemSize 0
+              match
+                checkPtrArgAligned
+                  s locals' bodyLocalDecls bodyLayouts aVal elemAlign (Bool.not isZero)
+              with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok () =>
+                match
+                  checkPtrArgAligned
+                    s locals' bodyLocalDecls bodyLayouts bVal elemAlign (Bool.not isZero)
+                with
+                | .ub => MirStepNode.fail .ub
+                | .unsupported => MirStepNode.unsupported
+                | .ok () =>
+                  match isZero with
+                  | true =>
+                    writeIntrinsicReturnWithProtectors
+                      s bodyLocalDecls bodyLayouts locals' destination targetOpt (.scalar ⟨1, 1⟩)
+                  | false =>
+                    match Nat.ble elemSize isizeMax with
+                    | false => MirStepNode.fail .ub
+                    | true =>
+                      match aVal, bVal with
+                      | .ptr aPtr _, .ptr bPtr _ =>
+                        match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts aPtr with
+                        | .ub => MirStepNode.fail .ub
+                        | .unsupported => MirStepNode.unsupported
+                        | .ok aEp =>
+                          match endpointAccessCheck aEp elemSize with
+                          | .ub => MirStepNode.fail .ub
+                          | .unsupported => MirStepNode.unsupported
+                          | .ok () =>
+                            match readRootAbstractBytes s.memory aEp with
+                            | .none => MirStepNode.unsupported
+                            | .some aRootBytes =>
+                              match sliceAbstractBytes aRootBytes aEp.effOff elemSize with
+                              | .none => MirStepNode.fail .ub
+                              | .some aSlice =>
+                                match endpointBorrowsAfterRead s.memory aEp elemSize with
+                                | .none => MirStepNode.fail .ub
+                                | .some borrows₁ =>
+                                  let mem₁ : Memory := { s.memory with borrows := borrows₁ }
+                                  match stripProvenanceBytes s.memory aSlice with
+                                  | .ub => MirStepNode.fail .ub
+                                  | .unsupported => MirStepNode.unsupported
+                                  | .ok aRaw =>
+                                    match
+                                      resolveLiveMemEndpoint
+                                        { s with memory := mem₁ }
+                                        locals' bodyLocalDecls bodyLayouts bPtr
+                                    with
+                                    | .ub => MirStepNode.fail .ub
+                                    | .unsupported => MirStepNode.unsupported
+                                    | .ok bEp =>
+                                      match endpointAccessCheck bEp elemSize with
+                                      | .ub => MirStepNode.fail .ub
+                                      | .unsupported => MirStepNode.unsupported
+                                      | .ok () =>
+                                        match readRootAbstractBytes mem₁ bEp with
+                                        | .none => MirStepNode.unsupported
+                                        | .some bRootBytes =>
+                                          match
+                                            sliceAbstractBytes bRootBytes bEp.effOff elemSize
+                                          with
+                                          | .none => MirStepNode.fail .ub
+                                          | .some bSlice =>
+                                            match endpointBorrowsAfterRead mem₁ bEp elemSize with
+                                            | .none => MirStepNode.fail .ub
+                                            | .some borrows₂ =>
+                                              match stripProvenanceBytes mem₁ bSlice with
+                                              | .ub => MirStepNode.fail .ub
+                                              | .unsupported => MirStepNode.unsupported
+                                              | .ok bRaw =>
+                                                let eqBit :=
+                                                  match listByteEq aRaw bRaw with
+                                                  | true => 1
+                                                  | false => 0
+                                                writeIntrinsicReturnWithProtectors
+                                                  { s with
+                                                    memory := { mem₁ with borrows := borrows₂ } }
+                                                  bodyLocalDecls
+                                                  bodyLayouts
+                                                  locals'
+                                                  destination
+                                                  targetOpt
+                                                  (.scalar ⟨eqBit, 1⟩)
+                      | _, _ => MirStepNode.fail .ub
+            | _, _, _ => MirStepNode.unsupported
+        | _, _ => MirStepNode.fail .ub
+  | _ => MirStepNode.fail .ub
+
+/--
+Evaluate a direct call to `core::intrinsics::typed_swap_nonoverlapping<T>(x:
+*mut T, y: *mut T) -> ()`:
+1. Unsized `T` fails closed `.unsupported`.
+2. Rejects malformed/null pointer arguments (even for ZST `T` per `ptr#safety`)
+   and layout-uninhabited `T` with `.ub` BEFORE failing closed on undetermined
+   layout/alignment.
+3. Checks alignment of `x` and `y` against `align_of::<T>()`; ZST is a no-op.
+4. For `size_of::<T>() > 0`, resolves live endpoints and checks tag windows,
+   enforces container-first disjointness (`AllocKey.beq` + `rangesDisjoint`,
+   permitting disjoint elements of the same container while rejecting any byte
+   overlap as `.ub`), executes exact-range Tree Borrows transitions in order
+   `read(x) -> read(y) -> write(x) -> write(y)`, validates both values via
+   3-way `validateTypedBytes`, resets all inter-field/trailing/common-union
+   padding to `.uninit` on BOTH stack locals and globals via
+   `resetTypedPaddingBytes`, and commits atomically via
+   `commitRootAbstractBytes` (single-buffer commit when `x` and `y` share the
+   same root allocation).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2545-L2573>
+
+> "/// Non-overlapping *typed* swap of a single value.
+> ...
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * Both `x` and `y` must be [valid] for both reads and writes.
+> ///
+> /// * Both `x` and `y` must be properly aligned.
+> ///
+> /// * The region of memory beginning at `x` must *not* overlap with the region of memory
+> ///   beginning at `y`.
+> ///
+> /// * The memory pointed by `x` and `y` must both contain values of type `T`.
+> ...
+> pub const unsafe fn typed_swap_nonoverlapping<T>(x: *mut T, y: *mut T) {"
+-/
+def evalTypedSwapNonOverlappingCall
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  let isizeMax := Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1
+  match argVals with
+  | xVal :: yVal :: .nil =>
+    match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+    | .none =>
+      match
+        isNullThinPtr s.memory ptrBytes xVal,
+        isNullThinPtr s.memory ptrBytes yVal
+      with
+      | .some false, .some false =>
+        intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+      | _, _ => MirStepNode.fail .ub
+    | .some elemTy =>
+      match isUnsizedRigidTy 8 elemTy with
+      | true => MirStepNode.unsupported
+      | false =>
+        match
+          isNullThinPtr s.memory ptrBytes xVal,
+          isNullThinPtr s.memory ptrBytes yVal
+        with
+        | .some false, .some false =>
+          match isUninhabitedRigidTy bodyLocalDecls bodyLayouts 8 elemTy with
+          | true => MirStepNode.fail .ub
+          | false =>
+            match
+              rigidTyLayoutDeterminedAux bodyLocalDecls bodyLayouts true 8 elemTy,
+              exactRigidTyByteSize? bodyLocalDecls bodyLayouts elemTy,
+              exactRigidTyAlign? bodyLocalDecls bodyLayouts elemTy
+            with
+            | true, .some elemSize, .some elemAlign =>
+              let isZero := Nat.beq elemSize 0
+              match
+                checkPtrArgAligned
+                  s locals' bodyLocalDecls bodyLayouts xVal elemAlign (Bool.not isZero)
+              with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok () =>
+                match
+                  checkPtrArgAligned
+                    s locals' bodyLocalDecls bodyLayouts yVal elemAlign (Bool.not isZero)
+                with
+                | .ub => MirStepNode.fail .ub
+                | .unsupported => MirStepNode.unsupported
+                | .ok () =>
+                  match isZero with
+                  | true =>
+                    writeIntrinsicReturnWithProtectors
+                      s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
+                  | false =>
+                    match Nat.ble elemSize isizeMax with
+                    | false => MirStepNode.fail .ub
+                    | true =>
+                      match xVal, yVal with
+                      | .ptr xPtr _, .ptr yPtr _ =>
+                        match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts xPtr with
+                        | .ub => MirStepNode.fail .ub
+                        | .unsupported => MirStepNode.unsupported
+                        | .ok xEp =>
+                          match endpointAccessCheck xEp elemSize with
+                          | .ub => MirStepNode.fail .ub
+                          | .unsupported => MirStepNode.unsupported
+                          | .ok () =>
+                            match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts yPtr with
+                            | .ub => MirStepNode.fail .ub
+                            | .unsupported => MirStepNode.unsupported
+                            | .ok yEp0 =>
+                              match endpointAccessCheck yEp0 elemSize with
+                              | .ub => MirStepNode.fail .ub
+                              | .unsupported => MirStepNode.unsupported
+                              | .ok () =>
+                                let sameAlloc := AllocKey.beq xEp.allocKey yEp0.allocKey
+                                match
+                                  Bool.and sameAlloc
+                                    (Bool.not
+                                      (rangesDisjoint
+                                        xEp.effOff elemSize yEp0.effOff elemSize))
+                                with
+                                | true => MirStepNode.fail .ub
+                                | false =>
+                                  match readRootAbstractBytes s.memory xEp with
+                                  | .none => MirStepNode.unsupported
+                                  | .some xRootBytes =>
+                                    match sliceAbstractBytes xRootBytes xEp.effOff elemSize with
+                                    | .none => MirStepNode.fail .ub
+                                    | .some xSlice =>
+                                      match endpointBorrowsAfterRead s.memory xEp elemSize with
+                                      | .none => MirStepNode.fail .ub
+                                      | .some borrows₁ =>
+                                        let mem₁ : Memory := { s.memory with borrows := borrows₁ }
+                                        match
+                                          resolveLiveMemEndpoint
+                                            { s with memory := mem₁ }
+                                            locals' bodyLocalDecls bodyLayouts yPtr
+                                        with
+                                        | .ub => MirStepNode.fail .ub
+                                        | .unsupported => MirStepNode.unsupported
+                                        | .ok yEp₁ =>
+                                          match endpointAccessCheck yEp₁ elemSize with
+                                          | .ub => MirStepNode.fail .ub
+                                          | .unsupported => MirStepNode.unsupported
+                                          | .ok () =>
+                                            match readRootAbstractBytes mem₁ yEp₁ with
+                                            | .none => MirStepNode.unsupported
+                                            | .some yRootBytes =>
+                                              match
+                                                sliceAbstractBytes yRootBytes yEp₁.effOff elemSize
+                                              with
+                                              | .none => MirStepNode.fail .ub
+                                              | .some ySlice =>
+                                                match endpointBorrowsAfterRead mem₁ yEp₁ elemSize with
+                                                | .none => MirStepNode.fail .ub
+                                                | .some borrows₂ =>
+                                                  let mem₂ : Memory :=
+                                                    { mem₁ with borrows := borrows₂ }
+                                                  let elemTyFull :=
+                                                    resolveIntrinsicPointeeFullTy
+                                                      bodyLocalDecls bodyLayouts argOps elemTy
+                                                  match
+                                                    validateTypedBytes
+                                                      s.memory bodyLocalDecls bodyLayouts
+                                                      defaultCodecFuel elemTyFull xSlice
+                                                  with
+                                                  | .ub => MirStepNode.fail .ub
+                                                  | .unsupported => MirStepNode.unsupported
+                                                  | .valid =>
+                                                    match
+                                                      validateTypedBytes
+                                                        mem₁ bodyLocalDecls bodyLayouts
+                                                        defaultCodecFuel elemTyFull ySlice
+                                                    with
+                                                    | .ub => MirStepNode.fail .ub
+                                                    | .unsupported => MirStepNode.unsupported
+                                                    | .valid =>
+                                                      match
+                                                        resetTypedPaddingBytes
+                                                          defaultCodecFuel
+                                                          bodyLocalDecls bodyLayouts
+                                                          elemTyFull xSlice,
+                                                        resetTypedPaddingBytes
+                                                          defaultCodecFuel
+                                                          bodyLocalDecls bodyLayouts
+                                                          elemTyFull ySlice
+                                                      with
+                                                      | .some xStored, .some yStored =>
+                                                        match
+                                                          resolveLiveMemEndpoint
+                                                            { s with memory := mem₂ }
+                                                            locals' bodyLocalDecls bodyLayouts xPtr
+                                                        with
+                                                        | .ub => MirStepNode.fail .ub
+                                                        | .unsupported => MirStepNode.unsupported
+                                                        | .ok xEp₂ =>
+                                                          match endpointAccessCheck xEp₂ elemSize with
+                                                          | .ub => MirStepNode.fail .ub
+                                                          | .unsupported => MirStepNode.unsupported
+                                                          | .ok () =>
+                                                            match
+                                                              endpointBorrowsAfterWrite
+                                                                mem₂ xEp₂ elemSize
+                                                            with
+                                                            | .none => MirStepNode.fail .ub
+                                                            | .some borrows₃ =>
+                                                              let mem₃ : Memory :=
+                                                                { mem₂ with borrows := borrows₃ }
+                                                              match sameAlloc with
+                                                              | true =>
+                                                                match
+                                                                  resolveLiveMemEndpoint
+                                                                    { s with memory := mem₃ }
+                                                                    locals' bodyLocalDecls
+                                                                    bodyLayouts yPtr
+                                                                with
+                                                                | .ub => MirStepNode.fail .ub
+                                                                | .unsupported => MirStepNode.unsupported
+                                                                | .ok yEp₃ =>
+                                                                  match
+                                                                    endpointAccessCheck yEp₃ elemSize
+                                                                  with
+                                                                  | .ub => MirStepNode.fail .ub
+                                                                  | .unsupported =>
+                                                                    MirStepNode.unsupported
+                                                                  | .ok () =>
+                                                                    match
+                                                                      endpointBorrowsAfterWrite
+                                                                        mem₃ yEp₃ elemSize
+                                                                    with
+                                                                    | .none => MirStepNode.fail .ub
+                                                                    | .some borrows₄ =>
+                                                                      let mem₄ : Memory :=
+                                                                        { mem₃ with
+                                                                          borrows := borrows₄ }
+                                                                      match
+                                                                        writeAbstractBytesAt
+                                                                          xRootBytes
+                                                                          xEp₂.effOff
+                                                                          yStored
+                                                                      with
+                                                                      | .none => MirStepNode.fail .ub
+                                                                      | .some patched1 =>
+                                                                        match
+                                                                          writeAbstractBytesAt
+                                                                            patched1
+                                                                            yEp₃.effOff
+                                                                            xStored
+                                                                        with
+                                                                        | .none => MirStepNode.fail .ub
+                                                                        | .some patched2 =>
+                                                                          match
+                                                                            commitRootAbstractBytes
+                                                                              mem₄ locals' xEp₂
+                                                                              patched2
+                                                                          with
+                                                                          | .ub => MirStepNode.fail .ub
+                                                                          | .unsupported =>
+                                                                            MirStepNode.unsupported
+                                                                          | .ok (localsF, memF) =>
+                                                                            writeIntrinsicReturnWithProtectors
+                                                                              { s with memory := memF }
+                                                                              bodyLocalDecls
+                                                                              bodyLayouts
+                                                                              localsF
+                                                                              destination
+                                                                              targetOpt
+                                                                              .unit
+                                                              | false =>
+                                                                match
+                                                                  writeAbstractBytesAt
+                                                                    xRootBytes
+                                                                    xEp₂.effOff
+                                                                    yStored
+                                                                with
+                                                                | .none => MirStepNode.fail .ub
+                                                                | .some xPatched =>
+                                                                  match
+                                                                    commitRootAbstractBytes
+                                                                      mem₃ locals' xEp₂ xPatched
+                                                                  with
+                                                                  | .ub => MirStepNode.fail .ub
+                                                                  | .unsupported =>
+                                                                    MirStepNode.unsupported
+                                                                  | .ok (locals₁, mem₃') =>
+                                                                    match
+                                                                      resolveLiveMemEndpoint
+                                                                        { s with memory := mem₃' }
+                                                                        locals₁ bodyLocalDecls
+                                                                        bodyLayouts yPtr
+                                                                    with
+                                                                    | .ub => MirStepNode.fail .ub
+                                                                    | .unsupported =>
+                                                                      MirStepNode.unsupported
+                                                                    | .ok yEp₃ =>
+                                                                      match
+                                                                        endpointAccessCheck
+                                                                          yEp₃ elemSize
+                                                                      with
+                                                                      | .ub => MirStepNode.fail .ub
+                                                                      | .unsupported =>
+                                                                        MirStepNode.unsupported
+                                                                      | .ok () =>
+                                                                        match
+                                                                          endpointBorrowsAfterWrite
+                                                                            mem₃' yEp₃ elemSize
+                                                                        with
+                                                                        | .none =>
+                                                                          MirStepNode.fail .ub
+                                                                        | .some borrows₄ =>
+                                                                          let mem₄ : Memory :=
+                                                                            { mem₃' with
+                                                                              borrows := borrows₄ }
+                                                                          match
+                                                                            writeAbstractBytesAt
+                                                                              yRootBytes
+                                                                              yEp₃.effOff
+                                                                              xStored
+                                                                          with
+                                                                          | .none =>
+                                                                            MirStepNode.fail .ub
+                                                                          | .some yPatched =>
+                                                                            match
+                                                                              commitRootAbstractBytes
+                                                                                mem₄ locals₁ yEp₃
+                                                                                yPatched
+                                                                            with
+                                                                            | .ub =>
+                                                                              MirStepNode.fail .ub
+                                                                            | .unsupported =>
+                                                                              MirStepNode.unsupported
+                                                                            | .ok (localsF, memF) =>
+                                                                              writeIntrinsicReturnWithProtectors
+                                                                                { s with
+                                                                                  memory := memF }
+                                                                                bodyLocalDecls
+                                                                                bodyLayouts
+                                                                                localsF
+                                                                                destination
+                                                                                targetOpt
+                                                                                .unit
+                                                      | _, _ => MirStepNode.unsupported
+                      | _, _ => MirStepNode.fail .ub
+            | _, _, _ => MirStepNode.unsupported
+        | _, _ => MirStepNode.fail .ub
+  | _ => MirStepNode.fail .ub
+
+/--
+Resolve the effective byte offsets `(ptrOff, baseOff)` of `ptrVal` and `baseVal`
+for `core::intrinsics::ptr_offset_from` / `ptr_offset_from_unsigned`:
+- Same-address fast path (equal provenance-free addresses in either integer or
+  unbacked `allocId = 0` encoding, identical `(allocId, offsetBytes)`, or equal
+  effective offsets in the same live allocation) returns `.ok (0, 0)` without
+  requiring liveness or in-bounds checks.
+- Non-zero distance requires both pointers to derive from the same live
+  allocation with both offsets in `[0, allocSize]` (including one-past-end),
+  independent of Tree Borrows permissions (`DIV-LM-D6-OFFSET-DISABLED-TAG`).
+- Distinct dead tags of the same root local fault `.ub` when their known
+  effective offsets differ, and fail closed `.unsupported` when equal or
+  unknown (storage generation is not recorded).
+
+Reference (`core::ptr::const_ptr::<impl *const T>::offset_from` documentation,
+`library/core/src/ptr/const_ptr.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L545-L552>
+
+> "/// If any of the following conditions are violated, the result is Undefined Behavior:
+> ///
+> /// * `self` and `origin` must either
+> ///
+> ///   * point to the same address, or
+> ///   * both be [derived from][crate::ptr#provenance] a pointer to the same [allocation], and the memory range between
+> ///     the two pointers must be in bounds of that object."
+-/
+def resolvePtrOffsetFromOffsets
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (ptrVal baseVal : Value) :
+    MemOpRes (Nat × Nat) :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  let intAddrOf : Value → Option Nat := fun v =>
+    match v with
+    | .scalar sc =>
+      match Nat.beq sc.sizeBytes ptrBytes with
+      | true => .some (Nat.mod sc.bits (scalarModulus ptrBytes))
+      | false => .none
+    | .ptr p sz =>
+      match Bool.and (Nat.beq sz ptrBytes)
+        (Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p))) with
+      | true => .some (Nat.mod p.offsetBytes (scalarModulus ptrBytes))
+      | false => .none
+    | _ => .none
+  match intAddrOf ptrVal, intAddrOf baseVal with
+  | .some a1, .some a2 =>
+    match Nat.beq a1 a2 with
+    | true => .ok (0, 0)
+    | false => .ub
+  | .some _, .none => .ub
+  | .none, .some _ => .ub
+  | .none, .none =>
+    match ptrVal, baseVal with
+    | .ptr p1 sz1, .ptr p2 sz2 =>
+      match Bool.and (Nat.beq sz1 ptrBytes) (Nat.beq sz2 ptrBytes) with
+      | false => .ub
+      | true =>
+        match Bool.and (Nat.beq p1.allocId p2.allocId) (Nat.beq p1.offsetBytes p2.offsetBytes) with
+        | true => .ok (0, 0)
+        | false =>
+          match
+            lookupGlobalAlloc s.memory.globals p1.allocId,
+            lookupGlobalAlloc s.memory.globals p2.allocId
+          with
+          | .some g1, .some g2 =>
+            match Nat.beq g1.allocId g2.allocId with
+            | false => .ub
+            | true =>
+              match Nat.beq p1.offsetBytes p2.offsetBytes with
+              | true => .ok (0, 0)
+              | false =>
+                let gSize := length g1.bytes
+                match Bool.and (Nat.ble p1.offsetBytes gSize) (Nat.ble p2.offsetBytes gSize) with
+                | true => .ok (p1.offsetBytes, p2.offsetBytes)
+                | false => .ub
+          | .some _, .none => .ub
+          | .none, .some _ => .ub
+          | .none, .none =>
+            match
+              lookupBorrow s.memory.borrows p1.tag,
+              lookupBorrow s.memory.borrows p2.tag
+            with
+            | .some e1, .some e2 =>
+              match
+                Bool.and
+                  (Nat.beq e1.targetFrameDepth e2.targetFrameDepth)
+                  (Nat.beq e1.targetLocal e2.targetLocal)
+              with
+              | false => .ub
+              | true =>
+                match e1.allocDead, e2.allocDead with
+                | true, true =>
+                  match Nat.beq e1.tag e2.tag with
+                  | true => .ub
+                  | false =>
+                    match
+                      borrowPlaceByteOffset?
+                        locals s.memory.callerLocals bodyLocalDecls bodyLayouts e1 s.memory.callStack,
+                      borrowPlaceByteOffset?
+                        locals s.memory.callerLocals bodyLocalDecls bodyLayouts e2 s.memory.callStack
+                    with
+                    | .some po1, .some po2 =>
+                      let eff1 := Nat.add po1 p1.offsetBytes
+                      let eff2 := Nat.add po2 p2.offsetBytes
+                      match Nat.beq eff1 eff2 with
+                      | false => .ub
+                      | true => .unsupported
+                    | _, _ => .unsupported
+                | true, false => .ub
+                | false, true => .ub
+                | false, false =>
+                  match
+                    borrowPlaceByteOffset?
+                      locals s.memory.callerLocals bodyLocalDecls bodyLayouts e1 s.memory.callStack,
+                    borrowPlaceByteOffset?
+                      locals s.memory.callerLocals bodyLocalDecls bodyLayouts e2 s.memory.callStack
+                  with
+                  | .some po1, .some po2 =>
+                    let eff1 := Nat.add po1 p1.offsetBytes
+                    let eff2 := Nat.add po2 p2.offsetBytes
+                    match Nat.beq eff1 eff2 with
+                    | true => .ok (0, 0)
+                    | false =>
+                      match
+                        readFrameLocalSlot
+                          locals s.memory.callStack s.memory.callerLocals
+                          e1.targetFrameDepth e1.targetLocal
+                      with
+                      | .none => .ub
+                      | .some .dead => .ub
+                      | .some slot =>
+                        let (targetDecls, targetLayouts) : List LocalDecl × LayoutTable :=
+                          match
+                            frameLocalDeclsAndLayoutsAtDepth
+                              s.memory.callStack bodyLocalDecls bodyLayouts e1.targetFrameDepth
+                          with
+                          | .some pair => pair
+                          | .none =>
+                            foreignFrameDeclsAndLayouts
+                              s.memory.callStack bodyLayouts e1.targetFrameDepth e1.targetLocal
+                        let rootTy? : Option Ty :=
+                          match get? targetDecls e1.targetLocal with
+                          | .some decl => .some decl.ty
+                          | .none => .none
+                        let allocSize? : Option Nat :=
+                          match rootTy? with
+                          | .some rTy => exactTyByteSize? targetDecls targetLayouts rTy
+                          | .none =>
+                            match slot with
+                            | .init rootVal =>
+                              match untypedValueHasExactByteImage defaultCodecFuel rootVal with
+                              | true => valueDefaultByteSize rootVal
+                              | false => .none
+                            | _ => .none
+                        match allocSize? with
+                        | .none => .unsupported
+                        | .some allocSize =>
+                          match Bool.and (Nat.ble eff1 allocSize) (Nat.ble eff2 allocSize) with
+                          | true => .ok (eff1, eff2)
+                          | false => .ub
+                  | _, _ => .unsupported
+            | _, _ => .ub
+    | _, _ => .ub
+
+/--
+Compute the element-scaled signed (`unsigned = false`, `isize`) or unsigned
+(`unsigned = true`, `usize`) pointer distance `(ptrOff - baseOff) / elemSize`,
+rejecting ZST (`elemSize == 0`), oversized `elemSize > isize::MAX`,
+out-of-range byte distance (`|dist| > isize::MAX`, which rejects `isize::MIN`
+as UB), negative distance when `unsigned = true`, and non-exact divisibility.
+
+Reference (`library/core/src/ptr/const_ptr.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L553-L574>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L665-L679>
+
+> "/// * The distance between the pointers, in bytes, must be an exact multiple
+> ///   of the size of `T`.
+> ///
+> /// As a consequence, the absolute distance between the pointers, in bytes, computed on
+> /// mathematical integers (without \"wrapping around\"), cannot overflow an `isize`."
+
+> "/// - The distance between the pointers must be non-negative (`self >= origin`)
+> ...
+> /// Importantly, despite the return type of this method being able to represent
+> /// a larger offset, it's still *not permitted* to pass pointers which differ
+> /// by more than `isize::MAX` *bytes*."
+-/
+def evalPtrOffsetFromDistance
+    (ptrBytes : Nat)
+    (unsigned : Bool)
+    (elemSize ptrOff baseOff : Nat) :
+    Option ScalarInt :=
+  let modW := scalarModulus ptrBytes
+  let isizeMax := Nat.sub (Nat.div modW 2) 1
+  match Bool.or (Nat.beq elemSize 0) (Bool.not (Nat.ble elemSize isizeMax)) with
+  | true => .none
+  | false =>
+    match Nat.ble baseOff ptrOff with
+    | true =>
+      let dist := Nat.sub ptrOff baseOff
+      match Bool.and (Nat.ble dist isizeMax) (Nat.beq (Nat.mod dist elemSize) 0) with
+      | true => .some ⟨Nat.div dist elemSize, ptrBytes⟩
+      | false => .none
+    | false =>
+      match unsigned with
+      | true => .none
+      | false =>
+        let negDist := Nat.sub baseOff ptrOff
+        match Bool.and (Nat.ble negDist isizeMax) (Nat.beq (Nat.mod negDist elemSize) 0) with
+        | true =>
+          let q := Nat.div negDist elemSize
+          .some ⟨Nat.sub modW q, ptrBytes⟩
+        | false => .none
+
+/--
+Evaluate a direct call to `core::intrinsics::ptr_offset_from<T>(ptr, base) ->
+isize` (`unsigned = false`) or `core::intrinsics::ptr_offset_from_unsigned<T>(
+ptr, base) -> usize` (`unsigned = true`). Uses `withAlign := false` when gating
+`T`'s structural size because element alignment is never required.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2268-L2278>
+
+> "pub const unsafe fn ptr_offset_from<T>(ptr: *const T, base: *const T) -> isize;"
+> "pub const unsafe fn ptr_offset_from_unsigned<T>(ptr: *const T, base: *const T) -> usize;"
+-/
+def evalPtrOffsetFromCall
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx)
+    (unsigned : Bool) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  let isizeMax := Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1
+  match argVals with
+  | ptrVal :: baseVal :: .nil =>
+    match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+    | .none =>
+      match
+        isNullThinPtr s.memory ptrBytes ptrVal,
+        isNullThinPtr s.memory ptrBytes baseVal
+      with
+      | .none, _ => MirStepNode.fail .ub
+      | _, .none => MirStepNode.fail .ub
+      | _, _ => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+    | .some elemTy =>
+      match isUnsizedRigidTy 8 elemTy with
+      | true => MirStepNode.unsupported
+      | false =>
+        match
+          isNullThinPtr s.memory ptrBytes ptrVal,
+          isNullThinPtr s.memory ptrBytes baseVal
+        with
+        | .none, _ => MirStepNode.fail .ub
+        | _, .none => MirStepNode.fail .ub
+        | .some _, .some _ =>
+          match
+            rigidTyLayoutDeterminedAux bodyLocalDecls bodyLayouts false 8 elemTy,
+            exactRigidTyByteSize? bodyLocalDecls bodyLayouts elemTy
+          with
+          | true, .some elemSize =>
+            match Bool.or (Nat.beq elemSize 0) (Bool.not (Nat.ble elemSize isizeMax)) with
+            | true => MirStepNode.fail .ub
+            | false =>
+              match
+                resolvePtrOffsetFromOffsets s locals' bodyLocalDecls bodyLayouts ptrVal baseVal
+              with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok (ptrOff, baseOff) =>
+                match evalPtrOffsetFromDistance ptrBytes unsigned elemSize ptrOff baseOff with
+                | .none => MirStepNode.fail .ub
+                | .some retSc =>
+                  writeIntrinsicReturnWithProtectors
+                    s bodyLocalDecls bodyLayouts locals' destination targetOpt (.scalar retSc)
+          | _, _ => MirStepNode.unsupported
+  | _ => MirStepNode.fail .ub
+
+/--
+Resolve `(allocAlign, placeOff)` for a provenance-carrying `ProvenancePtr` `p`
+for alignment-invariant symbolic `ptr_mask`: returns `.some (align, placeOff)`
+only when the root allocation's alignment is a validated positive power of two
+(using `exactRootAllocAlign?` for stack allocations and `Align.isPowerOfTwoBytes`
+for global allocations).
+-/
+def resolvePtrAllocAlignAndPlaceOff
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (p : ProvenancePtr) :
+    Option (Nat × Nat) :=
+  match lookupGlobalAlloc s.memory.globals p.allocId with
+  | .some gAlloc =>
+    match Align.isPowerOfTwoBytes gAlloc.align with
+    | true => .some (gAlloc.align.bytes, 0)
+    | false => .none
+  | .none =>
+    match lookupBorrow s.memory.borrows p.tag with
+    | .none => .none
+    | .some entry =>
+      match
+        borrowPlaceByteOffset?
+          locals s.memory.callerLocals bodyLocalDecls bodyLayouts entry s.memory.callStack
+      with
+      | .none => .none
+      | .some placeOff =>
+        let (targetDecls, targetLayouts) : List LocalDecl × LayoutTable :=
+          match
+            frameLocalDeclsAndLayoutsAtDepth
+              s.memory.callStack bodyLocalDecls bodyLayouts entry.targetFrameDepth
+          with
+          | .some pair => pair
+          | .none =>
+            foreignFrameDeclsAndLayouts
+              s.memory.callStack bodyLayouts entry.targetFrameDepth entry.targetLocal
+        match get? targetDecls entry.targetLocal with
+        | .none => .none
+        | .some rootDecl =>
+          match exactRootAllocAlign? targetDecls targetLayouts rootDecl.ty with
+          | .some rootAlign => .some (rootAlign, placeOff)
+          | .none => .none
+
+/--
+Evaluate a direct call to `core::intrinsics::ptr_mask<T>(ptr: *const T, mask:
+usize) -> *const T`:
+- Computes `ptr.with_addr(ptr.addr() & mask)`, preserving `ProvenancePtr`
+  (`allocId` / `tag`) WITHOUT modifying `Memory.exposedAllocIds` (per strict
+  provenance / `ucg#630` / `rust#166220`).
+- Integer pointers (`.scalar` or unbacked `allocId = 0`) mask directly.
+- Provenance-carrying thin pointers succeed on the universal identity mask
+  `mask == 2^W - 1` even when `allocAlign` is unknown, and in symbolic-base mode
+  succeed whenever `(2^W - 1) - mask < allocAlign` (guaranteeing base-address
+  invariance `(baseAddr + relOff) & mask = baseAddr + (relOff & mask)` for every
+  `allocAlign`-aligned base address) and `relOff & mask >= placeOff`, failing
+  closed `.unsupported` otherwise.
+- Wide pointers and provenance-carrying `usize` masks fail closed `.unsupported`
+  after validating malformed pointer/mask arguments as `.ub`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L944-L954>
+
+> "/// Masks out bits of the pointer according to a mask.
+> ///
+> /// Note that, unlike most intrinsics, this is safe to call;
+> /// it does not require an `unsafe` block.
+> /// Therefore, implementations must not require the user to uphold
+> /// any safety invariants.
+> ...
+> pub fn ptr_mask<T>(ptr: *const T, mask: usize) -> *const T;"
+
+Reference (`library/core/src/ptr/const_ptr.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L489-L494>
+
+> "/// Masks out bits of the pointer according to a mask.
+> ///
+> /// This is convenience for `ptr.map_addr(|a| a & mask)`.
+> ///
+> /// For non-`Sized` pointees this operation changes only the data pointer,
+> /// leaving the metadata untouched."
+-/
+def evalPtrMaskCall
+    (s : MachineState)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx) :
+    MirStepNode :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  let ptrBits := Nat.mul 8 ptrBytes
+  let modW := scalarModulus ptrBytes
+  let allOnes := Nat.sub modW 1
+  match argVals with
+  | ptrVal :: maskVal :: .nil =>
+    match ptrVal with
+    | .aggregate 0 (dVal :: mVal :: .nil) =>
+      match
+        isNullThinPtr s.memory ptrBytes dVal,
+        isValidWidePtrMetaValForWidth ptrBytes mVal,
+        decodeUsizeArg? s.memory ptrBytes maskVal
+      with
+      | .none, _, _ => MirStepNode.fail .ub
+      | _, false, _ => MirStepNode.fail .ub
+      | _, _, .ub => MirStepNode.fail .ub
+      | .some _, true, _ => MirStepNode.unsupported
+    | .scalar sc =>
+      match Nat.beq sc.sizeBytes ptrBytes with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match decodeUsizeArg? s.memory ptrBytes maskVal with
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
+        | .ok maskBits =>
+          let masked := bitwiseAndBits ptrBits sc.bits maskBits
+          writeIntrinsicReturnWithProtectors
+            s bodyLocalDecls bodyLayouts locals' destination targetOpt (.scalar ⟨masked, ptrBytes⟩)
+    | .ptr p sz =>
+      match Nat.beq sz ptrBytes with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match decodeUsizeArg? s.memory ptrBytes maskVal with
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
+        | .ok maskBits =>
+          let maskW := Nat.mod maskBits modW
+          match Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p)) with
+          | true =>
+            let masked := bitwiseAndBits ptrBits p.offsetBytes maskW
+            writeIntrinsicReturnWithProtectors
+              s bodyLocalDecls bodyLayouts locals' destination targetOpt
+              (.ptr { allocId := 0, offsetBytes := masked } ptrBytes)
+          | false =>
+            match Bool.and (Nat.beq maskW allOnes) (Nat.blt p.offsetBytes modW) with
+            | true =>
+              writeIntrinsicReturnWithProtectors
+                s bodyLocalDecls bodyLayouts locals' destination targetOpt (.ptr p ptrBytes)
+            | false =>
+              match resolvePtrAllocAlignAndPlaceOff s locals' bodyLocalDecls bodyLayouts p with
+              | .none => MirStepNode.unsupported
+              | .some (allocAlign, placeOff) =>
+                let relOff := Nat.add placeOff p.offsetBytes
+                match
+                  Bool.and
+                    (Nat.blt (Nat.sub allOnes maskW) allocAlign)
+                    (Nat.blt relOff modW)
+                with
+                | false => MirStepNode.unsupported
+                | true =>
+                  let maskedRel := bitwiseAndBits ptrBits relOff maskW
+                  match Nat.blt maskedRel placeOff with
+                  | true => MirStepNode.unsupported
+                  | false =>
+                    let newOff := Nat.sub maskedRel placeOff
+                    writeIntrinsicReturnWithProtectors
+                      s bodyLocalDecls bodyLayouts locals' destination targetOpt
+                      (.ptr { p with offsetBytes := newOff } ptrBytes)
+    | _ => MirStepNode.fail .ub
+  | _ => MirStepNode.fail .ub
+
+/--
+Resolve the `Ty` of `black_box<T>(dummy: T)` preserving any resolved field
+`layoutIdx` from `operandTyResolved` on `dummyOp` when consistent with
+`target.typeArgs`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2339-L2345>
+
+> "pub const fn black_box<T>(dummy: T) -> T;"
+-/
+def resolveBlackBoxTy?
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand) :
+    Option Ty :=
+  let opTy? : Option Ty :=
+    match argOps with
+    | dummyOp :: _ => operandTyResolved bodyLocalDecls bodyLayouts dummyOp
+    | .nil => .none
+  match target.typeArgs with
+  | argTy :: _ =>
+    match opTy? with
+    | .some opTy =>
+      match rigidTyEq opTy.kind argTy with
+      | true => .some opTy
+      | false => .some { kind := argTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+    | .none => .some { kind := argTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+  | .nil => opTy?
+
+/--
+Evaluate a direct call to `core::intrinsics::black_box<T>(dummy: T) -> T`:
+validates `dummy` against `T` via 3-way `validateBlackBoxValue` (permitting
+`.uninit` iff `T` permits it, rejecting invalid `bool`/`char`, null thin/wide
+references and `fn()`, uninhabited-pointee `&!`, null `dyn` vtables, and
+oversized slice lengths as `.ub`, and failing closed `.unsupported` on unknown
+or unsized `T`, char-shaped surrogates in layout scalars, scalar provenance, and
+unvalidated multi-variant enums), then writes `dummy` unchanged to `destination`
+via `writeIntrinsicReturnWithProtectors`.
+
+Reference (`library/core/src/intrinsics/mod.rs` and `library/core/src/hint.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2339-L2345>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/hint.rs#L315-L321>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/hint.rs#L486>
+
+> "pub const fn black_box<T>(dummy: T) -> T;"
+
+> "/// An identity function that *__hints__* to the compiler to be maximally pessimistic about what
+> /// `black_box` could do."
+
+> "/// During constant evaluation, `black_box` is treated as a no-op."
+-/
+def evalBlackBoxCall
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx) :
+    MirStepNode :=
+  match argVals with
+  | dummyVal :: .nil =>
+    match resolveBlackBoxTy? target bodyLocalDecls bodyLayouts argOps with
+    | .none => MirStepNode.unsupported
+    | .some dummyTy =>
+      match
+        validateBlackBoxValue
+          s.memory bodyLocalDecls bodyLayouts defaultCodecFuel dummyTy dummyVal
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .valid =>
+        writeIntrinsicReturnWithProtectors
+          s bodyLocalDecls bodyLayouts locals' destination targetOpt dummyVal
+  | _ => MirStepNode.fail .ub
+
+/--
+Dispatch the 8 core memory & pointer intrinsics (`copy`, `compare_bytes`,
+`raw_eq`, `typed_swap_nonoverlapping`, `ptr_offset_from`,
+`ptr_offset_from_unsigned`, `ptr_mask`, `black_box`), returning `.none` for all
+other `RustIntrinsicKind` variants so `evalDirectRustIntrinsic?` and
+`const_eval_select` fall through to existing evaluators.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
+
+> "Compiler intrinsics."
+-/
+@[reducible]
+def evalCoreMemPtrIntrinsicCall?
+    (kind : RustIntrinsicKind)
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx) :
+    Option MirStepNode :=
+  match kind with
+  | .copy =>
+    .some
+      (evalCopyCall
+        s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetOpt)
+  | .compareBytes =>
+    .some
+      (evalCompareBytesCall
+        s bodyLocalDecls bodyLayouts argVals locals' destination targetOpt)
+  | .rawEq =>
+    .some
+      (evalRawEqCall
+        s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetOpt)
+  | .typedSwapNonOverlapping =>
+    .some
+      (evalTypedSwapNonOverlappingCall
+        s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetOpt)
+  | .ptrOffsetFrom =>
+    .some
+      (evalPtrOffsetFromCall
+        s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetOpt false)
+  | .ptrOffsetFromUnsigned =>
+    .some
+      (evalPtrOffsetFromCall
+        s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetOpt true)
+  | .ptrMask =>
+    .some
+      (evalPtrMaskCall
+        s bodyLocalDecls bodyLayouts argVals locals' destination targetOpt)
+  | .blackBox =>
+    .some
+      (evalBlackBoxCall
+        s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetOpt)
+  | _ => .none
+
+/--
+Convert a normal return step `.tau (.running _)` of a returning intrinsic called
+through a diverging MIR call terminator (`target = .none`) into immediate
+undefined behavior (`MirStepNode.fail .ub`), while preserving `.unsupported` and
+other faults/outcomes unchanged.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L800-L814>
+
+> "Call {
+> ...
+>     target: Option<BasicBlock>,"
+-/
+@[reducible]
+def divergingCallReturnStep : MirStepNode → MirStepNode
+  | .tau (.running _) => MirStepNode.fail .ub
+  | other => other
+
+/--
+Dispatch a direct diverging MIR call (`target = .none`) to an inline-modeled
+compiler intrinsic:
+- `core::intrinsics::const_eval_select` fails closed `MirStepNode.unsupported`
+  because its runtime callee `called_at_rt` may validly diverge (`-> !`).
+- The 8 core memory & pointer intrinsics execute with `targetOpt = .none`
+  (preserving `.unsupported` / `.fail .ub` and faulting `.fail .ub` upon normal
+  return).
+- `exact_div`, `copy_nonoverlapping`, `write_bytes`, and all other returning
+  intrinsics execute and turn any normal return step `.tau (.running _)` into
+  `MirStepNode.fail .ub` via `divergingCallReturnStep` while preserving
+  `.unsupported` and faults.
+- Non-intrinsic `DefPath`s return `.none` so `evalTerminator` falls through to
+  `MirStepNode.extCall`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L800-L814>
+
+> "Call {
+> ...
+>     target: Option<BasicBlock>,"
+-/
+@[reducible]
+def evalDivergingRustIntrinsic?
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place) :
+    Option MirStepNode :=
+  match isDirectExactDivTarget target with
+  | true =>
+    .some
+      (match argVals with
+       | .scalar lhs :: .scalar rhs :: .nil =>
+         match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+         | .none => MirStepNode.unsupported
+         | .some isSigned =>
+           match evalExactDiv lhs rhs locals' s.memory isSigned with
+           | .ok _ _ _ => MirStepNode.fail .ub
+           | .ub => MirStepNode.fail .ub
+           | .unsupported => MirStepNode.unsupported
+       | _ => MirStepNode.fail .ub)
+  | false =>
+    match classifyRustIntrinsic? target.defPath with
+    | .none => .none
+    | .some .constEvalSelect => .some MirStepNode.unsupported
+    | .some .copyNonOverlapping =>
+      .some
+        (divergingCallReturnStep
+          (evalCopyNonOverlappingCall
+            s bodyLocalDecls bodyLayouts argOps argVals locals' destination 0))
+    | .some .writeBytes =>
+      .some
+        (divergingCallReturnStep
+          (evalWriteBytesCall
+            s target bodyLocalDecls bodyLayouts argOps argVals locals' destination 0))
+    | .some kind =>
+      match
+        evalCoreMemPtrIntrinsicCall?
+          kind s target bodyLocalDecls bodyLayouts argOps argVals locals' destination .none
+      with
+      | .some stepNode => .some stepNode
+      | .none =>
+        .some
+          (divergingCallReturnStep
+            (evalNonSelectIntrinsicCall
+              kind s target bodyLocalDecls bodyLayouts argOps argVals locals' destination 0))
+
+/--
 Dispatch a direct (`target.isIndirect = false`) call to a
 `CallConv.rustIntrinsic` compiler intrinsic in `evalTerminator` when
 `classifyRustIntrinsic? target.defPath` returns `.some kind`.
@@ -3830,17 +6071,32 @@ def evalDirectRustIntrinsic?
                          rtTarget
                          tupleTyOpt
                          (isPtrPointeeIntrinsicKind rtKind)
-                     evalNonSelectIntrinsicCall
-                       rtKind
-                       s
-                       rtTarget'
-                       bodyLocalDecls
-                       bodyLayouts
-                       selectArgOps
-                       unpackedArgs
-                       locals'
-                       destination
-                       targetBb
+                     match
+                       evalCoreMemPtrIntrinsicCall?
+                         rtKind
+                         s
+                         rtTarget'
+                         bodyLocalDecls
+                         bodyLayouts
+                         selectArgOps
+                         unpackedArgs
+                         locals'
+                         destination
+                         (.some targetBb)
+                     with
+                     | .some stepNode => stepNode
+                     | .none =>
+                       evalNonSelectIntrinsicCall
+                         rtKind
+                         s
+                         rtTarget'
+                         bodyLocalDecls
+                         bodyLayouts
+                         selectArgOps
+                         unpackedArgs
+                         locals'
+                         destination
+                         targetBb
                    | .none =>
                      match isUnreachableCallTarget rtTarget.defPath with
                      | true => MirStepNode.fail .ub
@@ -3859,10 +6115,20 @@ def evalDirectRustIntrinsic?
                              { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
                              (resumeExternalCall s locals' destination targetBb unwind)
        | _ => MirStepNode.fail .ub)
-  | .some kind =>
+  | .some .copyNonOverlapping =>
     .some
-      (evalNonSelectIntrinsicCall
-        kind
+      (evalCopyNonOverlappingCall
+        s
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
+  | .some .writeBytes =>
+    .some
+      (evalWriteBytesCall
         s
         target
         bodyLocalDecls
@@ -3872,6 +6138,34 @@ def evalDirectRustIntrinsic?
         locals'
         destination
         targetBb)
+  | .some kind =>
+    .some
+      (match
+         evalCoreMemPtrIntrinsicCall?
+           kind
+           s
+           target
+           bodyLocalDecls
+           bodyLayouts
+           argOps
+           argVals
+           locals'
+           destination
+           (.some targetBb)
+       with
+       | .some stepNode => stepNode
+       | .none =>
+         evalNonSelectIntrinsicCall
+           kind
+           s
+           target
+           bodyLocalDecls
+           bodyLayouts
+           argOps
+           argVals
+           locals'
+           destination
+           targetBb)
 
 /--
 Execute a basic-block `Terminator` from state `s`.
@@ -4504,9 +6798,22 @@ def evalTerminator
                   | .halted out => MirStepNode.retOutcome out
                   | .faulted fk => MirStepNode.fail fk
                 | false =>
-                  MirStepNode.extCall
-                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                    (resumeExternalDivergingCall s locals' unwind)
+                  match
+                    evalDivergingRustIntrinsic?
+                      s
+                      target
+                      bodyLocalDecls
+                      bodyLayouts
+                      argOps
+                      argVals
+                      locals'
+                      destination
+                  with
+                  | .some stepNode => stepNode
+                  | .none =>
+                    MirStepNode.extCall
+                      { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                      (resumeExternalDivergingCall s locals' unwind)
           | true =>
             MirStepNode.extCall
               { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }

@@ -144,6 +144,42 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalSetDiscriminantLocal derefTargetsSuspendedFrame FrameWriteResult
   foreignFrameDerefWrite evalForeignFrameDerefWrite
   evalSetDiscriminantDerefWrite
+  MemOpRes TypedValidity minNat AllocKey AllocKey.beq
+  intTyTargetBytes floatTyByteWidth scalarLayoutTargetByteWidth
+  isSingleVariantShape tupleLastRigidTy? knownWidePointeeTailAux?
+  ptrPointeeMayBeUnsizedAux isConsistentPtrLayout declPtrToPointeeByteSize?
+  allRigidTysSatisfy rigidTyLayoutDeterminedAux explicitLayoutConsistent
+  findConsistentDeclLayout? consistentExplicitLayout? resolveConsistentLayout?
+  exactTyByteSizeAux? exactTyByteSize? exactRigidTyByteSize?
+  exactRootAllocAlign? exactRigidTyAlign? isBackedPtr isNullThinPtr
+  decodeUsizeArg? isValidWidePtrMetaValForWidth normalizeAccessBorrowProj
+  borrowsAfterReadAccess borrowsAfterWriteAccess untypedValueHasExactByteImage
+  ResolvedMemEndpoint resolveLiveMemEndpoint endpointAccessCheck
+  checkPtrArgAligned optProvEq abstractBytesEq abstractByteRefines
+  abstractBytesRefine hasUninitByte allBytesUninit allBytesMatchProv
+  allBytesSameProv bytesHaveRealProvenance extractRawU8Bytes
+  stripProvenanceBytes encodePtrRawBytes scalarPairOffsetsValid
+  encodeFieldsAtOffsetsExactWith encodeUntypedFlatElemsExact
+  encodeUntypedLeafOrArrayExact encodeArrayElemsAtLayoutIdx
+  encodeUnionFieldsWithLayouts encodeLeafForScalarLayout
+  encodeValueAtLayoutIdx encodeRawArrayElems encodeRawValueBytes
+  readRootAbstractBytes appendBoolList repeatBoolList orBoolListAt
+  arbitraryFieldsDataMask unionFieldsDataMask layoutDataMask applyDataMask
+  tyDataMask resetTypedPaddingBytes validRangeExcludesAny
+  validRangeCoversAllNonNull decodeScalarLayoutBytesTarget
+  decodeFieldsAtLayoutIdxs decodeArrayElemsAtLayoutIdx
+  decodeUnionFieldsAtLayoutIdxs decodeValueAtLayoutIdx
+  decodePartialUninitArrayChunks decodeThinPtrBytes decodePartialUninitValue
+  abstractBytesToGlobalOptBytes buildGlobalRelocsAux updateGlobalAllocById
+  commitRootAbstractBytes evalCopyMemory anyListTrue isUninhabitedRigidTy
+  isUninhabitedTy referenceToUninhabited charShapedSurrogate
+  TypedValidity.andThen validateNonNullPtrBytes validateScalarLayoutBytes
+  validateWideMetaBytes validateLayoutFieldsWith validateArrayChunksWith
+  validateTypedBytesForLayoutIdx validateTypedBytes allFieldLayoutsPermitUninit
+  layoutPermitsUninit allRigidTysPermitUninit tyPermitsUninit
+  validateScalarLayoutValue validateWideMetaValue validateLayoutFieldsValuesWith
+  validateValueListWith validateTupleValuesWith validateValueAtLayoutIdx
+  validateBlackBoxValue
   evalStmt lookupSwitchTarget findCallee?
   extractCalleeDefPath? restoreCallerProtectors hasFrameDeallocProtectorConflict
   disableFrameBorrows disableFramesAbove writeReturnDestination pushCalleeFrame
@@ -174,7 +210,15 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalNonSelectIntrinsicCall isPtrPointeeIntrinsicKind
   withConstEvalSelectIntrinsicTypeArgs rigidTysToZeroSizedOps
   constEvalSelectTupleArgOps finishMemIntrinsicCall evalCopyNonOverlappingCall
-  WriteBytesAction writeBytesAction evalWriteBytesCall evalDirectRustIntrinsic?
+  WriteBytesAction writeBytesAction evalWriteBytesCall
+  writeIntrinsicReturnWithProtectors resolveIntrinsicPointeeFullTy
+  endpointBorrowsAfterRead endpointBorrowsAfterWrite
+  compareUnsignedBytesI32 evalCopyCall evalCompareBytesCall evalRawEqCall
+  evalTypedSwapNonOverlappingCall resolvePtrOffsetFromOffsets
+  evalPtrOffsetFromDistance evalPtrOffsetFromCall
+  resolvePtrAllocAlignAndPlaceOff evalPtrMaskCall resolveBlackBoxTy?
+  evalBlackBoxCall evalCoreMemPtrIntrinsicCall? divergingCallReturnStep
+  evalDivergingRustIntrinsic? evalDirectRustIntrinsic?
   isUnreachableCallTarget isAbortingPanicDefPath
   isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees

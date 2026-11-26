@@ -5917,6 +5917,176 @@ private theorem resumeExternalTailCall_exec_preserves_tables (mem : Memory) (ans
     | halted _ | faulted _ => exact trivial
   | aborted => exact trivial
 
+private theorem commitRootAbstractBytes_preserves_tables
+    {mem : Memory} {locals : List LocalSlot} {ep : ResolvedMemEndpoint}
+    {bs : List AbstractByte} {l' : List LocalSlot} {m' : Memory}
+    (hok : commitRootAbstractBytes mem locals ep bs = .ok (l', m')) :
+    TablesPreserved mem m' := by
+  unfold commitRootAbstractBytes at hok
+  repeat' (first
+    | (injection hok with hp; injection hp with _ hm; subst hm; exact ⟨rfl, rfl⟩)
+    | nomatch hok
+    | (dsimp only at hok; split at hok))
+
+private theorem evalCopyMemory_preserves_tables
+    {s : MachineState} {locals : List LocalSlot}
+    {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}
+    {srcPtr dstPtr : ProvenancePtr} {byteCount : Nat}
+    {l' : List LocalSlot} {m' : Memory}
+    (hok : evalCopyMemory s locals bodyLocalDecls bodyLayouts srcPtr dstPtr byteCount = .ok (l', m')) :
+    TablesPreserved s.memory m' := by
+  unfold evalCopyMemory at hok
+  repeat' (first
+    | nomatch hok
+    | exact commitRootAbstractBytes_preserves_tables hok
+    | (dsimp only at hok; split at hok))
+
+private theorem writeIntrinsicReturnWithProtectors_preserves_tables (s : MachineState)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (locals' : List LocalSlot) (destination : Place)
+    (targetOpt : Option BasicBlockIdx) (retVal : Value) :
+    StepNodePreservesTables s.memory
+      (writeIntrinsicReturnWithProtectors s bodyLocalDecls bodyLayouts locals'
+        destination targetOpt retVal) := by
+  unfold writeIntrinsicReturnWithProtectors; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | (rename_i hF; exact foreignFrameDerefWrite_preserves_tables hF)
+    | split)
+
+private theorem evalCoreMemPtrIntrinsicCall?_preserves_tables (kind : RustIntrinsicKind)
+    (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetOpt : Option BasicBlockIdx) :
+    OptStepNodePreservesTables s.memory
+      (evalCoreMemPtrIntrinsicCall? kind s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetOpt) := by
+  cases kind with
+  | copy =>
+    dsimp only [evalCoreMemPtrIntrinsicCall?]
+    unfold evalCopyCall
+    repeat' (first
+      | exact trivial
+      | exact intrinsicMissingPointeeStep_preserves_tables _ _ _ _
+      | exact writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _
+      | exact StepNodePreservesTables.mono (evalCopyMemory_preserves_tables ‹_›)
+          (writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _)
+      | (dsimp only; split))
+  | compareBytes =>
+    dsimp only [evalCoreMemPtrIntrinsicCall?]
+    unfold evalCompareBytesCall
+    repeat' (first
+      | exact trivial
+      | exact writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _
+      | (dsimp only; split))
+  | rawEq =>
+    dsimp only [evalCoreMemPtrIntrinsicCall?]
+    unfold evalRawEqCall
+    repeat' (first
+      | exact trivial
+      | exact intrinsicMissingPointeeStep_preserves_tables _ _ _ _
+      | exact writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _
+      | (dsimp only; split))
+  | typedSwapNonOverlapping =>
+    dsimp only [evalCoreMemPtrIntrinsicCall?]
+    unfold evalTypedSwapNonOverlappingCall
+    repeat' (first
+      | exact trivial
+      | exact intrinsicMissingPointeeStep_preserves_tables _ _ _ _
+      | exact writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _
+      | (apply StepNodePreservesTables.mono _
+          (writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _);
+         first
+         | exact commitRootAbstractBytes_preserves_tables ‹_›
+         | exact (commitRootAbstractBytes_preserves_tables ‹_›).trans
+             (commitRootAbstractBytes_preserves_tables ‹_›))
+      | (dsimp only; split))
+  | ptrOffsetFrom | ptrOffsetFromUnsigned =>
+    dsimp only [evalCoreMemPtrIntrinsicCall?]
+    unfold evalPtrOffsetFromCall
+    repeat' (first
+      | exact trivial
+      | exact intrinsicMissingPointeeStep_preserves_tables _ _ _ _
+      | exact writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _
+      | (dsimp only; split))
+  | ptrMask =>
+    dsimp only [evalCoreMemPtrIntrinsicCall?]
+    unfold evalPtrMaskCall
+    repeat' (first
+      | exact trivial
+      | exact writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _
+      | (dsimp only; split))
+  | blackBox =>
+    dsimp only [evalCoreMemPtrIntrinsicCall?]
+    unfold evalBlackBoxCall
+    repeat' (first
+      | exact trivial
+      | exact writeIntrinsicReturnWithProtectors_preserves_tables _ _ _ _ _ _ _
+      | (dsimp only; split))
+  | _ => exact trivial
+
+private theorem evalCoreMemPtrIntrinsicCall?_some_preserves_tables {kind : RustIntrinsicKind}
+    {s : MachineState} {target : ResolvedCallTarget}
+    {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    {destination : Place} {targetOpt : Option BasicBlockIdx} {node : MirStepNode}
+    (h : evalCoreMemPtrIntrinsicCall? kind s target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination targetOpt = .some node) :
+    StepNodePreservesTables s.memory node := by
+  have hD := evalCoreMemPtrIntrinsicCall?_preserves_tables kind s target bodyLocalDecls
+    bodyLayouts argOps argVals locals' destination targetOpt
+  rw [h] at hD
+  exact hD
+
+private theorem divergingCallReturnStep_preserves_tables (mem : Memory) (node : MirStepNode)
+    (hNode : StepNodePreservesTables mem node) :
+    StepNodePreservesTables mem (divergingCallReturnStep node) := by
+  cases node with
+  | tau st => cases st <;> exact trivial
+  | ret _ => exact trivial
+  | vis i k =>
+    rcases i with f | (e | ⟨req⟩)
+    · exact trivial
+    · exact hNode
+    · exact hNode
+
+private theorem evalDivergingRustIntrinsic?_preserves_tables (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) :
+    OptStepNodePreservesTables s.memory
+      (evalDivergingRustIntrinsic? s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination) := by
+  unfold evalDivergingRustIntrinsic?; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact OptStepNodePreservesTables.some_of
+        (divergingCallReturnStep_preserves_tables _ _
+          (evalCopyNonOverlappingCall_preserves_tables _ _ _ _ _ _ _ _))
+    | exact OptStepNodePreservesTables.some_of
+        (divergingCallReturnStep_preserves_tables _ _
+          (evalWriteBytesCall_preserves_tables _ _ _ _ _ _ _ _ _))
+    | exact OptStepNodePreservesTables.some_of
+        (divergingCallReturnStep_preserves_tables _ _
+          (evalNonSelectIntrinsicCall_preserves_tables _ _ _ _ _ _ _ _ _ _))
+    | (rename_i hC; exact OptStepNodePreservesTables.some_of
+        (evalCoreMemPtrIntrinsicCall?_some_preserves_tables hC))
+    | split)
+
+private theorem evalDivergingRustIntrinsic?_some_preserves_tables {s : MachineState}
+    {target : ResolvedCallTarget} {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    {destination : Place} {node : MirStepNode}
+    (h : evalDivergingRustIntrinsic? s target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination = .some node) :
+    StepNodePreservesTables s.memory node := by
+  have hD := evalDivergingRustIntrinsic?_preserves_tables s target bodyLocalDecls bodyLayouts
+    argOps argVals locals' destination
+  rw [h] at hD
+  exact hD
+
 private theorem evalDirectRustIntrinsic_preserves_tables (s : MachineState)
     (currentBody : Option CapturedMir) (target : ResolvedCallTarget)
     (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
@@ -5936,6 +6106,9 @@ private theorem evalDirectRustIntrinsic_preserves_tables (s : MachineState)
     | exact evalNonSelectIntrinsicCall_preserves_tables _ _ _ _ _ _ _ _ _ _
     | exact evalCopyNonOverlappingCall_preserves_tables _ _ _ _ _ _ _ _
     | exact evalWriteBytesCall_preserves_tables _ _ _ _ _ _ _ _ _
+    | (rename_i hC; exact evalCoreMemPtrIntrinsicCall?_some_preserves_tables hC)
+    | (rename_i hC; exact OptStepNodePreservesTables.some_of
+        (evalCoreMemPtrIntrinsicCall?_some_preserves_tables hC))
     | exact OptStepNodePreservesTables.some_of
         (StepNodePreservesTables.extCall_of ⟨rfl, rfl⟩
           (fun ans hAns => resumeExternalCall_exec_preserves_tables _ _ _ _ _ ans hAns))
@@ -6030,6 +6203,7 @@ theorem evalTerminator_preserves_tables (s : MachineState) (term : Terminator)
           | exact StepNodePreservesTables.extCall_of ⟨rfl, rfl⟩
               (fun ans hAns => resumeExternalDivergingCall_exec_preserves_tables _ _ _ ans hAns)
           | (rename_i hU; exact applyUnwindAction_preserves_tables _ _ _ _ hU)
+          | (rename_i hD; exact evalDivergingRustIntrinsic?_some_preserves_tables hD)
           | split)
     | tailCall func argOps =>
       unfold evalTerminator; dsimp only
@@ -6759,7 +6933,9 @@ theorem evalTerminator_divergingCall_extCall_of_calleeTableExcludes
       target.isIndirect = true ∨
         (isUnreachableCallTarget target.defPath = false ∧
           isAbortingPanicDefPath target.defPath = false ∧
-          isUnwindingPanicDefPath target.defPath = false)) :
+          isUnwindingPanicDefPath target.defPath = false))
+    (hNotExact : isDirectExactDivTarget target = false := by decide)
+    (hNotIntrinsic : classifyRustIntrinsic? target.defPath = none := by decide) :
     evalTerminator s term currentBody =
       MirStepNode.extCall
         { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
@@ -6775,7 +6951,9 @@ theorem evalTerminator_divergingCall_extCall_of_calleeTableExcludes
     · rw [hInd]
     · cases target.isIndirect with
       | true => rfl
-      | false => rw [hUnreach, hAbort, hUnwind]
+      | false =>
+        rw [hUnreach, hAbort, hUnwind]
+        simp only [evalDivergingRustIntrinsic?, hNotExact, hNotIntrinsic]
 
 /--
 The guard does not turn `unreachable_unchecked` into a request: a direct
@@ -7355,7 +7533,12 @@ theorem evalTerminator_divergingCall_extCall_of_call_site {s : MachineState}
     (hExcl : CalleeTableExcludes s.memory targetDefPath)
     (hNotUnreach : isUnreachableCallTarget targetDefPath = false)
     (hNotAbort : isAbortingPanicDefPath targetDefPath = false)
-    (hNotUnwind : isUnwindingPanicDefPath targetDefPath = false) :
+    (hNotUnwind : isUnwindingPanicDefPath targetDefPath = false)
+    (hNotExact :
+      isDirectExactDivTarget
+        { defPath := targetDefPath, typeArgs := extractCalleeTypeArgs func,
+          fnSig := .none, isIndirect := false } = false := by decide)
+    (hNotIntrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
     evalTerminator s term currentBody =
       MirStepNode.extCall
         { defPath := targetDefPath, typeArgs := extractCalleeTypeArgs func,
@@ -7366,7 +7549,7 @@ theorem evalTerminator_divergingCall_extCall_of_call_site {s : MachineState}
       { defPath := targetDefPath, typeArgs := extractCalleeTypeArgs func,
         fnSig := .none, isIndirect := false })
     hKind (resolveCallTarget_of_extractCalleeDefPath s func targetDefPath _ _ _ hFunc)
-    hArgs hExcl (Or.inr ⟨hNotUnreach, hNotAbort, hNotUnwind⟩)
+    hArgs hExcl (Or.inr ⟨hNotUnreach, hNotAbort, hNotUnwind⟩) hNotExact hNotIntrinsic
 
 /-- Two-layer bridge for a syntactic tail-call site (`TerminatorKind.tailCall`). -/
 theorem evalTerminator_tailCall_extCall_of_call_site {s : MachineState}

@@ -15008,6 +15008,8 @@ def LIntrinsicOp.fromRustIntrinsicKind? : RustIntrinsicKind → Option LIntrinsi
   | .constEvalSelect => none
   | .copyNonOverlapping => none
   | .writeBytes => none
+  | .copy | .compareBytes | .rawEq | .typedSwapNonOverlapping
+  | .ptrOffsetFrom | .ptrOffsetFromUnsigned | .ptrMask | .blackBox => none
 
 /-- Map a value-returning `LIntrinsicOp` handled by `evalNonSelectIntrinsicCall` to its
 `RustIntrinsicKind` counterpart. -/
@@ -16855,7 +16857,7 @@ private theorem evalDirectRustIntrinsic_of_nonSelect
         locals' destination targetBb) := by
   unfold evalDirectRustIntrinsic?
   rw [hClass]
-  cases kind <;> first | contradiction | rfl | (cases op <;> cases hKind)
+  cases kind <;> first | contradiction | simp only [evalCoreMemPtrIntrinsicCall?] | (cases op <;> cases hKind)
 
 /-- Internal strengthening of `evalLoweredTerminator_call_refines_evalTerminator` recording that
 every `.goto` transition preserves `s'.memory = s.memory` and `.returned` is impossible. -/

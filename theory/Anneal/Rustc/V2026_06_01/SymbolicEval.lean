@@ -5735,7 +5735,9 @@ theorem evalTerminatorSymTree_diverging_extCall
       .none)
     (h_not_unreach : isUnreachableCallTarget resolvedTarget.defPath = false)
     (h_not_abort : isAbortingPanicDefPath resolvedTarget.defPath = false)
-    (h_not_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false) :
+    (h_not_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false)
+    (h_not_exact : stringEq resolvedTarget.defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_not_intrinsic : classifyRustIntrinsic? resolvedTarget.defPath = none := by decide) :
     evalTerminatorSymTree
       s
       { kind := .call func argOps destination .none unwind, span := span }
@@ -5754,9 +5756,9 @@ theorem evalTerminatorSymTree_diverging_extCall
   dsimp only []
   rw [h_none]
   dsimp only []
-  cases resolvedTarget.isIndirect
-  · dsimp only []
-    rw [h_not_unreach, h_not_abort, h_not_unwind]
+  cases h_ind : resolvedTarget.isIndirect
+  · dsimp only [evalDivergingRustIntrinsic?, isDirectExactDivTarget]
+    rw [h_not_unreach, h_not_abort, h_not_unwind, h_ind, h_not_exact, h_not_intrinsic]
   · rfl
 
 /--

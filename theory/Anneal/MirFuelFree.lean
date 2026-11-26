@@ -12807,7 +12807,9 @@ theorem evalNonSelectIntrinsicCall_cases
   | alignOfVal =>
     exact evalAlignOfValIntrinsicCall_cases target bodyLocalDecls bodyLayouts
       argOps argVals locals' destination targetBb
-  | copyNonOverlapping | writeBytes =>
+  | copyNonOverlapping | writeBytes | copy | compareBytes | rawEq
+  | typedSwapNonOverlapping | ptrOffsetFrom | ptrOffsetFromUnsigned
+  | ptrMask | blackBox =>
     exact Or.inr (Or.inr fun _ => rfl)
 
 theorem writePlaceValue_deref_nil_borrows
