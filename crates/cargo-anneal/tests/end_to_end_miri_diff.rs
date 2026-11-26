@@ -61,10 +61,11 @@
 //!    stages the corpus, checks that the 4 zero-count `copy_nonoverlapping`
 //!    alignment / null seeds lower to `NonDivergingIntrinsic.copyNonOverlapping`
 //!    and carry no `known_anneal_bug`, kernel-checks their 4
-//!    `Verify.MiriDiffCorpus.*` modules in Lake, and verifies their exact Miri
-//!    UB fault spans. Unlike item 2, it does not build the Category 9
-//!    multi-callee modules, so it also runs on hosts where those modules
-//!    exceed the available memory.
+//!    `Verify.MiriDiffCorpus.*` modules in Lake, runs `TrustedBoundary.lean`
+//!    in `verify-audit` mode (`VerifiedUnconditional` kernel replay) on the two
+//!    `pass` certificates, and verifies their exact Miri UB fault spans. Unlike
+//!    item 2, it does not build the Category 9 multi-callee modules, so it also
+//!    runs on hosts where those modules exceed the available memory.
 
 use std::env;
 use std::fs;
@@ -1229,6 +1230,74 @@ fn end_to_end_miri_diff_category12_zero_count_copy_align_and_null() {
         .collect();
     run_lake_verify_targets(&dot_anneal, &targets)
         .expect("all 4 Category 12 Verify.MiriDiffCorpus.* modules must kernel-check in Lake");
+
+    // Run `TrustedBoundary.lean` in `verify-audit` mode (statement-origin
+    // isolation, zero `sorryAx`/`axiom`, fresh kernel replay at `trustLevel := 0`)
+    // on both Category 12 `pass` certificates.
+    let lake_bin = env::var_os("LAKE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".elan/bin/lake"))
+                .filter(|p| p.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from("lake"));
+    let trusted_boundary = checkout_root.join("trusted/audit/TrustedBoundary.lean");
+    let pass_names = [
+        "pass_copy_nonoverlapping_zero_dangling",
+        "pass_copy_nonoverlapping_zero_null",
+    ];
+    let pass_modules: Vec<String> = pass_names
+        .iter()
+        .map(|name| format!("Verify.MiriDiffCorpus.{name}"))
+        .collect();
+    let mut audit_cmd = Command::new(&lake_bin);
+    audit_cmd
+        .current_dir(&dot_anneal)
+        .arg("env")
+        .arg("lean")
+        .arg("--run")
+        .arg(&trusted_boundary)
+        .arg("verify-audit")
+        .arg("--allow-assumptions=false")
+        .arg("--allow-provisional-native=false")
+        .arg(format!("--verify-modules={}", pass_modules.join(",")));
+    let verify_dir = dot_anneal.join("generated/Verify/MiriDiffCorpus");
+    for name in pass_names {
+        audit_cmd.arg(format!(
+            "--source=Mir.MiriDiffCorpus.{name}={}",
+            mir_dir.join(format!("{name}.lean")).display()
+        ));
+        audit_cmd.arg(format!(
+            "--source=Verify.MiriDiffCorpus.{name}={}",
+            verify_dir.join(format!("{name}.lean")).display()
+        ));
+    }
+    let audit_out = audit_cmd
+        .output()
+        .expect("spawn TrustedBoundary verify-audit");
+    let audit_stdout = String::from_utf8_lossy(&audit_out.stdout);
+    let audit_stderr = String::from_utf8_lossy(&audit_out.stderr);
+    assert!(
+        audit_out.status.success(),
+        "TrustedBoundary verify-audit failed for Category 12 pass certificates ({}):\n{}\n{}",
+        audit_out.status,
+        audit_stdout,
+        audit_stderr
+    );
+    for module in &pass_modules {
+        let matched = audit_stdout.lines().any(|line| {
+            let parts: Vec<&str> = line.split('\t').collect();
+            parts.len() >= 3
+                && parts[0] == "VERIFY_AUDIT_ITEM"
+                && parts[1] == module
+                && parts[2] == "VerifiedUnconditional"
+        });
+        assert!(
+            matched,
+            "expected `VERIFY_AUDIT_ITEM\\t{module}\\tVerifiedUnconditional` in TrustedBoundary output:\n{audit_stdout}"
+        );
+    }
 
     verify_miri_diff_ub_locations(&dot_anneal, "MiriDiffCorpus", &cat12_manifest)
         .expect("Category 12 UB fault spans must match live Miri spans");
