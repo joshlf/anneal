@@ -1233,6 +1233,108 @@ theorem cm_miri_rawEq_eval_universal {P S C V : Type} [Miri.Memory.PointerProven
     hPt, hLay, hSized, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hRdL, hScL, hPtrL, hAlL,
     hBytesL, hRdR, hScR, hPtrR, hAlR, hBytesR, Except.mapError]
 
+section VendoredBytesCompare
+open Lean Elab Term
+
+/-- Elaborates to the UNMODIFIED vendored `private def bytesCompare`
+(`Miri/Interpreter/Intrinsics.lean:174-176`), resolved by its exact private
+name in the imported `Miri.Interpreter.Intrinsics` module (fails closed if the
+vendored declaration is renamed or removed). -/
+elab "cm_vendored_bytesCompare%" : term => do
+  let n : Name :=
+    (Name.mkNum (`_private ++ `Miri.Interpreter.Intrinsics) 0) ++ `Miri.Interpreter.Intrinsics.bytesCompare
+  unless (← getEnv).contains n do
+    throwError "vendored Miri.Interpreter.Intrinsics.bytesCompare not found ({n})"
+  return mkConst n
+
+end VendoredBytesCompare
+
+/-- The unmodified vendored `Miri.Interpreter.Intrinsics.bytesCompare` itself
+(a definitional alias of the private vendored constant, NOT a re-implementation). -/
+def cmVendoredBytesCompare : List UInt8 → List UInt8 → Ordering := cm_vendored_bytesCompare%
+
+/-- **Mirror faithfulness**: the documented mirror `cmMiriBytesCompare` IS the
+unmodified vendored `bytesCompare`, for EVERY pair of byte lists. -/
+theorem cmMiriBytesCompare_eq_vendored : cmMiriBytesCompare = cmVendoredBytesCompare := by
+  funext l r
+  induction l generalizing r with
+  | nil => cases r <;> rfl
+  | cons a as ih =>
+    cases r with
+    | nil => rfl
+    | cons b bs =>
+      have h1 : cmMiriBytesCompare (a :: as) (b :: bs) =
+          if a == b then cmMiriBytesCompare as bs else compare a b := rfl
+      have h2 : cmVendoredBytesCompare (a :: as) (b :: bs) =
+          if a == b then cmVendoredBytesCompare as bs else compare a b := rfl
+      rw [h1, h2, ih]
+
+/-- The `Int32` result selected by vendored `Intrinsics.compareBytes`
+(`Intrinsics.lean:186`). -/
+def cmMiriOrderingI32 : Ordering → Int32
+  | .lt => -1
+  | .eq => 0
+  | .gt => 1
+
+/-- The vendored `Int32` result's 32-bit `ScalarInt` image has exactly the bit
+pattern `cmMiriBytesCompareI32Bits` assigns to the same ordering. -/
+theorem cm_miri_ofInt32_bits (o : Ordering) :
+    (Miri.Memory.ScalarInt.ofInt32 (cmMiriOrderingI32 o)).data.toNat =
+      (match o with | .lt => 4294967295 | .eq => 0 | .gt => 1) := by
+  cases o <;> decide
+
+/-- **Universal `compare_bytes` Trusted ↔ vendored bit correspondence**: for ALL
+equal-length byte lists, the `ScalarInt` that UNMODIFIED vendored
+`bytesCompare` + `Intrinsics.compareBytes` (`Intrinsics.lean:174-187`) produce
+carries exactly Trusted's `compareUnsignedBytesI32 l r` bits. -/
+theorem cm_compareUnsignedBytesI32_eq_vendored (l r : List UInt8) (hLen : l.length = r.length) :
+    (Miri.Memory.ScalarInt.ofInt32 (cmMiriOrderingI32 (cmVendoredBytesCompare l r))).data.toNat =
+      compareUnsignedBytesI32 l r := by
+  rw [cm_compareUnsignedBytesI32_eq_miriBytesCompare l r hLen, ← cmMiriBytesCompare_eq_vendored,
+    cm_miri_ofInt32_bits]
+  unfold cmMiriBytesCompareI32Bits
+  rfl
+
+/-- **Universal vendored `Miri.Interpreter.Intrinsics.compareBytes` step-simulation**
+(`Intrinsics.lean:178-187`): for ANY hooks `h`, whenever both pointer operands
+and the count operand decode, and `readBytesStripProvenance` yields `lBytes` and
+`rBytes` over `count` bytes, `Intrinsics.compareBytes` returns the `Int32`
+scalar of the UNMODIFIED vendored `bytesCompare lBytes rBytes`. -/
+theorem cm_miri_compareBytes_eval_universal {P S C V : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.IntrinsicHooks P S C V) (choice : C)
+    (leftOp rightOp countOp : Miri.Interpreter.OpTy P) (st0 st1 st2 st3 st4 st5 : S)
+    (lImm rImm cImm : Miri.Interpreter.RvalueImmTy P)
+    (lSc rSc cSc : Miri.Memory.Scalar P) (lPtr rPtr : Miri.Memory.Pointer (Option P))
+    (count : UInt64) (lBytes rBytes : Array UInt8)
+    (hRdL : h.readImmediate choice leftOp st0 = .ok lImm st1)
+    (hScL : lImm.imm.toScalar = .ok lSc)
+    (hPtrL : lSc.toPointer h.target = .ok lPtr)
+    (hRdR : h.readImmediate choice rightOp st1 = .ok rImm st2)
+    (hScR : rImm.imm.toScalar = .ok rSc)
+    (hPtrR : rSc.toPointer h.target = .ok rPtr)
+    (hRdC : h.readImmediate choice countOp st2 = .ok cImm st3)
+    (hScC : cImm.imm.toScalar = .ok cSc)
+    (hUsize : cSc.toTargetUsize (Miri.ABI.Size.fromBits h.target.pointerWidth.bits) = .ok count)
+    (hBytesL : h.readBytesStripProvenance choice lPtr (Miri.ABI.Size.ofBytes count) st3 = .ok lBytes st4)
+    (hBytesR : h.readBytesStripProvenance choice rPtr (Miri.ABI.Size.ofBytes count) st4 = .ok rBytes st5) :
+    Miri.Interpreter.Intrinsics.compareBytes h choice leftOp rightOp countOp st0 =
+      .ok (.fromScalarInt (.ofInt32 (cmMiriOrderingI32
+        (cmVendoredBytesCompare lBytes.toList rBytes.toList)))) st5 := by
+  have hCmp :
+      Miri.Interpreter.Intrinsics.compareBytes h choice leftOp rightOp countOp =
+      (do
+        let left ← cmMirrorPointer h choice leftOp
+        let right ← cmMirrorPointer h choice rightOp
+        let count := Miri.ABI.Size.ofBytes (← cmMirrorUsize h choice countOp)
+        let left ← h.readBytesStripProvenance choice left count
+        let right ← h.readBytesStripProvenance choice right count
+        pure (.fromScalarInt (.ofInt32 (cmMiriOrderingI32
+          (cmVendoredBytesCompare left.toList right.toList))))) := rfl
+  rw [hCmp]
+  simp only [cmMirrorPointer, cmMirrorUsize, cmMirrorScalar, cmLiftRes, bind, EStateM.bind, pure,
+    EStateM.pure, hRdL, hScL, hPtrL, hRdR, hScR, hPtrR, hRdC, hScC, hUsize, hBytesL, hBytesR,
+    Except.mapError]
+
 /-! ## §3. LeanMiri Observations, States, and the Corpus Observation (`cmLmObserve`) -/
 
 /-- Normalized observation of a vendored `Miri.Interpreter.Step.step` run: the

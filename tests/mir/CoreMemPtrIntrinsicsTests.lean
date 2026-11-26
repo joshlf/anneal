@@ -660,6 +660,115 @@ theorem cm_trusted_hardened_edge_cases :
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
     first | rfl | decide +kernel
 
+/-! ### Paired controls for the hardened negative witnesses
+
+Each hardened UB / fail-closed witness above is paired here with a control
+that differs in exactly ONE ingredient and is ACCEPTED, so the fault is
+attributable to that ingredient rather than to an unrelated fixture defect. -/
+
+/-- `compare_bytes(&G100, &G101, 9)` where `G100` carries a relocated pointer at
+bytes `0..8` and byte `8` is `.uninit` (`uninitTail = true`) or `0`. -/
+def cmCmpProvMir (uninitTail : Bool) : CapturedMir :=
+  cmCallBody "cm::cmp_uninit_before_prov"
+    [mkDecl i32MirTy, mkDecl cmRawConstU8Ty, mkDecl cmRawConstU8Ty] 2
+    (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
+    [.copy (locPlace 1), .copy (locPlace 2), cmUsizeConst 9] 0 []
+    [{ allocId := 100,
+       bytes := [some 0, some 0, some 0, some 0, some 0, some 0, some 0, some 0,
+                 if uninitTail then none else some 0],
+       relocations := [(0, ⟨101, 0⟩)], align := ⟨8⟩, mutability := .mut },
+     cmGlobal 101 (List.replicate 9 (some 0)) 8]
+
+/-- `(u8, u32)` and `MaybeUninit<(u8, u32)>` (layout entries `1` / `2` of
+`cmHardenedLayouts`). -/
+def cmPadKind : RigidTy := .tuple [.uint .u8, .uint .u32]
+def cmMuPadKind : RigidTy := .adt "core::mem::maybe_uninit::MaybeUninit" [cmPadKind]
+
+/-- `[typed_swap_nonoverlapping::<T>(_1, _2);] compare_bytes(_1, _rhs, cnt)`:
+the swap is executed iff `doSwap` (otherwise bb0 is a plain `goto`). -/
+def cmPadSwapCmpMir (name : String) (kind : RigidTy) (midDecls : List MirAst.Ty)
+    (allocs : List CapturedAllocation) (doSwap : Bool) (rhs cnt : Nat) : CapturedMir :=
+  let rawMut : MirAst.Ty := { kind := .rawPtr .mut kind, layoutIdx := 10 }
+  let unitLoc := 3 + midDecls.length
+  { mkMirBody name
+      ([mkDecl i32MirTy, mkDecl rawMut, mkDecl rawMut] ++ midDecls.map mkDecl ++ [mkDecl unitMirTy]) 2
+      [mkBb [] (if doSwap then
+          .call (cmIntrinsicOp "core::intrinsics::typed_swap_nonoverlapping" [kind])
+            [.copy (locPlace 1), .copy (locPlace 2)] (locPlace unitLoc) (some 1) .continue_
+        else .goto 1),
+       mkBb [] (.call (cmIntrinsicOp "core::intrinsics::compare_bytes" [])
+          [.copy (locPlace 1), .copy (locPlace rhs), cmUsizeConst cnt] (locPlace 0) (some 2) .continue_),
+       mkBb [] .return_] with
+    layouts := cmHardenedLayouts, allocations := allocs }
+
+/-- Globals `100 = (1, pad 0xAA, 5)` and `101 = (2, pad 0xBB, 6)`. -/
+def cmPadGlobals : List CapturedAllocation :=
+  [cmGlobal 100 [some 1, some 0xAA, some 0xAA, some 0xAA, some 5, some 0, some 0, some 0] 4,
+   cmGlobal 101 [some 2, some 0xBB, some 0xBB, some 0xBB, some 6, some 0, some 0, some 0] 4]
+
+def cmPadGlobalMir (doSwap : Bool) (rhs cnt : Nat) : CapturedMir :=
+  cmPadSwapCmpMir "cm::swap_pad_global" cmPadKind [{ kind := cmPadKind, layoutIdx := 1 }]
+    cmPadGlobals doSwap rhs cnt
+
+def cmPadUnionMir (doSwap : Bool) (rhs cnt : Nat) : CapturedMir :=
+  cmPadSwapCmpMir "cm::swap_union_pad" cmMuPadKind [{ kind := cmMuPadKind, layoutIdx := 2 }]
+    cmPadGlobals doSwap rhs cnt
+
+def cmPadStackMir (doSwap : Bool) (rhs cnt : Nat) : CapturedMir :=
+  cmPadSwapCmpMir "cm::swap_pad_stack" cmPadKind
+    [{ kind := .array (.uint .u8) 16, layoutIdx := 9 }, { kind := cmPadKind, layoutIdx := 1 }]
+    [] doSwap rhs cnt
+
+/-- Stack byte buffer `_3 : [u8; 16]` (align 4) holding the two padded images,
+borrowed by unique tag `1`; `_1 = &_3[0]`, `_2 = &_3[8]`. -/
+def cmPadStackState (body : CapturedMir) : MachineState :=
+  let buf16Val : Value :=
+    .aggregate 0 ([1, 0xAA, 0xAA, 0xAA, 5, 0, 0, 0, 2, 0xBB, 0xBB, 0xBB, 6, 0, 0, 0].map
+      fun b => Value.scalar ⟨b, 1⟩)
+  let bBuf : BorrowEntry :=
+    { tag := 1, targetLocal := 3, targetProjection := [], perm := .unique,
+      rangeOffset := 0, rangeLen := 16, protector := none, parentTag := none,
+      targetFrameDepth := 0, allocDead := false }
+  let base := cmInitLiveState body [.ptr ⟨1, 0⟩ 8, .ptr ⟨1, 8⟩ 8]
+  { base with
+    frame := { base.frame with
+      locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨1, 8⟩ 8),
+                 .init buf16Val, .uninit, .uninit] },
+    memory := { base.memory with borrows := [bBuf], nextTag := 2 } }
+
+/-- **Paired controls on `V2026_06_01.MirSemantics.stepMirFn`**:
+1. `compare_bytes` eager `.uninit`-before-provenance: the SAME relocated slice
+   faults `.ub` with an `.uninit` tail but fails closed `.unsupported`
+   (provenance) once the tail byte is initialized, so the `.ub` is caused by the
+   eager `.uninit` scan preceding the provenance check;
+2. `typed_swap_nonoverlapping` padding reset on a global, a union
+   `MaybeUninit<(u8, u32)>`, and a stack `[u8; 16]` buffer: for EACH, without
+   the swap `compare_bytes(x, x, 4) = 0` (the padding bytes are initialized),
+   with the swap `compare_bytes(x, x, 4)` faults `.ub` (the swap reset padding
+   bytes `1..3` to `.uninit`), and with the swap `compare_bytes(x, y, 1) = 1`
+   (the swap really exchanged the data byte: `x[0] = 2 > y[0] = 1`). -/
+theorem cm_trusted_hardened_paired_controls :
+    cmRunTrusted (cmCmpProvMir true) 8
+      (cmInitLiveState (cmCmpProvMir true) [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunTrusted (cmCmpProvMir false) 8
+      (cmInitLiveState (cmCmpProvMir false) [cmGPtr 100 0, cmGPtr 101 0]) = .unsupported ∧
+    cmRunTrusted (cmPadGlobalMir false 1 4) 10
+      (cmInitLiveState (cmPadGlobalMir false 1 4) [cmGPtr 100 0, cmGPtr 101 0]) = .scalar 0 4 ∧
+    cmRunTrusted (cmPadGlobalMir true 1 4) 10
+      (cmInitLiveState (cmPadGlobalMir true 1 4) [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunTrusted (cmPadGlobalMir true 2 1) 10
+      (cmInitLiveState (cmPadGlobalMir true 2 1) [cmGPtr 100 0, cmGPtr 101 0]) = .scalar 1 4 ∧
+    cmRunTrusted (cmPadUnionMir false 1 4) 10
+      (cmInitLiveState (cmPadUnionMir false 1 4) [cmGPtr 100 0, cmGPtr 101 0]) = .scalar 0 4 ∧
+    cmRunTrusted (cmPadUnionMir true 1 4) 10
+      (cmInitLiveState (cmPadUnionMir true 1 4) [cmGPtr 100 0, cmGPtr 101 0]) = .ub ∧
+    cmRunTrusted (cmPadUnionMir true 2 1) 10
+      (cmInitLiveState (cmPadUnionMir true 2 1) [cmGPtr 100 0, cmGPtr 101 0]) = .scalar 1 4 ∧
+    cmRunTrusted (cmPadStackMir false 1 4) 10 (cmPadStackState (cmPadStackMir false 1 4)) = .scalar 0 4 ∧
+    cmRunTrusted (cmPadStackMir true 1 4) 10 (cmPadStackState (cmPadStackMir true 1 4)) = .ub ∧
+    cmRunTrusted (cmPadStackMir true 2 1) 10 (cmPadStackState (cmPadStackMir true 2 1)) = .scalar 1 4 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
 /-! ### `V2026_06_01` <-> `V2026_08_01` dialect parity -/
 
 
@@ -1038,6 +1147,10 @@ run_cmd do
         lmNs ++ `cmIntrinsic_ofDefPath_defPath, lmNs ++ `cmDecodeFnItemTyId_cmFnItemTyId,
         lmNs ++ `cmIntrinsic_names,
         lmNs ++ `cm_compareUnsignedBytesI32_eq_miriBytesCompare,
+        lmNs ++ `cmMiriBytesCompare_eq_vendored,
+        lmNs ++ `cm_miri_ofInt32_bits,
+        lmNs ++ `cm_compareUnsignedBytesI32_eq_vendored,
+        lmNs ++ `cm_miri_compareBytes_eval_universal,
         lmNs ++ `cm_evalPtrOffsetFromDistance_eq_miriSpec,
         lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix,
         lmNs ++ `cm_bitwiseAndBits_64_eq_u64_land,
@@ -1107,6 +1220,46 @@ run_cmd do
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: unifiedDualBundle does not reach {req}"
+    -- Vendored anchoring of the universal LM correspondence theorems: each one
+    -- must transitively reach the UNMODIFIED vendored constant it claims to
+    -- characterize (never only a local re-implementation).
+    let closureOf : Name → NameSet := fun root => Id.run do
+      let mut seen : NameSet := {}
+      let mut stack : Array Name := #[root]
+      while !stack.isEmpty do
+        let n := stack.back!
+        stack := stack.pop
+        if seen.contains n then continue
+        seen := seen.insert n
+        if let some ci := env.find? n then
+          for d in ci.getUsedConstantsAsSet do
+            if !seen.contains d then stack := stack.push d
+      return seen
+    let privBytesCompare : Name :=
+      (Name.mkNum (`_private ++ `Miri.Interpreter.Intrinsics) 0) ++ `Miri.Interpreter.Intrinsics.bytesCompare
+    unless env.contains privBytesCompare do
+      throwError "cross-root: vendored private bytesCompare not found"
+    let vendoredAnchors : List (Name × Name) :=
+      [ (lmNs ++ `cmMiriBytesCompare_eq_vendored, privBytesCompare),
+        (lmNs ++ `cm_compareUnsignedBytesI32_eq_vendored, privBytesCompare),
+        (lmNs ++ `cm_miri_compareBytes_eval_universal, `Miri.Interpreter.Intrinsics.compareBytes),
+        (lmNs ++ `cm_miri_compareBytes_eval_universal, privBytesCompare),
+        (lmNs ++ `cm_miri_rawEq_eval_universal, `Miri.Interpreter.Intrinsics.rawEq),
+        (lmNs ++ `cm_miri_ptrMask_eval_universal, `Miri.Interpreter.Intrinsics.eval),
+        (lmNs ++ `cm_miri_blackBox_eval_universal, `Miri.Interpreter.Intrinsics.eval),
+        (lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix, `Miri.Interpreter.IntegerOps.binary),
+        (lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix,
+          `Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv),
+        (lmNs ++ `cm_bitwiseAndBits_64_eq_u64_land, `UInt64.land),
+        (lmNs ++ `cmLmObserve_table, `Miri.Interpreter.Step.step),
+        (lmNs ++ `cmLmObserve_table, `Miri.Interpreter.Intrinsics.typedSwap) ]
+    for (thm, anchor) in vendoredAnchors do
+      unless (closureOf thm).contains anchor do
+        throwError "cross-root vendored-anchor failure: {thm} does not reach {anchor}"
+    -- Discrimination self-test: the documented local mirror alone does NOT reach
+    -- the vendored constant, so the anchor check above is not vacuous.
+    if (closureOf (lmNs ++ `cmMiriBytesCompare)).contains privBytesCompare then
+      throwError "cross-root self-test: local mirror unexpectedly reaches vendored bytesCompare"
     return (added.size, bundleCount, acceptedPos, rejected, crAxioms.toArray)
 
   let ctx : Core.Context :=
