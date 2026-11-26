@@ -41,11 +41,21 @@ Connects the reduced-product value domain `AbsVal` (`InitDom` x `Tnum` x
   unsigned twin type (`intTwin`): sign-agnostic operators
   (`binOpSignAgnostic`) evaluate identically at `isSigned = true`, and signed
   ordered comparisons coincide with unsigned ones on non-negative operands.
+  The biased coordinate `signedBias w x = (x + 2^(w-1)) mod 2^w` of
+  `ReducedProduct`'s signed domain is bridged to `signedLt` / `signedLe`
+  (`signedLt_iff_signedBias_lt`, `signedLe_iff_signedBias_le`), to
+  `signedOverflowAdd` / `signedOverflowSub`
+  (`signedOverflowAdd_false_of_biased_bounds`,
+  `signedOverflowSub_false_of_biased_bounds`), to signed `div` / `rem`
+  (`safeSignedDiv_sound_v2026`), and to `CastKind.intToInt` sign extension
+  (`intCastBits`).
 * Section 2 defines relational comparison guards (`RelGuard`), abstract
   booleans (`BoolAbs`), abstract local slots (`MirAbsSlot`) and frames
   (`MirAbsEnv`), their concretizations against `List LocalSlot`, the
   lattice order and join, guard-clearing writes (`setMirAbsSlot`), and branch
-  refinements (`refineEnvByGuard`), all consumed by `Anneal.AiPcc.MirTransfer`.
+  refinements (`refineEnvByGuard`, including the signed constant guards
+  `.sleConst` / `.sgtConst` / `.seqConst` / `.sneConst`), all consumed by
+  `Anneal.AiPcc.MirTransfer`.
 
 Integer widths follow `intCastTargetBytes`: `usize` is 8 bytes wide, exactly
 as in the `CastKind.intToInt` arm of `evalRvalue`; scalars of any other byte
@@ -1233,6 +1243,532 @@ theorem evalScalarBinOp_sint_rem_safe
 
 end ScalarOps
 
+/-! ### Biased signed coordinates (`signedBias`) against `MirSemantics.Scalars`
+
+`ReducedProduct`'s signed domain works in the biased coordinate
+`signedBias w x = (x + 2^(w-1)) mod 2^w`, an order isomorphism from signed
+two's-complement order onto unsigned order. The lemmas below relate it to
+`signedLt` / `signedLe` / `signedOverflowAdd` / `signedOverflowSub` /
+`evalSignedDiv` / `evalSignedRem` of `Trusted.Rustc.V2026_06_01.MirSemantics`. -/
+
+section SignedBias
+
+variable {u : UintTy}
+
+/-- `halfModPow2 (uintWidth u)` is the `MirSemantics` sign threshold
+`modPow2 (uintWidth u) / 2`. -/
+theorem halfModPow2_uintWidth_eq_half (u : UintTy) :
+    halfModPow2 (uintWidth u) = modPow2 (uintWidth u) / 2 := by
+  cases u <;> rfl
+
+theorem nat_sub_lt_of_lt_add {x h : Nat} (hG : h ≤ x) (hLt : x < h + h) :
+    x - h < h :=
+  nat_lt_of_add_lt_add_right (c := h) (by rw [Nat.sub_add_cancel hG]; exact hLt)
+
+theorem lt_half_add_half_uint {x : Nat} (hx : x < modPow2 (uintWidth u)) :
+    x < modPow2 (uintWidth u) / 2 + modPow2 (uintWidth u) / 2 := by
+  rw [← modPow2_uintWidth_eq_add_half]
+  exact hx
+
+/-- Biased coordinate of a non-negative bit pattern. -/
+theorem signedBias_uint_of_lt_half {x : Nat}
+    (hx : x < modPow2 (uintWidth u) / 2) :
+    signedBias (uintWidth u) x = x + modPow2 (uintWidth u) / 2 := by
+  have h := signedBias_of_lt_half (w := uintWidth u) (x := x) (uintWidth_valid u)
+    (by rw [halfModPow2_uintWidth_eq_half]; exact hx)
+  rw [halfModPow2_uintWidth_eq_half] at h
+  exact h
+
+/-- Biased coordinate of a negative bit pattern. -/
+theorem signedBias_uint_of_ge_half {x : Nat}
+    (hx : modPow2 (uintWidth u) / 2 ≤ x) (hxM : x < modPow2 (uintWidth u)) :
+    signedBias (uintWidth u) x = x - modPow2 (uintWidth u) / 2 := by
+  have h := signedBias_of_ge_half (w := uintWidth u) (x := x) (uintWidth_valid u)
+    (by rw [halfModPow2_uintWidth_eq_half]; exact hx) hxM
+  rw [halfModPow2_uintWidth_eq_half] at h
+  exact h
+
+/-- `signedBias` is an involution on `[0, 2^w)`. -/
+theorem signedBias_signedBias {w x : Nat} (hw : validWidth w = true)
+    (hx : x < modPow2 w) : signedBias w (signedBias w x) = x := by
+  have h := signedBias_inv hw hx
+  rw [Nat.add_comm] at h
+  exact h
+
+/-- `signedBias` is injective on `[0, 2^w)`. -/
+theorem signedBias_inj {w x y : Nat} (hw : validWidth w = true)
+    (hx : x < modPow2 w) (hy : y < modPow2 w)
+    (h : signedBias w x = signedBias w y) : x = y := by
+  have h1 := signedBias_signedBias hw hx
+  rw [h, signedBias_signedBias hw hy] at h1
+  exact h1.symm
+
+/-- Equality of bit patterns is equality of biased coordinates. -/
+theorem signedBias_beq {w x y : Nat} (hw : validWidth w = true)
+    (hx : x < modPow2 w) (hy : y < modPow2 w) :
+    Nat.beq (signedBias w x) (signedBias w y) = Nat.beq x y := by
+  cases hB : Nat.beq x y with
+  | true => rw [Nat.eq_of_beq_eq_true hB, nat_beq_refl]
+  | false =>
+    cases hB2 : Nat.beq (signedBias w x) (signedBias w y) with
+    | false => rfl
+    | true =>
+      rw [signedBias_inj hw hx hy (Nat.eq_of_beq_eq_true hB2), nat_beq_refl] at hB
+      nomatch hB
+
+theorem signedLt_of_neg_nonneg {x y : Nat}
+    (hx : modPow2 (uintWidth u) / 2 ≤ x) (hxM : x < modPow2 (uintWidth u))
+    (hy : y < modPow2 (uintWidth u) / 2) :
+    signedLt x y (uintBytes u) = true := by
+  have hyM : y < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hy (Nat.div_le_self _ 2)
+  simp only [signedLt]
+  rw [wrapScalarBits_of_lt_uint hxM, wrapScalarBits_of_lt_uint hyM,
+    isSignedNegative_of_ge_half hx hxM, isSignedNegative_of_lt_half hy]
+
+theorem signedLt_of_nonneg_neg {x y : Nat}
+    (hx : x < modPow2 (uintWidth u) / 2)
+    (hy : modPow2 (uintWidth u) / 2 ≤ y) (hyM : y < modPow2 (uintWidth u)) :
+    signedLt x y (uintBytes u) = false := by
+  have hxM : x < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hx (Nat.div_le_self _ 2)
+  simp only [signedLt]
+  rw [wrapScalarBits_of_lt_uint hxM, wrapScalarBits_of_lt_uint hyM,
+    isSignedNegative_of_lt_half hx, isSignedNegative_of_ge_half hy hyM]
+
+theorem not_ble_true_iff_lt {a b : Nat} : (!(Nat.ble b a)) = true ↔ a < b := by
+  rw [← nat_blt_eq_not_ble]
+  exact ⟨lt_of_blt_true, blt_true_of_lt⟩
+
+/-- `MirSemantics.Scalars.signedLt` is unsigned `<` on biased coordinates. -/
+theorem signedLt_iff_signedBias_lt {x y : Nat}
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    signedLt x y (uintBytes u) = true ↔
+      signedBias (uintWidth u) x < signedBias (uintWidth u) y := by
+  cases Nat.lt_or_ge x (modPow2 (uintWidth u) / 2) with
+  | inl hxL =>
+    cases Nat.lt_or_ge y (modPow2 (uintWidth u) / 2) with
+    | inl hyL =>
+      rw [signedLt_of_nonneg hxL hyL, signedBias_uint_of_lt_half hxL,
+        signedBias_uint_of_lt_half hyL]
+      exact Iff.trans not_ble_true_iff_lt
+        ⟨fun h => Nat.add_lt_add_right h _, nat_lt_of_add_lt_add_right⟩
+    | inr hyG =>
+      rw [signedLt_of_nonneg_neg hxL hyG hy, signedBias_uint_of_lt_half hxL,
+        signedBias_uint_of_ge_half hyG hy]
+      refine ⟨(fun h => nomatch h), fun h => ?_⟩
+      have hyLt := nat_sub_lt_of_lt_add hyG (lt_half_add_half_uint hy)
+      exact False.elim (Nat.lt_irrefl _
+        (Nat.lt_trans (Nat.lt_of_lt_of_le hyLt (Nat.le_add_left _ x)) h))
+  | inr hxG =>
+    cases Nat.lt_or_ge y (modPow2 (uintWidth u) / 2) with
+    | inl hyL =>
+      rw [signedLt_of_neg_nonneg hxG hx hyL, signedBias_uint_of_ge_half hxG hx,
+        signedBias_uint_of_lt_half hyL]
+      have hxLt := nat_sub_lt_of_lt_add hxG (lt_half_add_half_uint hx)
+      exact ⟨fun _ => Nat.lt_of_lt_of_le hxLt (Nat.le_add_left _ y), fun _ => rfl⟩
+    | inr hyG =>
+      rw [signedLt_of_neg hxG hx hyG hy, signedBias_uint_of_ge_half hxG hx,
+        signedBias_uint_of_ge_half hyG hy]
+      exact Iff.trans not_ble_true_iff_lt
+        ⟨fun h => Nat.sub_lt_sub_right hxG h, fun h => by
+          have h2 := Nat.add_lt_add_right h (modPow2 (uintWidth u) / 2)
+          rw [Nat.sub_add_cancel hxG, Nat.sub_add_cancel hyG] at h2
+          exact h2⟩
+
+/-- `MirSemantics.Scalars.signedLe` is unsigned `≤` on biased coordinates. -/
+theorem signedLe_iff_signedBias_le {x y : Nat}
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    signedLe x y (uintBytes u) = true ↔
+      signedBias (uintWidth u) x ≤ signedBias (uintWidth u) y := by
+  have hIff := signedLt_iff_signedBias_lt (u := u) hy hx
+  simp only [signedLe]
+  cases hLt : signedLt y x (uintBytes u) with
+  | true =>
+    exact ⟨(fun h => nomatch h),
+      fun hLe => False.elim (Nat.not_le_of_gt (hIff.mp hLt) hLe)⟩
+  | false =>
+    exact ⟨fun _ => Nat.le_of_not_lt (fun hGt => by
+      rw [hIff.mpr hGt] at hLt; nomatch hLt), fun _ => rfl⟩
+
+/-- Boolean form of `signedLt_iff_signedBias_lt`. -/
+theorem signedLt_eq_blt_signedBias {x y : Nat}
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    signedLt x y (uintBytes u) =
+      Nat.blt (signedBias (uintWidth u) x) (signedBias (uintWidth u) y) := by
+  have hIff := signedLt_iff_signedBias_lt (u := u) hx hy
+  cases hB : Nat.blt (signedBias (uintWidth u) x) (signedBias (uintWidth u) y) with
+  | true => exact hIff.mpr (lt_of_blt_true hB)
+  | false =>
+    cases hS : signedLt x y (uintBytes u) with
+    | false => rfl
+    | true => rw [blt_true_of_lt (hIff.mp hS)] at hB; nomatch hB
+
+/-- Boolean form of `signedLe_iff_signedBias_le`. -/
+theorem signedLe_eq_ble_signedBias {x y : Nat}
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    signedLe x y (uintBytes u) =
+      Nat.ble (signedBias (uintWidth u) x) (signedBias (uintWidth u) y) := by
+  have hIff := signedLe_iff_signedBias_le (u := u) hx hy
+  cases hB : Nat.ble (signedBias (uintWidth u) x) (signedBias (uintWidth u) y) with
+  | true => exact hIff.mpr (Nat.le_of_ble_eq_true hB)
+  | false =>
+    cases hS : signedLe x y (uintBytes u) with
+    | false => rfl
+    | true => rw [Nat.ble_eq_true_of_le (hIff.mp hS)] at hB; nomatch hB
+
+theorem three_mul_eq (h : Nat) : 3 * h = h + (h + h) := by
+  have h3 : 3 * h = 2 * h + h := Nat.succ_mul 2 h
+  rw [h3, Nat.two_mul, Nat.add_comm]
+
+/-- Two negative operands whose sum stays `≥ 2^w + 2^(w-1)` do not overflow. -/
+theorem signedOverflowAdd_false_of_neg_ge {a b : Nat}
+    (hx : modPow2 (uintWidth u) / 2 ≤ a) (hxM : a < modPow2 (uintWidth u))
+    (hy : modPow2 (uintWidth u) / 2 ≤ b) (hyM : b < modPow2 (uintWidth u))
+    (hSum : modPow2 (uintWidth u) + modPow2 (uintWidth u) / 2 ≤ a + b) :
+    signedOverflowAdd a b (uintBytes u) = false := by
+  have hMLe : modPow2 (uintWidth u) ≤ a + b :=
+    Nat.le_trans (Nat.le_add_right _ _) hSum
+  have hSubLt : a + b - modPow2 (uintWidth u) < modPow2 (uintWidth u) := by
+    apply nat_lt_of_add_lt_add_right (c := modPow2 (uintWidth u))
+    rw [Nat.sub_add_cancel hMLe]
+    exact Nat.add_lt_add hxM hyM
+  have hSubGe : modPow2 (uintWidth u) / 2 ≤ a + b - modPow2 (uintWidth u) := by
+    apply Nat.le_sub_of_add_le
+    rw [Nat.add_comm]
+    exact hSum
+  have hMod : wrapVal (uintWidth u) (a + b) = a + b - modPow2 (uintWidth u) := by
+    dsimp only [wrapVal]
+    rw [nat_mod_eq_sub_mod hMLe]
+    exact nat_mod_eq_of_lt hSubLt
+  have hAddEq : Nat.add a b = a + b := rfl
+  simp only [signedOverflowAdd]
+  rw [isSignedNegative_of_ge_half hx hxM, isSignedNegative_of_ge_half hy hyM,
+    hAddEq, wrapScalarBits_eq_wrapVal, hMod,
+    isSignedNegative_of_ge_half hSubGe hSubLt]
+
+/-- Bridge from `AbsVal.noSignedOverflowAdd`'s biased bounds
+(`H ≤ bias x + bias y < 3 * H`) to `signedOverflowAdd = false`. -/
+theorem signedOverflowAdd_false_of_biased_bounds {x y : Nat}
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u))
+    (hLo : halfModPow2 (uintWidth u) ≤
+      signedBias (uintWidth u) x + signedBias (uintWidth u) y)
+    (hHi : signedBias (uintWidth u) x + signedBias (uintWidth u) y <
+      3 * halfModPow2 (uintWidth u)) :
+    signedOverflowAdd x y (uintBytes u) = false := by
+  rw [halfModPow2_uintWidth_eq_half] at hLo hHi
+  cases Nat.lt_or_ge x (modPow2 (uintWidth u) / 2) with
+  | inl hxL =>
+    cases Nat.lt_or_ge y (modPow2 (uintWidth u) / 2) with
+    | inl hyL =>
+      rw [signedBias_uint_of_lt_half hxL, signedBias_uint_of_lt_half hyL,
+        Nat.add_add_add_comm, three_mul_eq] at hHi
+      exact signedOverflowAdd_false_of_nonneg_lt hxL hyL
+        (nat_lt_of_add_lt_add_right hHi)
+    | inr hyG =>
+      exact signedOverflowAdd_false_of_opp_sign (Or.inl ⟨hxL, hyG, hy⟩)
+  | inr hxG =>
+    cases Nat.lt_or_ge y (modPow2 (uintWidth u) / 2) with
+    | inl hyL =>
+      exact signedOverflowAdd_false_of_opp_sign (Or.inr ⟨hxG, hx, hyL⟩)
+    | inr hyG =>
+      rw [signedBias_uint_of_ge_half hxG hx, signedBias_uint_of_ge_half hyG hy]
+        at hLo
+      have h2 := Nat.add_le_add_right hLo
+        (modPow2 (uintWidth u) / 2 + modPow2 (uintWidth u) / 2)
+      rw [Nat.add_add_add_comm (x - _) (y - _), Nat.sub_add_cancel hxG,
+        Nat.sub_add_cancel hyG, ← modPow2_uintWidth_eq_add_half,
+        Nat.add_comm] at h2
+      exact signedOverflowAdd_false_of_neg_ge hxG hx hyG hy h2
+
+/-- Negative minus non-negative that stays negative does not overflow. -/
+theorem signedOverflowSub_false_of_neg_nonneg {a b : Nat}
+    (hx : modPow2 (uintWidth u) / 2 ≤ a) (hxM : a < modPow2 (uintWidth u))
+    (hy : b < modPow2 (uintWidth u) / 2)
+    (hDiff : b + modPow2 (uintWidth u) / 2 ≤ a) :
+    signedOverflowSub a b (uintBytes u) = false := by
+  have hyM : b < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hy (Nat.div_le_self _ 2)
+  have hLe : b ≤ a := Nat.le_trans (Nat.le_add_right _ _) hDiff
+  have hSubLt : a - b < modPow2 (uintWidth u) :=
+    Nat.lt_of_le_of_lt (Nat.sub_le a b) hxM
+  have hSubGe : modPow2 (uintWidth u) / 2 ≤ a - b := by
+    apply Nat.le_sub_of_add_le
+    rw [Nat.add_comm]
+    exact hDiff
+  have hSub : Nat.sub a b = a - b := rfl
+  simp only [signedOverflowSub]
+  rw [wrapScalarBits_of_lt_uint hxM, wrapScalarBits_of_lt_uint hyM,
+    Nat.ble_eq_true_of_le hLe]
+  simp only
+  rw [hSub, wrapScalarBits_of_lt_uint hSubLt,
+    isSignedNegative_of_ge_half hx hxM, isSignedNegative_of_lt_half hy,
+    isSignedNegative_of_ge_half hSubGe hSubLt]
+
+/-- Non-negative minus negative that stays non-negative does not overflow. -/
+theorem signedOverflowSub_false_of_nonneg_neg {a b : Nat}
+    (hx : a < modPow2 (uintWidth u) / 2)
+    (hy : modPow2 (uintWidth u) / 2 ≤ b) (hyM : b < modPow2 (uintWidth u))
+    (hDiff : a + modPow2 (uintWidth u) / 2 < b) :
+    signedOverflowSub a b (uintBytes u) = false := by
+  have hxM : a < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hx (Nat.div_le_self _ 2)
+  have hLt : a < b := Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hDiff
+  have hBle : Nat.ble b a = false := by
+    cases hB : Nat.ble b a with
+    | false => rfl
+    | true => exact False.elim (Nat.not_le_of_gt hLt (Nat.le_of_ble_eq_true hB))
+  have hbLe : b ≤ modPow2 (uintWidth u) + a :=
+    Nat.le_trans (Nat.le_of_lt hyM) (Nat.le_add_right _ _)
+  have hDiffLt : modPow2 (uintWidth u) + a - b < modPow2 (uintWidth u) / 2 := by
+    apply nat_lt_of_add_lt_add_right (c := b)
+    rw [Nat.sub_add_cancel hbLe]
+    have h2 := Nat.add_lt_add_left hDiff (modPow2 (uintWidth u) / 2)
+    rw [← Nat.add_assoc, Nat.add_comm (modPow2 (uintWidth u) / 2) a,
+      Nat.add_assoc, ← modPow2_uintWidth_eq_add_half, Nat.add_comm a] at h2
+    exact h2
+  have hDiffM : modPow2 (uintWidth u) + a - b < modPow2 (uintWidth u) :=
+    Nat.lt_of_lt_of_le hDiffLt (Nat.div_le_self _ 2)
+  have hW : wrapScalarBits (Nat.sub (Nat.add (scalarModulus (uintBytes u)) a) b)
+      (scalarModulus (uintBytes u)) = modPow2 (uintWidth u) + a - b := by
+    rw [wrapScalarBits_eq_wrapVal, scalarModulus_uintBytes]
+    exact wrapVal_of_lt hDiffM
+  simp only [signedOverflowSub]
+  rw [wrapScalarBits_of_lt_uint hxM, wrapScalarBits_of_lt_uint hyM, hBle]
+  simp only
+  rw [hW, isSignedNegative_of_lt_half hx, isSignedNegative_of_ge_half hy hyM,
+    isSignedNegative_of_lt_half hDiffLt]
+
+/-- Bridge from `AbsVal.noSignedOverflowSub`'s biased bounds
+(`bias y ≤ bias x + H` and `bias x < bias y + H`) to
+`signedOverflowSub = false`. -/
+theorem signedOverflowSub_false_of_biased_bounds {x y : Nat}
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u))
+    (hLo : signedBias (uintWidth u) y ≤
+      signedBias (uintWidth u) x + halfModPow2 (uintWidth u))
+    (hHi : signedBias (uintWidth u) x <
+      signedBias (uintWidth u) y + halfModPow2 (uintWidth u)) :
+    signedOverflowSub x y (uintBytes u) = false := by
+  rw [halfModPow2_uintWidth_eq_half] at hLo hHi
+  cases Nat.lt_or_ge x (modPow2 (uintWidth u) / 2) with
+  | inl hxL =>
+    cases Nat.lt_or_ge y (modPow2 (uintWidth u) / 2) with
+    | inl hyL =>
+      exact signedOverflowSub_false_of_same_sign (Or.inl ⟨hxL, hyL⟩)
+    | inr hyG =>
+      rw [signedBias_uint_of_lt_half hxL, signedBias_uint_of_ge_half hyG hy,
+        Nat.sub_add_cancel hyG] at hHi
+      exact signedOverflowSub_false_of_nonneg_neg hxL hyG hy hHi
+  | inr hxG =>
+    cases Nat.lt_or_ge y (modPow2 (uintWidth u) / 2) with
+    | inl hyL =>
+      rw [signedBias_uint_of_ge_half hxG hx, signedBias_uint_of_lt_half hyL,
+        Nat.sub_add_cancel hxG] at hLo
+      exact signedOverflowSub_false_of_neg_nonneg hxG hx hyL hLo
+    | inr hyG =>
+      exact signedOverflowSub_false_of_same_sign (Or.inr ⟨hxG, hx, hyG, hy⟩)
+
+theorem half_lt_modPow2_uint (u : UintTy) :
+    modPow2 (uintWidth u) / 2 < modPow2 (uintWidth u) :=
+  Nat.lt_of_le_of_lt (half_le_sub_one_uint u)
+    (Nat.sub_lt (modPow2_pos _) Nat.zero_lt_one)
+
+/-- `0` has biased coordinate `2^(w-1)`. -/
+theorem signedBias_zero_uint (u : UintTy) :
+    signedBias (uintWidth u) 0 = modPow2 (uintWidth u) / 2 := by
+  rw [signedBias_uint_of_lt_half (half_pos_uint u), Nat.zero_add]
+
+/-- `INT_MIN = 2^(w-1)` has biased coordinate `0`. -/
+theorem signedBias_half_uint (u : UintTy) :
+    signedBias (uintWidth u) (modPow2 (uintWidth u) / 2) = 0 := by
+  rw [signedBias_uint_of_ge_half (Nat.le_refl _) (half_lt_modPow2_uint u),
+    Nat.sub_self]
+
+/-- `-1 = 2^w - 1` has biased coordinate `2^(w-1) - 1`. -/
+theorem signedBias_minusOne_uint (u : UintTy) :
+    signedBias (uintWidth u) (modPow2 (uintWidth u) - 1) =
+      modPow2 (uintWidth u) / 2 - 1 := by
+  rw [signedBias_uint_of_ge_half (half_le_sub_one_uint u)
+    (Nat.sub_lt (modPow2_pos _) Nat.zero_lt_one), Nat.sub_right_comm,
+    Nat.sub_eq_of_eq_add (modPow2_uintWidth_eq_add_half u)]
+
+/-- Bridge from `AbsVal.safeSignedDiv` to the `MirSemantics` side conditions
+of signed `div` / `rem`: the divisor is nonzero and the operands are not
+`(INT_MIN, -1)` (`minSigned = 2^(w-1)`, `minusOne = 2^w - 1`). -/
+theorem safeSignedDiv_sound_v2026 {a b : AbsVal} {x y : Nat}
+    (hOk : AbsVal.safeSignedDiv (uintWidth u) a b = true)
+    (ha : a.denote (uintWidth u) (some x))
+    (hb : b.denote (uintWidth u) (some y)) :
+    y ≠ 0 ∧
+      ¬ (x = modPow2 (uintWidth u) / 2 ∧ y = modPow2 (uintWidth u) - 1) := by
+  have h := absVal_safeSignedDiv_sound hOk ha hb
+  rw [halfModPow2_uintWidth_eq_half] at h
+  refine ⟨fun hy0 => h.1 (by rw [hy0]; exact signedBias_zero_uint u),
+    fun hBad => h.2 ⟨?_, ?_⟩⟩
+  · rw [hBad.1]; exact signedBias_half_uint u
+  · rw [hBad.2]; exact signedBias_minusOne_uint u
+
+/-- Signed `div` / `rem` under the `safeSignedDiv` side conditions never
+fault; the operator is selected by unification against `hop`. -/
+theorem evalScalarBinOp_sint_divrem_safe {op : BinOp} {x y : Nat}
+    (locals : List LocalSlot) (mem : Memory) (hop : op = .div ∨ op = .rem)
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u))
+    (hyNe : y ≠ 0)
+    (hNoOv : ¬ (x = modPow2 (uintWidth u) / 2 ∧
+      y = modPow2 (uintWidth u) - 1)) :
+    ∃ bits, bits < modPow2 (uintWidth u) ∧
+      evalScalarBinOp op ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem true =
+        .ok (.scalar ⟨bits, uintBytes u⟩) locals mem := by
+  cases hop with
+  | inl h => subst h; exact evalScalarBinOp_sint_div_safe locals mem hx hy hyNe hNoOv
+  | inr h => subst h; exact evalScalarBinOp_sint_rem_safe locals mem hx hy hyNe hNoOv
+
+/-- `evalSignedDiv` / `evalSignedRem` are fault-free on operands certified by
+`AbsVal.safeSignedDiv`. -/
+theorem safeSignedDiv_evalSigned_v2026 {a b : AbsVal} {x y : Nat}
+    (locals : List LocalSlot) (mem : Memory)
+    (hOk : AbsVal.safeSignedDiv (uintWidth u) a b = true)
+    (ha : a.denote (uintWidth u) (some x))
+    (hb : b.denote (uintWidth u) (some y)) :
+    (∃ q, q < modPow2 (uintWidth u) ∧
+      evalSignedDiv x y (uintBytes u) locals mem =
+        .ok (.scalar ⟨q, uintBytes u⟩) locals mem) ∧
+    (∃ r, r < modPow2 (uintWidth u) ∧
+      evalSignedRem x y (uintBytes u) locals mem =
+        .ok (.scalar ⟨r, uintBytes u⟩) locals mem) := by
+  have hS := safeSignedDiv_sound_v2026 hOk ha hb
+  have hx := (absVal_some_elim ha).1
+  have hy := (absVal_some_elim hb).1
+  have hb0 : Nat.beq y 0 = false := by
+    cases h : Nat.beq y 0 with
+    | false => rfl
+    | true => exact False.elim (hS.1 (Nat.eq_of_beq_eq_true h))
+  have hD : evalScalarBinOp .div ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem
+      true = evalSignedDiv x y (uintBytes u) locals mem := by
+    simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl, hb0]
+  have hR : evalScalarBinOp .rem ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem
+      true = evalSignedRem x y (uintBytes u) locals mem := by
+    simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl, hb0]
+  refine ⟨?_, ?_⟩
+  · cases evalScalarBinOp_sint_div_safe locals mem hx hy hS.1 hS.2 with
+    | intro q hq => exact ⟨q, hq.1, Eq.trans hD.symm hq.2⟩
+  · cases evalScalarBinOp_sint_rem_safe locals mem hx hy hS.1 hS.2 with
+    | intro r hr => exact ⟨r, hr.1, Eq.trans hR.symm hr.2⟩
+
+/-- Signed `<` evaluates to unsigned `<` on biased coordinates. -/
+theorem evalScalarBinOp_sint_lt {x y : Nat} (locals : List LocalSlot)
+    (mem : Memory)
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    evalScalarBinOp .lt ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem true =
+      .ok (.scalar (boolToScalar (Nat.blt (signedBias (uintWidth u) x)
+        (signedBias (uintWidth u) y)))) locals mem := by
+  simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+  rw [signedLt_eq_blt_signedBias hx hy]
+
+/-- Signed `<=` evaluates to unsigned `<=` on biased coordinates. -/
+theorem evalScalarBinOp_sint_le {x y : Nat} (locals : List LocalSlot)
+    (mem : Memory)
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    evalScalarBinOp .le ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem true =
+      .ok (.scalar (boolToScalar (Nat.ble (signedBias (uintWidth u) x)
+        (signedBias (uintWidth u) y)))) locals mem := by
+  simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+  rw [signedLe_eq_ble_signedBias hx hy]
+
+/-- Signed `>` evaluates to unsigned `>` on biased coordinates. -/
+theorem evalScalarBinOp_sint_gt {x y : Nat} (locals : List LocalSlot)
+    (mem : Memory)
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    evalScalarBinOp .gt ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem true =
+      .ok (.scalar (boolToScalar (Nat.blt (signedBias (uintWidth u) y)
+        (signedBias (uintWidth u) x)))) locals mem := by
+  simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+  rw [signedLt_eq_blt_signedBias hy hx]
+
+/-- Signed `>=` evaluates to unsigned `>=` on biased coordinates. -/
+theorem evalScalarBinOp_sint_ge {x y : Nat} (locals : List LocalSlot)
+    (mem : Memory)
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    evalScalarBinOp .ge ⟨x, uintBytes u⟩ ⟨y, uintBytes u⟩ locals mem true =
+      .ok (.scalar (boolToScalar (Nat.ble (signedBias (uintWidth u) y)
+        (signedBias (uintWidth u) x)))) locals mem := by
+  simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+  rw [signedLe_eq_ble_signedBias hy hx]
+
+/-- Sign extension of a negative bit pattern to a strictly wider type sets
+the new high bits (`2^w₂ - 2^w₁ + x`). -/
+theorem signExtendBits_neg {u2 : UintTy} {x : Nat}
+    (hx : modPow2 (uintWidth u) / 2 ≤ x) (hxM : x < modPow2 (uintWidth u))
+    (hW : Nat.ble (uintBytes u2) (uintBytes u) = false) :
+    signExtendBits x (uintBytes u) (uintBytes u2) =
+      modPow2 (uintWidth u2) - modPow2 (uintWidth u) + x := by
+  simp only [signExtendBits, hW]
+  rw [wrapScalarBits_of_lt_uint hxM, isSignedNegative_of_ge_half hx hxM,
+    scalarModulus_uintBytes, scalarModulus_uintBytes]
+  rfl
+
+/-- Narrowing (or same-width) `signExtendBits` truncates the bit pattern. -/
+theorem signExtendBits_narrow {u2 : UintTy} {x : Nat}
+    (hxM : x < modPow2 (uintWidth u))
+    (hW : Nat.ble (uintBytes u2) (uintBytes u) = true) :
+    signExtendBits x (uintBytes u) (uintBytes u2) = wrapVal (uintWidth u2) x := by
+  simp only [signExtendBits, hW]
+  rw [wrapScalarBits_of_lt_uint hxM, wrapScalarBits_eq_wrapVal]
+
+/-- Bit pattern produced by `CastKind.intToInt` from a `uSrc`-wide source
+(sign-extended iff `srcSigned` and strictly widening) to `uDst`, exactly as
+computed by `evalRvalue`. -/
+def intCastBits (srcSigned : Bool) (uSrc uDst : UintTy) (x : Nat) : Nat :=
+  match srcSigned with
+  | false => wrapScalarBits x (scalarModulus (uintBytes uDst))
+  | true =>
+    match Nat.ble (uintBytes uDst) (uintBytes uSrc) with
+    | true => wrapScalarBits x (scalarModulus (uintBytes uDst))
+    | false => signExtendBits x (uintBytes uSrc) (uintBytes uDst)
+
+/-- Every `intToInt` cast result fits the target width. -/
+theorem intCastBits_lt (srcSigned : Bool) (uSrc uDst : UintTy) (x : Nat) :
+    intCastBits srcSigned uSrc uDst x < modPow2 (uintWidth uDst) := by
+  have hWrap : wrapScalarBits x (scalarModulus (uintBytes uDst)) <
+      modPow2 (uintWidth uDst) := by
+    rw [wrapScalarBits_eq_wrapVal]
+    exact nat_mod_lt _ (modPow2_pos _)
+  cases srcSigned with
+  | false => exact hWrap
+  | true =>
+    dsimp only [intCastBits]
+    cases Nat.ble (uintBytes uDst) (uintBytes uSrc) with
+    | true => exact hWrap
+    | false => exact signExtendBits_lt_uint uSrc uDst x
+
+/-- Unsigned-source, narrowing, and same-width casts wrap the bit pattern. -/
+theorem intCastBits_wrap {srcSigned : Bool} {uSrc uDst : UintTy} (x : Nat)
+    (h : srcSigned = false ∨
+      Nat.ble (uintWidth uDst) (uintWidth uSrc) = true) :
+    intCastBits srcSigned uSrc uDst x = wrapVal (uintWidth uDst) x := by
+  cases srcSigned with
+  | false => exact wrapScalarBits_eq_wrapVal uDst x
+  | true =>
+    cases h with
+    | inl hF => nomatch hF
+    | inr hLe =>
+      dsimp only [intCastBits]
+      rw [uintBytes_ble_eq_width, hLe]
+      exact wrapScalarBits_eq_wrapVal uDst x
+
+/-- A strictly widening cast of a non-negative signed value is the identity. -/
+theorem intCastBits_widen_nonneg {uSrc uDst : UintTy} {x : Nat}
+    (hx : x < modPow2 (uintWidth uSrc) / 2)
+    (hW : Nat.ble (uintWidth uDst) (uintWidth uSrc) = false) :
+    intCastBits true uSrc uDst x = x := by
+  have hWb : Nat.ble (uintBytes uDst) (uintBytes uSrc) = false := by
+    rw [uintBytes_ble_eq_width]; exact hW
+  dsimp only [intCastBits]
+  rw [hWb]
+  exact signExtendBits_nonneg hx hWb
+
+end SignedBias
+
 /-- Bitwise complement of an in-range unsigned integer equals XOR with
 `2^w - 1`. -/
 theorem nat_xor_mask_eq_sub {w x : Nat} (hx : x < modPow2 w) :
@@ -1417,9 +1953,12 @@ end ListHelpers
 
 /-! ## 3. Relational Comparison Guards -/
 
-/-- Relational predicate attached to a `bool` local recording the unsigned
-comparison that produced it, enabling path-sensitive refinement at
-`switchInt` and `assert` without fused compare-and-branch instructions. -/
+/-- Relational predicate attached to a `bool` local recording the comparison
+that produced it, enabling path-sensitive refinement at `switchInt` and
+`assert` without fused compare-and-branch instructions. The `u*` guards
+compare bit patterns in unsigned order; the `s*Const` guards compare the
+two's-complement bit pattern of a signed local (at `uintWidth (intTwin i)`)
+against the bit pattern of a constant in signed order (`signedBias`). -/
 inductive RelGuard where
   | none
   | uleConst (reg : Nat) (u : UintTy) (bound : Nat)
@@ -1430,6 +1969,10 @@ inductive RelGuard where
   | uneConst (reg : Nat) (u : UintTy) (val : Nat)
   | ueqReg (lhs rhs : Nat) (u : UintTy)
   | uneReg (lhs rhs : Nat) (u : UintTy)
+  | sleConst (reg : Nat) (i : IntTy) (boundBits : Nat)
+  | sgtConst (reg : Nat) (i : IntTy) (boundBits : Nat)
+  | seqConst (reg : Nat) (i : IntTy) (val : Nat)
+  | sneConst (reg : Nat) (i : IntTy) (val : Nat)
 
 /-- Structural equality on `RelGuard`. -/
 def RelGuard.beq : RelGuard → RelGuard → Bool
@@ -1450,6 +1993,14 @@ def RelGuard.beq : RelGuard → RelGuard → Bool
     Nat.beq l1 l2 && Nat.beq r1 r2 && uintTyBeq u1 u2
   | .uneReg l1 r1 u1, .uneReg l2 r2 u2 =>
     Nat.beq l1 l2 && Nat.beq r1 r2 && uintTyBeq u1 u2
+  | .sleConst r1 i1 b1, .sleConst r2 i2 b2 =>
+    Nat.beq r1 r2 && intTyBeq i1 i2 && Nat.beq b1 b2
+  | .sgtConst r1 i1 b1, .sgtConst r2 i2 b2 =>
+    Nat.beq r1 r2 && intTyBeq i1 i2 && Nat.beq b1 b2
+  | .seqConst r1 i1 v1, .seqConst r2 i2 v2 =>
+    Nat.beq r1 r2 && intTyBeq i1 i2 && Nat.beq v1 v2
+  | .sneConst r1 i1 v1, .sneConst r2 i2 v2 =>
+    Nat.beq r1 r2 && intTyBeq i1 i2 && Nat.beq v1 v2
   | _, _ => false
 
 /-- Soundness of `RelGuard.beq`. -/
@@ -1466,7 +2017,9 @@ theorem relGuard_eq_of_beq {g1 g2 : RelGuard} (h : RelGuard.beq g1 g2 = true) :
        | rw [Nat.eq_of_beq_eq_true h1, uintTy_eq_of_beq h2,
            Nat.eq_of_beq_eq_true h3]
        | rw [Nat.eq_of_beq_eq_true h1, Nat.eq_of_beq_eq_true h2,
-           uintTy_eq_of_beq h3])
+           uintTy_eq_of_beq h3]
+       | rw [Nat.eq_of_beq_eq_true h1, intTy_eq_of_beq h2,
+           Nat.eq_of_beq_eq_true h3])
     | nomatch h
 
 /-- Logical negation of a `RelGuard`. -/
@@ -1480,6 +2033,10 @@ def RelGuard.negate : RelGuard → RelGuard
   | .uneConst r u v => .ueqConst r u v
   | .ueqReg l r u => .uneReg l r u
   | .uneReg l r u => .ueqReg l r u
+  | .sleConst r i b => .sgtConst r i b
+  | .sgtConst r i b => .sleConst r i b
+  | .seqConst r i v => .sneConst r i v
+  | .sneConst r i v => .seqConst r i v
 
 /-- True iff `g` references local `id`. -/
 def RelGuard.mentions (id : Nat) : RelGuard → Bool
@@ -1492,6 +2049,10 @@ def RelGuard.mentions (id : Nat) : RelGuard → Bool
   | .uneConst r _ _ => Nat.beq r id
   | .ueqReg l r _ => Nat.beq l id || Nat.beq r id
   | .uneReg l r _ => Nat.beq l id || Nat.beq r id
+  | .sleConst r _ _ => Nat.beq r id
+  | .sgtConst r _ _ => Nat.beq r id
+  | .seqConst r _ _ => Nat.beq r id
+  | .sneConst r _ _ => Nat.beq r id
 
 /-- Unsigned bit pattern of a scalar `Value` at byte width `uintBytes u`. -/
 def uintValNat? (u : UintTy) : Value → Option Nat
@@ -1542,6 +2103,18 @@ def RelGuard.denote (locals : List LocalSlot) (g : RelGuard) (b : Bool) :
   | .uneReg l r u =>
     ∀ x y, localUintNat? locals l u = some x →
       localUintNat? locals r u = some y → (b = true ↔ x ≠ y)
+  | .sleConst r i boundBits =>
+    ∀ x, localUintNat? locals r (intTwin i) = some x →
+      (b = true ↔ signedBias (uintWidth (intTwin i)) x ≤
+        signedBias (uintWidth (intTwin i)) boundBits)
+  | .sgtConst r i boundBits =>
+    ∀ x, localUintNat? locals r (intTwin i) = some x →
+      (b = true ↔ signedBias (uintWidth (intTwin i)) boundBits <
+        signedBias (uintWidth (intTwin i)) x)
+  | .seqConst r i val =>
+    ∀ x, localUintNat? locals r (intTwin i) = some x → (b = true ↔ x = val)
+  | .sneConst r i val =>
+    ∀ x, localUintNat? locals r (intTwin i) = some x → (b = true ↔ x ≠ val)
 
 /-- Soundness of `RelGuard.negate`. -/
 theorem relGuard_negate_sound {locals : List LocalSlot} {g : RelGuard}
@@ -1638,6 +2211,51 @@ theorem relGuard_negate_sound {locals : List LocalSlot} {g : RelGuard}
         | true => exact Nat.eq_of_beq_eq_true hB
         | false => exact False.elim (nomatch (hIff.mpr (nat_ne_of_beq_false hB)))
       exact ⟨(fun _ => hEq), (fun _ => rfl)⟩
+  | sleConst r i bound =>
+    intro x hx
+    have hIff := h x hx
+    cases b with
+    | true =>
+      have hLe := hIff.mp rfl
+      exact ⟨(fun hF => nomatch hF),
+        (fun hGt => False.elim (Nat.not_le_of_gt hGt hLe))⟩
+    | false =>
+      exact ⟨(fun _ => Nat.lt_of_not_le (fun hLe => nomatch (hIff.mpr hLe))),
+        (fun _ => rfl)⟩
+  | sgtConst r i bound =>
+    intro x hx
+    have hIff := h x hx
+    cases b with
+    | true =>
+      have hGt := hIff.mp rfl
+      exact ⟨(fun hF => nomatch hF),
+        (fun hLe => False.elim (Nat.not_le_of_gt hGt hLe))⟩
+    | false =>
+      exact ⟨(fun _ => Nat.le_of_not_lt (fun hGt => nomatch (hIff.mpr hGt))),
+        (fun _ => rfl)⟩
+  | seqConst r i val =>
+    intro x hx
+    have hIff := h x hx
+    cases b with
+    | true =>
+      have hEq := hIff.mp rfl
+      exact ⟨(fun hF => nomatch hF), (fun hNe => False.elim (hNe hEq))⟩
+    | false =>
+      have hNe : x ≠ val := fun hEq => nomatch (hIff.mpr hEq)
+      exact ⟨(fun _ => hNe), (fun _ => rfl)⟩
+  | sneConst r i val =>
+    intro x hx
+    have hIff := h x hx
+    cases b with
+    | true =>
+      have hNe := hIff.mp rfl
+      exact ⟨(fun hF => nomatch hF), (fun hEq => False.elim (hNe hEq))⟩
+    | false =>
+      have hEq : x = val := by
+        cases hB : Nat.beq x val with
+        | true => exact Nat.eq_of_beq_eq_true hB
+        | false => exact False.elim (nomatch (hIff.mpr (nat_ne_of_beq_false hB)))
+      exact ⟨(fun _ => hEq), (fun _ => rfl)⟩
 
 /-- Writing local `id` leaves `localUintNat?` of every other local intact. -/
 theorem localUintNat?_set?_ne {locals locals' : List LocalSlot} {id r : Nat}
@@ -1701,6 +2319,22 @@ theorem relGuard_preserved_on_update {locals locals' : List LocalSlot}
     rw [hLocEq l u (bool_or_false_left hNoMent)] at hx
     rw [hLocEq r u (bool_or_false_right hNoMent)] at hy
     exact hDen x y hx hy
+  | sleConst r i bound =>
+    intro x hx
+    rw [hLocEq r (intTwin i) hNoMent] at hx
+    exact hDen x hx
+  | sgtConst r i bound =>
+    intro x hx
+    rw [hLocEq r (intTwin i) hNoMent] at hx
+    exact hDen x hx
+  | seqConst r i val =>
+    intro x hx
+    rw [hLocEq r (intTwin i) hNoMent] at hx
+    exact hDen x hx
+  | sneConst r i val =>
+    intro x hx
+    rw [hLocEq r (intTwin i) hNoMent] at hx
+    exact hDen x hx
 
 /-! ## 4. Abstract Booleans (`BoolAbs`) -/
 
@@ -2432,6 +3066,28 @@ theorem sintCopy_denote_sint {ty : Ty} {locals : List LocalSlot} {i : IntTy}
     cases v with
     | scalar sc => exact ⟨h.2.1, h.2.2.1⟩
     | _ => exact h.2
+
+/-- Canonical denotation of an initialized `.sint` slot: the declared type is
+`int i`, and the stored scalar has the twin byte width with its
+two's-complement bit pattern described by `a` (signed order is recovered
+through `signedBias (uintWidth (intTwin i))`). -/
+theorem mirAbsSlot_sint_denote_iff {ty : Ty} {locals : List LocalSlot}
+    {i : IntTy} {a : AbsVal} {sc : ScalarInt} :
+    (MirAbsSlot.sint i a).denote ty locals (.init (.scalar sc)) ↔
+      ty.kind = .int i ∧ sc.sizeBytes = uintBytes (intTwin i) ∧
+        a.denote (uintWidth (intTwin i)) (some sc.bits) := Iff.rfl
+
+/-- A `.sint` slot denotes exactly what the `.uint` slot of its unsigned twin
+denotes at the twin type. -/
+theorem mirAbsSlot_sint_denote_twin {ty ty' : Ty} {locals : List LocalSlot}
+    {i : IntTy} {a : AbsVal} {cs : LocalSlot}
+    (hTy : ty.kind = .int i) (hTy' : ty'.kind = .uint (intTwin i)) :
+    (MirAbsSlot.sint i a).denote ty locals cs ↔
+      (MirAbsSlot.uint (intTwin i) a).denote ty' locals cs := by
+  cases cs with
+  | dead => exact ⟨fun h => ⟨hTy', h.2⟩, fun h => ⟨hTy, h.2⟩⟩
+  | uninit => exact ⟨fun h => ⟨hTy', h.2⟩, fun h => ⟨hTy, h.2⟩⟩
+  | init v => exact ⟨fun h => ⟨hTy', h.2⟩, fun h => ⟨hTy, h.2⟩⟩
 
 /-- Live-but-uninitialized abstract slot for a local of declared type `ty`
 (the abstract counterpart of `StorageLive` / `Deinit`). -/
@@ -4511,12 +5167,45 @@ theorem env_uint_extract {decls : List LocalDecl} {env : MirAbsEnv}
         exact ⟨sc, d, hL, hcs.1, hcs.2.2.1, hsc.2.1, hsc.2.2,
           localUintNat?_of_get? hL hsc.2.1⟩
 
+/-- `AbsVal.refineSleConst` is sound for every bound (out-of-range bounds
+leave `a` unchanged). -/
+theorem absVal_refineSleConst_sound_any {w x boundBits : Nat} {a : AbsVal}
+    (hw : validWidth w = true) (ha : a.denote w (some x))
+    (hai : a.isInit = true)
+    (hSle : signedBias w x ≤ signedBias w boundBits) :
+    (AbsVal.refineSleConst w a boundBits).denote w (some x) := by
+  cases hB : Nat.blt boundBits (modPow2 w) with
+  | true => exact absVal_refineSleConst_sound hw ha hai (lt_of_blt_true hB) hSle
+  | false =>
+    dsimp only [AbsVal.refineSleConst]
+    rw [hw, hai, hB]
+    exact ha
+
+/-- `AbsVal.refineSgtConst` is sound for every bound (out-of-range bounds
+leave `a` unchanged). -/
+theorem absVal_refineSgtConst_sound_any {w x boundBits : Nat} {a : AbsVal}
+    (hw : validWidth w = true) (ha : a.denote w (some x))
+    (hai : a.isInit = true)
+    (hSgt : signedBias w boundBits < signedBias w x) :
+    (AbsVal.refineSgtConst w a boundBits).denote w (some x) := by
+  cases hB : Nat.blt boundBits (modPow2 w) with
+  | true => exact absVal_refineSgtConst_sound hw ha hai (lt_of_blt_true hB) hSgt
+  | false =>
+    dsimp only [AbsVal.refineSgtConst]
+    rw [hw, hai, hB]
+    exact ha
+--END
+
 /-- Refine `env` using `RelGuard` `g` assuming boolean outcome `branchVal`.
 Register-register guards refine both operands symmetrically (across `.uint`,
 `.uintCopy`, `.sint`, and `.sintCopy` slots, propagating refinements to copy
 aliases), `.ueqReg` meets both operands via `AbsVal.meetInit`,
-self-contradictions (`l < l`, `l ≠ l`) yield `AbsVal.bot`, and `.uneConst`
-refines via ring-complement intersection (`AbsVal.refineUneConst`). -/
+self-contradictions (`l < l`, `l ≠ l`) yield `AbsVal.bot`, `.uneConst` /
+`.sneConst` refine via ring-complement intersection
+(`AbsVal.refineUneConst`), and the signed constant guards `.sleConst` /
+`.sgtConst` / `.seqConst` refine `.sint` / `.sintCopy` slots (and aliases)
+through `AbsVal.refineSleConst` / `AbsVal.refineSgtConst` /
+`AbsVal.refineEqConst` in biased signed coordinates. -/
 def refineEnvByGuard (env : MirAbsEnv) (g : RelGuard) (branchVal : Bool) :
     MirAbsEnv :=
   let eff :=
@@ -4594,6 +5283,18 @@ def refineEnvByGuard (env : MirAbsEnv) (g : RelGuard) (branchVal : Bool) :
             (fun ar => AbsVal.refineUneConst (uintWidth u) ar v)
         | none => env₁
       | none => env₁
+  | .sleConst r i boundBits =>
+    refineUintSlot env r (intTwin i)
+      (fun a => AbsVal.refineSleConst (uintWidth (intTwin i)) a boundBits)
+  | .sgtConst r i boundBits =>
+    refineUintSlot env r (intTwin i)
+      (fun a => AbsVal.refineSgtConst (uintWidth (intTwin i)) a boundBits)
+  | .seqConst r i val =>
+    refineUintSlot env r (intTwin i)
+      (fun a => AbsVal.refineEqConst (uintWidth (intTwin i)) a val)
+  | .sneConst r i val =>
+    refineUintSlot env r (intTwin i)
+      (fun a => AbsVal.refineUneConst (uintWidth (intTwin i)) a val)
 
 /-- Soundness of `refineEnvByGuard`. -/
 theorem refineEnvByGuard_sound {decls : List LocalDecl} {env : MirAbsEnv}
@@ -4612,6 +5313,26 @@ theorem refineEnvByGuard_sound {decls : List LocalDecl} {env : MirAbsEnv}
       | false => g.negate) = eff at hEff ⊢
   cases eff with
   | none => exact hEnv
+  | sleConst r i boundBits =>
+    apply refineUintSlot_sound hEnv
+    intro a x hInit ha hx
+    exact absVal_refineSleConst_sound_any (uintWidth_valid (intTwin i)) ha hInit
+      ((hEff x hx).mp rfl)
+  | sgtConst r i boundBits =>
+    apply refineUintSlot_sound hEnv
+    intro a x hInit ha hx
+    exact absVal_refineSgtConst_sound_any (uintWidth_valid (intTwin i)) ha hInit
+      ((hEff x hx).mp rfl)
+  | seqConst r i val =>
+    apply refineUintSlot_sound hEnv
+    intro a x hInit ha hx
+    exact absVal_refineEqConst_sound (uintWidth_valid (intTwin i)) ha hInit
+      ((hEff x hx).mp rfl)
+  | sneConst r i val =>
+    apply refineUintSlot_sound hEnv
+    intro a x hInit ha hx
+    exact absVal_refineUneConst_sound (uintWidth_valid (intTwin i)) ha hInit
+      ((hEff x hx).mp rfl)
   | uneConst r u val =>
     apply refineUintSlot_sound hEnv
     intro a x hInit ha hx
