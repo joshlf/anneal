@@ -23386,6 +23386,24 @@ example :
 
 open WitnessLM4_2 in
 example :
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ : AnnealStepState),
+      let b := copyZeroOveralignedBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [entry] ∧
+      get? s₃.frame.locals 1 = some (.init (.scalar ⟨42, 8⟩)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_overaligned_ok
+
+open WitnessLM4_2 in
+example :
     ∃ (s₁ s₂ : MachineState) (m₁ m₂ m₃ : AnnealStepState) (msg : String),
       let b := copyDistinctOobBody
       let hooks := annealStepHooks b.localDecls b.layouts
@@ -24059,14 +24077,20 @@ open LeanMiriSpec.Correspondence in
   stepMirFn_copyNonOverlapping_stage1_eq_lm4_2
   copyZeroPtrAgree_scalar
   copyTyAlignBound?_exact_of_sizeAndAlign
+  copyTyAlignBound?_exact_of_validLayout
+  alignIsPowerOfTwoBytes_of_validCopyAlign
   copyZeroPtrAgree_ptr_root
   isUnresolvedLayoutIdx_emptyLayoutTable
+  resolveCopyElemLayout_of_unresolved_ptrs
   copyZeroAlign_of_agree
   copyZeroPtrAgree_lm3_1
   stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets
+  stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets_emptyLayout
   step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
   step_intrinsic_copyNonOverlapping_stage1_simulation
   step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap
+  step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets
+  step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets_emptyLayout
   step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence
   step_intrinsic_copyNonOverlapping_stage1_perm_divergence
   decodeValueFromBytes_encodeLittleEndianBytes_int
@@ -24149,6 +24173,7 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_dangling_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_null_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_nonzero_null_ub_agreement
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_overaligned_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_disjoint_subrange_divergence
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_cross_type_divergence

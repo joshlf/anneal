@@ -7884,47 +7884,75 @@ theorem copyTyAlignBound?_exact_of_sizeAndAlign {decls : List LocalDecl}
   unfold copyTyAlignBound?
   rw [hns]; dsimp only; rw [hunres]; dsimp only; rw [hsa]
 
+/-- With a resolved, validated `layoutIdx` in any `LayoutTable`, Stage-1
+`copyTyAlignBound?` is the exact alignment recorded in that `TypeLayout`. -/
+theorem copyTyAlignBound?_exact_of_validLayout {decls : List LocalDecl}
+    {layouts : LayoutTable} {ty : Ty} {l : TypeLayout} {sz al : Nat}
+    (hns : copyIsUnsizedRigidTy 8 ty.kind = false)
+    (hres : isUnresolvedLayoutIdx layouts ty.layoutIdx = false)
+    (hlook : LayoutTable.lookup layouts ty.layoutIdx = some l)
+    (hval : copyValidatedLayoutFor? layouts ty.layoutIdx ty.kind l = some (sz, al)) :
+    copyTyAlignBound? decls layouts 32 ty = some (.exact al) := by
+  unfold copyTyAlignBound?
+  rw [hns]; dsimp only; rw [hres]; dsimp only; rw [hlook]; dsimp only; rw [hval]
+
+/-- Every `ValidCopyAlignPair` alignment (`1`, `2`, `4`, `8`, `16`) satisfies
+Stage-1's `Align.isPowerOfTwoBytes`. -/
+theorem alignIsPowerOfTwoBytes_of_validCopyAlign {abi : Miri.ABI.Align} {elemAlign : Nat}
+    (h : ValidCopyAlignPair abi elemAlign) :
+    Align.isPowerOfTwoBytes { bytes := elemAlign } = true := by
+  rcases h with ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ <;> rfl
+
 /-- A provenance pointer whose tag resolves to a live (`allocDead = false`) root
-borrow of a local whose type resolves to `(elemBytes, elemAlign)` (empty layout
-table, empty call stack) satisfies `CopyZeroPtrAgree`: Stage-1
-`stackBorrowAlignKnown` reduces to `offsetBytes % elemAlign = 0`. -/
+borrow of a local whose alignment bound in any 64-bit `LayoutTable` is a
+positive multiple of `elemAlign` (`.exact` or `.atLeast`, same-aligned or
+over-aligned, on an empty or populated `LayoutTable`) satisfies
+`CopyZeroPtrAgree`: Stage-1 `stackBorrowAlignKnown` reduces to
+`offsetBytes % elemAlign = 0`. -/
 theorem copyZeroPtrAgree_ptr_root
     {s : MachineState} {locals : List LocalSlot} {decls : List LocalDecl}
-    {elemBytes elemAlign : Nat} {p : ProvenancePtr} {e : AllocMapEntry} {decl : LocalDecl}
+    {layouts : LayoutTable} {elemAlign : Nat} {p : ProvenancePtr}
+    {e : AllocMapEntry} {decl : LocalDecl} {bound : PlaceAlignBound}
+    (hptr8 : layoutPointerBytes layouts = 8)
     (hstack : s.memory.callStack = .nil)
     (hlook : lookupBorrow s.memory.borrows p.tag = some e.toBorrowEntry)
     (hlive : e.toBorrowEntry.allocDead = false)
     (hdecl : get? decls e.localIdx = some decl)
-    (hunres : isUnresolvedLayoutIdx emptyLayoutTable decl.ty.layoutIdx = true)
-    (hsa : copyTySizeAndAlign? decls emptyLayoutTable 32 decl.ty.kind = some (elemBytes, elemAlign))
+    (hbound : copyTyAlignBound? decls layouts 32 decl.ty = some bound)
+    (hb_pos : 0 < bound.val)
+    (hdvd : bound.val % elemAlign = 0)
     (hpos : 0 < elemAlign) :
-    CopyZeroPtrAgree s locals decls emptyLayoutTable elemAlign (.ptr p 8) := by
-  have hb := copyTyAlignBound?_exact_of_sizeAndAlign hunres hsa
-  have hroot : borrowPlaceByteOffset? locals s.memory.callerLocals decls emptyLayoutTable
+    CopyZeroPtrAgree s locals decls layouts elemAlign (.ptr p 8) := by
+  have hroot : borrowPlaceByteOffset? locals s.memory.callerLocals decls layouts
       e.toBorrowEntry s.memory.callStack = some 0 := rfl
-  have hframe : frameLocalDeclsAndLayoutsAtDepth s.memory.callStack decls emptyLayoutTable
-      e.toBorrowEntry.targetFrameDepth = some (decls, emptyLayoutTable) := by
+  have hframe : frameLocalDeclsAndLayoutsAtDepth s.memory.callStack decls layouts
+      e.toBorrowEntry.targetFrameDepth = some (decls, layouts) := by
     rw [hstack]; rfl
-  have hpt : placeTyResolved decls emptyLayoutTable
+  have hpt : placeTyResolved decls layouts
       { local_ := e.toBorrowEntry.targetLocal, projection := e.toBorrowEntry.targetProjection } =
       some decl.ty := by
-    show placeTyResolved decls emptyLayoutTable { local_ := e.localIdx, projection := .nil } = _
+    show placeTyResolved decls layouts { local_ := e.localIdx, projection := .nil } = _
     unfold placeTyResolved; rw [hdecl]
   have hroot_decl : get? decls e.toBorrowEntry.targetLocal = some decl := hdecl
   unfold CopyZeroPtrAgree checkZeroCountCopyPtr ptrValueAligned
-  dsimp only
+  rw [hptr8]; dsimp only
   rw [hlook]; dsimp only
   unfold stackBorrowAlignKnown
-  rw [hlive, hroot, hframe]; dsimp only; rw [hroot_decl, hpt]; dsimp only; rw [hb]
-  simp only [PlaceAlignBound.val]
+  rw [hlive, hroot, hframe]; dsimp only; rw [hroot_decl, hpt]; dsimp only; rw [hbound]
+  dsimp only
   rw [show Nat.add 0 p.offsetBytes = p.offsetBytes from Nat.zero_add _]
+  have hb0 : Nat.beq bound.val 0 = false := by
+    cases h : Nat.beq bound.val 0
+    · rfl
+    · exact absurd (Nat.eq_of_beq_eq_true h) (Nat.ne_of_gt hb_pos)
+  have hdvd_b : Nat.beq (Nat.mod bound.val elemAlign) 0 = true := by
+    rw [show Nat.mod bound.val elemAlign = 0 from hdvd]; rfl
   have he0 : Nat.beq elemAlign 0 = false := by
     cases h : Nat.beq elemAlign 0
     · rfl
     · exact absurd (Nat.eq_of_beq_eq_true h) (Nat.ne_of_gt hpos)
-  have hself : Nat.beq (Nat.mod elemAlign elemAlign) 0 = true := by
-    rw [show Nat.mod elemAlign elemAlign = 0 from Nat.mod_self elemAlign]; rfl
-  rw [he0, hself]
+  rw [hb0, hdvd_b, he0]
+  dsimp only
   by_cases hle : elemAlign ≤ 1
   · have h1 : elemAlign = 1 := by omega
     subst h1
@@ -7944,6 +7972,47 @@ theorem copyZeroPtrAgree_ptr_root
 theorem isUnresolvedLayoutIdx_emptyLayoutTable (idx : Nat) :
     isUnresolvedLayoutIdx emptyLayoutTable idx = true := by
   cases idx <;> rfl
+
+/-- When both pointer operands carry unresolved `layoutIdx` entries in `layouts`
+and `copyTySizeAndAlign?` resolves their shared pointee kind to
+`(elemBytes, elemAlign)` with power-of-two `elemAlign`, Stage-1
+`resolveCopyElemLayout` returns `.ok elemBytes elemAlign`. -/
+theorem resolveCopyElemLayout_of_unresolved_ptrs
+    {decls : List LocalDecl} {layouts : LayoutTable}
+    {srcIdx dstIdx : Local} {srcDecl dstDecl : LocalDecl}
+    {srcMut dstMut : Mutability} {pointeeKind : RigidTy}
+    {elemBytes elemAlign : Nat}
+    (hsrcDecl : get? decls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeKind)
+    (hsrcUnres : isUnresolvedLayoutIdx layouts srcDecl.ty.layoutIdx = true)
+    (hdstDecl : get? decls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hdstUnres : isUnresolvedLayoutIdx layouts dstDecl.ty.layoutIdx = true)
+    (hsa : copyTySizeAndAlign? decls layouts 32 pointeeKind = some (elemBytes, elemAlign))
+    (hpow2 : Align.isPowerOfTwoBytes { bytes := elemAlign } = true) :
+    resolveCopyElemLayout decls layouts (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) =
+      .ok elemBytes elemAlign := by
+  have hns : copyIsUnsizedRigidTy 8 pointeeKind = false := by
+    cases h : copyIsUnsizedRigidTy 8 pointeeKind
+    · rfl
+    · unfold copyTySizeAndAlign? at hsa; rw [h] at hsa; cases hsa
+  have hopS : operandPointeeLookup decls layouts (.copy ⟨srcIdx, []⟩) =
+      .pointee pointeeKind .none := by
+    unfold operandPointeeLookup operandTyResolved placeTyResolved
+    dsimp only; rw [hsrcDecl]; dsimp only [resolveProjectedTyResolved]
+    rw [hsrcUnres]; dsimp only; rw [hsrcTy]
+  have hopD : operandPointeeLookup decls layouts (.copy ⟨dstIdx, []⟩) =
+      .pointee pointeeKind .none := by
+    unfold operandPointeeLookup operandTyResolved placeTyResolved
+    dsimp only; rw [hdstDecl]; dsimp only [resolveProjectedTyResolved]
+    rw [hdstUnres]; dsimp only; rw [hdstTy]
+  have hsingle : resolveSinglePointeeLayout decls layouts pointeeKind .none =
+      .ok elemBytes elemAlign := by
+    unfold resolveSinglePointeeLayout
+    rw [hns]; dsimp only; rw [hsa]; dsimp only; rw [hpow2]
+  unfold resolveCopyElemLayout
+  rw [hopS, hopD]; dsimp only; rw [hsingle]
+  simp only [Nat.beq_refl, Bool.and_self]
 
 /-- Per-pointer agreement on both `src` and `dst` yields the zero-count hypothesis
 `hzero_align` of `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`. -/
@@ -7967,9 +8036,13 @@ theorem copyZeroAlign_of_agree
   · exact Or.inr ⟨Or.inl haS, rfl⟩
 
 /-- **Semantic discharge of the zero-count precheck (`LM-4.2`)**: under
-`StateRelLM3_1` on the empty layout table with no exposed provenance, every
-initialized raw-pointer operand value satisfies `CopyZeroPtrAgree` provided each
-provenance pointer it may hold targets a live root local of the pointee type. -/
+`StateRelLM3_1` on any 64-bit `LayoutTable` (`hptr8`) with no exposed provenance
+(`hexp`), every initialized raw-pointer operand value satisfies
+`CopyZeroPtrAgree` provided each provenance pointer it may hold targets a live
+root local whose alignment bound is a positive multiple of `elemAlign`
+(including both same-aligned and over-aligned locals, on empty or populated
+layout tables). Provenance-free integer addresses (aligned null, aligned
+dangling, or misaligned) need no extra hypothesis. -/
 theorem copyZeroPtrAgree_lm3_1
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -7977,18 +8050,19 @@ theorem copyZeroPtrAgree_lm3_1
     {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     (hframes : m.stack.frames = #[tf])
     {idx : Local} {decl : LocalDecl} {mutability : Mutability} {pk : RigidTy}
-    {elemBytes elemAlign : Nat} {v : Value}
+    {elemAlign : Nat} {v : Value}
     (hdecl : get? body.localDecls idx = some decl)
     (hty : decl.ty.kind = .rawPtr mutability pk)
     (himm : IsImmediateFrameLocal tf idx)
     (hval : get? s.frame.locals idx = some (.init v))
-    (hlay : body.layouts = emptyLayoutTable)
+    (hptr8 : layoutPointerBytes body.layouts = 8)
     (hexp : s.memory.exposedAllocIds = [])
-    (hsa : copyTySizeAndAlign? body.localDecls emptyLayoutTable 32 pk = some (elemBytes, elemAlign))
     (hpos : 0 < elemAlign)
     (hlive : ∀ p e tdecl, v = .ptr p 8 → e ∈ allocMap → e.tag = p.tag →
       get? body.localDecls e.localIdx = some tdecl →
-      e.toBorrowEntry.allocDead = false ∧ tdecl.ty.kind = pk) :
+      e.toBorrowEntry.allocDead = false ∧
+        ∃ bound, copyTyAlignBound? body.localDecls body.layouts 32 tdecl.ty = some bound ∧
+          0 < bound.val ∧ bound.val % elemAlign = 0) :
     CopyZeroPtrAgree s s.frame.locals body.localDecls body.layouts elemAlign v := by
   obtain ⟨_, _, _, _, _, _, _, _, _, _, halloc, _⟩ := id hstate
   rcases annealEvalOperand_rawPtr_lm3_1 hstate hframes hdecl hty himm with
@@ -7996,28 +8070,102 @@ theorem copyZeroPtrAgree_lm3_1
   · rw [hval] at hd; cases hd
   · rw [hval] at hun; cases hun
   · rw [hval] at hsc; injection hsc with h; injection h with h; subst h
-    exact copyZeroPtrAgree_scalar hexp (by rw [hlay]) hsz8 (hsz8 ▸ hrel.canonical) hpos
+    exact copyZeroPtrAgree_scalar hexp hptr8 hsz8 (hsz8 ▸ hrel.canonical) hpos
   · rw [hval] at hptr; injection hptr with h; injection h with h; subst h
     rcases hptrRel with ⟨_, _, _, _, _, _, e, he, het, _⟩
     obtain ⟨tdecl, htdecl, _⟩ := halloc.target_decl e he
-    obtain ⟨hdead, hk⟩ := hlive ptrVal e tdecl rfl he het htdecl
+    obtain ⟨hdead, bound, hbound, hb_pos, hdvd⟩ := hlive ptrVal e tdecl rfl he het htdecl
     have hlook : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
       rw [← het]; exact (halloc.borrow_sync e he).2
-    rw [hlay]
-    exact copyZeroPtrAgree_ptr_root hstate.callStack_nil hlook hdead htdecl
-      (isUnresolvedLayoutIdx_emptyLayoutTable _) (hk ▸ hsa) hpos
+    exact copyZeroPtrAgree_ptr_root hptr8 hstate.callStack_nil hlook hdead htdecl
+      hbound hb_pos hdvd hpos
 
 /-- **`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets` (`LM-4.2`,
-Stage-1 bridge with semantic zero-count hypotheses)**: the conclusion of
-`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2` with its Stage-1-internal
-zero-count hypothesis `hzero_align` replaced by semantic conditions: the empty
-layout table (`hlay`, which also yields `hptr8`), no exposed provenance (`hexp`),
-the pointee's resolved layout (`hsa`), and, on `count = 0`, every provenance
-pointer operand targets a live (`allocDead = false`) root local of the same
-pointee type (`hzero_live`). Provenance-free integer operands (aligned null,
+Stage-1 bridge with semantic zero-count hypotheses, arbitrary `LayoutTable`)**:
+the conclusion of `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2` with its
+Stage-1-internal zero-count hypothesis `hzero_align` replaced by semantic
+conditions over any 64-bit `LayoutTable`: no exposed provenance (`hexp`), and on
+`count = 0`, every provenance pointer operand targets a live (`allocDead = false`)
+root local whose alignment bound is a positive multiple of `elemAlign`
+(`hzero_live`, covering same-aligned and over-aligned backing locals as well as
+populated `LayoutTable`s). Provenance-free integer operands (aligned null,
 aligned `NonNull::dangling()`, or misaligned addresses) need no extra hypothesis.
 No non-null exclusion is needed. -/
 theorem stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : LocalDecl} {srcMut dstMut : Mutability} {pointeeTy countTy : Ty}
+    {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (helem_pos : 0 < elemBytes)
+    (hexp : s.memory.exposedAllocIds = [])
+    (hzero_live : ∀ p countSc e decl,
+      (get? s.frame.locals srcIdx = some (.init (.ptr p 8)) ∨
+        get? s.frame.locals dstIdx = some (.init (.ptr p 8))) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      countSc.bits = 0 →
+      e ∈ allocMap → e.tag = p.tag →
+      get? body.localDecls e.localIdx = some decl →
+      e.toBorrowEntry.allocDead = false ∧
+        ∃ bound, copyTyAlignBound? body.localDecls body.layouts 32 decl.ty = some bound ∧
+          0 < bound.val ∧ bound.val % elemAlign = 0)
+    (hptr_single : ∀ srcPtr dstPtr countSc e_s e_d decl_s decl_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      countSc.bits = 1 ∧
+        srcPtr.offsetBytes = 0 ∧
+        dstPtr.offsetBytes = 0 ∧
+        decl_s.ty.kind = pointeeTy.kind ∧
+        decl_d.ty.kind = pointeeTy.kind ∧
+        unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none ∧
+        unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
+    (hres : resolveCopyElemLayout body.localDecls body.layouts (.copy ⟨srcIdx, []⟩)
+      (.copy ⟨dstIdx, []⟩) = .ok elemBytes elemAlign := by rfl)
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
+    stepMirFn body s = stepMirFnLM4_2 body s := by
+  have hpos : 0 < elemAlign := by
+    rcases hpt.align_pair.validCopyAlign with h | h | h | h | h <;> omega
+  obtain ⟨tf, hframes, _⟩ := id hstate
+  refine stepMirFn_copyNonOverlapping_stage1_eq_lm4_2 hstate hphase hbb hstmt
+    hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt helem_pos
+    ?_ hptr_single hres hptr8
+  intro srcVal dstVal countSc hsrc hdst hcnt hc0
+  exact copyZeroAlign_of_agree
+    (copyZeroPtrAgree_lm3_1 hstate hframes hsrcDecl hsrcTy (hsrcImm tf hframes) hsrc hptr8 hexp
+      hpos (fun p e tdecl hv he het htd => by
+        subst hv; exact hzero_live p countSc e tdecl (Or.inl hsrc) hcnt hc0 he het htd))
+    (copyZeroPtrAgree_lm3_1 hstate hframes hdstDecl hdstTy (hdstImm tf hframes) hdst hptr8 hexp
+      hpos (fun p e tdecl hv he het htd => by
+        subst hv; exact hzero_live p countSc e tdecl (Or.inr hdst) hcnt hc0 he het htd))
+
+/-- **`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets_emptyLayout`**:
+empty-`LayoutTable` specialization of
+`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets` that derives
+`resolveCopyElemLayout = .ok elemBytes elemAlign`, `layoutPointerBytes = 8`, and
+`hzero_align` entirely from `hlay`, `hexp`, `hsa`, and `hzero_live` (zero
+TCB-internal hypotheses). -/
+theorem stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets_emptyLayout
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -8066,24 +8214,27 @@ theorem stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets
         decl_s.ty.kind = pointeeTy.kind ∧
         decl_d.ty.kind = pointeeTy.kind ∧
         unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none ∧
-        unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
-    (hres : resolveCopyElemLayout body.localDecls body.layouts (.copy ⟨srcIdx, []⟩)
-      (.copy ⟨dstIdx, []⟩) = .ok elemBytes elemAlign := by rfl) :
+        unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none) :
     stepMirFn body s = stepMirFnLM4_2 body s := by
   have hpos : 0 < elemAlign := by
     rcases hpt.align_pair.validCopyAlign with h | h | h | h | h <;> omega
-  obtain ⟨tf, hframes, _⟩ := id hstate
-  refine stepMirFn_copyNonOverlapping_stage1_eq_lm4_2 hstate hphase hbb hstmt
+  have hpow2 : Align.isPowerOfTwoBytes { bytes := elemAlign } = true :=
+    alignIsPowerOfTwoBytes_of_validCopyAlign hpt.align_pair
+  have hres : resolveCopyElemLayout body.localDecls body.layouts (.copy ⟨srcIdx, []⟩)
+      (.copy ⟨dstIdx, []⟩) = .ok elemBytes elemAlign := by
+    rw [hlay]
+    exact resolveCopyElemLayout_of_unresolved_ptrs hsrcDecl hsrcTy
+      (isUnresolvedLayoutIdx_emptyLayoutTable _) hdstDecl hdstTy
+      (isUnresolvedLayoutIdx_emptyLayoutTable _) hsa hpow2
+  refine stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets hstate hphase hbb hstmt
     hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt helem_pos
-    ?_ hptr_single hres (by rw [hlay])
-  intro srcVal dstVal countSc hsrc hdst hcnt hc0
-  exact copyZeroAlign_of_agree
-    (copyZeroPtrAgree_lm3_1 hstate hframes hsrcDecl hsrcTy (hsrcImm tf hframes) hsrc hlay hexp
-      hsa hpos (fun p e tdecl hv he het htd => by
-        subst hv; exact hzero_live p countSc e tdecl (Or.inl hsrc) hcnt hc0 he het htd))
-    (copyZeroPtrAgree_lm3_1 hstate hframes hdstDecl hdstTy (hdstImm tf hframes) hdst hlay hexp
-      hsa hpos (fun p e tdecl hv he het htd => by
-        subst hv; exact hzero_live p countSc e tdecl (Or.inr hdst) hcnt hc0 he het htd))
+    hexp ?_ hptr_single hres (by rw [hlay])
+  intro p countSc e decl hloc hcnt hc0 he het hdecl
+  obtain ⟨hdead, hk⟩ := hzero_live p countSc e decl hloc hcnt hc0 he het hdecl
+  refine ⟨hdead, .exact elemAlign, ?_, hpos, Nat.mod_self elemAlign⟩
+  rw [hlay]
+  exact copyTyAlignBound?_exact_of_sizeAndAlign (isUnresolvedLayoutIdx_emptyLayoutTable _)
+    (hk ▸ hsa)
 
 /-- **`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit` (`LM-4.2`,
 Stage-1 `Trusted`)**: one real Stage-1 `stepMirFn` step of
@@ -8375,6 +8526,189 @@ theorem step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap
       hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt
       helem_pos hzero_align htgt_same hptr_single hlive_ok hres hptr8)
     hact
+
+/-- **`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets`
+(`LM-4.2`, Stage-1 `Trusted`)**: semantic zero-count lockstep simulation over any
+64-bit `LayoutTable`, replacing `hzero_align` by `hexp` and `hzero_live` (live
+root target whose alignment bound is a positive multiple of `elemAlign`). -/
+theorem step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : LocalDecl} {srcMut dstMut : Mutability} {pointeeTy countTy : Ty}
+    {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (helem_pos : 0 < elemBytes)
+    (hexp : s.memory.exposedAllocIds = [])
+    (hzero_live : ∀ p countSc e decl,
+      (get? s.frame.locals srcIdx = some (.init (.ptr p 8)) ∨
+        get? s.frame.locals dstIdx = some (.init (.ptr p 8))) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      countSc.bits = 0 →
+      e ∈ allocMap → e.tag = p.tag →
+      get? body.localDecls e.localIdx = some decl →
+      e.toBorrowEntry.allocDead = false ∧
+        ∃ bound, copyTyAlignBound? body.localDecls body.layouts 32 decl.ty = some bound ∧
+          0 < bound.val ∧ bound.val % elemAlign = 0)
+    (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      decl_s.ty.kind = pointeeTy.kind ∧
+        decl_d.ty.kind = pointeeTy.kind ∧
+        unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none ∧
+        unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
+    (hptr_single : ∀ srcPtr dstPtr countSc,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      countSc.bits = 1 ∧
+        srcPtr.offsetBytes = 0 ∧
+        dstPtr.offsetBytes = 0)
+    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? s.frame.locals e_s.localIdx ≠ some .dead →
+      get? s.frame.locals e_d.localIdx ≠ some .dead →
+      e_s.perm ≠ .disabled ∧
+        (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
+        get? s.frame.locals e_s.localIdx ≠ some .uninit)
+    (hres : resolveCopyElemLayout body.localDecls body.layouts (.copy ⟨srcIdx, []⟩)
+      (.copy ⟨dstIdx, []⟩) = .ok elemBytes elemAlign := by rfl)
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
+    StepRelLM3_1 body m
+      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  have hpos : 0 < elemAlign := by
+    rcases hpt.align_pair.validCopyAlign with h | h | h | h | h <;> omega
+  obtain ⟨tf, hframes, _⟩ := id hstate
+  refine step_intrinsic_copyNonOverlapping_stage1_simulation_explicit hstate hphase hbb hstmt
+    hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt helem_pos
+    ?_ htgt_same hptr_single hlive_ok hres hptr8
+  intro srcVal dstVal countSc hsrc hdst hcnt hc0
+  exact copyZeroAlign_of_agree
+    (copyZeroPtrAgree_lm3_1 hstate hframes hsrcDecl hsrcTy (hsrcImm tf hframes) hsrc hptr8 hexp
+      hpos (fun p e tdecl hv he het htd => by
+        subst hv; exact hzero_live p countSc e tdecl (Or.inl hsrc) hcnt hc0 he het htd))
+    (copyZeroPtrAgree_lm3_1 hstate hframes hdstDecl hdstTy (hdstImm tf hframes) hdst hptr8 hexp
+      hpos (fun p e tdecl hv he het htd => by
+        subst hv; exact hzero_live p countSc e tdecl (Or.inr hdst) hcnt hc0 he het htd))
+
+/-- **`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets_emptyLayout`**:
+empty-`LayoutTable` specialization of
+`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets`
+discharging `hzero_align`, `hres`, and `hptr8` completely semantically. -/
+theorem step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets_emptyLayout
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : LocalDecl} {srcMut dstMut : Mutability} {pointeeTy countTy : Ty}
+    {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (helem_pos : 0 < elemBytes)
+    (hlay : body.layouts = emptyLayoutTable)
+    (hexp : s.memory.exposedAllocIds = [])
+    (hsa : copyTySizeAndAlign? body.localDecls emptyLayoutTable 32 pointeeTy.kind =
+      some (elemBytes, elemAlign))
+    (hzero_live : ∀ p countSc e decl,
+      (get? s.frame.locals srcIdx = some (.init (.ptr p 8)) ∨
+        get? s.frame.locals dstIdx = some (.init (.ptr p 8))) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      countSc.bits = 0 →
+      e ∈ allocMap → e.tag = p.tag →
+      get? body.localDecls e.localIdx = some decl →
+      e.toBorrowEntry.allocDead = false ∧ decl.ty.kind = pointeeTy.kind)
+    (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      decl_s.ty.kind = pointeeTy.kind ∧
+        decl_d.ty.kind = pointeeTy.kind ∧
+        unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none ∧
+        unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
+    (hptr_single : ∀ srcPtr dstPtr countSc,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      countSc.bits = 1 ∧
+        srcPtr.offsetBytes = 0 ∧
+        dstPtr.offsetBytes = 0)
+    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? s.frame.locals e_s.localIdx ≠ some .dead →
+      get? s.frame.locals e_d.localIdx ≠ some .dead →
+      e_s.perm ≠ .disabled ∧
+        (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
+        get? s.frame.locals e_s.localIdx ≠ some .uninit) :
+    StepRelLM3_1 body m
+      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  have hpos : 0 < elemAlign := by
+    rcases hpt.align_pair.validCopyAlign with h | h | h | h | h <;> omega
+  have hpow2 : Align.isPowerOfTwoBytes { bytes := elemAlign } = true :=
+    alignIsPowerOfTwoBytes_of_validCopyAlign hpt.align_pair
+  have hres : resolveCopyElemLayout body.localDecls body.layouts (.copy ⟨srcIdx, []⟩)
+      (.copy ⟨dstIdx, []⟩) = .ok elemBytes elemAlign := by
+    rw [hlay]
+    exact resolveCopyElemLayout_of_unresolved_ptrs hsrcDecl hsrcTy
+      (isUnresolvedLayoutIdx_emptyLayoutTable _) hdstDecl hdstTy
+      (isUnresolvedLayoutIdx_emptyLayoutTable _) hsa hpow2
+  refine step_intrinsic_copyNonOverlapping_stage1_simulation_explicit_of_live_targets
+    hstate hphase hbb hstmt hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
+    hcountInt hcountOp hpt helem_pos hexp ?_ htgt_same hptr_single hlive_ok hres (by rw [hlay])
+  intro p countSc e decl hloc hcnt hc0 he het hdecl
+  obtain ⟨hdead, hk⟩ := hzero_live p countSc e decl hloc hcnt hc0 he het hdecl
+  refine ⟨hdead, .exact elemAlign, ?_, hpos, Nat.mod_self elemAlign⟩
+  rw [hlay]
+  exact copyTyAlignBound?_exact_of_sizeAndAlign (isUnresolvedLayoutIdx_emptyLayoutTable _)
+    (hk ▸ hsa)
 
 /-- **Stage-1 uninitialized-source divergence (`LM-4.2`, Stage-1 `Trusted`)**:
 copying `count = 1` element from an uninitialized (`.uninit`) live non-union

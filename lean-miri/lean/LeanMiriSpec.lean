@@ -384,10 +384,12 @@ import LeanMiriSpec.Audit
   executes `write_bytes` with its own, more restrictive `evalWriteBytesCall`)
   (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.CopyLM4_2`: `NonDivergingIntrinsic.CopyNonOverlapping`
-  Stage-1 bridge (`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`, and
-  `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets` with semantic
-  zero-count hypotheses discharged by `copyZeroPtrAgree_lm3_1`), Stage-1
-  lockstep simulation (`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit`,
+  Stage-1 bridge (`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`,
+  `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets` over arbitrary
+  64-bit `LayoutTable`s, and `…_emptyLayout` deriving `resolveCopyElemLayout`
+  and `hzero_align` purely semantically), Stage-1 lockstep simulation
+  (`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit`,
+  `…_of_live_targets`, `…_of_live_targets_emptyLayout`,
   `step_intrinsic_copyNonOverlapping_stage1_simulation`,
   `step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap`), Stage-1
   distinct-local full-byte multi-element `evalCopySubplaceMulti` / `copyBytesSubplace`
