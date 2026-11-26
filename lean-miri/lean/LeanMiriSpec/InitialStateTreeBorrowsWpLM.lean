@@ -3073,17 +3073,20 @@ def annealTbCheckMemAccess (mplace : Miri.Interpreter.MemPlace AnnealProv)
     Miri.Interpreter.RvalueM AnnealStepState Unit := do
   let st ← get
   let some bs := st.machine.borrowTracker | return ()
-  let some (.concrete allocId tag) := mplace.ptr.provenance | return ()
-  let some base := st.machine.lookupBaseAddr allocId
-    | throw (.undefinedBehavior "Tree Borrows access on allocation without base address")
-  let offset := Size.ofBytes (mplace.ptr.offset.bytes - base)
-  match st.machine.memory.live.find? (fun row => row.1 == allocId) with
+  -- Resolve through the project's CHECKED `annealResolvePtr` (fail closed on provenance-free,
+  -- wildcard, base-less, or below-base pointers instead of wrapping `UInt64` subtraction).
+  let some resolved := (annealResolvePtr st.machine mplace.ptr (Int.ofNat size.bytes.toNat)).toOption
+    | throw (.undefinedBehavior "Tree Borrows access through unresolvable pointer")
+  match st.machine.memory.live.find? (fun row => row.1 == resolved.allocId) with
   | none => throw (.undefinedBehavior "Tree Borrows access on dangling allocation")
   | some (_, ⟨_, alloc⟩) =>
     match alloc.extra with
-    | none => return ()
+    -- With the borrow tracker active, EVERY live allocation must carry a `BorrowTree` (as in
+    -- vendored Miri, whose allocation extra is non-optional): fail closed, never skip the check.
+    | none => throw (.invalidProgram "Tree Borrows enabled but allocation has no borrow tree")
     | some tree =>
-      let res := tree.performBorrowAccessRange (.concrete tag) offset size kind
+      let allocId := resolved.allocId
+      let res := tree.performBorrowAccessRange (.concrete resolved.extra) resolved.offset size kind
         bs.global.protectedTags .VisitChildrenOfAccessed
       let alloc' := alloc.setExtra (some res.tree)
       match st.machine.memory.setLiveAllocation allocId alloc' with
@@ -3099,7 +3102,18 @@ def annealTbCheckMemAccess (mplace : Miri.Interpreter.MemPlace AnnealProv)
 memory write (`*p = rvalue`) or dereference memory read (`_d = copy/move (*p)`), enforces real
 vendored `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange` against
 `state.machine.borrowTracker.global.protectedTags` and live allocation `BorrowTree`s, then executes
-unmodified `annealStepHooks.assign`! -/
+unmodified `annealStepHooks.assign`!
+
+**Scope / honesty note.** `Miri.Interpreter.Step.step` itself is unmodified; this is an
+*instantiation* of its `StepHooks` parameter. The pre-existing correspondence instantiation
+(`annealMemoryCopyHooks`, `Correspondence/Translate.lean`) deliberately tracks NO borrow state, so
+these hooks are Anneal-authored instrumentation, NOT vendored Miri's own TB-enabled machine
+(`PlaceMachine.memoryAccess` / `MachineMemoryHooks`). Consequently:
+- the instrumentation only intercepts `Use (Copy/Move *p)` reads and `*p = _` writes, so a
+  successful run under `annealTbStepHooks` is NOT a general Tree Borrows soundness claim;
+- its per-access TB verdicts on the §4.3 witness accesses are cross-validated against unmodified
+  vendored `MachineMemoryHooks.beforeMemoryWrite` / `beforeMemoryRead` by
+  `witness_tb_hooks_agree_vendored_machineMemoryHooks`. -/
 def annealTbStepHooks (localDecls : List LocalDecl := .nil)
     (layouts : AnnealLayoutTable := emptyLayoutTable) :
     StepHooks AnnealProv LocalLayout Unit AnnealMachine Unit (RuntimePlace AnnealProv) :=
@@ -3191,17 +3205,20 @@ private noncomputable def annealTbCheckMemAccessLMU (mplace : Miri.Interpreter.M
     Miri.Interpreter.RvalueM AnnealStepState Unit := do
   let st ← get
   let some bs := st.machine.borrowTracker | return ()
-  let some (.concrete allocId tag) := mplace.ptr.provenance | return ()
-  let some base := st.machine.lookupBaseAddr allocId
-    | throw (.undefinedBehavior "Tree Borrows access on allocation without base address")
-  let offset := Size.ofBytes (mplace.ptr.offset.bytes - base)
-  match st.machine.memory.live.find? (fun row => row.1 == allocId) with
+  -- Resolve through the project's CHECKED `annealResolvePtr` (fail closed on provenance-free,
+  -- wildcard, base-less, or below-base pointers instead of wrapping `UInt64` subtraction).
+  let some resolved := (annealResolvePtr st.machine mplace.ptr (Int.ofNat size.bytes.toNat)).toOption
+    | throw (.undefinedBehavior "Tree Borrows access through unresolvable pointer")
+  match st.machine.memory.live.find? (fun row => row.1 == resolved.allocId) with
   | none => throw (.undefinedBehavior "Tree Borrows access on dangling allocation")
   | some (_, ⟨_, alloc⟩) =>
     match alloc.extra with
-    | none => return ()
+    -- With the borrow tracker active, EVERY live allocation must carry a `BorrowTree` (as in
+    -- vendored Miri, whose allocation extra is non-optional): fail closed, never skip the check.
+    | none => throw (.invalidProgram "Tree Borrows enabled but allocation has no borrow tree")
     | some tree =>
-      let res := performBorrowAccessRangeLMU tree (.concrete tag) offset size kind
+      let allocId := resolved.allocId
+      let res := performBorrowAccessRangeLMU tree (.concrete resolved.extra) resolved.offset size kind
         bs.global.protectedTags .VisitChildrenOfAccessed
       let alloc' := alloc.setExtra (some res.tree)
       match st.machine.memory.setLiveAllocation allocId alloc' with
@@ -3350,6 +3367,126 @@ theorem witness_tb_enabled_translateBody_positive_and_negative_ub_refutations :
     | ok _ _ => rw [hR] at hFrozRun; cases hFrozRun
     | error _ _ => rw [hR] at hSafe; exact hSafe
 
+/-- Trivial (single-threaded, no data race, no sync objects) vendored `MachineMemoryHooks.Hooks`
+with the SAME protector set `ep1Prot23` as the §4.3 borrow tracker. -/
+private def ep1TrivialMMHooks : MachineMemoryHooks.Hooks Unit Unit Unit :=
+  { protectedTags := ep1Prot23
+    emitDiagnostic := fun s _ _ => s
+    dataRaceRead := fun s _ _ _ => ⟨s, .ok ()⟩
+    dataRaceWrite := fun s _ _ _ => ⟨s, .ok ()⟩
+    dataRaceDeallocate := fun s _ _ _ _ => ⟨s, .ok ()⟩
+    syncOnAccess := fun s _ _ => ⟨s, .ok ()⟩
+    deleteOnWrite := fun _ => false
+    recordDeallocatedSpan := fun s _ => s
+    freeAllocId := fun s _ _ _ _ => s }
+
+private def ep1TrivialMMCtx : MachineMemoryHooks.Context Unit Unit :=
+  { state := (), syncObjects := .empty }
+
+private noncomputable def ep1VendoredTbAlloc : Allocation Provenance BorrowTree :=
+  ep1BaseAlloc16.withExtra ep1DisjointTwoChildTree
+
+private def ep1VendoredTbPtr (tag : BorTag) (off : UInt64) : Pointer (Option Provenance) :=
+  ⟨Size.ofBytes (0x1000 + off), some (.concrete ep1AllocId tag)⟩
+
+/-- Real vendored `MachineMemoryHooks` verdict for a 4-byte access through `tag` at `off`, reduced
+to `tbAccessPre` via `miriBeforeMemoryWriteExactWP_iff` / `miriBeforeMemoryReadExactWP_iff`. -/
+private theorem ep1VendoredSetLive (t : BorrowTree) :
+    ep1ObsState.memory.setLiveAllocation ep1AllocId (ep1VendoredTbAlloc.setExtra t) =
+      .ok { ep1ObsState.memory with
+            live := ((ep1ObsState.memory.live.filter fun row => row.1 != ep1AllocId).push
+              (ep1AllocId, { kind := .stack, allocation := ep1VendoredTbAlloc.setExtra t })) } :=
+  MemoryState.setLiveAllocation_of_find ep1ObsState.memory ep1AllocId
+    { kind := .stack, allocation := ep1VendoredTbAlloc } _ rfl
+
+/-- **Cross-validation of the §4.3 instrumentation against UNMODIFIED vendored
+`Miri.TreeBorrows.MachineMemoryHooks` (`witness_tb_hooks_agree_vendored_machineMemoryHooks`)**:
+on the same allocation (`ep1BaseAlloc16` + `ep1DisjointTwoChildTree`), the same protector set
+(`ep1Prot23`), and the same 4-byte accesses that `witness_tb_enabled_translateBody_*` performs,
+vendored `beforeMemoryWrite` / `beforeMemoryRead` (pinned `MiriMachine::before_memory_{write,read}`)
+return EXACTLY the verdicts `annealTbStepHooks` reports:
+1. write through root `tag 1` at `[0, 4)`: vendored hook FAULTS, and the underlying status is the
+   `ProtectedDisabled Frozen` transition error reported by the instrumentation;
+2. write through `tag 2` (`Frozen`) at `[0, 4)`: vendored hook FAULTS with `ChildAccessForbidden Frozen`;
+3. write through `tag 3` (`Unique`) at `[8, 12)` and read through `tag 2` at `[0, 4)`: vendored hooks
+   SUCCEED (the positive run's accesses). -/
+theorem witness_tb_hooks_agree_vendored_machineMemoryHooks :
+    AnnealExactWP
+      (miriBeforeMemoryWriteAction ep1TrivialMMHooks ep1VendoredTbAlloc (ep1VendoredTbPtr ep1Tag1 0)
+        ep1AllocId (.concrete ep1Tag1) (allocRange Size.ZERO (Size.ofBytes 4)))
+      (fun _ _ => False) (fun _ _ => True) (ep1ObsState.memory, ep1TrivialMMCtx) ∧
+    formatTbAccessStatus
+      (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag1) Size.ZERO
+        (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).status =
+      "Tree Borrows UB: ProtectedDisabled Frozen" ∧
+    AnnealExactWP
+      (miriBeforeMemoryWriteAction ep1TrivialMMHooks ep1VendoredTbAlloc (ep1VendoredTbPtr ep1Tag2 0)
+        ep1AllocId (.concrete ep1Tag2) (allocRange Size.ZERO (Size.ofBytes 4)))
+      (fun _ _ => False) (fun _ _ => True) (ep1ObsState.memory, ep1TrivialMMCtx) ∧
+    formatTbAccessStatus
+      (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag2) Size.ZERO
+        (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).status =
+      "Tree Borrows UB: ChildAccessForbidden Frozen" ∧
+    AnnealExactWP
+      (miriBeforeMemoryWriteAction ep1TrivialMMHooks ep1VendoredTbAlloc (ep1VendoredTbPtr ep1Tag3 8)
+        ep1AllocId (.concrete ep1Tag3) (allocRange (Size.ofBytes 8) (Size.ofBytes 4)))
+      (fun _ _ => True) (fun _ _ => False) (ep1ObsState.memory, ep1TrivialMMCtx) ∧
+    AnnealExactWP
+      (miriBeforeMemoryReadAction ep1TrivialMMHooks ep1VendoredTbAlloc (ep1VendoredTbPtr ep1Tag2 0)
+        ep1AllocId (.concrete ep1Tag2) (allocRange Size.ZERO (Size.ofBytes 4)))
+      (fun _ _ => True) (fun _ _ => False) (ep1ObsState.memory, ep1TrivialMMCtx) := by
+  have hW1 :
+      (performBorrowAccessRangeLMU ep1DisjointTwoChildTree (.concrete ep1Tag1) Size.ZERO
+        (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).status =
+      .AccessFailure ⟨0, 4⟩ (.TransitionError 1 (.ProtectedDisabled .Frozen)) := by kernel_rfl
+  have hW2 :
+      (performBorrowAccessRangeLMU ep1DisjointTwoChildTree (.concrete ep1Tag2) Size.ZERO
+        (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).status =
+      .AccessFailure ⟨0, 4⟩ (.TransitionError 1 (.ChildAccessForbidden .Frozen)) := by kernel_rfl
+  have hW3 :
+      (performBorrowAccessRangeLMU ep1DisjointTwoChildTree (.concrete ep1Tag3) (Size.ofBytes 8)
+        (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).status = .Completed := by
+    kernel_rfl
+  have hR2 :
+      (performBorrowAccessRangeLMU ep1DisjointTwoChildTree (.concrete ep1Tag2) Size.ZERO
+        (Size.ofBytes 4) .Read ep1Prot23 .VisitChildrenOfAccessed).status = .Completed := by
+    kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · rw [miriBeforeMemoryWriteExactWP_iff ep1TrivialMMHooks ep1VendoredTbAlloc _ ep1AllocId _ _
+      (Size.ofBytes 4) _ _ ep1TrivialMMCtx _ _ rfl rfl rfl (by kernel_rfl) (ep1VendoredSetLive _)]
+    unfold tbAccessPre
+    change match (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag1) Size.ZERO
+        (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).status with
+      | .Completed => False | _ => True
+    rw [performBorrowAccessRangeLMU.eq_src, hW1]
+    trivial
+  · rw [performBorrowAccessRangeLMU.eq_src, hW1]; rfl
+  · rw [miriBeforeMemoryWriteExactWP_iff ep1TrivialMMHooks ep1VendoredTbAlloc _ ep1AllocId _ _
+      (Size.ofBytes 4) _ _ ep1TrivialMMCtx _ _ rfl rfl rfl (by kernel_rfl) (ep1VendoredSetLive _)]
+    unfold tbAccessPre
+    change match (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag2) Size.ZERO
+        (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).status with
+      | .Completed => False | _ => True
+    rw [performBorrowAccessRangeLMU.eq_src, hW2]
+    trivial
+  · rw [performBorrowAccessRangeLMU.eq_src, hW2]; rfl
+  · rw [miriBeforeMemoryWriteExactWP_iff ep1TrivialMMHooks ep1VendoredTbAlloc _ ep1AllocId _ _
+      (Size.ofBytes 12) _ _ ep1TrivialMMCtx _ _ rfl rfl rfl (by kernel_rfl) (ep1VendoredSetLive _)]
+    unfold tbAccessPre
+    change match (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag3)
+        (Size.ofBytes 8) (Size.ofBytes 4) .Write ep1Prot23 .VisitChildrenOfAccessed).status with
+      | .Completed => True | _ => False
+    rw [performBorrowAccessRangeLMU.eq_src, hW3]
+    trivial
+  · rw [miriBeforeMemoryReadExactWP_iff ep1TrivialMMHooks ep1VendoredTbAlloc _ ep1AllocId _ _
+      (Size.ofBytes 4) _ _ ep1TrivialMMCtx _ _ rfl rfl rfl (by kernel_rfl) (ep1VendoredSetLive _)]
+    unfold tbAccessPre
+    change match (ep1DisjointTwoChildTree.performBorrowAccessRange (.concrete ep1Tag2) Size.ZERO
+        (Size.ofBytes 4) .Read ep1Prot23 .VisitChildrenOfAccessed).status with
+      | .Completed => True | _ => False
+    rw [performBorrowAccessRangeLMU.eq_src, hR2]
+    trivial
+
 end TbEnabledTranslateBodyMiriExecution
 
 end CrossLayerCorrespondence
@@ -3429,7 +3566,8 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
     (type_of% @witness_call_dispatch_foreign_emulate_and_call_terminator) ∧
     (type_of% @witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub) ∧
     (type_of% @witness_v2026_capturedMir_tree_borrows_ub_triangle) ∧
-    (type_of% @witness_tb_enabled_translateBody_positive_and_negative_ub_refutations) :=
+    (type_of% @witness_tb_enabled_translateBody_positive_and_negative_ub_refutations) ∧
+    (type_of% @witness_tb_hooks_agree_vendored_machineMemoryHooks) :=
   ⟨@miriTreeNewChildExactWP_iff, @miriTreeInitialSetupExactWP_iff, @miriTreeRangeExactWP_iff,
    @miriTreeRangeSymbolicExactWP_iff, @miriTreeInitAndRangeExactWP_iff,
    @miriTreeRangeSeqExactWP_iff, @miriTreeRangeChainExactWP_iff,
@@ -3470,7 +3608,8 @@ theorem ep1_initial_state_tree_borrows_wp_capstone :
    @witness_call_dispatch_foreign_emulate_and_call_terminator,
    @witness_translateBody_positive_multiStmt_and_negative_deadReturn_ub,
    @witness_v2026_capturedMir_tree_borrows_ub_triangle,
-   @witness_tb_enabled_translateBody_positive_and_negative_ub_refutations⟩
+   @witness_tb_enabled_translateBody_positive_and_negative_ub_refutations,
+   @witness_tb_hooks_agree_vendored_machineMemoryHooks⟩
 
 section AxiomAndIsolationAudit
 open Lean Elab Command
@@ -3584,6 +3723,10 @@ run_cmd do
         `Anneal.MiriTreeBorrowsV2026.miriPerformLocAccess),
       (ns ++ `witness_v2026_capturedMir_tree_borrows_ub_triangle,
         `Miri.TreeBorrows.performAccess),
+      (ns ++ `witness_tb_hooks_agree_vendored_machineMemoryHooks,
+        `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
+      (ns ++ `witness_tb_hooks_agree_vendored_machineMemoryHooks,
+        `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryRead),
       (ns ++ `witness_tb_enabled_translateBody_positive_and_negative_ub_refutations,
         `LeanMiriSpec.Correspondence.translateBody),
       (ns ++ `witness_tb_enabled_translateBody_positive_and_negative_ub_refutations,
