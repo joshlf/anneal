@@ -205,10 +205,8 @@ theorem ep2_joint_tb_reborrow_and_rangespan_24byte_frame :
     | some bm' =>
       have hBFr1 := allocBytesAtByteMem_frame_of_writeV2026Bytes_disjoint rfl hD01 hWB hBm1
       have hBFr2 := allocBytesAtByteMem_frame_of_writeV2026Bytes_disjoint rfl hD02 hWB hBm2
-      have hRead0 : readV2026Bytes bm' ⟨2, 0⟩ 8 4 = some ep2Patch8AbsBytes := by
-        injection hWB with hBeq
-        rw [← hBeq]
-        rfl
+      have hRead0 : readV2026Bytes bm' ⟨2, 0⟩ 8 4 = some ep2Patch8AbsBytes :=
+        (allocBytesAtByteMem_of_writeV2026Bytes_self (rW := ⟨2, 0, 8⟩) rfl hWB).2
       exact ⟨bm', rfl, hRead0, hBFr1, hBFr2⟩
 
 /-- **Joint Positive & Negative Integration Theorem 2 (`[propext]`)**:
@@ -444,12 +442,73 @@ theorem ep2_provenance_guard_and_mir_reclaim_coupling :
       decodeValueFromBytes 1 wfLoopLayouts wfU32Ty bs = some (.scalar ⟨42, 4⟩)) := by
   have hGuard := witness_v2026_relocation_provenance_guard
   refine ⟨fun _ hW => allocBytesAtV2026_of_write_self hW, hGuard.1, hGuard.2.1,
-    hGuard.2.2.2.1, fun _ h => mirWavefrontCutAt_zero_quiescent h, ?_⟩
+    hGuard.2.2.2.2.1, fun _ h => mirWavefrontCutAt_zero_quiescent h, ?_⟩
   cases witness_mir_return_eq_reclaimed_loan_decode_v2026 with
   | intro wD h1 =>
     cases h1 with
     | intro bs h =>
       exact ⟨wD, bs, h.1, h.2.1, h.2.2.2.1, h.2.2.2.2⟩
+
+/-- **Pass A1 Integration Suite (`[propext]`)**:
+1. Zero-length relocation-safe write `relocsAvoidRange_zero_len` + `writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 4, 0⟩ [] = some rsPtrMemoryV2026`;
+2. Total checked `rangeMergeChecked` split/merge (`ownRange_of_rangeMergeChecked`) + fail-closed rejection on non-adjacent and cross-allocation ranges;
+3. Oracle-free multi-step `stepMirFn_lockstep_chain_indexedCut` driving arbitrary `MirTraceStepsTo` traces to stage-`0` quiescence (`worldMeasureV2026 = []`);
+4. Memory-sensitive pointer-dereference `wfPtrReadReclaimLoopBody` (`*epoch_ptr`) evaluating to `.scalar ⟨42, 4⟩` on `epoch = 10` and `.scalar ⟨132, 4⟩` on `epoch = 100`, coupled via oracle-free `runCfgSteps_wavefrontDrain_indexedCut_bridge` to `.activeMut` reclamation `132` and `decodeValueFromBytes`. -/
+theorem ep2_a1_zero_len_reloc_checked_merge_and_ptr_loop_integration :
+    (∀ relocs s, relocsAvoidRange relocs s 0 = true) ∧
+    writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 4, 0⟩ [] = some rsPtrMemoryV2026 ∧
+    rangeMergeChecked ⟨1, 0, 4⟩ ⟨1, 4, 4⟩ = some ⟨1, 0, 8⟩ ∧
+    rangeMergeChecked ⟨1, 0, 4⟩ ⟨1, 5, 4⟩ = none ∧
+    rangeMergeChecked ⟨1, 0, 4⟩ ⟨2, 4, 4⟩ = none ∧
+    (∀ (ms0 msFinal : MachineState) (trace : List MachineState)
+       (v0 : View) (r0 : ResTrie ResElem) (w0 : WavefrontWorldV2026),
+      MirTraceStepsTo wfPtrReadReclaimLoopBody ms0 trace msFinal →
+      IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
+        wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) trace.length
+        (ms0, v0, r0, w0) →
+      ∃ (wFinal : WavefrontWorldV2026) (rFinal : ResTrie ResElem) (vFinal : View),
+        msFinal.memory.globals = ms0.memory.globals ∧
+        WavefrontConvergesV2026 wfPolicyTower53210 w0 wFinal ∧
+        wFinal.fifoQueue = [] ∧
+        wFinal.stealDeque = [] ∧
+        worldMeasureV2026 wFinal = [] ∧
+        IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
+          wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) 0
+          (msFinal, vFinal, rFinal, wFinal)) ∧
+    runCfgSteps wfPtrReadReclaimLoopBody (.running true .none wfPtrLoopInitMs10) 15 =
+      .halted true (.normal (.scalar ⟨42, 4⟩, wfCNode24Mem0)) ∧
+    runCfgSteps wfPtrReadReclaimLoopBody (.running true .none wfPtrLoopInitMs100) 15 =
+      .halted true (.normal (.scalar ⟨132, 4⟩, wfCNodeMem100)) ∧
+    (∃ (wDrained100 : WavefrontWorldV2026),
+      WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld100 wDrained100 ∧
+      ActivePureLoanAtV2026 path0 wfCNodeEpochLens 132 wDrained100 ∧
+      v2026SubLensGet wfCNodeEpochLens wDrained100.mem = some (wfEncodeU32LeAbsBytes 132) ∧
+      decodeValueFromBytes 1 wfPtrLoopLayouts wfU32Ty (wfEncodeU32LeAbsBytes 132) =
+        some (.scalar ⟨132, 4⟩)) := by
+  have hGuard := witness_v2026_relocation_provenance_guard
+  have hPtrLoop := witness_v2026_ptrDeref_mir_loop_input_sensitive
+  have hPol : PolicyAdmissible wfPolicyTower53210 :=
+    towerLookupNext_admissible wfTower53210 1 0 rfl
+  refine ⟨relocsAvoidRange_zero_len, hGuard.2.2.2.1, rfl, rfl, rfl, ?_,
+    hPtrLoop.2.1, hPtrLoop.2.2.1, ?_⟩
+  · intro ms0 msFinal trace v0 r0 w0 hTr hCut
+    cases stepMirFn_lockstep_chain_indexedCut wfPtrReadReclaimLoopBody
+        wfPolicyTower53210 hPol (cellAuthProp path2 99)
+        wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) rfl hTr v0 r0 w0 hCut with
+    | intro wF hwF =>
+      cases hwF with
+      | intro rF hrF =>
+        cases hrF with
+        | intro vF hvF =>
+          exact ⟨wF, rF, vF, hvF.1, hvF.2.1, hvF.2.2.1, hvF.2.2.2.1, hvF.2.2.2.2.1,
+            hvF.2.2.2.2.2.2⟩
+  · cases hPtrLoop.2.2.2 with
+    | intro wD100 hw =>
+      cases hw with
+      | intro _ hr =>
+        cases hr with
+        | intro _ hv =>
+          exact ⟨wD100, hv.1, hv.2.2.1, hv.2.2.2.1, hv.2.2.2.2.1⟩
 
 /-- **Unified Episode 2 Cross-Module Master Capstone (`[propext]`)**:
 Bundles the positive and fail-closed negative witnesses from ALL THREE root modules:
@@ -641,15 +700,21 @@ run_cmd do
         ``Trusted.Rustc.V2026_06_01.MirSemantics.ptrAllocByteBound?),
       (``Anneal.SepAC.RangeSpanV2026.byteRangesOverlapBool_false_iff_rangeDisjoint_pos,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.byteRangesOverlapBool),
+      (``Anneal.SepAC.RangeSpanV2026.relocsAvoidRange,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.byteRangesOverlapBool),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_frame_of_write_disjoint,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_of_write_self,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_of_write_self,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocAllocId),
+      (``Anneal.SepAC.RangeSpanV2026.allocBytesAtByteMem_of_writeV2026Bytes_self,
+        ``writeV2026Bytes),
       (``Anneal.WavefrontReclaim.WavefrontV2026.mirWavefrontCutAt_zero_quiescent,
         ``Anneal.WavefrontReclaim.WavefrontV2026.runWavefrontStepsV2026),
       (``Anneal.WavefrontReclaim.WavefrontV2026.witness_mir_return_eq_reclaimed_loan_decode_v2026,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.decodeValueFromBytes),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.witness_v2026_ptrDeref_mir_loop_input_sensitive,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.decodeValueFromBytes),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtByteMem_frame_of_writeV2026Bytes_disjoint,
         ``writeV2026Bytes),
@@ -668,9 +733,15 @@ run_cmd do
       (``Anneal.WavefrontReclaim.WavefrontV2026.stepMirFn_wavefrontStep_firewall_bridge,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (``Anneal.WavefrontReclaim.WavefrontV2026.stepMirFn_wavefrontStep_firewall_bridge,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.stepMirFn_wavefrontStep_firewall_bridge,
         ``Anneal.Firewall.Firewall),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.stepMirFn_lockstep_chain_indexedCut,
+        ``Anneal.WavefrontReclaim.WavefrontV2026.mirWavefrontCutAt_zero_quiescent),
       (``Anneal.WavefrontReclaim.WavefrontV2026.runCfgSteps_wavefrontDrain_indexedCut_bridge,
         ``Anneal.PureMirExec.runCfgSteps),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.runCfgSteps_wavefrontDrain_indexedCut_bridge,
+        ``Anneal.PureMirExec.stepCfgState),
       (``Anneal.WavefrontReclaim.WavefrontV2026.runCfgSteps_wavefrontDrain_indexedCut_bridge,
         ``Anneal.Firewall.IndexedCut) ]
   for (s, t) in bridgePairs do
@@ -690,7 +761,7 @@ run_cmd do
           throwError "test theorem {c} depends on forbidden axiom {a}"
         unless a == ``propext || a == ``Classical.choice || a == ``Quot.sound do
           throwError "test theorem {c} depends on non-standard axiom {a}"
-  if localThms < 5 then
+  if localThms < 6 then
     throwError "local test audit vacuous: only {localThms} theorems found"
 
   -- 8. Optional cross-root kernel audit of `LeanMiriSpec.InitialStateTreeBorrowsWpLM` when
@@ -706,9 +777,30 @@ run_cmd do
           #[{ module := `LeanMiriSpec.InitialStateTreeBorrowsWpLM }] {}
           (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private)
         let lmEnv := lmEnv.setExporting false
-        for m in lmEnv.header.moduleNames do
+        let mut lmModIdx? : Option Nat := none
+        for i in [:lmEnv.header.moduleNames.size] do
+          let m := lmEnv.header.moduleNames[i]!
           if (`MiniRustSpec).isPrefixOf m then
             return some s!"cross-root MiniRustSpec violation: {m}"
+          if m == `LeanMiriSpec.InitialStateTreeBorrowsWpLM then
+            lmModIdx? := some i
+        let some lmModIdx := lmModIdx?
+          | return some "cross-root audit: module index for InitialStateTreeBorrowsWpLM missing"
+        let mut lmThmCount : Nat := 0
+        for (c, info) in lmEnv.constants.map₁.toList do
+          if lmEnv.getModuleIdxFor? c == some lmModIdx then
+            match info with
+            | .thmInfo _ => lmThmCount := lmThmCount + 1
+            | .defnInfo dv =>
+              if dv.safety != .safe then
+                return some s!"cross-root safety violation: {c} is not safe"
+            | .axiomInfo _ =>
+              return some s!"cross-root custom axiom forbidden: {c}"
+            | .opaqueInfo _ =>
+              return some s!"cross-root opaque decl forbidden: {c}"
+            | _ => pure ()
+        if lmThmCount < 15 then
+          return some s!"cross-root vacuity: only {lmThmCount} theorems in InitialStateTreeBorrowsWpLM"
         let lmTargets : List Name :=
           [ `LeanMiriSpec.InitialStateTreeBorrowsWpLM.ep1_initial_state_tree_borrows_wp_capstone,
             `LeanMiriSpec.InitialStateTreeBorrowsWpLM.witness_vendored_placeMachine_tb_step_positive_and_ub_refutations ]
@@ -729,6 +821,9 @@ run_cmd do
                   return some s!"cross-root forbidden axiom {cur} in {t}"
                 unless cur == ``propext || cur == ``Classical.choice || cur == ``Quot.sound do
                   return some s!"cross-root non-standard axiom {cur} in {t}"
+              if let .opaqueInfo _ := ci then
+                if (`LeanMiriSpec).isPrefixOf cur then
+                  return some s!"cross-root opaque dependency {cur} in {t}"
               qAx := qAx ++ ci.type.getUsedConstants
               if let some v := ci.value? (allowOpaque := true) then
                 qAx := qAx ++ v.getUsedConstants

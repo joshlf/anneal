@@ -593,6 +593,48 @@ theorem rangeMerge_split (r : ByteRange) {k : Nat} (hk : k ≤ r.len) :
     dsimp only [rangeMerge, rangeSplit]
     rw [natSub_add_cancel_rs hk]
 
+/-- Fail-closed $O(1)$ adjacent `ByteRange` merger (`0` `._unsafe_rec`): returns
+`some (rangeMerge rL rR)` iff `rL` and `rR` belong to the same allocation and
+`rL.start + rL.len = rR.start` (rejecting non-adjacent or cross-allocation ranges). -/
+def rangeMergeChecked (rL rR : ByteRange) : Option ByteRange :=
+  match Nat.beq rL.allocId rR.allocId && Nat.beq (rL.start + rL.len) rR.start with
+  | true => some (rangeMerge rL rR)
+  | false => none
+
+/-- Checked re-merge of `rangeSplit r k` succeeds with `some r` whenever `k ≤ r.len`
+(`[]` zero axioms). -/
+theorem rangeMergeChecked_split (r : ByteRange) {k : Nat} (hk : k ≤ r.len) :
+    rangeMergeChecked (rangeSplit r k).1 (rangeSplit r k).2 = some r := by
+  unfold rangeMergeChecked
+  dsimp only [rangeSplit]
+  rw [natBeq_refl_rs r.allocId, natBeq_refl_rs (r.start + k)]
+  dsimp only [Bool.and]
+  exact congrArg some (rangeMerge_split r hk)
+
+/-- Soundness of `rangeMergeChecked` (`[]` zero axioms): success guarantees same-allocation
+adjacency, disjointness, and exact equality with `rangeMerge rL rR`. -/
+theorem rangeMergeChecked_sound {rL rR rM : ByteRange}
+    (h : rangeMergeChecked rL rR = some rM) :
+    rL.allocId = rR.allocId ∧
+    rL.start + rL.len = rR.start ∧
+    RangeDisjoint rL rR ∧
+    rM = rangeMerge rL rR := by
+  unfold rangeMergeChecked at h
+  cases hId : Nat.beq rL.allocId rR.allocId with
+  | false => rw [hId] at h; nomatch h
+  | true =>
+    rw [hId] at h
+    cases hAdj : Nat.beq (rL.start + rL.len) rR.start with
+    | false => rw [hAdj] at h; nomatch h
+    | true =>
+      rw [hAdj] at h
+      dsimp only [Bool.and] at h
+      injection h with hEqM
+      have hSame := natEq_of_beq_rs hId
+      have hAd := natEq_of_beq_rs hAdj
+      have hDisj : RangeDisjoint rL rR := Or.inr (Or.inl (by rw [hAd]; exact Nat.le_refl _))
+      exact ⟨hSame, hAd, hDisj, hEqM.symm⟩
+
 /-- Exact byte coverage of `rangeSplit r k` (`[]` zero axioms): when `k ≤ r.len`,
 `(aid, off)` lies in `r` iff it lies in the left or right half. -/
 theorem rangeSplit_covers_iff (r : ByteRange) {k : Nat} (hk : k ≤ r.len)
@@ -1182,6 +1224,46 @@ theorem ownRange_split_iff (m : Memory) (r : ByteRange)
         rw [hBleStart]
         exact hJoin
 
+/-- General fail-closed adjacent `ByteRange` ownership merge over unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.Memory` (`[propext]` only): whenever
+`rangeMergeChecked rL rR = some rM`, owning `rL ↦ bsL` and `rR ↦ bsR` combines into
+`rM ↦ bsL ++ bsR`. -/
+theorem ownRange_of_rangeMergeChecked
+    {m : Memory} {rL rR rM : ByteRange} {bsL bsR : List AbstractByte}
+    (hL : AllocBytesAtV2026 m rL bsL)
+    (hR : AllocBytesAtV2026 m rR bsR)
+    (hMerge : rangeMergeChecked rL rR = some rM) :
+    AllocBytesAtV2026 m rM (bsL ++ bsR) := by
+  have hSnd := rangeMergeChecked_sound hMerge
+  have hk : rL.len ≤ rM.len := by
+    rw [hSnd.2.2.2]
+    exact Nat.le_add_right rL.len rR.len
+  have hSplitL : (rangeSplit rM rL.len).1 = rL := by
+    rw [hSnd.2.2.2]
+    cases rL
+    rfl
+  have hSplitR : (rangeSplit rM rL.len).2 = rR := by
+    rw [hSnd.2.2.2]
+    cases rL with
+    | mk aidL stL lenL =>
+      cases rR with
+      | mk aidR stR lenR =>
+        dsimp only at hSnd
+        dsimp only [rangeMerge, rangeSplit]
+        rw [hSnd.1, hSnd.2.1, Nat.add_sub_cancel_left]
+  cases hL with
+  | intro aL haL =>
+    have hTakeEq : (bsL ++ bsR).take rL.len = bsL := by
+      rw [← haL.2.2.1]
+      exact listTake_append_prefix_rs bsL bsR
+    have hDropEq : (bsL ++ bsR).drop rL.len = bsR := by
+      rw [listDrop_append_ge_rs bsL bsR (by rw [haL.2.2.1]; exact Nat.le_refl _),
+        haL.2.2.1, Nat.sub_self]
+      rfl
+    apply (ownRange_split_iff m rM (bsL ++ bsR) hk).mpr
+    rw [hSplitL, hSplitR, hTakeEq, hDropEq]
+    exact ⟨⟨aL, haL⟩, hR⟩
+
 /-- Replace matching global `CapturedAllocation` entries for `a'.allocId` (`0` `._unsafe_rec`). -/
 def replaceGlobalAllocV2026 (a' : CapturedAllocation)
     (gs : List CapturedAllocation) : List CapturedAllocation :=
@@ -1191,10 +1273,26 @@ def replaceGlobalAllocV2026 (a' : CapturedAllocation)
     | false => a)
 
 /-- `true` iff no 8-byte relocation span `[ro, ro + 8)` (the span consulted by unmodified
-`Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocAllocId`) intersects `[s, s + l)`
-(non-recursive `List.all`, `0` `._unsafe_rec`). -/
+`Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocAllocId`) overlaps `[s, s + l)` under
+unmodified `MirSemantics.byteRangesOverlapBool` (non-recursive `List.all`, `0` `._unsafe_rec`).
+Using `!byteRangesOverlapBool p.1 8 s l` ensures empty writes (`l = 0`) never falsely fail
+even when `s` lies inside a relocation span. -/
 def relocsAvoidRange (relocs : List (Nat × ProvenancePtr)) (s l : Nat) : Bool :=
-  relocs.all (fun p => Nat.ble (p.1 + 8) s || Nat.ble (s + l) p.1)
+  relocs.all (fun p => !byteRangesOverlapBool p.1 8 s l)
+
+/-- Zero-length byte slices (`l = 0`) avoid every relocation span unconditionally (`[]`). -/
+theorem relocsAvoidRange_zero_len :
+    ∀ (relocs : List (Nat × ProvenancePtr)) (s : Nat),
+      relocsAvoidRange relocs s 0 = true
+  | [], _ => rfl
+  | (ro, _) :: rest, s => by
+    have hSub := relocsAvoidRange_zero_len rest s
+    change (!byteRangesOverlapBool ro 8 s 0 && relocsAvoidRange rest s 0) = true
+    have hOv0 : byteRangesOverlapBool ro 8 s 0 = false := by
+      dsimp only [byteRangesOverlapBool]
+      rfl
+    rw [hOv0, hSub]
+    rfl
 
 /-- Fail-closed byte-range write into a mutable global `CapturedAllocation` of unmodified
 `Trusted.Rustc.V2026_06_01.MirSemantics.Memory`: rejects missing, read-only (`.not`),
@@ -1436,26 +1534,41 @@ private theorem lookupRelocAllocId_none_of_avoid :
       lookupRelocAllocId relocs off = none
   | [], _, _, _, _, _, _ => rfl
   | (ro, tp) :: rest, s, l, off, hAv, hGe, hLt => by
-    have hAv' : ((Nat.ble (ro + 8) s || Nat.ble (s + l) ro) &&
+    have hAv' : ((!byteRangesOverlapBool ro 8 s l) &&
         relocsAvoidRange rest s l) = true := hAv
     have hHead := bool_and_left_rs hAv'
     have hRest :=
       lookupRelocAllocId_none_of_avoid rest s l off (bool_and_right_rs hAv') hGe hLt
+    have hPosL : 0 < l := by
+      cases l with
+      | zero =>
+        rw [Nat.add_zero] at hLt
+        exact False.elim (Nat.not_lt_of_ge hGe hLt)
+      | succ n => exact Nat.zero_lt_succ n
+    have hOvF : byteRangesOverlapBool ro 8 s l = false := by
+      cases hOv : byteRangesOverlapBool ro 8 s l with
+      | false => rfl
+      | true => rw [hOv] at hHead; exact Bool.noConfusion hHead
+    have hDisj :=
+      (byteRangesOverlapBool_false_iff_rangeDisjoint_pos
+        (r₁ := ⟨0, ro, 8⟩) (r₂ := ⟨0, s, l⟩) rfl (Nat.zero_lt_succ 7) hPosL).mp hOvF
     unfold lookupRelocAllocId
-    cases h1 : Nat.ble (ro + 8) s with
-    | true =>
-      have hLe : ro + 8 ≤ off := Nat.le_trans (natLe_of_ble_rs h1) hGe
-      have hB : Nat.ble (Nat.add ro 8) off = true := natBle_of_le_rs hLe
-      rw [hB]
-      cases Nat.ble ro off with
-      | true => exact hRest
-      | false => exact hRest
-    | false =>
-      rw [h1] at hHead
-      have hLt2 : off < ro := Nat.lt_of_lt_of_le hLt (natLe_of_ble_rs hHead)
-      have hB : Nat.ble ro off = false := natBle_false_of_lt_rs hLt2
-      rw [hB]
-      exact hRest
+    cases hDisj with
+    | inl hNe0 => exact False.elim (hNe0 rfl)
+    | inr hOrd =>
+      cases hOrd with
+      | inl hBefore =>
+        have hLe : ro + 8 ≤ off := Nat.le_trans hBefore hGe
+        have hB : Nat.ble (Nat.add ro 8) off = true := natBle_of_le_rs hLe
+        rw [hB]
+        cases Nat.ble ro off with
+        | true => exact hRest
+        | false => exact hRest
+      | inr hAfter =>
+        have hLt2 : off < ro := Nat.lt_of_lt_of_le hLt hAfter
+        have hB : Nat.ble ro off = false := natBle_false_of_lt_rs hLt2
+        rw [hB]
+        exact hRest
 
 /-- Reading `patch.length` bytes at `off` returns `rawToAbstractBytes patch` whenever the
 underlying bytes agree with `patch` and no relocation covers the read window. -/
@@ -1841,6 +1954,124 @@ theorem allocBytesAtByteMem_frame_of_writeV2026Bytes_disjoint
                     | inr hBefore =>
                       rw [listSlice_splice_left aW.bytes newBytes hWStartLe hBefore]
                       exact haF.2.2.2.2
+
+private theorem listSlice_splice_self {α : Type} (xs mid : List α)
+    {wStart : Nat} (hWLe : wStart ≤ xs.length) :
+    (((xs.take wStart ++ mid) ++
+        xs.drop (wStart + mid.length)).drop wStart).take mid.length = mid := by
+  have hTakeLen : (xs.take wStart).length = wStart :=
+    listLength_take_of_le_rs wStart xs hWLe
+  rw [List.append_assoc,
+    listDrop_append_ge_rs (xs.take wStart) (mid ++ xs.drop (wStart + mid.length))
+      (by rw [hTakeLen]; exact Nat.le_refl wStart),
+    hTakeLen, Nat.sub_self]
+  exact listTake_append_prefix_rs mid (xs.drop (wStart + mid.length))
+
+/-- General read-after-write ownership law for `SpatialMemV2026.writeV2026Bytes`
+(`[propext]` only): after `writeV2026Bytes bm ⟨rW.allocId, rW.start⟩ reqAlign newBytes = some bm'`
+with `newBytes.length = rW.len`, `AllocBytesAtByteMem bm' rW newBytes` holds AND
+`readV2026Bytes bm' ⟨rW.allocId, rW.start⟩ newBytes.length reqAlign = some newBytes`. -/
+theorem allocBytesAtByteMem_of_writeV2026Bytes_self
+    {bm bm' : V2026ByteMem} {rW : ByteRange} {reqAlign : Nat}
+    {newBytes : List AbstractByte}
+    (hLenW : newBytes.length = rW.len)
+    (hWrite : writeV2026Bytes bm ⟨rW.allocId, rW.start⟩ reqAlign newBytes = some bm') :
+    AllocBytesAtByteMem bm' rW newBytes ∧
+    readV2026Bytes bm' ⟨rW.allocId, rW.start⟩ newBytes.length reqAlign = some newBytes := by
+  unfold writeV2026Bytes at hWrite
+  cases hEmp : newBytes.isEmpty with
+  | true =>
+    rw [hEmp, ite_eq_left (rfl : true = true)] at hWrite
+    nomatch hWrite
+  | false =>
+    rw [hEmp, ite_eq_right Bool.false_ne_true] at hWrite
+    cases hFindW : findV2026Alloc rW.allocId bm.allocs with
+    | none => rw [hFindW] at hWrite; nomatch hWrite
+    | some aW =>
+      rw [hFindW] at hWrite
+      dsimp only at hWrite
+      cases hLiveW : aW.live with
+      | false =>
+        rw [hLiveW] at hWrite
+        dsimp only [Bool.not, Bool.or] at hWrite
+        rw [ite_eq_left (rfl : true = true)] at hWrite
+        nomatch hWrite
+      | true =>
+        rw [hLiveW] at hWrite
+        cases hMutW : aW.mutability with
+        | not =>
+          rw [hMutW] at hWrite
+          dsimp only [Bool.not, Bool.or] at hWrite
+          rw [ite_eq_left (rfl : true = true)] at hWrite
+          nomatch hWrite
+        | «mut» =>
+          rw [hMutW] at hWrite
+          cases hBndW : v2026InBounds aW rW.start newBytes.length with
+          | false =>
+            rw [hBndW] at hWrite
+            dsimp only [Bool.not, Bool.or] at hWrite
+            rw [ite_eq_left (rfl : true = true)] at hWrite
+            nomatch hWrite
+          | true =>
+            rw [hBndW] at hWrite
+            cases hAlW : v2026Aligned aW rW.start reqAlign with
+            | false =>
+              rw [hAlW] at hWrite
+              dsimp only [Bool.not, Bool.or] at hWrite
+              rw [ite_eq_left (rfl : true = true)] at hWrite
+              nomatch hWrite
+            | true =>
+              rw [hAlW] at hWrite
+              dsimp only [Bool.not, Bool.or] at hWrite
+              rw [ite_eq_right Bool.false_ne_true] at hWrite
+              injection hWrite with hMeq
+              let bytes' : List AbstractByte :=
+                (aW.bytes.take rW.start ++ newBytes) ++
+                  aW.bytes.drop (rW.start + newBytes.length)
+              let aW' : V2026ByteAlloc := { aW with bytes := bytes' }
+              have hM'Alloc : bm'.allocs = replaceV2026Alloc aW' bm.allocs := by
+                rw [← hMeq]
+                dsimp only [aW', bytes']
+                cases aW
+                dsimp only at hMutW hLiveW ⊢
+                rw [hMutW, hLiveW]
+              have hAwId : aW.allocId = rW.allocId :=
+                findV2026Alloc_id_eq_rs bm.allocs rW.allocId aW hFindW
+              have hLeBoundsW : rW.start + newBytes.length ≤ aW.bytes.length :=
+                natLe_of_ble_rs hBndW
+              have hWStartLe : rW.start ≤ aW.bytes.length :=
+                Nat.le_trans (Nat.le_add_right rW.start newBytes.length) hLeBoundsW
+              have hBytesLenEq : bytes'.length = aW.bytes.length := by
+                dsimp only [bytes']
+                rw [List.length_append, List.length_append,
+                  listLength_take_of_le_rs rW.start aW.bytes hWStartLe,
+                  listLength_drop_rs, Nat.add_sub_of_le hLeBoundsW]
+              have hFind' : findV2026Alloc rW.allocId bm'.allocs = some aW' := by
+                rw [hM'Alloc, ← hAwId]
+                exact findV2026Alloc_replace_eq_rs aW'
+                  (by dsimp only [aW']; rw [hAwId]; exact hFindW)
+              have hSliceSelf : (aW'.bytes.drop rW.start).take newBytes.length = newBytes := by
+                dsimp only [aW', bytes']
+                exact listSlice_splice_self aW.bytes newBytes hWStartLe
+              refine ⟨⟨aW', hFind', hLiveW, ?_, hLenW, ?_⟩, ?_⟩
+              · dsimp only [aW']
+                rw [hBytesLenEq, ← hLenW]
+                exact hLeBoundsW
+              · rw [← hLenW]
+                exact hSliceSelf
+              · unfold readV2026Bytes
+                rw [hFind']
+                dsimp only
+                have hIb' : v2026InBounds aW' rW.start newBytes.length = true := by
+                  unfold v2026InBounds at hBndW ⊢
+                  dsimp only [aW']
+                  rw [hBytesLenEq]
+                  exact hBndW
+                have hAl' : v2026Aligned aW' rW.start reqAlign = true := hAlW
+                have hLive' : aW'.live = true := hLiveW
+                rw [hLive', hIb', hAl']
+                dsimp only [Bool.not, Bool.or]
+                rw [ite_eq_right Bool.false_ne_true, hSliceSelf]
 
 /-- Reading a slice from `V2026ByteMem` via `readV2026Bytes` returns `some bs` whenever
 `AllocBytesAtByteMem bm r bs` holds and alignment is satisfied (`reqAlign = 1`, `a.alignBytes ≥ 1`). -/
@@ -2607,23 +2838,24 @@ theorem witness_v2026_sameAlloc_and_crossAlloc_write_frame :
         allocBytesAtByteMem_frame_of_writeV2026Bytes_disjoint rfl hDPost hW hBmPost
       have hFr0 :=
         allocBytesAtByteMem_frame_of_writeV2026Bytes_disjoint rfl hD0 hW hBm0
-      have hReadMid : readV2026Bytes bm' ⟨1, 6⟩ 4 2 = some rsPatchAbsBytes := by
-        injection hW with hBeq
-        rw [← hBeq]
-        rfl
-      exact ⟨bm', hW, hFrPre, hFrPost, hFr0, hReadMid⟩
+      have hSelf :=
+        allocBytesAtByteMem_of_writeV2026Bytes_self (rW := rMid) rfl hW
+      exact ⟨bm', hW, hFrPre, hFrPost, hFr0, hSelf.2⟩
 
 /-- Fail-closed negative controls for `RangeSpanV2026` (`[propext]` only):
 1. Overlapping ranges return `rangeDisjointBool = false`, `¬ RangeDisjoint`, and
    `byteRangesOverlapBool = true`;
-2. Out-of-bounds and missing-allocation `AllocBytesAtV2026` are refuted (`¬ AllocBytesAtV2026`);
-3. Writing to a read-only global allocation (`0`), an out-of-bounds slice, or a dead
+2. `rangeMergeChecked` rejects non-adjacent same-allocation ranges and cross-allocation ranges;
+3. Out-of-bounds and missing-allocation `AllocBytesAtV2026` are refuted (`¬ AllocBytesAtV2026`);
+4. Writing to a read-only global allocation (`0`), an out-of-bounds slice, or a dead
    `V2026ByteMem` allocation fails closed (`none`);
-4. Strict linearity (`¬ AffineEntails`) of both `PHeapProp` and `V2026RangeProp`. -/
+5. Strict linearity (`¬ AffineEntails`) of both `PHeapProp` and `V2026RangeProp`. -/
 theorem witness_rangespan_negative_controls :
     rangeDisjointBool ⟨7, 0, 10⟩ ⟨7, 5, 10⟩ = false ∧
     ¬ RangeDisjoint ⟨7, 0, 10⟩ ⟨7, 5, 10⟩ ∧
     byteRangesOverlapBool 0 10 5 10 = true ∧
+    rangeMergeChecked ⟨1, 0, 4⟩ ⟨1, 5, 4⟩ = none ∧
+    rangeMergeChecked ⟨1, 0, 4⟩ ⟨2, 4, 4⟩ = none ∧
     ¬ AllocBytesAtV2026 rsInitMemoryV2026 ⟨1, 14, 4⟩ rsPatchAbsBytes ∧
     ¬ AllocBytesAtV2026 rsInitMemoryV2026 ⟨99, 0, 4⟩ rsPatchAbsBytes ∧
     writeMemoryBytesV2026 rsInitMemoryV2026 ⟨0, 0, 4⟩ rsPatchBytes = none ∧
@@ -2635,7 +2867,7 @@ theorem witness_rangespan_negative_controls :
      writeV2026Bytes deadBm ⟨1, 0⟩ 1 rsPatchAbsBytes = none) ∧
     ¬ AffineEntails (@pheapEmp Nat) (@PHeapEntails Nat) ∧
     ¬ AffineEntails v2026RangeEmp V2026RangeEntails := by
-  refine ⟨rfl, ?_, rfl, ?_, ?_, rfl, rfl, rfl,
+  refine ⟨rfl, ?_, rfl, rfl, rfl, ?_, ?_, rfl, rfl, rfl,
     not_affineEntails_pheapProp 0, not_affineEntails_v2026RangeProp⟩
   · intro hD
     have hT := (rangeDisjointBool_iff ⟨7, 0, 10⟩ ⟨7, 5, 10⟩).mpr hD
@@ -2691,18 +2923,22 @@ theorem witness_v2026_relocation_provenance_guard :
       writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 8, 4⟩ rsPatchBytes = some m' ∧
       AllocBytesAtV2026 m' ⟨3, 8, 4⟩ rsPatchAbsBytes ∧
       abstractBytesHaveProv rsPatchAbsBytes = false ∧
-      AllocBytesAtV2026 m' ⟨3, 0, 8⟩ rsPtrAbsBytes) ∧
+      AllocBytesAtV2026 m' ⟨3, 0, 8⟩ rsPtrAbsBytes ∧
+      AllocBytesAtV2026 m' ⟨3, 0, 12⟩ (rsPtrAbsBytes ++ rsPatchAbsBytes)) ∧
+    writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 4, 0⟩ [] = some rsPtrMemoryV2026 ∧
     writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 4, 4⟩ rsPatchBytes = none ∧
     writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 0, 4⟩ rsPatchBytes = none ∧
     writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 6, 4⟩ rsPatchBytes = none := by
   have hPtr : AllocBytesAtV2026 rsPtrMemoryV2026 ⟨3, 0, 8⟩ rsPtrAbsBytes :=
     ⟨rsPtrAlloc3, rfl, natLe_of_ble_rs rfl, rfl, rfl⟩
-  refine ⟨hPtr, rfl, ?_, rfl, rfl, rfl⟩
+  refine ⟨hPtr, rfl, ?_, rfl, rfl, rfl, rfl⟩
   cases hW : writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 8, 4⟩ rsPatchBytes with
   | none => nomatch hW
   | some m' =>
     have hD : RangeDisjoint ⟨3, 8, 4⟩ ⟨3, 0, 8⟩ := (rangeDisjointBool_iff _ _).mp rfl
-    exact ⟨m', rfl, allocBytesAtV2026_of_write_self hW, rfl,
-      allocBytesAtV2026_frame_of_write_disjoint hD hW hPtr⟩
+    have hSelf := allocBytesAtV2026_of_write_self hW
+    have hFr := allocBytesAtV2026_frame_of_write_disjoint hD hW hPtr
+    have hMerged := ownRange_of_rangeMergeChecked hFr hSelf rfl
+    exact ⟨m', rfl, hSelf, rfl, hFr, hMerged⟩
 
 end Anneal.SepAC.RangeSpanV2026
