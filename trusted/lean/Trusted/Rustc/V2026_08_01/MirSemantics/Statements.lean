@@ -8233,16 +8233,23 @@ def intrinsicRigidTyKindAlign : RigidTy → Option Nat
 Compute the maximum `fieldAlign k` over the fields `ks` of a tuple, or `1` for
 the unit tuple `()`, faulting with `.none` if any field alignment is unknown.
 
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
+Reference (The Rust Reference, "The Rust Representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.repr.rust.layout>
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.tuple.def>
 
 > "The only data layout guarantees made by this representation are those
-> required for soundness. They are:
+> required for soundness. These are:
 >
-> 1. The fields are properly aligned.
-> 2. The fields do not overlap.
-> 3. The alignment of the type is at least the maximum alignment of its
->    fields."
+> - The offset of a field is divisible by that field's alignment.
+>
+> - The alignment of the type is at least the maximum alignment of its fields."
+> "Tuples are laid out according to the Rust representation."
+
+Modeling choice: the Reference guarantees only that a tuple's alignment is AT
+LEAST the maximum field alignment; this helper returns exactly that maximum
+(what `rustc` computes today). Callers use it as the root-allocation alignment,
+where a lower bound is sound for "aligned" verdicts and for the symbolic
+`ptr_mask` criterion.
 -/
 @[reducible]
 def tupleFieldsAlign (fieldAlign : RigidTy → Option Nat) : List RigidTy → Option Nat
@@ -8327,10 +8334,12 @@ def intrinsicRigidTyAlign
 Sum `fieldSize k` over the fields `ks` of a tuple, before the total is padded to
 the tuple's alignment, faulting with `.none` if any field size is unknown.
 
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
+Reference (The Rust Reference, "The Rust Representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.repr.rust.layout.struct>
 
-> "2. The fields do not overlap."
+> "For structs, it is further guaranteed that the fields do not overlap. That
+> is, the fields can be ordered such that the offset plus the size of any field
+> is less than or equal to the offset of the next field in the ordering."
 -/
 @[reducible]
 def tupleFieldsByteSum (fieldSize : RigidTy → Option Nat) : List RigidTy → Option Nat
@@ -8622,10 +8631,12 @@ Reference (The Rust Reference 1.98.0, "Dynamically Sized Types"):
 <https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html#r-dynamic-sized.pointer-types>
 
 > "Pointer types to DSTs are sized but have twice the size of pointers to sized
-> types
->
-> * Pointers to slices and `str` also store the number of elements.
-> * Pointers to trait objects also store a pointer to a vtable."
+> types, since they also store metadata:"
+> "Pointers to slices store the number of elements; pointers to `str` store the
+> length in bytes."
+> "Pointers to trait objects store a pointer to a vtable."
+> "Pointers to a struct or tuple with an unsized tail store the same metadata as
+> a pointer to that tail."
 -/
 def knownWidePointeeTailAux? : Nat → RigidTy → Option RigidTy
   | .zero, _ => .none
@@ -8791,9 +8802,13 @@ for `ty` on `layouts`:
   unless the pointee is a directly handled top-level `[T]` / `str` / `dyn Trait`.
 
 Reference (The Rust Reference 1.98.0, "Type Layout — Primitive Types"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.primitive.align>
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.primitive.platform-specific-alignment>
 
-> "For primitive types, the alignment is platform-specific, though typically equal to their size. In particular, on many 32-bit platforms, `i64`, `u64`, and `f64` are only aligned to 4 bytes, not 8."
+> "The alignment of primitives is platform-specific. In most cases, their
+> alignment is equal to their size, but it may be less. In particular, `i128`
+> and `u128` are often aligned to 4 or 8 bytes even though their size is 16, and
+> on many 32-bit platforms, `i64`, `u64`, and `f64` are only aligned to 4 bytes,
+> not 8."
 -/
 def rigidTyLayoutDeterminedAux
     (localDecls : List LocalDecl)
@@ -9355,9 +9370,15 @@ Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
 > /// `path` is None when the accessed node is not a descendant of `self`."
 
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.alias>
 
-> "- Breaking the pointer aliasing rules."
+> "Breaking the pointer aliasing rules. The exact aliasing rules are not
+> determined yet, but here is an outline of the general principles:"
+
+Modeling choice: because the Reference leaves the exact aliasing rules
+undetermined, the Tree Borrows transitions applied here (following Miri and
+MiniRust, cited above) are a modeling choice of this semantics, not a
+documented Rust guarantee.
 -/
 def borrowsAfterReadAccess
     (borrows : List BorrowEntry)
@@ -9418,6 +9439,16 @@ Reference (Miri Tree Borrows implementation,
 > "if protected && self.accessed && transition.produces_disabled() {
 >     return Err(TransitionError::ProtectedDisabled(old_perm));
 > }"
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.alias>
+
+> "Breaking the pointer aliasing rules. The exact aliasing rules are not
+> determined yet, but here is an outline of the general principles:"
+
+Modeling choice: the Miri Tree Borrows transitions quoted above are a modeling
+choice of this semantics, not a documented Rust guarantee (the Reference leaves
+the exact aliasing rules undetermined).
 -/
 def borrowsAfterWriteAccess
     (borrows : List BorrowEntry)
@@ -11879,9 +11910,13 @@ layout-uninhabited pointee `T` (e.g. `&!`, `&(u8, !)`; returns `false` for
 unsized `&[!]` and for `&&!` whose pointee `&!` is layout-inhabited).
 
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.reference-box>
 
-> "- A reference or `Box<T>` must be aligned and non-null, cannot be dangling, and must point to a valid value (in case of dynamically sized types, using the metadata stored in the pointer). Note that the last point (about pointing to a valid value) remains a subject of some debate and may be relaxed in the future."
+> "A reference or `Box<T>` must be aligned and non-null, it cannot be dangling,
+> and it must point to a valid value (in case of dynamically sized types, using
+> the actual dynamic type of the pointee as determined by the metadata). Note
+> that the last point (about pointing to a valid value) remains a subject of
+> some debate."
 -/
 def referenceToUninhabited
     (localDecls : List LocalDecl)
@@ -11899,12 +11934,14 @@ inside a `char`-shaped `ScalarLayout` (`Int(32, false)` with `validRange =
 type `u32 is 0..=0x10FFFF`, layout-driven validators fail closed `.unsupported`
 on such surrogates while direct `RigidTy.char` remains exact `.ub`.
 
-Reference (The Rust Reference 1.98.0, "Textual types"):
-<https://doc.rust-lang.org/1.98.0/reference/types/textual.html>
+Reference (The Rust Reference 1.98.0, "Character type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/char.html#r-type.char.intro>
+<https://doc.rust-lang.org/1.98.0/reference/types/char.html#r-type.char.value>
 
-> "A value of type `char` is a Unicode scalar value (i.e. a code point that is
-> not a surrogate), represented as a 32-bit unsigned word in the 0x0000 to
-> 0xD7FF or 0xE000 to 0x10FFFF range. It is immediate Undefined Behavior to
+> "The `char` type represents a single Unicode scalar value (i.e., a code point
+> that is not a surrogate)."
+> "A value of type `char` is represented as a 32-bit unsigned word in the 0x0000
+> to 0xD7FF or 0xE000 to 0x10FFFF range. It is immediate undefined behavior to
 > create a `char` that falls outside this range."
 -/
 @[reducible]
