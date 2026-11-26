@@ -10,7 +10,6 @@ those terms.
 
 import Lean
 import MiniRustSpec.NullaryAndPtrCoercionMR
-import Trusted.Rustc.V2026_08_01.MirSemantics.Machine
 
 /-!
 # Episode 2 Dual-Authority Correspondence (`MiniRustSpec` Authority):
@@ -1651,6 +1650,21 @@ theorem cm_minirust_rawEq_evalIntrinsicM {M : Type} [Gen.Memory M] [MemoryOps M]
       .ok (.Bool (lBytes == rBytes), m2) := by
   simp [evalIntrinsicM, typeEq, cm_ptrTypeEq_refl ptrTy, hL, hR, bind, Except.bind, pure]
   rfl
+
+/-- **Universal polymorphic `evalIntrinsicM .RawEq` ↔ Trusted `listByteEq`
+correspondence (both `Mach` and `MachTB`)**: for EVERY memory model `M`
+(`BasicMemory` or `TreeBorrowsMemory`), `evalIntrinsicM m .RawEq` returns
+`.Bool (listByteEq lBytes rBytes)`, matching Trusted's exact `evalRawEqCall`
+byte comparator. -/
+theorem cm_minirust_rawEq_evalIntrinsicM_eq_trusted_listByteEq {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 m2 : Machine M) (lp rp : Pointer (Gen.Memory.Provenance M))
+    (ptrTy : PtrType) (lBytes rBytes : List UInt8)
+    (hL : loadRawDataM m lp ptrTy = .ok (lBytes, m1))
+    (hR : loadRawDataM m1 rp ptrTy = .ok (rBytes, m2)) :
+    evalIntrinsicM m .RawEq [(.Ptr lp, .Ptr ptrTy), (.Ptr rp, .Ptr ptrTy)] .Bool =
+      .ok (.Bool (listByteEq lBytes rBytes), m2) := by
+  rw [cm_mr_listByteEq_eq_beq]
+  exact cm_minirust_rawEq_evalIntrinsicM m m1 m2 lp rp ptrTy lBytes rBytes hL hR
 
 /-- **Universal `MachTB.wfLive` preservation for `evalIntrinsicM .RawEq`**: every
 successful `RawEq` step on `TreeBorrowsMemory<x86_64>` preserves `MachTB.wfLive`. -/

@@ -394,6 +394,7 @@ theorem cm_mr_deep_theorems_used :
   have _ := @cm_evalBlackBoxCall_rawPtr_preserves_prov
   have _ := @cm_minirust_loadRawDataM_tb_wfLive
   have _ := @cm_minirust_rawEq_evalIntrinsicM
+  have _ := @cm_minirust_rawEq_evalIntrinsicM_eq_trusted_listByteEq
   have _ := @cm_minirust_rawEq_evalIntrinsicM_tb_wfLive
   have _ := @cm_minirust_evalPtrOffsetFromM_pos_neg_underflow_agree
   have _ := @cm_minirust_evalPtrOffsetM_wrapping_preserves_prov
@@ -1496,7 +1497,19 @@ run_cmd do
           `Miri.Interpreter.IntegerArithmeticIntrinsic.exactDiv),
         (lmNs ++ `cm_bitwiseAndBits_64_eq_u64_land, `UInt64.land),
         (lmNs ++ `cmLmObserve_table, `Miri.Interpreter.Step.step),
-        (lmNs ++ `cmLmObserve_table, `Miri.Interpreter.Intrinsics.typedSwap) ]
+        (lmNs ++ `cmLmObserve_table, `Miri.Interpreter.Intrinsics.typedSwap),
+        -- MR polymorphic & MachTB.wfLive anchoring
+        (mrNs ++ `cm_minirust_rawEq_evalIntrinsicM_eq_trusted_listByteEq, `MiniRustSpec.Interp.evalIntrinsicM),
+        (mrNs ++ `cm_minirust_rawEq_evalIntrinsicM_eq_trusted_listByteEq,
+          `Trusted.Rustc.V2026_06_01.MirSemantics.listByteEq),
+        (mrNs ++ `cm_minirust_rawEq_evalIntrinsicM_tb_wfLive, `MiniRustSpec.Correspondence.MachTB.wfLive),
+        (mrNs ++ `cm_minirust_evalPtrOffsetFromM_pos_neg_underflow_agree,
+          `MiniRustSpec.Interp.evalPtrOffsetFromM),
+        (mrNs ++ `cm_minirust_evalPtrOffsetFromM_pos_neg_underflow_agree,
+          `Trusted.Rustc.V2026_06_01.MirSemantics.evalPtrOffsetFromDistance),
+        (mrNs ++ `cm_minirust_evalPtrOffsetM_wrapping_preserves_prov, `MiniRustSpec.Interp.evalPtrOffsetM),
+        (mrNs ++ `cm_minirust_stepsTB_wfLive_all_ok, `MiniRustSpec.Correspondence.MachTB.wfLive),
+        (mrNs ++ `cm_minirust_stepsTB_wfLive_all_ok, `MiniRustSpec.Interp.stepsTB) ]
     for (thm, anchor) in vendoredAnchors do
       unless (closureOf thm).contains anchor do
         throwError "cross-root vendored-anchor failure: {thm} does not reach {anchor}"
