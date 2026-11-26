@@ -15008,6 +15008,8 @@ def LIntrinsicOp.fromRustIntrinsicKind? : RustIntrinsicKind → Option LIntrinsi
   | .constEvalSelect => none
   | .copyNonOverlapping => none
   | .writeBytes => none
+  | .copy | .compareBytes | .rawEq | .typedSwapNonOverlapping
+  | .ptrOffsetFrom | .ptrOffsetFromUnsigned | .ptrMask | .blackBox => none
 
 /-- Map a value-returning `LIntrinsicOp` handled by `evalNonSelectIntrinsicCall` to its
 `RustIntrinsicKind` counterpart. -/
@@ -16855,7 +16857,11 @@ private theorem evalDirectRustIntrinsic_of_nonSelect
         locals' destination targetBb) := by
   unfold evalDirectRustIntrinsic?
   rw [hClass]
-  cases kind <;> first | contradiction | rfl | (cases op <;> cases hKind)
+  cases kind <;> first
+    | contradiction
+    | rfl
+    | (simp only []; done)
+    | (cases op <;> cases hKind)
 
 /-- Internal strengthening of `evalLoweredTerminator_call_refines_evalTerminator` recording that
 every `.goto` transition preserves `s'.memory = s.memory` and `.returned` is impossible. -/
@@ -30371,6 +30377,17 @@ private theorem lowerIntrinsicKind_V2026_06_01_off_literals {defPath : DefPath}
     (hMem : defPath ∉ adapterLiteralDefPaths_V2026_06_01) :
     lowerIntrinsicKind_V2026_06_01 defPath = none ∧
       ep1LowerIntrinsicKind_V2026_06_01 defPath = none := by
+  -- The 8 core memory & pointer intrinsics (Episode 1 of `ws-tcb-core-mem-and-ptr-intrinsics`)
+  -- classify in `Trusted` but lower to no `LIntrinsicOp` (`fromRustIntrinsicKind?`), so both
+  -- adapters return `none` on them as well.
+  by_cases hNew : defPath ∈ ["core::intrinsics::copy", "core::intrinsics::compare_bytes",
+      "core::intrinsics::raw_eq", "core::intrinsics::typed_swap_nonoverlapping",
+      "core::intrinsics::ptr_offset_from", "core::intrinsics::ptr_offset_from_unsigned",
+      "core::intrinsics::ptr_mask", "core::intrinsics::black_box"]
+  · simp only [List.mem_cons, List.not_mem_nil, or_false] at hNew
+    rcases hNew with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+      exact ⟨by decide +kernel, by decide +kernel⟩
+  simp only [List.mem_cons, List.not_mem_nil, or_false, not_or] at hNew
   simp only [adapterLiteralDefPaths_V2026_06_01, ep1RustIntrinsicDefPaths_V2026_06_01,
     ep1UnreachableDefPaths_V2026_06_01, ep1AbortingPanicDefPaths_V2026_06_01,
     ep1UnwindingPanicDefPaths_V2026_06_01, List.map_cons, List.map_nil, List.cons_append,
@@ -30379,7 +30396,7 @@ private theorem lowerIntrinsicKind_V2026_06_01_off_literals {defPath : DefPath}
     isUnreachableCallTarget, isAbortingPanicDefPath, isUnwindingPanicDefPath,
     ep1RustIntrinsicDefPaths_V2026_06_01,
     ep1UnreachableDefPaths_V2026_06_01, ep1AbortingPanicDefPaths_V2026_06_01,
-    ep1UnwindingPanicDefPaths_V2026_06_01, stringEq_eq_decide, hMem]
+    ep1UnwindingPanicDefPaths_V2026_06_01, stringEq_eq_decide, hMem, hNew]
 
 /-- **Episode 1 adapter parity (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`)**: for every
 `DefPath`, `lowerIntrinsicKind_V2026_06_01` is Episode 1's `lower_intrinsic_kind_v2026_06_01`
@@ -32026,8 +32043,10 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
 /-- **Target-presence boundary Part 2 (`evalLoweredTerminator_call_value_without_target_extCall`)**:
 a hand-built diverging (`target = none`) direct call to any of the 25 value-returning intrinsics is
 rejected fail-closed by `evalLoweredTerminator` (`= none`), whereas `Trusted`'s `evalTerminator`
-dispatches value intrinsics only on `target = some _` calls and falls through to
-`MirStepNode.extCall` with `resumeExternalDivergingCall`. -/
+dispatches a diverging call through `evalDivergingRustIntrinsic?` (Episode 1 of
+`ws-tcb-core-mem-and-ptr-intrinsics`: a diverging call to a returning intrinsic turns its normal
+return into `.fail .ub`) and otherwise falls through to `MirStepNode.extCall` with
+`resumeExternalDivergingCall`. -/
 theorem evalLoweredTerminator_call_value_without_target_extCall
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
     {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
@@ -32049,8 +32068,12 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
         evalOperands s.frame.locals args s.memory.borrows env.globals env.layouts
             s.memory.callerLocals = .ok avs locals2 ∧
           evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) =
-            .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
-              (resumeExternalDivergingCall s locals2 u) := by
+            (match evalDivergingRustIntrinsic? s { defPath := defPath, typeArgs := typeArgs }
+                cm.localDecls env.layouts args avs locals2 dest with
+             | some stepNode => stepNode
+             | none =>
+               .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
+                 (resumeExternalDivergingCall s locals2 u)) := by
   have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
     trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
   have hNotDiv : op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind := by
@@ -32100,14 +32123,16 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
       fun _ _ => rfl
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-        hLayouts, hCorr.globals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
+        hLayouts, hCorr.globals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]
+      rfl⟩
 
 /-- **Target-presence boundary for call-form memory intrinsics
 (`evalLoweredTerminator_call_memIntrinsic_without_target_extCall`)**:
 a hand-built diverging (`target = none`) direct call to `core::intrinsics::copy_nonoverlapping` or
 `core::intrinsics::write_bytes` is rejected fail-closed (`= none`) by `evalLoweredTerminator` for
 **every** `env.memIntrinsic` callback, while `Trusted`'s `evalTerminator` dispatches memory
-intrinsics inline only on `target = some _` calls and falls through to `MirStepNode.extCall` with
+intrinsics on diverging calls through `evalDivergingRustIntrinsic?` (Episode 1 of
+`ws-tcb-core-mem-and-ptr-intrinsics`) and otherwise falls through to `MirStepNode.extCall` with
 `resumeExternalDivergingCall`. -/
 theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
@@ -32133,8 +32158,12 @@ theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
         evalOperands s.frame.locals args s.memory.borrows env.globals env.layouts
             s.memory.callerLocals = .ok avs locals2 ∧
           evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) =
-            .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
-              (resumeExternalDivergingCall s locals2 u) := by
+            (match evalDivergingRustIntrinsic? s { defPath := defPath, typeArgs := typeArgs }
+                cm.localDecls env.layouts args avs locals2 dest with
+             | some stepNode => stepNode
+             | none =>
+               .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
+                 (resumeExternalDivergingCall s locals2 u)) := by
   have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
     trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
   have hNotDiv : op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind := by
@@ -32181,7 +32210,8 @@ theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
       fun _ _ => rfl
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-        hLayouts, hGlobals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
+        hLayouts, hGlobals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]
+      rfl⟩
 
 /-! #### 5g.2: `three_way_compare` `Ordering` ADT Encoding (`orderingVariant?`, `intrinsic.rs:108-136`) -/
 
