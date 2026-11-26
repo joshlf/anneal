@@ -5195,6 +5195,315 @@ theorem absVal_refineSgtConst_sound_any {w x boundBits : Nat} {a : AbsVal}
     rw [hw, hai, hB]
     exact ha
 
+/-- Tightens an upper bound `hi` downward to the largest `hi' ≤ hi` satisfying
+`sc` (`none` if no non-negative `x ≤ hi` satisfies `sc`). -/
+def tightHiByCongNat (hi : Nat) : StridedCong → Option Nat
+  | .bot => none
+  | .top => some hi
+  | .cong m r =>
+    match Nat.ble 1 m && Nat.blt r m with
+    | false => some hi
+    | true =>
+      let rem := hi % m
+      let delta :=
+        match Nat.ble r rem with
+        | true => rem - r
+        | false => rem + m - r
+      match Nat.ble delta hi with
+      | true => some (hi - delta)
+      | false => none
+
+/-- Soundness and completeness of `tightHiByCongNat`: any concrete witness
+`x ≤ hi` satisfying `sc` guarantees `some hi'` with `x ≤ hi' ≤ hi`. -/
+theorem tightHiByCongNat_sound {hi x : Nat} {sc : StridedCong}
+    (hLe : x ≤ hi) (hSc : sc.denote x) :
+    ∃ hi', tightHiByCongNat hi sc = some hi' ∧ x ≤ hi' ∧ hi' ≤ hi := by
+  cases sc with
+  | bot => exact False.elim hSc
+  | top => exact ⟨hi, rfl, hLe, Nat.le_refl hi⟩
+  | cong m r =>
+    have hm : 1 ≤ m := hSc.1
+    have hmPos : 0 < m := hm
+    have hr : r < m := hSc.2.1
+    have hxMod : x % m = r := hSc.2.2
+    have hWf : (Nat.ble 1 m && Nat.blt r m) = true := by
+      rw [Nat.ble_eq_true_of_le hm, blt_true_of_lt hr]; rfl
+    have hXEq : m * (x / m) + r = x := by
+      have h := Nat.div_add_mod x m
+      rw [hxMod] at h
+      exact h
+    have hHiEq : m * (hi / m) + hi % m = hi := Nat.div_add_mod hi m
+    have hRemLt : hi % m < m := Nat.mod_lt hi hmPos
+    unfold tightHiByCongNat
+    dsimp only
+    rw [hWf]
+    dsimp only
+    cases hR : Nat.ble r (hi % m) with
+    | true =>
+      have hRLe : r ≤ hi % m := Nat.le_of_ble_eq_true hR
+      have hDeltaLe : hi % m - r ≤ hi :=
+        Nat.le_trans (Nat.sub_le _ _)
+          (Nat.le_trans (Nat.le_add_left _ _) (Nat.le_of_eq hHiEq))
+      rw [Nat.ble_eq_true_of_le hDeltaLe]
+      refine ⟨hi - (hi % m - r), rfl, ?_, Nat.sub_le _ _⟩
+      have hHiSub : hi - (hi % m - r) = m * (hi / m) + r := by
+        calc hi - (hi % m - r)
+            = m * (hi / m) + hi % m - (hi % m - r) := congrArg (· - _) hHiEq.symm
+          _ = m * (hi / m) + (hi % m - (hi % m - r)) := Nat.add_sub_assoc (Nat.sub_le _ _) _
+          _ = m * (hi / m) + r := congrArg (m * (hi / m) + ·) (Nat.sub_sub_self hRLe)
+      rw [hHiSub]
+      have hQLe : x / m ≤ hi / m := by
+        cases Nat.lt_or_ge (hi / m) (x / m) with
+        | inr h => exact h
+        | inl hGt =>
+          have hStep : m * (hi / m) + m ≤ m * (x / m) := by
+            rw [← Nat.mul_succ]; exact Nat.mul_le_mul_left m hGt
+          have hLt : hi < m * (hi / m) + m :=
+            Nat.lt_of_le_of_lt (Nat.le_of_eq hHiEq.symm)
+              (Nat.add_lt_add_left hRemLt (m * (hi / m)))
+          have hLeX : m * (x / m) ≤ x :=
+            Nat.le_trans (Nat.le_add_right (m * (x / m)) r) (Nat.le_of_eq hXEq)
+          exact False.elim
+            (Nat.not_le_of_gt (Nat.lt_of_lt_of_le hLt (Nat.le_trans hStep hLeX)) hLe)
+      exact hXEq ▸ Nat.add_le_add_right (Nat.mul_le_mul_left m hQLe) r
+    | false =>
+      have hRemLtR : hi % m < r := by
+        cases Nat.lt_or_ge (hi % m) r with
+        | inl h => exact h
+        | inr h => rw [Nat.ble_eq_true_of_le h] at hR; nomatch hR
+      cases hQ : hi / m with
+      | zero =>
+        rw [hQ, Nat.mul_zero, Nat.zero_add] at hHiEq
+        have hRLex : r ≤ x := hXEq ▸ Nat.le_add_left r (m * (x / m))
+        have hHiLtX : hi < x :=
+          Nat.lt_of_lt_of_le (hHiEq ▸ hRemLtR) hRLex
+        exact False.elim (Nat.not_le_of_gt hHiLtX hLe)
+      | succ q' =>
+        have hHiEq' : m * q' + (hi % m + m) = hi := by
+          rw [hQ, Nat.mul_succ, Nat.add_assoc, Nat.add_comm m (hi % m)] at hHiEq
+          exact hHiEq
+        have hRLeAdd : r ≤ hi % m + m :=
+          Nat.le_trans (Nat.le_of_lt hr) (Nat.le_add_left _ _)
+        have hDeltaLe : hi % m + m - r ≤ hi :=
+          Nat.le_trans (Nat.sub_le _ _)
+            (Nat.le_trans (Nat.le_add_left _ _) (Nat.le_of_eq hHiEq'))
+        rw [Nat.ble_eq_true_of_le hDeltaLe]
+        refine ⟨hi - (hi % m + m - r), rfl, ?_, Nat.sub_le _ _⟩
+        have hHiSub : hi - (hi % m + m - r) = m * q' + r := by
+          calc hi - (hi % m + m - r)
+              = m * q' + (hi % m + m) - (hi % m + m - r) := congrArg (· - _) hHiEq'.symm
+            _ = m * q' + ((hi % m + m) - (hi % m + m - r)) := Nat.add_sub_assoc (Nat.sub_le _ _) _
+            _ = m * q' + r := congrArg (m * q' + ·) (Nat.sub_sub_self hRLeAdd)
+        rw [hHiSub]
+        have hQLe : x / m ≤ q' := by
+          cases Nat.lt_or_ge q' (x / m) with
+          | inr h => exact h
+          | inl hGt =>
+            have hStep : m * (q' + 1) ≤ m * (x / m) := Nat.mul_le_mul_left m hGt
+            have hHiLt : hi < m * (q' + 1) + r :=
+              (hQ ▸ hHiEq) ▸ Nat.add_lt_add_left hRemLtR (m * (q' + 1))
+            have hLeX : m * (q' + 1) + r ≤ x :=
+              hXEq ▸ Nat.add_le_add_right hStep r
+            exact False.elim (Nat.not_le_of_gt (Nat.lt_of_lt_of_le hHiLt hLeX) hLe)
+        exact hXEq ▸ Nat.add_le_add_right (Nat.mul_le_mul_left m hQLe) r
+
+/-- Adding or subtracting `halfModPow2 w` preserves residue modulo any divisor
+`m` of `halfModPow2 w`. -/
+theorem signedBias_mod_of_dvd_half {w x m : Nat} (hw : validWidth w = true)
+    (hx : x < modPow2 w) (hDvd : halfModPow2 w % m = 0) :
+    signedBias w x % m = x % m := by
+  cases hLt : Nat.blt x (halfModPow2 w) with
+  | true =>
+    rw [signedBias_of_lt_half hw (lt_of_blt_true hLt), Nat.add_mod, hDvd,
+      Nat.add_zero, Nat.mod_mod]
+  | false =>
+    have hGe : halfModPow2 w ≤ x := by
+      cases Nat.lt_or_ge x (halfModPow2 w) with
+      | inl h => rw [blt_true_of_lt h] at hLt; nomatch hLt
+      | inr h => exact h
+    rw [signedBias_of_ge_half hw hGe hx]
+    have hEq : x % m = ((x - halfModPow2 w) + halfModPow2 w) % m := by
+      rw [Nat.sub_add_cancel hGe]
+    rw [hEq, Nat.add_mod, hDvd, Nat.add_zero, Nat.mod_mod]
+
+/-- Transports a `StridedCong` on bit patterns `x` to biased coordinates
+`signedBias w x` whenever its modulus divides `halfModPow2 w` (all power-of-two
+strides `2^k ≤ 2^(w-1)`). -/
+def congForSignedBias (w : Nat) : StridedCong → StridedCong
+  | .cong m r =>
+    match Nat.beq (halfModPow2 w % m) 0 with
+    | true => .cong m r
+    | false => .top
+  | sc => sc
+
+theorem congForSignedBias_sound {w x : Nat} {sc : StridedCong}
+    (hw : validWidth w = true) (hx : x < modPow2 w) (hSc : sc.denote x) :
+    (congForSignedBias w sc).denote (signedBias w x) := by
+  cases sc with
+  | bot => exact False.elim hSc
+  | top => exact True.intro
+  | cong m r =>
+    unfold congForSignedBias
+    dsimp only
+    cases hDvd : Nat.beq (halfModPow2 w % m) 0 with
+    | false => exact True.intro
+    | true =>
+      refine ⟨hSc.1, hSc.2.1, ?_⟩
+      show signedBias w x % m = r
+      rw [signedBias_mod_of_dvd_half hw hx (Nat.eq_of_beq_eq_true hDvd)]
+      exact hSc.2.2
+
+/-- Tightens an unsigned `x ≤ bound` refinement using `a.sc` congruence before
+intersecting via `AbsVal.refineUleConst`. -/
+def refineUleConstWithCong (w : Nat) (a : AbsVal) (bound : Nat) : AbsVal :=
+  match tightHiByCongNat bound a.sc with
+  | none => AbsVal.bot
+  | some bound' => AbsVal.refineUleConst w a bound'
+
+theorem refineUleConstWithCong_sound {w x bound : Nat} {a : AbsVal}
+    (hw : validWidth w = true) (ha : a.denote w (some x))
+    (hai : a.isInit = true) (hLe : x ≤ bound) :
+    (refineUleConstWithCong w a bound).denote w (some x) := by
+  have haE := absVal_some_elim ha
+  cases tightHiByCongNat_sound hLe haE.2.2.2 with
+  | intro bound' hb =>
+    unfold refineUleConstWithCong
+    rw [hb.1]
+    exact absVal_refineUleConst_sound hw ha hai hb.2.1
+
+/-- Tightens an unsigned `bound < x` refinement using `a.sc` congruence before
+intersecting via `AbsVal.refineUgtConst`. -/
+def refineUgtConstWithCong (w : Nat) (a : AbsVal) (bound : Nat) : AbsVal :=
+  match validWidth w && a.isInit with
+  | false => AbsVal.refineUgtConst w a bound
+  | true =>
+    let M := modPow2 w
+    match Nat.blt (bound + 1) M with
+    | false => AbsVal.bot
+    | true =>
+      match tightLoByCong (bound + 1) (M - 1) a.sc with
+      | none => AbsVal.bot
+      | some lo' =>
+        match Nat.blt 0 lo' with
+        | true => AbsVal.refineUgtConst w a (lo' - 1)
+        | false => AbsVal.refineUgtConst w a bound
+
+theorem refineUgtConstWithCong_sound {w x bound : Nat} {a : AbsVal}
+    (hw : validWidth w = true) (ha : a.denote w (some x))
+    (hai : a.isInit = true) (hGt : bound < x) :
+    (refineUgtConstWithCong w a bound).denote w (some x) := by
+  have haE := absVal_some_elim ha
+  have hB1Lt : bound + 1 < modPow2 w := Nat.lt_of_le_of_lt hGt haE.1
+  unfold refineUgtConstWithCong
+  rw [hw, hai]
+  dsimp only
+  rw [blt_true_of_lt hB1Lt]
+  dsimp only
+  have hNoNone := tightLoByCong_none_impossible hGt (Nat.le_sub_one_of_lt haE.1)
+    haE.2.2.2
+  cases hLo : tightLoByCong (bound + 1) (modPow2 w - 1) a.sc with
+  | none => exact False.elim (hNoNone hLo)
+  | some lo' =>
+    dsimp only
+    have hLoLe : lo' ≤ x := tightLoByCong_sound hGt haE.2.2.2 hLo
+    cases hPos : Nat.blt 0 lo' with
+    | false => exact absVal_refineUgtConst_sound hw ha hai hGt
+    | true =>
+      exact absVal_refineUgtConst_sound hw ha hai
+        (Nat.lt_of_lt_of_le (Nat.sub_lt (lt_of_blt_true hPos) (Nat.zero_lt_succ 0))
+          hLoLe)
+
+/-- Tightens a signed `signedBias w x ≤ signedBias w boundBits` refinement
+using `a.sc` congruence (in biased coordinates) before intersecting via
+`AbsVal.refineSleConst`. -/
+def refineSleConstWithCong (w : Nat) (a : AbsVal) (boundBits : Nat) : AbsVal :=
+  match validWidth w && a.isInit && Nat.blt boundBits (modPow2 w) with
+  | false => AbsVal.refineSleConst w a boundBits
+  | true =>
+    let sb := signedBias w boundBits
+    match tightHiByCongNat sb (congForSignedBias w a.sc) with
+    | none => AbsVal.bot
+    | some sb' => AbsVal.refineSleConst w a (signedBias w sb')
+
+theorem refineSleConstWithCong_sound {w x boundBits : Nat} {a : AbsVal}
+    (hw : validWidth w = true) (ha : a.denote w (some x))
+    (hai : a.isInit = true)
+    (hSle : signedBias w x ≤ signedBias w boundBits) :
+    (refineSleConstWithCong w a boundBits).denote w (some x) := by
+  unfold refineSleConstWithCong
+  rw [hw, hai]
+  cases hB : Nat.blt boundBits (modPow2 w) with
+  | false => exact absVal_refineSleConst_sound_any hw ha hai hSle
+  | true =>
+    dsimp only
+    have haE := absVal_some_elim ha
+    have hScB := congForSignedBias_sound hw haE.1 haE.2.2.2
+    cases tightHiByCongNat_sound hSle hScB with
+    | intro sb' hsb' =>
+      rw [hsb'.1]
+      dsimp only
+      have hSb'Lt : sb' < modPow2 w :=
+        Nat.lt_of_le_of_lt hsb'.2.2 (signedBias_lt boundBits)
+      apply absVal_refineSleConst_sound_any hw ha hai
+      rw [signedBias_signedBias hw hSb'Lt]
+      exact hsb'.2.1
+
+/-- Tightens a signed `signedBias w boundBits < signedBias w x` refinement
+using `a.sc` congruence (in biased coordinates) before intersecting via
+`AbsVal.refineSgtConst`. -/
+def refineSgtConstWithCong (w : Nat) (a : AbsVal) (boundBits : Nat) : AbsVal :=
+  match validWidth w && a.isInit && Nat.blt boundBits (modPow2 w) with
+  | false => AbsVal.refineSgtConst w a boundBits
+  | true =>
+    let M := modPow2 w
+    let sb := signedBias w boundBits
+    match Nat.blt (sb + 1) M with
+    | false => AbsVal.bot
+    | true =>
+      match tightLoByCong (sb + 1) (M - 1) (congForSignedBias w a.sc) with
+      | none => AbsVal.bot
+      | some lo' =>
+        match Nat.blt 0 lo' && Nat.blt lo' M with
+        | true => AbsVal.refineSgtConst w a (signedBias w (lo' - 1))
+        | false => AbsVal.refineSgtConst w a boundBits
+
+theorem refineSgtConstWithCong_sound {w x boundBits : Nat} {a : AbsVal}
+    (hw : validWidth w = true) (ha : a.denote w (some x))
+    (hai : a.isInit = true)
+    (hSgt : signedBias w boundBits < signedBias w x) :
+    (refineSgtConstWithCong w a boundBits).denote w (some x) := by
+  unfold refineSgtConstWithCong
+  rw [hw, hai]
+  cases hB : Nat.blt boundBits (modPow2 w) with
+  | false => exact absVal_refineSgtConst_sound_any hw ha hai hSgt
+  | true =>
+    dsimp only
+    have haE := absVal_some_elim ha
+    have hSbXLt : signedBias w x < modPow2 w := signedBias_lt x
+    have hSb1Lt : signedBias w boundBits + 1 < modPow2 w :=
+      Nat.lt_of_le_of_lt hSgt hSbXLt
+    rw [blt_true_of_lt hSb1Lt]
+    dsimp only
+    have hScB := congForSignedBias_sound hw haE.1 haE.2.2.2
+    have hNoNone := tightLoByCong_none_impossible hSgt
+      (Nat.le_sub_one_of_lt hSbXLt) hScB
+    cases hLo : tightLoByCong (signedBias w boundBits + 1) (modPow2 w - 1)
+        (congForSignedBias w a.sc) with
+    | none => exact False.elim (hNoNone hLo)
+    | some lo' =>
+      dsimp only
+      have hLoLe : lo' ≤ signedBias w x := tightLoByCong_sound hSgt hScB hLo
+      cases hOk : (Nat.blt 0 lo' && Nat.blt lo' (modPow2 w)) with
+      | false => exact absVal_refineSgtConst_sound_any hw ha hai hSgt
+      | true =>
+        have hPos : 0 < lo' := lt_of_blt_true (bool_and_true_left hOk)
+        have hPredLtLo : lo' - 1 < lo' := Nat.sub_lt hPos (Nat.zero_lt_succ 0)
+        have hPredLtM : lo' - 1 < modPow2 w :=
+          Nat.lt_trans hPredLtLo (lt_of_blt_true (bool_and_true_right hOk))
+        apply absVal_refineSgtConst_sound_any hw ha hai
+        rw [signedBias_signedBias hw hPredLtM]
+        exact Nat.lt_of_lt_of_le hPredLtLo hLoLe
+
 /-- Refine `env` using `RelGuard` `g` assuming boolean outcome `branchVal`.
 Register-register guards refine both operands symmetrically (across `.uint`,
 `.uintCopy`, `.sint`, and `.sintCopy` slots, propagating refinements to copy
@@ -5203,8 +5512,12 @@ self-contradictions (`l < l`, `l ≠ l`) yield `AbsVal.bot`, `.uneConst` /
 `.sneConst` refine via ring-complement intersection
 (`AbsVal.refineUneConst`), and the signed constant guards `.sleConst` /
 `.sgtConst` / `.seqConst` refine `.sint` / `.sintCopy` slots (and aliases)
-through `AbsVal.refineSleConst` / `AbsVal.refineSgtConst` /
-`AbsVal.refineEqConst` in biased signed coordinates. -/
+through `refineSleConstWithCong` / `refineSgtConstWithCong` (congruence-aware
+tightening over `AbsVal.refineSleConst` / `AbsVal.refineSgtConst` in biased
+signed coordinates) and `AbsVal.refineEqConst`; `.uleConst` / `.ugtConst`
+similarly apply congruence-aware tightening (`refineUleConstWithCong` /
+`refineUgtConstWithCong`) so stride-aligned loops verify across arbitrary
+non-power-of-two, negative, and sign-straddling bounds. -/
 def refineEnvByGuard (env : MirAbsEnv) (g : RelGuard) (branchVal : Bool) :
     MirAbsEnv :=
   let eff :=
@@ -5214,9 +5527,9 @@ def refineEnvByGuard (env : MirAbsEnv) (g : RelGuard) (branchVal : Bool) :
   match eff with
   | .none => env
   | .uleConst r u bound =>
-    refineUintSlot env r u (fun a => AbsVal.refineUleConst (uintWidth u) a bound)
+    refineUintSlot env r u (fun a => refineUleConstWithCong (uintWidth u) a bound)
   | .ugtConst r u bound =>
-    refineUintSlot env r u (fun a => AbsVal.refineUgtConst (uintWidth u) a bound)
+    refineUintSlot env r u (fun a => refineUgtConstWithCong (uintWidth u) a bound)
   | .ultReg l r u =>
     match Nat.beq l r with
     | true => refineUintSlot env l u (fun _ => AbsVal.bot)
@@ -5284,10 +5597,10 @@ def refineEnvByGuard (env : MirAbsEnv) (g : RelGuard) (branchVal : Bool) :
       | none => env₁
   | .sleConst r i boundBits =>
     refineUintSlot env r (intTwin i)
-      (fun a => AbsVal.refineSleConst (uintWidth (intTwin i)) a boundBits)
+      (fun a => refineSleConstWithCong (uintWidth (intTwin i)) a boundBits)
   | .sgtConst r i boundBits =>
     refineUintSlot env r (intTwin i)
-      (fun a => AbsVal.refineSgtConst (uintWidth (intTwin i)) a boundBits)
+      (fun a => refineSgtConstWithCong (uintWidth (intTwin i)) a boundBits)
   | .seqConst r i val =>
     refineUintSlot env r (intTwin i)
       (fun a => AbsVal.refineEqConst (uintWidth (intTwin i)) a val)
@@ -5315,12 +5628,12 @@ theorem refineEnvByGuard_sound {decls : List LocalDecl} {env : MirAbsEnv}
   | sleConst r i boundBits =>
     apply refineUintSlot_sound hEnv
     intro a x hInit ha hx
-    exact absVal_refineSleConst_sound_any (uintWidth_valid (intTwin i)) ha hInit
+    exact refineSleConstWithCong_sound (uintWidth_valid (intTwin i)) ha hInit
       ((hEff x hx).mp rfl)
   | sgtConst r i boundBits =>
     apply refineUintSlot_sound hEnv
     intro a x hInit ha hx
-    exact absVal_refineSgtConst_sound_any (uintWidth_valid (intTwin i)) ha hInit
+    exact refineSgtConstWithCong_sound (uintWidth_valid (intTwin i)) ha hInit
       ((hEff x hx).mp rfl)
   | seqConst r i val =>
     apply refineUintSlot_sound hEnv
@@ -5340,12 +5653,12 @@ theorem refineEnvByGuard_sound {decls : List LocalDecl} {env : MirAbsEnv}
   | uleConst r u bound =>
     apply refineUintSlot_sound hEnv
     intro a x hInit ha hx
-    exact absVal_refineUleConst_sound (uintWidth_valid u) ha hInit
+    exact refineUleConstWithCong_sound (uintWidth_valid u) ha hInit
       ((hEff x hx).mp rfl)
   | ugtConst r u bound =>
     apply refineUintSlot_sound hEnv
     intro a x hInit ha hx
-    exact absVal_refineUgtConst_sound (uintWidth_valid u) ha hInit
+    exact refineUgtConstWithCong_sound (uintWidth_valid u) ha hInit
       ((hEff x hx).mp rfl)
   | ueqConst r u val =>
     apply refineUintSlot_sound hEnv

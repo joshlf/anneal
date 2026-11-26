@@ -44,6 +44,11 @@ with the canary helpers of `Anneal.AiPcc.Canaries`:
    constant products, and signed loops (a sign-straddling counter and a count
    up to `i32::MAX`) certified through `AutoProve.autoVerifyCutpoints` and its
    `VerificationResult` / stateful / trace certificates.
+7. Congruence-tightened stride-aligned loops (negative, sign-straddling
+   count-up and countdown, and non-power-of-two unsigned bounds), bounded
+   signed interval multiplication (`sintNoOverflowMulBiased`, including
+   opposite-sign `INT_MIN` boundaries and `i128` overflow boundaries), and a
+   `bb0`-as-cutpoint loop verified via `AutoProve.autoVerifyCutpoints`.
 -/
 
 namespace Anneal.AiPccMirTests
@@ -2134,5 +2139,350 @@ info: 'Anneal.AiPccMirTests.signedCount64_traceVerificationResult' depends on ax
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms signedCount64_traceVerificationResult
+
+/-! ## 7. Congruence-Tightened Stride Loops, Signed Interval Products, and `bb0` Cutpoints -/
+
+/-- An initialized abstract value in `[lo, hi]` with stride congruence
+`x ≡ rem (mod m)`. -/
+def strideIvAbs (w lo hi m rem : Nat) : AbsVal :=
+  reduceAbsVal w ⟨.init, Tnum.top w, .iv lo hi, .cong m rem⟩
+
+/-- `-64` as an `i32` bit pattern. -/
+def i32Neg64 : Nat := modPow2 32 - 64
+
+/-- `fn() -> i32 { let mut i = start; while i op bound { i = stepOp(i, step) }; i }`
+for two's-complement bit patterns `start`, `bound`, `step`. -/
+def signedStrideLoopBody (op stepOp : BinOp) (start bound step : Nat) :
+    CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_stride_loop" 0
+    [canaryIntTy .i32, canaryIntTy .i32, canaryBoolTy]
+    [ canaryBlock [.storageLive 1,
+        .assign (canaryPlace 1) (.use (canaryIConst .i32 start)),
+        .storageLive 2] (.goto 1),
+      canaryBlock [.assign (canaryPlace 2)
+          (.binaryOp op (canaryCopy 1) (canaryIConst .i32 bound))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 3)], 2⟩),
+      canaryBlock [.assign (canaryPlace 1)
+          (.binaryOp stepOp (canaryCopy 1) (canaryIConst .i32 step))]
+        (.goto 1),
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1)),
+        .storageDead 2, .storageDead 1] .return_ ]
+
+/-- `fn() -> u32 { let mut i = start; while i op bound { i += step }; i }`. -/
+def unsignedStrideLoopBody (op : BinOp) (start bound step : Nat) :
+    CapturedMir :=
+  canaryBody "ai_pcc_tests::unsigned_stride_loop" 0
+    [canaryUintTy .u32, canaryUintTy .u32, canaryBoolTy]
+    [ canaryBlock [.storageLive 1,
+        .assign (canaryPlace 1) (.use (canaryUConst .u32 start)),
+        .storageLive 2] (.goto 1),
+      canaryBlock [.assign (canaryPlace 2)
+          (.binaryOp op (canaryCopy 1) (canaryUConst .u32 bound))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 3)], 2⟩),
+      canaryBlock [.assign (canaryPlace 1)
+          (.binaryOp .addUnchecked (canaryCopy 1) (canaryUConst .u32 step))]
+        (.goto 1),
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1)),
+        .storageDead 2, .storageDead 1] .return_ ]
+
+/-- Loop-header cutpoint of `unsignedStrideLoopBody` with counter value `a`. -/
+def unsignedStrideCutpoints (a : AbsVal) : List (Nat × MirAbsEnv) :=
+  [(1, [.uint .u32 (AbsVal.uninit 32), .uint .u32 a, .bool .uninit])]
+
+/-- Sign-straddling stride-4 loop `i = -64; while i < 32 { i += 4 }`. -/
+def signedStraddlingStride4Body : CapturedMir :=
+  signedStrideLoopBody .lt .addUnchecked i32Neg64 32 4
+
+/-- Header cutpoint of `signedStraddlingStride4Body`:
+`-64 <= i <= 32` and `i ≡ 0 (mod 4)`. -/
+def signedStraddlingStride4Cutpoints : List (Nat × MirAbsEnv) :=
+  signedCountCutpoints (strideIvAbs 32 i32Neg64 32 4 0)
+
+/-- Congruence-aware guard refinement (`refineSleConstWithCong`,
+`refineSgtConstWithCong`, `refineUleConstWithCong`, `refineUgtConstWithCong`)
+certifies stride-aligned loops across negative intervals, sign-straddling
+count-up and countdown intervals, and non-power-of-two unsigned bounds, while
+rejecting off-by-one guards and unaligned entry values. -/
+theorem stride_aligned_loops_via_congruence_refinement :
+    -- Negative range: `i = -64; while i < -32 { i += 4 }` exits at `-32`.
+    AutoProve.autoVerifyCutpoints
+      (signedStrideLoopBody .lt .addUnchecked i32Neg64 i32Neg32 4)
+      (.sint .i32 (AbsVal.const 32 i32Neg32))
+      (signedCountCutpoints (strideIvAbs 32 i32Neg64 i32Neg32 4 0)) = true ∧
+    -- Near-miss: `i <= -32` steps to `-28`, violating `[-64, -32]`.
+    AutoProve.autoVerifyCutpoints
+      (signedStrideLoopBody .le .addUnchecked i32Neg64 i32Neg32 4)
+      (.sint .i32 (AbsVal.topInit 32))
+      (signedCountCutpoints (strideIvAbs 32 i32Neg64 i32Neg32 4 0)) = false ∧
+    -- Near-miss: unaligned start `-63` violates `i ≡ 0 (mod 4)`.
+    AutoProve.autoVerifyCutpoints
+      (signedStrideLoopBody .lt .addUnchecked (i32Neg64 + 1) i32Neg32 4)
+      (.sint .i32 (AbsVal.const 32 i32Neg32))
+      (signedCountCutpoints (strideIvAbs 32 i32Neg64 i32Neg32 4 0)) = false ∧
+    -- Sign-straddling count-up: `i = -64; while i < 32 { i += 4 }` exits at `32`.
+    AutoProve.autoVerifyCutpoints signedStraddlingStride4Body
+      (.sint .i32 (AbsVal.const 32 32))
+      signedStraddlingStride4Cutpoints = true ∧
+    -- Sign-straddling countdown: `i = 32; while i > -64 { i -= 4 }` exits at `-64`.
+    AutoProve.autoVerifyCutpoints
+      (signedStrideLoopBody .gt .subUnchecked 32 i32Neg64 4)
+      (.sint .i32 (AbsVal.const 32 i32Neg64))
+      signedStraddlingStride4Cutpoints = true ∧
+    -- Near-miss countdown: `i >= -64` steps to `-68`, violating `[-64, 32]`.
+    AutoProve.autoVerifyCutpoints
+      (signedStrideLoopBody .ge .subUnchecked 32 i32Neg64 4)
+      (.sint .i32 (AbsVal.topInit 32))
+      signedStraddlingStride4Cutpoints = false ∧
+    -- Non-power-of-two unsigned: `i = 0; while i < 24 { i += 4 }` exits at `24`.
+    AutoProve.autoVerifyCutpoints
+      (unsignedStrideLoopBody .lt 0 24 4)
+      (.uint .u32 (AbsVal.const 32 24))
+      (unsignedStrideCutpoints (strideIvAbs 32 0 24 4 0)) = true ∧
+    -- Near-miss unsigned: `i <= 24` steps to `28`, violating `[0, 24]`.
+    AutoProve.autoVerifyCutpoints
+      (unsignedStrideLoopBody .le 0 24 4)
+      (.uint .u32 (AbsVal.topInit 32))
+      (unsignedStrideCutpoints (strideIvAbs 32 0 24 4 0)) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Audited claim for `signedStraddlingStride4Body`: returns `32`. -/
+def signedStraddlingStride4Claim : Trusted.VerificationResult.Claim where
+  body := signedStraddlingStride4Body
+  pre args := args = []
+  post _ ret := ret = .scalar ⟨32, 4⟩
+
+/-- `VerificationResult signedStraddlingStride4Claim` from one `rfl`. -/
+theorem signedStraddlingStride4_verificationResult :
+    Trusted.VerificationResult.VerificationResult
+      signedStraddlingStride4Claim :=
+  AutoProve.bodyVerified_of_autoVerifyCutpoints
+    (retInv := .sint .i32 (AbsVal.const 32 32))
+    (cutpoints := signedStraddlingStride4Cutpoints)
+    (rpoOrder := AutoProve.defaultRpoOrder signedStraddlingStride4Body
+      signedStraddlingStride4Cutpoints)
+    rfl
+    (fun args hPre => by
+      have hArgs : args = [] := hPre
+      subst hArgs
+      exact rfl)
+    (fun _ _ _ hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        exact sint_valDenote_exact rfl hDen)
+
+/-- `fn(x: i8, y: i8) -> i8`: when `lo1 <= x <= hi1` and `lo2 <= y <= hi2`
+(all two's-complement bit patterns), compute `x.unchecked_mul(y)`. -/
+def guardedSignedMulBody (lo1 hi1 lo2 hi2 : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::guarded_signed_mul" 2
+    [canaryIntTy .i8, canaryIntTy .i8, canaryIntTy .i8,
+     canaryBoolTy, canaryBoolTy, canaryBoolTy, canaryBoolTy]
+    [ canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.binaryOp .ge (canaryCopy 1) (canaryIConst .i8 lo1))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 5)], 1⟩),
+      canaryBlock [.storageLive 4,
+        .assign (canaryPlace 4)
+          (.binaryOp .le (canaryCopy 1) (canaryIConst .i8 hi1))]
+        (.switchInt (canaryCopy 4) ⟨[(0, 5)], 2⟩),
+      canaryBlock [.storageLive 5,
+        .assign (canaryPlace 5)
+          (.binaryOp .ge (canaryCopy 2) (canaryIConst .i8 lo2))]
+        (.switchInt (canaryCopy 5) ⟨[(0, 5)], 3⟩),
+      canaryBlock [.storageLive 6,
+        .assign (canaryPlace 6)
+          (.binaryOp .le (canaryCopy 2) (canaryIConst .i8 hi2))]
+        (.switchInt (canaryCopy 6) ⟨[(0, 5)], 4⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .mulUnchecked (canaryCopy 1) (canaryCopy 2))] .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- Checked (`mulWithOverflow` + `assert(!.1)`) counterpart of
+`guardedSignedMulBody`. -/
+def guardedSignedCheckedMulBody (lo1 hi1 lo2 hi2 : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::guarded_signed_checked_mul" 2
+    [canaryIntTy .i8, canaryIntTy .i8, canaryIntTy .i8,
+     canaryBoolTy, canaryBoolTy, canaryBoolTy, canaryBoolTy, intPairTy .i8]
+    [ canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.binaryOp .ge (canaryCopy 1) (canaryIConst .i8 lo1))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 6)], 1⟩),
+      canaryBlock [.storageLive 4,
+        .assign (canaryPlace 4)
+          (.binaryOp .le (canaryCopy 1) (canaryIConst .i8 hi1))]
+        (.switchInt (canaryCopy 4) ⟨[(0, 6)], 2⟩),
+      canaryBlock [.storageLive 5,
+        .assign (canaryPlace 5)
+          (.binaryOp .ge (canaryCopy 2) (canaryIConst .i8 lo2))]
+        (.switchInt (canaryCopy 5) ⟨[(0, 6)], 3⟩),
+      canaryBlock [.storageLive 6,
+        .assign (canaryPlace 6)
+          (.binaryOp .le (canaryCopy 2) (canaryIConst .i8 hi2))]
+        (.switchInt (canaryCopy 6) ⟨[(0, 6)], 4⟩),
+      canaryBlock [.storageLive 7,
+        .assign (canaryPlace 7)
+          (.binaryOp .mulWithOverflow (canaryCopy 1) (canaryCopy 2))]
+        (.assert (.move (fieldPlace 7 1 canaryBoolTy)) false 5 .continue_),
+      canaryBlock [.assign (canaryPlace 0)
+          (.use (.move (fieldPlace 7 0 (canaryIntTy .i8))))] .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn() -> i128 { c1.unchecked_mul(c2) }` on `i128` constants. -/
+def i128ConstMulBody (c1 c2 : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::i128_const_mul" 0 [canaryIntTy .i128]
+    [canaryBlock [.assign (canaryPlace 0)
+      (.binaryOp .mulUnchecked (canaryIConst .i128 c1) (canaryIConst .i128 c2))]
+      .return_]
+
+/-- Bounded signed interval products (`sintNoOverflowMulBiased`): sign-straddling
+and opposite-sign `INT_MIN`-boundary products verify in both unchecked and
+checked forms, while overflowing products (`+128`, `-130`, `i128::MIN * -1`)
+fail closed. -/
+theorem signed_interval_products :
+    -- `[-10, 10] * 2` fits (`[-20, 20]`).
+    AutoProve.autoVerifyAcyclic (guardedSignedMulBody 246 10 2 2) = true ∧
+    AutoProve.autoVerifyAcyclic (guardedSignedCheckedMulBody 246 10 2 2) = true ∧
+    -- `[-10, -1] * [-5, 5]` fits (`[-50, 50]`).
+    AutoProve.autoVerifyAcyclic (guardedSignedMulBody 246 255 251 5) = true ∧
+    -- Opposite-sign exact `i8::MIN` boundary: `[-64, -1] * [1, 2]` and symmetric.
+    AutoProve.autoVerifyAcyclic (guardedSignedMulBody 192 255 1 2) = true ∧
+    AutoProve.autoVerifyAcyclic (guardedSignedCheckedMulBody 192 255 1 2) = true ∧
+    AutoProve.autoVerifyAcyclic (guardedSignedMulBody 1 2 192 255) = true ∧
+    -- Overflowing symmetric product `[-64, 64] * 2` (`+128` overflows).
+    AutoProve.autoVerifyAcyclic (guardedSignedMulBody 192 64 2 2) = false ∧
+    AutoProve.autoVerifyAcyclic (guardedSignedCheckedMulBody 192 64 2 2) = false ∧
+    -- Overflowing same-sign negative product `[-64, -1] * [-2, -1]` (`+128`).
+    AutoProve.autoVerifyAcyclic (guardedSignedMulBody 192 255 254 255) = false ∧
+    AutoProve.autoVerifyAcyclic (guardedSignedCheckedMulBody 192 255 254 255) = false ∧
+    -- Overflowing opposite-sign product `[-65, -1] * [1, 2]` (`-130`).
+    AutoProve.autoVerifyAcyclic (guardedSignedMulBody 191 255 1 2) = false ∧
+    -- `i128` exact boundary: `(-2) * 2^126 = i128::MIN` fits;
+    -- `(-2) * (2^126 + 1)` and `i128::MIN * -1` overflow.
+    AutoProve.autoVerifyAcyclic
+      (i128ConstMulBody (modPow2 128 - 2) (modPow2 126)) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (i128ConstMulBody (modPow2 128 - 2) (modPow2 126 + 1)) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (i128ConstMulBody (modPow2 127) (modPow2 128 - 1)) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `fn(mut x: i32) -> i32 { while x < 0 { x = x.unchecked_add(1); } x }`
+where the entry block `bb0` itself is the loop header (`bb0 -> bb1 -> bb0`,
+exit `bb2`).
+- `_0 : i32`; `_1 : i32` argument/counter; `_2 : bool` guard. -/
+def bb0CutpointLoopBody : CapturedMir :=
+  canaryBody "ai_pcc_tests::bb0_cutpoint_loop" 1
+    [canaryIntTy .i32, canaryIntTy .i32, canaryBoolTy]
+    [ -- bb0: entry & loop header (cutpoint)
+      canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.binaryOp .lt (canaryCopy 1) (canaryIConst .i32 0))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+      -- bb1: `x < 0`, so `x.unchecked_add(1)` cannot overflow
+      canaryBlock [.assign (canaryPlace 1)
+          (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i32 1)),
+        .storageDead 2] (.goto 0),
+      -- bb2: `x >= 0`, return `x`
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1)),
+        .storageDead 2] .return_ ]
+
+/-- Cutpoint invariant on `bb0` (equal to the entry environment). -/
+def bb0CutpointLoopCutpoints : List (Nat × MirAbsEnv) :=
+  [(0, entryEnv bb0CutpointLoopBody.localDecls [.sint .i32 (AbsVal.topInit 32)])]
+
+/-- Return postcondition of `bb0CutpointLoopBody`: non-negative `i32`
+(`0 <= bits < 2^31`). -/
+def bb0CutpointLoopRetInv : MirAbsSlot :=
+  .sint .i32 (ivAbs 32 0 (modPow2 31 - 1))
+
+/-- A loop whose entry block `bb0` is the cutpoint: `defaultRpoOrder` without
+cutpoints rejects the cyclic CFG (`autoVerifyAcyclic = false`), while adding
+the `bb0` cutpoint computes `[0, 2, 1]` and certifies the loop and its
+non-negative return bound. -/
+theorem bb0_as_cutpoint_loop :
+    AutoProve.defaultRpoOrder bb0CutpointLoopBody = [1, 0, 2] ∧
+    AutoProve.autoVerifyAcyclic bb0CutpointLoopBody = false ∧
+    AutoProve.defaultRpoOrder bb0CutpointLoopBody bb0CutpointLoopCutpoints =
+      [0, 2, 1] ∧
+    AutoProve.autoVerifyCutpoints bb0CutpointLoopBody bb0CutpointLoopRetInv
+      bb0CutpointLoopCutpoints = true :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Audited claim for `bb0CutpointLoopBody`: for every valid `i32` input it is
+UB-free and every normal return is non-negative (`bits < 2^31`). -/
+def bb0CutpointLoopClaim : Trusted.VerificationResult.Claim where
+  body := bb0CutpointLoopBody
+  pre args := AutoProve.ValidEntryArgs bb0CutpointLoopBody args
+  post _ ret := ∃ bits, ret = .scalar ⟨bits, 4⟩ ∧ bits < modPow2 31
+
+/-- `VerificationResult bb0CutpointLoopClaim` from one `rfl`. -/
+theorem bb0CutpointLoop_verificationResult :
+    Trusted.VerificationResult.VerificationResult bb0CutpointLoopClaim :=
+  AutoProve.bodyVerified_of_autoVerifyCutpoints
+    (retInv := bb0CutpointLoopRetInv) (cutpoints := bb0CutpointLoopCutpoints)
+    (rpoOrder := AutoProve.defaultRpoOrder bb0CutpointLoopBody
+      bb0CutpointLoopCutpoints)
+    rfl
+    (fun _ hPre => hPre)
+    (fun _ _ _ hRet => by
+      match hRet with
+      | ⟨d, hD, hDen⟩ =>
+        injection hD with hD
+        subst hD
+        match sint_valDenote_ubound (hi := modPow2 31 - 1) rfl hDen with
+        | ⟨bits, hV, hLe⟩ =>
+          exact ⟨bits, hV,
+            Nat.lt_of_le_of_lt hLe (Nat.sub_lt (modPow2_pos 31) Nat.one_pos)⟩)
+
+/--
+info: 'Anneal.AiPcc.refineSleConstWithCong_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms refineSleConstWithCong_sound
+
+/--
+info: 'Anneal.AiPcc.refineSgtConstWithCong_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms refineSgtConstWithCong_sound
+
+/--
+info: 'Anneal.AiPcc.refineUleConstWithCong_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms refineUleConstWithCong_sound
+
+/--
+info: 'Anneal.AiPcc.refineUgtConstWithCong_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms refineUgtConstWithCong_sound
+
+/--
+info: 'Anneal.AiPcc.sintNoOverflowMulBiased_sound' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms sintNoOverflowMulBiased_sound
+
+/--
+info: 'Anneal.AiPccMirTests.signedStraddlingStride4_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedStraddlingStride4_verificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.bb0CutpointLoop_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms bb0CutpointLoop_verificationResult
 
 end Anneal.AiPccMirTests
