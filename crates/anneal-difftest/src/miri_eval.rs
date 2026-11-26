@@ -3657,6 +3657,10 @@ struct FnAndAuxCollector<'a> {
     path_stack: Vec<String>,
     container_stack: Vec<String>,
     top_fn_stack: Vec<String>,
+    /// Every enclosing `fn` item (outermost first), including `fn`s nested
+    /// inside `mod`s or other `fn`s, so function-local `use` items are gated
+    /// on the reachability of their whole enclosing `fn` chain.
+    fn_stack: Vec<String>,
     in_impl_depth: usize,
 }
 
@@ -3689,6 +3693,7 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
             .extend(quote::ToTokens::to_token_stream(func));
         let pushed_top = self.path_stack.is_empty() && self.in_impl_depth == 0;
         self.path_stack.push(name.clone());
+        self.fn_stack.push(name.clone());
         if pushed_top {
             self.top_fn_stack.push(name.clone());
         } else if self.in_impl_depth == 0 {
@@ -3698,6 +3703,7 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
         if pushed_top {
             self.top_fn_stack.pop();
         }
+        self.fn_stack.pop();
         self.path_stack.pop();
     }
 
@@ -3722,11 +3728,12 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         // Record each imported path resolved against the enclosing `mod`
         // containers (`crate::` resets, `super::` pops, `self::` stays) and
-        // scoped to any enclosing top-level `fn`, so an import inside an
-        // unreached function or `dead_mod::other` never leaks `dead_mod::*`.
+        // scoped to its whole enclosing `fn` chain (top-level, `mod`-nested, or
+        // `fn`-nested), so an import inside an unreached function or
+        // `dead_mod::other` never leaks `dead_mod::*`.
         let mut flat: Vec<(Vec<String>, String)> = Vec::new();
         flatten_use_tree(&item.tree, &mut Vec::new(), &mut flat);
-        let enclosing_top_fn = self.top_fn_stack.first().cloned();
+        let enclosing_fns = self.fn_stack.clone();
         for (segments, mut used_name) in flat {
             let mut base: Vec<String> = self.container_stack.clone();
             let mut leading = true;
@@ -3753,7 +3760,7 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
                     used_name = mod_ident.clone();
                 }
             }
-            let entry = (enclosing_top_fn.clone(), base, used_name);
+            let entry = (enclosing_fns.clone(), base, used_name);
             if !self.graph.imported_paths.contains(&entry) {
                 self.graph.imported_paths.push(entry);
             }
@@ -4014,6 +4021,7 @@ fn collect_fn_and_aux_items(items: &[syn::Item], graph: &mut ScopeGraphData) {
         path_stack: Vec::new(),
         container_stack: Vec::new(),
         top_fn_stack: Vec::new(),
+        fn_stack: Vec::new(),
         in_impl_depth: 0,
     };
     for item in items {
@@ -4031,9 +4039,9 @@ struct ScopeGraphData {
     impl_method_names: BTreeSet<String>,
     nested_fn_stems: BTreeMap<String, Vec<NestedFnOwner>>,
     inherent_impl_method_stems: BTreeMap<String, Vec<InherentMethodOwner>>,
-    /// `(enclosing top-level fn if local, resolved import path, name it is
+    /// `(enclosing fn chain if local, resolved import path, name it is
     /// used under)`; a glob import ends in `"*"` and is used under `"*"`.
-    imported_paths: Vec<(Option<String>, Vec<String>, String)>,
+    imported_paths: Vec<(Vec<String>, Vec<String>, String)>,
     top_level_fns: BTreeSet<String>,
     defined_value_names: BTreeSet<String>,
     defined_type_names: BTreeSet<String>,
@@ -5296,10 +5304,8 @@ fn confirm_helper_module_suffixes(
                 if containers.iter().all(named) {
                     return true;
                 }
-                scope_graph.imported_paths.iter().any(|(enclosing_fn, path, used)| {
-                    if let Some(top) = enclosing_fn.as_deref()
-                        && !top_fn_is_reached(top)
-                    {
+                scope_graph.imported_paths.iter().any(|(enclosing_fns, path, used)| {
+                    if !enclosing_fns.iter().all(|f| top_fn_is_reached(f)) {
                         return false;
                     }
                     let Some((last, prefix)) = path.split_last() else {
@@ -15965,14 +15971,42 @@ fn dead_fn() -> u32 {
     use dead_fn_mod::helper;
     helper(9u32)
 }
+mod dead_mod2 {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x + v;
+        f(10u32)
+    }
+}
+mod local_mod {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x ^ v;
+        f(11u32)
+    }
+}
+mod dead_wrapper {
+    pub fn dead_inner() -> u32 {
+        use super::dead_mod2::helper;
+        helper(12u32)
+    }
+}
+mod live_wrapper {
+    pub fn live_inner() -> u32 {
+        use super::local_mod::helper;
+        helper(13u32)
+    }
+}
 pub fn root_entry() -> u32 {
     live_mod::helper(1u32) ^ inner_mod::deep(2u32) ^ globbed(3u32) ^ sub::run(4u32)
+        ^ live_wrapper::live_inner()
 }
 ";
         let pairs: Vec<(String, String)> = [
             ("{closure#0}", "X.live_mod_helper_closure_0"),
             ("{closure#0}", "X.dead_mod_helper_closure_0"),
             ("{closure#0}", "X.dead_fn_mod_helper_closure_0"),
+            // `use` inside a `mod`-nested fn: gated on that fn's reachability.
+            ("{closure#0}", "X.dead_mod2_helper_closure_0"),
+            ("{closure#0}", "X.local_mod_helper_closure_0"),
             ("{closure#0}", "X.outer_mod_inner_mod_deep_closure_0"),
             ("{closure#0}", "X.glob_mod_globbed_closure_0"),
             ("{closure#0}", "X.self_mod_sub_run_closure_0"),
@@ -15991,6 +16025,7 @@ pub fn root_entry() -> u32 {
             ),
             vec![
                 "X.live_mod_helper_closure_0",
+                "X.local_mod_helper_closure_0",
                 "X.outer_mod_inner_mod_deep_closure_0",
                 "X.glob_mod_globbed_closure_0",
                 "X.self_mod_sub_run_closure_0",
