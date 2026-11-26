@@ -24057,6 +24057,13 @@ open LeanMiriSpec.Correspondence in
   encodeUntypedValueToBytes_ptr_decode_roundtrip
   step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported
   stepMirFn_copyNonOverlapping_stage1_eq_lm4_2
+  copyZeroPtrAgree_scalar
+  copyTyAlignBound?_exact_of_sizeAndAlign
+  copyZeroPtrAgree_ptr_root
+  isUnresolvedLayoutIdx_emptyLayoutTable
+  copyZeroAlign_of_agree
+  copyZeroPtrAgree_lm3_1
+  stepMirFn_copyNonOverlapping_stage1_eq_lm4_2_of_live_targets
   step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
   step_intrinsic_copyNonOverlapping_stage1_simulation
   step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap

@@ -2745,12 +2745,24 @@ theorem wit_lm4_2_copy_nonoverlapping_zero_dangling_ok :
     usize_integral (fun tf₁ _ => constInt_wellTyped usize_integral valid8 (by decide) rfl b rfl tf₁)
     u64_copyPointee (by decide)
     (by
+      -- Discharged semantically (`copyZeroPtrAgree_lm3_1`), not by evaluating the precheck.
       intro srcVal dstVal _ hsrc hdst _ _
       have hsV : srcVal = .scalar ⟨8, 8⟩ := by
         simpa [s₁, mkPtrState, get?] using hsrc.symm
       have hdV : dstVal = .ptr { allocId := 1, offsetBytes := 0 } 8 := by
         simpa [s₁, mkPtrState, get?] using hdst.symm
-      subst hsV hdV; exact Or.inl ⟨rfl, rfl, rfl⟩)
+      subst hsV hdV
+      obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+      exact copyZeroAlign_of_agree
+        (copyZeroPtrAgree_lm3_1 hrel₁ htf₁ rfl rfl (himm₁ tf₁ htf₁ 2 (by decide)) hsrc rfl rfl
+          rfl (by decide) (fun _ _ _ hv _ _ _ => by cases hv))
+        (copyZeroPtrAgree_lm3_1 hrel₁ htf₁ rfl rfl (himm₁ tf₁ htf₁ 3 (by decide)) hdst rfl rfl
+          rfl (by decide) (fun _ e tdecl _ he _ htd => by
+            cases he with
+            | tail _ h => cases h
+            | head _ =>
+              have hd : tdecl = declOf u64K := Option.some.inj htd.symm
+              subst hd; exact ⟨rfl, rfl⟩)))
     (by intro _ _ _ _ _ _ hsrc; simp [s₁, mkPtrState, get?] at hsrc)
     (by intro _ _ _ hsrc; simp [s₁, mkPtrState, get?] at hsrc)
     (by intro _ _ _ _ _ hsrc; simp [s₁, mkPtrState, get?] at hsrc)
@@ -2822,12 +2834,24 @@ theorem wit_lm4_2_copy_nonoverlapping_zero_null_ok :
     usize_integral (fun tf₁ _ => constInt_wellTyped usize_integral valid8 (by decide) rfl b rfl tf₁)
     u64_copyPointee (by decide)
     (by
+      -- Discharged semantically (`copyZeroPtrAgree_lm3_1`), not by evaluating the precheck.
       intro srcVal dstVal _ hsrc hdst _ _
       have hsV : srcVal = .ptr { allocId := 1, offsetBytes := 0 } 8 := by
         simpa [s₁, mkPtrState, get?] using hsrc.symm
       have hdV : dstVal = .scalar ⟨0, 8⟩ := by
         simpa [s₁, mkPtrState, get?] using hdst.symm
-      subst hsV hdV; exact Or.inl ⟨rfl, rfl, rfl⟩)
+      subst hsV hdV
+      obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+      exact copyZeroAlign_of_agree
+        (copyZeroPtrAgree_lm3_1 hrel₁ htf₁ rfl rfl (himm₁ tf₁ htf₁ 3 (by decide)) hsrc rfl rfl
+          rfl (by decide) (fun _ e tdecl _ he _ htd => by
+            cases he with
+            | tail _ h => cases h
+            | head _ =>
+              have hd : tdecl = declOf u64K := Option.some.inj htd.symm
+              subst hd; exact ⟨rfl, rfl⟩))
+        (copyZeroPtrAgree_lm3_1 hrel₁ htf₁ rfl rfl (himm₁ tf₁ htf₁ 2 (by decide)) hdst rfl rfl
+          rfl (by decide) (fun _ _ _ hv _ _ _ => by cases hv)))
     (by intro _ _ _ _ _ _ _ hdst; simp [s₁, mkPtrState, get?] at hdst)
     (by intro _ _ _ _ hdst; simp [s₁, mkPtrState, get?] at hdst)
     (by intro _ _ _ _ _ _ hdst; simp [s₁, mkPtrState, get?] at hdst)
