@@ -1098,6 +1098,32 @@ theorem t_live08_accepts_of_coherent_dyn :
     ((coherent_encode pTag 8 (by decide)).trans rfl)
     ((coherent_encode pVt 8 (by decide)).trans rfl)
 
+/-- `fn`-pointer pointee `()` (live `decodeTypedValueFromBytes` `.fnPtr` route) and `bool`. -/
+theorem t_live06_accepts_of_coherent_thin :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge true (.tuple []) 8
+        ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := 5, offsetBytes := 0x40 } 8) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge false .bool 4
+        ((encodePtrBytesProto pBig4 4).map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := 3, offsetBytes := 0x11223344 } 4) :=
+  ⟨live06_accepts_of_coherent_thin true (.tuple []) (fun _ h => by cases h) (fun h => by cases h)
+      (fun _ h => by cases h) 8 _ pTag ((coherent_encode pTag 8 (by decide)).trans rfl),
+    live06_accepts_of_coherent_thin false .bool (fun _ h => by cases h) (fun h => by cases h)
+      (fun _ h => by cases h) 4 _ pBig4 ((coherent_encode pBig4 4 (by decide)).trans rfl)⟩
+
+/-- `fn`-pointer pointee `()` (live `decodeTypedValueFromBytes` `.fnPtr` route) and `bool`. -/
+theorem t_live08_accepts_of_coherent_thin :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge true (.tuple []) 8
+        ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := 5, offsetBytes := 0x40 } 8) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge false .bool 4
+        ((encodePtrBytesProto pBig4 4).map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := 3, offsetBytes := 0x11223344 } 4) :=
+  ⟨live08_accepts_of_coherent_thin true (.tuple []) (fun _ h => by cases h) (fun h => by cases h)
+      (fun _ h => by cases h) 8 _ pTag ((coherent_encode pTag 8 (by decide)).trans rfl),
+    live08_accepts_of_coherent_thin false .bool (fun _ h => by cases h) (fun h => by cases h)
+      (fun _ h => by cases h) 4 _ pBig4 ((coherent_encode pBig4 4 (by decide)).trans rfl)⟩
+
 /-! ## 2. Prototype decoders on the adversarial inputs (independent `rfl` checks) -/
 
 /-- Live keeps provenance on these images (`LiveV06.w1_*` / `w2_*`); the prototype on the

@@ -1379,7 +1379,7 @@ def opt2LegacyHasProv : AbstractByteOpt2 → Bool
   | .init _ (some _) => true
   | _ => false
 
-/-- **Option 2 migration hazard (kernel-checked):** Lean elaborates the two-argument pattern
+/-- **Option 2 migration hazard (kernel-checked):** Lean reads the two-argument pattern
 `.init _ (some _)` as `.init _ (some _) none` (the defaulted field is filled in the pattern),
 so it silently stops matching fragment-carrying bytes and falls through to the catch-all arm.
 Every one of the census' 2-argument `AbstractByte.init` patterns would change meaning. -/
@@ -3157,6 +3157,33 @@ theorem live06_accepts_of_coherent (isRef : Bool) (n : Nat) (l : List AbstractBy
     Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length]
   simp only [hL, hD, hU, Nat.beq_refl, Nat.mod_eq_of_lt hoff, nat_beq_zero_of_pos hn]
 
+/-- **Backward compatibility for EVERY thin pointee (universal, V2026_06_01):** generalizes
+`live06_accepts_of_coherent` from `u8` to any non-slice / non-`str` / non-`dyn` pointee
+(including the `()` pointee live uses for `fn` pointers). -/
+theorem live06_accepts_of_coherent_thin (isRef : Bool)
+    (pointee : Trusted.Rustc.V2026_06_01.MirAst.RigidTy)
+    (hs : ∀ e, pointee ≠ .slice e) (hstr : pointee ≠ .str) (hd : ∀ t, pointee ≠ .dynamic t)
+    (n : Nat) (l : List AbstractByteProto) (p : ProvenancePtrProto)
+    (h : abstractBytesCoherentPtrProvProto n l = some p) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge isRef pointee n
+      (l.map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n) := by
+  obtain ⟨hn, hoff, rfl⟩ := (coherent_iff_encode n l p).mp h
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, (Nat.sub_add_cancel hn).symm⟩
+  rw [toLive06_encode]
+  simp only [normOffset, Nat.mod_eq_of_lt hoff]
+  have hL := live06_encodeLE_length p.offsetBytes (k + 1) (some (p.allocId, p.tag))
+  have hD := live06_decodeLE_encodeLE p.offsetBytes k (p.allocId, p.tag)
+  have hU := live06_uniform_encodeLE p.allocId p.tag p.offsetBytes k
+  cases pointee
+  case slice e => exact absurd rfl (hs e)
+  case str => exact absurd rfl hstr
+  case dynamic t => exact absurd rfl (hd t)
+  all_goals
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
+      Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length]
+    simp only [hL, hD, hU, Nat.beq_refl, Nat.mod_eq_of_lt hoff, nat_beq_zero_of_pos hn]
+
 /-- **Refinement (contrapositive, universal):** whenever live `V2026_06_01` rejects a reference
 image (UB), the prototype strips it too — the prototype never accepts what live rejects. -/
 theorem coherent_none_of_live06_ref_none (n : Nat) (l : List AbstractByteProto)
@@ -3395,6 +3422,33 @@ theorem live08_accepts_of_coherent (isRef : Bool) (n : Nat) (l : List AbstractBy
   simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge,
     Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length]
   simp only [hL, hD, hU, Nat.beq_refl, Nat.mod_eq_of_lt hoff, nat_beq_zero_of_pos hn]
+
+/-- **Backward compatibility for EVERY thin pointee (universal, V2026_08_01):** generalizes
+`live08_accepts_of_coherent` from `u8` to any non-slice / non-`str` / non-`dyn` pointee
+(including the `()` pointee live uses for `fn` pointers). -/
+theorem live08_accepts_of_coherent_thin (isRef : Bool)
+    (pointee : Trusted.Rustc.V2026_08_01.MirAst.RigidTy)
+    (hs : ∀ e, pointee ≠ .slice e) (hstr : pointee ≠ .str) (hd : ∀ t, pointee ≠ .dynamic t)
+    (n : Nat) (l : List AbstractByteProto) (p : ProvenancePtrProto)
+    (h : abstractBytesCoherentPtrProvProto n l = some p) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge isRef pointee n
+      (l.map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n) := by
+  obtain ⟨hn, hoff, rfl⟩ := (coherent_iff_encode n l p).mp h
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, (Nat.sub_add_cancel hn).symm⟩
+  rw [toLive08_encode]
+  simp only [normOffset, Nat.mod_eq_of_lt hoff]
+  have hL := live08_encodeLE_length p.offsetBytes (k + 1) (some (p.allocId, p.tag))
+  have hD := live08_decodeLE_encodeLE p.offsetBytes k (p.allocId, p.tag)
+  have hU := live08_uniform_encodeLE p.allocId p.tag p.offsetBytes k
+  cases pointee
+  case slice e => exact absurd rfl (hs e)
+  case str => exact absurd rfl hstr
+  case dynamic t => exact absurd rfl (hd t)
+  all_goals
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge,
+      Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length]
+    simp only [hL, hD, hU, Nat.beq_refl, Nat.mod_eq_of_lt hoff, nat_beq_zero_of_pos hn]
 
 /-- **Refinement (contrapositive, universal):** whenever live `V2026_08_01` rejects a reference
 image (UB), the prototype strips it too — the prototype never accepts what live rejects. -/
