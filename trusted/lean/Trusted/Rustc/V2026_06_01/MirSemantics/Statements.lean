@@ -9650,7 +9650,7 @@ Reference (`library/core/src/ptr/mod.rs` at commit
 def isNullThinPtr (mem : Memory) (ptrBytes : Nat) : Value → Option Bool
   | .scalar sv =>
     match Nat.beq sv.sizeBytes ptrBytes with
-    | true => .some (Nat.beq sv.bits 0)
+    | true => .some (Nat.beq (Nat.mod sv.bits (scalarModulus ptrBytes)) 0)
     | false => .none
   | .ptr p sz =>
     match Nat.beq sz ptrBytes with
@@ -9659,7 +9659,9 @@ def isNullThinPtr (mem : Memory) (ptrBytes : Nat) : Value → Option Bool
       .some
         (Bool.and
           (Nat.beq p.allocId 0)
-          (Bool.and (Nat.beq p.offsetBytes 0) (Bool.not (isBackedPtr mem p))))
+          (Bool.and
+            (Nat.beq (Nat.mod p.offsetBytes (scalarModulus ptrBytes)) 0)
+            (Bool.not (isBackedPtr mem p))))
   | _ => .none
 
 /--
@@ -9740,10 +9742,13 @@ for a non-zero read of `[accessOff, accessOff + accessLen)` through `(tag, entry
 Uses the exact access interval `(accessOff, accessLen)` rather than widening a
 ranged borrow to `(entry.rangeOffset, entry.rangeLen)`.
 
-Reference (Miri Tree Borrows implementation,
-`src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs>
+Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L89-L125>
+
+> "/// Recusively do state transition on `self` node and all its descendants.
+> /// `path` is the path from `self` to the accessed node.
+> /// `path` is None when the accessed node is not a descendant of `self`."
 
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -9947,6 +9952,11 @@ structure ResolvedMemEndpoint : Type where
 /--
 Resolve a pointer `p : ProvenancePtr` to a live stack or global
 `ResolvedMemEndpoint`:
+- Deallocated stack borrows (`entry.allocDead = true`, set by `StorageDead` and
+  frame teardown) fault immediately with `.ub` BEFORE inspecting
+  `(entry.targetFrameDepth, entry.targetLocal)`, preventing a dangling pointer
+  from aliasing a later callee's live local at the same depth/index and masking
+  dangling-pointer `.ub` as `.unsupported`.
 - Dead or out-of-frame stack locals and unbacked/non-existent allocations fault
   with `.ub`.
 - Stack locals whose projection offset or root allocation size cannot be
@@ -9975,103 +9985,106 @@ def resolveLiveMemEndpoint
     MemOpRes ResolvedMemEndpoint :=
   match lookupBorrow s.memory.borrows p.tag with
   | .some entry =>
-    match
-      readFrameLocalSlot
-        locals
-        s.memory.callStack
-        s.memory.callerLocals
-        entry.targetFrameDepth
-        entry.targetLocal
-    with
-    | .none => .ub
-    | .some .dead => .ub
-    | .some slot =>
-      let (targetDecls, targetLayouts) : List LocalDecl × LayoutTable :=
-        match activeFrameSlot? locals s.memory.callStack entry.targetFrameDepth entry.targetLocal with
-        | .some _ => (bodyLocalDecls, bodyLayouts)
-        | .none =>
-          foreignFrameDeclsAndLayouts
-            s.memory.callStack
-            bodyLayouts
-            entry.targetFrameDepth
-            entry.targetLocal
-      let rootTy? : Option Ty :=
-        match get? targetDecls entry.targetLocal with
-        | .some decl => .some decl.ty
-        | .none => .none
+    match entry.allocDead with
+    | true => .ub
+    | false =>
       match
-        borrowPlaceByteOffset?
+        readFrameLocalSlot
           locals
-          s.memory.callerLocals
-          bodyLocalDecls
-          bodyLayouts
-          entry
           s.memory.callStack
+          s.memory.callerLocals
+          entry.targetFrameDepth
+          entry.targetLocal
       with
-      | .none => .unsupported
-      | .some placeOff =>
-        let rootSizeOpt : Option Nat :=
-          match rootTy? with
-          | .some rTy => exactTyByteSize? targetDecls targetLayouts rTy
+      | .none => .ub
+      | .some .dead => .ub
+      | .some slot =>
+        let (targetDecls, targetLayouts) : List LocalDecl × LayoutTable :=
+          match activeFrameSlot? locals s.memory.callStack entry.targetFrameDepth entry.targetLocal with
+          | .some _ => (bodyLocalDecls, bodyLayouts)
           | .none =>
-            match slot with
-            | .init rootVal =>
-              match untypedValueHasExactByteImage defaultCodecFuel rootVal with
-              | true => valueDefaultByteSize rootVal
-              | false => .none
-            | _ => .none
-        match rootSizeOpt with
+            foreignFrameDeclsAndLayouts
+              s.memory.callStack
+              bodyLayouts
+              entry.targetFrameDepth
+              entry.targetLocal
+        let rootTy? : Option Ty :=
+          match get? targetDecls entry.targetLocal with
+          | .some decl => .some decl.ty
+          | .none => .none
+        match
+          borrowPlaceByteOffset?
+            locals
+            s.memory.callerLocals
+            bodyLocalDecls
+            bodyLayouts
+            entry
+            s.memory.callStack
+        with
         | .none => .unsupported
-        | .some allocSize =>
-          let normProj :=
-            normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
-          let projWinOpt : Option (Nat × Nat) :=
-            match normProj with
-            | .nil => .some (0, allocSize)
-            | _ :: _ =>
-              match
-                placeTyResolved targetDecls targetLayouts
-                  { local_ := entry.targetLocal, projection := entry.targetProjection }
-              with
-              | .none => .none
-              | .some placeTy =>
-                match exactTyByteSize? targetDecls targetLayouts placeTy with
-                | .none => .none
-                | .some pSz =>
-                  match Nat.ble (Nat.add placeOff pSz) allocSize with
-                  | true => .some (placeOff, Nat.add placeOff pSz)
-                  | false => .none
-          let tagWindow : Option (Nat × Nat) :=
-            match Nat.blt 0 entry.rangeLen with
-            | false => projWinOpt
-            | true =>
-              let rStart := entry.rangeOffset
-              let rEnd := minNat (Nat.add entry.rangeOffset entry.rangeLen) allocSize
-              match projWinOpt with
-              | .none => .none
-              | .some (pStart, pEnd) =>
-                let iStart := maxNat rStart pStart
-                let iEnd := minNat rEnd pEnd
-                match Nat.ble iStart iEnd with
-                | true => .some (iStart, iEnd)
-                | false => .some (iStart, iStart)
-          let rootAlign? : Option Nat :=
+        | .some placeOff =>
+          let rootSizeOpt : Option Nat :=
             match rootTy? with
-            | .some rTy => exactRootAllocAlign? targetDecls targetLayouts rTy
-            | .none => .none
-          .ok {
-            allocKey := .stack entry.targetFrameDepth entry.targetLocal
-            allocSize := allocSize
-            effOff := Nat.add placeOff p.offsetBytes
-            tagWindow := tagWindow
-            borrow? := .some (p.tag, entry)
-            globalAlloc? := .none
-            targetDecls := targetDecls
-            targetLayouts := targetLayouts
-            rootTy? := rootTy?
-            rootSlot? := .some slot
-            rootAlign? := rootAlign?
-          }
+            | .some rTy => exactTyByteSize? targetDecls targetLayouts rTy
+            | .none =>
+              match slot with
+              | .init rootVal =>
+                match untypedValueHasExactByteImage defaultCodecFuel rootVal with
+                | true => valueDefaultByteSize rootVal
+                | false => .none
+              | _ => .none
+          match rootSizeOpt with
+          | .none => .unsupported
+          | .some allocSize =>
+            let normProj :=
+              normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
+            let projWinOpt : Option (Nat × Nat) :=
+              match normProj with
+              | .nil => .some (0, allocSize)
+              | _ :: _ =>
+                match
+                  placeTyResolved targetDecls targetLayouts
+                    { local_ := entry.targetLocal, projection := entry.targetProjection }
+                with
+                | .none => .none
+                | .some placeTy =>
+                  match exactTyByteSize? targetDecls targetLayouts placeTy with
+                  | .none => .none
+                  | .some pSz =>
+                    match Nat.ble (Nat.add placeOff pSz) allocSize with
+                    | true => .some (placeOff, Nat.add placeOff pSz)
+                    | false => .none
+            let tagWindow : Option (Nat × Nat) :=
+              match Nat.blt 0 entry.rangeLen with
+              | false => projWinOpt
+              | true =>
+                let rStart := entry.rangeOffset
+                let rEnd := minNat (Nat.add entry.rangeOffset entry.rangeLen) allocSize
+                match projWinOpt with
+                | .none => .none
+                | .some (pStart, pEnd) =>
+                  let iStart := maxNat rStart pStart
+                  let iEnd := minNat rEnd pEnd
+                  match Nat.ble iStart iEnd with
+                  | true => .some (iStart, iEnd)
+                  | false => .some (iStart, iStart)
+            let rootAlign? : Option Nat :=
+              match rootTy? with
+              | .some rTy => exactRootAllocAlign? targetDecls targetLayouts rTy
+              | .none => .none
+            .ok {
+              allocKey := .stack entry.targetFrameDepth entry.targetLocal
+              allocSize := allocSize
+              effOff := Nat.add placeOff p.offsetBytes
+              tagWindow := tagWindow
+              borrow? := .some (p.tag, entry)
+              globalAlloc? := .none
+              targetDecls := targetDecls
+              targetLayouts := targetLayouts
+              rootTy? := rootTy?
+              rootSlot? := .some slot
+              rootAlign? := rootAlign?
+            }
   | .none =>
     match lookupGlobalAlloc s.memory.globals p.allocId with
     | .some gAlloc =>
@@ -11864,7 +11877,7 @@ def decodePartialUninitValue
           | .fnPtr _ _ _ _ => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
           | .ref _ pt =>
             match knownWidePointeeTailAux? 8 pt with
-            | .some _ =>
+            | .some tailTy =>
               match Nat.beq (length bytes) (Nat.mul 2 ptrBytes) with
               | false => .none
               | true =>
@@ -11875,7 +11888,7 @@ def decodePartialUninitValue
                   let mBs := dropAbstractBytes ptrBytes bytes
                   match
                     decodeThinPtrBytes mem ptrBytes true false dBs,
-                    match pt with
+                    match tailTy with
                     | .dynamic _ => decodeThinPtrBytes mem ptrBytes true false mBs
                     | _ =>
                       match bytesHaveRealProvenance mem mBs with
@@ -11899,7 +11912,7 @@ def decodePartialUninitValue
                 | .none => .none
           | .rawPtr _ pt =>
             match knownWidePointeeTailAux? 8 pt with
-            | .some _ =>
+            | .some tailTy =>
               match Nat.beq (length bytes) (Nat.mul 2 ptrBytes) with
               | false => .none
               | true =>
@@ -11910,8 +11923,8 @@ def decodePartialUninitValue
                   let mBs := dropAbstractBytes ptrBytes bytes
                   match
                     decodeThinPtrBytes mem ptrBytes false false dBs,
-                    match pt with
-                    | .dynamic _ => decodeThinPtrBytes mem ptrBytes false false mBs
+                    match tailTy with
+                    | .dynamic _ => decodeThinPtrBytes mem ptrBytes true false mBs
                     | _ =>
                       match bytesHaveRealProvenance mem mBs with
                       | true => .none
@@ -13032,12 +13045,13 @@ def validateScalarLayoutValue
   match scalarLayoutTargetByteWidth layouts sl with
   | .none => .unsupported
   | .some expectedSz =>
+    let modW := scalarModulus expectedSz
     match sl with
     | .union _ =>
       match v with
       | .uninit => .valid
       | .scalar sc =>
-        match Nat.beq sc.sizeBytes expectedSz with
+        match Bool.and (Nat.beq sc.sizeBytes expectedSz) (Nat.blt sc.bits modW) with
         | true => .valid
         | false => .ub
       | .ptr _ sz =>
@@ -13052,7 +13066,7 @@ def validateScalarLayoutValue
       | .unit => .ub
       | .aggregate _ _ => .unsupported
       | .scalar sc =>
-        match Nat.beq sc.sizeBytes expectedSz with
+        match Bool.and (Nat.beq sc.sizeBytes expectedSz) (Nat.blt sc.bits modW) with
         | false => .ub
         | true =>
           match wrappingRangeContains validRange sc.bits with
@@ -13071,7 +13085,7 @@ def validateScalarLayoutValue
               Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr mem p))
             with
             | true =>
-              match wrappingRangeContains validRange p.offsetBytes with
+              match Bool.and (Nat.blt p.offsetBytes modW) (wrappingRangeContains validRange p.offsetBytes) with
               | true => .valid
               | false => .ub
             | false =>
@@ -13082,7 +13096,7 @@ def validateScalarLayoutValue
             match Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr mem p)) with
             | false => .unsupported
             | true =>
-              match wrappingRangeContains validRange p.offsetBytes with
+              match Bool.and (Nat.blt p.offsetBytes modW) (wrappingRangeContains validRange p.offsetBytes) with
               | false => .ub
               | true =>
                 match charShapedSurrogate pk validRange p.offsetBytes with
@@ -13362,28 +13376,36 @@ def validateBlackBoxValue
         match intTyTargetBytes layouts ty.kind with
         | .none => .unsupported
         | .some sz =>
+          let modSz := scalarModulus sz
           match v with
           | .scalar sc =>
-            match Nat.beq sc.sizeBytes sz with | true => .valid | false => .ub
+            match Bool.and (Nat.beq sc.sizeBytes sz) (Nat.blt sc.bits modSz) with
+            | true => .valid
+            | false => .ub
           | .ptr p pSz =>
             match Nat.beq pSz sz with
             | false => .ub
             | true =>
               match Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr mem p)) with
-              | true => .valid
+              | true =>
+                match Nat.blt p.offsetBytes modSz with | true => .valid | false => .ub
               | false => .unsupported
           | _ => .ub
       | .float w =>
         let sz := floatTyByteWidth w
+        let modSz := scalarModulus sz
         match v with
         | .scalar sc =>
-          match Nat.beq sc.sizeBytes sz with | true => .valid | false => .ub
+          match Bool.and (Nat.beq sc.sizeBytes sz) (Nat.blt sc.bits modSz) with
+          | true => .valid
+          | false => .ub
         | .ptr p pSz =>
           match Nat.beq pSz sz with
           | false => .ub
           | true =>
             match Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr mem p)) with
-            | true => .valid
+            | true =>
+              match Nat.blt p.offsetBytes modSz with | true => .valid | false => .ub
             | false => .unsupported
         | _ => .ub
       | .tuple .nil | .fnDef _ _ =>

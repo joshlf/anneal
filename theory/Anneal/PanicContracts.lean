@@ -5948,12 +5948,16 @@ private theorem writeIntrinsicReturnWithProtectors_preserves_tables (s : Machine
     StepNodePreservesTables s.memory
       (writeIntrinsicReturnWithProtectors s bodyLocalDecls bodyLayouts locals'
         destination targetOpt retVal) := by
-  unfold writeIntrinsicReturnWithProtectors; try dsimp only
-  repeat' (first
-    | exact trivial
-    | exact ⟨rfl, rfl⟩
-    | (rename_i hF; exact foreignFrameDerefWrite_preserves_tables hF)
-    | split)
+  unfold writeIntrinsicReturnWithProtectors
+  cases targetOpt with
+  | none => exact trivial
+  | some targetBb =>
+    dsimp only
+    split
+    · exact trivial
+    · cases hW : writeReturnDestination locals' s.memory destination retVal bodyLocalDecls bodyLayouts with
+      | ok updL mem' => exact writeReturnDestination_preserves_tables hW
+      | ub | unsupported => exact trivial
 
 private theorem evalCoreMemPtrIntrinsicCall?_preserves_tables (kind : RustIntrinsicKind)
     (s : MachineState) (target : ResolvedCallTarget)

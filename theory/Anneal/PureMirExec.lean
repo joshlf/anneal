@@ -301,30 +301,12 @@ theorem writeIntrinsicReturnWithProtectors_isStmtNode
   | none => exact Or.inr (Or.inl ⟨.ub, rfl⟩)
   | some targetBb =>
     dsimp only
-    cases destination.projection with
-    | cons head rest =>
-      cases head with
-      | deref =>
-        dsimp only
-        repeat' (first
-          | exact Or.inl ⟨_, rfl⟩
-          | exact Or.inr (Or.inl ⟨_, rfl⟩)
-          | exact Or.inr (Or.inr rfl)
-          | split)
-      | _ =>
-        dsimp only
-        repeat' (first
-          | exact Or.inl ⟨_, rfl⟩
-          | exact Or.inr (Or.inl ⟨_, rfl⟩)
-          | exact Or.inr (Or.inr rfl)
-          | split)
-    | nil =>
-      dsimp only
-      repeat' (first
-        | exact Or.inl ⟨_, rfl⟩
-        | exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | exact Or.inr (Or.inr rfl)
-        | split)
+    split
+    · exact Or.inr (Or.inl ⟨.ub, rfl⟩)
+    · cases writeReturnDestination locals' s.memory destination retVal bodyLocalDecls bodyLayouts with
+      | ok _ _ => exact Or.inl ⟨_, rfl⟩
+      | ub => exact Or.inr (Or.inl ⟨.ub, rfl⟩)
+      | unsupported => exact Or.inr (Or.inr rfl)
 
 theorem writeIntrinsicReturnWithProtectors_none_eq_ub
     (s : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
@@ -705,6 +687,187 @@ theorem endpointBorrowsAfterWrite_congr_core {m₁ m₂ : Memory} (h : MemCoreEq
   unfold endpointBorrowsAfterWrite
   rw [h.1, h.2.2.2.2.2]
 
+private theorem writeReturnDestination_pushBaseStack_of_empty_or_nil
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (cl : List LocalSlot) (m : Memory) (dst : Place) (rv : Value)
+    (ld : List LocalDecl) (ly : LayoutTable)
+    (h_bor : baseStack = [] ∨ m.borrows = []) :
+    writeReturnDestination cl (Memory.pushBaseStack calleeBody baseStack m) dst rv ld ly =
+      FrameWriteResult.pushBaseStack calleeBody baseStack
+        (writeReturnDestination cl m dst rv ld ly) := by
+  rcases h_bor with rfl | h_nil
+  · rcases dst with ⟨dLoc, dProj⟩
+    cases dProj with
+    | nil =>
+      unfold writeReturnDestination
+      dsimp only [Memory.pushBaseStack, FrameWriteResult.pushBaseStack]
+      cases get? cl dLoc with
+      | none => rfl
+      | some sl =>
+        cases sl with
+        | dead => rfl
+        | uninit | init _ =>
+          dsimp only
+          cases hasProtectedWriteConflict m.borrows m.activeProtectors dLoc .none .nil 0 0 (length m.callStack) with
+          | true => rfl
+          | false =>
+            dsimp only
+            cases set? cl dLoc (.init rv) <;> rfl
+    | cons hd tl =>
+      have h_nd_nil : ∀ (hd : ProjectionElem), hd ≠ .deref → stripLeadingOpaqueCast (hd :: tl) ≠ [] →
+          writeReturnDestination cl (Memory.pushBaseStack calleeBody [] m) ⟨dLoc, hd :: tl⟩ rv ld ly =
+            FrameWriteResult.pushBaseStack calleeBody [] (writeReturnDestination cl m ⟨dLoc, hd :: tl⟩ rv ld ly) := by
+        intro hd h_nd h_nr
+        rw [writeReturnDestination_nonDeref cl (Memory.pushBaseStack calleeBody [] m) dLoc hd tl rv ld ly h_nd h_nr,
+            writeReturnDestination_nonDeref cl m dLoc hd tl rv ld ly h_nd h_nr]
+        dsimp only [Memory.pushBaseStack, FrameWriteResult.pushBaseStack]
+        cases hasProtectedWriteConflict m.borrows m.activeProtectors dLoc .none
+            (resolveBorrowWriteLocalProj (eraseLeadingOpaqueCastDecls ld ly dLoc (hd :: tl)) ly cl dLoc (hd :: tl))
+            0 0 (length m.callStack) with
+        | true => rfl
+        | false =>
+          dsimp only
+          split
+          · rfl
+          · rename_i rootVal _
+            cases writeProjectedForLocal cl (eraseLeadingOpaqueCastDecls ld ly dLoc (hd :: tl)) ly dLoc rootVal (hd :: tl) rv with
+            | ub => rfl
+            | unsupported => rfl
+            | ok rootVal' =>
+              dsimp only
+              cases set? cl dLoc (.init rootVal') <;> rfl
+      cases hd with
+      | deref =>
+        unfold writeReturnDestination
+        rw [Memory.pushBaseStack_borrows, Memory.pushBaseStack_nil_callStack,
+            Memory.pushBaseStack_activeProtectors]
+        cases evalPlaceWrite cl m.borrows ⟨dLoc, .deref :: tl⟩ rv m.activeProtectors ld ly m.callStack with
+        | unsupported => rfl
+        | ok updL =>
+          dsimp only
+          cases Bool.or (derefWriteTreeUB cl m.borrows ⟨dLoc, .deref :: tl⟩)
+              (derefWriteUnionProtectorUB ld ly cl m.borrows m.activeProtectors ⟨dLoc, .deref :: tl⟩ tl m.callStack) <;> rfl
+        | ub =>
+          dsimp only
+          exact foreignFrameDerefWrite_pushBaseStack calleeBody cl m ⟨dLoc, .deref :: tl⟩ tl rv ld ly
+      | opaqueCast castTy =>
+        cases h_s : stripLeadingOpaqueCast (.opaqueCast castTy :: tl) with
+        | nil =>
+          unfold writeReturnDestination
+          dsimp only at h_s ⊢; rw [h_s]
+          dsimp only [Memory.pushBaseStack, FrameWriteResult.pushBaseStack]
+          split
+          · rfl
+          · cases get? cl dLoc with
+            | none => rfl
+            | some sl =>
+              cases sl with
+              | dead => rfl
+              | uninit | init _ =>
+                dsimp only
+                cases hasProtectedWriteConflict m.borrows m.activeProtectors dLoc .none .nil 0 0 (length m.callStack) with
+                | true => rfl
+                | false =>
+                  dsimp only
+                  cases set? cl dLoc (.init rv) <;> rfl
+        | cons sh st =>
+          exact h_nd_nil (.opaqueCast castTy) (fun h => nomatch h) (by rw [h_s]; exact List.cons_ne_nil _ _)
+      | field fIdx fTy => exact h_nd_nil (.field fIdx fTy) (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | index idxLoc => exact h_nd_nil (.index idxLoc) (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | constantIndex off minLen fromEnd => exact h_nd_nil (.constantIndex off minLen fromEnd) (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | subslice from_ to_ fromEnd => exact h_nd_nil (.subslice from_ to_ fromEnd) (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | downcast dName vIdx => exact h_nd_nil (.downcast dName vIdx) (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | unwrapUnsafeBinder uTy => exact h_nd_nil (.unwrapUnsafeBinder uTy) (fun h => nomatch h) (List.cons_ne_nil _ _)
+  · rcases m with ⟨nA, gl, bor, nT, cal, tr, cs, ac, ap, nP, cloc, fp, ex, ru⟩
+    dsimp only at h_nil; subst h_nil
+    let m0 := Memory.mk nA gl [] nT cal tr cs ac ap nP cloc fp ex ru
+    have h_mp_bor : (Memory.pushBaseStack calleeBody baseStack m0).borrows = [] := by
+      cases baseStack <;> rfl
+    have h_hpc : ∀ p loc pr d, hasProtectedWriteConflict [] p loc none pr 0 0 d = false := by
+      intro p _ _ _; cases p <;> rfl
+    have h_icb : ∀ loc d, invalidateConflictingBorrows [] loc none d = [] := fun _ _ => rfl
+    have h_icbp : ∀ loc pr d, invalidateConflictingBorrowsAtProj [] loc none pr 0 0 d = [] := fun _ _ _ => rfl
+    have h_nonDeref : ∀ (dLoc : Local) (hd : ProjectionElem) (tl : List ProjectionElem),
+        hd ≠ .deref → stripLeadingOpaqueCast (hd :: tl) ≠ [] →
+        writeReturnDestination cl (Memory.pushBaseStack calleeBody baseStack m0) ⟨dLoc, hd :: tl⟩ rv ld ly =
+          FrameWriteResult.pushBaseStack calleeBody baseStack
+            (writeReturnDestination cl m0 ⟨dLoc, hd :: tl⟩ rv ld ly) := by
+      intro dLoc hd tl h_nd h_nr
+      rw [writeReturnDestination_nonDeref cl (Memory.pushBaseStack calleeBody baseStack m0) dLoc
+            hd tl rv ld ly h_nd h_nr,
+          writeReturnDestination_nonDeref cl m0 dLoc hd tl rv ld ly h_nd h_nr]
+      dsimp only [m0]; rw [h_mp_bor]; simp only [h_hpc, h_icbp]
+      split
+      · rfl
+      · rename_i rootVal _
+        cases writeProjectedForLocal cl (eraseLeadingOpaqueCastDecls ld ly dLoc (hd :: tl)) ly dLoc rootVal (hd :: tl) rv with
+        | ub => rfl
+        | unsupported => rfl
+        | ok rootVal' =>
+          dsimp only
+          cases set? cl dLoc (.init rootVal') with
+          | none => rfl
+          | some _ => cases baseStack <;> rfl
+    rcases dst with ⟨dLoc, dProj⟩
+    cases dProj with
+    | nil =>
+      unfold writeReturnDestination
+      dsimp only [m0]
+      rw [h_mp_bor]
+      simp only [h_hpc, h_icb]
+      cases get? cl dLoc with
+      | none => rfl
+      | some sl =>
+        cases sl with
+        | dead => rfl
+        | uninit | init _ =>
+          dsimp only
+          cases set? cl dLoc (.init rv) with
+          | none => rfl
+          | some _ => cases baseStack <;> rfl
+    | cons hd tl =>
+      cases hd with
+      | deref =>
+        unfold writeReturnDestination
+        dsimp only [m0]
+        rw [h_mp_bor]
+        simp only [evalPlaceWrite_deref_nil_borrows]
+        rw [foreignFrameDerefWrite_nil_borrows cl (Memory.pushBaseStack calleeBody baseStack m0)
+              ⟨dLoc, .deref :: tl⟩ tl rv h_mp_bor ld ly,
+            foreignFrameDerefWrite_nil_borrows cl m0 ⟨dLoc, .deref :: tl⟩ tl rv rfl ld ly]
+        rfl
+      | opaqueCast castTy =>
+        cases h_s : stripLeadingOpaqueCast (.opaqueCast castTy :: tl) with
+        | nil =>
+          unfold writeReturnDestination; dsimp only [m0] at h_s ⊢; rw [h_s, h_mp_bor]
+          simp only [h_hpc, h_icb]
+          split
+          · rfl
+          · cases get? cl dLoc with
+            | none => rfl
+            | some sl =>
+              cases sl with
+              | dead => rfl
+              | uninit | init _ =>
+                dsimp only
+                cases set? cl dLoc (.init rv) with
+                | none => rfl
+                | some _ => cases baseStack <;> rfl
+        | cons sh st =>
+          exact h_nonDeref dLoc (.opaqueCast castTy) tl (fun h => nomatch h) (by rw [h_s]; exact List.cons_ne_nil _ _)
+      | field fIdx fTy =>
+        exact h_nonDeref dLoc (.field fIdx fTy) tl (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | index idxLoc =>
+        exact h_nonDeref dLoc (.index idxLoc) tl (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | constantIndex off minLen fromEnd =>
+        exact h_nonDeref dLoc (.constantIndex off minLen fromEnd) tl (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | subslice from_ to_ fromEnd =>
+        exact h_nonDeref dLoc (.subslice from_ to_ fromEnd) tl (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | downcast dName vIdx =>
+        exact h_nonDeref dLoc (.downcast dName vIdx) tl (fun h => nomatch h) (List.cons_ne_nil _ _)
+      | unwrapUnsafeBinder uTy =>
+        exact h_nonDeref dLoc (.unwrapUnsafeBinder uTy) tl (fun h => nomatch h) (List.cons_ne_nil _ _)
+
 theorem writeIntrinsicReturnWithProtectors_pushBaseStack_of_noCallWP
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (ms : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
@@ -722,128 +885,49 @@ theorem writeIntrinsicReturnWithProtectors_pushBaseStack_of_noCallWP
       writeIntrinsicReturnWithProtectors (MachineState.pushBaseStack calleeBody baseStack ms)
           bodyLocalDecls bodyLayouts locals' destination (.some targetBb) retVal =
         MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
-  rcases destination with ⟨loc, proj⟩
-  cases proj with
-  | cons head rest =>
-    cases head with
-    | deref =>
-      unfold writeIntrinsicReturnWithProtectors at h_st ⊢
-      rcases h_bor with rfl | h_nil_bor
-      · dsimp only [MachineState.pushBaseStack] at h_st ⊢
-        rw [Memory.pushBaseStack_borrows, Memory.pushBaseStack_nil_callStack,
-            Memory.pushBaseStack_activeProtectors]
-        cases h_ep : evalPlaceWrite locals' ms.memory.borrows ⟨loc, .deref :: rest⟩ retVal
-            ms.memory.activeProtectors bodyLocalDecls bodyLayouts ms.memory.callStack with
-        | unsupported => rw [h_ep] at h_st; exact False.elim h_st
-        | ok updL =>
-          rw [h_ep] at h_st; dsimp only at h_st ⊢
-          cases h_tb : Bool.or (derefWriteTreeUB locals' ms.memory.borrows ⟨loc, .deref :: rest⟩)
-              (derefWriteUnionProtectorUB bodyLocalDecls bodyLayouts locals' ms.memory.borrows
-                ms.memory.activeProtectors ⟨loc, .deref :: rest⟩ rest ms.memory.callStack) with
-          | true => rw [h_tb] at h_st; exact False.elim h_st
-          | false =>
-            exact ⟨{ frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updL }
-                     memory := { ms.memory with
-                                 borrows := invalidateDerefWriteBorrowsWithLayouts bodyLocalDecls
-                                   bodyLayouts locals' ms.memory.borrows ⟨loc, .deref :: rest⟩
-                                   rest ms.memory.callStack } }, rfl, rfl⟩
-        | ub =>
-          rw [h_ep] at h_st; dsimp only at h_st ⊢
-          rw [foreignFrameDerefWrite_pushBaseStack calleeBody locals' ms.memory
-              ⟨loc, .deref :: rest⟩ rest retVal bodyLocalDecls bodyLayouts]
-          cases h_ff : foreignFrameDerefWrite locals' ms.memory ⟨loc, .deref :: rest⟩ rest retVal
-              bodyLocalDecls bodyLayouts with
-          | ub => rw [h_ff] at h_st; exact False.elim h_st
-          | unsupported => rw [h_ff] at h_st; exact False.elim h_st
-          | ok updL mem' =>
-            exact ⟨{ frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updL }
-                     memory := mem' }, rfl, rfl⟩
-      · dsimp only at h_st
-        rw [h_nil_bor, evalPlaceWrite_deref_nil_borrows] at h_st
-        dsimp only at h_st
-        rw [foreignFrameDerefWrite_nil_borrows locals' ms.memory ⟨loc, .deref :: rest⟩ rest retVal
-            h_nil_bor bodyLocalDecls bodyLayouts] at h_st
-        exact False.elim h_st
-    | _ =>
-      unfold writeIntrinsicReturnWithProtectors at h_st ⊢
-      rcases h_bor with rfl | h_nil_bor
-      · dsimp only [MachineState.pushBaseStack] at h_st ⊢
-        rw [Memory.pushBaseStack_borrows, Memory.pushBaseStack_nil_callStack,
-            Memory.pushBaseStack_activeProtectors]
-        cases h_wr : writePlaceValue locals' ms.memory.borrows ⟨loc, _ :: rest⟩ retVal
-            bodyLocalDecls bodyLayouts ms.memory.callStack with
-        | ub => rw [h_wr] at h_st; exact False.elim h_st
-        | unsupported => rw [h_wr] at h_st; exact False.elim h_st
-        | ok updL =>
-          rw [h_wr] at h_st; dsimp only at h_st ⊢
-          cases h_p : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors
-              loc .none (resolveBorrowWriteLocalProj bodyLocalDecls bodyLayouts locals' loc (_ :: rest))
-              0 0 (length ms.memory.callStack) with
-          | true => rw [h_p] at h_st; exact False.elim h_st
-          | false => exact ⟨_, rfl, rfl⟩
-      · dsimp only [MachineState.pushBaseStack] at h_st ⊢
-        rw [Memory.pushBaseStack_borrows]
-        rw [h_nil_bor] at h_st ⊢
-        rw [writePlaceValue_nil_borrows_callStack locals' ⟨loc, _ :: rest⟩ retVal
-            bodyLocalDecls bodyLayouts ms.memory.callStack] at h_st ⊢
-        rw [writePlaceValue_nil_borrows_callStack locals' ⟨loc, _ :: rest⟩ retVal
-            bodyLocalDecls bodyLayouts (Memory.pushBaseStack calleeBody baseStack ms.memory).callStack]
-        cases h_wr : writePlaceValue locals' [] ⟨loc, _ :: rest⟩ retVal bodyLocalDecls bodyLayouts [] with
-        | ub => rw [h_wr] at h_st; exact False.elim h_st
-        | unsupported => rw [h_wr] at h_st; exact False.elim h_st
-        | ok updL =>
-          rw [h_wr] at h_st; dsimp only [hasProtectedWriteConflict] at h_st ⊢
-          cases resolveBorrowWriteLocalProj bodyLocalDecls bodyLayouts locals' loc (_ :: rest) with
-          | nil =>
-            dsimp only [invalidateConflictingBorrows]
-            refine ⟨{ frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updL }
-                      memory := { ms.memory with borrows := [] } }, rfl, ?_⟩
-            rcases baseStack with _ | ⟨_, _⟩ <;> simp [Memory.pushBaseStack, h_nil_bor]
-          | cons _ _ =>
-            dsimp only [invalidateConflictingBorrowsAtProj]
-            refine ⟨{ frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updL }
-                      memory := { ms.memory with borrows := [] } }, rfl, ?_⟩
-            rcases baseStack with _ | ⟨_, _⟩ <;> simp [Memory.pushBaseStack, h_nil_bor]
+  unfold writeIntrinsicReturnWithProtectors at h_st ⊢
+  dsimp only [MachineState.pushBaseStack] at h_st ⊢
+  have h_wr := writeReturnDestination_pushBaseStack_of_empty_or_nil calleeBody baseStack locals'
+      ms.memory destination retVal bodyLocalDecls bodyLayouts h_bor
+  have h_main :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (match writeReturnDestination locals' ms.memory destination retVal bodyLocalDecls bodyLayouts with
+         | .ok updatedLocals mem' =>
+           MirStepNode.step { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }, memory := mem' }
+         | .ub => MirStepNode.fail .ub
+         | .unsupported => MirStepNode.unsupported) →
+      ∃ nextSt : MachineState,
+        (match writeReturnDestination locals' ms.memory destination retVal bodyLocalDecls bodyLayouts with
+         | .ok updatedLocals mem' =>
+           MirStepNode.step { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }, memory := mem' }
+         | .ub => MirStepNode.fail .ub
+         | .unsupported => MirStepNode.unsupported) = MirStepNode.step nextSt ∧
+        (match writeReturnDestination locals' (Memory.pushBaseStack calleeBody baseStack ms.memory)
+            destination retVal bodyLocalDecls bodyLayouts with
+         | .ok updatedLocals mem' =>
+           MirStepNode.step { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }, memory := mem' }
+         | .ub => MirStepNode.fail .ub
+         | .unsupported => MirStepNode.unsupported) =
+          MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+    intro h_st'
+    rw [h_wr]
+    cases hW : writeReturnDestination locals' ms.memory destination retVal bodyLocalDecls bodyLayouts with
+    | ub => rw [hW] at h_st'; exact False.elim h_st'
+    | unsupported => rw [hW] at h_st'; exact False.elim h_st'
+    | ok updL mem' =>
+      exact ⟨{ frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updL }
+               memory := mem' }, rfl, rfl⟩
+  rcases destination with ⟨dLoc, dProj⟩
+  cases dProj with
+  | cons _ _ => exact h_main h_st
   | nil =>
-    unfold writeIntrinsicReturnWithProtectors at h_st ⊢
-    rcases h_bor with rfl | h_nil_bor
-    · dsimp only [MachineState.pushBaseStack] at h_st ⊢
-      rw [Memory.pushBaseStack_borrows, Memory.pushBaseStack_nil_callStack,
-          Memory.pushBaseStack_activeProtectors]
-      cases h_wr : writePlaceValue locals' ms.memory.borrows ⟨loc, []⟩ retVal
-          bodyLocalDecls bodyLayouts ms.memory.callStack with
-      | ub => rw [h_wr] at h_st; exact False.elim h_st
-      | unsupported => rw [h_wr] at h_st; exact False.elim h_st
-      | ok updL =>
-        rw [h_wr] at h_st; dsimp only at h_st ⊢
-        cases h_p : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors
-            loc .none (resolveBorrowWriteLocalProj bodyLocalDecls bodyLayouts locals' loc [])
-            0 0 (length ms.memory.callStack) with
-        | true => rw [h_p] at h_st; exact False.elim h_st
-        | false => exact ⟨_, rfl, rfl⟩
-    · dsimp only [MachineState.pushBaseStack] at h_st ⊢
-      rw [Memory.pushBaseStack_borrows]
-      rw [h_nil_bor] at h_st ⊢
-      rw [writePlaceValue_nil_borrows_callStack locals' ⟨loc, []⟩ retVal
-          bodyLocalDecls bodyLayouts ms.memory.callStack] at h_st ⊢
-      rw [writePlaceValue_nil_borrows_callStack locals' ⟨loc, []⟩ retVal
-          bodyLocalDecls bodyLayouts (Memory.pushBaseStack calleeBody baseStack ms.memory).callStack]
-      cases h_wr : writePlaceValue locals' [] ⟨loc, []⟩ retVal bodyLocalDecls bodyLayouts [] with
-      | ub => rw [h_wr] at h_st; exact False.elim h_st
-      | unsupported => rw [h_wr] at h_st; exact False.elim h_st
-      | ok updL =>
-        rw [h_wr] at h_st; dsimp only [hasProtectedWriteConflict] at h_st ⊢
-        cases resolveBorrowWriteLocalProj bodyLocalDecls bodyLayouts locals' loc [] with
-        | nil =>
-          dsimp only [invalidateConflictingBorrows]
-          refine ⟨{ frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updL }
-                    memory := { ms.memory with borrows := [] } }, rfl, ?_⟩
-          rcases baseStack with _ | ⟨_, _⟩ <;> simp [Memory.pushBaseStack, h_nil_bor]
-        | cons _ _ =>
-          dsimp only [invalidateConflictingBorrowsAtProj]
-          refine ⟨{ frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updL }
-                    memory := { ms.memory with borrows := [] } }, rfl, ?_⟩
-          rcases baseStack with _ | ⟨_, _⟩ <;> simp [Memory.pushBaseStack, h_nil_bor]
+    cases bodyLocalDecls with
+    | nil => exact h_main h_st
+    | cons _ _ =>
+      dsimp only at h_st ⊢
+      cases h_v : validateValueForTy? bodyLayouts (placeTy (_ :: _) bodyLayouts ⟨dLoc, []⟩) retVal with
+      | false => rw [h_v] at h_st; exact False.elim h_st
+      | true => rw [h_v] at h_st; exact h_main h_st
 
 private theorem resolveLiveMemEndpoint_borrows_nil
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -1291,34 +1375,12 @@ private theorem writeIntrinsicReturnWithProtectors_pushBaseStack_nil
   cases targetOpt with
   | none => rfl
   | some targetBb =>
-    rcases destination with ⟨loc, proj⟩
-    cases proj with
-    | nil =>
-      dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-      repeat' (first | rfl | split)
-    | cons head rest =>
-      cases head with
-      | deref =>
-        dsimp only [MachineState.pushBaseStack]
-        rw [Memory.pushBaseStack_borrows, Memory.pushBaseStack_nil_callStack,
-            Memory.pushBaseStack_activeProtectors,
-            foreignFrameDerefWrite_pushBaseStack calleeBody locals' ms.memory
-              ⟨loc, .deref :: rest⟩ rest retVal bodyLocalDecls bodyLayouts]
-        cases evalPlaceWrite locals' ms.memory.borrows ⟨loc, .deref :: rest⟩ retVal
-            ms.memory.activeProtectors bodyLocalDecls bodyLayouts ms.memory.callStack with
-        | unsupported => rfl
-        | ok updL =>
-          dsimp only
-          cases Bool.or (derefWriteTreeUB locals' ms.memory.borrows ⟨loc, .deref :: rest⟩)
-              (derefWriteUnionProtectorUB bodyLocalDecls bodyLayouts locals' ms.memory.borrows
-                ms.memory.activeProtectors ⟨loc, .deref :: rest⟩ rest ms.memory.callStack) <;> rfl
-        | ub =>
-          dsimp only
-          cases foreignFrameDerefWrite locals' ms.memory ⟨loc, .deref :: rest⟩ rest retVal
-              bodyLocalDecls bodyLayouts <;> rfl
-      | _ =>
-        dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-        repeat' (first | rfl | split)
+    dsimp only [MachineState.pushBaseStack]
+    split
+    · rfl
+    · rw [writeReturnDestination_pushBaseStack_of_empty_or_nil calleeBody [] locals'
+          ms.memory destination retVal bodyLocalDecls bodyLayouts (Or.inl rfl)]
+      cases writeReturnDestination locals' ms.memory destination retVal bodyLocalDecls bodyLayouts <;> rfl
 
 /--
 Unified structural & relational characterization of the 8 core memory & pointer
@@ -1910,11 +1972,24 @@ private theorem evalTypedSwapNonOverlappingCall_rel
                                 | unsupported => exact .unsupported
                                 | ok xEp =>
                                   dsimp only
-                                  cases endpointAccessCheck xEp elemSize with
-                                  | ub => exact .fail .ub
-                                  | unsupported => exact .unsupported
-                                  | ok _ =>
+                                  cases Nat.ble (Nat.add xEp.effOff elemSize) xEp.allocSize with
+                                  | false => exact .fail .ub
+                                  | true =>
                                     dsimp only
+                                    have h_wGuard : ∀ (o : Option CapturedAllocation) (n₁ n₂ : MirStepNode),
+                                        CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt n₁ n₂ →
+                                        CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt
+                                          (match (match o with | .some g => (match g.mutability with | .mut => true | .not => false) | .none => true) with
+                                           | false => MirStepNode.fail .ub
+                                           | true => n₁)
+                                          (match (match o with | .some g => (match g.mutability with | .mut => true | .not => false) | .none => true) with
+                                           | false => MirStepNode.fail .ub
+                                           | true => n₂) := by
+                                      intro o n₁ n₂ hn
+                                      cases o with
+                                      | none => exact hn
+                                      | some g => cases hgm : g.mutability <;> simp only [hgm] <;> first | exact .fail .ub | exact hn
+                                    apply h_wGuard xEp.globalAlloc?
                                     rcases h_ep ms.memory locals' yPtr h_P0 with ⟨h_epy0, _⟩
                                     rw [h_epy0]
                                     cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts yPtr with
@@ -1922,16 +1997,24 @@ private theorem evalTypedSwapNonOverlappingCall_rel
                                     | unsupported => exact .unsupported
                                     | ok yEp0 =>
                                       dsimp only
-                                      cases endpointAccessCheck yEp0 elemSize with
-                                      | ub => exact .fail .ub
-                                      | unsupported => exact .unsupported
-                                      | ok _ =>
+                                      cases Nat.ble (Nat.add yEp0.effOff elemSize) yEp0.allocSize with
+                                      | false => exact .fail .ub
+                                      | true =>
                                         dsimp only
+                                        apply h_wGuard yEp0.globalAlloc?
                                         cases Bool.and (AllocKey.beq xEp.allocKey yEp0.allocKey)
                                             (Bool.not (rangesDisjoint xEp.effOff elemSize yEp0.effOff elemSize)) with
                                         | true => exact .fail .ub
                                         | false =>
                                           dsimp only
+                                          have h_acGuard : ∀ (ep : ResolvedMemEndpoint) (n₁ n₂ : MirStepNode),
+                                              CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt n₁ n₂ →
+                                              CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt
+                                                (match endpointAccessCheck ep elemSize with | .ub => MirStepNode.fail .ub | .unsupported => MirStepNode.unsupported | .ok () => n₁)
+                                                (match endpointAccessCheck ep elemSize with | .ub => MirStepNode.fail .ub | .unsupported => MirStepNode.unsupported | .ok () => n₂) := by
+                                            intro ep n₁ n₂ hn
+                                            cases endpointAccessCheck ep elemSize with | ub => exact .fail .ub | unsupported => exact .unsupported | ok _ => exact hn
+                                          apply h_acGuard xEp; apply h_acGuard yEp0
                                           rw [readRootAbstractBytes_congr h_bgf0]
                                           cases readRootAbstractBytes ms.memory xEp with
                                           | none => exact .unsupported
@@ -5886,46 +5969,12 @@ private theorem writeIntrinsicReturnWithProtectors_stmtStepBorrowsNeNil
   | none => exact sn_fail
   | some targetBb =>
     dsimp only
-    rcases destination with ⟨loc, proj⟩
-    cases proj with
-    | nil =>
-      dsimp only
-      repeat' (first
-        | exact sn_fail | exact sn_unsup
-        | exact sn_step (invalidateConflictingBorrows_ne_nil h_ne)
-        | exact sn_step (invalidateConflictingBorrowsAtProj_ne_nil h_ne)
-        | split)
-    | cons head rest =>
-      cases head with
-      | deref =>
-        dsimp only
-        cases evalPlaceWrite locals' ms.memory.borrows ⟨loc, .deref :: rest⟩ retVal
-            ms.memory.activeProtectors bodyLocalDecls bodyLayouts ms.memory.callStack with
-        | unsupported => exact sn_unsup
-        | ok updL =>
-          dsimp only
-          cases Bool.or (derefWriteTreeUB locals' ms.memory.borrows ⟨loc, .deref :: rest⟩)
-              (derefWriteUnionProtectorUB bodyLocalDecls bodyLayouts locals' ms.memory.borrows
-                ms.memory.activeProtectors ⟨loc, .deref :: rest⟩ rest ms.memory.callStack) with
-          | true => exact sn_fail
-          | false => exact sn_step (invalidateDerefWriteBorrowsWithLayouts_ne_nil h_ne)
-        | ub =>
-          dsimp only
-          have h_fw := foreignFrameDerefWrite_ne_nil
-            (l1 := locals') (m1 := ms.memory) (dst := ⟨loc, .deref :: rest⟩)
-            (rp := rest) (val := retVal) (ld := bodyLocalDecls) (ly := bodyLayouts) h_ne
-          cases h_ff : foreignFrameDerefWrite locals' ms.memory ⟨loc, .deref :: rest⟩ rest retVal
-              bodyLocalDecls bodyLayouts with
-          | ub => exact sn_fail
-          | unsupported => exact sn_unsup
-          | ok updL mem' => exact sn_step (h_fw updL mem' h_ff)
-      | _ =>
-        dsimp only
-        repeat' (first
-          | exact sn_fail | exact sn_unsup
-          | exact sn_step (invalidateConflictingBorrows_ne_nil h_ne)
-          | exact sn_step (invalidateConflictingBorrowsAtProj_ne_nil h_ne)
-          | split)
+    split
+    · exact sn_fail
+    · cases hW : writeReturnDestination locals' ms.memory destination retVal bodyLocalDecls bodyLayouts with
+      | ub => exact sn_fail
+      | unsupported => exact sn_unsup
+      | ok updL mem' => exact sn_step (writeReturnDestination_borrows_ne_nil h_ne hW)
 
 private theorem intrinsicMissingPointeeStep_stmtStepBorrowsNeNil
     (ld : List LocalDecl) (ly : LayoutTable) (argOps : List Operand) :

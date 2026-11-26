@@ -12454,6 +12454,25 @@ private theorem evalCopyMemory_callerBodies
     | (have hcb := commitRootAbstractBytes_callerBodies hok; exact hcb)
     | ((try dsimp only at hok); split at hok))
 
+private theorem writeReturnDestination_withCalleeCtx_early (c : CalleeEnv) (ac : Option CapturedMir)
+    (ti : List TraitImplEntry) (callerLocals : List LocalSlot) (mem : Memory) (dst : Place)
+    (retVal : Value) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    writeReturnDestination callerLocals (Memory.withCalleeCtx c ac ti mem) dst retVal localDecls
+        layouts =
+      FrameWriteResult.mapMem (Memory.withCalleeCtx c ac ti)
+        (writeReturnDestination callerLocals mem dst retVal localDecls layouts) := by
+  unfold writeReturnDestination
+  dsimp only [Memory.withCalleeCtx]
+  repeat' (first | rfl | split)
+  all_goals (
+    try simp only [foreignFrameDerefWrite_withCalleeCtx'] at *
+    try simp only [*, FrameWriteResult.mapMem] at *
+    try (simp at *; done)
+    try (simp only [FrameWriteResult.ok.injEq] at *
+         obtain ⟨h₁, h₂⟩ := ‹_ ∧ _›
+         subst_vars
+         rfl))
+
 private theorem writeIntrinsicReturnWithProtectors_stepCtxCB
     (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
@@ -12468,21 +12487,15 @@ private theorem writeIntrinsicReturnWithProtectors_stepCtxCB
   cases targetOpt with
   | none => exact stepCtxCB_fail
   | some targetBb =>
-    dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
-    repeat' (first
-      | with_reducible (first
-        | exact stepCtxCB_fail | exact stepCtxCB_unsupported
-        | exact stepCtxCB_mk rfl (CallerBodiesEq.refl _))
-      | split)
-    all_goals (
-      simp only [foreignFrameDerefWrite_withCalleeCtx'] at *
-      simp only [*, FrameWriteResult.mapMem] at *
-      first
-      | (simp at *; done)
-      | (simp only [FrameWriteResult.ok.injEq] at *
-         obtain ⟨h₁, h₂⟩ := ‹_ ∧ _›
-         subst_vars
-         exact stepCtxCB_mk rfl (cb_of_foreignFrameDerefWrite (by assumption) (by rfl))))
+    dsimp only [MachineState.mapMem]
+    split
+    · exact stepCtxCB_fail
+    · rw [writeReturnDestination_withCalleeCtx_early]
+      cases hW : writeReturnDestination locals' s.memory destination retVal bodyLocalDecls bodyLayouts with
+      | ub => exact stepCtxCB_fail
+      | unsupported => exact stepCtxCB_unsupported
+      | ok updL mem' =>
+        exact stepCtxCB_mk rfl (writeReturnDestination_callerBodies hW)
 
 private theorem writeIntrinsicReturnWithProtectors_withCalleeCtx
     (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)

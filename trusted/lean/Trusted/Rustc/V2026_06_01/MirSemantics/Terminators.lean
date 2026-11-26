@@ -4232,14 +4232,17 @@ intrinsics:
 - A diverging call (`targetOpt = .none`) to a returning intrinsic faults with
   `MirStepNode.fail .ub` once the intrinsic itself has completed without
   faulting or hitting `.unsupported`.
-- A `.deref :: restProj` destination forwards `bodyLocalDecls` and
-  `bodyLayouts` through `evalPlaceWrite`, enforces BOTH `derefWriteTreeUB` and
-  `derefWriteUnionProtectorUB`, invalidates borrows via
-  `invalidateDerefWriteBorrowsWithLayouts`, and handles suspended caller frames
-  via `foreignFrameDerefWrite`.
-- A direct (non-deref) destination checks `hasProtectedWriteConflict` against
-  active function-entry protectors before invalidating borrows with the
-  union-truncated projection `resolveBorrowWriteLocalProj`.
+- On `targetOpt = .some targetBb`, validates `retVal` against `destination`'s
+  declared type for bare whole-local writes (`destination.projection = .nil`
+  when `bodyLocalDecls` is non-empty) and delegates to `writeReturnDestination`,
+  giving exact parity with normal `TerminatorKind.return_` call-return writes:
+  `.deref` writes with `bodyLocalDecls`/`bodyLayouts`, `derefWriteTreeUB`,
+  `derefWriteUnionProtectorUB`, `invalidateDerefWriteBorrowsWithLayouts`, and
+  `foreignFrameDerefWrite`; pure `.opaqueCast` whole-local writes; and
+  projected direct writes including field-by-field initialization of `.uninit`
+  locals (`uninitFieldWriteShell?`), nested field shells,
+  `eraseLeadingOpaqueCastDecls`, `hasProtectedWriteConflict`, and
+  union-truncated `resolveBorrowWriteLocalProj` borrow invalidation.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -4268,136 +4271,33 @@ def writeIntrinsicReturnWithProtectors
   match targetOpt with
   | .none => MirStepNode.fail .ub
   | .some targetBb =>
-    match destination.projection with
-    | .deref :: restProj =>
+    let nilTyValid : Bool :=
+      match destination.projection, bodyLocalDecls with
+      | .nil, _ :: _ =>
+        validateValueForTy? bodyLayouts (placeTy bodyLocalDecls bodyLayouts destination) retVal
+      | _, _ => true
+    match nilTyValid with
+    | false => MirStepNode.fail .ub
+    | true =>
       match
-        evalPlaceWrite
+        writeReturnDestination
           locals'
-          s.memory.borrows
-          destination
-          retVal
-          s.memory.activeProtectors
-          bodyLocalDecls
-          bodyLayouts
-          s.memory.callStack
-      with
-      | .ok updatedLocals =>
-        match
-          Bool.or
-            (derefWriteTreeUB locals' s.memory.borrows destination)
-            (derefWriteUnionProtectorUB
-              bodyLocalDecls
-              bodyLayouts
-              locals'
-              s.memory.borrows
-              s.memory.activeProtectors
-              destination
-              restProj
-              s.memory.callStack)
-        with
-        | true => MirStepNode.fail .ub
-        | false =>
-          let borrows' :=
-            invalidateDerefWriteBorrowsWithLayouts
-              bodyLocalDecls
-              bodyLayouts
-              locals'
-              s.memory.borrows
-              destination
-              restProj
-              s.memory.callStack
-          MirStepNode.step {
-            frame := {
-              s.frame with
-              blockIdx := targetBb
-              stmtIdx := 0
-              locals := updatedLocals
-            }
-            memory := { s.memory with borrows := borrows' }
-          }
-      | .ub =>
-        match
-          foreignFrameDerefWrite
-            locals'
-            s.memory
-            destination
-            restProj
-            retVal
-            bodyLocalDecls
-            bodyLayouts
-        with
-        | .ok updatedLocals mem' =>
-          MirStepNode.step {
-            frame := {
-              s.frame with
-              blockIdx := targetBb
-              stmtIdx := 0
-              locals := updatedLocals
-            }
-            memory := mem'
-          }
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
-      | .unsupported => MirStepNode.unsupported
-    | _ =>
-      match
-        writePlaceValue
-          locals'
-          s.memory.borrows
+          s.memory
           destination
           retVal
           bodyLocalDecls
           bodyLayouts
-          s.memory.callStack
       with
-      | .ok updatedLocals =>
-        let depth := length s.memory.callStack
-        let resolvedProj :=
-          resolveBorrowWriteLocalProj
-            bodyLocalDecls
-            bodyLayouts
-            locals'
-            destination.local_
-            destination.projection
-        match
-          hasProtectedWriteConflict
-            s.memory.borrows
-            s.memory.activeProtectors
-            destination.local_
-            .none
-            resolvedProj
-            0
-            0
-            depth
-        with
-        | true => MirStepNode.fail .ub
-        | false =>
-          let borrows' :=
-            match resolvedProj with
-            | .nil =>
-              invalidateConflictingBorrows
-                s.memory.borrows
-                destination.local_
-                .none
-                depth
-            | pHead :: pTail =>
-              invalidateConflictingBorrowsAtProj
-                s.memory.borrows
-                destination.local_
-                .none
-                (pHead :: pTail)
-                0
-                0
-                depth
-          MirStepNode.step {
-            frame := {
-              s.frame with
-              blockIdx := targetBb
-              stmtIdx := 0
-              locals := updatedLocals
-            }
-            memory := { s.memory with borrows := borrows' }
+      | .ok updatedLocals mem' =>
+        MirStepNode.step {
+          frame := {
+            s.frame with
+            blockIdx := targetBb
+            stmtIdx := 0
+            locals := updatedLocals
           }
+          memory := mem'
+        }
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
 
@@ -5090,28 +4990,49 @@ def evalTypedSwapNonOverlappingCall
                         | .ub => MirStepNode.fail .ub
                         | .unsupported => MirStepNode.unsupported
                         | .ok xEp =>
-                          match endpointAccessCheck xEp elemSize with
-                          | .ub => MirStepNode.fail .ub
-                          | .unsupported => MirStepNode.unsupported
-                          | .ok () =>
-                            match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts yPtr with
-                            | .ub => MirStepNode.fail .ub
-                            | .unsupported => MirStepNode.unsupported
-                            | .ok yEp0 =>
-                              match endpointAccessCheck yEp0 elemSize with
+                          match Nat.ble (Nat.add xEp.effOff elemSize) xEp.allocSize with
+                          | false => MirStepNode.fail .ub
+                          | true =>
+                            let xWritable : Bool :=
+                              match xEp.globalAlloc? with
+                              | .some g => match g.mutability with | .mut => true | .not => false
+                              | .none => true
+                            match xWritable with
+                            | false => MirStepNode.fail .ub
+                            | true =>
+                              match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts yPtr with
                               | .ub => MirStepNode.fail .ub
                               | .unsupported => MirStepNode.unsupported
-                              | .ok () =>
-                                let sameAlloc := AllocKey.beq xEp.allocKey yEp0.allocKey
-                                match
-                                  Bool.and sameAlloc
-                                    (Bool.not
-                                      (rangesDisjoint
-                                        xEp.effOff elemSize yEp0.effOff elemSize))
-                                with
-                                | true => MirStepNode.fail .ub
-                                | false =>
-                                  match readRootAbstractBytes s.memory xEp with
+                              | .ok yEp0 =>
+                                match Nat.ble (Nat.add yEp0.effOff elemSize) yEp0.allocSize with
+                                | false => MirStepNode.fail .ub
+                                | true =>
+                                  let yWritable : Bool :=
+                                    match yEp0.globalAlloc? with
+                                    | .some g =>
+                                      match g.mutability with | .mut => true | .not => false
+                                    | .none => true
+                                  match yWritable with
+                                  | false => MirStepNode.fail .ub
+                                  | true =>
+                                    let sameAlloc := AllocKey.beq xEp.allocKey yEp0.allocKey
+                                    match
+                                      Bool.and sameAlloc
+                                        (Bool.not
+                                          (rangesDisjoint
+                                            xEp.effOff elemSize yEp0.effOff elemSize))
+                                    with
+                                    | true => MirStepNode.fail .ub
+                                    | false =>
+                                      match endpointAccessCheck xEp elemSize with
+                                      | .ub => MirStepNode.fail .ub
+                                      | .unsupported => MirStepNode.unsupported
+                                      | .ok () =>
+                                        match endpointAccessCheck yEp0 elemSize with
+                                        | .ub => MirStepNode.fail .ub
+                                        | .unsupported => MirStepNode.unsupported
+                                        | .ok () =>
+                                          match readRootAbstractBytes s.memory xEp with
                                   | .none => MirStepNode.unsupported
                                   | .some xRootBytes =>
                                     match sliceAbstractBytes xRootBytes xEp.effOff elemSize with
@@ -5345,9 +5266,15 @@ for `core::intrinsics::ptr_offset_from` / `ptr_offset_from_unsigned`:
 - Non-zero distance requires both pointers to derive from the same live
   allocation with both offsets in `[0, allocSize]` (including one-past-end),
   independent of Tree Borrows permissions (`DIV-LM-D6-OFFSET-DISABLED-TAG`).
-- Distinct dead tags of the same root local fault `.ub` when their known
-  effective offsets differ, and fail closed `.unsupported` when equal or
-  unknown (storage generation is not recorded).
+- Distinct dead tags of the same root local with empty (or transparent-only)
+  projections fault `.ub` when their pointer offsets differ mod `2^W`, and fail
+  closed `.unsupported` when equal (storage generation is not recorded). Dead
+  tags carrying non-empty projections ALWAYS fail closed `.unsupported` without
+  calling `borrowPlaceByteOffset?`: after a frame pop or tail call, the same
+  `(targetFrameDepth, targetLocal)` may name an unrelated local of a later
+  callee (e.g. a tuple where the dead frame held a union), so reading current
+  declarations could fabricate distinct field offsets and falsely report `.ub`
+  on equal-address dangling pointers.
 - Provenance tags are resolved in `s.memory.borrows` BEFORE `AllocId`s are
   resolved in `s.memory.globals` (matching `resolveLiveMemEndpoint` and
   `Places.ptrAddress?`), because stack tags and captured global `AllocId`s share
@@ -5421,15 +5348,12 @@ def resolvePtrOffsetFromOffsets
                 | true => .ub
                 | false =>
                   match
-                    borrowPlaceByteOffset?
-                      locals s.memory.callerLocals bodyLocalDecls bodyLayouts e1 s.memory.callStack,
-                    borrowPlaceByteOffset?
-                      locals s.memory.callerLocals bodyLocalDecls bodyLayouts e2 s.memory.callStack
+                    stripTransparentProjections e1.targetProjection,
+                    stripTransparentProjections e2.targetProjection
                   with
-                  | .some po1, .some po2 =>
-                    let eff1 := Nat.add po1 p1.offsetBytes
-                    let eff2 := Nat.add po2 p2.offsetBytes
-                    match Nat.beq eff1 eff2 with
+                  | .nil, .nil =>
+                    let modW := scalarModulus ptrBytes
+                    match Nat.beq (Nat.mod p1.offsetBytes modW) (Nat.mod p2.offsetBytes modW) with
                     | false => .ub
                     | true => .unsupported
                   | _, _ => .unsupported
