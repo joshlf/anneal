@@ -2298,13 +2298,59 @@ theorem cm_miri_compareBytes_cmHooks_universal (ld : List LocalDecl) (ly : Layou
     lSc rSc (.fromScalarInt (.ofUInt64 count)) lPtr rPtr count lBytes rBytes
     rfl rfl hPtrL rfl rfl hPtrR rfl rfl (cm_miri_ofUInt64_toTargetUsize count) hRdL hRdR
 
+/-- **Trusted `raw_eq` comparator = Boolean list equality**: Trusted's
+`listByteEq` (used by `evalRawEqCall` to compute `eqBit`) is exactly `==` on
+`List UInt8`, for ALL byte lists (including unequal lengths). -/
+theorem cm_listByteEq_eq_beq (l r : List UInt8) : listByteEq l r = (l == r) := by
+  induction l generalizing r with
+  | nil => cases r <;> rfl
+  | cons a as ih =>
+    cases r with
+    | nil => rfl
+    | cons b bs =>
+      have hUnf : listByteEq (a :: as) (b :: bs) =
+          (match Nat.beq a.toBitVec.toNat b.toBitVec.toNat with
+           | true => listByteEq as bs
+           | false => false) := rfl
+      rw [hUnf, List.cons_beq_cons, ih bs]
+      by_cases hab : a = b
+      · subst hab
+        simp [Nat.beq_refl]
+      · have hne : Nat.beq a.toBitVec.toNat b.toBitVec.toNat = false := by
+          cases h : Nat.beq a.toBitVec.toNat b.toBitVec.toNat with
+          | false => rfl
+          | true =>
+            exact absurd (UInt8.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq (Nat.eq_of_beq_eq_true h))) hab
+        rw [hne]
+        simp [hab]
+
+/-- **Universal vendored ↔ Trusted `raw_eq` verdict**: the vendored
+`Intrinsics.rawEq` result `lBytes == rBytes` (`Intrinsics.lean:197`) equals
+Trusted `listByteEq` on the same byte images, for ALL byte arrays. -/
+theorem cm_rawEq_vendored_eq_trusted_listByteEq (lBytes rBytes : Array UInt8) :
+    (lBytes == rBytes) = listByteEq lBytes.toList rBytes.toList := by
+  rw [cm_listByteEq_eq_beq]
+  cases hEq : (lBytes == rBytes) with
+  | true =>
+    have hArr : lBytes = rBytes := eq_of_beq hEq
+    subst hArr
+    simp
+  | false =>
+    symm
+    apply beq_false_of_ne
+    intro hList
+    have hArr : lBytes = rBytes := Array.ext' hList
+    subst hArr
+    simp at hEq
+
 /-- **Concrete `cmIntrinsicHooks`-instantiated `raw_eq` universal Trusted ↔
 vendored correspondence**: for ALL `ld`, `ly`, `tb`, `tyArg`, sized pointee
 type `ptTy`, aligned pointers `lPtr`/`rPtr` whose `cmReadBytesStripProvenance tb`
 reads `lBytes`/`rBytes`, unmodified vendored
 `Miri.Interpreter.Intrinsics.rawEq (cmIntrinsicHooks ld ly tb tyArg) ()` returns
-`lBytes == rBytes`, which equals Trusted's initialized bytewise equality
-`lBytes.toList.map some == rBytes.toList.map some`. -/
+`lBytes == rBytes`, which equals the EXACT Trusted `raw_eq` byte comparator
+`Trusted.Rustc.V2026_06_01.MirSemantics.listByteEq` (the `eqBit` source of
+`evalRawEqCall`) on the same stripped byte images. -/
 theorem cm_miri_rawEq_cmHooks_universal (ld : List LocalDecl) (ly : LayoutTable)
     (tb : Bool) (tyArg : Miri.MIR.TyId)
     (lSc rSc : Miri.Memory.Scalar AnnealProv) (lPtr rPtr : Miri.Memory.Pointer (Option AnnealProv))
@@ -2323,34 +2369,13 @@ theorem cm_miri_rawEq_cmHooks_universal (ld : List LocalDecl) (ly : LayoutTable)
     Miri.Interpreter.Intrinsics.rawEq (cmIntrinsicHooks ld ly tb tyArg) ()
       ⟨.immediate (.scalar lSc), lLay⟩ ⟨.immediate (.scalar rSc), rLay⟩ st0 =
       .ok (lBytes == rBytes) st2 ∧
-    (lBytes == rBytes) = (lBytes.toList.map Option.some == rBytes.toList.map Option.some) := by
-  refine ⟨?_, ?_⟩
+    (lBytes == rBytes) = listByteEq lBytes.toList rBytes.toList := by
+  refine ⟨?_, cm_rawEq_vendored_eq_trusted_listByteEq lBytes rBytes⟩
   · exact cm_miri_rawEq_eval_universal (cmIntrinsicHooks ld ly tb tyArg) ()
       ⟨.immediate (.scalar lSc), lLay⟩ ⟨.immediate (.scalar rSc), rLay⟩
       st0 st0 st0 st0 st0 st1 st1 st1 st2 ptTy ptLay
       ⟨.scalar lSc, lLay⟩ ⟨.scalar rSc, rLay⟩ lSc rSc lPtr rPtr lBytes rBytes
       hPt hLay hSized rfl rfl hPtrL hAlL hRdL rfl rfl hPtrR hAlR hRdR
-  · cases hEq : (lBytes == rBytes) with
-    | true =>
-      have hArr : lBytes = rBytes := eq_of_beq hEq
-      subst hArr; simp
-    | false =>
-      symm
-      apply beq_false_of_ne
-      intro hMap
-      have hMapInj : ∀ (a b : List UInt8), a.map Option.some = b.map Option.some → a = b := by
-        intro a; induction a with
-        | nil => intro b hb; cases b with | nil => rfl | cons _ _ => cases hb
-        | cons x xs ih =>
-          intro b hb; cases b with
-          | nil => cases hb
-          | cons y ys =>
-            simp only [List.map_cons, List.cons.injEq, Option.some.injEq] at hb
-            rw [hb.1, ih ys hb.2]
-      have hList : lBytes.toList = rBytes.toList := hMapInj lBytes.toList rBytes.toList hMap
-      have hArr : lBytes = rBytes := Array.ext' hList
-      subst hArr
-      simp at hEq
 
 /-- **Concrete `cmIntrinsicHooks`-instantiated `copy` universal zero-count &
 overflow-UB laws**:

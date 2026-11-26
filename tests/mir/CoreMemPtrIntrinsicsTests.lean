@@ -382,6 +382,8 @@ theorem cm_mr_deep_theorems_used :
   have _ := @cm_evalPtrMaskCall_direct_preserves_exposed
   have _ := @cm_minirust_rawEq_evalIntrinsic
   have _ := @cm_minirust_loadRawData_uninit_ub
+  have _ := @cm_mr_listByteEq_eq_beq
+  have _ := @cm_minirust_rawEq_eq_trusted_listByteEq
   have _ := @cm_minirust_evalPtrOffsetFrom_divExact_agree
   have _ := @cm_minirust_evalPtrOffsetFrom_neg_divExact_agree
   have _ := @cm_minirust_evalPtrOffsetFrom_unsigned_underflow_ub
@@ -1377,6 +1379,8 @@ run_cmd do
         lmNs ++ `cm_miri_rawEq_eval_universal,
         lmNs ++ `cm_miri_compareBytes_cmHooks_universal,
         lmNs ++ `cm_miri_rawEq_cmHooks_universal,
+        lmNs ++ `cm_listByteEq_eq_beq,
+        lmNs ++ `cm_rawEq_vendored_eq_trusted_listByteEq,
         lmNs ++ `cm_miri_copyWith_cmHooks_zero_count_and_overflow_universal,
         lmNs ++ `cm_miri_typedSwap_and_validatePlace_cmHooks_universal,
         lmNs ++ `cmLmTableCheck_true, lmNs ++ `cmLmObserve_table,
@@ -1477,6 +1481,8 @@ run_cmd do
         (lmNs ++ `cm_miri_rawEq_eval_universal, `Miri.Interpreter.Intrinsics.rawEq),
         (lmNs ++ `cm_miri_rawEq_cmHooks_universal, `Miri.Interpreter.Intrinsics.rawEq),
         (lmNs ++ `cm_miri_rawEq_cmHooks_universal, lmNs ++ `cmIntrinsicHooks),
+        (lmNs ++ `cm_miri_rawEq_cmHooks_universal, `Trusted.Rustc.V2026_06_01.MirSemantics.listByteEq),
+        (lmNs ++ `cm_rawEq_vendored_eq_trusted_listByteEq, `Trusted.Rustc.V2026_06_01.MirSemantics.listByteEq),
         (lmNs ++ `cm_miri_ptrMask_eval_universal, `Miri.Interpreter.Intrinsics.eval),
         (lmNs ++ `cm_miri_blackBox_eval_universal, `Miri.Interpreter.Intrinsics.eval),
         (lmNs ++ `cm_miri_ptrOffsetFrom_vendored_matrix, `Miri.Interpreter.IntegerOps.binary),

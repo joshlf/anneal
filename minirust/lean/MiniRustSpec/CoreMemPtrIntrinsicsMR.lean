@@ -1251,6 +1251,44 @@ theorem cm_minirust_rawEq_evalIntrinsic (m m1 m2 : Mach) (lp rp : Pointer Prov)
   simp [evalIntrinsic, typeEq, hRefl, hL, hR, bind, Except.bind, pure]
   rfl
 
+/-- Trusted's `raw_eq` byte comparator `listByteEq` (the `eqBit` source of
+`evalRawEqCall`) is exactly `==` on `List UInt8`, for ALL byte lists. -/
+theorem cm_mr_listByteEq_eq_beq (l r : List UInt8) : listByteEq l r = (l == r) := by
+  induction l generalizing r with
+  | nil => cases r <;> rfl
+  | cons a as ih =>
+    cases r with
+    | nil => rfl
+    | cons b bs =>
+      have hUnf : listByteEq (a :: as) (b :: bs) =
+          (match Nat.beq a.toBitVec.toNat b.toBitVec.toNat with
+           | true => listByteEq as bs
+           | false => false) := rfl
+      rw [hUnf, List.cons_beq_cons, ih bs]
+      by_cases hab : a = b
+      · subst hab
+        simp [Nat.beq_refl]
+      · have hne : Nat.beq a.toBitVec.toNat b.toBitVec.toNat = false := by
+          cases h : Nat.beq a.toBitVec.toNat b.toBitVec.toNat with
+          | false => rfl
+          | true =>
+            exact absurd (UInt8.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq (Nat.eq_of_beq_eq_true h))) hab
+        rw [hne]
+        simp [hab]
+
+/-- **Universal Trusted ↔ MiniRust `raw_eq` verdict**: whenever MiniRust's
+`loadRawData` yields the byte images `lBytes`, `rBytes`,
+`evalIntrinsic m .RawEq` returns EXACTLY Trusted's `evalRawEqCall` verdict
+`listByteEq lBytes rBytes` on the same images. -/
+theorem cm_minirust_rawEq_eq_trusted_listByteEq (m m1 m2 : Mach) (lp rp : Pointer Prov)
+    (ptrTy : PtrType) (lBytes rBytes : List UInt8)
+    (hL : loadRawData m lp ptrTy = .ok (lBytes, m1))
+    (hR : loadRawData m1 rp ptrTy = .ok (rBytes, m2)) :
+    evalIntrinsic m .RawEq [(.Ptr lp, .Ptr ptrTy), (.Ptr rp, .Ptr ptrTy)] .Bool =
+      .ok (.Bool (listByteEq lBytes rBytes), m2) := by
+  rw [cm_mr_listByteEq_eq_beq]
+  exact cm_minirust_rawEq_evalIntrinsic m m1 m2 lp rp ptrTy lBytes rBytes hL hR
+
 /-- **Universal MiniRust `RawEq` uninit-byte UB law**: whenever `CM.load` yields a
 byte list containing `.Uninit`, `loadRawData` faults with MiniRust's exact UB. -/
 theorem cm_minirust_loadRawData_uninit_ub (m : Mach) (lp : Pointer Prov) (mut_ : LibSpecr.Mutability)
