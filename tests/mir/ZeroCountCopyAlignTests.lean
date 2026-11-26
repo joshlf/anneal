@@ -345,11 +345,11 @@ theorem dead_borrow_align8_unsupported : run 2 3 (pv 2 0) (av 8) 0 = MirStepNode
 theorem packed_field_misaligned_ub : run 2 3 (pv 5 0) (av 8) 0 = MirStepNode.fail .ub := rfl
 theorem packed_field_plus7_in_outer_noop : run 2 3 (pv 3 7) (av 8) 0 = noop := rfl
 theorem packed_field_in_outer_misaligned_ub : run 2 3 (pv 3 0) (av 8) 0 = MirStepNode.fail .ub := rfl
-/-- `(u128, u128)` without a layout entry is only `.atLeast` its fields' lower bounds, which
-are unknown for `u128` here, so `&raw mut x.0` is undetermined (never a false `.ub`). -/
+/-- `(u128, u128)` without a layout entry is `.atLeast 8` on 64-bit, so `&raw mut x.0` at
+offset `0` is undetermined (never a false `.ub`) while odd offset `+3` (`3 % 8 ≠ 0`) is `.ub`. -/
 theorem u128_tuple_field_no_false_ub : run 12 12 (pv 4 0) (av 16) 0 = MirStepNode.unsupported := rfl
-theorem u128_tuple_field_odd_offset_unsupported :
-    run 12 12 (pv 4 3) (av 16) 0 = MirStepNode.unsupported := rfl
+theorem u128_tuple_field_odd_offset_ub :
+    run 12 12 (pv 4 3) (av 16) 0 = MirStepNode.fail .ub := rfl
 theorem large_offset_aligned_noop : run 2 3 (pv 1 (10 ^ 10)) (av 8) 0 = noop := rfl
 theorem large_offset_misaligned_ub : run 2 3 (pv 1 (10 ^ 10 + 3)) (av 8) 0 = MirStepNode.fail .ub := rfl
 
@@ -357,8 +357,10 @@ theorem large_offset_misaligned_ub : run 2 3 (pv 1 (10 ^ 10 + 3)) (av 8) 0 = Mir
 
 theorem placeholder_wrapper_unresolved :
     resolveCopyElemLayout D64 L64 (cp 6) (cp 6) = .unsupported := rfl
-theorem placeholder_wrapper_count5_not_noop :
+theorem placeholder_wrapper_count0_unsupported :
     run 6 6 (pv 1 0) (pv 1 0) 0 = MirStepNode.unsupported := rfl
+theorem placeholder_wrapper_count5_not_noop :
+    run 6 6 (av 1) (av 1) 5 = MirStepNode.fail .ub := rfl
 theorem placeholder_array_unresolved :
     resolveCopyElemLayout D64 L64 (cp 7) (cp 7) = .unsupported := rfl
 theorem placeholder_truncated_unresolved :
@@ -428,6 +430,247 @@ theorem call_aligned_null_count0_steps :
     runCall (av 0) (av 8) 0 = finishMemIntrinsicCall S64 noop (loc 0) 1 := rfl
 theorem call_live_aligned_count0_steps :
     runCall (pv 1 0) (pv 1 0) 0 = finishMemIntrinsicCall S64 noop (loc 0) 1 := rfl
+
+/-! ### B1 soundness regressions & full-branch coverage -/
+
+/-- `[u8; 8]` at `entries[0]` must NOT hijack `*mut u64` (`layoutIdx = 0`) to align 1. -/
+def L64_u8arr8 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [lay 8 1 (.array ⟨1⟩ 8)] }
+
+def D64_ptrPtr : List LocalDecl :=
+  [decl (.array (.uint .u8) 8) 0, decl (ptrK (ptrK (.uint .u64))) 0, decl (ptrK (.uint .u64)) 0]
+
+theorem non_ptr_u8arr8_cannot_hijack_ptr_resolve :
+    resolveCopyElemLayout D64_ptrPtr L64_u8arr8 (cp 1) (cp 1) = .ok 8 8 := rfl
+theorem non_ptr_u8arr8_cannot_hijack_ptr_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_ptrPtr L64_u8arr8 (av 1) (av 1) 0
+      locals64 = MirStepNode.fail .ub := rfl
+
+/-- `#[repr(packed)] struct P8 { a: u64 }` at `entries[0]` must NOT hijack `*mut u64` to align 1. -/
+def L64_packed8 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [lay 8 1 (.arbitrary [⟨0⟩] [0]) [1], lay 8 8 .primitive] }
+
+theorem non_ptr_packed8_cannot_hijack_ptr_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_ptrPtr L64_packed8 (av 1) (av 1) 0
+      locals64 = MirStepNode.fail .ub := rfl
+
+/-- Projected operand `_1[0] : *mut Align8` must NOT alias `entries[0] = *mut Packed` via
+synthesized `layoutIdx = 0` (`operandTyResolved` preserves unresolved indices). -/
+def align8K : RigidTy := .adt "zc::Align8" []
+def L64_projHijack : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [ptrLay 8 1, lay 9 1 (.arbitrary [⟨0⟩, ⟨1⟩] [0, 1]) [2, 3],
+                lay 1 1 .primitive, lay 8 8 .primitive] }
+def D64_projHijack : List LocalDecl :=
+  [decl (ptrK packedK) 0, decl (.array (ptrK align8K) 2) 99]
+def opProjAlign8 : Operand := .copy (loc 1 [.constantIndex 0 2 false])
+
+theorem projected_ptr_cannot_hijack_entry0_packed :
+    resolveCopyElemLayout D64_projHijack L64_projHijack opProjAlign8 opProjAlign8 =
+      .unsupported := rfl
+
+/-- Depth-16 truncated `[T; 0]` (`align = 1, size = 0, fieldLayouts = []`) must NOT resolve as
+`.ok 0 1` align-1 ZST; concrete `[u64; 0]` with a corrupt align-1 un-interned layout falls back
+to exact `.ok 0 8`. -/
+def L64_truncArr0 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [lay 0 1 (.arbitrary [] []), lay 0 1 (.array ⟨0⟩ 0), ptrLay 8 1] }
+def D64_truncArr0 : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK (.array paramT 0)) 2, decl (ptrK arrU64x0) 2]
+
+theorem truncated_arr0_param_unresolved :
+    resolveCopyElemLayout D64_truncArr0 L64_truncArr0 (cp 1) (cp 1) = .unsupported := rfl
+theorem truncated_arr0_param_count5_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_truncArr0 L64_truncArr0 (av 1) (av 1) 5
+      locals64 = MirStepNode.fail .ub := rfl
+theorem corrupt_arr0_u64_recovers_align8 :
+    resolveCopyElemLayout D64_truncArr0 L64_truncArr0 (cp 2) (cp 2) = .ok 0 8 := rfl
+
+/-- Over-aligned uninhabited layout (`size = 0, align = 16, isUninhabited = true`) is rejected
+for `!`, so `!` falls back to `(0, 1)` with no false `.ub` on `addr = 1`. -/
+def L64_neverBad : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ { size := ⟨0⟩, align := ⟨16⟩, backendRepr := .memory, fields := .arbitrary [] [],
+          variants := .empty, isUninhabited := true, fieldLayouts := [] }
+      , ptrLay 8 0 ] }
+def D64_neverBad : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK .never) 1]
+
+theorem never_rejects_overaligned_layout :
+    resolveCopyElemLayout D64_neverBad L64_neverBad (cp 1) (cp 1) = .ok 0 1 := rfl
+theorem never_count0_aligned1_noop :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_neverBad L64_neverBad (av 1) (av 1) 0
+      locals64 = noop := rfl
+
+/-- Direct exercise of the `.atLeast` branch in `stackBorrowAlignKnown` on 32-bit with NO `u32`
+local declaration: unlaid-out `(u32, u32)` has `rootBound = .atLeast 2`, while `elemAlign = 4`:
+offset `0` (`0 % 2 = 0`) is `.unsupported` (no false `.ub`), and offset `1` (`1 % 2 ≠ 0`) is `.ub`. -/
+def D32_noDecl : List LocalDecl :=
+  [decl (.tuple []) 0, decl (.tuple [.uint .u32, .uint .u32]) 99, decl (ptrK (.uint .u32)) 2]
+
+theorem target32_u32_tuple_atLeast2_off0_unsupported :
+    evalCopyNonOverlappingWithCount S32 (cp 2) (cp 2) D32_noDecl L32 (pv 1 0 4) (av 4 4) 0
+      S32.frame.locals = MirStepNode.unsupported := rfl
+theorem target32_u32_tuple_atLeast2_off1_ub :
+    evalCopyNonOverlappingWithCount S32 (cp 2) (cp 2) D32_noDecl L32 (pv 1 1 4) (av 4 4) 0
+      S32.frame.locals = MirStepNode.fail .ub := rfl
+
+/-- `globalAllocAlignKnown` coverage: align 8 off 0 noop, align 8 off 1 ub, align 4 off 1 ub,
+align 4 off 0 unsupported, non-power-of-two align 3 unsupported. -/
+def gAlloc (id al : Nat) : CapturedAllocation :=
+  { allocId := id, bytes := [], relocations := [], align := ⟨al⟩, mutability := .not }
+def S64_globals : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := locals64 },
+    memory := { emptyMemory with
+      globals := [gAlloc 10 8, gAlloc 11 4, gAlloc 12 3], nextTag := 1 } }
+
+theorem global_align8_off0_noop :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 10 0) (av 8) 0 locals64 =
+      MirStepNode.step (advanceStmt S64_globals locals64) := rfl
+theorem global_align8_off1_ub :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 10 1) (av 8) 0 locals64 = MirStepNode.fail .ub := rfl
+theorem global_align4_off1_u64_ub :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 11 1) (av 8) 0 locals64 = MirStepNode.fail .ub := rfl
+theorem global_align4_off0_u64_unsupported :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 11 0) (av 8) 0 locals64 = MirStepNode.unsupported := rfl
+theorem global_nonpow2_align3_unsupported :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 12 0) (av 8) 0 locals64 = MirStepNode.unsupported := rfl
+
+/-- Recursive concrete `struct Node { next: *mut Node }`: `copyLayoutHasPlaceholder` stops at
+pointer `backendRepr` and never cycles; also checks `ptLayoutIdx = 0` preserved with no `Node`
+local declaration. -/
+def nodeK : RigidTy := .adt "zc::Node" []
+def L64_node : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [lay 8 8 (.arbitrary [⟨0⟩] [0]) [1], ptrLay 8 0] }
+def D64_node : List LocalDecl := [decl (ptrK nodeK) 1]
+
+theorem recursive_node_ptLayoutIdx0_resolves :
+    resolveCopyElemLayout D64_node L64_node (cp 0) (cp 0) = .ok 8 8 := rfl
+theorem recursive_node_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 0) (cp 0) D64_node L64_node (av 4) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+
+/-- Truncated generic multi-variant enum (`size = 1, align = 1, fieldLayouts = []`) is rejected. -/
+def L64_truncEnum : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩] [0],
+          variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+            [.arbitrary [] [], .arbitrary [⟨0⟩] [0]],
+          isUninhabited := false, fieldLayouts := [] }
+      , ptrLay 8 1 ] }
+def D64_truncEnum : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK (.adt "zc::EnumT" [paramT])) 2]
+
+theorem placeholder_truncated_enum_unresolved :
+    resolveCopyElemLayout D64_truncEnum L64_truncEnum (cp 1) (cp 1) = .unsupported := rfl
+
+/-- Unsized pointees (`*mut [u8]`, `*mut str`, `*mut (u8, [u8])`) fault `.ub` for all counts;
+non-pointer-classified `.alias`/`.param`/ADT operands are `.unknown` (never spurious `.ub`);
+opaque ADT pointer `*const Opaque` fails closed `.unsupported`; mismatched pointees (`*mut u32`
+vs `*mut u8`) are `.unsupported` at `count = 0` and delegate at `count = 1`. -/
+def D64_misc : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.slice (.uint .u8))) 0
+  , decl (ptrK .str) 0
+  , decl (ptrK (.tuple [.uint .u8, .slice (.uint .u8)])) 0
+  , decl (.alias "zc::Alias" []) 0
+  , decl paramT 0
+  , decl opaqueK 0
+  , decl (ptrK (ptrK opaqueK)) 0
+  , decl (ptrK (.uint .u32)) 0
+  , decl (ptrK (.uint .u8)) 0 ]
+
+theorem unsized_slice_count0_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+theorem unsized_str_count0_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 2) (cp 2) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+theorem unsized_tuple_count1_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 3) (cp 3) D64_misc L64 (av 8) (av 8) 1 locals64 =
+      MirStepNode.fail .ub := rfl
+theorem alias_operand_count0_unsupported :
+    evalCopyNonOverlappingWithCount S64 (cp 4) (cp 4) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.unsupported := rfl
+theorem param_operand_count0_unsupported :
+    evalCopyNonOverlappingWithCount S64 (cp 5) (cp 5) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.unsupported := rfl
+theorem nonbox_adt_operand_count0_unsupported :
+    evalCopyNonOverlappingWithCount S64 (cp 6) (cp 6) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.unsupported := rfl
+theorem opaque_adt_ptr_unresolved :
+    resolveCopyElemLayout D64_misc L64 (cp 7) (cp 7) = .unsupported := rfl
+theorem mismatched_pointees_count0_unsupported :
+    evalCopyNonOverlappingWithCount S64 (cp 8) (cp 9) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.unsupported := rfl
+theorem mismatched_pointees_count1_delegates_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 8) (cp 9) D64_misc L64 (av 8) (av 8) 1 locals64 =
+      MirStepNode.fail .ub := rfl
+
+/-- Corrupted `[u8; 0]` with nonzero size `8` and corrupted wide pointer `*const [u8]` with
+`align = 16` are rejected by `copyLayoutMatchesRigidTy` and fall back cleanly. -/
+def L64_corrupt : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 8 8 (.array ⟨0⟩ 0) [4]
+      , { size := ⟨16⟩, align := ⟨16⟩,
+          backendRepr := .scalarPair
+            (.initialized (.pointer 0) ⟨0, 2 ^ 64 - 1⟩)
+            (.initialized (.int 64 false) ⟨0, 2 ^ 64 - 1⟩),
+          fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0,
+          isUninhabited := false, fieldLayouts := [] }
+      , ptrLay 8 1
+      , lay 1 1 .primitive
+      , ptrLay 8 2 ] }
+def D64_corrupt : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.array (.uint .u8) 0)) 3
+  , decl (ptrK (.rawPtr .not (.slice (.uint .u8)))) 5 ]
+
+theorem corrupt_array0_nonzero_size_rejected :
+    resolveCopyElemLayout D64_corrupt L64_corrupt (cp 1) (cp 1) = .ok 0 1 := rfl
+theorem corrupt_wide_ptr_align16_rejected :
+    resolveCopyElemLayout D64_corrupt L64_corrupt (cp 2) (cp 2) = .ok 16 8 := rfl
+
+/-- Cross-frame `callStack` borrow (`targetFrameDepth = 0` while active frame is at depth `1`):
+`frameLocalDeclsAndLayoutsAtDepth` reads the saved caller's `localDecls`/`layouts`. -/
+def callerBody64 : CapturedMir :=
+  { defPath := "zc::caller", phase := .runtimePostCleanup, role := .subject, argCount := 0,
+    localDecls := [decl (.tuple []) 0, decl (.uint .u64) 1], basicBlocks := [],
+    fnAbi :=
+      { args := [], ret := { layout := lay 0 1 (.arbitrary [] []), mode := .ignore },
+        conv := .rust, canUnwind := false },
+    layouts := L64, allocations := [] }
+def savedCaller64 : SavedCallerFrame :=
+  { callerBody := callerBody64,
+    frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨7, 8⟩)] },
+    destination := loc 0 }
+def S64_crossFrame : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := locals64 },
+    memory := { emptyMemory with
+      callStack := [savedCaller64],
+      borrows := [bor 1 1],
+      nextTag := 2 } }
+
+theorem cross_frame_borrow_aligned_noop :
+    evalCopyNonOverlappingWithCount S64_crossFrame (cp 2) (cp 3) D64 L64 (pv 1 0) (av 8) 0
+      locals64 = MirStepNode.step (advanceStmt S64_crossFrame locals64) := rfl
+theorem cross_frame_borrow_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64_crossFrame (cp 2) (cp 3) D64 L64 (pv 1 1) (av 8) 0
+      locals64 = MirStepNode.fail .ub := rfl
 
 end Anneal.Tests.ZeroCountCopyAlign.V06
 
@@ -728,11 +971,11 @@ theorem dead_borrow_align8_unsupported : run 2 3 (pv 2 0) (av 8) 0 = MirStepNode
 theorem packed_field_misaligned_ub : run 2 3 (pv 5 0) (av 8) 0 = MirStepNode.fail .ub := rfl
 theorem packed_field_plus7_in_outer_noop : run 2 3 (pv 3 7) (av 8) 0 = noop := rfl
 theorem packed_field_in_outer_misaligned_ub : run 2 3 (pv 3 0) (av 8) 0 = MirStepNode.fail .ub := rfl
-/-- `(u128, u128)` without a layout entry is only `.atLeast` its fields' lower bounds, which
-are unknown for `u128` here, so `&raw mut x.0` is undetermined (never a false `.ub`). -/
+/-- `(u128, u128)` without a layout entry is `.atLeast 8` on 64-bit, so `&raw mut x.0` at
+offset `0` is undetermined (never a false `.ub`) while odd offset `+3` (`3 % 8 ≠ 0`) is `.ub`. -/
 theorem u128_tuple_field_no_false_ub : run 12 12 (pv 4 0) (av 16) 0 = MirStepNode.unsupported := rfl
-theorem u128_tuple_field_odd_offset_unsupported :
-    run 12 12 (pv 4 3) (av 16) 0 = MirStepNode.unsupported := rfl
+theorem u128_tuple_field_odd_offset_ub :
+    run 12 12 (pv 4 3) (av 16) 0 = MirStepNode.fail .ub := rfl
 theorem large_offset_aligned_noop : run 2 3 (pv 1 (10 ^ 10)) (av 8) 0 = noop := rfl
 theorem large_offset_misaligned_ub : run 2 3 (pv 1 (10 ^ 10 + 3)) (av 8) 0 = MirStepNode.fail .ub := rfl
 
@@ -740,8 +983,10 @@ theorem large_offset_misaligned_ub : run 2 3 (pv 1 (10 ^ 10 + 3)) (av 8) 0 = Mir
 
 theorem placeholder_wrapper_unresolved :
     resolveCopyElemLayout D64 L64 (cp 6) (cp 6) = .unsupported := rfl
-theorem placeholder_wrapper_count5_not_noop :
+theorem placeholder_wrapper_count0_unsupported :
     run 6 6 (pv 1 0) (pv 1 0) 0 = MirStepNode.unsupported := rfl
+theorem placeholder_wrapper_count5_not_noop :
+    run 6 6 (av 1) (av 1) 5 = MirStepNode.fail .ub := rfl
 theorem placeholder_array_unresolved :
     resolveCopyElemLayout D64 L64 (cp 7) (cp 7) = .unsupported := rfl
 theorem placeholder_truncated_unresolved :
@@ -811,6 +1056,247 @@ theorem call_aligned_null_count0_steps :
     runCall (av 0) (av 8) 0 = finishMemIntrinsicCall S64 noop (loc 0) 1 := rfl
 theorem call_live_aligned_count0_steps :
     runCall (pv 1 0) (pv 1 0) 0 = finishMemIntrinsicCall S64 noop (loc 0) 1 := rfl
+
+/-! ### B1 soundness regressions & full-branch coverage -/
+
+/-- `[u8; 8]` at `entries[0]` must NOT hijack `*mut u64` (`layoutIdx = 0`) to align 1. -/
+def L64_u8arr8 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [lay 8 1 (.array ⟨1⟩ 8)] }
+
+def D64_ptrPtr : List LocalDecl :=
+  [decl (.array (.uint .u8) 8) 0, decl (ptrK (ptrK (.uint .u64))) 0, decl (ptrK (.uint .u64)) 0]
+
+theorem non_ptr_u8arr8_cannot_hijack_ptr_resolve :
+    resolveCopyElemLayout D64_ptrPtr L64_u8arr8 (cp 1) (cp 1) = .ok 8 8 := rfl
+theorem non_ptr_u8arr8_cannot_hijack_ptr_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_ptrPtr L64_u8arr8 (av 1) (av 1) 0
+      locals64 = MirStepNode.fail .ub := rfl
+
+/-- `#[repr(packed)] struct P8 { a: u64 }` at `entries[0]` must NOT hijack `*mut u64` to align 1. -/
+def L64_packed8 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [lay 8 1 (.arbitrary [⟨0⟩] [0]) [1], lay 8 8 .primitive] }
+
+theorem non_ptr_packed8_cannot_hijack_ptr_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_ptrPtr L64_packed8 (av 1) (av 1) 0
+      locals64 = MirStepNode.fail .ub := rfl
+
+/-- Projected operand `_1[0] : *mut Align8` must NOT alias `entries[0] = *mut Packed` via
+synthesized `layoutIdx = 0` (`operandTyResolved` preserves unresolved indices). -/
+def align8K : RigidTy := .adt "zc::Align8" []
+def L64_projHijack : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [ptrLay 8 1, lay 9 1 (.arbitrary [⟨0⟩, ⟨1⟩] [0, 1]) [2, 3],
+                lay 1 1 .primitive, lay 8 8 .primitive] }
+def D64_projHijack : List LocalDecl :=
+  [decl (ptrK packedK) 0, decl (.array (ptrK align8K) 2) 99]
+def opProjAlign8 : Operand := .copy (loc 1 [.constantIndex 0 2 false])
+
+theorem projected_ptr_cannot_hijack_entry0_packed :
+    resolveCopyElemLayout D64_projHijack L64_projHijack opProjAlign8 opProjAlign8 =
+      .unsupported := rfl
+
+/-- Depth-16 truncated `[T; 0]` (`align = 1, size = 0, fieldLayouts = []`) must NOT resolve as
+`.ok 0 1` align-1 ZST; concrete `[u64; 0]` with a corrupt align-1 un-interned layout falls back
+to exact `.ok 0 8`. -/
+def L64_truncArr0 : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [lay 0 1 (.arbitrary [] []), lay 0 1 (.array ⟨0⟩ 0), ptrLay 8 1] }
+def D64_truncArr0 : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK (.array paramT 0)) 2, decl (ptrK arrU64x0) 2]
+
+theorem truncated_arr0_param_unresolved :
+    resolveCopyElemLayout D64_truncArr0 L64_truncArr0 (cp 1) (cp 1) = .unsupported := rfl
+theorem truncated_arr0_param_count5_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_truncArr0 L64_truncArr0 (av 1) (av 1) 5
+      locals64 = MirStepNode.fail .ub := rfl
+theorem corrupt_arr0_u64_recovers_align8 :
+    resolveCopyElemLayout D64_truncArr0 L64_truncArr0 (cp 2) (cp 2) = .ok 0 8 := rfl
+
+/-- Over-aligned uninhabited layout (`size = 0, align = 16, isUninhabited = true`) is rejected
+for `!`, so `!` falls back to `(0, 1)` with no false `.ub` on `addr = 1`. -/
+def L64_neverBad : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ { size := ⟨0⟩, align := ⟨16⟩, backendRepr := .memory, fields := .arbitrary [] [],
+          variants := .empty, isUninhabited := true, fieldLayouts := [] }
+      , ptrLay 8 0 ] }
+def D64_neverBad : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK .never) 1]
+
+theorem never_rejects_overaligned_layout :
+    resolveCopyElemLayout D64_neverBad L64_neverBad (cp 1) (cp 1) = .ok 0 1 := rfl
+theorem never_count0_aligned1_noop :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_neverBad L64_neverBad (av 1) (av 1) 0
+      locals64 = noop := rfl
+
+/-- Direct exercise of the `.atLeast` branch in `stackBorrowAlignKnown` on 32-bit with NO `u32`
+local declaration: unlaid-out `(u32, u32)` has `rootBound = .atLeast 2`, while `elemAlign = 4`:
+offset `0` (`0 % 2 = 0`) is `.unsupported` (no false `.ub`), and offset `1` (`1 % 2 ≠ 0`) is `.ub`. -/
+def D32_noDecl : List LocalDecl :=
+  [decl (.tuple []) 0, decl (.tuple [.uint .u32, .uint .u32]) 99, decl (ptrK (.uint .u32)) 2]
+
+theorem target32_u32_tuple_atLeast2_off0_unsupported :
+    evalCopyNonOverlappingWithCount S32 (cp 2) (cp 2) D32_noDecl L32 (pv 1 0 4) (av 4 4) 0
+      S32.frame.locals = MirStepNode.unsupported := rfl
+theorem target32_u32_tuple_atLeast2_off1_ub :
+    evalCopyNonOverlappingWithCount S32 (cp 2) (cp 2) D32_noDecl L32 (pv 1 1 4) (av 4 4) 0
+      S32.frame.locals = MirStepNode.fail .ub := rfl
+
+/-- `globalAllocAlignKnown` coverage: align 8 off 0 noop, align 8 off 1 ub, align 4 off 1 ub,
+align 4 off 0 unsupported, non-power-of-two align 3 unsupported. -/
+def gAlloc (id al : Nat) : CapturedAllocation :=
+  { allocId := id, bytes := [], relocations := [], align := ⟨al⟩, mutability := .not }
+def S64_globals : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := locals64 },
+    memory := { emptyMemory with
+      globals := [gAlloc 10 8, gAlloc 11 4, gAlloc 12 3], nextTag := 1 } }
+
+theorem global_align8_off0_noop :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 10 0) (av 8) 0 locals64 =
+      MirStepNode.step (advanceStmt S64_globals locals64) := rfl
+theorem global_align8_off1_ub :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 10 1) (av 8) 0 locals64 = MirStepNode.fail .ub := rfl
+theorem global_align4_off1_u64_ub :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 11 1) (av 8) 0 locals64 = MirStepNode.fail .ub := rfl
+theorem global_align4_off0_u64_unsupported :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 11 0) (av 8) 0 locals64 = MirStepNode.unsupported := rfl
+theorem global_nonpow2_align3_unsupported :
+    evalCopyNonOverlappingWithCount S64_globals (cp 2) (cp 3) D64 L64
+      (pv 12 0) (av 8) 0 locals64 = MirStepNode.unsupported := rfl
+
+/-- Recursive concrete `struct Node { next: *mut Node }`: `copyLayoutHasPlaceholder` stops at
+pointer `backendRepr` and never cycles; also checks `ptLayoutIdx = 0` preserved with no `Node`
+local declaration. -/
+def nodeK : RigidTy := .adt "zc::Node" []
+def L64_node : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [lay 8 8 (.arbitrary [⟨0⟩] [0]) [1], ptrLay 8 0] }
+def D64_node : List LocalDecl := [decl (ptrK nodeK) 1]
+
+theorem recursive_node_ptLayoutIdx0_resolves :
+    resolveCopyElemLayout D64_node L64_node (cp 0) (cp 0) = .ok 8 8 := rfl
+theorem recursive_node_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 0) (cp 0) D64_node L64_node (av 4) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+
+/-- Truncated generic multi-variant enum (`size = 1, align = 1, fieldLayouts = []`) is rejected. -/
+def L64_truncEnum : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩] [0],
+          variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+            [.arbitrary [] [], .arbitrary [⟨0⟩] [0]],
+          isUninhabited := false, fieldLayouts := [] }
+      , ptrLay 8 1 ] }
+def D64_truncEnum : List LocalDecl :=
+  [decl (.tuple []) 0, decl (ptrK (.adt "zc::EnumT" [paramT])) 2]
+
+theorem placeholder_truncated_enum_unresolved :
+    resolveCopyElemLayout D64_truncEnum L64_truncEnum (cp 1) (cp 1) = .unsupported := rfl
+
+/-- Unsized pointees (`*mut [u8]`, `*mut str`, `*mut (u8, [u8])`) fault `.ub` for all counts;
+non-pointer-classified `.alias`/`.param`/ADT operands are `.unknown` (never spurious `.ub`);
+opaque ADT pointer `*const Opaque` fails closed `.unsupported`; mismatched pointees (`*mut u32`
+vs `*mut u8`) are `.unsupported` at `count = 0` and delegate at `count = 1`. -/
+def D64_misc : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.slice (.uint .u8))) 0
+  , decl (ptrK .str) 0
+  , decl (ptrK (.tuple [.uint .u8, .slice (.uint .u8)])) 0
+  , decl (.alias "zc::Alias" []) 0
+  , decl paramT 0
+  , decl opaqueK 0
+  , decl (ptrK (ptrK opaqueK)) 0
+  , decl (ptrK (.uint .u32)) 0
+  , decl (ptrK (.uint .u8)) 0 ]
+
+theorem unsized_slice_count0_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 1) (cp 1) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+theorem unsized_str_count0_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 2) (cp 2) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.fail .ub := rfl
+theorem unsized_tuple_count1_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 3) (cp 3) D64_misc L64 (av 8) (av 8) 1 locals64 =
+      MirStepNode.fail .ub := rfl
+theorem alias_operand_count0_unsupported :
+    evalCopyNonOverlappingWithCount S64 (cp 4) (cp 4) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.unsupported := rfl
+theorem param_operand_count0_unsupported :
+    evalCopyNonOverlappingWithCount S64 (cp 5) (cp 5) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.unsupported := rfl
+theorem nonbox_adt_operand_count0_unsupported :
+    evalCopyNonOverlappingWithCount S64 (cp 6) (cp 6) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.unsupported := rfl
+theorem opaque_adt_ptr_unresolved :
+    resolveCopyElemLayout D64_misc L64 (cp 7) (cp 7) = .unsupported := rfl
+theorem mismatched_pointees_count0_unsupported :
+    evalCopyNonOverlappingWithCount S64 (cp 8) (cp 9) D64_misc L64 (av 8) (av 8) 0 locals64 =
+      MirStepNode.unsupported := rfl
+theorem mismatched_pointees_count1_delegates_ub :
+    evalCopyNonOverlappingWithCount S64 (cp 8) (cp 9) D64_misc L64 (av 8) (av 8) 1 locals64 =
+      MirStepNode.fail .ub := rfl
+
+/-- Corrupted `[u8; 0]` with nonzero size `8` and corrupted wide pointer `*const [u8]` with
+`align = 16` are rejected by `copyLayoutMatchesRigidTy` and fall back cleanly. -/
+def L64_corrupt : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ lay 0 1 (.arbitrary [] [])
+      , lay 8 8 (.array ⟨0⟩ 0) [4]
+      , { size := ⟨16⟩, align := ⟨16⟩,
+          backendRepr := .scalarPair
+            (.initialized (.pointer 0) ⟨0, 2 ^ 64 - 1⟩)
+            (.initialized (.int 64 false) ⟨0, 2 ^ 64 - 1⟩),
+          fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0,
+          isUninhabited := false, fieldLayouts := [] }
+      , ptrLay 8 1
+      , lay 1 1 .primitive
+      , ptrLay 8 2 ] }
+def D64_corrupt : List LocalDecl :=
+  [ decl (.tuple []) 0
+  , decl (ptrK (.array (.uint .u8) 0)) 3
+  , decl (ptrK (.rawPtr .not (.slice (.uint .u8)))) 5 ]
+
+theorem corrupt_array0_nonzero_size_rejected :
+    resolveCopyElemLayout D64_corrupt L64_corrupt (cp 1) (cp 1) = .ok 0 1 := rfl
+theorem corrupt_wide_ptr_align16_rejected :
+    resolveCopyElemLayout D64_corrupt L64_corrupt (cp 2) (cp 2) = .ok 16 8 := rfl
+
+/-- Cross-frame `callStack` borrow (`targetFrameDepth = 0` while active frame is at depth `1`):
+`frameLocalDeclsAndLayoutsAtDepth` reads the saved caller's `localDecls`/`layouts`. -/
+def callerBody64 : CapturedMir :=
+  { defPath := "zc::caller", phase := .runtimePostCleanup, role := .subject, argCount := 0,
+    localDecls := [decl (.tuple []) 0, decl (.uint .u64) 1], basicBlocks := [],
+    fnAbi :=
+      { args := [], ret := { layout := lay 0 1 (.arbitrary [] []), mode := .ignore },
+        conv := .rust, canUnwind := false },
+    layouts := L64, allocations := [] }
+def savedCaller64 : SavedCallerFrame :=
+  { callerBody := callerBody64,
+    frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨7, 8⟩)] },
+    destination := loc 0 }
+def S64_crossFrame : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := locals64 },
+    memory := { emptyMemory with
+      callStack := [savedCaller64],
+      borrows := [bor 1 1],
+      nextTag := 2 } }
+
+theorem cross_frame_borrow_aligned_noop :
+    evalCopyNonOverlappingWithCount S64_crossFrame (cp 2) (cp 3) D64 L64 (pv 1 0) (av 8) 0
+      locals64 = MirStepNode.step (advanceStmt S64_crossFrame locals64) := rfl
+theorem cross_frame_borrow_misaligned_ub :
+    evalCopyNonOverlappingWithCount S64_crossFrame (cp 2) (cp 3) D64 L64 (pv 1 1) (av 8) 0
+      locals64 = MirStepNode.fail .ub := rfl
 
 end Anneal.Tests.ZeroCountCopyAlign.V08
 
@@ -1032,9 +1518,9 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.u128_tuple_field_no_false_ub
 
-/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.u128_tuple_field_odd_offset_unsupported' depends on axioms: [propext] -/
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.u128_tuple_field_odd_offset_ub' depends on axioms: [propext] -/
 #guard_msgs in
-#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.u128_tuple_field_odd_offset_unsupported
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.u128_tuple_field_odd_offset_ub
 
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.large_offset_aligned_noop' depends on axioms: [propext] -/
 #guard_msgs in
@@ -1344,9 +1830,9 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.u128_tuple_field_no_false_ub
 
-/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.u128_tuple_field_odd_offset_unsupported' depends on axioms: [propext, Quot.sound] -/
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.u128_tuple_field_odd_offset_ub' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
-#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.u128_tuple_field_odd_offset_unsupported
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.u128_tuple_field_odd_offset_ub
 
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.large_offset_aligned_noop' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
@@ -1431,3 +1917,268 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.call_live_aligned_count0_steps' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.call_live_aligned_count0_steps
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.placeholder_wrapper_count0_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.placeholder_wrapper_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.non_ptr_u8arr8_cannot_hijack_ptr_resolve' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.non_ptr_u8arr8_cannot_hijack_ptr_resolve
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.non_ptr_u8arr8_cannot_hijack_ptr_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.non_ptr_u8arr8_cannot_hijack_ptr_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.non_ptr_packed8_cannot_hijack_ptr_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.non_ptr_packed8_cannot_hijack_ptr_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.projected_ptr_cannot_hijack_entry0_packed' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.projected_ptr_cannot_hijack_entry0_packed
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.truncated_arr0_param_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.truncated_arr0_param_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.truncated_arr0_param_count5_misaligned_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.truncated_arr0_param_count5_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_arr0_u64_recovers_align8' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_arr0_u64_recovers_align8
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.never_rejects_overaligned_layout' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.never_rejects_overaligned_layout
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.never_count0_aligned1_noop' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.never_count0_aligned1_noop
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.target32_u32_tuple_atLeast2_off0_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.target32_u32_tuple_atLeast2_off0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.target32_u32_tuple_atLeast2_off1_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.target32_u32_tuple_atLeast2_off1_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.global_align8_off0_noop' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.global_align8_off0_noop
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.global_align8_off1_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.global_align8_off1_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.global_align4_off1_u64_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.global_align4_off1_u64_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.global_align4_off0_u64_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.global_align4_off0_u64_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.global_nonpow2_align3_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.global_nonpow2_align3_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.recursive_node_ptLayoutIdx0_resolves' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.recursive_node_ptLayoutIdx0_resolves
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.recursive_node_misaligned_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.recursive_node_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.placeholder_truncated_enum_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.placeholder_truncated_enum_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.unsized_slice_count0_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.unsized_slice_count0_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.unsized_str_count0_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.unsized_str_count0_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.unsized_tuple_count1_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.unsized_tuple_count1_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.alias_operand_count0_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.alias_operand_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.param_operand_count0_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.param_operand_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.nonbox_adt_operand_count0_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.nonbox_adt_operand_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.opaque_adt_ptr_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.opaque_adt_ptr_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.mismatched_pointees_count0_unsupported' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.mismatched_pointees_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.mismatched_pointees_count1_delegates_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.mismatched_pointees_count1_delegates_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_array0_nonzero_size_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_array0_nonzero_size_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_wide_ptr_align16_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.corrupt_wide_ptr_align16_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.cross_frame_borrow_aligned_noop' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.cross_frame_borrow_aligned_noop
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.cross_frame_borrow_misaligned_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.cross_frame_borrow_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.placeholder_wrapper_count0_unsupported' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.placeholder_wrapper_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.non_ptr_u8arr8_cannot_hijack_ptr_resolve' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.non_ptr_u8arr8_cannot_hijack_ptr_resolve
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.non_ptr_u8arr8_cannot_hijack_ptr_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.non_ptr_u8arr8_cannot_hijack_ptr_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.non_ptr_packed8_cannot_hijack_ptr_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.non_ptr_packed8_cannot_hijack_ptr_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.projected_ptr_cannot_hijack_entry0_packed' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.projected_ptr_cannot_hijack_entry0_packed
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.truncated_arr0_param_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.truncated_arr0_param_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.truncated_arr0_param_count5_misaligned_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.truncated_arr0_param_count5_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_arr0_u64_recovers_align8' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_arr0_u64_recovers_align8
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.never_rejects_overaligned_layout' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.never_rejects_overaligned_layout
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.never_count0_aligned1_noop' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.never_count0_aligned1_noop
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.target32_u32_tuple_atLeast2_off0_unsupported' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.target32_u32_tuple_atLeast2_off0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.target32_u32_tuple_atLeast2_off1_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.target32_u32_tuple_atLeast2_off1_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.global_align8_off0_noop' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.global_align8_off0_noop
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.global_align8_off1_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.global_align8_off1_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.global_align4_off1_u64_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.global_align4_off1_u64_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.global_align4_off0_u64_unsupported' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.global_align4_off0_u64_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.global_nonpow2_align3_unsupported' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.global_nonpow2_align3_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.recursive_node_ptLayoutIdx0_resolves' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.recursive_node_ptLayoutIdx0_resolves
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.recursive_node_misaligned_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.recursive_node_misaligned_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.placeholder_truncated_enum_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.placeholder_truncated_enum_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.unsized_slice_count0_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.unsized_slice_count0_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.unsized_str_count0_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.unsized_str_count0_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.unsized_tuple_count1_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.unsized_tuple_count1_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.alias_operand_count0_unsupported' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.alias_operand_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.param_operand_count0_unsupported' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.param_operand_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.nonbox_adt_operand_count0_unsupported' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.nonbox_adt_operand_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.opaque_adt_ptr_unresolved' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.opaque_adt_ptr_unresolved
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.mismatched_pointees_count0_unsupported' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.mismatched_pointees_count0_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.mismatched_pointees_count1_delegates_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.mismatched_pointees_count1_delegates_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_array0_nonzero_size_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_array0_nonzero_size_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_wide_ptr_align16_rejected' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.corrupt_wide_ptr_align16_rejected
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.cross_frame_borrow_aligned_noop' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.cross_frame_borrow_aligned_noop
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.cross_frame_borrow_misaligned_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.cross_frame_borrow_misaligned_ub

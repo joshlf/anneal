@@ -3770,6 +3770,42 @@ def copyTargetIs64 (layouts : LayoutTable) : Bool :=
   | n + 1 => Nat.beq (n + 1) 64
 
 /--
+Whether a `BackendRepr` is a thin pointer representation (`Scalar` whose
+primitive is a pointer).
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1793-L1810>
+
+> "pub enum BackendRepr {
+> Scalar(Scalar),
+> ScalarPair(Scalar, Scalar),"
+-/
+@[reducible]
+def copyIsThinPtrBackendRepr : BackendRepr → Bool
+  | .scalar (.initialized (.pointer _) _) => true
+  | .scalar (.union (.pointer _)) => true
+  | _ => false
+
+/--
+Whether a `BackendRepr` is a wide pointer representation (`ScalarPair` whose
+first component's primitive is a pointer).
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1793-L1810>
+
+> "pub enum BackendRepr {
+> Scalar(Scalar),
+> ScalarPair(Scalar, Scalar),"
+-/
+@[reducible]
+def copyIsWidePtrBackendRepr : BackendRepr → Bool
+  | .scalarPair (.initialized (.pointer _) _) _ => true
+  | .scalarPair (.union (.pointer _)) _ => true
+  | _ => false
+
+/--
 Whether a `BackendRepr` is a (thin or wide) pointer representation: a
 `Scalar` or the first component of a `ScalarPair` whose primitive is a
 pointer.
@@ -3783,12 +3819,8 @@ Reference (`compiler/rustc_abi/src/lib.rs` at commit
 > ScalarPair(Scalar, Scalar),"
 -/
 @[reducible]
-def copyIsPtrBackendRepr : BackendRepr → Bool
-  | .scalar (.initialized (.pointer _) _) => true
-  | .scalar (.union (.pointer _)) => true
-  | .scalarPair (.initialized (.pointer _) _) _ => true
-  | .scalarPair (.union (.pointer _)) _ => true
-  | _ => false
+def copyIsPtrBackendRepr (r : BackendRepr) : Bool :=
+  Bool.or (copyIsThinPtrBackendRepr r) (copyIsWidePtrBackendRepr r)
 
 /--
 Whether some entry `idx ∈ fieldLayouts` is a dangling index into `layouts` or
@@ -3860,7 +3892,7 @@ def copyLayoutTruncatedParametric (l : TypeLayout) : Bool :=
     match l.fields with
     | .primitive => false
     | .union n => Bool.not (Nat.beq n 0)
-    | .array _ n => Bool.not (Nat.beq n 0)
+    | .array _ _ => true
     | .arbitrary offsets _ =>
       match offsets with
       | .nil => false
@@ -3983,15 +4015,22 @@ def copyLayoutMatchesRigidTy
     Bool.and (Bool.not l.isUninhabited)
       (Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1))
   let ptrOk : RigidTy → Bool := fun pt =>
-    let sizeOk : Bool :=
+    let thinOk : Bool :=
+      Bool.and (Nat.beq l.size.bytes ptrBytes)
+        (Bool.and (copyIsThinPtrBackendRepr l.backendRepr)
+          (match l.fields with | .primitive => true | _ => false))
+    let wideOk : Bool :=
+      Bool.and (Nat.beq l.size.bytes (Nat.mul 2 ptrBytes))
+        (copyIsWidePtrBackendRepr l.backendRepr)
+    let shapeOk : Bool :=
       match copyPtrIsWide? 8 pt with
-      | .some true => Nat.beq l.size.bytes (Nat.mul 2 ptrBytes)
-      | .some false => Nat.beq l.size.bytes ptrBytes
-      | .none =>
-        Bool.or (Nat.beq l.size.bytes ptrBytes) (Nat.beq l.size.bytes (Nat.mul 2 ptrBytes))
-    Bool.and (Bool.not l.isUninhabited) (Bool.and (Nat.ble l.align.bytes ptrBytes) sizeOk)
+      | .some true => wideOk
+      | .some false => thinOk
+      | .none => Bool.or thinOk wideOk
+    Bool.and (Bool.not l.isUninhabited) (Bool.and (Nat.ble l.align.bytes ptrBytes) shapeOk)
   match kind with
-  | .never => Bool.and l.isUninhabited (Nat.beq l.size.bytes 0)
+  | .never =>
+    Bool.and l.isUninhabited (Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1))
   | .fnDef _ _ => zstOk
   | .ref _ pt => ptrOk pt
   | .rawPtr _ pt => ptrOk pt
@@ -4197,8 +4236,11 @@ Fuel-bounded statically known alignment of a place or allocation of type `ty`:
 2. a validated layout at a resolved `ty.layoutIdx`
    (`isUnresolvedLayoutIdx = false`), or else the exact `copyTySizeAndAlign?`
    alignment, is `.exact`;
-3. otherwise an array has its element's bound, a tuple has `.atLeast` the
-   maximum of its fields' lower bounds, and every other type has none.
+3. otherwise on 64-bit targets (`copyTargetIs64`) `i128`/`u128`/`f128` have
+   `.atLeast 8`, on 32-bit targets (`pointerBits = 32`) multi-byte primitives
+   and pointers have `.atLeast 2`, an array inherits its element's bound, a
+   tuple has `.atLeast` the maximum of its fields' lower bounds, and every
+   other type has none.
 
 Reference (The Rust Reference 1.98.0, "Array Layout" and "The Rust representation"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#array-layout>
@@ -4207,10 +4249,16 @@ Reference (The Rust Reference 1.98.0, "Array Layout" and "The Rust representatio
 > "An array of [T; N] has a size of size_of::<T>() * N and the same alignment of T. Arrays are laid out so that the zero-based nth element of the array is offset from the start of the array by n * size_of::<T>() bytes."
 > "The alignment of the type is at least the maximum alignment of its fields."
 
-Justification: an array's alignment equals its element's (so `.exact` and
+Justification and modeling choice (supplied target facts, not documented Rust
+guarantees): an array's alignment equals its element's (so `.exact` and
 `.atLeast` are inherited); a tuple without a layout entry is only known to be
 at least as aligned as its most-aligned field (`.atLeast`), so it never yields
 a definite misalignment verdict that a more-aligned real layout would refute.
+On all 64-bit targets supported by `rustc` 1.98, `i128`/`u128`/`f128` have
+alignment at least `8` (`8` on `s390x`, `16` on `x86_64`/`aarch64`), and on all
+32-bit targets (`pointerBits = 32`), multi-byte primitives and pointers have
+alignment at least `2` (`2` on `m68k`, `4` on `i686`/`armv7`/`wasm32`); both
+are tagged `.atLeast` so they never over-claim alignment or cause false `.ub`.
 -/
 def copyTyAlignBound?
     (localDecls : List LocalDecl)
@@ -4246,6 +4294,21 @@ def copyTyAlignBound?
                     copyTyAlignBound? localDecls layouts fuel'
                       { kind := k, layoutIdx := unresolvedLayoutIdx layouts })
                   ks))
+          | .int .i128 | .uint .u128 | .float .f128 =>
+            match copyTargetIs64 layouts with
+            | true => .some (.atLeast 8)
+            | false =>
+              match Nat.beq layouts.pointerBits 32 with
+              | true => .some (.atLeast 2)
+              | false => .none
+          | .int .i16 | .uint .u16 | .float .f16
+          | .char | .int .i32 | .uint .u32 | .float .f32
+          | .int .i64 | .uint .u64 | .float .f64
+          | .int .isize | .uint .usize | .fnPtr _ _ _ _
+          | .ref _ _ | .rawPtr _ _ =>
+            match Nat.beq layouts.pointerBits 32 with
+            | true => .some (.atLeast 2)
+            | false => .none
           | _ => .none
 
 /--
@@ -4579,10 +4642,12 @@ def copyKindDefinitelyNonPtr : RigidTy → Bool
 
 /--
 Classify the `copy_nonoverlapping` operand `op` (`OperandPointeeLookup`) from
-its declared type (`operandTy`) and, for pointer types, the pointer type's
-captured layout: when that layout is a pointer representation
-(`copyIsPtrBackendRepr`) with exactly one `fieldLayouts` entry `ptLayoutIdx`,
-`ptLayoutIdx` is the authoritative pointee layout index (also when it is `0`).
+its resolved declared type (`operandTyResolved`, so projected places never
+synthesize `layoutIdx = 0` and alias `entries[0]`) and, for pointer types, the
+pointer type's captured layout: when that layout is a thin pointer
+representation (`copyIsThinPtrBackendRepr`) with exactly one `fieldLayouts`
+entry `ptLayoutIdx`, `ptLayoutIdx` is the authoritative pointee layout index
+(also when it is `0`).
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -4600,13 +4665,13 @@ def operandPointeeLookup
     (layouts : LayoutTable)
     (op : Operand) :
     OperandPointeeLookup :=
-  match operandTy localDecls layouts op with
+  match operandTyResolved localDecls layouts op with
   | .none => .unknown
   | .some ty =>
     let auth : Option Nat :=
       match LayoutTable.lookup layouts ty.layoutIdx with
       | .some ptrLayout =>
-        match copyIsPtrBackendRepr ptrLayout.backendRepr, ptrLayout.fieldLayouts with
+        match copyIsThinPtrBackendRepr ptrLayout.backendRepr, ptrLayout.fieldLayouts with
         | true, ptLayoutIdx :: .nil => .some ptLayoutIdx
         | _, _ => .none
       | .none => .none
@@ -8169,90 +8234,207 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
         dsimp only
         rw [hDis]
   · cases localDecls <;> cases restProj <;> simp [evalStmt, evalOperand, hPtrSlot, hDis]
-  · intro hNonZst
-    have hNZ :
-        evalCopyNonOverlappingWithCountNonZero
-          { s with
-            frame := { s.frame with locals := localsAfter }
-            memory := { s.memory with borrows := disableLocalBorrows borrows loc d } }
-          srcOp dstOp localDecls layouts (.ptr ptrVal sz) otherVal (n + 1) localsAfter =
-          MirStepNode.fail .ub := by
-      unfold evalCopyNonOverlappingWithCountNonZero
-      cases otherVal with
-      | ptr dstPtr dstSz =>
-        dsimp only
-        rw [hDis]
-        cases hDst : lookupBorrow (disableLocalBorrows borrows loc d) dstPtr.tag <;> rfl
-      | _ => rfl
-    unfold evalCopyNonOverlappingWithCount
-    dsimp only
-    cases hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
-    | ub => rfl
-    | unsupported =>
-      dsimp only
-      split
-      · rename_i hz
-        nomatch hz
-      · split
-        · rfl
-        · exact hNZ
-    | ok es al =>
-      cases es with
-      | zero => exact absurd hR (hNonZst al)
-      | succ es' =>
-        dsimp only
-        split
-        · rfl
-        · split
-          · rename_i hz
-            nomatch hz
-          · split
-            · rfl
-            · exact hNZ
-  · intro hNonZst
-    have hNZ :
-        evalCopyNonOverlappingWithCountNonZero
-          { s with
-            frame := { s.frame with locals := localsAfter }
-            memory := { s.memory with borrows := disableLocalBorrows borrows loc d } }
-          srcOp dstOp localDecls layouts otherVal (.ptr ptrVal sz) (n + 1) localsAfter =
-          MirStepNode.fail .ub := by
-      unfold evalCopyNonOverlappingWithCountNonZero
-      cases otherVal with
-      | ptr srcPtr srcSz =>
-        dsimp only
-        rw [hDis]
-        cases hSrc : lookupBorrow (disableLocalBorrows borrows loc d) srcPtr.tag with
-        | none => rfl
-        | some srcEntry =>
-          dsimp only
-          cases hPerm : srcEntry.perm <;> rfl
-      | _ => rfl
-    unfold evalCopyNonOverlappingWithCount
-    dsimp only
-    cases hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
-    | ub => rfl
-    | unsupported =>
-      dsimp only
-      split
-      · rename_i hz
-        nomatch hz
-      · split
-        · rfl
-        · exact hNZ
-    | ok es al =>
-      cases es with
-      | zero => exact absurd hR (hNonZst al)
-      | succ es' =>
-        dsimp only
-        split
-        · rfl
-        · split
-          · rename_i hz
-            nomatch hz
-          · split
-            · rfl
-            · exact hNZ
+  · exact fun hNonZst =>
+      let borrowsAfter := disableLocalBorrows borrows loc d
+      let sAfter : MachineState :=
+        { s with
+          frame := { s.frame with locals := localsAfter }
+          memory := { s.memory with borrows := borrowsAfter } }
+      let hNZ :
+          evalCopyNonOverlappingWithCountNonZero
+            sAfter srcOp dstOp localDecls layouts (.ptr ptrVal sz) otherVal (n + 1) localsAfter =
+            MirStepNode.fail .ub :=
+        match otherVal with
+        | .ptr dstPtr _ =>
+          let f : Option BorrowEntry → Option BorrowEntry → MirStepNode
+            | .some srcEntry, .some dstEntry =>
+              match srcEntry.perm, dstEntry.perm with
+              | .disabled, _ => MirStepNode.fail .ub
+              | _, .frozen => MirStepNode.fail .ub
+              | _, .disabled => MirStepNode.fail .ub
+              | _, _ =>
+                match copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
+                | false =>
+                  evalForeignFrameCopySingleDirect
+                    sAfter srcOp dstOp localDecls layouts ptrVal dstPtr srcEntry dstEntry
+                    (n + 1) localsAfter
+                | true =>
+                  evalCopyNonOverlappingPermOk
+                    sAfter srcOp dstOp localDecls layouts ptrVal dstPtr srcEntry dstEntry
+                    (n + 1) localsAfter
+            | _, _ => MirStepNode.fail .ub
+          Eq.trans
+            (congrArg (fun b => f b (lookupBorrow borrowsAfter dstPtr.tag)) hDis)
+            (@Option.rec BorrowEntry
+              (fun dOpt => f (.some { entry with perm := .disabled, allocDead := true }) dOpt =
+                MirStepNode.fail .ub)
+              rfl (fun _ => rfl) (lookupBorrow borrowsAfter dstPtr.tag))
+        | .scalar _ => rfl
+        | .unit => rfl
+        | .aggregate _ _ => rfl
+        | .uninit => rfl
+      let ptrBytes := layoutPointerBytes layouts
+      let nonZero : MirStepNode :=
+        match Bool.and (isThinPtrValue ptrBytes (.ptr ptrVal sz))
+                (isThinPtrValue ptrBytes otherVal) with
+        | false => MirStepNode.fail .ub
+        | true =>
+          evalCopyNonOverlappingWithCountNonZero
+            sAfter srcOp dstOp localDecls layouts (.ptr ptrVal sz) otherVal (n + 1) localsAfter
+      let hNonZero : nonZero = MirStepNode.fail .ub :=
+        @Bool.rec
+          (fun b =>
+            (match b with
+             | false => MirStepNode.fail .ub
+             | true =>
+               evalCopyNonOverlappingWithCountNonZero
+                 sAfter srcOp dstOp localDecls layouts (.ptr ptrVal sz) otherVal (n + 1)
+                 localsAfter) = MirStepNode.fail .ub)
+          rfl hNZ
+          (Bool.and (isThinPtrValue ptrBytes (.ptr ptrVal sz))
+            (isThinPtrValue ptrBytes otherVal))
+      let stepOf : CopyElemLayout → MirStepNode
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => nonZero
+        | .ok elemSize elemAlign =>
+          let totalBytes := Nat.mul (n + 1) elemSize
+          match Nat.ble totalBytes (isizeMaxBytes ptrBytes) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match Nat.beq totalBytes 0 with
+            | true =>
+              match zeroByteCopyPrecheck sAfter localsAfter localDecls layouts elemAlign
+                      (.ptr ptrVal sz) otherVal with
+              | .ok => MirStepNode.step (advanceStmt sAfter localsAfter)
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+            | false => nonZero
+      match hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
+      | .ub => Eq.trans (congrArg stepOf hR) rfl
+      | .unsupported => Eq.trans (congrArg stepOf hR) hNonZero
+      | .ok 0 al => absurd hR (hNonZst al)
+      | .ok (es' + 1) _ =>
+        Eq.trans (congrArg stepOf hR)
+          (@Bool.rec
+            (fun b =>
+              (match b with | false => MirStepNode.fail .ub | true => nonZero) =
+                MirStepNode.fail .ub)
+            rfl hNonZero
+            (Nat.ble (Nat.mul (n + 1) (es' + 1)) (isizeMaxBytes ptrBytes)))
+  · exact fun hNonZst =>
+      let borrowsAfter := disableLocalBorrows borrows loc d
+      let sAfter : MachineState :=
+        { s with
+          frame := { s.frame with locals := localsAfter }
+          memory := { s.memory with borrows := borrowsAfter } }
+      let hNZ :
+          evalCopyNonOverlappingWithCountNonZero
+            sAfter srcOp dstOp localDecls layouts otherVal (.ptr ptrVal sz) (n + 1) localsAfter =
+            MirStepNode.fail .ub :=
+        match otherVal with
+        | .ptr srcPtr _ =>
+          let f : Option BorrowEntry → Option BorrowEntry → MirStepNode
+            | .some srcEntry, .some dstEntry =>
+              match srcEntry.perm, dstEntry.perm with
+              | .disabled, _ => MirStepNode.fail .ub
+              | _, .frozen => MirStepNode.fail .ub
+              | _, .disabled => MirStepNode.fail .ub
+              | _, _ =>
+                match copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
+                | false =>
+                  evalForeignFrameCopySingleDirect
+                    sAfter srcOp dstOp localDecls layouts srcPtr ptrVal srcEntry dstEntry
+                    (n + 1) localsAfter
+                | true =>
+                  evalCopyNonOverlappingPermOk
+                    sAfter srcOp dstOp localDecls layouts srcPtr ptrVal srcEntry dstEntry
+                    (n + 1) localsAfter
+            | _, _ => MirStepNode.fail .ub
+          let hDstDis : ∀ (se : BorrowEntry),
+              f (.some se) (.some { entry with perm := .disabled, allocDead := true }) =
+                MirStepNode.fail .ub := fun se =>
+            let hP : ∀ (p : TreeBorrowPerm),
+                (match p, TreeBorrowPerm.disabled with
+                 | .disabled, _ => MirStepNode.fail .ub
+                 | _, .frozen => MirStepNode.fail .ub
+                 | _, .disabled => MirStepNode.fail .ub
+                 | _, _ =>
+                   match copyEntriesTargetActiveFrame s.memory.callStack se
+                           { entry with perm := .disabled, allocDead := true } with
+                   | false =>
+                     evalForeignFrameCopySingleDirect
+                       sAfter srcOp dstOp localDecls layouts srcPtr ptrVal se
+                       { entry with perm := .disabled, allocDead := true } (n + 1) localsAfter
+                   | true =>
+                     evalCopyNonOverlappingPermOk
+                       sAfter srcOp dstOp localDecls layouts srcPtr ptrVal se
+                       { entry with perm := .disabled, allocDead := true } (n + 1) localsAfter) =
+                  MirStepNode.fail .ub
+              | .cell => rfl
+              | .reservedFrz _ => rfl
+              | .reservedIM => rfl
+              | .unique => rfl
+              | .frozen => rfl
+              | .disabled => rfl
+            hP se.perm
+          Eq.trans
+            (congrArg (fun b => f (lookupBorrow borrowsAfter srcPtr.tag) b) hDis)
+            (@Option.rec BorrowEntry
+              (fun sOpt => f sOpt (.some { entry with perm := .disabled, allocDead := true }) =
+                MirStepNode.fail .ub)
+              rfl hDstDis (lookupBorrow borrowsAfter srcPtr.tag))
+        | .scalar _ => rfl
+        | .unit => rfl
+        | .aggregate _ _ => rfl
+        | .uninit => rfl
+      let ptrBytes := layoutPointerBytes layouts
+      let nonZero : MirStepNode :=
+        match Bool.and (isThinPtrValue ptrBytes otherVal)
+                (isThinPtrValue ptrBytes (.ptr ptrVal sz)) with
+        | false => MirStepNode.fail .ub
+        | true =>
+          evalCopyNonOverlappingWithCountNonZero
+            sAfter srcOp dstOp localDecls layouts otherVal (.ptr ptrVal sz) (n + 1) localsAfter
+      let hNonZero : nonZero = MirStepNode.fail .ub :=
+        @Bool.rec
+          (fun b =>
+            (match b with
+             | false => MirStepNode.fail .ub
+             | true =>
+               evalCopyNonOverlappingWithCountNonZero
+                 sAfter srcOp dstOp localDecls layouts otherVal (.ptr ptrVal sz) (n + 1)
+                 localsAfter) = MirStepNode.fail .ub)
+          rfl hNZ
+          (Bool.and (isThinPtrValue ptrBytes otherVal)
+            (isThinPtrValue ptrBytes (.ptr ptrVal sz)))
+      let stepOf : CopyElemLayout → MirStepNode
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => nonZero
+        | .ok elemSize elemAlign =>
+          let totalBytes := Nat.mul (n + 1) elemSize
+          match Nat.ble totalBytes (isizeMaxBytes ptrBytes) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match Nat.beq totalBytes 0 with
+            | true =>
+              match zeroByteCopyPrecheck sAfter localsAfter localDecls layouts elemAlign
+                      otherVal (.ptr ptrVal sz) with
+              | .ok => MirStepNode.step (advanceStmt sAfter localsAfter)
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+            | false => nonZero
+      match hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
+      | .ub => Eq.trans (congrArg stepOf hR) rfl
+      | .unsupported => Eq.trans (congrArg stepOf hR) hNonZero
+      | .ok 0 al => absurd hR (hNonZst al)
+      | .ok (es' + 1) _ =>
+        Eq.trans (congrArg stepOf hR)
+          (@Bool.rec
+            (fun b =>
+              (match b with | false => MirStepNode.fail .ub | true => nonZero) =
+                MirStepNode.fail .ub)
+            rfl hNonZero
+            (Nat.ble (Nat.mul (n + 1) (es' + 1)) (isizeMaxBytes ptrBytes)))
 
 /--
 Universal proof that a bare `StatementKind.placeMention` (`place.projection = []`)

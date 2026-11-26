@@ -315,14 +315,20 @@ theorem bdCopy2_not_noUB : ¬ MirNoUBTree (mirCallTree (bdCopyBody 2) [.scalar �
 def bdCopyZeroScalars : MirAst.Statement :=
   mkStmt (.intrinsic (.copyNonOverlapping (constU32 0) (constU32 0) (bdConstUsize 0)))
 
-/-- Even with `count = 0`, Anneal rejects the statement with `.ub` in every state:
-neither `src` nor `dst` is statically a pointer (both are `u32` constants), so the
-`copy_nonoverlapping` operands are ill-typed (`resolveCopyElemLayout = .ub`), and a
-malformed `count` (wrong width for the target) is `.ub` as well (stated on the
-64-bit `emptyLayoutTable`, where the `usize` count is well formed). -/
-theorem bdCopyZeroScalars_ub (s : MachineState) (decls : List LocalDecl) :
-    evalStmt s bdCopyZeroScalars decls emptyLayoutTable = MirStepNode.fail .ub :=
-  rfl
+/-- Even with `count = 0`, Anneal rejects the statement with `.ub` in every state and
+under every `LayoutTable`: a wrong-width `count` (e.g. 32-bit target with 8-byte count)
+faults at `countScalarWellFormed`, and otherwise neither `src` nor `dst` is statically a
+pointer (both are `u32` constants), so `resolveCopyElemLayout = .ub`. -/
+theorem bdCopyZeroScalars_ub (s : MachineState) (decls : List LocalDecl)
+    (layouts : LayoutTable) :
+    evalStmt s bdCopyZeroScalars decls layouts = MirStepNode.fail .ub := by
+  unfold evalStmt evalCopyNonOverlapping bdCopyZeroScalars mkStmt constU32 bdConstUsize
+  simp only [evalOperand, evalConstValue]
+  cases countScalarWellFormed (layoutPointerBytes layouts) ⟨0, 8⟩
+  · rfl
+  · unfold evalCopyNonOverlappingWithCount resolveCopyElemLayout operandPointeeLookup
+      operandTyResolved
+    rfl
 
 theorem bdCopy_translateStatement (decls : List LocalDecl) (src dst count : Operand) :
     translateStatement decls (mkStmt (.intrinsic (.copyNonOverlapping src dst count))) = none ∧
