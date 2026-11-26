@@ -4457,6 +4457,19 @@ theorem coerce_generic_non_closure_is_ub :
       .ub := by
   rfl
 
+/-- C5 precedence on a forged linked body that is both capturing and generic (`typeParamCount = 1`): reification and an indirect call through a pointer to it fail closed with `.unsupported`, while the same capturing body without type parameters is `.ub` at both sites. -/
+theorem generic_capturing_body_is_unsupported_not_ub :
+    let genCap : CapturedMir :=
+      { Mir.ClosureMatrix.capturing_direct_closure_0.body with typeParamCount := 1 }
+    (coerce "ClosureFnPointer(Safe)" (.closure capPath .nil) (.aggregate 0 .nil) fnU32 [genCap],
+     coerce "ClosureFnPointer(Safe)" (.closure capPath .nil) (.aggregate 0 .nil) fnU32
+       [Mir.ClosureMatrix.capturing_direct_closure_0.body],
+     runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [genCap] [entry capPath fnU32],
+     runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [Mir.ClosureMatrix.capturing_direct_closure_0.body]
+       [entry capPath fnU32]) =
+      (.unsupported, .ub, .unsupported, .ub) := by
+  rfl
+
 /-- Inline `const_eval_select` rejects a forged `.unit` value in a `fn`-pointer local even when `target.typeArgs[2]` names a valid closure. -/
 theorem inline_ces_forged_unit_with_fnptr_operand_ty_is_ub :
     let caller :=
@@ -5963,6 +5976,19 @@ theorem coerce_generic_non_closure_is_ub :
         typeParamCount := 1 }
     coerce "ClosureFnPointer(Safe)" (.closure "tests::gen_fn" .nil) (.aggregate 0 .nil) fnU32 [genFn] =
       .ub := by
+  rfl
+
+/-- C5 precedence on a forged linked body that is both capturing and generic (`typeParamCount = 1`): reification and an indirect call through a pointer to it fail closed with `.unsupported`, while the same capturing body without type parameters is `.ub` at both sites. -/
+theorem generic_capturing_body_is_unsupported_not_ub :
+    let genCap : CapturedMir :=
+      { V08.Mir.ClosureMatrix.capturing_direct_closure_0.body with typeParamCount := 1 }
+    (coerce "ClosureFnPointer(Safe)" (.closure capPath .nil) (.aggregate 0 .nil) fnU32 [genCap],
+     coerce "ClosureFnPointer(Safe)" (.closure capPath .nil) (.aggregate 0 .nil) fnU32
+       [V08.Mir.ClosureMatrix.capturing_direct_closure_0.body],
+     runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [genCap] [entry capPath fnU32],
+     runWith (ptrCaller fnU32) [fnPtrVal, u32v 5] [V08.Mir.ClosureMatrix.capturing_direct_closure_0.body]
+       [entry capPath fnU32]) =
+      (.unsupported, .ub, .unsupported, .ub) := by
   rfl
 
 /-- Inline `const_eval_select` rejects a forged `.unit` value in a `fn`-pointer local even when `target.typeArgs[2]` names a valid closure. -/
