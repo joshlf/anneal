@@ -54,6 +54,15 @@ with the canary helpers of `Anneal.AiPcc.Canaries`:
    (`sintAddOverflowBoolAbs` / `sintSubOverflowBoolAbs`, including `0 - y`
    ruling out `i8::MIN / -1` on the `!ov` branch), and exact-constant
    `ov = true` folding.
+9. B4 adversarial boundary falsification across `i8`/`i32`/`i128` widths,
+   signed `*WithOverflow` corners, narrowing sign-flip division hazards, and
+   canary axiom guards.
+10. A4 final-pass adversarial coverage: non-power-of-two/zero congruence
+    fallback, signed-to-unsigned widening hazards, `u8 -> i8` sign-flip,
+    `bool -> i8`, chained widening, signed `switchInt` `INT_MIN` exclusion,
+    `i8::MIN - y` / `(-1) - y` overflow arms, move-alias invalidation on
+    `subWithOverflow`, multi-width `INT_MIN * -1` rejections, and
+    unreachable-cycle / empty-CFG `AutoProve` fail-closed checks.
 -/
 
 namespace Anneal.AiPccMirTests
@@ -2972,5 +2981,245 @@ info: 'Anneal.AiPccMirTests.signed_b4_boundary_falsification' depends on axioms:
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms signed_b4_boundary_falsification
+
+/-! ## 10. A4 Final-Pass Edge-Case Falsification & Widening Axiom Guard -/
+
+/-- `fn(x: i8) -> u32`: widen `x` (optionally guarded to `[-10, 10]` or
+`[-10, -1]`) to `u32` and apply `op(_, k)`. Negative `i8` values sign-extend
+to `[0xFFFF_FF80, 0xFFFF_FFFF]`, so `addUnchecked(1)` must fail closed while
+`subUnchecked(10)` on `[-10, -1]` certifies. -/
+def signedToU32CastOpBody (mode : Nat) (op : BinOp) (k : Nat) : CapturedMir :=
+  match mode with
+  | 0 =>
+    canaryBody "ai_pcc_tests::i8_to_u32_op" 1
+      [canaryUintTy .u32, canaryIntTy .i8, canaryUintTy .u32]
+      [canaryBlock [.storageLive 2,
+          .assign (canaryPlace 2)
+            (.cast .intToInt (canaryCopy 1) (canaryUintTy .u32)),
+          .assign (canaryPlace 0)
+            (.binaryOp op (canaryCopy 2) (canaryUConst .u32 k))] .return_]
+  | 1 =>
+    canaryBody "ai_pcc_tests::i8_straddle_u32_op" 1
+      [canaryUintTy .u32, canaryIntTy .i8, canaryBoolTy, canaryBoolTy,
+       canaryUintTy .u32]
+      [ canaryBlock [.storageLive 2,
+          .assign (canaryPlace 2)
+            (.binaryOp .ge (canaryCopy 1) (canaryIConst .i8 246))]
+          (.switchInt (canaryCopy 2) ⟨[(0, 3)], 1⟩),
+        canaryBlock [.storageLive 3,
+          .assign (canaryPlace 3)
+            (.binaryOp .le (canaryCopy 1) (canaryIConst .i8 10))]
+          (.switchInt (canaryCopy 3) ⟨[(0, 3)], 2⟩),
+        canaryBlock [.storageLive 4,
+          .assign (canaryPlace 4)
+            (.cast .intToInt (canaryCopy 1) (canaryUintTy .u32)),
+          .assign (canaryPlace 0)
+            (.binaryOp op (canaryCopy 4) (canaryUConst .u32 k))] .return_,
+        canaryBlock [.assign (canaryPlace 0) (.use (canaryUConst .u32 0))]
+          .return_ ]
+  | _ =>
+    canaryBody "ai_pcc_tests::i8_neg_u32_op" 1
+      [canaryUintTy .u32, canaryIntTy .i8, canaryBoolTy, canaryBoolTy,
+       canaryUintTy .u32]
+      [ canaryBlock [.storageLive 2,
+          .assign (canaryPlace 2)
+            (.binaryOp .ge (canaryCopy 1) (canaryIConst .i8 246))]
+          (.switchInt (canaryCopy 2) ⟨[(0, 3)], 1⟩),
+        canaryBlock [.storageLive 3,
+          .assign (canaryPlace 3)
+            (.binaryOp .lt (canaryCopy 1) (canaryIConst .i8 0))]
+          (.switchInt (canaryCopy 3) ⟨[(0, 3)], 2⟩),
+        canaryBlock [.storageLive 4,
+          .assign (canaryPlace 4)
+            (.cast .intToInt (canaryCopy 1) (canaryUintTy .u32)),
+          .assign (canaryPlace 0)
+            (.binaryOp op (canaryCopy 4) (canaryUConst .u32 k))] .return_,
+        canaryBlock [.assign (canaryPlace 0) (.use (canaryUConst .u32 0))]
+          .return_ ]
+
+/-- `fn(x: u8) -> i8`: when `x >= lo`, cast `x as i8` and divide by `-1`.
+`lo = 128` includes `i8::MIN` (`128`) and must fail closed; `lo = 129` stays
+in `[-127, -1]` and certifies. -/
+def u8ToI8DivNeg1Body (lo : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::u8_to_i8_div" 1
+    [canaryIntTy .i8, canaryUintTy .u8, canaryBoolTy, canaryIntTy .i8]
+    [ canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.binaryOp .ge (canaryCopy 1) (canaryUConst .u8 lo))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+      canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.cast .intToInt (canaryCopy 1) (canaryIntTy .i8)),
+        .assign (canaryPlace 0)
+          (.binaryOp .div (canaryCopy 3) (canaryIConst .i8 255))] .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn(x: i8) -> i8`: `switchInt` matching `i8::MIN` (`128`), placing
+`x / -1` on either the matching arm (`true`, UB) or the `otherwise` arm
+(`false`, certified via `.sneConst`). -/
+def signedSwitchMinDivBody (divOnMatchArm : Bool) : CapturedMir :=
+  let divStmt : StatementKind :=
+    .assign (canaryPlace 0)
+      (.binaryOp .div (canaryCopy 1) (canaryIConst .i8 255))
+  let zeroStmt : StatementKind :=
+    .assign (canaryPlace 0) (.use (canaryIConst .i8 0))
+  canaryBody "ai_pcc_tests::signed_switch_min_div" 1
+    [canaryIntTy .i8, canaryIntTy .i8]
+    [ canaryBlock [] (.switchInt (canaryCopy 1) ⟨[(128, 1)], 2⟩),
+      canaryBlock [if divOnMatchArm then divStmt else zeroStmt] .return_,
+      canaryBlock [if divOnMatchArm then zeroStmt else divStmt] .return_ ]
+
+/-- `fn(y: i8) -> i8`: `(_, ov) = i8::MIN.overflowing_sub(y)`, testing
+`y.op(k)` on the `!ov` arm (`onOvArm = false`, `y <= 0`) or the `ov` arm
+(`onOvArm = true`, `y > 0`). -/
+def subMinConstOvBody (onOvArm : Bool) (op : BinOp) (k : Nat) : CapturedMir :=
+  let stmt : StatementKind :=
+    .assign (canaryPlace 0) (.binaryOp op (canaryCopy 1) (canaryIConst .i8 k))
+  let zero : StatementKind := .assign (canaryPlace 0) (.use (canaryIConst .i8 0))
+  canaryBody "ai_pcc_tests::sub_min_const_ov" 1
+    [canaryIntTy .i8, canaryIntTy .i8, intPairTy .i8, canaryBoolTy]
+    [ canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 2)
+          (.binaryOp .subWithOverflow (canaryIConst .i8 128) (canaryCopy 1)),
+        .assign (canaryPlace 3)
+          (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+      canaryBlock [if onOvArm then zero else stmt] .return_,
+      canaryBlock [if onOvArm then stmt else zero] .return_ ]
+
+/-- A4 final-pass edge-case falsification suite covering non-power-of-two and
+zero congruence fallbacks, signed-to-unsigned widening hazards, `u8 -> i8`
+sign-flip, `bool -> i8` casts, chained `i8 -> i16 -> i32` widening, signed
+`switchInt` `INT_MIN` exclusion, both arms of `i8::MIN.overflowing_sub(y)`,
+dead `ov` pruning on `(-1).overflowing_sub(y)`, move-alias invalidation on
+`subWithOverflow`, multi-width `INT_MIN * -1` rejections, and unreachable-cycle
+/ empty-CFG `AutoProve` fail-closed checks. -/
+theorem signed_a4_edge_falsification :
+    tightHiByCongNat 9 (.cong 3 1) = some 7 ∧
+    tightHiByCongNat 0 (.cong 3 1) = none ∧
+    tightHiByCongNat 10 (.cong 0 0) = some 10 ∧
+    congForSignedBias 8 (.cong 3 1) = .top ∧
+    congForSignedBias 8 (.cong 0 0) = .top ∧
+    congForSignedBias 8 (.cong 256 5) = .top ∧
+    (refineSleConstWithCong 8 ⟨.init, Tnum.top 8, .top, .cong 3 2⟩ 0).wi =
+      .iv 128 0 ∧
+    sintMulOk .i16 (AbsVal.const 16 (modPow2 15))
+      (AbsVal.const 16 (modPow2 16 - 1)) = false ∧
+    sintMulOk .i64 (AbsVal.const 64 (modPow2 63))
+      (AbsVal.const 64 (modPow2 64 - 1)) = false ∧
+    sintMulOk .isize (AbsVal.const 64 (modPow2 63))
+      (AbsVal.const 64 (modPow2 64 - 1)) = false ∧
+    AutoProve.autoVerifyAcyclic (signedToU32CastOpBody 0 .addUnchecked 1) =
+      false ∧
+    AutoProve.autoVerifyAcyclic (signedToU32CastOpBody 1 .addUnchecked 10) =
+      false ∧
+    AutoProve.autoVerifyAcyclic (signedToU32CastOpBody 2 .addUnchecked 1) =
+      false ∧
+    AutoProve.autoVerifyAcyclic (signedToU32CastOpBody 2 .subUnchecked 10) =
+      true ∧
+    AutoProve.autoVerifyAcyclic (u8ToI8DivNeg1Body 128) = false ∧
+    AutoProve.autoVerifyAcyclic (u8ToI8DivNeg1Body 129) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::bool_to_i8_add126" 1
+        [canaryIntTy .i8, canaryBoolTy, canaryIntTy .i8]
+        [canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i8)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 2) (canaryIConst .i8 126))]
+            .return_]) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::bool_to_i8_add127" 1
+        [canaryIntTy .i8, canaryBoolTy, canaryIntTy .i8]
+        [canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i8)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 2) (canaryIConst .i8 127))]
+            .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::chained_widen_ok" 1
+        [canaryIntTy .i32, canaryIntTy .i8, canaryIntTy .i16, canaryIntTy .i32]
+        [canaryBlock [.storageLive 2, .storageLive 3,
+            .assign (canaryPlace 2)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i16)),
+            .assign (canaryPlace 3)
+              (.cast .intToInt (canaryCopy 2) (canaryIntTy .i32)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 3)
+                (canaryIConst .i32 (modPow2 31 - 128)))] .return_]) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::chained_widen_ov" 1
+        [canaryIntTy .i32, canaryIntTy .i8, canaryIntTy .i16, canaryIntTy .i32]
+        [canaryBlock [.storageLive 2, .storageLive 3,
+            .assign (canaryPlace 2)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i16)),
+            .assign (canaryPlace 3)
+              (.cast .intToInt (canaryCopy 2) (canaryIntTy .i32)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 3)
+                (canaryIConst .i32 (modPow2 31 - 127)))] .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic (signedSwitchMinDivBody false) = true ∧
+    AutoProve.autoVerifyAcyclic (signedSwitchMinDivBody true) = false ∧
+    AutoProve.autoVerifyAcyclic (subMinConstOvBody false .addUnchecked 127) =
+      true ∧
+    AutoProve.autoVerifyAcyclic (subMinConstOvBody false .subUnchecked 1) =
+      false ∧
+    AutoProve.autoVerifyAcyclic (subMinConstOvBody true .subUnchecked 1) =
+      true ∧
+    AutoProve.autoVerifyAcyclic (subMinConstOvBody true .addUnchecked 1) =
+      false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::sub_neg1_ov_dead" 1
+        [canaryIntTy .i8, canaryIntTy .i8, intPairTy .i8, canaryBoolTy]
+        [ canaryBlock [.storageLive 2, .storageLive 3,
+            .assign (canaryPlace 2)
+              (.binaryOp .subWithOverflow (canaryIConst .i8 255) (canaryCopy 1)),
+            .assign (canaryPlace 3)
+              (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+            (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+            .return_,
+          canaryBlock [] .unreachable ]) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::move_alias_sub_ov" 1
+        [canaryIntTy .i8, canaryIntTy .i8, intPairTy .i8, canaryBoolTy]
+        [ canaryBlock [.storageLive 2, .storageLive 3,
+            .assign (canaryPlace 2)
+              (.binaryOp .subWithOverflow (canaryCopy 1) (.move (canaryPlace 1))),
+            .assign (canaryPlace 3)
+              (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+            (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1))] .return_,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+            .return_ ]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::unreachable_cycle" 0 [canaryIntTy .i8]
+        [ canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+            .return_,
+          canaryBlock [] (.goto 2),
+          canaryBlock [] (.goto 1) ]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::empty_blocks" 0 [canaryIntTy .i8] []) =
+      false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::empty_locals" 0 []
+        [canaryBlock [] .return_]) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl⟩
+
+/--
+info: 'Anneal.AiPcc.sintCastAbs_sound' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms sintCastAbs_sound
+
+/--
+info: 'Anneal.AiPccMirTests.signed_a4_edge_falsification' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signed_a4_edge_falsification
 
 end Anneal.AiPccMirTests

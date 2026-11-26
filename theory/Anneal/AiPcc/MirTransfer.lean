@@ -2146,37 +2146,36 @@ theorem castUintAbs_sound {uSrc uDst : UintTy} {a : AbsVal} {x : Nat}
   cases hEq : Nat.beq (uintWidth uSrc) (uintWidth uDst) with
   | true =>
     have hwEq := Nat.eq_of_beq_eq_true hEq
-    simp only
+    dsimp only
     rw [← hwEq, wrapVal_of_lt hxLt]
     exact hx
   | false =>
-    simp only
+    dsimp only
     cases hLt : Nat.blt (uintWidth uSrc) (uintWidth uDst) with
     | true =>
-      simp only
+      dsimp only
       have hMono := modPow2_mono (Nat.le_of_lt (lt_of_blt_true hLt))
       rw [wrapVal_of_lt (Nat.lt_of_lt_of_le hxLt hMono)]
       exact absVal_refineUleConst_sound (uintWidth_valid uDst)
         (absVal_denote_widen hMono hx) hai (Nat.le_sub_one_of_lt hxLt)
     | false =>
-      simp only
+      dsimp only
       cases hEx : a.exactVal? (uintWidth uSrc) with
       | some cx =>
-        simp only
+        dsimp only
         have h1 := (absVal_exactVal?_sound hEx hx).1
-        injection h1 with h1
-        subst h1
+        cases h1
         exact absVal_const_sound (uintWidth_valid uDst)
       | none =>
-        simp only
+        dsimp only
         cases hHi : a.ubound? with
         | none => exact hNarrowCap
         | some hi =>
-          simp only
+          dsimp only
           cases hHiLt : Nat.blt hi (modPow2 (uintWidth uDst)) with
           | false => exact hNarrowCap
           | true =>
-            simp only
+            dsimp only
             have hXLeHi : x ≤ hi := absVal_ubound?_sound hHi hx
             have hHiDst : hi < modPow2 (uintWidth uDst) := lt_of_blt_true hHiLt
             have hXDst : x < modPow2 (uintWidth uDst) :=
@@ -2195,16 +2194,16 @@ theorem castUintAbs_sound {uSrc uDst : UintTy} {a : AbsVal} {x : Nat}
               | top => rw [hI0, hWi] at hHi; nomatch hHi
               | iv lo hi' =>
                 rw [hI0, hWi] at hHi
-                simp only at hHi
+                dsimp only at hHi
                 cases hBle : Nat.ble lo hi' with
                 | false => rw [hBle] at hHi; nomatch hHi
                 | true =>
                   rw [hBle] at hHi
-                  injection hHi with hHiEq
-                  subst hHiEq
+                  cases hHi
                   have hW := hxE.2.2.1
                   rw [hWi] at hW
-                  simp only [WrappedInterval.denote, hBle] at hW
+                  dsimp only [WrappedInterval.denote] at hW
+                  rw [hBle] at hW
                   have hLoLeHi := Nat.le_of_ble_eq_true hBle
                   exact wrapped_denote_iv_of_le
                     (Nat.lt_of_le_of_lt hLoLeHi hHiDst) hHiDst hLoLeHi
@@ -5793,13 +5792,17 @@ theorem evalScalarBinOp_sint_divrem_frame {op : BinOp} {u : UintTy} {a b : Nat}
     subst hop
     refine hCases evalSignedDiv (evalSignedDiv_cases a b (uintBytes u)) ?_
     intro locals mem
-    simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+    conv => lhs; whnf
+    rw [uintBytes_beq_zero]; conv => lhs; whnf
+    rw [Nat.beq_refl]
     cases Nat.beq b 0 <;> rfl
   | inr hop =>
     subst hop
     refine hCases evalSignedRem (evalSignedRem_cases a b (uintBytes u)) ?_
     intro locals mem
-    simp only [evalScalarBinOp, uintBytes_beq_zero, Nat.beq_refl]
+    conv => lhs; whnf
+    rw [uintBytes_beq_zero]; conv => lhs; whnf
+    rw [Nat.beq_refl]
     cases Nat.beq b 0 <;> rfl
 
 
