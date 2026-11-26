@@ -1644,6 +1644,236 @@ theorem miriReleaseOneProtector_preserves_noDup (st : MiriTbState)
         | some _ => exact hRep
         | none => exact hRep
 
+/-- `miriBeginFrame` preserves `MiriAllocIdsNoDup` on both `.ok` and `.err`. -/
+theorem miriBeginFrame_preserves_noDup (st : MiriTbState) (frameId : Nat)
+    (hNoDup : MiriAllocIdsNoDup st.allocTrees) :
+    match miriBeginFrame st frameId with
+    | .ok st' => MiriAllocIdsNoDup st'.allocTrees
+    | .err st' _ => MiriAllocIdsNoDup st'.allocTrees := by
+  unfold miriBeginFrame
+  cases miriFindFrame? frameId st.frames with
+  | some _ => exact hNoDup
+  | none => exact hNoDup
+
+/-- `miriRegisterProtectorOpt` leaves `allocTrees` identically untouched. -/
+theorem miriRegisterProtectorOpt_allocTrees (st : MiriTbState) (frameIdOpt : Option Nat)
+    (allocId : AllocId) (newTag : Nat) :
+    (miriRegisterProtectorOpt st frameIdOpt allocId newTag).allocTrees = st.allocTrees := by
+  cases frameIdOpt <;> rfl
+
+/-- `miriEndCall` leaves `allocTrees` identically untouched. -/
+theorem miriEndCall_allocTrees (st : MiriTbState) (frameId : Nat) :
+    (miriEndCall st frameId).allocTrees = st.allocTrees :=
+  rfl
+
+/-- `miriReborrowTag` preserves `MiriAllocIdsNoDup` across ALL `.ok` and `.err` paths! -/
+theorem miriReborrowTag_preserves_noDup (mem : Memory) (st : MiriTbState)
+    (frameIdOpt : Option Nat) (allocId : AllocId) (newTag parentTag : Nat)
+    (insidePerm outsidePerm : MiriPerm) (off size : Nat)
+    (hNoDup : MiriAllocIdsNoDup st.allocTrees) :
+    match miriReborrowTag mem st frameIdOpt allocId newTag parentTag insidePerm outsidePerm off size with
+    | .ok st' => MiriAllocIdsNoDup st'.allocTrees
+    | .err st' _ => MiriAllocIdsNoDup st'.allocTrees := by
+  unfold miriReborrowTag
+  dsimp only
+  cases miriInitialInsideLoc newTag insidePerm _ with
+  | error _ => exact hNoDup
+  | ok insideLoc =>
+    dsimp only
+    cases miriInitialOutsideLoc newTag outsidePerm _ with
+    | error _ => exact hNoDup
+    | ok outsideLoc =>
+      dsimp only
+      cases miriCheckFrameOpt frameIdOpt st.frames with
+      | error _ => exact hNoDup
+      | ok _ =>
+        dsimp only
+        have hRegNoDup :
+            MiriAllocIdsNoDup (miriRegisterProtectorOpt st frameIdOpt allocId newTag).allocTrees := by
+          rw [miriRegisterProtectorOpt_allocTrees]; exact hNoDup
+        cases miriInspectAllocV2026 allocId mem with
+        | missing => exact hRegNoDup
+        | dead => exact hRegNoDup
+        | live mutability =>
+          dsimp only
+          cases miriFindAllocTree? allocId st.allocTrees with
+          | none => exact hRegNoDup
+          | some atree0 =>
+            dsimp only
+            cases miriFindTopoNode? newTag atree0.tree with
+            | some _ => exact hRegNoDup
+            | none =>
+              dsimp only
+              cases miriFindTopoNode? parentTag atree0.tree with
+              | none => exact hRegNoDup
+              | some _ =>
+                dsimp only
+                have hParentStep :
+                    match
+                      (match Nat.beq size 0 with
+                       | true => MiriTbResult.ok (miriRegisterProtectorOpt st frameIdOpt allocId newTag)
+                       | false =>
+                         match miriAssociatedAccess insidePerm with
+                         | none =>
+                           if miriRangeIsCovered off size atree0.segments then
+                             .ok (miriRegisterProtectorOpt st frameIdOpt allocId newTag)
+                           else
+                             .err (miriRegisterProtectorOpt st frameIdOpt allocId newTag)
+                               (.uncoveredRange allocId)
+                         | some pKind =>
+                           match !miriKindIsRead pKind &&
+                             (match mutability with | .not => true | .mut => false) with
+                           | true =>
+                             .err (miriRegisterProtectorOpt st frameIdOpt allocId newTag)
+                               (.writeToReadOnly allocId)
+                           | false =>
+                             miriPerformRangedAccess
+                               (miriRegisterProtectorOpt st frameIdOpt allocId newTag)
+                               allocId parentTag off size pKind .visitChildrenOfAccessed) with
+                    | .ok stP => MiriAllocIdsNoDup stP.allocTrees
+                    | .err stP _ => MiriAllocIdsNoDup stP.allocTrees := by
+                  cases Nat.beq size 0 with
+                  | true => exact hRegNoDup
+                  | false =>
+                    dsimp only
+                    cases miriAssociatedAccess insidePerm with
+                    | none =>
+                      dsimp only
+                      cases miriRangeIsCovered off size atree0.segments with
+                      | true => exact hRegNoDup
+                      | false => exact hRegNoDup
+                    | some pKind =>
+                      dsimp only
+                      cases !miriKindIsRead pKind &&
+                          (match mutability with | .not => true | .mut => false) with
+                      | true => exact hRegNoDup
+                      | false =>
+                        dsimp only
+                        exact miriPerformRangedAccess_preserves_noDup
+                          (miriRegisterProtectorOpt st frameIdOpt allocId newTag)
+                          allocId parentTag off size pKind .visitChildrenOfAccessed hRegNoDup
+                have hFin :
+                    ∀ (ps : MiriTbResult MiriTbState),
+                      (match ps with
+                       | .ok stP => MiriAllocIdsNoDup stP.allocTrees
+                       | .err stP _ => MiriAllocIdsNoDup stP.allocTrees) →
+                      match
+                        (match ps with
+                         | .err partialSt err => MiriTbResult.err partialSt err
+                         | .ok stAfterParent =>
+                           match miriFindAllocTree? allocId stAfterParent.allocTrees with
+                           | none => .err stAfterParent (.uncoveredRange allocId)
+                           | some atree =>
+                             let ancPath := miriAncestorPath atree.tree parentTag
+                             let tree' := miriInsertChildTopo atree.tree parentTag newTag
+                             let splitSegs := miriSplitSegmentsAt off size atree.segments
+                             let minSifa :=
+                               if Nat.beq size 0 then
+                                 outsideLoc.sifa
+                               else
+                                 miriSifaEnsureNoStrongerThan insideLoc.sifa outsideLoc.sifa
+                             let segs' : List MiriSegment :=
+                               splitSegs.map (fun seg =>
+                                 let wSeg := miriWeakenSegmentAncestors ancPath minSifa seg
+                                 let childLoc :=
+                                   if miriSegmentOverlaps off size seg then insideLoc else outsideLoc
+                                 MiriSegment.mk wSeg.offset wSeg.size
+                                   (wSeg.entries ++ [MiriTagEntry.mk newTag childLoc]))
+                             .ok { frames := stAfterParent.frames
+                                   allocTrees :=
+                                     miriReplaceAllocTree
+                                       { allocId := allocId, tree := tree', segments := segs' }
+                                       stAfterParent.allocTrees }) with
+                      | .ok st' => MiriAllocIdsNoDup st'.allocTrees
+                      | .err st' _ => MiriAllocIdsNoDup st'.allocTrees := by
+                  intro ps hPs
+                  cases ps with
+                  | err partialSt err => exact hPs
+                  | ok stAfterParent =>
+                    dsimp only
+                    cases miriFindAllocTree? allocId stAfterParent.allocTrees with
+                    | none => exact hPs
+                    | some atree =>
+                      dsimp only
+                      exact miriReplaceAllocTree_preserves_noDup _ stAfterParent.allocTrees hPs
+                exact hFin _ hParentStep
+
+/-- `miriReleaseTagListForward` preserves `MiriAllocIdsNoDup` on BOTH `.ok` and `.err` outcomes! -/
+theorem miriReleaseTagListForward_preserves_noDup (mem : Memory)
+    (tags : List (AllocId × Nat)) :
+    ∀ (st : MiriTbState),
+      MiriAllocIdsNoDup st.allocTrees →
+      match miriReleaseTagListForward mem st tags with
+      | .ok st' => MiriAllocIdsNoDup st'.allocTrees
+      | .err st' _ => MiriAllocIdsNoDup st'.allocTrees := by
+  induction tags with
+  | nil =>
+    intro st hNoDup
+    exact hNoDup
+  | cons pair rest ih =>
+    intro st hNoDup
+    have hFold :
+        ∀ (acc : MiriTbResult MiriTbState),
+          (match acc with
+           | .ok s => MiriAllocIdsNoDup s.allocTrees
+           | .err s _ => MiriAllocIdsNoDup s.allocTrees) →
+          match rest.foldl
+              (fun (a : MiriTbResult MiriTbState) p =>
+                match a with
+                | .err ps e => .err ps e
+                | .ok cs =>
+                  match miriInspectAllocV2026 p.1 mem with
+                  | .missing => .err cs (.deadOrMissingAlloc p.1)
+                  | .dead => .ok cs
+                  | .live _ => miriReleaseOneProtector cs p.1 p.2) acc with
+          | .ok st' => MiriAllocIdsNoDup st'.allocTrees
+          | .err st' _ => MiriAllocIdsNoDup st'.allocTrees := by
+      intro acc hAcc
+      cases acc with
+      | ok s => exact ih s hAcc
+      | err ps e =>
+        have hSticky :
+            ∀ (xs : List (AllocId × Nat)),
+              xs.foldl
+                (fun (a : MiriTbResult MiriTbState) p =>
+                  match a with
+                  | .err ps' e' => .err ps' e'
+                  | .ok cs =>
+                    match miriInspectAllocV2026 p.1 mem with
+                    | .missing => .err cs (.deadOrMissingAlloc p.1)
+                    | .dead => .ok cs
+                    | .live _ => miriReleaseOneProtector cs p.1 p.2)
+                (MiriTbResult.err ps e) = MiriTbResult.err ps e := by
+          intro xs
+          induction xs with
+          | nil => rfl
+          | cons _ tl ihXs => exact ihXs
+        rw [hSticky rest]
+        exact hAcc
+    unfold miriReleaseTagListForward
+    dsimp only [List.foldl]
+    apply hFold
+    cases miriInspectAllocV2026 pair.1 mem with
+    | missing => exact hNoDup
+    | dead => exact hNoDup
+    | live _ => exact miriReleaseOneProtector_preserves_noDup st pair.1 pair.2 hNoDup
+
+/-- `miriExitCallFrame` preserves `MiriAllocIdsNoDup` on BOTH `.ok` and `.err` outcomes! -/
+theorem miriExitCallFrame_preserves_noDup (mem : Memory) (st : MiriTbState) (frameId : Nat)
+    (hNoDup : MiriAllocIdsNoDup st.allocTrees) :
+    match miriExitCallFrame mem st frameId with
+    | .ok st' => MiriAllocIdsNoDup st'.allocTrees
+    | .err st' _ => MiriAllocIdsNoDup st'.allocTrees := by
+  unfold miriExitCallFrame
+  cases miriFindFrame? frameId st.frames with
+  | none => exact hNoDup
+  | some frame =>
+    dsimp only
+    have hRel := miriReleaseTagListForward_preserves_noDup mem frame.protectedTags st hNoDup
+    cases hR : miriReleaseTagListForward mem st frame.protectedTags with
+    | err partialSt err => rw [hR] at hRel; exact hRel
+    | ok releasedSt => rw [hR] at hRel; exact hRel
+
 /-- Disjoint-allocation frame preservation for `miriPerformRangedAccess`: accessing `a₁` leaves
 `a₂ ≠ a₁` completely untouched on BOTH `.ok` and `.err` outcomes! -/
 theorem miriPerformRangedAccess_preserves_other_alloc (st : MiriTbState)
@@ -2327,6 +2557,65 @@ theorem retagKindToInitialPerms_eq_v2026_retagPerm
     simp only [retagKindToInitialPerms, retagPerm, fnEntryRetagPerm,
       mutabilityToMiriRefKind, retagKindIsProtected, miriSelectRetagPerm] <;>
     cases rigidTyIsFreeze 16 pointee <;> exact ⟨rfl, rfl⟩
+
+/-- **Exact shared-borrow initial-permission bridge** to unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.sharedBorrowPerm`. -/
+theorem miriSelectRetagPerm_eq_v2026_sharedBorrowPerm
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place) :
+    miriPermToV2026
+        (miriSelectRetagPerm .shared true
+          (match placeTy localDecls layouts place with
+           | .some ty => tyIsFreeze ty
+           | .none => true)
+          false false) =
+      sharedBorrowPerm localDecls layouts place := by
+  unfold sharedBorrowPerm
+  cases placeTy localDecls layouts place with
+  | none => rfl
+  | some ty => dsimp only; cases tyIsFreeze ty <;> rfl
+
+/-- **Exact mutable-borrow initial-permission bridge** to unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.mutableBorrowPerm`. -/
+theorem miriSelectRetagPerm_eq_v2026_mutableBorrowPerm
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place) :
+    miriPermToV2026
+        (miriSelectRetagPerm .mutable true
+          (match placeTy localDecls layouts place with
+           | .some ty => tyIsFreeze ty
+           | .none => true)
+          false false) =
+      mutableBorrowPerm localDecls layouts place := by
+  unfold mutableBorrowPerm
+  cases placeTy localDecls layouts place with
+  | none => rfl
+  | some ty => dsimp only; cases tyIsFreeze ty <;> rfl
+
+/-- **Exact protector-check bridge** to unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowProtectorCheck`: on any non-disabled foreign
+access, `miriPerformLocAccess` agrees with `treeBorrowProtectorCheck` applied to
+`treeBorrowPermTransition`. -/
+theorem miriPerformLocAccess_foreign_eq_v2026_treeBorrowProtectorCheck
+    (tag : Nat) (kind : MiriAccessKind) (perm : MiriPerm) (sifa : MiriSifa)
+    (isProtected : Bool) (hNotDis : perm ≠ .disabled) :
+    match treeBorrowProtectorCheck isProtected
+        (treeBorrowPermTransition (miriAccessKindToV2026 kind) .foreignAccess
+          (miriPermToV2026 perm) isProtected) with
+    | .transition next =>
+      miriPerformLocAccess tag ⟨perm, true, sifa⟩ kind .foreignAccess isProtected =
+        .ok ⟨v2026PermToMiri next, true, miriSifaRecordNew sifa kind .foreignAccess⟩
+    | .ub =>
+      ∃ st' err,
+        miriPerformLocAccess tag ⟨perm, true, sifa⟩ kind .foreignAccess isProtected = .err st' err ∧
+        (err = .childAccessForbidden tag perm ∨ err = .protectedDisabled tag perm)
+    | .protectedReservedIM =>
+      miriPerformLocAccess tag ⟨perm, true, sifa⟩ kind .foreignAccess isProtected =
+        .err ⟨perm, true, miriSifaRecordNew sifa kind .foreignAccess⟩
+          (.impossibleProtectedReservedIM tag) := by
+  have h := miriPerformLocAccess_agrees_v2026_treeBorrowNodeAccess tag kind .foreignAccess perm sifa
+    isProtected (fun _ => hNotDis)
+  cases perm with
+  | disabled => exact False.elim (hNotDis rfl)
+  | cell | reservedFrz _ | reservedIM | unique | frozen => exact h
 
 /-- **Exact range-disjointness bridge** to unmodified
 `Trusted.Rustc.V2026_06_01.MirSemantics.rangesDisjoint`. -/
