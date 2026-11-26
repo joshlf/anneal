@@ -1767,6 +1767,618 @@ theorem intCastBits_widen_nonneg {uSrc uDst : UintTy} {x : Nat}
   rw [hWb]
   exact signExtendBits_nonneg hx hWb
 
+/-- Strict widening implies `2^(wSrc) ≤ 2^(wDst - 1)`. -/
+theorem modPow2_le_halfModPow2_of_lt_width {uSrc uDst : UintTy}
+    (hW : Nat.ble (uintWidth uDst) (uintWidth uSrc) = false) :
+    modPow2 (uintWidth uSrc) ≤ halfModPow2 (uintWidth uDst) := by
+  have hLt : uintWidth uSrc < uintWidth uDst :=
+    Nat.lt_of_not_le (fun hLe => by rw [Nat.ble_eq_true_of_le hLe] at hW; nomatch hW)
+  exact modPow2_mono (Nat.le_sub_one_of_lt hLt)
+
+/-- Sign-extending a signed bit pattern from `uSrc` to a strictly wider `uDst`
+acts as an exact affine shift by `halfModPow2 wDst - halfModPow2 wSrc` in
+biased signed coordinates. -/
+theorem signedBias_signExtendBits {uSrc uDst : UintTy} {x : Nat}
+    (hxM : x < modPow2 (uintWidth uSrc))
+    (hW : Nat.ble (uintWidth uDst) (uintWidth uSrc) = false) :
+    signedBias (uintWidth uDst)
+        (signExtendBits x (uintBytes uSrc) (uintBytes uDst)) =
+      signedBias (uintWidth uSrc) x +
+        (halfModPow2 (uintWidth uDst) - halfModPow2 (uintWidth uSrc)) := by
+  have hw1 := uintWidth_valid uSrc
+  have hw2 := uintWidth_valid uDst
+  have hWb : Nat.ble (uintBytes uDst) (uintBytes uSrc) = false := by
+    rw [uintBytes_ble_eq_width]; exact hW
+  have hM1LeH2 : modPow2 (uintWidth uSrc) ≤ halfModPow2 (uintWidth uDst) :=
+    modPow2_le_halfModPow2_of_lt_width hW
+  have hH1Eq := halfModPow2_uintWidth_eq_half uSrc
+  have hH2Eq := halfModPow2_uintWidth_eq_half uDst
+  have hM1Eq := modPow2_eq_half_add_half hw1
+  have hM2Eq := modPow2_eq_half_add_half hw2
+  have hH1LeH2 : halfModPow2 (uintWidth uSrc) ≤ halfModPow2 (uintWidth uDst) :=
+    Nat.le_trans (Nat.le_of_lt (halfModPow2_lt_modPow2 hw1)) hM1LeH2
+  cases Nat.lt_or_ge x (halfModPow2 (uintWidth uSrc)) with
+  | inl hxL =>
+    have hxL' : x < modPow2 (uintWidth uSrc) / 2 := hH1Eq ▸ hxL
+    rw [signExtendBits_nonneg hxL' hWb]
+    have hxL2 : x < halfModPow2 (uintWidth uDst) := Nat.lt_of_lt_of_le hxL hH1LeH2
+    rw [signedBias_of_lt_half hw2 hxL2, signedBias_of_lt_half hw1 hxL,
+      Nat.add_assoc, Nat.add_comm (halfModPow2 (uintWidth uSrc)),
+      Nat.sub_add_cancel hH1LeH2]
+  | inr hxG =>
+    have hxG' : modPow2 (uintWidth uSrc) / 2 ≤ x := hH1Eq ▸ hxG
+    rw [signExtendBits_neg hxG' hxM hWb]
+    have hM1LeM2 : modPow2 (uintWidth uSrc) ≤ modPow2 (uintWidth uDst) :=
+      Nat.le_trans hM1LeH2 (Nat.le_of_lt (halfModPow2_lt_modPow2 hw2))
+    have hH2LeDiff : halfModPow2 (uintWidth uDst) ≤
+        modPow2 (uintWidth uDst) - modPow2 (uintWidth uSrc) := by
+      apply Nat.le_sub_of_add_le
+      rw [hM2Eq]
+      exact Nat.add_le_add_left hM1LeH2 _
+    have hGeH2 : halfModPow2 (uintWidth uDst) ≤
+        modPow2 (uintWidth uDst) - modPow2 (uintWidth uSrc) + x :=
+      Nat.le_trans hH2LeDiff (Nat.le_add_right _ _)
+    have hLtM2 : modPow2 (uintWidth uDst) - modPow2 (uintWidth uSrc) + x <
+        modPow2 (uintWidth uDst) := by
+      have h := Nat.add_lt_add_left hxM
+        (modPow2 (uintWidth uDst) - modPow2 (uintWidth uSrc))
+      rwa [Nat.sub_add_cancel hM1LeM2] at h
+    rw [signedBias_of_ge_half hw2 hGeH2 hLtM2, signedBias_of_ge_half hw1 hxG hxM]
+    apply Nat.add_right_cancel (m := halfModPow2 (uintWidth uDst) +
+      modPow2 (uintWidth uSrc))
+    have hLhs :
+        (modPow2 (uintWidth uDst) - modPow2 (uintWidth uSrc) + x -
+            halfModPow2 (uintWidth uDst)) +
+          (halfModPow2 (uintWidth uDst) + modPow2 (uintWidth uSrc)) =
+        modPow2 (uintWidth uDst) + x := by
+      rw [← Nat.add_assoc, Nat.sub_add_cancel hGeH2,
+        Nat.add_right_comm, Nat.sub_add_cancel hM1LeM2]
+    have hRhs :
+        (x - halfModPow2 (uintWidth uSrc) +
+            (halfModPow2 (uintWidth uDst) - halfModPow2 (uintWidth uSrc))) +
+          (halfModPow2 (uintWidth uDst) + modPow2 (uintWidth uSrc)) =
+        modPow2 (uintWidth uDst) + x := by
+      let H1 := halfModPow2 (uintWidth uSrc)
+      let H2 := halfModPow2 (uintWidth uDst)
+      let a := x - H1
+      let b := H2 - H1
+      have hPerm : (a + b) + (H2 + (H1 + H1)) = (a + H1) + ((b + H1) + H2) :=
+        calc (a + b) + (H2 + (H1 + H1))
+            = a + (b + (H2 + (H1 + H1))) := Nat.add_assoc _ _ _
+          _ = a + ((b + H1) + (H1 + H2)) := by
+              rw [Nat.add_comm H2 (H1 + H1), ← Nat.add_assoc b (H1 + H1),
+                ← Nat.add_assoc b H1 H1, Nat.add_assoc (b + H1) H1 H2]
+          _ = a + (H1 + ((b + H1) + H2)) := by
+              rw [Nat.add_comm (b + H1) (H1 + H2), Nat.add_assoc H1 H2 (b + H1),
+                Nat.add_comm H2 (b + H1)]
+          _ = (a + H1) + ((b + H1) + H2) := (Nat.add_assoc _ _ _).symm
+      change (a + b) + (H2 + modPow2 (uintWidth uSrc)) = modPow2 (uintWidth uDst) + x
+      rw [hM1Eq, hM2Eq]
+      change (a + b) + (H2 + (H1 + H1)) = (H2 + H2) + x
+      rw [hPerm]
+      have ha : a + H1 = x := Nat.sub_add_cancel hxG
+      have hb : b + H1 = H2 := Nat.sub_add_cancel hH1LeH2
+      rw [ha, hb, Nat.add_comm]
+    exact Eq.trans hLhs hRhs.symm
+
+/-- Any biased signed interval `[sLo, sHi]` (`sHi < 2^w`) maps via the
+involution `signedBias w` to a `WrappedInterval.iv (signedBias w sLo)
+(signedBias w sHi)` denoting every `y < 2^w` with `sLo ≤ signedBias w y ≤ sHi`. -/
+theorem signedBias_iv_denote {w sLo sHi y : Nat} (hw : validWidth w = true)
+    (hLoLe : sLo ≤ signedBias w y) (hLeHi : signedBias w y ≤ sHi)
+    (hHiLt : sHi < modPow2 w) (hyLt : y < modPow2 w) :
+    (WrappedInterval.iv (signedBias w sLo) (signedBias w sHi)).denote
+      (modPow2 w) y := by
+  have hLoLt : sLo < modPow2 w :=
+    Nat.lt_of_le_of_lt (Nat.le_trans hLoLe hLeHi) hHiLt
+  have hInv : signedBias w (signedBias w y) = y := signedBias_signedBias hw hyLt
+  refine ⟨signedBias_lt sLo, signedBias_lt sHi, hyLt, ?_⟩
+  cases Nat.lt_or_ge sHi (halfModPow2 w) with
+  | inl hHiH =>
+    have hLoH : sLo < halfModPow2 w :=
+      Nat.lt_of_le_of_lt (Nat.le_trans hLoLe hLeHi) hHiH
+    have hYH : signedBias w y < halfModPow2 w := Nat.lt_of_le_of_lt hLeHi hHiH
+    have hLoE := signedBias_of_lt_half hw hLoH
+    have hHiE := signedBias_of_lt_half hw hHiH
+    have hYE : y = signedBias w y + halfModPow2 w :=
+      Eq.trans hInv.symm (signedBias_of_lt_half hw hYH)
+    rw [hLoE, hHiE, Nat.ble_eq_true_of_le
+      (Nat.add_le_add_right (Nat.le_trans hLoLe hLeHi) _), hYE]
+    exact ⟨Nat.add_le_add_right hLoLe _, Nat.add_le_add_right hLeHi _⟩
+  | inr hHiGe =>
+    cases Nat.lt_or_ge sLo (halfModPow2 w) with
+    | inr hLoGe =>
+      have hYGe : halfModPow2 w ≤ signedBias w y := Nat.le_trans hLoGe hLoLe
+      have hLoE := signedBias_of_ge_half hw hLoGe hLoLt
+      have hHiE := signedBias_of_ge_half hw hHiGe hHiLt
+      have hYE : y = signedBias w y - halfModPow2 w :=
+        Eq.trans hInv.symm (signedBias_of_ge_half hw hYGe (signedBias_lt y))
+      rw [hLoE, hHiE, Nat.ble_eq_true_of_le
+        (Nat.sub_le_sub_right (Nat.le_trans hLoLe hLeHi) _), hYE]
+      exact ⟨Nat.sub_le_sub_right hLoLe _, Nat.sub_le_sub_right hLeHi _⟩
+    | inl hLoH =>
+      have hLoE := signedBias_of_lt_half hw hLoH
+      have hHiE := signedBias_of_ge_half hw hHiGe hHiLt
+      have hHiLtH : sHi - halfModPow2 w < halfModPow2 w :=
+        nat_sub_lt_of_lt_add hHiGe (modPow2_eq_half_add_half hw ▸ hHiLt)
+      have hHiLtLo : sHi - halfModPow2 w < sLo + halfModPow2 w :=
+        Nat.lt_of_lt_of_le hHiLtH (Nat.le_add_left _ _)
+      have hBleF : Nat.ble (sLo + halfModPow2 w) (sHi - halfModPow2 w) = false := by
+        cases hb : Nat.ble (sLo + halfModPow2 w) (sHi - halfModPow2 w) with
+        | false => rfl
+        | true =>
+          exact False.elim (Nat.not_le_of_gt hHiLtLo (Nat.le_of_ble_eq_true hb))
+      rw [hLoE, hHiE, hBleF]
+      cases Nat.lt_or_ge (signedBias w y) (halfModPow2 w) with
+      | inl hYH =>
+        have hYE : y = signedBias w y + halfModPow2 w :=
+          Eq.trans hInv.symm (signedBias_of_lt_half hw hYH)
+        rw [hYE]
+        exact Or.inl (Nat.add_le_add_right hLoLe _)
+      | inr hYGe =>
+        have hYE : y = signedBias w y - halfModPow2 w :=
+          Eq.trans hInv.symm (signedBias_of_ge_half hw hYGe (signedBias_lt y))
+        rw [hYE]
+        exact Or.inr (Nat.sub_le_sub_right hLeHi _)
+
+/-- Commutativity of `signedOverflowAdd`. -/
+theorem signedOverflowAdd_comm (a b sz : Nat) :
+    signedOverflowAdd a b sz = signedOverflowAdd b a sz := by
+  unfold signedOverflowAdd
+  have hAdd : Nat.add a b = Nat.add b a := Nat.add_comm a b
+  rw [hAdd]
+  cases isSignedNegative a sz <;> cases isSignedNegative b sz <;> rfl
+
+/-- Exact biased-coordinate characterization of signed addition overflow:
+`signedOverflowAdd x y = true` iff `bias x + bias y < H` or `3 * H ≤ bias x + bias y`. -/
+theorem signedOverflowAdd_iff_biased_out {x y : Nat}
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    signedOverflowAdd x y (uintBytes u) = true ↔
+      signedBias (uintWidth u) x + signedBias (uintWidth u) y <
+          halfModPow2 (uintWidth u) ∨
+        3 * halfModPow2 (uintWidth u) ≤
+          signedBias (uintWidth u) x + signedBias (uintWidth u) y := by
+  have hw := uintWidth_valid u
+  have hHEq := halfModPow2_uintWidth_eq_half u
+  have hMEq := modPow2_eq_half_add_half hw
+  let H := halfModPow2 (uintWidth u)
+  constructor
+  · intro hOv
+    cases Nat.lt_or_ge
+        (signedBias (uintWidth u) x + signedBias (uintWidth u) y) H with
+    | inl hLo => exact Or.inl hLo
+    | inr hGe =>
+      cases Nat.lt_or_ge
+          (signedBias (uintWidth u) x + signedBias (uintWidth u) y) (3 * H) with
+      | inr hHi => exact Or.inr hHi
+      | inl hLt =>
+        rw [signedOverflowAdd_false_of_biased_bounds hx hy hGe hLt] at hOv
+        nomatch hOv
+  · intro hOut
+    cases hOut with
+    | inl hLo =>
+      have hxG : H ≤ x :=
+        Nat.le_of_not_lt (fun hxL => by
+          rw [signedBias_of_lt_half hw hxL] at hLo
+          exact Nat.not_le_of_gt hLo
+            (Nat.le_trans (Nat.le_add_left _ _) (Nat.le_add_right _ _)))
+      have hyG : H ≤ y :=
+        Nat.le_of_not_lt (fun hyL => by
+          rw [signedBias_of_lt_half hw hyL] at hLo
+          exact Nat.not_le_of_gt hLo
+            (Nat.le_trans (Nat.le_add_left _ _) (Nat.le_add_left _ _)))
+      rw [signedBias_of_ge_half hw hxG hx, signedBias_of_ge_half hw hyG hy] at hLo
+      have hMLe : modPow2 (uintWidth u) ≤ x + y := by
+        rw [hMEq]; exact Nat.add_le_add hxG hyG
+      have hSubLtH : x + y - modPow2 (uintWidth u) < H := by
+        apply nat_lt_of_add_lt_add_right (c := modPow2 (uintWidth u))
+        rw [Nat.sub_add_cancel hMLe]
+        have h2 := Nat.add_lt_add_right hLo (H + H)
+        rw [Nat.add_add_add_comm (x - H) (y - H), Nat.sub_add_cancel hxG,
+          Nat.sub_add_cancel hyG, ← hMEq] at h2
+        exact h2
+      have hSubLtM : x + y - modPow2 (uintWidth u) < modPow2 (uintWidth u) :=
+        Nat.lt_trans hSubLtH (halfModPow2_lt_modPow2 hw)
+      have hMod : wrapVal (uintWidth u) (x + y) = x + y - modPow2 (uintWidth u) := by
+        dsimp only [wrapVal]
+        rw [nat_mod_eq_sub_mod hMLe]
+        exact nat_mod_eq_of_lt hSubLtM
+      have hAddEq : Nat.add x y = x + y := rfl
+      simp only [signedOverflowAdd]
+      rw [isSignedNegative_of_ge_half (hHEq ▸ hxG) hx,
+        isSignedNegative_of_ge_half (hHEq ▸ hyG) hy,
+        hAddEq, wrapScalarBits_eq_wrapVal, hMod,
+        isSignedNegative_of_lt_half (hHEq ▸ hSubLtH)]
+    | inr hHi =>
+      have hxL : x < H :=
+        Nat.lt_of_not_ge (fun hxG => by
+          have h1 : signedBias (uintWidth u) x < H := by
+            rw [signedBias_of_ge_half hw hxG hx]
+            exact nat_sub_lt_of_lt_add hxG (hMEq ▸ hx)
+          have h2 : signedBias (uintWidth u) y < H + H := hMEq ▸ signedBias_lt y
+          have hSum := Nat.add_lt_add h1 h2
+          rw [← three_mul_eq] at hSum
+          exact Nat.not_le_of_gt hSum hHi)
+      have hyL : y < H :=
+        Nat.lt_of_not_ge (fun hyG => by
+          have h1 : signedBias (uintWidth u) y < H := by
+            rw [signedBias_of_ge_half hw hyG hy]
+            exact nat_sub_lt_of_lt_add hyG (hMEq ▸ hy)
+          have h2 : signedBias (uintWidth u) x < H + H := hMEq ▸ signedBias_lt x
+          have hSum := Nat.add_lt_add h1 h2
+          rw [Nat.add_comm (signedBias (uintWidth u) y), ← three_mul_eq] at hSum
+          exact Nat.not_le_of_gt hSum hHi)
+      rw [signedBias_of_lt_half hw hxL, signedBias_of_lt_half hw hyL,
+        Nat.add_add_add_comm, three_mul_eq] at hHi
+      have hGeH : H ≤ x + y := Nat.le_of_add_le_add_right hHi
+      have hLtM : x + y < modPow2 (uintWidth u) := by
+        rw [hMEq]; exact Nat.add_lt_add hxL hyL
+      have hAddEq : Nat.add x y = x + y := rfl
+      simp only [signedOverflowAdd]
+      rw [isSignedNegative_of_lt_half (hHEq ▸ hxL),
+        isSignedNegative_of_lt_half (hHEq ▸ hyL),
+        hAddEq, wrapScalarBits_of_lt_uint hLtM,
+        isSignedNegative_of_ge_half (hHEq ▸ hGeH) hLtM]
+
+/-- Signed addition with a positive constant `0 < c < 2^(w-1)` overflows iff
+`x >s (2^(w-1) - 1 - c)`. -/
+theorem signedOverflowAdd_iff_sgt {x c : Nat}
+    (hx : x < modPow2 (uintWidth u))
+    (hcPos : 0 < c) (hcHalf : c < halfModPow2 (uintWidth u)) :
+    signedOverflowAdd x c (uintBytes u) = true ↔
+      signedBias (uintWidth u) (halfModPow2 (uintWidth u) - 1 - c) <
+        signedBias (uintWidth u) x := by
+  have hw := uintWidth_valid u
+  let H := halfModPow2 (uintWidth u)
+  have hcM : c < modPow2 (uintWidth u) :=
+    Nat.lt_trans hcHalf (halfModPow2_lt_modPow2 hw)
+  have hSc : signedBias (uintWidth u) c = c + H :=
+    signedBias_of_lt_half hw hcHalf
+  have hBndLt : H - 1 - c < H :=
+    Nat.lt_of_le_of_lt (Nat.sub_le _ _)
+      (Nat.sub_lt (Nat.lt_trans hcPos hcHalf) Nat.zero_lt_one)
+  have hSbBnd : signedBias (uintWidth u) (H - 1 - c) = H - 1 - c + H :=
+    signedBias_of_lt_half hw hBndLt
+  have hKey : (H - 1 - c + H + 1) + (c + H) = 3 * H := by
+    have h1 : 1 ≤ H := Nat.lt_trans hcPos hcHalf
+    have h2 : c ≤ H - 1 := Nat.le_sub_one_of_lt hcHalf
+    calc (H - 1 - c + H + 1) + (c + H)
+        = ((H - 1 - c + c) + 1) + (H + H) := by
+            rw [Nat.add_right_comm (H - 1 - c) H 1,
+              Nat.add_assoc (H - 1 - c + 1) H (c + H),
+              Nat.add_left_comm H c H,
+              ← Nat.add_assoc (H - 1 - c + 1) c (H + H),
+              Nat.add_right_comm (H - 1 - c) 1 c]
+      _ = H + (H + H) := by rw [Nat.sub_add_cancel h2, Nat.sub_add_cancel h1]
+      _ = 3 * H := (three_mul_eq H).symm
+  rw [signedOverflowAdd_iff_biased_out hx hcM, hSc, hSbBnd]
+  constructor
+  · intro hOut
+    cases hOut with
+    | inl hLo =>
+      exact False.elim (Nat.not_le_of_gt hLo
+        (Nat.le_trans (Nat.le_add_left _ _) (Nat.le_add_left _ _)))
+    | inr hHi =>
+      exact Nat.lt_of_succ_le
+        (Nat.le_of_add_le_add_right (Nat.le_trans (Nat.le_of_eq hKey) hHi))
+  · intro hLt
+    apply Or.inr
+    rw [← hKey]
+    exact Nat.add_le_add_right hLt (c + H)
+
+/-- Signed addition with a negative constant `2^(w-1) ≤ c < 2^w` overflows iff
+`x ≤s (2^(w-1) + (2^w - c) - 1)`. -/
+theorem signedOverflowAdd_iff_sle {x c : Nat}
+    (hx : x < modPow2 (uintWidth u))
+    (hcHalf : halfModPow2 (uintWidth u) ≤ c)
+    (hcM : c < modPow2 (uintWidth u)) :
+    signedOverflowAdd x c (uintBytes u) = true ↔
+      signedBias (uintWidth u) x ≤
+        signedBias (uintWidth u)
+          (halfModPow2 (uintWidth u) + (modPow2 (uintWidth u) - c) - 1) := by
+  have hw := uintWidth_valid u
+  let H := halfModPow2 (uintWidth u)
+  have hMEq := modPow2_eq_half_add_half hw
+  have hSc : signedBias (uintWidth u) c = c - H :=
+    signedBias_of_ge_half hw hcHalf hcM
+  have hPos : 0 < modPow2 (uintWidth u) - c := Nat.sub_pos_of_lt hcM
+  have hDiffLeH : modPow2 (uintWidth u) - c ≤ H := by
+    apply Nat.sub_le_of_le_add
+    rw [hMEq]
+    exact Nat.add_le_add_left hcHalf H
+  have hBndGe : H ≤ H + (modPow2 (uintWidth u) - c) - 1 := by
+    rw [Nat.add_sub_assoc hPos]
+    exact Nat.le_add_right _ _
+  have hBndLt : H + (modPow2 (uintWidth u) - c) - 1 < modPow2 (uintWidth u) := by
+    rw [Nat.add_sub_assoc hPos]
+    exact Nat.lt_of_lt_of_le
+      (Nat.add_lt_add_left
+        (Nat.lt_of_lt_of_le (Nat.sub_lt hPos Nat.zero_lt_one) hDiffLeH) H)
+      (Nat.le_of_eq hMEq.symm)
+  have hSbBnd : signedBias (uintWidth u) (H + (modPow2 (uintWidth u) - c) - 1) =
+      modPow2 (uintWidth u) - c - 1 := by
+    rw [signedBias_of_ge_half hw hBndGe hBndLt, Nat.add_sub_assoc hPos,
+      Nat.add_sub_cancel_left]
+  have hKey : (modPow2 (uintWidth u) - c - 1) + 1 + (c - H) = H := by
+    rw [Nat.sub_add_cancel hPos]
+    apply Nat.add_right_cancel (m := H)
+    rw [Nat.add_assoc, Nat.sub_add_cancel hcHalf,
+      Nat.sub_add_cancel (Nat.le_of_lt hcM), hMEq]
+  rw [signedOverflowAdd_iff_biased_out hx hcM, hSc, hSbBnd]
+  constructor
+  · intro hOut
+    cases hOut with
+    | inr hHi =>
+      have hSxLt : signedBias (uintWidth u) x < H + H := hMEq ▸ signedBias_lt x
+      have hScLt : c - H < H := nat_sub_lt_of_lt_add hcHalf (hMEq ▸ hcM)
+      have hSum := Nat.add_lt_add hScLt hSxLt
+      rw [Nat.add_comm (c - H), ← three_mul_eq] at hSum
+      exact False.elim (Nat.not_le_of_gt hSum hHi)
+    | inl hLo =>
+      have hLo' : signedBias (uintWidth u) x + (c - H) <
+          (modPow2 (uintWidth u) - c - 1) + 1 + (c - H) :=
+        Nat.lt_of_lt_of_le hLo (Nat.le_of_eq hKey.symm)
+      exact Nat.le_of_lt_succ (nat_lt_of_add_lt_add_right hLo')
+  · intro hLe
+    apply Or.inl
+    exact Nat.lt_of_lt_of_le (Nat.add_lt_add_right (Nat.lt_succ_of_le hLe) (c - H))
+      (Nat.le_of_eq hKey)
+
+/-- Exact biased-coordinate characterization of signed subtraction overflow:
+`signedOverflowSub x y = true` iff `bias x + H < bias y` or `bias y + H ≤ bias x`. -/
+theorem signedOverflowSub_iff_biased_out {x y : Nat}
+    (hx : x < modPow2 (uintWidth u)) (hy : y < modPow2 (uintWidth u)) :
+    signedOverflowSub x y (uintBytes u) = true ↔
+      signedBias (uintWidth u) x + halfModPow2 (uintWidth u) <
+          signedBias (uintWidth u) y ∨
+        signedBias (uintWidth u) y + halfModPow2 (uintWidth u) ≤
+          signedBias (uintWidth u) x := by
+  have hw := uintWidth_valid u
+  have hHEq := halfModPow2_uintWidth_eq_half u
+  have hMEq := modPow2_eq_half_add_half hw
+  let H := halfModPow2 (uintWidth u)
+  constructor
+  · intro hOv
+    cases Nat.lt_or_ge (signedBias (uintWidth u) x + H)
+        (signedBias (uintWidth u) y) with
+    | inl hLo => exact Or.inl hLo
+    | inr hGe =>
+      cases Nat.lt_or_ge (signedBias (uintWidth u) x)
+          (signedBias (uintWidth u) y + H) with
+      | inr hHi => exact Or.inr hHi
+      | inl hLt =>
+        rw [signedOverflowSub_false_of_biased_bounds hx hy hGe hLt] at hOv
+        nomatch hOv
+  · intro hOut
+    cases hOut with
+    | inl hLo =>
+      have hxG : H ≤ x :=
+        Nat.le_of_not_lt (fun hxL => by
+          rw [signedBias_of_lt_half hw hxL, Nat.add_assoc, ← hMEq] at hLo
+          exact Nat.not_le_of_gt (Nat.lt_of_lt_of_le (signedBias_lt y)
+            (Nat.le_add_left _ _)) (Nat.le_of_lt hLo))
+      have hyL : y < H :=
+        Nat.lt_of_not_ge (fun hyG => by
+          have hSyLt : signedBias (uintWidth u) y < H := by
+            rw [signedBias_of_ge_half hw hyG hy]
+            exact nat_sub_lt_of_lt_add hyG (hMEq ▸ hy)
+          exact Nat.not_le_of_gt (Nat.lt_of_lt_of_le hSyLt (Nat.le_add_left _ _))
+            (Nat.le_of_lt hLo))
+      rw [signedBias_of_ge_half hw hxG hx, Nat.sub_add_cancel hxG,
+        signedBias_of_lt_half hw hyL] at hLo
+      have hyLeX : y ≤ x := Nat.le_of_lt (Nat.lt_of_lt_of_le hyL hxG)
+      have hSubLtH : x - y < H := by
+        apply nat_lt_of_add_lt_add_right (c := y)
+        rw [Nat.sub_add_cancel hyLeX, Nat.add_comm H y]
+        exact hLo
+      have hSubLtM : x - y < modPow2 (uintWidth u) :=
+        Nat.lt_trans hSubLtH (halfModPow2_lt_modPow2 hw)
+      have hSubEq : Nat.sub x y = x - y := rfl
+      simp only [signedOverflowSub]
+      rw [wrapScalarBits_of_lt_uint hx, wrapScalarBits_of_lt_uint hy,
+        Nat.ble_eq_true_of_le hyLeX]
+      simp only
+      rw [hSubEq, wrapScalarBits_of_lt_uint hSubLtM,
+        isSignedNegative_of_ge_half (hHEq ▸ hxG) hx,
+        isSignedNegative_of_lt_half (hHEq ▸ hyL),
+        isSignedNegative_of_lt_half (hHEq ▸ hSubLtH)]
+    | inr hHi =>
+      have hyG : H ≤ y :=
+        Nat.le_of_not_lt (fun hyL => by
+          rw [signedBias_of_lt_half hw hyL, Nat.add_assoc, ← hMEq] at hHi
+          exact Nat.not_le_of_gt (signedBias_lt x)
+            (Nat.le_trans (Nat.le_add_left _ _) hHi))
+      have hxL : x < H :=
+        Nat.lt_of_not_ge (fun hxG => by
+          have hSxLt : signedBias (uintWidth u) x < H := by
+            rw [signedBias_of_ge_half hw hxG hx]
+            exact nat_sub_lt_of_lt_add hxG (hMEq ▸ hx)
+          exact Nat.not_le_of_gt hSxLt
+            (Nat.le_trans (Nat.le_add_left _ _) hHi))
+      rw [signedBias_of_ge_half hw hyG hy, Nat.sub_add_cancel hyG,
+        signedBias_of_lt_half hw hxL] at hHi
+      have hxLtY : x < y := Nat.lt_of_lt_of_le hxL hyG
+      have hBleF : Nat.ble y x = false := by
+        cases hB : Nat.ble y x with
+        | false => rfl
+        | true => exact False.elim (Nat.not_le_of_gt hxLtY (Nat.le_of_ble_eq_true hB))
+      have hDiffGeH : H ≤ modPow2 (uintWidth u) + x - y := by
+        apply Nat.le_sub_of_add_le
+        rw [hMEq, Nat.add_comm H y, Nat.add_comm (H + H) x, ← Nat.add_assoc x H H]
+        exact Nat.add_le_add_right hHi H
+      have hDiffLtM : modPow2 (uintWidth u) + x - y < modPow2 (uintWidth u) := by
+        apply nat_lt_of_add_lt_add_right (c := y)
+        rw [Nat.sub_add_cancel (Nat.le_trans (Nat.le_of_lt hy) (Nat.le_add_right _ _))]
+        exact Nat.add_lt_add_left hxLtY (modPow2 (uintWidth u))
+      have hW : wrapScalarBits (Nat.sub (Nat.add (scalarModulus (uintBytes u)) x) y)
+          (scalarModulus (uintBytes u)) = modPow2 (uintWidth u) + x - y := by
+        rw [wrapScalarBits_eq_wrapVal, scalarModulus_uintBytes]
+        exact wrapVal_of_lt hDiffLtM
+      simp only [signedOverflowSub]
+      rw [wrapScalarBits_of_lt_uint hx, wrapScalarBits_of_lt_uint hy, hBleF]
+      simp only
+      rw [hW, isSignedNegative_of_lt_half (hHEq ▸ hxL),
+        isSignedNegative_of_ge_half (hHEq ▸ hyG) hy,
+        isSignedNegative_of_ge_half (hHEq ▸ hDiffGeH) hDiffLtM]
+
+/-- Signed subtraction `x - c` with positive `0 < c < 2^(w-1)` overflows iff
+`x ≤s (2^(w-1) + c - 1)`. -/
+theorem signedOverflowSub_constR_pos_iff_sle {x c : Nat}
+    (hx : x < modPow2 (uintWidth u))
+    (hcPos : 0 < c) (hcHalf : c < halfModPow2 (uintWidth u)) :
+    signedOverflowSub x c (uintBytes u) = true ↔
+      signedBias (uintWidth u) x ≤
+        signedBias (uintWidth u) (halfModPow2 (uintWidth u) + c - 1) := by
+  have hw := uintWidth_valid u
+  have hcM : c < modPow2 (uintWidth u) :=
+    Nat.lt_trans hcHalf (halfModPow2_lt_modPow2 hw)
+  have hSc : signedBias (uintWidth u) c = c + halfModPow2 (uintWidth u) :=
+    signedBias_of_lt_half hw hcHalf
+  have hBndGe : halfModPow2 (uintWidth u) ≤ halfModPow2 (uintWidth u) + c - 1 := by
+    rw [Nat.add_sub_assoc hcPos]; exact Nat.le_add_right _ _
+  have hBndLt : halfModPow2 (uintWidth u) + c - 1 < modPow2 (uintWidth u) := by
+    rw [Nat.add_sub_assoc hcPos, modPow2_eq_half_add_half hw]
+    exact Nat.add_lt_add_left (Nat.lt_of_le_of_lt (Nat.sub_le _ _) hcHalf) _
+  have hSbBnd : signedBias (uintWidth u) (halfModPow2 (uintWidth u) + c - 1) = c - 1 := by
+    rw [signedBias_of_ge_half hw hBndGe hBndLt, Nat.add_sub_assoc hcPos,
+      Nat.add_sub_cancel_left]
+  rw [signedOverflowSub_iff_biased_out hx hcM, hSc, hSbBnd]
+  constructor
+  · intro hOut
+    cases hOut with
+    | inr hHi =>
+      rw [Nat.add_assoc, ← modPow2_eq_half_add_half hw] at hHi
+      exact False.elim (Nat.not_le_of_gt (signedBias_lt x)
+        (Nat.le_trans (Nat.le_add_left _ _) hHi))
+    | inl hLo =>
+      have hLt : signedBias (uintWidth u) x < c := nat_lt_of_add_lt_add_right hLo
+      exact Nat.le_sub_one_of_lt hLt
+  · intro hLe
+    apply Or.inl
+    exact Nat.add_lt_add_right
+      (Nat.lt_of_le_of_lt hLe (Nat.sub_lt hcPos Nat.zero_lt_one)) _
+
+/-- Signed subtraction `x - INT_MIN` overflows iff `x >s -1` (`x ≥s 0`). -/
+theorem signedOverflowSub_constR_min_iff_sgt {x : Nat}
+    (hx : x < modPow2 (uintWidth u)) :
+    signedOverflowSub x (halfModPow2 (uintWidth u)) (uintBytes u) = true ↔
+      signedBias (uintWidth u) (modPow2 (uintWidth u) - 1) <
+        signedBias (uintWidth u) x := by
+  have hw := uintWidth_valid u
+  have hHPos : 0 < halfModPow2 (uintWidth u) := modPow2_pos _
+  have hHM : halfModPow2 (uintWidth u) < modPow2 (uintWidth u) :=
+    halfModPow2_lt_modPow2 hw
+  have hSc : signedBias (uintWidth u) (halfModPow2 (uintWidth u)) = 0 := by
+    rw [signedBias_of_ge_half hw (Nat.le_refl _) hHM, Nat.sub_self]
+  have hSbM1 : signedBias (uintWidth u) (modPow2 (uintWidth u) - 1) =
+      halfModPow2 (uintWidth u) - 1 := by
+    rw [signedBias_minusOne_uint, halfModPow2_uintWidth_eq_half]
+  rw [signedOverflowSub_iff_biased_out hx hHM, hSc, hSbM1, Nat.zero_add]
+  constructor
+  · intro hOut
+    cases hOut with
+    | inl hLo => nomatch hLo
+    | inr hHi => exact Nat.lt_of_lt_of_le (Nat.sub_lt hHPos Nat.zero_lt_one) hHi
+  · intro hLt
+    apply Or.inr
+    have h : (halfModPow2 (uintWidth u) - 1) + 1 ≤ signedBias (uintWidth u) x :=
+      Nat.succ_le_of_lt hLt
+    rwa [Nat.sub_add_cancel hHPos] at h
+
+/-- Signed subtraction `x - c` with negative `2^(w-1) < c < 2^w` overflows iff
+`x >s (c - 2^(w-1) - 1)`. -/
+theorem signedOverflowSub_constR_neg_iff_sgt {x c : Nat}
+    (hx : x < modPow2 (uintWidth u))
+    (hcGt : halfModPow2 (uintWidth u) < c)
+    (hcM : c < modPow2 (uintWidth u)) :
+    signedOverflowSub x c (uintBytes u) = true ↔
+      signedBias (uintWidth u) (c - halfModPow2 (uintWidth u) - 1) <
+        signedBias (uintWidth u) x := by
+  have hw := uintWidth_valid u
+  have hHPos : 0 < halfModPow2 (uintWidth u) := modPow2_pos _
+  have hcGe : halfModPow2 (uintWidth u) ≤ c := Nat.le_of_lt hcGt
+  have hcPos : 0 < c := Nat.lt_trans hHPos hcGt
+  have hDiffPos : 0 < c - halfModPow2 (uintWidth u) := Nat.sub_pos_of_lt hcGt
+  have hDiffLtH : c - halfModPow2 (uintWidth u) < halfModPow2 (uintWidth u) :=
+    nat_sub_lt_of_lt_add hcGe (modPow2_eq_half_add_half hw ▸ hcM)
+  have hBndLtH : c - halfModPow2 (uintWidth u) - 1 < halfModPow2 (uintWidth u) :=
+    Nat.lt_of_le_of_lt (Nat.sub_le _ _) hDiffLtH
+  have hSc : signedBias (uintWidth u) c = c - halfModPow2 (uintWidth u) :=
+    signedBias_of_ge_half hw hcGe hcM
+  have hSbBnd : signedBias (uintWidth u) (c - halfModPow2 (uintWidth u) - 1) = c - 1 := by
+    rw [signedBias_of_lt_half hw hBndLtH, ← Nat.sub_add_comm hDiffPos,
+      Nat.sub_add_cancel hcGe]
+  rw [signedOverflowSub_iff_biased_out hx hcM, hSc, Nat.sub_add_cancel hcGe, hSbBnd]
+  constructor
+  · intro hOut
+    cases hOut with
+    | inl hLo =>
+      exact False.elim (Nat.not_le_of_gt hDiffLtH
+        (Nat.le_trans (Nat.le_add_left _ _) (Nat.le_of_lt hLo)))
+    | inr hHi => exact Nat.lt_of_lt_of_le (Nat.sub_lt hcPos Nat.zero_lt_one) hHi
+  · intro hLt
+    apply Or.inr
+    have h : (c - 1) + 1 ≤ signedBias (uintWidth u) x := Nat.succ_le_of_lt hLt
+    rwa [Nat.sub_add_cancel hcPos] at h
+
+/-- Signed subtraction `c - y` with non-negative `c < 2^(w-1)` overflows iff
+`y ≤s (2^(w-1) + c)`. -/
+theorem signedOverflowSub_constL_nonneg_iff_sle {c y : Nat}
+    (hcHalf : c < halfModPow2 (uintWidth u))
+    (hy : y < modPow2 (uintWidth u)) :
+    signedOverflowSub c y (uintBytes u) = true ↔
+      signedBias (uintWidth u) y ≤
+        signedBias (uintWidth u) (halfModPow2 (uintWidth u) + c) := by
+  have hw := uintWidth_valid u
+  have hcM : c < modPow2 (uintWidth u) :=
+    Nat.lt_trans hcHalf (halfModPow2_lt_modPow2 hw)
+  have hSc : signedBias (uintWidth u) c = c + halfModPow2 (uintWidth u) :=
+    signedBias_of_lt_half hw hcHalf
+  have hBndGe : halfModPow2 (uintWidth u) ≤ halfModPow2 (uintWidth u) + c :=
+    Nat.le_add_right _ _
+  have hBndLt : halfModPow2 (uintWidth u) + c < modPow2 (uintWidth u) := by
+    rw [modPow2_eq_half_add_half hw]; exact Nat.add_lt_add_left hcHalf _
+  have hSbBnd : signedBias (uintWidth u) (halfModPow2 (uintWidth u) + c) = c := by
+    rw [signedBias_of_ge_half hw hBndGe hBndLt, Nat.add_sub_cancel_left]
+  rw [signedOverflowSub_iff_biased_out hcM hy, hSc, hSbBnd]
+  constructor
+  · intro hOut
+    cases hOut with
+    | inl hLo =>
+      rw [Nat.add_assoc, ← modPow2_eq_half_add_half hw] at hLo
+      exact False.elim (Nat.not_le_of_gt (signedBias_lt y)
+        (Nat.le_trans (Nat.le_add_left _ _) (Nat.le_of_lt hLo)))
+    | inr hHi => exact Nat.le_of_add_le_add_right hHi
+  · intro hLe
+    exact Or.inr (Nat.add_le_add_right hLe _)
+
+/-- Signed subtraction `c - y` with negative `2^(w-1) ≤ c < 2^w` overflows iff
+`y >s (c - 2^(w-1))`. -/
+theorem signedOverflowSub_constL_neg_iff_sgt {c y : Nat}
+    (hcHalf : halfModPow2 (uintWidth u) ≤ c)
+    (hcM : c < modPow2 (uintWidth u))
+    (hy : y < modPow2 (uintWidth u)) :
+    signedOverflowSub c y (uintBytes u) = true ↔
+      signedBias (uintWidth u) (c - halfModPow2 (uintWidth u)) <
+        signedBias (uintWidth u) y := by
+  have hw := uintWidth_valid u
+  have hDiffLtH : c - halfModPow2 (uintWidth u) < halfModPow2 (uintWidth u) :=
+    nat_sub_lt_of_lt_add hcHalf (modPow2_eq_half_add_half hw ▸ hcM)
+  have hSc : signedBias (uintWidth u) c = c - halfModPow2 (uintWidth u) :=
+    signedBias_of_ge_half hw hcHalf hcM
+  have hSbBnd : signedBias (uintWidth u) (c - halfModPow2 (uintWidth u)) = c := by
+    rw [signedBias_of_lt_half hw hDiffLtH, Nat.sub_add_cancel hcHalf]
+  rw [signedOverflowSub_iff_biased_out hcM hy, hSc, Nat.sub_add_cancel hcHalf, hSbBnd]
+  constructor
+  · intro hOut
+    cases hOut with
+    | inl hLo => exact hLo
+    | inr hHi =>
+      exact False.elim (Nat.not_le_of_gt hDiffLtH
+        (Nat.le_trans (Nat.le_add_left _ _) hHi))
+  · intro hLt
+    exact Or.inl hLt
+
 end SignedBias
 
 /-- Bitwise complement of an in-range unsigned integer equals XOR with

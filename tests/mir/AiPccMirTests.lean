@@ -49,6 +49,11 @@ with the canary helpers of `Anneal.AiPcc.Canaries`:
    signed interval multiplication (`sintNoOverflowMulBiased`, including
    opposite-sign `INT_MIN` boundaries and `i128` overflow boundaries), and a
    `bb0`-as-cutpoint loop verified via `AutoProve.autoVerifyCutpoints`.
+8. Exact biased signed widening casts (`sintCastAbs` via
+   `signedBias_signExtendBits`), signed `*WithOverflow` relational guards
+   (`sintAddOverflowBoolAbs` / `sintSubOverflowBoolAbs`, including `0 - y`
+   ruling out `i8::MIN / -1` on the `!ov` branch), and exact-constant
+   `ov = true` folding.
 -/
 
 namespace Anneal.AiPccMirTests
@@ -1690,9 +1695,9 @@ theorem signed_adversarial_edge_cases :
             (.binaryOp .shlUnchecked (canaryCopy 1) (canaryCopy 2))] .return_,
           canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
             .return_ ]) = false ∧
-    -- Conservative rejection (this body is in fact safe): a non-exact
-    -- negative `i8 -> i32` widening falls back to `topInit`, so the following
-    -- `unchecked_add(1)` cannot be certified.
+    -- Exact biased signed widening (`sintCastAbs`): widening negative `x : i8`
+    -- to `i32` preserves `[-128, -1]`, so `(x as i32).unchecked_add(1)` verifies,
+    -- while `(x as i32).unchecked_add(i32::MIN)` genuinely overflows and fails closed.
     AutoProve.autoVerifyAcyclic
       (canaryBody "ai_pcc_tests::neg_widen_add" 1
         [canaryIntTy .i32, canaryIntTy .i8, canaryBoolTy, canaryIntTy .i32]
@@ -1705,6 +1710,22 @@ theorem signed_adversarial_edge_cases :
               (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
             .assign (canaryPlace 0)
               (.binaryOp .addUnchecked (canaryCopy 3) (canaryIConst .i32 1))]
+            .return_,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i32 0))]
+            .return_ ]) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::neg_widen_add_min" 1
+        [canaryIntTy .i32, canaryIntTy .i8, canaryBoolTy, canaryIntTy .i32]
+        [ canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.binaryOp .lt (canaryCopy 1) (canaryIConst .i8 0))]
+            (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+          canaryBlock [.storageLive 3,
+            .assign (canaryPlace 3)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 3)
+                (canaryIConst .i32 (modPow2 31)))]
             .return_,
           canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i32 0))]
             .return_ ]) = false ∧
@@ -1752,7 +1773,7 @@ theorem signed_adversarial_edge_cases :
           canaryBlock [] (.goto 2),
           canaryBlock [] (.goto 1) ]) = false :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-   rfl, rfl, rfl, rfl⟩
+   rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 info: 'Anneal.AiPccMirTests.signedClampAdd_auto_safe' depends on axioms:
@@ -2484,5 +2505,316 @@ info: 'Anneal.AiPccMirTests.bb0CutpointLoop_verificationResult' depends on axiom
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms bb0CutpointLoop_verificationResult
+
+/-! ## 8. Exact Biased Signed Widening and Signed `*WithOverflow` Guards -/
+
+/-- `fn(x: i8) -> i32 { (x as i32).unchecked_add(1) }`: exact biased signed
+widening maps arbitrary `x : i8` into `[-128, 127]` in `i32`. -/
+def widenI8ToI32Add1Body : CapturedMir :=
+  canaryBody "ai_pcc_tests::widen_i8_i32_add1" 1
+    [canaryIntTy .i32, canaryIntTy .i8, canaryIntTy .i32]
+    [canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
+        .assign (canaryPlace 0)
+          (.binaryOp .addUnchecked (canaryCopy 2) (canaryIConst .i32 1)),
+        .storageDead 2] .return_]
+
+/-- Trusted `VerificationResult` for `widenI8ToI32Add1Body` from one `rfl`. -/
+theorem widenI8ToI32Add1_verificationResult :
+    Trusted.VerificationResult.VerificationResult
+      (AutoProve.autoClaim widenI8ToI32Add1Body) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic rfl
+
+/-- Exact biased signed widening (`sintCastAbs`) preserves signed ranges across
+arbitrary `i8 -> i32` and negative `i8 -> {i32, u32}` casts, pruning dead traps
+while still rejecting genuine overflow after widening. -/
+theorem signed_widening_casts_exact :
+    -- Arbitrary `x : i8 -> (x as i32).unchecked_add(1)` and `unchecked_sub(1)`.
+    AutoProve.autoVerifyAcyclic widenI8ToI32Add1Body = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::widen_i8_i32_sub1" 1
+        [canaryIntTy .i32, canaryIntTy .i8, canaryIntTy .i32]
+        [canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
+            .assign (canaryPlace 0)
+              (.binaryOp .subUnchecked (canaryCopy 2) (canaryIConst .i32 1)),
+            .storageDead 2] .return_]) = true ∧
+    -- Negative `x : i8` widened to `i32` stays `< 0` and `(x as i32) + 128 >= 0`
+    -- (pruning unreachable traps on the false edges).
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::neg_widen_sign_and_shift" 1
+        [canaryIntTy .i32, canaryIntTy .i8, canaryBoolTy, canaryIntTy .i32,
+         canaryBoolTy]
+        [ canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.binaryOp .lt (canaryCopy 1) (canaryIConst .i8 0))]
+            (.switchInt (canaryCopy 2) ⟨[(0, 4)], 1⟩),
+          canaryBlock [.storageLive 3, .storageLive 4,
+            .assign (canaryPlace 3)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
+            .assign (canaryPlace 4)
+              (.binaryOp .lt (canaryCopy 3) (canaryIConst .i32 0))]
+            (.switchInt (canaryCopy 4) ⟨[(0, 3)], 2⟩),
+          canaryBlock [.assign (canaryPlace 3)
+              (.binaryOp .addUnchecked (canaryCopy 3) (canaryIConst .i32 128)),
+            .assign (canaryPlace 4)
+              (.binaryOp .ge (canaryCopy 3) (canaryIConst .i32 0))]
+            (.switchInt (canaryCopy 4) ⟨[(0, 3)], 5⟩),
+          canaryBlock [] .unreachable,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i32 0))]
+            .return_,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 3))]
+            .return_ ]) = true ∧
+    -- Negative `x : i8` widened to `u32` lies in `[2^32 - 128, 2^32 - 1]`.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::neg_widen_u32_bound" 1
+        [canaryUintTy .u32, canaryIntTy .i8, canaryBoolTy, canaryUintTy .u32,
+         canaryBoolTy]
+        [ canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.binaryOp .lt (canaryCopy 1) (canaryIConst .i8 0))]
+            (.switchInt (canaryCopy 2) ⟨[(0, 3)], 1⟩),
+          canaryBlock [.storageLive 3, .storageLive 4,
+            .assign (canaryPlace 3)
+              (.cast .intToInt (canaryCopy 1) (canaryUintTy .u32)),
+            .assign (canaryPlace 4)
+              (.binaryOp .ge (canaryCopy 3)
+                (canaryUConst .u32 (modPow2 32 - 128)))]
+            (.switchInt (canaryCopy 4) ⟨[(0, 2)], 4⟩),
+          canaryBlock [] .unreachable,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryUConst .u32 0))]
+            .return_,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 3))]
+            .return_ ]) = true ∧
+    -- Genuine overflow after widening: `x : i8` widened to `i32` can be `+127`,
+    -- so `(x as i32).unchecked_add(i32::MAX)` overflows; negative `x <= -100`
+    -- widened to `i32` and subtracting `i32::MAX` also overflows.
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::widen_i8_i32_add_max" 1
+        [canaryIntTy .i32, canaryIntTy .i8, canaryIntTy .i32]
+        [canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
+            .assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 2)
+                (canaryIConst .i32 (modPow2 31 - 1)))] .return_]) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::neg_widen_sub_max" 1
+        [canaryIntTy .i32, canaryIntTy .i8, canaryBoolTy, canaryIntTy .i32]
+        [ canaryBlock [.storageLive 2,
+            .assign (canaryPlace 2)
+              (.binaryOp .le (canaryCopy 1) (canaryIConst .i8 156))]
+            (.switchInt (canaryCopy 2) ⟨[(0, 2)], 1⟩),
+          canaryBlock [.storageLive 3,
+            .assign (canaryPlace 3)
+              (.cast .intToInt (canaryCopy 1) (canaryIntTy .i32)),
+            .assign (canaryPlace 0)
+              (.binaryOp .subUnchecked (canaryCopy 3)
+                (canaryIConst .i32 (modPow2 31 - 1)))] .return_,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i32 0))]
+            .return_ ]) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `fn(x: i8) -> i8`: compute `(_, ov) = x.overflowing_add(c)` (or
+`c.overflowing_add(x)` when `constLeft = true`); if `!ov`, return
+`x.unchecked_add(uncheckedC)`, else `0`. -/
+def signedOverflowBranchAddBody (c uncheckedC : Nat) (constLeft : Bool) :
+    CapturedMir :=
+  let addRhs :=
+    match constLeft with
+    | false => Rvalue.binaryOp .addWithOverflow (canaryCopy 1) (canaryIConst .i8 c)
+    | true => Rvalue.binaryOp .addWithOverflow (canaryIConst .i8 c) (canaryCopy 1)
+  canaryBody "ai_pcc_tests::signed_ov_branch_add" 1
+    [canaryIntTy .i8, canaryIntTy .i8, intPairTy .i8, canaryBoolTy]
+    [ canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 2) addRhs,
+        .assign (canaryPlace 3)
+          (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i8 uncheckedC))]
+        .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn(x: i8) -> i8`: compute `(_, ov) = x.overflowing_sub(c)`; if `!ov`,
+return `x.unchecked_sub(uncheckedC)`, else `0`. -/
+def signedOverflowBranchSubRBody (c uncheckedC : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_ov_branch_sub_r" 1
+    [canaryIntTy .i8, canaryIntTy .i8, intPairTy .i8, canaryBoolTy]
+    [ canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 2)
+          (.binaryOp .subWithOverflow (canaryCopy 1) (canaryIConst .i8 c)),
+        .assign (canaryPlace 3)
+          (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .subUnchecked (canaryCopy 1) (canaryIConst .i8 uncheckedC))]
+        .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn(y: i8) -> i8`: compute `(_, ov) = c.overflowing_sub(y)`; if `!ov`,
+return `uncheckedC.unchecked_sub(y)`, else `0`. -/
+def signedOverflowBranchSubLBody (c uncheckedC : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_ov_branch_sub_l" 1
+    [canaryIntTy .i8, canaryIntTy .i8, intPairTy .i8, canaryBoolTy]
+    [ canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 2)
+          (.binaryOp .subWithOverflow (canaryIConst .i8 c) (canaryCopy 1)),
+        .assign (canaryPlace 3)
+          (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .subUnchecked (canaryIConst .i8 uncheckedC) (canaryCopy 1))]
+        .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn(y: i8) -> i8`: `let (_, ov) = 0i8.overflowing_sub(y); if !ov { y / -1 } else { 0 }`.
+On the `!ov` arm, `sintSubOverflowBoolAbs`'s `.sleConst _ .i8 128` guard negates
+to `y > i8::MIN`, certifying `y / -1` UB-free. -/
+def signedNegGuardDivBody : CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_neg_guard_div" 1
+    [canaryIntTy .i8, canaryIntTy .i8, intPairTy .i8, canaryBoolTy]
+    [ canaryBlock [.storageLive 2, .storageLive 3,
+        .assign (canaryPlace 2)
+          (.binaryOp .subWithOverflow (canaryIConst .i8 0) (canaryCopy 1)),
+        .assign (canaryPlace 3)
+          (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 1)], 2⟩),
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .div (canaryCopy 1) (canaryIConst .i8 255))] .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- Trusted `VerificationResult` for `signedNegGuardDivBody` from one `rfl`. -/
+theorem signedNegGuardDiv_verificationResult :
+    Trusted.VerificationResult.VerificationResult
+      (AutoProve.autoClaim signedNegGuardDivBody) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic rfl
+
+/-- Exact-constant signed `*WithOverflow` body asserting `ov == true`. -/
+def signedConstAssertOverflowBody (op : BinOp) (c1 c2 : Nat) : CapturedMir :=
+  canaryBody "ai_pcc_tests::signed_const_assert_ov" 0
+    [canaryIntTy .i8, intPairTy .i8]
+    [ canaryBlock [.storageLive 1,
+        .assign (canaryPlace 1)
+          (.binaryOp op (canaryIConst .i8 c1) (canaryIConst .i8 c2))]
+        (.assert (.move (fieldPlace 1 1 canaryBoolTy)) true 1 .continue_),
+      canaryBlock [.assign (canaryPlace 0)
+          (.use (.move (fieldPlace 1 0 (canaryIntTy .i8))))] .return_ ]
+
+/-- Signed `*WithOverflow` relational guards (`sintAddOverflowBoolAbs`,
+`sintSubOverflowBoolAbs`) and exact-constant `ov = true` folding: branching on
+`!ov` (or `ov`) refines the variable operand tightly for positive, negative,
+`INT_MIN`, and `0 - y` cases, while rejecting off-by-one unchecked follow-ups. -/
+theorem signed_overflow_relational_guards :
+    -- `x + 10` and `10 + x`: `!ov` certifies `x + 10` but rejects `x + 11`.
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchAddBody 10 10 false) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchAddBody 10 10 true) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchAddBody 10 11 false) = false ∧
+    -- `x + (-10)` and `(-10) + x`: `!ov` certifies `x + (-10)` but rejects `x + (-11)`.
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchAddBody 246 246 false) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchAddBody 246 246 true) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchAddBody 246 245 false) = false ∧
+    -- `x + i8::MIN`: `!ov` refines `x >= 0` (certifying `x + i8::MIN`), and on
+    -- the `ov` arm `x < 0` (certifying `x.unchecked_add(1)`).
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchAddBody 128 128 false) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc_tests::signed_ov_true_arm_add_min" 1
+        [canaryIntTy .i8, canaryIntTy .i8, intPairTy .i8, canaryBoolTy]
+        [ canaryBlock [.storageLive 2, .storageLive 3,
+            .assign (canaryPlace 2)
+              (.binaryOp .addWithOverflow (canaryCopy 1) (canaryIConst .i8 128)),
+            .assign (canaryPlace 3)
+              (.use (.copy (fieldPlace 2 1 canaryBoolTy)))]
+            (.switchInt (canaryCopy 3) ⟨[(0, 2)], 1⟩),
+          canaryBlock [.assign (canaryPlace 0)
+              (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i8 1))]
+            .return_,
+          canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+            .return_ ]) = true ∧
+    -- `x - 10`, `x - (-10)`, `x - i8::MIN` (`!ov` refines `x` tightly).
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubRBody 10 10) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubRBody 10 11) = false ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubRBody 246 246) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubRBody 246 245) = false ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubRBody 128 128) = true ∧
+    -- `0 - y`, `10 - y`, `(-2) - y` (`!ov` refines `y` tightly).
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubLBody 0 0) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubLBody 10 10) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubLBody 10 11) = false ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubLBody 254 254) = true ∧
+    AutoProve.autoVerifyAcyclic (signedOverflowBranchSubLBody 254 253) = false ∧
+    -- Cross-operation refinement: `0 - y` overflow-free => `y != i8::MIN` => `y / -1` safe.
+    AutoProve.autoVerifyAcyclic signedNegGuardDivBody = true ∧
+    -- Exact constant overflowing `*WithOverflow` folds `ov = true`.
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOverflowBody .addWithOverflow 127 1) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOverflowBody .subWithOverflow 128 1) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOverflowBody .mulWithOverflow 128 255) = true ∧
+    -- Non-overflowing constant cannot satisfy `assert(ov == true)`.
+    AutoProve.autoVerifyAcyclic
+      (signedConstAssertOverflowBody .addWithOverflow 10 20) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+info: 'Anneal.AiPcc.signedBias_signExtendBits' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedBias_signExtendBits
+
+/--
+info: 'Anneal.AiPcc.signedOverflowAdd_iff_sgt' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedOverflowAdd_iff_sgt
+
+/--
+info: 'Anneal.AiPcc.signedOverflowSub_constL_nonneg_iff_sle' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedOverflowSub_constL_nonneg_iff_sle
+
+/--
+info: 'Anneal.AiPcc.sintAddOverflowBoolAbs_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms sintAddOverflowBoolAbs_sound
+
+/--
+info: 'Anneal.AiPcc.sintSubOverflowBoolAbs_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms sintSubOverflowBoolAbs_sound
+
+/--
+info: 'Anneal.AiPcc.sintMulOverflowBoolAbs_sound' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms sintMulOverflowBoolAbs_sound
+
+/--
+info: 'Anneal.AiPccMirTests.widenI8ToI32Add1_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms widenI8ToI32Add1_verificationResult
+
+/--
+info: 'Anneal.AiPccMirTests.signedNegGuardDiv_verificationResult' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms signedNegGuardDiv_verificationResult
 
 end Anneal.AiPccMirTests
