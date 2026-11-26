@@ -611,6 +611,73 @@ impl<T: Copy> Wrapper<T> {
     }
 
     #[test]
+    fn driver_captures_trait_impl_and_default_method_closures() {
+        let sample_rust = r#"#![allow(dead_code)]
+
+pub trait Compute {
+    fn compute(&self, x: u32) -> u32;
+    fn compute_default(&self, x: u32) -> u32 {
+        let f: fn(u32) -> u32 = |v: u32| v + 11;
+        f(self.compute(x))
+    }
+}
+
+pub struct BoxedVal(pub u32);
+
+impl Compute for BoxedVal {
+    fn compute(&self, x: u32) -> u32 {
+        let f: fn(u32) -> u32 = |v: u32| v ^ 19;
+        f(x + self.0)
+    }
+}
+
+pub fn unrelated(x: u32) -> u32 {
+    let f: fn(u32) -> u32 = |v: u32| v ^ 1;
+    f(x)
+}
+"#;
+        let (temp_root, unit_dir, manifest) = capture_with_difftest_flags(
+            "closure-trait-impl",
+            "trait_demo",
+            "2024",
+            sample_rust,
+            Some("Compute"),
+        );
+
+        let concrete = find_target(
+            &manifest,
+            "trait_demo::<BoxedVal as Compute>::compute::{closure#0}",
+        );
+        assert_eq!(concrete.item_kind, CapturedItemKind::Callee);
+        let concrete_lean = read_target_lean(&unit_dir, concrete);
+        assert!(
+            !concrete_lean.contains("typeParamCount :="),
+            "concrete trait impl closure must have typeParamCount = 0:\n{concrete_lean}"
+        );
+        assert!(concrete_lean.contains("conv := CallConv.rust, canUnwind := true"));
+
+        let default_clo = find_target(
+            &manifest,
+            "trait_demo::Compute::compute_default::{closure#0}",
+        );
+        assert_eq!(default_clo.item_kind, CapturedItemKind::Callee);
+        let default_lean = read_target_lean(&unit_dir, default_clo);
+        assert!(
+            default_lean.contains("typeParamCount := 1,"),
+            "default trait method closure must inherit Self (typeParamCount = 1):\n{default_lean}"
+        );
+
+        assert!(
+            !manifest
+                .unit_targets
+                .iter()
+                .any(|t| t.target.def_id.contains("unrelated")),
+            "filtered capture must exclude unrelated items and closures"
+        );
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn driver_captures_unit_manifest_and_mir_lean_modules() {
         let temp_root = unique_temp_dir("integration");
         let capture_dir = temp_root.join("capture");

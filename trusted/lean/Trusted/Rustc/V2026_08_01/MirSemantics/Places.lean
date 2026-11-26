@@ -15182,14 +15182,17 @@ Validate a `PointerCoercion::ClosureFnPointer` reification of the closure
 1. `fnAbi` must be `CallConv.rust`, otherwise `.ub`.
 2. If no closure body `p` is linked in `callees`, `.ok` (as for unlinked
    function items in `checkCalleeSig`).
-3. A linked body with `typeParamCount > 0` is `.unsupported`: the closure type
-   carries no parent generic arguments, so the instantiation is unknown.
-4. A linked body must be a non-capturing closure body of `p`
+3. A linked body that is not a closure body (`calleeOwnClosureShape? = .none`)
+   is `.ub` (even if generic).
+4. A linked closure body with `typeParamCount > 0` is `.unsupported`: the
+   closure type carries no parent generic arguments, so the instantiation is
+   unknown.
+5. A non-generic linked closure body must be non-capturing
    (`calleeOwnClosureShape? = .some (.nonCapturing _)`) with
    `fnAbi.conv = .rust`, `argCount = length fnInputs + 1`, and declarations
    `_0 :: _1 :: params` matching `(fnInputs, fnOutput)`
-   (`closureCalleeDeclsCompatible`); a capturing or non-closure body, or any
-   mismatch, is `.ub`.
+   (`closureCalleeDeclsCompatible`); a capturing closure body or any mismatch
+   is `.ub`.
 
 Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
 <https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
@@ -15235,11 +15238,16 @@ def checkClosureCalleeSig
     match findCallee? callees p with
     | .none => .ok
     | .some c =>
-      match c.typeParamCount with
-      | .succ _ => .unsupported
-      | 0 =>
-        match calleeOwnClosureShape? c with
-        | .some (.nonCapturing _) =>
+      match calleeOwnClosureShape? c with
+      | .none => .ub
+      | .some .capturing =>
+        match c.typeParamCount with
+        | .succ _ => .unsupported
+        | 0 => .ub
+      | .some (.nonCapturing _) =>
+        match c.typeParamCount with
+        | .succ _ => .unsupported
+        | 0 =>
           match
             Bool.and
               (callConvEq c.fnAbi.conv .rust)
@@ -15254,8 +15262,6 @@ def checkClosureCalleeSig
           with
           | true => .ok
           | false => .ub
-        | .some .capturing => .ub
-        | .none => .ub
 
 /--
 Validate that a linked callee `p` in `callees` or `extraTraitImpls` (when

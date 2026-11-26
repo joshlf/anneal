@@ -2788,6 +2788,17 @@ Reference (`library/core/src/intrinsics/mod.rs` at commit
 >     _called_in_const: F,
 >     _called_at_rt: G,
 > ) -> RET"
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment."
+
+Justification: a non-capturing closure (`RigidTy.closure _ .nil`) has no
+captured fields, so it is an inhabited zero-sized type representable by
+`Value.unit`. Capturing closures (`_ :: _`) are excluded because captured fields
+may be non-zero-sized or uninhabited.
 -/
 @[reducible]
 def isZeroSizedUnitElemTy : Nat → RigidTy → Bool
@@ -2796,6 +2807,7 @@ def isZeroSizedUnitElemTy : Nat → RigidTy → Bool
     match ty with
     | .tuple ks => allZeroSizedUnitElemTys (isZeroSizedUnitElemTy fuel') ks
     | .fnDef _ _ => true
+    | .closure _ .nil => true
     | .array _ .zero => true
     | .array elemTy (.succ _) => isZeroSizedUnitElemTy fuel' elemTy
     | _ => false
@@ -2945,8 +2957,8 @@ def resolveConstEvalSelectTarget?
         | .some { kind := .fnDef defPath typeArgs, .. } => .some (defPath, typeArgs)
         | .some { kind := .closure defPath .nil, .. } =>
           nonGenericClosureTarget? s.memory.callees defPath
-        | .some { kind := .closure _ (_ :: _), .. } => .none
-        | _ =>
+        | .some _ => .none
+        | .none =>
           match get? target.typeArgs 2 with
           | .some (.fnDef defPath typeArgs) => .some (defPath, typeArgs)
           | .some (.closure defPath .nil) => nonGenericClosureTarget? s.memory.callees defPath

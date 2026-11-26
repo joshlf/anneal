@@ -2714,6 +2714,734 @@ def body : CapturedMir :=
 end V08.Mir.ClosureMatrix.zero_arg_closure_0
 
 
+/-! ## 3b. Verbatim `rustc-capture` output: nested, trait-impl, and transmute closures (`V2026_06_01`) -/
+
+namespace Mir.ClosureExtended.BoxedVal_as_Compute_compute
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::<BoxedVal as Compute>::compute`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=8, align=8
+-- TypeLayout[4]: size=0, align=1
+-- TypeLayout[5]: size=1, align=1
+-- TypeLayout[6]: size=8, align=4
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } List.nil) (List.cons 0 List.nil)), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 (List.cons 5 List.nil)) } List.nil))))))) }
+
+-- bb0: StorageLive(_3); StorageLive(_4); _4 = {closure@src/lib.rs:21:33: 21:41}; _3 = move _4 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_4); StorageLive(_5); _5 = copy _3; StorageLive(_6); StorageLive(_7); _7 = copy _2; StorageLive(_8); _8 = copy ((*_1).0: u32); _9 = AddWithOverflow(copy _7, copy _8); assert(!move (_9.1: bool), "attempt to compute `{} + {}`, which would overflow", move _7, move _8) -> [success: bb1, unwind continue]
+-- bb1: _6 = move (_9.0: u32); StorageDead(_8); StorageDead(_7); _0 = move _5(move _6) -> [return: bb2, unwind continue]
+-- bb2: StorageDead(_6); StorageDead(_5); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::<BoxedVal as Compute>::compute",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    traitImpls := (List.cons { traitRef := { defPath := "closure_extended::Compute::compute", args := (List.cons (RigidTy.adt "closure_extended::BoxedVal" List.nil) List.nil) }, implPath := "closure_extended::<BoxedVal as Compute>::compute" } List.nil),
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.adt "closure_extended::BoxedVal" List.nil)), layoutIdx := 2 }, debugName := (Option.some "self") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := (Option.some "f") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::<BoxedVal as Compute>::compute::{closure#0}" List.nil), layoutIdx := 4 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.tuple (List.cons (RigidTy.uint UintTy.u32) (List.cons RigidTy.bool List.nil))), layoutIdx := 6 }, debugName := Option.none } List.nil)))))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 9), span := "<dummy>" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:21:13: 21:14" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:21:33: 21:48" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::<BoxedVal as Compute>::compute::{closure#0}") List.nil)), span := "src/lib.rs:21:33: 21:48" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 4, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 })), span := "src/lib.rs:21:33: 21:48" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:21:40: 21:41" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:22:9: 22:10" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 3, projection := List.nil }))), span := "src/lib.rs:22:9: 22:10" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:22:11: 22:21" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:22:11: 22:12" } (List.cons { kind := (StatementKind.assign { local_ := 7, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:22:11: 22:12" } (List.cons { kind := (StatementKind.storageLive 8), span := "src/lib.rs:22:15: 22:21" } (List.cons { kind := (StatementKind.assign { local_ := 8, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := (List.cons ProjectionElem.deref (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }) List.nil)) }))), span := "src/lib.rs:22:15: 22:21" } (List.cons { kind := (StatementKind.assign { local_ := 9, projection := List.nil } (Rvalue.binaryOp BinOp.addWithOverflow (Operand.copy { local_ := 7, projection := List.nil }) (Operand.copy { local_ := 8, projection := List.nil }))), span := "src/lib.rs:22:11: 22:21" } List.nil)))))))))))))), terminator := { kind := (TerminatorKind.assert (Operand.move { local_ := 9, projection := (List.cons (ProjectionElem.field 1 { kind := RigidTy.bool, layoutIdx := 5 }) List.nil) }) false 1 UnwindAction.continue_), span := "src/lib.rs:22:11: 22:21" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 6, projection := List.nil } (Rvalue.use (Operand.move { local_ := 9, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }) List.nil) }))), span := "src/lib.rs:22:11: 22:21" } (List.cons { kind := (StatementKind.storageDead 8), span := "src/lib.rs:22:20: 22:21" } (List.cons { kind := (StatementKind.storageDead 7), span := "src/lib.rs:22:20: 22:21" } List.nil))), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 5, projection := List.nil }) (List.cons (Operand.move { local_ := 6, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 2) UnwindAction.continue_), span := "src/lib.rs:22:9: 22:22" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:22:21: 22:22" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:22:21: 22:22" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:23:5: 23:6" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:23:6: 23:6" }, isCleanup := false } List.nil))),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.BoxedVal_as_Compute_compute
+
+namespace Mir.ClosureExtended.BoxedVal_as_Compute_compute_closure_0
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::<BoxedVal as Compute>::compute::{closure#0}`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=0, align=1
+-- TypeLayout[2]: size=8, align=8
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } List.nil))) }
+
+-- bb0: StorageLive(_3); _3 = copy _2; _0 = BitXor(move _3, const 19_u32); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::<BoxedVal as Compute>::compute::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::<BoxedVal as Compute>::compute::{closure#0}" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "v") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:21:42: 21:43" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:21:42: 21:43" } (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.binaryOp BinOp.bitXor (Operand.move { local_ := 3, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 19, sizeBytes := 4 })) }))), span := "src/lib.rs:21:42: 21:48" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:21:47: 21:48" } List.nil)))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:21:48: 21:48" }, isCleanup := false } List.nil),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.BoxedVal_as_Compute_compute_closure_0
+
+namespace Mir.ClosureExtended.Compute_compute_default
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::Compute::compute_default`. -/
+
+-- TypeLayout[0]: size=0, align=1
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=0, align=1
+-- TypeLayout[3]: size=8, align=8
+-- TypeLayout[4]: size=0, align=1
+-- TypeLayout[5]: size=0, align=1
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))))) }
+
+-- bb0: StorageLive(_3); StorageLive(_4); _4 = {closure@src/lib.rs:12:33: 12:41}; _3 = move _4 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_4); StorageLive(_5); _5 = copy _3; StorageLive(_6); StorageLive(_7); _7 = &(*_1); StorageLive(_8); _8 = copy _2; _6 = <Self as Compute>::compute(move _7, move _8) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_8); StorageDead(_7); _0 = move _5(move _6) -> [return: bb2, unwind continue]
+-- bb2: StorageDead(_6); StorageDead(_5); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::Compute::compute_default",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    typeParamCount := 1,
+    genericParams := (List.cons { idx := 0, name := "Self" } List.nil),
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.param 0 "Self")), layoutIdx := 2 }, debugName := (Option.some "self") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := (Option.some "f") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::Compute::compute_default::{closure#0}" List.nil), layoutIdx := 4 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.param 0 "Self")), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } List.nil))))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:12:13: 12:14" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:12:33: 12:48" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::Compute::compute_default::{closure#0}") List.nil)), span := "src/lib.rs:12:33: 12:48" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 4, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 })), span := "src/lib.rs:12:33: 12:48" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:12:40: 12:41" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:13:9: 13:10" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 3, projection := List.nil }))), span := "src/lib.rs:13:9: 13:10" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:13:11: 13:26" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:13:11: 13:15" } (List.cons { kind := (StatementKind.assign { local_ := 7, projection := List.nil } (Rvalue.ref BorrowKind.shared { local_ := 1, projection := (List.cons ProjectionElem.deref List.nil) })), span := "src/lib.rs:13:11: 13:15" } (List.cons { kind := (StatementKind.storageLive 8), span := "src/lib.rs:13:24: 13:25" } (List.cons { kind := (StatementKind.assign { local_ := 8, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:13:24: 13:25" } List.nil)))))))))))), terminator := { kind := (TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.fnDef "closure_extended::Compute::compute" (List.cons (RigidTy.param 0 "Self") List.nil)), layoutIdx := 5 }, val := ConstValue.zeroSized }) (List.cons (Operand.move { local_ := 7, projection := List.nil }) (List.cons (Operand.move { local_ := 8, projection := List.nil }) List.nil)) { local_ := 6, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:13:11: 13:26" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 8), span := "src/lib.rs:13:25: 13:26" } (List.cons { kind := (StatementKind.storageDead 7), span := "src/lib.rs:13:25: 13:26" } List.nil)), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 5, projection := List.nil }) (List.cons (Operand.move { local_ := 6, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 2) UnwindAction.continue_), span := "src/lib.rs:13:9: 13:27" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:13:26: 13:27" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:13:26: 13:27" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:14:5: 14:6" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:14:6: 14:6" }, isCleanup := false } List.nil))),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.ignore } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.Compute_compute_default
+
+namespace Mir.ClosureExtended.Compute_compute_default_closure_0
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::Compute::compute_default::{closure#0}`. -/
+
+-- TypeLayout[0]: size=0, align=1
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=0, align=1
+-- TypeLayout[3]: size=8, align=8
+-- TypeLayout[4]: size=1, align=1
+-- TypeLayout[5]: size=8, align=4
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 2 List.nil) } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 (List.cons 4 List.nil)) } List.nil)))))) }
+
+-- bb0: StorageLive(_3); _3 = copy _2; _4 = AddWithOverflow(copy _3, const 11_u32); assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", move _3, const 11_u32) -> [success: bb1, unwind continue]
+-- bb1: _0 = move (_4.0: u32); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::Compute::compute_default::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    typeParamCount := 1,
+    genericParams := (List.cons { idx := 0, name := "Self" } List.nil),
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::Compute::compute_default::{closure#0}" List.nil)), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := (Option.some "v") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.tuple (List.cons (RigidTy.uint UintTy.u32) (List.cons RigidTy.bool List.nil))), layoutIdx := 5 }, debugName := Option.none } List.nil))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 4), span := "<dummy>" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:12:42: 12:43" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:12:42: 12:43" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.binaryOp BinOp.addWithOverflow (Operand.copy { local_ := 3, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, val := (ConstValue.scalar (ConstScalar.int { bits := 11, sizeBytes := 4 })) }))), span := "src/lib.rs:12:42: 12:48" } List.nil)))), terminator := { kind := (TerminatorKind.assert (Operand.move { local_ := 4, projection := (List.cons (ProjectionElem.field 1 { kind := RigidTy.bool, layoutIdx := 4 }) List.nil) }) false 1 UnwindAction.continue_), span := "src/lib.rs:12:42: 12:48" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.use (Operand.move { local_ := 4, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }) List.nil) }))), span := "src/lib.rs:12:42: 12:48" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:12:47: 12:48" } List.nil)), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:12:48: 12:48" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 2 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.Compute_compute_default_closure_0
+
+namespace Mir.ClosureExtended.call_concrete_trait_impl
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::call_concrete_trait_impl`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=0, align=1
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } List.nil) (List.cons 0 List.nil)), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))) }
+
+-- bb0: StorageLive(_2); _2 = BoxedVal(const 5_u32); StorageLive(_3); _3 = &_2; StorageLive(_4); _4 = copy _1; _0 = <BoxedVal as Compute>::compute(move _3, move _4) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_4); StorageDead(_3); StorageDead(_2); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::call_concrete_trait_impl",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.adt "closure_extended::BoxedVal" List.nil), layoutIdx := 1 }, debugName := (Option.some "b") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.adt "closure_extended::BoxedVal" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:27:9: 27:10" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.aggregate (AggregateKind.adt "closure_extended::BoxedVal" 0 Option.none) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 5, sizeBytes := 4 })) }) List.nil))), span := "src/lib.rs:27:13: 27:24" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:28:5: 28:6" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.ref BorrowKind.shared { local_ := 2, projection := List.nil })), span := "src/lib.rs:28:5: 28:6" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:28:15: 28:16" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := List.nil }))), span := "src/lib.rs:28:15: 28:16" } List.nil)))))), terminator := { kind := (TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.fnDef "closure_extended::Compute::compute" (List.cons (RigidTy.adt "closure_extended::BoxedVal" List.nil) List.nil)), layoutIdx := 3 }, val := ConstValue.zeroSized }) (List.cons (Operand.move { local_ := 3, projection := List.nil }) (List.cons (Operand.move { local_ := 4, projection := List.nil }) List.nil)) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:28:5: 28:17" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:28:16: 28:17" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:28:16: 28:17" } (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:29:1: 29:2" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:29:2: 29:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.call_concrete_trait_impl
+
+namespace Mir.ClosureExtended.call_default_trait_closure
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::call_default_trait_closure`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=0, align=1
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } List.nil) (List.cons 0 List.nil)), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))) }
+
+-- bb0: StorageLive(_2); _2 = BoxedVal(const 5_u32); StorageLive(_3); _3 = &_2; StorageLive(_4); _4 = copy _1; _0 = <BoxedVal as Compute>::compute_default(move _3, move _4) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_4); StorageDead(_3); StorageDead(_2); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::call_default_trait_closure",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.adt "closure_extended::BoxedVal" List.nil), layoutIdx := 1 }, debugName := (Option.some "b") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.adt "closure_extended::BoxedVal" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:32:9: 32:10" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.aggregate (AggregateKind.adt "closure_extended::BoxedVal" 0 Option.none) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 5, sizeBytes := 4 })) }) List.nil))), span := "src/lib.rs:32:13: 32:24" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:33:5: 33:6" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.ref BorrowKind.shared { local_ := 2, projection := List.nil })), span := "src/lib.rs:33:5: 33:6" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:33:23: 33:24" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := List.nil }))), span := "src/lib.rs:33:23: 33:24" } List.nil)))))), terminator := { kind := (TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.fnDef "closure_extended::Compute::compute_default" (List.cons (RigidTy.adt "closure_extended::BoxedVal" List.nil) List.nil)), layoutIdx := 3 }, val := ConstValue.zeroSized }) (List.cons (Operand.move { local_ := 3, projection := List.nil }) (List.cons (Operand.move { local_ := 4, projection := List.nil }) List.nil)) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:33:5: 33:25" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:33:24: 33:25" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:33:24: 33:25" } (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:34:1: 34:2" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:34:2: 34:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.call_default_trait_closure
+
+namespace Mir.ClosureExtended.fn_ptr_transmute_roundtrip
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::fn_ptr_transmute_roundtrip`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=8, align=8
+-- TypeLayout[2]: size=0, align=1
+-- TypeLayout[3]: size=8, align=8
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 2 List.nil) } List.nil)))) }
+
+-- bb0: StorageLive(_2); StorageLive(_3); _3 = {closure@src/lib.rs:37:29: 37:37}; _2 = move _3 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_3); StorageLive(_4); StorageLive(_5); _5 = copy _2; _4 = move _5 as *const () (FnPtrToPtr); StorageDead(_5); StorageLive(_6); StorageLive(_7); _7 = copy _4; _6 = move _7 as fn(u32) -> u32 (Transmute); StorageDead(_7); StorageLive(_8); _8 = copy _6; StorageLive(_9); _9 = copy _1; _0 = move _8(move _9) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_9); StorageDead(_8); StorageDead(_6); StorageDead(_4); StorageDead(_2); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::fn_ptr_transmute_roundtrip",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := (Option.some "f") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::fn_ptr_transmute_roundtrip::{closure#0}" List.nil), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.tuple List.nil)), layoutIdx := 3 }, debugName := (Option.some "raw") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := (Option.some "g") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.tuple List.nil)), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:37:9: 37:10" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:37:29: 37:44" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::fn_ptr_transmute_roundtrip::{closure#0}") List.nil)), span := "src/lib.rs:37:29: 37:44" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 3, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 })), span := "src/lib.rs:37:29: 37:44" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:37:36: 37:37" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:38:9: 38:12" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:38:26: 38:27" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:38:26: 38:27" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.cast CastKind.fnPtrToPtr (Operand.move { local_ := 5, projection := List.nil }) { kind := (RigidTy.rawPtr Mutability.not (RigidTy.tuple List.nil)), layoutIdx := 3 })), span := "src/lib.rs:38:26: 38:40" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:38:39: 38:40" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:39:9: 39:10" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:39:59: 39:62" } (List.cons { kind := (StatementKind.assign { local_ := 7, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 4, projection := List.nil }))), span := "src/lib.rs:39:59: 39:62" } (List.cons { kind := (StatementKind.assign { local_ := 6, projection := List.nil } (Rvalue.cast CastKind.transmute (Operand.move { local_ := 7, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 })), span := "src/lib.rs:39:38: 39:63" } (List.cons { kind := (StatementKind.storageDead 7), span := "src/lib.rs:39:62: 39:63" } (List.cons { kind := (StatementKind.storageLive 8), span := "src/lib.rs:40:5: 40:6" } (List.cons { kind := (StatementKind.assign { local_ := 8, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 6, projection := List.nil }))), span := "src/lib.rs:40:5: 40:6" } (List.cons { kind := (StatementKind.storageLive 9), span := "src/lib.rs:40:7: 40:8" } (List.cons { kind := (StatementKind.assign { local_ := 9, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := List.nil }))), span := "src/lib.rs:40:7: 40:8" } List.nil))))))))))))))))))), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 8, projection := List.nil }) (List.cons (Operand.move { local_ := 9, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:40:5: 40:9" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 9), span := "src/lib.rs:40:8: 40:9" } (List.cons { kind := (StatementKind.storageDead 8), span := "src/lib.rs:40:8: 40:9" } (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:41:1: 41:2" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:41:1: 41:2" } (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:41:1: 41:2" } List.nil))))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:41:2: 41:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.fn_ptr_transmute_roundtrip
+
+namespace Mir.ClosureExtended.fn_ptr_transmute_roundtrip_closure_0
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::fn_ptr_transmute_roundtrip::{closure#0}`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=0, align=1
+-- TypeLayout[2]: size=8, align=8
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } List.nil))) }
+
+-- bb0: StorageLive(_3); _3 = copy _2; _0 = BitXor(move _3, const 31_u32); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::fn_ptr_transmute_roundtrip::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::fn_ptr_transmute_roundtrip::{closure#0}" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "a") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:37:38: 37:39" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:37:38: 37:39" } (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.binaryOp BinOp.bitXor (Operand.move { local_ := 3, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 31, sizeBytes := 4 })) }))), span := "src/lib.rs:37:38: 37:44" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:37:43: 37:44" } List.nil)))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:37:44: 37:44" }, isCleanup := false } List.nil),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.fn_ptr_transmute_roundtrip_closure_0
+
+namespace Mir.ClosureExtended.nested_fnptr
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::nested_fnptr`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=8, align=8
+-- TypeLayout[2]: size=0, align=1
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil))) }
+
+-- bb0: StorageLive(_2); StorageLive(_3); _3 = {closure@src/lib.rs:2:33: 2:41}; _2 = move _3 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_3); StorageLive(_4); _4 = copy _2; StorageLive(_5); _5 = copy _1; _0 = move _4(move _5) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_5); StorageDead(_4); StorageDead(_2); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::nested_fnptr",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := (Option.some "outer") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::nested_fnptr::{closure#0}" List.nil), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:2:9: 2:14" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:2:33: 5:6" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::nested_fnptr::{closure#0}") List.nil)), span := "src/lib.rs:2:33: 5:6" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 3, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 })), span := "src/lib.rs:2:33: 5:6" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:2:40: 2:41" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:6:5: 6:10" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:6:5: 6:10" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:6:11: 6:12" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := List.nil }))), span := "src/lib.rs:6:11: 6:12" } List.nil))))))))), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 4, projection := List.nil }) (List.cons (Operand.move { local_ := 5, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:6:5: 6:13" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:6:12: 6:13" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:6:12: 6:13" } (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:7:1: 7:2" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:7:2: 7:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.nested_fnptr
+
+namespace Mir.ClosureExtended.nested_fnptr_closure_0
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::nested_fnptr::{closure#0}`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=0, align=1
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=8, align=8
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))) }
+
+-- bb0: StorageLive(_3); StorageLive(_4); _4 = {closure@src/lib.rs:3:37: 3:45}; _3 = move _4 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_4); StorageLive(_5); _5 = copy _3; StorageLive(_6); StorageLive(_7); _7 = copy _2; _6 = BitXor(move _7, const 3_u32); StorageDead(_7); _0 = move _5(move _6) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_6); StorageDead(_5); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::nested_fnptr::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::nested_fnptr::{closure#0}" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "a") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := (Option.some "inner") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::nested_fnptr::{closure#0}::{closure#0}" List.nil), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:3:13: 3:18" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:3:37: 3:57" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::nested_fnptr::{closure#0}::{closure#0}") List.nil)), span := "src/lib.rs:3:37: 3:57" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 4, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 })), span := "src/lib.rs:3:37: 3:57" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:3:44: 3:45" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:4:9: 4:14" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 3, projection := List.nil }))), span := "src/lib.rs:4:9: 4:14" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:4:15: 4:20" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:4:15: 4:16" } (List.cons { kind := (StatementKind.assign { local_ := 7, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:4:15: 4:16" } (List.cons { kind := (StatementKind.assign { local_ := 6, projection := List.nil } (Rvalue.binaryOp BinOp.bitXor (Operand.move { local_ := 7, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 3, sizeBytes := 4 })) }))), span := "src/lib.rs:4:15: 4:20" } (List.cons { kind := (StatementKind.storageDead 7), span := "src/lib.rs:4:19: 4:20" } List.nil)))))))))))), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 5, projection := List.nil }) (List.cons (Operand.move { local_ := 6, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:4:9: 4:21" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:4:20: 4:21" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:4:20: 4:21" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:5:5: 5:6" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:5:6: 5:6" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.nested_fnptr_closure_0
+
+namespace Mir.ClosureExtended.nested_fnptr_closure_0_closure_0
+
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::nested_fnptr::{closure#0}::{closure#0}`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=0, align=1
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=1, align=1
+-- TypeLayout[4]: size=8, align=4
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 (List.cons 3 List.nil)) } List.nil))))) }
+
+-- bb0: StorageLive(_3); StorageLive(_4); _4 = copy _2; _3 = BitXor(move _4, const 7_u32); StorageDead(_4); _5 = AddWithOverflow(copy _3, const 1_u32); assert(!move (_5.1: bool), "attempt to compute `{} + {}`, which would overflow", move _3, const 1_u32) -> [success: bb1, unwind continue]
+-- bb1: _0 = move (_5.0: u32); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::nested_fnptr::{closure#0}::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::nested_fnptr::{closure#0}::{closure#0}" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "b") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.tuple (List.cons (RigidTy.uint UintTy.u32) (List.cons RigidTy.bool List.nil))), layoutIdx := 4 }, debugName := Option.none } List.nil)))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 5), span := "<dummy>" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:3:46: 3:53" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:3:47: 3:48" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:3:47: 3:48" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.binaryOp BinOp.bitXor (Operand.move { local_ := 4, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 7, sizeBytes := 4 })) }))), span := "src/lib.rs:3:46: 3:53" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:3:52: 3:53" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.binaryOp BinOp.addWithOverflow (Operand.copy { local_ := 3, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 1, sizeBytes := 4 })) }))), span := "src/lib.rs:3:46: 3:57" } List.nil))))))), terminator := { kind := (TerminatorKind.assert (Operand.move { local_ := 5, projection := (List.cons (ProjectionElem.field 1 { kind := RigidTy.bool, layoutIdx := 3 }) List.nil) }) false 1 UnwindAction.continue_), span := "src/lib.rs:3:46: 3:57" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.use (Operand.move { local_ := 5, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }) List.nil) }))), span := "src/lib.rs:3:46: 3:57" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:3:56: 3:57" } List.nil)), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:3:57: 3:57" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end Mir.ClosureExtended.nested_fnptr_closure_0_closure_0
+
+/-! ## 3c. Verbatim `rustc-capture` output: nested, trait-impl, and transmute closures (`V2026_08_01`) -/
+
+namespace V08.Mir.ClosureExtended.BoxedVal_as_Compute_compute
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::<BoxedVal as Compute>::compute`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=8, align=8
+-- TypeLayout[4]: size=0, align=1
+-- TypeLayout[5]: size=1, align=1
+-- TypeLayout[6]: size=8, align=4
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } List.nil) (List.cons 0 List.nil)), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 (List.cons 5 List.nil)) } List.nil))))))) }
+
+-- bb0: StorageLive(_3); StorageLive(_4); _4 = {closure@src/lib.rs:21:33: 21:41}; _3 = move _4 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_4); StorageLive(_5); _5 = copy _3; StorageLive(_6); StorageLive(_7); _7 = copy _2; StorageLive(_8); _8 = copy ((*_1).0: u32); _9 = AddWithOverflow(copy _7, copy _8); assert(!move (_9.1: bool), "attempt to compute `{} + {}`, which would overflow", move _7, move _8) -> [success: bb1, unwind continue]
+-- bb1: _6 = move (_9.0: u32); StorageDead(_8); StorageDead(_7); _0 = move _5(move _6) -> [return: bb2, unwind continue]
+-- bb2: StorageDead(_6); StorageDead(_5); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::<BoxedVal as Compute>::compute",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    traitImpls := (List.cons { traitRef := { defPath := "closure_extended::Compute::compute", args := (List.cons (RigidTy.adt "closure_extended::BoxedVal" List.nil) List.nil) }, implPath := "closure_extended::<BoxedVal as Compute>::compute" } List.nil),
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.adt "closure_extended::BoxedVal" List.nil)), layoutIdx := 2 }, debugName := (Option.some "self") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := (Option.some "f") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::<BoxedVal as Compute>::compute::{closure#0}" List.nil), layoutIdx := 4 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.tuple (List.cons (RigidTy.uint UintTy.u32) (List.cons RigidTy.bool List.nil))), layoutIdx := 6 }, debugName := Option.none } List.nil)))))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 9), span := "<dummy>" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:21:13: 21:14" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:21:33: 21:48" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::<BoxedVal as Compute>::compute::{closure#0}") List.nil)), span := "src/lib.rs:21:33: 21:48" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 4, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 })), span := "src/lib.rs:21:33: 21:48" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:21:40: 21:41" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:22:9: 22:10" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 3, projection := List.nil }))), span := "src/lib.rs:22:9: 22:10" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:22:11: 22:21" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:22:11: 22:12" } (List.cons { kind := (StatementKind.assign { local_ := 7, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:22:11: 22:12" } (List.cons { kind := (StatementKind.storageLive 8), span := "src/lib.rs:22:15: 22:21" } (List.cons { kind := (StatementKind.assign { local_ := 8, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := (List.cons ProjectionElem.deref (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }) List.nil)) }))), span := "src/lib.rs:22:15: 22:21" } (List.cons { kind := (StatementKind.assign { local_ := 9, projection := List.nil } (Rvalue.binaryOp BinOp.addWithOverflow (Operand.copy { local_ := 7, projection := List.nil }) (Operand.copy { local_ := 8, projection := List.nil }))), span := "src/lib.rs:22:11: 22:21" } List.nil)))))))))))))), terminator := { kind := (TerminatorKind.assert (Operand.move { local_ := 9, projection := (List.cons (ProjectionElem.field 1 { kind := RigidTy.bool, layoutIdx := 5 }) List.nil) }) false 1 UnwindAction.continue_), span := "src/lib.rs:22:11: 22:21" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 6, projection := List.nil } (Rvalue.use (Operand.move { local_ := 9, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }) List.nil) }))), span := "src/lib.rs:22:11: 22:21" } (List.cons { kind := (StatementKind.storageDead 8), span := "src/lib.rs:22:20: 22:21" } (List.cons { kind := (StatementKind.storageDead 7), span := "src/lib.rs:22:20: 22:21" } List.nil))), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 5, projection := List.nil }) (List.cons (Operand.move { local_ := 6, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 2) UnwindAction.continue_), span := "src/lib.rs:22:9: 22:22" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:22:21: 22:22" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:22:21: 22:22" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:23:5: 23:6" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:23:6: 23:6" }, isCleanup := false } List.nil))),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.BoxedVal_as_Compute_compute
+
+namespace V08.Mir.ClosureExtended.BoxedVal_as_Compute_compute_closure_0
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::<BoxedVal as Compute>::compute::{closure#0}`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=0, align=1
+-- TypeLayout[2]: size=8, align=8
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } List.nil))) }
+
+-- bb0: StorageLive(_3); _3 = copy _2; _0 = BitXor(move _3, const 19_u32); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::<BoxedVal as Compute>::compute::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::<BoxedVal as Compute>::compute::{closure#0}" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "v") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:21:42: 21:43" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:21:42: 21:43" } (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.binaryOp BinOp.bitXor (Operand.move { local_ := 3, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 19, sizeBytes := 4 })) }))), span := "src/lib.rs:21:42: 21:48" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:21:47: 21:48" } List.nil)))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:21:48: 21:48" }, isCleanup := false } List.nil),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.BoxedVal_as_Compute_compute_closure_0
+
+namespace V08.Mir.ClosureExtended.Compute_compute_default
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::Compute::compute_default`. -/
+
+-- TypeLayout[0]: size=0, align=1
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=0, align=1
+-- TypeLayout[3]: size=8, align=8
+-- TypeLayout[4]: size=0, align=1
+-- TypeLayout[5]: size=0, align=1
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))))) }
+
+-- bb0: StorageLive(_3); StorageLive(_4); _4 = {closure@src/lib.rs:12:33: 12:41}; _3 = move _4 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_4); StorageLive(_5); _5 = copy _3; StorageLive(_6); StorageLive(_7); _7 = &(*_1); StorageLive(_8); _8 = copy _2; _6 = <Self as Compute>::compute(move _7, move _8) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_8); StorageDead(_7); _0 = move _5(move _6) -> [return: bb2, unwind continue]
+-- bb2: StorageDead(_6); StorageDead(_5); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::Compute::compute_default",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    typeParamCount := 1,
+    genericParams := (List.cons { idx := 0, name := "Self" } List.nil),
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.param 0 "Self")), layoutIdx := 2 }, debugName := (Option.some "self") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := (Option.some "f") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::Compute::compute_default::{closure#0}" List.nil), layoutIdx := 4 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.param 0 "Self")), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } List.nil))))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:12:13: 12:14" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:12:33: 12:48" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::Compute::compute_default::{closure#0}") List.nil)), span := "src/lib.rs:12:33: 12:48" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 4, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 })), span := "src/lib.rs:12:33: 12:48" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:12:40: 12:41" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:13:9: 13:10" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 3, projection := List.nil }))), span := "src/lib.rs:13:9: 13:10" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:13:11: 13:26" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:13:11: 13:15" } (List.cons { kind := (StatementKind.assign { local_ := 7, projection := List.nil } (Rvalue.ref BorrowKind.shared { local_ := 1, projection := (List.cons ProjectionElem.deref List.nil) })), span := "src/lib.rs:13:11: 13:15" } (List.cons { kind := (StatementKind.storageLive 8), span := "src/lib.rs:13:24: 13:25" } (List.cons { kind := (StatementKind.assign { local_ := 8, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:13:24: 13:25" } List.nil)))))))))))), terminator := { kind := (TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.fnDef "closure_extended::Compute::compute" (List.cons (RigidTy.param 0 "Self") List.nil)), layoutIdx := 5 }, val := ConstValue.zeroSized }) (List.cons (Operand.move { local_ := 7, projection := List.nil }) (List.cons (Operand.move { local_ := 8, projection := List.nil }) List.nil)) { local_ := 6, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:13:11: 13:26" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 8), span := "src/lib.rs:13:25: 13:26" } (List.cons { kind := (StatementKind.storageDead 7), span := "src/lib.rs:13:25: 13:26" } List.nil)), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 5, projection := List.nil }) (List.cons (Operand.move { local_ := 6, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 2) UnwindAction.continue_), span := "src/lib.rs:13:9: 13:27" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:13:26: 13:27" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:13:26: 13:27" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:14:5: 14:6" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:14:6: 14:6" }, isCleanup := false } List.nil))),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.ignore } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.Compute_compute_default
+
+namespace V08.Mir.ClosureExtended.Compute_compute_default_closure_0
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::Compute::compute_default::{closure#0}`. -/
+
+-- TypeLayout[0]: size=0, align=1
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=0, align=1
+-- TypeLayout[3]: size=8, align=8
+-- TypeLayout[4]: size=1, align=1
+-- TypeLayout[5]: size=8, align=4
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 2 List.nil) } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 (List.cons 4 List.nil)) } List.nil)))))) }
+
+-- bb0: StorageLive(_3); _3 = copy _2; _4 = AddWithOverflow(copy _3, const 11_u32); assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", move _3, const 11_u32) -> [success: bb1, unwind continue]
+-- bb1: _0 = move (_4.0: u32); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::Compute::compute_default::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    typeParamCount := 1,
+    genericParams := (List.cons { idx := 0, name := "Self" } List.nil),
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::Compute::compute_default::{closure#0}" List.nil)), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := (Option.some "v") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.tuple (List.cons (RigidTy.uint UintTy.u32) (List.cons RigidTy.bool List.nil))), layoutIdx := 5 }, debugName := Option.none } List.nil))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 4), span := "<dummy>" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:12:42: 12:43" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:12:42: 12:43" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.binaryOp BinOp.addWithOverflow (Operand.copy { local_ := 3, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, val := (ConstValue.scalar (ConstScalar.int { bits := 11, sizeBytes := 4 })) }))), span := "src/lib.rs:12:42: 12:48" } List.nil)))), terminator := { kind := (TerminatorKind.assert (Operand.move { local_ := 4, projection := (List.cons (ProjectionElem.field 1 { kind := RigidTy.bool, layoutIdx := 4 }) List.nil) }) false 1 UnwindAction.continue_), span := "src/lib.rs:12:42: 12:48" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.use (Operand.move { local_ := 4, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }) List.nil) }))), span := "src/lib.rs:12:42: 12:48" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:12:47: 12:48" } List.nil)), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:12:48: 12:48" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 2 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.Compute_compute_default_closure_0
+
+namespace V08.Mir.ClosureExtended.call_concrete_trait_impl
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::call_concrete_trait_impl`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=0, align=1
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } List.nil) (List.cons 0 List.nil)), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))) }
+
+-- bb0: StorageLive(_2); _2 = BoxedVal(const 5_u32); StorageLive(_3); _3 = &_2; StorageLive(_4); _4 = copy _1; _0 = <BoxedVal as Compute>::compute(move _3, move _4) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_4); StorageDead(_3); StorageDead(_2); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::call_concrete_trait_impl",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.adt "closure_extended::BoxedVal" List.nil), layoutIdx := 1 }, debugName := (Option.some "b") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.adt "closure_extended::BoxedVal" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:27:9: 27:10" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.aggregate (AggregateKind.adt "closure_extended::BoxedVal" 0 Option.none) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 5, sizeBytes := 4 })) }) List.nil))), span := "src/lib.rs:27:13: 27:24" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:28:5: 28:6" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.ref BorrowKind.shared { local_ := 2, projection := List.nil })), span := "src/lib.rs:28:5: 28:6" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:28:15: 28:16" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := List.nil }))), span := "src/lib.rs:28:15: 28:16" } List.nil)))))), terminator := { kind := (TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.fnDef "closure_extended::Compute::compute" (List.cons (RigidTy.adt "closure_extended::BoxedVal" List.nil) List.nil)), layoutIdx := 3 }, val := ConstValue.zeroSized }) (List.cons (Operand.move { local_ := 3, projection := List.nil }) (List.cons (Operand.move { local_ := 4, projection := List.nil }) List.nil)) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:28:5: 28:17" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:28:16: 28:17" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:28:16: 28:17" } (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:29:1: 29:2" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:29:2: 29:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.call_concrete_trait_impl
+
+namespace V08.Mir.ClosureExtended.call_default_trait_closure
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::call_default_trait_closure`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=4, align=4
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=0, align=1
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } List.nil) (List.cons 0 List.nil)), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))) }
+
+-- bb0: StorageLive(_2); _2 = BoxedVal(const 5_u32); StorageLive(_3); _3 = &_2; StorageLive(_4); _4 = copy _1; _0 = <BoxedVal as Compute>::compute_default(move _3, move _4) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_4); StorageDead(_3); StorageDead(_2); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::call_default_trait_closure",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.adt "closure_extended::BoxedVal" List.nil), layoutIdx := 1 }, debugName := (Option.some "b") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.adt "closure_extended::BoxedVal" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:32:9: 32:10" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.aggregate (AggregateKind.adt "closure_extended::BoxedVal" 0 Option.none) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 5, sizeBytes := 4 })) }) List.nil))), span := "src/lib.rs:32:13: 32:24" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:33:5: 33:6" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.ref BorrowKind.shared { local_ := 2, projection := List.nil })), span := "src/lib.rs:33:5: 33:6" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:33:23: 33:24" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := List.nil }))), span := "src/lib.rs:33:23: 33:24" } List.nil)))))), terminator := { kind := (TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.fnDef "closure_extended::Compute::compute_default" (List.cons (RigidTy.adt "closure_extended::BoxedVal" List.nil) List.nil)), layoutIdx := 3 }, val := ConstValue.zeroSized }) (List.cons (Operand.move { local_ := 3, projection := List.nil }) (List.cons (Operand.move { local_ := 4, projection := List.nil }) List.nil)) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:33:5: 33:25" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:33:24: 33:25" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:33:24: 33:25" } (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:34:1: 34:2" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:34:2: 34:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.call_default_trait_closure
+
+namespace V08.Mir.ClosureExtended.fn_ptr_transmute_roundtrip
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::fn_ptr_transmute_roundtrip`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=8, align=8
+-- TypeLayout[2]: size=0, align=1
+-- TypeLayout[3]: size=8, align=8
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 2 List.nil) } List.nil)))) }
+
+-- bb0: StorageLive(_2); StorageLive(_3); _3 = {closure@src/lib.rs:37:29: 37:37}; _2 = move _3 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_3); StorageLive(_4); StorageLive(_5); _5 = copy _2; _4 = move _5 as *const () (FnPtrToPtr); StorageDead(_5); StorageLive(_6); StorageLive(_7); _7 = copy _4; _6 = move _7 as fn(u32) -> u32 (Transmute); StorageDead(_7); StorageLive(_8); _8 = copy _6; StorageLive(_9); _9 = copy _1; _0 = move _8(move _9) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_9); StorageDead(_8); StorageDead(_6); StorageDead(_4); StorageDead(_2); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::fn_ptr_transmute_roundtrip",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := (Option.some "f") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::fn_ptr_transmute_roundtrip::{closure#0}" List.nil), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.tuple List.nil)), layoutIdx := 3 }, debugName := (Option.some "raw") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := (Option.some "g") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.tuple List.nil)), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:37:9: 37:10" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:37:29: 37:44" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::fn_ptr_transmute_roundtrip::{closure#0}") List.nil)), span := "src/lib.rs:37:29: 37:44" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 3, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 })), span := "src/lib.rs:37:29: 37:44" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:37:36: 37:37" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:38:9: 38:12" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:38:26: 38:27" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:38:26: 38:27" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.cast CastKind.fnPtrToPtr (Operand.move { local_ := 5, projection := List.nil }) { kind := (RigidTy.rawPtr Mutability.not (RigidTy.tuple List.nil)), layoutIdx := 3 })), span := "src/lib.rs:38:26: 38:40" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:38:39: 38:40" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:39:9: 39:10" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:39:59: 39:62" } (List.cons { kind := (StatementKind.assign { local_ := 7, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 4, projection := List.nil }))), span := "src/lib.rs:39:59: 39:62" } (List.cons { kind := (StatementKind.assign { local_ := 6, projection := List.nil } (Rvalue.cast CastKind.transmute (Operand.move { local_ := 7, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 })), span := "src/lib.rs:39:38: 39:63" } (List.cons { kind := (StatementKind.storageDead 7), span := "src/lib.rs:39:62: 39:63" } (List.cons { kind := (StatementKind.storageLive 8), span := "src/lib.rs:40:5: 40:6" } (List.cons { kind := (StatementKind.assign { local_ := 8, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 6, projection := List.nil }))), span := "src/lib.rs:40:5: 40:6" } (List.cons { kind := (StatementKind.storageLive 9), span := "src/lib.rs:40:7: 40:8" } (List.cons { kind := (StatementKind.assign { local_ := 9, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := List.nil }))), span := "src/lib.rs:40:7: 40:8" } List.nil))))))))))))))))))), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 8, projection := List.nil }) (List.cons (Operand.move { local_ := 9, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:40:5: 40:9" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 9), span := "src/lib.rs:40:8: 40:9" } (List.cons { kind := (StatementKind.storageDead 8), span := "src/lib.rs:40:8: 40:9" } (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:41:1: 41:2" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:41:1: 41:2" } (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:41:1: 41:2" } List.nil))))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:41:2: 41:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.fn_ptr_transmute_roundtrip
+
+namespace V08.Mir.ClosureExtended.fn_ptr_transmute_roundtrip_closure_0
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::fn_ptr_transmute_roundtrip::{closure#0}`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=0, align=1
+-- TypeLayout[2]: size=8, align=8
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } List.nil))) }
+
+-- bb0: StorageLive(_3); _3 = copy _2; _0 = BitXor(move _3, const 31_u32); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::fn_ptr_transmute_roundtrip::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::fn_ptr_transmute_roundtrip::{closure#0}" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "a") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:37:38: 37:39" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:37:38: 37:39" } (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.binaryOp BinOp.bitXor (Operand.move { local_ := 3, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 31, sizeBytes := 4 })) }))), span := "src/lib.rs:37:38: 37:44" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:37:43: 37:44" } List.nil)))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:37:44: 37:44" }, isCleanup := false } List.nil),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.fn_ptr_transmute_roundtrip_closure_0
+
+namespace V08.Mir.ClosureExtended.nested_fnptr
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::nested_fnptr`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=8, align=8
+-- TypeLayout[2]: size=0, align=1
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil))) }
+
+-- bb0: StorageLive(_2); StorageLive(_3); _3 = {closure@src/lib.rs:2:33: 2:41}; _2 = move _3 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_3); StorageLive(_4); _4 = copy _2; StorageLive(_5); _5 = copy _1; _0 = move _4(move _5) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_5); StorageDead(_4); StorageDead(_2); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::nested_fnptr",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "x") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := (Option.some "outer") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::nested_fnptr::{closure#0}" List.nil), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:2:9: 2:14" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:2:33: 5:6" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::nested_fnptr::{closure#0}") List.nil)), span := "src/lib.rs:2:33: 5:6" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 3, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 1 })), span := "src/lib.rs:2:33: 5:6" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:2:40: 2:41" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:6:5: 6:10" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:6:5: 6:10" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:6:11: 6:12" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 1, projection := List.nil }))), span := "src/lib.rs:6:11: 6:12" } List.nil))))))))), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 4, projection := List.nil }) (List.cons (Operand.move { local_ := 5, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:6:5: 6:13" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:6:12: 6:13" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:6:12: 6:13" } (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:7:1: 7:2" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:7:2: 7:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.nested_fnptr
+
+namespace V08.Mir.ClosureExtended.nested_fnptr_closure_0
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::nested_fnptr::{closure#0}`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=0, align=1
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=8, align=8
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))) }
+
+-- bb0: StorageLive(_3); StorageLive(_4); _4 = {closure@src/lib.rs:3:37: 3:45}; _3 = move _4 as fn(u32) -> u32 (PointerCoercion(ClosureFnPointer(Safe), Implicit)); StorageDead(_4); StorageLive(_5); _5 = copy _3; StorageLive(_6); StorageLive(_7); _7 = copy _2; _6 = BitXor(move _7, const 3_u32); StorageDead(_7); _0 = move _5(move _6) -> [return: bb1, unwind continue]
+-- bb1: StorageDead(_6); StorageDead(_5); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::nested_fnptr::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::nested_fnptr::{closure#0}" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "a") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := (Option.some "inner") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.closure "closure_extended::nested_fnptr::{closure#0}::{closure#0}" List.nil), layoutIdx := 1 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil)))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:3:13: 3:18" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:3:37: 3:57" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.aggregate (AggregateKind.closure "closure_extended::nested_fnptr::{closure#0}::{closure#0}") List.nil)), span := "src/lib.rs:3:37: 3:57" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.cast (CastKind.pointerCoercion "ClosureFnPointer(Safe)") (Operand.move { local_ := 4, projection := List.nil }) { kind := (RigidTy.fnPtr (List.cons (RigidTy.uint UintTy.u32) List.nil) (RigidTy.uint UintTy.u32) Safety.safe CallConv.rust), layoutIdx := 3 })), span := "src/lib.rs:3:37: 3:57" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:3:44: 3:45" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:4:9: 4:14" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 3, projection := List.nil }))), span := "src/lib.rs:4:9: 4:14" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:4:15: 4:20" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:4:15: 4:16" } (List.cons { kind := (StatementKind.assign { local_ := 7, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:4:15: 4:16" } (List.cons { kind := (StatementKind.assign { local_ := 6, projection := List.nil } (Rvalue.binaryOp BinOp.bitXor (Operand.move { local_ := 7, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 3, sizeBytes := 4 })) }))), span := "src/lib.rs:4:15: 4:20" } (List.cons { kind := (StatementKind.storageDead 7), span := "src/lib.rs:4:19: 4:20" } List.nil)))))))))))), terminator := { kind := (TerminatorKind.call (Operand.move { local_ := 5, projection := List.nil }) (List.cons (Operand.move { local_ := 6, projection := List.nil }) List.nil) { local_ := 0, projection := List.nil } (Option.some 1) UnwindAction.continue_), span := "src/lib.rs:4:9: 4:21" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:4:20: 4:21" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:4:20: 4:21" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:5:5: 5:6" } List.nil))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:5:6: 5:6" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.nested_fnptr_closure_0
+
+namespace V08.Mir.ClosureExtended.nested_fnptr_closure_0_closure_0
+
+open Trusted.Rustc.V2026_08_01.Layout
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-! Captured `Runtime(PostCleanup)` MIR and compiler layout table for `closure_extended::nested_fnptr::{closure#0}::{closure#0}`. -/
+
+-- TypeLayout[0]: size=4, align=4
+-- TypeLayout[1]: size=0, align=1
+-- TypeLayout[2]: size=8, align=8
+-- TypeLayout[3]: size=1, align=1
+-- TypeLayout[4]: size=8, align=4
+def layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 (List.cons 3 List.nil)) } List.nil))))) }
+
+-- bb0: StorageLive(_3); StorageLive(_4); _4 = copy _2; _3 = BitXor(move _4, const 7_u32); StorageDead(_4); _5 = AddWithOverflow(copy _3, const 1_u32); assert(!move (_5.1: bool), "attempt to compute `{} + {}`, which would overflow", move _3, const 1_u32) -> [success: bb1, unwind continue]
+-- bb1: _0 = move (_5.0: u32); StorageDead(_3); return
+def body : CapturedMir :=
+  {
+    defPath := "closure_extended::nested_fnptr::{closure#0}::{closure#0}",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.not (RigidTy.closure "closure_extended::nested_fnptr::{closure#0}::{closure#0}" List.nil)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "b") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.tuple (List.cons (RigidTy.uint UintTy.u32) (List.cons RigidTy.bool List.nil))), layoutIdx := 4 }, debugName := Option.none } List.nil)))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 5), span := "<dummy>" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:3:46: 3:53" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:3:47: 3:48" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:3:47: 3:48" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.binaryOp BinOp.bitXor (Operand.move { local_ := 4, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 7, sizeBytes := 4 })) }))), span := "src/lib.rs:3:46: 3:53" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:3:52: 3:53" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.binaryOp BinOp.addWithOverflow (Operand.copy { local_ := 3, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 1, sizeBytes := 4 })) }))), span := "src/lib.rs:3:46: 3:57" } List.nil))))))), terminator := { kind := (TerminatorKind.assert (Operand.move { local_ := 5, projection := (List.cons (ProjectionElem.field 1 { kind := RigidTy.bool, layoutIdx := 3 }) List.nil) }) false 1 UnwindAction.continue_), span := "src/lib.rs:3:46: 3:57" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.use (Operand.move { local_ := 5, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }) List.nil) }))), span := "src/lib.rs:3:46: 3:57" } (List.cons { kind := (StatementKind.storageDead 3), span := "src/lib.rs:3:56: 3:57" } List.nil)), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:3:57: 3:57" }, isCleanup := false } List.nil)),
+    fnAbi := { args := (List.cons { layout := { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) }, mode := AbiPassMode.direct } (List.cons { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct } List.nil)), ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := layouts,
+    allocations := List.nil
+  }
+
+end V08.Mir.ClosureExtended.nested_fnptr_closure_0_closure_0
+
 /-! ## 4. Difftest reproducer: exact `rfl` confirmation (`V2026_06_01`) -/
 
 namespace Anneal.ClosureFnPtrTests.Finding
@@ -3669,6 +4397,103 @@ theorem coerce_unlinked_extern_c_is_ub :
       .ub := by
   rfl
 
+
+/-- Real-captured 2-level nested closure-to-`fn`-pointer call: `((10 ^ 3) ^ 7) + 1 = 15` (matches Miri). -/
+theorem nested_fnptr_is_15 :
+    runWith Mir.ClosureExtended.nested_fnptr.body [u32v 10]
+      [Mir.ClosureExtended.nested_fnptr_closure_0.body,
+       Mir.ClosureExtended.nested_fnptr_closure_0_closure_0.body] =
+      .normalScalar 15 4 := by
+  rfl
+
+/-- Real-captured concrete trait-impl closure-to-`fn`-pointer call: `(10 + 5) ^ 19 = 28` (matches Miri). -/
+theorem concrete_trait_impl_closure_is_28 :
+    runWith Mir.ClosureExtended.call_concrete_trait_impl.body [u32v 10]
+      [Mir.ClosureExtended.BoxedVal_as_Compute_compute.body,
+       Mir.ClosureExtended.BoxedVal_as_Compute_compute_closure_0.body] =
+      .normalScalar 28 4 := by
+  rfl
+
+/-- C5 on real-captured default trait method: its closure inherits `Self` (`typeParamCount = 1`), so reification fails closed `.unsupported` (never `.ub`). -/
+theorem default_trait_method_closure_is_unsupported :
+    runWith Mir.ClosureExtended.call_default_trait_closure.body [u32v 10]
+      [Mir.ClosureExtended.BoxedVal_as_Compute_compute.body,
+       Mir.ClosureExtended.BoxedVal_as_Compute_compute_closure_0.body,
+       Mir.ClosureExtended.Compute_compute_default.body,
+       Mir.ClosureExtended.Compute_compute_default_closure_0.body] =
+      .unsupported := by
+  rfl
+
+/-- Real-captured `ClosureFnPointer` -> `FnPtrToPtr` -> `Transmute` -> indirect call roundtrip: `10 ^ 31 = 21` (matches Miri). -/
+theorem fn_ptr_transmute_roundtrip_is_21 :
+    runWith Mir.ClosureExtended.fn_ptr_transmute_roundtrip.body [u32v 10]
+      [Mir.ClosureExtended.fn_ptr_transmute_roundtrip_closure_0.body] =
+      .normalScalar 21 4 := by
+  rfl
+
+/-- Tree Borrows compatibility: a non-capturing closure body beginning with `Retag(FnEntry, _1)` succeeds when entered with the synthesized ZST reference `.scalar ⟨1, 8⟩`. -/
+theorem closure_body_fn_entry_retag_succeeds :
+    let base := Mir.ClosureMatrix.fn_shared_closure_0.body
+    let retagBody :=
+      { base with
+        basicBlocks :=
+          match base.basicBlocks with
+          | bb0 :: rest =>
+            { bb0 with
+              statements :=
+                { kind := .retag .fnEntry (plc 1), span := "retag_env" } :: bb0.statements } :: rest
+          | .nil => .nil }
+    runWith Mir.ClosureMatrix.fn_shared.body [u32v 5] [retagBody] =
+      .normalScalar 22 4 := by
+  rfl
+
+/-- Forged `ClosureFnPointer(Safe)` targeting a generic non-closure `fn` item faults with `.ub` (never `.unsupported`). -/
+theorem coerce_generic_non_closure_is_ub :
+    let genFn : CapturedMir :=
+      { Mir.ClosureMatrix.ct_add.body with
+        defPath := "tests::gen_fn"
+        typeParamCount := 1 }
+    coerce "ClosureFnPointer(Safe)" (.closure "tests::gen_fn" .nil) (.aggregate 0 .nil) fnU32 [genFn] =
+      .ub := by
+  rfl
+
+/-- Inline `const_eval_select` rejects a forged `.unit` value in a `fn`-pointer local even when `target.typeArgs[2]` names a valid closure. -/
+theorem inline_ces_forged_unit_with_fnptr_operand_ty_is_ub :
+    let caller :=
+      { Mir.ClosureMatrix.fn_shared.body with
+        defPath := "tests::ces_forged_unit_fnptr_ty"
+        argCount := 2
+        localDecls := [decl u32K 0, decl u32K 0, decl fnU32 1, decl (.tuple [u32K]) 0]
+        basicBlocks :=
+          [{ statements :=
+               [{ kind := .storageLive 3, span := "ces_live" },
+                { kind := .assign (plc 3) (.aggregate .tuple [.copy (plc 1)]), span := "ces_args" }]
+             terminator :=
+               { kind :=
+                   .call
+                     (.constant
+                       { ty := { kind := .fnDef "core::intrinsics::const_eval_select" (cesTyArgs sharedClo)
+                                 layoutIdx := 2 }
+                         val := .zeroSized })
+                     [.move (plc 3),
+                      .constant { ty := { kind := .fnDef "closure_matrix::ct_add" .nil, layoutIdx := 2 }
+                                  val := .zeroSized },
+                      .copy (plc 2)]
+                     (plc 0) (.some 1) .continue_
+                 span := "ces_call" }
+             isCleanup := false },
+           retBlock] }
+    runWith caller [u32v 5, .unit] [Mir.ClosureMatrix.fn_shared_closure_0.body] =
+      .ub := by
+  rfl
+
+/-- `unpackConstEvalSelectArgs?` accepts a zero-sized tuple containing a non-capturing closure and rejects a capturing closure. -/
+theorem unpack_ces_zst_closure_tuple :
+    (unpackConstEvalSelectArgs? .unit (.some (.tuple [.closure "tests::c" .nil])),
+     unpackConstEvalSelectArgs? .unit (.some (.tuple [.closure "tests::c" [u32K]]))) =
+      (.some [.unit], .none) := by
+  rfl
+
 end Anneal.ClosureFnPtrTests.V06
 
 /-! ## 6. Closure function-pointer matrix on `V2026_08_01` -/
@@ -4305,6 +5130,7 @@ theorem stepMirStatePeriodic_eq (fuel' : Nat) (body : CapturedMir) (st : MirExec
     stepMirStatePeriodic fuel' body st = stepMirState body st := by
   unfold stepMirStatePeriodic
   cases Nat.beq (fuel' % 2) 0 <;> simp only [stepMirStateStrict_eq]
+
 
 
 end Anneal.ClosureFnPtrTests.V08Strict
@@ -5080,6 +5906,102 @@ theorem coerce_unlinked_extern_c_is_ub :
       .ub := by
   rfl
 
+/-- Real-captured 2-level nested closure-to-`fn`-pointer call: `((10 ^ 3) ^ 7) + 1 = 15` (matches Miri). -/
+theorem nested_fnptr_is_15 :
+    runWith V08.Mir.ClosureExtended.nested_fnptr.body [u32v 10]
+      [V08.Mir.ClosureExtended.nested_fnptr_closure_0.body,
+       V08.Mir.ClosureExtended.nested_fnptr_closure_0_closure_0.body] =
+      .normalScalar 15 4 := by
+  rfl
+
+/-- Real-captured concrete trait-impl closure-to-`fn`-pointer call: `(10 + 5) ^ 19 = 28` (matches Miri). -/
+theorem concrete_trait_impl_closure_is_28 :
+    runWith V08.Mir.ClosureExtended.call_concrete_trait_impl.body [u32v 10]
+      [V08.Mir.ClosureExtended.BoxedVal_as_Compute_compute.body,
+       V08.Mir.ClosureExtended.BoxedVal_as_Compute_compute_closure_0.body] =
+      .normalScalar 28 4 := by
+  rfl
+
+/-- C5 on real-captured default trait method: its closure inherits `Self` (`typeParamCount = 1`), so reification fails closed `.unsupported` (never `.ub`). -/
+theorem default_trait_method_closure_is_unsupported :
+    runWith V08.Mir.ClosureExtended.call_default_trait_closure.body [u32v 10]
+      [V08.Mir.ClosureExtended.BoxedVal_as_Compute_compute.body,
+       V08.Mir.ClosureExtended.BoxedVal_as_Compute_compute_closure_0.body,
+       V08.Mir.ClosureExtended.Compute_compute_default.body,
+       V08.Mir.ClosureExtended.Compute_compute_default_closure_0.body] =
+      .unsupported := by
+  rfl
+
+/-- Real-captured `ClosureFnPointer` -> `FnPtrToPtr` -> `Transmute` -> indirect call roundtrip: `10 ^ 31 = 21` (matches Miri). -/
+theorem fn_ptr_transmute_roundtrip_is_21 :
+    runWith V08.Mir.ClosureExtended.fn_ptr_transmute_roundtrip.body [u32v 10]
+      [V08.Mir.ClosureExtended.fn_ptr_transmute_roundtrip_closure_0.body] =
+      .normalScalar 21 4 := by
+  rfl
+
+/-- Tree Borrows compatibility: a non-capturing closure body beginning with `Retag(FnEntry, _1)` succeeds when entered with the synthesized ZST reference `.scalar ⟨1, 8⟩`. -/
+theorem closure_body_fn_entry_retag_succeeds :
+    let base := V08.Mir.ClosureMatrix.fn_shared_closure_0.body
+    let retagBody :=
+      { base with
+        basicBlocks :=
+          match base.basicBlocks with
+          | bb0 :: rest =>
+            { bb0 with
+              statements :=
+                { kind := .retag .fnEntry (plc 1), span := "retag_env" } :: bb0.statements } :: rest
+          | .nil => .nil }
+    runWith V08.Mir.ClosureMatrix.fn_shared.body [u32v 5] [retagBody] =
+      .normalScalar 22 4 := by
+  rfl
+
+/-- Forged `ClosureFnPointer(Safe)` targeting a generic non-closure `fn` item faults with `.ub` (never `.unsupported`). -/
+theorem coerce_generic_non_closure_is_ub :
+    let genFn : CapturedMir :=
+      { V08.Mir.ClosureMatrix.ct_add.body with
+        defPath := "tests::gen_fn"
+        typeParamCount := 1 }
+    coerce "ClosureFnPointer(Safe)" (.closure "tests::gen_fn" .nil) (.aggregate 0 .nil) fnU32 [genFn] =
+      .ub := by
+  rfl
+
+/-- Inline `const_eval_select` rejects a forged `.unit` value in a `fn`-pointer local even when `target.typeArgs[2]` names a valid closure. -/
+theorem inline_ces_forged_unit_with_fnptr_operand_ty_is_ub :
+    let caller :=
+      { V08.Mir.ClosureMatrix.fn_shared.body with
+        defPath := "tests::ces_forged_unit_fnptr_ty"
+        argCount := 2
+        localDecls := [decl u32K 0, decl u32K 0, decl fnU32 1, decl (.tuple [u32K]) 0]
+        basicBlocks :=
+          [{ statements :=
+               [{ kind := .storageLive 3, span := "ces_live" },
+                { kind := .assign (plc 3) (.aggregate .tuple [.copy (plc 1)]), span := "ces_args" }]
+             terminator :=
+               { kind :=
+                   .call
+                     (.constant
+                       { ty := { kind := .fnDef "core::intrinsics::const_eval_select" (cesTyArgs sharedClo)
+                                 layoutIdx := 2 }
+                         val := .zeroSized })
+                     [.move (plc 3),
+                      .constant { ty := { kind := .fnDef "closure_matrix::ct_add" .nil, layoutIdx := 2 }
+                                  val := .zeroSized },
+                      .copy (plc 2)]
+                     (plc 0) (.some 1) .continue_
+                 span := "ces_call" }
+             isCleanup := false },
+           retBlock] }
+    runWith caller [u32v 5, .unit] [V08.Mir.ClosureMatrix.fn_shared_closure_0.body] =
+      .ub := by
+  rfl
+
+/-- `unpackConstEvalSelectArgs?` accepts a zero-sized tuple containing a non-capturing closure and rejects a capturing closure. -/
+theorem unpack_ces_zst_closure_tuple :
+    (unpackConstEvalSelectArgs? .unit (.some (.tuple [.closure "tests::c" .nil])),
+     unpackConstEvalSelectArgs? .unit (.some (.tuple [.closure "tests::c" [u32K]]))) =
+      (.some [.unit], .none) := by
+  rfl
+
 end Anneal.ClosureFnPtrTests.V08
 
 /-! ## 7. Axiom audit -/
@@ -5090,3 +6012,10 @@ end Anneal.ClosureFnPtrTests.V08
 #print axioms Anneal.ClosureFnPtrTests.V08.forged_env_call_capturing_is_ub
 #print axioms Anneal.ClosureFnPtrTests.V06.inline_ces_indirect_closure_is_22
 #print axioms Anneal.ClosureFnPtrTests.V08.inline_ces_indirect_closure_is_22
+
+#print axioms Anneal.ClosureFnPtrTests.V06.nested_fnptr_is_15
+#print axioms Anneal.ClosureFnPtrTests.V08.nested_fnptr_is_15
+#print axioms Anneal.ClosureFnPtrTests.V06.concrete_trait_impl_closure_is_28
+#print axioms Anneal.ClosureFnPtrTests.V08.concrete_trait_impl_closure_is_28
+#print axioms Anneal.ClosureFnPtrTests.V06.closure_body_fn_entry_retag_succeeds
+#print axioms Anneal.ClosureFnPtrTests.V08.closure_body_fn_entry_retag_succeeds
