@@ -61,7 +61,14 @@ End-to-end verification suite and cross-root kernel bridge across ALL THREE engi
      no-forgery through the niche, a pinned `Trusted` layout-only-decoder FINDING on direct-tagged enums with
      reference payloads, and the exact TWO-SIDED `translateRvalue` truth for projected float operands
      (`fa_translateRvalue_binaryOp_two_sided`: comparisons and float-on-the-RIGHT arithmetic are type-erased
-     `some`; ONLY the `statementOk*` / `inFragment*` gates reject them).
+     `some`; ONLY the `statementOk*` / `inFragment*` gates reject them);
+   - Round-2 counter-audit (`W14`): mixed `copy/const` (`copy (-2.0_f32) % const 2.0_f32 = -0.0`) &
+     `const/copy` (`const 2.0_f32 % copy (-2.0_f32) = +0.0`) `stepMirFn`/`runA` witnesses (paired in §2 with
+     real `Step.step` simulations `step_float_arith_{copy_const,const_copy}_deterministic_simulation`),
+     universal `f64` `Mach` + `MachTB.wfLive` carrier bridge (`fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive`)
+     instantiated on `f64` subnormal, overflow, and all 6 nondeterministic `sNaN + 1.0` outcomes, and the
+     explicit `evalByteCastRichWithPolicy` contrast rejecting forged `Tagged::B(&u8)` while accepting `Tagged::A`
+     under BOTH policies.
 2. **Cross-Root Dual-Authority Kernel Bridge (`run_cmd`)**:
    Loads BOTH `.lake/build/lib/lean` (`Anneal.Mir.IeeeFloatArith`, `MiniRustSpec.FloatArithMR`)
    and `examples/.lake/build/lib/lean` (`LeanMiriSpec.FloatArithLM`) into a fresh Lean kernel
@@ -1110,6 +1117,119 @@ theorem w13_finding_direct_tagged_ref_payload_missed_ub_layout_only_decoder :
   dsimp only
   exact ⟨fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl⟩, rfl⟩
 
+section Round2A2
+
+open MiniRustSpec MiniRustSpec.LibSpecr MiniRustSpec.Interp MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness MiniRustSpec.Correspondence.PointerWitness
+open MiniRustSpec.Correspondence.RefWitness MiniRustSpec.Correspondence.FloatCastMR
+
+/-- `fn rem_cc(x: f32) -> f32 { x % 2.0_f32 }` (`_0 = Rem(copy _1, const 2.0_f32)`). -/
+private def tRemCopyConstBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  fcBody "w14::rem_copy_const_f32" [fcDecl fcF32Ty, fcDecl fcF32Ty]
+    [.assign (local_ 0) (.binaryOp .rem (.copy (local_ 1)) (mkFConst fcF32Ty 0x40000000 4))]
+
+/-- `fn rem_kc(x: f32) -> f32 { 2.0_f32 % x }` (`_0 = Rem(const 2.0_f32, copy _1)`). -/
+private def tRemConstCopyBody : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  fcBody "w14::rem_const_copy_f32" [fcDecl fcF32Ty, fcDecl fcF32Ty]
+    [.assign (local_ 0) (.binaryOp .rem (mkFConst fcF32Ty 0x40000000 4) (.copy (local_ 1)))]
+
+/-- Shared `Mach` + `MachTB` (`MachTB.wfLive`) 64-bit carrier target predicate for `bits`. -/
+private abbrev tF64CarrierBoth (bits : Nat) : Prop :=
+  (∃ (m0 m' : Mach),
+    fcStartMachine8 fcCarrier64Body [.scalar ⟨bits, 8⟩] = some m0 ∧
+    Interp.steps 3 m0 = .ok m' ∧
+    m'.threads = [thread1 fcCtx8 [{ fcCtx8.caller with next_block := fcCtx8.nextBlock, next_stmt := 0 }]] ∧
+    m'.mem.memory.allocations[0]? = some { fcRetAlloc8 with data := (encodeLittleEndianBytes bits 8 none).map fcByteToMR }) ∧
+  (∃ (m0 m' : MachTB),
+    fcStartMachineTB8 fcCarrier64Body [.scalar ⟨bits, 8⟩] = some m0 ∧
+    Interp.stepsTB 3 m0 = .ok m' ∧ MachTB.wfLive m' ∧
+    m'.threads.map (·.stack.length) = [1] ∧
+    m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data)) =
+      some (true, ((encodeLittleEndianBytes bits 8 none).map fcByteToMR).map liftByteTB)) ∧
+  fcRetAfter8 fcCarrier64Body [.scalar ⟨bits, 8⟩] 3 =
+    some (some { fcRetAlloc8 with data := (encodeLittleEndianBytes bits 8 none).map fcByteToMR }, [1]) ∧
+  fcRetAfterTB8 fcCarrier64Body [.scalar ⟨bits, 8⟩] 3 = tbRetU64 bits
+
+/-- **`W14` Witness (Round-2 counter-audit `A2`)**:
+1. Mixed `copy/const` (`copy (-2.0_f32) % const 2.0_f32 = -0.0`) and `const/copy`
+   (`const 2.0_f32 % copy (-2.0_f32) = +0.0`) step-level (`stepMirFn` + `runA`, including `.uninit`
+   and `.dead` UB) witnesses, paired in §2 with the vendored Miri `Step.step` simulations
+   `step_float_arith_{copy_const,const_copy}_deterministic_simulation`;
+2. Universal `f64` (`binary64`) `Mach` + `MachTB.wfLive` carrier bridge
+   (`fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive`) instantiated on `f64` subnormal
+   (`0x1 + 0x1 = 0x2`), overflow (`f64::MAX + f64::MAX = +Inf`), and all 6 nondeterministic
+   `sNaN(0x7FF4000000000001) + 1.0` outcomes;
+3. `evalByteCastRichWithPolicy` (`RichAdtSpec.taggedEnum`) rejecting forged `Tagged::B(&u8)`
+   (`[1usize, 0x1000usize]` and `[1usize, 0usize]`) with `.ub` under BOTH policies, contrasted with
+   `Tagged::A` (`[0usize, 0x1000usize]` and `[0usize, 0usize]`) succeeding with `.ok (.aggregate 0 [])`
+   under BOTH policies (and layout-only `evalByteCast` agreeing on `Tagged::A`). -/
+theorem w14_a2_mixed_step_f64_machTB_and_richAdt_tagged_no_forge :
+    let sCC := initMachineState tRemCopyConstBody [.scalar ⟨0xC0000000, 4⟩]
+    let sKC := initMachineState tRemConstCopyBody [.scalar ⟨0xC0000000, 4⟩]
+    let forgedB : Trusted.Rustc.V2026_06_01.MirSemantics.Value := .aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨0x1000, 8⟩]
+    let forgedBNull : Trusted.Rustc.V2026_06_01.MirSemantics.Value := .aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨0, 8⟩]
+    let taggedA : Trusted.Rustc.V2026_06_01.MirSemantics.Value := .aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨0x1000, 8⟩]
+    let taggedA0 : Trusted.Rustc.V2026_06_01.MirSemantics.Value := .aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨0, 8⟩]
+    -- (a) Mixed `copy/const` and `const/copy` real `stepMirFn` / `runA` + `.uninit` / `.dead` UB
+    (stepMirFn tRemCopyConstBody sCC =
+        MirStepNode.step (advanceStmt sCC [.init (.scalar ⟨0x80000000, 4⟩), .init (.scalar ⟨0xC0000000, 4⟩)] sCC.memory) ∧
+      (∃ mem, runA tRemCopyConstBody 5 sCC = some ([], .normal (.scalar ⟨0x80000000, 4⟩, mem))) ∧
+      stepMirFn tRemConstCopyBody sKC =
+        MirStepNode.step (advanceStmt sKC [.init (.scalar ⟨0x00000000, 4⟩), .init (.scalar ⟨0xC0000000, 4⟩)] sKC.memory) ∧
+      (∃ mem, runA tRemConstCopyBody 5 sKC = some ([], .normal (.scalar ⟨0x00000000, 4⟩, mem))) ∧
+      stepMirFn tRemCopyConstBody { sCC with frame := { sCC.frame with locals := [.uninit, .uninit] } } =
+        MirStepNode.fail .ub ∧
+      stepMirFn tRemConstCopyBody { sKC with frame := { sKC.frame with locals := [.uninit, .uninit] } } =
+        MirStepNode.fail .ub ∧
+      stepMirFn tRemCopyConstBody { sCC with frame := { sCC.frame with locals := [.uninit, .dead] } } =
+        MirStepNode.fail .ub ∧
+      stepMirFn tRemConstCopyBody { sKC with frame := { sKC.frame with locals := [.uninit, .dead] } } =
+        MirStepNode.fail .ub) ∧
+    -- (b) Universal `f64` `Mach` + `MachTB.wfLive` bridge on subnormal, overflow, and 6 sNaN outcomes
+    (tF64CarrierBoth 0x0000000000000002 ∧
+      tF64CarrierBoth 0x7FF0000000000000 ∧
+      (∀ cand ∈ [0x7FF8000000000000, 0xFFF8000000000000, 0x7FFC000000000001, 0xFFFC000000000001,
+          0x7FF4000000000001, 0xFFF4000000000001], tF64CarrierBoth cand)) ∧
+    -- (c) `evalByteCastRichWithPolicy`: forged `Tagged::B(&u8)` is `.ub` under BOTH policies,
+    --     contrasted with `Tagged::A` succeeding under BOTH policies
+    (∀ policy,
+      evalByteCastRichWithPolicy [.init forgedB] (.copy ⟨0, .nil⟩) tTaggedRefU8Ty emptyMemory
+          [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts tOptRefU8Specs policy = .ub ∧
+      evalByteCastRichWithPolicy [.init forgedBNull] (.copy ⟨0, .nil⟩) tTaggedRefU8Ty emptyMemory
+          [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts tOptRefU8Specs policy = .ub ∧
+      evalByteCastRichWithPolicy [.init taggedA] (.copy ⟨0, .nil⟩) tTaggedRefU8Ty emptyMemory
+          [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts tOptRefU8Specs policy =
+        .ok (.aggregate 0 []) [.init taggedA] emptyMemory ∧
+      evalByteCastRichWithPolicy [.init taggedA0] (.copy ⟨0, .nil⟩) tTaggedRefU8Ty emptyMemory
+          [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts tOptRefU8Specs policy =
+        .ok (.aggregate 0 []) [.init taggedA0] emptyMemory ∧
+      evalByteCast [.init taggedA] (.copy ⟨0, .nil⟩) tTaggedRefU8Ty emptyMemory
+          [⟨.not, tUsizeArr2NicheTy, .none⟩] tNicheEnumLayouts policy =
+        .ok (.aggregate 0 []) [.init taggedA] emptyMemory) := by
+  dsimp only
+  have hSubEv : evalFloatArithBase .add .binary64 0x0000000000000001 0x0000000000000001 =
+      .some 0x0000000000000002 := by decide +kernel
+  have hSubNan : isNaNBits .binary64 0x0000000000000002 = false := by decide +kernel
+  have hOvEv : evalFloatArithBase .add .binary64 0x7FEFFFFFFFFFFFFF 0x7FEFFFFFFFFFFFFF =
+      .some 0x7FF0000000000000 := by decide +kernel
+  have hOvNan : isNaNBits .binary64 0x7FF0000000000000 = false := by decide +kernel
+  have hSubBr := @fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive .deterministic .add
+    0x0000000000000001 0x0000000000000001 ⟨0x0000000000000002, 8⟩ rfl (by
+      unfold EvalFloatBinOpRel; dsimp only [evalFloatCmp]; rw [hSubEv]
+      simp only [hSubNan, Bool.false_eq_true, ↓reduceIte]; rfl)
+  have hOvBr := @fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive .deterministic .add
+    0x7FEFFFFFFFFFFFFF 0x7FEFFFFFFFFFFFFF ⟨0x7FF0000000000000, 8⟩ rfl (by
+      unfold EvalFloatBinOpRel; dsimp only [evalFloatCmp]; rw [hOvEv]
+      simp only [hOvNan, Bool.false_eq_true, ↓reduceIte]; rfl)
+  exact ⟨⟨rfl, ⟨_, rfl⟩, rfl, ⟨_, rfl⟩, rfl, rfl, rfl, rfl⟩,
+    ⟨hSubBr.2.2, hOvBr.2.2, fun cand hc =>
+      (fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive .nondeterministic .add
+        0x7FF4000000000001 0x3FF0000000000000 ⟨cand, 8⟩ rfl
+        (w11_mr_f64_nan_candidates_machTB_carrier.1 cand hc)).2.2⟩,
+    fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩⟩
+
+end Round2A2
+
 /-! ## §2. Cross-Root Dual-Authority Kernel Bridge (`IeeeFloatArith` + `FloatArithMR` + `FloatArithLM`) -/
 
 open Lean Elab Command Meta in
@@ -1197,7 +1317,10 @@ run_cmd do
         lmNs ++ `miri_transmute_fnPtr_no_forge_ub,
         lmNs ++ `w8_lm_const_nondet_rawPtr_vs_ref_and_uninit_binop,
         -- Round-2 (`B2`): `%` dividend-sign / exactly-zero-remainder agreement of BOTH engines.
-        lmNs ++ `w9_lm_rem_dividend_sign_and_zero_remainder ]
+        lmNs ++ `w9_lm_rem_dividend_sign_and_zero_remainder,
+        -- Round-2 counter-audit (`A2`): mixed `copy/const` & `const/copy` real `Step.step` simulations.
+        lmNs ++ `step_float_arith_copy_const_deterministic_simulation,
+        lmNs ++ `step_float_arith_const_copy_deterministic_simulation ]
     let generalMrThms : List Name :=
       [ mrNs ++ `fa_no_fragment_admits_float_arith_or_cmp,
         mrNs ++ `fa_projected_float_place_rejection,
@@ -1206,6 +1329,7 @@ run_cmd do
         mrNs ++ `fa_sym_mr_negXor_f32_lockstep,
         mrNs ++ `fa_sym_mr_negXor_f64_lockstep,
         mrNs ++ `fa_bridge_evalFloatBinOpRel_mach_steps,
+        mrNs ++ `fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive,
         mrNs ++ `fa_ptr2int_live_mach_and_machTB_wfLive,
         mrNs ++ `fa_composite_tuple_struct_policy_correspondence,
         mrNs ++ `fa_no_forge_ref_and_uninit_live_mach_and_machTB_wfLive ]
@@ -1557,7 +1681,12 @@ run_cmd do
         -- Round-2 (`B2`): two-sided `translateRvalue` truth and the dual-engine `%` sign witness.
         `MiniRustSpec.Correspondence.translateRvalue,
         `MiniRustSpec.FloatArithMR.fa_translateRvalue_binaryOp_two_sided,
-        `LeanMiriSpec.FloatArithLM.w9_lm_rem_dividend_sign_and_zero_remainder ]
+        `LeanMiriSpec.FloatArithLM.w9_lm_rem_dividend_sign_and_zero_remainder,
+        -- Round-2 counter-audit (`A2`): mixed `copy/const` & `const/copy` `Step.step` simulations
+        -- and universal `f64` (`binary64`) `Mach` + `MachTB.wfLive` relational carrier bridge.
+        `LeanMiriSpec.FloatArithLM.step_float_arith_copy_const_deterministic_simulation,
+        `LeanMiriSpec.FloatArithLM.step_float_arith_const_copy_deterministic_simulation,
+        `MiniRustSpec.FloatArithMR.fa_bridge_evalFloatBinOpRel_f64_mach_and_machTB_wfLive ]
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: unifiedFloatArithAndUcg630DualBundle does not reach {req}"
@@ -1571,7 +1700,7 @@ run_cmd do
       reachedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
   unless addedCount == 7 && rejectedCount == 12 && acceptedCount == 11 && ieeeThms ≥ 300 &&
-      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 65 && lmPublic ≥ 64 && reachedCount == 43 do
+      mrThms ≥ 100 && lmThms ≥ 95 && mrPublic ≥ 66 && lmPublic ≥ 66 && reachedCount == 46 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount}, accepted={acceptedCount}, ieee={ieeeThms}, mr={mrThms}, lm={lmThms}, mrPublic={mrPublic}, lmPublic={lmPublic}, reached={reachedCount})"
   logInfo m!"ep2 float-arith cross-root kernel bridge: added {addedCount} dual theorems, rejected {rejectedCount} forged controls (paired with {acceptedCount} accepted positive controls), audited {ieeeThms} constructive IeeeFloatArith + {mrThms} MR + {lmThms} LM theorems (0 host Float, 0 MiniRustSpec imports in LM, {mrPublic} MR + {lmPublic} LM public theorems all covered by axiomAudit bundles, MiniRust Gen.Type has no float constructor), reached all {reachedCount} Trusted(06+08)+MiniRust+Miri constants, axioms {crAxioms}"
 
