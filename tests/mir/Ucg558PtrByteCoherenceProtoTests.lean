@@ -48,6 +48,14 @@ theorem t_leImage_getElem? :
     (leImage 0x1122 8)[1]? = if 1 < 8 then some (UInt8.ofNat (0x1122 / 256 ^ 1)) else none :=
   leImage_getElem? _ _ _
 
+theorem t_leValue_lt : leValue [0xFF, 0xFF] < 256 ^ ([0xFF, 0xFF] : List UInt8).length :=
+  leValue_lt [0xFF, 0xFF]
+
+theorem t_leImage_leValue :
+    leImage (leValue [0x88, 0x77, 0x66, 0x55]) ([0x88, 0x77, 0x66, 0x55] : List UInt8).length =
+      [0x88, 0x77, 0x66, 0x55] :=
+  leImage_leValue [0x88, 0x77, 0x66, 0x55]
+
 theorem t_encodePtrFragsAux_length : (encodePtrFragsAux 1 1 0 8 0 0 8).length = 8 :=
   encodePtrFragsAux_length _ _ _ _ _ _ _
 
@@ -84,6 +92,22 @@ theorem t_coherent_some_frags :
     ∀ (i : Nat) (x : AbstractByteProto), (encodePtrBytesProto pZero 8)[i]? = some x →
       ∃ b, x = .init b (some ⟨1, 1, i, 0, 8⟩) :=
   coherent_some_frags 8 _ ⟨1, 1, 0⟩ t_roundtrip_zero_64
+
+theorem t_dataBytesProto_length :
+    (leImage 0x1122334455667788 8).length = (encodePtrBytesProto pBig 8).length :=
+  dataBytesProto_length _ _ (dataBytesProto_encode _ _ _ _ _ _ _)
+
+theorem t_dataBytesProto_getElem? :
+    (leImage 0x1122 8)[1]? = some 0x11 :=
+  dataBytesProto_getElem? (encodePtrBytesProto ⟨1, 1, 0x1122⟩ 8) (leImage 0x1122 8)
+    (dataBytesProto_encode _ _ _ _ _ _ _) 1 0x11 _ rfl
+
+/-- Exact algebraic characterization (`↔`) instantiated in both directions. -/
+theorem t_coherent_iff_encode :
+    (0 < 8 ∧ pTag.offsetBytes < 256 ^ 8 ∧ encodePtrBytesProto pTag 8 = encodePtrBytesProto pTag 8) ∧
+    abstractBytesCoherentPtrProvProto 8 (encodePtrBytesProto pTag 8) = some pTag :=
+  ⟨(coherent_iff_encode 8 _ pTag).mp ((coherent_encode pTag 8 (by decide)).trans rfl),
+    (coherent_iff_encode 8 _ pTag).mpr ⟨by decide, by decide, rfl⟩⟩
 
 /-- Exact `tag` preservation with `tag ≠ allocId` (live drops it, see `w3_tag_dropped`). -/
 theorem t_exact_tag_64 :
@@ -205,6 +229,18 @@ theorem t_cross_width :
       (encodePtrBytesProto pBig4 4 ++ encodePtrBytesProto pBig4 4) = none :=
   coherent_cross_width_none pBig4 pBig4 4 (by decide)
 
+theorem t_encode_normOffset :
+    encodePtrBytesProto ⟨1, 1, 2 ^ 64 + 5⟩ 8 =
+      encodePtrBytesProto ⟨1, 1, normOffset 8 (2 ^ 64 + 5)⟩ 8 :=
+  encodePtrBytesProto_normOffset ⟨1, 1, 2 ^ 64 + 5⟩ 8
+
+theorem t_splice_equiv_normOffset :
+    abstractBytesCoherentPtrProvProto 8
+      (spliceBytes 3 (encodePtrBytesProto ⟨5, 9, 5⟩ 8)
+        (encodePtrBytesProto ⟨5, 9, 2 ^ 64 + 5⟩ 8)) =
+      some ⟨5, 9, normOffset 8 5⟩ :=
+  coherent_splice_equiv_normOffset ⟨5, 9, 5⟩ ⟨5, 9, 2 ^ 64 + 5⟩ 8 3 (by decide) rfl rfl rfl
+
 theorem t_take_append : ([1, 2] ++ [3] : List Nat).take 2 = [1, 2] :=
   take_append_of_length _ _ 2 rfl
 
@@ -235,6 +271,44 @@ theorem t_slice_exact :
       (encodePtrBytesProto pTag 8 ++ encodeLittleEndianBytesProto 3 8) =
       some (.aggregate [.ptr pTag 8, .scalar 3 8]) :=
   decode_encode_slice_exact true pTag 3 8 (by decide) (by decide) (by decide)
+
+theorem t_str_exact :
+    decodePtrBytesNoForgeProto true .str 8
+      (encodePtrBytesProto pTag 8 ++ encodeLittleEndianBytesProto 5 8) =
+      some (.aggregate [.ptr pTag 8, .scalar 5 8]) :=
+  decode_encode_str_exact true pTag 5 8 (by decide) (by decide) (by decide)
+
+theorem t_thin_unnormalized :
+    decodePtrBytesNoForgeProto true .thin 4 (encodePtrBytesProto ⟨5, 9, 2 ^ 32 + 7⟩ 4) =
+      some (.ptr ⟨5, 9, normOffset 4 (2 ^ 32 + 7)⟩ 4) :=
+  decode_encode_thin_unnormalized true ⟨5, 9, 2 ^ 32 + 7⟩ 4 (by decide)
+
+theorem t_haveFrag_some :
+    abstractBytesHaveFragProto [mkInitByte 0, mkPtrFragByte 1 2 3 0 1 8] = true :=
+  haveFrag_of_getElem?_some _ 1 1 ⟨2, 3, 0, 1, 8⟩ rfl
+
+theorem t_dyn_rev_vtable_univ :
+    decodePtrBytesNoForgeProto true .dyn 8
+        (encodePtrBytesProto pTag 8 ++ (encodePtrBytesProto pVt 8).reverse) = none ∧
+    ∃ vbits, decodePtrBytesNoForgeProto false .dyn 8
+        (encodePtrBytesProto pTag 8 ++ (encodePtrBytesProto pVt 8).reverse) =
+      some (.aggregate [.ptr pTag 8, .scalar vbits 8]) :=
+  decode_dyn_rev_vtable_ref_none_raw_scalar pTag pVt 8 (by decide) (by decide)
+
+theorem t_slice_prov_meta_none :
+    decodePtrBytesNoForgeProto false .slice 8
+        (encodePtrBytesProto pTag 8 ++ encodePtrBytesProto pVt 8) = none ∧
+    decodePtrBytesNoForgeProto false .str 8
+        (encodePtrBytesProto pTag 8 ++ encodePtrBytesProto pVt 8) = none :=
+  decode_slice_prov_meta_none false (encodePtrBytesProto pTag 8) (encodePtrBytesProto pVt 8)
+    8 0 _ _ (encodePtrBytesProto_length _ _) (encodePtrBytesProto_getElem? pVt 8 0 (by decide))
+
+theorem t_slice_swapped_halves_none :
+    decodePtrBytesNoForgeProto true .slice 8
+        (encodeLittleEndianBytesProto 3 8 ++ encodePtrBytesProto pTag 8) = none ∧
+    decodePtrBytesNoForgeProto true .str 8
+        (encodeLittleEndianBytesProto 3 8 ++ encodePtrBytesProto pTag 8) = none :=
+  decode_slice_swapped_halves_none true pTag 3 8 (by decide)
 
 theorem t_dataBytes_append :
     dataBytesProto ([mkInitByte 1] ++ [mkInitByte 2]) = some ([1] ++ [2]) :=
@@ -279,7 +353,9 @@ theorem t_opt2_hazard :
     opt2LegacyHasProv (.init 0 (some (1, 1)) (some ⟨0, 0, 8⟩)) = false :=
   opt2_legacy_pattern_hazard
 
-theorem t_imageVec8_inj : 5 % 256 ^ 8 = 5 % 256 ^ 8 := imageVec8_inj 5 5 rfl
+/-- Non-trivial injectivity instantiation: `5` and `2^64 + 5` share identical 8-byte images. -/
+theorem t_imageVec8_inj : 5 % 256 ^ 8 = (2 ^ 64 + 5) % 256 ^ 8 :=
+  imageVec8_inj 5 (2 ^ 64 + 5) rfl
 
 theorem t_uint8_ofNat_toNat : (UInt8.ofNat 7).toNat = 7 := uint8_ofNat_toNat_of_lt 7 (by decide)
 
@@ -293,19 +369,27 @@ theorem t_miri_of_coherent_32 :
       .ok (some (3, 7)) :=
   miri_of_coherent 4 (by decide) _ pBig4 ((coherent_encode pBig4 4 (by decide)).trans rfl)
 
+/-- Non-empty instantiation of `miri_loop_of_frags` on a real 8-byte encoded pointer. -/
 theorem t_miri_loop_of_frags :
-    inspectFragmentsMirrorLoop none 0 (some ((1, 1), imageVec8 0))
-      (([] : List AbstractByteProto).map toMiriFrag) = .ok (some (1, 1)) :=
-  miri_loop_of_frags 1 1 0 8 [] 0 (fun _ _ h => by simp at h) (by decide)
+    inspectFragmentsMirrorLoop none 0 (some ((3, 7), imageVec8 pBig.offsetBytes))
+      ((encodePtrBytesProto pBig 8).map toMiriFrag) = .ok (some (3, 7)) :=
+  miri_loop_of_frags 3 7 pBig.offsetBytes 8 (by decide) (encodePtrBytesProto pBig 8) 0
+    (fun i x hx => by
+      obtain ⟨_, hall⟩ := coherent_some_frags 8 _ pBig ((coherent_encode pBig 8 (by decide)).trans rfl)
+      obtain ⟨b, hb⟩ := hall i x hx
+      exact ⟨b, by simpa [pBig] using hb⟩)
+    (by decide)
 
 theorem t_fragsWellFormed : FragsWellFormed 8 (encodePtrBytesProto pBig 8) :=
   fragsWellFormed_encode pBig 8 (by decide)
 
+/-- Non-empty instantiation of `miri_loop_inv` on a real 8-byte encoded pointer. -/
 theorem t_miri_loop_inv :
-    (1, 1) = (1, 1) ∧ ∀ (i : Nat) (x : AbstractByteProto), ([] : List AbstractByteProto)[i]? = some x →
-      ∃ b f, x = .init b (some f) ∧ (UInt8.ofNat f.byteIdx).toNat = 0 + i ∧ f.allocId = 1 ∧
-        f.tag = 1 ∧ imageVec8 f.origOffset = imageVec8 0 :=
-  miri_loop_inv 1 1 (imageVec8 0) [] 0 (1, 1) rfl
+    (3, 7) = (3, 7) ∧ ∀ (i : Nat) (x : AbstractByteProto), (encodePtrBytesProto pBig 8)[i]? = some x →
+      ∃ b f, x = .init b (some f) ∧ (UInt8.ofNat f.byteIdx).toNat = 0 + i ∧ f.allocId = 3 ∧
+        f.tag = 7 ∧ imageVec8 (normOffset f.ptrBytes f.origOffset) = imageVec8 pBig.offsetBytes :=
+  miri_loop_inv 3 7 (imageVec8 pBig.offsetBytes) (encodePtrBytesProto pBig 8) 0 (3, 7)
+    t_miri_loop_of_frags
 
 /-- Miri ⇒ prototype on a real 64-bit and a real 32-bit image. -/
 theorem t_coherent_of_miri :
@@ -320,6 +404,34 @@ theorem t_coherent_of_miri_32 :
   coherent_of_miri 4 (by decide) (by decide) _ (encodePtrBytesProto_length _ _)
     (fragsWellFormed_encode _ 4 (by decide)) (3, 7) t_miri_of_coherent_32
 
+theorem t_miri_loop_some_expected_ok :
+    ∃ r, inspectFragmentsMirrorLoop none 0 (some ((3, 7), imageVec8 pBig.offsetBytes))
+      ((encodePtrBytesProto pBig 8).map toMiriFrag) = .ok r :=
+  miri_loop_some_expected_ok _ (encodePtrBytesProto pBig 8) 0
+
+theorem t_miri_nonempty_ok :
+    ∃ r, inspectFragmentsMirror none ((encodePtrBytesProto pBig 8).reverse.map toMiriFrag) = .ok r :=
+  miri_nonempty_ok _ (by decide)
+
+/-- Exact Proto ↔ Miri recovery biconditional (64-bit and 32-bit). -/
+theorem t_coherent_iff_miri_some :
+    inspectFragmentsMirror none ((encodePtrBytesProto pBig 8).map toMiriFrag) = .ok (some (3, 7)) ∧
+    (abstractBytesCoherentPtrProvProto 4 (encodePtrBytesProto pBig4 4)).map
+      (fun p => (p.allocId, p.tag)) = some (3, 7) :=
+  ⟨(coherent_iff_miri_some 8 (by decide) (by decide) _ (encodePtrBytesProto_length _ _)
+      (fragsWellFormed_encode _ 8 (by decide)) (3, 7)).mp rfl,
+    (coherent_iff_miri_some 4 (by decide) (by decide) _ (encodePtrBytesProto_length _ _)
+      (fragsWellFormed_encode _ 4 (by decide)) (3, 7)).mpr t_miri_of_coherent_32⟩
+
+/-- Exact Proto ↔ Miri stripping biconditional on `p` / `p + 256` splice. -/
+theorem t_coherent_iff_miri_none :
+    inspectFragmentsMirror none
+      ((spliceBytes 1 (encodePtrBytesProto pZero 8) (encodePtrBytesProto p256 8)).map toMiriFrag) =
+      .ok none :=
+  (coherent_iff_miri_none 8 (by decide) (by decide) _ rfl
+    (fragsWellFormed_splice 8 1 _ _ (by decide) (fragsWellFormed_encode _ 8 (by decide))
+      (fragsWellFormed_encode _ 8 (by decide)))).mp t_splice_0_256
+
 theorem t_toMiniRust_encodeAux :
     (encodePtrFragsAux 1 1 0 8 0 0 8).map AbstractByteProto.toMiniRust =
       MiniRustSpec.Interp.encodePtrBytes (some (mrProv 1)) 0 (leImage 0 8) :=
@@ -330,10 +442,14 @@ theorem t_toMiniRust_encode :
     (encodePtrBytesProto pBig 8).map AbstractByteProto.toMiniRust = mrEnc 3 0x1122334455667788 :=
   (toMiniRust_encode pBig 8).trans rfl
 
+/-- Non-empty instantiation of `mr_keep` on a real 8-byte encoded pointer. -/
 theorem t_mr_keep :
-    MiniRustSpec.Interp.decodePtrProvenance 0 (some (mrProv 1))
-      (([] : List AbstractByteProto).map AbstractByteProto.toMiniRust) = some (mrProv 1) :=
-  mr_keep 1 [] 0 (fun _ _ h => by simp at h)
+    MiniRustSpec.Interp.decodePtrProvenance 0 (some (mrProv 3))
+      ((encodePtrBytesProto pBig 8).map AbstractByteProto.toMiniRust) = some (mrProv 3) :=
+  mr_keep 3 (encodePtrBytesProto pBig 8) 0 (fun i x hx => by
+    obtain ⟨_, hall⟩ := coherent_some_frags 8 _ pBig ((coherent_encode pBig 8 (by decide)).trans rfl)
+    obtain ⟨b, hb⟩ := hall i x hx
+    exact ⟨b, _, hb, rfl, (Nat.zero_add i).symm⟩)
 
 theorem t_mr_of_coherent :
     mrDecodedProv ((encodePtrBytesProto pBig 8).map AbstractByteProto.toMiniRust) =
@@ -390,6 +506,56 @@ theorem t_mr_keeps_tag_splice :
     mrDecodedProv ((spliceBytes 4 (encodePtrBytesProto ⟨1, 1, 0x10⟩ 8)
       (encodePtrBytesProto ⟨1, 2, 0x10⟩ 8)).map AbstractByteProto.toMiniRust) = some (mrProv 1) :=
   mr_keeps_same_alloc_splice _ _ 8 4 (by decide) (by decide) rfl
+
+theorem t_agree_uninit :
+    abstractBytesCoherentPtrProvProto 8 ((encodePtrBytesProto pBig 8).set 5 .uninit) = none ∧
+      mrDecodedProv (((encodePtrBytesProto pBig 8).set 5 .uninit).map AbstractByteProto.toMiniRust) =
+        none :=
+  agree_strip_uninit 8 _ 5 rfl
+
+theorem t_mr_leValue_eq : MiniRustSpec.Interp.leValue [0x22, 0x11] = leValue [0x22, 0x11] :=
+  mr_leValue_eq [0x22, 0x11]
+
+theorem t_mr_mapM_data :
+    ((encodePtrBytesProto pBig 8).map AbstractByteProto.toMiniRust).mapM
+        MiniRustSpec.Interp.AbstractByte.data = some (leImage pBig.offsetBytes 8) :=
+  mr_mapM_data_of_dataBytesProto _ _ (dataBytesProto_encode _ _ _ _ _ _ _)
+
+theorem t_mr_decodePtr_coherent_8 :
+    MiniRustSpec.Interp.decodePtr ((encodePtrBytesProto pBig 8).map AbstractByteProto.toMiniRust) =
+      .ok (some { addr := (pBig.offsetBytes : Int), provenance := some (mrProv 3) }) :=
+  mr_decodePtr_of_coherent_8 _ pBig ((coherent_encode pBig 8 (by decide)).trans rfl)
+
+theorem t_mr_decodePtr_reverse_8 :
+    MiniRustSpec.Interp.decodePtr
+        ((encodePtrBytesProto pBig 8).reverse.map AbstractByteProto.toMiniRust) =
+      .ok (some { addr := (leValue (leImage (normOffset 8 pBig.offsetBytes) 8).reverse : Int),
+                  provenance := none }) :=
+  mr_decodePtr_reverse_8 pBig
+
+theorem t_dataBytesProto_take :
+    dataBytesProto ((encodePtrBytesProto pBig 8).take 3) =
+      some ((leImage pBig.offsetBytes 8).take 3) :=
+  dataBytesProto_take _ _ 3 (dataBytesProto_encode _ _ _ _ _ _ _)
+
+theorem t_dataBytesProto_drop :
+    dataBytesProto ((encodePtrBytesProto pBig 8).drop 3) =
+      some ((leImage pBig.offsetBytes 8).drop 3) :=
+  dataBytesProto_drop _ _ 3 (dataBytesProto_encode _ _ _ _ _ _ _)
+
+theorem t_fragsWellFormed_splice :
+    FragsWellFormed 8 (spliceBytes 1 (encodePtrBytesProto pZero 8) (encodePtrBytesProto p256 8)) :=
+  fragsWellFormed_splice 8 1 _ _ (by decide) (fragsWellFormed_encode _ 8 (by decide))
+    (fragsWellFormed_encode _ 8 (by decide))
+
+/-- Universal 3-way `UCG#558` strict-refinement theorem instantiated on `p = 0` vs `p + 256`. -/
+theorem t_mr_decodePtr_splice_8_strict :
+    let spliced := spliceBytes 1 (encodePtrBytesProto pZero 8) (encodePtrBytesProto p256 8)
+    abstractBytesCoherentPtrProvProto 8 spliced = none ∧
+    inspectFragmentsMirror none (spliced.map toMiriFrag) = .ok none ∧
+    ∃ addr, MiniRustSpec.Interp.decodePtr (spliced.map AbstractByteProto.toMiniRust) =
+      .ok (some { addr := addr, provenance := some (mrProv 1) }) :=
+  mr_decodePtr_splice_8_strict_refinement pZero p256 1 (by decide) (by decide) rfl (by decide)
 
 theorem t_copyBytewise_eq :
     copyBytewiseProto [mkInitByte 1] [AbstractByteProto.uninit] = [mkInitByte 1] :=
@@ -467,6 +633,55 @@ theorem t_readMaybeUninit_uninit :
 
 theorem t_readU8_2 : decodeTypedValueFromBytesProto 8 (.uint 1) [mkInitByte 2] = some (.scalar 2 1) :=
   readU8_byte 8 2
+
+/-- Fragment-preserving union raw-byte overlay keeps `tag ≠ allocId` intact across round-trip. -/
+theorem t_rawOverlay_roundtrip_ptr :
+    decodeRawOverlayProto (encodeRawOverlayProto (encodePtrBytesProto pTag 8)) =
+      some (encodePtrBytesProto pTag 8) ∧
+    decodePtrBytesNoForgeProto true .thin 8 (encodePtrBytesProto pTag 8) = some (.ptr pTag 8) :=
+  rawOverlay_roundtrip_ptr true pTag 8 (by decide) (by decide)
+
+theorem t_readBytes_writeBytes :
+    readBytesProto ([AbstractByteProto.uninit, .uninit].take 1 ++ [mkInitByte 2] ++
+      [AbstractByteProto.uninit, .uninit].drop (1 + [mkInitByte 2].length)) 1
+      [mkInitByte 2].length = some [mkInitByte 2] :=
+  readBytesProto_writeBytesProto [.uninit, .uninit] 1 [mkInitByte 2] (by decide)
+
+theorem t_readUnalignedBool_at_offset_chain :
+    ∃ buf₁ buf₂,
+      writeBytesProto [mkInitByte 7, .uninit, mkInitByte 9, mkInitByte 9] 1 [mkInitByte 2] =
+        some buf₁ ∧
+      readTypedFromBytesProto 8 (.uint 1) buf₁ 1 = some (.scalar 2 1) ∧
+      readTypedFromBytesProto 8 .bool buf₁ 1 = none ∧
+      readTypedFromBytesProto 8 (.unaligned .bool) buf₁ 1 = none ∧
+      writeBytesProto buf₁ 1 [mkInitByte 1] = some buf₂ ∧
+      readTypedFromBytesProto 8 .bool buf₂ 1 = some (.scalar 1 1) ∧
+      readTypedFromBytesProto 8 (.unaligned .bool) buf₂ 1 = some (.aggregate [.scalar 1 1]) :=
+  readUnalignedBool_at_offset_chain 8 [mkInitByte 7, .uninit, mkInitByte 9, mkInitByte 9] 1 2 1
+    (by decide) (by decide) (by decide)
+
+theorem t_isValidCharCode_surrogate_false :
+    Trusted.Rustc.V2026_06_01.MirSemantics.isValidCharCode 0xD800 = false :=
+  isValidCharCode_surrogate_false 0xD800 (by decide) (by decide)
+
+theorem t_write_and_read_char_surrogate_univ :
+    ∃ buf₁,
+      writeBytesProto (List.replicate 6 .uninit) 1 (encodeLittleEndianBytesProto 0xDFFF 4) =
+        some buf₁ ∧
+      readTypedFromBytesProto 8 .char buf₁ 1 = none ∧
+      readTypedFromBytesProto 8 (.uint 4) buf₁ 1 = some (.scalar 0xDFFF 4) :=
+  write_and_read_char_surrogate_univ 8 (List.replicate 6 .uninit) 1 0xDFFF
+    (by decide) (by decide) (by decide)
+
+theorem t_kani_nested_maybeUninit_unaligned_bool_univ :
+    copyNonOverlappingBytesProto [mkInitByte 2] [.uninit] 0 0 1 = some [mkInitByte 2] ∧
+    readTypedFromBytesProto 8 (.maybeUninit (.maybeUninit (.unaligned .bool)))
+        [mkInitByte 2] 0 = some (.rawBytes [mkInitByte 2]) ∧
+    readTypedFromBytesProto 8 (.maybeUninit (.unaligned .bool))
+        [mkInitByte 2] 0 = some (.rawBytes [mkInitByte 2]) ∧
+    readTypedFromBytesProto 8 (.unaligned .bool) [mkInitByte 2] 0 = none ∧
+    readTypedFromBytesProto 8 .bool [mkInitByte 2] 0 = none :=
+  kani_nested_maybeUninit_unaligned_bool_univ 8 2 (by decide)
 
 theorem t_toLive06_encodeAux :
     (encodePtrFragsAux 1 1 0 8 0 0 8).map AbstractByteProto.toLive06 =
@@ -586,8 +801,12 @@ theorem t_proto_typed_roundtrip :
     encodeValueToBytesProto 8 (.unaligned .bool) (.aggregate [.scalar 1 1]) = some [mkInitByte 1] ∧
     encodeValueToBytesProto 8 (.maybeUninit .bool) (.rawBytes [mkInitByte 2]) =
       some [mkInitByte 2] ∧
-    decodeTypedValueFromBytesProto 8 (.uint 1) [mkPtrFragByte 0 1 1 0 0 8] = none :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    decodeTypedValueFromBytesProto 8 (.uint 1) [mkPtrFragByte 0 1 1 0 0 8] = none ∧
+    encodeValueToBytesProto 4 (.rawPtr .slice) (.aggregate [.ptr pBig4 4, .scalar 3 8]) = none ∧
+    encodeValueToBytesProto 4 (.rawPtr .slice) (.aggregate [.ptr pBig4 4, .scalar (2 ^ 32) 4]) =
+      none ∧
+    encodeValueToBytesProto 4 (.rawPtr .thin) (.scalar (2 ^ 32) 4) = none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## `Kani#5205` scenario chains on the prototype -/
 
@@ -829,6 +1048,32 @@ theorem t_w3_mixed_tag_stripped_ref :
       none :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w3_mixed_tag_stripped_ref
 
+theorem t_w3_dyn_plain_vtable_ref_unsound :
+    decodePtrBytesNoForge true (.dynamic "Trait") 8
+      (liveEnc 1 1 0x10 8 ++ livePlain 0x1122 8) =
+      some (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0x10 } 8, .scalar ⟨0x1122, 8⟩]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w3_dyn_plain_vtable_ref_unsound
+
+theorem t_w3_dyn_encode_vtable_ptr_none :
+    encodeValueToBytes 16 layouts64 dynRefTy
+      (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0x10 } 8,
+        .ptr { allocId := 2, offsetBytes := 0x1000 } 8]) = none :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w3_dyn_encode_vtable_ptr_none
+
+theorem t_w3_raw_overlay_drops_tag_and_frag :
+    overlayRawAbstractByteVals (encodeRawAbstractByteVals (liveEnc 5 9 0x40 8))
+      (replicateUninitBytes 8) = some (liveEnc 5 5 0x40 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w3_raw_overlay_drops_tag_and_frag
+
+theorem t_w1_decodeValueFromBytes_forges_prov :
+    decodeValueFromBytes 16 layouts64 rawPtrTy (livePlain 0x20004 8) =
+      some (.ptr { allocId := 2, offsetBytes := 4 } 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w1_decodeValueFromBytes_forges_prov
+
+theorem t_w1_scalarLayout_32bit_none :
+    decodeScalarLayoutBytesNoForge ptrScalarInit (liveEnc 1 1 0x11223344 4) = none :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w1_scalarLayout_32bit_none
+
 theorem t_k_decode_bool_2_none :
     decodeTypedValueFromBytes 16 kLayouts tyBool [.init 2 none] = none :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_decode_bool_2_none
@@ -841,6 +1086,11 @@ theorem t_k_decode_maybeUninitBool_2 :
     decodeTypedValueFromBytes 16 kLayouts tyMUBool [.init 2 none] =
       some (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]]) :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_decode_maybeUninitBool_2
+
+theorem t_k_decode_nested_maybeUninitBool_2 :
+    decodeTypedValueFromBytes 16 kLayouts tyMUMUBool [.init 2 none] =
+      some (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_decode_nested_maybeUninitBool_2
 
 theorem t_k_decode_unalignedBool_2_none :
     decodeTypedValueFromBytes 16 kLayouts tyUnalBool [.init 2 none] = none :=
@@ -872,17 +1122,27 @@ theorem t_k_copy_u8arr_to_maybeUninitBool :
       .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩]))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_u8arr_to_maybeUninitBool
 
+theorem t_k_copy_u8arr_to_nestedMaybeUninitBool :
+    stepOutcome (copyActive tyU8A1 tyMUMUBool u8Arr2 .uninit) =
+      .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩]))) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_u8arr_to_nestedMaybeUninitBool
+
 theorem t_k_copy_u8arr_to_u8arr :
     stepOutcome (copyActive tyU8A1 tyU8A1 u8Arr2 .uninit) =
       .step (activeLocals (.init (.aggregate 0 [.scalar ⟨2, 1⟩]))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_u8arr_to_u8arr
 
 theorem t_k_copy_maybeUninit_to_maybeUninit :
-    stepOutcome (copyActive tyMUBool tyMUBool
-      (.init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]])) .uninit) =
-      .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩]))
-        (.init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]]))) [] :=
+    stepOutcome (copyActive tyMUBool tyMUBool muBool2 .uninit) =
+      .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩])) muBool2) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_maybeUninit_to_maybeUninit
+
+theorem t_k_copy_union_to_nonunion :
+    stepOutcome (copyActive tyMUBool tyU8A1 muBool2 .uninit) =
+      .step (activeLocals (.init (.aggregate 0 [.scalar ⟨2, 1⟩])) muBool2) [] ∧
+    stepOutcome (copyActive tyMUBool tyBool muBool2 .uninit) = .ub ∧
+    stepOutcome (copyActive tyMUBool tyUnalBool muBool2 .uninit) = .ub :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_union_to_nonunion
 
 theorem t_k_copy_u8arr_to_bool_premature_ub :
     stepOutcome (copyActive tyU8A1 tyBool u8Arr2 .uninit) = .ub :=
@@ -897,10 +1157,27 @@ theorem t_k_copy_u8arr_to_unalignedBool :
       .step (activeLocals (.init (.aggregate 0 [.scalar ⟨2, 1⟩]))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_u8arr_to_unalignedBool
 
+theorem t_k_copy_u8_to_unalignedBool_shape_vs_typed :
+    stepOutcome (copyActive tyU8 tyUnalBool u8Scalar2 .uninit) =
+      .step (activeLocals (.init (.scalar ⟨2, 1⟩)) u8Scalar2) [] ∧
+    stepOutcome (copyActiveEx tyU8 tyUnalBool tyPtrU8 tyPtrUnalBool 0 0 1 u8Scalar2 .uninit) = .ub :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_u8_to_unalignedBool_shape_vs_typed
+
 theorem t_k_copy_u8arr_to_maybeUninitUnaligned :
     stepOutcome (copyActive tyU8A1 tyMUUnal u8Arr2 .uninit) =
-      .step (activeLocals (.init (.aggregate 0 [.unit, .aggregate 0 [.scalar ⟨2, 1⟩]]))) [] :=
+      .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩]))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_u8arr_to_maybeUninitUnaligned
+
+theorem t_k_copy_subplace_multi_audit :
+    stepOutcome (copyActiveEx tyU8A2 tyBoolA2 tyPtrU8 tyPtrU8 0 0 2 u8Arr12 .uninit) = .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A4 tyBool tyPtrU8 tyPtrU8 1 0 1 u8Arr4Bad .uninit) = .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A4 tyUnalBool tyPtrU8 tyPtrU8 1 0 1 u8Arr4Bad .uninit) =
+      .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A4 tyUnalBool tyPtrU8 tyPtrU8 1 0 1 u8Arr4Ok .uninit) =
+      .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A4 tyBool tyPtrU8 tyPtrU8 1 0 1 u8Arr4Ok .uninit) =
+      .step (activeLocalsAt 1 0 (.init (.scalar ⟨1, 1⟩)) u8Arr4Ok) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_subplace_multi_audit
 
 theorem t_k_gap_unalignedBool_field_reads_2 :
     copyThenRead tyU8A1 tyUnalBool u8Arr2 [.field 0 tyBool] = .ok (.scalar ⟨2, 1⟩) :=
@@ -912,7 +1189,7 @@ theorem t_k_gap_unalignedBool_whole_reads_2 :
 
 theorem t_k_gap_maybeUninitUnaligned_assume_init :
     copyThenRead tyU8A1 tyMUUnal u8Arr2 [.field 1 tyUnalBool] =
-      .ok (.aggregate 0 [.scalar ⟨2, 1⟩]) :=
+      .ok (.scalar ⟨2, 1⟩) :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_gap_maybeUninitUnaligned_assume_init
 
 theorem t_k_maybeUninitBool_assume_init_ub :
@@ -1149,6 +1426,32 @@ theorem t_w3_mixed_tag_stripped_ref :
       none :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w3_mixed_tag_stripped_ref
 
+theorem t_w3_dyn_plain_vtable_ref_unsound :
+    decodePtrBytesNoForge true (.dynamic "Trait") 8
+      (liveEnc 1 1 0x10 8 ++ livePlain 0x1122 8) =
+      some (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0x10 } 8, .scalar ⟨0x1122, 8⟩]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w3_dyn_plain_vtable_ref_unsound
+
+theorem t_w3_dyn_encode_vtable_ptr_none :
+    encodeValueToBytes 16 layouts64 dynRefTy
+      (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0x10 } 8,
+        .ptr { allocId := 2, offsetBytes := 0x1000 } 8]) = none :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w3_dyn_encode_vtable_ptr_none
+
+theorem t_w3_raw_overlay_drops_tag_and_frag :
+    overlayRawAbstractByteVals (encodeRawAbstractByteVals (liveEnc 5 9 0x40 8))
+      (replicateUninitBytes 8) = some (liveEnc 5 5 0x40 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w3_raw_overlay_drops_tag_and_frag
+
+theorem t_w1_decodeValueFromBytes_forges_prov :
+    decodeValueFromBytes 16 layouts64 rawPtrTy (livePlain 0x20004 8) =
+      some (.ptr { allocId := 2, offsetBytes := 4 } 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w1_decodeValueFromBytes_forges_prov
+
+theorem t_w1_scalarLayout_32bit_none :
+    decodeScalarLayoutBytesNoForge ptrScalarInit (liveEnc 1 1 0x11223344 4) = none :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w1_scalarLayout_32bit_none
+
 theorem t_k_decode_bool_2_none :
     decodeTypedValueFromBytes 16 kLayouts tyBool [.init 2 none] = none :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_decode_bool_2_none
@@ -1161,6 +1464,11 @@ theorem t_k_decode_maybeUninitBool_2 :
     decodeTypedValueFromBytes 16 kLayouts tyMUBool [.init 2 none] =
       some (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]]) :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_decode_maybeUninitBool_2
+
+theorem t_k_decode_nested_maybeUninitBool_2 :
+    decodeTypedValueFromBytes 16 kLayouts tyMUMUBool [.init 2 none] =
+      some (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_decode_nested_maybeUninitBool_2
 
 theorem t_k_decode_unalignedBool_2_none :
     decodeTypedValueFromBytes 16 kLayouts tyUnalBool [.init 2 none] = none :=
@@ -1192,17 +1500,27 @@ theorem t_k_copy_u8arr_to_maybeUninitBool :
       .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩]))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_u8arr_to_maybeUninitBool
 
+theorem t_k_copy_u8arr_to_nestedMaybeUninitBool :
+    stepOutcome (copyActive tyU8A1 tyMUMUBool u8Arr2 .uninit) =
+      .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩]))) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_u8arr_to_nestedMaybeUninitBool
+
 theorem t_k_copy_u8arr_to_u8arr :
     stepOutcome (copyActive tyU8A1 tyU8A1 u8Arr2 .uninit) =
       .step (activeLocals (.init (.aggregate 0 [.scalar ⟨2, 1⟩]))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_u8arr_to_u8arr
 
 theorem t_k_copy_maybeUninit_to_maybeUninit :
-    stepOutcome (copyActive tyMUBool tyMUBool
-      (.init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]])) .uninit) =
-      .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩]))
-        (.init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]]))) [] :=
+    stepOutcome (copyActive tyMUBool tyMUBool muBool2 .uninit) =
+      .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩])) muBool2) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_maybeUninit_to_maybeUninit
+
+theorem t_k_copy_union_to_nonunion :
+    stepOutcome (copyActive tyMUBool tyU8A1 muBool2 .uninit) =
+      .step (activeLocals (.init (.aggregate 0 [.scalar ⟨2, 1⟩])) muBool2) [] ∧
+    stepOutcome (copyActive tyMUBool tyBool muBool2 .uninit) = .ub ∧
+    stepOutcome (copyActive tyMUBool tyUnalBool muBool2 .uninit) = .ub :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_union_to_nonunion
 
 theorem t_k_copy_u8arr_to_bool_premature_ub :
     stepOutcome (copyActive tyU8A1 tyBool u8Arr2 .uninit) = .ub :=
@@ -1217,10 +1535,27 @@ theorem t_k_copy_u8arr_to_unalignedBool :
       .step (activeLocals (.init (.aggregate 0 [.scalar ⟨2, 1⟩]))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_u8arr_to_unalignedBool
 
+theorem t_k_copy_u8_to_unalignedBool_shape_vs_typed :
+    stepOutcome (copyActive tyU8 tyUnalBool u8Scalar2 .uninit) =
+      .step (activeLocals (.init (.scalar ⟨2, 1⟩)) u8Scalar2) [] ∧
+    stepOutcome (copyActiveEx tyU8 tyUnalBool tyPtrU8 tyPtrUnalBool 0 0 1 u8Scalar2 .uninit) = .ub :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_u8_to_unalignedBool_shape_vs_typed
+
 theorem t_k_copy_u8arr_to_maybeUninitUnaligned :
     stepOutcome (copyActive tyU8A1 tyMUUnal u8Arr2 .uninit) =
-      .step (activeLocals (.init (.aggregate 0 [.unit, .aggregate 0 [.scalar ⟨2, 1⟩]]))) [] :=
+      .step (activeLocals (.init (.aggregate 0 [.unit, .scalar ⟨2, 1⟩]))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_u8arr_to_maybeUninitUnaligned
+
+theorem t_k_copy_subplace_multi_audit :
+    stepOutcome (copyActiveEx tyU8A2 tyBoolA2 tyPtrU8 tyPtrU8 0 0 2 u8Arr12 .uninit) = .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A4 tyBool tyPtrU8 tyPtrU8 1 0 1 u8Arr4Bad .uninit) = .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A4 tyUnalBool tyPtrU8 tyPtrU8 1 0 1 u8Arr4Bad .uninit) =
+      .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A4 tyUnalBool tyPtrU8 tyPtrU8 1 0 1 u8Arr4Ok .uninit) =
+      .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A4 tyBool tyPtrU8 tyPtrU8 1 0 1 u8Arr4Ok .uninit) =
+      .step (activeLocalsAt 1 0 (.init (.scalar ⟨1, 1⟩)) u8Arr4Ok) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_subplace_multi_audit
 
 theorem t_k_gap_unalignedBool_field_reads_2 :
     copyThenRead tyU8A1 tyUnalBool u8Arr2 [.field 0 tyBool] = .ok (.scalar ⟨2, 1⟩) :=
@@ -1232,7 +1567,7 @@ theorem t_k_gap_unalignedBool_whole_reads_2 :
 
 theorem t_k_gap_maybeUninitUnaligned_assume_init :
     copyThenRead tyU8A1 tyMUUnal u8Arr2 [.field 1 tyUnalBool] =
-      .ok (.aggregate 0 [.scalar ⟨2, 1⟩]) :=
+      .ok (.scalar ⟨2, 1⟩) :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_gap_maybeUninitUnaligned_assume_init
 
 theorem t_k_maybeUninitBool_assume_init_ub :
