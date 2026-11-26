@@ -49,12 +49,18 @@ every divergence witness evaluates the real, unmodified live definitions.
   hardcoding `layoutIdx := 0` and `validateValueForTy?` ignoring `.adt`) stores an invalid
   payload that reads back as `2` without UB, while foreign-frame copy stores `2u8` into a
   caller `bool` local unchecked.
-* **Provenance through integer storage and union overlays (`rust#148259`).** End to end,
-  `copy_nonoverlapping::<*const u8>` out of a `MaybeUninit<*const u8>` holding plain integer
-  bytes FORGES a pointer (`evalCopyUnionBytes` → `decodeValueFromBytes`:
-  `allocId := bits / 65536`), while a `*const u8 → usize` copy keeps the full `.ptr` inside the
-  `usize` local (reads return the pointer). The in-order bytewise pointer copy
-  (`copy_nonoverlapping::<u8>`, `count > 1`) is `.unsupported` in live.
+* **Provenance through integer storage, union overlays, and global relocations (`rust#148259`).**
+  End to end, provenance forging (`decodeValueFromBytes`: `allocId := bits / 65536`) is reachable
+  across THREE copy paths when byte conversion runs: `evalCopyUnionBytes` (`MaybeUninit<*const u8>`
+  → `*const u8`), `evalCopySingleDirect` (`*const usize` → `*mut *const u8` and even `*mut &u8`,
+  contrasting with same-pointee `*mut *const u8` which bypasses conversion), and
+  `evalForeignFrameCopySingleDirect` (forging into the caller frame), while `evalCopySubplaceMulti`
+  fails closed with `.unsupported` on pointer destinations. Conversely, a `*const *const u8` →
+  `*mut *const u8` copy into a `usize` local keeps `.ptr` inside integer storage, while a typed
+  `*const *const u8` → `*mut usize` copy strips it. In global allocations (`globalAllocBytesAux` /
+  `lookupRelocAllocId`, `Bytes.lean:276-331`), misaligned cross-relocation reads (offset `1` or `4`
+  across `[p, p]`) unsoundly retain provenance, and `lookupRelocAllocId` hardcodes width `8`,
+  bleeding 32-bit relocations into bytes `4..7`.
 
 ## Prototype
 
@@ -1190,6 +1196,15 @@ theorem coherentOpt2_none_of_missing_frag (n : Nat) (l : List AbstractByteOpt2) 
   | none => rfl
   | some q => cases q; rfl
 
+/-- **Option 2 fails closed on orphan fragment without provenance (universal):** the
+incoherent state `.init b none (some m)` admitted by Option 2 strips provenance. -/
+theorem coherentOpt2_none_of_orphan_frag (n : Nat) (l : List AbstractByteOpt2) (i : Nat)
+    (b : UInt8) (m : PtrByteFragMeta) (hx : l[i]? = some (.init b none (some m))) :
+    abstractBytesCoherentPtrProvOpt2 n l = none := by
+  apply coherent_none_of_no_frag n _ i b
+  rw [List.getElem?_map, hx]
+  rfl
+
 theorem provPair_mkPtrFragByte (b : UInt8) (a t i o n : Nat) :
     provPair? (mkPtrFragByte b a t i o n) = some (a, t) := rfl
 
@@ -2322,6 +2337,265 @@ theorem decode_ptr_as_int_none (p : ProvenancePtrProto) (n : Nat) (hn : 0 < n) :
   simp only [decodeTypedValueFromBytesProto, decodePlainIntProto, hf, Bool.not_true,
     Bool.and_false]
 
+/-- **No provenance forging on wide pointers (universal, `0 < ptrBytes`):** plain `2 * n`
+integer bytes never decode to `.ptr`; references (`.slice`, `.str`, `.dyn`) are UB, and raw
+wide pointers decode to two provenance-less `.scalar` halves. -/
+theorem decode_plain_wide_no_forge (dBits mBits n : Nat) (hn : 0 < n)
+    (hd : dBits < 256 ^ n) (hm : mBits < 256 ^ n) :
+    let bs := encodeLittleEndianBytesProto dBits n ++ encodeLittleEndianBytesProto mBits n
+    decodeTypedValueFromBytesProto n (.ref .slice) bs = none ∧
+    decodeTypedValueFromBytesProto n (.ref .str) bs = none ∧
+    decodeTypedValueFromBytesProto n (.ref .dyn) bs = none ∧
+    decodeTypedValueFromBytesProto n (.rawPtr .slice) bs =
+      some (.aggregate [.scalar dBits n, .scalar mBits n]) ∧
+    decodeTypedValueFromBytesProto n (.rawPtr .str) bs =
+      some (.aggregate [.scalar dBits n, .scalar mBits n]) ∧
+    decodeTypedValueFromBytesProto n (.rawPtr .dyn) bs =
+      some (.aggregate [.scalar dBits n, .scalar mBits n]) := by
+  intro bs
+  have hdl : (encodeLittleEndianBytesProto dBits n).length = n := plain_length dBits n
+  have hml : (encodeLittleEndianBytesProto mBits n).length = n := plain_length mBits n
+  have hd0 : (encodeLittleEndianBytesProto dBits n)[0]? = some (.init (UInt8.ofNat dBits) none) := by
+    simp [encodeLittleEndianBytesProto, leImage_getElem?, hn]
+  have hm0 : (encodeLittleEndianBytesProto mBits n)[0]? = some (.init (UInt8.ofNat mBits) none) := by
+    simp [encodeLittleEndianBytesProto, leImage_getElem?, hn]
+  have hcd := coherent_none_of_no_frag n _ 0 _ hd0
+  have hcm := coherent_none_of_no_frag n _ 0 _ hm0
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp only [bs, decodeTypedValueFromBytesProto, decodePtrBytesNoForgeProto, decodeWidePtrBytesProto,
+      List.length_append, hdl, hml, Nat.beq_refl, take_append_of_length _ _ n hdl,
+      drop_append_of_length _ _ n hdl, decodeThinPtrBytesProto, dataBytesProto_plain, hcd,
+      haveFrag_plain]
+  · simp only [bs, decodeTypedValueFromBytesProto, decodePtrBytesNoForgeProto, decodeWidePtrBytesProto,
+      List.length_append, hdl, hml, Nat.beq_refl, take_append_of_length _ _ n hdl,
+      drop_append_of_length _ _ n hdl, decodeThinPtrBytesProto, dataBytesProto_plain, hcd,
+      haveFrag_plain]
+  · simp only [bs, decodeTypedValueFromBytesProto, decodePtrBytesNoForgeProto, decodeWidePtrBytesProto,
+      List.length_append, hdl, hml, Nat.beq_refl, take_append_of_length _ _ n hdl,
+      drop_append_of_length _ _ n hdl, decodeThinPtrBytesProto, dataBytesProto_plain, hcd, hcm]
+  · simp only [bs, decodeTypedValueFromBytesProto, decodePtrBytesNoForgeProto, decodeWidePtrBytesProto,
+      List.length_append, hdl, hml, Nat.beq_refl, take_append_of_length _ _ n hdl,
+      drop_append_of_length _ _ n hdl, decodeThinPtrBytesProto, dataBytesProto_plain, hcd,
+      haveFrag_plain, leValue_leImage, Nat.mod_eq_of_lt hd, Nat.mod_eq_of_lt hm]
+  · simp only [bs, decodeTypedValueFromBytesProto, decodePtrBytesNoForgeProto, decodeWidePtrBytesProto,
+      List.length_append, hdl, hml, Nat.beq_refl, take_append_of_length _ _ n hdl,
+      drop_append_of_length _ _ n hdl, decodeThinPtrBytesProto, dataBytesProto_plain, hcd,
+      haveFrag_plain, leValue_leImage, Nat.mod_eq_of_lt hd, Nat.mod_eq_of_lt hm]
+  · simp only [bs, decodeTypedValueFromBytesProto, decodePtrBytesNoForgeProto, decodeWidePtrBytesProto,
+      List.length_append, hdl, hml, Nat.beq_refl, take_append_of_length _ _ n hdl,
+      drop_append_of_length _ _ n hdl, decodeThinPtrBytesProto, dataBytesProto_plain, hcd, hcm,
+      leValue_leImage, Nat.mod_eq_of_lt hd, Nat.mod_eq_of_lt hm]
+
+/-- **Any non-empty sub-slice of a pointer image fails typed integer read (universal):**
+reading byte `off` of a pointer as `u8`, or any `len > 0` slice as `.uint len`, is UB, while
+reading the same slice at `MaybeUninit<[u8; len]>` (or untyped `readBytesProto`) succeeds and
+preserves the fragments. -/
+theorem decode_ptr_subslice_as_int_none (p : ProvenancePtrProto) (n off len : Nat)
+    (hlen : 0 < len) (hb : off + len ≤ n) :
+    readTypedFromBytesProto n (.uint len) (encodePtrBytesProto p n) off = none ∧
+    readTypedFromBytesProto n (.maybeUninit (.uint len)) (encodePtrBytesProto p n) off =
+      some (.rawBytes (((encodePtrBytesProto p n).drop off).take len)) := by
+  have hl := encodePtrBytesProto_length p n
+  have hsub_len : (((encodePtrBytesProto p n).drop off).take len).length = len := by
+    simp only [List.length_take, List.length_drop, hl]
+    exact Nat.min_eq_left (Nat.le_sub_of_add_le' hb)
+  have hoff_lt : off < n := Nat.lt_of_lt_of_le (Nat.lt_add_of_pos_right hlen) hb
+  have h0 : (((encodePtrBytesProto p n).drop off).take len)[0]? =
+      (encodePtrBytesProto p n)[off]? := by
+    rw [List.getElem?_take, ite_pos' hlen, List.getElem?_drop, Nat.add_zero]
+  rw [encodePtrBytesProto_getElem? p n off hoff_lt] at h0
+  have hf : abstractBytesHaveFragProto (((encodePtrBytesProto p n).drop off).take len) = true :=
+    haveFrag_of_getElem?_some _ 0 _ _ h0
+  refine ⟨?_, ?_⟩
+  · simp only [readTypedFromBytesProto, TyProto.sizeBytes, readBytesProto, hl,
+      Nat.ble_eq_true_of_le hb, decodeTypedValueFromBytesProto, decodePlainIntProto, hf,
+      Bool.not_true, Bool.and_false]
+  · simp only [readTypedFromBytesProto, TyProto.sizeBytes, readBytesProto, hl,
+      Nat.ble_eq_true_of_le hb, decodeTypedValueFromBytesProto, hsub_len, Nat.beq_refl]
+
+theorem nat_blt_eq_true_of_lt {a b : Nat} (h : a < b) : Nat.blt a b = true :=
+  Nat.ble_eq_true_of_le h
+
+/-- **Universal typed codec round-trip across core `TyProto` types:** encoding any valid
+`uint`, `bool`, `char`, thin/wide pointer (`rawPtr`/`ref`/`fnPtr`), or `Unaligned<bool>` and
+decoding it back recovers the exact value (preserving `ProvenancePtrProto.tag`). -/
+theorem typed_encode_decode_roundtrip (n : Nat) (hn : 0 < n) (bits len : Nat)
+    (p vt : ProvenancePtrProto) (b : UInt8) (c : Nat)
+    (hbits : bits < 256 ^ n) (hlen : len < 256 ^ n)
+    (hp : p.offsetBytes < 256 ^ n) (hvt : vt.offsetBytes < 256 ^ n)
+    (hb : b.toNat ≤ 1) (hc : Trusted.Rustc.V2026_06_01.MirSemantics.isValidCharCode c = true)
+    (hc4 : c < 256 ^ 4) :
+    (encodeValueToBytesProto n (.uint n) (.scalar bits n)).bind
+        (decodeTypedValueFromBytesProto n (.uint n)) = some (.scalar bits n) ∧
+    (encodeValueToBytesProto n .bool (.scalar b.toNat 1)).bind
+        (decodeTypedValueFromBytesProto n .bool) = some (.scalar b.toNat 1) ∧
+    (encodeValueToBytesProto n .char (.scalar c 4)).bind
+        (decodeTypedValueFromBytesProto n .char) = some (.scalar c 4) ∧
+    (encodeValueToBytesProto n (.ref .thin) (.ptr p n)).bind
+        (decodeTypedValueFromBytesProto n (.ref .thin)) = some (.ptr p n) ∧
+    (encodeValueToBytesProto n .fnPtr (.ptr p n)).bind
+        (decodeTypedValueFromBytesProto n .fnPtr) = some (.ptr p n) ∧
+    (encodeValueToBytesProto n (.ref .dyn) (.aggregate [.ptr p n, .ptr vt n])).bind
+        (decodeTypedValueFromBytesProto n (.ref .dyn)) = some (.aggregate [.ptr p n, .ptr vt n]) ∧
+    (encodeValueToBytesProto n (.ref .slice) (.aggregate [.ptr p n, .scalar len n])).bind
+        (decodeTypedValueFromBytesProto n (.ref .slice)) =
+      some (.aggregate [.ptr p n, .scalar len n]) ∧
+    (encodeValueToBytesProto n (.unaligned .bool) (.aggregate [.scalar b.toNat 1])).bind
+        (decodeTypedValueFromBytesProto n (.unaligned .bool)) =
+      some (.aggregate [.scalar b.toNat 1]) := by
+  have hb1 : b.toNat < 256 := UInt8.toNat_lt b
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp only [encodeValueToBytesProto, Nat.beq_refl, nat_blt_eq_true_of_lt hbits,
+      Bool.and_self, Option.bind_some, decodeTypedValueFromBytesProto, decodePlainIntProto,
+      plain_length, haveFrag_plain, Bool.not_false, dataBytesProto_plain, leValue_leImage,
+      Nat.mod_eq_of_lt hbits]
+  · simp only [encodeValueToBytesProto, Nat.beq_refl, Nat.ble_eq_true_of_le hb, Bool.and_self,
+      Option.bind_some, decodeTypedValueFromBytesProto, decodePlainIntProto, plain_length,
+      haveFrag_plain, Bool.not_false, dataBytesProto_plain, leValue_leImage, Nat.pow_one,
+      Nat.mod_eq_of_lt hb1]
+  · simp only [encodeValueToBytesProto, Nat.beq_refl, hc, Bool.and_self, Option.bind_some,
+      decodeTypedValueFromBytesProto, decodePlainIntProto, plain_length, haveFrag_plain,
+      Bool.not_false, dataBytesProto_plain, leValue_leImage, Nat.mod_eq_of_lt hc4]
+  · simp only [encodeValueToBytesProto, encodePtrValueProto, encodeThinPtrValueProto, Nat.beq_refl,
+      Option.bind_some, decodeTypedValueFromBytesProto, decode_encode_thin_exact true p n hn hp]
+  · simp only [encodeValueToBytesProto, encodeThinPtrValueProto, Nat.beq_refl, Option.bind_some,
+      decodeTypedValueFromBytesProto, decode_encode_thin_exact true p n hn hp]
+  · simp only [encodeValueToBytesProto, encodePtrValueProto, encodeThinPtrValueProto, Nat.beq_refl,
+      Option.bind_some, decodeTypedValueFromBytesProto,
+      decode_encode_dyn_exact true p vt n hn hp hvt]
+  · simp only [encodeValueToBytesProto, encodePtrValueProto, encodeThinPtrValueProto, Nat.beq_refl,
+      nat_blt_eq_true_of_lt hlen, Bool.and_self, Option.bind_some, decodeTypedValueFromBytesProto,
+      decode_encode_slice_exact true p len n hn hp hlen]
+  · simp only [encodeValueToBytesProto, Nat.beq_refl, Nat.ble_eq_true_of_le hb, Bool.and_self,
+      Option.bind_some, decodeTypedValueFromBytesProto, decodePlainIntProto, plain_length,
+      haveFrag_plain, Bool.not_false, dataBytesProto_plain, leValue_leImage, Nat.pow_one,
+      Nat.mod_eq_of_lt hb1]
+
+/-! ### Global allocation relocation fragment prototype (`globalAllocBytesAux` fix) -/
+
+/-- Parameterized global relocation lookup returning `(relocStartOffset, targetPtr)` when
+`offset ∈ [relocOff, relocOff + ptrBytes)` (fixing live `Bytes.lean:283`'s hardcoded `8`). -/
+def lookupGlobalRelocProto (ptrBytes : Nat) :
+    List (Nat × ProvenancePtrProto) → Nat → Option (Nat × ProvenancePtrProto)
+  | [], _ => none
+  | (relocOff, targetPtr) :: rest, offset =>
+    match Nat.ble relocOff offset && !Nat.ble (relocOff + ptrBytes) offset with
+    | true => some (relocOff, targetPtr)
+    | false => lookupGlobalRelocProto ptrBytes rest offset
+
+/-- Fragment-aware global allocation reader (prototype replacement for live
+`globalAllocBytesAux`, `Bytes.lean:292-313`): attaches exact `byteIdx := offset - relocOff`,
+normalized `origOffset`, `ptrBytes`, and `tag`. -/
+def globalAllocBytesProto (ptrBytes : Nat) (bytes : List (Option UInt8))
+    (relocs : List (Nat × ProvenancePtrProto)) : Nat → Nat → Option (List AbstractByteProto)
+  | _, 0 => some []
+  | offset, rem + 1 =>
+    match bytes[offset]? with
+    | none => none
+    | some optByte =>
+      match globalAllocBytesProto ptrBytes bytes relocs (offset + 1) rem with
+      | none => none
+      | some rest =>
+        let absByte : AbstractByteProto :=
+          match optByte with
+          | none => .uninit
+          | some b =>
+            match lookupGlobalRelocProto ptrBytes relocs offset with
+            | some (relocOff, targetPtr) =>
+              .init b (some ⟨targetPtr.allocId, targetPtr.tag, offset - relocOff,
+                normOffset ptrBytes targetPtr.offsetBytes, ptrBytes⟩)
+            | none => .init b none
+        some (absByte :: rest)
+
+theorem globalAllocBytesProto_getElem? (ptrBytes : Nat) (bytes : List (Option UInt8))
+    (relocs : List (Nat × ProvenancePtrProto)) (off len : Nat) (out : List AbstractByteProto)
+    (h : globalAllocBytesProto ptrBytes bytes relocs off len = some out) :
+    out.length = len ∧
+    ∀ (i : Nat), i < len →
+      ∃ optByte, bytes[off + i]? = some optByte ∧
+        out[i]? = some (match optByte with
+          | none => .uninit
+          | some b =>
+            match lookupGlobalRelocProto ptrBytes relocs (off + i) with
+            | some (relocOff, targetPtr) =>
+              .init b (some ⟨targetPtr.allocId, targetPtr.tag, (off + i) - relocOff,
+                normOffset ptrBytes targetPtr.offsetBytes, ptrBytes⟩)
+            | none => .init b none) := by
+  induction len generalizing off out with
+  | zero =>
+    simp only [globalAllocBytesProto, Option.some.injEq] at h
+    subst h
+    exact ⟨rfl, fun i hi => absurd hi (Nat.not_lt_zero i)⟩
+  | succ rem ih =>
+    simp only [globalAllocBytesProto] at h
+    cases hb : bytes[off]? with
+    | none => simp [hb] at h
+    | some optByte =>
+      cases hr : globalAllocBytesProto ptrBytes bytes relocs (off + 1) rem with
+      | none => simp [hb, hr] at h
+      | some rest =>
+        simp only [hb, hr, Option.some.injEq] at h
+        subst h
+        obtain ⟨hlen, hall⟩ := ih (off + 1) rest hr
+        refine ⟨by simp [hlen], ?_⟩
+        intro i hi
+        cases i with
+        | zero =>
+          exact ⟨optByte, by simpa using hb, by simp⟩
+        | succ i =>
+          have hi' : i < rem := Nat.lt_of_succ_lt_succ hi
+          obtain ⟨ob, hob, hget⟩ := hall i hi'
+          have hadd : off + (i + 1) = off + 1 + i := by
+            rw [Nat.add_assoc, Nat.add_comm 1 i]
+          refine ⟨ob, by rwa [hadd], ?_⟩
+          simp only [List.getElem?_cons_succ, hadd, hget]
+
+/-- **Aligned global relocation read recovers exact pointer with `tag` (universal, 32/64-bit):**
+when `bytes[relocOff .. relocOff + n)` holds `leImage (normOffset n p.offsetBytes) n` and every
+offset in `[relocOff, relocOff + n)` resolves to `(relocOff, p)`, `globalAllocBytesProto`
+produces `encodePtrBytesProto p n` and decodes cleanly to `.ptr`. -/
+theorem globalAlloc_aligned_read_exact (n relocOff : Nat) (hn : 0 < n)
+    (bytes : List (Option UInt8)) (relocs : List (Nat × ProvenancePtrProto))
+    (p : ProvenancePtrProto) (out : List AbstractByteProto)
+    (hread : globalAllocBytesProto n bytes relocs relocOff n = some out)
+    (hdata : ∀ i, i < n →
+      bytes[relocOff + i]? = some (some (UInt8.ofNat (normOffset n p.offsetBytes / 256 ^ i))))
+    (hrel : ∀ i, i < n → lookupGlobalRelocProto n relocs (relocOff + i) = some (relocOff, p)) :
+    out = encodePtrBytesProto p n ∧
+    abstractBytesCoherentPtrProvProto n out = some ⟨p.allocId, p.tag, normOffset n p.offsetBytes⟩ := by
+  obtain ⟨hlen, hall⟩ := globalAllocBytesProto_getElem? n bytes relocs relocOff n out hread
+  have heq : out = encodePtrBytesProto p n := by
+    apply List.ext_getElem?
+    intro i
+    rcases Nat.lt_or_ge i n with hi | hi
+    · obtain ⟨ob, hob, hget⟩ := hall i hi
+      rw [hdata i hi, Option.some.injEq] at hob
+      subst hob
+      simp only [hget, hrel i hi, encodePtrBytesProto_getElem? p n i hi, Nat.add_sub_cancel_left]
+    · rw [List.getElem?_eq_none (by rw [hlen]; exact hi),
+        List.getElem?_eq_none (by rw [encodePtrBytesProto_length]; exact hi)]
+  exact ⟨heq, by rw [heq]; exact coherent_encode p n hn⟩
+
+/-- **Misaligned global relocation read strips provenance (universal):** reading starting at
+`relocOff + k` (`0 < k < n`, even across adjacent identical relocations `[p, p]`) puts
+`byteIdx = k ≠ 0` at byte `0`, so `abstractBytesCoherentPtrProvProto` strips provenance
+(contrast live `w4_global_misaligned_cross_reloc_unsound`). -/
+theorem globalAlloc_misaligned_read_strips (n relocOff k : Nat) (hk0 : 0 < k) (hkn : k < n)
+    (bytes : List (Option UInt8)) (relocs : List (Nat × ProvenancePtrProto))
+    (p : ProvenancePtrProto) (b0 : UInt8) (out : List AbstractByteProto)
+    (hread : globalAllocBytesProto n bytes relocs (relocOff + k) n = some out)
+    (hb0 : bytes[relocOff + k]? = some (some b0))
+    (hrel0 : lookupGlobalRelocProto n relocs (relocOff + k) = some (relocOff, p)) :
+    abstractBytesCoherentPtrProvProto n out = none := by
+  have hn : 0 < n := Nat.lt_trans hk0 hkn
+  obtain ⟨_, hall⟩ := globalAllocBytesProto_getElem? n bytes relocs (relocOff + k) n out hread
+  obtain ⟨ob, hob, hget⟩ := hall 0 hn
+  simp only [Nat.add_zero] at hob hget
+  rw [hb0, Option.some.injEq] at hob
+  subst hob
+  simp only [hrel0, Nat.add_sub_cancel_left] at hget
+  exact coherent_none_of_byteIdx_ne n out 0 b0 _ hget (Nat.ne_of_gt hk0)
+
 /-! ## 10. Projections onto the live `AbstractByte` (both rustc snapshots) -/
 
 def AbstractByteProto.toLive06 : AbstractByteProto →
@@ -2593,6 +2867,44 @@ theorem w1_decodeValueFromBytes_forges_prov :
 theorem w1_scalarLayout_32bit_none :
     decodeScalarLayoutBytesNoForge ptrScalarInit (liveEnc 1 1 0x11223344 4) = none := rfl
 
+/-- Two adjacent identical pointers `[p, p]` (`allocId = 1`, `offsetBytes = 0x10`) in a global
+static `CapturedAllocation` (relocations at byte offsets `0` and `8`). -/
+def globalTwoPtrsAlloc : CapturedAllocation :=
+  { allocId := 99,
+    bytes := [some 0x10, some 0, some 0, some 0, some 0, some 0, some 0, some 0,
+              some 0x10, some 0, some 0, some 0, some 0, some 0, some 0, some 0],
+    relocations := [(0, { allocId := 1, offsetBytes := 0x10 }),
+                    (8, { allocId := 1, offsetBytes := 0x10 })],
+    align := ⟨8⟩,
+    mutability := .not }
+
+/-- **W4 (global allocation misaligned cross-relocation unsoundness, `Bytes.lean:276-331`):**
+reading 8 bytes at offset `1` or `4` across two adjacent relocations `[p, p]` produces 8 bytes
+all tagged `(1, 1)` (no `byteIdx`), so live `decodePtrBytesNoForge` (both raw AND ref!)
+unsoundly retains provenance on a misaligned cross-relocation pointer slice! -/
+theorem w4_global_misaligned_cross_reloc_unsound :
+    (match globalAllocSliceToAbstractBytes globalTwoPtrsAlloc 1 8 with
+      | some bs => decodePtrBytesNoForge true thinTy 8 bs
+      | none => none) =
+      some (.ptr { allocId := 1, offsetBytes := 0x1000000000000000 } 8) ∧
+    (match globalAllocSliceToAbstractBytes globalTwoPtrsAlloc 4 8 with
+      | some bs => decodePtrBytesNoForge false thinTy 8 bs
+      | none => none) =
+      some (.ptr { allocId := 1, offsetBytes := 0x0000001000000000 } 8) := ⟨rfl, rfl⟩
+
+/-- **W4 (32-bit global relocation width bug, `Bytes.lean:283`):** `lookupRelocAllocId`
+hardcodes `relocOff + 8`, so a 32-bit pointer relocation at offset `0` bleeds provenance into
+the adjacent non-pointer word at bytes `4..7`. -/
+theorem w4_global_32bit_reloc_bleeds :
+    globalAllocSliceToAbstractBytes
+      { allocId := 100,
+        bytes := [some 0x10, some 0, some 0, some 0, some 0x42, some 0, some 0, some 0],
+        relocations := [(0, { allocId := 1, offsetBytes := 0x10 })],
+        align := ⟨4⟩,
+        mutability := .not } 4 4 =
+      some [.init 0x42 (some (1, 1)), .init 0 (some (1, 1)),
+            .init 0 (some (1, 1)), .init 0 (some (1, 1))] := rfl
+
 /-! ### `Kani#5205` / `#5196`: read-time untyped-byte validity audit -/
 
 def tl (sz al : Nat) (br : BackendRepr) (f : FieldsShape) (fl : List Nat) : TypeLayout :=
@@ -2623,7 +2935,8 @@ def kLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entri
   tl 2 1 .memory (.array ⟨1⟩ 2) [4],
   tl 2 1 .memory (.array ⟨1⟩ 2) [3],
   tl 1 1 .memory (.union 2) [0, 1],
-  tl 8 8 .memory (.union 2) [0, 10]] }
+  tl 8 8 .memory (.union 2) [0, 10],
+  tl 8 1 .memory (.array ⟨1⟩ 8) [4]] }
 
 def tyUnit : Ty := { kind := .tuple [], layoutIdx := 0 }
 def tyMUBool : Ty := { kind := .adt "core::mem::MaybeUninit" [.bool], layoutIdx := 1 }
@@ -2644,9 +2957,13 @@ def tyMUMUBool : Ty :=
   { kind := .adt "core::mem::MaybeUninit" [.adt "core::mem::MaybeUninit" [.bool]], layoutIdx := 13 }
 def tyUsize : Ty := { kind := .uint .usize, layoutIdx := 10 }
 def tyRawU8 : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 10 }
+def tyRefU8 : Ty := { kind := .ref .not (.uint .u8), layoutIdx := 10 }
 def tyPtrRawU8 : Ty := { kind := .rawPtr .mut (.rawPtr .not (.uint .u8)), layoutIdx := 10 }
+def tyPtrRefU8 : Ty := { kind := .rawPtr .mut (.ref .not (.uint .u8)), layoutIdx := 10 }
+def tyPtrUsize : Ty := { kind := .rawPtr .mut (.uint .usize), layoutIdx := 10 }
 def tyMUPtr : Ty :=
   { kind := .adt "core::mem::MaybeUninit" [.rawPtr .not (.uint .u8)], layoutIdx := 14 }
+def tyU8A8 : Ty := { kind := .array (.uint .u8) 8, layoutIdx := 15 }
 
 theorem k_decode_bool_2_none : decodeTypedValueFromBytes 16 kLayouts tyBool [.init 2 none] = none :=
   rfl
@@ -2884,16 +3201,52 @@ theorem k_gap_union_to_ptr_forges_provenance :
     stepOutcome (copyActiveEx tyMUPtr tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1 muPtrPlain .uninit) =
       .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8)) muPtrPlain) [] := rfl
 
-/-- The single-direct `usize → *const u8` copy does NOT forge: the integer is stored as a
-provenance-less `.scalar`. -/
+/-- When BOTH pointers have the same pointee type (`*mut *const u8`), `evalCopySingleDirect`
+hits `sameRigidTyShape = true` (`Statements.lean:673`) and skips byte conversion, storing
+`.scalar` without forging. -/
 theorem k_copy_usize_to_ptr_no_forge :
     stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1
       (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
       .step (activeLocals (.init (.scalar ⟨0x20004, 8⟩)) (.init (.scalar ⟨0x20004, 8⟩))) [] := rfl
 
-/-- **GAP (permissive):** copying a `*const u8` into a `usize` local keeps the full `.ptr`
-(provenance survives inside integer-typed storage), and reading the `usize` local returns the
-pointer, so a `ptr → usize → ptr` transmute round trip never loses provenance. -/
+/-- **GAP (provenance forging via `evalCopySingleDirect`, `Statements.lean:685-696`):** when
+`src` is `*const usize` and `dst` is `*mut *const u8` (or even `*mut &u8`!),
+`sameRigidTyShape = false` routes through `decodeValueFromBytes`, FORGING
+`{ allocId := 2, offsetBytes := 4 }` from plain integer `0x20004` — even into a `&u8` ref! -/
+theorem k_gap_singleDirect_usize_to_ptr_forges_provenance :
+    stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrUsize tyPtrRawU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8))
+        (.init (.scalar ⟨0x20004, 8⟩))) [] ∧
+    stepOutcome (copyActiveEx tyUsize tyRefU8 tyPtrUsize tyPtrRefU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8))
+        (.init (.scalar ⟨0x20004, 8⟩))) [] := ⟨rfl, rfl⟩
+
+/-- Plain little-endian bytes of `0x20004` in a `[u8; 8]` array local. -/
+def u8Arr8Addr : LocalSlot :=
+  .init (.aggregate 0 [.scalar ⟨4, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨2, 1⟩, .scalar ⟨0, 1⟩,
+    .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩])
+
+def u8Arr8Zero : LocalSlot :=
+  .init (.aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩,
+    .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩])
+
+/-- **`evalCopySubplaceMulti` pointer audit (`Statements.lean:2555`):** because
+`isLayoutIndepByteKind` excludes `.rawPtr` and `.ref`, `copy_nonoverlapping::<u8>` with
+`count = 8` from `[u8; 8]` into `*const u8` or `&u8` fails closed with `.unsupported` (does
+not forge, contrasting with `evalCopyUnionBytes` / `evalCopySingleDirect` /
+`evalForeignFrameCopySingleDirect`). -/
+theorem k_copy_subplaceMulti_u8arr8_to_ptr_unsupported :
+    stepOutcome (copyActiveEx tyU8A8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8 u8Arr8Addr .uninit) =
+      .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A8 tyRefU8 tyPtrU8 tyPtrU8 0 0 8 u8Arr8Addr .uninit) =
+      .unsupported :=
+  ⟨rfl, rfl⟩
+
+/-- **GAP (permissive):** copying a `*const u8` into a `usize` local via same-pointee pointers
+keeps the full `.ptr` (and reading returns `.ptr`), whereas distinct pointees
+`*const *const u8` → `*mut usize` strip provenance to `.scalar`. -/
 theorem k_gap_ptr_to_usize_keeps_provenance :
     stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrRawU8 0 0 1
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
@@ -2902,18 +3255,25 @@ theorem k_gap_ptr_to_usize_keeps_provenance :
     readOutcome (evalOperand [.init .unit, .uninit,
         .init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)] (.copy (lc 2)) [] [] kLayouts []
       [decl tyUnit, decl tyUnit, decl tyUsize] []) =
-      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) := ⟨rfl, rfl⟩
+      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) ∧
+    stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrUsize 0 0 1
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
+      .step (activeLocals (.init (.scalar ⟨0x40, 8⟩))
+        (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))) [] := ⟨rfl, rfl, rfl⟩
 
 /-- Live cannot model the in-order byte-by-byte copy of a pointer: `copy_nonoverlapping::<u8>`
-with `count = 8` from a `*const u8` local into `[u8; 8]` or into another `*const u8` local is
-`.unsupported` (fail-closed incompleteness; the prototype's `copyBytewise_preserves_ptr` and
+from a `*const u8` local into initialized `[u8; 8]` (`count = 8`), `.uninit` `[u8; 4]`
+(`count = 4`), or another `*const u8` local (`count = 8`) is `.unsupported` (fail-closed
+incompleteness; the prototype's `copyBytewise_preserves_ptr` and
 `copyNonOverlapping_preserves_ptr` cover it). -/
 theorem k_copy_ptr_bytewise_unsupported :
+    stepOutcome (copyActiveEx tyRawU8 tyU8A8 tyPtrU8 tyPtrU8 0 0 8
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) u8Arr8Zero) = .unsupported ∧
     stepOutcome (copyActiveEx tyRawU8 tyU8A4 tyPtrU8 tyPtrU8 0 0 4
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported ∧
     stepOutcome (copyActiveEx tyRawU8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported :=
-  ⟨rfl, rfl⟩
+  ⟨rfl, rfl, rfl⟩
 
 def wFnAbi : FnAbi :=
   { args := [], ret := { layout := tl 0 1 .memory (.arbitrary [] []) [], mode := .direct },
@@ -2945,9 +3305,23 @@ def copyForeign (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) : MirStepNode :
   evalCopyNonOverlapping (foreignState srcSlot dstSlot dstTy) (.copy (lc 3)) (.copy (lc 4))
     (usz 1) [decl tyUnit, decl srcTy, decl tyUnit, decl tyPtrU8, decl tyPtrU8] kLayouts
 
+def copyForeignEx (srcTy dstTy srcPtrTy dstPtrTy : Ty) (srcSlot dstSlot : LocalSlot) :
+    MirStepNode :=
+  evalCopyNonOverlapping (foreignState srcSlot dstSlot dstTy) (.copy (lc 3)) (.copy (lc 4))
+    (usz 1) [decl tyUnit, decl srcTy, decl tyUnit, decl srcPtrTy, decl dstPtrTy] kLayouts
+
 def foreignActive (src : LocalSlot) : List LocalSlot :=
   [.init .unit, src, .uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
     .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
+
+/-- **GAP (provenance forging into caller frame via `evalForeignFrameCopySingleDirect`,
+`Statements.lean:3459`):** copying a `usize` (`0x20004`) via `*const usize` → `*mut *const u8`
+into the caller's `*const u8` local FORGES `.ptr { allocId := 2, offsetBytes := 4 } 8`. -/
+theorem k_gap_foreign_usize_to_ptr_forges_provenance :
+    stepOutcome (copyForeignEx tyUsize tyRawU8 tyPtrUsize tyPtrRawU8
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (foreignActive (.init (.scalar ⟨0x20004, 8⟩)))
+        [[.init .unit, .init (.ptr { allocId := 2, offsetBytes := 4 } 8)]] := rfl
 
 /-- **GAP (permissive):** a foreign-frame `copy_nonoverlapping` of `2u8` into the caller's
 `bool` local stores `2` with no check (the active-frame path reports premature UB). -/
@@ -3233,6 +3607,44 @@ theorem w1_decodeValueFromBytes_forges_prov :
 theorem w1_scalarLayout_32bit_none :
     decodeScalarLayoutBytesNoForge ptrScalarInit (liveEnc 1 1 0x11223344 4) = none := rfl
 
+/-- Two adjacent identical pointers `[p, p]` (`allocId = 1`, `offsetBytes = 0x10`) in a global
+static `CapturedAllocation` (relocations at byte offsets `0` and `8`). -/
+def globalTwoPtrsAlloc : CapturedAllocation :=
+  { allocId := 99,
+    bytes := [some 0x10, some 0, some 0, some 0, some 0, some 0, some 0, some 0,
+              some 0x10, some 0, some 0, some 0, some 0, some 0, some 0, some 0],
+    relocations := [(0, { allocId := 1, offsetBytes := 0x10 }),
+                    (8, { allocId := 1, offsetBytes := 0x10 })],
+    align := ⟨8⟩,
+    mutability := .not }
+
+/-- **W4 (global allocation misaligned cross-relocation unsoundness, `Bytes.lean:276-331`):**
+reading 8 bytes at offset `1` or `4` across two adjacent relocations `[p, p]` produces 8 bytes
+all tagged `(1, 1)` (no `byteIdx`), so live `decodePtrBytesNoForge` (both raw AND ref!)
+unsoundly retains provenance on a misaligned cross-relocation pointer slice! -/
+theorem w4_global_misaligned_cross_reloc_unsound :
+    (match globalAllocSliceToAbstractBytes globalTwoPtrsAlloc 1 8 with
+      | some bs => decodePtrBytesNoForge true thinTy 8 bs
+      | none => none) =
+      some (.ptr { allocId := 1, offsetBytes := 0x1000000000000000 } 8) ∧
+    (match globalAllocSliceToAbstractBytes globalTwoPtrsAlloc 4 8 with
+      | some bs => decodePtrBytesNoForge false thinTy 8 bs
+      | none => none) =
+      some (.ptr { allocId := 1, offsetBytes := 0x0000001000000000 } 8) := ⟨rfl, rfl⟩
+
+/-- **W4 (32-bit global relocation width bug, `Bytes.lean:283`):** `lookupRelocAllocId`
+hardcodes `relocOff + 8`, so a 32-bit pointer relocation at offset `0` bleeds provenance into
+the adjacent non-pointer word at bytes `4..7`. -/
+theorem w4_global_32bit_reloc_bleeds :
+    globalAllocSliceToAbstractBytes
+      { allocId := 100,
+        bytes := [some 0x10, some 0, some 0, some 0, some 0x42, some 0, some 0, some 0],
+        relocations := [(0, { allocId := 1, offsetBytes := 0x10 })],
+        align := ⟨4⟩,
+        mutability := .not } 4 4 =
+      some [.init 0x42 (some (1, 1)), .init 0 (some (1, 1)),
+            .init 0 (some (1, 1)), .init 0 (some (1, 1))] := rfl
+
 /-! ### `Kani#5205` / `#5196`: read-time untyped-byte validity audit -/
 
 def tl (sz al : Nat) (br : BackendRepr) (f : FieldsShape) (fl : List Nat) : TypeLayout :=
@@ -3263,7 +3675,8 @@ def kLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entri
   tl 2 1 .memory (.array ⟨1⟩ 2) [4],
   tl 2 1 .memory (.array ⟨1⟩ 2) [3],
   tl 1 1 .memory (.union 2) [0, 1],
-  tl 8 8 .memory (.union 2) [0, 10]] }
+  tl 8 8 .memory (.union 2) [0, 10],
+  tl 8 1 .memory (.array ⟨1⟩ 8) [4]] }
 
 def tyUnit : Ty := { kind := .tuple [], layoutIdx := 0 }
 def tyMUBool : Ty := { kind := .adt "core::mem::MaybeUninit" [.bool], layoutIdx := 1 }
@@ -3284,9 +3697,13 @@ def tyMUMUBool : Ty :=
   { kind := .adt "core::mem::MaybeUninit" [.adt "core::mem::MaybeUninit" [.bool]], layoutIdx := 13 }
 def tyUsize : Ty := { kind := .uint .usize, layoutIdx := 10 }
 def tyRawU8 : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 10 }
+def tyRefU8 : Ty := { kind := .ref .not (.uint .u8), layoutIdx := 10 }
 def tyPtrRawU8 : Ty := { kind := .rawPtr .mut (.rawPtr .not (.uint .u8)), layoutIdx := 10 }
+def tyPtrRefU8 : Ty := { kind := .rawPtr .mut (.ref .not (.uint .u8)), layoutIdx := 10 }
+def tyPtrUsize : Ty := { kind := .rawPtr .mut (.uint .usize), layoutIdx := 10 }
 def tyMUPtr : Ty :=
   { kind := .adt "core::mem::MaybeUninit" [.rawPtr .not (.uint .u8)], layoutIdx := 14 }
+def tyU8A8 : Ty := { kind := .array (.uint .u8) 8, layoutIdx := 15 }
 
 theorem k_decode_bool_2_none : decodeTypedValueFromBytes 16 kLayouts tyBool [.init 2 none] = none :=
   rfl
@@ -3524,16 +3941,52 @@ theorem k_gap_union_to_ptr_forges_provenance :
     stepOutcome (copyActiveEx tyMUPtr tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1 muPtrPlain .uninit) =
       .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8)) muPtrPlain) [] := rfl
 
-/-- The single-direct `usize → *const u8` copy does NOT forge: the integer is stored as a
-provenance-less `.scalar`. -/
+/-- When BOTH pointers have the same pointee type (`*mut *const u8`), `evalCopySingleDirect`
+hits `sameRigidTyShape = true` (`Statements.lean:673`) and skips byte conversion, storing
+`.scalar` without forging. -/
 theorem k_copy_usize_to_ptr_no_forge :
     stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrRawU8 tyPtrRawU8 0 0 1
       (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
       .step (activeLocals (.init (.scalar ⟨0x20004, 8⟩)) (.init (.scalar ⟨0x20004, 8⟩))) [] := rfl
 
-/-- **GAP (permissive):** copying a `*const u8` into a `usize` local keeps the full `.ptr`
-(provenance survives inside integer-typed storage), and reading the `usize` local returns the
-pointer, so a `ptr → usize → ptr` transmute round trip never loses provenance. -/
+/-- **GAP (provenance forging via `evalCopySingleDirect`, `Statements.lean:685-696`):** when
+`src` is `*const usize` and `dst` is `*mut *const u8` (or even `*mut &u8`!),
+`sameRigidTyShape = false` routes through `decodeValueFromBytes`, FORGING
+`{ allocId := 2, offsetBytes := 4 }` from plain integer `0x20004` — even into a `&u8` ref! -/
+theorem k_gap_singleDirect_usize_to_ptr_forges_provenance :
+    stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrUsize tyPtrRawU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8))
+        (.init (.scalar ⟨0x20004, 8⟩))) [] ∧
+    stepOutcome (copyActiveEx tyUsize tyRefU8 tyPtrUsize tyPtrRefU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8))
+        (.init (.scalar ⟨0x20004, 8⟩))) [] := ⟨rfl, rfl⟩
+
+/-- Plain little-endian bytes of `0x20004` in a `[u8; 8]` array local. -/
+def u8Arr8Addr : LocalSlot :=
+  .init (.aggregate 0 [.scalar ⟨4, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨2, 1⟩, .scalar ⟨0, 1⟩,
+    .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩])
+
+def u8Arr8Zero : LocalSlot :=
+  .init (.aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩,
+    .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩])
+
+/-- **`evalCopySubplaceMulti` pointer audit (`Statements.lean:2555`):** because
+`isLayoutIndepByteKind` excludes `.rawPtr` and `.ref`, `copy_nonoverlapping::<u8>` with
+`count = 8` from `[u8; 8]` into `*const u8` or `&u8` fails closed with `.unsupported` (does
+not forge, contrasting with `evalCopyUnionBytes` / `evalCopySingleDirect` /
+`evalForeignFrameCopySingleDirect`). -/
+theorem k_copy_subplaceMulti_u8arr8_to_ptr_unsupported :
+    stepOutcome (copyActiveEx tyU8A8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8 u8Arr8Addr .uninit) =
+      .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A8 tyRefU8 tyPtrU8 tyPtrU8 0 0 8 u8Arr8Addr .uninit) =
+      .unsupported :=
+  ⟨rfl, rfl⟩
+
+/-- **GAP (permissive):** copying a `*const u8` into a `usize` local via same-pointee pointers
+keeps the full `.ptr` (and reading returns `.ptr`), whereas distinct pointees
+`*const *const u8` → `*mut usize` strip provenance to `.scalar`. -/
 theorem k_gap_ptr_to_usize_keeps_provenance :
     stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrRawU8 0 0 1
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
@@ -3542,18 +3995,25 @@ theorem k_gap_ptr_to_usize_keeps_provenance :
     readOutcome (evalOperand [.init .unit, .uninit,
         .init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)] (.copy (lc 2)) [] [] kLayouts []
       [decl tyUnit, decl tyUnit, decl tyUsize] []) =
-      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) := ⟨rfl, rfl⟩
+      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) ∧
+    stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrUsize 0 0 1
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
+      .step (activeLocals (.init (.scalar ⟨0x40, 8⟩))
+        (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))) [] := ⟨rfl, rfl, rfl⟩
 
 /-- Live cannot model the in-order byte-by-byte copy of a pointer: `copy_nonoverlapping::<u8>`
-with `count = 8` from a `*const u8` local into `[u8; 8]` or into another `*const u8` local is
-`.unsupported` (fail-closed incompleteness; the prototype's `copyBytewise_preserves_ptr` and
+from a `*const u8` local into initialized `[u8; 8]` (`count = 8`), `.uninit` `[u8; 4]`
+(`count = 4`), or another `*const u8` local (`count = 8`) is `.unsupported` (fail-closed
+incompleteness; the prototype's `copyBytewise_preserves_ptr` and
 `copyNonOverlapping_preserves_ptr` cover it). -/
 theorem k_copy_ptr_bytewise_unsupported :
+    stepOutcome (copyActiveEx tyRawU8 tyU8A8 tyPtrU8 tyPtrU8 0 0 8
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) u8Arr8Zero) = .unsupported ∧
     stepOutcome (copyActiveEx tyRawU8 tyU8A4 tyPtrU8 tyPtrU8 0 0 4
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported ∧
     stepOutcome (copyActiveEx tyRawU8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported :=
-  ⟨rfl, rfl⟩
+  ⟨rfl, rfl, rfl⟩
 
 def wFnAbi : FnAbi :=
   { args := [], ret := { layout := tl 0 1 .memory (.arbitrary [] []) [], mode := .direct },
@@ -3585,9 +4045,23 @@ def copyForeign (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) : MirStepNode :
   evalCopyNonOverlapping (foreignState srcSlot dstSlot dstTy) (.copy (lc 3)) (.copy (lc 4))
     (usz 1) [decl tyUnit, decl srcTy, decl tyUnit, decl tyPtrU8, decl tyPtrU8] kLayouts
 
+def copyForeignEx (srcTy dstTy srcPtrTy dstPtrTy : Ty) (srcSlot dstSlot : LocalSlot) :
+    MirStepNode :=
+  evalCopyNonOverlapping (foreignState srcSlot dstSlot dstTy) (.copy (lc 3)) (.copy (lc 4))
+    (usz 1) [decl tyUnit, decl srcTy, decl tyUnit, decl srcPtrTy, decl dstPtrTy] kLayouts
+
 def foreignActive (src : LocalSlot) : List LocalSlot :=
   [.init .unit, src, .uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
     .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
+
+/-- **GAP (provenance forging into caller frame via `evalForeignFrameCopySingleDirect`,
+`Statements.lean:3459`):** copying a `usize` (`0x20004`) via `*const usize` → `*mut *const u8`
+into the caller's `*const u8` local FORGES `.ptr { allocId := 2, offsetBytes := 4 } 8`. -/
+theorem k_gap_foreign_usize_to_ptr_forges_provenance :
+    stepOutcome (copyForeignEx tyUsize tyRawU8 tyPtrUsize tyPtrRawU8
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (foreignActive (.init (.scalar ⟨0x20004, 8⟩)))
+        [[.init .unit, .init (.ptr { allocId := 2, offsetBytes := 4 } 8)]] := rfl
 
 /-- **GAP (permissive):** a foreign-frame `copy_nonoverlapping` of `2u8` into the caller's
 `bool` local stores `2` with no check (the active-frame path reports premature UB). -/

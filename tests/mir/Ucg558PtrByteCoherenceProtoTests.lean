@@ -345,6 +345,12 @@ theorem t_opt2_unmigrated_fails_closed :
       (List.replicate 8 (AbstractByteOpt2.init 0 (some (1, 1)))) = none :=
   coherentOpt2_none_of_missing_frag 8 _ 0 0 (some (1, 1)) rfl
 
+/-- An incoherent Option 2 byte `.init b none (some m)` (orphan fragment) also fails closed. -/
+theorem t_opt2_orphan_frag_fails_closed :
+    abstractBytesCoherentPtrProvOpt2 8
+      (List.replicate 8 (AbstractByteOpt2.init 0 none (some ⟨0, 0, 8⟩))) = none :=
+  coherentOpt2_none_of_orphan_frag 8 _ 0 0 ⟨0, 0, 8⟩ rfl
+
 theorem t_provPair : provPair? (mkPtrFragByte 0 5 9 0 0x40 8) = some (5, 9) :=
   provPair_mkPtrFragByte _ _ _ _ _ _
 
@@ -728,6 +734,98 @@ theorem t_decode_ptr_as_int_none_32 :
     decodeTypedValueFromBytesProto 4 (.uint 4) (encodePtrBytesProto pBig4 4) = none :=
   decode_ptr_as_int_none pBig4 4 (by decide)
 
+theorem t_decode_plain_wide_no_forge :
+    let bs := encodeLittleEndianBytesProto 0x20004 8 ++ encodeLittleEndianBytesProto 7 8
+    decodeTypedValueFromBytesProto 8 (.ref .slice) bs = none ∧
+    decodeTypedValueFromBytesProto 8 (.ref .str) bs = none ∧
+    decodeTypedValueFromBytesProto 8 (.ref .dyn) bs = none ∧
+    decodeTypedValueFromBytesProto 8 (.rawPtr .slice) bs =
+      some (.aggregate [.scalar 0x20004 8, .scalar 7 8]) ∧
+    decodeTypedValueFromBytesProto 8 (.rawPtr .str) bs =
+      some (.aggregate [.scalar 0x20004 8, .scalar 7 8]) ∧
+    decodeTypedValueFromBytesProto 8 (.rawPtr .dyn) bs =
+      some (.aggregate [.scalar 0x20004 8, .scalar 7 8]) :=
+  decode_plain_wide_no_forge 0x20004 7 8 (by decide) (by decide) (by decide)
+
+theorem t_decode_ptr_subslice_as_int_none :
+    readTypedFromBytesProto 8 (.uint 1) (encodePtrBytesProto pTag 8) 3 = none ∧
+    readTypedFromBytesProto 8 (.maybeUninit (.uint 1)) (encodePtrBytesProto pTag 8) 3 =
+      some (.rawBytes (((encodePtrBytesProto pTag 8).drop 3).take 1)) :=
+  decode_ptr_subslice_as_int_none pTag 8 3 1 (by decide) (by decide)
+
+theorem t_nat_blt_eq_true : Nat.blt 3 8 = true := nat_blt_eq_true_of_lt (by decide)
+
+theorem t_typed_encode_decode_roundtrip :
+    (encodeValueToBytesProto 8 (.uint 8) (.scalar 0x1234 8)).bind
+        (decodeTypedValueFromBytesProto 8 (.uint 8)) = some (.scalar 0x1234 8) ∧
+    (encodeValueToBytesProto 8 .bool (.scalar (1 : UInt8).toNat 1)).bind
+        (decodeTypedValueFromBytesProto 8 .bool) = some (.scalar (1 : UInt8).toNat 1) ∧
+    (encodeValueToBytesProto 8 .char (.scalar 0x41 4)).bind
+        (decodeTypedValueFromBytesProto 8 .char) = some (.scalar 0x41 4) ∧
+    (encodeValueToBytesProto 8 (.ref .thin) (.ptr pTag 8)).bind
+        (decodeTypedValueFromBytesProto 8 (.ref .thin)) = some (.ptr pTag 8) ∧
+    (encodeValueToBytesProto 8 .fnPtr (.ptr pTag 8)).bind
+        (decodeTypedValueFromBytesProto 8 .fnPtr) = some (.ptr pTag 8) ∧
+    (encodeValueToBytesProto 8 (.ref .dyn) (.aggregate [.ptr pTag 8, .ptr pVt 8])).bind
+        (decodeTypedValueFromBytesProto 8 (.ref .dyn)) = some (.aggregate [.ptr pTag 8, .ptr pVt 8]) ∧
+    (encodeValueToBytesProto 8 (.ref .slice) (.aggregate [.ptr pTag 8, .scalar 9 8])).bind
+        (decodeTypedValueFromBytesProto 8 (.ref .slice)) =
+      some (.aggregate [.ptr pTag 8, .scalar 9 8]) ∧
+    (encodeValueToBytesProto 8 (.unaligned .bool) (.aggregate [.scalar (1 : UInt8).toNat 1])).bind
+        (decodeTypedValueFromBytesProto 8 (.unaligned .bool)) =
+      some (.aggregate [.scalar (1 : UInt8).toNat 1]) :=
+  typed_encode_decode_roundtrip 8 (by decide) 0x1234 9 pTag pVt 1 0x41
+    (by decide) (by decide) (by decide) (by decide) (by decide) rfl (by decide)
+
+def globalTwoPtrsBytes : List (Option UInt8) :=
+  [some 0x40, some 0, some 0, some 0, some 0, some 0, some 0, some 0,
+   some 0x40, some 0, some 0, some 0, some 0, some 0, some 0, some 0]
+
+def globalTwoPtrsRelocs : List (Nat × ProvenancePtrProto) :=
+  [(0, pTag), (8, pTag)]
+
+theorem t_globalAllocBytesProto_getElem? :
+    (encodePtrBytesProto pTag 8).length = 8 ∧
+    ∀ (i : Nat), i < 8 →
+      ∃ optByte, globalTwoPtrsBytes[0 + i]? = some optByte ∧
+        (encodePtrBytesProto pTag 8)[i]? = some (match optByte with
+          | none => .uninit
+          | some b =>
+            match lookupGlobalRelocProto 8 globalTwoPtrsRelocs (0 + i) with
+            | some (relocOff, targetPtr) =>
+              .init b (some ⟨targetPtr.allocId, targetPtr.tag, (0 + i) - relocOff,
+                normOffset 8 targetPtr.offsetBytes, 8⟩)
+            | none => .init b none) :=
+  globalAllocBytesProto_getElem? 8 globalTwoPtrsBytes globalTwoPtrsRelocs 0 8 _ rfl
+
+/-- Aligned global relocation read recovers `pTag` with exact `tag = 9 ≠ allocId = 5`. -/
+theorem t_globalAlloc_aligned_read_exact :
+    encodePtrBytesProto pTag 8 = encodePtrBytesProto pTag 8 ∧
+    abstractBytesCoherentPtrProvProto 8 (encodePtrBytesProto pTag 8) =
+      some ⟨pTag.allocId, pTag.tag, normOffset 8 pTag.offsetBytes⟩ :=
+  globalAlloc_aligned_read_exact 8 0 (by decide) globalTwoPtrsBytes globalTwoPtrsRelocs pTag
+    (encodePtrBytesProto pTag 8) rfl
+    (fun i hi => by
+      match i, hi with
+      | 0, _ | 1, _ | 2, _ | 3, _ | 4, _ | 5, _ | 6, _ | 7, _ => rfl)
+    (fun i hi => by
+      match i, hi with
+      | 0, _ | 1, _ | 2, _ | 3, _ | 4, _ | 5, _ | 6, _ | 7, _ => rfl)
+
+/-- Misaligned global relocation read at offset `1` across `[pTag, pTag]` strips provenance. -/
+theorem t_globalAlloc_misaligned_read_strips :
+    abstractBytesCoherentPtrProvProto 8
+      ((globalAllocBytesProto 8 globalTwoPtrsBytes globalTwoPtrsRelocs 1 8).getD []) = none :=
+  globalAlloc_misaligned_read_strips 8 0 1 (by decide) (by decide)
+    globalTwoPtrsBytes globalTwoPtrsRelocs pTag 0 _ rfl rfl rfl
+
+/-- 32-bit global relocation at offset `0` does NOT bleed into bytes `4..7`. -/
+theorem t_globalAlloc_32bit_no_bleed :
+    globalAllocBytesProto 4
+      [some 0x10, some 0, some 0, some 0, some 0x42, some 0, some 0, some 0]
+      [(0, ⟨1, 9, 0x10⟩)] 4 4 =
+      some [mkInitByte 0x42, mkInitByte 0, mkInitByte 0, mkInitByte 0] := rfl
+
 /-! ## 2. Prototype decoders on the adversarial inputs (independent `rfl` checks) -/
 
 /-- Live keeps provenance on these images (`LiveV06.w1_*` / `w2_*`); the prototype on the
@@ -1096,6 +1194,28 @@ theorem t_w1_scalarLayout_32bit_none :
     decodeScalarLayoutBytesNoForge ptrScalarInit (liveEnc 1 1 0x11223344 4) = none :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w1_scalarLayout_32bit_none
 
+theorem t_w4_global_misaligned_cross_reloc_unsound :
+    (match globalAllocSliceToAbstractBytes globalTwoPtrsAlloc 1 8 with
+      | some bs => decodePtrBytesNoForge true thinTy 8 bs
+      | none => none) =
+      some (.ptr { allocId := 1, offsetBytes := 0x1000000000000000 } 8) ∧
+    (match globalAllocSliceToAbstractBytes globalTwoPtrsAlloc 4 8 with
+      | some bs => decodePtrBytesNoForge false thinTy 8 bs
+      | none => none) =
+      some (.ptr { allocId := 1, offsetBytes := 0x0000001000000000 } 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w4_global_misaligned_cross_reloc_unsound
+
+theorem t_w4_global_32bit_reloc_bleeds :
+    globalAllocSliceToAbstractBytes
+      { allocId := 100,
+        bytes := [some 0x10, some 0, some 0, some 0, some 0x42, some 0, some 0, some 0],
+        relocations := [(0, { allocId := 1, offsetBytes := 0x10 })],
+        align := ⟨4⟩,
+        mutability := .not } 4 4 =
+      some [.init 0x42 (some (1, 1)), .init 0 (some (1, 1)),
+            .init 0 (some (1, 1)), .init 0 (some (1, 1))] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w4_global_32bit_reloc_bleeds
+
 theorem t_k_decode_bool_2_none :
     decodeTypedValueFromBytes 16 kLayouts tyBool [.init 2 none] = none :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_decode_bool_2_none
@@ -1286,6 +1406,24 @@ theorem t_k_copy_usize_to_ptr_no_forge :
       .step (activeLocals (.init (.scalar ⟨0x20004, 8⟩)) (.init (.scalar ⟨0x20004, 8⟩))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_usize_to_ptr_no_forge
 
+theorem t_k_gap_singleDirect_usize_to_ptr_forges_provenance :
+    stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrUsize tyPtrRawU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8))
+        (.init (.scalar ⟨0x20004, 8⟩))) [] ∧
+    stepOutcome (copyActiveEx tyUsize tyRefU8 tyPtrUsize tyPtrRefU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8))
+        (.init (.scalar ⟨0x20004, 8⟩))) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_gap_singleDirect_usize_to_ptr_forges_provenance
+
+theorem t_k_copy_subplaceMulti_u8arr8_to_ptr_unsupported :
+    stepOutcome (copyActiveEx tyU8A8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8 u8Arr8Addr .uninit) =
+      .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A8 tyRefU8 tyPtrU8 tyPtrU8 0 0 8 u8Arr8Addr .uninit) =
+      .unsupported :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_subplaceMulti_u8arr8_to_ptr_unsupported
+
 theorem t_k_gap_ptr_to_usize_keeps_provenance :
     stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrRawU8 0 0 1
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
@@ -1294,15 +1432,28 @@ theorem t_k_gap_ptr_to_usize_keeps_provenance :
     readOutcome (evalOperand [.init .unit, .uninit,
         .init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)] (.copy (lc 2)) [] [] kLayouts []
       [decl tyUnit, decl tyUnit, decl tyUsize] []) =
-      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) :=
+      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) ∧
+    stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrUsize 0 0 1
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
+      .step (activeLocals (.init (.scalar ⟨0x40, 8⟩))
+        (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_gap_ptr_to_usize_keeps_provenance
 
 theorem t_k_copy_ptr_bytewise_unsupported :
+    stepOutcome (copyActiveEx tyRawU8 tyU8A8 tyPtrU8 tyPtrU8 0 0 8
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) u8Arr8Zero) = .unsupported ∧
     stepOutcome (copyActiveEx tyRawU8 tyU8A4 tyPtrU8 tyPtrU8 0 0 4
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported ∧
     stepOutcome (copyActiveEx tyRawU8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_copy_ptr_bytewise_unsupported
+
+theorem t_k_gap_foreign_usize_to_ptr_forges_provenance :
+    stepOutcome (copyForeignEx tyUsize tyRawU8 tyPtrUsize tyPtrRawU8
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (foreignActive (.init (.scalar ⟨0x20004, 8⟩)))
+        [[.init .unit, .init (.ptr { allocId := 2, offsetBytes := 4 } 8)]] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.k_gap_foreign_usize_to_ptr_forges_provenance
 
 end RestateLiveV06
 
@@ -1503,6 +1654,28 @@ theorem t_w1_scalarLayout_32bit_none :
     decodeScalarLayoutBytesNoForge ptrScalarInit (liveEnc 1 1 0x11223344 4) = none :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w1_scalarLayout_32bit_none
 
+theorem t_w4_global_misaligned_cross_reloc_unsound :
+    (match globalAllocSliceToAbstractBytes globalTwoPtrsAlloc 1 8 with
+      | some bs => decodePtrBytesNoForge true thinTy 8 bs
+      | none => none) =
+      some (.ptr { allocId := 1, offsetBytes := 0x1000000000000000 } 8) ∧
+    (match globalAllocSliceToAbstractBytes globalTwoPtrsAlloc 4 8 with
+      | some bs => decodePtrBytesNoForge false thinTy 8 bs
+      | none => none) =
+      some (.ptr { allocId := 1, offsetBytes := 0x0000001000000000 } 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w4_global_misaligned_cross_reloc_unsound
+
+theorem t_w4_global_32bit_reloc_bleeds :
+    globalAllocSliceToAbstractBytes
+      { allocId := 100,
+        bytes := [some 0x10, some 0, some 0, some 0, some 0x42, some 0, some 0, some 0],
+        relocations := [(0, { allocId := 1, offsetBytes := 0x10 })],
+        align := ⟨4⟩,
+        mutability := .not } 4 4 =
+      some [.init 0x42 (some (1, 1)), .init 0 (some (1, 1)),
+            .init 0 (some (1, 1)), .init 0 (some (1, 1))] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w4_global_32bit_reloc_bleeds
+
 theorem t_k_decode_bool_2_none :
     decodeTypedValueFromBytes 16 kLayouts tyBool [.init 2 none] = none :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_decode_bool_2_none
@@ -1665,6 +1838,24 @@ theorem t_k_copy_usize_to_ptr_no_forge :
       .step (activeLocals (.init (.scalar ⟨0x20004, 8⟩)) (.init (.scalar ⟨0x20004, 8⟩))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_usize_to_ptr_no_forge
 
+theorem t_k_gap_singleDirect_usize_to_ptr_forges_provenance :
+    stepOutcome (copyActiveEx tyUsize tyRawU8 tyPtrUsize tyPtrRawU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8))
+        (.init (.scalar ⟨0x20004, 8⟩))) [] ∧
+    stepOutcome (copyActiveEx tyUsize tyRefU8 tyPtrUsize tyPtrRefU8 0 0 1
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (activeLocals (.init (.ptr { allocId := 2, offsetBytes := 4 } 8))
+        (.init (.scalar ⟨0x20004, 8⟩))) [] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_gap_singleDirect_usize_to_ptr_forges_provenance
+
+theorem t_k_copy_subplaceMulti_u8arr8_to_ptr_unsupported :
+    stepOutcome (copyActiveEx tyU8A8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8 u8Arr8Addr .uninit) =
+      .unsupported ∧
+    stepOutcome (copyActiveEx tyU8A8 tyRefU8 tyPtrU8 tyPtrU8 0 0 8 u8Arr8Addr .uninit) =
+      .unsupported :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_subplaceMulti_u8arr8_to_ptr_unsupported
+
 theorem t_k_gap_ptr_to_usize_keeps_provenance :
     stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrRawU8 0 0 1
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
@@ -1673,15 +1864,28 @@ theorem t_k_gap_ptr_to_usize_keeps_provenance :
     readOutcome (evalOperand [.init .unit, .uninit,
         .init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)] (.copy (lc 2)) [] [] kLayouts []
       [decl tyUnit, decl tyUnit, decl tyUsize] []) =
-      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) :=
+      .ok (.ptr { allocId := 7, offsetBytes := 0x40 } 8) ∧
+    stepOutcome (copyActiveEx tyRawU8 tyUsize tyPtrRawU8 tyPtrUsize 0 0 1
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) =
+      .step (activeLocals (.init (.scalar ⟨0x40, 8⟩))
+        (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8))) [] :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_gap_ptr_to_usize_keeps_provenance
 
 theorem t_k_copy_ptr_bytewise_unsupported :
+    stepOutcome (copyActiveEx tyRawU8 tyU8A8 tyPtrU8 tyPtrU8 0 0 8
+      (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) u8Arr8Zero) = .unsupported ∧
     stepOutcome (copyActiveEx tyRawU8 tyU8A4 tyPtrU8 tyPtrU8 0 0 4
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported ∧
     stepOutcome (copyActiveEx tyRawU8 tyRawU8 tyPtrU8 tyPtrU8 0 0 8
       (.init (.ptr { allocId := 7, offsetBytes := 0x40 } 8)) .uninit) = .unsupported :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_copy_ptr_bytewise_unsupported
+
+theorem t_k_gap_foreign_usize_to_ptr_forges_provenance :
+    stepOutcome (copyForeignEx tyUsize tyRawU8 tyPtrUsize tyPtrRawU8
+      (.init (.scalar ⟨0x20004, 8⟩)) .uninit) =
+      .step (foreignActive (.init (.scalar ⟨0x20004, 8⟩)))
+        [[.init .unit, .init (.ptr { allocId := 2, offsetBytes := 4 } 8)]] :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.k_gap_foreign_usize_to_ptr_forges_provenance
 
 end RestateLiveV08
 
