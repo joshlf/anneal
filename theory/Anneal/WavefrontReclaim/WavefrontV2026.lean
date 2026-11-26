@@ -858,13 +858,28 @@ def v2026SubLensGet (L : V2026SubLens) (m : Memory) : Option (List AbstractByte)
     | false => none
     | true => globalAllocSliceToAbstractBytes a L.offset L.size
 
-/-- Replaces matching global `CapturedAllocation` entries for `a'.allocId` (`0` `._unsafe_rec`). -/
+/-- Replaces ONLY the FIRST global `CapturedAllocation` entry matching `a'.allocId` via `@Nat.rec`
+(`0` `._unsafe_rec`), matching `lookupGlobalAlloc`, `RangeSpanV2026.replaceGlobalAllocV2026`,
+and `SpatialMemV2026.replaceV2026Alloc` 1-to-1. -/
 def replaceGlobalAllocWf (a' : CapturedAllocation)
     (gs : List CapturedAllocation) : List CapturedAllocation :=
-  gs.map (fun a =>
-    match Nat.beq a.allocId a'.allocId with
-    | true => a'
-    | false => a)
+  (@Nat.rec (fun _ => List CapturedAllocation → List CapturedAllocation)
+    (fun _ => [])
+    (fun _ ih xs =>
+      match xs with
+      | [] => []
+      | hd :: tl =>
+        match Nat.beq hd.allocId a'.allocId with
+        | true => a' :: tl
+        | false => hd :: ih tl)
+    gs.length) gs
+
+private theorem replaceGlobalAllocWf_cons (a' hd : CapturedAllocation)
+    (tl : List CapturedAllocation) :
+    replaceGlobalAllocWf a' (hd :: tl) =
+      match Nat.beq hd.allocId a'.allocId with
+      | true => a' :: tl
+      | false => hd :: replaceGlobalAllocWf a' tl := rfl
 
 /-- Fail-closed `V2026_06_01` sub-lens write splicing `rawPatch` into `m.globals`. -/
 def v2026SubLensPut (L : V2026SubLens) (m : Memory)
@@ -902,7 +917,7 @@ private theorem lookupGlobalAlloc_replace_eq_wf (a' : CapturedAllocation) :
   | [], _, h => nomatch h
   | hd :: tl, a, h => by
     unfold lookupGlobalAlloc at h
-    dsimp only [replaceGlobalAllocWf, List.map]
+    rw [replaceGlobalAllocWf_cons]
     cases hb : Nat.beq hd.allocId a'.allocId with
     | true =>
       dsimp only
@@ -922,7 +937,7 @@ private theorem lookupGlobalAlloc_replace_ne_wf (a' : CapturedAllocation) (other
         lookupGlobalAlloc globals otherId
   | [] => rfl
   | hd :: tl => by
-    dsimp only [replaceGlobalAllocWf, List.map]
+    rw [replaceGlobalAllocWf_cons]
     cases hb : Nat.beq hd.allocId a'.allocId with
     | true =>
       have hEq : hd.allocId = a'.allocId := natEq_of_beq hd.allocId a'.allocId hb
@@ -931,7 +946,6 @@ private theorem lookupGlobalAlloc_replace_ne_wf (a' : CapturedAllocation) (other
       dsimp only
       unfold lookupGlobalAlloc
       rw [hNe, hNeHd]
-      exact lookupGlobalAlloc_replace_ne_wf a' otherId hNe tl
     | false =>
       dsimp only
       unfold lookupGlobalAlloc
@@ -4647,18 +4661,32 @@ abbrev MirWavefrontCutState : Type :=
   MachineState × View × ResTrie ResElem × WavefrontWorldV2026
 
 /-- Top-level stage-indexed predicate bound inside `Anneal.Firewall.IndexedCut` so
-expanded `WorldMatchesV2026` / `Memory` bodies stay hidden from outer goals. The stage is a
-GENUINE remaining-work bound (not a free label): at `stage = n` the computable wavefront
-runner `runWavefrontStepsV2026 (n + 1) pol` drains the coupled world to quiescence, so
-`stage = 0` FORCES quiescence (`mirWavefrontCutAt_zero_quiescent`) and every lockstep
-`stepMirFn` / wavefront transition must consume exactly one unit of stage budget. -/
+expanded `WorldMatchesV2026` / `Memory` bodies stay hidden from outer goals. Carries DUAL
+`Firewall`-shielded `MirGlobalSliceAtV2026` invariants — BOTH on the MIR machine's `st.1.memory`
+AND on the wavefront world's own mutated `st.2.2.2.mem` (backed by `allDisjointFromLens frameL
+st.2.2.2.loans` across `.activeMut` leaf writebacks) — alongside the genuine remaining-drain
+budget `runWavefrontStepsV2026 (stage + 1) pol st.2.2.2 = some wD`. -/
 def mirWavefrontCutAt (pol : SpawnPolicy) (F : VProp)
     (frameL : V2026SubLens) (frameBs : List AbstractByte)
     (stage : Nat) (st : MirWavefrontCutState) : Prop :=
   WorldMatchesV2026 st.2.1 st.2.2.1 st.2.2.2 ∧
   (vsep (vMinStep st.2.2.2.stepCount) F).holds st.2.1 st.2.2.1 ∧
   MirGlobalSliceAtV2026 st.1.memory frameL frameBs ∧
+  MirGlobalSliceAtV2026 st.2.2.2.mem frameL frameBs ∧
+  allDisjointFromLens frameL st.2.2.2.loans ∧
   ∃ wD : WavefrontWorldV2026, runWavefrontStepsV2026 (stage + 1) pol st.2.2.2 = some wD
+
+/-- Extracts BOTH `Firewall`-shielded `MirGlobalSliceAtV2026` invariants (on `st.1.memory` AND on
+the wavefront world's own `st.2.2.2.mem`) plus `allDisjointFromLens` from any `IndexedCut` (`[]`). -/
+theorem mirWavefrontCutAt_dual_mem_frame {pol : SpawnPolicy} {F : VProp}
+    {frameL : V2026SubLens} {frameBs : List AbstractByte}
+    {stage : Nat} {st : MirWavefrontCutState}
+    (h : IndexedCut (mirWavefrontCutAt pol F frameL frameBs) stage st) :
+    MirGlobalSliceAtV2026 st.1.memory frameL frameBs ∧
+    MirGlobalSliceAtV2026 st.2.2.2.mem frameL frameBs ∧
+    allDisjointFromLens frameL st.2.2.2.loans :=
+  let hO := open_cut h
+  ⟨hO.2.2.1, hO.2.2.2.1, hO.2.2.2.2.1⟩
 
 /-- One-step unfolding of `runWavefrontStepsV2026` on a non-empty pool (`[]` zero axioms). -/
 theorem runWavefrontStepsV2026_succ_of_step (pol : SpawnPolicy) (fuel : Nat)
@@ -4700,7 +4728,7 @@ theorem mirWavefrontCutAt_zero_quiescent {pol : SpawnPolicy} {F : VProp}
     (h : IndexedCut (mirWavefrontCutAt pol F frameL frameBs) 0 st) :
     wfPoolIsNonEmpty st.2.2.2 = false ∧ worldMeasureV2026 st.2.2.2 = [] := by
   have hO := open_cut h
-  cases hO.2.2.2 with
+  cases hO.2.2.2.2.2 with
   | intro wD hRun =>
     have hQ := runWavefrontStepsV2026_one_quiescent pol st.2.2.2 wD hRun
     exact ⟨hQ, (wavefrontConvergesV2026_extract_fuel pol st.2.2.2 st.2.2.2
@@ -5662,15 +5690,21 @@ theorem stepMirFn_wavefrontStep_firewall_bridge
       | intro vOut hv =>
         have hMemNext : MirGlobalSliceAtV2026 msNext.memory frameL frameBs :=
           mirGlobalSliceAtV2026_of_globals_eq hGlobEq hOpened.2.2.1
+        have hWfStepFr :=
+          wavefrontStep_preserves_disjoint_mem_frame pol wIn wOut frameL hOpened.2.2.2.2.1 hv.1
+        have hWfMemNext : MirGlobalSliceAtV2026 wOut.mem frameL frameBs :=
+          Firewall.map wfMirMemFrameFirewallTag (fun h0 => Eq.trans hWfStepFr.1 h0)
+            hOpened.2.2.2.1
         have hCutOut :
             IndexedCut (mirWavefrontCutAt pol F frameL frameBs) stage
               (msNext, vOut, rOut, wOut) := by
-          cases hOpened.2.2.2 with
+          cases hOpened.2.2.2.2.2 with
           | intro wD hRun =>
             have hRun' : runWavefrontStepsV2026 (stage + 1) pol wOut = some wD :=
               (runWavefrontStepsV2026_succ_of_step pol (stage + 1) wIn wOut hNe hv.1).symm.trans
                 hRun
-            exact seal_cut ⟨hv.2.2.2.2.1, hv.2.2.2.1, hMemNext, wD, hRun'⟩
+            exact seal_cut ⟨hv.2.2.2.2.1, hv.2.2.2.1, hMemNext, hWfMemNext, hWfStepFr.2,
+              wD, hRun'⟩
         exact ⟨wOut, rOut, vOut, hGlobEq, hv.1, hv.2.2.2.2.2, hv.2.1, hv.2.2.1, hCutOut⟩
 
 /-- Inductive multi-step trace of `MirSingleStepTo` transitions. Carries NO per-step
@@ -5765,7 +5799,7 @@ theorem stepMirFn_lockstep_chain_indexedCut
       have hCut1 :
           IndexedCut (mirWavefrontCutAt pol F frameL frameBs) rest.length
             (ms1, v0, r0, w0) :=
-        seal_cut ⟨hOp.1, hOp.2.1, hMem1, w0, hRun1⟩
+        seal_cut ⟨hOp.1, hOp.2.1, hMem1, hOp.2.2.2.1, hOp.2.2.2.2.1, w0, hRun1⟩
       cases ih v0 r0 w0 hRoot1.1 hRoot1.2 hCut1 with
       | intro wFinal hwF =>
         cases hwF with
@@ -5906,6 +5940,8 @@ theorem runCfgSteps_wavefrontDrain_indexedCut_bridge
     (hPre : (vsep vemp F).holds vIn rIn)
     (hMIn : WorldMatchesV2026 vIn rIn wIn)
     (hMemFrameIn : MirGlobalSliceAtV2026 ms0.memory frameL frameBs)
+    (hWfMemFrameIn : MirGlobalSliceAtV2026 wIn.mem frameL frameBs)
+    (hLoansDisjIn : allDisjointFromLens frameL wIn.loans)
     (hQueued : (anyTaskHasLoan lid wIn.fifoQueue || anyTaskHasLoan lid wIn.stealDeque) = true) :
     ∃ (wDrained : WavefrontWorldV2026) (rOut : ResTrie ResElem) (vOut : View)
       (e0 : WfLoanEntryV2026),
@@ -5943,6 +5979,10 @@ theorem runCfgSteps_wavefrontDrain_indexedCut_bridge
         | intro e0 he0 =>
           have hMemOut : MirGlobalSliceAtV2026 memFinal frameL frameBs :=
             mirGlobalSliceAtV2026_of_globals_eq hGlobEq hMemFrameIn
+          have hWfFr :=
+            wavefrontConverges_preserves_disjoint_mem_frame pol hConv frameL hLoansDisjIn
+          have hWfMemOut : MirGlobalSliceAtV2026 wDrained.mem frameL frameBs :=
+            Firewall.map wfMirMemFrameFirewallTag (fun h0 => Eq.trans hWfFr.1 h0) hWfMemFrameIn
           have hRun1 : runWavefrontStepsV2026 1 pol wDrained = some wDrained := by
             change (match wfPoolIsNonEmpty wDrained with
               | false => some wDrained
@@ -5954,7 +5994,7 @@ theorem runCfgSteps_wavefrontDrain_indexedCut_bridge
           have hCut0 :
               IndexedCut (mirWavefrontCutAt pol F frameL frameBs) 0
                 ({ ms0 with memory := memFinal }, vOut, rOut, wDrained) :=
-            seal_cut ⟨hv.2.2.2.2, hv.2.2.2.1, hMemOut, wDrained, hRun1⟩
+            seal_cut ⟨hv.2.2.2.2, hv.2.2.2.1, hMemOut, hWfMemOut, hWfFr.2, wDrained, hRun1⟩
           have hDecAgree :
               ∃ bs : List AbstractByte,
                 v2026SubLensGet e0.lens wDrained.mem = some bs ∧
@@ -6812,7 +6852,8 @@ theorem witness_v2026_stepMirFn_and_runCfgSteps_wavefront_loop :
       IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
         wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) 10
         (wfLoopInitMs, [0], wfLoopBridgeRes0, wfLoopBridgeWorld0) :=
-    seal_cut ⟨hM0, hMinHold0, hMemFr0, wfWithBridgeCells mwW10, wfLoopBridge_run11⟩
+    seal_cut ⟨hM0, hMinHold0, hMemFr0, hMemFr0, ⟨rfl, True.intro⟩,
+      wfWithBridgeCells mwW10, wfLoopBridge_run11⟩
   refine ⟨hMir1, hCfg15, ?_, ?_⟩
   · cases stepMirFn_wavefrontStep_firewall_bridge wfReclaimLoopBody
         wfPolicyTower53210 hPol (cellAuthProp path2 99)
@@ -6831,7 +6872,7 @@ theorem witness_v2026_stepMirFn_and_runCfgSteps_wavefront_loop :
         wfLoopInitMs 15 (.scalar ⟨42, 4⟩) wfCNode24Mem0
         [0] wfLoopBridgeRes0 wfLoopBridgeWorld0 path0
         rfl hCfg15 (vsep_vemp_intro [0] _ wfLoopBridgeRes0 hCellHold0)
-        hM0 hMemFr0 rfl with
+        hM0 hMemFr0 hMemFr0 ⟨rfl, True.intro⟩ rfl with
     | intro wDrained hwD =>
       cases hwD with
       | intro rOut hrD =>
@@ -7047,7 +7088,7 @@ theorem witness_v2026_ptrDeref_mir_loop_input_sensitive :
       wfPtrLoopInitMs100 15 (.scalar ⟨132, 4⟩) wfCNodeMem100
       [0] wfLoopBridgeRes0 wfLoopBridgeWorld100 path0
       rfl hCfg100 (vsep_vemp_intro [0] _ wfLoopBridgeRes0 hCellHold0)
-      hM100 hMemFr100 rfl with
+      hM100 hMemFr100 hMemFr100 ⟨rfl, True.intro⟩ rfl with
   | intro wDrained100 hwD =>
     cases hwD with
     | intro rOut100 hrD =>
@@ -7144,7 +7185,8 @@ theorem witness_stepMirFn_lockstep_trace10_ptrLoop_v2026 :
           wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) tr.length
           (wfPtrLoopInitMs10, [0], wfLoopBridgeRes0, wfLoopBridgeWorld0) := by
       rw [hSound.2]
-      exact seal_cut ⟨hM0, hMinHold0, hMemFr0, wfWithBridgeCells mwW10, wfLoopBridge_run11⟩
+      exact seal_cut ⟨hM0, hMinHold0, hMemFr0, hMemFr0, ⟨rfl, True.intro⟩,
+        wfWithBridgeCells mwW10, wfLoopBridge_run11⟩
     cases stepMirFn_lockstep_chain_indexedCut wfPtrReadReclaimLoopBody wfPolicyTower53210 hPol
         (cellAuthProp path2 99) wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) rfl hSound.1
         [0] wfLoopBridgeRes0 wfLoopBridgeWorld0 rfl rfl hCut with
@@ -7259,7 +7301,8 @@ theorem witness_stepMirFn_full_return_and_stutter_lockstep_v2026 :
           wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) out10.1.length
           (wfPtrLoopInitMs10, [0], wfLoopBridgeRes0, wfLoopBridgeWorld0) := by
       rw [hSound.2]
-      exact seal_cut ⟨hM0, hMinHold0, hMemFr0, wfWithBridgeCells mwW10, wfLoopBridge_run15⟩
+      exact seal_cut ⟨hM0, hMinHold0, hMemFr0, hMemFr0, ⟨rfl, True.intro⟩,
+        wfWithBridgeCells mwW10, wfLoopBridge_run15⟩
     cases stepMirFn_lockstep_chain_indexedCut wfPtrReadReclaimLoopBody wfPolicyTower53210 hPol
         (cellAuthProp path2 99) wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) rfl hSound.1
         [0] wfLoopBridgeRes0 wfLoopBridgeWorld0 rfl rfl hCut14 with

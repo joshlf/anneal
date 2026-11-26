@@ -637,6 +637,111 @@ theorem ep2_b3_wavefront_memory_frame_law :
     | intro wF h =>
       exact ⟨msF, wF, h.1, h.2.2.1, hW.2.1, h.2.2.2⟩
 
+/-- **Cross-Module Operational Unification (`[propext]`-only)**: every successful
+`WavefrontV2026.v2026SubLensPut` mutation (the primitive executed by `.pureLiftSafe` and
+`.poolWavefrontStep` leaf writebacks) is an EXACT instance of
+`RangeSpanV2026.writeMemoryBytesV2026`, so every Wavefront writeback inherits
+`v2026RangeSepConj_write_frame` AND `memGlobalsToByteMem_writeMemoryBytesV2026_commutes`! -/
+theorem ep2_v2026SubLensPut_implies_writeMemoryBytesV2026
+    {L : V2026SubLens} {m m' : Memory} {rawPatch : List (Option UInt8)}
+    (hPut : v2026SubLensPut L m rawPatch = some m') :
+    writeMemoryBytesV2026 m ⟨L.allocId, L.offset, L.size⟩ rawPatch = some m' := by
+  unfold v2026SubLensPut at hPut
+  unfold writeMemoryBytesV2026
+  dsimp only
+  cases hFind : lookupGlobalAlloc m.globals L.allocId with
+  | none => rw [hFind] at hPut; nomatch hPut
+  | some a =>
+    rw [hFind] at hPut
+    dsimp only at hPut ⊢
+    cases hOk : v2026AllocLensOk L a with
+    | false =>
+      rw [hOk] at hPut
+      dsimp only [Bool.and] at hPut
+      nomatch hPut
+    | true =>
+      rw [hOk] at hPut
+      cases hLen : Nat.beq rawPatch.length L.size with
+      | false =>
+        rw [hLen] at hPut
+        dsimp only [Bool.and] at hPut
+        nomatch hPut
+      | true =>
+        rw [hLen] at hPut
+        dsimp only [Bool.and] at hPut ⊢
+        unfold v2026AllocLensOk at hOk
+        cases hMut : a.mutability with
+        | not =>
+          rw [hMut] at hOk
+          dsimp only [Bool.and] at hOk
+          nomatch hOk
+        | «mut» =>
+          rw [hMut] at hOk
+          dsimp only
+          cases hRel : a.relocations with
+          | cons _ _ =>
+            rw [hRel] at hOk
+            dsimp only [List.isEmpty, Bool.and] at hOk
+            nomatch hOk
+          | nil =>
+            rw [hRel] at hOk
+            have hAvNil : relocsAvoidRange [] L.offset L.size = true := rfl
+            have hBnd : Nat.ble (L.offset + L.size) a.bytes.length = true :=
+              ((Bool.and_eq_true _ _).mp hOk).2
+            rw [hAvNil, hBnd]
+            dsimp only [Bool.and]
+            rw [hRel, hMut] at hPut
+            exact hPut
+
+/-- **Pass A3 Integration (`[propext]`)**:
+1. Write-side commuting square `memGlobalsToByteMem_writeMemoryBytesV2026_commutes` between
+   `RangeSpanV2026.writeMemoryBytesV2026` and `SpatialMemV2026.writeV2026Bytes` (instantiated on
+   pointer-bearing `rsPtrMemoryV2026`, preserving `[0, 8)` pointer provenance `(1, 1)`), plus
+   zero-length write identity `memGlobalsToByteMem_writeMemoryBytesV2026_zero_len`;
+2. Operational unification `ep2_v2026SubLensPut_implies_writeMemoryBytesV2026` linking
+   `WavefrontV2026.v2026SubLensPut` directly to `RangeSpanV2026.writeMemoryBytesV2026`;
+3. Dual-memory `IndexedCut` extraction `mirWavefrontCutAt_dual_mem_frame` on the full 14+1-step
+   `stepMirFn` return trace (`witness_stepMirFn_full_return_and_stutter_lockstep_v2026`),
+   certifying `Firewall`-shielded `[20, 24) = 99` inside the cut on BOTH `msAtRet10.memory`
+   AND `wFinal.mem` simultaneously! -/
+theorem ep2_a3_commuting_write_square_dual_cut_and_sublens_unification :
+    (∀ (L : V2026SubLens) (m m' : Memory) (rawPatch : List (Option UInt8)),
+      v2026SubLensPut L m rawPatch = some m' →
+      writeMemoryBytesV2026 m ⟨L.allocId, L.offset, L.size⟩ rawPatch = some m') ∧
+    (∃ m' : Memory,
+      writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 8, 4⟩ rsPatchBytes = some m' ∧
+      writeV2026Bytes (memGlobalsToByteMem rsPtrMemoryV2026) ⟨3, 8⟩ 4 rsPatchAbsBytes =
+        some (memGlobalsToByteMem m') ∧
+      readV2026Bytes (memGlobalsToByteMem m') ⟨3, 0⟩ 8 8 = some rsPtrAbsBytes) ∧
+    (∀ (m m' : Memory) (s : Nat) (patch : List (Option UInt8)),
+      writeMemoryBytesV2026 m ⟨1, s, 0⟩ patch = some m' →
+      memGlobalsToByteMem m' = memGlobalsToByteMem m) ∧
+    (∃ (msAtRet10 : MachineState) (wFinal : WavefrontWorldV2026),
+      stepMirFn wfPtrReadReclaimLoopBody msAtRet10 =
+        MirStepNode.retNormal (.scalar ⟨42, 4⟩) msAtRet10.memory ∧
+      WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld0 wFinal ∧
+      MirGlobalSliceAtV2026 msAtRet10.memory wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) ∧
+      MirGlobalSliceAtV2026 wFinal.mem wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) ∧
+      allDisjointFromLens wfCNodeFrameSlotLens wFinal.loans) := by
+  have hCommWit := witness_memGlobals_write_commutes_and_shadowed_allocId
+  have hFull := witness_stepMirFn_full_return_and_stutter_lockstep_v2026
+  refine ⟨fun _ _ _ _ h => ep2_v2026SubLensPut_implies_writeMemoryBytesV2026 h,
+    hCommWit.1,
+    fun _ _ _ _ hW => (memGlobalsToByteMem_writeMemoryBytesV2026_zero_len rfl hW).2,
+    ?_⟩
+  cases hFull.2.2.1 with
+  | intro tr14 h1 =>
+    cases h1 with
+    | intro msAtRet10 h =>
+      cases h.2.2.2 with
+      | intro wFinal hw =>
+        cases hw with
+        | intro rFinal hr =>
+          cases hr with
+          | intro vFinal hv =>
+            have hDual := mirWavefrontCutAt_dual_mem_frame hv.2.2.2.2.2
+            exact ⟨msAtRet10, wFinal, h.2.2.1, hv.2.2.2.1, hDual.1, hDual.2.1, hDual.2.2⟩
+
 /-- **Unified Episode 2 Cross-Module Master Capstone (`[propext]`)**:
 Bundles the positive and fail-closed negative witnesses from ALL THREE root modules:
 `Anneal.MiriTreeBorrowsV2026`, `Anneal.SepAC.RangeSpanV2026`, and
@@ -837,6 +942,10 @@ run_cmd do
         ``Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocAllocId),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtByteMem_memGlobals_iff,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes),
+      (``Anneal.SepAC.RangeSpanV2026.memGlobalsToByteMem_writeMemoryBytesV2026_commutes,
+        ``writeV2026Bytes),
+      (``Anneal.SepAC.RangeSpanV2026.memGlobalsToByteMem_writeMemoryBytesV2026_commutes,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocAllocId),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_frame_of_fpDisjoint,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.byteRangesOverlapBool),
       (``Anneal.SepAC.RangeSpanV2026.v2026RangeSepConj_write_frame,
@@ -845,6 +954,8 @@ run_cmd do
         ``writeV2026Bytes),
       (``Anneal.WavefrontReclaim.WavefrontV2026.mirWavefrontCutAt_zero_quiescent,
         ``Anneal.WavefrontReclaim.WavefrontV2026.runWavefrontStepsV2026),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.mirWavefrontCutAt_dual_mem_frame,
+        ``Anneal.WavefrontReclaim.WavefrontV2026.MirGlobalSliceAtV2026),
       (``Anneal.WavefrontReclaim.WavefrontV2026.witness_mir_return_eq_reclaimed_loan_decode_v2026,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.decodeValueFromBytes),
       (``Anneal.WavefrontReclaim.WavefrontV2026.witness_v2026_ptrDeref_mir_loop_input_sensitive,
@@ -908,7 +1019,7 @@ run_cmd do
           throwError "test theorem {c} depends on forbidden axiom {a}"
         unless a == ``propext || a == ``Classical.choice || a == ``Quot.sound do
           throwError "test theorem {c} depends on non-standard axiom {a}"
-  if localThms < 8 then
+  if localThms < 10 then
     throwError "local test audit vacuous: only {localThms} theorems found"
 
   -- 8. Optional cross-root kernel audit of `LeanMiriSpec.InitialStateTreeBorrowsWpLM` when
