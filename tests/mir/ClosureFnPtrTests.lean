@@ -4507,6 +4507,39 @@ theorem unpack_ces_zst_closure_tuple :
       (.some [.unit], .none) := by
   rfl
 
+/-- Coercion-tag/callee-kind mismatches all fault with `.ub`: `ReifyFnPointer(Safe)` on a closure type, `ClosureFnPointer(Safe)` on a `fnDef` type, and forged `ReifyFnPointer(Safe)` on a `fnDef` naming a linked closure body even with an `(N + 1)`-arg signature. -/
+theorem coerce_wrong_coercion_kind_is_ub :
+    (coerce "ReifyFnPointer(Safe)" sharedClo (.aggregate 0 .nil) fnU32 [Mir.ClosureMatrix.fn_shared_closure_0.body],
+     coerce "ClosureFnPointer(Safe)" (.fnDef "closure_matrix::ct_add" .nil) .unit fnU32 [Mir.ClosureMatrix.ct_add.body],
+     coerce "ReifyFnPointer(Safe)" (.fnDef sharedPath .nil) .unit
+       (.fnPtr [.ref .not sharedClo, u32K] u32K .safe .rust)
+       [Mir.ClosureMatrix.fn_shared_closure_0.body]) =
+      (.ub, .ub, .ub) := by
+  rfl
+
+/-- Inline `const_eval_select` rejects a forged `.closure` runtime target naming a linked non-closure `fn` item with `.ub` (never executing it and never returning `.unsupported` when generic). -/
+theorem inline_ces_forged_closure_ty_on_non_closure_is_ub :
+    let genFn : CapturedMir :=
+      { Mir.ClosureMatrix.ct_add.body with
+        defPath := "tests::gen_fn"
+        typeParamCount := 1 }
+    (runWith (cesCaller (.closure "closure_matrix::ct_add" .nil)) [u32v 5, .aggregate 0 .nil]
+       [Mir.ClosureMatrix.ct_add.body],
+     runWith (cesCaller (.closure "tests::gen_fn" .nil)) [u32v 5, .aggregate 0 .nil]
+       [genFn]) =
+      (.ub, .ub) := by
+  rfl
+
+/-- C5 precedence on inline `const_eval_select` with a linked generic capturing closure body (`typeParamCount = 1`): `.unsupported`, while the non-generic capturing body with forged `.closure capPath .nil` faults with `.ub`. -/
+theorem inline_ces_generic_capturing_is_unsupported_not_ub :
+    let genCap : CapturedMir :=
+      { Mir.ClosureMatrix.capturing_direct_closure_0.body with typeParamCount := 1 }
+    (runWith (cesCaller (.closure capPath .nil)) [u32v 5, .aggregate 0 .nil] [genCap],
+     runWith (cesCaller (.closure capPath .nil)) [u32v 5, .aggregate 0 .nil]
+       [Mir.ClosureMatrix.capturing_direct_closure_0.body]) =
+      (.unsupported, .ub) := by
+  rfl
+
 end Anneal.ClosureFnPtrTests.V06
 
 /-! ## 6. Closure function-pointer matrix on `V2026_08_01` -/
@@ -6026,6 +6059,39 @@ theorem unpack_ces_zst_closure_tuple :
     (unpackConstEvalSelectArgs? .unit (.some (.tuple [.closure "tests::c" .nil])),
      unpackConstEvalSelectArgs? .unit (.some (.tuple [.closure "tests::c" [u32K]]))) =
       (.some [.unit], .none) := by
+  rfl
+
+/-- Coercion-tag/callee-kind mismatches all fault with `.ub`: `ReifyFnPointer(Safe)` on a closure type, `ClosureFnPointer(Safe)` on a `fnDef` type, and forged `ReifyFnPointer(Safe)` on a `fnDef` naming a linked closure body even with an `(N + 1)`-arg signature. -/
+theorem coerce_wrong_coercion_kind_is_ub :
+    (coerce "ReifyFnPointer(Safe)" sharedClo (.aggregate 0 .nil) fnU32 [V08.Mir.ClosureMatrix.fn_shared_closure_0.body],
+     coerce "ClosureFnPointer(Safe)" (.fnDef "closure_matrix::ct_add" .nil) .unit fnU32 [V08.Mir.ClosureMatrix.ct_add.body],
+     coerce "ReifyFnPointer(Safe)" (.fnDef sharedPath .nil) .unit
+       (.fnPtr [.ref .not sharedClo, u32K] u32K .safe .rust)
+       [V08.Mir.ClosureMatrix.fn_shared_closure_0.body]) =
+      (.ub, .ub, .ub) := by
+  rfl
+
+/-- Inline `const_eval_select` rejects a forged `.closure` runtime target naming a linked non-closure `fn` item with `.ub` (never executing it and never returning `.unsupported` when generic). -/
+theorem inline_ces_forged_closure_ty_on_non_closure_is_ub :
+    let genFn : CapturedMir :=
+      { V08.Mir.ClosureMatrix.ct_add.body with
+        defPath := "tests::gen_fn"
+        typeParamCount := 1 }
+    (runWith (cesCaller (.closure "closure_matrix::ct_add" .nil)) [u32v 5, .aggregate 0 .nil]
+       [V08.Mir.ClosureMatrix.ct_add.body],
+     runWith (cesCaller (.closure "tests::gen_fn" .nil)) [u32v 5, .aggregate 0 .nil]
+       [genFn]) =
+      (.ub, .ub) := by
+  rfl
+
+/-- C5 precedence on inline `const_eval_select` with a linked generic capturing closure body (`typeParamCount = 1`): `.unsupported`, while the non-generic capturing body with forged `.closure capPath .nil` faults with `.ub`. -/
+theorem inline_ces_generic_capturing_is_unsupported_not_ub :
+    let genCap : CapturedMir :=
+      { V08.Mir.ClosureMatrix.capturing_direct_closure_0.body with typeParamCount := 1 }
+    (runWith (cesCaller (.closure capPath .nil)) [u32v 5, .aggregate 0 .nil] [genCap],
+     runWith (cesCaller (.closure capPath .nil)) [u32v 5, .aggregate 0 .nil]
+       [V08.Mir.ClosureMatrix.capturing_direct_closure_0.body]) =
+      (.unsupported, .ub) := by
   rfl
 
 end Anneal.ClosureFnPtrTests.V08

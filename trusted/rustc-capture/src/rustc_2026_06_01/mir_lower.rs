@@ -2762,7 +2762,10 @@ pub fn is_capturable_local_closure(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 ///
 /// Closure-like items are never intrinsics and have no item name, so the
 /// intrinsic test is skipped for them (`tcx.item_name` panics with
-/// `item_name: no name` on a closure `DefId`). `rustc`
+/// `item_name: no name` on a closure `DefId`). As in
+/// [`is_capturable_local_closure`], only plain closures (`Ty::is_closure`) are
+/// admitted among `DefKind::Closure` items, excluding non-local coroutines and
+/// coroutine-closures (`async fn` bodies and `async ||` closures). `rustc`
 /// (`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) documents closure-like items in
 /// [`compiler/rustc_middle/src/ty/util.rs` lines 586–595](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/util.rs#L586-L595):
 ///
@@ -2776,6 +2779,16 @@ pub fn is_capturable_local_closure(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 /// >    /// parent of the closure's `DefId` will also be the context where it appears.
 /// >    pub fn is_closure_like(self, def_id: DefId) -> bool {
 /// >        matches!(self.def_kind(def_id), DefKind::Closure)
+/// >    }
+/// >```
+///
+/// and distinguishes plain closures in
+/// [`compiler/rustc_middle/src/ty/sty.rs` lines 1454–1457](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L1454-L1457):
+///
+/// >```text
+/// >    #[inline]
+/// >    pub fn is_closure(self) -> bool {
+/// >        matches!(self.kind(), Closure(..))
 /// >    }
 /// >```
 ///
@@ -2795,7 +2808,16 @@ pub fn should_capture_non_local_callee(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     if tcx.is_foreign_item(def_id) || tcx.is_constructor(def_id) {
         return false;
     }
-    if !tcx.is_closure_like(def_id) && tcx.is_intrinsic(def_id, tcx.item_name(def_id)) {
+    if tcx.is_closure_like(def_id) {
+        if !tcx
+            .type_of(def_id)
+            .instantiate_identity()
+            .skip_norm_wip()
+            .is_closure()
+        {
+            return false;
+        }
+    } else if tcx.is_intrinsic(def_id, tcx.item_name(def_id)) {
         return false;
     }
     if !tcx.is_mir_available(def_id) {

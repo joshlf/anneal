@@ -15220,7 +15220,7 @@ closures, to `fn` pointers (the Rust ABI) "with the matching signature"; the
 closure body's own ABI is the Rust calling convention (the `rust-call`
 closure signature canonicalizes to `CanonAbi::Rust`). Step 2 keeps the existing
 leniency for unlinked bodies, which are only reached through external calls.
-Step 3 is a modeling choice that fails closed with `.unsupported`, never
+Step 4 is a modeling choice that fails closed with `.unsupported`, never
 `.ub`, because a generic closure is well formed in Rust. The `Safety`
 compatibility of the coercion tag is checked by the caller
 (`reifyCoercionSafetyCompatible`).
@@ -15270,7 +15270,9 @@ present) is compatible with the target function-pointer signature
 1. Resolves `(p, typeArgs)` via `resolveCalleeBodyAndArgs?` across both direct
    `callees` and `TraitImplEntry` tables (`extraTraitImpls` and `c.traitImpls`).
 2. Rejects `CallConv.rustIntrinsic` callees (compiler intrinsics cannot be
-   coerced to function pointers).
+   coerced to function pointers) and linked closure bodies
+   (`calleeOwnClosureShape? c ≠ .none`, which must coerce through
+   `PointerCoercion::ClosureFnPointer`, never `ReifyFnPointer`).
 3. Requires `length fnInputs == c.argCount` and `callConvEq fnAbi c.fnAbi.conv`.
 4. Requires `length effectiveTypeArgs == c.typeParamCount` and checks
    `calleeLocalDeclsCompatible` on `c.localDecls` (instantiated with
@@ -15281,6 +15283,14 @@ Reference (The Rust Reference, "Function pointer types"):
 
 > "Two function pointer types are compatible if they have the same ABI, safety,
 > parameter types, and return type."
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L11-L21>
+
+> "/// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+> /// It cannot convert an unsafe fn-item to a safe fn pointer.
+> ReifyFnPointer(hir::Safety),"
 -/
 def checkCalleeSig
     (callees : List CapturedMir)
@@ -15324,7 +15334,11 @@ def checkCalleeSig
           (Nat.beq (length fnInputs) c.argCount)
           (Bool.and
             (callConvEq fnAbi c.fnAbi.conv)
-            declsCompatible))
+            (Bool.and
+              (match calleeOwnClosureShape? c with
+               | .none => true
+               | .some _ => false)
+              declsCompatible)))
 
 /--
 Evaluate `CastKind.pointerCoercion "UnsafeFnPointer"`, coercing a safe

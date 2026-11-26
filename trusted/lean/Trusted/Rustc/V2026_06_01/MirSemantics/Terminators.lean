@@ -2891,10 +2891,15 @@ def unpackConstEvalSelectArgs?
 
 /--
 Resolve the closure type `RigidTy.closure defPath .nil` of a non-capturing
-`const_eval_select` runtime target to the callee `(defPath, .nil)`, unless the
-linked closure body `defPath` in `callees` is generic (`typeParamCount > 0`),
-in which case `.none`: the closure type carries no parent generic arguments,
-so its instantiation is unknown (see `constEvalSelectUnresolvedFailure`).
+`const_eval_select` runtime target to the callee `(defPath, .nil)`:
+- Unlinked (`findCallee? callees defPath = .none`): `.some (defPath, .nil)`
+  (preserving external-call dispatch).
+- Linked non-closure body (`calleeOwnClosureShape? c = .none`): `.none`, so
+  forged `.closure` types naming a `fn` item fault with `.ub`.
+- Linked generic closure body (`calleeOwnClosureShape? c = .some _`,
+  `c.typeParamCount > 0`): `.none`, so `constEvalSelectUnresolvedFailure`
+  reports `.unsupported` because parent generic arguments are not carried.
+- Linked non-generic closure body (`c.typeParamCount = 0`): `.some (defPath, .nil)`.
 
 Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
 <https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
@@ -2907,6 +2912,8 @@ Justification: `rustc-capture` lowers closure types with their captured-path
 types only (`ClosureArgs::upvar_tys`), so a non-capturing closure type names
 its body and no type arguments; parent generic arguments are dropped (a
 modeling choice), which is why a generic body cannot be instantiated here.
+Rejecting linked non-closure bodies prevents a forged `.closure` type from
+dispatching to a `fn` item or masking the fault as `.unsupported`.
 -/
 @[reducible]
 def nonGenericClosureTarget?
@@ -2916,9 +2923,12 @@ def nonGenericClosureTarget?
   match findCallee? callees defPath with
   | .none => .some (defPath, .nil)
   | .some c =>
-    match c.typeParamCount with
-    | 0 => .some (defPath, .nil)
-    | .succ _ => .none
+    match calleeOwnClosureShape? c with
+    | .none => .none
+    | .some _ =>
+      match c.typeParamCount with
+      | 0 => .some (defPath, .nil)
+      | .succ _ => .none
 
 /--
 Resolve the runtime target function `called_at_rt : G` (the 3rd argument) of
@@ -3111,13 +3121,13 @@ def constEvalSelectUnresolvedFailure
   | .some (.closure p .nil) =>
     match rtFnVal with
     | .unit =>
-      match nonGenericClosureTarget? s.memory.callees p with
-      | .none => .unsupported
-      | .some _ => .ub
+      match isGenericClosureArityMismatch s.memory.callees p .nil with
+      | true => .unsupported
+      | false => .ub
     | .aggregate 0 .nil =>
-      match nonGenericClosureTarget? s.memory.callees p with
-      | .none => .unsupported
-      | .some _ => .ub
+      match isGenericClosureArityMismatch s.memory.callees p .nil with
+      | true => .unsupported
+      | false => .ub
     | _ => .ub
   | _ => .ub
 

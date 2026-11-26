@@ -678,6 +678,123 @@ pub fn unrelated(x: u32) -> u32 {
     }
 
     #[test]
+    fn driver_captures_non_local_plain_closure_and_skips_non_local_async_coroutine() {
+        let temp_root = unique_temp_dir("nonlocal-closure-vs-async");
+        let dep_out = temp_root.join("dep_out");
+        let app_out = temp_root.join("app_out");
+        let capture_dir = temp_root.join("capture");
+        fs::create_dir_all(&dep_out).expect("create dep_out");
+        fs::create_dir_all(&app_out).expect("create app_out");
+        fs::create_dir_all(&capture_dir).expect("create capture_dir");
+
+        let dep_src = temp_root.join("dep.rs");
+        fs::write(
+            &dep_src,
+            br#"#![allow(dead_code)]
+
+#[inline]
+pub fn run_nonlocal_closure(x: u32) -> u32 {
+    let f: fn(u32) -> u32 = |v: u32| v.wrapping_mul(3).wrapping_add(7);
+    f(x)
+}
+
+#[inline]
+pub async fn nonlocal_async(x: u32) -> u32 {
+    x.wrapping_add(1)
+}
+"#,
+        )
+        .expect("write dep.rs");
+
+        let dep_args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "dep_clos".to_owned(),
+            "--crate-type".to_owned(),
+            "rlib".to_owned(),
+            "--edition=2021".to_owned(),
+            "--out-dir".to_owned(),
+            dep_out.to_string_lossy().into_owned(),
+            dep_src.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(
+            run_with_args_and_filter(&dep_args, None, None, None),
+            0,
+            "building dependency rlib must succeed"
+        );
+
+        let dep_rlib = dep_out.join("libdep_clos.rlib");
+        let app_src = temp_root.join("app.rs");
+        fs::write(
+            &app_src,
+            br#"#![allow(dead_code)]
+extern crate dep_clos;
+
+pub fn call_dep_indirect(x: u32) -> u32 {
+    dep_clos::run_nonlocal_closure(x)
+}
+
+pub fn call_dep_async(x: u32) -> impl core::future::Future<Output = u32> {
+    dep_clos::nonlocal_async(x)
+}
+"#,
+        )
+        .expect("write app.rs");
+
+        let app_args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "app_clos".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            "--edition=2021".to_owned(),
+            "-Zmir-opt-level=0".to_owned(),
+            "-C".to_owned(),
+            "debug-assertions=off".to_owned(),
+            "-C".to_owned(),
+            "overflow-checks=on".to_owned(),
+            "--extern".to_owned(),
+            format!("dep_clos={}", dep_rlib.display()),
+            "-L".to_owned(),
+            format!("dependency={}", dep_out.display()),
+            "--out-dir".to_owned(),
+            app_out.to_string_lossy().into_owned(),
+            app_src.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(
+            run_with_args_and_filter(&app_args, Some(capture_dir.clone()), None, None),
+            0,
+            "capturing app_clos must succeed without ICE"
+        );
+
+        let unit_dir = capture_dir.join("app_clos");
+        let manifest_json = fs::read_to_string(unit_dir.join("UnitCaptureManifest.json"))
+            .expect("read app_clos manifest");
+        let manifest =
+            UnitCaptureManifest::from_json_str(&manifest_json).expect("parse app_clos manifest");
+        assert!(manifest.compilation_succeeded);
+
+        let plain_clo = find_target(&manifest, "dep_clos::run_nonlocal_closure::{closure#0}");
+        assert_eq!(plain_clo.item_kind, CapturedItemKind::Callee);
+        let plain_lean = read_target_lean(&unit_dir, plain_clo);
+        assert!(plain_lean.contains("conv := CallConv.rust, canUnwind := true"));
+        assert!(plain_lean.contains(
+            "(RigidTy.closure \"dep_clos::run_nonlocal_closure::{closure#0}\" List.nil)"
+        ));
+
+        assert!(
+            !manifest
+                .unit_targets
+                .iter()
+                .any(|t| t.target.def_id == "dep_clos::nonlocal_async::{closure#0}"),
+            "non-local async coroutine must not be captured as a plain closure callee"
+        );
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn driver_captures_unit_manifest_and_mir_lean_modules() {
         let temp_root = unique_temp_dir("integration");
         let capture_dir = temp_root.join("capture");
