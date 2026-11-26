@@ -4303,8 +4303,11 @@ def writeIntrinsicReturnWithProtectors
 
 /--
 Resolve the pointee `Ty` (preserving a consistent `layoutIdx` from the first
-pointer operand when it matches `elemTy`) for pointer-parameterized memory
-intrinsics (`typed_swap_nonoverlapping<T>`).
+pointer operand only when its `TypeLayout` is a consistent pointer layout with
+an explicit pointee entry matching `elemTy`, never adopting synthetic
+`layoutIdx = 0` from `pointeeTyOf` or `const_eval_select` `.zeroSized` dummy
+operands) for pointer-parameterized memory intrinsics
+(`typed_swap_nonoverlapping<T>`).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -4320,13 +4323,50 @@ def resolveIntrinsicPointeeFullTy
     Ty :=
   match argOps with
   | ptrOp :: _ =>
-    match operandPointeeTy bodyLocalDecls bodyLayouts ptrOp with
-    | .some pt =>
-      match rigidTyEq pt.kind elemTy with
-      | true => pt
-      | false => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
-    | .none => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+    match ptrOp with
+    | .constant { val := .zeroSized, .. } =>
+      { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+    | _ =>
+      match operandTyResolved bodyLocalDecls bodyLayouts ptrOp with
+      | .some ptrTy =>
+        match pointeeTyOf ptrTy with
+        | .some pt =>
+          match rigidTyEq pt.kind elemTy with
+          | false => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+          | true =>
+            match LayoutTable.lookup bodyLayouts ptrTy.layoutIdx with
+            | .some ptrLayout =>
+              match isConsistentPtrLayout bodyLayouts ptrLayout, ptrLayout.fieldLayouts with
+              | true, ptLayoutIdx :: .nil =>
+                { kind := elemTy, layoutIdx := ptLayoutIdx }
+              | _, _ => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+            | .none => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+        | .none => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+      | .none => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
   | .nil => { kind := elemTy, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+
+/--
+Check alignment on both pointer arguments of a two-pointer intrinsic without
+letting `.unsupported` on the first pointer mask definite `.ub` on the second.
+-/
+def checkPtrPairAligned
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (ptrA ptrB : Value)
+    (reqAlign : Nat)
+    (nonZeroAccess : Bool) :
+    MemOpRes Unit :=
+  match
+    checkPtrArgAligned s locals bodyLocalDecls bodyLayouts ptrA reqAlign nonZeroAccess,
+    checkPtrArgAligned s locals bodyLocalDecls bodyLayouts ptrB reqAlign nonZeroAccess
+  with
+  | .ub, _ => .ub
+  | _, .ub => .ub
+  | .unsupported, _ => .unsupported
+  | _, .unsupported => .unsupported
+  | .ok (), .ok () => .ok ()
 
 /--
 Apply an exact-range Tree Borrows read transition for endpoint `ep` over
@@ -4506,30 +4546,22 @@ def evalCopyCall
             match Nat.beq elemSize 0 with
             | true =>
               match
-                checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts srcVal elemAlign false
+                checkPtrPairAligned s locals' bodyLocalDecls bodyLayouts srcVal dstVal elemAlign false
               with
               | .ub => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
               | .ok () =>
-                match
-                  checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts dstVal elemAlign false
-                with
-                | .ub => MirStepNode.fail .ub
-                | .unsupported => MirStepNode.unsupported
-                | .ok () =>
-                  writeIntrinsicReturnWithProtectors
-                    s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
+                writeIntrinsicReturnWithProtectors
+                  s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
             | false =>
               match countRes with
               | .ub => MirStepNode.fail .ub
               | .unsupported =>
                 match
-                  checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts srcVal elemAlign false,
-                  checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts dstVal elemAlign false
+                  checkPtrPairAligned s locals' bodyLocalDecls bodyLayouts srcVal dstVal elemAlign false
                 with
-                | .ub, _ => MirStepNode.fail .ub
-                | _, .ub => MirStepNode.fail .ub
-                | _, _ => MirStepNode.unsupported
+                | .ub => MirStepNode.fail .ub
+                | _ => MirStepNode.unsupported
               | .ok count =>
                 let byteCount := Nat.mul count elemSize
                 match Nat.ble byteCount isizeMax with
@@ -4538,53 +4570,41 @@ def evalCopyCall
                   match Nat.beq byteCount 0 with
                   | true =>
                     match
-                      checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts srcVal elemAlign false
+                      checkPtrPairAligned s locals' bodyLocalDecls bodyLayouts srcVal dstVal elemAlign false
                     with
                     | .ub => MirStepNode.fail .ub
                     | .unsupported => MirStepNode.unsupported
                     | .ok () =>
-                      match
-                        checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts dstVal elemAlign false
-                      with
-                      | .ub => MirStepNode.fail .ub
-                      | .unsupported => MirStepNode.unsupported
-                      | .ok () =>
-                        writeIntrinsicReturnWithProtectors
-                          s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
+                      writeIntrinsicReturnWithProtectors
+                        s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
                   | false =>
                     match Bool.or srcNull dstNull with
                     | true => MirStepNode.fail .ub
                     | false =>
                       match
-                        checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts srcVal elemAlign true
+                        checkPtrPairAligned s locals' bodyLocalDecls bodyLayouts srcVal dstVal elemAlign true
                       with
                       | .ub => MirStepNode.fail .ub
                       | .unsupported => MirStepNode.unsupported
                       | .ok () =>
-                        match
-                          checkPtrArgAligned s locals' bodyLocalDecls bodyLayouts dstVal elemAlign true
-                        with
-                        | .ub => MirStepNode.fail .ub
-                        | .unsupported => MirStepNode.unsupported
-                        | .ok () =>
-                          match srcVal, dstVal with
-                          | .ptr srcPtr _, .ptr dstPtr _ =>
-                            match
-                              evalCopyMemory
-                                s locals' bodyLocalDecls bodyLayouts srcPtr dstPtr byteCount
-                            with
-                            | .ub => MirStepNode.fail .ub
-                            | .unsupported => MirStepNode.unsupported
-                            | .ok (locals₂, mem₂) =>
-                              writeIntrinsicReturnWithProtectors
-                                { s with memory := mem₂ }
-                                bodyLocalDecls
-                                bodyLayouts
-                                locals₂
-                                destination
-                                targetOpt
-                                .unit
-                          | _, _ => MirStepNode.fail .ub
+                        match srcVal, dstVal with
+                        | .ptr srcPtr _, .ptr dstPtr _ =>
+                          match
+                            evalCopyMemory
+                              s locals' bodyLocalDecls bodyLayouts srcPtr dstPtr byteCount
+                          with
+                          | .ub => MirStepNode.fail .ub
+                          | .unsupported => MirStepNode.unsupported
+                          | .ok (locals₂, mem₂) =>
+                            writeIntrinsicReturnWithProtectors
+                              { s with memory := mem₂ }
+                              bodyLocalDecls
+                              bodyLayouts
+                              locals₂
+                              destination
+                              targetOpt
+                              .unit
+                        | _, _ => MirStepNode.fail .ub
           | _, _, _ => MirStepNode.unsupported
   | _ => MirStepNode.fail .ub
 
@@ -4803,29 +4823,22 @@ def evalRawEqCall
             | true, .some elemSize, .some elemAlign =>
               let isZero := Nat.beq elemSize 0
               match
-                checkPtrArgAligned
-                  s locals' bodyLocalDecls bodyLayouts aVal elemAlign (Bool.not isZero)
+                checkPtrPairAligned
+                  s locals' bodyLocalDecls bodyLayouts aVal bVal elemAlign (Bool.not isZero)
               with
               | .ub => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
               | .ok () =>
-                match
-                  checkPtrArgAligned
-                    s locals' bodyLocalDecls bodyLayouts bVal elemAlign (Bool.not isZero)
-                with
-                | .ub => MirStepNode.fail .ub
-                | .unsupported => MirStepNode.unsupported
-                | .ok () =>
-                  match isZero with
+                match isZero with
+                | true =>
+                  writeIntrinsicReturnWithProtectors
+                    s bodyLocalDecls bodyLayouts locals' destination targetOpt (.scalar ⟨1, 1⟩)
+                | false =>
+                  match Nat.ble elemSize isizeMax with
+                  | false => MirStepNode.fail .ub
                   | true =>
-                    writeIntrinsicReturnWithProtectors
-                      s bodyLocalDecls bodyLayouts locals' destination targetOpt (.scalar ⟨1, 1⟩)
-                  | false =>
-                    match Nat.ble elemSize isizeMax with
-                    | false => MirStepNode.fail .ub
-                    | true =>
-                      match aVal, bVal with
-                      | .ptr aPtr _, .ptr bPtr _ =>
+                    match aVal, bVal with
+                    | .ptr aPtr _, .ptr bPtr _ =>
                         match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts aPtr with
                         | .ub => MirStepNode.fail .ub
                         | .unsupported => MirStepNode.unsupported
@@ -4903,6 +4916,61 @@ def evalRawEqCall
             | _, _, _ => MirStepNode.unsupported
         | _, _ => MirStepNode.fail .ub
   | _ => MirStepNode.fail .ub
+
+/--
+Read both root abstract-byte images for `typed_swap_nonoverlapping`, validate
+both `elemSize`-byte slices against `elemTyFull` using `TypedValidity.combine`
+(so definite `.ub` in either slice is never masked by `.unsupported` in the
+other), and reset padding bytes in both slices before commit.
+-/
+def readValidateAndPrepareSwapSlices
+    (memX memY : Memory)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (elemTyFull : Ty)
+    (xEp yEp : ResolvedMemEndpoint)
+    (elemSize : Nat) :
+    MemOpRes ((List AbstractByte × List AbstractByte) × (List AbstractByte × List AbstractByte)) :=
+  let xPair : MemOpRes (List AbstractByte × List AbstractByte) :=
+    match readRootAbstractBytes memX xEp with
+    | .none => .unsupported
+    | .some xRootBytes =>
+      match sliceAbstractBytes xRootBytes xEp.effOff elemSize with
+      | .none => .ub
+      | .some xSlice => .ok (xRootBytes, xSlice)
+  let yPair : MemOpRes (List AbstractByte × List AbstractByte) :=
+    match readRootAbstractBytes memY yEp with
+    | .none => .unsupported
+    | .some yRootBytes =>
+      match sliceAbstractBytes yRootBytes yEp.effOff elemSize with
+      | .none => .ub
+      | .some ySlice => .ok (yRootBytes, ySlice)
+  let xValRes : TypedValidity :=
+    match xPair with
+    | .ub => .ub
+    | .unsupported => .unsupported
+    | .ok (_, xSlice) =>
+      validateTypedBytes memX bodyLocalDecls bodyLayouts defaultCodecFuel elemTyFull xSlice
+  let yValRes : TypedValidity :=
+    match yPair with
+    | .ub => .ub
+    | .unsupported => .unsupported
+    | .ok (_, ySlice) =>
+      validateTypedBytes memY bodyLocalDecls bodyLayouts defaultCodecFuel elemTyFull ySlice
+  match TypedValidity.combine xValRes fun _ => yValRes with
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .valid =>
+    match xPair, yPair with
+    | .ok (xRootBytes, xSlice), .ok (yRootBytes, ySlice) =>
+      match
+        resetTypedPaddingBytes defaultCodecFuel bodyLocalDecls bodyLayouts elemTyFull xSlice,
+        resetTypedPaddingBytes defaultCodecFuel bodyLocalDecls bodyLayouts elemTyFull ySlice
+      with
+      | .some xStored, .some yStored => .ok ((xRootBytes, xStored), (yRootBytes, yStored))
+      | _, _ => .unsupported
+    | _, _ => .unsupported
+
 
 /--
 Evaluate a direct call to `core::intrinsics::typed_swap_nonoverlapping<T>(x:
@@ -4994,210 +5062,215 @@ def evalTypedSwapNonOverlappingCall
             | true, .some elemSize, .some elemAlign =>
               let isZero := Nat.beq elemSize 0
               match
-                checkPtrArgAligned
-                  s locals' bodyLocalDecls bodyLayouts xVal elemAlign (Bool.not isZero)
+                checkPtrPairAligned
+                  s locals' bodyLocalDecls bodyLayouts xVal yVal elemAlign (Bool.not isZero)
               with
               | .ub => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
               | .ok () =>
-                match
-                  checkPtrArgAligned
-                    s locals' bodyLocalDecls bodyLayouts yVal elemAlign (Bool.not isZero)
-                with
-                | .ub => MirStepNode.fail .ub
-                | .unsupported => MirStepNode.unsupported
-                | .ok () =>
-                  match isZero with
+                match isZero with
+                | true =>
+                  writeIntrinsicReturnWithProtectors
+                    s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
+                | false =>
+                  match Nat.ble elemSize isizeMax with
+                  | false => MirStepNode.fail .ub
                   | true =>
-                    writeIntrinsicReturnWithProtectors
-                      s bodyLocalDecls bodyLayouts locals' destination targetOpt .unit
-                  | false =>
-                    match Nat.ble elemSize isizeMax with
-                    | false => MirStepNode.fail .ub
-                    | true =>
-                      match xVal, yVal with
-                      | .ptr xPtr _, .ptr yPtr _ =>
-                        match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts xPtr with
-                        | .ub => MirStepNode.fail .ub
-                        | .unsupported => MirStepNode.unsupported
-                        | .ok xEp =>
-                          match Nat.ble (Nat.add xEp.effOff elemSize) xEp.allocSize with
+                    match xVal, yVal with
+                    | .ptr xPtr _, .ptr yPtr _ =>
+                      match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts xPtr with
+                      | .ub => MirStepNode.fail .ub
+                      | .unsupported => MirStepNode.unsupported
+                      | .ok xEp =>
+                        match Nat.ble (Nat.add xEp.effOff elemSize) xEp.allocSize with
+                        | false => MirStepNode.fail .ub
+                        | true =>
+                          let xWritable : Bool :=
+                            match xEp.globalAlloc? with
+                            | .some g => match g.mutability with | .mut => true | .not => false
+                            | .none => true
+                          match xWritable with
                           | false => MirStepNode.fail .ub
                           | true =>
-                            let xWritable : Bool :=
-                              match xEp.globalAlloc? with
-                              | .some g => match g.mutability with | .mut => true | .not => false
-                              | .none => true
-                            match xWritable with
-                            | false => MirStepNode.fail .ub
-                            | true =>
-                              match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts yPtr with
-                              | .ub => MirStepNode.fail .ub
-                              | .unsupported => MirStepNode.unsupported
-                              | .ok yEp0 =>
-                                match Nat.ble (Nat.add yEp0.effOff elemSize) yEp0.allocSize with
+                            match resolveLiveMemEndpoint s locals' bodyLocalDecls bodyLayouts yPtr with
+                            | .ub => MirStepNode.fail .ub
+                            | .unsupported => MirStepNode.unsupported
+                            | .ok yEp0 =>
+                              match Nat.ble (Nat.add yEp0.effOff elemSize) yEp0.allocSize with
+                              | false => MirStepNode.fail .ub
+                              | true =>
+                                let yWritable : Bool :=
+                                  match yEp0.globalAlloc? with
+                                  | .some g =>
+                                    match g.mutability with | .mut => true | .not => false
+                                  | .none => true
+                                match yWritable with
                                 | false => MirStepNode.fail .ub
                                 | true =>
-                                  let yWritable : Bool :=
-                                    match yEp0.globalAlloc? with
-                                    | .some g =>
-                                      match g.mutability with | .mut => true | .not => false
-                                    | .none => true
-                                  match yWritable with
-                                  | false => MirStepNode.fail .ub
-                                  | true =>
-                                    let sameAlloc := AllocKey.beq xEp.allocKey yEp0.allocKey
-                                    match
-                                      Bool.and sameAlloc
-                                        (Bool.not
-                                          (rangesDisjoint
-                                            xEp.effOff elemSize yEp0.effOff elemSize))
-                                    with
-                                    | true => MirStepNode.fail .ub
-                                    | false =>
-                                      match endpointAccessCheck xEp elemSize with
+                                  let sameAlloc := AllocKey.beq xEp.allocKey yEp0.allocKey
+                                  match
+                                    Bool.and sameAlloc
+                                      (Bool.not
+                                        (rangesDisjoint
+                                          xEp.effOff elemSize yEp0.effOff elemSize))
+                                  with
+                                  | true => MirStepNode.fail .ub
+                                  | false =>
+                                    match endpointAccessCheck xEp elemSize with
+                                    | .ub => MirStepNode.fail .ub
+                                    | .unsupported => MirStepNode.unsupported
+                                    | .ok () =>
+                                      match endpointAccessCheck yEp0 elemSize with
                                       | .ub => MirStepNode.fail .ub
                                       | .unsupported => MirStepNode.unsupported
                                       | .ok () =>
-                                        match endpointAccessCheck yEp0 elemSize with
-                                        | .ub => MirStepNode.fail .ub
-                                        | .unsupported => MirStepNode.unsupported
-                                        | .ok () =>
-                                          match readRootAbstractBytes s.memory xEp with
-                                  | .none => MirStepNode.unsupported
-                                  | .some xRootBytes =>
-                                    match sliceAbstractBytes xRootBytes xEp.effOff elemSize with
-                                    | .none => MirStepNode.fail .ub
-                                    | .some xSlice =>
-                                      match endpointBorrowsAfterRead s.memory xEp elemSize with
-                                      | .none => MirStepNode.fail .ub
-                                      | .some borrows₁ =>
-                                        let mem₁ : Memory := { s.memory with borrows := borrows₁ }
-                                        match
-                                          resolveLiveMemEndpoint
-                                            { s with memory := mem₁ }
-                                            locals' bodyLocalDecls bodyLayouts yPtr
-                                        with
-                                        | .ub => MirStepNode.fail .ub
-                                        | .unsupported => MirStepNode.unsupported
-                                        | .ok yEp₁ =>
-                                          match endpointAccessCheck yEp₁ elemSize with
+                                        match endpointBorrowsAfterRead s.memory xEp elemSize with
+                                        | .none => MirStepNode.fail .ub
+                                        | .some borrows₁ =>
+                                          let mem₁ : Memory := { s.memory with borrows := borrows₁ }
+                                          match
+                                            resolveLiveMemEndpoint
+                                              { s with memory := mem₁ }
+                                              locals' bodyLocalDecls bodyLayouts yPtr
+                                          with
                                           | .ub => MirStepNode.fail .ub
                                           | .unsupported => MirStepNode.unsupported
-                                          | .ok () =>
-                                            match readRootAbstractBytes mem₁ yEp₁ with
-                                            | .none => MirStepNode.unsupported
-                                            | .some yRootBytes =>
-                                              match
-                                                sliceAbstractBytes yRootBytes yEp₁.effOff elemSize
-                                              with
+                                          | .ok yEp₁ =>
+                                            match endpointAccessCheck yEp₁ elemSize with
+                                            | .ub => MirStepNode.fail .ub
+                                            | .unsupported => MirStepNode.unsupported
+                                            | .ok () =>
+                                              match endpointBorrowsAfterRead mem₁ yEp₁ elemSize with
                                               | .none => MirStepNode.fail .ub
-                                              | .some ySlice =>
-                                                match endpointBorrowsAfterRead mem₁ yEp₁ elemSize with
-                                                | .none => MirStepNode.fail .ub
-                                                | .some borrows₂ =>
-                                                  let mem₂ : Memory :=
-                                                    { mem₁ with borrows := borrows₂ }
-                                                  let elemTyFull :=
-                                                    resolveIntrinsicPointeeFullTy
-                                                      bodyLocalDecls bodyLayouts argOps elemTy
-                                                  match
-                                                    validateTypedBytes
-                                                      s.memory bodyLocalDecls bodyLayouts
-                                                      defaultCodecFuel elemTyFull xSlice
-                                                  with
+                                              | .some borrows₂ =>
+                                                let mem₂ : Memory :=
+                                                  { mem₁ with borrows := borrows₂ }
+                                                match
+                                                  resolveLiveMemEndpoint
+                                                    { s with memory := mem₂ }
+                                                    locals' bodyLocalDecls bodyLayouts xPtr
+                                                with
+                                                | .ub => MirStepNode.fail .ub
+                                                | .unsupported => MirStepNode.unsupported
+                                                | .ok xEp₂ =>
+                                                  match endpointAccessCheck xEp₂ elemSize with
                                                   | .ub => MirStepNode.fail .ub
                                                   | .unsupported => MirStepNode.unsupported
-                                                  | .valid =>
+                                                  | .ok () =>
                                                     match
-                                                      validateTypedBytes
-                                                        mem₁ bodyLocalDecls bodyLayouts
-                                                        defaultCodecFuel elemTyFull ySlice
+                                                      endpointBorrowsAfterWrite
+                                                        mem₂ xEp₂ elemSize
                                                     with
-                                                    | .ub => MirStepNode.fail .ub
-                                                    | .unsupported => MirStepNode.unsupported
-                                                    | .valid =>
+                                                    | .none => MirStepNode.fail .ub
+                                                    | .some borrows₃ =>
+                                                      let mem₃ : Memory :=
+                                                        { mem₂ with borrows := borrows₃ }
                                                       match
-                                                        resetTypedPaddingBytes
-                                                          defaultCodecFuel
-                                                          bodyLocalDecls bodyLayouts
-                                                          elemTyFull xSlice,
-                                                        resetTypedPaddingBytes
-                                                          defaultCodecFuel
-                                                          bodyLocalDecls bodyLayouts
-                                                          elemTyFull ySlice
+                                                        resolveLiveMemEndpoint
+                                                          { s with memory := mem₃ }
+                                                          locals' bodyLocalDecls bodyLayouts yPtr
                                                       with
-                                                      | .some xStored, .some yStored =>
+                                                      | .ub => MirStepNode.fail .ub
+                                                      | .unsupported => MirStepNode.unsupported
+                                                      | .ok yEp₃ =>
                                                         match
-                                                          resolveLiveMemEndpoint
-                                                            { s with memory := mem₂ }
-                                                            locals' bodyLocalDecls bodyLayouts xPtr
+                                                          endpointAccessCheck yEp₃ elemSize
                                                         with
                                                         | .ub => MirStepNode.fail .ub
                                                         | .unsupported => MirStepNode.unsupported
-                                                        | .ok xEp₂ =>
-                                                          match endpointAccessCheck xEp₂ elemSize with
-                                                          | .ub => MirStepNode.fail .ub
-                                                          | .unsupported => MirStepNode.unsupported
-                                                          | .ok () =>
+                                                        | .ok () =>
+                                                          match
+                                                            endpointBorrowsAfterWrite
+                                                              mem₃ yEp₃ elemSize
+                                                          with
+                                                          | .none => MirStepNode.fail .ub
+                                                          | .some borrows₄ =>
+                                                            let mem₄ : Memory :=
+                                                              { mem₃ with borrows := borrows₄ }
+                                                            let elemTyFull :=
+                                                              resolveIntrinsicPointeeFullTy
+                                                                bodyLocalDecls bodyLayouts
+                                                                argOps elemTy
                                                             match
-                                                              endpointBorrowsAfterWrite
-                                                                mem₂ xEp₂ elemSize
+                                                              readValidateAndPrepareSwapSlices
+                                                                s.memory mem₁
+                                                                bodyLocalDecls bodyLayouts
+                                                                elemTyFull xEp yEp₁ elemSize
                                                             with
-                                                            | .none => MirStepNode.fail .ub
-                                                            | .some borrows₃ =>
-                                                              let mem₃ : Memory :=
-                                                                { mem₂ with borrows := borrows₃ }
-                                                              match
-                                                                resolveLiveMemEndpoint
-                                                                  { s with memory := mem₃ }
-                                                                  locals' bodyLocalDecls
-                                                                  bodyLayouts yPtr
-                                                              with
-                                                              | .ub => MirStepNode.fail .ub
-                                                              | .unsupported =>
-                                                                MirStepNode.unsupported
-                                                              | .ok yEp₃ =>
-                                                                match
-                                                                  endpointAccessCheck yEp₃ elemSize
-                                                                with
-                                                                | .ub => MirStepNode.fail .ub
-                                                                | .unsupported =>
-                                                                  MirStepNode.unsupported
-                                                                | .ok () =>
-                                                                  match
-                                                                    endpointBorrowsAfterWrite
-                                                                      mem₃ yEp₃ elemSize
-                                                                  with
-                                                                  | .none => MirStepNode.fail .ub
-                                                                  | .some borrows₄ =>
-                                                                    let mem₄ : Memory :=
-                                                                      { mem₃ with
-                                                                        borrows := borrows₄ }
-                                                                    match sameAlloc with
-                                                                    | true =>
+                                                            | .ub => MirStepNode.fail .ub
+                                                            | .unsupported =>
+                                                              MirStepNode.unsupported
+                                                            | .ok ((xRootBytes, xStored),
+                                                                   (yRootBytes, yStored)) =>
+                                                                  match sameAlloc with
+                                                                  | true =>
+                                                                    match
+                                                                      writeAbstractBytesAt
+                                                                        xRootBytes
+                                                                        xEp₂.effOff
+                                                                        yStored
+                                                                    with
+                                                                    | .none => MirStepNode.fail .ub
+                                                                    | .some patched1 =>
                                                                       match
                                                                         writeAbstractBytesAt
-                                                                          xRootBytes
-                                                                          xEp₂.effOff
-                                                                          yStored
+                                                                          patched1
+                                                                          yEp₃.effOff
+                                                                          xStored
                                                                       with
                                                                       | .none =>
                                                                         MirStepNode.fail .ub
-                                                                      | .some patched1 =>
+                                                                      | .some patched2 =>
+                                                                        match
+                                                                          commitRootAbstractBytes
+                                                                            mem₄ locals' xEp₂
+                                                                            patched2
+                                                                        with
+                                                                        | .ub =>
+                                                                          MirStepNode.fail .ub
+                                                                        | .unsupported =>
+                                                                          MirStepNode.unsupported
+                                                                        | .ok (localsF, memF) =>
+                                                                          writeIntrinsicReturnWithProtectors
+                                                                            { s with
+                                                                              memory := memF }
+                                                                            bodyLocalDecls
+                                                                            bodyLayouts
+                                                                            localsF
+                                                                            destination
+                                                                            targetOpt
+                                                                            .unit
+                                                                  | false =>
+                                                                    match
+                                                                      writeAbstractBytesAt
+                                                                        xRootBytes
+                                                                        xEp₂.effOff
+                                                                        yStored
+                                                                    with
+                                                                    | .none => MirStepNode.fail .ub
+                                                                    | .some xPatched =>
+                                                                      match
+                                                                        commitRootAbstractBytes
+                                                                          mem₄ locals' xEp₂
+                                                                          xPatched
+                                                                      with
+                                                                      | .ub => MirStepNode.fail .ub
+                                                                      | .unsupported =>
+                                                                        MirStepNode.unsupported
+                                                                      | .ok (locals₁, mem₄') =>
                                                                         match
                                                                           writeAbstractBytesAt
-                                                                            patched1
+                                                                            yRootBytes
                                                                             yEp₃.effOff
                                                                             xStored
                                                                         with
                                                                         | .none =>
                                                                           MirStepNode.fail .ub
-                                                                        | .some patched2 =>
+                                                                        | .some yPatched =>
                                                                           match
                                                                             commitRootAbstractBytes
-                                                                              mem₄ locals' xEp₂
-                                                                              patched2
+                                                                              mem₄' locals₁ yEp₃
+                                                                              yPatched
                                                                           with
                                                                           | .ub =>
                                                                             MirStepNode.fail .ub
@@ -5213,56 +5286,7 @@ def evalTypedSwapNonOverlappingCall
                                                                               destination
                                                                               targetOpt
                                                                               .unit
-                                                                    | false =>
-                                                                      match
-                                                                        writeAbstractBytesAt
-                                                                          xRootBytes
-                                                                          xEp₂.effOff
-                                                                          yStored
-                                                                      with
-                                                                      | .none =>
-                                                                        MirStepNode.fail .ub
-                                                                      | .some xPatched =>
-                                                                        match
-                                                                          commitRootAbstractBytes
-                                                                            mem₄ locals' xEp₂
-                                                                            xPatched
-                                                                        with
-                                                                        | .ub =>
-                                                                          MirStepNode.fail .ub
-                                                                        | .unsupported =>
-                                                                          MirStepNode.unsupported
-                                                                        | .ok (locals₁, mem₄') =>
-                                                                          match
-                                                                            writeAbstractBytesAt
-                                                                              yRootBytes
-                                                                              yEp₃.effOff
-                                                                              xStored
-                                                                          with
-                                                                          | .none =>
-                                                                            MirStepNode.fail .ub
-                                                                          | .some yPatched =>
-                                                                            match
-                                                                              commitRootAbstractBytes
-                                                                                mem₄' locals₁ yEp₃
-                                                                                yPatched
-                                                                            with
-                                                                            | .ub =>
-                                                                              MirStepNode.fail .ub
-                                                                            | .unsupported =>
-                                                                              MirStepNode.unsupported
-                                                                            | .ok (localsF, memF) =>
-                                                                              writeIntrinsicReturnWithProtectors
-                                                                                { s with
-                                                                                  memory := memF }
-                                                                                bodyLocalDecls
-                                                                                bodyLayouts
-                                                                                localsF
-                                                                                destination
-                                                                                targetOpt
-                                                                                .unit
-                                                      | _, _ => MirStepNode.unsupported
-                      | _, _ => MirStepNode.fail .ub
+                    | _, _ => MirStepNode.fail .ub
             | _, _, _ => MirStepNode.unsupported
         | _, _ => MirStepNode.fail .ub
   | _ => MirStepNode.fail .ub
@@ -5279,13 +5303,18 @@ for `core::intrinsics::ptr_offset_from` / `ptr_offset_from_unsigned`:
   independent of Tree Borrows permissions (`DIV-LM-D6-OFFSET-DISABLED-TAG`).
 - Distinct dead tags of the same root local with empty (or transparent-only)
   projections fault `.ub` when their pointer offsets differ mod `2^W`, and fail
-  closed `.unsupported` when equal (storage generation is not recorded). Dead
-  tags carrying non-empty projections ALWAYS fail closed `.unsupported` without
-  calling `borrowPlaceByteOffset?`: after a frame pop or tail call, the same
-  `(targetFrameDepth, targetLocal)` may name an unrelated local of a later
-  callee (e.g. a tuple where the dead frame held a union), so reading current
-  declarations could fabricate distinct field offsets and falsely report `.ub`
-  on equal-address dangling pointers.
+  closed `.unsupported` when equal (storage generation is not recorded).
+  Modeling choice: Anneal models allocations in a non-reusing symbolic address
+  space (aligned with `lean-miri`'s `offsetIsAddr = false`), so two dead tags
+  cannot accidentally resolve to the same runtime address via stack-slot reuse
+  when their offsets differ; when their offsets are equal, the two dead tags
+  may still stem from the same or different generations, so the check fails
+  closed `.unsupported`. Dead tags carrying non-empty projections ALWAYS fail
+  closed `.unsupported` without calling `borrowPlaceByteOffset?`: after a frame
+  pop or tail call, the same `(targetFrameDepth, targetLocal)` may name an
+  unrelated local of a later callee (e.g. a tuple where the dead frame held a
+  union), so reading current declarations could fabricate distinct field
+  offsets and falsely report `.ub` on equal-address dangling pointers.
 - Provenance tags are resolved in `s.memory.borrows` BEFORE `AllocId`s are
   resolved in `s.memory.globals` (matching `resolveLiveMemEndpoint` and
   `Places.ptrAddress?`), because stack tags and captured global `AllocId`s share
@@ -5313,16 +5342,18 @@ def resolvePtrOffsetFromOffsets
     (ptrVal baseVal : Value) :
     MemOpRes (Nat × Nat) :=
   let ptrBytes := layoutPointerBytes bodyLayouts
+  let modW := scalarModulus ptrBytes
   let intAddrOf : Value → Option Nat := fun v =>
     match v with
     | .scalar sc =>
-      match Nat.beq sc.sizeBytes ptrBytes with
-      | true => .some (Nat.mod sc.bits (scalarModulus ptrBytes))
+      match Bool.and (Nat.beq sc.sizeBytes ptrBytes) (Nat.blt sc.bits modW) with
+      | true => .some sc.bits
       | false => .none
     | .ptr p sz =>
       match Bool.and (Nat.beq sz ptrBytes)
-        (Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p))) with
-      | true => .some (Nat.mod p.offsetBytes (scalarModulus ptrBytes))
+        (Bool.and (Nat.beq p.allocId 0)
+          (Bool.and (Bool.not (isBackedPtr s.memory p)) (Nat.blt p.offsetBytes modW))) with
+      | true => .some p.offsetBytes
       | false => .none
     | _ => .none
   match intAddrOf ptrVal, intAddrOf baseVal with
@@ -5338,7 +5369,14 @@ def resolvePtrOffsetFromOffsets
       match Bool.and (Nat.beq sz1 ptrBytes) (Nat.beq sz2 ptrBytes) with
       | false => .ub
       | true =>
-        match Bool.and (Nat.beq p1.allocId p2.allocId) (Nat.beq p1.offsetBytes p2.offsetBytes) with
+        match
+          Bool.or
+            (Bool.and (Nat.beq p1.allocId 0) (Bool.not (isBackedPtr s.memory p1)))
+            (Bool.and (Nat.beq p2.allocId 0) (Bool.not (isBackedPtr s.memory p2)))
+        with
+        | true => .ub
+        | false =>
+          match Bool.and (Nat.beq p1.allocId p2.allocId) (Nat.beq p1.offsetBytes p2.offsetBytes) with
         | true => .ok (0, 0)
         | false =>
           match
@@ -5691,7 +5729,7 @@ def evalPtrMaskCall
     | .aggregate 0 (dVal :: mVal :: .nil) =>
       match
         isNullThinPtr s.memory ptrBytes dVal,
-        isValidWidePtrMetaValForWidth ptrBytes mVal,
+        isValidWidePtrMetaValForWidth s.memory ptrBytes mVal,
         decodeUsizeArg? s.memory ptrBytes maskVal
       with
       | .none, _, _ => MirStepNode.fail .ub
@@ -5699,7 +5737,7 @@ def evalPtrMaskCall
       | _, _, .ub => MirStepNode.fail .ub
       | .some _, true, _ => MirStepNode.unsupported
     | .scalar sc =>
-      match Nat.beq sc.sizeBytes ptrBytes with
+      match Bool.and (Nat.beq sc.sizeBytes ptrBytes) (Nat.blt sc.bits modW) with
       | false => MirStepNode.fail .ub
       | true =>
         match decodeUsizeArg? s.memory ptrBytes maskVal with
@@ -5713,49 +5751,58 @@ def evalPtrMaskCall
       match Nat.beq sz ptrBytes with
       | false => MirStepNode.fail .ub
       | true =>
-        match decodeUsizeArg? s.memory ptrBytes maskVal with
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
-        | .ok maskBits =>
-          let maskW := Nat.mod maskBits modW
-          match Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p)) with
-          | true =>
-            let masked := bitwiseAndBits ptrBits p.offsetBytes maskW
-            writeIntrinsicReturnWithProtectors
-              s bodyLocalDecls bodyLayouts locals' destination targetOpt
-              (.ptr { allocId := 0, offsetBytes := masked } ptrBytes)
-          | false =>
-            match Bool.and (Nat.beq maskW allOnes) (Nat.blt p.offsetBytes modW) with
+        let isUnbackedInt :=
+          Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr s.memory p))
+        match Bool.and isUnbackedInt (Bool.not (Nat.blt p.offsetBytes modW)) with
+        | true => MirStepNode.fail .ub
+        | false =>
+          match decodeUsizeArg? s.memory ptrBytes maskVal with
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+          | .ok maskBits =>
+            let maskW := Nat.mod maskBits modW
+            match isUnbackedInt with
             | true =>
+              let masked := bitwiseAndBits ptrBits p.offsetBytes maskW
               writeIntrinsicReturnWithProtectors
-                s bodyLocalDecls bodyLayouts locals' destination targetOpt (.ptr p ptrBytes)
+                s bodyLocalDecls bodyLayouts locals' destination targetOpt
+                (.ptr { allocId := 0, offsetBytes := masked } ptrBytes)
             | false =>
-              match resolvePtrAllocAlignAndPlaceOff s locals' bodyLocalDecls bodyLayouts p with
-              | .none => MirStepNode.unsupported
-              | .some (allocAlign, placeOff) =>
-                let relOff := Nat.add placeOff p.offsetBytes
-                match
-                  Bool.and
-                    (Nat.blt (Nat.sub allOnes maskW) allocAlign)
-                    (Nat.blt relOff modW)
-                with
-                | false => MirStepNode.unsupported
-                | true =>
-                  let maskedRel := bitwiseAndBits ptrBits relOff maskW
-                  match Nat.blt maskedRel placeOff with
-                  | true => MirStepNode.unsupported
-                  | false =>
-                    let newOff := Nat.sub maskedRel placeOff
-                    writeIntrinsicReturnWithProtectors
-                      s bodyLocalDecls bodyLayouts locals' destination targetOpt
-                      (.ptr { p with offsetBytes := newOff } ptrBytes)
+              match Bool.and (Nat.beq maskW allOnes) (Nat.blt p.offsetBytes modW) with
+              | true =>
+                writeIntrinsicReturnWithProtectors
+                  s bodyLocalDecls bodyLayouts locals' destination targetOpt (.ptr p ptrBytes)
+              | false =>
+                match resolvePtrAllocAlignAndPlaceOff s locals' bodyLocalDecls bodyLayouts p with
+                | .none => MirStepNode.unsupported
+                | .some (allocAlign, placeOff) =>
+                  let relOff := Nat.add placeOff p.offsetBytes
+                  match
+                    Bool.and
+                      (Nat.ble allocAlign (signedHalfModulus ptrBytes))
+                      (Bool.and
+                        (Nat.blt (Nat.sub allOnes maskW) allocAlign)
+                        (Nat.blt relOff modW))
+                  with
+                  | false => MirStepNode.unsupported
+                  | true =>
+                    let maskedRel := bitwiseAndBits ptrBits relOff maskW
+                    match Nat.blt maskedRel placeOff with
+                    | true => MirStepNode.unsupported
+                    | false =>
+                      let newOff := Nat.sub maskedRel placeOff
+                      writeIntrinsicReturnWithProtectors
+                        s bodyLocalDecls bodyLayouts locals' destination targetOpt
+                        (.ptr { p with offsetBytes := newOff } ptrBytes)
     | _ => MirStepNode.fail .ub
   | _ => MirStepNode.fail .ub
 
 /--
 Resolve the `Ty` of `black_box<T>(dummy: T)` preserving any resolved field
 `layoutIdx` from `operandTyResolved` on `dummyOp` when consistent with
-`target.typeArgs`.
+`target.typeArgs` (stripping synthetic `layoutIdx = 0` on `.zeroSized`
+constants such as `const_eval_select` dummy operands so unrelated `entries[0]`
+layouts are never adopted).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -5771,7 +5818,13 @@ def resolveBlackBoxTy?
     Option Ty :=
   let opTy? : Option Ty :=
     match argOps with
-    | dummyOp :: _ => operandTyResolved bodyLocalDecls bodyLayouts dummyOp
+    | dummyOp :: _ =>
+      match dummyOp with
+      | .constant { ty := cTy, val := .zeroSized } =>
+        match Nat.beq cTy.layoutIdx 0 with
+        | true => .some { kind := cTy.kind, layoutIdx := unresolvedLayoutIdx bodyLayouts }
+        | false => .some cTy
+      | _ => operandTyResolved bodyLocalDecls bodyLayouts dummyOp
     | .nil => .none
   match target.typeArgs with
   | argTy :: _ =>
@@ -5990,7 +6043,8 @@ Dispatch a direct (`target.isIndirect = false`) call to a
 `CallConv.rustIntrinsic` compiler intrinsic in `evalTerminator` when
 `classifyRustIntrinsic? target.defPath` returns `.some kind`: the runtime
 dispatch of `const_eval_select`, the call-form memory intrinsics
-(`evalCopyNonOverlappingCall`, `evalWriteBytesCall`), or a value-returning
+(`evalCopyNonOverlappingCall`, `evalWriteBytesCall`), the 8 core memory &
+pointer intrinsics (`evalCoreMemPtrIntrinsicCall?`), or a value-returning
 intrinsic (`evalNonSelectIntrinsicCall`).
 
 Returns `.none` when `target.defPath` is not an inline-modeled intrinsic so

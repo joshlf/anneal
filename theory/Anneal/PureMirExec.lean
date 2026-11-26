@@ -446,6 +446,12 @@ theorem isNullThinPtr_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂) (w : N
   | ptr p sz => unfold isNullThinPtr; dsimp only; rw [isBackedPtr_congr h]
   | _ => rfl
 
+theorem isValidWidePtrMetaValForWidth_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
+    (w : Nat) (v : Value) :
+    isValidWidePtrMetaValForWidth m₁ w v = isValidWidePtrMetaValForWidth m₂ w v := by
+  unfold isValidWidePtrMetaValForWidth
+  rw [isNullThinPtr_congr h]
+
 theorem decodeUsizeArg?_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂) (w : Nat) (v : Value) :
     decodeUsizeArg? m₁ w v = decodeUsizeArg? m₂ w v := by
   cases v with
@@ -640,8 +646,8 @@ theorem validateBlackBoxValue_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂
   | zero => rfl
   | succ fuel' ih =>
     unfold validateBlackBoxValue
-    simp only [isBackedPtr_congr h, isNullThinPtr_congr h, validateWideMetaValue_congr h,
-      validateValueAtLayoutIdx_congr h, ih]
+    simp only [isBackedPtr_congr h, isNullThinPtr_congr h, isValidWidePtrMetaValForWidth_congr h,
+      validateWideMetaValue_congr h, validateValueAtLayoutIdx_congr h, ih]
 
 theorem resolveLiveMemEndpoint_congr_core {s₁ s₂ : MachineState}
     (h : MemCoreEq s₁.memory s₂.memory) (locals : List LocalSlot)
@@ -651,6 +657,27 @@ theorem resolveLiveMemEndpoint_congr_core {s₁ s₂ : MachineState}
   unfold resolveLiveMemEndpoint
   rw [h.1, h.2.1, h.2.2.2.1, h.2.2.2.2.1]
 
+theorem checkPtrPairAligned_congr_of {s₁ s₂ : MachineState} {locals : List LocalSlot}
+    {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}
+    (h : ∀ v a nz,
+      checkPtrArgAligned s₁ locals bodyLocalDecls bodyLayouts v a nz =
+        checkPtrArgAligned s₂ locals bodyLocalDecls bodyLayouts v a nz)
+    (ptrA ptrB : Value) (reqAlign : Nat) (nonZero : Bool) :
+    checkPtrPairAligned s₁ locals bodyLocalDecls bodyLayouts ptrA ptrB reqAlign nonZero =
+      checkPtrPairAligned s₂ locals bodyLocalDecls bodyLayouts ptrA ptrB reqAlign nonZero := by
+  unfold checkPtrPairAligned
+  rw [h, h]
+
+theorem readValidateAndPrepareSwapSlices_congr
+    {mX₁ mX₂ mY₁ mY₂ : Memory} (hX : MemBGFEq mX₁ mX₂) (hY : MemBGFEq mY₁ mY₂)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (elemTyFull : Ty) (xEp yEp : ResolvedMemEndpoint) (elemSize : Nat) :
+    readValidateAndPrepareSwapSlices mX₁ mY₁ bodyLocalDecls bodyLayouts elemTyFull xEp yEp elemSize =
+      readValidateAndPrepareSwapSlices mX₂ mY₂ bodyLocalDecls bodyLayouts elemTyFull xEp yEp elemSize := by
+  unfold readValidateAndPrepareSwapSlices
+  simp only [readRootAbstractBytes_congr hX, readRootAbstractBytes_congr hY,
+    validateTypedBytes_congr hX, validateTypedBytes_congr hY]
+
 theorem checkPtrArgAligned_congr_core {s₁ s₂ : MachineState}
     (h : MemCoreEq s₁.memory s₂.memory) (locals : List LocalSlot)
     (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
@@ -658,7 +685,7 @@ theorem checkPtrArgAligned_congr_core {s₁ s₂ : MachineState}
     checkPtrArgAligned s₁ locals bodyLocalDecls bodyLayouts ptrVal reqAlign nonZero =
       checkPtrArgAligned s₂ locals bodyLocalDecls bodyLayouts ptrVal reqAlign nonZero := by
   unfold checkPtrArgAligned
-  rw [h.1, h.2.1, h.2.2.2.1, h.2.2.2.2.1]
+  simp only [h.1, h.2.1, h.2.2.2.1, h.2.2.2.2.1, isBackedPtr_congr h.toBGFEq]
 
 theorem resolvePtrOffsetFromOffsets_congr_core {s₁ s₂ : MachineState}
     (h : MemCoreEq s₁.memory s₂.memory) (locals : List LocalSlot)
@@ -959,9 +986,10 @@ private theorem checkPtrArgAligned_borrows_nil
         locals bodyLocalDecls bodyLayouts ptrVal reqAlign nonZero =
       checkPtrArgAligned ms locals bodyLocalDecls bodyLayouts ptrVal reqAlign nonZero := by
   unfold checkPtrArgAligned
+  have hb := isBackedPtr_congr (memBGFEq_pushBaseStack calleeBody baseStack ms.memory)
   dsimp only [MachineState.pushBaseStack]
   rw [Memory.pushBaseStack_borrows, Memory.pushBaseStack_globals, h_nil]
-  cases ptrVal <;> rfl
+  simp only [hb, lookupBorrow]
 
 private theorem resolvePtrOffsetFromOffsets_borrows_nil
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -1540,6 +1568,71 @@ private theorem coreMemPtrStepRel_missingPointee
   · rw [hf]; exact .fail fk
   · rw [hu]; exact .unsupported
 
+private theorem coreMemPtrStepRel_ptrPair
+    {f : Memory → Memory} {P : Memory → Prop} {ms : MachineState}
+    {ld : List LocalDecl} {ly : LayoutTable} {dest : Place} {tOpt : Option BasicBlockIdx}
+    {v1 v2 : Value} {k1 k2 : ProvenancePtr → ProvenancePtr → MirStepNode}
+    (hk : ∀ p1 p2, CoreMemPtrStepRel f P ms ld ly dest tOpt (k1 p1 p2) (k2 p1 p2)) :
+    CoreMemPtrStepRel f P ms ld ly dest tOpt
+      (match v1, v2 with | .ptr p1 _, .ptr p2 _ => k1 p1 p2 | _, _ => MirStepNode.fail .ub)
+      (match v1, v2 with | .ptr p1 _, .ptr p2 _ => k2 p1 p2 | _, _ => MirStepNode.fail .ub) := by
+  cases v1 <;> cases v2 <;> first | exact .fail .ub | exact hk _ _
+
+private theorem coreMemPtrStepRel_memOpUnit
+    {f : Memory → Memory} {P : Memory → Prop} {ms : MachineState}
+    {ld : List LocalDecl} {ly : LayoutTable} {dest : Place} {tOpt : Option BasicBlockIdx}
+    {r : MemOpRes Unit} {n1 n2 : MirStepNode}
+    (hk : CoreMemPtrStepRel f P ms ld ly dest tOpt n1 n2) :
+    CoreMemPtrStepRel f P ms ld ly dest tOpt
+      (match r with | .ub => MirStepNode.fail .ub | .unsupported => MirStepNode.unsupported | .ok () => n1)
+      (match r with | .ub => MirStepNode.fail .ub | .unsupported => MirStepNode.unsupported | .ok () => n2) := by
+  cases r with
+  | ub => exact .fail .ub
+  | unsupported => exact .unsupported
+  | ok u => cases u; exact hk
+
+private theorem coreMemPtrStepRel_boolUb
+    {f : Memory → Memory} {P : Memory → Prop} {ms : MachineState}
+    {ld : List LocalDecl} {ly : LayoutTable} {dest : Place} {tOpt : Option BasicBlockIdx}
+    {b : Bool} {n1 n2 : MirStepNode}
+    (hk : CoreMemPtrStepRel f P ms ld ly dest tOpt n1 n2) :
+    CoreMemPtrStepRel f P ms ld ly dest tOpt
+      (match b with | false => MirStepNode.fail .ub | true => n1)
+      (match b with | false => MirStepNode.fail .ub | true => n2) := by
+  cases b with
+  | false => exact .fail .ub
+  | true => exact hk
+
+private theorem coreMemPtrStepRel_boolUbTrue
+    {f : Memory → Memory} {P : Memory → Prop} {ms : MachineState}
+    {ld : List LocalDecl} {ly : LayoutTable} {dest : Place} {tOpt : Option BasicBlockIdx}
+    {b : Bool} {n1 n2 : MirStepNode}
+    (hk : CoreMemPtrStepRel f P ms ld ly dest tOpt n1 n2) :
+    CoreMemPtrStepRel f P ms ld ly dest tOpt
+      (match b with | true => MirStepNode.fail .ub | false => n1)
+      (match b with | true => MirStepNode.fail .ub | false => n2) := by
+  cases b with
+  | true => exact .fail .ub
+  | false => exact hk
+
+private theorem coreMemPtrStepRel_nonNullPair
+    {f : Memory → Memory} {P : Memory → Prop} {ms : MachineState}
+    {ld : List LocalDecl} {ly : LayoutTable} {dest : Place} {tOpt : Option BasicBlockIdx}
+    {a b : Option Bool} {n1 n2 : MirStepNode}
+    (hk : CoreMemPtrStepRel f P ms ld ly dest tOpt n1 n2) :
+    CoreMemPtrStepRel f P ms ld ly dest tOpt
+      (match a, b with | .some false, .some false => n1 | _, _ => MirStepNode.fail .ub)
+      (match a, b with | .some false, .some false => n2 | _, _ => MirStepNode.fail .ub) := by
+  cases a with
+  | none => exact .fail .ub
+  | some ab =>
+    cases ab with
+    | true => exact .fail .ub
+    | false =>
+      cases b with
+      | none => exact .fail .ub
+      | some bb => cases bb <;> first | exact .fail .ub | exact hk
+
 private theorem evalCopyCall_rel
     (f : Memory → Memory) (P : Memory → Prop) (ms : MachineState)
     (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
@@ -1607,21 +1700,16 @@ private theorem evalCopyCall_rel
                     cases Nat.beq elemSize 0 with
                     | true =>
                       dsimp only
-                      rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts srcVal elemAlign false with
+                      rw [checkPtrPairAligned_congr_of h_al]
+                      cases checkPtrPairAligned ms locals' bodyLocalDecls bodyLayouts srcVal dstVal elemAlign false with
                       | ub => exact .fail .ub
                       | unsupported => exact .unsupported
-                      | ok _ =>
-                        dsimp only
-                        rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts dstVal elemAlign false with
-                        | ub => exact .fail .ub
-                        | unsupported => exact .unsupported
-                        | ok _ => exact .write ms.memory locals' .unit h_P0
+                      | ok _ => exact .write ms.memory locals' .unit h_P0
                     | false =>
                       dsimp only
                       first
-                      | (rw [h_al, h_al]
-                         cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts srcVal elemAlign false <;>
-                         cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts dstVal elemAlign false <;>
+                      | (rw [checkPtrPairAligned_congr_of h_al]
+                         cases checkPtrPairAligned ms locals' bodyLocalDecls bodyLayouts srcVal dstVal elemAlign false <;>
                            first | exact .fail .ub | exact .unsupported)
                       | (rename_i count
                          cases Nat.ble (Nat.mul count elemSize) (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes bodyLayouts)) 2) 1) with
@@ -1631,34 +1719,24 @@ private theorem evalCopyCall_rel
                            cases Nat.beq (Nat.mul count elemSize) 0 with
                            | true =>
                              dsimp only
-                             rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts srcVal elemAlign false with
+                             rw [checkPtrPairAligned_congr_of h_al]
+                             cases checkPtrPairAligned ms locals' bodyLocalDecls bodyLayouts srcVal dstVal elemAlign false with
                              | ub => exact .fail .ub
                              | unsupported => exact .unsupported
-                             | ok _ =>
-                               dsimp only
-                               rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts dstVal elemAlign false with
-                               | ub => exact .fail .ub
-                               | unsupported => exact .unsupported
-                               | ok _ => exact .write ms.memory locals' .unit h_P0
+                             | ok _ => exact .write ms.memory locals' .unit h_P0
                            | false =>
                              dsimp only
                              cases Bool.or srcNull dstNull with
                              | true => exact .fail .ub
                              | false =>
                                dsimp only
-                               rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts srcVal elemAlign true with
+                               rw [checkPtrPairAligned_congr_of h_al]
+                               cases checkPtrPairAligned ms locals' bodyLocalDecls bodyLayouts srcVal dstVal elemAlign true with
                                | ub => exact .fail .ub
                                | unsupported => exact .unsupported
                                | ok _ =>
-                                 dsimp only
-                                 rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts dstVal elemAlign true with
-                                 | ub => exact .fail .ub
-                                 | unsupported => exact .unsupported
-                                 | ok _ =>
                                    dsimp only
-                                   cases srcVal <;> cases dstVal <;> try exact .fail .ub
-                                   rename_i srcPtr _ dstPtr _
-                                   dsimp only
+                                   apply coreMemPtrStepRel_ptrPair; intro srcPtr dstPtr
                                    rcases h_copy srcPtr dstPtr (Nat.mul count elemSize) with ⟨h_cp_eq, h_cp_P⟩
                                    rw [h_cp_eq]
                                    cases h_cm : evalCopyMemory ms locals' bodyLocalDecls bodyLayouts srcPtr dstPtr (Nat.mul count elemSize) with
@@ -1695,126 +1773,94 @@ private theorem evalCompareBytesCall_rel
   · exact .fail .ub
   · dsimp only
     rw [isNullThinPtr_congr h_bgf0, isNullThinPtr_congr h_bgf0]
-    cases isNullThinPtr ms.memory (layoutPointerBytes bodyLayouts) leftVal with
-    | none => exact .fail .ub
-    | some lb =>
-      cases lb with
-      | true => exact .fail .ub
+    apply coreMemPtrStepRel_nonNullPair
+    rw [decodeUsizeArg?_congr h_bgf0]
+    cases decodeUsizeArg? ms.memory (layoutPointerBytes bodyLayouts) lenVal with
+    | ub => exact .fail .ub
+    | unsupported => exact .unsupported
+    | ok byteCount =>
+      dsimp only
+      apply coreMemPtrStepRel_boolUb
+      cases Nat.beq byteCount 0 with
+      | true => exact .write ms.memory locals' (.scalar ⟨0, 4⟩) h_P0
       | false =>
-        cases isNullThinPtr ms.memory (layoutPointerBytes bodyLayouts) rightVal with
-        | none => exact .fail .ub
-        | some rb =>
-          cases rb with
-          | true => exact .fail .ub
-          | false =>
+        dsimp only
+        apply coreMemPtrStepRel_ptrPair; intro leftPtr rightPtr
+        rcases h_ep ms.memory locals' leftPtr h_P0 with ⟨h_ep1, h_E1⟩
+        rw [h_ep1]
+        cases h_l : resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts leftPtr with
+        | ub => exact .fail .ub
+        | unsupported => exact .unsupported
+        | ok leftEp =>
+          dsimp only
+          apply coreMemPtrStepRel_boolUb
+          rcases h_ep ms.memory locals' rightPtr h_P0 with ⟨h_ep0r, _⟩
+          rw [h_ep0r]
+          cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts rightPtr with
+          | ub => exact .fail .ub
+          | unsupported => exact .unsupported
+          | ok rightEp0 =>
             dsimp only
-            rw [decodeUsizeArg?_congr h_bgf0]
-            cases decodeUsizeArg? ms.memory (layoutPointerBytes bodyLayouts) lenVal with
-            | ub => exact .fail .ub
-            | unsupported => exact .unsupported
-            | ok byteCount =>
-              dsimp only
-              cases Nat.ble byteCount (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes bodyLayouts)) 2) 1) with
-              | false => exact .fail .ub
-              | true =>
+            apply coreMemPtrStepRel_boolUb
+            apply coreMemPtrStepRel_memOpUnit
+            rcases h_ebr ms.memory leftEp byteCount h_P0 (h_E1 leftEp h_l) with ⟨h_r1, h_r1p⟩
+            rw [h_r1]
+            cases h_b1 : endpointBorrowsAfterRead ms.memory leftEp byteCount with
+            | none => exact .fail .ub
+            | some borrows₁ =>
+              obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
+              dsimp only; rw [h_fb1]
+              rcases h_ep { ms.memory with borrows := borrows₁ } locals' rightPtr h_P1 with ⟨h_ep2, h_E2⟩
+              rw [h_ep2]
+              cases h_r : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := borrows₁ } }
+                  locals' bodyLocalDecls bodyLayouts rightPtr with
+              | ub => exact .fail .ub
+              | unsupported => exact .unsupported
+              | ok rightEp =>
                 dsimp only
-                cases Nat.beq byteCount 0 with
-                | true => exact .write ms.memory locals' (.scalar ⟨0, 4⟩) h_P0
-                | false =>
-                  dsimp only
-                  cases leftVal <;> cases rightVal <;> try exact .fail .ub
-                  rename_i leftPtr _ rightPtr _
-                  dsimp only
-                  rcases h_ep ms.memory locals' leftPtr h_P0 with ⟨h_ep1, h_E1⟩
-                  rw [h_ep1]
-                  cases h_l : resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts leftPtr with
-                  | ub => exact .fail .ub
-                  | unsupported => exact .unsupported
-                  | ok leftEp =>
+                apply coreMemPtrStepRel_memOpUnit
+                rcases h_ebr { ms.memory with borrows := borrows₁ } rightEp byteCount h_P1 (h_E2 rightEp h_r) with ⟨h_r2, h_r2p⟩
+                rw [h_r2]
+                cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } rightEp byteCount with
+                | none => exact .fail .ub
+                | some borrows₂ =>
+                  obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
+                  have h_fb2' : { f ms.memory with borrows := borrows₂ } =
+                      f { ms.memory with borrows := borrows₂ } :=
+                    Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
+                  have h_bgf2 := h_bgf { ms.memory with borrows := borrows₂ } h_P2
+                  dsimp only at h_fb2' ⊢
+                  rw [readRootAbstractBytes_congr h_bgf0]
+                  cases readRootAbstractBytes ms.memory leftEp with
+                  | none => exact .unsupported
+                  | some lrb =>
                     dsimp only
-                    cases Nat.ble (Nat.add leftEp.effOff byteCount) leftEp.allocSize with
-                    | false => exact .fail .ub
-                    | true =>
+                    cases sliceAbstractBytes lrb leftEp.effOff byteCount with
+                    | none => exact .fail .ub
+                    | some leftSlice =>
                       dsimp only
-                      rcases h_ep ms.memory locals' rightPtr h_P0 with ⟨h_ep0r, _⟩
-                      rw [h_ep0r]
-                      cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts rightPtr with
-                      | ub => exact .fail .ub
-                      | unsupported => exact .unsupported
-                      | ok rightEp0 =>
+                      rw [h_fb2', readRootAbstractBytes_congr h_bgf2]
+                      cases readRootAbstractBytes { ms.memory with borrows := borrows₂ } rightEp with
+                      | none => exact .unsupported
+                      | some rrb =>
                         dsimp only
-                        cases Nat.ble (Nat.add rightEp0.effOff byteCount) rightEp0.allocSize with
-                        | false => exact .fail .ub
-                        | true =>
+                        cases sliceAbstractBytes rrb rightEp.effOff byteCount with
+                        | none => exact .fail .ub
+                        | some rightSlice =>
                           dsimp only
-                          cases endpointAccessCheck leftEp byteCount with
+                          rw [stripProvenanceBytes_congr h_bgf2, stripProvenanceBytes_congr h_bgf2]
+                          cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } leftSlice with
                           | ub => exact .fail .ub
-                          | unsupported => exact .unsupported
-                          | ok _ =>
-                            dsimp only
-                            rcases h_ebr ms.memory leftEp byteCount h_P0 (h_E1 leftEp h_l) with ⟨h_r1, h_r1p⟩
-                            rw [h_r1]
-                            cases h_b1 : endpointBorrowsAfterRead ms.memory leftEp byteCount with
-                            | none => exact .fail .ub
-                            | some borrows₁ =>
-                              obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
-                              dsimp only
-                              rw [h_fb1]
-                              rcases h_ep { ms.memory with borrows := borrows₁ } locals' rightPtr h_P1 with ⟨h_ep2, h_E2⟩
-                              rw [h_ep2]
-                              cases h_r : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := borrows₁ } }
-                                  locals' bodyLocalDecls bodyLayouts rightPtr with
-                              | ub => exact .fail .ub
-                              | unsupported => exact .unsupported
-                              | ok rightEp =>
-                                dsimp only
-                                cases endpointAccessCheck rightEp byteCount with
-                                | ub => exact .fail .ub
-                                | unsupported => exact .unsupported
-                                | ok _ =>
-                                  dsimp only
-                                  rcases h_ebr { ms.memory with borrows := borrows₁ } rightEp byteCount h_P1 (h_E2 rightEp h_r) with ⟨h_r2, h_r2p⟩
-                                  rw [h_r2]
-                                  cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } rightEp byteCount with
-                                  | none => exact .fail .ub
-                                  | some borrows₂ =>
-                                    obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
-                                    have h_fb2' : { f ms.memory with borrows := borrows₂ } =
-                                        f { ms.memory with borrows := borrows₂ } :=
-                                      Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
-                                    have h_bgf2 := h_bgf { ms.memory with borrows := borrows₂ } h_P2
-                                    dsimp only at h_fb2' ⊢
-                                    rw [readRootAbstractBytes_congr h_bgf0]
-                                    cases readRootAbstractBytes ms.memory leftEp with
-                                    | none => exact .unsupported
-                                    | some lrb =>
-                                      dsimp only
-                                      cases sliceAbstractBytes lrb leftEp.effOff byteCount with
-                                      | none => exact .fail .ub
-                                      | some leftSlice =>
-                                        dsimp only
-                                        rw [h_fb2', readRootAbstractBytes_congr h_bgf2]
-                                        cases readRootAbstractBytes { ms.memory with borrows := borrows₂ } rightEp with
-                                        | none => exact .unsupported
-                                        | some rrb =>
-                                          dsimp only
-                                          cases sliceAbstractBytes rrb rightEp.effOff byteCount with
-                                          | none => exact .fail .ub
-                                          | some rightSlice =>
-                                            dsimp only
-                                            rw [stripProvenanceBytes_congr h_bgf2, stripProvenanceBytes_congr h_bgf2]
-                                            cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } leftSlice with
-                                            | ub => exact .fail .ub
-                                            | unsupported =>
-                                              cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } rightSlice with
-                                              | ub => exact .fail .ub
-                                              | unsupported | ok _ => exact .unsupported
-                                            | ok leftRaw =>
-                                              cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } rightSlice with
-                                              | ub => exact .fail .ub
-                                              | unsupported => exact .unsupported
-                                              | ok rightRaw =>
-                                                exact .write { ms.memory with borrows := borrows₂ } locals' _ h_P2
+                          | unsupported =>
+                            cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } rightSlice with
+                            | ub => exact .fail .ub
+                            | unsupported | ok _ => exact .unsupported
+                          | ok leftRaw =>
+                            cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } rightSlice with
+                            | ub => exact .fail .ub
+                            | unsupported => exact .unsupported
+                            | ok rightRaw =>
+                              exact .write { ms.memory with borrows := borrows₂ } locals' _ h_P2
   · exact .fail .ub
 
 private theorem evalRawEqCall_rel
@@ -1866,144 +1912,101 @@ private theorem evalRawEqCall_rel
       | false =>
         dsimp only
         rw [isNullThinPtr_congr h_bgf0, isNullThinPtr_congr h_bgf0]
-        cases isNullThinPtr ms.memory (layoutPointerBytes bodyLayouts) aVal with
-        | none => exact .fail .ub
-        | some ab =>
-          cases ab with
-          | true => exact .fail .ub
-          | false =>
-            cases isNullThinPtr ms.memory (layoutPointerBytes bodyLayouts) bVal with
-            | none => exact .fail .ub
-            | some bb =>
-              cases bb with
-              | true => exact .fail .ub
+        apply coreMemPtrStepRel_nonNullPair
+        apply coreMemPtrStepRel_boolUbTrue
+        cases rigidTyLayoutDeterminedAux bodyLocalDecls bodyLayouts true 8 elemTy with
+        | false => exact .unsupported
+        | true =>
+          cases exactRigidTyByteSize? bodyLocalDecls bodyLayouts elemTy with
+          | none => exact .unsupported
+          | some elemSize =>
+            cases exactRigidTyAlign? bodyLocalDecls bodyLayouts elemTy with
+            | none => exact .unsupported
+            | some elemAlign =>
+              dsimp only
+              rw [checkPtrPairAligned_congr_of h_al]
+              apply coreMemPtrStepRel_memOpUnit
+              cases Nat.beq elemSize 0 with
+              | true => exact .write ms.memory locals' (.scalar ⟨1, 1⟩) h_P0
               | false =>
                 dsimp only
-                cases isUninhabitedRigidTy bodyLocalDecls bodyLayouts 8 elemTy with
-                | true => exact .fail .ub
-                | false =>
+                apply coreMemPtrStepRel_boolUb
+                apply coreMemPtrStepRel_ptrPair; intro aPtr bPtr
+                rcases h_ep ms.memory locals' aPtr h_P0 with ⟨h_ep1, h_E1⟩
+                rw [h_ep1]
+                cases h_a : resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts aPtr with
+                | ub => exact .fail .ub
+                | unsupported => exact .unsupported
+                | ok aEp =>
                   dsimp only
-                  cases rigidTyLayoutDeterminedAux bodyLocalDecls bodyLayouts true 8 elemTy with
-                  | false => exact .unsupported
-                  | true =>
-                    cases exactRigidTyByteSize? bodyLocalDecls bodyLayouts elemTy with
-                    | none => exact .unsupported
-                    | some elemSize =>
-                      cases exactRigidTyAlign? bodyLocalDecls bodyLayouts elemTy with
-                      | none => exact .unsupported
-                      | some elemAlign =>
+                  apply coreMemPtrStepRel_boolUb
+                  rcases h_ep ms.memory locals' bPtr h_P0 with ⟨h_ep0b, _⟩
+                  rw [h_ep0b]
+                  cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts bPtr with
+                  | ub => exact .fail .ub
+                  | unsupported => exact .unsupported
+                  | ok bEp0 =>
+                    dsimp only
+                    apply coreMemPtrStepRel_boolUb
+                    apply coreMemPtrStepRel_memOpUnit
+                    rcases h_ebr ms.memory aEp elemSize h_P0 (h_E1 aEp h_a) with ⟨h_r1, h_r1p⟩
+                    rw [h_r1]
+                    cases h_b1 : endpointBorrowsAfterRead ms.memory aEp elemSize with
+                    | none => exact .fail .ub
+                    | some borrows₁ =>
+                      obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
+                      dsimp only; rw [h_fb1]
+                      rcases h_ep { ms.memory with borrows := borrows₁ } locals' bPtr h_P1 with ⟨h_ep2, h_E2⟩
+                      rw [h_ep2]
+                      cases h_b : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := borrows₁ } }
+                          locals' bodyLocalDecls bodyLayouts bPtr with
+                      | ub => exact .fail .ub
+                      | unsupported => exact .unsupported
+                      | ok bEp =>
                         dsimp only
-                        rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts aVal elemAlign (Bool.not (Nat.beq elemSize 0)) with
-                        | ub => exact .fail .ub
-                        | unsupported => exact .unsupported
-                        | ok _ =>
-                          dsimp only
-                          rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts bVal elemAlign (Bool.not (Nat.beq elemSize 0)) with
-                          | ub => exact .fail .ub
-                          | unsupported => exact .unsupported
-                          | ok _ =>
+                        apply coreMemPtrStepRel_memOpUnit
+                        rcases h_ebr { ms.memory with borrows := borrows₁ } bEp elemSize h_P1 (h_E2 bEp h_b) with ⟨h_r2, h_r2p⟩
+                        rw [h_r2]
+                        cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } bEp elemSize with
+                        | none => exact .fail .ub
+                        | some borrows₂ =>
+                          obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
+                          have h_fb2' : { f ms.memory with borrows := borrows₂ } =
+                              f { ms.memory with borrows := borrows₂ } :=
+                            Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
+                          have h_bgf2 := h_bgf { ms.memory with borrows := borrows₂ } h_P2
+                          dsimp only at h_fb2' ⊢
+                          rw [readRootAbstractBytes_congr h_bgf0]
+                          cases readRootAbstractBytes ms.memory aEp with
+                          | none => exact .unsupported
+                          | some arb =>
                             dsimp only
-                            cases Nat.beq elemSize 0 with
-                            | true => exact .write ms.memory locals' (.scalar ⟨1, 1⟩) h_P0
-                            | false =>
+                            cases sliceAbstractBytes arb aEp.effOff elemSize with
+                            | none => exact .fail .ub
+                            | some aSlice =>
                               dsimp only
-                              cases Nat.ble elemSize (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes bodyLayouts)) 2) 1) with
-                              | false => exact .fail .ub
-                              | true =>
+                              rw [h_fb2', readRootAbstractBytes_congr h_bgf2]
+                              cases readRootAbstractBytes { ms.memory with borrows := borrows₂ } bEp with
+                              | none => exact .unsupported
+                              | some brb =>
                                 dsimp only
-                                cases aVal <;> cases bVal <;> try exact .fail .ub
-                                rename_i aPtr _ bPtr _
-                                dsimp only
-                                rcases h_ep ms.memory locals' aPtr h_P0 with ⟨h_ep1, h_E1⟩
-                                rw [h_ep1]
-                                cases h_a : resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts aPtr with
-                                | ub => exact .fail .ub
-                                | unsupported => exact .unsupported
-                                | ok aEp =>
+                                cases sliceAbstractBytes brb bEp.effOff elemSize with
+                                | none => exact .fail .ub
+                                | some bSlice =>
                                   dsimp only
-                                  cases Nat.ble (Nat.add aEp.effOff elemSize) aEp.allocSize with
-                                  | false => exact .fail .ub
-                                  | true =>
-                                    dsimp only
-                                    rcases h_ep ms.memory locals' bPtr h_P0 with ⟨h_ep0b, _⟩
-                                    rw [h_ep0b]
-                                    cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts bPtr with
+                                  rw [stripProvenanceBytes_congr h_bgf2, stripProvenanceBytes_congr h_bgf2]
+                                  cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } aSlice with
+                                  | ub => exact .fail .ub
+                                  | unsupported =>
+                                    cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } bSlice with
+                                    | ub => exact .fail .ub
+                                    | unsupported | ok _ => exact .unsupported
+                                  | ok aRaw =>
+                                    cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } bSlice with
                                     | ub => exact .fail .ub
                                     | unsupported => exact .unsupported
-                                    | ok bEp0 =>
-                                      dsimp only
-                                      cases Nat.ble (Nat.add bEp0.effOff elemSize) bEp0.allocSize with
-                                      | false => exact .fail .ub
-                                      | true =>
-                                        dsimp only
-                                        cases endpointAccessCheck aEp elemSize with
-                                        | ub => exact .fail .ub
-                                        | unsupported => exact .unsupported
-                                        | ok _ =>
-                                          dsimp only
-                                          rcases h_ebr ms.memory aEp elemSize h_P0 (h_E1 aEp h_a) with ⟨h_r1, h_r1p⟩
-                                          rw [h_r1]
-                                          cases h_b1 : endpointBorrowsAfterRead ms.memory aEp elemSize with
-                                          | none => exact .fail .ub
-                                          | some borrows₁ =>
-                                            obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
-                                            dsimp only
-                                            rw [h_fb1]
-                                            rcases h_ep { ms.memory with borrows := borrows₁ } locals' bPtr h_P1 with ⟨h_ep2, h_E2⟩
-                                            rw [h_ep2]
-                                            cases h_b : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := borrows₁ } }
-                                                locals' bodyLocalDecls bodyLayouts bPtr with
-                                            | ub => exact .fail .ub
-                                            | unsupported => exact .unsupported
-                                            | ok bEp =>
-                                              dsimp only
-                                              cases endpointAccessCheck bEp elemSize with
-                                              | ub => exact .fail .ub
-                                              | unsupported => exact .unsupported
-                                              | ok _ =>
-                                                dsimp only
-                                                rcases h_ebr { ms.memory with borrows := borrows₁ } bEp elemSize h_P1 (h_E2 bEp h_b) with ⟨h_r2, h_r2p⟩
-                                                rw [h_r2]
-                                                cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } bEp elemSize with
-                                                | none => exact .fail .ub
-                                                | some borrows₂ =>
-                                                  obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
-                                                  have h_fb2' : { f ms.memory with borrows := borrows₂ } =
-                                                      f { ms.memory with borrows := borrows₂ } :=
-                                                    Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
-                                                  have h_bgf2 := h_bgf { ms.memory with borrows := borrows₂ } h_P2
-                                                  dsimp only at h_fb2' ⊢
-                                                  rw [readRootAbstractBytes_congr h_bgf0]
-                                                  cases readRootAbstractBytes ms.memory aEp with
-                                                  | none => exact .unsupported
-                                                  | some arb =>
-                                                    dsimp only
-                                                    cases sliceAbstractBytes arb aEp.effOff elemSize with
-                                                    | none => exact .fail .ub
-                                                    | some aSlice =>
-                                                      dsimp only
-                                                      rw [h_fb2', readRootAbstractBytes_congr h_bgf2]
-                                                      cases readRootAbstractBytes { ms.memory with borrows := borrows₂ } bEp with
-                                                      | none => exact .unsupported
-                                                      | some brb =>
-                                                        dsimp only
-                                                        cases sliceAbstractBytes brb bEp.effOff elemSize with
-                                                        | none => exact .fail .ub
-                                                        | some bSlice =>
-                                                          dsimp only
-                                                          rw [stripProvenanceBytes_congr h_bgf2, stripProvenanceBytes_congr h_bgf2]
-                                                          cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } aSlice with
-                                                          | ub => exact .fail .ub
-                                                          | unsupported =>
-                                                            cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } bSlice with
-                                                            | ub => exact .fail .ub
-                                                            | unsupported | ok _ => exact .unsupported
-                                                          | ok aRaw =>
-                                                            cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } bSlice with
-                                                            | ub => exact .fail .ub
-                                                            | unsupported => exact .unsupported
-                                                            | ok bRaw =>
-                                                              exact .write { ms.memory with borrows := borrows₂ } locals' _ h_P2
+                                    | ok bRaw =>
+                                      exact .write { ms.memory with borrows := borrows₂ } locals' _ h_P2
   · exact .fail .ub
 
 private theorem evalTypedSwapNonOverlappingCall_rel
@@ -2066,278 +2069,169 @@ private theorem evalTypedSwapNonOverlappingCall_rel
       | false =>
         dsimp only
         rw [isNullThinPtr_congr h_bgf0, isNullThinPtr_congr h_bgf0]
-        cases isNullThinPtr ms.memory (layoutPointerBytes bodyLayouts) xVal with
-        | none => exact .fail .ub
-        | some xb =>
-          cases xb with
-          | true => exact .fail .ub
-          | false =>
-            cases isNullThinPtr ms.memory (layoutPointerBytes bodyLayouts) yVal with
-            | none => exact .fail .ub
-            | some yb =>
-              cases yb with
-              | true => exact .fail .ub
+        apply coreMemPtrStepRel_nonNullPair
+        apply coreMemPtrStepRel_boolUbTrue
+        cases rigidTyLayoutDeterminedAux bodyLocalDecls bodyLayouts true 8 elemTy with
+        | false => exact .unsupported
+        | true =>
+          cases exactRigidTyByteSize? bodyLocalDecls bodyLayouts elemTy with
+          | none => exact .unsupported
+          | some elemSize =>
+            cases exactRigidTyAlign? bodyLocalDecls bodyLayouts elemTy with
+            | none => exact .unsupported
+            | some elemAlign =>
+              dsimp only
+              rw [checkPtrPairAligned_congr_of h_al]
+              apply coreMemPtrStepRel_memOpUnit
+              cases Nat.beq elemSize 0 with
+              | true => exact .write ms.memory locals' .unit h_P0
               | false =>
                 dsimp only
-                cases isUninhabitedRigidTy bodyLocalDecls bodyLayouts 8 elemTy with
-                | true => exact .fail .ub
-                | false =>
+                apply coreMemPtrStepRel_boolUb
+                apply coreMemPtrStepRel_ptrPair; intro xPtr yPtr
+                rcases h_ep ms.memory locals' xPtr h_P0 with ⟨h_epx0, h_Ex0⟩
+                rw [h_epx0]
+                cases h_x0 : resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts xPtr with
+                | ub => exact .fail .ub
+                | unsupported => exact .unsupported
+                | ok xEp =>
                   dsimp only
-                  cases rigidTyLayoutDeterminedAux bodyLocalDecls bodyLayouts true 8 elemTy with
-                  | false => exact .unsupported
-                  | true =>
-                    cases exactRigidTyByteSize? bodyLocalDecls bodyLayouts elemTy with
-                    | none => exact .unsupported
-                    | some elemSize =>
-                      cases exactRigidTyAlign? bodyLocalDecls bodyLayouts elemTy with
-                      | none => exact .unsupported
-                      | some elemAlign =>
+                  apply coreMemPtrStepRel_boolUb
+                  apply coreMemPtrStepRel_boolUb
+                  rcases h_ep ms.memory locals' yPtr h_P0 with ⟨h_epy0, _⟩
+                  rw [h_epy0]
+                  cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts yPtr with
+                  | ub => exact .fail .ub
+                  | unsupported => exact .unsupported
+                  | ok yEp0 =>
+                    dsimp only
+                    apply coreMemPtrStepRel_boolUb
+                    apply coreMemPtrStepRel_boolUb
+                    apply coreMemPtrStepRel_boolUbTrue
+                    apply coreMemPtrStepRel_memOpUnit
+                    apply coreMemPtrStepRel_memOpUnit
+                    rcases h_ebr ms.memory xEp elemSize h_P0 (h_Ex0 xEp h_x0) with ⟨h_r1, h_r1p⟩
+                    rw [h_r1]
+                    cases h_b1 : endpointBorrowsAfterRead ms.memory xEp elemSize with
+                    | none => exact .fail .ub
+                    | some borrows₁ =>
+                      obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
+                      dsimp only; rw [h_fb1]
+                      rcases h_ep { ms.memory with borrows := borrows₁ } locals' yPtr h_P1 with ⟨h_epy1, h_Ey1⟩
+                      rw [h_epy1]
+                      cases h_y1 : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := borrows₁ } }
+                          locals' bodyLocalDecls bodyLayouts yPtr with
+                      | ub => exact .fail .ub
+                      | unsupported => exact .unsupported
+                      | ok yEp₁ =>
                         dsimp only
-                        rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts xVal elemAlign (Bool.not (Nat.beq elemSize 0)) with
-                        | ub => exact .fail .ub
-                        | unsupported => exact .unsupported
-                        | ok _ =>
-                          dsimp only
-                          rw [h_al]; cases checkPtrArgAligned ms locals' bodyLocalDecls bodyLayouts yVal elemAlign (Bool.not (Nat.beq elemSize 0)) with
+                        apply coreMemPtrStepRel_memOpUnit
+                        rcases h_ebr { ms.memory with borrows := borrows₁ } yEp₁ elemSize h_P1 (h_Ey1 yEp₁ h_y1) with ⟨h_r2, h_r2p⟩
+                        rw [h_r2]
+                        cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } yEp₁ elemSize with
+                        | none => exact .fail .ub
+                        | some borrows₂ =>
+                          obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
+                          have h_fb2' : { f ms.memory with borrows := borrows₂ } =
+                              f { ms.memory with borrows := borrows₂ } :=
+                            Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
+                          dsimp only at h_fb2' ⊢
+                          rw [h_fb2']
+                          rcases h_ep { ms.memory with borrows := borrows₂ } locals' xPtr h_P2 with ⟨h_epx2, h_Ex2⟩
+                          rw [h_epx2]
+                          cases h_x2 : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := borrows₂ } }
+                              locals' bodyLocalDecls bodyLayouts xPtr with
                           | ub => exact .fail .ub
                           | unsupported => exact .unsupported
-                          | ok _ =>
+                          | ok xEp₂ =>
                             dsimp only
-                            cases Nat.beq elemSize 0 with
-                            | true => exact .write ms.memory locals' .unit h_P0
-                            | false =>
-                              dsimp only
-                              cases Nat.ble elemSize (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes bodyLayouts)) 2) 1) with
-                              | false => exact .fail .ub
-                              | true =>
+                            apply coreMemPtrStepRel_memOpUnit
+                            rcases h_ebw { ms.memory with borrows := borrows₂ } xEp₂ elemSize h_P2 (h_Ex2 xEp₂ h_x2) with ⟨h_w3, h_w3p⟩
+                            rw [h_w3]
+                            cases h_b3 : endpointBorrowsAfterWrite { ms.memory with borrows := borrows₂ } xEp₂ elemSize with
+                            | none => exact .fail .ub
+                            | some borrows₃ =>
+                              obtain ⟨h_P3, h_fb3⟩ := h_w3p borrows₃ h_b3
+                              have h_fb3' : { f ms.memory with borrows := borrows₃ } =
+                                  f { ms.memory with borrows := borrows₃ } :=
+                                Eq.trans (congrArg (fun m => { m with borrows := borrows₃ }) h_fb2') h_fb3
+                              dsimp only at h_fb3' ⊢
+                              rw [h_fb3']
+                              rcases h_ep { ms.memory with borrows := borrows₃ } locals' yPtr h_P3 with ⟨h_epy3, h_Ey3⟩
+                              rw [h_epy3]
+                              cases h_y3 : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := borrows₃ } }
+                                  locals' bodyLocalDecls bodyLayouts yPtr with
+                              | ub => exact .fail .ub
+                              | unsupported => exact .unsupported
+                              | ok yEp₃ =>
                                 dsimp only
-                                cases xVal <;> cases yVal <;> try exact .fail .ub
-                                rename_i xPtr _ yPtr _
-                                dsimp only
-                                rcases h_ep ms.memory locals' xPtr h_P0 with ⟨h_epx0, h_Ex0⟩
-                                rw [h_epx0]
-                                cases h_x0 : resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts xPtr with
-                                | ub => exact .fail .ub
-                                | unsupported => exact .unsupported
-                                | ok xEp =>
-                                  dsimp only
-                                  cases Nat.ble (Nat.add xEp.effOff elemSize) xEp.allocSize with
-                                  | false => exact .fail .ub
-                                  | true =>
+                                apply coreMemPtrStepRel_memOpUnit
+                                rcases h_ebw { ms.memory with borrows := borrows₃ } yEp₃ elemSize h_P3 (h_Ey3 yEp₃ h_y3) with ⟨h_w4, h_w4p⟩
+                                rw [h_w4]
+                                cases h_b4 : endpointBorrowsAfterWrite { ms.memory with borrows := borrows₃ } yEp₃ elemSize with
+                                | none => exact .fail .ub
+                                | some borrows₄ =>
+                                  obtain ⟨h_P4, h_fb4⟩ := h_w4p borrows₄ h_b4
+                                  have h_fb4' : { f ms.memory with borrows := borrows₄ } =
+                                      f { ms.memory with borrows := borrows₄ } :=
+                                    Eq.trans (congrArg (fun m => { m with borrows := borrows₄ }) h_fb3') h_fb4
+                                  have h_bgf1 := h_bgf { ms.memory with borrows := borrows₁ } h_P1
+                                  dsimp only at h_fb4' ⊢
+                                  rw [h_fb4', readValidateAndPrepareSwapSlices_congr h_bgf0 h_bgf1]
+                                  cases readValidateAndPrepareSwapSlices ms.memory { ms.memory with borrows := borrows₁ }
+                                      bodyLocalDecls bodyLayouts
+                                      (resolveIntrinsicPointeeFullTy bodyLocalDecls bodyLayouts argOps elemTy)
+                                      xEp yEp₁ elemSize with
+                                  | ub => exact .fail .ub
+                                  | unsupported => exact .unsupported
+                                  | ok swapPair =>
+                                    rcases swapPair with ⟨⟨xrb, xStored⟩, ⟨yrb, yStored⟩⟩
                                     dsimp only
-                                    have h_wGuard : ∀ (o : Option CapturedAllocation) (n₁ n₂ : MirStepNode),
-                                        CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt n₁ n₂ →
-                                        CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt
-                                          (match (match o with | .some g => (match g.mutability with | .mut => true | .not => false) | .none => true) with
-                                           | false => MirStepNode.fail .ub
-                                           | true => n₁)
-                                          (match (match o with | .some g => (match g.mutability with | .mut => true | .not => false) | .none => true) with
-                                           | false => MirStepNode.fail .ub
-                                           | true => n₂) := by
-                                      intro o n₁ n₂ hn
-                                      cases o with
-                                      | none => exact hn
-                                      | some g => cases hgm : g.mutability <;> simp only [hgm] <;> first | exact .fail .ub | exact hn
-                                    apply h_wGuard xEp.globalAlloc?
-                                    rcases h_ep ms.memory locals' yPtr h_P0 with ⟨h_epy0, _⟩
-                                    rw [h_epy0]
-                                    cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts yPtr with
-                                    | ub => exact .fail .ub
-                                    | unsupported => exact .unsupported
-                                    | ok yEp0 =>
+                                    cases AllocKey.beq xEp.allocKey yEp0.allocKey with
+                                    | true =>
                                       dsimp only
-                                      cases Nat.ble (Nat.add yEp0.effOff elemSize) yEp0.allocSize with
-                                      | false => exact .fail .ub
-                                      | true =>
+                                      cases writeAbstractBytesAt xrb xEp₂.effOff yStored with
+                                      | none => exact .fail .ub
+                                      | some p1 =>
                                         dsimp only
-                                        apply h_wGuard yEp0.globalAlloc?
-                                        cases Bool.and (AllocKey.beq xEp.allocKey yEp0.allocKey)
-                                            (Bool.not (rangesDisjoint xEp.effOff elemSize yEp0.effOff elemSize)) with
-                                        | true => exact .fail .ub
-                                        | false =>
+                                        cases writeAbstractBytesAt p1 yEp₃.effOff xStored with
+                                        | none => exact .fail .ub
+                                        | some p2 =>
                                           dsimp only
-                                          have h_acGuard : ∀ (ep : ResolvedMemEndpoint) (n₁ n₂ : MirStepNode),
-                                              CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt n₁ n₂ →
-                                              CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt
-                                                (match endpointAccessCheck ep elemSize with | .ub => MirStepNode.fail .ub | .unsupported => MirStepNode.unsupported | .ok () => n₁)
-                                                (match endpointAccessCheck ep elemSize with | .ub => MirStepNode.fail .ub | .unsupported => MirStepNode.unsupported | .ok () => n₂) := by
-                                            intro ep n₁ n₂ hn
-                                            cases endpointAccessCheck ep elemSize with | ub => exact .fail .ub | unsupported => exact .unsupported | ok _ => exact hn
-                                          apply h_acGuard xEp; apply h_acGuard yEp0
-                                          rw [readRootAbstractBytes_congr h_bgf0]
-                                          cases readRootAbstractBytes ms.memory xEp with
-                                          | none => exact .unsupported
-                                          | some xrb =>
+                                          rcases h_commit { ms.memory with borrows := borrows₄ }
+                                              locals' xEp₂ p2 h_P4 (h_Ex2 xEp₂ h_x2) with ⟨h_c_eq, h_c_P⟩
+                                          rw [h_c_eq]
+                                          cases h_cm1 : commitRootAbstractBytes
+                                              { ms.memory with borrows := borrows₄ } locals' xEp₂ p2 with
+                                          | ub => exact .fail .ub
+                                          | unsupported => exact .unsupported
+                                          | ok pair => exact .write pair.2 pair.1 .unit (h_c_P pair.1 pair.2 h_cm1)
+                                    | false =>
+                                      dsimp only
+                                      cases writeAbstractBytesAt xrb xEp₂.effOff yStored with
+                                      | none => exact .fail .ub
+                                      | some xPatched =>
+                                        dsimp only
+                                        rcases h_commit { ms.memory with borrows := borrows₄ }
+                                            locals' xEp₂ xPatched h_P4 (h_Ex2 xEp₂ h_x2) with ⟨h_c1_eq, h_c1_P⟩
+                                        rw [h_c1_eq]
+                                        cases h_cm1 : commitRootAbstractBytes
+                                            { ms.memory with borrows := borrows₄ } locals' xEp₂ xPatched with
+                                        | ub => exact .fail .ub
+                                        | unsupported => exact .unsupported
+                                        | ok pair₁ =>
+                                          have h_P4' := h_c1_P pair₁.1 pair₁.2 h_cm1
+                                          dsimp only
+                                          cases writeAbstractBytesAt yrb yEp₃.effOff xStored with
+                                          | none => exact .fail .ub
+                                          | some yPatched =>
                                             dsimp only
-                                            cases sliceAbstractBytes xrb xEp.effOff elemSize with
-                                            | none => exact .fail .ub
-                                            | some xSlice =>
-                                              dsimp only
-                                              rcases h_ebr ms.memory xEp elemSize h_P0 (h_Ex0 xEp h_x0) with ⟨h_r1, h_r1p⟩
-                                              rw [h_r1]
-                                              cases h_b1 : endpointBorrowsAfterRead ms.memory xEp elemSize with
-                                              | none => exact .fail .ub
-                                              | some borrows₁ =>
-                                                obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
-                                                dsimp only
-                                                rw [h_fb1]
-                                                rcases h_ep { ms.memory with borrows := borrows₁ } locals' yPtr h_P1 with ⟨h_epy1, h_Ey1⟩
-                                                rw [h_epy1]
-                                                cases h_y1 : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := borrows₁ } }
-                                                    locals' bodyLocalDecls bodyLayouts yPtr with
-                                                | ub => exact .fail .ub
-                                                | unsupported => exact .unsupported
-                                                | ok yEp₁ =>
-                                                  dsimp only
-                                                  cases endpointAccessCheck yEp₁ elemSize with
-                                                  | ub => exact .fail .ub
-                                                  | unsupported => exact .unsupported
-                                                  | ok _ =>
-                                                    dsimp only
-                                                    have h_bgf1 := h_bgf { ms.memory with borrows := borrows₁ } h_P1
-                                                    rw [readRootAbstractBytes_congr h_bgf1]
-                                                    cases readRootAbstractBytes { ms.memory with borrows := borrows₁ } yEp₁ with
-                                                    | none => exact .unsupported
-                                                    | some yrb =>
-                                                      dsimp only
-                                                      cases sliceAbstractBytes yrb yEp₁.effOff elemSize with
-                                                      | none => exact .fail .ub
-                                                      | some ySlice =>
-                                                        dsimp only
-                                                        rcases h_ebr { ms.memory with borrows := borrows₁ } yEp₁ elemSize h_P1 (h_Ey1 yEp₁ h_y1) with ⟨h_r2, h_r2p⟩
-                                                        rw [h_r2]
-                                                        cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } yEp₁ elemSize with
-                                                        | none => exact .fail .ub
-                                                        | some borrows₂ =>
-                                                          obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
-                                                          dsimp only
-                                                          rw [validateTypedBytes_congr h_bgf0]
-                                                          cases validateTypedBytes ms.memory bodyLocalDecls bodyLayouts defaultCodecFuel
-                                                              (resolveIntrinsicPointeeFullTy bodyLocalDecls bodyLayouts argOps elemTy) xSlice with
-                                                          | ub => exact .fail .ub
-                                                          | unsupported => exact .unsupported
-                                                          | valid =>
-                                                            dsimp only
-                                                            rw [validateTypedBytes_congr h_bgf1]
-                                                            cases validateTypedBytes { ms.memory with borrows := borrows₁ } bodyLocalDecls bodyLayouts defaultCodecFuel
-                                                                (resolveIntrinsicPointeeFullTy bodyLocalDecls bodyLayouts argOps elemTy) ySlice with
-                                                            | ub => exact .fail .ub
-                                                            | unsupported => exact .unsupported
-                                                            | valid =>
-                                                              dsimp only
-                                                              cases resetTypedPaddingBytes defaultCodecFuel bodyLocalDecls bodyLayouts
-                                                                  (resolveIntrinsicPointeeFullTy bodyLocalDecls bodyLayouts argOps elemTy) xSlice with
-                                                              | none => exact .unsupported
-                                                              | some xStored =>
-                                                                cases resetTypedPaddingBytes defaultCodecFuel bodyLocalDecls bodyLayouts
-                                                                    (resolveIntrinsicPointeeFullTy bodyLocalDecls bodyLayouts argOps elemTy) ySlice with
-                                                                | none => exact .unsupported
-                                                                | some yStored =>
-                                                                  have h_fb2' : { f ms.memory with borrows := borrows₂ } =
-                                                                      f { ms.memory with borrows := borrows₂ } :=
-                                                                    Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
-                                                                  dsimp only at h_fb2' ⊢
-                                                                  rw [h_fb2']
-                                                                  rcases h_ep { ms.memory with borrows := borrows₂ } locals' xPtr h_P2 with ⟨h_epx2, h_Ex2⟩
-                                                                  rw [h_epx2]
-                                                                  cases h_x2 : resolveLiveMemEndpoint
-                                                                      { ms with memory := { ms.memory with borrows := borrows₂ } }
-                                                                      locals' bodyLocalDecls bodyLayouts xPtr with
-                                                                  | ub => exact .fail .ub
-                                                                  | unsupported => exact .unsupported
-                                                                  | ok xEp₂ =>
-                                                                    dsimp only
-                                                                    cases endpointAccessCheck xEp₂ elemSize with
-                                                                    | ub => exact .fail .ub
-                                                                    | unsupported => exact .unsupported
-                                                                    | ok _ =>
-                                                                      dsimp only
-                                                                      rcases h_ebw { ms.memory with borrows := borrows₂ } xEp₂ elemSize h_P2 (h_Ex2 xEp₂ h_x2) with ⟨h_w3, h_w3p⟩
-                                                                      rw [h_w3]
-                                                                      cases h_b3 : endpointBorrowsAfterWrite
-                                                                          { ms.memory with borrows := borrows₂ } xEp₂ elemSize with
-                                                                      | none => exact .fail .ub
-                                                                      | some borrows₃ =>
-                                                                        obtain ⟨h_P3, h_fb3⟩ := h_w3p borrows₃ h_b3
-                                                                        have h_fb3' : { f ms.memory with borrows := borrows₃ } =
-                                                                            f { ms.memory with borrows := borrows₃ } :=
-                                                                          Eq.trans (congrArg (fun m => { m with borrows := borrows₃ }) h_fb2') h_fb3
-                                                                        dsimp only at h_fb3' ⊢
-                                                                        rw [h_fb3']
-                                                                        rcases h_ep { ms.memory with borrows := borrows₃ } locals' yPtr h_P3 with ⟨h_epy3, h_Ey3⟩
-                                                                        rw [h_epy3]
-                                                                        cases h_y3 : resolveLiveMemEndpoint
-                                                                            { ms with memory := { ms.memory with borrows := borrows₃ } }
-                                                                            locals' bodyLocalDecls bodyLayouts yPtr with
-                                                                        | ub => exact .fail .ub
-                                                                        | unsupported => exact .unsupported
-                                                                        | ok yEp₃ =>
-                                                                          dsimp only
-                                                                          cases endpointAccessCheck yEp₃ elemSize with
-                                                                          | ub => exact .fail .ub
-                                                                          | unsupported => exact .unsupported
-                                                                          | ok _ =>
-                                                                            dsimp only
-                                                                            rcases h_ebw { ms.memory with borrows := borrows₃ } yEp₃ elemSize h_P3 (h_Ey3 yEp₃ h_y3) with ⟨h_w4, h_w4p⟩
-                                                                            rw [h_w4]
-                                                                            cases h_b4 : endpointBorrowsAfterWrite
-                                                                                { ms.memory with borrows := borrows₃ } yEp₃ elemSize with
-                                                                            | none => exact .fail .ub
-                                                                            | some borrows₄ =>
-                                                                              obtain ⟨h_P4, h_fb4⟩ := h_w4p borrows₄ h_b4
-                                                                              have h_fb4' : { f ms.memory with borrows := borrows₄ } =
-                                                                                  f { ms.memory with borrows := borrows₄ } :=
-                                                                                Eq.trans (congrArg (fun m => { m with borrows := borrows₄ }) h_fb3') h_fb4
-                                                                              dsimp only at h_fb4' ⊢
-                                                                              rw [h_fb4']
-                                                                              cases AllocKey.beq xEp.allocKey yEp0.allocKey with
-                                                                              | true =>
-                                                                                dsimp only
-                                                                                cases writeAbstractBytesAt xrb xEp₂.effOff yStored with
-                                                                                | none => exact .fail .ub
-                                                                                | some p1 =>
-                                                                                  dsimp only
-                                                                                  cases writeAbstractBytesAt p1 yEp₃.effOff xStored with
-                                                                                  | none => exact .fail .ub
-                                                                                  | some p2 =>
-                                                                                    dsimp only
-                                                                                    rcases h_commit { ms.memory with borrows := borrows₄ }
-                                                                                        locals' xEp₂ p2 h_P4 (h_Ex2 xEp₂ h_x2) with ⟨h_c_eq, h_c_P⟩
-                                                                                    rw [h_c_eq]
-                                                                                    cases h_cm1 : commitRootAbstractBytes
-                                                                                        { ms.memory with borrows := borrows₄ }
-                                                                                        locals' xEp₂ p2 with
-                                                                                    | ub => exact .fail .ub
-                                                                                    | unsupported => exact .unsupported
-                                                                                    | ok pair => exact .write pair.2 pair.1 .unit (h_c_P pair.1 pair.2 h_cm1)
-                                                                              | false =>
-                                                                                dsimp only
-                                                                                cases writeAbstractBytesAt xrb xEp₂.effOff yStored with
-                                                                                | none => exact .fail .ub
-                                                                                | some xPatched =>
-                                                                                  dsimp only
-                                                                                  rcases h_commit { ms.memory with borrows := borrows₄ }
-                                                                                      locals' xEp₂ xPatched h_P4 (h_Ex2 xEp₂ h_x2) with ⟨h_c1_eq, h_c1_P⟩
-                                                                                  rw [h_c1_eq]
-                                                                                  cases h_cm1 : commitRootAbstractBytes
-                                                                                      { ms.memory with borrows := borrows₄ }
-                                                                                      locals' xEp₂ xPatched with
-                                                                                  | ub => exact .fail .ub
-                                                                                  | unsupported => exact .unsupported
-                                                                                  | ok pair₁ =>
-                                                                                    have h_P4' := h_c1_P pair₁.1 pair₁.2 h_cm1
-                                                                                    dsimp only
-                                                                                    cases writeAbstractBytesAt yrb yEp₃.effOff xStored with
-                                                                                    | none => exact .fail .ub
-                                                                                    | some yPatched =>
-                                                                                      dsimp only
-                                                                                      rcases h_commit pair₁.2 pair₁.1 yEp₃ yPatched h_P4' (h_Ey3 yEp₃ h_y3) with ⟨h_c2_eq, h_c2_P⟩
-                                                                                      rw [h_c2_eq]
-                                                                                      cases h_cm2 : commitRootAbstractBytes pair₁.2
-                                                                                          pair₁.1 yEp₃ yPatched with
-                                                                                      | ub => exact .fail .ub
-                                                                                      | unsupported => exact .unsupported
-                                                                                      | ok pairF => exact .write pairF.2 pairF.1 .unit (h_c2_P pairF.1 pairF.2 h_cm2)
+                                            rcases h_commit pair₁.2 pair₁.1 yEp₃ yPatched h_P4' (h_Ey3 yEp₃ h_y3) with ⟨h_c2_eq, h_c2_P⟩
+                                            rw [h_c2_eq]
+                                            cases h_cm2 : commitRootAbstractBytes pair₁.2 pair₁.1 yEp₃ yPatched with
+                                            | ub => exact .fail .ub
+                                            | unsupported => exact .unsupported
+                                            | ok pairF => exact .write pairF.2 pairF.1 .unit (h_c2_P pairF.1 pairF.2 h_cm2)
   · exact .fail .ub
 
 private theorem evalPtrOffsetFromCall_rel
@@ -2423,7 +2317,8 @@ private theorem evalPtrMaskCall_rel
   · cases ptrVal with
     | scalar sc =>
       dsimp only
-      cases Nat.beq sc.sizeBytes (layoutPointerBytes bodyLayouts) with
+      cases Bool.and (Nat.beq sc.sizeBytes (layoutPointerBytes bodyLayouts))
+          (Nat.blt sc.bits (scalarModulus (layoutPointerBytes bodyLayouts))) with
       | false => exact .fail .ub
       | true =>
         dsimp only
@@ -2438,43 +2333,50 @@ private theorem evalPtrMaskCall_rel
       | false => exact .fail .ub
       | true =>
         dsimp only
-        rw [decodeUsizeArg?_congr h_bgf0]
-        cases decodeUsizeArg? ms.memory (layoutPointerBytes bodyLayouts) maskVal with
-        | ub => exact .fail .ub
-        | unsupported => exact .unsupported
-        | ok maskBits =>
+        rw [isBackedPtr_congr h_bgf0]
+        cases Bool.and (Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr ms.memory p)))
+            (Bool.not (Nat.blt p.offsetBytes (scalarModulus (layoutPointerBytes bodyLayouts)))) with
+        | true => exact .fail .ub
+        | false =>
           dsimp only
-          rw [isBackedPtr_congr h_bgf0]
-          cases Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr ms.memory p)) with
-          | true => exact .write ms.memory locals' _ h_P0
-          | false =>
+          rw [decodeUsizeArg?_congr h_bgf0]
+          cases decodeUsizeArg? ms.memory (layoutPointerBytes bodyLayouts) maskVal with
+          | ub => exact .fail .ub
+          | unsupported => exact .unsupported
+          | ok maskBits =>
             dsimp only
-            cases Bool.and
-                (Nat.beq (Nat.mod maskBits (scalarModulus (layoutPointerBytes bodyLayouts)))
-                  (Nat.sub (scalarModulus (layoutPointerBytes bodyLayouts)) 1))
-                (Nat.blt p.offsetBytes (scalarModulus (layoutPointerBytes bodyLayouts))) with
+            cases Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr ms.memory p)) with
             | true => exact .write ms.memory locals' _ h_P0
             | false =>
               dsimp only
-              rw [h_ra]
-              cases resolvePtrAllocAlignAndPlaceOff ms locals' bodyLocalDecls bodyLayouts p with
-              | none => exact .unsupported
-              | some ap =>
+              cases Bool.and
+                  (Nat.beq (Nat.mod maskBits (scalarModulus (layoutPointerBytes bodyLayouts)))
+                    (Nat.sub (scalarModulus (layoutPointerBytes bodyLayouts)) 1))
+                  (Nat.blt p.offsetBytes (scalarModulus (layoutPointerBytes bodyLayouts))) with
+              | true => exact .write ms.memory locals' _ h_P0
+              | false =>
                 dsimp only
-                cases Bool.and
-                    (Nat.blt (Nat.sub (Nat.sub (scalarModulus (layoutPointerBytes bodyLayouts)) 1)
-                      (Nat.mod maskBits (scalarModulus (layoutPointerBytes bodyLayouts)))) ap.1)
-                    (Nat.blt (Nat.add ap.2 p.offsetBytes) (scalarModulus (layoutPointerBytes bodyLayouts))) with
-                | false => exact .unsupported
-                | true =>
+                rw [h_ra]
+                cases resolvePtrAllocAlignAndPlaceOff ms locals' bodyLocalDecls bodyLayouts p with
+                | none => exact .unsupported
+                | some ap =>
                   dsimp only
-                  cases Nat.blt
-                      (bitwiseAndBits (Nat.mul 8 (layoutPointerBytes bodyLayouts))
-                        (Nat.add ap.2 p.offsetBytes)
-                        (Nat.mod maskBits (scalarModulus (layoutPointerBytes bodyLayouts))))
-                      ap.2 with
-                  | true => exact .unsupported
-                  | false => exact .write ms.memory locals' _ h_P0
+                  cases Bool.and
+                      (Nat.ble ap.1 (signedHalfModulus (layoutPointerBytes bodyLayouts)))
+                      (Bool.and
+                        (Nat.blt (Nat.sub (Nat.sub (scalarModulus (layoutPointerBytes bodyLayouts)) 1)
+                          (Nat.mod maskBits (scalarModulus (layoutPointerBytes bodyLayouts)))) ap.1)
+                        (Nat.blt (Nat.add ap.2 p.offsetBytes) (scalarModulus (layoutPointerBytes bodyLayouts)))) with
+                  | false => exact .unsupported
+                  | true =>
+                    dsimp only
+                    cases Nat.blt
+                        (bitwiseAndBits (Nat.mul 8 (layoutPointerBytes bodyLayouts))
+                          (Nat.add ap.2 p.offsetBytes)
+                          (Nat.mod maskBits (scalarModulus (layoutPointerBytes bodyLayouts))))
+                        ap.2 with
+                    | true => exact .unsupported
+                    | false => exact .write ms.memory locals' _ h_P0
     | aggregate v fs =>
       cases v with
       | zero =>
@@ -2483,22 +2385,22 @@ private theorem evalPtrMaskCall_rel
         · exact .fail .ub
         · change CoreMemPtrStepRel f P ms bodyLocalDecls bodyLayouts destination targetOpt
             (match isNullThinPtr (f ms.memory) (layoutPointerBytes bodyLayouts) dVal,
-              isValidWidePtrMetaValForWidth (layoutPointerBytes bodyLayouts) mVal,
+              isValidWidePtrMetaValForWidth (f ms.memory) (layoutPointerBytes bodyLayouts) mVal,
               decodeUsizeArg? (f ms.memory) (layoutPointerBytes bodyLayouts) maskVal with
              | .none, _, _ => MirStepNode.fail .ub
              | _, false, _ => MirStepNode.fail .ub
              | _, _, .ub => MirStepNode.fail .ub
              | .some _, true, _ => MirStepNode.unsupported)
             (match isNullThinPtr ms.memory (layoutPointerBytes bodyLayouts) dVal,
-              isValidWidePtrMetaValForWidth (layoutPointerBytes bodyLayouts) mVal,
+              isValidWidePtrMetaValForWidth ms.memory (layoutPointerBytes bodyLayouts) mVal,
               decodeUsizeArg? ms.memory (layoutPointerBytes bodyLayouts) maskVal with
              | .none, _, _ => MirStepNode.fail .ub
              | _, false, _ => MirStepNode.fail .ub
              | _, _, .ub => MirStepNode.fail .ub
              | .some _, true, _ => MirStepNode.unsupported)
-          rw [isNullThinPtr_congr h_bgf0, decodeUsizeArg?_congr h_bgf0]
+          rw [isNullThinPtr_congr h_bgf0, isValidWidePtrMetaValForWidth_congr h_bgf0, decodeUsizeArg?_congr h_bgf0]
           cases isNullThinPtr ms.memory (layoutPointerBytes bodyLayouts) dVal <;>
-          cases isValidWidePtrMetaValForWidth (layoutPointerBytes bodyLayouts) mVal <;>
+          cases isValidWidePtrMetaValForWidth ms.memory (layoutPointerBytes bodyLayouts) mVal <;>
           cases decodeUsizeArg? ms.memory (layoutPointerBytes bodyLayouts) maskVal <;>
             first | exact .fail .ub | exact .unsupported
         · exact .fail .ub

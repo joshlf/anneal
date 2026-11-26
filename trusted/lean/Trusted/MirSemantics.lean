@@ -170,7 +170,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   tyDataMask resetTypedPaddingBytes validRangeExcludesAny
   validRangeCoversAllNonNull anyListTrue isUninhabitedRigidTy
   isUninhabitedTy referenceToUninhabited charShapedSurrogate
-  TypedValidity.andThen validateNonNullPtrBytes validateScalarLayoutBytes
+  TypedValidity.combine validateNonNullPtrBytes validateScalarLayoutBytes
   validateWideMetaBytes decodeScalarLayoutBytesTarget
   decodeFieldsAtLayoutIdxs decodeArrayElemsAtLayoutIdx
   decodeUnionFieldsAtLayoutIdxs decodeValueAtLayoutIdx
@@ -180,7 +180,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   commitRootAbstractBytes evalCopyMemory
   validateTupleFieldsBytesWith validateLayoutFieldsWith validateArrayChunksWith
   validateTypedBytesForLayoutIdx validateTypedBytes allFieldLayoutsPermitUninit
-  layoutPermitsUninit allRigidTysPermitUninit tyPermitsUninit
+  layoutPermitsUninit allTupleFieldsPermitUninit tyPermitsUninit
   validateScalarLayoutValue validateWideMetaValue validateLayoutFieldsValuesWith
   validateValueListWith validateTupleValuesWith validateValueAtLayoutIdx
   validateBlackBoxValue
@@ -216,9 +216,9 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   constEvalSelectTupleArgOps finishMemIntrinsicCall evalCopyNonOverlappingCall
   WriteBytesAction writeBytesAction evalWriteBytesCall
   writeIntrinsicReturnWithProtectors resolveIntrinsicPointeeFullTy
-  endpointBorrowsAfterRead endpointBorrowsAfterWrite
+  checkPtrPairAligned endpointBorrowsAfterRead endpointBorrowsAfterWrite
   compareUnsignedBytesI32 evalCopyCall evalCompareBytesCall evalRawEqCall
-  evalTypedSwapNonOverlappingCall resolvePtrOffsetFromOffsets
+  readValidateAndPrepareSwapSlices evalTypedSwapNonOverlappingCall resolvePtrOffsetFromOffsets
   evalPtrOffsetFromDistance evalPtrOffsetFromCall
   resolvePtrAllocAlignAndPlaceOff evalPtrMaskCall resolveBlackBoxTy?
   evalBlackBoxCall evalCoreMemPtrIntrinsicCall? divergingCallReturnStep
