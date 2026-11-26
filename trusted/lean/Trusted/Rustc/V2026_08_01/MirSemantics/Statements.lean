@@ -4870,6 +4870,9 @@ def evalCopyNonOverlappingWithCountNonZero
 Execute a `NonDivergingIntrinsic.copyNonOverlapping src dst count` statement
 (and, through `Terminators.evalCopyNonOverlappingCall`, a direct
 `copy_nonoverlapping::<T>(src, dst, count)` call) with pre-resolved count bits:
+0. `countBits` must be a `usize` bit pattern (`countBits < 2^(8 * ptrBytes)`,
+   trivially true for `count = 0`); otherwise `.ub`. This also covers the call
+   form, whose caller only checks the scalar's width.
 1. Resolve `(size_of::<T>(), align_of::<T>())` (`resolveCopyElemLayout`); an
    ill-typed operand (statically non-pointer, or unsized pointee) faults `.ub`
    for every count.
@@ -4985,27 +4988,30 @@ def evalCopyNonOverlappingWithCount
     | true =>
       evalCopyNonOverlappingWithCountNonZero
         s src dst localDecls layouts srcVal dstVal countBits locals₃
-  match resolveCopyElemLayout localDecls layouts src dst with
-  | .ub => MirStepNode.fail .ub
-  | .unsupported =>
-    match Nat.beq countBits 0 with
-    | true =>
-      match zeroByteCopyPrecheck s locals₃ localDecls layouts 1 srcVal dstVal with
-      | .ub => MirStepNode.fail .ub
-      | _ => MirStepNode.unsupported
-    | false => nonZero
-  | .ok elemSize elemAlign =>
-    let totalBytes := Nat.mul countBits elemSize
-    match Nat.ble totalBytes (isizeMaxBytes ptrBytes) with
-    | false => MirStepNode.fail .ub
-    | true =>
-      match Nat.beq totalBytes 0 with
+  match Bool.or (Nat.beq countBits 0) (Nat.blt countBits (scalarModulus ptrBytes)) with
+  | false => MirStepNode.fail .ub
+  | true =>
+    match resolveCopyElemLayout localDecls layouts src dst with
+    | .ub => MirStepNode.fail .ub
+    | .unsupported =>
+      match Nat.beq countBits 0 with
       | true =>
-        match zeroByteCopyPrecheck s locals₃ localDecls layouts elemAlign srcVal dstVal with
-        | .ok => MirStepNode.step (advanceStmt s locals₃)
+        match zeroByteCopyPrecheck s locals₃ localDecls layouts 1 srcVal dstVal with
         | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
+        | _ => MirStepNode.unsupported
       | false => nonZero
+    | .ok elemSize elemAlign =>
+      let totalBytes := Nat.mul countBits elemSize
+      match Nat.ble totalBytes (isizeMaxBytes ptrBytes) with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match Nat.beq totalBytes 0 with
+        | true =>
+          match zeroByteCopyPrecheck s locals₃ localDecls layouts elemAlign srcVal dstVal with
+          | .ok => MirStepNode.step (advanceStmt s locals₃)
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+        | false => nonZero
 
 /--
 Execute a `NonDivergingIntrinsic.copyNonOverlapping src dst count` statement.
@@ -7964,18 +7970,26 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
               | .ub => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
             | false => nonZero
-      match hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
-      | .ub => Eq.trans (congrArg stepOf hR) rfl
-      | .unsupported => Eq.trans (congrArg stepOf hR) hNonZero
-      | .ok 0 al => absurd hR (hNonZst al)
-      | .ok (es' + 1) _ =>
-        Eq.trans (congrArg stepOf hR)
-          (@Bool.rec
+      let inner : stepOf (resolveCopyElemLayout localDecls layouts srcOp dstOp) =
+          MirStepNode.fail .ub :=
+        match hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
+        | .ub => rfl
+        | .unsupported => hNonZero
+        | .ok 0 al => absurd hR (hNonZst al)
+        | .ok (es' + 1) _ =>
+          @Bool.rec
             (fun b =>
               (match b with | false => MirStepNode.fail .ub | true => nonZero) =
                 MirStepNode.fail .ub)
             rfl hNonZero
-            (Nat.ble (Nat.mul (n + 1) (es' + 1)) (isizeMaxBytes ptrBytes)))
+            (Nat.ble (Nat.mul (n + 1) (es' + 1)) (isizeMaxBytes ptrBytes))
+      @Bool.rec
+        (fun b =>
+          (match b with
+           | false => MirStepNode.fail .ub
+           | true => stepOf (resolveCopyElemLayout localDecls layouts srcOp dstOp)) =
+            MirStepNode.fail .ub)
+        rfl inner (Nat.blt (n + 1) (scalarModulus ptrBytes))
   · exact fun hNonZst =>
       let borrowsAfter := disableLocalBorrows borrows loc d
       let sAfter : MachineState :=
@@ -8077,18 +8091,26 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
               | .ub => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
             | false => nonZero
-      match hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
-      | .ub => Eq.trans (congrArg stepOf hR) rfl
-      | .unsupported => Eq.trans (congrArg stepOf hR) hNonZero
-      | .ok 0 al => absurd hR (hNonZst al)
-      | .ok (es' + 1) _ =>
-        Eq.trans (congrArg stepOf hR)
-          (@Bool.rec
+      let inner : stepOf (resolveCopyElemLayout localDecls layouts srcOp dstOp) =
+          MirStepNode.fail .ub :=
+        match hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
+        | .ub => rfl
+        | .unsupported => hNonZero
+        | .ok 0 al => absurd hR (hNonZst al)
+        | .ok (es' + 1) _ =>
+          @Bool.rec
             (fun b =>
               (match b with | false => MirStepNode.fail .ub | true => nonZero) =
                 MirStepNode.fail .ub)
             rfl hNonZero
-            (Nat.ble (Nat.mul (n + 1) (es' + 1)) (isizeMaxBytes ptrBytes)))
+            (Nat.ble (Nat.mul (n + 1) (es' + 1)) (isizeMaxBytes ptrBytes))
+      @Bool.rec
+        (fun b =>
+          (match b with
+           | false => MirStepNode.fail .ub
+           | true => stepOf (resolveCopyElemLayout localDecls layouts srcOp dstOp)) =
+            MirStepNode.fail .ub)
+        rfl inner (Nat.blt (n + 1) (scalarModulus ptrBytes))
 
 /--
 Universal proof that a bare `StatementKind.placeMention` (`place.projection = []`)

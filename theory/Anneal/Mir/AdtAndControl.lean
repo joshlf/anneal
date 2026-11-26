@@ -13508,6 +13508,13 @@ theorem evalCopyNonOverlappingWithCount_zero_ub (s : MachineState) (src dst : Op
   simp only [hElem, h0, hPre]
   all_goals rfl
 
+/-- A well-formed `usize` count scalar (`countScalarWellFormed`) has in-range bits. -/
+theorem countScalarWellFormed_bits_lt {ptrBytes : Nat} {sc : ScalarInt}
+    (h : countScalarWellFormed ptrBytes sc = true) : sc.bits < scalarModulus ptrBytes := by
+  unfold countScalarWellFormed at h
+  simp only [Bool.and_eq_true] at h
+  exact Nat.blt_eq.mp h.2
+
 /-- The resolved element layouts on which Trusted's `evalCopyNonOverlappingWithCount` delegates a
 `count`-element copy to the (unchanged) non-zero-byte implementation
 `evalCopyNonOverlappingWithCountNonZero`: an unresolved layout with `count ≠ 0`, or a resolved
@@ -13524,6 +13531,7 @@ theorem evalCopyNonOverlappingWithCount_eq_nonZero (s : MachineState) (src dst :
     (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
     (srcSz dstSz count : Nat) (locals₃ : List LocalSlot)
     (hSrcSz : srcSz = layoutPointerBytes layouts) (hDstSz : dstSz = layoutPointerBytes layouts)
+    (hCnt : count < scalarModulus (layoutPointerBytes layouts))
     (hDel : CopyDelegatesNonZero localDecls layouts src dst count) :
     evalCopyNonOverlappingWithCount s src dst localDecls layouts (.ptr srcPtr srcSz)
         (.ptr dstPtr dstSz) count locals₃ =
@@ -13534,7 +13542,11 @@ theorem evalCopyNonOverlappingWithCount_eq_nonZero (s : MachineState) (src dst :
       (.ptr srcPtr (layoutPointerBytes layouts)) &&
       isThinPtrValue (layoutPointerBytes layouts) (.ptr dstPtr (layoutPointerBytes layouts))) =
       true := by simp [isThinPtrValue]
+  have hRange : Bool.or (Nat.beq count 0)
+      (Nat.blt count (scalarModulus (layoutPointerBytes layouts))) = true := by
+    simp [Nat.blt_eq.mpr hCnt]
   unfold evalCopyNonOverlappingWithCount
+  simp only [hRange]
   rcases hDel with ⟨hR, hC⟩ | ⟨es, al, hR, hPos, hLe⟩
   · have hC' : Nat.beq count 0 = false := by
       cases count with
@@ -23078,7 +23090,7 @@ theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp
       evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry 1
         s.frame.locals := by
     rw [evalCopyNonOverlappingWithCount_eq_nonZero s srcOp dstOp localDecls layouts srcPtr dstPtr
-      srcSz dstSz 1 s.frame.locals hSrcSz hDstSz hDel]
+      srcSz dstSz 1 s.frame.locals hSrcSz hDstSz (hOne ▸ countScalarWellFormed_bits_lt hCntW) hDel]
     unfold evalCopyNonOverlappingWithCountNonZero
     simp only [hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with
@@ -23577,7 +23589,8 @@ theorem evalStmt_copyNonOverlapping_window_refines
       evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
         count s.frame.locals := by
     rw [evalCopyNonOverlappingWithCount_eq_nonZero s srcOp dstOp localDecls layouts srcPtr dstPtr
-      srcSz dstSz count s.frame.locals hSrcSz hDstSz hDel]
+      srcSz dstSz count s.frame.locals hSrcSz hDstSz
+      (hCountBits ▸ countScalarWellFormed_bits_lt hCntW) hDel]
     unfold evalCopyNonOverlappingWithCountNonZero
     simp only [hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with
@@ -24679,7 +24692,8 @@ theorem evalStmt_copyNonOverlapping_window_same_or_disjoint_refines
       evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
         count s.frame.locals := by
     rw [evalCopyNonOverlappingWithCount_eq_nonZero s srcOp dstOp localDecls layouts srcPtr dstPtr
-      srcSz dstSz count s.frame.locals hSrcSz hDstSz hDel]
+      srcSz dstSz count s.frame.locals hSrcSz hDstSz
+      (hCountBits ▸ countScalarWellFormed_bits_lt hCntW) hDel]
     unfold evalCopyNonOverlappingWithCountNonZero
     simp only [hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with

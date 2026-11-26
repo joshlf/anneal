@@ -60,12 +60,16 @@ whose pointers pass the zero-byte precondition is a pure no-op. -/
 theorem zst_any_count_noop_univ (s : MachineState) (src dst : Operand) (ld : List LocalDecl)
     (ly : LayoutTable) (sv dv : Value) (count : Nat) (l3 : List LocalSlot) (al : Nat)
     (hElem : resolveCopyElemLayout ld ly src dst = .ok 0 al)
-    (hPre : zeroByteCopyPrecheck s l3 ld ly al sv dv = .ok) :
+    (hPre : zeroByteCopyPrecheck s l3 ld ly al sv dv = .ok)
+    (hCnt : count < scalarModulus (layoutPointerBytes ly)) :
     evalCopyNonOverlappingWithCount s src dst ld ly sv dv count l3 =
       MirStepNode.step (advanceStmt s l3) := by
   have h0 : Nat.mul count 0 = 0 := Nat.mul_zero count
+  have hRange : Bool.or (Nat.beq count 0)
+      (Nat.blt count (scalarModulus (layoutPointerBytes ly))) = true := by
+    simp [Nat.blt_eq.mpr hCnt]
   unfold evalCopyNonOverlappingWithCount
-  simp only [hElem, h0, hPre]
+  simp only [hRange, hElem, h0, hPre]
   all_goals rfl
 
 /-- A definitely violated zero-byte precondition on either pointer is `.ub` for `count = 0`,
@@ -102,13 +106,37 @@ unchanged non-zero-byte implementation. -/
 theorem unresolved_nonzero_delegates_univ (s : MachineState) (src dst : Operand)
     (ld : List LocalDecl) (ly : LayoutTable) (sp dp : ProvenancePtr) (count : Nat)
     (l3 : List LocalSlot) (hElem : resolveCopyElemLayout ld ly src dst = .unsupported)
-    (hC : Nat.beq count 0 = false) :
+    (hC : Nat.beq count 0 = false) (hCnt : count < scalarModulus (layoutPointerBytes ly)) :
     evalCopyNonOverlappingWithCount s src dst ld ly (.ptr sp (layoutPointerBytes ly))
         (.ptr dp (layoutPointerBytes ly)) count l3 =
       evalCopyNonOverlappingWithCountNonZero s src dst ld ly (.ptr sp (layoutPointerBytes ly))
         (.ptr dp (layoutPointerBytes ly)) count l3 := by
   unfold evalCopyNonOverlappingWithCount
-  simp [hElem, hC, isThinPtrValue]
+  simp [hElem, hC, isThinPtrValue, Nat.blt_eq.mpr hCnt]
+
+/-- A `count` whose bits are not a `usize` bit pattern is `.ub` at every element layout
+(even for a zero-sized `T`, where `count * size_of::<T>() = 0`). -/
+theorem out_of_range_count_ub_univ (s : MachineState) (src dst : Operand) (ld : List LocalDecl)
+    (ly : LayoutTable) (sv dv : Value) (count : Nat) (l3 : List LocalSlot)
+    (hCnt : scalarModulus (layoutPointerBytes ly) ≤ count) :
+    evalCopyNonOverlappingWithCount s src dst ld ly sv dv count l3 = MirStepNode.fail .ub := by
+  have hPos : 0 < scalarModulus (layoutPointerBytes ly) := by
+    generalize layoutPointerBytes ly = k
+    induction k with
+    | zero => exact Nat.one_pos
+    | succ k ih => exact Nat.mul_pos (by decide) ih
+  have hRange : Bool.or (Nat.beq count 0)
+      (Nat.blt count (scalarModulus (layoutPointerBytes ly))) = false := by
+    have h1 : count ≠ 0 := by omega
+    have h2 : ¬ count < scalarModulus (layoutPointerBytes ly) := by omega
+    have e1 : Nat.beq count 0 = false :=
+      Bool.eq_false_iff.mpr (fun h => h1 (Nat.eq_of_beq_eq_true h))
+    have e2 : Nat.blt count (scalarModulus (layoutPointerBytes ly)) = false :=
+      Bool.eq_false_iff.mpr (fun h => h2 (Nat.blt_eq.mp h))
+    rw [e1, e2]
+    rfl
+  unfold evalCopyNonOverlappingWithCount
+  simp only [hRange]
 
 /-! ### Fixtures -/
 
@@ -319,6 +347,12 @@ theorem resolve_arrU64x0 : resolveCopyElemLayout D64 L64 (cp 4) (cp 4) = .ok 0 8
 theorem zst_aligned_count5_noop : run 4 4 (av 16) (av 8) 5 = noop := rfl
 theorem zst_misaligned_count5_ub : run 4 4 (av 16) (av 4) 5 = MirStepNode.fail .ub := rfl
 theorem zst_dead_borrow_count5_unsupported : run 4 4 (pv 2 0) (av 8) 5 = MirStepNode.unsupported := rfl
+theorem zst_out_of_range_count_ub : run 4 4 (av 8) (av 8) (2 ^ 64) = MirStepNode.fail .ub := rfl
+/-- The call form only checks the `count` scalar's width; the out-of-range bits of a
+zero-sized-`T` call are still `.ub` (`evalCopyNonOverlappingWithCount` step 0). -/
+theorem call_zst_out_of_range_count_ub :
+    evalCopyNonOverlappingCall S64 D64 L64 [cp 4, cp 4, usz 0] [av 8, av 8, .scalar ⟨2 ^ 64, 8⟩]
+      locals64 (loc 0) 1 = MirStepNode.fail .ub := rfl
 
 /-! ### `count * size_of::<T>() ≤ isize::MAX` -/
 
@@ -689,12 +723,16 @@ whose pointers pass the zero-byte precondition is a pure no-op. -/
 theorem zst_any_count_noop_univ (s : MachineState) (src dst : Operand) (ld : List LocalDecl)
     (ly : LayoutTable) (sv dv : Value) (count : Nat) (l3 : List LocalSlot) (al : Nat)
     (hElem : resolveCopyElemLayout ld ly src dst = .ok 0 al)
-    (hPre : zeroByteCopyPrecheck s l3 ld ly al sv dv = .ok) :
+    (hPre : zeroByteCopyPrecheck s l3 ld ly al sv dv = .ok)
+    (hCnt : count < scalarModulus (layoutPointerBytes ly)) :
     evalCopyNonOverlappingWithCount s src dst ld ly sv dv count l3 =
       MirStepNode.step (advanceStmt s l3) := by
   have h0 : Nat.mul count 0 = 0 := Nat.mul_zero count
+  have hRange : Bool.or (Nat.beq count 0)
+      (Nat.blt count (scalarModulus (layoutPointerBytes ly))) = true := by
+    simp [Nat.blt_eq.mpr hCnt]
   unfold evalCopyNonOverlappingWithCount
-  simp only [hElem, h0, hPre]
+  simp only [hRange, hElem, h0, hPre]
   all_goals rfl
 
 /-- A definitely violated zero-byte precondition on either pointer is `.ub` for `count = 0`,
@@ -731,13 +769,37 @@ unchanged non-zero-byte implementation. -/
 theorem unresolved_nonzero_delegates_univ (s : MachineState) (src dst : Operand)
     (ld : List LocalDecl) (ly : LayoutTable) (sp dp : ProvenancePtr) (count : Nat)
     (l3 : List LocalSlot) (hElem : resolveCopyElemLayout ld ly src dst = .unsupported)
-    (hC : Nat.beq count 0 = false) :
+    (hC : Nat.beq count 0 = false) (hCnt : count < scalarModulus (layoutPointerBytes ly)) :
     evalCopyNonOverlappingWithCount s src dst ld ly (.ptr sp (layoutPointerBytes ly))
         (.ptr dp (layoutPointerBytes ly)) count l3 =
       evalCopyNonOverlappingWithCountNonZero s src dst ld ly (.ptr sp (layoutPointerBytes ly))
         (.ptr dp (layoutPointerBytes ly)) count l3 := by
   unfold evalCopyNonOverlappingWithCount
-  simp [hElem, hC, isThinPtrValue]
+  simp [hElem, hC, isThinPtrValue, Nat.blt_eq.mpr hCnt]
+
+/-- A `count` whose bits are not a `usize` bit pattern is `.ub` at every element layout
+(even for a zero-sized `T`, where `count * size_of::<T>() = 0`). -/
+theorem out_of_range_count_ub_univ (s : MachineState) (src dst : Operand) (ld : List LocalDecl)
+    (ly : LayoutTable) (sv dv : Value) (count : Nat) (l3 : List LocalSlot)
+    (hCnt : scalarModulus (layoutPointerBytes ly) ≤ count) :
+    evalCopyNonOverlappingWithCount s src dst ld ly sv dv count l3 = MirStepNode.fail .ub := by
+  have hPos : 0 < scalarModulus (layoutPointerBytes ly) := by
+    generalize layoutPointerBytes ly = k
+    induction k with
+    | zero => exact Nat.one_pos
+    | succ k ih => exact Nat.mul_pos (by decide) ih
+  have hRange : Bool.or (Nat.beq count 0)
+      (Nat.blt count (scalarModulus (layoutPointerBytes ly))) = false := by
+    have h1 : count ≠ 0 := by omega
+    have h2 : ¬ count < scalarModulus (layoutPointerBytes ly) := by omega
+    have e1 : Nat.beq count 0 = false :=
+      Bool.eq_false_iff.mpr (fun h => h1 (Nat.eq_of_beq_eq_true h))
+    have e2 : Nat.blt count (scalarModulus (layoutPointerBytes ly)) = false :=
+      Bool.eq_false_iff.mpr (fun h => h2 (Nat.blt_eq.mp h))
+    rw [e1, e2]
+    rfl
+  unfold evalCopyNonOverlappingWithCount
+  simp only [hRange]
 
 /-! ### Fixtures -/
 
@@ -945,6 +1007,12 @@ theorem resolve_arrU64x0 : resolveCopyElemLayout D64 L64 (cp 4) (cp 4) = .ok 0 8
 theorem zst_aligned_count5_noop : run 4 4 (av 16) (av 8) 5 = noop := rfl
 theorem zst_misaligned_count5_ub : run 4 4 (av 16) (av 4) 5 = MirStepNode.fail .ub := rfl
 theorem zst_dead_borrow_count5_unsupported : run 4 4 (pv 2 0) (av 8) 5 = MirStepNode.unsupported := rfl
+theorem zst_out_of_range_count_ub : run 4 4 (av 8) (av 8) (2 ^ 64) = MirStepNode.fail .ub := rfl
+/-- The call form only checks the `count` scalar's width; the out-of-range bits of a
+zero-sized-`T` call are still `.ub` (`evalCopyNonOverlappingWithCount` step 0). -/
+theorem call_zst_out_of_range_count_ub :
+    evalCopyNonOverlappingCall S64 D64 L64 [cp 4, cp 4, usz 0] [av 8, av 8, .scalar ⟨2 ^ 64, 8⟩]
+      locals64 (loc 0) 1 = MirStepNode.fail .ub := rfl
 
 /-! ### `count * size_of::<T>() ≤ isize::MAX` -/
 
@@ -1446,6 +1514,18 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.zst_dead_borrow_count5_unsupported
 
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.zst_out_of_range_count_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.zst_out_of_range_count_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.call_zst_out_of_range_count_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.call_zst_out_of_range_count_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.out_of_range_count_ub_univ' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V06.out_of_range_count_ub_univ
+
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V06.overflow_u64_ub' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V06.overflow_u64_ub
@@ -1757,6 +1837,18 @@ end Anneal.Tests.ZeroCountCopyAlign.V08
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.zst_dead_borrow_count5_unsupported' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms Anneal.Tests.ZeroCountCopyAlign.V08.zst_dead_borrow_count5_unsupported
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.zst_out_of_range_count_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.zst_out_of_range_count_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.call_zst_out_of_range_count_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.call_zst_out_of_range_count_ub
+
+/-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.out_of_range_count_ub_univ' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.Tests.ZeroCountCopyAlign.V08.out_of_range_count_ub_univ
 
 /-- info: 'Anneal.Tests.ZeroCountCopyAlign.V08.overflow_u64_ub' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
