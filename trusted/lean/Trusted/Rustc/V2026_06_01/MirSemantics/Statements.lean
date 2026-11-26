@@ -9469,11 +9469,42 @@ Target-width- and layout-consistency-aware exact root ABI alignment of `ty : Ty`
    `explicitLayoutConsistent` or `isUnresolvedLayoutIdx`), failing closed on
    unlaid-out ADTs/closures and non-64-bit platform-dependent alignments unless
    confirmed by a consistent explicit `TypeLayout`.
+4. `i128`, `u128`, and `f128` without a consistent `TypeLayout` (explicit or from
+   a local of the same type) fail closed (`.none`). The same value serves both
+   as the REQUIRED alignment (`copy`, `raw_eq`, `typed_swap_nonoverlapping`) and
+   as the GUARANTEED root-allocation alignment (`checkPtrArgAligned`,
+   `ptr_mask`), so any fixed guess is unsound in one of the two roles on some
+   target: the Reference states these types are often aligned to 4 or 8 bytes.
 
 Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
 
 > "The alignment of a value specifies what addresses are valid to store the value at. A value of alignment n must only be stored at an address that is a multiple of n."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.primitive.platform-specific-alignment>
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.primitive.size-align>
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.pointer.thin>
+
+> "The alignment of primitives is platform-specific. In most cases, their
+> alignment is equal to their size, but it may be less. In particular, `i128`
+> and `u128` are often aligned to 4 or 8 bytes even though their size is 16, and
+> on many 32-bit platforms, `i64`, `u64`, and `f64` are only aligned to 4 bytes,
+> not 8."
+> "`usize` and `isize` have the same size and alignment."
+> "Pointers to sized types have the same size and alignment as `usize`."
+
+Reference (The Rust Reference 1.98.0, "Boolean type" and "Character type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/boolean.html#r-type.bool.layout>
+<https://doc.rust-lang.org/1.98.0/reference/types/char.html#r-type.char.layout>
+
+> "An object with the boolean type has a size and alignment of 1 each."
+> "`char` is guaranteed to have the same size and alignment as `u32` on all platforms."
+
+Modeling choice (supplied target facts, not documented Rust guarantees): without
+a layout entry, 2-byte and 4-byte primitives are taken as size-aligned on targets with
+`pointerBits >= 32`, and 8-byte primitives, `usize`/`isize`, and thin pointers
+as 8-aligned only on 64-bit targets; every other width fails closed.
 -/
 def exactRootAllocAlignAux?
     (localDecls : List LocalDecl)
@@ -9504,8 +9535,7 @@ def exactRootAllocAlignAux?
             match isAtLeast32 with | true => .some 4 | false => .none
           | .int .i64 | .uint .u64 | .float .f64 =>
             match is64 with | true => .some 8 | false => .none
-          | .int .i128 | .uint .u128 | .float .f128 =>
-            match is64 with | true => .some 16 | false => .none
+          | .int .i128 | .uint .u128 | .float .f128 => .none
           | .int .isize | .uint .usize | .fnPtr _ _ _ _ =>
             match is64 with | true => .some 8 | false => .none
           | .ref _ pt | .rawPtr _ pt =>
