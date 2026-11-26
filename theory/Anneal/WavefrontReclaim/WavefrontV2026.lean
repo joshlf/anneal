@@ -4494,6 +4494,112 @@ theorem vsepWpOrdRelV2026_fiveStage_chained_lifecycle
                                   hV04, hPc04, hPost4,
                                   hw4'.2.2.2.2.2.1, hw4'.2.2.2.2.2.2⟩
 
+/-! ### Wavefront-Memory Spatial Frame Preservation Across `V2026_06_01` Loan Writebacks -/
+
+/-- A single popped-task execution preserves every `V2026SubLens` slice of the wavefront
+world's OWN `V2026_06_01` `Memory` that is byte-disjoint from all loan lenses (the only bytes a
+leaf writeback may touch via `v2026SubLensPut`), and preserves that disjointness
+(`[propext]`). -/
+theorem execWavefrontPopped_preserves_disjoint_mem_frame (pol : SpawnPolicy) (hd : WorkerTask)
+    (remFifo remSteal : List WorkerTask) (w wOut : WavefrontWorldV2026) (fL : V2026SubLens)
+    (hDisj : allDisjointFromLens fL w.loans)
+    (hExec : execWavefrontPoppedV2026 pol hd remFifo remSteal w = .returned wOut) :
+    v2026SubLensGet fL wOut.mem = v2026SubLensGet fL w.mem ∧
+    allDisjointFromLens fL wOut.loans := by
+  unfold execWavefrontPoppedV2026 at hExec
+  dsimp only at hExec
+  cases hAdm : spawnAdmissible hd.rank (pol hd.rank).1 (pol hd.rank).2.1 with
+  | false => rw [hAdm] at hExec; nomatch hExec
+  | true =>
+    rw [hAdm] at hExec
+    dsimp only at hExec
+    cases hY : hd.remYields with
+    | succ y' =>
+      rw [hY] at hExec
+      injection hExec with hW
+      subst hW
+      exact ⟨rfl, hDisj⟩
+    | zero =>
+      rw [hY] at hExec
+      dsimp only at hExec
+      cases hK : (pol hd.rank).1 with
+      | succ k' =>
+        rw [hK] at hExec
+        injection hExec with hW
+        subst hW
+        exact ⟨rfl, hDisj⟩
+      | zero =>
+        rw [hK] at hExec
+        dsimp only at hExec
+        cases hF : wfFindLoan hd.loanId w.loans with
+        | none => rw [hF] at hExec; nomatch hExec
+        | some e =>
+          rw [hF] at hExec
+          dsimp only at hExec
+          cases hSc : loanPhaseMatchesScope e.phase hd.scopeId with
+          | false => rw [hSc] at hExec; nomatch hExec
+          | true =>
+            rw [hSc] at hExec
+            dsimp only at hExec
+            cases hPut : v2026SubLensPut e.lens w.mem
+                (wfEncodeU32LeRawBytes (wrapU32 (e.val + hd.writeDelta))) with
+            | none => rw [hPut] at hExec; nomatch hExec
+            | some memOut =>
+              rw [hPut] at hExec
+              injection hExec with hW
+              subst hW
+              have hD1 : v2026LensDisjoint fL e.lens = true :=
+                allDisjointFromLens_wfFindLoan fL w.loans hd.loanId e hDisj hF
+              have hD2 : v2026LensDisjoint e.lens fL = true := by
+                rw [v2026LensDisjoint_symm]
+                exact hD1
+              exact ⟨v2026SubLens_get_put_disjoint e.lens fL w.mem memOut _ hD2 hPut,
+                allDisjointFromLens_wfSetLoanEntryAt fL w.loans hd.loanId _ _ hDisj⟩
+
+/-- Every successful `.poolWavefrontStep` preserves loan-disjoint slices of the world's
+`V2026_06_01` `Memory` (`[propext]`). -/
+theorem wavefrontStep_preserves_disjoint_mem_frame (pol : SpawnPolicy)
+    (w wOut : WavefrontWorldV2026) (fL : V2026SubLens)
+    (hDisj : allDisjointFromLens fL w.loans)
+    (hStep : evalHybridCmdV2026 (.poolWavefrontStep pol) w = .returned wOut) :
+    v2026SubLensGet fL wOut.mem = v2026SubLensGet fL w.mem ∧
+    allDisjointFromLens fL wOut.loans := by
+  change (match w.fifoQueue with
+    | hd :: ft => execWavefrontPoppedV2026 pol hd ft w.stealDeque w
+    | [] =>
+      match w.stealDeque with
+      | [] => .faultInvalidSpawn
+      | hd :: stTail => execWavefrontPoppedV2026 pol hd [] stTail w) = .returned wOut at hStep
+  cases hFq : w.fifoQueue with
+  | cons hd ft =>
+    rw [hFq] at hStep
+    exact execWavefrontPopped_preserves_disjoint_mem_frame pol hd ft w.stealDeque w wOut fL
+      hDisj hStep
+  | nil =>
+    rw [hFq] at hStep
+    dsimp only at hStep
+    cases hSd : w.stealDeque with
+    | nil => rw [hSd] at hStep; nomatch hStep
+    | cons hd st =>
+      rw [hSd] at hStep
+      exact execWavefrontPopped_preserves_disjoint_mem_frame pol hd [] st w wOut fL hDisj hStep
+
+/-- **Wavefront-drain spatial frame law over `V2026_06_01` `Memory` (`[propext]`)**: an entire
+`WavefrontConvergesV2026` drain — including every `.activeMut` leaf writeback into the world's
+`Memory.globals` — leaves every loan-disjoint `V2026SubLens` slice byte-for-byte unchanged
+under unmodified `globalAllocSliceToAbstractBytes`. -/
+theorem wavefrontConverges_preserves_disjoint_mem_frame (pol : SpawnPolicy)
+    {w wF : WavefrontWorldV2026} (hConv : WavefrontConvergesV2026 pol w wF)
+    (fL : V2026SubLens) (hDisj : allDisjointFromLens fL w.loans) :
+    v2026SubLensGet fL wF.mem = v2026SubLensGet fL w.mem ∧
+    allDisjointFromLens fL wF.loans := by
+  induction hConv with
+  | quiescent _ _ => exact ⟨rfl, hDisj⟩
+  | step w0 w1 _ _ hSt _ _ ih =>
+    have h1 := wavefrontStep_preserves_disjoint_mem_frame pol w0 w1 fL hDisj hSt
+    have h2 := ih h1.2
+    exact ⟨h2.1.trans h1.1, h2.2⟩
+
 /-! ## 5. `Firewall` / `IndexedCut`-Shielded `stepMirFn` & `runCfgSteps` Operational Bridge -/
 
 /-- `Anneal.Firewall`-shielded assertion that `m : Memory` owns `bs` at `L : V2026SubLens`,
@@ -7174,6 +7280,60 @@ theorem witness_stepMirFn_full_return_and_stutter_lockstep_v2026 :
     have hRet100 : stepMirFn wfPtrReadReclaimLoopBody out100.2 =
         MirStepNode.retNormal (.scalar ⟨132, 4⟩) out100.2.memory := rfl
     exact ⟨out100.1, out100.2, hEq100, hRet100⟩
+
+/-- **Positive Witness 10 — Dual-Memory Spatial Frame (`[propext]`)**: along the REAL 10-step
+`stepMirFn` lockstep trace of `wfPtrReadReclaimLoopBody` (Witness 8), the frame slot
+`wfCNodeFrameSlotLens = [20, 24)` holding `99` is preserved in BOTH memories: the MIR machine's
+final `Memory` (operational globals preservation) AND the drained wavefront world's own
+`V2026_06_01` `Memory` (via `wavefrontConverges_preserves_disjoint_mem_frame`), even though the
+drain's `.activeMut` writeback genuinely MUTATED that same allocation's epoch slot `[0, 4)` from
+`10` to `42`. -/
+theorem witness_dual_memory_frame_lockstep_trace10_v2026 :
+    allDisjointFromLens wfCNodeFrameSlotLens wfLoopBridgeWorld0.loans ∧
+    v2026SubLensGet wfCNodeEpochLens wfLoopBridgeWorld0.mem = some (wfEncodeU32LeAbsBytes 10) ∧
+    ∃ (msF : MachineState) (wF : WavefrontWorldV2026),
+      MirGlobalSliceAtV2026 msF.memory wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) ∧
+      WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld0 wF ∧
+      v2026SubLensGet wfCNodeFrameSlotLens wF.mem = some (wfEncodeU32LeAbsBytes 99) ∧
+      v2026SubLensGet wfCNodeEpochLens wF.mem = some (wfEncodeU32LeAbsBytes 42) := by
+  have hDisj0 : allDisjointFromLens wfCNodeFrameSlotLens wfLoopBridgeWorld0.loans :=
+    ⟨rfl, True.intro⟩
+  refine ⟨hDisj0, rfl, ?_⟩
+  cases witness_stepMirFn_lockstep_trace10_ptrLoop_v2026 with
+  | intro tr h1 =>
+    cases h1 with
+    | intro msF h =>
+      cases h.2.2.2 with
+      | intro wF hw =>
+        cases hw with
+        | intro rF hr =>
+          cases hr with
+          | intro vF hv =>
+            have hConv := hv.2.1
+            have hFr := wavefrontConverges_preserves_disjoint_mem_frame wfPolicyTower53210
+              hConv wfCNodeFrameSlotLens hDisj0
+            have hFr0 : v2026SubLensGet wfCNodeFrameSlotLens wfLoopBridgeWorld0.mem =
+                some (wfEncodeU32LeAbsBytes 99) := wfCNode24Mem0_get_frameSlot
+            have hReclaim := universal_post_drain_activeMut_reclaim wfPolicyTower53210
+              (towerLookupNext_admissible wfTower53210 1 0 rfl)
+              wfLoopBridgeWorld0 wF
+              (seal_loansSyncedWithMemV2026
+                ⟨rfl, True.intro, rfl, rfl, wfCNode24Mem0_get_epoch, True.intro⟩)
+              rfl hConv path0 rfl
+            cases hReclaim with
+            | intro e0 he0 =>
+              have hFind0 : wfFindLoan path0 wfLoopBridgeWorld0.loans =
+                  some (WfLoanEntryV2026.mk path0 (.spatialCheckedOut 1) wfCNodeEpochLens 10) :=
+                rfl
+              rw [hFind0] at he0
+              injection he0.1 with hSameE
+              rw [← hSameE] at he0
+              dsimp only at he0
+              have hSum42 :
+                  wrapU32 (10 + worldLoanDeltaSum wfPolicyTower53210 path0 wfLoopBridgeWorld0) =
+                    42 := rfl
+              rw [hSum42] at he0
+              exact ⟨msF, wF, hv.2.2.2.1, hConv, hFr.1.trans hFr0, he0.2.2.2⟩
 
 /-- Helper constructing single-cause negative test worlds over `wfCNode24Mem0`. -/
 def mkNegWorldV2026 (loans : List WfLoanEntryV2026)

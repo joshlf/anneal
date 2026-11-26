@@ -611,6 +611,32 @@ theorem ep2_a2_sepConj_write_frame_rootFrame_cfg_and_full_stepMirFn_return :
             exact ⟨tr14, msAtRet10, h.1, h.2.2.1, wF, rF, vF,
               hv.2.2.2.1, hv.2.2.2.2.1, hv.2.2.2.2.2⟩
 
+/-- **Pass B3 Integration — Wavefront-Memory Frame Law (`[propext]`)**:
+(1) GENERAL: every `WavefrontConvergesV2026` drain preserves every loan-disjoint
+`V2026SubLens` slice of the world's own `V2026_06_01` `Memory` (despite genuine `.activeMut`
+writebacks into the same `Memory.globals`); (2) CONCRETE dual-memory frame along the real
+10-step `stepMirFn` lockstep trace: `[20, 24) = 99` survives in BOTH the MIR machine memory and the
+drained wavefront memory, while the loan-covered epoch slot `[0, 4)` is NOT framed (`10 ↦ 42`),
+showing the disjointness side condition is load-bearing. -/
+theorem ep2_b3_wavefront_memory_frame_law :
+    (∀ (pol : SpawnPolicy) (w wF : WavefrontWorldV2026) (fL : V2026SubLens),
+      WavefrontConvergesV2026 pol w wF →
+      allDisjointFromLens fL w.loans →
+      v2026SubLensGet fL wF.mem = v2026SubLensGet fL w.mem) ∧
+    (∃ (msF : MachineState) (wF : WavefrontWorldV2026),
+      MirGlobalSliceAtV2026 msF.memory wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) ∧
+      v2026SubLensGet wfCNodeFrameSlotLens wF.mem = some (wfEncodeU32LeAbsBytes 99) ∧
+      v2026SubLensGet wfCNodeEpochLens wfLoopBridgeWorld0.mem = some (wfEncodeU32LeAbsBytes 10) ∧
+      v2026SubLensGet wfCNodeEpochLens wF.mem = some (wfEncodeU32LeAbsBytes 42)) := by
+  refine ⟨fun pol _ _ fL hConv hDisj =>
+    (wavefrontConverges_preserves_disjoint_mem_frame pol hConv fL hDisj).1, ?_⟩
+  have hW := witness_dual_memory_frame_lockstep_trace10_v2026
+  cases hW.2.2 with
+  | intro msF h1 =>
+    cases h1 with
+    | intro wF h =>
+      exact ⟨msF, wF, h.1, h.2.2.1, hW.2.1, h.2.2.2⟩
+
 /-- **Unified Episode 2 Cross-Module Master Capstone (`[propext]`)**:
 Bundles the positive and fail-closed negative witnesses from ALL THREE root modules:
 `Anneal.MiriTreeBorrowsV2026`, `Anneal.SepAC.RangeSpanV2026`, and
@@ -853,6 +879,10 @@ run_cmd do
         ``Anneal.WavefrontReclaim.WavefrontV2026.mirSingleStepTo_preserves_rootFrame_of_wavefrontCfgBody),
       (``Anneal.WavefrontReclaim.WavefrontV2026.mirNodeNext?_sound,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode.emitStep),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.wavefrontConverges_preserves_disjoint_mem_frame,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.wavefrontConverges_preserves_disjoint_mem_frame,
+        ``Anneal.WavefrontReclaim.WavefrontV2026.v2026SubLens_get_put_disjoint),
       (``Anneal.WavefrontReclaim.WavefrontV2026.witness_stepMirFn_lockstep_trace10_ptrLoop_v2026,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (``Anneal.WavefrontReclaim.WavefrontV2026.runCfgSteps_wavefrontDrain_indexedCut_bridge,
