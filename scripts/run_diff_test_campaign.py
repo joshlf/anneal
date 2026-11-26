@@ -303,6 +303,12 @@ class DeduplicatedFinding:
     failing_construct_hint: str | None = None
     failing_construct_hints: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        if self.failing_construct_hint and not self.failing_construct_hints:
+            self.failing_construct_hints = [self.failing_construct_hint]
+        elif self.failing_construct_hint is None and self.failing_construct_hints:
+            self.failing_construct_hint = self.failing_construct_hints[0]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "fingerprint": self.fingerprint,

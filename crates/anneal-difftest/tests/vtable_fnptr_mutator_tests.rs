@@ -790,7 +790,7 @@ fn perturb_fault_seed_miri_candidates(
             .1
             .seed_u64
     };
-    let cases: [(&str, &str, &dyn MiriAstMutator, u64, &'static MiriTemplate); 6] = [
+    let cases: [(&str, &str, &dyn MiriAstMutator, u64, &'static MiriTemplate); 7] = [
         (
             "panic_perturb_vt",
             "pub fn panic_perturb_vt() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
@@ -803,6 +803,13 @@ fn perturb_fault_seed_miri_candidates(
             "pub fn panic_perturb_clos() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
             &ClosureAndAddrEqMutator,
             seed_of("closure_by_unique_ref"),
+            &PERTURB_FAULT_TEMPLATES[0],
+        ),
+        (
+            "panic_perturb_clos_fn_ptr",
+            "pub fn panic_perturb_clos_fn_ptr() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
+            &ClosureAndAddrEqMutator,
+            seed_of("closure_fn_ptr"),
             &PERTURB_FAULT_TEMPLATES[0],
         ),
         (
@@ -2081,7 +2088,7 @@ fn tb_stacked_and_perturb_fault_miri_candidates_place_probes_and_compile() {
 
     let perturb_cands = perturb_fault_seed_miri_candidates(tb_cands.len());
     let perturb_replay = perturb_fault_seed_miri_candidates(tb_cands.len());
-    assert_eq!(perturb_cands.len(), 6);
+    assert_eq!(perturb_cands.len(), 7);
     assert_eq!(perturb_cands.len(), perturb_replay.len());
     for ((_, cand), (_, replay)) in perturb_cands.iter().zip(&perturb_replay) {
         assert_eq!(cand, replay, "`{}` is not deterministic", cand.fn_name);
@@ -2724,6 +2731,29 @@ fn indirect_call_templates_run_through_live_miri_and_anneal_oracles() {
                 problems.push(format!(
                     "clos_closure_fn_ptr expected failing_construct_hint PointerCoercion::ClosureFnPointer, got {:?}",
                     finding.failing_construct_hint
+                ));
+            }
+        }
+        if finding.fn_name == "vt_dyn_dispatch" || finding.fn_name == "clos_closure_fn_ptr" {
+            let expected_hint = if finding.fn_name == "vt_dyn_dispatch" {
+                "PointerCoercion::Unsize"
+            } else {
+                "PointerCoercion::ClosureFnPointer"
+            };
+            let bundle_dir = dir.join("findings").join(&finding.finding_id);
+            let json_text = fs::read_to_string(bundle_dir.join("finding.json")).unwrap_or_default();
+            let summary_text =
+                fs::read_to_string(bundle_dir.join("SUMMARY.md")).unwrap_or_default();
+            if !json_text.contains(&format!("\"failing_construct_hint\": \"{expected_hint}\"")) {
+                problems.push(format!(
+                    "{} finding.json missing failing_construct_hint {expected_hint}",
+                    finding.fn_name
+                ));
+            }
+            if !summary_text.contains(&format!("- **Failing construct hint**: `{expected_hint}`")) {
+                problems.push(format!(
+                    "{} SUMMARY.md missing failing_construct_hint bullet for {expected_hint}",
+                    finding.fn_name
                 ));
             }
         }

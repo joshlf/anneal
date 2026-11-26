@@ -9937,6 +9937,48 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
                 "Intrinsic::CopyNonOverlapping",
             )
 
+            # Direct construction with only `failing_construct_hint` keeps
+            # `to_dict()`, Markdown, and JUnit XML consistent.
+            direct_dedup = campaign.DeduplicatedFinding(
+                fingerprint="VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub",
+                cause="VTableAndFnPtrMutator",
+                seed_name="pass_seed",
+                divergence_class="false_positive_ub",
+                normalized_anneal_tag="MirDiffTag.ub",
+                quarantined=False,
+                occurrences=1,
+                primary_fn_name="pass_seed__b0_c0",
+                primary_repro_path=str(repro),
+                all_repro_paths=[str(repro)],
+                miri_outcome="pass:scalar:55:4",
+                anneal_outcome="ub@src/lib.rs:8:51: 9:37",
+                kernel_confirmed=True,
+                witness_polarity="sound_conservative_abstraction",
+                failing_construct_hint="PointerCoercion::Unsize",
+            )
+            self.assertEqual(
+                direct_dedup.to_dict()["failing_construct_hints"],
+                ["PointerCoercion::Unsize"],
+            )
+            junit_path = tmp_path / "junit.xml"
+            campaign.write_oracle_junit_xml(
+                junit_path,
+                "smoke",
+                {"compared_candidates": 1, "diverge_count": 1},
+                campaign.RedFlagResult(passed=True, checks={}, failure_reasons=[]),
+                [direct_dedup],
+                False,
+                None,
+                None,
+                [],
+                False,
+                1.0,
+            )
+            self.assertIn(
+                "construct_hint=PointerCoercion::Unsize",
+                junit_path.read_text(encoding="utf-8"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3639,6 +3639,14 @@ fn collect_ident_tokens(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<Str
 /// under their self-type identifiers rather than merging their method names
 /// (such as `drop`) across unrelated `impl` blocks in `fn_bodies`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedImportPath {
+    enclosing_containers: Vec<String>,
+    enclosing_fns: Vec<String>,
+    path: Vec<String>,
+    used: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NestedFnOwner {
     top_fn: Option<String>,
     containers: Vec<String>,
@@ -3728,11 +3736,13 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         // Record each imported path resolved against the enclosing `mod`
         // containers (`crate::` resets, `super::` pops, `self::` stays) and
-        // scoped to its whole enclosing `fn` chain (top-level, `mod`-nested, or
-        // `fn`-nested), so an import inside an unreached function or
-        // `dead_mod::other` never leaks `dead_mod::*`.
+        // scoped to BOTH its enclosing `mod` containers and its enclosing `fn`
+        // chain, so an import inside an unreached `mod` (at module level or
+        // inside a `fn` whose short name collides with a reached sibling) never
+        // leaks globally.
         let mut flat: Vec<(Vec<String>, String)> = Vec::new();
         flatten_use_tree(&item.tree, &mut Vec::new(), &mut flat);
+        let enclosing_containers = self.container_stack.clone();
         let enclosing_fns = self.fn_stack.clone();
         for (segments, mut used_name) in flat {
             let mut base: Vec<String> = self.container_stack.clone();
@@ -3760,7 +3770,12 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
                     used_name = mod_ident.clone();
                 }
             }
-            let entry = (enclosing_fns.clone(), base, used_name);
+            let entry = ScopedImportPath {
+                enclosing_containers: enclosing_containers.clone(),
+                enclosing_fns: enclosing_fns.clone(),
+                path: base,
+                used: used_name,
+            };
             if !self.graph.imported_paths.contains(&entry) {
                 self.graph.imported_paths.push(entry);
             }
@@ -4039,9 +4054,9 @@ struct ScopeGraphData {
     impl_method_names: BTreeSet<String>,
     nested_fn_stems: BTreeMap<String, Vec<NestedFnOwner>>,
     inherent_impl_method_stems: BTreeMap<String, Vec<InherentMethodOwner>>,
-    /// `(enclosing fn chain if local, resolved import path, name it is
-    /// used under)`; a glob import ends in `"*"` and is used under `"*"`.
-    imported_paths: Vec<(Vec<String>, Vec<String>, String)>,
+    /// Resolved `use` paths gated on their enclosing `mod` containers and `fn`
+    /// chain; a glob import ends in `"*"` and is used under `"*"`.
+    imported_paths: Vec<ScopedImportPath>,
     top_level_fns: BTreeSet<String>,
     defined_value_names: BTreeSet<String>,
     defined_type_names: BTreeSet<String>,
@@ -5304,11 +5319,13 @@ fn confirm_helper_module_suffixes(
                 if containers.iter().all(named) {
                     return true;
                 }
-                scope_graph.imported_paths.iter().any(|(enclosing_fns, path, used)| {
-                    if !enclosing_fns.iter().all(|f| top_fn_is_reached(f)) {
+                scope_graph.imported_paths.iter().any(|imp| {
+                    if !imp.enclosing_containers.last().is_none_or(named)
+                        || !imp.enclosing_fns.iter().all(|f| top_fn_is_reached(f))
+                    {
                         return false;
                     }
-                    let Some((last, prefix)) = path.split_last() else {
+                    let Some((last, prefix)) = imp.path.split_last() else {
                         return false;
                     };
                     if last == "*" {
@@ -5317,12 +5334,12 @@ fn confirm_helper_module_suffixes(
                             && containers[prefix.len()..].iter().all(named);
                     }
                     if prefix == containers && last == leaf {
-                        return scope_idents.contains(used);
+                        return scope_idents.contains(&imp.used);
                     }
-                    path.len() <= containers.len()
-                        && containers[..path.len()] == **path
-                        && scope_idents.contains(used)
-                        && containers[path.len()..].iter().all(named)
+                    imp.path.len() <= containers.len()
+                        && containers[..imp.path.len()] == *imp.path
+                        && scope_idents.contains(&imp.used)
+                        && containers[imp.path.len()..].iter().all(named)
                 })
             };
 
@@ -15977,6 +15994,12 @@ mod dead_mod2 {
         f(10u32)
     }
 }
+mod dead_mod3 {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x + v;
+        f(14u32)
+    }
+}
 mod local_mod {
     pub fn helper(v: u32) -> u32 {
         let f = |x: u32| x ^ v;
@@ -15984,28 +16007,37 @@ mod local_mod {
     }
 }
 mod dead_wrapper {
+    use super::dead_mod3::helper as mod_level_helper;
     pub fn dead_inner() -> u32 {
         use super::dead_mod2::helper;
-        helper(12u32)
+        helper(12u32) ^ mod_level_helper(1u32)
+    }
+}
+mod dead_mod_holder {
+    use super::dead_mod3::helper;
+    pub fn shared_inner() -> u32 {
+        helper(15u32)
     }
 }
 mod live_wrapper {
-    pub fn live_inner() -> u32 {
+    pub fn shared_inner() -> u32 {
         use super::local_mod::helper;
         helper(13u32)
     }
 }
 pub fn root_entry() -> u32 {
     live_mod::helper(1u32) ^ inner_mod::deep(2u32) ^ globbed(3u32) ^ sub::run(4u32)
-        ^ live_wrapper::live_inner()
+        ^ live_wrapper::shared_inner()
 }
 ";
         let pairs: Vec<(String, String)> = [
             ("{closure#0}", "X.live_mod_helper_closure_0"),
             ("{closure#0}", "X.dead_mod_helper_closure_0"),
             ("{closure#0}", "X.dead_fn_mod_helper_closure_0"),
-            // `use` inside a `mod`-nested fn: gated on that fn's reachability.
+            // `use` inside a dead `mod` (module-level or inside a name-colliding fn)
+            // must never leak; a live `mod`-nested fn's `use` still links.
             ("{closure#0}", "X.dead_mod2_helper_closure_0"),
+            ("{closure#0}", "X.dead_mod3_helper_closure_0"),
             ("{closure#0}", "X.local_mod_helper_closure_0"),
             ("{closure#0}", "X.outer_mod_inner_mod_deep_closure_0"),
             ("{closure#0}", "X.glob_mod_globbed_closure_0"),
