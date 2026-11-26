@@ -3531,9 +3531,1378 @@ def evalForeignFrameCopySingleDirect
                 | .none => MirStepNode.fail .ub
       | _ => MirStepNode.fail .ub
 
+/-! ### Zero-byte `copy_nonoverlapping`: pointer validity, alignment, and size guard -/
+
 /--
-Execute a `NonDivergingIntrinsic.copyNonOverlapping src dst count` statement with
-pre-resolved count bits.
+Three-valued outcome of a pure, machine-state-reading but non-mutating
+precondition check on the zero-byte fragment of `copy_nonoverlapping::<T>`
+(`count * size_of::<T>() == 0`): the precondition holds in every execution
+(`.ok`), is violated in some execution permitted by the Rust abstract machine
+(`.ub`), or cannot be decided from the modeled state (`.unsupported`, fail
+closed).
+
+Modeling choice: this is an evaluator-internal verdict type; it carries no
+Rust-attributed property by itself (see `zeroByteCopyPrecheck` and
+`evalCopyNonOverlappingWithCount` for the modeled Rust rules).
+-/
+inductive ZeroCheck : Type where
+  /-- The checked precondition holds in every execution. -/
+  | ok : ZeroCheck
+  /-- The checked precondition is violated in some permitted execution. -/
+  | ub : ZeroCheck
+  /-- The modeled state does not determine the precondition (fail closed). -/
+  | unsupported : ZeroCheck
+
+/--
+Kleene strong conjunction of two independent `ZeroCheck` verdicts: `.ub` on
+either side wins (`ub ∧₃ _ = ub`, `_ ∧₃ ub = ub`), otherwise `.unsupported` on
+either side wins, and `ok ∧₃ ok = ok`.
+
+Both conjuncts are pure predicates over the same pre-state (neither performs a
+memory access), so a definite violation of the `dst` precondition is undefined
+behavior in every execution regardless of whether the `src` precondition could
+be decided; an undecided `src` check therefore never masks a definite `dst`
+violation (and vice versa).
+
+Reference (`core::ptr::copy_nonoverlapping` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L455-L461>
+
+> "/// Behavior is undefined if any of the following conditions are violated:"
+> ...
+> "/// * Both `src` and `dst` must be properly aligned."
+-/
+@[reducible]
+def ZeroCheck.both : ZeroCheck → ZeroCheck → ZeroCheck
+  | .ub, _ => .ub
+  | _, .ub => .ub
+  | .unsupported, _ => .unsupported
+  | _, .unsupported => .unsupported
+  | .ok, .ok => .ok
+
+/--
+Convert a three-valued alignment verdict (`.some true` = aligned in every
+execution, `.some false` = misaligned in some permitted execution, `.none` =
+undetermined) into a `ZeroCheck`.
+
+Modeling choice: evaluator-internal plumbing with no Rust-attributed property.
+-/
+@[reducible]
+def ZeroCheck.ofAligned? : Option Bool → ZeroCheck
+  | .some true => .ok
+  | .some false => .ub
+  | .none => .unsupported
+
+/--
+`isize::MAX` (`2^(8 * ptrBytes - 1) - 1`) on a target with `ptrBytes`-byte
+pointers: the largest byte count `count * size_of::<T>()` a
+`copy_nonoverlapping::<T>` call may cover.
+
+Reference (`core::ptr::copy_nonoverlapping` source,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L457-L459>
+
+> "/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0."
+
+Reference (The Rust Reference 1.98.0, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
+
+> "The usize type is an unsigned integer type with the same number of bits as the platform’s pointer type. It can represent every memory address in the process."
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L126-L133>
+
+> "//! For any allocation with `base` address, `size`, and a set of
+> //! `addresses`, the following are guaranteed:
+> ...
+> //! - `size <= isize::MAX`"
+
+Justification and modeling choice: the copied byte count is the
+mathematical product `count * size_of::<T>()` (a `Nat`, never wrapped). No
+allocation, and hence no region a pointer can be valid for, spans more than
+`isize::MAX` bytes; a product above `isize::MAX` can therefore never satisfy
+the validity requirement when it is non-zero. A product above `isize::MAX` is
+treated as undefined behavior before any zero-byte short-circuit, matching the
+`count * size_of::<T>() <= isize::MAX` precondition enforced by
+`Terminators.evalCopyCall` (`isizeMax`); this ordering is a modeling choice
+(such a product is never `0`).
+-/
+@[reducible]
+def isizeMaxBytes (ptrBytes : Nat) : Nat :=
+  Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1
+
+/--
+Whether `v` has the shape of a thin raw-pointer value on a target with
+`ptrBytes`-byte pointers: an in-range `ptrBytes`-wide integer address
+(`.scalar ⟨bits, ptrBytes⟩`, `bits < 2^(8 * ptrBytes)`) or a `ptrBytes`-wide
+provenance pointer (`.ptr p ptrBytes`). Every other `Value` (`.unit`,
+`.aggregate`, `Value.uninit` in snapshots that have it, wrong-width scalars or
+pointers, out-of-range bits) is not a `*const T` / `*mut T` value.
+
+Reference (The Rust Reference 1.98.0, "Pointer types" / "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.pointer.thin>
+
+> "Pointers to sized types have the same size and alignment as `usize`."
+
+Modeling choice: the wildcard arm (rather than an explicit `Value.uninit` arm)
+keeps this definition byte-identical across snapshots whose `Value` differs in
+its non-pointer constructors.
+-/
+@[reducible]
+def isThinPtrValue (ptrBytes : Nat) : Value → Bool
+  | .scalar sv =>
+    Bool.and (Nat.beq sv.sizeBytes ptrBytes) (Nat.blt sv.bits (scalarModulus ptrBytes))
+  | .ptr _ sz => Nat.beq sz ptrBytes
+  | _ => false
+
+/--
+Whether the evaluated `count : usize` argument `sc` of a
+`copy_nonoverlapping` statement is a well-formed `usize` bit pattern on a
+target with `ptrBytes`-byte pointers (`sc.sizeBytes = ptrBytes` and
+`sc.bits < 2^(8 * ptrBytes)`).
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L530>
+
+> "pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {"
+
+Reference (The Rust Reference 1.98.0, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
+
+> "The usize type is an unsigned integer type with the same number of bits as the platform’s pointer type. It can represent every memory address in the process."
+
+Modeling choice: a `count` operand whose value is not such a bit pattern is
+ill-typed MIR and faults with `.ub` (as for any other ABI-incompatible
+argument).
+-/
+@[reducible]
+def countScalarWellFormed (ptrBytes : Nat) (sc : ScalarInt) : Bool :=
+  Bool.and (Nat.beq sc.sizeBytes ptrBytes) (Nat.blt sc.bits (scalarModulus ptrBytes))
+
+/--
+Whether some element of `ks` satisfies `pred` (helper for
+`copyIsUnsizedRigidTy`).
+
+Modeling choice: pure list helper with no Rust-attributed property.
+-/
+def copyAnyUnsizedRigidTy (pred : RigidTy → Bool) : List RigidTy → Bool
+  | .nil => false
+  | k :: rest =>
+    match pred k with
+    | true => true
+    | false => copyAnyUnsizedRigidTy pred rest
+
+/--
+Fuel-bounded structural test whether `ty` is a dynamically sized type: a slice,
+`str`, trait object, `extern` type, an array of such, or a tuple containing
+one. Self-contained (it depends only on `MirAst`) so that the zero-byte
+`copy_nonoverlapping` guard is portable across snapshots whose shared
+`isUnsizedRigidTy` lives in different modules.
+
+Reference (The Rust Reference 1.98.0, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Structs may contain a DST as the last field; this makes the struct itself a
+> DST."
+
+Modeling choice: exhausting `fuel` answers `false`; callers never conclude
+anything stronger than "not structurally known to be unsized" from `false`
+(the subsequent layout resolution fails closed independently).
+-/
+def copyIsUnsizedRigidTy : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ fuel', ty =>
+    match ty with
+    | .slice _ => true
+    | .str => true
+    | .dynamic _ => true
+    | .foreign _ => true
+    | .array elemTy _ => copyIsUnsizedRigidTy fuel' elemTy
+    | .tuple ks => copyAnyUnsizedRigidTy (copyIsUnsizedRigidTy fuel') ks
+    | _ => false
+
+/--
+Self-contained copy of `layoutValidForResolvedAdt`: `true` when `l` at
+`layoutIdx` is structurally plausible as the layout of an `.adt` or `.closure`
+(every `layoutValidForAdt l` entry, plus inhabited single-variant
+`FieldsShape.primitive` wrapper layouts at a non-zero, hence non-synthesized,
+index).
+
+Reference (The Rust Reference 1.98.0, "The transparent representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-transparent-representation>
+
+> "Structs and enums with this representation have the same layout and ABI as the
+> only non-size 0 non-alignment 1 field, if present, or unit otherwise."
+-/
+@[reducible]
+def copyLayoutValidForResolvedAdt (layoutIdx : Nat) (l : TypeLayout) : Bool :=
+  match layoutValidForAdt l with
+  | true => true
+  | false =>
+    match Nat.beq layoutIdx 0, l.isUninhabited, l.fields, l.variants with
+    | false, false, .primitive, .single _ => true
+    | _, _, _, _ => false
+
+/--
+Whether `layouts` describes a 64-bit target (`pointerBits = 64`, with the
+table default `pointerBits = 0` read as 64-bit like `layoutPointerBytes`).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.primitive.platform-specific-alignment>
+
+> "The alignment of primitives is platform-specific. In most cases, their
+> alignment is equal to their size, but it may be less. In particular, `i128`
+> and `u128` are often aligned to 4 or 8 bytes even though their size is 16, and
+> on many 32-bit platforms, `i64`, `u64`, and `f64` are only aligned to 4 bytes,
+> not 8."
+
+Modeling choice: the structural (layout-free) size/alignment fallback of the
+zero-byte guard is only used on 64-bit targets (see `copyTySizeAndAlign?`).
+-/
+@[reducible]
+def copyTargetIs64 (layouts : LayoutTable) : Bool :=
+  match layouts.pointerBits with
+  | 0 => true
+  | n + 1 => Nat.beq (n + 1) 64
+
+/--
+Whether a `BackendRepr` is a (thin or wide) pointer representation: a
+`Scalar` or the first component of a `ScalarPair` whose primitive is a
+pointer.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1793-L1810>
+
+> "pub enum BackendRepr {
+> Scalar(Scalar),
+> ScalarPair(Scalar, Scalar),"
+-/
+@[reducible]
+def copyIsPtrBackendRepr : BackendRepr → Bool
+  | .scalar (.initialized (.pointer _) _) => true
+  | .scalar (.union (.pointer _)) => true
+  | .scalarPair (.initialized (.pointer _) _) _ => true
+  | .scalarPair (.union (.pointer _)) _ => true
+  | _ => false
+
+/--
+Whether some entry `idx ∈ fieldLayouts` is a dangling index into `layouts` or
+satisfies `check` (helper for `copyLayoutHasPlaceholder`).
+
+Modeling choice: a dangling `fieldLayouts` index is treated as possibly
+placeholder-bearing (fail closed).
+-/
+def copyAnyFieldLayoutHasPlaceholder
+    (layouts : LayoutTable)
+    (check : TypeLayout → Bool) :
+    List Nat → Bool
+  | .nil => false
+  | idx :: rest =>
+    match LayoutTable.lookup layouts idx with
+    | .none => true
+    | .some fl =>
+      match check fl with
+      | true => true
+      | false => copyAnyFieldLayoutHasPlaceholder layouts check rest
+
+/--
+Fuel-bounded test whether the layout `l` is, or transitively (through
+`fieldLayouts`) contains, a pre-monomorphization generic placeholder layout
+(`TypeLayout.isParamPlaceholder`): the synthetic `size = 0, align = 1`
+`.primitive` layout that `rustc-capture` emits for a type parameter `T` before
+`LayoutTable.appendParamLayouts` substitutes the instantiated layouts.
+Recursion stops at pointer layouts (`copyIsPtrBackendRepr`), whose single
+`fieldLayouts` entry names the pointee rather than a field, so recursive types
+such as `struct Node { next: *mut Node }` never cycle.
+
+Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L706-L712>
+
+> "fn layout_of(&self, ty: Ty<'tcx>) -> Self::LayoutOfResult"
+
+Modeling choice: a placeholder-bearing layout is a template, not the layout of
+any concrete type, so it never determines `size_of::<T>()` or
+`align_of::<T>()`. Exhausting `fuel` answers `true` (fail closed; `32` exceeds
+the depth-16 `rustc-capture` field-interning limit).
+-/
+def copyLayoutHasPlaceholder (layouts : LayoutTable) : Nat → TypeLayout → Bool
+  | .zero, _ => true
+  | .succ fuel', l =>
+    match TypeLayout.isParamPlaceholder l with
+    | true => true
+    | false =>
+      match copyIsPtrBackendRepr l.backendRepr with
+      | true => false
+      | false =>
+        copyAnyFieldLayoutHasPlaceholder layouts (copyLayoutHasPlaceholder layouts fuel')
+          l.fieldLayouts
+
+/--
+Whether `l` matches the synthetic template `rustc-capture` emits for a
+parametric compound type whose field layouts were not interned (field depth
+`≥ 16`): `align = 1`, `size ≤ 1`, at least one field, and no `fieldLayouts`.
+
+Modeling choice (supplied `rustc-capture` fact, not a documented Rust
+guarantee): such a template does not determine the size or alignment of the
+instantiated type, so it is rejected (fail closed). A genuine concrete
+`align = 1, size ≤ 1` compound layout captured without `fieldLayouts` is also
+rejected; this only costs precision (`.unsupported`), never soundness.
+-/
+@[reducible]
+def copyLayoutTruncatedParametric (l : TypeLayout) : Bool :=
+  let hasFields : Bool :=
+    match l.fields with
+    | .primitive => false
+    | .union n => Bool.not (Nat.beq n 0)
+    | .array _ n => Bool.not (Nat.beq n 0)
+    | .arbitrary offsets _ =>
+      match offsets with
+      | .nil => false
+      | _ :: _ => true
+  match l.fieldLayouts with
+  | _ :: _ => false
+  | .nil => Bool.and hasFields (Bool.and (Nat.beq l.align.bytes 1) (Nat.ble l.size.bytes 1))
+
+/--
+Target byte size of a primitive scalar or pointer-width `RigidTy` on a target
+with `ptrBytes`-byte pointers, or `.none` for every other kind.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.primitive.size-align>
+
+> "`usize` and `isize` have the same size and alignment."
+
+Reference (The Rust Reference 1.98.0, "Boolean type" and "Character type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/boolean.html#r-type.bool.layout>
+<https://doc.rust-lang.org/1.98.0/reference/types/char.html#r-type.char.layout>
+
+> "An object with the boolean type has a size and alignment of 1 each."
+> "`char` is guaranteed to have the same size and alignment as `u32` on all platforms."
+
+Modeling choice: the fixed-width integer and float sizes are their bit widths
+divided by 8; function pointers are pointer-width.
+-/
+@[reducible]
+def copyPrimByteSize? (ptrBytes : Nat) : RigidTy → Option Nat
+  | .bool | .int .i8 | .uint .u8 => .some 1
+  | .int .i16 | .uint .u16 | .float .f16 => .some 2
+  | .char | .int .i32 | .uint .u32 | .float .f32 => .some 4
+  | .int .i64 | .uint .u64 | .float .f64 => .some 8
+  | .int .i128 | .uint .u128 | .float .f128 => .some 16
+  | .int .isize | .uint .usize | .fnPtr _ _ _ _ => .some ptrBytes
+  | _ => .none
+
+/--
+Last element of a tuple's field-type list (helper for `copyPtrIsWide?`).
+
+Modeling choice: pure list helper with no Rust-attributed property.
+-/
+def copyListLast? : List RigidTy → Option RigidTy
+  | .nil => .none
+  | k :: .nil => .some k
+  | _ :: rest => copyListLast? rest
+
+/--
+Fuel-bounded test whether a pointer to `pt` is a wide pointer: `.some true`
+for slices, `str`, trait objects, and tuples whose last field is such;
+`.some false` for every other structurally sized or `extern` pointee; `.none`
+when the pointee's sizedness is not determined structurally (an ADT, which may
+have an unsized tail, an unnormalized `.param` / `.alias`, or `.other`).
+
+Reference (The Rust Reference 1.98.0, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html#r-dynamic-sized.pointer-types>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types, since they also store metadata:"
+> "Pointers to a struct or tuple with an unsized tail store the same metadata as
+> a pointer to that tail."
+-/
+def copyPtrIsWide? : Nat → RigidTy → Option Bool
+  | .zero, _ => .none
+  | .succ fuel', pt =>
+    match pt with
+    | .slice _ => .some true
+    | .str => .some true
+    | .dynamic _ => .some true
+    | .tuple ks =>
+      match copyListLast? ks with
+      | .none => .some false
+      | .some lastK => copyPtrIsWide? fuel' lastK
+    | .adt _ _ => .none
+    | .param _ _ => .none
+    | .alias _ _ => .none
+    | .other _ => .none
+    | _ => .some false
+
+/--
+Whether the compiler-supplied layout `l` (found at index `layoutIdx`) is shape-
+and size-consistent with the type `kind` it is used for, on target `layouts`:
+primitive sizes, `!` / function-item / `()` zero-sized shapes, thin
+(`ptrBytes`) or wide (`2 * ptrBytes`) pointers with alignment at most
+`ptrBytes`, arrays with `count = N` and `size = stride * N`, tuples with one
+offset per field, ADT/closure plausibility (`copyLayoutValidForResolvedAdt`),
+and — for compound types — no generic placeholder (`copyLayoutHasPlaceholder`)
+and no truncated parametric template (`copyLayoutTruncatedParametric`). This
+rejects mislabeled indices (for example an unrelated `entries[0]` reached
+through a synthesized `layoutIdx = 0`).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an array with that item type including alignment padding. The size of a value is always a multiple of its alignment."
+
+Reference (The Rust Reference 1.98.0, "Array Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#array-layout>
+
+> "An array of [T; N] has a size of size_of::<T>() * N and the same alignment of T. Arrays are laid out so that the zero-based nth element of the array is offset from the start of the array by n * size_of::<T>() bytes."
+
+Reference (The Rust Reference 1.98.0, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html#r-dynamic-sized.pointer-types>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types, since they also store metadata:"
+-/
+def copyLayoutMatchesRigidTy
+    (layouts : LayoutTable)
+    (layoutIdx : Nat)
+    (kind : RigidTy)
+    (l : TypeLayout) :
+    Bool :=
+  let ptrBytes := layoutPointerBytes layouts
+  let compoundOk : Bool :=
+    Bool.and
+      (Bool.not (copyLayoutHasPlaceholder layouts 32 l))
+      (Bool.not (copyLayoutTruncatedParametric l))
+  let zstOk : Bool :=
+    Bool.and (Bool.not l.isUninhabited)
+      (Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1))
+  let ptrOk : RigidTy → Bool := fun pt =>
+    let sizeOk : Bool :=
+      match copyPtrIsWide? 8 pt with
+      | .some true => Nat.beq l.size.bytes (Nat.mul 2 ptrBytes)
+      | .some false => Nat.beq l.size.bytes ptrBytes
+      | .none =>
+        Bool.or (Nat.beq l.size.bytes ptrBytes) (Nat.beq l.size.bytes (Nat.mul 2 ptrBytes))
+    Bool.and (Bool.not l.isUninhabited) (Bool.and (Nat.ble l.align.bytes ptrBytes) sizeOk)
+  match kind with
+  | .never => Bool.and l.isUninhabited (Nat.beq l.size.bytes 0)
+  | .fnDef _ _ => zstOk
+  | .ref _ pt => ptrOk pt
+  | .rawPtr _ pt => ptrOk pt
+  | .array _ n =>
+    match l.fields with
+    | .array stride count =>
+      Bool.and compoundOk
+        (Bool.and (Nat.beq count n) (Nat.beq l.size.bytes (Nat.mul stride.bytes n)))
+    | _ => false
+  | .tuple ks =>
+    match ks with
+    | .nil => zstOk
+    | _ :: _ =>
+      match l.fields with
+      | .arbitrary offsets _ => Bool.and compoundOk (Nat.beq (length offsets) (length ks))
+      | _ => false
+  | .adt _ _ => Bool.and compoundOk (copyLayoutValidForResolvedAdt layoutIdx l)
+  | .closure _ _ => Bool.and compoundOk (copyLayoutValidForResolvedAdt layoutIdx l)
+  | _ =>
+    match copyPrimByteSize? ptrBytes kind, l.fields with
+    | .some sz, .primitive =>
+      Bool.and (Bool.not l.isUninhabited)
+        (Bool.and (Nat.beq l.size.bytes sz) (Nat.ble l.align.bytes sz))
+    | _, _ => false
+
+/--
+`(size, align)` of a compiler-supplied layout `l` at `layoutIdx` used for the
+type `kind`, when `l` is well formed (power-of-two alignment, size a multiple
+of the alignment: `TypeLayout.isWellFormed`), is not a generic placeholder
+(`TypeLayout.isParamPlaceholder`), and is consistent with `kind`
+(`copyLayoutMatchesRigidTy`); `.none` otherwise.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "Alignment is measured in bytes, and must be at least 1, and always a power of 2."
+> "The size of a value is always a multiple of its alignment."
+-/
+@[reducible]
+def copyValidatedLayoutFor?
+    (layouts : LayoutTable)
+    (layoutIdx : Nat)
+    (kind : RigidTy)
+    (l : TypeLayout) :
+    Option (Nat × Nat) :=
+  match
+    Bool.and (TypeLayout.isWellFormed l)
+      (Bool.and (Bool.not (TypeLayout.isParamPlaceholder l))
+        (copyLayoutMatchesRigidTy layouts layoutIdx kind l))
+  with
+  | true => .some (l.size.bytes, l.align.bytes)
+  | false => .none
+
+/--
+`(size, align)` of `kind` from the first `LocalDecl` of structurally equal type
+(`rigidTyEq`) whose captured layout passes `copyValidatedLayoutFor?`.
+
+Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/layout.rs#L706-L712>
+
+> "fn layout_of(&self, ty: Ty<'tcx>) -> Self::LayoutOfResult"
+
+Justification: `rustc` computes one layout per monomorphized type, so a
+validated layout of a local of type `kind` is the layout of `kind`.
+-/
+def copyFindDeclLayout?
+    (layouts : LayoutTable)
+    (kind : RigidTy) :
+    List LocalDecl → Option (Nat × Nat)
+  | .nil => .none
+  | decl :: rest =>
+    match rigidTyEq decl.ty.kind kind with
+    | false => copyFindDeclLayout? layouts kind rest
+    | true =>
+      match LayoutTable.lookup layouts decl.ty.layoutIdx with
+      | .some l =>
+        match copyValidatedLayoutFor? layouts decl.ty.layoutIdx kind l with
+        | .some r => .some r
+        | .none => copyFindDeclLayout? layouts kind rest
+      | .none => copyFindDeclLayout? layouts kind rest
+
+/--
+Fuel-bounded exact `(size_of::<T>(), align_of::<T>())` of a sized type `kind`:
+1. structurally unsized kinds (`copyIsUnsizedRigidTy`) have none;
+2. a validated `LocalDecl` layout of the same type (`copyFindDeclLayout?`)
+   wins;
+3. otherwise `bool`/`u8`/`i8` are `(1, 1)` and `!`, function items, and `()`
+   are `(0, 1)` on every target, and arrays `[E; N]` are
+   `(N * size_of::<E>(), align_of::<E>())`;
+4. on 64-bit targets only (`copyTargetIs64`), 2-, 4-, and 8-byte primitives,
+   `usize`/`isize`, function pointers, and thin (`8`) or wide (`16`) pointers
+   are size-aligned / `8`-aligned; `i128`/`u128`/`f128`, multi-field tuples,
+   ADTs, closures, generic parameters, and every other kind have none without a
+   validated layout.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.primitive.platform-specific-alignment>
+
+> "The alignment of primitives is platform-specific. In most cases, their
+> alignment is equal to their size, but it may be less. In particular, `i128`
+> and `u128` are often aligned to 4 or 8 bytes even though their size is 16, and
+> on many 32-bit platforms, `i64`, `u64`, and `f64` are only aligned to 4 bytes,
+> not 8."
+
+Reference (The Rust Reference 1.98.0, "Array Layout" and "Tuple Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#array-layout>
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.tuple.unit>
+
+> "An array of [T; N] has a size of size_of::<T>() * N and the same alignment of T. Arrays are laid out so that the zero-based nth element of the array is offset from the start of the array by n * size_of::<T>() bytes."
+> "The exception to this is the unit tuple (()), which is guaranteed as a zero-sized type to have a size of 0 and an alignment of 1."
+
+Modeling choice (supplied target facts, not documented Rust guarantees): the
+64-bit primitive and pointer alignments of step 4 hold on every 64-bit target
+`rustc` 1.98 supports; on other widths the fallback fails closed. Function
+items and `!` are zero-sized with alignment 1 (as `rustc` lays them out).
+-/
+def copyTySizeAndAlign?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Nat → RigidTy → Option (Nat × Nat)
+  | .zero, _ => .none
+  | .succ fuel', kind =>
+    match copyIsUnsizedRigidTy 8 kind with
+    | true => .none
+    | false =>
+      match copyFindDeclLayout? layouts kind localDecls with
+      | .some r => .some r
+      | .none =>
+        match kind with
+        | .bool | .int .i8 | .uint .u8 => .some (1, 1)
+        | .never | .fnDef _ _ | .tuple .nil => .some (0, 1)
+        | .array elem n =>
+          match copyTySizeAndAlign? localDecls layouts fuel' elem with
+          | .some (esz, ea) => .some (Nat.mul esz n, ea)
+          | .none => .none
+        | _ =>
+          match copyTargetIs64 layouts with
+          | false => .none
+          | true =>
+            match kind with
+            | .int .i16 | .uint .u16 | .float .f16 => .some (2, 2)
+            | .char | .int .i32 | .uint .u32 | .float .f32 => .some (4, 4)
+            | .int .i64 | .uint .u64 | .float .f64 => .some (8, 8)
+            | .int .isize | .uint .usize | .fnPtr _ _ _ _ => .some (8, 8)
+            | .ref _ pt | .rawPtr _ pt =>
+              match copyPtrIsWide? 8 pt with
+              | .some false => .some (8, 8)
+              | .some true => .some (16, 8)
+              | .none => .none
+            | _ => .none
+
+/--
+Statically known alignment of an allocation or place of some type: exactly
+`a` (`.exact a`: the allocator may place it at any multiple of `a`, and every
+placement is a multiple of `a`) or at least `a` (`.atLeast a`: every placement
+is a multiple of `a`, but the exact alignment is not known, so placements need
+not range over all multiples of `a`).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The alignment of a value specifies what addresses are valid to store the value at. A value of alignment n must only be stored at an address that is a multiple of n."
+-/
+inductive PlaceAlignBound : Type where
+  /-- The alignment is exactly `a`. -/
+  | exact (a : Nat) : PlaceAlignBound
+  /-- The alignment is some power of two that is at least `a`. -/
+  | atLeast (a : Nat) : PlaceAlignBound
+
+/--
+The alignment value carried by a `PlaceAlignBound` (a guaranteed divisor of
+every placement address in both cases).
+
+Modeling choice: projection with no further Rust-attributed property.
+-/
+@[reducible]
+def PlaceAlignBound.val : PlaceAlignBound → Nat
+  | .exact a => a
+  | .atLeast a => a
+
+/--
+Lower bound on the alignment of a tuple with field types `ks`: the maximum of
+the per-field lower bounds `bound k` (a field without a bound contributes `1`).
+
+Reference (The Rust Reference 1.98.0, "The Rust representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.repr.rust.layout>
+
+> "The alignment of the type is at least the maximum alignment of its fields."
+-/
+def copyTupleAlignLowerBound (bound : RigidTy → Option PlaceAlignBound) : List RigidTy → Nat
+  | .nil => 1
+  | k :: rest =>
+    let a : Nat :=
+      match bound k with
+      | .some b => b.val
+      | .none => 1
+    maxNat a (copyTupleAlignLowerBound bound rest)
+
+/--
+Fuel-bounded statically known alignment of a place or allocation of type `ty`:
+1. structurally unsized types have none;
+2. a validated layout at a resolved `ty.layoutIdx`
+   (`isUnresolvedLayoutIdx = false`), or else the exact `copyTySizeAndAlign?`
+   alignment, is `.exact`;
+3. otherwise an array has its element's bound, a tuple has `.atLeast` the
+   maximum of its fields' lower bounds, and every other type has none.
+
+Reference (The Rust Reference 1.98.0, "Array Layout" and "The Rust representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#array-layout>
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.repr.rust.layout>
+
+> "An array of [T; N] has a size of size_of::<T>() * N and the same alignment of T. Arrays are laid out so that the zero-based nth element of the array is offset from the start of the array by n * size_of::<T>() bytes."
+> "The alignment of the type is at least the maximum alignment of its fields."
+
+Justification: an array's alignment equals its element's (so `.exact` and
+`.atLeast` are inherited); a tuple without a layout entry is only known to be
+at least as aligned as its most-aligned field (`.atLeast`), so it never yields
+a definite misalignment verdict that a more-aligned real layout would refute.
+-/
+def copyTyAlignBound?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Nat → Ty → Option PlaceAlignBound
+  | .zero, _ => .none
+  | .succ fuel', ty =>
+    match copyIsUnsizedRigidTy 8 ty.kind with
+    | true => .none
+    | false =>
+      let explicit? : Option (Nat × Nat) :=
+        match isUnresolvedLayoutIdx layouts ty.layoutIdx with
+        | true => .none
+        | false =>
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | .some l => copyValidatedLayoutFor? layouts ty.layoutIdx ty.kind l
+          | .none => .none
+      match explicit? with
+      | .some (_, a) => .some (.exact a)
+      | .none =>
+        match copyTySizeAndAlign? localDecls layouts 32 ty.kind with
+        | .some (_, a) => .some (.exact a)
+        | .none =>
+          match ty.kind with
+          | .array elem _ =>
+            copyTyAlignBound? localDecls layouts fuel'
+              { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }
+          | .tuple ks =>
+            .some
+              (.atLeast
+                (copyTupleAlignLowerBound
+                  (fun k =>
+                    copyTyAlignBound? localDecls layouts fuel'
+                      { kind := k, layoutIdx := unresolvedLayoutIdx layouts })
+                  ks))
+          | _ => .none
+
+/--
+Three-valued alignment verdict for a provenance pointer whose tag resolves to
+the stack borrow `entry`, at byte offset `offsetBytes` from the borrowed
+place, against the required element alignment `elemAlign` (a positive power of
+two):
+- `elemAlign ≤ 1` is satisfied by every address (`.some true`);
+- a deallocated target (`entry.allocDead = true`) is undetermined (`.none`):
+  after a frame pop the same `(targetFrameDepth, targetLocal)` may name an
+  unrelated local of a later frame, so neither its declaration nor the place
+  offset can be trusted;
+- otherwise the address is `base + placeOff + offsetBytes` where `placeOff` is
+  the borrowed place's byte offset within the root local
+  (`borrowPlaceByteOffset?`) and `base` ranges over the placements of the root
+  local allowed by its statically known alignment
+  `rootBound = copyTyAlignBound? rootDecl.ty` (declarations of the target frame,
+  `frameLocalDeclsAndLayoutsAtDepth`); the borrowed place's own type bound
+  must be nonzero and a multiple of `elemAlign` (otherwise `.none`):
+  * `ra % elemAlign = 0`: every placement is a multiple of `elemAlign`, so the
+    verdict is exactly `(placeOff + offsetBytes) % elemAlign = 0` (one `O(1)`
+    `Nat.mod`);
+  * `.exact ra` with `ra % elemAlign ≠ 0` (so `ra < elemAlign`, e.g. a
+    `#[repr(packed)]` root): two consecutive placements differ by
+    `ra < elemAlign`, so some placement is misaligned (`.some false`);
+  * `.atLeast ra` with `ra % elemAlign ≠ 0`: misaligned in every execution
+    exactly when `elemAlign % ra = 0` and `(placeOff + offsetBytes) % ra ≠ 0`
+    (`.some false`), and undetermined otherwise (`.none`, never a false `.ub`).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The alignment of a value specifies what addresses are valid to store the value at. A value of alignment n must only be stored at an address that is a multiple of n."
+
+Reference (The Rust Reference 1.98.0, "The alignment modifiers"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-alignment-modifiers>
+
+> "The align and packed modifiers can be used to respectively raise or lower
+> the alignment of structs and unions. packed may also alter the padding
+> between fields (although it will not alter the padding inside of any
+> field)."
+
+Modeling choice: allocation addresses are chosen by the abstract machine, so a
+precondition violated for some placement compatible with the root local's
+alignment is undefined behavior; the canonical `stackLocalAddrPageBase` page
+address used for pointer comparisons is not a real alignment guarantee and is
+never consulted. Root-frame caller referents (`callerLocals`) have no
+declaration in the target frame and are undetermined.
+-/
+def stackBorrowAlignKnown
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (entry : BorrowEntry)
+    (offsetBytes elemAlign : Nat) :
+    Option Bool :=
+  match Nat.ble elemAlign 1 with
+  | true => .some true
+  | false =>
+    match entry.allocDead with
+    | true => .none
+    | false =>
+      match
+        borrowPlaceByteOffset?
+          locals
+          s.memory.callerLocals
+          localDecls
+          layouts
+          entry
+          s.memory.callStack
+      with
+      | .none => .none
+      | .some placeOff =>
+        match
+          frameLocalDeclsAndLayoutsAtDepth
+            s.memory.callStack
+            localDecls
+            layouts
+            entry.targetFrameDepth
+        with
+        | .none => .none
+        | .some (tDecls, tLays) =>
+          match
+            get? tDecls entry.targetLocal,
+            placeTyResolved tDecls tLays
+              { local_ := entry.targetLocal, projection := entry.targetProjection }
+          with
+          | .some rootDecl, .some placeTy =>
+            match
+              copyTyAlignBound? tDecls tLays 32 placeTy,
+              copyTyAlignBound? tDecls tLays 32 rootDecl.ty
+            with
+            | .some placeBound, .some rootBound =>
+              let off := Nat.add placeOff offsetBytes
+              let pa := placeBound.val
+              let ra := rootBound.val
+              match
+                Bool.and (Bool.not (Nat.beq pa 0)) (Nat.beq (Nat.mod pa elemAlign) 0),
+                Nat.beq ra 0
+              with
+              | true, false =>
+                match Nat.beq (Nat.mod ra elemAlign) 0 with
+                | true => .some (Nat.beq (Nat.mod off elemAlign) 0)
+                | false =>
+                  match rootBound with
+                  | .exact _ => .some false
+                  | .atLeast _ =>
+                    match
+                      Bool.and
+                        (Nat.beq (Nat.mod elemAlign ra) 0)
+                        (Bool.not (Nat.beq (Nat.mod off ra) 0))
+                    with
+                    | true => .some false
+                    | false => .none
+              | _, _ => .none
+            | _, _ => .none
+          | _, _ => .none
+
+/--
+Three-valued alignment verdict for a pointer at byte offset `offsetBytes` into
+the captured global allocation `g` against the required element alignment
+`elemAlign` (a positive power of two):
+- `elemAlign ≤ 1`: `.some true`;
+- `g.align` a power of two that is a multiple of `elemAlign`: every placement
+  of `g` is a multiple of `elemAlign`, so exactly `offsetBytes % elemAlign = 0`;
+- `g.align` a smaller power of two (hence a divisor of `elemAlign`) with
+  `offsetBytes % g.align ≠ 0`: misaligned in every execution (`.some false`);
+- otherwise undetermined (`.none`).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The alignment of a value specifies what addresses are valid to store the value at. A value of alignment n must only be stored at an address that is a multiple of n."
+
+Modeling choice: `g.align` is the captured allocation alignment, a guaranteed
+divisor of the allocation's address; it is not assumed to be exact.
+-/
+@[reducible]
+def globalAllocAlignKnown (g : CapturedAllocation) (offsetBytes elemAlign : Nat) : Option Bool :=
+  match Nat.ble elemAlign 1 with
+  | true => .some true
+  | false =>
+    match Align.isPowerOfTwoBytes g.align with
+    | false => .none
+    | true =>
+      let ga := g.align.bytes
+      match Nat.beq (Nat.mod ga elemAlign) 0 with
+      | true => .some (Nat.beq (Nat.mod offsetBytes elemAlign) 0)
+      | false =>
+        match Nat.beq (Nat.mod offsetBytes ga) 0 with
+        | false => .some false
+        | true => .none
+
+/--
+Three-valued alignment verdict for a provenance pointer into an allocation
+whose base alignment is not modeled (a reified function pointer, or another
+unbacked non-zero `allocId`), at byte offset `offsetBytes`, against the
+required element alignment `elemAlign` (a positive power of two):
+- `elemAlign ≤ 1`: `.some true`;
+- `offsetBytes % elemAlign ≠ 0`: `.some false` — if the base alignment `A` is a
+  multiple of `elemAlign` every address is `≡ offsetBytes ≢ 0 (mod elemAlign)`,
+  and otherwise (`A < elemAlign`) the placement at a multiple of `elemAlign` is
+  allowed and misaligned;
+- otherwise undetermined (`.none`).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The alignment of a value specifies what addresses are valid to store the value at. A value of alignment n must only be stored at an address that is a multiple of n."
+
+Modeling choice: the canonical `allocId * 65536 + offsetBytes` address used for
+pointer comparisons is not a real alignment guarantee and is never consulted.
+-/
+@[reducible]
+def unbackedAlignKnown (offsetBytes elemAlign : Nat) : Option Bool :=
+  match Nat.ble elemAlign 1 with
+  | true => .some true
+  | false =>
+    match Nat.beq (Nat.mod offsetBytes elemAlign) 0 with
+    | true => .none
+    | false => .some false
+
+/--
+Zero-byte `copy_nonoverlapping` precondition on one pointer argument `v`
+(evaluated with frame `locals`) for element alignment `elemAlign` (a positive
+power of two):
+- `v` must be a thin pointer value (`.scalar ⟨bits, ptrBytes⟩` with in-range
+  `bits`, or `.ptr p ptrBytes`); anything else is `.ub`;
+- an integer address (`.scalar`, or a provenance-free unbacked `.ptr` with
+  `allocId = 0`, whose `offsetBytes` must be `< 2^(8 * ptrBytes)`) must satisfy
+  `addr % elemAlign = 0` (so aligned null and aligned `NonNull::dangling()`
+  are accepted, misaligned addresses are `.ub`);
+- a provenance pointer is checked by `stackBorrowAlignKnown` (stack borrow
+  tag), `globalAllocAlignKnown` (captured global), or `unbackedAlignKnown`
+  (function pointer or other unbacked allocation).
+No memory, slot, or Tree Borrows state is read or written beyond the borrow
+table and declarations used to locate the address.
+
+Reference (`core::ptr::copy_nonoverlapping` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L455-L473>
+
+> "/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0."
+> ...
+> "/// * Both `src` and `dst` must be properly aligned."
+> ...
+> "/// Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> /// `0`, the pointers must be properly aligned."
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L61-L63>
+
+> "//! When a function requires proper alignment, it does so even if the access
+> //! has size 0, i.e., even if memory is not actually touched. Consider using
+> //! [`NonNull::dangling`] in such cases."
+
+Justification: when the copied byte count is `0` the validity requirement is
+discharged by its "or that number must be 0" clause (so null and dangling
+pointers are permitted), while the alignment requirement still applies.
+-/
+def checkZeroCountCopyPtr
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (elemAlign : Nat)
+    (v : Value) :
+    ZeroCheck :=
+  let ptrBytes := layoutPointerBytes layouts
+  let modW := scalarModulus ptrBytes
+  match v with
+  | .scalar sv =>
+    match Bool.and (Nat.beq sv.sizeBytes ptrBytes) (Nat.blt sv.bits modW) with
+    | false => .ub
+    | true =>
+      match Bool.or (Nat.ble elemAlign 1) (Nat.beq (Nat.mod sv.bits elemAlign) 0) with
+      | true => .ok
+      | false => .ub
+  | .ptr p sz =>
+    match Nat.beq sz ptrBytes with
+    | false => .ub
+    | true =>
+      match lookupBorrow s.memory.borrows p.tag with
+      | .some entry =>
+        ZeroCheck.ofAligned?
+          (stackBorrowAlignKnown s locals localDecls layouts entry p.offsetBytes elemAlign)
+      | .none =>
+        match lookupGlobalAlloc s.memory.globals p.allocId with
+        | .some g => ZeroCheck.ofAligned? (globalAllocAlignKnown g p.offsetBytes elemAlign)
+        | .none =>
+          match lookupFnPtr s.memory.fnPtrs p.allocId, Nat.beq p.allocId 0 with
+          | .none, true =>
+            match Nat.blt p.offsetBytes modW with
+            | false => .ub
+            | true =>
+              match
+                Bool.or (Nat.ble elemAlign 1) (Nat.beq (Nat.mod p.offsetBytes elemAlign) 0)
+              with
+              | true => .ok
+              | false => .ub
+          | _, _ => ZeroCheck.ofAligned? (unbackedAlignKnown p.offsetBytes elemAlign)
+  | _ => .ub
+
+/--
+Zero-byte `copy_nonoverlapping` precondition on both pointer arguments: the
+Kleene strong conjunction (`ZeroCheck.both`) of `checkZeroCountCopyPtr` on
+`srcVal` and on `dstVal`.
+
+Reference (`core::ptr::copy_nonoverlapping` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L461>
+
+> "/// * Both `src` and `dst` must be properly aligned."
+-/
+@[reducible]
+def zeroByteCopyPrecheck
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (elemAlign : Nat)
+    (srcVal dstVal : Value) :
+    ZeroCheck :=
+  ZeroCheck.both
+    (checkZeroCountCopyPtr s locals localDecls layouts elemAlign srcVal)
+    (checkZeroCountCopyPtr s locals localDecls layouts elemAlign dstVal)
+
+/--
+Static classification of a `copy_nonoverlapping` pointer operand: its declared
+type is unavailable or not normalized (`.unknown`), is definitely not a pointer
+(`.nonPtr`), or is `*const T` / `*mut T` / `&T` with pointee `kind` and, when
+the pointer's captured layout is a pointer representation with a single
+`fieldLayouts` entry, that pointee layout index (`authLayoutIdx`).
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L530>
+
+> "pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {"
+-/
+inductive OperandPointeeLookup : Type where
+  /-- The operand's static type is unknown or not normalized. -/
+  | unknown : OperandPointeeLookup
+  /-- The operand's static type is definitely not a pointer. -/
+  | nonPtr : OperandPointeeLookup
+  /-- The operand is a pointer to `kind`, with an authoritative pointee layout
+      index when the pointer layout records one. -/
+  | pointee (kind : RigidTy) (authLayoutIdx : Option Nat) : OperandPointeeLookup
+
+/--
+Whether a type is definitely not a pointer type: scalars, tuples, arrays, `!`,
+function items, function pointers, and closures. ADTs, generic parameters,
+aliases, and `.other` are never classified as non-pointers (they may normalize
+to a pointer type or be uncaptured), nor are references and raw pointers.
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L530>
+
+> "pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {"
+-/
+@[reducible]
+def copyKindDefinitelyNonPtr : RigidTy → Bool
+  | .bool | .char | .int _ | .uint _ | .float _ | .never => true
+  | .tuple _ | .array _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _ => true
+  | _ => false
+
+/--
+Classify the `copy_nonoverlapping` operand `op` (`OperandPointeeLookup`) from
+its declared type (`operandTy`) and, for pointer types, the pointer type's
+captured layout: when that layout is a pointer representation
+(`copyIsPtrBackendRepr`) with exactly one `fieldLayouts` entry `ptLayoutIdx`,
+`ptLayoutIdx` is the authoritative pointee layout index (also when it is `0`).
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1705-L1725>
+
+> "pub struct LayoutData<FieldIdx, VariantIdx> {
+>     pub fields: FieldsShape<FieldIdx>,
+>     pub variants: Variants<FieldIdx, VariantIdx>,
+>     pub abi: BackendRepr,
+>     ...
+> }"
+-/
+def operandPointeeLookup
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (op : Operand) :
+    OperandPointeeLookup :=
+  match operandTy localDecls layouts op with
+  | .none => .unknown
+  | .some ty =>
+    let auth : Option Nat :=
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | .some ptrLayout =>
+        match copyIsPtrBackendRepr ptrLayout.backendRepr, ptrLayout.fieldLayouts with
+        | true, ptLayoutIdx :: .nil => .some ptLayoutIdx
+        | _, _ => .none
+      | .none => .none
+    match ty.kind with
+    | .rawPtr _ pt => .pointee pt auth
+    | .ref _ pt => .pointee pt auth
+    | k =>
+      match copyKindDefinitelyNonPtr k with
+      | true => .nonPtr
+      | false => .unknown
+
+/--
+Resolved element layout of a `copy_nonoverlapping::<T>` statement: exact
+`size_of::<T>()` and `align_of::<T>()` (`.ok`), an ill-typed operand
+(`.ub`), or an undetermined layout (`.unsupported`).
+
+Modeling choice: evaluator-internal verdict type.
+-/
+inductive CopyElemLayout : Type where
+  /-- `size_of::<T>() = elemSize` and `align_of::<T>() = elemAlign`. -/
+  | ok (elemSize elemAlign : Nat) : CopyElemLayout
+  /-- The operand types make the statement ill-typed. -/
+  | ub : CopyElemLayout
+  /-- The element layout is not determined by the captured data. -/
+  | unsupported : CopyElemLayout
+
+/--
+Resolve `(size_of::<T>(), align_of::<T>())` for one pointer operand's pointee
+`kind`: a structurally unsized pointee is ill-typed (`.ub`); otherwise the
+authoritative pointee layout (`authLayoutIdx`, validated by
+`copyValidatedLayoutFor?`) or else `copyTySizeAndAlign?` determines it, and a
+non-power-of-two alignment or missing resolution is `.unsupported`.
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L530>
+
+> "pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {"
+
+Modeling choice: the generic parameter `T` of `copy_nonoverlapping` carries no
+`?Sized` relaxation, so a statement whose pointee is structurally unsized is
+ill-typed MIR, modeled as undefined behavior.
+-/
+def resolveSinglePointeeLayout
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (kind : RigidTy)
+    (authLayoutIdx : Option Nat) :
+    CopyElemLayout :=
+  match copyIsUnsizedRigidTy 8 kind with
+  | true => .ub
+  | false =>
+    let explicit? : Option (Nat × Nat) :=
+      match authLayoutIdx with
+      | .some idx =>
+        match LayoutTable.lookup layouts idx with
+        | .some l => copyValidatedLayoutFor? layouts idx kind l
+        | .none => .none
+      | .none => .none
+    let resolved? : Option (Nat × Nat) :=
+      match explicit? with
+      | .some r => .some r
+      | .none => copyTySizeAndAlign? localDecls layouts 32 kind
+    match resolved? with
+    | .some (sz, al) =>
+      match Align.isPowerOfTwoBytes { bytes := al } with
+      | true => .ok sz al
+      | false => .unsupported
+    | .none => .unsupported
+
+/--
+Resolve the element layout of `copy_nonoverlapping::<T>(src, dst, count)` from
+both operands: a statically non-pointer operand or an unsized pointee is
+`.ub`; two resolved pointees must agree on `(size, align)` (else
+`.unsupported`); when only one pointee resolves, it is used only if both
+pointee types are structurally equal (`rigidTyEq`) or the other operand's type
+is unknown; otherwise `.unsupported`.
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L530>
+
+> "pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {"
+-/
+def resolveCopyElemLayout
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (src dst : Operand) :
+    CopyElemLayout :=
+  match operandPointeeLookup localDecls layouts src, operandPointeeLookup localDecls layouts dst with
+  | .nonPtr, _ => .ub
+  | _, .nonPtr => .ub
+  | .pointee srcKind srcAuth, .pointee dstKind dstAuth =>
+    match
+      resolveSinglePointeeLayout localDecls layouts srcKind srcAuth,
+      resolveSinglePointeeLayout localDecls layouts dstKind dstAuth
+    with
+    | .ub, _ => .ub
+    | _, .ub => .ub
+    | .ok sSz sAl, .ok dSz dAl =>
+      match Bool.and (Nat.beq sSz dSz) (Nat.beq sAl dAl) with
+      | true => .ok sSz sAl
+      | false => .unsupported
+    | .ok sSz sAl, .unsupported =>
+      match rigidTyEq srcKind dstKind with
+      | true => .ok sSz sAl
+      | false => .unsupported
+    | .unsupported, .ok dSz dAl =>
+      match rigidTyEq srcKind dstKind with
+      | true => .ok dSz dAl
+      | false => .unsupported
+    | .unsupported, .unsupported => .unsupported
+  | .pointee srcKind srcAuth, .unknown =>
+    resolveSinglePointeeLayout localDecls layouts srcKind srcAuth
+  | .unknown, .pointee dstKind dstAuth =>
+    resolveSinglePointeeLayout localDecls layouts dstKind dstAuth
+  | .unknown, .unknown => .unsupported
+
+/--
+Execute the non-zero-byte part of a
+`NonDivergingIntrinsic.copyNonOverlapping src dst count` statement with
+pre-resolved count bits (`count * size_of::<T>() > 0`, or `count ≠ 0` with an
+undetermined element layout): both values must be live provenance pointers
+whose tags resolve to borrow entries with a readable source and writable
+destination permission, and the copy is delegated to the active-frame
+(`evalCopyNonOverlappingPermOk`) or foreign-frame
+(`evalForeignFrameCopySingleDirect`) implementation.
+
+Reference (`core::ptr::copy_nonoverlapping` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L455-L465>
+
+> "/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0."
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L19>
+
+> "//! * A [null] pointer is *never* valid for reads/writes."
+-/
+def evalCopyNonOverlappingWithCountNonZero
+    (s : MachineState)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcVal dstVal : Value)
+    (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    MirStepNode :=
+  match srcVal, dstVal with
+  | .ptr srcPtr _, .ptr dstPtr _ =>
+    match
+      lookupBorrow s.memory.borrows srcPtr.tag,
+      lookupBorrow s.memory.borrows dstPtr.tag
+    with
+    | .some srcEntry, .some dstEntry =>
+      match srcEntry.perm, dstEntry.perm with
+      | .disabled, _ => MirStepNode.fail .ub
+      | _, .frozen => MirStepNode.fail .ub
+      | _, .disabled => MirStepNode.fail .ub
+      | _, _ =>
+        match copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
+        | false =>
+          evalForeignFrameCopySingleDirect
+            s
+            src
+            dst
+            localDecls
+            layouts
+            srcPtr
+            dstPtr
+            srcEntry
+            dstEntry
+            countBits
+            locals₃
+        | true =>
+          evalCopyNonOverlappingPermOk
+            s
+            src
+            dst
+            localDecls
+            layouts
+            srcPtr
+            dstPtr
+            srcEntry
+            dstEntry
+            countBits
+            locals₃
+    | _, _ => MirStepNode.fail .ub
+  | _, _ => MirStepNode.fail .ub
+
+/--
+Execute a `NonDivergingIntrinsic.copyNonOverlapping src dst count` statement
+(and, through `Terminators.evalCopyNonOverlappingCall`, a direct
+`copy_nonoverlapping::<T>(src, dst, count)` call) with pre-resolved count bits:
+1. Resolve `(size_of::<T>(), align_of::<T>())` (`resolveCopyElemLayout`); an
+   ill-typed operand (statically non-pointer, or unsized pointee) faults `.ub`
+   for every count.
+2. Undetermined layout: for `count = 0` the alignment-agnostic zero-byte check
+   (`zeroByteCopyPrecheck` at alignment `1`) still faults malformed pointer
+   values with `.ub` and otherwise fails closed `.unsupported`; for
+   `count ≠ 0` both values must be thin pointer values (`isThinPtrValue`, else
+   `.ub`) and the copy is delegated unchanged to
+   `evalCopyNonOverlappingWithCountNonZero`.
+3. Resolved layout: `count * size_of::<T>() > isize::MAX` faults `.ub` before
+   any short-circuit. When `count * size_of::<T>() = 0` (`count = 0`, or a
+   zero-sized `T` such as `()` or `[u64; 0]` with any `count`), both pointers
+   must be well-formed thin pointer values aligned to `align_of::<T>()`
+   (`zeroByteCopyPrecheck`): aligned null and aligned dangling pointers are
+   accepted, and the statement is then a no-op (no slot or memory access, no
+   Tree Borrows access, no overlap check); a malformed or misaligned pointer
+   faults `.ub`, and an undetermined alignment fails closed `.unsupported`.
+   Otherwise the gated non-zero copy runs as in step 2.
+
+Reference (`core::ptr::copy_nonoverlapping` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L439-L473>
+
+> "/// Copies `count * size_of::<T>()` bytes from `src` to `dst`. The source
+> /// and destination must *not* overlap.
+> ...
+> /// # Safety
+> ///
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * Both `src` and `dst` must be properly aligned.
+> ///
+> /// * The region of memory beginning at `src` with a size of `count *
+> ///   size_of::<T>()` bytes must *not* overlap with the region of memory
+> ///   beginning at `dst` with the same size.
+> ...
+> /// Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> /// `0`, the pointers must be properly aligned."
+
+Reference (`core::ptr::copy_nonoverlapping` source,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L530-L547>
+
+> "pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {
+>     ub_checks::assert_unsafe_precondition!(
+>         check_language_ub,
+> ...
+>         ) => {
+>             let zero_size = count == 0 || size == 0;
+>             ub_checks::maybe_is_aligned_and_not_null(src, align, zero_size)
+>                 && ub_checks::maybe_is_aligned_and_not_null(dst, align, zero_size)
+>                 && ub_checks::maybe_is_nonoverlapping(src, dst, size, count)
+>         }
+>     );"
+
+Reference (`library/core/src/ub_checks.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ub_checks.rs#L110-L125>
+
+> "/// Checks whether `ptr` is properly aligned with respect to the given alignment, and
+> /// if `is_zst == false`, that `ptr` is not null.
+> ...
+>     maybe_is_aligned(ptr, align) && (is_zst || !ptr.is_null())"
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L19>
+
+> "//! * A [null] pointer is *never* valid for reads/writes.
+> //! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes."
+
+Justification: the documented `# Safety` contract is the normative premise.
+Its validity clauses are waived exactly when `count * size_of::<T>() = 0` ("or
+that number must be 0"), so on the zero-byte fragment neither a null nor a
+dangling pointer is undefined behavior, whereas the alignment clause applies
+"even if the effectively copied size ... is `0`". The quoted debug assertion
+(`zero_size = count == 0 || size == 0`, non-null required only when
+`!is_zst`) is supplied library behavior that agrees with this reading; it is
+not used as an additional premise. The general pointer-validity note above
+("A null pointer is never valid") concerns accesses of non-zero size and is
+superseded for this function by the explicit "or that number must be 0"
+waiver. Hence the zero-byte fragment accepts aligned null and aligned dangling
+pointers (matching `Terminators.evalCopyCall` for `core::intrinsics::copy`),
+and every non-zero-byte copy still requires live, non-null pointers (enforced
+by `evalCopyNonOverlappingWithCountNonZero`).
+
+Modeling choices and remaining gaps: the `count * size_of::<T>() <= isize::MAX`
+bound (`isizeMaxBytes`) is derived from validity rather than separately
+quoted; an undetermined element layout or alignment fails closed
+(`.unsupported`) rather than guessing; non-zero-byte copies with a resolved
+layout keep the existing (unchanged) non-zero semantics, which do not re-check
+alignment.
 -/
 def evalCopyNonOverlappingWithCount
     (s : MachineState)
@@ -3544,50 +4913,34 @@ def evalCopyNonOverlappingWithCount
     (countBits : Nat)
     (locals₃ : List LocalSlot) :
     MirStepNode :=
-  match Nat.beq countBits 0 with
-  | true => MirStepNode.step (advanceStmt s locals₃)
-  | false =>
-    match srcVal, dstVal with
-    | .ptr srcPtr _, .ptr dstPtr _ =>
-      match
-        lookupBorrow s.memory.borrows srcPtr.tag,
-        lookupBorrow s.memory.borrows dstPtr.tag
-      with
-      | .some srcEntry, .some dstEntry =>
-        match srcEntry.perm, dstEntry.perm with
-        | .disabled, _ => MirStepNode.fail .ub
-        | _, .frozen => MirStepNode.fail .ub
-        | _, .disabled => MirStepNode.fail .ub
-        | _, _ =>
-          match copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
-          | false =>
-            evalForeignFrameCopySingleDirect
-              s
-              src
-              dst
-              localDecls
-              layouts
-              srcPtr
-              dstPtr
-              srcEntry
-              dstEntry
-              countBits
-              locals₃
-          | true =>
-            evalCopyNonOverlappingPermOk
-              s
-              src
-              dst
-              localDecls
-              layouts
-              srcPtr
-              dstPtr
-              srcEntry
-              dstEntry
-              countBits
-              locals₃
-      | _, _ => MirStepNode.fail .ub
-    | _, _ => MirStepNode.fail .ub
+  let ptrBytes := layoutPointerBytes layouts
+  let nonZero : MirStepNode :=
+    match Bool.and (isThinPtrValue ptrBytes srcVal) (isThinPtrValue ptrBytes dstVal) with
+    | false => MirStepNode.fail .ub
+    | true =>
+      evalCopyNonOverlappingWithCountNonZero
+        s src dst localDecls layouts srcVal dstVal countBits locals₃
+  match resolveCopyElemLayout localDecls layouts src dst with
+  | .ub => MirStepNode.fail .ub
+  | .unsupported =>
+    match Nat.beq countBits 0 with
+    | true =>
+      match zeroByteCopyPrecheck s locals₃ localDecls layouts 1 srcVal dstVal with
+      | .ub => MirStepNode.fail .ub
+      | _ => MirStepNode.unsupported
+    | false => nonZero
+  | .ok elemSize elemAlign =>
+    let totalBytes := Nat.mul countBits elemSize
+    match Nat.ble totalBytes (isizeMaxBytes ptrBytes) with
+    | false => MirStepNode.fail .ub
+    | true =>
+      match Nat.beq totalBytes 0 with
+      | true =>
+        match zeroByteCopyPrecheck s locals₃ localDecls layouts elemAlign srcVal dstVal with
+        | .ok => MirStepNode.step (advanceStmt s locals₃)
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
+      | false => nonZero
 
 /--
 Execute a `NonDivergingIntrinsic.copyNonOverlapping src dst count` statement.
@@ -3649,16 +5002,19 @@ def evalCopyNonOverlapping
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok (.scalar countSc) locals₃ =>
-        evalCopyNonOverlappingWithCount
-          s
-          src
-          dst
-          localDecls
-          layouts
-          srcVal
-          dstVal
-          countSc.bits
-          locals₃
+        match countScalarWellFormed (layoutPointerBytes layouts) countSc with
+        | false => MirStepNode.fail .ub
+        | true =>
+          evalCopyNonOverlappingWithCount
+            s
+            src
+            dst
+            localDecls
+            layouts
+            srcVal
+            dstVal
+            countSc.bits
+            locals₃
       | .ok _ _ => MirStepNode.fail .ub
 
 /--
@@ -6337,7 +7693,11 @@ a pointer `ptrVal` whose provenance tag resolved to a borrow entry targeting
 every dereferencing write (`writePlaceValue`, `evalPlaceWrite`,
 `StatementKind.setDiscriminant`), every safe reborrow (`Rvalue.ref`), every
 reference retag (`StatementKind.retag`), and every non-zero-length
-`copy_nonoverlapping` (`evalCopyNonOverlappingWithCount`) through it. This holds
+`copy_nonoverlapping` (`evalCopyNonOverlappingWithCount` with `count = n + 1`)
+through it whose element type is not zero-sized
+(`resolveCopyElemLayout ≠ .ok 0 _`): a zero-byte copy of a zero-sized `T`
+through a dead, aligned pointer accesses no memory and is not undefined
+behavior (`core::ptr::copy_nonoverlapping`: "or that number must be 0"). This holds
 for arbitrary frame locals `localsAfter` (in particular after `loc` has been
 revived by `StorageLive(loc)` and re-initialized) and arbitrary captured global
 allocations `globals`: the disabled stack borrow entry keeps shadowing any
@@ -6403,10 +7763,12 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
          MirStepNode.fail .ub) ∧
     evalStmt sAfter ⟨.setDiscriminant derefPlace n, span⟩ localDecls layouts =
       MirStepNode.fail .ub ∧
-    evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
-      (.ptr ptrVal sz) otherVal (n + 1) localsAfter = MirStepNode.fail .ub ∧
-    evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
-      otherVal (.ptr ptrVal sz) (n + 1) localsAfter = MirStepNode.fail .ub := by
+    ((∀ al, resolveCopyElemLayout localDecls layouts srcOp dstOp ≠ .ok 0 al) →
+      evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
+        (.ptr ptrVal sz) otherVal (n + 1) localsAfter = MirStepNode.fail .ub) ∧
+    ((∀ al, resolveCopyElemLayout localDecls layouts srcOp dstOp ≠ .ok 0 al) →
+      evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
+        otherVal (.ptr ptrVal sz) (n + 1) localsAfter = MirStepNode.fail .ub) := by
   dsimp only
   have hDis : lookupBorrow (disableLocalBorrows borrows loc d) ptrVal.tag =
       .some { entry with perm := .disabled, allocDead := true } :=
@@ -6463,26 +7825,90 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
         dsimp only
         rw [hDis]
   · cases localDecls <;> cases restProj <;> simp [evalStmt, evalOperand, hPtrSlot, hDis]
-  · unfold evalCopyNonOverlappingWithCount
-    simp only [Nat.beq]
-    cases otherVal with
-    | ptr dstPtr dstSz =>
-      dsimp only
-      rw [hDis]
-      cases hDst : lookupBorrow (disableLocalBorrows borrows loc d) dstPtr.tag <;> rfl
-    | _ => rfl
-  · unfold evalCopyNonOverlappingWithCount
-    simp only [Nat.beq]
-    cases otherVal with
-    | ptr srcPtr srcSz =>
-      dsimp only
-      rw [hDis]
-      cases hSrc : lookupBorrow (disableLocalBorrows borrows loc d) srcPtr.tag with
-      | none => rfl
-      | some srcEntry =>
+  · intro hNonZst
+    have hNZ :
+        evalCopyNonOverlappingWithCountNonZero
+          { s with
+            frame := { s.frame with locals := localsAfter }
+            memory := { s.memory with borrows := disableLocalBorrows borrows loc d } }
+          srcOp dstOp localDecls layouts (.ptr ptrVal sz) otherVal (n + 1) localsAfter =
+          MirStepNode.fail .ub := by
+      unfold evalCopyNonOverlappingWithCountNonZero
+      cases otherVal with
+      | ptr dstPtr dstSz =>
         dsimp only
-        cases hPerm : srcEntry.perm <;> rfl
-    | _ => rfl
+        rw [hDis]
+        cases hDst : lookupBorrow (disableLocalBorrows borrows loc d) dstPtr.tag <;> rfl
+      | _ => rfl
+    unfold evalCopyNonOverlappingWithCount
+    dsimp only
+    cases hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
+    | ub => rfl
+    | unsupported =>
+      dsimp only
+      split
+      · rename_i hz
+        nomatch hz
+      · split
+        · rfl
+        · exact hNZ
+    | ok es al =>
+      cases es with
+      | zero => exact absurd hR (hNonZst al)
+      | succ es' =>
+        dsimp only
+        split
+        · rfl
+        · split
+          · rename_i hz
+            nomatch hz
+          · split
+            · rfl
+            · exact hNZ
+  · intro hNonZst
+    have hNZ :
+        evalCopyNonOverlappingWithCountNonZero
+          { s with
+            frame := { s.frame with locals := localsAfter }
+            memory := { s.memory with borrows := disableLocalBorrows borrows loc d } }
+          srcOp dstOp localDecls layouts otherVal (.ptr ptrVal sz) (n + 1) localsAfter =
+          MirStepNode.fail .ub := by
+      unfold evalCopyNonOverlappingWithCountNonZero
+      cases otherVal with
+      | ptr srcPtr srcSz =>
+        dsimp only
+        rw [hDis]
+        cases hSrc : lookupBorrow (disableLocalBorrows borrows loc d) srcPtr.tag with
+        | none => rfl
+        | some srcEntry =>
+          dsimp only
+          cases hPerm : srcEntry.perm <;> rfl
+      | _ => rfl
+    unfold evalCopyNonOverlappingWithCount
+    dsimp only
+    cases hR : resolveCopyElemLayout localDecls layouts srcOp dstOp with
+    | ub => rfl
+    | unsupported =>
+      dsimp only
+      split
+      · rename_i hz
+        nomatch hz
+      · split
+        · rfl
+        · exact hNZ
+    | ok es al =>
+      cases es with
+      | zero => exact absurd hR (hNonZst al)
+      | succ es' =>
+        dsimp only
+        split
+        · rfl
+        · split
+          · rename_i hz
+            nomatch hz
+          · split
+            · rfl
+            · exact hNZ
 
 /--
 Universal proof that a bare `StatementKind.placeMention` (`place.projection = []`)

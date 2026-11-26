@@ -1797,12 +1797,10 @@ def stepTerminatorWith (prune : Bool) (resolve : CalleeResolver) (s : MachineSta
                   calleeBody
                   argVals)
         | .none =>
-          -- A diverging call to `core::intrinsics::const_eval_select` (one whose
-          -- `called_at_rt` returns `!`) is not unpacked here; like any other
-          -- unlinked callee it becomes an external call, which constrains
-          -- nothing. Captured MIR never contains one, because `rustc` replaces
-          -- every `const_eval_select` call with a direct call to `called_at_rt`
-          -- before `optimized_mir` (`withConstEvalSelectIntrinsicTypeArgs`).
+          -- Verbatim copy of the trusted diverging arm: a diverging call to
+          -- `core::intrinsics::const_eval_select` fails closed inside
+          -- `evalDivergingRustIntrinsic?`, and diverging calls to returning
+          -- intrinsics turn normal returns into `MirStepNode.fail .ub`.
           match target.isIndirect with
           | false =>
             match isUnreachableCallTarget target.defPath with
@@ -1818,9 +1816,22 @@ def stepTerminatorWith (prune : Bool) (resolve : CalleeResolver) (s : MachineSta
                   | .halted out => MirStepNode.retOutcome out
                   | .faulted fk => MirStepNode.fail fk
                 | false =>
-                  MirStepNode.extCall
-                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                    (resumeExternalDivergingCall s locals' unwind)
+                  match
+                    evalDivergingRustIntrinsic?
+                      s
+                      target
+                      bodyLocalDecls
+                      bodyLayouts
+                      argOps
+                      argVals
+                      locals'
+                      destination
+                  with
+                  | .some stepNode => stepNode
+                  | .none =>
+                    MirStepNode.extCall
+                      { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                      (resumeExternalDivergingCall s locals' unwind)
           | true =>
             MirStepNode.extCall
               { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }

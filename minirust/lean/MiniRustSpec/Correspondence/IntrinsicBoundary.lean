@@ -25,8 +25,8 @@ that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
 1. `Rvalue::NullaryOp(UbChecks)`: Anneal fails closed (`unsupported`), while
    `minimize` produces a `bool` constant fixed by the compilation session.
 2. `StatementKind::Intrinsic(CopyNonOverlapping)`: Anneal executes it, while
-   `minimize` aborts translation. With `count = 0` Anneal never checks that
-   `src` and `dst` are pointers (`bdCopyZeroScalars_step`), `count = 1` copies
+   `minimize` aborts translation. Even with `count = 0` Anneal rejects non-pointer
+   `src` and `dst` operands with `.ub` (`bdCopyZeroScalars_ub`), `count = 1` copies
    between the two 4-byte `u32` locals (`bdCopy1_anneal_ret`), and an
    out-of-bounds `count = 2` (`8` bytes across 4-byte locals) faults with UB
    (`bdCopy2_anneal_ub`, `bdCopy2_not_noUB`).
@@ -315,11 +315,13 @@ theorem bdCopy2_not_noUB : Â¬ MirNoUBTree (mirCallTree (bdCopyBody 2) [.scalar â
 def bdCopyZeroScalars : MirAst.Statement :=
   mkStmt (.intrinsic (.copyNonOverlapping (constU32 0) (constU32 0) (bdConstUsize 0)))
 
-/-- With `count = 0`, Anneal steps past the statement in every state, even
-though neither `src` nor `dst` is a pointer. -/
-theorem bdCopyZeroScalars_step (s : MachineState) (decls : List LocalDecl)
-    (layouts : LayoutTable) :
-    evalStmt s bdCopyZeroScalars decls layouts = MirStepNode.step (advanceStmt s s.frame.locals) :=
+/-- Even with `count = 0`, Anneal rejects the statement with `.ub` in every state:
+neither `src` nor `dst` is statically a pointer (both are `u32` constants), so the
+`copy_nonoverlapping` operands are ill-typed (`resolveCopyElemLayout = .ub`), and a
+malformed `count` (wrong width for the target) is `.ub` as well (stated on the
+64-bit `emptyLayoutTable`, where the `usize` count is well formed). -/
+theorem bdCopyZeroScalars_ub (s : MachineState) (decls : List LocalDecl) :
+    evalStmt s bdCopyZeroScalars decls emptyLayoutTable = MirStepNode.fail .ub :=
   rfl
 
 theorem bdCopy_translateStatement (decls : List LocalDecl) (src dst count : Operand) :

@@ -10648,6 +10648,44 @@ theorem evalForeignFrameCopySingleDirect_callerBodies (s : MachineState) (src ds
   (evalForeignFrameCopySingleDirect_stepCtxCB [] none [] s src dst localDecls layouts srcPtr
     dstPtr srcEntry dstEntry countBits locals₃).2
 
+private theorem evalCopyNonOverlappingWithCountNonZero_stepCtxCB
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
+    StepCtxCB c ac ti s.memory.callStack
+      (evalCopyNonOverlappingWithCountNonZero
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        src dst localDecls layouts srcVal dstVal countBits locals₃)
+      (evalCopyNonOverlappingWithCountNonZero
+        s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
+  unfold evalCopyNonOverlappingWithCountNonZero
+  cases srcVal with
+  | ptr srcPtr _ =>
+    cases dstVal with
+    | ptr dstPtr _ =>
+      dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
+      cases lookupBorrow s.memory.borrows srcPtr.tag with
+      | none => exact stepCtxCB_fail
+      | some srcEntry =>
+        cases lookupBorrow s.memory.borrows dstPtr.tag with
+        | none => exact stepCtxCB_fail
+        | some dstEntry =>
+          dsimp only
+          cases srcEntry.perm <;> cases dstEntry.perm <;>
+            cases copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry <;>
+            first
+            | exact stepCtxCB_fail
+            | exact stepCtxCB_unsupported
+            | exact ⟨(evalCopyNonOverlappingPermOk_trusted_stepCtxCB c ac ti
+                s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃).1,
+                evalCopyNonOverlappingPermOk_callerBodies s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃⟩
+            | exact ⟨(evalForeignFrameCopySingleDirect_stepCtxCB c ac ti
+                s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃).1,
+                evalForeignFrameCopySingleDirect_callerBodies s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃⟩
+    | _ => exact stepCtxCB_fail
+  | _ => exact stepCtxCB_fail
+
 private theorem evalCopyNonOverlappingWithCount_stepCtxCB
     (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (src dst : Operand)
@@ -10659,35 +10697,21 @@ private theorem evalCopyNonOverlappingWithCount_stepCtxCB
         src dst localDecls layouts srcVal dstVal countBits locals₃)
       (evalCopyNonOverlappingWithCount
         s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
+  -- The zero-byte precondition never reads the callee context.
+  have hPre : ∀ a, zeroByteCopyPrecheck (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+      locals₃ localDecls layouts a srcVal dstVal =
+      zeroByteCopyPrecheck s locals₃ localDecls layouts a srcVal dstVal := fun _ => rfl
+  have hNZ := evalCopyNonOverlappingWithCountNonZero_stepCtxCB c ac ti s src dst localDecls
+    layouts srcVal dstVal countBits locals₃
   unfold evalCopyNonOverlappingWithCount
-  cases Nat.beq countBits 0 with
-  | true => exact stepCtxCB_advance rfl rfl (CallerBodiesEq.refl _)
-  | false =>
-    cases srcVal with
-    | ptr srcPtr _ =>
-      cases dstVal with
-      | ptr dstPtr _ =>
-        dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
-        cases lookupBorrow s.memory.borrows srcPtr.tag with
-        | none => exact stepCtxCB_fail
-        | some srcEntry =>
-          cases lookupBorrow s.memory.borrows dstPtr.tag with
-          | none => exact stepCtxCB_fail
-          | some dstEntry =>
-            dsimp only
-            cases srcEntry.perm <;> cases dstEntry.perm <;>
-              cases copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry <;>
-              first
-              | exact stepCtxCB_fail
-              | exact stepCtxCB_unsupported
-              | exact ⟨(evalCopyNonOverlappingPermOk_trusted_stepCtxCB c ac ti
-                  s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃).1,
-                  evalCopyNonOverlappingPermOk_callerBodies s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃⟩
-              | exact ⟨(evalForeignFrameCopySingleDirect_stepCtxCB c ac ti
-                  s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃).1,
-                  evalForeignFrameCopySingleDirect_callerBodies s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃⟩
-      | _ => exact stepCtxCB_fail
-    | _ => exact stepCtxCB_fail
+  simp only [hPre]
+  repeat' (first
+    | exact stepCtxCB_fail
+    | exact stepCtxCB_unsupported
+    | exact stepCtxCB_advance rfl rfl (CallerBodiesEq.refl _)
+    | exact hNZ
+    | (dsimp only)
+    | split)
 
 theorem evalCopyNonOverlappingWithCount_withCalleeCtx
     (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
@@ -10739,10 +10763,14 @@ private theorem evalCopyNonOverlapping_stepCtxCB
       | ok countVal locals₃ =>
         cases countVal with
         | scalar countSc =>
-          exact ⟨evalCopyNonOverlappingWithCount_withCalleeCtx
-            c ac ti s src dst localDecls layouts srcVal dstVal countSc.bits locals₃,
-            evalCopyNonOverlappingWithCount_callerBodies
-            s src dst localDecls layouts srcVal dstVal countSc.bits locals₃⟩
+          dsimp only
+          cases countScalarWellFormed (layoutPointerBytes layouts) countSc with
+          | false => exact stepCtxCB_fail
+          | true =>
+            exact ⟨evalCopyNonOverlappingWithCount_withCalleeCtx
+              c ac ti s src dst localDecls layouts srcVal dstVal countSc.bits locals₃,
+              evalCopyNonOverlappingWithCount_callerBodies
+              s src dst localDecls layouts srcVal dstVal countSc.bits locals₃⟩
         | _ => exact stepCtxCB_fail
 
 theorem evalCopyNonOverlapping_withCalleeCtx

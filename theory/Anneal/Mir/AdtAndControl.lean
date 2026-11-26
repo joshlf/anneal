@@ -13476,14 +13476,79 @@ theorem copyNonOverlappingChecks_disjoint {ptrBits : Nat} {src dst : CopyPtr}
   · exact h
 
 /-- **Agreement with Trusted's zero-count `copyNonOverlapping`**: once its operands are
-evaluated, Trusted's copy of `0` elements is a no-op step (it never faults); Anneal's zero-count
-copy is likewise a no-op after `copyNonOverlappingChecks`, so every successful Anneal zero-count
-copy is matched by a Trusted step (Anneal is stricter: it also checks null/alignment/width). -/
+evaluated, Trusted's copy of `0` elements with a resolved element layout is a no-op step exactly
+when both pointer values pass Trusted's zero-byte precondition (`zeroByteCopyPrecheck`: well-formed
+thin pointers aligned to `align_of::<T>()`; aligned null and dangling pointers are accepted).
+Anneal's zero-count copy is likewise a no-op after `copyNonOverlappingChecks`, which is stricter
+(it also rejects null). -/
 theorem evalCopyNonOverlappingWithCount_zero (s : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
-    (locals₃ : List LocalSlot) :
+    (locals₃ : List LocalSlot) {elemSize elemAlign : Nat}
+    (hElem : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign)
+    (hPre : zeroByteCopyPrecheck s locals₃ localDecls layouts elemAlign srcVal dstVal = .ok) :
     evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal 0 locals₃ =
-      .step (advanceStmt s locals₃) := rfl
+      .step (advanceStmt s locals₃) := by
+  have h0 : Nat.mul 0 elemSize = 0 := Nat.zero_mul elemSize
+  unfold evalCopyNonOverlappingWithCount
+  simp only [hElem, h0, hPre]
+  all_goals rfl
+
+/-- Trusted's zero-count `copyNonOverlapping` faults with `.ub` whenever the zero-byte
+precondition is definitely violated (a malformed or misaligned pointer value), even though no
+byte is copied. -/
+theorem evalCopyNonOverlappingWithCount_zero_ub (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
+    (locals₃ : List LocalSlot) {elemSize elemAlign : Nat}
+    (hElem : resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign)
+    (hPre : zeroByteCopyPrecheck s locals₃ localDecls layouts elemAlign srcVal dstVal = .ub) :
+    evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal 0 locals₃ =
+      .fail .ub := by
+  have h0 : Nat.mul 0 elemSize = 0 := Nat.zero_mul elemSize
+  unfold evalCopyNonOverlappingWithCount
+  simp only [hElem, h0, hPre]
+  all_goals rfl
+
+/-- The resolved element layouts on which Trusted's `evalCopyNonOverlappingWithCount` delegates a
+`count`-element copy to the (unchanged) non-zero-byte implementation
+`evalCopyNonOverlappingWithCountNonZero`: an unresolved layout with `count ≠ 0`, or a resolved
+layout whose byte count `count * size_of::<T>()` is positive and at most `isize::MAX`. -/
+def CopyDelegatesNonZero (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (src dst : Operand) (count : Nat) : Prop :=
+  (resolveCopyElemLayout localDecls layouts src dst = .unsupported ∧ count ≠ 0) ∨
+  ∃ elemSize elemAlign, resolveCopyElemLayout localDecls layouts src dst = .ok elemSize elemAlign ∧
+    0 < count * elemSize ∧ count * elemSize ≤ isizeMaxBytes (layoutPointerBytes layouts)
+
+/-- On `CopyDelegatesNonZero` layouts, Trusted's copy of two well-formed (pointer-width) pointer
+values is exactly the non-zero-byte implementation. -/
+theorem evalCopyNonOverlappingWithCount_eq_nonZero (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
+    (srcSz dstSz count : Nat) (locals₃ : List LocalSlot)
+    (hSrcSz : srcSz = layoutPointerBytes layouts) (hDstSz : dstSz = layoutPointerBytes layouts)
+    (hDel : CopyDelegatesNonZero localDecls layouts src dst count) :
+    evalCopyNonOverlappingWithCount s src dst localDecls layouts (.ptr srcPtr srcSz)
+        (.ptr dstPtr dstSz) count locals₃ =
+      evalCopyNonOverlappingWithCountNonZero s src dst localDecls layouts (.ptr srcPtr srcSz)
+        (.ptr dstPtr dstSz) count locals₃ := by
+  subst hSrcSz hDstSz
+  have hThin : (isThinPtrValue (layoutPointerBytes layouts)
+      (.ptr srcPtr (layoutPointerBytes layouts)) &&
+      isThinPtrValue (layoutPointerBytes layouts) (.ptr dstPtr (layoutPointerBytes layouts))) =
+      true := by simp [isThinPtrValue]
+  unfold evalCopyNonOverlappingWithCount
+  rcases hDel with ⟨hR, hC⟩ | ⟨es, al, hR, hPos, hLe⟩
+  · have hC' : Nat.beq count 0 = false := by
+      cases count with
+      | zero => exact absurd rfl hC
+      | succ n => rfl
+    simp only [hR, hC', hThin]
+  · have hB : Nat.ble (Nat.mul count es) (isizeMaxBytes (layoutPointerBytes layouts)) = true :=
+      Nat.ble_eq.mpr hLe
+    have hZ : Nat.beq (Nat.mul count es) 0 = false := by
+      have hPos' : 0 < Nat.mul count es := hPos
+      cases h : Nat.mul count es with
+      | zero => rw [h] at hPos'; exact absurd hPos' (Nat.lt_irrefl 0)
+      | succ k => rfl
+    simp only [hR, hB, hZ, hThin]
 
 /-- The frame facts `eval_copy_nonoverlapping` consults about locals: each local's synthetic base
 address (`synthetic_local_ptr`), the number of declared locals, and whether a local is declared
@@ -23001,6 +23066,9 @@ theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp
     (hSrcU : resolveUnionEndpoint? localDecls layouts s.frame.locals srcEntry = none)
     (hDstU : resolveUnionEndpoint? localDecls layouts s.frame.locals dstEntry = none)
     (hSrcOff : srcPtr.offsetBytes = 0) (hDstOff : dstPtr.offsetBytes = 0)
+    (hSrcSz : srcSz = layoutPointerBytes layouts) (hDstSz : dstSz = layoutPointerBytes layouts)
+    (hCntW : countScalarWellFormed (layoutPointerBytes layouts) countSc = true)
+    (hDel : CopyDelegatesNonZero localDecls layouts srcOp dstOp 1)
     (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl) :
     evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩ localDecls layouts =
       evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
@@ -23009,12 +23077,14 @@ theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp
       (.ptr srcPtr srcSz) (.ptr dstPtr dstSz) 1 s.frame.locals =
       evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry 1
         s.frame.locals := by
-    unfold evalCopyNonOverlappingWithCount
+    rw [evalCopyNonOverlappingWithCount_eq_nonZero s srcOp dstOp localDecls layouts srcPtr dstPtr
+      srcSz dstSz 1 s.frame.locals hSrcSz hDstSz hDel]
+    unfold evalCopyNonOverlappingWithCountNonZero
     simp only [hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with
     | disabled => exact absurd hs hSrcP
     | _ => rcases hDstP with hd | hd <;> simp [hd]
-  simp only [evalStmt, evalCopyNonOverlapping, hSrc, hDst, hCnt, hOne, hPermOk]
+  simp only [evalStmt, evalCopyNonOverlapping, hSrc, hDst, hCnt, hCntW, hOne, hPermOk]
   unfold evalCopyNonOverlappingPermOk
   simp only [hSrcU, hDstU, hSrcOff, hDstOff, Nat.beq_refl, Bool.and_self]
 
@@ -23064,6 +23134,9 @@ theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantId
         sameRigidTyShape srcPt.kind dstPt.kind = true)
     (hNoUnion : placeTouchesUnion localDecls layouts ⟨dl, dh :: dt⟩ = false)
     (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, dh :: dt⟩) v = true)
+    (hSrcSz : srcSz = layoutPointerBytes layouts) (hDstSz : dstSz = layoutPointerBytes layouts)
+    (hCntW : countScalarWellFormed (layoutPointerBytes layouts) countSc = true)
+    (hDel : CopyDelegatesNonZero localDecls layouts srcOp dstOp 1)
     (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl) :
     ∃ locals₄, evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩
         localDecls layouts = .step (advanceStmt s locals₄
@@ -23072,7 +23145,8 @@ theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantId
               (length s.memory.callStack) }) ∧
       SlotsRefine SlotBelow slots' locals₄ := by
   rw [evalStmt_copyNonOverlapping_singleDirect s srcOp dstOp countOp span localDecls layouts hSrcOp
-    hDstOp hCnt hOne hSrcE hDstE hSrcP hDstP hSrcU hDstU hSrcOff hDstOff hActive]
+    hDstOp hCnt hOne hSrcE hDstE hSrcP hDstP hSrcU hDstU hSrcOff hDstOff hSrcSz hDstSz hCntW hDel
+    hActive]
   exact evalCopyNonOverlappingSubplace_refines hRel hSrcR hDstR hNe hSrcRead hSrcSlot hDstRoot hDh
     hDt h s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry hTagNe hSrcEntry hDstEntry
     hPointee hNoUnion hValid
@@ -23487,6 +23561,9 @@ theorem evalStmt_copyNonOverlapping_window_refines
         srcEntry dstEntry
         (copySliceWindowProj [] s0 count (length srcElems))
         (copySliceWindowProj [] d0 count (length dstElems)) = some borrows' := by rfl)
+    (hSrcSz : srcSz = layoutPointerBytes layouts) (hDstSz : dstSz = layoutPointerBytes layouts)
+    (hCntW : countScalarWellFormed (layoutPointerBytes layouts) countSc = true)
+    (hDel : CopyDelegatesNonZero localDecls layouts srcOp dstOp count)
     (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl)
     (hSrcInit : valueListContainsUninit srcElems = false := by rfl)
     (hDstInit : valueListContainsUninit dstElems = false := by rfl) :
@@ -23499,14 +23576,14 @@ theorem evalStmt_copyNonOverlapping_window_refines
       (.ptr srcPtr srcSz) (.ptr dstPtr dstSz) count s.frame.locals =
       evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
         count s.frame.locals := by
-    unfold evalCopyNonOverlappingWithCount
-    have hCntNe0 : Nat.beq count 0 = false :=
-      ((beq_cases count 0).resolve_left (fun ⟨_, hEq⟩ => by omega)).1
-    simp only [hCntNe0, hSrcE, hDstE, hActive]
+    rw [evalCopyNonOverlappingWithCount_eq_nonZero s srcOp dstOp localDecls layouts srcPtr dstPtr
+      srcSz dstSz count s.frame.locals hSrcSz hDstSz hDel]
+    unfold evalCopyNonOverlappingWithCountNonZero
+    simp only [hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with
     | disabled => exact absurd hs hSrcP
     | _ => rcases hDstP with hd | hd <;> simp [hd]
-  simp only [evalStmt, evalCopyNonOverlapping, hSrcOp, hDstOp, hCnt, hCountBits, hPermOk]
+  simp only [evalStmt, evalCopyNonOverlapping, hSrcOp, hDstOp, hCnt, hCntW, hCountBits, hPermOk]
   exact evalCopyNonOverlappingSubplace_window_refines hRel hCount hElemSz hSrcR hDstR hNe hSrcRoot
     hDstRoot hSLen hDLen h s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
     hTagNe hSrcEntry hDstEntry hSrcOff hDstOff hSrcU hDstU hSrcArr hDstArr hAlign hNoConflictSz
@@ -24586,6 +24663,9 @@ theorem evalStmt_copyNonOverlapping_window_same_or_disjoint_refines
         srcEntry dstEntry
         (copySliceWindowProj [] s0 count (length srcElems))
         (copySliceWindowProj [] d0 count (length dstElems)) = some borrows' := by rfl)
+    (hSrcSz : srcSz = layoutPointerBytes layouts) (hDstSz : dstSz = layoutPointerBytes layouts)
+    (hCntW : countScalarWellFormed (layoutPointerBytes layouts) countSc = true)
+    (hDel : CopyDelegatesNonZero localDecls layouts srcOp dstOp count)
     (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl)
     (hSrcInit : valueListContainsUninit srcElems = false := by rfl)
     (hDstInit : valueListContainsUninit dstElems = false := by rfl) :
@@ -24598,14 +24678,14 @@ theorem evalStmt_copyNonOverlapping_window_same_or_disjoint_refines
       (.ptr srcPtr srcSz) (.ptr dstPtr dstSz) count s.frame.locals =
       evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
         count s.frame.locals := by
-    unfold evalCopyNonOverlappingWithCount
-    have hCntNe0 : Nat.beq count 0 = false :=
-      ((beq_cases count 0).resolve_left (fun ⟨_, hEq⟩ => by omega)).1
-    simp only [hCntNe0, hSrcE, hDstE, hActive]
+    rw [evalCopyNonOverlappingWithCount_eq_nonZero s srcOp dstOp localDecls layouts srcPtr dstPtr
+      srcSz dstSz count s.frame.locals hSrcSz hDstSz hDel]
+    unfold evalCopyNonOverlappingWithCountNonZero
+    simp only [hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with
     | disabled => exact absurd hs hSrcP
     | _ => rcases hDstP with hd | hd <;> simp [hd]
-  simp only [evalStmt, evalCopyNonOverlapping, hSrcOp, hDstOp, hCnt, hCountBits, hPermOk]
+  simp only [evalStmt, evalCopyNonOverlapping, hSrcOp, hDstOp, hCnt, hCntW, hCountBits, hPermOk]
   exact evalCopyNonOverlappingSubplace_window_same_or_disjoint_refines hRel hCount hElemSz hSrcR
     hDstR hSrcRoot hDstRoot hSLen hDLen h s srcOp dstOp localDecls layouts srcPtr dstPtr
     srcEntry dstEntry hTagNe hDisj hSrcEntry hDstEntry hSrcOff hDstOff hSrcU hDstU hSrcArr hDstArr

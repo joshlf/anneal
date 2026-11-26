@@ -95,6 +95,54 @@ theorem evalNonSelectIntrinsicCall_frames (kind : RustIntrinsicKind) (s : Machin
     (MirLiftCore.evalNonSelectIntrinsicCall_calleeCtx_preserved kind s target bodyLocalDecls
       bodyLayouts argOps argVals locals' destination targetBb)
 
+/-- Every trusted core memory/pointer intrinsic step (`evalCoreMemPtrIntrinsicCall?`)
+frames its state. -/
+theorem evalCoreMemPtrIntrinsicCall?_frames {kind : RustIntrinsicKind} {s : MachineState}
+    {target : ResolvedCallTarget} {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    {destination : Place} {targetOpt : Option BasicBlockIdx} {n : MirStepNode}
+    (h : evalCoreMemPtrIntrinsicCall? kind s target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination targetOpt = some n) :
+    FramesStep s n :=
+  framesStep_of_ctx_fixed
+    (MirLiftCore.evalCoreMemPtrIntrinsicCall?_calleeCtx_preserved kind s target bodyLocalDecls
+      bodyLayouts argOps argVals locals' destination targetOpt h)
+
+/-- A diverging-call intrinsic step (`evalDivergingRustIntrinsic?`) that fires is a fault or
+`unsupported` (`PureMirExec.evalDivergingRustIntrinsic?_eq_none_or_fault`). -/
+theorem evalDivergingRustIntrinsic?_some_fault {s : MachineState}
+    {target : ResolvedCallTarget} {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    {destination : Place} {n : MirStepNode}
+    (h : evalDivergingRustIntrinsic? s target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination = some n) :
+    (∃ fk, n = MirStepNode.fail fk) ∨ n = MirStepNode.unsupported := by
+  rcases Anneal.PureMirExec.evalDivergingRustIntrinsic?_eq_none_or_fault s target bodyLocalDecls
+      bodyLayouts argOps argVals locals' destination with h0 | ⟨fk, h1⟩ | h2
+  · rw [h0] at h; cases h
+  · rw [h1] at h; injection h with h; exact Or.inl ⟨fk, h.symm⟩
+  · rw [h2] at h; injection h with h; exact Or.inr h.symm
+
+/-- Every diverging-call intrinsic step frames its state (it is a fault). -/
+theorem evalDivergingRustIntrinsic?_frames {s : MachineState}
+    {target : ResolvedCallTarget} {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    {destination : Place} {n : MirStepNode}
+    (h : evalDivergingRustIntrinsic? s target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination = some n) :
+    FramesStep s n := by
+  rcases evalDivergingRustIntrinsic?_some_fault h with ⟨_, rfl⟩ | rfl <;> exact True.intro
+
+/-- Every diverging-call intrinsic step has no successor state (it is a fault). -/
+theorem nodeSuccs_evalDivergingRustIntrinsic? {P : MachineState → Prop} {s : MachineState}
+    {target : ResolvedCallTarget} {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    {destination : Place} {n : MirStepNode}
+    (h : evalDivergingRustIntrinsic? s target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination = some n) :
+    MirLiftCore.NodeSuccs P n := by
+  rcases evalDivergingRustIntrinsic?_some_fault h with ⟨_, rfl⟩ | rfl <;> trivial
+
 /-- Unwinding through saved caller frames keeps the callee table and trait impls of the
 unwound memory. -/
 theorem unwindFromCallStack_frames :
@@ -498,6 +546,7 @@ theorem evalDirectRustIntrinsic?_frames {s : MachineState} {currentBody : Option
       | exact framesStep_step rfl rfl
       | exact writeIntrinsicScalarResult_frames _ _ _ _ _
       | exact evalNonSelectIntrinsicCall_frames _ _ _ _ _ _ _ _ _ _
+      | exact evalCoreMemPtrIntrinsicCall?_frames ‹_›
       | exact applyUnwindAction_frames ‹_›
       | (dsimp only)
       | split)
@@ -511,7 +560,9 @@ theorem evalDirectRustIntrinsic?_frames {s : MachineState} {currentBody : Option
       (MirLiftCore.evalWriteBytesCall_calleeCtx_preserved _ _ _ _ _ _ _ _ _)
   · injection h with h
     subst h
-    exact evalNonSelectIntrinsicCall_frames _ _ _ _ _ _ _ _ _ _
+    split
+    · exact evalCoreMemPtrIntrinsicCall?_frames ‹_›
+    · exact evalNonSelectIntrinsicCall_frames _ _ _ _ _ _ _ _ _ _
 
 /-- Root tail-call entry relocation (`tailCalleeEntryMemory` / `relocateRootCallerReferents`)
 keeps the callee table. -/
@@ -592,6 +643,7 @@ theorem stepTerminatorWith_frames (prune : Bool) (resolve : CalleeResolver) (s :
         | exact True.intro
         | exact hself
         | exact applyUnwindAction_frames ‹_›
+        | exact evalDivergingRustIntrinsic?_frames ‹_›
         | (dsimp only)
         | split)
   | tailCall func argOps =>
@@ -1884,16 +1936,34 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_lookup {cone : List DefPath}
   | none => exact h_fb
   | some kind =>
     rw [h_k] at h_cl
-    have h_step : ∀ (k : RustIntrinsicKind),
+    have h_nsel : ∀ (k : RustIntrinsicKind),
         MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl)
           (evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
-            argOps argVals locals' destination targetBb) := by
-      intro k
-      exact nodeSuccs_closedInvLookup_of_ctx h_inv
+            argOps argVals locals' destination targetBb) := fun k =>
+      nodeSuccs_closedInvLookup_of_ctx h_inv
         (MirLiftCore.evalNonSelectIntrinsicCall_calleeCtx_preserved k s target bodyLocalDecls
           bodyLayouts argOps argVals locals' destination targetBb)
         (MirLiftCore.evalNonSelectIntrinsicCall_callerBodies k s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
+    have h_step : ∀ (k : RustIntrinsicKind),
+        MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl)
+          (match evalCoreMemPtrIntrinsicCall? k s target bodyLocalDecls bodyLayouts
+              argOps argVals locals' destination (some targetBb) with
+           | some stepNode => stepNode
+           | none =>
+             evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
+               argOps argVals locals' destination targetBb) := by
+      intro k
+      cases h_cm : evalCoreMemPtrIntrinsicCall? k s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination (some targetBb) with
+      | some sn =>
+        exact nodeSuccs_closedInvLookup_of_ctx h_inv
+          (MirLiftCore.evalCoreMemPtrIntrinsicCall?_calleeCtx_preserved k s target bodyLocalDecls
+            bodyLayouts argOps argVals locals' destination (some targetBb) h_cm)
+          (MirLiftCore.evalCoreMemPtrIntrinsicCall?_callerBodies k s target bodyLocalDecls
+            bodyLayouts argOps argVals locals' destination (some targetBb) h_cm)
+      | none => exact h_nsel k
+    have h_step' := h_step kind
     cases kind with
     | constEvalSelect => cases h_cl
     | copyNonOverlapping =>
@@ -1908,7 +1978,7 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_lookup {cone : List DefPath}
           argOps argVals locals' destination targetBb)
         (MirLiftCore.evalWriteBytesCall_callerBodies s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
-    | _ => exact h_step _
+    | _ => exact h_step'
 
 theorem nodeSuccs_evalTerminatorLookup {cone : List DefPath} {root : CapturedMir}
     {tbl : OpaqueCalleeTable} {s : MachineState} {term : Terminator}
@@ -2015,7 +2085,11 @@ theorem nodeSuccs_evalTerminatorLookup {cone : List DefPath} {root : CapturedMir
               exact closedInvLookup_push h_inv h_cur (inConeLookup_of_lookup h_dp h_lk)
           | none =>
             dsimp only
-            repeat' (first | trivial | exact nodeSuccs_applyUnwindLookup h_inv _ _ | split)
+            repeat' (first
+              | trivial
+              | exact nodeSuccs_applyUnwindLookup h_inv _ _
+              | exact nodeSuccs_evalDivergingRustIntrinsic? ‹_›
+              | split)
   | tailCall func argOps =>
     have hq : MirLiftCore.CallTargetInCone cone s (s.memory.activeCallee.getD root) func
         (length argOps) := h_term
@@ -2474,16 +2548,34 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_lookupPoly {cone : List DefPath}
   | none => exact h_fb
   | some kind =>
     rw [h_k] at h_cl
-    have h_step : ∀ (k : RustIntrinsicKind),
+    have h_nsel : ∀ (k : RustIntrinsicKind),
         MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti)
           (evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
-            argOps argVals locals' destination targetBb) := by
-      intro k
-      exact nodeSuccs_closedInvLookupPoly_of_ctx h_inv
+            argOps argVals locals' destination targetBb) := fun k =>
+      nodeSuccs_closedInvLookupPoly_of_ctx h_inv
         (MirLiftCore.evalNonSelectIntrinsicCall_calleeCtx_preserved k s target bodyLocalDecls
           bodyLayouts argOps argVals locals' destination targetBb)
         (MirLiftCore.evalNonSelectIntrinsicCall_callerBodies k s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
+    have h_step : ∀ (k : RustIntrinsicKind),
+        MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti)
+          (match evalCoreMemPtrIntrinsicCall? k s target bodyLocalDecls bodyLayouts
+              argOps argVals locals' destination (some targetBb) with
+           | some stepNode => stepNode
+           | none =>
+             evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
+               argOps argVals locals' destination targetBb) := by
+      intro k
+      cases h_cm : evalCoreMemPtrIntrinsicCall? k s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination (some targetBb) with
+      | some sn =>
+        exact nodeSuccs_closedInvLookupPoly_of_ctx h_inv
+          (MirLiftCore.evalCoreMemPtrIntrinsicCall?_calleeCtx_preserved k s target bodyLocalDecls
+            bodyLayouts argOps argVals locals' destination (some targetBb) h_cm)
+          (MirLiftCore.evalCoreMemPtrIntrinsicCall?_callerBodies k s target bodyLocalDecls
+            bodyLayouts argOps argVals locals' destination (some targetBb) h_cm)
+      | none => exact h_nsel k
+    have h_step' := h_step kind
     cases kind with
     | constEvalSelect => cases h_cl
     | copyNonOverlapping =>
@@ -2498,7 +2590,7 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_lookupPoly {cone : List DefPath}
           argOps argVals locals' destination targetBb)
         (MirLiftCore.evalWriteBytesCall_callerBodies s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
-    | _ => exact h_step _
+    | _ => exact h_step'
 
 theorem nodeSuccs_evalTerminatorLookupPoly {cone : List DefPath} {root : CapturedMir}
     {tbl t₂ : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState} {term : Terminator}
@@ -2604,7 +2696,11 @@ theorem nodeSuccs_evalTerminatorLookupPoly {cone : List DefPath} {root : Capture
               exact closedInvLookupPoly_push h_inv h_cur (inConeLookupPoly_of_lookup h_dp h_no₁ h_lk)
           | none =>
             dsimp only
-            repeat' (first | trivial | exact nodeSuccs_applyUnwindLookupPoly h_inv _ _ | split)
+            repeat' (first
+              | trivial
+              | exact nodeSuccs_applyUnwindLookupPoly h_inv _ _
+              | exact nodeSuccs_evalDivergingRustIntrinsic? ‹_›
+              | split)
   | tailCall func argOps =>
     have hq : MirLiftCore.CallTargetInConePoly cone t₂.toList s (s.memory.activeCallee.getD root)
         func (length argOps) := h_term

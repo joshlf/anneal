@@ -5586,7 +5586,7 @@ private theorem evalCopyNonOverlappingWithCount_preserves_tables (s : MachineSta
     StepNodePreservesTables s.memory
       (evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
         locals₃) := by
-  unfold evalCopyNonOverlappingWithCount; try dsimp only
+  unfold evalCopyNonOverlappingWithCount evalCopyNonOverlappingWithCountNonZero; try dsimp only
   repeat' (first
     | exact trivial
     | exact ⟨rfl, rfl⟩

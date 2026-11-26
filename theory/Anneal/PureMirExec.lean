@@ -221,11 +221,13 @@ theorem evalCopyNonOverlappingCall_pushBaseStack_of_noCallWP
             { ms with memory := s'.memory } s'.frame.locals destination targetBb .unit h_st
             (Or.inl rfl)
         · rcases evalCopyNonOverlappingWithCount_borrows_nil ms srcOp dstOp bodyLocalDecls
-              bodyLayouts srcVal dstVal countSc.bits locals' h_nil with ⟨h_c, h_eq⟩ | ⟨fk, hf⟩
+              bodyLayouts srcVal dstVal countSc.bits locals' h_nil with h_eq | hu' | ⟨fk, hf⟩
           · rw [h_eq] at h_st ⊢
-            rw [evalCopyNonOverlappingWithCount_eq, h_c]
+            rw [evalCopyNonOverlappingWithCount_pushBaseStack_of_borrows_nil calleeBody baseStack
+              ms srcOp dstOp bodyLocalDecls bodyLayouts srcVal dstVal countSc.bits locals' h_nil, h_eq]
             exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack ms locals'
               destination targetBb .unit h_st (Or.inr h_nil)
+          · rw [hu'] at h_st; exact False.elim h_st
           · rw [hf] at h_st; exact False.elim h_st
       · rw [hf] at h_st; exact False.elim h_st
       · rw [hu] at h_st; exact False.elim h_st
@@ -4426,8 +4428,12 @@ private theorem evalCopyNonOverlappingWithCount_ne_nil
       | exact evalCopySubplaceMulti_ne_nil h
       | exact copyWriteDstVal_ne_nil h
       | split)
+  have h_nz {sv dv cnt l3} :
+      stmtStepBorrowsNeNil (evalCopyNonOverlappingWithCountNonZero s src dst ld ly sv dv cnt l3) := by
+    unfold evalCopyNonOverlappingWithCountNonZero; try dsimp only
+    repeat' (first | exact sn_fail | exact sn_unsup | exact sn_step h | exact h_ff | exact h_perm | split)
   unfold evalCopyNonOverlappingWithCount; try dsimp only
-  repeat' (first | exact sn_fail | exact sn_unsup | exact sn_step h | exact h_ff | exact h_perm | split)
+  repeat' (first | exact sn_fail | exact sn_unsup | exact sn_step h | exact h_nz | (dsimp only) | split)
 
 private theorem evalCopyNonOverlapping_ne_nil
     {s src dst count ld ly} (h : s.memory.borrows ≠ []) :
@@ -5456,7 +5462,10 @@ theorem evalStmt_borrows_nil_pushBaseStack
           | scalar sc => dsimp only; cases Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) <;> rfl
           | _ => rfl
       | copyNonOverlapping src dst count =>
-        unfold evalStmt evalCopyNonOverlapping evalCopyNonOverlappingWithCount
+        have hc := evalCopyNonOverlappingWithCount_pushBaseStack_of_borrows_nil calleeBody
+          (bHd :: bTl) ⟨sFr, ⟨nA, gl, [], nT, cal, tr, cs, ac, ap, nP, cl, fp, ex, ru⟩⟩ src dst
+          localDecls layouts
+        unfold evalStmt evalCopyNonOverlapping
         dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack, lookupBorrow]
         simp only [evalOperand_nil_borrows_callStack]
         cases evalOperand sFr.locals src [] gl layouts cl localDecls [] with
@@ -5473,9 +5482,9 @@ theorem evalStmt_borrows_nil_pushBaseStack
               cases cntVal with
               | scalar sc =>
                 dsimp only
-                cases Nat.beq sc.bits 0 with
-                | true => rfl
-                | false => cases srcVal <;> (cases dstVal <;> rfl)
+                cases countScalarWellFormed (layoutPointerBytes layouts) sc with
+                | false => rfl
+                | true => exact hc srcVal dstVal sc.bits l3 rfl
               | _ => rfl
     | setDiscriminant p variantIdx =>
       rcases p with ⟨pLoc, _ | ⟨phd, ptl⟩⟩

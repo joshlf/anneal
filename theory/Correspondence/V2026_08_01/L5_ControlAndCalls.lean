@@ -2112,7 +2112,10 @@ theorem mir_evalTerminator_diverging_call_external_corresponds
         callerBody.layouts
         s.memory.callerLocals
         callerBody.localDecls
-        s.memory.callStack = .ok argVals locals') :
+        s.memory.callStack = .ok argVals locals')
+    (hNotIntrinsic :
+      evalDivergingRustIntrinsic? s { defPath := defPath, typeArgs := extractCalleeTypeArgs func }
+        callerBody.localDecls callerBody.layouts argOps argVals locals' destination = .none) :
     (evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
       MirStepNode.extCall
         { defPath := defPath, typeArgs := extractCalleeTypeArgs func, args := argVals, memory := s.memory }
@@ -2129,7 +2132,7 @@ theorem mir_evalTerminator_diverging_call_external_corresponds
     (resumeExternalDivergingCall s locals' unwind .aborted = .halted .abort) := by
   refine ⟨?_, ?_, ?_, ?_⟩
   · simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs,
-      hNotUnreach, hFindNone, hNotAbort, hNotPanic]
+      hNotUnreach, hFindNone, hNotAbort, hNotPanic, hNotIntrinsic]
   · intro retVal memAfter
     rfl
   · intro memAfter
@@ -2437,6 +2440,8 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
       isUnreachableCallTarget defPath = false →
       isAbortingPanicDefPath defPath = false →
       isUnwindingPanicDefPath defPath = false →
+      evalDivergingRustIntrinsic? s { defPath := defPath, typeArgs := extractCalleeTypeArgs func }
+        callerBody.localDecls callerBody.layouts argOps argVals locals' destination = .none →
       evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
         MirStepNode.extCall
           { defPath := defPath, typeArgs := extractCalleeTypeArgs func, args := argVals, memory := s.memory }
@@ -2461,9 +2466,9 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
     simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFindNone,
       hNotUnreach, hNotAbort, hPanic]
     cases applyUnwindAction s locals' s.memory unwind <;> rfl
-  · intro hFindNone hNotUnreach hNotAbort hNotPanic
+  · intro hFindNone hNotUnreach hNotAbort hNotPanic hNotIntrinsic
     simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFindNone,
-      hNotUnreach, hNotAbort, hNotPanic]
+      hNotUnreach, hNotAbort, hNotPanic, hNotIntrinsic]
   · refine ⟨rfl, ?_, ?_, rfl⟩
     · simp [evalTerminator, pushDivergingCalleeFrame, unwindFromCallStack, restoreCallerProtectors]
     · intro hNil hCeil

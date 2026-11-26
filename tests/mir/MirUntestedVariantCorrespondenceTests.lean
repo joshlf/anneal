@@ -5366,10 +5366,11 @@ frame:
 and a source borrow whose root slot exists neither in the frame nor among the caller-owned
 referents is UB. The element-window copy itself (`copySliceElements`) is characterized by
 `copyNonOverlapping_trusted_elem_window_universal` and pinned by the witnesses below.
-A `count = 0` copy never reaches this resolution: Trusted steps without the alignment check,
-whereas Miri checks alignment "including for zero-length copies"
-(`copyNonOverlapping_leanMiri_check_order`) — a pre-existing, documented difference outside
-this file's scope (`LeanMiriSpec`'s `wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence`). -/
+A zero-byte copy (`count = 0`, or a zero-sized element type) never reaches this resolution:
+Trusted's `evalCopyNonOverlappingWithCount` instead checks that both pointers are well-formed
+and aligned to `align_of::<T>()` without accessing memory (aligned null and dangling pointers
+are accepted), matching Miri, which checks alignment "including for zero-length copies"
+(`copyNonOverlapping_leanMiri_check_order`; see `tests/mir/ZeroCountCopyAlignTests.lean`). -/
 theorem copyNonOverlapping_trusted_subplace_resolution_universal
     (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame) (src dst : Operand)
     (decls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)

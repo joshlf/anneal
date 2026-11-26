@@ -10853,13 +10853,11 @@ def evalCopyNonOverlappingPermOk
     | false =>
       evalCopySubplaceMulti s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry n locals₃
 
-theorem evalCopyNonOverlappingWithCount_eq
+theorem evalCopyNonOverlappingWithCountNonZero_eq
     (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
-    evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits locals₃ =
-      match Nat.beq countBits 0 with
-      | true => MirStepNode.step (advanceStmt s locals₃)
-      | false =>
+    evalCopyNonOverlappingWithCountNonZero s src dst localDecls layouts srcVal dstVal countBits
+        locals₃ =
         match srcVal, dstVal with
         | .ptr srcPtr _, .ptr dstPtr _ =>
           match lookupBorrow s.memory.borrows srcPtr.tag, lookupBorrow s.memory.borrows dstPtr.tag with
@@ -10878,33 +10876,29 @@ theorem evalCopyNonOverlappingWithCount_eq
                   srcEntry dstEntry countBits locals₃
           | _, _ => MirStepNode.fail .ub
         | _, _ => MirStepNode.fail .ub := by
-  unfold evalCopyNonOverlappingWithCount
-  cases Nat.beq countBits 0 with
-  | true => rfl
-  | false =>
-    dsimp only
-    cases srcVal with
-    | ptr srcPtr _ =>
-      cases dstVal with
-      | ptr dstPtr _ =>
-        dsimp only
-        cases lookupBorrow s.memory.borrows srcPtr.tag with
+  unfold evalCopyNonOverlappingWithCountNonZero
+  cases srcVal with
+  | ptr srcPtr _ =>
+    cases dstVal with
+    | ptr dstPtr _ =>
+      dsimp only
+      cases lookupBorrow s.memory.borrows srcPtr.tag with
+      | none => rfl
+      | some srcEntry =>
+        cases lookupBorrow s.memory.borrows dstPtr.tag with
         | none => rfl
-        | some srcEntry =>
-          cases lookupBorrow s.memory.borrows dstPtr.tag with
-          | none => rfl
-          | some dstEntry =>
-            dsimp only
-            have h_ok :
-                _root_.Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk
-                  s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
-                evalCopyNonOverlappingPermOk
-                  s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ :=
-              rfl
-            rw [h_ok]
-            cases srcEntry.perm <;> cases dstEntry.perm <;> rfl
-      | _ => rfl
+        | some dstEntry =>
+          dsimp only
+          have h_ok :
+              _root_.Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk
+                s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
+              evalCopyNonOverlappingPermOk
+                s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ :=
+            rfl
+          rw [h_ok]
+          cases srcEntry.perm <;> cases dstEntry.perm <;> rfl
     | _ => rfl
+  | _ => rfl
 
 theorem copyWriteDstVal_pushBaseStack
     (calleeBody : CapturedMir)
@@ -11128,6 +11122,72 @@ theorem evalForeignFrameCopySingleDirect_isStmtNode
     | exact Or.inr (Or.inr rfl)
     | split)
 
+theorem evalCopyNonOverlappingWithCountNonZero_pushBaseStack
+    (calleeBody : CapturedMir)
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
+    evalCopyNonOverlappingWithCountNonZero
+        (MachineState.pushBaseStack calleeBody [] s)
+        src dst localDecls layouts srcVal dstVal countBits locals₃ =
+      MirStepNode.pushBaseStack calleeBody []
+        (evalCopyNonOverlappingWithCountNonZero
+          s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
+  rw [evalCopyNonOverlappingWithCountNonZero_eq, evalCopyNonOverlappingWithCountNonZero_eq]
+  cases srcVal with
+  | ptr srcPtr _ =>
+    cases dstVal with
+    | ptr dstPtr _ =>
+      dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+      cases lookupBorrow s.memory.borrows srcPtr.tag with
+      | none => rfl
+      | some srcEntry =>
+        cases lookupBorrow s.memory.borrows dstPtr.tag with
+        | none => rfl
+        | some dstEntry =>
+          dsimp only
+          cases srcEntry.perm <;> cases dstEntry.perm <;>
+            first
+            | rfl
+            | (cases copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
+               | false =>
+                 exact evalForeignFrameCopySingleDirect_pushBaseStack calleeBody
+                   s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃
+               | true =>
+                 exact evalCopyNonOverlappingPermOk_pushBaseStack calleeBody
+                   s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃)
+    | _ => rfl
+  | _ => rfl
+
+/-- The zero-byte `copy_nonoverlapping` precondition never reads `Memory.activeCallee`, so it is
+invariant under `MachineState.pushBaseStack` with an empty base stack. -/
+theorem zeroByteCopyPrecheck_pushBaseStack
+    (calleeBody : CapturedMir) (s : MachineState) (locals₃ : List LocalSlot)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (elemAlign : Nat)
+    (srcVal dstVal : Value) :
+    zeroByteCopyPrecheck (MachineState.pushBaseStack calleeBody [] s) locals₃ localDecls layouts
+        elemAlign srcVal dstVal =
+      zeroByteCopyPrecheck s locals₃ localDecls layouts elemAlign srcVal dstVal := rfl
+
+/-- With no Tree Borrows entries, the zero-byte `copy_nonoverlapping` precondition reads neither
+`Memory.callStack` nor `Memory.activeCallee` (no stack-borrow resolution happens), so it is
+invariant under `MachineState.pushBaseStack` for every base stack. -/
+theorem zeroByteCopyPrecheck_pushBaseStack_of_borrows_nil
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame) (s : MachineState)
+    (locals₃ : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (elemAlign : Nat) (srcVal dstVal : Value) (h_nil : s.memory.borrows = []) :
+    zeroByteCopyPrecheck (MachineState.pushBaseStack calleeBody baseStack s) locals₃ localDecls
+        layouts elemAlign srcVal dstVal =
+      zeroByteCopyPrecheck s locals₃ localDecls layouts elemAlign srcVal dstVal := by
+  have hc : ∀ v, checkZeroCountCopyPtr (MachineState.pushBaseStack calleeBody baseStack s) locals₃
+      localDecls layouts elemAlign v =
+      checkZeroCountCopyPtr s locals₃ localDecls layouts elemAlign v := by
+    intro v
+    unfold checkZeroCountCopyPtr
+    cases v <;> simp [MachineState.pushBaseStack, Memory.pushBaseStack, h_nil, lookupBorrow]
+  unfold zeroByteCopyPrecheck
+  rw [hc, hc]
+
 theorem evalCopyNonOverlappingWithCount_pushBaseStack
     (calleeBody : CapturedMir)
     (s : MachineState) (src dst : Operand)
@@ -11139,34 +11199,38 @@ theorem evalCopyNonOverlappingWithCount_pushBaseStack
       MirStepNode.pushBaseStack calleeBody []
         (evalCopyNonOverlappingWithCount
           s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
-  rw [evalCopyNonOverlappingWithCount_eq, evalCopyNonOverlappingWithCount_eq]
-  cases Nat.beq countBits 0 with
-  | true => rfl
-  | false =>
-    cases srcVal with
-    | ptr srcPtr _ =>
-      cases dstVal with
-      | ptr dstPtr _ =>
-        dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-        cases lookupBorrow s.memory.borrows srcPtr.tag with
-        | none => rfl
-        | some srcEntry =>
-          cases lookupBorrow s.memory.borrows dstPtr.tag with
-          | none => rfl
-          | some dstEntry =>
-            dsimp only
-            cases srcEntry.perm <;> cases dstEntry.perm <;>
-              first
-              | rfl
-              | (cases copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
-                 | false =>
-                   exact evalForeignFrameCopySingleDirect_pushBaseStack calleeBody
-                     s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃
-                 | true =>
-                   exact evalCopyNonOverlappingPermOk_pushBaseStack calleeBody
-                     s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃)
-      | _ => rfl
-    | _ => rfl
+  unfold evalCopyNonOverlappingWithCount
+  simp only [zeroByteCopyPrecheck_pushBaseStack, evalCopyNonOverlappingWithCountNonZero_pushBaseStack]
+  repeat' (first | rfl | exact step_push_fail | exact step_push_unsupported | (dsimp only) | split)
+
+theorem evalCopyNonOverlappingWithCountNonZero_isStmtNode
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
+    IsStmtNode
+      (evalCopyNonOverlappingWithCountNonZero
+        s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
+  rw [evalCopyNonOverlappingWithCountNonZero_eq]
+  cases srcVal with
+  | ptr srcPtr _ =>
+    cases dstVal with
+    | ptr dstPtr _ =>
+      dsimp only
+      cases lookupBorrow s.memory.borrows srcPtr.tag with
+      | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
+      | some srcEntry =>
+        cases lookupBorrow s.memory.borrows dstPtr.tag with
+        | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
+        | some dstEntry =>
+          dsimp only
+          cases srcEntry.perm <;> cases dstEntry.perm <;>
+            first
+            | exact Or.inr (Or.inl ⟨_, rfl⟩)
+            | (cases copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
+               | false => exact evalForeignFrameCopySingleDirect_isStmtNode ..
+               | true => exact evalCopyNonOverlappingPermOk_isStmtNode ..)
+    | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
+  | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
 
 theorem evalCopyNonOverlappingWithCount_isStmtNode
     (s : MachineState) (src dst : Operand)
@@ -11175,51 +11239,40 @@ theorem evalCopyNonOverlappingWithCount_isStmtNode
     IsStmtNode
       (evalCopyNonOverlappingWithCount
         s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
-  rw [evalCopyNonOverlappingWithCount_eq]
-  cases Nat.beq countBits 0 with
-  | true => exact Or.inl ⟨_, rfl⟩
-  | false =>
-    cases srcVal with
-    | ptr srcPtr _ =>
-      cases dstVal with
-      | ptr dstPtr _ =>
-        dsimp only
-        cases lookupBorrow s.memory.borrows srcPtr.tag with
-        | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | some srcEntry =>
-          cases lookupBorrow s.memory.borrows dstPtr.tag with
-          | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-          | some dstEntry =>
-            dsimp only
-            cases srcEntry.perm <;> cases dstEntry.perm <;>
-              first
-              | exact Or.inr (Or.inl ⟨_, rfl⟩)
-              | (cases copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
-                 | false => exact evalForeignFrameCopySingleDirect_isStmtNode ..
-                 | true => exact evalCopyNonOverlappingPermOk_isStmtNode ..)
-      | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
-    | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
+  have hNZ := evalCopyNonOverlappingWithCountNonZero_isStmtNode s src dst localDecls layouts
+    srcVal dstVal countBits locals₃
+  unfold evalCopyNonOverlappingWithCount
+  dsimp only
+  repeat' (first
+    | (dsimp only)
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | exact hNZ
+    | split)
 
 /-- With no Tree Borrows entries, the statement-form `copy_nonoverlapping` core either copies
-nothing (`count = 0`: it only advances) or faults (no borrow entry for a pointer argument). -/
+nothing (a zero-byte copy: it only advances), fails closed, or faults (no borrow entry for a
+pointer argument of a non-zero-byte copy). -/
 theorem evalCopyNonOverlappingWithCount_borrows_nil
     (s : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot)
     (h_nil : s.memory.borrows = []) :
-    (Nat.beq countBits 0 = true ∧
-      evalCopyNonOverlappingWithCount
-          s src dst localDecls layouts srcVal dstVal countBits locals₃ =
-        MirStepNode.step (advanceStmt s locals₃)) ∨
+    evalCopyNonOverlappingWithCount
+        s src dst localDecls layouts srcVal dstVal countBits locals₃ =
+      MirStepNode.step (advanceStmt s locals₃) ∨
+    evalCopyNonOverlappingWithCount
+        s src dst localDecls layouts srcVal dstVal countBits locals₃ =
+      MirStepNode.unsupported ∨
     ∃ fk : FailureKind,
       evalCopyNonOverlappingWithCount
           s src dst localDecls layouts srcVal dstVal countBits locals₃ =
         MirStepNode.fail fk := by
-  rw [evalCopyNonOverlappingWithCount_eq]
-  cases h_c : Nat.beq countBits 0 with
-  | true => exact Or.inl ⟨rfl, rfl⟩
-  | false =>
-    refine Or.inr ?_
+  have hNZ : ∃ fk : FailureKind,
+      evalCopyNonOverlappingWithCountNonZero s src dst localDecls layouts srcVal dstVal countBits
+        locals₃ = MirStepNode.fail fk := by
+    rw [evalCopyNonOverlappingWithCountNonZero_eq]
     cases srcVal with
     | ptr srcPtr _ =>
       cases dstVal with
@@ -11229,6 +11282,50 @@ theorem evalCopyNonOverlappingWithCount_borrows_nil
         exact ⟨_, rfl⟩
       | _ => exact ⟨_, rfl⟩
     | _ => exact ⟨_, rfl⟩
+  unfold evalCopyNonOverlappingWithCount
+  dsimp only
+  repeat' (first
+    | (dsimp only)
+    | exact Or.inl rfl
+    | exact Or.inr (Or.inl rfl)
+    | exact Or.inr (Or.inr ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr hNZ)
+    | split)
+
+/-- With no Tree Borrows entries, the statement-form `copy_nonoverlapping` core commutes with
+`MachineState.pushBaseStack` for every base stack. -/
+theorem evalCopyNonOverlappingWithCount_pushBaseStack_of_borrows_nil
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot)
+    (h_nil : s.memory.borrows = []) :
+    evalCopyNonOverlappingWithCount
+        (MachineState.pushBaseStack calleeBody baseStack s)
+        src dst localDecls layouts srcVal dstVal countBits locals₃ =
+      MirStepNode.pushBaseStack calleeBody baseStack
+        (evalCopyNonOverlappingWithCount
+          s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
+  have hNZ : ∀ (s' : MachineState), s'.memory.borrows = [] →
+      evalCopyNonOverlappingWithCountNonZero s' src dst localDecls layouts srcVal dstVal
+        countBits locals₃ = MirStepNode.fail .ub := by
+    intro s' h'
+    rw [evalCopyNonOverlappingWithCountNonZero_eq]
+    cases srcVal with
+    | ptr srcPtr _ =>
+      cases dstVal with
+      | ptr dstPtr _ =>
+        dsimp only
+        rw [h']
+        rfl
+      | _ => rfl
+    | _ => rfl
+  have h₁ := hNZ (MachineState.pushBaseStack calleeBody baseStack s) h_nil
+  have h₂ := hNZ s h_nil
+  unfold evalCopyNonOverlappingWithCount
+  simp only [zeroByteCopyPrecheck_pushBaseStack_of_borrows_nil calleeBody baseStack s locals₃
+    localDecls layouts _ srcVal dstVal h_nil, h₁, h₂]
+  repeat' (first | rfl | exact step_push_fail | exact step_push_unsupported | (dsimp only) | split)
 
 theorem evalCopyNonOverlapping_isStmtNode
     (s : MachineState) (src dst count : Operand)
@@ -11251,8 +11348,12 @@ theorem evalCopyNonOverlapping_isStmtNode
       | ok countVal locals₃ =>
         cases countVal with
         | scalar countSc =>
-          exact evalCopyNonOverlappingWithCount_isStmtNode s src dst localDecls layouts
-            srcVal dstVal countSc.bits locals₃
+          dsimp only
+          cases countScalarWellFormed (layoutPointerBytes layouts) countSc with
+          | false => exact Or.inr (Or.inl ⟨_, rfl⟩)
+          | true =>
+            exact evalCopyNonOverlappingWithCount_isStmtNode s src dst localDecls layouts
+              srcVal dstVal countSc.bits locals₃
         | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
 
 theorem evalCopyNonOverlapping_pushBaseStack
@@ -11282,9 +11383,13 @@ theorem evalCopyNonOverlapping_pushBaseStack
       | ok countVal locals₃ =>
         cases countVal with
         | scalar countSc =>
-          exact evalCopyNonOverlappingWithCount_pushBaseStack
-            calleeBody s src dst localDecls layouts
-            srcVal dstVal countSc.bits locals₃
+          dsimp only
+          cases countScalarWellFormed (layoutPointerBytes layouts) countSc with
+          | false => rfl
+          | true =>
+            exact evalCopyNonOverlappingWithCount_pushBaseStack
+              calleeBody s src dst localDecls layouts
+              srcVal dstVal countSc.bits locals₃
         | _ => rfl
 
 /--

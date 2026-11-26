@@ -296,11 +296,21 @@ theorem nonOverlappingPtrs_of_ne_alloc
 /--
 Bridge theorem connecting `NonOverlappingPtrs src dst 0` directly to
 `MirSemantics.evalCopyNonOverlapping` when `count` evaluates to `0`.
+
+Even a zero-byte copy requires both pointers to be well-formed and aligned to
+`align_of::<T>()` (`core::ptr::copy_nonoverlapping`: "even if the effectively
+copied size ... is `0`, the pointers must be properly aligned"), so the bridge
+takes the resolved element layout (`hElem`) and the trusted zero-byte
+precondition (`hAligned`) as obligations.
 -/
 theorem evalCopyNonOverlapping_zero_of_obligations
     (s : MachineState) (srcOp dstOp countOp : Operand)
     (src dst : RawPtrVal) (srcVal dstVal : Value)
+    (elemSize elemAlign : Nat)
     (hNonoverlap : NonOverlappingPtrs src dst 0)
+    (hElem : resolveCopyElemLayout [] emptyLayoutTable srcOp dstOp = .ok elemSize elemAlign)
+    (hAligned :
+      zeroByteCopyPrecheck s s.frame.locals [] emptyLayoutTable elemAlign srcVal dstVal = .ok)
     (hSrc :
       evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
           (callStack := s.memory.callStack) =
@@ -318,12 +328,20 @@ theorem evalCopyNonOverlapping_zero_of_obligations
     NonOverlappingPtrs src dst 0 := by
   refine ⟨?_, hNonoverlap⟩
   unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount
-  simp [hSrc, hDst, hCnt]
+  simp [hSrc, hDst, hCnt, hElem, hAligned, countScalarWellFormed, layoutPointerBytes,
+    emptyLayoutTable]
+  all_goals rfl
 
 /--
 Bridge theorem connecting `NonOverlappingPtrs`, `HasTreeBorrowAccess`, and
 `LiveAllocAt` directly to `MirSemantics.evalCopyNonOverlapping` for `count = 1`
 at base offset `0`.
+
+`hElem` (the element layout is not statically resolved from the empty
+declarations, so the copy is the delegated non-zero copy rather than a zero-byte
+ZST no-op or an ill-typed `.ub`) and `hSz` (both arguments are well-formed
+`usize`-wide thin pointers, `isThinPtrValue`) are the obligations introduced by
+the zero-byte `copy_nonoverlapping` guard.
 
 `hFrame` requires both borrow targets to lie in the active frame
 (`copyEntriesTargetActiveFrame`, which holds trivially when the root frame is
@@ -352,6 +370,8 @@ theorem evalCopyNonOverlapping_one_of_obligations
           (callStack := s.memory.callStack) =
         .ok (.scalar ⟨1, 8⟩) s.frame.locals)
     (hSrcPt : operandPointeeTy [] emptyLayoutTable srcOp = none)
+    (hElem : resolveCopyElemLayout [] emptyLayoutTable srcOp dstOp = .unsupported)
+    (hSz : sz = 8)
     (hSrcLookup :
       lookupBorrow s.memory.borrows src.toProvenancePtr.tag = some srcEntry)
     (hDstLookup :
@@ -383,11 +403,16 @@ theorem evalCopyNonOverlapping_one_of_obligations
   refine ⟨?_, hNonoverlap⟩
   have hSrcZero : src.toProvenancePtr.offsetBytes = 0 := hSrcOff
   have hDstZero : dst.toProvenancePtr.offsetBytes = 0 := hDstOff
+  subst hSz
   unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount
+    evalCopyNonOverlappingWithCountNonZero
     evalCopyNonOverlappingPermOk evalCopySingleDirect writePlaceValue
-  simp [hSrc, hDst, hCnt, hSrcLookup, hDstLookup, hSrcPerm, hDstPerm,
+  simp [hSrc, hDst, hCnt, hElem, countScalarWellFormed, isThinPtrValue, layoutPointerBytes,
+        emptyLayoutTable,
+        hSrcLookup, hDstLookup, hSrcPerm, hDstPerm,
         hSrcZero, hDstZero, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt,
         hDstProj, hDstVal, hWrite, hFrame, hCopiedInit]
+  all_goals rfl
 
 /-! ## 3. Slice-Split, Unaligned Raw-Pointer, and Array-to-Slice Obligations -/
 
