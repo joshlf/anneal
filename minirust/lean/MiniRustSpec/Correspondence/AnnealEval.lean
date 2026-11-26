@@ -2700,6 +2700,34 @@ theorem operandIsSigned_of_OperandOkT (decls : List LocalDecl) (layouts : Layout
     revert ht
     cases ty.kind <;> simp [signedOf, intBoolTupleTy]
 
+theorem isFloatOptTy_of_operandOk (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    (srcIt : Gen.IntType) (op : Operand) (hok : operandOk layouts decls srcIt op = true) :
+    MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts op) = false := by
+  obtain ⟨ty, hty, hit⟩ := operandTy_of_operandOk decls layouts srcIt op hok
+  rw [hty]
+  rcases intTypeOf_kind hit with ⟨⟨u, hu⟩, _⟩ | ⟨⟨i, hi⟩, _⟩
+  · simp [MirSemantics.isFloatOptTy, MirSemantics.isFloatTy, hu]
+  · simp [MirSemantics.isFloatOptTy, MirSemantics.isFloatTy, hi]
+
+theorem isFloatOptTy_of_OperandOkT (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    {T : Gen.Type} (op : Operand) (hok : OperandOkT layouts decls T op) :
+    MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts op) = false := by
+  obtain ⟨ty, hty, hT⟩ := operandTy_of_OperandOkT decls layouts op hok
+  rw [hty]
+  rcases scalarTypeOf_cases hT with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩ | ⟨_, ht, _⟩
+  · unfold isBoolTy at hb
+    split at hb <;> simp_all [MirSemantics.isFloatOptTy, MirSemantics.isFloatTy]
+  · rcases intTypeOf_kind hit with ⟨⟨u, hu⟩, _⟩ | ⟨⟨i, hi⟩, _⟩
+    · simp [MirSemantics.isFloatOptTy, MirSemantics.isFloatTy, hu]
+    · simp [MirSemantics.isFloatOptTy, MirSemantics.isFloatTy, hi]
+  · unfold isOrderingTy at ho
+    split at ho <;> simp_all [MirSemantics.isFloatOptTy, MirSemantics.isFloatTy]
+  · simp only [MirSemantics.isFloatOptTy, MirSemantics.isFloatTy]
+    unfold intBoolTupleOf at ht
+    cases hk : ty.kind with
+    | float _ => rw [hk] at ht; nomatch ht
+    | _ => rfl
+
 theorem castBits_eq_toNat (srcIt it : Gen.IntType) (hsrcGood : GoodSize srcIt.size.bytes)
     (x : Nat) (hx : x < 2 ^ (8 * srcIt.size.bytes)) :
     let m := MirSemantics.scalarModulus it.size.bytes
@@ -3851,7 +3879,9 @@ theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) 
       have hx := opBits_lt decls locals hslots it op hok x hxo
       cases uop <;> simp [translateUnOp] at hiuop <;> subst hiuop
       · simp only [evalRvalue, ha x hxo, evalUnaryNot_frag decls layouts it hsz op hok x hx, intUnArith]
-      · simp [evalRvalue, ha x hxo, hbeq, Nat.sub_eq, wrap_neg_eq_toNat x _ hx, intUnArith]
+      · have hnf := isFloatOptTy_of_operandOk decls layouts it op hok
+        simp only [evalRvalue, ha x hxo, hnf]
+        simp [hbeq, Nat.sub_eq, wrap_neg_eq_toNat x _ hx, intUnArith]
   | .binaryOp op a b, hok =>
     obtain ⟨iop, rhsIt, hiop, hoka, hrhsTy, hokb, hhom⟩ := rvalueOk_binaryOp hok
     obtain ⟨_, _, hrhsTyOf⟩ := operandTy_of_operandOk decls layouts rhsIt b hokb
@@ -3873,18 +3903,20 @@ theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) 
         have hx := opBits_lt decls locals hslots it a hoka x hxa
         have hy := opBits_lt decls locals hslots rhsIt b hokb y hyb
         have hsigned := operandIsSigned_of_operandOk decls layouts it a hoka
+        have hnfa := isFloatOptTy_of_operandOk decls layouts it a hoka
+        have hnfb := isFloatOptTy_of_operandOk decls layouts rhsIt b hokb
         have hne : op ≠ .offset := by rintro rfl; cases hiop
         obtain ⟨hbinOk, hbinNone⟩ :=
           evalScalarBinOp_frag op iop hiop it rhsIt hgood hrhsGood hhom x y hx hy locals mem
         cases hz : intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it with
         | none =>
           refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hr, fun _ => ?_⟩
-          cases op <;> first | exact absurd rfl hne | simp [evalRvalue, ha x hxa, hb y hyb, hsigned, hbinNone hz]
+          cases op <;> first | exact absurd rfl hne | simp only [evalRvalue, ha x hxa, hb y hyb, hnfa, hnfb, Bool.or, hsigned, hbinNone hz]
         | some z =>
           refine ⟨fun r hr => ?_, fun h => by simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at h⟩
           simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hr
           subst hr
-          cases op <;> first | exact absurd rfl hne | simp [evalRvalue, ha x hxa, hb y hyb, hsigned, hbinOk z hz]
+          cases op <;> first | exact absurd rfl hne | (simp only [evalRvalue, ha x hxa, hb y hyb, hnfa, hnfb, hsigned]; simp [hbinOk z hz])
   | .cast .intToInt op targetTy, hok =>
     simp only [rvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     obtain ⟨htgt, hsrc⟩ := hok
@@ -4534,6 +4566,14 @@ theorem operandIsSigned_of_RelOperandOk (decls : List LocalDecl) (layouts : Layo
   | bool op hok =>
     exact operandIsSigned_of_OperandOkT decls layouts op (operandOkB_T hok)
 
+theorem isFloatOptTy_of_RelOperandOk (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    {T : Gen.Type} {it : Gen.IntType} (op : Operand)
+    (hok : RelOperandOk layouts decls T it op) :
+    MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts op) = false := by
+  cases hok with
+  | int it op hok => exact isFloatOptTy_of_operandOk decls layouts it op hok
+  | bool op hok => exact isFloatOptTy_of_OperandOkT decls layouts op (operandOkB_T hok)
+
 /-- Evaluating a fragment rvalue of type `bool` in Anneal's semantics. -/
 theorem evalRvalue_fragB {layouts : Layout.LayoutTable} (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
@@ -4606,10 +4646,12 @@ theorem evalRvalue_fragB {layouts : Layout.LayoutTable} (decls : List LocalDecl)
               exact evalScalarBinOp_rel_bool op rel hrel x y (by simpa [ValidBits] using hx)
                 (by simpa [ValidBits] using hy) locals mem
           have hne : op ≠ .offset := by rintro rfl; cases hrel
+          have hnfa := isFloatOptTy_of_RelOperandOk decls layouts a hokA
+          have hnfb := isFloatOptTy_of_RelOperandOk decls layouts b hokB
           have hev : evalRvalue locals (.binaryOp op a b) mem decls layouts =
               evalScalarBinOp op ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ locals mem
                 (MirSemantics.operandIsSigned decls a layouts) := by
-            cases op <;> first | exact absurd rfl hne | simp [evalRvalue, ha x hxa, hb y hyb]
+            cases op <;> first | exact absurd rfl hne | simp only [evalRvalue, ha x hxa, hb y hyb, hnfa, hnfb, Bool.or]
           rw [hev, hsigned, hres]
           cases relBool rel (cmpOf T x y) <;> rfl
     | none =>
@@ -4640,10 +4682,12 @@ theorem evalRvalue_fragB {layouts : Layout.LayoutTable} (decls : List LocalDecl)
           simp [rvBitsB, hrel, hiop, hxa, hyb] at hr
           subst hr
           have hne : op ≠ .offset := by rintro rfl; cases hiop
+          have hnfa := isFloatOptTy_of_OperandOkT decls layouts a hokA
+          have hnfb := isFloatOptTy_of_OperandOkT decls layouts b hokB
           have hev : evalRvalue locals (.binaryOp op a b) mem decls layouts =
               evalScalarBinOp op ⟨x, u8Ty.size.bytes⟩ ⟨y, u8Ty.size.bytes⟩ locals mem
                 (MirSemantics.operandIsSigned decls a layouts) := by
-            cases op <;> first | exact absurd rfl hne | simp [evalRvalue, ha x hxa, hb y hyb]
+            cases op <;> first | exact absurd rfl hne | simp only [evalRvalue, ha x hxa, hb y hyb, hnfa, hnfb, Bool.or]
           rw [hev, hsigned, evalScalarBinOp_boolBit op iop hiop x y hx hy locals mem]
   | .cast _ _ _, hok => simp [rvalueOkB] at hok
   | .copyForDeref _, hok => simp [rvalueOkB] at hok
@@ -4760,7 +4804,9 @@ theorem evalRvalue_fragO {layouts : Layout.LayoutTable} (decls : List LocalDecl)
           | bool =>
             exact evalScalarBinOp_cmp_bool x y (by simpa [ValidBits] using hx)
               (by simpa [ValidBits] using hy) locals mem
-        simp only [evalRvalue, ha x hxa, hb y hyb, hsigned, hres]
+        have hnfa := isFloatOptTy_of_RelOperandOk decls layouts a hokA
+        have hnfb := isFloatOptTy_of_RelOperandOk decls layouts b hokB
+        simp only [evalRvalue, ha x hxa, hb y hyb, hnfa, hnfb, Bool.or, hsigned, hres]
 
 /-! ## `(Int, bool)` 2-tuple rvalues and checked integer arithmetic -/
 
@@ -4956,12 +5002,14 @@ theorem evalRvalue_fragTuple {layouts : Layout.LayoutTable} (decls : List LocalD
         have hx := opBits_lt decls locals hslots it a hoka x hxa
         have hy := opBits_lt decls locals hslots it b hokb y hyb
         have hsigned := operandIsSigned_of_operandOk decls layouts it a hoka
+        have hnfa := isFloatOptTy_of_operandOk decls layouts it a hoka
+        have hnfb := isFloatOptTy_of_operandOk decls layouts it b hokb
         have hchk := evalScalarBinOp_checked op cop hcop it hgood x y hx hy locals mem
         have hne : op ≠ .offset := by rintro rfl; cases hcop
         refine ⟨fun bits b' hbb => ?_, fun h => by simp [rvTupleBits, hcop, hxa, hyb] at h⟩
         simp [rvTupleBits, hcop, hxa, hyb] at hbb
         rcases hbb with ⟨rfl, rfl⟩
-        cases op <;> first | exact absurd rfl hne | simp [evalRvalue, ha x hxa, hb y hyb, hsigned, hchk]
+        cases op <;> first | exact absurd rfl hne | (simp only [evalRvalue, ha x hxa, hb y hyb, hnfa, hnfb, hsigned]; simp [hchk])
   | .aggregate .tuple [a, b], hok =>
     simp only [rvalueOkTuple, Bool.and_eq_true] at hok
     obtain ⟨hoka, hokb⟩ := hok
@@ -6431,6 +6479,45 @@ theorem evalUnaryNot_locals (sc : ScalarInt) (ty : Option Ty) (L L' : List Local
   unfold evalUnaryNot
   (repeat' split) <;> rfl
 
+theorem evalFloatUnaryNeg_locals (sc : ScalarInt) (ty : Option Ty) (L L' : List LocalSlot)
+    (mem : MirSemantics.Memory) :
+    MirSemantics.evalFloatUnaryNeg sc ty L' mem =
+      rvWithLocals (MirSemantics.evalFloatUnaryNeg sc ty L mem) L' := by
+  unfold MirSemantics.evalFloatUnaryNeg
+  (repeat' split) <;> rfl
+
+theorem evalFloatScalarBinOp_locals (op : BinOp) (lhs rhs : ScalarInt)
+    (lhsTy? rhsTy? : Option Ty) (L L' : List LocalSlot) (mem : MirSemantics.Memory) :
+    MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? L' mem =
+      rvWithLocals (MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? L mem) L' := by
+  unfold MirSemantics.evalFloatScalarBinOp
+  cases lhsTy? with
+  | none => rfl
+  | some lTy =>
+    cases rhsTy? with
+    | none => rfl
+    | some rTy =>
+      dsimp only
+      cases MirSemantics.ieeeFormatOfTy? lTy with
+      | none => rfl
+      | some fL =>
+        cases MirSemantics.ieeeFormatOfTy? rTy with
+        | none => rfl
+        | some fR =>
+          dsimp only
+          cases
+            Bool.and
+              (match fL, fR with
+               | .binary32, .binary32 => true
+               | .binary64, .binary64 => true
+               | _, _ => false)
+              (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth))
+          with
+          | false => rfl
+          | true =>
+            dsimp only
+            cases MirSemantics.evalFloatBinOp op fL lhs.bits rhs.bits <;> rfl
+
 theorem operandTy_copyOp (decls : List LocalDecl) (layouts : Layout.LayoutTable) (op : Operand) :
     operandTy decls layouts (copyOp op) = operandTy decls layouts op := by
   cases op <;> rfl
@@ -7588,12 +7675,14 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
   | .unaryOp .neg op, _, _ =>
     obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl]
-    rw [evalOperand_move locals op hs _ _ _ _ decls]
+    rw [evalOperand_move locals op hs _ _ _ _ decls, operandTy_copyOp]
     cases evalOperand locals (copyOp op) mem.borrows mem.globals layouts mem.callerLocals decls
         mem.callStack with
     | ok v L1 =>
       cases v <;> simp only [opWithLocals] <;> try rfl
-      split <;> rfl
+      cases MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts op) with
+      | true => exact evalFloatUnaryNeg_locals _ _ _ _ _
+      | false => dsimp only; split <;> rfl
     | ub => rfl
     | unsupported => rfl
   | .binaryOp bop a b, _, hframe =>
@@ -7602,7 +7691,8 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
     have hmv := readsOk_moved (op := a) (ops := [b]) hr
     dsimp only [MoveFrameOk, rvPost, opsPost, rvOperands, List.foldl] at hframe
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl]
-    rw [evalOperand_move locals a hsa _ _ _ _ decls, operandIsSigned_copyOp]
+    rw [evalOperand_move locals a hsa _ _ _ _ decls, operandIsSigned_copyOp,
+      operandTy_copyOp decls layouts a, operandTy_copyOp decls layouts b]
     have hca := @evalOperand_copy_frame locals locals a hsa (fun _ _ => rfl) mem.borrows mem.globals
       layouts mem.callerLocals decls mem.callStack
     have hcb := @evalOperand_copy_frame locals locals b hsb (fun _ _ => rfl) mem.borrows mem.globals
@@ -7623,9 +7713,13 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
         match va, vb with
         | .scalar lhs, .scalar rhs =>
           dsimp only
-          cases bop <;> first
-          | exact evalScalarPtrOffsetBinOp_frame (operandTy_copyOp _ _ _).symm
-          | exact evalScalarBinOp_locals _ _ _ _ _ _ _
+          cases bop with
+          | offset => exact evalScalarPtrOffsetBinOp_frame (operandTy_copyOp _ _ _).symm
+          | _ =>
+            cases Bool.or (MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts a))
+                (MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts b)) with
+            | true => exact evalFloatScalarBinOp_locals _ _ _ _ _ _ _ _
+            | false => exact evalScalarBinOp_locals _ _ _ _ _ _ _
         | .scalar lhs, .ptr pv sz =>
           dsimp only
           cases bop with

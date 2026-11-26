@@ -50,6 +50,11 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   preferredNaNBits roundRatioTiesToEven FloatIntTarget FloatPtrWidth clampInt
   truncRatio floatToIntValue encodeTwosComplement evalFloatToIntSaturating
   intValueOfBits evalIntToFloatRoundTiesToEven evalFloatToFloatRoundTiesToEven
+  isNaNBits isQuietNaNBits isSignalingNaNBits evalFloatNeg evalFloatAbs
+  signedNum evalFloatPartialCompare evalFloatCmp negateFloatKind exactSumFloat
+  evalFloatArithBase FloatArithMode nanChoicesQuieted nanChoicesSignaling
+  expandNanSigns nanChoices natListMem isAdmissibleQuietNaN evalFloatBinOp
+  EvalFloatBinOpRel Ptr2IntTransmutePolicy
   ScalarVal AbstractByte mergeByteProvenance
   encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBytes
   decodeScalarBytes replicateUninitBytes takeAbstractBytes dropAbstractBytes
@@ -93,6 +98,11 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue
   writePlaceValue derefWriteTreeUB layoutValidForAdt layoutValidForResolvedAdt
   resolveByteCastSrcTyAndSize evalByteCast
+  policyRejectsProv stripAbstractByteProv stripAbstractBytesProv
+  valueHasProv valueListHasProv scalarLayoutIsPointer backendReprHasPointer
+  decodeTypedKindByteSize RichAdtSpec lookupRichAdtSpec decodeRichFieldSpecs
+  findRichTaggedVariant decodePtrBytesRichNoForge decodeTypedValueRichWithPolicy
+  richTyByteSize evalByteCastRichWithPolicy
   evalNullaryOp evalUseRvalue evalShallowInitBox evalWrapUnsafeBinder
   unsizeArrayToSliceSpec? evalUnsizeCoercion deriveStackElemThinPtr
   resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze placeIsFreeze
@@ -108,7 +118,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalGlobalThinPtrDerefBorrow evalPlaceDiscriminant
   activeFrameTargetLocals? ieeeFormatOfTy? floatIntTargetOfTy?
   floatPtrWidthOfLayouts evalFloatCast evalFloatCastRvalue
-  evalRvalue evalRvalueWithMemory advanceStmt
+  isFloatTy isFloatOptTy evalFloatUnaryNeg evalFloatScalarBinOp
+  evalRvalue evalRvalueWithMemory EvalRvalueFloatRel advanceStmt
   normalizeSubsliceProjectionsAux normalizeSubsliceProjections
   projectionsOverlap truncateTyProjAtUnion resolveBorrowWriteLocalProj
   resolveDerefBorrowWriteFullProj derefWriteUnionProtectorUB
@@ -133,6 +144,46 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalSetDiscriminantLocal derefTargetsSuspendedFrame FrameWriteResult
   foreignFrameDerefWrite evalForeignFrameDerefWrite
   evalSetDiscriminantDerefWrite
+  MemOpRes TypedValidity minNat AllocKey AllocKey.beq
+  intTyTargetBytes floatTyByteWidth scalarLayoutTargetByteWidth
+  isSingleVariantShape tupleLastRigidTy? knownWidePointeeTailAux?
+  ptrPointeeMayBeUnsizedAux isConsistentPtrLayout declPtrToPointeeByteSize?
+  allRigidTysSatisfy rigidTyLayoutDeterminedAux explicitLayoutConsistent
+  findConsistentDeclLayout? consistentExplicitLayout? resolveConsistentLayout?
+  exactRootAllocAlignAux? exactRootAllocAlign? exactRigidTyAlign?
+  exactTyByteSizeAux? exactTyByteSize? exactRigidTyByteSize?
+  isBackedPtr isNullThinPtr
+  decodeUsizeArg? isValidWidePtrMetaValForWidth normalizeAccessBorrowProj
+  borrowsAfterReadAccess borrowsAfterWriteAccess untypedValueHasExactByteImage
+  ResolvedMemEndpoint resolveLiveMemEndpoint endpointAccessCheck
+  checkPtrArgAligned optProvEq abstractBytesEq abstractByteRefines
+  abstractBytesRefine hasUninitByte allBytesUninit allBytesMatchProv
+  allBytesSameProv bytesHaveRealProvenance extractRawU8Bytes
+  stripProvenanceBytes encodePtrRawBytes scalarPairOffsetsValid
+  encodeFieldsAtOffsetsExactWith encodeUntypedFlatElemsExact
+  encodeUntypedLeafOrArrayExact encodeArrayElemsAtLayoutIdx
+  appendBoolList repeatBoolList orBoolListAt
+  arbitraryFieldsDataMask unionFieldsDataMask layoutDataMask
+  allUntypedUnionSlotsEmpty mergeExactUnionTypedSlots encodeLeafForScalarLayout
+  encodeValueAtLayoutIdx encodeRawArrayElems encodeRawValueBytes
+  readRootAbstractBytes applyDataMask
+  tyDataMask resetTypedPaddingBytes validRangeExcludesAny
+  validRangeCoversAllNonNull anyListTrue isUninhabitedRigidTy
+  isUninhabitedTy referenceToUninhabited charShapedSurrogate
+  TypedValidity.combine validateNonNullPtrBytes validateScalarLayoutBytes
+  validateWideMetaBytes decodeScalarLayoutBytesTarget
+  decodeFieldsAtLayoutIdxs decodeArrayElemsAtLayoutIdx
+  decodeUnionFieldsAtLayoutIdxs decodeValueAtLayoutIdx
+  decodeTupleFieldsAtOffsetsWith
+  decodePartialUninitArrayChunks decodeThinPtrBytes decodePartialUninitValue
+  abstractBytesToGlobalOptBytes buildGlobalRelocsAux updateGlobalAllocById
+  commitRootAbstractBytes evalCopyMemory
+  validateTupleFieldsBytesWith validateLayoutFieldsWith validateArrayChunksWith
+  validateTypedBytesForLayoutIdx validateTypedBytes allFieldLayoutsPermitUninit
+  layoutPermitsUninit allTupleFieldsPermitUninit tyPermitsUninit
+  validateScalarLayoutValue validateWideMetaValue validateLayoutFieldsValuesWith
+  validateValueListWith validateTupleValuesWith validateValueAtLayoutIdx
+  validateBlackBoxValue
   evalStmt lookupSwitchTarget findCallee?
   extractCalleeDefPath? restoreCallerProtectors hasFrameDeallocProtectorConflict
   disableFrameBorrows disableFramesAbove writeReturnDestination pushCalleeFrame
@@ -163,7 +214,15 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalNonSelectIntrinsicCall isPtrPointeeIntrinsicKind
   withConstEvalSelectIntrinsicTypeArgs rigidTysToZeroSizedOps
   constEvalSelectTupleArgOps finishMemIntrinsicCall evalCopyNonOverlappingCall
-  WriteBytesAction writeBytesAction evalWriteBytesCall evalDirectRustIntrinsic?
+  WriteBytesAction writeBytesAction evalWriteBytesCall
+  writeIntrinsicReturnWithProtectors resolveIntrinsicPointeeFullTy
+  checkPtrPairAligned endpointBorrowsAfterRead endpointBorrowsAfterWrite
+  compareUnsignedBytesI32 evalCopyCall evalCompareBytesCall evalRawEqCall
+  readValidateAndPrepareSwapSlices evalTypedSwapNonOverlappingCall resolvePtrOffsetFromOffsets
+  evalPtrOffsetFromDistance evalPtrOffsetFromCall
+  resolvePtrAllocAlignAndPlaceOff evalPtrMaskCall resolveBlackBoxTy?
+  evalBlackBoxCall evalCoreMemPtrIntrinsicCall? divergingCallReturnStep
+  evalDivergingRustIntrinsic? evalDirectRustIntrinsic?
   isUnreachableCallTarget isAbortingPanicDefPath
   isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees

@@ -859,7 +859,7 @@ theorem ValidEnumLayout.enumLayoutHasDisjointDirectTag_true
             · by_cases h64 : bits = 64
               · subst h64; rcases htb with rfl | rfl | rfl | rfl <;> cases habi <;> rfl
               · have h128 : translateAbiIntegerBits bits = .I128 := by
-                  simp [translateAbiIntegerBits, h8, h16, h32, h64]
+                  simp [translateAbiIntegerBits]
                 rw [h128] at habi
                 rcases htb with rfl | rfl | rfl | rfl <;> cases habi
   have hafter_all : allVariantFieldsAfterTag tagBytes rawShapes = true := by
@@ -3619,7 +3619,7 @@ theorem evalRvalue_discriminant_simulation
     rw [henv_src] at henv'; injection henv' with heq_p; rcases heq_p with ⟨rfl, rfl⟩
     have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
       unfold evalStmt; rw [hkind]
-      simp [evalRvalue, evalOperand, hslot_s]
+      simp [evalRvalue, hslot_s]
     have hop_ok :=
       annealEvalOperand_copy_live (m := m₀) (known := none) rfl hlt_s hsrc_decl hmls_s_eq hcache_s
     have hrd_err := readDiscriminant_uninitInd_ub body.localDecls (m := m₁) hmem_u

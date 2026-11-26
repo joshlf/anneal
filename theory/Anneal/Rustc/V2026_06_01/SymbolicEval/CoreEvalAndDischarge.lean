@@ -1429,8 +1429,14 @@ def evalRvalueSymTree
           | .offset =>
             .leaf (evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs)
           | _ =>
-            let isSigned := operandIsSigned localDecls lhsOp layouts
-            evalScalarBinOpSymTree op lhs rhs locals₂ mem isSigned
+            let lhsTy := operandTy localDecls layouts lhsOp
+            let rhsTy := operandTy localDecls layouts rhsOp
+            match Bool.or (isFloatOptTy lhsTy) (isFloatOptTy rhsTy) with
+            | true =>
+              .leaf (evalFloatScalarBinOp op lhs rhs lhsTy rhsTy locals₂ mem)
+            | false =>
+              let isSigned := operandIsSigned localDecls lhsOp layouts
+              evalScalarBinOpSymTree op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
@@ -1559,7 +1565,10 @@ theorem evalRvalueSymTree_eval
             | offset => rfl
             | _ =>
               dsimp only
-              exact evalScalarBinOpSymTree_eval _ lhs rhs locals₂ mem _
+              cases Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                  (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+              | true => rfl
+              | false => exact evalScalarBinOpSymTree_eval _ lhs rhs locals₂ mem _
           | ptr ptrVal sz =>
             cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
             | false => rfl

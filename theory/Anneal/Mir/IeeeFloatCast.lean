@@ -194,17 +194,7 @@ def roundRatioBits (mode : RoundingMode) (f : IeeeFormat) (neg : Bool) (n d : Na
       else if 2 ^ (f.fractionBits + 1) ≤ significand' then preferredNaNBits f
       else encodeBits f neg (exponent' + (f.bias : Int)).toNat (significand' - 2 ^ f.fractionBits)
 
-/-- `true` iff `bits` decodes to a NaN. -/
-def isNaNBits (f : IeeeFormat) (bits : Nat) : Bool :=
-  match decodeBits f bits with
-  | .nan _ _ _ => true
-  | _ => false
-
-/-- `true` iff `bits` decodes to a quiet NaN. -/
-def isQuietNaNBits (f : IeeeFormat) (bits : Nat) : Bool :=
-  match decodeBits f bits with
-  | .nan _ quiet _ => quiet
-  | _ => false
+export Trusted.Rustc.V2026_06_01.MirSemantics (isNaNBits isQuietNaNBits)
 
 /-- Half-away-from-zero contrast model of the int-to-float cast
 (`b/585733184`). -/
@@ -2751,7 +2741,7 @@ theorem isNaNBits_evalFloatToFloatRoundTiesToEven (src dst : IeeeFormat) (bits :
   have hsrc : ∀ k, decodeBits src bits = k → isNaNBits src bits = (match k with
       | .nan _ _ _ => true
       | _ => false) := by
-    intro k hk; unfold isNaNBits; rw [hk]
+    intro k hk; unfold isNaNBits; rw [hk]; cases k <;> rfl
   have hE : 2 ^ dst.exponentBits - 1 < 2 ^ dst.exponentBits :=
     Nat.sub_lt (Nat.two_pow_pos _) (by decide)
   cases hdec : decodeBits src bits with

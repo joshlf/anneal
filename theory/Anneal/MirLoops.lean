@@ -1237,8 +1237,14 @@ def evalRvalueFast
           | .offset =>
             evalScalarPtrOffsetBinOp locals₂ mem body.localDecls body.layouts lhsOp lhs rhs
           | _ =>
-            let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
-            evalScalarBinOp op lhs rhs locals₂ mem isSigned
+            let lhsTy := operandTy body.localDecls body.layouts lhsOp
+            let rhsTy := operandTy body.localDecls body.layouts rhsOp
+            match Bool.or (isFloatOptTy lhsTy) (isFloatOptTy rhsTy) with
+            | true =>
+              evalFloatScalarBinOp op lhs rhs lhsTy rhsTy locals₂ mem
+            | false =>
+              let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
+              evalScalarBinOp op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
@@ -1464,21 +1470,29 @@ def evalRvalueSymTreeFast
           match op with
           | .offset =>
             .leaf (evalScalarPtrOffsetBinOp locals₂ mem body.localDecls body.layouts lhsOp lhs rhs)
-          | .bitAnd =>
-            .branch (Nat.beq lhs.sizeBytes 0) (.leaf .unsupported)
-              (.branch (Nat.beq lhs.sizeBytes rhs.sizeBytes)
-                (.leaf
-                  (.ok
-                    (.scalar
-                      ⟨bitwiseAndBitsFast (Nat.mul lhs.sizeBytes 8) lhs.bits rhs.bits,
-                       lhs.sizeBytes⟩)
-                    locals₂ mem))
-                (.leaf .unsupported))
-          | .eq => evalScalarBinOpSymTree .eq lhs rhs locals₂ mem false
-          | .ne => evalScalarBinOpSymTree .ne lhs rhs locals₂ mem false
           | _ =>
-            let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
-            evalScalarBinOpSymTree op lhs rhs locals₂ mem isSigned
+            let lhsTy := operandTy body.localDecls body.layouts lhsOp
+            let rhsTy := operandTy body.localDecls body.layouts rhsOp
+            match Bool.or (isFloatOptTy lhsTy) (isFloatOptTy rhsTy) with
+            | true =>
+              .leaf (evalFloatScalarBinOp op lhs rhs lhsTy rhsTy locals₂ mem)
+            | false =>
+              match op with
+              | .bitAnd =>
+                .branch (Nat.beq lhs.sizeBytes 0) (.leaf .unsupported)
+                  (.branch (Nat.beq lhs.sizeBytes rhs.sizeBytes)
+                    (.leaf
+                      (.ok
+                        (.scalar
+                          ⟨bitwiseAndBitsFast (Nat.mul lhs.sizeBytes 8) lhs.bits rhs.bits,
+                           lhs.sizeBytes⟩)
+                        locals₂ mem))
+                    (.leaf .unsupported))
+              | .eq => evalScalarBinOpSymTree .eq lhs rhs locals₂ mem false
+              | .ne => evalScalarBinOpSymTree .ne lhs rhs locals₂ mem false
+              | _ =>
+                let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
+                evalScalarBinOpSymTree op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
@@ -1636,7 +1650,14 @@ theorem evalRvalueSymTreeFast_eq
         | scalar lhs =>
           cases v₂ with
           | scalar rhs =>
-            cases op <;> simp only [evalScalarBinOpSymTree, bitwiseAndBitsFast_eq]
+            cases op with
+            | offset => rfl
+            | _ =>
+              dsimp only
+              cases Bool.or (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                  (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+              | true => rfl
+              | false => simp only [evalScalarBinOpSymTree, bitwiseAndBitsFast_eq]
           | _ => rfl
         | _ => cases v₂ <;> rfl
   | unaryOp uop op =>

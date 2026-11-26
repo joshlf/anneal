@@ -1649,6 +1649,8 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
     (h_not_unreach : isUnreachableCallTarget defPath = false := by decide)
     (h_not_abort : isAbortingPanicDefPath defPath = false := by decide)
     (h_not_unwind : isUnwindingPanicDefPath defPath = false := by decide)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide)
     (h_contract_pre :
       ∀ m : Memory,
         ModularRootMemory body callees traitImpls m →
@@ -1758,6 +1760,8 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
       dsimp only
       have h_not_unw : isUnwindingPanicDefPath defPath = false := h_not_unwind
       rw [h_not_unw]
+      dsimp only [evalDivergingRustIntrinsic?, isDirectExactDivTarget]
+      rw [h_not_exact, h_not_intrinsic]
       dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP, MirCallContract.toCallContract]
       rcases h_sub _ (h_contract_pre m hm) with ⟨h_cpre, h_cpost_imp⟩
       refine ⟨h_cpre, fun ans hp_sup => ?_⟩

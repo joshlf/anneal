@@ -2446,6 +2446,9 @@ inductive LiftLensRvalue
         evalScalarBinOp op lhs rhs env₂ mem
             (operandIsSigned localDecls lhsOp layouts) =
           .ok v env₂ mem) →
+      (hNotFloat :
+        Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+          (isFloatOptTy (operandTy localDecls layouts rhsOp)) = false := by rfl) →
       LiftLensRvalue localDecls layouts env entries
         (.binaryOp op lhsOp rhsOp) v env₂
   | unaryOp_not
@@ -2462,6 +2465,7 @@ inductive LiftLensRvalue
       {op : Operand} {sc : ScalarInt} :
       LiftLensOperandAny localDecls layouts env entries op (.scalar sc) env' →
       Nat.beq sc.sizeBytes 0 = false →
+      (hNotFloat : isFloatOptTy (operandTy localDecls layouts op) = false := by rfl) →
       LiftLensRvalue localDecls layouts env entries
         (.unaryOp .neg op)
         (.scalar ⟨wrapScalarBits
@@ -2514,12 +2518,15 @@ theorem LiftLensRvalue.binaryOp_add
     {lhsOp rhsOp : Operand} {a b sz : Nat}
     (hSz : sz ≠ 0)
     (hLhs : LiftLensOperandAny localDecls layouts env entries lhsOp (.scalar ⟨a, sz⟩) env₁)
-    (hRhs : LiftLensOperandAny localDecls layouts env₁ entries rhsOp (.scalar ⟨b, sz⟩) env₂) :
+    (hRhs : LiftLensOperandAny localDecls layouts env₁ entries rhsOp (.scalar ⟨b, sz⟩) env₂)
+    (hNotFloat :
+      Bool.or (isFloatOptTy (operandTy localDecls layouts lhsOp))
+        (isFloatOptTy (operandTy localDecls layouts rhsOp)) = false := by rfl) :
     LiftLensRvalue localDecls layouts env entries
       (.binaryOp .add lhsOp rhsOp)
       (.scalar ⟨wrapScalarBits (Nat.add a b) (scalarModulus sz), sz⟩)
       env₂ := by
-  refine .binaryOp hLhs hRhs (fun mem => ?_)
+  refine .binaryOp hLhs hRhs (fun mem => ?_) hNotFloat
   have hZero : Nat.beq sz 0 = false := by
     cases sz with
     | zero => exact absurd rfl hSz
@@ -3228,7 +3235,7 @@ theorem LiftLensRvalue.evalRvalue_eq
         rw [hNoUb]
         dsimp only
         rw [hFr, ← hB, ← hInv.callStack_nil]
-  | binaryOp hLhs hRhs hEvalOp =>
+  | binaryOp hLhs hRhs hEvalOp hNotFloat =>
     rcases hLhs.evalOperand_eq hInv with ⟨hEval₁, hLen₁⟩
     rcases hRhs.evalOperand_eq (by rw [hLen₁]; exact hInv) with
       ⟨hEval₂, hLen₂⟩
@@ -3244,7 +3251,8 @@ theorem LiftLensRvalue.evalRvalue_eq
       unfold evalScalarBinOp at hBad
       repeat' split at hBad
       all_goals contradiction
-    · exact hEvalOp m
+    · rw [hNotFloat]
+      exact hEvalOp m
   | unaryOp_not hOp hNot =>
     rcases hOp.evalOperand_eq hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
@@ -3252,12 +3260,14 @@ theorem LiftLensRvalue.evalRvalue_eq
     dsimp only
     rw [hEval]
     exact hNot m
-  | unaryOp_neg hOp hSz =>
+  | unaryOp_neg hOp hSz hNotFloat =>
     rcases hOp.evalOperand_eq hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
+    dsimp only
+    rw [hNotFloat]
     dsimp only
     rw [hSz]
   | cast_intToInt hOp hSz hTarget =>
@@ -4443,9 +4453,9 @@ theorem LiftLensRvalue.length_eq
   | use_deref hDeref _ => cases hDeref <;> rfl
   | use_deref_field hField _ => cases hField <;> rfl
   | copyForDeref_deref _ _ => rfl
-  | binaryOp hLhs hRhs _ => exact hRhs.length_eq.trans hLhs.length_eq
+  | binaryOp hLhs hRhs _ _ => exact hRhs.length_eq.trans hLhs.length_eq
   | unaryOp_not hOp _ => exact hOp.length_eq
-  | unaryOp_neg hOp _ => exact hOp.length_eq
+  | unaryOp_neg hOp _ _ => exact hOp.length_eq
   | cast_intToInt hOp _ _ => exact hOp.length_eq
   | tuple_nil => rfl
   | aggregate_tuple hOps => exact hOps.length_eq
@@ -8794,7 +8804,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
         rw [hNoUb]
         dsimp only
         rw [hFr, ← hB, ← hInv.callStack_nil]
-  | binaryOp hLhs hRhs hEvalOp =>
+  | binaryOp hLhs hRhs hEvalOp hNotFloat =>
     rcases hLhs.evalOperand_eq_subplace hInv with ⟨hEval₁, hLen₁⟩
     rcases hRhs.evalOperand_eq_subplace (by rw [hLen₁]; exact hInv)
       with ⟨hEval₂, hLen₂⟩
@@ -8810,7 +8820,8 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
       unfold evalScalarBinOp at hBad
       repeat' split at hBad
       all_goals contradiction
-    · exact hEvalOp m
+    · rw [hNotFloat]
+      exact hEvalOp m
   | unaryOp_not hOp hNot =>
     rcases hOp.evalOperand_eq_subplace hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
@@ -8818,12 +8829,14 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     dsimp only
     rw [hEval]
     exact hNot m
-  | unaryOp_neg hOp hSz =>
+  | unaryOp_neg hOp hSz hNotFloat =>
     rcases hOp.evalOperand_eq_subplace hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
+    dsimp only
+    rw [hNotFloat]
     dsimp only
     rw [hSz]
   | cast_intToInt hOp hSz hTarget =>
