@@ -2229,6 +2229,92 @@ theorem allocBytesAtByteMem_of_allocBytesAtV2026
               · rw [hBytesEq, hFull.2]; exact ha.2.1
               · rw [hBytesEq, hDropEq, hTakeEq, hMidEq]
 
+/-- Converse bridge (`[propext]` only): slice ownership on `SpatialMemV2026.memGlobalsToByteMem m`
+implies `AllocBytesAtV2026 m r bs` on unmodified `V2026_06_01.MirSemantics.Memory`. -/
+theorem allocBytesAtV2026_of_allocBytesAtByteMem_memGlobals
+    {m : Memory} {r : ByteRange} {bs : List AbstractByte}
+    (hBm : AllocBytesAtByteMem (memGlobalsToByteMem m) r bs) :
+    AllocBytesAtV2026 m r bs := by
+  cases hBm with
+  | intro aB haB =>
+    have hFindB := haB.1
+    unfold memGlobalsToByteMem at hFindB
+    rw [findV2026Alloc_map_captured m.globals r.allocId] at hFindB
+    cases hLk : lookupGlobalAlloc m.globals r.allocId with
+    | none => rw [hLk] at hFindB; nomatch hFindB
+    | some a =>
+      rw [hLk] at hFindB
+      dsimp only [Option.map] at hFindB
+      injection hFindB with hEqB
+      have hBndB := haB.2.2.1
+      have hSliceB := haB.2.2.2.2
+      rw [← hEqB] at hBndB hSliceB
+      cases globalAllocBytesAux_total_exists a.bytes a.relocations 0 a.bytes.length
+          (by rw [Nat.zero_add]; exact Nat.le_refl _) with
+      | intro fullOut hFull =>
+        have hGlobFull : globalAllocSliceToAbstractBytes a 0 a.bytes.length = some fullOut := by
+          unfold globalAllocSliceToAbstractBytes
+          exact hFull.1
+        have hBytesEq : (capturedAllocToByteAlloc a).bytes = fullOut := by
+          unfold capturedAllocToByteAlloc
+          rw [hGlobFull]
+          rfl
+        rw [hBytesEq] at hBndB hSliceB
+        have hInBnd : r.start + r.len ≤ a.bytes.length := by
+          rw [← hFull.2]; exact hBndB
+        have hStartLe : r.start ≤ a.bytes.length :=
+          Nat.le_trans (Nat.le_add_right r.start r.len) hInBnd
+        have hFullSplit1 :
+            globalAllocBytesAux a.bytes a.relocations 0
+              (r.start + (a.bytes.length - r.start)) = some fullOut := by
+          rw [natSub_add_cancel_rs hStartLe]; exact hFull.1
+        cases (globalAllocBytesAux_split a.bytes a.relocations r.start
+            (a.bytes.length - r.start) 0 fullOut).mp hFullSplit1 with
+        | intro preBs hSp1 =>
+          cases hSp1 with
+          | intro sufBs hC1 =>
+            have hPreLen : preBs.length = r.start :=
+              globalAllocBytesAux_length_rs a.bytes a.relocations 0 r.start preBs hC1.1
+            have hDropEq : fullOut.drop r.start = sufBs := by
+              rw [hC1.2.2, ← hPreLen,
+                listDrop_append_ge_rs preBs sufBs (Nat.le_refl preBs.length), Nat.sub_self]
+              rfl
+            have hRemLe : r.len ≤ a.bytes.length - r.start := by
+              have hS := Nat.sub_le_sub_right hInBnd r.start
+              rw [Nat.add_sub_cancel_left] at hS
+              exact hS
+            have hSufAux :
+                globalAllocBytesAux a.bytes a.relocations r.start
+                  (r.len + ((a.bytes.length - r.start) - r.len)) = some sufBs := by
+              rw [natSub_add_cancel_rs hRemLe]
+              have h0 := hC1.2.1
+              rw [Nat.zero_add] at h0
+              exact h0
+            cases (globalAllocBytesAux_split a.bytes a.relocations r.len
+                ((a.bytes.length - r.start) - r.len) r.start sufBs).mp hSufAux with
+            | intro midBs hSp2 =>
+              cases hSp2 with
+              | intro tailBs hC2 =>
+                have hMidLen : midBs.length = r.len :=
+                  globalAllocBytesAux_length_rs a.bytes a.relocations r.start r.len midBs hC2.1
+                have hTakeEq : sufBs.take r.len = midBs := by
+                  rw [hC2.2.2, ← hMidLen]
+                  exact listTake_append_prefix_rs midBs tailBs
+                rw [hDropEq, hTakeEq] at hSliceB
+                refine ⟨a, hLk, hInBnd, haB.2.2.2.1, ?_⟩
+                unfold globalAllocSliceToAbstractBytes
+                have hBleSt : Nat.ble r.start (Trusted.Sequence.length a.bytes) = true :=
+                  natBle_of_le_rs hStartLe
+                rw [hBleSt, ← hSliceB]
+                exact hC2.1
+
+/-- Exact bidirectional equivalence between `AllocBytesAtByteMem (memGlobalsToByteMem m)` and
+`AllocBytesAtV2026 m` (`[propext]` only). -/
+theorem allocBytesAtByteMem_memGlobals_iff
+    (m : Memory) (r : ByteRange) (bs : List AbstractByte) :
+    AllocBytesAtByteMem (memGlobalsToByteMem m) r bs ↔ AllocBytesAtV2026 m r bs :=
+  ⟨allocBytesAtV2026_of_allocBytesAtByteMem_memGlobals, allocBytesAtByteMem_of_allocBytesAtV2026⟩
+
 /-- Direct framing on unmodified `Trusted.Rustc.V2026_06_01.MirSemantics.{sliceAbstractBytes,
 writeAbstractBytesAt}` (`[propext]` only): overwriting `patch` at `wOff` preserves any
 disjoint `sliceAbstractBytes` at `(fOff, fLen)`. -/
@@ -2541,6 +2627,283 @@ theorem v2026Range_frame_cancel (env : Nat → V2026RangeProp)
       (evalSepExprFuel v2026RangeSepConj v2026RangeEmp env fuel lhs)
       (evalSepExprFuel v2026RangeSepConj v2026RangeEmp env fuel rhs) :=
   sepAC_entails_of_cancelAtoms v2026RangeProp_sepACULaws env hRes
+
+/-- Unconditional equivalence (including `len = 0` empty slices!) between unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.byteRangesOverlapBool` and semantic footprint
+disjointness `fpDisjoint (InRange r₁) (InRange r₂)` on same-allocation ranges (`[]` zero axioms). -/
+theorem byteRangesOverlapBool_false_iff_fpDisjoint_sameAlloc
+    {r₁ r₂ : ByteRange} (hSame : r₁.allocId = r₂.allocId) :
+    byteRangesOverlapBool r₁.start r₁.len r₂.start r₂.len = false ↔
+      fpDisjoint (InRange r₁) (InRange r₂) := by
+  refine ⟨?_, ?_⟩
+  · intro hOvF aid off hBoth
+    cases hL1 : r₁.len with
+    | zero =>
+      have hLt1 := hBoth.1.2.2
+      rw [hL1, Nat.add_zero] at hLt1
+      exact Nat.not_lt_of_ge hBoth.1.2.1 hLt1
+    | succ n1 =>
+      cases hL2 : r₂.len with
+      | zero =>
+        have hLt2 := hBoth.2.2.2
+        rw [hL2, Nat.add_zero] at hLt2
+        exact Nat.not_lt_of_ge hBoth.2.2.1 hLt2
+      | succ n2 =>
+        have hPos1 : 0 < r₁.len := by rw [hL1]; exact Nat.zero_lt_succ n1
+        have hPos2 : 0 < r₂.len := by rw [hL2]; exact Nat.zero_lt_succ n2
+        have hDisj :=
+          (byteRangesOverlapBool_false_iff_rangeDisjoint_pos hSame hPos1 hPos2).mp hOvF
+        exact rangeDisjoint_no_shared_offset hDisj hBoth.1 hBoth.2
+  · intro hFpD
+    cases hOv : byteRangesOverlapBool r₁.start r₁.len r₂.start r₂.len with
+    | false => rfl
+    | true =>
+      unfold byteRangesOverlapBool at hOv
+      have hNZ1 := bool_and_left_rs hOv
+      have hRest1 := bool_and_right_rs hOv
+      have hNZ2 := bool_and_left_rs hRest1
+      have hBnds := bool_and_right_rs hRest1
+      have hPos1 : 0 < r₁.len := by
+        cases hZ1 : r₁.len with
+        | zero => rw [hZ1] at hNZ1; nomatch hNZ1
+        | succ n => exact Nat.zero_lt_succ n
+      have hPos2 : 0 < r₂.len := by
+        cases hZ2 : r₂.len with
+        | zero => rw [hZ2] at hNZ2; nomatch hNZ2
+        | succ n => exact Nat.zero_lt_succ n
+      have hLt12 : r₁.start < r₂.start + r₂.len :=
+        natLe_of_ble_rs (bool_and_left_rs hBnds)
+      have hLt21 : r₂.start < r₁.start + r₁.len :=
+        natLe_of_ble_rs (bool_and_right_rs hBnds)
+      cases Nat.lt_or_ge r₁.start r₂.start with
+      | inl hStLt =>
+        exact False.elim (hFpD r₁.allocId r₂.start
+          ⟨⟨rfl, Nat.le_of_lt hStLt, hLt21⟩,
+           ⟨hSame.symm, Nat.le_refl r₂.start, Nat.lt_add_of_pos_right hPos2⟩⟩)
+      | inr hStGe =>
+        exact False.elim (hFpD r₁.allocId r₁.start
+          ⟨⟨rfl, Nat.le_refl r₁.start, Nat.lt_add_of_pos_right hPos1⟩,
+           ⟨hSame.symm, hStGe, hLt12⟩⟩)
+
+/-- Semantic footprint-disjoint write frame law over unmodified `V2026_06_01.MirSemantics.Memory`
+(`[]`/`[propext]` only): strengthens `allocBytesAtV2026_frame_of_write_disjoint` from syntactic
+`RangeDisjoint` to semantic `fpDisjoint (InRange rW) (InRange rF)` — covering interior zero-length
+slices `⟨aid, off, 0⟩` inside `[0, N)` where `RangeDisjoint` is `False`! -/
+theorem allocBytesAtV2026_frame_of_fpDisjoint
+    {m m' : Memory} {rW rF : ByteRange}
+    {patch : List (Option UInt8)} {bsF : List AbstractByte}
+    (hFpD : fpDisjoint (InRange rW) (InRange rF))
+    (hWrite : writeMemoryBytesV2026 m rW patch = some m')
+    (hFrame : AllocBytesAtV2026 m rF bsF) :
+    AllocBytesAtV2026 m' rF bsF := by
+  cases hIdEq : Nat.beq rW.allocId rF.allocId with
+  | false =>
+    have hNe : rW.allocId ≠ rF.allocId := fun h => by
+      rw [h, natBeq_refl_rs] at hIdEq
+      exact Bool.noConfusion hIdEq
+    exact allocBytesAtV2026_frame_of_write_disjoint (Or.inl hNe) hWrite hFrame
+  | true =>
+    have hSame : rW.allocId = rF.allocId := natEq_of_beq_rs hIdEq
+    cases hLW : rW.len with
+    | zero =>
+      have hWrite0 := hWrite
+      unfold writeMemoryBytesV2026 at hWrite0
+      cases hFindW : lookupGlobalAlloc m.globals rW.allocId with
+      | none => rw [hFindW] at hWrite0; nomatch hWrite0
+      | some aW =>
+        rw [hFindW] at hWrite0
+        dsimp only at hWrite0
+        cases hMutW : aW.mutability with
+        | not => rw [hMutW] at hWrite0; nomatch hWrite0
+        | «mut» =>
+          rw [hMutW] at hWrite0
+          dsimp only at hWrite0
+          cases hChk : (Nat.beq patch.length rW.len &&
+              (Nat.ble (rW.start + rW.len) aW.bytes.length &&
+                relocsAvoidRange aW.relocations rW.start rW.len)) with
+          | false => rw [hChk] at hWrite0; nomatch hWrite0
+          | true =>
+            rw [hChk] at hWrite0
+            dsimp only at hWrite0
+            injection hWrite0 with hMeq
+            have hPLen0 : patch.length = 0 := by
+              rw [natEq_of_beq_rs (bool_and_left_rs hChk)]; exact hLW
+            have hPNil : patch = [] := by
+              cases patch with
+              | nil => rfl
+              | cons _ _ => nomatch hPLen0
+            have hBndW : rW.start ≤ aW.bytes.length := by
+              have hb := natLe_of_ble_rs (bool_and_left_rs (bool_and_right_rs hChk))
+              rw [hLW, Nat.add_zero] at hb
+              exact hb
+            have hAwId : aW.allocId = rW.allocId :=
+              lookupGlobalAlloc_allocId_eq m.globals rW.allocId aW hFindW
+            let bytes0 := (List.take rW.start aW.bytes ++ patch) ++
+              List.drop (rW.start + patch.length) aW.bytes
+            have hBytes0Eq : bytes0 = aW.bytes := by
+              dsimp only [bytes0]
+              rw [hPNil, List.append_nil, List.length, Nat.add_zero,
+                listSplit_take_drop_rs rW.start aW.bytes]
+            have hAwSame : ({ aW with bytes := bytes0 } : CapturedAllocation) = aW := by
+              rw [hBytes0Eq]
+            have hM'Glob : m'.globals = replaceGlobalAllocV2026 aW m.globals := by
+              rw [← hMeq]
+              cases aW
+              dsimp only at hMutW hAwSame ⊢
+              rw [hMutW] at hAwSame ⊢
+              exact congrArg (fun a => replaceGlobalAllocV2026 a m.globals) hAwSame
+            cases hFrame with
+            | intro aF haF =>
+              have hEqA : some aW = some aF := by rw [← hFindW, hSame, haF.1]
+              injection hEqA with hA
+              rw [← hA] at haF
+              refine ⟨aW, ?_, haF.2.1, haF.2.2.1, haF.2.2.2⟩
+              rw [hM'Glob, ← hSame, ← hAwId]
+              exact lookupGlobalAlloc_replace_eq aW (by rw [hAwId]; exact hFindW)
+    | succ nW =>
+      cases hLF : rF.len with
+      | zero =>
+        have hWrite1 := hWrite
+        unfold writeMemoryBytesV2026 at hWrite1
+        cases hFindW : lookupGlobalAlloc m.globals rW.allocId with
+        | none => rw [hFindW] at hWrite1; nomatch hWrite1
+        | some aW =>
+          rw [hFindW] at hWrite1
+          dsimp only at hWrite1
+          cases hMutW : aW.mutability with
+          | not => rw [hMutW] at hWrite1; nomatch hWrite1
+          | «mut» =>
+            rw [hMutW] at hWrite1
+            dsimp only at hWrite1
+            cases hChk : (Nat.beq patch.length rW.len &&
+                (Nat.ble (rW.start + rW.len) aW.bytes.length &&
+                  relocsAvoidRange aW.relocations rW.start rW.len)) with
+            | false => rw [hChk] at hWrite1; nomatch hWrite1
+            | true =>
+              rw [hChk] at hWrite1
+              dsimp only at hWrite1
+              injection hWrite1 with hMeq
+              have hLenW : patch.length = rW.len := natEq_of_beq_rs (bool_and_left_rs hChk)
+              have hBndW : rW.start + patch.length ≤ aW.bytes.length := by
+                rw [hLenW]
+                exact natLe_of_ble_rs (bool_and_left_rs (bool_and_right_rs hChk))
+              have hWStartLe : rW.start ≤ aW.bytes.length :=
+                Nat.le_trans (Nat.le_add_right rW.start patch.length) hBndW
+              let bytes' := (aW.bytes.take rW.start ++ patch) ++
+                aW.bytes.drop (rW.start + patch.length)
+              let aW' : CapturedAllocation := { aW with bytes := bytes' }
+              have hBytesLenEq : bytes'.length = aW.bytes.length := by
+                dsimp only [bytes']
+                rw [List.length_append, List.length_append,
+                  listLength_take_of_le_rs rW.start aW.bytes hWStartLe,
+                  listLength_drop_rs, Nat.add_sub_of_le hBndW]
+              have hAwId : aW.allocId = rW.allocId :=
+                lookupGlobalAlloc_allocId_eq m.globals rW.allocId aW hFindW
+              have hM'Glob : m'.globals = replaceGlobalAllocV2026 aW' m.globals := by
+                rw [← hMeq]
+                dsimp only [aW', bytes']
+                cases aW
+                dsimp only at hMutW ⊢
+                rw [hMutW]
+              cases hFrame with
+              | intro aF haF =>
+                have hEqA : some aW = some aF := by rw [← hFindW, hSame, haF.1]
+                injection hEqA with hA
+                rw [← hA] at haF
+                have hBsNil : bsF = [] := by
+                  have hL0 := haF.2.2.1
+                  rw [hLF] at hL0
+                  cases bsF with
+                  | nil => rfl
+                  | cons _ _ => nomatch hL0
+                have hFind' : lookupGlobalAlloc m'.globals rF.allocId = some aW' := by
+                  rw [hM'Glob, ← hSame, ← hAwId]
+                  exact lookupGlobalAlloc_replace_eq aW'
+                    (by dsimp only [aW']; rw [hAwId]; exact hFindW)
+                have hFStLe : rF.start ≤ aW.bytes.length := by
+                  have hb := haF.2.1
+                  rw [hLF, Nat.add_zero] at hb
+                  exact hb
+                refine ⟨aW', hFind', ?_, haF.2.2.1, ?_⟩
+                · dsimp only [aW']
+                  rw [hBytesLenEq]
+                  exact haF.2.1
+                · rw [hBsNil, hLF]
+                  unfold globalAllocSliceToAbstractBytes
+                  have hBle' : Nat.ble rF.start (Trusted.Sequence.length aW'.bytes) = true := by
+                    change Nat.ble rF.start bytes'.length = true
+                    rw [hBytesLenEq]
+                    exact natBle_of_le_rs hFStLe
+                  rw [hBle']
+                  rfl
+      | succ nF =>
+        have hPosW : 0 < rW.len := by rw [hLW]; exact Nat.zero_lt_succ nW
+        have hPosF : 0 < rF.len := by rw [hLF]; exact Nat.zero_lt_succ nF
+        have hOvF : byteRangesOverlapBool rW.start rW.len rF.start rF.len = false :=
+          (byteRangesOverlapBool_false_iff_fpDisjoint_sameAlloc hSame).mpr hFpD
+        have hDisj :=
+          (byteRangesOverlapBool_false_iff_rangeDisjoint_pos hSame hPosW hPosF).mp hOvF
+        exact allocBytesAtV2026_frame_of_write_disjoint hDisj hWrite hFrame
+
+/-- Footprint-local write-frame safety predicate for `V2026RangeProp` assertions: any assertion
+whose truth depends only on bytes inside its `fp : ByteFootprint` is preserved under disjoint
+`writeMemoryBytesV2026` mutations. -/
+def V2026WriteFrameSafe (F : V2026RangeProp) : Prop :=
+  ∀ {m m' : Memory} {rW : ByteRange} {patch : List (Option UInt8)} {fp : ByteFootprint},
+    fpDisjoint (InRange rW) fp →
+    writeMemoryBytesV2026 m rW patch = some m' →
+    F.pred m fp → F.pred m' fp
+
+/-- `v2026RangeEmp` is `V2026WriteFrameSafe` (`[]` zero axioms). -/
+theorem v2026WriteFrameSafe_emp : V2026WriteFrameSafe v2026RangeEmp :=
+  fun _ _ h => h
+
+/-- Every `v2026RangePointsTo r bs` is `V2026WriteFrameSafe` (`[propext]` only), even when `r` or
+`rW` has `len = 0`! -/
+theorem v2026WriteFrameSafe_pointsTo (r : ByteRange) (bs : List AbstractByte) :
+    V2026WriteFrameSafe (v2026RangePointsTo r bs) := by
+  intro m m' rW patch fp hDisj hWrite hPt
+  have hFpDR : fpDisjoint (InRange rW) (InRange r) := fun aid off hb =>
+    hDisj aid off ⟨hb.1, (hPt.2 aid off).mpr hb.2⟩
+  exact ⟨allocBytesAtV2026_frame_of_fpDisjoint hFpDR hWrite hPt.1, hPt.2⟩
+
+/-- `V2026WriteFrameSafe` is closed under `v2026RangeSepConj` (`[]` zero axioms). -/
+theorem v2026WriteFrameSafe_sepConj {P Q : V2026RangeProp}
+    (hP : V2026WriteFrameSafe P) (hQ : V2026WriteFrameSafe Q) :
+    V2026WriteFrameSafe (v2026RangeSepConj P Q) := by
+  intro m m' rW patch fp hDisj hWrite hSep
+  cases hSep with
+  | intro fp₁ hR =>
+    cases hR with
+    | intro fp₂ hC =>
+      have hD1 : fpDisjoint (InRange rW) fp₁ := fun aid off hb =>
+        hDisj aid off ⟨hb.1, (hC.2.1 aid off).mpr (Or.inl hb.2)⟩
+      have hD2 : fpDisjoint (InRange rW) fp₂ := fun aid off hb =>
+        hDisj aid off ⟨hb.1, (hC.2.1 aid off).mpr (Or.inr hb.2)⟩
+      exact ⟨fp₁, fp₂, hC.1, hC.2.1,
+        hP hD1 hWrite hC.2.2.1, hQ hD2 hWrite hC.2.2.2⟩
+
+/-- **Separating-Conjunction Write Frame Law for `V2026RangeProp` (`[propext]` only)**:
+couples `v2026RangeSepConj` directly to `writeMemoryBytesV2026` over unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.Memory`: mutating `rW` from `bsOld` to `patch` updates
+`v2026RangePointsTo rW (rawToAbstractBytes patch)` in place while preserving ANY separated
+`V2026WriteFrameSafe` frame `F` across the exact same composite `ByteFootprint`! -/
+theorem v2026RangeSepConj_write_frame
+    {m m' : Memory} {rW : ByteRange} {bsOld : List AbstractByte}
+    {patch : List (Option UInt8)} {F : V2026RangeProp} {fp : ByteFootprint}
+    (hSafeF : V2026WriteFrameSafe F)
+    (hWrite : writeMemoryBytesV2026 m rW patch = some m')
+    (hPre : (v2026RangeSepConj (v2026RangePointsTo rW bsOld) F).pred m fp) :
+    (v2026RangeSepConj (v2026RangePointsTo rW (rawToAbstractBytes patch)) F).pred m' fp := by
+  cases hPre with
+  | intro fp₁ hR =>
+    cases hR with
+    | intro fp₂ hC =>
+      have hDisjW2 : fpDisjoint (InRange rW) fp₂ := fun aid off hb =>
+        hC.1 aid off ⟨(hC.2.2.1.2 aid off).mpr hb.1, hb.2⟩
+      exact ⟨fp₁, fp₂, hC.1, hC.2.1,
+        ⟨allocBytesAtV2026_of_write_self hWrite, hC.2.2.1.2⟩,
+        hSafeF hDisjW2 hWrite hC.2.2.2⟩
 
 /-! ## Part V: Concrete Positive & Fail-Closed Negative Witnesses -/
 
@@ -2940,5 +3303,87 @@ theorem witness_v2026_relocation_provenance_guard :
     have hFr := allocBytesAtV2026_frame_of_write_disjoint hD hW hPtr
     have hMerged := ownRange_of_rangeMergeChecked hFr hSelf rfl
     exact ⟨m', rfl, hSelf, rfl, hFr, hMerged⟩
+
+/-- **Separating-conjunction write-frame + interior zero-length write witness (`[propext]` only)**:
+1. Exercises `v2026RangeSepConj_write_frame` across a 3-way `split_at_mut` (`[0,4) ∗ [4,10) ∗ [10,16)`)
+   on `rsInitMemoryV2026`, mutating `[4,8)` inside `[4,10)` after splitting and re-framing both
+   neighbors inside `V2026RangeProp`;
+2. Demonstrates that an interior zero-length write `⟨1, 4, 0⟩` inside `[0, 8)` (where syntactic
+   `rangeDisjointBool ⟨1, 4, 0⟩ ⟨1, 0, 8⟩ = false`!) satisfies `fpDisjoint` and frames
+   `AllocBytesAtV2026 rsInitMemoryV2026 ⟨1, 0, 8⟩` via `allocBytesAtV2026_frame_of_fpDisjoint`;
+3. Demonstrates the bidirectional `allocBytesAtByteMem_memGlobals_iff` bridge. -/
+theorem witness_v2026RangeSepConj_write_frame_and_zeroLen_interior :
+    rangeDisjointBool ⟨1, 4, 0⟩ ⟨1, 0, 8⟩ = false ∧
+    byteRangesOverlapBool 4 0 0 8 = false ∧
+    (∃ mZ : Memory,
+      writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 0⟩ [] = some mZ ∧
+      AllocBytesAtV2026 mZ ⟨1, 0, 8⟩ (List.replicate 8 (.init 0x11 none))) ∧
+    (AllocBytesAtByteMem (memGlobalsToByteMem rsInitMemoryV2026) ⟨1, 0, 16⟩
+      (List.replicate 16 (.init 0x11 none)) ↔
+     AllocBytesAtV2026 rsInitMemoryV2026 ⟨1, 0, 16⟩
+      (List.replicate 16 (.init 0x11 none))) ∧
+    (∃ m' : Memory,
+      writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 4⟩ rsPatchBytes = some m' ∧
+      (v2026RangeSepConj
+        (v2026RangePointsTo ⟨1, 4, 4⟩ rsPatchAbsBytes)
+        (v2026RangeSepConj
+          (v2026RangePointsTo ⟨1, 0, 4⟩ (List.replicate 4 (.init 0x11 none)))
+          (v2026RangePointsTo ⟨1, 8, 8⟩ (List.replicate 8 (.init 0x11 none))))).pred m'
+        (InRange ⟨1, 0, 16⟩)) := by
+  have hAt8 : AllocBytesAtV2026 rsInitMemoryV2026 ⟨1, 0, 8⟩
+      (List.replicate 8 (.init 0x11 none)) :=
+    ⟨{ allocId := 1, align := ⟨4⟩, mutability := .mut,
+       bytes := List.replicate 16 (some 0x11), relocations := [] },
+     rfl, natLe_of_ble_rs rfl, rfl, rfl⟩
+  have hAt16 : AllocBytesAtV2026 rsInitMemoryV2026 ⟨1, 0, 16⟩
+      (List.replicate 16 (.init 0x11 none)) :=
+    ⟨{ allocId := 1, align := ⟨4⟩, mutability := .mut,
+       bytes := List.replicate 16 (some 0x11), relocations := [] },
+     rfl, Nat.le_refl 16, rfl, rfl⟩
+  refine ⟨rfl, rfl, ?_, allocBytesAtByteMem_memGlobals_iff _ _ _, ?_⟩
+  · cases hWZ : writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 0⟩ [] with
+    | none => nomatch hWZ
+    | some mZ =>
+      have hFpD : fpDisjoint (InRange ⟨1, 4, 0⟩) (InRange ⟨1, 0, 8⟩) :=
+        (byteRangesOverlapBool_false_iff_fpDisjoint_sameAlloc
+          (r₁ := ⟨1, 4, 0⟩) (r₂ := ⟨1, 0, 8⟩) rfl).mp rfl
+      exact ⟨mZ, rfl, allocBytesAtV2026_frame_of_fpDisjoint hFpD hWZ hAt8⟩
+  · cases hW : writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 4⟩ rsPatchBytes with
+    | none => nomatch hW
+    | some m' =>
+      have hPt16 : (v2026RangePointsTo ⟨1, 0, 16⟩
+          (List.replicate 16 (.init 0x11 none))).pred rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) :=
+        ⟨hAt16, fun _ _ => Iff.rfl⟩
+      have hSp1 := (v2026RangePointsTo_split_bientails ⟨1, 0, 16⟩
+        (List.replicate 16 (.init 0x11 none)) (k := 4) (natLe_of_ble_rs rfl)).1
+        rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hPt16
+      have hSp2 := (v2026RangePointsTo_split_bientails ⟨1, 4, 12⟩
+        (List.replicate 12 (.init 0x11 none)) (k := 4) (natLe_of_ble_rs rfl)).1
+      have hLR := v2026RangeProp_sepACULaws
+      have hMono := hLR.monoRight
+        (v2026RangePointsTo ⟨1, 0, 4⟩ (List.replicate 4 (.init 0x11 none)))
+        (v2026RangePointsTo ⟨1, 4, 12⟩ (List.replicate 12 (.init 0x11 none)))
+        (v2026RangeSepConj
+          (v2026RangePointsTo ⟨1, 4, 4⟩ (List.replicate 4 (.init 0x11 none)))
+          (v2026RangePointsTo ⟨1, 8, 8⟩ (List.replicate 8 (.init 0x11 none))))
+        hSp2 rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hSp1
+      -- Reorder `([0,4) ∗ ([4,4) ∗ [8,8)))` -> `([4,4) ∗ ([0,4) ∗ [8,8)))` via SepACULaws
+      let P0 := v2026RangePointsTo ⟨1, 0, 4⟩ (List.replicate 4 (.init 0x11 none))
+      let P4 := v2026RangePointsTo ⟨1, 4, 4⟩ (List.replicate 4 (.init 0x11 none))
+      let P8 := v2026RangePointsTo ⟨1, 8, 8⟩ (List.replicate 8 (.init 0x11 none))
+      have hAssoc1 := (hLR.assoc P0 P4 P8).2 rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hMono
+      have hComm04 : V2026RangeEntails
+          (v2026RangeSepConj (v2026RangeSepConj P0 P4) P8)
+          (v2026RangeSepConj (v2026RangeSepConj P4 P0) P8) := by
+        intro m0 fp0 hS
+        have hS1 := (hLR.comm (v2026RangeSepConj P0 P4) P8).1 m0 fp0 hS
+        have hS2 := hLR.monoRight P8 _ _ (hLR.comm P0 P4).1 m0 fp0 hS1
+        exact (hLR.comm P8 (v2026RangeSepConj P4 P0)).1 m0 fp0 hS2
+      have hPreReord := (hLR.assoc P4 P0 P8).1 rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩)
+        (hComm04 rsInitMemoryV2026 (InRange ⟨1, 0, 16⟩) hAssoc1)
+      have hSafeFrame : V2026WriteFrameSafe (v2026RangeSepConj P0 P8) :=
+        v2026WriteFrameSafe_sepConj
+          (v2026WriteFrameSafe_pointsTo _ _) (v2026WriteFrameSafe_pointsTo _ _)
+      exact ⟨m', rfl, v2026RangeSepConj_write_frame hSafeFrame hW hPreReord⟩
 
 end Anneal.SepAC.RangeSpanV2026

@@ -544,6 +544,73 @@ theorem ep2_b2_lockstep_trace_and_unconditional_reclaim_decode :
           | intro vF hv =>
             exact ⟨tr, msF, h.2.1, h.2.2.1, hv.1, hv.2.2.2.2.2.1, hv.2.2.2.2.2.2⟩
 
+/-- **Pass A2 Integration (`[propext]`)**:
+1. Separating-conjunction write framing `v2026RangeSepConj_write_frame` across a 3-way split
+   `[0,4) ∗ [4,4) ∗ [8,8)` + semantic `fpDisjoint` framing on an interior zero-length write
+   `⟨1, 4, 0⟩` inside `[0, 8)` (where syntactic `rangeDisjointBool ⟨1, 4, 0⟩ ⟨1, 0, 8⟩ = false`)
+   + bidirectional `allocBytesAtByteMem_memGlobals_iff`;
+2. Unconditional root-frame & `wfMemShape` preservation across `runCfgSteps`;
+3. Full 14+1-step unmodified `stepMirFn` normal-return trace (`MirStepNode.retNormal`) on
+   `wfPtrReadReclaimLoopBody` exercising BOTH active wavefront steps (`1..10`) AND quiescent
+   stutter steps (`11..14`) inside `stepMirFn_lockstep_chain_indexedCut` (for both `epoch = 10 -> 42`
+   and `epoch = 100 -> 132`), plus fail-closed `isWavefrontCfgOperand` / `isWavefrontCfgStmt`
+   rejections on deref-moves and deref-writes. -/
+theorem ep2_a2_sepConj_write_frame_rootFrame_cfg_and_full_stepMirFn_return :
+    rangeDisjointBool ⟨1, 4, 0⟩ ⟨1, 0, 8⟩ = false ∧
+    (∃ mZ : Memory,
+      writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 0⟩ [] = some mZ ∧
+      AllocBytesAtV2026 mZ ⟨1, 0, 8⟩ (List.replicate 8 (.init 0x11 none))) ∧
+    (∀ (m : Memory) (r : ByteRange) (bs : List AbstractByte),
+      AllocBytesAtByteMem (memGlobalsToByteMem m) r bs ↔ AllocBytesAtV2026 m r bs) ∧
+    (∃ m' : Memory,
+      writeMemoryBytesV2026 rsInitMemoryV2026 ⟨1, 4, 4⟩ rsPatchBytes = some m' ∧
+      (v2026RangeSepConj
+        (v2026RangePointsTo ⟨1, 4, 4⟩ rsPatchAbsBytes)
+        (v2026RangeSepConj
+          (v2026RangePointsTo ⟨1, 0, 4⟩ (List.replicate 4 (.init 0x11 none)))
+          (v2026RangePointsTo ⟨1, 8, 8⟩ (List.replicate 8 (.init 0x11 none))))).pred m'
+        (InRange ⟨1, 0, 16⟩)) ∧
+    (∀ (ms0 : MachineState) (cfgFuel : Nat) (retVal : Value) (memFinal : Memory),
+      ms0.memory.activeCallee = none →
+      ms0.memory.callStack = [] →
+      runCfgSteps wfPtrReadReclaimLoopBody (.running true .none ms0) cfgFuel =
+        .halted true (.normal (retVal, memFinal)) →
+      wfMemShape memFinal = wfMemShape ms0.memory) ∧
+    isWavefrontCfgOperand (.move ⟨1, [.deref]⟩) = false ∧
+    isWavefrontCfgStmt { kind := .assign ⟨1, [.deref]⟩ (.use (.constant { ty := wfU32Ty, val := .scalar (.int ⟨0, 4⟩) })), span := "" } = false ∧
+    (∃ (tr14 : List MachineState) (msAtRet10 : MachineState),
+      mirStepTrace wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs10 = some (tr14, msAtRet10) ∧
+      stepMirFn wfPtrReadReclaimLoopBody msAtRet10 =
+        MirStepNode.retNormal (.scalar ⟨42, 4⟩) msAtRet10.memory ∧
+      ∃ (wFinal : WavefrontWorldV2026) (rFinal : ResTrie ResElem) (vFinal : View),
+        WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld0 wFinal ∧
+        worldMeasureV2026 wFinal = [] ∧
+        IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
+          wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) 0
+          (msAtRet10, vFinal, rFinal, wFinal)) ∧
+    (∃ (tr14_100 : List MachineState) (msAtRet100 : MachineState),
+      mirStepTrace wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs100 = some (tr14_100, msAtRet100) ∧
+      stepMirFn wfPtrReadReclaimLoopBody msAtRet100 =
+        MirStepNode.retNormal (.scalar ⟨132, 4⟩) msAtRet100.memory) := by
+  have hRs := witness_v2026RangeSepConj_write_frame_and_zeroLen_interior
+  have hWf := witness_stepMirFn_full_return_and_stutter_lockstep_v2026
+  refine ⟨hRs.1, hRs.2.2.1, allocBytesAtByteMem_memGlobals_iff, hRs.2.2.2.2,
+    fun _ _ _ _ hC hS hR =>
+      runCfgSteps_preserves_memShape_of_wavefrontCfgBody rfl hC hS hR,
+    hWf.1, hWf.2.1, ?_, hWf.2.2.2⟩
+  cases hWf.2.2.1 with
+  | intro tr14 h1 =>
+    cases h1 with
+    | intro msAtRet10 h =>
+      cases h.2.2.2 with
+      | intro wF hw =>
+        cases hw with
+        | intro rF hr =>
+          cases hr with
+          | intro vF hv =>
+            exact ⟨tr14, msAtRet10, h.1, h.2.2.1, wF, rF, vF,
+              hv.2.2.2.1, hv.2.2.2.2.1, hv.2.2.2.2.2⟩
+
 /-- **Unified Episode 2 Cross-Module Master Capstone (`[propext]`)**:
 Bundles the positive and fail-closed negative witnesses from ALL THREE root modules:
 `Anneal.MiriTreeBorrowsV2026`, `Anneal.SepAC.RangeSpanV2026`, and
@@ -742,6 +809,12 @@ run_cmd do
         ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_of_write_self,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocAllocId),
+      (``Anneal.SepAC.RangeSpanV2026.allocBytesAtByteMem_memGlobals_iff,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes),
+      (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_frame_of_fpDisjoint,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.byteRangesOverlapBool),
+      (``Anneal.SepAC.RangeSpanV2026.v2026RangeSepConj_write_frame,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtByteMem_of_writeV2026Bytes_self,
         ``writeV2026Bytes),
       (``Anneal.WavefrontReclaim.WavefrontV2026.mirWavefrontCutAt_zero_quiescent,
@@ -750,6 +823,10 @@ run_cmd do
         ``Trusted.Rustc.V2026_06_01.MirSemantics.decodeValueFromBytes),
       (``Anneal.WavefrontReclaim.WavefrontV2026.witness_v2026_ptrDeref_mir_loop_input_sensitive,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.decodeValueFromBytes),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.runCfgSteps_preserves_rootFrame_and_globals_of_wavefrontCfgBody,
+        ``Anneal.PureMirExec.evalTerminatorCfg),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.witness_stepMirFn_full_return_and_stutter_lockstep_v2026,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode.retNormal),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtByteMem_frame_of_writeV2026Bytes_disjoint,
         ``writeV2026Bytes),
       (``Anneal.SepAC.RangeSpanV2026.v2026Range_frame_cancel,
@@ -801,7 +878,7 @@ run_cmd do
           throwError "test theorem {c} depends on forbidden axiom {a}"
         unless a == ``propext || a == ``Classical.choice || a == ``Quot.sound do
           throwError "test theorem {c} depends on non-standard axiom {a}"
-  if localThms < 6 then
+  if localThms < 8 then
     throwError "local test audit vacuous: only {localThms} theorems found"
 
   -- 8. Optional cross-root kernel audit of `LeanMiriSpec.InitialStateTreeBorrowsWpLM` when
@@ -848,12 +925,15 @@ run_cmd do
           if lmEnv.find? t |>.isNone then
             return some s!"cross-root audit: missing {t}"
           let mut seenAx : NameSet := {}
+          let mut sawMiri : Bool := false
           let mut qAx : Array Name := #[t]
           while !qAx.isEmpty do
             let cur := qAx.back!
             qAx := qAx.pop
             if seenAx.contains cur then continue
             seenAx := seenAx.insert cur
+            if (`Miri).isPrefixOf cur then
+              sawMiri := true
             if let some ci := lmEnv.find? cur then
               if let .axiomInfo _ := ci then
                 if cur == ``sorryAx || cur == ``Lean.ofReduceBool ||
@@ -867,6 +947,11 @@ run_cmd do
               qAx := qAx ++ ci.type.getUsedConstants
               if let some v := ci.value? (allowOpaque := true) then
                 qAx := qAx ++ v.getUsedConstants
+          unless sawMiri do
+            return some s!"cross-root shadow-spec failure: {t} does not reach vendored Miri.*"
+          if t == `LeanMiriSpec.InitialStateTreeBorrowsWpLM.ep1_initial_state_tree_borrows_wp_capstone then
+            unless seenAx.contains ``Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowPermTransition do
+              return some s!"cross-root bridge failure: {t} does not reach V2026 treeBorrowPermTransition"
         return none
       finally
         Lean.searchPathRef.set savedSp

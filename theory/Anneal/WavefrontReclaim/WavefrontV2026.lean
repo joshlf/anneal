@@ -4600,15 +4600,26 @@ theorem mirWavefrontCutAt_zero_quiescent {pol : SpawnPolicy} {F : VProp}
     exact ⟨hQ, (wavefrontConvergesV2026_extract_fuel pol st.2.2.2 st.2.2.2
       (WavefrontConvergesV2026.quiescent st.2.2.2 hQ)).2.2.1⟩
 
+/-- Computable syntactic operand check for wavefront CFG loops: permits constants, copies
+(including pointer-dereference loads `.copy ⟨ptr, [.deref]⟩` out of `Memory.globals`), and pure
+local moves `.move ⟨loc, []⟩`, while fail-closedly rejecting moves out behind a projection or
+dereference (`.move ⟨_, _ :: _⟩`, `0` `._unsafe_rec`). -/
+def isWavefrontCfgOperand (op : Operand) : Bool :=
+  match op with
+  | .constant _ => true
+  | .copy _ => true
+  | .move ⟨_, []⟩ => true
+  | .move ⟨_, _ :: _⟩ => false
+
 /-- Computable syntactic check for pure/read-only `Rvalue` forms in wavefront CFG loops
 (including `.use (.copy ⟨ptr, [.deref]⟩)` dereference loads out of `Memory.globals`,
 `.binaryOp .add`/`.sub`, `.aggregate .tuple`, and local shared `.ref`, `0` `._unsafe_rec`). -/
 def isWavefrontCfgRvalue (rv : Rvalue) : Bool :=
   match rv with
-  | .use _ => true
-  | .binaryOp .add _ _ => true
-  | .binaryOp .sub _ _ => true
-  | .aggregate .tuple _ => true
+  | .use op => isWavefrontCfgOperand op
+  | .binaryOp .add lhs rhs => isWavefrontCfgOperand lhs && isWavefrontCfgOperand rhs
+  | .binaryOp .sub lhs rhs => isWavefrontCfgOperand lhs && isWavefrontCfgOperand rhs
+  | .aggregate .tuple ops => ops.all isWavefrontCfgOperand
   | .ref .shared ⟨_, []⟩ => true
   | _ => false
 
@@ -4624,7 +4635,8 @@ def isWavefrontCfgStmt (stmt : Statement) : Bool :=
 (`goto`, `return_`, `switchInt`, `0` `._unsafe_rec`). -/
 def isWavefrontCfgTerminator (term : Terminator) : Bool :=
   match term.kind with
-  | .goto _ | .return_ | .switchInt _ _ => true
+  | .goto _ | .return_ => true
+  | .switchInt discr _ => isWavefrontCfgOperand discr
   | _ => false
 
 /-- Computable syntactic check for `CapturedMir` wavefront CFG bodies (`0` `._unsafe_rec`). -/
@@ -4789,28 +4801,15 @@ private theorem evalRvalue_preserves_globals_of_wfCfg
           | mk ptrLoc proj =>
             cases proj with
             | nil => injection hEv with _ _ hM; rw [← hM]
-            | cons pe restP =>
-              cases pe with
-              | deref =>
-                cases hB : mem.borrows with
-                | nil => rw [hB] at hEv; dsimp only at hEv; injection hEv with _ _ hM; rw [← hM]
-                | cons b1 bs1 =>
-                  cases bs1 with
-                  | nil => rw [hB] at hEv; dsimp only at hEv; injection hEv with _ _ hM; rw [← hM]
-                  | cons b2 bs2 =>
-                    rw [hB] at hEv
-                    dsimp only at hEv
-                    cases hUb : derefReadTreeUB locals ptrLoc restP (b1 :: b2 :: bs2)
-                        mem.activeProtectors with
-                    | true => rw [hUb] at hEv; nomatch hEv
-                    | false =>
-                      rw [hUb] at hEv
-                      injection hEv with _ _ hM
-                      rw [← hM]
-              | _ => injection hEv with _ _ hM; rw [← hM]
+            | cons _ _ =>
+              dsimp only [isWavefrontCfgRvalue, isWavefrontCfgOperand] at hRv
+              nomatch hRv
   | binaryOp bop lhsOp rhsOp =>
     have hAddOrSub : bop = .add ∨ bop = .sub := by
-      cases bop <;> first | exact Or.inl rfl | exact Or.inr rfl | nomatch hRv
+      cases bop with
+      | add => exact Or.inl rfl
+      | sub => exact Or.inr rfl
+      | _ => dsimp only [isWavefrontCfgRvalue] at hRv; nomatch hRv
     dsimp only [evalRvalueFast] at hEv
     cases hL : evalOperandFast body locals lhsOp mem.borrows mem.globals
         mem.callerLocals body.localDecls mem.callStack with
@@ -5225,12 +5224,15 @@ theorem mirSingleStepTo_preserves_rootFrame_of_wavefrontCfgBody
     (congrArg (fun p => p.2.1) hShape).trans hNoStack⟩
 
 /-- Invariant tracking that a running `CfgExecState`'s cached statement/terminator cursor
-comes from `isWavefrontCfgStmt` / `isWavefrontCfgTerminator` and preserves `globals0`. -/
+comes from `isWavefrontCfgStmt` / `isWavefrontCfgTerminator` and preserves `globals0`, and that
+every normal `.halted` outcome preserves `globals0` AND exits in a clean root-frame state
+(`activeCallee = none`, `callStack = []`). -/
 @[reducible]
 def cfgStateMatchesWavefrontGlobals (globals0 : List CapturedAllocation) :
     CfgExecState → Prop
   | .faulted => True
-  | .halted _ (.normal (_, mem)) => mem.globals = globals0
+  | .halted _ (.normal (_, mem)) =>
+    mem.globals = globals0 ∧ mem.activeCallee = none ∧ mem.callStack = []
   | .halted _ _ => True
   | .running _ cur s =>
     s.memory.globals = globals0 ∧
@@ -5342,6 +5344,7 @@ private theorem evalTerminatorCfg_preserves_globals_of_wfCfg
     (body : CapturedMir) (ok : Bool) (s : MachineState) (term : Terminator)
     (globals0 : List CapturedAllocation)
     (hGlob : s.memory.globals = globals0)
+    (hNoCallee : s.memory.activeCallee = none)
     (hTm : isWavefrontCfgTerminator term = true) :
     cfgStateMatchesWavefrontGlobals globals0 (evalTerminatorCfg body ok s term) := by
   cases term with
@@ -5350,7 +5353,7 @@ private theorem evalTerminatorCfg_preserves_globals_of_wfCfg
     | goto _ => exact ⟨hGlob, True.intro⟩
     | return_ =>
       dsimp only [evalTerminatorCfg]
-      cases s.memory.callStack with
+      cases hCs : s.memory.callStack with
       | cons _ _ => exact True.intro
       | nil =>
         dsimp only
@@ -5368,7 +5371,7 @@ private theorem evalTerminatorCfg_preserves_globals_of_wfCfg
               dsimp only
               cases valueContainsUninit rv with
               | true => exact True.intro
-              | false => exact hGlob
+              | false => exact ⟨hGlob, hNoCallee, rfl⟩
     | switchInt discr targets =>
       dsimp only [evalTerminatorCfg]
       cases evalOperandWithBodyCastFast body s.frame.locals discr s.memory.borrows
@@ -5393,7 +5396,7 @@ private theorem stepCfgState_preserves_globals_of_wfCfg
   | halted ok out => exact hInv
   | running ok cur s =>
     dsimp only [stepCfgState]
-    cases s.memory.activeCallee with
+    cases hAc : s.memory.activeCallee with
     | some _ => exact True.intro
     | none =>
       cases cur with
@@ -5411,7 +5414,7 @@ private theorem stepCfgState_preserves_globals_of_wfCfg
               cases stmts with
               | nil =>
                 exact evalTerminatorCfg_preserves_globals_of_wfCfg body ok s term
-                  globals0 hInv.1 (bandRight hBbOk)
+                  globals0 hInv.1 hAc (bandRight hBbOk)
               | cons stmt rest =>
                 have hStAll : (isWavefrontCfgStmt stmt && rest.all isWavefrontCfgStmt) = true :=
                   bandLeft hBbOk
@@ -5438,7 +5441,7 @@ private theorem stepCfgState_preserves_globals_of_wfCfg
                   | false => exact True.intro
                   | true =>
                     exact evalTerminatorCfg_preserves_globals_of_wfCfg body ok s term
-                      globals0 hInv.1 (bandRight hInv.2)
+                      globals0 hInv.1 hAc (bandRight hInv.2)
               | cons stmt rest =>
                 dsimp only
                 cases Nat.beq s.frame.blockIdx bIdx with
@@ -5457,18 +5460,20 @@ private theorem stepCfgState_preserves_globals_of_wfCfg
                       (some (bIdx, Nat.add sIdx 1, rest, term)) hNextCurOk s stmt globals0
                       hInv.1 (bandLeft hStAll)
 
-/-- Multi-step operational globals-preservation theorem for unmodified
+/-- Multi-step operational globals AND root-frame preservation theorem for unmodified
 `Anneal.PureMirExec.runCfgSteps` (`[]` zero axioms):
 for any `isWavefrontCfgBody body = true` and ANY `cfgFuel`, halting at
-`.halted ok' (.normal (retVal, memFinal))` guarantees `memFinal.globals = ms0.memory.globals`
-without any caller-supplied `hGlobEq` oracle! -/
-theorem runCfgSteps_preserves_globals_of_wavefrontCfgBody
+`.halted ok' (.normal (retVal, memFinal))` guarantees `memFinal.globals = ms0.memory.globals`,
+`memFinal.activeCallee = none`, and `memFinal.callStack = []` without any caller-supplied oracle! -/
+theorem runCfgSteps_preserves_rootFrame_and_globals_of_wavefrontCfgBody
     {body : CapturedMir} {ok ok' : Bool} {ms0 : MachineState}
     {cfgFuel : Nat} {retVal : Value} {memFinal : Memory}
     (hBody : isWavefrontCfgBody body = true)
     (hRun : runCfgSteps body (.running ok .none ms0) cfgFuel =
       .halted ok' (.normal (retVal, memFinal))) :
-    memFinal.globals = ms0.memory.globals := by
+    memFinal.globals = ms0.memory.globals ∧
+    memFinal.activeCallee = none ∧
+    memFinal.callStack = [] := by
   have hLoop : ∀ n : Nat,
       cfgStateMatchesWavefrontGlobals ms0.memory.globals
         (runCfgSteps body (.running ok .none ms0) n) := by
@@ -5481,6 +5486,30 @@ theorem runCfgSteps_preserves_globals_of_wavefrontCfgBody
   have hFinal := hLoop cfgFuel
   rw [hRun] at hFinal
   exact hFinal
+
+/-- Multi-step operational `wfMemShape` preservation corollary for `runCfgSteps` (`[]` zero axioms). -/
+theorem runCfgSteps_preserves_memShape_of_wavefrontCfgBody
+    {body : CapturedMir} {ok ok' : Bool} {ms0 : MachineState}
+    {cfgFuel : Nat} {retVal : Value} {memFinal : Memory}
+    (hBody : isWavefrontCfgBody body = true)
+    (hNoCallee0 : ms0.memory.activeCallee = none)
+    (hNoStack0 : ms0.memory.callStack = [])
+    (hRun : runCfgSteps body (.running ok .none ms0) cfgFuel =
+      .halted ok' (.normal (retVal, memFinal))) :
+    wfMemShape memFinal = wfMemShape ms0.memory := by
+  have hAll := runCfgSteps_preserves_rootFrame_and_globals_of_wavefrontCfgBody hBody hRun
+  dsimp only [wfMemShape]
+  rw [hAll.1, hAll.2.1, hAll.2.2, hNoCallee0, hNoStack0]
+
+/-- Multi-step operational globals-preservation corollary for `runCfgSteps` (`[]` zero axioms). -/
+theorem runCfgSteps_preserves_globals_of_wavefrontCfgBody
+    {body : CapturedMir} {ok ok' : Bool} {ms0 : MachineState}
+    {cfgFuel : Nat} {retVal : Value} {memFinal : Memory}
+    (hBody : isWavefrontCfgBody body = true)
+    (hRun : runCfgSteps body (.running ok .none ms0) cfgFuel =
+      .halted ok' (.normal (retVal, memFinal))) :
+    memFinal.globals = ms0.memory.globals :=
+  (runCfgSteps_preserves_rootFrame_and_globals_of_wavefrontCfgBody hBody hRun).1
 
 /-- Single-step `V2026_06_01` `stepMirFn` ↔ wavefront-step lockstep bridge shielded by
 `Anneal.Firewall.IndexedCut` and `MirGlobalSliceAtV2026` (`[propext]`):
@@ -7020,6 +7049,131 @@ theorem witness_stepMirFn_lockstep_trace10_ptrLoop_v2026 :
         | intro vF hvF =>
           exact ⟨tr, msF, rfl, hSound.2, hSound.1, wF, rF, vF, hvF.1, hvF.2.1,
             hvF.2.2.2.2.1, hvF.2.2.2.2.2.1, hvF.2.2.2.2.2.2.1, hvF.2.2.2.2.2.2.2⟩
+
+/-- 15-fuel drain certificate (`stage = 14`) for `wfLoopBridgeWorld0`: steps `mwW1 .. mwW10`
+for 10 wavefront steps and immediately recognizes quiescence at remaining fuel `5` (`[]` zero axioms). -/
+theorem wfLoopBridge_run15 :
+    runWavefrontStepsV2026 15 wfPolicyTower53210 wfLoopBridgeWorld0 =
+      some (wfWithBridgeCells mwW10) :=
+  runWavefrontStepV2026_chain 14 wfLoopBridgeWorld0 (wfWithBridgeCells mwW1)
+    (wfWithBridgeCells mwW10) rfl rfl
+    (runWavefrontStepV2026_chain 13 (wfWithBridgeCells mwW1) (wfWithBridgeCells mwW2)
+      (wfWithBridgeCells mwW10) rfl rfl
+      (runWavefrontStepV2026_chain 12 (wfWithBridgeCells mwW2) (wfWithBridgeCells mwW3)
+        (wfWithBridgeCells mwW10) rfl rfl
+        (runWavefrontStepV2026_chain 11 (wfWithBridgeCells mwW3) (wfWithBridgeCells mwW4)
+          (wfWithBridgeCells mwW10) rfl rfl
+          (runWavefrontStepV2026_chain 10 (wfWithBridgeCells mwW4) (wfWithBridgeCells mwW5)
+            (wfWithBridgeCells mwW10) rfl rfl
+            (runWavefrontStepV2026_chain 9 (wfWithBridgeCells mwW5) (wfWithBridgeCells mwW6)
+              (wfWithBridgeCells mwW10) rfl rfl
+              (runWavefrontStepV2026_chain 8 (wfWithBridgeCells mwW6) (wfWithBridgeCells mwW7)
+                (wfWithBridgeCells mwW10) rfl rfl
+                (runWavefrontStepV2026_chain 7 (wfWithBridgeCells mwW7) (wfWithBridgeCells mwW8)
+                  (wfWithBridgeCells mwW10) rfl rfl
+                  (runWavefrontStepV2026_chain 6 (wfWithBridgeCells mwW8)
+                    (wfWithBridgeCells mwW9) (wfWithBridgeCells mwW10) rfl rfl
+                    (runWavefrontStepV2026_chain 5 (wfWithBridgeCells mwW9)
+                      (wfWithBridgeCells mwW10) (wfWithBridgeCells mwW10) rfl rfl rfl)))))))))
+
+/-- **Positive Witness 9 (`[propext]`)**: full 14+1-step end-to-end `stepMirFn` normal-return
+lockstep trace exercising BOTH active wavefront steps (`1..10`) AND quiescent post-drain stutter
+steps (`11..14`) inside `stepMirFn_lockstep_chain_indexedCut`, followed by the 15th unmodified
+`stepMirFn` executing `TerminatorKind.return_` to `.tau (.halted (.normal (.scalar ⟨42, 4⟩, ...)))`
+on `epoch = 10` AND `.tau (.halted (.normal (.scalar ⟨132, 4⟩, ...)))` on `epoch = 100`, plus
+fail-closed operand/statement rejections on deref-moves and deref-writes! -/
+theorem witness_stepMirFn_full_return_and_stutter_lockstep_v2026 :
+    isWavefrontCfgOperand (.move ⟨1, [.deref]⟩) = false ∧
+    isWavefrontCfgStmt { kind := .assign ⟨1, [.deref]⟩ (.use (wfU32ConstOp 0)), span := "" } =
+      false ∧
+    (∃ (tr14 : List MachineState) (msAtRet10 : MachineState),
+      mirStepTrace wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs10 = some (tr14, msAtRet10) ∧
+      tr14.length = 14 ∧
+      stepMirFn wfPtrReadReclaimLoopBody msAtRet10 =
+        MirStepNode.retNormal (.scalar ⟨42, 4⟩) msAtRet10.memory ∧
+      ∃ (wFinal : WavefrontWorldV2026) (rFinal : ResTrie ResElem) (vFinal : View),
+        msAtRet10.memory.globals = wfCNode24Mem0.globals ∧
+        msAtRet10.memory.activeCallee = none ∧
+        msAtRet10.memory.callStack = [] ∧
+        WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld0 wFinal ∧
+        worldMeasureV2026 wFinal = [] ∧
+        IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
+          wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) 0
+          (msAtRet10, vFinal, rFinal, wFinal)) ∧
+    (∃ (tr14_100 : List MachineState) (msAtRet100 : MachineState),
+      mirStepTrace wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs100 = some (tr14_100, msAtRet100) ∧
+      stepMirFn wfPtrReadReclaimLoopBody msAtRet100 =
+        MirStepNode.retNormal (.scalar ⟨132, 4⟩) msAtRet100.memory) := by
+  have hPol : PolicyAdmissible wfPolicyTower53210 :=
+    towerLookupNext_admissible wfTower53210 1 0 rfl
+  have hM0 : WorldMatchesV2026 [0] wfLoopBridgeRes0 wfLoopBridgeWorld0 :=
+    WorldMatchesV2026.mk rfl
+      (seal_loansSyncedWithMemV2026
+        ⟨rfl, True.intro, rfl, rfl, wfCNode24Mem0_get_epoch, True.intro⟩)
+      rfl rfl
+      (fun cid => by
+        cases hEq2 : Pos4.beq path2 cid with
+        | true => rw [← pos4_eq_of_beq path2 cid hEq2]; rfl
+        | false =>
+          have hNeCell : listBoolBeq (cellPath path2) (cellPath cid) = false := by
+            dsimp only [cellPath, listBoolBeq, Bool.and]; exact hEq2
+          dsimp only [wfLoopBridgeRes0]
+          rw [resTrie_getBits_modifyBits_ne (cellPath path2) (cellPath cid) rfl hNeCell,
+            singleRes_getBits_ne poolPath (cellPath cid) _ rfl rfl]
+          exact True.intro)
+      (fun lid2 => by
+        dsimp only [wfLoopBridgeRes0]
+        rw [resTrie_getBits_modifyBits_ne (cellPath path2) (checkedLoanPath lid2) rfl rfl,
+          singleRes_getBits_ne poolPath (checkedLoanPath lid2) _ rfl rfl]
+        exact True.intro)
+  have hCellHold0 : (cellAuthProp path2 99).holds [0] wfLoopBridgeRes0 :=
+    ResTrieSub.mk
+      ⟨ResTrie.modifyBits (cellPath path2) (fun _ => some (.cell .capOnly))
+        (singleRes poolPath (.pool [(11, 2)])), rfl⟩
+  have hMinHold0 : (vsep (vMinStep wfLoopBridgeWorld0.stepCount) (cellAuthProp path2 99)).holds
+      [0] wfLoopBridgeRes0 :=
+    ⟨.empty, wfLoopBridgeRes0, rfl, rfl, hCellHold0⟩
+  have hMemFr0 :
+      MirGlobalSliceAtV2026 wfPtrLoopInitMs10.memory wfCNodeFrameSlotLens
+        (wfEncodeU32LeAbsBytes 99) :=
+    seal_mirGlobalSliceAtV2026 wfCNode24Mem0_get_frameSlot
+  refine ⟨rfl, rfl, ?_, ?_⟩
+  · let out10 :=
+      match mirStepTrace wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs10 with
+      | some p => p
+      | none => ([], wfPtrLoopInitMs10)
+    have hEq14 : mirStepTrace wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs10 =
+        some (out10.1, out10.2) := rfl
+    have hRet10 : stepMirFn wfPtrReadReclaimLoopBody out10.2 =
+        MirStepNode.retNormal (.scalar ⟨42, 4⟩) out10.2.memory := rfl
+    have hSound := mirStepTrace_sound wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs10
+      out10.1 out10.2 hEq14
+    have hCut14 :
+        IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
+          wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) out10.1.length
+          (wfPtrLoopInitMs10, [0], wfLoopBridgeRes0, wfLoopBridgeWorld0) := by
+      rw [hSound.2]
+      exact seal_cut ⟨hM0, hMinHold0, hMemFr0, wfWithBridgeCells mwW10, wfLoopBridge_run15⟩
+    cases stepMirFn_lockstep_chain_indexedCut wfPtrReadReclaimLoopBody wfPolicyTower53210 hPol
+        (cellAuthProp path2 99) wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99) rfl hSound.1
+        [0] wfLoopBridgeRes0 wfLoopBridgeWorld0 rfl rfl hCut14 with
+    | intro wF hwF =>
+      cases hwF with
+      | intro rF hrF =>
+        cases hrF with
+        | intro vF hvF =>
+          exact ⟨out10.1, out10.2, hEq14, hSound.2, hRet10, wF, rF, vF,
+            hvF.1, hvF.2.2.2.2.2.2.2.1, hvF.2.2.2.2.2.2.2.2,
+            hvF.2.1, hvF.2.2.2.2.1, hvF.2.2.2.2.2.2.1⟩
+  · let out100 :=
+      match mirStepTrace wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs100 with
+      | some p => p
+      | none => ([], wfPtrLoopInitMs100)
+    have hEq100 : mirStepTrace wfPtrReadReclaimLoopBody 14 wfPtrLoopInitMs100 =
+        some (out100.1, out100.2) := rfl
+    have hRet100 : stepMirFn wfPtrReadReclaimLoopBody out100.2 =
+        MirStepNode.retNormal (.scalar ⟨132, 4⟩) out100.2.memory := rfl
+    exact ⟨out100.1, out100.2, hEq100, hRet100⟩
 
 /-- Helper constructing single-cause negative test worlds over `wfCNode24Mem0`. -/
 def mkNegWorldV2026 (loans : List WfLoanEntryV2026)
