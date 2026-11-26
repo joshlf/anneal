@@ -967,6 +967,38 @@ theorem t_disjoint_byte_overwrite_preserves_ptr :
   disjoint_byte_overwrite_preserves_ptr true pTag 8 (by decide) (by decide)
     [mkInitByte 0xAA] 0x55 (by decide)
 
+theorem t_live06_accepts_of_coherent :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge true (.uint .u8) 8
+      ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := 5, offsetBytes := 0x40 } 8) :=
+  live06_accepts_of_coherent true 8 _ pTag ((coherent_encode pTag 8 (by decide)).trans rfl)
+
+theorem t_live06_accepts_of_coherent_32 :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge false (.uint .u8) 4
+      ((encodePtrBytesProto pBig4 4).map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := 3, offsetBytes := 0x11223344 } 4) :=
+  live06_accepts_of_coherent false 4 _ pBig4 ((coherent_encode pBig4 4 (by decide)).trans rfl)
+
+theorem t_coherent_none_of_live06_ref_none :
+    abstractBytesCoherentPtrProvProto 8 (encodeLittleEndianBytesProto 0x20004 8) = none :=
+  coherent_none_of_live06_ref_none 8 _ rfl
+
+theorem t_live08_accepts_of_coherent :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge true (.uint .u8) 8
+      ((encodePtrBytesProto pTag 8).map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := 5, offsetBytes := 0x40 } 8) :=
+  live08_accepts_of_coherent true 8 _ pTag ((coherent_encode pTag 8 (by decide)).trans rfl)
+
+theorem t_live08_accepts_of_coherent_32 :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge false (.uint .u8) 4
+      ((encodePtrBytesProto pBig4 4).map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := 3, offsetBytes := 0x11223344 } 4) :=
+  live08_accepts_of_coherent false 4 _ pBig4 ((coherent_encode pBig4 4 (by decide)).trans rfl)
+
+theorem t_coherent_none_of_live08_ref_none :
+    abstractBytesCoherentPtrProvProto 8 (encodeLittleEndianBytesProto 0x20004 8) = none :=
+  coherent_none_of_live08_ref_none 8 _ rfl
+
 /-! ## 2. Prototype decoders on the adversarial inputs (independent `rfl` checks) -/
 
 /-- Live keeps provenance on these images (`LiveV06.w1_*` / `w2_*`); the prototype on the

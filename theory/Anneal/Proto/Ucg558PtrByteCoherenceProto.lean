@@ -78,10 +78,12 @@ modulo `256 ^ ptrBytes = 2 ^ (8 * ptrBytes)`, equivalent to Miri's full `Pointer
 image), plus an Option 2 encoding (`AbstractByteOpt2`, defaulted fragment slot) with lossless
 projections. Universal theorems cover intact round trips with exact `tag` (thin, slice/`str`,
 `dyn`, and `decodeScalarLayoutBytesNoForgeProto`), zero-width rejection, in-order byte copies,
-partial byte overwrites, stripping of every moved byte / reversal / swap / duplication / offset or
+single-byte overwrites, stripping of every moved byte / reversal / swap / duplication / offset or
 provenance splice / scalar-mixed / uninit / cross-width image, the Miri biconditional (and
 wildcard non-rescue), the live `MiniRustSpec.Interp.{encodePtr,decodePtr}` refinement (and its
-strict `UCG#558` tightening), and read-time-only validity.
+strict `UCG#558` tightening), read-time-only validity, and backward compatibility with both
+live snapshots (`live0{6,8}_accepts_of_coherent`: every image the prototype accepts, live
+accepts with the same allocation and offset, so the migration only removes live acceptances).
 -/
 
 namespace Anneal.Proto.Ucg558PtrByteCoherenceProto
@@ -2906,7 +2908,7 @@ theorem decode_splice_ref_none_raw_scalar (p₁ p₂ : ProvenancePtrProto) (n k 
     (coherent_splice_none p₁ p₂ n k hk0 hkn hne)
   exact ⟨h.1, h.2.2⟩
 
-/-- **Custom union / partial byte overwrite strips pointer provenance (universal):** overwriting
+/-- **Custom union / single-byte overwrite strips pointer provenance (universal):** overwriting
 ANY single byte `k < n` of an encoded pointer with a plain `u8` (e.g. via `union { p: *const u8,
 b: [u8; 8] }`, even writing back the identical numeric byte value!) strips provenance: reading as
 `&T` / `fnPtr` is UB and reading as `*const T` yields only the bare scalar address. -/
@@ -3032,6 +3034,152 @@ theorem toLive08_encode (p : ProvenancePtrProto) (n : Nat) :
       Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes
         (normOffset n p.offsetBytes) n (some (p.allocId, p.tag)) :=
   toLive08_encodeAux _ _ _ _ _ _ _
+
+/-! ### Backward compatibility: the prototype only removes live acceptances -/
+
+theorem live06_encodeLE_length (bits k : Nat) (prov : Option (Nat × Nat)) :
+    (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes bits k prov).length = k := by
+  induction k generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp [Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes, ih]
+
+theorem live06_decodeLE_encodeLE (bits k : Nat) (q : Nat × Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeLittleEndianBytes
+      (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes bits (k + 1) (some q)) =
+      some (bits % 256 ^ (k + 1), some q) := by
+  induction k generalizing bits with
+  | zero =>
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodeLittleEndianBytes,
+      Trusted.Rustc.V2026_06_01.MirSemantics.mergeByteProvenance]
+    rw [show (UInt8.ofNat bits).toBitVec.toNat = bits % 256 from UInt8.toNat_ofNat']
+    rfl
+  | succ k ih =>
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes] at ih ⊢
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodeLittleEndianBytes, ih,
+      Trusted.Rustc.V2026_06_01.MirSemantics.mergeByteProvenance]
+    rw [show (UInt8.ofNat bits).toBitVec.toNat = bits % 256 from UInt8.toNat_ofNat',
+      Nat.pow_succ' (n := k + 1), Nat.mod_mul]
+    rfl
+
+theorem live06_allProv_encodeLE (a t bits k : Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesAllProvAux a t
+      (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes bits k (some (a, t))) =
+      true := by
+  induction k generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp only [Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesAllProvAux, Nat.beq_refl,
+      Bool.and_self, ih]
+
+theorem live06_uniform_encodeLE (a t bits k : Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesUniformProv
+      (Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes bits (k + 1) (some (a, t))) =
+      true := by
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesUniformProv]
+  exact live06_allProv_encodeLE a t _ k
+
+/-- **Backward compatibility with live `V2026_06_01` (universal):** every pointer image the
+prototype accepts is accepted by live `decodePtrBytesNoForge` (projected through `toLive06`) with
+the same allocation and offset — the prototype only ever removes live acceptances. -/
+theorem live06_accepts_of_coherent (isRef : Bool) (n : Nat) (l : List AbstractByteProto)
+    (p : ProvenancePtrProto) (h : abstractBytesCoherentPtrProvProto n l = some p) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge isRef (.uint .u8) n
+      (l.map AbstractByteProto.toLive06) =
+      some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n) := by
+  obtain ⟨hn, hoff, rfl⟩ := (coherent_iff_encode n l p).mp h
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, (Nat.sub_add_cancel hn).symm⟩
+  rw [toLive06_encode]
+  simp only [normOffset, Nat.mod_eq_of_lt hoff]
+  have hL := live06_encodeLE_length p.offsetBytes (k + 1) (some (p.allocId, p.tag))
+  have hD := live06_decodeLE_encodeLE p.offsetBytes k (p.allocId, p.tag)
+  have hU := live06_uniform_encodeLE p.allocId p.tag p.offsetBytes k
+  simp only [Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length]
+  simp only [hL, hD, hU, Nat.beq_refl, Nat.mod_eq_of_lt hoff, nat_beq_zero_of_pos hn]
+
+/-- **Refinement (contrapositive, universal):** whenever live `V2026_06_01` rejects a reference
+image (UB), the prototype strips it too — the prototype never accepts what live rejects. -/
+theorem coherent_none_of_live06_ref_none (n : Nat) (l : List AbstractByteProto)
+    (h : Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge true (.uint .u8) n
+      (l.map AbstractByteProto.toLive06) = none) :
+    abstractBytesCoherentPtrProvProto n l = none := by
+  cases hc : abstractBytesCoherentPtrProvProto n l with
+  | none => rfl
+  | some p => rw [live06_accepts_of_coherent true n l p hc] at h; exact absurd h (by simp)
+
+
+theorem live08_encodeLE_length (bits k : Nat) (prov : Option (Nat × Nat)) :
+    (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes bits k prov).length = k := by
+  induction k generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp [Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes, ih]
+
+theorem live08_decodeLE_encodeLE (bits k : Nat) (q : Nat × Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodeLittleEndianBytes
+      (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes bits (k + 1) (some q)) =
+      some (bits % 256 ^ (k + 1), some q) := by
+  induction k generalizing bits with
+  | zero =>
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodeLittleEndianBytes,
+      Trusted.Rustc.V2026_08_01.MirSemantics.mergeByteProvenance]
+    rw [show (UInt8.ofNat bits).toBitVec.toNat = bits % 256 from UInt8.toNat_ofNat']
+    rfl
+  | succ k ih =>
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes] at ih ⊢
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodeLittleEndianBytes, ih,
+      Trusted.Rustc.V2026_08_01.MirSemantics.mergeByteProvenance]
+    rw [show (UInt8.ofNat bits).toBitVec.toNat = bits % 256 from UInt8.toNat_ofNat',
+      Nat.pow_succ' (n := k + 1), Nat.mod_mul]
+    rfl
+
+theorem live08_allProv_encodeLE (a t bits k : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesAllProvAux a t
+      (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes bits k (some (a, t))) =
+      true := by
+  induction k generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp only [Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesAllProvAux, Nat.beq_refl,
+      Bool.and_self, ih]
+
+theorem live08_uniform_encodeLE (a t bits k : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesUniformProv
+      (Trusted.Rustc.V2026_08_01.MirSemantics.encodeLittleEndianBytes bits (k + 1) (some (a, t))) =
+      true := by
+  simp only [Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesUniformProv]
+  exact live08_allProv_encodeLE a t _ k
+
+/-- **Backward compatibility with live `V2026_08_01` (universal):** every pointer image the
+prototype accepts is accepted by live `decodePtrBytesNoForge` (projected through `toLive08`) with
+the same allocation and offset — the prototype only ever removes live acceptances. -/
+theorem live08_accepts_of_coherent (isRef : Bool) (n : Nat) (l : List AbstractByteProto)
+    (p : ProvenancePtrProto) (h : abstractBytesCoherentPtrProvProto n l = some p) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge isRef (.uint .u8) n
+      (l.map AbstractByteProto.toLive08) =
+      some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } n) := by
+  obtain ⟨hn, hoff, rfl⟩ := (coherent_iff_encode n l p).mp h
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, (Nat.sub_add_cancel hn).symm⟩
+  rw [toLive08_encode]
+  simp only [normOffset, Nat.mod_eq_of_lt hoff]
+  have hL := live08_encodeLE_length p.offsetBytes (k + 1) (some (p.allocId, p.tag))
+  have hD := live08_decodeLE_encodeLE p.offsetBytes k (p.allocId, p.tag)
+  have hU := live08_uniform_encodeLE p.allocId p.tag p.offsetBytes k
+  simp only [Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge,
+    Trusted.Rustc.V2026_08_01.MirSemantics.decodeScalarBytes, Trusted.Sequence.length]
+  simp only [hL, hD, hU, Nat.beq_refl, Nat.mod_eq_of_lt hoff, nat_beq_zero_of_pos hn]
+
+/-- **Refinement (contrapositive, universal):** whenever live `V2026_08_01` rejects a reference
+image (UB), the prototype strips it too — the prototype never accepts what live rejects. -/
+theorem coherent_none_of_live08_ref_none (n : Nat) (l : List AbstractByteProto)
+    (h : Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge true (.uint .u8) n
+      (l.map AbstractByteProto.toLive08) = none) :
+    abstractBytesCoherentPtrProvProto n l = none := by
+  cases hc : abstractBytesCoherentPtrProvProto n l with
+  | none => rfl
+  | some p => rw [live08_accepts_of_coherent true n l p hc] at h; exact absurd h (by simp)
+
 
 /-! ## 11. Live `Trusted.Rustc.V2026_06_01.MirSemantics` witnesses -/
 
