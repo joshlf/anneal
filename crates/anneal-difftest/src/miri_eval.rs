@@ -3707,10 +3707,33 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        collect_ident_tokens(
-            quote::ToTokens::to_token_stream(item),
-            &mut self.graph.imported_idents,
-        );
+        // Record each imported path resolved against the enclosing `mod`
+        // containers (`crate::` resets, `super::` pops, `self::` stays), so an
+        // import of `dead_mod::other` never makes every `dead_mod::*` item
+        // reachable.
+        let mut flat: Vec<(Vec<String>, String)> = Vec::new();
+        flatten_use_tree(&item.tree, &mut Vec::new(), &mut flat);
+        for (segments, used_name) in flat {
+            let mut base: Vec<String> = self.container_stack.clone();
+            let mut leading = true;
+            for seg in segments {
+                match seg.as_str() {
+                    "crate" if leading => base.clear(),
+                    "self" if leading => {}
+                    "super" if leading => {
+                        base.pop();
+                    }
+                    _ => {
+                        leading = false;
+                        base.push(seg);
+                    }
+                }
+            }
+            let entry = (base, used_name);
+            if !self.graph.imported_paths.contains(&entry) {
+                self.graph.imported_paths.push(entry);
+            }
+        }
         syn::visit::visit_item_use(self, item);
     }
 
@@ -3923,6 +3946,44 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
     }
 }
 
+/// Flatten a `use` tree into `(path segments, name used in scope)` pairs
+/// (`use a::{b, c as d, e::*}` yields `([a, b], b)`, `([a, c], d)`,
+/// `([a, e, *], *)`).
+fn flatten_use_tree(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    out: &mut Vec<(Vec<String>, String)>,
+) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            prefix.push(p.ident.to_string());
+            flatten_use_tree(&p.tree, prefix, out);
+            prefix.pop();
+        }
+        syn::UseTree::Name(n) => {
+            let name = n.ident.to_string();
+            let mut full = prefix.clone();
+            full.push(name.clone());
+            out.push((full, name));
+        }
+        syn::UseTree::Rename(r) => {
+            let mut full = prefix.clone();
+            full.push(r.ident.to_string());
+            out.push((full, r.rename.to_string()));
+        }
+        syn::UseTree::Glob(_) => {
+            let mut full = prefix.clone();
+            full.push("*".to_string());
+            out.push((full, "*".to_string()));
+        }
+        syn::UseTree::Group(g) => {
+            for t in &g.items {
+                flatten_use_tree(t, prefix, out);
+            }
+        }
+    }
+}
+
 fn collect_fn_and_aux_items(items: &[syn::Item], graph: &mut ScopeGraphData) {
     let mut collector = FnAndAuxCollector {
         graph,
@@ -3946,7 +4007,9 @@ struct ScopeGraphData {
     impl_method_names: BTreeSet<String>,
     nested_fn_stems: BTreeMap<String, Vec<NestedFnOwner>>,
     inherent_impl_method_stems: BTreeMap<String, Vec<InherentMethodOwner>>,
-    imported_idents: BTreeSet<String>,
+    /// `(resolved import path, name it is used under)`; a glob import ends in
+    /// `"*"` and is used under `"*"`.
+    imported_paths: Vec<(Vec<String>, String)>,
     top_level_fns: BTreeSet<String>,
     defined_value_names: BTreeSet<String>,
     defined_type_names: BTreeSet<String>,
@@ -5199,11 +5262,32 @@ fn confirm_helper_module_suffixes(
                     || scope_fns.contains(fn_name)
             };
 
-            let containers_reachable = |containers: &[String]| -> bool {
-                containers.iter().all(|c| {
-                    scope_idents.contains(c)
-                        || scope_aux.contains(c)
-                        || scope_graph.imported_idents.contains(c)
+            // `containers` (enclosing `mod`/`trait` path of `leaf`) is reachable
+            // when a reached body names every container (`live_mod::helper()`),
+            // or when an import names exactly `containers::leaf`, globs a prefix
+            // of `containers` whose remaining segments a reached body names, or
+            // imports a prefix module that a reached body then uses by name.
+            let containers_reachable = |containers: &[String], leaf: &str| -> bool {
+                let named = |c: &String| scope_idents.contains(c) || scope_aux.contains(c);
+                if containers.iter().all(named) {
+                    return true;
+                }
+                scope_graph.imported_paths.iter().any(|(path, used)| {
+                    let Some((last, prefix)) = path.split_last() else {
+                        return false;
+                    };
+                    if last == "*" {
+                        return prefix.len() <= containers.len()
+                            && containers[..prefix.len()] == *prefix
+                            && containers[prefix.len()..].iter().all(named);
+                    }
+                    if prefix == containers && last == leaf {
+                        return true;
+                    }
+                    path.len() <= containers.len()
+                        && containers[..path.len()] == **path
+                        && scope_idents.contains(used)
+                        && containers[path.len()..].iter().all(named)
                 })
             };
 
@@ -5226,12 +5310,12 @@ fn confirm_helper_module_suffixes(
                                         && n.top_fn
                                             .as_deref()
                                             .is_none_or(|top| top_fn_is_reached(top))
-                                        && containers_reachable(&n.containers)
+                                        && containers_reachable(&n.containers, &n.leaf_fn)
                                 }
                                 ClosureOwner::InherentImplMethod(m) => {
                                     scope_inherent_methods
                                         .contains(&(m.self_ty.clone(), m.method.clone()))
-                                        && containers_reachable(&m.containers)
+                                        && containers_reachable(&m.containers, &m.self_ty)
                                 }
                             });
                         }
@@ -15773,6 +15857,76 @@ fn driver() {
         assert_eq!(
             extract_failing_construct_hint_from_rust_line(&implicit_snippet).as_deref(),
             Some("PointerCoercion::Unsize")
+        );
+    }
+
+    #[test]
+    fn confirm_helper_module_suffixes_resolves_use_imports_by_exact_path_not_by_container_name() {
+        // `use dead_mod::other;` must NOT make `dead_mod::helper`'s closure
+        // reachable merely because a same-named `live_mod::helper` is reached;
+        // a module-prefix import (`use outer_mod::inner_mod;` then
+        // `inner_mod::deep()`) and a glob (`use glob_mod::*;`) still link
+        // their closures.
+        let lib_rs = "\
+mod live_mod {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x + v;
+        f(1u32)
+    }
+}
+mod dead_mod {
+    pub fn helper(v: u32) -> u32 {
+        let f = |x: u32| x + v;
+        f(2u32)
+    }
+    pub fn other() -> u32 {
+        0u32
+    }
+}
+mod outer_mod {
+    pub mod inner_mod {
+        pub fn deep(v: u32) -> u32 {
+            let f = |x: u32| x ^ v;
+            f(3u32)
+        }
+    }
+}
+mod glob_mod {
+    pub fn globbed(v: u32) -> u32 {
+        let f = |x: u32| x + v;
+        f(4u32)
+    }
+}
+use dead_mod::other;
+use outer_mod::inner_mod;
+use glob_mod::*;
+pub fn root_entry() -> u32 {
+    live_mod::helper(1u32) ^ inner_mod::deep(2u32) ^ globbed(3u32)
+}
+";
+        let pairs: Vec<(String, String)> = [
+            ("{closure#0}", "X.live_mod_helper_closure_0"),
+            ("{closure#0}", "X.dead_mod_helper_closure_0"),
+            ("{closure#0}", "X.outer_mod_inner_mod_deep_closure_0"),
+            ("{closure#0}", "X.glob_mod_globbed_closure_0"),
+        ]
+        .iter()
+        .map(|(s, suf)| ((*s).to_string(), (*suf).to_string()))
+        .collect();
+        let helpers: Vec<String> = pairs.iter().map(|(_, suf)| suf.clone()).collect();
+        assert_eq!(
+            confirm_helper_module_suffixes(
+                lib_rs,
+                "X",
+                &pairs,
+                &helpers,
+                &[OracleItemSpec::with_fuel("root_entry".to_string(), 200)],
+            ),
+            vec![
+                "X.live_mod_helper_closure_0",
+                "X.outer_mod_inner_mod_deep_closure_0",
+                "X.glob_mod_globbed_closure_0",
+            ],
         );
     }
 
