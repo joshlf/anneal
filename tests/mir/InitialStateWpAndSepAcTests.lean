@@ -417,6 +417,40 @@ theorem ep2_wavefront_firewall_mir_loop_and_rangespan_frame :
           exact ⟨wDrained, rOut, vOut, hvD.1, hvD.2.2.1, hvD.2.2.2.2.1,
             hvD.2.2.2.2.2.1, hOwnF, hvD.2.2.2.2.2.2⟩
 
+/-- **Provenance-Guard + Stage-Budget + MIR↔Reclaim Coupling Integration (`[propext]`)**:
+1. GENERAL `RangeSpanV2026.allocBytesAtV2026_of_write_self` read-after-write on the joint
+   24-byte `wfCNode24Mem0` (raw `u32` epoch/meta patch reads back provenance-free);
+2. Fail-closed relocation guard: a raw write over the pointer bytes of the satisfiable
+   pointer-bearing `rsPtrMemoryV2026` (whose `[0, 8)` genuinely carries provenance) is rejected;
+3. `WavefrontV2026.mirWavefrontCutAt` stage budget: ANY stage-`0` cut forces quiescence;
+4. The real `wfReclaimLoopBody` `runCfgSteps` result equals unmodified `decodeValueFromBytes`
+   of the reclaimed epoch slice in the drained wavefront world's `V2026_06_01` `Memory`. -/
+theorem ep2_provenance_guard_and_mir_reclaim_coupling :
+    (∀ m' : Memory,
+      writeMemoryBytesV2026 wfCNode24Mem0 ⟨2, 0, 8⟩ ep2Patch8RawBytes = some m' →
+      AllocBytesAtV2026 m' ⟨2, 0, 8⟩ ep2Patch8AbsBytes) ∧
+    AllocBytesAtV2026 rsPtrMemoryV2026 ⟨3, 0, 8⟩ rsPtrAbsBytes ∧
+    abstractBytesHaveProv rsPtrAbsBytes = true ∧
+    writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 4, 4⟩ rsPatchBytes = none ∧
+    (∀ st : MirWavefrontCutState,
+      IndexedCut (mirWavefrontCutAt wfPolicyTower53210 (cellAuthProp path2 99)
+        wfCNodeFrameSlotLens (wfEncodeU32LeAbsBytes 99)) 0 st →
+      wfPoolIsNonEmpty st.2.2.2 = false ∧ worldMeasureV2026 st.2.2.2 = []) ∧
+    (∃ (wDrained : WavefrontWorldV2026) (bs : List AbstractByte),
+      runCfgSteps wfReclaimLoopBody (.running true .none wfLoopInitMs) 15 =
+        .halted true (.normal (.scalar ⟨42, 4⟩, wfCNode24Mem0)) ∧
+      WavefrontConvergesV2026 wfPolicyTower53210 wfLoopBridgeWorld0 wDrained ∧
+      v2026SubLensGet wfCNodeEpochLens wDrained.mem = some bs ∧
+      decodeValueFromBytes 1 wfLoopLayouts wfU32Ty bs = some (.scalar ⟨42, 4⟩)) := by
+  have hGuard := witness_v2026_relocation_provenance_guard
+  refine ⟨fun _ hW => allocBytesAtV2026_of_write_self hW, hGuard.1, hGuard.2.1,
+    hGuard.2.2.2.1, fun _ h => mirWavefrontCutAt_zero_quiescent h, ?_⟩
+  cases witness_mir_return_eq_reclaimed_loan_decode_v2026 with
+  | intro wD h1 =>
+    cases h1 with
+    | intro bs h =>
+      exact ⟨wD, bs, h.1, h.2.1, h.2.2.2.1, h.2.2.2.2⟩
+
 /-- **Unified Episode 2 Cross-Module Master Capstone (`[propext]`)**:
 Bundles the positive and fail-closed negative witnesses from ALL THREE root modules:
 `Anneal.MiriTreeBorrowsV2026`, `Anneal.SepAC.RangeSpanV2026`, and
@@ -582,7 +616,13 @@ run_cmd do
       if seen.contains n then continue
       seen := seen.insert n
       if n == target then break
-      if (`Anneal).isPrefixOf n then
+      -- Descend through public AND private (`_private.Anneal.*`) Anneal helper lemmas.
+      let isAnnealLocal : Bool :=
+        (`Anneal).isPrefixOf n ||
+          (match Lean.privateToUserName? n with
+           | some u => (`Anneal).isPrefixOf u
+           | none => false)
+      if isAnnealLocal then
         if let some ciN := env.find? n then
           todo := todo ++ ciN.type.getUsedConstants
           if let some vN := ciN.value? (allowOpaque := true) then
@@ -603,6 +643,14 @@ run_cmd do
         ``Trusted.Rustc.V2026_06_01.MirSemantics.byteRangesOverlapBool),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_frame_of_write_disjoint,
         ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes),
+      (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_of_write_self,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux),
+      (``Anneal.SepAC.RangeSpanV2026.allocBytesAtV2026_of_write_self,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocAllocId),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.mirWavefrontCutAt_zero_quiescent,
+        ``Anneal.WavefrontReclaim.WavefrontV2026.runWavefrontStepsV2026),
+      (``Anneal.WavefrontReclaim.WavefrontV2026.witness_mir_return_eq_reclaimed_loan_decode_v2026,
+        ``Trusted.Rustc.V2026_06_01.MirSemantics.decodeValueFromBytes),
       (``Anneal.SepAC.RangeSpanV2026.allocBytesAtByteMem_frame_of_writeV2026Bytes_disjoint,
         ``writeV2026Bytes),
       (``Anneal.SepAC.RangeSpanV2026.v2026Range_frame_cancel,

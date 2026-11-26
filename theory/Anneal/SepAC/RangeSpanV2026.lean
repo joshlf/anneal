@@ -1190,9 +1190,19 @@ def replaceGlobalAllocV2026 (a' : CapturedAllocation)
     | true => a'
     | false => a)
 
+/-- `true` iff no 8-byte relocation span `[ro, ro + 8)` (the span consulted by unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocAllocId`) intersects `[s, s + l)`
+(non-recursive `List.all`, `0` `._unsafe_rec`). -/
+def relocsAvoidRange (relocs : List (Nat × ProvenancePtr)) (s l : Nat) : Bool :=
+  relocs.all (fun p => Nat.ble (p.1 + 8) s || Nat.ble (s + l) p.1)
+
 /-- Fail-closed byte-range write into a mutable global `CapturedAllocation` of unmodified
 `Trusted.Rustc.V2026_06_01.MirSemantics.Memory`: rejects missing, read-only (`.not`),
-mismatched-length, or out-of-bounds writes with `none`. -/
+mismatched-length, or out-of-bounds writes with `none`, AND rejects raw-byte writes that
+would overlap any pointer relocation span (`relocsAvoidRange`). Without the relocation guard,
+overwriting pointer bytes with plain data would leave a stale `relocations` entry behind and
+`globalAllocSliceToAbstractBytes` would read the new bytes back WITH the old pointer's
+provenance (provenance forgery). -/
 def writeMemoryBytesV2026 (m : Memory) (r : ByteRange)
     (patch : List (Option UInt8)) : Option Memory :=
   match lookupGlobalAlloc m.globals r.allocId with
@@ -1201,7 +1211,9 @@ def writeMemoryBytesV2026 (m : Memory) (r : ByteRange)
     match a.mutability with
     | .not => none
     | .mut =>
-      match Nat.beq patch.length r.len && Nat.ble (r.start + r.len) a.bytes.length with
+      match Nat.beq patch.length r.len &&
+          (Nat.ble (r.start + r.len) a.bytes.length &&
+            relocsAvoidRange a.relocations r.start r.len) with
       | false => none
       | true =>
         let bytes' :=
@@ -1306,7 +1318,9 @@ theorem allocBytesAtV2026_frame_of_write_disjoint
     | «mut» =>
       rw [hMutW] at hWrite
       dsimp only at hWrite
-      cases hChk : (Nat.beq patch.length rW.len && Nat.ble (rW.start + rW.len) aW.bytes.length) with
+      cases hChk : (Nat.beq patch.length rW.len &&
+          (Nat.ble (rW.start + rW.len) aW.bytes.length &&
+            relocsAvoidRange aW.relocations rW.start rW.len)) with
       | false => rw [hChk] at hWrite; nomatch hWrite
       | true =>
         rw [hChk] at hWrite
@@ -1314,7 +1328,7 @@ theorem allocBytesAtV2026_frame_of_write_disjoint
         injection hWrite with hMeq
         have hLenW : patch.length = rW.len := natEq_of_beq_rs (bool_and_left_rs hChk)
         have hBndW : rW.start + rW.len ≤ aW.bytes.length :=
-          natLe_of_ble_rs (bool_and_right_rs hChk)
+          natLe_of_ble_rs (bool_and_left_rs (bool_and_right_rs hChk))
         have hAwId : aW.allocId = rW.allocId :=
           lookupGlobalAlloc_allocId_eq m.globals rW.allocId aW hFindW
         let bytes' : List (Option UInt8) :=
@@ -1396,6 +1410,185 @@ theorem allocBytesAtV2026_frame_of_write_disjoint
               unfold globalAllocSliceToAbstractBytes at hOrig
               rw [hBle0] at hOrig
               exact hOrig
+
+/-! ### General Read-After-Write over `V2026_06_01` `Memory` (Provenance-Exact) -/
+
+/-- Provenance-free `AbstractByte` view of a raw `Option UInt8` patch: exactly how unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux` decodes relocation-free bytes
+(non-recursive `List.map`, `0` `._unsafe_rec`). -/
+def rawToAbstractBytes (patch : List (Option UInt8)) : List AbstractByte :=
+  patch.map (fun o =>
+    match o with
+    | none => .uninit
+    | some b => .init b none)
+
+/-- `rawToAbstractBytes` is length-preserving (`[]` zero axioms). -/
+theorem rawToAbstractBytes_length : ∀ (patch : List (Option UInt8)),
+    (rawToAbstractBytes patch).length = patch.length
+  | [] => rfl
+  | _ :: rest => congrArg Nat.succ (rawToAbstractBytes_length rest)
+
+/-- Every offset inside a `relocsAvoidRange`-clean range has no relocation provenance under
+unmodified `lookupRelocAllocId`. -/
+private theorem lookupRelocAllocId_none_of_avoid :
+    ∀ (relocs : List (Nat × ProvenancePtr)) (s l off : Nat),
+      relocsAvoidRange relocs s l = true → s ≤ off → off < s + l →
+      lookupRelocAllocId relocs off = none
+  | [], _, _, _, _, _, _ => rfl
+  | (ro, tp) :: rest, s, l, off, hAv, hGe, hLt => by
+    have hAv' : ((Nat.ble (ro + 8) s || Nat.ble (s + l) ro) &&
+        relocsAvoidRange rest s l) = true := hAv
+    have hHead := bool_and_left_rs hAv'
+    have hRest :=
+      lookupRelocAllocId_none_of_avoid rest s l off (bool_and_right_rs hAv') hGe hLt
+    unfold lookupRelocAllocId
+    cases h1 : Nat.ble (ro + 8) s with
+    | true =>
+      have hLe : ro + 8 ≤ off := Nat.le_trans (natLe_of_ble_rs h1) hGe
+      have hB : Nat.ble (Nat.add ro 8) off = true := natBle_of_le_rs hLe
+      rw [hB]
+      cases Nat.ble ro off with
+      | true => exact hRest
+      | false => exact hRest
+    | false =>
+      rw [h1] at hHead
+      have hLt2 : off < ro := Nat.lt_of_lt_of_le hLt (natLe_of_ble_rs hHead)
+      have hB : Nat.ble ro off = false := natBle_false_of_lt_rs hLt2
+      rw [hB]
+      exact hRest
+
+/-- Reading `patch.length` bytes at `off` returns `rawToAbstractBytes patch` whenever the
+underlying bytes agree with `patch` and no relocation covers the read window. -/
+private theorem globalAllocBytesAux_of_patch :
+    ∀ (patch bytes : List (Option UInt8)) (relocs : List (Nat × ProvenancePtr)) (off : Nat),
+      (∀ j, j < patch.length →
+        Trusted.Sequence.get? bytes (off + j) = Trusted.Sequence.get? patch j) →
+      (∀ j, j < patch.length → lookupRelocAllocId relocs (off + j) = none) →
+      globalAllocBytesAux bytes relocs off patch.length = some (rawToAbstractBytes patch)
+  | [], _, _, _, _, _ => rfl
+  | p :: ps, bytes, relocs, off, hGet, hRel => by
+    have hShift : ∀ j, off + 1 + j = off + (j + 1) := fun j => by
+      rw [Nat.add_assoc, Nat.add_comm 1 j]
+    have hIH : globalAllocBytesAux bytes relocs (Nat.add off 1) ps.length =
+        some (rawToAbstractBytes ps) :=
+      globalAllocBytesAux_of_patch ps bytes relocs (off + 1)
+        (fun j hj => by
+          rw [hShift j]
+          exact hGet (j + 1) (Nat.succ_lt_succ hj))
+        (fun j hj => by
+          rw [hShift j]
+          exact hRel (j + 1) (Nat.succ_lt_succ hj))
+    have h0 : Trusted.Sequence.get? bytes off = some p := by
+      have h := hGet 0 (Nat.zero_lt_succ _)
+      rw [Nat.add_zero] at h
+      exact h
+    have hR0 : lookupRelocAllocId relocs off = none := by
+      have h := hRel 0 (Nat.zero_lt_succ _)
+      rw [Nat.add_zero] at h
+      exact h
+    change globalAllocBytesAux bytes relocs off (ps.length + 1) = _
+    unfold globalAllocBytesAux
+    rw [h0]
+    dsimp only
+    rw [hIH]
+    cases p with
+    | none => rfl
+    | some b =>
+      dsimp only
+      rw [hR0]
+      rfl
+
+/-- Bytes inside the spliced window read back as the patch. -/
+private theorem listGet_splice_mid {α : Type} (xs mid : List α)
+    {wStart j : Nat} (hWLe : wStart ≤ xs.length) (hj : j < mid.length) :
+    Trusted.Sequence.get?
+      ((xs.take wStart ++ mid) ++ xs.drop (wStart + mid.length)) (wStart + j) =
+      Trusted.Sequence.get? mid j := by
+  have hTakeLen : (xs.take wStart).length = wStart :=
+    listLength_take_of_le_rs wStart xs hWLe
+  have hPreLen : (xs.take wStart ++ mid).length = wStart + mid.length := by
+    rw [List.length_append, hTakeLen]
+  rw [listGet_append_left_rs (xs.take wStart ++ mid) _ (wStart + j)
+      (by rw [hPreLen]; exact Nat.add_lt_add_left hj wStart),
+    listGet_append_right_rs (xs.take wStart) mid (wStart + j)
+      (by rw [hTakeLen]; exact Nat.le_add_right wStart j),
+    hTakeLen, Nat.add_sub_cancel_left]
+
+/-- General provenance-exact read-after-write law directly over unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.Memory` (`[propext]` only): after a successful
+`writeMemoryBytesV2026 m rW patch = some m'`, unmodified `globalAllocSliceToAbstractBytes`
+reads `rW` back as exactly `rawToAbstractBytes patch` — every initialized byte carries
+`none` provenance, so no pointer provenance can be forged by a raw-data write. -/
+theorem allocBytesAtV2026_of_write_self
+    {m m' : Memory} {rW : ByteRange} {patch : List (Option UInt8)}
+    (hWrite : writeMemoryBytesV2026 m rW patch = some m') :
+    AllocBytesAtV2026 m' rW (rawToAbstractBytes patch) := by
+  unfold writeMemoryBytesV2026 at hWrite
+  cases hFindW : lookupGlobalAlloc m.globals rW.allocId with
+  | none => rw [hFindW] at hWrite; nomatch hWrite
+  | some aW =>
+    rw [hFindW] at hWrite
+    dsimp only at hWrite
+    cases hMutW : aW.mutability with
+    | not => rw [hMutW] at hWrite; nomatch hWrite
+    | «mut» =>
+      rw [hMutW] at hWrite
+      dsimp only at hWrite
+      cases hChk : (Nat.beq patch.length rW.len &&
+          (Nat.ble (rW.start + rW.len) aW.bytes.length &&
+            relocsAvoidRange aW.relocations rW.start rW.len)) with
+      | false => rw [hChk] at hWrite; nomatch hWrite
+      | true =>
+        rw [hChk] at hWrite
+        dsimp only at hWrite
+        injection hWrite with hMeq
+        have hLenW : patch.length = rW.len := natEq_of_beq_rs (bool_and_left_rs hChk)
+        have hBndW : rW.start + rW.len ≤ aW.bytes.length :=
+          natLe_of_ble_rs (bool_and_left_rs (bool_and_right_rs hChk))
+        have hAvoid : relocsAvoidRange aW.relocations rW.start rW.len = true :=
+          bool_and_right_rs (bool_and_right_rs hChk)
+        have hAwId : aW.allocId = rW.allocId :=
+          lookupGlobalAlloc_allocId_eq m.globals rW.allocId aW hFindW
+        let bytes' : List (Option UInt8) :=
+          (aW.bytes.take rW.start ++ patch) ++ aW.bytes.drop (rW.start + patch.length)
+        let aW' : CapturedAllocation := { aW with bytes := bytes' }
+        have hM'Glob : m'.globals = replaceGlobalAllocV2026 aW' m.globals := by
+          rw [← hMeq]
+          dsimp only [aW', bytes']
+          cases aW
+          dsimp only at hMutW ⊢
+          rw [hMutW]
+        have hWStartLe : rW.start ≤ aW.bytes.length :=
+          Nat.le_trans (Nat.le_add_right rW.start rW.len) hBndW
+        have hBndPatch : rW.start + patch.length ≤ aW.bytes.length := by
+          rw [hLenW]; exact hBndW
+        have hBytesLenEq : bytes'.length = aW.bytes.length := by
+          dsimp only [bytes']
+          rw [List.length_append, List.length_append,
+            listLength_take_of_le_rs rW.start aW.bytes hWStartLe,
+            listLength_drop_rs, Nat.add_sub_of_le hBndPatch]
+        have hFind' : lookupGlobalAlloc m'.globals rW.allocId = some aW' := by
+          rw [hM'Glob, ← hAwId]
+          exact lookupGlobalAlloc_replace_eq aW'
+            (by dsimp only [aW']; rw [hAwId]; exact hFindW)
+        refine ⟨aW', hFind', ?_, ?_, ?_⟩
+        · dsimp only [aW']
+          rw [hBytesLenEq]
+          exact hBndW
+        · rw [rawToAbstractBytes_length, hLenW]
+        · unfold globalAllocSliceToAbstractBytes
+          have hBle1 : Nat.ble rW.start (Trusted.Sequence.length aW'.bytes) = true := by
+            change Nat.ble rW.start bytes'.length = true
+            rw [hBytesLenEq]
+            exact natBle_of_le_rs hWStartLe
+          rw [hBle1, ← hLenW]
+          apply globalAllocBytesAux_of_patch
+          · intro j hj
+            exact listGet_splice_mid aW.bytes patch hWStartLe hj
+          · intro j hj
+            exact lookupRelocAllocId_none_of_avoid aW.relocations rW.start rW.len (rW.start + j)
+              hAvoid (Nat.le_add_right _ _)
+              (by rw [← hLenW]; exact Nat.add_lt_add_left hj _)
 
 /-! ### `SpatialMemV2026.V2026ByteMem` & `sliceAbstractBytes`/`writeAbstractBytesAt` Bridge -/
 
@@ -2463,5 +2656,53 @@ theorem witness_rangespan_negative_controls :
     cases hMiss with
     | intro _ ha =>
       nomatch ha.1
+
+/-- Pointer-bearing mutable 16-byte global allocation `3` in unmodified `V2026_06_01` form:
+an 8-byte pointer relocation at `[0, 8)` targeting allocation `1` followed by 8 bytes of plain
+data at `[8, 16)` (a `struct { p: *const u8, data: [u8; 8] }` static). -/
+def rsPtrAlloc3 : CapturedAllocation :=
+  { allocId := 3
+    align := ⟨8⟩
+    mutability := .mut
+    bytes := List.replicate 16 (some 0x00)
+    relocations := [(0, { allocId := 1, offsetBytes := 0 })] }
+
+/-- Single-allocation `Memory` holding `rsPtrAlloc3`. -/
+def rsPtrMemoryV2026 : Memory :=
+  { emptyMemory with nextAllocId := 4, globals := [rsPtrAlloc3] }
+
+/-- Provenance-carrying pointer bytes of `rsPtrAlloc3` (`(allocId, tag) = (1, 1)`). -/
+def rsPtrAbsBytes : List AbstractByte :=
+  List.replicate 8 (.init 0x00 (some (1, 1)))
+
+/-- **Relocation/provenance guard witness (`[propext]` only)** on a satisfiable pointer-bearing
+`V2026_06_01` allocation:
+1. the pointer bytes `[0, 8)` genuinely carry provenance under unmodified
+   `globalAllocSliceToAbstractBytes` (`abstractBytesHaveProv = true`);
+2. a same-allocation data write into the disjoint `[8, 12)` succeeds, reads back
+   provenance-free via the GENERAL `allocBytesAtV2026_of_write_self`, and frames the
+   provenance-carrying pointer bytes via `allocBytesAtV2026_frame_of_write_disjoint`;
+3. raw-data writes overlapping the relocation span (`[4, 8)`, `[0, 4)`, `[6, 10)`) fail
+   closed, so plain bytes can never be read back with forged pointer provenance. -/
+theorem witness_v2026_relocation_provenance_guard :
+    AllocBytesAtV2026 rsPtrMemoryV2026 ⟨3, 0, 8⟩ rsPtrAbsBytes ∧
+    abstractBytesHaveProv rsPtrAbsBytes = true ∧
+    (∃ m' : Memory,
+      writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 8, 4⟩ rsPatchBytes = some m' ∧
+      AllocBytesAtV2026 m' ⟨3, 8, 4⟩ rsPatchAbsBytes ∧
+      abstractBytesHaveProv rsPatchAbsBytes = false ∧
+      AllocBytesAtV2026 m' ⟨3, 0, 8⟩ rsPtrAbsBytes) ∧
+    writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 4, 4⟩ rsPatchBytes = none ∧
+    writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 0, 4⟩ rsPatchBytes = none ∧
+    writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 6, 4⟩ rsPatchBytes = none := by
+  have hPtr : AllocBytesAtV2026 rsPtrMemoryV2026 ⟨3, 0, 8⟩ rsPtrAbsBytes :=
+    ⟨rsPtrAlloc3, rfl, natLe_of_ble_rs rfl, rfl, rfl⟩
+  refine ⟨hPtr, rfl, ?_, rfl, rfl, rfl⟩
+  cases hW : writeMemoryBytesV2026 rsPtrMemoryV2026 ⟨3, 8, 4⟩ rsPatchBytes with
+  | none => nomatch hW
+  | some m' =>
+    have hD : RangeDisjoint ⟨3, 8, 4⟩ ⟨3, 0, 8⟩ := (rangeDisjointBool_iff _ _).mp rfl
+    exact ⟨m', rfl, allocBytesAtV2026_of_write_self hW, rfl,
+      allocBytesAtV2026_frame_of_write_disjoint hD hW hPtr⟩
 
 end Anneal.SepAC.RangeSpanV2026
