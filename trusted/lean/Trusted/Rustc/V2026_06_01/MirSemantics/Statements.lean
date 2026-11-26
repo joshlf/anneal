@@ -5012,9 +5012,11 @@ Execute a `NonDivergingIntrinsic.copyNonOverlapping src dst count` statement
    zero-sized `T` such as `()` or `[u64; 0]` with any `count`), both pointers
    must be well-formed thin pointer values aligned to `align_of::<T>()`
    (`zeroByteCopyPrecheck`): aligned null and aligned dangling pointers are
-   accepted, and the statement is then a no-op (no slot or memory access, no
-   Tree Borrows access, no overlap check); a malformed or misaligned pointer
-   faults `.ub`, and an undetermined alignment fails closed `.unsupported`.
+   accepted (while no provenance has been exposed; afterwards an integer
+   address with `align_of::<T>() > 1` is undetermined), and the statement is
+   then a no-op (no slot or memory access, no Tree Borrows access, no overlap
+   check); a malformed or misaligned pointer faults `.ub`, and an undetermined
+   alignment fails closed `.unsupported`.
    Otherwise the gated non-zero copy runs as in step 2.
 
 Reference (`core::ptr::copy_nonoverlapping` documentation,
@@ -5086,15 +5088,20 @@ not used as an additional premise. The general pointer-validity note above
 ("A null pointer is never valid") concerns accesses of non-zero size and is
 superseded for this function by the explicit "or that number must be 0"
 waiver. Hence the zero-byte fragment accepts aligned null and aligned dangling
-pointers (matching `Terminators.evalCopyCall` for `core::intrinsics::copy`),
-and every non-zero-byte copy still requires live, non-null pointers (enforced
-by `evalCopyNonOverlappingWithCountNonZero`).
+pointers, and every non-zero-byte copy still requires live, non-null pointers
+(enforced by `evalCopyNonOverlappingWithCountNonZero`).
 
 Modeling choices and remaining gaps: the `count * size_of::<T>() <= isize::MAX`
 bound (`isizeMaxBytes`) is derived from validity rather than separately
 quoted; an undetermined element layout or alignment fails closed
-(`.unsupported`) rather than guessing; non-zero-byte copies with a resolved
-layout keep the existing (unchanged) non-zero semantics, which do not re-check
+(`.unsupported`) rather than guessing; once any provenance has been exposed,
+integer addresses (including aligned null and aligned dangling ones) with
+`align_of::<T>() > 1` are undetermined, because exposed integers carry
+canonical addresses that are not alignment guarantees (`checkZeroCountCopyPtr`);
+`Terminators.evalCopyCall` (`core::intrinsics::copy`, via `checkPtrArgAligned`)
+does not apply this exposure restriction, so the two intrinsics differ on
+integer addresses after exposure; non-zero-byte copies with a resolved layout
+keep the existing (unchanged) non-zero semantics, which do not re-check
 alignment.
 -/
 def evalCopyNonOverlappingWithCount
