@@ -28,7 +28,9 @@ simulation theorems, and in explicitly labeled contrast conjuncts.
 * Lockstep witnesses (both machines step to related states, or both report
   undefined behavior): `assume`, the bit / saturating / `exact_div` /
   `arith_offset` calls, single-element / OOB / overflow `write_bytes`, and the
-  `copy_nonoverlapping` zero-count, overlap, out-of-bounds same-local, overflow,
+  `copy_nonoverlapping` zero-count (aligned live pointer, aligned dangling
+  `NonNull::dangling()` address, and aligned null), zero-count misaligned (UB in
+  both), overlap, out-of-bounds same-local, overflow,
   distinct-local single-element, distinct-local out-of-bounds (`count = 2` on
   `bool` and `u64` via `copyAccessFitsAlloc?`), and distinct-local full-byte
   multi-element (`count * size_of::<u8>() = 8` via `copyBytesSubplace`) witnesses.
@@ -44,7 +46,7 @@ simulation theorems, and in explicitly labeled contrast conjuncts.
   while `annealStepHooks` fails closed.
 * Stage-1 divergence witnesses (`*_divergence`, `*_single_clobber*`):
   concrete programs on which Stage-1 `Trusted` and canonical `lean-miri` disagree —
-  Stage-1 accepts zero-count misaligned copies that Miri rejects, rejects same-tag
+  Stage-1 rejects same-tag
   disjoint copies and provenance-free `.scalar` pointers in `arith_offset` that
   Miri accepts, stores an ill-sized value on cross-type copies, clobbers the whole
   destination on `count = 1` cross-width copies (`evalCopySingleDirect`), and
@@ -2140,7 +2142,7 @@ theorem wit_lm4_2_copy_nonoverlapping_zero_ok :
         simpa [s₁, mkPtrState, get?] using hsrc.symm
       have hdV : dstVal = .ptr { allocId := 1, offsetBytes := 0 } 8 := by
         simpa [s₁, mkPtrState, get?] using hdst.symm
-      subst hsV hdV; exact ⟨rfl, rfl⟩)
+      subst hsV hdV; exact ⟨rfl, rfl, rfl⟩)
     (by
       intro _ _ e_s e_d decl_s decl_d _ _ he_s _ he_d _ hd_s hd_d
       cases he_s with
@@ -2246,7 +2248,7 @@ theorem wit_lm4_2_copy_nonoverlapping_overlap_ub :
         | head _ =>
           exact ⟨by nofun, Or.inl rfl,
             by simp [s₁, mkPtrState, entry, rawPtrAllocMapEntry, get?]⟩)
-  have hs₂ : stepMirFn b s₁ = .fail .ub := rfl
+  have hs₂ : stepMirFn b s₁ = .fail .ub := by dsimp +zetaDelta only; rfl
   rw [hs₂] at hsim₂
   obtain ⟨m₂, msg, hm₂⟩ := hsim₂.miri_ub_of_anneal_ub
   exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, hs₂, hm₂⟩
@@ -2393,18 +2395,22 @@ def copyMisalignedZeroBody : CapturedMir :=
      copyStmt 2 2 0]
     .return_
 
-/-- **`wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence`** (Stage-1
-divergence; Stage-1 is more permissive than `lean-miri`): real 4-step lockstep
-execution advancing `_2 : *mut u64` to misaligned `offsetBytes = 1`, then
-`copy_nonoverlapping(copy _2, copy _2, 0_usize)`. `lean-miri`'s
-`Intrinsics.copyWith` checks both pointers' alignment before the zero-length copy
-(as rustc's `copy_intrinsic`; `core::ptr::copy_nonoverlapping`: the pointers must be
-properly aligned even when the copied size is `0`) and reports undefined behavior,
-whereas Stage-1 `evalCopyNonOverlappingWithCount` (`Statements.lean:1697`) returns
-`advanceStmt` for `count = 0` before any check, so Stage-1 `stepMirFn` steps:
-Stage-1 `Trusted` accepts a program that canonical Miri rejects. (Only the
-pre-Stage-1 reference model `stepMirFnLM4_2` checked alignment first.) -/
-theorem wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence :
+/-- **`wit_lm4_2_copy_nonoverlapping_zero_misaligned_ub_agreement`** (lockstep
+undefined-behavior agreement): real 4-step lockstep execution advancing
+`_2 : *mut u64` to misaligned `offsetBytes = 1` (`StateRelLM3_1` after every
+step), then `copy_nonoverlapping(copy _2, copy _2, 0_usize)`, on which **both**
+machines report undefined behavior:
+* `lean-miri`'s `Intrinsics.copyWith` checks both pointers' alignment before the
+  zero-length copy (as rustc's `copy_intrinsic`; `core::ptr::copy_nonoverlapping`:
+  the pointers must be properly aligned even when the copied size is `0`);
+* Stage-1 `evalCopyNonOverlappingWithCount` resolves `align_of::<u64>() = 8`
+  (`resolveCopyElemLayout`) and its zero-byte precheck
+  (`zeroByteCopyPrecheck` / `stackBorrowAlignKnown`) finds the live stack borrow
+  of the 8-aligned local `_1` at byte offset `1`, misaligned in every placement,
+  so Stage-1 `stepMirFn` faults with `MirStepNode.fail .ub`.
+This retires the former permissive divergence (Stage-1 used to return
+`advanceStmt` for `count = 0` before any check). -/
+theorem wit_lm4_2_copy_nonoverlapping_zero_misaligned_ub_agreement :
     ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState) (msg : String),
       let b := copyMisalignedZeroBody
       let hooks := annealStepHooks b.localDecls b.layouts
@@ -2421,7 +2427,7 @@ theorem wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence :
       stepMirFn b s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       StateRelLM3_1 b s₄ m₄ [entry] ∧
-      stepMirFn b s₄ = .step (advanceStmt s₄ s₄.frame.locals) ∧
+      stepMirFn b s₄ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .error (.undefinedBehavior msg)) := by
   let b := copyMisalignedZeroBody
   have hrel₀ : StateRel b (ptr4AnnealPre b) (ptr4MiriPre b unitK) :=
@@ -2533,8 +2539,287 @@ theorem wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence :
   have hs₅ : stepMirFnLM4_2 b s₄ = .fail .ub := rfl
   rw [hs₅] at hsim₅
   obtain ⟨m₅, msg, hm₅⟩ := hsim₅.miri_ub_of_anneal_ub
+  have hstage1 : stepMirFn b s₄ = .fail .ub := rfl
   exact ⟨s₁, s₂, s₃, s₄, m₁, m₂, m₃, m₄, m₅, msg,
-    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄, rfl, hm₅⟩
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄, hstage1, hm₅⟩
+
+/-! ### 6.1 Zero-count copies through aligned dangling and aligned null pointers
+
+`core::ptr::copy_nonoverlapping` (`library/core/src/ptr/mod.rs` at rustc
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) waives pointer validity when
+`count * size_of::<T>()` is `0` ("or that number must be 0") but still requires
+alignment. Both Stage-1 `Trusted` (`zeroByteCopyPrecheck`) and `lean-miri`
+(`Intrinsics.copyWith`: `checkAlign`, then `checkAndDerefPtr` returns
+`.ok none` for size `0`) therefore accept a zero-count copy through the
+provenance-free address `8` (the address of `NonNull::<u64>::dangling()`) and
+through the aligned null address `0`. -/
+
+/-- `addr` as an 8-byte `lean-miri` scalar. -/
+def zcScalarAddr (addr : Nat) : Miri.Memory.ScalarInt :=
+  Miri.Memory.ScalarInt.ofUInt64 (UInt64.ofNat addr)
+
+/-- `ScalarRel` between Anneal's `⟨8, 8⟩` and `zcScalarAddr 8`. -/
+theorem zc_scalarRel8 : ScalarRel ⟨8, 8⟩ (zcScalarAddr 8) :=
+  ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, rfl, rfl⟩
+
+/-- `ScalarRel` between Anneal's `⟨0, 8⟩` and `zcScalarAddr 0`. -/
+theorem zc_scalarRel0 : ScalarRel ⟨0, 8⟩ (zcScalarAddr 0) :=
+  ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, rfl, rfl⟩
+
+/-- Pre-state of `ptr4Body` where `_1 = 42_u64` and `_2 : *mut u64` holds the
+provenance-free 8-byte address `.scalar ⟨addr, 8⟩` (`addr as *mut u64`). -/
+def ptr4ScalarAddrAnnealPre (b : CapturedMir) (addr : Nat) : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨addr, 8⟩), .uninit] }
+    memory := (initMachineState b []).memory }
+
+def ptr4ScalarAddrMiriFramePre (b : CapturedMir) (d₀ : RigidTy) (addr : Nat) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody b
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy (tyOf d₀)) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+        layout := some (translateTy (tyOf u64K)) },
+      { value := .live (.immediate (.scalar (.fromScalarInt (zcScalarAddr addr)))),
+        layout := some (translateTy (tyOf rawMutU64K)) },
+      { value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def ptr4ScalarAddrMiriPre (b : CapturedMir) (d₀ : RigidTy) (addr : Nat) : AnnealStepState :=
+  { stack := ⟨#[ptr4ScalarAddrMiriFramePre b d₀ addr]⟩, machine := AnnealMachine.empty }
+
+theorem ptr4ScalarAddr_all_immediate (b : CapturedMir) (d₀ : RigidTy) (addr : Nat) :
+    ∀ tf, (ptr4ScalarAddrMiriPre b d₀ addr).stack.frames = #[tf] →
+      ∀ k, IsImmediateFrameLocal tf k := by
+  intro tf h k mls hmls mp hmp
+  injection h with h₁; injection h₁ with h₂; subst h₂
+  match k with
+  | 0 | 1 | 2 | 3 => simp [ptr4ScalarAddrMiriFramePre] at hmls; subst hmls; cases hmp
+  | _ + 4 => simp [ptr4ScalarAddrMiriFramePre] at hmls
+
+theorem ptr4ScalarAddr_stateRel (d₀ d₃ : RigidTy) (stmts : List MirAst.Statement)
+    (term0 : TerminatorKind) (addr : Nat) (hrel : ScalarRel ⟨addr, 8⟩ (zcScalarAddr addr)) :
+    StateRel (ptr4Body d₀ rawMutU64K d₃ stmts term0)
+      (ptr4ScalarAddrAnnealPre (ptr4Body d₀ rawMutU64K d₃ stmts term0) addr)
+      (ptr4ScalarAddrMiriPre (ptr4Body d₀ rawMutU64K d₃ stmts term0) d₀ addr) := by
+  let b := ptr4Body d₀ rawMutU64K d₃ stmts term0
+  refine StateRel.mk (ptr4ScalarAddrMiriFramePre b d₀ addr) rfl rfl
+    ⟨translateTy (tyOf d₀), rfl⟩ ?_
+    rfl rfl rfl rfl rfl (by
+      intro i _ _ _ _ _ _ hi _
+      revert hi
+      match i with
+      | 0 | 1 | 2 | 3 | _ + 4 => rintro ⟨⟩)
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 | 3 =>
+    have hs : slot = .uninit := by simpa [ptr4ScalarAddrAnnealPre, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [ptr4ScalarAddrMiriFramePre] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = declOf u64K := by simpa [b, ptr4Body, get?] using hdecl.symm
+    have hs : slot = .init (.scalar ⟨42, 8⟩) := by
+      simpa [ptr4ScalarAddrAnnealPre, get?] using hslot.symm
+    have hm : mls =
+        { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+          layout := some (translateTy (tyOf u64K)) } := by
+      simpa [ptr4ScalarAddrMiriFramePre] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ (some (translateTy (tyOf u64K))) (fun _ h => Option.some.inj h.symm)
+      (Or.inr ⟨_, rfl, .scalar _ _ Witness.lm31_scalarRel42 rfl
+        (fun h => nomatch h) (fun h => nomatch h)⟩)
+  | 2 =>
+    have hd : decl = declOf rawMutU64K := by simpa [b, ptr4Body, get?] using hdecl.symm
+    have hs : slot = .init (.scalar ⟨addr, 8⟩) := by
+      simpa [ptr4ScalarAddrAnnealPre, get?] using hslot.symm
+    have hm : mls =
+        { value := .live (.immediate (.scalar (.fromScalarInt (zcScalarAddr addr)))),
+          layout := some (translateTy (tyOf rawMutU64K)) } := by
+      simpa [ptr4ScalarAddrMiriFramePre] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ (some (translateTy (tyOf rawMutU64K)))
+      (fun _ h => Option.some.inj h.symm)
+      (Or.inr ⟨_, rfl, .scalar _ _ hrel rfl (fun h => nomatch h) (fun h => nomatch h)⟩)
+  | _ + 4 => simp [ptr4Body, get?] at hdecl
+
+/-- Body `_3 = &raw mut _1; copy_nonoverlapping(copy _2, copy _3, 0_usize)` (source
+`_2`, destination the live borrow `_3` of `_1`). -/
+def copyZeroScalarSrcBody : CapturedMir :=
+  ptr4Body unitK rawMutU64K rawMutU64K
+    [mkStmt42 (.assign (local42 3) (.rawPtr .mut (local42 1))), copyStmt 2 3 0]
+    .return_
+
+/-- Body `_3 = &raw mut _1; copy_nonoverlapping(copy _3, copy _2, 0_usize)` (source
+the live borrow `_3` of `_1`, destination `_2`). -/
+def copyZeroScalarDstBody : CapturedMir :=
+  ptr4Body unitK rawMutU64K rawMutU64K
+    [mkStmt42 (.assign (local42 3) (.rawPtr .mut (local42 1))), copyStmt 3 2 0]
+    .return_
+
+/-- **`wit_lm4_2_copy_nonoverlapping_zero_dangling_ok`** (positive lockstep
+witness): from a `StateRelLM3_1`-related pre-state with `_2 : *mut u64` holding the
+provenance-free aligned address `8` (`NonNull::<u64>::dangling()`), real 2-step
+lockstep execution of `_3 = &raw mut _1` and
+`copy_nonoverlapping(copy _2, copy _3, 0_usize)`: both Stage-1 `stepMirFn`
+(alignment-only zero-byte precheck on the dangling source and the live
+destination borrow) and `lean-miri` step with `.ok true` to `StateRelLM3_1`-related
+states, leaving `_1 = 42_u64` and `_2` unchanged. -/
+theorem wit_lm4_2_copy_nonoverlapping_zero_dangling_ok :
+    ∃ (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState),
+      let b := copyZeroScalarSrcBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4ScalarAddrAnnealPre b 8) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4ScalarAddrMiriPre b unitK 8) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      get? s₂.frame.locals 1 = some (.init (.scalar ⟨42, 8⟩)) ∧
+      get? s₂.frame.locals 2 = some (.init (.scalar ⟨8, 8⟩)) := by
+  let b := copyZeroScalarSrcBody
+  have hrel₀ : StateRel b (ptr4ScalarAddrAnnealPre b 8) (ptr4ScalarAddrMiriPre b unitK 8) :=
+    ptr4ScalarAddr_stateRel unitK rawMutU64K
+      [mkStmt42 (.assign (local42 3) (.rawPtr .mut (local42 1))), copyStmt 2 3 0] .return_
+      8 zc_scalarRel8
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  have himm₀ : ∀ tf, (ptr4ScalarAddrMiriPre b unitK 8).stack.frames = #[tf] →
+      IsImmediateFrameLocal tf 3 ∧ IsImmediateFrameLocal tf 1 :=
+    fun tf htf => ⟨ptr4ScalarAddr_all_immediate b _ 8 tf htf 3,
+      ptr4ScalarAddr_all_immediate b _ 8 tf htf 1⟩
+  let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+  let s₁ := mkPtrState b 0 1
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨8, 8⟩),
+      .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+    [entry.toBorrowEntry] 2
+  have hs₁ : stepMirFn b (ptr4ScalarAddrAnnealPre b 8) = .step s₁ := rfl
+  have hsim₁ := step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty
+  rw [hs₁] at hsim₁
+  obtain ⟨m₁, hm₁, hrel₁⟩ := hsim₁.miri_step_of_anneal_step
+  have htag₀ : (ptr4ScalarAddrAnnealPre b 8).memory.nextTag = 1 := rfl
+  have hid₀ : (⟨(ptr4ScalarAddrMiriPre b unitK 8).machine.memory.nextAllocId,
+      AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = Witness.lm31AllocId1 := rfl
+  rw [htag₀, hid₀] at hrel₁
+  obtain ⟨_, himm₁_step⟩ := Witness.step_rawPtr_addrOf_preserves_ne hrel₀ rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty hm₁
+  have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+    fun tf₁ htf₁ k hne =>
+      himm₁_step _ tf₁ rfl htf₁ k hne (ptr4ScalarAddr_all_immediate b _ 8 _ rfl k)
+  let s₂ := mkPtrState b 0 2
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨8, 8⟩),
+      .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+    [entry.toBorrowEntry] 2
+  have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+  have hsim₂ := step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
+    (pointeeTy := tyOf u64K)
+    hrel₁ hphase rfl rfl rfl rfl (fun tf₁ htf₁ => himm₁ tf₁ htf₁ 2 (by decide))
+    rfl rfl (fun tf₁ htf₁ => himm₁ tf₁ htf₁ 3 (by decide))
+    usize_integral (fun tf₁ _ => constInt_wellTyped usize_integral valid8 (by decide) rfl b rfl tf₁)
+    u64_copyPointee (by decide)
+    (by
+      intro srcVal dstVal _ hsrc hdst _ _
+      have hsV : srcVal = .scalar ⟨8, 8⟩ := by
+        simpa [s₁, mkPtrState, get?] using hsrc.symm
+      have hdV : dstVal = .ptr { allocId := 1, offsetBytes := 0 } 8 := by
+        simpa [s₁, mkPtrState, get?] using hdst.symm
+      subst hsV hdV; exact ⟨rfl, rfl, rfl⟩)
+    (by intro _ _ _ _ _ _ hsrc; simp [s₁, mkPtrState, get?] at hsrc)
+    (by intro _ _ _ hsrc; simp [s₁, mkPtrState, get?] at hsrc)
+    (by intro _ _ _ _ _ hsrc; simp [s₁, mkPtrState, get?] at hsrc)
+  rw [hs₂] at hsim₂
+  obtain ⟨m₂, hm₂, hrel₂⟩ := hsim₂.miri_step_of_anneal_step
+  exact ⟨s₁, s₂, m₁, m₂, hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, rfl, rfl⟩
+
+/-- **`wit_lm4_2_copy_nonoverlapping_zero_null_ok`** (positive lockstep witness):
+from a `StateRelLM3_1`-related pre-state with `_2 : *mut u64` holding the aligned
+null address `0` (`0 as *mut u64`), real 2-step lockstep execution of
+`_3 = &raw mut _1` and `copy_nonoverlapping(copy _3, copy _2, 0_usize)`: both
+Stage-1 `stepMirFn` (`0 % align_of::<u64>() = 0`, so the zero-byte precheck
+accepts the null destination; matching `Terminators.evalCopyCall`, live Miri, and
+`CoreMemPtrIntrinsicsLM.cm_lm_trusted_null_zero_size_deltas`) and `lean-miri`
+(`checkAlign` accepts address `0`; `checkAndDerefPtr` returns `.ok none` for size
+`0`) step with `.ok true` to `StateRelLM3_1`-related states, leaving `_1 = 42_u64`
+and the null `_2` unchanged. -/
+theorem wit_lm4_2_copy_nonoverlapping_zero_null_ok :
+    ∃ (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState),
+      let b := copyZeroScalarDstBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4ScalarAddrAnnealPre b 0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4ScalarAddrMiriPre b unitK 0) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      get? s₂.frame.locals 1 = some (.init (.scalar ⟨42, 8⟩)) ∧
+      get? s₂.frame.locals 2 = some (.init (.scalar ⟨0, 8⟩)) := by
+  let b := copyZeroScalarDstBody
+  have hrel₀ : StateRel b (ptr4ScalarAddrAnnealPre b 0) (ptr4ScalarAddrMiriPre b unitK 0) :=
+    ptr4ScalarAddr_stateRel unitK rawMutU64K
+      [mkStmt42 (.assign (local42 3) (.rawPtr .mut (local42 1))), copyStmt 3 2 0] .return_
+      0 zc_scalarRel0
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  have himm₀ : ∀ tf, (ptr4ScalarAddrMiriPre b unitK 0).stack.frames = #[tf] →
+      IsImmediateFrameLocal tf 3 ∧ IsImmediateFrameLocal tf 1 :=
+    fun tf htf => ⟨ptr4ScalarAddr_all_immediate b _ 0 tf htf 3,
+      ptr4ScalarAddr_all_immediate b _ 0 tf htf 1⟩
+  let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+  let s₁ := mkPtrState b 0 1
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨0, 8⟩),
+      .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+    [entry.toBorrowEntry] 2
+  have hs₁ : stepMirFn b (ptr4ScalarAddrAnnealPre b 0) = .step s₁ := rfl
+  have hsim₁ := step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty
+  rw [hs₁] at hsim₁
+  obtain ⟨m₁, hm₁, hrel₁⟩ := hsim₁.miri_step_of_anneal_step
+  have htag₀ : (ptr4ScalarAddrAnnealPre b 0).memory.nextTag = 1 := rfl
+  have hid₀ : (⟨(ptr4ScalarAddrMiriPre b unitK 0).machine.memory.nextAllocId,
+      AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = Witness.lm31AllocId1 := rfl
+  rw [htag₀, hid₀] at hrel₁
+  obtain ⟨_, himm₁_step⟩ := Witness.step_rawPtr_addrOf_preserves_ne hrel₀ rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty hm₁
+  have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+    fun tf₁ htf₁ k hne =>
+      himm₁_step _ tf₁ rfl htf₁ k hne (ptr4ScalarAddr_all_immediate b _ 0 _ rfl k)
+  let s₂ := mkPtrState b 0 2
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨0, 8⟩),
+      .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+    [entry.toBorrowEntry] 2
+  have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+  have hsim₂ := step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
+    (pointeeTy := tyOf u64K)
+    hrel₁ hphase rfl rfl rfl rfl (fun tf₁ htf₁ => himm₁ tf₁ htf₁ 3 (by decide))
+    rfl rfl (fun tf₁ htf₁ => himm₁ tf₁ htf₁ 2 (by decide))
+    usize_integral (fun tf₁ _ => constInt_wellTyped usize_integral valid8 (by decide) rfl b rfl tf₁)
+    u64_copyPointee (by decide)
+    (by
+      intro srcVal dstVal _ hsrc hdst _ _
+      have hsV : srcVal = .ptr { allocId := 1, offsetBytes := 0 } 8 := by
+        simpa [s₁, mkPtrState, get?] using hsrc.symm
+      have hdV : dstVal = .scalar ⟨0, 8⟩ := by
+        simpa [s₁, mkPtrState, get?] using hdst.symm
+      subst hsV hdV; exact ⟨rfl, rfl, rfl⟩)
+    (by intro _ _ _ _ _ _ _ hdst; simp [s₁, mkPtrState, get?] at hdst)
+    (by intro _ _ _ _ hdst; simp [s₁, mkPtrState, get?] at hdst)
+    (by intro _ _ _ _ _ _ hdst; simp [s₁, mkPtrState, get?] at hdst)
+  rw [hs₂] at hsim₂
+  obtain ⟨m₂, hm₂, hrel₂⟩ := hsim₂.miri_step_of_anneal_step
+  exact ⟨s₁, s₂, m₁, m₂, hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, rfl, rfl⟩
 
 /-- Reusable 6-local MIR body (`_0 : (), _1 : u64, _2 : u64, _3 : *const u64, _4 : d₄, _5 : *mut u64`)
 for distinct-allocation `CopyNonOverlapping` witnesses. -/
@@ -2751,7 +3036,7 @@ theorem wit_lm4_2_copy_nonoverlapping_ok :
   let s₃ := mkPtrState b 0 3
     [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨42, 8⟩), .init ptr1, .init ptr2, .uninit]
     [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
-  have hs₃ : stepMirFn b s₂ = .step s₃ := rfl
+  have hs₃ : stepMirFn b s₂ = .step s₃ := by dsimp +zetaDelta only; rfl
   have hsim₃ := step_intrinsic_copyNonOverlapping_stage1_simulation_explicit (pointeeTy := tyOf u64K)
     hrel₂ hphase rfl rfl rfl rfl (fun tf₂ htf₂ => himm₂ tf₂ htf₂ 3 (by decide) (by decide))
     rfl rfl (fun tf₂ htf₂ => himm₂ tf₂ htf₂ 4 (by decide) (by decide))
@@ -3374,7 +3659,7 @@ theorem wit_lm4_2_copy_nonoverlapping_disjoint_subrange_divergence :
     obtain ⟨_, _, _, msc, hrel_sc, hread⟩ := hsc_spec ⟨0x00000000002A002A, 8⟩ rfl
     exact ⟨la₁, msc, hfind₁, hrel_sc, hread⟩
   exact ⟨s₁, s₂, s₃, s₄, m₁, m₂, m₃, m₄, m₅,
-    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄, rfl, hm₅,
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄, (by dsimp +zetaDelta only; rfl), hm₅,
     ⟨s₅, hrel₅, rfl⟩, hmem₁⟩
 
 /-- Body for cross-type `u64 -> u32` `copy_nonoverlapping` into an `.uninit` destination:
@@ -3610,7 +3895,7 @@ theorem wit_lm4_2_copy_nonoverlapping_cross_type_divergence :
     obtain ⟨_, _, _, msc, hrel_sc, hread⟩ := hsc_spec ⟨42, 4⟩ rfl
     exact ⟨la₂, msc, hfind₂, hrel_sc, hread⟩
   exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
-    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, ⟨_, rfl, rfl⟩, rfl, hm₄,
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, (by dsimp +zetaDelta only; exact ⟨_, rfl, rfl⟩), rfl, hm₄,
     ⟨s₄, hrel₄, rfl⟩, hmem₂⟩
 
 /-- Body for multi-element (`count = 2 > 1`) non-zero-offset (`offsetBytes = 2`)
@@ -3734,7 +4019,7 @@ theorem wit_lm4_2_copy_nonoverlapping_uninit_src_range_divergence :
     (.head _) rfl (.head _) rfl rfl rfl u64_integral u64_integral (by decide) (by decide)
     rfl (by simp [s₃, mkPtrState, entry, rawPtrAllocMapEntry, get?])
   exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
-    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, rfl, hm₄⟩
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, (by dsimp +zetaDelta only; rfl), hm₄⟩
 
 /-- Body for multi-element (`count = 2 > 1`) non-zero-offset (`offsetBytes = 2`)
 Tree Borrows `.frozen` permission divergence on `_1 : u64 = 42_u64`:
@@ -3879,7 +4164,7 @@ theorem wit_lm4_2_copy_nonoverlapping_perm_range_divergence :
     (Or.inr (by simp [s₄, mkPtrState, entry, rawPtrAllocMapEntry, get?]))
     (Or.inr (Or.inl rfl))
   exact ⟨s₁, s₂, s₃, s₄, m₁, m₂, m₃, m₄, m₅,
-    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄, rfl, hm₅⟩
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄, (by dsimp +zetaDelta only; rfl), hm₅⟩
 
 /-! ## 14. Pointee `layoutIdx := 0` and `isSingleDirect` Regression Witnesses -/
 
@@ -5086,9 +5371,12 @@ theorem wit_lm4_2_copy_nonoverlapping_rawPtr_cast_lockstep_boundary :
     rfl rfl (fun tf₄ htf₄ => himm₄ tf₄ htf₄ 5 (by decide) (by decide)) (by nofun)
     usize_integral (fun tf₄ _ => constInt_wellTyped usize_integral valid8 (by decide) rfl b rfl tf₄)
     (Or.inl ⟨_, rfl, rfl⟩)
-  exact ⟨s₁, s₂, s₃, s₄, _, m₁, m₂, m₃, m₄, m₅,
+  obtain ⟨s₅, hs₅, hloc₅⟩ : ∃ s₅, stepMirFn b s₄ = .step s₅ ∧
+      get? s₅.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) := by
+    dsimp +zetaDelta only; exact ⟨_, rfl, rfl⟩
+  exact ⟨s₁, s₂, s₃, s₄, s₅, m₁, m₂, m₃, m₄, m₅,
     hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
-    rfl, rfl, rfl, rfl, hm₅⟩
+    rfl, rfl, hs₅, hloc₅, hm₅⟩
 
 /-! ## 7. Stage-1 `arith_offset` on provenance-free `.scalar` pointer & `Stage1ExtraIntrinsic` witnesses -/
 

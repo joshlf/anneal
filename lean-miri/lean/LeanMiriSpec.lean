@@ -413,13 +413,14 @@ import LeanMiriSpec.Audit
   (`core::intrinsics::wrapping_offset` and `std::intrinsics::*`, which
   `rustc-capture` never emits and Stage-1 routes to `MirStepNode.extCall`).
 * `LeanMiriSpec.Correspondence.WitLM4_2`: concrete Stage-1 lockstep (including
+  zero-count `copy_nonoverlapping` UB agreement on a misaligned pointer, positive
+  zero-count lockstep through aligned dangling and aligned null pointers,
   distinct-local out-of-bounds UB via `copyAccessFitsAlloc?` and full-byte
   multi-element `copyBytesSubplace`), Stage-1 boundary (`extCall`,
   `Stage1ExtraIntrinsic`, multi-byte partial scalar `copy_nonoverlapping`
   `MirStepNode.unsupported`, and 5-step lockstep `TyId 80` pointer-valued
   `copy_nonoverlapping` on initialized pointer operands), and Stage-1 divergence
-  witnesses for `LM-4.2` (Stage-1 `Trusted` accepts zero-count misaligned
-  `copy_nonoverlapping`, rejects same-tag disjoint copies, stores ill-sized values
+  witnesses for `LM-4.2` (Stage-1 `Trusted` rejects same-tag disjoint copies, stores ill-sized values
   on cross-type copies, clobbers the whole destination on `count = 1` cross-width
   copies in 5-step lockstep, and rejects provenance-free `.scalar`
   pointers in `arith_offset`).

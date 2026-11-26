@@ -1457,3 +1457,63 @@ pub fn ub_shared_temp_unsafe_cell_raw_const_cast_mut_write() -> u32 {
         *frozen
     }
 }
+
+// ============================================================================
+// Category 12: Zero-Count `copy_nonoverlapping` Alignment and Null Guards
+// ============================================================================
+//
+// `core::intrinsics::copy_nonoverlapping` lowers to the MIR statement
+// `NonDivergingIntrinsic::CopyNonOverlapping`. The `# Safety` contract of
+// `copy_nonoverlapping` at rustc `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`
+// waives validity when `count * size_of::<T>()` is `0` but still requires
+// alignment, and a null pointer is never valid for a non-zero access. These
+// four seeds pin both halves on `u64` elements:
+// - a misaligned pointer is UB even when `count = 0`;
+// - an aligned dangling pointer (`8usize as *mut u64`, the address of
+//   `NonNull::<u64>::dangling()`; `NonNull::dangling` itself is an uncaptured
+//   call under `-Zmir-opt-level=0`) and an aligned null pointer
+//   (`0usize as *mut u64`) are accepted when `count = 0`;
+// - a null pointer is UB when `count = 1`.
+
+/// Upstream source: `tests/fail/intrinsics/copy_unaligned.rs`
+pub fn ub_copy_nonoverlapping_zero_misaligned() -> u32 {
+    let mut x: u64 = 42;
+    let base: *mut u8 = (&raw mut x) as *mut u8;
+    let p: *mut u64 = unsafe { offset(base, 1isize) } as *mut u64;
+    unsafe {
+        copy_nonoverlapping(p as *const u64, p, 0usize);
+    }
+    x as u32
+}
+
+/// Upstream source: `tests/pass/zero-sized-accesses-and-offsets.rs`
+pub fn pass_copy_nonoverlapping_zero_dangling() -> u32 {
+    let mut x: u64 = 61;
+    let dangling: *mut u64 = 8usize as *mut u64;
+    unsafe {
+        copy_nonoverlapping(dangling as *const u64, &raw mut x, 0usize);
+        copy_nonoverlapping(&raw const x, dangling, 0usize);
+    }
+    x as u32
+}
+
+/// Upstream source: `tests/pass/zero-sized-accesses-and-offsets.rs`
+pub fn pass_copy_nonoverlapping_zero_null() -> u32 {
+    let mut x: u64 = 73;
+    let null: *mut u64 = 0usize as *mut u64;
+    unsafe {
+        copy_nonoverlapping(null as *const u64, &raw mut x, 0usize);
+        copy_nonoverlapping(&raw const x, null, 0usize);
+    }
+    x as u32
+}
+
+/// Upstream source: `tests/fail/intrinsics/copy_null.rs`
+pub fn ub_copy_nonoverlapping_nonzero_null() -> u32 {
+    let mut x: u64 = 85;
+    let null: *const u64 = 0usize as *const u64;
+    unsafe {
+        copy_nonoverlapping(null, &raw mut x, 1usize);
+    }
+    x as u32
+}

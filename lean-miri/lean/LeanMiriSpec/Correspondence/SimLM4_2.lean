@@ -56,8 +56,12 @@ by `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`):
 * `step_intrinsic_copyNonOverlapping_simulation` (with explicit `allocMap'`
   counterpart `step_intrinsic_copyNonOverlapping_simulation_explicit`; proved in
   `CopyLM4_2`). Stage-1 `evalCopyNonOverlapping` diverges from the reference
-  model on zero-count misaligned, multi-element out-of-bounds, same-tag disjoint
-  sub-range, and cross-type copies; see `WitLM4_2.lean` §6.
+  model on multi-element out-of-bounds, same-tag disjoint sub-range, and
+  cross-type copies; see `WitLM4_2.lean` §6. On zero-count copies both machines
+  check alignment (`wit_lm4_2_copy_nonoverlapping_zero_misaligned_ub_agreement`)
+  and accept aligned null and dangling pointers
+  (`wit_lm4_2_copy_nonoverlapping_zero_null_ok`,
+  `wit_lm4_2_copy_nonoverlapping_zero_dangling_ok`).
 * `call_intrinsic_write_bytes_simulation` (with
   `call_intrinsic_write_bytes_simulation_explicit` and
   `call_intrinsic_write_bytes_perm_divergence`; proved in `WriteBytesLM4_2`):
@@ -89,8 +93,7 @@ by `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`):
    (`stepMirFn_stage1_std_offset_alias_extCall`).
 3. **Stage-1 `Trusted` divergences** (certified, but not fixable under
    `lean-miri/lean/**`):
-   * `copy_nonoverlapping` accepts zero-count misaligned copies;
-   * it does not bounds-check distinct scalar locals and copies the whole source
+   * `copy_nonoverlapping` does not bounds-check distinct scalar locals and copies the whole source
      value: out-of-bounds acceptance, partial-copy clobbering, ill-sized values on
      cross-type copies;
    * it rejects same-tag disjoint ranges;

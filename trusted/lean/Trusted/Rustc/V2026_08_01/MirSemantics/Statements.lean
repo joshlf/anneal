@@ -133,14 +133,15 @@ a single pointee layout entry in `TypeLayout.fieldLayouts`.
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1705-L1725>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L2102-L2122>
 
-> "pub struct LayoutData<FieldIdx, VariantIdx> {
+> "pub struct LayoutData<FieldIdx: Idx, VariantIdx: Idx> {
+>     /// Says where the fields are located within the layout.
 >     pub fields: FieldsShape<FieldIdx>,
+> ...
 >     pub variants: Variants<FieldIdx, VariantIdx>,
->     pub abi: BackendRepr,
->     ...
-> }"
+> ...
+>     pub backend_repr: BackendRepr,"
 -/
 @[reducible]
 def operandPointeeTy
@@ -4448,7 +4449,8 @@ Modeling choice: allocation addresses are chosen by the abstract machine, so a
 precondition violated for some placement compatible with the root local's
 alignment is undefined behavior; the canonical `stackLocalAddrPageBase` page
 address used for pointer comparisons is not a real alignment guarantee and is
-never consulted. Root-frame caller referents (`callerLocals`) have no
+never consulted here (integer addresses derived from it by exposing provenance
+are handled by `checkZeroCountCopyPtr`). Root-frame caller referents (`callerLocals`) have no
 declaration in the target frame and are undetermined.
 -/
 def stackBorrowAlignKnown
@@ -4594,7 +4596,9 @@ power of two):
 - an integer address (`.scalar`, or a provenance-free unbacked `.ptr` with
   `allocId = 0`, whose `offsetBytes` must be `< 2^(8 * ptrBytes)`) must satisfy
   `addr % elemAlign = 0` (so aligned null and aligned `NonNull::dangling()`
-  are accepted, misaligned addresses are `.ub`);
+  are accepted, misaligned addresses are `.ub`), except that an aligned
+  integer address with `elemAlign > 1` is undetermined (`.unsupported`) once
+  any allocation's provenance has been exposed (`exposedAllocIds ≠ []`);
 - a provenance pointer is checked by `stackBorrowAlignKnown` (stack borrow
   tag), `globalAllocAlignKnown` (captured global), or `unbackedAlignKnown`
   (function pointer or other unbacked allocation).
@@ -4624,6 +4628,17 @@ commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 Justification: when the copied byte count is `0` the validity requirement is
 discharged by its "or that number must be 0" clause (so null and dangling
 pointers are permitted), while the alignment requirement still applies.
+
+Modeling choice: an integer address is the concrete runtime address only while
+no provenance has been exposed. `evalPointerExposeProvenance` reports the
+canonical `allocId * 65536 + offsetBytes` address of an exposed allocation,
+which is not a real alignment guarantee (the abstract machine may place the
+allocation at any address that is a multiple of its own alignment), so once
+`s.memory.exposedAllocIds` is non-empty an integer address that is aligned in
+the canonical numbering may be misaligned in some execution and is reported as
+undetermined (`.unsupported`) when `elemAlign > 1`. A canonical address that is
+misaligned stays `.ub`: placing the allocation at a multiple of `elemAlign`
+yields a misaligned execution.
 -/
 def checkZeroCountCopyPtr
     (s : MachineState)
@@ -4641,7 +4656,10 @@ def checkZeroCountCopyPtr
     | false => .ub
     | true =>
       match Bool.or (Nat.ble elemAlign 1) (Nat.beq (Nat.mod sv.bits elemAlign) 0) with
-      | true => .ok
+      | true =>
+        match Nat.ble elemAlign 1, s.memory.exposedAllocIds with
+        | false, _ :: _ => .unsupported
+        | _, _ => .ok
       | false => .ub
   | .ptr p sz =>
     match Nat.beq sz ptrBytes with
@@ -4663,7 +4681,10 @@ def checkZeroCountCopyPtr
               match
                 Bool.or (Nat.ble elemAlign 1) (Nat.beq (Nat.mod p.offsetBytes elemAlign) 0)
               with
-              | true => .ok
+              | true =>
+                match Nat.ble elemAlign 1, s.memory.exposedAllocIds with
+                | false, _ :: _ => .unsupported
+                | _, _ => .ok
               | false => .ub
           | _, _ => ZeroCheck.ofAligned? (unbackedAlignKnown p.offsetBytes elemAlign)
   | _ => .ub
@@ -4746,14 +4767,15 @@ entry `ptLayoutIdx`, `ptLayoutIdx` is the authoritative pointee layout index
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1705-L1725>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L2102-L2122>
 
-> "pub struct LayoutData<FieldIdx, VariantIdx> {
+> "pub struct LayoutData<FieldIdx: Idx, VariantIdx: Idx> {
+>     /// Says where the fields are located within the layout.
 >     pub fields: FieldsShape<FieldIdx>,
+> ...
 >     pub variants: Variants<FieldIdx, VariantIdx>,
->     pub abi: BackendRepr,
->     ...
-> }"
+> ...
+>     pub backend_repr: BackendRepr,"
 -/
 def operandPointeeLookup
     (localDecls : List LocalDecl)

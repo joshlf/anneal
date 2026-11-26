@@ -22777,7 +22777,7 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
       0 < countSc.bits * elemBytes →
-      countSc.bits * elemBytes ≤ isizeMaxBytes →
+      countSc.bits * elemBytes ≤ Correspondence.isizeMaxBytes →
       e_s ∈ allocMap → e_s.tag = srcPtr.tag →
       e_d ∈ allocMap → e_d.tag = dstPtr.tag →
       get? body.localDecls e_s.localIdx = some decl_s →
@@ -22866,7 +22866,7 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
       0 < countSc.bits * elemBytes →
-      countSc.bits * elemBytes ≤ isizeMaxBytes →
+      countSc.bits * elemBytes ≤ Correspondence.isizeMaxBytes →
       e ∈ allocMap → e.tag = ptrVal.tag →
       get? body.localDecls e.localIdx = some tgtDecl →
       IsIntegralTy tgtDecl.ty tgtKind →
@@ -23335,9 +23335,41 @@ example :
       stepMirFn b s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       StateRelLM3_1 b s₄ m₄ [entry] ∧
-      stepMirFn b s₄ = .step (advanceStmt s₄ s₄.frame.locals) ∧
+      stepMirFn b s₄ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .error (.undefinedBehavior msg)) :=
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_misaligned_ub_agreement
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState),
+      let b := copyZeroScalarSrcBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4ScalarAddrAnnealPre b 8) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4ScalarAddrMiriPre b unitK 8) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      get? s₂.frame.locals 1 = some (.init (.scalar ⟨42, 8⟩)) ∧
+      get? s₂.frame.locals 2 = some (.init (.scalar ⟨8, 8⟩)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_dangling_ok
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState),
+      let b := copyZeroScalarDstBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4ScalarAddrAnnealPre b 0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4ScalarAddrMiriPre b unitK 0) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      get? s₂.frame.locals 1 = some (.init (.scalar ⟨42, 8⟩)) ∧
+      get? s₂.frame.locals 2 = some (.init (.scalar ⟨0, 8⟩)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_null_ok
 
 open WitnessLM4_2 in
 example :
@@ -23638,7 +23670,9 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
       countSc.bits = 0 →
       ptrValueAligned elemAlign srcVal = true ∧
-        ptrValueAligned elemAlign dstVal = true)
+        ptrValueAligned elemAlign dstVal = true ∧
+        zeroByteCopyPrecheck s s.frame.locals body.localDecls body.layouts elemAlign
+          srcVal dstVal = .ok)
     (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
@@ -23669,14 +23703,17 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       get? s.frame.locals e_d.localIdx ≠ some .dead →
       e_s.perm ≠ .disabled ∧
         (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
-        get? s.frame.locals e_s.localIdx ≠ some .uninit) :
+        get? s.frame.locals e_s.localIdx ≠ some .uninit)
+    (hres : resolveCopyElemLayout body.localDecls body.layouts (.copy ⟨srcIdx, []⟩)
+      (.copy ⟨dstIdx, []⟩) = .ok elemBytes elemAlign)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m
       (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
   step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
     hstate hphase hbb hstmt hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
-    hcountInt hcountOp hpt helem_pos hzero_align htgt_same hptr_single hlive_ok
+    hcountInt hcountOp hpt helem_pos hzero_align htgt_same hptr_single hlive_ok hres hptr8
 
 open WitnessLM4_2 in
 example :
@@ -23924,7 +23961,10 @@ example
     (hw_eq : integerKindByteWidth dstKind = integerKindByteWidth srcKind)
     (hfull : countSc.bits * elemBytes = integerKindByteWidth srcKind)
     (hsc_sz : srcSc.sizeBytes = integerKindByteWidth srcKind)
-    (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind)) :
+    (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind))
+    (hres : resolveCopyElemLayout body.localDecls body.layouts (.copy ⟨srcIdx, []⟩)
+      (.copy ⟨dstIdx, []⟩) = .ok elemBytes elemAlign)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m
       (copyStage1FullBytesNextAllocMap s.frame.locals allocMap srcIdx dstIdx countOp elemBytes)
       (stepMirFn body s)
@@ -23933,7 +23973,7 @@ example
     hstate hphase hbb hstmt hprim hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
     hcountInt hcountOp hpt hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos
     he_s het_s he_d het_d hperm_s hperm_d hne_loc hunion_s hunion_d
-    hslot_s hslot_d hdecl_s hsrcInt hdecl_d hdstInt hw_eq hfull hsc_sz hsc_lt
+    hslot_s hslot_d hdecl_s hsrcInt hdecl_d hdstInt hw_eq hfull hsc_sz hsc_lt hres hptr8
 
 open LeanMiriSpec.Correspondence in
 #assert_standard_axioms
@@ -24078,7 +24118,12 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_overlap_ub
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_oob_ub
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_overflow_ub
-  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_misaligned_ub_agreement
+  WitnessLM4_2.zc_scalarRel8
+  WitnessLM4_2.zc_scalarRel0
+  WitnessLM4_2.ptr4ScalarAddr_stateRel
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_dangling_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_null_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_disjoint_subrange_divergence
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_cross_type_divergence

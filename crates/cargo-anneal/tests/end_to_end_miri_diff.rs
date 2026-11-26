@@ -134,7 +134,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         manifest.rustc_commit,
         "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"
     );
-    assert_eq!(manifest.tests.len(), 112);
+    assert_eq!(manifest.tests.len(), 116);
 
     // Every `known_anneal_bug` must have status == "open_bug" and diverge from
     // `miri_verdict` (either by tag or by `ub_location_mismatch`); none remain
@@ -429,18 +429,18 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         rustc_wrapper: Some(wrapper_bin.clone()),
     };
 
-    let report = run_miri_diff_suite(&config).expect("112-test Miri differential suite must pass");
-    assert_eq!(report.total_tests, 112);
-    assert_eq!(report.verified_pass_count, 52);
+    let report = run_miri_diff_suite(&config).expect("116-test Miri differential suite must pass");
+    assert_eq!(report.total_tests, 116);
+    assert_eq!(report.verified_pass_count, 54);
     assert_eq!(report.verified_panic_count, 12);
-    assert_eq!(report.verified_strict_ub_count, 48);
+    assert_eq!(report.verified_strict_ub_count, 50);
     assert_eq!(report.ratcheted_known_bug_count, 0);
-    // 52 pass + 12 panic + 2 helper subjects (`helper_add_ten` and the empty
-    // `Drop::drop` of Category 9's `UnwindCleanupGuard`) = 66 certificate
+    // 54 pass + 12 panic + 2 helper subjects (`helper_add_ten` and the empty
+    // `Drop::drop` of Category 9's `UnwindCleanupGuard`) = 68 certificate
     // modules. Category 9's call-chain helpers and Category 11's probes and
     // `static`s are `__ANNEAL_MODEL_*` model items: never certified on their
     // own.
-    assert_eq!(report.audited_certificate_modules.len(), 66);
+    assert_eq!(report.audited_certificate_modules.len(), 68);
     for helper in [
         "Verify.MiriDiffCorpus.helper_add_ten",
         "Verify.MiriDiffCorpus.UnwindCleanupGuard_as_core_ops_Drop_drop",
@@ -493,7 +493,7 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     );
 
     let summary = render_miri_diff_report(&report);
-    assert!(summary.contains("Total corpus tests:              112"));
+    assert!(summary.contains("Total corpus tests:              116"));
     assert!(summary.contains("Verified `panic` (SafePanic):    12"));
     assert!(summary.contains("of which modular (frame rely): 1"));
     assert!(summary.contains("Open Anneal bugs (ratcheted):    0"));

@@ -296,8 +296,7 @@ concrete real-step instances in the `Wit*` modules:
 * `LM-4.2` (Stage-1 `Trusted` behavior that `lean-miri/lean/**` cannot change):
   * `CopyNonOverlapping` from an uninitialized source and through a frozen
     borrow (`step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence`,
-    `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), Stage-1's
-    acceptance of zero-count misaligned copies, missing bounds check on distinct
+    `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), missing bounds check on distinct
     scalar locals (out-of-bounds acceptance, partial-copy clobbering, cross-type
     copies), and rejection of same-tag disjoint ranges (`WitLM4_2.lean` §6, §7,
     §14, §15), plus the `TyId 80` `lean-miri` encoding boundary on pointer-valued

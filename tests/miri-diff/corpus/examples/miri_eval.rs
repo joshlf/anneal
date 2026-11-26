@@ -258,6 +258,16 @@ fn main() {
             print_u32(ub_shared_temp_unsafe_cell_raw_const_cast_mut_write())
         }
 
+        // Category 12: Zero-count `copy_nonoverlapping` alignment and null guards
+        "ub_copy_nonoverlapping_zero_misaligned" => {
+            print_u32(ub_copy_nonoverlapping_zero_misaligned())
+        }
+        "pass_copy_nonoverlapping_zero_dangling" => {
+            print_u32(pass_copy_nonoverlapping_zero_dangling())
+        }
+        "pass_copy_nonoverlapping_zero_null" => print_u32(pass_copy_nonoverlapping_zero_null()),
+        "ub_copy_nonoverlapping_nonzero_null" => print_u32(ub_copy_nonoverlapping_nonzero_null()),
+
         other => {
             eprintln!("unknown test: {other}");
             std::process::exit(2);

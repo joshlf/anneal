@@ -70,11 +70,11 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 112 tests: 52 `pass`, 12 `panic` (11 certified via
+The corpus holds 116 tests: 54 `pass`, 12 `panic` (11 certified via
 `verifySafePanicMirPointBounded` and `panic_explicit_macro` via
-`verifyModularSafePanicMirBounded`), and 48 `ub`, grouped into eleven categories
+`verifyModularSafePanicMirBounded`), and 50 `ub`, grouped into twelve categories
 that `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
-Anneal agrees with Miri on all 112 tests: `manifest.toml` records no open
+Anneal agrees with Miri on all 116 tests: `manifest.toml` records no open
 `known_anneal_bug` entry.
 Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
 (`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
@@ -266,9 +266,11 @@ statement) or agreement with Miri:
   UB at the `copy_nonoverlapping` (`false_positive_ub`,
   `sound_conservative_abstraction`), both when a candidate calls a probe and
   when it runs the probe's body in the root frame. Zero-byte same-tag copies
-  (`count == 0` on `[u32; 4]` and `[u8; 8]`, plus `count == 1` on `()` in
-  `Statements.lean`'s `evalCopySingleDirect`) likewise report `false_positive_ub`,
-  whereas same-tag disjoint byte copies inside `OverlayU32` (`evalCopyUnionBytes`
+  (`count == 0` on `[u32; 4]` and `[u8; 8]`, plus `count == 1` on `()`) no
+  longer reach a same-tag guard: the zero-byte fragment of `Statements.lean`'s
+  `evalCopyNonOverlappingWithCount` checks only pointer alignment, so they are
+  expected to agree with Miri (their pin accepts agreement or the former
+  `false_positive_ub`), whereas same-tag disjoint byte copies inside `OverlayU32` (`evalCopyUnionBytes`
   via `rangesDisjoint`) and true same-tag overlaps on both `[u32; 4]` and
   `[u8; 8]` agree with Miri today.
 - `static` accesses. Anneal reports UB at the first access to any `static`,
@@ -288,6 +290,25 @@ statement) or agreement with Miri:
   before its frozen write, so it agrees with Miri only once both this gap and
   the `static` gap are fixed. Its manifest twin writes no `UnsafeCell` field
   and agrees.
+
+Category 12 adds 4 tests that pin the zero-count alignment and null rules of
+`core::intrinsics::copy_nonoverlapping` (MIR
+`NonDivergingIntrinsic::CopyNonOverlapping`) on `u64` elements. The intrinsic
+waives pointer validity when `count * size_of::<T>()` is `0`, but still
+requires both pointers to be aligned, and a null pointer is never valid for a
+non-zero access:
+
+| Theme | Tests |
+| :--- | :--- |
+| Misaligned pointer with `count = 0` | `ub_copy_nonoverlapping_zero_misaligned` (`offset((&raw mut x) as *mut u8, 1isize) as *mut u64` as both `src` and `dst`; Miri: `accessing memory with alignment 1, but alignment 8 is required`) |
+| Aligned dangling and aligned null pointers with `count = 0` | `pass_copy_nonoverlapping_zero_dangling` (`8usize as *mut u64`, the address of `NonNull::<u64>::dangling()`, as `src` and then as `dst`, returning `61`), `pass_copy_nonoverlapping_zero_null` (`0usize as *mut u64` as `src` and then as `dst`, returning `73`) |
+| Null pointer with `count = 1` | `ub_copy_nonoverlapping_nonzero_null` (`0usize as *const u64` as `src`; Miri: `attempting to access 8 bytes, but got null pointer`) |
+
+The dangling seed uses the integer address `8` instead of calling
+`NonNull::dangling`: under `-Zmir-opt-level=0` that call is not inlined, so it
+would remain an uncaptured external call. The null seeds cast the integer `0`
+for the same reason (`core::ptr::without_provenance` is also an uncaptured
+call).
 
 ## Policy on `known_anneal_bug` Entries
 
@@ -318,7 +339,7 @@ statement) or agreement with Miri:
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
-The suite currently exposes no open Anneal bug: all 112 tests agree with Miri.
+The suite currently exposes no open Anneal bug: all 116 tests agree with Miri.
 
 ## Running the Suite
 

@@ -54,11 +54,19 @@ correspondence-local copy of the **pre-Stage-1** (`origin/sup/lm-0` at
   (single-element primitive writes at offset `0`, `.ub` past the end of a whole
   local, `.unsupported` on untracked pointers and other shapes), which is not
   `evalWriteBytesCall` below;
-* Stage-1 `evalCopyNonOverlapping` (`Statements.lean:1739`) differs from
-  `evalCopyNonOverlappingLM4_2` (no alignment check when `count = 0`, no bounds
-  check on distinct-local multi-element copies, same-tag ranges always treated
-  as overlapping, whole-value single-element copies across pointee types); see
-  the Stage-1 divergence witnesses of `WitLM4_2.lean` §6.
+* Stage-1 `evalCopyNonOverlapping` (`Statements.lean`) differs from
+  `evalCopyNonOverlappingLM4_2` (no bounds check on distinct-local
+  multi-element copies, same-tag ranges always treated as overlapping,
+  whole-value single-element copies across pointee types, and a zero-byte
+  precheck that resolves provenance pointers to their backing allocation and
+  fails closed when their alignment is undetermined, and on aligned integer
+  addresses once any provenance has been exposed); see the Stage-1
+  divergence witnesses of `WitLM4_2.lean` §6. Both check alignment when
+  `count = 0` and (while no provenance has been exposed) accept aligned null
+  and aligned dangling pointers there
+  (`wit_lm4_2_copy_nonoverlapping_zero_misaligned_ub_agreement`,
+  `wit_lm4_2_copy_nonoverlapping_zero_dangling_ok`,
+  `wit_lm4_2_copy_nonoverlapping_zero_null_ok`).
 
 Every theorem whose Anneal side is `stepMirFnLM4_2` (or one of the definitions
 above) is therefore a statement about this reference model only, and says
@@ -724,8 +732,9 @@ def evalCopyRootIntScalars
 
 /-- Pre-Stage-1 reference `copy_nonoverlapping` evaluator once `srcVal`, `dstVal`,
 and `countBits` have been evaluated into `locals₃` (**not** Stage-1
-`evalCopyNonOverlappingWithCount`, `Statements.lean:1688`, which skips every check
-when `countBits = 0` and does not bounds-check scalar-root copies). -/
+`evalCopyNonOverlappingWithCount` (`Statements.lean`), which resolves the
+element layout, runs a provenance-aware zero-byte alignment precheck, and does
+not bounds-check scalar-root copies). -/
 def evalCopyNonOverlappingWithCountLM4_2
     (s : MachineState)
     (src dst : Operand)
