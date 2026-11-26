@@ -70,6 +70,20 @@ its CFG, with no fixed-point iteration in the kernel:
    full-coverage reverse-postorder schedule modulo the Bourdoncle
    `cutpoints`, materializes the acyclic block invariants in one forward pass,
    and checks the result with `checkMirCert`.
+3. `AutoProve` (section 9) synthesizes the remaining inputs of
+   `verifyMirCutpoints` for bodies whose parameters and return place are
+   unsigned or signed integers, `bool`, or `()`:
+   `AutoProve.buildEntryEnv?` builds the entry frame from the declared
+   parameter types, `AutoProve.autoRetSlot?` the top return invariant, and
+   `AutoProve.defaultRpoOrder` a reverse-postorder schedule by fuel-bounded
+   depth-first search (it terminates on cyclic CFGs, and its result is
+   re-validated by `validRpoSchedule`). One `rfl` proof of
+   `AutoProve.autoVerifyAcyclic body = true` then gives
+   `AutoProve.autoVerifyAcyclic_sound` for every `AutoProve.ValidEntryArgs`
+   argument list and the trusted certificate
+   `AutoProve.bodyVerified_of_autoVerifyAcyclic`;
+   `AutoProve.autoVerifyCutpoints` does the same for loops with Bourdoncle
+   cutpoints.
 
 Every definition is computable and every theorem depends only on `propext`
 and `Quot.sound`.
@@ -1575,5 +1589,513 @@ theorem verifyMirCutpoints_traceVerificationResult
       c.post args mem tr (.normal (retVal, mem'))) :
     Trusted.VerificationResult.TraceVerificationResult c :=
   checkMirCert_traceVerificationResult (bool_and_true_right hVer) hPre hPost
+
+/-! ## 9. Zero-Manual-WP Auto-Proof Front-End (`AutoProve`) -/
+
+namespace AutoProve
+
+/-- Top initialized abstract slot of a supported parameter or return type:
+unsigned integers (`.uint u`), signed integers (`.int i`, tracked by bit
+pattern), `bool`, and `()` (`.tuple []`). Every other type is unsupported
+(`none`). -/
+def argTopAbsSlot? (ty : Ty) : Option MirAbsSlot :=
+  match ty.kind with
+  | .uint u => some (.uint u (AbsVal.topInit (uintWidth u)))
+  | .int i => some (.sint i (AbsVal.topInit (uintWidth (intTwin i))))
+  | .bool => some (.bool (.top .none))
+  | .tuple [] => some (.unit true)
+  | _ => none
+
+/-- `v` is a well-formed argument value of a supported type `ty`: an in-range
+integer scalar of the declared byte width, a canonical `bool` scalar, or the
+unit value. No value is valid at an unsupported type. -/
+def ValidEntryArgVal (ty : Ty) (v : Value) : Prop :=
+  match ty.kind with
+  | .uint u =>
+    ∃ bits, v = .scalar ⟨bits, uintBytes u⟩ ∧ bits < modPow2 (uintWidth u)
+  | .int i =>
+    ∃ bits, v = .scalar ⟨bits, uintBytes (intTwin i)⟩ ∧
+      bits < modPow2 (uintWidth (intTwin i))
+  | .bool => ∃ b, v = .scalar (boolToScalar b)
+  | .tuple [] => v = .unit ∨ v = .aggregate 0 []
+  | _ => False
+
+/-- The top slot of a supported type is guard-free and describes every valid
+argument value of that type. -/
+theorem argTopAbsSlot?_sound {ty : Ty} {slot : MirAbsSlot} {v : Value}
+    (hSlot : argTopAbsSlot? ty = some slot) (hVal : ValidEntryArgVal ty v) :
+    slot.noRelGuard = true ∧ slot.valDenote ty v := by
+  unfold argTopAbsSlot? at hSlot
+  unfold ValidEntryArgVal at hVal
+  cases hk : ty.kind with
+  | uint u =>
+    rw [hk] at hSlot hVal
+    injection hSlot with hS
+    subst hS
+    cases hVal with
+    | intro bits hb =>
+      rw [hb.1]
+      exact ⟨rfl, hk, rfl, absVal_topInit_sound hb.2⟩
+  | int i =>
+    rw [hk] at hSlot hVal
+    injection hSlot with hS
+    subst hS
+    cases hVal with
+    | intro bits hb =>
+      rw [hb.1]
+      exact ⟨rfl, hk, rfl, absVal_topInit_sound hb.2⟩
+  | bool =>
+    rw [hk] at hSlot hVal
+    injection hSlot with hS
+    subst hS
+    cases hVal with
+    | intro b hb =>
+      rw [hb]
+      exact ⟨rfl, hk, boolAbs_denote_of_bool (ba := .top .none) True.intro⟩
+  | tuple ts =>
+    cases ts with
+    | nil =>
+      rw [hk] at hSlot hVal
+      injection hSlot with hS
+      subst hS
+      exact ⟨rfl, hk, hVal⟩
+    | cons _ _ => rw [hk] at hSlot; nomatch hSlot
+  | _ => rw [hk] at hSlot; nomatch hSlot
+
+/-- Top argument slots for the first `n` parameter declarations of `ds`
+(`none` if there are fewer than `n` declarations or any has an unsupported
+type). -/
+def argSlotsAux : Nat → List LocalDecl → Option (List MirAbsSlot)
+  | 0, _ => some []
+  | _ + 1, [] => none
+  | n + 1, d :: ds =>
+    match argTopAbsSlot? d.ty, argSlotsAux n ds with
+    | some s, some rest => some (s :: rest)
+    | _, _ => none
+
+/-- Top argument slots for the `body.argCount` parameters `_1 ..` of `body`. -/
+def buildArgSlots? (body : CapturedMir) : Option (List MirAbsSlot) :=
+  argSlotsAux body.argCount (body.localDecls.drop 1)
+
+/-- `args` supplies exactly one valid value for each of the first `n`
+parameter declarations of `ds`. -/
+def ValidEntryArgsAux : Nat → List LocalDecl → List Value → Prop
+  | 0, _, args => args = []
+  | n + 1, d :: ds, v :: vs => ValidEntryArgVal d.ty v ∧ ValidEntryArgsAux n ds vs
+  | _ + 1, _, _ => False
+
+/-- `args` is a valid argument list for `body`: exactly `body.argCount` values,
+each a `ValidEntryArgVal` of the declared type of its parameter local. -/
+def ValidEntryArgs (body : CapturedMir) (args : List Value) : Prop :=
+  ValidEntryArgsAux body.argCount (body.localDecls.drop 1) args
+
+/-- The top argument slots satisfy `entryArgsOk` on every valid argument
+list. -/
+theorem argSlotsAux_sound :
+    ∀ (n : Nat) (ds : List LocalDecl) (slots : List MirAbsSlot)
+      (args : List Value),
+      argSlotsAux n ds = some slots → ValidEntryArgsAux n ds args →
+      entryArgsOk ds slots args
+  | 0, ds, slots, args, hS, hA => by
+    have hS' : some [] = some slots := hS
+    have hA' : args = [] := hA
+    injection hS' with hS'
+    subst hS'
+    subst hA'
+    exact entryArgsOk_nil ds
+  | _ + 1, [], _, _, hS, _ => nomatch hS
+  | _ + 1, _ :: _, _, [], _, hA => nomatch hA
+  | n + 1, d :: ds, slots, v :: vs, hS, hA => by
+    have hS' : (match argTopAbsSlot? d.ty, argSlotsAux n ds with
+        | some s, some rest => some (s :: rest)
+        | _, _ => none) = some slots := hS
+    cases h1 : argTopAbsSlot? d.ty with
+    | none => rw [h1] at hS'; nomatch hS'
+    | some s =>
+      cases h2 : argSlotsAux n ds with
+      | none => rw [h1, h2] at hS'; nomatch hS'
+      | some rest =>
+        rw [h1, h2] at hS'
+        injection hS' with hS'
+        subst hS'
+        have hs := argTopAbsSlot?_sound h1 hA.1
+        exact ⟨hs.1, hs.2, argSlotsAux_sound n ds rest vs h2 hA.2⟩
+
+/-- `buildArgSlots?` yields argument slots satisfying `entryArgsOk` on every
+valid argument list. -/
+theorem buildArgSlots?_sound {body : CapturedMir} {argSlots : List MirAbsSlot}
+    {args : List Value} (hSlots : buildArgSlots? body = some argSlots)
+    (hArgs : ValidEntryArgs body args) :
+    entryArgsOk (body.localDecls.drop 1) argSlots args :=
+  argSlotsAux_sound _ _ _ _ hSlots hArgs
+
+/-- Default top return invariant derived from the declared type of the return
+place `_0` (`none` for an unsupported return type). -/
+def autoRetSlot? (body : CapturedMir) : Option MirAbsSlot :=
+  match get? body.localDecls 0 with
+  | some d => argTopAbsSlot? d.ty
+  | none => none
+
+/-- Abstract entry frame of `body`, mirroring `initLocalsAux 0 body.localDecls
+args`: `_0` live and uninitialized, each parameter at the top slot of its
+type, every other local dead. Fails closed (`none`) unless
+`body.argCount < length body.localDecls` and the return place and every
+parameter have a supported type. -/
+def buildEntryEnv? (body : CapturedMir) : Option MirAbsEnv :=
+  match Nat.blt body.argCount (length body.localDecls) with
+  | false => none
+  | true =>
+    match autoRetSlot? body with
+    | none => none
+    | some _ =>
+      match buildArgSlots? body with
+      | none => none
+      | some argSlots => some (entryEnv body.localDecls argSlots)
+
+/-- A built entry frame is `entryEnv` over the built argument slots. -/
+theorem buildEntryEnv?_eq {body : CapturedMir} {env : MirAbsEnv}
+    (hBuild : buildEntryEnv? body = some env) :
+    ∃ argSlots, buildArgSlots? body = some argSlots ∧
+      env = entryEnv body.localDecls argSlots := by
+  unfold buildEntryEnv? at hBuild
+  cases hLt : Nat.blt body.argCount (length body.localDecls) with
+  | false => rw [hLt] at hBuild; nomatch hBuild
+  | true =>
+    rw [hLt] at hBuild
+    cases hRet : autoRetSlot? body with
+    | none => rw [hRet] at hBuild; nomatch hBuild
+    | some r =>
+      rw [hRet] at hBuild
+      cases hS : buildArgSlots? body with
+      | none => rw [hS] at hBuild; nomatch hBuild
+      | some argSlots =>
+        rw [hS] at hBuild
+        injection hBuild with hBuild
+        exact ⟨argSlots, rfl, hBuild.symm⟩
+
+/-- Soundness of `buildEntryEnv?`: for every valid argument list, the built
+argument slots satisfy `entryArgsOk` and the built entry frame denotes the
+concrete entry frame `initLocalsAux 0 body.localDecls args`. -/
+theorem buildEntryEnv?_sound {body : CapturedMir} {env : MirAbsEnv}
+    {args : List Value} (hBuild : buildEntryEnv? body = some env)
+    (hArgs : ValidEntryArgs body args) :
+    (∃ argSlots, buildArgSlots? body = some argSlots ∧
+      env = entryEnv body.localDecls argSlots ∧
+      entryArgsOk (body.localDecls.drop 1) argSlots args) ∧
+    mirAbsEnvDenote body.localDecls env
+      (initLocalsAux 0 body.localDecls args) := by
+  cases buildEntryEnv?_eq hBuild with
+  | intro argSlots h =>
+    have hOk := buildArgSlots?_sound h.1 hArgs
+    refine ⟨⟨argSlots, h.1, h.2, hOk⟩, ?_⟩
+    rw [h.2]
+    exact entryEnv_sound hOk
+
+/-- Fuel-bounded depth-first postorder visit from block `u`. The state is
+`(visited, order)`: finished blocks are prepended to `order` (so `order` is a
+reverse postorder), and edges into `cutpoints` are not followed. Out-of-range
+and already visited blocks are skipped; with `fuel = 0` the state is returned
+unchanged, so the visit terminates on every CFG. Fuel
+`length body.basicBlocks` suffices for a complete visit, because each nested
+call marks a distinct block. -/
+def rpoDfsVisit (body : CapturedMir) (cutpoints : List (Nat × MirAbsEnv))
+    (fuel : Nat) : Nat → List Nat × List Nat → List Nat × List Nat :=
+  Nat.rec
+    (motive := fun _ => Nat → List Nat × List Nat → List Nat × List Nat)
+    (fun _ st => st)
+    (fun _ ih u st =>
+      match !Nat.blt u (length body.basicBlocks) ||
+          natListContains u st.1 with
+      | true => st
+      | false =>
+        let succs :=
+          match get? body.basicBlocks u with
+          | some bb => syntacticTermTargets bb.terminator.kind
+          | none => []
+        let st2 :=
+          succs.foldl
+            (fun acc v =>
+              match isCutpoint v cutpoints with
+              | true => acc
+              | false => ih v acc)
+            (u :: st.1, st.2)
+        (st2.1, u :: st2.2))
+    fuel
+
+/-- Reverse-postorder schedule of `body.basicBlocks` modulo `cutpoints`, by
+fuel-bounded depth-first search (`rpoDfsVisit` with fuel
+`length body.basicBlocks`). Blocks `1 ..` are visited first and block `0`
+last, so `0` heads the schedule whenever no edge outside `cutpoints` enters
+it. The result is only a candidate: `validRpoSchedule` rejects it if the CFG
+has a cycle that avoids every cutpoint. -/
+def defaultRpoOrder (body : CapturedMir)
+    (cutpoints : List (Nat × MirAbsEnv) := []) : List Nat :=
+  match length body.basicBlocks with
+  | 0 => []
+  | m + 1 =>
+    let stRest :=
+      Nat.rec
+        (motive := fun _ => Nat → List Nat × List Nat → List Nat × List Nat)
+        (fun _ st => st)
+        (fun _ ih idx st =>
+          ih (idx + 1) (rpoDfsVisit body cutpoints (m + 1) idx st))
+        m 1 ([], [])
+    (rpoDfsVisit body cutpoints (m + 1) 0 stRest).2
+
+/-- Automatic cutpoint verifier: builds the entry frame from `body` and runs
+`verifyMirCutpoints` (by default on `defaultRpoOrder body cutpoints`). -/
+def autoVerifyCutpoints (body : CapturedMir) (retInv : MirAbsSlot)
+    (cutpoints : List (Nat × MirAbsEnv))
+    (rpoOrder : List Nat := defaultRpoOrder body cutpoints) : Bool :=
+  match buildEntryEnv? body with
+  | none => false
+  | some env => verifyMirCutpoints body env retInv cutpoints rpoOrder
+
+/-- Automatic acyclic verifier with an explicit return postcondition
+`retInv`. -/
+def autoVerifyAcyclicWithRet (body : CapturedMir) (retInv : MirAbsSlot)
+    (rpoOrder : List Nat := defaultRpoOrder body []) : Bool :=
+  autoVerifyCutpoints body retInv [] rpoOrder
+
+/-- Automatic acyclic verifier: synthesizes the entry frame, the top return
+invariant, and (by default) the schedule from `body`. A body whose CFG has a
+cycle is rejected (it needs `autoVerifyCutpoints`). -/
+def autoVerifyAcyclic (body : CapturedMir)
+    (rpoOrder : List Nat := defaultRpoOrder body []) : Bool :=
+  match autoRetSlot? body with
+  | none => false
+  | some retInv => autoVerifyAcyclicWithRet body retInv rpoOrder
+
+/-- Return-value postcondition certified by `autoVerifyAcyclic`: the returned
+value inhabits the top slot of the declared return type. -/
+def AutoRetOk (body : CapturedMir) (retVal : Value) : Prop :=
+  ∃ d retInv, get? body.localDecls 0 = some d ∧
+    autoRetSlot? body = some retInv ∧ retInv.valDenote d.ty retVal
+
+/-- An accepted `autoVerifyCutpoints` run is a `verifyMirCutpoints`
+certificate over the built argument slots. -/
+theorem autoVerifyCutpoints_elim {body : CapturedMir} {retInv : MirAbsSlot}
+    {cutpoints : List (Nat × MirAbsEnv)} {rpoOrder : List Nat}
+    (hVer : autoVerifyCutpoints body retInv cutpoints rpoOrder = true) :
+    ∃ argSlots, buildArgSlots? body = some argSlots ∧
+      verifyMirCutpoints body (entryEnv body.localDecls argSlots) retInv
+        cutpoints rpoOrder = true := by
+  unfold autoVerifyCutpoints at hVer
+  cases hB : buildEntryEnv? body with
+  | none => rw [hB] at hVer; nomatch hVer
+  | some env =>
+    rw [hB] at hVer
+    cases buildEntryEnv?_eq hB with
+    | intro argSlots h =>
+      refine ⟨argSlots, h.1, ?_⟩
+      rw [← h.2]
+      exact hVer
+
+/-- An accepted `autoVerifyAcyclic` run is an `autoVerifyAcyclicWithRet` run
+on the synthesized top return invariant. -/
+theorem autoVerifyAcyclic_elim {body : CapturedMir} {rpoOrder : List Nat}
+    (hVer : autoVerifyAcyclic body rpoOrder = true) :
+    ∃ retInv, autoRetSlot? body = some retInv ∧
+      autoVerifyAcyclicWithRet body retInv rpoOrder = true := by
+  unfold autoVerifyAcyclic at hVer
+  cases hRet : autoRetSlot? body with
+  | none => rw [hRet] at hVer; nomatch hVer
+  | some retInv =>
+    rw [hRet] at hVer
+    exact ⟨retInv, rfl, hVer⟩
+
+/-- Soundness of `autoVerifyCutpoints`: for every valid argument list, the
+conclusions of `verifyMirCutpoints_sound_call` (unbounded-iteration safety,
+`retInv` on every returned value, an all-prefix UB-free interaction tree, and
+the `wpOutcome` to `wpStateOk` upgrade). -/
+theorem autoVerifyCutpoints_sound {body : CapturedMir} {retInv : MirAbsSlot}
+    {cutpoints : List (Nat × MirAbsEnv)} {rpoOrder : List Nat}
+    {args : List Value}
+    (hVer : autoVerifyCutpoints body retInv cutpoints rpoOrder = true)
+    (hArgs : ValidEntryArgs body args) :
+    SafeFrom body (initMachineState body args) ∧
+    (∀ retVal, ReturnsFrom body (initMachineState body args) retVal →
+      ∃ d, get? body.localDecls 0 = some d ∧ retInv.valDenote d.ty retVal) ∧
+    MirNoUBTree (mirCallTree body args) ∧
+    (@Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps body)
+        (fun _ => True) (fun _ => True) (initMachineState body args) →
+      @Anneal.ParametricCore.wpStateOk _ _ _ (mirPccWpOps body)
+        (mirRetPost body retInv) (initMachineState body args)) := by
+  cases autoVerifyCutpoints_elim hVer with
+  | intro argSlots h =>
+    exact verifyMirCutpoints_sound_call h.2 (buildArgSlots?_sound h.1 hArgs)
+
+/-- Soundness of `autoVerifyAcyclicWithRet`. -/
+theorem autoVerifyAcyclicWithRet_sound {body : CapturedMir}
+    {retInv : MirAbsSlot} {rpoOrder : List Nat} {args : List Value}
+    (hVer : autoVerifyAcyclicWithRet body retInv rpoOrder = true)
+    (hArgs : ValidEntryArgs body args) :
+    SafeFrom body (initMachineState body args) ∧
+    (∀ retVal, ReturnsFrom body (initMachineState body args) retVal →
+      ∃ d, get? body.localDecls 0 = some d ∧ retInv.valDenote d.ty retVal) ∧
+    MirNoUBTree (mirCallTree body args) ∧
+    (@Anneal.ParametricCore.wpOutcome _ _ _ (mirPccWpOps body)
+        (fun _ => True) (fun _ => True) (initMachineState body args) →
+      @Anneal.ParametricCore.wpStateOk _ _ _ (mirPccWpOps body)
+        (mirRetPost body retInv) (initMachineState body args)) :=
+  autoVerifyCutpoints_sound hVer hArgs
+
+/-- Soundness of `autoVerifyAcyclic` for an explicit schedule `rpoOrder`: for
+every valid argument list the body is safe for unboundedly many steps, every
+returned value inhabits the top slot of the return type, and the interaction
+tree is all-prefix UB-free. -/
+theorem autoVerifyAcyclicOrder_sound {body : CapturedMir}
+    {rpoOrder : List Nat} {args : List Value}
+    (hVer : autoVerifyAcyclic body rpoOrder = true)
+    (hArgs : ValidEntryArgs body args) :
+    SafeFrom body (initMachineState body args) ∧
+    (∀ retVal, ReturnsFrom body (initMachineState body args) retVal →
+      AutoRetOk body retVal) ∧
+    MirNoUBTree (mirCallTree body args) := by
+  cases autoVerifyAcyclic_elim hVer with
+  | intro retInv h =>
+    have hS := autoVerifyAcyclicWithRet_sound h.2 hArgs
+    refine ⟨hS.1, ?_, hS.2.2.1⟩
+    intro retVal hR
+    cases hS.2.1 retVal hR with
+    | intro d hd => exact ⟨d, retInv, hd.1, h.1, hd.2⟩
+
+/-- Soundness of `autoVerifyAcyclic` on the default schedule: one `rfl` proof
+of `autoVerifyAcyclic body = true` certifies the body for every valid
+argument list. -/
+theorem autoVerifyAcyclic_sound {body : CapturedMir} {args : List Value}
+    (hVer : autoVerifyAcyclic body = true)
+    (hArgs : ValidEntryArgs body args) :
+    SafeFrom body (initMachineState body args) ∧
+    (∀ retVal, ReturnsFrom body (initMachineState body args) retVal →
+      AutoRetOk body retVal) ∧
+    MirNoUBTree (mirCallTree body args) :=
+  autoVerifyAcyclicOrder_sound hVer hArgs
+
+/-- Canonical audited safety claim certified by `autoVerifyAcyclic`: on every
+valid argument list `body` (linked against `callees`) is UB-free and each
+normal return inhabits the top slot of the return type. -/
+def autoClaim (body : CapturedMir) (callees : List CapturedMir := []) :
+    Trusted.VerificationResult.Claim where
+  body := body
+  pre := ValidEntryArgs body
+  post := fun _ retVal => AutoRetOk body retVal
+  callees := callees
+
+/-- Trusted `VerificationResult c` from an `autoVerifyCutpoints` run (loops
+with Bourdoncle cutpoints), for any claim whose precondition implies valid
+entry arguments and whose postcondition follows from `retInv`. -/
+theorem bodyVerified_of_autoVerifyCutpoints
+    {c : Trusted.VerificationResult.Claim} {retInv : MirAbsSlot}
+    {cutpoints : List (Nat × MirAbsEnv)} {rpoOrder : List Nat}
+    (hVer : autoVerifyCutpoints c.body retInv cutpoints rpoOrder = true)
+    (hPre : ∀ args, c.pre args → ValidEntryArgs c.body args)
+    (hPost : ∀ args retVal, c.pre args →
+      (∃ d, get? c.body.localDecls 0 = some d ∧
+        retInv.valDenote d.ty retVal) →
+      c.post args retVal) :
+    Trusted.VerificationResult.VerificationResult c := by
+  cases autoVerifyCutpoints_elim hVer with
+  | intro argSlots h =>
+    exact verifyMirCutpoints_verificationResult h.2
+      (fun args hP => buildArgSlots?_sound h.1 (hPre args hP)) hPost
+
+/-- Trusted `VerificationResult c` from an `autoVerifyAcyclic` run on an
+explicit schedule. The precondition and postcondition obligations default to
+the identity, which discharges `autoClaim body`. -/
+theorem bodyVerified_of_autoVerifyAcyclicOrder
+    {c : Trusted.VerificationResult.Claim} {rpoOrder : List Nat}
+    (hVer : autoVerifyAcyclic c.body rpoOrder = true)
+    (hPre : ∀ args, c.pre args → ValidEntryArgs c.body args := by
+      exact fun _ h => h)
+    (hPost : ∀ args retVal, c.pre args → AutoRetOk c.body retVal →
+      c.post args retVal := by exact fun _ _ _ h => h) :
+    Trusted.VerificationResult.VerificationResult c := by
+  cases autoVerifyAcyclic_elim hVer with
+  | intro retInv h =>
+    exact bodyVerified_of_autoVerifyCutpoints (retInv := retInv)
+      (cutpoints := []) h.2 hPre
+      (fun args retVal hP hR =>
+        match hR with
+        | ⟨d, hd, hDen⟩ => hPost args retVal hP ⟨d, retInv, hd, h.1, hDen⟩)
+
+/-- One-liner trusted `VerificationResult c` for an acyclic
+scalar/signed/`bool`/unit body on the default schedule:
+`bodyVerified_of_autoVerifyAcyclic rfl` proves
+`VerificationResult (autoClaim body)`. -/
+theorem bodyVerified_of_autoVerifyAcyclic
+    {c : Trusted.VerificationResult.Claim}
+    (hVer : autoVerifyAcyclic c.body = true)
+    (hPre : ∀ args, c.pre args → ValidEntryArgs c.body args := by
+      exact fun _ h => h)
+    (hPost : ∀ args retVal, c.pre args → AutoRetOk c.body retVal →
+      c.post args retVal := by exact fun _ _ _ h => h) :
+    Trusted.VerificationResult.VerificationResult c :=
+  bodyVerified_of_autoVerifyAcyclicOrder hVer hPre hPost
+
+/-- Trusted `StatefulVerificationResult c` from an `autoVerifyAcyclic` run on
+the default schedule, for a root-entry memory and valid entry arguments. -/
+theorem statefulVerificationResult_of_autoVerifyAcyclic
+    {c : Trusted.VerificationResult.StatefulClaim}
+    (hVer : autoVerifyAcyclic c.body = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧ ValidEntryArgs c.body args)
+    (hPost : ∀ args mem retVal mem', c.pre args mem →
+      MirMemFrame mem' mem → AutoRetOk c.body retVal →
+      c.post args mem retVal mem') :
+    Trusted.VerificationResult.StatefulVerificationResult c := by
+  cases autoVerifyAcyclic_elim hVer with
+  | intro retInv h =>
+    cases autoVerifyCutpoints_elim h.2 with
+    | intro argSlots hC =>
+      exact verifyMirCutpoints_statefulVerificationResult hC.2
+        (fun args mem hP =>
+          have hQ := hPre args mem hP
+          ⟨hQ.1, hQ.2.1, hQ.2.2.1, buildArgSlots?_sound hC.1 hQ.2.2.2⟩)
+        (fun args mem retVal mem' hP hF hR =>
+          match hR with
+          | ⟨d, hd, hDen⟩ =>
+            hPost args mem retVal mem' hP hF ⟨d, retInv, hd, h.1, hDen⟩)
+
+/-- Trusted `TraceVerificationResult c` from an `autoVerifyAcyclic` run on the
+default schedule: every reachable outcome is a normal return along an
+observation-only trace. -/
+theorem traceVerificationResult_of_autoVerifyAcyclic
+    {c : Trusted.VerificationResult.TraceClaim}
+    (hVer : autoVerifyAcyclic c.body = true)
+    (hPre : ∀ args mem, c.pre args mem →
+      mem.callStack = [] ∧ mem.activeCallee = none ∧
+      mem.activeProtectors = [] ∧ ValidEntryArgs c.body args)
+    (hPost : ∀ args mem tr retVal mem', c.pre args mem →
+      TraceObsOnly tr → MirMemFrame mem' mem → AutoRetOk c.body retVal →
+      c.post args mem tr (.normal (retVal, mem'))) :
+    Trusted.VerificationResult.TraceVerificationResult c := by
+  cases autoVerifyAcyclic_elim hVer with
+  | intro retInv h =>
+    cases autoVerifyCutpoints_elim h.2 with
+    | intro argSlots hC =>
+      exact verifyMirCutpoints_traceVerificationResult hC.2
+        (fun args mem hP =>
+          have hQ := hPre args mem hP
+          ⟨hQ.1, hQ.2.1, hQ.2.2.1, buildArgSlots?_sound hC.1 hQ.2.2.2⟩)
+        (fun args mem tr retVal mem' hP hTr hF hR =>
+          match hR with
+          | ⟨d, hd, hDen⟩ =>
+            hPost args mem tr retVal mem' hP hTr hF
+              ⟨d, retInv, hd, h.1, hDen⟩)
+
+end AutoProve
+
+/-- End-to-end certificate of the auto-proof front-end: one accepted
+`AutoProve.autoVerifyAcyclic` run is a trusted `VerificationResult` of the
+canonical safety claim `AutoProve.autoClaim body callees`, for any linked
+`callees`. -/
+theorem autoVerifyAcyclic_verificationResult (body : CapturedMir)
+    (callees : List CapturedMir)
+    (hVer : AutoProve.autoVerifyAcyclic body = true) :
+    Trusted.VerificationResult.VerificationResult
+      (AutoProve.autoClaim body callees) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic hVer
 
 end Anneal.AiPcc

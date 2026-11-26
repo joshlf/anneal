@@ -51,6 +51,15 @@ Canary suite for the `Anneal.AiPcc` stack. It is not imported by
 3. Positive controls and CFG joins (`switchInt` diamonds, `move` aliasing,
    checked arithmetic with `assert`).
 4. A fail-closed negative suite and a `validRpoSchedule` suite.
+5. Signed-integer and `AutoProve` canaries: a guarded `i8` body and an
+   `isize -> usize` body verified by one `rfl` run of
+   `AutoProve.autoVerifyAcyclic` (also packaged as a trusted
+   `VerificationResult`), same-skeleton positive controls, a fail-closed
+   signed suite (overflow, `/ 0`, `MIN / -1`, bad shift amounts, unsigned
+   `neg`, narrowing and sign-extending casts), a CFG whose block numbering is
+   not a topological order, and cyclic CFGs (rejected by
+   `AutoProve.autoVerifyAcyclic`, accepted by
+   `AutoProve.autoVerifyCutpoints`).
 -/
 
 /-- Certified loop-header abstract value for `_1`: `0 ≤ _1 ≤ 1024` and low 3
@@ -814,5 +823,399 @@ theorem canary_validRpoSchedule_tests :
       false ∧
     validRpoSchedule stride8LoopBody [(6, [])] [0, 1, 2, 3, 4, 5] = false :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## Signed Integers and the `AutoProve` Front-End -/
+
+/-- One-block signed function `fn(_1 : i8) -> i8`. -/
+def oneBlockI8Body (stmts : List StatementKind) (t : TerminatorKind) :
+    CapturedMir :=
+  canaryBody "ai_pcc::signed_i8_unit" 1 [canaryIntTy .i8, canaryIntTy .i8]
+    [canaryBlock stmts t]
+
+/-- One-block signed function `fn(_1 : i32) -> i32`. -/
+def oneBlockI32Body (stmts : List StatementKind) (t : TerminatorKind) :
+    CapturedMir :=
+  canaryBody "ai_pcc::signed_i32_unit" 1 [canaryIntTy .i32, canaryIntTy .i32]
+    [canaryBlock stmts t]
+
+/-- One-block unsigned function `fn(_1 : u8) -> u8`. -/
+def oneBlockU8Body (stmts : List StatementKind) (t : TerminatorKind) :
+    CapturedMir :=
+  canaryBody "ai_pcc::unsigned_u8_unit" 1 [canaryUintTy .u8, canaryUintTy .u8]
+    [canaryBlock stmts t]
+
+/-- Guarded signed `i8` body exercising `.sgtConst` / `.sleConst` branch
+refinement, sign-straddling `addUnchecked` / `subUnchecked`, `neg`, `not`,
+`mul`, bitwise masking, unchecked shifts by a signed amount, `div` / `rem`,
+and widening / narrowing `intToInt` casts.
+- `_0 : i8`; `_1 : i8` argument `x`; `_2, _3 : bool`; `_4, _5 : i8`;
+  `_6 : i32`.
+- `bb0`: `x >= -100` (bit pattern `156`), else `bb3` returns `-1`;
+- `bb1`: `x <= 100`, else `bb4` returns `1`;
+- `bb2`: with `x` in `[-100, 100]`, `x.unchecked_add(10)` and
+  `x.unchecked_sub(-10)` cannot overflow; `_5 = x & 3` lies in `[0, 3]`, so
+  both unchecked shifts are in range; `_5 + 1` lies in `[1, 4]`, so `/` and
+  `%` cannot divide by zero or compute `i8::MIN / -1`. -/
+def signedGuardedOpsBody : CapturedMir :=
+  canaryBody "ai_pcc::signed_guarded_ops" 1
+    [canaryIntTy .i8, canaryIntTy .i8, canaryBoolTy, canaryBoolTy,
+     canaryIntTy .i8, canaryIntTy .i8, canaryIntTy .i32]
+    [ -- bb0: `_2 = _1 >= -100`
+      canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.binaryOp .ge (canaryCopy 1) (canaryIConst .i8 156))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 3)], 1⟩),
+      -- bb1: `_3 = _1 <= 100`
+      canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.binaryOp .le (canaryCopy 1) (canaryIConst .i8 100))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 4)], 2⟩),
+      -- bb2: guarded signed operations on `_1` in `[-100, 100]`
+      canaryBlock [.storageLive 4, .storageLive 5, .storageLive 6,
+        .assign (canaryPlace 4)
+          (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i8 10)),
+        .assign (canaryPlace 4)
+          (.binaryOp .subUnchecked (canaryCopy 1) (canaryIConst .i8 246)),
+        .assign (canaryPlace 4) (.unaryOp .neg (canaryCopy 4)),
+        .assign (canaryPlace 4) (.unaryOp .not (canaryCopy 4)),
+        .assign (canaryPlace 4)
+          (.binaryOp .mul (canaryCopy 4) (canaryIConst .i8 3)),
+        .assign (canaryPlace 5)
+          (.binaryOp .bitAnd (canaryCopy 1) (canaryIConst .i8 3)),
+        .assign (canaryPlace 4)
+          (.binaryOp .shlUnchecked (canaryCopy 4) (canaryCopy 5)),
+        .assign (canaryPlace 4)
+          (.binaryOp .shrUnchecked (canaryCopy 4) (canaryCopy 5)),
+        .assign (canaryPlace 5)
+          (.binaryOp .addUnchecked (canaryCopy 5) (canaryIConst .i8 1)),
+        .assign (canaryPlace 4) (.binaryOp .div (canaryCopy 4) (canaryCopy 5)),
+        .assign (canaryPlace 4) (.binaryOp .rem (canaryCopy 4) (canaryCopy 5)),
+        .assign (canaryPlace 6)
+          (.cast .intToInt (canaryCopy 4) (canaryIntTy .i32)),
+        .assign (canaryPlace 0)
+          (.cast .intToInt (canaryCopy 6) (canaryIntTy .i8))] .return_,
+      -- bb3: `x < -100` returns `-1`
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 255))]
+        .return_,
+      -- bb4: `x > 100` returns `1`
+      canaryBlock [.storageDead 3,
+        .assign (canaryPlace 0) (.use (canaryIConst .i8 1))] .return_ ]
+
+/-- Every in-range `i8` bit pattern is a valid argument list of
+`signedGuardedOpsBody` (so `ValidEntryArgs` is not vacuous). -/
+theorem signedGuardedOps_validEntryArgs (x : Nat) (hx : x < modPow2 8) :
+    AutoProve.ValidEntryArgs signedGuardedOpsBody [.scalar ⟨x, 1⟩] :=
+  ⟨⟨x, rfl, hx⟩, rfl⟩
+
+/-- Positive signed canary: one `rfl` run of `AutoProve.autoVerifyAcyclic`
+proves `signedGuardedOpsBody` safe for all valid `i8` arguments, with no
+hand-written entry frame, return invariant, or schedule. -/
+theorem canary_signed_guarded_ops_auto_safe {args : List Value}
+    (hArgs : AutoProve.ValidEntryArgs signedGuardedOpsBody args) :
+    SafeFrom signedGuardedOpsBody (initMachineState signedGuardedOpsBody args) ∧
+    (∀ v, ReturnsFrom signedGuardedOpsBody
+        (initMachineState signedGuardedOpsBody args) v →
+      AutoProve.AutoRetOk signedGuardedOpsBody v) ∧
+    MirNoUBTree (mirCallTree signedGuardedOpsBody args) :=
+  AutoProve.autoVerifyAcyclic_sound rfl hArgs
+
+/-- `canary_signed_guarded_ops_auto_safe` at every concrete `i8` argument:
+the call is safe and returns an `i8`. -/
+theorem canary_signed_guarded_ops_all_i8 (x : Nat) (hx : x < modPow2 8) :
+    SafeFrom signedGuardedOpsBody
+      (initMachineState signedGuardedOpsBody [.scalar ⟨x, 1⟩]) ∧
+    (∀ v, ReturnsFrom signedGuardedOpsBody
+        (initMachineState signedGuardedOpsBody [.scalar ⟨x, 1⟩]) v →
+      ∃ bits, v = .scalar ⟨bits, 1⟩ ∧ bits < modPow2 8) ∧
+    MirNoUBTree (mirCallTree signedGuardedOpsBody [.scalar ⟨x, 1⟩]) := by
+  have h := canary_signed_guarded_ops_auto_safe
+    (signedGuardedOps_validEntryArgs x hx)
+  refine ⟨h.1, ?_, h.2.2⟩
+  intro v hRet
+  match h.2.1 v hRet with
+  | ⟨d, retInv, hD, hSlot, hDen⟩ =>
+    injection hD with hD
+    injection hSlot with hSlot
+    subst hD
+    subst hSlot
+    have h2 := hDen.2
+    cases v
+    case scalar sc =>
+      cases sc with
+      | mk bits sz =>
+        have hSz : sz = 1 := h2.1
+        subst hSz
+        exact ⟨bits, rfl, (absVal_some_elim h2.2).1⟩
+    all_goals exact False.elim h2
+
+/-- Trusted `VerificationResult` for `signedGuardedOpsBody` from one `rfl`:
+on every valid argument list the body is UB-free and returns an `i8`. -/
+theorem canary_signed_guarded_ops_verificationResult :
+    Trusted.VerificationResult.VerificationResult
+      (AutoProve.autoClaim signedGuardedOpsBody) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic rfl
+
+/-- `fn f(x: isize) -> usize { (-(x + 1)) as usize }`: wrapping `isize`
+addition, wrapping negation (defined on `isize::MIN`), and a same-width
+signed-to-unsigned cast.
+- `_0 : usize`; `_1 : isize` argument; `_2 : isize` temporary. -/
+def signedIsizeToUsizeBody : CapturedMir :=
+  canaryBody "ai_pcc::isize_to_usize" 1
+    [canaryUintTy .usize, canaryIntTy .isize, canaryIntTy .isize]
+    [canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.binaryOp .add (canaryCopy 1) (canaryIConst .isize 1)),
+        .assign (canaryPlace 2) (.unaryOp .neg (canaryCopy 2)),
+        .assign (canaryPlace 0)
+          (.cast .intToInt (canaryCopy 2) (canaryUintTy .usize))] .return_]
+
+/-- `AutoProve.autoVerifyAcyclic` proves `signedIsizeToUsizeBody` safe for all
+valid `isize` arguments (negative values and `isize::MIN` included). -/
+theorem canary_signed_isize_to_usize_auto_safe {args : List Value}
+    (hArgs : AutoProve.ValidEntryArgs signedIsizeToUsizeBody args) :
+    SafeFrom signedIsizeToUsizeBody
+      (initMachineState signedIsizeToUsizeBody args) ∧
+    (∀ v, ReturnsFrom signedIsizeToUsizeBody
+        (initMachineState signedIsizeToUsizeBody args) v →
+      AutoProve.AutoRetOk signedIsizeToUsizeBody v) ∧
+    MirNoUBTree (mirCallTree signedIsizeToUsizeBody args) :=
+  AutoProve.autoVerifyAcyclic_sound rfl hArgs
+
+/-- `fn(x: i32) -> i8`: when `0 <= x <= hi`, return
+`(x as i8).unchecked_add(-100)`, otherwise `0`. The narrowing cast keeps the
+low byte, so the sum is in range exactly when the low byte cannot be
+negative as an `i8` (`hi <= 127`).
+- `_0 : i8`; `_1 : i32` argument; `_2, _3 : bool`; `_4 : i8`. -/
+def narrowThenAddBody (hi : Nat) : CapturedMir :=
+  canaryBody "ai_pcc::narrow_then_add" 1
+    [canaryIntTy .i8, canaryIntTy .i32, canaryBoolTy, canaryBoolTy,
+     canaryIntTy .i8]
+    [ canaryBlock [.storageLive 2,
+        .assign (canaryPlace 2)
+          (.binaryOp .ge (canaryCopy 1) (canaryIConst .i32 0))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 3)], 1⟩),
+      canaryBlock [.storageLive 3,
+        .assign (canaryPlace 3)
+          (.binaryOp .le (canaryCopy 1) (canaryIConst .i32 hi))]
+        (.switchInt (canaryCopy 3) ⟨[(0, 3)], 2⟩),
+      canaryBlock [.storageLive 4,
+        .assign (canaryPlace 4)
+          (.cast .intToInt (canaryCopy 1) (canaryIntTy .i8)),
+        .assign (canaryPlace 0)
+          (.binaryOp .addUnchecked (canaryCopy 4) (canaryIConst .i8 156))]
+        .return_,
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryIConst .i8 0))]
+        .return_ ]
+
+/-- `fn() -> i32 { (c as i32).unchecked_add(k) }` for an `i8` constant with
+bit pattern `c` and an `i32` constant with bit pattern `k`: the widening cast
+sign-extends `c`.
+- `_0 : i32`; `_1 : i32` temporary. -/
+def widenConstThenAddBody (c k : Nat) : CapturedMir :=
+  canaryBody "ai_pcc::widen_const_then_add" 0
+    [canaryIntTy .i32, canaryIntTy .i32]
+    [canaryBlock [.storageLive 1,
+        .assign (canaryPlace 1)
+          (.cast .intToInt (canaryIConst .i8 c) (canaryIntTy .i32)),
+        .assign (canaryPlace 0)
+          (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i32 k))]
+        .return_]
+
+/-- Same-skeleton positive controls for `canary_negative_signed_rejections`
+(each rejected body differs from an accepted one only in the hazard):
+1. `1i8.unchecked_add(1)` (in range);
+2. `x / 2` and 3. `x % 2` (divisor neither `0` nor `-1`);
+4. `x.unchecked_shl(7)` (largest in-range shift amount);
+5. `x.unchecked_shr(0)` (smallest shift amount);
+6. `-x` on `i8` (wrapping: `-i8::MIN == i8::MIN`);
+7. `x / 2` on `i32`;
+8. `0i8.unchecked_sub(1)` (exact operands, no overflow);
+9. `!x` on `u8`;
+10. the narrowing cast of `x` in `[0, 100]` followed by
+    `unchecked_add(-100)`;
+11. `(-1i8 as i32).unchecked_add(i32::MAX)` (sign extension gives `-1`, so
+    the sum is `i32::MAX - 1`; zero extension would overflow);
+12. `(1i8 as i32).unchecked_add(i32::MIN)`. -/
+theorem canary_positive_signed_near_miss_same_skeleton :
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .addUnchecked (canaryIConst .i8 1) (canaryIConst .i8 1))]
+        .return_) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .div (canaryCopy 1) (canaryIConst .i8 2))] .return_) =
+      true ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .rem (canaryCopy 1) (canaryIConst .i8 2))] .return_) =
+      true ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .shlUnchecked (canaryCopy 1) (canaryIConst .i8 7))]
+        .return_) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .shrUnchecked (canaryCopy 1) (canaryIConst .i8 0))]
+        .return_) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0) (.unaryOp .neg (canaryCopy 1))]
+        .return_) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI32Body [.assign (canaryPlace 0)
+        (.binaryOp .div (canaryCopy 1) (canaryIConst .i32 2))] .return_) =
+      true ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .subUnchecked (canaryIConst .i8 0) (canaryIConst .i8 1))]
+        .return_) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockU8Body [.assign (canaryPlace 0) (.unaryOp .not (canaryCopy 1))]
+        .return_) = true ∧
+    AutoProve.autoVerifyAcyclic (narrowThenAddBody 100) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (widenConstThenAddBody 255 (modPow2 31 - 1)) = true ∧
+    AutoProve.autoVerifyAcyclic
+      (widenConstThenAddBody 1 (modPow2 31)) = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Fail-closed signed suite: `AutoProve.autoVerifyAcyclic` rejects every
+signed undefined-behavior class on the skeletons accepted by
+`canary_positive_signed_near_miss_same_skeleton`:
+1. `x.unchecked_add(1)` (overflows at `i8::MAX`);
+2. `x.unchecked_sub(1)` (overflows at `i8::MIN`);
+3. `0i8.unchecked_sub(x)` (`-i8::MIN` overflows);
+4. `10 / x` and 5. `10 % x` (possible zero divisor);
+6. `x / -1` on `i8` and 7. on `i32` (`MIN / -1`);
+8. `x % -1` on `i8` (`MIN % -1`);
+9. `x.unchecked_shl(-1)` (negative shift amount);
+10. `x.unchecked_shr(8)` (out-of-range shift amount);
+11. `-x` on `u8` (`UnOp.neg` is not defined on unsigned integers);
+12. the narrowing cast of `x` in `[0, 200]` followed by
+    `unchecked_add(-100)` (`200 as i8 == -56`, and `-56 - 100` overflows);
+13. `(-1i8 as i32).unchecked_add(i32::MIN)` (sign extension gives `-1`, and
+    `-1 + i32::MIN` overflows; zero extension would not). -/
+theorem canary_negative_signed_rejections :
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i8 1))]
+        .return_) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .subUnchecked (canaryCopy 1) (canaryIConst .i8 1))]
+        .return_) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .subUnchecked (canaryIConst .i8 0) (canaryCopy 1))]
+        .return_) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .div (canaryIConst .i8 10) (canaryCopy 1))] .return_) =
+      false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .rem (canaryIConst .i8 10) (canaryCopy 1))] .return_) =
+      false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .div (canaryCopy 1) (canaryIConst .i8 255))] .return_) =
+      false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI32Body [.assign (canaryPlace 0)
+        (.binaryOp .div (canaryCopy 1)
+          (canaryIConst .i32 (modPow2 32 - 1)))] .return_) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .rem (canaryCopy 1) (canaryIConst .i8 255))] .return_) =
+      false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .shlUnchecked (canaryCopy 1) (canaryIConst .i8 255))]
+        .return_) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockI8Body [.assign (canaryPlace 0)
+        (.binaryOp .shrUnchecked (canaryCopy 1) (canaryIConst .i8 8))]
+        .return_) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (oneBlockU8Body [.assign (canaryPlace 0) (.unaryOp .neg (canaryCopy 1))]
+        .return_) = false ∧
+    AutoProve.autoVerifyAcyclic (narrowThenAddBody 200) = false ∧
+    AutoProve.autoVerifyAcyclic
+      (widenConstThenAddBody 255 (modPow2 31)) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Acyclic CFG whose block numbering is not a topological order
+(`0 -> 2 -> 1` and `0 -> 1`): `bb0` tests `_1 <= 100` and branches to `bb2`
+(which computes `_1.unchecked_add(1)` and jumps to `bb1`) or directly to the
+exit block `bb1`.
+- `_0 : i8`; `_1 : i8` argument; `_2 : bool`. -/
+def nonMonotonicRpoBody : CapturedMir :=
+  canaryBody "ai_pcc::non_monotonic_rpo" 1
+    [canaryIntTy .i8, canaryIntTy .i8, canaryBoolTy]
+    [ -- bb0: `_0 = _1; _2 = _1 <= 100; if _2 { bb2 } else { bb1 }`
+      canaryBlock [.assign (canaryPlace 0) (.use (canaryCopy 1)),
+        .storageLive 2,
+        .assign (canaryPlace 2)
+          (.binaryOp .le (canaryCopy 1) (canaryIConst .i8 100))]
+        (.switchInt (canaryCopy 2) ⟨[(0, 1)], 2⟩),
+      -- bb1: exit block, numbered before its predecessor `bb2`
+      canaryBlock [] .return_,
+      -- bb2: `_1 <= 100`, so `_1 + 1` cannot overflow
+      canaryBlock [.assign (canaryPlace 0)
+          (.binaryOp .addUnchecked (canaryCopy 1) (canaryIConst .i8 1))]
+        (.goto 1) ]
+
+/-- `AutoProve.defaultRpoOrder` schedules `nonMonotonicRpoBody` as
+`[0, 2, 1]`; the index order `[0, 1, 2]` is not a valid schedule (the edge
+`2 -> 1` runs backward) and is rejected. -/
+theorem canary_non_monotonic_rpo_schedule :
+    AutoProve.defaultRpoOrder nonMonotonicRpoBody = [0, 2, 1] ∧
+    validRpoSchedule nonMonotonicRpoBody [] [0, 2, 1] = true ∧
+    validRpoSchedule nonMonotonicRpoBody [] [0, 1, 2] = false ∧
+    AutoProve.autoVerifyAcyclic nonMonotonicRpoBody [0, 1, 2] = false :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Trusted `VerificationResult` for the non-monotonic CFG from a single
+`rfl`, on the computed default schedule. -/
+theorem canary_non_monotonic_rpo_auto_verified :
+    Trusted.VerificationResult.VerificationResult
+      (AutoProve.autoClaim nonMonotonicRpoBody) :=
+  AutoProve.bodyVerified_of_autoVerifyAcyclic rfl
+
+/-- Cyclic CFGs: the fuel-bounded `AutoProve.defaultRpoOrder` terminates and
+returns a candidate schedule, `AutoProve.autoVerifyAcyclic` rejects the loop
+bodies `stride8LoopBody` and `spinLoopBody`, and
+`AutoProve.autoVerifyCutpoints` accepts them with their Bourdoncle cutpoints
+on the computed default schedule. -/
+theorem canary_auto_cyclic_rejection_and_cutpoints :
+    AutoProve.defaultRpoOrder stride8LoopBody = [0, 1, 3, 4, 5, 2] ∧
+    AutoProve.autoVerifyAcyclic stride8LoopBody = false ∧
+    AutoProve.defaultRpoOrder stride8LoopBody stride8LoopCutpoints =
+      [0, 1, 3, 4, 5, 2] ∧
+    AutoProve.autoVerifyCutpoints stride8LoopBody stride8LoopRetInv
+      stride8LoopCutpoints = true ∧
+    AutoProve.defaultRpoOrder spinLoopBody = [0] ∧
+    AutoProve.autoVerifyAcyclic spinLoopBody = false ∧
+    AutoProve.autoVerifyCutpoints spinLoopBody .dead spinLoopCutpoints =
+      true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `AutoProve` fails closed on unsupported signatures: a `(u8, bool)` return
+type, a `(u8, bool)` parameter, and `argCount` not below the number of
+locals. -/
+theorem canary_auto_unsupported_signatures_rejected :
+    AutoProve.buildEntryEnv?
+      (canaryBody "ai_pcc::auto_pair_ret" 0 [canaryUintPairTy .u8]
+        [canaryBlock [] .return_]) = none ∧
+    AutoProve.buildEntryEnv?
+      (canaryBody "ai_pcc::auto_pair_arg" 1
+        [canaryUintTy .u8, canaryUintPairTy .u8]
+        [canaryBlock [] .return_]) = none ∧
+    AutoProve.buildEntryEnv?
+      (canaryBody "ai_pcc::auto_arg_count" 1 [canaryUintTy .u8]
+        [canaryBlock [] .return_]) = none ∧
+    AutoProve.autoVerifyAcyclic
+      (canaryBody "ai_pcc::auto_arg_count" 1 [canaryUintTy .u8]
+        [canaryBlock [] .return_]) = false :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 end Anneal.AiPcc
