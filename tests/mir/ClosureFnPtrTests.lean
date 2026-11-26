@@ -6134,24 +6134,29 @@ theorem untyped_fnptr_entry_closure_dispatch_and_c10 :
 
 end Anneal.ClosureFnPtrTests.V08
 
-/-! ## 7. Axiom audit -/
+/-! ## 7. Axiom audit
 
-#print axioms Anneal.ClosureFnPtrTests.Finding.finding_tag_is_9147
-#print axioms Anneal.ClosureFnPtrTests.Finding.finding_probe_is_9147
-#print axioms Anneal.ClosureFnPtrTests.V06.forged_env_call_capturing_is_ub
-#print axioms Anneal.ClosureFnPtrTests.V08.forged_env_call_capturing_is_ub
-#print axioms Anneal.ClosureFnPtrTests.V06.inline_ces_indirect_closure_is_22
-#print axioms Anneal.ClosureFnPtrTests.V08.inline_ces_indirect_closure_is_22
-
-#print axioms Anneal.ClosureFnPtrTests.V06.nested_fnptr_is_15
-#print axioms Anneal.ClosureFnPtrTests.V08.nested_fnptr_is_15
-#print axioms Anneal.ClosureFnPtrTests.V06.concrete_trait_impl_closure_is_28
-#print axioms Anneal.ClosureFnPtrTests.V08.concrete_trait_impl_closure_is_28
-#print axioms Anneal.ClosureFnPtrTests.V06.closure_body_fn_entry_retag_succeeds
-#print axioms Anneal.ClosureFnPtrTests.V08.closure_body_fn_entry_retag_succeeds
-#print axioms Anneal.ClosureFnPtrTests.V06.coerce_wrong_coercion_kind_is_ub
-#print axioms Anneal.ClosureFnPtrTests.V08.coerce_wrong_coercion_kind_is_ub
-#print axioms Anneal.ClosureFnPtrTests.V06.inline_ces_forged_closure_ty_on_non_closure_is_ub
-#print axioms Anneal.ClosureFnPtrTests.V08.inline_ces_forged_closure_ty_on_non_closure_is_ub
-#print axioms Anneal.ClosureFnPtrTests.V06.untyped_fnptr_entry_closure_dispatch_and_c10
-#print axioms Anneal.ClosureFnPtrTests.V08.untyped_fnptr_entry_closure_dispatch_and_c10
+Every declaration added by this file (the embedded `Mir.*` captures, the test-local
+`V2026_08_01` stepper port, and all `Anneal.ClosureFnPtrTests.*` witnesses) is checked:
+no `unsafe` declaration, and every axiom used is in `{propext, Classical.choice,
+Quot.sound}` (so no `sorryAx`, no `Lean.ofReduceBool` / `native_decide`). Fails unless at
+least 150 theorems are audited, so the audit cannot pass vacuously. -/
+open Lean Elab Command in
+run_cmd do
+  let env ← getEnv
+  let allowed : List Name := [``propext, ``Classical.choice, ``Quot.sound]
+  let mut decls : Nat := 0
+  let mut theorems : Nat := 0
+  for (n, ci) in env.constants.map₂.toList do
+    if (`Anneal.ClosureFnPtrTests).isPrefixOf n || (`Mir).isPrefixOf n then
+      if ci.isUnsafe then throwError "unsafe declaration: {n}"
+      let axs ← collectAxioms n
+      for a in axs do
+        unless allowed.contains a do
+          throwError "{n} depends on disallowed axiom {a}"
+      decls := decls + 1
+      if ci matches .thmInfo _ then
+        theorems := theorems + 1
+  if theorems < 150 then
+    throwError "axiom audit covered only {theorems} theorems (expected at least 150)"
+  logInfo m!"axiom audit passed: {decls} declarations ({theorems} theorems)"
