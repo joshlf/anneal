@@ -39,10 +39,13 @@ use crate::mutators_miri::{
 use crate::shrink::{MemoizedOracle, MutatorChainShrinkStatus, shrink_mutation_chain_detailed};
 
 /// Step fuel bound used for `miri-difftest` candidates (`DEFAULT_ORACLE_FUEL`
-/// times 4, so 3-pass Episode 2 ADT/union/retag mutations on loop and
-/// multi-match seeds do not prematurely exhaust step fuel under
-/// `-Zmir-opt-level=0`).
-pub const MIRI_DIFFTEST_CANDIDATE_FUEL: u32 = DEFAULT_ORACLE_FUEL * 4;
+/// times 8 = 1024, so 3-pass mutations stacking indirect-call drivers like
+/// `ClosureAndAddrEqMutator` (`wide_slices_uncalled_closure`, ~280 MIR steps)
+/// with ADT/union/retag and `write_bytes!` mutations (such as Campaign #23
+/// `pass_bitwise_and_or_xor_not__b24_c17` at 566 steps) do not prematurely
+/// exhaust step fuel under `-Zmir-opt-level=0`, while genuine infinite loops
+/// still hit `outOfFuel` promptly).
+pub const MIRI_DIFFTEST_CANDIDATE_FUEL: u32 = DEFAULT_ORACLE_FUEL * 8;
 
 /// Canonical mutator names always included in `mutator_applications`.
 pub const MIRI_MUTATOR_NAMES: [&str; 7] = [
@@ -1480,6 +1483,11 @@ pub struct MiriFindingBundle {
     /// Anneal fault/panic span of the original (unshrunk) candidate in the
     /// staged batch `src/lib.rs`.
     pub batch_anneal_span: Option<String>,
+    /// Concise diagnostic hint naming the failing MIR/Rust construct at
+    /// `anneal_span` (for example `"PointerCoercion::Unsize"` vs.
+    /// `"PointerCoercion::ClosureFnPointer"`), derived without altering the
+    /// canonical 3-part campaign fingerprint.
+    pub failing_construct_hint: Option<String>,
     /// Extracted neighborhood from `.anneal/generated/Mir/<Crate>/<Item>.lean`.
     pub mir_neighborhood: String,
     /// Whether the Lean 4 kernel confirmed `evalMirDiffTagBounded` and
@@ -1899,6 +1907,9 @@ pub struct MiriCandidateShrinkResult {
     /// `.anneal/generated/Mir/...` snippet captured by the oracle run that
     /// accepted `minimized_candidate` (live shrinking only).
     pub mir_neighborhood: Option<String>,
+    /// Diagnostic hint naming the failing MIR/Rust construct from the oracle
+    /// run that accepted `minimized_candidate` (live shrinking only).
+    pub failing_construct_hint: Option<String>,
     /// Kernel confirmation theorem block from the `MiriOracleConfirm.lean` of the
     /// oracle run that accepted `minimized_candidate` (live shrinking only).
     pub kernel_confirm_theorems: Option<String>,
@@ -1935,6 +1946,7 @@ fn unshrunk_result(
         minimized_candidate: cand.clone(),
         minimized_report: original_report.clone(),
         mir_neighborhood: None,
+        failing_construct_hint: None,
         kernel_confirm_theorems: None,
     }
 }
@@ -2073,6 +2085,7 @@ where
             minimized_candidate: min_cand,
             minimized_report: min_rep,
             mir_neighborhood: None,
+            failing_construct_hint: None,
             kernel_confirm_theorems: None,
         };
     }
@@ -2097,6 +2110,8 @@ pub struct LiveCandidateEvaluation {
     pub report: ItemOracleReport,
     /// Extracted `.anneal/generated/Mir/...` snippet for the candidate.
     pub mir_neighborhood: String,
+    /// Concise failing MIR/Rust construct hint derived from the live run.
+    pub failing_construct_hint: Option<String>,
     /// Extracted kernel confirmation theorem block from `MiriOracleConfirm.lean`.
     pub kernel_confirm_theorems: String,
 }
@@ -2143,10 +2158,21 @@ pub fn evaluate_candidate_live(
             .unwrap_or_default();
         let mir_neighborhood =
             extract_mir_neighborhood(&staging_dir, &run.report.crate_camel, &report.name);
+        let staged_anneal_span = report.anneal.span().map(SourceSpan::display_short);
+        let failing_construct_hint = derive_failing_construct_hint_from_staging(
+            &staging_dir,
+            &run.report.crate_camel,
+            &report.name,
+            staged_anneal_span.as_deref(),
+            &mir_neighborhood,
+            &cand.source,
+            staged_anneal_span.as_deref(),
+        );
         let kernel_confirm_theorems = extract_confirm_theorems(&confirm_src, &report.name);
         Ok(LiveCandidateEvaluation {
             report,
             mir_neighborhood,
+            failing_construct_hint,
             kernel_confirm_theorems,
         })
     })();
@@ -2174,7 +2200,8 @@ pub fn minimize_miri_candidate_mutations(
 ) -> Result<MiriCandidateShrinkResult, String> {
     let toolchain = resolve_miri_toolchain_safe()?;
     // Artifacts of signature-matching oracle runs, keyed by evaluated `fn_source`.
-    let mut artifacts_by_source: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut artifacts_by_source: BTreeMap<String, (String, Option<String>, String)> =
+        BTreeMap::new();
     let eval_live = |sub_cand: &GeneratedMiriCandidate| -> Option<ItemOracleReport> {
         let live = match evaluate_candidate_live(
             sub_cand,
@@ -2204,7 +2231,11 @@ pub fn minimize_miri_candidate_mutations(
         if discrepancy_signatures_match(original_report, &live.report) {
             artifacts_by_source.insert(
                 sub_cand.fn_source.clone(),
-                (live.mir_neighborhood, live.kernel_confirm_theorems),
+                (
+                    live.mir_neighborhood,
+                    live.failing_construct_hint,
+                    live.kernel_confirm_theorems,
+                ),
             );
         }
         Some(live.report)
@@ -2216,15 +2247,17 @@ pub fn minimize_miri_candidate_mutations(
     res.executed_oracle_runs = memo.executed_runs;
     drop(memo);
     if res.is_reduced() {
-        let (mir_neighborhood, kernel_confirm_theorems) = artifacts_by_source
-            .remove(&res.minimized_candidate.fn_source)
-            .ok_or_else(|| {
-                format!(
-                    "accepted minimized candidate `{}` has no recorded oracle artifacts",
-                    res.minimized_candidate.fn_name
-                )
-            })?;
+        let (mir_neighborhood, failing_construct_hint, kernel_confirm_theorems) =
+            artifacts_by_source
+                .remove(&res.minimized_candidate.fn_source)
+                .ok_or_else(|| {
+                    format!(
+                        "accepted minimized candidate `{}` has no recorded oracle artifacts",
+                        res.minimized_candidate.fn_name
+                    )
+                })?;
         res.mir_neighborhood = Some(mir_neighborhood);
+        res.failing_construct_hint = failing_construct_hint;
         res.kernel_confirm_theorems = Some(kernel_confirm_theorems);
     }
     Ok(res)
@@ -2880,7 +2913,7 @@ fn translate_span_to_repro(
     translate_span_to_repro_with_aux(span, batch_start_line, repro_start_line, &[])
 }
 
-fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str) -> String {
+fn resolve_candidate_mir_path(corpus_root: &Path, crate_camel: &str, fn_name: &str) -> PathBuf {
     let crate_mir_dir = corpus_root.join(".anneal/generated/Mir").join(crate_camel);
     let reexported_ns_path = fs::read_to_string(corpus_root.join("src/lib.rs"))
         .ok()
@@ -2888,7 +2921,7 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
         .map(|ns| crate_mir_dir.join(format!("{ns}_{fn_name}.lean")))
         .filter(|p| p.is_file());
     let direct_path = crate_mir_dir.join(format!("{fn_name}.lean"));
-    let mir_path = if let Some(ns_path) = reexported_ns_path {
+    if let Some(ns_path) = reexported_ns_path {
         ns_path
     } else if direct_path.is_file() {
         direct_path
@@ -2904,12 +2937,18 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
                     .and_then(|s| s.to_str())
                     .and_then(|n| n.strip_prefix("stage_ns_"))
                     .and_then(|n| n.strip_suffix(&suffix))
-                    .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                    .is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                    })
             })
             .collect();
         ns_matches.sort();
         ns_matches.into_iter().next().unwrap_or(direct_path)
-    };
+    }
+}
+
+fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str) -> String {
+    let mir_path = resolve_candidate_mir_path(corpus_root, crate_camel, fn_name);
     let Ok(raw) = fs::read_to_string(&mir_path) else {
         return format!("(Mir module {} not found)", mir_path.display());
     };
@@ -2926,6 +2965,430 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
         ));
         snippet
     }
+}
+
+fn camel_to_pascal(ident: &str) -> String {
+    let clean = ident.trim_end_matches('_');
+    let mut chars = clean.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => ident.to_string(),
+    }
+}
+
+fn spans_refer_to_same_site(record_span: &str, target_span: &str) -> bool {
+    let rec = record_span.trim();
+    let tgt = target_span.trim();
+    if rec.is_empty() || tgt.is_empty() {
+        return false;
+    }
+    if rec == tgt {
+        return true;
+    }
+    if let (Some(rs), Some(ts)) = (
+        SourceSpan::parse_anneal_span(rec),
+        SourceSpan::parse_anneal_span(tgt),
+    ) {
+        return source_files_match(&rs.file, &ts.file)
+            && rs.start_line == ts.start_line
+            && rs.start_col == ts.start_col
+            && rs.end_line == ts.end_line
+            && rs.end_col == ts.end_col;
+    }
+    false
+}
+
+fn extract_first_lean_string_literal(raw: &str) -> Option<String> {
+    let start = raw.find('"')?;
+    let mut out = String::new();
+    let mut chars = raw[start + 1..].chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(esc) = chars.next() {
+                    match esc {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        other => out.push(other),
+                    }
+                }
+            }
+            '"' => return Some(out),
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+fn iter_mir_kind_span_records(mir_text: &str) -> Vec<(String, String)> {
+    let mut records = Vec::new();
+    let marker = "{ kind :=";
+    let bytes = mir_text.as_bytes();
+    let mut pos = 0usize;
+    while let Some(rel) = mir_text[pos..].find(marker) {
+        let start = pos + rel;
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut i = start;
+        let mut end = None;
+        let mut top_span_idx = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_str {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                b',' if depth == 1 && mir_text[i..].starts_with(", span :=") => {
+                    top_span_idx = Some(i);
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(end_idx) = end else {
+            break;
+        };
+        if let Some(span_idx) = top_span_idx {
+            let kind_expr = mir_text[start + marker.len()..span_idx].trim();
+            let span_rhs = mir_text[span_idx + ", span :=".len()..end_idx].trim();
+            if let Some(span_str) = extract_first_lean_string_literal(span_rhs) {
+                records.push((kind_expr.to_string(), span_str));
+            }
+        }
+        pos = end_idx + 1;
+    }
+    records
+}
+
+fn take_lean_ident_prefix(raw: &str) -> Option<&str> {
+    let len = raw
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    (len > 0).then_some(&raw[..len])
+}
+
+fn classify_mir_kind_expr(kind_expr: &str) -> Option<(u8, String)> {
+    // 1. `CastKind.pointerCoercion` (both quoted rustc debug tags and constructor spellings).
+    if let Some(idx) = kind_expr.find("CastKind.pointerCoercion") {
+        let rest = kind_expr[idx + "CastKind.pointerCoercion".len()..].trim_start();
+        if rest.starts_with('"')
+            && let Some(raw_tag) = extract_first_lean_string_literal(rest)
+        {
+            let variant = raw_tag.split('(').next().unwrap_or("").trim();
+            if !variant.is_empty() {
+                return Some((100, format!("PointerCoercion::{variant}")));
+            }
+        }
+        let ctor_rest = rest.trim_start_matches('(').trim_start();
+        if let Some(after_pc) = ctor_rest.strip_prefix("PointerCoercion.")
+            && let Some(ident) = take_lean_ident_prefix(after_pc)
+        {
+            return Some((100, format!("PointerCoercion::{}", camel_to_pascal(ident))));
+        }
+    }
+    // 2. Other `CastKind.<variant>`.
+    if let Some(idx) = kind_expr.find("CastKind.")
+        && let Some(ident) = take_lean_ident_prefix(&kind_expr[idx + "CastKind.".len()..])
+    {
+        return Some((95, format!("CastKind::{}", camel_to_pascal(ident))));
+    }
+    // 3. Specific `Rvalue.*` inside `StatementKind.assign`.
+    if let Some(idx) = kind_expr.find("Rvalue.binaryOp") {
+        let rest = &kind_expr[idx + "Rvalue.binaryOp".len()..];
+        if let Some(bidx) = rest.find("BinOp.")
+            && let Some(op) = take_lean_ident_prefix(&rest[bidx + "BinOp.".len()..])
+        {
+            return Some((80, format!("BinaryOp::{}", camel_to_pascal(op))));
+        }
+    }
+    if let Some(idx) = kind_expr.find("Rvalue.unaryOp") {
+        let rest = &kind_expr[idx + "Rvalue.unaryOp".len()..];
+        if let Some(uidx) = rest.find("UnOp.")
+            && let Some(op) = take_lean_ident_prefix(&rest[uidx + "UnOp.".len()..])
+        {
+            return Some((80, format!("UnaryOp::{}", camel_to_pascal(op))));
+        }
+    }
+    if let Some(idx) = kind_expr.find("Rvalue.nullaryOp") {
+        let rest = &kind_expr[idx + "Rvalue.nullaryOp".len()..];
+        if let Some(nidx) = rest.find("NullOp.")
+            && let Some(op) = take_lean_ident_prefix(&rest[nidx + "NullOp.".len()..])
+        {
+            return Some((80, format!("NullOp::{}", camel_to_pascal(op))));
+        }
+    }
+    if let Some(idx) = kind_expr.find("Rvalue.aggregate") {
+        let rest = &kind_expr[idx + "Rvalue.aggregate".len()..];
+        if let Some(aidx) = rest.find("AggregateKind.")
+            && let Some(kind) = take_lean_ident_prefix(&rest[aidx + "AggregateKind.".len()..])
+        {
+            return Some((80, format!("AggregateKind::{}", camel_to_pascal(kind))));
+        }
+    }
+    for (rv_name, prio) in [
+        ("discriminant", 70u8),
+        ("len", 70),
+        ("rawPtr", 70),
+        ("repeat", 70),
+        ("shallowInitBox", 70),
+        ("copyForDeref", 70),
+        ("wrapUnsafeBinder", 70),
+        ("ref", 60),
+    ] {
+        let pat = format!("Rvalue.{rv_name}");
+        if let Some(idx) = kind_expr.find(&pat) {
+            let after = kind_expr.as_bytes().get(idx + pat.len()).copied();
+            if after.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_') {
+                return Some((prio, format!("Rvalue::{}", camel_to_pascal(rv_name))));
+            }
+        }
+    }
+    // 4. Non-assign `StatementKind.*`.
+    if let Some(idx) = kind_expr.find("NonDivergingIntrinsic.")
+        && let Some(intr) =
+            take_lean_ident_prefix(&kind_expr[idx + "NonDivergingIntrinsic.".len()..])
+    {
+        return Some((90, format!("Intrinsic::{}", camel_to_pascal(intr))));
+    }
+    for (stmt_name, prio) in [
+        ("retag", 80u8),
+        ("setDiscriminant", 80),
+        ("deinit", 80),
+        ("assign", 40),
+        ("placeMention", 20),
+        ("storageDead", 10),
+        ("storageLive", 10),
+    ] {
+        let pat = format!("StatementKind.{stmt_name}");
+        if let Some(idx) = kind_expr.find(&pat) {
+            let after = kind_expr.as_bytes().get(idx + pat.len()).copied();
+            if after.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_') {
+                return Some((prio, format!("StatementKind::{}", camel_to_pascal(stmt_name))));
+            }
+        }
+    }
+    // 5. `TerminatorKind.*`.
+    if kind_expr.contains("TerminatorKind.call") {
+        if let Some(idx) = kind_expr.find("RigidTy.fnDef") {
+            let rest = kind_expr[idx + "RigidTy.fnDef".len()..].trim_start();
+            if let Some(callee) = extract_first_lean_string_literal(rest)
+                && !callee.is_empty()
+            {
+                return Some((90, format!("Call::{callee}")));
+            }
+        }
+        return Some((60, "TerminatorKind::Call".to_string()));
+    }
+    for (term_name, prio) in [
+        ("assert", 90u8),
+        ("drop", 90),
+        ("unreachable", 90),
+        ("inlineAsm", 90),
+        ("tailCall", 90),
+        ("switchInt", 60),
+        ("goto", 20),
+        ("return_", 20),
+    ] {
+        let pat = format!("TerminatorKind.{term_name}");
+        if let Some(idx) = kind_expr.find(&pat) {
+            let after = kind_expr.as_bytes().get(idx + pat.len()).copied();
+            if after.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_') {
+                return Some((prio, format!("TerminatorKind::{}", camel_to_pascal(term_name))));
+            }
+        }
+    }
+    None
+}
+
+/// Derive a concise diagnostic hint (such as `"PointerCoercion::Unsize"` or
+/// `"PointerCoercion::ClosureFnPointer"`) from Lean MIR text matching any span
+/// in `target_spans`, preferring the highest-specificity construct when
+/// multiple statements (e.g. `StorageLive`, `Rvalue.ref`, and `CastKind.pointerCoercion`)
+/// share the same source span.
+pub fn extract_failing_construct_hint_from_mir(
+    mir_text: &str,
+    target_spans: &[&str],
+) -> Option<String> {
+    if mir_text.is_empty() || target_spans.is_empty() {
+        return None;
+    }
+    let records = iter_mir_kind_span_records(mir_text);
+    for &target in target_spans {
+        let mut best: Option<(u8, String)> = None;
+        for (kind_expr, rec_span) in &records {
+            if spans_refer_to_same_site(rec_span, target)
+                && let Some((prio, hint)) = classify_mir_kind_expr(kind_expr)
+            {
+                if best.as_ref().is_none_or(|(best_prio, _)| prio > *best_prio) {
+                    best = Some((prio, hint));
+                }
+            }
+        }
+        if let Some((_, hint)) = best {
+            return Some(hint);
+        }
+    }
+    None
+}
+
+fn extract_failing_construct_hint_from_rust_line(fault_line: &str) -> Option<String> {
+    let stripped = fault_line.trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    if stripped.contains("as &dyn ")
+        || stripped.contains("as &mut dyn ")
+        || stripped.contains("as *const dyn ")
+        || stripped.contains("as *mut dyn ")
+    {
+        return Some("PointerCoercion::Unsize".to_string());
+    }
+    if (stripped.contains("fn(") || stripped.contains("unsafe fn("))
+        && stripped.contains('|')
+        && (stripped.contains(": fn(")
+            || stripped.contains(": unsafe fn(")
+            || stripped.contains("as fn(")
+            || stripped.contains("as unsafe fn("))
+    {
+        return Some("PointerCoercion::ClosureFnPointer".to_string());
+    }
+    if stripped.contains("transmute::<") || stripped.contains("transmute(") {
+        return Some("CastKind::Transmute".to_string());
+    }
+    if stripped.contains("copy_nonoverlapping(") {
+        return Some("Intrinsic::CopyNonOverlapping".to_string());
+    }
+    if stripped.contains("addr_eq(") {
+        return Some("Call::core::ptr::addr_eq".to_string());
+    }
+    for name in [
+        "unchecked_add",
+        "unchecked_sub",
+        "unchecked_mul",
+        "unchecked_div",
+        "unchecked_rem",
+        "unchecked_shl",
+        "unchecked_shr",
+    ] {
+        if stripped.contains(&format!("{name}(")) {
+            return Some(format!("Call::{name}"));
+        }
+    }
+    None
+}
+
+fn derive_failing_construct_hint_from_staging(
+    corpus_root: &Path,
+    crate_camel: &str,
+    fn_name: &str,
+    staged_anneal_span: Option<&str>,
+    mir_neighborhood: &str,
+    repro_source: &str,
+    repro_anneal_span: Option<&str>,
+) -> Option<String> {
+    if let Some(sp) = staged_anneal_span {
+        let primary_path = resolve_candidate_mir_path(corpus_root, crate_camel, fn_name);
+        if let Ok(raw) = fs::read_to_string(&primary_path)
+            && let Some(hint) = extract_failing_construct_hint_from_mir(&raw, &[sp])
+        {
+            return Some(hint);
+        }
+        // Faults in indirect-call drivers (`__anneal_vt_driver_*`,
+        // `__anneal_clos_driver_*`) or other intra-crate helpers live in the
+        // helper's `.lean` file rather than `<fn_name>.lean`. Scan the staged
+        // crate's generated MIR modules deterministically for the exact span.
+        let crate_mir_dir = corpus_root.join(".anneal/generated/Mir").join(crate_camel);
+        let fast_needle = SourceSpan::parse_anneal_span(sp).map(|s| {
+            format!(
+                ":{}:{}: {}:{}",
+                s.start_line, s.start_col, s.end_line, s.end_col
+            )
+        });
+        let primary_ns = primary_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(split_stage_ns_rel)
+            .map(|(ns, _)| format!("{ns}_"));
+        let mut lean_files: Vec<PathBuf> = fs::read_dir(&crate_mir_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|ent| ent.path()))
+            .filter(|p| {
+                p.extension().and_then(|e| e.to_str()) == Some("lean") && *p != primary_path
+            })
+            .collect();
+        lean_files.sort_by(|a, b| {
+            let a_in_ns = primary_ns.as_deref().is_some_and(|pfx| {
+                a.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with(pfx))
+            });
+            let b_in_ns = primary_ns.as_deref().is_some_and(|pfx| {
+                b.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with(pfx))
+            });
+            b_in_ns.cmp(&a_in_ns).then_with(|| a.cmp(b))
+        });
+        for path in lean_files {
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let maybe_present = raw.contains(sp)
+                || fast_needle
+                    .as_deref()
+                    .is_some_and(|needle| raw.contains(needle));
+            if !maybe_present {
+                continue;
+            }
+            if let Some(hint) = extract_failing_construct_hint_from_mir(&raw, &[sp]) {
+                return Some(hint);
+            }
+        }
+    }
+
+    let mut fallback_spans: Vec<&str> = Vec::new();
+    if let Some(sp) = repro_anneal_span {
+        fallback_spans.push(sp);
+    }
+    if let Some(sp) = staged_anneal_span
+        && !fallback_spans.contains(&sp)
+    {
+        fallback_spans.push(sp);
+    }
+    if let Some(hint) = extract_failing_construct_hint_from_mir(mir_neighborhood, &fallback_spans) {
+        return Some(hint);
+    }
+    if let Some(sp) = repro_anneal_span
+        && let Some(parsed) = SourceSpan::parse_anneal_span(sp)
+        && parsed.start_line >= 1
+        && let Some(line) = repro_source.lines().nth((parsed.start_line - 1) as usize)
+    {
+        return extract_failing_construct_hint_from_rust_line(line);
+    }
+    None
 }
 
 /// The `namespace <ident> ... end <ident>` section of `confirm_src` enclosing
@@ -3085,25 +3548,74 @@ struct FnAndAuxCollector<'a> {
     fn_bodies: &'a mut BTreeMap<String, proc_macro2::TokenStream>,
     aux_tokens: &'a mut BTreeMap<String, Vec<proc_macro2::TokenStream>>,
     impl_method_names: &'a mut BTreeSet<String>,
+    nested_fn_stems: &'a mut BTreeMap<String, Vec<(Option<String>, String)>>,
+    path_stack: Vec<String>,
+    top_fn_stack: Vec<String>,
+    in_impl_depth: usize,
+}
+
+impl FnAndAuxCollector<'_> {
+    fn record_nested_fn_stem(&mut self, leaf_fn: &str) {
+        if self.path_stack.len() < 2 {
+            return;
+        }
+        let owner = (self.top_fn_stack.first().cloned(), leaf_fn.to_string());
+        for stem in [self.path_stack.join("_"), self.path_stack.join(".")] {
+            let entries = self.nested_fn_stems.entry(stem).or_default();
+            if !entries.contains(&owner) {
+                entries.push(owner.clone());
+            }
+        }
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
     fn visit_item_fn(&mut self, func: &'ast syn::ItemFn) {
+        let name = func.sig.ident.to_string();
         self.fn_bodies
-            .entry(func.sig.ident.to_string())
+            .entry(name.clone())
             .or_default()
             .extend(quote::ToTokens::to_token_stream(func));
+        let pushed_top = self.path_stack.is_empty() && self.in_impl_depth == 0;
+        self.path_stack.push(name.clone());
+        if pushed_top {
+            self.top_fn_stack.push(name.clone());
+        } else if self.in_impl_depth == 0 {
+            self.record_nested_fn_stem(&name);
+        }
         syn::visit::visit_item_fn(self, func);
+        if pushed_top {
+            self.top_fn_stack.pop();
+        }
+        self.path_stack.pop();
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        self.path_stack.push(item.ident.to_string());
+        syn::visit::visit_item_mod(self, item);
+        self.path_stack.pop();
+    }
+
+    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+        self.path_stack.push(item.ident.to_string());
+        syn::visit::visit_item_trait(self, item);
+        self.path_stack.pop();
     }
 
     fn visit_trait_item_fn(&mut self, method: &'ast syn::TraitItemFn) {
+        let name = method.sig.ident.to_string();
         if method.default.is_some() {
             self.fn_bodies
-                .entry(method.sig.ident.to_string())
+                .entry(name.clone())
                 .or_default()
                 .extend(quote::ToTokens::to_token_stream(method));
         }
+        self.path_stack.push(name.clone());
+        if method.default.is_some() && self.in_impl_depth == 0 {
+            self.record_nested_fn_stem(&name);
+        }
         syn::visit::visit_trait_item_fn(self, method);
+        self.path_stack.pop();
     }
 
     fn visit_item_macro(&mut self, mac: &'ast syn::ItemMacro) {
@@ -3187,7 +3699,9 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
                 }
             }
         }
+        self.in_impl_depth += 1;
         syn::visit::visit_item_impl(self, imp);
+        self.in_impl_depth -= 1;
     }
 }
 
@@ -3196,11 +3710,16 @@ fn collect_fn_and_aux_items(
     fn_bodies: &mut BTreeMap<String, proc_macro2::TokenStream>,
     aux_tokens: &mut BTreeMap<String, Vec<proc_macro2::TokenStream>>,
     impl_method_names: &mut BTreeSet<String>,
+    nested_fn_stems: &mut BTreeMap<String, Vec<(Option<String>, String)>>,
 ) {
     let mut collector = FnAndAuxCollector {
         fn_bodies,
         aux_tokens,
         impl_method_names,
+        nested_fn_stems,
+        path_stack: Vec::new(),
+        top_fn_stack: Vec::new(),
+        in_impl_depth: 0,
     };
     for item in items {
         syn::visit::Visit::visit_item(&mut collector, item);
@@ -3212,6 +3731,7 @@ struct ScopeGraphData {
     fn_bodies: BTreeMap<String, proc_macro2::TokenStream>,
     aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>>,
     impl_method_names: BTreeSet<String>,
+    nested_fn_stems: BTreeMap<String, Vec<(Option<String>, String)>>,
     top_level_fns: BTreeSet<String>,
     defined_value_names: BTreeSet<String>,
     defined_type_names: BTreeSet<String>,
@@ -3283,6 +3803,7 @@ fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> Scoped
                         &mut ns_data.fn_bodies,
                         &mut ns_data.aux_tokens,
                         &mut ns_data.impl_method_names,
+                        &mut ns_data.nested_fn_stems,
                     );
                     stage_ns.insert(mod_name, ns_data);
                 }
@@ -3297,6 +3818,7 @@ fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> Scoped
             &mut root.fn_bodies,
             &mut root.aux_tokens,
             &mut root.impl_method_names,
+            &mut root.nested_fn_stems,
         );
     }
 
@@ -4085,6 +4607,134 @@ fn split_stage_ns_rel(rel: &str) -> Option<(&str, &str)> {
     Some((&trimmed[..ns_len], &after_prefix[digit_len + 1..]))
 }
 
+fn is_closure_dot_segment(seg: &str) -> bool {
+    let core = seg.trim_matches('_');
+    if core == "closure" {
+        return true;
+    }
+    let Some(rest) = core.strip_prefix("closure_") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split('_')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Strip one trailing closure segment from a sanitized or dotted relative
+/// module stem, yielding candidate enclosing prefixes in priority order
+/// (single-`_` separator before legacy double-`__` so a function whose name
+/// ends in `_` takes precedence over one without).
+fn strip_one_trailing_closure_segment<'a>(s: &'a str) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+
+    if let Some((prefix, tail)) = s.rsplit_once('.')
+        && !prefix.is_empty()
+        && is_closure_dot_segment(tail)
+    {
+        out.push(prefix);
+    }
+
+    // Underscore-separated forms:
+    // - `<prefix>_closure` (from `{closure}`)
+    // - `<prefix>_closure_<digits>` (from `{closure#N}`)
+    // - `<prefix>_closure_<digits>_<digits>` (when `disambiguate_identifier` appended `_2`, ...)
+    // Plus legacy double-underscore test forms (`<prefix>__closure`, `<prefix>__closure_<digits>`).
+    let mut push_underscored = |before_closure: &'a str| {
+        if !before_closure.is_empty() && !out.contains(&before_closure) {
+            out.push(before_closure);
+        }
+        if let Some(legacy) = before_closure.strip_suffix('_')
+            && !legacy.is_empty()
+            && !out.contains(&legacy)
+        {
+            out.push(legacy);
+        }
+    };
+
+    if let Some(before) = s.strip_suffix("_closure") {
+        push_underscored(before);
+    }
+    if let Some((stem_before_num, num)) = s.rsplit_once('_')
+        && !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
+    {
+        if let Some(before) = stem_before_num.strip_suffix("_closure") {
+            push_underscored(before);
+        } else if let Some((stem_before_idx, idx)) = stem_before_num.rsplit_once('_')
+            && !idx.is_empty()
+            && idx.bytes().all(|b| b.is_ascii_digit())
+            && let Some(before) = stem_before_idx.strip_suffix("_closure")
+        {
+            push_underscored(before);
+        }
+    }
+
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClosureOwner {
+    TopFn(String),
+    NestedFn {
+        top_fn: Option<String>,
+        leaf_fn: String,
+    },
+}
+
+/// Resolve the enclosing function owner(s) of a closure's relative stem inside
+/// `scope_graph` by peeling closure segments one level at a time (breadth-first),
+/// stopping at the shallowest depth that matches a known top-level or nested
+/// function so `fn foo_closure` never over-strips to `fn foo`, while nested
+/// closures (`foo::{closure#0}::{closure#0}`) peel back to `foo`.
+fn resolve_closure_owners_in_scope(rel: &str, scope_graph: &ScopeGraphData) -> Vec<ClosureOwner> {
+    const MAX_CLOSURE_DEPTH: usize = 16;
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut frontier: Vec<&str> = Vec::new();
+    for cand in strip_one_trailing_closure_segment(rel) {
+        if visited.insert(cand) {
+            frontier.push(cand);
+        }
+    }
+    for _depth in 1..=MAX_CLOSURE_DEPTH {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut matched: Vec<ClosureOwner> = Vec::new();
+        for &cand in &frontier {
+            if scope_graph.top_level_fns.contains(cand) {
+                let owner = ClosureOwner::TopFn(cand.to_string());
+                if !matched.contains(&owner) {
+                    matched.push(owner);
+                }
+            } else if let Some(nested_list) = scope_graph.nested_fn_stems.get(cand) {
+                for (top_fn, leaf_fn) in nested_list {
+                    let owner = ClosureOwner::NestedFn {
+                        top_fn: top_fn.clone(),
+                        leaf_fn: leaf_fn.clone(),
+                    };
+                    if !matched.contains(&owner) {
+                        matched.push(owner);
+                    }
+                }
+            }
+        }
+        if !matched.is_empty() {
+            return matched;
+        }
+        let mut next_frontier: Vec<&str> = Vec::new();
+        for cand in frontier {
+            for next in strip_one_trailing_closure_segment(cand) {
+                if visited.insert(next) {
+                    next_frontier.push(next);
+                }
+            }
+        }
+        frontier = next_frontier;
+    }
+    Vec::new()
+}
+
 /// Subset of the batch's `helper_module_suffixes` that `MiriOracleConfirm.lean`
 /// links for `entries`, keeping crate-root (`None`) and `stage_ns_<n>` scopes
 /// strictly isolated unless `stage_ns_<n>` reaches an unshadowed `super::*` item.
@@ -4124,11 +4774,26 @@ fn confirm_helper_module_suffixes(
                 .get(&target_scope)
                 .unwrap_or(&empty_set);
 
-            let enclosing_top_fn = |short: &str, suf: &str| -> Option<String> {
-                let mut rel = suf.strip_prefix(&crate_prefix)?;
-                while let Some((_, rest)) = split_stage_ns_rel(rel) {
-                    rel = rest;
+            fn strip_scope_rel<'a>(
+                suf: &'a str,
+                crate_prefix: &str,
+                target_ns: Option<&str>,
+            ) -> Option<&'a str> {
+                let mut rel = suf.strip_prefix(crate_prefix)?;
+                if let Some(target_ns) = target_ns {
+                    while let Some((ns, rest)) = split_stage_ns_rel(rel) {
+                        if ns == target_ns {
+                            rel = rest;
+                        } else {
+                            break;
+                        }
+                    }
                 }
+                Some(rel)
+            }
+
+            let enclosing_top_fn = |short: &str, suf: &str| -> Option<String> {
+                let rel = strip_scope_rel(suf, &crate_prefix, target_scope.as_deref())?;
                 if rel == short {
                     return None;
                 }
@@ -4136,12 +4801,6 @@ fn confirm_helper_module_suffixes(
                     && scope_graph.top_level_fns.contains(first)
                 {
                     return Some(first.to_string());
-                }
-                if short.starts_with("{closure")
-                    && let Some((prefix, _)) = rel.rsplit_once("__closure")
-                    && scope_graph.top_level_fns.contains(prefix)
-                {
-                    return Some(prefix.to_string());
                 }
                 if let Some(prefix) = rel.strip_suffix(&format!("_{short}"))
                     && scope_graph.top_level_fns.contains(prefix)
@@ -4151,12 +4810,8 @@ fn confirm_helper_module_suffixes(
                 None
             };
             let matching_impl_self_ty = |short: &str, suf: &str| -> Option<String> {
-                let mut cur = suf.strip_prefix(&crate_prefix)?;
-                while let Some((_, rest)) = split_stage_ns_rel(cur) {
-                    cur = rest;
-                }
-                let rel_trimmed = cur.trim_start_matches('_');
-                if rel_trimmed == short {
+                let cur = strip_scope_rel(suf, &crate_prefix, target_scope.as_deref())?;
+                if cur == short || cur.strip_prefix('_') == Some(short) {
                     return None;
                 }
                 let mut candidate_types: BTreeSet<&String> =
@@ -4168,11 +4823,17 @@ fn confirm_helper_module_suffixes(
                         }
                     }
                 }
+                let cur_no_leading_lt = cur.strip_prefix('_');
                 candidate_types
                     .into_iter()
                     .filter(|self_ty| {
-                        rel_trimmed.starts_with(&format!("{self_ty}_"))
-                            || rel_trimmed.starts_with(&format!("{self_ty}."))
+                        let pat_u = format!("{self_ty}_");
+                        let pat_d = format!("{self_ty}.");
+                        cur.starts_with(&pat_u)
+                            || cur.starts_with(&pat_d)
+                            || cur_no_leading_lt.is_some_and(|stripped| {
+                                stripped.starts_with(&pat_u) || stripped.starts_with(&pat_d)
+                            })
                     })
                     .max_by_key(|self_ty| self_ty.len())
                     .cloned()
@@ -4193,6 +4854,12 @@ fn confirm_helper_module_suffixes(
                     (None, None) => scoped.root.fn_bodies.contains_key(entry_name),
                 }
             };
+            let top_fn_is_reached = |fn_name: &str| -> bool {
+                entries
+                    .iter()
+                    .any(|s| s.name == fn_name && entry_is_in_target_scope(&s.name))
+                    || scope_fns.contains(fn_name)
+            };
 
             subject_pairs
                 .iter()
@@ -4200,17 +4867,31 @@ fn confirm_helper_module_suffixes(
                 .any(|(short, _)| {
                     let is_opaque = !scope_graph.fn_bodies.contains_key(short)
                         && !scope_graph.impl_method_names.contains(short);
+                    if short.starts_with("{closure")
+                        && let Some(rel) =
+                            strip_scope_rel(suffix, &crate_prefix, target_scope.as_deref())
+                    {
+                        let owners = resolve_closure_owners_in_scope(rel, scope_graph);
+                        if !owners.is_empty() {
+                            return owners.iter().any(|owner| match owner {
+                                ClosureOwner::TopFn(f) => top_fn_is_reached(f),
+                                ClosureOwner::NestedFn { top_fn, leaf_fn } => {
+                                    scope_fns.contains(leaf_fn)
+                                        && top_fn
+                                            .as_deref()
+                                            .is_none_or(|top| top_fn_is_reached(top))
+                                }
+                            });
+                        }
+                    }
                     if let Some(enclosing) = enclosing_top_fn(short, suffix) {
                         let ambiguous_with_type_impl = scope_graph
                             .defined_type_names
                             .contains(&enclosing)
                             && scope_graph.impl_method_names.contains(short);
                         if !ambiguous_with_type_impl {
-                            let enclosing_reached = entries
-                                .iter()
-                                .any(|s| s.name == enclosing && entry_is_in_target_scope(&s.name))
-                                || scope_fns.contains(&enclosing);
-                            return enclosing_reached && (scope_fns.contains(short) || is_opaque);
+                            return top_fn_is_reached(&enclosing)
+                                && (scope_fns.contains(short) || is_opaque);
                         }
                     }
                     if let Some(self_ty) = matching_impl_self_ty(short, suffix) {
@@ -6422,6 +7103,7 @@ fn write_finding_bundle_to_dir(
          - **Witness polarity**: `{}`\n\
          - **Miri outcome**: `{}` (repro position: `{}`)\n\
          - **Anneal outcome**: `{}` (`{}` at `{}`)\n\
+         - **Failing construct hint**: `{}`\n\
          - **Lean 4 kernel confirmed (`by rfl`)**: `{}`\n\
          - **Standalone reproducer**: `{}`\n\n\
          ## Miri Output Excerpt\n\n\
@@ -6448,6 +7130,7 @@ fn write_finding_bundle_to_dir(
         finding.anneal_outcome_tag,
         finding.anneal_lean_tag,
         finding.anneal_span.as_deref().unwrap_or("none"),
+        finding.failing_construct_hint.as_deref().unwrap_or("none"),
         finding.kernel_confirmed,
         repro_path.display(),
         finding.miri_excerpt,
@@ -6936,20 +7619,36 @@ pub fn evaluate_miri_batches_with_options(
                         .anneal
                         .to_lean_mir_diff_tag()
                         .unwrap_or_else(|| "none".to_string());
-                    let (mir_neighborhood, kernel_confirm_theorems) = match reduced {
-                        Some(sr) => (
-                            sr.mir_neighborhood.clone().unwrap_or_default(),
-                            sr.kernel_confirm_theorems.clone().unwrap_or_default(),
-                        ),
-                        None => (
-                            extract_mir_neighborhood(
-                                &staging_dir,
-                                &oracle_report.crate_camel,
-                                &item_rep.name,
+                    let (mir_neighborhood, failing_construct_hint, kernel_confirm_theorems) =
+                        match reduced {
+                            Some(sr) => (
+                                sr.mir_neighborhood.clone().unwrap_or_default(),
+                                sr.failing_construct_hint.clone(),
+                                sr.kernel_confirm_theorems.clone().unwrap_or_default(),
                             ),
-                            extract_confirm_theorems(&confirm_src, &item_rep.name),
-                        ),
-                    };
+                            None => {
+                                let mir_neighborhood = extract_mir_neighborhood(
+                                    &staging_dir,
+                                    &oracle_report.crate_camel,
+                                    &item_rep.name,
+                                );
+                                let failing_construct_hint =
+                                    derive_failing_construct_hint_from_staging(
+                                        &staging_dir,
+                                        &oracle_report.crate_camel,
+                                        &item_rep.name,
+                                        batch_anneal_span.as_deref(),
+                                        &mir_neighborhood,
+                                        &eff_cand.source,
+                                        repro_anneal_span.as_deref(),
+                                    );
+                                (
+                                    mir_neighborhood,
+                                    failing_construct_hint,
+                                    extract_confirm_theorems(&confirm_src, &item_rep.name),
+                                )
+                            }
+                        };
 
                     let finding_id = format!("finding_{:04}_{}", findings.len(), item_rep.name);
                     let mut bundle = MiriFindingBundle {
@@ -6978,6 +7677,7 @@ pub fn evaluate_miri_batches_with_options(
                         anneal_lean_tag,
                         anneal_span: repro_anneal_span,
                         batch_anneal_span,
+                        failing_construct_hint,
                         mir_neighborhood,
                         kernel_confirmed: eff_item_rep.kernel_confirmed,
                         kernel_confirm_theorems,
@@ -7199,6 +7899,7 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
          {inner}\"anneal_lean_tag\": {},\n\
          {inner}\"anneal_span\": {},\n\
          {inner}\"batch_anneal_span\": {},\n\
+         {inner}\"failing_construct_hint\": {},\n\
          {inner}\"mir_neighborhood\": {},\n\
          {inner}\"kernel_confirmed\": {},\n\
          {inner}\"kernel_confirm_theorems\": {},\n\
@@ -7221,6 +7922,7 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
         json_escape(&finding.anneal_lean_tag),
         render_opt_str_json(&finding.anneal_span),
         render_opt_str_json(&finding.batch_anneal_span),
+        render_opt_str_json(&finding.failing_construct_hint),
         json_escape(&finding.mir_neighborhood),
         finding.kernel_confirmed,
         json_escape(&finding.kernel_confirm_theorems),
@@ -10581,6 +11283,7 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
             anneal_lean_tag: "MirDiffTag.ub".to_string(),
             anneal_span: Some("src/lib.rs:56:9:56:42".to_string()),
             batch_anneal_span: Some("src/lib.rs:124:9:124:42".to_string()),
+            failing_construct_hint: Some("PointerCoercion::ClosureFnPointer".to_string()),
             mir_neighborhood: "def body : CapturedMir := ...".to_string(),
             kernel_confirmed: true,
             kernel_confirm_theorems: "theorem confirm_tag_x : ... := by\n  rfl".to_string(),
@@ -10605,6 +11308,7 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
         assert!(finding_json.contains("\"executed_oracle_runs\": 3"));
         assert!(finding_json.contains("\"shrink_status\": \"minimized\""));
         assert!(finding_json.contains("\"witness_polarity\": \"value_mismatch\""));
+        assert!(finding_json.contains("\"failing_construct_hint\": \"PointerCoercion::ClosureFnPointer\""));
         assert!(summary_md.contains(
             "- **Original mutator chain**: `ArithmeticCastMutator, RawPtrOffsetMutator, PlaceProjectionWrapper`"
         ));
@@ -10614,6 +11318,7 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
         ));
         assert!(summary_md.contains("- **Shrink status**: `minimized`"));
         assert!(summary_md.contains("- **Witness polarity**: `value_mismatch`"));
+        assert!(summary_md.contains("- **Failing construct hint**: `PointerCoercion::ClosureFnPointer`"));
     }
 
     #[test]
@@ -11355,6 +12060,7 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
             anneal_lean_tag: "MirDiffTag.passScalar 0 4".to_string(),
             anneal_span: None,
             batch_anneal_span: None,
+            failing_construct_hint: None,
             mir_neighborhood: String::new(),
             kernel_confirmed: true,
             kernel_confirm_theorems: String::new(),
@@ -14403,5 +15109,486 @@ pub fn cand_ep1_b4_rename() -> u32 {
                 b"\xff\xfe"
             ))));
         }
+    }
+
+    #[test]
+    fn confirm_helper_module_suffixes_resolves_nested_and_underscored_closures_with_stage_ns_isolation()
+    {
+        let lib_rs = "\
+fn __anneal_vt_driver_61873(seed: u32) -> u32 {
+    let f = |z: u32| z + 1u32;
+    let g = |z: u32| {
+        let inner = |w: u32| w ^ 3u32;
+        inner(z)
+    };
+    f(seed) ^ g(seed)
+}
+fn __anneal_vt_driver_1(seed: u32) -> u32 {
+    let f = |z: u32| z ^ 1u32;
+    f(seed)
+}
+fn __anneal_vt_driver_10(seed: u32) -> u32 {
+    let f = |z: u32| z ^ 10u32;
+    f(seed)
+}
+fn foo(seed: u32) -> u32 {
+    let f = |z: u32| z + 2u32;
+    f(seed)
+}
+fn foo_bar(seed: u32) -> u32 {
+    let f = |z: u32| z + 3u32;
+    f(seed)
+}
+fn foo_closure(seed: u32) -> u32 {
+    let f = |z: u32| z + 4u32;
+    f(seed)
+}
+struct __LeadingStruct { pub v: u32 }
+impl __LeadingStruct {
+    fn compute(&self) -> u32 {
+        let f = |z: u32| z + self.v;
+        f(1u32)
+    }
+}
+struct __UnusedLeadingStruct { pub v: u32 }
+impl __UnusedLeadingStruct {
+    fn compute(&self) -> u32 {
+        let f = |z: u32| z + self.v;
+        f(2u32)
+    }
+}
+pub fn root_entry() -> u32 {
+    let s = __LeadingStruct { v: 9u32 };
+    __anneal_vt_driver_61873(1u32) ^ __anneal_vt_driver_1(2u32) ^ foo(3u32) ^ s.compute()
+}
+pub mod stage_ns_0 {
+    fn __anneal_vt_driver_1(seed: u32) -> u32 {
+        let f = |z: u32| z ^ 100u32;
+        f(seed)
+    }
+    fn __anneal_clos_driver_99(seed: u32) -> u32 {
+        let f = |z: u32| z ^ 99u32;
+        f(seed)
+    }
+    pub fn ns0_entry() -> u32 {
+        __anneal_vt_driver_1(5u32)
+    }
+}
+pub use stage_ns_0::ns0_entry;
+pub mod stage_ns_1 {
+    fn __anneal_vt_driver_1(seed: u32) -> u32 {
+        let f = |z: u32| z ^ 200u32;
+        f(seed)
+    }
+    pub fn ns1_entry() -> u32 {
+        __anneal_vt_driver_1(6u32)
+    }
+}
+pub use stage_ns_1::ns1_entry;
+";
+        let pairs: Vec<(String, String)> = [
+            // Crate-root reached driver closures (single-underscore `sanitize_item_module_stem`
+            // form, nested `{closure#0}::{closure#0}`, and dot-separated form).
+            ("{closure#0}", "MiriDiffCorpus.__anneal_vt_driver_61873_closure_0"),
+            ("{closure#1}", "MiriDiffCorpus.__anneal_vt_driver_61873_closure_1"),
+            ("{closure#0}", "MiriDiffCorpus.__anneal_vt_driver_61873_closure_1_closure_0"),
+            ("{closure}", "MiriDiffCorpus.__anneal_vt_driver_61873._closure_"),
+            // Prefix-collision pairs: `__anneal_vt_driver_1` (reached) vs `_10` (unreached),
+            // `foo` (reached) vs `foo_bar` and `foo_closure` (unreached).
+            ("{closure#0}", "MiriDiffCorpus.__anneal_vt_driver_1_closure_0"),
+            ("{closure#0}", "MiriDiffCorpus.__anneal_vt_driver_10_closure_0"),
+            ("{closure#0}", "MiriDiffCorpus.foo_closure_0"),
+            ("{closure#0}", "MiriDiffCorpus.foo_bar_closure_0"),
+            ("{closure#0}", "MiriDiffCorpus.foo_closure_closure_0"),
+            // Leading-underscore impl method closures (reached vs unreached).
+            ("{closure#0}", "MiriDiffCorpus.__LeadingStruct_compute_closure_0"),
+            ("{closure#0}", "MiriDiffCorpus.__UnusedLeadingStruct_compute_closure_0"),
+            // `stage_ns_0` reached vs unreached closures, and `stage_ns_1` same-named driver closure.
+            ("{closure#0}", "MiriDiffCorpus.stage_ns_0___anneal_vt_driver_1_closure_0"),
+            ("{closure#0}", "MiriDiffCorpus.stage_ns_0___anneal_clos_driver_99_closure_0"),
+            ("{closure#0}", "MiriDiffCorpus.stage_ns_1___anneal_vt_driver_1_closure_0"),
+        ]
+        .iter()
+        .map(|(s, suf)| ((*s).to_string(), (*suf).to_string()))
+        .collect();
+        let helpers: Vec<String> = pairs.iter().map(|(_, suf)| suf.clone()).collect();
+
+        // 1. Crate-root entry links ONLY its reached closures (including leading-underscore
+        //    drivers, nested closures, and reached leading-underscore impl methods), never
+        //    prefix-colliding unreached functions or any `stage_ns_*` closures.
+        let root_linked = confirm_helper_module_suffixes(
+            lib_rs,
+            "MiriDiffCorpus",
+            &pairs,
+            &helpers,
+            &[OracleItemSpec::with_fuel("root_entry".to_string(), 200)],
+        );
+        assert_eq!(
+            root_linked,
+            vec![
+                "MiriDiffCorpus.__anneal_vt_driver_61873_closure_0",
+                "MiriDiffCorpus.__anneal_vt_driver_61873_closure_1",
+                "MiriDiffCorpus.__anneal_vt_driver_61873_closure_1_closure_0",
+                "MiriDiffCorpus.__anneal_vt_driver_61873._closure_",
+                "MiriDiffCorpus.__anneal_vt_driver_1_closure_0",
+                "MiriDiffCorpus.foo_closure_0",
+                "MiriDiffCorpus.__LeadingStruct_compute_closure_0",
+            ],
+            "unexpected root closure links: {root_linked:?}"
+        );
+
+        // 2. `stage_ns_0` entry links ONLY `stage_ns_0`'s reached driver closure, never
+        //    `stage_ns_0`'s unreached driver closure, never `stage_ns_1`'s same-named closure,
+        //    and never crate-root's same-named closure.
+        let ns0_linked = confirm_helper_module_suffixes(
+            lib_rs,
+            "MiriDiffCorpus",
+            &pairs,
+            &helpers,
+            &[OracleItemSpec::with_fuel("ns0_entry".to_string(), 200)],
+        );
+        assert_eq!(
+            ns0_linked,
+            vec!["MiriDiffCorpus.stage_ns_0___anneal_vt_driver_1_closure_0"],
+            "stage_ns_0 must stay isolated from root, unreached siblings, and stage_ns_1: {ns0_linked:?}"
+        );
+    }
+
+    #[test]
+    fn extract_failing_construct_hint_distinguishes_unsize_closure_fn_ptr_and_other_mir_ops() {
+        let mir_unsize = "\
+def body : CapturedMir :=
+  { basicBlocks := [
+      { statements := [
+          { kind := (StatementKind.storageLive 2), span := \"src/lib.rs:42:40: 42:65\" },
+          { kind := (StatementKind.assign { local_ := 2, projection := [] } (Rvalue.ref BorrowKind.shared { local_ := 0, projection := [] })), span := \"src/lib.rs:42:40: 42:65\" },
+          { kind := (StatementKind.assign { local_ := 1, projection := [] } (Rvalue.cast (CastKind.pointerCoercion \"Unsize\") (Operand.move { local_ := 2, projection := [] }) (Ty.mk (RigidTy.rawPtr (Ty.mk (RigidTy.dynamic \"T\") 0) Mutability.not) 1))), span := \"src/lib.rs:42:40: 42:65\" },
+          { kind := (StatementKind.storageDead 2), span := \"src/lib.rs:42:40: 42:65\" }
+        ],
+        terminator := { kind := TerminatorKind.return_, span := \"src/lib.rs:43:1: 43:2\" } }
+    ] }
+";
+        assert_eq!(
+            extract_failing_construct_hint_from_mir(mir_unsize, &["src/lib.rs:42:40: 42:65"])
+                .as_deref(),
+            Some("PointerCoercion::Unsize")
+        );
+        // Unrelated span must not fabricate a hint from a different statement.
+        assert_eq!(
+            extract_failing_construct_hint_from_mir(mir_unsize, &["src/lib.rs:99:1: 99:2"]),
+            None
+        );
+
+        let mir_closure_safe = "\
+{ kind := (StatementKind.assign { local_ := 1, projection := [] } (Rvalue.cast (CastKind.pointerCoercion \"ClosureFnPointer(Safe)\") (Operand.move { local_ := 2, projection := [] }) (Ty.mk (RigidTy.fnPtr []) 0))), span := \"src/lib.rs:50:36: 50:72\" }
+";
+        assert_eq!(
+            extract_failing_construct_hint_from_mir(
+                mir_closure_safe,
+                &["/tmp/stage/src/lib.rs:50:36: 50:72"]
+            )
+            .as_deref(),
+            Some("PointerCoercion::ClosureFnPointer")
+        );
+
+        let mir_ctor_spelling = "\
+{ kind := (StatementKind.assign p (Rvalue.cast (CastKind.pointerCoercion (PointerCoercion.closureFnPointer Safety.safe)) op ty)), span := \"repro.rs:12:5: 12:30\" }
+";
+        assert_eq!(
+            extract_failing_construct_hint_from_mir(mir_ctor_spelling, &["repro.rs:12:5: 12:30"])
+                .as_deref(),
+            Some("PointerCoercion::ClosureFnPointer")
+        );
+
+        let mir_transmute = "\
+{ kind := (StatementKind.assign p (Rvalue.cast CastKind.transmute op ty)), span := \"src/lib.rs:20:5: 20:40\" }
+";
+        assert_eq!(
+            extract_failing_construct_hint_from_mir(mir_transmute, &["src/lib.rs:20:5: 20:40"])
+                .as_deref(),
+            Some("CastKind::Transmute")
+        );
+    }
+
+    #[test]
+    fn campaign_23_b24_c17_completes_within_candidate_fuel_while_infinite_loop_still_times_out() {
+        // Exact Campaign #23 (seed `0xd257e312`, batch 24, cand 17) mutant
+        // (`BitValidityTransmuteMutator`, `ClosureAndAddrEqMutator`
+        // `wide_slices_uncalled_closure`, `RawPtrOffsetMutator` `write_bytes!` +
+        // `copy_nonoverlapping`): requires exactly 566 Lean MIR steps under
+        // `-Zmir-opt-level=0`, which exhausted the previous `512`-step bound
+        // (`DEFAULT_ORACLE_FUEL * 4`) and now completes within
+        // `MIRI_DIFFTEST_CANDIDATE_FUEL` (`1024`).
+        let b24_c17_fn_src = r#"#[inline(never)]
+fn __anneal_wide_slice_addr_eq_43987(
+    __clos_p: *const [u32],
+    __clos_q: *const [u32],
+) -> bool {
+    (__clos_p as *const ()) == (__clos_q as *const ())
+}
+#[inline(never)]
+fn __anneal_clos_driver_43987(__clos_seed: u32, __clos_bias: u32) -> u32 {
+    let __clos_arr: [u32; 3] = [__clos_seed, __clos_bias, 7u32];
+    let __clos_full: *const [u32; 3] = &raw const __clos_arr;
+    let __clos_head: *const [u32; 1] = __clos_full as *const [u32; 1];
+    let __clos_tail_elem: *const u32 = unsafe {
+        offset(__clos_full as *const u32, 1isize)
+    };
+    let __clos_tail_arr: *const [u32; 2] = __clos_tail_elem as *const [u32; 2];
+    let __clos_long: *const [u32] = __clos_full;
+    let __clos_short: *const [u32] = __clos_head;
+    let __clos_tail: *const [u32] = __clos_tail_arr;
+    let __clos_long_bytes: usize = unsafe { size_of_val(__clos_long) };
+    let __clos_short_bytes: usize = unsafe { size_of_val(__clos_short) };
+    let __clos_tail_bytes: usize = unsafe { size_of_val(__clos_tail) };
+    let __clos_same: u32 = if __anneal_wide_slice_addr_eq_43987(
+        __clos_long,
+        __clos_short,
+    ) {
+        1u32
+    } else {
+        0u32
+    };
+    let __clos_inline_same: u32 = if (__clos_long as *const ())
+        == (__clos_short as *const ())
+    {
+        2u32
+    } else {
+        0u32
+    };
+    let __clos_diff: u32 = if __anneal_wide_slice_addr_eq_43987(
+        __clos_long,
+        __clos_tail,
+    ) {
+        0u32
+    } else {
+        4u32
+    };
+    let __clos_inline_diff: u32 = if (__clos_long as *const ())
+        == (__clos_tail as *const ())
+    {
+        0u32
+    } else {
+        8u32
+    };
+    let __clos_wide_acc: u32 = __clos_arr[0] ^ ((__clos_tail_bytes as u32) << 12u32)
+        ^ ((__clos_long_bytes as u32) << 8u32) ^ ((__clos_short_bytes as u32) << 4u32)
+        ^ __clos_same ^ __clos_inline_same ^ __clos_diff ^ __clos_inline_diff;
+    let __clos_cap: u32 = __clos_wide_acc & 0xFFu32;
+    let __clos_agg = |__clos_u: u32| wrapping_add(__clos_cap, __clos_u);
+    let __clos_agg_bytes: usize = unsafe { size_of_val(&raw const __clos_agg) };
+    let __clos_keep: &u32 = &__clos_cap;
+    let __clos_acc: u32 = __clos_wide_acc ^ ((*__clos_keep) << 16u32)
+        ^ ((__clos_agg_bytes as u32) << 24u32);
+    __clos_acc
+}
+pub fn pass_bitwise_and_or_xor_not__b24_c17() -> u32 {
+    let x: u32 = 0x0F0F_00FF;
+    let y: u32 = 0x00FF_0F0F;
+    let and_v = x & y;
+    let or_v = x | y;
+    let xor_v = x ^ y;
+    let __tail___miri_valid_47332: u32 = (and_v ^ or_v) - xor_v + (!0u32 ^ 0xFFFF_FFFF);
+    let __niche_zero: u32 = 0u32;
+    let __niche_none: Option<NonZeroU32> = unsafe {
+        transmute::<u32, Option<NonZeroU32>>(__niche_zero)
+    };
+    let __niche_nz: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(2147483648u32) };
+    let __niche_some: Option<NonZeroU32> = Some(__niche_nz);
+    let __niche_empty: Option<NonZeroU32> = None;
+    let __niche_a: u32 = match __niche_none {
+        Some(__niche_inner) => unsafe { transmute::<NonZeroU32, u32>(__niche_inner) }
+        None => 5u32,
+    };
+    let __niche_b: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(__niche_some) };
+    let __niche_c: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(__niche_empty) };
+    let __miri_valid_47332: u32 = __niche_a ^ __niche_b ^ __niche_c;
+    let __tail___miri_clos_43987: u32 = __tail___miri_valid_47332
+        ^ (__miri_valid_47332 as u32);
+    let __miri_clos_43987: u32 = __anneal_clos_driver_43987(
+        (x as u32) & 0xFFFFu32,
+        26u32,
+    );
+    let __tail___miri_ptr_64322: u32 = __tail___miri_clos_43987
+        ^ (__miri_clos_43987 as u32);
+    let mut __wb_src: PairU32 = PairU32 { a: 22u32, b: 99u32 };
+    let mut __wb_dst: u32 = 0u32;
+    unsafe {
+        write_bytes!(& raw mut __wb_src.a, 15u8, 1usize);
+        copy_nonoverlapping(&raw const __wb_src.a, &raw mut __wb_dst, 1usize);
+    }
+    let __miri_ptr_64322: u32 = (__wb_dst & 0xFFu32) ^ __wb_src.b;
+    __tail___miri_ptr_64322 ^ (__miri_ptr_64322 as u32)
+}
+"#;
+        let b24_cand = GeneratedMiriCandidate {
+            id: 17,
+            seed_index: 0,
+            seed_name: "pass_bitwise_and_or_xor_not".to_string(),
+            fn_name: "pass_bitwise_and_or_xor_not__b24_c17".to_string(),
+            seed_u64: 0xd257_e312,
+            applied_mutators: vec![
+                "BitValidityTransmuteMutator".to_string(),
+                "ClosureAndAddrEqMutator".to_string(),
+                "RawPtrOffsetMutator".to_string(),
+            ],
+            tracked_locals: Vec::new(),
+            fn_source: b24_c17_fn_src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(b24_c17_fn_src),
+        };
+        let toolchain = resolve_miri_toolchain_safe().expect("miri toolchain");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+
+        // 1. Confirm the old `DEFAULT_ORACLE_FUEL * 4` (512) bound genuinely
+        //    reproduced `OutOfFuel` on this exact candidate.
+        let old_fuel_eval = evaluate_candidate_live(
+            &b24_cand,
+            DEFAULT_ORACLE_FUEL * 4,
+            &toolchain,
+            Some(&root),
+        )
+        .expect("evaluate b24_c17 at legacy 512 fuel");
+        assert!(
+            matches!(old_fuel_eval.report.anneal, AnnealOutcome::OutOfFuel { .. }),
+            "expected legacy 512 fuel to hit OutOfFuel on b24_c17, got {:?}",
+            old_fuel_eval.report.anneal
+        );
+
+        // 2. Under calibrated `MIRI_DIFFTEST_CANDIDATE_FUEL` (1024), b24_c17
+        //    terminates and agrees with Miri (`pass:scalar:2293271769:4`).
+        let fixed_eval = evaluate_candidate_live(
+            &b24_cand,
+            MIRI_DIFFTEST_CANDIDATE_FUEL,
+            &toolchain,
+            Some(&root),
+        )
+        .expect("evaluate b24_c17 at MIRI_DIFFTEST_CANDIDATE_FUEL");
+        assert!(
+            fixed_eval.report.verdict.is_agree()
+                && matches!(
+                    fixed_eval.report.miri,
+                    MiriOutcome::PassScalar {
+                        bits: 2_293_271_769,
+                        size_bytes: 4
+                    }
+                )
+                && matches!(
+                    fixed_eval.report.anneal,
+                    AnnealOutcome::PassScalar {
+                        bits: 2_293_271_769,
+                        size_bytes: 4
+                    }
+                ),
+            "expected b24_c17 to agree at pass:scalar:2293271769:4, got {:?}",
+            fixed_eval.report
+        );
+
+        // 3. A genuine infinite loop still terminates promptly as `OutOfFuel`
+        //    under `MIRI_DIFFTEST_CANDIDATE_FUEL` (no infinite-loop masking).
+        let loop_fn_src = "\
+pub fn infinite_loop_fuel_guard() -> u32 {
+    let mut acc: u32 = 0u32;
+    loop {
+        acc = wrapping_add(acc, 1u32);
+    }
+}
+";
+        let loop_staging = create_staging_dir("infinite_loop_fuel_guard").expect("staging dir");
+        let loop_res = (|| {
+            let full_src = crate::mutators_miri::build_standalone_candidate_source(loop_fn_src);
+            fs::write(loop_staging.join("src/lib.rs"), &full_src)
+                .map_err(|e| format!("write loop lib.rs: {e}"))?;
+            // Capture and evaluate ONLY the Anneal Lean probe (Miri would loop
+            // forever without an instruction cap), confirming `OutOfFuel`.
+            let units_dir = loop_staging.join("target/anneal/units");
+            fs::create_dir_all(&units_dir).map_err(|e| format!("mkdir units: {e}"))?;
+            let driver_cfg = CaptureDriverConfig {
+                workspace_root: loop_staging.clone(),
+                manifest_path: None,
+                units_dir: units_dir.clone(),
+                rustc_wrapper: None,
+                filter: None,
+                extra_cargo_args: vec!["--lib".to_string()],
+            };
+            let wrapper = ensure_rustc_wrapper(&driver_cfg, Some(&root))?;
+            let cargo_bin = resolve_cargo_bin();
+            let rustflags = DEFAULT_CAPTURE_RUSTFLAGS.join(" ");
+            let cap = build_batch_capture_command(
+                &cargo_bin,
+                &loop_staging,
+                &wrapper,
+                &units_dir,
+                &rustflags,
+            )
+            .output()
+            .map_err(|e| format!("capture loop: {e}"))?;
+            if !cap.status.success() {
+                return Err(format!(
+                    "capture loop failed: {}",
+                    String::from_utf8_lossy(&cap.stderr)
+                ));
+            }
+            let (_manifest, records) = aggregate_unit_manifests(&units_dir)?;
+            let scaffold_cfg = ScaffoldConfig {
+                workspace_root: loop_staging.clone(),
+                units_dir: Some(units_dir),
+                anneal_repo_root: Some(root.clone()),
+                init_spec_templates: false,
+                init_proof_templates: false,
+            };
+            scaffold_workspace_with_config(&scaffold_cfg, &records)?;
+            let dot_anneal = loop_staging.join(".anneal");
+            let oracle_dir = dot_anneal.join("oracle");
+            fs::create_dir_all(&oracle_dir).map_err(|e| format!("mkdir oracle: {e}"))?;
+            let lake_bin = resolve_lake_bin();
+            let _lean_guard = acquire_live_lean_oracle_lock();
+            run_lake_build_with_bin_and_threads(
+                &lake_bin,
+                &dot_anneal,
+                &[
+                    MIRI_SYMBOLIC_EVAL_MODULE,
+                    "Mir.MiriDiffCorpus.infinite_loop_fuel_guard",
+                ],
+                Some(2),
+            )?;
+            let probe_src = render_linked_anneal_probe_module(
+                "MiriDiffCorpus",
+                &[(
+                    OracleItemSpec::with_fuel(
+                        "infinite_loop_fuel_guard".to_string(),
+                        MIRI_DIFFTEST_CANDIDATE_FUEL,
+                    ),
+                    "MiriDiffCorpus.infinite_loop_fuel_guard".to_string(),
+                )],
+                &[],
+            );
+            let probe_path = oracle_dir.join("LoopGuardProbe.lean");
+            fs::write(&probe_path, &probe_src).map_err(|e| format!("write probe: {e}"))?;
+            let out = Command::new(&lake_bin)
+                .current_dir(&dot_anneal)
+                .env("LEAN_NUM_THREADS", "1")
+                .args(["env", "lean", "oracle/LoopGuardProbe.lean"])
+                .output()
+                .map_err(|e| format!("run lean probe: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "lean loop probe failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let parsed = parse_anneal_probe_output(&stdout)?;
+            Ok(parsed.get("infinite_loop_fuel_guard").cloned())
+        })();
+        let _ = fs::remove_dir_all(&loop_staging);
+        let loop_outcome = loop_res.expect("evaluate infinite loop in Anneal Lean probe");
+        assert!(
+            matches!(loop_outcome, Some(AnnealOutcome::OutOfFuel { .. })),
+            "genuine infinite loop must terminate as OutOfFuel under MIRI_DIFFTEST_CANDIDATE_FUEL, got {loop_outcome:?}"
+        );
     }
 }

@@ -9389,6 +9389,301 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
             ],
         )
 
+    def test_dyn_trait_and_closure_fn_ptr_deduplicate_distinctly_with_construct_hints(
+        self,
+    ) -> None:
+        """`&dyn Trait` (`VTableAndFnPtrMutator`) and `ClosureFnPointer`
+        (`ClosureAndAddrEqMutator`) deduplicate into two distinct 3-part fingerprints
+        with distinct `failing_construct_hint` values surfaced in JSON, Markdown, and
+        JUnit reports."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repro_dyn = tmp_path / "repro_dyn.rs"
+            repro_clos = tmp_path / "repro_clos.rs"
+            dyn_src = "\n".join(
+                [
+                    "trait __AnnealVtableTrait7 { fn eval_vt(&self, x: u32) -> u32; }",
+                    "struct __AnnealVtableReceiver7 { pub bias: u32 }",
+                    "impl __AnnealVtableTrait7 for __AnnealVtableReceiver7 {",
+                    "    fn eval_vt(&self, x: u32) -> u32 { x ^ self.bias }",
+                    "}",
+                    "fn __anneal_vt_driver_7(__vt_seed: u32, __vt_bias: u32) -> u32 {",
+                    "    let __vt_rec = __AnnealVtableReceiver7 { bias: __vt_bias };",
+                    "    let __vt_rec_dyn: &dyn __AnnealVtableTrait7 = &__vt_rec as &dyn __AnnealVtableTrait7;",
+                    "    __vt_rec_dyn.eval_vt(__vt_seed)",
+                    "}",
+                    "pub fn pass_seed__b0_c0() -> u32 { __anneal_vt_driver_7(1u32, 2u32) }",
+                ]
+            ) + "\n"
+            clos_src = "\n".join(
+                [
+                    "fn __anneal_clos_driver_9(__clos_seed: u32, __clos_bias: u32) -> u32 {",
+                    "    let __clos_cfp: fn(u32) -> u32 = |__clos_z: u32| __clos_z ^ 17u32;",
+                    "    __clos_cfp(__clos_seed ^ __clos_bias)",
+                    "}",
+                    "pub fn pass_seed__b0_c1() -> u32 { __anneal_clos_driver_9(1u32, 2u32) }",
+                ]
+            ) + "\n"
+            repro_dyn.write_text(dyn_src, encoding="utf-8")
+            repro_clos.write_text(clos_src, encoding="utf-8")
+
+            f_dyn = {
+                "finding_id": "finding_0000_pass_seed__b0_c0",
+                "fn_name": "pass_seed__b0_c0",
+                "seed_name": "pass_seed",
+                "applied_mutators": ["VTableAndFnPtrMutator"],
+                "divergence_class": "false_positive_ub",
+                "witness_polarity": "sound_conservative_abstraction",
+                "miri_outcome": "pass:scalar:7:4",
+                "anneal_outcome": "ub@src/lib.rs:8:51: 8:88",
+                "anneal_lean_tag": "MirDiffTag.ub",
+                "anneal_span": "src/lib.rs:8:51: 8:88",
+                "failing_construct_hint": "PointerCoercion::Unsize",
+                "miri_excerpt": "MIRI_PASS:scalar:7:4",
+                "mutant_source": dyn_src,
+                "repro_path": str(repro_dyn),
+                "kernel_confirmed": True,
+            }
+            f_clos = {
+                "finding_id": "finding_0001_pass_seed__b0_c1",
+                "fn_name": "pass_seed__b0_c1",
+                "seed_name": "pass_seed",
+                "applied_mutators": ["ClosureAndAddrEqMutator"],
+                "divergence_class": "false_positive_ub",
+                "witness_polarity": "sound_conservative_abstraction",
+                "miri_outcome": "pass:scalar:18:4",
+                "anneal_outcome": "ub@src/lib.rs:2:38: 2:71",
+                "anneal_lean_tag": "MirDiffTag.ub",
+                "anneal_span": "src/lib.rs:2:38: 2:71",
+                "failing_construct_hint": "PointerCoercion::ClosureFnPointer",
+                "miri_excerpt": "MIRI_PASS:scalar:18:4",
+                "mutant_source": clos_src,
+                "repro_path": str(repro_clos),
+                "kernel_confirmed": True,
+            }
+
+            all_dedup, unq, quar = campaign.deduplicate_and_quarantine_findings(
+                [f_dyn, f_clos], set(), set()
+            )
+            self.assertEqual(len(all_dedup), 2)
+            self.assertEqual(len(unq), 2)
+            self.assertEqual(len(quar), 0)
+            by_fp = {d.fingerprint: d for d in all_dedup}
+            self.assertIn("VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub", by_fp)
+            self.assertIn("ClosureAndAddrEqMutator:false_positive_ub:MirDiffTag.ub", by_fp)
+            for fp in by_fp:
+                self.assertTrue(campaign._is_well_formed_quarantine_token(fp), fp)
+                self.assertEqual(
+                    campaign.fingerprint_witness_polarity(fp),
+                    "sound_conservative_abstraction",
+                )
+            d_dyn = by_fp["VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub"]
+            d_clos = by_fp["ClosureAndAddrEqMutator:false_positive_ub:MirDiffTag.ub"]
+            self.assertEqual(d_dyn.failing_construct_hint, "PointerCoercion::Unsize")
+            self.assertEqual(d_dyn.failing_construct_hints, ["PointerCoercion::Unsize"])
+            self.assertEqual(d_dyn.to_dict()["failing_construct_hint"], "PointerCoercion::Unsize")
+            self.assertEqual(d_clos.failing_construct_hint, "PointerCoercion::ClosureFnPointer")
+            self.assertEqual(
+                d_clos.failing_construct_hints, ["PointerCoercion::ClosureFnPointer"]
+            )
+            self.assertEqual(
+                d_clos.to_dict()["failing_construct_hint"], "PointerCoercion::ClosureFnPointer"
+            )
+
+            # Markdown report surfaces both fingerprints and their construct hints.
+            rf = campaign.RedFlagResult(passed=True, checks={"oracle_invoked": True}, failure_reasons=[])
+            miri_stub = {
+                "harness": "miri-difftest",
+                "oracle_comparison": "performed",
+                "mode": "seeded",
+                "batches": 1,
+                "batch_size": 2,
+                "total_candidates": 2,
+                "compiled_candidates": 2,
+                "compile_failed_candidates": 0,
+                "compared_candidates": 2,
+                "agree_count": 0,
+                "diverge_count": 2,
+                "not_compared_count": 0,
+                "kernel_confirmed_divergences": 2,
+                "elapsed_ms": 250.0,
+                "miri_verdicts": {"pass": 2, "panic": 0, "ub": 0, "error": 0},
+                "anneal_outcomes": {
+                    "pass": 0,
+                    "panic": 0,
+                    "ub": 2,
+                    "unsupported": 0,
+                    "out_of_fuel": 0,
+                    "external_call": 0,
+                    "error": 0,
+                },
+                "divergence_classes": {
+                    k: (2 if k == "false_positive_ub" else 0)
+                    for k in campaign.VALID_DIVERGENCE_CLASSES
+                },
+                "not_compared_reasons": {
+                    k: 0 for k in campaign.VALID_NOT_COMPARED_REASONS
+                },
+                "witness_polarity_counts": {
+                    k: (2 if k == "sound_conservative_abstraction" else 0)
+                    for k in campaign.VALID_WITNESS_POLARITIES
+                },
+                "unmodeled_external_calls": {},
+                "mutator_applications": {
+                    "VTableAndFnPtrMutator": 1,
+                    "ClosureAndAddrEqMutator": 1,
+                },
+                "findings": [f_dyn, f_clos],
+            }
+            ok, msg = campaign.validate_performed_miri_summary(miri_stub)
+            self.assertTrue(ok, msg)
+            md = campaign.render_oracle_campaign_report(
+                profile=campaign.PROFILES["smoke"],
+                date_prefix="2026-11-26",
+                miri=miri_stub,
+                miri_red_flags=rf,
+                all_dedup=all_dedup,
+                unquarantined=unq,
+                quarantined=quar,
+                include_itree=False,
+                itree=None,
+                itree_red_flags=None,
+                itree_all_dedup=[],
+                itree_unquarantined=[],
+                itree_quarantined=[],
+                itree_ran_without_oracle=False,
+                miri_seed=0x5EED0001,
+                itree_seed=0,
+                elapsed_sec=1.0,
+            )
+            self.assertIn("`PointerCoercion::Unsize`", md)
+            self.assertIn("`PointerCoercion::ClosureFnPointer`", md)
+
+    def test_shared_fingerprint_preserves_all_distinct_construct_hints_and_legacy_findings_stay_valid(
+        self,
+    ) -> None:
+        """Multiple findings under one 3-part fingerprint surface all distinct
+        construct hints (including fallback extraction from `mir_neighborhood` and
+        fault source lines), and legacy findings omitting `failing_construct_hint`
+        pass validation and deduplication cleanly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            r1 = tmp_path / "r1.rs"
+            r2 = tmp_path / "r2.rs"
+            r3 = tmp_path / "r3.rs"
+            for p in (r1, r2, r3):
+                p.write_text("pub fn seed() -> u32 { 0 }\n", encoding="utf-8")
+
+            # Legacy finding without `failing_construct_hint`, derived from `mir_neighborhood`.
+            f_mir_fallback = {
+                "finding_id": "finding_0000_s1",
+                "fn_name": "seed__b0_c0",
+                "seed_name": "seed",
+                "applied_mutators": ["VTableAndFnPtrMutator"],
+                "divergence_class": "false_positive_ub",
+                "witness_polarity": "sound_conservative_abstraction",
+                "miri_outcome": "pass:scalar:1:4",
+                "anneal_outcome": "ub@src/lib.rs:10:5: 10:40",
+                "anneal_lean_tag": "MirDiffTag.ub",
+                "anneal_span": "src/lib.rs:10:5: 10:40",
+                "mir_neighborhood": (
+                    '{ kind := (StatementKind.storageLive 2), span := "src/lib.rs:10:5: 10:40" } '
+                    '{ kind := (StatementKind.assign p (Rvalue.ref BorrowKind.shared q)), span := "src/lib.rs:10:5: 10:40" } '
+                    '{ kind := (StatementKind.assign p (Rvalue.cast (CastKind.pointerCoercion "Unsize") '
+                    'op ty)), span := "src/lib.rs:10:5: 10:40" }'
+                ),
+                "miri_excerpt": "MIRI_PASS:scalar:1:4",
+                "repro_path": str(r1),
+                "kernel_confirmed": True,
+            }
+            # Second finding sharing the exact same 3-part fingerprint but with a
+            # different construct hint derived from `PointerCoercion.closureFnPointer`.
+            f_second_construct = {
+                "finding_id": "finding_0001_s2",
+                "fn_name": "seed__b0_c1",
+                "seed_name": "seed",
+                "applied_mutators": ["VTableAndFnPtrMutator"],
+                "divergence_class": "false_positive_ub",
+                "witness_polarity": "sound_conservative_abstraction",
+                "miri_outcome": "pass:scalar:2:4",
+                "anneal_outcome": "ub@src/lib.rs:12:5: 12:40",
+                "anneal_lean_tag": "MirDiffTag.ub",
+                "anneal_span": "src/lib.rs:12:5: 12:40",
+                "mir_neighborhood": (
+                    "{ kind := (StatementKind.assign p (Rvalue.cast (CastKind.pointerCoercion "
+                    '(PointerCoercion.closureFnPointer Safety.safe)) op ty)), span := "src/lib.rs:12:5: 12:40" }'
+                ),
+                "miri_excerpt": "MIRI_PASS:scalar:2:4",
+                "repro_path": str(r2),
+                "kernel_confirmed": True,
+            }
+            # Legacy finding with neither `failing_construct_hint` nor matching MIR/source line.
+            f_legacy_plain = {
+                "finding_id": "finding_0002_s3",
+                "fn_name": "other__b0_c2",
+                "seed_name": "other",
+                "applied_mutators": ["ArithmeticCastMutator"],
+                "divergence_class": "wrong_value",
+                "witness_polarity": "value_mismatch",
+                "miri_outcome": "pass:scalar:3:4",
+                "anneal_outcome": "pass:scalar:4:4",
+                "anneal_lean_tag": "(MirDiffTag.normalScalar 4 4)",
+                "miri_excerpt": "MIRI_PASS:scalar:3:4",
+                "repro_path": str(r3),
+                "kernel_confirmed": True,
+            }
+
+            all_dedup, unq, _ = campaign.deduplicate_and_quarantine_findings(
+                [f_mir_fallback, f_second_construct, f_legacy_plain], set(), set()
+            )
+            self.assertEqual(len(all_dedup), 2)
+            by_fp = {d.fingerprint: d for d in all_dedup}
+            shared = by_fp["VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub"]
+            self.assertEqual(shared.occurrences, 2)
+            self.assertEqual(shared.failing_construct_hint, "PointerCoercion::Unsize")
+            self.assertEqual(
+                shared.failing_construct_hints,
+                ["PointerCoercion::Unsize", "PointerCoercion::ClosureFnPointer"],
+            )
+            self.assertEqual(
+                shared.to_dict()["failing_construct_hints"],
+                ["PointerCoercion::Unsize", "PointerCoercion::ClosureFnPointer"],
+            )
+            # Quarantine still matches the canonical 3-part token cleanly.
+            _, unq_q, quar_q = campaign.deduplicate_and_quarantine_findings(
+                [f_mir_fallback, f_second_construct],
+                set(),
+                {"VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub"},
+            )
+            self.assertEqual(len(unq_q), 0)
+            self.assertEqual(len(quar_q), 1)
+            self.assertEqual(
+                quar_q[0].failing_construct_hints,
+                ["PointerCoercion::Unsize", "PointerCoercion::ClosureFnPointer"],
+            )
+
+            plain = by_fp["ArithmeticCastMutator:wrong_value:MirDiffTag.normalScalar"]
+            self.assertIsNone(plain.failing_construct_hint)
+            self.assertEqual(plain.failing_construct_hints, [])
+
+            # Legacy summary omitting `failing_construct_hint` passes validation;
+            # non-string/non-null `failing_construct_hint` fails validation.
+            summary = make_healthy_miri_report(tmp_path)
+            summary["agree_count"] -= 1
+            summary["diverge_count"] = 1
+            summary["kernel_confirmed_divergences"] = 1
+            summary["divergence_classes"]["wrong_value"] = 1
+            summary["witness_polarity_counts"]["value_mismatch"] = 1
+            summary["findings"] = [f_legacy_plain]
+            ok, msg = campaign.validate_performed_miri_summary(summary)
+            self.assertTrue(ok, msg)
+
+            bad_summary = copy.deepcopy(summary)
+            bad_summary["findings"][0]["failing_construct_hint"] = 123
+            ok_bad, msg_bad = campaign.validate_performed_miri_summary(bad_summary)
+            self.assertFalse(ok_bad)
+            self.assertIn("failing_construct_hint", msg_bad)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5445,13 +5445,14 @@ fn entry_fn_is_faulting_seed(func: &ItemFn) -> bool {
 /// call, so later passes that perturb or reorder the entry function's
 /// statements never rewrite a template.
 ///
-/// Anneal's `evalUnsizeCoercion` models only array-to-slice unsizing and
-/// `extractReifyCoercionTarget?` accepts only a closure type without type
-/// arguments, so Anneal is expected to reject the trait-object and
-/// closure-pointer templates with a (sound, conservative) false-positive UB at
-/// the coercion, before any virtual call. Those two templates are therefore
-/// drawn less often than the function-pointer template and never carry a
-/// fault.
+/// Anneal's `evalUnsizeCoercion` models only array-to-slice unsizing, so Anneal
+/// is expected to reject the trait-object template with a (sound, conservative)
+/// false-positive UB at the `PointerCoercion::Unsize` coercion, before any
+/// virtual call. That template is therefore drawn less often than the
+/// function-pointer template and never carries a fault. Non-capturing
+/// closure-to-`fn`-pointer coercions (`PointerCoercion::ClosureFnPointer`) live
+/// in [`ClosureAndAddrEqMutator`] so differential-testing fingerprints separate
+/// `&dyn Trait` unsizing from closure-to-`fn`-pointer coercion.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VTableAndFnPtrMutator;
 
@@ -5541,8 +5542,8 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
             // already-faulting (`panic_*` / `ub_*`) seed its driver runs as a
             // prefix ahead of the seed's fault, so there it emits only the
             // 100%-`Agree` `fn_ptr_chain` driver and never faults early with
-            // the conservative `FalsePositiveUb` of `dyn_dispatch` or
-            // `closure_fn_ptr` before the seed's own panic or UB.
+            // the conservative `FalsePositiveUb` of `dyn_dispatch` before the
+            // seed's own panic or UB.
             MutationMode::Pass | MutationMode::PerturbAst => match rng.gen_range(8) {
                 _ if prefix_probe => fn_ptr_chain(),
                 // Reify two distinct callees into `fn(u32) -> u32` pointers
@@ -5550,14 +5551,14 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                 // to `*const ()` (positive self-equality and negative equality
                 // against a live stack pointer), coerce `*mut u32` to
                 // `*const u32`, and call through both pointers.
-                0..=4 => fn_ptr_chain(),
+                0..=5 => fn_ptr_chain(),
                 // Unsize two distinct concrete receivers (the second with a
                 // non-zero field offset) to `&dyn Trait` with two trait methods
                 // and a second trait on the first receiver, dispatch dynamically
                 // across both impls and vtables, and check both positive
                 // (one pointee, two vtables) and negative (two distinct
                 // receivers) wide-pointer `core::ptr::addr_eq`.
-                5 | 6 => {
+                _ => {
                     // No `_` before the tag: the type names stay upper camel
                     // case, so the candidate compiles under `-D warnings`.
                     let trait_ident = format_ident!("__AnnealVtableTrait{tag}");
@@ -5642,26 +5643,6 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                         }
                     }
                 }
-                // Coerce non-capturing closures to both safe `fn` and direct
-                // `unsafe fn` pointers (`ClosureFnPointer(Safe)` and
-                // `ClosureFnPointer(Unsafe)`), coerce the safe pointer via
-                // `UnsafeFnPointer`, cast to `*const ()` (`FnPtrToPtr`), and
-                // call through all three pointers.
-                _ => syn::parse_quote! {
-                    #[inline(never)]
-                    fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
-                        let __vt_cfp: fn(u32) -> u32 = |__vt_z: u32| wrapping_add(__vt_z, #k0);
-                        let __vt_cufp: unsafe fn(u32) -> u32 = __vt_cfp;
-                        let __vt_cufp_direct: unsafe fn(u32) -> u32 = |__vt_z: u32| __vt_z ^ #k0;
-                        let __vt_raw_c: *const () = __vt_cfp as *const ();
-                        let __vt_raw_d: *const () = __vt_cufp as *const ();
-                        let __vt_first: u32 = __vt_cfp(__vt_seed);
-                        let __vt_second: u32 = unsafe { __vt_cufp(__vt_first ^ __vt_bias) };
-                        let __vt_third: u32 = unsafe { __vt_cufp_direct(__vt_second ^ #k1) };
-                        let __vt_same: u32 = if __vt_raw_c == __vt_raw_d { 1u32 } else { 0u32 };
-                        __vt_first ^ (__vt_second << 1u32) ^ (__vt_third << 2u32) ^ __vt_same
-                    }
-                },
             },
             MutationMode::Panic => match rng.gen_range(2) {
                 // Overflow inside the callee, reached through the `unsafe fn`
@@ -5781,7 +5762,14 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
 ///      from that reference is read after the call;
 ///    - an `FnOnce` closure that owns a `NonCopyU32` and a `&mut u32` reborrowed
 ///      from a `*mut u32`, writes through the reborrow, and whose parent
-///      pointer is read after the call.
+///      pointer is read after the call;
+///    - non-capturing closures coerced to safe `fn` and direct `unsafe fn`
+///      pointers (`ClosureFnPointer(Safe)` and `ClosureFnPointer(Unsafe)`),
+///      `UnsafeFnPointer`, and `FnPtrToPtr` (only in `Pass` and non-faulting
+///      `PerturbAst` regimes, never ahead of an already-faulting seed or in
+///      `Panic`/`Ub` modes, because Anneal's `extractReifyCoercionTarget?`
+///      conservatively rejects closure types carrying captured/implicit type
+///      arguments with false-positive UB).
 ///
 /// Anneal's Lean semantics does not model a call of `Fn::call` or
 /// `FnOnce::call_once` on a closure, but `anneal-rustc-capture` inlines a
@@ -5838,7 +5826,19 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
         let k1: u32 = [6u32, 13u32, 26u32, 52u32][rng.gen_range(4)];
         let seed_arg = indirect_seed_arg(&locals, k0);
         let construct = match mode {
-            MutationMode::Pass | MutationMode::PerturbAst => rng.gen_range(5),
+            // `PerturbAst` shares the `Pass` `gen_range(6)` draw so both regimes
+            // consume the PRNG identically. On an already-faulting (`panic_*` /
+            // `ub_*`) seed its driver runs as a prefix ahead of the seed's
+            // fault, so conservative-UB arm `5` (`closure_fn_ptr`) falls back to
+            // the 100%-`Agree` `wide_slices` arm (`0`).
+            MutationMode::Pass | MutationMode::PerturbAst => {
+                let pick = rng.gen_range(6);
+                if prefix_probe && pick == 5 {
+                    0
+                } else {
+                    pick
+                }
+            }
             MutationMode::Panic | MutationMode::Ub => [0usize, 2usize][rng.gen_range(2)],
         };
 
@@ -5908,7 +5908,7 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
                 let __clos_after: u32 = unsafe { *__clos_raw };
                 let __clos_acc: u32 = __clos_by_ref ^ (__clos_after << 1u32);
             },
-            _ => syn::parse_quote! {
+            4 => syn::parse_quote! {
                 let mut __clos_slot: u32 = __clos_seed;
                 let __clos_root: *mut u32 = &raw mut __clos_slot;
                 let __clos_child: &mut u32 = unsafe { &mut *__clos_root };
@@ -5920,6 +5920,26 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
                 });
                 let __clos_parent: u32 = unsafe { *__clos_root };
                 let __clos_acc: u32 = __clos_written ^ (__clos_parent << 1u32);
+            },
+            // Coerce non-capturing closures to both safe `fn` and direct
+            // `unsafe fn` pointers (`ClosureFnPointer(Safe)` and
+            // `ClosureFnPointer(Unsafe)`), coerce the safe pointer via
+            // `UnsafeFnPointer`, cast to `*const ()` (`FnPtrToPtr`), and
+            // call through all three pointers.
+            _ => syn::parse_quote! {
+                let __clos_cfp: fn(u32) -> u32 = |__clos_z: u32| wrapping_add(__clos_z, #k0);
+                let __clos_cufp: unsafe fn(u32) -> u32 = __clos_cfp;
+                let __clos_cufp_direct: unsafe fn(u32) -> u32 = |__clos_z: u32| __clos_z ^ #k0;
+                let __clos_raw_c: *const () = __clos_cfp as *const ();
+                let __clos_raw_d: *const () = __clos_cufp as *const ();
+                let __clos_first: u32 = __clos_cfp(__clos_seed);
+                let __clos_second: u32 = unsafe { __clos_cufp(__clos_first ^ __clos_bias) };
+                let __clos_third: u32 = unsafe { __clos_cufp_direct(__clos_second ^ #k1) };
+                let __clos_same: u32 = if __clos_raw_c == __clos_raw_d { 1u32 } else { 0u32 };
+                let __clos_acc: u32 = __clos_first
+                    ^ (__clos_second << 1u32)
+                    ^ (__clos_third << 2u32)
+                    ^ __clos_same;
             },
         };
         let tail_stmts: Vec<Stmt> = match mode {
@@ -5942,6 +5962,12 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
                 fn #wide_eq_ident(__clos_p: *const [u32], __clos_q: *const [u32]) -> bool {
                     (__clos_p as *const ()) == (__clos_q as *const ())
                 }
+            }
+        } else if construct == 5 {
+            File {
+                shebang: None,
+                attrs: Vec::new(),
+                items: Vec::new(),
             }
         } else {
             syn::parse_quote! {
@@ -9785,14 +9811,6 @@ pub fn indirect_seed() -> u32 {
                 ],
                 "__vt_fp",
             ),
-            (
-                "closure_fn_ptr",
-                &[
-                    "__vt_cfp: fn(u32) -> u32 = |__vt_z: u32|",
-                    "__vt_cufp_direct: unsafe fn(u32) -> u32 = |__vt_z: u32|",
-                ],
-                "dyn",
-            ),
         ];
         const VT_PANIC: &[Template] = &[
             (
@@ -9859,6 +9877,14 @@ pub fn indirect_seed() -> u32 {
                 ],
                 "::__::apply_keep(",
             ),
+            (
+                "closure_fn_ptr",
+                &[
+                    "__clos_cfp: fn(u32) -> u32 = |__clos_z: u32|",
+                    "__clos_cufp_direct: unsafe fn(u32) -> u32 = |__clos_z: u32|",
+                ],
+                "__AnnealVtable",
+            ),
         ];
         const CLOS_PANIC: &[Template] = &[
             (
@@ -9895,7 +9921,7 @@ pub fn indirect_seed() -> u32 {
         ];
         let vt: &dyn MiriAstMutator = &VTableAndFnPtrMutator;
         let clos: &dyn MiriAstMutator = &ClosureAndAddrEqMutator;
-        let cases: [(&dyn MiriAstMutator, MutationMode, &str, &[Template]); 11] = [
+        let cases: [(&dyn MiriAstMutator, MutationMode, &str, &[Template]); 12] = [
             (vt, Pass, "indirect_seed", VT_PASS),
             // On a seed that does not already fault, the end of the entry
             // function is live and `PerturbAst` is exactly `Pass`: every
@@ -9905,15 +9931,18 @@ pub fn indirect_seed() -> u32 {
             // On an already-faulting (`panic_*` / `ub_*`) seed, `PerturbAst`
             // injects its driver as a prefix before the seed's body, so
             // `VTableAndFnPtrMutator` emits only the 100%-`Agree`
-            // `fn_ptr_chain` driver (never conservative-UB `dyn_dispatch` or
-            // `closure_fn_ptr`).
+            // `fn_ptr_chain` driver (never conservative-UB `dyn_dispatch`).
             (vt, PerturbAst, "ub_indirect_seed", &VT_PASS[..1]),
             (vt, PerturbAst, "panic_indirect_seed", &VT_PASS[..1]),
             (vt, Panic, "indirect_seed", VT_PANIC),
             (vt, Ub, "indirect_seed", VT_UB),
             (clos, Pass, "indirect_seed", CLOS_PASS),
             (clos, PerturbAst, "indirect_seed", CLOS_PASS),
-            (clos, PerturbAst, "ub_indirect_seed", CLOS_PASS),
+            // On an already-faulting (`panic_*` / `ub_*`) seed, `PerturbAst`
+            // skips the conservative-UB `closure_fn_ptr` arm (`CLOS_PASS[5]`)
+            // and emits only the 5 100%-`Agree` templates.
+            (clos, PerturbAst, "ub_indirect_seed", &CLOS_PASS[..5]),
+            (clos, PerturbAst, "panic_indirect_seed", &CLOS_PASS[..5]),
             (clos, Panic, "indirect_seed", CLOS_PANIC),
             (clos, Ub, "indirect_seed", CLOS_UB),
         ];
@@ -9989,7 +10018,7 @@ pub fn indirect_seed() -> u32 {
                 compiled += 1;
             }
         }
-        assert_eq!(compiled, 2 * 3 + 2 + 2 + 2 + 3 * 5 + 2 + 2);
+        assert_eq!(compiled, 2 * 2 + 2 + 2 + 2 + 2 * 6 + 2 * 5 + 2 + 2);
     }
 
     #[test]

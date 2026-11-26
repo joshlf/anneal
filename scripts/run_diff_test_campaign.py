@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime
 import json
 import os
@@ -297,6 +297,11 @@ class DeduplicatedFinding:
     # divergence class); `None` for `itree-difftest` fingerprints, whose
     # `TraceReplayDiag` tags carry no Miri / Anneal soundness direction.
     witness_polarity: str | None = None
+    # Diagnostic hint naming the failing MIR/Rust construct (e.g.
+    # `PointerCoercion::Unsize` vs `PointerCoercion::ClosureFnPointer`) derived
+    # from the finding without altering the canonical 3-part fingerprint.
+    failing_construct_hint: str | None = None
+    failing_construct_hints: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -305,6 +310,8 @@ class DeduplicatedFinding:
             "seed_name": self.seed_name,
             "divergence_class": self.divergence_class,
             "witness_polarity": self.witness_polarity,
+            "failing_construct_hint": self.failing_construct_hint,
+            "failing_construct_hints": list(self.failing_construct_hints),
             "normalized_anneal_tag": self.normalized_anneal_tag,
             "quarantined": self.quarantined,
             "occurrences": self.occurrences,
@@ -683,6 +690,13 @@ def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]
                 f"finding[{idx}] has witness_polarity {polarity!r}, but its divergence_class "
                 f"{f['divergence_class']!r} has polarity {expected_polarity!r}",
             )
+        if "failing_construct_hint" in f:
+            raw_hint = f.get("failing_construct_hint")
+            if raw_hint is not None and not isinstance(raw_hint, str):
+                return (
+                    False,
+                    f"finding[{idx}] has invalid 'failing_construct_hint' {raw_hint!r}",
+                )
 
     return True, "ok"
 
@@ -4290,6 +4304,234 @@ def extract_fault_line_text(finding: dict[str, Any]) -> str:
     return src_lines[resolved - 1]
 
 
+def _camel_to_pascal(ident: str) -> str:
+    clean = ident.rstrip("_")
+    if not clean:
+        return ident
+    return clean[0].upper() + clean[1:]
+
+
+def _spans_refer_to_same_site(record_span: str, target_span: str) -> bool:
+    rec_trim = _rust_trim(record_span)
+    tgt_trim = _rust_trim(target_span)
+    if not rec_trim or not tgt_trim:
+        return False
+    if rec_trim == tgt_trim:
+        return True
+    rec_parsed = _parse_src_span(rec_trim)
+    tgt_parsed = _parse_src_span(tgt_trim)
+    if rec_parsed is not None and tgt_parsed is not None:
+        return (
+            _source_files_match(rec_parsed[0], tgt_parsed[0])
+            and rec_parsed[1:] == tgt_parsed[1:]
+        )
+    return False
+
+
+def _iter_mir_kind_span_records(mir_text: str) -> list[tuple[str, str]]:
+    """Extracts `(kind_expr, span_str)` pairs from Lean MIR `{ kind := ..., span := "..." }` records."""
+    records: list[tuple[str, str]] = []
+    marker = "{ kind :="
+    pos = 0
+    n = len(mir_text)
+    while True:
+        start = mir_text.find(marker, pos)
+        if start == -1:
+            break
+        depth = 0
+        in_str = False
+        i = start
+        end = -1
+        top_span_idx = -1
+        while i < n:
+            ch = mir_text[i]
+            if in_str:
+                if ch == "\\":
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_str = False
+                i += 1
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            elif depth == 1 and mir_text.startswith(", span :=", i):
+                top_span_idx = i
+            i += 1
+        if end == -1:
+            break
+        if top_span_idx != -1:
+            kind_expr = mir_text[start + len(marker) : top_span_idx].strip()
+            span_rhs = mir_text[top_span_idx + len(", span :=") : end].strip()
+            m_span = re.search(r'"((?:[^"\\]|\\.)*)"', span_rhs)
+            if m_span:
+                span_str = m_span.group(1).replace('\\"', '"').replace("\\\\", "\\")
+                records.append((kind_expr, span_str))
+        pos = end + 1
+    return records
+
+
+def _classify_mir_kind_expr(kind_expr: str) -> tuple[int, str] | None:
+    """Maps a Lean MIR statement/terminator `kind` expression to `(priority, hint)`."""
+    # 1. `CastKind.pointerCoercion` (both quoted rustc debug tags and constructor spellings).
+    m_pc_str = re.search(r'CastKind\.pointerCoercion\s+"([^"]+)"', kind_expr)
+    if m_pc_str:
+        raw_tag = m_pc_str.group(1).strip()
+        variant = raw_tag.split("(", 1)[0].strip()
+        if variant:
+            return (100, f"PointerCoercion::{variant}")
+    m_pc_ctor = re.search(r"CastKind\.pointerCoercion\s+\(?PointerCoercion\.([A-Za-z0-9_]+)", kind_expr)
+    if m_pc_ctor:
+        return (100, f"PointerCoercion::{_camel_to_pascal(m_pc_ctor.group(1))}")
+    # 2. Other `CastKind.*`.
+    m_cast = re.search(r"CastKind\.([A-Za-z0-9_]+)", kind_expr)
+    if m_cast:
+        return (95, f"CastKind::{_camel_to_pascal(m_cast.group(1))}")
+    # 3. Other Rvalues inside `StatementKind.assign`.
+    m_bin = re.search(r"Rvalue\.binaryOp\s+BinOp\.([A-Za-z0-9_]+)", kind_expr)
+    if m_bin:
+        return (80, f"BinaryOp::{_camel_to_pascal(m_bin.group(1))}")
+    m_un = re.search(r"Rvalue\.unaryOp\s+UnOp\.([A-Za-z0-9_]+)", kind_expr)
+    if m_un:
+        return (80, f"UnaryOp::{_camel_to_pascal(m_un.group(1))}")
+    m_null = re.search(r"Rvalue\.nullaryOp\s+\(?NullOp\.([A-Za-z0-9_]+)", kind_expr)
+    if m_null:
+        return (80, f"NullOp::{_camel_to_pascal(m_null.group(1))}")
+    m_agg = re.search(r"Rvalue\.aggregate\s+\(?AggregateKind\.([A-Za-z0-9_]+)", kind_expr)
+    if m_agg:
+        return (80, f"AggregateKind::{_camel_to_pascal(m_agg.group(1))}")
+    m_rv = re.search(
+        r"Rvalue\.(discriminant|len|ref|rawPtr|repeat|shallowInitBox|copyForDeref|wrapUnsafeBinder)\b",
+        kind_expr,
+    )
+    if m_rv:
+        rv_name = m_rv.group(1)
+        return (60 if rv_name == "ref" else 70, f"Rvalue::{_camel_to_pascal(rv_name)}")
+    # 4. Non-assign `StatementKind.*`.
+    m_intr = re.search(r"NonDivergingIntrinsic\.([A-Za-z0-9_]+)", kind_expr)
+    if m_intr:
+        return (90, f"Intrinsic::{_camel_to_pascal(m_intr.group(1))}")
+    m_stmt = re.search(
+        r"StatementKind\.(retag|setDiscriminant|deinit|storageDead|storageLive|placeMention|assign)\b",
+        kind_expr,
+    )
+    if m_stmt:
+        stmt_name = m_stmt.group(1)
+        stmt_prio = {
+            "retag": 80,
+            "setDiscriminant": 80,
+            "deinit": 80,
+            "assign": 40,
+            "placeMention": 20,
+            "storageDead": 10,
+            "storageLive": 10,
+        }[stmt_name]
+        return (stmt_prio, f"StatementKind::{_camel_to_pascal(stmt_name)}")
+    # 5. `TerminatorKind.*`.
+    if "TerminatorKind.call" in kind_expr:
+        m_fn = re.search(r'RigidTy\.fnDef\s+"([^"]+)"', kind_expr)
+        if m_fn:
+            return (90, f"Call::{m_fn.group(1)}")
+        return (60, "TerminatorKind::Call")
+    m_term = re.search(
+        r"TerminatorKind\.(assert|drop|switchInt|unreachable|inlineAsm|tailCall|goto|return_)\b",
+        kind_expr,
+    )
+    if m_term:
+        term_name = m_term.group(1)
+        term_prio = {
+            "assert": 90,
+            "drop": 90,
+            "unreachable": 90,
+            "inlineAsm": 90,
+            "tailCall": 90,
+            "switchInt": 60,
+            "goto": 20,
+            "return_": 20,
+        }[term_name]
+        return (term_prio, f"TerminatorKind::{_camel_to_pascal(term_name)}")
+    return None
+
+
+def _extract_failing_construct_hint_from_mir(
+    mir_text: str, target_spans: list[str]
+) -> str | None:
+    if not mir_text or not target_spans:
+        return None
+    records = _iter_mir_kind_span_records(mir_text)
+    for target in target_spans:
+        best_prio = -1
+        best_hint: str | None = None
+        for kind_expr, rec_span in records:
+            if _spans_refer_to_same_site(rec_span, target):
+                classified = _classify_mir_kind_expr(kind_expr)
+                if classified is not None and classified[0] > best_prio:
+                    best_prio, best_hint = classified
+        if best_hint is not None:
+            return best_hint
+    return None
+
+
+def _extract_failing_construct_hint_from_fault_line(fault_line: str) -> str | None:
+    if not fault_line:
+        return None
+    stripped = fault_line.strip()
+    if re.search(r"\bas\s+(?:&(?:mut\s+)?|\*(?:const|mut)\s+)dyn\b", stripped):
+        return "PointerCoercion::Unsize"
+    if (
+        re.search(r"(?::\s*(?:unsafe\s+)?fn\s*\([^)]*\)|\bas\s+(?:unsafe\s+)?fn\s*\([^)]*\))", stripped)
+        and "|" in stripped
+    ):
+        return "PointerCoercion::ClosureFnPointer"
+    if re.search(r"\btransmute\s*(?:::<|\()", stripped):
+        return "CastKind::Transmute"
+    if "copy_nonoverlapping(" in stripped:
+        return "Intrinsic::CopyNonOverlapping"
+    if "addr_eq(" in stripped:
+        return "Call::core::ptr::addr_eq"
+    m_unch = re.search(r"\b(unchecked_(?:add|sub|mul|div|rem|shl|shr))\s*\(", stripped)
+    if m_unch:
+        return f"Call::{m_unch.group(1)}"
+    return None
+
+
+def extract_failing_construct_hint(finding: dict[str, Any]) -> str | None:
+    """Extracts a concise diagnostic hint for the failing MIR/Rust construct.
+
+    Prefers `finding["failing_construct_hint"]` emitted by `miri-difftest`,
+    falling back to `mir_neighborhood` at `anneal_span` / `batch_anneal_span`
+    and then the Rust fault line so legacy findings without the field still
+    surface concrete construct hints without changing the 3-part fingerprint.
+    """
+    raw = finding.get("failing_construct_hint")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    mir_text = finding.get("mir_neighborhood")
+    if isinstance(mir_text, str) and mir_text.strip():
+        spans: list[str] = []
+        for key in ("anneal_span", "batch_anneal_span"):
+            val = finding.get(key)
+            if isinstance(val, str) and val.strip() and val.strip() not in spans:
+                spans.append(val.strip())
+        anneal_out = finding.get("anneal_outcome")
+        if isinstance(anneal_out, str) and "@" in anneal_out:
+            loc = anneal_out.partition("@")[2].strip()
+            if loc and loc not in spans:
+                spans.append(loc)
+        hint = _extract_failing_construct_hint_from_mir(mir_text, spans)
+        if hint is not None:
+            return hint
+    fault_line = extract_fault_line_text(finding)
+    return _extract_failing_construct_hint_from_fault_line(fault_line)
+
+
 def infer_finding_cause(
     finding: dict[str, Any], known_corpus_bug_seeds: set[str]
 ) -> str:
@@ -4417,12 +4659,18 @@ def deduplicate_and_quarantine_findings(
         fp, match_keys = quarantine_match_keys_for_miri_finding(f, known_corpus_bug_seeds)
         is_quarantined = bool(quarantine_rules and (match_keys & quarantine_rules))
         repro_path = str(f["repro_path"])
+        construct_hint = extract_failing_construct_hint(f)
 
         if fp in by_fp:
             existing = by_fp[fp]
             existing.occurrences += 1
             if repro_path not in existing.all_repro_paths:
                 existing.all_repro_paths.append(repro_path)
+            if construct_hint is not None:
+                if construct_hint not in existing.failing_construct_hints:
+                    existing.failing_construct_hints.append(construct_hint)
+                if existing.failing_construct_hint is None:
+                    existing.failing_construct_hint = construct_hint
             existing.kernel_confirmed = existing.kernel_confirmed and bool(
                 f.get("kernel_confirmed", False)
             )
@@ -4436,6 +4684,8 @@ def deduplicate_and_quarantine_findings(
                 existing.primary_repro_path = repro_path
                 existing.miri_outcome = str(f["miri_outcome"])
                 existing.anneal_outcome = str(f["anneal_outcome"])
+                if construct_hint is not None:
+                    existing.failing_construct_hint = construct_hint
         else:
             raw_polarity = f.get("witness_polarity")
             by_fp[fp] = DeduplicatedFinding(
@@ -4464,6 +4714,8 @@ def deduplicate_and_quarantine_findings(
                         else None
                     )
                 ),
+                failing_construct_hint=construct_hint,
+                failing_construct_hints=[construct_hint] if construct_hint is not None else [],
             )
 
     all_dedup = list(by_fp.values())
@@ -6564,11 +6816,18 @@ def write_oracle_junit_xml(
             )
         )
     elif len(miri_unquarantined) > 0:
-        summary_lines = [
-            f"{d.fingerprint} (occurrences={d.occurrences}, "
-            f"witness_polarity={d.witness_polarity}, repro={d.primary_repro_path})"
-            for d in miri_unquarantined
-        ]
+        summary_lines = []
+        for d in miri_unquarantined:
+            hint_suffix = (
+                f", construct_hint={','.join(d.failing_construct_hints)}"
+                if d.failing_construct_hints
+                else ""
+            )
+            summary_lines.append(
+                f"{d.fingerprint} (occurrences={d.occurrences}, "
+                f"witness_polarity={d.witness_polarity}{hint_suffix}, "
+                f"repro={d.primary_repro_path})"
+            )
         cases.append(
             (
                 "miri-difftest",
@@ -7858,21 +8117,29 @@ def render_oracle_campaign_report(
             "",
         ]
     )
+    def _construct_hint_cell(d: DeduplicatedFinding) -> str:
+        if d.failing_construct_hints:
+            return ", ".join(_md_table_cell(h, code=True) for h in d.failing_construct_hints)
+        if d.failing_construct_hint:
+            return _md_table_cell(d.failing_construct_hint, code=True)
+        return "n/a"
+
     if not unquarantined:
         lines.append("None.")
     else:
         lines.extend(
             [
-                "| Fingerprint | Class | Occurrences | Polarity | Miri | Anneal | Kernel Confirmed "
+                "| Fingerprint | Class | Occurrences | Polarity | Construct Hint | Miri | Anneal | Kernel Confirmed "
                 "| Reproducer |",
-                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- | :--- |",
+                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
         for d in unquarantined:
             polarity_cell = f"`{d.witness_polarity}`" if d.witness_polarity else "n/a"
+            hint_cell = _construct_hint_cell(d)
             lines.append(
                 f"| `{d.fingerprint}` | `{d.divergence_class}` | {d.occurrences} | "
-                f"{polarity_cell} | `{d.miri_outcome}` | `{d.anneal_outcome}` | "
+                f"{polarity_cell} | {hint_cell} | `{d.miri_outcome}` | `{d.anneal_outcome}` | "
                 f"`{str(d.kernel_confirmed).lower()}` | `{d.primary_repro_path}` |"
             )
 
@@ -7888,16 +8155,17 @@ def render_oracle_campaign_report(
     else:
         lines.extend(
             [
-                "| Fingerprint | Class | Occurrences | Polarity | Miri | Anneal | Kernel Confirmed "
+                "| Fingerprint | Class | Occurrences | Polarity | Construct Hint | Miri | Anneal | Kernel Confirmed "
                 "| Reproducer |",
-                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- | :--- |",
+                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
         for d in quarantined:
             polarity_cell = f"`{d.witness_polarity}`" if d.witness_polarity else "n/a"
+            hint_cell = _construct_hint_cell(d)
             lines.append(
                 f"| `{d.fingerprint}` | `{d.divergence_class}` | {d.occurrences} | "
-                f"{polarity_cell} | `{d.miri_outcome}` | `{d.anneal_outcome}` | "
+                f"{polarity_cell} | {hint_cell} | `{d.miri_outcome}` | `{d.anneal_outcome}` | "
                 f"`{str(d.kernel_confirmed).lower()}` | `{d.primary_repro_path}` |"
             )
 
