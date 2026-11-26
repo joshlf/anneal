@@ -835,7 +835,8 @@ theorem t_decode_incoherent_cross_width :
     decodePtrBytesNoForgeProto false .thin 8
         (encodePtrBytesProto pBig4 4 ++ encodePtrBytesProto pBig4 4) =
       some (.scalar (leValue (leImage 0x11223344 4 ++ leImage 0x11223344 4)) 8) :=
-  decode_incoherent_ref_none_raw_scalar 8 _ _ rfl rfl (coherent_cross_width_none pBig4 pBig4 4 (by decide))
+  decode_incoherent_ref_none_raw_scalar 8 (by decide) _ _ rfl rfl
+    (coherent_cross_width_none pBig4 pBig4 4 (by decide))
 
 /-- Mixed plain/pointer bytes: ref UB, raw bare address. -/
 theorem t_decode_incoherent_mixed_plain :
@@ -845,7 +846,8 @@ theorem t_decode_incoherent_mixed_plain :
       none ∧
     decodePtrBytesNoForgeProto false .thin 8 ((encodePtrBytesProto pBig 8).set 3 (mkInitByte 0x55)) =
       some (.scalar (leValue ((leImage 0x1122334455667788 8).set 3 0x55)) 8) :=
-  decode_incoherent_ref_none_raw_scalar 8 _ _ rfl rfl (coherent_set_plain_none pBig 8 3 0x55 (by decide))
+  decode_incoherent_ref_none_raw_scalar 8 (by decide) _ _ rfl rfl
+    (coherent_set_plain_none pBig 8 3 0x55 (by decide))
 
 /-- `UCG#558` value-level: `p = 0` / `p + 256` splice is UB as `&T`, address `256` as `*const T`. -/
 theorem t_decode_splice_0_256_value :
@@ -860,6 +862,110 @@ theorem t_decode_splice_0_256_value :
 theorem t_decode_splice_value_address_256 :
     leValue ((leImage (normOffset 8 0) 8).take 1 ++ (leImage (normOffset 8 256) 8).drop 1) = 256 :=
   rfl
+
+/-- Zero-width pointer guard: `ptrBytes = 0` always fails closed (no 0-byte `.scalar 0 0`). -/
+theorem t_decode_zero_width_none :
+    decodePtrBytesNoForgeProto false .thin 0 [] = none ∧
+    decodeScalarLayoutBytesNoForgeProto 0 (.initialized (.pointer 0) ⟨0, 0⟩) [] = none ∧
+    decodeScalarLayoutBytesNoForgeProto 0 (.union (.pointer 0)) [] = none ∧
+    encodeThinPtrValueProto true 0 (.ptr pZero 0) = none :=
+  decode_zero_width_none false true .thin 0 ⟨0, 0⟩ [] (.ptr pZero 0)
+
+/-- Universal `decodeScalarLayoutBytesNoForgeProto` round-trip at 64-bit and 32-bit (with `tag`). -/
+theorem t_scalarLayout_encode_ptr_exact :
+    (decodeScalarLayoutBytesNoForgeProto 8 (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩)
+        (encodePtrBytesProto pTag 8) = some (.ptr pTag 8) ∧
+     decodeScalarLayoutBytesNoForgeProto 8 (.union (.pointer 0))
+        (encodePtrBytesProto pTag 8) = some (.ptr pTag 8)) ∧
+    (decodeScalarLayoutBytesNoForgeProto 4 (.initialized (.pointer 0) ⟨1, 0xFFFFFFFF⟩)
+        (encodePtrBytesProto pBig4 4) = some (.ptr pBig4 4) ∧
+     decodeScalarLayoutBytesNoForgeProto 4 (.union (.pointer 0))
+        (encodePtrBytesProto pBig4 4) = some (.ptr pBig4 4)) :=
+  ⟨scalarLayout_encode_ptr_exact 8 0 (by decide) ⟨1, 0xFFFFFFFFFFFFFFFF⟩ pTag (by decide),
+   scalarLayout_encode_ptr_exact 4 0 (by decide) ⟨1, 0xFFFFFFFF⟩ pBig4 (by decide)⟩
+
+/-- Universal `decodeScalarLayoutBytesNoForgeProto` stripping on reversed all-zero pointer:
+`.union` degrades to `.scalar 0 8`; non-null `.initialized` (`start = 1`) rejects `0` as `none`. -/
+theorem t_scalarLayout_incoherent_ptr_strips :
+    decodeScalarLayoutBytesNoForgeProto 8 (.union (.pointer 0))
+        (encodePtrBytesProto pZero 8).reverse = some (.scalar 0 8) ∧
+    decodeScalarLayoutBytesNoForgeProto 8 (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩)
+        (encodePtrBytesProto pZero 8).reverse = none :=
+  scalarLayout_incoherent_ptr_strips 8 0 (by decide) ⟨1, 0xFFFFFFFFFFFFFFFF⟩
+    (encodePtrBytesProto pZero 8).reverse (leImage 0 8).reverse rfl rfl
+    (coherent_reverse_none pZero 8 (by decide))
+
+/-- Universal non-pointer `ScalarLayout`s (`.int`, `.float`) reject pointer fragments. -/
+theorem t_scalarLayout_nonPtr_rejects_frag :
+    (decodeScalarLayoutBytesNoForgeProto 8 (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩)
+        (encodePtrBytesProto pBig 8) = none ∧
+     decodeScalarLayoutBytesNoForgeProto 8 (.union (.int 64 false))
+        (encodePtrBytesProto pBig 8) = none) ∧
+    (decodeScalarLayoutBytesNoForgeProto 8 (.initialized (.float 64) ⟨0, 0xFFFFFFFFFFFFFFFF⟩)
+        (encodePtrBytesProto pBig 8) = none ∧
+     decodeScalarLayoutBytesNoForgeProto 8 (.union (.float 64))
+        (encodePtrBytesProto pBig 8) = none) :=
+  ⟨scalarLayout_nonPtr_rejects_frag 8 0 _ _ (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩
+      (encodePtrBytesProto pBig 8) rfl (fun _ h => by cases h),
+   scalarLayout_nonPtr_rejects_frag 8 0 _ _ (.float 64) ⟨0, 0xFFFFFFFFFFFFFFFF⟩
+      (encodePtrBytesProto pBig 8) rfl (fun _ h => by cases h)⟩
+
+/-- Universal `ScalarLayout` `bool` (`2u8` UB, `1u8` ok) and `char` surrogate (`0xD800` UB). -/
+theorem t_scalarLayout_bool_and_char_validity :
+    decodeScalarLayoutBytesNoForgeProto 8 (.initialized (.int 8 false) ⟨0, 1⟩)
+        [.init 2 none] = none ∧
+    decodeScalarLayoutBytesNoForgeProto 8 (.initialized (.int 8 false) ⟨0, 1⟩)
+        [.init 1 none] = some (.scalar 1 1) ∧
+    decodeScalarLayoutBytesNoForgeProto 8 (.initialized (.int 32 false) ⟨0, 0x10FFFF⟩)
+        (encodeLittleEndianBytesProto 0xD800 4) = none :=
+  scalarLayout_bool_and_char_validity 8 2 1 0xD800 (by decide) (by decide) (by decide) (by decide)
+
+/-- Universal Miri wildcard non-rescue on `pZero` / `p256` splice and misplaced concrete fragment. -/
+theorem t_miri_wildcard_does_not_rescue_splice :
+    inspectFragmentsMirror (some (0, 0))
+        [some ⟨0, (0, 0), imageVec8 0⟩,
+         some ⟨1, (1, 1), imageVec8 (normOffset 8 0)⟩,
+         some ⟨2, (1, 1), imageVec8 (normOffset 8 256)⟩] = .ok none ∧
+    inspectFragmentsMirror (some (0, 0))
+        [some ⟨0, (0, 0), imageVec8 0⟩,
+         some ⟨0, (1, 1), imageVec8 (normOffset 8 0)⟩] = .ok none :=
+  miri_wildcard_does_not_rescue_splice (0, 0) pZero p256 (by decide) (by decide) (by decide)
+
+/-- Universal live `MiniRustSpec.Interp.encodePtr` bridge on `pTag` (`allocId = 5, offset = 0x40`). -/
+theorem t_mr_encodePtr_eq_proto_8 :
+    MiniRustSpec.Interp.encodePtr
+        { addr := (0x40 : Int), provenance := some (mrProv 5) } =
+      .ok ((encodePtrBytesProto pTag 8).map AbstractByteProto.toMiniRust) :=
+  mr_encodePtr_eq_proto_8 pTag (by decide)
+
+/-- Universal live `MiniRustSpec.Interp.encodePtr` → `decodePtr` round-trip on `pTag`. -/
+theorem t_mr_encodePtr_decodePtr_roundtrip_8 :
+    (MiniRustSpec.Interp.encodePtr
+        { addr := (0x40 : Int), provenance := some (mrProv 5) }).bind
+        MiniRustSpec.Interp.decodePtr =
+      .ok (some { addr := (0x40 : Int), provenance := some (mrProv 5) }) :=
+  mr_encodePtr_decodePtr_roundtrip_8 pTag (by decide)
+
+/-- Custom union / partial byte overwrite: even overwriting byte `0` of `pTag` (`offset = 0x40`)
+with the IDENTICAL numeric byte `0x40` strips provenance (UB as `&T`/`fnPtr`, `.scalar` as `*const T`). -/
+theorem t_partial_byte_overwrite_strips_ptr :
+    ∃ buf₁,
+      writeBytesProto (encodePtrBytesProto pTag 8) 0 [mkInitByte 0x40] = some buf₁ ∧
+      readTypedFromBytesProto 8 (.ref .thin) buf₁ 0 = none ∧
+      readTypedFromBytesProto 8 .fnPtr buf₁ 0 = none ∧
+      readTypedFromBytesProto 8 (.rawPtr .thin) buf₁ 0 =
+        some (.scalar (leValue ((leImage (normOffset 8 0x40) 8).take 0 ++
+          [0x40] ++ (leImage (normOffset 8 0x40) 8).drop 1)) 8) :=
+  partial_byte_overwrite_strips_ptr pTag 8 0 0x40 (by decide)
+
+/-- Disjoint byte write at offset `8` preserves the pointer `pTag` at offset `0` with exact `tag`. -/
+theorem t_disjoint_byte_overwrite_preserves_ptr :
+    ∃ buf₁,
+      writeBytesProto (encodePtrBytesProto pTag 8 ++ [mkInitByte 0xAA]) 8 [mkInitByte 0x55] =
+        some buf₁ ∧
+      readTypedFromBytesProto 8 (.ref .thin) buf₁ 0 = some (.ptr pTag 8) :=
+  disjoint_byte_overwrite_preserves_ptr true pTag 8 (by decide) (by decide)
+    [mkInitByte 0xAA] 0x55 (by decide)
 
 /-! ## 2. Prototype decoders on the adversarial inputs (independent `rfl` checks) -/
 
@@ -1505,6 +1611,49 @@ theorem t_w3_wide_swapped_halves_matrix :
         .ptr { allocId := 1, offsetBytes := 0x10 } 8]) :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w3_wide_swapped_halves_matrix
 
+theorem t_w4_const_indirect_forges_prov :
+    evalConstValue (.indirect 101 0) rawPtrTy [globalPlainAddrAlloc] layouts64 =
+      some (.ptr { allocId := 2, offsetBytes := 4 } 8) ∧
+    evalConstValue (.indirect 101 0) tyRefU8 [globalPlainAddrAlloc] layouts64 =
+      some (.ptr { allocId := 2, offsetBytes := 4 } 8) ∧
+    evalConstValue (.slice (.int ⟨0x20004, 8⟩) 5)
+        { kind := .rawPtr .not (.slice thinTy), layoutIdx := 0 } [] layouts64 =
+      some (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 4 } 8, .scalar ⟨5, 8⟩]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w4_const_indirect_forges_prov
+
+theorem t_w4_decodeValueFromBytes_single_mixed_byte_unsound :
+    decodeValueFromBytes 16 layouts64 rawPtrTy
+        ([.init 0x10 (some (1, 1))] ++ livePlain 0 7) =
+      some (.ptr { allocId := 1, offsetBytes := 0x10 } 8) ∧
+    decodeValueFromBytes 16 layouts64 tyRefU8
+        ([.init 0x10 (some (1, 1))] ++ livePlain 0 7) =
+      some (.ptr { allocId := 1, offsetBytes := 0x10 } 8) ∧
+    decodeValueFromBytes 16 layouts64 tyRefU8
+        (spliceBytes 1 (liveEnc 1 1 0x10 8) (liveEnc 2 2 0x200 8)) =
+      some (.ptr { allocId := 1, offsetBytes := 0x210 } 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w4_decodeValueFromBytes_single_mixed_byte_unsound
+
+theorem t_w5_byteCast_transmute_audit :
+    byteCastOutcome tyMUPtr tyRefU8 muPtrRevVal =
+      .ok (.ptr { allocId := 1, offsetBytes := 0x8877665544332211 } 8) ∧
+    byteCastOutcome tyMUPtr tyRefU8 muPtrSpliceVal =
+      .ok (.ptr { allocId := 1, offsetBytes := 256 } 8) ∧
+    byteCastOutcome tyUsize tyRawU8 (.scalar ⟨0x20004, 8⟩) = .ok (.scalar ⟨0x20004, 8⟩) ∧
+    byteCastOutcome tyUsize tyRefU8 (.scalar ⟨0x20004, 8⟩) = .ub ∧
+    byteCastOutcome tyRawU8 tyUsize (.ptr { allocId := 7, offsetBytes := 0x40 } 8) = .ub ∧
+    byteCastOutcome tyU8 tyBool (.scalar ⟨2, 1⟩) = .ub ∧
+    byteCastOutcome tyU8 tyUnalBool (.scalar ⟨2, 1⟩) = .ub ∧
+    byteCastOutcome tyU8 tyMUBool (.scalar ⟨2, 1⟩) =
+      .ok (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w5_byteCast_transmute_audit
+
+theorem t_w5_enum_multiple_allows_prov_bytes :
+    decodeTypedValueFromBytes 16 enumTagLayouts tyEnumTag2 [.init 1 (some (1, 1))] =
+      some (.aggregate 1 []) ∧
+    decodeTypedValueFromBytes 16 kLayouts tyBool [.init 1 (some (1, 1))] = none ∧
+    decodeTypedValueFromBytes 16 kLayouts tyU8 [.init 1 (some (1, 1))] = none :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV06.w5_enum_multiple_allows_prov_bytes
+
 end RestateLiveV06
 
 namespace RestateLiveV08
@@ -1952,6 +2101,49 @@ theorem t_w3_wide_swapped_halves_matrix :
         .ptr { allocId := 1, offsetBytes := 0x10 } 8]) :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w3_wide_swapped_halves_matrix
 
+theorem t_w4_const_indirect_forges_prov :
+    evalConstValue (.indirect 101 0) rawPtrTy [globalPlainAddrAlloc] layouts64 =
+      some (.ptr { allocId := 2, offsetBytes := 4 } 8) ∧
+    evalConstValue (.indirect 101 0) tyRefU8 [globalPlainAddrAlloc] layouts64 =
+      some (.ptr { allocId := 2, offsetBytes := 4 } 8) ∧
+    evalConstValue (.slice (.int ⟨0x20004, 8⟩) 5)
+        { kind := .rawPtr .not (.slice thinTy), layoutIdx := 0 } [] layouts64 =
+      some (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 4 } 8, .scalar ⟨5, 8⟩]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w4_const_indirect_forges_prov
+
+theorem t_w4_decodeValueFromBytes_single_mixed_byte_unsound :
+    decodeValueFromBytes 16 layouts64 rawPtrTy
+        ([.init 0x10 (some (1, 1))] ++ livePlain 0 7) =
+      some (.ptr { allocId := 1, offsetBytes := 0x10 } 8) ∧
+    decodeValueFromBytes 16 layouts64 tyRefU8
+        ([.init 0x10 (some (1, 1))] ++ livePlain 0 7) =
+      some (.ptr { allocId := 1, offsetBytes := 0x10 } 8) ∧
+    decodeValueFromBytes 16 layouts64 tyRefU8
+        (spliceBytes 1 (liveEnc 1 1 0x10 8) (liveEnc 2 2 0x200 8)) =
+      some (.ptr { allocId := 1, offsetBytes := 0x210 } 8) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w4_decodeValueFromBytes_single_mixed_byte_unsound
+
+theorem t_w5_byteCast_transmute_audit :
+    byteCastOutcome tyMUPtr tyRefU8 muPtrRevVal =
+      .ok (.ptr { allocId := 1, offsetBytes := 0x8877665544332211 } 8) ∧
+    byteCastOutcome tyMUPtr tyRefU8 muPtrSpliceVal =
+      .ok (.ptr { allocId := 1, offsetBytes := 256 } 8) ∧
+    byteCastOutcome tyUsize tyRawU8 (.scalar ⟨0x20004, 8⟩) = .ok (.scalar ⟨0x20004, 8⟩) ∧
+    byteCastOutcome tyUsize tyRefU8 (.scalar ⟨0x20004, 8⟩) = .ub ∧
+    byteCastOutcome tyRawU8 tyUsize (.ptr { allocId := 7, offsetBytes := 0x40 } 8) = .ub ∧
+    byteCastOutcome tyU8 tyBool (.scalar ⟨2, 1⟩) = .ub ∧
+    byteCastOutcome tyU8 tyUnalBool (.scalar ⟨2, 1⟩) = .ub ∧
+    byteCastOutcome tyU8 tyMUBool (.scalar ⟨2, 1⟩) =
+      .ok (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨2, 1⟩]]) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w5_byteCast_transmute_audit
+
+theorem t_w5_enum_multiple_allows_prov_bytes :
+    decodeTypedValueFromBytes 16 enumTagLayouts tyEnumTag2 [.init 1 (some (1, 1))] =
+      some (.aggregate 1 []) ∧
+    decodeTypedValueFromBytes 16 kLayouts tyBool [.init 1 (some (1, 1))] = none ∧
+    decodeTypedValueFromBytes 16 kLayouts tyU8 [.init 1 (some (1, 1))] = none :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.LiveV08.w5_enum_multiple_allows_prov_bytes
+
 end RestateLiveV08
 
 namespace RestateThreeWay
@@ -1962,6 +2154,14 @@ theorem t_mr_intact :
     MiniRustSpec.Interp.decodePtr (mrEnc 1 0x1122) =
       .ok (some { addr := 0x1122, provenance := some (mrProv 1) }) :=
   Anneal.Proto.Ucg558PtrByteCoherenceProto.mr_intact
+
+theorem t_mr_encodePtr_concrete :
+    MiniRustSpec.Interp.encodePtr { addr := 0x1122, provenance := some (mrProv 1) } =
+      .ok (mrEnc 1 0x1122) ∧
+    (MiniRustSpec.Interp.encodePtr { addr := 0x1122, provenance := some (mrProv 1) }).bind
+        MiniRustSpec.Interp.decodePtr =
+      .ok (some { addr := 0x1122, provenance := some (mrProv 1) }) :=
+  Anneal.Proto.Ucg558PtrByteCoherenceProto.mr_encodePtr_concrete
 
 theorem t_mr_w1_rev8 :
     MiniRustSpec.Interp.decodePtr (mrEnc 1 0x1122334455667788).reverse =
