@@ -9979,6 +9979,60 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
                 junit_path.read_text(encoding="utf-8"),
             )
 
+            # Whitespace/duplicate normalization in `DeduplicatedFinding.__post_init__`
+            # and canonical 3-part ledger persistence via `update_suite_scoped_fingerprints`.
+            blank_dedup = campaign.DeduplicatedFinding(
+                fingerprint="ClosureAndAddrEqMutator:false_positive_ub:MirDiffTag.ub",
+                cause="ClosureAndAddrEqMutator",
+                seed_name="pass_seed",
+                divergence_class="false_positive_ub",
+                normalized_anneal_tag="MirDiffTag.ub",
+                quarantined=False,
+                occurrences=1,
+                primary_fn_name="pass_seed__b0_c1",
+                primary_repro_path=str(repro),
+                all_repro_paths=[str(repro)],
+                miri_outcome="pass:scalar:167:4",
+                anneal_outcome="ub@src/lib.rs:12:38: 12:71",
+                kernel_confirmed=True,
+                witness_polarity="sound_conservative_abstraction",
+                failing_construct_hint="   ",
+                failing_construct_hints=[
+                    "",
+                    " PointerCoercion::ClosureFnPointer ",
+                    "PointerCoercion::ClosureFnPointer",
+                ],
+            )
+            self.assertEqual(
+                blank_dedup.failing_construct_hint,
+                "PointerCoercion::ClosureFnPointer",
+            )
+            self.assertEqual(
+                blank_dedup.failing_construct_hints,
+                ["PointerCoercion::ClosureFnPointer"],
+            )
+            ledger: dict[str, Any] = {}
+            campaign.update_suite_scoped_fingerprints(
+                ledger,
+                "2026-11-26",
+                True,
+                [blank_dedup],
+                [direct_dedup],
+                False,
+                [],
+                [],
+            )
+            self.assertEqual(
+                ledger["active_fingerprints"],
+                ["ClosureAndAddrEqMutator:false_positive_ub:MirDiffTag.ub"],
+            )
+            self.assertEqual(
+                ledger["quarantined_fingerprints"],
+                ["VTableAndFnPtrMutator:false_positive_ub:MirDiffTag.ub"],
+            )
+            for fp in ledger["active_fingerprints"] + ledger["quarantined_fingerprints"]:
+                self.assertTrue(campaign._is_well_formed_quarantine_token(fp), fp)
+
 
 if __name__ == "__main__":
     unittest.main()

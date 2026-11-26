@@ -304,10 +304,23 @@ class DeduplicatedFinding:
     failing_construct_hints: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if self.failing_construct_hint and not self.failing_construct_hints:
-            self.failing_construct_hints = [self.failing_construct_hint]
-        elif self.failing_construct_hint is None and self.failing_construct_hints:
-            self.failing_construct_hint = self.failing_construct_hints[0]
+        primary = (
+            self.failing_construct_hint.strip()
+            if isinstance(self.failing_construct_hint, str) and self.failing_construct_hint.strip()
+            else None
+        )
+        dedup_hints: list[str] = []
+        for raw in self.failing_construct_hints:
+            if isinstance(raw, str):
+                cleaned = raw.strip()
+                if cleaned and cleaned not in dedup_hints:
+                    dedup_hints.append(cleaned)
+        if primary is not None:
+            dedup_hints = [primary] + [h for h in dedup_hints if h != primary]
+        elif dedup_hints:
+            primary = dedup_hints[0]
+        self.failing_construct_hint = primary
+        self.failing_construct_hints = dedup_hints
 
     def to_dict(self) -> dict[str, Any]:
         return {
