@@ -4791,7 +4791,13 @@ def ep1VendoredPlaceHooks :
 
 private def ep1PlaceStorageHooks : MachineHooks.StorageHooks Unit Unit :=
   { veryTriviallySized := fun _ => .ok true
-    layout := fun _ => pure (translateTy ep1U32Ty emptyLayoutTable)
+    layout := fun id => do
+      let slot ← match (← MachineHooks.currentFrame).getLocal id with
+        | .ok s => pure s
+        | .error e => throw (.stack e)
+      match slot.layout with
+      | some lay => pure lay
+      | none => throw (.unsupported "ep1 uncached local layout")
     allocateDyn := fun _ _ => throw (.unsupported "ep1 dynamic stack alloc unused")
     deallocateStack := fun _ => throw (.unsupported "ep1 stack dealloc unused") }
 
@@ -4867,6 +4873,9 @@ Witness-local (authored, scoped to `ep1BodyTbDerefWriteAndRead`):
   `.Use (.Copy/.Move srcPlace)`; every other rvalue shape fails closed with `.unsupported`);
 - `ep1PlaceCompilerHooks.deref` (resolves whole-local pointer dereferences via vendored
   `PlaceMachine.localToOpCore` with fixed `u32` pointee layout; non-deref projections fail closed);
+- `ep1PlaceStorageHooks` reads each local's actual cached frame layout via `Frame.getLocal`
+  (failing closed on uncached/missing locals or dynamic stack allocation/deallocation, with
+  `veryTriviallySized := fun _ => .ok true` for sized scalar/pointer locals);
 - `ep1VendoredControlHooks.copyReturn` is a no-op because the root `.stop` frame has no caller
   return destination (`returnOperand` still reads `_0` via vendored `Frame.getLocalOperand 0` and
   `popFrame` runs vendored `MachineHooks.beforeStackPopWithEnsure` before `Stack.popFrame`).
@@ -6066,19 +6075,6 @@ theorem witness_vendored_placeMachine_tb_step_positive_and_ub_refutations :
   have hS1 : bb0.statements[1]? = some stmt1 := rfl
   have hS2 : bb0.statements[2]? = none := rfl
   have hEx : ep1VendoredTbAlloc.extra = ep1DisjointTwoChildTree := rfl
-  have hLoc1 : ∀ (fr : Frame Provenance LocalLayout MachineHooks.FrameExtra)
-      (l0 l2 : LocalState Provenance LocalLayout) (op : Miri.Interpreter.Operand Provenance) (lay : Option LocalLayout),
-      fr.locals = #[l0, ⟨.live op, lay⟩, l2] → fr.getLocalOperand 1 = .ok op := by
-    intro fr l0 l2 op lay h; cases fr; simp only at h; subst h; rfl
-  have hLoc2 : ∀ (fr : Frame Provenance LocalLayout MachineHooks.FrameExtra)
-      (l0 l1 : LocalState Provenance LocalLayout) (op : Miri.Interpreter.Operand Provenance) (lay : Option LocalLayout),
-      fr.locals = #[l0, l1, ⟨.live op, lay⟩] → fr.getLocalOperand 2 = .ok op := by
-    intro fr l0 l1 op lay h; cases fr; simp only at h; subst h; rfl
-  have hRep0 : ∀ (fr : Frame Provenance LocalLayout MachineHooks.FrameExtra)
-      (l0 l1 l2 : LocalState Provenance LocalLayout) (v : LocalValue Provenance),
-      fr.locals = #[l0, l1, l2] →
-      fr.replaceLocalValue 0 v = .ok { fr with locals := #[{ l0 with value := v }, l1, l2] } := by
-    intro fr l0 l1 l2 v h; cases fr; simp only at h; subst h; rfl
   have hPtrConcrete0 : ∀ (tag : BorTag),
       (ep1VendoredPtrScalar (some (.concrete ep1AllocId tag)) 0).toPointer annealTargetDataLayout =
         .ok ⟨Size.ofBytes (ep1TbBaseAddr + 0), some (.concrete ep1AllocId tag)⟩ := fun _ => by kernel_rfl
@@ -6917,20 +6913,28 @@ run_cmd do
       seenC.contains `Miri.Memory.MemoryLifecycle.getAllocRaw do
     throwError "constant-closure isolation audit vacuous"
   -- 2. (e) `Anneal.MiriTreeBorrowsV2026` header guarantee, enforced (that module cannot import
-  --        `Lean`, so it is checked here): EVERY theorem it declares, INCLUDING `private` ones,
-  --        depends on axioms `⊆ {propext}`.
+  --        `Lean`, so it is checked here): EVERY theorem AND definition it declares (INCLUDING
+  --        `private` ones) depends strictly on axioms `⊆ {propext}`.
   let some tbIdx := env.getModuleIdx? `Anneal.MiriTreeBorrowsV2026
     | throwError "Anneal.MiriTreeBorrowsV2026 is not loaded"
   let mut tbThms : Nat := 0
+  let mut tbDefs : Nat := 0
   for (c, info) in env.constants.map₁.toList do
     if env.getModuleIdxFor? c == some tbIdx then
-      if let .thmInfo _ := info then
+      match info with
+      | .thmInfo _ =>
         tbThms := tbThms + 1
         for a in ← liftCoreM <| Lean.collectAxioms c do
           unless a == ``propext do
-            throwError "Anneal.MiriTreeBorrowsV2026 axiom-purity violation: {c} depends on {a}"
-  if tbThms < 150 then
-    throwError "Anneal.MiriTreeBorrowsV2026 axiom-purity audit vacuous: only {tbThms} theorems"
+            throwError "Anneal.MiriTreeBorrowsV2026 axiom-purity violation: theorem {c} depends on {a}"
+      | .defnInfo _ =>
+        tbDefs := tbDefs + 1
+        for a in ← liftCoreM <| Lean.collectAxioms c do
+          unless a == ``propext do
+            throwError "Anneal.MiriTreeBorrowsV2026 axiom-purity violation: def {c} depends on {a}"
+      | _ => pure ()
+  if tbThms < 150 || tbDefs < 30 then
+    throwError "Anneal.MiriTreeBorrowsV2026 axiom-purity audit vacuous: only {tbThms} theorems, {tbDefs} defs"
   -- 3. Bridge-reality audit: confirm our theorems genuinely reach REAL vendored Miri,
   --    Anneal.MiriTreeBorrowsV2026, AnnealExactWP, and translateBody.
   let bridgeReq : List (Lean.Name × Lean.Name) :=
