@@ -6916,6 +6916,21 @@ run_cmd do
       seenC.contains `Miri.Interpreter.RawMemoryMachine.readBytes &&
       seenC.contains `Miri.Memory.MemoryLifecycle.getAllocRaw do
     throwError "constant-closure isolation audit vacuous"
+  -- 2. (e) `Anneal.MiriTreeBorrowsV2026` header guarantee, enforced (that module cannot import
+  --        `Lean`, so it is checked here): EVERY theorem it declares, INCLUDING `private` ones,
+  --        depends on axioms `⊆ {propext}`.
+  let some tbIdx := env.getModuleIdx? `Anneal.MiriTreeBorrowsV2026
+    | throwError "Anneal.MiriTreeBorrowsV2026 is not loaded"
+  let mut tbThms : Nat := 0
+  for (c, info) in env.constants.map₁.toList do
+    if env.getModuleIdxFor? c == some tbIdx then
+      if let .thmInfo _ := info then
+        tbThms := tbThms + 1
+        for a in ← liftCoreM <| Lean.collectAxioms c do
+          unless a == ``propext do
+            throwError "Anneal.MiriTreeBorrowsV2026 axiom-purity violation: {c} depends on {a}"
+  if tbThms < 150 then
+    throwError "Anneal.MiriTreeBorrowsV2026 axiom-purity audit vacuous: only {tbThms} theorems"
   -- 3. Bridge-reality audit: confirm our theorems genuinely reach REAL vendored Miri,
   --    Anneal.MiriTreeBorrowsV2026, AnnealExactWP, and translateBody.
   let bridgeReq : List (Lean.Name × Lean.Name) :=

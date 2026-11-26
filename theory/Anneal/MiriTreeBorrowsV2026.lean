@@ -1329,33 +1329,18 @@ theorem miriPerformLocAccess_protectedDisabled_iff (tag : Nat) (st : MiriLocStat
     · rintro ⟨_, _, hEq⟩; cases hEq
   | transition nextPerm =>
     dsimp only
-    cases isProtected with
-    | false =>
-      simp only [Bool.false_and, Bool.false_eq_true, ↓reduceIte]
-      constructor
-      · rintro ⟨_, h⟩; cases h
-      · rintro ⟨hF, _, _⟩; cases hF
-    | true =>
-      simp only [Bool.true_and]
-      cases hAcc : (st.accessed || !miriRelIsForeign rel) with
-      | false =>
-        simp only [Bool.false_and, Bool.false_eq_true, ↓reduceIte]
-        constructor
-        · rintro ⟨_, h⟩; cases h
-        · rintro ⟨_, hF, _⟩; cases hF
-      | true =>
-        simp only [Bool.true_and]
-        cases nextPerm with
-        | disabled =>
-          simp only [miriPermIsDisabled, ↓reduceIte]
-          constructor
-          · intro _; exact ⟨trivial, trivial, trivial⟩
-          · intro _; exact ⟨_, rfl⟩
-        | cell | reservedFrz _ | reservedIM | unique | frozen =>
-          simp only [miriPermIsDisabled, Bool.false_eq_true, ↓reduceIte]
-          constructor
-          · rintro ⟨_, h⟩; cases h
-          · rintro ⟨_, _, hEq⟩; cases hEq
+    constructor
+    · rintro ⟨_, h⟩
+      revert h
+      cases isProtected <;> cases (st.accessed || !miriRelIsForeign rel) <;> cases nextPerm <;>
+        intro h <;> first | exact ⟨rfl, rfl, rfl⟩ | cases h
+    · rintro ⟨hP, hA, hEq⟩
+      cases hEq
+      subst hP
+      revert hA
+      cases (st.accessed || !miriRelIsForeign rel) <;> intro hA
+      · cases hA
+      · exact ⟨_, rfl⟩
 
 /-- SIFA `.read` soundness: whenever `miriStrongestSifa p isProt = some .read`, foreign read
 leaves `p` unchanged. -/
@@ -1491,10 +1476,15 @@ private theorem foldl_findAllocTree_replace_self (t' : MiriAllocTree) :
     cases hEq : Nat.beq t.allocId t'.allocId with
     | true =>
       have hSelf : Nat.beq t'.allocId t'.allocId = true := Nat.beq_refl t'.allocId
-      simp only [hSelf, ↓reduceIte]
+      -- Top-level `rw` only (no `simp` under the fold's binders), keeping axioms `⊆ {propext}`.
+      repeat rw [ite_eq_left (rfl : true = true)]
+      rw [hSelf]
+      repeat rw [ite_eq_left (rfl : true = true)]
       exact foldl_findAllocTree_replace_self t' rest (some t) (some t') rfl
     | false =>
-      simp only [hEq, Bool.false_eq_true, ↓reduceIte]
+      repeat rw [ite_eq_right Bool.false_ne_true]
+      rw [hEq]
+      repeat rw [ite_eq_right Bool.false_ne_true]
       exact foldl_findAllocTree_replace_self t' rest init₁ init₂ hInit
 
 /-- Replacing `t'.allocId` when present always causes `miriFindAllocTree? t'.allocId` to return
