@@ -527,43 +527,6 @@ theorem readRootAbstractBytes_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂
   unfold readRootAbstractBytes
   simp only [encodeRawValueBytes_congr h]
 
-theorem decodeScalarLayoutBytesTarget_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
-    (layouts : LayoutTable) (sl : ScalarLayout) (allowUninit : Bool) (bs : List AbstractByte) :
-    decodeScalarLayoutBytesTarget m₁ layouts sl allowUninit bs =
-      decodeScalarLayoutBytesTarget m₂ layouts sl allowUninit bs := by
-  unfold decodeScalarLayoutBytesTarget
-  simp only [isBackedPtr_congr h, bytesHaveRealProvenance_congr h]
-
-theorem decodeValueAtLayoutIdx_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
-    (layouts : LayoutTable) (allowPartialUninit : Bool)
-    (fuel : Nat) (lIdx : LayoutIdx) (bs : List AbstractByte) :
-    decodeValueAtLayoutIdx m₁ layouts allowPartialUninit fuel lIdx bs =
-      decodeValueAtLayoutIdx m₂ layouts allowPartialUninit fuel lIdx bs := by
-  induction fuel generalizing allowPartialUninit lIdx bs with
-  | zero => rfl
-  | succ fuel' ih =>
-    unfold decodeValueAtLayoutIdx
-    simp only [decodeScalarLayoutBytesTarget_congr h, bytesHaveRealProvenance_congr h, ih]
-
-theorem decodeThinPtrBytes_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
-    (ptrBytes : Nat) (reqNN allowUninit : Bool) (bs : List AbstractByte) :
-    decodeThinPtrBytes m₁ ptrBytes reqNN allowUninit bs =
-      decodeThinPtrBytes m₂ ptrBytes reqNN allowUninit bs := by
-  unfold decodeThinPtrBytes
-  simp only [isBackedPtr_congr h]
-
-theorem decodePartialUninitValue_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) (allowUninitLeaf : Bool)
-    (fuel : Nat) (tyOpt : Option Ty) (bs : List AbstractByte) :
-    decodePartialUninitValue m₁ localDecls layouts allowUninitLeaf fuel tyOpt bs =
-      decodePartialUninitValue m₂ localDecls layouts allowUninitLeaf fuel tyOpt bs := by
-  induction fuel generalizing allowUninitLeaf tyOpt bs with
-  | zero => rfl
-  | succ fuel' ih =>
-    unfold decodePartialUninitValue
-    simp only [bytesHaveRealProvenance_congr h, decodeThinPtrBytes_congr h,
-      decodeValueAtLayoutIdx_congr h, ih]
-
 theorem validateNonNullPtrBytes_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
     (ptrBytes : Nat) (bs : List AbstractByte) :
     validateNonNullPtrBytes m₁ ptrBytes bs = validateNonNullPtrBytes m₂ ptrBytes bs := by
@@ -583,6 +546,44 @@ theorem validateWideMetaBytes_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂
       validateWideMetaBytes m₂ localDecls layouts isRef hasHeader tailTy bs := by
   unfold validateWideMetaBytes
   simp only [validateNonNullPtrBytes_congr h, bytesHaveRealProvenance_congr h]
+
+theorem decodeScalarLayoutBytesTarget_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
+    (layouts : LayoutTable) (sl : ScalarLayout) (allowUninit : Bool) (bs : List AbstractByte) :
+    decodeScalarLayoutBytesTarget m₁ layouts sl allowUninit bs =
+      decodeScalarLayoutBytesTarget m₂ layouts sl allowUninit bs := by
+  unfold decodeScalarLayoutBytesTarget
+  simp only [isBackedPtr_congr h, bytesHaveRealProvenance_congr h]
+
+theorem decodeValueAtLayoutIdx_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
+    (layouts : LayoutTable) (allowPartialUninit : Bool)
+    (fuel : Nat) (lIdx : LayoutIdx) (bs : List AbstractByte) :
+    decodeValueAtLayoutIdx m₁ layouts allowPartialUninit fuel lIdx bs =
+      decodeValueAtLayoutIdx m₂ layouts allowPartialUninit fuel lIdx bs := by
+  induction fuel generalizing allowPartialUninit lIdx bs with
+  | zero => rfl
+  | succ fuel' ih =>
+    unfold decodeValueAtLayoutIdx
+    simp only [decodeScalarLayoutBytesTarget_congr h, bytesHaveRealProvenance_congr h,
+      encodeValueAtLayoutIdx_congr h, ih]
+
+theorem decodeThinPtrBytes_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
+    (ptrBytes : Nat) (reqNN allowUninit : Bool) (bs : List AbstractByte) :
+    decodeThinPtrBytes m₁ ptrBytes reqNN allowUninit bs =
+      decodeThinPtrBytes m₂ ptrBytes reqNN allowUninit bs := by
+  unfold decodeThinPtrBytes
+  simp only [isBackedPtr_congr h]
+
+theorem decodePartialUninitValue_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (allowUninitLeaf : Bool)
+    (fuel : Nat) (tyOpt : Option Ty) (bs : List AbstractByte) :
+    decodePartialUninitValue m₁ localDecls layouts allowUninitLeaf fuel tyOpt bs =
+      decodePartialUninitValue m₂ localDecls layouts allowUninitLeaf fuel tyOpt bs := by
+  induction fuel generalizing allowUninitLeaf tyOpt bs with
+  | zero => rfl
+  | succ fuel' ih =>
+    unfold decodePartialUninitValue
+    simp only [bytesHaveRealProvenance_congr h, decodeThinPtrBytes_congr h,
+      validateWideMetaBytes_congr h, decodeValueAtLayoutIdx_congr h, ih]
 
 theorem validateTypedBytesForLayoutIdx_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
     (layouts : LayoutTable) (fuel : Nat) (lIdx : LayoutIdx) (bs : List AbstractByte) :
@@ -1062,70 +1063,130 @@ private theorem evalCopyMemory_pushBaseStack
       | ub | unsupported => rfl
       | ok srcEp =>
         dsimp only
-        cases endpointAccessCheck srcEp byteCount with
-        | ub | unsupported => rfl
-        | ok _ =>
+        cases Nat.ble (Nat.add srcEp.effOff byteCount) srcEp.allocSize with
+        | false => rfl
+        | true =>
           dsimp only
-          rw [show (MachineState.pushBaseStack calleeBody [] ms).memory = Memory.pushBaseStack calleeBody [] ms.memory from rfl, h_rd]
-          cases readRootAbstractBytes ms.memory srcEp with
-          | none => rfl
-          | some sbs =>
+          rw [h_res1]
+          cases resolveLiveMemEndpoint ms locals bodyLocalDecls bodyLayouts dstPtr with
+          | ub | unsupported => rfl
+          | ok dstEp0 =>
             dsimp only
-            cases sliceAbstractBytes sbs srcEp.effOff byteCount with
-            | none => rfl
-            | some snap =>
+            cases Nat.ble (Nat.add dstEp0.effOff byteCount) dstEp0.allocSize with
+            | false => rfl
+            | true =>
               dsimp only
-              have h_br : (Memory.pushBaseStack calleeBody [] ms.memory).borrows = ms.memory.borrows := rfl
-              have h_ap : (Memory.pushBaseStack calleeBody [] ms.memory).activeProtectors = ms.memory.activeProtectors := rfl
-              rw [h_br, h_ap]
-              have h_step_b1 : ∀ (b1 : List BorrowEntry),
-                  (match resolveLiveMemEndpoint
-                      { MachineState.pushBaseStack calleeBody [] ms with
-                        memory := { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b1 } }
-                      locals bodyLocalDecls bodyLayouts dstPtr with
+              have h_post_w :
+                  (match endpointAccessCheck srcEp byteCount with
                    | .ub => MemOpRes.ub
                    | .unsupported => MemOpRes.unsupported
-                   | .ok dstEp =>
-                     match endpointAccessCheck dstEp byteCount with
+                   | .ok () =>
+                     match (match srcEp.borrow? with
+                       | .none => some (MachineState.pushBaseStack calleeBody [] ms).memory.borrows
+                       | .some (srcTag, srcEntry) =>
+                         borrowsAfterReadAccess (MachineState.pushBaseStack calleeBody [] ms).memory.borrows
+                           (MachineState.pushBaseStack calleeBody [] ms).memory.activeProtectors
+                           srcEp.targetDecls srcEp.targetLayouts srcTag srcEntry srcEp.effOff byteCount) with
+                     | .none => MemOpRes.ub
+                     | .some borrows₁ =>
+                       match resolveLiveMemEndpoint
+                           { MachineState.pushBaseStack calleeBody [] ms with
+                             memory := { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := borrows₁ } }
+                           locals bodyLocalDecls bodyLayouts dstPtr with
+                       | .ub => MemOpRes.ub
+                       | .unsupported => MemOpRes.unsupported
+                       | .ok dstEp =>
+                         match endpointAccessCheck dstEp byteCount with
+                         | .ub => MemOpRes.ub
+                         | .unsupported => MemOpRes.unsupported
+                         | .ok () =>
+                           match (match dstEp.borrow? with
+                             | .none => some borrows₁
+                             | .some (dstTag, dstEntry) =>
+                               borrowsAfterWriteAccess borrows₁
+                                 (MachineState.pushBaseStack calleeBody [] ms).memory.activeProtectors
+                                 dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
+                           | .none => MemOpRes.ub
+                           | .some borrows₂ =>
+                             match readRootAbstractBytes (MachineState.pushBaseStack calleeBody [] ms).memory srcEp with
+                             | .none => MemOpRes.unsupported
+                             | .some srcRootBytes =>
+                               match sliceAbstractBytes srcRootBytes srcEp.effOff byteCount with
+                               | .none => MemOpRes.ub
+                               | .some snapshot =>
+                                 match readRootAbstractBytes { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := borrows₂ } dstEp with
+                                 | .none => MemOpRes.unsupported
+                                 | .some dstRootBytes =>
+                                   match writeAbstractBytesAt dstRootBytes dstEp.effOff snapshot with
+                                   | .none => MemOpRes.ub
+                                   | .some patched =>
+                                     commitRootAbstractBytes { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := borrows₂ }
+                                       locals dstEp patched) =
+                  (match
+                    (match endpointAccessCheck srcEp byteCount with
                      | .ub => MemOpRes.ub
                      | .unsupported => MemOpRes.unsupported
                      | .ok () =>
-                       match (match dstEp.globalAlloc? with
-                         | .some g => match g.mutability with | .mut => true | .not => false
-                         | .none => true) with
-                       | false => MemOpRes.ub
-                       | true =>
-                         match (match dstEp.borrow? with
-                           | .none => some b1
-                           | .some (dstTag, dstEntry) =>
-                             borrowsAfterWriteAccess b1 ms.memory.activeProtectors
-                               dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
-                         | .none => MemOpRes.ub
-                         | .some b2 =>
-                           match readRootAbstractBytes { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b2 } dstEp with
-                           | .none => MemOpRes.unsupported
-                           | .some dstRootBytes =>
-                             match writeAbstractBytesAt dstRootBytes dstEp.effOff snap with
+                       match (match srcEp.borrow? with
+                         | .none => some ms.memory.borrows
+                         | .some (srcTag, srcEntry) =>
+                           borrowsAfterReadAccess ms.memory.borrows ms.memory.activeProtectors
+                             srcEp.targetDecls srcEp.targetLayouts srcTag srcEntry srcEp.effOff byteCount) with
+                       | .none => MemOpRes.ub
+                       | .some borrows₁ =>
+                         match resolveLiveMemEndpoint
+                             { ms with memory := { ms.memory with borrows := borrows₁ } }
+                             locals bodyLocalDecls bodyLayouts dstPtr with
+                         | .ub => MemOpRes.ub
+                         | .unsupported => MemOpRes.unsupported
+                         | .ok dstEp =>
+                           match endpointAccessCheck dstEp byteCount with
+                           | .ub => MemOpRes.ub
+                           | .unsupported => MemOpRes.unsupported
+                           | .ok () =>
+                             match (match dstEp.borrow? with
+                               | .none => some borrows₁
+                               | .some (dstTag, dstEntry) =>
+                                 borrowsAfterWriteAccess borrows₁ ms.memory.activeProtectors
+                                   dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
                              | .none => MemOpRes.ub
-                             | .some patched =>
-                               commitRootAbstractBytes { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b2 }
-                                 locals dstEp patched) =
-                  (match
-                    (match resolveLiveMemEndpoint
-                        { ms with memory := { ms.memory with borrows := b1 } }
-                        locals bodyLocalDecls bodyLayouts dstPtr with
-                     | .ub => MemOpRes.ub
-                     | .unsupported => MemOpRes.unsupported
-                     | .ok dstEp =>
-                       match endpointAccessCheck dstEp byteCount with
+                             | .some borrows₂ =>
+                               match readRootAbstractBytes ms.memory srcEp with
+                               | .none => MemOpRes.unsupported
+                               | .some srcRootBytes =>
+                                 match sliceAbstractBytes srcRootBytes srcEp.effOff byteCount with
+                                 | .none => MemOpRes.ub
+                                 | .some snapshot =>
+                                   match readRootAbstractBytes { ms.memory with borrows := borrows₂ } dstEp with
+                                   | .none => MemOpRes.unsupported
+                                   | .some dstRootBytes =>
+                                     match writeAbstractBytesAt dstRootBytes dstEp.effOff snapshot with
+                                     | .none => MemOpRes.ub
+                                     | .some patched =>
+                                       commitRootAbstractBytes { ms.memory with borrows := borrows₂ }
+                                         locals dstEp patched) with
+                   | .ok (l', m') => .ok (l', Memory.pushBaseStack calleeBody [] m')
+                   | .ub => .ub
+                   | .unsupported => .unsupported) := by
+                cases endpointAccessCheck srcEp byteCount with
+                | ub | unsupported => rfl
+                | ok _ =>
+                  dsimp only
+                  have h_br : (MachineState.pushBaseStack calleeBody [] ms).memory.borrows = ms.memory.borrows := rfl
+                  have h_ap : (MachineState.pushBaseStack calleeBody [] ms).memory.activeProtectors = ms.memory.activeProtectors := rfl
+                  rw [h_br, h_ap]
+                  have h_step_b1 : ∀ (b1 : List BorrowEntry),
+                      (match resolveLiveMemEndpoint
+                          { MachineState.pushBaseStack calleeBody [] ms with
+                            memory := { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := b1 } }
+                          locals bodyLocalDecls bodyLayouts dstPtr with
                        | .ub => MemOpRes.ub
                        | .unsupported => MemOpRes.unsupported
-                       | .ok () =>
-                         match (match dstEp.globalAlloc? with
-                           | .some g => match g.mutability with | .mut => true | .not => false
-                           | .none => true) with
-                         | false => MemOpRes.ub
-                         | true =>
+                       | .ok dstEp =>
+                         match endpointAccessCheck dstEp byteCount with
+                         | .ub => MemOpRes.ub
+                         | .unsupported => MemOpRes.unsupported
+                         | .ok () =>
                            match (match dstEp.borrow? with
                              | .none => some b1
                              | .some (dstTag, dstEntry) =>
@@ -1133,74 +1194,126 @@ private theorem evalCopyMemory_pushBaseStack
                                  dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
                            | .none => MemOpRes.ub
                            | .some b2 =>
-                             match readRootAbstractBytes { ms.memory with borrows := b2 } dstEp with
+                             match readRootAbstractBytes (MachineState.pushBaseStack calleeBody [] ms).memory srcEp with
                              | .none => MemOpRes.unsupported
-                             | .some dstRootBytes =>
-                               match writeAbstractBytesAt dstRootBytes dstEp.effOff snap with
+                             | .some sbs =>
+                               match sliceAbstractBytes sbs srcEp.effOff byteCount with
                                | .none => MemOpRes.ub
-                               | .some patched =>
-                                 commitRootAbstractBytes { ms.memory with borrows := b2 }
-                                   locals dstEp patched) with
-                   | .ok (l', m') => .ok (l', Memory.pushBaseStack calleeBody [] m')
-                   | .ub => .ub
-                   | .unsupported => .unsupported) := fun b1 => by
-                have h_core1 : MemCoreEq
-                    { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b1 }
-                    { ms.memory with borrows := b1 } := h_core0.withBorrows b1
-                rw [resolveLiveMemEndpoint_congr_core
-                    (s₁ := { MachineState.pushBaseStack calleeBody [] ms with
-                      memory := { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b1 } })
-                    (s₂ := { ms with memory := { ms.memory with borrows := b1 } }) h_core1]
-                cases resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := b1 } }
-                    locals bodyLocalDecls bodyLayouts dstPtr with
-                | ub | unsupported => rfl
-                | ok dstEp =>
-                  dsimp only
-                  cases endpointAccessCheck dstEp byteCount with
-                  | ub | unsupported => rfl
-                  | ok _ =>
-                    dsimp only
-                    have h_step_b2 : ∀ (b2 : List BorrowEntry),
-                        (match readRootAbstractBytes { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b2 } dstEp with
-                         | .none => MemOpRes.unsupported
-                         | .some dbs =>
-                           match writeAbstractBytesAt dbs dstEp.effOff snap with
-                           | .none => MemOpRes.ub
-                           | .some patched =>
-                             commitRootAbstractBytes { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b2 }
-                               locals dstEp patched) =
-                        (match (match readRootAbstractBytes { ms.memory with borrows := b2 } dstEp with
-                          | .none => MemOpRes.unsupported
-                          | .some dbs =>
-                            match writeAbstractBytesAt dbs dstEp.effOff snap with
-                            | .none => MemOpRes.ub
-                            | .some patched =>
-                              commitRootAbstractBytes { ms.memory with borrows := b2 }
-                                locals dstEp patched) with
-                         | .ok (l', m') => .ok (l', Memory.pushBaseStack calleeBody [] m')
-                         | .ub => .ub
-                         | .unsupported => .unsupported) := fun b2 => by
-                      have h_rd2 : readRootAbstractBytes
-                          { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b2 } dstEp =
-                          readRootAbstractBytes { ms.memory with borrows := b2 } dstEp :=
-                        readRootAbstractBytes_congr ((memBGFEq_pushBaseStack calleeBody [] ms.memory).withBorrows b2) dstEp
-                      rw [h_rd2]
-                      cases readRootAbstractBytes { ms.memory with borrows := b2 } dstEp with
-                      | none => rfl
-                      | some dbs =>
-                        dsimp only
-                        cases writeAbstractBytesAt dbs dstEp.effOff snap with
-                        | none => rfl
-                        | some patched =>
-                          exact commitRootAbstractBytes_pushBaseStack_nil calleeBody
-                            { ms.memory with borrows := b2 } locals dstEp patched
-                    cases h_g : dstEp.globalAlloc? with
-                    | some g =>
+                               | .some snap =>
+                                 match readRootAbstractBytes { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := b2 } dstEp with
+                                 | .none => MemOpRes.unsupported
+                                 | .some dbs =>
+                                   match writeAbstractBytesAt dbs dstEp.effOff snap with
+                                   | .none => MemOpRes.ub
+                                   | .some patched =>
+                                     commitRootAbstractBytes { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := b2 }
+                                       locals dstEp patched) =
+                      (match
+                        (match resolveLiveMemEndpoint
+                            { ms with memory := { ms.memory with borrows := b1 } }
+                            locals bodyLocalDecls bodyLayouts dstPtr with
+                         | .ub => MemOpRes.ub
+                         | .unsupported => MemOpRes.unsupported
+                         | .ok dstEp =>
+                           match endpointAccessCheck dstEp byteCount with
+                           | .ub => MemOpRes.ub
+                           | .unsupported => MemOpRes.unsupported
+                           | .ok () =>
+                             match (match dstEp.borrow? with
+                               | .none => some b1
+                               | .some (dstTag, dstEntry) =>
+                                 borrowsAfterWriteAccess b1 ms.memory.activeProtectors
+                                   dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
+                             | .none => MemOpRes.ub
+                             | .some b2 =>
+                               match readRootAbstractBytes ms.memory srcEp with
+                               | .none => MemOpRes.unsupported
+                               | .some sbs =>
+                                 match sliceAbstractBytes sbs srcEp.effOff byteCount with
+                                 | .none => MemOpRes.ub
+                                 | .some snap =>
+                                   match readRootAbstractBytes { ms.memory with borrows := b2 } dstEp with
+                                   | .none => MemOpRes.unsupported
+                                   | .some dbs =>
+                                     match writeAbstractBytesAt dbs dstEp.effOff snap with
+                                     | .none => MemOpRes.ub
+                                     | .some patched =>
+                                       commitRootAbstractBytes { ms.memory with borrows := b2 }
+                                         locals dstEp patched) with
+                       | .ok (l', m') => .ok (l', Memory.pushBaseStack calleeBody [] m')
+                       | .ub => .ub
+                       | .unsupported => .unsupported) := fun b1 => by
+                    have h_core1 : MemCoreEq
+                        { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := b1 }
+                        { ms.memory with borrows := b1 } := h_core0.withBorrows b1
+                    rw [resolveLiveMemEndpoint_congr_core
+                        (s₁ := { MachineState.pushBaseStack calleeBody [] ms with
+                          memory := { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := b1 } })
+                        (s₂ := { ms with memory := { ms.memory with borrows := b1 } }) h_core1]
+                    cases resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := b1 } }
+                        locals bodyLocalDecls bodyLayouts dstPtr with
+                    | ub | unsupported => rfl
+                    | ok dstEp =>
                       dsimp only
-                      cases g.mutability with
-                      | not => rfl
-                      | «mut» =>
+                      cases endpointAccessCheck dstEp byteCount with
+                      | ub | unsupported => rfl
+                      | ok _ =>
                         dsimp only
+                        have h_step_b2 : ∀ (b2 : List BorrowEntry),
+                            (match readRootAbstractBytes (MachineState.pushBaseStack calleeBody [] ms).memory srcEp with
+                             | .none => MemOpRes.unsupported
+                             | .some sbs =>
+                               match sliceAbstractBytes sbs srcEp.effOff byteCount with
+                               | .none => MemOpRes.ub
+                               | .some snap =>
+                                 match readRootAbstractBytes { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := b2 } dstEp with
+                                 | .none => MemOpRes.unsupported
+                                 | .some dbs =>
+                                   match writeAbstractBytesAt dbs dstEp.effOff snap with
+                                   | .none => MemOpRes.ub
+                                   | .some patched =>
+                                     commitRootAbstractBytes { (MachineState.pushBaseStack calleeBody [] ms).memory with borrows := b2 }
+                                       locals dstEp patched) =
+                            (match (match readRootAbstractBytes ms.memory srcEp with
+                              | .none => MemOpRes.unsupported
+                              | .some sbs =>
+                                match sliceAbstractBytes sbs srcEp.effOff byteCount with
+                                | .none => MemOpRes.ub
+                                | .some snap =>
+                                  match readRootAbstractBytes { ms.memory with borrows := b2 } dstEp with
+                                  | .none => MemOpRes.unsupported
+                                  | .some dbs =>
+                                    match writeAbstractBytesAt dbs dstEp.effOff snap with
+                                    | .none => MemOpRes.ub
+                                    | .some patched =>
+                                      commitRootAbstractBytes { ms.memory with borrows := b2 }
+                                        locals dstEp patched) with
+                             | .ok (l', m') => .ok (l', Memory.pushBaseStack calleeBody [] m')
+                             | .ub => .ub
+                             | .unsupported => .unsupported) := fun b2 => by
+                          rw [show (MachineState.pushBaseStack calleeBody [] ms).memory = Memory.pushBaseStack calleeBody [] ms.memory from rfl, h_rd]
+                          cases readRootAbstractBytes ms.memory srcEp with
+                          | none => rfl
+                          | some sbs =>
+                            dsimp only
+                            cases sliceAbstractBytes sbs srcEp.effOff byteCount with
+                            | none => rfl
+                            | some snap =>
+                              dsimp only
+                              have h_rd2 : readRootAbstractBytes
+                                  { Memory.pushBaseStack calleeBody [] ms.memory with borrows := b2 } dstEp =
+                                  readRootAbstractBytes { ms.memory with borrows := b2 } dstEp :=
+                                readRootAbstractBytes_congr ((memBGFEq_pushBaseStack calleeBody [] ms.memory).withBorrows b2) dstEp
+                              rw [h_rd2]
+                              cases readRootAbstractBytes { ms.memory with borrows := b2 } dstEp with
+                              | none => rfl
+                              | some dbs =>
+                                dsimp only
+                                cases writeAbstractBytesAt dbs dstEp.effOff snap with
+                                | none => rfl
+                                | some patched =>
+                                  exact commitRootAbstractBytes_pushBaseStack_nil calleeBody
+                                    { ms.memory with borrows := b2 } locals dstEp patched
                         cases dstEp.borrow? with
                         | none => exact h_step_b2 b1
                         | some p =>
@@ -1209,24 +1322,21 @@ private theorem evalCopyMemory_pushBaseStack
                               dstEp.targetDecls dstEp.targetLayouts p.1 p.2 dstEp.effOff byteCount with
                           | none => rfl
                           | some b2 => exact h_step_b2 b2
-                    | none =>
-                      dsimp only
-                      cases dstEp.borrow? with
-                      | none => exact h_step_b2 b1
-                      | some p =>
-                        dsimp only
-                        cases borrowsAfterWriteAccess b1 ms.memory.activeProtectors
-                            dstEp.targetDecls dstEp.targetLayouts p.1 p.2 dstEp.effOff byteCount with
-                        | none => rfl
-                        | some b2 => exact h_step_b2 b2
-              cases srcEp.borrow? with
-              | none => exact h_step_b1 ms.memory.borrows
-              | some p =>
+                  cases srcEp.borrow? with
+                  | none => exact h_step_b1 ms.memory.borrows
+                  | some p =>
+                    dsimp only
+                    cases borrowsAfterReadAccess ms.memory.borrows ms.memory.activeProtectors
+                        srcEp.targetDecls srcEp.targetLayouts p.1 p.2 srcEp.effOff byteCount with
+                    | none => rfl
+                    | some b1 => exact h_step_b1 b1
+              cases dstEp0.globalAlloc? with
+              | none => exact h_post_w
+              | some g =>
                 dsimp only
-                cases borrowsAfterReadAccess ms.memory.borrows ms.memory.activeProtectors
-                    srcEp.targetDecls srcEp.targetLayouts p.1 p.2 srcEp.effOff byteCount with
-                | none => rfl
-                | some b1 => exact h_step_b1 b1
+                cases g.mutability with
+                | not => rfl
+                | «mut» => exact h_post_w
     · intro h_nil l' m' h_ok
       unfold evalCopyMemory at h_ok
       rcases resolveLiveMemEndpoint_borrows_nil calleeBody [] ms locals bodyLocalDecls bodyLayouts srcPtr h_nil with ⟨_, h_src⟩
@@ -1236,51 +1346,53 @@ private theorem evalCopyMemory_pushBaseStack
         rw [h_s] at h_ok; dsimp only at h_ok
         obtain ⟨h_sb, _, _⟩ := h_src srcEp h_s
         rw [h_sb] at h_ok; dsimp only at h_ok
-        cases h_e1 : endpointAccessCheck srcEp byteCount with
-        | ub | unsupported => rw [h_e1] at h_ok; cases h_ok
-        | ok _ =>
-          rw [h_e1] at h_ok; dsimp only at h_ok
-          cases h_r1 : readRootAbstractBytes ms.memory srcEp with
-          | none => rw [h_r1] at h_ok; cases h_ok
-          | some sbs =>
-            rw [h_r1] at h_ok; dsimp only at h_ok
-            cases h_sl : sliceAbstractBytes sbs srcEp.effOff byteCount with
-            | none => rw [h_sl] at h_ok; cases h_ok
-            | some snap =>
-              rw [h_sl] at h_ok; dsimp only at h_ok
-              rcases resolveLiveMemEndpoint_borrows_nil calleeBody []
-                  { ms with memory := { ms.memory with borrows := ms.memory.borrows } }
-                  locals bodyLocalDecls bodyLayouts dstPtr h_nil with ⟨_, h_dst⟩
-              cases h_d : resolveLiveMemEndpoint
-                  { ms with memory := { ms.memory with borrows := ms.memory.borrows } }
-                  locals bodyLocalDecls bodyLayouts dstPtr with
-              | ub | unsupported => rw [h_d] at h_ok; cases h_ok
-              | ok dstEp =>
-                rw [h_d] at h_ok; dsimp only at h_ok
-                obtain ⟨h_db, g, h_dg⟩ := h_dst dstEp h_d
-                rw [h_db] at h_ok; dsimp only at h_ok
-                cases h_e2 : endpointAccessCheck dstEp byteCount with
-                | ub | unsupported => rw [h_e2] at h_ok; cases h_ok
+        cases h_sb1 : Nat.ble (Nat.add srcEp.effOff byteCount) srcEp.allocSize with
+        | false => rw [h_sb1] at h_ok; cases h_ok
+        | true =>
+          rw [h_sb1] at h_ok; dsimp only at h_ok
+          cases h_d0 : resolveLiveMemEndpoint ms locals bodyLocalDecls bodyLayouts dstPtr with
+          | ub | unsupported => rw [h_d0] at h_ok; cases h_ok
+          | ok dstEp0 =>
+            rw [h_d0] at h_ok; dsimp only at h_ok
+            cases h_db1 : Nat.ble (Nat.add dstEp0.effOff byteCount) dstEp0.allocSize with
+            | false => rw [h_db1] at h_ok; cases h_ok
+            | true =>
+              rw [h_db1] at h_ok; dsimp only at h_ok
+              split at h_ok
+              · cases h_ok
+              · cases h_e1 : endpointAccessCheck srcEp byteCount with
+                | ub | unsupported => rw [h_e1] at h_ok; cases h_ok
                 | ok _ =>
-                  rw [h_e2] at h_ok; dsimp only at h_ok
-                  rw [h_dg] at h_ok; dsimp only at h_ok
-                  cases h_gm : g.mutability with
-                  | not => rw [h_gm] at h_ok; cases h_ok
-                  | «mut» =>
-                    rw [h_gm] at h_ok; dsimp only at h_ok
-                    cases h_r2 : readRootAbstractBytes
-                        { ms.memory with borrows := ms.memory.borrows } dstEp with
-                    | none => rw [h_r2] at h_ok; cases h_ok
-                    | some dbs =>
-                      rw [h_r2] at h_ok; dsimp only at h_ok
-                      cases h_p : writeAbstractBytesAt dbs dstEp.effOff snap with
-                      | none => rw [h_p] at h_ok; cases h_ok
-                      | some patched =>
-                        rw [h_p] at h_ok; dsimp only at h_ok
-                        have h_cb := (commitRootAbstractBytes_pushBaseStack_global calleeBody []
-                          { ms.memory with borrows := ms.memory.borrows } locals dstEp patched h_dg).2
-                          l' m' h_ok
-                        exact h_cb.trans h_nil
+                  rw [h_e1] at h_ok; dsimp only at h_ok
+                  rcases resolveLiveMemEndpoint_borrows_nil calleeBody [] ms
+                      locals bodyLocalDecls bodyLayouts dstPtr h_nil with ⟨_, h_dst⟩
+                  obtain ⟨h_db, g, h_dg⟩ := h_dst dstEp0 h_d0
+                  rw [h_db] at h_ok; dsimp only at h_ok
+                  cases h_e2 : endpointAccessCheck dstEp0 byteCount with
+                  | ub | unsupported => rw [h_e2] at h_ok; cases h_ok
+                  | ok _ =>
+                    rw [h_e2] at h_ok; dsimp only at h_ok
+                    cases h_r1 : readRootAbstractBytes ms.memory srcEp with
+                    | none => rw [h_r1] at h_ok; cases h_ok
+                    | some sbs =>
+                      rw [h_r1] at h_ok; dsimp only at h_ok
+                      cases h_sl : sliceAbstractBytes sbs srcEp.effOff byteCount with
+                      | none => rw [h_sl] at h_ok; cases h_ok
+                      | some snap =>
+                        rw [h_sl] at h_ok; dsimp only at h_ok
+                        cases h_r2 : readRootAbstractBytes
+                            { ms.memory with borrows := ms.memory.borrows } dstEp0 with
+                        | none => rw [h_r2] at h_ok; cases h_ok
+                        | some dbs =>
+                          rw [h_r2] at h_ok; dsimp only at h_ok
+                          cases h_p : writeAbstractBytesAt dbs dstEp0.effOff snap with
+                          | none => rw [h_p] at h_ok; cases h_ok
+                          | some patched =>
+                            rw [h_p] at h_ok; dsimp only at h_ok
+                            have h_cb := (commitRootAbstractBytes_pushBaseStack_global calleeBody []
+                              { ms.memory with borrows := ms.memory.borrows } locals dstEp0 patched h_dg).2
+                              l' m' h_ok
+                            exact h_cb.trans h_nil
   · unfold evalCopyMemory
     rcases resolveLiveMemEndpoint_borrows_nil calleeBody baseStack ms locals bodyLocalDecls bodyLayouts
         srcPtr h_nil with ⟨h_s_eq, h_src⟩
@@ -1290,67 +1402,76 @@ private theorem evalCopyMemory_pushBaseStack
     | ok srcEp =>
       obtain ⟨h_sb, _, _⟩ := h_src srcEp h_s
       dsimp only
-      cases endpointAccessCheck srcEp byteCount with
-      | ub | unsupported => exact ⟨rfl, fun _ _ _ h => by cases h⟩
-      | ok _ =>
+      cases Nat.ble (Nat.add srcEp.effOff byteCount) srcEp.allocSize with
+      | false => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+      | true =>
         dsimp only
-        rw [show (MachineState.pushBaseStack calleeBody baseStack ms).memory =
-              Memory.pushBaseStack calleeBody baseStack ms.memory from rfl,
-            readRootAbstractBytes_congr (memBGFEq_pushBaseStack calleeBody baseStack ms.memory) srcEp]
-        cases readRootAbstractBytes ms.memory srcEp with
-        | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
-        | some sbs =>
+        rcases resolveLiveMemEndpoint_borrows_nil calleeBody baseStack ms locals bodyLocalDecls
+            bodyLayouts dstPtr h_nil with ⟨h_d0_eq, h_dst0⟩
+        rw [h_d0_eq]
+        cases h_d0 : resolveLiveMemEndpoint ms locals bodyLocalDecls bodyLayouts dstPtr with
+        | ub | unsupported => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+        | ok dstEp0 =>
+          obtain ⟨h_db0, g0, h_dg0⟩ := h_dst0 dstEp0 h_d0
           dsimp only
-          cases sliceAbstractBytes sbs srcEp.effOff byteCount with
-          | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
-          | some snap =>
+          cases Nat.ble (Nat.add dstEp0.effOff byteCount) dstEp0.allocSize with
+          | false => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+          | true =>
             dsimp only
-            rw [h_sb]
-            dsimp only
-            have h_b1_pb :
-                { MachineState.pushBaseStack calleeBody baseStack ms with
-                  memory := { Memory.pushBaseStack calleeBody baseStack ms.memory with
-                              borrows := (Memory.pushBaseStack calleeBody baseStack ms.memory).borrows } } =
-                  MachineState.pushBaseStack calleeBody baseStack ms := rfl
-            have h_b1_ms :
-                { ms with memory := { ms.memory with borrows := ms.memory.borrows } } = ms := rfl
-            rw [h_b1_pb, h_b1_ms]
-            rcases resolveLiveMemEndpoint_borrows_nil calleeBody baseStack ms locals bodyLocalDecls
-                bodyLayouts dstPtr h_nil with ⟨h_d_eq, h_dst⟩
-            rw [h_d_eq]
-            cases h_d : resolveLiveMemEndpoint ms locals bodyLocalDecls bodyLayouts dstPtr with
-            | ub | unsupported => exact ⟨rfl, fun _ _ _ h => by cases h⟩
-            | ok dstEp =>
-              obtain ⟨h_db, g, h_dg⟩ := h_dst dstEp h_d
+            rw [h_dg0]; dsimp only
+            cases g0.mutability with
+            | not => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+            | «mut» =>
               dsimp only
-              cases endpointAccessCheck dstEp byteCount with
+              cases endpointAccessCheck srcEp byteCount with
               | ub | unsupported => exact ⟨rfl, fun _ _ _ h => by cases h⟩
               | ok _ =>
                 dsimp only
-                rw [h_dg]; dsimp only
-                cases g.mutability with
-                | not => exact ⟨rfl, fun _ _ _ h => by cases h⟩
-                | «mut» =>
+                rw [h_sb]
+                dsimp only
+                have h_b1_pb :
+                    { MachineState.pushBaseStack calleeBody baseStack ms with
+                      memory := { (MachineState.pushBaseStack calleeBody baseStack ms).memory with
+                                  borrows := (MachineState.pushBaseStack calleeBody baseStack ms).memory.borrows } } =
+                      MachineState.pushBaseStack calleeBody baseStack ms := rfl
+                have h_b1_ms :
+                    { ms with memory := { ms.memory with borrows := ms.memory.borrows } } = ms := rfl
+                rw [h_b1_pb, h_b1_ms, h_d0_eq, h_d0]
+                dsimp only
+                cases endpointAccessCheck dstEp0 byteCount with
+                | ub | unsupported => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+                | ok _ =>
                   dsimp only
-                  rw [h_db]
+                  rw [h_db0]
                   dsimp only
                   have h_m2_pb :
-                      { Memory.pushBaseStack calleeBody baseStack ms.memory with
-                        borrows := (Memory.pushBaseStack calleeBody baseStack ms.memory).borrows } =
+                      { (MachineState.pushBaseStack calleeBody baseStack ms).memory with
+                        borrows := (MachineState.pushBaseStack calleeBody baseStack ms).memory.borrows } =
                         Memory.pushBaseStack calleeBody baseStack ms.memory := rfl
                   have h_m2_ms : { ms.memory with borrows := ms.memory.borrows } = ms.memory := rfl
                   rw [h_m2_pb, h_m2_ms,
-                      readRootAbstractBytes_congr (memBGFEq_pushBaseStack calleeBody baseStack ms.memory) dstEp]
-                  cases readRootAbstractBytes ms.memory dstEp with
+                      show (MachineState.pushBaseStack calleeBody baseStack ms).memory =
+                        Memory.pushBaseStack calleeBody baseStack ms.memory from rfl,
+                      readRootAbstractBytes_congr (memBGFEq_pushBaseStack calleeBody baseStack ms.memory) srcEp]
+                  cases readRootAbstractBytes ms.memory srcEp with
                   | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
-                  | some dbs =>
+                  | some sbs =>
                     dsimp only
-                    cases writeAbstractBytesAt dbs dstEp.effOff snap with
+                    cases sliceAbstractBytes sbs srcEp.effOff byteCount with
                     | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
-                    | some patched =>
-                      rcases commitRootAbstractBytes_pushBaseStack_global calleeBody baseStack
-                          ms.memory locals dstEp patched h_dg with ⟨h_c_eq, h_c_bor⟩
-                      exact ⟨h_c_eq, fun _ l' m' h_ok => (h_c_bor l' m' h_ok).trans h_nil⟩
+                    | some snap =>
+                      dsimp only
+                      rw [readRootAbstractBytes_congr (memBGFEq_pushBaseStack calleeBody baseStack ms.memory) dstEp0]
+                      cases readRootAbstractBytes ms.memory dstEp0 with
+                      | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+                      | some dbs =>
+                        dsimp only
+                        cases writeAbstractBytesAt dbs dstEp0.effOff snap with
+                        | none => exact ⟨rfl, fun _ _ _ h => by cases h⟩
+                        | some patched =>
+                          rcases commitRootAbstractBytes_pushBaseStack_global calleeBody baseStack
+                              ms.memory locals dstEp0 patched h_dg0 with ⟨h_c_eq, h_c_bor⟩
+                          exact ⟨h_c_eq, fun _ l' m' h_ok => (h_c_bor l' m' h_ok).trans h_nil⟩
 
 private theorem intrinsicMissingPointeeStep_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -1611,32 +1732,32 @@ private theorem evalCompareBytesCall_rel
                   | unsupported => exact .unsupported
                   | ok leftEp =>
                     dsimp only
-                    cases endpointAccessCheck leftEp byteCount with
-                    | ub => exact .fail .ub
-                    | unsupported => exact .unsupported
-                    | ok _ =>
+                    cases Nat.ble (Nat.add leftEp.effOff byteCount) leftEp.allocSize with
+                    | false => exact .fail .ub
+                    | true =>
                       dsimp only
-                      rw [readRootAbstractBytes_congr h_bgf0]
-                      cases readRootAbstractBytes ms.memory leftEp with
-                      | none => exact .unsupported
-                      | some lrb =>
+                      rcases h_ep ms.memory locals' rightPtr h_P0 with ⟨h_ep0r, _⟩
+                      rw [h_ep0r]
+                      cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts rightPtr with
+                      | ub => exact .fail .ub
+                      | unsupported => exact .unsupported
+                      | ok rightEp0 =>
                         dsimp only
-                        cases sliceAbstractBytes lrb leftEp.effOff byteCount with
-                        | none => exact .fail .ub
-                        | some leftSlice =>
+                        cases Nat.ble (Nat.add rightEp0.effOff byteCount) rightEp0.allocSize with
+                        | false => exact .fail .ub
+                        | true =>
                           dsimp only
-                          rcases h_ebr ms.memory leftEp byteCount h_P0 (h_E1 leftEp h_l) with ⟨h_r1, h_r1p⟩
-                          rw [h_r1]
-                          cases h_b1 : endpointBorrowsAfterRead ms.memory leftEp byteCount with
-                          | none => exact .fail .ub
-                          | some borrows₁ =>
-                            obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
+                          cases endpointAccessCheck leftEp byteCount with
+                          | ub => exact .fail .ub
+                          | unsupported => exact .unsupported
+                          | ok _ =>
                             dsimp only
-                            rw [stripProvenanceBytes_congr h_bgf0]
-                            cases stripProvenanceBytes ms.memory leftSlice with
-                            | ub => exact .fail .ub
-                            | unsupported => exact .unsupported
-                            | ok leftRaw =>
+                            rcases h_ebr ms.memory leftEp byteCount h_P0 (h_E1 leftEp h_l) with ⟨h_r1, h_r1p⟩
+                            rw [h_r1]
+                            cases h_b1 : endpointBorrowsAfterRead ms.memory leftEp byteCount with
+                            | none => exact .fail .ub
+                            | some borrows₁ =>
+                              obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
                               dsimp only
                               rw [h_fb1]
                               rcases h_ep { ms.memory with borrows := borrows₁ } locals' rightPtr h_P1 with ⟨h_ep2, h_E2⟩
@@ -1652,34 +1773,48 @@ private theorem evalCompareBytesCall_rel
                                 | unsupported => exact .unsupported
                                 | ok _ =>
                                   dsimp only
-                                  have h_bgf1 := h_bgf { ms.memory with borrows := borrows₁ } h_P1
-                                  rw [readRootAbstractBytes_congr h_bgf1]
-                                  cases readRootAbstractBytes { ms.memory with borrows := borrows₁ } rightEp with
-                                  | none => exact .unsupported
-                                  | some rrb =>
-                                    dsimp only
-                                    cases sliceAbstractBytes rrb rightEp.effOff byteCount with
-                                    | none => exact .fail .ub
-                                    | some rightSlice =>
+                                  rcases h_ebr { ms.memory with borrows := borrows₁ } rightEp byteCount h_P1 (h_E2 rightEp h_r) with ⟨h_r2, h_r2p⟩
+                                  rw [h_r2]
+                                  cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } rightEp byteCount with
+                                  | none => exact .fail .ub
+                                  | some borrows₂ =>
+                                    obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
+                                    have h_fb2' : { f ms.memory with borrows := borrows₂ } =
+                                        f { ms.memory with borrows := borrows₂ } :=
+                                      Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
+                                    have h_bgf2 := h_bgf { ms.memory with borrows := borrows₂ } h_P2
+                                    dsimp only at h_fb2' ⊢
+                                    rw [readRootAbstractBytes_congr h_bgf0]
+                                    cases readRootAbstractBytes ms.memory leftEp with
+                                    | none => exact .unsupported
+                                    | some lrb =>
                                       dsimp only
-                                      rcases h_ebr { ms.memory with borrows := borrows₁ } rightEp byteCount h_P1 (h_E2 rightEp h_r) with ⟨h_r2, h_r2p⟩
-                                      rw [h_r2]
-                                      cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } rightEp byteCount with
+                                      cases sliceAbstractBytes lrb leftEp.effOff byteCount with
                                       | none => exact .fail .ub
-                                      | some borrows₂ =>
-                                        obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
+                                      | some leftSlice =>
                                         dsimp only
-                                        rw [stripProvenanceBytes_congr h_bgf1]
-                                        cases stripProvenanceBytes { ms.memory with borrows := borrows₁ } rightSlice with
-                                        | ub => exact .fail .ub
-                                        | unsupported => exact .unsupported
-                                        | ok rightRaw =>
-                                          have h_fb2' : { f ms.memory with borrows := borrows₂ } =
-                                              f { ms.memory with borrows := borrows₂ } :=
-                                            Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
-                                          dsimp only at h_fb2' ⊢
-                                          rw [h_fb2']
-                                          exact .write { ms.memory with borrows := borrows₂ } locals' _ h_P2
+                                        rw [h_fb2', readRootAbstractBytes_congr h_bgf2]
+                                        cases readRootAbstractBytes { ms.memory with borrows := borrows₂ } rightEp with
+                                        | none => exact .unsupported
+                                        | some rrb =>
+                                          dsimp only
+                                          cases sliceAbstractBytes rrb rightEp.effOff byteCount with
+                                          | none => exact .fail .ub
+                                          | some rightSlice =>
+                                            dsimp only
+                                            rw [stripProvenanceBytes_congr h_bgf2, stripProvenanceBytes_congr h_bgf2]
+                                            cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } leftSlice with
+                                            | ub => exact .fail .ub
+                                            | unsupported =>
+                                              cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } rightSlice with
+                                              | ub => exact .fail .ub
+                                              | unsupported | ok _ => exact .unsupported
+                                            | ok leftRaw =>
+                                              cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } rightSlice with
+                                              | ub => exact .fail .ub
+                                              | unsupported => exact .unsupported
+                                              | ok rightRaw =>
+                                                exact .write { ms.memory with borrows := borrows₂ } locals' _ h_P2
   · exact .fail .ub
 
 private theorem evalRawEqCall_rel
@@ -1786,32 +1921,32 @@ private theorem evalRawEqCall_rel
                                 | unsupported => exact .unsupported
                                 | ok aEp =>
                                   dsimp only
-                                  cases endpointAccessCheck aEp elemSize with
-                                  | ub => exact .fail .ub
-                                  | unsupported => exact .unsupported
-                                  | ok _ =>
+                                  cases Nat.ble (Nat.add aEp.effOff elemSize) aEp.allocSize with
+                                  | false => exact .fail .ub
+                                  | true =>
                                     dsimp only
-                                    rw [readRootAbstractBytes_congr h_bgf0]
-                                    cases readRootAbstractBytes ms.memory aEp with
-                                    | none => exact .unsupported
-                                    | some arb =>
+                                    rcases h_ep ms.memory locals' bPtr h_P0 with ⟨h_ep0b, _⟩
+                                    rw [h_ep0b]
+                                    cases resolveLiveMemEndpoint ms locals' bodyLocalDecls bodyLayouts bPtr with
+                                    | ub => exact .fail .ub
+                                    | unsupported => exact .unsupported
+                                    | ok bEp0 =>
                                       dsimp only
-                                      cases sliceAbstractBytes arb aEp.effOff elemSize with
-                                      | none => exact .fail .ub
-                                      | some aSlice =>
+                                      cases Nat.ble (Nat.add bEp0.effOff elemSize) bEp0.allocSize with
+                                      | false => exact .fail .ub
+                                      | true =>
                                         dsimp only
-                                        rcases h_ebr ms.memory aEp elemSize h_P0 (h_E1 aEp h_a) with ⟨h_r1, h_r1p⟩
-                                        rw [h_r1]
-                                        cases h_b1 : endpointBorrowsAfterRead ms.memory aEp elemSize with
-                                        | none => exact .fail .ub
-                                        | some borrows₁ =>
-                                          obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
+                                        cases endpointAccessCheck aEp elemSize with
+                                        | ub => exact .fail .ub
+                                        | unsupported => exact .unsupported
+                                        | ok _ =>
                                           dsimp only
-                                          rw [stripProvenanceBytes_congr h_bgf0]
-                                          cases stripProvenanceBytes ms.memory aSlice with
-                                          | ub => exact .fail .ub
-                                          | unsupported => exact .unsupported
-                                          | ok aRaw =>
+                                          rcases h_ebr ms.memory aEp elemSize h_P0 (h_E1 aEp h_a) with ⟨h_r1, h_r1p⟩
+                                          rw [h_r1]
+                                          cases h_b1 : endpointBorrowsAfterRead ms.memory aEp elemSize with
+                                          | none => exact .fail .ub
+                                          | some borrows₁ =>
+                                            obtain ⟨h_P1, h_fb1⟩ := h_r1p borrows₁ h_b1
                                             dsimp only
                                             rw [h_fb1]
                                             rcases h_ep { ms.memory with borrows := borrows₁ } locals' bPtr h_P1 with ⟨h_ep2, h_E2⟩
@@ -1827,34 +1962,48 @@ private theorem evalRawEqCall_rel
                                               | unsupported => exact .unsupported
                                               | ok _ =>
                                                 dsimp only
-                                                have h_bgf1 := h_bgf { ms.memory with borrows := borrows₁ } h_P1
-                                                rw [readRootAbstractBytes_congr h_bgf1]
-                                                cases readRootAbstractBytes { ms.memory with borrows := borrows₁ } bEp with
-                                                | none => exact .unsupported
-                                                | some brb =>
-                                                  dsimp only
-                                                  cases sliceAbstractBytes brb bEp.effOff elemSize with
-                                                  | none => exact .fail .ub
-                                                  | some bSlice =>
+                                                rcases h_ebr { ms.memory with borrows := borrows₁ } bEp elemSize h_P1 (h_E2 bEp h_b) with ⟨h_r2, h_r2p⟩
+                                                rw [h_r2]
+                                                cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } bEp elemSize with
+                                                | none => exact .fail .ub
+                                                | some borrows₂ =>
+                                                  obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
+                                                  have h_fb2' : { f ms.memory with borrows := borrows₂ } =
+                                                      f { ms.memory with borrows := borrows₂ } :=
+                                                    Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
+                                                  have h_bgf2 := h_bgf { ms.memory with borrows := borrows₂ } h_P2
+                                                  dsimp only at h_fb2' ⊢
+                                                  rw [readRootAbstractBytes_congr h_bgf0]
+                                                  cases readRootAbstractBytes ms.memory aEp with
+                                                  | none => exact .unsupported
+                                                  | some arb =>
                                                     dsimp only
-                                                    rcases h_ebr { ms.memory with borrows := borrows₁ } bEp elemSize h_P1 (h_E2 bEp h_b) with ⟨h_r2, h_r2p⟩
-                                                    rw [h_r2]
-                                                    cases h_b2 : endpointBorrowsAfterRead { ms.memory with borrows := borrows₁ } bEp elemSize with
+                                                    cases sliceAbstractBytes arb aEp.effOff elemSize with
                                                     | none => exact .fail .ub
-                                                    | some borrows₂ =>
-                                                      obtain ⟨h_P2, h_fb2⟩ := h_r2p borrows₂ h_b2
+                                                    | some aSlice =>
                                                       dsimp only
-                                                      rw [stripProvenanceBytes_congr h_bgf1]
-                                                      cases stripProvenanceBytes { ms.memory with borrows := borrows₁ } bSlice with
-                                                      | ub => exact .fail .ub
-                                                      | unsupported => exact .unsupported
-                                                      | ok bRaw =>
-                                                        have h_fb2' : { f ms.memory with borrows := borrows₂ } =
-                                                            f { ms.memory with borrows := borrows₂ } :=
-                                                          Eq.trans (congrArg (fun m => { m with borrows := borrows₂ }) h_fb1) h_fb2
-                                                        dsimp only at h_fb2' ⊢
-                                                        rw [h_fb2']
-                                                        exact .write { ms.memory with borrows := borrows₂ } locals' _ h_P2
+                                                      rw [h_fb2', readRootAbstractBytes_congr h_bgf2]
+                                                      cases readRootAbstractBytes { ms.memory with borrows := borrows₂ } bEp with
+                                                      | none => exact .unsupported
+                                                      | some brb =>
+                                                        dsimp only
+                                                        cases sliceAbstractBytes brb bEp.effOff elemSize with
+                                                        | none => exact .fail .ub
+                                                        | some bSlice =>
+                                                          dsimp only
+                                                          rw [stripProvenanceBytes_congr h_bgf2, stripProvenanceBytes_congr h_bgf2]
+                                                          cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } aSlice with
+                                                          | ub => exact .fail .ub
+                                                          | unsupported =>
+                                                            cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } bSlice with
+                                                            | ub => exact .fail .ub
+                                                            | unsupported | ok _ => exact .unsupported
+                                                          | ok aRaw =>
+                                                            cases stripProvenanceBytes { ms.memory with borrows := borrows₂ } bSlice with
+                                                            | ub => exact .fail .ub
+                                                            | unsupported => exact .unsupported
+                                                            | ok bRaw =>
+                                                              exact .write { ms.memory with borrows := borrows₂ } locals' _ h_P2
   · exact .fail .ub
 
 private theorem evalTypedSwapNonOverlappingCall_rel
@@ -2115,33 +2264,34 @@ private theorem evalTypedSwapNonOverlappingCall_rel
                                                                           Eq.trans (congrArg (fun m => { m with borrows := borrows₃ }) h_fb2') h_fb3
                                                                         dsimp only at h_fb3' ⊢
                                                                         rw [h_fb3']
-                                                                        cases AllocKey.beq xEp.allocKey yEp0.allocKey with
-                                                                        | true =>
+                                                                        rcases h_ep { ms.memory with borrows := borrows₃ } locals' yPtr h_P3 with ⟨h_epy3, h_Ey3⟩
+                                                                        rw [h_epy3]
+                                                                        cases h_y3 : resolveLiveMemEndpoint
+                                                                            { ms with memory := { ms.memory with borrows := borrows₃ } }
+                                                                            locals' bodyLocalDecls bodyLayouts yPtr with
+                                                                        | ub => exact .fail .ub
+                                                                        | unsupported => exact .unsupported
+                                                                        | ok yEp₃ =>
                                                                           dsimp only
-                                                                          rcases h_ep { ms.memory with borrows := borrows₃ } locals' yPtr h_P3 with ⟨h_epy3, h_Ey3⟩
-                                                                          rw [h_epy3]
-                                                                          cases h_y3 : resolveLiveMemEndpoint
-                                                                              { ms with memory := { ms.memory with borrows := borrows₃ } }
-                                                                              locals' bodyLocalDecls bodyLayouts yPtr with
+                                                                          cases endpointAccessCheck yEp₃ elemSize with
                                                                           | ub => exact .fail .ub
                                                                           | unsupported => exact .unsupported
-                                                                          | ok yEp₃ =>
+                                                                          | ok _ =>
                                                                             dsimp only
-                                                                            cases endpointAccessCheck yEp₃ elemSize with
-                                                                            | ub => exact .fail .ub
-                                                                            | unsupported => exact .unsupported
-                                                                            | ok _ =>
-                                                                              dsimp only
-                                                                              rcases h_ebw { ms.memory with borrows := borrows₃ } yEp₃ elemSize h_P3 (h_Ey3 yEp₃ h_y3) with ⟨h_w4, h_w4p⟩
-                                                                              rw [h_w4]
-                                                                              cases h_b4 : endpointBorrowsAfterWrite
-                                                                                  { ms.memory with borrows := borrows₃ } yEp₃ elemSize with
-                                                                              | none => exact .fail .ub
-                                                                              | some borrows₄ =>
-                                                                                obtain ⟨h_P4, h_fb4⟩ := h_w4p borrows₄ h_b4
-                                                                                have h_fb4' : { f ms.memory with borrows := borrows₄ } =
-                                                                                    f { ms.memory with borrows := borrows₄ } :=
-                                                                                  Eq.trans (congrArg (fun m => { m with borrows := borrows₄ }) h_fb3') h_fb4
+                                                                            rcases h_ebw { ms.memory with borrows := borrows₃ } yEp₃ elemSize h_P3 (h_Ey3 yEp₃ h_y3) with ⟨h_w4, h_w4p⟩
+                                                                            rw [h_w4]
+                                                                            cases h_b4 : endpointBorrowsAfterWrite
+                                                                                { ms.memory with borrows := borrows₃ } yEp₃ elemSize with
+                                                                            | none => exact .fail .ub
+                                                                            | some borrows₄ =>
+                                                                              obtain ⟨h_P4, h_fb4⟩ := h_w4p borrows₄ h_b4
+                                                                              have h_fb4' : { f ms.memory with borrows := borrows₄ } =
+                                                                                  f { ms.memory with borrows := borrows₄ } :=
+                                                                                Eq.trans (congrArg (fun m => { m with borrows := borrows₄ }) h_fb3') h_fb4
+                                                                              dsimp only at h_fb4' ⊢
+                                                                              rw [h_fb4']
+                                                                              cases AllocKey.beq xEp.allocKey yEp0.allocKey with
+                                                                              | true =>
                                                                                 dsimp only
                                                                                 cases writeAbstractBytesAt xrb xEp₂.effOff yStored with
                                                                                 | none => exact .fail .ub
@@ -2150,8 +2300,7 @@ private theorem evalTypedSwapNonOverlappingCall_rel
                                                                                   cases writeAbstractBytesAt p1 yEp₃.effOff xStored with
                                                                                   | none => exact .fail .ub
                                                                                   | some p2 =>
-                                                                                    dsimp only at h_fb4' ⊢
-                                                                                    rw [h_fb4']
+                                                                                    dsimp only
                                                                                     rcases h_commit { ms.memory with borrows := borrows₄ }
                                                                                         locals' xEp₂ p2 h_P4 (h_Ex2 xEp₂ h_x2) with ⟨h_c_eq, h_c_P⟩
                                                                                     rw [h_c_eq]
@@ -2161,51 +2310,30 @@ private theorem evalTypedSwapNonOverlappingCall_rel
                                                                                     | ub => exact .fail .ub
                                                                                     | unsupported => exact .unsupported
                                                                                     | ok pair => exact .write pair.2 pair.1 .unit (h_c_P pair.1 pair.2 h_cm1)
-                                                                        | false =>
-                                                                          dsimp only
-                                                                          cases writeAbstractBytesAt xrb xEp₂.effOff yStored with
-                                                                          | none => exact .fail .ub
-                                                                          | some xPatched =>
-                                                                            dsimp only
-                                                                            rcases h_commit { ms.memory with borrows := borrows₃ }
-                                                                                locals' xEp₂ xPatched h_P3 (h_Ex2 xEp₂ h_x2) with ⟨h_c1_eq, h_c1_P⟩
-                                                                            rw [h_c1_eq]
-                                                                            cases h_cm1 : commitRootAbstractBytes
-                                                                                { ms.memory with borrows := borrows₃ }
-                                                                                locals' xEp₂ xPatched with
-                                                                            | ub => exact .fail .ub
-                                                                            | unsupported => exact .unsupported
-                                                                            | ok pair₁ =>
-                                                                              have h_P3' := h_c1_P pair₁.1 pair₁.2 h_cm1
-                                                                              dsimp only
-                                                                              rcases h_ep pair₁.2 pair₁.1 yPtr h_P3' with ⟨h_epy3, h_Ey3⟩
-                                                                              rw [h_epy3]
-                                                                              cases h_y3 : resolveLiveMemEndpoint { ms with memory := pair₁.2 }
-                                                                                  pair₁.1 bodyLocalDecls bodyLayouts yPtr with
-                                                                              | ub => exact .fail .ub
-                                                                              | unsupported => exact .unsupported
-                                                                              | ok yEp₃ =>
+                                                                              | false =>
                                                                                 dsimp only
-                                                                                cases endpointAccessCheck yEp₃ elemSize with
-                                                                                | ub => exact .fail .ub
-                                                                                | unsupported => exact .unsupported
-                                                                                | ok _ =>
+                                                                                cases writeAbstractBytesAt xrb xEp₂.effOff yStored with
+                                                                                | none => exact .fail .ub
+                                                                                | some xPatched =>
                                                                                   dsimp only
-                                                                                  rcases h_ebw pair₁.2 yEp₃ elemSize h_P3' (h_Ey3 yEp₃ h_y3) with ⟨h_w4, h_w4p⟩
-                                                                                  rw [h_w4]
-                                                                                  cases h_b4 : endpointBorrowsAfterWrite pair₁.2 yEp₃ elemSize with
-                                                                                  | none => exact .fail .ub
-                                                                                  | some borrows₄ =>
-                                                                                    obtain ⟨h_P4, h_fb4⟩ := h_w4p borrows₄ h_b4
+                                                                                  rcases h_commit { ms.memory with borrows := borrows₄ }
+                                                                                      locals' xEp₂ xPatched h_P4 (h_Ex2 xEp₂ h_x2) with ⟨h_c1_eq, h_c1_P⟩
+                                                                                  rw [h_c1_eq]
+                                                                                  cases h_cm1 : commitRootAbstractBytes
+                                                                                      { ms.memory with borrows := borrows₄ }
+                                                                                      locals' xEp₂ xPatched with
+                                                                                  | ub => exact .fail .ub
+                                                                                  | unsupported => exact .unsupported
+                                                                                  | ok pair₁ =>
+                                                                                    have h_P4' := h_c1_P pair₁.1 pair₁.2 h_cm1
                                                                                     dsimp only
                                                                                     cases writeAbstractBytesAt yrb yEp₃.effOff xStored with
                                                                                     | none => exact .fail .ub
                                                                                     | some yPatched =>
-                                                                                      dsimp only at h_fb4 ⊢
-                                                                                      rw [h_fb4]
-                                                                                      rcases h_commit { pair₁.2 with borrows := borrows₄ } pair₁.1 yEp₃ yPatched h_P4 (h_Ey3 yEp₃ h_y3) with ⟨h_c2_eq, h_c2_P⟩
+                                                                                      dsimp only
+                                                                                      rcases h_commit pair₁.2 pair₁.1 yEp₃ yPatched h_P4' (h_Ey3 yEp₃ h_y3) with ⟨h_c2_eq, h_c2_P⟩
                                                                                       rw [h_c2_eq]
-                                                                                      cases h_cm2 : commitRootAbstractBytes { pair₁.2 with borrows := borrows₄ }
+                                                                                      cases h_cm2 : commitRootAbstractBytes pair₁.2
                                                                                           pair₁.1 yEp₃ yPatched with
                                                                                       | ub => exact .fail .ub
                                                                                       | unsupported => exact .unsupported
@@ -5906,56 +6034,67 @@ private theorem evalCopyMemory_borrows_ne_nil
   | ub | unsupported => rw [h1] at hok; nomatch hok
   | ok srcEp =>
     rw [h1] at hok; dsimp only at hok
-    cases h2 : endpointAccessCheck srcEp byteCount with
-    | ub | unsupported => rw [h2] at hok; nomatch hok
-    | ok _ =>
-      rw [h2] at hok; dsimp only at hok
-      cases h3 : readRootAbstractBytes ms.memory srcEp with
-      | none => rw [h3] at hok; nomatch hok
-      | some sbs =>
-        rw [h3] at hok; dsimp only at hok
-        cases h4 : sliceAbstractBytes sbs srcEp.effOff byteCount with
-        | none => rw [h4] at hok; nomatch hok
-        | some snap =>
-          rw [h4] at hok; dsimp only at hok
+    cases h1b : Nat.ble (Nat.add srcEp.effOff byteCount) srcEp.allocSize with
+    | false => rw [h1b] at hok; nomatch hok
+    | true =>
+      rw [h1b] at hok; dsimp only at hok
+      cases h2d : resolveLiveMemEndpoint ms locals bodyLocalDecls bodyLayouts dstPtr with
+      | ub | unsupported => rw [h2d] at hok; nomatch hok
+      | ok dstEp0 =>
+        rw [h2d] at hok; dsimp only at hok
+        cases h2b : Nat.ble (Nat.add dstEp0.effOff byteCount) dstEp0.allocSize with
+        | false => rw [h2b] at hok; nomatch hok
+        | true =>
+          rw [h2b] at hok; dsimp only at hok
           split at hok
           · nomatch hok
-          · rename_i b1 hb1
-            have hne1 : b1 ≠ [] := by
-              cases hsb : srcEp.borrow? with
-              | none => rw [hsb] at hb1; injection hb1 with he; rw [← he]; exact h_ne
-              | some p => rw [hsb] at hb1; exact borrowsAfterReadAccess_ne_nil h_ne hb1
-            try dsimp only at hok
-            cases h5 : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := b1 } }
-                locals bodyLocalDecls bodyLayouts dstPtr with
-            | ub | unsupported => rw [h5] at hok; nomatch hok
-            | ok dstEp =>
-              rw [h5] at hok; dsimp only at hok
-              cases h6 : endpointAccessCheck dstEp byteCount with
-              | ub | unsupported => rw [h6] at hok; nomatch hok
-              | ok _ =>
-                rw [h6] at hok; dsimp only at hok
-                split at hok
-                · nomatch hok
-                · try dsimp only at hok
-                  split at hok
-                  · nomatch hok
-                  · rename_i b2 hb2
-                    have hne2 : b2 ≠ [] := by
-                      cases hdb : dstEp.borrow? with
-                      | none => rw [hdb] at hb2; injection hb2 with he; rw [← he]; exact hne1
-                      | some p => rw [hdb] at hb2; exact borrowsAfterWriteAccess_ne_nil hne1 hb2
-                    try dsimp only at hok
-                    cases h8 : readRootAbstractBytes { ms.memory with borrows := b2 } dstEp with
-                    | none => rw [h8] at hok; nomatch hok
-                    | some dbs =>
-                      rw [h8] at hok; dsimp only at hok
-                      cases h9 : writeAbstractBytesAt dbs dstEp.effOff snap with
-                      | none => rw [h9] at hok; nomatch hok
-                      | some newDbs =>
-                        rw [h9] at hok; dsimp only at hok
-                        rw [commitRootAbstractBytes_borrows_eq hok]
-                        exact hne2
+          · cases h2 : endpointAccessCheck srcEp byteCount with
+            | ub | unsupported => rw [h2] at hok; nomatch hok
+            | ok _ =>
+              rw [h2] at hok; dsimp only at hok
+              split at hok
+              · nomatch hok
+              · rename_i b1 hb1
+                have hne1 : b1 ≠ [] := by
+                  cases hsb : srcEp.borrow? with
+                  | none => rw [hsb] at hb1; injection hb1 with he; rw [← he]; exact h_ne
+                  | some p => rw [hsb] at hb1; exact borrowsAfterReadAccess_ne_nil h_ne hb1
+                try dsimp only at hok
+                cases h5 : resolveLiveMemEndpoint { ms with memory := { ms.memory with borrows := b1 } }
+                    locals bodyLocalDecls bodyLayouts dstPtr with
+                | ub | unsupported => rw [h5] at hok; nomatch hok
+                | ok dstEp =>
+                  rw [h5] at hok; dsimp only at hok
+                  cases h6 : endpointAccessCheck dstEp byteCount with
+                  | ub | unsupported => rw [h6] at hok; nomatch hok
+                  | ok _ =>
+                    rw [h6] at hok; dsimp only at hok
+                    split at hok
+                    · nomatch hok
+                    · rename_i b2 hb2
+                      have hne2 : b2 ≠ [] := by
+                        cases hdb : dstEp.borrow? with
+                        | none => rw [hdb] at hb2; injection hb2 with he; rw [← he]; exact hne1
+                        | some p => rw [hdb] at hb2; exact borrowsAfterWriteAccess_ne_nil hne1 hb2
+                      try dsimp only at hok
+                      cases h3 : readRootAbstractBytes ms.memory srcEp with
+                      | none => rw [h3] at hok; nomatch hok
+                      | some sbs =>
+                        rw [h3] at hok; dsimp only at hok
+                        cases h4 : sliceAbstractBytes sbs srcEp.effOff byteCount with
+                        | none => rw [h4] at hok; nomatch hok
+                        | some snap =>
+                          rw [h4] at hok; dsimp only at hok
+                          cases h8 : readRootAbstractBytes { ms.memory with borrows := b2 } dstEp with
+                          | none => rw [h8] at hok; nomatch hok
+                          | some dbs =>
+                            rw [h8] at hok; dsimp only at hok
+                            cases h9 : writeAbstractBytesAt dbs dstEp.effOff snap with
+                            | none => rw [h9] at hok; nomatch hok
+                            | some newDbs =>
+                              rw [h9] at hok; dsimp only at hok
+                              rw [commitRootAbstractBytes_borrows_eq hok]
+                              exact hne2
 
 private theorem writeIntrinsicReturnWithProtectors_stmtStepBorrowsNeNil
     {ms : MachineState} {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable}

@@ -150,8 +150,9 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   ptrPointeeMayBeUnsizedAux isConsistentPtrLayout declPtrToPointeeByteSize?
   allRigidTysSatisfy rigidTyLayoutDeterminedAux explicitLayoutConsistent
   findConsistentDeclLayout? consistentExplicitLayout? resolveConsistentLayout?
+  exactRootAllocAlignAux? exactRootAllocAlign? exactRigidTyAlign?
   exactTyByteSizeAux? exactTyByteSize? exactRigidTyByteSize?
-  exactRootAllocAlign? exactRigidTyAlign? isBackedPtr isNullThinPtr
+  isBackedPtr isNullThinPtr
   decodeUsizeArg? isValidWidePtrMetaValForWidth normalizeAccessBorrowProj
   borrowsAfterReadAccess borrowsAfterWriteAccess untypedValueHasExactByteImage
   ResolvedMemEndpoint resolveLiveMemEndpoint endpointAccessCheck
@@ -161,20 +162,23 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   stripProvenanceBytes encodePtrRawBytes scalarPairOffsetsValid
   encodeFieldsAtOffsetsExactWith encodeUntypedFlatElemsExact
   encodeUntypedLeafOrArrayExact encodeArrayElemsAtLayoutIdx
-  encodeUnionFieldsWithLayouts encodeLeafForScalarLayout
+  appendBoolList repeatBoolList orBoolListAt
+  arbitraryFieldsDataMask unionFieldsDataMask layoutDataMask
+  allUntypedUnionSlotsEmpty mergeExactUnionTypedSlots encodeLeafForScalarLayout
   encodeValueAtLayoutIdx encodeRawArrayElems encodeRawValueBytes
-  readRootAbstractBytes appendBoolList repeatBoolList orBoolListAt
-  arbitraryFieldsDataMask unionFieldsDataMask layoutDataMask applyDataMask
+  readRootAbstractBytes applyDataMask
   tyDataMask resetTypedPaddingBytes validRangeExcludesAny
-  validRangeCoversAllNonNull decodeScalarLayoutBytesTarget
-  decodeFieldsAtLayoutIdxs decodeArrayElemsAtLayoutIdx
-  decodeUnionFieldsAtLayoutIdxs decodeValueAtLayoutIdx
-  decodePartialUninitArrayChunks decodeThinPtrBytes decodePartialUninitValue
-  abstractBytesToGlobalOptBytes buildGlobalRelocsAux updateGlobalAllocById
-  commitRootAbstractBytes evalCopyMemory anyListTrue isUninhabitedRigidTy
+  validRangeCoversAllNonNull anyListTrue isUninhabitedRigidTy
   isUninhabitedTy referenceToUninhabited charShapedSurrogate
   TypedValidity.andThen validateNonNullPtrBytes validateScalarLayoutBytes
-  validateWideMetaBytes validateLayoutFieldsWith validateArrayChunksWith
+  validateWideMetaBytes decodeScalarLayoutBytesTarget
+  decodeFieldsAtLayoutIdxs decodeArrayElemsAtLayoutIdx
+  decodeUnionFieldsAtLayoutIdxs decodeValueAtLayoutIdx
+  decodeTupleFieldsAtOffsetsWith
+  decodePartialUninitArrayChunks decodeThinPtrBytes decodePartialUninitValue
+  abstractBytesToGlobalOptBytes buildGlobalRelocsAux updateGlobalAllocById
+  commitRootAbstractBytes evalCopyMemory
+  validateTupleFieldsBytesWith validateLayoutFieldsWith validateArrayChunksWith
   validateTypedBytesForLayoutIdx validateTypedBytes allFieldLayoutsPermitUninit
   layoutPermitsUninit allRigidTysPermitUninit tyPermitsUninit
   validateScalarLayoutValue validateWideMetaValue validateLayoutFieldsValuesWith

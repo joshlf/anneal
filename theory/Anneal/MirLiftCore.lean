@@ -12285,69 +12285,128 @@ private theorem evalCopyMemory_withCalleeCtx
   | ub | unsupported => rfl
   | ok srcEp =>
     dsimp only
-    cases endpointAccessCheck srcEp byteCount with
-    | ub | unsupported => rfl
-    | ok _ =>
+    cases Nat.ble (Nat.add srcEp.effOff byteCount) srcEp.allocSize with
+    | false => rfl
+    | true =>
       dsimp only
-      rw [h_rd]
-      cases readRootAbstractBytes s.memory srcEp with
-      | none => rfl
-      | some sbs =>
+      rw [h_ep]
+      cases resolveLiveMemEndpoint s locals bodyLocalDecls bodyLayouts dstPtr with
+      | ub | unsupported => rfl
+      | ok dstEp0 =>
         dsimp only
-        cases sliceAbstractBytes sbs srcEp.effOff byteCount with
-        | none => rfl
-        | some snap =>
+        cases Nat.ble (Nat.add dstEp0.effOff byteCount) dstEp0.allocSize with
+        | false => rfl
+        | true =>
           dsimp only
-          have h_br : (Memory.withCalleeCtx c ac ti s.memory).borrows = s.memory.borrows := rfl
-          have h_ap : (Memory.withCalleeCtx c ac ti s.memory).activeProtectors = s.memory.activeProtectors := rfl
-          rw [h_br, h_ap]
-          have h_step_b1 : ∀ (b1 : List BorrowEntry),
-              (match resolveLiveMemEndpoint
-                  { frame := s.frame, memory := { Memory.withCalleeCtx c ac ti s.memory with borrows := b1 } }
-                  locals bodyLocalDecls bodyLayouts dstPtr with
+          have h_post_w :
+              (match endpointAccessCheck srcEp byteCount with
                | .ub => MemOpRes.ub
                | .unsupported => MemOpRes.unsupported
-               | .ok dstEp =>
-                 match endpointAccessCheck dstEp byteCount with
+               | .ok () =>
+                 match (match srcEp.borrow? with
+                   | .none => some (Memory.withCalleeCtx c ac ti s.memory).borrows
+                   | .some (srcTag, srcEntry) =>
+                     borrowsAfterReadAccess (Memory.withCalleeCtx c ac ti s.memory).borrows
+                       (Memory.withCalleeCtx c ac ti s.memory).activeProtectors
+                       srcEp.targetDecls srcEp.targetLayouts srcTag srcEntry srcEp.effOff byteCount) with
+                 | .none => MemOpRes.ub
+                 | .some borrows₁ =>
+                   match resolveLiveMemEndpoint
+                       { frame := s.frame, memory := { Memory.withCalleeCtx c ac ti s.memory with borrows := borrows₁ } }
+                       locals bodyLocalDecls bodyLayouts dstPtr with
+                   | .ub => MemOpRes.ub
+                   | .unsupported => MemOpRes.unsupported
+                   | .ok dstEp =>
+                     match endpointAccessCheck dstEp byteCount with
+                     | .ub => MemOpRes.ub
+                     | .unsupported => MemOpRes.unsupported
+                     | .ok () =>
+                       match (match dstEp.borrow? with
+                         | .none => some borrows₁
+                         | .some (dstTag, dstEntry) =>
+                           borrowsAfterWriteAccess borrows₁
+                             (Memory.withCalleeCtx c ac ti s.memory).activeProtectors
+                             dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
+                       | .none => MemOpRes.ub
+                       | .some borrows₂ =>
+                         match readRootAbstractBytes (Memory.withCalleeCtx c ac ti s.memory) srcEp with
+                         | .none => MemOpRes.unsupported
+                         | .some srcRootBytes =>
+                           match sliceAbstractBytes srcRootBytes srcEp.effOff byteCount with
+                           | .none => MemOpRes.ub
+                           | .some snapshot =>
+                             match readRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := borrows₂ } dstEp with
+                             | .none => MemOpRes.unsupported
+                             | .some dstRootBytes =>
+                               match writeAbstractBytesAt dstRootBytes dstEp.effOff snapshot with
+                               | .none => MemOpRes.ub
+                               | .some patchedRootBytes =>
+                                 commitRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := borrows₂ }
+                                   locals dstEp patchedRootBytes) =
+              (match
+                (match endpointAccessCheck srcEp byteCount with
                  | .ub => MemOpRes.ub
                  | .unsupported => MemOpRes.unsupported
                  | .ok () =>
-                   match (match dstEp.globalAlloc? with
-                     | .some g => match g.mutability with | .mut => true | .not => false
-                     | .none => true) with
-                   | false => MemOpRes.ub
-                   | true =>
-                     match (match dstEp.borrow? with
-                       | .none => some b1
-                       | .some (dstTag, dstEntry) =>
-                         borrowsAfterWriteAccess b1 s.memory.activeProtectors
-                           dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
-                     | .none => MemOpRes.ub
-                     | .some b2 =>
-                       match readRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := b2 } dstEp with
-                       | .none => MemOpRes.unsupported
-                       | .some dbs =>
-                         match writeAbstractBytesAt dbs dstEp.effOff snap with
+                   match (match srcEp.borrow? with
+                     | .none => some s.memory.borrows
+                     | .some (srcTag, srcEntry) =>
+                       borrowsAfterReadAccess s.memory.borrows s.memory.activeProtectors
+                         srcEp.targetDecls srcEp.targetLayouts srcTag srcEntry srcEp.effOff byteCount) with
+                   | .none => MemOpRes.ub
+                   | .some borrows₁ =>
+                     match resolveLiveMemEndpoint
+                         { s with memory := { s.memory with borrows := borrows₁ } }
+                         locals bodyLocalDecls bodyLayouts dstPtr with
+                     | .ub => MemOpRes.ub
+                     | .unsupported => MemOpRes.unsupported
+                     | .ok dstEp =>
+                       match endpointAccessCheck dstEp byteCount with
+                       | .ub => MemOpRes.ub
+                       | .unsupported => MemOpRes.unsupported
+                       | .ok () =>
+                         match (match dstEp.borrow? with
+                           | .none => some borrows₁
+                           | .some (dstTag, dstEntry) =>
+                             borrowsAfterWriteAccess borrows₁ s.memory.activeProtectors
+                               dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
                          | .none => MemOpRes.ub
-                         | .some patched =>
-                           commitRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := b2 }
-                             locals dstEp patched) =
-              (match
-                (match resolveLiveMemEndpoint
-                    { s with memory := { s.memory with borrows := b1 } }
-                    locals bodyLocalDecls bodyLayouts dstPtr with
-                 | .ub => MemOpRes.ub
-                 | .unsupported => MemOpRes.unsupported
-                 | .ok dstEp =>
-                   match endpointAccessCheck dstEp byteCount with
+                         | .some borrows₂ =>
+                           match readRootAbstractBytes s.memory srcEp with
+                           | .none => MemOpRes.unsupported
+                           | .some srcRootBytes =>
+                             match sliceAbstractBytes srcRootBytes srcEp.effOff byteCount with
+                             | .none => MemOpRes.ub
+                             | .some snapshot =>
+                               match readRootAbstractBytes { s.memory with borrows := borrows₂ } dstEp with
+                               | .none => MemOpRes.unsupported
+                               | .some dstRootBytes =>
+                                 match writeAbstractBytesAt dstRootBytes dstEp.effOff snapshot with
+                                 | .none => MemOpRes.ub
+                                 | .some patchedRootBytes =>
+                                   commitRootAbstractBytes { s.memory with borrows := borrows₂ }
+                                     locals dstEp patchedRootBytes) with
+               | .ok (l', m') => .ok (l', Memory.withCalleeCtx c ac ti m')
+               | .ub => .ub
+               | .unsupported => .unsupported) := by
+            cases endpointAccessCheck srcEp byteCount with
+            | ub | unsupported => rfl
+            | ok _ =>
+              dsimp only
+              have h_br : (Memory.withCalleeCtx c ac ti s.memory).borrows = s.memory.borrows := rfl
+              have h_ap : (Memory.withCalleeCtx c ac ti s.memory).activeProtectors = s.memory.activeProtectors := rfl
+              rw [h_br, h_ap]
+              have h_step_b1 : ∀ (b1 : List BorrowEntry),
+                  (match resolveLiveMemEndpoint
+                      { frame := s.frame, memory := { Memory.withCalleeCtx c ac ti s.memory with borrows := b1 } }
+                      locals bodyLocalDecls bodyLayouts dstPtr with
                    | .ub => MemOpRes.ub
                    | .unsupported => MemOpRes.unsupported
-                   | .ok () =>
-                     match (match dstEp.globalAlloc? with
-                       | .some g => match g.mutability with | .mut => true | .not => false
-                       | .none => true) with
-                     | false => MemOpRes.ub
-                     | true =>
+                   | .ok dstEp =>
+                     match endpointAccessCheck dstEp byteCount with
+                     | .ub => MemOpRes.ub
+                     | .unsupported => MemOpRes.unsupported
+                     | .ok () =>
                        match (match dstEp.borrow? with
                          | .none => some b1
                          | .some (dstTag, dstEntry) =>
@@ -12355,65 +12414,117 @@ private theorem evalCopyMemory_withCalleeCtx
                              dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
                        | .none => MemOpRes.ub
                        | .some b2 =>
-                         match readRootAbstractBytes { s.memory with borrows := b2 } dstEp with
+                         match readRootAbstractBytes (Memory.withCalleeCtx c ac ti s.memory) srcEp with
                          | .none => MemOpRes.unsupported
-                         | .some dbs =>
-                           match writeAbstractBytesAt dbs dstEp.effOff snap with
+                         | .some sbs =>
+                           match sliceAbstractBytes sbs srcEp.effOff byteCount with
                            | .none => MemOpRes.ub
-                           | .some patched =>
-                             commitRootAbstractBytes { s.memory with borrows := b2 }
-                               locals dstEp patched) with
-               | .ok (l', m') => .ok (l', Memory.withCalleeCtx c ac ti m')
-               | .ub => .ub
-               | .unsupported => .unsupported) := fun b1 => by
-            rw [h_m_b]
-            rw [h_ep { s.memory with borrows := b1 } dstPtr]
-            cases resolveLiveMemEndpoint { frame := s.frame, memory := { s.memory with borrows := b1 } }
-                locals bodyLocalDecls bodyLayouts dstPtr with
-            | ub | unsupported => rfl
-            | ok dstEp =>
-              dsimp only
-              cases endpointAccessCheck dstEp byteCount with
-              | ub | unsupported => rfl
-              | ok _ =>
-                dsimp only
-                have h_step_b2 : ∀ (b2 : List BorrowEntry),
-                    (match readRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := b2 } dstEp with
-                     | .none => MemOpRes.unsupported
-                     | .some dbs =>
-                       match writeAbstractBytesAt dbs dstEp.effOff snap with
-                       | .none => MemOpRes.ub
-                       | .some patched =>
-                         commitRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := b2 }
-                           locals dstEp patched) =
-                    (match (match readRootAbstractBytes { s.memory with borrows := b2 } dstEp with
-                      | .none => MemOpRes.unsupported
-                      | .some dbs =>
-                        match writeAbstractBytesAt dbs dstEp.effOff snap with
-                        | .none => MemOpRes.ub
-                        | .some patched =>
-                          commitRootAbstractBytes { s.memory with borrows := b2 }
-                            locals dstEp patched) with
-                     | .ok (l', m') => .ok (l', Memory.withCalleeCtx c ac ti m')
-                     | .ub => .ub
-                     | .unsupported => .unsupported) := fun b2 => by
-                  rw [h_m_b, h_rd]
-                  cases readRootAbstractBytes { s.memory with borrows := b2 } dstEp with
-                  | none => rfl
-                  | some dbs =>
-                    dsimp only
-                    cases writeAbstractBytesAt dbs dstEp.effOff snap with
-                    | none => rfl
-                    | some patched =>
-                      exact commitRootAbstractBytes_withCalleeCtx c ac ti
-                        { s.memory with borrows := b2 } locals dstEp patched
-                cases dstEp.globalAlloc? with
-                | some g =>
+                           | .some snap =>
+                             match readRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := b2 } dstEp with
+                             | .none => MemOpRes.unsupported
+                             | .some dbs =>
+                               match writeAbstractBytesAt dbs dstEp.effOff snap with
+                               | .none => MemOpRes.ub
+                               | .some patched =>
+                                 commitRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := b2 }
+                                   locals dstEp patched) =
+                  (match
+                    (match resolveLiveMemEndpoint
+                        { s with memory := { s.memory with borrows := b1 } }
+                        locals bodyLocalDecls bodyLayouts dstPtr with
+                     | .ub => MemOpRes.ub
+                     | .unsupported => MemOpRes.unsupported
+                     | .ok dstEp =>
+                       match endpointAccessCheck dstEp byteCount with
+                       | .ub => MemOpRes.ub
+                       | .unsupported => MemOpRes.unsupported
+                       | .ok () =>
+                         match (match dstEp.borrow? with
+                           | .none => some b1
+                           | .some (dstTag, dstEntry) =>
+                             borrowsAfterWriteAccess b1 s.memory.activeProtectors
+                               dstEp.targetDecls dstEp.targetLayouts dstTag dstEntry dstEp.effOff byteCount) with
+                         | .none => MemOpRes.ub
+                         | .some b2 =>
+                           match readRootAbstractBytes s.memory srcEp with
+                           | .none => MemOpRes.unsupported
+                           | .some sbs =>
+                             match sliceAbstractBytes sbs srcEp.effOff byteCount with
+                             | .none => MemOpRes.ub
+                             | .some snap =>
+                               match readRootAbstractBytes { s.memory with borrows := b2 } dstEp with
+                               | .none => MemOpRes.unsupported
+                               | .some dbs =>
+                                 match writeAbstractBytesAt dbs dstEp.effOff snap with
+                                 | .none => MemOpRes.ub
+                                 | .some patched =>
+                                   commitRootAbstractBytes { s.memory with borrows := b2 }
+                                     locals dstEp patched) with
+                   | .ok (l', m') => .ok (l', Memory.withCalleeCtx c ac ti m')
+                   | .ub => .ub
+                   | .unsupported => .unsupported) := fun b1 => by
+                rw [h_m_b]
+                rw [h_ep { s.memory with borrows := b1 } dstPtr]
+                cases resolveLiveMemEndpoint { frame := s.frame, memory := { s.memory with borrows := b1 } }
+                    locals bodyLocalDecls bodyLayouts dstPtr with
+                | ub | unsupported => rfl
+                | ok dstEp =>
                   dsimp only
-                  cases g.mutability with
-                  | not => rfl
-                  | «mut» =>
+                  cases endpointAccessCheck dstEp byteCount with
+                  | ub | unsupported => rfl
+                  | ok _ =>
                     dsimp only
+                    have h_step_b2 : ∀ (b2 : List BorrowEntry),
+                        (match readRootAbstractBytes (Memory.withCalleeCtx c ac ti s.memory) srcEp with
+                         | .none => MemOpRes.unsupported
+                         | .some sbs =>
+                           match sliceAbstractBytes sbs srcEp.effOff byteCount with
+                           | .none => MemOpRes.ub
+                           | .some snap =>
+                             match readRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := b2 } dstEp with
+                             | .none => MemOpRes.unsupported
+                             | .some dbs =>
+                               match writeAbstractBytesAt dbs dstEp.effOff snap with
+                               | .none => MemOpRes.ub
+                               | .some patched =>
+                                 commitRootAbstractBytes { Memory.withCalleeCtx c ac ti s.memory with borrows := b2 }
+                                   locals dstEp patched) =
+                        (match (match readRootAbstractBytes s.memory srcEp with
+                          | .none => MemOpRes.unsupported
+                          | .some sbs =>
+                            match sliceAbstractBytes sbs srcEp.effOff byteCount with
+                            | .none => MemOpRes.ub
+                            | .some snap =>
+                              match readRootAbstractBytes { s.memory with borrows := b2 } dstEp with
+                              | .none => MemOpRes.unsupported
+                              | .some dbs =>
+                                match writeAbstractBytesAt dbs dstEp.effOff snap with
+                                | .none => MemOpRes.ub
+                                | .some patched =>
+                                  commitRootAbstractBytes { s.memory with borrows := b2 }
+                                    locals dstEp patched) with
+                         | .ok (l', m') => .ok (l', Memory.withCalleeCtx c ac ti m')
+                         | .ub => .ub
+                         | .unsupported => .unsupported) := fun b2 => by
+                      rw [h_rd]
+                      cases readRootAbstractBytes s.memory srcEp with
+                      | none => rfl
+                      | some sbs =>
+                        dsimp only
+                        cases sliceAbstractBytes sbs srcEp.effOff byteCount with
+                        | none => rfl
+                        | some snap =>
+                          dsimp only
+                          rw [h_m_b, h_rd]
+                          cases readRootAbstractBytes { s.memory with borrows := b2 } dstEp with
+                          | none => rfl
+                          | some dbs =>
+                            dsimp only
+                            cases writeAbstractBytesAt dbs dstEp.effOff snap with
+                            | none => rfl
+                            | some patched =>
+                              exact commitRootAbstractBytes_withCalleeCtx c ac ti
+                                { s.memory with borrows := b2 } locals dstEp patched
                     cases dstEp.borrow? with
                     | none => exact h_step_b2 b1
                     | some p =>
@@ -12422,24 +12533,21 @@ private theorem evalCopyMemory_withCalleeCtx
                           dstEp.targetDecls dstEp.targetLayouts p.1 p.2 dstEp.effOff byteCount with
                       | none => rfl
                       | some b2 => exact h_step_b2 b2
-                | none =>
-                  dsimp only
-                  cases dstEp.borrow? with
-                  | none => exact h_step_b2 b1
-                  | some p =>
-                    dsimp only
-                    cases borrowsAfterWriteAccess b1 s.memory.activeProtectors
-                        dstEp.targetDecls dstEp.targetLayouts p.1 p.2 dstEp.effOff byteCount with
-                    | none => rfl
-                    | some b2 => exact h_step_b2 b2
-          cases srcEp.borrow? with
-          | none => exact h_step_b1 s.memory.borrows
-          | some p =>
+              cases srcEp.borrow? with
+              | none => exact h_step_b1 s.memory.borrows
+              | some p =>
+                dsimp only
+                cases borrowsAfterReadAccess s.memory.borrows s.memory.activeProtectors
+                    srcEp.targetDecls srcEp.targetLayouts p.1 p.2 srcEp.effOff byteCount with
+                | none => rfl
+                | some b1 => exact h_step_b1 b1
+          cases dstEp0.globalAlloc? with
+          | none => exact h_post_w
+          | some g =>
             dsimp only
-            cases borrowsAfterReadAccess s.memory.borrows s.memory.activeProtectors
-                srcEp.targetDecls srcEp.targetLayouts p.1 p.2 srcEp.effOff byteCount with
-            | none => rfl
-            | some b1 => exact h_step_b1 b1
+            cases g.mutability with
+            | not => rfl
+            | «mut» => exact h_post_w
 
 private theorem evalCopyMemory_callerBodies
     {s : MachineState} {locals : List LocalSlot}

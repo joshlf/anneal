@@ -8884,7 +8884,9 @@ def rigidTyLayoutDeterminedAux
       allRigidTysSatisfy
         (rigidTyLayoutDeterminedAux localDecls layouts withAlign fuel')
         ks
-    | _ => true
+    | .adt _ _ => true
+    | .closure _ _ => true
+    | _ => false
 
 /--
 Test whether an explicit `TypeLayout` entry `l` is both size-consistent and
@@ -9071,14 +9073,114 @@ def resolveConsistentLayout?
   | .none => findConsistentDeclLayout? localDecls layouts ty.kind
 
 /--
+Target-width- and layout-consistency-aware exact root ABI alignment of `ty : Ty`:
+1. Rejects structurally unsized types (`isUnsizedRigidTy 8 ty.kind = true`).
+2. Trusts `ty.layoutIdx` ONLY when `explicitLayoutConsistent layouts ty l = true`
+   (and `findConsistentDeclLayout?` otherwise).
+3. Computes recursive primitive, pointer, array, and tuple alignments directly
+   without ever calling `findDeclLayoutForRigidTy` (which does not check
+   `explicitLayoutConsistent` or `isUnresolvedLayoutIdx`), failing closed on
+   unlaid-out ADTs/closures and non-64-bit platform-dependent alignments unless
+   confirmed by a consistent explicit `TypeLayout`.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The alignment of a value specifies what addresses are valid to store the value at. A value of alignment n must only be stored at an address that is a multiple of n."
+-/
+def exactRootAllocAlignAux?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Nat → Ty → Option Nat
+  | .zero, _ => .none
+  | .succ fuel', ty =>
+    match isUnsizedRigidTy 8 ty.kind with
+    | true => .none
+    | false =>
+      match consistentExplicitLayout? layouts ty with
+      | .some (_, l) => .some l.align.bytes
+      | .none =>
+        match findConsistentDeclLayout? localDecls layouts ty.kind with
+        | .some (_, l) => .some l.align.bytes
+        | .none =>
+          let ptrBits :=
+            match layouts.pointerBits with
+            | 0 => 64
+            | n + 1 => n + 1
+          let is64 := Nat.beq ptrBits 64
+          let isAtLeast32 := Nat.ble 32 ptrBits
+          match ty.kind with
+          | .bool | .never | .fnDef _ _ | .tuple .nil | .int .i8 | .uint .u8 => .some 1
+          | .int .i16 | .uint .u16 | .float .f16 =>
+            match isAtLeast32 with | true => .some 2 | false => .none
+          | .int .i32 | .uint .u32 | .float .f32 | .char =>
+            match isAtLeast32 with | true => .some 4 | false => .none
+          | .int .i64 | .uint .u64 | .float .f64 =>
+            match is64 with | true => .some 8 | false => .none
+          | .int .i128 | .uint .u128 | .float .f128 =>
+            match is64 with | true => .some 16 | false => .none
+          | .int .isize | .uint .usize | .fnPtr _ _ _ _ =>
+            match is64 with | true => .some 8 | false => .none
+          | .ref _ pt | .rawPtr _ pt =>
+            match is64 with
+            | false => .none
+            | true =>
+              match knownWidePointeeTailAux? 8 pt with
+              | .some _ => .some 8
+              | .none =>
+                match ptrPointeeMayBeUnsizedAux 8 pt with
+                | false => .some 8
+                | true =>
+                  match declPtrToPointeeByteSize? localDecls layouts pt with
+                  | .some sz =>
+                    match Nat.beq sz 8 with | true => .some 8 | false => .none
+                  | .none => .none
+          | .array elem _ =>
+            exactRootAllocAlignAux? localDecls layouts fuel'
+              { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }
+          | .tuple (k :: .nil) =>
+            exactRootAllocAlignAux? localDecls layouts fuel'
+              { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
+          | .tuple ks =>
+            tupleFieldsAlign
+              (fun fk =>
+                exactRootAllocAlignAux? localDecls layouts fuel'
+                  { kind := fk, layoutIdx := unresolvedLayoutIdx layouts })
+              ks
+          | _ => .none
+
+/--
+Target-width- and layout-consistency-aware exact root ABI alignment of `ty : Ty`.
+-/
+@[reducible]
+def exactRootAllocAlign?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty) :
+    Option Nat :=
+  exactRootAllocAlignAux? localDecls layouts 8 ty
+
+/--
+Target-aware exact ABI byte alignment of `kind : RigidTy`.
+-/
+@[reducible]
+def exactRigidTyAlign?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (kind : RigidTy) :
+    Option Nat :=
+  exactRootAllocAlign? localDecls layouts { kind := kind, layoutIdx := unresolvedLayoutIdx layouts }
+
+/--
 Target-width- and layout-consistency-aware exact byte size of `ty`:
 1. Rejects structurally unsized types (`isUnsizedRigidTy 8 ty.kind = true`).
 2. Trusts `ty.layoutIdx` only when `explicitLayoutConsistent layouts ty l = true`.
 3. Resolves primitive, pointer-width (`layoutPointerBytes`), and confirmed
    custom-DST pointer types directly without 64-bit assumptions.
-4. Falls back to `intrinsicRigidTyByteSize` only when `rigidTyLayoutDeterminedAux`
-   confirms structural sizing is valid on `layouts` and no inconsistent explicit
-   layout is trusted.
+4. For unlaid-out `>= 2`-field tuples, sums field sizes via `exactTyByteSizeAux?`
+   and rounds up to `exactRootAllocAlignAux?` (never calling
+   `findDeclLayoutForRigidTy`, so unresolved `entries[0]` or inconsistent field
+   layouts can never leak in).
 
 Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -9140,9 +9242,20 @@ def exactTyByteSizeAux?
           match findConsistentDeclLayout? localDecls layouts (.tuple ks) with
           | .some (_, l) => .some l.size.bytes
           | .none =>
-            match rigidTyLayoutDeterminedAux localDecls layouts false 8 (.tuple ks) with
-            | true => intrinsicRigidTyByteSize localDecls layouts (.tuple ks)
-            | false => .none
+            match
+              tupleFieldsByteSum
+                (fun fk =>
+                  exactTyByteSizeAux? localDecls layouts fuel'
+                    { kind := fk, layoutIdx := unresolvedLayoutIdx layouts })
+                ks,
+              exactRootAllocAlignAux? localDecls layouts (.succ fuel')
+                { kind := .tuple ks, layoutIdx := unresolvedLayoutIdx layouts }
+            with
+            | .some rawBytes, .some alignBytes =>
+              match Nat.blt 0 alignBytes with
+              | true => .some (roundUpToAlign rawBytes alignBytes)
+              | false => .none
+            | _, _ => .none
         | .adt _ _ =>
           match findConsistentDeclLayout? localDecls layouts ty.kind with
           | .some (_, l) => .some l.size.bytes
@@ -9175,67 +9288,6 @@ def exactRigidTyByteSize?
     (kind : RigidTy) :
     Option Nat :=
   exactTyByteSize? localDecls layouts { kind := kind, layoutIdx := unresolvedLayoutIdx layouts }
-
-/--
-Target-width- and layout-consistency-aware exact root ABI alignment of `ty : Ty`:
-1. If `ty.layoutIdx` resolves to a `TypeLayout` satisfying
-   `explicitLayoutConsistent layouts ty l`, returns `l.align.bytes`.
-2. Otherwise strips `ty.layoutIdx` to `unresolvedLayoutIdx layouts` (never
-   leaking a rejected explicit index into `tyExactByteAlign?`), checks
-   `findConsistentDeclLayout?` for ADTs/closures/tuples/arrays, and consults
-   `tyExactByteAlign?` ONLY when `rigidTyLayoutDeterminedAux ... true 8 ty.kind`
-   holds.
-
-Reference (The Rust Reference 1.98.0, "Type Layout — Size and Alignment"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
-
-> "The alignment of a value specifies what addresses are valid to store the value at. A value of alignment n must only be stored at an address that is a multiple of n."
--/
-def exactRootAllocAlign?
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (ty : Ty) :
-    Option Nat :=
-  match isUnsizedRigidTy 8 ty.kind with
-  | true => .none
-  | false =>
-    match consistentExplicitLayout? layouts ty with
-    | .some (_, l) => .some l.align.bytes
-    | .none =>
-      match findConsistentDeclLayout? localDecls layouts ty.kind with
-      | .some (_, l) => .some l.align.bytes
-      | .none =>
-        match rigidTyLayoutDeterminedAux localDecls layouts true 8 ty.kind with
-        | false => .none
-        | true =>
-          let strippedTy : Ty := { ty with layoutIdx := unresolvedLayoutIdx layouts }
-          match ty.kind with
-          | .adt _ _ => .none
-          | .closure _ _ => .none
-          | _ =>
-            match tyExactByteAlign? localDecls layouts strippedTy with
-            | .some a =>
-              match Align.isPowerOfTwoBytes ⟨a⟩ with
-              | true => .some a
-              | false => .none
-            | .none =>
-              match intrinsicRigidTyAlign localDecls layouts ty.kind with
-              | .some a =>
-                match Align.isPowerOfTwoBytes ⟨a⟩ with
-                | true => .some a
-                | false => .none
-              | .none => .none
-
-/--
-Target-aware exact ABI byte alignment of `kind : RigidTy`.
--/
-@[reducible]
-def exactRigidTyAlign?
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (kind : RigidTy) :
-    Option Nat :=
-  exactRootAllocAlign? localDecls layouts { kind := kind, layoutIdx := unresolvedLayoutIdx layouts }
 
 /--
 Test whether `p : ProvenancePtr` is backed by a live or recorded entry in
@@ -9301,7 +9353,7 @@ Reference (The Rust Reference 1.98.0, "Numeric types"):
 @[reducible]
 def decodeUsizeArg? (mem : Memory) (ptrBytes : Nat) : Value → MemOpRes Nat
   | .scalar sc =>
-    match Nat.beq sc.sizeBytes ptrBytes with
+    match Bool.and (Nat.beq sc.sizeBytes ptrBytes) (Nat.blt sc.bits (scalarModulus ptrBytes)) with
     | true => .ok sc.bits
     | false => .ub
   | .ptr p sz =>
@@ -9309,7 +9361,10 @@ def decodeUsizeArg? (mem : Memory) (ptrBytes : Nat) : Value → MemOpRes Nat
     | false => .ub
     | true =>
       match Bool.and (Nat.beq p.allocId 0) (Bool.not (isBackedPtr mem p)) with
-      | true => .ok p.offsetBytes
+      | true =>
+        match Nat.blt p.offsetBytes (scalarModulus ptrBytes) with
+        | true => .ok p.offsetBytes
+        | false => .ub
       | false => .unsupported
   | _ => .ub
 
@@ -10204,453 +10259,6 @@ def encodeArrayElemsAtLayoutIdx
           encodeArrayElemsAtLayoutIdx encodeElem elemSize stride (Nat.add curOff stride) rest buf'
 
 /--
-Encode a union aggregate's fields using `fieldLayouts` when available, writing
-the active non-ZST field at offset `0` over an all-`.uninit` buffer of
-`totalSize` bytes.
--/
-def encodeUnionFieldsWithLayouts
-    (encodeAt : Nat → Value → Option (List AbstractByte))
-    (layouts : LayoutTable)
-    (totalSize : Nat) :
-    List Nat → List Value → Option (List AbstractByte)
-  | .nil, .nil => .some (replicateUninitBytes totalSize)
-  | fIdx :: restIdxs, fv :: restVals =>
-    match LayoutTable.lookup layouts fIdx with
-    | .none => .none
-    | .some fl =>
-      match Nat.beq fl.size.bytes 0 with
-      | true => encodeUnionFieldsWithLayouts encodeAt layouts totalSize restIdxs restVals
-      | false =>
-        match fv with
-        | .unit => encodeUnionFieldsWithLayouts encodeAt layouts totalSize restIdxs restVals
-        | _ =>
-          match encodeAt fIdx fv with
-          | .none => .none
-          | .some fBs =>
-            match Bool.and (Nat.beq (length fBs) fl.size.bytes) (Nat.ble fl.size.bytes totalSize) with
-            | false => .none
-            | true => writeAbstractBytesAt (replicateUninitBytes totalSize) 0 fBs
-  | _, _ => .none
-
-/--
-Encode a single leaf value (`.scalar` or `.ptr`) into `expectedSz` raw
-little-endian bytes for a layout slot without `fieldLayouts`.
--/
-def encodeLeafForScalarLayout
-    (mem : Memory)
-    (expectedSz : Nat) :
-    Value → Option (List AbstractByte)
-  | .scalar sv =>
-    match Nat.beq sv.sizeBytes expectedSz with
-    | true => encodeScalarBytes sv .none
-    | false => .none
-  | .ptr p sz =>
-    match Nat.beq sz expectedSz with
-    | true => encodePtrRawBytes mem p sz
-    | false => .none
-  | _ => .none
-
-/--
-Exact, layout-directed raw abstract-byte encoder for `v` at `layouts.entries[lIdx]`:
-- Fails closed (`.none`) on big-endian `LayoutTable`s (`isLittleEndian = false`).
-- Preserves raw scalar bytes (including invalid `bool`/`char` bit patterns) so
-  `typed_swap_nonoverlapping` observes UB rather than misclassifying as
-  `.unsupported`.
-- Encodes `.arbitrary` structs/tuples strictly from `TypeLayout.fields` +
-  `fieldLayouts` (or validated `.scalar`/memory-ordered `.scalarPair` when
-  `fieldLayouts = .nil`), NEVER guessing field types from generic `args` or
-  packing nested padded structs back-to-back.
-
-Reference (The Rust Reference 1.98.0, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
-
-> "The size of a value is the offset in bytes between successive elements in an array with that item type including alignment padding."
--/
-def encodeValueAtLayoutIdx
-    (mem : Memory)
-    (layouts : LayoutTable) :
-    Nat → LayoutIdx → Value → Option (List AbstractByte)
-  | .zero, _, _ => .none
-  | .succ fuel', lIdx, v =>
-    match layouts.isLittleEndian with
-    | false => .none
-    | true =>
-      match LayoutTable.lookup layouts lIdx with
-      | .none => .none
-      | .some l =>
-        match Bool.and (TypeLayout.isWellFormed l) (Bool.not l.isUninhabited) with
-        | false => .none
-        | true =>
-          match l.variants with
-          | .empty => .none
-          | .multiple _ _ _ => .none
-          | .single expectedVar =>
-            match l.fields with
-            | .primitive =>
-              match Nat.beq l.size.bytes 0 with
-              | true =>
-                match v with
-                | .unit => .some .nil
-                | .aggregate varIdx .nil =>
-                  match Nat.beq varIdx expectedVar with
-                  | true => .some .nil
-                  | false => .none
-                | _ => .none
-              | false =>
-                match l.backendRepr with
-                | .scalar sl =>
-                  match scalarLayoutTargetByteWidth layouts sl with
-                  | .some w =>
-                    match Nat.beq w l.size.bytes with
-                    | true => encodeLeafForScalarLayout mem l.size.bytes v
-                    | false => .none
-                  | .none => .none
-                | _ => encodeLeafForScalarLayout mem l.size.bytes v
-            | .arbitrary .nil _ =>
-              match v with
-              | .unit => .some (replicateUninitBytes l.size.bytes)
-              | .aggregate varIdx .nil =>
-                match Nat.beq varIdx expectedVar with
-                | true => .some (replicateUninitBytes l.size.bytes)
-                | false => .none
-              | _ => .none
-            | .arbitrary offsets memIdx =>
-              match v with
-              | .aggregate varIdx fieldVals =>
-                match
-                  Bool.and
-                    (Nat.beq varIdx expectedVar)
-                    (Nat.beq (length fieldVals) (length offsets))
-                with
-                | false => .none
-                | true =>
-                  match Nat.beq (length l.fieldLayouts) (length offsets) with
-                  | true =>
-                    encodeFieldsAtOffsetsExactWith
-                      (fun fIdx fv => encodeValueAtLayoutIdx mem layouts fuel' fIdx fv)
-                      (fun fIdx =>
-                        match LayoutTable.lookup layouts fIdx with
-                        | .some fl => .some fl.size.bytes
-                        | .none => .none)
-                      offsets
-                      l.fieldLayouts
-                      fieldVals
-                      (replicateUninitBytes l.size.bytes)
-                  | false =>
-                    match offsets, fieldVals, l.backendRepr with
-                    | off0 :: .nil, v0 :: .nil, .scalar s0 =>
-                      match scalarLayoutTargetByteWidth layouts s0 with
-                      | .some sz0 =>
-                        match encodeLeafForScalarLayout mem sz0 v0 with
-                        | .some b0 =>
-                          writeAbstractBytesAt (replicateUninitBytes l.size.bytes) off0.bytes b0
-                        | .none => .none
-                      | .none => .none
-                    | off0 :: off1 :: .nil, v0 :: v1 :: .nil, .scalarPair s0 s1 =>
-                      match
-                        scalarPairOffsetsValid layouts (off0 :: off1 :: .nil) memIdx s0 s1 l.size.bytes
-                      with
-                      | .some (firstOff, sz0, secondOff, sz1, swapped) =>
-                        let (firstVal, secondVal) :=
-                          match swapped with
-                          | false => (v0, v1)
-                          | true => (v1, v0)
-                        match
-                          encodeLeafForScalarLayout mem sz0 firstVal,
-                          encodeLeafForScalarLayout mem sz1 secondVal
-                        with
-                        | .some b0, .some b1 =>
-                          match writeAbstractBytesAt (replicateUninitBytes l.size.bytes) firstOff b0 with
-                          | .some buf1 => writeAbstractBytesAt buf1 secondOff b1
-                          | .none => .none
-                        | _, _ => .none
-                      | .none => .none
-                    | _, _, _ => .none
-              | _ => .none
-            | .array stride count =>
-              match Nat.beq count 0 with
-              | true =>
-                match Nat.beq l.size.bytes 0 with
-                | false => .none
-                | true =>
-                  match v with
-                  | .unit => .some .nil
-                  | .aggregate varIdx .nil =>
-                    match Nat.beq varIdx expectedVar with
-                    | true => .some .nil
-                    | false => .none
-                  | _ => .none
-              | false =>
-                match Nat.beq l.size.bytes (Nat.mul stride.bytes count) with
-                | false => .none
-                | true =>
-                  match v with
-                  | .aggregate varIdx elems =>
-                    match
-                      Bool.and (Nat.beq varIdx expectedVar) (Nat.beq (length elems) count)
-                    with
-                    | false => .none
-                    | true =>
-                      match l.fieldLayouts with
-                      | elemLIdx :: _ =>
-                        match LayoutTable.lookup layouts elemLIdx with
-                        | .some elemFl =>
-                          match Nat.ble elemFl.size.bytes stride.bytes with
-                          | false => .none
-                          | true =>
-                            encodeArrayElemsAtLayoutIdx
-                              (fun ev => encodeValueAtLayoutIdx mem layouts fuel' elemLIdx ev)
-                              elemFl.size.bytes
-                              stride.bytes
-                              0
-                              elems
-                              (replicateUninitBytes l.size.bytes)
-                        | .none => .none
-                      | .nil => .none
-                  | _ => .none
-            | .union _ =>
-              match v with
-              | .unit =>
-                match Nat.beq l.size.bytes 0 with
-                | true => .some .nil
-                | false => .none
-              | .scalar sv =>
-                match Nat.ble sv.sizeBytes l.size.bytes with
-                | false => .none
-                | true =>
-                  match encodeScalarBytes sv .none with
-                  | .some bs => writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 bs
-                  | .none => .none
-              | .ptr p sz =>
-                match Nat.ble sz l.size.bytes with
-                | false => .none
-                | true =>
-                  match encodePtrRawBytes mem p sz with
-                  | .some bs => writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 bs
-                  | .none => .none
-              | .aggregate _ fieldVals =>
-                match fieldVals with
-                | .nil => .some (replicateUninitBytes l.size.bytes)
-                | .unit :: .nil => .some (replicateUninitBytes l.size.bytes)
-                | .aggregate 0 .nil :: .nil => .some (replicateUninitBytes l.size.bytes)
-                | _ =>
-                  match Nat.beq (length l.fieldLayouts) (length fieldVals) with
-                  | true =>
-                    encodeUnionFieldsWithLayouts
-                      (fun fIdx fv => encodeValueAtLayoutIdx mem layouts fuel' fIdx fv)
-                      layouts
-                      l.size.bytes
-                      l.fieldLayouts
-                      fieldVals
-                  | false =>
-                    -- Untyped union payload (e.g., `MaybeUninit<[u8; N]>` without fieldLayouts):
-                    -- accept only leaf or homogeneous flat-array payloads.
-                    let payloadOpt : Option Value :=
-                      match fieldVals with
-                      | fv :: .nil => .some fv
-                      | .unit :: fv :: .nil => .some fv
-                      | .aggregate 0 .nil :: fv :: .nil => .some fv
-                      | _ => .none
-                    match payloadOpt with
-                    | .none => .none
-                    | .some pv =>
-                      match encodeUntypedLeafOrArrayExact mem pv with
-                      | .some bs =>
-                        match Nat.ble (length bs) l.size.bytes with
-                        | true => writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 bs
-                        | false => .none
-                      | .none => .none
-
-/--
-Encode array elements for a known element `RigidTy` when no `TypeLayout` entry
-with `fieldLayouts` is present.
--/
-def encodeRawArrayElems
-    (encodeElem : Value → Option (List AbstractByte))
-    (elemSz : Nat) :
-    List Value → Option (List AbstractByte)
-  | .nil => .some .nil
-  | ev :: rest =>
-    match encodeElem ev, encodeRawArrayElems encodeElem elemSz rest with
-    | .some eb, .some rb =>
-      match Nat.beq (length eb) elemSz with
-      | true => .some (appendAbstractBytes eb rb)
-      | false => .none
-    | _, _ => .none
-
-/--
-Exact raw byte encoder for `v : Value` at optional `tyOpt : Option Ty`,
-preserving invalid scalar bit patterns and `.uninit` sub-values, enforcing
-little-endianness, and never guessing sequential layouts for `>= 2`-field tuples
-or unlaid-out ADTs.
--/
-def encodeRawValueBytes
-    (mem : Memory)
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable) :
-    Nat → Option Ty → Value → Option (List AbstractByte)
-  | .zero, _, _ => .none
-  | .succ fuel', tyOpt, v =>
-    match layouts.isLittleEndian with
-    | false => .none
-    | true =>
-      match tyOpt with
-      | .none => encodeUntypedLeafOrArrayExact mem v
-      | .some ty =>
-        let ptrBytes := layoutPointerBytes layouts
-        match consistentExplicitLayout? layouts ty with
-        | .some (lIdx, _) => encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx v
-        | .none =>
-          match ty.kind with
-          | .bool => encodeLeafForScalarLayout mem 1 v
-          | .char => encodeLeafForScalarLayout mem 4 v
-          | .int _ =>
-            match intTyTargetBytes layouts ty.kind with
-            | .some sz => encodeLeafForScalarLayout mem sz v
-            | .none => .none
-          | .uint _ =>
-            match intTyTargetBytes layouts ty.kind with
-            | .some sz => encodeLeafForScalarLayout mem sz v
-            | .none => .none
-          | .float w => encodeLeafForScalarLayout mem (floatTyByteWidth w) v
-          | .never =>
-            match v with
-            | .unit | .aggregate 0 .nil => .some .nil
-            | _ => .none
-          | .fnDef _ _ =>
-            match v with
-            | .unit | .aggregate 0 .nil => .some .nil
-            | _ => .none
-          | .tuple .nil =>
-            match v with
-            | .unit | .aggregate 0 .nil => .some .nil
-            | _ => .none
-          | .fnPtr _ _ _ _ => encodeLeafForScalarLayout mem ptrBytes v
-          | .ref _ pt =>
-            match knownWidePointeeTailAux? 8 pt with
-            | .some _ =>
-              match v with
-              | .aggregate 0 (dVal :: mVal :: .nil) =>
-                match
-                  encodeLeafForScalarLayout mem ptrBytes dVal,
-                  encodeLeafForScalarLayout mem ptrBytes mVal
-                with
-                | .some db, .some mb => .some (appendAbstractBytes db mb)
-                | _, _ => .none
-              | _ => .none
-            | .none =>
-              match ptrPointeeMayBeUnsizedAux 8 pt with
-              | false => encodeLeafForScalarLayout mem ptrBytes v
-              | true =>
-                match declPtrToPointeeByteSize? localDecls layouts pt with
-                | .some sz =>
-                  match Nat.beq sz ptrBytes with
-                  | true => encodeLeafForScalarLayout mem ptrBytes v
-                  | false =>
-                    match Nat.beq sz (Nat.mul 2 ptrBytes), v with
-                    | true, .aggregate 0 (dVal :: mVal :: .nil) =>
-                      match
-                        encodeLeafForScalarLayout mem ptrBytes dVal,
-                        encodeLeafForScalarLayout mem ptrBytes mVal
-                      with
-                      | .some db, .some mb => .some (appendAbstractBytes db mb)
-                      | _, _ => .none
-                    | _, _ => .none
-                | .none => .none
-          | .rawPtr _ pt =>
-            match knownWidePointeeTailAux? 8 pt with
-            | .some _ =>
-              match v with
-              | .aggregate 0 (dVal :: mVal :: .nil) =>
-                match
-                  encodeLeafForScalarLayout mem ptrBytes dVal,
-                  encodeLeafForScalarLayout mem ptrBytes mVal
-                with
-                | .some db, .some mb => .some (appendAbstractBytes db mb)
-                | _, _ => .none
-              | _ => .none
-            | .none =>
-              match ptrPointeeMayBeUnsizedAux 8 pt with
-              | false => encodeLeafForScalarLayout mem ptrBytes v
-              | true =>
-                match declPtrToPointeeByteSize? localDecls layouts pt with
-                | .some sz =>
-                  match Nat.beq sz ptrBytes with
-                  | true => encodeLeafForScalarLayout mem ptrBytes v
-                  | false =>
-                    match Nat.beq sz (Nat.mul 2 ptrBytes), v with
-                    | true, .aggregate 0 (dVal :: mVal :: .nil) =>
-                      match
-                        encodeLeafForScalarLayout mem ptrBytes dVal,
-                        encodeLeafForScalarLayout mem ptrBytes mVal
-                      with
-                      | .some db, .some mb => .some (appendAbstractBytes db mb)
-                      | _, _ => .none
-                    | _, _ => .none
-                | .none => .none
-          | .array elem n =>
-            match Nat.beq n 0 with
-            | true =>
-              match v with
-              | .unit | .aggregate 0 .nil => .some .nil
-              | _ => .none
-            | false =>
-              let elemTy : Ty := { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }
-              match exactTyByteSize? localDecls layouts elemTy with
-              | .none => .none
-              | .some elemSz =>
-                match v with
-                | .aggregate 0 elems =>
-                  match Nat.beq (length elems) n with
-                  | true =>
-                    encodeRawArrayElems
-                      (fun ev => encodeRawValueBytes mem localDecls layouts fuel' (.some elemTy) ev)
-                      elemSz
-                      elems
-                  | false => .none
-                | _ => .none
-          | .tuple (k :: .nil) =>
-            let innerTy : Ty := { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
-            match v with
-            | .aggregate 0 (v0 :: .nil) =>
-              encodeRawValueBytes mem localDecls layouts fuel' (.some innerTy) v0
-            | _ => .none
-          | .tuple ks =>
-            match findConsistentDeclLayout? localDecls layouts (.tuple ks) with
-            | .some (lIdx, _) => encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx v
-            | .none => .none
-          | .adt _ _ =>
-            match findConsistentDeclLayout? localDecls layouts ty.kind with
-            | .some (lIdx, _) => encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx v
-            | .none => .none
-          | .closure _ _ =>
-            match findConsistentDeclLayout? localDecls layouts ty.kind with
-            | .some (lIdx, _) => encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx v
-            | .none => .none
-          | _ => .none
-
-/--
-Read the full root `List AbstractByte` image of `ep : ResolvedMemEndpoint`.
--/
-def readRootAbstractBytes
-    (mem : Memory)
-    (ep : ResolvedMemEndpoint) :
-    Option (List AbstractByte) :=
-  match ep.globalAlloc? with
-  | .some gAlloc => globalAllocSliceToAbstractBytes gAlloc 0 ep.allocSize
-  | .none =>
-    match ep.rootSlot? with
-    | .some .uninit => .some (replicateUninitBytes ep.allocSize)
-    | .some (.init rootVal) =>
-      match encodeRawValueBytes mem ep.targetDecls ep.targetLayouts defaultCodecFuel ep.rootTy? rootVal with
-      | .some bs =>
-        match Nat.beq (length bs) ep.allocSize with
-        | true => .some bs
-        | false => .none
-      | .none => .none
-    | _ => .none
-
-/--
 Concatenate two `List Bool`s.
 -/
 @[reducible]
@@ -10862,6 +10470,523 @@ def layoutDataMask (layouts : LayoutTable) : Nat → LayoutIdx → Option (List 
                 | _ => .none
 
 /--
+Test whether every typed slot in a layout-less union's slot list is empty
+(`.unit`, or non-enum `.aggregate 0 .nil`).
+-/
+def allUntypedUnionSlotsEmpty (hasNonZstFieldlessEnum0 : Bool) : List Value → Bool
+  | .nil => true
+  | .unit :: rest => allUntypedUnionSlotsEmpty hasNonZstFieldlessEnum0 rest
+  | .aggregate 0 .nil :: rest =>
+    match hasNonZstFieldlessEnum0 with
+    | true => false
+    | false => allUntypedUnionSlotsEmpty hasNonZstFieldlessEnum0 rest
+  | _ :: _ => false
+
+/--
+Merge ALL non-empty typed union slots into `(buf, bufMask)` using exact
+`fieldLayouts` and `layoutDataMask`, preserving every byte initialized by any
+field (including larger fields after smaller ones or byte-array fields covering
+another field's padding) and failing closed (`.none`) if two slots disagree on a
+non-padding byte.
+-/
+def mergeExactUnionTypedSlots
+    (layouts : LayoutTable)
+    (encodeAt : Nat → Value → Option (List AbstractByte))
+    (maskFuel totalSize : Nat) :
+    List Nat → List Value → List AbstractByte → List Bool → Option (List AbstractByte)
+  | .nil, .nil, buf, _ => .some buf
+  | fIdx :: restIdxs, fv :: restVals, buf, bufMask =>
+    match LayoutTable.lookup layouts fIdx with
+    | .none => .none
+    | .some fl =>
+      match Nat.beq fl.size.bytes 0 with
+      | true =>
+        mergeExactUnionTypedSlots layouts encodeAt maskFuel totalSize restIdxs restVals buf bufMask
+      | false =>
+        match fv with
+        | .unit =>
+          mergeExactUnionTypedSlots layouts encodeAt maskFuel totalSize restIdxs restVals buf bufMask
+        | _ =>
+          match encodeAt fIdx fv, layoutDataMask layouts (.succ maskFuel) fIdx with
+          | .some fBs, .some fMask =>
+            match
+              Bool.and (Nat.beq (length fBs) fl.size.bytes)
+                (Bool.and (Nat.beq (length fMask) fl.size.bytes) (Nat.ble fl.size.bytes totalSize))
+            with
+            | false => .none
+            | true =>
+              match mergeMaskedAbstractBytes buf bufMask fBs fMask with
+              | .none => .none
+              | .some (buf', bufMask') =>
+                mergeExactUnionTypedSlots
+                  layouts encodeAt maskFuel totalSize restIdxs restVals buf' bufMask'
+          | _, _ => .none
+  | _, _, _, _ => .none
+
+/--
+Encode a single leaf value (`.scalar` or `.ptr`) into `expectedSz` raw
+little-endian bytes for a layout slot without `fieldLayouts`.
+-/
+def encodeLeafForScalarLayout
+    (mem : Memory)
+    (expectedSz : Nat) :
+    Value → Option (List AbstractByte)
+  | .scalar sv =>
+    match Nat.beq sv.sizeBytes expectedSz with
+    | true => encodeScalarBytes sv .none
+    | false => .none
+  | .ptr p sz =>
+    match Nat.beq sz expectedSz with
+    | true => encodePtrRawBytes mem p sz
+    | false => .none
+  | _ => .none
+
+/--
+Exact, layout-directed raw abstract-byte encoder for `v` at `layouts.entries[lIdx]`:
+- Fails closed (`.none`) on big-endian `LayoutTable`s (`isLittleEndian = false`).
+- Preserves raw scalar bytes (including invalid `bool`/`char` bit patterns) so
+  `typed_swap_nonoverlapping` observes UB rather than misclassifying as
+  `.unsupported`.
+- Encodes `.arbitrary` structs/tuples strictly from `TypeLayout.fields` +
+  `fieldLayouts` (or validated `.scalar`/memory-ordered `.scalarPair` when
+  `fieldLayouts = .nil`), NEVER guessing field types from generic `args` or
+  packing nested padded structs back-to-back.
+
+Reference (The Rust Reference 1.98.0, "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an array with that item type including alignment padding."
+-/
+def encodeValueAtLayoutIdx
+    (mem : Memory)
+    (layouts : LayoutTable) :
+    Nat → LayoutIdx → Value → Option (List AbstractByte)
+  | .zero, _, _ => .none
+  | .succ fuel', lIdx, v =>
+    match layouts.isLittleEndian with
+    | false => .none
+    | true =>
+      match LayoutTable.lookup layouts lIdx with
+      | .none => .none
+      | .some l =>
+        match Bool.and (TypeLayout.isWellFormed l) (Bool.not l.isUninhabited) with
+        | false => .none
+        | true =>
+          match l.variants with
+          | .empty => .none
+          | .multiple _ _ _ => .none
+          | .single expectedVar =>
+            match l.fields with
+            | .primitive =>
+              match Nat.beq l.size.bytes 0 with
+              | true =>
+                match v with
+                | .unit => .some .nil
+                | .aggregate varIdx .nil =>
+                  match Nat.beq varIdx expectedVar with
+                  | true => .some .nil
+                  | false => .none
+                | _ => .none
+              | false =>
+                match l.backendRepr with
+                | .scalar sl =>
+                  match scalarLayoutTargetByteWidth layouts sl with
+                  | .some w =>
+                    match Nat.beq w l.size.bytes with
+                    | true => encodeLeafForScalarLayout mem l.size.bytes v
+                    | false => .none
+                  | .none => .none
+                | _ => encodeLeafForScalarLayout mem l.size.bytes v
+            | .arbitrary .nil _ =>
+              match v with
+              | .unit => .some (replicateUninitBytes l.size.bytes)
+              | .aggregate varIdx .nil =>
+                match Nat.beq varIdx expectedVar with
+                | true => .some (replicateUninitBytes l.size.bytes)
+                | false => .none
+              | _ => .none
+            | .arbitrary offsets memIdx =>
+              match v with
+              | .aggregate varIdx fieldVals =>
+                match
+                  Bool.and
+                    (Nat.beq varIdx expectedVar)
+                    (Nat.beq (length fieldVals) (length offsets))
+                with
+                | false => .none
+                | true =>
+                  match Nat.beq (length l.fieldLayouts) (length offsets) with
+                  | true =>
+                    encodeFieldsAtOffsetsExactWith
+                      (fun fIdx fv => encodeValueAtLayoutIdx mem layouts fuel' fIdx fv)
+                      (fun fIdx =>
+                        match LayoutTable.lookup layouts fIdx with
+                        | .some fl => .some fl.size.bytes
+                        | .none => .none)
+                      offsets
+                      l.fieldLayouts
+                      fieldVals
+                      (replicateUninitBytes l.size.bytes)
+                  | false =>
+                    match offsets, fieldVals, l.backendRepr with
+                    | off0 :: .nil, v0 :: .nil, .scalar s0 =>
+                      match scalarLayoutTargetByteWidth layouts s0 with
+                      | .some sz0 =>
+                        match encodeLeafForScalarLayout mem sz0 v0 with
+                        | .some b0 =>
+                          writeAbstractBytesAt (replicateUninitBytes l.size.bytes) off0.bytes b0
+                        | .none => .none
+                      | .none => .none
+                    | off0 :: off1 :: .nil, v0 :: v1 :: .nil, .scalarPair s0 s1 =>
+                      match
+                        scalarPairOffsetsValid layouts (off0 :: off1 :: .nil) memIdx s0 s1 l.size.bytes
+                      with
+                      | .some (firstOff, sz0, secondOff, sz1, swapped) =>
+                        let (firstVal, secondVal) :=
+                          match swapped with
+                          | false => (v0, v1)
+                          | true => (v1, v0)
+                        match
+                          encodeLeafForScalarLayout mem sz0 firstVal,
+                          encodeLeafForScalarLayout mem sz1 secondVal
+                        with
+                        | .some b0, .some b1 =>
+                          match writeAbstractBytesAt (replicateUninitBytes l.size.bytes) firstOff b0 with
+                          | .some buf1 => writeAbstractBytesAt buf1 secondOff b1
+                          | .none => .none
+                        | _, _ => .none
+                      | .none => .none
+                    | _, _, _ => .none
+              | _ => .none
+            | .array stride count =>
+              match Nat.beq count 0 with
+              | true =>
+                match Nat.beq l.size.bytes 0 with
+                | false => .none
+                | true =>
+                  match v with
+                  | .unit => .some .nil
+                  | .aggregate varIdx .nil =>
+                    match Nat.beq varIdx expectedVar with
+                    | true => .some .nil
+                    | false => .none
+                  | _ => .none
+              | false =>
+                match Nat.beq l.size.bytes (Nat.mul stride.bytes count) with
+                | false => .none
+                | true =>
+                  match v with
+                  | .aggregate varIdx elems =>
+                    match
+                      Bool.and (Nat.beq varIdx expectedVar) (Nat.beq (length elems) count)
+                    with
+                    | false => .none
+                    | true =>
+                      match l.fieldLayouts with
+                      | elemLIdx :: _ =>
+                        match LayoutTable.lookup layouts elemLIdx with
+                        | .some elemFl =>
+                          match Nat.ble elemFl.size.bytes stride.bytes with
+                          | false => .none
+                          | true =>
+                            encodeArrayElemsAtLayoutIdx
+                              (fun ev => encodeValueAtLayoutIdx mem layouts fuel' elemLIdx ev)
+                              elemFl.size.bytes
+                              stride.bytes
+                              0
+                              elems
+                              (replicateUninitBytes l.size.bytes)
+                        | .none => .none
+                      | .nil => .none
+                  | _ => .none
+            | .union count =>
+              match v with
+              | .unit =>
+                match Nat.beq l.size.bytes 0 with
+                | true => .some .nil
+                | false => .none
+              | .scalar sv =>
+                match Nat.ble sv.sizeBytes l.size.bytes with
+                | false => .none
+                | true =>
+                  match encodeScalarBytes sv .none with
+                  | .some bs => writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 bs
+                  | .none => .none
+              | .ptr p sz =>
+                match Nat.ble sz l.size.bytes with
+                | false => .none
+                | true =>
+                  match encodePtrRawBytes mem p sz with
+                  | .some bs => writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 bs
+                  | .none => .none
+              | .aggregate varIdx fieldVals =>
+                match Nat.beq varIdx 0 with
+                | false => .none
+                | true =>
+                  match splitUnionTypedAndOverlay count fieldVals with
+                  | .none => .none
+                  | .some (typedVals, overlayOpt) =>
+                    match overlayOpt with
+                    | .some rawVals =>
+                      match
+                        Bool.and
+                          (Nat.beq (length rawVals) l.size.bytes)
+                          (Nat.ble
+                            (unionNonUnitNonZstTypedSlotCount layouts count l.fieldLayouts typedVals)
+                            1)
+                      with
+                      | false => .none
+                      | true =>
+                        match overlayRawAbstractByteVals rawVals (replicateUninitBytes l.size.bytes) with
+                        | .none => .none
+                        | .some rawImg =>
+                          match Nat.beq (length l.fieldLayouts) (length typedVals) with
+                          | true =>
+                            mergeExactUnionTypedSlots
+                              layouts
+                              (fun fIdx fv => encodeValueAtLayoutIdx mem layouts fuel' fIdx fv)
+                              fuel'
+                              l.size.bytes
+                              l.fieldLayouts
+                              typedVals
+                              rawImg
+                              (replicateBool l.size.bytes true)
+                          | false =>
+                            match
+                              allUntypedUnionSlotsEmpty
+                                (layoutEntriesHaveNonZstFieldlessEnum0 layouts.entries)
+                                typedVals
+                            with
+                            | true => .some rawImg
+                            | false => .none
+                    | .none =>
+                      match Nat.beq (length l.fieldLayouts) (length typedVals) with
+                      | true =>
+                        mergeExactUnionTypedSlots
+                          layouts
+                          (fun fIdx fv => encodeValueAtLayoutIdx mem layouts fuel' fIdx fv)
+                          fuel'
+                          l.size.bytes
+                          l.fieldLayouts
+                          typedVals
+                          (replicateUninitBytes l.size.bytes)
+                          (replicateBool l.size.bytes false)
+                      | false =>
+                        let hasEnum0 := layoutEntriesHaveNonZstFieldlessEnum0 layouts.entries
+                        match allUntypedUnionSlotsEmpty hasEnum0 typedVals with
+                        | true => .some (replicateUninitBytes l.size.bytes)
+                        | false =>
+                          -- Untyped union payload (e.g., `MaybeUninit<[u8; N]>` without fieldLayouts):
+                          -- accept only leaf or homogeneous flat-array payloads.
+                          let payloadOpt : Option Value :=
+                            match typedVals with
+                            | fv :: .nil => .some fv
+                            | .unit :: fv :: .nil => .some fv
+                            | .aggregate 0 .nil :: fv :: .nil =>
+                              match hasEnum0 with
+                              | true => .none
+                              | false => .some fv
+                            | _ => .none
+                          match payloadOpt with
+                          | .none => .none
+                          | .some pv =>
+                            match encodeUntypedLeafOrArrayExact mem pv with
+                            | .some bs =>
+                              match Nat.ble (length bs) l.size.bytes with
+                              | true => writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 bs
+                              | false => .none
+                            | .none => .none
+
+/--
+Encode array elements for a known element `RigidTy` when no `TypeLayout` entry
+with `fieldLayouts` is present.
+-/
+def encodeRawArrayElems
+    (encodeElem : Value → Option (List AbstractByte))
+    (elemSz : Nat) :
+    List Value → Option (List AbstractByte)
+  | .nil => .some .nil
+  | ev :: rest =>
+    match encodeElem ev, encodeRawArrayElems encodeElem elemSz rest with
+    | .some eb, .some rb =>
+      match Nat.beq (length eb) elemSz with
+      | true => .some (appendAbstractBytes eb rb)
+      | false => .none
+    | _, _ => .none
+
+/--
+Exact raw byte encoder for `v : Value` at optional `tyOpt : Option Ty`,
+preserving invalid scalar bit patterns and `.uninit` sub-values, enforcing
+little-endianness, and never guessing sequential layouts for `>= 2`-field tuples
+or unlaid-out ADTs.
+-/
+def encodeRawValueBytes
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Nat → Option Ty → Value → Option (List AbstractByte)
+  | .zero, _, _ => .none
+  | .succ fuel', tyOpt, v =>
+    match layouts.isLittleEndian with
+    | false => .none
+    | true =>
+      match tyOpt with
+      | .none => encodeUntypedLeafOrArrayExact mem v
+      | .some ty =>
+        let ptrBytes := layoutPointerBytes layouts
+        match consistentExplicitLayout? layouts ty with
+        | .some (lIdx, _) => encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx v
+        | .none =>
+          match ty.kind with
+          | .bool => encodeLeafForScalarLayout mem 1 v
+          | .char => encodeLeafForScalarLayout mem 4 v
+          | .int _ =>
+            match intTyTargetBytes layouts ty.kind with
+            | .some sz => encodeLeafForScalarLayout mem sz v
+            | .none => .none
+          | .uint _ =>
+            match intTyTargetBytes layouts ty.kind with
+            | .some sz => encodeLeafForScalarLayout mem sz v
+            | .none => .none
+          | .float w => encodeLeafForScalarLayout mem (floatTyByteWidth w) v
+          | .never =>
+            match v with
+            | .unit | .aggregate 0 .nil => .some .nil
+            | _ => .none
+          | .fnDef _ _ =>
+            match v with
+            | .unit | .aggregate 0 .nil => .some .nil
+            | _ => .none
+          | .tuple .nil =>
+            match v with
+            | .unit | .aggregate 0 .nil => .some .nil
+            | _ => .none
+          | .fnPtr _ _ _ _ => encodeLeafForScalarLayout mem ptrBytes v
+          | .ref _ pt =>
+            match knownWidePointeeTailAux? 8 pt with
+            | .some _ =>
+              match v with
+              | .aggregate 0 (dVal :: mVal :: .nil) =>
+                match
+                  encodeLeafForScalarLayout mem ptrBytes dVal,
+                  encodeLeafForScalarLayout mem ptrBytes mVal
+                with
+                | .some db, .some mb => .some (appendAbstractBytes db mb)
+                | _, _ => .none
+              | _ => .none
+            | .none =>
+              match ptrPointeeMayBeUnsizedAux 8 pt with
+              | false => encodeLeafForScalarLayout mem ptrBytes v
+              | true =>
+                match declPtrToPointeeByteSize? localDecls layouts pt with
+                | .some sz =>
+                  match Nat.beq sz ptrBytes with
+                  | true => encodeLeafForScalarLayout mem ptrBytes v
+                  | false =>
+                    match Nat.beq sz (Nat.mul 2 ptrBytes), v with
+                    | true, .aggregate 0 (dVal :: mVal :: .nil) =>
+                      match
+                        encodeLeafForScalarLayout mem ptrBytes dVal,
+                        encodeLeafForScalarLayout mem ptrBytes mVal
+                      with
+                      | .some db, .some mb => .some (appendAbstractBytes db mb)
+                      | _, _ => .none
+                    | _, _ => .none
+                | .none => .none
+          | .rawPtr _ pt =>
+            match knownWidePointeeTailAux? 8 pt with
+            | .some _ =>
+              match v with
+              | .aggregate 0 (dVal :: mVal :: .nil) =>
+                match
+                  encodeLeafForScalarLayout mem ptrBytes dVal,
+                  encodeLeafForScalarLayout mem ptrBytes mVal
+                with
+                | .some db, .some mb => .some (appendAbstractBytes db mb)
+                | _, _ => .none
+              | _ => .none
+            | .none =>
+              match ptrPointeeMayBeUnsizedAux 8 pt with
+              | false => encodeLeafForScalarLayout mem ptrBytes v
+              | true =>
+                match declPtrToPointeeByteSize? localDecls layouts pt with
+                | .some sz =>
+                  match Nat.beq sz ptrBytes with
+                  | true => encodeLeafForScalarLayout mem ptrBytes v
+                  | false =>
+                    match Nat.beq sz (Nat.mul 2 ptrBytes), v with
+                    | true, .aggregate 0 (dVal :: mVal :: .nil) =>
+                      match
+                        encodeLeafForScalarLayout mem ptrBytes dVal,
+                        encodeLeafForScalarLayout mem ptrBytes mVal
+                      with
+                      | .some db, .some mb => .some (appendAbstractBytes db mb)
+                      | _, _ => .none
+                    | _, _ => .none
+                | .none => .none
+          | .array elem n =>
+            match Nat.beq n 0 with
+            | true =>
+              match v with
+              | .unit | .aggregate 0 .nil => .some .nil
+              | _ => .none
+            | false =>
+              let elemTy : Ty := { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }
+              match exactTyByteSize? localDecls layouts elemTy with
+              | .none => .none
+              | .some elemSz =>
+                match v with
+                | .aggregate 0 elems =>
+                  match Nat.beq (length elems) n with
+                  | true =>
+                    encodeRawArrayElems
+                      (fun ev => encodeRawValueBytes mem localDecls layouts fuel' (.some elemTy) ev)
+                      elemSz
+                      elems
+                  | false => .none
+                | _ => .none
+          | .tuple (k :: .nil) =>
+            let innerTy : Ty := { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
+            match v with
+            | .aggregate 0 (v0 :: .nil) =>
+              encodeRawValueBytes mem localDecls layouts fuel' (.some innerTy) v0
+            | _ => .none
+          | .tuple ks =>
+            match findConsistentDeclLayout? localDecls layouts (.tuple ks) with
+            | .some (lIdx, _) => encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx v
+            | .none => .none
+          | .adt _ _ =>
+            match findConsistentDeclLayout? localDecls layouts ty.kind with
+            | .some (lIdx, _) => encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx v
+            | .none => .none
+          | .closure _ _ =>
+            match findConsistentDeclLayout? localDecls layouts ty.kind with
+            | .some (lIdx, _) => encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx v
+            | .none => .none
+          | _ => .none
+
+/--
+Read the full root `List AbstractByte` image of `ep : ResolvedMemEndpoint`.
+-/
+def readRootAbstractBytes
+    (mem : Memory)
+    (ep : ResolvedMemEndpoint) :
+    Option (List AbstractByte) :=
+  match ep.globalAlloc? with
+  | .some gAlloc => globalAllocSliceToAbstractBytes gAlloc 0 ep.allocSize
+  | .none =>
+    match ep.rootSlot? with
+    | .some .uninit => .some (replicateUninitBytes ep.allocSize)
+    | .some (.init rootVal) =>
+      match encodeRawValueBytes mem ep.targetDecls ep.targetLayouts defaultCodecFuel ep.rootTy? rootVal with
+      | .some bs =>
+        match Nat.beq (length bs) ep.allocSize with
+        | true => .some bs
+        | false => .none
+      | .none => .none
+    | _ => .none
+
+/--
 Apply a data mask `mask` to `bytes`: keep bytes where `mask[i] = true` and reset
 padding bytes where `mask[i] = false` to `AbstractByte.uninit`.
 -/
@@ -10978,861 +11103,6 @@ def validRangeCoversAllNonNull (ptrBytes : Nat) (r : WrappingRange) : Bool :=
   match Nat.ble r.start r.end_ with
   | true => Bool.and (Nat.ble r.start 1) (Nat.ble maxVal r.end_)
   | false => Nat.ble r.start (Nat.add r.end_ 1)
-
-/--
-Decode a single scalar or pointer `Value` from `bytes` according to target-aware
-`ScalarLayout` `sl` (allowing `Value.uninit` when all bytes are `.uninit` in a
-`.union` scalar layout or when `allowUninit = true`). Rejects fragmented/mixed
-provenance when `sl` excludes any bit pattern and enforces `validRange` /
-`validRangeCoversAllNonNull`.
--/
-def decodeScalarLayoutBytesTarget
-    (mem : Memory)
-    (layouts : LayoutTable)
-    (sl : ScalarLayout)
-    (_allowUninit : Bool)
-    (bytes : List AbstractByte) :
-    Option Value :=
-  match layouts.isLittleEndian with
-  | false => .none
-  | true =>
-    match scalarLayoutTargetByteWidth layouts sl with
-    | .none => .none
-    | .some expectedSz =>
-      match Nat.beq (length bytes) expectedSz with
-      | false => .none
-      | true =>
-        match allBytesUninit bytes with
-        | true => .none
-        | false =>
-          match hasUninitByte bytes with
-          | true => .none
-          | false =>
-            match sl with
-            | .union pk =>
-              match allBytesSameProv bytes, decodeScalarBytes bytes false with
-              | .some (.some (a, _)), .some (sv, _) =>
-                match pk with
-                | .pointer _ =>
-                  .some (.ptr { allocId := a, offsetBytes := sv.bits } expectedSz)
-                | _ => .none
-              | .some .none, .some (sv, _) =>
-                .some (.scalar sv)
-              | _, _ => .none
-            | .initialized pk validRange =>
-              match pk with
-              | .pointer _ =>
-                match allBytesSameProv bytes, decodeScalarBytes bytes false with
-                | .some (.some (a, _)), .some (sv, _) =>
-                  match
-                    Bool.and (Nat.beq a 0) (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := sv.bits }))
-                  with
-                  | true =>
-                    match wrappingRangeContains validRange sv.bits with
-                    | true => .some (.ptr { allocId := 0, offsetBytes := sv.bits } expectedSz)
-                    | false => .none
-                  | false =>
-                    match validRangeCoversAllNonNull expectedSz validRange with
-                    | true => .some (.ptr { allocId := a, offsetBytes := sv.bits } expectedSz)
-                    | false => .none
-                | .some .none, .some (sv, _) =>
-                  match wrappingRangeContains validRange sv.bits with
-                  | true => .some (.ptr { allocId := 0, offsetBytes := sv.bits } expectedSz)
-                  | false => .none
-                | _, _ => .none
-              | _ =>
-                match bytesHaveRealProvenance mem bytes with
-                | true => .none
-                | false =>
-                  match decodeScalarBytes bytes false with
-                  | .some (sv, _) =>
-                    match wrappingRangeContains validRange sv.bits with
-                    | true => .some (.scalar sv)
-                    | false => .none
-                  | .none => .none
-
-/--
-Decode `FieldsShape.arbitrary` fields strictly by `fieldLayouts` at `offsets`.
--/
-def decodeFieldsAtLayoutIdxs
-    (decodeAt : LayoutIdx → List AbstractByte → Option Value)
-    (layouts : LayoutTable)
-    (bytes : List AbstractByte) :
-    List Size → List Nat → Option (List Value)
-  | .nil, .nil => .some .nil
-  | off :: restOffs, fIdx :: restIdxs =>
-    match LayoutTable.lookup layouts fIdx with
-    | .none => .none
-    | .some fl =>
-      match sliceAbstractBytes bytes off.bytes fl.size.bytes with
-      | .none => .none
-      | .some slice =>
-        match decodeAt fIdx slice, decodeFieldsAtLayoutIdxs decodeAt layouts bytes restOffs restIdxs with
-        | .some fv, .some fvs => .some (fv :: fvs)
-        | _, _ => .none
-  | _, _ => .none
-
-/--
-Decode `count` array chunks at `stride` starting from `curOff`.
--/
-def decodeArrayElemsAtLayoutIdx
-    (decodeElem : List AbstractByte → Option Value)
-    (bytes : List AbstractByte)
-    (elemSize stride curOff : Nat) :
-    Nat → Option (List Value)
-  | .zero => .some .nil
-  | .succ rem =>
-    match sliceAbstractBytes bytes curOff elemSize with
-    | .none => .none
-    | .some slice =>
-      match
-        decodeElem slice,
-        decodeArrayElemsAtLayoutIdx decodeElem bytes elemSize stride (Nat.add curOff stride) rem
-      with
-      | .some ev, .some evs => .some (ev :: evs)
-      | _, _ => .none
-
-/--
-Decode every field of a union from offset `0` using `fieldLayouts`, demoting any
-field whose bytes cannot decode as a valid value (or ZST fields) to `.unit`
-(matching `V2026_08_01.MirSemantics.Bytes.decodeUnionFieldsByLayoutIdxs`, since
-`V2026_08_01` has no `Value.uninit` constructor).
--/
-def decodeUnionFieldsAtLayoutIdxs
-    (decodeAt : LayoutIdx → List AbstractByte → Option Value)
-    (layouts : LayoutTable)
-    (bytes : List AbstractByte) :
-    List Nat → List Value
-  | .nil => .nil
-  | fIdx :: rest =>
-    let fv : Value :=
-      match LayoutTable.lookup layouts fIdx with
-      | .none => .unit
-      | .some fl =>
-        match Nat.beq fl.size.bytes 0 with
-        | true => .unit
-        | false =>
-          match sliceAbstractBytes bytes 0 fl.size.bytes with
-          | .some slice =>
-            match decodeAt fIdx slice with
-            | .some v => v
-            | .none => .unit
-          | .none => .unit
-    fv :: decodeUnionFieldsAtLayoutIdxs decodeAt layouts bytes rest
-
-/--
-Exact layout-directed decoder (`decodeValueAtLayoutIdx`), mirroring
-`encodeValueAtLayoutIdx`:
-- Fails closed (`.none`) on big-endian `LayoutTable`s.
-- Decodes ADTs/structs/tuples/arrays strictly from `TypeLayout.fields`,
-  `fieldLayouts`, and `backendRepr` (in memory order for `.scalarPair`).
-- In `V2026_08_01` (which has no `Value.uninit` constructor), wholly-`.uninit`
-  sub-values fail closed (`.none`) while whole-local uninit commits as
-  `LocalSlot.uninit` in `commitRootAbstractBytes`.
--/
-def decodeValueAtLayoutIdx
-    (mem : Memory)
-    (layouts : LayoutTable)
-    (allowPartialUninit : Bool) :
-    Nat → LayoutIdx → List AbstractByte → Option Value
-  | .zero, _, _ => .none
-  | .succ fuel', lIdx, bytes =>
-    match layouts.isLittleEndian with
-    | false => .none
-    | true =>
-      match LayoutTable.lookup layouts lIdx with
-      | .none => .none
-      | .some l =>
-        match
-          Bool.and (TypeLayout.isWellFormed l)
-            (Bool.and (Bool.not l.isUninhabited) (Nat.beq (length bytes) l.size.bytes))
-        with
-        | false => .none
-        | true =>
-          match l.variants with
-          | .empty => .none
-          | .multiple _ _ _ => .none
-          | .single varIdx =>
-            match l.fields with
-            | .primitive =>
-              match Nat.beq l.size.bytes 0 with
-              | true => .some .unit
-              | false =>
-                match l.backendRepr with
-                | .scalar s0 =>
-                  decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit bytes
-                | _ =>
-                  match allBytesUninit bytes with
-                  | true => .none
-                  | false =>
-                    match bytesHaveRealProvenance mem bytes with
-                    | true => .none
-                    | false =>
-                      match decodeScalarBytes bytes false with
-                      | .some (sv, _) => .some (.scalar sv)
-                      | .none => .none
-            | .arbitrary .nil _ => .some (.aggregate varIdx .nil)
-            | .arbitrary offsets memIdx =>
-              match allBytesUninit bytes with
-              | true => .none
-              | false =>
-                match Nat.beq (length l.fieldLayouts) (length offsets) with
-                | true =>
-                  match
-                    decodeFieldsAtLayoutIdxs
-                      (fun fIdx bs =>
-                        decodeValueAtLayoutIdx mem layouts allowPartialUninit fuel' fIdx bs)
-                      layouts
-                      bytes
-                      offsets
-                      l.fieldLayouts
-                  with
-                  | .some vals => .some (.aggregate varIdx vals)
-                  | .none => .none
-                | false =>
-                  match offsets, l.backendRepr with
-                  | off0 :: .nil, .scalar s0 =>
-                    match scalarLayoutTargetByteWidth layouts s0 with
-                    | .some sz0 =>
-                      match sliceAbstractBytes bytes off0.bytes sz0 with
-                      | .some sl0 =>
-                        match decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit sl0 with
-                        | .some v0 => .some (.aggregate varIdx (v0 :: .nil))
-                        | .none => .none
-                      | .none => .none
-                    | .none => .none
-                  | off0 :: off1 :: .nil, .scalarPair s0 s1 =>
-                    match
-                      scalarPairOffsetsValid layouts (off0 :: off1 :: .nil) memIdx s0 s1 l.size.bytes
-                    with
-                    | .some (firstOff, sz0, secondOff, sz1, swapped) =>
-                      match
-                        sliceAbstractBytes bytes firstOff sz0,
-                        sliceAbstractBytes bytes secondOff sz1
-                      with
-                      | .some sl0, .some sl1 =>
-                        match
-                          decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit sl0,
-                          decodeScalarLayoutBytesTarget mem layouts s1 allowPartialUninit sl1
-                        with
-                        | .some vFirst, .some vSecond =>
-                          match swapped with
-                          | false => .some (.aggregate varIdx (vFirst :: vSecond :: .nil))
-                          | true => .some (.aggregate varIdx (vSecond :: vFirst :: .nil))
-                        | _, _ => .none
-                      | _, _ => .none
-                    | .none => .none
-                  | _, _ => .none
-            | .array stride count =>
-              match Nat.beq count 0 with
-              | true => .some (.aggregate varIdx .nil)
-              | false =>
-                match Nat.beq l.size.bytes (Nat.mul stride.bytes count) with
-                | false => .none
-                | true =>
-                  match l.fieldLayouts with
-                  | elemLIdx :: _ =>
-                    match LayoutTable.lookup layouts elemLIdx with
-                    | .some elemFl =>
-                      match Nat.ble elemFl.size.bytes stride.bytes with
-                      | false => .none
-                      | true =>
-                        match
-                          decodeArrayElemsAtLayoutIdx
-                            (fun bs =>
-                              decodeValueAtLayoutIdx mem layouts allowPartialUninit fuel' elemLIdx bs)
-                            bytes
-                            elemFl.size.bytes
-                            stride.bytes
-                            0
-                            count
-                        with
-                        | .some vals => .some (.aggregate varIdx vals)
-                        | .none => .none
-                    | .none => .none
-                  | .nil => .none
-            | .union _ =>
-              match allBytesUninit bytes with
-              | true => .none
-              | false =>
-                match l.fieldLayouts with
-                | fHead :: fTail =>
-                  let vals :=
-                    decodeUnionFieldsAtLayoutIdxs
-                      (fun fIdx bs =>
-                        decodeValueAtLayoutIdx mem layouts true fuel' fIdx bs)
-                      layouts
-                      bytes
-                      (fHead :: fTail)
-                  .some (.aggregate varIdx vals)
-                | .nil =>
-                  match l.backendRepr with
-                  | .scalar s0 =>
-                    decodeScalarLayoutBytesTarget mem layouts s0 true bytes
-                  | _ => .none
-
-/--
-Decode array chunks using `decodeElem`, returning `.none` if any chunk fails.
--/
-def decodePartialUninitArrayChunks
-    (decodeElem : List AbstractByte → Option Value)
-    (elemSz : Nat) :
-    Nat → List AbstractByte → Option (List Value)
-  | .zero, .nil => .some .nil
-  | .succ rem, bs =>
-    let chunk := takeAbstractBytes elemSz bs
-    let rest := dropAbstractBytes elemSz bs
-    match Nat.beq (length chunk) elemSz with
-    | false => .none
-    | true =>
-      match decodeElem chunk, decodePartialUninitArrayChunks decodeElem elemSz rem rest with
-      | .some ev, .some evs => .some (ev :: evs)
-      | _, _ => .none
-  | _, _ => .none
-
-/--
-Decode a single thin pointer byte slice of width `ptrBytes` (for raw ptr, ref,
-or fnPtr).
--/
-def decodeThinPtrBytes
-    (mem : Memory)
-    (ptrBytes : Nat)
-    (requireNonNull : Bool)
-    (_allowUninit : Bool)
-    (bytes : List AbstractByte) :
-    Option Value :=
-  match Nat.beq (length bytes) ptrBytes with
-  | false => .none
-  | true =>
-    match allBytesUninit bytes with
-    | true => .none
-    | false =>
-      match allBytesSameProv bytes, decodeScalarBytes bytes false with
-      | .some (.some (a, _)), .some (sv, _) =>
-        match
-          Bool.and requireNonNull
-            (Bool.and (Nat.beq a 0)
-              (Bool.and (Nat.beq sv.bits 0)
-                (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := 0 }))))
-        with
-        | true => .none
-        | false => .some (.ptr { allocId := a, offsetBytes := sv.bits } ptrBytes)
-      | .some .none, .some (sv, _) =>
-        match Bool.and requireNonNull (Nat.beq sv.bits 0) with
-        | true => .none
-        | false => .some (.ptr { allocId := 0, offsetBytes := sv.bits } ptrBytes)
-      | _, _ => .none
-
-/--
-Decode a `List AbstractByte` into a `Value` for committing into a stack
-`LocalSlot`, allowing `Value.uninit` in byte arrays (`[u8; N]`), unions, and
-wholly-uninit aggregate fields (so padding resets on stack byte buffers round-trip
-cleanly), while rejecting half-uninit scalars, bit-invalid `bool`/`char`, and
-provenance-in-integer writes (guarded downstream by `abstractBytesRefine`).
--/
-def decodePartialUninitValue
-    (mem : Memory)
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (allowUninitLeaf : Bool) :
-    Nat → Option Ty → List AbstractByte → Option Value
-  | .zero, _, _ => .none
-  | .succ fuel', tyOpt, bytes =>
-    match layouts.isLittleEndian with
-    | false => .none
-    | true =>
-      match tyOpt with
-      | .none =>
-        match bytes with
-        | .nil => .some .unit
-        | _ :: _ =>
-          match bytesHaveRealProvenance mem bytes with
-          | true =>
-            let ptrBytes := layoutPointerBytes layouts
-            match Nat.beq (length bytes) ptrBytes with
-            | true => decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes
-            | false => .none
-          | false =>
-            match hasUninitByte bytes with
-            | true => .none
-            | false =>
-              match decodeScalarBytes bytes false with
-              | .some (sv, _) => .some (.scalar sv)
-              | .none => .none
-      | .some ty =>
-        let ptrBytes := layoutPointerBytes layouts
-        match consistentExplicitLayout? layouts ty with
-        | .some (lIdx, l) =>
-          match ty.kind with
-          | .bool =>
-            match bytes with
-            | .uninit :: .nil => .none
-            | .init b .none :: .nil =>
-              let n := b.toBitVec.toNat
-              match Nat.ble n 1 with
-              | true => .some (.scalar ⟨n, 1⟩)
-              | false => .none
-            | _ => .none
-          | .char =>
-            match Nat.beq (length bytes) 4 with
-            | false => .none
-            | true =>
-              match allBytesUninit bytes with
-              | true => .none
-              | false =>
-                match bytesHaveRealProvenance mem bytes with
-                | true => .none
-                | false =>
-                  match decodeScalarBytes bytes false with
-                  | .some (sv, _) =>
-                    match isValidCharCode sv.bits with
-                    | true => .some (.scalar sv)
-                    | false => .none
-                  | .none => .none
-          | .array (.uint .u8) n =>
-            match Nat.beq (length bytes) n with
-            | false => .none
-            | true =>
-              match
-                decodePartialUninitArrayChunks
-                  (fun chunk =>
-                    match chunk with
-                    | .uninit :: .nil => .none
-                    | .init b .none :: .nil => .some (.scalar ⟨b.toBitVec.toNat, 1⟩)
-                    | _ => .none)
-                  1
-                  n
-                  bytes
-              with
-              | .some elems => .some (.aggregate 0 elems)
-              | .none => .none
-          | _ =>
-            let allowSub : Bool :=
-              match l.fields with
-              | .union _ => true
-              | .array _ _ => true
-              | .arbitrary _ _ => true
-              | .primitive => allowUninitLeaf
-            decodeValueAtLayoutIdx mem layouts allowSub (.succ fuel') lIdx bytes
-        | .none =>
-          match ty.kind with
-          | .bool =>
-            match bytes with
-            | .uninit :: .nil => .none
-            | .init b .none :: .nil =>
-              let n := b.toBitVec.toNat
-              match Nat.ble n 1 with
-              | true => .some (.scalar ⟨n, 1⟩)
-              | false => .none
-            | _ => .none
-          | .char =>
-            match Nat.beq (length bytes) 4 with
-            | false => .none
-            | true =>
-              match allBytesUninit bytes with
-              | true => .none
-              | false =>
-                match bytesHaveRealProvenance mem bytes with
-                | true => .none
-                | false =>
-                  match decodeScalarBytes bytes false with
-                  | .some (sv, _) =>
-                    match isValidCharCode sv.bits with
-                    | true => .some (.scalar sv)
-                    | false => .none
-                  | .none => .none
-          | .int _ | .uint _ =>
-            match intTyTargetBytes layouts ty.kind with
-            | .none => .none
-            | .some sz =>
-              match Nat.beq (length bytes) sz with
-              | false => .none
-              | true =>
-                match allBytesUninit bytes with
-                | true => .none
-                | false =>
-                  match bytesHaveRealProvenance mem bytes with
-                  | true => .none
-                  | false =>
-                    match decodeScalarBytes bytes false with
-                    | .some (sv, _) => .some (.scalar sv)
-                    | .none => .none
-          | .float w =>
-            let sz := floatTyByteWidth w
-            match Nat.beq (length bytes) sz with
-            | false => .none
-            | true =>
-              match allBytesUninit bytes with
-              | true => .none
-              | false =>
-                match bytesHaveRealProvenance mem bytes with
-                | true => .none
-                | false =>
-                  match decodeScalarBytes bytes false with
-                  | .some (sv, _) => .some (.scalar sv)
-                  | .none => .none
-          | .tuple .nil | .fnDef _ _ =>
-            match bytes with
-            | .nil => .some .unit
-            | _ :: _ => .none
-          | .never => .none
-          | .fnPtr _ _ _ _ => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
-          | .ref _ pt =>
-            match knownWidePointeeTailAux? 8 pt with
-            | .some tailTy =>
-              match Nat.beq (length bytes) (Nat.mul 2 ptrBytes) with
-              | false => .none
-              | true =>
-                match allBytesUninit bytes with
-                | true => .none
-                | false =>
-                  let dBs := takeAbstractBytes ptrBytes bytes
-                  let mBs := dropAbstractBytes ptrBytes bytes
-                  match
-                    decodeThinPtrBytes mem ptrBytes true false dBs,
-                    match tailTy with
-                    | .dynamic _ => decodeThinPtrBytes mem ptrBytes true false mBs
-                    | _ =>
-                      match bytesHaveRealProvenance mem mBs with
-                      | true => .none
-                      | false =>
-                        match decodeScalarBytes mBs false with
-                        | .some (msv, _) => .some (.scalar msv)
-                        | .none => .none
-                  with
-                  | .some dv, .some mv => .some (.aggregate 0 (dv :: mv :: .nil))
-                  | _, _ => .none
-            | .none =>
-              match ptrPointeeMayBeUnsizedAux 8 pt with
-              | false => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
-              | true =>
-                match declPtrToPointeeByteSize? localDecls layouts pt with
-                | .some sz =>
-                  match Nat.beq sz ptrBytes with
-                  | true => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
-                  | false => .none
-                | .none => .none
-          | .rawPtr _ pt =>
-            match knownWidePointeeTailAux? 8 pt with
-            | .some tailTy =>
-              match Nat.beq (length bytes) (Nat.mul 2 ptrBytes) with
-              | false => .none
-              | true =>
-                match allBytesUninit bytes with
-                | true => .none
-                | false =>
-                  let dBs := takeAbstractBytes ptrBytes bytes
-                  let mBs := dropAbstractBytes ptrBytes bytes
-                  match
-                    decodeThinPtrBytes mem ptrBytes false false dBs,
-                    match tailTy with
-                    | .dynamic _ => decodeThinPtrBytes mem ptrBytes true false mBs
-                    | _ =>
-                      match bytesHaveRealProvenance mem mBs with
-                      | true => .none
-                      | false =>
-                        match decodeScalarBytes mBs false with
-                        | .some (msv, _) => .some (.scalar msv)
-                        | .none => .none
-                  with
-                  | .some dv, .some mv => .some (.aggregate 0 (dv :: mv :: .nil))
-                  | _, _ => .none
-            | .none =>
-              match ptrPointeeMayBeUnsizedAux 8 pt with
-              | false => decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes
-              | true =>
-                match declPtrToPointeeByteSize? localDecls layouts pt with
-                | .some sz =>
-                  match Nat.beq sz ptrBytes with
-                  | true => decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes
-                  | false => .none
-                | .none => .none
-          | .array elem n =>
-            match Nat.beq n 0 with
-            | true =>
-              match bytes with
-              | .nil => .some (.aggregate 0 .nil)
-              | _ :: _ => .none
-            | false =>
-              let elemTy : Ty := { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }
-              match exactTyByteSize? localDecls layouts elemTy with
-              | .none => .none
-              | .some elemSz =>
-                match Nat.beq (length bytes) (Nat.mul elemSz n) with
-                | false => .none
-                | true =>
-                  let allowElemUninit : Bool :=
-                    match elem with
-                    | .uint .u8 => true
-                    | _ => allowUninitLeaf
-                  match
-                    decodePartialUninitArrayChunks
-                      (fun chunk =>
-                        decodePartialUninitValue
-                          mem localDecls layouts allowElemUninit fuel' (.some elemTy) chunk)
-                      elemSz
-                      n
-                      bytes
-                  with
-                  | .some elems => .some (.aggregate 0 elems)
-                  | .none => .none
-          | .tuple (k :: .nil) =>
-            let innerTy : Ty := { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
-            match
-              decodePartialUninitValue mem localDecls layouts allowUninitLeaf fuel' (.some innerTy) bytes
-            with
-            | .some v0 => .some (.aggregate 0 (v0 :: .nil))
-            | .none => .none
-          | .tuple ks =>
-            match findConsistentDeclLayout? localDecls layouts (.tuple ks) with
-            | .some (lIdx, _) => decodeValueAtLayoutIdx mem layouts true (.succ fuel') lIdx bytes
-            | .none => .none
-          | .adt _ _ =>
-            match findConsistentDeclLayout? localDecls layouts ty.kind with
-            | .some (lIdx, _) => decodeValueAtLayoutIdx mem layouts true (.succ fuel') lIdx bytes
-            | .none => .none
-          | .closure _ _ =>
-            match findConsistentDeclLayout? localDecls layouts ty.kind with
-            | .some (lIdx, _) => decodeValueAtLayoutIdx mem layouts true (.succ fuel') lIdx bytes
-            | .none => .none
-          | _ => .none
-
-/--
-Convert a `List AbstractByte` into `List (Option UInt8)` for a global
-`CapturedAllocation`.
--/
-def abstractBytesToGlobalOptBytes : List AbstractByte → List (Option UInt8)
-  | .nil => .nil
-  | .uninit :: rest => .none :: abstractBytesToGlobalOptBytes rest
-  | .init b _ :: rest => .some b :: abstractBytesToGlobalOptBytes rest
-
-/--
-Build global relocation records `(byteOffset, ProvenancePtr)` from `bytes` using
-pointer word size `ptrBytes`. Downstream `commitRootAbstractBytes` re-reads
-`globalAllocSliceToAbstractBytes` and enforces `abstractBytesEq`, so any partial
-pointer or 32-bit relocation width mismatch fails closed `.unsupported`.
--/
-def buildGlobalRelocsAux (ptrBytes : Nat) : Nat → Nat → List AbstractByte → List (Nat × ProvenancePtr)
-  | _, _, .nil => .nil
-  | off, .succ skip, _ :: rest => buildGlobalRelocsAux ptrBytes (Nat.add off 1) skip rest
-  | off, .zero, b :: rest =>
-    match b with
-    | .init _ (.some (a, _)) =>
-      let window := takeAbstractBytes ptrBytes (b :: rest)
-      match Nat.beq (length window) ptrBytes, allBytesSameProv window with
-      | true, .some (.some (a', _)) =>
-        match Nat.beq a a', ptrBytes with
-        | true, .succ ptrBytes' =>
-          (off, { allocId := a, offsetBytes := 0 }) ::
-            buildGlobalRelocsAux ptrBytes (Nat.add off 1) ptrBytes' rest
-        | _, _ => buildGlobalRelocsAux ptrBytes (Nat.add off 1) 0 rest
-      | _, _ => buildGlobalRelocsAux ptrBytes (Nat.add off 1) 0 rest
-    | _ => buildGlobalRelocsAux ptrBytes (Nat.add off 1) 0 rest
-
-/--
-Replace the `CapturedAllocation` with `allocId` in `globals`.
--/
-def updateGlobalAllocById
-    (allocId : AllocId)
-    (updated : CapturedAllocation) :
-    List CapturedAllocation → Option (List CapturedAllocation)
-  | .nil => .none
-  | g :: rest =>
-    match Nat.beq g.allocId allocId with
-    | true => .some (updated :: rest)
-    | false =>
-      match updateGlobalAllocById allocId updated rest with
-      | .some rest' => .some (g :: rest')
-      | .none => .none
-
-/--
-Commit a full root allocation byte image `newRootBytes` back into `ep` with
-mandatory round-trip verification:
-- On **global allocations**: requires `gAlloc.mutability == .mut` (else `.ub`),
-  updates bytes & relocations, re-reads `globalAllocSliceToAbstractBytes`, and
-  enforces exact `abstractBytesEq` (failing closed `.unsupported` on partial
-  pointers or relocation width bleed).
-- On **stack locals**: if all bytes are `.uninit`, commits `LocalSlot.uninit`;
-  otherwise decodes via `decodePartialUninitValue`, re-encodes via
-  `encodeRawValueBytes`, and enforces `abstractBytesRefine reencoded newRootBytes`
-  (failing closed `.unsupported` if any byte or provenance would be altered or
-  uninit padding would be promoted back to initialized).
--/
-def commitRootAbstractBytes
-    (mem : Memory)
-    (locals : List LocalSlot)
-    (ep : ResolvedMemEndpoint)
-    (newRootBytes : List AbstractByte) :
-    MemOpRes (List LocalSlot × Memory) :=
-  match Nat.beq (length newRootBytes) ep.allocSize with
-  | false => .unsupported
-  | true =>
-    match ep.globalAlloc? with
-    | .some gAlloc =>
-      match gAlloc.mutability with
-      | .not => .ub
-      | .mut =>
-        let ptrBytes := layoutPointerBytes ep.targetLayouts
-        let updatedAlloc : CapturedAllocation := {
-          gAlloc with
-          bytes := abstractBytesToGlobalOptBytes newRootBytes
-          relocations := buildGlobalRelocsAux ptrBytes 0 0 newRootBytes
-        }
-        match globalAllocSliceToAbstractBytes updatedAlloc 0 ep.allocSize with
-        | .none => .unsupported
-        | .some rereadBytes =>
-          match abstractBytesEq rereadBytes newRootBytes with
-          | false => .unsupported
-          | true =>
-            match updateGlobalAllocById gAlloc.allocId updatedAlloc mem.globals with
-            | .some globals' => .ok (locals, { mem with globals := globals' })
-            | .none => .ub
-    | .none =>
-      match ep.allocKey with
-      | .global _ => .unsupported
-      | .stack frameDepth targetLocal =>
-        match allBytesUninit newRootBytes with
-        | true =>
-          match
-            writeFrameLocalSlot locals mem.callStack mem.callerLocals frameDepth targetLocal .uninit
-          with
-          | .some (locals', callStack', callerLocals') =>
-            .ok (locals', { mem with callStack := callStack', callerLocals := callerLocals' })
-          | .none => .ub
-        | false =>
-          match
-            decodePartialUninitValue
-              mem ep.targetDecls ep.targetLayouts false defaultCodecFuel ep.rootTy? newRootBytes
-          with
-          | .none => .unsupported
-          | .some decodedVal =>
-            match
-              encodeRawValueBytes
-                mem ep.targetDecls ep.targetLayouts defaultCodecFuel ep.rootTy? decodedVal
-            with
-            | .none => .unsupported
-            | .some reencoded =>
-              match abstractBytesRefine reencoded newRootBytes with
-              | false => .unsupported
-              | true =>
-                match
-                  writeFrameLocalSlot
-                    locals mem.callStack mem.callerLocals frameDepth targetLocal (.init decodedVal)
-                with
-                | .some (locals', callStack', callerLocals') =>
-                  .ok (locals', { mem with callStack := callStack', callerLocals := callerLocals' })
-                | .none => .ub
-
-/--
-Overlapping `memmove` byte-copy core (`core::intrinsics::copy`) for a positive
-`byteCount > 0`:
-- **Phase A (read-snapshot)**: resolves `srcPtr` to a live endpoint, checks
-  bounds and tag window (`endpointAccessCheck`), snapshots `byteCount` raw
-  `AbstractByte`s preserving provenance and `.uninit`, and applies exact-range
-  Tree Borrows read transitions yielding `borrows₁`.
-- **Phase B (write on post-read `borrows₁`)**: resolves `dstPtr` against
-  `borrows₁` (catching sibling `.unique` -> `.frozen` read-then-write UB),
-  checks bounds, tag window, and global mutability, applies exact-range Tree
-  Borrows write transitions yielding `borrows₂`, patches the snapshot into `dst`,
-  and commits via `commitRootAbstractBytes`.
-
-Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
-commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L554-L589>
-
-> "/// Copies `count * size_of::<T>()` bytes from `src` to `dst`. The source
-> /// and destination may overlap.
-> ...
-> /// Copying takes place as if the bytes were copied from `src`
-> /// to a temporary array and then copied from the array to `dst`.
-> ///
-> /// The copy is \"untyped\" in the sense that data may be uninitialized or otherwise violate the
-> /// requirements of `T`. The initialization state is preserved exactly.
-> ...
-> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0,
-> ///   and `dst` must remain valid even when `src` is read for `count * size_of::<T>()` bytes. (This
-> ///   means if the memory ranges overlap, the `dst` pointer must not be invalidated by `src` reads.)"
--/
-def evalCopyMemory
-    (s : MachineState)
-    (locals : List LocalSlot)
-    (bodyLocalDecls : List LocalDecl)
-    (bodyLayouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr)
-    (byteCount : Nat) :
-    MemOpRes (List LocalSlot × Memory) :=
-  match resolveLiveMemEndpoint s locals bodyLocalDecls bodyLayouts srcPtr with
-  | .ub => .ub
-  | .unsupported => .unsupported
-  | .ok srcEp =>
-    match endpointAccessCheck srcEp byteCount with
-    | .ub => .ub
-    | .unsupported => .unsupported
-    | .ok () =>
-      match readRootAbstractBytes s.memory srcEp with
-      | .none => .unsupported
-      | .some srcRootBytes =>
-        match sliceAbstractBytes srcRootBytes srcEp.effOff byteCount with
-        | .none => .ub
-        | .some snapshot =>
-          let borrows₁Opt : Option (List BorrowEntry) :=
-            match srcEp.borrow? with
-            | .none => .some s.memory.borrows
-            | .some (srcTag, srcEntry) =>
-              borrowsAfterReadAccess
-                s.memory.borrows
-                s.memory.activeProtectors
-                srcEp.targetDecls
-                srcEp.targetLayouts
-                srcTag
-                srcEntry
-                srcEp.effOff
-                byteCount
-          match borrows₁Opt with
-          | .none => .ub
-          | .some borrows₁ =>
-            let s₁ : MachineState := { s with memory := { s.memory with borrows := borrows₁ } }
-            match resolveLiveMemEndpoint s₁ locals bodyLocalDecls bodyLayouts dstPtr with
-            | .ub => .ub
-            | .unsupported => .unsupported
-            | .ok dstEp =>
-              match endpointAccessCheck dstEp byteCount with
-              | .ub => .ub
-              | .unsupported => .unsupported
-              | .ok () =>
-                let dstWritable : Bool :=
-                  match dstEp.globalAlloc? with
-                  | .some g => match g.mutability with | .mut => true | .not => false
-                  | .none => true
-                match dstWritable with
-                | false => .ub
-                | true =>
-                  let borrows₂Opt : Option (List BorrowEntry) :=
-                    match dstEp.borrow? with
-                    | .none => .some borrows₁
-                    | .some (dstTag, dstEntry) =>
-                      borrowsAfterWriteAccess
-                        borrows₁
-                        s.memory.activeProtectors
-                        dstEp.targetDecls
-                        dstEp.targetLayouts
-                        dstTag
-                        dstEntry
-                        dstEp.effOff
-                        byteCount
-                  match borrows₂Opt with
-                  | .none => .ub
-                  | .some borrows₂ =>
-                    let mem₂ : Memory := { s.memory with borrows := borrows₂ }
-                    match readRootAbstractBytes mem₂ dstEp with
-                    | .none => .unsupported
-                    | .some dstRootBytes =>
-                      match writeAbstractBytesAt dstRootBytes dstEp.effOff snapshot with
-                      | .none => .ub
-                      | .some patchedRootBytes =>
-                        commitRootAbstractBytes mem₂ locals dstEp patchedRootBytes
-
-/-! ### 3-Way Layout- and Target-Width-Aware Typed Byte & Value Validation -/
 
 /--
 Helper testing whether any element in `xs` satisfies `pred`.
@@ -12148,6 +11418,981 @@ def validateWideMetaBytes
                     | true => .unsupported
                     | false => .valid
       | _ => .unsupported
+
+/--
+Decode a single scalar or pointer `Value` from `bytes` according to target-aware
+`ScalarLayout` `sl`. In `V2026_08_01` (which has no `Value.uninit` constructor),
+any `.uninit` byte fails closed (`.none`). Rejects fragmented/mixed provenance
+when `sl` excludes any bit pattern and enforces `validRange`,
+`validRangeCoversAllNonNull`, and `charShapedSurrogate`.
+-/
+def decodeScalarLayoutBytesTarget
+    (mem : Memory)
+    (layouts : LayoutTable)
+    (sl : ScalarLayout)
+    (_allowUninit : Bool)
+    (bytes : List AbstractByte) :
+    Option Value :=
+  match layouts.isLittleEndian with
+  | false => .none
+  | true =>
+    match scalarLayoutTargetByteWidth layouts sl with
+    | .none => .none
+    | .some expectedSz =>
+      match Nat.beq (length bytes) expectedSz with
+      | false => .none
+      | true =>
+        match allBytesUninit bytes with
+        | true => .none
+        | false =>
+          match hasUninitByte bytes with
+          | true => .none
+          | false =>
+            match sl with
+            | .union pk =>
+              match allBytesSameProv bytes, decodeScalarBytes bytes false with
+              | .some (.some (a, _)), .some (sv, _) =>
+                match pk with
+                | .pointer _ =>
+                  .some (.ptr { allocId := a, offsetBytes := sv.bits } expectedSz)
+                | _ => .none
+              | .some .none, .some (sv, _) =>
+                .some (.scalar sv)
+              | _, _ => .none
+            | .initialized pk validRange =>
+              match pk with
+              | .pointer _ =>
+                match allBytesSameProv bytes, decodeScalarBytes bytes false with
+                | .some (.some (a, _)), .some (sv, _) =>
+                  match
+                    Bool.and (Nat.beq a 0) (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := sv.bits }))
+                  with
+                  | true =>
+                    match wrappingRangeContains validRange sv.bits with
+                    | true => .some (.ptr { allocId := 0, offsetBytes := sv.bits } expectedSz)
+                    | false => .none
+                  | false =>
+                    match validRangeCoversAllNonNull expectedSz validRange with
+                    | true => .some (.ptr { allocId := a, offsetBytes := sv.bits } expectedSz)
+                    | false => .none
+                | .some .none, .some (sv, _) =>
+                  match wrappingRangeContains validRange sv.bits with
+                  | true => .some (.ptr { allocId := 0, offsetBytes := sv.bits } expectedSz)
+                  | false => .none
+                | _, _ => .none
+              | _ =>
+                match bytesHaveRealProvenance mem bytes with
+                | true => .none
+                | false =>
+                  match decodeScalarBytes bytes false with
+                  | .some (sv, _) =>
+                    match wrappingRangeContains validRange sv.bits with
+                    | false => .none
+                    | true =>
+                      match charShapedSurrogate pk validRange sv.bits with
+                      | true => .none
+                      | false => .some (.scalar sv)
+                  | .none => .none
+
+/--
+Decode `FieldsShape.arbitrary` fields strictly by `fieldLayouts` at `offsets`.
+-/
+def decodeFieldsAtLayoutIdxs
+    (decodeAt : LayoutIdx → List AbstractByte → Option Value)
+    (layouts : LayoutTable)
+    (bytes : List AbstractByte) :
+    List Size → List Nat → Option (List Value)
+  | .nil, .nil => .some .nil
+  | off :: restOffs, fIdx :: restIdxs =>
+    match LayoutTable.lookup layouts fIdx with
+    | .none => .none
+    | .some fl =>
+      match sliceAbstractBytes bytes off.bytes fl.size.bytes with
+      | .none => .none
+      | .some slice =>
+        match decodeAt fIdx slice, decodeFieldsAtLayoutIdxs decodeAt layouts bytes restOffs restIdxs with
+        | .some fv, .some fvs => .some (fv :: fvs)
+        | _, _ => .none
+  | _, _ => .none
+
+/--
+Decode `count` array chunks at `stride` starting from `curOff`.
+-/
+def decodeArrayElemsAtLayoutIdx
+    (decodeElem : List AbstractByte → Option Value)
+    (bytes : List AbstractByte)
+    (elemSize stride curOff : Nat) :
+    Nat → Option (List Value)
+  | .zero => .some .nil
+  | .succ rem =>
+    match sliceAbstractBytes bytes curOff elemSize with
+    | .none => .none
+    | .some slice =>
+      match
+        decodeElem slice,
+        decodeArrayElemsAtLayoutIdx decodeElem bytes elemSize stride (Nat.add curOff stride) rem
+      with
+      | .some ev, .some evs => .some (ev :: evs)
+      | _, _ => .none
+
+/--
+Decode every field of a union from offset `0` using `fieldLayouts`, demoting any
+field whose bytes cannot decode as a valid value (or ZST fields) to `.unit`
+(matching `V2026_08_01.MirSemantics.Bytes.decodeUnionFieldsByLayoutIdxs`, since
+`V2026_08_01` has no `Value.uninit` constructor).
+-/
+def decodeUnionFieldsAtLayoutIdxs
+    (decodeAt : LayoutIdx → List AbstractByte → Option Value)
+    (layouts : LayoutTable)
+    (bytes : List AbstractByte) :
+    List Nat → List Value
+  | .nil => .nil
+  | fIdx :: rest =>
+    let fv : Value :=
+      match LayoutTable.lookup layouts fIdx with
+      | .none => .unit
+      | .some fl =>
+        match Nat.beq fl.size.bytes 0 with
+        | true => .unit
+        | false =>
+          match sliceAbstractBytes bytes 0 fl.size.bytes with
+          | .some slice =>
+            match decodeAt fIdx slice with
+            | .some v => v
+            | .none => .unit
+          | .none => .unit
+    fv :: decodeUnionFieldsAtLayoutIdxs decodeAt layouts bytes rest
+
+/--
+Exact layout-directed decoder (`decodeValueAtLayoutIdx`), mirroring
+`encodeValueAtLayoutIdx`:
+- Fails closed (`.none`) on big-endian `LayoutTable`s.
+- Decodes ADTs/structs/tuples/arrays strictly from `TypeLayout.fields`,
+  `fieldLayouts`, and `backendRepr` (in memory order for `.scalarPair`).
+- In `V2026_08_01` (which has no `Value.uninit` constructor), wholly-`.uninit`
+  sub-values fail closed (`.none`) while whole-local uninit commits as
+  `LocalSlot.uninit` in `commitRootAbstractBytes`.
+-/
+def decodeValueAtLayoutIdx
+    (mem : Memory)
+    (layouts : LayoutTable)
+    (allowPartialUninit : Bool) :
+    Nat → LayoutIdx → List AbstractByte → Option Value
+  | .zero, _, _ => .none
+  | .succ fuel', lIdx, bytes =>
+    match layouts.isLittleEndian with
+    | false => .none
+    | true =>
+      match LayoutTable.lookup layouts lIdx with
+      | .none => .none
+      | .some l =>
+        match
+          Bool.and (TypeLayout.isWellFormed l)
+            (Bool.and (Bool.not l.isUninhabited) (Nat.beq (length bytes) l.size.bytes))
+        with
+        | false => .none
+        | true =>
+          match l.variants with
+          | .empty => .none
+          | .multiple _ _ _ => .none
+          | .single varIdx =>
+            match l.fields with
+            | .primitive =>
+              match Nat.beq l.size.bytes 0 with
+              | true => .some .unit
+              | false =>
+                match l.backendRepr with
+                | .scalar s0 =>
+                  decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit bytes
+                | _ =>
+                  match allBytesUninit bytes with
+                  | true => .none
+                  | false =>
+                    match bytesHaveRealProvenance mem bytes with
+                    | true => .none
+                    | false =>
+                      match decodeScalarBytes bytes false with
+                      | .some (sv, _) => .some (.scalar sv)
+                      | .none => .none
+            | .arbitrary .nil _ => .some (.aggregate varIdx .nil)
+            | .arbitrary offsets memIdx =>
+              match allBytesUninit bytes with
+              | true => .none
+              | false =>
+                match Nat.beq (length l.fieldLayouts) (length offsets) with
+                | true =>
+                  match
+                    decodeFieldsAtLayoutIdxs
+                      (fun fIdx bs =>
+                        decodeValueAtLayoutIdx mem layouts allowPartialUninit fuel' fIdx bs)
+                      layouts
+                      bytes
+                      offsets
+                      l.fieldLayouts
+                  with
+                  | .some vals => .some (.aggregate varIdx vals)
+                  | .none => .none
+                | false =>
+                  match offsets, l.backendRepr with
+                  | off0 :: .nil, .scalar s0 =>
+                    match scalarLayoutTargetByteWidth layouts s0 with
+                    | .some sz0 =>
+                      match sliceAbstractBytes bytes off0.bytes sz0 with
+                      | .some sl0 =>
+                        match decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit sl0 with
+                        | .some v0 => .some (.aggregate varIdx (v0 :: .nil))
+                        | .none => .none
+                      | .none => .none
+                    | .none => .none
+                  | off0 :: off1 :: .nil, .scalarPair s0 s1 =>
+                    match
+                      scalarPairOffsetsValid layouts (off0 :: off1 :: .nil) memIdx s0 s1 l.size.bytes
+                    with
+                    | .some (firstOff, sz0, secondOff, sz1, swapped) =>
+                      match
+                        sliceAbstractBytes bytes firstOff sz0,
+                        sliceAbstractBytes bytes secondOff sz1
+                      with
+                      | .some sl0, .some sl1 =>
+                        match
+                          decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit sl0,
+                          decodeScalarLayoutBytesTarget mem layouts s1 allowPartialUninit sl1
+                        with
+                        | .some vFirst, .some vSecond =>
+                          match swapped with
+                          | false => .some (.aggregate varIdx (vFirst :: vSecond :: .nil))
+                          | true => .some (.aggregate varIdx (vSecond :: vFirst :: .nil))
+                        | _, _ => .none
+                      | _, _ => .none
+                    | .none => .none
+                  | _, _ => .none
+            | .array stride count =>
+              match Nat.beq count 0 with
+              | true => .some (.aggregate varIdx .nil)
+              | false =>
+                match Nat.beq l.size.bytes (Nat.mul stride.bytes count) with
+                | false => .none
+                | true =>
+                  match l.fieldLayouts with
+                  | elemLIdx :: _ =>
+                    match LayoutTable.lookup layouts elemLIdx with
+                    | .some elemFl =>
+                      match Nat.ble elemFl.size.bytes stride.bytes with
+                      | false => .none
+                      | true =>
+                        match
+                          decodeArrayElemsAtLayoutIdx
+                            (fun bs =>
+                              decodeValueAtLayoutIdx mem layouts allowPartialUninit fuel' elemLIdx bs)
+                            bytes
+                            elemFl.size.bytes
+                            stride.bytes
+                            0
+                            count
+                        with
+                        | .some vals => .some (.aggregate varIdx vals)
+                        | .none => .none
+                    | .none => .none
+                  | .nil => .none
+            | .union count =>
+              match allBytesUninit bytes with
+              | true =>
+                match Nat.beq varIdx 0 with
+                | true => .some (.aggregate 0 (replicateValue count .unit))
+                | false => .none
+              | false =>
+                let rawOverlayFallback : Unit → Option Value := fun _ =>
+                  match Bool.and (Nat.beq varIdx 0) (Nat.blt 0 count) with
+                  | false => .none
+                  | true =>
+                    match forceValueListOpt (encodeRawAbstractByteVals bytes) with
+                    | .some rawVals =>
+                      .some
+                        (.aggregate 0
+                          (appendValueList
+                            (replicateValue count .unit)
+                            (.aggregate 0 rawVals :: .nil)))
+                    | .none => .none
+                match l.fieldLayouts with
+                | fHead :: fTail =>
+                  match Nat.beq (length (fHead :: fTail)) count with
+                  | true =>
+                    let vals :=
+                      decodeUnionFieldsAtLayoutIdxs
+                        (fun fIdx bs =>
+                          decodeValueAtLayoutIdx mem layouts true fuel' fIdx bs)
+                        layouts
+                        bytes
+                        (fHead :: fTail)
+                    match
+                      encodeValueAtLayoutIdx mem layouts (.succ fuel') lIdx (.aggregate varIdx vals)
+                    with
+                    | .some reBs =>
+                      match abstractBytesEq reBs bytes with
+                      | true => .some (.aggregate varIdx vals)
+                      | false => rawOverlayFallback ()
+                    | .none => rawOverlayFallback ()
+                  | false => rawOverlayFallback ()
+                | .nil =>
+                  match l.backendRepr with
+                  | .scalar s0 =>
+                    match decodeScalarLayoutBytesTarget mem layouts s0 true bytes with
+                    | .some v => .some v
+                    | .none => rawOverlayFallback ()
+                  | _ => rawOverlayFallback ()
+
+/--
+Decode tuple fields at `offsets` pairing each element's `RigidTy` with its
+optional `TypeLayout` index from `fieldLayouts` so type-level invariants (`&!`,
+`&[T]`/`&str` lengths, `dyn` vtables, `char`) are preserved when committing into
+stack tuple locals.
+-/
+def decodeTupleFieldsAtOffsetsWith
+    (decodeField : RigidTy → Option LayoutIdx → List AbstractByte → Option Value)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (bytes : List AbstractByte) :
+    List Size → List RigidTy → List Nat → Option (List Value)
+  | .nil, .nil, _ => .some .nil
+  | off :: restOffs, k :: restKs, fIdxs =>
+    let (fIdxOpt, restIdxs) : Option LayoutIdx × List Nat :=
+      match fIdxs with
+      | fIdx :: tail => (.some fIdx, tail)
+      | .nil => (.none, .nil)
+    let fTy : Ty :=
+      match fIdxOpt with
+      | .some fIdx => { kind := k, layoutIdx := fIdx }
+      | .none => { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
+    match exactTyByteSize? localDecls layouts fTy with
+    | .none => .none
+    | .some fSz =>
+      match sliceAbstractBytes bytes off.bytes fSz with
+      | .none => .none
+      | .some slice =>
+        match
+          decodeField k fIdxOpt slice,
+          decodeTupleFieldsAtOffsetsWith
+            decodeField localDecls layouts bytes restOffs restKs restIdxs
+        with
+        | .some fv, .some fvs => .some (fv :: fvs)
+        | _, _ => .none
+  | _, _, _ => .none
+
+/--
+Decode array chunks using `decodeElem`, returning `.none` if any chunk fails.
+-/
+def decodePartialUninitArrayChunks
+    (decodeElem : List AbstractByte → Option Value)
+    (elemSz : Nat) :
+    Nat → List AbstractByte → Option (List Value)
+  | .zero, .nil => .some .nil
+  | .succ rem, bs =>
+    let chunk := takeAbstractBytes elemSz bs
+    let rest := dropAbstractBytes elemSz bs
+    match Nat.beq (length chunk) elemSz with
+    | false => .none
+    | true =>
+      match decodeElem chunk, decodePartialUninitArrayChunks decodeElem elemSz rem rest with
+      | .some ev, .some evs => .some (ev :: evs)
+      | _, _ => .none
+  | _, _ => .none
+
+/--
+Decode a single thin pointer byte slice of width `ptrBytes` (for raw ptr, ref,
+or fnPtr).
+-/
+def decodeThinPtrBytes
+    (mem : Memory)
+    (ptrBytes : Nat)
+    (requireNonNull : Bool)
+    (_allowUninit : Bool)
+    (bytes : List AbstractByte) :
+    Option Value :=
+  match Nat.beq (length bytes) ptrBytes with
+  | false => .none
+  | true =>
+    match allBytesUninit bytes with
+    | true => .none
+    | false =>
+      match allBytesSameProv bytes, decodeScalarBytes bytes false with
+      | .some (.some (a, _)), .some (sv, _) =>
+        match
+          Bool.and requireNonNull
+            (Bool.and (Nat.beq a 0)
+              (Bool.and (Nat.beq sv.bits 0)
+                (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := 0 }))))
+        with
+        | true => .none
+        | false => .some (.ptr { allocId := a, offsetBytes := sv.bits } ptrBytes)
+      | .some .none, .some (sv, _) =>
+        match Bool.and requireNonNull (Nat.beq sv.bits 0) with
+        | true => .none
+        | false => .some (.ptr { allocId := 0, offsetBytes := sv.bits } ptrBytes)
+      | _, _ => .none
+
+/--
+Decode a `List AbstractByte` into a `Value` for committing into a stack
+`LocalSlot`, enforcing type-level invariants (`bool`, `char`, `&!`, `&[T]`/`&str`
+lengths, `dyn` vtables, tuple fields) and using raw-byte union overlays for
+partially initialized unions (in `V2026_08_01`, which has no `Value.uninit`
+constructor, partially initialized non-union leaves fail closed `.none`, while
+wholly-uninit locals commit as `LocalSlot.uninit` in `commitRootAbstractBytes`;
+all commits are guarded downstream by `abstractBytesRefine`).
+-/
+def decodePartialUninitValue
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (allowUninitLeaf : Bool) :
+    Nat → Option Ty → List AbstractByte → Option Value
+  | .zero, _, _ => .none
+  | .succ fuel', tyOpt, bytes =>
+    match layouts.isLittleEndian with
+    | false => .none
+    | true =>
+      match tyOpt with
+      | .none =>
+        match bytes with
+        | .nil => .some .unit
+        | _ :: _ =>
+          match bytesHaveRealProvenance mem bytes with
+          | true =>
+            let ptrBytes := layoutPointerBytes layouts
+            match Nat.beq (length bytes) ptrBytes with
+            | true => decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes
+            | false => .none
+          | false =>
+            match hasUninitByte bytes with
+            | true => .none
+            | false =>
+              match decodeScalarBytes bytes false with
+              | .some (sv, _) => .some (.scalar sv)
+              | .none => .none
+      | .some ty =>
+        let ptrBytes := layoutPointerBytes layouts
+        match ty.kind with
+        | .bool =>
+          match bytes with
+          | .uninit :: .nil => .none
+          | .init b .none :: .nil =>
+            let n := b.toBitVec.toNat
+            match Nat.ble n 1 with
+            | true => .some (.scalar ⟨n, 1⟩)
+            | false => .none
+          | _ => .none
+        | .char =>
+          match Nat.beq (length bytes) 4 with
+          | false => .none
+          | true =>
+            match allBytesUninit bytes with
+            | true => .none
+            | false =>
+              match bytesHaveRealProvenance mem bytes with
+              | true => .none
+              | false =>
+                match decodeScalarBytes bytes false with
+                | .some (sv, _) =>
+                  match isValidCharCode sv.bits with
+                  | true => .some (.scalar sv)
+                  | false => .none
+                | .none => .none
+        | .int _ | .uint _ =>
+          match intTyTargetBytes layouts ty.kind with
+          | .none => .none
+          | .some sz =>
+            match Nat.beq (length bytes) sz with
+            | false => .none
+            | true =>
+              match allBytesUninit bytes with
+              | true => .none
+              | false =>
+                match bytesHaveRealProvenance mem bytes with
+                | true => .none
+                | false =>
+                  match decodeScalarBytes bytes false with
+                  | .some (sv, _) => .some (.scalar sv)
+                  | .none => .none
+        | .float w =>
+          let sz := floatTyByteWidth w
+          match Nat.beq (length bytes) sz with
+          | false => .none
+          | true =>
+            match allBytesUninit bytes with
+            | true => .none
+            | false =>
+              match bytesHaveRealProvenance mem bytes with
+              | true => .none
+              | false =>
+                match decodeScalarBytes bytes false with
+                | .some (sv, _) => .some (.scalar sv)
+                | .none => .none
+        | .tuple .nil | .fnDef _ _ =>
+          match bytes with
+          | .nil => .some .unit
+          | _ :: _ => .none
+        | .never => .none
+        | .fnPtr _ _ _ _ => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
+        | .ref _ pt =>
+          match knownWidePointeeTailAux? 8 pt with
+          | .some tailTy =>
+            let hasHeader := match pt with | .tuple _ => true | _ => false
+            match Nat.beq (length bytes) (Nat.mul 2 ptrBytes) with
+            | false => .none
+            | true =>
+              match allBytesUninit bytes with
+              | true => .none
+              | false =>
+                let dBs := takeAbstractBytes ptrBytes bytes
+                let mBs := dropAbstractBytes ptrBytes bytes
+                match validateWideMetaBytes mem localDecls layouts true hasHeader tailTy mBs with
+                | .valid =>
+                  match
+                    decodeThinPtrBytes mem ptrBytes true false dBs,
+                    match tailTy with
+                    | .dynamic _ => decodeThinPtrBytes mem ptrBytes true false mBs
+                    | _ =>
+                      match bytesHaveRealProvenance mem mBs with
+                      | true => .none
+                      | false =>
+                        match decodeScalarBytes mBs false with
+                        | .some (msv, _) => .some (.scalar msv)
+                        | .none => .none
+                  with
+                  | .some dv, .some mv => .some (.aggregate 0 (dv :: mv :: .nil))
+                  | _, _ => .none
+                | _ => .none
+          | .none =>
+            match ptrPointeeMayBeUnsizedAux 8 pt with
+            | false =>
+              match referenceToUninhabited localDecls layouts pt with
+              | true => .none
+              | false => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
+            | true =>
+              match declPtrToPointeeByteSize? localDecls layouts pt with
+              | .some sz =>
+                match Nat.beq sz ptrBytes with
+                | true =>
+                  match referenceToUninhabited localDecls layouts pt with
+                  | true => .none
+                  | false => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
+                | false => .none
+              | .none => .none
+        | .rawPtr _ pt =>
+          match knownWidePointeeTailAux? 8 pt with
+          | .some tailTy =>
+            let hasHeader := match pt with | .tuple _ => true | _ => false
+            match Nat.beq (length bytes) (Nat.mul 2 ptrBytes) with
+            | false => .none
+            | true =>
+              match allBytesUninit bytes with
+              | true => .none
+              | false =>
+                let dBs := takeAbstractBytes ptrBytes bytes
+                let mBs := dropAbstractBytes ptrBytes bytes
+                match validateWideMetaBytes mem localDecls layouts false hasHeader tailTy mBs with
+                | .valid =>
+                  match
+                    decodeThinPtrBytes mem ptrBytes false false dBs,
+                    match tailTy with
+                    | .dynamic _ => decodeThinPtrBytes mem ptrBytes true false mBs
+                    | _ =>
+                      match bytesHaveRealProvenance mem mBs with
+                      | true => .none
+                      | false =>
+                        match decodeScalarBytes mBs false with
+                        | .some (msv, _) => .some (.scalar msv)
+                        | .none => .none
+                  with
+                  | .some dv, .some mv => .some (.aggregate 0 (dv :: mv :: .nil))
+                  | _, _ => .none
+                | _ => .none
+          | .none =>
+            match ptrPointeeMayBeUnsizedAux 8 pt with
+            | false => decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes
+            | true =>
+              match declPtrToPointeeByteSize? localDecls layouts pt with
+              | .some sz =>
+                match Nat.beq sz ptrBytes with
+                | true => decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes
+                | false => .none
+              | .none => .none
+        | .array (.uint .u8) n =>
+          match Nat.beq (length bytes) n with
+          | false => .none
+          | true =>
+            match
+              decodePartialUninitArrayChunks
+                (fun chunk =>
+                  match chunk with
+                  | .uninit :: .nil => .none
+                  | .init b .none :: .nil => .some (.scalar ⟨b.toBitVec.toNat, 1⟩)
+                  | _ => .none)
+                1
+                n
+                bytes
+            with
+            | .some elems => .some (.aggregate 0 elems)
+            | .none => .none
+        | .array elem n =>
+          match Nat.beq n 0 with
+          | true =>
+            match bytes with
+            | .nil => .some (.aggregate 0 .nil)
+            | _ :: _ => .none
+          | false =>
+            let elemTy : Ty :=
+              match resolveConsistentLayout? localDecls layouts ty with
+              | .some (_, { fields := .array _ _, fieldLayouts := elemLIdx :: _, .. }) =>
+                { kind := elem, layoutIdx := elemLIdx }
+              | _ => { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }
+            match exactTyByteSize? localDecls layouts elemTy with
+            | .none => .none
+            | .some elemSz =>
+              match Nat.beq (length bytes) (Nat.mul elemSz n) with
+              | false => .none
+              | true =>
+                match
+                  decodePartialUninitArrayChunks
+                    (fun chunk =>
+                      decodePartialUninitValue
+                        mem localDecls layouts true fuel' (.some elemTy) chunk)
+                    elemSz
+                    n
+                    bytes
+                with
+                | .some elems => .some (.aggregate 0 elems)
+                | .none => .none
+        | .tuple (k :: .nil) =>
+          let innerTy : Ty :=
+            match resolveConsistentLayout? localDecls layouts ty with
+            | .some (_, { fields := .arbitrary _ _, fieldLayouts := fIdx :: .nil, .. }) =>
+              { kind := k, layoutIdx := fIdx }
+            | _ => { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
+          match
+            decodePartialUninitValue mem localDecls layouts allowUninitLeaf fuel' (.some innerTy) bytes
+          with
+          | .some v0 => .some (.aggregate 0 (v0 :: .nil))
+          | .none => .none
+        | .tuple ks =>
+          match resolveConsistentLayout? localDecls layouts ty with
+          | .some (_, l) =>
+            match l.fields, l.variants with
+            | .arbitrary offsets _, .single expectedVar =>
+              match
+                Bool.and (Nat.beq (length offsets) (length ks)) (Nat.beq (length bytes) l.size.bytes)
+              with
+              | false => .none
+              | true =>
+                match allBytesUninit bytes with
+                | true => .none
+                | false =>
+                  let fIdxs : List Nat :=
+                    match Nat.beq (length l.fieldLayouts) (length ks) with
+                    | true => l.fieldLayouts
+                    | false => .nil
+                  match
+                    decodeTupleFieldsAtOffsetsWith
+                      (fun fk fIdxOpt slice =>
+                        let fTy : Ty :=
+                          match fIdxOpt with
+                          | .some fIdx => { kind := fk, layoutIdx := fIdx }
+                          | .none => { kind := fk, layoutIdx := unresolvedLayoutIdx layouts }
+                        decodePartialUninitValue mem localDecls layouts true fuel' (.some fTy) slice)
+                      localDecls
+                      layouts
+                      bytes
+                      offsets
+                      ks
+                      fIdxs
+                  with
+                  | .some vals => .some (.aggregate expectedVar vals)
+                  | .none => .none
+            | _, _ => .none
+          | .none => .none
+        | .adt _ _ | .closure _ _ =>
+          match resolveConsistentLayout? localDecls layouts ty with
+          | .some (lIdx, _) => decodeValueAtLayoutIdx mem layouts true (.succ fuel') lIdx bytes
+          | .none => .none
+        | _ => .none
+
+/--
+Convert a `List AbstractByte` into `List (Option UInt8)` for a global
+`CapturedAllocation`.
+-/
+def abstractBytesToGlobalOptBytes : List AbstractByte → List (Option UInt8)
+  | .nil => .nil
+  | .uninit :: rest => .none :: abstractBytesToGlobalOptBytes rest
+  | .init b _ :: rest => .some b :: abstractBytesToGlobalOptBytes rest
+
+/--
+Build global relocation records `(byteOffset, ProvenancePtr)` from `bytes` using
+pointer word size `ptrBytes`. Downstream `commitRootAbstractBytes` re-reads
+`globalAllocSliceToAbstractBytes` and enforces `abstractBytesEq`, so any partial
+pointer or 32-bit relocation width mismatch fails closed `.unsupported`.
+-/
+def buildGlobalRelocsAux (ptrBytes : Nat) : Nat → Nat → List AbstractByte → List (Nat × ProvenancePtr)
+  | _, _, .nil => .nil
+  | off, .succ skip, _ :: rest => buildGlobalRelocsAux ptrBytes (Nat.add off 1) skip rest
+  | off, .zero, b :: rest =>
+    match b with
+    | .init _ (.some (a, _)) =>
+      let window := takeAbstractBytes ptrBytes (b :: rest)
+      match Nat.beq (length window) ptrBytes, allBytesSameProv window with
+      | true, .some (.some (a', _)) =>
+        match Nat.beq a a', ptrBytes with
+        | true, .succ ptrBytes' =>
+          (off, { allocId := a, offsetBytes := 0 }) ::
+            buildGlobalRelocsAux ptrBytes (Nat.add off 1) ptrBytes' rest
+        | _, _ => buildGlobalRelocsAux ptrBytes (Nat.add off 1) 0 rest
+      | _, _ => buildGlobalRelocsAux ptrBytes (Nat.add off 1) 0 rest
+    | _ => buildGlobalRelocsAux ptrBytes (Nat.add off 1) 0 rest
+
+/--
+Replace the `CapturedAllocation` with `allocId` in `globals`.
+-/
+def updateGlobalAllocById
+    (allocId : AllocId)
+    (updated : CapturedAllocation) :
+    List CapturedAllocation → Option (List CapturedAllocation)
+  | .nil => .none
+  | g :: rest =>
+    match Nat.beq g.allocId allocId with
+    | true => .some (updated :: rest)
+    | false =>
+      match updateGlobalAllocById allocId updated rest with
+      | .some rest' => .some (g :: rest')
+      | .none => .none
+
+/--
+Commit a full root allocation byte image `newRootBytes` back into `ep` with
+mandatory round-trip verification:
+- On **global allocations**: requires `gAlloc.mutability == .mut` (else `.ub`),
+  updates bytes & relocations, re-reads `globalAllocSliceToAbstractBytes`, and
+  enforces exact `abstractBytesEq` (failing closed `.unsupported` on partial
+  pointers or relocation width bleed).
+- On **stack locals**: if all bytes are `.uninit`, commits `LocalSlot.uninit`;
+  otherwise decodes via `decodePartialUninitValue`, re-encodes via
+  `encodeRawValueBytes`, and enforces `abstractBytesRefine reencoded newRootBytes`
+  (failing closed `.unsupported` if any byte or provenance would be altered or
+  uninit padding would be promoted back to initialized).
+-/
+def commitRootAbstractBytes
+    (mem : Memory)
+    (locals : List LocalSlot)
+    (ep : ResolvedMemEndpoint)
+    (newRootBytes : List AbstractByte) :
+    MemOpRes (List LocalSlot × Memory) :=
+  match Nat.beq (length newRootBytes) ep.allocSize with
+  | false => .unsupported
+  | true =>
+    match ep.globalAlloc? with
+    | .some gAlloc =>
+      match gAlloc.mutability with
+      | .not => .ub
+      | .mut =>
+        let ptrBytes := layoutPointerBytes ep.targetLayouts
+        let updatedAlloc : CapturedAllocation := {
+          gAlloc with
+          bytes := abstractBytesToGlobalOptBytes newRootBytes
+          relocations := buildGlobalRelocsAux ptrBytes 0 0 newRootBytes
+        }
+        match globalAllocSliceToAbstractBytes updatedAlloc 0 ep.allocSize with
+        | .none => .unsupported
+        | .some rereadBytes =>
+          match abstractBytesEq rereadBytes newRootBytes with
+          | false => .unsupported
+          | true =>
+            match updateGlobalAllocById gAlloc.allocId updatedAlloc mem.globals with
+            | .some globals' => .ok (locals, { mem with globals := globals' })
+            | .none => .ub
+    | .none =>
+      match ep.allocKey with
+      | .global _ => .unsupported
+      | .stack frameDepth targetLocal =>
+        match allBytesUninit newRootBytes with
+        | true =>
+          match
+            writeFrameLocalSlot locals mem.callStack mem.callerLocals frameDepth targetLocal .uninit
+          with
+          | .some (locals', callStack', callerLocals') =>
+            .ok (locals', { mem with callStack := callStack', callerLocals := callerLocals' })
+          | .none => .ub
+        | false =>
+          match
+            decodePartialUninitValue
+              mem ep.targetDecls ep.targetLayouts false defaultCodecFuel ep.rootTy? newRootBytes
+          with
+          | .none => .unsupported
+          | .some decodedVal =>
+            match
+              encodeRawValueBytes
+                mem ep.targetDecls ep.targetLayouts defaultCodecFuel ep.rootTy? decodedVal
+            with
+            | .none => .unsupported
+            | .some reencoded =>
+              match abstractBytesRefine reencoded newRootBytes with
+              | false => .unsupported
+              | true =>
+                match
+                  writeFrameLocalSlot
+                    locals mem.callStack mem.callerLocals frameDepth targetLocal (.init decodedVal)
+                with
+                | .some (locals', callStack', callerLocals') =>
+                  .ok (locals', { mem with callStack := callStack', callerLocals := callerLocals' })
+                | .none => .ub
+
+/--
+Overlapping `memmove` byte-copy core (`core::intrinsics::copy`) for a positive
+`byteCount > 0`:
+- **Phase A (read-snapshot)**: resolves `srcPtr` to a live endpoint, checks
+  bounds and tag window (`endpointAccessCheck`), snapshots `byteCount` raw
+  `AbstractByte`s preserving provenance and `.uninit`, and applies exact-range
+  Tree Borrows read transitions yielding `borrows₁`.
+- **Phase B (write on post-read `borrows₁`)**: resolves `dstPtr` against
+  `borrows₁` (catching sibling `.unique` -> `.frozen` read-then-write UB),
+  checks bounds, tag window, and global mutability, applies exact-range Tree
+  Borrows write transitions yielding `borrows₂`, patches the snapshot into `dst`,
+  and commits via `commitRootAbstractBytes`.
+
+Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L554-L589>
+
+> "/// Copies `count * size_of::<T>()` bytes from `src` to `dst`. The source
+> /// and destination may overlap.
+> ...
+> /// Copying takes place as if the bytes were copied from `src`
+> /// to a temporary array and then copied from the array to `dst`.
+> ///
+> /// The copy is \"untyped\" in the sense that data may be uninitialized or otherwise violate the
+> /// requirements of `T`. The initialization state is preserved exactly.
+> ...
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0,
+> ///   and `dst` must remain valid even when `src` is read for `count * size_of::<T>()` bytes. (This
+> ///   means if the memory ranges overlap, the `dst` pointer must not be invalidated by `src` reads.)"
+-/
+def evalCopyMemory
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr)
+    (byteCount : Nat) :
+    MemOpRes (List LocalSlot × Memory) :=
+  match resolveLiveMemEndpoint s locals bodyLocalDecls bodyLayouts srcPtr with
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .ok srcEp =>
+    match Nat.ble (Nat.add srcEp.effOff byteCount) srcEp.allocSize with
+    | false => .ub
+    | true =>
+      match resolveLiveMemEndpoint s locals bodyLocalDecls bodyLayouts dstPtr with
+      | .ub => .ub
+      | .unsupported => .unsupported
+      | .ok dstEp0 =>
+        match Nat.ble (Nat.add dstEp0.effOff byteCount) dstEp0.allocSize with
+        | false => .ub
+        | true =>
+          let dstWritable : Bool :=
+            match dstEp0.globalAlloc? with
+            | .some g => match g.mutability with | .mut => true | .not => false
+            | .none => true
+          match dstWritable with
+          | false => .ub
+          | true =>
+            match endpointAccessCheck srcEp byteCount with
+            | .ub => .ub
+            | .unsupported => .unsupported
+            | .ok () =>
+              let borrows₁Opt : Option (List BorrowEntry) :=
+                match srcEp.borrow? with
+                | .none => .some s.memory.borrows
+                | .some (srcTag, srcEntry) =>
+                  borrowsAfterReadAccess
+                    s.memory.borrows
+                    s.memory.activeProtectors
+                    srcEp.targetDecls
+                    srcEp.targetLayouts
+                    srcTag
+                    srcEntry
+                    srcEp.effOff
+                    byteCount
+              match borrows₁Opt with
+              | .none => .ub
+              | .some borrows₁ =>
+                let s₁ : MachineState := { s with memory := { s.memory with borrows := borrows₁ } }
+                match resolveLiveMemEndpoint s₁ locals bodyLocalDecls bodyLayouts dstPtr with
+                | .ub => .ub
+                | .unsupported => .unsupported
+                | .ok dstEp =>
+                  match endpointAccessCheck dstEp byteCount with
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                  | .ok () =>
+                    let borrows₂Opt : Option (List BorrowEntry) :=
+                      match dstEp.borrow? with
+                      | .none => .some borrows₁
+                      | .some (dstTag, dstEntry) =>
+                        borrowsAfterWriteAccess
+                          borrows₁
+                          s.memory.activeProtectors
+                          dstEp.targetDecls
+                          dstEp.targetLayouts
+                          dstTag
+                          dstEntry
+                          dstEp.effOff
+                          byteCount
+                    match borrows₂Opt with
+                    | .none => .ub
+                    | .some borrows₂ =>
+                      let mem₂ : Memory := { s.memory with borrows := borrows₂ }
+                      match readRootAbstractBytes s.memory srcEp with
+                      | .none => .unsupported
+                      | .some srcRootBytes =>
+                        match sliceAbstractBytes srcRootBytes srcEp.effOff byteCount with
+                        | .none => .ub
+                        | .some snapshot =>
+                          match readRootAbstractBytes mem₂ dstEp with
+                          | .none => .unsupported
+                          | .some dstRootBytes =>
+                            match writeAbstractBytesAt dstRootBytes dstEp.effOff snapshot with
+                            | .none => .ub
+                            | .some patchedRootBytes =>
+                              commitRootAbstractBytes mem₂ locals dstEp patchedRootBytes
+
+/-! ### 3-Way Layout- and Target-Width-Aware Typed Byte & Value Validation -/
+
+/--
+Validate all fields of a tuple at `offsets`, pairing each element's `RigidTy`
+with its optional `TypeLayout` index from `fieldLayouts` so type-level validity
+invariants (`&!`, `&[T]`/`&str` lengths, `dyn` vtables, `char`) are enforced.
+-/
+def validateTupleFieldsBytesWith
+    (validateField : RigidTy → Option LayoutIdx → List AbstractByte → TypedValidity)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (bytes : List AbstractByte) :
+    List Size → List RigidTy → List Nat → TypedValidity
+  | .nil, .nil, _ => .valid
+  | off :: restOffs, k :: restKs, fIdxs =>
+    let (fIdxOpt, restIdxs) : Option LayoutIdx × List Nat :=
+      match fIdxs with
+      | fIdx :: tail => (.some fIdx, tail)
+      | .nil => (.none, .nil)
+    let fTy : Ty :=
+      match fIdxOpt with
+      | .some fIdx => { kind := k, layoutIdx := fIdx }
+      | .none => { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
+    match exactTyByteSize? localDecls layouts fTy with
+    | .none => .unsupported
+    | .some fSz =>
+      match sliceAbstractBytes bytes off.bytes fSz with
+      | .none => .unsupported
+      | .some slice =>
+        TypedValidity.andThen (validateField k fIdxOpt slice) fun _ =>
+          validateTupleFieldsBytesWith
+            validateField localDecls layouts bytes restOffs restKs restIdxs
+  | _, _, _ => .unsupported
 
 /--
 Validate all fields of a layout's `.arbitrary` shape at `offsets` using
@@ -12504,25 +12749,36 @@ def validateTypedBytes
                 0
                 n
       | .tuple (k :: .nil) =>
-        let innerTy : Ty := { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
+        let innerTy : Ty :=
+          match resolveConsistentLayout? localDecls layouts ty with
+          | .some (_, { fields := .arbitrary _ _, fieldLayouts := fIdx :: .nil, .. }) =>
+            { kind := k, layoutIdx := fIdx }
+          | _ => { kind := k, layoutIdx := unresolvedLayoutIdx layouts }
         validateTypedBytes mem localDecls layouts fuel' innerTy bytes
       | .tuple ks =>
         match resolveConsistentLayout? localDecls layouts ty with
-        | .some (lIdx, l) =>
+        | .some (_, l) =>
           match l.fields, l.variants with
           | .arbitrary offsets _, .single _ =>
             match Nat.beq (length offsets) (length ks), Nat.beq (length bytes) l.size.bytes with
             | true, true =>
-              match Nat.beq (length l.fieldLayouts) (length ks) with
-              | true =>
-                validateLayoutFieldsWith
-                  (fun fIdx bs => validateTypedBytesForLayoutIdx mem layouts fuel' fIdx bs)
-                  layouts
-                  bytes
-                  offsets
-                  l.fieldLayouts
-              | false =>
-                validateTypedBytesForLayoutIdx mem layouts (.succ fuel') lIdx bytes
+              let fIdxs : List Nat :=
+                match Nat.beq (length l.fieldLayouts) (length ks) with
+                | true => l.fieldLayouts
+                | false => .nil
+              validateTupleFieldsBytesWith
+                (fun fk fIdxOpt slice =>
+                  let fTy : Ty :=
+                    match fIdxOpt with
+                    | .some fIdx => { kind := fk, layoutIdx := fIdx }
+                    | .none => { kind := fk, layoutIdx := unresolvedLayoutIdx layouts }
+                  validateTypedBytes mem localDecls layouts fuel' fTy slice)
+                localDecls
+                layouts
+                bytes
+                offsets
+                ks
+                fIdxs
             | _, _ => .unsupported
           | _, _ => .unsupported
         | .none => .unsupported
