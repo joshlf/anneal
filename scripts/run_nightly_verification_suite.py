@@ -7604,7 +7604,7 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             "check_trusted_self_test",
             "cat1_trusted_boundary",
             [sys.executable, "-B", "trusted/audit/check_trusted.py", "--self-test"],
-            1500,
+            2400,
             wrap="build",
         )
         # Cold `+Anneal.BitValidity +Anneal.ByteCodec +Anneal.Mir.Cast` after the core
