@@ -1848,6 +1848,245 @@ fn render_captured_mir(mir: &IrCapturedMir) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// LCNF constructor-size budget of `emit_mir_lean_module` (Lean `v4.34.1` `IR/Checker.lean`)
+// ---------------------------------------------------------------------------
+
+/// Scalar-area budget, in bytes, of every constructor `emit_mir_lean_module` renders.
+///
+/// Lean `v4.34.1`'s IR checker (`IR/Checker.lean`, `checkExpr` on `.ctor`) rejects a
+/// constructor whose scalar area (`ssize + usize * 8`) exceeds
+/// `LEAN_IR_MAX_CTOR_SCALAR_BYTES` ("has too many scalar fields"), and the debug C runtime
+/// asserts the strict `scalar_sz < 1024` in `lean_alloc_ctor`. `960 = 1024 - 64` stays below
+/// both.
+const MAX_LCNF_CTOR_SCALAR_BYTES: usize = 960;
+
+/// Boxed-field budget of every constructor `emit_mir_lean_module` renders.
+///
+/// The IR checker rejects more than `LEAN_IR_MAX_CTOR_OBJ_FIELDS` boxed fields ("has too many
+/// fields") and `lean_alloc_ctor` asserts `num_objs < 256`. `240 = 256 - 16` stays below both.
+const MAX_LCNF_CTOR_OBJ_FIELDS: usize = 240;
+
+/// Declared-field budget (erased fields included) of every constructor `emit_mir_lean_module`
+/// renders.
+///
+/// Independently of the IR checker, Lean `v4.34.1` stops elaborating wide structures: the
+/// `structure` command fails with "maximum recursion depth has been reached" (default
+/// `maxRecDepth`) at `520` fields while `500` fields elaborate, and the derived `BEq` instance
+/// already fails at `256` fields. The cap equals `MAX_LCNF_CTOR_OBJ_FIELDS`.
+const MAX_LCNF_CTOR_DECLARED_FIELDS: usize = 240;
+
+/// `LEAN_MAX_CTOR_SCALARS_SIZE` (`lean.h`): the largest constructor scalar area, in bytes, that
+/// the IR checker accepts.
+const LEAN_IR_MAX_CTOR_SCALAR_BYTES: usize = 1024;
+
+/// `LEAN_MAX_CTOR_FIELDS` (`lean.h`): the largest number of boxed fields of one constructor that
+/// the IR checker accepts.
+const LEAN_IR_MAX_CTOR_OBJ_FIELDS: usize = 256;
+
+/// Width, in bytes, of the widest unboxed LCNF scalar (`UInt64`, `USize`, `Float`).
+const MAX_LCNF_SCALAR_FIELD_BYTES: usize = 8;
+
+// Every budget stays strictly below the Lean limits.
+const _: () = assert!(
+    MAX_LCNF_CTOR_SCALAR_BYTES < LEAN_IR_MAX_CTOR_SCALAR_BYTES
+        && MAX_LCNF_CTOR_OBJ_FIELDS < LEAN_IR_MAX_CTOR_OBJ_FIELDS
+        && MAX_LCNF_CTOR_DECLARED_FIELDS >= MAX_LCNF_CTOR_OBJ_FIELDS,
+    "LCNF constructor budgets must stay below the Lean limits"
+);
+
+/// A Lean constructor that [`emit_mir_lean_module`] may render, with its number of explicit
+/// fields (defaulted structure fields included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MirModuleCtorArity {
+    /// Structure or constructor name: `Layout.*` and `MirAst.*` under
+    /// `Trusted.Rustc.V2026_06_01`, `VerificationResult.Claim` under `Trusted`, or a prelude
+    /// constructor.
+    lean_name: &'static str,
+    /// Number of explicit fields.
+    fields: usize,
+}
+
+const fn mir_ctor(lean_name: &'static str, fields: usize) -> MirModuleCtorArity {
+    MirModuleCtorArity { lean_name, fields }
+}
+
+/// Every structure and every constructor with fields declared in
+/// `trusted/lean/Trusted/Rustc/V2026_06_01/{Layout.lean,MirAst/*.lean}`, plus
+/// `VerificationResult.Claim` and the prelude constructors `List.cons`, `Option.some`, and
+/// `Prod.mk`: a superset of the constructors [`emit_mir_lean_module`] renders.
+///
+/// `ctor_arity_tests::mir_module_ctor_arities_match_trusted_lean_sources` re-derives the trusted
+/// entries from the Lean sources.
+const MIR_MODULE_CTOR_ARITIES: &[MirModuleCtorArity] = &[
+    mir_ctor("Layout.Size", 1),
+    mir_ctor("Layout.Align", 1),
+    mir_ctor("Layout.WrappingRange", 2),
+    mir_ctor("Layout.PrimitiveKind.int", 2),
+    mir_ctor("Layout.PrimitiveKind.float", 1),
+    mir_ctor("Layout.PrimitiveKind.pointer", 1),
+    mir_ctor("Layout.ScalarLayout.initialized", 2),
+    mir_ctor("Layout.ScalarLayout.union", 1),
+    mir_ctor("Layout.FieldsShape.union", 1),
+    mir_ctor("Layout.FieldsShape.array", 2),
+    mir_ctor("Layout.FieldsShape.arbitrary", 2),
+    mir_ctor("Layout.VariantsShape.single", 1),
+    mir_ctor("Layout.VariantsShape.multiple", 3),
+    mir_ctor("Layout.BackendRepr.scalar", 1),
+    mir_ctor("Layout.BackendRepr.scalarPair", 2),
+    mir_ctor("Layout.TypeLayout", 8),
+    mir_ctor("Layout.ArgAbi", 2),
+    mir_ctor("Layout.CallConv.other", 1),
+    mir_ctor("Layout.FnAbi", 4),
+    mir_ctor("Layout.LayoutTable", 3),
+    mir_ctor("MirAst.BasicBlockData", 3),
+    mir_ctor("MirAst.LocalDecl", 3),
+    mir_ctor("MirAst.CapturedAllocation", 5),
+    mir_ctor("MirAst.CapturedMir", 12),
+    mir_ctor("MirAst.ProjectionElem.field", 2),
+    mir_ctor("MirAst.ProjectionElem.index", 1),
+    mir_ctor("MirAst.ProjectionElem.constantIndex", 3),
+    mir_ctor("MirAst.ProjectionElem.subslice", 3),
+    mir_ctor("MirAst.ProjectionElem.downcast", 2),
+    mir_ctor("MirAst.ProjectionElem.opaqueCast", 1),
+    mir_ctor("MirAst.ProjectionElem.unwrapUnsafeBinder", 1),
+    mir_ctor("MirAst.Place", 2),
+    mir_ctor("MirAst.Operand.copy", 1),
+    mir_ctor("MirAst.Operand.move", 1),
+    mir_ctor("MirAst.Operand.constant", 1),
+    mir_ctor("MirAst.NullOp.offsetOf", 1),
+    mir_ctor("MirAst.BorrowKind.mut", 1),
+    mir_ctor("MirAst.CastKind.pointerCoercion", 1),
+    mir_ctor("MirAst.AggregateKind.array", 1),
+    mir_ctor("MirAst.AggregateKind.adt", 3),
+    mir_ctor("MirAst.AggregateKind.closure", 1),
+    mir_ctor("MirAst.AggregateKind.coroutine", 1),
+    mir_ctor("MirAst.AggregateKind.rawPtr", 2),
+    mir_ctor("MirAst.Rvalue.use", 1),
+    mir_ctor("MirAst.Rvalue.repeat", 2),
+    mir_ctor("MirAst.Rvalue.ref", 2),
+    mir_ctor("MirAst.Rvalue.threadLocalRef", 1),
+    mir_ctor("MirAst.Rvalue.rawPtr", 2),
+    mir_ctor("MirAst.Rvalue.len", 1),
+    mir_ctor("MirAst.Rvalue.cast", 3),
+    mir_ctor("MirAst.Rvalue.binaryOp", 3),
+    mir_ctor("MirAst.Rvalue.nullaryOp", 2),
+    mir_ctor("MirAst.Rvalue.unaryOp", 2),
+    mir_ctor("MirAst.Rvalue.discriminant", 1),
+    mir_ctor("MirAst.Rvalue.aggregate", 2),
+    mir_ctor("MirAst.Rvalue.shallowInitBox", 2),
+    mir_ctor("MirAst.Rvalue.copyForDeref", 1),
+    mir_ctor("MirAst.Rvalue.wrapUnsafeBinder", 2),
+    mir_ctor("MirAst.NonDivergingIntrinsic.assume", 1),
+    mir_ctor("MirAst.NonDivergingIntrinsic.copyNonOverlapping", 3),
+    mir_ctor("MirAst.StatementKind.assign", 2),
+    mir_ctor("MirAst.StatementKind.setDiscriminant", 2),
+    mir_ctor("MirAst.StatementKind.deinit", 1),
+    mir_ctor("MirAst.StatementKind.storageLive", 1),
+    mir_ctor("MirAst.StatementKind.storageDead", 1),
+    mir_ctor("MirAst.StatementKind.retag", 2),
+    mir_ctor("MirAst.StatementKind.placeMention", 1),
+    mir_ctor("MirAst.StatementKind.intrinsic", 1),
+    mir_ctor("MirAst.StatementKind.backwardIncompatibleDropHint", 1),
+    mir_ctor("MirAst.Statement", 2),
+    mir_ctor("MirAst.SwitchTargets", 2),
+    mir_ctor("MirAst.UnwindAction.cleanup", 1),
+    mir_ctor("MirAst.TerminatorKind.goto", 1),
+    mir_ctor("MirAst.TerminatorKind.switchInt", 2),
+    mir_ctor("MirAst.TerminatorKind.drop", 3),
+    mir_ctor("MirAst.TerminatorKind.call", 5),
+    mir_ctor("MirAst.TerminatorKind.tailCall", 2),
+    mir_ctor("MirAst.TerminatorKind.assert", 4),
+    mir_ctor("MirAst.TerminatorKind.inlineAsm", 3),
+    mir_ctor("MirAst.Terminator", 2),
+    mir_ctor("MirAst.RigidTy.param", 2),
+    mir_ctor("MirAst.RigidTy.alias", 2),
+    mir_ctor("MirAst.RigidTy.int", 1),
+    mir_ctor("MirAst.RigidTy.uint", 1),
+    mir_ctor("MirAst.RigidTy.float", 1),
+    mir_ctor("MirAst.RigidTy.tuple", 1),
+    mir_ctor("MirAst.RigidTy.array", 2),
+    mir_ctor("MirAst.RigidTy.slice", 1),
+    mir_ctor("MirAst.RigidTy.ref", 2),
+    mir_ctor("MirAst.RigidTy.rawPtr", 2),
+    mir_ctor("MirAst.RigidTy.adt", 2),
+    mir_ctor("MirAst.RigidTy.fnDef", 2),
+    mir_ctor("MirAst.RigidTy.fnPtr", 4),
+    mir_ctor("MirAst.RigidTy.closure", 2),
+    mir_ctor("MirAst.RigidTy.dynamic", 1),
+    mir_ctor("MirAst.RigidTy.foreign", 1),
+    mir_ctor("MirAst.RigidTy.other", 1),
+    mir_ctor("MirAst.Ty", 2),
+    mir_ctor("MirAst.ScalarInt", 2),
+    mir_ctor("MirAst.ProvenancePtr", 2),
+    mir_ctor("MirAst.ConstScalar.int", 1),
+    mir_ctor("MirAst.ConstScalar.ptr", 2),
+    mir_ctor("MirAst.ConstValue.scalar", 1),
+    mir_ctor("MirAst.ConstValue.slice", 2),
+    mir_ctor("MirAst.ConstValue.indirect", 2),
+    mir_ctor("MirAst.ConstValue.unevaluated", 1),
+    mir_ctor("MirAst.ConstOperand", 2),
+    mir_ctor("MirAst.MirPhaseTag.other", 1),
+    mir_ctor("MirAst.ContractRole.requires", 1),
+    mir_ctor("MirAst.ContractRole.ensures", 1),
+    mir_ctor("MirAst.ContractRole.externalSpec", 1),
+    mir_ctor("MirAst.GenericParamDef", 2),
+    mir_ctor("MirAst.TraitRef", 2),
+    mir_ctor("MirAst.TraitImplEntry", 2),
+    mir_ctor("VerificationResult.Claim", 4),
+    mir_ctor("List.cons", 2),
+    mir_ctor("Option.some", 1),
+    mir_ctor("Prod.mk", 2),
+];
+
+/// Whether two ASCII/UTF-8 names are byte-identical, usable in `const` context.
+const fn same_lean_name(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < a.len() {
+        if a[index] != b[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// True when every constructor of `arities` has a non-empty name that no other entry repeats and
+/// fits the LCNF budgets even if each field takes the worst case:
+/// `MAX_LCNF_SCALAR_FIELD_BYTES` scalar bytes and one boxed field.
+const fn mir_module_ctor_arities_fit(arities: &[MirModuleCtorArity]) -> bool {
+    let mut index = 0;
+    while index < arities.len() {
+        let arity = arities[index];
+        if arity.lean_name.is_empty()
+            || arity.fields > MAX_LCNF_CTOR_OBJ_FIELDS
+            || arity.fields > MAX_LCNF_CTOR_DECLARED_FIELDS
+            || arity.fields.saturating_mul(MAX_LCNF_SCALAR_FIELD_BYTES) > MAX_LCNF_CTOR_SCALAR_BYTES
+        {
+            return false;
+        }
+        let mut other = index + 1;
+        while other < arities.len() {
+            if same_lean_name(arity.lean_name, arities[other].lean_name) {
+                return false;
+            }
+            other += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
+// Pre-emission LCNF check of `emit_mir_lean_module`, at compile time.
+const _: () = assert!(
+    mir_module_ctor_arities_fit(MIR_MODULE_CTOR_ARITIES),
+    "a MIR module constructor exceeds the LCNF constructor budget"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,5 +2283,377 @@ mod tests {
         assert!(code.contains("traitImpls := (List.cons { traitRef := { defPath := \"demo::MyTrait::method\", args := (List.cons (RigidTy.adt \"demo::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil)) List.nil) }, implPath := \"demo::<Wrapper<T> as MyTrait>::method\" } List.nil)"));
         assert!(code.contains("(RigidTy.alias \"demo::MyTrait::Assoc\" (List.cons (RigidTy.param 0 \"T\") List.nil))"));
         assert!(code.contains("fieldLayouts := (List.cons 0 (List.cons 0 List.nil))"));
+    }
+}
+
+#[cfg(test)]
+mod ctor_arity_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+
+    fn demo_answer_mir() -> IrCapturedMir {
+        let u32_layout = IrTypeLayout {
+            size: IrSize { bytes: 4 },
+            align: IrAlign { bytes: 4 },
+            backend_repr: IrBackendRepr::Scalar(IrScalarLayout::Initialized {
+                value: IrPrimitiveKind::Int {
+                    bits: 32,
+                    signed: false,
+                },
+                valid_range: IrWrappingRange {
+                    start: 0,
+                    end_: u32::MAX as u128,
+                },
+            }),
+            fields: IrFieldsShape::Primitive,
+            variants: IrVariantsShape::Single { index: 0 },
+            is_uninhabited: false,
+            field_layouts: vec![],
+        };
+        let u32_ty = IrTy {
+            kind: IrRigidTy::Uint(IrUintTy::U32),
+            layout_idx: 0,
+        };
+        IrCapturedMir {
+            def_path: String::from("demo::answer"),
+            phase: IrMirPhaseTag::RuntimeOptimized,
+            role: IrContractRole::Subject,
+            type_param_count: 0,
+            generic_params: vec![],
+            trait_impls: vec![],
+            arg_count: 0,
+            local_decls: vec![IrLocalDecl {
+                mutability: IrMutability::Mut,
+                ty: u32_ty.clone(),
+                debug_name: None,
+            }],
+            basic_blocks: vec![IrBasicBlockData {
+                statements: vec![IrStatement {
+                    kind: IrStatementKind::Assign(
+                        IrPlace {
+                            local_: 0,
+                            projection: vec![],
+                        },
+                        IrRvalue::Use(IrOperand::Constant(IrConstOperand {
+                            ty: u32_ty,
+                            val: IrConstValue::Scalar(IrConstScalar::Int(IrScalarInt {
+                                bits: 42,
+                                size_bytes: 4,
+                            })),
+                        })),
+                    ),
+                    span: String::from("src/lib.rs:1:21: 1:23"),
+                    comment: Some(String::from("_0 = const 42_u32")),
+                }],
+                terminator: IrTerminator {
+                    kind: IrTerminatorKind::Return,
+                    span: String::from("src/lib.rs:1:25: 1:25"),
+                    comment: Some(String::from("return")),
+                },
+                is_cleanup: false,
+            }],
+            fn_abi: IrFnAbi {
+                args: vec![],
+                ret: IrArgAbi {
+                    layout: u32_layout.clone(),
+                    mode: IrAbiPassMode::Direct,
+                },
+                conv: IrCallConv::Rust,
+                can_unwind: true,
+            },
+            layouts: IrLayoutTable {
+                pointer_bits: 64,
+                is_little_endian: true,
+                entries: vec![u32_layout],
+            },
+            allocations: vec![],
+        }
+    }
+
+    #[test]
+    fn mir_module_ctor_arities_fit_the_lcnf_budget() {
+        assert!(mir_module_ctor_arities_fit(MIR_MODULE_CTOR_ARITIES));
+        let widest = MIR_MODULE_CTOR_ARITIES
+            .iter()
+            .max_by_key(|arity| arity.fields)
+            .expect("non-empty table");
+        assert_eq!(
+            (widest.lean_name, widest.fields),
+            ("MirAst.CapturedMir", 12)
+        );
+        let fits = |lean_name, fields| mir_module_ctor_arities_fit(&[mir_ctor(lean_name, fields)]);
+        // 241 boxed fields exceed the object budget.
+        assert!(!fits("Synthetic.objects", 241));
+        // 121 worst-case fields need 968 scalar bytes; 120 need exactly 960.
+        assert!(!fits("Synthetic.scalars", 121));
+        assert!(fits("Synthetic.largest", 120));
+        // Empty and duplicated names are rejected.
+        assert!(!fits("", 1));
+        let duplicated = [
+            mir_ctor("Synthetic.twice", 1),
+            mir_ctor("Synthetic.twice", 2),
+        ];
+        assert!(!mir_module_ctor_arities_fit(&duplicated));
+        let distinct = [mir_ctor("Synthetic.a", 1), mir_ctor("Synthetic.ab", 2)];
+        assert!(mir_module_ctor_arities_fit(&distinct));
+        // The guard is compile-time only: the emitted module is unchanged (SHA-256 of the
+        // module emitted by the pre-guard emitter, base `9110fbec`).
+        let emitted = emit_mir_lean_module("Mir.Demo.answer", &demo_answer_mir());
+        assert_eq!(
+            crate::manifest::sha256_hex(emitted.as_bytes()),
+            "41f365d3e8274ca6da09dc4f0daecdc72fd0ecee8b06c7d5d761a4deace348e9"
+        );
+    }
+
+    #[test]
+    fn rendered_mir_module_ctors_are_in_the_arity_table() {
+        let known: BTreeSet<&str> = MIR_MODULE_CTOR_ARITIES
+            .iter()
+            .map(|arity| match arity.lean_name.split_once('.') {
+                Some(("Layout" | "MirAst", rest)) => rest,
+                _ => arity.lean_name,
+            })
+            .collect();
+        let module = emit_mir_lean_module("Mir.Demo.answer", &demo_answer_mir());
+        let applied: BTreeSet<&str> = module
+            .match_indices('(')
+            .filter_map(|(offset, _)| {
+                let rest = &module[offset + 1..];
+                let head_len = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                    .unwrap_or(rest.len());
+                let head = &rest[..head_len];
+                (head.contains('.') && rest[head_len..].starts_with(' ')).then_some(head)
+            })
+            .collect();
+        assert!(applied.contains("RigidTy.uint") && applied.contains("List.cons"));
+        // `UInt8.ofNat` is a function, not a constructor.
+        let unknown: Vec<&str> = applied
+            .into_iter()
+            .filter(|head| !known.contains(head) && *head != "UInt8.ofNat")
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "constructors missing from the table: {unknown:?}"
+        );
+    }
+
+    /// Removes Lean comments, keeping string literals and line structure.
+    fn strip_lean_comments(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut index = 0;
+        let mut depth = 0usize;
+        while index < chars.len() {
+            let current = chars[index];
+            let next = chars.get(index + 1).copied();
+            if depth == 0 && current == '"' {
+                out.push(current);
+                index += 1;
+                while index < chars.len() && chars[index] != '"' {
+                    if chars[index] == '\\' && index + 1 < chars.len() {
+                        out.push(chars[index]);
+                        index += 1;
+                    }
+                    out.push(chars[index]);
+                    index += 1;
+                }
+                if index < chars.len() {
+                    out.push('"');
+                    index += 1;
+                }
+            } else if current == '/' && next == Some('-') {
+                depth += 1;
+                index += 2;
+            } else if depth > 0 && current == '-' && next == Some('/') {
+                depth -= 1;
+                index += 2;
+            } else if depth > 0 {
+                if current == '\n' {
+                    out.push('\n');
+                }
+                index += 1;
+            } else if current == '-' && next == Some('-') {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            } else {
+                out.push(current);
+                index += 1;
+            }
+        }
+        out
+    }
+
+    /// Number of binder names in the explicit, implicit, and instance binder groups of one
+    /// inductive constructor entry (the text after `|`), plus arrows of an arrow-style type.
+    fn lean_ctor_entry_arity(entry: &str) -> (String, usize) {
+        let entry = entry.trim_start();
+        let name: String = entry
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\'')
+            .collect();
+        let rest = &entry[name.len()..];
+        let mut arity = 0;
+        let mut depth = 0usize;
+        let mut group = String::new();
+        let mut result_type = None;
+        for (offset, c) in rest.char_indices() {
+            match c {
+                '(' | '{' | '[' | '\u{2983}' => {
+                    if depth > 0 {
+                        group.push(c);
+                    }
+                    depth += 1;
+                }
+                ')' | '}' | ']' | '\u{2984}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let names = group.split(':').next().unwrap_or("");
+                        arity += names.split_whitespace().count();
+                        group.clear();
+                    } else {
+                        group.push(c);
+                    }
+                }
+                ':' if depth == 0 => {
+                    result_type = Some(&rest[offset + 1..]);
+                    break;
+                }
+                _ if depth > 0 => group.push(c),
+                _ => {}
+            }
+        }
+        if let Some(result_type) = result_type {
+            let mut nesting = 0i32;
+            for c in result_type.chars() {
+                match c {
+                    '(' | '{' | '[' => nesting += 1,
+                    ')' | '}' | ']' => nesting -= 1,
+                    '\u{2192}' if nesting == 0 => arity += 1,
+                    _ => {}
+                }
+            }
+        }
+        (name, arity)
+    }
+
+    /// `(name, explicit field count, is_structure)` of every structure and inductive
+    /// constructor declared at the top level of a Lean source file.
+    fn lean_decl_arities(text: &str) -> Vec<(String, usize, bool)> {
+        let stripped = strip_lean_comments(text);
+        let lines: Vec<&str> = stripped.lines().collect();
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            index += 1;
+            let (is_structure, rest) = if let Some(rest) = line.strip_prefix("structure ") {
+                (true, rest)
+            } else if let Some(rest) = line.strip_prefix("inductive ") {
+                (false, rest)
+            } else {
+                continue;
+            };
+            let type_name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\'' || *c == '.')
+                .collect();
+            let body_start = index;
+            while index < lines.len()
+                && (lines[index].is_empty() || lines[index].starts_with([' ', '\t']))
+            {
+                index += 1;
+            }
+            let body = &lines[body_start..index];
+            if is_structure {
+                let fields = body
+                    .iter()
+                    .filter(|line| {
+                        let Some(field) = line.strip_prefix("  ") else {
+                            return false;
+                        };
+                        let name_len = field
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\'')
+                            .count();
+                        name_len > 0
+                            && !field.starts_with(|c: char| c.is_ascii_digit())
+                            && field[name_len..].starts_with(" :")
+                    })
+                    .count();
+                out.push((type_name, fields, true));
+            } else {
+                let mut entries: Vec<String> = Vec::new();
+                for line in body {
+                    if let Some(entry) = line.trim_start().strip_prefix('|') {
+                        entries.push(entry.to_owned());
+                    } else if let Some(last) = entries.last_mut() {
+                        last.push('\n');
+                        last.push_str(line);
+                    }
+                }
+                for entry in entries {
+                    let (ctor, arity) = lean_ctor_entry_arity(&entry);
+                    out.push((format!("{type_name}.{ctor}"), arity, false));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn mir_module_ctor_arities_match_trusted_lean_sources() {
+        let dialect =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../lean/Trusted/Rustc/V2026_06_01");
+        let mut sources = vec![(String::from("Layout"), dialect.join("Layout.lean"))];
+        let mut mir_ast: Vec<PathBuf> = std::fs::read_dir(dialect.join("MirAst"))
+            .expect("MirAst sources")
+            .map(|entry| entry.expect("MirAst entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "lean"))
+            .collect();
+        mir_ast.sort();
+        assert!(!mir_ast.is_empty());
+        sources.extend(
+            mir_ast
+                .into_iter()
+                .map(|path| (String::from("MirAst"), path)),
+        );
+
+        let mut expected: BTreeMap<String, usize> = BTreeMap::new();
+        for (prefix, path) in &sources {
+            let text = std::fs::read_to_string(path).expect("trusted Lean source");
+            for (name, fields, is_structure) in lean_decl_arities(&text) {
+                if is_structure || fields > 0 {
+                    let previous = expected.insert(format!("{prefix}.{name}"), fields);
+                    assert_eq!(previous, None, "duplicate declaration {name}");
+                }
+            }
+        }
+        let verification = std::fs::read_to_string(dialect.join("../../VerificationResult.lean"))
+            .expect("VerificationResult.lean");
+        let claim = lean_decl_arities(&verification)
+            .into_iter()
+            .find(|(name, _, is_structure)| name == "Claim" && *is_structure)
+            .expect("structure Claim");
+        expected.insert(String::from("VerificationResult.Claim"), claim.1);
+        for (name, fields) in [("List.cons", 2), ("Option.some", 1), ("Prod.mk", 2)] {
+            expected.insert(String::from(name), fields);
+        }
+
+        let table: BTreeMap<String, usize> = MIR_MODULE_CTOR_ARITIES
+            .iter()
+            .map(|arity| (arity.lean_name.to_owned(), arity.fields))
+            .collect();
+        assert_eq!(
+            table.len(),
+            MIR_MODULE_CTOR_ARITIES.len(),
+            "duplicate table entries"
+        );
+        assert_eq!(table, expected);
+        assert_eq!(table.get("Layout.TypeLayout"), Some(&8));
+        assert_eq!(table.get("MirAst.CapturedMir"), Some(&12));
+        assert_eq!(table.get("MirAst.TerminatorKind.call"), Some(&5));
     }
 }

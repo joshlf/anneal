@@ -66,6 +66,8 @@ _AMBIENT_ANNEAL_ENV_PREFIXES: tuple[str, ...] = (
     "ANNEAL_WORKTREE_",
     "ANNEAL_LSP_",
     "ANNEAL_OOM_",
+    "ANNEAL_REPLAY_",
+    "ANNEAL_AUDIT_",
 )
 _ENV_PATCHER: Any = None
 # Every Python-level way to replace the current process image ends in `os.execv` or
@@ -2719,6 +2721,8 @@ class TestCliSubprocess(unittest.TestCase):
             "ANNEAL_LEAN_MEMORY_MAX_MB",
             "ANNEAL_LEAN_TIMEOUT_SEC",
             "ANNEAL_LEAN_RUN_IN_SCOPE",
+            "ANNEAL_REPLAY_THREADS",
+            "ANNEAL_AUDIT_LEAN_THREADS",
         ):
             self.assertIn(known, names)
         self.assertEqual(
@@ -2757,6 +2761,9 @@ class TestCliSubprocess(unittest.TestCase):
                 "ANNEAL_LSP_NO_EVICT": "1",
                 "ANNEAL_LSP_SOCKET": str(root / "no-such.sock"),
                 "ANNEAL_OOM_OFFLOAD_CMD": "false",
+                # An invalid replay budget fails closed (exit 2) if it ever leaks through.
+                "ANNEAL_REPLAY_THREADS": "65",
+                "ANNEAL_AUDIT_LEAN_THREADS": "9",
             }
 
             def synthetic(env_extra: dict[str, str] | None = None) -> dict[str, Any]:
@@ -2782,7 +2789,8 @@ class TestCliSubprocess(unittest.TestCase):
                 "-c",
                 "import json, os; print(json.dumps({"
                 "k: os.environ.get(k) for k in ("
-                "'ANNEAL_LEAN_RUN_LEAN_M_MB', 'ANNEAL_LSP_NO_EVICT', 'ANNEAL_OOM_OFFLOAD_CMD'"
+                "'ANNEAL_LEAN_RUN_LEAN_M_MB', 'ANNEAL_LSP_NO_EVICT', 'ANNEAL_OOM_OFFLOAD_CMD', "
+                "'ANNEAL_AUDIT_LEAN_THREADS'"
                 ")}))",
             ]
 
@@ -2834,6 +2842,8 @@ class TestCliSubprocess(unittest.TestCase):
                     "ANNEAL_LEAN_RUN_LEAN_M_MB": str(clean_file["lean_m_mb"]),
                     "ANNEAL_LSP_NO_EVICT": None,
                     "ANNEAL_OOM_OFFLOAD_CMD": None,
+                    # The default replay budget, not the poisoned ambient value.
+                    "ANNEAL_AUDIT_LEAN_THREADS": str(min(2, clean_file["threads"])),
                 },
             )
             for live_data in (live, direct):
@@ -2879,8 +2889,21 @@ class TestCliSubprocess(unittest.TestCase):
                     "ANNEAL_LEAN_RUN_LEAN_M_MB": "99",
                     "ANNEAL_LSP_NO_EVICT": "1",
                     "ANNEAL_OOM_OFFLOAD_CMD": "false",
+                    "ANNEAL_AUDIT_LEAN_THREADS": None,
                 },
             )
+            leaked_replay = self._synthetic_cli(
+                root, "cg_uncapped", "--probe", "--json",
+                env_extra={"ANNEAL_REPLAY_THREADS": "65"},
+            )
+            self.assertEqual(leaked_replay.returncode, 2, leaked_replay.stderr)
+            self.assertIn("invalid ANNEAL_REPLAY_THREADS='65'", leaked_replay.stderr)
+            leaked_audit = self._synthetic_cli(
+                root, "cg_uncapped", "--mode", "file", "--no-slot-lock", "--", *child_env_cmd,
+                env_extra={"ANNEAL_AUDIT_LEAN_THREADS": "9"},
+            )
+            self.assertEqual(leaked_audit.returncode, 0, leaked_audit.stderr)
+            self.assertEqual(json.loads(leaked_audit.stdout)["ANNEAL_AUDIT_LEAN_THREADS"], "9")
 
     def test_cli_synthetic_hosts_honor_caller_lowered_lean_num_threads_end_to_end(self) -> None:
         """Real subprocess CLI on both uncapped and cgroup-capped synthetic hosts:

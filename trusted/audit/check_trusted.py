@@ -27,7 +27,8 @@ sys.dont_write_bytecode = True  # Public self-test imports must not write checko
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
-CHILD_TIMEOUT_SECS = 180
+CHILD_TIMEOUT_SECS = 300  # The -j1 compile of Anneal.PureMirExec takes 165-197 s under load.
+AUDIT_LEAN_THREADS_ENV, DEFAULT_AUDIT_LEAN_THREADS, MAX_AUDIT_LEAN_THREADS = "ANNEAL_AUDIT_LEAN_THREADS", 2, 64  # Lean children's LEAN_NUM_THREADS.
 # The compiled-environment auditor re-checks every non-toolchain declaration in the kernel (the
 # downstream environment holds ~50k declarations), so it gets a longer, still bounded, envelope.
 OLEAN_CHILD_TIMEOUT_SECS = 900
@@ -94,7 +95,15 @@ DOWNSTREAM_TARGETS = [
     ("Anneal.UnsafeObligations", "theory/Anneal/UnsafeObligations.lean", ["Trusted", "Anneal.Memory"], "theory"),
     ("Anneal.SepLogic", "theory/Anneal/SepLogic.lean", ["Trusted", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.Memory", "Anneal.UnsafeObligations"], "theory"),
     ("Anneal.Rustc.V2026_06_01.Lower", "theory/Anneal/Rustc/V2026_06_01/Lower.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.Memory", "Anneal.UnsafeObligations", "Anneal.SepLogic"], "theory"),
-    ("Anneal.Rustc.V2026_06_01.SymbolicEval", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.Scalars", "Anneal.Memory", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval.CoreEvalAndDischarge", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval/CoreEvalAndDischarge.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.Scalars", "Anneal.Memory", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval.PinnedSpecEquivAndCalls", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval/PinnedSpecEquivAndCalls.lean", ["Anneal.Rustc.V2026_06_01.SymbolicEval.CoreEvalAndDischarge"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval.DiffTestingAndSigTests", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval/DiffTestingAndSigTests.lean", ["Anneal.Rustc.V2026_06_01.SymbolicEval.PinnedSpecEquivAndCalls"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval.SymTableGvnAndCanonState", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval/SymTableGvnAndCanonState.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.Scalars", "Anneal.Memory", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval.MirCfgAndJoinPruning", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval/MirCfgAndJoinPruning.lean", ["Anneal.Rustc.V2026_06_01.SymbolicEval.SymTableGvnAndCanonState"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval.CfgGvnDriverAndBenchmarks", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval/CfgGvnDriverAndBenchmarks.lean", ["Anneal.Rustc.V2026_06_01.SymbolicEval.MirCfgAndJoinPruning"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval.MirSemanticsBridges", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval/MirSemanticsBridges.lean", ["Anneal.Rustc.V2026_06_01.SymbolicEval.DiffTestingAndSigTests", "Anneal.Rustc.V2026_06_01.SymbolicEval.CfgGvnDriverAndBenchmarks"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval.MirJoinDiamondWitness", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval/MirJoinDiamondWitness.lean", ["Anneal.Rustc.V2026_06_01.SymbolicEval.MirSemanticsBridges"], "theory"),
+    ("Anneal.Rustc.V2026_06_01.SymbolicEval", "theory/Anneal/Rustc/V2026_06_01/SymbolicEval.lean", ["Anneal.Rustc.V2026_06_01.SymbolicEval.CoreEvalAndDischarge", "Anneal.Rustc.V2026_06_01.SymbolicEval.PinnedSpecEquivAndCalls", "Anneal.Rustc.V2026_06_01.SymbolicEval.DiffTestingAndSigTests", "Anneal.Rustc.V2026_06_01.SymbolicEval.SymTableGvnAndCanonState", "Anneal.Rustc.V2026_06_01.SymbolicEval.MirCfgAndJoinPruning", "Anneal.Rustc.V2026_06_01.SymbolicEval.CfgGvnDriverAndBenchmarks", "Anneal.Rustc.V2026_06_01.SymbolicEval.MirSemanticsBridges", "Anneal.Rustc.V2026_06_01.SymbolicEval.MirJoinDiamondWitness"], "theory"),
     ("Anneal.Rustc.V2026_06_01.SymReflect", "theory/Anneal/Rustc/V2026_06_01/SymReflect.lean", ["Trusted", "Anneal.ITreeWP", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval"], "theory"),
     ("Anneal.Rustc.V2026_06_01.TraceCheck", "theory/Anneal/Rustc/V2026_06_01/TraceCheck.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.Rustc.V2026_06_01.Lower"], "theory"),
     ("Anneal.FunctionalTranslation", "theory/Anneal/FunctionalTranslation.lean", ["Trusted", "Anneal.Refinement", "Anneal.ITree", "Anneal.ITreeWP", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower"], "theory"),
@@ -145,6 +154,18 @@ class Failure(Exception):
     def __init__(self, code: int, phase: str, message: str):
         super().__init__(message)
         self.code, self.phase = code, phase
+
+
+def resolve_audit_lean_threads(env=None) -> str:
+    """Unset/blank AUDIT_LEAN_THREADS_ENV: the default; else ASCII digits in 1..MAX, or Failure(2, "admission")."""
+    raw = (os.environ if env is None else env).get(AUDIT_LEAN_THREADS_ENV)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return str(DEFAULT_AUDIT_LEAN_THREADS)
+    digits = raw.lstrip("0") if isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw) else None  # Bounded before int().
+    if digits is not None and len(digits) <= len(str(MAX_AUDIT_LEAN_THREADS)) and 1 <= int(digits or "0") <= MAX_AUDIT_LEAN_THREADS:
+        return str(int(digits))
+    shown = repr(raw[:32]) + "..." if isinstance(raw, str) and len(raw) > 32 else repr(raw)
+    raise Failure(2, "admission", f"invalid {AUDIT_LEAN_THREADS_ENV}={shown}; expected integer in 1..{MAX_AUDIT_LEAN_THREADS}")
 
 
 def digest(path: Path) -> str:
@@ -286,10 +307,9 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
                 or not all(isinstance(x, str) and x for x in entry)
                 or not re.fullmatch(r"[0-9a-f]{64}", entry[1])):
             raise Failure(1, phase, "invalid rust_sources entry in CaptureManifest.json")
-        # rustc-capture records sources relative to its working directory and keeps the
-        # absolute path of a primary-package source outside it (`#[path]` modules, generated
-        # `include!` files), so absolute entries are digest-checked as recorded; a relative
-        # entry, however, must not climb above the manifest root (`../escape.rs`).
+        # rustc-capture records sources relative to its working directory and keeps the absolute path of a primary-package
+        # source outside it (`#[path]` modules, generated `include!` files), so absolute entries are digest-checked as
+        # recorded; a relative entry, however, must not climb above the manifest root (`../escape.rs`).
         if not os.path.isabs(entry[0]) and climbs_above_root(entry[0]):
             raise Failure(1, phase, f"CaptureManifest.json rust_sources path escapes checkout: {entry[0]}")
         raw_src = root / entry[0]
@@ -312,34 +332,26 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
         if target["def_id"] in seen_defs:
             raise Failure(1, phase, f"duplicate target def_id {target['def_id']}")
         seen_defs.add(target["def_id"])
-        # Generated `Mir/<Item>.lean` modules live under the manifest root (cargo-anneal derives
-        # their module names from the relative path): absolute, root-escaping, symlinked, or
-        # non-`.lean` paths fail.
+        # Generated `Mir/<Item>.lean` modules live under the manifest root (cargo-anneal derives their module names
+        # from the relative path): absolute, root-escaping, symlinked, or non-`.lean` paths fail.
         mir_rel = target["mir_module_path"]
         if os.path.isabs(mir_rel) or climbs_above_root(mir_rel):
-            raise Failure(
-                1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {mir_rel}"
-            )
+            raise Failure(1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {mir_rel}")
         if not mir_rel.endswith(".lean"):
-            raise Failure(
-                1, phase, f"CaptureManifest.json mir_module_path must be a .lean file: {mir_rel}"
-            )
+            raise Failure(1, phase, f"CaptureManifest.json mir_module_path must be a .lean file: {mir_rel}")
         raw_mir = root / mir_rel
         regular(raw_mir, phase)
         mir_path = raw_mir.resolve()
         try:
             mir_path.relative_to(root_resolved)
         except ValueError:
-            raise Failure(
-                1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {mir_rel}"
-            )
+            raise Failure(1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {mir_rel}")
         regular(mir_path, phase)
         if digest(mir_path) != target["mir_module_sha256"]:
             raise Failure(1, phase, f"Mir module digest mismatch for {mir_rel}")
         lean_audit_targets.append((mir_rel, mir_path))
-    # Waiver pins on the captured Rust sources (`lang="rust"` so included non-`.rs` files
-    # cannot evade `audit_rust_text`); waiver pins plus annotated-claim non-vacuity on the
-    # `Mir/<Item>.lean` targets (`lang="lean"`, after their digests matched).
+    # Waiver pins on the captured Rust sources (`lang="rust"` so included non-`.rs` files cannot evade `audit_rust_text`);
+    # waiver pins plus annotated-claim non-vacuity on the `Mir/<Item>.lean` targets (`lang="lean"`, after digests matched).
     audit_waivers_and_vacuity(rust_audit_sources, vacuity=False, lang="rust")
     audit_waivers_and_vacuity(lean_audit_targets, vacuity=True, lang="lean")
     return manifest
@@ -505,11 +517,12 @@ class Checker:
             self.cache_dir = raw_cache.resolve()
             if self.cache_dir == self.checkout or self.checkout in self.cache_dir.parents:
                 raise Failure(2, "admission", f"cache directory must reside outside checkout: {self.cache_dir}")
+        audit_lean_threads = resolve_audit_lean_threads()  # Before the stage exists: no leak on failure.
         self.stage = Path(tempfile.mkdtemp(prefix="anneal-trusted-", dir=temp_parent)).resolve()
         self.phase, self.execution_began, self.counter = "admission", False, 0
         self.environment = {k: v for k, v in os.environ.items()
                             if not k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_"))}
-        self.environment["PATH"] = os.defpath
+        self.environment["PATH"], self.environment["LEAN_NUM_THREADS"] = os.defpath, audit_lean_threads
         self.artifacts: dict[str, list[list[str]]] = {}
         self.graph: dict = {}
         self.expected_artifacts: dict[str, str] = {}
@@ -1435,11 +1448,13 @@ class Checker:
                     "preflight",
                     f"project imports of {module} ({actual_proj}) differ from DOWNSTREAM_TARGETS ({expected_proj})",
                 )
-        # `--fast` elaborates up to four declarations at once (`-j4`, `Elab.async`), so its peak heap
-        # is several sequential peaks: `-M2048` makes the kernel abort with "excessive memory
-        # consumption" on large theory modules that the sequential `-j1 -M2048` path accepts.
+        # `--fast` compiles downstream modules without async elaboration and respects
+        # `LEAN_NUM_THREADS` (`ANNEAL_AUDIT_LEAN_THREADS`, default 2) with `-M4096` headroom:
+        # `Elab.async=true` + `-M2048` causes intermittent "excessive memory consumption"
+        # aborts on large theory modules (e.g. Anneal.PureMirExec), while `-j{LEAN_NUM_THREADS}`
+        # avoids oversubscribing 8 GiB capsules.
         downstream_flags = (
-            ["-j4", "-M4096", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
+            [f"-j{self.environment['LEAN_NUM_THREADS']}", "-M4096", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
             if self.fast
             else ["-j1", "-M2048", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
         )
@@ -1603,7 +1618,7 @@ class Checker:
         if self.fast:
             self.freshness()
         trusted_flags = (
-            ["-j4", "-M2048", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false"]
+            [f"-j{self.environment['LEAN_NUM_THREADS']}", "-M2048", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false"]
             if self.fast
             else ["-j1", "-M2048", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false"]
         )
@@ -8296,17 +8311,14 @@ def audit_waivers_and_vacuity(
 ) -> dict[str, int]:
     """Enforce waiver pins and annotated-claim non-vacuity on `(label, path)` sources.
 
-    `.rs` sources (or `lang="rust"`) get the waiver-pin audit; `.lean` sources (or
-    `lang="lean"`) get the waiver-pin audit plus
-    (with `vacuity`) every 3-axis / `TRIVIAL_PROOF` check on theorems carrying 3-axis
-    metadata (`Kind:` / `Witness:` / `Assumes:` / `Subject:`) or an `anneal:` waiver
-    docstring, and on `Proof/` claim theorems, plus the syntactic hypothesis-contradiction
-    check on all named hypotheses (`vacuity_scope="annotated"`).
-    Unannotated smoke lemmas without contradictory hypotheses (such as
-    `theorem trivial_witness : True := trivial`) pass cleanly. Raises `Failure(1, "waiver-pin", ...)`
-    when any source has a waiver finding, else `Failure(1, "vacuity-audit", ...)` on any
-    vacuity finding, and returns `{"leanFiles": ..., "rustFiles": ...}` when clean. Pure
-    Python: it spawns no subprocess, so `--fast` status-file counts are unaffected.
+    `.rs` sources (or `lang="rust"`) get the waiver-pin audit; `.lean` sources (or `lang="lean"`) get the waiver-pin
+    audit plus (with `vacuity`) every 3-axis / `TRIVIAL_PROOF` check on theorems carrying 3-axis metadata (`Kind:` /
+    `Witness:` / `Assumes:` / `Subject:`) or an `anneal:` waiver docstring, and on `Proof/` claim theorems, plus the
+    syntactic hypothesis-contradiction check on all named hypotheses (`vacuity_scope="annotated"`). Unannotated smoke
+    lemmas without contradictory hypotheses (such as `theorem trivial_witness : True := trivial`) pass cleanly. Raises
+    `Failure(1, "waiver-pin", ...)` when any source has a waiver finding, else `Failure(1, "vacuity-audit", ...)` on any
+    vacuity finding, and returns `{"leanFiles": ..., "rustFiles": ...}` when clean. Pure Python: it spawns no
+    subprocess, so `--fast` status-file counts are unaffected.
     """
     waiver_hits: list[tuple[str, WaiverPinFinding]] = []
     vacuity_hits: list[tuple[str, WaiverPinFinding]] = []
@@ -8323,9 +8335,7 @@ def audit_waivers_and_vacuity(
             findings = audit_rust_text(text, file_path=label)
         else:
             n_lean += 1
-            findings = audit_lean_text(
-                text, file_path=label, check_3axis=vacuity, vacuity_scope="annotated"
-            )
+            findings = audit_lean_text(text, file_path=label, check_3axis=vacuity, vacuity_scope="annotated")
         for finding in findings:
             (waiver_hits if finding.rule in _WAIVER_RULE_SET else vacuity_hits).append((label, finding))
     for phase, hits, what in ((WAIVER_PIN_PHASE, waiver_hits, "waiver-pin"),
@@ -8513,9 +8523,9 @@ def verify_base_snapshot(checkout: Path, snapshot: Path, expected_drift=()) -> d
 
 
 def waiver_vacuity_gate(checkout: Path) -> dict[str, dict[str, int]]:
-    """`--audit-vacuity`: the pure-Python waiver-pin / vacuity audit of the checkout's
-    `trusted/lean` sources, `trusted/rustc-capture` Rust sources, and `DOWNSTREAM_TARGETS`
-    (no Lean process; the full gate also audits the staged copies it compiles)."""
+    """`--audit-vacuity`: the pure-Python waiver-pin / vacuity audit of the checkout's `trusted/lean` sources,
+    `trusted/rustc-capture` Rust sources, and `DOWNSTREAM_TARGETS` (no Lean process; the full gate also audits the
+    staged copies it compiles)."""
     source = checkout / "trusted/lean"
     _inventory, modules = snapshot(source)
     trusted = audit_waivers_and_vacuity([(f"trusted/lean/{rel}", source / rel) for rel in modules.values()])
