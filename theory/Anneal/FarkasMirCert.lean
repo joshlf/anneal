@@ -2501,6 +2501,37 @@ theorem canary_align_zero_guard_isolated :
       (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) = false :=
   ⟨rfl, rfl, rfl⟩
 
+/-- Canary: isolates the `lo ≤ hi` and `hi < M` guards of `aipccIntervalRefine`
+and the operand-range guard of `uintSubNoUnderflowCertified`. In each case,
+every valid sub-goal certificate checks `= true` independently while
+`checkFarkasMirGoal` rejects `= false` solely on the violated guard. -/
+theorem canary_aipcc_and_sub_guards_isolated :
+    -- `lo > hi` (10 > 5): both bound certs valid, `Nat.ble 10 5` rejects
+    checkNatCutGoal ⟨[⟨.cst 10, .var 0⟩, ⟨.var 0, .cst 5⟩], ⟨.cst 10, .var 0⟩⟩
+      [.hyp 0, .hyp 3, .comb 0 1 1 1] = true ∧
+    checkNatCutGoal ⟨[⟨.cst 10, .var 0⟩, ⟨.var 0, .cst 5⟩], ⟨.var 0, .cst 5⟩⟩
+      [.hyp 1, .hyp 3, .comb 0 1 1 1] = true ∧
+    checkFarkasMirGoal
+      (.aipccIntervalRefine [⟨.cst 10, .var 0⟩, ⟨.var 0, .cst 5⟩] 256 10 5 (.var 0))
+      (.pair [.hyp 0, .hyp 3, .comb 0 1 1 1] [.hyp 1, .hyp 3, .comb 0 1 1 1]) = false ∧
+    -- `hi ≥ M` (256 ≥ 256): both bound certs valid, `Nat.blt 256 256` rejects
+    checkNatCutGoal ⟨[⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 256⟩], ⟨.cst 0, .var 0⟩⟩
+      [.hyp 0, .hyp 3, .comb 0 1 1 1] = true ∧
+    checkNatCutGoal ⟨[⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 256⟩], ⟨.var 0, .cst 256⟩⟩
+      [.hyp 1, .hyp 3, .comb 0 1 1 1] = true ∧
+    checkFarkasMirGoal
+      (.aipccIntervalRefine [⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 256⟩] 256 0 256 (.var 0))
+      (.pair [.hyp 0, .hyp 3, .comb 0 1 1 1] [.hyp 1, .hyp 3, .comb 0 1 1 1]) = false ∧
+    -- `uintSubNoUnderflowCertified`: `b ≤ a` cert valid, `a < 2^32` range fails
+    checkNatCutGoal
+      ⟨[⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst (modPow2 32)⟩], ⟨.var 1, .var 0⟩⟩
+      [.hyp 0, .hyp 4, .comb 0 1 1 1] = true ∧
+    checkFarkasMirGoal
+      (.uintSubNoUnderflowCertified .u32
+        [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst (modPow2 32)⟩] (.var 0) (.var 1))
+      (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-! ### Fail-Closed Negative `rfl` Controls (`= false`) -/
 
 /-- Negative canary: truncated or overlong `certs` lists are rejected fail-closed
@@ -2626,10 +2657,10 @@ theorem neg_canary_structural_fail_closed :
     checkFarkasMirGoal
       (.aipccIntervalRefine [⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 256⟩] 256 0 256 (.var 0))
       (.pair [.hyp 0, .hyp 3, .comb 0 1 1 1] [.hyp 1, .hyp 3, .comb 0 1 1 1]) = false ∧
-    -- Mismatched goal/cert constructor rejected
+    -- Mismatched goal/cert constructor rejected (valid cert wrapped as `.edge`)
     checkFarkasMirGoal
       (.sliceBounds [⟨.var 0, .cst 1⟩] (.var 0) (.cst 0) (.cst 1))
-      (.edge []) = false ∧
+      (.edge [[.hyp 0, .hyp 2, .comb 0 1 1 1]]) = false ∧
     -- Certified subtraction with an unprovable operand range (`a ≤ 2^32`
     -- admits `a = 2^32`) rejected even though `b ≤ a` is certified
     checkFarkasMirGoal

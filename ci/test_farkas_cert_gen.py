@@ -1478,6 +1478,7 @@ class FarkasMirCertGenTests(unittest.TestCase):
                 "sources": [
                     ["Anneal.FarkasMirCert", str(_ANNEAL_ROOT / "theory/Anneal/FarkasMirCert.lean")],
                     ["Anneal.TestFarkasMirPreflight", str(probe)],
+                    ["Anneal.TestFarkasMirDiffPreflight", str(cfile)],
                 ],
             }), encoding="utf-8")
             pf = subprocess.run(
