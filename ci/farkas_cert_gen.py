@@ -527,6 +527,19 @@ def generate_certificate(
 
 
 _SUPPORTED_WIDTHS = frozenset({8, 16, 32, 64, 128})
+# Global Lean identifiers referenced by `--mir-bounds` snippets. User variables
+# are bound as theorem binders, so a variable with one of these names would
+# shadow the global and make the emitted snippet ill-typed.
+_MIR_SNIPPET_RESERVED = frozenset((
+    "modPow2 uintWidth uintBytes scalarModulus evalScalarBinOp ValidSliceRange "
+    "evalPtrOffset AlignedPtr NonOverlappingPtrs WrappedInterval RawPtrVal LocalSlot "
+    "Memory NatCutIneq NatLinExpr ScalarInt UintTy some none wrappedInterval_denote_bounds "
+    "farkas_discharges_slice_bounds farkas_discharges_aligned_stride "
+    "farkas_discharges_u64_add_no_overflow farkas_discharges_uint_add_no_overflow "
+    "farkas_discharges_uint_sub_no_underflow farkas_discharges_uint_sub_no_underflow_certified "
+    "farkas_discharges_uint_mul_const_no_overflow farkas_discharges_non_overlapping_ptrs "
+    "farkas_discharges_aipcc_interval_refinement"
+).split())
 _MIR_BOUNDS_PRESETS = (
     "slice-range",
     "aligned-stride",
@@ -773,11 +786,14 @@ def generate_mir_bounds_certificate(
     _validate_common_args(thm_name, max_nodes)
     if preset not in _MIR_BOUNDS_PRESETS:
         raise ParseError(f"Unsupported `--mir-bounds` preset: `{preset}`")
+    base_reserved = _MIR_SNIPPET_RESERVED
+    if thm_name in base_reserved:
+        raise ParseError(f"Unsupported or reserved Lean name: `{thm_name}`")
     conj = "/\\" if ascii_lean else "∧"
     le_sym = "<=" if ascii_lean else "≤"
 
     if preset == "slice-range":
-        reserved = frozenset({thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", "rp", "hOff"})
+        reserved = base_reserved | frozenset({thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", "rp", "hOff"})
         off_ast = _parse_expr_str(offset_expr, "nat", reserved=reserved)
         len_ast = _parse_expr_str(len_expr, "nat", reserved=reserved)
         tot_ast = _parse_expr_str(total_expr, "nat", reserved=reserved)
@@ -829,7 +845,7 @@ def generate_mir_bounds_certificate(
     if preset == "aligned-stride":
         if align < 1 or align > _MAG_CAP_128:
             raise ParseError("`--align` must satisfy `1 <= align <= 2^128`.")
-        reserved = frozenset({
+        reserved = base_reserved | frozenset({
             thm_name, f"{thm_name}_hyps", f"{thm_name}_cert_le", f"{thm_name}_cert_ge", "rp", "hOff"
         })
         off_ast = _parse_expr_str(offset_expr, "nat", reserved=reserved)
@@ -886,7 +902,7 @@ def generate_mir_bounds_certificate(
     if preset == "uint-add-no-overflow":
         if width not in _SUPPORTED_WIDTHS:
             raise ParseError(f"Unsupported `--width {width}`; expected one of 8, 16, 32, 64, 128.")
-        reserved = frozenset({thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", "locals", "mem"})
+        reserved = base_reserved | frozenset({thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", "locals", "mem"})
         lhs_ast = _parse_expr_str(lhs_expr, "nat", reserved=reserved)
         rhs_ast = _parse_expr_str(rhs_expr, "nat", reserved=reserved)
         sum_ast = ("add", lhs_ast, rhs_ast)
@@ -956,8 +972,9 @@ def generate_mir_bounds_certificate(
     if preset == "uint-sub-no-underflow":
         if width not in _SUPPORTED_WIDTHS:
             raise ParseError(f"Unsupported `--width {width}`; expected one of 8, 16, 32, 64, 128.")
-        reserved = frozenset({
-            thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", "locals", "mem", "hRange"
+        reserved = base_reserved | frozenset({
+            thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", f"{thm_name}_cert_range",
+            "locals", "mem", "hRange"
         })
         lhs_ast = _parse_expr_str(lhs_expr, "nat", reserved=reserved)
         rhs_ast = _parse_expr_str(rhs_expr, "nat", reserved=reserved)
@@ -995,25 +1012,56 @@ def generate_mir_bounds_certificate(
         sc_r = _format_scalar(rhs_raw, f"uintBytes {uty}", ascii_lean=ascii_lean)
         sc_diff = _format_scalar(diff_s, f"uintBytes {uty}", ascii_lean=ascii_lean)
         sc_z = _format_scalar("0", "1", ascii_lean=ascii_lean)
-        snippet = (
-            f"{_mir_header()}"
-            f"private def {thm_name}_hyps : List NatCutIneq :=\n  [{hyp_lits}]\n\n"
-            f"private def {thm_name}_cert : List CutStep :=\n  [{_format_steps(steps)}]\n\n"
-            f"private theorem {thm_name} {v_bind}(locals : List LocalSlot) (mem : Memory)\n"
-            f"    (hRange : {lhs_raw} < modPow2 (uintWidth {uty})){h_bind} :\n"
+        # Try to also certify the operand range `lhs + 1 <= 2^width` from the same
+        # hypotheses; when found, the emitted theorem needs no external `hRange`.
+        try:
+            steps_rng = _solve_fixed_goal(
+                "nat", le_hyps_ast, ("add", lhs_ast, ("cst", 1)), ("cst", 1 << width),
+                vidx, max_nodes,
+            )
+        except ParseError:
+            steps_rng = None
+        concl = (
             f"    {rhs_raw} {le_sym} {lhs_raw} {conj}\n"
             f"    {diff_s} < modPow2 (uintWidth {uty}) {conj}\n"
             f"    evalScalarBinOp .subUnchecked {sc_l} {sc_r} locals mem false =\n"
             f"      .ok (.scalar {sc_diff}) locals mem {conj}\n"
             f"    evalScalarBinOp .subWithOverflow {sc_l} {sc_r} locals mem false =\n"
             f"      .ok (.aggregate 0 [.scalar {sc_diff}, .scalar {sc_z}]) locals mem :=\n"
+        )
+        if steps_rng is not None:
+            snippet = (
+                f"{_mir_header()}"
+                f"private def {thm_name}_hyps : List NatCutIneq :=\n  [{hyp_lits}]\n\n"
+                f"private def {thm_name}_cert : List CutStep :=\n  [{_format_steps(steps)}]\n\n"
+                f"private def {thm_name}_cert_range : List CutStep :=\n  [{_format_steps(steps_rng)}]\n\n"
+                f"private theorem {thm_name} {v_bind}(locals : List LocalSlot) (mem : Memory){h_bind} :\n"
+                f"    {lhs_raw} < modPow2 (uintWidth {uty}) {conj}\n"
+                f"{concl}"
+                f"  farkas_discharges_uint_sub_no_underflow_certified {uty} {thm_name}_hyps\n"
+                f"    ({rp_ast(lhs_ast)}) ({rp_ast(rhs_ast)})\n"
+                f"    {thm_name}_cert {thm_name}_cert_range rfl rfl [{', '.join(vars_)}] locals mem{p_args}"
+            )
+            return {
+                "solved": True, "mode": "mir-bounds", "preset": preset, "domain": "nat",
+                "width": width, "variables": vars_, "steps": steps,
+                "range_certified": True, "steps_range": steps_rng, "lean_snippet": snippet,
+            }
+        snippet = (
+            f"{_mir_header()}"
+            f"private def {thm_name}_hyps : List NatCutIneq :=\n  [{hyp_lits}]\n\n"
+            f"private def {thm_name}_cert : List CutStep :=\n  [{_format_steps(steps)}]\n\n"
+            f"private theorem {thm_name} {v_bind}(locals : List LocalSlot) (mem : Memory)\n"
+            f"    (hRange : {lhs_raw} < modPow2 (uintWidth {uty})){h_bind} :\n"
+            f"{concl}"
             f"  farkas_discharges_uint_sub_no_underflow {uty} {thm_name}_hyps\n"
             f"    ({rp_ast(lhs_ast)}) ({rp_ast(rhs_ast)})\n"
             f"    {thm_name}_cert rfl [{', '.join(vars_)}] locals mem hRange{p_args}"
         )
         return {
             "solved": True, "mode": "mir-bounds", "preset": preset, "domain": "nat",
-            "width": width, "variables": vars_, "steps": steps, "lean_snippet": snippet,
+            "width": width, "variables": vars_, "steps": steps,
+            "range_certified": False, "lean_snippet": snippet,
         }
 
     if preset == "aipcc-interval-refine":
@@ -1035,7 +1083,7 @@ def generate_mir_bounds_certificate(
                 raise ParseError(
                     f"Source interval [{src_lo}, {src_hi}] must satisfy 0 <= lo <= hi < 2^{width}."
                 )
-        reserved = frozenset({
+        reserved = base_reserved | frozenset({
             thm_name, f"{thm_name}_hyps", f"{thm_name}_cert_lo", f"{thm_name}_cert_hi", "hSrc"
         })
         x_ast = _parse_expr_str(var_name, "nat", reserved=reserved)
@@ -1107,7 +1155,11 @@ def generate_mir_bounds_certificate(
             raise ParseError(f"Unsupported `--width {width}`; expected one of 8, 16, 32, 64, 128.")
         if scale < 0 or scale > _MAG_CAP_128:
             raise ParseError("`--scale` must satisfy `0 <= scale <= 2^128`.")
-        reserved = frozenset({thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", "locals", "mem"})
+        if scale >= (1 << width):
+            raise ParseError(
+                f"`--scale {scale}` is not a valid `u{width}` operand (must be < 2^{width})."
+            )
+        reserved = base_reserved | frozenset({thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", "locals", "mem"})
         x_ast = _parse_expr_str(var_name, "nat", reserved=reserved)
         prod_ast = ("mulC", scale, x_ast)
         gl_le = ("add", prod_ast, ("cst", 1))
@@ -1165,7 +1217,7 @@ def generate_mir_bounds_certificate(
     # preset == "non-overlapping-ptrs"
     if direction not in ("src-before-dst", "dst-before-src"):
         raise ParseError(f"Unsupported `--direction`: `{direction}`")
-    reserved = frozenset({
+    reserved = base_reserved | frozenset({
         thm_name, f"{thm_name}_hyps", f"{thm_name}_cert", "src", "dst", "hSrcOff", "hDstOff"
     })
     src_ast = _parse_expr_str(src_offset_expr, "nat", reserved=reserved)
@@ -1487,7 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
             if ns.pres or ns.obligations or ns.witness is not None or ns.strict_witness is not None or ns.check_equiv:
                 raise ParseError("Entailment flags require `--entailment-check`.")
             if ns.goal is None:
-                raise ParseError("the following arguments are required: --goal")
+                # Preserve baseline argparse semantics (`--goal` was `required=True`).
+                p.error("the following arguments are required: --goal")
             res = generate_certificate(
                 ns.domain, ns.hyps, ns.goal, ns.name,
                 max_nodes=ns.max_nodes, ascii_lean=ascii_lean,

@@ -392,6 +392,20 @@ class FarkasCertGenTests(unittest.TestCase):
             self.assertTrue(json.loads(p_out.read_text(encoding="utf-8"))["ok"])
 
 
+def _tamper_snippet(snip: str) -> str:
+    """Replace the first certificate in a generated snippet with `[.hyp 0]`."""
+    out, n = re.subn(
+        r"(_cert(?:_le|_lo)? : List CutStep :=\n  )\[[^\]]*\]", r"\1[.hyp 0]", snip, count=1
+    )
+    if n == 0:
+        out, n = re.subn(
+            r"(_fwd_certs : List \(List CutStep\) :=\n  )\[\[[^\]]*\]", r"\1[[.hyp 0]",
+            snip, count=1,
+        )
+    assert n == 1 and out != snip, snip
+    return out
+
+
 class FarkasMirCertGenTests(unittest.TestCase):
     def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -536,11 +550,69 @@ class FarkasMirCertGenTests(unittest.TestCase):
             ["--mir-bounds", "slice-range", "--entailment-check", "--obligation", "0 <= 1", "--witness", ""],
             ["--mir-bounds", "slice-range", "--domain", "int", "--hyp", "off <= 1"],
             ["--mir-bounds", "slice-range", "--goal", "0 <= 1"],
-            ["--hyp", "x <= 1"],  # missing --goal in default mode
         ):
             rc, out, _ = self._run_cli([*bad_argv, "--json"])
             self.assertEqual(rc, 2, bad_argv)
             self.assertFalse(json.loads(out)["solved"])
+        # Missing `--goal` in default mode keeps the baseline argparse contract
+        # (`required=True`): usage error on stderr and `SystemExit(2)`, no JSON.
+        for argv in (["--hyp", "x <= 1", "--json"], ["--hyp", "x <= 1"]):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    cli_main(argv)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertEqual(out.getvalue(), "")
+            self.assertIn("the following arguments are required: --goal", err.getvalue())
+
+        # Variables (and theorem names) that would shadow globals referenced by the
+        # emitted snippet are rejected up front instead of producing ill-typed Lean.
+        for kwargs in (
+            {"preset": "uint-add-no-overflow", "hyp_strings": ["modPow2 <= 5"], "lhs_expr": "modPow2"},
+            {"preset": "slice-range", "hyp_strings": [], "len_expr": "some"},
+            {"preset": "non-overlapping-ptrs", "hyp_strings": ["NonOverlappingPtrs <= 1"]},
+            {"preset": "slice-range", "hyp_strings": [], "thm_name": "evalPtrOffset"},
+        ):
+            with self.assertRaises(ParseError, msg=kwargs):
+                generate_mir_bounds_certificate(**kwargs)
+
+        # A constant multiplier must itself be a valid `uN` operand (`< 2^width`):
+        # `256 * x` with `x <= 0` is overflow-free but `256` is not a `u8`.
+        with self.assertRaises(ParseError):
+            generate_mir_bounds_certificate(
+                "uint-mul-const-no-overflow", ["x <= 0"], "mul_bad_k", width=8, scale=256
+            )
+        ok_k = generate_mir_bounds_certificate(
+            "uint-mul-const-no-overflow", ["x <= 1"], "mul_max_k", width=8, scale=255
+        )
+        self.assertTrue(ok_k["solved"])
+        rc, out, _ = self._run_cli([
+            "--mir-bounds", "uint-mul-const-no-overflow", "--width", "8", "--scale", "256",
+            "--hyp", "x <= 0", "--json",
+        ])
+        self.assertEqual(rc, 2)
+        self.assertFalse(json.loads(out)["solved"])
+
+    def test_uint_sub_range_certification(self) -> None:
+        # Operand range derivable from hyps -> fully certified theorem, no `hRange`.
+        cert = generate_mir_bounds_certificate(
+            "uint-sub-no-underflow", ["b + 4 <= a", "a <= 1000"], "sub_cert", width=32
+        )
+        self.assertTrue(cert["solved"])
+        self.assertTrue(cert["range_certified"])
+        self.assertTrue(cert["steps_range"])
+        self.assertIn("farkas_discharges_uint_sub_no_underflow_certified .u32", cert["lean_snippet"])
+        self.assertNotIn("hRange", cert["lean_snippet"])
+        self.assertIn("sub_cert_cert_range", cert["lean_snippet"])
+        # Range NOT derivable (`a <= 2^32` admits `a = 2^32`) -> fall back to `hRange`.
+        unc = generate_mir_bounds_certificate(
+            "uint-sub-no-underflow", ["b + 4 <= a", f"a <= {1 << 32}"], "sub_unc", width=32
+        )
+        self.assertTrue(unc["solved"])
+        self.assertFalse(unc["range_certified"])
+        self.assertNotIn("steps_range", unc)
+        self.assertIn("(hRange : a < modPow2 (uintWidth .u32))", unc["lean_snippet"])
+        self.assertNotIn("_certified", unc["lean_snippet"])
 
     def test_entailment_check_modes_and_negative_controls(self) -> None:
         # 1. Nat sufficient-only with heterogeneous obligation variable subsets
@@ -680,6 +752,13 @@ class FarkasMirCertGenTests(unittest.TestCase):
         self.assertTrue(ascii_run.stdout.isascii())
         self.assertIn("{ lhs :=", ascii_run.stdout)
 
+    def _assert_fails_only_at_rfl(self, output: str, expected: int, label: str) -> None:
+        chunks = re.split(r"(?m)^\S+?:\d+:\d+: (?=error)", output)[1:]
+        self.assertEqual(len(chunks), expected, f"{label}: unexpected error count\n{output}")
+        for ch in chunks:
+            self.assertNotRegex(ch, r"(?i)unknown (identifier|constant)", f"{label}:\n{output}")
+            self.assertRegex(ch, r"\brfl\b", f"{label}: error is not a rejected `rfl`\n{output}")
+
     def test_live_lean_kernel_checks_mir_bounds_and_entailment(self) -> None:
         lean_bin = _find_pinned_lean()
         if lean_bin is None:
@@ -688,14 +767,17 @@ class FarkasMirCertGenTests(unittest.TestCase):
                 self.fail(msg)
             self.skipTest(msg)
 
+        # Always (incrementally) rebuild: a pre-existing but stale `.olean` would
+        # otherwise make the kernel checks below test an outdated library.
         olean_path = _ANNEAL_ROOT / ".lake/build/lib/lean/Anneal/FarkasMirCert.olean"
-        if not olean_path.is_file():
-            lake_bin = lean_bin.parent / "lake"
-            if not lake_bin.is_file():
-                found_lake = shutil.which("lake")
-                if not found_lake:
-                    self.fail("Anneal.FarkasMirCert.olean missing and `lake` not found.")
-                lake_bin = Path(found_lake)
+        lake_bin = lean_bin.parent / "lake"
+        if not lake_bin.is_file():
+            found_lake = shutil.which("lake")
+            lake_bin = Path(found_lake) if found_lake else lake_bin
+        if not lake_bin.is_file():
+            if not olean_path.is_file() or os.environ.get("ANNEAL_CI_STRICT") == "1":
+                self.fail("`lake` not found; cannot (re)build Anneal.FarkasMirCert.")
+        else:
             build_env = {**os.environ, "PATH": f"{lean_bin.parent}:{os.environ.get('PATH', '')}"}
             subprocess.check_call(
                 [str(lake_bin), "build", "Anneal.FarkasMirCert"],
@@ -761,6 +843,21 @@ class FarkasMirCertGenTests(unittest.TestCase):
                 "uint-mul-const-no-overflow",
                 ["x <= 1024"],
                 "live_u64_mul", width=64, scale=8, var_name="x",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-mul-const-no-overflow",
+                ["x <= 1"],
+                "live_u8_mul_max_k", width=8, scale=255, var_name="x",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-sub-no-underflow",
+                ["b + 4 <= a", "a <= 1000"],
+                "live_u32_sub_certified", width=32,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-sub-no-underflow",
+                ["b <= a", f"a + 1 <= {1 << 128}"],
+                "live_u128_sub_certified_ascii", width=128, ascii_lean=True,
             )["lean_snippet"],
             generate_mir_bounds_certificate(
                 "non-overlapping-ptrs",
@@ -851,12 +948,13 @@ class FarkasMirCertGenTests(unittest.TestCase):
                     "NegTamperedCert.lean",
                     "import Anneal.FarkasMirCert\n"
                     "open Anneal.LinearArith Anneal.AiPcc Anneal.UnsafeObligations Anneal.FarkasMirCert\n"
-                    "private theorem bad_cert (a b : Nat) (locals : List Trusted.Rustc.V2026_06_01.MirAst.LocalSlot)\n"
-                    "    (mem : Trusted.Rustc.V2026_06_01.MirSemantics.Memory) (ha : a <= 10) :\n"
+                    "open Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics\n"
+                    "private theorem bad_cert (a b : Nat) (locals : List LocalSlot)\n"
+                    "    (mem : Memory) (ha : a <= 10) :\n"
                     "    a + b < modPow2 (uintWidth .u64) /\\ a + b < scalarModulus (uintBytes .u64) /\\\n"
-                    "    Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .addUnchecked ⟨a, uintBytes .u64⟩ ⟨b, uintBytes .u64⟩ locals mem false =\n"
+                    "    evalScalarBinOp .addUnchecked ⟨a, uintBytes .u64⟩ ⟨b, uintBytes .u64⟩ locals mem false =\n"
                     "      .ok (.scalar ⟨a + b, uintBytes .u64⟩) locals mem /\\\n"
-                    "    Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .addWithOverflow ⟨a, uintBytes .u64⟩ ⟨b, uintBytes .u64⟩ locals mem false =\n"
+                    "    evalScalarBinOp .addWithOverflow ⟨a, uintBytes .u64⟩ ⟨b, uintBytes .u64⟩ locals mem false =\n"
                     "      .ok (.aggregate 0 [.scalar ⟨a + b, uintBytes .u64⟩, .scalar ⟨0, 1⟩]) locals mem :=\n"
                     "  farkas_discharges_u64_add_no_overflow [⟨.var 0, .cst 10⟩] (.var 0) (.var 1) [.hyp 0] rfl [a, b] locals mem ha\n",
                 ),
@@ -895,6 +993,24 @@ class FarkasMirCertGenTests(unittest.TestCase):
                     text=True, capture_output=True, timeout=60,
                 )
                 self.assertNotEqual(nres.returncode, 0, f"Negative control unexpectedly passed: {fname}")
+                self._assert_fails_only_at_rfl(nres.stdout + nres.stderr, 1, fname)
+
+            # Systematic tampering of EVERY generated snippet: corrupt its (first)
+            # certificate to `[.hyp 0]` and require the kernel to reject exactly
+            # that `rfl` (and nothing else, e.g. no unknown identifiers).
+            tampered = [_tamper_snippet(snip) for snip in snippets]
+            tbody = "\n".join(
+                ln for snip in tampered for ln in snip.splitlines()
+                if not ln.startswith(("import ", "open "))
+            )
+            tfile = t / "NegTamperedAll.lean"
+            tfile.write_text(hdr + tbody + "\n", encoding="utf-8")
+            tres = subprocess.run(
+                [str(lean_bin), str(tfile)], env=lean_env,
+                text=True, capture_output=True, timeout=240,
+            )
+            self.assertNotEqual(tres.returncode, 0)
+            self._assert_fails_only_at_rfl(tres.stdout + tres.stderr, len(snippets), "NegTamperedAll")
 
             # Confirm Anneal.FarkasMirCert and emitted ProbeMir.lean pass Pass-1 preflight.
             tb = _ANNEAL_ROOT / "trusted/audit/TrustedBoundary.lean"

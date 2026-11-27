@@ -392,6 +392,40 @@ theorem farkas_discharges_uint_sub_no_underflow
     exact ⟨hLe, hDiffLt, hUnchk, hWithOv⟩)
     (checkNatCutGoal_sound ⟨hyps, ⟨rhsExpr, lhsExpr⟩⟩ steps hChk env)
 
+/-- Fully certificate-derived variant of `farkas_discharges_uint_sub_no_underflow`:
+the in-range operand bound `lhs < modPow2 (uintWidth u)` is no longer an
+external hypothesis but is itself discharged by a second `NatCutGoal`
+certificate proving `lhs + 1 ≤ modPow2 (uintWidth u)` from the same `hyps`. -/
+theorem farkas_discharges_uint_sub_no_underflow_certified
+    (u : UintTy) (hyps : List NatCutIneq) (lhsExpr rhsExpr : NatLinExpr)
+    (stepsLe stepsRange : List CutStep)
+    (hChkLe : checkNatCutGoal ⟨hyps, ⟨rhsExpr, lhsExpr⟩⟩ stepsLe = true)
+    (hChkRange : checkNatCutGoal
+      ⟨hyps, ⟨.add lhsExpr (.cst 1), .cst (modPow2 (uintWidth u))⟩⟩ stepsRange = true)
+    (env : List Nat) (locals : List LocalSlot) (mem : Memory) :
+    HypsImp (NatCutIneq.holds env) hyps
+      (lhsExpr.eval env < modPow2 (uintWidth u) ∧
+       rhsExpr.eval env ≤ lhsExpr.eval env ∧
+       lhsExpr.eval env - rhsExpr.eval env < modPow2 (uintWidth u) ∧
+       evalScalarBinOp .subUnchecked
+         ⟨lhsExpr.eval env, uintBytes u⟩ ⟨rhsExpr.eval env, uintBytes u⟩
+         locals mem false =
+         .ok (.scalar ⟨lhsExpr.eval env - rhsExpr.eval env, uintBytes u⟩) locals mem ∧
+       evalScalarBinOp .subWithOverflow
+         ⟨lhsExpr.eval env, uintBytes u⟩ ⟨rhsExpr.eval env, uintBytes u⟩
+         locals mem false =
+         .ok (.aggregate 0
+           [.scalar ⟨lhsExpr.eval env - rhsExpr.eval env, uintBytes u⟩,
+            .scalar ⟨0, 1⟩]) locals mem) :=
+  hypsImp_of_all_imp hyps (fun hAll =>
+    have hLt : lhsExpr.eval env < modPow2 (uintWidth u) :=
+      hypsImp_apply_all hyps
+        (checkNatCutGoal_lt_sound hyps lhsExpr (.cst (modPow2 (uintWidth u)))
+          stepsRange hChkRange env) hAll
+    ⟨hLt, hypsImp_apply_all hyps
+      (farkas_discharges_uint_sub_no_underflow u hyps lhsExpr rhsExpr stepsLe hChkLe
+        env locals mem hLt) hAll⟩)
+
 /-- Discharges constant-scaled unsigned multiplication overflow-freedom
 `k * x < modPow2 (uintWidth u)` for any `u : UintTy` from a `NatCutGoal`
 certificate proving `k * x + 1 ≤ modPow2 (uintWidth u)`: proves the strict
@@ -1561,6 +1595,10 @@ inductive FarkasMirGoal where
       (u : UintTy) (hyps : List NatCutIneq) (lhs rhs : NatLinExpr)
   | uintSubNoUnderflow
       (u : UintTy) (hyps : List NatCutIneq) (lhs rhs : NatLinExpr)
+  /-- Like `uintSubNoUnderflow`, but the operand range `lhs < 2^width` is also
+  certified (paired with `.pair stepsLe stepsRange`). -/
+  | uintSubNoUnderflowCertified
+      (u : UintTy) (hyps : List NatCutIneq) (lhs rhs : NatLinExpr)
   | uintMulConstNoOverflow
       (u : UintTy) (hyps : List NatCutIneq) (k : Nat) (x : NatLinExpr)
   | sliceBounds
@@ -1624,8 +1662,25 @@ def FarkasMirGoal.denote : FarkasMirGoal → Prop
            .ok (.aggregate 0
              [.scalar ⟨lhs.eval env - rhs.eval env, uintBytes u⟩,
               .scalar ⟨0, 1⟩]) locals mem)
+  | .uintSubNoUnderflowCertified u hyps lhs rhs =>
+    ∀ (env : List Nat) (locals : List LocalSlot) (mem : Memory),
+      HypsImp (NatCutIneq.holds env) hyps
+        (lhs.eval env < modPow2 (uintWidth u) ∧
+         rhs.eval env ≤ lhs.eval env ∧
+         lhs.eval env - rhs.eval env < modPow2 (uintWidth u) ∧
+         evalScalarBinOp .subUnchecked
+           ⟨lhs.eval env, uintBytes u⟩ ⟨rhs.eval env, uintBytes u⟩
+           locals mem false =
+           .ok (.scalar ⟨lhs.eval env - rhs.eval env, uintBytes u⟩) locals mem ∧
+         evalScalarBinOp .subWithOverflow
+           ⟨lhs.eval env, uintBytes u⟩ ⟨rhs.eval env, uintBytes u⟩
+           locals mem false =
+           .ok (.aggregate 0
+             [.scalar ⟨lhs.eval env - rhs.eval env, uintBytes u⟩,
+              .scalar ⟨0, 1⟩]) locals mem)
   | .uintMulConstNoOverflow u hyps k x =>
     ∀ (env : List Nat) (locals : List LocalSlot) (mem : Memory),
+      UintScalarInRange u ⟨k, uintBytes u⟩ ∧
       HypsImp (NatCutIneq.holds env) hyps
         (k * x.eval env < modPow2 (uintWidth u) ∧
          k * x.eval env < scalarModulus (uintBytes u) ∧
@@ -1687,7 +1742,11 @@ noncomputable def checkFarkasMirGoal : FarkasMirGoal → FarkasMirCert → Bool
       ⟨hyps, ⟨.add (.add lhs rhs) (.cst 1), .cst (modPow2 (uintWidth u))⟩⟩ steps
   | .uintSubNoUnderflow _ hyps lhs rhs, .single steps =>
     checkNatCutGoal ⟨hyps, ⟨rhs, lhs⟩⟩ steps
+  | .uintSubNoUnderflowCertified u hyps lhs rhs, .pair stepsLe stepsRange =>
+    checkNatCutGoal ⟨hyps, ⟨rhs, lhs⟩⟩ stepsLe &&
+    checkNatCutGoal ⟨hyps, ⟨.add lhs (.cst 1), .cst (modPow2 (uintWidth u))⟩⟩ stepsRange
   | .uintMulConstNoOverflow u hyps k x, .single steps =>
+    Nat.blt k (modPow2 (uintWidth u)) &&
     checkNatCutGoal
       ⟨hyps, ⟨.add (.mulC k x) (.cst 1), .cst (modPow2 (uintWidth u))⟩⟩ steps
   | .sliceBounds hyps off len total, .single steps =>
@@ -1734,11 +1793,22 @@ theorem checkFarkasMirGoal_sound (goal : FarkasMirGoal) (cert : FarkasMirCert)
       intro env locals mem hLt
       exact farkas_discharges_uint_sub_no_underflow u hyps lhs rhs steps hChk env locals mem hLt
     | pair _ _ | triple _ _ _ | edge _ => nomatch hChk
+  | uintSubNoUnderflowCertified u hyps lhs rhs =>
+    cases cert with
+    | pair stepsLe stepsRange =>
+      dsimp only [checkFarkasMirGoal] at hChk
+      intro env locals mem
+      exact farkas_discharges_uint_sub_no_underflow_certified u hyps lhs rhs
+        stepsLe stepsRange (bool_and_left hChk) (bool_and_right hChk) env locals mem
+    | single _ | triple _ _ _ | edge _ => nomatch hChk
   | uintMulConstNoOverflow u hyps k x =>
     cases cert with
     | single steps =>
+      dsimp only [checkFarkasMirGoal] at hChk
       intro env locals mem
-      exact farkas_discharges_uint_mul_const_no_overflow u hyps k x steps hChk env locals mem
+      exact ⟨⟨rfl, lt_of_blt_true (bool_and_left hChk)⟩,
+        farkas_discharges_uint_mul_const_no_overflow u hyps k x steps
+          (bool_and_right hChk) env locals mem⟩
     | pair _ _ | triple _ _ _ | edge _ => nomatch hChk
   | sliceBounds hyps off len total =>
     cases cert with
@@ -2038,6 +2108,64 @@ theorem canary_unified_farkas_mir_goal :
     (.single [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 2, .comb 2 1 3 1, .hyp 6, .comb 4 1 5 1])
     rfl
 
+/-- Canary: fully certified `u32` subtraction (both `b ≤ a` AND the operand range
+`a < 2^32` are discharged by certificates; no external range hypothesis). -/
+theorem canary_u32_sub_no_underflow_certified (a b : Nat)
+    (locals : List LocalSlot) (mem : Memory)
+    (hGap : b + 4 ≤ a) (hA : a ≤ 1000) :
+    a < modPow2 (uintWidth .u32) ∧ b ≤ a ∧ a - b < modPow2 (uintWidth .u32) ∧
+    evalScalarBinOp .subUnchecked ⟨a, uintBytes .u32⟩ ⟨b, uintBytes .u32⟩
+      locals mem false =
+      .ok (.scalar ⟨a - b, uintBytes .u32⟩) locals mem ∧
+    evalScalarBinOp .subWithOverflow ⟨a, uintBytes .u32⟩ ⟨b, uintBytes .u32⟩
+      locals mem false =
+      .ok (.aggregate 0 [.scalar ⟨a - b, uintBytes .u32⟩, .scalar ⟨0, 1⟩]) locals mem :=
+  checkFarkasMirGoal_sound
+    (.uintSubNoUnderflowCertified .u32
+      [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst 1000⟩] (.var 0) (.var 1))
+    (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1])
+    rfl [a, b] locals mem hGap hA
+
+/-- Canary: the `magCap128` guard is the *sole* reason the detoured trace is
+rejected. The same semantically valid `u128` refutation is accepted directly
+(all derived rows `≤ 2^128`) and rejected when routed through the
+intermediate row `2 * x ≤ 2^129 - 2` (`> magCap128`), although that detour is
+arithmetically sound (`2 * hyp + 2 * negGoal` still yields `0 ≤ -2`); an
+unrelated over-cap hypothesis also poisons an otherwise valid trace
+(`rowsWithinCap` checks every hypothesis). -/
+theorem canary_u128_mag_cap_isolated :
+    checkFarkasMirGoal
+      (.uintAddNoOverflow .u128 [⟨.add (.var 0) (.cst 1), .cst (modPow2 128)⟩]
+        (.var 0) (.cst 0))
+      (.single [.hyp 0, .hyp 2, .comb 0 1 1 1]) = true ∧
+    checkFarkasMirGoal
+      (.uintAddNoOverflow .u128 [⟨.add (.var 0) (.cst 1), .cst (modPow2 128)⟩]
+        (.var 0) (.cst 0))
+      (.single [.hyp 0, .hyp 2, .comb 0 1 0 1, .comb 2 1 1 2]) = false ∧
+    checkFarkasMirGoal
+      (.uintAddNoOverflow .u128
+        [⟨.add (.var 0) (.cst 1), .cst (modPow2 128)⟩, ⟨.var 1, .cst 5⟩]
+        (.var 0) (.cst 0))
+      (.single [.hyp 0, .hyp 4, .comb 0 1 1 1]) = true ∧
+    checkFarkasMirGoal
+      (.uintAddNoOverflow .u128
+        [⟨.add (.var 0) (.cst 1), .cst (modPow2 128)⟩, ⟨.var 1, .cst (magCap128 + 1)⟩]
+        (.var 0) (.cst 0))
+      (.single [.hyp 0, .hyp 4, .comb 0 1 1 1]) = false :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Canary: the unified schema rejects a constant multiplier `k` that is not a
+valid `uN` scalar operand (`k ≥ 2^width`), even when `k * x < 2^width` holds
+(here `x ≤ 0`), while accepting the in-range neighbour `k = 2^width - 1`. -/
+theorem canary_mul_const_operand_range :
+    checkFarkasMirGoal
+      (.uintMulConstNoOverflow .u8 [⟨.var 0, .cst 0⟩] 255 (.var 0))
+      (.single [.hyp 0, .hyp 2, .comb 0 255 1 1]) = true ∧
+    checkFarkasMirGoal
+      (.uintMulConstNoOverflow .u8 [⟨.var 0, .cst 0⟩] 256 (.var 0))
+      (.single [.hyp 0, .hyp 2, .comb 0 256 1 1]) = false :=
+  ⟨rfl, rfl⟩
+
 /-! ### Fail-Closed Negative `rfl` Controls (`= false`) -/
 
 /-- Negative canary: truncated or overlong `certs` lists are rejected fail-closed
@@ -2134,10 +2262,12 @@ theorem neg_canary_structural_fail_closed :
     checkFarkasMirGoal
       (.sliceBounds [⟨.var 0, .cst 1⟩] (.var 0) (.cst 0) (.cst 1))
       (.edge []) = false ∧
-    -- Over-cap constant (> magCap128) in u128 hypothesis rejected fail-closed
+    -- Certified subtraction with an unprovable operand range (`a ≤ 2^32`
+    -- admits `a = 2^32`) rejected even though `b ≤ a` is certified
     checkFarkasMirGoal
-      (.uintAddNoOverflow .u128 [⟨.var 0, .cst (magCap128 + 1)⟩] (.var 0) (.cst 0))
-      (.single [.hyp 0, .hyp 2, .comb 0 1 1 1]) = false :=
+      (.uintSubNoUnderflowCertified .u32
+        [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst (modPow2 32)⟩] (.var 0) (.var 1))
+      (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) = false :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.FarkasMirCert
