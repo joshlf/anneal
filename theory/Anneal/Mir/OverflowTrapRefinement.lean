@@ -3402,6 +3402,154 @@ theorem panic_strategy_abort_vs_unwind_distinct :
   · exact not_toPartial_le_of_distinct_ret hTauP hObsP hTauA hObsA (fun h => nomatch h)
   · exact not_toPartial_le_of_distinct_ret hTauA hObsA hTauP hObsP (fun h => nomatch h)
 
+private theorem abort_vs_unwind_iff_of_dichotomy {bA bP : CapturedMir} {f : Nat}
+    {args : List Value} {P : Prop} (hDec : P ∨ ¬ P)
+    (hYes : P → ∃ o, runMirCall bA f args = .halted o ∧ runMirCall bP f args = .halted o)
+    (hNo : ¬ P → runMirCall bA f args = .halted .abort ∧ runMirCall bP f args = .halted .panic) :
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall bA f args))
+        (classifyMirExecStateExact (runMirCall bP f args)) ↔ P) ∧
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall bP f args))
+        (classifyMirExecStateExact (runMirCall bA f args)) ↔ P) ∧
+    ((mirCallTree bP args).toPartial ≤ (mirCallTree bA args).toPartial ↔ P) ∧
+    ((mirCallTree bA args).toPartial ≤ (mirCallTree bP args).toPartial ↔ P) := by
+  refine ⟨⟨fun hRef => ?_, fun hp => ?_⟩, ⟨fun hRef => ?_, fun hp => ?_⟩,
+          ⟨fun hLe => ?_, fun hp => ?_⟩, ⟨fun hLe => ?_, fun hp => ?_⟩⟩
+  · cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨hA, hP⟩ := hNo hnp
+      rw [hA, hP] at hRef
+      nomatch hRef
+  · have ⟨_, hA, hP⟩ := hYes hp
+    rw [hA, hP]
+    exact mirExactOutcomeRefines_refl _
+  · cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨hA, hP⟩ := hNo hnp
+      rw [hA, hP] at hRef
+      nomatch hRef
+  · have ⟨_, hA, hP⟩ := hYes hp
+    rw [hA, hP]
+    exact mirExactOutcomeRefines_refl _
+  · cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨hA, hP⟩ := hNo hnp
+      have ⟨uA, hTauA, hObsA⟩ := runMirSteps_halted_to_tauStar _ f _ _ hA
+      have ⟨uP, hTauP, hObsP⟩ := runMirSteps_halted_to_tauStar _ f _ _ hP
+      exact False.elim (not_toPartial_le_of_distinct_ret hTauP hObsP hTauA hObsA
+        (fun h => nomatch h) hLe)
+  · have ⟨_, hA, hP⟩ := hYes hp
+    exact (mirCallTree_toPartial_equiv_of_same_halted hP hA).1
+  · cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨hA, hP⟩ := hNo hnp
+      have ⟨uA, hTauA, hObsA⟩ := runMirSteps_halted_to_tauStar _ f _ _ hA
+      have ⟨uP, hTauP, hObsP⟩ := runMirSteps_halted_to_tauStar _ f _ _ hP
+      exact False.elim (not_toPartial_le_of_distinct_ret hTauA hObsA hTauP hObsP
+        (fun h => nomatch h) hLe)
+  · have ⟨_, hA, hP⟩ := hYes hp
+    exact (mirCallTree_toPartial_equiv_of_same_halted hA hP).1
+
+/-- Parametric `-C panic=abort` vs. `-C panic=unwind` cross-strategy `iff` for `add`:
+for ALL `u : UintTy` and `a b : Nat`, the two panic strategies agree under strategy-exact
+refinement and Layer 1A `ITree.toPartial` *iff* `a + b < 2^w` (and are strictly incomparable
+on every overflowing input). -/
+theorem panic_strategy_abort_vs_unwind_add_iff (u : UintTy) (a b : Nat) :
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .add .terminate) 6 (uintArgs2 u a b)))
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .add .continue_) 6 (uintArgs2 u a b)))
+      ↔ a + b < modPow2 (uintWidth u)) ∧
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .add .continue_) 6 (uintArgs2 u a b)))
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .add .terminate) 6 (uintArgs2 u a b)))
+      ↔ a + b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkCheckedArithBody u .add .continue_) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .add .terminate) (uintArgs2 u a b)).toPartial
+      ↔ a + b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkCheckedArithBody u .add .terminate) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .add .continue_) (uintArgs2 u a b)).toPartial
+      ↔ a + b < modPow2 (uintWidth u)) :=
+  abort_vs_unwind_iff_of_dichotomy (f := 6) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_add_ok u .abort a b h,
+                  runMirCall_checked_add_ok u .unwind a b h⟩)
+    (fun h => ⟨runMirCall_checked_add_trap u .abort a b (Nat.not_lt.mp h),
+               runMirCall_checked_add_trap u .unwind a b (Nat.not_lt.mp h)⟩)
+
+/-- Parametric `-C panic=abort` vs. `-C panic=unwind` cross-strategy `iff` for in-range `sub`
+(`↔ b ≤ a`). -/
+theorem panic_strategy_abort_vs_unwind_sub_iff (u : UintTy) (a b : Nat)
+    (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .sub .terminate) 6 (uintArgs2 u a b)))
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .sub .continue_) 6 (uintArgs2 u a b)))
+      ↔ b ≤ a) ∧
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .sub .continue_) 6 (uintArgs2 u a b)))
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .sub .terminate) 6 (uintArgs2 u a b)))
+      ↔ b ≤ a) ∧
+    ((mirCallTree (mkCheckedArithBody u .sub .continue_) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .sub .terminate) (uintArgs2 u a b)).toPartial
+      ↔ b ≤ a) ∧
+    ((mirCallTree (mkCheckedArithBody u .sub .terminate) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .sub .continue_) (uintArgs2 u a b)).toPartial
+      ↔ b ≤ a) :=
+  abort_vs_unwind_iff_of_dichotomy (f := 6) (le_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_sub_ok u .abort a b ha hb h,
+                  runMirCall_checked_sub_ok u .unwind a b ha hb h⟩)
+    (fun h => ⟨runMirCall_checked_sub_trap u .abort a b ha hb (Nat.not_le.mp h),
+               runMirCall_checked_sub_trap u .unwind a b ha hb (Nat.not_le.mp h)⟩)
+
+/-- Parametric `-C panic=abort` vs. `-C panic=unwind` cross-strategy `iff` for `mul`
+(`↔ a * b < 2^w`). -/
+theorem panic_strategy_abort_vs_unwind_mul_iff (u : UintTy) (a b : Nat) :
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .mul .terminate) 6 (uintArgs2 u a b)))
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .mul .continue_) 6 (uintArgs2 u a b)))
+      ↔ a * b < modPow2 (uintWidth u)) ∧
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .mul .continue_) 6 (uintArgs2 u a b)))
+        (classifyMirExecStateExact (runMirCall (mkCheckedArithBody u .mul .terminate) 6 (uintArgs2 u a b)))
+      ↔ a * b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkCheckedArithBody u .mul .continue_) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .mul .terminate) (uintArgs2 u a b)).toPartial
+      ↔ a * b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkCheckedArithBody u .mul .terminate) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .mul .continue_) (uintArgs2 u a b)).toPartial
+      ↔ a * b < modPow2 (uintWidth u)) :=
+  abort_vs_unwind_iff_of_dichotomy (f := 6) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_mul_ok u .abort a b h,
+                  runMirCall_checked_mul_ok u .unwind a b h⟩)
+    (fun h => ⟨runMirCall_checked_mul_trap u .abort a b (Nat.not_lt.mp h),
+               runMirCall_checked_mul_trap u .unwind a b (Nat.not_lt.mp h)⟩)
+
+/-- Parametric `-C panic=abort` vs. `-C panic=unwind` cross-strategy `iff` for composite
+`add_scaled` (`↔ a + k * b < 2^w`). -/
+theorem panic_strategy_abort_vs_unwind_add_scaled_iff (u : UintTy) (k a b : Nat) :
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall (mkCheckedAddScaledBody u k .terminate) 13 (uintArgs2 u a b)))
+        (classifyMirExecStateExact (runMirCall (mkCheckedAddScaledBody u k .continue_) 13 (uintArgs2 u a b)))
+      ↔ a + k * b < modPow2 (uintWidth u)) ∧
+    (MirExactOutcomeRefines
+        (classifyMirExecStateExact (runMirCall (mkCheckedAddScaledBody u k .continue_) 13 (uintArgs2 u a b)))
+        (classifyMirExecStateExact (runMirCall (mkCheckedAddScaledBody u k .terminate) 13 (uintArgs2 u a b)))
+      ↔ a + k * b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkCheckedAddScaledBody u k .continue_) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedAddScaledBody u k .terminate) (uintArgs2 u a b)).toPartial
+      ↔ a + k * b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkCheckedAddScaledBody u k .terminate) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedAddScaledBody u k .continue_) (uintArgs2 u a b)).toPartial
+      ↔ a + k * b < modPow2 (uintWidth u)) :=
+  abort_vs_unwind_iff_of_dichotomy (f := 13) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_add_scaled_ok u k .abort a b h,
+                  runMirCall_checked_add_scaled_ok u k .unwind a b h⟩)
+    (fun h => ⟨runMirCall_checked_add_scaled_trap u k .abort a b (Nat.not_lt.mp h),
+               runMirCall_checked_add_scaled_trap u k .unwind a b (Nat.not_lt.mp h)⟩)
+
 /-- Negative Soundness #15: composite `add_scaled` (`a + 4 * b`) overflow counterexample on `u8`
 (`200 + 4 * 20 = 280 ≥ 256`, where the inner multiplication `4 * 20 = 80` succeeds while the
 outer addition overflows): checked traps, unchecked faults `.ub`, so `¬ (checked ⊑ unchecked)`
@@ -3743,5 +3891,180 @@ theorem assert_polarity_mutation_breaks_refinement (u : UintTy) (strat : PanicSt
     exact classify_ret_not_refines_trapOutcome strat _ _
   · rw [runMirCall_checked_mul_trap u strat a b h, (runMirCall_mul_polarity_mutant u strat a b).2 h]
     exact classify_trapOutcome_not_refines_ret strat _ _
+
+private theorem trapOutcome_ne_normal (strat : PanicStrategy) (v : Value) (m : Memory) :
+    strat.toTrapOutcome ≠ .normal (v, m) := by
+  intro hEq
+  cases strat <;> nomatch hEq
+
+/-- Tree-level Layer 1A `ITree.toPartial` polarity-mutation refutation for `add` (no range
+hypotheses needed): breaks forward refinement on every non-overflowing input and breaks
+panic preservation on every overflowing input. -/
+theorem assert_polarity_mutation_breaks_toPartial_add (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) :
+    (a + b < modPow2 (uintWidth u) →
+      ¬ ((mirCallTree (mkCheckedArithBodyWithExpected u .add strat.toUnwindAction true)
+            (uintArgs2 u a b)).toPartial ≤
+         (mirCallTree (mkUncheckedArithBody u .add) (uintArgs2 u a b)).toPartial)) ∧
+    (modPow2 (uintWidth u) ≤ a + b →
+      ¬ ((mirCallTree (mkCheckedArithBodyWithExpected u .add strat.toUnwindAction true)
+            (uintArgs2 u a b)).toPartial ≤
+         (mirCallTree (mkCheckedArithBody u .add strat.toUnwindAction)
+            (uintArgs2 u a b)).toPartial)) := by
+  refine ⟨fun hNoOv => ?_, fun hOv => ?_⟩
+  · have ⟨_, hTauM, hObsM⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _ ((runMirCall_add_polarity_mutant u strat a b).1 hNoOv)
+    have ⟨_, hTauU, hObsU⟩ :=
+      runMirSteps_halted_to_tauStar _ 2 _ _ (runMirCall_unchecked_add_ok u a b hNoOv)
+    exact not_toPartial_le_of_distinct_ret hTauM hObsM hTauU hObsU (trapOutcome_ne_normal strat _ _)
+  · have ⟨_, hTauM, hObsM⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _ ((runMirCall_add_polarity_mutant u strat a b).2 hOv)
+    have ⟨_, hTauC, hObsC⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _ (runMirCall_checked_add_trap u strat a b hOv)
+    exact not_toPartial_le_of_distinct_ret hTauM hObsM hTauC hObsC
+      (fun h => trapOutcome_ne_normal strat _ _ h.symm)
+
+/-- Tree-level Layer 1A `ITree.toPartial` polarity-mutation refutation for in-range `sub`. -/
+theorem assert_polarity_mutation_breaks_toPartial_sub (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    (b ≤ a →
+      ¬ ((mirCallTree (mkCheckedArithBodyWithExpected u .sub strat.toUnwindAction true)
+            (uintArgs2 u a b)).toPartial ≤
+         (mirCallTree (mkUncheckedArithBody u .sub) (uintArgs2 u a b)).toPartial)) ∧
+    (a < b →
+      ¬ ((mirCallTree (mkCheckedArithBodyWithExpected u .sub strat.toUnwindAction true)
+            (uintArgs2 u a b)).toPartial ≤
+         (mirCallTree (mkCheckedArithBody u .sub strat.toUnwindAction)
+            (uintArgs2 u a b)).toPartial)) := by
+  refine ⟨fun hLe => ?_, fun hUnd => ?_⟩
+  · have ⟨_, hTauM, hObsM⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _
+        ((runMirCall_sub_polarity_mutant u strat a b ha hb).1 hLe)
+    have ⟨_, hTauU, hObsU⟩ :=
+      runMirSteps_halted_to_tauStar _ 2 _ _ (runMirCall_unchecked_sub_ok u a b ha hLe)
+    exact not_toPartial_le_of_distinct_ret hTauM hObsM hTauU hObsU (trapOutcome_ne_normal strat _ _)
+  · have ⟨_, hTauM, hObsM⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _
+        ((runMirCall_sub_polarity_mutant u strat a b ha hb).2 hUnd)
+    have ⟨_, hTauC, hObsC⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _ (runMirCall_checked_sub_trap u strat a b ha hb hUnd)
+    exact not_toPartial_le_of_distinct_ret hTauM hObsM hTauC hObsC
+      (fun h => trapOutcome_ne_normal strat _ _ h.symm)
+
+/-- Tree-level Layer 1A `ITree.toPartial` polarity-mutation refutation for `mul` (no range
+hypotheses needed). -/
+theorem assert_polarity_mutation_breaks_toPartial_mul (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) :
+    (a * b < modPow2 (uintWidth u) →
+      ¬ ((mirCallTree (mkCheckedArithBodyWithExpected u .mul strat.toUnwindAction true)
+            (uintArgs2 u a b)).toPartial ≤
+         (mirCallTree (mkUncheckedArithBody u .mul) (uintArgs2 u a b)).toPartial)) ∧
+    (modPow2 (uintWidth u) ≤ a * b →
+      ¬ ((mirCallTree (mkCheckedArithBodyWithExpected u .mul strat.toUnwindAction true)
+            (uintArgs2 u a b)).toPartial ≤
+         (mirCallTree (mkCheckedArithBody u .mul strat.toUnwindAction)
+            (uintArgs2 u a b)).toPartial)) := by
+  refine ⟨fun hNoOv => ?_, fun hOv => ?_⟩
+  · have ⟨_, hTauM, hObsM⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _ ((runMirCall_mul_polarity_mutant u strat a b).1 hNoOv)
+    have ⟨_, hTauU, hObsU⟩ :=
+      runMirSteps_halted_to_tauStar _ 2 _ _ (runMirCall_unchecked_mul_ok u a b hNoOv)
+    exact not_toPartial_le_of_distinct_ret hTauM hObsM hTauU hObsU (trapOutcome_ne_normal strat _ _)
+  · have ⟨_, hTauM, hObsM⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _ ((runMirCall_mul_polarity_mutant u strat a b).2 hOv)
+    have ⟨_, hTauC, hObsC⟩ :=
+      runMirSteps_halted_to_tauStar _ 6 _ _ (runMirCall_checked_mul_trap u strat a b hOv)
+    exact not_toPartial_le_of_distinct_ret hTauM hObsM hTauC hObsC
+      (fun h => trapOutcome_ne_normal strat _ _ h.symm)
+
+private theorem runMirCall_checkedUnreachable_of_step2 (u : UintTy) (op : ArithKind)
+    (a b r : Nat)
+    (hStep2 : stepMirState (mkCheckedArithBody u op .unreachable)
+      (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit])) =
+      .tau (.running (mkCanonState 0 2
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩),
+         .init (.aggregate 0 [.scalar ⟨r, uintBytes u⟩, .scalar ⟨1, 1⟩])]))) :
+    runMirCall (mkCheckedArithBody u op .unreachable) 6 (uintArgs2 u a b) = .faulted .ub := by
+  have hStep1 : stepMirState (mkCheckedArithBody u op .unreachable)
+      (.running (initMachineState (mkCheckedArithBody u op .unreachable) (uintArgs2 u a b))) =
+      .tau (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit])) := rfl
+  rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2]
+  rfl
+
+/-- Parametric `UnwindAction.unreachable` mutant evaluation: on ANY overflowing/underflowing
+input for `add`, in-range `sub`, or `mul` across ALL `u : UintTy`, replacing `terminate` /
+`continue_` with `UnwindAction.unreachable` turns the overflow assert into `.faulted .ub`. -/
+theorem runMirCall_checked_unreachable_ub (u : UintTy) (a b : Nat) :
+    (modPow2 (uintWidth u) ≤ a + b →
+      runMirCall (mkCheckedArithBody u .add .unreachable) 6 (uintArgs2 u a b) = .faulted .ub) ∧
+    (a < modPow2 (uintWidth u) → b < modPow2 (uintWidth u) → a < b →
+      runMirCall (mkCheckedArithBody u .sub .unreachable) 6 (uintArgs2 u a b) = .faulted .ub) ∧
+    (modPow2 (uintWidth u) ≤ a * b →
+      runMirCall (mkCheckedArithBody u .mul .unreachable) 6 (uintArgs2 u a b) = .faulted .ub) := by
+  refine ⟨fun hOv => ?_, fun ha hb hUnd => ?_, fun hOv => ?_⟩
+  · have hBin := evalScalarBinOp_uint_addWithOverflow (u := u) (a := a) (b := b)
+      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
+      canonInitMemory
+    rw [Nat.ble_eq_true_of_le hOv] at hBin
+    exact runMirCall_checkedUnreachable_of_step2 u .add a b _
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+  · have hBin := evalScalarBinOp_uint_subWithOverflow (u := u) (a := a) (b := b)
+      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
+      canonInitMemory ha hb
+    rw [nat_ble_false_of_lt hUnd] at hBin
+    exact runMirCall_checkedUnreachable_of_step2 u .sub a b _
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+  · have hBin := evalScalarBinOp_uint_mulWithOverflow (u := u) (a := a) (b := b)
+      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
+      canonInitMemory
+    rw [Nat.ble_eq_true_of_le hOv] at hBin
+    exact runMirCall_checkedUnreachable_of_step2 u .mul a b _
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+
+/-- **Universal `UnwindAction.unreachable` sensitivity**: for ALL `u : UintTy`, BOTH strategies,
+and ALL overflowing/underflowing inputs (`add`, in-range `sub`, `mul`), mutating the assert's
+unwind action to `.unreachable` collapses the trap-vs-UB asymmetry so that BOTH
+`MirOutcomeRefines checked_unreachable unchecked` AND
+`(mirCallTree unchecked).toPartial ≤ (mirCallTree checked_unreachable).toPartial` HOLD.
+Hence the asymmetric negative soundness theorems (`#8`, `#12`, `#13`) genuinely depend on
+`UnwindAction.terminate` / `UnwindAction.continue_` producing deterministic traps. -/
+theorem unwind_unreachable_collapses_trap_separation (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) :
+    (modPow2 (uintWidth u) ≤ a + b →
+      MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .add .unreachable) 6 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkUncheckedArithBody u .add) 2 (uintArgs2 u a b))) ∧
+      (mirCallTree (mkUncheckedArithBody u .add) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .add .unreachable) (uintArgs2 u a b)).toPartial) ∧
+    (a < modPow2 (uintWidth u) → b < modPow2 (uintWidth u) → a < b →
+      MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .sub .unreachable) 6 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkUncheckedArithBody u .sub) 2 (uintArgs2 u a b))) ∧
+      (mirCallTree (mkUncheckedArithBody u .sub) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .sub .unreachable) (uintArgs2 u a b)).toPartial) ∧
+    (modPow2 (uintWidth u) ≤ a * b →
+      MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .mul .unreachable) 6 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkUncheckedArithBody u .mul) 2 (uintArgs2 u a b))) ∧
+      (mirCallTree (mkUncheckedArithBody u .mul) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .mul .unreachable) (uintArgs2 u a b)).toPartial) := by
+  refine ⟨fun hOv => ?_, fun ha hb hUnd => ?_, fun hOv => ?_⟩
+  · have hU := (runMirCall_checked_unreachable_ub u a b).1 hOv
+    exact ⟨by rw [hU]; trivial, mirCallTree_toPartial_refines_ub hU⟩
+  · have hU := (runMirCall_checked_unreachable_ub u a b).2.1 ha hb hUnd
+    exact ⟨by rw [hU]; trivial, mirCallTree_toPartial_refines_ub hU⟩
+  · have hU := (runMirCall_checked_unreachable_ub u a b).2.2 hOv
+    exact ⟨by rw [hU]; trivial, mirCallTree_toPartial_refines_ub hU⟩
 
 end Anneal.Mir.OverflowTrapRefinement

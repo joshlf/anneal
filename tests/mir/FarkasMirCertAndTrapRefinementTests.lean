@@ -338,6 +338,77 @@ theorem test_e2e_uint_mul_const_right_elim (strat : PanicStrategy) (n : Nat) (hn
   checked_mul_const_right_refines_unchecked_of_farkas_cert
     .u64 strat uintMulConstHyps (.var 0) 16 uintMulConstCert rfl rfl [n] hn
 
+/-! ### 1.9 `array-to-slice`, Unified `checkFarkasMirGoal_sound`, & `.u16` / `.usize` Width Coverage -/
+
+-- Generated via:
+--   python3 -B ci/farkas_cert_gen.py --domain nat \
+--     --hyp "4 * q <= off" --hyp "off <= 4 * q" --hyp "4 * q + 4 * n <= total" \
+--     --goal "4 * q <= off" / "off <= 4 * q" / "off + 4 * n <= total" --json
+private def arrayToSliceHyps : List NatCutIneq :=
+  [ ⟨.mulC 4 (.var 1), .var 0⟩
+  , ⟨.var 0, .mulC 4 (.var 1)⟩
+  , ⟨.add (.mulC 4 (.var 1)) (.mulC 4 (.var 2)), .var 3⟩ ]
+
+private def arrayToSliceAlignLeCert : List CutStep :=
+  [.hyp 0, .hyp 7, .comb 0 1 1 1]
+
+private def arrayToSliceAlignGeCert : List CutStep :=
+  [.hyp 1, .hyp 7, .comb 0 1 1 1]
+
+private def arrayToSliceRangeCert : List CutStep :=
+  [.hyp 1, .hyp 2, .hyp 7, .comb 0 1 1 1, .comb 3 1 2 1]
+
+-- Generated via:
+--   python3 -B ci/farkas_cert_gen.py --mir-bounds uint-add-no-overflow --width 16 \
+--     --hyp "a <= 40000" --hyp "b <= 25535" --lhs-expr "a" --rhs-expr "b" --json
+private def u16MaxHyps : List NatCutIneq :=
+  [⟨.var 0, .cst 40000⟩, ⟨.var 1, .cst 25535⟩]
+
+private def u16MaxCert : List CutStep :=
+  [.hyp 0, .hyp 1, .hyp 4, .comb 0 1 1 1, .comb 3 1 2 1]
+
+/-- End-to-end `ValidArrayToSliceCast` (both directly via `farkas_discharges_array_to_slice_cast`
+and through the unified `checkFarkasMirGoal_sound` dispatcher), plus `.u16` (`40000 + 25535 =
+65535 = u16::MAX`) and `.usize` (`add_scaled`) checked-to-unchecked elimination so ALL 6 `UintTy`
+variants (`.u8`, `.u16`, `.u32`, `.u64`, `.u128`, `.usize`) are exercised end-to-end. -/
+theorem test_e2e_array_to_slice_dispatcher_and_u16_usize (strat : PanicStrategy)
+    (rp : RawPtrVal) (q n total a16 b16 aSz bSz : Nat)
+    (hAlign1 : 4 * q ≤ rp.offset) (hAlign2 : rp.offset ≤ 4 * q)
+    (hTot : 4 * q + 4 * n ≤ total)
+    (ha16 : a16 ≤ 40000) (hb16 : b16 ≤ 25535)
+    (haSz : aSz ≤ 1000000) (hbSz : bSz ≤ 250000) :
+    ValidArrayToSliceCast rp 4 4 n total ∧
+    evalPtrOffset rp (n * 4) total = some { rp with offset := rp.offset + n * 4 } ∧
+    a16 + b16 < modPow2 (uintWidth .u16) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody .u16 .add strat.toUnwindAction) 6
+          (uintArgs2 .u16 a16 b16)))
+      (classifyMirExecState strat
+        (runMirCall (mkUncheckedArithBody .u16 .add) 2 (uintArgs2 .u16 a16 b16))) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedAddScaledBody .usize 4 strat.toUnwindAction) 13
+          (uintArgs2 .usize aSz bSz)))
+      (classifyMirExecState strat
+        (runMirCall (mkUncheckedAddScaledBody .usize 4) 5 (uintArgs2 .usize aSz bSz))) := by
+  have hArr := farkas_discharges_array_to_slice_cast
+    arrayToSliceHyps 4 4 (.var 0) (.var 1) (.var 2) (.var 3)
+    arrayToSliceAlignLeCert arrayToSliceAlignGeCert arrayToSliceRangeCert
+    rfl rfl rfl rfl [rp.offset, q, n, total] rp rfl hAlign1 hAlign2 hTot
+  have hArrDisp := checkFarkasMirGoal_sound
+    (.arrayToSliceCast arrayToSliceHyps 4 4 (.var 0) (.var 1) (.var 2) (.var 3))
+    (.triple arrayToSliceAlignLeCert arrayToSliceAlignGeCert arrayToSliceRangeCert)
+    rfl [rp.offset, q, n, total] rp rfl hAlign1 hAlign2 hTot
+  have hU16Disp := checkFarkasMirGoal_sound
+    (.uintAddNoOverflow .u16 u16MaxHyps (.var 0) (.var 1))
+    (.single u16MaxCert) rfl [a16, b16] [] canonInitMemory ha16 hb16
+  have hU16Eq := checked_add_equiv_unchecked_of_farkas_cert
+    .u16 strat u16MaxHyps (.var 0) (.var 1) u16MaxCert rfl [a16, b16] ha16 hb16
+  have hUsize := checked_add_scaled_refines_unchecked_of_farkas_cert
+    .usize 4 strat addScaledHyps (.var 0) (.var 1) addScaledCert rfl rfl [aSz, bSz] haSz hbSz
+  exact ⟨hArr.1, hArrDisp.2, hU16Disp.1, hU16Eq, hUsize.2.1⟩
+
 /-! ## 2. Entailment-Graph Adequacy Non-Vacuity, Strictness, Transitivity, & Negative Checks -/
 
 -- Generated via:
@@ -1128,6 +1199,66 @@ theorem test_assert_polarity_mutation_universal :
          (assert_polarity_mutation_breaks_refinement .u8 .unwind 5 6 h5 h6).2.2.2.1
            (Nat.lt_succ_self 5)⟩
 
+/-- Parametric `-C panic=abort` vs. `-C panic=unwind` equivalence/incomparability `iff`,
+tree-level `ITree.toPartial` polarity-mutation refutation, and universal
+`UnwindAction.unreachable` trap-collapse sensitivity across `.u16`, `.u64`, `.usize`, `.u128`. -/
+theorem test_parametric_strategy_separation_and_mutation_toPartial :
+    -- Cross-strategy equivalence holds on non-overflowing u16/usize, fails on overflowing u128/u16
+    ((mirCallTree (mkCheckedArithBody .u16 .add .continue_) (uintArgs2 .u16 40000 25535)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u16 .add .terminate) (uintArgs2 .u16 40000 25535)).toPartial) ∧
+    (¬ ((mirCallTree (mkCheckedArithBody .u128 .add .continue_) (uintArgs2 .u128 u128Max 1)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u128 .add .terminate) (uintArgs2 .u128 u128Max 1)).toPartial)) ∧
+    (¬ ((mirCallTree (mkCheckedArithBody .usize .sub .terminate) (uintArgs2 .usize 0 1)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .usize .sub .continue_) (uintArgs2 .usize 0 1)).toPartial)) ∧
+    (¬ ((mirCallTree (mkCheckedAddScaledBody .u16 4 .continue_) (uintArgs2 .u16 65500 20)).toPartial ≤
+      (mirCallTree (mkCheckedAddScaledBody .u16 4 .terminate) (uintArgs2 .u16 65500 20)).toPartial)) ∧
+    -- Tree-level Layer 1A ITree.toPartial polarity-mutation refutation (add, sub, mul)
+    (¬ ((mirCallTree (flipAssertPolarity (mkCheckedArithBody .u64 .add .terminate))
+          (uintArgs2 .u64 7 9)).toPartial ≤
+        (mirCallTree (mkUncheckedArithBody .u64 .add) (uintArgs2 .u64 7 9)).toPartial)) ∧
+    (¬ ((mirCallTree (flipAssertPolarity (mkCheckedArithBody .u128 .sub .continue_))
+          (uintArgs2 .u128 0 1)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody .u128 .sub .continue_) (uintArgs2 .u128 0 1)).toPartial)) ∧
+    (¬ ((mirCallTree (flipAssertPolarity (mkCheckedArithBody .u16 .mul .terminate))
+          (uintArgs2 .u16 256 256)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody .u16 .mul .terminate) (uintArgs2 .u16 256 256)).toPartial)) ∧
+    -- Universal UnwindAction.unreachable sensitivity on u128 add, usize sub, u16 mul
+    ((mirCallTree (mkUncheckedArithBody .u128 .add) (uintArgs2 .u128 u128Max 1)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u128 .add .unreachable) (uintArgs2 .u128 u128Max 1)).toPartial) ∧
+    ((mirCallTree (mkUncheckedArithBody .usize .sub) (uintArgs2 .usize 0 1)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .usize .sub .unreachable) (uintArgs2 .usize 0 1)).toPartial) ∧
+    ((mirCallTree (mkUncheckedArithBody .u16 .mul) (uintArgs2 .u16 256 256)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u16 .mul .unreachable) (uintArgs2 .u16 256 256)).toPartial) := by
+  have hMod128 : modPow2 (uintWidth .u128) = u128Max + 1 := by
+    rw [modPow2_eq_pow]; rfl
+  have h0Lt128 : 0 < modPow2 (uintWidth .u128) := by rw [hMod128]; exact Nat.succ_pos _
+  have h1Lt128 : 1 < modPow2 (uintWidth .u128) := by
+    rw [hMod128]; exact Nat.succ_lt_succ (Nat.succ_pos _)
+  have hOv128 : modPow2 (uintWidth .u128) ≤ u128Max + 1 := by rw [hMod128]; exact Nat.le_refl _
+  have h0LtSz : 0 < modPow2 (uintWidth .usize) := Nat.le_of_ble_eq_true rfl
+  have h1LtSz : 1 < modPow2 (uintWidth .usize) := Nat.le_of_ble_eq_true rfl
+  rw [test_flipAssertPolarity_is_theory_mutant, test_flipAssertPolarity_is_theory_mutant,
+      test_flipAssertPolarity_is_theory_mutant]
+  exact ⟨(panic_strategy_abort_vs_unwind_add_iff .u16 40000 25535).2.2.1.2
+           (Nat.le_of_ble_eq_true rfl),
+         fun h => Nat.not_lt_of_le hOv128
+           ((panic_strategy_abort_vs_unwind_add_iff .u128 u128Max 1).2.2.1.1 h),
+         fun h => Nat.not_le_of_gt (Nat.lt_succ_self 0)
+           ((panic_strategy_abort_vs_unwind_sub_iff .usize 0 1 h0LtSz h1LtSz).2.2.2.1 h),
+         fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+           ((panic_strategy_abort_vs_unwind_add_scaled_iff .u16 4 65500 20).2.2.1.1 h),
+         (assert_polarity_mutation_breaks_toPartial_add .u64 .abort 7 9).1
+           (Nat.le_of_ble_eq_true rfl),
+         (assert_polarity_mutation_breaks_toPartial_sub .u128 .unwind 0 1 h0Lt128 h1Lt128).2
+           (Nat.lt_succ_self 0),
+         (assert_polarity_mutation_breaks_toPartial_mul .u16 .abort 256 256).2
+           (Nat.le_of_ble_eq_true rfl),
+         ((unwind_unreachable_collapses_trap_separation .u128 .abort u128Max 1).1 hOv128).2,
+         ((unwind_unreachable_collapses_trap_separation .usize .unwind 0 1).2.1
+           h0LtSz h1LtSz (Nat.lt_succ_self 0)).2,
+         ((unwind_unreachable_collapses_trap_separation .u16 .abort 256 256).2.2
+           (Nat.le_of_ble_eq_true rfl)).2⟩
+
 /-! ## 4. Programmatic `run_cmd` Hygiene Audit & `#print axioms` Checks -/
 
 open Lean Elab Command in
@@ -1237,7 +1368,16 @@ run_cmd do
     , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_add_polarity_mutant
     , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_sub_polarity_mutant
     , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_mul_polarity_mutant
-    , ``Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_refinement ]
+    , ``Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_refinement
+    , ``Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_add_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_sub_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_mul_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_add_scaled_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_toPartial_add
+    , ``Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_toPartial_sub
+    , ``Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_toPartial_mul
+    , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_checked_unreachable_ub
+    , ``Anneal.Mir.OverflowTrapRefinement.unwind_unreachable_collapses_trap_separation ]
   -- Exact allowlist of coinductive `Anneal.ITree.WeakRef` / `Eutt` bridge corollaries in
   -- `Anneal.Mir.OverflowTrapRefinement` (these use `Classical.choice` solely via Lean 4
   -- `coinductive_fixpoint` in `Anneal.ITree`; NO other declaration in either module may).
@@ -1336,8 +1476,8 @@ run_cmd do
     unless seenCoind.length == allowedCoindThms.length do
       throwError "coinductive allowlist mismatch in {mod}: seen {seenCoind.length}, allowlisted {allowedCoindThms.length}"
     return s!"{mod}: {nConstThm}c+{nCoindThm}w thms, {nConstDefn}c+{nCoindAuxDefn}aux defs"
-  let sFarkas ← auditDeclsInModule `Anneal.FarkasMirCert 190 350 []
-  let sTrap ← auditDeclsInModule `Anneal.Mir.OverflowTrapRefinement 245 300
+  let sFarkas ← auditDeclsInModule `Anneal.FarkasMirCert 195 390 []
+  let sTrap ← auditDeclsInModule `Anneal.Mir.OverflowTrapRefinement 258 310
     allowedOverflowCoinductiveThms
   -- Every curated key declaration must live in one of the swept modules.
   for d in keyFarkasDecls ++ keyTrapConstructiveDecls ++ keyWeakRefBridgeDecls do
@@ -1384,7 +1524,7 @@ run_cmd do
       throwError "over-broad test coinductive allowlist: {expected} is not Classical-dependent"
   unless seenTestCoind.length == allowedTestCoinductiveThms.length do
     throwError "test coinductive allowlist mismatch: seen {seenTestCoind.length}, allowlisted {allowedTestCoinductiveThms.length}"
-  if constructiveTestTheorems < 29 || weakRefTestTheorems != 3 || constructiveTestDefns < 10 then
+  if constructiveTestTheorems < 31 || weakRefTestTheorems != 3 || constructiveTestDefns < 15 then
     throwError "test audit is vacuous: thms={constructiveTestTheorems}c+{weakRefTestTheorems}w, defs={constructiveTestDefns}"
   logInfo m!"hygiene audit passed: [{sFarkas}; {sTrap}]; curated {keyFarkasDecls.length} FarkasMirCert + {keyTrapConstructiveDecls.length} constructive OverflowTrapRefinement + {keyWeakRefBridgeDecls.length} WeakRef bridges; test module {constructiveTestTheorems}c+{weakRefTestTheorems}w thms, {constructiveTestDefns}c defs (0 sorryAx, 0 ofReduceBool, 0 trustCompiler, Classical.choice strictly allowlisted under WeakRef/Eutt)"
 
@@ -1396,12 +1536,15 @@ run_cmd do
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_refines_unchecked_of_farkas_cert
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_overflow_not_refines_wrapping
 #print axioms Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_distinct
+#print axioms Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_add_iff
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_sub_out_of_range_lhs_not_refines_unchecked
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_inner_mul_overflow_not_refines_unchecked
 #print axioms Anneal.Mir.OverflowTrapRefinement.runMirCall_checked_add_scaled_outer_add_trap_pinned
 #print axioms Anneal.Mir.OverflowTrapRefinement.add_scaled_failure_sites_pinned
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_wrapping_refines_iff
 #print axioms Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_refinement
+#print axioms Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_toPartial_add
+#print axioms Anneal.Mir.OverflowTrapRefinement.unwind_unreachable_collapses_trap_separation
 #print axioms Anneal.Mir.OverflowTrapRefinement.runMirSteps_faulted_to_tauStar
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_mul_const_right_refines_unchecked_of_farkas_cert
 #print axioms Anneal.Mir.OverflowTrapRefinement.unchecked_refines_to_checked_of_fuel
