@@ -15,24 +15,30 @@ import Anneal.Mir.OverflowTrapRefinement
 
 Kernel-checked end-to-end tests covering:
 1. Real `ci/farkas_cert_gen.py`-generated `CutStep` certificates replayed by `rfl` for:
-   - `add_scaled` (`a + 4 * b < 2^64` and `2^32`) discharging both `Anneal.FarkasMirCert`
+   - `add_scaled` (`a + 4 * b < 2^64`, `2^32`, and `usize`) discharging both `Anneal.FarkasMirCert`
      and concrete `stepMirState` checked-to-unchecked elimination (`OverflowTrapRefinement`);
-   - `u128` boundary addition (`a + b < 2^128`) checked-to-unchecked elimination;
-   - `slice-range` (`ValidSliceRange` + `evalPtrOffset`), `slice-split` (`ValidSliceSplit`),
-     and `non-overlapping-ptrs` (`NonOverlappingPtrs`);
+   - `u128` boundary addition (`a + b < 2^128`) and `u16` (`40000 + 25535 = u16::MAX`)
+     checked-to-unchecked elimination (covering all 6 `UintTy` variants);
+   - `slice-range` (`ValidSliceRange` + `evalPtrOffset`), `slice-split` (`ValidSliceSplit`,
+     with generator-provenance lock-down), `non-overlapping-ptrs` (`NonOverlappingPtrs`), and
+     `array-to-slice` (`ValidArrayToSliceCast` + unified `checkFarkasMirGoal_sound` dispatcher,
+     with generator-provenance lock-down);
    - `aligned-stride` with a genuine Chvatal-Gomory `CutStep.divCut` parity cut (`AlignedPtr`);
    - loop-bound `AiPcc` `WrappedInterval` and `MirAbsSlot.uint` refinement;
    - `uint-sub-no-underflow` (certified and range-hypothesized) + `stepMirState` checked-to-unchecked;
-   - `uint-mul-const-no-overflow` + `stepMirState` checked-to-unchecked multiplication elimination.
+   - `uint-mul-const-no-overflow` (left & right constant) + `stepMirState` checked-to-unchecked.
 2. Reflective Entailment-Graph adequacy non-vacuity, strictness, equivalence, multi-hop graph
-   transitivity (`Nat` and `Int`), and negative fail-closed `= false` `rfl` checks.
+   transitivity (`Nat` and `Int`), and negative fail-closed `= false` `rfl` checks (including
+   false `.equiv` claims and malformed/disconnected `EntailmentGraph` checks).
 3. Asymmetric overflow-trap refinement (`-C panic=abort` and `-C panic=unwind` `stepMirState`
    traces, unconditional `unchecked ⊑ checked`, `Trusted.Refinement.Partial` duality,
    step-bounded `TauLeN` and general operational `iff` bridges to `mirCallTree` / `WeakRef`,
+   tree-level reverse `iff`s, symmetric checked-vs-wrapping 4-way `iff`, parametric cross-strategy
+   `iff`, parametric assert-polarity & `UnwindAction.unreachable` mutation sensitivity,
    `u128` exact boundary canaries, and all 17 explicit negative soundness theorems).
-4. Programmatic `run_cmd` soundness/hygiene audit over `Lean.collectAxioms` across all key
-   declarations of `Anneal.FarkasMirCert`, `Anneal.Mir.OverflowTrapRefinement`, and this test
-   module, plus `#print axioms` checks.
+4. Programmatic `run_cmd` soundness/hygiene audit over `Lean.collectAxioms` sweeping EVERY
+   theorem and definition of `Anneal.FarkasMirCert`, `Anneal.Mir.OverflowTrapRefinement`, and
+   this test module (exact duplicate-free coinductive allowlists), plus `#print axioms` checks.
 -/
 
 namespace Anneal.Mir.FarkasMirCertAndTrapRefinementTests
@@ -139,9 +145,13 @@ private def sliceRangeHyps : List NatCutIneq :=
 private def sliceRangeCert : List CutStep :=
   [.hyp 0, .hyp 1, .hyp 2, .hyp 6, .comb 0 1 1 1, .comb 2 1 3 1, .comb 4 1 5 1]
 
--- Generated via:
+-- Generated via two separate generator runs over the SAME equality hypothesis:
 --   python3 -B ci/farkas_cert_gen.py --domain nat --hyp "mid + right = total" --goal "mid + right <= total" --json
 --   python3 -B ci/farkas_cert_gen.py --domain nat --hyp "mid + right = total" --goal "total <= mid + right" --json
+-- Each run prunes to the single used half of the equality (1 hyp over 3 vars, negated-goal
+-- slot `1 + 3 = 4`) and emits verbatim `[.hyp 0, .hyp 4, .comb 0 1 1 1]`. Relocating into
+-- the shared 2-hyp / 3-var context `sliceSplitHyps` (negated-goal slot `2 + 3 = 5`) maps
+-- hyp 0 -> 0 (le) / 1 (ge) and slot 4 -> 5 (locked down in `test_slice_split_generator_provenance`).
 private def sliceSplitHyps : List NatCutIneq :=
   [⟨.add (.var 0) (.var 1), .var 2⟩, ⟨.var 2, .add (.var 0) (.var 1)⟩]
 
@@ -150,6 +160,27 @@ private def sliceSplitCertLe : List CutStep :=
 
 private def sliceSplitCertGe : List CutStep :=
   [.hyp 1, .hyp 5, .comb 0 1 1 1]
+
+/-- Generator provenance and relocation lock-down for the `slice-split` certificates:
+raw pruned generator certs check `= true` on their pruned goals, relocated certs check
+`= true` on the shared `sliceSplitHyps` context, and un-relocated raw certs fail closed
+(`= false`) in the shared context. -/
+theorem test_slice_split_generator_provenance :
+    checkNatCutGoal
+      { hyps := [⟨.add (.var 0) (.var 1), .var 2⟩],
+        concl := ⟨.add (.var 0) (.var 1), .var 2⟩ }
+      [.hyp 0, .hyp 4, .comb 0 1 1 1] = true ∧
+    checkNatCutGoal
+      { hyps := [⟨.var 0, .add (.var 1) (.var 2)⟩],
+        concl := ⟨.var 0, .add (.var 1) (.var 2)⟩ }
+      [.hyp 0, .hyp 4, .comb 0 1 1 1] = true ∧
+    checkNatCutGoal ⟨sliceSplitHyps, ⟨.add (.var 0) (.var 1), .var 2⟩⟩ sliceSplitCertLe = true ∧
+    checkNatCutGoal ⟨sliceSplitHyps, ⟨.var 2, .add (.var 0) (.var 1)⟩⟩ sliceSplitCertGe = true ∧
+    checkNatCutGoal ⟨sliceSplitHyps, ⟨.add (.var 0) (.var 1), .var 2⟩⟩
+      [.hyp 0, .hyp 4, .comb 0 1 1 1] = false ∧
+    checkNatCutGoal ⟨sliceSplitHyps, ⟨.var 2, .add (.var 0) (.var 1)⟩⟩
+      [.hyp 0, .hyp 4, .comb 0 1 1 1] = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 -- Generated via:
 --   python3 -B ci/farkas_cert_gen.py --mir-bounds non-overlapping-ptrs \
@@ -575,7 +606,8 @@ theorem test_entailment_graph_multi_hop :
      rfl [1, 2] 0 2 rfl⟩
 
 /-- Negative fail-closed `rfl` checks (`= false`) for vacuous preconditions, bad witnesses,
-invalid strict witnesses, false equivalence claims, and unprovable obligations. -/
+invalid strict witnesses, false equivalence claims (`Nat` and `Int`), unprovable obligations,
+invalid graph edges, and disconnected graph paths. -/
 theorem test_entailment_negative_fail_closed :
     -- Vacuous precondition (`1 ≤ 0`) fails non-vacuity check
     checkNatEntailmentAdequacy [⟨.cst 1, .cst 0⟩] [⟨.var 0, .cst 0⟩]
@@ -592,12 +624,30 @@ theorem test_entailment_negative_fail_closed :
     -- Unprovable obligation (`x ≤ 20` does not entail `x ≤ 10`)
     checkNatEntailmentAdequacy [⟨.var 0, .cst 20⟩] [⟨.var 0, .cst 10⟩]
       [[.hyp 0, .hyp 2, .comb 0 1 1 1]] [0] .sufficientOnly = false ∧
+    -- False Nat equivalence claim (`x ≤ 10` is strictly stronger than `x ≤ 20`)
+    checkNatEntailmentAdequacy [⟨.var 0, .cst 10⟩] [⟨.var 0, .cst 20⟩]
+      [[.hyp 0, .hyp 2, .comb 0 1 1 1]] [0]
+      (.equiv [[.hyp 0, .hyp 2, .comb 0 1 1 1]]) = false ∧
     -- Int bad strict witness (`x = -2` satisfies `-4 ≤ x ≤ 6`)
     checkIntEntailmentAdequacy
       [⟨.cst ⟨true, 4⟩, .var 0⟩, ⟨.var 0, .cst ⟨false, 6⟩⟩]
       [⟨.cst ⟨true, 8⟩, .var 0⟩]
-      [[.hyp 0, .hyp 2, .comb 0 1 1 1]] [Int.negOfNat 1] (.strict [Int.negOfNat 2]) = false :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+      [[.hyp 0, .hyp 2, .comb 0 1 1 1]] [Int.negOfNat 1] (.strict [Int.negOfNat 2]) = false ∧
+    -- False Int equivalence claim (`-4 ≤ x` is strictly stronger than `-8 ≤ x`)
+    checkIntEntailmentAdequacy
+      [⟨.cst ⟨true, 4⟩, .var 0⟩] [⟨.cst ⟨true, 8⟩, .var 0⟩]
+      [[.hyp 0, .hyp 1, .comb 0 1 1 1]] [Int.ofNat 0]
+      (.equiv [[.hyp 0, .hyp 1, .comb 0 1 1 1]]) = false ∧
+    -- Invalid NatEntailmentGraph edge (`x ≤ 20 → x ≤ 10` fails closed)
+    checkNatEntailmentGraph
+      { nodes := [[⟨.var 0, .cst 20⟩], [⟨.var 0, .cst 10⟩]]
+        edges := [(0, 1, [[.hyp 0, .hyp 2, .comb 0 1 1 1]])] } = false ∧
+    -- Disconnected NatEntailmentGraph path (`0 → 2` when only edge `0 → 1` exists)
+    checkGraphIndexPath
+      ({ nodes := [[⟨.var 0, .cst 2⟩], [⟨.var 0, .cst 4⟩], [⟨.var 0, .cst 8⟩]]
+         edges := [(0, 1, [[.hyp 0, .hyp 2, .comb 0 1 1 1]])] } : NatEntailmentGraph)
+      0 2 [1, 2] = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## 3. Asymmetric Trap Refinement, `Partial` Duality, & All 17 Negative Soundness Canaries (#1–#15 Here, #16–#17 in §3.2) -/
 
@@ -1576,7 +1626,7 @@ run_cmd do
       throwError "over-broad test coinductive allowlist: {expected} is not Classical-dependent"
   unless seenTestCoind.length == allowedTestCoinductiveThms.length do
     throwError "test coinductive allowlist mismatch: seen {seenTestCoind.length}, allowlisted {allowedTestCoinductiveThms.length}"
-  if constructiveTestTheorems < 32 || weakRefTestTheorems != 3 || constructiveTestDefns < 15 then
+  if constructiveTestTheorems < 33 || weakRefTestTheorems != 3 || constructiveTestDefns < 15 then
     throwError "test audit is vacuous: thms={constructiveTestTheorems}c+{weakRefTestTheorems}w, defs={constructiveTestDefns}"
   logInfo m!"hygiene audit passed: [{sFarkas}; {sTrap}]; curated {keyFarkasDecls.length} FarkasMirCert + {keyTrapConstructiveDecls.length} constructive OverflowTrapRefinement + {keyWeakRefBridgeDecls.length} WeakRef bridges; test module {constructiveTestTheorems}c+{weakRefTestTheorems}w thms, {constructiveTestDefns}c defs (0 sorryAx, 0 ofReduceBool, 0 trustCompiler, Classical.choice strictly allowlisted under WeakRef/Eutt)"
 
