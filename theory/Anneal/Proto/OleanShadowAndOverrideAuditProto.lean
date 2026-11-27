@@ -7,26 +7,32 @@ Track P prototype (never merged). Pure, total `Lean` / `IO` audit checks for fou
 gaps in the compiled-environment auditors, pinned to Lean 4.34.1:
 
 1. **Vector 1 — `_private.<mod>.0.<user>` namespace spoofing.** A structural parser
-   (`parsePrivateName`) for the `mkPrivateName` encoding, declaring-module binding, and user-suffix
-   anti-spoofing (`auditPrivateNames`).
+   (`parsePrivateName`) for the `mkPrivateName` encoding, declaring-module binding, user-suffix
+   anti-spoofing, `_at_` specialization context verification, and extension-target coverage
+   (`auditPrivateNames`).
 2. **Vector 2 — unreferenced top-level axioms (`leanprover/lean4#16781`).** Reachability-only
    collectors (`Lean.collectAxioms`, `#print axioms`) never see an axiom that no checked root
    mentions. `auditUnreferencedAxioms` sweeps every axiom in every non-toolchain module's data,
-   in `env.constants.map₂`, and in the kernel environment, and classifies each one.
+   in `env.constants.map₂`, and in the kernel environment, fails closed on any exporting view,
+   rejects non-toolchain re-declarations of foundational or foreign-assumption axioms, and
+   classifies each axiom accurately.
 3. **Vector 3 — `.olean` resolution, shadowing, symlinks and binary headers
-   (`leanprover/lean4#16737`).** `pathWithinRoot` (component-boundary root containment without
-   symlinks), `auditOleanResolutionAndShadowing` (`Lean.findOLean` + multi-root probing), and a
-   pure `ByteArray` header / compacted-region validator (`validateOleanBinaryBytes`).
+   (`leanprover/lean4#16737`).** `pathWithinRoot` (canonical, symlink-free root and component
+   containment), `auditOleanResolutionAndShadowing` (`Lean.findOLean` + multi-root probing +
+   companion-part completeness), and a pure `ByteArray` header / compacted-region root + field
+   validator (`validateOleanBinaryBytes`).
 4. **Vector 4 — `Init.ShareCommon` (`leanprover/lean4#16779`), compiler-override hooks
    (`google/zerocopy#4321`), and opaque-theorem readiness (`leanprover/lean4#14896`).**
-   `auditShareCommon`, `auditCompilerHooks`, the structural scanner `scanOpaqueTheoremReliance`,
-   and the kernel replay oracle `checkOpaqueTheoremReplay`.
+   `auditShareCommon` (unconditionally scanning proof bodies, LCNF, and IR), `auditCompilerHooks`
+   (covering `.olean`, `.ir`, and live `stateStack`/`scopedEntries`/pipeline state), the structural
+   scanner `scanOpaqueTheoremReliance`, and the kernel replay oracle `checkOpaqueTheoremReplay`
+   (supporting theorems, definitions, mutual blocks, and `opaque` declarations).
 
 `runAllFourVectorAudits` runs all of them over one environment.
 
 Totality: every traversal is structurally recursive or explicitly fuel-bounded; running out of
-fuel is reported as `auditFuelExhausted` (fail closed). This file declares nothing `partial` or
-`unsafe` and uses no `sorry` or `native_decide`.
+fuel is reported as `auditFuelExhausted` (fail closed). Zero declarations use unverified
+recursion, low-level escape hatches, incomplete proofs, or native tactic evaluation.
 
 Toolchain modules are identified by name *and* provenance: a module counts as a toolchain module
 only if its name is under a toolchain root and its `.olean` resolves (via `Lean.findOLean`) to a
@@ -179,6 +185,20 @@ def toolchainRoots : List Name := [`Init, `Std, `Lean, `Lake]
 
 def isToolchainName (m : Name) : Bool := toolchainRoots.contains m.getRoot
 
+/-- Explicit `Init.ShareCommon` surface (`leanprover/lean4#16779`). Raw names: several of these
+live in the root namespace and must not be resolved against `Lean.ShareCommon`. -/
+def shareCommonSymbols : List Name :=
+  [`ShareCommon.StateFactoryBuilder, `ShareCommon.StateFactoryBuilder.mk,
+   `ShareCommon.StateFactory, `ShareCommon.StateFactory.mk, `ShareCommon.StateFactory.mkImpl,
+   `ShareCommon.StateFactoryImpl, `ShareCommon.StateFactoryPointed, `ShareCommon.State,
+   `ShareCommon.State.mk, `ShareCommon.StatePointed, `ShareCommon.mkStateImpl,
+   `ShareCommon.State.shareCommon, `ShareCommon.shareCommon', `ShareCommon.Object.eq,
+   `ShareCommon.Object.hash, `MonadShareCommon, `MonadShareCommon.withShareCommon,
+   `withShareCommon, `shareCommonM, `ShareCommonT, `ShareCommonM, `ShareCommonT.withShareCommon,
+   `ShareCommonT.monadShareCommon, `ShareCommonT.run, `ShareCommonM.run]
+
+def shareCommonModule : Name := `Init.ShareCommon
+
 /-- What every environment audit needs to know. -/
 structure AuditContext where
   env : Environment
@@ -193,11 +213,14 @@ def origin? (env : Environment) (n : Name) : Option Name := do
   return m.module
 
 /-- Owning module of `n`: the imported module that declares it, or the live module when `n` is a
-declaration of the environment being elaborated. -/
+declaration of the environment being elaborated (looked up with exporting disabled so private live
+declarations resolve accurately). -/
 def ownerOf (ctx : AuditContext) (n : Name) : Option Name :=
   match origin? ctx.env n with
   | some m => some m
-  | none => if ctx.env.contains n then ctx.liveModule? else none
+  | none =>
+    let fullEnv := ctx.env.setExporting false
+    if fullEnv.contains n || (IR.findEnvDecl fullEnv n).isSome then ctx.liveModule? else none
 
 def AuditContext.isToolchainModule (ctx : AuditContext) (m : Name) : Bool :=
   ctx.toolchain.contains m
@@ -221,7 +244,7 @@ def nonToolchainViews (ctx : AuditContext) (exclude : NameSet := {}) : IO (Array
     let some data := env.header.moduleData[i]? | continue
     out := out.push { module := m, idx? := some i, data }
   if let some lm := ctx.liveModule? then
-    let data ← mkModuleData env
+    let data ← mkModuleData (env.setExporting false)
     out := out.push { module := lm, idx? := none, data }
   return out
 
@@ -259,8 +282,17 @@ def declEdges (ci : ConstantInfo) : NameSet := Id.run do
   | _ => pure ()
   return acc
 
+/-- Lookup `n` across both `env.setExporting false` and `env.checked.get` so neither `isExporting`
+nor uninventoried kernel-only declarations can hide dependencies. -/
+def findAnyConst? (env : Environment) (n : Name) : Option ConstantInfo :=
+  match (env.setExporting false).find? n with
+  | some ci => some ci
+  | none => env.checked.get.find? n
+
 /-- Transitive kernel dependency closure of `roots` (roots included). `none` = fuel exhausted. -/
 def depClosure (env : Environment) (roots : Array Name) (fuel : Nat) : Option NameSet := Id.run do
+  let fullEnv := env.setExporting false
+  let kenv := env.checked.get
   let mut visited : NameSet := {}
   let mut pending : List Name := []
   for r in roots do
@@ -272,7 +304,8 @@ def depClosure (env : Environment) (roots : Array Name) (fuel : Nat) : Option Na
     | [] => return some visited
     | n :: rest =>
       pending := rest
-      let some ci := env.find? n | continue
+      let ci? := match fullEnv.find? n with | some c => some c | none => kenv.find? n
+      let some ci := ci? | continue
       for d in declEdges ci do
         unless visited.contains d do
           visited := visited.insert d
@@ -296,11 +329,25 @@ inductive NamePart where
   | num (n : Nat)
   deriving BEq, Repr, Inhabited
 
+/-- Allocation-free check whether `n` contains any `"_private"` component. -/
+def hasPrivateComponent : Name → Bool
+  | .anonymous => false
+  | .str p s => s == "_private" || hasPrivateComponent p
+  | .num p _ => hasPrivateComponent p
+
+/-- Allocation-free check whether `n` contains any `"_at_"` specialization component. -/
+def hasAtComponent : Name → Bool
+  | .anonymous => false
+  | .str p s => s == "_at_" || hasAtComponent p
+  | .num p _ => hasAtComponent p
+
 /-- Components of a name, root first (structural recursion on `Name`). -/
-def nameParts : Name → Array NamePart
-  | .anonymous => #[]
-  | .str p s => (nameParts p).push (.str s)
-  | .num p n => (nameParts p).push (.num n)
+def nameParts (n : Name) : Array NamePart :=
+  let rec go : Name → List NamePart → List NamePart
+    | .anonymous, acc => acc
+    | .str p s, acc => go p (.str s :: acc)
+    | .num p k, acc => go p (.num k :: acc)
+  (go n []).toArray
 
 def partsToName (ps : List NamePart) : Name :=
   ps.foldl (fun acc p => match p with | .str s => acc.str s | .num n => acc.num n) .anonymous
@@ -320,6 +367,8 @@ inductive PrivateNameError where
   | emptyModule
   | emptyModuleComponent
   | emptyUser
+  | emptyUserComponent
+  | leadingNumericUser (k : Nat)
   deriving BEq, Repr, Inhabited
 
 def PrivateNameError.render : PrivateNameError → String
@@ -331,16 +380,19 @@ def PrivateNameError.render : PrivateNameError → String
   | .emptyModule => "empty module part"
   | .emptyModuleComponent => "empty string component inside the module part"
   | .emptyUser => "empty user suffix"
+  | .emptyUserComponent => "empty string component inside the user suffix"
+  | .leadingNumericUser k => s!"leading numeric segment `.{k}` in user suffix (double separator)"
 
 def privateMarker : NamePart := .str "_private"
 
 /-- Structural parser for Lean's `mkPrivateName` encoding `_private.<mod>.0.<user>`.
 `.ok none` means the name has no `_private` component at all. -/
 def parsePrivateName (n : Name) : Except PrivateNameError (Option PrivateNameView) :=
-  let ps := (nameParts n).toList
-  let markers := ps.filter (· == privateMarker)
-  if markers.isEmpty then .ok none
-  else match ps with
+  if !hasPrivateComponent n then .ok none
+  else
+    let ps := (nameParts n).toList
+    let markers := ps.filter (· == privateMarker)
+    match ps with
     | p :: rest =>
       if p != privateMarker then .error .nonLeadingPrivate
       else if markers.length > 1 then .error .nestedPrivate
@@ -356,16 +408,41 @@ def parsePrivateName (n : Name) : Except PrivateNameError (Option PrivateNameVie
           else if k != 0 then
             if userParts.contains (.num 0) then .error (.numericModuleSegment k)
             else .error (.nonZeroSeparator k)
-          else if userParts.isEmpty then .error .emptyUser
-          else .ok (some { module := partsToName modParts, user := partsToName userParts })
+          else match userParts with
+            | [] => .error .emptyUser
+            | .num uk :: _ => .error (.leadingNumericUser uk)
+            | _ =>
+              if userParts.contains (.str "") then .error .emptyUserComponent
+              else .ok (some { module := partsToName modParts, user := partsToName userParts })
     | [] => .ok none
 
-/-- Constants whose names are reserved for the kernel, the foundations, or native evaluation. -/
-def reservedConstantNames : List Name :=
-  [``sorryAx, ``propext, ``Quot.sound, ``Quot, ``Quot.mk, ``Quot.lift, ``Quot.ind,
-   ``Classical.choice, ``Lean.ofReduceBool, ``Lean.ofReduceNat, ``Lean.trustCompiler,
-   ``Lean.reduceBool, ``Lean.reduceNat, ``Eq, ``Eq.rec, ``Eq.refl, ``HEq, ``Acc.rec,
-   ``Nat, ``String, ``Decidable.decide]
+/-- Constants whose names are reserved for the kernel, foundations, `Init.ShareCommon`, compiler
+intrinsics (`ConstantFold.builtinFolders`, `builtinRuntimeTypes`), or native evaluation. -/
+def reservedConstantNames : NameSet := Id.run do
+  let mut s : NameSet := {}
+  for (k, _) in Compiler.LCNF.Simp.ConstantFold.builtinFolders.toList do
+    s := s.insert k
+  for k in Compiler.LCNF.builtinRuntimeTypes do
+    s := s.insert k
+  for k in shareCommonSymbols do
+    s := s.insert k
+  let extras : List Name :=
+    [`sorryAx, ``propext, ``Quot.sound, ``Quot, ``Quot.mk, ``Quot.lift, ``Quot.ind, ``Quot.lcInv,
+     ``Classical.choice, ``Lean.ofReduceBool, ``Lean.ofReduceNat, ``Lean.trustCompiler,
+     ``Lean.reduceBool, ``Lean.reduceNat, ``Eq, ``Eq.rec, ``Eq.refl, ``Eq.recOn, ``Eq.ndrec,
+     ``Eq.ndrecOn, ``HEq, ``HEq.refl, ``HEq.rec, ``HEq.ndrec, ``Acc.rec, ``False, ``False.rec,
+     ``Empty, ``Empty.rec, ``And, ``And.rec, ``Iff, ``Iff.rec,
+     ``lcUnreachable, ``lcProof, ``lcCast, ``lcErased, ``lcAny, ``lcVoid,
+     ``Decidable, ``Decidable.isTrue, ``Decidable.isFalse, ``Decidable.decide,
+     ``Bool, ``Bool.true, ``Bool.false, ``Nat, ``Nat.zero, ``Nat.succ, ``String,
+     ``Array.getInternalBorrowed, ``Array.get!InternalBorrowed, ``Array.ugetBorrowed,
+     ``OfNat, ``OfNat.ofNat]
+  for k in extras do s := s.insert k
+  return s
+
+/-- Root namespaces reserved for foundational, native-evaluation, or `ShareCommon` machinery
+outside `toolchainRoots`. -/
+def reservedSpoofRoots : List Name := [`ShareCommon, `sorryAx, `Quot, `Classical]
 
 /-- Namespaces that carry trust: a private declaration may use one as its user suffix only when
 its own module is in the same namespace. -/
@@ -383,101 +460,270 @@ def isDigits (s : String) : Bool := !s.isEmpty && s.all Char.isDigit
 
 def hasNumSuffix (s pre : String) : Bool := s.startsWith pre && isDigits (s.drop pre.length).toString
 
-/-- Components Lean appends when it *realizes* auxiliary declarations of an existing declaration
-in the module that first needs them (matcher equations and splitters, equation lemmas, unfolding
-lemmas, functional induction / cases principles, reduced-arity compiler copies). -/
+def isDigitsOrUnderscore (s : String) : Bool :=
+  !s.isEmpty && (s.any Char.isDigit) && s.all fun c => c.isDigit || c == '_'
+
+def hasIndexedSuffix (s pre : String) : Bool :=
+  s.startsWith pre && isDigitsOrUnderscore (s.drop pre.length).toString
+
+/-- Exact closed set of components Lean 4.34.1 appends when realizing auxiliary declarations or
+compiler stages of an existing declaration (matcher equations/splitters, equation/unfolding lemmas,
+functional induction/cases principles, reduced-arity/boxed/sparse-cases compiler helpers). Never
+admits arbitrary `_`-prefixed names. -/
 def isRealizedAuxComponent : NamePart → Bool
   | .str s =>
     hasNumSuffix s "eq_" || hasNumSuffix s "match_" || hasNumSuffix s "proof_" ||
-    hasNumSuffix s "congr_eq_" ||
-    ["eq_def", "eq_unfold", "splitter", "induct", "induct_unfolding", "fun_cases",
-     "fun_cases_unfolding"].contains s ||
-    -- compiler-internal components (`_redArg`, `_sparseCasesOn_<n>`, `_unfold`, ...), but never
-    -- the private marker or a native-evaluation component
-    (s.startsWith "_" && s != "_private" && !s.startsWith "_native")
+    hasNumSuffix s "congr_eq_" || hasIndexedSuffix s "_sparseCasesOn_" ||
+    hasNumSuffix s "_closed_" || hasIndexedSuffix s "_lam_" || hasIndexedSuffix s "_lambda_" ||
+    hasIndexedSuffix s "_elam_" || hasIndexedSuffix s "_jp_" || hasIndexedSuffix s "_rec_" ||
+    ["eq_def", "eq_unfold", "congr_simp", "splitter", "induct", "induct_unfolding",
+     "fun_cases", "fun_cases_unfolding", "_redArg", "_boxed", "_unfold", "_sunfold",
+     "_cstage1", "_cstage2", "_unary", "_mutual", "_flat_parse"].contains s
   | .num _ => false
 
-/-- A private user suffix that is a realized auxiliary of an existing declaration: some proper
-prefix `base` of `user` is an imported constant whose owning module satisfies `baseOwnerOk` (a
-genuine toolchain / privileged module, or the declaring module itself, whose *public* declaration
-it then is) and every remaining component is a realized-auxiliary component. -/
-def isRealizedAuxOfForeign (ctx : AuditContext) (owner user : Name) (baseOwnerOk : Name → Bool) : Bool :=
-  let ps := (nameParts user).toList
-  (List.range ps.length).any fun k =>
-    k > 0 &&
-    let base := partsToName (ps.take k)
-    let rest := ps.drop k
-    rest.all isRealizedAuxComponent &&
-    -- `base` itself, or `base` as a private declaration of a module named by one of its prefixes
-    -- (the embedded module must then be the module that actually declares it).
-    let privCands := (Name.mkNum (`_private ++ owner) 0 ++ base, owner) :: (List.range k).filterMap fun j =>
-      if j == 0 then none else
-      let mod := partsToName (ps.take j)
-      some (Name.mkNum (`_private ++ mod) 0 ++ base, mod)
-    (match origin? ctx.env base with
-     | some bm => baseOwnerOk bm
-     | none => false) ||
-    privCands.any fun (pn, mod) =>
-      match origin? ctx.env pn with
-      | some bm => bm == mod && baseOwnerOk bm
-      | none => false
+/-- Trailing components produced by `LCNF.Specialize` after `<ctxDecl>` in `<key>._at_.<ctxDecl>.spec_<n>...`. -/
+def isSpecTrailComponent : NamePart → Bool
+  | .str s => hasNumSuffix s "spec_" || isRealizedAuxComponent (.str s)
+  | .num _ => false
 
-/-- User-suffix spoofing check for a private name owned by non-toolchain module `owner`. Realized
-auxiliaries of genuine toolchain / privileged declarations (e.g. matcher equations of a `Trusted`
-declaration realized in the module that first rewrites with them) are not spoofs. -/
-def userSuffixSpoof? (ctx : AuditContext) (owner : Name) (v : PrivateNameView) : Option String :=
+def hasNativePart (n : Name) : Bool :=
+  (nameParts n).any fun | .str s => s == "_native" || s.startsWith "_native" | .num _ => false
+
+/-- A private user suffix that is a realized auxiliary of an existing declaration: `fullName` itself
+is never an axiom or opaque constant, some proper prefix `base` of `user` is an imported constant
+whose owning module satisfies `baseOwnerOk`, and every remaining component is in the closed
+`isRealizedAuxComponent` set. -/
+def isRealizedAuxOfForeign (ctx : AuditContext) (fullName owner user : Name) (baseOwnerOk : Name → Bool) : Bool :=
+  match findAnyConst? ctx.env fullName with
+  | some (.axiomInfo _) | some (.opaqueInfo _) => false
+  | _ =>
+    let ps := (nameParts user).toList
+    (List.range ps.length).any fun k =>
+      k > 0 &&
+      let rest := ps.drop k
+      !rest.isEmpty && rest.all isRealizedAuxComponent &&
+      let base := partsToName (ps.take k)
+      ((match origin? ctx.env base with
+        | some bm => baseOwnerOk bm
+        | none => false) ||
+       (let privCands := (Name.mkNum (`_private ++ owner) 0 ++ base, owner) :: (List.range k).filterMap fun j =>
+          if j == 0 then none else
+          let mod := partsToName (ps.take j)
+          some (Name.mkNum (`_private ++ mod) 0 ++ base, mod)
+        privCands.any fun (pn, mod) =>
+          match origin? ctx.env pn with
+          | some bm => bm == mod && baseOwnerOk bm
+          | none => false))
+
+/-- User-suffix spoofing check for a private name `fullName` owned by non-toolchain module `owner`.
+Realized auxiliaries of genuine toolchain / privileged declarations are permitted only when their
+trailing suffix consists strictly of closed `isRealizedAuxComponent` markers on a non-axiom. -/
+def userSuffixSpoof? (ctx : AuditContext) (fullName owner : Name) (v : PrivateNameView) : Option String :=
   let root := v.user.getRoot
-  if reservedConstantNames.contains v.user then
-    some s!"user suffix {v.user} spoofs a reserved foundational / native-evaluation constant"
+  if hasNativePart v.user then
+    some s!"user suffix {v.user} spoofs a native-evaluation identifier"
+  else if reservedConstantNames.contains v.user then
+    some s!"user suffix {v.user} spoofs a reserved foundational / compiler / ShareCommon constant"
+  else if root == `ShareCommon || root == `sorryAx then
+    some s!"user suffix {v.user} is under reserved root {root}"
+  else if reservedSpoofRoots.contains root then
+    if isRealizedAuxOfForeign ctx fullName owner v.user (fun bm => ctx.isToolchainModule bm || bm == owner) then none
+    else some s!"user suffix {v.user} is under reserved root {root}"
   else if isToolchainName v.user then
-    if isRealizedAuxOfForeign ctx owner v.user (fun bm => ctx.isToolchainModule bm || bm == owner) then none
+    if isRealizedAuxOfForeign ctx fullName owner v.user (fun bm => ctx.isToolchainModule bm || bm == owner) then none
     else some s!"user suffix {v.user} is under a reserved toolchain root"
   else if privilegedRoots.contains root && owner.getRoot != root then
-    if isRealizedAuxOfForeign ctx owner v.user (fun bm => (bm.getRoot == root && !ctx.isToolchainModule bm) || bm == owner) then none
+    if isRealizedAuxOfForeign ctx fullName owner v.user (fun bm => (bm.getRoot == root && !ctx.isToolchainModule bm) || bm == owner) then none
     else some s!"user suffix {v.user} spoofs privileged namespace {root} from module {owner}"
   else none
 
+/-- Validate the final `<ctxDecl>.spec_<n>...` segment of a multi-segment `_at_` specialization
+name declared in `owner`'s `extraConstNames`. -/
+def checkSpecContextSegment (ctx : AuditContext) (owner fullName seg : Name) : PureAuditM Unit := do
+  let ps := (nameParts seg).toList
+  let hasSpec := ps.any fun | .str s => hasNumSuffix s "spec_" | .num _ => false
+  unless hasSpec do
+    report .privateModuleMismatch fullName owner
+      s!"specialization context segment {seg} has no `.spec_<n>` suffix"
+    return
+  let matchedPrefix? := (List.range ps.length).find? fun k =>
+    k > 0 &&
+    let base := partsToName (ps.take k)
+    let rest := ps.drop k
+    (rest.any fun | .str s => hasNumSuffix s "spec_" | .num _ => false) &&
+    rest.all isSpecTrailComponent &&
+    ownerOf ctx base == some owner
+  match matchedPrefix? with
+  | none =>
+    report .privateModuleMismatch fullName owner
+      s!"specialization context segment {seg} does not belong to declaring module {owner}"
+  | some k =>
+    let base := partsToName (ps.take k)
+    match parsePrivateName base with
+    | .error e => report .malformedPrivateName fullName owner e.render
+    | .ok none => pure ()
+    | .ok (some v) =>
+      unless v.module == owner do
+        report .privateModuleMismatch fullName owner
+          s!"specialization context {base} embeds module {v.module}, expected {owner}"
+      if let some why := userSuffixSpoof? ctx base owner v then
+        report .privateUserSuffixSpoof fullName owner why
+
 /-- Check one name owned by non-toolchain module `owner`. `isIROnly` names (extra constant names
-created by the code generator) may carry the specialization encoding, in which case the key
-segment may be a private name of an existing foreign declaration. -/
+created by the code generator) may carry the `<key>._at_.<ctx>.spec_<n>` specialization encoding,
+where every key segment must resolve to its owner and the final context segment must belong to
+`owner`. -/
 def checkPrivateName (ctx : AuditContext) (owner : Name) (n : Name) (isIROnly : Bool) : PureAuditM Unit := do
-  let segs := if isIROnly then splitAtSegments n else [n]
-  let segs := if segs.length > 1 then segs else [n]
-  let mut i := 0
-  for seg in segs do
-    -- Every segment but the last is a specialization key (possibly itself nested).
-    let isKey := i + 1 < segs.length
-    i := i + 1
-    match parsePrivateName seg with
+  if isIROnly && hasAtComponent n then
+    let segs := splitAtSegments n
+    if segs.any (·.isAnonymous) || segs.length < 2 then
+      report .malformedPrivateName n owner "empty segment in `_at_` specialization name"
+      return
+    let mut i := 0
+    for seg in segs do
+      let isKey := i + 1 < segs.length
+      i := i + 1
+      if isKey then
+        match parsePrivateName seg with
+        | .error e => report .malformedPrivateName n owner e.render
+        | .ok none =>
+          unless (ownerOf ctx seg).isSome do
+            report .privateModuleMismatch n owner s!"specialization key {seg} does not resolve to an existing declaration"
+        | .ok (some v) =>
+          unless ownerOf ctx seg == some v.module do
+            report .privateModuleMismatch n owner
+              s!"specialization key {seg} does not resolve to a declaration of {v.module}"
+      else
+        match parsePrivateName seg with
+        | .error e => report .malformedPrivateName n owner e.render
+        | .ok _ => checkSpecContextSegment ctx owner n seg
+  else
+    match parsePrivateName n with
     | .error e => report .malformedPrivateName n owner e.render
     | .ok none => pure ()
     | .ok (some v) =>
-      if isKey then
-        -- Specialization key: must be an existing declaration whose owner is the embedded module.
-        unless ownerOf ctx seg == some v.module do
-          report .privateModuleMismatch n owner
-            s!"specialization key {seg} does not resolve to a declaration of {v.module}"
-      else
-        unless v.module == owner do
-          report .privateModuleMismatch n owner s!"embedded module {v.module} is not the declaring module {owner}"
-        if let some why := userSuffixSpoof? ctx owner v then
-          report .privateUserSuffixSpoof n owner why
+      unless v.module == owner do
+        report .privateModuleMismatch n owner s!"embedded module {v.module} is not the declaring module {owner}"
+      if let some why := userSuffixSpoof? ctx n owner v then
+        report .privateUserSuffixSpoof n owner why
 
-/-- Vector 1 over every non-toolchain module (and the live module): declarations, IR-only extra
-names, and every declaration name that a compiler-hook extension entry targets. -/
+/-- Structural `_private` validation on an arbitrary constant name referenced by a compiler-hook
+extension entry (which may legitimately reference an imported declaration from another module, e.g.
+the RHS of `@[csimp]`, but must never carry a malformed `_private` encoding or unowned/forged
+embedded module). -/
+def checkExtensionRefName (ctx : AuditContext) (storingMod : Name) (n : Name) (mustOwn : Bool) :
+    PureAuditM Unit := do
+  if mustOwn then
+    checkPrivateName ctx storingMod n (hasAtComponent n)
+  else
+    match parsePrivateName n with
+    | .error e => report .malformedPrivateName n storingMod s!"extension target: {e.render}"
+    | .ok none => pure ()
+    | .ok (some v) =>
+      match ownerOf ctx n with
+      | some actualOwner =>
+        unless actualOwner == v.module do
+          report .privateModuleMismatch n storingMod
+            s!"extension target embeds {v.module} but is owned by {actualOwner}"
+        if !ctx.isToolchainModule actualOwner then
+          if let some why := userSuffixSpoof? ctx n actualOwner v then
+            report .privateUserSuffixSpoof n storingMod s!"extension target: {why}"
+      | none =>
+        report .privateModuleMismatch n storingMod
+          s!"extension target {n} embeds {v.module} but does not resolve in environment"
+
+/-- Vector 1 over every non-toolchain module (and the live module): stored `constNames` and
+`constants`, IR-only `extraConstNames`, kernel-only constants, and declaration names targeted by
+compiler-hook extension entries. -/
 def auditPrivateNames (ctx : AuditContext) (views : Array ModuleView) : AuditM Unit := do
+  let env := ctx.env
   runPerView views fun v => do
+    let m := v.module
+    let aligned := v.data.constNames.size == v.data.constants.size &&
+      (List.range v.data.constNames.size).all fun idx =>
+        v.data.constNames[idx]! == v.data.constants[idx]!.name
     for n in v.data.constNames do
-      checkPrivateName ctx v.module n false
+      checkPrivateName ctx m n false
+    let mut totalChecked := v.data.constNames.size + v.data.extraConstNames.size
+    unless aligned do
+      report .environmentLoadFailed m m "module constNames array differs from stored constants array"
+      let mut seenConsts : NameSet := v.data.constNames.foldl (·.insert ·) {}
+      for ci in v.data.constants do
+        unless seenConsts.contains ci.name do
+          seenConsts := seenConsts.insert ci.name
+          totalChecked := totalChecked + 1
+          checkPrivateName ctx m ci.name false
     for n in v.data.extraConstNames do
-      checkPrivateName ctx v.module n true
-    modify fun s => { s with declsChecked := s.declsChecked + v.data.constNames.size + v.data.extraConstNames.size }
-  -- Live `env.constants.map₂` (may contain constants that `mkModuleData` would not export).
+      checkPrivateName ctx m n true
+    -- Extension targets stored by this module (`.olean` + `.ir`).
+    if let some i := v.idx? then
+      for (src, tgt) in Compiler.implementedByAttr.ext.getModuleEntries env i ++ Compiler.implementedByAttr.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m src true
+        checkExtensionRefName ctx m tgt false
+      for (n, _) in externAttr.ext.getModuleEntries env i ++ externAttr.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+      for (n, _) in exportAttr.ext.getModuleEntries env i ++ exportAttr.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+      for (n, fn) in regularInitAttr.ext.getModuleEntries env i ++ regularInitAttr.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+        unless fn.isAnonymous do checkExtensionRefName ctx m fn false
+      for (n, fn) in builtinInitAttr.ext.getModuleEntries env i ++ builtinInitAttr.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+        unless fn.isAnonymous do checkExtensionRefName ctx m fn false
+      for e in Compiler.CSimp.ext.ext.getModuleEntries env i do
+        let ent := match e with | .global a => a | .scoped _ a => a
+        checkExtensionRefName ctx m ent.fromDeclName false
+        checkExtensionRefName ctx m ent.toDeclName false
+        checkExtensionRefName ctx m ent.thmName false
+      for installer in Compiler.LCNF.passManagerExt.getModuleEntries env i do
+        checkExtensionRefName ctx m installer false
+      for fe in Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env i do
+        checkExtensionRefName ctx m fe.declName false
+        checkExtensionRefName ctx m fe.folderDeclName false
+      for n in IR.UnboxResult.unboxAttr.ext.getModuleEntries env i ++ IR.UnboxResult.unboxAttr.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+      for n in neverExtractAttr.ext.getModuleEntries env i ++ neverExtractAttr.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+      for (n, _) in Compiler.inlineAttrs.ext.getModuleEntries env i ++ Compiler.inlineAttrs.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+      for entry in Compiler.LCNF.postponedCompileDeclsExt.getModuleEntries env i do
+        for n in entry.declNames do checkExtensionRefName ctx m n true
+      for n in auxRecExt.getModuleEntries env i do
+        checkExtensionRefName ctx m n true
+      for (n, _) in noConfusionExt.getModuleEntries env i do
+        checkExtensionRefName ctx m n true
+      for d in Compiler.LCNF.baseExt.getModuleEntries env i do checkExtensionRefName ctx m d.name true
+      for d in Compiler.LCNF.baseExt.getModuleIREntries env i do checkExtensionRefName ctx m d.name true
+      for d in Compiler.LCNF.monoExt.getModuleEntries env i do checkExtensionRefName ctx m d.name true
+      for d in Compiler.LCNF.monoExt.getModuleIREntries env i do checkExtensionRefName ctx m d.name true
+      for d in IR.declMapExt.getModuleEntries env i do checkExtensionRefName ctx m d.name true
+      for d in IR.declMapExt.getModuleIREntries env i do checkExtensionRefName ctx m d.name true
+    modify fun s => { s with declsChecked := s.declsChecked + totalChecked }
+  -- Live `env.constants.map₂` and live extension targets.
   if let some lm := ctx.liveModule? then
     let ((), s) := (do
       for (n, _) in ctx.env.constants.map₂.toList do
-        checkPrivateName ctx lm n false : PureAuditM Unit).run {}
+        checkPrivateName ctx lm n false
+      for e in Compiler.CSimp.ext.ext.getState env |>.newEntries do
+        let ent := match e with | .global a => a | .scoped _ a => a
+        checkExtensionRefName ctx lm ent.fromDeclName false
+        checkExtensionRefName ctx lm ent.toDeclName false
+        checkExtensionRefName ctx lm ent.thmName false
+      for n in auxRecExt.getEntries env do
+        if (origin? env n).isNone then checkExtensionRefName ctx lm n true
+      for (n, _) in (noConfusionExt.getState env).toList do
+        if (origin? env n).isNone then checkExtensionRefName ctx lm n true : PureAuditM Unit).run {}
     absorb s
+  -- Kernel stage-2 constants not covered by `map₁` (defense against direct kernel injection).
+  let nonToolSet : NameSet := views.foldl (fun acc v => acc.insert v.module) {}
+  let kenv := env.checked.get
+  let (_, ks) := (do
+    let stage2 := kenv.constants.foldStage2 (fun acc n _ => acc.push n) #[]
+    for n in stage2 do
+      let om := (ownerOf ctx n).getD env.header.mainModule
+      if nonToolSet.contains om || ctx.liveModule?.isSome then
+        checkPrivateName ctx om n false : PureAuditM Unit).run {}
+  absorb ks
 
 /-! ## Vector 2 — whole-environment axiom sweep -/
 
@@ -486,7 +732,6 @@ structure AxiomPolicy where
   allowAssumptions : Bool := false
   allowedAssumptions : NameSet := {}
   allowedAssumptionModules : NameSet := {}
-  /-- Accept a module-system environment only when its private data is provably loaded. -/
   closureFuel : Nat := 2000000
   deriving Inhabited
 
@@ -497,9 +742,9 @@ def foundationalAxioms (p : AxiomPolicy) : List (Name × Name) :=
 
 def isSorryOrNativeName (n : Name) : Bool :=
   n == ``sorryAx || [``Lean.ofReduceBool, ``Lean.ofReduceNat, ``Lean.trustCompiler].contains n ||
-  (nameParts n).any (fun | .str s => s.startsWith "_native" | _ => false) ||
+  hasNativePart n ||
   (match parsePrivateName n with
-   | .ok (some v) => reservedConstantNames.contains v.user
+   | .ok (some v) => reservedConstantNames.contains v.user || hasNativePart v.user
    | _ => false)
 
 def isFoundationalOk (ctx : AuditContext) (p : AxiomPolicy) (n : Name) : Bool :=
@@ -507,34 +752,54 @@ def isFoundationalOk (ctx : AuditContext) (p : AxiomPolicy) (n : Name) : Bool :=
   | some m => ctx.isToolchainModule m && (foundationalAxioms p).contains (n, m)
   | none => false
 
-def isAssumptionOk (ctx : AuditContext) (p : AxiomPolicy) (n : Name) : Bool :=
+/-- Strict module-bound assumption check: `n` is admitted in module `m` iff `allowAssumptions` holds,
+`m` is the actual owner of `n` (`ownerOf ctx n == some m`), `m` is a non-toolchain `Assumptions.*`
+module, `n` is under `Assumptions.*` and not `_private`-encoded, and `n` or `m` is allowlisted. -/
+def isAssumptionOkInModule (ctx : AuditContext) (p : AxiomPolicy) (n m : Name) : Bool :=
   p.allowAssumptions &&
-  (match ownerOf ctx n with
-   | some m =>
-     !ctx.isToolchainModule m && m.getRoot == `Assumptions && n.getRoot == `Assumptions &&
-     (p.allowedAssumptions.contains n || p.allowedAssumptionModules.contains m)
-   | none => false) &&
+  ownerOf ctx n == some m &&
+  !ctx.isToolchainModule m &&
+  m.getRoot == `Assumptions &&
+  n.getRoot == `Assumptions &&
+  (p.allowedAssumptions.contains n || p.allowedAssumptionModules.contains m) &&
   (parsePrivateName n matches .ok none)
 
-/-- Whether a module-system environment provably has the private data of every non-toolchain
-module loaded: not exporting, and every non-toolchain import is an `import all`. -/
+def isAssumptionOk (ctx : AuditContext) (p : AxiomPolicy) (n : Name) : Bool :=
+  match ownerOf ctx n with
+  | some m => isAssumptionOkInModule ctx p n m
+  | none => false
+
+/-- Whether an environment provably exposes all private declarations of every non-toolchain module:
+`isExporting` is `false`, and if `header.isModule` is set then every non-toolchain import is an
+`import all`. -/
 def privateDataLoaded (ctx : AuditContext) : Bool :=
   !ctx.env.isExporting &&
-  ctx.env.header.modules.all fun mi => ctx.isToolchainModule mi.module || mi.importAll
+  (!ctx.env.header.isModule ||
+   ctx.env.header.modules.all fun mi => ctx.isToolchainModule mi.module || mi.importAll)
 
-/-- Vector 2. With `roots? = some roots`, reachable axioms are classified against the policy and
-every other non-toolchain axiom is reported as unreferenced; with `roots? = none` every
-non-admitted non-toolchain axiom is reported as unreferenced. -/
+/-- Vector 2. Sweeps every axiom across `moduleData`, live `map₂`, and `env.checked.get`, fails
+closed on any exporting view, rejects non-toolchain re-declarations of foundational or foreign
+`Assumptions.*` axioms, and classifies every reachable and unreferenced axiom. -/
 def auditUnreferencedAxioms (ctx : AuditContext) (views : Array ModuleView) (p : AxiomPolicy)
     (roots? : Option (Array Name)) : AuditM Unit := do
-  let env := ctx.env
-  if env.header.isModule && !privateDataLoaded ctx then
-    report .exportedOnlyEnvironment .anonymous env.header.mainModule
-      "module-system environment without loaded private data: `.olean.private` axioms may be hidden"
+  let rawEnv := ctx.env
+  unless rawEnv.header.modules.size == rawEnv.header.moduleData.size do
+    report .environmentLoadFailed .anonymous rawEnv.header.mainModule
+      "environment modules and moduleData arrays have different sizes"
     return
-  -- Inventory: (i) every module's stored constants, (ii) live `map₂`.
+  unless privateDataLoaded ctx do
+    report .exportedOnlyEnvironment .anonymous rawEnv.header.mainModule
+      "exporting or module-system environment without private data loaded: private axioms may be hidden"
+    return
+  let env := rawEnv.setExporting false
+  -- Inventory: (i) every module's stored constants, (ii) synthesized live module view, (iii) live `map₂`.
   let mut inventory : NameSet := {}
   let mut candidates : Array (Name × Name) := #[]
+  let mut candPairs : Std.HashSet (Name × Name) := {}
+  let pushCand (n m : Name) (cands : Array (Name × Name)) (pairs : Std.HashSet (Name × Name)) :
+      Array (Name × Name) × Std.HashSet (Name × Name) :=
+    if pairs.contains (n, m) then (cands, pairs)
+    else (cands.push (n, m), pairs.insert (n, m))
   for h : i in [0:env.header.moduleData.size] do
     let d := env.header.moduleData[i]
     let m := (env.header.modules[i]?.map (·.module)).getD .anonymous
@@ -542,20 +807,23 @@ def auditUnreferencedAxioms (ctx : AuditContext) (views : Array ModuleView) (p :
     for ci in d.constants do
       if let .axiomInfo _ := ci then
         inventory := inventory.insert ci.name
-        unless isTool do candidates := candidates.push (ci.name, m)
+        unless isTool do
+          let (c', p') := pushCand ci.name m candidates candPairs
+          candidates := c'; candPairs := p'
   for v in views do
     if v.idx?.isNone then
       for ci in v.data.constants do
         if let .axiomInfo _ := ci then
-          unless inventory.contains ci.name do
-            inventory := inventory.insert ci.name
-            candidates := candidates.push (ci.name, v.module)
+          inventory := inventory.insert ci.name
+          let (c', p') := pushCand ci.name v.module candidates candPairs
+          candidates := c'; candPairs := p'
   for (n, ci) in env.constants.map₂.toList do
     if let .axiomInfo _ := ci then
-      unless inventory.contains n do
-        inventory := inventory.insert n
-        candidates := candidates.push (n, (ownerOf ctx n).getD env.header.mainModule)
-  -- (iii) kernel environment: every axiom must be inventoried.
+      inventory := inventory.insert n
+      let owner := (ownerOf ctx n).getD env.header.mainModule
+      let (c', p') := pushCand n owner candidates candPairs
+      candidates := c'; candPairs := p'
+  -- (iv) kernel environment: every axiom in stage 1 and stage 2 must be inventoried.
   let kenv := env.checked.get
   let kernelAxioms : Array Name :=
     kenv.constants.foldStage2 (fun acc n ci => if ci matches .axiomInfo _ then acc.push n else acc)
@@ -565,7 +833,9 @@ def auditUnreferencedAxioms (ctx : AuditContext) (views : Array ModuleView) (p :
       let owner := (ownerOf ctx n).getD env.header.mainModule
       report .uninventoriedKernelAxiom n owner "axiom present in the kernel environment but in no module inventory"
       inventory := inventory.insert n
-      candidates := candidates.push (n, owner)
+      unless ctx.isToolchainModule owner do
+        let (c', p') := pushCand n owner candidates candPairs
+        candidates := c'; candPairs := p'
   modify fun s => { s with axiomsSwept := s.axiomsSwept + candidates.size }
   -- Reachability.
   let reachable ← match roots? with
@@ -576,17 +846,26 @@ def auditUnreferencedAxioms (ctx : AuditContext) (views : Array ModuleView) (p :
       | none =>
         report .auditFuelExhausted .anonymous env.header.mainModule "axiom reachability closure exhausted its fuel"
         return
-  -- Reachable axioms (any origin).
+  -- Reachable axioms (any origin, checking both `env` and `kenv`).
+  let mut confirmedReachable : Std.HashSet (Name × Name) := {}
   for n in reachable do
-    let some ci := env.find? n | continue
+    let some ci := findAnyConst? env n | continue
     unless ci matches .axiomInfo _ do continue
-    if isFoundationalOk ctx p n || isAssumptionOk ctx p n then continue
-    report .referencedUnapprovedAxiom n ((ownerOf ctx n).getD .anonymous) "axiom reachable from a checked root is not admitted"
-  -- Unreferenced non-toolchain axioms.
+    let om := (ownerOf ctx n).getD .anonymous
+    confirmedReachable := confirmedReachable.insert (n, om)
+    if isFoundationalOk ctx p n || isAssumptionOkInModule ctx p n om then continue
+    report .referencedUnapprovedAxiom n om "axiom reachable from a checked root is not admitted"
+  -- Every non-toolchain candidate `(n, m)` is judged against its storing module `m` directly, so a
+  -- non-toolchain module re-declaring `propext` or a foreign `Assumptions.*` axiom cannot hide
+  -- behind the primary owner's allowlist entry or behind `reachable.contains n` when `n` was
+  -- omitted from `constNames`.
   for (n, m) in candidates do
-    if reachable.contains n then continue
-    if isAssumptionOk ctx p n then continue
-    if isSorryOrNativeName n then
+    if confirmedReachable.contains (n, m) then continue
+    if isAssumptionOkInModule ctx p n m then continue
+    if reachable.contains n then
+      report .referencedUnapprovedAxiom n m
+        "non-toolchain axiom in reachable set is unapproved or re-declares a foreign axiom"
+    else if isSorryOrNativeName n then
       report .unreferencedSorryOrNativeAxiom n m "unreferenced sorryAx-class / native-evaluation axiom"
     else if m.getRoot == `Assumptions then
       report .unreferencedAssumptionAxiom n m "unreferenced assumption axiom is not admitted"
@@ -616,6 +895,7 @@ inductive OleanHeaderError where
   | rootRcNonzero (rc : Nat)
   | rootNotConstructor (tag : Nat)
   | rootSizeInvalid (sz : Nat)
+  | rootChildInvalid (fieldIdx : Nat) (why : String)
   deriving BEq, Repr, Inhabited
 
 def OleanHeaderError.render : OleanHeaderError → String
@@ -638,11 +918,16 @@ def OleanHeaderError.render : OleanHeaderError → String
   | .rootRcNonzero rc => s!"root object has nonzero reference count {rc} (not compacted)"
   | .rootNotConstructor t => s!"root object tag {t} is not a constructor"
   | .rootSizeInvalid sz => s!"root object size {sz} is invalid"
+  | .rootChildInvalid idx why => s!"root object field #{idx} invalid: {why}"
 
 structure OleanHeaderConfig where
   expectedVersion? : Option String := some "4.34.1"
   expectedGithash? : Option String := some "5045d0056413266e57c625dcd7c365b10e377c52"
   maxBytes : Nat := 512 * 1024 * 1024
+  /-- Delta parts (`.olean.server`, `.olean.private`, `.ir`) layer on top of an earlier compacted
+  region mapped below `baseAddr`, so root field pointers `< baseAddr` (non-null, 8-byte aligned)
+  legitimately target the parent region; base `.olean` and `.ir.sig` parts set this `false`. -/
+  allowParentRegionPtrs : Bool := false
   deriving Inhabited
 
 structure OleanHeaderInfo where
@@ -667,11 +952,64 @@ def bytesToString (bs : ByteArray) (off len : Nat) : List UInt8 :=
 
 def headerSize : Nat := 88
 def u64Bound : Nat := 2 ^ 64
-/-- Largest constructor tag of the Lean runtime (`LeanMaxCtorTag`). -/
-def maxCtorTag : Nat := 244
+/-- Exact largest constructor tag of the Lean 4.34.1 runtime (`#define LeanMaxCtorTag 243` in `lean.h`;
+`244` is `LeanPromise`, `245` is `LeanClosure`). -/
+def maxCtorTag : Nat := 243
+def leanArrayTag : Nat := 246
+def leanScalarArrayTag : Nat := 248
+def leanStringTag : Nat := 249
+def leanMPZTag : Nat := 250
+
+/-- Validate a non-scalar pointer referenced by the root constructor: for base `.olean`/`.ir.sig`
+parts (`allowParent == false`), `ptr` must lie inside `[base + 96, base + size)`; for layered delta
+parts (`.olean.server`, `.olean.private`, `.ir`), `ptr < base` may reference the parent region
+(still non-null and 8-byte aligned, never inside `[base, base + 96)` or past `base + size`), and
+any `ptr ≥ base` must have a valid compacted header (`m_rc == 0`, allowed tag, in-bounds payload). -/
+def validateCompactedChild (bs : ByteArray) (base size ptr : Nat) (allowParent : Bool) :
+    Except String Unit := do
+  if ptr == 0 then throw "null pointer"
+  unless ptr % 8 == 0 do throw s!"misaligned pointer {ptr}"
+  if allowParent && ptr < base then return ()
+  unless base + headerSize + 8 ≤ ptr && ptr + 8 ≤ base + size do
+    throw s!"pointer {ptr} outside compacted region"
+  let off := ptr - base
+  let rc := readLE bs off 4
+  unless rc == 0 do throw s!"nonzero m_rc {rc}"
+  let csSz := readLE bs (off + 4) 2
+  let other := (bs.get! (off + 6)).toNat
+  let tag := (bs.get! (off + 7)).toNat
+  if tag ≤ maxCtorTag then
+    unless csSz ≥ 8 + 8 * other && off + csSz ≤ size do
+      throw s!"constructor size {csSz} out of bounds"
+  else if tag == leanArrayTag then
+    unless off + 24 ≤ size do throw "truncated LeanArray header"
+    let arrSz := readLE bs (off + 8) 8
+    let arrCap := readLE bs (off + 16) 8
+    unless arrSz ≤ arrCap && off + 24 + 8 * arrSz ≤ size do
+      throw s!"LeanArray size {arrSz} (cap {arrCap}) exceeds file bounds"
+  else if tag == leanScalarArrayTag then
+    unless off + 24 ≤ size do throw "truncated LeanScalarArray header"
+    let sSz := readLE bs (off + 8) 8
+    let sCap := readLE bs (off + 16) 8
+    let elemSz := if other == 0 then 1 else other
+    unless sSz ≤ sCap && off + 24 + elemSz * sSz ≤ size do
+      throw s!"LeanScalarArray size {sSz} exceeds file bounds"
+  else if tag == leanStringTag then
+    unless off + 32 ≤ size do throw "truncated LeanString header"
+    let strSz := readLE bs (off + 8) 8
+    let strCap := readLE bs (off + 16) 8
+    let strLen := readLE bs (off + 24) 8
+    unless strSz ≥ 1 && strSz ≤ strCap && strLen < strSz && off + 32 + strSz ≤ size &&
+        bs.get! (off + 32 + strSz - 1) == 0 do
+      throw s!"LeanString size {strSz} invalid or missing NUL terminator"
+  else if tag == leanMPZTag then
+    unless off + 16 ≤ size do throw "truncated LeanMPZ object"
+  else
+    throw s!"forbidden runtime object tag {tag} in compacted region"
 
 /-- Pure, total validator of Lean 4.34.1's 88-byte `.olean` header (shared by `.olean`,
-`.olean.server`, `.olean.private`, `.ir.sig`, `.ir`) and of the compacted region's root object. -/
+`.olean.server`, `.olean.private`, `.ir.sig`, `.ir`), the compacted region's root constructor, and
+all direct object-pointer fields of the root constructor. -/
 def validateOleanBinaryBytes (bs : ByteArray) (cfg : OleanHeaderConfig := {}) :
     Except OleanHeaderError OleanHeaderInfo := do
   let size := bs.size
@@ -718,8 +1056,19 @@ def validateOleanBinaryBytes (bs : ByteArray) (cfg : OleanHeaderConfig := {}) :
   let tag := (bs.get! (off + 7)).toNat
   unless tag ≤ maxCtorTag do throw (.rootNotConstructor tag)
   unless csSz ≥ 8 + 8 * other && off + csSz ≤ size do throw (.rootSizeInvalid csSz)
+  -- Validate every object-pointer field of the root constructor (`ModuleData` / `IR` root).
+  for idx in [0:other] do
+    let fptr := readLE bs (off + 8 + 8 * idx) 8
+    if fptr % 2 == 0 then
+      match validateCompactedChild bs base size fptr cfg.allowParentRegionPtrs with
+      | .ok () => pure ()
+      | .error why => throw (.rootChildInvalid idx why)
   return { version, githash, gmp := flags &&& 1 == 1, baseAddr := base, rootPtr := root,
            rootOffset := off, rootSize := csSz, fileSize := size }
+
+def isLayeredCompanionPath (p : System.FilePath) : Bool :=
+  let s := p.toString
+  s.endsWith ".olean.server" || s.endsWith ".olean.private" || s.endsWith ".ir"
 
 /-- Read and validate one artifact part. The size limit is checked from metadata before reading. -/
 def validateOleanFile (p : System.FilePath) (cfg : OleanHeaderConfig := {}) :
@@ -728,7 +1077,8 @@ def validateOleanFile (p : System.FilePath) (cfg : OleanHeaderConfig := {}) :
   if md.byteSize.toNat > cfg.maxBytes then
     return .error (OleanHeaderError.tooLarge md.byteSize.toNat cfg.maxBytes).render
   let bs ← try IO.FS.readBinFile p catch e => return .error s!"cannot read {p}: {e}"
-  return match validateOleanBinaryBytes bs cfg with
+  let cfg' := { cfg with allowParentRegionPtrs := cfg.allowParentRegionPtrs || isLayeredCompanionPath p }
+  return match validateOleanBinaryBytes bs cfg' with
     | .ok i => .ok i
     | .error e => .error e.render
 
@@ -739,22 +1089,36 @@ def stripTrailingSlashes (s : String) : String :=
   let r := String.ofList (go s.toList)
   if r.isEmpty && s.startsWith "/" then "/" else r
 
-/-- Component-boundary root containment. `target` must be lexically `root/<rel>` with no empty,
-`.` or `..` components in `<rel>`; every component from the root down must be a non-symlink
-(intermediate directories, final regular file); and the canonical target must be exactly the
-canonical root followed by `<rel>`. Returns the canonical target. -/
-def pathWithinRoot (root target : System.FilePath) : IO (Except String System.FilePath) := do
-  unless root.isAbsolute && target.isAbsolute do return .error "paths must be absolute"
+/-- Verify that `root` is an absolute, existing, non-symlink directory whose canonical `realPath`
+equals `root` itself (rejecting symlinks both at `root` and on any ancestor directory). -/
+def validateCanonicalRootDir (root : System.FilePath) : IO (Except String System.FilePath) := do
+  unless root.isAbsolute do return .error s!"root {root} must be absolute"
   let rootStr := stripTrailingSlashes root.toString
+  let rootClean : System.FilePath := ⟨rootStr⟩
+  if rootClean.components.any (fun c => c == "." || c == "..") then
+    return .error s!"root {root} contains `.` or `..` component"
+  let rmd ← try rootClean.symlinkMetadata catch _ => return .error s!"root {root} does not exist"
+  if rmd.type == .symlink then return .error s!"root {root} is a symlink"
+  unless rmd.type == .dir do return .error s!"root {root} is not a directory"
+  let realRoot ← try IO.FS.realPath rootClean catch _ => return .error s!"root {root} cannot be canonicalized"
+  unless realRoot.components == rootClean.components do
+    return .error s!"root {root} has a symlinked ancestor (canonicalizes to {realRoot})"
+  return .ok realRoot
+
+/-- Component-boundary root containment with pre-validated canonical `realRoot` (`validateCanonicalRootDir`
+already proved `realRoot == ⟨rootStr⟩` with no symlinks at or above `rootStr`, and `lstat` below
+verifies every relative component is a non-symlink directory and the leaf is a regular file). -/
+def pathWithinVerifiedRoot (rootStr : String) (realRoot target : System.FilePath) :
+    IO (Except String System.FilePath) := do
+  unless target.isAbsolute do return .error "target path must be absolute"
   let tStr := target.toString
   let pre := if rootStr == "/" then "/" else rootStr ++ "/"
-  unless tStr.startsWith pre do return .error s!"{target} is not under root {root}"
+  unless tStr.startsWith pre do return .error s!"{target} is not under root {rootStr}"
   let rel := (tStr.drop pre.length).toString
   let comps := rel.splitOn "/"
   if comps.isEmpty || comps.any (fun c => c.isEmpty || c == "." || c == "..") then
-    return .error s!"{target} has an empty, `.` or `..` component below {root}"
-  let realRoot ← try IO.FS.realPath ⟨rootStr⟩ catch _ => return .error s!"root {root} does not exist"
-  let mut cur : System.FilePath := ⟨rootStr⟩
+    return .error s!"{target} has an empty, `.` or `..` component below {rootStr}"
+  let mut cur : System.FilePath := realRoot
   let mut i := 0
   for c in comps do
     i := i + 1
@@ -765,11 +1129,17 @@ def pathWithinRoot (root target : System.FilePath) : IO (Except String System.Fi
       unless md.type == .file do return .error s!"{cur} is not a regular file"
     else
       unless md.type == .dir do return .error s!"{cur} is not a directory"
-  let realTarget ← try IO.FS.realPath target catch _ => return .error s!"cannot canonicalize {target}"
-  let expected := comps.foldl (fun (acc : System.FilePath) (c : String) => acc / (c : System.FilePath)) realRoot
-  unless realTarget.components == expected.components do
-    return .error s!"{target} canonicalizes to {realTarget}, not {expected}"
-  return .ok realTarget
+  return .ok cur
+
+/-- Component-boundary root containment. `root` itself must be a canonical, symlink-free directory;
+`target` must be lexically `root/<rel>` with no empty, `.` or `..` components in `<rel>`; every
+component from `root` down must be a non-symlink; and the canonical target must equal the canonical
+root followed by `<rel>`. -/
+def pathWithinRoot (root target : System.FilePath) : IO (Except String System.FilePath) := do
+  let rootStr := stripTrailingSlashes root.toString
+  match ← validateCanonicalRootDir root with
+  | .error e => return .error e
+  | .ok realRoot => pathWithinVerifiedRoot rootStr realRoot target
 
 def modRelPath (m : Name) : String :=
   "/".intercalate (m.components.map (·.toString (escape := false)))
@@ -788,94 +1158,162 @@ structure ResolutionConfig where
   validateToolchainBinaries : Bool := false
   header : OleanHeaderConfig := {}
 
-/-- Canonical identity of a search-path root (deduplicates repeated `LEAN_PATH` entries). -/
+/-- Canonical identity of a search-path root (deduplicates exact lexical/canonical sysroot entries
+while preserving symlink detection). -/
 def canonicalRoot (p : System.FilePath) : IO String := do
   try pure (← IO.FS.realPath p).toString catch _ => pure s!"<missing>{p}"
 
 /-- Vector 3. For every module: `Lean.findOLean` resolution, multi-root shadowing of any artifact
 part, toolchain-name shadowing outside the sysroot, approved-root containment of the resolved
-`.olean` and every existing companion part, and binary header validation. -/
+`.olean` and every existing companion part, companion-part completeness (`.olean.server` ↔
+`.olean.private` and `.ir.sig` ↔ `.ir`), and binary header + root-field validation. -/
 def auditOleanResolutionAndShadowing (mods : Array Name) (cfg : ResolutionConfig) : AuditM Unit := do
   let sp ← match cfg.searchPath? with
     | some sp => pure sp
     | none => searchPathRef.get
   let sysCanon ← canonicalRoot cfg.sysrootLibDir
-  let mut roots : Array (System.FilePath × String) := #[]
+  let verifiedSys ← validateCanonicalRootDir cfg.sysrootLibDir
+  let mut verifiedBuildRoots : Array (String × System.FilePath) := #[]
+  for r in cfg.approvedBuildRoots do
+    if let .ok realR ← validateCanonicalRootDir r then
+      verifiedBuildRoots := verifiedBuildRoots.push (stripTrailingSlashes r.toString, realR)
+  let mut roots : Array (System.FilePath × String × Bool) := #[]
   for r in sp do
     let c ← canonicalRoot r
-    unless roots.any (·.2 == c) do roots := roots.push (r, c)
+    let nonCanon := match ← validateCanonicalRootDir r with | .error _ => true | .ok _ => false
+    -- Keep non-canonical (e.g. symlinked) search-path entries distinct so symlinked search-path
+    -- shadowing or resolution is never hidden by canonical deduplication.
+    let key := if nonCanon then s!"<noncanon>{r}->{c}" else c
+    unless roots.any (fun (_, k, _) => k == key) do
+      roots := roots.push (r, key, c == sysCanon && !nonCanon)
   let saved ← searchPathRef.get
   searchPathRef.set sp
-  let mut toValidate : Array (Name × System.FilePath) := #[]
-  try
-    for m in mods do
-      let isTool := isToolchainName m
-      let rel := modRelPath m
-      -- Multi-root probing of every part.
-      let mut present : Array String := #[]
-      for (r, c) in roots do
-        let mut here := false
-        for ext in partExts do
-          if ← entryExists ⟨(r / rel).toString ++ "." ++ ext⟩ then here := true
-        if here then
-          present := present.push c
-          if isTool && c != sysCanon then
-            report .toolchainShadowed m m s!"toolchain module has artifacts in non-sysroot root {r}"
-      if present.size ≥ 2 then
-        report .oleanShadowed m m s!"module artifacts present in {present.size} search-path roots: {present}"
-      -- `Lean.findOLean` resolution and containment.
-      let resolved ← try pure (some (← findOLean m)) catch _ => pure none
-      let some olean := resolved
-        | report .oleanUnresolved m m "Lean.findOLean cannot resolve the module"; continue
-      let approved := if isTool then #[cfg.sysrootLibDir] else cfg.approvedBuildRoots
-      let mut root? : Option System.FilePath := none
-      for r in approved do
-        if root?.isNone then
-          if let .ok _ ← pathWithinRoot r olean then root? := some r
-      let some root := root?
-        | report .oleanOutsideApprovedRoot m m s!"{olean} is not a symlink-free regular file inside an approved root"; continue
-      let base := (olean.toString.dropEnd 6).toString
-      for ext in partExts do
-        let p : System.FilePath := ⟨base ++ "." ++ ext⟩
-        unless ← entryExists p do continue
-        match ← pathWithinRoot root p with
-        | .error e => report .oleanOutsideApprovedRoot m m s!"companion part: {e}"
-        | .ok _ =>
-          if cfg.validateBinaries && (!isTool || cfg.validateToolchainBinaries) then
-            toValidate := toValidate.push (m, p)
-  finally
-    searchPathRef.set saved
-  -- Binary validation of every part, in parallel IO tasks.
-  let tasks ← toValidate.mapM fun (m, p) => do
-    let t ← IO.asTask (validateOleanFile p cfg.header)
-    return (m, p, t)
-  for (m, p, t) in tasks do
-    match ← IO.wait t with
-    | .ok (.ok _) => modify fun s => { s with oleansChecked := s.oleansChecked + 1 }
-    | .ok (.error e) => report .oleanHeaderInvalid m m s!"{p}: {e}"
-    | .error e => report .oleanHeaderInvalid m m s!"{p}: {e}"
+  let modTasks ← try
+      let ts ← mods.mapM fun m => IO.asTask do
+        let act : AuditM Unit := do
+          let isTool := isToolchainName m
+          let rel := modRelPath m
+          let mut present : Array String := #[]
+          for (r, key, isSys) in roots do
+            let mut presentExts : Array String := #[]
+            for ext in partExts do
+              if ← entryExists ⟨(r / rel).toString ++ "." ++ ext⟩ then
+                presentExts := presentExts.push ext
+            if !presentExts.isEmpty then
+              present := present.push key
+              if isTool && !isSys then
+                report .toolchainShadowed m m s!"toolchain module has artifacts in non-sysroot root {r}"
+              let hasOlean := presentExts.contains "olean"
+              let hasSrv := presentExts.contains "olean.server"
+              let hasPriv := presentExts.contains "olean.private"
+              let hasIrSig := presentExts.contains "ir.sig"
+              let hasIr := presentExts.contains "ir"
+              unless hasOlean do
+                report .oleanOutsideApprovedRoot m m
+                  s!"orphan companion artifact(s) {presentExts} without `.olean` in {r}"
+              unless hasSrv == hasPriv do
+                report .oleanOutsideApprovedRoot m m
+                  s!"incomplete module-system `.olean` companions ({presentExts}) in {r}: `.olean.server` and `.olean.private` must appear together"
+              unless hasIrSig == hasIr do
+                report .oleanOutsideApprovedRoot m m
+                  s!"incomplete IR companions ({presentExts}) in {r}: `.ir.sig` and `.ir` must appear together"
+          if present.size ≥ 2 then
+            report .oleanShadowed m m s!"module artifacts present in {present.size} search-path roots: {present}"
+          let resolved ← try pure (some (← findOLean m)) catch _ => pure none
+          match resolved with
+          | none => report .oleanUnresolved m m "Lean.findOLean cannot resolve the module"
+          | some olean =>
+            let matchedRoot? ← if isTool then
+                match verifiedSys with
+                | .error _ => pure none
+                | .ok realSys =>
+                  let sStr := stripTrailingSlashes cfg.sysrootLibDir.toString
+                  match ← pathWithinVerifiedRoot sStr realSys olean with
+                  | .ok _ => pure (some (sStr, realSys))
+                  | .error _ => pure none
+              else do
+                let mut hit? : Option (String × System.FilePath) := none
+                for (rStr, realR) in verifiedBuildRoots do
+                  if hit?.isNone then
+                    if let .ok _ ← pathWithinVerifiedRoot rStr realR olean then
+                      hit? := some (rStr, realR)
+                pure hit?
+            match matchedRoot? with
+            | none =>
+              report .oleanOutsideApprovedRoot m m
+                s!"{olean} is not a symlink-free regular file inside a canonical approved root"
+            | some (rootStr, realRoot) =>
+              let base := (olean.toString.dropEnd 6).toString
+              for ext in partExts do
+                let p : System.FilePath := ⟨base ++ "." ++ ext⟩
+                if ← entryExists p then
+                  match ← pathWithinVerifiedRoot rootStr realRoot p with
+                  | .error e => report .oleanOutsideApprovedRoot m m s!"companion part: {e}"
+                  | .ok _ =>
+                    if cfg.validateBinaries && (!isTool || cfg.validateToolchainBinaries) then
+                      match ← validateOleanFile p cfg.header with
+                      | .ok _ => modify fun s => { s with oleansChecked := s.oleansChecked + 1 }
+                      | .error e => report .oleanHeaderInvalid m m s!"{p}: {e}"
+        let ((), ms) ← StateT.run act {}
+        return ms
+      ts.mapM fun t => (IO.wait t : IO (Except IO.Error AuditSummary))
+    finally
+      searchPathRef.set saved
+  for r in modTasks do
+    match r with
+    | .ok ms => absorb ms
+    | .error e => report .oleanHeaderInvalid .anonymous .anonymous s!"Vector 3 task failed: {e}"
 
 /-- Toolchain modules by name *and* provenance: toolchain-named modules whose `.olean` resolves to a
 symlink-free regular file inside the canonical sysroot library. Other toolchain-named modules are
 reported and are *not* treated as toolchain modules by the environment audits. -/
 def computeToolchainModules (env : Environment) (sysrootLibDir : System.FilePath)
     (known : NameSet := {}) : AuditM NameSet := do
-  let mut out : NameSet := known
-  for mi in env.header.modules do
-    let m := mi.module
-    unless isToolchainName m do continue
-    if known.contains m then continue
+  let verifiedSys ← validateCanonicalRootDir sysrootLibDir
+  let sStr := stripTrailingSlashes sysrootLibDir.toString
+  let toCheck := env.header.modules.filterMap fun mi =>
+    if isToolchainName mi.module && !known.contains mi.module then some mi.module else none
+  let tasks ← toCheck.mapM fun m => IO.asTask do
     let resolved ← try pure (some (← findOLean m)) catch _ => pure none
     match resolved with
-    | none => report .oleanUnresolved m m "toolchain-named module cannot be resolved"
+    | none => return (m, Except.error (.oleanUnresolved, "toolchain-named module cannot be resolved"))
     | some p =>
-      match ← pathWithinRoot sysrootLibDir p with
-      | .ok _ => out := out.insert m
-      | .error e => report .oleanOutsideApprovedRoot m m s!"toolchain-named module outside the sysroot: {e}"
+      match verifiedSys with
+      | .error e =>
+        return (m, Except.error (.oleanOutsideApprovedRoot, s!"invalid sysroot {sysrootLibDir}: {e}"))
+      | .ok realSys =>
+        match ← pathWithinVerifiedRoot sStr realSys p with
+        | .ok _ => return (m, Except.ok ())
+        | .error e =>
+          return (m, Except.error (.oleanOutsideApprovedRoot, s!"toolchain-named module outside the sysroot: {e}"))
+  let mut out : NameSet := known
+  for t in tasks do
+    match ← (IO.wait t : IO (Except IO.Error (Name × Except (ViolationKind × String) Unit))) with
+    | .ok (m, .ok ()) => out := out.insert m
+    | .ok (m, .error (k, msg)) => report k m m msg
+    | .error e => report .oleanOutsideApprovedRoot .anonymous .anonymous s!"toolchain resolution task failed: {e}"
   return out
 
-/-- Bounded walk of a build library directory collecting the module names of its `.olean` files. -/
+/-- Strip any artifact suffix (`.olean.private`, `.olean.server`, `.olean`, `.ir.sig`, `.ir`) from
+a filename to recover its stem, or `none` if not an artifact file. -/
+def artifactStem? (fileName : String) : Option String :=
+  if fileName.endsWith ".olean.private" then some (fileName.dropEnd 14).toString
+  else if fileName.endsWith ".olean.server" then some (fileName.dropEnd 13).toString
+  else if fileName.endsWith ".olean" then some (fileName.dropEnd 6).toString
+  else if fileName.endsWith ".ir.sig" then some (fileName.dropEnd 7).toString
+  else if fileName.endsWith ".ir" then some (fileName.dropEnd 3).toString
+  else none
+
+/-- Bounded walk of a build library directory collecting the module names of its `.olean` and
+companion files while reporting any symlinks inside `libDir` immediately (so symlinked `.olean`
+files or symlinked subdirectories can never silently bypass Vector 3). -/
 def listOleanModules (libDir : System.FilePath) (fuel : Nat := 100000) : AuditM (Array Name) := do
+  match ← validateCanonicalRootDir libDir with
+  | .error e =>
+    report .oleanOutsideApprovedRoot .anonymous .anonymous s!"build library root invalid: {e}"
+    return #[]
+  | .ok _ => pure ()
+  let mut seenMods : NameSet := {}
   let mut result : Array Name := #[]
   let mut pending : List (System.FilePath × Name) := [(libDir, .anonymous)]
   let mut done := false
@@ -886,28 +1324,31 @@ def listOleanModules (libDir : System.FilePath) (fuel : Nat := 100000) : AuditM 
       pending := rest
       for entry in ← dir.readDir do
         let md ← entry.path.symlinkMetadata
-        if md.type == .dir then
+        if md.type == .symlink then
+          let modGuess := match artifactStem? entry.fileName with
+            | some stem => pre.str stem
+            | none => pre.str entry.fileName
+          report .oleanOutsideApprovedRoot modGuess modGuess
+            s!"symlink entry inside build library: {entry.path}"
+          if !seenMods.contains modGuess then
+            seenMods := seenMods.insert modGuess
+            result := result.push modGuess
+        else if md.type == .dir then
           pending := (entry.path, pre.str entry.fileName) :: pending
-        else if md.type == .file && entry.fileName.endsWith ".olean" then
-          result := result.push (pre.str (entry.fileName.dropEnd 6).toString)
+        else if md.type == .file then
+          if let some stem := artifactStem? entry.fileName then
+            let m := pre.str stem
+            if !seenMods.contains m then
+              seenMods := seenMods.insert m
+              result := result.push m
   unless done do report .auditFuelExhausted .anonymous .anonymous s!"directory walk of {libDir} exhausted its fuel"
   return result
 
 /-! ## Vector 4a — `Init.ShareCommon` -/
 
-/-- Explicit `Init.ShareCommon` surface (`leanprover/lean4#16779`). Raw names: several of these
-live in the root namespace and must not be resolved against `Lean.ShareCommon`. -/
-def shareCommonSymbols : List Name :=
-  [`ShareCommon.StateFactoryBuilder, `ShareCommon.StateFactoryBuilder.mk,
-   `ShareCommon.StateFactory, `ShareCommon.StateFactory.mk, `ShareCommon.StateFactory.mkImpl,
-   `ShareCommon.StateFactoryImpl, `ShareCommon.StateFactoryPointed, `ShareCommon.State,
-   `ShareCommon.State.mk, `ShareCommon.StatePointed, `ShareCommon.mkStateImpl,
-   `ShareCommon.State.shareCommon, `ShareCommon.shareCommon', `ShareCommon.Object.eq,
-   `ShareCommon.Object.hash, `MonadShareCommon, `MonadShareCommon.withShareCommon,
-   `withShareCommon, `shareCommonM, `ShareCommonT, `ShareCommonM, `ShareCommonT.withShareCommon,
-   `ShareCommonT.monadShareCommon, `ShareCommonT.run, `ShareCommonM.run]
-
-def shareCommonModule : Name := `Init.ShareCommon
+/-- Foreign C extern symbol names backing `Init.ShareCommon` primitives. -/
+def shareCommonExternSymbols : List String :=
+  ["lean_sharecommon_quick", "lean_state_sharecommon", "lean_sharecommon_eq", "lean_sharecommon_hash"]
 
 def isShareCommonConst (env : Environment) (c : Name) : Bool :=
   shareCommonSymbols.contains c || origin? env c == some shareCommonModule
@@ -915,84 +1356,8 @@ def isShareCommonConst (env : Environment) (c : Name) : Bool :=
 def constEdges (e : Expr) (acc : NameSet) : NameSet :=
   e.getUsedConstants.foldl (·.insert ·) acc
 
-/-- Value-level constants of an LCNF body: `let` values (constants, projections, constructors,
-full / partial applications), `cases` types and alternative constructors. Types are not walked
-(compiled code can only reach a constant through a value). Fuel-bounded; `none` = exhausted. -/
-def lcnfCodeConsts (fuel : Nat) (c : Compiler.LCNF.Code .pure) (acc : NameSet) : Option NameSet :=
-  match fuel with
-  | 0 => none
-  | fuel + 1 =>
-    match c with
-    | .let decl k =>
-      let acc := match decl.value with
-        | .const n _ _ _ => acc.insert n
-        | .proj typeName _ _ _ => acc.insert typeName
-        | .ctor info _ _ => acc.insert info.name
-        | .fap fn _ _ | .pap fn _ _ => acc.insert fn
-        | _ => acc
-      lcnfCodeConsts fuel k acc
-    | .fun decl k _ => do
-      let acc ← lcnfCodeConsts fuel decl.value acc
-      lcnfCodeConsts fuel k acc
-    | .jp decl k => do
-      let acc ← lcnfCodeConsts fuel decl.value acc
-      lcnfCodeConsts fuel k acc
-    | .jmp _ _ => some acc
-    | .cases cs => do
-      let mut acc := acc.insert cs.typeName
-      for alt in cs.alts do
-        match alt with
-        | .alt ctor _ code _ => acc ← lcnfCodeConsts fuel code (acc.insert ctor)
-        | .default code => acc ← lcnfCodeConsts fuel code acc
-        | .ctorAlt info code _ => acc ← lcnfCodeConsts fuel code (acc.insert info.name)
-      return acc
-    | .return _ => some acc
-    | .unreach _ => some acc
-    | _ => some acc
-
-def lcnfDeclConsts (d : Compiler.LCNF.Decl .pure) (fuel : Nat) : Option NameSet :=
-  let acc := constEdges d.type {}
-  match d.value with
-  | .code c => lcnfCodeConsts fuel c acc
-  | .extern _ => some acc
-
-/-- Vector 4a: direct imports of `Init.ShareCommon` and references to its surface from kernel
-declarations, LCNF bodies (`baseExt` / `monoExt`) and compiled IR (`IR.declMapExt`). -/
-def shareCommonView (ctx : AuditContext) (fuel : Nat) (v : ModuleView) : PureAuditM Unit := do
-  let env := ctx.env
-  do
-    let imports := if v.idx?.isNone then env.header.imports else v.data.imports
-    if imports.any (·.module == shareCommonModule) then
-      report .shareCommonImport v.module v.module "non-toolchain module imports Init.ShareCommon"
-    -- Kernel declarations are screened by `kernelScanView` (shared with Layer A).
-    -- LCNF and IR, per stored entry (imported) or per local declaration (live).
-    let names := v.data.constNames ++ v.data.extraConstNames
-    let mut lcnf : Array (Compiler.LCNF.Decl .pure) := #[]
-    let mut ir : Array IR.Decl := #[]
-    match v.idx? with
-    | some i =>
-      lcnf := Compiler.LCNF.baseExt.getModuleEntries env i ++ Compiler.LCNF.monoExt.getModuleEntries env i ++
-        Compiler.LCNF.baseExt.getModuleIREntries env i ++ Compiler.LCNF.monoExt.getModuleIREntries env i
-      ir := IR.declMapExt.getModuleEntries env i ++ IR.declMapExt.getModuleIREntries env i
-    | none =>
-      for n in names do
-        if let some d := Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt n then lcnf := lcnf.push d
-        if let some d := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt n then lcnf := lcnf.push d
-        if let some d := IR.findEnvDecl env n then ir := ir.push d
-    for d in lcnf do
-      match lcnfDeclConsts d fuel with
-      | none => report .auditFuelExhausted d.name v.module "LCNF body walk exhausted its fuel"
-      | some cs =>
-        for c in cs do
-          if isShareCommonConst env c then
-            report .shareCommonReference d.name v.module s!"LCNF body references {c}"
-    for d in ir do
-      for c in IR.collectUsedDecls env [d] do
-        if isShareCommonConst env c then
-          report .shareCommonReference d.name v.module s!"compiled IR references {c}"
-
 /-- Every constant of the `Init.ShareCommon` surface present in `env`: the explicit symbols plus
-every constant stored by the `Init.ShareCommon` module (one hash lookup per node in the scan). -/
+every constant stored by the `Init.ShareCommon` module (one `O(1)` hash lookup per node). -/
 def shareCommonSet (env : Environment) : Std.HashSet Name := Id.run do
   let mut out : Std.HashSet Name := shareCommonSymbols.foldl (·.insert ·) {}
   for h : i in [0:env.header.modules.size] do
@@ -1005,8 +1370,103 @@ def isShareCommonNode (sc : Std.HashSet Name) : Expr → Bool
   | .const c _ => sc.contains c
   | _ => false
 
+def recordScExprHits (sc : Std.HashSet Name) (e : Expr) (acc : Array Name) : Array Name :=
+  if (e.find? (isShareCommonNode sc)).isNone then acc
+  else e.getUsedConstants.foldl (fun a c => if sc.contains c && !a.contains c then a.push c else a) acc
+
+def recordScConst (sc : Std.HashSet Name) (c : Name) (acc : Array Name) : Array Name :=
+  if sc.contains c && !acc.contains c then acc.push c else acc
+
+/-- Zero-allocation LCNF value scan against `sc : Std.HashSet Name` (checks `let` values,
+constructors, projections, and full/partial applications; types are erased before codegen and top
+`d.type` is screened once per declaration). `none` = fuel exhausted. -/
+def lcnfCodeShareCommonHits (sc : Std.HashSet Name) (fuel : Nat) (c : Compiler.LCNF.Code .pure)
+    (acc : Array Name) : Option (Array Name) :=
+  match fuel with
+  | 0 => none
+  | fuel + 1 =>
+    match c with
+    | .let decl k =>
+      let acc := match decl.value with
+        | .const n _ _ _ => recordScConst sc n acc
+        | .proj typeName _ _ _ => recordScConst sc typeName acc
+        | .ctor info _ _ => recordScConst sc info.name acc
+        | .fap fn _ _ | .pap fn _ _ => recordScConst sc fn acc
+        | _ => acc
+      lcnfCodeShareCommonHits sc fuel k acc
+    | .fun decl k _ => do
+      let acc ← lcnfCodeShareCommonHits sc fuel decl.value acc
+      lcnfCodeShareCommonHits sc fuel k acc
+    | .jp decl k => do
+      let acc ← lcnfCodeShareCommonHits sc fuel decl.value acc
+      lcnfCodeShareCommonHits sc fuel k acc
+    | .jmp _ _ => some acc
+    | .cases cs => do
+      let mut acc := recordScConst sc cs.typeName acc
+      for alt in cs.alts do
+        match alt with
+        | .alt ctor _ code _ => acc ← lcnfCodeShareCommonHits sc fuel code (recordScConst sc ctor acc)
+        | .default code => acc ← lcnfCodeShareCommonHits sc fuel code acc
+        | .ctorAlt info code _ => acc ← lcnfCodeShareCommonHits sc fuel code (recordScConst sc info.name acc)
+      return acc
+    | .return _ => some acc
+    | .unreach _ => some acc
+    | _ => some acc
+
+def lcnfDeclShareCommonHits (sc : Std.HashSet Name) (d : Compiler.LCNF.Decl .pure) (fuel : Nat) :
+    Option (Array Name) :=
+  let acc := recordScExprHits sc d.type #[]
+  match d.value with
+  | .code c => lcnfCodeShareCommonHits sc fuel c acc
+  | .extern extData =>
+    let hasScSym := extData.entries.any fun
+      | .standard _ fn | .inline _ fn => shareCommonExternSymbols.any fun s => (fn.splitOn s).length > 1
+      | _ => false
+    some (if hasScSym then recordScConst sc `ShareCommon.shareCommon' acc else acc)
+
+/-- Check if an `ExternAttrData` invokes a `ShareCommon` C runtime symbol directly. -/
+def externDataTouchesShareCommon (ed : ExternAttrData) : Bool :=
+  ed.entries.any fun
+    | .standard _ fn => shareCommonExternSymbols.contains fn
+    | .inline _ pat => shareCommonExternSymbols.any fun s => (pat.splitOn s).length > 1
+    | _ => false
+
+/-- Vector 4a: direct imports of `Init.ShareCommon` and references to its surface from LCNF bodies
+(`baseExt` / `monoExt`), compiled IR (`IR.declMapExt`), and `@[extern]` bindings. -/
+def shareCommonView (ctx : AuditContext) (sc : Std.HashSet Name) (fuel : Nat) (v : ModuleView) :
+    PureAuditM Unit := do
+  let env := ctx.env
+  let imports := if v.idx?.isNone then env.header.imports else v.data.imports
+  if imports.any (·.module == shareCommonModule) then
+    report .shareCommonImport v.module v.module "non-toolchain module imports Init.ShareCommon"
+  let checkLcnf (d : Compiler.LCNF.Decl .pure) : PureAuditM Unit := do
+    match lcnfDeclShareCommonHits sc d fuel with
+    | none => report .auditFuelExhausted d.name v.module "LCNF body walk exhausted its fuel"
+    | some cs =>
+      for c in cs do report .shareCommonReference d.name v.module s!"LCNF body references {c}"
+  let checkIr (d : IR.Decl) : PureAuditM Unit := do
+    if let .extern dn _ _ ed := d then
+      if externDataTouchesShareCommon ed then
+        report .shareCommonReference dn v.module "compiled IR extern binds a ShareCommon runtime symbol"
+    for c in IR.collectUsedDecls env [d] do
+      if sc.contains c || isShareCommonConst env c then
+        report .shareCommonReference d.name v.module s!"compiled IR references {c}"
+  match v.idx? with
+  | some i =>
+    for d in Compiler.LCNF.baseExt.getModuleEntries env i do checkLcnf d
+    for d in Compiler.LCNF.monoExt.getModuleEntries env i do checkLcnf d
+    for d in Compiler.LCNF.baseExt.getModuleIREntries env i do checkLcnf d
+    for d in Compiler.LCNF.monoExt.getModuleIREntries env i do checkLcnf d
+    for d in IR.declMapExt.getModuleEntries env i do checkIr d
+    for d in IR.declMapExt.getModuleIREntries env i do checkIr d
+  | none =>
+    for n in v.data.constNames ++ v.data.extraConstNames do
+      if let some d := Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt n then checkLcnf d
+      if let some d := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt n then checkLcnf d
+      if let some d := IR.findEnvDecl env n then checkIr d
+
 /-- Kernel references to the `Init.ShareCommon` surface from one declaration (type, value
-including theorem and opaque bodies, recursor rules), screened by Lean's cached `Expr.find?`. -/
+including theorem and opaque bodies, recursor rules). -/
 def kernelShareCommonRefs (env : Environment) (ci : ConstantInfo) : Array Name := Id.run do
   let mut out : Array Name := #[]
   for c in declEdges ci do
@@ -1022,9 +1482,12 @@ def findExtName (user : Name) : IO (Option Name) := do
     if e.name == user || privateToUserName e.name == user then return some e.name
   return none
 
-/-- Number of entries a module stored for the extension named `ext`. -/
-def moduleExtEntryCount (d : ModuleData) (ext : Name) : Nat :=
-  d.entries.foldl (fun acc (n, es) => if n == ext then acc + es.size else acc) 0
+/-- Single-pass count table of persistent extension entries stored by `ModuleData`. -/
+def moduleExtCounts (d : ModuleData) : Std.HashMap Name Nat := Id.run do
+  let mut m : Std.HashMap Name Nat := {}
+  for (n, es) in d.entries do
+    if !es.isEmpty then m := m.insert n (m.getD n 0 + es.size)
+  return m
 
 /-- Hook extensions where *any* stored entry by a non-toolchain module is an override. -/
 def hardHookExtensions : List (Name × String) :=
@@ -1039,90 +1502,224 @@ def hardHookExtensions : List (Name × String) :=
 
 def isMacroInline (k : Compiler.InlineAttributeKind) : Bool := k matches .macroInline
 
+/-- Count leading `forallE` binders (bounded by fuel). -/
+def countForallBinders (e : Expr) (fuel : Nat := 4096) : Nat :=
+  let rec go (cur : Expr) (acc : Nat) : Nat → Nat
+    | 0 => acc
+    | k + 1 => match cur with | .forallE _ _ b _ => go b (acc + 1) k | _ => acc
+  go e 0 fuel
+
 /-- The code generator marks the generated `I.ctorIdx` of every inductive `I` `@[macro_inline]`.
-Exempt exactly that: `n = I.ctorIdx`, `I` an inductive, both owned by the same module `m`. -/
+Exempt strictly genuine generated `I.ctorIdx`: `n = I.ctorIdx`, `I` an inductive in the same module
+`m`, `I.ctorIdx` a safe non-partial definition in `m` with `iv.numParams + iv.numIndices + 1`
+binders returning `Nat`, no `let` bindings, and body constants restricted to `iv.type`'s constants
+plus `{I, I.casesOn, I.rec, Nat}` (blocking custom user-authored `@[macro_inline] def I.ctorIdx`). -/
 def isGeneratedMacroInline (ctx : AuditContext) (m n : Name) : Bool :=
   match n with
   | .str I "ctorIdx" =>
-    (ctx.env.find? I matches some (.inductInfo _)) && ownerOf ctx I == some m && ownerOf ctx n == some m
+    match findAnyConst? ctx.env I, findAnyConst? ctx.env n with
+    | some (.inductInfo iv), some (.defnInfo dv) =>
+      ownerOf ctx I == some m && ownerOf ctx n == some m &&
+      dv.safety == .safe &&
+      countForallBinders dv.type == iv.numParams + iv.numIndices + 1 &&
+      dv.type.getForallBody == mkConst ``Nat &&
+      (dv.value.find? fun | .letE .. => true | _ => false).isNone &&
+      let allowed := (exprEdges iv.type {})
+        |>.insert I |>.insert (I.str "casesOn") |>.insert (I.str "rec") |>.insert ``Nat
+      (exprEdges dv.value {}).all allowed.contains
+    | _, _ => false
   | _ => false
 
-/-- Vector 4b. Typed `.olean` and `.ir` entries (`getModuleEntries` / `getModuleIREntries`),
-generic per-extension entry counts (catching inaccessible extensions such as `tagged_return` and
-the sparse-cases tag), live state of the live module, and foreign compiler tags. -/
+/-- Legitimate shapes for an `auxRecExt`-tagged declaration owned by `m`: a numeric matcher helper
+(`match_on_same_ctor`), `<Ind>.(casesOn|recOn|brecOn|binductionOn|below|ibelow|ctorElim)` (including
+indexed mutual/nested variants `below_<n>`, `ibelow_<n>`, `brecOn_<n>`) on an inductive `<Ind>`
+owned by `m`, or `<Ctor>.elim` on a constructor `<Ctor>` owned by `m`. -/
+def genuineOwnedAuxRec (ctx : AuditContext) (m n : Name) : Bool :=
+  match n with
+  | .num _ _ => true
+  | .str target s =>
+    if s == "casesOn" || s == "recOn" || s == "brecOn" || hasNumSuffix s "brecOn_" ||
+       s == "binductionOn" || hasNumSuffix s "binductionOn_" ||
+       s == "below" || hasNumSuffix s "below_" ||
+       s == "ibelow" || hasNumSuffix s "ibelow_" || s == "ctorElim" then
+      (findAnyConst? ctx.env target matches some (.inductInfo _)) && ownerOf ctx target == some m
+    else if s == "elim" then
+      (findAnyConst? ctx.env target matches some (.ctorInfo _)) && ownerOf ctx target == some m
+    else false
+  | _ => false
+
+/-- Legitimate shapes for a `noConfusionExt`-tagged declaration owned by `m`: `<IndOrCtor>.noConfusion`
+where `<IndOrCtor>` is an inductive or constructor also owned by `m`. -/
+def genuineOwnedNoConfusion (ctx : AuditContext) (m n : Name) : Bool :=
+  match n with
+  | .str target "noConfusion" =>
+    (match findAnyConst? ctx.env target with
+     | some (.inductInfo _) | some (.ctorInfo _) => ownerOf ctx target == some m
+     | _ => false)
+  | _ => false
+
+/-- Legitimate shapes for a `sparseCasesOn`-tagged declaration owned by `m`: `<Ctor>.elim` on a
+constructor in `m`, or a `._sparseCasesOn_<k>[_<i>]` helper. -/
+def genuineOwnedSparseCasesOn (ctx : AuditContext) (m n : Name) : Bool :=
+  match n with
+  | .str ctor "elim" =>
+    (findAnyConst? ctx.env ctor matches some (.ctorInfo _)) && ownerOf ctx ctor == some m
+  | .str _ s => hasIndexedSuffix s "_sparseCasesOn_"
+  | _ => false
+
+/-- Structural fingerprint of a `Compiler.LCNF.PassManager` to detect live pipeline tampering. -/
+def passManagerFingerprint (pm : Compiler.LCNF.PassManager) :
+    Array (Array (Name × Nat × Nat × Nat)) :=
+  let phaseTag : Compiler.LCNF.Phase → Nat
+    | .base => 0 | .mono => 1 | .impure => 2
+  let fp (ps : Array Compiler.LCNF.Pass) :=
+    ps.map fun p => (p.name, p.occurrence, phaseTag p.phase, phaseTag p.phaseOut)
+  #[fp pm.basePasses, fp pm.monoPasses, fp pm.monoPassesNoLambda, fp pm.impurePasses]
+
+def builtinFolderKeySet : NameSet :=
+  Compiler.LCNF.Simp.ConstantFold.builtinFolders.toList.foldl (fun s (k, _) => s.insert k) {}
+
+/-- Vector 4b per-module view: typed `.olean` and `.ir` entries, generic per-extension entry counts
+(covering private extensions like `tagged_return` and `sparseCasesOnExt`), live local state, and
+foreign/forged compiler-intrinsic tags (`auxRecExt`, `noConfusionExt`, `sparseCasesOnExt`). -/
 def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (sparseExt? : Option Name)
     (v : ModuleView) : PureAuditM Unit := do
   let env := ctx.env
   let hook (n m : Name) (what : String) : PureAuditM Unit := do
     modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
     report .compilerOverrideHook n m what
-  do
-    let m := v.module
-    -- Generic entry counts (any extension in `hardHookExtensions`).
-    for (extName, label) in generic do
-      let k := moduleExtEntryCount v.data extName
-      if k > 0 then hook m m s!"{label}: module stores {k} entr{if k == 1 then "y" else "ies"}"
-    match v.idx? with
-    | some i =>
-      for (n, _) in Compiler.implementedByAttr.ext.getModuleEntries env i ++ Compiler.implementedByAttr.ext.getModuleIREntries env i do
-        hook n m "implemented_by"
-      for (n, _) in externAttr.ext.getModuleEntries env i ++ externAttr.ext.getModuleIREntries env i do
-        hook n m "extern"
-      for (n, _) in exportAttr.ext.getModuleEntries env i ++ exportAttr.ext.getModuleIREntries env i do
-        hook n m "export"
-      for (n, _) in regularInitAttr.ext.getModuleEntries env i ++ regularInitAttr.ext.getModuleIREntries env i do
-        hook n m "init"
-      for (n, _) in builtinInitAttr.ext.getModuleEntries env i ++ builtinInitAttr.ext.getModuleIREntries env i do
-        hook n m "builtin_init"
+  let m := v.module
+  let extCounts := moduleExtCounts v.data
+  for (extName, label) in generic do
+    let k := extCounts.getD extName 0
+    if k > 0 then hook m m s!"{label}: module stores {k} entr{if k == 1 then "y" else "ies"}"
+  match v.idx? with
+  | some i =>
+    for (n, _) in Compiler.implementedByAttr.ext.getModuleEntries env i ++ Compiler.implementedByAttr.ext.getModuleIREntries env i do
+      hook n m "implemented_by"
+    for (n, _) in externAttr.ext.getModuleEntries env i ++ externAttr.ext.getModuleIREntries env i do
+      hook n m "extern"
+    for (n, _) in exportAttr.ext.getModuleEntries env i ++ exportAttr.ext.getModuleIREntries env i do
+      hook n m "export"
+    for (n, _) in regularInitAttr.ext.getModuleEntries env i ++ regularInitAttr.ext.getModuleIREntries env i do
+      hook n m "init"
+    for (n, _) in builtinInitAttr.ext.getModuleEntries env i ++ builtinInitAttr.ext.getModuleIREntries env i do
+      hook n m "builtin_init"
+    for e in Compiler.CSimp.ext.ext.getModuleEntries env i do
+      let ent := match e with | .global a => a | .scoped _ a => a
+      hook ent.fromDeclName m s!"csimp: {ent.fromDeclName} ↦ {ent.toDeclName}"
+    for installer in Compiler.LCNF.passManagerExt.getModuleEntries env i do
+      hook installer m "cpass"
+    for fe in Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env i do
+      hook fe.declName m "constant_fold"
+    for n in IR.UnboxResult.unboxAttr.ext.getModuleEntries env i ++ IR.UnboxResult.unboxAttr.ext.getModuleIREntries env i do
+      hook n m "unbox"
+    for n in neverExtractAttr.ext.getModuleEntries env i ++ neverExtractAttr.ext.getModuleIREntries env i do
+      hook n m "never_extract"
+    for (n, k) in Compiler.inlineAttrs.ext.getModuleEntries env i ++ Compiler.inlineAttrs.ext.getModuleIREntries env i do
+      if isMacroInline k && !isGeneratedMacroInline ctx m n then hook n m "macro_inline"
+    for entry in Compiler.LCNF.postponedCompileDeclsExt.getModuleEntries env i do
+      for n in entry.declNames do
+        report .postponedCompilation n m "compilation postponed (no IR stored)"
+    for n in auxRecExt.getModuleEntries env i do
+      if origin? env n != some m then
+        report .foreignCompilerTag n m "auxiliary-recursor tag on a foreign declaration"
+      else if !genuineOwnedAuxRec ctx m n then
+        report .compilerOverrideHook n m "auxiliary-recursor tag on a non-recursor declaration"
+    for (n, _) in noConfusionExt.getModuleEntries env i do
+      if origin? env n != some m then
+        report .foreignCompilerTag n m "noConfusion tag on a foreign declaration"
+      else if !genuineOwnedNoConfusion ctx m n then
+        report .compilerOverrideHook n m "noConfusion tag on a non-noConfusion declaration"
+  | none =>
+    for n in v.data.constNames ++ v.data.extraConstNames do
+      if (Compiler.implementedByAttr.getParam? env n).isSome then hook n m "implemented_by"
+      if (getExternAttrData? env n).isSome then hook n m "extern"
+      if (exportAttr.getParam? env n).isSome then hook n m "export"
+      if (regularInitAttr.getParam? env n).isSome then hook n m "init"
+      if (builtinInitAttr.getParam? env n).isSome then hook n m "builtin_init"
+      if IR.UnboxResult.unboxAttr.hasTag env n then hook n m "unbox"
+      if neverExtractAttr.hasTag env n then hook n m "never_extract"
+      if (Compiler.getInlineAttribute? env n).any isMacroInline && !isGeneratedMacroInline ctx m n then
+        hook n m "macro_inline"
+    for n in auxRecExt.getEntries env do
+      if (origin? env n).isNone then
+        unless genuineOwnedAuxRec ctx m n do
+          report .compilerOverrideHook n m "auxiliary-recursor tag on a non-recursor declaration"
+      else
+        report .foreignCompilerTag n m "auxiliary-recursor tag on a foreign declaration"
+    for (n, _) in (noConfusionExt.getState env).toList do
+      if (origin? env n).isNone then
+        unless genuineOwnedNoConfusion ctx m n do
+          report .compilerOverrideHook n m "noConfusion tag on a non-noConfusion declaration"
+      else
+        report .foreignCompilerTag n m "noConfusion tag on a foreign declaration"
+    for entry in Compiler.LCNF.postponedCompileDeclsExt.getEntries env do
+      for n in entry.declNames do
+        report .postponedCompilation n m "compilation postponed (no IR stored)"
+  -- Sparse-cases tags (inaccessible extension): only run per-decl checks when `stored > 0`,
+  -- deduplicating `constNames` against pigeonhole forgery and validating owned shape.
+  if let some se := sparseExt? then
+    let stored := extCounts.getD se 0
+    if stored > 0 then
+      let mut uniqueOwned : NameSet := {}
+      let mut validOwned := 0
+      for n in v.data.constNames do
+        if !uniqueOwned.contains n && ownerOf ctx n == some m && isSparseCasesOn env n then
+          uniqueOwned := uniqueOwned.insert n
+          if genuineOwnedSparseCasesOn ctx m n then validOwned := validOwned + 1
+          else report .compilerOverrideHook n m "sparse-cases tag on a non-sparseCasesOn declaration"
+      if stored > validOwned then
+        report .foreignCompilerTag m m s!"sparse-cases tag: {stored} stored entries exceed {validOwned} valid owned declarations"
+
+/-- Environment-wide live compiler-state checks (`CSimp` `stateStack`/`newEntries`/`scopedEntries`,
+`passManagerExt` live passes & pipeline fingerprint, and `ConstantFold.folderExt` live folders). -/
+def auditLiveCompilerState (ctx : AuditContext) : AuditM Unit := do
+  let env := ctx.env
+  let ownerMod := ctx.liveModule?.getD env.header.mainModule
+  let mut toolchainCSimp : Std.HashSet (Name × Name × Name) := {}
+  for h : i in [0:env.header.modules.size] do
+    let m := env.header.modules[i].module
+    if ctx.isToolchainModule m then
       for e in Compiler.CSimp.ext.ext.getModuleEntries env i do
         let ent := match e with | .global a => a | .scoped _ a => a
-        hook ent.fromDeclName m s!"csimp: {ent.fromDeclName} ↦ {ent.toDeclName}"
-      for installer in Compiler.LCNF.passManagerExt.getModuleEntries env i do
-        hook installer m "cpass"
-      for fe in Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env i do
-        hook fe.declName m "constant_fold"
-      for n in IR.UnboxResult.unboxAttr.ext.getModuleEntries env i ++ IR.UnboxResult.unboxAttr.ext.getModuleIREntries env i do
-        hook n m "unbox"
-      for n in neverExtractAttr.ext.getModuleEntries env i ++ neverExtractAttr.ext.getModuleIREntries env i do
-        hook n m "never_extract"
-      for (n, k) in Compiler.inlineAttrs.ext.getModuleEntries env i ++ Compiler.inlineAttrs.ext.getModuleIREntries env i do
-        if isMacroInline k && !isGeneratedMacroInline ctx m n then hook n m "macro_inline"
-      for entry in Compiler.LCNF.postponedCompileDeclsExt.getModuleEntries env i do
-        for n in entry.declNames do
-          report .postponedCompilation n m "compilation postponed (no IR stored)"
-      for n in auxRecExt.getModuleEntries env i do
-        unless origin? env n == some m do
-          report .foreignCompilerTag n m "auxiliary-recursor tag on a foreign declaration"
-      for (n, _) in noConfusionExt.getModuleEntries env i do
-        unless origin? env n == some m do
-          report .foreignCompilerTag n m "noConfusion tag on a foreign declaration"
-    | none =>
-      -- Live module: per local declaration, plus local extension state.
-      for n in v.data.constNames ++ v.data.extraConstNames do
-        if (Compiler.implementedByAttr.getParam? env n).isSome then hook n m "implemented_by"
-        if (getExternAttrData? env n).isSome then hook n m "extern"
-        if (exportAttr.getParam? env n).isSome then hook n m "export"
-        if (regularInitAttr.getParam? env n).isSome then hook n m "init"
-        if (builtinInitAttr.getParam? env n).isSome then hook n m "builtin_init"
-        if IR.UnboxResult.unboxAttr.hasTag env n then hook n m "unbox"
-        if neverExtractAttr.hasTag env n then hook n m "never_extract"
-        if (Compiler.getInlineAttribute? env n).any isMacroInline && !isGeneratedMacroInline ctx m n then
-          hook n m "macro_inline"
-      for e in Compiler.CSimp.ext.ext.getState env |>.newEntries do
-        let ent := match e with | .global a => a | .scoped _ a => a
-        hook ent.fromDeclName m s!"csimp: {ent.fromDeclName} ↦ {ent.toDeclName}"
-      for n in auxRecExt.getEntries env do
-        unless (origin? env n).isNone do
-          report .foreignCompilerTag n m "auxiliary-recursor tag on a foreign declaration"
-      for entry in Compiler.LCNF.postponedCompileDeclsExt.getEntries env do
-        for n in entry.declNames do
-          report .postponedCompilation n m "compilation postponed (no IR stored)"
-    -- Sparse-cases tags (inaccessible extension): stored entries must all be owned declarations.
-    if let some se := sparseExt? then
-      let stored := moduleExtEntryCount v.data se
-      let owned := v.data.constNames.foldl (fun a n => if isSparseCasesOn env n then a + 1 else a) 0
-      if stored > owned then
-        report .foreignCompilerTag m m s!"sparse-cases tag: {stored} stored entries but only {owned} owned tagged declarations"
+        toolchainCSimp := toolchainCSimp.insert (ent.fromDeclName, ent.toDeclName, ent.thmName)
+  let csimpState := Compiler.CSimp.ext.ext.getState env
+  for frame in csimpState.stateStack do
+    for (k, ent) in frame.state.map.toList do
+      unless k == ent.fromDeclName && toolchainCSimp.contains (k, ent.toDeclName, ent.thmName) do
+        modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+        report .compilerOverrideHook k ownerMod s!"csimp: {ent.fromDeclName} ↦ {ent.toDeclName}"
+  for e in csimpState.newEntries do
+    let ent := match e with | .global a => a | .scoped _ a => a
+    unless toolchainCSimp.contains (ent.fromDeclName, ent.toDeclName, ent.thmName) do
+      modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+      report .compilerOverrideHook ent.fromDeclName ownerMod s!"csimp: {ent.fromDeclName} ↦ {ent.toDeclName}"
+  for (_, entries) in csimpState.scopedEntries.map.toList do
+    for ent in entries.toArray do
+      unless toolchainCSimp.contains (ent.fromDeclName, ent.toDeclName, ent.thmName) do
+        modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+        report .compilerOverrideHook ent.fromDeclName ownerMod s!"csimp: {ent.fromDeclName} ↦ {ent.toDeclName}"
+  let (livePasses, livePM) := Compiler.LCNF.passManagerExt.getState env
+  for p in livePasses do
+    modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+    report .compilerOverrideHook p ownerMod "cpass: live compiler pass registered"
+  unless passManagerFingerprint livePM == passManagerFingerprint Compiler.LCNF.builtinPassManager do
+    modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+    report .compilerOverrideHook `compiler_pipeline ownerMod "cpass: live PassManager differs from builtinPassManager"
+  let (liveFolders, liveFolderMap) := Compiler.LCNF.Simp.ConstantFold.folderExt.getState env
+  for fe in liveFolders do
+    modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+    report .compilerOverrideHook fe.declName ownerMod s!"constant_fold: live folder {fe.folderDeclName}"
+  let mut liveFolderKeys : NameSet := {}
+  for (k, _) in liveFolderMap.toList do
+    liveFolderKeys := liveFolderKeys.insert k
+    unless builtinFolderKeySet.contains k do
+      modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+      report .compilerOverrideHook k ownerMod "constant_fold: live folder key outside builtinFolders"
+  unless liveFolderKeys.size == builtinFolderKeySet.size do
+    modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+    report .compilerOverrideHook `constant_fold ownerMod "constant_fold: live folder table differs from builtinFolders"
 
 def auditCompilerHooks (ctx : AuditContext) (views : Array ModuleView) : AuditM Unit := do
   let mut generic : Array (Name × String) := #[]
@@ -1134,29 +1731,28 @@ def auditCompilerHooks (ctx : AuditContext) (views : Array ModuleView) : AuditM 
   if sparseExt?.isNone then
     report .environmentLoadFailed `Lean.sparseCasesOnExt .anonymous "sparse-cases extension is not registered"
   runPerView views (hooksView ctx generic sparseExt?)
+  auditLiveCompilerState ctx
 
 /-! ## Vector 4c — opaque-theorem readiness (`leanprover/lean4#14896`) -/
 
-/-- Index of the major premise of recursor-like constant `f`, if it is a kernel recursor or one of
-its auxiliary `casesOn` / `recOn` wrappers. -/
+/-- Index of the major premise of recursor-like constant `f`, if it is a kernel recursor (`.rec`,
+`.rec_1`, ...) or one of its auxiliary `casesOn` / `recOn` wrappers. -/
 def majorPremiseIdx? (env : Environment) (f : Name) : Option (Nat × RecursorVal) := do
-  match env.find? f with
+  match findAnyConst? env f with
   | some (.recInfo rv) => return (rv.numParams + rv.numMotives + rv.numMinors + rv.numIndices, rv)
   | _ =>
     match f with
     | .str ind s =>
-      let some (.recInfo rv) := env.find? (ind.str "rec") | none
+      let some (.recInfo rv) := findAnyConst? env (ind.str "rec") | none
       if s == "casesOn" then return (rv.numParams + 1 + rv.numIndices, rv)
       else if s == "recOn" then return (rv.numParams + rv.numMotives + rv.numIndices, rv)
       else none
     | _ => none
 
 /-- Whether an application of recursor-like `rv` at universe levels `us` eliminates into a
-non-`Prop` sort. A recursor with a motive universe parameter (one more level parameter than its
-inductive) is a large eliminator; its first level argument is the motive's universe. Recursors
-without that extra parameter eliminate only into `Prop`. -/
+non-`Prop` sort. -/
 def isLargeElimination (env : Environment) (rv : RecursorVal) (us : List Level) : Bool :=
-  let indLevels := match env.find? rv.getMajorInduct with
+  let indLevels := match findAnyConst? env rv.getMajorInduct with
     | some ci => ci.levelParams.length
     | none => 0
   if rv.levelParams.length > indLevels then
@@ -1165,20 +1761,33 @@ def isLargeElimination (env : Environment) (rv : RecursorVal) (us : List Level) 
     | [] => true
   else false
 
-def isTheoremHead (env : Environment) (e : Expr) : Option Name :=
-  match e.getAppFn with
-  | .const c _ => if (env.find? c) matches some (.thmInfo _) then some c else none
-  | _ => none
+/-- Extract a theorem constant heading `e` (unwrapping metadata, trivial `let x := v; x` bindings,
+and constant-body head beta redexes up to bounded fuel). -/
+def isTheoremHead (env : Environment) (e : Expr) (fuel : Nat := 16) : Option Name :=
+  match fuel with
+  | 0 => none
+  | fuel + 1 =>
+    match e with
+    | .mdata _ b => isTheoremHead env b fuel
+    | .letE _ _ v (.bvar 0) _ => isTheoremHead env v fuel
+    | _ =>
+      match e.getAppFn with
+      | .const c _ => if (findAnyConst? env c) matches some (.thmInfo _) then some c else none
+      | .mdata _ fn => isTheoremHead env fn fuel
+      | .lam _ _ body _ =>
+        if !body.hasLooseBVars then isTheoremHead env body fuel else none
+      | _ => none
 
 /-- Whether inductive `S` lives in `Prop` (its type's final codomain is `Sort 0`). -/
 def isPropInductive (env : Environment) (S : Name) : Bool :=
-  match env.find? S with
+  match findAnyConst? env S with
   | some (.inductInfo iv) => iv.type.getForallBody.isProp
   | _ => false
 
 /-- The δ-position test of Layer A for a single node (no recursion into subterms):
 `(idx, rv)`-major premise of a non-K large elimination that is headed by a theorem, or a
-projection out of a theorem-headed term of a non-`Prop` structure. -/
+projection out of a theorem-headed term of a non-`Prop` structure. Checks `isTheoremHead` before
+`isPropInductive` on `.proj` so non-theorem projections perform zero environment lookups. -/
 def opaqueHitAt? (env : Environment) (e : Expr) : Option (Name × String) :=
   match e with
   | .app .. =>
@@ -1195,30 +1804,34 @@ def opaqueHitAt? (env : Environment) (e : Expr) : Option (Name × String) :=
       | none => none
     | _ => none
   | .proj S _ s =>
-    if isPropInductive env S then none
-    else (isTheoremHead env s).map (·, "scrutinee of Expr.proj")
+    match isTheoremHead env s with
+    | some thm => if isPropInductive env S then none else some (thm, "scrutinee of Expr.proj")
+    | none => none
   | _ => none
 
 /-- Cheap syntactic screen applied before `opaqueHitAt?`: an application headed by a constant whose
-last component is `rec`, `casesOn` or `recOn` at a non-zero first universe level, or a `.proj`. -/
+last component is `rec`, `rec_<n>`, `casesOn`, or `recOn` at a non-zero first universe level, or a
+`.proj` whose scrutinee is not an unadorned bound/free variable. -/
 def maybeOpaqueHit (e : Expr) : Bool :=
   match e with
   | .app .. =>
     match e.getAppFn with
-    | .const (.str _ s) (u :: _) => (s == "rec" || s == "casesOn" || s == "recOn") && !(u == Level.zero)
+    | .const (.str _ s) (u :: _) =>
+      (s == "rec" || s.startsWith "rec_" || s == "casesOn" || s == "recOn") && !(u == Level.zero)
     | _ => false
+  | .proj _ _ (.bvar _) | .proj _ _ (.fvar _) => false
   | .proj .. => true
   | _ => false
 
-/-- Pre-filter for Layer A using Lean's cached `Expr.find?`: only declarations that contain a
-δ-position hit need the detailed walk. -/
+/-- Pre-filter for Layer A using Lean's cached `Expr.find?`. -/
 def needsOpaqueScan (env : Environment) (ci : ConstantInfo) : Bool :=
   let p : Expr → Bool := fun e => maybeOpaqueHit e && (opaqueHitAt? env e).isSome
   (ci.type.find? p).isSome || ((ci.value? (allowOpaque := true)).any fun v => (v.find? p).isSome)
 
 /-- Layer A: structural scan for theorems in kernel δ-reduction positions — the major premise of a
-non-K large elimination (a recursor, `casesOn` or `recOn` whose motive is not `Prop`-valued), or
-the scrutinee of `Expr.proj`. Shared subterms are visited once. `.error ()` = fuel exhausted. -/
+non-K large elimination (a recursor, `rec_<n>`, `casesOn` or `recOn` whose motive is not
+`Prop`-valued), or the scrutinee of `Expr.proj`. Shared subterms are visited once. `.error ()` =
+fuel exhausted. -/
 def scanOpaqueTheoremReliance (env : Environment) (ci : ConstantInfo) (fuel : Nat := 2000000) :
     Except Unit (Array (Name × String)) := Id.run do
   unless needsOpaqueScan env ci do return .ok #[]
@@ -1263,10 +1876,12 @@ def kernelHeartbeatThreshold (budget : Nat) : IO USize := do
 def replayPrefix : Name := `_opaqueTheoremReplay
 
 def freshReplayName (env : Environment) (n : Name) (tag : String) : Name := Id.run do
+  let fullEnv := env.setExporting false
+  let kenv := env.checked.get
   let base := (replayPrefix.str tag) ++ n
   let mut c := base
   for i in [0:1000] do
-    if !env.contains c then return c
+    if !fullEnv.contains c && (kenv.find? c).isNone then return c
     c := base.appendIndexAfter i
   return base.str "fresh_exhausted"
 
@@ -1280,23 +1895,38 @@ def kernelErrorString (e : Kernel.Exception) : String :=
   | .interrupted => "interrupted"
   | _ => "kernel rejected the declaration"
 
-/-- Layer B: exact kernel-opaque replay oracle. Refuses to invoke the kernel when the closure
-reaches a native evaluator. Otherwise every theorem `t` the declaration depends on (directly or
-through the bodies of definitions) is replaced by a fresh *axiom* with the identical level
-parameters and type; every definition whose body reaches such a theorem through definition bodies
-is re-added under a fresh name with its references rewritten; then the declaration is replayed
-both unchanged and with the rewriting. Proof irrelevance makes each axiom copy definitionally
-equal to the theorem it replaces wherever only its type matters, so the rewritten replay fails
-exactly when the kernel had to δ-unfold a theorem body. -/
+/-- Replayable unit in the unified theorem/definition/opaque DAG for `checkOpaqueTheoremReplay`. -/
+inductive ReplayNode where
+  | thmAsAxiom (name : Name)
+  | defGroup (names : List Name)
+  | opaq (name : Name)
+
+/-- Layer B: exact kernel-opaque replay oracle (`leanprover/lean4#14896`).
+Refuses to invoke the kernel when `declName`'s closure reaches `Lean.reduceBool` or
+`Lean.reduceNat`. Otherwise walks dependencies through theorem *types*, definition types/bodies
+(including mutual blocks), and `opaque` types/bodies; replaces every dependency `.thmInfo` with an
+`.axiomInfo` carrying the rewritten `type` and identical `levelParams`; rewrites every definition
+(or mutual block) and `opaque` declaration whose type/body reaches an erased theorem; inserts all
+rewritten nodes in unified DAG topological order; and replays `declName` (supporting `.thmInfo`,
+`.defnInfo`, and `.opaqueInfo`) against both the original and theorem-erased `Kernel.Environment`. -/
 def checkOpaqueTheoremReplay (env : Environment) (declName : Name) (fuel : Nat := 200000)
     (maxRenamed : Nat := 512) (heartbeats : Nat := 200000) : IO OpaqueReplayResult := do
-  let some ci := env.find? declName | return .notFound
+  let some ci := findAnyConst? env declName | return .notFound
   if reachesNativeEvaluator env #[declName] fuel then return .refusedNativeEvaluator
-  -- Collect definitions reachable through definition bodies, and the theorems they mention.
+  let targetGroup : NameSet := match ci with
+    | .defnInfo dv => dv.all.foldl (·.insert ·) (NameSet.empty.insert declName)
+    | _ => NameSet.empty.insert declName
+  let mut initPending : List Name := []
+  for m in targetGroup do
+    if let some mci := findAnyConst? env m then
+      initPending := (declEdges mci).toList ++ initPending
+  -- Collect dependency theorems (walking their statement types!), definitions, and opaques.
   let mut defs : Array Name := #[]
-  let mut thms : NameSet := {}
-  let mut visited : NameSet := NameSet.empty.insert declName
-  let mut pending : List Name := (declEdges ci).toList
+  let mut opaques : Array Name := #[]
+  let mut thms : Array Name := #[]
+  let mut thmSet : NameSet := {}
+  let mut visited : NameSet := targetGroup
+  let mut pending : List Name := initPending
   let mut exhausted := true
   for _ in [0:fuel] do
     match pending with
@@ -1305,120 +1935,228 @@ def checkOpaqueTheoremReplay (env : Environment) (declName : Name) (fuel : Nat :
       pending := rest
       if visited.contains n then continue
       visited := visited.insert n
-      match env.find? n with
-      | some (.thmInfo _) => thms := thms.insert n
+      match findAnyConst? env n with
+      | some (.thmInfo tv) =>
+        thms := thms.push n
+        thmSet := thmSet.insert n
+        pending := (exprEdges tv.type {}).toList ++ pending
       | some (.defnInfo dv) =>
         defs := defs.push n
-        pending := (exprEdges dv.value (exprEdges dv.type {})).toList ++ pending
+        let groupEdges := dv.all.foldl (fun acc sib =>
+          match findAnyConst? env sib with
+          | some (.defnInfo sdv) => exprEdges sdv.value (exprEdges sdv.type acc)
+          | _ => acc) (exprEdges dv.value (exprEdges dv.type {}))
+        for sib in dv.all do
+          if !visited.contains sib && !targetGroup.contains sib then
+            visited := visited.insert sib
+            defs := defs.push sib
+        pending := groupEdges.toList ++ pending
+      | some (.opaqueInfo ov) =>
+        opaques := opaques.push n
+        pending := (exprEdges ov.value (exprEdges ov.type {})).toList ++ pending
       | _ => pure ()
   if exhausted then return .fuelExhausted "dependency walk"
   if thms.isEmpty then return .noTheoremDependencies
-  -- Definitions whose bodies reach an erased theorem (fixpoint, bounded by |defs| + 1 rounds).
-  let edgesOf (n : Name) : NameSet :=
-    match env.find? n with
-    | some (.defnInfo dv) => exprEdges dv.value (exprEdges dv.type {})
+  -- Reachability fixpoint: which defs, opaques, and theorem statements reach an erased theorem?
+  let nodeEdges (n : Name) : NameSet :=
+    match findAnyConst? env n with
+    | some (.thmInfo tv) => exprEdges tv.type {}
+    | some (.defnInfo dv) =>
+      dv.all.foldl (fun acc sib =>
+        match findAnyConst? env sib with
+        | some (.defnInfo sdv) => exprEdges sdv.value (exprEdges sdv.type acc)
+        | _ => acc) (exprEdges dv.value (exprEdges dv.type {}))
+    | some (.opaqueInfo ov) => exprEdges ov.value (exprEdges ov.type {})
     | _ => {}
-  let mut reach : NameSet := thms
+  let cands := defs ++ opaques
+  let mut reach : NameSet := thmSet
   let mut stable := false
-  for _ in [0:defs.size + 1] do
+  for _ in [0:cands.size + 1] do
     let mut changed := false
-    for d in defs do
-      if !reach.contains d && (edgesOf d).any reach.contains then
-        reach := reach.insert d
+    for c in cands do
+      if !reach.contains c && (nodeEdges c).any reach.contains then
+        reach := reach.insert c
         changed := true
     if !changed then stable := true; break
   unless stable do return .fuelExhausted "theorem-reachability fixpoint"
   let renamedDefs := defs.filter reach.contains
-  if renamedDefs.size > maxRenamed then return .fuelExhausted s!"{renamedDefs.size} definitions to rewrite"
+  let renamedOpaques := opaques.filter reach.contains
+  let totalRenamed := renamedDefs.size + renamedOpaques.size
+  if totalRenamed > maxRenamed then return .fuelExhausted s!"{totalRenamed} declarations to rewrite"
   let mut ren : NameMap Name := {}
   for t in thms do ren := ren.insert t (freshReplayName env t "thm")
   for d in renamedDefs do ren := ren.insert d (freshReplayName env d "def")
+  for o in renamedOpaques do ren := ren.insert o (freshReplayName env o "opaq")
   let rw (e : Expr) : Expr := e.replace fun
     | .const n us => (ren.find? n).map (Expr.const · us)
     | _ => none
+  -- Build unified ReplayNode list (grouping mutual definitions by `dv.all`).
+  let mut nodes : Array ReplayNode := thms.map .thmAsAxiom
+  let mut groupedDefs : NameSet := {}
+  for d in renamedDefs do
+    if !groupedDefs.contains d then
+      let group := match findAnyConst? env d with
+        | some (.defnInfo dv) =>
+          let g := dv.all.filter renamedDefs.contains
+          if g.isEmpty then [d] else g
+        | _ => [d]
+      for g in group do groupedDefs := groupedDefs.insert g
+      nodes := nodes.push (.defGroup group)
+  for o in renamedOpaques do nodes := nodes.push (.opaq o)
+  let allRenamedSet : NameSet := thmSet ++
+    renamedDefs.foldl (·.insert ·) {} ++
+    renamedOpaques.foldl (·.insert ·) {}
+  let nodeNames : ReplayNode → List Name
+    | .thmAsAxiom t => [t]
+    | .defGroup gs => gs
+    | .opaq o => [o]
+  let nodeDeps (nd : ReplayNode) : List Name :=
+    let own := nodeNames nd
+    let es := own.foldl (fun acc x => acc ++ nodeEdges x) ({} : NameSet)
+    es.toList.filter fun x => allRenamedSet.contains x && !own.contains x
+  -- Unified topological insertion into `kenv`.
   let mut kenv := env.toKernelEnv
-  -- Theorem → axiom copies.
-  for t in thms do
-    let some tci := env.find? t | return .fuelExhausted s!"missing theorem {t}"
-    let some t' := ren.find? t | return .fuelExhausted s!"missing rename for {t}"
-    let decl := Declaration.axiomDecl { name := t', levelParams := tci.levelParams, type := tci.type, isUnsafe := false }
-    match kenv.addDeclCore (← kernelHeartbeatThreshold heartbeats) 0 decl none with
-    | .ok k => kenv := k
-    | .error e => return .fuelExhausted s!"axiom copy of {t} rejected: {kernelErrorString e}"
-  -- Rewritten definitions in dependency order (bounded passes).
   let mut added : NameSet := {}
-  let mut remaining := renamedDefs
-  for _ in [0:renamedDefs.size + 1] do
+  let mut remaining := nodes
+  for _ in [0:nodes.size + 1] do
     if remaining.isEmpty then break
-    let mut next : Array Name := #[]
-    for d in remaining do
-      let deps := (edgesOf d).toList.filter fun x => renamedDefs.contains x && x != d
-      if deps.all added.contains then
-        let some (.defnInfo dv) := env.find? d | return .fuelExhausted s!"missing definition {d}"
-        let some d' := ren.find? d | return .fuelExhausted s!"missing rename for {d}"
-        let decl := Declaration.defnDecl { dv with name := d', type := rw dv.type, value := rw dv.value, all := [d'] }
-        match kenv.addDeclCore (← kernelHeartbeatThreshold heartbeats) 0 decl none with
-        | .ok k => kenv := k; added := added.insert d
-        | .error e =>
-          return .deltaReliance thms.size renamedDefs.size s!"rewritten definition {d} rejected: {kernelErrorString e}"
-      else next := next.push d
-    if next.size == remaining.size then return .fuelExhausted "definition dependency cycle"
+    let mut next : Array ReplayNode := #[]
+    for nd in remaining do
+      if (nodeDeps nd).all added.contains then
+        match nd with
+        | .thmAsAxiom t =>
+          let some tci := findAnyConst? env t | return .fuelExhausted s!"missing theorem {t}"
+          let some t' := ren.find? t | return .fuelExhausted s!"missing rename for {t}"
+          let decl := Declaration.axiomDecl {
+            name := t', levelParams := tci.levelParams, type := rw tci.type, isUnsafe := false }
+          match kenv.addDeclCore (← kernelHeartbeatThreshold heartbeats) 0 decl none with
+          | .ok k => kenv := k; added := added.insert t
+          | .error e =>
+            return .deltaReliance thms.size totalRenamed
+              s!"theorem statement of {t} rejected when prior theorems opaque: {kernelErrorString e}"
+        | .defGroup gs =>
+          let mut dvals : List DefinitionVal := []
+          let allNames' := gs.filterMap ren.find?
+          for g in gs do
+            let some (.defnInfo dv) := findAnyConst? env g | return .fuelExhausted s!"missing definition {g}"
+            let some g' := ren.find? g | return .fuelExhausted s!"missing rename for {g}"
+            dvals := dvals ++ [{ dv with name := g', type := rw dv.type, value := rw dv.value, all := allNames' }]
+          let decl := match dvals with
+            | [single] => Declaration.defnDecl single
+            | many => Declaration.mutualDefnDecl many
+          match kenv.addDeclCore (← kernelHeartbeatThreshold heartbeats) 0 decl none with
+          | .ok k =>
+            kenv := k
+            for g in gs do added := added.insert g
+          | .error e =>
+            return .deltaReliance thms.size totalRenamed
+              s!"rewritten definition {gs} rejected: {kernelErrorString e}"
+        | .opaq o =>
+          let some (.opaqueInfo ov) := findAnyConst? env o | return .fuelExhausted s!"missing opaque {o}"
+          let some o' := ren.find? o | return .fuelExhausted s!"missing rename for {o}"
+          let decl := Declaration.opaqueDecl {
+            ov with name := o', type := rw ov.type, value := rw ov.value, all := [o'] }
+          match kenv.addDeclCore (← kernelHeartbeatThreshold heartbeats) 0 decl none with
+          | .ok k => kenv := k; added := added.insert o
+          | .error e =>
+            return .deltaReliance thms.size totalRenamed
+              s!"rewritten opaque {o} rejected: {kernelErrorString e}"
+      else
+        next := next.push nd
+    if next.size == remaining.size then return .fuelExhausted "dependency cycle among rewritten declarations"
     remaining := next
-  unless remaining.isEmpty do return .fuelExhausted "definition ordering"
-  -- Replay: original first (must be accepted), then rewritten.
-  let mkDecl (name : Name) (type value : Expr) : Option Declaration :=
+  unless remaining.isEmpty do return .fuelExhausted "topological ordering incomplete"
+  -- Replay target declaration (supporting `.thmInfo`, `.defnInfo` including mutuals, and `.opaqueInfo`).
+  let mkTargetDecl (tag : String) (rewrite : Expr → Expr) : Option Declaration := Id.run do
     match ci with
-    | .thmInfo _ => some (.thmDecl { name, levelParams := ci.levelParams, type, value })
-    | .defnInfo dv => some (.defnDecl { dv with name, type, value, all := [name] })
-    | _ => none
-  let some v := ci.value? (allowOpaque := true) | return .noTheoremDependencies
-  let some orig := mkDecl (freshReplayName env declName "orig") ci.type v | return .noTheoremDependencies
+    | .thmInfo tv =>
+      let n' := freshReplayName env declName tag
+      return some (.thmDecl { tv with name := n', type := rewrite tv.type, value := rewrite tv.value })
+    | .opaqueInfo ov =>
+      let n' := freshReplayName env declName tag
+      return some (.opaqueDecl { ov with name := n', type := rewrite ov.type, value := rewrite ov.value, all := [n'] })
+    | .defnInfo dv =>
+      if dv.all.length ≤ 1 then
+        let n' := freshReplayName env declName tag
+        return some (.defnDecl { dv with name := n', type := rewrite dv.type, value := rewrite dv.value, all := [n'] })
+      else
+        let mut selfRen : NameMap Name := {}
+        for s in dv.all do selfRen := selfRen.insert s (freshReplayName env s tag)
+        let rwSelf (e : Expr) : Expr := (rewrite e).replace fun
+          | .const n us => (selfRen.find? n).map (Expr.const · us)
+          | _ => none
+        let all' := dv.all.filterMap selfRen.find?
+        let mut dvals : List DefinitionVal := []
+        for s in dv.all do
+          let some (.defnInfo sdv) := findAnyConst? env s | return none
+          let some s' := selfRen.find? s | return none
+          dvals := dvals ++ [{ sdv with name := s', type := rwSelf sdv.type, value := rwSelf sdv.value, all := all' }]
+        return some (.mutualDefnDecl dvals)
+    | _ => return none
+  let some orig := mkTargetDecl "orig" id | return .noTheoremDependencies
   match env.toKernelEnv.addDeclCore (← kernelHeartbeatThreshold heartbeats) 0 orig none with
   | .error e => return .originalRejected (kernelErrorString e)
   | .ok _ => pure ()
-  let some erased := mkDecl (freshReplayName env declName "erased") (rw ci.type) (rw v) | return .noTheoremDependencies
+  let some erased := mkTargetDecl "erased" rw | return .noTheoremDependencies
   match kenv.addDeclCore (← kernelHeartbeatThreshold heartbeats) 0 erased none with
-  | .ok _ => return .clean thms.size renamedDefs.size
-  | .error e => return .deltaReliance thms.size renamedDefs.size (kernelErrorString e)
+  | .ok _ => return .clean thms.size totalRenamed
+  | .error e => return .deltaReliance thms.size totalRenamed (kernelErrorString e)
 
 /-- One traversal per kernel declaration shared by Vector 4a (`Init.ShareCommon` references) and
-Layer A (opaque-theorem δ positions): Lean's cached `Expr.find?` screens type, value and recursor
-rules with the union of both node predicates, and only declarations with a hit get the detailed
-checks. Every compacted expression is thus read once per audit. -/
-def kernelScanChunk (ctx : AuditContext) (sc : Std.HashSet Name) (structural theoremBodies : Bool) (fuel : Nat)
-    (v : ModuleView) (lo hi : Nat) : PureAuditM Unit := do
+Layer A (opaque-theorem δ positions). All types, definition/opaque bodies, and recursor rules are
+always scanned; theorem proof bodies are scanned whenever `scanThmBodies` is `true` (the default)
+or for the in-memory live module (`v.idx?.isNone`). (Note: `Init.ShareCommon` declares zero kernel
+axioms—its soundness hazard in `leanprover/lean4#16779` arises through `@[implemented_by]` /
+`@[extern]` in compiled `def`s or `Lean.reduceBool`, both of which are always covered even when
+compiled `.olean` theorem bodies are skipped in fast sweeps.) -/
+def kernelScanChunk (ctx : AuditContext) (sc : Std.HashSet Name) (structural scanThmBodies : Bool)
+    (fuel : Nat) (v : ModuleView) (lo hi : Nat) : PureAuditM Unit := do
   let env := ctx.env
-  let p : Expr → Bool := fun e =>
+  let includeThmBodies := scanThmBodies || v.idx?.isNone
+  let pFull : Expr → Bool := fun e =>
     isShareCommonNode sc e || (structural && maybeOpaqueHit e && (opaqueHitAt? env e).isSome)
-  let exprsOf (ci : ConstantInfo) : List Expr := Id.run do
-    let value? := match ci with
-      | .thmInfo _ => if theoremBodies then ci.value? (allowOpaque := true) else none
-      | _ => ci.value? (allowOpaque := true)
-    let mut exprs : List Expr := ci.type :: value?.toList
-    if let .recInfo rv := ci then exprs := exprs ++ rv.rules.map (·.rhs)
-    return exprs
   let consts := v.data.constants[lo:hi].toArray
-  -- One cached traversal over the whole slice first: a module's compacted expressions share
-  -- subterms across declarations, which a per-declaration `find?` would re-visit.
-  let all : Expr := mkAppN (.sort .zero) (consts.foldl (fun acc ci => acc ++ (exprsOf ci).toArray) #[])
-  if (all.find? p).isNone then return
+  let mut fullExprs : Array Expr := #[]
   for ci in consts do
-    let exprs := exprsOf ci
-    unless exprs.any (fun e => (e.find? p).isSome) do continue
+    fullExprs := fullExprs.push ci.type
+    match ci with
+    | .thmInfo _ =>
+      if includeThmBodies then
+        if let some val := ci.value? (allowOpaque := true) then fullExprs := fullExprs.push val
+    | _ =>
+      if let some val := ci.value? (allowOpaque := true) then fullExprs := fullExprs.push val
+    if let .recInfo rv := ci then
+      for r in rv.rules do fullExprs := fullExprs.push r.rhs
+  let fullHit := !fullExprs.isEmpty && ((mkAppN (.sort .zero) fullExprs).find? pFull).isSome
+  if !fullHit then return
+  for ci in consts do
+    let hasHit : Bool := match ci with
+      | .thmInfo _ =>
+        (ci.type.find? pFull).isSome ||
+        (includeThmBodies && ((ci.value? (allowOpaque := true)).any fun val => (val.find? pFull).isSome))
+      | .recInfo rv =>
+        (ci.type.find? pFull).isSome ||
+        ((ci.value? (allowOpaque := true)).any fun val => (val.find? pFull).isSome) ||
+        rv.rules.any fun r => (r.rhs.find? pFull).isSome
+      | _ =>
+        (ci.type.find? pFull).isSome ||
+        ((ci.value? (allowOpaque := true)).any fun val => (val.find? pFull).isSome)
+    unless hasHit == true do continue
     for c in kernelShareCommonRefs env ci do
       report .shareCommonReference ci.name v.module s!"kernel declaration references {c}"
-    if structural then
+    if structural && (!(ci matches .thmInfo _) || includeThmBodies) then
       match scanOpaqueTheoremReliance env ci fuel with
       | .error () => report .auditFuelExhausted ci.name v.module "structural opaque-theorem scan exhausted its fuel"
       | .ok hits =>
         for (t, why) in hits do
           flag .opaqueTheoremStructural ci.name v.module s!"theorem {t} in δ position ({why})"
 
-/-- Vector 4a over modules: imports, kernel references (shared traversal), LCNF and IR. -/
+/-- Vector 4a over modules: imports, kernel references (one whole-module cached `Expr.find?` per
+module so shared subterms inside a compacted `.olean` region are visited at most once), LCNF and IR. -/
 def auditShareCommon (ctx : AuditContext) (views : Array ModuleView) (structural : Bool := true)
     (theoremBodies : Bool := true) (fuel : Nat := 2000000) : AuditM Unit := do
   let sc := shareCommonSet ctx.env
-  runPerView views (shareCommonView ctx 100000)
+  runPerView views (shareCommonView ctx sc 100000)
   runPerView views fun v => kernelScanChunk ctx sc structural theoremBodies fuel v 0 v.data.constants.size
 
 /-- Vector 4c Layer B on each requested declaration (hard violations). Layer A runs inside
@@ -1429,7 +2167,7 @@ def auditOpaqueTheorems (ctx : AuditContext) (replayTargets : Array Name := #[])
   for n in replayTargets do
     let m := (ownerOf ctx n).getD .anonymous
     match ← checkOpaqueTheoremReplay env n fuel with
-    | .deltaReliance e r err => report .opaqueTheoremDeltaReliance n m s!"accepted, but rejected with {e} theorem(s) opaque ({r} definition(s) rewritten): {err}"
+    | .deltaReliance e r err => report .opaqueTheoremDeltaReliance n m s!"accepted, but rejected with {e} theorem(s) opaque ({r} declaration(s) rewritten): {err}"
     | .originalRejected err => report .opaqueTheoremDeltaReliance n m s!"original replay rejected: {err}"
     | .refusedNativeEvaluator => report .nativeEvaluatorReachable n m "kernel replay refused: native evaluator reachable"
     | .fuelExhausted why => report .auditFuelExhausted n m s!"opaque-theorem replay: {why}"
@@ -1446,9 +2184,8 @@ structure FourVectorConfig where
   resolutionModules? : Option (Array Name) := none
   replayTargets : Array Name := #[]
   runStructuralOpaqueScan : Bool := true
-  /-- Screen theorem bodies in the shared kernel traversal (Layer A and `Init.ShareCommon`
-  references inside proofs). Theorem bodies are never executed and are by far the bulk of compiled
-  data, so a fast sweep may turn this off; types and all other values are always screened. -/
+  /-- Also run Layer A structural opaque-theorem scan inside theorem proof bodies (`Init.ShareCommon`
+  screening of theorem proof bodies is *always* enabled regardless of this flag). -/
   kernelScanTheoremBodies : Bool := true
 
 /-- Build an audit context: toolchain modules by name and sysroot provenance. -/
@@ -1495,10 +2232,7 @@ def buildClosure (info : Std.HashMap Name BuildModuleInfo) (m : Name) (fuel : Na
           todo := i :: todo
   if todo.isEmpty then some seen else none
 
-/-- Duplicate declarations `importModules` merges instead of rejecting (independently realized
-theorems: same name, type, level parameters and mutual block; mirrors the toolchain's rule, with
-axiom pairs approximated by type equality — a wrong merge guess only makes the later
-`importModules` fail, which is reported). -/
+/-- Duplicate declarations `importModules` merges instead of rejecting. -/
 def mergeableDuplicate (a b : ConstantInfo) : Bool :=
   a.name == b.name && a.type == b.type && a.levelParams == b.levelParams &&
   match a, b with
@@ -1522,32 +2256,67 @@ def addToBatch (info : Std.HashMap Name BuildModuleInfo) (owners : Std.HashMap N
 
 /-- Sweep a compiled build library directory, fail closed at every stage:
 
-1. Vector 3 on every build module first (resolution, shadowing, containment, and binary header
-   validation of every artifact part), *before* any byte is handed to `readModuleData` or
-   `importModules`; modules with any Vector 3 finding are not loaded.
-2. Build modules are not all co-importable (two modules may realize the same auxiliary lemma), so
-   the import graph and constant names are read and the import roots are partitioned into
-   conflict-free batches; a module whose own closure contains a duplicate constant is reported as
-   `environmentLoadFailed` (it can never be loaded) and is not imported.
-3. Each batch is imported once (`.private` level, no extensions) and audited (Vectors 1, 2, 4), every
-   module exactly once; Vector 3 resolution is then repeated for every toolchain module seen. -/
+1. Vector 3 on every build module first (including symlinks and orphan companions discovered in
+   `buildLib`), *before* any byte is handed to `readModuleData` or `importModules`; modules with
+   any Vector 3 finding are quarantined.
+2. Fast single-batch path when `bad` is empty and all requested `roots` co-import cleanly; automatic
+   fallback to `readModuleData` conflict-free batch partitioning when `bad` is non-empty or when two
+   build modules realize incompatible duplicate auxiliaries.
+3. Every validated module in scope is audited across Vectors 1, 2, and 4, and every toolchain module
+   seen is verified by Vector 3. -/
 def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorConfig := {})
     (roots? : Option (Array Name) := none) : AuditM Unit := do
   let t0 ← IO.monoMsNow
   let sp : SearchPath := [buildLib, sysrootLib]
   let hdr := (cfg.resolution?.map (·.header)).getD {}
-  let mods := (← listOleanModules buildLib).qsort Name.lt
   let before := (← get).violations.size
+  let mods := (← listOleanModules buildLib).qsort Name.lt
   -- 1. Vector 3 over build modules before loading anything.
   auditOleanResolutionAndShadowing mods
     { sysrootLibDir := sysrootLib, approvedBuildRoots := #[buildLib], searchPath? := some sp, header := hdr }
   let bad : NameSet := (← get).violations[before:].foldl (fun acc v => acc.insert v.module) {}
-  -- 2. Import graph of the validated modules reachable from the library roots (default: every
-  -- single-component module, i.e. every `lean_lib` root present in the build directory).
   let roots := roots?.getD (mods.filter (·.isAtomic))
   let modSet : NameSet := mods.foldl (·.insert ·) {}
+  let missingRoots := roots.filter (!modSet.contains ·)
+  for mr in missingRoots do
+    report .oleanUnresolved mr mr "requested library root not present in build directory"
+  let validRoots := roots.filter (fun r => modSet.contains r && !bad.contains r)
+  -- 2a. Fast single-batch path when all artifacts passed Vector 3 (`bad.isEmpty`).
+  if bad.isEmpty && missingRoots.isEmpty && !validRoots.isEmpty then
+    let saved ← searchPathRef.get
+    searchPathRef.set sp
+    let singleEnv? ← try
+        let ti ← IO.monoMsNow
+        let env ← importModules (validRoots.map ({ module := · })) {} (loadExts := false) (level := .private)
+        let dt := (← IO.monoMsNow) - ti
+        pure (some (env.setExporting false, dt))
+      catch _ =>
+        pure none
+      finally
+        searchPathRef.set saved
+    if let some (env, importMs) := singleEnv? then
+      let saved2 ← searchPathRef.get
+      searchPathRef.set sp
+      let mut audited : NameSet := {}
+      let mut seen : NameSet := {}
+      try
+        let ctx ← mkAuditContext env sysrootLib
+        runAllFourVectorAudits ctx { cfg with resolution? := none }
+        for mi in env.header.modules do
+          seen := seen.insert mi.module
+          unless ctx.isToolchainModule mi.module do audited := audited.insert mi.module
+      finally
+        searchPathRef.set saved2
+      let tcSeen := seen.toArray.filter isToolchainName
+      auditOleanResolutionAndShadowing tcSeen
+        { sysrootLibDir := sysrootLib, approvedBuildRoots := #[], searchPath? := some sp, header := hdr }
+      let stray := (mods.filter fun m => !audited.contains m).size
+      let t1 ← IO.monoMsNow
+      modify fun s => { s with modulesChecked := audited.size, elapsedMs := t1 - t0, importMs, strayArtifacts := stray }
+      return
+  -- 2b. General conflict-partitioning fallback (when `bad` is non-empty or roots conflict).
   let mut info : Std.HashMap Name BuildModuleInfo := {}
-  let mut todo : List Name := roots.toList.filter modSet.contains
+  let mut todo : List Name := validRoots.toList
   for _ in [0:mods.size + 1] do
     match todo with
     | [] => break
@@ -1559,13 +2328,11 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
       info := info.insert m { imports := imps, constants := d.constants }
       todo := imps.toList.filter (fun i => modSet.contains i && !info.contains i) ++ todo
   let mut inScope : NameSet := {}
-  for r in roots do
-    if bad.contains r then continue
+  for r in validRoots do
     match buildClosure info r with
     | some cl => inScope := cl.toList.foldl (·.insert ·) inScope
     | none => report .auditFuelExhausted r r "import closure exhausted its fuel"
   let stray := (mods.filter fun m => !inScope.contains m && !bad.contains m).size
-  -- A module importing an unloaded module is itself unloadable.
   let mut alive : NameSet := info.fold (fun acc m _ => if inScope.contains m then acc.insert m else acc) {}
   for m in mods do
     if !inScope.contains m then continue
@@ -1587,7 +2354,7 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
     for s in sinks do
       let some cl := buildClosure info s
         | report .auditFuelExhausted s s "import closure exhausted its fuel"; alive := alive.erase s; continue
-      if cl.toList.any (!alive.contains ·) then
+      if cl.toList.any (fun x => modSet.contains x && !alive.contains x) then
         report .environmentLoadFailed s s "imports an unloadable module"; alive := alive.erase s; progress := true; continue
       match addToBatch info {} cl.toList with
       | .error (n, a, b) =>
@@ -1598,10 +2365,10 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
         let mut placed := false
         for bi in [0:batches.size] do
           if placed then break
-          let (roots, members, owners) := batches[bi]!
+          let (bRoots, members, owners) := batches[bi]!
           let fresh := cl.toList.filter (!members.contains ·)
           if let .ok owners' := addToBatch info owners fresh then
-            batches := batches.set! bi (roots.push s, fresh.foldl (·.insert ·) members, owners')
+            batches := batches.set! bi (bRoots.push s, fresh.foldl (·.insert ·) members, owners')
             placed := true
         unless placed do
           if let .ok owners := addToBatch info {} cl.toList then batches := batches.push (#[s], cl, owners)
@@ -1616,14 +2383,14 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
   let mut seen : NameSet := {}
   let mut importMs := 0
   try
-    for (roots, _, _) in batches do
+    for (bRoots, _, _) in batches do
       let ti ← IO.monoMsNow
       let env? ← try
-          let env ← importModules (roots.map ({ module := · })) {} (loadExts := false) (level := .private)
+          let env ← importModules (bRoots.map ({ module := · })) {} (loadExts := false) (level := .private)
           importMs := importMs + ((← IO.monoMsNow) - ti)
-          pure (some env)
+          pure (some (env.setExporting false))
         catch e =>
-          for r in roots do report .environmentLoadFailed r r s!"importModules failed: {e}"
+          for r in bRoots do report .environmentLoadFailed r r s!"importModules failed: {e}"
           pure none
       let some env := env? | continue
       let ctx ← mkAuditContext env sysrootLib none toolchain
@@ -1637,7 +2404,6 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
   for m in mods do
     if alive.contains m && !audited.contains m then
       report .environmentLoadFailed m m "validated module was not covered by any import batch"
-  -- Toolchain modules seen: resolution / shadowing / sysroot containment (no binary re-read).
   let tcSeen := seen.toArray.filter isToolchainName
   auditOleanResolutionAndShadowing tcSeen
     { sysrootLibDir := sysrootLib, approvedBuildRoots := #[], searchPath? := some sp, header := hdr }

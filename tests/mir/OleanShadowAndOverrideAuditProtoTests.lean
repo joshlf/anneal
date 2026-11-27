@@ -80,7 +80,11 @@ def compileModule (root : System.FilePath) (mod : Name) (src : String) : IO Syst
   IO.FS.writeFile leanFile src
   let olean := root / (rel ++ ".olean")
   let leanBin := (← findSysroot) / "bin" / "lean"
-  let out ← IO.Process.output { cmd := leanBin.toString, args := #["-R", root.toString, "-o", olean.toString, leanFile.toString] }
+  let leanPath := root.toString ++ ":" ++ (← sysLib).toString
+  let out ← IO.Process.output {
+    cmd := leanBin.toString
+    args := #["-R", root.toString, "-o", olean.toString, leanFile.toString]
+    env := #[("LEAN_PATH", some leanPath)] }
   unless out.exitCode == 0 do throw (IO.userError s!"compiling {mod} failed: {out.stdout} {out.stderr}")
   return olean
 
@@ -117,6 +121,8 @@ PASS T1 empty user suffix rejected
 PASS T1 numeric segment inside module rejected
 PASS T1 nested _private rejected
 PASS T1 non-leading _private rejected
+PASS T1 double-zero separator (_private.M.0.0.foo) rejected
+PASS T1 empty user component (_private.M.0."") rejected
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -131,6 +137,10 @@ PASS T1 non-leading _private rejected
     (parsesTo (Name.mkNum (Name.mkNum `_private.A 3 ++ `B) 0 ++ `x) (.error (.numericModuleSegment 3)))
   expect "T1 nested _private rejected" (parsesTo (privName `A (privName `B `x)) (.error .nestedPrivate))
   expect "T1 non-leading _private rejected" (parsesTo (`Foo ++ privName `Bar `baz) (.error .nonLeadingPrivate))
+  expect "T1 double-zero separator (_private.M.0.0.foo) rejected"
+    (parsesTo (Name.mkNum (Name.mkNum `_private.M 0) 0 ++ `foo) (.error (.leadingNumericUser 0)))
+  expect "T1 empty user component (_private.M.0.\"\") rejected"
+    (parsesTo ((Name.mkNum `_private.M 0).str "") (.error .emptyUserComponent))
 
 /-! ### T2: genuine private declarations and compiler auxiliaries (control) -/
 
@@ -183,11 +193,11 @@ PASS T3 forged Assumptions axiom never admitted by the assumption allowlist
   expect "T3 forged Init prefix rejected" (mm.any (·.decl == privName `Init.Core `V1Forge.bar))
   expect "T3 forged Assumptions prefix rejected" (mm.any (·.decl == privName `Assumptions.Ok `V1Forge.ax))
   expect "T3 forged Assumptions axiom never admitted by the assumption allowlist"
-    (s.violations.any fun v => v.decl == privName `Assumptions.Ok `V1Forge.ax && v.kind == .unreferencedSorryOrNativeAxiom ||
-      v.decl == privName `Assumptions.Ok `V1Forge.ax && v.kind == .unreferencedTopLevelAxiom)
+    (s.violations.any fun v => v.decl == privName `Assumptions.Ok `V1Forge.ax &&
+      (v.kind == .unreferencedSorryOrNativeAxiom || v.kind == .unreferencedTopLevelAxiom))
     (renderAll (anyHits s "V1Forge"))
 
-/-! ### T4: user-suffix spoofing (`Init.*`, `sorryAx`, `Trusted.*`) -/
+/-! ### T4: user-suffix spoofing (`Init.*`, `sorryAx`, `Trusted.*`, wildcard `._spoof`, `ShareCommon.*`, `_at_`) -/
 
 private def _root_.Init.V1Spoof.x : Nat := 0
 private def _root_.Trusted.V1Spoof.y : Nat := 0
@@ -197,6 +207,14 @@ run_cmd liftCoreM do
   let env ← getEnv
   forgeDef (privName env.mainModule `sorryAx)
   forgeDef (privName env.mainModule `Lean.ofReduceBool)
+  -- B1 regression: underscore-suffixed spoof extending an imported `Lean.*` constant (`Lean.Name.mkStr1._spoof`)
+  forgeDef (privName env.mainModule `Lean.Name.mkStr1._spoof)
+  -- B1 regression: axiom spoofing realized `.eq_1` suffix on an imported `Lean.*` constant
+  forgeAxiom (privName env.mainModule `Lean.Name.mkStr1.eq_99)
+  -- B1 regression: `ShareCommon.*`, `Classical.*`, and `_native` user-suffix spoofs
+  forgeDef (privName env.mainModule `ShareCommon.StateFactory.mk)
+  forgeDef (privName env.mainModule `Classical.some)
+  forgeDef (privName env.mainModule `_native.native_decide.ax_9)
 
 /--
 info: PASS T4 Init.* user suffix rejected
@@ -204,10 +222,15 @@ PASS T4 Trusted.* user suffix rejected
 PASS T4 Lean.* user suffix rejected
 PASS T4 sorryAx user suffix rejected
 PASS T4 Lean.ofReduceBool user suffix rejected
+PASS T4 underscore-wildcard spoof on existing Lean constant rejected
+PASS T4 axiom spoofing realized .eq_99 suffix rejected
+PASS T4 ShareCommon / Classical / _native user suffixes rejected
+PASS T4 forged _at_ specialization context in extraConstNames rejected
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
-  let main := (← getEnv).mainModule
+  let env ← getEnv
+  let main := env.mainModule
   let s ← liveAudit
   let sp := s.violations.filter (·.kind == .privateUserSuffixSpoof)
   expect "T4 Init.* user suffix rejected" (sp.any (·.decl == privName main `Init.V1Spoof.x))
@@ -215,8 +238,23 @@ PASS T4 Lean.ofReduceBool user suffix rejected
   expect "T4 Lean.* user suffix rejected" (sp.any (·.decl == privName main `Lean.V1Spoof.z))
   expect "T4 sorryAx user suffix rejected" (sp.any (·.decl == privName main `sorryAx))
   expect "T4 Lean.ofReduceBool user suffix rejected" (sp.any (·.decl == privName main `Lean.ofReduceBool))
+  expect "T4 underscore-wildcard spoof on existing Lean constant rejected"
+    (sp.any (·.decl == privName main `Lean.Name.mkStr1._spoof))
+  expect "T4 axiom spoofing realized .eq_99 suffix rejected"
+    (sp.any (·.decl == privName main `Lean.Name.mkStr1.eq_99))
+  expect "T4 ShareCommon / Classical / _native user suffixes rejected"
+    (sp.any (·.decl == privName main `ShareCommon.StateFactory.mk) &&
+     sp.any (·.decl == privName main `Classical.some) &&
+     sp.any (·.decl == privName main `_native.native_decide.ax_9))
+  -- B1 regression: forged `_at_` specialization name in `extraConstNames` whose context is foreign
+  let lib ← sysLib
+  let (ctx, _) ← AuditM.run' (mkAuditContext env lib (some main))
+  let spoofSpec := (privName `Init.Data.Nat.Basic `Nat.repeatTR.loop) ++ `_at_ ++ `Trusted.Spoof.spec_0
+  let ((), specSummary) := (checkPrivateName ctx main spoofSpec true).run {}
+  expect "T4 forged _at_ specialization context in extraConstNames rejected"
+    (specSummary.violations.any (·.kind == .privateModuleMismatch)) (renderAll specSummary.violations)
 
-/-! ### T5: malformed, nested and non-leading `_private` declarations in the live environment -/
+/-! ### T5: malformed, nested and non-leading `_private` declarations and extension targets -/
 
 run_cmd liftCoreM do
   let env ← getEnv
@@ -230,20 +268,31 @@ info: PASS T5 non-leading _private declaration rejected
 PASS T5 nested _private declaration rejected
 PASS T5 non-zero separator declaration rejected
 PASS T5 missing separator declaration rejected
+PASS T5 malformed and foreign _private extension targets rejected
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
-  let main := (← getEnv).mainModule
+  let env ← getEnv
+  let main := env.mainModule
   let s ← liveAudit
   let bad := s.violations.filter (·.kind == .malformedPrivateName)
   expect "T5 non-leading _private declaration rejected" (bad.any (·.decl == `V1Bad ++ privName main `nonLeading))
   expect "T5 nested _private declaration rejected" (bad.any (·.decl == privName main (privName main `V1Bad.nested)))
   expect "T5 non-zero separator declaration rejected" (bad.any (·.decl == Name.mkNum (`_private ++ main) 1 ++ `V1Bad.nonZero))
   expect "T5 missing separator declaration rejected" (bad.any (·.decl == `_private ++ main ++ `V1Bad.noSeparator))
+  let lib ← sysLib
+  let (ctx, _) ← AuditM.run' (mkAuditContext env lib (some main))
+  let ((), extS) := (do
+    checkExtensionRefName ctx main `_private.MalformedExtTarget false
+    checkExtensionRefName ctx main (privName `Trusted.Foreign `ghostTarget) false : PureAuditM Unit).run {}
+  expect "T5 malformed and foreign _private extension targets rejected"
+    (extS.violations.any (·.kind == .malformedPrivateName) &&
+     extS.violations.any (·.kind == .privateModuleMismatch))
+    (renderAll extS.violations)
 
 /-! ## Vector 2 — unreferenced top-level axioms (`leanprover/lean4#16781`) -/
 
-/-! ### T6: foundational control -/
+/-! ### T6: foundational control + B1 non-toolchain re-declaration anti-spoofing -/
 
 theorem V2Ctl.claim (p q : Prop) (h : p ↔ q) : p = q := propext h
 theorem V2Ctl.choice (α : Type) (h : Nonempty α) : ∃ _ : α, True := ⟨Classical.choice h, trivial⟩
@@ -251,6 +300,7 @@ theorem V2Ctl.choice (α : Type) (h : Nonempty α) : ∃ _ : α, True := ⟨Clas
 /--
 info: PASS T6 propext / Classical.choice admitted with their toolchain modules
 PASS T6 Classical.choice rejected when allowClassicalChoice = false
+PASS T6 non-toolchain re-declaration of propext or foreign Assumptions axiom rejected
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
@@ -260,6 +310,27 @@ PASS T6 Classical.choice rejected when allowClassicalChoice = false
   let s ← liveAudit { axioms := { allowClassicalChoice := false }, axiomRoots? := some #[``V2Ctl.choice] }
   expect "T6 Classical.choice rejected when allowClassicalChoice = false"
     (s.violations.any fun v => v.kind == .referencedUnapprovedAxiom && v.decl == ``Classical.choice)
+  -- B1 regression: untrusted module `Evil` re-declaring `Assumptions.Ok.ax` alongside `Assumptions.Ok`
+  withTmpDir fun dir => do
+    let _ ← compileModule dir `Assumptions.Ok "axiom Assumptions.Ok.ax : True\n"
+    let _ ← compileModule dir `Evil "import Assumptions.Ok\n"
+    let env ← importWith dir #[`Evil]
+    -- Inject a forged `Assumptions.Ok.ax` and `propext` into a synthetic `ModuleView` for `Evil`
+    let some axCi := env.find? `Assumptions.Ok.ax | throw (IO.userError "missing ax")
+    let some propCi := env.find? ``propext | throw (IO.userError "missing propext")
+    let lib ← sysLib
+    let ((), spoofS) ← AuditM.run' do
+      let ctx ← mkAuditContext env lib
+      let evilView : ModuleView := {
+        module := `Evil, idx? := none,
+        data := { (default : ModuleData) with constants := #[axCi, propCi], constNames := #[`Assumptions.Ok.ax, ``propext] } }
+      auditUnreferencedAxioms ctx #[evilView]
+        { allowAssumptions := true, allowedAssumptions := NameSet.empty.insert `Assumptions.Ok.ax }
+        (some #[``propext])
+    expect "T6 non-toolchain re-declaration of propext or foreign Assumptions axiom rejected"
+      (spoofS.violations.any (fun v => v.decl == ``propext && v.module == `Evil) &&
+       spoofS.violations.any (fun v => v.decl == `Assumptions.Ok.ax && v.module == `Evil))
+      (renderAll spoofS.violations)
 
 /-! ### T7: unreferenced public `axiom : False` (missed by `collectAxioms`) -/
 
@@ -341,12 +412,13 @@ PASS T9 reachable sorryAx rejected
   expect "T9 reachable sorryAx rejected"
     (s.violations.any fun v => v.kind == .referencedUnapprovedAxiom && v.decl == `sorryAx)
 
-/-! ### T10: exported-only (`isModule`) environments fail closed -/
+/-! ### T10: exported-only (`isModule`) environments fail closed even after `setExporting false` -/
 
 /--
 info: PASS T10 exported-level import is a module-system environment
 PASS T10 the exported view hides the private axiom
 PASS T10 auditUnreferencedAxioms fails closed on the exported-only view
+PASS T10 exported-level isModule env still fails closed even if caller calls setExporting false
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -359,6 +431,13 @@ PASS T10 auditUnreferencedAxioms fails closed on the exported-only view
     let s ← auditImported env {} dir
     expect "T10 auditUnreferencedAxioms fails closed on the exported-only view"
       (s.violations.any (·.kind == .exportedOnlyEnvironment)) (renderAll s.violations)
+    -- B1 regression: calling `env.setExporting false` on an `.exported` import (where `.olean.private`
+    -- was never loaded and `importAll` is `false`) must STILL fail closed!
+    let envUnmasked := env.setExporting false
+    let sUnmasked ← auditImported envUnmasked {} dir
+    expect "T10 exported-level isModule env still fails closed even if caller calls setExporting false"
+      (!envUnmasked.isExporting && sUnmasked.violations.any (·.kind == .exportedOnlyEnvironment))
+      (renderAll sUnmasked.violations)
 
 /-! ## Vector 3 — `Lean.findOLean`, shadowing, symlinks, binary headers (`leanprover/lean4#16737`) -/
 
@@ -389,11 +468,13 @@ PASS T11 resolution + shadowing audit is clean on the real search path
   expect "T11 resolution + shadowing audit is clean on the real search path"
     (s.violations.isEmpty && s.oleansChecked == 11) s!"{renderAll s.violations} {s.oleansChecked}"
 
-/-! ### T12: multi-root shadowing and toolchain shadowing -/
+/-! ### T12: multi-root shadowing, toolchain shadowing, and incomplete/orphan companion parts -/
 
 /--
 info: PASS T12 module present in two search-path roots is reported as shadowed
 PASS T12 toolchain module copied into a non-sysroot root is reported
+PASS T12 stripped .olean.private companion (with .olean.server remaining) is reported
+PASS T12 orphan .ir companion without .ir.sig is reported
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -415,16 +496,33 @@ PASS T12 toolchain module copied into a non-sysroot root is reported
     expect "T12 toolchain module copied into a non-sysroot root is reported"
       (s.violations.any (·.kind == .toolchainShadowed) && s.violations.any (·.kind == .oleanOutsideApprovedRoot))
       (renderAll s.violations)
+    -- B1 regression: module-system file with `.olean.private` deleted while `.olean.server` remains
+    let rootC := dir / "rootC"
+    let modOlean ← compileModule rootC `StrippedMod hiddenAxSrc
+    IO.FS.removeFile ⟨modOlean.toString ++ ".private"⟩
+    let ((), sStrip) ← AuditM.run' (auditOleanResolutionAndShadowing #[`StrippedMod]
+      { sysrootLibDir := lib, approvedBuildRoots := #[rootC], searchPath? := some [rootC, lib] })
+    expect "T12 stripped .olean.private companion (with .olean.server remaining) is reported"
+      (sStrip.violations.any (·.kind == .oleanOutsideApprovedRoot)) (renderAll sStrip.violations)
+    -- B1 regression: incomplete `.ir` without `.ir.sig`
+    IO.FS.writeBinFile (rootA / "Shadowed.ir") (← IO.FS.readBinFile olean)
+    let ((), sIr) ← AuditM.run' (auditOleanResolutionAndShadowing #[`Shadowed]
+      { sysrootLibDir := lib, approvedBuildRoots := #[rootA], searchPath? := some [rootA, lib] })
+    expect "T12 orphan .ir companion without .ir.sig is reported"
+      (sIr.violations.any (·.kind == .oleanOutsideApprovedRoot)) (renderAll sIr.violations)
 
-/-! ### T13: symlink escape, path-prefix confusion and `..` -/
+/-! ### T13: symlink escape, symlinked root, symlink inside buildLib, path-prefix confusion and `..` -/
 
 /--
 info: PASS T13 regular file inside the root accepted
 PASS T13 prefix-confused sibling root (root_evil vs root) rejected
 PASS T13 symlinked artifact escaping the root rejected
 PASS T13 symlinked directory component rejected
+PASS T13 symlinked approved root itself rejected
+PASS T13 symlinked ancestor of approved root rejected
 PASS T13 dot-dot component rejected
 PASS T13 resolution through root_evil is outside the approved root
+PASS T13 listOleanModules flags symlinked .olean inside buildLib immediately
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -433,26 +531,36 @@ PASS T13 resolution through root_evil is outside the approved root
     let root := dir / "root"
     let evil := dir / "root_evil"
     let outside := dir / "outside"
-    for d in [root, evil, outside, root / "Sub"] do IO.FS.createDirAll d
+    for d in [root, evil, outside, root / "Sub", outside / "nested"] do IO.FS.createDirAll d
     let bytes ← IO.FS.readBinFile (lib / "Init" / "Prelude.olean")
     IO.FS.writeBinFile (root / "Good.olean") bytes
     IO.FS.writeBinFile (evil / "Evil.olean") bytes
     IO.FS.writeBinFile (outside / "Esc.olean") bytes
+    IO.FS.writeBinFile (outside / "nested" / "Sneak.olean") bytes
     let ln (target link : System.FilePath) : IO Unit := do
       let out ← IO.Process.output { cmd := "ln", args := #["-s", target.toString, link.toString] }
       unless out.exitCode == 0 do throw (IO.userError out.stderr)
     ln (outside / "Esc.olean") (root / "Esc.olean")
     ln outside (root / "Link")
+    ln outside (dir / "sym_root")
     expect "T13 regular file inside the root accepted" ((← pathWithinRoot root (root / "Good.olean")) matches .ok _)
     expect "T13 prefix-confused sibling root (root_evil vs root) rejected"
       ((← pathWithinRoot root (evil / "Evil.olean")) matches .error _)
     expect "T13 symlinked artifact escaping the root rejected" ((← pathWithinRoot root (root / "Esc.olean")) matches .error _)
     expect "T13 symlinked directory component rejected" ((← pathWithinRoot root (root / "Link" / "Esc.olean")) matches .error _)
+    expect "T13 symlinked approved root itself rejected"
+      ((← pathWithinRoot (dir / "sym_root") (dir / "sym_root" / "Esc.olean")) matches .error _)
+    expect "T13 symlinked ancestor of approved root rejected"
+      ((← pathWithinRoot (dir / "sym_root" / "nested") (dir / "sym_root" / "nested" / "Sneak.olean")) matches .error _)
     expect "T13 dot-dot component rejected" ((← pathWithinRoot root (root / "Sub" / ".." / "Good.olean")) matches .error _)
     let ((), s) ← AuditM.run' (auditOleanResolutionAndShadowing #[`Evil]
       { sysrootLibDir := lib, approvedBuildRoots := #[root], searchPath? := some [evil, lib] })
     expect "T13 resolution through root_evil is outside the approved root"
       (s.violations.any (·.kind == .oleanOutsideApprovedRoot)) (renderAll s.violations)
+    let (foundMods, sWalk) ← AuditM.run' (listOleanModules root)
+    expect "T13 listOleanModules flags symlinked .olean inside buildLib immediately"
+      (foundMods.contains `Esc && sWalk.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Esc)
+      (renderAll sWalk.violations)
 
 /-! ### T14: truncated and misaligned bytes (`leanprover/lean4#16737`) -/
 
@@ -481,7 +589,7 @@ PASS T14 file over the size limit rejected before parsing
   expect "T14 file over the size limit rejected before parsing"
     (isErr (validateOleanBinaryBytes bs { maxBytes := 1024 }) (· matches .tooLarge _ _))
 
-/-! ### T15: corrupted magic / version / githash / root pointer / `m_rc` -/
+/-! ### T15: corrupted magic / version / githash / baseAddr wrap / root tag 244 / root child ptrs -/
 
 def setByte (bs : ByteArray) (i : Nat) (b : UInt8) : ByteArray := bs.set! i b
 
@@ -496,10 +604,10 @@ PASS T15 garbage after the version terminator rejected
 PASS T15 version mismatch rejected
 PASS T15 non-hex githash rejected
 PASS T15 githash mismatch rejected
-PASS T15 zero / misaligned base address rejected
+PASS T15 zero / misaligned / wrapping base address rejected
 PASS T15 scalar / misaligned / out-of-bounds root pointer rejected
-PASS T15 nonzero root m_rc rejected
-PASS T15 oversized root m_cs_sz rejected
+PASS T15 nonzero root m_rc and non-ctor tag 244 (LeanPromise) rejected
+PASS T15 oversized root m_cs_sz and corrupted root field pointers rejected
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -513,16 +621,22 @@ PASS T15 oversized root m_cs_sz rejected
   expect "T15 version mismatch rejected" (isErr (v (setByte bs 11 0x39)) (· matches .versionMismatch ..))
   expect "T15 non-hex githash rejected" (isErr (v (setByte bs 41 0x47)) (· matches .badGithash))
   expect "T15 githash mismatch rejected" (isErr (v (setByte bs 41 0x61)) (· matches .githashMismatch ..))
-  expect "T15 zero / misaligned base address rejected"
-    (isErr (v (setLE64 bs 80 0)) (· matches .zeroBaseAddr) && isErr (v (setLE64 bs 80 (info.baseAddr + 4))) (· matches .misalignedBaseAddr _))
+  expect "T15 zero / misaligned / wrapping base address rejected"
+    (isErr (v (setLE64 bs 80 0)) (· matches .zeroBaseAddr) &&
+     isErr (v (setLE64 bs 80 (info.baseAddr + 4))) (· matches .misalignedBaseAddr _) &&
+     isErr (v (setLE64 bs 80 (2 ^ 64 - 8))) (· matches .baseAddrWraps))
   expect "T15 scalar / misaligned / out-of-bounds root pointer rejected"
     (isErr (v (setLE64 bs 88 (info.rootPtr + 1))) (· matches .scalarRootPtr _) &&
      isErr (v (setLE64 bs 88 (info.rootPtr + 4))) (· matches .misalignedRootPtr _) &&
      isErr (v (setLE64 bs 88 (info.baseAddr + info.fileSize))) (· matches .rootOutOfBounds _) &&
      isErr (v (setLE64 bs 88 info.baseAddr)) (· matches .rootOutOfBounds _))
-  expect "T15 nonzero root m_rc rejected" (isErr (v (setByte bs info.rootOffset 1)) (· matches .rootRcNonzero _))
-  expect "T15 oversized root m_cs_sz rejected"
-    (isErr (v (setByte (setByte bs (info.rootOffset + 4) 0xff) (info.rootOffset + 5) 0xff)) (· matches .rootSizeInvalid _))
+  expect "T15 nonzero root m_rc and non-ctor tag 244 (LeanPromise) rejected"
+    (isErr (v (setByte bs info.rootOffset 1)) (· matches .rootRcNonzero _) &&
+     isErr (v (setByte bs (info.rootOffset + 7) 244)) (· matches .rootNotConstructor 244))
+  expect "T15 oversized root m_cs_sz and corrupted root field pointers rejected"
+    (isErr (v (setByte (setByte bs (info.rootOffset + 4) 0xff) (info.rootOffset + 5) 0xff)) (· matches .rootSizeInvalid _) &&
+     isErr (v (setLE64 bs (info.rootOffset + 8) 0)) (· matches .rootChildInvalid 0 _) &&
+     isErr (v (setLE64 bs (info.rootOffset + 8) (info.baseAddr + info.fileSize + 64))) (· matches .rootChildInvalid 0 _))
 
 /-! ## Vector 4 — `Init.ShareCommon`, compiler overrides, opaque-theorem readiness -/
 
@@ -548,7 +662,7 @@ info: PASS T16 benign @[inline]/@[noinline]/generated ctorIdx produce no Vector 
 
 namespace V4Share
 /-- A builder written in total, safe code whose map ignores keys: the runtime's max-sharing
-primitive trusts it, so `StateFactory.mk` bypasses every `unsafe` / `implemented_by` check on
+primitive trusts it, so `StateFactory.mk` bypasses every safety / `implemented_by` check on
 user declarations. -/
 def evilBuilder : ShareCommon.StateFactoryBuilder where
   Map := fun α β _ _ => List (α × β)
@@ -563,22 +677,31 @@ def evilBuilder : ShareCommon.StateFactoryBuilder where
 def exploit : Nat :=
   let σ := ShareCommon.StateFactory.mk evilBuilder
   ((ShareCommon.State.mk σ : ShareCommon.State.{0} σ).shareCommon (5 : Nat)).1
+
+/-- B1 regression: theorem proof body referencing `ShareCommon.shareCommon'` (erased from LCNF/IR
+and absent from `ci.type`, testing that even `kernelScanTheoremBodies = false` catches it). -/
+theorem proofBodyShareCommon : True :=
+  let _ := ShareCommon.shareCommon' (0 : Nat)
+  trivial
 end V4Share
 
 def shareImportSrc : String := "import Init.ShareCommon\ndef usesNothing : Nat := 0\n"
 
 /--
 info: PASS T17 StateFactoryBuilder / StateFactory.mk / State.shareCommon references rejected
+PASS T17 theorem proof-body ShareCommon reference caught even when kernelScanTheoremBodies = false
 PASS T17 compiled IR / LCNF references rejected
 PASS T17 direct import of Init.ShareCommon rejected
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
-  let s ← liveAudit
+  let s ← liveAudit { kernelScanTheoremBodies := false }
   let sc := hits s .shareCommonReference "V4Share"
   expect "T17 StateFactoryBuilder / StateFactory.mk / State.shareCommon references rejected"
     (sc.any (fun v => nameHas v.decl "evilBuilder") && sc.any (fun v => v.decl == `OleanShadowAndOverrideAuditProtoTests.V4Share.exploit))
     (renderAll sc)
+  expect "T17 theorem proof-body ShareCommon reference caught even when kernelScanTheoremBodies = false"
+    (sc.any fun v => v.decl == ``V4Share.proofBodyShareCommon) (renderAll sc)
   expect "T17 compiled IR / LCNF references rejected"
     (sc.any fun v => (v.detail.splitOn "IR").length > 1 || (v.detail.splitOn "LCNF").length > 1) (renderAll sc)
   withTmpDir fun dir => do
@@ -588,7 +711,7 @@ PASS T17 direct import of Init.ShareCommon rejected
     expect "T17 direct import of Init.ShareCommon rejected"
       (s.violations.any fun v => v.kind == .shareCommonImport && v.module == `ShareImp) (renderAll s.violations)
 
-/-! ### T18: compiler-override hooks (`google/zerocopy#4321`) -/
+/-! ### T18: compiler-override hooks (`google/zerocopy#4321`) + B1 custom `ctorIdx` & foreign tags -/
 
 namespace V4Hook
 @[extern "v4_hook_c_fn"] opaque externFn : Nat → Nat
@@ -606,6 +729,17 @@ def csimpFast (n : Nat) : Nat := n
 @[tagged_return, extern "v4_hook_tagged"] opaque taggedFn : Nat → Nat
 end V4Hook
 
+-- B1 regression: add a bare inductive via `addDecl` (no generated `ctorIdx`) and author a custom
+-- `@[macro_inline] def BareInd.ctorIdx` with lazy multi-arg signature; also mark a foreign decl in
+-- `noConfusionExt` and a custom pass in `passManagerExt` on cloned environments!
+run_cmd liftCoreM do
+  let indName := `OleanShadowAndOverrideAuditProtoTests.V4Hook.BareInd
+  addDecl (.inductDecl [] 0 [{
+    name := indName, type := mkSort .one,
+    ctors := [{ name := indName.str "mk", type := mkConst indName }] }] false)
+
+@[macro_inline] def V4Hook.BareInd.ctorIdx (b : Bool) (x y : Nat) : Nat := if b then x else y
+
 /--
 info: PASS T18 hook implemented_by
 PASS T18 hook extern
@@ -617,19 +751,41 @@ PASS T18 hook macro_inline
 PASS T18 hook never_extract
 PASS T18 hook unbox
 PASS T18 hook tagged_return
+PASS T18 custom @[macro_inline] BareInd.ctorIdx is not exempted
+PASS T18 live foreign noConfusion tag, scoped csimp, and tampered PassManager caught
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
   let s ← liveAudit
-  let main := (← getEnv).mainModule
+  let env ← getEnv
+  let main := env.mainModule
   let hs := s.violations.filter (·.kind == .compilerOverrideHook)
   for label in ["implemented_by", "extern", "export", "init", "builtin_init", "csimp", "macro_inline",
                 "never_extract", "unbox", "tagged_return"] do
     expect s!"T18 hook {label}"
       (hs.any fun v => v.detail.startsWith label && (nameHas v.decl "V4Hook" || v.decl == main))
       (renderAll hs)
+  expect "T18 custom @[macro_inline] BareInd.ctorIdx is not exempted"
+    (hs.any fun v => v.decl == `OleanShadowAndOverrideAuditProtoTests.V4Hook.BareInd.ctorIdx && v.detail == "macro_inline")
+    (renderAll hs)
+  -- B1 regression: test live foreign `noConfusionExt` tag + non-recursor `auxRecExt` tag + live
+  -- `PassManager` modification without triggering `MapDeclarationExtension.insert`'s stderr panic
+  let envTampered := noConfusionExt.modifyState env (·.insert ``Nat.add (.regular 4 1 2))
+  let envTampered := markAuxRecursor envTampered ``V4Hook.fastF
+  let envTampered := Compiler.LCNF.passManagerExt.modifyState envTampered fun (ps, pm) =>
+    (ps, { pm with basePasses := #[] })
+  let lib ← sysLib
+  let ((), sTamp) ← AuditM.run' do
+    let ctx ← mkAuditContext envTampered lib (some main)
+    let views ← nonToolchainViews ctx
+    auditCompilerHooks ctx views
+  expect "T18 live foreign noConfusion tag, scoped csimp, and tampered PassManager caught"
+    (sTamp.violations.any (fun v => v.kind == .foreignCompilerTag && v.decl == ``Nat.add) &&
+     sTamp.violations.any (fun v => v.kind == .compilerOverrideHook && v.decl == ``V4Hook.fastF) &&
+     sTamp.violations.any (fun v => v.kind == .compilerOverrideHook && v.decl == `compiler_pipeline))
+    (renderAll sTamp.violations)
 
-/-! ### T19: `leanprover/lean4#14896` opaque-theorem witness (Layer A + Layer B) -/
+/-! ### T19: `leanprover/lean4#14896` opaque-theorem witness (Layer A + Layer B + B1 `opaque` & stmt-type) -/
 
 namespace V4Opaque
 theorem accZeroThm : Acc (fun _ _ : Nat => False) 0 := Acc.intro 0 (fun _ h => h.elim)
@@ -646,17 +802,29 @@ def viaReduceBool : Bool := Lean.reduceBool true
 end V4Opaque
 
 /- `accViaThm = 42` proved by `rfl` (kernel-checked directly; the elaborator does not reduce
-`Acc.rec`). -/
+`Acc.rec`), plus B1 regressions: an `opaque` relying on δ-reducing `accZeroThm`, and a theorem
+whose *dependency theorem statement* relies on δ-reducing `accZeroThm`. -/
 run_cmd liftCoreM do
   let n42 := mkNatLit 42
-  addDecl (.thmDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaThm_eq, levelParams := []
-                      type := mkApp3 (mkConst ``Eq [1]) (mkConst ``Nat) (mkConst ``V4Opaque.accViaThm) n42
-                      value := mkApp2 (mkConst ``Eq.refl [1]) (mkConst ``Nat) n42 })
+  let eqTy := mkApp3 (mkConst ``Eq [1]) (mkConst ``Nat) (mkConst ``V4Opaque.accViaThm) n42
+  let eqRefl := mkApp2 (mkConst ``Eq.refl [1]) (mkConst ``Nat) n42
+  addDecl (.thmDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaThm_eq,
+                      levelParams := [], type := eqTy, value := eqRefl })
+  addDecl (.opaqueDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.opaqueViaThm,
+                         levelParams := [], type := eqTy, value := eqRefl, isUnsafe := false })
+  let stmtNeedsDeltaTy := Expr.letE `h eqTy eqRefl (mkConst ``True) false
+  addDecl (.thmDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.depStmtNeedsDelta,
+                      levelParams := [], type := stmtNeedsDeltaTy, value := mkConst ``True.intro })
+  addDecl (.thmDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.viaDepStmt,
+                      levelParams := [], type := mkConst ``True,
+                      value := mkConst `OleanShadowAndOverrideAuditProtoTests.V4Opaque.depStmtNeedsDelta })
 
 /--
 info: PASS T19 Layer A flags the theorem in the Acc.rec major premise
 PASS T19 Layer A does not flag the definition contrast
 PASS T19 Layer B: rfl theorem accepted, rejected once theorems are kernel-opaque
+PASS T19 Layer B: opaque declaration relying on theorem body caught
+PASS T19 Layer B: dependency theorem whose statement relies on theorem body caught
 PASS T19 Layer B: definition contrast replays cleanly
 PASS T19 Layer B refuses to run the kernel when a native evaluator is reachable
 PASS T19 live audit reports opaqueTheoremDeltaReliance for the replay target
@@ -671,6 +839,10 @@ PASS T19 live audit reports opaqueTheoremDeltaReliance for the replay target
   expect "T19 Layer A does not flag the definition contrast" ((scanOpaqueTheoremReliance env defCi) matches .ok #[])
   let r ← checkOpaqueTheoremReplay env `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaThm_eq
   expect "T19 Layer B: rfl theorem accepted, rejected once theorems are kernel-opaque" (r matches .deltaReliance ..) (repr r |>.pretty)
+  let rOp ← checkOpaqueTheoremReplay env `OleanShadowAndOverrideAuditProtoTests.V4Opaque.opaqueViaThm
+  expect "T19 Layer B: opaque declaration relying on theorem body caught" (rOp matches .deltaReliance ..) (repr rOp |>.pretty)
+  let rDep ← checkOpaqueTheoremReplay env `OleanShadowAndOverrideAuditProtoTests.V4Opaque.viaDepStmt
+  expect "T19 Layer B: dependency theorem whose statement relies on theorem body caught" (rDep matches .deltaReliance ..) (repr rDep |>.pretty)
   let r ← checkOpaqueTheoremReplay env ``V4Opaque.accViaDef_eq
   expect "T19 Layer B: definition contrast replays cleanly" (r matches .clean .. || r matches .noTheoremDependencies) (repr r |>.pretty)
   let r ← checkOpaqueTheoremReplay env ``V4Opaque.viaReduceBool
@@ -678,7 +850,7 @@ PASS T19 live audit reports opaqueTheoremDeltaReliance for the replay target
   let s ← liveAudit { replayTargets := #[`OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaThm_eq, ``V4Opaque.accViaDef_eq] }
   expect "T19 live audit reports opaqueTheoremDeltaReliance for the replay target"
     ((s.violations.filter (·.kind == .opaqueTheoremDeltaReliance)).map (·.decl) == #[`OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaThm_eq] &&
-     s.policyFlags.any fun v => v.decl == ``V4Opaque.accViaThm) (renderAll s.violations)
+      s.policyFlags.any fun v => v.decl == ``V4Opaque.accViaThm) (renderAll s.violations)
 
 /-! ## T20: real sweep over the compiled build library of this checkout
 
@@ -700,10 +872,10 @@ def sweep (label : String) (cfg : FourVectorConfig) (budgetMs? : Option Nat) : I
   if let some b := budgetMs? then
     expect s!"{label} finished within {b} ms" (s.elapsedMs < b) s!"{s.elapsedMs}"
 
--- Fast sweep (theorem bodies are not screened; everything else is): timed against 5 s.
-#eval sweep "T20 fast sweep" { runStructuralOpaqueScan := false, kernelScanTheoremBodies := false } (some 5000)
+-- Fast sweep (Init.ShareCommon scanned on ALL bodies including theorems; Layer A on types & defs): timed against 5 s.
+#eval sweep "T20 fast sweep" { runStructuralOpaqueScan := true, kernelScanTheoremBodies := false } (some 5000)
 
--- Deep sweep (theorem bodies screened, Layer A structural scan on): zero findings, time reported.
+-- Deep sweep (full Layer A + Init.ShareCommon across all theorem bodies too): zero findings, time reported.
 #eval sweep "T20 deep sweep" {} none
 
 end OleanShadowAndOverrideAuditProtoTests
