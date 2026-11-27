@@ -244,6 +244,19 @@ theorem mirExactOutcomeRefines_forget {Val : Type} {x y : MirExactOutcomeClass V
     | ret _ => exact h
     | trap _ | ub | unsupported => exact False.elim h
 
+theorem mirExactOutcomeEquiv_refl {Val : Type} (x : MirExactOutcomeClass Val) :
+    MirExactOutcomeEquiv x x :=
+  ⟨mirExactOutcomeRefines_refl x, mirExactOutcomeRefines_refl x⟩
+
+theorem mirExactOutcomeEquiv_symm {Val : Type} {x y : MirExactOutcomeClass Val}
+    (h : MirExactOutcomeEquiv x y) : MirExactOutcomeEquiv y x :=
+  ⟨h.2, h.1⟩
+
+theorem mirExactOutcomeEquiv_trans {Val : Type} {x y z : MirExactOutcomeClass Val}
+    (hxy : MirExactOutcomeEquiv x y) (hyz : MirExactOutcomeEquiv y z) :
+    MirExactOutcomeEquiv x z :=
+  ⟨mirExactOutcomeRefines_trans hxy.1 hyz.1, mirExactOutcomeRefines_trans hyz.2 hxy.2⟩
+
 /-- `LE` on `MirOutcomeClass Val` aligned with `Trusted.Refinement` Smyth order:
 `impl ≤ spec` iff `MirOutcomeRefines spec impl` (`.ub` and `.unsupported` are top). -/
 instance instLEMirOutcomeClass {Val : Type} : LE (MirOutcomeClass Val) where
@@ -395,6 +408,11 @@ theorem mirExactOutcomeRefines_iff_partial_le {Val : Type}
         nomatch hEq
       | ub | unsupported => exact False.elim hImplDef
 
+/-- `MirExactOutcomeClass.toPartial` is `Trusted.Refinement.Monotone`. -/
+theorem mirExactOutcomeClass_toPartial_monotone {Val : Type} :
+    Trusted.Refinement.Monotone (MirExactOutcomeClass.toPartial (Val := Val)) :=
+  fun _ _ h => (mirExactOutcomeRefines_iff_partial_le _ _).1 h
+
 /-! ## 2. Multi-Step `stepMirState` Runner & Coinductive `mirCallTree` / `WeakRef` Bridge -/
 
 /-- Fuel-bounded multi-step operational executor stepping `stepMirState`.
@@ -428,6 +446,18 @@ def runMirCall (body : CapturedMir) (fuel : Nat) (args : List Value) : MirExecSt
 /-- Strategy-exact classifier mapping a `MirExecState` to `MirExactOutcomeClass Value`. -/
 def classifyMirExecStateExact : MirExecState → MirExactOutcomeClass Value
   | .halted (.normal (v, _)) => .ret v
+  | .halted .abort => .trap .abort
+  | .halted .panic => .trap .panic
+  | .faulted .ub => .ub
+  | .faulted .unsupported => .unsupported
+  | .faulted .outOfFuel => .unsupported
+  | .running _ => .unsupported
+
+/-- Full-outcome strategy-exact classifier preserving both the return value and final memory
+`(Value × Memory)` so `MirExactOutcomeRefines` corresponds *iff* to Layer 1A `ITree.toPartial`
+and coinductive `WeakRef` over `mirCallTree` for every settled execution. -/
+def classifyMirOutcomeExact : MirExecState → MirExactOutcomeClass (Value × Memory)
+  | .halted (.normal vm) => .ret vm
   | .halted .abort => .trap .abort
   | .halted .panic => .trap .panic
   | .faulted .ub => .ub
@@ -554,6 +584,46 @@ theorem runMirSteps_ub_mono (body : CapturedMir) :
         | inl req => cases req; exact h
         | inr _ => nomatch h
 
+/-- A `MirExecState` is *settled* when it is a genuine halting outcome or a genuine UB fault
+(never an `.outOfFuel` truncation, an `.unsupported` boundary, or a still-`.running` state). -/
+def SettledExec : MirExecState → Prop
+  | .halted _ => True
+  | .faulted .ub => True
+  | _ => False
+
+/-- A non-`.unsupported` classification under ANY strategy implies the state is settled. -/
+theorem settledExec_of_classify_ne_unsupported {strat : PanicStrategy} {st : MirExecState}
+    (h : classifyMirExecState strat st ≠ .unsupported) : SettledExec st := by
+  cases st with
+  | halted _ => trivial
+  | running _ => exact False.elim (h rfl)
+  | faulted fk =>
+    cases fk with
+    | ub => trivial
+    | unsupported => exact False.elim (h rfl)
+    | outOfFuel => exact False.elim (h rfl)
+
+/-- Settled `runMirSteps` results are invariant under additional fuel. -/
+theorem runMirSteps_settled_mono (body : CapturedMir) (fuel extra : Nat) (st : MirExecState)
+    (h : SettledExec (runMirSteps body fuel st)) :
+    runMirSteps body (fuel + extra) st = runMirSteps body fuel st := by
+  generalize hR : runMirSteps body fuel st = r at h ⊢
+  cases r with
+  | halted o => exact runMirSteps_halted_mono body fuel extra st o hR
+  | running _ => exact False.elim h
+  | faulted fk =>
+    cases fk with
+    | ub => exact runMirSteps_ub_mono body fuel extra st hR
+    | unsupported => exact False.elim h
+    | outOfFuel => exact False.elim h
+
+/-- Settled `runMirCall` results are identical at every larger fuel `fuel' ≥ fuel`. -/
+theorem runMirCall_fuel_stable {body : CapturedMir} {fuel fuel' : Nat} {args : List Value}
+    (hle : fuel ≤ fuel') (h : SettledExec (runMirCall body fuel args)) :
+    runMirCall body fuel' args = runMirCall body fuel args := by
+  obtain ⟨extra, rfl⟩ := Nat.exists_eq_add_of_le hle
+  exact runMirSteps_settled_mono body fuel extra _ h
+
 /-- Coinductive MIR interaction tree starting from an arbitrary `MirExecState`. -/
 def mirExecTree (body : CapturedMir) (st : MirExecState) :
     ITree MirEffect MirOutcome :=
@@ -563,14 +633,38 @@ theorem mirExecTree_running (body : CapturedMir) (s : MachineState) :
     mirExecTree body (.running s) = mirTree body s :=
   rfl
 
-/-- Exact `TauStar` bridge for halted executions: if `runMirSteps body fuel st = .halted out`,
-then `mirExecTree body st` reduces in finitely many silent `.tau` steps to a node
-observing `.ret out`. -/
-theorem runMirSteps_halted_to_tauStar (body : CapturedMir) :
+/-- Step-bounded silent `.tau` reduction: `TauLeN n t u` means `t` reduces to `u` in
+at most `n` silent `.tau` steps. -/
+inductive TauLeN {E : Effect.{0}} {R : Type} : Nat → ITree E R → ITree E R → Prop where
+  | refl (n : Nat) (t : ITree E R) : TauLeN n t t
+  | step {n : Nat} {t t' u : ITree E R} :
+      t.observe = .tau t' → TauLeN n t' u → TauLeN (n + 1) t u
+
+/-- Erase the step bound of `TauLeN` to `Trusted.ITree.TauStar`. -/
+theorem TauLeN.toTauStar {E : Effect.{0}} {R : Type} {n : Nat} {t u : ITree E R}
+    (h : TauLeN n t u) : TauStar t u := by
+  induction h with
+  | refl _ _ => exact .refl _
+  | step hObs _ ih => exact .step hObs ih
+
+/-- `TauLeN` is monotone in the step bound `n`. -/
+theorem TauLeN.mono {E : Effect.{0}} {R : Type} {n m : Nat} {t u : ITree E R}
+    (h : TauLeN n t u) (hle : n ≤ m) : TauLeN m t u := by
+  induction h generalizing m with
+  | refl _ _ => exact .refl m _
+  | @step n' _ _ _ hObs _ ih =>
+    cases m with
+    | zero => exact False.elim (Nat.not_succ_le_zero n' hle)
+    | succ m' => exact .step hObs (ih (Nat.le_of_succ_le_succ hle))
+
+/-- Step-bounded (`≤ fuel`) `TauLeN` bridge for halted executions: if
+`runMirSteps body fuel st = .halted out`, then `mirExecTree body st` reduces in at most
+`fuel` silent `.tau` steps to a node observing `.ret out`. -/
+theorem runMirSteps_halted_to_tauLeN (body : CapturedMir) :
     ∀ (fuel : Nat) (st : MirExecState) (out : MirOutcome),
       runMirSteps body fuel st = .halted out →
       ∃ u : ITree MirEffect MirOutcome,
-        TauStar (mirExecTree body st) u ∧ u.observe = .ret out
+        TauLeN fuel (mirExecTree body st) u ∧ u.observe = .ret out
   | 0, st, out, h => by
     cases st with
     | running _ => nomatch h
@@ -578,7 +672,7 @@ theorem runMirSteps_halted_to_tauStar (body : CapturedMir) :
     | halted o =>
       injection h with ho
       subst ho
-      refine ⟨mirExecTree body (.halted o), .refl _, ?_⟩
+      refine ⟨mirExecTree body (.halted o), .refl 0 _, ?_⟩
       unfold mirExecTree
       rw [ITree.observe_cofix]
       rfl
@@ -588,7 +682,7 @@ theorem runMirSteps_halted_to_tauStar (body : CapturedMir) :
       dsimp only [runMirSteps] at h
       injection h with ho
       subst ho
-      refine ⟨mirExecTree body (.halted o), .refl _, ?_⟩
+      refine ⟨mirExecTree body (.halted o), .refl (fuel + 1) _, ?_⟩
       unfold mirExecTree
       rw [ITree.observe_cofix]
       rfl
@@ -600,13 +694,13 @@ theorem runMirSteps_halted_to_tauStar (body : CapturedMir) :
         rw [hStep] at h
         injection h with ho
         subst ho
-        refine ⟨mirExecTree body (.running s), .refl _, ?_⟩
+        refine ⟨mirExecTree body (.running s), .refl (fuel + 1) _, ?_⟩
         unfold mirExecTree
         rw [ITree.observe_cofix, hStep]
         rfl
       | tau next =>
         rw [hStep] at h
-        have ⟨u, hTau, hObs⟩ := runMirSteps_halted_to_tauStar body fuel next out h
+        have ⟨u, hTau, hObs⟩ := runMirSteps_halted_to_tauLeN body fuel next out h
         have hStepObs : (mirExecTree body (.running s)).observe = .tau (mirExecTree body next) := by
           unfold mirExecTree
           rw [ITree.observe_cofix, hStep]
@@ -618,88 +712,29 @@ theorem runMirSteps_halted_to_tauStar (body : CapturedMir) :
         | inl req => cases req; nomatch h
         | inr _ => nomatch h
 
-/-- Exact `TauStar` + `FaultNow` bridge for `.ub` faults: if
-`runMirSteps body fuel st = .faulted .ub`, then `mirExecTree body st` reduces via silent
-`.tau`s to `MirStepNode.fail .ub` (`.vis (.inl (.fail .ub)) PEmpty.elim`), proving
-`FaultNow (mirExecTree body st)`. -/
-theorem runMirSteps_ub_to_tauStar (body : CapturedMir) :
-    ∀ (fuel : Nat) (st : MirExecState),
-      runMirSteps body fuel st = .faulted .ub →
-      ∃ u : ITree MirEffect MirOutcome,
-        TauStar (mirExecTree body st) u ∧
-        u.observe = .vis (.inl (.fail .ub)) PEmpty.elim
-  | 0, st, h => by
-    cases st with
-    | running _ => nomatch h
-    | halted _ => nomatch h
-    | faulted fk =>
-      dsimp only [runMirSteps] at h
-      injection h with hfk
-      subst hfk
-      refine ⟨mirExecTree body (.faulted .ub), .refl _, ?_⟩
-      unfold mirExecTree
-      rw [ITree.observe_cofix]
-      dsimp only [stepMirState, MirStepNode.fail, ITreeF.map]
-      congr
-      funext o
-      exact PEmpty.elim o
-  | fuel + 1, st, h => by
-    cases st with
-    | halted _ => nomatch h
-    | faulted fk =>
-      dsimp only [runMirSteps] at h
-      injection h with hfk
-      subst hfk
-      refine ⟨mirExecTree body (.faulted .ub), .refl _, ?_⟩
-      unfold mirExecTree
-      rw [ITree.observe_cofix]
-      dsimp only [stepMirState, MirStepNode.fail, ITreeF.map]
-      congr
-      funext o
-      exact PEmpty.elim o
-    | running s =>
-      dsimp only [runMirSteps] at h
-      cases hStep : stepMirState body (.running s) with
-      | ret _ => rw [hStep] at h; nomatch h
-      | tau next =>
-        rw [hStep] at h
-        have ⟨u, hTau, hObs⟩ := runMirSteps_ub_to_tauStar body fuel next h
-        have hStepObs : (mirExecTree body (.running s)).observe = .tau (mirExecTree body next) := by
-          unfold mirExecTree
-          rw [ITree.observe_cofix, hStep]
-          rfl
-        exact ⟨u, .step hStepObs hTau, hObs⟩
-      | vis i k =>
-        rw [hStep] at h
-        cases i with
-        | inl req =>
-          cases req with
-          | fail fk =>
-            injection h with hfk
-            subst hfk
-            refine ⟨mirExecTree body (.running s), .refl _, ?_⟩
-            unfold mirExecTree
-            rw [ITree.observe_cofix, hStep]
-            dsimp only [ITreeF.map]
-            congr
-            funext o
-            exact PEmpty.elim o
-        | inr _ => nomatch h
+/-- Exact `TauStar` bridge for halted executions (corollary of `runMirSteps_halted_to_tauLeN`). -/
+theorem runMirSteps_halted_to_tauStar (body : CapturedMir)
+    (fuel : Nat) (st : MirExecState) (out : MirOutcome)
+    (h : runMirSteps body fuel st = .halted out) :
+    ∃ u : ITree MirEffect MirOutcome,
+      TauStar (mirExecTree body st) u ∧ u.observe = .ret out :=
+  let ⟨u, hLe, hObs⟩ := runMirSteps_halted_to_tauLeN body fuel st out h
+  ⟨u, hLe.toTauStar, hObs⟩
 
-/-- Exact `TauStar` characterization of EVERY `.faulted fk` result of `runMirSteps`
-(generalizing `runMirSteps_ub_to_tauStar`): `mirExecTree body st` reduces via silent `.tau`s
-to a node `u` that is either
+/-- Step-bounded (`≤ fuel`) `TauLeN` characterization of EVERY `.faulted fk` result of
+`runMirSteps`: `mirExecTree body st` reduces in at most `fuel` silent `.tau` steps to a node
+`u` that is either
 - the genuine fail node `.vis (.inl (.fail fk)) PEmpty.elim` emitted by `stepMirState`, or
 - (only when `fk = .unsupported`) a non-fault observation/call request `.vis (.inr e) k`
   that the fuel-bounded runner conservatively refuses to model, or
 - (only when `fk = .outOfFuel`) a still-running state that the runner truncated.
 So `runMirSteps` never fabricates a fault: every runner-introduced fault kind is
-precisely accounted for. -/
-theorem runMirSteps_faulted_to_tauStar (body : CapturedMir) :
+precisely accounted for within the `≤ fuel` step bound. -/
+theorem runMirSteps_faulted_to_tauLeN (body : CapturedMir) :
     ∀ (fuel : Nat) (st : MirExecState) (fk : FailureKind),
       runMirSteps body fuel st = .faulted fk →
       ∃ u : ITree MirEffect MirOutcome,
-        TauStar (mirExecTree body st) u ∧
+        TauLeN fuel (mirExecTree body st) u ∧
         (u.observe = .vis (.inl (.fail fk)) PEmpty.elim ∨
          (fk = .unsupported ∧ ∃ e k, u.observe = .vis (.inr e) k) ∨
          (fk = .outOfFuel ∧ ∃ s, u = mirExecTree body (.running s)))
@@ -709,13 +744,13 @@ theorem runMirSteps_faulted_to_tauStar (body : CapturedMir) :
       dsimp only [runMirSteps] at h
       injection h with hfk
       subst hfk
-      exact ⟨mirExecTree body (.running s), .refl _, .inr (.inr ⟨rfl, s, rfl⟩)⟩
+      exact ⟨mirExecTree body (.running s), .refl 0 _, .inr (.inr ⟨rfl, s, rfl⟩)⟩
     | halted _ => nomatch h
     | faulted fk' =>
       dsimp only [runMirSteps] at h
       injection h with hfk
       subst hfk
-      refine ⟨mirExecTree body (.faulted fk'), .refl _, .inl ?_⟩
+      refine ⟨mirExecTree body (.faulted fk'), .refl 0 _, .inl ?_⟩
       unfold mirExecTree
       rw [ITree.observe_cofix]
       dsimp only [stepMirState, MirStepNode.fail, ITreeF.map]
@@ -729,7 +764,7 @@ theorem runMirSteps_faulted_to_tauStar (body : CapturedMir) :
       dsimp only [runMirSteps] at h
       injection h with hfk
       subst hfk
-      refine ⟨mirExecTree body (.faulted fk'), .refl _, .inl ?_⟩
+      refine ⟨mirExecTree body (.faulted fk'), .refl (fuel + 1) _, .inl ?_⟩
       unfold mirExecTree
       rw [ITree.observe_cofix]
       dsimp only [stepMirState, MirStepNode.fail, ITreeF.map]
@@ -742,7 +777,7 @@ theorem runMirSteps_faulted_to_tauStar (body : CapturedMir) :
       | ret _ => rw [hStep] at h; nomatch h
       | tau next =>
         rw [hStep] at h
-        have ⟨u, hTau, hObs⟩ := runMirSteps_faulted_to_tauStar body fuel next fk h
+        have ⟨u, hTau, hObs⟩ := runMirSteps_faulted_to_tauLeN body fuel next fk h
         have hStepObs : (mirExecTree body (.running s)).observe = .tau (mirExecTree body next) := by
           unfold mirExecTree
           rw [ITree.observe_cofix, hStep]
@@ -756,7 +791,7 @@ theorem runMirSteps_faulted_to_tauStar (body : CapturedMir) :
           | fail fk' =>
             injection h with hfk
             subst hfk
-            refine ⟨mirExecTree body (.running s), .refl _, .inl ?_⟩
+            refine ⟨mirExecTree body (.running s), .refl (fuel + 1) _, .inl ?_⟩
             unfold mirExecTree
             rw [ITree.observe_cofix, hStep]
             dsimp only [ITreeF.map]
@@ -766,11 +801,49 @@ theorem runMirSteps_faulted_to_tauStar (body : CapturedMir) :
         | inr e =>
           injection h with hfk
           subst hfk
-          refine ⟨mirExecTree body (.running s), .refl _,
+          refine ⟨mirExecTree body (.running s), .refl (fuel + 1) _,
             .inr (.inl ⟨rfl, e, fun x => mirExecTree body (k x), ?_⟩)⟩
           unfold mirExecTree
           rw [ITree.observe_cofix, hStep]
           rfl
+
+/-- Step-bounded (`≤ fuel`) `TauLeN` + `FaultNow` bridge for `.ub` faults (corollary of
+`runMirSteps_faulted_to_tauLeN`). -/
+theorem runMirSteps_ub_to_tauLeN (body : CapturedMir)
+    (fuel : Nat) (st : MirExecState)
+    (h : runMirSteps body fuel st = .faulted .ub) :
+    ∃ u : ITree MirEffect MirOutcome,
+      TauLeN fuel (mirExecTree body st) u ∧
+      u.observe = .vis (.inl (.fail .ub)) PEmpty.elim := by
+  have ⟨u, hLe, hCase⟩ := runMirSteps_faulted_to_tauLeN body fuel st .ub h
+  rcases hCase with hObs | ⟨hEq, _⟩ | ⟨hEq, _⟩
+  · exact ⟨u, hLe, hObs⟩
+  · nomatch hEq
+  · nomatch hEq
+
+/-- Exact `TauStar` + `FaultNow` bridge for `.ub` faults (corollary of
+`runMirSteps_ub_to_tauLeN`). -/
+theorem runMirSteps_ub_to_tauStar (body : CapturedMir)
+    (fuel : Nat) (st : MirExecState)
+    (h : runMirSteps body fuel st = .faulted .ub) :
+    ∃ u : ITree MirEffect MirOutcome,
+      TauStar (mirExecTree body st) u ∧
+      u.observe = .vis (.inl (.fail .ub)) PEmpty.elim :=
+  let ⟨u, hLe, hObs⟩ := runMirSteps_ub_to_tauLeN body fuel st h
+  ⟨u, hLe.toTauStar, hObs⟩
+
+/-- Exact `TauStar` characterization of EVERY `.faulted fk` result of `runMirSteps`
+(corollary of `runMirSteps_faulted_to_tauLeN`). -/
+theorem runMirSteps_faulted_to_tauStar (body : CapturedMir)
+    (fuel : Nat) (st : MirExecState) (fk : FailureKind)
+    (h : runMirSteps body fuel st = .faulted fk) :
+    ∃ u : ITree MirEffect MirOutcome,
+      TauStar (mirExecTree body st) u ∧
+      (u.observe = .vis (.inl (.fail fk)) PEmpty.elim ∨
+       (fk = .unsupported ∧ ∃ e k, u.observe = .vis (.inr e) k) ∨
+       (fk = .outOfFuel ∧ ∃ s, u = mirExecTree body (.running s))) :=
+  let ⟨u, hLe, hCase⟩ := runMirSteps_faulted_to_tauLeN body fuel st fk h
+  ⟨u, hLe.toTauStar, hCase⟩
 
 /-- `.faulted .ub` from `runMirCall` implies `FaultNow (mirCallTree body args)`. -/
 theorem runMirCall_ub_faultNow {body : CapturedMir} {fuel : Nat}
@@ -896,6 +969,78 @@ theorem mirCallTree_toPartial_refines_ub {bImpl bSpec : CapturedMir} {fSpec : Na
     (mirCallTree bImpl argsImpl).toPartial ≤ (mirCallTree bSpec argsSpec).toPartial :=
   toPartial_le_of_faultNow (runMirCall_ub_faultNow hUb)
 
+private theorem halted_eq_of_mirExactOutcomeRefines {o₁ o₂ : MirOutcome}
+    (h : MirExactOutcomeRefines (classifyMirOutcomeExact (.halted o₁))
+      (classifyMirOutcomeExact (.halted o₂))) : o₁ = o₂ := by
+  cases o₁ with
+  | normal vm₁ =>
+    cases o₂ with
+    | normal vm₂ => exact congrArg Outcome.normal h
+    | abort => exact False.elim h
+    | panic => exact False.elim h
+  | abort =>
+    cases o₂ with
+    | abort => rfl
+    | normal _ => exact False.elim h
+    | panic => nomatch h
+  | panic =>
+    cases o₂ with
+    | panic => rfl
+    | normal _ => exact False.elim h
+    | abort => nomatch h
+
+/-- **General Operational Equivalence (Constructive Layer 1A `ITree.toPartial`)**:
+For ANY two settled `runMirCall` executions (`bSpec` and `bImpl`), strategy-exact outcome
+refinement `MirExactOutcomeRefines` holds *if and only if* their coinductive `mirCallTree`
+interpretations satisfy Layer 1A Smyth refinement `ITree.toPartial ≤`. -/
+theorem mirExactOutcomeRefines_iff_mirCallTree_toPartial_le
+    {bSpec bImpl : CapturedMir} {fSpec fImpl : Nat} {argsSpec argsImpl : List Value}
+    (hSpecSettled : SettledExec (runMirCall bSpec fSpec argsSpec))
+    (hImplSettled : SettledExec (runMirCall bImpl fImpl argsImpl)) :
+    MirExactOutcomeRefines
+      (classifyMirOutcomeExact (runMirCall bSpec fSpec argsSpec))
+      (classifyMirOutcomeExact (runMirCall bImpl fImpl argsImpl))
+      ↔ (mirCallTree bImpl argsImpl).toPartial ≤ (mirCallTree bSpec argsSpec).toPartial := by
+  generalize hS : runMirCall bSpec fSpec argsSpec = rSpec at hSpecSettled ⊢
+  generalize hI : runMirCall bImpl fImpl argsImpl = rImpl at hImplSettled ⊢
+  cases rSpec with
+  | running _ => exact False.elim hSpecSettled
+  | faulted fkS =>
+    cases fkS with
+    | unsupported => exact False.elim hSpecSettled
+    | outOfFuel => exact False.elim hSpecSettled
+    | ub =>
+      exact ⟨fun _ => mirCallTree_toPartial_refines_ub hS, fun _ => trivial⟩
+  | halted oSpec =>
+    have ⟨uS, hTauS, hObsS⟩ := runMirSteps_halted_to_tauStar bSpec fSpec _ oSpec hS
+    cases rImpl with
+    | running _ => exact False.elim hImplSettled
+    | faulted fkI =>
+      cases fkI with
+      | unsupported => exact False.elim hImplSettled
+      | outOfFuel => exact False.elim hImplSettled
+      | ub =>
+        constructor
+        · intro hRef
+          cases oSpec <;> exact False.elim hRef
+        · intro hLe
+          exact False.elim (not_toPartial_le_of_faultNow_ret (runMirCall_ub_faultNow hI) hTauS hObsS hLe)
+    | halted oImpl =>
+      have ⟨uI, hTauI, hObsI⟩ := runMirSteps_halted_to_tauStar bImpl fImpl _ oImpl hI
+      constructor
+      · intro hRef
+        have hEq := halted_eq_of_mirExactOutcomeRefines hRef
+        subst hEq
+        exact (mirCallTree_toPartial_equiv_of_same_halted hI hS).1
+      · intro hLe
+        have ⟨_, hSub⟩ := hLe (treeSafe_of_tauStar_ret hTauS hObsS)
+        have hRetI : ReachesRet (mirCallTree bImpl argsImpl) [] oImpl :=
+          (reachesRet_iff_of_tauStar_ret hTauI hObsI [] oImpl).2 ⟨rfl, rfl⟩
+        have hRetS : ReachesRet (mirCallTree bSpec argsSpec) [] oImpl := hSub ([], oImpl) hRetI
+        have hEq : oImpl = oSpec := ((reachesRet_iff_of_tauStar_ret hTauS hObsS [] oImpl).1 hRetS).2
+        subst hEq
+        exact mirExactOutcomeRefines_refl _
+
 /-! ### 2.1 Coinductive `Anneal.ITree.Eutt` & `WeakRef` Bridge Corollaries -/
 
 /-- `TauStar` to a `.ret out` node implies `Eutt t (ITree.ret out)`. -/
@@ -967,6 +1112,62 @@ theorem mirCallTree_weakRef_refines_ub {bImpl bSpec : CapturedMir} {fSpec : Nat}
     (hUb : runMirCall bSpec fSpec argsSpec = .faulted .ub) :
     WeakRef (mirCallTree bImpl argsImpl) (mirCallTree bSpec argsSpec) :=
   weakRef_of_faultNow (runMirCall_ub_faultNow hUb)
+
+/-- **General Operational Equivalence (Coinductive `Anneal.ITree.WeakRef`)**:
+For ANY two settled `runMirCall` executions (`bSpec` and `bImpl`), strategy-exact outcome
+refinement `MirExactOutcomeRefines` holds *if and only if* `WeakRef` holds between their
+coinductive `mirCallTree`s. -/
+theorem mirExactOutcomeRefines_iff_mirCallTree_weakRef
+    {bSpec bImpl : CapturedMir} {fSpec fImpl : Nat} {argsSpec argsImpl : List Value}
+    (hSpecSettled : SettledExec (runMirCall bSpec fSpec argsSpec))
+    (hImplSettled : SettledExec (runMirCall bImpl fImpl argsImpl)) :
+    MirExactOutcomeRefines
+      (classifyMirOutcomeExact (runMirCall bSpec fSpec argsSpec))
+      (classifyMirOutcomeExact (runMirCall bImpl fImpl argsImpl))
+      ↔ WeakRef (mirCallTree bImpl argsImpl) (mirCallTree bSpec argsSpec) := by
+  generalize hS : runMirCall bSpec fSpec argsSpec = rSpec at hSpecSettled ⊢
+  generalize hI : runMirCall bImpl fImpl argsImpl = rImpl at hImplSettled ⊢
+  cases rSpec with
+  | running _ => exact False.elim hSpecSettled
+  | faulted fkS =>
+    cases fkS with
+    | unsupported => exact False.elim hSpecSettled
+    | outOfFuel => exact False.elim hSpecSettled
+    | ub =>
+      exact ⟨fun _ => mirCallTree_weakRef_refines_ub hS, fun _ => trivial⟩
+  | halted oSpec =>
+    have ⟨uS, hTauS, hObsS⟩ := runMirSteps_halted_to_tauStar bSpec fSpec _ oSpec hS
+    cases rImpl with
+    | running _ => exact False.elim hImplSettled
+    | faulted fkI =>
+      cases fkI with
+      | unsupported => exact False.elim hImplSettled
+      | outOfFuel => exact False.elim hImplSettled
+      | ub =>
+        constructor
+        · intro hRef
+          cases oSpec <;> exact False.elim hRef
+        · intro hW
+          exact False.elim (not_weakRef_of_faultNow_ret (runMirCall_ub_faultNow hI) hTauS hObsS hW)
+    | halted oImpl =>
+      have ⟨uI, hTauI, hObsI⟩ := runMirSteps_halted_to_tauStar bImpl fImpl _ oImpl hI
+      constructor
+      · intro hRef
+        have hEq := halted_eq_of_mirExactOutcomeRefines hRef
+        subst hEq
+        exact (mirCallTree_weakRef_equiv_of_same_halted hI hS).1
+      · intro hW
+        rw [WeakRef.eq_def] at hW
+        have ⟨_, hRetSim, _⟩ := hW (not_faultNow_of_tauStar_ret hTauS hObsS)
+        have ⟨b', hsb', hb'r⟩ := hRetSim uI oImpl hTauI hObsI
+        have hU : uS = b' :=
+          TauStar.unique_nonTau hTauS hsb'
+            (fun _ hw => by rw [hObsS] at hw; nomatch hw)
+            (fun _ hw => by rw [hb'r] at hw; nomatch hw)
+        rw [hU, hb'r] at hObsS
+        injection hObsS with hEq
+        subst hEq
+        exact mirExactOutcomeRefines_refl _
 
 /-! ## 3. Canonical `CapturedMir` Arithmetic Bodies & Exact `stepMirState` Evaluation -/
 
@@ -2371,51 +2572,12 @@ theorem checked_add_scaled_weakRef_unchecked_of_farkas_cert
 
 `.unsupported` is a top element of `MirOutcomeRefines` (like `.ub`), so a fuel-truncated
 (`.outOfFuel`), still-`.running`, unmodeled (`.unsupported`), or strategy-mismatched trap on the
-SPEC side would make a refinement claim hold vacuously. This section proves that this NEVER
-happens for any canonical body: every canonical run classifies to a non-`.unsupported` outcome
-under its own panic strategy, for ALL inputs, and is therefore *settled* (a genuine halting
-outcome or a genuine `.ub` fault). Settled runs are fuel-independent, so every refinement
-theorem above holds verbatim at ANY fuel at least the canonical step count. -/
-
-/-- A `MirExecState` is *settled* when it is a genuine halting outcome or a genuine UB fault
-(never an `.outOfFuel` truncation, an `.unsupported` boundary, or a still-`.running` state). -/
-def SettledExec : MirExecState → Prop
-  | .halted _ => True
-  | .faulted .ub => True
-  | _ => False
-
-/-- A non-`.unsupported` classification under ANY strategy implies the state is settled. -/
-theorem settledExec_of_classify_ne_unsupported {strat : PanicStrategy} {st : MirExecState}
-    (h : classifyMirExecState strat st ≠ .unsupported) : SettledExec st := by
-  cases st with
-  | halted _ => trivial
-  | running _ => exact False.elim (h rfl)
-  | faulted fk =>
-    cases fk with
-    | ub => trivial
-    | unsupported => exact False.elim (h rfl)
-    | outOfFuel => exact False.elim (h rfl)
-
-/-- Settled `runMirSteps` results are invariant under additional fuel. -/
-theorem runMirSteps_settled_mono (body : CapturedMir) (fuel extra : Nat) (st : MirExecState)
-    (h : SettledExec (runMirSteps body fuel st)) :
-    runMirSteps body (fuel + extra) st = runMirSteps body fuel st := by
-  generalize hR : runMirSteps body fuel st = r at h ⊢
-  cases r with
-  | halted o => exact runMirSteps_halted_mono body fuel extra st o hR
-  | running _ => exact False.elim h
-  | faulted fk =>
-    cases fk with
-    | ub => exact runMirSteps_ub_mono body fuel extra st hR
-    | unsupported => exact False.elim h
-    | outOfFuel => exact False.elim h
-
-/-- Settled `runMirCall` results are identical at every larger fuel `fuel' ≥ fuel`. -/
-theorem runMirCall_fuel_stable {body : CapturedMir} {fuel fuel' : Nat} {args : List Value}
-    (hle : fuel ≤ fuel') (h : SettledExec (runMirCall body fuel args)) :
-    runMirCall body fuel' args = runMirCall body fuel args := by
-  obtain ⟨extra, rfl⟩ := Nat.exists_eq_add_of_le hle
-  exact runMirSteps_settled_mono body fuel extra _ h
+SPEC side would make a refinement claim hold vacuously. Using `SettledExec` and
+`runMirCall_fuel_stable` from Section 2, this section proves that this NEVER happens for any
+canonical body: every canonical run classifies to a non-`.unsupported` outcome under its own
+panic strategy, for ALL inputs, and is therefore *settled* (a genuine halting outcome or a
+genuine `.ub` fault). Settled runs are fuel-independent, so every refinement theorem above holds
+verbatim at ANY fuel at least the canonical step count. -/
 
 private theorem classify_ret_ne_unsupported (strat : PanicStrategy) (v : Value) (m : Memory) :
     classifyMirExecState strat (.halted (.normal (v, m))) ≠ .unsupported :=
@@ -2602,7 +2764,7 @@ theorem unchecked_sub_refines_to_checked_of_fuel (u : UintTy) (strat : PanicStra
       runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hNV.1)]
   exact (unchecked_sub_refines_to_checked u strat a b ha hb).1
 
-/-! ## 6. Explicit Non-Vacuous Negative Soundness Theorems (15 Theorems) -/
+/-! ## 6. Explicit Non-Vacuous Negative Soundness Theorems (17 Theorems) -/
 
 /-- Negative Soundness #1: a deterministic trap never refines a normal return. -/
 theorem trap_not_refines_ret {Val : Type} (v : Val) :
@@ -2856,6 +3018,63 @@ theorem checked_add_scaled_overflow_not_refines_unchecked (strat : PanicStrategy
   have hU := runMirCall_unchecked_add_scaled_ub .u8 4 200 20 hOv
   have ⟨uC, hTauC, hObsC⟩ := runMirSteps_halted_to_tauStar _ 13 _ _ hC
   refine ⟨hC, hU, ?_, ?_⟩
+  · rw [hC, hU, classify_trapOutcome_eq strat]
+    exact trap_not_refines_ub
+  · exact not_toPartial_le_of_faultNow_ret (runMirCall_ub_faultNow hU) hTauC hObsC
+
+/-- Negative Soundness #16: tightness of the LHS range hypothesis `ha : a < 2^w` in
+`checked_sub_refines_unchecked_iff`. On `u8` with `a = 300 ≥ 256` and `b = 10`, `b ≤ a` holds,
+yet `subWithOverflow` wraps `300 - 10 = 290` to `34` with `ov = false` and returns `34`, whereas
+`subUnchecked` checks `256 ≤ 290` and faults `.ub`. Hence `¬ (checked_sub ⊑ unchecked_sub)` and
+`¬ toPartial ≤`, proving the range hypothesis (or certified range proof) is strictly necessary. -/
+theorem checked_sub_out_of_range_lhs_not_refines_unchecked (strat : PanicStrategy) :
+    10 ≤ 300 ∧
+    runMirCall (mkCheckedArithBody .u8 .sub strat.toUnwindAction) 6 (uintArgs2 .u8 300 10) =
+      .halted (.normal (.scalar ⟨34, 1⟩, canonInitMemory)) ∧
+    runMirCall (mkUncheckedArithBody .u8 .sub) 2 (uintArgs2 .u8 300 10) = .faulted .ub ∧
+    ¬ MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody .u8 .sub strat.toUnwindAction) 6 (uintArgs2 .u8 300 10)))
+      (classifyMirExecState strat
+        (runMirCall (mkUncheckedArithBody .u8 .sub) 2 (uintArgs2 .u8 300 10))) ∧
+    ¬ ((mirCallTree (mkUncheckedArithBody .u8 .sub) (uintArgs2 .u8 300 10)).toPartial ≤
+       (mirCallTree (mkCheckedArithBody .u8 .sub strat.toUnwindAction)
+         (uintArgs2 .u8 300 10)).toPartial) := by
+  have hC : runMirCall (mkCheckedArithBody .u8 .sub strat.toUnwindAction) 6 (uintArgs2 .u8 300 10) =
+      .halted (.normal (.scalar ⟨34, 1⟩, canonInitMemory)) := by
+    cases strat <;> rfl
+  have hU : runMirCall (mkUncheckedArithBody .u8 .sub) 2 (uintArgs2 .u8 300 10) =
+      .faulted .ub := rfl
+  have ⟨uC, hTauC, hObsC⟩ := runMirSteps_halted_to_tauStar _ 6 _ _ hC
+  refine ⟨Nat.le_of_ble_eq_true rfl, hC, hU, ?_, ?_⟩
+  · rw [hC, hU]
+    exact ret_not_refines_ub _
+  · exact not_toPartial_le_of_faultNow_ret (runMirCall_ub_faultNow hU) hTauC hObsC
+
+/-- Negative Soundness #17: inner-multiplication failure site of composite `add_scaled`
+(`a + 4 * b`) on `u8` (`a = 1, b = 70`, where the inner product `4 * 70 = 280 ≥ 256` overflows
+at `bb0` BEFORE `bb1`'s outer addition is ever reached): checked traps at `bb0`'s assert,
+unchecked faults `.ub` at `bb0`'s `mulUnchecked`, so `¬ (checked ⊑ unchecked)` and
+`¬ toPartial ≤`. Complements #15 (which triggers the outer-add failure site in `bb1`). -/
+theorem checked_add_scaled_inner_mul_overflow_not_refines_unchecked (strat : PanicStrategy) :
+    modPow2 (uintWidth .u8) ≤ 4 * 70 ∧
+    runMirCall (mkCheckedAddScaledBody .u8 4 strat.toUnwindAction) 13 (uintArgs2 .u8 1 70) =
+      .halted strat.toTrapOutcome ∧
+    runMirCall (mkUncheckedAddScaledBody .u8 4) 5 (uintArgs2 .u8 1 70) = .faulted .ub ∧
+    ¬ MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedAddScaledBody .u8 4 strat.toUnwindAction) 13 (uintArgs2 .u8 1 70)))
+      (classifyMirExecState strat
+        (runMirCall (mkUncheckedAddScaledBody .u8 4) 5 (uintArgs2 .u8 1 70))) ∧
+    ¬ ((mirCallTree (mkUncheckedAddScaledBody .u8 4) (uintArgs2 .u8 1 70)).toPartial ≤
+       (mirCallTree (mkCheckedAddScaledBody .u8 4 strat.toUnwindAction)
+         (uintArgs2 .u8 1 70)).toPartial) := by
+  have hInnerOv : modPow2 (uintWidth .u8) ≤ 4 * 70 := Nat.le_of_ble_eq_true rfl
+  have hOv : modPow2 (uintWidth .u8) ≤ 1 + 4 * 70 := Nat.le_of_ble_eq_true rfl
+  have hC := runMirCall_checked_add_scaled_trap .u8 4 strat 1 70 hOv
+  have hU := runMirCall_unchecked_add_scaled_ub .u8 4 1 70 hOv
+  have ⟨uC, hTauC, hObsC⟩ := runMirSteps_halted_to_tauStar _ 13 _ _ hC
+  refine ⟨hInnerOv, hC, hU, ?_, ?_⟩
   · rw [hC, hU, classify_trapOutcome_eq strat]
     exact trap_not_refines_ub
   · exact not_toPartial_le_of_faultNow_ret (runMirCall_ub_faultNow hU) hTauC hObsC
