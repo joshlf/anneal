@@ -57,7 +57,12 @@ onto unmodified `Trusted.Rustc.V2026_06_01.MirSemantics` via `v2026Step`,
    unmodified trusted tree (`reaches_mirTree_of_stepsToV2026`,
    `not_mirNoUBTree_of_stepsTo_fault_fail`) and a concrete external-call vs
    linked-callee multi-frame canary
-   (`canary_stepBoundV2026_extCall_vs_linked_callee`).
+   (`canary_stepBoundV2026_extCall_vs_linked_callee`); and *exact call-free
+   partial-correctness completeness* of all-fuel strict WLP
+   (`partialCorrectness_iff_forall_execWlpStateV2026`,
+   `verificationResult_iff_forall_wlpProgStrictV2026`,
+   `statefulVerificationResult_iff_forall_wlpStateV2026`) under
+   `NoExtCallReachV2026`.
 -/
 
 namespace Anneal.StepBound
@@ -2172,6 +2177,136 @@ theorem not_statefulVerificationResult_of_stepsTo_done_normal_fail
   let ⟨_, hVal⟩ := hV.proof args mem hPre
   exact hNotPost (hVal (tr, .normal (retVal, mem')) hRet hPre retVal mem' rfl)
 
+/-! ### Exact Partial-Correctness Completeness of Strict WLP (Call-Free) -/
+
+/-- No external call is reachable from `s` along `v2026Step body`. -/
+def NoExtCallReachV2026 (body : CapturedMir) (s : MachineState) : Prop :=
+  ∀ (k : Nat) (s' : MachineState) (req : MirCallReq),
+    StepsToV2026 body k s s' → v2026Step body s' ≠ .fault (.extCall req)
+
+/-- Exact completeness of all-fuel strict WLP against trusted partial
+correctness: if the unmodified `mirTree body s` is `TreeSafe`, every reachable
+return satisfies `post`, and no external call is reachable, then strict
+deterministic WLP holds at EVERY fuel (`{propext, Quot.sound}` only). -/
+theorem forall_execWlpStateV2026_of_partialCorrectness {body : CapturedMir}
+    {post : MirOutcome → Prop} :
+    ∀ (fuel : Nat) {s : MachineState},
+      Trusted.ITree.TreeSafe (mirTree body s) →
+      (∀ tr out, Trusted.ITree.ReachesRet (mirTree body s) tr out → post out) →
+      NoExtCallReachV2026 body s →
+      execWlpStateV2026 body fuel s post
+  | 0, _, _, _, _ => trivial
+  | fuel + 1, s, hSafe, hRet, hNoCall => by
+    dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome]
+    rw [execWlpStepPred_succ_iff]
+    cases hS : v2026Step body s with
+    | step s' =>
+      have h1 : StepsToV2026 body 1 s s' := StepsToV2026.single hS
+      obtain ⟨tr₀, hR₀⟩ := reaches_mirTree_of_stepsToV2026 h1
+      exact forall_execWlpStateV2026_of_partialCorrectness fuel
+        (fun tr u hR hF => hSafe _ u (reaches_trans_v2026 hR₀ hR) hF)
+        (fun tr out ⟨u, hR, hO⟩ =>
+          hRet _ out ⟨u, reaches_trans_v2026 hR₀ hR, hO⟩)
+        (fun k s'' req hSteps =>
+          hNoCall (k + 1) s'' req (StepsToV2026.step hS hSteps))
+    | done out =>
+      obtain ⟨tr, hR⟩ := reachesRet_mirTree_of_stepsTo_done (StepsToV2026.refl s) hS
+      exact hRet tr out hR
+    | fault f =>
+      cases f with
+      | fail fk =>
+        exact not_mirNoUBTree_of_stepsTo_fault_fail (StepsToV2026.refl s) hS hSafe
+      | extCall req => exact hNoCall 0 s req (StepsToV2026.refl s) hS
+      | stuck => exact v2026Step_never_stuck body s hS
+
+/-- Exact call-free characterization of trusted partial correctness:
+`TreeSafe (mirTree body s) ∧ (ReachesRet → post)` iff strict deterministic WLP
+holds at every fuel. -/
+theorem partialCorrectness_iff_forall_execWlpStateV2026 {body : CapturedMir}
+    {post : MirOutcome → Prop} {s : MachineState}
+    (hNoCall : NoExtCallReachV2026 body s) :
+    (Trusted.ITree.TreeSafe (mirTree body s) ∧
+      ∀ tr out, Trusted.ITree.ReachesRet (mirTree body s) tr out → post out) ↔
+    ∀ fuel : Nat, execWlpStateV2026 body fuel s post :=
+  ⟨fun ⟨hSafe, hRet⟩ fuel =>
+      forall_execWlpStateV2026_of_partialCorrectness fuel hSafe hRet hNoCall,
+   fun h => ⟨treeSafe_mirTree_of_forall_execWlpStateV2026 h,
+     reachesRet_post_of_forall_execWlpStateV2026 h⟩⟩
+
+/-- Certificate-level completeness: every call-free stateless
+`VerificationResult c` is derivable from `wlpProgStrictV2026` at every fuel
+(converse of `verifyMirSafe_of_forall_wlpProgStrictV2026`). -/
+theorem forall_wlpProgStrictV2026_of_verificationResult (c : Claim)
+    (hV : VerificationResult c)
+    (hNoCall : ∀ args : List Value, c.pre args →
+      NoExtCallReachV2026 c.body
+        (initMachineStateWithCallees c.body args c.callees)) :
+    ∀ args : List Value, c.pre args → ∀ fuel : Nat,
+      wlpProgStrictV2026 c.body fuel args c.callees
+        (mirSafePost (fun retVal _ => c.post args retVal)) := by
+  intro args hPre fuel
+  refine wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
+    (forall_execWlpStateV2026_of_partialCorrectness fuel
+      (hV.proof args hPre).1 (fun tr out hR => ?_) (hNoCall args hPre))
+  cases out with
+  | normal p =>
+    exact (hV.proof args hPre).2 (tr, .normal p) hR hPre p.1 p.2 rfl
+  | panic => exact trivial
+  | abort => exact trivial
+
+/-- Exact call-free certificate characterization: a stateless claim with no
+reachable external call holds iff `wlpProgStrictV2026` holds at every fuel on
+every admissible input. -/
+theorem verificationResult_iff_forall_wlpProgStrictV2026 (c : Claim)
+    (hNoCall : ∀ args : List Value, c.pre args →
+      NoExtCallReachV2026 c.body
+        (initMachineStateWithCallees c.body args c.callees)) :
+    VerificationResult c ↔
+      ∀ args : List Value, c.pre args → ∀ fuel : Nat,
+        wlpProgStrictV2026 c.body fuel args c.callees
+          (mirSafePost (fun retVal _ => c.post args retVal)) :=
+  ⟨fun hV => forall_wlpProgStrictV2026_of_verificationResult c hV hNoCall,
+   verifyMirSafe_of_forall_wlpProgStrictV2026 c⟩
+
+/-- Stateful certificate-level completeness: every call-free
+`StatefulVerificationResult c` is derivable from strict WLP at every fuel
+(converse of `verifyStatefulMirSafe_of_forall_wlpStateV2026`). -/
+theorem forall_wlpStateV2026_of_statefulVerificationResult (c : StatefulClaim)
+    (hV : StatefulVerificationResult c)
+    (hNoCall : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      NoExtCallReachV2026 c.body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees)) :
+    ∀ (args : List Value) (mem : Memory), c.pre args mem → ∀ fuel : Nat,
+      wlpStateV2026 c.body fuel
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees)
+        (mirSafePost (c.post args mem)) := by
+  intro args mem hPre fuel
+  refine wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
+    (forall_execWlpStateV2026_of_partialCorrectness fuel
+      (hV.proof args mem hPre).1 (fun tr out hR => ?_) (hNoCall args mem hPre))
+  cases out with
+  | normal p =>
+    exact (hV.proof args mem hPre).2 (tr, .normal p) hR hPre p.1 p.2 rfl
+  | panic => exact trivial
+  | abort => exact trivial
+
+/-- Exact call-free stateful certificate characterization. -/
+theorem statefulVerificationResult_iff_forall_wlpStateV2026 (c : StatefulClaim)
+    (hNoCall : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      NoExtCallReachV2026 c.body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees)) :
+    StatefulVerificationResult c ↔
+      ∀ (args : List Value) (mem : Memory), c.pre args mem → ∀ fuel : Nat,
+        wlpStateV2026 c.body fuel
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
+          (mirSafePost (c.post args mem)) :=
+  ⟨fun hV => forall_wlpStateV2026_of_statefulVerificationResult c hV hNoCall,
+   verifyStatefulMirSafe_of_forall_wlpStateV2026 c⟩
+
 /-! ## Part V: Concrete `V2026_06_01` Tight-Budget & Refutation Canaries -/
 
 /-- Minimal 1-block `CapturedMir` whose `bb0` faults immediately with
@@ -2832,5 +2967,31 @@ theorem canary_stepBoundV2026_certificate_refutations_and_exists_ret :
             hDone3 rfl))
     exact wlpOutcomeV2026_of_stepStageCut (StepsToV2026.to_stepStageCut hSteps3) hDoneWlp
   exact ⟨hNoFaultCert, hNoBadCert, hExistsRet, hWlpCut⟩
+
+/-- Non-vacuity canary for the `NoExtCallReachV2026` side condition of the
+exact completeness theorems: it holds for the self-looping
+`canaryDivergingMirBody` and FAILS for the unlinked `canaryCallerMir` (whose
+first step is a genuine external call). -/
+theorem canary_stepBoundV2026_noExtCallReach :
+    NoExtCallReachV2026 canaryDivergingMirBody
+      (initMachineState canaryDivergingMirBody []) ∧
+    ¬ NoExtCallReachV2026 canaryCallerMir (initMachineState canaryCallerMir []) := by
+  have hStep : v2026Step canaryDivergingMirBody
+      (initMachineState canaryDivergingMirBody []) =
+      .step (initMachineState canaryDivergingMirBody []) := rfl
+  have hSelf : ∀ k : Nat, StepsToV2026 canaryDivergingMirBody k
+      (initMachineState canaryDivergingMirBody [])
+      (initMachineState canaryDivergingMirBody []) := by
+    intro k
+    induction k with
+    | zero => exact StepsToV2026.refl _
+    | succ k ih => exact StepsToV2026.step hStep ih
+  refine ⟨fun k s' req hSteps hExt => ?_, fun hN => ?_⟩
+  · have hEq := StepsToV2026.deterministic hSteps (hSelf k)
+    rw [hEq, hStep] at hExt
+    cases hExt
+  · obtain ⟨req, hExt⟩ : ∃ req, v2026Step canaryCallerMir
+        (initMachineState canaryCallerMir []) = .fault (.extCall req) := ⟨_, rfl⟩
+    exact hN 0 _ req (StepsToV2026.refl _) hExt
 
 end Anneal.StepBound
