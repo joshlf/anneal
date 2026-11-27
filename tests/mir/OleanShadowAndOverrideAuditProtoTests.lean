@@ -704,6 +704,7 @@ targets the root of `Init.olean`. They are valid only relative to that parent re
 info: PASS T15b empty Init.olean.server layer accepted against its parent region
 PASS T15b the same layer without parent regions fails closed
 PASS T15b a root outside every parent region is rejected
+PASS T15b non-96-byte payload or non-root interior parent pointer rejected
 PASS T15b all five parts of the real Init module pass the chained validation
 -/
 #guard_msgs in
@@ -712,13 +713,23 @@ PASS T15b all five parts of the real Init module pass the chained validation
   let parent ← IO.FS.readBinFile (lib / "Init.olean")
   let some pInfo := (validateOleanBinaryBytes parent).toOption | throw (IO.userError "parent failed")
   let srv ← IO.FS.readBinFile (lib / "Init.olean.server")
-  let chained : OleanHeaderConfig := { allowParentRegionPtrs := true, parentRegions := #[(pInfo.baseAddr, pInfo.fileSize)] }
+  let chained : OleanHeaderConfig := {
+    allowParentRegionPtrs := true,
+    parentRegions := #[(pInfo.baseAddr, pInfo.fileSize)],
+    parentRoots := #[pInfo.rootPtr] }
   expect "T15b empty Init.olean.server layer accepted against its parent region"
     ((validateOleanBinaryBytes srv chained) matches .ok _)
   expect "T15b the same layer without parent regions fails closed"
     (isErr (validateOleanBinaryBytes srv { allowParentRegionPtrs := true }) (· matches .rootOutOfBounds _))
   expect "T15b a root outside every parent region is rejected"
     (isErr (validateOleanBinaryBytes (setLE64 srv 88 (pInfo.baseAddr + pInfo.fileSize + 64)) chained) (· matches .rootOutOfBounds _))
+  -- B4-1 regression: reject >96-byte delta layer carrying unvalidated payload while re-rooting in parent,
+  -- and reject 96-byte delta layer pointing to an interior non-root offset `pInfo.baseAddr + 128`!
+  let paddedSrv := srv ++ ByteArray.mk #[0, 0, 0, 0, 0, 0, 0, 0]
+  let interiorRootSrv := setLE64 srv 88 (pInfo.baseAddr + 128)
+  expect "T15b non-96-byte payload or non-root interior parent pointer rejected"
+    (isErr (validateOleanBinaryBytes paddedSrv chained) (· matches .rootOutOfBounds _) &&
+     isErr (validateOleanBinaryBytes interiorRootSrv chained) (· matches .rootOutOfBounds _))
   let ((), s) ← AuditM.run' (auditOleanResolutionAndShadowing #[`Init]
     { sysrootLibDir := lib, approvedBuildRoots := #[], searchPath? := some [lib], validateToolchainBinaries := true })
   expect "T15b all five parts of the real Init module pass the chained validation"
@@ -852,6 +863,7 @@ PASS T18 hook tagged_return
 PASS T18 custom @[macro_inline] BareInd.ctorIdx is not exempted
 PASS T18 live foreign noConfusion tag, scoped csimp, and tampered PassManager caught
 PASS T18 forged specialization cache entries (foreign target, kernel target, mismatched key) caught
+PASS T18 IR-only specCacheExt forgery, ShareCommon key, and cross-phase IR body tampering caught
 PASS T18 module-system @[tagged_return] caught at declaration granularity
 -/
 #guard_msgs in
@@ -906,6 +918,23 @@ PASS T18 module-system @[tagged_return] caught at declaration granularity
      (sSpecK.violations.any fun v => v.kind == .compilerOverrideHook && v.decl == ``V4Hook.fastF) &&
      (sSpecKey.violations.any fun v => v.kind == .compilerOverrideHook && v.decl == fakeExtra))
     s!"{renderAll sSpecF.violations} | {renderAll sSpecK.violations} | {renderAll sSpecKey.violations}"
+  -- B4-3 regression: (1) IR-only `fakeExtra` whose key head *matches* `Nat.add` (caught because
+  -- `baseExt`/`monoExt` are missing), (2) `ShareCommon` constant inside `specCacheExt` key, and
+  -- (3) cross-phase `SimpleRet` tampering (`V4Hook.fastF` returns `param 0` in kernel, tampered IR returns literal `99`)!
+  let ((), sSpecIrOnly) := (validateSpecCacheEntry ctxIr main {} (NameSet.empty.insert fakeExtra)
+    { key := mkConst ``Nat.add, declName := fakeExtra }).run {}
+  let ((), sSpecScKey) := (validateSpecCacheEntry ctxIr main {} (NameSet.empty.insert fakeExtra)
+    { key := mkApp (mkConst ``Nat.add) (mkConst `ShareCommon.shareCommon'), declName := fakeExtra }).run {}
+  let tamperedIrBody : IR.FnBody := .vdecl ⟨1⟩ .object (.lit (.num 99)) (.ret (.var ⟨1⟩))
+  let envBadIr := IR.declMapExt.addEntry env (.fdecl ``V4Hook.fastF #[{ x := ⟨0⟩, borrow := false, ty := .object }] .object tamperedIrBody {})
+  let ((), sCross) ← AuditM.run' do
+    let ctxC ← mkAuditContext envBadIr lib (some main)
+    auditCompilerHooks ctxC (← nonToolchainViews ctxC)
+  expect "T18 IR-only specCacheExt forgery, ShareCommon key, and cross-phase IR body tampering caught"
+    ((sSpecIrOnly.violations.any fun v => v.kind == .compilerOverrideHook && v.decl == fakeExtra) &&
+     (sSpecScKey.violations.any fun v => v.kind == .shareCommonReference && v.decl == fakeExtra) &&
+     (sCross.violations.any fun v => v.kind == .compilerOverrideHook && v.decl == ``V4Hook.fastF && v.detail.startsWith "cross_phase_body"))
+    s!"{renderAll sSpecIrOnly.violations} | {renderAll sSpecScKey.violations} | {renderAll sCross.violations}"
   -- B3 regression: module-system file with `@[tagged_return, extern]` caught at exact declaration `modTaggedFn`
   let sModTag ← withTmpDir fun dir => do
     let src := "module\n@[tagged_return, extern \"mod_tag_c\"] public opaque modTaggedFn : Nat → Nat\n"
@@ -1083,6 +1112,7 @@ PASS T21 tampered-githash toolchain boundary import rejected before importModule
 PASS T21 transitive Init.Bridge -> Planted sysroot escape caught
 PASS T21 symlinked toolchain companion (.olean.private) rejected before importModules
 PASS T21 corrupted toolchain companion (.ir) header rejected before importModules
+PASS T21 2-hop transitive toolchain companion tampering rejected before importModules
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -1132,7 +1162,8 @@ PASS T21 corrupted toolchain companion (.ir) header rejected before importModule
     expect "T21 tampered-githash toolchain boundary import rejected before importModules"
       (sHdr.importMs == 0 && sHdr.violations.any fun v => v.kind == .oleanHeaderInvalid && v.decl == `Init.Fake)
       (renderAll sHdr.violations)
-    -- B2-2b regression: valid-header `Init.Bridge` in `fakeSys` transitively importing `Planted`
+    -- B2-2b & B4-2 regression: valid-header `Init.Bridge` in `fakeSys` transitively importing `Planted`
+    -- is now caught *before* `importModules` (`importMs == 0 && modulesChecked == 0`)!
     let _ ← compileModule fakeSys `Init.Bridge "prelude\nimport Init.Prelude\nimport Planted\ndef br : Nat := plantedVal\n" (some s!"{fakeSys}:{lib}")
     IO.FS.removeFile (fakeSys / "Init" / "Bridge.lean")
     let buildBr := dir / "buildBr"
@@ -1141,7 +1172,8 @@ PASS T21 corrupted toolchain companion (.ir) header rejected before importModule
     IO.FS.removeFile (buildBr / "UseBridge.lean")
     let ((), sBr) ← AuditM.run' (auditBuildLibrary buildBr fakeSys {} (some #[`UseBridge]))
     expect "T21 transitive Init.Bridge -> Planted sysroot escape caught"
-      (sBr.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Planted)
+      (sBr.importMs == 0 && sBr.modulesChecked == 0 &&
+       sBr.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Planted)
       (renderAll sBr.violations)
     -- A3 regression: the `.olean` of a directly imported toolchain module is fine, but a companion
     -- part that `importModules` also reads is a symlink out of the sysroot / has a corrupted header.
@@ -1177,6 +1209,22 @@ PASS T21 corrupted toolchain companion (.ir) header rejected before importModule
       (sIr.importMs == 0 && sIr.modulesChecked == 0 &&
        sIr.violations.any fun v => v.kind == .oleanHeaderInvalid && v.decl == `Init.Prelude)
       (renderAll sIr.violations)
+    -- B4-2 regression: 2-hop transitive toolchain companion tampering (`UseHop -> Init.Hop -> Init.Prelude`,
+    -- where `Init.Hop` is clean and `Init/Prelude.olean.private` has a forged githash)!
+    let sysHop ← mkSys "sysHop"
+    let _ ← compileModule sysHop `Init.Hop "prelude\nimport Init.Prelude\ndef hopVal : Nat := 1\n" (some s!"{sysHop}:{lib}")
+    IO.FS.removeFile (sysHop / "Init" / "Hop.lean")
+    let buildHop := dir / "buildHop"
+    IO.FS.createDirAll buildHop
+    let _ ← compileModule buildHop `UseHop "prelude\nimport Init.Hop\ndef uh : Nat := hopVal\n" (some s!"{buildHop}:{sysHop}:{lib}")
+    IO.FS.removeFile (buildHop / "UseHop.lean")
+    let hopPriv := sysHop / "Init" / "Prelude.olean.private"
+    IO.FS.writeBinFile hopPriv (setByte (← IO.FS.readBinFile hopPriv) 41 0x61)
+    let ((), sHop) ← AuditM.run' (auditBuildLibrary buildHop sysHop {} (some #[`UseHop]))
+    expect "T21 2-hop transitive toolchain companion tampering rejected before importModules"
+      (sHop.importMs == 0 && sHop.modulesChecked == 0 &&
+       sHop.violations.any fun v => v.kind == .oleanHeaderInvalid && v.decl == `Init.Prelude)
+      (renderAll sHop.violations)
 
 /-! ## T22: large whole-module audits screen theorem bodies in every mode (A2 regression)
 
@@ -1192,6 +1240,7 @@ info: PASS T22 large-audit path, structural scan on: sorryAx in a compiled theor
 PASS T22 large-audit path, constant-only screen: sorryAx in a compiled theorem body caught
 PASS T22 large-audit path, theorem bodies excluded from find?: still caught by the constant screen
 PASS T22 constant-only screen with theoremBodies=false catches ShareCommon without running Layer A find?
+PASS T22 large-audit path catches Lean.reduceBool -> Lean.trustCompiler and classifies referenced local axioms
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -1214,6 +1263,46 @@ PASS T22 constant-only screen with theoremBodies=false catches ShareCommon witho
     expect "T22 constant-only screen with theoremBodies=false catches ShareCommon without running Layer A find?"
       (sSc.violations.any fun v => v.kind == .shareCommonReference && v.decl == `usesSc)
       (renderAll sSc.violations)
+    -- B4-4 regression: on the large-audit path (`implicitClosureMaxConsts = 0`), `Lean.reduceBool`
+    -- pulls in `Lean.trustCompiler` and a referenced local axiom is classified as `referencedUnapprovedAxiom`!
+    let _ ← compileModule dir `LargeNativeAndLocal
+      "set_option linter.deprecated false in\ndef sneakRb : Bool := Lean.reduceBool true\naxiom localAx : False\ntheorem useLocalAx : False := localAx\n"
+    let envLn ← importWith dir #[`LargeNativeAndLocal]
+    let sLnFast ← auditImported envLn { axioms := big, runStructuralOpaqueScan := false } dir
+    expect "T22 large-audit path catches Lean.reduceBool -> Lean.trustCompiler and classifies referenced local axioms"
+      ((sLnFast.violations.any fun v => v.kind == .referencedUnapprovedAxiom && v.decl == ``Lean.trustCompiler) &&
+       (sLnFast.violations.any fun v => v.kind == .referencedUnapprovedAxiom && v.decl == `localAx))
+      (renderAll sLnFast.violations)
+
+/-! ## T23: Vector 1 phantom `isRealizedAuxOfForeign` & live compiler-extension `_private` targets (B4 regression) -/
+
+/--
+info: PASS T23 phantom non-existent name cannot spoof foreign realized .eq_1 auxiliary
+PASS T23 live ConstantFold and passManagerExt _private spoof targets rejected
+-/
+#guard_msgs in
+#eval show CoreM Unit from do
+  let env ← getEnv
+  let main := env.mainModule
+  let lib ← sysLib
+  let (ctx, _) ← AuditM.run' (mkAuditContext env lib (some main))
+  let phantomEq := privName main `Lean.Name.mkStr1.eq_999
+  let ((), sPh) := (checkPrivateName ctx main phantomEq false).run {}
+  expect "T23 phantom non-existent name cannot spoof foreign realized .eq_1 auxiliary"
+    (sPh.violations.any fun v => v.kind == .privateUserSuffixSpoof && v.decl == phantomEq)
+    (renderAll sPh.violations)
+  let spoofTarget := privName `Trusted.Foreign `ghostPass
+  let malformedFolder := `_private.MalformedLiveFolder
+  let envLiveExt := Compiler.LCNF.passManagerExt.modifyState env fun (ps, pm) => (spoofTarget :: ps, pm)
+  let envLiveExt := Compiler.LCNF.Simp.ConstantFold.folderExt.modifyState envLiveExt fun (fs, fm) =>
+    ({ declName := ``Nat.add, folderDeclName := malformedFolder, folder := fun _ => pure none } :: fs, fm)
+  let ((), sLiveExt) ← AuditM.run' do
+    let ctxL ← mkAuditContext envLiveExt lib (some main)
+    auditPrivateNames ctxL (← nonToolchainViews ctxL)
+  expect "T23 live ConstantFold and passManagerExt _private spoof targets rejected"
+    ((sLiveExt.violations.any fun v => v.kind == .privateModuleMismatch && v.decl == spoofTarget) &&
+     (sLiveExt.violations.any fun v => v.kind == .malformedPrivateName && v.decl == malformedFolder))
+    (renderAll sLiveExt.violations)
 
 -- Deep sweep (full Layer A + every expression via `find?`): zero findings, time reported.
 #eval sweep "T20 deep sweep" {} none

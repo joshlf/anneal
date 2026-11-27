@@ -515,13 +515,17 @@ def hasNativePart (n : Name) : Bool :=
   (nameParts n).any fun | .str s => s == "_native" || s.startsWith "_native" | .num _ => false
 
 /-- A private user suffix that is a realized auxiliary of an existing declaration: `fullName` itself
-is never an axiom or opaque constant, some proper prefix `base` of `user` is an imported constant
+must exist (either in the kernel environment as a non-axiom/non-opaque declaration or in compiled IR)
+and never be an axiom or opaque constant, some proper prefix `base` of `user` is an imported constant
 whose owning module satisfies `baseOwnerOk`, and every remaining component is in the closed
 `isRealizedAuxComponent` set. -/
 def isRealizedAuxOfForeign (ctx : AuditContext) (fullName owner user : Name) (baseOwnerOk : Name → Bool) : Bool :=
-  match findAnyConst? ctx.env fullName with
-  | some (.axiomInfo _) | some (.opaqueInfo _) => false
-  | _ =>
+  let existsSafe := match findAnyConst? ctx.env fullName with
+    | some (.axiomInfo _) | some (.opaqueInfo _) => false
+    | some _ => true
+    | none => (IR.findEnvDecl (ctx.env.setExporting false) fullName).isSome
+  if !existsSafe then false
+  else
     let ps := (nameParts user).toList
     (List.range ps.length).any fun k =>
       k > 0 &&
@@ -744,16 +748,51 @@ def auditPrivateNames (ctx : AuditContext) (views : Array ModuleView) : AuditM U
       for d in IR.declMapExt.getModuleEntries env i do checkExtensionRefName ctx m d.name true
       for d in IR.declMapExt.getModuleIREntries env i do checkExtensionRefName ctx m d.name true
     modify fun s => { s with declsChecked := s.declsChecked + totalChecked }
-  -- Live `env.constants.map₂` and live extension targets.
+  -- Live `env.constants.map₂` and all live extension targets.
   if let some lm := ctx.liveModule? then
+    let liveView? := views.find? (·.idx?.isNone)
     let ((), s) := (do
       for (n, _) in ctx.env.constants.map₂.toList do
         checkPrivateName ctx lm n false
-      for e in Compiler.CSimp.ext.ext.getState env |>.newEntries do
+      if let some lv := liveView? then
+        for n in lv.data.constNames ++ lv.data.extraConstNames do
+          if let some tgt := Compiler.implementedByAttr.getParam? env n then
+            checkExtensionRefName ctx lm tgt false
+          if let some fn := regularInitAttr.getParam? env n then
+            unless fn.isAnonymous do checkExtensionRefName ctx lm fn false
+          if let some fn := builtinInitAttr.getParam? env n then
+            unless fn.isAnonymous do checkExtensionRefName ctx lm fn false
+      let csimpState := Compiler.CSimp.ext.ext.getState env
+      for frame in csimpState.stateStack do
+        for (k, ent) in frame.state.map.toList do
+          checkExtensionRefName ctx lm k false
+          checkExtensionRefName ctx lm ent.fromDeclName false
+          checkExtensionRefName ctx lm ent.toDeclName false
+          checkExtensionRefName ctx lm ent.thmName false
+      for e in csimpState.newEntries do
         let ent := match e with | .global a => a | .scoped _ a => a
         checkExtensionRefName ctx lm ent.fromDeclName false
         checkExtensionRefName ctx lm ent.toDeclName false
         checkExtensionRefName ctx lm ent.thmName false
+      for (_, entries) in csimpState.scopedEntries.map.toList do
+        for ent in entries.toArray do
+          checkExtensionRefName ctx lm ent.fromDeclName false
+          checkExtensionRefName ctx lm ent.toDeclName false
+          checkExtensionRefName ctx lm ent.thmName false
+      let (livePasses, _) := Compiler.LCNF.passManagerExt.getState env
+      for p in livePasses do
+        checkExtensionRefName ctx lm p false
+      let (liveFolders, liveFolderMap) := Compiler.LCNF.Simp.ConstantFold.folderExt.getState env
+      for fe in liveFolders do
+        checkExtensionRefName ctx lm fe.declName false
+        checkExtensionRefName ctx lm fe.folderDeclName false
+      for (k, _) in liveFolderMap.toList do
+        checkExtensionRefName ctx lm k false
+      for entry in Compiler.LCNF.postponedCompileDeclsExt.getEntries env do
+        for n in entry.declNames do checkExtensionRefName ctx lm n true
+      for di in Meta.defaultInstanceExtension.getEntries env do
+        checkExtensionRefName ctx lm di.className false
+        checkExtensionRefName ctx lm di.instanceName false
       for n in auxRecExt.getEntries env do
         if (origin? env n).isNone then checkExtensionRefName ctx lm n true
       for (n, _) in (noConfusionExt.getState env).toList do
@@ -947,6 +986,32 @@ def auditUnreferencedAxioms (ctx : AuditContext) (views : Array ModuleView) (p :
         | none =>
           report .auditFuelExhausted .anonymous env.header.mainModule "axiom reachability closure exhausted its fuel"
           return
+      else if !candidates.isEmpty then
+        -- When non-toolchain axiom candidates exist above `implicitClosureMaxConsts`, compute
+        -- exact reachability across non-toolchain declarations (verified toolchain modules cannot
+        -- reference non-toolchain constants) so referenced vs unreferenced classification stays exact.
+        let candNames : NameSet := candidates.foldl (fun acc (n, _) => acc.insert n) {}
+        let mut used : NameSet := {}
+        for v in views do
+          for ci in v.data.constants do
+            unless ci matches .axiomInfo _ do
+              used := used ++ declEdges ci
+        for (_, ci) in env.constants.map₂.toList do
+          unless ci matches .axiomInfo _ do
+            used := used ++ declEdges ci
+        -- Close through any axiom candidate types that depend on earlier axioms.
+        let mut rSet : NameSet := used.foldl (fun acc n => if candNames.contains n then acc.insert n else acc) {}
+        for _ in [0:candidates.size + 1] do
+          let mut changed := false
+          for (cn, _) in candidates do
+            if rSet.contains cn then
+              if let some aci := findAnyConst? env cn then
+                for d in declEdges aci do
+                  if candNames.contains d && !rSet.contains d then
+                    rSet := rSet.insert d
+                    changed := true
+          if !changed then break
+        pure rSet
       else
         pure ({} : NameSet)
   -- Reachable axioms (any origin, checking both `env` and `kenv`).
@@ -1040,6 +1105,10 @@ structure OleanHeaderConfig where
   /-- Optional parent regions from an accompanying compacted chain (e.g. `.olean*` when validating
   `.ir`) that `< baseAddr` pointers may also target without sharing the primary overlap set. -/
   auxParentRegions : Array (Nat × Nat) := #[]
+  /-- Validated `rootPtr` values of parent regions in the same chain; when non-empty, a 96-byte
+  empty delta layer re-rooted outside its own region must match one of these exact `rootPtr`s. -/
+  parentRoots : Array Nat := #[]
+  auxParentRoots : Array Nat := #[]
   deriving Inhabited
 
 structure OleanHeaderInfo where
@@ -1167,12 +1236,17 @@ def validateOleanBinaryBytes (bs : ByteArray) (cfg : OleanHeaderConfig := {}) :
   unless root % 2 == 0 do throw (.scalarRootPtr root)
   unless root % 8 == 0 do throw (.misalignedRootPtr root)
   -- An empty delta layer (e.g. a 96-byte `.olean.server` / `.olean.private` of a module with no
-  -- server-only or private data) stores no objects and re-roots at an object of a parent region.
-  -- That root was validated with the parent; it must lie strictly inside a known parent region.
+  -- server-only or private data) stores zero objects (`size == headerSize + 8 == 96`) and re-roots
+  -- at the validated `rootPtr` of a parent region (never carrying unvalidated payload bytes or
+  -- pointing into interior string/scalar bytes of a parent).
   let inOwn := base + headerSize + 8 ≤ root && root + 8 ≤ base + size
   if !inOwn then
+    let allParents := cfg.parentRegions ++ cfg.auxParentRegions
+    let allRoots := cfg.parentRoots ++ cfg.auxParentRoots
     let inParent := cfg.allowParentRegionPtrs &&
-      cfg.parentRegions.any fun (pBase, pSize) => pBase + headerSize + 8 ≤ root && root + 8 ≤ pBase + pSize
+      size == headerSize + 8 &&
+      (allParents.any fun (pBase, pSize) => pBase + headerSize + 8 ≤ root && root + 8 ≤ pBase + pSize) &&
+      (allRoots.isEmpty || allRoots.contains root)
     unless inParent do throw (.rootOutOfBounds root)
     return { version, githash, gmp := flags &&& 1 == 1, baseAddr := base, rootPtr := root,
              rootOffset := 0, rootSize := 0, fileSize := size }
@@ -1212,6 +1286,70 @@ def validateOleanFile (p : System.FilePath) (cfg : OleanHeaderConfig := {}) :
   let bs ← try IO.FS.readBinFile p catch e => return .error s!"cannot read {p}: {e}"
   let cfg' := { cfg with allowParentRegionPtrs := cfg.allowParentRegionPtrs || isLayeredCompanionPath p }
   return match validateOleanBinaryBytes bs cfg' with
+    | .ok i => .ok i
+    | .error e => .error e.render
+
+/-- Fast 96-byte prefix + `lstat`-size validator for multi-hundred-module transitive sysroot walks:
+verifies regular non-symlink file, `maxBytes`, magic, format version, flags, pinned Lean version,
+pinned 40-char githash, `baseAddr` alignment & u64 wrap, 8-byte `dataSize` alignment, `parentRegions`
+disjointness, and `rootPtr` alignment & bounds (including 96-byte empty-delta `parentRoots` equality)
+by reading only the first 96 bytes from disk. -/
+def validateOleanHeaderPrefixFile (p : System.FilePath) (cfg : OleanHeaderConfig := {}) :
+    IO (Except String OleanHeaderInfo) := do
+  let md ← try p.symlinkMetadata catch e => return .error s!"cannot lstat {p}: {e}"
+  if md.type == .symlink then return .error s!"{p} is a symlink"
+  unless md.type == .file do return .error s!"{p} is not a regular file"
+  let size := md.byteSize.toNat
+  if size < headerSize + 8 then return .error (OleanHeaderError.tooShort size).render
+  if size > cfg.maxBytes then return .error (OleanHeaderError.tooLarge size cfg.maxBytes).render
+  let bs ← try IO.FS.withFile p .read (·.read 96) catch e => return .error s!"cannot read {p}: {e}"
+  if bs.size < headerSize + 8 then return .error (OleanHeaderError.tooShort bs.size).render
+  let allowParent := cfg.allowParentRegionPtrs || isLayeredCompanionPath p
+  let chk : Except OleanHeaderError OleanHeaderInfo := do
+    unless bytesToString bs 0 5 == "olean".toUTF8.toList do throw .badMagic
+    let ver := (bs.get! 5).toNat
+    unless ver == 2 do throw (.badFormatVersion ver)
+    let flags := (bs.get! 6).toNat
+    unless flags &&& (255 - 1) == 0 do throw (.badFlags flags)
+    let vbytes := bytesToString bs 7 33
+    let vchars := vbytes.takeWhile (· != 0)
+    let vrest := vbytes.drop vchars.length
+    if vchars.isEmpty then throw (.badVersionString "empty")
+    unless vchars.all (fun b => b ≥ 0x20 && b ≤ 0x7e) do throw (.badVersionString "non-printable byte")
+    unless vrest.all (· == 0) do throw (.badVersionString "non-NUL byte after the terminator")
+    let version := String.ofList (vchars.map fun b => Char.ofNat b.toNat)
+    if let some e := cfg.expectedVersion? then
+      unless version == e do throw (.versionMismatch version e)
+    let gbytes := bytesToString bs 40 40
+    unless gbytes.all (fun b => (b ≥ 0x30 && b ≤ 0x39) || (b ≥ 0x61 && b ≤ 0x66)) do throw .badGithash
+    let githash := String.ofList (gbytes.map fun b => Char.ofNat b.toNat)
+    if let some e := cfg.expectedGithash? then
+      unless githash == e do throw (.githashMismatch githash e)
+    let base := readLE bs 80 8
+    if base == 0 then throw .zeroBaseAddr
+    unless base % 8 == 0 do throw (.misalignedBaseAddr base)
+    unless base + size < u64Bound do throw .baseAddrWraps
+    unless (size - headerSize) % 8 == 0 do throw (.misalignedDataSize size)
+    for (pBase, pSize) in cfg.parentRegions do
+      unless base + size ≤ pBase || pBase + pSize ≤ base do
+        throw (.overlappingParentRegion base size)
+    let root := readLE bs 88 8
+    unless root % 2 == 0 do throw (.scalarRootPtr root)
+    unless root % 8 == 0 do throw (.misalignedRootPtr root)
+    let inOwn := base + headerSize + 8 ≤ root && root + 8 ≤ base + size
+    if !inOwn then
+      let allParents := cfg.parentRegions ++ cfg.auxParentRegions
+      let allRoots := cfg.parentRoots ++ cfg.auxParentRoots
+      let inParent := allowParent &&
+        size == headerSize + 8 &&
+        (allParents.any fun (pBase, pSize) => pBase + headerSize + 8 ≤ root && root + 8 ≤ pBase + pSize) &&
+        (allRoots.isEmpty || allRoots.contains root)
+      unless inParent do throw (.rootOutOfBounds root)
+      return { version, githash, gmp := flags &&& 1 == 1, baseAddr := base, rootPtr := root,
+               rootOffset := 0, rootSize := 0, fileSize := size }
+    return { version, githash, gmp := flags &&& 1 == 1, baseAddr := base, rootPtr := root,
+             rootOffset := root - base, rootSize := 8, fileSize := size }
+  return match chk with
     | .ok i => .ok i
     | .error e => .error e.render
 
@@ -1378,7 +1516,9 @@ def auditOleanResolutionAndShadowing (mods : Array Name) (cfg : ResolutionConfig
             | some (rootStr, realRoot) =>
               let base := (olean.toString.dropEnd 6).toString
               let mut oleanChain : Array (Nat × Nat) := #[]
+              let mut oleanRoots : Array Nat := #[]
               let mut irChain : Array (Nat × Nat) := #[]
+              let mut irRoots : Array Nat := #[]
               for ext in partExts do
                 let p : System.FilePath := ⟨base ++ "." ++ ext⟩
                 if ← entryExists p then
@@ -1388,13 +1528,18 @@ def auditOleanResolutionAndShadowing (mods : Array Name) (cfg : ResolutionConfig
                     if cfg.validateBinaries && (!isTool || cfg.validateToolchainBinaries) then
                       let isIr := ext == "ir.sig" || ext == "ir"
                       let pCfg := if isIr then
-                          { cfg.header with parentRegions := irChain, auxParentRegions := oleanChain }
+                          { cfg.header with parentRegions := irChain, auxParentRegions := oleanChain,
+                                            parentRoots := irRoots, auxParentRoots := oleanRoots }
                         else
-                          { cfg.header with parentRegions := oleanChain }
+                          { cfg.header with parentRegions := oleanChain, parentRoots := oleanRoots }
                       match ← validateOleanFile p pCfg with
                       | .ok info =>
-                        if isIr then irChain := irChain.push (info.baseAddr, info.fileSize)
-                        else oleanChain := oleanChain.push (info.baseAddr, info.fileSize)
+                        if isIr then
+                          irChain := irChain.push (info.baseAddr, info.fileSize)
+                          irRoots := irRoots.push info.rootPtr
+                        else
+                          oleanChain := oleanChain.push (info.baseAddr, info.fileSize)
+                          oleanRoots := oleanRoots.push info.rootPtr
                         modify fun s => { s with oleansChecked := s.oleansChecked + 1 }
                       | .error e => report .oleanHeaderInvalid m m s!"{p}: {e}"
         let ((), ms) ← StateT.run act {}
@@ -1728,34 +1873,169 @@ def stripLeadingLams : Expr → Nat → Expr
   | .lam _ _ b _, k + 1 => stripLeadingLams b k
   | e, _ + 1 => e
 
+def countLeadingLams : Expr → Nat → Nat
+  | _, 0 => 0
+  | .lam _ _ b _, k + 1 => 1 + countLeadingLams b k
+  | _, _ + 1 => 0
+
+/-- Structural check that `dn` has the exact specialization form `<kfn>._at_.<rest>` ending in a
+`.spec_<n>` component (preventing string-interpolation spoofing of `._at_.`). -/
+def isConstAtSpecName (kfn dn : Name) : Bool :=
+  let kp := (nameParts kfn).toList
+  let dp := (nameParts dn).toList
+  let pfx := kp ++ [.str "_at_"]
+  dp.length > pfx.length &&
+  dp.take pfx.length == pfx &&
+  (match dn with | .str _ s => hasNumSuffix s "spec_" | _ => false)
+
+/-- Lightweight summary of a trivial direct-return body across kernel, LCNF (`baseExt`/`monoExt`),
+and IR (`IR.declMapExt`) phases, used to detect cross-phase codegen tampering without false
+positives on structure/enum representation erasure. -/
+inductive SimpleRet where
+  | param (idx : Nat)
+  | natLit (v : Nat)
+  | strLit (v : String)
+  | other
+  deriving BEq, Repr
+
+def classifyLCNF (_ : Environment) (d : Compiler.LCNF.Decl .pure) : SimpleRet :=
+  match d.value with
+  | .extern .. => .other
+  | .code code =>
+    let paramIdx (fv : FVarId) : Option Nat := d.params.findIdx? (·.fvarId == fv)
+    match code with
+    | .return fv =>
+      match paramIdx fv with
+      | some i => .param i
+      | none => .other
+    | .let ld (.return fv) =>
+      if ld.fvarId == fv then
+        match ld.value with
+        | .lit (.nat v) => .natLit v
+        | .lit (.str v) => .strLit v
+        | .fvar fv2 #[] =>
+          match paramIdx fv2 with
+          | some i => .param i
+          | none => .other
+        | _ => .other
+      else .other
+    | _ => .other
+
+def classifyIR (d : IR.Decl) : SimpleRet :=
+  match d with
+  | .extern .. => .other
+  | .fdecl _ xs _ body _ =>
+    let paramIdx (v : IR.VarId) : Option Nat := xs.findIdx? (·.x == v)
+    let rec stripRC (b : IR.FnBody) : Nat → IR.FnBody
+      | 0 => b
+      | fuel + 1 => match b with
+        | .inc _ _ _ _ rest | .dec _ _ _ _ rest => stripRC rest fuel
+        | _ => b
+    match stripRC body 16 with
+    | .ret (.var v) =>
+      match paramIdx v with
+      | some i => .param i
+      | none => .other
+    | .vdecl x _ (.lit (.num v)) rest =>
+      match stripRC rest 16 with
+      | .ret (.var y) => if x == y then .natLit v else .other
+      | _ => .other
+    | .vdecl x _ (.lit (.str v)) rest =>
+      match stripRC rest 16 with
+      | .ret (.var y) => if x == y then .strLit v else .other
+      | _ => .other
+    | _ => .other
+
+def classifyKernel (_ : Environment) (ci : ConstantInfo) : SimpleRet :=
+  match ci.value? (allowOpaque := true) with
+  | none => .other
+  | some v =>
+    let nLams := countLeadingLams v 256
+    let body := stripLeadingLams v 256
+    match body with
+    | .bvar i => if i < nLams then .param (nLams - 1 - i) else .other
+    | .lit (.natVal k) => .natLit k
+    | .lit (.strVal s) => .strLit s
+    | .app (.app (.app (.const ``OfNat.ofNat _) ty) (.lit (.natVal k))) _ =>
+      if ty == mkConst ``Nat then .natLit k else .other
+    | _ => .other
+
+def simpleRetCompat (a b : SimpleRet) : Bool :=
+  match a, b with
+  | .other, _ | _, .other => true
+  | .natLit x, .natLit y => x == y
+  | .strLit x, .strLit y => x == y
+  | .param _, .param _ => true
+  | _, _ => false
+
 /-- Validate one `Compiler.LCNF.Specialize.CacheEntry` stored by module `m`:
-1. `declName` must NOT be a kernel declaration (`constNames` or `findAnyConst?`),
-2. `declName` must be an IR-only declaration owned by `m` (`extraConstNames` + `ownerOf`) with an
-   actual compiled IR body (`IR.findEnvDecl`), and
-3. stripping leading lambdas from `key` must expose a constant head `kfn` matching the specialization
-   prefix `<kfn>._at_.` of `declName` with a `.spec_<n>` marker. -/
+1. `key` must be closed (`!hasLooseBVars && !hasFVar`), within the 512-binder lambda bound, and all
+   constants in `key` must pass `Init.ShareCommon` and `_private` anti-spoofing checks;
+2. `declName` must NOT be a kernel declaration, must be owned by `m` (`extraConstNames` + `ownerOf`),
+   and must structurally equal `<kfn>._at_.<ctx>.spec_<n>`;
+3. `declName` must exist as a safe `.code` declaration across `baseExt`, `monoExt`, and
+   `IR.declMapExt`, with `baseDecl.params.size ≥ countLeadingLams key`, `baseDecl.levelParams.length`
+   bounded by `key`'s universe parameters, cross-phase `SimpleRet` consistency, and `kfn` itself
+   resolving to a safe `.code` declaration in `baseExt`. -/
 def validateSpecCacheEntry (ctx : AuditContext) (m : Name) (modKernelNames modExtraNames : NameSet)
     (e : Compiler.LCNF.Specialize.CacheEntry) : PureAuditM Unit := do
   modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
   let env := ctx.env
   let dn := e.declName
+  for kc in e.key.getUsedConstants do
+    if isShareCommonConst env kc then
+      report .shareCommonReference dn m s!"specialize_cache key references {kc}"
+    checkExtensionRefName ctx m kc false
+  if e.key.hasLooseBVars || e.key.hasFVar then
+    report .compilerOverrideHook dn m "specialize_cache: key contains free or loose bound variables"
+    return
   if modKernelNames.contains dn || (findAnyConst? env dn).isSome then
     report .compilerOverrideHook dn m "specialize_cache: entry targets a kernel declaration"
     return
   unless modExtraNames.contains dn && ownerOf ctx dn == some m do
     report .foreignCompilerTag dn m "specialize_cache: entry target is not owned by the storing module"
     return
-  if (IR.findEnvDecl env dn).isNone then
+  let some irDecl := IR.findEnvDecl env dn | do
     report .compilerOverrideHook dn m "specialize_cache: entry target has no compiled IR body"
     return
-  let keyBody := stripLeadingLams e.key 256
+  let some baseDecl := Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt dn | do
+    report .compilerOverrideHook dn m "specialize_cache: entry target is missing from LCNF baseExt"
+    return
+  let some monoDecl := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt dn | do
+    report .compilerOverrideHook dn m "specialize_cache: entry target is missing from LCNF monoExt"
+    return
+  let keyLams := countLeadingLams e.key 512
+  let keyBody := stripLeadingLams e.key 512
+  if keyBody matches .lam .. then
+    report .auditFuelExhausted dn m "specialize_cache: key exceeds 512 leading lambda binders"
+    return
   match keyBody.getAppFn with
   | .const kfn _ =>
-    let dnStr := dn.toString
-    let kStr := kfn.toString
-    unless dnStr.startsWith (kStr ++ "._at_.") && (dnStr.splitOn ".spec_").length > 1 do
+    unless isConstAtSpecName kfn dn do
       report .compilerOverrideHook dn m
-        s!"specialize_cache: target {dn} does not match specialization key head {kfn}"
+        s!"specialize_cache: target {dn} does not structurally match specialization key head {kfn}"
+      return
+    let some kfnBase := Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt kfn | do
+      report .compilerOverrideHook dn m s!"specialize_cache: key head {kfn} has no LCNF baseExt body"
+      return
+    let keyLP := (collectLevelParams {} e.key).params.size
+    -- `Specialize.mkSpecDecl` sets `specDecl.safe := decl.safe` (which is `false` when specializing
+    -- safe stdlib functions implemented via `@[implemented_by]` helpers such as `Array.foldrMUnsafe.fold`).
+    unless baseDecl.safe == kfnBase.safe && monoDecl.safe == kfnBase.safe && (kfnBase.value matches .code _) &&
+        baseDecl.params.size ≥ keyLams && baseDecl.levelParams.length ≤ keyLP do
+      report .compilerOverrideHook dn m
+        s!"specialize_cache: target {dn} violates LCNF safety/arity/universe invariants for {kfn}"
+      return
+    let br := classifyLCNF env baseDecl
+    let mr := classifyLCNF env monoDecl
+    let ir := classifyIR irDecl
+    let kr := classifyLCNF env kfnBase
+    let kCompat := match kr with
+      | .natLit _ | .strLit _ => simpleRetCompat kr br && simpleRetCompat kr ir
+      | _ => true
+    unless simpleRetCompat br mr && simpleRetCompat mr ir && simpleRetCompat br ir && kCompat do
+      report .compilerOverrideHook dn m
+        s!"specialize_cache: cross-phase direct-return mismatch on specialized body {dn}"
   | _ =>
     report .compilerOverrideHook dn m "specialize_cache: specialization key is not constant-headed"
 
@@ -1859,6 +2139,63 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (v : Modul
         report .postponedCompilation n m "compilation postponed (no IR stored)"
     for (key, dn) in (Compiler.LCNF.Specialize.specCacheExt.getState env).toList do
       validateSpecCacheEntry ctx m modKernelNames modExtraNames { key, declName := dn }
+  -- Cross-phase direct-return consistency across kernel `ConstantInfo`, `baseExt`, `monoExt`, and
+  -- `IR.declMapExt` (catches `.ir` or `monoExt` body tampering that registers no hook attribute).
+  -- For imported modules (`v.idx? = some i`), index only that module's own compiled LCNF/IR entries
+  -- instead of querying global environment maps on every theorem declaration.
+  match v.idx? with
+  | some i =>
+    let mut baseRets : Std.HashMap Name SimpleRet := {}
+    let mut monoRets : Std.HashMap Name SimpleRet := {}
+    let mut irRets : Std.HashMap Name SimpleRet := {}
+    for d in Compiler.LCNF.baseExt.getModuleEntries env i do baseRets := baseRets.insert d.name (classifyLCNF env d)
+    for d in Compiler.LCNF.baseExt.getModuleIREntries env i do baseRets := baseRets.insert d.name (classifyLCNF env d)
+    for d in Compiler.LCNF.monoExt.getModuleEntries env i do monoRets := monoRets.insert d.name (classifyLCNF env d)
+    for d in Compiler.LCNF.monoExt.getModuleIREntries env i do monoRets := monoRets.insert d.name (classifyLCNF env d)
+    for d in IR.declMapExt.getModuleEntries env i do irRets := irRets.insert d.name (classifyIR d)
+    for d in IR.declMapExt.getModuleIREntries env i do irRets := irRets.insert d.name (classifyIR d)
+    if !baseRets.isEmpty || !monoRets.isEmpty || !irRets.isEmpty then
+      let implSet : NameSet :=
+        (Compiler.implementedByAttr.ext.getModuleEntries env i ++
+         Compiler.implementedByAttr.ext.getModuleIREntries env i).foldl (fun s (n, _) => s.insert n) {}
+      let extSet : NameSet :=
+        (externAttr.ext.getModuleEntries env i ++
+         externAttr.ext.getModuleIREntries env i).foldl (fun s (n, _) => s.insert n) {}
+      for ci in v.data.constants do
+        if !(ci matches .thmInfo _) && !implSet.contains ci.name && !extSet.contains ci.name then
+          let kr := classifyKernel env ci
+          if kr != .other then
+            let br := baseRets.getD ci.name .other
+            let mr := monoRets.getD ci.name .other
+            let ir := irRets.getD ci.name .other
+            unless simpleRetCompat kr br && simpleRetCompat kr mr && simpleRetCompat kr ir &&
+                simpleRetCompat br mr && simpleRetCompat mr ir do
+              hook ci.name m "cross_phase_body: compiled LCNF/IR return contradicts kernel definition"
+      for en in v.data.extraConstNames do
+        let br := baseRets.getD en .other
+        let mr := monoRets.getD en .other
+        let ir := irRets.getD en .other
+        unless simpleRetCompat br mr && simpleRetCompat mr ir && simpleRetCompat br ir do
+          hook en m "cross_phase_body: compiled IR return contradicts LCNF auxiliary body"
+  | none =>
+    for ci in v.data.constants do
+      if !(ci matches .thmInfo _) &&
+         (Compiler.implementedByAttr.getParam? env ci.name).isNone &&
+         (getExternAttrData? env ci.name).isNone then
+        let kr := classifyKernel env ci
+        if kr != .other then
+          let br := (Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt ci.name).map (classifyLCNF env) |>.getD .other
+          let mr := (Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt ci.name).map (classifyLCNF env) |>.getD .other
+          let ir := (IR.findEnvDecl env ci.name).map classifyIR |>.getD .other
+          unless simpleRetCompat kr br && simpleRetCompat kr mr && simpleRetCompat kr ir &&
+              simpleRetCompat br mr && simpleRetCompat mr ir do
+            hook ci.name m "cross_phase_body: compiled LCNF/IR return contradicts kernel definition"
+    for en in v.data.extraConstNames do
+      let br := (Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt en).map (classifyLCNF env) |>.getD .other
+      let mr := (Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt en).map (classifyLCNF env) |>.getD .other
+      let ir := (IR.findEnvDecl env en).map classifyIR |>.getD .other
+      unless simpleRetCompat br mr && simpleRetCompat mr ir && simpleRetCompat br ir do
+        hook en m "cross_phase_body: compiled IR return contradicts LCNF auxiliary body"
 
 /-- Environment-wide live compiler-state checks (`CSimp` `stateStack`/`newEntries`/`scopedEntries`,
 `passManagerExt` live passes & pipeline fingerprint, and `ConstantFold.folderExt` live folders). -/
@@ -2468,7 +2805,9 @@ def checkOpaqueTheoremReplay (env : Environment) (declName : Name) (fuel : Nat :
   | .error e => return .deltaReliance thms.size totalRenamed (kernelErrorString e)
 
 /-- Non-foundational toolchain axioms (`sorryAx` and native-evaluation trust axioms) screened in
-C++ when auditing whole modules without an explicit root list. -/
+C++ when auditing whole modules without an explicit root list. `Lean.reduceBool` and
+`Lean.reduceNat` (`kernelNativeEvaluators`) are also screened because they are the sole toolchain
+definitions in `Init.Prelude` whose bodies depend on `Lean.trustCompiler`. -/
 def forbiddenToolchainAxioms : List Name :=
   [``sorryAx, ``Lean.ofReduceBool, ``Lean.ofReduceNat, ``Lean.trustCompiler]
 
@@ -2483,7 +2822,8 @@ def kernelScanChunk (ctx : AuditContext) (sc : Std.HashSet Name) (structural sca
   let env := ctx.env
   let includeThmBodies := scanThmBodies || v.idx?.isNone
   let isBadConst (c : Name) : Bool :=
-    sc.contains c || (checkImplicitAxioms && forbiddenToolchainAxioms.contains c)
+    sc.contains c ||
+    (checkImplicitAxioms && (forbiddenToolchainAxioms.contains c || kernelNativeEvaluators.contains c))
   let pFull : Expr → Bool := fun e =>
     (match e with | .const c _ => isBadConst c | _ => false) ||
     (structural && maybeOpaqueHit e && (opaqueHitAt? env e).isSome)
@@ -2550,6 +2890,12 @@ def kernelScanChunk (ctx : AuditContext) (sc : Std.HashSet Name) (structural sca
               reportedForbidden := reportedForbidden.insert fa
               report .referencedUnapprovedAxiom fa om
                 s!"axiom reachable from {ci.name} in {v.module} is not admitted"
+      if kernelNativeEvaluators.any edges.contains && !reportedForbidden.contains ``Lean.trustCompiler then
+        if let some om := ownerOf ctx ``Lean.trustCompiler then
+          if ctx.isToolchainModule om then
+            reportedForbidden := reportedForbidden.insert ``Lean.trustCompiler
+            report .referencedUnapprovedAxiom ``Lean.trustCompiler om
+              s!"axiom reachable via native evaluator in {ci.name} ({v.module}) is not admitted"
     if structural && (!(ci matches .thmInfo _) || includeThmBodies) then
       match scanOpaqueTheoremReliance env ci fuel with
       | .error () => report .auditFuelExhausted ci.name v.module "structural opaque-theorem scan exhausted its fuel"
@@ -2745,58 +3091,116 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
       report .auditFuelExhausted .anonymous .anonymous "build-library import graph walk exhausted its fuel"
     let verifiedSys ← validateCanonicalRootDir sysrootLib
     let sysStr := stripTrailingSlashes sysrootLib.toString
-    let boundaryTasks ← extOrder.mapM fun i => IO.asTask do
-      if !isToolchainName i then
-        return (i, some (.oleanOutsideApprovedRoot,
-          s!"imported by {extImporters.getD i #[]} but neither a build-directory module nor a toolchain module inside the sysroot"))
-      match ← (try pure (some (← findOLean i)) catch _ => pure none) with
-      | none =>
-        return (i, some (.oleanUnresolved, s!"toolchain import {i} could not be resolved"))
-      | some p =>
-        match verifiedSys with
-        | .error e => return (i, some (.oleanOutsideApprovedRoot, e))
-        | .ok realSys =>
-          match ← pathWithinVerifiedRoot sysStr realSys p with
-          | .error e => return (i, some (.oleanOutsideApprovedRoot, e))
-          | .ok _ =>
-            let base := (p.toString.dropEnd 6).toString
-            let hasSrv ← entryExists ⟨base ++ ".olean.server"⟩
-            let hasPriv ← entryExists ⟨base ++ ".olean.private"⟩
-            let hasIrSig ← entryExists ⟨base ++ ".ir.sig"⟩
-            let hasIr ← entryExists ⟨base ++ ".ir"⟩
-            if hasSrv != hasPriv || hasIrSig != hasIr then
-              return (i, some (.oleanOutsideApprovedRoot, s!"incomplete toolchain companion artifacts for {i}"))
-            -- Every existing part (not just the `.olean`) is read by `importModules` at the private
-            -- level, so each must be a symlink-free regular file inside the sysroot with a valid
-            -- pinned header *before* the import.
-            -- Layered parts are validated against the regions of the parts below them, exactly as
-            -- in `auditOleanResolutionAndShadowing`.
-            let mut oleanChain : Array (Nat × Nat) := #[]
-            let mut irChain : Array (Nat × Nat) := #[]
-            for ext in partExts do
-              let part : System.FilePath := ⟨base ++ "." ++ ext⟩
-              unless ← entryExists part do continue
-              if let .error e ← pathWithinVerifiedRoot sysStr realSys part then
-                return (i, some (.oleanOutsideApprovedRoot, s!"companion part: {e}"))
-              let isIr := ext == "ir.sig" || ext == "ir"
-              let pCfg := if isIr then { hdr with parentRegions := irChain, auxParentRegions := oleanChain }
-                else { hdr with parentRegions := oleanChain }
-              match ← validateOleanFile part pCfg with
-              | .error e => return (i, some (.oleanHeaderInvalid, s!"{part}: {e}"))
-              | .ok info =>
-                if isIr then irChain := irChain.push (info.baseAddr, info.fileSize)
-                else oleanChain := oleanChain.push (info.baseAddr, info.fileSize)
-            return (i, none)
-    for bt in boundaryTasks do
-      match ← IO.wait bt with
-      | .error e =>
-        report .oleanHeaderInvalid .anonymous .anonymous s!"boundary validation task failed: {e}"
-      | .ok (i, some (vk, msg)) =>
-        report vk i i msg
-        for m in extImporters.getD i #[] do
-          report .environmentLoadFailed m m s!"imports {i}, which failed pre-import boundary validation"
+    let wantTcBin := (cfg.resolution?.map (·.validateToolchainBinaries)).getD false
+    -- Walk the *entire* transitive external import closure before `importModules` touches any file,
+    -- so multi-hop toolchain companions (`UseHop -> Init.Hop -> Init.Prelude`) and transitive
+    -- sysroot escapes (`Init.Bridge -> Planted`) are validated and quarantined prior to import.
+    let mut tcQueued : NameSet := extOrder.foldl (·.insert ·) {}
+    let mut tcRevImporters : Std.HashMap Name (Array Name) := {}
+    let mut failedExternal : Array Name := #[]
+    let mut tcFrontier : Array Name := extOrder
+    for _ in [0:4096] do
+      if tcFrontier.isEmpty then break
+      let useFullValidator := wantTcBin || tcQueued.size ≤ 32
+      let hopTasks ← tcFrontier.mapM fun i => IO.asTask do
+        if !isToolchainName i then
+          return (i, Except.error (.oleanOutsideApprovedRoot,
+            s!"imported transitively by build modules but {i} is neither a build-directory module nor a toolchain module"))
+        match ← (try pure (some (← findOLean i)) catch _ => pure none) with
+        | none =>
+          return (i, Except.error (.oleanUnresolved, s!"toolchain import {i} could not be resolved"))
+        | some p =>
+          match verifiedSys with
+          | .error e => return (i, Except.error (.oleanOutsideApprovedRoot, e))
+          | .ok realSys =>
+            match ← pathWithinVerifiedRoot sysStr realSys p with
+            | .error e => return (i, Except.error (.oleanOutsideApprovedRoot, e))
+            | .ok _ =>
+              -- `pathWithinVerifiedRoot` on `p` (`<dir>/<Name>.olean`) already `lstat`-verified
+              -- every ancestor directory of `<dir>`; each companion is a sibling in `<dir>`, so one
+              -- `symlinkMetadata` per sibling checks regular non-symlink file status directly.
+              let base := (p.toString.dropEnd 6).toString
+              let statOpt (sp : System.FilePath) : IO (Option IO.FS.Metadata) := do
+                try pure (some (← sp.symlinkMetadata)) catch _ => pure none
+              let mOlean ← statOpt ⟨base ++ ".olean"⟩
+              let mSrv ← statOpt ⟨base ++ ".olean.server"⟩
+              let mPriv ← statOpt ⟨base ++ ".olean.private"⟩
+              let mIrSig ← statOpt ⟨base ++ ".ir.sig"⟩
+              let mIr ← statOpt ⟨base ++ ".ir"⟩
+              if mSrv.isSome != mPriv.isSome || mIrSig.isSome != mIr.isSome then
+                return (i, Except.error (.oleanOutsideApprovedRoot, s!"incomplete toolchain companion artifacts for {i}"))
+              let partsMeta : Array (String × Option IO.FS.Metadata) :=
+                #[("olean", mOlean), ("olean.server", mSrv), ("olean.private", mPriv), ("ir.sig", mIrSig), ("ir", mIr)]
+              let mut oleanChain : Array (Nat × Nat) := #[]
+              let mut oleanRoots : Array Nat := #[]
+              let mut irChain : Array (Nat × Nat) := #[]
+              let mut irRoots : Array Nat := #[]
+              for (ext, mOpt) in partsMeta do
+                let some md := mOpt | continue
+                let part : System.FilePath := ⟨base ++ "." ++ ext⟩
+                if md.type == .symlink then
+                  return (i, Except.error (.oleanOutsideApprovedRoot, s!"companion part: {part} is a symlink"))
+                unless md.type == .file do
+                  return (i, Except.error (.oleanOutsideApprovedRoot, s!"companion part: {part} is not a regular file"))
+                let isIr := ext == "ir.sig" || ext == "ir"
+                let pCfg := if isIr then
+                    { hdr with parentRegions := irChain, auxParentRegions := oleanChain,
+                               parentRoots := irRoots, auxParentRoots := oleanRoots }
+                  else
+                    { hdr with parentRegions := oleanChain, parentRoots := oleanRoots }
+                let vRes ← if useFullValidator then validateOleanFile part pCfg
+                  else validateOleanHeaderPrefixFile part pCfg
+                match vRes with
+                | .error e => return (i, Except.error (.oleanHeaderInvalid, s!"{part}: {e}"))
+                | .ok info =>
+                  if isIr then
+                    irChain := irChain.push (info.baseAddr, info.fileSize)
+                    irRoots := irRoots.push info.rootPtr
+                  else
+                    oleanChain := oleanChain.push (info.baseAddr, info.fileSize)
+                    oleanRoots := oleanRoots.push info.rootPtr
+              let nextImps ← try
+                  let (td, _) ← readModuleData p
+                  pure (Except.ok (td.imports.map (·.module)))
+                catch e =>
+                  pure (Except.error (.oleanHeaderInvalid, s!"readModuleData failed on {p}: {e}"))
+              return (i, nextImps)
+      let mut nextTcFrontier : Array Name := #[]
+      for ht in hopTasks do
+        match ← IO.wait ht with
+        | .error e =>
+          report .oleanHeaderInvalid .anonymous .anonymous s!"boundary validation task failed: {e}"
+        | .ok (i, .error (vk, msg)) =>
+          report vk i i msg
+          failedExternal := failedExternal.push i
+        | .ok (i, .ok nextImps) =>
+          for j in nextImps do
+            unless modSet.contains j do
+              tcRevImporters := tcRevImporters.insert j ((tcRevImporters.getD j #[]).push i)
+              unless tcQueued.contains j do
+                tcQueued := tcQueued.insert j
+                nextTcFrontier := nextTcFrontier.push j
+      tcFrontier := nextTcFrontier
+    unless tcFrontier.isEmpty do
+      report .auditFuelExhausted .anonymous .anonymous "transitive toolchain boundary walk exhausted its fuel"
+    -- Propagate any external validation failure backwards along `tcRevImporters` to `extImporters`
+    -- (runs in 0 ms in the common clean case when `failedExternal` is empty).
+    if !failedExternal.isEmpty then
+      let mut taintedExt : NameSet := failedExternal.foldl (·.insert ·) {}
+      let mut revTodo : List Name := failedExternal.toList
+      for _ in [0:4096] do
+        match revTodo with
+        | [] => break
+        | x :: rest =>
+          revTodo := rest
+          for pMod in tcRevImporters.getD x #[] do
+            unless taintedExt.contains pMod do
+              taintedExt := taintedExt.insert pMod
+              revTodo := pMod :: revTodo
+      for te in taintedExt do
+        for m in extImporters.getD te #[] do
+          report .environmentLoadFailed m m s!"imports {te}, which failed pre-import boundary validation"
           bad := bad.insert m
-      | .ok (_, none) => pure ()
   finally
     searchPathRef.set savedG
   let validRoots := roots.filter (fun r => modSet.contains r && !bad.contains r)
@@ -2833,14 +3237,12 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
                 "loaded non-toolchain module resolved outside the approved build directory"
       finally
         searchPathRef.set saved2
-      -- Any newly discovered transitive toolchain module (beyond `extOrder`, which already passed
-      -- `validateOleanFile` pre-import) also has its binary header validated when `bad` is non-empty
-      -- or `validateToolchainBinaries` is requested.
       let wantTcBin := (cfg.resolution?.map (·.validateToolchainBinaries)).getD false
-      let tcSeen := seen.toArray.filter isToolchainName
-      auditOleanResolutionAndShadowing tcSeen
-        { sysrootLibDir := sysrootLib, approvedBuildRoots := #[], searchPath? := some sp,
-          validateToolchainBinaries := wantTcBin, header := hdr }
+      if wantTcBin then
+        let tcSeen := seen.toArray.filter isToolchainName
+        auditOleanResolutionAndShadowing tcSeen
+          { sysrootLibDir := sysrootLib, approvedBuildRoots := #[], searchPath? := some sp,
+            validateToolchainBinaries := true, header := hdr }
       let stray := (mods.filter fun m => !audited.contains m).size
       let t1 ← IO.monoMsNow
       modify fun s => { s with modulesChecked := audited.size, elapsedMs := t1 - t0, importMs, strayArtifacts := stray }
