@@ -2307,6 +2307,129 @@ theorem statefulVerificationResult_iff_forall_wlpStateV2026 (c : StatefulClaim)
   ⟨fun hV => forall_wlpStateV2026_of_statefulVerificationResult c hV hNoCall,
    verifyStatefulMirSafe_of_forall_wlpStateV2026 c⟩
 
+/-- Every all-fuel strict deterministic WLP derivation rules out reachable
+external calls (`NoExtCallReachV2026`). -/
+theorem noExtCallReachV2026_of_forall_execWlpStateV2026 {body : CapturedMir}
+    {post : MirOutcome → Prop} {s : MachineState}
+    (hAll : ∀ fuel : Nat, execWlpStateV2026 body fuel s post) :
+    NoExtCallReachV2026 body s := by
+  intro k s' req hSteps hExt
+  have hAux : ∀ {n : Nat} {a b : MachineState},
+      StepsToV2026 body n a b →
+      execWlpStateV2026 body (n + 1) a post →
+      execWlpStateV2026 body 1 b post := by
+    intro n a b hSt
+    induction hSt with
+    | refl _ => exact fun h => h
+    | @step m s₀ s₁ _ hs _ ih =>
+      intro hWlp
+      dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome] at hWlp
+      rw [execWlpStepPred_succ_iff, hs] at hWlp
+      exact ih hWlp
+  have h1 : execWlpStateV2026 body 1 s' post := hAux hSteps (hAll (k + 1))
+  dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome] at h1
+  rw [execWlpStepPred_succ_iff, hExt] at h1
+  exact h1
+
+/-- Any bounded terminating `ReachesDoneWithinV2026` run implies
+`NoExtCallReachV2026`. -/
+theorem noExtCallReachV2026_of_reachesDoneWithinV2026 {body : CapturedMir}
+    {post : MirOutcome → Prop} {bound : Nat} {s : MachineState}
+    (h : ReachesDoneWithinV2026 body post bound s) :
+    NoExtCallReachV2026 body s :=
+  noExtCallReachV2026_of_forall_execWlpStateV2026
+    (forall_execWlpStateV2026_of_reachesDoneWithinV2026 h)
+
+/-- Any productive `DivergesV2026` witness implies `NoExtCallReachV2026`. -/
+theorem noExtCallReachV2026_of_divergesV2026 {body : CapturedMir}
+    {s : MachineState} (hDiv : DivergesV2026 body s) :
+    NoExtCallReachV2026 body s :=
+  noExtCallReachV2026_of_forall_execWlpStateV2026
+    (forall_execWlpStateV2026_of_divergesV2026 hDiv (fun _ => False))
+
+/-- Any `ReactiveStepContractV2026` invariant state implies
+`NoExtCallReachV2026`. -/
+theorem noExtCallReachV2026_of_reactiveStepContractV2026 {body : CapturedMir}
+    {inv yieldPred : MachineState → Prop} {post : MirOutcome → Prop}
+    {frameBound : Nat}
+    (hContract : ReactiveStepContractV2026 body inv yieldPred post frameBound)
+    {s : MachineState} (hInv : inv s) :
+    NoExtCallReachV2026 body s :=
+  noExtCallReachV2026_of_forall_execWlpStateV2026
+    (forall_execWlpStateV2026_of_reactiveStepContractV2026 hContract hInv)
+
+/-- Unconditional exact equivalence (no external side condition): all-fuel
+strict WLP holds iff `TreeSafe`, `ReachesRet → post`, AND `NoExtCallReachV2026`
+all hold (`{propext, Quot.sound}` only). -/
+theorem forall_execWlpStateV2026_iff_partialCorrectness_and_noExtCall
+    {body : CapturedMir} {post : MirOutcome → Prop} {s : MachineState} :
+    (∀ fuel : Nat, execWlpStateV2026 body fuel s post) ↔
+      (Trusted.ITree.TreeSafe (mirTree body s) ∧
+       (∀ tr out, Trusted.ITree.ReachesRet (mirTree body s) tr out → post out) ∧
+       NoExtCallReachV2026 body s) :=
+  ⟨fun h =>
+      ⟨treeSafe_mirTree_of_forall_execWlpStateV2026 h,
+       reachesRet_post_of_forall_execWlpStateV2026 h,
+       noExtCallReachV2026_of_forall_execWlpStateV2026 h⟩,
+   fun ⟨hSafe, hRet, hNoCall⟩ fuel =>
+      forall_execWlpStateV2026_of_partialCorrectness fuel hSafe hRet hNoCall⟩
+
+/-- Unconditional exact equivalence connecting fuel-free
+`ParametricCore.wlpOutcome (ops := V2026Bridge.mirNoCallDetWpOps body)` to
+trusted `TreeSafe ∧ (ReachesRet → post) ∧ NoExtCallReachV2026`
+(`{propext, Quot.sound}` only). -/
+theorem wlpOutcome_mirNoCallDet_iff_partialCorrectness_and_noExtCall
+    {body : CapturedMir} {post : MirOutcome → Prop} {s : MachineState} :
+    Anneal.ParametricCore.wlpOutcome
+        (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps body)
+        post (fun _ => False) s ↔
+      (Trusted.ITree.TreeSafe (mirTree body s) ∧
+       (∀ tr out, Trusted.ITree.ReachesRet (mirTree body s) tr out → post out) ∧
+       NoExtCallReachV2026 body s) :=
+  Iff.trans wlpOutcome_mirNoCallDet_iff_forall_execWlpStateV2026
+    forall_execWlpStateV2026_iff_partialCorrectness_and_noExtCall
+
+/-- Exact call-free stateless certificate characterization via fuel-free
+`ParametricCore.wlpOutcome (ops := V2026Bridge.mirNoCallDetWpOps c.body)`. -/
+theorem verificationResult_iff_wlpOutcome_mirNoCallDet (c : Claim)
+    (hNoCall : ∀ args : List Value, c.pre args →
+      NoExtCallReachV2026 c.body
+        (initMachineStateWithCallees c.body args c.callees)) :
+    VerificationResult c ↔
+      ∀ args : List Value, c.pre args →
+        Anneal.ParametricCore.wlpOutcome
+          (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps c.body)
+          (mirSafePost (fun retVal _ => c.post args retVal))
+          (fun _ => False)
+          (initMachineStateWithCallees c.body args c.callees) :=
+  Iff.trans (verificationResult_iff_forall_wlpProgStrictV2026 c hNoCall)
+    ⟨fun h args hPre =>
+        wlpOutcome_mirNoCallDet_iff_forall_wlpStateV2026.mpr (h args hPre),
+     fun h args hPre =>
+        wlpOutcome_mirNoCallDet_iff_forall_wlpStateV2026.mp (h args hPre)⟩
+
+/-- Exact call-free stateful certificate characterization via fuel-free
+`ParametricCore.wlpOutcome (ops := V2026Bridge.mirNoCallDetWpOps c.body)`. -/
+theorem statefulVerificationResult_iff_wlpOutcome_mirNoCallDet
+    (c : StatefulClaim)
+    (hNoCall : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      NoExtCallReachV2026 c.body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees)) :
+    StatefulVerificationResult c ↔
+      ∀ (args : List Value) (mem : Memory), c.pre args mem →
+        Anneal.ParametricCore.wlpOutcome
+          (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps c.body)
+          (mirSafePost (c.post args mem))
+          (fun _ => False)
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees) :=
+  Iff.trans (statefulVerificationResult_iff_forall_wlpStateV2026 c hNoCall)
+    ⟨fun h args mem hPre =>
+        wlpOutcome_mirNoCallDet_iff_forall_wlpStateV2026.mpr (h args mem hPre),
+     fun h args mem hPre =>
+        wlpOutcome_mirNoCallDet_iff_forall_wlpStateV2026.mp (h args mem hPre)⟩
+
 /-! ## Part V: Concrete `V2026_06_01` Tight-Budget & Refutation Canaries -/
 
 /-- Minimal 1-block `CapturedMir` whose `bb0` faults immediately with
