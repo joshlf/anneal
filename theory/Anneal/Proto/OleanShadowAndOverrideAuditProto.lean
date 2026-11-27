@@ -511,8 +511,11 @@ def isSpecTrailComponent : NamePart → Bool
   | .str s => hasNumSuffix s "spec_" || isRealizedAuxComponent (.str s)
   | .num _ => false
 
-def hasNativePart (n : Name) : Bool :=
-  (nameParts n).any fun | .str s => s == "_native" || s.startsWith "_native" | .num _ => false
+/-- Allocation-free check whether `n` contains any `"_native"` or `"_native*"` component. -/
+def hasNativePart : Name → Bool
+  | .anonymous => false
+  | .str p s => s == "_native" || s.startsWith "_native" || hasNativePart p
+  | .num p _ => hasNativePart p
 
 /-- A private user suffix that is a realized auxiliary of an existing declaration: `fullName` itself
 must exist (either in the kernel environment as a non-axiom/non-opaque declaration or in compiled IR)
@@ -675,8 +678,12 @@ def auditPrivateNames (ctx : AuditContext) (views : Array ModuleView) : AuditM U
       for idx in [0:v.data.constNames.size] do
         if v.data.constNames[idx]! != v.data.constants[idx]!.name then return false
       return true
+    let mut seenPrivRegular : Std.HashSet Name := {}
+    let mut seenPrivIR : Std.HashSet Name := {}
     for n in v.data.constNames do
-      checkPrivateName ctx m n false
+      if hasPrivateComponent n then
+        seenPrivRegular := seenPrivRegular.insert n
+        checkPrivateName ctx m n false
     let mut totalChecked := v.data.constNames.size + v.data.extraConstNames.size
     unless aligned do
       report .environmentLoadFailed m m "module constNames array differs from stored constants array"
@@ -685,23 +692,37 @@ def auditPrivateNames (ctx : AuditContext) (views : Array ModuleView) : AuditM U
         unless seenConsts.contains ci.name do
           seenConsts := seenConsts.insert ci.name
           totalChecked := totalChecked + 1
-          checkPrivateName ctx m ci.name false
+          if hasPrivateComponent ci.name then
+            seenPrivRegular := seenPrivRegular.insert ci.name
+            checkPrivateName ctx m ci.name false
     for n in v.data.extraConstNames do
-      checkPrivateName ctx m n true
+      if hasPrivateComponent n || hasAtComponent n then
+        seenPrivIR := seenPrivIR.insert n
+        checkPrivateName ctx m n true
+    -- Helper avoiding redundant re-parsing of names already validated in `constNames`/`extraConstNames`
+    -- under the exact same `isIROnly = hasAtComponent n` mode.
+    let checkOwnedExt (n : Name) : PureAuditM Unit := do
+      let hasAt := hasAtComponent n
+      if !hasPrivateComponent n && !hasAt then return
+      if hasAt then
+        if seenPrivIR.contains n then return
+      else
+        if seenPrivRegular.contains n || seenPrivIR.contains n then return
+      checkPrivateName ctx m n hasAt
     -- Extension targets stored by this module (`.olean` + `.ir`).
     if let some i := v.idx? then
       for (src, tgt) in Compiler.implementedByAttr.ext.getModuleEntries env i ++ Compiler.implementedByAttr.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m src true
+        checkOwnedExt src
         checkExtensionRefName ctx m tgt false
       for (n, _) in externAttr.ext.getModuleEntries env i ++ externAttr.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for (n, _) in exportAttr.ext.getModuleEntries env i ++ exportAttr.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for (n, fn) in regularInitAttr.ext.getModuleEntries env i ++ regularInitAttr.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
         unless fn.isAnonymous do checkExtensionRefName ctx m fn false
       for (n, fn) in builtinInitAttr.ext.getModuleEntries env i ++ builtinInitAttr.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
         unless fn.isAnonymous do checkExtensionRefName ctx m fn false
       for e in Compiler.CSimp.ext.ext.getModuleEntries env i ++ Compiler.CSimp.ext.ext.getModuleIREntries env i do
         let ent := match e with | .global a => a | .scoped _ a => a
@@ -714,39 +735,39 @@ def auditPrivateNames (ctx : AuditContext) (views : Array ModuleView) : AuditM U
         checkExtensionRefName ctx m fe.declName false
         checkExtensionRefName ctx m fe.folderDeclName false
       for n in IR.UnboxResult.unboxAttr.ext.getModuleEntries env i ++ IR.UnboxResult.unboxAttr.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for n in neverExtractAttr.ext.getModuleEntries env i ++ neverExtractAttr.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for (n, _) in Compiler.inlineAttrs.ext.getModuleEntries env i ++ Compiler.inlineAttrs.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for entry in Compiler.LCNF.postponedCompileDeclsExt.getModuleEntries env i ++ Compiler.LCNF.postponedCompileDeclsExt.getModuleIREntries env i do
-        for n in entry.declNames do checkExtensionRefName ctx m n true
+        for n in entry.declNames do checkOwnedExt n
       for n in auxRecExt.getModuleEntries env i ++ auxRecExt.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for (n, _) in noConfusionExt.getModuleEntries env i ++ noConfusionExt.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for n in sparseCasesOnExt.getModuleEntries env i ++ sparseCasesOnExt.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for n in Compiler.LCNF.taggedReturnAttr.ext.getModuleEntries env i ++
           Compiler.LCNF.taggedReturnAttr.ext.getModuleIREntries env i do
-        checkExtensionRefName ctx m n true
+        checkOwnedExt n
       for se in Compiler.LCNF.Specialize.specCacheExt.getModuleEntries env i ++
           Compiler.LCNF.Specialize.specCacheExt.getModuleIREntries env i do
-        checkExtensionRefName ctx m se.declName true
+        checkOwnedExt se.declName
       for sig in Compiler.LCNF.impureSigExt.getModuleEntries env i ++ Compiler.LCNF.impureSigExt.getModuleIREntries env i do
-        checkExtensionRefName ctx m sig.name true
+        checkOwnedExt sig.name
       for (dn, _) in Compiler.LCNF.UnreachableBranches.functionSummariesExt.getModuleEntries env i ++
           Compiler.LCNF.UnreachableBranches.functionSummariesExt.getModuleIREntries env i do
-        checkExtensionRefName ctx m dn true
+        checkOwnedExt dn
       for di in Meta.defaultInstanceExtension.getModuleEntries env i ++ Meta.defaultInstanceExtension.getModuleIREntries env i do
         checkExtensionRefName ctx m di.className false
         checkExtensionRefName ctx m di.instanceName false
-      for d in Compiler.LCNF.baseExt.getModuleEntries env i do checkExtensionRefName ctx m d.name true
-      for d in Compiler.LCNF.baseExt.getModuleIREntries env i do checkExtensionRefName ctx m d.name true
-      for d in Compiler.LCNF.monoExt.getModuleEntries env i do checkExtensionRefName ctx m d.name true
-      for d in Compiler.LCNF.monoExt.getModuleIREntries env i do checkExtensionRefName ctx m d.name true
-      for d in IR.declMapExt.getModuleEntries env i do checkExtensionRefName ctx m d.name true
-      for d in IR.declMapExt.getModuleIREntries env i do checkExtensionRefName ctx m d.name true
+      for d in Compiler.LCNF.baseExt.getModuleEntries env i do checkOwnedExt d.name
+      for d in Compiler.LCNF.baseExt.getModuleIREntries env i do checkOwnedExt d.name
+      for d in Compiler.LCNF.monoExt.getModuleEntries env i do checkOwnedExt d.name
+      for d in Compiler.LCNF.monoExt.getModuleIREntries env i do checkOwnedExt d.name
+      for d in IR.declMapExt.getModuleEntries env i do checkOwnedExt d.name
+      for d in IR.declMapExt.getModuleIREntries env i do checkOwnedExt d.name
     modify fun s => { s with declsChecked := s.declsChecked + totalChecked }
   -- Live `env.constants.map₂` and all live extension targets.
   if let some lm := ctx.liveModule? then
@@ -1659,8 +1680,9 @@ def isShareCommonNode (sc : Std.HashSet Name) : Expr → Bool
   | _ => false
 
 def recordScExprHits (sc : Std.HashSet Name) (e : Expr) (acc : Array Name) : Array Name :=
-  if (e.find? (isShareCommonNode sc)).isNone then acc
-  else e.getUsedConstants.foldl (fun a c => if sc.contains c && !a.contains c then a.push c else a) acc
+  let cs := e.getUsedConstants
+  if !cs.any sc.contains then acc
+  else cs.foldl (fun a c => if sc.contains c && !a.contains c then a.push c else a) acc
 
 def recordScConst (sc : Std.HashSet Name) (c : Name) (acc : Array Name) : Array Name :=
   if sc.contains c && !acc.contains c then acc.push c else acc
@@ -1719,6 +1741,31 @@ def externDataTouchesShareCommon (ed : ExternAttrData) : Bool :=
     | .inline _ pat => shareCommonExternSymbols.any fun s => (pat.splitOn s).length > 1
     | _ => false
 
+/-- Zero-allocation, fuel-bounded IR `FnBody` scan for `Init.ShareCommon` callees (checks `.fap`
+and `.pap` calls directly without per-declaration `NameSet` allocation). `none` = fuel exhausted. -/
+def irFnBodyShareCommonHits (sc : Std.HashSet Name) (fuel : Nat) (b : IR.FnBody)
+    (acc : Array Name) : Option (Array Name) :=
+  match fuel with
+  | 0 => none
+  | fuel + 1 =>
+    match b with
+    | .vdecl _ _ v rest =>
+      let acc := match v with
+        | .fap f _ | .pap f _ => recordScConst sc f acc
+        | _ => acc
+      irFnBodyShareCommonHits sc fuel rest acc
+    | .jdecl _ _ v rest => do
+      let acc ← irFnBodyShareCommonHits sc fuel v acc
+      irFnBodyShareCommonHits sc fuel rest acc
+    | .case _ _ _ alts => do
+      let mut acc := acc
+      for alt in alts do
+        acc ← irFnBodyShareCommonHits sc fuel alt.body acc
+      return acc
+    | e =>
+      if e.isTerminal then some acc
+      else irFnBodyShareCommonHits sc fuel e.body acc
+
 /-- Vector 4a: direct imports of `Init.ShareCommon` and references to its surface from LCNF bodies
 (`baseExt` / `monoExt`), compiled IR (`IR.declMapExt`), and `@[extern]` bindings. -/
 def shareCommonView (ctx : AuditContext) (sc : Std.HashSet Name) (fuel : Nat) (v : ModuleView) :
@@ -1733,12 +1780,21 @@ def shareCommonView (ctx : AuditContext) (sc : Std.HashSet Name) (fuel : Nat) (v
     | some cs =>
       for c in cs do report .shareCommonReference d.name v.module s!"LCNF body references {c}"
   let checkIr (d : IR.Decl) : PureAuditM Unit := do
-    if let .extern dn _ _ ed := d then
+    let mut hits := recordScConst sc d.name #[]
+    if let some initFn := getInitFnNameFor? env d.name then
+      hits := recordScConst sc initFn hits
+    match d with
+    | .extern dn _ _ ed =>
       if externDataTouchesShareCommon ed then
         report .shareCommonReference dn v.module "compiled IR extern binds a ShareCommon runtime symbol"
-    for c in IR.collectUsedDecls env [d] do
-      if sc.contains c || isShareCommonConst env c then
-        report .shareCommonReference d.name v.module s!"compiled IR references {c}"
+    | .fdecl _ _ _ body _ =>
+      match irFnBodyShareCommonHits sc fuel body hits with
+      | none =>
+        report .auditFuelExhausted d.name v.module "IR body walk exhausted its fuel"
+        return
+      | some hs => hits := hs
+    for c in hits do
+      report .shareCommonReference d.name v.module s!"compiled IR references {c}"
   match v.idx? with
   | some i =>
     for d in Compiler.LCNF.baseExt.getModuleEntries env i do checkLcnf d
@@ -2053,8 +2109,8 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (v : Modul
   for (extName, label) in generic do
     let k := extCounts.getD extName 0
     if k > 0 then hook m m s!"{label}: module stores {k} entr{if k == 1 then "y" else "ies"}"
-  let modKernelNames : NameSet := v.data.constNames.foldl (·.insert ·) {}
-  let modExtraNames : NameSet := v.data.extraConstNames.foldl (·.insert ·) {}
+  let mut modKernelNames? : Option NameSet := none
+  let mut modExtraNames? : Option NameSet := none
   match v.idx? with
   | some i =>
     for (n, _) in Compiler.implementedByAttr.ext.getModuleEntries env i ++ Compiler.implementedByAttr.ext.getModuleIREntries env i do
@@ -2101,9 +2157,15 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (v : Modul
         report .foreignCompilerTag n m "noConfusion tag on a foreign declaration"
       else if !genuineOwnedNoConfusion ctx m n then
         report .compilerOverrideHook n m "noConfusion tag on a non-noConfusion declaration"
-    for se in Compiler.LCNF.Specialize.specCacheExt.getModuleEntries env i ++
-        Compiler.LCNF.Specialize.specCacheExt.getModuleIREntries env i do
-      validateSpecCacheEntry ctx m modKernelNames modExtraNames se
+    let specEntries := Compiler.LCNF.Specialize.specCacheExt.getModuleEntries env i ++
+        Compiler.LCNF.Specialize.specCacheExt.getModuleIREntries env i
+    if !specEntries.isEmpty then
+      let mkn := v.data.constNames.foldl (·.insert ·) {}
+      let men := v.data.extraConstNames.foldl (·.insert ·) {}
+      modKernelNames? := some mkn
+      modExtraNames? := some men
+      for se in specEntries do
+        validateSpecCacheEntry ctx m mkn men se
   | none =>
     for n in v.data.constNames ++ v.data.extraConstNames do
       if (Compiler.implementedByAttr.getParam? env n).isSome then hook n m "implemented_by"
@@ -2137,8 +2199,12 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (v : Modul
     for entry in Compiler.LCNF.postponedCompileDeclsExt.getEntries env do
       for n in entry.declNames do
         report .postponedCompilation n m "compilation postponed (no IR stored)"
-    for (key, dn) in (Compiler.LCNF.Specialize.specCacheExt.getState env).toList do
-      validateSpecCacheEntry ctx m modKernelNames modExtraNames { key, declName := dn }
+    let liveSpec := (Compiler.LCNF.Specialize.specCacheExt.getState env).toList
+    if !liveSpec.isEmpty then
+      let mkn := modKernelNames?.getD (v.data.constNames.foldl (·.insert ·) {})
+      let men := modExtraNames?.getD (v.data.extraConstNames.foldl (·.insert ·) {})
+      for (key, dn) in liveSpec do
+        validateSpecCacheEntry ctx m mkn men { key, declName := dn }
   -- Cross-phase direct-return consistency across kernel `ConstantInfo`, `baseExt`, `monoExt`, and
   -- `IR.declMapExt` (catches `.ir` or `monoExt` body tampering that registers no hook attribute).
   -- For imported modules (`v.idx? = some i`), index only that module's own compiled LCNF/IR entries
@@ -2163,11 +2229,11 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (v : Modul
          externAttr.ext.getModuleIREntries env i).foldl (fun s (n, _) => s.insert n) {}
       for ci in v.data.constants do
         if !(ci matches .thmInfo _) && !implSet.contains ci.name && !extSet.contains ci.name then
-          let kr := classifyKernel env ci
-          if kr != .other then
-            let br := baseRets.getD ci.name .other
-            let mr := monoRets.getD ci.name .other
-            let ir := irRets.getD ci.name .other
+          let br := baseRets.getD ci.name .other
+          let mr := monoRets.getD ci.name .other
+          let ir := irRets.getD ci.name .other
+          if br != .other || mr != .other || ir != .other then
+            let kr := classifyKernel env ci
             unless simpleRetCompat kr br && simpleRetCompat kr mr && simpleRetCompat kr ir &&
                 simpleRetCompat br mr && simpleRetCompat mr ir do
               hook ci.name m "cross_phase_body: compiled LCNF/IR return contradicts kernel definition"
@@ -2828,34 +2894,34 @@ def kernelScanChunk (ctx : AuditContext) (sc : Std.HashSet Name) (structural sca
     (match e with | .const c _ => isBadConst c | _ => false) ||
     (structural && maybeOpaqueHit e && (opaqueHitAt? env e).isSome)
   let consts := v.data.constants[lo:hi].toArray
-  let mut fullExprs : Array Expr := #[]
-  let mut fastThmVals : Array Expr := #[]
-  for ci in consts do
-    fullExprs := fullExprs.push ci.type
-    match ci with
-    | .thmInfo _ =>
-      if let some val := ci.value? (allowOpaque := true) then
-        if includeThmBodies then fullExprs := fullExprs.push val
-        else fastThmVals := fastThmVals.push val
-    | _ =>
-      if let some val := ci.value? (allowOpaque := true) then fullExprs := fullExprs.push val
-    if let .recInfo rv := ci then
-      for r in rv.rules do fullExprs := fullExprs.push r.rhs
-  -- Overlap the C++ `getUsedConstants` theorem-body screen with the `fullExprs.find?` traversal on
-  -- separate worker threads so large modules never serialize the two region walks on a single core.
-  -- Without the structural scan the screen is a pure constant-membership test, so one C++
-  -- `getUsedConstants` pass over the whole slice (types, values, theorem bodies, recursor rules)
-  -- replaces the per-node Lean `find?` callback; with it, `find?` covers the full expressions and
-  -- `getUsedConstants` the theorem bodies excluded from the structural walk.
   let (fullHit, fastThmHit) :=
-    if structural then
+    if structural then Id.run do
+      let mut fullExprs : Array Expr := Array.emptyWithCapacity (consts.size * 2)
+      let mut fastThmVals : Array Expr := #[]
+      for ci in consts do
+        fullExprs := fullExprs.push ci.type
+        match ci with
+        | .thmInfo _ =>
+          if let some val := ci.value? (allowOpaque := true) then
+            if includeThmBodies then fullExprs := fullExprs.push val
+            else fastThmVals := fastThmVals.push val
+        | _ =>
+          if let some val := ci.value? (allowOpaque := true) then fullExprs := fullExprs.push val
+        if let .recInfo rv := ci then
+          for r in rv.rules do fullExprs := fullExprs.push r.rhs
       let fastThmTask := Task.spawn fun _ =>
         !fastThmVals.isEmpty && ((mkAppN (.sort .zero) fastThmVals).getUsedConstants.any isBadConst)
       let fullHit := !fullExprs.isEmpty && ((mkAppN (.sort .zero) fullExprs).find? pFull).isSome
-      (fullHit, fastThmTask.get)
-    else
-      let hit := (mkAppN (.sort .zero) (fullExprs ++ fastThmVals)).getUsedConstants.any isBadConst
-      (hit, hit)
+      return (fullHit, fastThmTask.get)
+    else Id.run do
+      let mut allExprs : Array Expr := Array.emptyWithCapacity (consts.size * 2)
+      for ci in consts do
+        allExprs := allExprs.push ci.type
+        if let some val := ci.value? (allowOpaque := true) then allExprs := allExprs.push val
+        if let .recInfo rv := ci then
+          for r in rv.rules do allExprs := allExprs.push r.rhs
+      let hit := !allExprs.isEmpty && ((mkAppN (.sort .zero) allExprs).getUsedConstants.any isBadConst)
+      return (hit, hit)
   if !fullHit && !fastThmHit then return
   let mut reportedForbidden : NameSet := {}
   for ci in consts do
@@ -2903,18 +2969,44 @@ def kernelScanChunk (ctx : AuditContext) (sc : Std.HashSet Name) (structural sca
         for (t, why) in hits do
           flag .opaqueTheoremStructural ci.name v.module s!"theorem {t} in δ position ({why})"
 
-/-- Vector 4a over modules: imports, kernel references (one whole-module cached traversal per
-module so shared subterms inside a compacted `.olean` region are visited at most once), LCNF and IR. -/
+/-- Vector 4a over modules: imports, kernel references (chunked at 512 declarations per task for
+large modules so multi-thousand-declaration modules parallelize cleanly across worker threads),
+LCNF and IR. -/
 def auditShareCommon (ctx : AuditContext) (views : Array ModuleView) (structural : Bool := true)
     (theoremBodies : Bool := true) (fuel : Nat := 2000000) (checkImplicitAxioms : Bool := false) :
     AuditM Unit := do
   let sc := shareCommonSet ctx.env
+  -- Schedule largest modules first (LPT) and split multi-thousand-constant modules into 512-decl
+  -- chunks so heavy modules do not form a single-threaded straggler tail.
+  let chunkSize : Nat := 512
+  let mut kernWork : Array (Nat × ModuleView × Nat × Nat) := #[]
+  for idx in [0:views.size] do
+    let v := views[idx]!
+    let n := v.data.constants.size
+    if n ≤ chunkSize then
+      kernWork := kernWork.push (idx, v, 0, n)
+    else
+      let numChunks := (n + chunkSize - 1) / chunkSize
+      for c in [0:numChunks] do
+        let lo := c * chunkSize
+        let hi := min n (lo + chunkSize)
+        kernWork := kernWork.push (idx, v, lo, hi)
+  -- Launch largest chunks first for load balance, then absorb in deterministic `(viewIdx, lo)` order.
+  let lptOrder := (Array.range kernWork.size).qsort fun a b =>
+    let (_, _, alo, ahi) := kernWork[a]!
+    let (_, _, blo, bhi) := kernWork[b]!
+    (ahi - alo) > (bhi - blo)
+  let mut kernTasks : Array (Option (Task AuditSummary)) := Array.replicate kernWork.size none
+  for k in lptOrder do
+    let (_, v, lo, hi) := kernWork[k]!
+    let tk := Task.spawn fun _ =>
+      ((kernelScanChunk ctx sc structural theoremBodies checkImplicitAxioms fuel v lo hi).run {}).2
+    kernTasks := kernTasks.set! k (some tk)
   let lcnfTasks := views.map fun v => Task.spawn fun _ => ((shareCommonView ctx sc 100000 v).run {}).2
-  let kernTasks := views.map fun v => Task.spawn fun _ =>
-    ((kernelScanChunk ctx sc structural theoremBodies checkImplicitAxioms fuel v 0 v.data.constants.size).run {}).2
   for i in [0:views.size] do
     absorb lcnfTasks[i]!.get
-    absorb kernTasks[i]!.get
+  for k in [0:kernTasks.size] do
+    if let some tk := kernTasks[k]! then absorb tk.get
 
 /-- Vector 4c Layer B on each requested declaration (hard violations). Layer A runs inside
 `auditShareCommon`'s shared kernel traversal. -/
@@ -3072,6 +3164,7 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
   let mut info : Std.HashMap Name BuildModuleInfo := {}
   let mut extImporters : Std.HashMap Name (Array Name) := {}
   let mut extOrder : Array Name := #[]
+  let mut verifiedTc : NameSet := {}
   let mut queued : NameSet := initTodo.foldl (·.insert ·) {}
   let mut frontier : Array Name := initTodo
   let savedG ← searchPathRef.get
@@ -3195,6 +3288,7 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
           report vk i i msg
           failedExternal := failedExternal.push i
         | .ok (i, .ok nextImps) =>
+          verifiedTc := verifiedTc.insert i
           for j in nextImps do
             unless modSet.contains j do
               tcRevImporters := tcRevImporters.insert j ((tcRevImporters.getD j #[]).push i)
@@ -3244,7 +3338,7 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
       let mut audited : NameSet := {}
       let mut seen : NameSet := {}
       try
-        match ← mkAuditContext env sysrootLib with
+        match ← mkAuditContext env sysrootLib none verifiedTc with
         | ctx =>
           runAllFourVectorAudits ctx { cfg with resolution? := none }
           for mi in env.header.modules do
