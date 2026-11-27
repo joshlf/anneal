@@ -1459,6 +1459,70 @@ theorem mr_concurrent_basic_retag_ptr_noop (cm : ConcurrentMemory BM) (fe : Memo
     ConcurrentMemory.retag_ptr cm fe ptr ptrTy fnEntry fnImplicitWrites vtableLookup =
       .ok (ptr, cm, fe) := rfl
 
+/-- `D1` concrete non-vacuity witnesses for `mr_checkPtrM_slice_isize_overflow_ub` and
+`mr_checkPtrM_tuple_slice_isize_overflow_ub` at the exact `isize::MAX` boundaries of `[u32]`,
+`HeaderSlice`, and `Align8TailU16`. -/
+theorem mr_checkPtrM_overflow_witnesses :
+    let headerPt : PointeeInfo :=
+      { layout := .Tuple ⟨⟨1⟩, ⟨1⟩, none⟩ (.Slice ⟨4⟩ ⟨4⟩), inhabited := true,
+        unsafe_cells := .Sized [], freeze := true, unpin := true }
+    let align8Pt : PointeeInfo :=
+      { layout := .Tuple ⟨⟨8⟩, ⟨8⟩, none⟩ (.Slice ⟨2⟩ ⟨2⟩), inhabited := true,
+        unsafe_cells := .Sized [], freeze := true, unpin := true }
+    checkPtrM (M := BM) ⟨⟨4096, none⟩, some (.ElementCount 2305843009213693952)⟩
+      (.Ref .Immutable mrSliceU32Pointee) none =
+        ub "Value::Ptr: total size exeeds isize::MAX" ∧
+    checkPtrM (M := BM) ⟨⟨4096, none⟩, some (.ElementCount 2305843009213693951)⟩
+      (.Ref .Immutable headerPt) none =
+        ub "Value::Ptr: total size exeeds isize::MAX" ∧
+    checkPtrM (M := BM) ⟨⟨4096, none⟩, some (.ElementCount 4611686018427387897)⟩
+      (.Ref .Immutable align8Pt) none =
+        ub "Value::Ptr: total size exeeds isize::MAX" := by
+  refine ⟨?_, ?_, ?_⟩
+  · exact mr_checkPtrM_slice_isize_overflow_ub (M := BM) ⟨4096, none⟩
+      (.Ref .Immutable mrSliceU32Pointee) mrSliceU32Pointee ⟨4⟩ ⟨4⟩ 2305843009213693952 none
+      (by decide) rfl rfl rfl (by omega) (by decide) (by decide)
+  · exact mr_checkPtrM_tuple_slice_isize_overflow_ub (M := BM) ⟨4096, none⟩
+      (.Ref .Immutable _) _ ⟨⟨1⟩, ⟨1⟩, none⟩ ⟨4⟩ ⟨4⟩ 2305843009213693951 none
+      (by decide) rfl rfl rfl (by omega) (by decide) (by decide)
+  · exact mr_checkPtrM_tuple_slice_isize_overflow_ub (M := BM) ⟨4096, none⟩
+      (.Ref .Immutable _) _ ⟨⟨8⟩, ⟨8⟩, none⟩ ⟨2⟩ ⟨2⟩ 4611686018427387897 none
+      (by decide) rfl rfl rfl (by omega) (by decide) (by decide)
+
+/-- `D2` concrete non-vacuity witnesses for `mr_union_single_chunk_decode_encode_roundtrip`
+(partially initialized `[0x2A, uninit, uninit, uninit]`) and `mr_decodeM_bool_invalid` (byte `2`). -/
+theorem mr_union_roundtrip_and_bool_invalid_witnesses :
+    let partialBytes : List (AbstractByte Prov) := [.Init 42 none, .Uninit, .Uninit, .Uninit]
+    (do
+      match ← Type.decodeM (M := BM) mrMuU32Ty partialBytes with
+      | some v => Type.encodeM (M := BM) mrMuU32Ty v
+      | none => ub "unexpected union decode failure") = pure partialBytes ∧
+    Type.decodeM (M := BM) .Bool [.Init 2 none] = pure none :=
+  ⟨mr_union_single_chunk_decode_encode_roundtrip (M := BM)
+      [(⟨0⟩, unitType), (⟨0⟩, CrossFrameRefAndPanicMR.u32Ty), (⟨0⟩, mrU8Ty)]
+      4 ⟨4⟩ [.Init 42 none, .Uninit, .Uninit, .Uninit] rfl,
+   mr_decodeM_bool_invalid (M := BM) 2 none (by decide) (by decide)⟩
+
+/-- `D3` non-vacuity witness for `mr_ptrOffsetInboundsM_ok_eq_wrapping`: offsetting a valid
+in-bounds address `0` by `0` succeeds on `Mach` (`signed_dereferenceable` on size `0` requires only
+in-bounds address) and agrees with `ptrOffsetWrappingM`. -/
+theorem mr_ptrOffsetInboundsM_ok_witness :
+    ∃ m0 : Mach,
+      MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM (M := BM) () mrWdProg14 = .ok m0 ∧
+      ptrOffsetInboundsM m0 ⟨0, none⟩ 0 = pure (ptrOffsetWrappingM ⟨0, none⟩ 0) := by
+  have hok : (MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM (M := BM) () mrWdProg14).toBool = true := by
+    kernel_rfl
+  cases h : MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM (M := BM) () mrWdProg14 with
+  | ok m0 =>
+    refine ⟨m0, rfl, ?_⟩
+    have hRes : ptrOffsetInboundsM m0 ⟨0, none⟩ 0 = pure ⟨0, none⟩ := by
+      simp [ptrOffsetInboundsM, ConcurrentMemory.signed_dereferenceable,
+        MemoryOps.signed_dereferenceable, BM.signed_dereferenceable, BM.dereferenceable,
+        BM.check_ptr, inBounds, Size.bits, x86_64.PTR_SIZE]
+    have hEq := (mr_ptrOffsetInboundsM_ok_eq_wrapping m0 ⟨0, none⟩ ⟨0, none⟩ 0 hRes).2.1
+    exact hRes.trans (congrArg pure hEq)
+  | error e => rw [h] at hok; cases hok
+
 /-- **`minirust#300` flip canary**: this theorem holds exactly while the pin predates upstream
 `374bf855`. Bumping the pin past `#300` makes pinned `checkPtrM` reject the null `fn()` and breaks
 this statement (and the case `22` table cell), flagging that `checkPtrFnNonNull` /
@@ -1511,6 +1575,28 @@ theorem ep1_minirust_widedst_maybeuninit_capstone :
     mr_ptrOffsetWrappingM_compose, fun ptr m h => checkPtrFnNonNull_fnptr_null ptr m h,
     fun ptr ty m h => checkPtrFnNonNull_ne_fnptr ptr ty m h⟩
   decide +kernel
+
+/-- **Episode 1 MiniRust universal-laws & witnesses capstone**: bundles the remaining universal
+`D1`–`D4` laws (`Align8TailU16`, `checkPtrM` `isize::MAX` overflow, `Type.Union` decode→encode
+round-trip, `bool` invalid byte, `ptrOffsetInboundsM`, Case 19 `BasicMemory` no-op retag,
+Trusted `decodeTypedValueFromBytes` / `intrinsicWidePointeeStep`, and the `#300` flip canary)
+together with their concrete non-vacuity witnesses. -/
+theorem ep1_minirust_universal_laws_capstone :
+    type_of% mr_align8_tail_u16_full_size ∧
+    type_of% mr_checkPtrM_overflow_witnesses ∧
+    type_of% mr_union_roundtrip_and_bool_invalid_witnesses ∧
+    type_of% mr_ptrOffsetInboundsM_ok_witness ∧
+    type_of% mr_ptrOffsetInboundsM_oob_witness ∧
+    type_of% mr_basic_retag_ptr_noop ∧
+    type_of% mr_concurrent_basic_retag_ptr_noop ∧
+    type_of% trusted_decodeTypedValueFromBytes_null_witness ∧
+    type_of% trusted_intrinsicWidePointeeStep_adt_unsupported ∧
+    type_of% mr_minirust300_flip_canary :=
+  ⟨mr_align8_tail_u16_full_size, mr_checkPtrM_overflow_witnesses,
+   mr_union_roundtrip_and_bool_invalid_witnesses, mr_ptrOffsetInboundsM_ok_witness,
+   mr_ptrOffsetInboundsM_oob_witness, mr_basic_retag_ptr_noop,
+   mr_concurrent_basic_retag_ptr_noop, trusted_decodeTypedValueFromBytes_null_witness,
+   trusted_intrinsicWidePointeeStep_adt_unsupported, mr_minirust300_flip_canary⟩
 
 section AxiomAudit
 open Lean Elab Command

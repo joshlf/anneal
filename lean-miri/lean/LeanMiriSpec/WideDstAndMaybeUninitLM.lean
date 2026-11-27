@@ -2308,9 +2308,15 @@ end UniversalLaws
 section StepDriver
 open Miri.ABI Miri.Memory Miri.Interpreter LeanMiriSpec.Correspondence
 
-/-- `CastHooks` overlay over `annealCastHooksLM2_2` wiring `.Transmute` (`copyAllowTransmute`)
-through unmodified vendored `Miri.Memory.Validity.checkScalar` against the target layout's
-`validRange` (`pointerLayoutData true` for `fn() -> u32`, `pointerLayoutData false` for `*const u8`). -/
+/-- Harness-provided `CastHooks` adapter over `annealCastHooksLM2_2`:
+1. `typeInfo 40 := .rawPointer 51` bridges `Translate.lean`'s aggregate-pointee thin raw-pointer
+   encoding (`*const [u32; 3]`, `TyId = 40`, which `castTypeInfoOfEncodedTyId` leaves unwired) to
+   vendored `Miri.Interpreter.Cast.ptrToPtr`;
+2. `copyAllowTransmute` bridges `CastKind.Transmute` directly to unmodified vendored
+   `Miri.Memory.Validity.checkScalar` against the target layout's `validRange`
+   (`pointerLayoutData true` for `fn() -> u32`, `pointerLayoutData false` for `*const u8`).
+Both hooks are thin harness adapters; every layout, cast, and validity decision is performed by the
+vendored `Miri` functions. -/
 def wdCastHooks (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
     Miri.Interpreter.CastHooks
       AnnealProv AnnealStepState Unit (Miri.Interpreter.RuntimePlace AnnealProv) :=
@@ -2419,9 +2425,55 @@ private def wdStepD3Locals (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
     if idx == 1 then ⟨.live (.indirect arrMp), l⟩
     else ⟨.live (.immediate .uninit), l⟩).toArray
 
-private def wdStepIsUb : Except StepError (Option (Miri.Interpreter.LocalValue AnnealProv)) → Bool
-  | .error (.undefinedBehavior _) => true
-  | _ => false
+/-- Run exactly `n` iterations of `Miri.Interpreter.Step.step` (returning the intermediate state),
+used to observe intermediate local values (such as `_4 = base + 100` right after `arith_offset`). -/
+private def wdRunMiriStepsState
+    (hooks : Miri.Interpreter.StepHooks AnnealProv Miri.Interpreter.LocalLayout Unit AnnealMachine
+      Unit (Miri.Interpreter.RuntimePlace AnnealProv))
+    (steps : Nat) (st : AnnealStepState) : Except StepError AnnealStepState :=
+  match steps with
+  | 0 => .ok st
+  | n + 1 =>
+    let (st', res) := Miri.Interpreter.Step.step hooks () st
+    match res with
+    | .error e => .error e
+    | .ok _ => wdRunMiriStepsState hooks n st'
+
+private def wdStepAid2 : AllocId := ⟨2, by decide⟩
+private def wdStepBase2 : UInt64 := 8589934592
+
+private def wdStepD2Mach : AnnealMachine :=
+  match Allocation.tryNew (Prov := AnnealProv) (Size.ofBytes 4) ⟨2⟩ .Uninit
+      (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) with
+  | .ok a =>
+    { AnnealMachine.empty with
+      memory := { (MemoryState.empty : AnnealMemory) with
+        live := #[(wdStepAid1, ⟨.stack, a.withExtra none⟩),
+                  (wdStepAid2, ⟨.stack, a.withExtra none⟩)] },
+      addresses := { AnnealMachine.empty.addresses with
+        baseAddr := #[⟨wdStepAid1, wdStepBase1⟩, ⟨wdStepAid2, wdStepBase2⟩] } }
+  | .error _ => AnnealMachine.empty
+
+private def wdStepD2Locals (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    Array (Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) :=
+  let lays := body.localDecls.map (fun d => some (translateTy d.ty body.layouts))
+  let mp1 : Miri.Interpreter.MemPlace AnnealProv :=
+    ⟨⟨Size.ofBytes wdStepBase1, some (.concrete wdStepAid1 .one)⟩, .none, none⟩
+  let mp2 : Miri.Interpreter.MemPlace AnnealProv :=
+    ⟨⟨Size.ofBytes wdStepBase2, some (.concrete wdStepAid2 .one)⟩, .none, none⟩
+  (lays.zipIdx.map fun (l, idx) =>
+    if idx == 1 then ⟨.live (.indirect mp1), l⟩
+    else if idx == 2 then ⟨.live (.indirect mp2), l⟩
+    else ⟨.live (.immediate .uninit), l⟩).toArray
+
+/-- `D2` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase11Mir`**: stepping
+`ManuallyDrop<u32>` write `77`, copy, and field-`0` projection read through unmodified
+`Miri.Interpreter.Step.step` returns `77`, matching `lmWdObserve _ 11`. -/
+theorem lm_step_wdCase11_manually_drop_ok :
+    wdRunMiriSteps (wdStepHooks wdCase11Mir) 16
+      (wdMkStepState wdCase11Mir wdU32Ty (wdStepD2Locals wdCase11Mir) wdStepD2Mach) =
+      .ok (some (.live (.immediate (.scalar (wdStepUInt 77 4))))) := by
+  decide +kernel
 
 /-- `D3` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase14Mir`**: stepping the
 translated `CapturedMir` fixture (`*const [u32;3] -> *const u8 -> +4 -> *const u32 -> +1 -> -1 -> *p`)
@@ -2433,13 +2485,54 @@ theorem lm_step_wdCase14_ok :
       .ok (some (.live (.immediate (.scalar (wdStepUInt 200 4))))) := by
   decide +kernel
 
+/-- `D3` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase15Mir`**: stepping
+`arith_offset(+100)` out of bounds and `arith_offset(-96)` back in bounds through unmodified
+`Miri.Interpreter.Step.step` -> `Call.evalCallTerminator` -> `Intrinsics.eval` (`"arith_offset"`)
+-> `Pointer.wrappingSignedOffset` returns `arr[1] = 200`, matching `lmWdObserve _ 15 = .okScalar 200`. -/
+theorem lm_step_wdCase15_wrapping_oob_and_back_ok :
+    wdRunMiriSteps (wdStepHooks wdCase15Mir) 16
+      (wdMkStepState wdCase15Mir wdU32Ty (wdStepD3Locals wdCase15Mir) wdStepArr3Mach) =
+      .ok (some (.live (.immediate (.scalar (wdStepUInt 200 4))))) := by
+  decide +kernel
+
 /-- `D3` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase16Mir`**: stepping the
 translated `CapturedMir` fixture (`offset(+100)` past the 12-byte array, no deref) through
-unmodified `Miri.Interpreter.Step.step` + `ptrOffsetInbounds` faults with `.undefinedBehavior`,
-matching `lmWdObserve _ 16 = .ub`. -/
+unmodified `Miri.Interpreter.Step.step` + `ptrOffsetInbounds` faults with exact
+`"pointer Offset out of bounds"` UB, matching `lmWdObserve _ 16 = .ub`. -/
 theorem lm_step_wdCase16_oob_ub :
-    wdStepIsUb (wdRunMiriSteps (wdStepHooks wdCase16Mir) 16
-      (wdMkStepState wdCase16Mir wdU32Ty (wdStepD3Locals wdCase16Mir) wdStepArr3Mach)) = true := by
+    wdRunMiriSteps (wdStepHooks wdCase16Mir) 16
+      (wdMkStepState wdCase16Mir wdU32Ty (wdStepD3Locals wdCase16Mir) wdStepArr3Mach) =
+      .error (.undefinedBehavior "pointer Offset out of bounds") := by
+  decide +kernel
+
+/-- `D3` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase17Mir`**: proves BOTH:
+1. After 3 steps (`&raw const _1`, `as *const u8`, `arith_offset(+100)`), local `_4` holds the
+   exact concrete OOB pointer `wdStepBase1 + 100` (proving `arith_offset` genuinely executed via
+   `Call.evalCallTerminator` -> `Intrinsics.eval`, NOT an uninitialized local!), AND
+2. Dereferencing `_5 = _4 as *const u32` at offset `100` in the 12-byte allocation faults because
+   `Allocation.readScalar` checks `InitMask.isRangeInitialized [100, 104)` (`finish > 12` returns
+   `.error [12, 104)`), surfacing `.error (.undefinedBehavior "read of uninitialized memory field")`
+   through `annealReadIndirectImmediate`, matching `lmWdObserve _ 17 = .ub`. -/
+theorem lm_step_wdCase17_wrapping_oob_deref_ub :
+    let oobPtr : Scalar AnnealProv :=
+      Scalar.fromPointer annealTargetDataLayout
+        ⟨Size.ofBytes (wdStepBase1 + 100), .concrete wdStepAid1 .one⟩
+    (wdRunMiriStepsState (wdStepHooks wdCase17Mir) 3
+        (wdMkStepState wdCase17Mir wdU32Ty (wdStepD3Locals wdCase17Mir) wdStepArr3Mach)).map
+        (fun st => st.stack.frames[0]?.bind fun f => f.locals[4]?.map (·.value)) =
+      .ok (some (.live (.immediate (.scalar oobPtr)))) ∧
+    wdRunMiriSteps (wdStepHooks wdCase17Mir) 16
+      (wdMkStepState wdCase17Mir wdU32Ty (wdStepD3Locals wdCase17Mir) wdStepArr3Mach) =
+      .error (.undefinedBehavior "read of uninitialized memory field") := by
+  refine ⟨?_, ?_⟩ <;> decide +kernel
+
+/-- `D3` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase18Mir`**: stepping
+`offset(0)` + `arith_offset(0)` + `*p` through unmodified `Miri.Interpreter.Step.step` returns
+`arr[0] = 100`, matching `lmWdObserve _ 18 = .okScalar 100`. -/
+theorem lm_step_wdCase18_zero_offset_chain_ok :
+    wdRunMiriSteps (wdStepHooks wdCase18Mir) 16
+      (wdMkStepState wdCase18Mir wdU32Ty (wdStepD3Locals wdCase18Mir) wdStepArr3Mach) =
+      .ok (some (.live (.immediate (.scalar (wdStepUInt 100 4))))) := by
   decide +kernel
 
 /-- `D4` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase20Mir`**: stepping
@@ -2511,30 +2604,42 @@ theorem lm_step_wdCase19_basic_ok :
   decide +kernel
 
 /-- `D4` case `22` executes the SAME shared fixture as case `21` (`wdCase21Mir`): LeanMiri's
-`Step.step` rejects the null `fn()` regardless of MiniRust's pinned `checkPtr` (the pin delta). -/
+`Step.step` rejects the null `fn()` with exact `"invalid scalar value in transmute"` regardless of
+MiniRust's pinned `checkPtr` (the pin delta). -/
 theorem lm_step_wdCase22_null_fnptr_ub :
     let fnLay := some (translateTy wdFnPtrTy wdCase21Mir.layouts)
     let usLay := some (translateTy wdUsizeTy wdCase21Mir.layouts)
-    wdStepIsUb (wdRunMiriSteps (wdStepHooks wdCase21Mir) 8
+    wdRunMiriSteps (wdStepHooks wdCase21Mir) 8
       (wdMkStepState wdCase21Mir wdFnPtrTy
         #[⟨.live (.immediate .uninit), fnLay⟩,
-          ⟨.live (.immediate (.scalar (wdStepUInt 0 8))), usLay⟩])) = true := by
+          ⟨.live (.immediate (.scalar (wdStepUInt 0 8))), usLay⟩]) =
+      .error (.undefinedBehavior "invalid scalar value in transmute") := by
   decide +kernel
 
 /-- **Step-driver capstone**: every direct `Miri.Interpreter.Step.step` execution of a shared
-`CapturedMir` fixture (cases `14`, `16`, `19` without a borrow tracker, `20`, `21`, `22`, `23`)
-agrees with the harness table, over a backing allocation that really holds `[100, 200, 300]`. -/
+`CapturedMir` fixture (cases `11`, `14`, `15`, `16`, `17`, `18`, `19` without a borrow tracker,
+`20`, `21`, `22`, `23` — 11 shared fixtures covering `ManuallyDrop`, ALL `D3` pointer-offset &
+`arith_offset` chains, and ALL `D4` `FnPtr`/raw transmutes!) agrees with the harness table, over
+a backing allocation that really holds `[100, 200, 300]`, with exact UB messages. -/
 theorem ep1_lean_miri_step_driver_capstone :
-    type_of% lm_step_arr3_backing_is_100_200_300 ∧ type_of% lm_step_wdCase14_ok ∧
-    type_of% lm_step_wdCase16_oob_ub ∧ type_of% lm_step_wdCase19_basic_ok ∧
-    type_of% lm_step_wdCase20_fnptr_ok ∧ type_of% lm_step_wdCase21_null_fnptr_ub ∧
-    type_of% lm_step_wdCase22_null_fnptr_ub ∧ type_of% lm_step_wdCase23_null_raw_ok ∧
-    lmWdObserve false 14 = .okScalar 200 ∧ lmWdObserve false 16 = .ub ∧
+    type_of% lm_step_arr3_backing_is_100_200_300 ∧
+    type_of% lm_step_wdCase11_manually_drop_ok ∧ type_of% lm_step_wdCase14_ok ∧
+    type_of% lm_step_wdCase15_wrapping_oob_and_back_ok ∧ type_of% lm_step_wdCase16_oob_ub ∧
+    type_of% lm_step_wdCase17_wrapping_oob_deref_ub ∧ type_of% lm_step_wdCase18_zero_offset_chain_ok ∧
+    type_of% lm_step_wdCase19_basic_ok ∧ type_of% lm_step_wdCase20_fnptr_ok ∧
+    type_of% lm_step_wdCase21_null_fnptr_ub ∧ type_of% lm_step_wdCase22_null_fnptr_ub ∧
+    type_of% lm_step_wdCase23_null_raw_ok ∧
+    lmWdObserve false 11 = .okScalar 77 ∧ lmWdObserve false 14 = .okScalar 200 ∧
+    lmWdObserve false 15 = .okScalar 200 ∧ lmWdObserve false 16 = .ub ∧
+    lmWdObserve false 17 = .ub ∧ lmWdObserve false 18 = .okScalar 100 ∧
     lmWdObserve false 19 = .okScalar 999 ∧ lmWdObserve false 20 = .okFnPtr 1 ∧
     lmWdObserve false 21 = .ub ∧ lmWdObserve false 22 = .ub ∧ lmWdObserve false 23 = .okFnPtr 0 := by
-  refine ⟨lm_step_arr3_backing_is_100_200_300, lm_step_wdCase14_ok, lm_step_wdCase16_oob_ub,
+  refine ⟨lm_step_arr3_backing_is_100_200_300, lm_step_wdCase11_manually_drop_ok, lm_step_wdCase14_ok,
+    lm_step_wdCase15_wrapping_oob_and_back_ok, lm_step_wdCase16_oob_ub,
+    lm_step_wdCase17_wrapping_oob_deref_ub, lm_step_wdCase18_zero_offset_chain_ok,
     lm_step_wdCase19_basic_ok, lm_step_wdCase20_fnptr_ok, lm_step_wdCase21_null_fnptr_ub,
-    lm_step_wdCase22_null_fnptr_ub, lm_step_wdCase23_null_raw_ok, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+    lm_step_wdCase22_null_fnptr_ub, lm_step_wdCase23_null_raw_ok,
+    ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
   · rw [lmWdObserveU.eq_src]; decide +kernel
 
 end StepDriver
