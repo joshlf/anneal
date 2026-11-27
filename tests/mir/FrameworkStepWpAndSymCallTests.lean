@@ -400,25 +400,14 @@ theorem scaled_chunks_blockCtx :
   rw [symRunChunksWith_blockCtx_eq scaledCfg scaledBlockCtx]
   exact scaled_chunks
 
-/-- Reflective `BoolCertCut` certificate verifying that the 4-chunk pipeline
-reduces to a `.ret` (load-bearing via `symRunChunks_of_boolCert`). -/
-def scaledChunkCertCheck : List SymChunk → Bool :=
-  fun ks =>
-    match ks with
-    | [6, 7, 7, 4] => true
-    | _ => false
-
-theorem scaled_chunk_boolCert : BoolCertCut scaledChunkCertCheck [6, 7, 7, 4] :=
-  BoolCertCut.seal scaledChunkCertCheck [6, 7, 7, 4] rfl
-
-theorem scaled_chunk_boolCert_sound (_h : scaledChunkCertCheck [6, 7, 7, 4] = true) :
-    symRunChunks scaledCfg [6, 7, 7, 4] scaledEntry =
-      .ret (.scalar vres) scaledFin scaledConds :=
-  scaled_chunks
+/-- Load-bearing reflective `BoolCertCut`: `condsStatic` certifies the constant
+debug-assert side condition inside `mul_scaled` for EVERY environment. -/
+theorem scaled_assertCert : BoolCertCut condsStatic [.assertHolds (.const ⟨1, 1⟩) true] :=
+  BoolCertCut.seal _ _ rfl
 
 /-- Sealed `SymChunkCut` (`IndexedCut`) + `SymCondFirewall` (`Firewall`)
 4-chunk pipeline over `add_scaled`, plus `Chunk8BlockTree` `symRunChunksWith_sound`
-and `BoolCertCut` `symRunChunks_of_boolCert`. -/
+and load-bearing `BoolCertCut condsStatic` (`condsHold_of_boolCert`). -/
 theorem add_scaled_blockCtx_firewall {b m k : Nat} (hb : b < M64) (hm : m < M64) (hk : k < M64)
     (hbmk : b + m * k < M64) :
     ExecWithinStepsV2026 addScaledCallerBody [su b, su m, su k] [mulScaledCalleeBody]
@@ -431,14 +420,14 @@ theorem add_scaled_blockCtx_firewall {b m k : Nat} (hb : b < M64) (hm : m < M64)
           [mulScaledCalleeBody])) := by
   have hmk : m * k < M64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hbmk
   have hConds := scaled_conds_hold hb hm hk hmk hbmk
+  have hAssert : (SymCond.assertHolds (.const ⟨1, 1⟩) true).holds (scaledEnv b m k) :=
+    (condsHold_of_boolCert scaled_assertCert (scaledEnv b m k)).1
   have hpost : mirNormalPost (fun r _ => r = su (b + m * k))
       (.normal ((SymVal.scalar vres).eval (scaledEnv b m k),
         (scaledFin.toMachineState scaledCfg (scaledEnv b m k)).memory)) := by
     show Value.scalar (vres.eval (scaledEnv b m k)) = su (b + m * k)
     rw [scaled_vres_eval hb hm hk hmk hbmk]
   have hTree := (symRunChunksWith_sound scaledBlockCtx scaled_chunks_blockCtx (scaledEnv b m k)
-    hConds hpost).2.1
-  have hCert := (symRunChunks_of_boolCert scaled_chunk_boolCert scaled_chunk_boolCert_sound
     hConds hpost).2.1
   let hCut4 : SymChunkCut scaledCfg (mirNormalPost (fun r _ => r = su (b + m * k))) 4
       (scaledCp3.toMachineState scaledCfg (scaledEnv b m k)) :=
@@ -448,12 +437,32 @@ theorem add_scaled_blockCtx_firewall {b m k : Nat} (hb : b < M64) (hm : m < M64)
     symChunkCut_step scaled_chunk3 (Anneal.Firewall.wrap 3 ⟨hConds.2.2.1, trivial⟩) hCut4
   let hCut2 : SymChunkCut scaledCfg (mirNormalPost (fun r _ => r = su (b + m * k))) (7 + (7 + 4))
       (scaledCp1.toMachineState scaledCfg (scaledEnv b m k)) :=
-    symChunkCut_step scaled_chunk2 (Anneal.Firewall.wrap 2 ⟨hConds.1, hConds.2.1, trivial⟩) hCut3
+    symChunkCut_step scaled_chunk2 (Anneal.Firewall.wrap 2 ⟨hAssert, hConds.2.1, trivial⟩) hCut3
   let hCut1 : SymChunkCut scaledCfg (mirNormalPost (fun r _ => r = su (b + m * k)))
       (6 + (7 + (7 + 4))) (scaledEntry.toMachineState scaledCfg (scaledEnv b m k)) :=
     symChunkCut_step scaled_chunk1 (Anneal.Firewall.wrap 1 trivial) hCut2
   have hRes := symChunkCut_entry_sound hCut1
-  exact ⟨hTree, hCert, hRes.2.2⟩
+  exact ⟨hTree, hRes.2.1, hRes.2.2⟩
+
+/-- Explicit `Framework.StepWp.execStepOutcome` bridge for multi-frame `add_scaled`
+(`symProgRunSteps_ret_execStepOutcome`). -/
+theorem add_scaled_execStepOutcome {b m k : Nat} (hb : b < M64) (hm : m < M64) (hk : k < M64)
+    (hbmk : b + m * k < M64) :
+    execStepOutcome (v2026Step addScaledCallerBody)
+      (mirNormalPost (fun r _ => r = su (b + m * k))) (fun _ => False) 24
+      (initMachineStateWithCallees addScaledCallerBody [su b, su m, su k]
+        [mulScaledCalleeBody]) := by
+  have hmk : m * k < M64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hbmk
+  have hpost : mirNormalPost (fun r _ => r = su (b + m * k))
+      (.normal ((SymVal.scalar vres).eval (scaledEnv b m k),
+        (scaledFin.toMachineState scaledCfg (scaledEnv b m k)).memory)) := by
+    show Value.scalar (vres.eval (scaledEnv b m k)) = su (b + m * k)
+    rw [scaled_vres_eval hb hm hk hmk hbmk]
+  have h := symProgRunSteps_ret_execStepOutcome scaled_run (scaledEnv b m k)
+    (scaled_conds_hold hb hm hk hmk hbmk) hpost
+  unfold scaledEntry at h
+  rw [symProgEntry_toMachineState] at h
+  exact h
 
 /-- The 23-step prefix (everything but the root `return`). -/
 theorem scaled_chunk4_prefix :
@@ -562,26 +571,42 @@ def pairEnv (x y : Nat) : SymEnv
   | 1 => y
   | _ => 0
 
-theorem mix_conds_hold (x y : Nat) : condsHold (pairEnv x y) mixConds :=
-  ⟨⟨Nat.succ_ne_zero 3, rfl⟩, Nat.succ_ne_zero 3, trivial⟩
+/-- Load-bearing reflective `BoolCertCut`: `condsStatic` certifies ALL side
+conditions of `mix` (including `.widthNonzero` on the compound `wrappingOp`
+node `vxy`) for every environment. -/
+theorem mix_condsCert : BoolCertCut condsStatic mixConds :=
+  BoolCertCut.seal _ _ rfl
 
-/-- Universal `mix` result: exactly the trusted `bswap (wrapping_mul x y)` kernel
-composition, for all raw inputs. -/
+/-- Universal `mix` result via `symRunChunks_of_condsCert`: zero manual
+side-condition proof, exact trusted `bswap (wrapping_mul x y)` kernel
+composition for all raw inputs. -/
 theorem mix_symbolic (x y : Nat) :
     ExecWithinStepsV2026 mixBody [.scalar ⟨x, 4⟩, .scalar ⟨y, 4⟩] []
       (mirNormalPost (fun r _ => r = .scalar
         ((evalBswap ((evalWrappingMul ⟨x, 4⟩ ⟨y, 4⟩).getD symDefaultScalar)).getD
           symDefaultScalar))) 5 :=
-  (symRunChunks_sound (post := mirNormalPost (fun r _ => r = .scalar
+  (symRunChunks_of_condsCert (post := mirNormalPost (fun r _ => r = .scalar
         ((evalBswap ((evalWrappingMul ⟨x, 4⟩ ⟨y, 4⟩).getD symDefaultScalar)).getD
-          symDefaultScalar))) mix_chunk (pairEnv x y) (mix_conds_hold x y) rfl).2.1
+          symDefaultScalar))) mix_chunk mix_condsCert (pairEnv x y) rfl).1
+
+/-- Direct unmodified `mirCallTree` adequacy for `mix` (`symRunChunks_mirCallTree_sound`). -/
+theorem mix_mirCallTree_sound (x y : Nat) :
+    MirNoUBTree (mirCallTree mixBody [.scalar ⟨x, 4⟩, .scalar ⟨y, 4⟩]) ∧
+      ∀ tr out, Trusted.ITree.ReachesRet (mirCallTree mixBody [.scalar ⟨x, 4⟩, .scalar ⟨y, 4⟩])
+        tr out →
+        mirNormalPost (fun r _ => r = .scalar
+          ((evalBswap ((evalWrappingMul ⟨x, 4⟩ ⟨y, 4⟩).getD symDefaultScalar)).getD
+            symDefaultScalar)) out :=
+  symRunChunks_mirCallTree_sound (post := mirNormalPost (fun r _ => r = .scalar
+    ((evalBswap ((evalWrappingMul ⟨x, 4⟩ ⟨y, 4⟩).getD symDefaultScalar)).getD
+      symDefaultScalar))) rfl mix_chunk (pairEnv x y) (condsHold_of_boolCert mix_condsCert _) rfl
 
 /-- Concrete: `bswap(0x01020304 * 1) = 0x04030201`. -/
 theorem mix_concrete :
     ExecWithinStepsV2026 mixBody [.scalar ⟨0x01020304, 4⟩, .scalar ⟨1, 4⟩] []
       (mirNormalPost (fun r _ => r = .scalar ⟨0x04030201, 4⟩)) 5 :=
-  (symRunChunks_sound (post := mirNormalPost (fun r _ => r = .scalar ⟨0x04030201, 4⟩))
-    mix_chunk (pairEnv 0x01020304 1) (mix_conds_hold _ _) rfl).2.1
+  (symRunChunks_of_condsCert (post := mirNormalPost (fun r _ => r = .scalar ⟨0x04030201, 4⟩))
+    mix_chunk mix_condsCert (pairEnv 0x01020304 1) rfl).1
 
 /-! ### Companion: `addWithOverflow` + field proj + `!bool` + `cast .intToInt` + `deinit` + `aggregate` + `discriminant` -/
 
@@ -715,11 +740,27 @@ theorem checkedAddCast_chunk :
 
 abbrev M32 : Nat := scalarModulus 4
 
+/-- Load-bearing reflective `BoolCertCut`: `condsStatic` certifies all 4
+structural side conditions of `checked_add_cast` (including compound
+`checkedFlag` `validBool`, compound `checkedVal` `widthNonzero`, and compound
+`castInt` `widthsMatch`) for EVERY environment. -/
+theorem checkedAddCast_staticCondsCert :
+    BoolCertCut condsStatic
+      [.widthsMatch vx vy, .validBool vcaFlg, .widthNonzero vcaVal,
+       .widthsMatch vcaWide (.const ⟨0, 8⟩)] :=
+  BoolCertCut.seal _ _ rfl
+
 /-- Universal `checked_add_cast`: for all `a, b : Nat` with `a + b < 2^32`,
-returns `a + b` as `u64` within 19 steps (choice-free). -/
+returns `a + b` as `u64` within 19 steps (choice-free), discharging all 4
+structural side conditions via `checkedAddCast_staticCondsCert` and also
+establishing unmodified `mirCallTree` adequacy. -/
 theorem checkedAddCast_symbolic {a b : Nat} (hab : a + b < M32) :
     ExecWithinStepsV2026 checkedAddCastBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩] []
-      (mirNormalPost (fun r _ => r = .scalar ⟨a + b, 8⟩)) 19 := by
+        (mirNormalPost (fun r _ => r = .scalar ⟨a + b, 8⟩)) 19 ∧
+      MirNoUBTree (mirCallTree checkedAddCastBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]) ∧
+      ∀ tr out, Trusted.ITree.ReachesRet
+        (mirCallTree checkedAddCastBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]) tr out →
+        mirNormalPost (fun r _ => r = .scalar ⟨a + b, 8⟩) out := by
   have hlt64 : a + b < M64 := Nat.lt_trans hab (by decide : M32 < M64)
   have hSum : Nat.add a b < scalarModulus 4 := hab
   have hBle : Nat.ble (scalarModulus 4) (Nat.add a b) = false := nat_ble_false_of_lt hSum
@@ -749,18 +790,18 @@ theorem checkedAddCast_symbolic {a b : Nat} (hab : a + b < M32) :
       symDefaultScalar = _
     rw [Nat.add_zero, wrapScalarBits_of_lt hlt64]
     rfl
-  have hConds : condsHold (pairEnv a b) checkedAddCastConds := by
-    refine ⟨⟨Nat.succ_ne_zero 3, rfl⟩, ?_, ?_, ?_, ?_, trivial⟩
-    · dsimp only [SymCond.holds]; rw [hEvalFlg]; exact ⟨rfl, Or.inl rfl⟩
-    · dsimp only [SymCond.holds]; rw [hEvalNot]
-    · dsimp only [SymCond.holds]; rw [hEvalVal]; exact Nat.succ_ne_zero 3
-    · dsimp only [SymCond.holds]; rw [hEvalWide]; exact ⟨eight_ne_zero, rfl⟩
+  obtain ⟨hcW, hcB, hcNz, hcW2, _⟩ :=
+    condsHold_of_boolCert checkedAddCast_staticCondsCert (pairEnv a b)
+  have hConds : condsHold (pairEnv a b) checkedAddCastConds :=
+    ⟨hcW, hcB, by dsimp only [SymCond.holds]; rw [hEvalNot], hcNz, hcW2, trivial⟩
   have hPost : mirNormalPost (fun r _ => r = .scalar ⟨a + b, 8⟩)
       (.normal ((SymVal.scalar vcaSum).eval (pairEnv a b),
         (checkedAddCastFin.toMachineState checkedAddCastCfg (pairEnv a b)).memory)) := by
     show Value.scalar (vcaSum.eval (pairEnv a b)) = .scalar ⟨a + b, 8⟩
     rw [hEvalSum]
-  exact (symRunChunks_sound checkedAddCast_chunk (pairEnv a b) hConds hPost).2.1
+  have hExec := (symRunChunks_sound checkedAddCast_chunk (pairEnv a b) hConds hPost).2.1
+  have hCall := symRunChunks_mirCallTree_sound rfl checkedAddCast_chunk (pairEnv a b) hConds hPost
+  exact ⟨hExec, hCall.1, hCall.2⟩
 
 /-! ### Symbolic `SwitchInt` fork (`SymStepRes.branch`) -/
 
@@ -1472,13 +1513,18 @@ theorem scaled_add_step :
 
 theorem scaled_at_add : scaledCp2b.atCall scaledCfg = true := rfl
 
-/-- Non-switch steps are exactly silent (`symProgStep_sound_obs`), e.g. the
-caller's `unchecked_add` call in `add_scaled`. -/
+/-- Non-switch steps are exactly silent (`symProgStep_sound_obs` &
+`symProgStep_stepMirState_sound_obs`), e.g. the caller's `unchecked_add` call
+in `add_scaled`. -/
 theorem scaled_add_call_silent (b m k : Nat) (hc : condsHold (scaledEnv b m k)
     [.noOverflowAdd false vb vmk]) :
     stepMirFn addScaledCallerBody (scaledCp2b.toMachineState scaledCfg (scaledEnv b m k)) =
-      MirStepNode.step (scaledCp3.toMachineState scaledCfg (scaledEnv b m k)) :=
-  symProgStep_sound_obs scaled_add_step (scaledEnv b m k) hc
+        MirStepNode.step (scaledCp3.toMachineState scaledCfg (scaledEnv b m k)) ∧
+      stepMirState addScaledCallerBody
+        (.running (scaledCp2b.toMachineState scaledCfg (scaledEnv b m k))) =
+        MirStepNode.step (scaledCp3.toMachineState scaledCfg (scaledEnv b m k)) :=
+  ⟨symProgStep_sound_obs scaled_add_step (scaledEnv b m k) hc,
+   symProgStep_stepMirState_sound_obs scaled_add_step (scaledEnv b m k) hc⟩
 
 /-- For ALL `(b, m, k)` where the callee product fits but `2^64 ≤ b + m * k`,
 `add_scaled` has UB at the caller's `unchecked_add` after the inline callee
@@ -1826,22 +1872,246 @@ theorem spin_partial_not_total (fuel bound : Nat) (post : MirOutcome → Prop) :
     not_reachesDoneWithinV2026_of_divergesV2026 hDiv bound post,
     not_mirWpConverges_of_divergesV2026 hDiv post⟩
 
+/-! ### 3e. Universal statement-level & `Assert`-terminator fail-closed UB / panic -/
+
+/-- Checkpoint in `checked_add_cast` right before the `Assert` terminator. -/
+def checkedAddCastAtAssert : SymProg :=
+  { frame :=
+      { blockIdx := 0, stmtIdx := 4
+        locals := [U, I vx, I vy, .init (.aggregate 0 [vcaVal, vcaFlg]), I vcaNot, D, D, D] }
+    stack := [], active := none }
+
+theorem checkedAddCast_prefix4 :
+    symProgRunSteps checkedAddCastCfg 4 checkedAddCastEntry =
+      .step checkedAddCastAtAssert [.widthsMatch vx vy, .validBool vcaFlg] := rfl
+
+theorem checkedAddCast_assert_step :
+    symProgStep checkedAddCastCfg checkedAddCastAtAssert =
+      .step checkedAddCastCp1 [.assertHolds vcaNot true] := rfl
+
+theorem checkedAddCast_pre_condsCert :
+    BoolCertCut condsStatic [.widthsMatch vx vy, .validBool vcaFlg] :=
+  BoolCertCut.seal _ _ rfl
+
+/-- Universal fail-closed `Assert (.unreachable)` UB: for ALL `a, b : Nat` with
+`2^32 ≤ a + b`, `checked_add_cast(a, b)` reaches trusted UB via
+`symProgRunSteps_assert_ub_refutes`. -/
+theorem checkedAddCast_overflow_ub_forall {a b : Nat} (hov : M32 ≤ a + b) :
+    ¬ MirNoUBTree (mirTree checkedAddCastBody
+        (initMachineStateWithCallees checkedAddCastBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩] [])) ∧
+      (∀ post, ¬ MirWpConverges checkedAddCastBody
+        (initMachineStateWithCallees checkedAddCastBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩] [])
+        post) ∧
+      (∀ post bound, ¬ ExecWithinStepsV2026 checkedAddCastBody
+        [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩] [] post bound) := by
+  have hBle : Nat.ble (scalarModulus 4) (Nat.add a b) = true := Nat.ble_eq_true_of_le hov
+  have hEvalFlg : vcaFlg.eval (pairEnv a b) = ⟨1, 1⟩ := by
+    rw [SymScalar.eval_checkedFlag, SymScalar.eval_var, SymScalar.eval_var]
+    show (some (ScalarInt.mk
+      (match Nat.ble (scalarModulus 4) (Nat.add a b) with | true => 1 | false => 0) 1)).getD
+      symDefaultScalar = _
+    rw [hBle]; rfl
+  have hEvalNot : vcaNot.eval (pairEnv a b) = ⟨0, 1⟩ := by
+    rw [SymScalar.eval_unaryOp, hEvalFlg]; rfl
+  have hn : ¬ condsHold (pairEnv a b) [.assertHolds vcaNot true] := by
+    intro h
+    have h1 : (vcaNot.eval (pairEnv a b)).bits = 1 := h.1
+    rw [hEvalNot] at h1
+    exact Nat.noConfusion h1
+  have h := symProgRunSteps_assert_ub_refutes checkedAddCast_prefix4 checkedAddCast_assert_step
+    rfl (pairEnv a b) (condsHold_of_boolCert checkedAddCast_pre_condsCert _) hn
+  rw [show checkedAddCastBody = checkedAddCastCfg.body from rfl,
+    show ([] : List CapturedMir) = checkedAddCastCfg.callees from rfl,
+    show [Value.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩] =
+      symValsEval (pairEnv a b) [.scalar vx, .scalar vy] from rfl, ← symProgEntry_toMachineState]
+  exact h
+
+/--
+```text
+fn add_div(a: u32, b: u32, c: u32) -> u32 {
+  // bb0: StorageLive(_4); _4 = AddUnchecked(copy _1, copy _2);
+  //      _0 = Div(copy _4, copy _3); StorageDead(_4); return
+}
+``` -/
+def binUncheckedDivBody : CapturedMir :=
+  { defPath := "bin_ub::add_div"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 3
+    localDecls :=
+      [decl u32Ty' "_0", decl u32Ty' "a", decl u32Ty' "b", decl u32Ty' "c", decl u32Ty' "_4"]
+    basicBlocks :=
+      [ { statements :=
+            [ st (.storageLive 4)
+            , st (.assign (pl 4) (.binaryOp .addUnchecked (.copy (pl 1)) (.copy (pl 2))))
+            , st (.assign (pl 0) (.binaryOp .div (.copy (pl 4)) (.copy (pl 3))))
+            , st (.storageDead 4) ]
+          terminator := tm .return_
+          isCleanup := false } ]
+    fnAbi :=
+      { args := [{ layout := u32Layout', mode := .direct }, { layout := u32Layout', mode := .direct },
+                 { layout := u32Layout', mode := .direct }]
+        ret := { layout := u32Layout', mode := .direct }
+        conv := .rust
+        canUnwind := false }
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [u32Layout'] }
+    allocations := [] }
+
+def binUbCfg : SymConfig := { body := binUncheckedDivBody, callees := [] }
+abbrev vz : SymScalar := .var 2 4
+abbrev vabU : SymScalar := .binOp .addUnchecked false vx vy
+abbrev vabDiv : SymScalar := .binOp .div false vabU vz
+
+def binUbEntry : SymProg := symProgEntry binUbCfg [.scalar vx, .scalar vy, .scalar vz]
+
+def binUbAtAdd : SymProg :=
+  { frame := { blockIdx := 0, stmtIdx := 1, locals := [U, I vx, I vy, I vz, U] }
+    stack := [], active := none }
+
+def binUbAtDiv : SymProg :=
+  { frame := { blockIdx := 0, stmtIdx := 2, locals := [U, I vx, I vy, I vz, I vabU] }
+    stack := [], active := none }
+
+def binUbAfterDiv : SymProg :=
+  { frame := { blockIdx := 0, stmtIdx := 3, locals := [I vabDiv, I vx, I vy, I vz, I vabU] }
+    stack := [], active := none }
+
+theorem binUb_prefix1 : symProgRunSteps binUbCfg 1 binUbEntry = .step binUbAtAdd [] := rfl
+theorem binUb_add_step :
+    symProgStep binUbCfg binUbAtAdd = .step binUbAtDiv [.binNoOverflowAdd false vx vy] := rfl
+theorem binUb_prefix2 :
+    symProgRunSteps binUbCfg 2 binUbEntry = .step binUbAtDiv [.binNoOverflowAdd false vx vy] := rfl
+theorem binUb_div_step :
+    symProgStep binUbCfg binUbAtDiv = .step binUbAfterDiv [.binDivSafe false vabU vz] := rfl
+
+/-- Universal statement-level fail-closed UB (`Rvalue.binaryOp .addUnchecked`):
+for ALL `a, b, c` with `2^32 ≤ a + b`, `add_div(a, b, c)` reaches trusted UB
+via `symProgRunSteps_stmt_ub_refutes`. -/
+theorem binUncheckedAdd_overflow_ub_forall {a b c : Nat} (hov : M32 ≤ a + b) :
+    ¬ MirNoUBTree (mirTree binUncheckedDivBody
+        (initMachineStateWithCallees binUncheckedDivBody
+          [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩, .scalar ⟨c, 4⟩] [])) ∧
+      (∀ post, ¬ MirWpConverges binUncheckedDivBody
+        (initMachineStateWithCallees binUncheckedDivBody
+          [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩, .scalar ⟨c, 4⟩] []) post) ∧
+      (∀ post bound, ¬ ExecWithinStepsV2026 binUncheckedDivBody
+        [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩, .scalar ⟨c, 4⟩] [] post bound) := by
+  have hw : symCondWidthOk (scaledEnv a b c) (.binNoOverflowAdd false vx vy) :=
+    ⟨Nat.succ_ne_zero 3, rfl⟩
+  have hn : ¬ (SymCond.binNoOverflowAdd false vx vy).holds (scaledEnv a b c) :=
+    fun h => Nat.not_le_of_gt h.2 hov
+  have h := symProgRunSteps_stmt_ub_refutes binUb_prefix1 binUb_add_step rfl (scaledEnv a b c)
+    trivial hw hn (fun _ heq => SymCond.noConfusion heq)
+  rw [show binUncheckedDivBody = binUbCfg.body from rfl,
+    show ([] : List CapturedMir) = binUbCfg.callees from rfl,
+    show [Value.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩, .scalar ⟨c, 4⟩] =
+      symValsEval (scaledEnv a b c) [.scalar vx, .scalar vy, .scalar vz] from rfl,
+    ← symProgEntry_toMachineState]
+  exact h
+
+/-- Universal statement-level fail-closed UB (`Rvalue.binaryOp .div`):
+for ALL `a, b` with `a + b < 2^32`, `add_div(a, b, 0)` reaches trusted UB
+via `symProgRunSteps_stmt_ub_refutes`. -/
+theorem binDiv_zero_ub_forall {a b : Nat} (hab : a + b < M32) :
+    ¬ MirNoUBTree (mirTree binUncheckedDivBody
+        (initMachineStateWithCallees binUncheckedDivBody
+          [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩, .scalar ⟨0, 4⟩] [])) ∧
+      (∀ post, ¬ MirWpConverges binUncheckedDivBody
+        (initMachineStateWithCallees binUncheckedDivBody
+          [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩, .scalar ⟨0, 4⟩] []) post) ∧
+      (∀ post bound, ¬ ExecWithinStepsV2026 binUncheckedDivBody
+        [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩, .scalar ⟨0, 4⟩] [] post bound) := by
+  have hAddEval : vabU.eval (scaledEnv a b 0) = ⟨a + b, 4⟩ := by
+    have hSum : Nat.add a b < scalarModulus 4 := hab
+    rw [SymScalar.eval_binOp, SymScalar.eval_var, SymScalar.eval_var]
+    show (match (match Nat.ble (scalarModulus 4) (Nat.add a b) with
+      | true => RvalueEvalResult.ub
+      | false => RvalueEvalResult.ok (.scalar ⟨Nat.add a b, 4⟩) [] emptyMemory) with
+      | .ok (.scalar sc) _ _ => some sc | _ => none).getD symDefaultScalar = _
+    rw [nat_ble_false_of_lt hSum]
+    rfl
+  have hpre : condsHold (scaledEnv a b 0) [.binNoOverflowAdd false vx vy] :=
+    ⟨⟨⟨Nat.succ_ne_zero 3, rfl⟩, hab⟩, trivial⟩
+  have hw : symCondWidthOk (scaledEnv a b 0) (.binDivSafe false vabU vz) := by
+    dsimp only [symCondWidthOk]; rw [hAddEval]; exact ⟨Nat.succ_ne_zero 3, rfl⟩
+  have hn : ¬ (SymCond.binDivSafe false vabU vz).holds (scaledEnv a b 0) :=
+    fun h => h.2.1 rfl
+  have h := symProgRunSteps_stmt_ub_refutes binUb_prefix2 binUb_div_step rfl (scaledEnv a b 0)
+    hpre hw hn (fun _ heq => SymCond.noConfusion heq)
+  rw [show binUncheckedDivBody = binUbCfg.body from rfl,
+    show ([] : List CapturedMir) = binUbCfg.callees from rfl,
+    show [Value.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩, .scalar ⟨0, 4⟩] =
+      symValsEval (scaledEnv a b 0) [.scalar vx, .scalar vy, .scalar vz] from rfl,
+    ← symProgEntry_toMachineState]
+  exact h
+
+/-- Root `Assert` with `unwind = .continue_` (`MirOutcome.panic` on violation). -/
+def assertContinueBody : CapturedMir :=
+  { chkBody with
+    defPath := "chk::chk_panic"
+    basicBlocks :=
+      [ { statements := []
+          terminator := tm (.assert (.copy (pl 1)) true 1 .continue_)
+          isCleanup := false }
+      , { statements := [st (.assign (pl 0) (.use (.copy (pl 2))))]
+          terminator := tm .return_
+          isCleanup := false } ] }
+
+def assertContinueCfg : SymConfig := { body := assertContinueBody, callees := [] }
+def assertContinueEntry : SymProg := symProgEntry assertContinueCfg [.scalar vflag, .scalar vchkx]
+
+theorem assertContinue_step :
+    symProgStep assertContinueCfg assertContinueEntry =
+      .step (assertContinueEntry.jump 1 [U, I vflag, I vchkx]) [.assertHolds vflag true] := rfl
+
+/-- Universal root `Assert (.continue_)` panic refutation: for ALL `x`, `flag = false`
+panics on unmodified `stepMirFn` and refutes every normal-return `ExecWithinStepsV2026`. -/
+theorem assert_continue_panic_forall (x : Nat) (Q : Value → Memory → Prop) (bound : Nat) :
+    stepMirFn assertContinueBody
+        (initMachineStateWithCallees assertContinueBody [.scalar ⟨0, 1⟩, .scalar ⟨x, 4⟩] []) =
+        MirStepNode.retOutcome .panic ∧
+      ¬ ExecWithinStepsV2026 assertContinueBody [.scalar ⟨0, 1⟩, .scalar ⟨x, 4⟩] []
+        (mirNormalPost Q) bound := by
+  have hn : ¬ condsHold (pairEnv 0 x) [.assertHolds vflag true] :=
+    fun h => Nat.noConfusion (h.1 : (0 : Nat) = 1)
+  have hStep := symProgStep_assert_panic_of_not_conds assertContinue_step (pairEnv 0 x) hn rfl rfl
+  have hRef := symProgRunSteps_assert_panic_refutes (symProgRunSteps_zero assertContinueCfg assertContinueEntry)
+    assertContinue_step rfl rfl (pairEnv 0 x) trivial hn (post := mirNormalPost Q)
+    (fun h => h) bound
+  unfold assertContinueEntry at hStep hRef
+  rw [symProgEntry_toMachineState] at hStep hRef
+  exact ⟨hStep, hRef⟩
+
 /-! ## Pillar 4: `#print axioms` + `run_cmd` Kernel Hygiene Audit -/
 
 #print axioms symProgStep_sound
+#print axioms symProgStep_stepMirState_sound_obs
 #print axioms symProgRunSteps_sound
 #print axioms symProgRunSteps_ret_sound
+#print axioms symProgRunSteps_ret_execStepOutcome
 #print axioms symRunChunks_sound
+#print axioms symRunChunks_mirCallTree_sound
+#print axioms symRunChunks_of_condsCert
 #print axioms symRunChunksWith_sound
 #print axioms symChunkCut_entry_sound
 #print axioms symRunChunks_of_boolCert
+#print axioms symProgRunSteps_ub_refutes
+#print axioms symProgRunSteps_stmt_ub_refutes
+#print axioms symProgRunSteps_assert_ub_refutes
+#print axioms symProgRunSteps_assert_panic_refutes
 #print axioms verificationResult_of_symRunChunks
 #print axioms statefulVerificationResult_of_symRunChunks
 #print axioms add_scaled_symbolic
+#print axioms add_scaled_execStepOutcome
 #print axioms add_scaled_blockCtx_firewall
 #print axioms add_scaled_verificationResult
 #print axioms add_scaled_statefulVerificationResult
 #print axioms checkedAddCast_symbolic
+#print axioms checkedAddCast_overflow_ub_forall
+#print axioms binUncheckedAdd_overflow_ub_forall
+#print axioms binDiv_zero_ub_forall
+#print axioms assert_continue_panic_forall
+#print axioms mix_mirCallTree_sound
 #print axioms scaled_overflow_refuted
 #print axioms scaled_add_overflow_refuted
 #print axioms callChk_refuted
@@ -1916,12 +2186,13 @@ run_cmd auditModule `Anneal.MirSymExec.ChunkedCallV2026 choiceFreeAxioms (forbid
 -- `VerificationResult` / `StatefulVerificationResult` certificates).
 /-- Key end-to-end test theorems (positive and negative canaries). -/
 def keyTestTheorems : Array Lean.Name :=
-  #[``add_scaled_symbolic, ``add_scaled_blockCtx_firewall,
+  #[``add_scaled_symbolic, ``add_scaled_execStepOutcome, ``add_scaled_blockCtx_firewall,
     ``add_scaled_verificationResult, ``add_scaled_statefulVerificationResult,
-    ``add_scaled_not_23, ``checkedAddCast_symbolic,
-    ``scaled_overflow_refuted, ``scaled_overflow_conds_fail,
+    ``add_scaled_not_23, ``checkedAddCast_symbolic, ``checkedAddCast_overflow_ub_forall,
+    ``binUncheckedAdd_overflow_ub_forall, ``binDiv_zero_ub_forall,
+    ``assert_continue_panic_forall, ``scaled_overflow_refuted, ``scaled_overflow_conds_fail,
     ``scaled_add_overflow_refuted, ``scaled_add_overflow_conds_fail,
-    ``mix_symbolic, ``mix_concrete, ``sel_symbolic, ``chk_ok,
+    ``mix_symbolic, ``mix_mirCallTree_sound, ``mix_concrete, ``sel_symbolic, ``chk_ok,
     ``chk_refuted, ``callChk_refuted, ``divSh_ok, ``divSh_div0_refuted, ``divSh_shift_refuted,
     ``cd_pass1_loop, ``cd_pass2, ``cd_worklist, ``cd_not15, ``cd_verificationResult,
     ``cd_statefulVerificationResult, ``cd_pass1_forall, ``cd_pass2_forall,
