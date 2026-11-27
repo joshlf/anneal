@@ -667,6 +667,24 @@ theorem trusted_intrinsicWidePointeeStep_dst_unsupported :
   ⟨trusted_intrinsicWidePointeeStep_adt_unsupported "wd::HeaderSlice" [],
    trusted_intrinsicWidePointeeStep_adt_unsupported "wd::Align8TailU16" []⟩
 
+
+/-- **Fixture `layoutIdx` convention is Trusted's own** (`Bytes.lean` `rigidTyByteSize`: primitives,
+pointers, and homogeneous primitive arrays are sized structurally by `rigidTyKindByteSize`; only
+ADTs and layout-indexed aggregates consult `LayoutTable.lookup layouts ty.layoutIdx`, and Trusted
+itself synthesizes `{ kind := _, layoutIdx := 0 }` for element types). So the `layoutIdx := 0` on
+every primitive / pointer / array fixture type is semantically inert in Trusted (it does NOT pick
+up `wdU8Layout`), while the `MaybeUninit` / `ManuallyDrop` types resolve through their own table
+entries. (LeanMiri's `translateTy` adapter does consult the table for arrays, which is why the
+`constantIndex` fixtures of cases `0` / `5` are pinned as a Step-adapter boundary in the LM root.) -/
+theorem trusted_fixture_layoutIdx_convention :
+    rigidTyByteSize wdLayouts wdU8Ty = some 1 ∧ rigidTyByteSize wdLayouts wdU32Ty = some 4 ∧
+    rigidTyByteSize wdLayouts wdUsizeTy = some 8 ∧ rigidTyByteSize wdLayouts wdBoolTy = some 1 ∧
+    rigidTyByteSize wdLayouts wdArr3U32Ty = some 12 ∧ rigidTyByteSize wdLayouts wdRawU8Ty = some 8 ∧
+    rigidTyByteSize wdLayouts wdFnPtrTy = some 8 ∧
+    rigidTyByteSize wdLayouts wdMuU32Ty = some 4 ∧ rigidTyByteSize wdLayouts wdMuBoolTy = some 1 ∧
+    rigidTyByteSize wdLayouts wdMdU32Ty = some 4 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
 end TrustedRootCauses
 
 /-! ## §2. Post-`minirust#300` Non-Null `FnPtr` Validity Predicate (Defined Here, Zero
@@ -1667,6 +1685,7 @@ run_cmd do
       (ns ++ `trusted_decodePtrBytesNoForge_fnptr_provless, `Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge),
       (ns ++ `trusted_decodeTypedValueFromBytes_fnPtr_provless, `Trusted.Rustc.V2026_06_01.MirSemantics.decodeTypedValueFromBytes),
       (ns ++ `trusted_intrinsicWidePointeeStep_adt_unsupported, `Trusted.Rustc.V2026_06_01.MirSemantics.intrinsicWidePointeeStep),
+      (ns ++ `trusted_fixture_layoutIdx_convention, `Trusted.Rustc.V2026_06_01.MirSemantics.rigidTyByteSize),
       (ns ++ `mr_concurrent_basic_retag_ptr_noop, `MiniRustSpec.Interp.ConcurrentMemory.retag_ptr),
       (ns ++ `mr_encodeM_union_single_chunk, `MiniRustSpec.Interp.Type.encodeM) ]
   for (thm, req) in bridgeReq do
