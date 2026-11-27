@@ -210,7 +210,8 @@ elab "#assert_minirustspec_import_isolation" : command => do
   let ib := `MiniRustSpec.Correspondence.IntrinsicBoundary
   let allowed := [ib]
   let core := [`MiniRustSpec.Correspondence.Translate, `MiniRustSpec.Correspondence.Simulation,
-    `MiniRustSpec.Correspondence.IntrinsicFallback, `MiniRustSpec.Interp, `MiniRustSpec.Generated]
+    `MiniRustSpec.Correspondence.IntrinsicFallback, `MiniRustSpec.Interp, `MiniRustSpec.Generated,
+    `MiniRustSpec.ClosureFnPtrMR]
   let translate := `MiniRustSpec.Correspondence.Translate
   let negDirect : Array (Lean.Name × Array Lean.Name) :=
     #[(translate, #[`Anneal.Scalars]), (`Anneal.Scalars, #[])]
@@ -19147,6 +19148,7 @@ verbatim `rustc-capture` bodies (including the `9147` difftest reproducer). -/
   MiniRustSpec.ClosureFnPtrMR.minirust_createFrameM_arity_law
   MiniRustSpec.ClosureFnPtrMR.minirust_ptr_rel_eq_same_addr_M
   MiniRustSpec.ClosureFnPtrMR.minirust_closure_call_return_tb_wfLive
+  MiniRustSpec.ClosureFnPtrMR.closure_coercion_widening_identity_general_mach_and_tb
   MiniRustSpec.ClosureFnPtrMR.closure_coercion_widening_identity_mach_and_tb
   MiniRustSpec.ClosureFnPtrMR.cfInit_eq_initMachineStateWithCallees
   MiniRustSpec.ClosureFnPtrMR.cfRunStep_of_step
@@ -19169,7 +19171,10 @@ verbatim `rustc-capture` bodies (including the `9147` difftest reproducer). -/
   MiniRustSpec.ClosureFnPtrMR.cf_coercion_fail_closed_witness
   MiniRustSpec.ClosureFnPtrMR.cf_indirect_call_fail_closed_three_way_witness
   MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_law_instance_fn
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_law_instance_fnMut
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_law_instance_fnOnce
   MiniRustSpec.ClosureFnPtrMR.closureFnPtrEntryRel_instance_mach_and_tb
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_correspondence_instance_mach_and_tb
 
 #assert_minirustspec_import_isolation
 

@@ -27102,9 +27102,11 @@ end StatementPins
 open LeanMiriSpec.ClosureFnPtrLM in
 #assert_standard_axioms
   cfStepHooks
+  cfStepHooksDirectUnwind
   cfCastHooks
   cfCallHooks
   cfStepHooks_eq_K
+  cfStepHooksDirectUnwind_eq_K
   cfMiriStutter_sound
   cfStutterCheck_sound
   cfCertificate_sound
@@ -27117,17 +27119,26 @@ open LeanMiriSpec.ClosureFnPtrLM in
   cfResolveClosure_fnOnce_is_item
   cfResolveClosure_fn_is_shim
   cfResolveClosure_generic_unsupported
+  cfNonCapturingClosure_vendored_law
+  cfCast_closureFnPointer_vendored_law
+  cfCast_unsafeFnPointer_and_fnPtrToPtr_identity
   cf_fn_once_certificate
   cf_fn_once_lockstep
+  cf_finding_0007_driver_stutter_sim
+  cf_finding_0007_main_stutter_sim
   cf_trusted_finding_parity
-  cf_miri_finding_main_boundary
-  cf_trusted_matrix
+  cf_fn_shared_stutter_sim
+  cf_fn_mut_stutter_sim
+  cf_zero_and_two_arg_stutter_sim
+  cf_unsafe_and_widen_identity_stutter_sim
+  cf_mixed_ces_and_tail_stutter_sim
+  cf_w_c8_e2e_closure_stutter_sim
+  cf_unwind_through_closure_witness
   cf_generic_closure_r1_unsupported
-  cf_direct_closure_call_trusted_external
-  cf_unwind_boundary
+  cf_direct_closure_call_witness
   cf_neg_capturing_fail_closed
   cf_neg_forged_call_ub
-  cf_neg_transmuted_sig_fail_closed
+  cf_neg_transmuted_sig_ub
   cf_neg_extern_c_ub
   cf_neg_safety_boundary
   cf_normal_spelling_boundary
@@ -27138,6 +27149,13 @@ example :
       [cfFx_id_once, cfFx_fn_once_kind_closure_0] [cfU32 5] [cfU32Imm 5] 200 =
       some (.scalar 8 4, 0) :=
   cf_fn_once_certificate
+
+open LeanMiriSpec.ClosureFnPtrLM in
+example :
+    cfCertificate (cfStepHooks cfProgFinding) cfProgFinding cfFx_finding_main
+      [cfFx_finding_driver, cfFx_finding_closure_0, cfFx_finding_closure_1] [] [] 600 =
+      some (.scalar 9147 4, 15) :=
+  cf_finding_0007_main_stutter_sim.1
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
 -- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.

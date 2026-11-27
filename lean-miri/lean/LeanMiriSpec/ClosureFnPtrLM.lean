@@ -66,46 +66,69 @@ and frames are pushed and popped by the vendored `Stack` operations.
    * `cfStutterSim_trusted_run`, `cfStutterSim_miri_run`: a stuttering
      simulation determines the bounded `stepMirFn` run and a successful
      `Step.step` run to a root `Return` with the same observation;
-   * `cfStepHooks_eq_K`: the step hooks equal their mechanically derived
-     kernel-evaluable form (every `for _ in [a:b]` loop of the vendored
-     interpreter rewritten to the equal `List.range'` loop), so each
-     kernel-checked statement is about the unmodified vendored code;
-   * resolution and pointer-identity laws: `cfResolveClosure_fnOnce_is_item`,
-     `cfResolveClosure_fn_is_shim`, `cfResolveClosure_generic_unsupported`,
-     `cfInstanceOfAllocNat_item`, `cfInstanceOfAllocNat_shim`,
-     `cfFnAllocNat_injective`.
-2. **Kernel-checked witnesses (§15)** on the verbatim bodies: the `FnOnce`
-   certificate and 1-to-1 lockstep simulation (`cf_fn_once_certificate`,
-   `cf_fn_once_lockstep`); the reproducer on `stepMirFn`
-   (`cf_trusted_finding_parity`: `159` and `9147 : u32`); the closure matrix on
-   `stepMirFn` (`cf_trusted_matrix`); and the fail-closed negatives and
-   boundaries on both machines (`cf_neg_capturing_fail_closed`,
-   `cf_neg_forged_call_ub`, `cf_neg_transmuted_sig_fail_closed`,
-   `cf_neg_extern_c_ub`, `cf_neg_safety_boundary`,
-   `cf_normal_spelling_boundary`, `cf_generic_closure_r1_unsupported`,
-   `cf_direct_closure_call_trusted_external`, `cf_unwind_boundary`,
-   `cf_miri_finding_main_boundary`).
-3. **Build-time certificates (§16), not kernel-checked**: the `Fn` / `FnMut`
-   stuttering certificates across `ClosureOnceShim`, including the reproducer
-   driver `__anneal_vt_driver_61873(35, 24) = 159`.
+   * `cfStepHooks_eq_K` / `cfStepHooksDirectUnwind_eq_K`: the step hooks equal
+     their mechanically derived kernel-evaluable forms (every `for _ in [a:b]`
+     loop rewritten via `Std.Legacy.Range.forIn_eq_forIn_range'` and every
+     `KeyedArray.contains` hash-index query rewritten via the vendored
+     `Miri.Memory.KeyedArray.contains_rows`), so every kernel-checked theorem
+     is about the unmodified vendored code;
+   * resolution, `nonCapturingClosure`, `Cast.cast`, and pointer-identity laws:
+     `cfResolveClosure_fnOnce_is_item`, `cfResolveClosure_fn_is_shim`,
+     `cfResolveClosure_generic_unsupported`, `cfInstanceOfAllocNat_item`,
+     `cfInstanceOfAllocNat_shim`, `cfFnAllocNat_injective`,
+     `cfNonCapturingClosure_vendored_law` (unmodified vendored
+     `ExecutionCallLeaves.nonCapturingClosure`),
+     `cfCast_closureFnPointer_vendored_law` (unmodified vendored `Cast.cast`
+     for `ClosureFnPointer(Safe|Unsafe)` and capturing-closure rejection), and
+     `cfCast_unsafeFnPointer_and_fnPtrToPtr_identity` (universal `raw_c == raw_d`
+     pointer identity across `UnsafeFnPointer` and `FnPtrToPtr`).
+2. **Kernel-checked simulation and parity witnesses (§15)** — every witness in
+   this module is a kernel-checked theorem (`decide +kernel`, zero `#guard`s,
+   zero `ofReduceBool`) on verbatim `rustc-capture` bodies:
+   * **`finding_0007` Miri parity (`159` and `9147 : u32`)**: BOTH
+     `__anneal_vt_driver_61873(35, 24) = 159` (`cf_finding_0007_driver_stutter_sim`,
+     `k = 15`) AND the full root reproducer
+     `pass_shared_temp_const_raw_ptr_read_and_freeze_retag__b22_c27() = 9147 : u32`
+     (`cf_finding_0007_main_stutter_sim`, `k = 15`) in `CfStutterSim` between
+     `stepMirFn` and unmodified vendored `Step.step`;
+   * **`FnOnce` 1-to-1 lockstep (`k = 0`)** (`cf_fn_once_certificate`,
+     `cf_fn_once_lockstep`) and **`Fn` / `FnMut` stuttering (`k = 5`)** across
+     real `ClosureOnceShim` frames: `fn_shared` (`22`), `fn_mut_kind` (`7`),
+     `zero_arg` (`7`), `two_arg` (`5`), `unsafe_closure` (`20`),
+     `widen_and_identity` (`262`, verifying `raw_c == raw_d`),
+     `mixed_fn_item_and_closure` (`24`), `ces_through_closure_fn_ptr` (`21`),
+     `tail_through_closure` (`12`), and the exact Episode 1 `C8` end-to-end
+     program (`cf_w_c8_e2e_closure_stutter_sim`, `42 : u32`, `k = 5`, closing
+     `UnwindSetDiscrAndFnPtrLM.w_c8_end_to_end_closure_coercion_and_indirect_call`);
+   * **Panic unwinding through an indirect closure call**
+     (`cf_unwind_through_closure_witness`): normal return (`x = 4`, `CfStutterSim`,
+     `k = 5`), cleanup unwinding through `ClosureOnceShim` `bb3`/`bb4` and
+     `unwind_through_closure` `bb3`/`bb4` to root unwind (`Trusted = .panic`,
+     vendored Miri `"unwinding past the topmost stack frame"`), `.unreachable`
+     (UB on both machines), and `.terminate` (`.abort` on both machines under
+     direct-unwind hooks, plus canonical `"unwindTerminate"` boundary);
+   * **Fail-closed negatives and boundaries on both machines**: capturing
+     closures (`u32` and ZST `()`), forged `(N+1)`-argument indirect calls on
+     both `FnOnce` and `Fn` (`ClosureOnceShim`) closures (UB on both),
+     transmuted signature `fn(u64) -> u32` (UB on both: vendored Miri
+     `"AbiMismatchArgument 1"`), `extern "C"` call (UB on both: vendored Miri
+     `"caller/callee calling convention mismatch"`), `Safety` boundary,
+     `"ClosureFnPointer(Normal)"` spelling boundary, generic closure under `R1`
+     (`.unsupported` on both), and direct closure call with explicit `&_env`
+     (`Trusted = .ext "core::ops::Fn::call"`, Miri = `14 : u32`).
 
-## What is NOT proved
+## Scope boundaries
 
-* The `Fn` / `FnMut` stuttering certificates of §16 are checked by compiled
-  evaluation (`#guard`) of the certificate checker, **not by the kernel**, and
-  are not theorems: kernel reduction of the vendored memory model on the
-  shim's `_3 = &mut _1` does not finish within the build's resource limits.
-  Only the `FnOnce` path, which needs no memory, is kernel-checked.
-* The reproducer's root body (`9147 : u32`) is kernel-checked on `stepMirFn`
-  only. Under the hooks of this module `Step.step` stops with `.unsupported`
-  at the body's struct aggregate (`cf_miri_finding_main_boundary`): struct
-  aggregates and reference-to-struct projections are outside the hook overlay
-  this module builds on. The driver, which contains every closure coercion
-  and call of the reproducer, is covered by §16.
-* Panic unwinding through an indirect closure call is a boundary only
-  (`cf_unwind_boundary`).
-* There is no simulation theorem quantified over all programs; the universal
-  content is the soundness of the certificate checker and the resolution laws.
+* There is no simulation theorem quantified over all arbitrary Rust programs;
+  the universal content is the soundness of the certificate checker
+  (`cfStutterCheck_sound`, `cfCertificate_sound`, `cfStutterSim_zero_lockstep`,
+  `cfStutterSim_trusted_run`, `cfStutterSim_miri_run`) together with the
+  universal vendored-Miri resolution, `nonCapturingClosure`, `Cast.cast`, and
+  pointer-identity laws.
+* Unlinked `core` panic items (`core::fmt::Arguments::<'a>::from_str` and
+  `core::panicking::panic_fmt`) are modeled by a small stub body and an unwind
+  entry hook invoking vendored `ControlFlow.unwindToBlock` for the unwinding
+  witnesses.
 
 ## Divergences that are characterized, not hidden
 
@@ -119,15 +142,17 @@ and frames are pushed and popped by the vendored `Stack` operations.
   reports `.ub`; the vendored `Cast.cast` rejects the program
   (`invalidProgram "capturing closure in pointer cast"`).
 * **Direct closure calls.** A direct `Fn::call(&_env, (x,))` is a visible
-  external call in `Trusted` and is executed by Miri; no simulation is claimed.
+  external call in `Trusted` and is executed by Miri (`cf_direct_closure_call_witness`).
 * **Moves.** The vendored `evalFnCallArgument` does not de-initialize a moved
   caller local, `Trusted` does; `cfSlotRel` therefore relates a `Trusted`
   `.uninit` slot to any live Miri local.
-* **Environment and data pointers.** The synchronization relation `cfRel`
-  compares the active body, the location, the call depth up to shim frames,
-  and the top-frame locals; scalars agree exactly and function pointers denote
-  the same linked body. The closure environment local `_1`, data pointers,
-  and memory-backed aggregates are **not** compared, and no aliasing model
+* **Environment and aliasing.** The synchronization relation `cfRel` compares
+  the active body, the location, the call depth up to shim frames, and the
+  top-frame locals: scalars and one- or two-scalar aggregates agree byte-for-byte
+  (both in registers and in memory via vendored `Allocation.readScalar`),
+  zero-sized values agree, and function pointers denote the same linked body.
+  The closure environment local `_1` of a closure body is exempt, data-pointer
+  provenance graphs are not compared beyond pointer-ness, and no aliasing model
   (Stacked or Tree Borrows, protectors) is installed.
 * **Root unwinding.** Unwinding out of the root frame is UB in Miri
   ("unwinding past the topmost stack frame") and `.panic` in `Trusted`.
@@ -1064,9 +1089,52 @@ def cfTupleLayout? (layouts : LayoutTable) (params : List LocalDecl) : Option Ty
 def cfCallMutPath : DefPath := "core::ops::FnMut::call_mut"
 def cfCallPath : DefPath := "core::ops::Fn::call"
 def cfCallOncePath : DefPath := "core::ops::FnOnce::call_once"
+def cfFmtFromStrPath : DefPath := "core::fmt::Arguments::<'a>::from_str"
+def cfPanicFmtPath : DefPath := "core::panicking::panic_fmt"
 
 def cfShimStmt (k : StatementKind) : MirAst.Statement := { kind := k, span := "<closure-once-shim>" }
 def cfShimTerm (k : TerminatorKind) : MirAst.Terminator := { kind := k, span := "<closure-once-shim>" }
+
+/-- Minimal `core::fmt::Arguments::<'a>::from_str` constructor stub for the panic-unwinding
+witnesses, matching the `miri-difftest` oracle stub. -/
+def cfFmtFromStrStub : CapturedMir :=
+  let argsLayout : TypeLayout :=
+    { size := { bytes := 16 }, align := { bytes := 8 },
+      backendRepr := .scalarPair
+        (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+        (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+      fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1],
+      variants := .single 0, isUninhabited := false }
+  let strRefLayout : TypeLayout :=
+    { size := { bytes := 16 }, align := { bytes := 8 },
+      backendRepr := .scalarPair
+        (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+        (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 }),
+      fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1],
+      variants := .single 0, isUninhabited := false }
+  { defPath := cfFmtFromStrPath, phase := .runtimePostCleanup, role := .model, argCount := 1,
+    localDecls :=
+      [{ mutability := .mut, ty := { kind := .adt "core::fmt::Arguments" [], layoutIdx := 0 }, debugName := none },
+       { mutability := .not, ty := { kind := .ref .not .str, layoutIdx := 1 }, debugName := none }],
+    basicBlocks :=
+      [{ statements := [{ kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩)), span := "<fmt>" }],
+         terminator := { kind := .return_, span := "<fmt>" }, isCleanup := false }],
+    fnAbi :=
+      { args := [{ layout := strRefLayout, mode := .pair }],
+        ret := { layout := argsLayout, mode := .pair },
+        conv := .rust, canUnwind := false },
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [argsLayout, strRefLayout] },
+    allocations := [] }
+
+/-- Replace the unwind action of the `call` terminator ending `bb0`. -/
+def cfSetBb0CallUnwind (b : CapturedMir) (u : UnwindAction) : CapturedMir :=
+  match b.basicBlocks with
+  | bb :: rest =>
+    match bb.terminator.kind with
+    | .call f a d t _ =>
+      { b with basicBlocks := { bb with terminator := { bb.terminator with kind := .call f a d t u } } :: rest }
+    | _ => b
+  | [] => b
 
 /-- The `ClosureOnceShim` MIR for the non-`FnOnce` closure body `c`. -/
 def cfShimBody (c : CapturedMir) : Option CapturedMir :=
@@ -1108,6 +1176,7 @@ def cfShimBody (c : CapturedMir) : Option CapturedMir :=
 def cfCallOnceDefId : Miri.MIR.DefId := 4000000
 def cfCallMutDefId : Miri.MIR.DefId := 4000001
 def cfCallDefId : Miri.MIR.DefId := 4000002
+def cfPanicFmtDefId : Miri.MIR.DefId := 4000003
 def cfClosureArgBase : Miri.MIR.TyId := 5000000
 
 def cfItemInstance (n : Nat) : Miri.Interpreter.CallInstance := ⟨.Item n, #[]⟩
@@ -1236,11 +1305,16 @@ def cfFnAbiOfInstance (prog : CfProg) (inst : Miri.Interpreter.CallInstance) : O
   | .Shim (.ClosureOnce _ n _) => (cfItem? prog n).bind fun it => cfFnAbiOfShim it.body
   | _ => none
 
-/-- A `Ty` (with layout index into `b.layouts`) for the type `k` named in a signature. -/
+/-- A `Ty` (with layout index into `b.layouts`) for the type `k` named in a signature.
+Checks `b.localDecls` first so non-default scalar layouts (e.g. `u64` in a layout table whose
+entry `0` is `u32`) retain their exact captured layout index. -/
 def cfTyOfRigid (b : CapturedMir) (k : RigidTy) : Option Ty :=
-  match encodeScalarRigidTy k with
-  | some _ => some { kind := k, layoutIdx := 0 }
-  | none => (b.localDecls.find? fun d => rigidTyEq d.ty.kind k).map (·.ty)
+  match b.localDecls.find? fun d => rigidTyEq d.ty.kind k with
+  | some d => some d.ty
+  | none =>
+    match encodeScalarRigidTy k with
+    | some _ => some { kind := k, layoutIdx := 0 }
+    | none => none
 
 def cfArgAbiOfRigid (b : CapturedMir) (k : RigidTy) : Option CfArgAbi :=
   match cfTyOfRigid b k with
@@ -1383,17 +1457,133 @@ def cfIsFnPtrCastKind : Miri.MIR.CastKind → Bool
   | .PointerCoercion .UnsafeFnPointer _ | .FnPtrToPtr => true
   | _ => false
 
+/-- Pointer scalar with concrete provenance for a constant byte/str slice allocation. -/
+def cfSliceConstPtr (allocId : Nat) : Miri.Memory.Scalar AnnealProv :=
+  let raw := if allocId == 0 then 1 else allocId
+  if h : UInt64.ofNat raw ≠ 0 then
+    let id : Miri.Memory.AllocId := ⟨UInt64.ofNat raw, h⟩
+    Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id), .concrete id .one⟩
+  else
+    .fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 0)
+
+/-- Resolve the pointee `LocalLayout` of a safe reference local (extending
+`lookupRefDerefPointeeLayout` to ADT pointees via `TypeLayout.fieldLayouts`). -/
+def cfLookupRefPointeeLayout (localDecls : List LocalDecl) (layouts : LayoutTable) (localId : Nat) :
+    Option Miri.Interpreter.LocalLayout :=
+  match lookupRefDerefPointeeLayout localDecls layouts localId with
+  | some l => some l
+  | none =>
+    match get? localDecls localId with
+    | some decl =>
+      match decl.ty.kind with
+      | .ref _ pointeeKind =>
+        match layouts.lookup decl.ty.layoutIdx with
+        | some tl =>
+          match tl.fieldLayouts with
+          | pIdx :: _ => some (translateTy { kind := pointeeKind, layoutIdx := pIdx } layouts)
+          | [] => none
+        | none => none
+      | _ => none
+    | none => none
+
+/-- Dereference a pointer or safe-reference local to its `(MemPlace, pointeeLayout)`,
+using `annealDerefOperandToMemPlace` for raw pointers and `annealSafeRefDerefCheck`
+(vendored `Miri.Memory.checkAndDerefPtr`) for safe references including ADT pointees. -/
+def cfDerefOperandToMemPlace (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (localId : Miri.MIR.LocalId) (operand : Miri.Interpreter.Operand AnnealProv)
+    (ptrLayout : Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState
+      (Miri.Interpreter.MemPlace AnnealProv × Miri.Interpreter.LocalLayout) := do
+  match lookupDerefPointeeLayout localDecls layouts localId ptrLayout with
+  | some _ => annealDerefOperandToMemPlace localDecls layouts localId operand ptrLayout
+  | none =>
+    let some pointeeLay := cfLookupRefPointeeLayout localDecls layouts localId
+      | throw (.unsupported "dereference of local without pointee layout")
+    let ptrImm ← annealReadImmediateLM2_2 ⟨operand, ptrLayout⟩
+    let st ← get
+    match annealSafeRefDerefCheck st.machine ptrImm.imm pointeeLay with
+    | .ok mplace => return (mplace, pointeeLay)
+    | .error err => throw err
+
+/-- Place evaluator supporting `.Deref :: rest` projections (e.g. `(*_2).1` on `&PairU32`)
+through vendored `Miri.Interpreter.projectField` (`annealProjectPlaceList`). -/
+def cfEvalPlace (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (place : Miri.MIR.Place) (skipValidity : Bool := false) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.RuntimePlace AnnealProv) := do
+  match place.projection.toList with
+  | .Deref :: rest =>
+    let st ← get
+    if st.stack.currentFrame?.isNone then throw (.stack .emptyStack)
+    let (frame', layout) ← annealResolveAndCacheLocalLayout localDecls layouts place.localId none
+    let operand ← match frame'.getLocalOperand place.localId with
+      | .ok op => pure op
+      | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
+      | .error e => throw (.stack e)
+    let (mplace, pointeeLay) ← cfDerefOperandToMemPlace localDecls layouts place.localId operand layout
+    match annealProjectPlaceList layouts ⟨.memory mplace, pointeeLay⟩ rest with
+    | .ok p => return p
+    | .error err => throw err
+  | _ => annealEvalPlaceOverlay localDecls layouts place skipValidity
+
+/-- Operand evaluator supporting `.Deref :: rest` projections (via vendored
+`Miri.Interpreter.project`) and constant `&str` slice operands. -/
+def cfEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (op : Miri.MIR.Operand) (known : Option Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) := do
+  match op with
+  | .Copy place | .Move place =>
+    match place.projection.toList with
+    | .Deref :: rest =>
+      let st ← get
+      if st.stack.currentFrame?.isNone then throw (.stack .emptyStack)
+      let (frame', layout) ← annealResolveAndCacheLocalLayout localDecls layouts place.localId none
+      let operand ← match frame'.getLocalOperand place.localId with
+        | .ok op => pure op
+        | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
+        | .error e => throw (.stack e)
+      let (mplace, pointeeLay) ← cfDerefOperandToMemPlace localDecls layouts place.localId operand layout
+      annealEvalProjection layouts ⟨.indirect mplace, pointeeLay⟩ rest
+    | _ => annealEvalOperandOverlay localDecls layouts op known
+  | .Constant c =>
+    match c.value with
+    | .Val (.Slice allocId len) tyId =>
+      let lay := layoutOfEncodedTyId tyId layouts
+      match Miri.Memory.Scalar.fromUInt (BitVec.ofNat 128 len) (Miri.ABI.Size.ofBytes 8) with
+      | .ok lSc => pure ⟨.immediate (.scalarPair (cfSliceConstPtr allocId) lSc), lay⟩
+      | .error _ => throw (.invalidProgram "slice constant length overflow")
+    | _ => annealEvalOperandOverlay localDecls layouts op known
+  | _ => annealEvalOperandOverlay localDecls layouts op known
+
+/-- `forceAllocation` via vendored `Miri.Interpreter.forceAllocation` and
+`annealMutablePlaceHooks` (supporting `.scalarPair` structs such as `PairU32`). -/
+def cfForceAllocation (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (place : Miri.Interpreter.RuntimePlace AnnealProv) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.MemPlace AnnealProv) := fun st =>
+  match Miri.Interpreter.forceAllocation (annealMutablePlaceHooks localDecls layouts) () place st with
+  | .ok res st' => .ok res.mplace st'
+  | .error (.stack (.localExpectedLive _)) st' => .error (.undefinedBehavior "address of dead local") st'
+  | .error e st' => .error e st'
+
 def cfRvalueHooks (prog : CfProg) (body : CapturedMir) :
     Miri.Interpreter.RvalueHooks AnnealProv AnnealStepState Unit (Miri.Interpreter.RuntimePlace AnnealProv) :=
   let base := annealRvalueHooksUnwindFnPtrClosure body []
   { base with
+    evalPlace := fun _ p skip => cfEvalPlace body.localDecls body.layouts p skip
+    evalOperand := fun _ op known => cfEvalOperand body.localDecls body.layouts op known
+    evalOperandAt := fun _ _ op known => cfEvalOperand body.localDecls body.layouts op known
+    evalPlaceToOp := fun _ p known => cfEvalOperand body.localDecls body.layouts (.Copy p) known
+    readImmediate := fun _ op => annealReadImmediateLM2_2 op
+    copyOp := fun _ src dest =>
+      if dest.layout.layout.isZst then annealWriteImmediateLM2_2 .uninit dest
+      else if usesStructMemCopyDest dest then annealStructMemCopyOp body.localDecls body.layouts src dest
+      else do let imm ← annealReadImmediateLM2_2 src; annealWriteImmediateLM2_2 imm.imm dest
+    writeAggregate := fun c k os d =>
+      Miri.Interpreter.writeAggregate (annealAggregateHooksUnwindFnPtrClosure body.localDecls body.layouts) c k os d
+    forceAllocation := fun _ place => cfForceAllocation body.localDecls body.layouts place
     cast := fun c src kind ty dest =>
       if cfIsFnPtrCastKind kind then Miri.Interpreter.Cast.cast (cfCastHooks prog body) c 16 src kind ty dest
       else base.cast c src kind ty dest }
-
-def cfIsFnPtrCastRvalue : Miri.MIR.Rvalue → Bool
-  | .Cast kind _ _ => cfIsFnPtrCastKind kind
-  | _ => false
 
 /-! ## §6. Closure-aware `CallHooks` for the vendored call pipeline -/
 
@@ -1440,6 +1630,7 @@ inductive CfCallee where
   | fnPtr (ins : List RigidTy) (out : RigidTy) (abi : CallConv)
   | item (n : Nat)
   | closureMethod (methodDefId : Miri.MIR.DefId) (n : Nat)
+  | panicFmt
 
 def cfClassifyCallee (prog : CfProg) : CfM (CapturedMir × Ty × CfCallee) := do
   let (b, func) ← cfActiveCall prog
@@ -1449,21 +1640,45 @@ def cfClassifyCallee (prog : CfProg) : CfM (CapturedMir × Ty × CfCallee) := do
     match ty.kind with
     | .fnPtr ins out _ abi => pure (b, ty, .fnPtr ins out abi)
     | .fnDef path targs =>
-      let method? : Option Miri.MIR.DefId :=
-        if stringEq path cfCallMutPath then some cfCallMutDefId
-        else if stringEq path cfCallPath then some cfCallDefId
-        else if stringEq path cfCallOncePath then some cfCallOnceDefId
-        else none
-      match method?, targs with
-      | some m, .closure cpath _ :: _ =>
-        match cfFindItem? prog cpath [] with
-        | some n => pure (b, ty, .closureMethod m n)
-        | none => throw (.unsupported "unresolved external call")
-      | _, _ =>
-        match cfFindItem? prog path targs with
-        | some n => pure (b, ty, .item n)
-        | none => throw (.unsupported "unresolved external call")
+      if stringEq path cfPanicFmtPath then pure (b, ty, .panicFmt)
+      else
+        let method? : Option Miri.MIR.DefId :=
+          if stringEq path cfCallMutPath then some cfCallMutDefId
+          else if stringEq path cfCallPath then some cfCallDefId
+          else if stringEq path cfCallOncePath then some cfCallOnceDefId
+          else none
+        match method?, targs with
+        | some m, .closure cpath _ :: _ =>
+          match cfFindItem? prog cpath [] with
+          | some n => pure (b, ty, .closureMethod m n)
+          | none => throw (.unsupported "unresolved external call")
+        | _, _ =>
+          match cfFindItem? prog path targs with
+          | some n => pure (b, ty, .item n)
+          | none => throw (.unsupported "unresolved external call")
     | _ => throw (.invalidProgram "invalid callee type")
+
+/-- ABI of `core::panicking::panic_fmt(core::fmt::Arguments) -> !`. -/
+def cfPanicFmtAbi : CfFnAbi :=
+  let argsLayout : TypeLayout :=
+    { size := { bytes := 16 }, align := { bytes := 8 },
+      backendRepr := .scalarPair
+        (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+        (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+      fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1],
+      variants := .single 0, isUninhabited := false }
+  let neverLayout : TypeLayout :=
+    { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+      fields := .primitive, variants := .empty, isUninhabited := true }
+  let layouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [argsLayout, neverLayout] }
+  let argD : LocalDecl := { mutability := .not, ty := { kind := .adt "core::fmt::Arguments" [], layoutIdx := 0 }, debugName := none }
+  let retD : LocalDecl := { mutability := .mut, ty := { kind := .never, layoutIdx := 1 }, debugName := none }
+  { args := #[cfArgAbiOfDecl layouts argD .pair], ret := cfArgAbiOfDecl layouts retD .ignore,
+    conv := .Rust, canUnwind := true }
+
+def cfControlHooks (directUnwind : Bool := false) (body : CapturedMir) :=
+  if directUnwind then annealControlHooksWithDirectUnwind body.localDecls body.layouts {}
+  else annealControlHooksLM4_1 body.localDecls body.layouts {}
 
 def cfRunFrameStorage (prog : CfProg)
     (op : List LocalDecl → LayoutTable → Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit →
@@ -1560,7 +1775,7 @@ def cfVendoredFnAbi (abi : CfFnAbi) : Miri.ABI.FnAbi Miri.MIR.TyId :=
   { args := abi.args.map (·.abi), ret := abi.ret.abi, cVariadic := false,
     fixedCount := UInt32.ofNat abi.args.size, conv := abi.conv, canUnwind := abi.canUnwind }
 
-def cfCallHooks (prog : CfProg) :
+def cfCallHooks (prog : CfProg) (directUnwind : Bool := false) :
     Miri.Interpreter.CallHooks AnnealProv AnnealStepState Unit Unit Unit Miri.ABI.ExternAbi CfFnAbi CfArgAbi where
   debugAssertions := false
   getFrame := fun st =>
@@ -1575,18 +1790,18 @@ def cfCallHooks (prog : CfProg) :
   frameIndex := fun st => .ok (st.stack.frames.size - 1) st
   evalOperand := fun _ op => do
     let b ← cfActive prog
-    annealEvalOperandOverlay b.localDecls b.layouts op none
+    cfEvalOperand b.localDecls b.layouts op none
   evalOperandAt := fun _ _ op => do
     let b ← cfActive prog
-    annealEvalOperandOverlay b.localDecls b.layouts op none
+    cfEvalOperand b.localDecls b.layouts op none
   evalPlace := fun _ place _ => do
     let b ← cfActive prog
-    let runtimePlace ← annealEvalPlaceOverlay b.localDecls b.layouts place
+    let runtimePlace ← cfEvalPlace b.localDecls b.layouts place
     pure runtimePlace.stackView
   placeToOp := fun _ place => cfStackPlaceToOp prog place
   forceAllocation := fun _ place => do
     let b ← cfActive prog
-    let mp ← annealForceAllocation b.localDecls b.layouts place.toRuntimePlace
+    let mp ← cfForceAllocation b.localDecls b.layouts place.toRuntimePlace
     pure ⟨mp, place.layout⟩
   functionSignature := fun _ layout => do
     let (_, ty, callee) ← cfClassifyCallee prog
@@ -1599,6 +1814,7 @@ def cfCallHooks (prog : CfProg) :
       | some it => pure (it.body.argCount, .Rust)
       | none => throw (.invalidProgram "unknown item")
     | .closureMethod _ _ => pure (2, .RustCall)
+    | .panicFmt => pure (1, .Rust)
   functionKind := fun tyId => do
     let (_, ty, callee) ← cfClassifyCallee prog
     if encodeTyId ty != tyId then throw (.invalidProgram "callee operand type mismatch")
@@ -1606,6 +1822,7 @@ def cfCallHooks (prog : CfProg) :
     | .fnPtr .. => pure .FnPtr
     | .item n => pure (.FnDef n #[])
     | .closureMethod m n => pure (.FnDef m #[.Type (cfClosureArgBase + n)])
+    | .panicFmt => pure (.FnDef cfPanicFmtDefId #[])
   readPointer := fun _ op => do
     let imm ← annealReadImmediateOverlay op
     match imm.imm.toScalar with
@@ -1618,7 +1835,8 @@ def cfCallHooks (prog : CfProg) :
     let inst ← cfGetPtrFn prog ptr
     pure (.Instance inst)
   resolve := fun _ defId args =>
-    if defId == cfCallMutDefId || defId == cfCallDefId || defId == cfCallOnceDefId then
+    if defId == cfPanicFmtDefId then pure (cfItemInstance cfPanicFmtDefId)
+    else if defId == cfCallMutDefId || defId == cfCallDefId || defId == cfCallOnceDefId then
       match (args[0]? : Option Miri.MIR.GenericArg) with
       | some (Miri.MIR.GenericArg.Type t) =>
         let requested : CfClosureKind :=
@@ -1641,9 +1859,11 @@ def cfCallHooks (prog : CfProg) :
       | none => throw (.unsupported "fn_abi_of_fn_ptr of an unsupported signature")
     | _ => throw (.invalidProgram "fn_abi_of_fn_ptr of a non-pointer callee")
   fnAbiOfInstance := fun _ inst _ =>
-    match cfFnAbiOfInstance prog inst with
-    | some fnAbi => pure fnAbi
-    | none => throw (.unsupported "fn_abi_of_instance of an unsupported instance")
+    if inst == cfItemInstance cfPanicFmtDefId then pure cfPanicFmtAbi
+    else
+      match cfFnAbiOfInstance prog inst with
+      | some fnAbi => pure fnAbi
+      | none => throw (.unsupported "fn_abi_of_instance of an unsupported instance")
   requiresCallerLocation := fun _ => pure false
   callerLocation := annealUnsupportedLeaf "call.callerLocation"
   abiCanUnwind := fun abi => abi.canUnwind
@@ -1696,10 +1916,15 @@ def cfCallHooks (prog : CfProg) :
   callExtra := fun _ _ _ _ _ _ _ => annealUnsupportedLeaf "call.callExtra"
   callIntrinsic := fun _ _ _ _ _ _ => annealUnsupportedLeaf "call.callIntrinsic"
   callLlvmIntrinsic := fun _ _ _ _ _ => annealUnsupportedLeaf "call.callLlvmIntrinsic"
-  findMirOrEvalFn := fun _ inst _ _ _ _ _ =>
-    match cfMirBodyOfInstance prog inst with
-    | some body => pure (some (⟨.ofCanonicalIndex (cfBodyIndex inst), body⟩, inst))
-    | none => throw (.unsupported "no MIR body for the callee instance")
+  findMirOrEvalFn := fun _ inst _ _ _ _ unwind =>
+    if inst == cfItemInstance cfPanicFmtDefId then do
+      let b ← cfActive prog
+      cfLiftStep (Miri.Interpreter.ControlFlow.unwindToBlock (cfControlHooks directUnwind b) () unwind)
+      pure none
+    else
+      match cfMirBodyOfInstance prog inst with
+      | some body => pure (some (⟨.ofCanonicalIndex (cfBodyIndex inst), body⟩, inst))
+      | none => throw (.unsupported "no MIR body for the callee instance")
   resolveVirtual := fun _ _ _ _ _ _ => annealUnsupportedLeaf "call.resolveVirtual"
   isDynamic := fun _ => annealUnsupportedLeaf "call.isDynamic"
   unpackDynForDrop := fun _ _ => annealUnsupportedLeaf "call.unpackDynForDrop"
@@ -1713,9 +1938,6 @@ def cfCallBudget : Nat := 2
 
 def cfBaseHooks (body : CapturedMir) : CfHooks := annealStepHooksUnwindFnPtrClosure body [] {} []
 
-def cfControlHooks (body : CapturedMir) :=
-  annealControlHooksLM4_1 body.localDecls body.layouts {}
-
 def cfDrop (prog : CfProg) (body : CapturedMir) (place : Miri.MIR.Place) (target : Miri.MIR.BasicBlockId)
     (unwind : Miri.MIR.UnwindAction) (st : AnnealStepState) : Miri.Interpreter.StepResult AnnealStepState Unit :=
   match st.stack.currentFrame? with
@@ -1723,66 +1945,36 @@ def cfDrop (prog : CfProg) (body : CapturedMir) (place : Miri.MIR.Place) (target
   | some frame =>
     if cfIsShimInstance frame.functionInstance then
       -- A non-capturing closure has no drop glue: `Drop` is `go_to_block(target)`.
-      match Miri.Interpreter.runRvalue (annealEvalPlaceOverlay body.localDecls body.layouts place) st with
+      match Miri.Interpreter.runRvalue (cfEvalPlace body.localDecls body.layouts place) st with
       | (st', .ok _) => Miri.Interpreter.ControlFlow.goToBlock target st'
       | (st', .error e) => (st', .error e)
+    else if place.projection.isEmpty then
+      let _ := prog
+      match frame.getLocal place.localId with
+      | .ok ls =>
+        match ls.value with
+        | .live (.indirect mp) =>
+          match lookupLocalDeclLayout body.localDecls body.layouts place.localId with
+          | some lay =>
+            match Miri.Interpreter.runRvalue (annealWriteIndirectImmediate .uninit mp Miri.ABI.Size.ZERO lay) st with
+            | (st', .ok ()) => Miri.Interpreter.ControlFlow.goToBlock target st'
+            | (st', .error e) => (st', .error e)
+          | none => (st, .error (.stack (.missingLocalType place.localId)))
+        | _ => annealEvalDropLM4_1 place target unwind st
+      | .error e => (st, .error (.stack e))
     else
       let _ := prog
       annealEvalDropLM4_1 place target unwind st
 
 abbrev CfCallImpl := Unit → Nat → Miri.MIR.Terminator → CfM Unit
 
-def cfTerminatorHooks (callImpl tailImpl : CfCallImpl) (prog : CfProg) (body : CapturedMir) :=
+def cfTerminatorHooks (callImpl tailImpl : CfCallImpl) (prog : CfProg) (body : CapturedMir)
+    (directUnwind : Bool := false) :=
   { annealTerminatorHooksLM4_1 body [] {} [] with
-    toControlHooks := cfControlHooks body
+    toControlHooks := cfControlHooks directUnwind body
     call := fun c term st => Miri.Interpreter.Call.run (callImpl c cfCallBudget term) st
     tailCall := fun c term st => Miri.Interpreter.Call.run (tailImpl c cfCallBudget term) st
     drop := fun _ place target unwind st => cfDrop prog body place target unwind st }
-
-/-- A whole-local copy or move between zero-sized locals (e.g. a non-capturing closure value). -/
-def cfLocalIsZst (b : CapturedMir) (p : Miri.MIR.Place) : Bool :=
-  p.projection.isEmpty &&
-    (match lookupLocalDeclLayout b.localDecls b.layouts p.localId with
-     | some l => l.layout.isZst
-     | none => false)
-
-def cfZstUseOperand? (b : CapturedMir) (place : Miri.MIR.Place) : Miri.MIR.Rvalue → Option Miri.MIR.Operand
-  | .Use op _ =>
-    (match op with
-     | .Copy p | .Move p => if cfLocalIsZst b place && cfLocalIsZst b p then some op else none
-     | _ => none)
-  | _ => none
-
-/-- `copy_op` of a zero-sized value: the source must be live, and the destination becomes the
-(bit-free) zero-sized value. -/
-def cfAssignZstUse (b : CapturedMir) (place : Miri.MIR.Place) (op : Miri.MIR.Operand) : CfM Unit := do
-  let dest ← annealEvalPlaceOverlay b.localDecls b.layouts place
-  let _ ← annealEvalOperandOverlay b.localDecls b.layouts op (some dest.layout)
-  annealWriteImmediateLM2_2 .uninit dest
-
-/-- A whole-local tuple aggregate of one or two operands, e.g. the argument tuple `(x,)` of a
-direct `Fn::call`. -/
-def cfScalarTupleOperands? (place : Miri.MIR.Place) : Miri.MIR.Rvalue → Option (List Miri.MIR.Operand)
-  | .Aggregate .Tuple ops =>
-    if place.projection.isEmpty && (ops.size == 1 || ops.size == 2) then some ops.toList else none
-  | _ => none
-
-/-- Write a tuple of one or two scalars as a `Scalar` / `ScalarPair` immediate. -/
-def cfAssignScalarTuple (b : CapturedMir) (place : Miri.MIR.Place) (ops : List Miri.MIR.Operand) : CfM Unit := do
-  let dest ← annealEvalPlaceOverlay b.localDecls b.layouts place
-  match ops with
-  | [op] =>
-    let v ← annealEvalOperandOverlay b.localDecls b.layouts op none
-    match v.op with
-    | .immediate (.scalar s) => annealWriteImmediateLM2_2 (.scalar s) dest
-    | _ => throw (.unsupported "tuple aggregate of a non-scalar operand")
-  | [op0, op1] =>
-    let v0 ← annealEvalOperandOverlay b.localDecls b.layouts op0 none
-    let v1 ← annealEvalOperandOverlay b.localDecls b.layouts op1 none
-    match v0.op, v1.op with
-    | .immediate (.scalar s0), .immediate (.scalar s1) => annealWriteImmediateLM2_2 (.scalarPair s0 s1) dest
-    | _, _ => throw (.unsupported "tuple aggregate of a non-scalar operand")
-  | _ => throw (.unsupported "tuple aggregate arity")
 
 def cfWithBody {A : Type} (prog : CfProg) (st : AnnealStepState)
     (k : CapturedMir → Miri.Interpreter.StepResult AnnealStepState A) : Miri.Interpreter.StepResult AnnealStepState A :=
@@ -1793,17 +1985,12 @@ def cfWithBody {A : Type} (prog : CfProg) (st : AnnealStepState)
     | some b => k b
     | none => (st, .error (.invalidProgram "frame instance has no captured body"))
 
-def cfStepHooksWith (callImpl tailImpl : CfCallImpl) (prog : CfProg) : CfHooks where
+/-- Every `assign` executes unmodified vendored `Miri.Interpreter.evalRvalueIntoPlace`
+(no shadow `assign` branches), and every `call` / `tailCall` executes unmodified vendored
+`Miri.Interpreter.Call.evalCallTerminator` / `evalTailCallTerminator`. -/
+def cfStepHooksWith (callImpl tailImpl : CfCallImpl) (prog : CfProg) (directUnwind : Bool := false) : CfHooks where
   assign := fun c place rvalue st => cfWithBody prog st fun b =>
-    if cfIsFnPtrCastRvalue rvalue then
-      Miri.Interpreter.runRvalue (Miri.Interpreter.evalRvalueIntoPlace (cfRvalueHooks prog b) c rvalue place) st
-    else
-      match cfZstUseOperand? b place rvalue with
-      | some op => Miri.Interpreter.runRvalue (cfAssignZstUse b place op) st
-      | none =>
-        match cfScalarTupleOperands? place rvalue with
-        | some ops => Miri.Interpreter.runRvalue (cfAssignScalarTuple b place ops) st
-        | none => (cfBaseHooks b).assign c place rvalue st
+    Miri.Interpreter.runRvalue (Miri.Interpreter.evalRvalueIntoPlace (cfRvalueHooks prog b) c rvalue place) st
   evalPlace := fun c place skip st => cfWithBody prog st fun b => (cfBaseHooks b).evalPlace c place skip st
   writeDiscriminant := fun c v p st => cfWithBody prog st fun b => (cfBaseHooks b).writeDiscriminant c v p st
   storageLive := fun c l st => cfWithBody prog st fun b => (cfBaseHooks b).storageLive c l st
@@ -1811,15 +1998,24 @@ def cfStepHooksWith (callImpl tailImpl : CfCallImpl) (prog : CfProg) : CfHooks w
   intrinsic := fun c i st => cfWithBody prog st fun b => (cfBaseHooks b).intrinsic c i st
   incrementConstEvalCounter := fun _ st => (st, .ok ())
   returnFromCurrentFrame := fun c unwinding st => cfWithBody prog st fun b =>
-    Miri.Interpreter.ControlFlow.returnFromCurrentFrame (cfControlHooks b) c unwinding st
+    Miri.Interpreter.ControlFlow.returnFromCurrentFrame (cfControlHooks directUnwind b) c unwinding st
   beforeTerminator := fun _ st => (st, .ok ())
   terminator := fun c term st => cfWithBody prog st fun b =>
-    Miri.Interpreter.ControlFlow.evalTerminator (cfTerminatorHooks callImpl tailImpl prog b) c term st
+    Miri.Interpreter.ControlFlow.evalTerminator (cfTerminatorHooks callImpl tailImpl prog b directUnwind) c term st
 
-/-- Step hooks running the unmodified vendored `Call.evalCallTerminator` / `Call.evalTailCallTerminator`. -/
-def cfStepHooks (prog : CfProg) : CfHooks :=
-  cfStepHooksWith (Miri.Interpreter.Call.evalCallTerminator (cfCallHooks prog))
-    (Miri.Interpreter.Call.evalTailCallTerminator (cfCallHooks prog)) prog
+/-- Parameterized step hooks running unmodified vendored `Call.evalCallTerminator` /
+`Call.evalTailCallTerminator`, selecting canonical vs. direct-unwind `unwindTerminate`. -/
+def cfStepHooksMode (directUnwind : Bool) (prog : CfProg) : CfHooks :=
+  cfStepHooksWith (Miri.Interpreter.Call.evalCallTerminator (cfCallHooks prog directUnwind))
+    (Miri.Interpreter.Call.evalTailCallTerminator (cfCallHooks prog directUnwind)) prog directUnwind
+
+/-- Canonical step hooks running unmodified vendored `Step.step`, `Cast.cast`, and
+`Call.evalCallTerminator` / `Call.evalTailCallTerminator`. -/
+def cfStepHooks (prog : CfProg) : CfHooks := cfStepHooksMode false prog
+
+/-- Direct-unwind step hooks (`unwindTerminate` reports `TerminationInfo.abort`),
+matching `UnwindSetDiscrAndFnPtrLM.annealStepHooksUnwindFnPtrClosureDirectUnwind`. -/
+def cfStepHooksDirectUnwind (prog : CfProg) : CfHooks := cfStepHooksMode true prog
 
 /-! ## §8. Machine runner and observations -/
 
@@ -1924,6 +2120,56 @@ def cfMiriRunFrom (h : CfHooks) (prog : CfProg) (fuel : Nat)
   | some st => cfMiriRun h fuel st
   | none => .stuck
 
+/-- Run vendored `Miri.Interpreter.Step.step`, preserving the exact `StepError` on error. -/
+def cfMiriRunOutcome (h : CfHooks) : Nat → AnnealStepState → Except Miri.Interpreter.StepError CfObs
+  | 0, _ => .ok .stuck
+  | n + 1, st =>
+    match cfMiriRootReturn? st with
+    | some obs =>
+      match Miri.Interpreter.Step.step h () st with
+      | (_, .ok true) => .ok obs
+      | (_, .ok false) => .ok .stuck
+      | (_, .error e) => .error e
+    | none =>
+      match Miri.Interpreter.Step.step h () st with
+      | (st', .ok true) => cfMiriRunOutcome h n st'
+      | (_, .ok false) => .ok .stuck
+      | (_, .error e) => .error e
+
+def cfMiriRunOutcomeFrom (h : CfHooks) (prog : CfProg) (fuel : Nat)
+    (args : List (Miri.Interpreter.Immediate AnnealProv)) : Except Miri.Interpreter.StepError CfObs :=
+  match cfMiriInit prog args with
+  | some st => cfMiriRunOutcome h fuel st
+  | none => .ok .stuck
+
+/-- Trace observer for unwinding through an indirect `Fn`/`FnMut` closure call: runs vendored
+`Miri.Interpreter.Step.step` and records `(visitedShimCleanup, visitedCallerCleanup, outcome)`. -/
+def cfMiriUnwindTrace (h : CfHooks) :
+    Nat → AnnealStepState → Bool → Bool → Bool × Bool × Except Miri.Interpreter.StepError CfObs
+  | 0, _, vShim, vCaller => (vShim, vCaller, .ok .stuck)
+  | n + 1, st, vShim, vCaller =>
+    let vShim' := vShim ||
+      match st.stack.currentFrame? with
+      | some f => cfIsShimInstance f.functionInstance &&
+          match f.location with | .mir loc => loc.block == 3 | _ => false
+      | none => false
+    let vCaller' := vCaller ||
+      match st.stack.currentFrame? with
+      | some f => f.functionInstance == cfItemInstance 0 &&
+          match f.location with | .mir loc => loc.block == 3 | _ => false
+      | none => false
+    match Miri.Interpreter.Step.step h () st with
+    | (st', .ok true) => cfMiriUnwindTrace h n st' vShim' vCaller'
+    | (_, .ok false) => (vShim', vCaller', .ok .stuck)
+    | (_, .error e) => (vShim', vCaller', .error e)
+
+def cfMiriUnwindTraceFrom (h : CfHooks) (prog : CfProg) (fuel : Nat)
+    (args : List (Miri.Interpreter.Immediate AnnealProv)) :
+    Bool × Bool × Except Miri.Interpreter.StepError CfObs :=
+  match cfMiriInit prog args with
+  | some st => cfMiriUnwindTrace h fuel st false false
+  | none => (false, false, .ok .stuck)
+
 /-! ## §9. Trusted runner (real `stepMirFn`) -/
 
 inductive CfRunState : Type where
@@ -1992,19 +2238,57 @@ def cfFnPtrRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine)
     | .error _ => false
   | _, _ => false
 
-/-- Value agreement at a synchronization point: scalars agree exactly, function pointers denote
-the same function, zero-sized values are unconstrained, and data pointers and memory-backed
-aggregates are not compared. -/
+/-- Read a `sz`-byte scalar from a memory-backed `MemPlace` at relative byte offset `relOff`
+through vendored `Miri.Memory.Allocation.readScalar`. -/
+def cfReadMemScalar (mach : AnnealMachine) (mp : Miri.Interpreter.MemPlace AnnealProv)
+    (relOff sz : Nat) : Option (Miri.Memory.Scalar AnnealProv) :=
+  match mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId with
+  | none => none
+  | some id =>
+    match mach.lookupBaseAddr id with
+    | none => none
+    | some base =>
+      match mach.memory.live.find? (fun (k, _) => k == id) with
+      | none => none
+      | some (_, localAlloc) =>
+        let off := Miri.ABI.Size.ofBytes ((mp.ptr.offset.bytes - base) + UInt64.ofNat relOff)
+        match localAlloc.allocation.readScalar annealTargetDataLayout
+            (Miri.Memory.allocRange off (Miri.ABI.Size.ofBytes (UInt64.ofNat sz))) false with
+        | .ok s => some s
+        | .error _ => none
+
+/-- Value agreement at a synchronization point (no catch-all `true`):
+* zero-sized values (`.unit`, `.aggregate _ []`) agree with `.immediate .uninit` or `.indirect _`;
+* scalars agree byte-for-byte in both registers and memory (`cfReadMemScalar`);
+* function pointers denote the same linked function or closure body (`cfFnPtrRel`), and data
+  pointers match Miri pointer scalars;
+* 1-scalar and 2-scalar aggregates (e.g. `Guard`, `PairU32`) agree byte-for-byte in both
+  immediate and memory-backed forms. All other combinations return `false`. -/
 def cfValRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine) :
     MirSemantics.Value → Miri.Interpreter.Operand AnnealProv → Bool
+  | .unit, .immediate .uninit => true
+  | .unit, .indirect _ => true
   | .scalar sc, .immediate (.scalar s) => cfScalarRel sc s
-  | .scalar _, _ => false
+  | .scalar sc, .indirect mp =>
+    match cfReadMemScalar mach mp 0 sc.sizeBytes with
+    | some s => cfScalarRel sc s
+    | none => false
   | .ptr p _, .immediate (.scalar s) =>
     if (lookupFnPtr fnPtrs p.allocId).isSome then cfFnPtrRel prog fnPtrs mach p s else s.isPointer
-  | .ptr _ _, _ => false
+  | .aggregate _ [], .immediate .uninit => true
+  | .aggregate _ [], .indirect _ => true
   | .aggregate _ [.scalar sc], .immediate (.scalar s) => cfScalarRel sc s
-  | .aggregate _ [.scalar a, .scalar b], .immediate (.scalarPair s0 s1) => cfScalarRel a s0 && cfScalarRel b s1
-  | _, _ => true
+  | .aggregate _ [.scalar sc], .indirect mp =>
+    match cfReadMemScalar mach mp 0 sc.sizeBytes with
+    | some s => cfScalarRel sc s
+    | none => false
+  | .aggregate _ [.scalar a, .scalar b], .immediate (.scalarPair s0 s1) =>
+    cfScalarRel a s0 && cfScalarRel b s1
+  | .aggregate _ [.scalar a, .scalar b], .indirect mp =>
+    match cfReadMemScalar mach mp 0 a.sizeBytes, cfReadMemScalar mach mp a.sizeBytes b.sizeBytes with
+    | some s0, some s1 => cfScalarRel a s0 && cfScalarRel b s1
+    | _, _ => false
+  | _, _ => false
 
 def cfSlotRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine) (exempt : Bool) :
     LocalSlot → Miri.Interpreter.LocalValue AnnealProv → Bool
@@ -2301,14 +2585,19 @@ theorem cfCertificate_sound {h : CfHooks} {prog : CfProg} {body : CapturedMir} {
 section KernelForms
 open Lean Meta Elab Command
 
-/-- Whether `c` is the `Std.Legacy.Range` instance behind `for _ in [a:b]` loops. -/
-def cfIsRangeLoopConst (c : Name) : Bool :=
+/-- Whether `c` is a kernel-reduction obstacle in vendored code: either the `Std.Legacy.Range`
+instance behind `for _ in [a:b]` loops (rewritten via `Std.Legacy.Range.forIn_eq_forIn_range'`),
+or `Miri.Memory.KeyedArray.contains` (whose `Std.HashMap` lookup touches `USize`/`numBits`,
+rewritten via the vendored `Miri.Memory.KeyedArray.contains_rows`). -/
+def cfIsKernelObstacle (c : Name) : Bool :=
   let s := c.toString
-  (s.splitOn "Std.Legacy.Range").length > 1 && ((s.splitOn "forIn").length > 1 || (s.splitOn "ForIn").length > 1)
+  ((s.splitOn "Std.Legacy.Range").length > 1 && ((s.splitOn "forIn").length > 1 || (s.splitOn "ForIn").length > 1)) ||
+    c == ``Miri.Memory.KeyedArray.contains
 
 /-- `#cf_derive_kernel_forms root => rootK rootEq` derives, for `root` and every definition it
-transitively uses whose body contains a `Std.Legacy.Range` loop, a copy in which every such loop
-is rewritten to the equal `List.range'` loop (`Std.Legacy.Range.forIn_eq_forIn_range'`), together
+transitively uses whose body contains a kernel-reduction obstacle (`Std.Legacy.Range` loops or
+`Miri.Memory.KeyedArray.contains`), a copy rewritten using the proved equalities
+`Std.Legacy.Range.forIn_eq_forIn_range'` and `Miri.Memory.KeyedArray.contains_rows`, together
 with a kernel-checked theorem `original = copy`. `rootK` and `rootEq : @root = @rootK` name the
 copy and theorem of `root`. -/
 elab "#cf_derive_kernel_forms " root:ident " => " rootK:ident rootEq:ident : command => liftTermElabM do
@@ -2335,13 +2624,13 @@ elab "#cf_derive_kernel_forms " root:ident " => " rootK:ident rootEq:ident : com
         for u in used do
           if !visited.contains u then stack := stack.push (u, false)
       | _ => pure ()
-  -- Definitions whose bodies (transitively) contain a `Std.Legacy.Range` loop.
+  -- Definitions whose bodies (transitively) contain a kernel-reduction obstacle.
   let mut tainted : Std.HashSet Name := {}
   for n in order do
     let used := deps.getD n #[]
     if (n.toString.splitOn "Std.Legacy.Range").length > 1 then
       pure ()
-    else if used.any cfIsRangeLoopConst || used.any tainted.contains then
+    else if used.any cfIsKernelObstacle || used.any tainted.contains then
       tainted := tainted.insert n
   let mut eqThm : Std.HashMap Name Name := {}
   let mut idx : Nat := 0
@@ -2351,6 +2640,7 @@ elab "#cf_derive_kernel_forms " root:ident " => " rootK:ident rootEq:ident : com
       let some (.defnInfo d) := (← getEnv).find? n | throwError "not a definition: {n}"
       let mut thms : SimpTheorems := {}
       thms ← thms.addConst ``Std.Legacy.Range.forIn_eq_forIn_range'
+      thms ← thms.addConst ``Miri.Memory.KeyedArray.contains_rows
       for u in deps.getD n #[] do
         if let some t := eqThm[u]? then
           thms ← thms.addConst t
@@ -2374,13 +2664,27 @@ elab "#cf_derive_kernel_forms " root:ident " => " rootK:ident rootEq:ident : com
         eqThm := eqThm.insert n tName
         derived := derived + 1
   unless eqThm.contains rootName do
-    throwError "{rootName} does not use any `Std.Legacy.Range` loop"
+    throwError "{rootName} does not use any kernel-reduction obstacle"
   logInfo m!"derived {derived} kernel forms from {order.size} reachable definitions"
 
 end KernelForms
 
 set_option maxHeartbeats 0 in
-#cf_derive_kernel_forms cfStepHooks => cfStepHooksK cfStepHooks_eq_K
+#cf_derive_kernel_forms cfStepHooksMode => cfStepHooksModeK cfStepHooksMode_eq_K
+
+/-- Kernel-evaluable form of `cfStepHooks`, proved equal by `cfStepHooks_eq_K`. -/
+noncomputable def cfStepHooksK (prog : CfProg) : CfHooks := cfStepHooksModeK false prog
+
+theorem cfStepHooks_eq_K : cfStepHooks = cfStepHooksK := by
+  funext prog
+  exact congrFun (congrFun cfStepHooksMode_eq_K false) prog
+
+/-- Kernel-evaluable form of `cfStepHooksDirectUnwind`, proved equal by `cfStepHooksDirectUnwind_eq_K`. -/
+noncomputable def cfStepHooksDirectUnwindK (prog : CfProg) : CfHooks := cfStepHooksModeK true prog
+
+theorem cfStepHooksDirectUnwind_eq_K : cfStepHooksDirectUnwind = cfStepHooksDirectUnwindK := by
+  funext prog
+  exact congrFun (congrFun cfStepHooksMode_eq_K true) prog
 
 /-! ## §12. Programs -/
 
@@ -2430,7 +2734,62 @@ def cfProgGeneric : CfProg :=
 def cfProgDirect : CfProg := [⟨[], cfFx_direct_closure_call⟩, ⟨[], cfFx_direct_closure_call_closure_0⟩]
 def cfProgUnwind : CfProg :=
   [⟨[], cfFx_unwind_through_closure⟩, ⟨[], cfFx_unwind_through_closure_closure_0⟩,
-   ⟨[], cfFx_Guard_as_core_ops_Drop_drop⟩]
+   ⟨[], cfFx_Guard_as_core_ops_Drop_drop⟩, ⟨[], cfFmtFromStrStub⟩]
+def cfProgUnwindWith (u : UnwindAction) : CfProg :=
+  [⟨[], cfSetBb0CallUnwind cfFx_unwind_through_closure u⟩, ⟨[], cfFx_unwind_through_closure_closure_0⟩,
+   ⟨[], cfFx_Guard_as_core_ops_Drop_drop⟩, ⟨[], cfFmtFromStrStub⟩]
+
+/-- Episode 1's `w_c8_end_to_end_closure_coercion_and_indirect_call` closure body (`c8_zst_clos`):
+`_1 : &{closure "c8_zst_clos"}`, `_2 : u32`, returns `_2`, with captured 2-argument `FnAbi`. -/
+def cfW_C8_ClosCallee : CapturedMir :=
+  let u32L : TypeLayout :=
+    { size := { bytes := 4 }, align := { bytes := 4 },
+      backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+      fields := .primitive, variants := .single 0, isUninhabited := false }
+  let layouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [u32L, cfZstLayout, cfPtrLayout] }
+  let u32T : Ty := { kind := .uint .u32, layoutIdx := 0 }
+  let envT : Ty := { kind := .ref .not (.closure "c8_zst_clos" []), layoutIdx := 2 }
+  { defPath := "c8_zst_clos", phase := .runtimePostCleanup, role := .subject, argCount := 2,
+    localDecls := [{ mutability := .mut, ty := u32T, debugName := none },
+                   { mutability := .mut, ty := envT, debugName := none },
+                   { mutability := .not, ty := u32T, debugName := none }],
+    basicBlocks :=
+      [{ statements := [cfShimStmt (.assign ⟨0, []⟩ (.use (.copy ⟨2, []⟩)))],
+         terminator := cfShimTerm .return_, isCleanup := false }],
+    fnAbi := { args := [{ layout := cfPtrLayout, mode := .direct }, { layout := u32L, mode := .direct }],
+               ret := { layout := u32L, mode := .direct }, conv := .rust, canUnwind := true },
+    layouts := layouts, allocations := [] }
+
+/-- Episode 1's `w_c8_end_to_end_closure_coercion_and_indirect_call` caller (`c8_e2e_caller`):
+`_2 = {closure "c8_zst_clos"}; _1 = copy _2 as fn(u32) -> u32 (ClosureFnPointer(Safe));
+_0 = move _1(const 42_u32) -> bb1; bb1: return`. -/
+def cfW_C8_Caller : CapturedMir :=
+  let u32L : TypeLayout :=
+    { size := { bytes := 4 }, align := { bytes := 4 },
+      backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+      fields := .primitive, variants := .single 0, isUninhabited := false }
+  let layouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [u32L, cfPtrLayout, cfZstLayout] }
+  let u32T : Ty := { kind := .uint .u32, layoutIdx := 0 }
+  let fnT : Ty := { kind := .fnPtr [.uint .u32] (.uint .u32) .safe .rust, layoutIdx := 1 }
+  let closT : Ty := { kind := .closure "c8_zst_clos" [], layoutIdx := 2 }
+  { defPath := "c8_e2e_caller", phase := .runtimePostCleanup, role := .subject, argCount := 0,
+    localDecls := [{ mutability := .mut, ty := u32T, debugName := none },
+                   { mutability := .mut, ty := fnT, debugName := none },
+                   { mutability := .mut, ty := closT, debugName := none }],
+    basicBlocks :=
+      [{ statements :=
+           [ cfShimStmt (.storageLive 1), cfShimStmt (.storageLive 2),
+             cfShimStmt (.assign ⟨2, []⟩ (.aggregate (.closure "c8_zst_clos") [])),
+             cfShimStmt (.assign ⟨1, []⟩ (.cast (.pointerCoercion "ClosureFnPointer(Safe)") (.copy ⟨2, []⟩) fnT)) ],
+         terminator := cfShimTerm (.call (.move ⟨1, []⟩)
+           [.constant { ty := u32T, val := .scalar (.int ⟨42, 4⟩) }] ⟨0, []⟩ (some 1) .continue_),
+         isCleanup := false },
+       { statements := [cfShimStmt (.storageDead 2), cfShimStmt (.storageDead 1)],
+         terminator := cfShimTerm .return_, isCleanup := false }],
+    fnAbi := { args := [], ret := { layout := u32L, mode := .direct }, conv := .rust, canUnwind := true },
+    layouts := layouts, allocations := [] }
+
+def cfProgW_C8 : CfProg := [⟨[], cfW_C8_Caller⟩, ⟨[], cfW_C8_ClosCallee⟩]
 
 /-! ## §13. Hand-built negative programs -/
 
@@ -2438,25 +2797,30 @@ def cfHandStmt (k : StatementKind) : MirAst.Statement := { kind := k, span := "<
 def cfHandTerm (k : TerminatorKind) : MirAst.Terminator := { kind := k, span := "<hand>" }
 def cfHandDecl (ty : Ty) : LocalDecl := { mutability := .mut, ty := ty, debugName := none }
 def cfU32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+def cfU64Layout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 },
+    backendRepr := .scalar (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
 def cfNegClosurePath : String := "closure_matrix::fn_once_kind::{closure#0}"
+def cfNegFnSharedPath : String := "closure_matrix::fn_shared::{closure#0}"
 def cfNegFnPtrTy (inputs : List RigidTy) (safety : Safety) (conv : CallConv) : Ty :=
   { kind := .fnPtr inputs (.uint .u32) safety conv, layoutIdx := 1 }
 
-/-- Hand-built variant of the captured `closure_matrix::fn_shared`, linked against the captured
-`FnOnce` closure body `closure_matrix::fn_once_kind::{closure#0}`:
+/-- Hand-built variant of the captured `closure_matrix::fn_shared`, linked against a chosen
+closure body (`closPath`, defaulting to the `FnOnce` closure body):
 `_3 = {closure}; _2 = move _3 as castTy (PointerCoercion(coercion)); _4 = copy _2; _5 = copy _1;
 _0 = move _4(callArgs)`, where the closure type of `_3` lists `upvarTys` and `_4 : callTy` may
 differ from `_2 : castTy` (the effect of a `transmute` between function-pointer types). -/
 def cfNegCaller (upvarTys : List RigidTy) (coercion : String) (castTy callTy : Ty)
-    (callArgs : List Operand) : CapturedMir :=
+    (callArgs : List Operand) (closPath : String := cfNegClosurePath) : CapturedMir :=
   { defPath := "hand::negative_caller", phase := .runtimeOptimized, role := .subject, argCount := 1,
     localDecls := [cfHandDecl cfU32Ty, cfHandDecl cfU32Ty, cfHandDecl castTy,
-                   cfHandDecl { kind := .closure cfNegClosurePath upvarTys, layoutIdx := 2 },
+                   cfHandDecl { kind := .closure closPath upvarTys, layoutIdx := 2 },
                    cfHandDecl callTy, cfHandDecl cfU32Ty],
     basicBlocks :=
       [ { statements :=
             [ cfHandStmt (.storageLive 2), cfHandStmt (.storageLive 3),
-              cfHandStmt (.assign ⟨3, []⟩ (.aggregate (.closure cfNegClosurePath) [])),
+              cfHandStmt (.assign ⟨3, []⟩ (.aggregate (.closure closPath) [])),
               cfHandStmt (.assign ⟨2, []⟩ (.cast (.pointerCoercion coercion) (.move ⟨3, []⟩) castTy)),
               cfHandStmt (.storageDead 3), cfHandStmt (.storageLive 4),
               cfHandStmt (.assign ⟨4, []⟩ (.use (.copy ⟨2, []⟩))),
@@ -2474,13 +2838,41 @@ def cfNegCapU32 : CapturedMir :=
 /-- Closure type with one zero-sized `()` upvar coerced by `ClosureFnPointer(Safe)`. -/
 def cfNegCapUnit : CapturedMir :=
   cfNegCaller [.tuple []] "ClosureFnPointer(Safe)" cfSafeFn1 cfSafeFn1 [.move ⟨5, []⟩]
-/-- Forged `(N+1)`-argument indirect call through a `fn(u32, u32) -> u32` pointer type. -/
+/-- Forged `(N+1)`-argument indirect call through `fn(u32, u32) -> u32` to a `FnOnce` closure. -/
 def cfNegForged : CapturedMir :=
   cfNegCaller [] "ClosureFnPointer(Safe)" cfSafeFn1 (cfNegFnPtrTy [.uint .u32, .uint .u32] .safe .rust)
     [.move ⟨5, []⟩, .copy ⟨1, []⟩]
-/-- Indirect call through a pointer retyped to `fn(u64) -> u32`. -/
+/-- Forged `(N+1)`-argument indirect call through `fn(u32, u32) -> u32` to a `Fn` (`ClosureOnceShim`) closure. -/
+def cfNegForgedFn : CapturedMir :=
+  cfNegCaller [] "ClosureFnPointer(Safe)" cfSafeFn1 (cfNegFnPtrTy [.uint .u32, .uint .u32] .safe .rust)
+    [.move ⟨5, []⟩, .copy ⟨1, []⟩] cfNegFnSharedPath
+/-- Indirect call through a pointer retyped to `fn(u64) -> u32`, with a genuine 8-byte `u64`
+layout and `u64` argument local so vendored `Call.evalCallTerminator` reaches `checkArgumentCompat`
+and raises `AbiMismatchArgument`. -/
 def cfNegTransSig : CapturedMir :=
-  cfNegCaller [] "ClosureFnPointer(Safe)" cfSafeFn1 (cfNegFnPtrTy [.uint .u64] .safe .rust) [.move ⟨5, []⟩]
+  let u64Idx := length cfFx_fn_shared.layouts.entries
+  let u64Ty : Ty := { kind := .uint .u64, layoutIdx := u64Idx }
+  let callTy := cfNegFnPtrTy [.uint .u64] .safe .rust
+  { defPath := "hand::neg_trans_sig", phase := .runtimeOptimized, role := .subject, argCount := 1,
+    localDecls := [cfHandDecl cfU32Ty, cfHandDecl cfU32Ty, cfHandDecl cfSafeFn1,
+                   cfHandDecl { kind := .closure cfNegClosurePath [], layoutIdx := 2 },
+                   cfHandDecl callTy, cfHandDecl u64Ty],
+    basicBlocks :=
+      [ { statements :=
+            [ cfHandStmt (.storageLive 2), cfHandStmt (.storageLive 3),
+              cfHandStmt (.assign ⟨3, []⟩ (.aggregate (.closure cfNegClosurePath) [])),
+              cfHandStmt (.assign ⟨2, []⟩ (.cast (.pointerCoercion "ClosureFnPointer(Safe)") (.move ⟨3, []⟩) cfSafeFn1)),
+              cfHandStmt (.storageDead 3), cfHandStmt (.storageLive 4),
+              cfHandStmt (.assign ⟨4, []⟩ (.use (.copy ⟨2, []⟩))),
+              cfHandStmt (.storageLive 5),
+              cfHandStmt (.assign ⟨5, []⟩ (.use (.constant { ty := u64Ty, val := .scalar (.int ⟨5, 8⟩) }))) ],
+          terminator := cfHandTerm (.call (.move ⟨4, []⟩) [.move ⟨5, []⟩] ⟨0, []⟩ (some 1) .continue_),
+          isCleanup := false },
+        { statements := [cfHandStmt (.storageDead 5), cfHandStmt (.storageDead 4), cfHandStmt (.storageDead 2)],
+          terminator := cfHandTerm .return_, isCleanup := false } ],
+    fnAbi := cfFx_fn_shared.fnAbi,
+    layouts := { cfFx_fn_shared.layouts with entries := cfFx_fn_shared.layouts.entries ++ [cfU64Layout] },
+    allocations := [] }
 /-- Indirect call through a pointer retyped to `extern "C" fn(u32) -> u32`. -/
 def cfNegExternC : CapturedMir :=
   cfNegCaller [] "ClosureFnPointer(Safe)" cfSafeFn1 (cfNegFnPtrTy [.uint .u32] .safe .c) [.move ⟨5, []⟩]
@@ -2494,11 +2886,17 @@ def cfNegSafetyCall : CapturedMir :=
 def cfNegNormal : CapturedMir :=
   cfNegCaller [] "ClosureFnPointer(Normal)" cfSafeFn1 cfSafeFn1 [.move ⟨5, []⟩]
 
-def cfNegProg (body : CapturedMir) : CfProg := [⟨[], body⟩, ⟨[], cfFx_fn_once_kind_closure_0⟩]
-def cfNegTrusted (body : CapturedMir) : CfObs := cfRun body 100 (cfInit body [cfU32 5] [cfFx_fn_once_kind_closure_0])
-def cfNegMiri (body : CapturedMir) : CfObs := cfMiriRunFrom (cfStepHooks (cfNegProg body)) (cfNegProg body) 100 [cfU32Imm 5]
+def cfNegProg (body : CapturedMir) (callee : CapturedMir := cfFx_fn_once_kind_closure_0) : CfProg :=
+  [⟨[], body⟩, ⟨[], callee⟩]
+def cfNegTrusted (body : CapturedMir) (callee : CapturedMir := cfFx_fn_once_kind_closure_0) : CfObs :=
+  cfRun body 100 (cfInit body [cfU32 5] [callee])
+def cfNegMiri (body : CapturedMir) (callee : CapturedMir := cfFx_fn_once_kind_closure_0) : CfObs :=
+  cfMiriRunFrom (cfStepHooks (cfNegProg body callee)) (cfNegProg body callee) 100 [cfU32Imm 5]
+def cfNegMiriOutcome (body : CapturedMir) (callee : CapturedMir := cfFx_fn_once_kind_closure_0) :
+    Except Miri.Interpreter.StepError CfObs :=
+  cfMiriRunOutcomeFrom (cfStepHooks (cfNegProg body callee)) (cfNegProg body callee) 100 [cfU32Imm 5]
 
-/-! ## §14. Universal resolution and pointer-identity laws -/
+/-! ## §14. Universal resolution, `nonCapturingClosure`, `Cast.cast`, and pointer-identity laws -/
 
 /-- The function allocation `65536 + 2n` denotes item `n`. -/
 theorem cfInstanceOfAllocNat_item (n : Nat) :
@@ -2556,11 +2954,172 @@ theorem cfResolveClosure_generic_unsupported {prog : CfProg} {n : Nat} {it : CfI
       .error (.unsupported "closure body with unresolved parent generic arguments") := by
   simp [cfResolveClosure, hit, hgen]
 
-/-! ## §15. Kernel-checked witnesses
+/-- **Universal vendored `ExecutionCallLeaves.nonCapturingClosure` law**:
+on unmodified vendored `Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler prog)`:
+1. a `ClosureOnceShim` with an upvar-free closure `_1` evaluates to `.ok true`;
+2. a non-capturing `FnOnce` closure item with an upvar-free closure `_1` evaluates to `.ok true`;
+3. any capturing closure (`upvars = u :: us`, whether non-ZST or ZST) evaluates to `.ok false`
+   for both item and shim instances;
+4. a non-closure item evaluates to `.ok false` without inspecting `_1`. -/
+theorem cfNonCapturingClosure_vendored_law (prog : CfProg) (st : AnnealStepState)
+    (f : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (b : CapturedMir) (d0 self : LocalDecl) (rest : List LocalDecl)
+    (abi : Miri.ABI.FnAbi Miri.MIR.TyId) (first : Miri.ABI.ArgAbi Miri.MIR.TyId)
+    (hFrame : st.stack.currentFrame? = some f)
+    (hBody : cfBodyOfInstance prog f.functionInstance = some b)
+    (hDecls : b.localDecls = d0 :: self :: rest)
+    (hFirst : abi.args[0]? = some first)
+    (hTy : encodeTyId self.ty = first.layout.ty) :
+    (∀ n p, self.ty.kind = .closure p [] →
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler prog) (cfShimInstance n) abi st =
+        .ok true st) ∧
+    (∀ n it p, cfItem? prog n = some it → cfClosureKind? it.body = some (.fnOnce, 0) →
+      self.ty.kind = .closure p [] →
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler prog) (cfItemInstance n) abi st =
+        .ok true st) ∧
+    (∀ n p u us, self.ty.kind = .closure p (u :: us) →
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler prog) (cfShimInstance n) abi st =
+        .ok false st) ∧
+    (∀ n it, cfItem? prog n = some it → cfClosureKind? it.body = none →
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler prog) (cfItemInstance n) abi st =
+        .ok false st) := by
+  have hAct : cfActive prog st = .ok b st := by
+    unfold cfActive; simp only [hFrame, hBody]
+  have hTyEq : (first.layout.ty == first.layout.ty) = true := beq_self_eq_true _
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro n p hKind
+    unfold Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure
+    simp only [cfShimInstance, cfCompiler, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+      hFirst, hAct, hDecls, hTy, hTyEq, ↓reduceIte, hKind]
+    rfl
+  · intro n it p hit hk hKind
+    unfold Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure
+    simp only [cfItemInstance, cfCompiler, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+      hit, Option.bind_some, hk, Option.isSome_some, hFirst, hAct, hDecls, hTy, hTyEq, ↓reduceIte, hKind]
+    rfl
+  · intro n p u us hKind
+    unfold Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure
+    simp only [cfShimInstance, cfCompiler, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+      hFirst, hAct, hDecls, hTy, hTyEq, ↓reduceIte, hKind]
+    rfl
+  · intro n it hit hk
+    unfold Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure
+    simp only [cfItemInstance, cfCompiler, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+      hit, Option.bind_some, hk, Option.isSome_none, Bool.false_eq_true, ↓reduceIte]
 
-Every theorem of this section is closed by `decide +kernel` on closed terms. Where the vendored
-interpreter runs, the goal is first transported along `cfStepHooks_eq_K`, so each statement is
-about `cfStepHooks`, i.e. the unmodified `Step.step`, `Cast.cast`, and `Call.evalCallTerminator`. -/
+/-- **Universal vendored `Cast.cast` law for `ClosureFnPointer(Safe|Unsafe)`**:
+on unmodified vendored `Miri.Interpreter.Cast.cast (cfCastHooks prog body)`:
+1. for a non-capturing closure (`upvars = 0`) whose linked body resolves via `cfResolveClosure`
+   to `inst` (`cfItemInstance n` for `FnOnce`, `cfShimInstance n` for `Fn`/`FnMut`), `Cast.cast`
+   writes the exact function pointer `cfFunctionPointer inst` into `dest`;
+2. for a capturing closure (`upvars = k + 1`, non-ZST or ZST), vendored `Cast.cast` rejects the
+   cast with `.error (.invalidProgram "capturing closure in pointer cast")` before reaching
+   `resolveClosureFnOnce`. -/
+theorem cfCast_closureFnPointer_vendored_law (prog : CfProg) (body : CapturedMir) (fuel : Nat)
+    (source : Miri.Interpreter.OpTy AnnealProv) (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (safety : Miri.MIR.Safety) (origin : Miri.MIR.CoercionSource) (st : AnnealStepState) :
+    (∀ n inst ptr st1,
+      cfCastTypeInfo prog body source.layout.ty st = .ok (.closure n #[] 0) st →
+      cfResolveClosure prog n .fnOnce = .ok inst →
+      cfFunctionPointer inst st = .ok ptr st1 →
+      Miri.Interpreter.Cast.cast (cfCastHooks prog body) () fuel source
+          (.PointerCoercion (.ClosureFnPointer safety) origin) dest.layout.ty dest st =
+        (cfCastHooks prog body).writePointer () ptr dest st1) ∧
+    (∀ n k,
+      cfCastTypeInfo prog body source.layout.ty st = .ok (.closure n #[] (k + 1)) st →
+      Miri.Interpreter.Cast.cast (cfCastHooks prog body) () fuel source
+          (.PointerCoercion (.ClosureFnPointer safety) origin) dest.layout.ty dest st =
+        .error (.invalidProgram "capturing closure in pointer cast") st) := by
+  refine ⟨?_, ?_⟩
+  · intro n inst ptr st1 hInfo hRes hPtr
+    unfold Miri.Interpreter.Cast.cast
+    simp only [cfCastHooks, annealCastHooksUnwindFnPtrClosure, annealCastHooksLM4_1, annealCastHooks,
+      Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, beq_self_eq_true, ↓reduceIte,
+      Bool.false_eq_true, hInfo, bne_self_eq_false, hRes, hPtr]
+  · intro n k hInfo
+    have hne : ((k + 1) != 0) = true := by simp
+    unfold Miri.Interpreter.Cast.cast
+    simp only [cfCastHooks, annealCastHooksUnwindFnPtrClosure, annealCastHooksLM4_1, annealCastHooks,
+      Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, beq_self_eq_true, ↓reduceIte,
+      Bool.false_eq_true, hInfo, hne]
+    rfl
+
+/-- Definitional unfolding of the `private` helper definitions inside vendored
+`Miri.Interpreter.Cast` (`readPointer`, `scalarOf`, `liftResult`, `isAnyPointer`, `invalid`)
+without editing `lean-miri/vendor/`. Pure definitional reduction (`replaceTargetDefEq`). -/
+local elab "cf_unfold_cast_privates" : tactic => do
+  let env ← Lean.getEnv
+  let some idx := env.getModuleIdx? `Miri.Interpreter.Cast
+    | throwError "Miri.Interpreter.Cast is not imported"
+  let targets := [`readPointer, `scalarOf, `liftResult, `isAnyPointer, `invalid]
+  let mut privs : Array Lean.Name := #[]
+  for n in env.header.moduleData[idx.toNat]!.constNames do
+    if let .str _ s := n then
+      if targets.any (fun t => t.toString == s) then
+        privs := privs.push n
+  let g ← Lean.Elab.Tactic.getMainGoal
+  let mut t ← g.getType
+  for _ in [:3] do
+    for p in privs do
+      t := (← Lean.Meta.unfold t p).expr
+  let g' ← g.replaceTargetDefEq t
+  Lean.Elab.Tactic.replaceMainGoal [g']
+
+/-- **Universal vendored `Cast.cast` pointer-identity law (`UnsafeFnPointer` & `FnPtrToPtr`,
+`raw_c == raw_d`)**: for any valid function-pointer scalar `sc` whose provenance resolves to `ptr`
+passing `cfCheckFnPointer prog ptr`:
+1. `PointerCoercion.UnsafeFnPointer` writes the exact unchanged scalar `.scalar sc` into `dest`;
+2. `CastKind.FnPtrToPtr` to an equal-size raw pointer writes the exact unchanged scalar `.scalar sc`
+   into `dest`.
+Hence casting `f : fn(..) -> ..` via `UnsafeFnPointer` to `g : unsafe fn(..) -> ..` and casting
+both via `FnPtrToPtr` yields identical pointer immediates (`raw_c == raw_d`). -/
+theorem cfCast_unsafeFnPointer_and_fnPtrToPtr_identity (prog : CfProg) (body : CapturedMir) (fuel : Nat)
+    (source : Miri.Interpreter.OpTy AnnealProv) (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (sc : Miri.Memory.Scalar AnnealProv) (ptr : Miri.Memory.Pointer (Option AnnealProv))
+    (st : AnnealStepState)
+    (hRead : annealReadImmediateOverlay source st = .ok ⟨.scalar sc, source.layout⟩ st)
+    (hPtr : sc.toPointer annealTargetDataLayout = .ok ptr)
+    (hSrcInfo : cfCastTypeInfo prog body source.layout.ty st = .ok .fnPointer st)
+    (hCheck : cfCheckFnPointer prog ptr st = .ok () st) :
+    (∀ origin,
+      cfCastTypeInfo prog body dest.layout.ty st = .ok .fnPointer st →
+      Miri.Interpreter.Cast.cast (cfCastHooks prog body) () fuel source
+          (.PointerCoercion .UnsafeFnPointer origin) dest.layout.ty dest st =
+        annealWriteImmediateLM2_2 (.scalar sc) dest st) ∧
+    (∀ pointee,
+      cfCastTypeInfo prog body dest.layout.ty st = .ok (.rawPointer pointee) st →
+      source.layout.layout.size = dest.layout.layout.size →
+      Miri.Interpreter.Cast.cast (cfCastHooks prog body) () fuel source
+          .FnPtrToPtr dest.layout.ty dest st =
+        annealWriteImmediateLM2_2 (.scalar sc) dest st) := by
+  have hTyEq : (dest.layout.ty == dest.layout.ty) = true := beq_self_eq_true _
+  refine ⟨?_, ?_⟩
+  · intro origin hDstInfo
+    unfold Miri.Interpreter.Cast.cast
+    simp only [cfCastHooks, annealCastHooksUnwindFnPtrClosure, annealCastHooksLM4_1, annealCastHooks,
+      Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, hTyEq, ↓reduceIte,
+      Bool.false_eq_true, hSrcInfo]
+    cf_unfold_cast_privates
+    simp only [Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, hRead,
+      Miri.Interpreter.Immediate.toScalar, Except.mapError, hPtr, hCheck, hDstInfo]
+  · intro pointee hDstInfo hSize
+    have hSizeEq : (source.layout.layout.size == dest.layout.layout.size) = true := by
+      rw [hSize]; exact beq_self_eq_true _
+    unfold Miri.Interpreter.Cast.cast Miri.Interpreter.Cast.ptrToPtr
+    simp only [cfCastHooks, annealCastHooksUnwindFnPtrClosure, annealCastHooksLM4_1, annealCastHooks,
+      Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, hTyEq, ↓reduceIte,
+      Bool.false_eq_true, hSrcInfo]
+    cf_unfold_cast_privates
+    simp only [Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, hRead,
+      Miri.Interpreter.Immediate.toScalar, Except.mapError, hPtr, hCheck, hSrcInfo,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hDstInfo, hSizeEq]
+
+/-! ## §15. Kernel-checked simulation, `finding_0007` parity, unwinding, and negative witnesses
+
+Every theorem of this section is closed by `decide +kernel` on closed terms (zero `#guard`s,
+zero `ofReduceBool`). Every vendored-Miri goal is transported along `cfStepHooks_eq_K` (or
+`cfStepHooksDirectUnwind_eq_K`), so every statement is about the unmodified vendored
+`Miri.Interpreter.Step.step`, `Cast.cast`, and `Call.evalCallTerminator` / `evalTailCallTerminator`. -/
 
 /-- **`FnOnce` certificate (C6).** `closure_matrix::fn_once_kind(5) = 8` on both machines with
 stutter index `0`: the indirect call enters the by-value closure body directly through the
@@ -2571,7 +3130,7 @@ theorem cf_fn_once_certificate :
       some (.scalar 8 4, 0) := by
   rw [cfStepHooks_eq_K]; decide +kernel
 
-/-- **`FnOnce` 1-to-1 lockstep simulation (C6)** between `stepMirFn` and `Step.step`. -/
+/-- **`FnOnce` 1-to-1 lockstep simulation (C6)** between `stepMirFn` and vendored `Step.step`. -/
 theorem cf_fn_once_lockstep :
     ∃ m, cfMiriInit cfProgFnOnce [cfU32Imm 5] = some m ∧
       CfLockstepSim (cfStepHooks cfProgFnOnce) cfProgFnOnce cfFx_fn_once_kind
@@ -2580,9 +3139,46 @@ theorem cf_fn_once_lockstep :
   obtain ⟨m, hm, _, hs⟩ := cfCertificate_sound cf_fn_once_certificate
   exact ⟨m, hm, cfStutterSim_zero_lockstep hs rfl⟩
 
-/-- **Reproducer parity on `stepMirFn`.** `__anneal_vt_driver_61873(35, 24) = 159` and
-`pass_shared_temp_const_raw_ptr_read_and_freeze_retag__b22_c27() = 9147 : u32`, the value Miri
-reports. -/
+/-- **`finding_0007` driver (`__anneal_vt_driver_61873(35, 24) = 159`) stuttering simulation**:
+kernel-checked `CfStutterSim` with stutter index `15` (three `Fn` closure calls × 5
+`ClosureOnceShim` steps each) between `stepMirFn` and unmodified vendored `Step.step`. -/
+theorem cf_finding_0007_driver_stutter_sim :
+    cfCertificate (cfStepHooks cfProgDriver) cfProgDriver cfFx_finding_driver
+      [cfFx_finding_closure_0, cfFx_finding_closure_1] [cfU32 35, cfU32 24] [cfU32Imm 35, cfU32Imm 24] 600 =
+      some (.scalar 159 4, 15) ∧
+    ∃ m, cfMiriInit cfProgDriver [cfU32Imm 35, cfU32Imm 24] = some m ∧
+      CfStutterSim (cfStepHooks cfProgDriver) cfProgDriver cfFx_finding_driver
+        (cfInit cfFx_finding_driver [cfU32 35, cfU32 24] [cfFx_finding_closure_0, cfFx_finding_closure_1]) m
+        (.scalar 159 4) 15 := by
+  have hc : cfCertificate (cfStepHooks cfProgDriver) cfProgDriver cfFx_finding_driver
+      [cfFx_finding_closure_0, cfFx_finding_closure_1] [cfU32 35, cfU32 24] [cfU32Imm 35, cfU32Imm 24] 600 =
+      some (.scalar 159 4, 15) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨m, hm, _, hs⟩ := cfCertificate_sound hc
+  exact ⟨hc, m, hm, hs⟩
+
+/-- **`finding_0007` full root reproducer parity (`9147 : u32`)**:
+kernel-checked `CfStutterSim` with stutter index `15` for the entire
+`pass_shared_temp_const_raw_ptr_read_and_freeze_retag__b22_c27` body (`PairU32` aggregate,
+`&PairU32` reborrows, `&raw const (*tmp).b`, raw-pointer reads, `__anneal_vt_driver_61873`, and
+all three `Fn` closure calls through `ClosureOnceShim`) between `stepMirFn` and unmodified
+vendored `Step.step`. -/
+theorem cf_finding_0007_main_stutter_sim :
+    cfCertificate (cfStepHooks cfProgFinding) cfProgFinding cfFx_finding_main
+      [cfFx_finding_driver, cfFx_finding_closure_0, cfFx_finding_closure_1] [] [] 600 =
+      some (.scalar 9147 4, 15) ∧
+    ∃ m, cfMiriInit cfProgFinding [] = some m ∧
+      CfStutterSim (cfStepHooks cfProgFinding) cfProgFinding cfFx_finding_main
+        (cfInit cfFx_finding_main [] [cfFx_finding_driver, cfFx_finding_closure_0, cfFx_finding_closure_1]) m
+        (.scalar 9147 4) 15 := by
+  have hc : cfCertificate (cfStepHooks cfProgFinding) cfProgFinding cfFx_finding_main
+      [cfFx_finding_driver, cfFx_finding_closure_0, cfFx_finding_closure_1] [] [] 600 =
+      some (.scalar 9147 4, 15) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨m, hm, _, hs⟩ := cfCertificate_sound hc
+  exact ⟨hc, m, hm, hs⟩
+
+/-- **Reproducer parity on `stepMirFn`** (immediate corollary of the stuttering simulations). -/
 theorem cf_trusted_finding_parity :
     cfRun cfFx_finding_driver 600
       (cfInit cfFx_finding_driver [cfU32 35, cfU32 24] [cfFx_finding_closure_0, cfFx_finding_closure_1]) =
@@ -2592,40 +3188,176 @@ theorem cf_trusted_finding_parity :
       .scalar 9147 4 :=
   ⟨by decide +kernel, by decide +kernel⟩
 
-/-- **Boundary of the reproducer's `main` body under `Step.step`.** The hooks of this module stop
-with `.unsupported` at the struct aggregate `PairU32 { .. }` of the root body, before any closure
-is reached. The closure coercions and calls of the reproducer all live in the driver. -/
-theorem cf_miri_finding_main_boundary :
-    cfMiriRunFrom (cfStepHooks cfProgFinding) cfProgFinding 600 [] = .unsupported := by
-  rw [cfStepHooks_eq_K]; decide +kernel
+/-- **`Fn` (`_1 : &{closure}`) stuttering simulation (C6)**: `fn_shared(5) = 22` with stutter
+index `5` across `ClosureOnceShim`. -/
+theorem cf_fn_shared_stutter_sim :
+    cfCertificate (cfStepHooks cfProgFnShared) cfProgFnShared cfFx_fn_shared
+      [cfFx_fn_shared_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 22 4, 5) ∧
+    ∃ m, cfMiriInit cfProgFnShared [cfU32Imm 5] = some m ∧
+      CfStutterSim (cfStepHooks cfProgFnShared) cfProgFnShared cfFx_fn_shared
+        (cfInit cfFx_fn_shared [cfU32 5] [cfFx_fn_shared_closure_0]) m (.scalar 22 4) 5 := by
+  have hc : cfCertificate (cfStepHooks cfProgFnShared) cfProgFnShared cfFx_fn_shared
+      [cfFx_fn_shared_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 22 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨m, hm, _, hs⟩ := cfCertificate_sound hc
+  exact ⟨hc, m, hm, hs⟩
 
-/-- The `stepMirFn` results of the closure matrix: `Fn`, `FnMut`, `FnOnce`, zero-argument,
-two-argument, `ClosureFnPointer(Unsafe)`, `UnsafeFnPointer` + `FnPtrToPtr` (`262 = 6 ^ (1 << 8)`
-records `raw_c == raw_d`), mixed `fn` item + closure, lowered `const_eval_select`, and
-`TailCall`. -/
-theorem cf_trusted_matrix :
-    cfRun cfFx_fn_shared 600 (cfInit cfFx_fn_shared [cfU32 5] [cfFx_fn_shared_closure_0]) = .scalar 22 4 ∧
-    cfRun cfFx_fn_mut_kind 600
-      (cfInit cfFx_fn_mut_kind [cfU32 5] [cfFx_id_mut, cfFx_fn_mut_kind_closure_0]) = .scalar 7 4 ∧
-    cfRun cfFx_fn_once_kind 600
-      (cfInit cfFx_fn_once_kind [cfU32 5] [cfFx_id_once, cfFx_fn_once_kind_closure_0]) = .scalar 8 4 ∧
-    cfRun cfFx_zero_arg 600 (cfInit cfFx_zero_arg [] [cfFx_zero_arg_closure_0]) = .scalar 7 4 ∧
-    cfRun cfFx_two_arg 600 (cfInit cfFx_two_arg [cfU32 6, cfU32 3] [cfFx_two_arg_closure_0]) = .scalar 5 4 ∧
-    cfRun cfFx_unsafe_closure 600
-      (cfInit cfFx_unsafe_closure [cfU32 5] [cfFx_unsafe_closure_closure_0]) = .scalar 20 4 ∧
-    cfRun cfFx_widen_and_identity 600
-      (cfInit cfFx_widen_and_identity [cfU32 5] [cfFx_widen_and_identity_closure_0]) = .scalar 262 4 ∧
-    cfRun cfFx_mixed_fn_item_and_closure 600
-      (cfInit cfFx_mixed_fn_item_and_closure [cfU32 4]
-        [cfFx_helper_triple, cfFx_mixed_fn_item_and_closure_closure_0]) = .scalar 24 4 ∧
-    cfRun cfFx_ces_through_closure_fn_ptr 600
-      (cfInit cfFx_ces_through_closure_fn_ptr [cfU32 4] [cfFx_ces_through_closure_fn_ptr_closure_0]) =
-      .scalar 21 4 ∧
-    cfRun cfTailRoot 600
-      (cfInit cfTailRoot [cfU32 9] [cfFx_tail_through_closure, cfFx_tail_through_closure_closure_0]) =
-      .scalar 12 4 :=
-  ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
-   by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+/-- **`FnMut` (`_1 : &mut {closure}`) stuttering simulation (C6)**: `fn_mut_kind(5) = 7` with
+stutter index `5` across `ClosureOnceShim`. -/
+theorem cf_fn_mut_stutter_sim :
+    cfCertificate (cfStepHooks cfProgFnMut) cfProgFnMut cfFx_fn_mut_kind
+      [cfFx_id_mut, cfFx_fn_mut_kind_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 7 4, 5) ∧
+    ∃ m, cfMiriInit cfProgFnMut [cfU32Imm 5] = some m ∧
+      CfStutterSim (cfStepHooks cfProgFnMut) cfProgFnMut cfFx_fn_mut_kind
+        (cfInit cfFx_fn_mut_kind [cfU32 5] [cfFx_id_mut, cfFx_fn_mut_kind_closure_0]) m (.scalar 7 4) 5 := by
+  have hc : cfCertificate (cfStepHooks cfProgFnMut) cfProgFnMut cfFx_fn_mut_kind
+      [cfFx_id_mut, cfFx_fn_mut_kind_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 7 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨m, hm, _, hs⟩ := cfCertificate_sound hc
+  exact ⟨hc, m, hm, hs⟩
+
+/-- **Zero-argument and two-argument closure stuttering simulations**: `zero_arg() = 7` and
+`two_arg(6, 3) = 5` (both `k = 5` across `ClosureOnceShim`, kernel-checked). -/
+theorem cf_zero_and_two_arg_stutter_sim :
+    (∃ m, cfMiriInit cfProgZeroArg [] = some m ∧
+      CfStutterSim (cfStepHooks cfProgZeroArg) cfProgZeroArg cfFx_zero_arg
+        (cfInit cfFx_zero_arg [] [cfFx_zero_arg_closure_0]) m (.scalar 7 4) 5) ∧
+    (∃ m, cfMiriInit cfProgTwoArg [cfU32Imm 6, cfU32Imm 3] = some m ∧
+      CfStutterSim (cfStepHooks cfProgTwoArg) cfProgTwoArg cfFx_two_arg
+        (cfInit cfFx_two_arg [cfU32 6, cfU32 3] [cfFx_two_arg_closure_0]) m (.scalar 5 4) 5) := by
+  have h0 : cfCertificate (cfStepHooks cfProgZeroArg) cfProgZeroArg cfFx_zero_arg
+      [cfFx_zero_arg_closure_0] [] [] 600 = some (.scalar 7 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  have h2 : cfCertificate (cfStepHooks cfProgTwoArg) cfProgTwoArg cfFx_two_arg
+      [cfFx_two_arg_closure_0] [cfU32 6, cfU32 3] [cfU32Imm 6, cfU32Imm 3] 600 = some (.scalar 5 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨m0, hm0, _, hs0⟩ := cfCertificate_sound h0
+  obtain ⟨m2, hm2, _, hs2⟩ := cfCertificate_sound h2
+  exact ⟨⟨m0, hm0, hs0⟩, ⟨m2, hm2, hs2⟩⟩
+
+/-- **`ClosureFnPointer(Unsafe)` and `UnsafeFnPointer` + `FnPtrToPtr` (`raw_c == raw_d`)
+stuttering simulations**: `unsafe_closure(5) = 20` and `widen_and_identity(5) = 262 = 6 ^ (1 << 8)`
+(both `k = 5` across `ClosureOnceShim`, kernel-checked). -/
+theorem cf_unsafe_and_widen_identity_stutter_sim :
+    (∃ m, cfMiriInit cfProgUnsafe [cfU32Imm 5] = some m ∧
+      CfStutterSim (cfStepHooks cfProgUnsafe) cfProgUnsafe cfFx_unsafe_closure
+        (cfInit cfFx_unsafe_closure [cfU32 5] [cfFx_unsafe_closure_closure_0]) m (.scalar 20 4) 5) ∧
+    (∃ m, cfMiriInit cfProgWiden [cfU32Imm 5] = some m ∧
+      CfStutterSim (cfStepHooks cfProgWiden) cfProgWiden cfFx_widen_and_identity
+        (cfInit cfFx_widen_and_identity [cfU32 5] [cfFx_widen_and_identity_closure_0]) m (.scalar 262 4) 5) := by
+  have hu : cfCertificate (cfStepHooks cfProgUnsafe) cfProgUnsafe cfFx_unsafe_closure
+      [cfFx_unsafe_closure_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 20 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  have hw : cfCertificate (cfStepHooks cfProgWiden) cfProgWiden cfFx_widen_and_identity
+      [cfFx_widen_and_identity_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 262 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨mu, hmu, _, hsu⟩ := cfCertificate_sound hu
+  obtain ⟨mw, hmw, _, hsw⟩ := cfCertificate_sound hw
+  exact ⟨⟨mu, hmu, hsu⟩, ⟨mw, hmw, hsw⟩⟩
+
+/-- **Mixed `fn` item + closure, lowered `const_eval_select`, and `TerminatorKind::TailCall`
+stuttering simulations**: `mixed_fn_item_and_closure(4) = 24`,
+`ces_through_closure_fn_ptr(4) = 21`, and `tail_through_closure(9) = 12` (each `k = 5`,
+kernel-checked). -/
+theorem cf_mixed_ces_and_tail_stutter_sim :
+    (∃ m, cfMiriInit cfProgMixed [cfU32Imm 4] = some m ∧
+      CfStutterSim (cfStepHooks cfProgMixed) cfProgMixed cfFx_mixed_fn_item_and_closure
+        (cfInit cfFx_mixed_fn_item_and_closure [cfU32 4]
+          [cfFx_helper_triple, cfFx_mixed_fn_item_and_closure_closure_0]) m (.scalar 24 4) 5) ∧
+    (∃ m, cfMiriInit cfProgCes [cfU32Imm 4] = some m ∧
+      CfStutterSim (cfStepHooks cfProgCes) cfProgCes cfFx_ces_through_closure_fn_ptr
+        (cfInit cfFx_ces_through_closure_fn_ptr [cfU32 4]
+          [cfFx_ces_through_closure_fn_ptr_closure_0]) m (.scalar 21 4) 5) ∧
+    (∃ m, cfMiriInit cfProgTail [cfU32Imm 9] = some m ∧
+      CfStutterSim (cfStepHooks cfProgTail) cfProgTail cfTailRoot
+        (cfInit cfTailRoot [cfU32 9]
+          [cfFx_tail_through_closure, cfFx_tail_through_closure_closure_0]) m (.scalar 12 4) 5) := by
+  have hm : cfCertificate (cfStepHooks cfProgMixed) cfProgMixed cfFx_mixed_fn_item_and_closure
+      [cfFx_helper_triple, cfFx_mixed_fn_item_and_closure_closure_0] [cfU32 4] [cfU32Imm 4] 600 =
+      some (.scalar 24 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  have hc : cfCertificate (cfStepHooks cfProgCes) cfProgCes cfFx_ces_through_closure_fn_ptr
+      [cfFx_ces_through_closure_fn_ptr_closure_0] [cfU32 4] [cfU32Imm 4] 600 =
+      some (.scalar 21 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  have ht : cfCertificate (cfStepHooks cfProgTail) cfProgTail cfTailRoot
+      [cfFx_tail_through_closure, cfFx_tail_through_closure_closure_0] [cfU32 9] [cfU32Imm 9] 600 =
+      some (.scalar 12 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨mm, hmm, _, hsm⟩ := cfCertificate_sound hm
+  obtain ⟨mc, hmc, _, hsc⟩ := cfCertificate_sound hc
+  obtain ⟨mt, hmt, _, hst⟩ := cfCertificate_sound ht
+  exact ⟨⟨mm, hmm, hsm⟩, ⟨mc, hmc, hsc⟩, ⟨mt, hmt, hst⟩⟩
+
+/-- **Closing Episode 1's `w_c8_end_to_end_closure_coercion_and_indirect_call` overlay gap**:
+the exact end-to-end `closure aggregate -> ClosureFnPointer(Safe) -> indirect call -> return`
+program (`c8_e2e_caller` calling `c8_zst_clos` on `42`) succeeds in BOTH `stepMirFn` and
+unmodified vendored `Miri.Interpreter.Step.step` (`CfStutterSim` with `k = 5` across
+`ClosureOnceShim`, returning `42 : u32`), without modifying `UnwindSetDiscrAndFnPtrLM.lean`. -/
+theorem cf_w_c8_e2e_closure_stutter_sim :
+    cfCertificate (cfStepHooks cfProgW_C8) cfProgW_C8 cfW_C8_Caller [cfW_C8_ClosCallee] [] [] 200 =
+      some (.scalar 42 4, 5) ∧
+    ∃ m, cfMiriInit cfProgW_C8 [] = some m ∧
+      CfStutterSim (cfStepHooks cfProgW_C8) cfProgW_C8 cfW_C8_Caller
+        (cfInit cfW_C8_Caller [] [cfW_C8_ClosCallee]) m (.scalar 42 4) 5 := by
+  have hc : cfCertificate (cfStepHooks cfProgW_C8) cfProgW_C8 cfW_C8_Caller [cfW_C8_ClosCallee] [] [] 200 =
+      some (.scalar 42 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨m, hm, _, hs⟩ := cfCertificate_sound hc
+  exact ⟨hc, m, hm, hs⟩
+
+/-- **Panic unwinding through an indirect closure call (all 4 regimes, kernel-checked)**:
+1. `x = 4` (non-panicking path): `Guard` construction, indirect closure call via `ClosureOnceShim`,
+   `drop(_2)`, and normal return `4 : u32` in `CfStutterSim` (`k = 5`);
+2. `x = 0`, `UnwindAction.cleanup 3`: the closure panics (`panic_fmt`), vendored Miri unwinds
+   through `ClosureOnceShim` cleanup `bb3`/`bb4` AND caller cleanup `bb3`/`bb4` (`visitedShimCleanup
+   = true ∧ visitedCallerCleanup = true`), reaching root unwind (`Trusted = .panic`, vendored Miri
+   `"unwinding past the topmost stack frame"`, matching `unwindResume_root_panic_vs_ub_divergence`);
+3. `x = 0`, `UnwindAction.unreachable`: unwinding past `ClosureOnceShim` hits `.Unreachable`
+   (`.ub` on both machines: vendored Miri `"unwinding past a frame that does not allow unwinding"`);
+4. `x = 0`, `UnwindAction.terminate`: unwinding hits `.Terminate .Abi` (`Trusted = .abort`,
+   canonical Miri `.unsupported "unwindTerminate"`, direct-unwind Miri
+   `.termination (.abort "panic in a function that cannot unwind")`). -/
+theorem cf_unwind_through_closure_witness :
+    (∃ m, cfMiriInit cfProgUnwind [cfU32Imm 4] = some m ∧
+      CfStutterSim (cfStepHooks cfProgUnwind) cfProgUnwind cfFx_unwind_through_closure
+        (cfInit cfFx_unwind_through_closure [cfU32 4]
+          [cfFx_unwind_through_closure_closure_0, cfFx_Guard_as_core_ops_Drop_drop, cfFmtFromStrStub])
+        m (.scalar 4 4) 5) ∧
+    (cfRun cfFx_unwind_through_closure 300
+        (cfInit cfFx_unwind_through_closure [cfU32 0]
+          [cfFx_unwind_through_closure_closure_0, cfFx_Guard_as_core_ops_Drop_drop, cfFmtFromStrStub]) =
+        .panic ∧
+      cfMiriUnwindTraceFrom (cfStepHooks cfProgUnwind) cfProgUnwind 300 [cfU32Imm 0] =
+        (true, true, .error (.undefinedBehavior "unwinding past the topmost stack frame"))) ∧
+    (cfRun (cfSetBb0CallUnwind cfFx_unwind_through_closure .unreachable) 300
+        (cfInit (cfSetBb0CallUnwind cfFx_unwind_through_closure .unreachable) [cfU32 0]
+          [cfFx_unwind_through_closure_closure_0, cfFx_Guard_as_core_ops_Drop_drop, cfFmtFromStrStub]) =
+        .ub ∧
+      cfMiriRunOutcomeFrom (cfStepHooks (cfProgUnwindWith .unreachable))
+          (cfProgUnwindWith .unreachable) 300 [cfU32Imm 0] =
+        .error (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) ∧
+    (cfRun (cfSetBb0CallUnwind cfFx_unwind_through_closure .terminate) 300
+        (cfInit (cfSetBb0CallUnwind cfFx_unwind_through_closure .terminate) [cfU32 0]
+          [cfFx_unwind_through_closure_closure_0, cfFx_Guard_as_core_ops_Drop_drop, cfFmtFromStrStub]) =
+        .abort ∧
+      cfMiriRunOutcomeFrom (cfStepHooks (cfProgUnwindWith .terminate))
+          (cfProgUnwindWith .terminate) 300 [cfU32Imm 0] =
+        .error (.unsupported "unwindTerminate") ∧
+      cfMiriRunOutcomeFrom (cfStepHooksDirectUnwind (cfProgUnwindWith .terminate))
+          (cfProgUnwindWith .terminate) 300 [cfU32Imm 0] =
+        .error (.termination (.abort "panic in a function that cannot unwind"))) := by
+  have hNorm : cfCertificate (cfStepHooks cfProgUnwind) cfProgUnwind cfFx_unwind_through_closure
+      [cfFx_unwind_through_closure_closure_0, cfFx_Guard_as_core_ops_Drop_drop, cfFmtFromStrStub]
+      [cfU32 4] [cfU32Imm 4] 300 = some (.scalar 4 4, 5) := by
+    rw [cfStepHooks_eq_K]; decide +kernel
+  obtain ⟨m, hm, _, hs⟩ := cfCertificate_sound hNorm
+  refine ⟨⟨m, hm, hs⟩, ⟨by decide +kernel, ?_⟩, ⟨by decide +kernel, ?_⟩,
+    ⟨by decide +kernel, ?_, ?_⟩⟩
+  · rw [cfStepHooks_eq_K]; decide +kernel
+  · rw [cfStepHooks_eq_K]; decide +kernel
+  · rw [cfStepHooks_eq_K]; decide +kernel
+  · rw [cfStepHooksDirectUnwind_eq_K]; decide +kernel
 
 /-- **Generic closure under `R1` (C5).** Both machines fail closed with `.unsupported`, never UB. -/
 theorem cf_generic_closure_r1_unsupported :
@@ -2637,56 +3369,54 @@ theorem cf_generic_closure_r1_unsupported :
   rw [cfStepHooks_eq_K]; decide +kernel
 
 /-- **Direct closure call with explicit `&_env` (C11).** `Trusted` does not route a direct
-`Fn::call(&_env, (x,))` through the function-pointer path: it surfaces as the visible external
-call `core::ops::Fn::call`. -/
-theorem cf_direct_closure_call_trusted_external :
+`Fn::call(&_env, (x,))` through the function-pointer path (it surfaces as the visible external call
+`core::ops::Fn::call`); vendored Miri executes the `rust-call` tuple untupling and returns
+`14 : u32` (kernel-checked). -/
+theorem cf_direct_closure_call_witness :
     cfRun cfFx_direct_closure_call 300
       (cfInit cfFx_direct_closure_call [cfU32 5] [cfFx_direct_closure_call_closure_0]) =
-      .ext "core::ops::Fn::call" := by
-  decide +kernel
-
-/-- **Boundary of panic unwinding through an indirect closure call.** `Trusted` reaches the
-panic machinery of the closure body through the pointer (the external call
-`core::fmt::Arguments::from_str`); the hooks of this module stop with `.unsupported` at the
-`Guard(..)` struct aggregate of the caller. No unwinding simulation is claimed. -/
-theorem cf_unwind_boundary :
-    cfRun cfFx_unwind_through_closure 300
-      (cfInit cfFx_unwind_through_closure [cfU32 0]
-        [cfFx_unwind_through_closure_closure_0, cfFx_Guard_as_core_ops_Drop_drop]) =
-      .ext "core::fmt::Arguments::<'a>::from_str" ∧
-    cfMiriRunFrom (cfStepHooks cfProgUnwind) cfProgUnwind 300 [cfU32Imm 0] = .unsupported := by
+      .ext "core::ops::Fn::call" ∧
+    cfMiriRunFrom (cfStepHooks cfProgDirect) cfProgDirect 300 [cfU32Imm 5] = .scalar 14 4 := by
   refine ⟨by decide +kernel, ?_⟩
   rw [cfStepHooks_eq_K]; decide +kernel
 
 /-- **Capturing closures fail closed (C10).** A closure type with a `u32` upvar or a zero-sized
-`()` upvar is `.ub` in `Trusted`; the vendored `Cast.cast` rejects the program
-(`invalidProgram "capturing closure in pointer cast"`). -/
+`()` upvar is `.ub` in `Trusted`; the vendored `Cast.cast` rejects the program with
+`.invalidProgram "capturing closure in pointer cast"`. -/
 theorem cf_neg_capturing_fail_closed :
-    cfNegTrusted cfNegCapU32 = .ub ∧ cfNegMiri cfNegCapU32 = .invalid ∧
-    cfNegTrusted cfNegCapUnit = .ub ∧ cfNegMiri cfNegCapUnit = .invalid := by
+    cfNegTrusted cfNegCapU32 = .ub ∧
+    cfNegMiriOutcome cfNegCapU32 = .error (.invalidProgram "capturing closure in pointer cast") ∧
+    cfNegTrusted cfNegCapUnit = .ub ∧
+    cfNegMiriOutcome cfNegCapUnit = .error (.invalidProgram "capturing closure in pointer cast") := by
+  refine ⟨by decide +kernel, ?_, by decide +kernel, ?_⟩ <;>
+    (unfold cfNegMiriOutcome; rw [cfStepHooks_eq_K]; decide +kernel)
+
+/-- **Forged `(N+1)`-argument indirect calls (C10)** on BOTH `FnOnce` (direct body) and `Fn`
+(`ClosureOnceShim`) closures are UB on both machines: vendored `initStackFrame` reports
+`"AbiMismatchArgument closure self"` when the caller passes an extra non-ZST argument. -/
+theorem cf_neg_forged_call_ub :
+    cfNegTrusted cfNegForged = .ub ∧ cfNegMiri cfNegForged = .ub ∧
+    cfNegTrusted cfNegForgedFn cfFx_fn_shared_closure_0 = .ub ∧
+    cfNegMiri cfNegForgedFn cfFx_fn_shared_closure_0 = .ub := by
   refine ⟨by decide +kernel, ?_, by decide +kernel, ?_⟩ <;>
     (unfold cfNegMiri; rw [cfStepHooks_eq_K]; decide +kernel)
 
-/-- **Forged `(N+1)`-argument indirect call (C10)** is UB on both machines; the vendored
-`initStackFrame` reports the argument-count mismatch on the closure `self` parameter. -/
-theorem cf_neg_forged_call_ub :
-    cfNegTrusted cfNegForged = .ub ∧ cfNegMiri cfNegForged = .ub := by
+/-- **Transmuted signature `fn(u64) -> u32`** is UB on BOTH machines: Trusted faults `.ub`, and
+vendored `Call.evalCallTerminator` (`checkArgumentCompat`) faults with
+`.undefinedBehavior "AbiMismatchArgument 1"`. -/
+theorem cf_neg_transmuted_sig_ub :
+    cfNegTrusted cfNegTransSig = .ub ∧
+    cfNegMiriOutcome cfNegTransSig = .error (.undefinedBehavior "AbiMismatchArgument 1") := by
   refine ⟨by decide +kernel, ?_⟩
-  unfold cfNegMiri; rw [cfStepHooks_eq_K]; decide +kernel
-
-/-- **Retyped signature `fn(u64) -> u32`**: `.ub` in `Trusted`; the hooks reject the program
-(the caller's layout table has no layout for the forged argument type). -/
-theorem cf_neg_transmuted_sig_fail_closed :
-    cfNegTrusted cfNegTransSig = .ub ∧ cfNegMiri cfNegTransSig = .invalid := by
-  refine ⟨by decide +kernel, ?_⟩
-  unfold cfNegMiri; rw [cfStepHooks_eq_K]; decide +kernel
+  unfold cfNegMiriOutcome; rw [cfStepHooks_eq_K]; decide +kernel
 
 /-- **`extern "C"` call of a Rust-ABI closure** is UB on both machines (the vendored
-`evalCalleeAndArgs` calling-convention check). -/
+`evalCalleeAndArgs` calling-convention check `"caller/callee calling convention mismatch"`). -/
 theorem cf_neg_extern_c_ub :
-    cfNegTrusted cfNegExternC = .ub ∧ cfNegMiri cfNegExternC = .ub := by
+    cfNegTrusted cfNegExternC = .ub ∧
+    cfNegMiriOutcome cfNegExternC = .error (.undefinedBehavior "caller/callee calling convention mismatch") := by
   refine ⟨by decide +kernel, ?_⟩
-  unfold cfNegMiri; rw [cfStepHooks_eq_K]; decide +kernel
+  unfold cfNegMiriOutcome; rw [cfStepHooks_eq_K]; decide +kernel
 
 /-- **`Safety` boundary.** A `ClosureFnPointer(Unsafe)` coercion to a safe pointer type is `.ub`
 in `Trusted`, while Miri (which has no dynamic `Safety` check) runs it; retyping a safe pointer
@@ -2707,57 +3437,7 @@ theorem cf_normal_spelling_boundary :
   refine ⟨by decide +kernel, ?_, rfl⟩
   unfold cfNegMiri; rw [cfStepHooks_eq_K]; decide +kernel
 
-/-! ## §16. `Fn` / `FnMut` stuttering certificates checked by compiled evaluation
-
-**These are NOT theorems and NOT kernel-checked.** Each `#guard` below runs the certificate
-checker `cfCertificate` under `cfStepHooks` (the unmodified vendored `Step.step`) with Lean's
-compiled evaluator and fails the build if the result differs. By `cfCertificate_sound`, an
-accepted certificate `some (o, k)` is a `CfStutterSim` with stutter index `k`; the index `5`
-is the five `Step.step`s inside one `ClosureOnceShim` frame (`StorageLive(_3)`,
-`_3 = &mut _1`, the `call_mut` terminator, `drop(_1)`, `return`), and `15` is three such calls.
-Kernel reduction of the vendored memory model on the shim's `_3 = &mut _1` (which forces the
-zero-sized closure local into memory) does not finish within the build's resource limits, so
-these certificates are not stated as theorems. -/
-
--- Reproducer driver: `__anneal_vt_driver_61873(35, 24) = 159` across three `Fn` closure calls.
-#guard cfCertificate (cfStepHooks cfProgDriver) cfProgDriver cfFx_finding_driver
-  [cfFx_finding_closure_0, cfFx_finding_closure_1] [cfU32 35, cfU32 24] [cfU32Imm 35, cfU32Imm 24] 600 =
-  some (.scalar 159 4, 15)
--- `Fn`.
-#guard cfCertificate (cfStepHooks cfProgFnShared) cfProgFnShared cfFx_fn_shared
-  [cfFx_fn_shared_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 22 4, 5)
--- `FnMut`.
-#guard cfCertificate (cfStepHooks cfProgFnMut) cfProgFnMut cfFx_fn_mut_kind
-  [cfFx_id_mut, cfFx_fn_mut_kind_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 7 4, 5)
--- `FnOnce` (also kernel-checked: `cf_fn_once_certificate`).
-#guard cfCertificate (cfStepHooks cfProgFnOnce) cfProgFnOnce cfFx_fn_once_kind
-  [cfFx_id_once, cfFx_fn_once_kind_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 8 4, 0)
--- Zero-argument and two-argument closures.
-#guard cfCertificate (cfStepHooks cfProgZeroArg) cfProgZeroArg cfFx_zero_arg
-  [cfFx_zero_arg_closure_0] [] [] 600 = some (.scalar 7 4, 5)
-#guard cfCertificate (cfStepHooks cfProgTwoArg) cfProgTwoArg cfFx_two_arg
-  [cfFx_two_arg_closure_0] [cfU32 6, cfU32 3] [cfU32Imm 6, cfU32Imm 3] 600 = some (.scalar 5 4, 5)
--- `ClosureFnPointer(Unsafe)`.
-#guard cfCertificate (cfStepHooks cfProgUnsafe) cfProgUnsafe cfFx_unsafe_closure
-  [cfFx_unsafe_closure_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 20 4, 5)
--- `ClosureFnPointer(Safe)` + `UnsafeFnPointer` + `FnPtrToPtr` (`raw_c == raw_d`).
-#guard cfCertificate (cfStepHooks cfProgWiden) cfProgWiden cfFx_widen_and_identity
-  [cfFx_widen_and_identity_closure_0] [cfU32 5] [cfU32Imm 5] 600 = some (.scalar 262 4, 5)
--- Mixed `fn` item and closure coercions.
-#guard cfCertificate (cfStepHooks cfProgMixed) cfProgMixed cfFx_mixed_fn_item_and_closure
-  [cfFx_helper_triple, cfFx_mixed_fn_item_and_closure_closure_0] [cfU32 4] [cfU32Imm 4] 600 =
-  some (.scalar 24 4, 5)
--- `const_eval_select` as lowered by `rustc` in runtime MIR (a plain indirect call).
-#guard cfCertificate (cfStepHooks cfProgCes) cfProgCes cfFx_ces_through_closure_fn_ptr
-  [cfFx_ces_through_closure_fn_ptr_closure_0] [cfU32 4] [cfU32Imm 4] 600 = some (.scalar 21 4, 5)
--- `TerminatorKind::TailCall` through a closure function pointer (below a root harness frame).
-#guard cfCertificate (cfStepHooks cfProgTail) cfProgTail cfTailRoot
-  [cfFx_tail_through_closure, cfFx_tail_through_closure_closure_0] [cfU32 9] [cfU32Imm 9] 600 =
-  some (.scalar 12 4, 5)
--- Direct closure call with explicit `&_env` (C11): Miri executes it and returns `14`.
-#guard cfMiriRunFrom (cfStepHooks cfProgDirect) cfProgDirect 300 [cfU32Imm 5] = .scalar 14 4
-
-/-! ## §17. Exhaustive Axiom and Import-Isolation Audit -/
+/-! ## §16. Exhaustive Axiom and Import-Isolation Audit -/
 
 section AxiomAudit
 open Lean Elab Command
@@ -2790,25 +3470,32 @@ elab "#assert_closure_fn_ptr_lm_audit" : command => do
     let axs ← liftCoreM <| Lean.collectAxioms c
     for a in axs do
       if a == ``sorryAx then throwError "{c} depends on sorryAx"
+      if a == ``Lean.ofReduceBool then throwError "{c} depends on Lean.ofReduceBool"
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "{c} depends on non-standard axiom {a}"
     checked := checked + 1
   if checked == 0 then
     throwError "LeanMiriSpec.ClosureFnPtrLM: 0 declarations found"
   let headline : List Lean.Name := [
-    ``cfStepHooks_eq_K, ``cfMiriStutter_sound, ``cfStutterCheck_sound, ``cfCertificate_sound,
+    ``cfStepHooks_eq_K, ``cfStepHooksDirectUnwind_eq_K,
+    ``cfMiriStutter_sound, ``cfStutterCheck_sound, ``cfCertificate_sound,
     ``cfStutterSim_zero_lockstep, ``cfStutterSim_trusted_run, ``cfStutterSim_miri_run,
     ``cfInstanceOfAllocNat_item, ``cfInstanceOfAllocNat_shim, ``cfFnAllocNat_injective,
     ``cfResolveClosure_fnOnce_is_item, ``cfResolveClosure_fn_is_shim,
-    ``cfResolveClosure_generic_unsupported, ``cf_fn_once_certificate, ``cf_fn_once_lockstep,
-    ``cf_trusted_finding_parity, ``cf_miri_finding_main_boundary, ``cf_trusted_matrix,
-    ``cf_generic_closure_r1_unsupported, ``cf_direct_closure_call_trusted_external,
-    ``cf_unwind_boundary, ``cf_neg_capturing_fail_closed, ``cf_neg_forged_call_ub,
-    ``cf_neg_transmuted_sig_fail_closed, ``cf_neg_extern_c_ub, ``cf_neg_safety_boundary,
-    ``cf_normal_spelling_boundary ]
+    ``cfResolveClosure_generic_unsupported, ``cfNonCapturingClosure_vendored_law,
+    ``cfCast_closureFnPointer_vendored_law, ``cfCast_unsafeFnPointer_and_fnPtrToPtr_identity,
+    ``cf_fn_once_certificate, ``cf_fn_once_lockstep,
+    ``cf_finding_0007_driver_stutter_sim, ``cf_finding_0007_main_stutter_sim,
+    ``cf_trusted_finding_parity, ``cf_fn_shared_stutter_sim, ``cf_fn_mut_stutter_sim,
+    ``cf_zero_and_two_arg_stutter_sim, ``cf_unsafe_and_widen_identity_stutter_sim,
+    ``cf_mixed_ces_and_tail_stutter_sim, ``cf_w_c8_e2e_closure_stutter_sim,
+    ``cf_unwind_through_closure_witness, ``cf_generic_closure_r1_unsupported,
+    ``cf_direct_closure_call_witness, ``cf_neg_capturing_fail_closed,
+    ``cf_neg_forged_call_ub, ``cf_neg_transmuted_sig_ub, ``cf_neg_extern_c_ub,
+    ``cf_neg_safety_boundary, ``cf_normal_spelling_boundary ]
   for c in headline do
     let some (.thmInfo _) := env.find? c | throwError "{c} is not a theorem of this module"
-  logInfo m!"LeanMiriSpec.ClosureFnPtrLM: verified {checked} declarations ({theorems} theorems, {headline.length} headline; sorry_free=true, standard_axioms_only=true, minirustspec_import_free=true)"
+  logInfo m!"LeanMiriSpec.ClosureFnPtrLM: verified {checked} declarations ({theorems} theorems, {headline.length} headline; sorry_free=true, ofReduceBool_free=true, standard_axioms_only=true, minirustspec_import_free=true)"
 
 #assert_closure_fn_ptr_lm_audit
 

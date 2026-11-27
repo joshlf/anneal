@@ -43,12 +43,16 @@ arguments by `Terminator::Call` and left by `Terminator::Return`.
      `ClosureFnPointer(Safe|Unsafe)` reification is decided by the linked body alone;
    * `ClosureFnPtrEntryRel` (the closure extension of `FnPtrEntryRel`) with
      `closure_reify_establishes_entryRel_M`, `closureFnPtrEntryRel_call_arity`,
-     `closure_coercion_widening_identity_mach_and_tb` (`UnsafeFnPointer` widening and
-     `FnPtrToPtr` pointer identity `raw_c == raw_d` on `Mach` and `MachTB`, for
-     `fn(u32) -> u32` pointers), and the two-sided call law
-     `closure_indirect_call_correspondence_M` (Trusted enters with `N + 1`
-     entry arguments where MiniRust binds `N`; a forged `(N + 1)`-argument call
-     is UB on both sides);
+     `closure_coercion_widening_identity_general_mach_and_tb` (arbitrary
+     `fn(fnIns) -> fnOut`, covering both `ClosureFnPointer(Safe)` +
+     `UnsafeFnPointer` + `FnPtrToPtr` and direct `ClosureFnPointer(Unsafe)` +
+     `FnPtrToPtr`, proving pointer identity `raw_c == raw_d` on `Mach` and
+     `MachTB`), `closure_coercion_widening_identity_mach_and_tb`, and the
+     coupled two-sided call law `closure_indirect_call_correspondence_M`
+     (connecting `s.memory`, the evaluated Trusted pointer `p`, `resolveCallTarget`,
+     `fnFromPtrM`, and `createFrameM`: Trusted enters with `N + 1` entry
+     arguments where MiniRust binds `N`; a forged `(N + 1)`-argument call is UB
+     on both sides);
    * `closure_indirect_call_prepends_env`, `closure_indirect_tailCall_prepends_env`,
      `closure_entry_frame_binds_env_then_args`, and
      `constEvalSelect_closure_runtime_target_dispatch` (Trusted) against
@@ -106,7 +110,6 @@ Strict import isolation: this module NEVER imports `Anneal.*`, `Miri.*`, or
 namespace MiniRustSpec.ClosureFnPtrMR
 
 set_option Elab.async false
-set_option linter.unusedSimpArgs false
 
 /-! ## §0. Verbatim `rustc-capture` Fixtures (shared with `LeanMiriSpec.ClosureFnPtrLM`)
 
@@ -1084,13 +1087,12 @@ theorem checkClosureCalleeSig_callee_directed (callees : List CapturedMir) (p : 
          | true => ClosureCoercionCheck.ok
          | false => ClosureCoercionCheck.ub)) ∧
     (∀ abi, callConvEq abi .rust = false → checkClosureCalleeSig callees p fnIns fnOut abi = .ub) := by
-  have hR : callConvEq CallConv.rust .rust = true := rfl
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
-  · intro h; unfold checkClosureCalleeSig; simp only [hR, hLinked, h]
-  · intro h ht; unfold checkClosureCalleeSig; simp only [hR, hLinked, h, ht]
+  · intro h; unfold checkClosureCalleeSig; simp only [hLinked, h]
+  · intro h ht; unfold checkClosureCalleeSig; simp only [hLinked, h, ht]
   · intro sh k h ht; unfold checkClosureCalleeSig
-    cases sh <;> simp only [hR, hLinked, h, ht]
-  · intro mode h ht; unfold checkClosureCalleeSig; simp only [hR, hLinked, h, ht]
+    cases sh <;> simp only [hLinked, h, ht]
+  · intro mode h ht; unfold checkClosureCalleeSig; simp only [hLinked, h, ht]
     generalize Bool.and (callConvEq c.fnAbi.conv CallConv.rust)
       (Bool.and (Nat.beq c.argCount (Nat.succ (length fnIns)))
         (closureCalleeDeclsCompatible [] c.localDecls (length fnIns) fnIns fnOut)) = b
@@ -1102,8 +1104,7 @@ then only reaches the closure through an external call. -/
 theorem checkClosureCalleeSig_unlinked_ok (callees : List CapturedMir) (p : DefPath)
     (fnIns : List RigidTy) (fnOut : RigidTy) (h : findCallee? callees p = none) :
     checkClosureCalleeSig callees p fnIns fnOut .rust = .ok := by
-  have hR : callConvEq CallConv.rust .rust = true := rfl
-  unfold checkClosureCalleeSig; simp only [hR, h]
+  unfold checkClosureCalleeSig; simp only [h]
 
 /-- **Universal `ClosureFnPointer(Safe|Unsafe)` reification law.** For every
 closure coercion tag, a zero-sized closure value whose operand type is the
@@ -1630,8 +1631,7 @@ theorem closureFnPtrEntryRel_call_arity {M : Type} [Gen.Memory M] [MemoryOps M] 
         Bool.and_false]
   · intro target hI hS
     have hb : Nat.beq c.argCount (Nat.succ n) = true := by rw [h.trustedArity]; exact Nat.beq_refl _
-    simp only [checkCalleeTargetCompatible, hI, h.shape, checkClosureTargetCompatible, hb, hS, Bool.true_and,
-      Bool.and_true]
+    simp only [checkCalleeTargetCompatible, hI, h.shape, checkClosureTargetCompatible, hb, hS, Bool.and_true]
   · rw [(checkClosureCalleeSig_callee_directed mem.callees c.defPath fnIns fnOut c h.linked).2.2.2.1 mode
       h.shape h.nonGeneric]
     split <;> simp
@@ -1663,14 +1663,14 @@ theorem minirust_createFrameM_arity_law {M : Type} [Gen.Memory M] [MemoryOps M] 
         .error (.ub "call ABI violation: calling conventions are not the same")) := by
   refine ⟨fun hne => ?_, fun heq => ?_, fun conv hconv => ?_⟩
   · unfold createFrameM
-    simp only [hSL, hAA, hRet, hAbi, bind, Except.bind, pure, Except.pure, ub, ne_eq, not_true_eq_false,
+    simp only [hSL, hAA, hRet, hAbi, bind, Except.bind, ub, ne_eq, not_true_eq_false,
       ↓reduceIte, Bool.not_true, Bool.false_eq_true, hne, not_false_eq_true]
   · unfold createFrameM
-    simp only [hSL, hAA, hRet, hAbi, bind, Except.bind, pure, Except.pure, ub, ne_eq, not_true_eq_false,
+    simp only [hSL, hAA, hRet, hAbi, bind, Except.bind, pure, Except.pure, ne_eq, not_true_eq_false,
       ↓reduceIte, Bool.not_true, Bool.false_eq_true, heq]
     cases initFrameArgsM { m with mem := cm2 } f2 func.args callerArgs <;> rfl
   · unfold createFrameM
-    simp only [hSL, hAA, bind, Except.bind, pure, Except.pure, ub, ne_eq, hconv, not_false_eq_true, ↓reduceIte]
+    simp only [hSL, hAA, bind, Except.bind, ub, ne_eq, hconv, not_false_eq_true, ↓reduceIte]
 
 /-- **Universal MiniRust pointer identity (`raw_c == raw_d`, `Mach` & `MachTB`).**
 `BinOp::Rel(Eq)` on two thin pointers with the same address is `true`
@@ -1698,16 +1698,129 @@ theorem minirust_closure_call_return_tb_wfLive {m m' : MachTB} (hwf : MachTB.wfL
   ⟨fun _ _ _ _ _ _ h => evalTerminatorM_tb_wfLive hwf h, fun h => evalTerminatorM_tb_wfLive hwf h,
    fun h => stepTB_wfLive hwf h, fun _ h => stepsTB_wfLive hwf h⟩
 
-/-- **Universal coercion → widening → pointer-identity pipeline for closure
-pointers (`Mach` & `MachTB`).** For a non-capturing `fn(u32) -> u32` closure
-whose linked body is closure-shaped (callee-directed premises, any receiver
-mode): `ClosureFnPointer` / `ClosureFnPointer(Safe)` reifies a pointer `p`
-related by `ClosureFnPtrEntryRel` on BOTH machines; `UnsafeFnPointer` widening
-returns the same `p`; `FnPtrToPtr` of the safe pointer (`raw_c`) and of the
-widened unsafe pointer (`raw_d`) both return the same `.ptr p 8` (pointer
-identity); and on MiniRust the `Constant::FnPointer`, the type-erasing
-`Transmute`s, and `raw_c == raw_d` agree on `Mach` and `MachTB` (expression
-evaluation, which leaves the machines — hence `MachTB.wfLive` — unchanged). -/
+/-- **Universal coercion → widening → pointer-identity pipeline for arbitrary
+signatures `fn(fnIns) -> fnOut`, covering BOTH `ClosureFnPointer(Safe)` +
+`UnsafeFnPointer` + `FnPtrToPtr` AND direct `ClosureFnPointer(Unsafe)` +
+`FnPtrToPtr` (`Mach` & `MachTB`, preserving `MachTB.wfLive`).**
+For any non-capturing closure signature `fn(fnIns) -> fnOut` (with reflexive
+fuel-bounded equality `rigidTyListEq fnIns fnIns = true` and `rigidTyEq fnOut fnOut = true`):
+* under a safe coercion tag (`ClosureFnPointer(Safe)` / `"ClosureFnPointer"`),
+  reification establishes `ClosureFnPtrEntryRel` on `Mach` and `MachTB`,
+  `UnsafeFnPointer` widening preserves the exact pointer `p`, and `FnPtrToPtr`
+  of both the safe and widened unsafe pointers produces `.ptr p 8` (pointer
+  identity `raw_c == raw_d`), matching MiniRust `Constant::FnPointer`,
+  `Transmute`, and `BinOp::Rel(Eq)` (`true`) on both `Mach` and `MachTB`;
+* under an unsafe coercion tag (`ClosureFnPointer(Unsafe)` / `"ClosureFnPointer"`),
+  direct reification to `unsafe fn(fnIns) -> fnOut` establishes
+  `ClosureFnPtrEntryRel` on `Mach` and `MachTB` and `FnPtrToPtr` preserves
+  `.ptr p 8`, matching MiniRust on both `Mach` and `MachTB`. -/
+theorem closure_coercion_widening_identity_general_mach_and_tb
+    (locals locals1 locals2 locals3 locals4 : List LocalSlot)
+    (opReify opUnsafe opRawC opRawD : MirAst.Operand) (mem : MirSemantics.Memory)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (ck : String) (dp : DefPath) (li : Nat)
+    (fnIns : List RigidTy) (fnOut : RigidTy) (fnSaf : Safety)
+    (zstVal : MirSemantics.Value) (c : CapturedMir) (mode : ClosureEnvMode) (fnNm : Gen.FnName) (addr : Nat)
+    (hAddr : addr < 2 ^ 64) (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance) (mBM : Mach)
+    (mTB : MachTB) (fnBM fnTB : Gen.Function)
+    (hCk : IsClosureCoercionTag ck) (hZst : zstVal = .unit ∨ zstVal = .aggregate 0 [])
+    (hSaf : reifyCoercionSafetyCompatible ck fnSaf = true)
+    (hInRefl : rigidTyListEq fnIns fnIns = true) (hOutRefl : rigidTyEq fnOut fnOut = true)
+    (hTy : operandTy decls layouts opReify = some { kind := .closure dp [], layoutIdx := li })
+    (hLinked : findCallee? mem.callees dp = some c) (hDp : c.defPath = dp)
+    (hShape : calleeOwnClosureShape? c = some (.nonCapturing mode)) (hTpc : c.typeParamCount = 0)
+    (hConv : callConvEq c.fnAbi.conv .rust = true) (hArgc : c.argCount = length fnIns + 1)
+    (hDecls : closureCalleeDeclsCompatible [] c.localDecls (length fnIns) fnIns fnOut = true)
+    (hFresh : findFnPtrEntry? mem.fnPtrs dp [] (some (.fnPtr fnIns fnOut fnSaf .rust)) = none)
+    (hNoB : lookupBorrow mem.borrows (nextFnPtrAllocId mem.fnPtrs) = none)
+    (hMapBM : mapIndex mBM.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok { addr := addr, provenance := provBM })
+    (hMapTB : mapIndex mTB.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok { addr := addr, provenance := provTB })
+    (hFnBM : fnFromPtrM mBM (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none)) = .ok fnBM)
+    (hFnTB : fnFromPtrM mTB (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none)) = .ok fnTB)
+    (hArBM : fnBM.args.length = length fnIns) (hArTB : fnTB.args.length = length fnIns)
+    (hConvBM : fnBM.calling_convention = .Rust) (hConvTB : fnTB.calling_convention = .Rust)
+    (hOp1 : evalOperand locals opReify mem.borrows mem.globals layouts mem.callerLocals
+      (callStack := mem.callStack) = .ok zstVal locals1) :
+    let sigKind : RigidTy := .fnPtr fnIns fnOut fnSaf .rust
+    let sigTy : MirAst.Ty := { kind := sigKind, layoutIdx := 0 }
+    let unsafeTy : MirAst.Ty := { kind := .fnPtr fnIns fnOut .unsafe_ .rust, layoutIdx := 0 }
+    let mem1 := cfInternedMem mem dp sigKind
+    let p := cfInternedPtr mem
+    evalRvalue locals (.cast (.pointerCoercion ck) opReify sigTy) mem decls layouts =
+      .ok (.ptr p 8) locals1 mem1 ∧
+    ClosureFnPtrEntryRel mem1 p mBM fnNm addr provBM c mode fnBM (length fnIns) ∧
+    ClosureFnPtrEntryRel mem1 p mTB fnNm addr provTB c mode fnTB (length fnIns) ∧
+    (fnSaf = .safe →
+      evalOperand locals1 opUnsafe mem1.borrows mem1.globals layouts mem1.callerLocals decls mem1.callStack =
+        .ok (.ptr p 8) locals2 →
+      operandTy decls layouts opUnsafe = some sigTy →
+      evalRvalue locals1 (.cast (.pointerCoercion "UnsafeFnPointer") opUnsafe unsafeTy) mem1 decls layouts =
+        .ok (.ptr p 8) locals2 mem1) ∧
+    (evalOperand locals2 opRawC mem1.borrows mem1.globals layouts mem1.callerLocals decls mem1.callStack =
+        .ok (.ptr p 8) locals3 →
+      operandTy decls layouts opRawC = some sigTy →
+      evalRvalue locals2 (.cast .fnPtrToPtr opRawC rawConstUnitMirTy) mem1 decls layouts =
+        .ok (.ptr p 8) locals3 mem1) ∧
+    (evalOperand locals3 opRawD mem1.borrows mem1.globals layouts mem1.callerLocals decls mem1.callStack =
+        .ok (.ptr p 8) locals4 →
+      operandTy decls layouts opRawD = some unsafeTy →
+      evalRvalue locals3 (.cast .fnPtrToPtr opRawD rawConstUnitMirTy) mem1 decls layouts =
+        .ok (.ptr p 8) locals4 mem1) ∧
+    evalValueM mBM (.Constant (.FnPointer fnNm) thinRawPtrTy) =
+      .ok ((.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy), mBM) ∧
+    evalValueM mTB (.Constant (.FnPointer fnNm) thinRawPtrTy) =
+      .ok ((.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy), mTB) ∧
+    evalCastOp (.Transmute thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) (some mBM) =
+      .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
+    evalCastOpM (M := TBM) (.Transmute thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) (some mTB) =
+      .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) ∧
+    evalBinOpM (M := BM) (.Rel .Eq)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) =
+      .ok (.Bool true, .Bool) ∧
+    evalBinOpM (M := TBM) (.Rel .Eq)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) =
+      .ok (.Bool true, .Bool) := by
+  have hBM := closure_reify_establishes_entryRel_M (M := BM) locals locals1 opReify mem decls layouts ck dp li
+    fnIns fnOut fnSaf zstVal c mode mBM fnNm addr provBM fnBM hCk hZst hOp1 hSaf hTy hLinked hDp
+    hShape hTpc hConv hArgc hDecls hFresh hNoB hAddr hMapBM hFnBM hArBM hConvBM
+  have hTB := closure_reify_establishes_entryRel_M (M := TBM) locals locals1 opReify mem decls layouts ck dp li
+    fnIns fnOut fnSaf zstVal c mode mTB fnNm addr provTB fnTB hCk hZst hOp1 hSaf hTy hLinked hDp
+    hShape hTpc hConv hArgc hDecls hFresh hNoB hAddr hMapTB hFnTB hArTB hConvTB
+  have hRelBM := hBM.2.2.1.entry
+  have hRelTB := hTB.2.2.1.entry
+  refine ⟨hBM.2.1, hBM.2.2.1, hTB.2.2.1, ?_, ?_, ?_, hBM.2.2.2, hTB.2.2.2,
+    evalCastOp_transmute_thinRawPtr_id addr hAddr provBM (some mBM),
+    evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB (some mTB),
+    minirust_ptr_rel_eq_same_addr_M (M := BM) addr provBM provBM _ _,
+    minirust_ptr_rel_eq_same_addr_M (M := TBM) addr provTB provTB _ _⟩
+  · intro hSafe hOp2 hTy2
+    subst hSafe
+    show evalUnsafeFnPointer locals1 opUnsafe { kind := .fnPtr fnIns fnOut .unsafe_ .rust, layoutIdx := 0 }
+      (cfInternedMem mem dp (.fnPtr fnIns fnOut .safe .rust)) decls layouts =
+      .ok (.ptr (cfInternedPtr mem) 8) locals2 (cfInternedMem mem dp (.fnPtr fnIns fnOut .safe .rust))
+    unfold evalUnsafeFnPointer
+    rw [hOp2, hTy2]
+    have hTag : lookupBorrow mem.borrows (cfInternedPtr mem).tag = none := hRelBM.2.1
+    simp only [cfInternedMem]
+    rw [hTag]
+    simp only [cfInternedPtr, callConvEq, hInRefl, hOutRefl, Nat.beq_refl, lookupFnPtr, Bool.and_self]
+  · intro hOp3 hTy3
+    exact (fnPtrToPtr_lockstep_mach_and_tb locals2 locals3 opRawC rawConstUnitMirTy
+      (cfInternedMem mem dp (.fnPtr fnIns fnOut fnSaf .rust)) decls layouts (cfInternedPtr mem) fnNm addr provBM provTB
+      mBM mTB hRelBM hRelTB hOp3 rfl (by simp [hTy3, callConvEq])
+      (by simp [cfInternedMem, cfInternedPtr, lookupFnPtr, Nat.beq_refl, callConvEq])).1
+  · intro hOp4 hTy4
+    exact (fnPtrToPtr_lockstep_mach_and_tb locals3 locals4 opRawD rawConstUnitMirTy
+      (cfInternedMem mem dp (.fnPtr fnIns fnOut fnSaf .rust)) decls layouts (cfInternedPtr mem) fnNm addr provBM provTB
+      mBM mTB hRelBM hRelTB hOp4 rfl (by simp [hTy4, callConvEq])
+      (by simp [cfInternedMem, cfInternedPtr, lookupFnPtr, Nat.beq_refl, callConvEq])).1
+
+/-- **Universal coercion → widening → pointer-identity pipeline for `fn(u32) -> u32`
+closure pointers (`Mach` & `MachTB`)** — specialization of
+`closure_coercion_widening_identity_general_mach_and_tb`. -/
 theorem closure_coercion_widening_identity_mach_and_tb (locals locals1 locals2 locals3 locals4 : List LocalSlot)
     (opReify opUnsafe opRawC opRawD : MirAst.Operand) (mem : MirSemantics.Memory)
     (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (ck : String) (dp : DefPath) (li : Nat)
@@ -1779,36 +1892,11 @@ theorem closure_coercion_widening_identity_mach_and_tb (locals locals1 locals2 l
         (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)
         (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) =
       .ok (.Bool true, .Bool) := by
-  have hBM := closure_reify_establishes_entryRel_M (M := BM) locals locals1 opReify mem decls layouts ck dp li
-    [.uint .u32] (.uint .u32) .safe zstVal c mode mBM fnNm addr provBM fnBM hCk hZst hOp1 hSaf hTy hLinked hDp
-    hShape hTpc hConv hArgc hDecls hFresh hNoB hAddr hMapBM hFnBM hArBM hConvBM
-  have hTB := closure_reify_establishes_entryRel_M (M := TBM) locals locals1 opReify mem decls layouts ck dp li
-    [.uint .u32] (.uint .u32) .safe zstVal c mode mTB fnNm addr provTB fnTB hCk hZst hOp1 hSaf hTy hLinked hDp
-    hShape hTpc hConv hArgc hDecls hFresh hNoB hAddr hMapTB hFnTB hArTB hConvTB
-  have hRelBM := hBM.2.2.1.entry
-  have hRelTB := hTB.2.2.1.entry
-  refine ⟨hBM.2.1, hBM.2.2.1, hTB.2.2.1, ?_, ?_, ?_, hBM.2.2.2, hTB.2.2.2,
-    evalCastOp_transmute_thinRawPtr_id addr hAddr provBM (some mBM),
-    evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB (some mTB),
-    minirust_ptr_rel_eq_same_addr_M (M := BM) addr provBM provBM _ _,
-    minirust_ptr_rel_eq_same_addr_M (M := TBM) addr provTB provTB _ _⟩
-  · intro hOp2 hTy2
-    have hU := unsafeFnPointer_ground_truth_and_divergences locals1 locals2 opUnsafe
-      (cfInternedMem mem dp fnPtrSafeU32MirTy.kind) decls layouts (cfInternedPtr mem) fnNm addr provBM provTB
-      mBM mTB hRelBM hRelTB hOp2
-    exact hU.2.2.1 hTy2 (by
-      simp [cfInternedMem, cfInternedPtr, lookupFnPtr, Nat.beq_refl, fnPtrSafeU32MirTy, callConvEq,
-        rigidTyListEq, rigidTyEq])
-  · intro hOp3 hTy3
-    exact (fnPtrToPtr_lockstep_mach_and_tb locals2 locals3 opRawC rawConstUnitMirTy
-      (cfInternedMem mem dp fnPtrSafeU32MirTy.kind) decls layouts (cfInternedPtr mem) fnNm addr provBM provTB
-      mBM mTB hRelBM hRelTB hOp3 rfl (by simp [hTy3, fnPtrSafeU32MirTy, callConvEq])
-      (by simp [cfInternedMem, cfInternedPtr, lookupFnPtr, Nat.beq_refl, fnPtrSafeU32MirTy, callConvEq])).1
-  · intro hOp4 hTy4
-    exact (fnPtrToPtr_lockstep_mach_and_tb locals3 locals4 opRawD rawConstUnitMirTy
-      (cfInternedMem mem dp fnPtrSafeU32MirTy.kind) decls layouts (cfInternedPtr mem) fnNm addr provBM provTB
-      mBM mTB hRelBM hRelTB hOp4 rfl (by simp [hTy4, fnPtrUnsafeU32MirTy, callConvEq])
-      (by simp [cfInternedMem, cfInternedPtr, lookupFnPtr, Nat.beq_refl, fnPtrSafeU32MirTy, callConvEq])).1
+  have hG := closure_coercion_widening_identity_general_mach_and_tb locals locals1 locals2 locals3 locals4
+    opReify opUnsafe opRawC opRawD mem decls layouts ck dp li [.uint .u32] (.uint .u32) .safe zstVal c mode fnNm
+    addr hAddr provBM provTB mBM mTB fnBM fnTB hCk hZst hSaf rfl rfl hTy hLinked hDp hShape hTpc hConv hArgc
+    hDecls hFresh hNoB hMapBM hMapTB hFnBM hFnTB hArBM hArTB hConvBM hConvTB hOp1
+  exact ⟨hG.1, hG.2.1, hG.2.2.1, hG.2.2.2.1 rfl, hG.2.2.2.2⟩
 
 /-- **Universal classification of a closure receiver by its captured upvars.**
 For the body's own closure path `p`, the three receiver forms `&{closure}`,
@@ -1830,35 +1918,40 @@ theorem classifyOwnClosureEnvTy_by_upvars (p : DefPath) (u : RigidTy) (us : List
   have hp : stringEq p p = true := stringEq_eq_true.mpr rfl
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> try (simp only [classifyOwnClosureEnvTy?, hp, closureShapeOfUpvars])
   intro q ups hq
-  simp only [classifyOwnClosureEnvTy?, hq, and_self]
+  simp only [hq, and_self]
 
-/-- **Universal two-sided indirect closure call correspondence (`Mach` &
-`MachTB`).** For closure pointers related by `ClosureFnPtrEntryRel` (Trusted
-body `c` with `n + 1` parameters, MiniRust function `fn` of arity `n`), a
-Trusted indirect call site whose target resolves to `c`, and a MiniRust call
-site passing as many arguments as the Trusted one:
+/-- **Universal coupled two-sided indirect closure call correspondence (`Mach` &
+`MachTB`).** For a Trusted state `s` and MiniRust machine `m` whose function
+pointers `p` (in `s.memory`) and `(addr, prov)` (in `m.fn_ptrs[fnNm]`) are
+coupled by `ClosureFnPtrEntryRel s.memory p m fnNm addr prov c mode fn n`
+(Trusted body `c` with `n + 1` parameters, MiniRust function `fn` of arity `n`),
+when the Trusted callee operand `func` evaluates directly to `.ptr p 8` (so
+`resolveCallTarget` resolves `p` through `hRel.fnEntry` and `hRel.entry`) and
+MiniRust resolves `(addr, prov)` through `hRel.mrResolve` (`fnFromPtrM`):
 * with `n` arguments and a compatible pointer signature, Trusted enters `c`
   with the synthesized environment prepended (`n + 1` entry arguments) while
-  MiniRust's `Machine::create_frame` accepts the arity and proceeds to bind
-  exactly the `n` caller arguments;
+  MiniRust's `fnFromPtrM` + `createFrameM` accepts the arity and proceeds to
+  bind exactly the `n` caller arguments;
 * with `n + 1` arguments (a forged pointer passing the environment
   explicitly), BOTH fault: Trusted with `.ub`, MiniRust with
   `"call ABI violation: number of arguments does not agree"`. -/
 theorem closure_indirect_call_correspondence_M {M : Type} [Gen.Memory M] [MemoryOps M]
-    {mem : MirSemantics.Memory} {p : ProvenancePtr} {m : Machine M} {fnNm : Gen.FnName} {addr : Nat}
+    {p : ProvenancePtr} {m : Machine M} {fnNm : Gen.FnName} {addr : Nat}
     {prov : Option (Gen.Memory.Provenance M)} {c : CapturedMir} {mode : ClosureEnvMode} {fn : Gen.Function}
-    {n : Nat} (hRel : ClosureFnPtrEntryRel mem p m fnNm addr prov c mode fn n)
+    {n : Nat}
     (s : MachineState) (callerBody : CapturedMir) (func : MirAst.Operand) (argOps : List MirAst.Operand)
     (dest : MirAst.Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction) (span : String)
-    (target : ResolvedCallTarget) (localsAfterFunc locals' : List LocalSlot)
-    (argVals : List MirSemantics.Value)
-    (hRes : resolveCallTarget s func (length argOps) callerBody.localDecls callerBody.layouts =
-      .ok target localsAfterFunc)
-    (hInd : target.isIndirect = true)
+    (localsAfterFunc locals' : List LocalSlot) (argVals : List MirSemantics.Value)
+    (hRel : ClosureFnPtrEntryRel s.memory p m fnNm addr prov c mode fn n)
+    (hNotDir : extractCalleeDefPath? func = none)
+    (hFunc : evalOperandWithBodyCast s.frame.locals func s.memory.borrows s.memory.globals
+      callerBody.layouts s.memory.callerLocals callerBody.localDecls s.memory.callStack =
+      .ok (.ptr p 8) localsAfterFunc)
+    (hCompatSite : ∀ e, lookupFnPtr s.memory.fnPtrs p.allocId = some e →
+      fnEntryCompatibleWithCallSite e (length argOps) (operandTy callerBody.localDecls callerBody.layouts func) = true)
     (hArgs : evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
       callerBody.layouts s.memory.callerLocals callerBody.localDecls s.memory.callStack = .ok argVals locals')
-    (hLook : lookupCallee s.memory.callees callerBody.layouts target.defPath target.typeArgs
-      s.memory.traitImpls = some c)
+    (hLook : lookupCallee s.memory.callees callerBody.layouts c.defPath [] s.memory.traitImpls = some c)
     (spa : StackPopAction M) (callerRetTy : Gen.Type) (callerArgs : List (Gen.Value M × Gen.Type))
     (f1 f2 : StackFrame M) (cm1 cm2 : ConcurrentMemory M) (calleeRetTy : Gen.Type)
     (hSL : storageLiveM { func := fn, locals := ⟨[]⟩, stack_pop_action := spa, next_block := fn.start, next_stmt := 0, extra := MemoryOps.new_call } m.mem fn.ret = .ok (f1, cm1))
@@ -1866,7 +1959,14 @@ theorem closure_indirect_call_correspondence_M {M : Type} [Gen.Memory M] [Memory
     (hRet : mapIndex f2.func.locals f2.func.ret "func.locals[func.ret]" = .ok calleeRetTy)
     (hAbi : checkAbiCompatibility callerRetTy calleeRetTy = .ok true)
     (hLen : callerArgs.length = length argVals) :
-    (length argVals = n → checkClosureTargetCompatible target c n = true →
+    fnFromPtrM m (.Ptr (ThinPointer.widen { addr := addr, provenance := prov } none)) = .ok fn ∧
+    (∃ e, lookupFnPtr s.memory.fnPtrs p.allocId = some e ∧
+      resolveCallTarget s func (length argOps) callerBody.localDecls callerBody.layouts =
+        .ok { defPath := c.defPath, typeArgs := [], fnSig := e.fnSig, isIndirect := true } localsAfterFunc) ∧
+    (length argVals = n →
+      (∀ e, lookupFnPtr s.memory.fnPtrs p.allocId = some e →
+        checkClosureTargetCompatible { defPath := c.defPath, typeArgs := [], fnSig := e.fnSig, isIndirect := true }
+          c n = true) →
       evalTerminator s { kind := .call func argOps dest (some targetBb) unwind, span := span } (some callerBody) =
         MirStepNode.step (pushCalleeFrame s callerBody locals' dest targetBb c
           (synthesizeClosureEnvArg mode (layoutPointerBytes c.layouts) :: argVals) unwind) ∧
@@ -1877,29 +1977,44 @@ theorem closure_indirect_call_correspondence_M {M : Type} [Gen.Memory M] [Memory
         MirStepNode.fail .ub ∧
       createFrameM m fn spa .Rust callerRetTy callerArgs =
         .error (.ub "call ABI violation: number of arguments does not agree")) := by
+  obtain ⟨e, hEntry, hDp, hTargs⟩ := hRel.fnEntry
+  obtain ⟨hOff, hNoB, _, _⟩ := hRel.entry
+  let target : ResolvedCallTarget := { defPath := c.defPath, typeArgs := [], fnSig := e.fnSig, isIndirect := true }
+  have hRes : resolveCallTarget s func (length argOps) callerBody.localDecls callerBody.layouts =
+      .ok target localsAfterFunc := by
+    have hCompat := hCompatSite e hEntry
+    unfold resolveCallTarget
+    simp only [hNotDir, hFunc, hOff, hNoB, hEntry, hCompat, hDp, hTargs, Nat.beq_refl, Bool.and_self]
+    rfl
   have hLaw := minirust_createFrameM_arity_law m fn spa callerRetTy callerArgs f1 f2 cm1 cm2 calleeRetTy hSL hAA
     hRet hAbi
   rw [hRel.mrConv] at hLaw
-  refine ⟨fun h1 hCompat => ⟨?_, ?_⟩, fun h2 => ⟨?_, ?_⟩⟩
+  refine ⟨hRel.mrResolve, ⟨e, hEntry, hRes⟩, fun h1 hCompat => ⟨?_, ?_⟩, fun h2 => ⟨?_, ?_⟩⟩
   · exact (closure_indirect_call_prepends_env s callerBody func argOps dest targetBb unwind span target
-      localsAfterFunc locals' argVals c mode hRes hInd hArgs hLook hRel.shape (by rw [h1]; exact hCompat)).1
+      localsAfterFunc locals' argVals c mode hRes rfl hArgs hLook hRel.shape
+      (by rw [h1]; exact hCompat e hEntry)).1
   · exact hLaw.2.1 (by rw [hRel.mrArity, hLen, h1])
   · exact (closure_indirect_call_fail_closed s callerBody func argOps dest targetBb unwind span target
-      localsAfterFunc locals' argVals c hRes hInd hArgs hLook
+      localsAfterFunc locals' argVals c hRes rfl hArgs hLook
       (Or.inr (Or.inl ⟨mode, hRel.shape, by rw [h2, hRel.trustedArity]⟩))).2.1
   · exact hLaw.1 (by rw [hRel.mrArity, hLen, h2]; exact Nat.ne_of_lt (Nat.lt_succ_self n))
 
 /-! ## §3. MiniRust Reference Programs (`Mach` & `MachTB`)
 
-MiniRust has no closure types: a non-capturing closure coerced to a function
-pointer is a `Function` of the closure's *user-visible* arity `N` registered in
-`Machine::fn_ptrs`, `ClosureFnPointer(Safe|Unsafe)` is `Constant::FnPointer`,
-`UnsafeFnPointer` and `FnPtrToPtr` are type-erasing `Transmute`s (MiniRust
-erases function-pointer safety), and an indirect call is `Terminator::Call` on
-the loaded pointer followed by the callee's `Terminator::Return` (which is
-also the reference lowering of `TerminatorKind::TailCall` and of the runtime
-arm of `const_eval_select`). Each root function ends in a self-loop, so the
-observed return local `_0` (allocation `0`) is stable under extra steps. -/
+MiniRust has no closure types (and upstream `tooling/minimize/src/rvalue.rs`
+explicitly leaves `ClosureFnPointer` unimplemented):
+
+> "| smir::CastKind::PointerCoercion(smir::PointerCoercion::ClosureFnPointer(..)) => rs::span_bug!(span, \"cast not supported: {cast_kind:?}\"),"
+
+A non-capturing closure coerced to a function pointer is modeled as a `Function`
+of the closure's *user-visible* arity `N` registered in `Machine::fn_ptrs`,
+`ClosureFnPointer(Safe|Unsafe)` is `Constant::FnPointer`, `UnsafeFnPointer` and
+`FnPtrToPtr` are type-erasing `Transmute`s (MiniRust erases function-pointer
+safety), and an indirect call is `Terminator::Call` on the loaded pointer
+followed by the callee's `Terminator::Return` (which is also the reference
+lowering of `TerminatorKind::TailCall` and of the runtime arm of
+`const_eval_select`). Each root function ends in a self-loop, so the observed
+return local `_0` (allocation `0`) is stable under extra steps. -/
 
 def cfLd (i : Nat) : ValueExpr := .Load (.Local (localName i))
 def cfLc (i : Nat) : PlaceExpr := .Local (localName i)
@@ -1908,12 +2023,39 @@ def cfBlk (ss : List Gen.Statement) (t : Gen.Terminator) : Gen.BasicBlock := ⟨
 /-- The final self-loop block. -/
 def cfLoopBb (i : Nat) : Gen.BbName × Gen.BasicBlock := (bbName i, cfBlk [] (.Goto (bbName i)))
 /-- `Constant::FnPointer` of program function `i` (the MiniRust image of
-`ReifyFnPointer` and `ClosureFnPointer`). -/
+`ReifyFnPointer` and `ClosureFnPointer`; `spec/lang/step/expressions.md`):
+> "Constant::FnPointer(fn_name) => {
+>     let ptr = self.fn_ptrs[fn_name];
+>     Value::Ptr(ptr.widen(None))
+> }" -/
 def cfFnPtrC (i : Nat) : ValueExpr := .Constant (.FnPointer (fnName i)) thinRawPtrTy
 def cfBin (op : IntBinOp) (a b : ValueExpr) : ValueExpr := .BinOp (.Int op) a b
-/-- A type-erasing pointer `Transmute` (`UnsafeFnPointer`, `FnPtrToPtr`). -/
+/-- A type-erasing pointer `Transmute` (`UnsafeFnPointer`, `FnPtrToPtr`;
+`tooling/minimize/src/rvalue.rs`):
+> "smir::CastKind::Transmute
+> | smir::CastKind::FnPtrToPtr
+> | smir::CastKind::PointerCoercion(smir::PointerCoercion::UnsafeFnPointer) => {
+>     let operand = self.translate_operand_smir(operand, span);
+>     let ty = self.translate_ty_smir(*cast_ty, span);
+>     build::transmute(operand, ty)
+> }" -/
 def cfPtrCast (v : ValueExpr) : ValueExpr := .UnOp (.Cast (.Transmute thinRawPtrTy)) v
-/-- `ret = callee(args) -> bb next` with calling convention `conv`. -/
+/-- `ret = callee(args) -> bb next` with calling convention `conv`, checking
+calling convention, return type, arity, and argument types in `create_frame`
+(`spec/lang/step/terminators.md`):
+> "if caller_conv != func.calling_convention {
+>     throw_ub!(\"call ABI violation: calling conventions are not the same\");
+> }
+> if !check_abi_compatibility(caller_ret_ty, func.locals[func.ret]) {
+>     throw_ub!(\"call ABI violation: return types are not compatible\");
+> }
+> if func.args.len() != caller_args.len() {
+>     throw_ub!(\"call ABI violation: number of arguments does not agree\");
+> }
+> for (callee_local, (caller_val, caller_ty)) in func.args.zip(caller_args) {
+>     if !check_abi_compatibility(caller_ty, func.locals[callee_local]) {
+>         throw_ub!(\"call ABI violation: argument types are not compatible\");
+>     }" -/
 def cfCall (callee : ValueExpr) (args : List ValueExpr) (ret next : Nat)
     (conv : CallingConvention := .Rust) : Gen.Terminator :=
   .Call callee conv (args.map .ByValue) (cfLc ret) (some (bbName next)) none
@@ -2427,6 +2569,16 @@ def cfMrExternCMach : Mach :=
   cfMrMach [cfMrBadCallCaller .C u32MrTy, cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))]
     [(cfU 4, 4), (cfU32B 5, 4), (cfU 8, 8)]
 
+/-- Root caller expecting a `u64` return from a `fn(u32) -> u32` closure function. -/
+def cfMrBadRetCaller : Gen.Function :=
+  mkMrFn [(localName 0, u64MrTy), (localName 1, u32MrTy), (localName 2, thinRawPtrTy)] [localName 1] (localName 0)
+    [(bbName 0, cfBlk [.Assign (cfLc 2) (cfFnPtrC 1)] (cfCall (cfLd 2) [cfLd 1] 0 1 .Rust)), cfLoopBb 1]
+
+/-- MiniRust transmuted return signature: a `u64` return destination for `fn(u32) -> u32`. -/
+def cfMrBadRetMach : Mach :=
+  cfMrMach [cfMrBadRetCaller, cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))]
+    [(cfU 8, 8), (cfU32B 5, 4), (cfU 8, 8)]
+
 /-- **Callee-directed environment prepend for all three receiver modes
 (kernel-checked on the verbatim closure bodies).** One `stepMirFn` step of an
 indirect `fn(u32) -> u32` call on `5` enters the closure body with four locals
@@ -2522,6 +2674,10 @@ theorem cf_indirect_call_fail_closed_three_way_witness :
       (cfPtrCallState (.fnPtr [.uint .u64] cfU32K .safe .rust) (.scalar ⟨5, 8⟩) cfFx_fn_shared_closure_0
         cfSharedPath (.fnPtr [.uint .u64] cfU32K .safe .rust) (.uint .u64)) = .ub ∧
     CfMrUb 4 cfMrBadSigMach "call ABI violation: argument types are not compatible" ∧
+    cfRun (cfPtrCaller (.fnPtr [cfU32K] (.uint .u64) .safe .rust)) 16
+      (cfPtrCallState (.fnPtr [cfU32K] (.uint .u64) .safe .rust) (cfU32V 5) cfFx_fn_shared_closure_0
+        cfSharedPath (.fnPtr [cfU32K] (.uint .u64) .safe .rust)) = .ub ∧
+    CfMrUb 4 cfMrBadRetMach "call ABI violation: return types are not compatible" ∧
     cfRun (cfPtrCaller (.fnPtr [cfU32K] cfU32K .safe .c)) 16
       (cfPtrCallState (.fnPtr [cfU32K] cfU32K .safe .c) (cfU32V 5) cfFx_fn_shared_closure_0 cfSharedPath
         (.fnPtr [cfU32K] cfU32K .safe .c)) = .ub ∧
@@ -2537,6 +2693,7 @@ theorem cf_indirect_call_fail_closed_three_way_witness :
       .ext "core::ops::Fn::call" :=
   ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
    by decide +kernel, cfMrUb_of_decide (by decide +kernel) (by decide +kernel), by decide +kernel,
+   cfMrUb_of_decide (by decide +kernel) (by decide +kernel), by decide +kernel,
    cfMrUb_of_decide (by decide +kernel) (by decide +kernel), by decide +kernel,
    cfMrUb_of_decide (by decide +kernel) (by decide +kernel), by decide +kernel, by decide +kernel,
    by decide +kernel⟩
@@ -2562,6 +2719,42 @@ theorem closure_indirect_call_law_instance_fn :
     (cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_shared_closure_0 cfSharedPath cfFnU32).frame.locals
     [cfU32V 5] cfFx_fn_shared_closure_0 .sharedRef rfl rfl rfl rfl (cfShapeTag_inj (by decide +kernel)) rfl).1
 
+/-- **The universal indirect-call law instantiated on a verbatim `FnMut` closure
+body (non-vacuity).** -/
+theorem closure_indirect_call_law_instance_fnMut :
+    let dp := "closure_matrix::fn_mut_kind::{closure#0}"
+    let st := cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_mut_kind_closure_0 dp cfFnU32
+    stepMirFn (cfPtrCaller cfFnU32) st =
+      MirStepNode.step (pushCalleeFrame st (cfPtrCaller cfFnU32) st.frame.locals (locPlace 0) 1
+        cfFx_fn_mut_kind_closure_0
+        (synthesizeClosureEnvArg .mutRef (layoutPointerBytes cfFx_fn_mut_kind_closure_0.layouts) :: [cfU32V 5])
+        .continue_) :=
+  (closure_indirect_call_prepends_env
+    (cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_mut_kind_closure_0 "closure_matrix::fn_mut_kind::{closure#0}" cfFnU32)
+    (cfPtrCaller cfFnU32) (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    { defPath := "closure_matrix::fn_mut_kind::{closure#0}", typeArgs := [], fnSig := some cfFnU32, isIndirect := true }
+    (cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_mut_kind_closure_0 "closure_matrix::fn_mut_kind::{closure#0}" cfFnU32).frame.locals
+    (cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_mut_kind_closure_0 "closure_matrix::fn_mut_kind::{closure#0}" cfFnU32).frame.locals
+    [cfU32V 5] cfFx_fn_mut_kind_closure_0 .mutRef rfl rfl rfl rfl (cfShapeTag_inj (by decide +kernel)) rfl).1
+
+/-- **The universal indirect-call law instantiated on a verbatim `FnOnce` closure
+body (non-vacuity).** -/
+theorem closure_indirect_call_law_instance_fnOnce :
+    let dp := "closure_matrix::fn_once_kind::{closure#0}"
+    let st := cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_once_kind_closure_0 dp cfFnU32
+    stepMirFn (cfPtrCaller cfFnU32) st =
+      MirStepNode.step (pushCalleeFrame st (cfPtrCaller cfFnU32) st.frame.locals (locPlace 0) 1
+        cfFx_fn_once_kind_closure_0
+        (synthesizeClosureEnvArg .byValue (layoutPointerBytes cfFx_fn_once_kind_closure_0.layouts) :: [cfU32V 5])
+        .continue_) :=
+  (closure_indirect_call_prepends_env
+    (cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_once_kind_closure_0 "closure_matrix::fn_once_kind::{closure#0}" cfFnU32)
+    (cfPtrCaller cfFnU32) (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    { defPath := "closure_matrix::fn_once_kind::{closure#0}", typeArgs := [], fnSig := some cfFnU32, isIndirect := true }
+    (cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_once_kind_closure_0 "closure_matrix::fn_once_kind::{closure#0}" cfFnU32).frame.locals
+    (cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_once_kind_closure_0 "closure_matrix::fn_once_kind::{closure#0}" cfFnU32).frame.locals
+    [cfU32V 5] cfFx_fn_once_kind_closure_0 .byValue rfl rfl rfl rfl (cfShapeTag_inj (by decide +kernel)) rfl).1
+
 /-- **`ClosureFnPtrEntryRel` instantiated on the verbatim `Fn` closure body and
 the reference machine, on `Mach` AND `MachTB` (non-vacuity).** The Trusted
 pointer at `65536` (an `FnPtrEntry` without any closure flag) and MiniRust
@@ -2585,6 +2778,186 @@ theorem closureFnPtrEntryRel_instance_mach_and_tb :
    ⟨_, { entry := ⟨rfl, rfl, by decide, rfl⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
          shape := cfShapeTag_inj (by decide +kernel), nonGeneric := rfl, trustedArity := rfl, mrResolve := rfl,
          mrArity := rfl, mrConv := rfl }⟩⟩
+
+private theorem storageDeadM_func_eq {M : Type} [Gen.Memory M] [MemoryOps M]
+    {fr fr' : StackFrame M} {cm cm' : ConcurrentMemory M} {l : LocalName}
+    (h : storageDeadM fr cm l = .ok (fr', cm')) : fr'.func = fr.func := by
+  unfold storageDeadM at h
+  cases h0 : mapIndex fr.func.locals l "self.func.locals[local]" with
+  | error e => simp only [h0, bind, Except.bind] at h; cases h
+  | ok ty =>
+    simp only [h0, bind, Except.bind] at h
+    cases h1 : «Type».layout ty with
+    | error e => simp only [h1] at h; cases h
+    | ok ly =>
+      simp only [h1] at h
+      cases h2 : LayoutStrategy.expect_size ly "WF ensures all locals are sized" with
+      | error e => simp only [h2] at h; cases h
+      | ok sz =>
+        simp only [h2] at h
+        cases h3 : LayoutStrategy.expect_align ly "WF ensures all locals are sized" with
+        | error e => simp only [h3] at h; cases h
+        | ok al =>
+          simp only [h3] at h
+          cases h4 : mapRemove fr.locals l with
+          | mk rem locals =>
+            simp only [h4] at h
+            cases rem with
+            | none =>
+              simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+              rw [← h.1]
+            | some ptr =>
+              cases h5 : ConcurrentMemory.deallocate cm ptr .Stack sz al with
+              | error e => simp only [h5] at h; cases h
+              | ok cm2 =>
+                simp only [h5, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+                rw [← h.1]
+
+private theorem storageLiveM_func_eq {M : Type} [Gen.Memory M] [MemoryOps M]
+    {fr fr' : StackFrame M} {cm cm' : ConcurrentMemory M} {l : LocalName}
+    (h : storageLiveM fr cm l = .ok (fr', cm')) : fr'.func = fr.func := by
+  unfold storageLiveM at h
+  cases h1 : storageDeadM fr cm l with
+  | error e => simp only [h1, bind, Except.bind] at h; cases h
+  | ok p1 =>
+    simp only [h1, bind, Except.bind] at h
+    cases h2 : mapIndex p1.1.func.locals l "self.func.locals[local]" with
+    | error e => simp only [h2] at h; cases h
+    | ok ty =>
+      simp only [h2] at h
+      cases h3 : «Type».layout ty with
+      | error e => simp only [h3] at h; cases h
+      | ok ly =>
+        simp only [h3] at h
+        cases h4 : LayoutStrategy.expect_size ly "WF ensures all locals are sized" with
+        | error e => simp only [h4] at h; cases h
+        | ok sz =>
+          simp only [h4] at h
+          cases h5 : LayoutStrategy.expect_align ly "WF ensures all locals are sized" with
+          | error e => simp only [h5] at h; cases h
+          | ok al =>
+            simp only [h5] at h
+            cases h6 : ConcurrentMemory.allocate p1.2 .Stack sz al with
+            | error e => simp only [h6] at h; cases h
+            | ok p3 =>
+              simp only [h6, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+              rw [← h.1]; dsimp only; exact storageDeadM_func_eq h1
+
+private theorem allocFrameArgsM_func_eq {M : Type} [Gen.Memory M] [MemoryOps M]
+    {fr fr' : StackFrame M} {cm cm' : ConcurrentMemory M} {args : List LocalName}
+    (h : allocFrameArgsM fr cm args = .ok (fr', cm')) : fr'.func = fr.func := by
+  induction args generalizing fr cm with
+  | nil =>
+    simp only [allocFrameArgsM, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+    exact congrArg StackFrame.func h.1.symm
+  | cons a rest ih =>
+    simp only [allocFrameArgsM, bind, Except.bind] at h
+    cases h1 : storageLiveM fr cm a with
+    | error e => simp only [h1] at h; cases h
+    | ok p1 =>
+      simp only [h1] at h
+      exact (ih h).trans (storageLiveM_func_eq h1)
+
+/-- **Non-vacuity instantiation of the coupled two-sided indirect call law
+`closure_indirect_call_correspondence_M` on BOTH `Mach` and `MachTB`**:
+all premises of `closure_indirect_call_correspondence_M` hold simultaneously on
+the verbatim `fn_shared::{closure#0}` Trusted state and `cfMrIndirectMach`
+reference machine (both `BM` and `TBM`). -/
+theorem closure_indirect_call_correspondence_instance_mach_and_tb :
+    let s := cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_shared_closure_0 cfSharedPath cfFnU32
+    let mBM := cfMrIndirectMach (cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))) [5]
+    let mTB := liftMachToTB mBM
+    let fn := cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))
+    (∃ f2 cm2,
+      evalTerminator s
+          { kind := .call (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) (some 1) .continue_, span := "ptr_call" }
+          (some (cfPtrCaller cfFnU32)) =
+        MirStepNode.step (pushCalleeFrame s (cfPtrCaller cfFnU32) s.frame.locals (locPlace 0) 1
+          cfFx_fn_shared_closure_0
+          (synthesizeClosureEnvArg .sharedRef (layoutPointerBytes cfFx_fn_shared_closure_0.layouts) :: [cfU32V 5])
+          .continue_) ∧
+      createFrameM mBM fn .BottomOfStack .Rust u32MrTy [(.Int 5, u32MrTy)] =
+        (initFrameArgsM { mBM with mem := cm2 } f2 fn.args [(.Int 5, u32MrTy)]).map (fun m' => (f2, m'))) ∧
+    (∃ f2 cm2,
+      createFrameM mTB fn .BottomOfStack .Rust u32MrTy [(.Int 5, u32MrTy)] =
+        (initFrameArgsM { mTB with mem := cm2 } f2 fn.args [(.Int 5, u32MrTy)]).map (fun m' => (f2, m'))) := by
+  dsimp only
+  let s := cfPtrCallState cfFnU32 (cfU32V 5) cfFx_fn_shared_closure_0 cfSharedPath cfFnU32
+  let fn := cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))
+  let mBM := cfMrIndirectMach fn [5]
+  let mTB := liftMachToTB mBM
+  obtain ⟨hRelBM, provTB, hRelTB⟩ := closureFnPtrEntryRel_instance_mach_and_tb
+  have hCompatSite : ∀ e, lookupFnPtr s.memory.fnPtrs (65536 : Nat) = some e →
+      fnEntryCompatibleWithCallSite e (length [MirAst.Operand.copy (locPlace 2)])
+        (operandTy (cfPtrCaller cfFnU32).localDecls (cfPtrCaller cfFnU32).layouts (.copy (locPlace 1))) = true := by
+    intro e he
+    have : e = cfEntry cfSharedPath cfFnU32 := by
+      have h' : some (cfEntry cfSharedPath cfFnU32) = some e := he
+      exact (Option.some.inj h').symm
+    subst this
+    rfl
+  have hCompatTarget : ∀ e, lookupFnPtr s.memory.fnPtrs (65536 : Nat) = some e →
+      checkClosureTargetCompatible
+        ({ defPath := cfFx_fn_shared_closure_0.defPath, typeArgs := [], fnSig := e.fnSig, isIndirect := true } :
+          ResolvedCallTarget) cfFx_fn_shared_closure_0 1 = true := by
+    intro e he
+    have : e = cfEntry cfSharedPath cfFnU32 := by
+      have h' : some (cfEntry cfSharedPath cfFnU32) = some e := he
+      exact (Option.some.inj h').symm
+    subst this
+    rfl
+  let initFrBM : StackFrame BM :=
+    { func := fn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+      next_block := fn.start, next_stmt := 0, extra := MemoryOps.new_call }
+  let initFrTB : StackFrame TBM :=
+    { func := fn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+      next_block := fn.start, next_stmt := 0, extra := MemoryOps.new_call }
+  have hBMInit : ∃ f1 cm1 f2 cm2,
+      storageLiveM initFrBM mBM.mem fn.ret = .ok (f1, cm1) ∧
+      allocFrameArgsM f1 cm1 fn.args = .ok (f2, cm2) := by
+    have hOk : (do
+        let (f1, cm1) ← storageLiveM initFrBM mBM.mem fn.ret
+        let _ ← allocFrameArgsM f1 cm1 fn.args
+        pure true).toOption = some true := by decide +kernel
+    cases h1 : storageLiveM initFrBM mBM.mem fn.ret with
+    | error e => simp only [h1, bind, Except.bind, Except.toOption] at hOk; cases hOk
+    | ok p1 =>
+      cases h2 : allocFrameArgsM p1.1 p1.2 fn.args with
+      | error e => simp only [h1, h2, bind, Except.bind, Except.toOption] at hOk; cases hOk
+      | ok p2 => exact ⟨p1.1, p1.2, p2.1, p2.2, rfl, h2⟩
+  have hTBInit : ∃ f1 cm1 f2 cm2,
+      storageLiveM initFrTB mTB.mem fn.ret = .ok (f1, cm1) ∧
+      allocFrameArgsM f1 cm1 fn.args = .ok (f2, cm2) := by
+    have hOk : (do
+        let (f1, cm1) ← storageLiveM initFrTB mTB.mem fn.ret
+        let _ ← allocFrameArgsM f1 cm1 fn.args
+        pure true).toOption = some true := by decide +kernel
+    cases h1 : storageLiveM initFrTB mTB.mem fn.ret with
+    | error e => simp only [h1, bind, Except.bind, Except.toOption] at hOk; cases hOk
+    | ok p1 =>
+      cases h2 : allocFrameArgsM p1.1 p1.2 fn.args with
+      | error e => simp only [h1, h2, bind, Except.bind, Except.toOption] at hOk; cases hOk
+      | ok p2 => exact ⟨p1.1, p1.2, p2.1, p2.2, rfl, h2⟩
+  obtain ⟨f1BM, cm1BM, f2BM, cm2BM, hSLBM, hAABM⟩ := hBMInit
+  obtain ⟨f1TB, cm1TB, f2TB, cm2TB, hSLTB, hAATB⟩ := hTBInit
+  have hLawBM := closure_indirect_call_correspondence_M (M := BM) s (cfPtrCaller cfFnU32)
+    (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    s.frame.locals s.frame.locals [cfU32V 5] hRelBM rfl rfl hCompatSite rfl rfl
+    .BottomOfStack u32MrTy [(.Int 5, u32MrTy)] f1BM f2BM cm1BM cm2BM u32MrTy hSLBM hAABM
+    (by
+      have hEq := allocFrameArgsM_func_eq hAABM
+      have hEq1 := storageLiveM_func_eq hSLBM
+      rw [hEq, hEq1]; rfl) rfl rfl
+  have hLawTB := closure_indirect_call_correspondence_M (M := TBM) s (cfPtrCaller cfFnU32)
+    (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    s.frame.locals s.frame.locals [cfU32V 5] hRelTB rfl rfl hCompatSite rfl rfl
+    .BottomOfStack u32MrTy [(.Int 5, u32MrTy)] f1TB f2TB cm1TB cm2TB u32MrTy hSLTB hAATB
+    (by
+      have hEq := allocFrameArgsM_func_eq hAATB
+      have hEq1 := storageLiveM_func_eq hSLTB
+      rw [hEq, hEq1]; rfl) rfl rfl
+  exact ⟨⟨f2BM, cm2BM, hLawBM.2.2.1 rfl hCompatTarget⟩,
+         ⟨f2TB, cm2TB, (hLawTB.2.2.1 rfl hCompatTarget).2⟩⟩
 
 /-! ## §6. Exhaustive Axiom, Import-Isolation, & `Classical.choice`-Free Audit -/
 
@@ -2641,6 +3014,7 @@ elab "#assert_closure_fn_ptr_mr_audit" : command => do
     ``closureFnPtrEntryRel_call_arity, ``closure_indirect_call_correspondence_M,
     ``classifyOwnClosureEnvTy_by_upvars, ``minirust_createFrameM_arity_law,
     ``minirust_ptr_rel_eq_same_addr_M, ``minirust_closure_call_return_tb_wfLive,
+    ``closure_coercion_widening_identity_general_mach_and_tb,
     ``closure_coercion_widening_identity_mach_and_tb, ``cf_fn_closure_three_way_witness,
     ``cf_fnMut_closure_three_way_witness, ``cf_fnOnce_closure_three_way_witness,
     ``cf_zero_and_two_arg_closure_three_way_witness, ``cf_unsafe_closure_three_way_witness,
@@ -2648,7 +3022,9 @@ elab "#assert_closure_fn_ptr_mr_audit" : command => do
     ``cf_mixed_fnItem_and_closure_three_way_witness, ``cf_constEvalSelect_closure_three_way_witness,
     ``cf_finding_0007_parity_three_way_witness, ``cf_env_prepend_three_receiver_modes_witness,
     ``cf_coercion_fail_closed_witness, ``cf_indirect_call_fail_closed_three_way_witness,
-    ``closure_indirect_call_law_instance_fn, ``closureFnPtrEntryRel_instance_mach_and_tb ]
+    ``closure_indirect_call_law_instance_fn, ``closure_indirect_call_law_instance_fnMut,
+    ``closure_indirect_call_law_instance_fnOnce, ``closureFnPtrEntryRel_instance_mach_and_tb,
+    ``closure_indirect_call_correspondence_instance_mach_and_tb ]
   for c in headline do
     match env.find? c with
     | some (.thmInfo _) => pure ()
