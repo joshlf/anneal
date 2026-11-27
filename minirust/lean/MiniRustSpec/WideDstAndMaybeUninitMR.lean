@@ -580,11 +580,55 @@ theorem trusted_decodePtrBytesNoForge_raw_provless (pointee : RigidTy) (ptrBytes
   simp only [hdec]
   split <;> (try split) <;> simp_all
 
-/-- `D1` **honest Trusted boundary**: `size_of_val` / `align_of_val` on the custom trailing-slice
-ADTs of cases `6` / `7` reach `intrinsicWidePointeeStep`, which is `.unsupported`. -/
+/-- `D4` **Trusted root cause at `decodeTypedValueFromBytes` (universal)**: for EVERY function
+pointer signature and layout table, decoding any provenance-free byte image fails (`none` -> UB),
+explaining cases `21` and `22` directly from `decodeTypedValueFromBytes`. -/
+theorem trusted_decodeTypedValueFromBytes_fnPtr_provless (fuel : Nat) (layouts : Layout.LayoutTable)
+    (inputs : List RigidTy) (output : RigidTy) (safety : Safety) (abi : Layout.CallConv)
+    (layoutIdx : Nat) (bytes : List AbstractByte) (sv : ScalarVal)
+    (hdec : decodeScalarBytes bytes false = some (sv, none)) :
+    decodeTypedValueFromBytes (fuel + 1) layouts
+      ⟨.fnPtr inputs output safety abi, layoutIdx⟩ bytes = none := by
+  unfold decodeTypedValueFromBytes normalizeCodecTy
+  exact trusted_decodePtrBytesNoForge_fnptr_provless (layoutPointerBytes layouts) bytes sv hdec
+
+/-- `D4` **Trusted raw-pointer contrast at `decodeTypedValueFromBytes` (universal)**: for EVERY
+mutability and layout table, the same provenance-free byte image of pointer width decodes to
+`.scalar ⟨sv.bits, layoutPointerBytes layouts⟩` at `*const u8` / `*mut u8`, explaining case `23`. -/
+theorem trusted_decodeTypedValueFromBytes_rawU8_provless (fuel : Nat) (layouts : Layout.LayoutTable)
+    (m : Mutability) (layoutIdx : Nat) (bytes : List AbstractByte) (sv : ScalarVal)
+    (hlen : Trusted.Sequence.length bytes = layoutPointerBytes layouts)
+    (hdec : decodeScalarBytes bytes false = some (sv, none)) :
+    decodeTypedValueFromBytes (fuel + 1) layouts
+      ⟨.rawPtr m (.uint .u8), layoutIdx⟩ bytes =
+      some (.scalar ⟨sv.bits, layoutPointerBytes layouts⟩) := by
+  unfold decodeTypedValueFromBytes normalizeCodecTy
+  exact trusted_decodePtrBytesNoForge_raw_provless (.uint .u8) (layoutPointerBytes layouts)
+    bytes sv rfl hlen hdec
+
+/-- `D4` non-vacuity witness for `trusted_decodeTypedValueFromBytes_{fnPtr,rawU8}_provless`:
+8 initialized zero bytes without provenance fail at `wdFnPtrTy` and decode to `0usize` at
+`wdRawU8Ty`. -/
+theorem trusted_decodeTypedValueFromBytes_null_witness :
+    decodeTypedValueFromBytes 8 wdLayouts wdFnPtrTy (List.replicate 8 (.init 0 none)) = none ∧
+    decodeTypedValueFromBytes 8 wdLayouts wdRawU8Ty (List.replicate 8 (.init 0 none)) =
+      some (.scalar ⟨0, 8⟩) :=
+  ⟨trusted_decodeTypedValueFromBytes_fnPtr_provless 7 wdLayouts [] (.uint .u32) .safe .rust 0
+      (List.replicate 8 (.init 0 none)) ⟨0, 8⟩ rfl,
+   trusted_decodeTypedValueFromBytes_rawU8_provless 7 wdLayouts .not 0
+      (List.replicate 8 (.init 0 none)) ⟨0, 8⟩ rfl rfl⟩
+
+/-- `D1` **universal honest Trusted boundary**: `intrinsicWidePointeeStep` returns `.unsupported`
+on EVERY custom ADT pointee (not only the two concrete DST structs). -/
+theorem trusted_intrinsicWidePointeeStep_adt_unsupported (name : DefPath) (args : List RigidTy) :
+    intrinsicWidePointeeStep (.adt name args) = .unsupported := rfl
+
+/-- `D1` **honest Trusted boundary** (concrete instances for cases `6` and `7`). -/
 theorem trusted_intrinsicWidePointeeStep_dst_unsupported :
     intrinsicWidePointeeStep wdHeaderSliceRigid = .unsupported ∧
-    intrinsicWidePointeeStep wdAlign8TailU16Rigid = .unsupported := ⟨rfl, rfl⟩
+    intrinsicWidePointeeStep wdAlign8TailU16Rigid = .unsupported :=
+  ⟨trusted_intrinsicWidePointeeStep_adt_unsupported "wd::HeaderSlice" [],
+   trusted_intrinsicWidePointeeStep_adt_unsupported "wd::Align8TailU16" []⟩
 
 end TrustedRootCauses
 
@@ -1395,6 +1439,26 @@ theorem mr_ptrOffsetInboundsM_oob_witness :
   | error e => rw [h] at hok; cases hok
 
 
+/-- `D3` **Case `19` faithfulness (universal `BasicMemory` no-op retag)**: on `BasicMemory` (`Mach`),
+`MemoryOps.retag_ptr` and `ConcurrentMemory.retag_ptr` are universally the identity regardless of
+`fnEntry` (`Validate(_, true)` installs no protector under `Mach`, matching Trusted's `tb = false`
+no-protector state and LeanMiri's `treeBorrows = false` mode, whereas `MachTB` delegates to
+`TreeBorrowsMemory.retag_ptr` and installs the `FnEntry` protector that rejects case `19`'s write). -/
+theorem mr_basic_retag_ptr_noop (m : BM) (fe : Memory.FrameExtra BM)
+    (ptr : Pointer (Memory.Provenance BM)) (ptrTy : PtrType)
+    (fnEntry fnImplicitWrites : Bool) (vtableLookup : ThinPointer (Memory.Provenance BM) → Interp VTable) :
+    MemoryOps.retag_ptr m fe ptr ptrTy fnEntry fnImplicitWrites vtableLookup =
+      .ok (ptr, m, fe) := rfl
+
+/-- `D3` **Case `19` faithfulness (`ConcurrentMemory.retag_ptr` on `BM`)**: lifts
+`mr_basic_retag_ptr_noop` through `ConcurrentMemory.retag_ptr`, proving that `mrWdProg19`'s
+`.Validate (wdLc 1) true` is universally a no-op under `Mach`. -/
+theorem mr_concurrent_basic_retag_ptr_noop (cm : ConcurrentMemory BM) (fe : Memory.FrameExtra BM)
+    (ptr : Pointer (Memory.Provenance BM)) (ptrTy : PtrType)
+    (fnEntry fnImplicitWrites : Bool) (vtableLookup : ThinPointer (Memory.Provenance BM) → Interp VTable) :
+    ConcurrentMemory.retag_ptr cm fe ptr ptrTy fnEntry fnImplicitWrites vtableLookup =
+      .ok (ptr, cm, fe) := rfl
+
 /-- **`minirust#300` flip canary**: this theorem holds exactly while the pin predates upstream
 `374bf855`. Bumping the pin past `#300` makes pinned `checkPtrM` reject the null `fn()` and breaks
 this statement (and the case `22` table cell), flagging that `checkPtrFnNonNull` /
@@ -1475,7 +1539,9 @@ run_cmd do
       (ns ++ `mr_evalPtrOffsetM_wrapping_compose, `MiniRustSpec.Interp.evalPtrOffsetM),
       (ns ++ `mr_decodeM_union_single_chunk, `MiniRustSpec.Interp.Type.decodeM),
       (ns ++ `trusted_decodePtrBytesNoForge_fnptr_provless, `Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge),
-      (ns ++ `trusted_intrinsicWidePointeeStep_dst_unsupported, `Trusted.Rustc.V2026_06_01.MirSemantics.intrinsicWidePointeeStep),
+      (ns ++ `trusted_decodeTypedValueFromBytes_fnPtr_provless, `Trusted.Rustc.V2026_06_01.MirSemantics.decodeTypedValueFromBytes),
+      (ns ++ `trusted_intrinsicWidePointeeStep_adt_unsupported, `Trusted.Rustc.V2026_06_01.MirSemantics.intrinsicWidePointeeStep),
+      (ns ++ `mr_concurrent_basic_retag_ptr_noop, `MiniRustSpec.Interp.ConcurrentMemory.retag_ptr),
       (ns ++ `mr_encodeM_union_single_chunk, `MiniRustSpec.Interp.Type.encodeM) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"

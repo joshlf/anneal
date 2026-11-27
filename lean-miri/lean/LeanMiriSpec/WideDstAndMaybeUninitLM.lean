@@ -1779,6 +1779,194 @@ theorem lm_initMask_applyCopy_uninit_preserves (size finish : Size) (oldState : 
     hRangeEq, hNotAny, Bool.false_eq_true, ↓reduceIte]
   exact InitMask.full_overwrite_stays_lazy size finish oldState false range hEnd hStart hFull
 
+section MemCopyUniversal
+open Lean Elab Tactic Meta in
+/-- Delta-unfold private `InitMask` / `ProvenanceMap` / `Allocation` helpers in the goal
+(pure definitional unfolding, zero axioms). -/
+local elab "unfold_mem_priv" : tactic => do
+  let mut mvarId ← getMainGoal
+  for target in [`Miri.Memory.sizeBytes,
+                 `Miri.Memory.InitMask.collectChunksAux,
+                 `Miri.Memory.ProvenanceMap.rangeEnd,
+                 `Miri.Memory.ProvenanceMap.adjustedStart,
+                 `Miri.Memory.ProvenanceMap.rangeEntries,
+                 `Miri.Memory.ProvenanceMap.subtractSize,
+                 `Miri.Memory.Allocation.prepareForOverwrite,
+                 `Miri.Memory.Allocation.checkedSlice,
+                 `Miri.Memory.Allocation.setInitialization,
+                 `Miri.Memory.Allocation.runProvenanceMutation] do
+    let env ← getEnv
+    let mut privs : Array Name := #[]
+    for (c, _) in env.constants.map₁.toList do
+      if privateToUserName? c == some target then
+        privs := privs.push c
+    for p in privs do
+      let (ty, r) ← mvarId.withContext do
+        let ty ← mvarId.getType
+        let r ← Lean.Meta.unfold ty p
+        pure (ty, r)
+      if r.expr != ty then
+        mvarId ← mvarId.withContext do
+          match r.proof? with
+          | some pf => mvarId.replaceTargetEq r.expr pf
+          | none => mvarId.replaceTargetDefEq r.expr
+  replaceMainGoal [mvarId]
+
+private theorem allocRange_endExclusive_props (range : AllocRange) (finish : Size)
+    (hEnd : range.endExclusive = .ok finish) :
+    range.start.bytes + range.size.bytes = finish.bytes ∧
+    range.start.bytes.toNat + range.size.bytes.toNat = finish.bytes.toNat ∧
+    range.start.bytes ≤ finish.bytes ∧
+    finish.bytes - range.start.bytes = range.size.bytes := by
+  unfold AllocRange.endExclusive AllocRange.end Size.add at hEnd
+  simp only [Except.mapError, Size.ofBytes] at hEnd
+  by_cases hlt : range.start.bytes + range.size.bytes < range.start.bytes
+  · simp only [hlt, ↓reduceIte] at hEnd; cases hEnd
+  · simp only [hlt, ↓reduceIte, Except.ok.injEq] at hEnd
+    rw [UInt64.lt_iff_toNat_lt] at hlt
+    have hsum : (range.start.bytes + range.size.bytes).toNat =
+        range.start.bytes.toNat + range.size.bytes.toNat := by
+      have ha := range.start.bytes.toNat_lt
+      have hb := range.size.bytes.toNat_lt
+      rw [UInt64.toNat_add] at hlt ⊢
+      by_cases hov : range.start.bytes.toNat + range.size.bytes.toNat < 2 ^ 64
+      · exact Nat.mod_eq_of_lt hov
+      · have hmod : (range.start.bytes.toNat + range.size.bytes.toNat) % 2 ^ 64 =
+            range.start.bytes.toNat + range.size.bytes.toNat - 2 ^ 64 := by
+          have : range.start.bytes.toNat + range.size.bytes.toNat < 2 * 2 ^ 64 := by omega
+          omega
+        omega
+    have hEq : finish.bytes = range.start.bytes + range.size.bytes := by rw [← hEnd]
+    refine ⟨hEq.symm, by rw [hEq, hsum], ?_, ?_⟩
+    · rw [hEq, UInt64.le_iff_toNat_le, hsum]; omega
+    · apply UInt64.toNat_inj.mp
+      rw [hEq, UInt64.toNat_sub_of_le _ _ (by rw [UInt64.le_iff_toNat_le, hsum]; omega), hsum]
+      omega
+
+/-- `D2` **TRUE UNIVERSAL `InitMask.prepareCopy` law**: for EVERY `srcSize` and EVERY non-empty
+in-bounds `range`, `prepareCopy` on a lazy-uninitialized `InitMask` succeeds and produces the
+single-run uninitialized `InitCopy` (`noBytesInit = true`). -/
+theorem lm_initMask_prepareCopy_lazy_uninit (srcSize : Size) (range : AllocRange) (finish : Size)
+    (hNe : range.size.bytes ≠ 0)
+    (hEnd : range.endExclusive = .ok finish)
+    (hIn : finish.bytes ≤ srcSize.bytes) :
+    (InitMask.new srcSize false).prepareCopy range = .ok ⟨false, #[range.size.bytes]⟩ := by
+  obtain ⟨_, hNatSum, hLe, hSub⟩ := allocRange_endExclusive_props range finish hEnd
+  have hPosNat : 0 < range.size.bytes.toNat := by
+    cases h : range.size.bytes.toNat with
+    | zero =>
+      exact absurd (UInt64.toNat_inj.mp (by simpa using h)) hNe
+    | succ k => omega
+  have hStartLt : range.start.bytes < finish.bytes := by
+    rw [UInt64.lt_iff_toNat_lt]; omega
+  have hNotGt : ¬ srcSize.bytes < finish.bytes := UInt64.not_lt.mpr hIn
+  have hNotStartGt : ¬ finish.bytes < range.start.bytes := UInt64.not_lt.mpr hLe
+  have hNotFinishLe : ¬ finish.bytes ≤ range.start.bytes := UInt64.not_le.mpr hStartLt
+  have hRangeIter : (InitMask.new srcSize false).rangeAsInitChunks range =
+      .ok ⟨InitMask.new srcSize false, false, range.start, finish⟩ := by
+    unfold InitMask.rangeAsInitChunks
+    simp only [hEnd, InitMask.new, bind, Except.bind, pure, Except.pure, gt_iff_lt, hNotGt,
+      ↓reduceIte, hStartLt]
+    rfl
+  let iter0 : InitChunkIter := ⟨InitMask.new srcSize false, false, range.start, finish⟩
+  let iter1 : InitChunkIter := ⟨InitMask.new srcSize false, true, finish, finish⟩
+  have hNext0 : iter0.next? = .ok (some (.Uninit range.start finish, iter1)) := by
+    unfold InitChunkIter.next?
+    unfold_mem_priv
+    have hge : ¬ (finish.bytes.toNat ≤ range.start.bytes.toNat) := by omega
+    simp only [iter0, iter1, InitMask.new, gt_iff_lt, hNotStartGt, hNotGt, decide_false,
+      Bool.or_self, Bool.false_eq_true, ↓reduceIte, ge_iff_le, hge, bne_self_eq_false,
+      hNotFinishLe, bind, Except.bind, pure, Except.pure, Bool.not_false]
+  have hNext1 : iter1.next? = .ok none := by
+    unfold InitChunkIter.next?
+    unfold_mem_priv
+    have hnl : ¬ finish.bytes < finish.bytes := UInt64.lt_irrefl _
+    simp only [iter1, InitMask.new, gt_iff_lt, hnl, hNotGt, decide_false, Bool.or_self,
+      Bool.false_eq_true, ↓reduceIte, ge_iff_le, Nat.le_refl, pure, Except.pure]
+  have hFuel1 : finish.bytes.toNat - range.start.bytes.toNat =
+      (finish.bytes.toNat - range.start.bytes.toNat - 1) + 1 := by omega
+  have hCollect : InitMask.collectChunks ⟨InitMask.new srcSize false, false, range.start, finish⟩ =
+      .ok #[.Uninit range.start finish] := by
+    change InitMask.collectChunks iter0 = .ok #[.Uninit range.start finish]
+    unfold InitMask.collectChunks
+    unfold_mem_priv
+    simp only [hNext0, bind, Except.bind]
+    have hFuel1' : iter0.finish.bytes.toNat - iter0.start.bytes.toNat =
+        (finish.bytes.toNat - range.start.bytes.toNat - 1) + 1 := hFuel1
+    rw [hFuel1']
+    unfold_mem_priv
+    simp only [hNext1, bind, Except.bind, pure, Except.pure]
+    rfl
+  have hFromEnd : AllocRange.fromEndpoints range.start finish = .ok ⟨range.start, range.size⟩ := by
+    unfold AllocRange.fromEndpoints Size.sub
+    simp only [hNotStartGt, ↓reduceIte, hSub, Except.mapError, Size.ofBytes, bind, Except.bind,
+      pure, Except.pure]
+  have hBeqFalse : (range.size.bytes == 0) = false := beq_false_of_ne hNe
+  unfold InitMask.prepareCopy
+  simp only [hBeqFalse, Bool.false_eq_true, ↓reduceIte, hRangeIter, hCollect,
+    bind, Except.bind, pure, Except.pure]
+  have hGet0 : (#[InitChunk.Uninit range.start finish])[0]? =
+      some (InitChunk.Uninit range.start finish) := rfl
+  rw [hGet0]
+  simp [InitChunk.isInit, InitChunk.range, hFromEnd, bind, Except.bind, pure, Except.pure]
+
+/-- `D2` **universal `ProvenanceMap.prepareCopy` law on empty provenance**: preparing a copy from
+an allocation with `ProvenanceMap.new` always returns an empty `ProvenanceCopy`. -/
+theorem lm_provenanceMap_prepareCopy_new {Prov : Type} (range : AllocRange) (finish : Size)
+    (data : Array UInt8) (pointerSize : Size)
+    (hPos : pointerSize.bytes ≠ 0)
+    (hEnd : range.endExclusive = .ok finish) :
+    (ProvenanceMap.new (Prov := Prov)).prepareCopy range data pointerSize = .ok ⟨#[], #[]⟩ := by
+  obtain ⟨_, hNatSum, _, _⟩ := allocRange_endExclusive_props range finish hEnd
+  have hPosBeq : (pointerSize.bytes == 0) = false := beq_false_of_ne hPos
+  have hRangePtrsEmpty : ∀ r fin, r.endExclusive = .ok fin →
+      (ProvenanceMap.new (Prov := Prov)).rangePtrs r pointerSize = .ok #[] := by
+    intro r fin hr
+    unfold ProvenanceMap.rangePtrs
+    unfold_mem_priv
+    simp only [ProvenanceMap.new, hPosBeq, Bool.false_eq_true, ↓reduceIte, hr,
+      Except.mapError, bind, Except.bind, pure, Except.pure]
+    rfl
+  have hStartZero : (allocRange range.start Size.ZERO).endExclusive = .ok range.start := by
+    cases range.start with | mk b =>
+    unfold AllocRange.endExclusive AllocRange.end allocRange Size.ZERO Size.add Size.ofBytes
+    have h0 : b + 0 = b := UInt64.add_zero b
+    have hlt : ¬ b < b := UInt64.lt_irrefl b
+    simp [Except.mapError, h0, hlt]
+  have hFinZero : (allocRange finish Size.ZERO).endExclusive = .ok finish := by
+    cases finish with | mk b =>
+    unfold AllocRange.endExclusive AllocRange.end allocRange Size.ZERO Size.add Size.ofBytes
+    have h0 : b + 0 = b := UInt64.add_zero b
+    have hlt : ¬ b < b := UInt64.lt_irrefl b
+    simp [Except.mapError, h0, hlt]
+  have hEmptyFilter : ∀ (a b : Size),
+      (Array.filter (fun (entry : Size × Prov) => decide (a.bytes ≤ entry.1.bytes) &&
+        decide (entry.1.bytes < b.bytes)) #[]) = #[] := fun _ _ => rfl
+  have hRp1 := hRangePtrsEmpty _ _ hStartZero
+  have hRp2 := hRangePtrsEmpty _ _ hFinZero
+  unfold ProvenanceMap.new at hRp1 hRp2
+  unfold ProvenanceMap.prepareCopy
+  unfold_mem_priv
+  simp only [hPosBeq, Bool.false_eq_true, ↓reduceIte, hEnd, Except.mapError,
+    bind, Except.bind, pure, Except.pure]
+  by_cases hge : pointerSize.bytes ≤ range.size.bytes
+  · have hSubOk : ¬ finish.bytes < pointerSize.bytes - 1 := by
+      rw [UInt64.lt_iff_toNat_lt]
+      have h1 : 0 < pointerSize.bytes.toNat := by
+        cases h : pointerSize.bytes.toNat with
+        | zero => exact absurd (UInt64.toNat_inj.mp (by simpa using h)) hPos
+        | succ k => omega
+      have hle : pointerSize.bytes.toNat ≤ range.size.bytes.toNat :=
+        UInt64.le_iff_toNat_le.mp hge
+      have hsub : (pointerSize.bytes - 1).toNat = pointerSize.bytes.toNat - 1 := by
+        rw [UInt64.toNat_sub_of_le _ _ (by rw [UInt64.le_iff_toNat_le]; simp; omega)]
+        simp
+      omega
+    have hEmptyP : (ProvenanceMap.new (Prov := Prov)).ptrs = #[] := rfl
+    simp only [ge_iff_le, hge, ↓reduceIte, Size.sub, Size.ofBytes, hSubOk, hEmptyP, hEmptyFilter]
+    simp [ProvenanceMap.new, hRp1, hRp2, pure, Except.pure]
+  · simp [ge_iff_le, hge, ProvenanceMap.new, hRp1, hRp2]
+
 /-- `D2` **universal `readScalar` UB law**: vendored `Allocation.readScalar` faults with `invalidUninitBytes` whenever the `InitMask` reports an uninitialized sub-range, for every allocation, layout, and range. -/
 theorem lm_readScalar_uninit_ub {Prov Extra : Type} [DecidableEq Prov] [PointerProvenance Prov]
     (a : Allocation Prov Extra) (layout : TargetDataLayout) (range : AllocRange) (rp : Bool)
@@ -1787,6 +1975,172 @@ theorem lm_readScalar_uninit_ub {Prov Extra : Type} [DecidableEq Prov] [PointerP
   unfold Allocation.initializationMask at h
   simp only [Allocation.readScalar, h]
   rfl
+
+/-- `D2` **TRUE UNIVERSAL `Allocation.copy` uninit-propagation law**: for EVERY allocation size
+`n > 0`, EVERY provenance/extra type, EVERY lazy-uninitialized source `src`, EVERY in-bounds
+`sourceRange` of size `dst.byteSize`, and EVERY mutable provenance-free destination `dst` (even
+one that was previously initialized!), vendored `Allocation.copy` succeeds WITHOUT UB and leaves
+the destination lazily uninitialized (`InitMask.new dst.byteSize false`), so every in-bounds
+subrange reports uninitialized and every typed `Allocation.readScalar` faults with
+`invalidUninitBytes`. -/
+theorem lm_allocation_copy_uninit_preserves {Prov Extra : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (src dst : Allocation Prov Extra) (sourceRange : AllocRange) (srcEnd : Size)
+    (ptrSize : Size) (sameAlloc nonoverlapping : Bool) (oldInit : Bool)
+    (hSrcLen : src.len = src.byteSize.bytes.toNat)
+    (hSrcInit : src.initializationMask = InitMask.new src.byteSize false)
+    (hSrcProv : src.provenanceMap = ProvenanceMap.new)
+    (hSrcEnd : sourceRange.endExclusive = .ok srcEnd)
+    (hSrcIn : srcEnd.bytes ≤ src.byteSize.bytes)
+    (hSizeEq : sourceRange.size = dst.byteSize)
+    (hNonZero : dst.byteSize.bytes ≠ 0)
+    (hDstLen : dst.len = dst.byteSize.bytes.toNat)
+    (hDstMut : dst.mutability = .Mut)
+    (hDstInit : dst.initializationMask = InitMask.new dst.byteSize oldInit)
+    (hDstProv : dst.provenanceMap = ProvenanceMap.new)
+    (hPtrPos : ptrSize.bytes ≠ 0) :
+    ∃ dst',
+      Allocation.copy src sourceRange Size.ZERO ptrSize sameAlloc nonoverlapping dst = .ok () dst' ∧
+      dst'.byteSize = dst.byteSize ∧
+      dst'.initializationMask = InitMask.new dst.byteSize false ∧
+      (∀ r fin, r.endExclusive = .ok fin → fin.bytes ≤ dst'.byteSize.bytes →
+        dst'.initializationMask.isRangeInitialized r = .ok (.error r)) ∧
+      (∀ layout r fin rp, r.endExclusive = .ok fin → fin.bytes ≤ dst'.byteSize.bytes →
+        dst'.readScalar layout r rp = .error (.invalidUninitBytes (some ⟨r, r⟩))) := by
+  obtain ⟨_, _, hSrcLe, _⟩ := allocRange_endExclusive_props sourceRange srcEnd hSrcEnd
+  have hSrcNe : sourceRange.size.bytes ≠ 0 := by rw [hSizeEq]; exact hNonZero
+  have hMul1 : Size.mul dst.byteSize 1 = .ok dst.byteSize := by
+    have h1 : dst.byteSize.bytes * 1 = dst.byteSize.bytes := UInt64.mul_one _
+    have hd : dst.byteSize.bytes / 1 = dst.byteSize.bytes := UInt64.div_one
+    simp [Size.mul, h1, hd, Size.ofBytes]
+  have hDstEnd : (allocRange Size.ZERO dst.byteSize).endExclusive = .ok dst.byteSize := by
+    cases h : dst.byteSize with | mk b =>
+    unfold AllocRange.endExclusive AllocRange.end allocRange Size.ZERO Size.add Size.ofBytes
+    have h0 : (0 : UInt64) + b = b := UInt64.zero_add b
+    have hlt : ¬ b < 0 := UInt64.not_lt_zero
+    simp [Except.mapError, h0, hlt]
+  have hNotSrcGt : ¬ srcEnd.bytes < sourceRange.start.bytes := UInt64.not_lt.mpr hSrcLe
+  have hNotSrcIn : ¬ src.byteSize.bytes < srcEnd.bytes := UInt64.not_lt.mpr hSrcIn
+  have hSrcInitCopy : src.initializationMask.prepareCopy sourceRange =
+      .ok ⟨false, #[sourceRange.size.bytes]⟩ := by
+    rw [hSrcInit]
+    exact lm_initMask_prepareCopy_lazy_uninit src.byteSize sourceRange srcEnd hSrcNe hSrcEnd hSrcIn
+  have hDstSetFalse : (InitMask.new dst.byteSize true).setRange (allocRange Size.ZERO dst.byteSize) false =
+      .ok (InitMask.new dst.byteSize false) :=
+    InitMask.full_overwrite_stays_lazy dst.byteSize dst.byteSize true false
+      (allocRange Size.ZERO dst.byteSize) hDstEnd rfl (UInt64.le_refl _)
+  have hNonZeroBeq : (dst.byteSize.bytes == 0) = false := beq_false_of_ne hNonZero
+  have hCopy : ∃ dst',
+      Allocation.copy src sourceRange Size.ZERO ptrSize sameAlloc nonoverlapping dst = .ok () dst' ∧
+      dst'.byteSize = dst.byteSize ∧
+      dst'.initializationMask = InitMask.new dst.byteSize false := by
+    have hSrcProvRaw : ∀ raw, src.provenanceMap.prepareCopy sourceRange raw ptrSize = .ok ⟨#[], #[]⟩ := by
+      intro raw; rw [hSrcProv]
+      exact lm_provenanceMap_prepareCopy_new sourceRange srcEnd raw ptrSize hPtrPos hSrcEnd
+    have hDstClearRaw : ∀ raw, ProvenanceMap.clear (allocRange Size.ZERO dst.byteSize) raw ptrSize
+        dst.provenanceMap = .ok () ProvenanceMap.new := by
+      intro raw; rw [hDstProv]
+      exact ProvenanceMap.clear_new (allocRange Size.ZERO dst.byteSize) raw ptrSize dst.byteSize hPtrPos hDstEnd
+    have hClearNew : ∀ raw, ProvenanceMap.clear (allocRange Size.ZERO dst.byteSize) raw ptrSize
+        (ProvenanceMap.new (Prov := Prov)) = .ok () ProvenanceMap.new := by
+      intro raw
+      exact ProvenanceMap.clear_new (allocRange Size.ZERO dst.byteSize) raw ptrSize dst.byteSize hPtrPos hDstEnd
+    have hDstSetTrue : dst.initializationMask.setRange (allocRange Size.ZERO dst.byteSize) true =
+        .ok (InitMask.new dst.byteSize true) := by
+      rw [hDstInit]
+      exact InitMask.full_overwrite_stays_lazy dst.byteSize dst.byteSize oldInit true
+        (allocRange Size.ZERO dst.byteSize) hDstEnd rfl (UInt64.le_refl _)
+    have hNotZeroGt : ¬ dst.byteSize.bytes < 0 := UInt64.not_lt_zero
+    have hNotSelfLt : ¬ dst.byteSize.bytes < dst.byteSize.bytes := UInt64.lt_irrefl _
+    refine ⟨?dst', ?hOk, ?hSz, ?hMask⟩
+    case hOk =>
+      unfold Allocation.copy Allocation.copyRepeatedly Allocation.writeUninit
+      unfold_mem_priv
+      dsimp only [Allocation.len, Allocation.byteSize, Allocation.initializationMask, Allocation.provenanceMap, allocRange, Size.ZERO, Size.ofBytes] at hSrcLen hDstLen hDstInit hDstProv hSrcInitCopy hSrcProvRaw hDstClearRaw hClearNew hDstSetTrue hDstSetFalse hSizeEq hNonZeroBeq hNotZeroGt hNotSelfLt hNotSrcIn hDstEnd hMul1
+      simp only [Id.run, hSrcLen, hDstLen, hDstMut, bne_self_eq_false, Bool.false_eq_true,
+        ↓reduceIte, hSrcEnd, hNotSrcGt, hNotSrcIn, decide_false, Bool.or_self, gt_iff_lt,
+        hSizeEq, hMul1, hDstEnd, hNotZeroGt, hNotSelfLt, hSrcProvRaw, hSrcInitCopy,
+        InitCopy.noBytesInit, Bool.not_false, hNonZeroBeq,
+        hDstSetTrue, hDstSetFalse, hDstClearRaw, hClearNew, Except.mapError, bind, Except.bind,
+        pure, Except.pure, allocRange, Size.ZERO]
+      rfl
+    case hSz => rfl
+    case hMask => rfl
+  obtain ⟨dst', hOk, hSz, hMask⟩ := hCopy
+  refine ⟨dst', hOk, hSz, hMask, ?_, ?_⟩
+  · intro r fin hEnd hIn
+    rw [hMask]
+    rw [hSz] at hIn
+    exact InitMask.lazy_uninitialized_query dst.byteSize r fin hEnd hIn
+  · intro layout r fin rp hEnd hIn
+    apply lm_readScalar_uninit_ub dst' layout r rp r
+    rw [hMask]
+    rw [hSz] at hIn
+    exact InitMask.lazy_uninitialized_query dst.byteSize r fin hEnd hIn
+
+/-- `D2` concrete non-vacuity witness for `lm_allocation_copy_uninit_preserves`: copying a fresh
+4-byte `Allocation.tryNew .Uninit` into an already-initialized 4-byte `Allocation.tryNew .Zero`
+succeeds and turns the destination lazily uninitialized. -/
+theorem lm_allocation_copy_uninit_witness :
+    ∃ src dst dst' : Allocation Provenance Unit,
+      Allocation.tryNew (Size.ofBytes 4) ⟨2⟩ .Uninit
+        (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) = .ok src ∧
+      Allocation.tryNew (Size.ofBytes 4) ⟨2⟩ .Zero
+        (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) = .ok dst ∧
+      Allocation.copy src (allocRange Size.ZERO (Size.ofBytes 4)) Size.ZERO
+        (Size.ofBytes 8) false true dst = .ok () dst' ∧
+      dst'.initializationMask = InitMask.new (Size.ofBytes 4) false := by
+  have hSrcOk : (Allocation.tryNew (Prov := Provenance) (Size.ofBytes 4) ⟨2⟩ .Uninit
+      (fun sz _ => some (Array.replicate sz.bytes.toNat 0))).toBool = true := by decide +kernel
+  have hDstOk : (Allocation.tryNew (Prov := Provenance) (Size.ofBytes 4) ⟨2⟩ .Zero
+      (fun sz _ => some (Array.replicate sz.bytes.toNat 0))).toBool = true := by decide +kernel
+  cases hs : Allocation.tryNew (Prov := Provenance) (Size.ofBytes 4) ⟨2⟩ .Uninit
+      (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) with
+  | error _ => rw [hs] at hSrcOk; cases hSrcOk
+  | ok src =>
+    cases hd : Allocation.tryNew (Prov := Provenance) (Size.ofBytes 4) ⟨2⟩ .Zero
+        (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) with
+    | error _ => rw [hd] at hDstOk; cases hDstOk
+    | ok dst =>
+      have hSrcProp : src.len = src.byteSize.bytes.toNat ∧
+          src.byteSize = Size.ofBytes 4 ∧
+          src.initializationMask = InitMask.new src.byteSize false ∧
+          src.provenanceMap = ProvenanceMap.new := by
+        have hCheck : (do
+            let s ← Allocation.tryNew (Prov := Provenance) (Size.ofBytes 4) ⟨2⟩ .Uninit
+              (fun sz _ => some (Array.replicate sz.bytes.toNat 0))
+            pure (s.len == s.byteSize.bytes.toNat && s.byteSize == Size.ofBytes 4 &&
+              s.initializationMask == InitMask.new s.byteSize false &&
+              s.provenanceMap == ProvenanceMap.new)) = .ok true := by decide +kernel
+        rw [hs] at hCheck
+        simp only [bind, Except.bind, pure, Except.pure, Except.ok.injEq,
+          Bool.and_eq_true, beq_iff_eq] at hCheck
+        exact ⟨hCheck.1.1.1, hCheck.1.1.2, hCheck.1.2, hCheck.2⟩
+      have hDstProp : dst.len = dst.byteSize.bytes.toNat ∧
+          dst.byteSize = Size.ofBytes 4 ∧
+          dst.mutability = Miri.Memory.Mutability.Mut ∧
+          dst.initializationMask = InitMask.new dst.byteSize true ∧
+          dst.provenanceMap = ProvenanceMap.new := by
+        have hCheck : (do
+            let d ← Allocation.tryNew (Prov := Provenance) (Size.ofBytes 4) ⟨2⟩ .Zero
+              (fun sz _ => some (Array.replicate sz.bytes.toNat 0))
+            pure (d.len == d.byteSize.bytes.toNat && d.byteSize == Size.ofBytes 4 &&
+              d.mutability == Miri.Memory.Mutability.Mut &&
+              d.initializationMask == InitMask.new d.byteSize true &&
+              d.provenanceMap == ProvenanceMap.new)) = .ok true := by decide +kernel
+        rw [hd] at hCheck
+        simp only [bind, Except.bind, pure, Except.pure, Except.ok.injEq,
+          Bool.and_eq_true, beq_iff_eq] at hCheck
+        exact ⟨hCheck.1.1.1.1, hCheck.1.1.1.2, hCheck.1.1.2, hCheck.1.2, hCheck.2⟩
+      obtain ⟨dst', hCopy, _, hMask, _, _⟩ := lm_allocation_copy_uninit_preserves
+        src dst (allocRange Size.ZERO (Size.ofBytes 4)) (Size.ofBytes 4) (Size.ofBytes 8)
+        false true true
+        hSrcProp.1 hSrcProp.2.2.1 hSrcProp.2.2.2 (by decide)
+        (by rw [hSrcProp.2.1]; exact UInt64.le_refl _)
+        hDstProp.2.1.symm (by rw [hDstProp.2.1]; decide)
+        hDstProp.1 hDstProp.2.2.1 hDstProp.2.2.2.1 hDstProp.2.2.2.2 (by decide)
+      exact ⟨src, dst, dst', rfl, rfl, hCopy, by rw [hMask, hDstProp.2.1]⟩
+
+end MemCopyUniversal
 
 /-- `D2` **universal `bool` validity law** (`kani#5205` / `#5196`): vendored `Validity.checkPrimitive .boolean` rejects every scalar whose `toBool` reports `invalidBool v`. -/
 theorem lm_checkPrimitive_bool_invalid {Prov ME HS : Type} [PointerProvenance Prov]
@@ -1949,6 +2303,187 @@ theorem lm_checkScalar_fnptr_int {HS : Type} (i : ScalarInt) (bits : U128)
 
 end UniversalLaws
 
+/-! ## §3b. Direct Vendored `Miri.Interpreter.Step.step` Execution on Shared `CapturedMir` Fixtures -/
+
+section StepDriver
+open Miri.ABI Miri.Memory Miri.Interpreter LeanMiriSpec.Correspondence
+
+/-- `CastHooks` overlay over `annealCastHooksLM2_2` wiring `.Transmute` (`copyAllowTransmute`)
+through unmodified vendored `Miri.Memory.Validity.checkScalar` against the target layout's
+`validRange` (`pointerLayoutData true` for `fn() -> u32`, `pointerLayoutData false` for `*const u8`). -/
+def wdCastHooks (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    Miri.Interpreter.CastHooks
+      AnnealProv AnnealStepState Unit (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  { annealCastHooksLM2_2 layouts with
+    typeInfo := fun _ tyId =>
+      if tyId == 40 then pure (.rawPointer 51)
+      else match castTypeInfoOfEncodedTyId tyId with
+      | .ok info => pure info
+      | .error err => throw err
+    copyAllowTransmute := fun _ src dest => do
+      let imm ← annealReadImmediateLM2_2 src
+      match imm.imm, dest.layout.layout.backendRepr with
+      | .scalar s, .Scalar (.Initialized (validRange := vr) ..) =>
+        let lay : ScalarValidityLayout := ⟨dest.layout.layout.size, vr⟩
+        match Validity.checkScalar (MachineError := Unit) (HookState := Unit)
+            lay s (fun _ st => .error () st) () with
+        | .ok () _ => annealWriteImmediateLM2_2 imm.imm dest
+        | .error _ _ => throw (.undefinedBehavior "invalid scalar value in transmute")
+      | _, _ => annealWriteImmediateLM2_2 imm.imm dest }
+
+/-- `StepHooks` over `annealStepHooksLM2_2` using `wdCastHooks` for `CastKind.Transmute` /
+`*const [u32; 3] -> *const u8` and `toRef` for `&raw const _1` (`Rvalue.RawPtr`). -/
+def wdStepHooks (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    Miri.Interpreter.StepHooks
+      AnnealProv Miri.Interpreter.LocalLayout Unit AnnealMachine Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  let rvHooks := { annealRvalueHooksLM2_2 body.localDecls body.layouts with
+    toRef := fun _ mp =>
+      match mp.metadata with
+      | .none =>
+        match Scalar.fromMaybePointer annealTargetDataLayout mp.ptr with
+        | .ok sc => pure (.scalar sc)
+        | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err)
+      | .metadata m =>
+        match Scalar.fromMaybePointer annealTargetDataLayout mp.ptr with
+        | .ok sc => pure (.scalarPair sc m)
+        | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err)
+    cast := fun c src kind ty dest =>
+      Miri.Interpreter.Cast.cast (wdCastHooks body.layouts) c 16 src kind ty dest }
+  { annealStepHooksLM2_2 body.localDecls body.layouts with
+    assign := fun choice place rvalue state =>
+      Miri.Interpreter.runRvalue
+        (Miri.Interpreter.evalRvalueIntoPlace rvHooks choice rvalue place) state }
+
+/-- Multi-step execution of unmodified vendored `Miri.Interpreter.Step.step` directly over a
+translated `CapturedMir` body. -/
+def wdRunMiriSteps
+    (hooks : Miri.Interpreter.StepHooks AnnealProv Miri.Interpreter.LocalLayout Unit AnnealMachine
+      Unit (Miri.Interpreter.RuntimePlace AnnealProv))
+    (steps : Nat) (st : AnnealStepState) :
+    Except StepError (Option (Miri.Interpreter.LocalValue AnnealProv)) :=
+  match steps with
+  | 0 => .error (.unsupported "out of fuel")
+  | n + 1 =>
+    let lastRet := st.stack.frames[0]?.bind (fun f => f.locals[0]?.map (·.value))
+    let (st', res) := Miri.Interpreter.Step.step hooks () st
+    match res with
+    | .error e => .error e
+    | .ok true =>
+      if st'.stack.frames.isEmpty then .ok lastRet
+      else wdRunMiriSteps hooks n st'
+    | .ok false => .ok (st'.stack.frames[0]?.bind (fun f => f.locals[0]?.map (·.value)))
+
+/-- Build the initial `AnnealStepState` for a shared `CapturedMir` fixture via `translateBody`. -/
+def wdMkStepState (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+    (retTy : Trusted.Rustc.V2026_06_01.MirAst.Ty)
+    (locs : Array (Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout))
+    (mach : AnnealMachine := AnnealMachine.empty) : AnnealStepState :=
+  { stack := { frames := #[{
+      body := translateBody body,
+      bodyIdentity := .ofCanonicalIndex 0,
+      functionInstance := { kind := .Item 0, args := #[] },
+      extra := (), returnContinuation := .stop false,
+      returnPlace := .frameLocal 0 0 none (translateTy retTy body.layouts) (.ofAllocationToken 0),
+      localsIdentity := .ofAllocationToken 0, locals := locs, vaList := #[],
+      trackCallerArg := none, location := .mir ⟨0, 0⟩ }] },
+    machine := mach }
+
+private def wdStepAid1 : AllocId := ⟨1, by decide⟩
+private def wdStepBase1 : UInt64 := 4294967296
+
+private def wdStepUInt (bits : Nat) (sz : UInt64) : Scalar AnnealProv :=
+  match Scalar.fromUInt (BitVec.ofNat 128 bits) (Size.ofBytes sz) with
+  | .ok s => s
+  | .error _ => Scalar.fromPointer annealTargetDataLayout ⟨.ZERO, .wildcard⟩
+
+private def wdStepFnPtr1 : Scalar AnnealProv :=
+  Scalar.fromPointer annealTargetDataLayout
+    ⟨Size.ofBytes wdStepBase1, .concrete wdStepAid1 .one⟩
+
+private def wdStepArr3Mach : AnnealMachine :=
+  match Allocation.fromBytes (Prov := AnnealProv)
+      #[100, 0, 0, 0, 200, 0, 0, 0, 300, 0, 0, 0] ⟨2⟩ .Mut with
+  | .ok a =>
+    { AnnealMachine.empty with
+      memory := { (MemoryState.empty : AnnealMemory) with live := #[(wdStepAid1, ⟨.stack, a.withExtra none⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨wdStepAid1, wdStepBase1⟩] } }
+  | .error _ => AnnealMachine.empty
+
+private def wdStepD3Locals (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    Array (Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) :=
+  let lays := body.localDecls.map (fun d => some (translateTy d.ty body.layouts))
+  let arrMp : Miri.Interpreter.MemPlace AnnealProv :=
+    ⟨⟨Size.ofBytes wdStepBase1, some (.concrete wdStepAid1 .one)⟩, .none, none⟩
+  (lays.zipIdx.map fun (l, idx) =>
+    if idx == 1 then ⟨.live (.indirect arrMp), l⟩
+    else ⟨.live (.immediate .uninit), l⟩).toArray
+
+private def wdStepIsUb : Except StepError (Option (Miri.Interpreter.LocalValue AnnealProv)) → Bool
+  | .error (.undefinedBehavior _) => true
+  | _ => false
+
+/-- `D3` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase14Mir`**: stepping the
+translated `CapturedMir` fixture (`*const [u32;3] -> *const u8 -> +4 -> *const u32 -> +1 -> -1 -> *p`)
+through unmodified `Miri.Interpreter.Step.step` + `ptrOffsetInbounds` returns `u32` `200`, matching
+`lmWdObserve _ 14 = .okScalar 200`. -/
+theorem lm_step_wdCase14_ok :
+    wdRunMiriSteps (wdStepHooks wdCase14Mir) 16
+      (wdMkStepState wdCase14Mir wdU32Ty (wdStepD3Locals wdCase14Mir) wdStepArr3Mach) =
+      .ok (some (.live (.immediate (.scalar (wdStepUInt 200 4))))) := by
+  decide +kernel
+
+/-- `D3` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase16Mir`**: stepping the
+translated `CapturedMir` fixture (`offset(+100)` past the 12-byte array, no deref) through
+unmodified `Miri.Interpreter.Step.step` + `ptrOffsetInbounds` faults with `.undefinedBehavior`,
+matching `lmWdObserve _ 16 = .ub`. -/
+theorem lm_step_wdCase16_oob_ub :
+    wdStepIsUb (wdRunMiriSteps (wdStepHooks wdCase16Mir) 16
+      (wdMkStepState wdCase16Mir wdU32Ty (wdStepD3Locals wdCase16Mir) wdStepArr3Mach)) = true := by
+  decide +kernel
+
+/-- `D4` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase20Mir`**: stepping
+`transmute::<fn() -> u32, fn() -> u32>` on a live non-null function pointer through unmodified
+`Miri.Interpreter.Step.step` + `Cast.cast` + `Validity.checkScalar` preserves the concrete
+function-pointer scalar, matching `lmWdObserve _ 20 = .okFnPtr 1`. -/
+theorem lm_step_wdCase20_fnptr_ok :
+    let fnLay := some (translateTy wdFnPtrTy wdCase20Mir.layouts)
+    wdRunMiriSteps (wdStepHooks wdCase20Mir) 8
+      (wdMkStepState wdCase20Mir wdFnPtrTy
+        #[⟨.live (.immediate .uninit), fnLay⟩, ⟨.live (.immediate (.scalar wdStepFnPtr1)), fnLay⟩]) =
+      .ok (some (.live (.immediate (.scalar wdStepFnPtr1)))) := by
+  decide +kernel
+
+/-- `D4` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase21Mir`**: stepping
+`transmute::<usize, fn() -> u32>(0)` through unmodified `Miri.Interpreter.Step.step` + `Cast.cast`
++ `Validity.checkScalar` at `pointerLayoutData true` faults with `.undefinedBehavior`, matching
+`lmWdObserve _ 21 = .ub`. -/
+theorem lm_step_wdCase21_null_fnptr_ub :
+    let fnLay := some (translateTy wdFnPtrTy wdCase21Mir.layouts)
+    let usLay := some (translateTy wdUsizeTy wdCase21Mir.layouts)
+    wdRunMiriSteps (wdStepHooks wdCase21Mir) 8
+      (wdMkStepState wdCase21Mir wdFnPtrTy
+        #[⟨.live (.immediate .uninit), fnLay⟩,
+          ⟨.live (.immediate (.scalar (wdStepUInt 0 8))), usLay⟩]) =
+      .error (.undefinedBehavior "invalid scalar value in transmute") := by
+  decide +kernel
+
+/-- `D4` **direct `Miri.Interpreter.Step.step` execution of shared `wdCase23Mir`**: stepping
+`transmute::<usize, *const u8>(0)` through unmodified `Miri.Interpreter.Step.step` + `Cast.cast`
++ `Validity.checkScalar` at `pointerLayoutData false` accepts `0usize`, matching
+`lmWdObserve _ 23 = .okFnPtr 0`. -/
+theorem lm_step_wdCase23_null_raw_ok :
+    let rawLay := some (translateTy wdRawU8Ty wdCase23Mir.layouts)
+    let usLay := some (translateTy wdUsizeTy wdCase23Mir.layouts)
+    wdRunMiriSteps (wdStepHooks wdCase23Mir) 8
+      (wdMkStepState wdCase23Mir wdRawU8Ty
+        #[⟨.live (.immediate .uninit), rawLay⟩,
+          ⟨.live (.immediate (.scalar (wdStepUInt 0 8))), usLay⟩]) =
+      .ok (some (.live (.immediate (.scalar (wdStepUInt 0 8))))) := by
+  decide +kernel
+
+end StepDriver
+
 /-! ## §4. Capstone -/
 
 /-- **Episode 1 LeanMiri capstone**: the 48-cell table, fail-closed range, exact mode
@@ -2033,7 +2568,11 @@ run_cmd do
       (ns ++ `lmWdObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmLoad),
       (ns ++ `lmWdObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmTreeAccess),
       (ns ++ `lm_initMask_applyCopy_uninit_preserves, `Miri.Memory.InitMask.applyCopy),
-      (ns ++ `lm_readScalar_uninit_witness, `Miri.Memory.InitMask.prepareCopy),
+      (ns ++ `lm_initMask_prepareCopy_lazy_uninit, `Miri.Memory.InitMask.prepareCopy),
+      (ns ++ `lm_allocation_copy_uninit_preserves, `Miri.Memory.Allocation.copy),
+      (ns ++ `lm_step_wdCase14_ok, `Miri.Interpreter.Step.step),
+      (ns ++ `lm_step_wdCase21_null_fnptr_ub, `Miri.Interpreter.Step.step),
+      (ns ++ `lm_step_wdCase21_null_fnptr_ub, `Miri.Memory.Validity.checkScalar),
       (ns ++ `lm_scalarMayBeNull_int, `Miri.Interpreter.ValidityMachine.scalarMayBeNull),
       (ns ++ `lm_readScalar_uninit_ub, `Miri.Memory.Allocation.readScalar),
       (ns ++ `lm_checkScalar_fnptr_int, `Miri.Memory.Validity.checkScalar) ]
