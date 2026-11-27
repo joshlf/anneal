@@ -6620,4 +6620,176 @@ theorem symProgRunSteps_assert_panic_refutes {cfg : SymConfig} {k : Nat} {p q q'
     rw [symProgStep_assert_panic_of_not_conds hstep env hn hstack hat]
     rfl) hnp
 
+/-! ## Part XIX: Path-Exploring Symbolic Execution (`symExplore`)
+
+Automatic all-paths exploration through `SymStepRes.branch` forks (the
+converged counterpart of `#4439`'s `symRunPaths`): every leaf records its
+accumulated path / side conditions, its symbolic return value, and its final
+program point. Soundness needs only ONE leaf whose conditions hold for a given
+environment (first-match `SwitchInt` edge conditions make leaves mutually
+exclusive per environment). Defined by `@Nat.rec` on the fuel and `List.foldr`
+over fork alternatives, so explorations reduce by `rfl`. -/
+
+/-- A returned exploration leaf: conditions, return value, final program. -/
+abbrev SymLeaf := List SymCond × SymVal × SymProg
+
+/-- Combine the explorations of fork alternatives (`none` if any fails). -/
+def symExploreAlts (ih : List SymCond → SymProg → Option (List SymLeaf)) (pc : List SymCond)
+    (alts : List (SymCond × SymProg)) : Option (List SymLeaf) :=
+  alts.foldr
+    (fun cq acc =>
+      match ih (pc ++ [cq.1]) cq.2, acc with
+      | some l₁, some l₂ => some (l₁ ++ l₂)
+      | _, _ => none)
+    (some [])
+
+/-- Explore all symbolic paths from `p` within `fuel` steps per path, starting
+from accumulated conditions `pc`. -/
+def symExplore (cfg : SymConfig) (fuel : Nat) :
+    List SymCond → SymProg → Option (List SymLeaf) :=
+  @Nat.rec (fun _ => List SymCond → SymProg → Option (List SymLeaf))
+    (fun _ _ => none)
+    (fun _ ih pc p =>
+      match symProgStep cfg p with
+      | .step q cs => ih (pc ++ cs) q
+      | .ret v fin cs => some [(pc ++ cs, v, fin)]
+      | .branch alts cs => symExploreAlts ih (pc ++ cs) alts
+      | .stuck => none)
+    fuel
+
+theorem symExploreAlts_mem {ih : List SymCond → SymProg → Option (List SymLeaf)}
+    {pc : List SymCond} :
+    ∀ {alts : List (SymCond × SymProg)} {leaves : List SymLeaf} {l : SymLeaf},
+      symExploreAlts ih pc alts = some leaves → l ∈ leaves →
+      ∃ c q sub, (c, q) ∈ alts ∧ ih (pc ++ [c]) q = some sub ∧ l ∈ sub
+  | [], leaves, l, h, hm => by
+    have h' : some ([] : List SymLeaf) = some leaves := h
+    injection h' with h''
+    subst h''
+    nomatch hm
+  | (c, q) :: rest, leaves, l, h, hm => by
+    have h' : (match ih (pc ++ [c]) q, symExploreAlts ih pc rest with
+        | some l₁, some l₂ => some (l₁ ++ l₂)
+        | _, _ => none) = some leaves := h
+    cases h1 : ih (pc ++ [c]) q with
+    | none => rw [h1] at h'; nomatch h'
+    | some l₁ =>
+      cases h2 : symExploreAlts ih pc rest with
+      | none => rw [h1, h2] at h'; nomatch h'
+      | some l₂ =>
+        rw [h1, h2] at h'
+        injection h' with h''
+        subst h''
+        rcases List.mem_append.mp hm with hl | hl
+        · exact ⟨c, q, l₁, List.Mem.head _, h1, hl⟩
+        · obtain ⟨c', q', sub, hmem, hih, hl'⟩ := symExploreAlts_mem h2 hl
+          exact ⟨c', q', sub, List.Mem.tail _ hmem, hih, hl'⟩
+
+/-- Every leaf's conditions extend the starting conditions. -/
+theorem symExplore_prefix (cfg : SymConfig) :
+    ∀ (n : Nat) {pc : List SymCond} {p : SymProg} {leaves : List SymLeaf} {l : SymLeaf},
+      symExplore cfg n pc p = some leaves → l ∈ leaves → ∃ rest, l.1 = pc ++ rest
+  | 0, _, _, _, _, h, _ => nomatch h
+  | n + 1, pc, p, leaves, l, h, hm => by
+    have h' : (match symProgStep cfg p with
+        | .step q cs => symExplore cfg n (pc ++ cs) q
+        | .ret v fin cs => some [(pc ++ cs, v, fin)]
+        | .branch alts cs => symExploreAlts (symExplore cfg n) (pc ++ cs) alts
+        | .stuck => none) = some leaves := h
+    cases hs : symProgStep cfg p with
+    | step q cs =>
+      rw [hs] at h'
+      obtain ⟨rest, hr⟩ := symExplore_prefix cfg n h' hm
+      exact ⟨cs ++ rest, by rw [hr, List.append_assoc]⟩
+    | ret v fin cs =>
+      rw [hs] at h'
+      injection h' with h''
+      subst h''
+      cases hm with
+      | head => exact ⟨cs, rfl⟩
+      | tail _ h => nomatch h
+    | branch alts cs =>
+      rw [hs] at h'
+      obtain ⟨c, q, sub, _, hih, hl⟩ := symExploreAlts_mem h' hm
+      obtain ⟨rest, hr⟩ := symExplore_prefix cfg n hih hl
+      exact ⟨cs ++ [c] ++ rest, by rw [hr, List.append_assoc, List.append_assoc,
+        List.append_assoc]⟩
+    | stuck =>
+      rw [hs] at h'
+      nomatch h'
+
+/-- **All-paths soundness**: if the exploration terminates with leaves and SOME
+leaf's conditions hold for `env` with its return value satisfying `post`, the
+unmodified trusted semantics reaches `.done` satisfying `post` within `n`
+steps. -/
+theorem symExplore_sound (cfg : SymConfig) :
+    ∀ (n : Nat) {pc : List SymCond} {p : SymProg} {leaves : List SymLeaf}
+      (env : SymEnv) {post : MirOutcome → Prop},
+      symExplore cfg n pc p = some leaves →
+      (∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+        post (.normal (l.2.1.eval env, (l.2.2.toMachineState cfg env).memory))) →
+      ReachesDoneWithinV2026 cfg.body post n (p.toMachineState cfg env)
+  | 0, _, _, _, _, _, h, _ => nomatch h
+  | n + 1, pc, p, leaves, env, post, h, ⟨l, hm, hc, hpost⟩ => by
+    have h' : (match symProgStep cfg p with
+        | .step q cs => symExplore cfg n (pc ++ cs) q
+        | .ret v fin cs => some [(pc ++ cs, v, fin)]
+        | .branch alts cs => symExploreAlts (symExplore cfg n) (pc ++ cs) alts
+        | .stuck => none) = some leaves := h
+    cases hs : symProgStep cfg p with
+    | step q cs =>
+      rw [hs] at h'
+      obtain ⟨rest, hr⟩ := symExplore_prefix cfg n h' hm
+      rw [hr] at hc
+      have hcs : condsHold env cs :=
+        ((condsHold_append env cs rest).mp
+          ((condsHold_append env pc (cs ++ rest)).mp (List.append_assoc pc cs rest ▸ hc)).2).1
+      exact reachesDoneWithinV2026_of_step (symProgStep_v2026_sound hs env hcs)
+        (symExplore_sound cfg n env h' ⟨l, hm, hr ▸ hc, hpost⟩)
+    | ret v fin cs =>
+      rw [hs] at h'
+      injection h' with h''
+      subst h''
+      cases hm with
+      | tail _ h => nomatch h
+      | head =>
+        obtain ⟨hfin, _, _⟩ := symProgStep_ret_sound hs env
+        subst hfin
+        exact ReachesDoneWithinV2026.mono (Nat.succ_le_succ (Nat.zero_le n))
+          (reachesDoneWithinV2026_of_done (symProgStep_ret_v2026_sound hs env) hpost)
+    | branch alts cs =>
+      rw [hs] at h'
+      obtain ⟨c, q, sub, hmem, hih, hl⟩ := symExploreAlts_mem h' hm
+      obtain ⟨rest, hr⟩ := symExplore_prefix cfg n hih hl
+      have hc' : condsHold env ((pc ++ cs) ++ [c] ++ rest) := hr ▸ hc
+      have hcc : c.holds env :=
+        ((condsHold_append env [c] rest).mp
+          ((condsHold_append env (pc ++ cs) ([c] ++ rest)).mp
+            (by rw [← List.append_assoc]; exact hc')).2).1.1
+      exact reachesDoneWithinV2026_of_step ((symProgStep_branch_sound hs env).2 c q hmem hcc)
+        (symExplore_sound cfg n env hih ⟨l, hl, hc, hpost⟩)
+    | stuck =>
+      rw [hs] at h'
+      nomatch h'
+
+/-- Stateless `VerificationResult` (panic-forbidding) from an all-paths
+exploration of the entry state. -/
+theorem verificationResult_of_symExplore (c : Claim) (cfg : SymConfig)
+    (hb : cfg.body = c.body) (hcal : cfg.callees = c.callees) (fuel : Nat)
+    (symArgs : List SymVal) (leaves : List SymLeaf)
+    (h : symExplore cfg fuel [] (symProgEntry cfg symArgs) = some leaves)
+    (henv : ∀ args, c.pre args → ∃ env : SymEnv, symValsEval env symArgs = args ∧
+      ∃ l, l ∈ leaves ∧ condsHold env l.1 ∧ c.post args (l.2.1.eval env)) :
+    VerificationResult c := by
+  refine verifyMirNoPanic_of_execWithinStepsV2026 c (fun args hPre => ?_)
+  obtain ⟨env, hargs, l, hm, hc, hpost⟩ := henv args hPre
+  have hR := symExplore_sound cfg fuel env
+    (post := mirNormalPost (fun retVal _ => c.post args retVal)) h ⟨l, hm, hc, hpost⟩
+  have hEntry := symProgEntry_toMachineState cfg symArgs env
+  rw [hargs] at hEntry
+  refine ⟨fuel, ?_⟩
+  unfold ExecWithinStepsV2026
+  rw [← hb, ← hcal, ← hEntry]
+  exact hR
+
 end Anneal.MirSymExec.ChunkedCallV2026

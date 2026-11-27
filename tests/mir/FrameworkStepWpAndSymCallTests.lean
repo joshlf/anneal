@@ -925,6 +925,41 @@ theorem sel_emits_event_succ (n : Nat) :
       | head => exact Nat.succ_ne_zero n
       | tail _ h => nomatch h)
 
+
+/-! ### All-paths exploration (`symExplore`) -/
+
+/-- Automatic exploration of BOTH `sel` paths in one `rfl`. -/
+theorem sel_explore :
+    symExplore selCfg 3 [] selEntry =
+      some [ ([.switchBranchEq vs 0 []], .concrete (.scalar ⟨1, 1⟩),
+              { frame := { blockIdx := 1, stmtIdx := 1
+                           locals := [.init (.concrete (.scalar ⟨1, 1⟩)), I vs] }
+                stack := [], active := none })
+           , ([.switchBranchOtherwise vs [0]], .scalar vs,
+              { frame := { blockIdx := 2, stmtIdx := 1, locals := [I vs, I vs] }
+                stack := [], active := none }) ] := rfl
+
+/-- `sel` claim over EVERY `u8` input, discharged from the exploration leaves. -/
+def selClaim : Claim :=
+  { body := selBody
+    pre := fun args => ∃ x, args = [.scalar ⟨x, 1⟩]
+    post := fun args r => ∃ x, args = [.scalar ⟨x, 1⟩] ∧
+      r = .scalar ⟨match x with | 0 => 1 | n + 1 => n + 1, 1⟩ }
+
+theorem sel_verificationResult_explore : VerificationResult selClaim := by
+  refine verificationResult_of_symExplore selClaim selCfg rfl rfl 3 [.scalar vs] _ sel_explore ?_
+  intro args ⟨x, hx⟩
+  subst hx
+  refine ⟨selEnv x, rfl, ?_⟩
+  cases x with
+  | zero =>
+    exact ⟨_, List.Mem.head _, ⟨⟨rfl, fun _ h => nomatch h⟩, trivial⟩, ⟨0, rfl, rfl⟩⟩
+  | succ n =>
+    refine ⟨_, List.Mem.tail _ (List.Mem.head _), ⟨fun u hu => ?_, trivial⟩, ⟨n + 1, rfl, rfl⟩⟩
+    cases hu with
+    | head => exact Nat.succ_ne_zero n
+    | tail _ h => nomatch h
+
 /-! ## Pillar 2: Bounded Loop via `StepBoundV2026` + `CnfOrd.Worklist` + `WlpV2026` -/
 
 /--
@@ -2199,7 +2234,7 @@ def keyTestTheorems : Array Lean.Name :=
     ``cd_not_tight_forall, ``cd_verificationResult_forall, ``cd_statefulVerificationResult_forall,
     ``spin_partial_not_total, ``add_scaled_mul_overflow_ub_forall,
     ``add_scaled_add_overflow_ub_forall, ``sel_emits_event_zero, ``sel_emits_event_succ,
-    ``scaled_add_call_silent, ``cd_iter_forall]
+    ``scaled_add_call_silent, ``cd_iter_forall, ``sel_verificationResult_explore]
 
 run_cmd auditAxioms keyTestTheorems choiceFreeAxioms
 
