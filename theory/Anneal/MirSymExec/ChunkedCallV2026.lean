@@ -8,6 +8,7 @@
 
 import Trusted
 import Anneal.Firewall
+import Anneal.ParametricCore.BlockTree
 import Anneal.Framework.StepWp
 import Anneal.CnfOrd.Worklist
 import Anneal.ConjunctiveWp.WlpV2026
@@ -91,14 +92,33 @@ inductive SymSatKind : Type where
 inductive SymUncheckedKind : Type where
   | add | sub | mul | div | rem | shl | shr
 
+/-- Unary scalar operators (`!x` on `bool`, bitwise `!x` on integers, wrapping `-x`). -/
+inductive SymUnOp : Type where
+  | neg | notInt | notBool
+
+/-- Overflow-checking binary operators (`AddWithOverflow`, `SubWithOverflow`,
+`MulWithOverflow`). -/
+inductive SymOverflowKind : Type where
+  | add | sub | mul
+
 /-- Raw width-parametric symbolic scalar expression trees. Widths live in the
 `ScalarInt.sizeBytes` of every denotation; signedness is recorded on each
-operator node exactly as resolved by the trusted intrinsic dispatcher. -/
+operator node exactly as resolved by the trusted MIR / intrinsic dispatcher. -/
 inductive SymNode : Type where
   /-- Symbolic input `id` of byte width `width`: denotes `⟨env id, width⟩`. -/
   | var (id : Nat) (width : Nat)
   /-- Concrete scalar constant. -/
   | const (sc : ScalarInt)
+  /-- Unary MIR scalar operator (`-x`, `!x`). -/
+  | unaryOp (op : SymUnOp) (a : SymNode)
+  /-- Scalar MIR `Rvalue.binaryOp` (`evalScalarBinOp`). -/
+  | binOp (op : BinOp) (signed : Bool) (a b : SymNode)
+  /-- Value component `.0` of `Rvalue.binaryOp` `*WithOverflow`. -/
+  | checkedVal (k : SymOverflowKind) (signed : Bool) (a b : SymNode)
+  /-- Overflow-flag component `.1` of `Rvalue.binaryOp` `*WithOverflow`. -/
+  | checkedFlag (k : SymOverflowKind) (signed : Bool) (a b : SymNode)
+  /-- Integer-to-integer MIR cast (`CastKind.intToInt`). -/
+  | castInt (signed : Bool) (targetBytes : Nat) (a : SymNode)
   /-- `wrapping_{add,sub,mul}`. -/
   | wrappingOp (k : SymWrapKind) (a b : SymNode)
   /-- `saturating_{add,sub}` with resolved signedness. -/
@@ -112,6 +132,57 @@ inductive SymNode : Type where
 symbolic step that produces such a node records a `SymCond` guaranteeing
 definedness, so the default is never observed under `condsHold`. -/
 def symDefaultScalar : ScalarInt := ⟨0, 0⟩
+
+/-- Trusted unary scalar evaluation (exact match with `evalRvalue` / `evalUnaryNot`). -/
+def symUnOpEval : SymUnOp → ScalarInt → ScalarInt
+  | .neg, sc =>
+    let modulus := scalarModulus sc.sizeBytes
+    let canonical := wrapScalarBits sc.bits modulus
+    ⟨wrapScalarBits (Nat.sub modulus canonical) modulus, sc.sizeBytes⟩
+  | .notInt, sc =>
+    let modulus := scalarModulus sc.sizeBytes
+    let canonical := wrapScalarBits sc.bits modulus
+    ⟨Nat.sub (Nat.sub modulus 1) canonical, sc.sizeBytes⟩
+  | .notBool, sc =>
+    ⟨match Nat.beq sc.bits 0 with | true => 1 | false => 0, 1⟩
+
+/-- Trusted scalar `Rvalue.binaryOp` kernel (calling `evalScalarBinOp` directly). -/
+def symBinOpEval (op : BinOp) (signed : Bool) (x y : ScalarInt) : Option ScalarInt :=
+  match evalScalarBinOp op x y [] emptyMemory signed with
+  | .ok (.scalar sc) _ _ => some sc
+  | _ => none
+
+/-- Map `SymOverflowKind` to its trusted `BinOp`. -/
+def symOverflowToBinOp : SymOverflowKind → BinOp
+  | .add => .addWithOverflow
+  | .sub => .subWithOverflow
+  | .mul => .mulWithOverflow
+
+/-- Value component `.0` of trusted `evalScalarBinOp` `*WithOverflow`. -/
+def symCheckedValEval (k : SymOverflowKind) (signed : Bool) (x y : ScalarInt) :
+    Option ScalarInt :=
+  match evalScalarBinOp (symOverflowToBinOp k) x y [] emptyMemory signed with
+  | .ok (.aggregate 0 [.scalar v, .scalar _]) _ _ => some v
+  | _ => none
+
+/-- Overflow flag `.1` of trusted `evalScalarBinOp` `*WithOverflow`. -/
+def symCheckedFlagEval (k : SymOverflowKind) (signed : Bool) (x y : ScalarInt) :
+    Option ScalarInt :=
+  match evalScalarBinOp (symOverflowToBinOp k) x y [] emptyMemory signed with
+  | .ok (.aggregate 0 [.scalar _, .scalar f]) _ _ => some f
+  | _ => none
+
+/-- Trusted `CastKind.intToInt` kernel (exact match with `evalRvalue`). -/
+def symCastIntEval (signed : Bool) (targetBytes : Nat) (sc : ScalarInt) : ScalarInt :=
+  let modulus := scalarModulus targetBytes
+  let castedBits :=
+    match signed with
+    | false => wrapScalarBits sc.bits modulus
+    | true =>
+      match Nat.ble targetBytes sc.sizeBytes with
+      | true => wrapScalarBits sc.bits modulus
+      | false => signExtendBits sc.bits sc.sizeBytes targetBytes
+  ⟨castedBits, targetBytes⟩
 
 /-- Trusted bit-intrinsic kernels (exactly as called by
 `evalNonSelectIntrinsicCall`, default `retBytes`). -/
@@ -156,6 +227,11 @@ def symNodeEvalFuel (env : SymEnv) (fuel : Nat) : SymNode → ScalarInt :=
       match e with
       | .var id w => ⟨env id, w⟩
       | .const sc => sc
+      | .unaryOp op a => symUnOpEval op (ih a)
+      | .binOp op s a b => (symBinOpEval op s (ih a) (ih b)).getD symDefaultScalar
+      | .checkedVal k s a b => (symCheckedValEval k s (ih a) (ih b)).getD symDefaultScalar
+      | .checkedFlag k s a b => (symCheckedFlagEval k s (ih a) (ih b)).getD symDefaultScalar
+      | .castInt s tb a => symCastIntEval s tb (ih a)
       | .wrappingOp k a b => (symWrapEval k (ih a) (ih b)).getD symDefaultScalar
       | .saturatingOp k s a b => (symSatEval k s (ih a) (ih b)).getD symDefaultScalar
       | .uncheckedOp k ls rs a b =>
@@ -167,6 +243,16 @@ def symNodeEvalFuel (env : SymEnv) (fuel : Nat) : SymNode → ScalarInt :=
 inductive SymNode.DepthLE : SymNode → Nat → Prop where
   | var {id w n : Nat} : SymNode.DepthLE (.var id w) (n + 1)
   | const {sc : ScalarInt} {n : Nat} : SymNode.DepthLE (.const sc) (n + 1)
+  | unaryOp {op : SymUnOp} {a : SymNode} {n : Nat} :
+      SymNode.DepthLE a n → SymNode.DepthLE (.unaryOp op a) (n + 1)
+  | binOp {op : BinOp} {s : Bool} {a b : SymNode} {n : Nat} :
+      SymNode.DepthLE a n → SymNode.DepthLE b n → SymNode.DepthLE (.binOp op s a b) (n + 1)
+  | checkedVal {k : SymOverflowKind} {s : Bool} {a b : SymNode} {n : Nat} :
+      SymNode.DepthLE a n → SymNode.DepthLE b n → SymNode.DepthLE (.checkedVal k s a b) (n + 1)
+  | checkedFlag {k : SymOverflowKind} {s : Bool} {a b : SymNode} {n : Nat} :
+      SymNode.DepthLE a n → SymNode.DepthLE b n → SymNode.DepthLE (.checkedFlag k s a b) (n + 1)
+  | castInt {s : Bool} {tb : Nat} {a : SymNode} {n : Nat} :
+      SymNode.DepthLE a n → SymNode.DepthLE (.castInt s tb a) (n + 1)
   | wrappingOp {k : SymWrapKind} {a b : SymNode} {n : Nat} :
       SymNode.DepthLE a n → SymNode.DepthLE b n → SymNode.DepthLE (.wrappingOp k a b) (n + 1)
   | saturatingOp {k : SymSatKind} {s : Bool} {a b : SymNode} {n : Nat} :
@@ -191,6 +277,33 @@ theorem SymNode.DepthLE.mono {t : SymNode} {n : Nat} (h : t.DepthLE n) :
     cases m with
     | zero => exact absurd hm (Nat.not_succ_le_zero _)
     | succ m => exact .const
+  | unaryOp _ iha =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m => exact .unaryOp (iha (Nat.le_of_succ_le_succ hm))
+  | binOp _ _ iha ihb =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m => exact .binOp (iha (Nat.le_of_succ_le_succ hm)) (ihb (Nat.le_of_succ_le_succ hm))
+  | checkedVal _ _ iha ihb =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m =>
+      exact .checkedVal (iha (Nat.le_of_succ_le_succ hm)) (ihb (Nat.le_of_succ_le_succ hm))
+  | checkedFlag _ _ iha ihb =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m =>
+      exact .checkedFlag (iha (Nat.le_of_succ_le_succ hm)) (ihb (Nat.le_of_succ_le_succ hm))
+  | castInt _ iha =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m => exact .castInt (iha (Nat.le_of_succ_le_succ hm))
   | wrappingOp _ _ iha ihb =>
     intro m hm
     cases m with
@@ -228,6 +341,45 @@ theorem symNodeEvalFuel_stable (env : SymEnv) {t : SymNode} {n : Nat} (h : t.Dep
     cases m with
     | zero => exact absurd hm (Nat.not_succ_le_zero _)
     | succ m => rfl
+  | unaryOp _ iha =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m =>
+      show symUnOpEval _ (symNodeEvalFuel env m _) = symUnOpEval _ (symNodeEvalFuel env _ _)
+      rw [iha (Nat.le_of_succ_le_succ hm)]
+  | binOp _ _ iha ihb =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m =>
+      show (symBinOpEval _ _ (symNodeEvalFuel env m _) (symNodeEvalFuel env m _)).getD _ =
+        (symBinOpEval _ _ (symNodeEvalFuel env _ _) (symNodeEvalFuel env _ _)).getD _
+      rw [iha (Nat.le_of_succ_le_succ hm), ihb (Nat.le_of_succ_le_succ hm)]
+  | checkedVal _ _ iha ihb =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m =>
+      show (symCheckedValEval _ _ (symNodeEvalFuel env m _) (symNodeEvalFuel env m _)).getD _ =
+        (symCheckedValEval _ _ (symNodeEvalFuel env _ _) (symNodeEvalFuel env _ _)).getD _
+      rw [iha (Nat.le_of_succ_le_succ hm), ihb (Nat.le_of_succ_le_succ hm)]
+  | checkedFlag _ _ iha ihb =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m =>
+      show (symCheckedFlagEval _ _ (symNodeEvalFuel env m _) (symNodeEvalFuel env m _)).getD _ =
+        (symCheckedFlagEval _ _ (symNodeEvalFuel env _ _) (symNodeEvalFuel env _ _)).getD _
+      rw [iha (Nat.le_of_succ_le_succ hm), ihb (Nat.le_of_succ_le_succ hm)]
+  | castInt _ iha =>
+    intro m hm
+    cases m with
+    | zero => exact absurd hm (Nat.not_succ_le_zero _)
+    | succ m =>
+      show symCastIntEval _ _ (symNodeEvalFuel env m _) =
+        symCastIntEval _ _ (symNodeEvalFuel env _ _)
+      rw [iha (Nat.le_of_succ_le_succ hm)]
   | wrappingOp _ _ iha ihb =>
     intro m hm
     cases m with
@@ -277,6 +429,29 @@ def SymScalar.var (id w : Nat) : SymScalar := ⟨.var id w, 1, .var⟩
 /-- Concrete scalar constant. -/
 def SymScalar.const (sc : ScalarInt) : SymScalar := ⟨.const sc, 1, .const⟩
 
+/-- Unary scalar operator node. -/
+def SymScalar.unaryOp (op : SymUnOp) (a : SymScalar) : SymScalar :=
+  ⟨.unaryOp op a.node, a.fuel + 1, .unaryOp a.wf⟩
+
+/-- Scalar `Rvalue.binaryOp` node. -/
+def SymScalar.binOp (op : BinOp) (s : Bool) (a b : SymScalar) : SymScalar :=
+  ⟨.binOp op s a.node b.node, Nat.max a.fuel b.fuel + 1,
+    .binOp (a.wf.mono (Nat.le_max_left _ _)) (b.wf.mono (Nat.le_max_right _ _))⟩
+
+/-- Value component `.0` of `*WithOverflow` binary op. -/
+def SymScalar.checkedVal (k : SymOverflowKind) (s : Bool) (a b : SymScalar) : SymScalar :=
+  ⟨.checkedVal k s a.node b.node, Nat.max a.fuel b.fuel + 1,
+    .checkedVal (a.wf.mono (Nat.le_max_left _ _)) (b.wf.mono (Nat.le_max_right _ _))⟩
+
+/-- Overflow-flag component `.1` of `*WithOverflow` binary op. -/
+def SymScalar.checkedFlag (k : SymOverflowKind) (s : Bool) (a b : SymScalar) : SymScalar :=
+  ⟨.checkedFlag k s a.node b.node, Nat.max a.fuel b.fuel + 1,
+    .checkedFlag (a.wf.mono (Nat.le_max_left _ _)) (b.wf.mono (Nat.le_max_right _ _))⟩
+
+/-- `CastKind.intToInt` node. -/
+def SymScalar.castInt (s : Bool) (tb : Nat) (a : SymScalar) : SymScalar :=
+  ⟨.castInt s tb a.node, a.fuel + 1, .castInt a.wf⟩
+
 /-- `wrapping_{add,sub,mul}` node. -/
 def SymScalar.wrappingOp (k : SymWrapKind) (a b : SymScalar) : SymScalar :=
   ⟨.wrappingOp k a.node b.node, Nat.max a.fuel b.fuel + 1,
@@ -302,6 +477,41 @@ theorem SymScalar.eval_var (env : SymEnv) (id w : Nat) :
 
 theorem SymScalar.eval_const (env : SymEnv) (sc : ScalarInt) :
     (SymScalar.const sc).eval env = sc := rfl
+
+theorem SymScalar.eval_unaryOp (env : SymEnv) (op : SymUnOp) (a : SymScalar) :
+    (SymScalar.unaryOp op a).eval env = symUnOpEval op (a.eval env) := rfl
+
+theorem SymScalar.eval_binOp (env : SymEnv) (op : BinOp) (s : Bool) (a b : SymScalar) :
+    (SymScalar.binOp op s a b).eval env =
+      (symBinOpEval op s (a.eval env) (b.eval env)).getD symDefaultScalar := by
+  show (symBinOpEval op s (symNodeEvalFuel env (Nat.max a.fuel b.fuel) a.node)
+      (symNodeEvalFuel env (Nat.max a.fuel b.fuel) b.node)).getD symDefaultScalar = _
+  rw [symNodeEvalFuel_stable env a.wf (Nat.le_max_left _ _),
+    symNodeEvalFuel_stable env b.wf (Nat.le_max_right _ _)]
+  rfl
+
+theorem SymScalar.eval_checkedVal (env : SymEnv) (k : SymOverflowKind) (s : Bool)
+    (a b : SymScalar) :
+    (SymScalar.checkedVal k s a b).eval env =
+      (symCheckedValEval k s (a.eval env) (b.eval env)).getD symDefaultScalar := by
+  show (symCheckedValEval k s (symNodeEvalFuel env (Nat.max a.fuel b.fuel) a.node)
+      (symNodeEvalFuel env (Nat.max a.fuel b.fuel) b.node)).getD symDefaultScalar = _
+  rw [symNodeEvalFuel_stable env a.wf (Nat.le_max_left _ _),
+    symNodeEvalFuel_stable env b.wf (Nat.le_max_right _ _)]
+  rfl
+
+theorem SymScalar.eval_checkedFlag (env : SymEnv) (k : SymOverflowKind) (s : Bool)
+    (a b : SymScalar) :
+    (SymScalar.checkedFlag k s a b).eval env =
+      (symCheckedFlagEval k s (a.eval env) (b.eval env)).getD symDefaultScalar := by
+  show (symCheckedFlagEval k s (symNodeEvalFuel env (Nat.max a.fuel b.fuel) a.node)
+      (symNodeEvalFuel env (Nat.max a.fuel b.fuel) b.node)).getD symDefaultScalar = _
+  rw [symNodeEvalFuel_stable env a.wf (Nat.le_max_left _ _),
+    symNodeEvalFuel_stable env b.wf (Nat.le_max_right _ _)]
+  rfl
+
+theorem SymScalar.eval_castInt (env : SymEnv) (s : Bool) (tb : Nat) (a : SymScalar) :
+    (SymScalar.castInt s tb a).eval env = symCastIntEval s tb (a.eval env) := rfl
 
 theorem SymScalar.eval_wrappingOp (env : SymEnv) (k : SymWrapKind) (a b : SymScalar) :
     (SymScalar.wrappingOp k a b).eval env =
@@ -424,6 +634,20 @@ inductive SymCond : Type where
   | switchBranchEq (d : SymScalar) (v : Nat) (prior : List Nat)
   /-- `SwitchInt` discriminant matches none of `vs` (otherwise edge). -/
   | switchBranchOtherwise (d : SymScalar) (vs : List Nat)
+  /-- Valid 1-byte boolean scalar (`sizeBytes = 1 ∧ (bits = 0 ∨ bits = 1)`). -/
+  | validBool (a : SymScalar)
+  /-- MIR `Rvalue.binaryOp .addUnchecked`: raw-bit no-overflow guard. -/
+  | binNoOverflowAdd (signed : Bool) (a b : SymScalar)
+  /-- MIR `Rvalue.binaryOp .subUnchecked`: raw-bit no-overflow guard. -/
+  | binNoOverflowSub (signed : Bool) (a b : SymScalar)
+  /-- MIR `Rvalue.binaryOp .mulUnchecked`: raw-bit no-overflow guard. -/
+  | binNoOverflowMul (signed : Bool) (a b : SymScalar)
+  /-- MIR `Rvalue.binaryOp .div`: nonzero raw divisor (and no signed `MIN / -1`). -/
+  | binDivSafe (signed : Bool) (a b : SymScalar)
+  /-- MIR `Rvalue.binaryOp .rem`: nonzero raw divisor (and no signed `MIN % -1`). -/
+  | binRemSafe (signed : Bool) (a b : SymScalar)
+  /-- MIR `Rvalue.binaryOp .{shlUnchecked,shrUnchecked}`: raw shift `< 8 * width`. -/
+  | binShiftInBounds (a b : SymScalar)
 
 /-- Canonical (wrapped) bits of a scalar at its own width. -/
 def scBits (x : ScalarInt) : Nat :=
@@ -493,6 +717,48 @@ def SymCond.holds (env : SymEnv) : SymCond → Prop
   | .switchBranchEq d v prior =>
     (d.eval env).bits = v ∧ ∀ u, u ∈ prior → (d.eval env).bits ≠ u
   | .switchBranchOtherwise d vs => ∀ u, u ∈ vs → (d.eval env).bits ≠ u
+  | .validBool a =>
+    let x := a.eval env
+    x.sizeBytes = 1 ∧ (x.bits = 0 ∨ x.bits = 1)
+  | .binNoOverflowAdd s a b =>
+    let x := a.eval env
+    let y := b.eval env
+    ScWidthsOk x y ∧
+      (match s with
+       | false => x.bits + y.bits < scalarModulus x.sizeBytes
+       | true => signedOverflowAdd x.bits y.bits x.sizeBytes = false)
+  | .binNoOverflowSub s a b =>
+    let x := a.eval env
+    let y := b.eval env
+    ScWidthsOk x y ∧
+      (match s with
+       | false => y.bits ≤ x.bits ∧ Nat.sub x.bits y.bits < scalarModulus x.sizeBytes
+       | true => signedOverflowSub x.bits y.bits x.sizeBytes = false)
+  | .binNoOverflowMul s a b =>
+    let x := a.eval env
+    let y := b.eval env
+    ScWidthsOk x y ∧
+      (match s with
+       | false => x.bits * y.bits < scalarModulus x.sizeBytes
+       | true => signedOverflowMul x.bits y.bits x.sizeBytes = false)
+  | .binDivSafe s a b =>
+    let x := a.eval env
+    let y := b.eval env
+    ScWidthsOk x y ∧ y.bits ≠ 0 ∧
+      (match s with
+       | false => True
+       | true => ScNotMinNegOne x y)
+  | .binRemSafe s a b =>
+    let x := a.eval env
+    let y := b.eval env
+    ScWidthsOk x y ∧ y.bits ≠ 0 ∧
+      (match s with
+       | false => True
+       | true => ScNotMinNegOne x y)
+  | .binShiftInBounds a b =>
+    let x := a.eval env
+    let y := b.eval env
+    x.sizeBytes ≠ 0 ∧ y.sizeBytes ≠ 0 ∧ y.bits < Nat.mul x.sizeBytes 8
 
 /-- All side conditions hold. -/
 def condsHold (env : SymEnv) (cs : List SymCond) : Prop :=
@@ -591,10 +857,12 @@ inductive SymStepRes : Type where
   /-- Outside the supported fragment (fail closed). -/
   | stuck
 
-/-- Symbolic `evalOperand` for bare locals (`copy` / `move`) and evaluated
+/-- Symbolic `evalOperand` for bare locals (`copy` / `move`), single-level
+non-union scalar aggregate field projections (`[.field idx _]`), and evaluated
 non-indirect constants. -/
 def symOperand (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (locals : List SymSlot) : Operand → Option (SymVal × List SymSlot)
+    (decls : List LocalDecl) (locals : List SymSlot) :
+    Operand → Option (SymVal × List SymSlot)
   | .copy p =>
     match p.projection with
     | [] =>
@@ -604,7 +872,17 @@ def symOperand (globals : List CapturedAllocation) (layouts : LayoutTable)
         | false => some (v, locals)
         | true => none
       | _ => none
-    | _ :: _ => none
+    | [.field idx _] =>
+      match placeTouchesUnion decls layouts p with
+      | true => none
+      | false =>
+        match get? locals p.local_ with
+        | some (.init (.aggregate _ fs)) =>
+          match get? fs idx with
+          | some s => some (.scalar s, locals)
+          | none => none
+        | _ => none
+    | _ => none
   | .move p =>
     match p.projection with
     | [] =>
@@ -617,7 +895,17 @@ def symOperand (globals : List CapturedAllocation) (layouts : LayoutTable)
           | none => none
         | true => none
       | _ => none
-    | _ :: _ => none
+    | [.field idx _] =>
+      match placeTouchesUnion decls layouts p with
+      | true => none
+      | false =>
+        match get? locals p.local_ with
+        | some (.init (.aggregate _ fs)) =>
+          match get? fs idx with
+          | some s => some (.scalar s, locals)
+          | none => none
+        | _ => none
+    | _ => none
   | .constant c =>
     match c.val with
     | .scalar cs =>
@@ -630,18 +918,28 @@ def symOperand (globals : List CapturedAllocation) (layouts : LayoutTable)
       | none => none
     | _ => none
 
-/-- Symbolic `evalOperandsWithBodyCast` over `symOperand` (by `List.foldr`). -/
+/-- Symbolic `evalOperands` / `evalOperandsWithBodyCast` over `symOperand` (by `List.foldr`). -/
 def symOperands (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (locals : List SymSlot) (ops : List Operand) : Option (List SymVal × List SymSlot) :=
+    (decls : List LocalDecl) (locals : List SymSlot) (ops : List Operand) :
+    Option (List SymVal × List SymSlot) :=
   ops.foldr
     (fun op ih locals =>
-      match symOperand globals layouts locals op with
+      match symOperand globals layouts decls locals op with
       | some (v, locals₁) =>
         match ih locals₁ with
         | some (vs, locals₂) => some (v :: vs, locals₂)
         | none => none
       | none => none)
     (fun locals => some ([], locals)) locals
+
+/-- Extract a list of symbolic scalars from symbolic values (for scalar aggregates). -/
+def symValsAsScalars? (vs : List SymVal) : Option (List SymScalar) :=
+  vs.foldr
+    (fun v ih =>
+      match v.asScalar?, ih with
+      | some s, some ss => some (s :: ss)
+      | _, _ => none)
+    (some [])
 
 /-- Env-independent sufficient condition for `validateLoadedValue` (types
 other than `bool` / `char` impose no bit-validity check). -/
@@ -658,17 +956,164 @@ def loadedValueStaticOk (layouts : LayoutTable) (decls : List LocalDecl)
       | _ => true
     | none => true
 
-/-- Symbolic `evalRvalue` (A0 fragment: `Rvalue.use`). -/
+/-- Symbolic scalar `Rvalue.binaryOp` dispatch (including `*WithOverflow` checked
+binary operators returning `.aggregate 0 [val, flag]`). -/
+def symScalarBinOp (op : BinOp) (signed : Bool) (a b : SymScalar) :
+    Option (SymVal × List SymCond) :=
+  match op with
+  | .add | .sub | .mul | .bitAnd | .bitOr | .bitXor
+  | .eq | .ne | .lt | .le | .gt | .ge | .cmp =>
+    some (.scalar (.binOp op signed a b), [.widthsMatch a b])
+  | .shl | .shr =>
+    some (.scalar (.binOp op signed a b), [.widthNonzero a, .widthNonzero b])
+  | .addWithOverflow =>
+    some (.aggregate 0 [.checkedVal .add signed a b, .checkedFlag .add signed a b],
+      [.widthsMatch a b])
+  | .subWithOverflow =>
+    some (.aggregate 0 [.checkedVal .sub signed a b, .checkedFlag .sub signed a b],
+      [.widthsMatch a b])
+  | .mulWithOverflow =>
+    some (.aggregate 0 [.checkedVal .mul signed a b, .checkedFlag .mul signed a b],
+      [.widthsMatch a b])
+  | .addUnchecked =>
+    some (.scalar (.binOp .addUnchecked signed a b), [.binNoOverflowAdd signed a b])
+  | .subUnchecked =>
+    some (.scalar (.binOp .subUnchecked signed a b), [.binNoOverflowSub signed a b])
+  | .mulUnchecked =>
+    some (.scalar (.binOp .mulUnchecked signed a b), [.binNoOverflowMul signed a b])
+  | .div =>
+    some (.scalar (.binOp .div signed a b), [.binDivSafe signed a b])
+  | .rem =>
+    some (.scalar (.binOp .rem signed a b), [.binRemSafe signed a b])
+  | .shlUnchecked =>
+    some (.scalar (.binOp .shlUnchecked signed a b), [.binShiftInBounds a b])
+  | .shrUnchecked =>
+    some (.scalar (.binOp .shrUnchecked signed a b), [.binShiftInBounds a b])
+  | .offset => none
+
+/-- Env-independent discriminant computation for an initialized scalar aggregate
+(exact mirror of `evalPlaceDiscriminant` when `valueListContainsUninit = false`). -/
+def symAggDiscriminant? (variantIdx fieldCount : Nat) (place : Place)
+    (decls : List LocalDecl) (layouts : LayoutTable) : Option ScalarInt :=
+  match placeTyResolved decls layouts place with
+  | some pTy =>
+    match pTy.kind with
+    | .never => none
+    | .adt defPath _ =>
+      let evalOrderingOrVariant : Option ScalarInt :=
+        match Bool.and (stringEq defPath "core::cmp::Ordering") (Nat.beq fieldCount 0) with
+        | true =>
+          match variantIdx with
+          | 0 => some ⟨255, 1⟩
+          | 1 => some ⟨0, 1⟩
+          | 2 => some ⟨1, 1⟩
+          | _ => none
+        | false => some ⟨variantIdx, 8⟩
+      match LayoutTable.lookup layouts pTy.layoutIdx with
+      | some { isUninhabited := true, .. } => none
+      | some { variants := .empty, .. } => none
+      | some { variants := .single expectedIdx, .. } =>
+        match Nat.beq variantIdx expectedIdx with
+        | true => some ⟨0, 8⟩
+        | false => none
+      | some { variants := .multiple _ _ variants, .. } =>
+        let varBoundsOk :=
+          match variants with
+          | .nil => true
+          | _ :: _ => Nat.ble (.succ variantIdx) (length variants)
+        match varBoundsOk with
+        | true => evalOrderingOrVariant
+        | false => none
+      | none => evalOrderingOrVariant
+    | .tuple _ | .array _ _ | .slice _ | .str =>
+      match Nat.beq variantIdx 0 with
+      | true => some ⟨0, 8⟩
+      | false => none
+    | _ => some ⟨variantIdx, 8⟩
+  | none => some ⟨variantIdx, 8⟩
+
+/-- Symbolic `evalRvalue`: `use` (including `bool` locals with `validBool`),
+`unaryOp` (`neg`, `not` on `bool`/int), `binaryOp` (all scalar arithmetic,
+bitwise, shift, comparison, unchecked, and `*WithOverflow` checked ops),
+`cast .intToInt`, scalar `aggregate` (`tuple`, `array`, `closure`), and
+bare-local `discriminant`. -/
 def symRvalue (globals : List CapturedAllocation) (layouts : LayoutTable)
     (decls : List LocalDecl) (locals : List SymSlot) :
     Rvalue → Option (SymVal × List SymSlot × List SymCond)
   | .use op =>
-    match symOperand globals layouts locals op with
+    match symOperand globals layouts decls locals op with
     | some (v, locals') =>
       match loadedValueStaticOk layouts decls op with
       | true => some (v, locals', [])
-      | false => none
+      | false =>
+        match operandTy decls layouts op with
+        | some ty =>
+          match ty.kind, v.asScalar? with
+          | .bool, some sc => some (v, locals', [.validBool sc])
+          | _, _ => none
+        | none => none
     | none => none
+  | .unaryOp .neg op =>
+    match symOperand globals layouts decls locals op with
+    | some (v, locals') =>
+      match v.asScalar? with
+      | some x => some (.scalar (.unaryOp .neg x), locals', [.widthNonzero x])
+      | none => none
+    | none => none
+  | .unaryOp .not op =>
+    match symOperand globals layouts decls locals op with
+    | some (v, locals') =>
+      match v.asScalar? with
+      | some x =>
+        match operandTy decls layouts op with
+        | some ty =>
+          match ty.kind with
+          | .bool => some (.scalar (.unaryOp .notBool x), locals', [.validBool x])
+          | .uint _ | .int _ => some (.scalar (.unaryOp .notInt x), locals', [.widthNonzero x])
+          | _ => none
+        | none => none
+      | none => none
+    | none => none
+  | .binaryOp op lhsOp rhsOp =>
+    match symOperand globals layouts decls locals lhsOp with
+    | some (lv, locals₁) =>
+      match symOperand globals layouts decls locals₁ rhsOp with
+      | some (rv, locals₂) =>
+        match lv.asScalar?, rv.asScalar? with
+        | some a, some b =>
+          let signed := operandIsSigned decls lhsOp layouts
+          match symScalarBinOp op signed a b with
+          | some (res, cs) => some (res, locals₂, cs)
+          | none => none
+        | _, _ => none
+      | none => none
+    | none => none
+  | .cast .intToInt op targetTy =>
+    match symOperand globals layouts decls locals op with
+    | some (v, locals') =>
+      match v.asScalar?, intCastTargetBytes targetTy.kind with
+      | some x, some targetBytes =>
+        let signed := operandIsSigned decls op layouts
+        some (.scalar (.castInt signed targetBytes x), locals', [.widthNonzero x])
+      | _, _ => none
+    | none => none
+  | .aggregate .tuple ops | .aggregate (.array _) ops | .aggregate (.closure _) ops =>
+    match symOperands globals layouts decls locals ops with
+    | some (vs, locals') =>
+      match symValsAsScalars? vs with
+      | some fs => some (.aggregate 0 fs, locals', [])
+      | none => none
+    | none => none
+  | .discriminant place =>
+    match place.projection with
+    | [] =>
+      match get? locals place.local_ with
+      | some (.init (.aggregate variantIdx fs)) =>
+        match symAggDiscriminant? variantIdx (length fs) place decls layouts with
+        | some sc => some (.concrete (.scalar sc), locals, [])
+        | none => none
+      | _ => none
+    | _ :: _ => none
   | _ => none
 
 /-- Advance the statement index of a symbolic frame with new locals. -/
@@ -694,6 +1139,17 @@ def symStmt (globals : List CapturedAllocation) (body : CapturedMir)
       | some locals' => some (f.advance locals', [])
       | none => none
     | none => none
+  | .deinit p =>
+    match p.projection with
+    | [] =>
+      match get? f.locals p.local_ with
+      | some .dead => none
+      | some _ =>
+        match set? f.locals p.local_ .uninit with
+        | some locals' => some (f.advance locals', [])
+        | none => none
+      | none => none
+    | _ :: _ => none
   | .assign dst rv =>
     match dst.projection with
     | [] =>
@@ -822,7 +1278,7 @@ def symTerm (cfg : SymConfig) (p : SymProg) (body : CapturedMir) (term : Termina
   | .goto target =>
     .step { p with frame := { p.frame with blockIdx := target, stmtIdx := 0 } } []
   | .switchInt discr targets =>
-    match symOperand cfg.body.allocations body.layouts p.frame.locals discr with
+    match symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals discr with
     | some (v, locals') =>
       match v.asScalar? with
       | some d =>
@@ -835,7 +1291,7 @@ def symTerm (cfg : SymConfig) (p : SymProg) (body : CapturedMir) (term : Termina
       | none => .stuck
     | none => .stuck
   | .assert cond expected target _ =>
-    match symOperand cfg.body.allocations body.layouts p.frame.locals cond with
+    match symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals cond with
     | some (v, locals') =>
       match v.asScalar? with
       | some c => .step (p.jump target locals') [.assertHolds c expected]
@@ -877,7 +1333,7 @@ def symTerm (cfg : SymConfig) (p : SymProg) (body : CapturedMir) (term : Termina
           typeArgs := extractCalleeTypeArgs func
           fnSig := none
           isIndirect := false }
-      match symOperands cfg.body.allocations body.layouts p.frame.locals argOps with
+      match symOperands cfg.body.allocations body.layouts body.localDecls p.frame.locals argOps with
       | none => .stuck
       | some (args, locals') =>
         match
@@ -916,13 +1372,21 @@ def symTerm (cfg : SymConfig) (p : SymProg) (body : CapturedMir) (term : Termina
                 | _ :: _ => .stuck
   | _ => .stuck
 
-/-- One symbolic step of the multi-frame program `p`. -/
-def symProgStep (cfg : SymConfig) (p : SymProg) : SymStepRes :=
+/-- One symbolic step of the multi-frame program `p`, fetching root basic blocks
+through an arbitrary block-lookup table `rootLook` (e.g. a dense
+`Chunk8BlockTree.lookup?` for `O(log N)` / `O(1)` lookup without unfolding
+`cfg.body.basicBlocks`). -/
+def symProgStepWith (cfg : SymConfig) (rootLook : Nat → Option BasicBlockData)
+    (p : SymProg) : SymStepRes :=
   let body := p.active.getD cfg.body
   match body.phase with
   | .other _ => .stuck
   | _ =>
-    match get? body.basicBlocks p.frame.blockIdx with
+    let bb? :=
+      match p.active with
+      | none => rootLook p.frame.blockIdx
+      | some activeBody => get? activeBody.basicBlocks p.frame.blockIdx
+    match bb? with
     | none => .stuck
     | some bb =>
       match get? bb.statements p.frame.stmtIdx with
@@ -935,6 +1399,10 @@ def symProgStep (cfg : SymConfig) (p : SymProg) : SymStepRes :=
           symTerm cfg p body bb.terminator
         else
           .stuck
+
+/-- One symbolic step of the multi-frame program `p`. -/
+def symProgStep (cfg : SymConfig) (p : SymProg) : SymStepRes :=
+  symProgStepWith cfg (fun idx => get? cfg.body.basicBlocks idx) p
 
 /-! ## Part IV: Step-Chunked Runner (`@Nat.rec`) -/
 
@@ -950,6 +1418,15 @@ def SymStepRes.bindRun (run : SymProg → SymStepRes) : SymStepRes → SymStepRe
   | .step p cs => (run p).addConds cs
   | r => r
 
+/-- Run up to `n` symbolic steps using an explicit root block-lookup table
+`rootLook` (`@Nat.rec` so explicit checkpoints reduce by `rfl`). -/
+def symProgRunStepsWith (cfg : SymConfig) (rootLook : Nat → Option BasicBlockData)
+    (n : Nat) : SymProg → SymStepRes :=
+  @Nat.rec (fun _ => SymProg → SymStepRes)
+    (fun p => .step p [])
+    (fun _ ih p => (symProgStepWith cfg rootLook p).bindRun ih)
+    n
+
 /-- Run up to `n` symbolic steps (stopping at return, fork, or stuck), by
 `@Nat.rec` so explicit checkpoints reduce by `rfl`. -/
 def symProgRunSteps (cfg : SymConfig) (n : Nat) : SymProg → SymStepRes :=
@@ -961,6 +1438,13 @@ def symProgRunSteps (cfg : SymConfig) (n : Nat) : SymProg → SymStepRes :=
 /-- A chunk is a step count. -/
 abbrev SymChunk := Nat
 
+/-- Run a list of chunks in sequence using an explicit root block-lookup table
+`rootLook` (e.g. `Chunk8BlockTree.lookup?`). -/
+def symRunChunksWith (cfg : SymConfig) (rootLook : Nat → Option BasicBlockData)
+    (ks : List SymChunk) (p : SymProg) : SymStepRes :=
+  ks.foldr (fun k ih p => (symProgRunStepsWith cfg rootLook k p).bindRun ih)
+    (fun p => .step p []) p
+
 /-- Run a list of chunks in sequence (structural recursion on the chunk list;
 each chunk is a `@Nat.rec` run, so pipelines reduce by `rfl`). -/
 def symRunChunks (cfg : SymConfig) (ks : List SymChunk) (p : SymProg) : SymStepRes :=
@@ -969,6 +1453,17 @@ def symRunChunks (cfg : SymConfig) (ks : List SymChunk) (p : SymProg) : SymStepR
 /-- Total number of steps of a chunk list. -/
 def chunksTotal (ks : List SymChunk) : Nat :=
   ks.foldr (fun k acc => k + acc) 0
+
+/-- Dense `Chunk8BlockTree` block-lookup context for `body.basicBlocks`
+(`O(log N)` spine depth + `O(1)` 8-wide leaf dispatch, zero linear traversal). -/
+structure SymBlockCtx (body : CapturedMir) : Type where
+  tree : Anneal.ParametricCore.Chunk8BlockTree BasicBlockData
+  valid : Anneal.ParametricCore.ValidChunk8BlockTree body.basicBlocks tree
+
+/-- Build the canonical `Chunk8BlockTree` block context for `body`. -/
+def SymBlockCtx.ofBody (body : CapturedMir) : SymBlockCtx body :=
+  { tree := Anneal.ParametricCore.Chunk8BlockTree.ofList body.basicBlocks
+    valid := Anneal.ParametricCore.valid_chunk8BlockTree_ofList body.basicBlocks }
 
 /-- Env-independent entry memory of a configuration. -/
 def symEntryMemory (cfg : SymConfig) : Memory :=
@@ -1001,13 +1496,14 @@ theorem condsHold_nil (env : SymEnv) : condsHold env [] = True := rfl
 theorem condsHold_cons (env : SymEnv) (c : SymCond) (cs : List SymCond) :
     condsHold env (c :: cs) = (c.holds env ∧ condsHold env cs) := rfl
 theorem symOperands_nil (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (locals : List SymSlot) : symOperands globals layouts locals [] = some ([], locals) := rfl
+    (decls : List LocalDecl) (locals : List SymSlot) :
+    symOperands globals layouts decls locals [] = some ([], locals) := rfl
 theorem symOperands_cons (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (locals : List SymSlot) (op : Operand) (rest : List Operand) :
-    symOperands globals layouts locals (op :: rest) =
-      match symOperand globals layouts locals op with
+    (decls : List LocalDecl) (locals : List SymSlot) (op : Operand) (rest : List Operand) :
+    symOperands globals layouts decls locals (op :: rest) =
+      match symOperand globals layouts decls locals op with
       | some (v, locals₁) =>
-        match symOperands globals layouts locals₁ rest with
+        match symOperands globals layouts decls locals₁ rest with
         | some (vs, locals₂) => some (v :: vs, locals₂)
         | none => none
       | none => none := rfl
@@ -1048,9 +1544,13 @@ theorem set?_symSlotsEval (env : SymEnv) (l : List SymSlot) (i : Nat) (s : SymSl
     set? (symSlotsEval env l) i (s.eval env) = (set? l i s).map (symSlotsEval env) := by
   unfold set?
   rw [length_symSlotsEval]
-  split
-  · exact congrArg some (symSlotsEval_set env l i s).symm
-  · rfl
+  cases Nat.decLt i l.length with
+  | isTrue h =>
+    rw [Anneal.ParametricCore.ite_prop_pos h, Anneal.ParametricCore.ite_prop_pos h]
+    exact congrArg some (symSlotsEval_set env l i s).symm
+  | isFalse h =>
+    rw [Anneal.ParametricCore.ite_prop_neg h, Anneal.ParametricCore.ite_prop_neg h]
+    rfl
 
 theorem set?_symSlotsEval_uninit (env : SymEnv) (l : List SymSlot) (i : Nat) :
     set? (symSlotsEval env l) i .uninit = (set? l i .uninit).map (symSlotsEval env) :=
@@ -1099,6 +1599,41 @@ theorem symVal_eval_of_asScalar {v : SymVal} {a : SymScalar}
   | aggregate _ _ => nomatch h
   | uninit => nomatch h
 
+theorem get?_symFieldsEval (env : SymEnv) :
+    ∀ (fs : List SymScalar) (i : Nat),
+      get? (symFieldsEval env fs) i = (get? fs i).map (fun s => Value.scalar (s.eval env))
+  | [], _ => rfl
+  | _ :: _, 0 => rfl
+  | _ :: rest, i + 1 => get?_symFieldsEval env rest i
+
+theorem length_symFieldsEval (env : SymEnv) :
+    ∀ fs : List SymScalar, length (symFieldsEval env fs) = length fs
+  | [] => rfl
+  | _ :: rest => congrArg Nat.succ (length_symFieldsEval env rest)
+
+theorem symValsAsScalars?_sound (env : SymEnv) :
+    ∀ {vs : List SymVal} {fs : List SymScalar},
+      symValsAsScalars? vs = some fs → symValsEval env vs = symFieldsEval env fs
+  | [], fs, h => by
+    injection h with h
+    subst h
+    rfl
+  | v :: rest, fs, h => by
+    change (match v.asScalar?, symValsAsScalars? rest with
+      | some s, some ss => some (s :: ss)
+      | _, _ => none) = some fs at h
+    cases hv : v.asScalar? with
+    | none => rw [hv] at h; nomatch h
+    | some s =>
+      cases hr : symValsAsScalars? rest with
+      | none => rw [hv, hr] at h; nomatch h
+      | some ss =>
+        rw [hv, hr] at h
+        injection h with h
+        subst h
+        rw [symValsEval_cons, symFieldsEval_cons, symVal_eval_of_asScalar hv env,
+          symValsAsScalars?_sound env hr]
+
 theorem symScalar_eval_of_asConst {a : SymScalar} {sc : ScalarInt}
     (h : a.asConst? = some sc) (env : SymEnv) : a.eval env = sc := by
   obtain ⟨node, fuel, wf⟩ := a
@@ -1107,6 +1642,11 @@ theorem symScalar_eval_of_asConst {a : SymScalar} {sc : ScalarInt}
     cases wf with
     | const => exact Option.some.inj h
   | var _ _ => nomatch h
+  | unaryOp _ _ => nomatch h
+  | binOp _ _ _ _ => nomatch h
+  | checkedVal _ _ _ _ => nomatch h
+  | checkedFlag _ _ _ _ => nomatch h
+  | castInt _ _ _ => nomatch h
   | wrappingOp _ _ _ => nomatch h
   | saturatingOp _ _ _ _ => nomatch h
   | uncheckedOp _ _ _ _ _ => nomatch h
@@ -1133,22 +1673,75 @@ theorem symSlotsEval_symInitLocalsAux (env : SymEnv) :
 
 /-! ## Part VI: Operand / Rvalue / Statement Soundness -/
 
+theorem nat_beq_false_of_ne {a b : Nat} (h : a ≠ b) : Nat.beq a b = false := by
+  cases hb : Nat.beq a b with
+  | false => rfl
+  | true => exact absurd (Nat.eq_of_beq_eq_true hb) h
+
+theorem nat_beq_true_of_eq {a b : Nat} (h : a = b) : Nat.beq a b = true := by
+  subst h
+  exact Nat.beq_refl a
+
+theorem nat_ble_false_of_lt {a b : Nat} (h : b < a) : Nat.ble a b = false := by
+  cases hb : Nat.ble a b with
+  | false => rfl
+  | true => exact absurd (Nat.le_of_ble_eq_true hb) (Nat.not_le_of_gt h)
+
+theorem scalarModulus_pos : ∀ n : Nat, 0 < scalarModulus n
+  | .zero => Nat.zero_lt_one
+  | .succ n => Nat.mul_pos (Nat.zero_lt_succ 255) (scalarModulus_pos n)
+
+theorem wrapScalarBits_lt (v : Nat) {m : Nat} (hm : 0 < m) : wrapScalarBits v m < m := by
+  unfold wrapScalarBits
+  cases hb : Nat.ble m v with
+  | true => exact Nat.mod_lt v hm
+  | false =>
+    exact Nat.lt_of_not_le (fun h => by
+      rw [Nat.ble_eq_true_of_le h] at hb
+      nomatch hb)
+
+theorem option_eq_some_getD {α : Type} {o : Option α} (h : o.isSome = true) (d : α) :
+    o = some (o.getD d) := by
+  cases o with
+  | none => nomatch h
+  | some _ => rfl
+
+theorem widthGuard_false {x y : ScalarInt} (h : ScWidthsOk x y) :
+    Bool.or (Nat.beq x.sizeBytes 0) (Bool.not (Nat.beq x.sizeBytes y.sizeBytes)) = false := by
+  rw [nat_beq_false_of_ne h.1, nat_beq_true_of_eq h.2]
+  rfl
+
+theorem minNegOne_guard_false {x y : ScalarInt} (h : ScNotMinNegOne x y) :
+    Bool.and
+      (Nat.beq (wrapScalarBits x.bits (scalarModulus x.sizeBytes))
+        (scalarPow2 (Nat.sub (Nat.mul x.sizeBytes 8) 1)))
+      (Nat.beq (wrapScalarBits y.bits (scalarModulus x.sizeBytes))
+        (Nat.sub (scalarModulus x.sizeBytes) 1)) = false := by
+  cases h1 : Nat.beq (wrapScalarBits x.bits (scalarModulus x.sizeBytes))
+      (scalarPow2 (Nat.sub (Nat.mul x.sizeBytes 8) 1)) with
+  | false => rfl
+  | true =>
+    cases h2 : Nat.beq (wrapScalarBits y.bits (scalarModulus x.sizeBytes))
+        (Nat.sub (scalarModulus x.sizeBytes) 1) with
+    | false => rfl
+    | true => exact absurd ⟨Nat.eq_of_beq_eq_true h1, Nat.eq_of_beq_eq_true h2⟩ h
+
 theorem symOperand_sound {globals : List CapturedAllocation} {layouts : LayoutTable}
-    {locals : List SymSlot} {op : Operand} {v : SymVal} {locals' : List SymSlot}
-    (h : symOperand globals layouts locals op = some (v, locals')) (env : SymEnv)
-    (borrows : List BorrowEntry) (callerLocals : List LocalSlot) (decls : List LocalDecl)
+    {decls : List LocalDecl} {locals : List SymSlot} {op : Operand} {v : SymVal}
+    {locals' : List SymSlot}
+    (h : symOperand globals layouts decls locals op = some (v, locals')) (env : SymEnv)
+    (borrows : List BorrowEntry) (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) :
     evalOperand (symSlotsEval env locals) op borrows globals layouts callerLocals decls
+      callStack = .ok (v.eval env) (symSlotsEval env locals') ∧
+    evalOperand (symSlotsEval env locals) op borrows globals layouts callerLocals []
       callStack = .ok (v.eval env) (symSlotsEval env locals') := by
   cases op with
   | copy p =>
     obtain ⟨loc, proj⟩ := p
     cases proj with
-    | cons _ _ => nomatch h
     | nil =>
       simp only [symOperand] at h
-      dsimp only [evalOperand]
-      rw [get?_symSlotsEval]
       cases hg : get? locals loc with
       | none => rw [hg] at h; nomatch h
       | some sl =>
@@ -1166,16 +1759,70 @@ theorem symOperand_sound {globals : List CapturedAllocation} {layouts : LayoutTa
             injection h with h1 h2
             subst h1
             subst h2
-            dsimp only [Option.map, SymSlot.eval, readProjectedValue]
-            rw [valueContainsUninit_symVal, hc]
+            refine ⟨?_, ?_⟩ <;> (
+              dsimp only [evalOperand]
+              rw [get?_symSlotsEval, hg]
+              dsimp only [Option.map, SymSlot.eval, readProjectedValue]
+              rw [valueContainsUninit_symVal, hc])
+    | cons pe rest =>
+      cases pe with
+      | field idx fty =>
+        cases rest with
+        | cons _ _ => nomatch h
+        | nil =>
+          simp only [symOperand] at h
+          cases hu : placeTouchesUnion decls layouts { local_ := loc, projection := [.field idx fty] } with
+          | true => rw [hu] at h; nomatch h
+          | false =>
+            rw [hu] at h
+            dsimp only at h
+            cases hg : get? locals loc with
+            | none => rw [hg] at h; nomatch h
+            | some sl =>
+              rw [hg] at h
+              cases sl with
+              | dead => nomatch h
+              | uninit => nomatch h
+              | init w =>
+                cases w with
+                | aggregate vidx fs =>
+                  dsimp only at h
+                  cases hf : get? fs idx with
+                  | none => rw [hf] at h; nomatch h
+                  | some s =>
+                    rw [hf] at h
+                    injection h with h
+                    injection h with h1 h2
+                    subst h1
+                    subst h2
+                    refine ⟨?_, ?_⟩
+                    · dsimp only [evalOperand]
+                      rw [get?_symSlotsEval, hg, hu]
+                      dsimp only [Option.map, SymSlot.eval, SymVal.eval, readProjectedValue]
+                      rw [get?_symFieldsEval, hf]
+                      rfl
+                    · dsimp only [evalOperand]
+                      rw [get?_symSlotsEval, hg]
+                      dsimp only [Option.map, SymSlot.eval, SymVal.eval, placeTouchesUnion,
+                        readProjectedValue]
+                      rw [get?_symFieldsEval, hf]
+                      rfl
+                | unit => nomatch h
+                | scalar _ => nomatch h
+                | uninit => nomatch h
+                | concrete _ => nomatch h
+      | deref => nomatch h
+      | index _ => nomatch h
+      | constantIndex _ _ _ => nomatch h
+      | subslice _ _ _ => nomatch h
+      | downcast _ _ => nomatch h
+      | opaqueCast _ => nomatch h
+      | unwrapUnsafeBinder _ => nomatch h
   | move p =>
     obtain ⟨loc, proj⟩ := p
     cases proj with
-    | cons _ _ => nomatch h
     | nil =>
       simp only [symOperand] at h
-      dsimp only [evalOperand]
-      rw [get?_symSlotsEval]
       cases hg : get? locals loc with
       | none => rw [hg] at h; nomatch h
       | some sl =>
@@ -1198,17 +1845,73 @@ theorem symOperand_sound {globals : List CapturedAllocation} {layouts : LayoutTa
               injection h with h1 h2
               subst h1
               subst h2
-              dsimp only [Option.map, SymSlot.eval, readProjectedValue]
-              rw [valueContainsUninit_symVal, hc]
-              dsimp only
-              rw [set?_symSlotsEval_uninit, hs]
-              rfl
+              refine ⟨?_, ?_⟩ <;> (
+                dsimp only [evalOperand]
+                rw [get?_symSlotsEval, hg]
+                dsimp only [Option.map, SymSlot.eval, readProjectedValue]
+                rw [valueContainsUninit_symVal, hc]
+                dsimp only
+                rw [set?_symSlotsEval_uninit, hs]
+                rfl)
+    | cons pe rest =>
+      cases pe with
+      | field idx fty =>
+        cases rest with
+        | cons _ _ => nomatch h
+        | nil =>
+          simp only [symOperand] at h
+          cases hu : placeTouchesUnion decls layouts { local_ := loc, projection := [.field idx fty] } with
+          | true => rw [hu] at h; nomatch h
+          | false =>
+            rw [hu] at h
+            dsimp only at h
+            cases hg : get? locals loc with
+            | none => rw [hg] at h; nomatch h
+            | some sl =>
+              rw [hg] at h
+              cases sl with
+              | dead => nomatch h
+              | uninit => nomatch h
+              | init w =>
+                cases w with
+                | aggregate vidx fs =>
+                  dsimp only at h
+                  cases hf : get? fs idx with
+                  | none => rw [hf] at h; nomatch h
+                  | some s =>
+                    rw [hf] at h
+                    injection h with h
+                    injection h with h1 h2
+                    subst h1
+                    subst h2
+                    refine ⟨?_, ?_⟩
+                    · dsimp only [evalOperand]
+                      rw [get?_symSlotsEval, hg, hu]
+                      dsimp only [Option.map, SymSlot.eval, SymVal.eval, readProjectedValue]
+                      rw [get?_symFieldsEval, hf]
+                      rfl
+                    · dsimp only [evalOperand]
+                      rw [get?_symSlotsEval, hg]
+                      dsimp only [Option.map, SymSlot.eval, SymVal.eval, placeTouchesUnion,
+                        readProjectedValue]
+                      rw [get?_symFieldsEval, hf]
+                      rfl
+                | unit => nomatch h
+                | scalar _ => nomatch h
+                | uninit => nomatch h
+                | concrete _ => nomatch h
+      | deref => nomatch h
+      | index _ => nomatch h
+      | constantIndex _ _ _ => nomatch h
+      | subslice _ _ _ => nomatch h
+      | downcast _ _ => nomatch h
+      | opaqueCast _ => nomatch h
+      | unwrapUnsafeBinder _ => nomatch h
   | constant c =>
     obtain ⟨ty, cv⟩ := c
     cases cv with
     | scalar cs =>
       simp only [symOperand] at h
-      dsimp only [evalOperand]
       cases he : evalConstValue (.scalar cs) ty globals layouts with
       | none => rw [he] at h; nomatch h
       | some w =>
@@ -1217,10 +1920,10 @@ theorem symOperand_sound {globals : List CapturedAllocation} {layouts : LayoutTa
         injection h with h1 h2
         subst h1
         subst h2
-        rfl
+        exact ⟨by dsimp only [evalOperand]; rw [he]; rfl,
+          by dsimp only [evalOperand]; rw [he]; rfl⟩
     | zeroSized =>
       simp only [symOperand] at h
-      dsimp only [evalOperand]
       cases he : evalConstValue .zeroSized ty globals layouts with
       | none => rw [he] at h; nomatch h
       | some w =>
@@ -1229,14 +1932,16 @@ theorem symOperand_sound {globals : List CapturedAllocation} {layouts : LayoutTa
         injection h with h1 h2
         subst h1
         subst h2
-        rfl
+        exact ⟨by dsimp only [evalOperand]; rw [he]; rfl,
+          by dsimp only [evalOperand]; rw [he]; rfl⟩
     | slice _ _ => nomatch h
     | indirect _ _ => nomatch h
     | unevaluated _ => nomatch h
 
 theorem symOperand_shape {globals : List CapturedAllocation} {layouts : LayoutTable}
-    {locals : List SymSlot} {op : Operand} {v : SymVal} {locals' : List SymSlot}
-    (h : symOperand globals layouts locals op = some (v, locals')) :
+    {decls : List LocalDecl} {locals : List SymSlot} {op : Operand} {v : SymVal}
+    {locals' : List SymSlot}
+    (h : symOperand globals layouts decls locals op = some (v, locals')) :
     operandIsLeadingOpaqueCastMove op = false := by
   cases op with
   | copy _ => rfl
@@ -1245,14 +1950,61 @@ theorem symOperand_shape {globals : List CapturedAllocation} {layouts : LayoutTa
     obtain ⟨loc, proj⟩ := p
     cases proj with
     | nil => rfl
-    | cons _ _ => nomatch h
+    | cons pe rest =>
+      cases pe with
+      | field _ _ => rfl
+      | deref => nomatch h
+      | index _ => nomatch h
+      | constantIndex _ _ _ => nomatch h
+      | subslice _ _ _ => nomatch h
+      | downcast _ _ => nomatch h
+      | opaqueCast _ => nomatch h
+      | unwrapUnsafeBinder _ => nomatch h
 
-theorem symOperands_sound {globals : List CapturedAllocation} {layouts : LayoutTable}
-    (env : SymEnv) (borrows : List BorrowEntry) (callerLocals : List LocalSlot)
-    (decls : List LocalDecl) (callStack : List SavedCallerFrame) :
+theorem symOperands_evalOperands_sound {globals : List CapturedAllocation} {layouts : LayoutTable}
+    {decls : List LocalDecl} (env : SymEnv) (borrows : List BorrowEntry)
+    (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame) :
     ∀ {locals : List SymSlot} {ops : List Operand} {vs : List SymVal}
       {locals' : List SymSlot},
-      symOperands globals layouts locals ops = some (vs, locals') →
+      symOperands globals layouts decls locals ops = some (vs, locals') →
+      evalOperands (symSlotsEval env locals) ops borrows globals layouts
+        callerLocals decls callStack = .ok (symValsEval env vs) (symSlotsEval env locals')
+  | locals, [], vs, locals', h => by
+    rw [symOperands_nil] at h
+    injection h with h
+    injection h with h1 h2
+    subst h1
+    subst h2
+    rfl
+  | locals, op :: rest, vs, locals', h => by
+    rw [symOperands_cons] at h
+    cases h1 : symOperand globals layouts decls locals op with
+    | none => rw [h1] at h; nomatch h
+    | some r =>
+      obtain ⟨v, locals₁⟩ := r
+      rw [h1] at h
+      dsimp only at h
+      cases h2 : symOperands globals layouts decls locals₁ rest with
+      | none => rw [h2] at h; nomatch h
+      | some r2 =>
+        obtain ⟨vs', locals₂⟩ := r2
+        rw [h2] at h
+        injection h with h
+        injection h with hv hl
+        subst hv
+        subst hl
+        simp only [evalOperands]
+        rw [(symOperand_sound h1 env borrows callerLocals callStack).1]
+        dsimp only
+        rw [symOperands_evalOperands_sound env borrows callerLocals callStack h2]
+        rfl
+
+theorem symOperands_sound {globals : List CapturedAllocation} {layouts : LayoutTable}
+    {decls : List LocalDecl} (env : SymEnv) (borrows : List BorrowEntry)
+    (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame) :
+    ∀ {locals : List SymSlot} {ops : List Operand} {vs : List SymVal}
+      {locals' : List SymSlot},
+      symOperands globals layouts decls locals ops = some (vs, locals') →
       evalOperandsWithBodyCast (symSlotsEval env locals) ops borrows globals layouts
         callerLocals decls callStack = .ok (symValsEval env vs) (symSlotsEval env locals')
   | locals, [], vs, locals', h => by
@@ -1264,13 +2016,13 @@ theorem symOperands_sound {globals : List CapturedAllocation} {layouts : LayoutT
     rfl
   | locals, op :: rest, vs, locals', h => by
     rw [symOperands_cons] at h
-    cases h1 : symOperand globals layouts locals op with
+    cases h1 : symOperand globals layouts decls locals op with
     | none => rw [h1] at h; nomatch h
     | some r =>
       obtain ⟨v, locals₁⟩ := r
       rw [h1] at h
       dsimp only at h
-      cases h2 : symOperands globals layouts locals₁ rest with
+      cases h2 : symOperands globals layouts decls locals₁ rest with
       | none => rw [h2] at h; nomatch h
       | some r2 =>
         obtain ⟨vs', locals₂⟩ := r2
@@ -1283,11 +2035,11 @@ theorem symOperands_sound {globals : List CapturedAllocation} {layouts : LayoutT
             layouts callerLocals decls callStack = .ok (v.eval env) (symSlotsEval env locals₁) := by
           unfold evalOperandWithBodyCast
           rw [symOperand_shape h1]
-          exact symOperand_sound h1 env borrows callerLocals [] callStack
+          exact (symOperand_sound h1 env borrows callerLocals callStack).2
         simp only [evalOperandsWithBodyCast]
         rw [hOp]
         dsimp only
-        rw [symOperands_sound env borrows callerLocals decls callStack h2]
+        rw [symOperands_sound env borrows callerLocals callStack h2]
         rfl
 
 theorem validateLoadedValue_of_static {layouts : LayoutTable} {decls : List LocalDecl}
@@ -1314,35 +2066,591 @@ theorem validateLoadedValue_of_static {layouts : LayoutTable} {decls : List Loca
       dsimp only
       cases ty.kind <;> first | (intro _; rfl) | (intro h; exact absurd h Bool.false_ne_true)
 
+theorem validateLoadedValue_of_validBool {layouts : LayoutTable} {decls : List LocalDecl}
+    {op : Operand} {ty : Ty} (hty : operandTy decls layouts op = some ty)
+    (hk : ty.kind = .bool) {sc : ScalarInt} (hb : sc.bits = 0 ∨ sc.bits = 1) :
+    validateLoadedValue layouts decls op (.scalar sc) = true := by
+  have hdisj : Bool.or (Nat.beq sc.bits 0) (Nat.beq sc.bits 1) = true := by
+    cases hb with
+    | inl h0 => rw [h0]; rfl
+    | inr h1 => rw [h1]; rfl
+  cases op with
+  | constant _ => rfl
+  | copy p =>
+    simp only [validateLoadedValue, hty, hk, hdisj]
+  | move p =>
+    simp only [validateLoadedValue, hty, hk, hdisj]
+
+theorem evalSignedDiv_transport (a b sz : Nat) (l₁ l₂ : List LocalSlot) (m₁ m₂ : Memory)
+    {v : Value} (h : evalSignedDiv a b sz l₁ m₁ = .ok v l₁ m₁) :
+    evalSignedDiv a b sz l₂ m₂ = .ok v l₂ m₂ := by
+  unfold evalSignedDiv at h ⊢
+  dsimp only at h ⊢
+  cases hc : Bool.and (Nat.beq (wrapScalarBits a (scalarModulus sz))
+      (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)))
+      (Nat.beq (wrapScalarBits b (scalarModulus sz)) (Nat.sub (scalarModulus sz) 1)) with
+  | true => rw [hc] at h; nomatch h
+  | false => rw [hc] at h; injection h with h1; rw [h1]
+
+theorem evalSignedRem_transport (a b sz : Nat) (l₁ l₂ : List LocalSlot) (m₁ m₂ : Memory)
+    {v : Value} (h : evalSignedRem a b sz l₁ m₁ = .ok v l₁ m₁) :
+    evalSignedRem a b sz l₂ m₂ = .ok v l₂ m₂ := by
+  unfold evalSignedRem at h ⊢
+  dsimp only at h ⊢
+  cases hc : Bool.and (Nat.beq (wrapScalarBits a (scalarModulus sz))
+      (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)))
+      (Nat.beq (wrapScalarBits b (scalarModulus sz)) (Nat.sub (scalarModulus sz) 1)) with
+  | true => rw [hc] at h; nomatch h
+  | false => rw [hc] at h; injection h with h1; rw [h1]
+
+theorem evalScalarBinOp_transport (op : BinOp) (lhs rhs : ScalarInt) (signed : Bool)
+    (l₁ l₂ : List LocalSlot) (m₁ m₂ : Memory) {v : Value}
+    (h : evalScalarBinOp op lhs rhs l₁ m₁ signed = .ok v l₁ m₁) :
+    evalScalarBinOp op lhs rhs l₂ m₂ signed = .ok v l₂ m₂ := by
+  unfold evalScalarBinOp at h ⊢
+  cases hz : Nat.beq lhs.sizeBytes 0 with
+  | true => rw [hz] at h; nomatch h
+  | false =>
+    rw [hz] at h
+    dsimp only at h ⊢
+    cases op with
+    | shl =>
+      cases hr : Nat.beq rhs.sizeBytes 0 with
+      | true => rw [hr] at h; nomatch h
+      | false => rw [hr] at h; injection h with h1; rw [h1]
+    | shlUnchecked =>
+      cases hr : Nat.beq rhs.sizeBytes 0 with
+      | true => rw [hr] at h; nomatch h
+      | false =>
+        rw [hr] at h; dsimp only at h ⊢
+        cases hb : Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits with
+        | true => rw [hb] at h; nomatch h
+        | false => rw [hb] at h; injection h with h1; rw [h1]
+    | shr =>
+      cases hr : Nat.beq rhs.sizeBytes 0 with
+      | true => rw [hr] at h; nomatch h
+      | false => rw [hr] at h; injection h with h1; rw [h1]
+    | shrUnchecked =>
+      cases hr : Nat.beq rhs.sizeBytes 0 with
+      | true => rw [hr] at h; nomatch h
+      | false =>
+        rw [hr] at h; dsimp only at h ⊢
+        cases hb : Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits with
+        | true => rw [hb] at h; nomatch h
+        | false => rw [hb] at h; injection h with h1; rw [h1]
+    | add | addWithOverflow | mul | mulWithOverflow | bitAnd | bitOr | bitXor
+    | eq | ne | lt | le | gt | ge =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true => rw [hw] at h; injection h with h1; rw [h1]
+    | sub =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true =>
+        rw [hw] at h; dsimp only at h ⊢
+        cases hb : Nat.ble rhs.bits lhs.bits <;> (rw [hb] at h; injection h with h1; rw [h1])
+    | subWithOverflow =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true =>
+        rw [hw] at h; dsimp only at h ⊢
+        cases signed with
+        | true => injection h with h1; rw [h1]
+        | false =>
+          dsimp only at h ⊢
+          cases hb : Nat.ble rhs.bits lhs.bits <;> (rw [hb] at h; injection h with h1; rw [h1])
+    | addUnchecked =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true =>
+        rw [hw] at h; dsimp only at h ⊢
+        cases signed with
+        | false =>
+          dsimp only at h ⊢
+          cases hb : Nat.ble (scalarModulus lhs.sizeBytes) (Nat.add lhs.bits rhs.bits) with
+          | true => rw [hb] at h; nomatch h
+          | false => rw [hb] at h; injection h with h1; rw [h1]
+        | true =>
+          dsimp only at h ⊢
+          cases hb : signedOverflowAdd lhs.bits rhs.bits lhs.sizeBytes with
+          | true => rw [hb] at h; nomatch h
+          | false => rw [hb] at h; injection h with h1; rw [h1]
+    | subUnchecked =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true =>
+        rw [hw] at h; dsimp only at h ⊢
+        cases signed with
+        | false =>
+          dsimp only at h ⊢
+          cases hb : Nat.ble rhs.bits lhs.bits with
+          | false => rw [hb] at h; nomatch h
+          | true =>
+            rw [hb] at h; dsimp only at h ⊢
+            cases hd : Nat.ble (scalarModulus lhs.sizeBytes) (Nat.sub lhs.bits rhs.bits) with
+            | true => rw [hd] at h; nomatch h
+            | false => rw [hd] at h; injection h with h1; rw [h1]
+        | true =>
+          dsimp only at h ⊢
+          cases hb : signedOverflowSub lhs.bits rhs.bits lhs.sizeBytes with
+          | true => rw [hb] at h; nomatch h
+          | false => rw [hb] at h; injection h with h1; rw [h1]
+    | mulUnchecked =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true =>
+        rw [hw] at h; dsimp only at h ⊢
+        cases signed with
+        | false =>
+          dsimp only at h ⊢
+          cases hb : Nat.ble (scalarModulus lhs.sizeBytes) (Nat.mul lhs.bits rhs.bits) with
+          | true => rw [hb] at h; nomatch h
+          | false => rw [hb] at h; injection h with h1; rw [h1]
+        | true =>
+          dsimp only at h ⊢
+          cases hb : signedOverflowMul lhs.bits rhs.bits lhs.sizeBytes with
+          | true => rw [hb] at h; nomatch h
+          | false => rw [hb] at h; injection h with h1; rw [h1]
+    | div =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true =>
+        rw [hw] at h; dsimp only at h ⊢
+        cases hb : Nat.beq rhs.bits 0 with
+        | true => rw [hb] at h; nomatch h
+        | false =>
+          rw [hb] at h; dsimp only at h ⊢
+          cases signed with
+          | false => injection h with h1; rw [h1]
+          | true => exact evalSignedDiv_transport lhs.bits rhs.bits lhs.sizeBytes l₁ l₂ m₁ m₂ h
+    | rem =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true =>
+        rw [hw] at h; dsimp only at h ⊢
+        cases hb : Nat.beq rhs.bits 0 with
+        | true => rw [hb] at h; nomatch h
+        | false =>
+          rw [hb] at h; dsimp only at h ⊢
+          cases signed with
+          | false => injection h with h1; rw [h1]
+          | true => exact evalSignedRem_transport lhs.bits rhs.bits lhs.sizeBytes l₁ l₂ m₁ m₂ h
+    | cmp =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true =>
+        rw [hw] at h; dsimp only at h ⊢
+        cases signed with
+        | false =>
+          dsimp only at h ⊢
+          cases heq : Nat.beq lhs.bits rhs.bits with
+          | true => rw [heq] at h; injection h with h1; rw [h1]
+          | false =>
+            rw [heq] at h; dsimp only at h ⊢
+            cases hle : Nat.ble lhs.bits rhs.bits <;> (rw [hle] at h; injection h with h1; rw [h1])
+        | true =>
+          dsimp only at h ⊢
+          cases heq : Nat.beq (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+              (wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes)) with
+          | true => rw [heq] at h; injection h with h1; rw [h1]
+          | false =>
+            rw [heq] at h; dsimp only at h ⊢
+            cases hlt : signedLt (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+                (wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes)) lhs.sizeBytes <;>
+              (rw [hlt] at h; injection h with h1; rw [h1])
+    | offset =>
+      cases hw : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rw [hw] at h; nomatch h
+      | true => rw [hw] at h; nomatch h
+
+theorem evalScalarBinOp_ok_scalar {op : BinOp} {signed : Bool} {x y sc : ScalarInt}
+    (h : evalScalarBinOp op x y [] emptyMemory signed = .ok (.scalar sc) [] emptyMemory)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp op x y locals mem signed =
+      .ok (.scalar ((symBinOpEval op signed x y).getD symDefaultScalar)) locals mem := by
+  have hsym : symBinOpEval op signed x y = some sc := by
+    unfold symBinOpEval
+    rw [h]
+  rw [hsym]
+  exact evalScalarBinOp_transport op x y signed [] locals emptyMemory mem h
+
+theorem evalScalarBinOp_ok_checked {k : SymOverflowKind} {signed : Bool} {x y sv sf : ScalarInt}
+    (h : evalScalarBinOp (symOverflowToBinOp k) x y [] emptyMemory signed =
+      .ok (.aggregate 0 [.scalar sv, .scalar sf]) [] emptyMemory)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp (symOverflowToBinOp k) x y locals mem signed =
+      .ok (.aggregate 0
+        [.scalar ((symCheckedValEval k signed x y).getD symDefaultScalar),
+         .scalar ((symCheckedFlagEval k signed x y).getD symDefaultScalar)]) locals mem := by
+  have hv : symCheckedValEval k signed x y = some sv := by
+    unfold symCheckedValEval; rw [h]
+    rfl
+  have hf : symCheckedFlagEval k signed x y = some sf := by
+    unfold symCheckedFlagEval; rw [h]
+    rfl
+  rw [hv, hf]
+  exact evalScalarBinOp_transport (symOverflowToBinOp k) x y signed [] locals emptyMemory mem h
+
+theorem symScalarBinOp_sound {op : BinOp} {signed : Bool} {a b : SymScalar} {res : SymVal}
+    {cs : List SymCond} (h : symScalarBinOp op signed a b = some (res, cs)) (env : SymEnv)
+    (hc : condsHold env cs) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp op (a.eval env) (b.eval env) locals mem signed =
+      .ok (res.eval env) locals mem := by
+  cases op with
+  | offset => nomatch h
+  | add | mul | bitAnd | bitOr | bitXor | eq | ne | lt | le | gt | ge =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1
+    change evalScalarBinOp _ (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp _ signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    exact evalScalarBinOp_ok_scalar (by
+      unfold evalScalarBinOp
+      rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]) locals mem
+  | sub =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1
+    change evalScalarBinOp .sub (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp .sub signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    cases hb : Nat.ble (b.eval env).bits (a.eval env).bits with
+    | true =>
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [hb]) locals mem
+    | false =>
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [hb]) locals mem
+  | cmp =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1
+    change evalScalarBinOp .cmp (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp .cmp signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    cases signed with
+    | false =>
+      cases heq : Nat.beq (a.eval env).bits (b.eval env).bits with
+      | true =>
+        exact evalScalarBinOp_ok_scalar (by
+          unfold evalScalarBinOp
+          rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+          dsimp only; rw [heq]) locals mem
+      | false =>
+        cases hle : Nat.ble (a.eval env).bits (b.eval env).bits <;>
+          exact evalScalarBinOp_ok_scalar (by
+            unfold evalScalarBinOp
+            rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+            dsimp only; rw [heq]; dsimp only; rw [hle]) locals mem
+    | true =>
+      cases heq : Nat.beq (wrapScalarBits (a.eval env).bits (scalarModulus (a.eval env).sizeBytes))
+          (wrapScalarBits (b.eval env).bits (scalarModulus (a.eval env).sizeBytes)) with
+      | true =>
+        exact evalScalarBinOp_ok_scalar (by
+          unfold evalScalarBinOp
+          rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+          dsimp only; rw [heq]) locals mem
+      | false =>
+        cases hlt : signedLt (wrapScalarBits (a.eval env).bits (scalarModulus (a.eval env).sizeBytes))
+            (wrapScalarBits (b.eval env).bits (scalarModulus (a.eval env).sizeBytes))
+            (a.eval env).sizeBytes <;>
+          exact evalScalarBinOp_ok_scalar (by
+            unfold evalScalarBinOp
+            rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+            dsimp only; rw [heq]; dsimp only; rw [hlt]) locals mem
+  | shl | shr =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hwa : (a.eval env).sizeBytes ≠ 0 := hc.1
+    have hwb : (b.eval env).sizeBytes ≠ 0 := hc.2.1
+    change evalScalarBinOp _ (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp _ signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    exact evalScalarBinOp_ok_scalar (by
+      unfold evalScalarBinOp
+      rw [nat_beq_false_of_ne hwa, nat_beq_false_of_ne hwb]) locals mem
+  | shlUnchecked | shrUnchecked =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hwa : (a.eval env).sizeBytes ≠ 0 := hc.1.1
+    have hwb : (b.eval env).sizeBytes ≠ 0 := hc.1.2.1
+    have hlt : (b.eval env).bits < Nat.mul (a.eval env).sizeBytes 8 := hc.1.2.2
+    change evalScalarBinOp _ (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp _ signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    exact evalScalarBinOp_ok_scalar (by
+      unfold evalScalarBinOp
+      rw [nat_beq_false_of_ne hwa, nat_beq_false_of_ne hwb]
+      dsimp only
+      rw [nat_ble_false_of_lt hlt]) locals mem
+  | addWithOverflow =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1
+    change evalScalarBinOp .addWithOverflow (a.eval env) (b.eval env) locals mem signed =
+      .ok (.aggregate 0 [.scalar ((SymScalar.checkedVal .add signed a b).eval env),
+        .scalar ((SymScalar.checkedFlag .add signed a b).eval env)]) locals mem
+    rw [SymScalar.eval_checkedVal, SymScalar.eval_checkedFlag]
+    exact evalScalarBinOp_ok_checked (k := .add) (by
+      unfold evalScalarBinOp symOverflowToBinOp
+      rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]) locals mem
+  | mulWithOverflow =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1
+    change evalScalarBinOp .mulWithOverflow (a.eval env) (b.eval env) locals mem signed =
+      .ok (.aggregate 0 [.scalar ((SymScalar.checkedVal .mul signed a b).eval env),
+        .scalar ((SymScalar.checkedFlag .mul signed a b).eval env)]) locals mem
+    rw [SymScalar.eval_checkedVal, SymScalar.eval_checkedFlag]
+    exact evalScalarBinOp_ok_checked (k := .mul) (by
+      unfold evalScalarBinOp symOverflowToBinOp
+      rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]) locals mem
+  | subWithOverflow =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1
+    change evalScalarBinOp .subWithOverflow (a.eval env) (b.eval env) locals mem signed =
+      .ok (.aggregate 0 [.scalar ((SymScalar.checkedVal .sub signed a b).eval env),
+        .scalar ((SymScalar.checkedFlag .sub signed a b).eval env)]) locals mem
+    rw [SymScalar.eval_checkedVal, SymScalar.eval_checkedFlag]
+    cases signed with
+    | true =>
+      exact evalScalarBinOp_ok_checked (k := .sub) (by
+        unfold evalScalarBinOp symOverflowToBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]) locals mem
+    | false =>
+      cases hb : Nat.ble (b.eval env).bits (a.eval env).bits <;>
+        exact evalScalarBinOp_ok_checked (k := .sub) (by
+          unfold evalScalarBinOp symOverflowToBinOp
+          rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+          dsimp only; rw [hb]) locals mem
+  | addUnchecked =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1.1
+    change evalScalarBinOp .addUnchecked (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp .addUnchecked signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    cases signed with
+    | false =>
+      have hlt : Nat.add (a.eval env).bits (b.eval env).bits < scalarModulus (a.eval env).sizeBytes :=
+        hc.1.2
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [nat_ble_false_of_lt hlt]) locals mem
+    | true =>
+      have ho : signedOverflowAdd (a.eval env).bits (b.eval env).bits (a.eval env).sizeBytes =
+          false := hc.1.2
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [ho]) locals mem
+  | subUnchecked =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1.1
+    change evalScalarBinOp .subUnchecked (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp .subUnchecked signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    cases signed with
+    | false =>
+      have hle : (b.eval env).bits ≤ (a.eval env).bits := hc.1.2.1
+      have hlt : Nat.sub (a.eval env).bits (b.eval env).bits <
+          scalarModulus (a.eval env).sizeBytes := hc.1.2.2
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only
+        rw [Nat.ble_eq_true_of_le hle]
+        dsimp only
+        rw [nat_ble_false_of_lt hlt]) locals mem
+    | true =>
+      have ho : signedOverflowSub (a.eval env).bits (b.eval env).bits (a.eval env).sizeBytes =
+          false := hc.1.2
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [ho]) locals mem
+  | mulUnchecked =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1.1
+    change evalScalarBinOp .mulUnchecked (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp .mulUnchecked signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    cases signed with
+    | false =>
+      have hlt : Nat.mul (a.eval env).bits (b.eval env).bits < scalarModulus (a.eval env).sizeBytes :=
+        hc.1.2
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [nat_ble_false_of_lt hlt]) locals mem
+    | true =>
+      have ho : signedOverflowMul (a.eval env).bits (b.eval env).bits (a.eval env).sizeBytes =
+          false := hc.1.2
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [ho]) locals mem
+  | div =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1.1
+    have hnz : (b.eval env).bits ≠ 0 := hc.1.2.1
+    change evalScalarBinOp .div (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp .div signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    cases signed with
+    | false =>
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [nat_beq_false_of_ne hnz]) locals mem
+    | true =>
+      have hm : ScNotMinNegOne (a.eval env) (b.eval env) := hc.1.2.2
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [nat_beq_false_of_ne hnz]
+        dsimp only [evalSignedDiv]
+        rw [minNegOne_guard_false hm]) locals mem
+  | rem =>
+    injection h with h; injection h with h1 h2; subst h1; subst h2
+    have hw : ScWidthsOk (a.eval env) (b.eval env) := hc.1.1
+    have hnz : (b.eval env).bits ≠ 0 := hc.1.2.1
+    change evalScalarBinOp .rem (a.eval env) (b.eval env) locals mem signed =
+      .ok (.scalar ((SymScalar.binOp .rem signed a b).eval env)) locals mem
+    rw [SymScalar.eval_binOp]
+    cases signed with
+    | false =>
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [nat_beq_false_of_ne hnz]) locals mem
+    | true =>
+      have hm : ScNotMinNegOne (a.eval env) (b.eval env) := hc.1.2.2
+      exact evalScalarBinOp_ok_scalar (by
+        unfold evalScalarBinOp
+        rw [nat_beq_false_of_ne hw.1, nat_beq_true_of_eq hw.2]
+        dsimp only; rw [nat_beq_false_of_ne hnz]
+        dsimp only [evalSignedRem]
+        rw [minNegOne_guard_false hm]) locals mem
+
+theorem evalPlaceDiscriminant_aggregate_eq {variantIdx : VariantIdx} {fs : List SymScalar}
+    {place : Place} {decls : List LocalDecl} {layouts : LayoutTable} {sc : ScalarInt}
+    (h : symAggDiscriminant? variantIdx (length fs) place decls layouts = some sc)
+    (env : SymEnv) (locals : List LocalSlot) (mem : Memory) :
+    evalPlaceDiscriminant (.aggregate variantIdx (symFieldsEval env fs)) locals mem place
+      decls layouts = .ok (.scalar sc) locals mem := by
+  unfold evalPlaceDiscriminant
+  dsimp only
+  rw [valueListContainsUninit_symFieldsEval]
+  dsimp only
+  unfold symAggDiscriminant? at h
+  cases hty : placeTyResolved decls layouts place with
+  | none =>
+    rw [hty] at h
+    injection h with h1
+    rw [← h1]
+  | some pTy =>
+    rw [hty] at h
+    dsimp only at h ⊢
+    cases hk : pTy.kind with
+    | never => rw [hk] at h; nomatch h
+    | tuple _ | array _ _ | slice _ | str =>
+      rw [hk] at h
+      dsimp only at h ⊢
+      cases hv : Nat.beq variantIdx 0 with
+      | false => rw [hv] at h; nomatch h
+      | true => rw [hv] at h; injection h with h1; rw [← h1]
+    | adt defPath _ =>
+      rw [hk] at h
+      dsimp only at h ⊢
+      rw [length_symFieldsEval]
+      cases hl : LayoutTable.lookup layouts pTy.layoutIdx with
+      | none =>
+        rw [hl] at h; dsimp only at h ⊢
+        cases hord : Bool.and (stringEq defPath "core::cmp::Ordering") (Nat.beq (length fs) 0) with
+        | false => rw [hord] at h; injection h with h1; rw [← h1]
+        | true =>
+          rw [hord] at h; dsimp only at h ⊢
+          match variantIdx, h with
+          | 0, h => injection h with h1; rw [← h1]; rfl
+          | 1, h => injection h with h1; rw [← h1]; rfl
+          | 2, h => injection h with h1; rw [← h1]; rfl
+          | _ + 3, h => nomatch h
+      | some lay =>
+        rw [hl] at h
+        cases lay with
+        | mk _ _ _ _ variants isUninhabited _ _ =>
+          cases isUninhabited with
+          | true => nomatch h
+          | false =>
+            cases variants with
+            | empty => nomatch h
+            | single expectedIdx =>
+              dsimp only at h ⊢
+              cases heq : Nat.beq variantIdx expectedIdx with
+              | false => rw [heq] at h; nomatch h
+              | true => rw [heq] at h; injection h with h1; rw [← h1]
+            | multiple _ _ variants =>
+              dsimp only at h ⊢
+              cases variants with
+              | nil =>
+                dsimp only at h ⊢
+                cases hord : Bool.and (stringEq defPath "core::cmp::Ordering") (Nat.beq (length fs) 0) with
+                | false => rw [hord] at h; injection h with h1; rw [← h1]
+                | true =>
+                  rw [hord] at h; dsimp only at h ⊢
+                  match variantIdx, h with
+                  | 0, h => injection h with h1; rw [← h1]; rfl
+                  | 1, h => injection h with h1; rw [← h1]; rfl
+                  | 2, h => injection h with h1; rw [← h1]; rfl
+                  | _ + 3, h => nomatch h
+              | cons vh vt =>
+                dsimp only at h ⊢
+                cases hvb : Nat.ble (.succ variantIdx) (length (vh :: vt)) with
+                | false => rw [hvb] at h; nomatch h
+                | true =>
+                  rw [hvb] at h; dsimp only at h ⊢
+                  cases hord : Bool.and (stringEq defPath "core::cmp::Ordering") (Nat.beq (length fs) 0) with
+                  | false => rw [hord] at h; injection h with h1; rw [← h1]
+                  | true =>
+                    rw [hord] at h; dsimp only at h ⊢
+                    match variantIdx, h with
+                    | 0, h => injection h with h1; rw [← h1]; rfl
+                    | 1, h => injection h with h1; rw [← h1]; rfl
+                    | 2, h => injection h with h1; rw [← h1]; rfl
+                    | _ + 3, h => nomatch h
+    | bool | char | int _ | uint _ | float _ | ref _ _ | rawPtr _ _
+    | fnDef _ _ | fnPtr _ _ _ _ | closure _ | alias | dynamic
+    | param _ | foreign _ | other _ =>
+      rw [hk] at h
+      injection h with h1
+      rw [← h1]
+
 theorem symRvalue_sound {globals : List CapturedAllocation} {layouts : LayoutTable}
     {decls : List LocalDecl} {locals : List SymSlot} {rv : Rvalue} {v : SymVal}
     {locals' : List SymSlot} {cs : List SymCond}
     (h : symRvalue globals layouts decls locals rv = some (v, locals', cs)) (env : SymEnv)
-    (mem : Memory) (hg : mem.globals = globals) (hb : mem.borrows = []) :
+    (hc : condsHold env cs) (mem : Memory) (hg : mem.globals = globals) (hb : mem.borrows = []) :
     evalRvalue (symSlotsEval env locals) rv mem decls layouts =
       .ok (v.eval env) (symSlotsEval env locals') mem := by
   cases rv with
   | use op =>
     simp only [symRvalue] at h
-    cases h1 : symOperand globals layouts locals op with
+    cases h1 : symOperand globals layouts decls locals op with
     | none => rw [h1] at h; nomatch h
     | some r =>
       obtain ⟨w, l₁⟩ := r
       rw [h1] at h
       dsimp only at h
-      cases h2 : loadedValueStaticOk layouts decls op with
-      | false => rw [h2] at h; nomatch h
-      | true =>
-        rw [h2] at h
-        injection h with h
-        injection h with hv h
-        injection h with hl _
-        subst hv
-        subst hl
+      have hOp := (symOperand_sound h1 env mem.borrows mem.callerLocals mem.callStack).1
+      have hTail : ∀ (v' : SymVal) (l' : List SymSlot),
+          validateLoadedValue layouts decls op (v'.eval env) = true →
+          symOperand globals layouts decls locals op = some (v', l') →
+          evalRvalue (symSlotsEval env locals) (.use op) mem decls layouts =
+            .ok (v'.eval env) (symSlotsEval env l') mem := by
+        intro v' l' hval hop
         simp only [evalRvalue]
-        rw [hg, symOperand_sound h1 env mem.borrows mem.callerLocals decls mem.callStack]
+        rw [hg, (symOperand_sound hop env mem.borrows mem.callerLocals mem.callStack).1]
         dsimp only
-        rw [validateLoadedValue_of_static h2]
+        rw [hval]
         dsimp only
         rw [hb]
         cases op with
@@ -1351,17 +2659,289 @@ theorem symRvalue_sound {globals : List CapturedAllocation} {layouts : LayoutTab
           obtain ⟨loc, proj⟩ := p
           cases proj with
           | nil => rfl
-          | cons _ _ => nomatch h1
+          | cons pe _ => cases pe <;> first | rfl | nomatch hop
         | move p =>
           obtain ⟨loc, proj⟩ := p
           cases proj with
           | nil => rfl
-          | cons _ _ => nomatch h1
+          | cons pe _ => cases pe <;> first | rfl | nomatch hop
+      cases h2 : loadedValueStaticOk layouts decls op with
+      | true =>
+        rw [h2] at h
+        injection h with h
+        injection h with hv h
+        injection h with hl _
+        subst hv
+        subst hl
+        exact hTail w l₁ (validateLoadedValue_of_static h2 _) h1
+      | false =>
+        rw [h2] at h
+        dsimp only at h
+        cases hty : operandTy decls layouts op with
+        | none => rw [hty] at h; nomatch h
+        | some ty =>
+          rw [hty] at h
+          dsimp only at h
+          cases hk : ty.kind with
+          | bool =>
+            rw [hk] at h
+            cases has : w.asScalar? with
+            | none => rw [has] at h; nomatch h
+            | some sc =>
+              rw [has] at h
+              injection h with h
+              injection h with hv h
+              injection h with hl hcs
+              subst hv
+              subst hl
+              subst hcs
+              have hval : validateLoadedValue layouts decls op (w.eval env) = true := by
+                rw [symVal_eval_of_asScalar has env]
+                exact validateLoadedValue_of_validBool hty hk hc.1.2
+              exact hTail w l₁ hval h1
+          | char | int _ | uint _ | float _ | ref _ _ | rawPtr _ _ | array _ _ | slice _
+          | str | tuple _ | adt _ _ | fnDef _ _ | fnPtr _ _ _ _ | closure _ | alias
+          | never | dynamic | param _ | foreign _ | other _ =>
+            rw [hk] at h; nomatch h
+  | unaryOp uop op =>
+    cases uop with
+    | ptrMetadata => nomatch h
+    | neg =>
+      simp only [symRvalue] at h
+      cases h1 : symOperand globals layouts decls locals op with
+      | none => rw [h1] at h; nomatch h
+      | some r =>
+        obtain ⟨w, l₁⟩ := r
+        rw [h1] at h; dsimp only at h
+        cases ha : w.asScalar? with
+        | none => rw [ha] at h; nomatch h
+        | some x =>
+          rw [ha] at h
+          injection h with h; injection h with hv h; injection h with hl hcs
+          subst hv; subst hl; subst hcs
+          simp only [evalRvalue]
+          rw [hg, (symOperand_sound h1 env mem.borrows mem.callerLocals mem.callStack).1,
+            symVal_eval_of_asScalar ha env]
+          dsimp only
+          rw [nat_beq_false_of_ne hc.1]
+          rfl
+    | not =>
+      simp only [symRvalue] at h
+      cases h1 : symOperand globals layouts decls locals op with
+      | none => rw [h1] at h; nomatch h
+      | some r =>
+        obtain ⟨w, l₁⟩ := r
+        rw [h1] at h; dsimp only at h
+        cases ha : w.asScalar? with
+        | none => rw [ha] at h; nomatch h
+        | some x =>
+          rw [ha] at h; dsimp only at h
+          cases hty : operandTy decls layouts op with
+          | none => rw [hty] at h; nomatch h
+          | some ty =>
+            rw [hty] at h; dsimp only at h
+            cases hk : ty.kind with
+            | bool =>
+              rw [hk] at h
+              injection h with h; injection h with hv h; injection h with hl hcs
+              subst hv; subst hl; subst hcs
+              simp only [evalRvalue]
+              rw [hg, (symOperand_sound h1 env mem.borrows mem.callerLocals mem.callStack).1,
+                symVal_eval_of_asScalar ha env]
+              dsimp only [evalUnaryNot]
+              rw [hty]
+              dsimp only
+              rw [hk]
+              dsimp only
+              rw [nat_beq_true_of_eq hc.1.1]
+              dsimp only
+              cases hc.1.2 with
+              | inl h0 =>
+                rw [nat_beq_true_of_eq h0]
+                show RvalueEvalResult.ok (.scalar ⟨1, 1⟩) _ _ =
+                  .ok (.scalar ⟨match Nat.beq (x.eval env).bits 0 with | true => 1 | false => 0, 1⟩) _ _
+                rw [nat_beq_true_of_eq h0]
+              | inr h1b =>
+                show (match Nat.beq (x.eval env).bits 0 with
+                  | true => RvalueEvalResult.ok (.scalar ⟨1, 1⟩) _ _
+                  | false => match Nat.beq (x.eval env).bits 1 with
+                    | true => .ok (.scalar ⟨0, 1⟩) _ _
+                    | false => .ub) =
+                  .ok (.scalar ⟨match Nat.beq (x.eval env).bits 0 with | true => 1 | false => 0, 1⟩) _ _
+                rw [h1b]
+            | uint _ | int _ =>
+              rw [hk] at h
+              injection h with h; injection h with hv h; injection h with hl hcs
+              subst hv; subst hl; subst hcs
+              simp only [evalRvalue]
+              rw [hg, (symOperand_sound h1 env mem.borrows mem.callerLocals mem.callStack).1,
+                symVal_eval_of_asScalar ha env]
+              dsimp only [evalUnaryNot]
+              rw [hty]
+              dsimp only
+              rw [hk]
+              dsimp only
+              rw [nat_beq_false_of_ne hc.1]
+              rfl
+            | char | float _ | ref _ _ | rawPtr _ _ | array _ _ | slice _ | str | tuple _
+            | adt _ _ | fnDef _ _ | fnPtr _ _ _ _ | closure _ | alias | never | dynamic
+            | param _ | foreign _ | other _ =>
+              rw [hk] at h; nomatch h
+  | binaryOp op lhsOp rhsOp =>
+    simp only [symRvalue] at h
+    cases h1 : symOperand globals layouts decls locals lhsOp with
+    | none => rw [h1] at h; nomatch h
+    | some r1 =>
+      obtain ⟨lv, l₁⟩ := r1
+      rw [h1] at h; dsimp only at h
+      cases h2 : symOperand globals layouts decls l₁ rhsOp with
+      | none => rw [h2] at h; nomatch h
+      | some r2 =>
+        obtain ⟨rv', l₂⟩ := r2
+        rw [h2] at h; dsimp only at h
+        cases ha : lv.asScalar? with
+        | none => rw [ha] at h; nomatch h
+        | some a =>
+          cases hb' : rv'.asScalar? with
+          | none => rw [ha, hb'] at h; nomatch h
+          | some b =>
+            rw [ha, hb'] at h; dsimp only at h
+            cases hs : symScalarBinOp op (operandIsSigned decls lhsOp layouts) a b with
+            | none => rw [hs] at h; nomatch h
+            | some r3 =>
+              obtain ⟨res, cs'⟩ := r3
+              rw [hs] at h
+              injection h with h; injection h with hv h; injection h with hl hcs
+              subst hv; subst hl; subst hcs
+              simp only [evalRvalue]
+              rw [hg, (symOperand_sound h1 env mem.borrows mem.callerLocals mem.callStack).1]
+              dsimp only
+              rw [(symOperand_sound h2 env mem.borrows mem.callerLocals mem.callStack).1,
+                symVal_eval_of_asScalar ha env, symVal_eval_of_asScalar hb' env]
+              cases op with
+              | offset => nomatch hs
+              | add | addUnchecked | addWithOverflow | sub | subUnchecked | subWithOverflow
+              | mul | mulUnchecked | mulWithOverflow | div | rem | bitXor | bitAnd | bitOr
+              | shl | shlUnchecked | shr | shrUnchecked | eq | lt | le | ne | ge | gt | cmp =>
+                exact symScalarBinOp_sound hs env hc (symSlotsEval env l₂) mem
+  | cast ck op targetTy =>
+    cases ck with
+    | intToInt =>
+      simp only [symRvalue] at h
+      cases h1 : symOperand globals layouts decls locals op with
+      | none => rw [h1] at h; nomatch h
+      | some r =>
+        obtain ⟨w, l₁⟩ := r
+        rw [h1] at h; dsimp only at h
+        cases ha : w.asScalar? with
+        | none => rw [ha] at h; nomatch h
+        | some x =>
+          cases ht : intCastTargetBytes targetTy.kind with
+          | none => rw [ha, ht] at h; nomatch h
+          | some tb =>
+            rw [ha, ht] at h
+            injection h with h; injection h with hv h; injection h with hl hcs
+            subst hv; subst hl; subst hcs
+            simp only [evalRvalue]
+            rw [hg, (symOperand_sound h1 env mem.borrows mem.callerLocals mem.callStack).1,
+              symVal_eval_of_asScalar ha env]
+            dsimp only
+            rw [nat_beq_false_of_ne hc.1, ht]
+            rfl
+    | _ => nomatch h
+  | aggregate ak ops =>
+    cases ak with
+    | tuple =>
+      simp only [symRvalue] at h
+      cases h1 : symOperands globals layouts decls locals ops with
+      | none => rw [h1] at h; nomatch h
+      | some r =>
+        obtain ⟨vs, l₁⟩ := r
+        rw [h1] at h; dsimp only at h
+        cases h2 : symValsAsScalars? vs with
+        | none => rw [h2] at h; nomatch h
+        | some fs =>
+          rw [h2] at h
+          injection h with h; injection h with hv h; injection h with hl _
+          subst hv; subst hl
+          simp only [evalRvalue]
+          rw [hg, symOperands_evalOperands_sound env mem.borrows mem.callerLocals mem.callStack h1,
+            symValsAsScalars?_sound env h2]
+          rfl
+    | array _ =>
+      simp only [symRvalue] at h
+      cases h1 : symOperands globals layouts decls locals ops with
+      | none => rw [h1] at h; nomatch h
+      | some r =>
+        obtain ⟨vs, l₁⟩ := r
+        rw [h1] at h; dsimp only at h
+        cases h2 : symValsAsScalars? vs with
+        | none => rw [h2] at h; nomatch h
+        | some fs =>
+          rw [h2] at h
+          injection h with h; injection h with hv h; injection h with hl _
+          subst hv; subst hl
+          simp only [evalRvalue]
+          rw [hg, symOperands_evalOperands_sound env mem.borrows mem.callerLocals mem.callStack h1,
+            symValsAsScalars?_sound env h2]
+          rfl
+    | closure _ =>
+      simp only [symRvalue] at h
+      cases h1 : symOperands globals layouts decls locals ops with
+      | none => rw [h1] at h; nomatch h
+      | some r =>
+        obtain ⟨vs, l₁⟩ := r
+        rw [h1] at h; dsimp only at h
+        cases h2 : symValsAsScalars? vs with
+        | none => rw [h2] at h; nomatch h
+        | some fs =>
+          rw [h2] at h
+          injection h with h; injection h with hv h; injection h with hl _
+          subst hv; subst hl
+          simp only [evalRvalue]
+          rw [hg, symOperands_evalOperands_sound env mem.borrows mem.callerLocals mem.callStack h1,
+            symValsAsScalars?_sound env h2]
+          rfl
+    | adt _ _ _ => nomatch h
+    | rawPtr _ _ => nomatch h
+    | coroutine _ => nomatch h
+  | discriminant place =>
+    obtain ⟨ploc, pproj⟩ := place
+    cases pproj with
+    | cons _ _ => nomatch h
+    | nil =>
+      simp only [symRvalue] at h
+      cases hg' : get? locals ploc with
+      | none => rw [hg'] at h; nomatch h
+      | some sl =>
+        rw [hg'] at h
+        cases sl with
+        | dead => nomatch h
+        | uninit => nomatch h
+        | init w =>
+          cases w with
+          | aggregate vidx fs =>
+            dsimp only at h
+            cases hd : symAggDiscriminant? vidx (length fs) { local_ := ploc, projection := [] }
+                decls layouts with
+            | none => rw [hd] at h; nomatch h
+            | some sc =>
+              rw [hd] at h
+              injection h with h; injection h with hv h; injection h with hl _
+              subst hv; subst hl
+              simp only [evalRvalue]
+              rw [get?_symSlotsEval, hg']
+              exact evalPlaceDiscriminant_aggregate_eq hd env (symSlotsEval env locals) mem
+          | unit => nomatch h
+          | scalar _ => nomatch h
+          | uninit => nomatch h
+          | concrete _ => nomatch h
   | _ => nomatch h
 
 theorem symStmt_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir} {stmt : Statement}
     {f' : SymFrame} {cs : List SymCond}
-    (h : symStmt cfg.body.allocations body p.frame stmt = some (f', cs)) (env : SymEnv) :
+    (h : symStmt cfg.body.allocations body p.frame stmt = some (f', cs)) (env : SymEnv)
+    (hc : condsHold env cs) :
     evalStmt (p.toMachineState cfg env) stmt body.localDecls body.layouts =
       MirStepNode.step ({ p with frame := f' }.toMachineState cfg env) := by
   obtain ⟨kind, span⟩ := stmt
@@ -1410,6 +2990,42 @@ theorem symStmt_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir} {stmt
         injection h with h1 _
         subst h1
         rfl
+  | deinit dst =>
+    obtain ⟨dloc, dproj⟩ := dst
+    cases dproj with
+    | cons _ _ => nomatch h
+    | nil =>
+      simp only [symStmt] at h
+      dsimp only [evalStmt, SymProg.toMachineState, SymFrame.eval]
+      rw [get?_symSlotsEval]
+      cases hg : get? p.frame.locals dloc with
+      | none => rw [hg] at h; nomatch h
+      | some sl =>
+        rw [hg] at h
+        cases sl with
+        | dead => nomatch h
+        | uninit =>
+          dsimp only at h
+          dsimp only [Option.map, SymSlot.eval]
+          rw [set?_symSlotsEval_uninit]
+          cases hs : set? p.frame.locals dloc .uninit with
+          | none => rw [hs] at h; nomatch h
+          | some l' =>
+            rw [hs] at h
+            injection h with h; injection h with h1 _
+            subst h1
+            rfl
+        | init _ =>
+          dsimp only at h
+          dsimp only [Option.map, SymSlot.eval]
+          rw [set?_symSlotsEval_uninit]
+          cases hs : set? p.frame.locals dloc .uninit with
+          | none => rw [hs] at h; nomatch h
+          | some l' =>
+            rw [hs] at h
+            injection h with h; injection h with h1 _
+            subst h1
+            rfl
   | assign dst rv =>
     obtain ⟨dloc, dproj⟩ := dst
     cases dproj with
@@ -1422,12 +3038,6 @@ theorem symStmt_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir} {stmt
         obtain ⟨v, locals₁, cs'⟩ := r
         rw [hr] at h
         dsimp only at h
-        have hEval := symRvalue_sound hr env (p.toMemory cfg env) rfl rfl
-        dsimp only [evalStmt]
-        rw [show (p.toMachineState cfg env).frame.locals = symSlotsEval env p.frame.locals from rfl,
-          show (p.toMachineState cfg env).memory = p.toMemory cfg env from rfl, hEval]
-        dsimp only
-        rw [get?_symSlotsEval]
         cases hg : get? locals₁ dloc with
         | none => rw [hg] at h; nomatch h
         | some sl =>
@@ -1436,69 +3046,45 @@ theorem symStmt_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir} {stmt
           | dead => nomatch h
           | uninit =>
             dsimp only at h
-            dsimp only [Option.map, SymSlot.eval]
-            rw [set?_symSlotsEval_init]
             cases hs : set? locals₁ dloc (.init v) with
             | none => rw [hs] at h; nomatch h
             | some l₂ =>
               rw [hs] at h
               injection h with h
-              injection h with h1 _
+              injection h with h1 hcs
               subst h1
+              subst hcs
+              have hEval := symRvalue_sound hr env hc (p.toMemory cfg env) rfl rfl
+              dsimp only [evalStmt]
+              rw [show (p.toMachineState cfg env).frame.locals = symSlotsEval env p.frame.locals from rfl,
+                show (p.toMachineState cfg env).memory = p.toMemory cfg env from rfl, hEval]
+              dsimp only
+              rw [get?_symSlotsEval, hg]
+              dsimp only [Option.map, SymSlot.eval]
+              rw [set?_symSlotsEval_init, hs]
               rfl
           | init w =>
             dsimp only at h
-            dsimp only [Option.map, SymSlot.eval]
-            rw [set?_symSlotsEval_init]
             cases hs : set? locals₁ dloc (.init v) with
             | none => rw [hs] at h; nomatch h
             | some l₂ =>
               rw [hs] at h
               injection h with h
-              injection h with h1 _
+              injection h with h1 hcs
               subst h1
+              subst hcs
+              have hEval := symRvalue_sound hr env hc (p.toMemory cfg env) rfl rfl
+              dsimp only [evalStmt]
+              rw [show (p.toMachineState cfg env).frame.locals = symSlotsEval env p.frame.locals from rfl,
+                show (p.toMachineState cfg env).memory = p.toMemory cfg env from rfl, hEval]
+              dsimp only
+              rw [get?_symSlotsEval, hg]
+              dsimp only [Option.map, SymSlot.eval]
+              rw [set?_symSlotsEval_init, hs]
               rfl
   | _ => nomatch h
 
 /-! ## Part VII: Side Conditions Imply Trusted Intrinsic Definedness -/
-
-theorem nat_beq_false_of_ne {a b : Nat} (h : a ≠ b) : Nat.beq a b = false := by
-  cases hb : Nat.beq a b with
-  | false => rfl
-  | true => exact absurd (Nat.eq_of_beq_eq_true hb) h
-
-theorem nat_beq_true_of_eq {a b : Nat} (h : a = b) : Nat.beq a b = true := by
-  subst h
-  exact Nat.beq_refl a
-
-theorem nat_ble_false_of_lt {a b : Nat} (h : b < a) : Nat.ble a b = false := by
-  cases hb : Nat.ble a b with
-  | false => rfl
-  | true => exact absurd (Nat.le_of_ble_eq_true hb) (Nat.not_le_of_gt h)
-
-theorem scalarModulus_pos : ∀ n : Nat, 0 < scalarModulus n
-  | .zero => Nat.zero_lt_one
-  | .succ n => Nat.mul_pos (Nat.zero_lt_succ 255) (scalarModulus_pos n)
-
-theorem wrapScalarBits_lt (v : Nat) {m : Nat} (hm : 0 < m) : wrapScalarBits v m < m := by
-  unfold wrapScalarBits
-  cases hb : Nat.ble m v with
-  | true => exact Nat.mod_lt v hm
-  | false =>
-    exact Nat.lt_of_not_le (fun h => by
-      rw [Nat.ble_eq_true_of_le h] at hb
-      nomatch hb)
-
-theorem option_eq_some_getD {α : Type} {o : Option α} (h : o.isSome = true) (d : α) :
-    o = some (o.getD d) := by
-  cases o with
-  | none => nomatch h
-  | some _ => rfl
-
-theorem widthGuard_false {x y : ScalarInt} (h : ScWidthsOk x y) :
-    Bool.or (Nat.beq x.sizeBytes 0) (Bool.not (Nat.beq x.sizeBytes y.sizeBytes)) = false := by
-  rw [nat_beq_false_of_ne h.1, nat_beq_true_of_eq h.2]
-  rfl
 
 theorem unGuard_false {x : ScalarInt} (h : x.sizeBytes ≠ 0) :
     Bool.or (Nat.beq x.sizeBytes 0) (Nat.beq 4 0) = false := by
@@ -1656,21 +3242,6 @@ theorem evalUncheckedMul_isSome {x y : ScalarInt} {sg : Bool} (hw : ScWidthsOk x
     dsimp only
     rw [hb]
     rfl
-
-theorem minNegOne_guard_false {x y : ScalarInt} (h : ScNotMinNegOne x y) :
-    Bool.and
-      (Nat.beq (wrapScalarBits x.bits (scalarModulus x.sizeBytes))
-        (scalarPow2 (Nat.sub (Nat.mul x.sizeBytes 8) 1)))
-      (Nat.beq (wrapScalarBits y.bits (scalarModulus x.sizeBytes))
-        (Nat.sub (scalarModulus x.sizeBytes) 1)) = false := by
-  cases h1 : Nat.beq (wrapScalarBits x.bits (scalarModulus x.sizeBytes))
-      (scalarPow2 (Nat.sub (Nat.mul x.sizeBytes 8) 1)) with
-  | false => rfl
-  | true =>
-    cases h2 : Nat.beq (wrapScalarBits y.bits (scalarModulus x.sizeBytes))
-        (Nat.sub (scalarModulus x.sizeBytes) 1) with
-    | false => rfl
-    | true => exact absurd ⟨Nat.eq_of_beq_eq_true h1, Nat.eq_of_beq_eq_true h2⟩ h
 
 theorem evalUncheckedDiv_isSome {x y : ScalarInt} {sg : Bool} (hw : ScWidthsOk x y)
     (hz : scBitsAt x y ≠ 0)
@@ -2035,15 +3606,16 @@ theorem symIntrinsic_sound {kind : RustIntrinsicKind} {target : ResolvedCallTarg
 /-! ## Part IX: Terminator Soundness against `evalTerminator` -/
 
 theorem symOperand_bodyCast_sound {globals : List CapturedAllocation} {layouts : LayoutTable}
-    {locals : List SymSlot} {op : Operand} {v : SymVal} {locals' : List SymSlot}
-    (h : symOperand globals layouts locals op = some (v, locals')) (env : SymEnv)
-    (borrows : List BorrowEntry) (callerLocals : List LocalSlot) (decls : List LocalDecl)
+    {decls : List LocalDecl} {locals : List SymSlot} {op : Operand} {v : SymVal}
+    {locals' : List SymSlot}
+    (h : symOperand globals layouts decls locals op = some (v, locals')) (env : SymEnv)
+    (borrows : List BorrowEntry) (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) :
     evalOperandWithBodyCast (symSlotsEval env locals) op borrows globals layouts callerLocals
       decls callStack = .ok (v.eval env) (symSlotsEval env locals') := by
   unfold evalOperandWithBodyCast
   rw [symOperand_shape h]
-  exact symOperand_sound h env borrows callerLocals [] callStack
+  exact (symOperand_sound h env borrows callerLocals callStack).2
 
 theorem evalDirectRustIntrinsic?_of_sym {kind : RustIntrinsicKind}
     {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
@@ -2073,7 +3645,7 @@ theorem symTerm_step_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
     exact ⟨.silent, rfl⟩
   | switchInt discr targets =>
     simp only [symTerm] at h
-    cases ho : symOperand cfg.body.allocations body.layouts p.frame.locals discr with
+    cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals discr with
     | none => rw [ho] at h; nomatch h
     | some r =>
       obtain ⟨v, locals'⟩ := r
@@ -2090,13 +3662,14 @@ theorem symTerm_step_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
           rw [hk] at h
           injection h with h1 _
           subst h1
-          dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval]
+          dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval,
+            bodyLocalDeclsOf]
           rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env,
             symScalar_eval_of_asConst hk env]
           exact ⟨_, rfl⟩
   | assert cond expected target unwind =>
     simp only [symTerm] at h
-    cases ho : symOperand cfg.body.allocations body.layouts p.frame.locals cond with
+    cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals cond with
     | none => rw [ho] at h; nomatch h
     | some r =>
       obtain ⟨v, locals'⟩ := r
@@ -2109,7 +3682,8 @@ theorem symTerm_step_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
         injection h with h1 h2
         subst h1
         subst h2
-        dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval]
+        dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval,
+          bodyLocalDeclsOf]
         rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env]
         refine ⟨.silent, ?_⟩
         cases expected with
@@ -2180,7 +3754,7 @@ theorem symTerm_step_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
       | some defPath =>
         rw [hf] at h
         dsimp only at h
-        cases ho : symOperands cfg.body.allocations body.layouts p.frame.locals argOps with
+        cases ho : symOperands cfg.body.allocations body.layouts body.localDecls p.frame.locals argOps with
         | none => rw [ho] at h; nomatch h
         | some r =>
           obtain ⟨args, locals'⟩ := r
@@ -2195,7 +3769,7 @@ theorem symTerm_step_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
             refine ⟨.silent, ?_⟩
             simp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval,
               resolveCallTarget, hf, bodyLocalDeclsOf]
-            rw [symOperands_sound env _ _ _ _ ho]
+            rw [symOperands_sound env _ _ _ ho]
             simp only [hl, checkCalleeTargetCompatible_direct, pushCalleeFrame, initLocals,
               ← symSlotsEval_symInitLocalsAux]
             rfl
@@ -2245,7 +3819,7 @@ theorem symTerm_step_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
                           refine ⟨.silent, ?_⟩
                           simp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory,
                             SymFrame.eval, resolveCallTarget, hf, bodyLocalDeclsOf]
-                          rw [symOperands_sound env _ _ _ _ ho]
+                          rw [symOperands_sound env _ _ _ ho]
                           simp only [hl, hx]
                           rw [evalDirectRustIntrinsic?_of_sym hk hi]
                           dsimp only
@@ -2352,7 +3926,7 @@ theorem symTerm_branch_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir
   cases kind with
   | switchInt discr targets =>
     simp only [symTerm] at h
-    cases ho : symOperand cfg.body.allocations body.layouts p.frame.locals discr with
+    cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals discr with
     | none => rw [ho] at h; nomatch h
     | some r =>
       obtain ⟨v, locals'⟩ := r
@@ -2373,7 +3947,8 @@ theorem symTerm_branch_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir
           refine ⟨rfl, fun c q hm hh => ?_⟩
           obtain ⟨_, hq⟩ := symSwitchAlts_sound p a locals' targets.otherwise env [] _ c q hm hh
           subst hq
-          dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval]
+          dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval,
+            bodyLocalDeclsOf]
           rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env]
           exact ⟨_, rfl⟩
   | goto _ => nomatch h
@@ -2430,8 +4005,14 @@ theorem symProgStep_dispatch {cfg : SymConfig} {p : SymProg} {r : SymStepRes}
           stepMirFn cfg.body (p.toMachineState cfg env) =
             evalTerminator (p.toMachineState cfg env) bb.terminator
               (some (p.active.getD cfg.body)))) := by
-  unfold symProgStep at h
+  unfold symProgStep symProgStepWith at h
   dsimp only at h
+  have hbbEq : (match p.active with
+      | none => get? cfg.body.basicBlocks p.frame.blockIdx
+      | some activeBody => get? activeBody.basicBlocks p.frame.blockIdx) =
+      get? (p.active.getD cfg.body).basicBlocks p.frame.blockIdx := by
+    cases p.active <;> rfl
+  rw [hbbEq] at h
   rw [stepMirFn_toMachineState]
   cases hph : (p.active.getD cfg.body).phase with
   | other _ =>
@@ -2463,13 +4044,10 @@ theorem symProgStep_dispatch {cfg : SymConfig} {p : SymProg} {r : SymStepRes}
       | none =>
         rw [hs] at h
         dsimp only at h ⊢
-        cases hl : (p.frame.stmtIdx == length bb.statements) with
-        | false =>
-          rw [hl] at h
-          exact absurd h.symm hr
-        | true =>
-          rw [hl] at h
-          exact Or.inr ⟨h, rfl⟩
+        revert h
+        refine Anneal.Firewall.ite_eq_elim_imp (fun hLen hTerm => ?_) (fun _ hStuck => absurd hStuck.symm hr)
+        rw [Anneal.ParametricCore.ite_prop_pos hLen]
+        exact Or.inr ⟨hTerm, rfl⟩
 
 /-- **Single-step soundness** against unmodified `stepMirFn`. -/
 theorem symProgStep_sound {cfg : SymConfig} {p p' : SymProg} {cs : List SymCond}
@@ -2478,9 +4056,10 @@ theorem symProgStep_sound {cfg : SymConfig} {p p' : SymProg} {cs : List SymCond}
       MirStepNode.emitStep obs (p'.toMachineState cfg env) := by
   obtain ⟨bb, _, hcase⟩ := symProgStep_dispatch h (fun h' => SymStepRes.noConfusion h') env
   rcases hcase with ⟨stmt, f', cs', _, hst, hr, hstep⟩ | ⟨ht, hstep⟩
-  · injection hr with h1 _
+  · injection hr with h1 h2
     subst h1
-    rw [hstep, symStmt_sound hst env]
+    subst h2
+    rw [hstep, symStmt_sound hst env hc]
     exact ⟨.silent, rfl⟩
   · rw [hstep]
     exact symTerm_step_sound ht env hc
@@ -2892,5 +4471,153 @@ theorem symProgRunSteps_done_refutes {cfg : SymConfig} {k : Nat} {p q : SymProg}
     ∀ bound, ¬ ReachesDoneWithinV2026 cfg.body post bound (p.toMachineState cfg env) :=
   fun _ => not_reachesDoneWithinV2026_of_stepsTo_done_fail
     (symProgRunSteps_sound cfg env k h hc) hd hn
+
+/-! ## Part XIII: `Chunk8BlockTree` Lookup & `Anneal.Firewall` / `BoolCertCut` Bridges -/
+
+/-- `Trusted.Sequence.get?` agrees unconditionally with `Anneal.ParametricCore.listGet?`. -/
+theorem sequenceGet?_eq_listGet? {α : Type} (xs : List α) (idx : Nat) :
+    get? xs idx = Anneal.ParametricCore.listGet? xs idx :=
+  Anneal.ParametricCore.listGet?_eq_of_rec get? (fun _ => rfl) (fun _ _ => rfl)
+    (fun _ _ _ => rfl) xs idx
+
+/-- Pointwise lookup agreement makes `symProgStepWith` identical to `symProgStep`. -/
+theorem symProgStepWith_eq_symProgStep {cfg : SymConfig}
+    {rootLook : Nat → Option BasicBlockData}
+    (hLook : ∀ idx, rootLook idx = get? cfg.body.basicBlocks idx) (p : SymProg) :
+    symProgStepWith cfg rootLook p = symProgStep cfg p := by
+  unfold symProgStep symProgStepWith
+  cases p.active with
+  | some _ => rfl
+  | none =>
+    dsimp only
+    rw [hLook p.frame.blockIdx]
+
+/-- Dense `Chunk8BlockTree` block-context step agreement (`O(log N)` spine + `O(1)` leaf). -/
+theorem symProgStepWith_blockCtx_eq (cfg : SymConfig) (ctx : SymBlockCtx cfg.body)
+    (p : SymProg) :
+    symProgStepWith cfg ctx.tree.lookup? p = symProgStep cfg p :=
+  symProgStepWith_eq_symProgStep
+    (fun idx => (ctx.valid.2 idx).trans (sequenceGet?_eq_listGet? cfg.body.basicBlocks idx).symm) p
+
+/-- `symProgRunStepsWith` agrees with `symProgRunSteps` under any valid `SymBlockCtx`. -/
+theorem symProgRunStepsWith_blockCtx_eq (cfg : SymConfig) (ctx : SymBlockCtx cfg.body) :
+    ∀ (n : Nat) (p : SymProg),
+      symProgRunStepsWith cfg ctx.tree.lookup? n p = symProgRunSteps cfg n p
+  | 0, _ => rfl
+  | n + 1, p => by
+    change (symProgStepWith cfg ctx.tree.lookup? p).bindRun
+        (symProgRunStepsWith cfg ctx.tree.lookup? n) =
+      (symProgStep cfg p).bindRun (symProgRunSteps cfg n)
+    rw [symProgStepWith_blockCtx_eq cfg ctx p]
+    have ih : symProgRunStepsWith cfg ctx.tree.lookup? n = symProgRunSteps cfg n :=
+      funext (symProgRunStepsWith_blockCtx_eq cfg ctx n)
+    rw [ih]
+
+/-- `symRunChunksWith` agrees with `symRunChunks` under any valid `SymBlockCtx`. -/
+theorem symRunChunksWith_blockCtx_eq (cfg : SymConfig) (ctx : SymBlockCtx cfg.body) :
+    ∀ (ks : List SymChunk) (p : SymProg),
+      symRunChunksWith cfg ctx.tree.lookup? ks p = symRunChunks cfg ks p
+  | [], _ => rfl
+  | k :: ks, p => by
+    change (symProgRunStepsWith cfg ctx.tree.lookup? k p).bindRun
+        (symRunChunksWith cfg ctx.tree.lookup? ks) =
+      (symProgRunSteps cfg k p).bindRun (symRunChunks cfg ks)
+    rw [symProgRunStepsWith_blockCtx_eq cfg ctx k p]
+    have ih : symRunChunksWith cfg ctx.tree.lookup? ks = symRunChunks cfg ks :=
+      funext (symRunChunksWith_blockCtx_eq cfg ctx ks)
+    rw [ih]
+
+/-- End-to-end multi-chunk soundness directly through a dense `Chunk8BlockTree`
+(`SymBlockCtx`) without linear `basicBlocks` traversal. -/
+theorem symRunChunksWith_sound {cfg : SymConfig} (ctx : SymBlockCtx cfg.body)
+    {ks : List SymChunk} {args : List SymVal} {v : SymVal} {fin : SymProg} {cs : List SymCond}
+    (h : symRunChunksWith cfg ctx.tree.lookup? ks (symProgEntry cfg args) = .ret v fin cs)
+    (env : SymEnv) (hc : condsHold env cs) {post : MirOutcome → Prop}
+    (hpost : post (.normal (v.eval env, (fin.toMachineState cfg env).memory))) :
+    ReachesDoneWithinV2026 cfg.body post (chunksTotal ks)
+        ((symProgEntry cfg args).toMachineState cfg env) ∧
+      ExecWithinStepsV2026 cfg.body (symValsEval env args) cfg.callees post (chunksTotal ks) ∧
+      ExecStatefulWithinStepsV2026 cfg.body (symValsEval env args) (symEntryMemory cfg)
+        cfg.callees post (chunksTotal ks) ∧
+      MirWpConverges cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees) post ∧
+      MirNoUBTree (mirTree cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees)) := by
+  rw [symRunChunksWith_blockCtx_eq] at h
+  exact symRunChunks_sound h env hc hpost
+
+/-- Tagged `Anneal.Firewall.Firewall` wrapper over symbolic side conditions. -/
+abbrev SymCondFirewall (tag : Nat) (env : SymEnv) (cs : List SymCond) : Prop :=
+  Anneal.Firewall.Firewall tag (condsHold env cs)
+
+/-- `Anneal.Firewall.IndexedCut` barrier sealing `ReachesDoneWithinV2026` at
+explicit symbolic chunk budgets so intermediate goals never expose expanded
+`MirSemantics` propositions to outer tactics. -/
+abbrev SymChunkCut (cfg : SymConfig) (post : MirOutcome → Prop)
+    (budget : Nat) (st : MachineState) : Prop :=
+  Anneal.Firewall.IndexedCut (fun n s => ReachesDoneWithinV2026 cfg.body post n s) budget st
+
+/-- Seal a terminal symbolic chunk behind `SymChunkCut` (`IndexedCut`), consuming
+a `SymCondFirewall`-wrapped side-condition proof. -/
+theorem symChunkCut_ret {cfg : SymConfig} {k tag : Nat} {p : SymProg} {v : SymVal}
+    {fin : SymProg} {cs : List SymCond} {env : SymEnv} {post : MirOutcome → Prop}
+    (h : symProgRunSteps cfg k p = .ret v fin cs)
+    (hc : SymCondFirewall tag env cs)
+    (hpost : post (.normal (v.eval env, (fin.toMachineState cfg env).memory))) :
+    SymChunkCut cfg post k (p.toMachineState cfg env) :=
+  Anneal.Firewall.seal_cut
+    (symProgRunSteps_ret_sound h env (Anneal.Firewall.unwrap hc) hpost)
+
+/-- Prepend a symbolic checkpoint chunk (`k₁` steps) onto a sealed `SymChunkCut`
+(`k₂` steps) via `Anneal.Firewall.step_cut` and `StepStageCut` composition. -/
+theorem symChunkCut_step {cfg : SymConfig} {k₁ k₂ tag : Nat} {p q : SymProg}
+    {cs : List SymCond} {env : SymEnv} {post : MirOutcome → Prop}
+    (h : symProgRunSteps cfg k₁ p = .step q cs)
+    (hc : SymCondFirewall tag env cs)
+    (hNext : SymChunkCut cfg post k₂ (q.toMachineState cfg env)) :
+    SymChunkCut cfg post (k₁ + k₂) (p.toMachineState cfg env) :=
+  Anneal.Firewall.step_cut
+    (fun hReach =>
+      reachesDoneWithinV2026_of_stepsTo
+        (symProgRunSteps_sound cfg env k₁ h (Anneal.Firewall.unwrap hc)) hReach)
+    hNext
+
+/-- Unseal a `SymChunkCut` at the symbolic entry state into all top-level
+`V2026_06_01` convergence and safety theorems via `Anneal.Firewall.finish_cut`. -/
+theorem symChunkCut_entry_sound {cfg : SymConfig} {args : List SymVal} {budget : Nat}
+    {env : SymEnv} {post : MirOutcome → Prop}
+    (hCut : SymChunkCut cfg post budget ((symProgEntry cfg args).toMachineState cfg env)) :
+    ExecWithinStepsV2026 cfg.body (symValsEval env args) cfg.callees post budget ∧
+      MirWpConverges cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees) post ∧
+      MirNoUBTree (mirTree cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees)) := by
+  have hR : ReachesDoneWithinV2026 cfg.body post budget
+      ((symProgEntry cfg args).toMachineState cfg env) :=
+    Anneal.Firewall.finish_cut (fun h => h) hCut
+  have hE : ExecWithinStepsV2026 cfg.body (symValsEval env args) cfg.callees post budget := by
+    unfold ExecWithinStepsV2026
+    rw [← symProgEntry_toMachineState]
+    exact hR
+  exact ⟨hE, mirWpConverges_of_reachesDoneWithinV2026 hE,
+    mirNoUBTree_of_reachesDoneWithinV2026 hE⟩
+
+/-- Discharge a multi-chunk symbolic run through a sealed `@[irreducible]`
+`Framework.StepWp.BoolCertCut` reflective certificate. -/
+theorem symRunChunks_of_boolCert {Code : Type} {check : Code → Bool} {cert : Code}
+    {cfg : SymConfig} {ks : List SymChunk} {args : List SymVal} {v : SymVal}
+    {fin : SymProg} {cs : List SymCond} {env : SymEnv} {post : MirOutcome → Prop}
+    (hCert : BoolCertCut check cert)
+    (hSound : check cert = true → symRunChunks cfg ks (symProgEntry cfg args) = .ret v fin cs)
+    (hc : condsHold env cs)
+    (hpost : post (.normal (v.eval env, (fin.toMachineState cfg env).memory))) :
+    ExecWithinStepsV2026 cfg.body (symValsEval env args) cfg.callees post (chunksTotal ks) ∧
+      MirWpConverges cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees) post ∧
+      MirNoUBTree (mirTree cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees)) := by
+  have hRun := BoolCertCut.elim hSound hCert
+  obtain ⟨_, hE, _, hW, hU⟩ := symRunChunks_sound hRun env hc hpost
+  exact ⟨hE, hW, hU⟩
 
 end Anneal.MirSymExec.ChunkedCallV2026

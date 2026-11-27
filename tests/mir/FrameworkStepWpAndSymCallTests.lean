@@ -360,14 +360,15 @@ theorem add_scaled_concrete_156 :
 def addScaledClaim : Claim :=
   { body := addScaledCallerBody
     pre := fun args => ∃ b m k, args = [su b, su m, su k] ∧ b < M64 ∧ m < M64 ∧ k < M64 ∧
-      m * k < M64 ∧ b + m * k < M64
+      b + m * k < M64
     post := fun args r => ∃ b m k, args = [su b, su m, su k] ∧ r = su (b + m * k)
     callees := [mulScaledCalleeBody] }
 
 theorem add_scaled_verificationResult : VerificationResult addScaledClaim := by
   refine verificationResult_of_symRunChunks addScaledClaim scaledCfg rfl rfl [6, 7, 7, 4]
     [.scalar vb, .scalar vm, .scalar vk] (.scalar vres) scaledFin scaledConds scaled_chunks ?_
-  intro args ⟨b, m, k, hargs, hb, hm, hk, hmk, hbmk⟩
+  intro args ⟨b, m, k, hargs, hb, hm, hk, hbmk⟩
+  have hmk : m * k < M64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hbmk
   exact ⟨scaledEnv b m k, hargs ▸ rfl, scaled_conds_hold hb hm hk hmk hbmk,
     ⟨b, m, k, hargs, add_scaled_symbolic_value hb hm hk hmk hbmk⟩⟩
 
@@ -375,7 +376,7 @@ theorem add_scaled_verificationResult : VerificationResult addScaledClaim := by
 def addScaledStatefulClaim : StatefulClaim :=
   { body := addScaledCallerBody
     pre := fun args mem => (∃ b m k, args = [su b, su m, su k] ∧ b < M64 ∧ m < M64 ∧ k < M64 ∧
-      m * k < M64 ∧ b + m * k < M64) ∧ mem = symEntryMemory scaledCfg
+      b + m * k < M64) ∧ mem = symEntryMemory scaledCfg
     post := fun args _ r _ => ∃ b m k, args = [su b, su m, su k] ∧ r = su (b + m * k)
     callees := [mulScaledCalleeBody] }
 
@@ -384,9 +385,75 @@ theorem add_scaled_statefulVerificationResult :
   refine statefulVerificationResult_of_symRunChunks addScaledStatefulClaim scaledCfg rfl rfl
     [6, 7, 7, 4] [.scalar vb, .scalar vm, .scalar vk] (.scalar vres) scaledFin scaledConds
     scaled_chunks ?_
-  intro args mem ⟨⟨b, m, k, hargs, hb, hm, hk, hmk, hbmk⟩, hmem⟩
+  intro args mem ⟨⟨b, m, k, hargs, hb, hm, hk, hbmk⟩, hmem⟩
+  have hmk : m * k < M64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hbmk
   exact ⟨hmem, scaledEnv b m k, hargs ▸ rfl, scaled_conds_hold hb hm hk hmk hbmk,
     ⟨b, m, k, hargs, add_scaled_symbolic_value hb hm hk hmk hbmk⟩⟩
+
+/-- Dense `Chunk8BlockTree` (`SymBlockCtx`) + `Anneal.Firewall` (`Firewall` /
+`IndexedCut`) + `BoolCertCut` convergence witness for `add_scaled`. -/
+def scaledBlockCtx : SymBlockCtx scaledCfg.body := SymBlockCtx.ofBody scaledCfg.body
+
+theorem scaled_chunks_blockCtx :
+    symRunChunksWith scaledCfg scaledBlockCtx.tree.lookup? [6, 7, 7, 4] scaledEntry =
+      .ret (.scalar vres) scaledFin scaledConds := by
+  rw [symRunChunksWith_blockCtx_eq scaledCfg scaledBlockCtx]
+  exact scaled_chunks
+
+/-- Reflective `BoolCertCut` certificate verifying that the 4-chunk pipeline
+reduces to a `.ret` (load-bearing via `symRunChunks_of_boolCert`). -/
+def scaledChunkCertCheck : List SymChunk → Bool :=
+  fun ks =>
+    match ks with
+    | [6, 7, 7, 4] => true
+    | _ => false
+
+theorem scaled_chunk_boolCert : BoolCertCut scaledChunkCertCheck [6, 7, 7, 4] :=
+  BoolCertCut.seal scaledChunkCertCheck [6, 7, 7, 4] rfl
+
+theorem scaled_chunk_boolCert_sound (_h : scaledChunkCertCheck [6, 7, 7, 4] = true) :
+    symRunChunks scaledCfg [6, 7, 7, 4] scaledEntry =
+      .ret (.scalar vres) scaledFin scaledConds :=
+  scaled_chunks
+
+/-- Sealed `SymChunkCut` (`IndexedCut`) + `SymCondFirewall` (`Firewall`)
+4-chunk pipeline over `add_scaled`, plus `Chunk8BlockTree` `symRunChunksWith_sound`
+and `BoolCertCut` `symRunChunks_of_boolCert`. -/
+theorem add_scaled_blockCtx_firewall {b m k : Nat} (hb : b < M64) (hm : m < M64) (hk : k < M64)
+    (hbmk : b + m * k < M64) :
+    ExecWithinStepsV2026 addScaledCallerBody [su b, su m, su k] [mulScaledCalleeBody]
+        (mirNormalPost (fun r _ => r = su (b + m * k))) 24 ∧
+      MirWpConverges addScaledCallerBody
+        (initMachineStateWithCallees addScaledCallerBody [su b, su m, su k] [mulScaledCalleeBody])
+        (mirNormalPost (fun r _ => r = su (b + m * k))) ∧
+      MirNoUBTree (mirTree addScaledCallerBody
+        (initMachineStateWithCallees addScaledCallerBody [su b, su m, su k]
+          [mulScaledCalleeBody])) := by
+  have hmk : m * k < M64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hbmk
+  have hConds := scaled_conds_hold hb hm hk hmk hbmk
+  have hpost : mirNormalPost (fun r _ => r = su (b + m * k))
+      (.normal ((SymVal.scalar vres).eval (scaledEnv b m k),
+        (scaledFin.toMachineState scaledCfg (scaledEnv b m k)).memory)) := by
+    show Value.scalar (vres.eval (scaledEnv b m k)) = su (b + m * k)
+    rw [scaled_vres_eval hb hm hk hmk hbmk]
+  have hTree := (symRunChunksWith_sound scaledBlockCtx scaled_chunks_blockCtx (scaledEnv b m k)
+    hConds hpost).2.1
+  have hCert := (symRunChunks_of_boolCert scaled_chunk_boolCert scaled_chunk_boolCert_sound
+    hConds hpost).2.1
+  let hCut4 : SymChunkCut scaledCfg (mirNormalPost (fun r _ => r = su (b + m * k))) 4
+      (scaledCp3.toMachineState scaledCfg (scaledEnv b m k)) :=
+    symChunkCut_ret scaled_chunk4 (Anneal.Firewall.wrap 4 trivial) hpost
+  let hCut3 : SymChunkCut scaledCfg (mirNormalPost (fun r _ => r = su (b + m * k))) (7 + 4)
+      (scaledCp2.toMachineState scaledCfg (scaledEnv b m k)) :=
+    symChunkCut_step scaled_chunk3 (Anneal.Firewall.wrap 3 ⟨hConds.2.2.1, trivial⟩) hCut4
+  let hCut2 : SymChunkCut scaledCfg (mirNormalPost (fun r _ => r = su (b + m * k))) (7 + (7 + 4))
+      (scaledCp1.toMachineState scaledCfg (scaledEnv b m k)) :=
+    symChunkCut_step scaled_chunk2 (Anneal.Firewall.wrap 2 ⟨hConds.1, hConds.2.1, trivial⟩) hCut3
+  let hCut1 : SymChunkCut scaledCfg (mirNormalPost (fun r _ => r = su (b + m * k)))
+      (6 + (7 + (7 + 4))) (scaledEntry.toMachineState scaledCfg (scaledEnv b m k)) :=
+    symChunkCut_step scaled_chunk1 (Anneal.Firewall.wrap 1 trivial) hCut2
+  have hRes := symChunkCut_entry_sound hCut1
+  exact ⟨hTree, hCert, hRes.2.2⟩
 
 /-- The 23-step prefix (everything but the root `return`). -/
 theorem scaled_chunk4_prefix :
@@ -515,6 +582,185 @@ theorem mix_concrete :
       (mirNormalPost (fun r _ => r = .scalar ⟨0x04030201, 4⟩)) 5 :=
   (symRunChunks_sound (post := mirNormalPost (fun r _ => r = .scalar ⟨0x04030201, 4⟩))
     mix_chunk (pairEnv 0x01020304 1) (mix_conds_hold _ _) rfl).2.1
+
+/-! ### Companion: `addWithOverflow` + field proj + `!bool` + `cast .intToInt` + `deinit` + `aggregate` + `discriminant` -/
+
+/-- `(u32, bool)` tuple layout / type. -/
+def pairU32BoolLayout : TypeLayout :=
+  { size := { bytes := 8 }
+    align := { bytes := 4 }
+    backendRepr := .scalarPair (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+      (.initialized (.int 8 false) { start := 0, end_ := 1 })
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1]
+    variants := .single 0
+    isUninhabited := false }
+
+def pairU32BoolTy : Ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := 3 }
+def u64Ty : Ty := { kind := .uint .u64, layoutIdx := 2 }
+
+/--
+```text
+fn checked_add_cast(a: u32, b: u32) -> u64 {
+  // bb0: StorageLive(_3); _3 = AddWithOverflow(copy _1, copy _2);
+  //      StorageLive(_4); _4 = Not(copy (_3.1));
+  //      assert(move _4, expected = true) -> bb1
+  // bb1: StorageLive(_5); _5 = (copy (_3.0)) as u64;
+  //      StorageLive(_6); _6 = (copy _5,);
+  //      StorageLive(_7); _7 = discriminant(_6);
+  //      _0 = Add(move _5, move _7);
+  //      Deinit(_6); StorageDead(_7); StorageDead(_6); StorageDead(_5);
+  //      StorageDead(_4); StorageDead(_3); return
+}
+``` -/
+def checkedAddCastBody : CapturedMir :=
+  { defPath := "checked_add_cast::checked_add_cast"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 2
+    localDecls :=
+      [ decl u64Ty "_0", decl u32Ty' "a", decl u32Ty' "b"
+      , decl pairU32BoolTy "_3", decl boolTy "_4", decl u64Ty "_5"
+      , decl { kind := .tuple [.uint .u64], layoutIdx := 2 } "_6", decl u64Ty "_7" ]
+    basicBlocks :=
+      [ { statements :=
+            [ st (.storageLive 3)
+            , st (.assign (pl 3) (.binaryOp .addWithOverflow (.copy (pl 1)) (.copy (pl 2))))
+            , st (.storageLive 4)
+            , st (.assign (pl 4) (.unaryOp .not (.copy { local_ := 3, projection := [.field 1 boolTy] }))) ]
+          terminator := tm (.assert (.move (pl 4)) true 1 .unreachable)
+          isCleanup := false }
+      , { statements :=
+            [ st (.storageLive 5)
+            , st (.assign (pl 5) (.cast .intToInt (.copy { local_ := 3, projection := [.field 0 u32Ty'] }) u64Ty))
+            , st (.storageLive 6)
+            , st (.assign (pl 6) (.aggregate .tuple [.copy (pl 5)]))
+            , st (.storageLive 7)
+            , st (.assign (pl 7) (.discriminant (pl 6)))
+            , st (.assign (pl 0) (.binaryOp .add (.move (pl 5)) (.move (pl 7))))
+            , st (.deinit (pl 6))
+            , st (.storageDead 7), st (.storageDead 6), st (.storageDead 5)
+            , st (.storageDead 4), st (.storageDead 3) ]
+          terminator := tm .return_
+          isCleanup := false } ]
+    fnAbi :=
+      { args := [{ layout := u32Layout', mode := .direct }, { layout := u32Layout', mode := .direct }]
+        ret := { layout := usizeLayout, mode := .direct }
+        conv := .rust
+        canUnwind := false }
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true
+        entries := [u32Layout', boolLayout, usizeLayout, pairU32BoolLayout] }
+    allocations := [] }
+
+def checkedAddCastCfg : SymConfig := { body := checkedAddCastBody, callees := [] }
+
+abbrev vcaVal : SymScalar := .checkedVal .add false vx vy
+abbrev vcaFlg : SymScalar := .checkedFlag .add false vx vy
+abbrev vcaNot : SymScalar := .unaryOp .notBool vcaFlg
+abbrev vcaWide : SymScalar := .castInt false 8 vcaVal
+abbrev vcaSum : SymScalar := .binOp .add false vcaWide (.const ⟨0, 8⟩)
+
+def checkedAddCastEntry : SymProg := symProgEntry checkedAddCastCfg [.scalar vx, .scalar vy]
+
+def checkedAddCastCp1 : SymProg :=
+  { frame :=
+      { blockIdx := 1, stmtIdx := 0
+        locals := [U, I vx, I vy, .init (.aggregate 0 [vcaVal, vcaFlg]), U, D, D, D] }
+    stack := [], active := none }
+
+def checkedAddCastCp2 : SymProg :=
+  { frame :=
+      { blockIdx := 1, stmtIdx := 7
+        locals := [I vcaSum, I vx, I vy, .init (.aggregate 0 [vcaVal, vcaFlg]), U, U,
+                   .init (.aggregate 0 [vcaWide]), U] }
+    stack := [], active := none }
+
+def checkedAddCastFin : SymProg :=
+  { frame := { blockIdx := 1, stmtIdx := 13, locals := [I vcaSum, I vx, I vy, D, D, D, D, D] }
+    stack := [], active := none }
+
+abbrev checkedAddCastConds : List SymCond :=
+  [ .widthsMatch vx vy
+  , .validBool vcaFlg
+  , .assertHolds vcaNot true
+  , .widthNonzero vcaVal
+  , .widthsMatch vcaWide (.const ⟨0, 8⟩) ]
+
+/-- Chunk 1 (5 steps): `addWithOverflow`, field `.1` proj, `!bool`, `assert`. -/
+theorem checkedAddCast_chunk1 :
+    symProgRunSteps checkedAddCastCfg 5 checkedAddCastEntry =
+      .step checkedAddCastCp1 [.widthsMatch vx vy, .validBool vcaFlg, .assertHolds vcaNot true] :=
+  rfl
+
+/-- Chunk 2 (7 steps): field `.0` proj, `cast .intToInt`, `aggregate`,
+`discriminant`, `binaryOp .add`. -/
+theorem checkedAddCast_chunk2 :
+    symProgRunSteps checkedAddCastCfg 7 checkedAddCastCp1 =
+      .step checkedAddCastCp2 [.widthNonzero vcaVal, .widthsMatch vcaWide (.const ⟨0, 8⟩)] := rfl
+
+/-- Chunk 3 (7 steps): `deinit`, `StorageDead`s, `return`. -/
+theorem checkedAddCast_chunk3 :
+    symProgRunSteps checkedAddCastCfg 7 checkedAddCastCp2 =
+      .ret (.scalar vcaSum) checkedAddCastFin [] := rfl
+
+/-- Full 19-step pipeline in 3 `rfl` chunks `[5, 7, 7]` exercising
+`addWithOverflow`, field projections, `unaryOp .not` on `bool`, `assert`,
+`cast .intToInt`, `aggregate`, `discriminant`, `binaryOp .add`, and `deinit`. -/
+theorem checkedAddCast_chunk :
+    symRunChunks checkedAddCastCfg [5, 7, 7] checkedAddCastEntry =
+      .ret (.scalar vcaSum) checkedAddCastFin checkedAddCastConds := by
+  rw [symRunChunks_eq]
+  exact symProgRunSteps_trans checkedAddCast_chunk1
+    (symProgRunSteps_trans checkedAddCast_chunk2 checkedAddCast_chunk3)
+
+abbrev M32 : Nat := scalarModulus 4
+
+/-- Universal `checked_add_cast`: for all `a, b : Nat` with `a + b < 2^32`,
+returns `a + b` as `u64` within 19 steps (choice-free). -/
+theorem checkedAddCast_symbolic {a b : Nat} (hab : a + b < M32) :
+    ExecWithinStepsV2026 checkedAddCastBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩] []
+      (mirNormalPost (fun r _ => r = .scalar ⟨a + b, 8⟩)) 19 := by
+  have hlt64 : a + b < M64 := Nat.lt_trans hab (by decide : M32 < M64)
+  have hSum : Nat.add a b < scalarModulus 4 := hab
+  have hBle : Nat.ble (scalarModulus 4) (Nat.add a b) = false := nat_ble_false_of_lt hSum
+  have hEvalVal : vcaVal.eval (pairEnv a b) = ⟨a + b, 4⟩ := by
+    rw [SymScalar.eval_checkedVal, SymScalar.eval_var, SymScalar.eval_var]
+    show (some { bits := wrapScalarBits (Nat.add a b) (scalarModulus 4), sizeBytes := 4 }).getD
+      symDefaultScalar = _
+    rw [wrapScalarBits_of_lt hSum]
+    rfl
+  have hEvalFlg : vcaFlg.eval (pairEnv a b) = ⟨0, 1⟩ := by
+    rw [SymScalar.eval_checkedFlag, SymScalar.eval_var, SymScalar.eval_var]
+    show (some (ScalarInt.mk
+      (match Nat.ble (scalarModulus 4) (Nat.add a b) with | true => 1 | false => 0) 1)).getD
+      symDefaultScalar = _
+    rw [hBle]
+    rfl
+  have hEvalNot : vcaNot.eval (pairEnv a b) = ⟨1, 1⟩ := by
+    rw [SymScalar.eval_unaryOp, hEvalFlg]; rfl
+  have hEvalWide : vcaWide.eval (pairEnv a b) = ⟨a + b, 8⟩ := by
+    rw [SymScalar.eval_castInt, hEvalVal]
+    unfold symCastIntEval
+    dsimp only
+    rw [wrapScalarBits_of_lt hlt64]
+  have hEvalSum : vcaSum.eval (pairEnv a b) = ⟨a + b, 8⟩ := by
+    rw [SymScalar.eval_binOp, hEvalWide, SymScalar.eval_const]
+    show (some { bits := wrapScalarBits ((a + b) + 0) (scalarModulus 8), sizeBytes := 8 }).getD
+      symDefaultScalar = _
+    rw [Nat.add_zero, wrapScalarBits_of_lt hlt64]
+    rfl
+  have hConds : condsHold (pairEnv a b) checkedAddCastConds := by
+    refine ⟨⟨Nat.succ_ne_zero 3, rfl⟩, ?_, ?_, ?_, ?_, trivial⟩
+    · dsimp only [SymCond.holds]; rw [hEvalFlg]; exact ⟨rfl, Or.inl rfl⟩
+    · dsimp only [SymCond.holds]; rw [hEvalNot]
+    · dsimp only [SymCond.holds]; rw [hEvalVal]; exact Nat.succ_ne_zero 3
+    · dsimp only [SymCond.holds]; rw [hEvalWide]; exact ⟨eight_ne_zero, rfl⟩
+  have hPost : mirNormalPost (fun r _ => r = .scalar ⟨a + b, 8⟩)
+      (.normal ((SymVal.scalar vcaSum).eval (pairEnv a b),
+        (checkedAddCastFin.toMachineState checkedAddCastCfg (pairEnv a b)).memory)) := by
+    show Value.scalar (vcaSum.eval (pairEnv a b)) = .scalar ⟨a + b, 8⟩
+    rw [hEvalSum]
+  exact (symRunChunks_sound checkedAddCast_chunk (pairEnv a b) hConds hPost).2.1
 
 /-! ### Symbolic `SwitchInt` fork (`SymStepRes.branch`) -/
 
@@ -813,6 +1059,252 @@ theorem cd_statefulVerificationResult :
   subst hMem
   exact ⟨16, cd_exec16⟩
 
+/-! ### Universal `countdown(n)` for ALL `2 * n < 2^32` (Symbolic Loop Body + `StepBoundV2026` + `WlpV2026` + Active `BoolCertCut`) -/
+
+def cdCfg : SymConfig := { body := cdBody, callees := [] }
+
+abbrev vcdAcc : SymScalar := .var 0 4
+abbrev vcdI : SymScalar := .var 1 4
+abbrev vcdSub : SymScalar := .binOp .sub false vcdI (.const ⟨1, 4⟩)
+abbrev vcdAdd : SymScalar := .binOp .add false vcdAcc (.const ⟨2, 4⟩)
+
+def cdSymEntry : SymProg := symProgEntry cdCfg [.scalar vcdI]
+def cdSymHead (acc i : SymScalar) : SymProg :=
+  { frame := { blockIdx := 1, stmtIdx := 0, locals := [I acc, I i] }, stack := [], active := none }
+def cdSymBodyStart : SymProg :=
+  { frame := { blockIdx := 2, stmtIdx := 0, locals := [I vcdAcc, I vcdI] }, stack := [], active := none }
+
+/-- Symbolic 2-step entry prefix of `countdown(n)` for arbitrary `n` (`rfl`). -/
+theorem cd_sym_pre :
+    symProgRunSteps cdCfg 2 cdSymEntry =
+      .step { frame := { blockIdx := 1, stmtIdx := 0
+                         locals := [.init (.concrete (.scalar ⟨0, 4⟩)), I vcdI] }
+              stack := [], active := none } [] := rfl
+
+/-- Symbolic 3-step loop body (`bb2 -> bb1`) for arbitrary `(acc, i)` (`rfl`),
+exercising `symRvalue (.binaryOp .sub)` and `symRvalue (.binaryOp .add)`. -/
+theorem cd_sym_body :
+    symProgRunSteps cdCfg 3 cdSymBodyStart =
+      .step (cdSymHead vcdAdd vcdSub)
+        [.widthsMatch vcdI (.const ⟨1, 4⟩), .widthsMatch vcdAcc (.const ⟨2, 4⟩)] := rfl
+
+/-- Active reflective `BoolCertCut` sealing a computable check that the
+symbolic entry prefix and 3-step loop body match the expected checkpoints. -/
+def cdChunkCertCheck : Unit → Bool :=
+  fun _ =>
+    match symProgRunSteps cdCfg 2 cdSymEntry, symProgRunSteps cdCfg 3 cdSymBodyStart with
+    | .step _ [], .step _ [_, _] => true
+    | _, _ => false
+
+theorem cd_chunk_boolCert : BoolCertCut cdChunkCertCheck () :=
+  BoolCertCut.seal cdChunkCertCheck () rfl
+
+/-- Symbolic 1-step entry `cdInit n → cdHead 0 n` for every `n : Nat`. -/
+theorem cd_pre_forall (n : Nat) :
+    StepsToV2026 cdBody 2 (initMachineStateWithCallees cdBody [.scalar ⟨n, 4⟩] [])
+      (cdHead 0 n) := by
+  have h := symProgRunSteps_sound cdCfg (pairEnv 0 n) 2 cd_sym_pre trivial
+  unfold cdSymEntry at h
+  rw [symProgEntry_toMachineState] at h
+  exact h
+
+/-- Observable `.vis` loop-head `switchInt` step for `i = k + 1` (stays in loop). -/
+theorem cd_head_step_succ (acc k : Nat) :
+    v2026Step cdBody (cdHead acc (k + 1)) =
+      .step (cdSymBodyStart.toMachineState cdCfg (pairEnv acc (k + 1))) := rfl
+
+/-- Observable `.vis` loop-head `switchInt` exit step for `i = 0`. -/
+theorem cd_head_step_zero (acc : Nat) :
+    v2026Step cdBody (cdHead acc 0) = .step (cdExit acc) := rfl
+
+/-- Terminal return step at `bb3` for any accumulator `acc`. -/
+theorem cd_exit_done_forall (acc : Nat) :
+    v2026Step cdBody (cdExit acc) = .done (.normal (.scalar ⟨acc, 4⟩, cdInit.memory)) := rfl
+
+/-- One full 4-step loop iteration `cdHead acc (k + 1) →⁴ cdHead (acc + 2) k`
+for EVERY `acc, k` without `u32` overflow, proved via `cd_sym_body` +
+`symProgRunSteps_sound`. -/
+theorem cd_iter_forall (acc k : Nat) (hacc : acc + 2 < M32) (hk : k < M32) :
+    StepsToV2026 cdBody 4 (cdHead acc (k + 1)) (cdHead (acc + 2) k) := by
+  have hConds : condsHold (pairEnv acc (k + 1))
+      [.widthsMatch vcdI (.const ⟨1, 4⟩), .widthsMatch vcdAcc (.const ⟨2, 4⟩)] :=
+    ⟨⟨Nat.succ_ne_zero 3, rfl⟩, ⟨Nat.succ_ne_zero 3, rfl⟩, trivial⟩
+  have hBody := symProgRunSteps_sound cdCfg (pairEnv acc (k + 1)) 3 cd_sym_body hConds
+  have hSub : vcdSub.eval (pairEnv acc (k + 1)) = ⟨k, 4⟩ := by
+    rw [SymScalar.eval_binOp, SymScalar.eval_var, SymScalar.eval_const]
+    have hle : Nat.ble 1 (k + 1) = true := Nat.ble_eq_true_of_le (Nat.succ_le_succ (Nat.zero_le k))
+    show (match (match Nat.ble 1 (k + 1) with
+      | true => RvalueEvalResult.ok (.scalar ⟨wrapScalarBits (Nat.sub (k + 1) 1) (scalarModulus 4), 4⟩)
+          [] emptyMemory
+      | false => RvalueEvalResult.ok (.scalar ⟨wrapScalarBits (Nat.sub (Nat.add (scalarModulus 4)
+          (wrapScalarBits (k + 1) (scalarModulus 4))) (wrapScalarBits 1 (scalarModulus 4)))
+          (scalarModulus 4), 4⟩) [] emptyMemory) with
+      | .ok (.scalar sc) _ _ => some sc | _ => none).getD symDefaultScalar = _
+    rw [hle]
+    have hsub1 : Nat.sub (k + 1) 1 = k := Nat.add_sub_cancel k 1
+    dsimp only
+    rw [hsub1, wrapScalarBits_of_lt hk]
+    rfl
+  have hAdd : vcdAdd.eval (pairEnv acc (k + 1)) = ⟨acc + 2, 4⟩ := by
+    rw [SymScalar.eval_binOp, SymScalar.eval_var, SymScalar.eval_const]
+    show (some { bits := wrapScalarBits (acc + 2) (scalarModulus 4), sizeBytes := 4 }).getD
+      symDefaultScalar = _
+    rw [wrapScalarBits_of_lt hacc]
+    rfl
+  have hEnd : (cdSymHead vcdAdd vcdSub).toMachineState cdCfg (pairEnv acc (k + 1)) =
+      cdHead (acc + 2) k := by
+    unfold cdSymHead cdHead SymProg.toMachineState SymFrame.eval symSlotsEval SymSlot.eval
+      SymVal.eval
+    simp only [List.map, hAdd, hSub]
+    rfl
+  rw [hEnd] at hBody
+  exact StepsToV2026.step (cd_head_step_succ acc k) hBody
+
+/-- Multi-iteration exact trace: `k` iterations from `cdHead acc k` reach
+`cdHead (acc + 2 * k) 0` in exactly `4 * k` steps. -/
+theorem cd_iters_exact :
+    ∀ (k acc : Nat), acc + 2 * k < M32 →
+      StepsToV2026 cdBody (4 * k) (cdHead acc k) (cdHead (acc + 2 * k) 0)
+  | 0, acc, _ => StepsToV2026.refl _
+  | k + 1, acc, hB => by
+    have h2 : acc + 2 * (k + 1) = (acc + 2) + 2 * k := by
+      rw [Nat.mul_succ, ← Nat.add_assoc, Nat.add_right_comm acc (2 * k) 2]
+    have hacc2 : acc + 2 < M32 :=
+      Nat.lt_of_le_of_lt (Nat.le_add_right (acc + 2) (2 * k)) (h2 ▸ hB)
+    have hk2 : k ≤ 2 * k := by
+      have : 1 * k ≤ 2 * k := Nat.mul_le_mul_right k (Nat.succ_le_succ (Nat.zero_le 1))
+      rw [Nat.one_mul] at this
+      exact this
+    have hklt : k < M32 :=
+      Nat.lt_of_le_of_lt (Nat.le_trans hk2 (Nat.le_add_left (2 * k) (acc + 2))) (h2 ▸ hB)
+    have h1 := cd_iter_forall acc k hacc2 hklt
+    have hrest := cd_iters_exact k (acc + 2) (h2 ▸ hB)
+    have htot := h1.trans hrest
+    have h4 : 4 + 4 * k = 4 * (k + 1) := by rw [Nat.mul_succ, Nat.add_comm]
+    rw [h4, ← h2] at htot
+    exact htot
+
+/-- **Universal Pass 1 (quantitative step bound & safety via `v2026_loop_countdown`)**:
+for ALL `n : Nat` with `2 * n < 2^32`, `countdown(n)` reaches `2 * n` in
+`n * 4 + 2` steps from the loop head (`4 * n + 4` from entry). -/
+theorem cd_pass1_forall (n : Nat) (hn : 2 * n < M32) :
+    ExecWithinStepsV2026 cdBody [.scalar ⟨n, 4⟩] []
+      (mirNormalPost (fun r _ => r = .scalar ⟨2 * n, 4⟩)) (n * 4 + 4) := by
+  let inv : Nat → MachineState → Prop :=
+    fun i st => i ≤ n ∧ st = cdHead (2 * (n - i)) i
+  have hExit : ∀ st, inv 0 st →
+      ReachesDoneWithinV2026 cdBody (mirNormalPost (fun r _ => r = .scalar ⟨2 * n, 4⟩)) 2 st := by
+    intro st ⟨_, hst⟩
+    rw [hst, Nat.sub_zero]
+    exact reachesDoneWithinV2026_of_step (cd_head_step_zero (2 * n))
+      (reachesDoneWithinV2026_of_done (cd_exit_done_forall (2 * n)) rfl)
+  have hStep : ∀ k st, inv (k + 1) st →
+      ReachesDoneWithinV2026 cdBody (mirNormalPost (fun r _ => r = .scalar ⟨2 * n, 4⟩)) 2 st ∨
+        BoundedReachV2026 cdBody (inv k) 4 st := by
+    intro k st ⟨hkLe, hst⟩
+    right
+    rw [hst]
+    have hsub : n - k = (n - (k + 1)) + 1 := by
+      have h1 : k < n := hkLe
+      have h2 := Nat.sub_add_cancel (Nat.le_of_lt h1)
+      have h3 : (n - (k + 1)) + (k + 1) = n := Nat.sub_add_cancel hkLe
+      have h4 : ((n - (k + 1)) + 1) + k = (n - k) + k := by
+        rw [Nat.add_assoc, Nat.add_comm 1 k, h3, h2]
+      exact (Nat.add_right_cancel h4).symm
+    have hmul : 2 * (n - (k + 1)) + 2 = 2 * (n - k) := by
+      rw [hsub, Nat.mul_succ]
+    have hacc2 : 2 * (n - (k + 1)) + 2 < M32 := by
+      rw [hmul]
+      exact Nat.lt_of_le_of_lt (Nat.mul_le_mul_left 2 (Nat.sub_le n k)) hn
+    have hklt : k < M32 := by
+      have hkn : k ≤ n := Nat.le_of_lt hkLe
+      have h1n : n ≤ 2 * n := by
+        have := Nat.mul_le_mul_right n (Nat.succ_le_succ (Nat.zero_le 1))
+        rw [Nat.one_mul] at this; exact this
+      exact Nat.lt_of_le_of_lt (Nat.le_trans hkn h1n) hn
+    have hIter := cd_iter_forall (2 * (n - (k + 1))) k hacc2 hklt
+    rw [hmul] at hIter
+    exact BoundedReachV2026.of_exact (Nat.le_refl 4) hIter ⟨Nat.le_of_lt hkLe, rfl⟩
+  have hLoop := v2026_loop_countdown inv 4 2 hExit hStep n (cdHead 0 n)
+    ⟨Nat.le_refl n, by rw [Nat.sub_self]⟩
+  have hTot := reachesDoneWithinV2026_of_stepsTo (cd_pre_forall n) hLoop
+  have hAdd : 2 + (n * 4 + 2) = n * 4 + 4 := by
+    rw [Nat.add_comm 2 (n * 4 + 2), Nat.add_assoc]
+  rw [hAdd] at hTot
+  exact hTot
+
+/-- **Universal tight budget**: for ALL `n` with `2 * n < 2^32`, `n * 4 + 3`
+steps are insufficient (strictly 1 step short of `n * 4 + 4`). -/
+theorem cd_not_tight_forall (n : Nat) (hn : 2 * n < M32) (post : MirOutcome → Prop) :
+    ¬ ExecWithinStepsV2026 cdBody [.scalar ⟨n, 4⟩] [] post (n * 4 + 3) := by
+  have hPre := cd_pre_forall n
+  have hIters := cd_iters_exact n 0 (by rw [Nat.zero_add]; exact hn)
+  rw [Nat.zero_add] at hIters
+  have hSteps := hPre.trans (hIters.trans (StepsToV2026.single (cd_head_step_zero (2 * n))))
+  have hEq : 2 + (4 * n + 1) = n * 4 + 3 := by
+    rw [Nat.mul_comm 4 n, Nat.add_comm 2 (n * 4 + 1), Nat.add_assoc]
+  rw [hEq] at hSteps
+  exact not_reachesDoneWithinV2026_of_stepsTo_ge hSteps (Nat.le_refl (n * 4 + 3))
+
+/-- **Universal Pass 2 (asymmetric two-pass splitting via `WlpV2026` +
+`StepStageCut` + active `BoolCertCut`)**: for ALL `n` with `2 * n < 2^32`,
+combines `wlpOutcomeV2026` at `fuelWlp = n * 4 + 8` with Pass-1 safety at
+`fuelSafe = n * 4 + 4 ≤ n * 4 + 8`. -/
+theorem cd_pass2_forall (n : Nat) (hn : 2 * n < M32) :
+    wpStateV2026 cdBody (n * 4 + 4) (initMachineStateWithCallees cdBody [.scalar ⟨n, 4⟩] [])
+      (mirNormalPost (fun r _ => r = .scalar ⟨2 * n, 4⟩)) := by
+  have _hCertCheck : cdChunkCertCheck () = true := BoolCertCut.unseal cd_chunk_boolCert
+  have hPre := cd_pre_forall n
+  have hIters := cd_iters_exact n 0 (by rw [Nat.zero_add]; exact hn)
+  rw [Nat.zero_add] at hIters
+  have hSteps := hPre.trans (hIters.trans (StepsToV2026.single (cd_head_step_zero (2 * n))))
+  have hEq : 2 + (4 * n + 1) = n * 4 + 3 := by
+    rw [Nat.mul_comm 4 n, Nat.add_comm 2 (n * 4 + 1), Nat.add_assoc]
+  rw [hEq] at hSteps
+  have hWlp : wlpOutcomeV2026 cdBody (mirNormalPost (fun r _ => r = .scalar ⟨2 * n, 4⟩))
+      (fun _ => False) (n * 4 + 8) (initMachineStateWithCallees cdBody [.scalar ⟨n, 4⟩] []) :=
+    wlpOutcomeV2026_of_stepStageCut hSteps.to_stepStageCut
+      (wlpOutcomeV2026_done_eq (fuel := n * 4 + 7) (cd_exit_done_forall (2 * n)) rfl)
+  have hSafe : wpStateV2026 cdBody (n * 4 + 4)
+      (initMachineStateWithCallees cdBody [.scalar ⟨n, 4⟩] []) (fun _ => True) :=
+    reachesDoneWithinV2026_iff_wpStateV2026.mp
+      (ReachesDoneWithinV2026.weaken (fun _ _ => trivial) (cd_pass1_forall n hn))
+  exact wpStateV2026_of_wlp_and_safety_le (Nat.add_le_add_left (by decide : 4 ≤ 8) (n * 4))
+    hWlp hSafe
+
+/-- Universal stateless `VerificationResult` for `countdown(n)` over all `2 * n < 2^32`. -/
+theorem cd_verificationResult_forall :
+    VerificationResult
+      { body := cdBody
+        pre := fun args => ∃ n, args = [.scalar ⟨n, 4⟩] ∧ 2 * n < M32
+        post := fun args r => ∃ n, args = [.scalar ⟨n, 4⟩] ∧ r = .scalar ⟨2 * n, 4⟩ } := by
+  refine verifyMirNoPanic_of_execWithinStepsV2026 _ (fun args ⟨n, hArgs, hn⟩ => ?_)
+  subst hArgs
+  exact ⟨n * 4 + 4, ReachesDoneWithinV2026.weaken
+    (fun out hOut => by
+      cases out with
+      | normal p => exact ⟨n, rfl, hOut⟩
+      | panic => exact False.elim hOut
+      | abort => exact False.elim hOut)
+    (reachesDoneWithinV2026_iff_wpStateV2026.mpr (cd_pass2_forall n hn))⟩
+
+/-- Universal stateful `StatefulVerificationResult` for `countdown(n)` over all `2 * n < 2^32`. -/
+theorem cd_statefulVerificationResult_forall :
+    StatefulVerificationResult
+      { body := cdBody
+        pre := fun args mem => (∃ n, args = [.scalar ⟨n, 4⟩] ∧ 2 * n < M32) ∧ mem = cdInit.memory
+        post := fun args _ r _ => ∃ n, args = [.scalar ⟨n, 4⟩] ∧ r = .scalar ⟨2 * n, 4⟩ } := by
+  refine verifyStatefulMirNoPanic_of_execWithinStepsV2026 _ (fun args mem ⟨⟨n, hArgs, hn⟩, hMem⟩ => ?_)
+  subst hArgs
+  subst hMem
+  exact ⟨n * 4 + 4, ReachesDoneWithinV2026.weaken
+    (fun out hOut => by
+      cases out with
+      | normal p => exact ⟨n, rfl, hOut⟩
+      | panic => exact False.elim hOut
+      | abort => exact False.elim hOut)
+    (reachesDoneWithinV2026_iff_wpStateV2026.mpr (cd_pass2_forall n hn))⟩
+
 /-! ## Pillar 3: Negative Non-Vacuity & Fail-Closed Falsification Canaries -/
 
 /-! ### 3a. Overflowing `unchecked_mul` inside the inline callee -/
@@ -864,6 +1356,56 @@ theorem scaled_overflow_refuted :
         [su 0, su 4294967296, su 4294967296] [mulScaledCalleeBody] post bound) := by
   have h := symProgRunSteps_fault_refutes scaled_prefix11 ovEnv ⟨rfl, trivial⟩
     scaled_overflow_v2026_fault
+  rw [show addScaledCallerBody = scaledCfg.body from rfl, show [mulScaledCalleeBody] =
+    scaledCfg.callees from rfl, ← scaled_args_eval, ← symProgEntry_toMachineState]
+  exact h
+
+/-! ### 3a-ii. Overflowing `unchecked_add` in the caller after inline callee returns -/
+
+/-- Checkpoint: caller at `bb1`, `stmtIdx = 6`, about to invoke `unchecked_add`. -/
+def scaledCp2b : SymProg :=
+  { frame := { blockIdx := 1, stmtIdx := 6
+               locals := [U, I vb, I vm, I vk, I vmk, D, D, I vb, I vmk] }
+    stack := []
+    active := some addScaledCallerBody }
+
+theorem scaled_chunk3a :
+    symProgRunSteps scaledCfg 6 scaledCp2 = .step scaledCp2b [] := rfl
+
+theorem scaled_prefix19 :
+    symProgRunSteps scaledCfg (6 + (7 + 6)) scaledEntry =
+      .step scaledCp2b [.assertHolds (.const ⟨1, 1⟩) true, .noOverflowMul false vm vk] :=
+  symProgRunSteps_trans scaled_chunk1 (symProgRunSteps_trans scaled_chunk2 scaled_chunk3a)
+
+/-- Inputs `(2^64 - 1, 1, 1)`: callee `mul_scaled(1, 1) = 1` succeeds, then
+caller `unchecked_add(2^64 - 1, 1)` overflows `usize`! -/
+abbrev ovAddEnv : SymEnv := scaledEnv 18446744073709551615 1 1
+
+/-- Symbolic rejection: `noOverflowAdd` fails closed while `noOverflowMul` holds. -/
+theorem scaled_add_overflow_conds_fail : ¬ condsHold ovAddEnv scaledConds := by
+  intro h
+  have ha : scBits (vb.eval ovAddEnv) + scBitsAt (vb.eval ovAddEnv) (vmk.eval ovAddEnv) <
+      scalarModulus (vb.eval ovAddEnv).sizeBytes := h.2.2.1.2
+  exact absurd ha (by decide)
+
+/-- Operational rejection: unmodified trusted `stepMirFn` faults with UB at the
+caller's `unchecked_add` call after returning from `mul_scaled`. -/
+theorem scaled_add_overflow_stepMirFn_ub :
+    stepMirFn addScaledCallerBody (scaledCp2b.toMachineState scaledCfg ovAddEnv) =
+      MirStepNode.fail .ub := rfl
+
+theorem scaled_add_overflow_refuted :
+    ¬ MirNoUBTree (mirTree addScaledCallerBody
+        (initMachineStateWithCallees addScaledCallerBody
+          [su 18446744073709551615, su 1, su 1] [mulScaledCalleeBody])) ∧
+      (∀ post, ¬ MirWpConverges addScaledCallerBody
+        (initMachineStateWithCallees addScaledCallerBody
+          [su 18446744073709551615, su 1, su 1] [mulScaledCalleeBody]) post) ∧
+      (∀ post bound, ¬ ExecWithinStepsV2026 addScaledCallerBody
+        [su 18446744073709551615, su 1, su 1] [mulScaledCalleeBody] post bound) := by
+  have hPreConds : condsHold ovAddEnv [.assertHolds (.const ⟨1, 1⟩) true, .noOverflowMul false vm vk] :=
+    ⟨rfl, ⟨⟨eight_ne_zero, rfl⟩, by decide⟩, trivial⟩
+  have h := symProgRunSteps_fault_refutes scaled_prefix19 ovAddEnv hPreConds (fk := .ub) rfl
   rw [show addScaledCallerBody = scaledCfg.body from rfl, show [mulScaledCalleeBody] =
     scaledCfg.callees from rfl, ← scaled_args_eval, ← symProgEntry_toMachineState]
   exact h
@@ -940,6 +1482,69 @@ theorem chk_refuted (x : Nat) :
     show [Value.scalar ⟨0, 1⟩, .scalar ⟨x, 4⟩] = symValsEval (pairEnv 0 x)
       [.scalar vflag, .scalar vchkx] from rfl, ← symProgEntry_toMachineState]
   exact ⟨h.1, h.2.2⟩
+
+/-- Multi-frame caller invoking inline callee `chk(flag, x)` whose `Assert` fails
+when `flag = false`. -/
+def callChkBody : CapturedMir :=
+  { defPath := "chk::call_chk"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 2
+    localDecls := [decl u32Ty' "_0", decl boolTy "flag", decl u32Ty' "x"]
+    basicBlocks :=
+      [ { statements := []
+          terminator := tm (.call (fnOp "chk::chk" []) [.copy (pl 1), .copy (pl 2)]
+            (pl 0) (some 1) .unreachable)
+          isCleanup := false }
+      , { statements := []
+          terminator := tm .return_
+          isCleanup := false } ]
+    fnAbi :=
+      { args := [{ layout := boolLayout, mode := .direct }, { layout := u32Layout', mode := .direct }]
+        ret := { layout := u32Layout', mode := .direct }
+        conv := .rust
+        canUnwind := false }
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [u32Layout', boolLayout] }
+    allocations := [] }
+
+def callChkCfg : SymConfig := { body := callChkBody, callees := [chkBody] }
+def callChkEntry : SymProg := symProgEntry callChkCfg [.scalar vflag, .scalar vchkx]
+
+def callChkInCallee : SymProg :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [U, I vflag, I vchkx] }
+    stack := [{ callerBody := callChkBody
+                frame := { blockIdx := 0, stmtIdx := 0, locals := [U, I vflag, I vchkx] }
+                destination := pl 0
+                returnTarget := 1
+                returnUnwind := .unreachable }]
+    active := some chkBody }
+
+theorem callChk_prefix1 :
+    symProgRunSteps callChkCfg 1 callChkEntry = .step callChkInCallee [] := rfl
+
+theorem callChk_full :
+    symRunChunks callChkCfg [5] callChkEntry =
+      .ret (.scalar vchkx)
+        { frame := { blockIdx := 1, stmtIdx := 0, locals := [I vchkx, I vflag, I vchkx] }
+          stack := [], active := some callChkBody } [.assertHolds vflag true] := rfl
+
+theorem callChk_stepMirFn_ub (x : Nat) :
+    stepMirFn callChkBody (callChkInCallee.toMachineState callChkCfg (pairEnv 0 x)) =
+      MirStepNode.fail .ub := rfl
+
+theorem callChk_refuted (x : Nat) :
+    ¬ condsHold (pairEnv 0 x) [.assertHolds vflag true] ∧
+      ¬ MirNoUBTree (mirTree callChkBody
+        (initMachineStateWithCallees callChkBody [.scalar ⟨0, 1⟩, .scalar ⟨x, 4⟩] [chkBody])) ∧
+      (∀ post, ¬ MirWpConverges callChkBody
+        (initMachineStateWithCallees callChkBody [.scalar ⟨0, 1⟩, .scalar ⟨x, 4⟩] [chkBody]) post) ∧
+      (∀ post bound, ¬ ExecWithinStepsV2026 callChkBody
+        [.scalar ⟨0, 1⟩, .scalar ⟨x, 4⟩] [chkBody] post bound) := by
+  have h := symProgRunSteps_fault_refutes callChk_prefix1 (pairEnv 0 x) trivial (fk := .ub) rfl
+  rw [show callChkBody = callChkCfg.body from rfl, show [chkBody] = callChkCfg.callees from rfl,
+    show [Value.scalar ⟨0, 1⟩, .scalar ⟨x, 4⟩] = symValsEval (pairEnv 0 x)
+      [.scalar vflag, .scalar vchkx] from rfl, ← symProgEntry_toMachineState]
+  exact ⟨chk_conds_fail x, h.1, h.2.1, h.2.2⟩
 
 /-! ### 3c. Division by zero and out-of-bounds shift -/
 
@@ -1035,20 +1640,33 @@ theorem divSh_div0_refuted (a : Nat) :
       [.scalar vx, .scalar vy] from rfl, ← symProgEntry_toMachineState]
   exact ⟨h.1, h.2.2⟩
 
-/-- Operational rejection (shift out of bounds) after the first (defined) step. -/
+/-- Program point just before the `unchecked_shl` call. -/
+def divShAtShl : SymProg :=
+  { frame := { blockIdx := 1, stmtIdx := 0, locals := [U, I vx, I vy, I vdq] }
+    stack := [], active := none }
+
+theorem divSh_shift_ub :
+    stepMirFn divShBody (divShAtShl.toMachineState divShCfg (pairEnv 64 32)) =
+      MirStepNode.fail .ub := rfl
+
+/-- Operational rejection (shift out of bounds) after the first (defined) step:
+refutes `MirNoUBTree`, `MirWpConverges`, and every `ExecWithinStepsV2026`. -/
 theorem divSh_shift_refuted :
     ¬ MirNoUBTree (mirTree divShBody
-        (initMachineStateWithCallees divShBody [.scalar ⟨64, 4⟩, .scalar ⟨32, 4⟩] [])) := by
+        (initMachineStateWithCallees divShBody [.scalar ⟨64, 4⟩, .scalar ⟨32, 4⟩] [])) ∧
+      (∀ post, ¬ MirWpConverges divShBody
+        (initMachineStateWithCallees divShBody [.scalar ⟨64, 4⟩, .scalar ⟨32, 4⟩] []) post) ∧
+      (∀ post bound, ¬ ExecWithinStepsV2026 divShBody
+        [.scalar ⟨64, 4⟩, .scalar ⟨32, 4⟩] [] post bound) := by
   have hpre : symProgRunSteps divShCfg 2 divShEntry =
-      .step { frame := { blockIdx := 1, stmtIdx := 0, locals := [U, I vx, I vy, I vdq] }
-              stack := [], active := none } [.divSafe false vx vy] := rfl
+      .step divShAtShl [.divSafe false vx vy] := rfl
   have h := symProgRunSteps_fault_refutes hpre (pairEnv 64 32)
     ⟨⟨⟨Nat.succ_ne_zero 3, rfl⟩, by decide, trivial⟩, trivial⟩ (fk := .ub) rfl
   rw [show divShBody = divShCfg.body from rfl,
     show ([] : List CapturedMir) = divShCfg.callees from rfl,
     show [Value.scalar ⟨64, 4⟩, .scalar ⟨32, 4⟩] = symValsEval (pairEnv 64 32)
       [.scalar vx, .scalar vy] from rfl, ← symProgEntry_toMachineState]
-  exact h.1
+  exact h
 
 /-! ### 3d. Under-budget bounds and divergence -/
 
@@ -1110,15 +1728,24 @@ theorem spin_partial_not_total (fuel bound : Nat) (post : MirOutcome → Prop) :
 #print axioms symProgRunSteps_sound
 #print axioms symProgRunSteps_ret_sound
 #print axioms symRunChunks_sound
+#print axioms symRunChunksWith_sound
+#print axioms symChunkCut_entry_sound
+#print axioms symRunChunks_of_boolCert
 #print axioms verificationResult_of_symRunChunks
 #print axioms statefulVerificationResult_of_symRunChunks
 #print axioms add_scaled_symbolic
+#print axioms add_scaled_blockCtx_firewall
 #print axioms add_scaled_verificationResult
 #print axioms add_scaled_statefulVerificationResult
+#print axioms checkedAddCast_symbolic
 #print axioms scaled_overflow_refuted
-#print axioms cd_pass2
-#print axioms cd_verificationResult
-#print axioms cd_statefulVerificationResult
+#print axioms scaled_add_overflow_refuted
+#print axioms callChk_refuted
+#print axioms cd_pass1_forall
+#print axioms cd_pass2_forall
+#print axioms cd_not_tight_forall
+#print axioms cd_verificationResult_forall
+#print axioms cd_statefulVerificationResult_forall
 #print axioms cd_worklist
 #print axioms spin_partial_not_total
 
@@ -1136,22 +1763,34 @@ def unsafeRecSuffix : String := "_unsafe" ++ "_rec"
 
 open Lean Elab Command in
 /-- Fails if any constant of module `mod` is a postulated constant, a
-compiler-generated unsafe recursive auxiliary, or a theorem outside `allowed`. -/
-def auditModule (mod : Name) (allowed : Array Name) : CommandElabM Unit := do
+compiler-generated unsafe recursive auxiliary, a `noncomputable` def (when
+`forbidNoncomputable = true`), or a theorem / definition depending on any axiom
+outside `allowed`. -/
+def auditModule (mod : Name) (allowed : Array Name)
+    (forbidNoncomputable : Bool := false) : CommandElabM Unit := do
   let env ← getEnv
   let some idx := env.getModuleIdx? mod
     | throwError m!"module {mod} not imported"
   let names := (env.header.moduleData[idx.toNat]!).constNames
-  let mut thms : Array Name := #[]
+  let mut checked : Array Name := #[]
+  let mut thmCount : Nat := 0
+  let mut defCount : Nat := 0
   for n in names do
     if n.toString.endsWith unsafeRecSuffix then
       throwError m!"hygiene audit failed: {n} is an unsafe recursive auxiliary"
+    if forbidNoncomputable && Lean.isNoncomputable env n then
+      throwError m!"hygiene audit failed: {n} is noncomputable"
     match env.find? n with
     | some (.axiomInfo _) => throwError m!"hygiene audit failed: {n} is postulated"
-    | some (.thmInfo _) => thms := thms.push n
+    | some (.thmInfo _) =>
+      checked := checked.push n
+      thmCount := thmCount + 1
+    | some (.defnInfo _) =>
+      checked := checked.push n
+      defCount := defCount + 1
     | _ => pure ()
-  auditAxioms thms allowed
-  logInfo m!"audited {mod}: {names.size} constants, {thms.size} theorems"
+  auditAxioms checked allowed
+  logInfo m!"audited {mod}: {names.size} constants, {thmCount} theorems, {defCount} defs"
 
 /-- Standard axioms permitted anywhere. -/
 def standardAxioms : Array Lean.Name := #[``propext, ``Classical.choice, ``Quot.sound]
@@ -1160,25 +1799,30 @@ def standardAxioms : Array Lean.Name := #[``propext, ``Classical.choice, ``Quot.
 def choiceFreeAxioms : Array Lean.Name := #[``propext, ``Quot.sound]
 
 -- All 5 converged modules: no postulates, no unsafe recursive auxiliaries, and only
--- standard axioms in every theorem.
+-- standard axioms in every theorem AND definition.
 run_cmd auditModule `Anneal.Framework.StepWp standardAxioms
 run_cmd auditModule `Anneal.CnfOrd.Worklist standardAxioms
 run_cmd auditModule `Anneal.ConjunctiveWp.WlpV2026 standardAxioms
 run_cmd auditModule `Anneal.StepBound.StepBoundV2026 standardAxioms
 
--- The chunked symbolic executor: EVERY theorem is choice-free.
-run_cmd auditModule `Anneal.MirSymExec.ChunkedCallV2026 choiceFreeAxioms
+-- The chunked symbolic executor: EVERY theorem AND definition is choice-free and computable.
+run_cmd auditModule `Anneal.MirSymExec.ChunkedCallV2026 choiceFreeAxioms (forbidNoncomputable := true)
 
 -- Key end-to-end test theorems: choice-free (including the
 -- `VerificationResult` / `StatefulVerificationResult` certificates).
 /-- Key end-to-end test theorems (positive and negative canaries). -/
 def keyTestTheorems : Array Lean.Name :=
-  #[``add_scaled_symbolic, ``add_scaled_verificationResult,
-    ``add_scaled_statefulVerificationResult, ``add_scaled_not_23, ``scaled_overflow_refuted,
-    ``scaled_overflow_conds_fail, ``mix_symbolic, ``mix_concrete, ``sel_symbolic, ``chk_ok,
-    ``chk_refuted, ``divSh_ok, ``divSh_div0_refuted, ``divSh_shift_refuted,
+  #[``add_scaled_symbolic, ``add_scaled_blockCtx_firewall,
+    ``add_scaled_verificationResult, ``add_scaled_statefulVerificationResult,
+    ``add_scaled_not_23, ``checkedAddCast_symbolic,
+    ``scaled_overflow_refuted, ``scaled_overflow_conds_fail,
+    ``scaled_add_overflow_refuted, ``scaled_add_overflow_conds_fail,
+    ``mix_symbolic, ``mix_concrete, ``sel_symbolic, ``chk_ok,
+    ``chk_refuted, ``callChk_refuted, ``divSh_ok, ``divSh_div0_refuted, ``divSh_shift_refuted,
     ``cd_pass1_loop, ``cd_pass2, ``cd_worklist, ``cd_not15, ``cd_verificationResult,
-    ``cd_statefulVerificationResult, ``spin_partial_not_total]
+    ``cd_statefulVerificationResult, ``cd_pass1_forall, ``cd_pass2_forall,
+    ``cd_not_tight_forall, ``cd_verificationResult_forall, ``cd_statefulVerificationResult_forall,
+    ``spin_partial_not_total]
 
 run_cmd auditAxioms keyTestTheorems choiceFreeAxioms
 
