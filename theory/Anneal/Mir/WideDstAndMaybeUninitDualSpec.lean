@@ -846,21 +846,50 @@ theorem dual_case2_two_query_halves_agree :
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 open MiniRustSpec.CrossFrameRefAndPanicMR in
+/-- Exact `Stop.machineStop` detector directly over unmodified `MiniRustSpec.Interp.steps` (`Mach`)
+and `stepsTB` (`MachTB`): returns `true` iff `bootProgramM` succeeds AND the unmodified MiniRust
+step driver halts specifically with `Stop.machineStop` (excluding boot failure, fuel exhaustion,
+`Stop.ub`, `Stop.abort`, `Stop.specPanic`, `Stop.unsupported`, `Stop.deadlock`, and
+`Stop.memoryLeak`). Unlike `runStopMsg{Basic,TB} = none`, this cannot hold vacuously on boot
+failure or out-of-fuel runs. -/
+def mrTerminatesCleanly (tb : Bool) (prog : MiniRustSpec.Gen.Program) (fuel : Nat := 120) : Bool :=
+  if tb then
+    match bootProgramM (M := MiniRustSpec.Interp.TBM)
+        ({ implicit_writes := true } : MiniRustSpec.Gen.TreeBorrowsParams) prog with
+    | .ok m0 =>
+      match MiniRustSpec.Interp.stepsTB fuel m0 with
+      | .error .machineStop => true
+      | _ => false
+    | .error _ => false
+  else
+    match bootProgramM (M := MiniRustSpec.Interp.BM) () prog with
+    | .ok m0 =>
+      match MiniRustSpec.Interp.steps fuel m0 with
+      | .error .machineStop => true
+      | _ => false
+    | .error _ => false
+
+open MiniRustSpec.CrossFrameRefAndPanicMR in
 /-- **Machine-level `#300` pin delta (where the case 21/22 verdicts come from).** On both `Mach`
-and `MachTB`, the pinned `d821c6e3` machine runs the null-`fn()` transmute programs of cases
-`21`, `22`, and `23` to completion with NO stop message. So unmodified MiniRust's own execution
-accepts the null function pointer. The two cases differ only in the observer's re-validation
-predicate: pinned `checkPtrM` for `22` (→ `okFnPtr 0`) versus the Episode 1 post-`#300`
-emulation `checkPtrFnNonNullM` for `21` (→ `.ub`). Case `21`'s MiniRust `.ub` is therefore the
-`#300` predicate (defined in `WideDstAndMaybeUninitMR`, zero `Interp.lean` edits), not a pinned
-interpreter verdict. -/
+and `MachTB`, the pinned `d821c6e3` machine boots and runs the null-`fn()` transmute programs of
+cases `21`, `22`, and `23` to clean `Stop.machineStop` (`mrTerminatesCleanly = true`, with no UB
+stop message — whereas a real UB program such as `mrWdProg16` yields `mrTerminatesCleanly = false`).
+So unmodified MiniRust's own execution accepts the null function pointer. The two cases differ only
+in the observer's re-validation predicate: pinned `checkPtrM` for `22` (→ `okFnPtr 0`) versus the
+Episode 1 post-`#300` emulation `checkPtrFnNonNullM` for `21` (→ `.ub`). Case `21`'s MiniRust
+`.ub` is therefore the `#300` predicate (defined in `WideDstAndMaybeUninitMR`, zero `Interp.lean`
+edits), not a pinned interpreter verdict. -/
 theorem dual_minirust300_machine_level_pin_delta :
+    mrTerminatesCleanly false mrWdProg21 = true ∧ mrTerminatesCleanly true mrWdProg21 = true ∧
+    mrTerminatesCleanly false mrWdProg22 = true ∧ mrTerminatesCleanly true mrWdProg22 = true ∧
+    mrTerminatesCleanly false mrWdProg23 = true ∧ mrTerminatesCleanly true mrWdProg23 = true ∧
+    mrTerminatesCleanly false mrWdProg16 = false ∧ mrTerminatesCleanly true mrWdProg16 = false ∧
     runStopMsgBasic mrWdProg21 = none ∧ runStopMsgTB mrWdProg21 = none ∧
     runStopMsgBasic mrWdProg22 = none ∧ runStopMsgTB mrWdProg22 = none ∧
     runStopMsgBasic mrWdProg23 = none ∧ runStopMsgTB mrWdProg23 = none ∧
     wdRun false mrWdProg21 = .ub ∧ wdRun true mrWdProg21 = .ub ∧
     wdRun false mrWdProg22 = .okFnPtr 0 ∧ wdRun true mrWdProg22 = .okFnPtr 0 := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-! ### The MiniRust observer's driver is MiniRust's own `steps` / `stepsTB`
 
@@ -1072,6 +1101,8 @@ run_cmd do
       ns ++ `dual_fail_closed_out_of_range, ns ++ `dual_mode_sensitivity_exact,
       ns ++ `dual_case19_mode_sensitivity, ns ++ `dual_dst_honest_trusted_boundary,
       ns ++ `dual_minirust300_pin_delta_and_flip_ready, ns ++ `dual_case13_union_copy_vs_typed_read,
+      ns ++ `dual_case2_two_query_halves_agree, ns ++ `mrTerminatesCleanly,
+      ns ++ `dual_minirust300_machine_level_pin_delta,
       ns ++ `rootBackedLmAuthority, ns ++ `rootBackedLmAuthority_tableCheck,
       ns ++ `rootBackedLmAuthority_failClosed,
       ns ++ `stopProj, ns ++ `stepsM_eq_runToStopM, ns ++ `stepsTB_eq_runToStopM ]

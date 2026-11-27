@@ -166,6 +166,14 @@ theorem out_of_range_and_class_canaries :
     trustedVerdict_out_of_range true 1000 (by decide), mrVerdict_out_of_range false 1000 (by decide),
     by decide, by decide, by decide, by decide⟩
 
+/-- Concrete §1 witnesses for Case `2` two-query anti-masking (`wdCase2Mir` + `wdCase2StrMir`) and
+exact `Stop.machineStop` termination of pinned MiniRust on `mrWdProg21`/`22`/`23` vs `false` on
+OOB UB `mrWdProg16`. -/
+theorem d1_case2_halves_and_d4_machine_delta_canary :
+    type_of% dual_case2_two_query_halves_agree ∧
+    type_of% dual_minirust300_machine_level_pin_delta :=
+  ⟨dual_case2_two_query_halves_agree, dual_minirust300_machine_level_pin_delta⟩
+
 /-- Root-side instantiation of the capstone at the real-observer-backed authority (non-vacuity of
 the capstone hypotheses), with its unified bundle's positive / fault projections. -/
 theorem root_capstone_instantiation :
@@ -351,26 +359,6 @@ run_cmd do
     addThmInfer capName
       (mkApp3 (mkConst (bNs ++ `ep2_widedst_maybeuninit_dual_authority_capstone)) authC hA hOob)
     added := added.push capName
-    -- The closed capstone conjoined with the Episode 1 LeanMiri capstones (step driver, universal
-    -- laws, tables, Case 13 copy companion): the root of the 3-engine reachability audit below.
-    let crossName := ns ++ `ep2_cross_root_three_engine_capstone
-    let crossPf ← MetaM.run' do
-      let parts : List Expr :=
-        [ mkConst capName,
-          mkConst c13Name,
-          mkConst (lmNs ++ `ep1_lean_miri_widedst_maybeuninit_capstone),
-          mkConst (lmNs ++ `ep1_lean_miri_universal_laws_capstone),
-          mkConst (lmNs ++ `ep1_lean_miri_step_driver_capstone),
-          mkConst (lmNs ++ `lmWdObserve_table),
-          mkConst (lmNs ++ `lmWdObserve_mode_sensitivity),
-          mkConst (lmNs ++ `lm_wd_exact_ub_diagnostics) ]
-      let rec conj : List Expr → MetaM Expr
-        | [] => return mkConst ``True.intro
-        | [p] => return p
-        | p :: ps => do mkAppM ``And.intro #[p, ← conj ps]
-      conj parts
-    addThmInfer crossName crossPf
-    added := added.push crossName
 
     -- 3b. Translation fidelity (anti-mock): `lmWdToVerdict` is EXACTLY the root translation
     -- `wdVerdictOf` after a constructor-for-constructor bijection `LmWdObs ≃ MrWdObs`; and the frozen
@@ -488,6 +476,7 @@ run_cmd do
         `wdCase16Mir, `wdCase17Mir, `wdCase18Mir, `wdCase19Mir, `wdCase20Mir, `wdCase21Mir,
         `wdCase23Mir ]
     let mut lockCount : Nat := 0
+    let mut lockNames : Array Name := #[]
     for tag in fixtureNames do
       let lhs := mkConst (mrNs ++ tag)
       let rhs := mkConst (lmNs ++ tag)
@@ -495,14 +484,51 @@ run_cmd do
       let lockName := ns ++ `fixtureLock ++ tag
       addThm lockName (mkEq ty lhs rhs) (mkRefl ty lhs)
       added := added.push lockName
+      lockNames := lockNames.push lockName
       lockCount := lockCount + 1
     let countLockName := ns ++ `fixtureLock ++ `caseCount
     addThm countLockName (mkEq natTy (mkConst (mrNs ++ `mrWdCaseCount)) (mkConst (lmNs ++ `lmWdCaseCount)))
       (mkRefl natTy (mkConst (mrNs ++ `mrWdCaseCount)))
     added := added.push countLockName
+    lockNames := lockNames.push countLockName
     lockCount := lockCount + 1
     unless lockCount = 39 do
       throwError "cross-root: expected 39 fixture locks, got {lockCount}"
+
+    -- 4b. Unified cross-root 3-engine capstone: conjoins the closed Episode 2 capstone, Case 13
+    -- 3-way copy contrast, anti-mock translation fidelity & bijection, frozen-table locks, all 5
+    -- direct-certificate bundle equalities, 3-engine UB root-cause alignment, all 39 `Eq.refl`
+    -- fixture locks, and the Episode 1 LeanMiri capstones into one single root theorem.
+    let crossName := ns ++ `ep2_cross_root_three_engine_capstone
+    let crossPf ← MetaM.run' do
+      let parts : List Expr :=
+        [ mkConst capName,
+          mkConst c13Name,
+          mkConst (ns ++ `translation_fidelity),
+          mkConst (ns ++ `lmToMr_mrToLm),
+          mkConst (ns ++ `mrToLm_lmToMr),
+          mkConst (ns ++ `frozenTableLock ++ `wdLmExpectedBasic),
+          mkConst (ns ++ `frozenTableLock ++ `wdLmExpectedTb),
+          mkConst (ns ++ `directBundle_eq ++ `unified),
+          mkConst (ns ++ `directBundle_eq ++ `d1),
+          mkConst (ns ++ `directBundle_eq ++ `d2),
+          mkConst (ns ++ `directBundle_eq ++ `d3),
+          mkConst (ns ++ `directBundle_eq ++ `d4),
+          mkConst rcName,
+          mkConst (lmNs ++ `ep1_lean_miri_widedst_maybeuninit_capstone),
+          mkConst (lmNs ++ `ep1_lean_miri_universal_laws_capstone),
+          mkConst (lmNs ++ `ep1_lean_miri_step_driver_capstone),
+          mkConst (lmNs ++ `lmWdObserve_table),
+          mkConst (lmNs ++ `lmWdObserve_mode_sensitivity),
+          mkConst (lmNs ++ `lm_wd_exact_ub_diagnostics) ] ++
+        (lockNames.toList.map mkConst)
+      let rec conj : List Expr → MetaM Expr
+        | [] => return mkConst ``True.intro
+        | [p] => return p
+        | p :: ps => do mkAppM ``And.intro #[p, ← conj ps]
+      conj parts
+    addThmInfer crossName crossPf
+    added := added.push crossName
 
     -- 5. Negative forgery controls on scratch environment copies: EVERY forged declaration MUST be
     -- rejected by the kernel AND paired with an accepted honest twin (100% paired: `twins = rejected`),
@@ -589,6 +615,9 @@ run_cmd do
     let stopMsgB (i : Nat) : Expr :=
       mkApp2 (mkConst `MiniRustSpec.CrossFrameRefAndPanicMR.runStopMsgBasic)
         (mkConst (mrNs ++ (Name.mkSimple s!"mrWdProg{i}"))) (mkNatLit 120)
+    let termClean (tb : Bool) (i : Nat) : Expr :=
+      mkApp3 (mkConst (bNs ++ `mrTerminatesCleanly))
+        (toExpr tb) (mkConst (mrNs ++ (Name.mkSimple s!"mrWdProg{i}"))) (mkNatLit 120)
     let forged : List (String × Declaration × Declaration) :=
       [ ("ill-typed 0 = 1",
           thmD (ns ++ `forged.zeroEqOne) (mkEq natTy (mkNatLit 0) (mkNatLit 1)) (mkRefl natTy (mkNatLit 0)),
@@ -698,6 +727,12 @@ run_cmd do
           thmD (ns ++ `honest.machineRunsNullFnPtr) (mkEq optStrTy (stopMsgB 22)
               (mkApp (mkConst ``Option.none [0]) (mkConst ``String)))
             (mkRefl optStrTy (stopMsgB 22))),
+        ("forged machine-level pin delta: pinned MiniRust MachTB fails to reach Stop.machineStop on case 22",
+          thmD (ns ++ `forged.machineNoCleanStopNullFnPtr) (eqFalse (termClean true 22)) reflFalse,
+          thmD (ns ++ `honest.machineCleanStopNullFnPtr) (eqTrue (termClean true 22)) reflTrue),
+        ("forged clean termination on OOB UB case 16 (Stop.ub must not pass mrTerminatesCleanly)",
+          thmD (ns ++ `forged.machineCleanStopOob16) (eqTrue (termClean false 16)) reflTrue,
+          thmD (ns ++ `honest.machineNoCleanStopOob16) (eqFalse (termClean false 16)) reflFalse),
         ("forged pin delta: pinned d821c6e3 checkPtr rejects the null FnPtr",
           thmD (ns ++ `forged.pinnedCheckPtrRejectsNull) (mkEq cpTy cpL nnR) (mkRefl cpTy cpL),
           thmD (ns ++ `honest.pinnedCheckPtrAcceptsNull) (mkEq cpTy cpL cpR) (mkRefl cpTy cpL)),
@@ -863,7 +898,7 @@ run_cmd do
     { fileName := "<wd-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 118 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 32 &&
+  unless addedCount ≥ 118 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 34 &&
       twinCount = rejectedCount && reachCount ≥ 48 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
@@ -887,7 +922,9 @@ run_cmd do
       `dual_no_specPanic_all_cells, `dual_fail_closed_out_of_range,
       `dual_mode_sensitivity_exact, `dual_case19_mode_sensitivity,
       `dual_dst_honest_trusted_boundary, `dual_minirust300_pin_delta_and_flip_ready,
-      `dual_case13_union_copy_vs_typed_read, `rootBackedLmAuthority,
+      `dual_case13_union_copy_vs_typed_read, `dual_case2_two_query_halves_agree,
+      `mrTerminatesCleanly, `dual_minirust300_machine_level_pin_delta,
+      `rootBackedLmAuthority,
       `rootBackedLmAuthority_tableCheck, `rootBackedLmAuthority_failClosed,
       `stepsM_eq_runToStopM, `stepsTB_eq_runToStopM ]
   let isChoiceFree (axs : Array Name) : Bool :=
