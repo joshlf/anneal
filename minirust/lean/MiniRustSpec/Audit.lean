@@ -19148,6 +19148,9 @@ verbatim `rustc-capture` bodies (including the `9147` difftest reproducer). -/
   MiniRustSpec.ClosureFnPtrMR.minirust_createFrameM_arity_law
   MiniRustSpec.ClosureFnPtrMR.minirust_createFrameM_abi_mismatch_law
   MiniRustSpec.ClosureFnPtrMR.closure_typed_sig_call_correspondence_M
+  MiniRustSpec.ClosureFnPtrMR.rigidTyMatchesCalleeDecl_fixedInt_eq
+  MiniRustSpec.ClosureFnPtrMR.cfTranslateAbiTy_fixedInt_abi_compat_iff
+  MiniRustSpec.ClosureFnPtrMR.closure_fixedInt_sig_call_correspondence_M
   MiniRustSpec.ClosureFnPtrMR.minirust_ptr_rel_eq_same_addr_M
   MiniRustSpec.ClosureFnPtrMR.minirust_closure_call_return_tb_wfLive
   MiniRustSpec.ClosureFnPtrMR.closure_coercion_widening_identity_general_mach_and_tb
@@ -19178,6 +19181,9 @@ verbatim `rustc-capture` bodies (including the `9147` difftest reproducer). -/
   MiniRustSpec.ClosureFnPtrMR.closureFnPtrEntryRel_instance_mach_and_tb
   MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_correspondence_instance_mach_and_tb
   MiniRustSpec.ClosureFnPtrMR.closure_typed_sig_instances_mach_and_tb
+  MiniRustSpec.ClosureFnPtrMR.closure_fixedInt_sig_instances_mach_and_tb
+  MiniRustSpec.ClosureFnPtrMR.closure_forged_and_tailCall_law_instances_mach_and_tb
+  MiniRustSpec.ClosureFnPtrMR.cf_ptr_and_usize_abi_divergence_witness
 
 #assert_minirustspec_import_isolation
 

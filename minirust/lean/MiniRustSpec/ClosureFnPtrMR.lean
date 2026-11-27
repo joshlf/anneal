@@ -52,9 +52,13 @@ arguments by `Terminator::Call` and left by `Terminator::Return`.
      `MachTB`), `closure_coercion_widening_identity_mach_and_tb`, the coupled
      two-sided call law `closure_indirect_call_correspondence_M` (connecting
      `s.memory`, the evaluated Trusted pointer `p`, `resolveCallTarget`,
-     `fnFromPtrM`, and `createFrameM`), and the typed signature ABI-mismatch law
-     `closure_typed_sig_call_correspondence_M` (universal return-type and
-     argument-type transmutation UB lockstep across Trusted, `Mach`, and `MachTB`);
+     `fnFromPtrM`, and `createFrameM`), the typed signature ABI-mismatch law
+     `closure_typed_sig_call_correspondence_M`, and the translation-derived
+     fixed-width integer/`bool` ABI correspondence
+     `cfTranslateAbiTy_fixedInt_abi_compat_iff` /
+     `closure_fixedInt_sig_call_correspondence_M` (deriving MiniRust ABI
+     rejection directly from `cfTranslateAbiTy` with no independent MiniRust
+     ABI-mismatch premise);
    * `closure_indirect_call_prepends_env`, `closure_indirect_tailCall_prepends_env`,
      `closure_entry_frame_binds_env_then_args`, and
      `constEvalSelect_closure_runtime_target_dispatch` (Trusted) against
@@ -88,14 +92,26 @@ arguments by `Terminator::Call` and left by `Terminator::Return`.
   environment; MiniRust's function of arity `N` has no environment at all. The
   observable results agree because a non-capturing body never reads `_1`.
 
-* In `closure_typed_sig_call_correspondence_M` the MiniRust-side mismatched
-  types (`badMrRet`, `badMrArg`) are premises, not images of the Trusted
-  transmuted types under `cfTranslateAbiTy`. The two checks genuinely differ on
-  pointers: MiniRust `check_abi_compatibility` compares only the pointer
-  metadata kind, so a transmuted `&u32` / `*const u64` argument is accepted by
-  MiniRust while `Trusted` (`calleeParamTysMatch`) rejects it; for integers both
-  require the same signedness and width. The law is therefore stated for the
-  mismatches MiniRust also rejects.
+* **Pointer and `usize`/`u64` ABI divergences (characterized & kernel-witnessed
+  by `cf_ptr_and_usize_abi_divergence_witness`).** For fixed-width integers
+  (`i8..i128`, `u8..u128`) and `bool`, `Trusted` (`rigidTyMatchesCalleeDecl`)
+  and MiniRust (`checkAbiCompatibility ∘ cfTranslateAbiTy`) agree
+  unconditionally (`cfTranslateAbiTy_fixedInt_abi_compat_iff`,
+  `closure_fixedInt_sig_call_correspondence_M`). Outside that fragment,
+  `Trusted` is strictly more conservative (fails closed with `.ub`):
+  - **Thin pointers**: MiniRust `check_abi_compatibility` compares only
+    `PtrType::meta_kind`, so a transmuted `*const u64` or `&u32` passed to a
+    `*const u32` closure parameter is accepted by MiniRust (`Mach` and `MachTB`,
+    preserving `MachTB.wfLive`) while `Trusted` (`calleeParamTysMatch`) rejects
+    it with `.ub`;
+  - **`usize` vs `u64` (and `isize` vs `i64`) on 64-bit `x86_64`**:
+    `cfTranslateAbiTy` maps both `usize` and `u64` to `IntType(Unsigned, 8)`, so
+    MiniRust accepts a `usize` caller argument passed to a `u64` closure
+    parameter while `Trusted` rejects it with `.ub`.
+  The general law `closure_typed_sig_call_correspondence_M` therefore takes the
+  MiniRust-side ABI rejection as a premise, while
+  `closure_fixedInt_sig_call_correspondence_M` derives it directly through
+  `cfTranslateAbiTy`.
 
 ## Why the earlier correspondence did not catch the reproducer
 
@@ -1886,6 +1902,196 @@ theorem closure_typed_sig_call_correspondence_M {M : Type} [Gen.Memory M] [Memor
         f1 f2 cm1 cm2 mrRetTy hSL hAA hRetF2).2 argLoc0 restLocs argVal badMrArg restArgs mrArg0
         hFnArgs rfl hRestLen hOkRet hArg0F2 hBadMrArg).2
 
+/-- Fixed-width Rust integers (`i8..i128`, `u8..u128`) and `bool`, excluding
+pointer-width `isize`/`usize` (which collapse to `i64`/`u64` in MiniRust on
+64-bit `x86_64`) and pointer types (where MiniRust compares only metadata kind). -/
+def cfIsFixedIntOrBoolRigidTy : RigidTy → Bool
+  | .bool => true
+  | .uint .u8 | .uint .u16 | .uint .u32 | .uint .u64 | .uint .u128 => true
+  | .int .i8 | .int .i16 | .int .i32 | .int .i64 | .int .i128 => true
+  | _ => false
+
+/-- On fixed-width integers and `bool`, `rigidTyMatchesCalleeDecl [] 8 t u = true`
+forces syntactic equality `u = t`. -/
+theorem rigidTyMatchesCalleeDecl_fixedInt_eq (t u : RigidTy)
+    (ht : cfIsFixedIntOrBoolRigidTy t = true) (h : rigidTyMatchesCalleeDecl [] 8 t u = true) :
+    u = t := by
+  have hNoParam : ∀ idx nm, rigidTyMatchesCalleeDecl [] 8 t (.param idx nm) = false := by
+    intro idx nm; cases idx <;> rfl
+  cases t with
+  | bool =>
+    cases u with
+    | param idx nm => rw [hNoParam] at h; cases h
+    | _ => first | rfl | (simp [rigidTyMatchesCalleeDecl, rigidTyEq] at h)
+  | uint u1 =>
+    cases u1 with
+    | usize => simp [cfIsFixedIntOrBoolRigidTy] at ht
+    | u8 | u16 | u32 | u64 | u128 =>
+      cases u with
+      | param idx nm => rw [hNoParam] at h; cases h
+      | uint u2 => cases u2 <;> first | rfl | (simp [rigidTyMatchesCalleeDecl, rigidTyEq] at h)
+      | _ => simp [rigidTyMatchesCalleeDecl, rigidTyEq] at h
+  | int i1 =>
+    cases i1 with
+    | isize => simp [cfIsFixedIntOrBoolRigidTy] at ht
+    | i8 | i16 | i32 | i64 | i128 =>
+      cases u with
+      | param idx nm => rw [hNoParam] at h; cases h
+      | int i2 => cases i2 <;> first | rfl | (simp [rigidTyMatchesCalleeDecl, rigidTyEq] at h)
+      | _ => simp [rigidTyMatchesCalleeDecl, rigidTyEq] at h
+  | _ => simp [cfIsFixedIntOrBoolRigidTy] at ht
+
+/-- **Universal fixed-width integer/`bool` ABI-compatibility equivalence**:
+for ALL fixed-width integer types (`i8..i128`, `u8..u128`) and `bool`,
+`cfTranslateAbiTy` is total and MiniRust `checkAbiCompatibility` on the
+translated types agrees unconditionally with Trusted
+`rigidTyMatchesCalleeDecl [] 8`. -/
+theorem cfTranslateAbiTy_fixedInt_abi_compat_iff (t1 t2 : RigidTy)
+    (h1 : cfIsFixedIntOrBoolRigidTy t1 = true) (h2 : cfIsFixedIntOrBoolRigidTy t2 = true) :
+    ∃ m1 m2, cfTranslateAbiTy t1 = some m1 ∧ cfTranslateAbiTy t2 = some m2 ∧
+      checkAbiCompatibility m1 m2 = .ok (rigidTyMatchesCalleeDecl [] 8 t1 t2) := by
+  cases t1 with
+  | bool =>
+    cases t2 with
+    | bool => exact ⟨_, _, rfl, rfl, rfl⟩
+    | uint u2 => cases u2 with
+      | usize => simp [cfIsFixedIntOrBoolRigidTy] at h2
+      | u8 | u16 | u32 | u64 | u128 => exact ⟨_, _, rfl, rfl, rfl⟩
+    | int i2 => cases i2 with
+      | isize => simp [cfIsFixedIntOrBoolRigidTy] at h2
+      | i8 | i16 | i32 | i64 | i128 => exact ⟨_, _, rfl, rfl, rfl⟩
+    | _ => simp [cfIsFixedIntOrBoolRigidTy] at h2
+  | uint u1 =>
+    cases u1 with
+    | usize => simp [cfIsFixedIntOrBoolRigidTy] at h1
+    | u8 | u16 | u32 | u64 | u128 =>
+      cases t2 with
+      | bool => exact ⟨_, _, rfl, rfl, rfl⟩
+      | uint u2 => cases u2 with
+        | usize => simp [cfIsFixedIntOrBoolRigidTy] at h2
+        | u8 | u16 | u32 | u64 | u128 => exact ⟨_, _, rfl, rfl, rfl⟩
+      | int i2 => cases i2 with
+        | isize => simp [cfIsFixedIntOrBoolRigidTy] at h2
+        | i8 | i16 | i32 | i64 | i128 => exact ⟨_, _, rfl, rfl, rfl⟩
+      | _ => simp [cfIsFixedIntOrBoolRigidTy] at h2
+  | int i1 =>
+    cases i1 with
+    | isize => simp [cfIsFixedIntOrBoolRigidTy] at h1
+    | i8 | i16 | i32 | i64 | i128 =>
+      cases t2 with
+      | bool => exact ⟨_, _, rfl, rfl, rfl⟩
+      | uint u2 => cases u2 with
+        | usize => simp [cfIsFixedIntOrBoolRigidTy] at h2
+        | u8 | u16 | u32 | u64 | u128 => exact ⟨_, _, rfl, rfl, rfl⟩
+      | int i2 => cases i2 with
+        | isize => simp [cfIsFixedIntOrBoolRigidTy] at h2
+        | i8 | i16 | i32 | i64 | i128 => exact ⟨_, _, rfl, rfl, rfl⟩
+      | _ => simp [cfIsFixedIntOrBoolRigidTy] at h2
+  | _ => simp [cfIsFixedIntOrBoolRigidTy] at h1
+
+/-- **Unconditional translation-derived fixed-width integer/`bool` ABI-mismatch
+correspondence (`Mach` & `MachTB`)**: unlike `closure_typed_sig_call_correspondence_M`,
+this theorem takes **no** independent `checkAbiCompatibility ... = .ok false`
+premise and **no** `calleeParamTysMatch ... = false` premise — both MiniRust ABI
+rejection and Trusted parameter-list rejection are derived directly from the
+Trusted type mismatch through `cfTranslateAbiTy` and
+`cfTranslateAbiTy_fixedInt_abi_compat_iff`. -/
+theorem closure_fixedInt_sig_call_correspondence_M {M : Type} [Gen.Memory M] [MemoryOps M]
+    {p : ProvenancePtr} {m : Machine M} {fnNm : Gen.FnName} {addr : Nat}
+    {prov : Option (Gen.Memory.Provenance M)} {c : CapturedMir} {mode : ClosureEnvMode} {fn : Gen.Function}
+    {fnIns : List RigidTy} {fnOut : RigidTy} {mrRetTy : Gen.Type}
+    (s : MachineState) (callerBody : CapturedMir) (func : MirAst.Operand) (argOps : List MirAst.Operand)
+    (dest : MirAst.Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction) (span : String)
+    (localsAfterFunc locals' : List LocalSlot) (argVals : List MirSemantics.Value)
+    (hRel : ClosureFnPtrEntryRel s.memory p m fnNm addr prov c mode fn fnIns.length)
+    (hSig : ClosureFnSigRel c fn fnIns fnOut mrRetTy)
+    (hOutFixed : cfIsFixedIntOrBoolRigidTy fnOut = true)
+    (hNotDir : extractCalleeDefPath? func = none)
+    (hFunc : evalOperandWithBodyCast s.frame.locals func s.memory.borrows s.memory.globals
+      callerBody.layouts s.memory.callerLocals callerBody.localDecls s.memory.callStack =
+      .ok (.ptr p 8) localsAfterFunc)
+    (hArgs : evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+      callerBody.layouts s.memory.callerLocals callerBody.localDecls s.memory.callStack = .ok argVals locals')
+    (hLook : lookupCallee s.memory.callees callerBody.layouts c.defPath [] s.memory.traitImpls = some c)
+    (spa : StackPopAction M) (f1 f2 : StackFrame M) (cm1 cm2 : ConcurrentMemory M)
+    (hSL : storageLiveM { func := fn, locals := ⟨[]⟩, stack_pop_action := spa, next_block := fn.start, next_stmt := 0, extra := MemoryOps.new_call } m.mem fn.ret = .ok (f1, cm1))
+    (hAA : allocFrameArgsM f1 cm1 fn.args = .ok (f2, cm2))
+    (hF2Func : f2.func = fn) :
+    (∀ e badIns badOut badSaf badMrRet callerArgs,
+      lookupFnPtr s.memory.fnPtrs p.allocId = some e →
+      e.fnSig = some (.fnPtr badIns badOut badSaf .rust) →
+      fnEntryCompatibleWithCallSite e (length argOps) (operandTy callerBody.localDecls callerBody.layouts func) = true →
+      cfIsFixedIntOrBoolRigidTy badOut = true →
+      cfTranslateAbiTy badOut = some badMrRet →
+      rigidTyMatchesCalleeDecl [] 8 badOut fnOut = false →
+      evalTerminator s { kind := .call func argOps dest (some targetBb) unwind, span := span } (some callerBody) =
+        MirStepNode.fail .ub ∧
+      createFrameM m fn spa .Rust badMrRet callerArgs =
+        .error (.ub "call ABI violation: return types are not compatible")) ∧
+    (∀ in0 restIns argLoc0 restLocs e badIn0 restBad badOut badSaf argVal badMrArg restArgs,
+      fnIns = in0 :: restIns →
+      fn.args = argLoc0 :: restLocs →
+      lookupFnPtr s.memory.fnPtrs p.allocId = some e →
+      e.fnSig = some (.fnPtr (badIn0 :: restBad) badOut badSaf .rust) →
+      fnEntryCompatibleWithCallSite e (length argOps) (operandTy callerBody.localDecls callerBody.layouts func) = true →
+      cfIsFixedIntOrBoolRigidTy in0 = true →
+      cfIsFixedIntOrBoolRigidTy badIn0 = true →
+      cfTranslateAbiTy badIn0 = some badMrArg →
+      rigidTyMatchesCalleeDecl [] 8 badIn0 in0 = false →
+      restLocs.length = restArgs.length →
+      evalTerminator s { kind := .call func argOps dest (some targetBb) unwind, span := span } (some callerBody) =
+        MirStepNode.fail .ub ∧
+      createFrameM m fn spa .Rust mrRetTy ((argVal, badMrArg) :: restArgs) =
+        .error (.ub "call ABI violation: argument types are not compatible")) := by
+  have hBase := closure_typed_sig_call_correspondence_M s callerBody func argOps dest targetBb unwind span
+    localsAfterFunc locals' argVals hRel hSig hNotDir hFunc hArgs hLook spa f1 f2 cm1 cm2 hSL hAA hF2Func
+  refine ⟨?_, ?_⟩
+  · intro e badIns badOut badSaf badMrRet callerArgs hE hESig hCompat hBadFix hBadTrans hBadOut
+    obtain ⟨m1, m2, hm1, hm2, hAbiEq⟩ := cfTranslateAbiTy_fixedInt_abi_compat_iff badOut fnOut hBadFix hOutFixed
+    have hEq1 : m1 = badMrRet := Option.some.inj (hm1.symm.trans hBadTrans)
+    have hEq2 : m2 = mrRetTy := Option.some.inj (hm2.symm.trans hSig.retTranslate)
+    subst hEq1; subst hEq2
+    rw [hBadOut] at hAbiEq
+    exact hBase.2.1 e badIns badOut badSaf m1 callerArgs hE hESig hCompat hBadOut hAbiEq
+  · intro in0 restIns argLoc0 restLocs e badIn0 restBad badOut badSaf argVal badMrArg restArgs
+      hIns hArgsEq hE hESig hCompat hInFix hBadFix hBadTrans hBadIn0 hRestLen
+    have hArgsRel := hSig.argsRel
+    rw [hIns, hArgsEq] at hArgsRel
+    obtain ⟨⟨mrArg0, hInTrans, hArg0Lookup⟩, _⟩ := hArgsRel
+    obtain ⟨m1, m2, hm1, hm2, hAbiEq⟩ := cfTranslateAbiTy_fixedInt_abi_compat_iff badIn0 in0 hBadFix hInFix
+    have hEq1 : m1 = badMrArg := Option.some.inj (hm1.symm.trans hBadTrans)
+    have hEq2 : m2 = mrArg0 := Option.some.inj (hm2.symm.trans hInTrans)
+    subst hEq1; subst hEq2
+    rw [hBadIn0] at hAbiEq
+    obtain ⟨r1, r2, hr1, hr2, hRetRefl⟩ := cfTranslateAbiTy_fixedInt_abi_compat_iff fnOut fnOut hOutFixed hOutFixed
+    have hEqR1 : r1 = mrRetTy := Option.some.inj (hr1.symm.trans hSig.retTranslate)
+    have hEqR2 : r2 = mrRetTy := Option.some.inj (hr2.symm.trans hSig.retTranslate)
+    subst hEqR1; subst hEqR2
+    have hOutRefl : rigidTyMatchesCalleeDecl [] 8 fnOut fnOut = true := by
+      cases fnOut with
+      | bool => rfl
+      | uint u => cases u <;> first | rfl | (simp [cfIsFixedIntOrBoolRigidTy] at hOutFixed)
+      | int i => cases i <;> first | rfl | (simp [cfIsFixedIntOrBoolRigidTy] at hOutFixed)
+      | _ => simp [cfIsFixedIntOrBoolRigidTy] at hOutFixed
+    rw [hOutRefl] at hRetRefl
+    have hBadParamList : ∀ retDecl envDecl paramDecls, c.localDecls = retDecl :: envDecl :: paramDecls →
+        calleeParamTysMatch [] (badIn0 :: restBad) paramDecls = false := by
+      intro retDecl envDecl paramDecls hDecls
+      obtain ⟨rD, eD, pDs, hD0, _, _, hMatch0⟩ := hSig.decls
+      have hEqDecls : retDecl :: envDecl :: paramDecls = rD :: eD :: pDs := hDecls.symm.trans hD0
+      injection hEqDecls with _ hTail1
+      injection hTail1 with _ hPEq
+      subst hPEq
+      rw [hIns] at hMatch0
+      cases paramDecls with
+      | nil => simp [calleeParamTysMatch] at hMatch0
+      | cons p0 ps =>
+        simp only [calleeParamTysMatch, Bool.and_eq_true] at hMatch0
+        have hp0 : p0.ty.kind = in0 := rigidTyMatchesCalleeDecl_fixedInt_eq in0 p0.ty.kind hInFix hMatch0.1
+        simp only [calleeParamTysMatch, hp0, hBadIn0, Bool.false_and]
+    exact hBase.2.2 in0 restIns argLoc0 restLocs e badIn0 restBad badOut badSaf argVal m1 restArgs m2
+      hIns hArgsEq hArg0Lookup hE hESig hCompat hBadParamList hRestLen hRetRefl hAbiEq
+
 /-- **Universal MiniRust pointer identity (`raw_c == raw_d`, `Mach` & `MachTB`).**
 `BinOp::Rel(Eq)` on two thin pointers with the same address is `true`
 regardless of provenance, for any pointer type. -/
@@ -3326,6 +3532,413 @@ theorem closure_typed_sig_instances_mach_and_tb :
     (.uint .u64) [] cfU32K .safe (.Int 5) u64MrTy [] u32MrTy rfl rfl rfl rfl rfl rfl hBadIn rfl rfl rfl
   exact ⟨hRetPairBM.1, hRetPairBM.2, hRetPairTB.2, hArgPairBM.1, hArgPairBM.2, hArgPairTB.2⟩
 
+/-- **Non-vacuity instantiations of `closure_fixedInt_sig_call_correspondence_M`
+on `Mach` and `MachTB`** (deriving MiniRust ABI rejection directly through
+`cfTranslateAbiTy` with ZERO hand-supplied MiniRust ABI-mismatch premises):
+covers return width mismatch (`u64` vs `u32`), argument width mismatch (`u64`
+vs `u32`), AND argument signedness mismatch (`i32` vs `u32`). -/
+theorem closure_fixedInt_sig_instances_mach_and_tb :
+    let fn := cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))
+    let mBM := cfMrIndirectMach fn [5]
+    let mTB := liftMachToTB mBM
+    let sigRet : RigidTy := .fnPtr [cfU32K] (.uint .u64) .safe .rust
+    let sigArgW : RigidTy := .fnPtr [.uint .u64] cfU32K .safe .rust
+    let sigArgS : RigidTy := .fnPtr [.int .i32] cfU32K .safe .rust
+    let sBadRet := cfPtrCallState sigRet (cfU32V 5) cfFx_fn_shared_closure_0 cfSharedPath sigRet
+    let sBadArgW := cfPtrCallState sigArgW (.scalar ⟨5, 8⟩) cfFx_fn_shared_closure_0 cfSharedPath sigArgW (.uint .u64)
+    let sBadArgS := cfPtrCallState sigArgS (cfU32V 5) cfFx_fn_shared_closure_0 cfSharedPath sigArgS (.int .i32)
+    evalTerminator sBadRet
+        { kind := .call (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) (some 1) .continue_, span := "ptr_call" }
+        (some (cfPtrCaller sigRet)) = MirStepNode.fail .ub ∧
+    createFrameM mBM fn .BottomOfStack .Rust u64MrTy [(.Int 5, u32MrTy)] =
+      .error (.ub "call ABI violation: return types are not compatible") ∧
+    createFrameM mTB fn .BottomOfStack .Rust u64MrTy [(.Int 5, u32MrTy)] =
+      .error (.ub "call ABI violation: return types are not compatible") ∧
+    evalTerminator sBadArgW
+        { kind := .call (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) (some 1) .continue_, span := "ptr_call" }
+        (some (cfPtrCaller sigArgW (.uint .u64))) = MirStepNode.fail .ub ∧
+    createFrameM mBM fn .BottomOfStack .Rust u32MrTy [(.Int 5, u64MrTy)] =
+      .error (.ub "call ABI violation: argument types are not compatible") ∧
+    createFrameM mTB fn .BottomOfStack .Rust u32MrTy [(.Int 5, u64MrTy)] =
+      .error (.ub "call ABI violation: argument types are not compatible") ∧
+    evalTerminator sBadArgS
+        { kind := .call (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) (some 1) .continue_, span := "ptr_call" }
+        (some (cfPtrCaller sigArgS (.int .i32))) = MirStepNode.fail .ub ∧
+    createFrameM mBM fn .BottomOfStack .Rust u32MrTy [(.Int 5, i32MrTy)] =
+      .error (.ub "call ABI violation: argument types are not compatible") ∧
+    createFrameM mTB fn .BottomOfStack .Rust u32MrTy [(.Int 5, i32MrTy)] =
+      .error (.ub "call ABI violation: argument types are not compatible") := by
+  dsimp only
+  let fn := cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))
+  let mBM := cfMrIndirectMach fn [5]
+  let mTB := liftMachToTB mBM
+  let initFrBM : StackFrame BM :=
+    { func := fn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+      next_block := fn.start, next_stmt := 0, extra := MemoryOps.new_call }
+  let initFrTB : StackFrame TBM :=
+    { func := fn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+      next_block := fn.start, next_stmt := 0, extra := MemoryOps.new_call }
+  have hBMInit : ∃ f1 cm1 f2 cm2,
+      storageLiveM initFrBM mBM.mem fn.ret = .ok (f1, cm1) ∧
+      allocFrameArgsM f1 cm1 fn.args = .ok (f2, cm2) := by
+    have hOk : (do
+        let (f1, cm1) ← storageLiveM initFrBM mBM.mem fn.ret
+        let _ ← allocFrameArgsM f1 cm1 fn.args
+        pure true).toOption = some true := by decide +kernel
+    cases h1 : storageLiveM initFrBM mBM.mem fn.ret with
+    | error e => simp only [h1, bind, Except.bind, Except.toOption] at hOk; cases hOk
+    | ok p1 =>
+      cases h2 : allocFrameArgsM p1.1 p1.2 fn.args with
+      | error e => simp only [h1, h2, bind, Except.bind, Except.toOption] at hOk; cases hOk
+      | ok p2 => exact ⟨p1.1, p1.2, p2.1, p2.2, rfl, h2⟩
+  have hTBInit : ∃ f1 cm1 f2 cm2,
+      storageLiveM initFrTB mTB.mem fn.ret = .ok (f1, cm1) ∧
+      allocFrameArgsM f1 cm1 fn.args = .ok (f2, cm2) := by
+    have hOk : (do
+        let (f1, cm1) ← storageLiveM initFrTB mTB.mem fn.ret
+        let _ ← allocFrameArgsM f1 cm1 fn.args
+        pure true).toOption = some true := by decide +kernel
+    cases h1 : storageLiveM initFrTB mTB.mem fn.ret with
+    | error e => simp only [h1, bind, Except.bind, Except.toOption] at hOk; cases hOk
+    | ok p1 =>
+      cases h2 : allocFrameArgsM p1.1 p1.2 fn.args with
+      | error e => simp only [h1, h2, bind, Except.bind, Except.toOption] at hOk; cases hOk
+      | ok p2 => exact ⟨p1.1, p1.2, p2.1, p2.2, rfl, h2⟩
+  obtain ⟨f1BM, cm1BM, f2BM, cm2BM, hSLBM, hAABM⟩ := hBMInit
+  obtain ⟨f1TB, cm1TB, f2TB, cm2TB, hSLTB, hAATB⟩ := hTBInit
+  have hF2BM : f2BM.func = fn := (allocFrameArgsM_func_eq hAABM).trans (storageLiveM_func_eq hSLBM)
+  have hF2TB : f2TB.func = fn := (allocFrameArgsM_func_eq hAATB).trans (storageLiveM_func_eq hSLTB)
+  have hSigShared : ClosureFnSigRel cfFx_fn_shared_closure_0 fn [.uint .u32] (.uint .u32) u32MrTy :=
+    closure_typed_sig_instances_mach_and_tb.1
+  obtain ⟨hBaseBM, provTB, hBaseTB⟩ := closureFnPtrEntryRel_instance_mach_and_tb
+  let sigRet : RigidTy := .fnPtr [cfU32K] (.uint .u64) .safe .rust
+  let sigArgW : RigidTy := .fnPtr [.uint .u64] cfU32K .safe .rust
+  let sigArgS : RigidTy := .fnPtr [.int .i32] cfU32K .safe .rust
+  let sBadRet := cfPtrCallState sigRet (cfU32V 5) cfFx_fn_shared_closure_0 cfSharedPath sigRet
+  let sBadArgW := cfPtrCallState sigArgW (.scalar ⟨5, 8⟩) cfFx_fn_shared_closure_0 cfSharedPath sigArgW (.uint .u64)
+  let sBadArgS := cfPtrCallState sigArgS (cfU32V 5) cfFx_fn_shared_closure_0 cfSharedPath sigArgS (.int .i32)
+  have hRelRetBM : ClosureFnPtrEntryRel sBadRet.memory { allocId := 65536, offsetBytes := 0 }
+      mBM (fnName 1) 8192 (some (⟨4⟩, ())) cfFx_fn_shared_closure_0 .sharedRef fn 1 :=
+    { entry := ⟨rfl, rfl, by decide, hBaseBM.entry.2.2.2⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
+      shape := hBaseBM.shape, nonGeneric := rfl, trustedArity := rfl,
+      mrResolve := hBaseBM.mrResolve, mrArity := rfl, mrConv := rfl }
+  have hRelRetTB : ClosureFnPtrEntryRel sBadRet.memory { allocId := 65536, offsetBytes := 0 }
+      mTB (fnName 1) 8192 provTB cfFx_fn_shared_closure_0 .sharedRef fn 1 :=
+    { entry := ⟨rfl, rfl, by decide, hBaseTB.entry.2.2.2⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
+      shape := hBaseTB.shape, nonGeneric := rfl, trustedArity := rfl,
+      mrResolve := hBaseTB.mrResolve, mrArity := rfl, mrConv := rfl }
+  have hRelArgWBM : ClosureFnPtrEntryRel sBadArgW.memory { allocId := 65536, offsetBytes := 0 }
+      mBM (fnName 1) 8192 (some (⟨4⟩, ())) cfFx_fn_shared_closure_0 .sharedRef fn 1 :=
+    { entry := ⟨rfl, rfl, by decide, hBaseBM.entry.2.2.2⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
+      shape := hBaseBM.shape, nonGeneric := rfl, trustedArity := rfl,
+      mrResolve := hBaseBM.mrResolve, mrArity := rfl, mrConv := rfl }
+  have hRelArgWTB : ClosureFnPtrEntryRel sBadArgW.memory { allocId := 65536, offsetBytes := 0 }
+      mTB (fnName 1) 8192 provTB cfFx_fn_shared_closure_0 .sharedRef fn 1 :=
+    { entry := ⟨rfl, rfl, by decide, hBaseTB.entry.2.2.2⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
+      shape := hBaseTB.shape, nonGeneric := rfl, trustedArity := rfl,
+      mrResolve := hBaseTB.mrResolve, mrArity := rfl, mrConv := rfl }
+  have hRelArgSBM : ClosureFnPtrEntryRel sBadArgS.memory { allocId := 65536, offsetBytes := 0 }
+      mBM (fnName 1) 8192 (some (⟨4⟩, ())) cfFx_fn_shared_closure_0 .sharedRef fn 1 :=
+    { entry := ⟨rfl, rfl, by decide, hBaseBM.entry.2.2.2⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
+      shape := hBaseBM.shape, nonGeneric := rfl, trustedArity := rfl,
+      mrResolve := hBaseBM.mrResolve, mrArity := rfl, mrConv := rfl }
+  have hRelArgSTB : ClosureFnPtrEntryRel sBadArgS.memory { allocId := 65536, offsetBytes := 0 }
+      mTB (fnName 1) 8192 provTB cfFx_fn_shared_closure_0 .sharedRef fn 1 :=
+    { entry := ⟨rfl, rfl, by decide, hBaseTB.entry.2.2.2⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
+      shape := hBaseTB.shape, nonGeneric := rfl, trustedArity := rfl,
+      mrResolve := hBaseTB.mrResolve, mrArity := rfl, mrConv := rfl }
+  have hRetBM := (closure_fixedInt_sig_call_correspondence_M (M := BM) sBadRet (cfPtrCaller sigRet)
+    (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    sBadRet.frame.locals sBadRet.frame.locals [cfU32V 5] hRelRetBM hSigShared rfl rfl rfl rfl rfl
+    .BottomOfStack f1BM f2BM cm1BM cm2BM hSLBM hAABM hF2BM).1
+    (cfEntry cfSharedPath sigRet) [cfU32K] (.uint .u64) .safe u64MrTy [(.Int 5, u32MrTy)] rfl rfl rfl rfl rfl rfl
+  have hRetTB := (closure_fixedInt_sig_call_correspondence_M (M := TBM) sBadRet (cfPtrCaller sigRet)
+    (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    sBadRet.frame.locals sBadRet.frame.locals [cfU32V 5] hRelRetTB hSigShared rfl rfl rfl rfl rfl
+    .BottomOfStack f1TB f2TB cm1TB cm2TB hSLTB hAATB hF2TB).1
+    (cfEntry cfSharedPath sigRet) [cfU32K] (.uint .u64) .safe u64MrTy [(.Int 5, u32MrTy)] rfl rfl rfl rfl rfl rfl
+  have hArgWBM := (closure_fixedInt_sig_call_correspondence_M (M := BM) sBadArgW (cfPtrCaller sigArgW (.uint .u64))
+    (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    sBadArgW.frame.locals sBadArgW.frame.locals [.scalar ⟨5, 8⟩] hRelArgWBM hSigShared rfl rfl rfl rfl rfl
+    .BottomOfStack f1BM f2BM cm1BM cm2BM hSLBM hAABM hF2BM).2
+    (.uint .u32) [] (localName 1) [] (cfEntry cfSharedPath sigArgW) (.uint .u64) [] cfU32K .safe
+    (.Int 5) u64MrTy [] rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  have hArgWTB := (closure_fixedInt_sig_call_correspondence_M (M := TBM) sBadArgW (cfPtrCaller sigArgW (.uint .u64))
+    (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    sBadArgW.frame.locals sBadArgW.frame.locals [.scalar ⟨5, 8⟩] hRelArgWTB hSigShared rfl rfl rfl rfl rfl
+    .BottomOfStack f1TB f2TB cm1TB cm2TB hSLTB hAATB hF2TB).2
+    (.uint .u32) [] (localName 1) [] (cfEntry cfSharedPath sigArgW) (.uint .u64) [] cfU32K .safe
+    (.Int 5) u64MrTy [] rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  have hArgSBM := (closure_fixedInt_sig_call_correspondence_M (M := BM) sBadArgS (cfPtrCaller sigArgS (.int .i32))
+    (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    sBadArgS.frame.locals sBadArgS.frame.locals [cfU32V 5] hRelArgSBM hSigShared rfl rfl rfl rfl rfl
+    .BottomOfStack f1BM f2BM cm1BM cm2BM hSLBM hAABM hF2BM).2
+    (.uint .u32) [] (localName 1) [] (cfEntry cfSharedPath sigArgS) (.int .i32) [] cfU32K .safe
+    (.Int 5) i32MrTy [] rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  have hArgSTB := (closure_fixedInt_sig_call_correspondence_M (M := TBM) sBadArgS (cfPtrCaller sigArgS (.int .i32))
+    (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) 1 .continue_ "ptr_call"
+    sBadArgS.frame.locals sBadArgS.frame.locals [cfU32V 5] hRelArgSTB hSigShared rfl rfl rfl rfl rfl
+    .BottomOfStack f1TB f2TB cm1TB cm2TB hSLTB hAATB hF2TB).2
+    (.uint .u32) [] (localName 1) [] (cfEntry cfSharedPath sigArgS) (.int .i32) [] cfU32K .safe
+    (.Int 5) i32MrTy [] rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  exact ⟨hRetBM.1, hRetBM.2, hRetTB.2, hArgWBM.1, hArgWBM.2, hArgWTB.2, hArgSBM.1, hArgSBM.2, hArgSTB.2⟩
+
+/-- **Non-vacuity instantiations of the forged `(N + 1)`-argument branch of
+`closure_indirect_call_correspondence_M` (`Mach` & `MachTB`) AND
+`closure_indirect_tailCall_prepends_env`** (verbatim `tail_through_closure::{closure#0}`). -/
+theorem closure_forged_and_tailCall_law_instances_mach_and_tb :
+    let fn := cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))
+    let mBM := cfMrIndirectMach fn [5]
+    let mTB := liftMachToTB mBM
+    let sigForged : RigidTy := .fnPtr [.ref .not cfSharedClo, cfU32K] cfU32K .safe .rust
+    let sForged := cfEnvPtrCallState cfSharedClo cfFx_fn_shared_closure_0 cfSharedPath
+    let tailPath := "closure_matrix::tail_through_closure::{closure#0}"
+    let tailCaller : CapturedMir :=
+      { cfFx_tail_through_closure with
+        defPath := "cf::tail_ptr_caller", argCount := 2,
+        localDecls := [cfDecl cfU32K 0, cfDecl cfFnU32 1, cfDecl cfU32K 0],
+        basicBlocks :=
+          [{ statements := [],
+             terminator := { kind := .tailCall (.copy (locPlace 1)) [.copy (locPlace 2)], span := "tail_call" },
+             isCleanup := false }] }
+    let sTail := cfInitPtrs tailCaller [cfFnPtrVal, cfU32V 9] [cfFx_tail_through_closure_closure_0] [cfEntry tailPath cfFnU32]
+    evalTerminator sForged
+        { kind := .call (.copy (locPlace 1)) [.copy (locPlace 2), .copy (locPlace 3)] (locPlace 0) (some 1) .continue_,
+          span := "env_ptr_call" }
+        (some (cfEnvPtrCaller sigForged (.ref .not cfSharedClo))) = MirStepNode.fail .ub ∧
+    createFrameM mBM fn .BottomOfStack .Rust u32MrTy [(.Int 1, u32MrTy), (.Int 5, u32MrTy)] =
+      .error (.ub "call ABI violation: number of arguments does not agree") ∧
+    createFrameM mTB fn .BottomOfStack .Rust u32MrTy [(.Int 1, u32MrTy), (.Int 5, u32MrTy)] =
+      .error (.ub "call ABI violation: number of arguments does not agree") ∧
+    evalTailCallTerminator sTail (.copy (locPlace 1)) [.copy (locPlace 2)] (some tailCaller) =
+      MirStepNode.step (enterTailCalleeFrame
+        (tailCalleeEntryMemory sTail.memory.callStack
+          { sTail.memory with borrows := disableFrameBorrows sTail.memory.borrows (length sTail.memory.callStack) (length sTail.frame.locals) }
+          (length sTail.frame.locals)
+          (length (initLocals cfFx_tail_through_closure_closure_0
+            (synthesizeClosureEnvArg .sharedRef (layoutPointerBytes cfFx_tail_through_closure_closure_0.layouts) :: [cfU32V 9]))))
+        cfFx_tail_through_closure_closure_0
+        (synthesizeClosureEnvArg .sharedRef (layoutPointerBytes cfFx_tail_through_closure_closure_0.layouts) :: [cfU32V 9])) := by
+  dsimp only
+  let fn := cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 17))
+  let mBM := cfMrIndirectMach fn [5]
+  let mTB := liftMachToTB mBM
+  let sigForged : RigidTy := .fnPtr [.ref .not cfSharedClo, cfU32K] cfU32K .safe .rust
+  let sForged := cfEnvPtrCallState cfSharedClo cfFx_fn_shared_closure_0 cfSharedPath
+  obtain ⟨hBaseBM, provTB, hBaseTB⟩ := closureFnPtrEntryRel_instance_mach_and_tb
+  have hRelBM : ClosureFnPtrEntryRel sForged.memory { allocId := 65536, offsetBytes := 0 }
+      mBM (fnName 1) 8192 (some (⟨4⟩, ())) cfFx_fn_shared_closure_0 .sharedRef fn 1 :=
+    { entry := ⟨rfl, rfl, by decide, hBaseBM.entry.2.2.2⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
+      shape := hBaseBM.shape, nonGeneric := rfl, trustedArity := rfl,
+      mrResolve := hBaseBM.mrResolve, mrArity := rfl, mrConv := rfl }
+  have hRelTB : ClosureFnPtrEntryRel sForged.memory { allocId := 65536, offsetBytes := 0 }
+      mTB (fnName 1) 8192 provTB cfFx_fn_shared_closure_0 .sharedRef fn 1 :=
+    { entry := ⟨rfl, rfl, by decide, hBaseTB.entry.2.2.2⟩, fnEntry := ⟨_, rfl, rfl, rfl⟩, linked := rfl,
+      shape := hBaseTB.shape, nonGeneric := rfl, trustedArity := rfl,
+      mrResolve := hBaseTB.mrResolve, mrArity := rfl, mrConv := rfl }
+  have hCompatSite : ∀ e, lookupFnPtr sForged.memory.fnPtrs (65536 : Nat) = some e →
+      fnEntryCompatibleWithCallSite e 2
+        (operandTy (cfEnvPtrCaller sigForged (.ref .not cfSharedClo)).localDecls
+          (cfEnvPtrCaller sigForged (.ref .not cfSharedClo)).layouts (.copy (locPlace 1))) = true := by
+    intro e he
+    have : e = cfEntry cfSharedPath sigForged := (Option.some.inj he).symm
+    subst this; rfl
+  let initFrBM : StackFrame BM :=
+    { func := fn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+      next_block := fn.start, next_stmt := 0, extra := MemoryOps.new_call }
+  let initFrTB : StackFrame TBM :=
+    { func := fn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+      next_block := fn.start, next_stmt := 0, extra := MemoryOps.new_call }
+  have hBMInit : ∃ f1 cm1 f2 cm2,
+      storageLiveM initFrBM mBM.mem fn.ret = .ok (f1, cm1) ∧
+      allocFrameArgsM f1 cm1 fn.args = .ok (f2, cm2) := by
+    have hOk : (do
+        let (f1, cm1) ← storageLiveM initFrBM mBM.mem fn.ret
+        let _ ← allocFrameArgsM f1 cm1 fn.args
+        pure true).toOption = some true := by decide +kernel
+    cases h1 : storageLiveM initFrBM mBM.mem fn.ret with
+    | error e => simp only [h1, bind, Except.bind, Except.toOption] at hOk; cases hOk
+    | ok p1 =>
+      cases h2 : allocFrameArgsM p1.1 p1.2 fn.args with
+      | error e => simp only [h1, h2, bind, Except.bind, Except.toOption] at hOk; cases hOk
+      | ok p2 => exact ⟨p1.1, p1.2, p2.1, p2.2, rfl, h2⟩
+  have hTBInit : ∃ f1 cm1 f2 cm2,
+      storageLiveM initFrTB mTB.mem fn.ret = .ok (f1, cm1) ∧
+      allocFrameArgsM f1 cm1 fn.args = .ok (f2, cm2) := by
+    have hOk : (do
+        let (f1, cm1) ← storageLiveM initFrTB mTB.mem fn.ret
+        let _ ← allocFrameArgsM f1 cm1 fn.args
+        pure true).toOption = some true := by decide +kernel
+    cases h1 : storageLiveM initFrTB mTB.mem fn.ret with
+    | error e => simp only [h1, bind, Except.bind, Except.toOption] at hOk; cases hOk
+    | ok p1 =>
+      cases h2 : allocFrameArgsM p1.1 p1.2 fn.args with
+      | error e => simp only [h1, h2, bind, Except.bind, Except.toOption] at hOk; cases hOk
+      | ok p2 => exact ⟨p1.1, p1.2, p2.1, p2.2, rfl, h2⟩
+  obtain ⟨f1BM, cm1BM, f2BM, cm2BM, hSLBM, hAABM⟩ := hBMInit
+  obtain ⟨f1TB, cm1TB, f2TB, cm2TB, hSLTB, hAATB⟩ := hTBInit
+  have hF2BM : f2BM.func = fn := (allocFrameArgsM_func_eq hAABM).trans (storageLiveM_func_eq hSLBM)
+  have hF2TB : f2TB.func = fn := (allocFrameArgsM_func_eq hAATB).trans (storageLiveM_func_eq hSLTB)
+  have hLawBM := (closure_indirect_call_correspondence_M (M := BM) sForged
+    (cfEnvPtrCaller sigForged (.ref .not cfSharedClo))
+    (.copy (locPlace 1)) [.copy (locPlace 2), .copy (locPlace 3)] (locPlace 0) 1 .continue_ "env_ptr_call"
+    sForged.frame.locals sForged.frame.locals [cfEnvScalar, cfU32V 5] hRelBM rfl rfl hCompatSite rfl rfl
+    .BottomOfStack u32MrTy [(.Int 1, u32MrTy), (.Int 5, u32MrTy)] f1BM f2BM cm1BM cm2BM u32MrTy hSLBM hAABM
+    (by rw [hF2BM]; rfl) rfl rfl).2.2.2 rfl
+  have hLawTB := (closure_indirect_call_correspondence_M (M := TBM) sForged
+    (cfEnvPtrCaller sigForged (.ref .not cfSharedClo))
+    (.copy (locPlace 1)) [.copy (locPlace 2), .copy (locPlace 3)] (locPlace 0) 1 .continue_ "env_ptr_call"
+    sForged.frame.locals sForged.frame.locals [cfEnvScalar, cfU32V 5] hRelTB rfl rfl hCompatSite rfl rfl
+    .BottomOfStack u32MrTy [(.Int 1, u32MrTy), (.Int 5, u32MrTy)] f1TB f2TB cm1TB cm2TB u32MrTy hSLTB hAATB
+    (by rw [hF2TB]; rfl) rfl rfl).2.2.2 rfl
+  let tailPath := "closure_matrix::tail_through_closure::{closure#0}"
+  let tailCaller : CapturedMir :=
+    { cfFx_tail_through_closure with
+      defPath := "cf::tail_ptr_caller", argCount := 2,
+      localDecls := [cfDecl cfU32K 0, cfDecl cfFnU32 1, cfDecl cfU32K 0],
+      basicBlocks :=
+        [{ statements := [],
+           terminator := { kind := .tailCall (.copy (locPlace 1)) [.copy (locPlace 2)], span := "tail_call" },
+           isCleanup := false }] }
+  let sTail := cfInitPtrs tailCaller [cfFnPtrVal, cfU32V 9] [cfFx_tail_through_closure_closure_0] [cfEntry tailPath cfFnU32]
+  have hTail := (closure_indirect_tailCall_prepends_env sTail tailCaller (.copy (locPlace 1)) [.copy (locPlace 2)]
+    "tail_call" { defPath := tailPath, typeArgs := [], fnSig := some cfFnU32, isIndirect := true }
+    sTail.frame.locals sTail.frame.locals [cfU32V 9] cfFx_tail_through_closure_closure_0 .sharedRef
+    rfl rfl rfl rfl rfl (cfShapeTag_inj (by decide +kernel)) rfl).2
+  exact ⟨hLawBM.1, hLawBM.2, hLawTB.2, hTail⟩
+
+/-- Layout table for 8-byte pointer and `u64`/`usize` ABI divergence bodies:
+`0 = u32`, `1 = 8-byte ptr`, `2 = 1-ZST closure`, `3 = 8-byte u64/usize`. -/
+def cfAbiDivLayouts : LayoutTable :=
+  let u64L : TypeLayout :=
+    { size := { bytes := 8 }, align := { bytes := 8 },
+      backendRepr := .scalar (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 }),
+      fields := .primitive, variants := .single 0, isUninhabited := false }
+  { cfFx_fn_shared_layouts with entries := cfFx_fn_shared_layouts.entries ++ [u64L] }
+
+/-- `fn(_1 : sigKind, _2 : argKind) -> u32 { _0 = _1(_2) }` with explicit argument layout index `argLay`. -/
+def cfAbiDivCaller (sigKind argKind : RigidTy) (argLay : Nat) : CapturedMir :=
+  { cfFx_fn_shared with
+    defPath := "cf::abi_div_caller", argCount := 2,
+    localDecls := [cfDecl cfU32K 0, cfDecl sigKind 1, cfDecl argKind argLay],
+    basicBlocks :=
+      [{ statements := [],
+         terminator := { kind := .call (.copy (locPlace 1)) [.copy (locPlace 2)] (locPlace 0) (some 1) .continue_,
+                         span := "abi_div_call" },
+         isCleanup := false }, cfRetBlock],
+    layouts := cfAbiDivLayouts }
+
+/-- Non-capturing closure body `|_p: *const u32| -> u32 { 77 }` (for pointer-ABI divergence). -/
+def cfPtrAbiClosPath : String := "cf::ptr_abi_closure::{closure#0}"
+def cfPtrAbiClosBody : CapturedMir :=
+  let c77 : MirAst.Operand := .constant { ty := { kind := cfU32K, layoutIdx := 0 }, val := .scalar (.int ⟨77, 4⟩) }
+  { cfFx_fn_shared_closure_0 with
+    defPath := cfPtrAbiClosPath, argCount := 2,
+    localDecls := [cfDecl cfU32K 0, cfDecl (.closure cfPtrAbiClosPath []) 2, cfDecl (.rawPtr .not cfU32K) 1],
+    basicBlocks :=
+      [{ statements := [{ kind := .assign (locPlace 0) (.use c77), span := "ptr_clos" }],
+         terminator := { kind := .return_, span := "ret" }, isCleanup := false }],
+    layouts := cfAbiDivLayouts }
+
+/-- Non-capturing closure body `|_x: u64| -> u32 { 77 }` (for `usize`/`u64` ABI divergence). -/
+def cfUsizeAbiClosPath : String := "cf::usize_abi_closure::{closure#0}"
+def cfUsizeAbiClosBody : CapturedMir :=
+  let c77 : MirAst.Operand := .constant { ty := { kind := cfU32K, layoutIdx := 0 }, val := .scalar (.int ⟨77, 4⟩) }
+  { cfFx_fn_shared_closure_0 with
+    defPath := cfUsizeAbiClosPath, argCount := 2,
+    localDecls := [cfDecl cfU32K 0, cfDecl (.closure cfUsizeAbiClosPath []) 2, cfDecl (.uint .u64) 3],
+    basicBlocks :=
+      [{ statements := [{ kind := .assign (locPlace 0) (.use c77), span := "usize_clos" }],
+         terminator := { kind := .return_, span := "ret" }, isCleanup := false }],
+    layouts := cfAbiDivLayouts }
+
+/-- MiniRust reference callee `fn(_1 : argTy) -> u32 { 77 }`. -/
+def cfMrConst77Fn (argTy : Gen.Type) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, argTy)] [localName 1] (localName 0)
+    [(bbName 0, cfBlk [.Assign (cfLc 0) (cfU32 77)] .Return)]
+
+@[reducible] def cfU32Pointee : PointeeInfo :=
+  { layout := .Sized ⟨4⟩ ⟨4⟩, inhabited := true, unsafe_cells := .Sized [], freeze := true, unpin := true }
+@[reducible] def cfU32RefMrTy : Gen.Type := .Ptr (.Ref .Immutable cfU32Pointee)
+
+/-- MiniRust thin-pointer ABI acceptance: caller passes `*const u64` (`thinRawPtrTy`,
+null pointer) to `fn(*const u32) -> u32`, returning `77`. -/
+def cfMrPtrRawDivergenceMach : Mach :=
+  cfMrMach [cfMrBadCallCaller .Rust thinRawPtrTy, cfMrConst77Fn thinRawPtrTy]
+    [(cfU 4, 4), (ptrBytes 0 none, 8), (cfU 8, 8)]
+
+/-- MiniRust ref-to-raw thin-pointer ABI acceptance: caller passes `&u32`
+(`.Ptr (.Ref .Immutable cfU32Pointee)`) to `fn(*const u32) -> u32` (`.Ptr (.Raw .None)`),
+returning `77` on both `Mach` and `MachTB` (preserving `MachTB.wfLive`). -/
+def cfMrPtrRefToRawDivergenceMach : Mach :=
+  let caller : Gen.Function :=
+    mkMrFn [(localName 0, u32MrTy), (localName 1, u32MrTy), (localName 2, cfU32RefMrTy), (localName 3, thinRawPtrTy)]
+      [localName 1] (localName 0)
+      [(bbName 0, cfBlk
+          [.Assign (cfLc 2) (.AddrOf (cfLc 1) (.Ref .Immutable cfU32Pointee)),
+           .Assign (cfLc 3) (cfFnPtrC 1)]
+          (cfCall (cfLd 3) [cfLd 2] 0 1 .Rust)),
+       cfLoopBb 1]
+  cfMrMach [caller, cfMrConst77Fn thinRawPtrTy]
+    [(cfU 4, 4), (cfU32B 5, 4), (cfU 8, 8), (cfU 8, 8)]
+
+/-- MiniRust `usize`/`u64` ABI acceptance on 64-bit `x86_64`: `cfTranslateAbiTy (.uint .usize) =
+some u64MrTy`, so calling `fn(u64) -> u32` with `5usize` returns `77`. -/
+def cfMrUsizeDivergenceMach : Mach :=
+  cfMrMach [cfMrBadCallCaller .Rust u64MrTy, cfMrConst77Fn u64MrTy]
+    [(cfU 4, 4), (scalarBytes ⟨.Unsigned, ⟨8⟩⟩ 5, 8), (cfU 8, 8)]
+
+/-- **Kernel-checked Pointer-ABI & `usize`/`u64` Divergence Witness (`Trusted` vs
+MiniRust `Mach` & `MachTB` with `MachTB.wfLive`)**:
+1. **Raw pointer pointee transmutation (`*const u64` -> `*const u32`)**:
+   - Positive control (`*const u32` -> `*const u32`): `Trusted = .scalar 77 4`;
+   - Transmuted (`*const u64` -> `*const u32`): `Trusted = .ub` (`calleeParamTysMatch`
+     requires exact syntactic pointee type), whereas MiniRust `checkAbiCompatibility`
+     compares only `PtrType.meta_kind` (`none == none`) and accepts on BOTH `Mach`
+     and `MachTB` (`77 : u32`, preserving `MachTB.wfLive`).
+2. **Reference-to-raw-pointer transmutation (`&u32` -> `*const u32`)**:
+   - `Trusted = .ub`, whereas MiniRust `checkAbiCompatibility cfU32RefMrTy thinRawPtrTy = .ok true`
+     and executes cleanly on BOTH `Mach` and `MachTB` (`77 : u32`, preserving `MachTB.wfLive`).
+3. **`usize` vs `u64` on 64-bit `x86_64`**:
+   - Positive control (`u64` -> `u64`): `Trusted = .scalar 77 4`;
+   - Transmuted (`usize` -> `u64`): `Trusted = .ub`, whereas `cfTranslateAbiTy (.uint .usize) =
+     cfTranslateAbiTy (.uint .u64) = some u64MrTy` and MiniRust executes cleanly on
+     BOTH `Mach` and `MachTB` (`77 : u32`, preserving `MachTB.wfLive`). -/
+theorem cf_ptr_and_usize_abi_divergence_witness :
+    let fnRawU32 : RigidTy := .fnPtr [.rawPtr .not cfU32K] cfU32K .safe .rust
+    let fnRawU64 : RigidTy := .fnPtr [.rawPtr .not (.uint .u64)] cfU32K .safe .rust
+    let fnRefU32 : RigidTy := .fnPtr [.ref .not cfU32K] cfU32K .safe .rust
+    let fnU64 : RigidTy := .fnPtr [.uint .u64] cfU32K .safe .rust
+    let fnUsize : RigidTy := .fnPtr [.uint .usize] cfU32K .safe .rust
+    let mkState := fun caller arg callee path sig =>
+      cfInitPtrs caller [cfFnPtrVal, arg] [callee] [cfEntry path sig]
+    cfRun (cfAbiDivCaller fnRawU32 (.rawPtr .not cfU32K) 1) 16
+      (mkState (cfAbiDivCaller fnRawU32 (.rawPtr .not cfU32K) 1) (.scalar ⟨0, 8⟩) cfPtrAbiClosBody cfPtrAbiClosPath fnRawU32) =
+      .scalar 77 4 ∧
+    cfRun (cfAbiDivCaller fnRawU64 (.rawPtr .not (.uint .u64)) 1) 16
+      (mkState (cfAbiDivCaller fnRawU64 (.rawPtr .not (.uint .u64)) 1) (.scalar ⟨0, 8⟩) cfPtrAbiClosBody cfPtrAbiClosPath fnRawU64) =
+      .ub ∧
+    checkAbiCompatibility thinRawPtrTy thinRawPtrTy = .ok true ∧
+    CfMrAgrees 8 cfMrPtrRawDivergenceMach 77 ∧
+    cfRun (cfAbiDivCaller fnRefU32 (.ref .not cfU32K) 1) 16
+      (mkState (cfAbiDivCaller fnRefU32 (.ref .not cfU32K) 1) (.scalar ⟨1, 8⟩) cfPtrAbiClosBody cfPtrAbiClosPath fnRefU32) =
+      .ub ∧
+    checkAbiCompatibility cfU32RefMrTy thinRawPtrTy = .ok true ∧
+    CfMrAgrees 10 cfMrPtrRefToRawDivergenceMach 77 ∧
+    cfRun (cfAbiDivCaller fnU64 (.uint .u64) 3) 16
+      (mkState (cfAbiDivCaller fnU64 (.uint .u64) 3) (.scalar ⟨5, 8⟩) cfUsizeAbiClosBody cfUsizeAbiClosPath fnU64) =
+      .scalar 77 4 ∧
+    cfRun (cfAbiDivCaller fnUsize (.uint .usize) 3) 16
+      (mkState (cfAbiDivCaller fnUsize (.uint .usize) 3) (.scalar ⟨5, 8⟩) cfUsizeAbiClosBody cfUsizeAbiClosPath fnUsize) =
+      .ub ∧
+    cfTranslateAbiTy (.uint .usize) = some u64MrTy ∧
+    cfTranslateAbiTy (.uint .u64) = some u64MrTy ∧
+    CfMrAgrees 8 cfMrUsizeDivergenceMach 77 :=
+  ⟨by decide +kernel, by decide +kernel, rfl, cfMrAgrees_of_decide (by decide +kernel) (by decide +kernel),
+   by decide +kernel, rfl, cfMrAgrees_of_decide (by decide +kernel) (by decide +kernel),
+   by decide +kernel, by decide +kernel, rfl, rfl,
+   cfMrAgrees_of_decide (by decide +kernel) (by decide +kernel)⟩
+
 /-! ## §6. Exhaustive Axiom, Import-Isolation, & `Classical.choice`-Free Audit -/
 
 section AxiomAudit
@@ -3381,6 +3994,8 @@ elab "#assert_closure_fn_ptr_mr_audit" : command => do
     ``closureFnPtrEntryRel_call_arity, ``closure_indirect_call_correspondence_M,
     ``classifyOwnClosureEnvTy_by_upvars, ``minirust_createFrameM_arity_law,
     ``minirust_createFrameM_abi_mismatch_law, ``closure_typed_sig_call_correspondence_M,
+    ``rigidTyMatchesCalleeDecl_fixedInt_eq, ``cfTranslateAbiTy_fixedInt_abi_compat_iff,
+    ``closure_fixedInt_sig_call_correspondence_M,
     ``minirust_ptr_rel_eq_same_addr_M, ``minirust_closure_call_return_tb_wfLive,
     ``closure_coercion_widening_identity_general_mach_and_tb,
     ``closure_coercion_widening_identity_mach_and_tb, ``cf_fn_closure_three_way_witness,
@@ -3393,7 +4008,10 @@ elab "#assert_closure_fn_ptr_mr_audit" : command => do
     ``closure_indirect_call_law_instance_fn, ``closure_indirect_call_law_instance_fnMut,
     ``closure_indirect_call_law_instance_fnOnce, ``closureFnPtrEntryRel_instance_mach_and_tb,
     ``closure_indirect_call_correspondence_instance_mach_and_tb,
-    ``closure_typed_sig_instances_mach_and_tb ]
+    ``closure_typed_sig_instances_mach_and_tb,
+    ``closure_fixedInt_sig_instances_mach_and_tb,
+    ``closure_forged_and_tailCall_law_instances_mach_and_tb,
+    ``cf_ptr_and_usize_abi_divergence_witness ]
   for c in headline do
     match env.find? c with
     | some (.thmInfo _) => pure ()
