@@ -49,7 +49,18 @@ Formalizes asymmetric `Trap`-vs-`UB` refinement directly over
 4. **Explicit Non-Vacuous Negative Soundness Suite**:
    Constructive disproofs of every forbidden refinement edge and concrete `stepMirState`
    overflowing/underflowing counterexamples for `add`, `sub`, `mul`, `add_scaled`, and
-   `-C panic=abort` vs. `-C panic=unwind` strategy separation.
+   `-C panic=abort` vs. `-C panic=unwind` strategy separation, plus parametric `add_scaled`
+   failure-site pinning (inner `bb0` multiplication vs. outer `bb1` addition).
+5. **Tree-Level & Cross-Strategy `iff` Characterizations**:
+   Layer 1A `ITree.toPartial` and coinductive `WeakRef` reverse `iff` (`unchecked` refines
+   `checked` iff no overflow) for `add`, `sub`, `mul`, `add_scaled`; the symmetric
+   checked-vs-wrapping 4-way `iff`; and the parametric `-C panic=abort` vs. `-C panic=unwind`
+   agreement `iff` (agree iff no overflow, strictly incomparable otherwise).
+6. **Parametric Mutation Sensitivity (Anti-Vacuity)**:
+   Flipping the assert polarity (`mkCheckedArithBodyWithExpected ... true`) or mutating the
+   unwind action to `UnwindAction.unreachable` provably breaks the corresponding refinement or
+   negative-soundness verdicts for ALL `u : UintTy` and ALL inputs, so every verdict above
+   depends on the exact operational content of the canonical bodies.
 -/
 
 namespace Anneal.Mir.OverflowTrapRefinement

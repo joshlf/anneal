@@ -340,10 +340,28 @@ theorem test_e2e_uint_mul_const_right_elim (strat : PanicStrategy) (n : Nat) (hn
 
 /-! ### 1.9 `array-to-slice`, Unified `checkFarkasMirGoal_sound`, & `.u16` / `.usize` Width Coverage -/
 
--- Generated via:
+-- Generated via three separate generator runs over the SAME hypothesis set (one per goal):
 --   python3 -B ci/farkas_cert_gen.py --domain nat \
 --     --hyp "4 * q <= off" --hyp "off <= 4 * q" --hyp "4 * q + 4 * n <= total" \
---     --goal "4 * q <= off" / "off <= 4 * q" / "off + 4 * n <= total" --json
+--     --goal "4 * q <= off" --json
+--   python3 -B ci/farkas_cert_gen.py --domain nat \
+--     --hyp "4 * q <= off" --hyp "off <= 4 * q" --hyp "4 * q + 4 * n <= total" \
+--     --goal "off <= 4 * q" --json
+--   python3 -B ci/farkas_cert_gen.py --domain nat \
+--     --hyp "4 * q <= off" --hyp "off <= 4 * q" --hyp "4 * q + 4 * n <= total" \
+--     --goal "off + 4 * n <= total" --json
+-- The generator prunes each goal to the hypotheses its certificate uses and renumbers the
+-- variables by first occurrence, emitting (verbatim, replayed in
+-- `test_array_to_slice_generator_provenance`):
+--   align-le: hyps [h0] over (q, off),         cert [.hyp 0, .hyp 3, .comb 0 1 1 1]
+--   align-ge: hyps [h1] over (off, q),         cert [.hyp 0, .hyp 3, .comb 0 1 1 1]
+--   range:    hyps [h1, h2] over (off, q, n, total),
+--             cert [.hyp 0, .hyp 1, .hyp 6, .comb 0 1 1 1, .comb 3 1 2 1]
+-- `farkas_discharges_array_to_slice_cast` needs ONE shared context (3 hyps over
+-- (off, q, n, total)), so each certificate is mechanically RELOCATED: every pruned hypothesis
+-- index maps to its index in the shared hyp list, and the negated-goal slot
+-- (`|hyps| + |vars|`) maps from 3 / 3 / 6 to the shared slot 3 + 4 = 7. Combination steps are
+-- unchanged.
 private def arrayToSliceHyps : List NatCutIneq :=
   [ ⟨.mulC 4 (.var 1), .var 0⟩
   , ⟨.var 0, .mulC 4 (.var 1)⟩
@@ -358,6 +376,8 @@ private def arrayToSliceAlignGeCert : List CutStep :=
 private def arrayToSliceRangeCert : List CutStep :=
   [.hyp 1, .hyp 2, .hyp 7, .comb 0 1 1 1, .comb 3 1 2 1]
 
+-- (The `.usize` `add_scaled` case below reuses the `--width 64` certificate `addScaledCert`
+-- from 1.1; its `rfl` replay against `.cst (modPow2 (uintWidth .usize))` is what certifies it.)
 -- Generated via:
 --   python3 -B ci/farkas_cert_gen.py --mir-bounds uint-add-no-overflow --width 16 \
 --     --hyp "a <= 40000" --hyp "b <= 25535" --lhs-expr "a" --rhs-expr "b" --json
@@ -408,6 +428,38 @@ theorem test_e2e_array_to_slice_dispatcher_and_u16_usize (strat : PanicStrategy)
   have hUsize := checked_add_scaled_refines_unchecked_of_farkas_cert
     .usize 4 strat addScaledHyps (.var 0) (.var 1) addScaledCert rfl rfl [aSz, bSz] haSz hbSz
   exact ⟨hArr.1, hArrDisp.2, hU16Disp.1, hU16Eq, hUsize.2.1⟩
+
+/-- Provenance lock-down for the `array-to-slice` certificates: the RAW generator outputs replay
+verbatim against the generator's own pruned goals, the RELOCATED certificates replay against the
+shared 3-hypothesis context used by `farkas_discharges_array_to_slice_cast`, and the raw
+certificates are REJECTED (`= false`) in the shared context, so the documented relocation is
+both necessary and exactly what makes them check. -/
+theorem test_array_to_slice_generator_provenance :
+    -- Raw generator outputs on the generator's own pruned goals
+    checkNatCutGoal
+      { hyps := [⟨.mulC 4 (.var 0), .var 1⟩], concl := ⟨.mulC 4 (.var 0), .var 1⟩ }
+      [.hyp 0, .hyp 3, .comb 0 1 1 1] = true ∧
+    checkNatCutGoal
+      { hyps := [⟨.var 0, .mulC 4 (.var 1)⟩], concl := ⟨.var 0, .mulC 4 (.var 1)⟩ }
+      [.hyp 0, .hyp 3, .comb 0 1 1 1] = true ∧
+    checkNatCutGoal
+      { hyps := [⟨.var 0, .mulC 4 (.var 1)⟩,
+                 ⟨.add (.mulC 4 (.var 1)) (.mulC 4 (.var 2)), .var 3⟩],
+        concl := ⟨.add (.var 0) (.mulC 4 (.var 2)), .var 3⟩ }
+      [.hyp 0, .hyp 1, .hyp 6, .comb 0 1 1 1, .comb 3 1 2 1] = true ∧
+    -- Relocated certificates in the shared context
+    checkNatCutGoal ⟨arrayToSliceHyps, ⟨.mulC 4 (.var 1), .var 0⟩⟩ arrayToSliceAlignLeCert = true ∧
+    checkNatCutGoal ⟨arrayToSliceHyps, ⟨.var 0, .mulC 4 (.var 1)⟩⟩ arrayToSliceAlignGeCert = true ∧
+    checkNatCutGoal ⟨arrayToSliceHyps, ⟨.add (.var 0) (.mulC 4 (.var 2)), .var 3⟩⟩
+      arrayToSliceRangeCert = true ∧
+    -- Un-relocated raw certificates are rejected in the shared context (fail-closed)
+    checkNatCutGoal ⟨arrayToSliceHyps, ⟨.mulC 4 (.var 1), .var 0⟩⟩
+      [.hyp 0, .hyp 3, .comb 0 1 1 1] = false ∧
+    checkNatCutGoal ⟨arrayToSliceHyps, ⟨.var 0, .mulC 4 (.var 1)⟩⟩
+      [.hyp 0, .hyp 3, .comb 0 1 1 1] = false ∧
+    checkNatCutGoal ⟨arrayToSliceHyps, ⟨.add (.var 0) (.mulC 4 (.var 2)), .var 3⟩⟩
+      [.hyp 0, .hyp 1, .hyp 6, .comb 0 1 1 1, .comb 3 1 2 1] = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## 2. Entailment-Graph Adequacy Non-Vacuity, Strictness, Transitivity, & Negative Checks -/
 
@@ -547,7 +599,7 @@ theorem test_entailment_negative_fail_closed :
       [[.hyp 0, .hyp 2, .comb 0 1 1 1]] [Int.negOfNat 1] (.strict [Int.negOfNat 2]) = false :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-! ## 3. Asymmetric Trap Refinement, `Partial` Duality, & All 15 Negative Soundness Canaries -/
+/-! ## 3. Asymmetric Trap Refinement, `Partial` Duality, & All 17 Negative Soundness Canaries (#1–#15 Here, #16–#17 in §3.2) -/
 
 /-- Concrete `stepMirState` traces for both `-C panic=abort` and `-C panic=unwind`,
 plus unconditional `unchecked ⊑ checked` on BOTH overflowing and non-overflowing inputs,
@@ -1524,7 +1576,7 @@ run_cmd do
       throwError "over-broad test coinductive allowlist: {expected} is not Classical-dependent"
   unless seenTestCoind.length == allowedTestCoinductiveThms.length do
     throwError "test coinductive allowlist mismatch: seen {seenTestCoind.length}, allowlisted {allowedTestCoinductiveThms.length}"
-  if constructiveTestTheorems < 31 || weakRefTestTheorems != 3 || constructiveTestDefns < 15 then
+  if constructiveTestTheorems < 32 || weakRefTestTheorems != 3 || constructiveTestDefns < 15 then
     throwError "test audit is vacuous: thms={constructiveTestTheorems}c+{weakRefTestTheorems}w, defs={constructiveTestDefns}"
   logInfo m!"hygiene audit passed: [{sFarkas}; {sTrap}]; curated {keyFarkasDecls.length} FarkasMirCert + {keyTrapConstructiveDecls.length} constructive OverflowTrapRefinement + {keyWeakRefBridgeDecls.length} WeakRef bridges; test module {constructiveTestTheorems}c+{weakRefTestTheorems}w thms, {constructiveTestDefns}c defs (0 sorryAx, 0 ofReduceBool, 0 trustCompiler, Classical.choice strictly allowlisted under WeakRef/Eutt)"
 
