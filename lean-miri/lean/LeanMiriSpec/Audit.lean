@@ -27124,6 +27124,7 @@ open LeanMiriSpec.ClosureFnPtrLM in
   cfCast_unsafeFnPointer_and_fnPtrToPtr_identity
   cf_fn_once_certificate
   cf_fn_once_lockstep
+  cf_closure_entry_frames_witness
   cf_finding_0007_driver_stutter_sim
   cf_finding_0007_main_stutter_sim
   cf_trusted_finding_parity

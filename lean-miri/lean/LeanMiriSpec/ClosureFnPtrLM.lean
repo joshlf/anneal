@@ -91,6 +91,13 @@ and frames are pushed and popped by the vendored `Stack` operations.
      `pass_shared_temp_const_raw_ptr_read_and_freeze_retag__b22_c27() = 9147 : u32`
      (`cf_finding_0007_main_stutter_sim`, `k = 15`) in `CfStutterSim` between
      `stepMirFn` and unmodified vendored `Step.step`;
+   * **Closure-entry frame shapes** (`cf_closure_entry_frames_witness`): for
+     `FnOnce` vendored Miri enters the body directly (depth `2`) with `_1`
+     storage-live and uninitialized and `_2` bound from the caller; for `Fn`,
+     `FnMut`, and the reproducer's driver it enters from a `ClosureOnceShim`
+     frame (depth `3`, the shim's `_1` memory-backed) with `_1` a pointer to the
+     shim's `_1`; `stepMirFn` enters at depth `2` with the empty aggregate
+     (`FnOnce`) or a scalar address (`Fn` / `FnMut`) in `_1`;
    * **`FnOnce` 1-to-1 lockstep (`k = 0`)** (`cf_fn_once_certificate`,
      `cf_fn_once_lockstep`) and **`Fn` / `FnMut` stuttering (`k = 5`)** across
      real `ClosureOnceShim` frames: `fn_shared` (`22`), `fn_mut_kind` (`7`),
@@ -129,6 +136,16 @@ and frames are pushed and popped by the vendored `Stack` operations.
   `core::panicking::panic_fmt`) are modeled by a small stub body and an unwind
   entry hook invoking vendored `ControlFlow.unwindToBlock` for the unwinding
   witnesses.
+* The `ClosureOnceShim` MIR (`cfShimBody`) is hand-constructed from rustc's
+  `make_shim` output for `FnOnce::call_once` (it is not a `rustc-capture`
+  capture), and the shim's `drop(_1)` is executed by `cfDrop` as
+  `go_to_block` (a non-capturing closure has no drop glue).
+* The synchronization relation `cfRel` compares only the active frame (body,
+  location, depth up to shim frames, locals): a Trusted `.uninit` slot matches
+  any live Miri local, a closure body's environment `_1` is exempt, data
+  pointers are only required to be Miri pointers, and borrow-tracker state is
+  not compared. The entry-frame shape of `_1` on both machines is pinned
+  separately by `cf_closure_entry_frames_witness`.
 
 ## Divergences that are characterized, not hidden
 
@@ -2982,11 +2999,15 @@ theorem cfNonCapturingClosure_vendored_law (prog : CfProg) (st : AnnealStepState
         .ok false st) ∧
     (∀ n it, cfItem? prog n = some it → cfClosureKind? it.body = none →
       Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler prog) (cfItemInstance n) abi st =
+        .ok false st) ∧
+    (∀ n it k p u us, cfItem? prog n = some it → cfClosureKind? it.body = some k →
+      self.ty.kind = .closure p (u :: us) →
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler prog) (cfItemInstance n) abi st =
         .ok false st) := by
   have hAct : cfActive prog st = .ok b st := by
     unfold cfActive; simp only [hFrame, hBody]
   have hTyEq : (first.layout.ty == first.layout.ty) = true := beq_self_eq_true _
-  refine ⟨?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro n p hKind
     unfold Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure
     simp only [cfShimInstance, cfCompiler, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
@@ -3006,6 +3027,11 @@ theorem cfNonCapturingClosure_vendored_law (prog : CfProg) (st : AnnealStepState
     unfold Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure
     simp only [cfItemInstance, cfCompiler, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
       hit, Option.bind_some, hk, Option.isSome_none, Bool.false_eq_true, ↓reduceIte]
+  · intro n it k p u us hit hk hKind
+    unfold Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure
+    simp only [cfItemInstance, cfCompiler, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+      hit, Option.bind_some, hk, Option.isSome_some, hFirst, hAct, hDecls, hTy, hTyEq, ↓reduceIte, hKind]
+    rfl
 
 /-- **Universal vendored `Cast.cast` law for `ClosureFnPointer(Safe|Unsafe)`**:
 on unmodified vendored `Miri.Interpreter.Cast.cast (cfCastHooks prog body)`:
@@ -3138,6 +3164,131 @@ theorem cf_fn_once_lockstep :
         (.scalar 8 4) := by
   obtain ⟨m, hm, _, hs⟩ := cfCertificate_sound cf_fn_once_certificate
   exact ⟨m, hm, cfStutterSim_zero_lockstep hs rfl⟩
+
+
+/-! ### Closure-entry frame observations (C6 frame shapes on vendored `Step.step`) -/
+
+/-- Code of a vendored Miri local slot: `0` live uninitialized immediate, `1` live pointer scalar,
+`2` live memory-backed (`indirect`), `3` dead, `4` other live value, `5` live non-pointer scalar,
+`6` absent. -/
+def cfLocalCode : Option (Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) → Nat
+  | some ls =>
+    match ls.value with
+    | .live (.immediate .uninit) => 0
+    | .live (.immediate (.scalar s)) => if s.isPointer then 1 else 5
+    | .live (.indirect _) => 2
+    | .dead => 3
+    | _ => 4
+  | none => 6
+
+/-- Bits of a live scalar local, if any. -/
+def cfLocalBits? : Option (Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) → Option Nat
+  | some ls =>
+    match ls.value with
+    | .live (.immediate (.scalar s)) =>
+      match s.toBits s.size with
+      | .ok bits => some bits.toNat
+      | .error _ => none
+    | _ => none
+  | none => none
+
+/-- The current frame is a closure body (not a shim) at its entry point `bb0[0]`. -/
+def cfAtClosureEntry (prog : CfProg) (f : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) :
+    Bool :=
+  !cfIsShimInstance f.functionInstance &&
+    (match cfBodyOfInstance prog f.functionInstance with
+     | some b => (cfClosureKind? b).isSome
+     | none => false) &&
+    (match f.location with
+     | .mir loc => loc.block == 0 && loc.statementIndex == 0
+     | .unwinding _ => false)
+
+/-- Run vendored `Step.step` until a closure body is entered and observe the entered frame:
+(code of `_1`, bits of `_2`, stack depth, whether the caller frame is a `ClosureOnceShim`, code of
+the caller frame's `_1`). -/
+def cfMiriFirstClosureEntry (h : CfHooks) (prog : CfProg) :
+    Nat → AnnealStepState → Option (Nat × Option Nat × Nat × Bool × Nat)
+  | 0, _ => none
+  | n + 1, st =>
+    match st.stack.currentFrame? with
+    | none => none
+    | some f =>
+      if cfAtClosureEntry prog f then
+        let below := st.stack.frames[st.stack.frames.size - 2]?
+        some (cfLocalCode f.locals[1]?, cfLocalBits? f.locals[2]?, st.stack.frames.size,
+          (below.map fun g => cfIsShimInstance g.functionInstance).getD false,
+          cfLocalCode (below.bind fun g => g.locals[1]?))
+      else
+        match Miri.Interpreter.Step.step h () st with
+        | (st', .ok true) => cfMiriFirstClosureEntry h prog n st'
+        | _ => none
+
+/-- `cfMiriFirstClosureEntry` from the initial vendored state of `prog` on `args`. -/
+def cfMiriClosureEntry (h : CfHooks) (prog : CfProg) (fuel : Nat)
+    (args : List (Miri.Interpreter.Immediate AnnealProv)) : Option (Nat × Option Nat × Nat × Bool × Nat) :=
+  match cfMiriInit prog args with
+  | some st => cfMiriFirstClosureEntry h prog fuel st
+  | none => none
+
+/-- Code of a Trusted environment value: `0` empty aggregate (by-value `FnOnce` environment),
+`1` scalar (address of a `&` / `&mut` environment), `2` other. -/
+def cfTrustedEnvCode : MirSemantics.Value → Nat
+  | .aggregate 0 [] => 0
+  | .scalar _ => 1
+  | _ => 2
+
+/-- Run `stepMirFn` until a closure body is entered and observe the entered frame:
+(code of `_1`, bits of `_2`, stack depth). -/
+def cfTrustedFirstClosureEntry (body : CapturedMir) : Nat → MachineState → Option (Nat × Option Nat × Nat)
+  | 0, _ => none
+  | n + 1, s =>
+    let atEntry : Bool :=
+      (match s.memory.activeCallee with
+       | some c => (cfClosureKind? c).isSome
+       | none => false) && s.frame.blockIdx == 0 && s.frame.stmtIdx == 0
+    if atEntry then
+      some (match get? s.frame.locals 1 with
+            | some (.init v) => cfTrustedEnvCode v
+            | _ => 3,
+            match get? s.frame.locals 2 with
+            | some (.init (.scalar sc)) => some sc.bits
+            | _ => none,
+            length s.memory.callStack + 1)
+    else
+      match cfRunStep body (.running s) with
+      | .running s' => cfTrustedFirstClosureEntry body n s'
+      | .done _ => none
+
+/-- **Closure-entry frame shapes on both machines (C6), kernel-checked.** At the first entry into
+the closure body:
+* `FnOnce` (`fn_once_kind(5)`): vendored `Call.evalCallTerminator` enters the by-value closure body
+  DIRECTLY from the caller (stack depth `2`, the caller is not a shim) through the
+  `nonCapturing && localId == 1` branch: `_1` is storage-live and uninitialized (code `0`) and
+  `_2 = 5` is bound from the caller's only argument. `stepMirFn` enters at the same depth with the
+  empty aggregate in `_1` (code `0`) and `_2 = 5` (1-to-1 lockstep).
+* `Fn` (`fn_shared(5)`), `FnMut` (`fn_mut_kind(5)`), and the reproducer's driver
+  (`__anneal_vt_driver_61873(35, 24)`): vendored Miri enters the closure body from a
+  `ClosureOnceShim` frame (depth `3`) whose own `_1` is the memory-backed 1-ZST environment
+  (code `2`), and the body's `_1` is a pointer to it (code `1`, the shim's `&mut _1`), with `_2`
+  bound from the caller's argument; `stepMirFn` elides the shim (depth `2`) and passes the
+  provenance-free scalar address (code `1`) — the stutter of `CfStutterSim`. -/
+theorem cf_closure_entry_frames_witness :
+    cfMiriClosureEntry (cfStepHooks cfProgFnOnce) cfProgFnOnce 64 [cfU32Imm 5] = some (0, some 5, 2, false, 5) ∧
+    cfTrustedFirstClosureEntry cfFx_fn_once_kind 64
+      (cfInit cfFx_fn_once_kind [cfU32 5] [cfFx_id_once, cfFx_fn_once_kind_closure_0]) = some (0, some 5, 2) ∧
+    cfMiriClosureEntry (cfStepHooks cfProgFnShared) cfProgFnShared 64 [cfU32Imm 5] = some (1, some 5, 3, true, 2) ∧
+    cfTrustedFirstClosureEntry cfFx_fn_shared 64
+      (cfInit cfFx_fn_shared [cfU32 5] [cfFx_fn_shared_closure_0]) = some (1, some 5, 2) ∧
+    cfMiriClosureEntry (cfStepHooks cfProgFnMut) cfProgFnMut 64 [cfU32Imm 5] = some (1, some 5, 3, true, 2) ∧
+    cfTrustedFirstClosureEntry cfFx_fn_mut_kind 64
+      (cfInit cfFx_fn_mut_kind [cfU32 5] [cfFx_id_mut, cfFx_fn_mut_kind_closure_0]) = some (1, some 5, 2) ∧
+    cfMiriClosureEntry (cfStepHooks cfProgDriver) cfProgDriver 64 [cfU32Imm 35, cfU32Imm 24] =
+      some (1, some 35, 3, true, 2) ∧
+    cfTrustedFirstClosureEntry cfFx_finding_driver 64
+      (cfInit cfFx_finding_driver [cfU32 35, cfU32 24] [cfFx_finding_closure_0, cfFx_finding_closure_1]) =
+      some (1, some 35, 2) := by
+  refine ⟨?_, by decide +kernel, ?_, by decide +kernel, ?_, by decide +kernel, ?_, by decide +kernel⟩ <;>
+    (rw [cfStepHooks_eq_K]; decide +kernel)
 
 /-- **`finding_0007` driver (`__anneal_vt_driver_61873(35, 24) = 159`) stuttering simulation**:
 kernel-checked `CfStutterSim` with stutter index `15` (three `Fn` closure calls × 5
@@ -3484,7 +3635,7 @@ elab "#assert_closure_fn_ptr_lm_audit" : command => do
     ``cfResolveClosure_fnOnce_is_item, ``cfResolveClosure_fn_is_shim,
     ``cfResolveClosure_generic_unsupported, ``cfNonCapturingClosure_vendored_law,
     ``cfCast_closureFnPointer_vendored_law, ``cfCast_unsafeFnPointer_and_fnPtrToPtr_identity,
-    ``cf_fn_once_certificate, ``cf_fn_once_lockstep,
+    ``cf_fn_once_certificate, ``cf_fn_once_lockstep, ``cf_closure_entry_frames_witness,
     ``cf_finding_0007_driver_stutter_sim, ``cf_finding_0007_main_stutter_sim,
     ``cf_trusted_finding_parity, ``cf_fn_shared_stutter_sim, ``cf_fn_mut_stutter_sim,
     ``cf_zero_and_two_arg_stutter_sim, ``cf_unsafe_and_widen_identity_stutter_sim,
