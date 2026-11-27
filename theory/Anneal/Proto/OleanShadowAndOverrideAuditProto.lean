@@ -2944,6 +2944,22 @@ structure FourVectorConfig where
   /-- Also run Layer A structural opaque-theorem scan inside theorem proof bodies (`Init.ShareCommon`
   screening of theorem proof bodies is *always* enabled regardless of this flag). -/
   kernelScanTheoremBodies : Bool := true
+  /-- Build-library sweeps fully validate (header, root object, root children) every part of every
+  transitively imported toolchain module before `importModules` when the closure has at most this
+  many toolchain modules. Larger closures fall back to the 96-byte header-prefix check *only* when
+  the sysroot is the library of the toolchain executing the audit (that library is already part of
+  the trusted computing base: it is the code running this check); any other sysroot is always fully
+  validated, since an attacker can pad any closure past this bound. -/
+  toolchainFullValidationMaxModules : Nat := 32
+
+/-- Canonical library directory of the toolchain executing this process. -/
+def runningToolchainLib : IO (Option System.FilePath) := do
+  try
+    let app ← IO.FS.realPath (← IO.appPath)
+    let some bin := app.parent | return none
+    let some root := bin.parent | return none
+    return some (← IO.FS.realPath (root / "lib" / "lean"))
+  catch _ => return none
 
 /-- Build an audit context: toolchain modules by name and sysroot provenance. -/
 def mkAuditContext (env : Environment) (sysrootLibDir : System.FilePath) (liveModule? : Option Name := none)
@@ -3092,6 +3108,10 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
     let verifiedSys ← validateCanonicalRootDir sysrootLib
     let sysStr := stripTrailingSlashes sysrootLib.toString
     let wantTcBin := (cfg.resolution?.map (·.validateToolchainBinaries)).getD false
+    let runningLib? ← runningToolchainLib
+    let isRunningToolchain : Bool := match verifiedSys, runningLib? with
+      | .ok realSys, some lib => realSys.components == lib.components
+      | _, _ => false
     -- Walk the *entire* transitive external import closure before `importModules` touches any file,
     -- so multi-hop toolchain companions (`UseHop -> Init.Hop -> Init.Prelude`) and transitive
     -- sysroot escapes (`Init.Bridge -> Planted`) are validated and quarantined prior to import.
@@ -3101,7 +3121,8 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
     let mut tcFrontier : Array Name := extOrder
     for _ in [0:4096] do
       if tcFrontier.isEmpty then break
-      let useFullValidator := wantTcBin || tcQueued.size ≤ 32
+      let useFullValidator := wantTcBin || !isRunningToolchain ||
+        tcQueued.size ≤ cfg.toolchainFullValidationMaxModules
       let hopTasks ← tcFrontier.mapM fun i => IO.asTask do
         if !isToolchainName i then
           return (i, Except.error (.oleanOutsideApprovedRoot,

@@ -1112,6 +1112,7 @@ PASS T21 tampered-githash toolchain boundary import rejected before importModule
 PASS T21 transitive Init.Bridge -> Planted sysroot escape caught
 PASS T21 symlinked toolchain companion (.olean.private) rejected before importModules
 PASS T21 corrupted toolchain companion (.ir) header rejected before importModules
+PASS T21 large-closure prefix shortcut never applies to a foreign sysroot (corrupted root object caught)
 PASS T21 2-hop transitive toolchain companion tampering rejected before importModules
 -/
 #guard_msgs in
@@ -1209,6 +1210,20 @@ PASS T21 2-hop transitive toolchain companion tampering rejected before importMo
       (sIr.importMs == 0 && sIr.modulesChecked == 0 &&
        sIr.violations.any fun v => v.kind == .oleanHeaderInvalid && v.decl == `Init.Prelude)
       (renderAll sIr.violations)
+    -- A4 regression: the 96-byte header-prefix shortcut for large toolchain closures read only the
+    -- header, so a corrupted root *object* (nonzero `m_rc`) in a sysroot that is not the running
+    -- toolchain passed and reached `importModules`. The shortcut is forced here
+    -- (`toolchainFullValidationMaxModules := 0`); an attacker can always pad a closure past 32.
+    let sysObj ← mkSys "sysRootObj"
+    let privPart := sysObj / "Init" / "Prelude.olean.private"
+    let pb ← IO.FS.readBinFile privPart
+    let rootOff := readLE pb 88 8 - readLE pb 80 8
+    IO.FS.writeBinFile privPart (setByte pb rootOff 1)
+    let ((), sObj) ← AuditM.run' (auditBuildLibrary buildP sysObj { toolchainFullValidationMaxModules := 0 } (some #[`UsePrelude]))
+    expect "T21 large-closure prefix shortcut never applies to a foreign sysroot (corrupted root object caught)"
+      (sObj.importMs == 0 && sObj.modulesChecked == 0 &&
+       sObj.violations.any fun v => v.kind == .oleanHeaderInvalid && v.decl == `Init.Prelude)
+      (renderAll sObj.violations)
     -- B4-2 regression: 2-hop transitive toolchain companion tampering (`UseHop -> Init.Hop -> Init.Prelude`,
     -- where `Init.Hop` is clean and `Init/Prelude.olean.private` has a forged githash)!
     let sysHop ← mkSys "sysHop"
