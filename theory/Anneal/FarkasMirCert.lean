@@ -2303,6 +2303,78 @@ theorem canary_mul_const_operand_range :
       (.single [.hyp 0, .hyp 2, .comb 0 256 1 1]) = false :=
   ⟨rfl, rfl⟩
 
+/-! ### Per-Checker Positive / Negative Coverage
+
+Every reflective checker below gets at least one direct `= true` and one direct
+`= false` `rfl` canary (previously `checkIntEntailmentGraph`,
+`checkIntEntailmentPath`, `check{Nat,Int}SpecWitness`, `sintLe`,
+`hasEdgeInList`, and the syntactic `*Beq` checkers were only exercised
+indirectly or not at all). -/
+
+/-- Canary: `IntLinSpec` two-edge path (`-3 ≤ x ⟹ -5 ≤ x ⟹ -10 ≤ x`) is accepted,
+a disconnected path and a reversed (non-entailing) edge are rejected. -/
+theorem canary_int_entailment_path_and_graph :
+    checkIntEntailmentPath [⟨.cst ⟨true, 3⟩, .var 0⟩] [⟨.cst ⟨true, 10⟩, .var 0⟩]
+      [ { src := [⟨.cst ⟨true, 3⟩, .var 0⟩], dst := [⟨.cst ⟨true, 5⟩, .var 0⟩],
+          certs := [[.hyp 0, .hyp 1, .comb 0 1 1 1]] }
+      , { src := [⟨.cst ⟨true, 5⟩, .var 0⟩], dst := [⟨.cst ⟨true, 10⟩, .var 0⟩],
+          certs := [[.hyp 0, .hyp 1, .comb 0 1 1 1]] } ] = true ∧
+    checkIntEntailmentPath [⟨.cst ⟨true, 3⟩, .var 0⟩] [⟨.cst ⟨true, 10⟩, .var 0⟩]
+      [ { src := [⟨.cst ⟨true, 3⟩, .var 0⟩], dst := [⟨.cst ⟨true, 5⟩, .var 0⟩],
+          certs := [[.hyp 0, .hyp 1, .comb 0 1 1 1]] }
+      , { src := [⟨.cst ⟨true, 4⟩, .var 0⟩], dst := [⟨.cst ⟨true, 10⟩, .var 0⟩],
+          certs := [[.hyp 0, .hyp 1, .comb 0 1 1 1]] } ] = false ∧
+    checkIntEntailmentGraph
+      { nodes := [[⟨.cst ⟨true, 3⟩, .var 0⟩], [⟨.cst ⟨true, 5⟩, .var 0⟩],
+                  [⟨.cst ⟨true, 10⟩, .var 0⟩]]
+        edges := [ (0, 1, [[.hyp 0, .hyp 1, .comb 0 1 1 1]])
+                 , (1, 2, [[.hyp 0, .hyp 1, .comb 0 1 1 1]]) ] } = true ∧
+    checkIntEntailmentGraph
+      { nodes := [[⟨.cst ⟨true, 3⟩, .var 0⟩], [⟨.cst ⟨true, 5⟩, .var 0⟩],
+                  [⟨.cst ⟨true, 10⟩, .var 0⟩]]
+        edges := [ (0, 1, [[.hyp 0, .hyp 1, .comb 0 1 1 1]])
+                 , (2, 0, [[.hyp 0, .hyp 1, .comb 0 1 1 1]]) ] } = false :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Canary: direct concrete witness checkers, `sintLe` (including the
+sign-magnitude negative zero `⟨true, 0⟩`), and `hasEdgeInList`. -/
+theorem canary_witness_sintLe_hasEdge :
+    checkNatSpecWitness [5, 7] [⟨.var 0, .cst 5⟩, ⟨.add (.var 0) (.cst 2), .var 1⟩] = true ∧
+    checkNatSpecWitness [6, 7] [⟨.var 0, .cst 5⟩, ⟨.add (.var 0) (.cst 2), .var 1⟩] = false ∧
+    checkNatSpecWitness [5, 6] [⟨.var 0, .cst 5⟩, ⟨.add (.var 0) (.cst 2), .var 1⟩] = false ∧
+    checkIntSpecWitness [Int.negOfNat 3] [⟨.cst ⟨true, 3⟩, .var 0⟩] = true ∧
+    checkIntSpecWitness [Int.negOfNat 4] [⟨.cst ⟨true, 3⟩, .var 0⟩] = false ∧
+    checkIntSpecWitness [Int.ofNat 1] [⟨.sub (.var 0) (.neg (.var 0)), .cst ⟨false, 2⟩⟩] = true ∧
+    checkIntSpecWitness [Int.ofNat 2] [⟨.sub (.var 0) (.neg (.var 0)), .cst ⟨false, 3⟩⟩] = false ∧
+    sintLe ⟨true, 0⟩ ⟨false, 0⟩ = true ∧
+    sintLe ⟨false, 0⟩ ⟨true, 0⟩ = true ∧
+    sintLe ⟨false, 1⟩ ⟨true, 0⟩ = false ∧
+    sintLe ⟨true, 5⟩ ⟨true, 3⟩ = true ∧
+    sintLe ⟨true, 3⟩ ⟨true, 5⟩ = false ∧
+    hasEdgeInList 1 2 [(0, 1, []), (1, 2, [])] = true ∧
+    hasEdgeInList 2 1 [(0, 1, []), (1, 2, [])] = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Canary: the syntactic path-chaining equality checkers accept identical
+specs and reject constant, variable, length, and constructor mismatches. The
+sign-magnitude zeros `⟨true, 0⟩` / `⟨false, 0⟩` are deliberately treated as
+distinct (conservative: may reject a valid chain, never accepts an invalid
+one). -/
+theorem canary_syntactic_beq :
+    natLinSpecBeq [⟨.add (.var 0) (.mulC 2 (.var 1)), .cst 5⟩]
+      [⟨.add (.var 0) (.mulC 2 (.var 1)), .cst 5⟩] = true ∧
+    natLinSpecBeq [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 6⟩] = false ∧
+    natLinSpecBeq [⟨.var 0, .cst 5⟩] [⟨.var 1, .cst 5⟩] = false ∧
+    natLinSpecBeq [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 5⟩, ⟨.var 0, .cst 5⟩] = false ∧
+    natLinSpecBeq [⟨.mulC 1 (.var 0), .cst 5⟩] [⟨.var 0, .cst 5⟩] = false ∧
+    intLinSpecBeq [⟨.sub (.var 0) (.neg (.var 1)), .cst ⟨true, 2⟩⟩]
+      [⟨.sub (.var 0) (.neg (.var 1)), .cst ⟨true, 2⟩⟩] = true ∧
+    intLinSpecBeq [⟨.var 0, .cst ⟨true, 2⟩⟩] [⟨.var 0, .cst ⟨false, 2⟩⟩] = false ∧
+    intLinSpecBeq [⟨.var 0, .cst ⟨true, 0⟩⟩] [⟨.var 0, .cst ⟨false, 0⟩⟩] = false ∧
+    intLinSpecBeq [⟨.sub (.var 0) (.var 1), .cst SInt.zero⟩]
+      [⟨.add (.var 0) (.neg (.var 1)), .cst SInt.zero⟩] = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-! ### Fail-Closed Negative `rfl` Controls (`= false`) -/
 
 /-- Negative canary: truncated or overlong `certs` lists are rejected fail-closed

@@ -433,6 +433,56 @@ def _tamper_all_cert_slots(snip: str) -> list[str]:
     return variants
 
 
+def _semantic_tamper_variants(snip: str) -> list[str]:
+    """Produce *non-trivial* tampered copies whose certificates / witnesses are
+    real, well-formed data that is valid for a DIFFERENT obligation:
+
+    * swap the two certificates of a two-sided preset (`_cert_le`/`_cert_ge`,
+      `_cert_lo`/`_cert_hi`, `_cert`/`_cert_range`),
+    * swap the first two forward certificates of a multi-obligation edge,
+    * in `.strict` mode, reuse the satisfaction witness as the strictness witness
+      (it satisfies `pre`, so it cannot falsify it) and vice versa (the strictness
+      witness falsifies `pre`, so it cannot be a satisfaction witness).
+
+    Unlike `[]` slots (rejected merely for being empty), these exercise the
+    kernel's semantic row arithmetic and witness evaluation.
+    """
+    m_name = re.search(r"(?m)^private theorem ([A-Za-z_][A-Za-z0-9_']*)\b", snip)
+    assert m_name is not None, snip
+    base = m_name.group(1)
+    suf = (r"(?=(?:_(?:hyps|cert(?:_le|_ge|_lo|_hi|_range)?|"
+           r"pre|obligation|fwd_certs|sat_witness|mode))?\b)")
+    out: list[str] = []
+
+    def emit(code: str) -> None:
+        assert code != snip, snip
+        out.append(re.sub(rf"\b{re.escape(base)}{suf}", f"{base}_s{len(out)}", code))
+
+    def slot(name: str) -> re.Match[str] | None:
+        return re.search(rf"({re.escape(base)}_{name} : List CutStep :=\n  )(\[[^\]]*\])", snip)
+
+    for a, b in (("cert_le", "cert_ge"), ("cert_lo", "cert_hi"), ("cert", "cert_range")):
+        ma, mb = slot(a), slot(b)
+        if ma and mb and ma.group(2) != mb.group(2):
+            (m1, m2) = (ma, mb) if ma.start() < mb.start() else (mb, ma)
+            emit(snip[: m1.start(2)] + m2.group(2) + snip[m1.end(2) : m2.start(2)]
+                 + m1.group(2) + snip[m2.end(2) :])
+    fm = re.search(r"(_fwd_certs : List \(List CutStep\) :=\n  \[)(.*)(\])", snip)
+    if fm:
+        items = list(re.finditer(r"\[[^\]]*\]", fm.group(2)))
+        if len(items) >= 2 and items[0].group(0) != items[1].group(0):
+            off = fm.start(2)
+            i0, i1 = items[0], items[1]
+            emit(snip[: off + i0.start()] + i1.group(0) + snip[off + i0.end() : off + i1.start()]
+                 + i0.group(0) + snip[off + i1.end() :])
+    sw = re.search(r"(_sat_witness : List (?:Nat|Int) :=\n  )(\[[^\]]*\])", snip)
+    st = re.search(r"(\.strict )(\[[^\]]*\])", snip)
+    if sw and st:
+        emit(snip[: st.start(2)] + sw.group(2) + snip[st.end(2) :])
+        emit(snip[: sw.start(2)] + st.group(2) + snip[sw.end(2) :])
+    return out
+
+
 class FarkasMirCertGenTests(unittest.TestCase):
     def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -970,6 +1020,30 @@ class FarkasMirCertGenTests(unittest.TestCase):
                 thm_name="live_ent_int_equiv_ascii",
                 ascii_lean=True,
             )["lean_snippet"],
+            # Compound (non-atomic) operand expressions: exercises rendering
+            # precedence and defeq of the emitted statement vs `NatLinExpr.eval`.
+            generate_mir_bounds_certificate(
+                "uint-add-no-overflow", ["a <= 100", "c <= 50", "b <= 1000"],
+                "live_u16_add_compound", width=16, lhs_expr="a + 2 * c", rhs_expr="b + 1",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-sub-no-underflow", ["c + 1 <= a", "a <= 1000", "b <= 1000"],
+                "live_u64_sub_compound_certified", width=64, lhs_expr="a + b", rhs_expr="c + 1",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-mul-const-no-overflow", ["a <= 10", "b <= 10"],
+                "live_u32_mul_compound", width=32, scale=3, var_name="a + 2 * b",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "slice-range", ["base <= 4", "n <= 7", "20 <= cap"],
+                "live_slice_compound", offset_expr="2 * base + 4", len_expr="n + 1",
+                total_expr="cap",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "non-overlapping-ptrs", ["s + 1 + 2 * k <= d"],
+                "live_nonoverlap_compound", src_offset_expr="s + 1", dst_offset_expr="d",
+                count_expr="2 * k",
+            )["lean_snippet"],
             # 0-variable constant MIR bounds and empty-pre entailment checks
             generate_mir_bounds_certificate(
                 "slice-range", [], "live_slice_const",
@@ -1113,6 +1187,25 @@ class FarkasMirCertGenTests(unittest.TestCase):
             )
             self.assertNotEqual(tres.returncode, 0)
             self._assert_fails_only_at_rfl(tres.stdout + tres.stderr, len(tampered), "NegTamperedAll")
+
+            # Semantic tampering (swapped certificates / witnesses that are valid
+            # data for a different obligation) must also be rejected at `rfl`.
+            semantic: list[str] = []
+            for snip in snippets:
+                semantic.extend(_semantic_tamper_variants(snip))
+            self.assertGreaterEqual(len(semantic), 8)
+            sbody = "\n".join(
+                ln for snip in semantic for ln in snip.splitlines()
+                if not ln.startswith(("import ", "open "))
+            )
+            sfile = t / "NegSemanticTamper.lean"
+            sfile.write_text(hdr + sbody + "\n", encoding="utf-8")
+            sres = subprocess.run(
+                [str(lean_bin), str(sfile)], env=lean_env,
+                text=True, capture_output=True, timeout=240,
+            )
+            self.assertNotEqual(sres.returncode, 0)
+            self._assert_fails_only_at_rfl(sres.stdout + sres.stderr, len(semantic), "NegSemanticTamper")
 
             # Confirm Anneal.FarkasMirCert and emitted ProbeMir.lean pass Pass-1 preflight.
             tb = _ANNEAL_ROOT / "trusted/audit/TrustedBoundary.lean"
