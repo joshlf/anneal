@@ -27122,6 +27122,10 @@ open LeanMiriSpec.ClosureFnPtrLM in
   cfNonCapturingClosure_vendored_law
   cfCast_closureFnPointer_vendored_law
   cfCast_unsafeFnPointer_and_fnPtrToPtr_identity
+  cfCall_passArgument_abiMismatch_vendored_law
+  cfCall_initStackFrame_convMismatch_vendored_law
+  cfCall_initStackFrame_forged_closure_self_vendored_law
+  cfCall_initStackFrame_zero_arg_closure_vendored_law
   cf_fn_once_certificate
   cf_fn_once_lockstep
   cf_closure_entry_frames_witness

@@ -79,9 +79,16 @@ and frames are pushed and popped by the vendored `Stack` operations.
      `cfNonCapturingClosure_vendored_law` (unmodified vendored
      `ExecutionCallLeaves.nonCapturingClosure`),
      `cfCast_closureFnPointer_vendored_law` (unmodified vendored `Cast.cast`
-     for `ClosureFnPointer(Safe|Unsafe)` and capturing-closure rejection), and
+     for `ClosureFnPointer(Safe|Unsafe)` and capturing-closure rejection),
      `cfCast_unsafeFnPointer_and_fnPtrToPtr_identity` (universal `raw_c == raw_d`
-     pointer identity across `UnsafeFnPointer` and `FnPtrToPtr`).
+     pointer identity across `UnsafeFnPointer` and `FnPtrToPtr`), and four
+     universal vendored `Miri.Interpreter.Call` laws
+     (`cfCall_passArgument_abiMismatch_vendored_law`,
+     `cfCall_initStackFrame_convMismatch_vendored_law`,
+     `cfCall_initStackFrame_forged_closure_self_vendored_law` for arbitrary
+     arity `n`, and `cfCall_initStackFrame_zero_arg_closure_vendored_law` for
+     both `"AbiMismatchReturn"` and successful `nonCapturing && localId == 1`
+     entry).
 2. **Kernel-checked simulation and parity witnesses (§15)** — every witness in
    this module is a kernel-checked theorem (`decide +kernel`, zero `#guard`s,
    zero `ofReduceBool`) on verbatim `rustc-capture` bodies:
@@ -115,14 +122,18 @@ and frames are pushed and popped by the vendored `Stack` operations.
      (UB on both machines), and `.terminate` (`.abort` on both machines under
      direct-unwind hooks, plus canonical `"unwindTerminate"` boundary);
    * **Fail-closed negatives and boundaries on both machines**: capturing
-     closures (`u32` and ZST `()`), forged `(N+1)`-argument indirect calls on
+     closures (`u32` and ZST `()`) at BOTH the coercion cast site (Trusted `.ub`,
+     vendored Miri `.invalidProgram "capturing closure in pointer cast"`) AND
+     the indirect call site via a forged pointer (genuine UB on both: vendored
+     Miri `"AbiMismatchArgument 0"`), forged `(N+1)`-argument indirect calls on
      both `FnOnce` and `Fn` (`ClosureOnceShim`) closures (UB on both),
-     transmuted signature `fn(u64) -> u32` (UB on both: vendored Miri
-     `"AbiMismatchArgument 1"`), `extern "C"` call (UB on both: vendored Miri
-     `"caller/callee calling convention mismatch"`), `Safety` boundary,
-     `"ClosureFnPointer(Normal)"` spelling boundary, generic closure under `R1`
-     (`.unsupported` on both), and direct closure call with explicit `&_env`
-     (`Trusted = .ext "core::ops::Fn::call"`, Miri = `14 : u32`).
+     transmuted argument signature `fn(u64) -> u32` (UB on both: vendored Miri
+     `"AbiMismatchArgument 1"`) AND transmuted return signature `fn(u32) -> u64`
+     (UB on both: vendored Miri `"AbiMismatchReturn"`), `extern "C"` call (UB on
+     both: vendored Miri `"caller/callee calling convention mismatch"`),
+     `Safety` boundary, `"ClosureFnPointer(Normal)"` spelling boundary, generic
+     closure under `R1` (`.unsupported` on both), and direct closure call with
+     explicit `&_env` (`Trusted = .ext "core::ops::Fn::call"`, Miri = `14 : u32`).
 
 ## Scope boundaries
 
@@ -130,8 +141,8 @@ and frames are pushed and popped by the vendored `Stack` operations.
   the universal content is the soundness of the certificate checker
   (`cfStutterCheck_sound`, `cfCertificate_sound`, `cfStutterSim_zero_lockstep`,
   `cfStutterSim_trusted_run`, `cfStutterSim_miri_run`) together with the
-  universal vendored-Miri resolution, `nonCapturingClosure`, `Cast.cast`, and
-  pointer-identity laws.
+  universal vendored-Miri resolution, `nonCapturingClosure`, `Cast.cast`,
+  `Call.passArgument`, `Call.initStackFrame`, and pointer-identity laws.
 * Unlinked `core` panic items (`core::fmt::Arguments::<'a>::from_str` and
   `core::panicking::panic_fmt`) are modeled by a small stub body and an unwind
   entry hook invoking vendored `ControlFlow.unwindToBlock` for the unwinding
@@ -140,12 +151,14 @@ and frames are pushed and popped by the vendored `Stack` operations.
   `make_shim` output for `FnOnce::call_once` (it is not a `rustc-capture`
   capture), and the shim's `drop(_1)` is executed by `cfDrop` as
   `go_to_block` (a non-capturing closure has no drop glue).
-* The synchronization relation `cfRel` compares only the active frame (body,
-  location, depth up to shim frames, locals): a Trusted `.uninit` slot matches
-  any live Miri local, a closure body's environment `_1` is exempt, data
-  pointers are only required to be Miri pointers, and borrow-tracker state is
-  not compared. The entry-frame shape of `_1` on both machines is pinned
-  separately by `cf_closure_entry_frames_witness`.
+* The synchronization relation `cfRel` compares the **entire non-shim call
+  stack** from the active frame down to the root frame (every frame's body
+  `defPath`, MIR location `(block, stmt)`, and locals via `cfLocalsRel`):
+  a Trusted `.uninit` slot matches any live Miri local (because vendored
+  `evalFnCallArgument` does not de-initialize moved locals), a closure body's
+  environment `_1` is exempt, data pointers are only required to be Miri
+  pointers, and borrow-tracker state is not compared. The entry-frame shape of
+  `_1` on both machines is pinned separately by `cf_closure_entry_frames_witness`.
 
 ## Divergences that are characterized, not hidden
 
@@ -155,17 +168,20 @@ and frames are pushed and popped by the vendored `Stack` operations.
 * **`"ClosureFnPointer(Normal)"`.** `Trusted` fails closed (`.unsupported`) on
   this spelling, which `rustc-capture` never emits; `translatePointerCoercion`
   maps it to `ClosureFnPointer(Safe)` (`cf_normal_spelling_boundary`).
-* **Capturing closures.** `rustc` rejects the coercion (E0308). `Trusted`
-  reports `.ub`; the vendored `Cast.cast` rejects the program
-  (`invalidProgram "capturing closure in pointer cast"`).
+* **Capturing closures.** `rustc` rejects the coercion (E0308). At the cast
+  site, `Trusted` reports `.ub` while vendored `Cast.cast` rejects the program
+  with `invalidProgram "capturing closure in pointer cast"`; at the indirect
+  call site (forged pointer to a `[u32]` or `[()]` capturing closure), BOTH
+  `Trusted` and vendored `Call.initStackFrame` report genuine UB
+  (`"AbiMismatchArgument 0"`).
 * **Direct closure calls.** A direct `Fn::call(&_env, (x,))` is a visible
   external call in `Trusted` and is executed by Miri (`cf_direct_closure_call_witness`).
 * **Moves.** The vendored `evalFnCallArgument` does not de-initialize a moved
   caller local, `Trusted` does; `cfSlotRel` therefore relates a `Trusted`
   `.uninit` slot to any live Miri local.
 * **Environment and aliasing.** The synchronization relation `cfRel` compares
-  the active body, the location, the call depth up to shim frames, and the
-  top-frame locals: scalars and one- or two-scalar aggregates agree byte-for-byte
+  every non-shim frame on the call stack (body `defPath`, location, and locals):
+  scalars and one- or two-scalar aggregates agree byte-for-byte
   (both in registers and in memory via vendored `Allocation.readScalar`),
   zero-sized values agree, and function pointers denote the same linked body.
   The closure environment local `_1` of a closure body is exempt, data-pointer
@@ -2324,8 +2340,25 @@ def cfLocalsRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine
 def cfNonShimDepth (m : AnnealStepState) : Nat :=
   (m.stack.frames.toList.filter fun f => !cfIsShimInstance f.functionInstance).length
 
-/-- Synchronization relation: same active body, same location, same depth up to shim frames,
-and agreeing locals (the environment local `_1` of a closure body is exempt). -/
+/-- Full-stack caller-frame agreement: every saved caller frame (below the active
+frame, skipping interposed `ClosureOnceShim` frames) matches on body `defPath`,
+MIR location `(blockIdx, stmtIdx)`, and locals via `cfLocalsRel`. -/
+def cfSavedFramesRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine) :
+    List SavedCallerFrame → List (Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) → Bool
+  | [], [] => true
+  | sf :: sfs, mf :: mfs =>
+    (match cfBodyOfInstance prog mf.functionInstance, mf.location with
+     | some b, .mir loc =>
+       stringEq b.defPath sf.callerBody.defPath &&
+       loc.block == sf.frame.blockIdx && loc.statementIndex == sf.frame.stmtIdx &&
+       cfLocalsRel prog fnPtrs mach (cfClosureKind? b).isSome 0 sf.frame.locals mf.locals.toList
+     | _, _ => false) &&
+    cfSavedFramesRel prog fnPtrs mach sfs mfs
+  | _, _ => false
+
+/-- Synchronization relation: same active body, same location, same non-shim call stack
+(every non-shim frame from active down to root agrees on body `defPath`, location, and
+locals; the environment local `_1` of a closure body is exempt). -/
 def cfRel (prog : CfProg) (body : CapturedMir) (s : MachineState) (m : AnnealStepState) : Bool :=
   match m.stack.currentFrame? with
   | none => false
@@ -2336,7 +2369,9 @@ def cfRel (prog : CfProg) (body : CapturedMir) (s : MachineState) (m : AnnealSte
       stringEq b.defPath (activeMirBody body s).defPath &&
       loc.block == s.frame.blockIdx && loc.statementIndex == s.frame.stmtIdx &&
       cfNonShimDepth m == length s.memory.callStack + 1 &&
-      cfLocalsRel prog s.memory.fnPtrs m.machine (cfClosureKind? b).isSome 0 s.frame.locals f.locals.toList
+      cfLocalsRel prog s.memory.fnPtrs m.machine (cfClosureKind? b).isSome 0 s.frame.locals f.locals.toList &&
+      cfSavedFramesRel prog s.memory.fnPtrs m.machine s.memory.callStack
+        ((m.stack.frames.toList.reverse.drop 1).filter fun fr => !cfIsShimInstance fr.functionInstance)
     | _, _ => false
 
 /-- A `ClosureOnceShim` frame, or a frame being unwound, is on top. -/
@@ -2890,6 +2925,68 @@ def cfNegTransSig : CapturedMir :=
     fnAbi := cfFx_fn_shared.fnAbi,
     layouts := { cfFx_fn_shared.layouts with entries := cfFx_fn_shared.layouts.entries ++ [cfU64Layout] },
     allocations := [] }
+/-- Indirect call through a pointer retyped to `fn(u32) -> u64`, with a genuine 8-byte `u64`
+return local so vendored `Call.initStackFrame` reaches `checkArgumentCompat` on the return
+ABI and raises `AbiMismatchReturn`. -/
+def cfNegTransRet : CapturedMir :=
+  let u64Idx := length cfFx_fn_shared.layouts.entries
+  let u64Ty : Ty := { kind := .uint .u64, layoutIdx := u64Idx }
+  let callTy : Ty := { kind := .fnPtr [.uint .u32] (.uint .u64) .safe .rust, layoutIdx := 1 }
+  { defPath := "hand::neg_trans_ret", phase := .runtimeOptimized, role := .subject, argCount := 1,
+    localDecls := [cfHandDecl u64Ty, cfHandDecl cfU32Ty, cfHandDecl cfSafeFn1,
+                   cfHandDecl { kind := .closure cfNegClosurePath [], layoutIdx := 2 },
+                   cfHandDecl callTy, cfHandDecl cfU32Ty],
+    basicBlocks :=
+      [ { statements :=
+            [ cfHandStmt (.storageLive 2), cfHandStmt (.storageLive 3),
+              cfHandStmt (.assign ⟨3, []⟩ (.aggregate (.closure cfNegClosurePath) [])),
+              cfHandStmt (.assign ⟨2, []⟩ (.cast (.pointerCoercion "ClosureFnPointer(Safe)") (.move ⟨3, []⟩) cfSafeFn1)),
+              cfHandStmt (.storageDead 3), cfHandStmt (.storageLive 4),
+              cfHandStmt (.assign ⟨4, []⟩ (.use (.copy ⟨2, []⟩))),
+              cfHandStmt (.storageLive 5), cfHandStmt (.assign ⟨5, []⟩ (.use (.copy ⟨1, []⟩))) ],
+          terminator := cfHandTerm (.call (.move ⟨4, []⟩) [.move ⟨5, []⟩] ⟨0, []⟩ (some 1) .continue_),
+          isCleanup := false },
+        { statements := [cfHandStmt (.storageDead 5), cfHandStmt (.storageDead 4), cfHandStmt (.storageDead 2)],
+          terminator := cfHandTerm .return_, isCleanup := false } ],
+    fnAbi := { cfFx_fn_shared.fnAbi with ret := { layout := cfU64Layout, mode := .direct } },
+    layouts := { cfFx_fn_shared.layouts with entries := cfFx_fn_shared.layouts.entries ++ [cfU64Layout] },
+    allocations := [] }
+/-- Caller receiving a forged `fn(u32) -> u32` pointer in `_1` and invoking it on `_2 : u32`
+(bypassing `Cast.cast` to exercise `Call.initStackFrame` on a capturing closure target). -/
+def cfNegCapCallCaller : CapturedMir :=
+  { defPath := "hand::neg_cap_call", phase := .runtimeOptimized, role := .subject, argCount := 2,
+    localDecls := [cfHandDecl cfU32Ty, cfHandDecl cfSafeFn1, cfHandDecl cfU32Ty],
+    basicBlocks :=
+      [ { statements := [],
+          terminator := cfHandTerm (.call (.copy ⟨1, []⟩) [.copy ⟨2, []⟩] ⟨0, []⟩ (some 1) .continue_),
+          isCleanup := false },
+        { statements := [], terminator := cfHandTerm .return_, isCleanup := false } ],
+    fnAbi := { args := [{ layout := cfPtrLayout, mode := .direct },
+                        { layout := cfFx_fn_shared.fnAbi.ret.layout, mode := .direct }],
+               ret := cfFx_fn_shared.fnAbi.ret, conv := .rust, canUnwind := true },
+    layouts := cfFx_fn_shared.layouts, allocations := [] }
+def cfNegCapCallTrusted (callee : CapturedMir) : CfObs :=
+  let s0 := cfInit cfNegCapCallCaller
+    [.ptr { allocId := 65536, offsetBytes := 0 } 8, cfU32 5] [callee]
+  let s1 : MachineState :=
+    { s0 with memory :=
+      { s0.memory with fnPtrs := [{ allocId := 65536, defPath := callee.defPath, typeArgs := [],
+                                    fnSig := some (.fnPtr [.uint .u32] (.uint .u32) .safe .rust) }] } }
+  cfRun cfNegCapCallCaller 100 s1
+def cfNegCapCallMiriOutcome (h : CfHooks) (callee : CapturedMir) : Except Miri.Interpreter.StepError CfObs :=
+  let prog : CfProg := [⟨[], cfNegCapCallCaller⟩, ⟨[], callee⟩]
+  match cfMiriInit prog [.uninit, cfU32Imm 5] with
+  | none => .error (.invalidProgram "init")
+  | some st0 =>
+    match cfFunctionPointer (cfItemInstance 1) st0 with
+    | .error e _ => .error e
+    | .ok ptr st1 =>
+      match Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout ptr with
+      | .error _ => .error (.invalidProgram "scalar")
+      | .ok sc =>
+        match cfMiriInit prog [.scalar sc, cfU32Imm 5] with
+        | none => .error (.invalidProgram "init2")
+        | some st2 => cfMiriRunOutcome h 100 { st2 with machine := st1.machine }
 /-- Indirect call through a pointer retyped to `extern "C" fn(u32) -> u32`. -/
 def cfNegExternC : CapturedMir :=
   cfNegCaller [] "ClosureFnPointer(Safe)" cfSafeFn1 (cfNegFnPtrTy [.uint .u32] .safe .c) [.move ⟨5, []⟩]
@@ -3139,6 +3236,236 @@ theorem cfCast_unsafeFnPointer_and_fnPtrToPtr_identity (prog : CfProg) (body : C
     simp only [Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, hRead,
       Miri.Interpreter.Immediate.toScalar, Except.mapError, hPtr, hCheck, hSrcInfo,
       Bool.not_true, Bool.false_eq_true, ↓reduceIte, hDstInfo, hSizeEq]
+
+/-- Definitional unfolding of the `private` helper definitions inside vendored
+`Miri.Interpreter.Call` (`require`, `at?`, `setSpan`) without editing
+`lean-miri/vendor/`. Pure definitional reduction (`replaceTargetDefEq`). -/
+local elab "cf_unfold_call_privates" : tactic => do
+  let env ← Lean.getEnv
+  let some idx := env.getModuleIdx? `Miri.Interpreter.Call
+    | throwError "Miri.Interpreter.Call is not imported"
+  let targets := [`require, `at?, `setSpan]
+  let mut privs : Array Lean.Name := #[]
+  for n in env.header.moduleData[idx.toNat]!.constNames do
+    if let .str _ s := n then
+      if targets.any (fun t => t.toString == s) then
+        privs := privs.push n
+  let g ← Lean.Elab.Tactic.getMainGoal
+  let mut t ← g.getType
+  for _ in [:3] do
+    for p in privs do
+      t := (← Lean.Meta.unfold t p).expr
+  let g' ← g.replaceTargetDefEq t
+  Lean.Elab.Tactic.replaceMainGoal [g']
+
+private theorem cfForIn_range_succ_err {E S β : Type} (n : Nat) (init : β)
+    (f : Nat → β → EStateM E S (ForInStep β)) (st st' : S) (e : E)
+    (h0 : f 0 init st = .error e st') :
+    (forIn [:n + 1] init f : EStateM E S β) st = .error e st' := by
+  rw [Std.Legacy.Range.forIn_eq_forIn_range']
+  simp only [Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one,
+    List.range'_succ, List.forIn_cons, Bind.bind, EStateM.bind, h0]
+
+private theorem cfForIn_range_one {E S β : Type} (init b1 : β)
+    (f : Nat → β → EStateM E S (ForInStep β)) (st st1 : S)
+    (h0 : f 0 init st = .ok (.yield b1) st1) :
+    (forIn [:1] init f : EStateM E S β) st = .ok b1 st1 := by
+  rw [Std.Legacy.Range.forIn_eq_forIn_range']
+  simp only [Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one,
+    List.range'_succ, List.range'_zero, List.forIn_cons, List.forIn_nil,
+    Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, h0]
+
+/-- **Universal vendored `Call.passArgument` argument-ABI mismatch law**:
+whenever `cfCheckArgumentCompat callerAbi calleeAbi` rejects a caller/callee
+argument pair, unmodified vendored `Miri.Interpreter.Call.passArgument` throws
+`.undefinedBehavior s!"AbiMismatchArgument {calleeIndex}"`. -/
+theorem cfCall_passArgument_abiMismatch_vendored_law (prog : CfProg) (directUnwind : Bool)
+    (caller : Miri.Interpreter.FnArg AnnealProv) (callerAbi calleeAbi : CfArgAbi) (calleeIndex : Nat)
+    (dest : Miri.MIR.Place) (calleeTy : Miri.MIR.TyId) (alreadyLive : Bool) (st : AnnealStepState)
+    (hTy : calleeTy = calleeAbi.abi.layout.ty)
+    (hLay : caller.layout.layout = callerAbi.abi.layout.layout)
+    (hBad : cfCheckArgumentCompat callerAbi calleeAbi st = .ok false st) :
+    Miri.Interpreter.Call.passArgument (cfCallHooks prog directUnwind) () caller callerAbi calleeAbi
+        calleeIndex dest calleeTy alreadyLive st =
+      .error (.undefinedBehavior s!"AbiMismatchArgument {calleeIndex}") st := by
+  have hTyEq : (calleeTy == calleeAbi.abi.layout.ty) = true := by rw [hTy]; exact beq_self_eq_true _
+  have hLayEq : (caller.layout.layout == callerAbi.abi.layout.layout) = true := by rw [hLay]; exact beq_self_eq_true _
+  unfold Miri.Interpreter.Call.passArgument
+  cf_unfold_call_privates
+  simp only [cfCallHooks, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+    hTyEq, hLayEq, ↓reduceIte, hBad, Bool.false_eq_true]
+  rfl
+
+/-- **Universal vendored `Call.initStackFrame` calling-convention mismatch law**:
+whenever caller and callee calling conventions differ (e.g. `extern "C"` call of
+a Rust-ABI closure), unmodified vendored `Miri.Interpreter.Call.initStackFrame`
+throws `.undefinedBehavior "caller/callee calling convention mismatch"` before
+pushing a frame. -/
+theorem cfCall_initStackFrame_convMismatch_vendored_law (prog : CfProg) (directUnwind : Bool)
+    (fnInstance : Miri.Interpreter.CallInstance) (loadedBody : Miri.Interpreter.LoadedBody)
+    (callerFnAbi calleeFnAbi : CfFnAbi) (args : Array (Miri.Interpreter.FnArg AnnealProv))
+    (destination : Miri.Interpreter.RuntimeStackPlace AnnealProv)
+    (cont : Miri.Interpreter.ReturnContinuation) (st : AnnealStepState)
+    (hNotPanic : (fnInstance == cfItemInstance cfPanicFmtDefId) = false)
+    (hCalleeAbi : cfFnAbiOfInstance prog fnInstance = some calleeFnAbi)
+    (hBadConv : (callerFnAbi.conv == calleeFnAbi.conv) = false) :
+    Miri.Interpreter.Call.initStackFrame (cfCallHooks prog directUnwind) () fnInstance loadedBody
+        callerFnAbi args false destination cont st =
+      .error (.undefinedBehavior "caller/callee calling convention mismatch") st := by
+  unfold Miri.Interpreter.Call.initStackFrame
+  cf_unfold_call_privates
+  simp only [cfCallHooks, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+    bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hNotPanic, hCalleeAbi, hBadConv]
+  rfl
+
+/-- **Universal vendored `Call.initStackFrame` forged `(N + 1)`-argument law (C10,
+arbitrary arity `n : Nat`)**: for ANY non-capturing closure (`FnOnce` item or
+`ClosureOnceShim`) with `body.argumentCount = n + 1` called with `n + 1` caller
+arguments whose first argument is NOT a 1-ZST, unmodified vendored
+`Miri.Interpreter.Call.initStackFrame` enters `nonCapturing && localId == 1` on
+iteration `0`, sees `callerAbis.size == calleeAbis.size`, and throws
+`.undefinedBehavior "AbiMismatchArgument closure self"`. -/
+theorem cfCall_initStackFrame_forged_closure_self_vendored_law
+    (prog : CfProg) (directUnwind : Bool) (fnInstance : Miri.Interpreter.CallInstance)
+    (loadedBody : Miri.Interpreter.LoadedBody) (callerFnAbi calleeFnAbi : CfFnAbi)
+    (args : Array (Miri.Interpreter.FnArg AnnealProv))
+    (destination : Miri.Interpreter.RuntimeStackPlace AnnealProv)
+    (cont : Miri.Interpreter.ReturnContinuation)
+    (st st1 st2 st3 : AnnealStepState) (destOp : Miri.Interpreter.OpTy AnnealProv)
+    (f : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) (span : Miri.MIR.SpanRef)
+    (n : Nat) (selfCallerAbi selfCalleeAbi : CfArgAbi) (arg0 : Miri.Interpreter.FnArg AnnealProv)
+    (b : CapturedMir) (selfLayout : Miri.Interpreter.LocalLayout)
+    (hNotPanic : (fnInstance == cfItemInstance cfPanicFmtDefId) = false)
+    (hCalleeAbi : cfFnAbiOfInstance prog fnInstance = some calleeFnAbi)
+    (hConv : (callerFnAbi.conv == calleeFnAbi.conv) = true)
+    (hUnwind : calleeFnAbi.canUnwind = true)
+    (hDestOp : (cfCallHooks prog directUnwind).placeToOp () destination st = .ok destOp st)
+    (hPush : (cfCallHooks prog directUnwind).pushRaw () fnInstance loadedBody destination cont st = .ok () st1)
+    (hFrame : st1.stack.currentFrame? = some f)
+    (hLoc : f.location = .unwinding span)
+    (hSet1 : (cfCallHooks prog directUnwind).setFrame { f with trackCallerArg := none } st1 = .ok () st2)
+    (hNonCap : (cfCallHooks prog directUnwind).nonCapturingClosure () fnInstance calleeFnAbi st2 = .ok true st2)
+    (hArgCount : loadedBody.body.argumentCount = n + 1)
+    (hArgsSize : args.size = n + 1)
+    (hCallerSize : callerFnAbi.args.size = n + 1)
+    (hCalleeSize : calleeFnAbi.args.size = n + 1)
+    (hNoSpread : (loadedBody.body.spreadArgument != some 1) = true)
+    (hGet2 : st2.stack.currentFrame? = some f)
+    (hSet3 : (cfCallHooks prog directUnwind).setFrame { f with location := .unwinding defaultSpanRef } st2 = .ok () st2)
+    (hActive : cfActive prog st2 = .ok b st2)
+    (hSelfLay : lookupLocalDeclLayout b.localDecls b.layouts 1 = some selfLayout)
+    (hCallee0 : calleeFnAbi.args[0]? = some selfCalleeAbi)
+    (hSelfZst : selfCalleeAbi.abi.layout.layout.is1zst = true)
+    (hSelfIgn : selfCalleeAbi.abi.isIgnore = true)
+    (hLive : (cfCallHooks prog directUnwind).storageLiveDyn () 1 .none st2 = .ok () st3)
+    (hArg0 : args[0]? = some arg0)
+    (hCaller0 : callerFnAbi.args[0]? = some selfCallerAbi)
+    (hNotZst : selfCallerAbi.abi.layout.layout.is1zst = false) :
+    Miri.Interpreter.Call.initStackFrame (cfCallHooks prog directUnwind) () fnInstance loadedBody
+        callerFnAbi args false destination cont st =
+      .error (.undefinedBehavior "AbiMismatchArgument closure self") st3 := by
+  unfold Miri.Interpreter.Call.initStackFrame
+  cf_unfold_call_privates
+  simp only [cfCallHooks, hLoc] at hDestOp hPush hSet1 hNonCap hSet3 hLive ⊢
+  simp only [Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+    bne_self_eq_false, Bool.false_eq_true, Bool.false_and, ↓reduceIte, hNotPanic, hCalleeAbi, hConv,
+    hUnwind, hDestOp, hPush, hFrame, hLoc, hSet1, hNonCap, hArgCount, hArgsSize, hCallerSize, hCalleeSize,
+    Nat.add_zero, beq_self_eq_true]
+  rw [cfForIn_range_succ_err n (0, 0) _ st2 st3 _ (by
+    simp only [EStateM.bind, EStateM.pure, Option.isNone_none,
+      Nat.zero_add, Bool.true_and, beq_self_eq_true, ↓reduceIte,
+      hGet2, hSet3, hActive, hSelfLay, hNoSpread, hCallee0,
+      hSelfZst, hSelfIgn, hLive, hArg0, hCaller0, hNotZst, Bool.false_eq_true]
+    rfl)]
+
+/-- **Universal vendored `Call.initStackFrame` non-capturing zero-arg closure entry &
+return-ABI law (C6)**: for ANY zero-argument non-capturing closure (`FnOnce` item or
+`ClosureOnceShim`, `body.argumentCount = 1`, `callerAbis.size = 0 ≠ 1 = calleeAbis.size`):
+unmodified vendored `Miri.Interpreter.Call.initStackFrame` takes the
+`nonCapturing && localId == 1` branch, calls `storageLiveDyn () 1 .none` (leaving
+`_1` storage-live uninitialized without consuming any caller argument), and then:
+1. rejects an incompatible return ABI with `.undefinedBehavior "AbiMismatchReturn"`;
+2. on a compatible return ABI, finishes frame initialization with `pushDone`. -/
+theorem cfCall_initStackFrame_zero_arg_closure_vendored_law
+    (prog : CfProg) (directUnwind : Bool) (fnInstance : Miri.Interpreter.CallInstance)
+    (loadedBody : Miri.Interpreter.LoadedBody) (callerFnAbi calleeFnAbi : CfFnAbi)
+    (destination : Miri.Interpreter.RuntimeStackPlace AnnealProv)
+    (cont : Miri.Interpreter.ReturnContinuation)
+    (st st1 st2 st3 : AnnealStepState) (destOp : Miri.Interpreter.OpTy AnnealProv)
+    (f : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) (span : Miri.MIR.SpanRef)
+    (selfCalleeAbi : CfArgAbi)
+    (b : CapturedMir) (selfLayout : Miri.Interpreter.LocalLayout)
+    (hNotPanic : (fnInstance == cfItemInstance cfPanicFmtDefId) = false)
+    (hCalleeAbi : cfFnAbiOfInstance prog fnInstance = some calleeFnAbi)
+    (hConv : (callerFnAbi.conv == calleeFnAbi.conv) = true)
+    (hUnwind : calleeFnAbi.canUnwind = true)
+    (hDestOp : (cfCallHooks prog directUnwind).placeToOp () destination st = .ok destOp st)
+    (hPush : (cfCallHooks prog directUnwind).pushRaw () fnInstance loadedBody destination cont st = .ok () st1)
+    (hFrame : st1.stack.currentFrame? = some f)
+    (hLoc : f.location = .unwinding span)
+    (hSet1 : (cfCallHooks prog directUnwind).setFrame { f with trackCallerArg := none } st1 = .ok () st2)
+    (hNonCap : (cfCallHooks prog directUnwind).nonCapturingClosure () fnInstance calleeFnAbi st2 = .ok true st2)
+    (hArgCount : loadedBody.body.argumentCount = 1)
+    (hCallerSize : callerFnAbi.args.size = 0)
+    (hCalleeSize : calleeFnAbi.args.size = 1)
+    (hNoSpread : (loadedBody.body.spreadArgument != some 1) = true)
+    (hGet2 : st2.stack.currentFrame? = some f)
+    (hSet3 : (cfCallHooks prog directUnwind).setFrame { f with location := .unwinding defaultSpanRef } st2 = .ok () st2)
+    (hActive : cfActive prog st2 = .ok b st2)
+    (hSelfLay : lookupLocalDeclLayout b.localDecls b.layouts 1 = some selfLayout)
+    (hCallee0 : calleeFnAbi.args[0]? = some selfCalleeAbi)
+    (hSelfZst : selfCalleeAbi.abi.layout.layout.is1zst = true)
+    (hSelfIgn : selfCalleeAbi.abi.isIgnore = true)
+    (hLive : (cfCallHooks prog directUnwind).storageLiveDyn () 1 .none st2 = .ok () st3)
+    (hGet3 : st3.stack.currentFrame? = some f)
+    (hSet4 : (cfCallHooks prog directUnwind).setFrame { f with location := .unwinding defaultSpanRef } st3 = .ok () st3) :
+    (cfCheckArgumentCompat callerFnAbi.ret calleeFnAbi.ret st3 = .ok false st3 →
+      Miri.Interpreter.Call.initStackFrame (cfCallHooks prog directUnwind) () fnInstance loadedBody
+          callerFnAbi #[] false destination cont st =
+        .error (.undefinedBehavior "AbiMismatchReturn") st3) ∧
+    (cfCheckArgumentCompat callerFnAbi.ret calleeFnAbi.ret st3 = .ok true st3 →
+      (cfCallHooks prog directUnwind).setFrame { f with location := .unwinding span } st3 = .ok () st3 →
+      Miri.Interpreter.Call.initStackFrame (cfCallHooks prog directUnwind) () fnInstance loadedBody
+          callerFnAbi #[] false destination cont st =
+        (cfCallHooks prog directUnwind).pushDone () st3) := by
+  have hStep0 : ∀ (g : Nat → Nat × Nat → EStateM Miri.Interpreter.StepError AnnealStepState (ForInStep (Nat × Nat))),
+      g 0 (0, 0) st2 = .ok (.yield (0, 1)) st3 →
+      (forIn [:1] (0, 0) g : EStateM Miri.Interpreter.StepError AnnealStepState (Nat × Nat)) st2 = .ok (0, 1) st3 :=
+    fun g h => cfForIn_range_one (0, 0) (0, 1) g st2 st3 h
+  refine ⟨?_, ?_⟩
+  · intro hBadRet
+    unfold Miri.Interpreter.Call.initStackFrame
+    cf_unfold_call_privates
+    simp only [cfCallHooks, hLoc] at hDestOp hPush hSet1 hNonCap hSet3 hLive hSet4 ⊢
+    simp only [Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+      bne_self_eq_false, Bool.false_eq_true, Bool.false_and, ↓reduceIte, hNotPanic, hCalleeAbi, hConv,
+      hUnwind, hDestOp, hPush, hFrame, hLoc, hSet1, hNonCap, hArgCount, hCallerSize, hCalleeSize,
+      Array.size_empty, Nat.add_zero, beq_self_eq_true]
+    rw [hStep0 _ (by
+      simp only [EStateM.bind, EStateM.pure, Option.isNone_none,
+        Nat.zero_add, Bool.true_and, beq_self_eq_true, ↓reduceIte,
+        hGet2, hSet3, hActive, hSelfLay, hNoSpread, hCallee0,
+        hSelfZst, hSelfIgn, hLive]
+      rfl)]
+    simp only [hGet3, hSet4, hBadRet, Bool.false_eq_true, ↓reduceIte]
+    rfl
+  · intro hOkRet hSet5
+    unfold Miri.Interpreter.Call.initStackFrame
+    cf_unfold_call_privates
+    simp only [cfCallHooks, hLoc] at hDestOp hPush hSet1 hNonCap hSet3 hLive hSet4 hSet5 ⊢
+    simp only [Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+      bne_self_eq_false, Bool.false_eq_true, Bool.false_and, ↓reduceIte, hNotPanic, hCalleeAbi, hConv,
+      hUnwind, hDestOp, hPush, hFrame, hLoc, hSet1, hNonCap, hArgCount, hCallerSize, hCalleeSize,
+      Array.size_empty, Nat.add_zero, beq_self_eq_true]
+    rw [hStep0 _ (by
+      simp only [EStateM.bind, EStateM.pure, Option.isNone_none,
+        Nat.zero_add, Bool.true_and, beq_self_eq_true, ↓reduceIte,
+        hGet2, hSet3, hActive, hSelfLay, hNoSpread, hCallee0,
+        hSelfZst, hSelfIgn, hLive]
+      rfl)]
+    cases destOp.op <;>
+      simp only [EStateM.bind, EStateM.pure, hGet3, hSet4, hOkRet, ↓reduceIte, hSet5,
+        beq_self_eq_true, Nat.lt_irrefl]
 
 /-! ## §15. Kernel-checked simulation, `finding_0007` parity, unwinding, and negative witnesses
 
@@ -3531,16 +3858,29 @@ theorem cf_direct_closure_call_witness :
   refine ⟨by decide +kernel, ?_⟩
   rw [cfStepHooks_eq_K]; decide +kernel
 
-/-- **Capturing closures fail closed (C10).** A closure type with a `u32` upvar or a zero-sized
-`()` upvar is `.ub` in `Trusted`; the vendored `Cast.cast` rejects the program with
-`.invalidProgram "capturing closure in pointer cast"`. -/
+/-- **Capturing closures fail closed (C10) at BOTH the cast site and the indirect call site.**
+* At the `ClosureFnPointer(Safe)` cast site: both `[u32]` and ZST `[()]` capturing closures are
+  `.ub` in `Trusted`, while vendored `Cast.cast` rejects the program with
+  `.invalidProgram "capturing closure in pointer cast"`.
+* At the indirect call site (forged `fn(u32) -> u32` pointer directly targeting the capturing
+  closure body, bypassing the cast): BOTH `Trusted` and vendored `Call.initStackFrame` report
+  genuine UB (`.undefinedBehavior "AbiMismatchArgument 0"`) for both `[u32]` and `[()]`. -/
 theorem cf_neg_capturing_fail_closed :
     cfNegTrusted cfNegCapU32 = .ub ∧
     cfNegMiriOutcome cfNegCapU32 = .error (.invalidProgram "capturing closure in pointer cast") ∧
     cfNegTrusted cfNegCapUnit = .ub ∧
-    cfNegMiriOutcome cfNegCapUnit = .error (.invalidProgram "capturing closure in pointer cast") := by
-  refine ⟨by decide +kernel, ?_, by decide +kernel, ?_⟩ <;>
-    (unfold cfNegMiriOutcome; rw [cfStepHooks_eq_K]; decide +kernel)
+    cfNegMiriOutcome cfNegCapUnit = .error (.invalidProgram "capturing closure in pointer cast") ∧
+    cfNegCapCallTrusted cfFx_capturing_direct_closure_0 = .ub ∧
+    cfNegCapCallMiriOutcome (cfStepHooks [⟨[], cfNegCapCallCaller⟩, ⟨[], cfFx_capturing_direct_closure_0⟩])
+        cfFx_capturing_direct_closure_0 = .error (.undefinedBehavior "AbiMismatchArgument 0") ∧
+    cfNegCapCallTrusted cfFx_capturing_direct_closure_1 = .ub ∧
+    cfNegCapCallMiriOutcome (cfStepHooks [⟨[], cfNegCapCallCaller⟩, ⟨[], cfFx_capturing_direct_closure_1⟩])
+        cfFx_capturing_direct_closure_1 = .error (.undefinedBehavior "AbiMismatchArgument 0") := by
+  refine ⟨by decide +kernel, ?_, by decide +kernel, ?_, by decide +kernel, ?_, by decide +kernel, ?_⟩
+  · unfold cfNegMiriOutcome; rw [cfStepHooks_eq_K]; decide +kernel
+  · unfold cfNegMiriOutcome; rw [cfStepHooks_eq_K]; decide +kernel
+  · rw [cfStepHooks_eq_K]; decide +kernel
+  · rw [cfStepHooks_eq_K]; decide +kernel
 
 /-- **Forged `(N+1)`-argument indirect calls (C10)** on BOTH `FnOnce` (direct body) and `Fn`
 (`ClosureOnceShim`) closures are UB on both machines: vendored `initStackFrame` reports
@@ -3552,14 +3892,17 @@ theorem cf_neg_forged_call_ub :
   refine ⟨by decide +kernel, ?_, by decide +kernel, ?_⟩ <;>
     (unfold cfNegMiri; rw [cfStepHooks_eq_K]; decide +kernel)
 
-/-- **Transmuted signature `fn(u64) -> u32`** is UB on BOTH machines: Trusted faults `.ub`, and
-vendored `Call.evalCallTerminator` (`checkArgumentCompat`) faults with
-`.undefinedBehavior "AbiMismatchArgument 1"`. -/
+/-- **Transmuted signatures (`fn(u64) -> u32` argument mismatch AND `fn(u32) -> u64` return
+mismatch)** are UB on BOTH machines:
+* argument mismatch: `Trusted = .ub`, vendored Miri `Call.passArgument` = `.undefinedBehavior "AbiMismatchArgument 1"`;
+* return mismatch: `Trusted = .ub`, vendored Miri `Call.initStackFrame` = `.undefinedBehavior "AbiMismatchReturn"`. -/
 theorem cf_neg_transmuted_sig_ub :
     cfNegTrusted cfNegTransSig = .ub ∧
-    cfNegMiriOutcome cfNegTransSig = .error (.undefinedBehavior "AbiMismatchArgument 1") := by
-  refine ⟨by decide +kernel, ?_⟩
-  unfold cfNegMiriOutcome; rw [cfStepHooks_eq_K]; decide +kernel
+    cfNegMiriOutcome cfNegTransSig = .error (.undefinedBehavior "AbiMismatchArgument 1") ∧
+    cfNegTrusted cfNegTransRet = .ub ∧
+    cfNegMiriOutcome cfNegTransRet = .error (.undefinedBehavior "AbiMismatchReturn") := by
+  refine ⟨by decide +kernel, ?_, by decide +kernel, ?_⟩ <;>
+    (unfold cfNegMiriOutcome; rw [cfStepHooks_eq_K]; decide +kernel)
 
 /-- **`extern "C"` call of a Rust-ABI closure** is UB on both machines (the vendored
 `evalCalleeAndArgs` calling-convention check `"caller/callee calling convention mismatch"`). -/
@@ -3635,6 +3978,9 @@ elab "#assert_closure_fn_ptr_lm_audit" : command => do
     ``cfResolveClosure_fnOnce_is_item, ``cfResolveClosure_fn_is_shim,
     ``cfResolveClosure_generic_unsupported, ``cfNonCapturingClosure_vendored_law,
     ``cfCast_closureFnPointer_vendored_law, ``cfCast_unsafeFnPointer_and_fnPtrToPtr_identity,
+    ``cfCall_passArgument_abiMismatch_vendored_law, ``cfCall_initStackFrame_convMismatch_vendored_law,
+    ``cfCall_initStackFrame_forged_closure_self_vendored_law,
+    ``cfCall_initStackFrame_zero_arg_closure_vendored_law,
     ``cf_fn_once_certificate, ``cf_fn_once_lockstep, ``cf_closure_entry_frames_witness,
     ``cf_finding_0007_driver_stutter_sim, ``cf_finding_0007_main_stutter_sim,
     ``cf_trusted_finding_parity, ``cf_fn_shared_stutter_sim, ``cf_fn_mut_stutter_sim,

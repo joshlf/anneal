@@ -19146,6 +19146,8 @@ verbatim `rustc-capture` bodies (including the `9147` difftest reproducer). -/
   MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_correspondence_M
   MiniRustSpec.ClosureFnPtrMR.classifyOwnClosureEnvTy_by_upvars
   MiniRustSpec.ClosureFnPtrMR.minirust_createFrameM_arity_law
+  MiniRustSpec.ClosureFnPtrMR.minirust_createFrameM_abi_mismatch_law
+  MiniRustSpec.ClosureFnPtrMR.closure_typed_sig_call_correspondence_M
   MiniRustSpec.ClosureFnPtrMR.minirust_ptr_rel_eq_same_addr_M
   MiniRustSpec.ClosureFnPtrMR.minirust_closure_call_return_tb_wfLive
   MiniRustSpec.ClosureFnPtrMR.closure_coercion_widening_identity_general_mach_and_tb
@@ -19175,6 +19177,7 @@ verbatim `rustc-capture` bodies (including the `9147` difftest reproducer). -/
   MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_law_instance_fnOnce
   MiniRustSpec.ClosureFnPtrMR.closureFnPtrEntryRel_instance_mach_and_tb
   MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_correspondence_instance_mach_and_tb
+  MiniRustSpec.ClosureFnPtrMR.closure_typed_sig_instances_mach_and_tb
 
 #assert_minirustspec_import_isolation
 
