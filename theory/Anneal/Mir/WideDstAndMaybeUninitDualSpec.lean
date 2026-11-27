@@ -622,14 +622,30 @@ theorem bundle_gate_pinDelta_and_dstBoundary (A : WdLmAuthority) (hA : lmTableCh
       ((lmSideOf (some .d4) A).reverseTotal wdModel
         (Bool.and_eq_true _ _ ▸ lmCheckOf_of_table (some .d4) A hA).1) rfl⟩
 
+/-- Witness polarity and fault-kind pinning on the unified bundle: positive witnesses are case `0`
+and fault witnesses are genuine `.undefined` UB (case `4`), never `.unsupported`. -/
+theorem unified_bundle_witness_kinds (A : WdLmAuthority) (hA : lmTableCheckOf A = true) :
+    let B := bundleOf A hA
+    B.mrPositive.p = 0 ∧ B.lmPositive.p = 0 ∧
+    B.mrFault.p = 4 ∧ B.lmFault.p = 4 ∧
+    B.mrFault.kind = .undefined ∧ B.lmFault.kind = .undefined ∧
+    B.mrFlip.kind = .undefined ∧ B.lmFlip.kind = .undefined :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-- Every per-domain bundle carries genuine correspondence / fault-equivalence claims and
-non-vacuous flip-direction guards (positive and fault witnesses) on BOTH authorities. -/
+non-vacuous flip-direction guards (positive and genuine `.undefined` UB fault witnesses) on BOTH
+authorities. -/
 theorem domain_bundle_claims (d : WdDomain) (A : WdLmAuthority) (hA : lmTableCheckOf A = true) :
     let B := domainBundleOf d A hA
     CorrespondenceClaim B.mrRel ∧ FaultEquivClaim B.mrRel ∧
     CorrespondenceClaim B.lmRel ∧ FaultEquivClaim B.lmRel ∧
+    B.mrPositive.p = okCaseOf (some d) ∧ B.lmPositive.p = okCaseOf (some d) ∧
+    B.mrFault.p = faultCaseOf (some d) ∧ B.lmFault.p = faultCaseOf (some d) ∧
+    B.mrFault.kind = .undefined ∧ B.lmFault.kind = .undefined ∧
     B.mrFlip.pOk = okCaseOf (some d) ∧ B.mrFlip.pFault = faultCaseOf (some d) ∧
+    B.mrFlip.kind = .undefined ∧
     B.lmFlip.pOk = okCaseOf (some d) ∧ B.lmFlip.pFault = faultCaseOf (some d) ∧
+    B.lmFlip.kind = .undefined ∧
     (∃ a r, B.mrRel.ExecA B.mrFlip.m B.mrFlip.pOk B.mrFlip.qOk B.mrFlip.cOk (.normal a) ∧
             B.mrRel.ExecR B.mrFlip.m B.mrFlip.pOk B.mrFlip.qOk B.mrFlip.cOk (.normal r) ∧
             B.mrRel.RetRel a r) ∧
@@ -643,12 +659,22 @@ theorem domain_bundle_claims (d : WdDomain) (A : WdLmAuthority) (hA : lmTableChe
     B.lmRel.ExecA B.lmFlip.m B.lmFlip.pFault B.lmFlip.qFault B.lmFlip.cFault
       (.fault B.lmFlip.kind) ∧
     B.lmRel.ExecR B.lmFlip.m B.lmFlip.pFault B.lmFlip.qFault B.lmFlip.cFault
-      (.fault B.lmFlip.kind) :=
-  ⟨(domainBundleOf d A hA).mrSim.correspondenceClaim,
+      (.fault B.lmFlip.kind) := by
+  have hk : ∀ d' : WdDomain,
+      (domainBundleOf d' A hA).mrFault.kind = .undefined ∧
+      (domainBundleOf d' A hA).lmFault.kind = .undefined ∧
+      (domainBundleOf d' A hA).mrFlip.kind = .undefined ∧
+      (domainBundleOf d' A hA).lmFlip.kind = .undefined := by
+    intro d'
+    cases d' <;> exact ⟨rfl, rfl, rfl, rfl⟩
+  exact ⟨(domainBundleOf d A hA).mrSim.correspondenceClaim,
    (domainBundleOf d A hA).mrSim.faultEquivClaim,
    (domainBundleOf d A hA).lmSim.correspondenceClaim,
    (domainBundleOf d A hA).lmSim.faultEquivClaim,
    rfl, rfl, rfl, rfl,
+   (hk d).1, (hk d).2.1,
+   rfl, rfl, (hk d).2.2.1,
+   rfl, rfl, (hk d).2.2.2,
    (domainBundleOf d A hA).mrFlip.okAgree,
    (domainBundleOf d A hA).mrFlip.faultA,
    (domainBundleOf d A hA).mrFlip.faultR,
@@ -669,6 +695,17 @@ theorem dual_exact_three_way_classification (A : WdLmAuthority) (hA : lmTableChe
         mrVerdict tb idx = A.verdict tb idx) ↔ wdClassOf idx = .dstBoundary) ∧
     ((trustedVerdict tb idx = A.verdict tb idx ∧ mrVerdict tb idx ≠ A.verdict tb idx) ↔
         wdClassOf idx = .pinDelta) := by
+  rw [trustedVerdict_cell tb idx hi, mrVerdict_cell tb idx hi, lmTableCheckOf_sound A hA tb idx hi]
+  revert hi
+  revert idx
+  cases tb <;> decide +kernel
+
+/-- **Zero `specPanic` / stuck cells across all 48 in-range cells** on all three authorities
+(ensuring `dual_exact_three_way_classification` never holds vacuously via `none = none`). -/
+theorem dual_no_specPanic_all_cells (A : WdLmAuthority) (hA : lmTableCheckOf A = true)
+    (tb : Bool) (idx : Nat) (hi : idx < mrWdCaseCount) :
+    trustedVerdict tb idx ≠ none ∧ mrVerdict tb idx ≠ none ∧
+    A.verdict tb idx ≠ none ∧ wdClassOf idx ≠ .outOfRange := by
   rw [trustedVerdict_cell tb idx hi, mrVerdict_cell tb idx hi, lmTableCheckOf_sound A hA tb idx hi]
   revert hi
   revert idx
@@ -895,6 +932,7 @@ the fail-closed obligation:
 theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
     (hA : lmTableCheckOf A = true) (hOob : WdLmFailClosed A) :
     wdCodec.TightValidRep ∧
+    (∀ b, wdValidRep b ↔ (wdDecode b).isSome = true) ∧
     type_of% wdCodec_rejects_malformed ∧
     (∀ sel, (mrSide sel).check wdModel = true) ∧
     (∀ sel, lmCheckOf sel A = true) ∧
@@ -916,8 +954,10 @@ theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
     type_of% (bundleOf A hA).projectFault ∧
     type_of% (modeSensitivity_present A hA) ∧
     type_of% (bundle_gate_pinDelta_and_dstBoundary A hA) ∧
+    type_of% (unified_bundle_witness_kinds A hA) ∧
     (∀ d, type_of% (domain_bundle_claims d A hA)) ∧
     (∀ tb idx (hi : idx < mrWdCaseCount), type_of% (dual_exact_three_way_classification A hA tb idx hi)) ∧
+    (∀ tb idx (hi : idx < mrWdCaseCount), type_of% (dual_no_specPanic_all_cells A hA tb idx hi)) ∧
     (∀ tb idx (h : mrWdCaseCount ≤ idx), type_of% (dual_fail_closed_out_of_range A hOob tb idx h)) ∧
     (∀ idx (hi : idx < mrWdCaseCount), type_of% (dual_mode_sensitivity_exact A hA idx hi)) ∧
     type_of% (dual_case19_mode_sensitivity A hA) ∧
@@ -928,12 +968,14 @@ theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
     type_of% steps_eq_runToStopM_bm ∧
     type_of% ep1_minirust_widedst_maybeuninit_capstone ∧
     type_of% ep1_minirust_universal_laws_capstone :=
-  ⟨wdCodec_tight, wdCodec_rejects_malformed, mrSide_check, fun sel => lmCheckOf_of_table sel A hA,
+  ⟨wdCodec_tight, wdValidRep_iff_decode_isSome, wdCodec_rejects_malformed,
+   mrSide_check, fun sel => lmCheckOf_of_table sel A hA,
    threeWayNormalAgreement A hA, crossAuthorityFaultEquiv A hA, exactBehaviorEq_both A hA,
    (bundleOf A hA).projectPositive, (bundleOf A hA).projectFault,
    modeSensitivity_present A hA, bundle_gate_pinDelta_and_dstBoundary A hA,
-   fun d => domain_bundle_claims d A hA,
-   dual_exact_three_way_classification A hA, dual_fail_closed_out_of_range A hOob,
+   unified_bundle_witness_kinds A hA, fun d => domain_bundle_claims d A hA,
+   dual_exact_three_way_classification A hA, dual_no_specPanic_all_cells A hA,
+   dual_fail_closed_out_of_range A hOob,
    dual_mode_sensitivity_exact A hA, dual_case19_mode_sensitivity A hA,
    dual_dst_honest_trusted_boundary A hA, dual_minirust300_pin_delta_and_flip_ready A hA,
    dual_case13_union_copy_vs_typed_read A hA,
@@ -986,8 +1028,9 @@ run_cmd do
       ns ++ `domainBundleOf, ns ++ `mrGate_of_threeWay, ns ++ `lmGate_of_threeWay,
       ns ++ `threeWayNormalAgreement, ns ++ `crossAuthorityFaultEquiv, ns ++ `exactBehaviorEq_both,
       ns ++ `projectPositive, ns ++ `projectFault, ns ++ `modeSensitivity_present,
-      ns ++ `bundle_gate_pinDelta_and_dstBoundary,
+      ns ++ `bundle_gate_pinDelta_and_dstBoundary, ns ++ `unified_bundle_witness_kinds,
       ns ++ `domain_bundle_claims, ns ++ `dual_exact_three_way_classification,
+      ns ++ `dual_no_specPanic_all_cells,
       ns ++ `dual_fail_closed_out_of_range, ns ++ `dual_mode_sensitivity_exact,
       ns ++ `dual_case19_mode_sensitivity, ns ++ `dual_dst_honest_trusted_boundary,
       ns ++ `dual_minirust300_pin_delta_and_flip_ready, ns ++ `dual_case13_union_copy_vs_typed_read,
@@ -999,6 +1042,23 @@ run_cmd do
     for a in ← liftCoreM <| Lean.collectAxioms c do
       unless a == ``propext || a == ``Quot.sound do
         throwError "constructive decl {c} must not depend on {a}"
+  -- Exhaustive constructive purity across the ENTIRE module: every declaration in `ns` except the
+  -- exact 3 declarations that re-export upstream Classical.choice (`steps_eq_runToStopM_bm` via
+  -- `stepM_bm_eq`, and the two Episode 2 capstones that re-export Episode 1 capstones) MUST lie
+  -- strictly in `[propext, Quot.sound]`.
+  let choiceAllowlist : List Lean.Name :=
+    [ ns ++ `steps_eq_runToStopM_bm,
+      ns ++ `ep2_widedst_maybeuninit_dual_authority_capstone,
+      ns ++ `ep2_widedst_maybeuninit_dual_authority_capstone_nonvacuous ]
+  let mut exhaustiveChoiceFree : Nat := 0
+  for (c, _) in env.constants.map₂.toList do
+    if ns.isPrefixOf c && !choiceAllowlist.contains c then
+      for a in ← liftCoreM <| Lean.collectAxioms c do
+        unless a == ``propext || a == ``Quot.sound do
+          throwError "exhaustive constructive audit failure: {c} depends on {a}"
+      exhaustiveChoiceFree := exhaustiveChoiceFree + 1
+  if exhaustiveChoiceFree < 250 then
+    throwError "exhaustive constructive audit vacuous: only {exhaustiveChoiceFree} decls checked"
   -- Auditor self-tests: confirm Classical.choice, sorryAx, and Lean.ofReduceBool are caught.
   if (← liftCoreM <| Lean.collectAxioms ``Classical.em).all
       (fun a => a == ``propext || a == ``Quot.sound) then

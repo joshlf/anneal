@@ -196,7 +196,7 @@ run_cmd do
   let cNs := `Anneal.Mir.DropBinderAndSubtypeBundle.Corpus
   let mrNs := `MiniRustSpec.WideDstAndMaybeUninitMR
   let lmNs := `LeanMiriSpec.WideDstAndMaybeUninitLM
-  let act : CoreM (Nat × Nat × Nat × Nat × Nat × Array Name) := do
+  let act : CoreM (Nat × Nat × Nat × Nat × Nat × Nat × Array Name) := do
     let addDef (name : Name) (val : Expr) : CoreM Expr := do
       let ty ← MetaM.run' <| inferType val
       addDecl <| .defnDecl {
@@ -329,9 +329,10 @@ run_cmd do
       added := added.push pn
     for thmName in [`threeWayNormalAgreement, `crossAuthorityFaultEquiv, `exactBehaviorEq_both,
                     `projectPositive, `projectFault, `modeSensitivity_present,
-                    `bundle_gate_pinDelta_and_dstBoundary,
-                    `dual_exact_three_way_classification, `dual_mode_sensitivity_exact,
-                    `dual_case19_mode_sensitivity, `dual_dst_honest_trusted_boundary,
+                    `bundle_gate_pinDelta_and_dstBoundary, `unified_bundle_witness_kinds,
+                    `dual_exact_three_way_classification, `dual_no_specPanic_all_cells,
+                    `dual_mode_sensitivity_exact, `dual_case19_mode_sensitivity,
+                    `dual_dst_honest_trusted_boundary,
                     `dual_minirust300_pin_delta_and_flip_ready,
                     `dual_case13_union_copy_vs_typed_read] do
       addThmInfer (ns ++ thmName) (mkApp2 (mkConst (bNs ++ thmName)) authC hA)
@@ -423,22 +424,25 @@ run_cmd do
       let n := ns ++ `frozenTableLock ++ rootTbl
       addThm n (mkEq listMrTy lhs rhs) (mkRefl listMrTy lhs)
       added := added.push n
-    -- 3c. Direct-certificate bundle: the side certificate kernel-evaluated on the twin is transported
-    -- onto the real authority, and the bundle it closes is definitionally the unified bundle.
-    let noneSel := mkApp (mkConst ``Option.none [0]) (mkConst domNs)
-    let directChk := ns ++ `lmSideCheck_direct_unified
-    let pFn ← MetaM.run' <| withLocalDeclD `a (mkConst (bNs ++ `WdLmAuthority)) fun a =>
-      mkLambdaFVars #[a] (mkApp2 (mkConst (bNs ++ `lmCheckOf)) noneSel a)
-    addThm directChk (eqTrue (mkApp2 (mkConst (bNs ++ `lmCheckOf)) noneSel authC))
-      (mkAppN (mkConst (bNs ++ `cert_transport))
-        #[authC, authUC, mkConst eqName, pFn, mkConst (ns ++ `lmSideCheckU ++ `unified)])
-    added := added.push directChk
+    -- 3c. Direct-certificate bundles: EVERY side certificate kernel-evaluated on the twin (`unified`
+    -- and all 4 per-domain `d1..d4`) is transported onto the real authority via `cert_transport`,
+    -- and every direct bundle it closes is definitionally equal (`Eq.refl`) to the table-closed one.
     let directBundle := ns ++ `directUnifiedBundle
-    let dTy ← addDef directBundle (mkApp3 (mkConst (bNs ++ `bundleOfSel)) noneSel authC (mkConst directChk))
-    added := added.push directBundle
-    addThm (ns ++ `directUnifiedBundle_eq_unified) (mkEq dTy (mkConst directBundle) (mkConst unifiedName))
-      (mkRefl dTy (mkConst directBundle))
-    added := added.push (ns ++ `directUnifiedBundle_eq_unified)
+    for (tag, sel) in sels do
+      let directChk := ns ++ `lmSideCheck_direct ++ tag
+      let pFn ← MetaM.run' <| withLocalDeclD `a (mkConst (bNs ++ `WdLmAuthority)) fun a =>
+        mkLambdaFVars #[a] (mkApp2 (mkConst (bNs ++ `lmCheckOf)) sel a)
+      addThm directChk (eqTrue (mkApp2 (mkConst (bNs ++ `lmCheckOf)) sel authC))
+        (mkAppN (mkConst (bNs ++ `cert_transport))
+          #[authC, authUC, mkConst eqName, pFn, mkConst (ns ++ `lmSideCheckU ++ tag)])
+      added := added.push directChk
+      let dName := if tag == `unified then directBundle else ns ++ `directDomainBundle ++ tag
+      let origName := if tag == `unified then unifiedName else ns ++ `domainBundle ++ tag
+      let dTy ← addDef dName (mkApp3 (mkConst (bNs ++ `bundleOfSel)) sel authC (mkConst directChk))
+      added := added.push dName
+      let eqBName := ns ++ `directBundle_eq ++ tag
+      addThm eqBName (mkEq dTy (mkConst dName) (mkConst origName)) (mkRefl dTy (mkConst dName))
+      added := added.push eqBName
 
     -- 4. Definitional `Eq.refl` fixture locks over EVERY shared definition in `section Fixtures`
     -- (38 items: layouts, builders, and all 25 `CapturedMir` fixtures) plus
@@ -531,6 +535,25 @@ run_cmd do
       let some (b, _) := rest.and? | throwError "cross-root: unexpected canary shape"
       let some (_, l2, r2) := b.eq? | throwError "cross-root: unexpected canary shape"
       return (ity, l1, r1, l2, r2)
+    -- Gate-boundary forgery helpers:
+    -- (a) MiniRust side with `lmGate` (admitting case `22`, where pinned MiniRust diverges);
+    -- (b) LeanMiri side with an always-true gate (admitting cases `6, 7`, where Trusted is `.unsupported`).
+    let noneSel := mkApp (mkConst ``Option.none [0]) (mkConst domNs)
+    let some (.defnInfo lmChkInfo) := (← getEnv).find? (bNs ++ `lmCheckOf)
+      | throwError "cross-root: lmCheckOf definition missing"
+    let checkOnWdModel := lmChkInfo.value.bindingBody!.bindingBody!.appFn!
+    let mrSideWithCase22 := mkApp3 (mkConst (bNs ++ `sideOf))
+      noneSel (mkConst (bNs ++ `lmGate)) (mkConst (bNs ++ `mrVerdictFn))
+    let mrSideWithCase22Check := mkApp checkOnWdModel mrSideWithCase22
+    let allTrueGate ← MetaM.run' <|
+      withLocalDeclD `sel (mkApp (mkConst ``Option [0]) (mkConst domNs)) fun sel =>
+        withLocalDeclD `i (mkConst (bNs ++ `WdCase)) fun i =>
+          mkLambdaFVars #[sel, i] (mkConst ``Bool.true)
+    let lmSideWithCase6 := mkApp3 (mkConst (bNs ++ `sideOf))
+      noneSel allTrueGate (mkApp (mkConst (bNs ++ `lmVerdictFn)) authUC)
+    let lmSideWithCase6Check := mkApp checkOnWdModel lmSideWithCase6
+    let lmMapBasic := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 lmToMr (mkConst (lmNs ++ `lmWdExpectedBasic))
+    let lmMapTb := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 lmToMr (mkConst (lmNs ++ `lmWdExpectedTb))
     let forged : List (String × Declaration × Declaration) :=
       [ ("ill-typed 0 = 1",
           thmD (ns ++ `forged.zeroEqOne) (mkEq natTy (mkNatLit 0) (mkNatLit 1)) (mkRefl natTy (mkNatLit 0)),
@@ -636,7 +659,23 @@ run_cmd do
           thmD (ns ++ `forged.lmToMrUb) (mkEq mrObsTy0 (mkApp lmToMr (lmObsC `ub)) (mrC `unsupported))
             (mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `ub))),
           thmD (ns ++ `honest.lmToMrUb) (mkEq mrObsTy0 (mkApp lmToMr (lmObsC `ub)) (mrC `ub))
-            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `ub)))) ]
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `ub)))),
+        ("forged MR Corpus.Side.check admitting pin-delta case 22",
+          thmD (ns ++ `forged.mrGateIncludesCase22) (eqTrue mrSideWithCase22Check) reflTrue,
+          thmD (ns ++ `honest.mrGateRejectsCase22) (eqFalse mrSideWithCase22Check) reflFalse),
+        ("forged LM Corpus.Side.check admitting DST-boundary cases 6/7",
+          thmD (ns ++ `forged.lmGateIncludesCase6) (eqTrue lmSideWithCase6Check) reflTrue,
+          thmD (ns ++ `honest.lmGateRejectsCase6) (eqFalse lmSideWithCase6Check) reflFalse),
+        ("forged cross-mode frozen-table lock (wdLmExpectedBasic = lmWdExpectedTb.map lmToMr)",
+          thmD (ns ++ `forged.frozenTableCrossMode) (mkEq listMrTy (mkConst (bNs ++ `wdLmExpectedBasic)) lmMapTb)
+            (mkRefl listMrTy (mkConst (bNs ++ `wdLmExpectedBasic))),
+          thmD (ns ++ `honest.frozenTableBasic) (mkEq listMrTy (mkConst (bNs ++ `wdLmExpectedBasic)) lmMapBasic)
+            (mkRefl listMrTy (mkConst (bNs ++ `wdLmExpectedBasic)))),
+        ("forged LM out-of-range cell 24 returns okScalar 0 instead of unsupported",
+          thmD (ns ++ `forged.lmOutOfRangeOk) (mkEq lmObsTy (lmObsU false 24) (mkApp (lmObsC `okScalar) (mkNatLit 0)))
+            (mkRefl lmObsTy (lmObsU false 24)),
+          thmD (ns ++ `honest.lmOutOfRangeUnsupported) (mkEq lmObsTy (lmObsU false 24) (lmObsC `unsupported))
+            (mkRefl lmObsTy (lmObsU false 24))) ]
     let mut rejected : Nat := 0
     let mut twins : Nat := 0
     for (what, d, h) in forged do
@@ -729,6 +768,15 @@ run_cmd do
             `Miri.Memory.InitMask.prepareCopy,
             `Miri.Memory.Validity.checkScalar,
             `Miri.Memory.Validity.checkPrimitive ]),
+        (directBundle,
+          [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+            `MiniRustSpec.WideDstAndMaybeUninitMR.mrTrustedWdObserve,
+            `MiniRustSpec.WideDstAndMaybeUninitMR.mrWdObserve,
+            `LeanMiriSpec.WideDstAndMaybeUninitLM.lmWdObserve,
+            `LeanMiriSpec.WideDstAndMaybeUninitLM.lmWdObserveU,
+            `Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta,
+            `Miri.Interpreter.ptrOffsetInbounds,
+            `Miri.Memory.Allocation.copy ]),
         (crossName,
           [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
             `Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
@@ -760,16 +808,16 @@ run_cmd do
         unless seen.contains r do
           throwError "cross-root reachability failure: {root} does not reach {r}"
         reachChecked := reachChecked + 1
-    return (added.size, bundleCount, lockCount, rejected, twins, crAxioms.toArray)
+    return (added.size, bundleCount, lockCount, rejected, twins, reachChecked, crAxioms.toArray)
 
   let ctx : Core.Context :=
     { fileName := "<wd-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
-  let ((addedCount, bundleCount, lockCount, rejectedCount, twinCount, crAxioms), _) ←
+  let ((addedCount, bundleCount, lockCount, rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 95 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 26 &&
-      twinCount = rejectedCount do
-    throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount}, twins={twinCount})"
-  logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), reached Trusted+MiniRust+Miri, axioms {crAxioms}"
+  unless addedCount ≥ 110 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 30 &&
+      twinCount = rejectedCount && reachCount ≥ 48 do
+    throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
+  logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
 
 /-! ## §3. Constructive Purity, Axiom Audit, and Auditor Self-Tests -/
 
@@ -779,13 +827,15 @@ run_cmd do
   let bNs := `Anneal.Mir.WideDstAndMaybeUninitDualSpec
   let constructiveDecls : List Name :=
     [ `wdCodec, `wdEncode_decode_of_valid, `wdCodec_tight, `wdCodec_encode_injective,
-      `wdCodec_decode_injective_on_valid, `wdCodec_rejects_malformed, `wdModel, `wdAnnealEval,
-      `mrVerdict, `trustedVerdict, `lmTableCheckOf_sound, `lmTableCheckOf_of_eq,
+      `wdCodec_decode_injective_on_valid, `wdValidRep_iff_decode_isSome,
+      `wdCodec_rejects_malformed, `wdModel, `wdAnnealEval, `mrVerdict, `trustedVerdict,
+      `lmTableCheckOf_sound, `lmTableCheckOf_of_eq, `cert_transport,
       `mrSide_check, `lmCheckOf_of_table, `bundleOfSel, `bundleOf, `domainBundleOf,
       `threeWayNormalAgreement, `crossAuthorityFaultEquiv, `exactBehaviorEq_both,
       `projectPositive, `projectFault, `modeSensitivity_present,
-      `bundle_gate_pinDelta_and_dstBoundary, `domain_bundle_claims,
-      `dual_exact_three_way_classification, `dual_fail_closed_out_of_range,
+      `bundle_gate_pinDelta_and_dstBoundary, `unified_bundle_witness_kinds,
+      `domain_bundle_claims, `dual_exact_three_way_classification,
+      `dual_no_specPanic_all_cells, `dual_fail_closed_out_of_range,
       `dual_mode_sensitivity_exact, `dual_case19_mode_sensitivity,
       `dual_dst_honest_trusted_boundary, `dual_minirust300_pin_delta_and_flip_ready,
       `dual_case13_union_copy_vs_typed_read, `rootBackedLmAuthority,
@@ -797,8 +847,34 @@ run_cmd do
     let axs ← liftCoreM <| Lean.collectAxioms (bNs ++ d)
     unless isChoiceFree axs do
       throwError "constructive audit failure: {d} uses a non-constructive axiom ({axs})"
-  -- Self-tests: the constructive check rejects `Classical.choice`; the axiom audit rejects
-  -- `sorryAx` and `Lean.ofReduceBool`.
+  -- Exhaustive choice-free audit across the entire `WideDstAndMaybeUninitDualSpec` module:
+  -- only the exact 3 upstream-Classical.choice re-exports may use `Classical.choice`.
+  let choiceAllowlist : List Name :=
+    [ bNs ++ `steps_eq_runToStopM_bm,
+      bNs ++ `ep2_widedst_maybeuninit_dual_authority_capstone,
+      bNs ++ `ep2_widedst_maybeuninit_dual_authority_capstone_nonvacuous ]
+  let some modIdx := env.getModuleIdx? bNs
+    | throwError "constructive audit failure: module {bNs} not found"
+  let modData := env.header.moduleData[modIdx.toNat]!
+  let mut exhaustiveChoiceFree : Nat := 0
+  for c in modData.constNames do
+    if bNs.isPrefixOf c && !choiceAllowlist.contains c then
+      let axs ← liftCoreM <| Lean.collectAxioms c
+      unless isChoiceFree axs do
+        throwError "exhaustive constructive audit failure: {c} uses non-constructive axiom ({axs})"
+      exhaustiveChoiceFree := exhaustiveChoiceFree + 1
+  unless exhaustiveChoiceFree ≥ 250 do
+    throwError "exhaustive constructive audit vacuous: only {exhaustiveChoiceFree} decls checked"
+  -- Self-tests: constructive check rejects `Classical.choice`; standard-axiom check rejects
+  -- `sorryAx` and `Lean.ofReduceBool`; trivial-prop detector rejects `True`, `1 = 1`, `∀ x, x = x`.
+  let rec isTrivialProp : Expr → Bool
+    | .forallE _ _ body _ => isTrivialProp body
+    | .letE _ _ _ body _ => isTrivialProp body
+    | e =>
+      if e.isConstOf ``True then true
+      else if e.isAppOfArity ``Eq 3 then e.appFn!.appArg! == e.appArg!
+      else if e.isAppOfArity ``Iff 2 then e.appFn!.appArg! == e.appArg!
+      else false
   unless !isChoiceFree (← liftCoreM <| Lean.collectAxioms ``Classical.em) do
     throwError "self-test: Classical.choice was not detected"
   unless !(← liftCoreM <| Lean.collectAxioms ``sorryAx).all
@@ -807,9 +883,19 @@ run_cmd do
   unless !(← liftCoreM <| Lean.collectAxioms ``Lean.ofReduceBool).all
       (fun a => a == ``propext || a == ``Quot.sound || a == ``Classical.choice) do
     throwError "self-test: Lean.ofReduceBool was not detected"
+  let natTy := mkConst ``Nat
+  let eq11 := mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit 1) (mkNatLit 1)
+  let eq12 := mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit 1) (mkNatLit 2)
+  let forallEq := Expr.forallE `x natTy (mkApp3 (mkConst ``Eq [1]) natTy (.bvar 0) (.bvar 0)) .default
+  unless isTrivialProp (mkConst ``True) && isTrivialProp eq11 && isTrivialProp forallEq &&
+      !isTrivialProp eq12 do
+    throwError "self-test: trivial theorem detector failed in §3"
   let tNs := `Anneal.Mir.WideDstAndMaybeUninitCorrespondenceTests
   let mut checked : Nat := 0
-  for (c, _) in env.constants.map₂.toList do
+  for (c, info) in env.constants.map₂.toList do
+    if let .thmInfo v := info then
+      if tNs.isPrefixOf c && !c.isInternal && isTrivialProp v.type then
+        throwError "test audit failure: {c} is a trivial theorem"
     for a in ← liftCoreM <| Lean.collectAxioms c do
       if a == ``sorryAx then throwError "test audit failure: {c} uses sorryAx"
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
@@ -817,6 +903,6 @@ run_cmd do
     if tNs.isPrefixOf c then checked := checked + 1
   unless checked ≥ 9 do
     throwError "test audit vacuous: only {checked} test declarations"
-  logInfo m!"wd constructive audit: {constructiveDecls.length} Episode 2 declarations in [propext, Quot.sound]; {checked} test declarations standard-axiom clean"
+  logInfo m!"wd constructive audit: {exhaustiveChoiceFree} DualSpec decls ({constructiveDecls.length} spotlighted) in [propext, Quot.sound]; {checked} test decls non-trivial & standard-axiom clean"
 
 end Anneal.Mir.WideDstAndMaybeUninitCorrespondenceTests
