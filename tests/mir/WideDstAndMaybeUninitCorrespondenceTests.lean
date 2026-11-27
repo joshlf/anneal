@@ -69,6 +69,8 @@ theorem d1_wide_slice_canaries :
     mrVerdict false 0 = some (.returns (.scalar 22)) ∧
     trustedVerdict true 1 = some (.returns (.sizeAlign 12 4)) ∧
     mrVerdict true 1 = some (.returns (.sizeAlign 12 4)) ∧
+    trustedVerdict false 2 = some (.returns (.sizeAlign 0 1)) ∧
+    mrVerdict false 2 = some (.returns (.sizeAlign 0 1)) ∧
     trustedVerdict false 3 = some (.returns (.sizeAlign 9223372036854775804 4)) ∧
     mrVerdict false 3 = some (.returns (.sizeAlign 9223372036854775804 4)) ∧
     trustedVerdict false 4 = some .undefinedBehavior ∧ mrVerdict false 4 = some .undefinedBehavior ∧
@@ -93,7 +95,9 @@ theorem d2_maybeuninit_canaries :
     mrVerdict false 8 = some (.returns (.uninitPreserved 4 0)) ∧
     trustedVerdict true 9 = some (.returns (.uninitPreserved 4 1)) ∧
     mrVerdict true 9 = some (.returns (.uninitPreserved 4 1)) ∧
+    trustedVerdict false 10 = some (.returns (.scalar 305419896)) ∧
     mrVerdict false 10 = some (.returns (.scalar 305419896)) ∧
+    trustedVerdict false 11 = some (.returns (.scalar 77)) ∧
     mrVerdict false 11 = some (.returns (.scalar 77)) ∧
     trustedVerdict false 12 = some .undefinedBehavior ∧ mrVerdict true 12 = some .undefinedBehavior ∧
     trustedVerdict true 13 = some .undefinedBehavior ∧ mrVerdict false 13 = some .undefinedBehavior ∧
@@ -118,8 +122,10 @@ dereferences are UB, and case `19` is mode-sensitive in BOTH Trusted and MiniRus
 theorem d3_offset_chain_canaries :
     trustedVerdict false 14 = some (.returns (.scalar 200)) ∧
     mrVerdict false 14 = some (.returns (.scalar 200)) ∧
+    trustedVerdict true 15 = some (.returns (.scalar 200)) ∧
     mrVerdict true 15 = some (.returns (.scalar 200)) ∧
     trustedVerdict false 16 = some .undefinedBehavior ∧ mrVerdict false 16 = some .undefinedBehavior ∧
+    trustedVerdict true 17 = some .undefinedBehavior ∧
     mrVerdict true 17 = some .undefinedBehavior ∧
     trustedVerdict true 18 = some (.returns (.scalar 100)) ∧
     mrVerdict true 18 = some (.returns (.scalar 100)) ∧
@@ -138,8 +144,10 @@ theorem d4_fnptr_minirust300_canaries :
     mrVerdict false 20 = some (.returns (.fnPtr 1)) ∧
     trustedVerdict false 21 = some .undefinedBehavior ∧ mrVerdict false 21 = some .undefinedBehavior ∧
     trustedVerdict true 22 = some .undefinedBehavior ∧
+    mrVerdict false 22 = some (.returns (.fnPtr 0)) ∧
     mrVerdict true 22 = some (.returns (.fnPtr 0)) ∧
     trustedVerdict false 23 = some (.returns (.fnPtr 0)) ∧
+    trustedVerdict true 23 = some (.returns (.fnPtr 0)) ∧
     mrVerdict true 23 = some (.returns (.fnPtr 0)) ∧
     mrVerdict false 22 ≠ trustedVerdict false 22 ∧ mrVerdict false 21 = trustedVerdict false 21 ∧
     wdClassOf 22 = .pinDelta ∧ wdClassOf 21 = .threeWay := by
@@ -321,6 +329,7 @@ run_cmd do
       added := added.push pn
     for thmName in [`threeWayNormalAgreement, `crossAuthorityFaultEquiv, `exactBehaviorEq_both,
                     `projectPositive, `projectFault, `modeSensitivity_present,
+                    `bundle_gate_pinDelta_and_dstBoundary,
                     `dual_exact_three_way_classification, `dual_mode_sensitivity_exact,
                     `dual_case19_mode_sensitivity, `dual_dst_honest_trusted_boundary,
                     `dual_minirust300_pin_delta_and_flip_ready,
@@ -330,16 +339,24 @@ run_cmd do
     addThmInfer (ns ++ `dual_fail_closed_out_of_range)
       (mkApp2 (mkConst (bNs ++ `dual_fail_closed_out_of_range)) authC hOob)
     added := added.push (ns ++ `dual_fail_closed_out_of_range)
+    -- 3-way Case 13 union-copy vs typed-read contrast (Trusted + MiniRust + LeanMiri).
+    let c13Name := ns ++ `dual_case13_three_way_copy_contrast
+    let c13Pf ← MetaM.run' <| mkAppM ``And.intro
+      #[mkConst (ns ++ `dual_case13_union_copy_vs_typed_read),
+        mkConst (lmNs ++ `lm_case13_union_copy_of_invalid_bool_byte_ok)]
+    addThmInfer c13Name c13Pf
+    added := added.push c13Name
     let capName := ns ++ `ep2_widedst_maybeuninit_dual_authority_capstone
     addThmInfer capName
       (mkApp3 (mkConst (bNs ++ `ep2_widedst_maybeuninit_dual_authority_capstone)) authC hA hOob)
     added := added.push capName
     -- The closed capstone conjoined with the Episode 1 LeanMiri capstones (step driver, universal
-    -- laws, tables): the root of the 3-engine reachability audit below.
+    -- laws, tables, Case 13 copy companion): the root of the 3-engine reachability audit below.
     let crossName := ns ++ `ep2_cross_root_three_engine_capstone
     let crossPf ← MetaM.run' do
       let parts : List Expr :=
         [ mkConst capName,
+          mkConst c13Name,
           mkConst (lmNs ++ `ep1_lean_miri_widedst_maybeuninit_capstone),
           mkConst (lmNs ++ `ep1_lean_miri_universal_laws_capstone),
           mkConst (lmNs ++ `ep1_lean_miri_step_driver_capstone),
@@ -354,13 +371,18 @@ run_cmd do
     addThmInfer crossName crossPf
     added := added.push crossName
 
-    -- 4. Definitional `Eq.refl` fixture locks over every shared fixture.
+    -- 4. Definitional `Eq.refl` fixture locks over EVERY shared definition in `section Fixtures`
+    -- (38 items: layouts, builders, and all 25 `CapturedMir` fixtures) plus
+    -- `mrWdCaseCount = lmWdCaseCount` (39 locks total).
     let fixtureNames : List Name :=
-      [ `wdCase0Mir, `wdCase1Mir, `wdCase2Mir, `wdCase2StrMir, `wdCase3Mir, `wdCase4Mir,
+      [ `wdU8Layout, `wdU32Layout, `wdUnitLayout, `wdMaybeUninitU32Layout, `wdBoolLayout,
+        `wdMaybeUninitBoolLayout, `wdManuallyDropU32Layout, `wdLayouts,
+        `wdFnAbi, `wdBody, `wdSizeAlignMir, `wdUnionCopyMir, `wdUnionReadMir,
+        `wdCase0Mir, `wdCase1Mir, `wdCase2Mir, `wdCase2StrMir, `wdCase3Mir, `wdCase4Mir,
         `wdCase5Mir, `wdCase6Mir, `wdCase7Mir, `wdCase8Mir, `wdCase9Mir, `wdCase10Mir,
         `wdCase11Mir, `wdCase12Mir, `wdCase13Mir, `wdCase13CopyMir, `wdCase14Mir, `wdCase15Mir,
         `wdCase16Mir, `wdCase17Mir, `wdCase18Mir, `wdCase19Mir, `wdCase20Mir, `wdCase21Mir,
-        `wdCase23Mir, `wdLayouts ]
+        `wdCase23Mir ]
     let mut lockCount : Nat := 0
     for tag in fixtureNames do
       let lhs := mkConst (mrNs ++ tag)
@@ -370,12 +392,17 @@ run_cmd do
       addThm lockName (mkEq ty lhs rhs) (mkRefl ty lhs)
       added := added.push lockName
       lockCount := lockCount + 1
-    unless lockCount = 26 do
-      throwError "cross-root: expected 26 fixture locks, got {lockCount}"
+    let countLockName := ns ++ `fixtureLock ++ `caseCount
+    addThm countLockName (mkEq natTy (mkConst (mrNs ++ `mrWdCaseCount)) (mkConst (lmNs ++ `lmWdCaseCount)))
+      (mkRefl natTy (mkConst (mrNs ++ `mrWdCaseCount)))
+    added := added.push countLockName
+    lockCount := lockCount + 1
+    unless lockCount = 39 do
+      throwError "cross-root: expected 39 fixture locks, got {lockCount}"
 
-    -- 5. Negative forgery controls on scratch environment copies: each forged declaration MUST be
-    -- rejected by the kernel; each honest twin (when present) MUST be accepted, so rejections are
-    -- caused by the forged content, not by an unevaluable term.
+    -- 5. Negative forgery controls on scratch environment copies: EVERY forged declaration MUST be
+    -- rejected by the kernel AND paired with an accepted honest twin (100% paired: `twins = rejected`),
+    -- proving rejections are caused by the forged content, never by an accidental type/name typo.
     let saved ← getEnv
     let accepts (d : Declaration) : CoreM Bool := do
       let r ← try addDecl d; pure true catch _ => pure false
@@ -398,6 +425,7 @@ run_cmd do
     let lmFn (n : Nat) : Expr := mkApp (lmObsC `okFnPtr) (mkNatLit n)
     let repTy ← MetaM.run' <| inferType (mkApp (mkConst (bNs ++ `wdEncode)) (mkApp (mkConst (bNs ++ `WdObs.scalar)) (mkNatLit 0)))
     let optObsTy := mkApp (mkConst ``Option [0]) obsTy
+    let noneObs := mkApp (mkConst ``Option.none [0]) obsTy
     let triple (a b c : Nat) : MetaM Expr := do
       mkAppM ``Prod.mk #[mkNatLit a, ← mkAppM ``Prod.mk #[mkNatLit b, mkNatLit c]]
     let scalarObs (n : Nat) := mkApp (mkConst (bNs ++ `WdObs.scalar)) (mkNatLit n)
@@ -415,76 +443,117 @@ run_cmd do
     let isFault (e : Expr) : Expr := mkApp2 (mkConst (cNs ++ `isFaultV)) obsTy e
     let mrVerd (tb : Bool) (i : Nat) : Expr :=
       mkApp2 (mkConst (bNs ++ `mrVerdict)) (toExpr tb) (mkNatLit i)
+    let trVerd (tb : Bool) (i : Nat) : Expr :=
+      mkApp2 (mkConst (bNs ++ `trustedVerdict)) (toExpr tb) (mkNatLit i)
     let capMirTy ← MetaM.run' <| inferType (mkConst (mrNs ++ `wdCase0Mir))
-    let forged : List (String × Declaration × Option Declaration) :=
+    let defD (n : Name) (ty val : Expr) : Declaration :=
+      .defnDecl { name := n, levelParams := [], type := ty, value := val,
+                  hints := .regular 0, safety := .safe }
+    let wdBundleTy := mkConst (bNs ++ `WdBundle)
+    let forged : List (String × Declaration × Declaration) :=
       [ ("ill-typed 0 = 1",
           thmD (ns ++ `forged.zeroEqOne) (mkEq natTy (mkNatLit 0) (mkNatLit 1)) (mkRefl natTy (mkNatLit 0)),
-          some (thmD (ns ++ `honest.zeroEqZero) (mkEq natTy (mkNatLit 0) (mkNatLit 0)) (mkRefl natTy (mkNatLit 0)))),
+          thmD (ns ++ `honest.zeroEqZero) (mkEq natTy (mkNatLit 0) (mkNatLit 0)) (mkRefl natTy (mkNatLit 0))),
         ("negated LM 48-cell certificate",
-          thmD (ns ++ `forged.lmTableFalse) (eqFalse (tblCheck authUC)) reflFalse, none),
+          thmD (ns ++ `forged.lmTableFalse) (eqFalse (tblCheck authUC)) reflFalse,
+          thmD (ns ++ `honest.lmTableTrue) (eqTrue (tblCheck authUC)) reflTrue),
         ("mode-inverted LM authority (Bool.not tb) certificate",
-          thmD (ns ++ `forged.modeInverted) (eqTrue (tblCheck invAuth)) reflTrue, none),
+          thmD (ns ++ `forged.modeInverted) (eqTrue (tblCheck invAuth)) reflTrue,
+          thmD (ns ++ `honest.modeInvertedFalse) (eqFalse (tblCheck invAuth)) reflFalse),
         ("ub/unsupported-swapped LM translation certificate",
-          thmD (ns ++ `forged.swappedTranslation) (eqTrue (tblCheck swapAuth)) reflTrue, none),
+          thmD (ns ++ `forged.swappedTranslation) (eqTrue (tblCheck swapAuth)) reflTrue,
+          thmD (ns ++ `honest.swappedTranslationFalse) (eqFalse (tblCheck swapAuth)) reflFalse),
+        ("forged DualCorrespondenceBundle from mode-inverted LM authority",
+          defD (ns ++ `forged.bundleModeInverted) wdBundleTy
+            (mkApp2 (mkConst (bNs ++ `bundleOf)) invAuth reflTrue),
+          defD (ns ++ `honest.bundleFromUnrolled) wdBundleTy
+            (mkApp2 (mkConst (bNs ++ `bundleOf)) authUC (mkConst tblUName))),
         ("swapped fixture lock (wdCase0Mir = wdCase5Mir)",
           thmD (ns ++ `forged.swappedFixture)
             (mkEq capMirTy (mkConst (mrNs ++ `wdCase0Mir)) (mkConst (lmNs ++ `wdCase5Mir)))
             (mkRefl capMirTy (mkConst (mrNs ++ `wdCase0Mir))),
-          some (thmD (ns ++ `honest.fixture5)
+          thmD (ns ++ `honest.fixture5)
             (mkEq capMirTy (mkConst (mrNs ++ `wdCase5Mir)) (mkConst (lmNs ++ `wdCase5Mir)))
-            (mkRefl capMirTy (mkConst (mrNs ++ `wdCase5Mir))))),
+            (mkRefl capMirTy (mkConst (mrNs ++ `wdCase5Mir)))),
         ("forged codec decode of non-zero padding (0,5,1)",
           thmD (ns ++ `forged.decodePadding) (mkEq optObsTy (decode t051) (someObs (scalarObs 5)))
             (mkRefl optObsTy (decode t051)),
-          some (thmD (ns ++ `honest.decodeCanonical) (mkEq optObsTy (decode t050) (someObs (scalarObs 5)))
-            (mkRefl optObsTy (decode t050)))),
+          thmD (ns ++ `honest.decodeCanonical) (mkEq optObsTy (decode t050) (someObs (scalarObs 5)))
+            (mkRefl optObsTy (decode t050))),
         ("forged codec decode of invalid wire tag 4",
           thmD (ns ++ `forged.decodeTag4) (mkEq optObsTy (decode t400) (someObs (scalarObs 0)))
-            (mkRefl optObsTy (decode t400)), none),
+            (mkRefl optObsTy (decode t400)),
+          thmD (ns ++ `honest.decodeTag4None) (mkEq optObsTy (decode t400) noneObs)
+            (mkRefl optObsTy (decode t400))),
         ("forged colliding codec encodings (scalar 0 = fnPtr 0)",
           thmD (ns ++ `forged.encodeCollision) (mkEq repTy (encode (scalarObs 0)) (encode (fnObs 0)))
             (mkRefl repTy (encode (scalarObs 0))),
-          some (thmD (ns ++ `honest.encodeFnPtr) (mkEq repTy (encode (fnObs 0)) t300)
-            (mkRefl repTy (encode (fnObs 0))))),
+          thmD (ns ++ `honest.encodeFnPtr) (mkEq repTy (encode (fnObs 0)) t300)
+            (mkRefl repTy (encode (fnObs 0)))),
         ("forged case 22: pinned d821c6e3 MiniRust rejects null FnPtr",
           thmD (ns ++ `forged.case22MrUb) (mkEq mrObsTy (mrObs false 22) (mrC `ub)) (mkRefl mrObsTy (mrObs false 22)),
-          some (thmD (ns ++ `honest.case22MrOk) (mkEq mrObsTy (mrObs false 22) (mrFn 0)) (mkRefl mrObsTy (mrObs false 22)))),
+          thmD (ns ++ `honest.case22MrOk) (mkEq mrObsTy (mrObs false 22) (mrFn 0)) (mkRefl mrObsTy (mrObs false 22))),
         ("forged case 22: LeanMiri follows the pinned MiniRust null FnPtr acceptance",
           thmD (ns ++ `forged.case22LmOk) (mkEq lmObsTy (lmObsU false 22) (lmFn 0)) (mkRefl lmObsTy (lmObsU false 22)),
-          some (thmD (ns ++ `honest.case22LmUb) (mkEq lmObsTy (lmObsU false 22) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU false 22)))),
+          thmD (ns ++ `honest.case22LmUb) (mkEq lmObsTy (lmObsU false 22) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU false 22))),
+        ("forged case 22: Trusted accepts null FnPtr",
+          thmD (ns ++ `forged.case22TrustedOk) (mkEq mrObsTy (trObs false 22) (mrFn 0)) (mkRefl mrObsTy (trObs false 22)),
+          thmD (ns ++ `honest.case22TrustedUb) (mkEq mrObsTy (trObs false 22) (mrC `ub)) (mkRefl mrObsTy (trObs false 22))),
         ("forged case 21: post-#300 checkPtrFnNonNull accepts null FnPtr",
           thmD (ns ++ `forged.case21MrOk) (mkEq mrObsTy (mrObs true 21) (mrFn 0)) (mkRefl mrObsTy (mrObs true 21)),
-          some (thmD (ns ++ `honest.case21MrUb) (mkEq mrObsTy (mrObs true 21) (mrC `ub)) (mkRefl mrObsTy (mrObs true 21)))),
+          thmD (ns ++ `honest.case21MrUb) (mkEq mrObsTy (mrObs true 21) (mrC `ub)) (mkRefl mrObsTy (mrObs true 21))),
         ("forged case 6: unmodified Trusted computes okSizeAlign 16 4",
           thmD (ns ++ `forged.case6TrustedOk)
             (mkEq mrObsTy (trObs false 6) (mkApp2 (mrC `okSizeAlign) (mkNatLit 16) (mkNatLit 4)))
             (mkRefl mrObsTy (trObs false 6)),
-          some (thmD (ns ++ `honest.case6TrustedUnsupported) (mkEq mrObsTy (trObs false 6) (mrC `unsupported))
-            (mkRefl mrObsTy (trObs false 6)))),
+          thmD (ns ++ `honest.case6TrustedUnsupported) (mkEq mrObsTy (trObs false 6) (mrC `unsupported))
+            (mkRefl mrObsTy (trObs false 6))),
+        ("forged case 7: unmodified Trusted computes okSizeAlign 16 8",
+          thmD (ns ++ `forged.case7TrustedOk)
+            (mkEq mrObsTy (trObs true 7) (mkApp2 (mrC `okSizeAlign) (mkNatLit 16) (mkNatLit 8)))
+            (mkRefl mrObsTy (trObs true 7)),
+          thmD (ns ++ `honest.case7TrustedUnsupported) (mkEq mrObsTy (trObs true 7) (mrC `unsupported))
+            (mkRefl mrObsTy (trObs true 7))),
+        ("forged case 19 mode invariance (Trusted basic = treeBorrows)",
+          thmD (ns ++ `forged.case19TrInvariant) (mkEq mrObsTy (trObs false 19) (trObs true 19))
+            (mkRefl mrObsTy (trObs false 19)),
+          thmD (ns ++ `honest.case19TrTbUb) (mkEq mrObsTy (trObs true 19) (mrC `ub)) (mkRefl mrObsTy (trObs true 19))),
         ("forged case 19 mode invariance (MiniRust basic = treeBorrows)",
           thmD (ns ++ `forged.case19MrInvariant) (mkEq mrObsTy (mrObs false 19) (mrObs true 19))
             (mkRefl mrObsTy (mrObs false 19)),
-          some (thmD (ns ++ `honest.case19MrTbUb) (mkEq mrObsTy (mrObs true 19) (mrC `ub)) (mkRefl mrObsTy (mrObs true 19)))),
+          thmD (ns ++ `honest.case19MrTbUb) (mkEq mrObsTy (mrObs true 19) (mrC `ub)) (mkRefl mrObsTy (mrObs true 19))),
         ("forged case 19 mode invariance (LeanMiri basic = treeBorrows)",
           thmD (ns ++ `forged.case19LmInvariant) (mkEq lmObsTy (lmObsU false 19) (lmObsU true 19))
             (mkRefl lmObsTy (lmObsU false 19)),
-          some (thmD (ns ++ `honest.case19LmTbUb) (mkEq lmObsTy (lmObsU true 19) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU true 19)))),
+          thmD (ns ++ `honest.case19LmTbUb) (mkEq lmObsTy (lmObsU true 19) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU true 19))),
+        ("forged case 12: Trusted accepts the uninit MaybeUninit<u32> typed read",
+          thmD (ns ++ `forged.case12TrAccepts) (eqTrue (isRet (trVerd false 12))) reflTrue,
+          thmD (ns ++ `honest.case12TrFaults) (eqTrue (isFault (trVerd false 12))) reflTrue),
         ("forged case 12: LeanMiri accepts the uninit MaybeUninit<u32> typed read",
           thmD (ns ++ `forged.case12LmAccepts) (eqTrue (isRet (lmVerd authUC false 12))) reflTrue,
-          some (thmD (ns ++ `honest.case12LmFaults) (eqTrue (isFault (lmVerd authUC false 12))) reflTrue)),
+          thmD (ns ++ `honest.case12LmFaults) (eqTrue (isFault (lmVerd authUC false 12))) reflTrue),
         ("forged case 12: MiniRust accepts the uninit MaybeUninit<u32> typed read",
           thmD (ns ++ `forged.case12MrAccepts) (eqTrue (isRet (mrVerd true 12))) reflTrue,
-          some (thmD (ns ++ `honest.case12MrFaults) (eqTrue (isFault (mrVerd true 12))) reflTrue)) ]
+          thmD (ns ++ `honest.case12MrFaults) (eqTrue (isFault (mrVerd true 12))) reflTrue),
+        ("forged case 13: MiniRust typed bool read succeeds like union copy",
+          thmD (ns ++ `forged.case13MrOk)
+            (mkEq mrObsTy (mrObs false 13) (mkApp2 (mrC `okUninitPreserved) (mkNatLit 1) (mkNatLit 1)))
+            (mkRefl mrObsTy (mrObs false 13)),
+          thmD (ns ++ `honest.case13MrUb) (mkEq mrObsTy (mrObs false 13) (mrC `ub)) (mkRefl mrObsTy (mrObs false 13))),
+        ("forged case 13: LeanMiri typed bool read succeeds like union copy",
+          thmD (ns ++ `forged.case13LmOk)
+            (mkEq lmObsTy (lmObsU false 13) (mkApp2 (lmObsC `okUninitPreserved) (mkNatLit 1) (mkNatLit 1)))
+            (mkRefl lmObsTy (lmObsU false 13)),
+          thmD (ns ++ `honest.case13LmUb) (mkEq lmObsTy (lmObsU false 13) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU false 13))) ]
     let mut rejected : Nat := 0
     let mut twins : Nat := 0
-    for (what, d, honest?) in forged do
+    for (what, d, h) in forged do
       if ← accepts d then
         throwError "cross-root negative control FAILED: kernel accepted {what}"
       rejected := rejected + 1
-      if let some h := honest? then
-        unless ← accepts h do
-          throwError "cross-root negative control VACUOUS: honest twin of {what} was rejected"
-        twins := twins + 1
+      unless ← accepts h do
+        throwError "cross-root negative control VACUOUS: honest twin of {what} was rejected"
+      twins := twins + 1
 
     -- 6. Axiom / non-triviality audit of every added declaration and required LM theorems.
     let env ← getEnv
@@ -551,14 +620,23 @@ run_cmd do
     let reqs : List (Name × List Name) :=
       [ (unifiedName,
           [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+            `Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
+            `Trusted.Rustc.V2026_06_01.MirSemantics.decodeTypedValueFromBytes,
+            `Trusted.Rustc.V2026_06_01.MirSemantics.intrinsicWidePointeeStep,
             `MiniRustSpec.WideDstAndMaybeUninitMR.mrTrustedWdObserve,
             `MiniRustSpec.WideDstAndMaybeUninitMR.mrWdObserve,
+            `MiniRustSpec.Interp.stepM,
             `MiniRustSpec.Interp.checkPtrM,
+            `MiniRustSpec.Interp.LayoutStrategy.compute_size_and_align,
+            `MiniRustSpec.Interp.ptrOffsetInboundsM,
             `LeanMiriSpec.WideDstAndMaybeUninitLM.lmWdObserve,
             `LeanMiriSpec.WideDstAndMaybeUninitLM.lmWdObserveU,
             `Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta,
             `Miri.Interpreter.ptrOffsetInbounds,
-            `Miri.Memory.Allocation.copy ]),
+            `Miri.Memory.Allocation.copy,
+            `Miri.Memory.InitMask.prepareCopy,
+            `Miri.Memory.Validity.checkScalar,
+            `Miri.Memory.Validity.checkPrimitive ]),
         (crossName,
           [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
             `Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge,
@@ -572,9 +650,13 @@ run_cmd do
             `Miri.Interpreter.Step.step,
             `Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta,
             `Miri.Interpreter.ptrOffsetInbounds,
+            `Miri.Interpreter.ValidityMachine.scalarMayBeNull,
+            `Miri.Memory.Validity.checkScalar,
+            `Miri.Memory.Validity.checkPrimitive,
             `Miri.Memory.Allocation.copy,
             `Miri.Memory.InitMask.prepareCopy,
             `LeanMiriSpec.WideDstAndMaybeUninitLM.lmWdObserve,
+            `LeanMiriSpec.WideDstAndMaybeUninitLM.lm_case13_union_copy_of_invalid_bool_byte_ok,
             `LeanMiriSpec.WideDstAndMaybeUninitLM.ep1_lean_miri_widedst_maybeuninit_capstone,
             `LeanMiriSpec.WideDstAndMaybeUninitLM.ep1_lean_miri_universal_laws_capstone,
             `LeanMiriSpec.WideDstAndMaybeUninitLM.ep1_lean_miri_step_driver_capstone ]) ]
@@ -592,10 +674,10 @@ run_cmd do
     { fileName := "<wd-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, twinCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 60 && bundleCount = 5 && lockCount = 26 && rejectedCount ≥ 10 &&
-      twinCount ≥ 8 do
+  unless addedCount ≥ 85 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 23 &&
+      twinCount = rejectedCount do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount}, twins={twinCount})"
-  logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount} honest twins accepted), reached Trusted+MiniRust+Miri, axioms {crAxioms}"
+  logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
 /-! ## §3. Constructive Purity, Axiom Audit, and Auditor Self-Tests -/
 
@@ -605,14 +687,18 @@ run_cmd do
   let bNs := `Anneal.Mir.WideDstAndMaybeUninitDualSpec
   let constructiveDecls : List Name :=
     [ `wdCodec, `wdEncode_decode_of_valid, `wdCodec_tight, `wdCodec_encode_injective,
-      `wdCodec_decode_injective_on_valid, `wdCodec_rejects_malformed, `lmTableCheckOf_sound,
-      `lmTableCheckOf_of_eq, `mrSide_check, `lmCheckOf_of_table, `bundleOf, `domainBundleOf,
+      `wdCodec_decode_injective_on_valid, `wdCodec_rejects_malformed, `wdModel, `wdAnnealEval,
+      `mrVerdict, `trustedVerdict, `lmTableCheckOf_sound, `lmTableCheckOf_of_eq,
+      `mrSide_check, `lmCheckOf_of_table, `bundleOfSel, `bundleOf, `domainBundleOf,
       `threeWayNormalAgreement, `crossAuthorityFaultEquiv, `exactBehaviorEq_both,
-      `projectPositive, `projectFault, `modeSensitivity_present, `domain_bundle_claims,
+      `projectPositive, `projectFault, `modeSensitivity_present,
+      `bundle_gate_pinDelta_and_dstBoundary, `domain_bundle_claims,
       `dual_exact_three_way_classification, `dual_fail_closed_out_of_range,
-      `dual_mode_sensitivity_exact, `dual_dst_honest_trusted_boundary,
-      `dual_minirust300_pin_delta_and_flip_ready, `dual_case13_union_copy_vs_typed_read,
-      `rootBackedLmAuthority_tableCheck ]
+      `dual_mode_sensitivity_exact, `dual_case19_mode_sensitivity,
+      `dual_dst_honest_trusted_boundary, `dual_minirust300_pin_delta_and_flip_ready,
+      `dual_case13_union_copy_vs_typed_read, `rootBackedLmAuthority,
+      `rootBackedLmAuthority_tableCheck, `rootBackedLmAuthority_failClosed,
+      `stepsM_eq_runToStopM, `stepsTB_eq_runToStopM ]
   let isChoiceFree (axs : Array Name) : Bool :=
     axs.all fun a => a == ``propext || a == ``Quot.sound
   for d in constructiveDecls do

@@ -561,14 +561,47 @@ theorem projectFault (A : WdLmAuthority) (hA : lmTableCheckOf A = true) :
     type_of% (bundleOf A hA).projectFault :=
   (bundleOf A hA).projectFault
 
-/-- Non-vacuous Tree Borrows mode-sensitivity witnesses (case `19`) on BOTH authorities of the
-unified bundle and of the `D3` bundle. -/
+/-- Non-vacuous Tree Borrows mode-sensitivity witnesses (case `19`, `basic` vs `treeBorrows`)
+carried directly by `(bundleOf A hA)` and `(domainBundleOf .d3 A hA)` on BOTH authorities,
+while sub-domains `D1`, `D2`, `D4` carry `none` (case `19` is the unique mode-sensitive case). -/
 theorem modeSensitivity_present (A : WdLmAuthority) (hA : lmTableCheckOf A = true) :
-    ((mrSide none).flipW wdModel (mrSide_check none)).isSome = true ∧
-    ((lmSideOf none A).flipW wdModel (lmCheckOf_of_table none A hA)).isSome = true ∧
-    ((mrSide (some .d3)).flipW wdModel (mrSide_check (some .d3))).isSome = true ∧
-    ((lmSideOf (some .d3) A).flipW wdModel (lmCheckOf_of_table (some .d3) A hA)).isSome = true := by
-  refine ⟨?_, ?_, ?_, ?_⟩ <;> (unfold Corpus.Side.flipW; rfl)
+    (∃ w, (bundleOf A hA).mrFlip.modeSensitivity? = some w ∧ w.m₁ = false ∧ w.m₂ = true ∧ w.p = 19) ∧
+    (∃ w, (bundleOf A hA).lmFlip.modeSensitivity? = some w ∧ w.m₁ = false ∧ w.m₂ = true ∧ w.p = 19) ∧
+    (∃ w, (domainBundleOf .d3 A hA).mrFlip.modeSensitivity? = some w ∧ w.m₁ = false ∧ w.m₂ = true ∧ w.p = 19) ∧
+    (∃ w, (domainBundleOf .d3 A hA).lmFlip.modeSensitivity? = some w ∧ w.m₁ = false ∧ w.m₂ = true ∧ w.p = 19) ∧
+    (domainBundleOf .d1 A hA).mrFlip.modeSensitivity? = none ∧
+    (domainBundleOf .d1 A hA).lmFlip.modeSensitivity? = none ∧
+    (domainBundleOf .d2 A hA).mrFlip.modeSensitivity? = none ∧
+    (domainBundleOf .d2 A hA).lmFlip.modeSensitivity? = none ∧
+    (domainBundleOf .d4 A hA).mrFlip.modeSensitivity? = none ∧
+    (domainBundleOf .d4 A hA).lmFlip.modeSensitivity? = none := by
+  refine ⟨?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl⟩
+
+/-- Exact support-gate encoding of the honest Trusted DST boundary (`6`, `7`: excluded from both
+`mrGate` and `lmGate`) and the `minirust#300` pin-delta (`22`: excluded from `mrGate` because
+pinned `d821c6e3` MiniRust diverges, yet included in `lmGate` with full `ExactBehaviorEq` on
+LeanMiri in both the unified and `D4` bundles). -/
+theorem bundle_gate_pinDelta_and_dstBoundary (A : WdLmAuthority) (hA : lmTableCheckOf A = true) :
+    mrGate none 6 = false ∧ lmGate none 6 = false ∧
+    mrGate none 7 = false ∧ lmGate none 7 = false ∧
+    mrGate (some .d1) 6 = false ∧ lmGate (some .d1) 6 = false ∧
+    mrGate (some .d1) 7 = false ∧ lmGate (some .d1) 7 = false ∧
+    mrGate none 22 = false ∧ lmGate none 22 = true ∧
+    mrGate (some .d4) 22 = false ∧ lmGate (some .d4) 22 = true ∧
+    (∀ mLM : Bool, ExactBehaviorEq (bundleOf A hA).lmRel mLM 22 () ∧
+      ExactBehaviorEq (domainBundleOf .d4 A hA).lmRel mLM 22 ()) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  intro mLM
+  exact ⟨(bundleOf A hA).lmSim.exactBehaviorEq_of_reverseTotal
+      ((lmSideOf none A).reverseTotal wdModel
+        (Bool.and_eq_true _ _ ▸ lmCheckOf_of_table none A hA).1) rfl,
+    (domainBundleOf .d4 A hA).lmSim.exactBehaviorEq_of_reverseTotal
+      ((lmSideOf (some .d4) A).reverseTotal wdModel
+        (Bool.and_eq_true _ _ ▸ lmCheckOf_of_table (some .d4) A hA).1) rfl⟩
 
 /-- Every per-domain bundle carries genuine correspondence / fault-equivalence claims and
 non-vacuous flip-direction guards (positive and fault witnesses) on BOTH authorities. -/
@@ -858,6 +891,7 @@ theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
     type_of% (bundleOf A hA).projectPositive ∧
     type_of% (bundleOf A hA).projectFault ∧
     type_of% (modeSensitivity_present A hA) ∧
+    type_of% (bundle_gate_pinDelta_and_dstBoundary A hA) ∧
     (∀ d, type_of% (domain_bundle_claims d A hA)) ∧
     (∀ tb idx (hi : idx < mrWdCaseCount), type_of% (dual_exact_three_way_classification A hA tb idx hi)) ∧
     (∀ tb idx (h : mrWdCaseCount ≤ idx), type_of% (dual_fail_closed_out_of_range A hOob tb idx h)) ∧
@@ -873,7 +907,8 @@ theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
   ⟨wdCodec_tight, wdCodec_rejects_malformed, mrSide_check, fun sel => lmCheckOf_of_table sel A hA,
    threeWayNormalAgreement A hA, crossAuthorityFaultEquiv A hA, exactBehaviorEq_both A hA,
    (bundleOf A hA).projectPositive, (bundleOf A hA).projectFault,
-   modeSensitivity_present A hA, fun d => domain_bundle_claims d A hA,
+   modeSensitivity_present A hA, bundle_gate_pinDelta_and_dstBoundary A hA,
+   fun d => domain_bundle_claims d A hA,
    dual_exact_three_way_classification A hA, dual_fail_closed_out_of_range A hOob,
    dual_mode_sensitivity_exact A hA, dual_case19_mode_sensitivity A hA,
    dual_dst_honest_trusted_boundary A hA, dual_minirust300_pin_delta_and_flip_ready A hA,
@@ -915,7 +950,9 @@ run_cmd do
       ns ++ `wdCodec_rejects_malformed, ns ++ `WdMode.of_toTb, ns ++ `WdMode.to_ofTb,
       ns ++ `allTbModes_complete, ns ++ `allWdCases_complete, ns ++ `wdVerdictOf,
       ns ++ `wdClassOf, ns ++ `wdDomainOf, ns ++ `lmTableCheckOf, ns ++ `lmTableCheckOf_sound,
-      ns ++ `lmTableCheckOf_of_eq, ns ++ `wdModelOf, ns ++ `sideOf, ns ++ `mrSide,
+      ns ++ `lmTableCheckOf_of_eq, ns ++ `wdModelOf, ns ++ `wdModel, ns ++ `wdAnnealEval,
+      ns ++ `wdExpectedAnnealEval, ns ++ `mrVerdict, ns ++ `trustedVerdict,
+      ns ++ `mrVerdictFn, ns ++ `lmVerdictFn, ns ++ `sideOf, ns ++ `mrSide,
       ns ++ `lmSideOf, ns ++ `lmCheckOf, ns ++ `bundleOfSel,
       ns ++ `range_map_getD, ns ++ `trustedTable_eq, ns ++ `mrTable_eq,
       ns ++ `trustedVerdict_cell, ns ++ `mrVerdict_cell, ns ++ `trustedVerdict_out_of_range,
@@ -924,17 +961,29 @@ run_cmd do
       ns ++ `domainBundleOf, ns ++ `mrGate_of_threeWay, ns ++ `lmGate_of_threeWay,
       ns ++ `threeWayNormalAgreement, ns ++ `crossAuthorityFaultEquiv, ns ++ `exactBehaviorEq_both,
       ns ++ `projectPositive, ns ++ `projectFault, ns ++ `modeSensitivity_present,
+      ns ++ `bundle_gate_pinDelta_and_dstBoundary,
       ns ++ `domain_bundle_claims, ns ++ `dual_exact_three_way_classification,
       ns ++ `dual_fail_closed_out_of_range, ns ++ `dual_mode_sensitivity_exact,
       ns ++ `dual_case19_mode_sensitivity, ns ++ `dual_dst_honest_trusted_boundary,
       ns ++ `dual_minirust300_pin_delta_and_flip_ready, ns ++ `dual_case13_union_copy_vs_typed_read,
-      ns ++ `rootBackedLmAuthority_tableCheck, ns ++ `rootBackedLmAuthority_failClosed,
+      ns ++ `rootBackedLmAuthority, ns ++ `rootBackedLmAuthority_tableCheck,
+      ns ++ `rootBackedLmAuthority_failClosed,
       ns ++ `stopProj, ns ++ `stepsM_eq_runToStopM, ns ++ `stepsTB_eq_runToStopM ]
   for c in constructiveDecls do
     unless env.contains c do throwError "constructive audit: {c} missing"
     for a in ← liftCoreM <| Lean.collectAxioms c do
       unless a == ``propext || a == ``Quot.sound do
         throwError "constructive decl {c} must not depend on {a}"
+  -- Auditor self-tests: confirm Classical.choice, sorryAx, and Lean.ofReduceBool are caught.
+  if (← liftCoreM <| Lean.collectAxioms ``Classical.em).all
+      (fun a => a == ``propext || a == ``Quot.sound) then
+    throwError "constructive audit self-test failed: Classical.em not caught"
+  if (← liftCoreM <| Lean.collectAxioms ``sorryAx).all
+      (fun a => a == ``propext || a == ``Quot.sound || a == ``Classical.choice) then
+    throwError "axiom audit self-test failed: sorryAx not caught"
+  if (← liftCoreM <| Lean.collectAxioms ``Lean.ofReduceBool).all
+      (fun a => a == ``propext || a == ``Quot.sound || a == ``Classical.choice) then
+    throwError "axiom audit self-test failed: Lean.ofReduceBool not caught"
   -- 4. Zero shadow evaluators: the bundles / capstone reach the REAL interpreters.
   let reachFrom (root : Lean.Name) : NameSet := Id.run do
     let mut seen : NameSet := {}
