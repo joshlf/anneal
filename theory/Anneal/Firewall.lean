@@ -36,12 +36,13 @@ Three complementary mechanisms are provided:
    expanded `Prop` expression out of the outer goal signature.
 
 3. **Goal-Directed `ite` Branch Eliminators (`ite_*_imp`, `ite_eq_*_imp`):**
-   Elaborating an applied hypothesis `have h' := elim h` (or `rw [...] at h`)
-   when `h : if P then T else F` forces Lean's elaborator to put `h`'s type in
-   WHNF, evaluating expensive symbolic guards `P` (e.g., `15s+` on nested type
-   normalization or `checkVal` evaluators). Using `revert h; refine
-   ite_absurd_left_imp ... ?_; intro h` unifies `@ite` structurally against the
-   goal without reducing `P`.
+   Applying an eliminator to a hypothesis `h : if P then T else F` (as in
+   `have h' := elim h`) makes the elaborator unify `h`'s type with the
+   eliminator's premise, which can put it in weak head normal form and
+   evaluate an expensive guard `P`. Reverting `h` and refining the goal
+   `(if P then T else F) → G` with one of these eliminators instead matches
+   `@ite` structurally and leaves `P` unreduced. Each eliminator is a term-mode
+   `Decidable.casesOn` on the guard's `Decidable` instance.
 -/
 
 namespace Anneal.Firewall
@@ -117,58 +118,71 @@ theorem finish_cut {σ : Type u} {cutAt : Nat → σ → Prop}
     (hCut : IndexedCut cutAt stage st) : post :=
   hDone hCut.runCut
 
-/-! ## 3. Goal-Directed `ite` Branch Eliminators (No Guard WHNF Reduction) -/
+/-! ## 3. Goal-Directed `ite` Branch Eliminators -/
 
-/-- Goal-directed case split on `@ite Prop P inst T F` in the goal head. Use via
-`revert h; refine ite_elim_imp ?_ ?_` when `P` is expensive to reduce so Lean
-matches `@ite` structurally without forcing WHNF on `P`. -/
+/-- Case split on `@ite Prop P inst T F` at the head of the goal. Use it as
+`revert h; refine ite_elim_imp ?_ ?_` when `P` is expensive to reduce, so Lean
+matches `@ite` structurally without putting `P` in weak head normal form. -/
 theorem ite_elim_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
     (hT : P → T → G) (hF : ¬ P → F → G) : @ite Prop P inst T F → G :=
   @Decidable.casesOn P (fun d => @ite Prop P d T F → G) inst hF hT
 
+/-- Eliminate `@ite Prop P inst T F → G` through the `then` branch, given a
+proof of the guard `P`. -/
 theorem ite_true_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
     (hP : P) (hT : T → G) : @ite Prop P inst T F → G :=
   ite_elim_imp (fun _ h => hT h) (fun hNP _ => False.elim (hNP hP))
 
+/-- Eliminate `@ite Prop P inst T F → G` through the `else` branch, given a
+proof of `¬ P`. -/
 theorem ite_false_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
     (hNP : ¬ P) (hF : F → G) : @ite Prop P inst T F → G :=
   ite_elim_imp (fun hP _ => False.elim (hNP hP)) (fun _ h => hF h)
 
-/-- Eliminate `@ite Prop P inst T F → G` when the `then`-branch `T` is absurd,
+/-- Eliminate `@ite Prop P inst T F → G` when the `then` branch `T` is absurd,
 without reducing the guard `P`. -/
 theorem ite_absurd_left_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
     (hAbs : T → False) (hF : F → G) : @ite Prop P inst T F → G :=
   ite_elim_imp (fun _ h => False.elim (hAbs h)) (fun _ h => hF h)
 
-/-- Eliminate `@ite Prop P inst T F → G` when the `else`-branch `F` is absurd,
+/-- Eliminate `@ite Prop P inst T F → G` when the `else` branch `F` is absurd,
 without reducing the guard `P`. -/
 theorem ite_absurd_right_imp {P : Prop} {inst : Decidable P} {T F G : Prop}
     (hT : T → G) (hAbs : F → False) : @ite Prop P inst T F → G :=
   ite_elim_imp (fun _ h => hT h) (fun _ h => False.elim (hAbs h))
 
 /-- Value-level counterpart of `ite_elim_imp` for `@ite α P inst t f = r → G`,
-useful for `Except` / `StepResult` / `Option` branch hypotheses. -/
+for branch hypotheses over values such as `Except`, `Option`, or step
+results. -/
 theorem ite_eq_elim_imp {α : Type u} {P : Prop} {inst : Decidable P}
     {t f r : α} {G : Prop}
     (hT : P → t = r → G) (hF : ¬ P → f = r → G) :
     @ite α P inst t f = r → G :=
   @Decidable.casesOn P (fun d => @ite α P d t f = r → G) inst hF hT
 
+/-- Eliminate `@ite α P inst t f = r → G` through the `then` branch, given a
+proof of the guard `P`. -/
 theorem ite_eq_true_imp {α : Type u} {P : Prop} {inst : Decidable P}
     {t f r : α} {G : Prop} (hP : P) (hT : t = r → G) :
     @ite α P inst t f = r → G :=
   ite_eq_elim_imp (fun _ h => hT h) (fun hNP _ => False.elim (hNP hP))
 
+/-- Eliminate `@ite α P inst t f = r → G` through the `else` branch, given a
+proof of `¬ P`. -/
 theorem ite_eq_false_imp {α : Type u} {P : Prop} {inst : Decidable P}
     {t f r : α} {G : Prop} (hNP : ¬ P) (hF : f = r → G) :
     @ite α P inst t f = r → G :=
   ite_eq_elim_imp (fun hP _ => False.elim (hNP hP)) (fun _ h => hF h)
 
+/-- Eliminate `@ite α P inst t f = r → G` when `t ≠ r`, so only the `else`
+branch can hold, without reducing the guard `P`. -/
 theorem ite_eq_absurd_left_imp {α : Type u} {P : Prop} {inst : Decidable P}
     {t f r : α} {G : Prop} (hNe : t ≠ r) (hF : f = r → G) :
     @ite α P inst t f = r → G :=
   ite_eq_elim_imp (fun _ h => False.elim (hNe h)) (fun _ h => hF h)
 
+/-- Eliminate `@ite α P inst t f = r → G` when `f ≠ r`, so only the `then`
+branch can hold, without reducing the guard `P`. -/
 theorem ite_eq_absurd_right_imp {α : Type u} {P : Prop} {inst : Decidable P}
     {t f r : α} {G : Prop} (hT : t = r → G) (hNe : f ≠ r) :
     @ite α P inst t f = r → G :=
@@ -235,28 +249,107 @@ theorem canary_irreducible_indexed_cut {st : Nat} (h : st = 0) : st = 0 :=
   let _opened : sampleIrrCut 0 st := open_cut h0
   finish_cut sampleIrrCut_done h0
 
-/-- Exercise `ite_absurd_left_imp`, `ite_absurd_right_imp`,
-`ite_eq_absurd_left_imp`, and `ite_eq_absurd_right_imp` via goal-directed
-`refine` without reducing an abstract guard `P`. -/
-theorem canary_ite_branch_eliminators {P : Prop} [Decidable P] {G : Prop}
-    (hTrueG : true = true → G)
-    (h1 : if P then False else G)
-    (h2 : if P then G else False)
-    (h3 : (if P then false else true) = true)
-    (h4 : (if P then true else false) = true) :
-    G ∧ G ∧ G ∧ G := by
-  have g1 : G := by
-    revert h1
-    refine ite_absurd_left_imp (fun hf => hf) (fun hg => hg)
-  have g2 : G := by
-    revert h2
-    refine ite_absurd_right_imp (fun hg => hg) (fun hf => hf)
-  have g3 : G := by
-    revert h3
-    refine ite_eq_absurd_left_imp Bool.noConfusion hTrueG
-  have g4 : G := by
-    revert h4
-    refine ite_eq_absurd_right_imp hTrueG Bool.noConfusion
-  exact ⟨g1, g2, g3, g4⟩
+/-- Guard for the `ite` canaries. It is marked `@[irreducible]` below, so the
+elaborator cannot unfold it while checking them. It is public because the
+canary statements mention it. -/
+def iteCanaryGuard (n : Nat) : Prop := n = 0
+
+/-- `Decidable` instance for `iteCanaryGuard`, passed to `@ite` explicitly. -/
+def iteCanaryGuardDec (n : Nat) : Decidable (iteCanaryGuard n) :=
+  Nat.decEq n 0
+
+attribute [irreducible] iteCanaryGuard
+
+/-- Exercise `ite_elim_imp` through the goal-directed
+`revert h; refine ... ?_; intro h` pattern on the irreducible
+`iteCanaryGuard`. -/
+theorem canary_ite_elim_imp {n : Nat} {T F : Prop}
+    (h : @ite Prop (iteCanaryGuard n) (iteCanaryGuardDec n) T F) :
+    (iteCanaryGuard n ∧ T) ∨ (¬ iteCanaryGuard n ∧ F) := by
+  revert h
+  refine ite_elim_imp (fun hP hT => Or.inl ⟨hP, hT⟩) ?_
+  intro hNP hF
+  exact Or.inr ⟨hNP, hF⟩
+
+/-- Exercise `ite_true_imp` on the irreducible `iteCanaryGuard`. -/
+theorem canary_ite_true_imp {n : Nat} {T F : Prop} (hP : iteCanaryGuard n)
+    (h : @ite Prop (iteCanaryGuard n) (iteCanaryGuardDec n) T F) : T := by
+  revert h
+  refine ite_true_imp hP ?_
+  intro hT
+  exact hT
+
+/-- Exercise `ite_false_imp` on the irreducible `iteCanaryGuard`. -/
+theorem canary_ite_false_imp {n : Nat} {T F : Prop} (hNP : ¬ iteCanaryGuard n)
+    (h : @ite Prop (iteCanaryGuard n) (iteCanaryGuardDec n) T F) : F := by
+  revert h
+  refine ite_false_imp hNP ?_
+  intro hF
+  exact hF
+
+/-- Exercise `ite_absurd_left_imp` on the irreducible `iteCanaryGuard`. -/
+theorem canary_ite_absurd_left_imp {n : Nat} {Q : Prop}
+    (h : @ite Prop (iteCanaryGuard n) (iteCanaryGuardDec n) False Q) : Q := by
+  revert h
+  refine ite_absurd_left_imp (fun hAbs => hAbs) ?_
+  intro hQ
+  exact hQ
+
+/-- Exercise `ite_absurd_right_imp` on the irreducible `iteCanaryGuard`. -/
+theorem canary_ite_absurd_right_imp {n : Nat} {Q : Prop}
+    (h : @ite Prop (iteCanaryGuard n) (iteCanaryGuardDec n) Q False) : Q := by
+  revert h
+  refine ite_absurd_right_imp ?_ (fun hAbs => hAbs)
+  intro hQ
+  exact hQ
+
+/-- Exercise `ite_eq_elim_imp` on the irreducible `iteCanaryGuard`: a value
+`ite` that evaluates to its `else` value `1` refutes the guard. -/
+theorem canary_ite_eq_elim_imp {n : Nat}
+    (h : @ite Nat (iteCanaryGuard n) (iteCanaryGuardDec n) 0 1 = 1) :
+    ¬ iteCanaryGuard n := by
+  have h01 : (0 : Nat) ≠ 1 := by decide
+  revert h
+  refine ite_eq_elim_imp (fun _ h => False.elim (h01 h)) ?_
+  intro hNP _
+  exact hNP
+
+/-- Exercise `ite_eq_true_imp` on the irreducible `iteCanaryGuard`. -/
+theorem canary_ite_eq_true_imp {n m r : Nat} (hP : iteCanaryGuard n)
+    (h : @ite Nat (iteCanaryGuard n) (iteCanaryGuardDec n) m 1 = r) :
+    m = r := by
+  revert h
+  refine ite_eq_true_imp hP ?_
+  intro hm
+  exact hm
+
+/-- Exercise `ite_eq_false_imp` on the irreducible `iteCanaryGuard`. -/
+theorem canary_ite_eq_false_imp {n m r : Nat} (hNP : ¬ iteCanaryGuard n)
+    (h : @ite Nat (iteCanaryGuard n) (iteCanaryGuardDec n) 0 m = r) :
+    m = r := by
+  revert h
+  refine ite_eq_false_imp hNP ?_
+  intro hm
+  exact hm
+
+/-- Exercise `ite_eq_absurd_left_imp` on the irreducible `iteCanaryGuard`. -/
+theorem canary_ite_eq_absurd_left_imp {n m : Nat}
+    (h : @ite Nat (iteCanaryGuard n) (iteCanaryGuardDec n) 0 m = 1) :
+    m = 1 := by
+  have h01 : (0 : Nat) ≠ 1 := by decide
+  revert h
+  refine ite_eq_absurd_left_imp h01 ?_
+  intro hm
+  exact hm
+
+/-- Exercise `ite_eq_absurd_right_imp` on the irreducible `iteCanaryGuard`. -/
+theorem canary_ite_eq_absurd_right_imp {n m : Nat}
+    (h : @ite Nat (iteCanaryGuard n) (iteCanaryGuardDec n) m 0 = 1) :
+    m = 1 := by
+  have h01 : (0 : Nat) ≠ 1 := by decide
+  revert h
+  refine ite_eq_absurd_right_imp ?_ h01
+  intro hm
+  exact hm
 
 end Anneal.Firewall
