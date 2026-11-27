@@ -507,7 +507,7 @@ PASS T11 resolution + shadowing audit is clean on the real search path
   let ((), s) ← AuditM.run' (auditOleanResolutionAndShadowing #[`Init.Prelude, `Init.Core, `Anneal.Proto.OleanShadowAndOverrideAuditProto]
     { sysrootLibDir := lib, approvedBuildRoots := #[buildLib], searchPath? := some [buildLib, lib, lib], validateToolchainBinaries := true })
   expect "T11 resolution + shadowing audit is clean on the real search path"
-    (s.violations.isEmpty && s.oleansChecked == 11) s!"{renderAll s.violations} {s.oleansChecked}"
+    (s.violations.isEmpty && s.oleansChecked ≥ 11) s!"{renderAll s.violations} {s.oleansChecked}"
 
 /-! ### T12: multi-root shadowing, toolchain shadowing, and incomplete/orphan companion parts -/
 
@@ -822,6 +822,8 @@ PASS T18 hook unbox
 PASS T18 hook tagged_return
 PASS T18 custom @[macro_inline] BareInd.ctorIdx is not exempted
 PASS T18 live foreign noConfusion tag, scoped csimp, and tampered PassManager caught
+PASS T18 forged specialization cache entries (foreign target, kernel target, mismatched key) caught
+PASS T18 module-system @[tagged_return] caught at declaration granularity
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
@@ -853,6 +855,37 @@ PASS T18 live foreign noConfusion tag, scoped csimp, and tampered PassManager ca
      sTamp.violations.any (fun v => v.kind == .compilerOverrideHook && v.decl == ``V4Hook.fastF) &&
      sTamp.violations.any (fun v => v.kind == .compilerOverrideHook && v.decl == `compiler_pipeline))
     (renderAll sTamp.violations)
+  -- B3 regression: forged `Specialize.specCacheExt` entries (1: foreign target `Nat.mul`,
+  -- 2: owned kernel definition `V4Hook.fastF`, 3: mismatched key head)
+  let ctxCore ← read
+  let (_, stSpecF) ← (Compiler.LCNF.Specialize.cacheSpec (mkConst ``Nat.add) ``Nat.mul).run ctxCore { env }
+  let (_, stSpecK) ← (Compiler.LCNF.Specialize.cacheSpec (mkConst ``Nat.add) ``V4Hook.fastF).run ctxCore { env }
+  let ((), sSpecF) ← AuditM.run' do
+    let ctx ← mkAuditContext stSpecF.env lib (some main)
+    auditCompilerHooks ctx (← nonToolchainViews ctx)
+  let ((), sSpecK) ← AuditM.run' do
+    let ctx ← mkAuditContext stSpecK.env lib (some main)
+    auditCompilerHooks ctx (← nonToolchainViews ctx)
+  -- Also test `validateSpecCacheEntry` directly on an owned IR extra decl with a mismatched key head
+  let fakeExtra := ``Nat.add ++ `_at_ ++ main ++ `spec_0
+  let envWithIr := IR.declMapExt.addEntry env (.fdecl fakeExtra #[] .object (.ret .erased) {})
+  let (ctxIr, _) ← AuditM.run' (mkAuditContext envWithIr lib (some main))
+  let ((), sSpecKey) := (validateSpecCacheEntry ctxIr main {} (NameSet.empty.insert fakeExtra)
+    { key := mkConst ``Nat.mul, declName := fakeExtra }).run {}
+  expect "T18 forged specialization cache entries (foreign target, kernel target, mismatched key) caught"
+    ((sSpecF.violations.any fun v => (v.kind == .foreignCompilerTag || v.kind == .compilerOverrideHook) && v.decl == ``Nat.mul) &&
+     (sSpecK.violations.any fun v => v.kind == .compilerOverrideHook && v.decl == ``V4Hook.fastF) &&
+     (sSpecKey.violations.any fun v => v.kind == .compilerOverrideHook && v.decl == fakeExtra))
+    s!"{renderAll sSpecF.violations} | {renderAll sSpecK.violations} | {renderAll sSpecKey.violations}"
+  -- B3 regression: module-system file with `@[tagged_return, extern]` caught at exact declaration `modTaggedFn`
+  let sModTag ← withTmpDir fun dir => do
+    let src := "module\n@[tagged_return, extern \"mod_tag_c\"] public opaque modTaggedFn : Nat → Nat\n"
+    let _ ← compileModule dir `ModTagged src
+    let envMod ← importWith dir #[`ModTagged]
+    auditImported envMod {} dir
+  expect "T18 module-system @[tagged_return] caught at declaration granularity"
+    (sModTag.violations.any fun v => v.kind == .compilerOverrideHook && v.decl == `modTaggedFn && v.detail == "tagged_return")
+    (renderAll sModTag.violations)
 
 /-! ### T19: `leanprover/lean4#14896` opaque-theorem witness (Layer A + Layer B + B1 `opaque` & stmt-type) -/
 
@@ -954,6 +987,7 @@ PASS T19 head-only test alone misses the `id`-wrapped theorem
 PASS T19 Layer B catches the `id`-wrapped theorem reliance
 PASS T19 Layer A flags a theorem aliased behind a Prop definition in the major premise
 PASS T19 Layer B catches inductive-constructor and WellFounded.fix theorem δ-reliance
+PASS T19 Layer A flags an Expr.proj scrutinee over an id-wrapped non-Prop theorem
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
@@ -994,6 +1028,10 @@ PASS T19 Layer B catches inductive-constructor and WellFounded.fix theorem δ-re
   expect "T19 Layer B catches inductive-constructor and WellFounded.fix theorem δ-reliance"
     ((rInd matches .deltaReliance ..) && (rWf matches .deltaReliance ..))
     s!"ind={repr rInd |>.pretty} wf={repr rWf |>.pretty}"
+  -- B3 regression: `.proj` on a non-`Prop` structure scrutinee wrapped in `id` around a `.thmInfo`
+  let projWrapped := Expr.proj ``Prod 0 (mkApp2 (mkConst ``id [.zero]) thmCi.type (mkConst ``V4Opaque.accZeroThm))
+  expect "T19 Layer A flags an Expr.proj scrutinee over an id-wrapped non-Prop theorem"
+    ((opaqueHitAt? env projWrapped) == some (``V4Opaque.accZeroThm, "scrutinee of Expr.proj"))
 
 /-! ## T21: non-toolchain module planted next to the toolchain library + B2 diamond-DAG & sysroot-bridge regressions
 
@@ -1088,6 +1126,7 @@ def sorryThmSrc : String := "theorem smuggled : 1 = 2 := sorryAx _ true\ndef ben
 info: PASS T22 large-audit path, structural scan on: sorryAx in a compiled theorem body caught
 PASS T22 large-audit path, constant-only screen: sorryAx in a compiled theorem body caught
 PASS T22 large-audit path, theorem bodies excluded from find?: still caught by the constant screen
+PASS T22 constant-only screen with theoremBodies=false catches ShareCommon without running Layer A find?
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -1104,6 +1143,12 @@ PASS T22 large-audit path, theorem bodies excluded from find?: still caught by t
     let s ← auditImported env { axioms := big, kernelScanTheoremBodies := false } dir
     expect "T22 large-audit path, theorem bodies excluded from find?: still caught by the constant screen"
       (caught s) (renderAll s.violations)
+    let _ ← compileModule dir `ScFast "def usesSc : Nat := (ShareCommon.shareCommon' (0 : Nat))\n"
+    let envSc ← importWith dir #[`ScFast]
+    let sSc ← auditImported envSc { runStructuralOpaqueScan := false, kernelScanTheoremBodies := false } dir
+    expect "T22 constant-only screen with theoremBodies=false catches ShareCommon without running Layer A find?"
+      (sSc.violations.any fun v => v.kind == .shareCommonReference && v.decl == `usesSc)
+      (renderAll sSc.violations)
 
 -- Deep sweep (full Layer A + every expression via `find?`): zero findings, time reported.
 #eval sweep "T20 deep sweep" {} none

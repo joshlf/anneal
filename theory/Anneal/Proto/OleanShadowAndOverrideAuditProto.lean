@@ -1,4 +1,9 @@
-import Lean
+module
+
+public import Lean
+import all Lean.Compiler.LCNF.Specialize
+import all Lean.AuxRecursor
+import all Lean.Compiler.LCNF.ToImpure
 
 /-!
 # Prototype: `.olean` private-name, unreferenced-axiom, shadowing, and compiler-override audits
@@ -24,9 +29,10 @@ gaps in the compiled-environment auditors, pinned to Lean 4.34.1:
 4. **Vector 4 — `Init.ShareCommon` (`leanprover/lean4#16779`), compiler-override hooks
    (`google/zerocopy#4321`), and opaque-theorem readiness (`leanprover/lean4#14896`).**
    `auditShareCommon` (unconditionally scanning proof bodies, LCNF, and IR), `auditCompilerHooks`
-   (covering `.olean`, `.ir`, and live `stateStack`/`scopedEntries`/pipeline state), the structural
-   scanner `scanOpaqueTheoremReliance`, and the kernel replay oracle `checkOpaqueTheoremReplay`
-   (supporting theorems, definitions, mutual blocks, and `opaque` declarations).
+   (covering `.olean`, `.ir`, live `stateStack`/`scopedEntries`/pipeline state, and typed
+   `specCacheExt` / `taggedReturnAttr` / `sparseCasesOnExt`), the structural scanner
+   `scanOpaqueTheoremReliance`, and the kernel replay oracle `checkOpaqueTheoremReplay`
+   (supporting theorems, definitions, mutual blocks, `opaque`, and inductive declarations).
 
 `runAllFourVectorAudits` runs all of them over one environment.
 
@@ -42,6 +48,8 @@ regular, symlink-free file inside the canonical sysroot library directory.
 open Lean
 
 namespace Anneal.Proto.OleanShadowAndOverrideAuditProto
+
+public section
 
 /-! ## Shared result types -/
 
@@ -490,7 +498,8 @@ def isRealizedAuxComponent : NamePart → Bool
   | .str s =>
     hasNumSuffix s "eq_" || hasNumSuffix s "match_" || hasNumSuffix s "proof_" ||
     hasNumSuffix s "congr_eq_" || hasIndexedSuffix s "_sparseCasesOn_" ||
-    hasNumSuffix s "_closed_" || hasIndexedSuffix s "_lam_" || hasIndexedSuffix s "_lambda_" ||
+    hasNumSuffix s "_closed_" || hasNumSuffix s "_boxed_const_" ||
+    hasIndexedSuffix s "_lam_" || hasIndexedSuffix s "_lambda_" ||
     hasIndexedSuffix s "_elam_" || hasIndexedSuffix s "_jp_" || hasIndexedSuffix s "_rec_" ||
     ["eq_def", "eq_unfold", "congr_simp", "splitter", "induct", "induct_unfolding",
      "fun_cases", "fun_cases_unfolding", "_redArg", "_boxed", "_unfold", "_sunfold",
@@ -712,6 +721,14 @@ def auditPrivateNames (ctx : AuditContext) (views : Array ModuleView) : AuditM U
         checkExtensionRefName ctx m n true
       for (n, _) in noConfusionExt.getModuleEntries env i ++ noConfusionExt.getModuleIREntries env i do
         checkExtensionRefName ctx m n true
+      for n in sparseCasesOnExt.getModuleEntries env i ++ sparseCasesOnExt.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+      for n in Compiler.LCNF.taggedReturnAttr.ext.getModuleEntries env i ++
+          Compiler.LCNF.taggedReturnAttr.ext.getModuleIREntries env i do
+        checkExtensionRefName ctx m n true
+      for se in Compiler.LCNF.Specialize.specCacheExt.getModuleEntries env i ++
+          Compiler.LCNF.Specialize.specCacheExt.getModuleIREntries env i do
+        checkExtensionRefName ctx m se.declName true
       for sig in Compiler.LCNF.impureSigExt.getModuleEntries env i ++ Compiler.LCNF.impureSigExt.getModuleIREntries env i do
         checkExtensionRefName ctx m sig.name true
       for (dn, _) in Compiler.LCNF.UnreachableBranches.functionSummariesExt.getModuleEntries env i ++
@@ -740,7 +757,11 @@ def auditPrivateNames (ctx : AuditContext) (views : Array ModuleView) : AuditM U
       for n in auxRecExt.getEntries env do
         if (origin? env n).isNone then checkExtensionRefName ctx lm n true
       for (n, _) in (noConfusionExt.getState env).toList do
-        if (origin? env n).isNone then checkExtensionRefName ctx lm n true : PureAuditM Unit).run {}
+        if (origin? env n).isNone then checkExtensionRefName ctx lm n true
+      for n in sparseCasesOnExt.getEntries env do
+        if (origin? env n).isNone then checkExtensionRefName ctx lm n true
+      for (_, dn) in (Compiler.LCNF.Specialize.specCacheExt.getState env).toList do
+        checkExtensionRefName ctx lm dn true : PureAuditM Unit).run {}
     absorb s
   -- Kernel stage-2 constants not covered by `map₁` (defense against direct kernel injection).
   let nonToolSet : NameSet := views.foldl (fun acc v => acc.insert v.module) {}
@@ -1692,11 +1713,48 @@ def passManagerFingerprint (pm : Compiler.LCNF.PassManager) :
 def builtinFolderKeySet : NameSet :=
   Compiler.LCNF.Simp.ConstantFold.builtinFolders.toList.foldl (fun s (k, _) => s.insert k) {}
 
-/-- Vector 4b per-module view: typed `.olean` and `.ir` entries, generic per-extension entry counts
-(covering private extensions like `tagged_return` and `sparseCasesOnExt`), live local state, and
-foreign/forged compiler-intrinsic tags (`auxRecExt`, `noConfusionExt`, `sparseCasesOnExt`). -/
-def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (sparseExt? : Option Name)
-    (v : ModuleView) : PureAuditM Unit := do
+/-- Strip up to `fuel` leading lambda binders from `e` (used to inspect `specCacheExt` keys). -/
+def stripLeadingLams : Expr → Nat → Expr
+  | e, 0 => e
+  | .lam _ _ b _, k + 1 => stripLeadingLams b k
+  | e, _ + 1 => e
+
+/-- Validate one `Compiler.LCNF.Specialize.CacheEntry` stored by module `m`:
+1. `declName` must NOT be a kernel declaration (`constNames` or `findAnyConst?`),
+2. `declName` must be an IR-only declaration owned by `m` (`extraConstNames` + `ownerOf`) with an
+   actual compiled IR body (`IR.findEnvDecl`), and
+3. stripping leading lambdas from `key` must expose a constant head `kfn` matching the specialization
+   prefix `<kfn>._at_.` of `declName` with a `.spec_<n>` marker. -/
+def validateSpecCacheEntry (ctx : AuditContext) (m : Name) (modKernelNames modExtraNames : NameSet)
+    (e : Compiler.LCNF.Specialize.CacheEntry) : PureAuditM Unit := do
+  modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
+  let env := ctx.env
+  let dn := e.declName
+  if modKernelNames.contains dn || (findAnyConst? env dn).isSome then
+    report .compilerOverrideHook dn m "specialize_cache: entry targets a kernel declaration"
+    return
+  unless modExtraNames.contains dn && ownerOf ctx dn == some m do
+    report .foreignCompilerTag dn m "specialize_cache: entry target is not owned by the storing module"
+    return
+  if (IR.findEnvDecl env dn).isNone then
+    report .compilerOverrideHook dn m "specialize_cache: entry target has no compiled IR body"
+    return
+  let keyBody := stripLeadingLams e.key 256
+  match keyBody.getAppFn with
+  | .const kfn _ =>
+    let dnStr := dn.toString
+    let kStr := kfn.toString
+    unless dnStr.startsWith (kStr ++ "._at_.") && (dnStr.splitOn ".spec_").length > 1 do
+      report .compilerOverrideHook dn m
+        s!"specialize_cache: target {dn} does not match specialization key head {kfn}"
+  | _ =>
+    report .compilerOverrideHook dn m "specialize_cache: specialization key is not constant-headed"
+
+/-- Vector 4b per-module view: typed `.olean` and `.ir` entries across all hook extensions (including
+`taggedReturnAttr`, `sparseCasesOnExt`, and `Specialize.specCacheExt`), generic `d.entries` fallback
+counts, live local state, and foreign/forged compiler-intrinsic tags. -/
+def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (v : ModuleView) :
+    PureAuditM Unit := do
   let env := ctx.env
   let hook (n m : Name) (what : String) : PureAuditM Unit := do
     modify fun s => { s with hookEntriesChecked := s.hookEntriesChecked + 1 }
@@ -1706,6 +1764,8 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (sparseExt
   for (extName, label) in generic do
     let k := extCounts.getD extName 0
     if k > 0 then hook m m s!"{label}: module stores {k} entr{if k == 1 then "y" else "ies"}"
+  let modKernelNames : NameSet := v.data.constNames.foldl (·.insert ·) {}
+  let modExtraNames : NameSet := v.data.extraConstNames.foldl (·.insert ·) {}
   match v.idx? with
   | some i =>
     for (n, _) in Compiler.implementedByAttr.ext.getModuleEntries env i ++ Compiler.implementedByAttr.ext.getModuleIREntries env i do
@@ -1725,6 +1785,9 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (sparseExt
       hook installer m "cpass"
     for fe in Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env i ++ Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleIREntries env i do
       hook fe.declName m "constant_fold"
+    for n in Compiler.LCNF.taggedReturnAttr.ext.getModuleEntries env i ++
+        Compiler.LCNF.taggedReturnAttr.ext.getModuleIREntries env i do
+      hook n m "tagged_return"
     for n in IR.UnboxResult.unboxAttr.ext.getModuleEntries env i ++ IR.UnboxResult.unboxAttr.ext.getModuleIREntries env i do
       hook n m "unbox"
     for n in neverExtractAttr.ext.getModuleEntries env i ++ neverExtractAttr.ext.getModuleIREntries env i do
@@ -1739,11 +1802,19 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (sparseExt
         report .foreignCompilerTag n m "auxiliary-recursor tag on a foreign declaration"
       else if !genuineOwnedAuxRec ctx m n then
         report .compilerOverrideHook n m "auxiliary-recursor tag on a non-recursor declaration"
+    for n in sparseCasesOnExt.getModuleEntries env i ++ sparseCasesOnExt.getModuleIREntries env i do
+      if origin? env n != some m then
+        report .foreignCompilerTag n m "sparse-cases tag on a foreign declaration"
+      else if !genuineOwnedSparseCasesOn ctx m n then
+        report .compilerOverrideHook n m "sparse-cases tag on a non-sparseCasesOn declaration"
     for (n, _) in noConfusionExt.getModuleEntries env i ++ noConfusionExt.getModuleIREntries env i do
       if origin? env n != some m then
         report .foreignCompilerTag n m "noConfusion tag on a foreign declaration"
       else if !genuineOwnedNoConfusion ctx m n then
         report .compilerOverrideHook n m "noConfusion tag on a non-noConfusion declaration"
+    for se in Compiler.LCNF.Specialize.specCacheExt.getModuleEntries env i ++
+        Compiler.LCNF.Specialize.specCacheExt.getModuleIREntries env i do
+      validateSpecCacheEntry ctx m modKernelNames modExtraNames se
   | none =>
     for n in v.data.constNames ++ v.data.extraConstNames do
       if (Compiler.implementedByAttr.getParam? env n).isSome then hook n m "implemented_by"
@@ -1751,6 +1822,7 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (sparseExt
       if (exportAttr.getParam? env n).isSome then hook n m "export"
       if (regularInitAttr.getParam? env n).isSome then hook n m "init"
       if (builtinInitAttr.getParam? env n).isSome then hook n m "builtin_init"
+      if Compiler.LCNF.taggedReturnAttr.hasTag env n then hook n m "tagged_return"
       if IR.UnboxResult.unboxAttr.hasTag env n then hook n m "unbox"
       if neverExtractAttr.hasTag env n then hook n m "never_extract"
       if (Compiler.getInlineAttribute? env n).any isMacroInline && !isGeneratedMacroInline ctx m n then
@@ -1761,6 +1833,12 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (sparseExt
           report .compilerOverrideHook n m "auxiliary-recursor tag on a non-recursor declaration"
       else
         report .foreignCompilerTag n m "auxiliary-recursor tag on a foreign declaration"
+    for n in sparseCasesOnExt.getEntries env do
+      if (origin? env n).isNone then
+        unless genuineOwnedSparseCasesOn ctx m n do
+          report .compilerOverrideHook n m "sparse-cases tag on a non-sparseCasesOn declaration"
+      else
+        report .foreignCompilerTag n m "sparse-cases tag on a foreign declaration"
     for (n, _) in (noConfusionExt.getState env).toList do
       if (origin? env n).isNone then
         unless genuineOwnedNoConfusion ctx m n do
@@ -1770,20 +1848,8 @@ def hooksView (ctx : AuditContext) (generic : Array (Name × String)) (sparseExt
     for entry in Compiler.LCNF.postponedCompileDeclsExt.getEntries env do
       for n in entry.declNames do
         report .postponedCompilation n m "compilation postponed (no IR stored)"
-  -- Sparse-cases tags (inaccessible extension): only run per-decl checks when `stored > 0`,
-  -- deduplicating `constNames` against pigeonhole forgery and validating owned shape.
-  if let some se := sparseExt? then
-    let stored := extCounts.getD se 0
-    if stored > 0 then
-      let mut uniqueOwned : NameSet := {}
-      let mut validOwned := 0
-      for n in v.data.constNames do
-        if !uniqueOwned.contains n && ownerOf ctx n == some m && isSparseCasesOn env n then
-          uniqueOwned := uniqueOwned.insert n
-          if genuineOwnedSparseCasesOn ctx m n then validOwned := validOwned + 1
-          else report .compilerOverrideHook n m "sparse-cases tag on a non-sparseCasesOn declaration"
-      if stored > validOwned then
-        report .foreignCompilerTag m m s!"sparse-cases tag: {stored} stored entries exceed {validOwned} valid owned declarations"
+    for (key, dn) in (Compiler.LCNF.Specialize.specCacheExt.getState env).toList do
+      validateSpecCacheEntry ctx m modKernelNames modExtraNames { key, declName := dn }
 
 /-- Environment-wide live compiler-state checks (`CSimp` `stateStack`/`newEntries`/`scopedEntries`,
 `passManagerExt` live passes & pipeline fingerprint, and `ConstantFold.folderExt` live folders). -/
@@ -1794,7 +1860,7 @@ def auditLiveCompilerState (ctx : AuditContext) : AuditM Unit := do
   for h : i in [0:env.header.modules.size] do
     let m := env.header.modules[i].module
     if ctx.isToolchainModule m then
-      for e in Compiler.CSimp.ext.ext.getModuleEntries env i do
+      for e in Compiler.CSimp.ext.ext.getModuleEntries env i ++ Compiler.CSimp.ext.ext.getModuleIREntries env i do
         let ent := match e with | .global a => a | .scoped _ a => a
         toolchainCSimp := toolchainCSimp.insert (ent.fromDeclName, ent.toDeclName, ent.thmName)
   let csimpState := Compiler.CSimp.ext.ext.getState env
@@ -1840,10 +1906,10 @@ def auditCompilerHooks (ctx : AuditContext) (views : Array ModuleView) : AuditM 
     match ← findExtName u with
     | some n => generic := generic.push (n, label)
     | none => report .environmentLoadFailed u .anonymous s!"hook extension for {label} is not registered"
-  let sparseExt? ← findExtName `Lean.sparseCasesOnExt
-  if sparseExt?.isNone then
-    report .environmentLoadFailed `Lean.sparseCasesOnExt .anonymous "sparse-cases extension is not registered"
-  runPerView views (hooksView ctx generic sparseExt?)
+  for req in [`Lean.sparseCasesOnExt, `Lean.Compiler.LCNF.Specialize.specCacheExt] do
+    if (← findExtName req).isNone then
+      report .environmentLoadFailed req .anonymous s!"compiler extension {req} is not registered"
+  runPerView views (hooksView ctx generic)
   auditLiveCompilerState ctx
 
 /-! ## Vector 4c — opaque-theorem readiness (`leanprover/lean4#14896`) -/
@@ -1890,6 +1956,42 @@ def isTheoremHead (env : Environment) (e : Expr) (fuel : Nat := 16) : Option Nam
       | .lam _ _ body _ =>
         if !body.hasLooseBVars then isTheoremHead env body fuel else none
       | _ => none
+
+/-- Extract a theorem constant from a non-`Prop` `.proj` scrutinee `s`, unwrapping projections,
+trivial `let` bindings, and non-constructor-headed definition/opaque aliases (`def wrap := thm` or
+`id thm`) up to `fuel` steps so wrapped theorem projections cannot evade Layer A. -/
+def projScrutineeTheorem? (env : Environment) (s : Expr) (fuel : Nat := 32) : Option Name :=
+  match isTheoremHead env s with
+  | some t => some t
+  | none =>
+    let rec go (cur : Expr) : Nat → Option Name
+      | 0 => none
+      | k + 1 =>
+        match isTheoremHead env cur with
+        | some t => some t
+        | none =>
+          match cur with
+          | .mdata _ b => go b k
+          | .letE _ _ v b _ =>
+            if !b.hasLooseBVars then go b k
+            else if b == .bvar 0 then go v k
+            else none
+          | .proj _ _ inner => go inner k
+          | _ =>
+            match cur.getAppFn with
+            | .const fn _ =>
+              match findAnyConst? env fn with
+              | some (.thmInfo _) => some fn
+              | some (.defnInfo dv) =>
+                let args := cur.getAppArgs
+                if fn == ``id && args.size ≥ 2 then go args[1]! k
+                else if args.isEmpty then go dv.value k
+                else none
+              | some (.opaqueInfo ov) =>
+                if cur.getAppArgs.isEmpty then go ov.value k else none
+              | _ => none
+            | _ => none
+    go s fuel
 
 def isTheoremConstNode (env : Environment) : Expr → Bool
   | .const c _ => ((findAnyConst? env c) matches some (.thmInfo _))
@@ -1971,7 +2073,7 @@ def opaqueHitAt? (env : Environment) (e : Expr) : Option (Name × String) :=
       | none => none
     | _ => none
   | .proj S _ s =>
-    match isTheoremHead env s with
+    match projScrutineeTheorem? env s with
     | some thm => if isPropInductive env S then none else some (thm, "scrutinee of Expr.proj")
     | none => none
   | _ => none
@@ -2408,23 +2510,25 @@ def kernelScanChunk (ctx : AuditContext) (sc : Std.HashSet Name) (structural sca
   if !fullHit && !fastThmHit then return
   let mut reportedForbidden : NameSet := {}
   for ci in consts do
+    let exprBad (e : Expr) : Bool :=
+      if structural then (e.find? pFull).isSome else e.getUsedConstants.any isBadConst
     let hasHit : Bool := match ci with
       | .thmInfo _ =>
-        (fullHit && (ci.type.find? pFull).isSome) ||
+        (fullHit && exprBad ci.type) ||
         (match ci.value? (allowOpaque := true) with
          | none => false
          | some val =>
-           if includeThmBodies then fullHit && (val.find? pFull).isSome
+           if includeThmBodies then fullHit && exprBad val
            else fastThmHit && val.getUsedConstants.any isBadConst)
       | .recInfo rv =>
         fullHit && (
-          (ci.type.find? pFull).isSome ||
-          ((ci.value? (allowOpaque := true)).any fun val => (val.find? pFull).isSome) ||
-          rv.rules.any fun r => (r.rhs.find? pFull).isSome)
+          exprBad ci.type ||
+          ((ci.value? (allowOpaque := true)).any exprBad) ||
+          rv.rules.any fun r => exprBad r.rhs)
       | _ =>
         fullHit && (
-          (ci.type.find? pFull).isSome ||
-          ((ci.value? (allowOpaque := true)).any fun val => (val.find? pFull).isSome))
+          exprBad ci.type ||
+          ((ci.value? (allowOpaque := true)).any exprBad))
     unless hasHit == true do continue
     for c in kernelShareCommonRefs env ci do
       report .shareCommonReference ci.name v.module s!"kernel declaration references {c}"
@@ -2688,22 +2792,28 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
       let mut audited : NameSet := {}
       let mut seen : NameSet := {}
       try
-        let ctx ← mkAuditContext env sysrootLib
-        runAllFourVectorAudits ctx { cfg with resolution? := none }
-        for mi in env.header.modules do
-          seen := seen.insert mi.module
-          if ctx.isToolchainModule mi.module then
-            pure ()
-          else if modSet.contains mi.module && !bad.contains mi.module then
-            audited := audited.insert mi.module
-          else
-            report .oleanOutsideApprovedRoot mi.module mi.module
-              "loaded non-toolchain module resolved outside the approved build directory"
+        match ← mkAuditContext env sysrootLib with
+        | ctx =>
+          runAllFourVectorAudits ctx { cfg with resolution? := none }
+          for mi in env.header.modules do
+            seen := seen.insert mi.module
+            if ctx.isToolchainModule mi.module then
+              pure ()
+            else if modSet.contains mi.module && !bad.contains mi.module then
+              audited := audited.insert mi.module
+            else
+              report .oleanOutsideApprovedRoot mi.module mi.module
+                "loaded non-toolchain module resolved outside the approved build directory"
       finally
         searchPathRef.set saved2
+      -- Any newly discovered transitive toolchain module (beyond `extOrder`, which already passed
+      -- `validateOleanFile` pre-import) also has its binary header validated when `bad` is non-empty
+      -- or `validateToolchainBinaries` is requested.
+      let wantTcBin := (cfg.resolution?.map (·.validateToolchainBinaries)).getD false
       let tcSeen := seen.toArray.filter isToolchainName
       auditOleanResolutionAndShadowing tcSeen
-        { sysrootLibDir := sysrootLib, approvedBuildRoots := #[], searchPath? := some sp, header := hdr }
+        { sysrootLibDir := sysrootLib, approvedBuildRoots := #[], searchPath? := some sp,
+          validateToolchainBinaries := wantTcBin, header := hdr }
       let stray := (mods.filter fun m => !audited.contains m).size
       let t1 ← IO.monoMsNow
       modify fun s => { s with modulesChecked := audited.size, elapsedMs := t1 - t0, importMs, strayArtifacts := stray }
@@ -2793,13 +2903,17 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
   for m in mods do
     if alive.contains m && !audited.contains m then
       report .environmentLoadFailed m m "validated module was not covered by any import batch"
+  let wantTcBin := (cfg.resolution?.map (·.validateToolchainBinaries)).getD false
   let tcSeen := seen.toArray.filter isToolchainName
   auditOleanResolutionAndShadowing tcSeen
-    { sysrootLibDir := sysrootLib, approvedBuildRoots := #[], searchPath? := some sp, header := hdr }
+    { sysrootLibDir := sysrootLib, approvedBuildRoots := #[], searchPath? := some sp,
+      validateToolchainBinaries := wantTcBin, header := hdr }
   let t1 ← IO.monoMsNow
   modify fun s => { s with modulesChecked := audited.size, elapsedMs := t1 - t0, importMs, strayArtifacts := stray }
 
 /-- Run an `AuditM` action from scratch. -/
 def AuditM.run' (x : AuditM α) : IO (α × AuditSummary) := StateT.run x {}
+
+end
 
 end Anneal.Proto.OleanShadowAndOverrideAuditProto
