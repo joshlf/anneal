@@ -715,6 +715,24 @@ theorem nonEmptyPool_worklistStep_returns (pol : SpawnPolicy)
       dsimp only
       cases hd.remYields <;> exact ⟨_, rfl⟩
 
+/-- Empty pools always fail closed under `worklistStep`. -/
+theorem worklistStep_empty_fault (pol : SpawnPolicy) (w : WorklistPool)
+    (hEmpty : poolIsNonEmpty w = false) :
+    worklistStep pol w = .faultInvalidSpawn := by
+  dsimp only [poolIsNonEmpty] at hEmpty
+  dsimp only [worklistStep]
+  cases hF : w.fifoQueue with
+  | cons _ _ =>
+    rw [hF] at hEmpty
+    exact False.elim (boolTrueNeFalseW hEmpty)
+  | nil =>
+    rw [hF] at hEmpty
+    cases hS : w.stealDeque with
+    | cons _ _ =>
+      rw [hS] at hEmpty
+      exact False.elim (boolTrueNeFalseW hEmpty)
+    | nil => rfl
+
 /-- Fuel-free inductive multi-rank worklist convergence judgment. -/
 inductive WorklistConverges (pol : SpawnPolicy) :
     WorklistPool → WorklistPool → Prop where
@@ -726,6 +744,30 @@ inductive WorklistConverges (pol : SpawnPolicy) :
       (hLt : cnfLt (poolMeasure wNext) (poolMeasure w) = true)
       (hRest : WorklistConverges pol wNext wFinal) :
       WorklistConverges pol w wFinal
+
+/-- Determinism of `WorklistConverges`: any initial pool drains to a unique
+quiescent final pool under `pol`. -/
+theorem WorklistConverges.unique {pol : SpawnPolicy} {w wFinal₁ wFinal₂ : WorklistPool}
+    (h₁ : WorklistConverges pol w wFinal₁)
+    (h₂ : WorklistConverges pol w wFinal₂) :
+    wFinal₁ = wFinal₂ := by
+  induction h₁ with
+  | quiescent w0 hEmp =>
+    cases h₂ with
+    | quiescent _ _ => rfl
+    | step _ _ _ hNe _ _ _ =>
+      rw [hEmp] at hNe
+      exact False.elim (boolFalseNeTrueW hNe)
+  | step w0 wNext₁ wf₁ hNe hSt₁ _ _ ih =>
+    cases h₂ with
+    | quiescent _ hEmp =>
+      rw [hNe] at hEmp
+      exact False.elim (boolTrueNeFalseW hEmp)
+    | step _ wNext₂ wf₂ _ hSt₂ _ hRest₂ =>
+      rw [hSt₁] at hSt₂
+      injection hSt₂ with hEq
+      subst hEq
+      exact ih hRest₂
 
 /-- Computable `@Nat.rec` multi-step runner for `worklistStep`. -/
 def runWorklistSteps (fuel : Nat) (pol : SpawnPolicy) (w : WorklistPool) :
@@ -967,6 +1009,64 @@ theorem canary_execLoop_cnfNorm_lex2 (resetVal o i : Nat) :
       | succ o' =>
         refine Or.inr ⟨1, execUntilPred_step (s' := (o', resetVal)) rfl
           (execUntilPred_stop 0 (Or.inl ⟨trivial, ?_⟩))⟩
+        refine cnfLt_of_coeff_drop _ _
+          (isCanonicalCnf_cnfNorm _) (isCanonicalCnf_cnfNorm _) 1 ?_ ?_
+        · rw [cnfCoeffAt_cnfNorm, cnfCoeffAt_cnfNorm]
+          exact natLtSuccSelfW o'
+        · intro q hGt
+          rw [cnfCoeffAt_cnfNorm, cnfCoeffAt_cnfNorm]
+          cases q with
+          | zero => cases hGt
+          | succ q1 =>
+            cases q1 with
+            | zero => cases hGt
+            | succ _ => rfl
+
+/-- Additional non-vacuity witness exercising empty-pool fail-closed behavior
+(`worklistStep_empty_fault`), `WorklistConverges.unique`, and
+`wpLoop_cnfOrd_exists` with non-`Unit` choice (`C := Bool`). -/
+theorem canary_worklist_empty_unique_and_wpLoop_cnfOrd (o i : Nat) :
+    worklistStep canaryTowerPolicy
+      { fifoQueue := [], stealDeque := [], nextTaskId := 0,
+        completedCount := 0, stepCount := 0 } = .faultInvalidSpawn ∧
+    (∀ w₁ w₂, WorklistConverges canaryTowerPolicy canaryInitPool w₁ →
+      WorklistConverges canaryTowerPolicy canaryInitPool w₂ → w₁ = w₂) ∧
+    (∃ fuel, wpUntil (C := Bool) (fun _ c => c = true) (fun _ => toyLexStep 2)
+      (fun st => st = (0, 0)) (fun _ => True) (fun _ => False) fuel (o, i)) := by
+  refine ⟨worklistStep_empty_fault canaryTowerPolicy _ rfl,
+    fun _ _ h₁ h₂ => WorklistConverges.unique h₁ h₂, ?_⟩
+  refine wpLoop_cnfOrd_exists (C := Bool) (c₀ := true) (fun _ _ => Iff.rfl)
+    (Inv := fun _ => True) (rank := fun st => cnfNorm [(1, st.1), (0, st.2)])
+    (fun st _ => isCanonicalCnf_cnfNorm _) ?_ (o, i) trivial
+  intro st _
+  cases st with
+  | mk outRem inRem =>
+    cases inRem with
+    | succ i' =>
+      refine Or.inr ⟨1, wpUntilPred_of_execUntilPred (C := Bool) (c₀ := true)
+        (fun _ _ => Iff.rfl)
+        (execUntilPred_step (s' := (outRem, i')) rfl
+          (execUntilPred_stop 0 (Or.inl ⟨trivial, ?_⟩)))⟩
+      refine cnfLt_of_coeff_drop _ _
+        (isCanonicalCnf_cnfNorm _) (isCanonicalCnf_cnfNorm _) 0 ?_ ?_
+      · rw [cnfCoeffAt_cnfNorm, cnfCoeffAt_cnfNorm]
+        exact natLtSuccSelfW i'
+      · intro q hGt
+        rw [cnfCoeffAt_cnfNorm, cnfCoeffAt_cnfNorm]
+        cases q with
+        | zero => cases hGt
+        | succ q1 =>
+          cases q1 with
+          | zero => rfl
+          | succ _ => rfl
+    | zero =>
+      cases outRem with
+      | zero => exact Or.inl rfl
+      | succ o' =>
+        refine Or.inr ⟨1, wpUntilPred_of_execUntilPred (C := Bool) (c₀ := true)
+          (fun _ _ => Iff.rfl)
+          (execUntilPred_step (s' := (o', 2)) rfl
+            (execUntilPred_stop 0 (Or.inl ⟨trivial, ?_⟩)))⟩
         refine cnfLt_of_coeff_drop _ _
           (isCanonicalCnf_cnfNorm _) (isCanonicalCnf_cnfNorm _) 1 ?_ ?_
         · rw [cnfCoeffAt_cnfNorm, cnfCoeffAt_cnfNorm]

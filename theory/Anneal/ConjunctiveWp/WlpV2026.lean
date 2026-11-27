@@ -30,15 +30,18 @@ unification seam:
    events), and external calls `.vis (.inr (.inr (.call _)))` — into
    `Framework.StepWp.StepResult MachineState MirOutcome V2026StepFault`, with
    exact correspondence lemmas against `stepMirFn`, `stepMirState`,
-   `PureMirExec.mirStep`, and `ParametricCore.V2026Bridge.mirDetStep`, exact
-   one-step `wpMirSym` unfolding rules, and adequacy bridges into
-   `MirWpConverges`, `MirNoUBTree`, `VerificationResult`, and
-   `StatefulVerificationResult`. The adapter is proved *exactly complete* for
-   call-free semantics (`v2026Exec_of_wpMirNoCallSym`,
-   `mirNoCallWpConverges_iff_exists_v2026Exec`), and `MirNoUBTree` adequacy is
-   proved directly against `Trusted.ITree.Reaches` / `TreeSafe`
-   (`treeSafe_mirTree_of_v2026Exec`) using only `{propext, Quot.sound}` — no
-   `Classical.choice`.
+   `PureMirExec.mirStep`, `ParametricCore.V2026Bridge.mirDetStep`, and
+   `ParametricCore.V2026Bridge.mirNoCallStep`, exact one-step `wpMirSym`
+   unfolding rules, and adequacy bridges into `MirWpConverges`, `MirNoUBTree`,
+   `ReachesRet`, `Productive`, `VerificationResult`,
+   `StatefulVerificationResult`, and `TotalVerificationResult`. The adapter is
+   proved *exactly complete* for call-free semantics
+   (`v2026Exec_of_wpMirNoCallSym`, `mirNoCallWpConverges_iff_exists_v2026Exec`,
+   `wpStateOk_mirNoCallDet_iff_exists_v2026Exec`), and `MirNoUBTree`,
+   `ReachesRet`, `Productive`, `VerificationResult`, and
+   `StatefulVerificationResult` adequacy are all proved directly against
+   `Trusted.ITree.Reaches` / `TreeSafe` using only `{propext, Quot.sound}` —
+   zero `Classical.choice`.
 2. **Deterministic `execWlp*`, Anti-Monotonicity, & Asymmetric Two-Pass Rules:**
    `wlpOutcomeV2026`, `wlpStateV2026`, `wlpProgV2026`, `wlpProgStrictV2026`,
    `execWlpOutcomeV2026`, `execWlpStateV2026`, `execWlpProgV2026`,
@@ -634,6 +637,128 @@ theorem mirDetStep_fault_of_v2026Step_fault {body : CapturedMir}
   Anneal.ParametricCore.V2026Bridge.toStepOutcome_fault_iff.mpr
     (mirStep_fault_of_v2026Step_fault h)
 
+/-- Exact `.step` correspondence between `v2026Step` and
+`ParametricCore.V2026Bridge.mirNoCallStep`. -/
+theorem v2026Step_step_iff_mirNoCallStep_step {body : CapturedMir}
+    {s s' : MachineState} :
+    v2026Step body s = .step s' ↔
+      Anneal.ParametricCore.V2026Bridge.mirNoCallStep body s = .step s' := by
+  unfold v2026Step ofV2026MirStepNode
+    Anneal.ParametricCore.V2026Bridge.mirNoCallStep
+  dsimp only [stepMirState]
+  cases stepMirFn body s with
+  | ret _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+  | tau st =>
+    cases st with
+    | running s₁ =>
+      exact ⟨(fun h => by injection h with hEq; rw [hEq]),
+             (fun h => by injection h with hEq; rw [hEq])⟩
+    | halted _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+    | faulted _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+  | vis i k =>
+    rcases i with f | (e | c)
+    · cases f; exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+    · cases e
+      dsimp only
+      cases k PUnit.unit with
+      | running s₁ =>
+        exact ⟨(fun h => by injection h with hEq; rw [hEq]),
+               (fun h => by injection h with hEq; rw [hEq])⟩
+      | halted _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+      | faulted _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+    · cases c; exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+
+/-- Exact `.done` correspondence between `v2026Step` and
+`ParametricCore.V2026Bridge.mirNoCallStep` (two-way, because both handle
+`.ret`, `.tau (.halted _)`, and observable `.vis _ (.halted _)`). -/
+theorem v2026Step_done_iff_mirNoCallStep_done {body : CapturedMir}
+    {s : MachineState} {out : MirOutcome} :
+    v2026Step body s = .done out ↔
+      Anneal.ParametricCore.V2026Bridge.mirNoCallStep body s = .done out := by
+  unfold v2026Step ofV2026MirStepNode
+    Anneal.ParametricCore.V2026Bridge.mirNoCallStep
+  dsimp only [stepMirState]
+  cases stepMirFn body s with
+  | ret o =>
+    exact ⟨(fun h => by injection h with hEq; rw [hEq]),
+           (fun h => by injection h with hEq; rw [hEq])⟩
+  | tau st =>
+    cases st with
+    | running _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+    | halted o =>
+      exact ⟨(fun h => by injection h with hEq; rw [hEq]),
+             (fun h => by injection h with hEq; rw [hEq])⟩
+    | faulted _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+  | vis i k =>
+    rcases i with f | (e | c)
+    · cases f; exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+    · cases e
+      dsimp only
+      cases k PUnit.unit with
+      | running _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+      | halted o =>
+        exact ⟨(fun h => by injection h with hEq; rw [hEq]),
+               (fun h => by injection h with hEq; rw [hEq])⟩
+      | faulted _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+    · cases c; exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+
+/-- Exact `.fault (.fail fk)` correspondence between `v2026Step` and
+`ParametricCore.V2026Bridge.mirNoCallStep`. -/
+theorem v2026Step_fault_fail_iff_mirNoCallStep_fail {body : CapturedMir}
+    {s : MachineState} {fk : FailureKind} :
+    v2026Step body s = .fault (.fail fk) ↔
+      Anneal.ParametricCore.V2026Bridge.mirNoCallStep body s = .fault (.fail fk) := by
+  unfold v2026Step ofV2026MirStepNode
+    Anneal.ParametricCore.V2026Bridge.mirNoCallStep
+  dsimp only [stepMirState]
+  cases stepMirFn body s with
+  | ret _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+  | tau st =>
+    cases st with
+    | running _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+    | halted _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+    | faulted fk' =>
+      exact ⟨(fun h => by injection h with hf; injection hf with hEq; rw [hEq]),
+             (fun h => by injection h with hf; injection hf with hEq; rw [hEq])⟩
+  | vis i k =>
+    rcases i with f | (e | c)
+    · cases f with
+      | fail fk' =>
+        exact ⟨(fun h => by injection h with hf; injection hf with hEq; rw [hEq]),
+               (fun h => by injection h with hf; injection hf with hEq; rw [hEq])⟩
+    · cases e
+      dsimp only
+      cases k PUnit.unit with
+      | running _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+      | halted _ => exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+      | faulted fk' =>
+        exact ⟨(fun h => by injection h with hf; injection hf with hEq; rw [hEq]),
+               (fun h => by injection h with hf; injection hf with hEq; rw [hEq])⟩
+    · cases c; exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
+
+/-- Exact external-call fault correspondence between `v2026Step` and
+`ParametricCore.V2026Bridge.mirNoCallStep`. -/
+theorem v2026Step_fault_extCall_iff_mirNoCallStep_extCall {body : CapturedMir}
+    {s : MachineState} :
+    (∃ req, v2026Step body s = .fault (.extCall req)) ↔
+      Anneal.ParametricCore.V2026Bridge.mirNoCallStep body s = .fault .extCall := by
+  unfold v2026Step ofV2026MirStepNode
+    Anneal.ParametricCore.V2026Bridge.mirNoCallStep
+  dsimp only [stepMirState]
+  cases stepMirFn body s with
+  | ret _ => exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => by cases h)⟩
+  | tau st =>
+    cases st <;> exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => by cases h)⟩
+  | vis i k =>
+    rcases i with f | (e | c)
+    · cases f; exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => by cases h)⟩
+    · cases e
+      dsimp only
+      cases k PUnit.unit <;>
+        exact ⟨(fun ⟨_, h⟩ => by cases h), (fun h => by cases h)⟩
+    · cases c with
+      | call req => exact ⟨fun _ => rfl, fun _ => ⟨req, rfl⟩⟩
+
 /-! ### Exact One-Step `wpMirSym` Unfolding Lemmas (Silent `.tau` & Observable `.vis`) -/
 
 /-- Exact one-step unfolding of `wpMirExecSym` on a `.halted out` state. -/
@@ -997,6 +1122,277 @@ theorem treeSafe_mirTree_of_v2026Exec {body : CapturedMir}
       rw [hStep] at h
       exact False.elim h
 
+/-! ### Choice-Free Direct `ReachesRet` & `Productive` Adequacy -/
+
+/-- A MIR interaction tree whose head node is `.ret r` can only reach `.ret`
+with outcome `out = r` (proved directly from `Trusted.ITree.Reaches`). -/
+theorem reachesRet_of_observe_ret_v2026 {t : ITree MirEffect MirOutcome}
+    {r out : MirOutcome} {tr : List (Event MirEffect)}
+    (h : t.observe = .ret r) (hR : ReachesRet t tr out) : out = r := by
+  let ⟨u, hReach, hRet⟩ := hR
+  cases hReach with
+  | refl _ =>
+    rw [h] at hRet
+    injection hRet with hEq
+    exact hEq.symm
+  | tau hObs _ => rw [h] at hObs; cases hObs
+  | vis hObs _ _ _ => rw [h] at hObs; cases hObs
+
+/-- `ReachesRet` steps forward across a silent `.tau` head node. -/
+theorem reachesRet_of_observe_tau_v2026 {t t' : ITree MirEffect MirOutcome}
+    {out : MirOutcome} {tr : List (Event MirEffect)}
+    (h : t.observe = .tau t') (hR : ReachesRet t tr out) :
+    ReachesRet t' tr out := by
+  let ⟨u, hReach, hRet⟩ := hR
+  cases hReach with
+  | refl _ => rw [h] at hRet; cases hRet
+  | tau hObs hNext =>
+    rw [h] at hObs
+    injection hObs with hEq
+    subst hEq
+    exact ⟨u, hNext, hRet⟩
+  | vis hObs _ _ _ => rw [h] at hObs; cases hObs
+
+/-- `ReachesRet` steps forward across a visible `.vis` head node. -/
+theorem reachesRet_of_observe_vis_v2026 {t : ITree MirEffect MirOutcome}
+    {i : MirEffect.I} {k : MirEffect.O i → ITree MirEffect MirOutcome}
+    {out : MirOutcome} {tr : List (Event MirEffect)}
+    (h : t.observe = .vis i k) (hR : ReachesRet t tr out) :
+    ∃ (o : MirEffect.O i) (tr' : List (Event MirEffect)),
+      ReachesRet (k o) tr' out := by
+  let ⟨u, hReach, hRet⟩ := hR
+  cases hReach with
+  | refl _ => rw [h] at hRet; cases hRet
+  | tau hObs _ => rw [h] at hObs; cases hObs
+  | vis hObs _ o hNext =>
+    rw [h] at hObs
+    cases hObs
+    exact ⟨o, _, ⟨u, hNext, hRet⟩⟩
+
+private theorem reachesRet_cofix_halted (body : CapturedMir)
+    {out retOut : MirOutcome} {tr : List (Event MirEffect)}
+    (hR : ReachesRet (ITree.cofix (stepMirState body) (.halted out)) tr retOut) :
+    retOut = out :=
+  reachesRet_of_observe_ret_v2026 (r := out) (ITree.observe_cofix _ _) hR
+
+/-- Choice-free return-postcondition adequacy: every fault-free
+`execStepOutcome (v2026Step body)` derivation implies `post out` for every
+`ReachesRet (mirTree body s) tr out` (`{propext, Quot.sound}` only). -/
+theorem reachesRet_post_of_v2026Exec {body : CapturedMir}
+    {post : MirOutcome → Prop} :
+    ∀ {fuel : Nat} {s : MachineState},
+      execStepOutcome (v2026Step body) post (fun _ => False) fuel s →
+      ∀ tr out, ReachesRet (mirTree body s) tr out → post out
+  | 0, _, h, _, _, _ => False.elim h
+  | fuel + 1, s, h, tr, out, hR => by
+    dsimp only [execStepOutcome] at h
+    rw [execStepPred_succ_iff] at h
+    have hObs := mirTree_observe body s
+    cases hStep : v2026Step body s with
+    | step s' =>
+      rw [hStep] at h
+      cases v2026Step_step_iff.mp hStep with
+      | inl hTau =>
+        rw [hTau] at hObs
+        exact reachesRet_post_of_v2026Exec h tr out
+          (reachesRet_of_observe_tau_v2026 (t' := mirTree body s') hObs hR)
+      | inr hVis =>
+        let ⟨_, k, hv, hk⟩ := hVis
+        rw [hv] at hObs
+        let ⟨o, tr', hR'⟩ := reachesRet_of_observe_vis_v2026
+          (k := fun o => ITree.cofix (stepMirState body) (k o)) hObs hR
+        cases o
+        have hR'' : ReachesRet (mirTree body s') tr' out := by
+          unfold mirTree
+          rw [← hk]
+          exact hR'
+        exact reachesRet_post_of_v2026Exec h tr' out hR''
+    | done out' =>
+      rw [hStep] at h
+      cases v2026Step_done_iff.mp hStep with
+      | inl hRet =>
+        rw [hRet] at hObs
+        have hEq := reachesRet_of_observe_ret_v2026 (r := out') hObs hR
+        rw [hEq]
+        exact h
+      | inr hRest =>
+        cases hRest with
+        | inl hTauH =>
+          rw [hTauH] at hObs
+          have hEq := reachesRet_cofix_halted body
+            (reachesRet_of_observe_tau_v2026 hObs hR)
+          rw [hEq]
+          exact h
+        | inr hVisH =>
+          let ⟨_, k, hv, hk⟩ := hVisH
+          rw [hv] at hObs
+          let ⟨o, tr', hR'⟩ := reachesRet_of_observe_vis_v2026
+            (k := fun o => ITree.cofix (stepMirState body) (k o)) hObs hR
+          cases o
+          have hR'' :
+              ReachesRet (ITree.cofix (stepMirState body) (.halted out')) tr' out := by
+            rw [← hk]
+            exact hR'
+          have hEq := reachesRet_cofix_halted body hR''
+          rw [hEq]
+          exact h
+    | fault _ =>
+      rw [hStep] at h
+      exact False.elim h
+
+/-- A MIR interaction tree whose head node is `.ret r` is `Productive`. -/
+theorem productive_of_observe_ret_v2026 {t : ITree MirEffect MirOutcome}
+    {r : MirOutcome} (h : t.observe = .ret r) : Productive t := by
+  intro tr u hR
+  cases hR with
+  | refl _ =>
+    refine ⟨t, TauStar.refl t, fun w hTau => ?_⟩
+    rw [h] at hTau
+    cases hTau
+  | tau hObs _ => rw [h] at hObs; cases hObs
+  | vis hObs _ _ _ => rw [h] at hObs; cases hObs
+
+/-- `Productive` propagates backwards across a silent `.tau` head node. -/
+theorem productive_of_observe_tau_v2026 {t t' : ITree MirEffect MirOutcome}
+    (h : t.observe = .tau t') (hProd : Productive t') : Productive t := by
+  intro tr u hR
+  cases hR with
+  | refl _ =>
+    let ⟨u', hTs, hNotTau⟩ := hProd [] t' (Reaches.refl t')
+    exact ⟨u', TauStar.step h hTs, hNotTau⟩
+  | tau hObs hNext =>
+    rw [h] at hObs
+    injection hObs with hEq
+    subst hEq
+    exact hProd _ _ hNext
+  | vis hObs _ _ _ => rw [h] at hObs; cases hObs
+
+/-- `Productive` propagates backwards across a visible `.vis` head node whose
+every continuation is `Productive`. -/
+theorem productive_of_observe_vis_v2026 {t : ITree MirEffect MirOutcome}
+    {i : MirEffect.I} {k : MirEffect.O i → ITree MirEffect MirOutcome}
+    (h : t.observe = .vis i k) (hProd : ∀ o, Productive (k o)) :
+    Productive t := by
+  intro tr u hR
+  cases hR with
+  | refl _ =>
+    refine ⟨t, TauStar.refl t, fun w hTau => ?_⟩
+    rw [h] at hTau
+    cases hTau
+  | tau hObs _ => rw [h] at hObs; cases hObs
+  | vis hObs _ o hNext =>
+    rw [h] at hObs
+    cases hObs
+    exact hProd o _ _ hNext
+
+private theorem productive_cofix_halted (body : CapturedMir) (out : MirOutcome) :
+    Productive (ITree.cofix (stepMirState body) (.halted out)) :=
+  productive_of_observe_ret_v2026 (r := out) (ITree.observe_cofix _ _)
+
+/-- Choice-free reactive productivity adequacy: every fault-free
+`execStepOutcome (v2026Step body)` derivation implies `Productive (mirTree body s)`
+directly (`{propext, Quot.sound}` only). -/
+theorem productive_mirTree_of_v2026Exec {body : CapturedMir}
+    {post : MirOutcome → Prop} :
+    ∀ {fuel : Nat} {s : MachineState},
+      execStepOutcome (v2026Step body) post (fun _ => False) fuel s →
+      Productive (mirTree body s)
+  | 0, _, h => False.elim h
+  | fuel + 1, s, h => by
+    dsimp only [execStepOutcome] at h
+    rw [execStepPred_succ_iff] at h
+    have hObs := mirTree_observe body s
+    cases hStep : v2026Step body s with
+    | step s' =>
+      rw [hStep] at h
+      have ih : Productive (mirTree body s') := productive_mirTree_of_v2026Exec h
+      cases v2026Step_step_iff.mp hStep with
+      | inl hTau =>
+        rw [hTau] at hObs
+        exact productive_of_observe_tau_v2026 (t' := mirTree body s') hObs ih
+      | inr hVis =>
+        let ⟨_, k, hv, hk⟩ := hVis
+        rw [hv] at hObs
+        refine productive_of_observe_vis_v2026
+          (k := fun o => ITree.cofix (stepMirState body) (k o)) hObs (fun o => ?_)
+        cases o
+        show Productive (ITree.cofix (stepMirState body) (k PUnit.unit))
+        rw [hk]
+        exact ih
+    | done out =>
+      cases v2026Step_done_iff.mp hStep with
+      | inl hRet =>
+        rw [hRet] at hObs
+        exact productive_of_observe_ret_v2026 (r := out) hObs
+      | inr hRest =>
+        cases hRest with
+        | inl hTauH =>
+          rw [hTauH] at hObs
+          exact productive_of_observe_tau_v2026 hObs (productive_cofix_halted body out)
+        | inr hVisH =>
+          let ⟨_, k, hv, hk⟩ := hVisH
+          rw [hv] at hObs
+          refine productive_of_observe_vis_v2026
+            (k := fun o => ITree.cofix (stepMirState body) (k o)) hObs (fun o => ?_)
+          cases o
+          show Productive (ITree.cofix (stepMirState body) (k PUnit.unit))
+          rw [hk]
+          exact productive_cofix_halted body out
+    | fault _ =>
+      rw [hStep] at h
+      exact False.elim h
+
+/-- Exact bidirectional equivalence between fuel-free
+`ParametricCore.wpStateOk (ops := V2026Bridge.mirNoCallDetWpOps body)` and
+existence of a finite fault-free `execStepOutcome (v2026Step body)` run. -/
+theorem wpStateOk_mirNoCallDet_iff_exists_v2026Exec {body : CapturedMir}
+    {s : MachineState} {post : MirOutcome → Prop} :
+    Anneal.ParametricCore.wpStateOk
+        (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps body) post s ↔
+      ∃ fuel : Nat,
+        execStepOutcome (v2026Step body) post (fun _ => False) fuel s := by
+  constructor
+  · intro hWp
+    exact Anneal.ParametricCore.wpOutcome_det_induction
+      (C := fun st => ∃ fuel : Nat,
+        execStepOutcome (v2026Step body) post (fun _ => False) fuel st)
+      (fun st st' hStep ih => by
+        let ⟨fuel, hF⟩ := ih
+        refine ⟨fuel + 1, ?_⟩
+        dsimp only [execStepOutcome]
+        rw [execStepPred_succ_iff, v2026Step_step_iff_mirNoCallStep_step.mpr hStep]
+        exact hF)
+      (fun st out hDone hPost => by
+        refine ⟨1, ?_⟩
+        dsimp only [execStepOutcome]
+        rw [execStepPred_succ_iff, v2026Step_done_iff_mirNoCallStep_done.mpr hDone]
+        exact hPost)
+      (fun _ _ _ hF => False.elim hF) hWp
+  · intro ⟨fuel, hExec⟩
+    induction fuel generalizing s with
+    | zero => exact False.elim hExec
+    | succ fuel ih =>
+      dsimp only [execStepOutcome] at hExec
+      rw [execStepPred_succ_iff] at hExec
+      cases hStep : v2026Step body s with
+      | step s' =>
+        rw [hStep] at hExec
+        refine Anneal.ParametricCore.wpUntil_step
+          (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps body) ?_
+        change (Anneal.ParametricCore.V2026Bridge.mirNoCallStep body s).wp _ _ _
+        rw [v2026Step_step_iff_mirNoCallStep_step.mp hStep]
+        exact ih hExec
+      | done out =>
+        rw [hStep] at hExec
+        refine Anneal.ParametricCore.wpUntil_step
+          (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps body) ?_
+        change (Anneal.ParametricCore.V2026Bridge.mirNoCallStep body s).wp _ _ _
+        rw [v2026Step_done_iff_mirNoCallStep_done.mp hStep]
+        exact hExec
+      | fault _ =>
+        rw [hStep] at hExec
+        exact False.elim hExec
+
 /-! ### Exact Completeness: `wpMirNoCallSym` ⇒ `execStepOutcome (v2026Step body)` -/
 
 private theorem v2026ExecSt_of_wpMirExecNoCallSym {body : CapturedMir}
@@ -1091,8 +1487,9 @@ theorem mirNoUBTree_of_v2026Exec {body : CapturedMir} {s : MachineState}
     MirNoUBTree (mirTree body s) :=
   treeSafe_mirTree_of_v2026Exec h
 
-/-- Whole-function stateless `VerificationResult` (`mirSafePost`) lifting from
-`execStepOutcome (v2026Step c.body)`. -/
+/-- Whole-function stateless `VerificationResult` (`mirSafePost`) lifting
+directly from `execStepOutcome (v2026Step c.body)` via choice-free `TreeSafe` +
+`ReachesRet` adequacy (`{propext, Quot.sound}` only). -/
 theorem verifyMirSafe_of_v2026Exec (c : Claim)
     (h : ∀ args : List Value, c.pre args →
       ∃ fuel : Nat,
@@ -1100,13 +1497,18 @@ theorem verifyMirSafe_of_v2026Exec (c : Claim)
           (mirSafePost (fun retVal _ => c.post args retVal))
           (fun _ => False) fuel
           (initMachineStateWithCallees c.body args c.callees)) :
-    VerificationResult c :=
-  verifyMirSafe_of_wpConverges c (fun args hPre => by
-    let ⟨_, hExec⟩ := h args hPre
-    exact mirWpConverges_of_v2026Exec hExec)
+    VerificationResult c := by
+  refine ⟨fun args hPre => ?_⟩
+  let ⟨_, hExec⟩ := h args hPre
+  refine ⟨treeSafe_mirTree_of_v2026Exec hExec,
+    fun outPair hRet _ retVal mem' hEq => ?_⟩
+  have hSafe := reachesRet_post_of_v2026Exec hExec outPair.1 outPair.2 hRet
+  rw [hEq] at hSafe
+  exact hSafe
 
 /-- Whole-function panic-forbidding stateless `VerificationResult`
-(`mirNormalPost`) lifting from `execStepOutcome (v2026Step c.body)`. -/
+(`mirNormalPost`) lifting directly from `execStepOutcome (v2026Step c.body)`
+(`{propext, Quot.sound}` only). -/
 theorem verifyMirNoPanic_of_v2026Exec (c : Claim)
     (h : ∀ args : List Value, c.pre args →
       ∃ fuel : Nat,
@@ -1115,12 +1517,14 @@ theorem verifyMirNoPanic_of_v2026Exec (c : Claim)
           (fun _ => False) fuel
           (initMachineStateWithCallees c.body args c.callees)) :
     VerificationResult c :=
-  verifyMirNoPanic_of_wpConverges c (fun args hPre => by
-    let ⟨_, hExec⟩ := h args hPre
-    exact mirWpConverges_of_v2026Exec hExec)
+  verifyMirSafe_of_v2026Exec c (fun args hPre => by
+    let ⟨fuel, hExec⟩ := h args hPre
+    exact ⟨fuel, execStepPred_mono
+      (fun _ _ ho => mirNormalPost_imp_mirSafePost ho) (fun _ _ hf => hf) hExec⟩)
 
 /-- Whole-function stateful `StatefulVerificationResult` (`mirSafePost`)
-lifting from `execStepOutcome (v2026Step c.body)`. -/
+lifting directly from `execStepOutcome (v2026Step c.body)`
+(`{propext, Quot.sound}` only). -/
 theorem verifyStatefulMirSafe_of_v2026Exec (c : StatefulClaim)
     (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
       ∃ fuel : Nat,
@@ -1129,13 +1533,18 @@ theorem verifyStatefulMirSafe_of_v2026Exec (c : StatefulClaim)
           (fun _ => False) fuel
           (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
             c.body args mem c.callees)) :
-    StatefulVerificationResult c :=
-  verifyStatefulMirSafe_of_wpConverges c (fun args mem hPre => by
-    let ⟨_, hExec⟩ := h args mem hPre
-    exact mirWpConverges_of_v2026Exec hExec)
+    StatefulVerificationResult c := by
+  refine ⟨fun args mem hPre => ?_⟩
+  let ⟨_, hExec⟩ := h args mem hPre
+  refine ⟨treeSafe_mirTree_of_v2026Exec hExec,
+    fun outPair hRet _ retVal mem' hEq => ?_⟩
+  have hSafe := reachesRet_post_of_v2026Exec hExec outPair.1 outPair.2 hRet
+  rw [hEq] at hSafe
+  exact hSafe
 
 /-- Whole-function panic-forbidding stateful `StatefulVerificationResult`
-(`mirNormalPost`) lifting from `execStepOutcome (v2026Step c.body)`. -/
+(`mirNormalPost`) lifting directly from `execStepOutcome (v2026Step c.body)`
+(`{propext, Quot.sound}` only). -/
 theorem verifyStatefulMirNoPanic_of_v2026Exec (c : StatefulClaim)
     (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
       ∃ fuel : Nat,
@@ -1145,12 +1554,15 @@ theorem verifyStatefulMirNoPanic_of_v2026Exec (c : StatefulClaim)
           (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
             c.body args mem c.callees)) :
     StatefulVerificationResult c :=
-  verifyStatefulMirNoPanic_of_wpConverges c (fun args mem hPre => by
-    let ⟨_, hExec⟩ := h args mem hPre
-    exact mirWpConverges_of_v2026Exec hExec)
+  verifyStatefulMirSafe_of_v2026Exec c (fun args mem hPre => by
+    let ⟨fuel, hExec⟩ := h args mem hPre
+    exact ⟨fuel, execStepPred_mono
+      (fun _ _ ho => mirNormalPost_imp_mirSafePost ho) (fun _ _ hf => hf) hExec⟩)
 
 /-- Whole-function total-correctness `TotalVerificationResult`
-(`mirNormalPost`) lifting from `execStepOutcome (v2026Step c.body)`. -/
+(`mirNormalPost`) lifting directly from `execStepOutcome (v2026Step c.body)`
+via direct `TreeSafe`, `Productive`, `productive_not_mayDiverge`, and
+`ReachesRet` adequacy (bypassing `DWP` / `DWLP`). -/
 theorem verifyTotalMir_of_v2026Exec (c : TotalClaim)
     (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
       ∃ fuel : Nat,
@@ -1159,10 +1571,17 @@ theorem verifyTotalMir_of_v2026Exec (c : TotalClaim)
           (fun _ => False) fuel
           (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
             c.body args mem c.callees)) :
-    TotalVerificationResult c :=
-  verifyTotalMir_of_wpConverges c (fun args mem hPre => by
-    let ⟨_, hExec⟩ := h args mem hPre
-    exact mirWpConverges_of_v2026Exec hExec)
+    TotalVerificationResult c := by
+  refine ⟨fun args mem hPre => ?_⟩
+  let ⟨_, hExec⟩ := h args mem hPre
+  have hProd := productive_mirTree_of_v2026Exec hExec
+  refine ⟨treeSafe_mirTree_of_v2026Exec hExec, hProd,
+    Anneal.ITree.productive_not_mayDiverge hProd, fun tr out hRet => ?_⟩
+  have hNorm := reachesRet_post_of_v2026Exec hExec tr out hRet
+  cases out with
+  | normal p => exact ⟨p.1, p.2, rfl, hNorm⟩
+  | panic => exact False.elim hNorm
+  | abort => exact False.elim hNorm
 
 /-! ## Part II: Deterministic `execWlp*`, Anti-Monotonicity, & Asymmetric Two-Pass Splitting -/
 
@@ -1395,6 +1814,29 @@ theorem wpProgV2026_of_wlp_and_safety_le {body : CapturedMir}
     wpProgV2026 body fuelSafe args callees post :=
   wpStateV2026_of_wlp_and_safety_le hLe hWlp hSafe
 
+/-- Deterministic fast-path asymmetric-fuel two-pass state combination
+(`fuelSafe ≤ fuelWlp`). -/
+theorem execStateV2026_of_execWlp_and_safety_le {body : CapturedMir}
+    {fuelSafe fuelWlp : Nat} {s : MachineState}
+    {post : MirOutcome → Prop} {onFault : V2026StepFault → Prop}
+    (hLe : fuelSafe ≤ fuelWlp)
+    (hWlp : execWlpOutcomeV2026 body post onFault fuelWlp s)
+    (hSafe : execStateV2026 body fuelSafe s (fun _ => True)) :
+    execStateV2026 body fuelSafe s post :=
+  execStepPred_mono (fun _ _ h => h.1) (fun _ _ h => h.2)
+    (execStepPred_of_wlp_and_safety_le hLe hWlp hSafe)
+
+/-- Deterministic fast-path whole-function asymmetric-fuel two-pass rule
+(`fuelSafe ≤ fuelWlp`). -/
+theorem execProgV2026_of_execWlp_and_safety_le {body : CapturedMir}
+    {fuelSafe fuelWlp : Nat} {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop}
+    (hLe : fuelSafe ≤ fuelWlp)
+    (hWlp : execWlpProgV2026 body fuelWlp args callees post)
+    (hSafe : execProgV2026 body fuelSafe args callees (fun _ => True)) :
+    execProgV2026 body fuelSafe args callees post :=
+  execStateV2026_of_execWlp_and_safety_le hLe hWlp hSafe
+
 /-- Asymmetric-fuel two-pass adequacy into `Anneal.MirFuelFree.MirWpConverges`
 whenever `fuelSafe ≤ fuelWlp`. -/
 theorem mirWpConverges_of_wlp_and_safety_le {body : CapturedMir}
@@ -1422,7 +1864,7 @@ theorem mirNoUBTree_of_wlp_and_safety_le {body : CapturedMir}
 
 /-- Whole-function stateless `VerificationResult` (`mirSafePost`) from an
 asymmetric-fuel two-pass (`wlpProgV2026` at `fuelWlp` + safety `wpProgV2026` at
-`fuelSafe ≤ fuelWlp`) derivation. -/
+`fuelSafe ≤ fuelWlp`) derivation (`{propext, Quot.sound}` only). -/
 theorem verifyMirSafe_of_wlp_and_safety_le (c : Claim)
     (h : ∀ args : List Value, c.pre args →
       ∃ fuelSafe fuelWlp : Nat,
@@ -1431,13 +1873,14 @@ theorem verifyMirSafe_of_wlp_and_safety_le (c : Claim)
           (mirSafePost (fun retVal _ => c.post args retVal)) ∧
         wpProgV2026 c.body fuelSafe args c.callees (fun _ => True)) :
     VerificationResult c :=
-  verifyMirSafe_of_wpConverges c (fun args hPre => by
-    let ⟨_, _, hLe, hWlp, hSafe⟩ := h args hPre
-    exact mirWpConverges_of_wlp_and_safety_le hLe hWlp hSafe)
+  verifyMirSafe_of_v2026Exec c (fun args hPre => by
+    let ⟨fuelSafe, _, hLe, hWlp, hSafe⟩ := h args hPre
+    exact ⟨fuelSafe, wpOutcomeV2026_iff_execOutcomeV2026.mp
+      (wpProgV2026_of_wlp_and_safety_le hLe hWlp hSafe)⟩)
 
 /-- Whole-function panic-forbidding stateless `VerificationResult`
-(`mirNormalPost`) from an asymmetric-fuel two-pass (`wlpProgV2026` at `fuelWlp`
-+ safety `wpProgV2026` at `fuelSafe ≤ fuelWlp`) derivation. -/
+(`mirNormalPost`) from an asymmetric-fuel two-pass derivation
+(`{propext, Quot.sound}` only). -/
 theorem verifyMirNoPanic_of_wlp_and_safety_le (c : Claim)
     (h : ∀ args : List Value, c.pre args →
       ∃ fuelSafe fuelWlp : Nat,
@@ -1446,12 +1889,34 @@ theorem verifyMirNoPanic_of_wlp_and_safety_le (c : Claim)
           (mirNormalPost (fun retVal _ => c.post args retVal)) ∧
         wpProgV2026 c.body fuelSafe args c.callees (fun _ => True)) :
     VerificationResult c :=
-  verifyMirNoPanic_of_wpConverges c (fun args hPre => by
-    let ⟨_, _, hLe, hWlp, hSafe⟩ := h args hPre
-    exact mirWpConverges_of_wlp_and_safety_le hLe hWlp hSafe)
+  verifyMirNoPanic_of_v2026Exec c (fun args hPre => by
+    let ⟨fuelSafe, _, hLe, hWlp, hSafe⟩ := h args hPre
+    exact ⟨fuelSafe, wpOutcomeV2026_iff_execOutcomeV2026.mp
+      (wpProgV2026_of_wlp_and_safety_le hLe hWlp hSafe)⟩)
+
+/-- Whole-function stateful `StatefulVerificationResult` (`mirSafePost`) from
+an asymmetric-fuel two-pass derivation (`{propext, Quot.sound}` only). -/
+theorem verifyStatefulMirSafe_of_wlp_and_safety_le (c : StatefulClaim)
+    (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      ∃ fuelSafe fuelWlp : Nat,
+        fuelSafe ≤ fuelWlp ∧
+        wlpOutcomeV2026 c.body (mirSafePost (c.post args mem))
+          (fun _ => True) fuelWlp
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees) ∧
+        wpStateV2026 c.body fuelSafe
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
+          (fun _ => True)) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirSafe_of_v2026Exec c (fun args mem hPre => by
+    let ⟨fuelSafe, _, hLe, hWlp, hSafe⟩ := h args mem hPre
+    exact ⟨fuelSafe, wpOutcomeV2026_iff_execOutcomeV2026.mp
+      (wpStateV2026_of_wlp_and_safety_le hLe hWlp hSafe)⟩)
 
 /-- Whole-function panic-forbidding stateful `StatefulVerificationResult`
-(`mirNormalPost`) from an asymmetric-fuel two-pass derivation. -/
+(`mirNormalPost`) from an asymmetric-fuel two-pass derivation
+(`{propext, Quot.sound}` only). -/
 theorem verifyStatefulMirNoPanic_of_wlp_and_safety_le (c : StatefulClaim)
     (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
       ∃ fuelSafe fuelWlp : Nat,
@@ -1465,9 +1930,30 @@ theorem verifyStatefulMirNoPanic_of_wlp_and_safety_le (c : StatefulClaim)
             c.body args mem c.callees)
           (fun _ => True)) :
     StatefulVerificationResult c :=
-  verifyStatefulMirNoPanic_of_wpConverges c (fun args mem hPre => by
-    let ⟨_, _, hLe, hWlp, hSafe⟩ := h args mem hPre
-    exact mirWpConverges_of_wlp_and_safety_le hLe hWlp hSafe)
+  verifyStatefulMirNoPanic_of_v2026Exec c (fun args mem hPre => by
+    let ⟨fuelSafe, _, hLe, hWlp, hSafe⟩ := h args mem hPre
+    exact ⟨fuelSafe, wpOutcomeV2026_iff_execOutcomeV2026.mp
+      (wpStateV2026_of_wlp_and_safety_le hLe hWlp hSafe)⟩)
+
+/-- Whole-function total-correctness `TotalVerificationResult`
+(`mirNormalPost`) from an asymmetric-fuel two-pass derivation. -/
+theorem verifyTotalMir_of_wlp_and_safety_le (c : TotalClaim)
+    (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      ∃ fuelSafe fuelWlp : Nat,
+        fuelSafe ≤ fuelWlp ∧
+        wlpOutcomeV2026 c.body (mirNormalPost (c.post args mem))
+          (fun _ => True) fuelWlp
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees) ∧
+        wpStateV2026 c.body fuelSafe
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
+          (fun _ => True)) :
+    TotalVerificationResult c :=
+  verifyTotalMir_of_v2026Exec c (fun args mem hPre => by
+    let ⟨fuelSafe, _, hLe, hWlp, hSafe⟩ := h args mem hPre
+    exact ⟨fuelSafe, wpOutcomeV2026_iff_execOutcomeV2026.mp
+      (wpStateV2026_of_wlp_and_safety_le hLe hWlp hSafe)⟩)
 
 /-! ## Part III: Minimum-Budget Conjunctive Composition (`compNatMin`) -/
 
@@ -1489,83 +1975,45 @@ theorem compNatMin_le_right (a b : Nat) : compNatMin a b ≤ b :=
 
 /-- Conjunctive composition for `wlpOutcomeV2026` at `compNatMin n₁ n₂`. -/
 theorem wlpOutcomeV2026_conj {body : CapturedMir}
-    {d₁ d₂ : MirOutcome → Prop} {f₁ f₂ : V2026StepFault → Prop} :
-    ∀ {n₁ n₂ : Nat} {s : MachineState},
-      wlpOutcomeV2026 body d₁ f₁ n₁ s →
-      wlpOutcomeV2026 body d₂ f₂ n₂ s →
-      wlpOutcomeV2026 body (fun o => d₁ o ∧ d₂ o) (fun k => f₁ k ∧ f₂ k)
-        (compNatMin n₁ n₂) s
-  | 0, _, _, _, _ => trivial
-  | _ + 1, 0, _, _, _ => trivial
-  | n₁ + 1, n₂ + 1, s, h₁, h₂ => by
-    rw [compNatMin_succ_succ]
-    intro c hc
-    have hc₁ := h₁ c hc
-    have hc₂ := h₂ c hc
-    dsimp only at hc₁ hc₂ ⊢
-    cases hStep : v2026Step body s with
-    | step st' =>
-      rw [hStep] at hc₁ hc₂
-      exact wlpOutcomeV2026_conj hc₁ hc₂
-    | done out =>
-      rw [hStep] at hc₁ hc₂
-      exact ⟨hc₁, hc₂⟩
-    | fault k =>
-      rw [hStep] at hc₁ hc₂
-      exact ⟨hc₁, hc₂⟩
+    {d₁ d₂ : MirOutcome → Prop} {f₁ f₂ : V2026StepFault → Prop}
+    {n₁ n₂ : Nat} {s : MachineState}
+    (h₁ : wlpOutcomeV2026 body d₁ f₁ n₁ s)
+    (h₂ : wlpOutcomeV2026 body d₂ f₂ n₂ s) :
+    wlpOutcomeV2026 body (fun o => d₁ o ∧ d₂ o) (fun k => f₁ k ∧ f₂ k)
+      (compNatMin n₁ n₂) s :=
+  wlpStepPred_conj h₁ h₂
+
+/-- Conjunctive composition for deterministic `execWlpOutcomeV2026` at
+`compNatMin n₁ n₂`. -/
+theorem execWlpOutcomeV2026_conj {body : CapturedMir}
+    {d₁ d₂ : MirOutcome → Prop} {f₁ f₂ : V2026StepFault → Prop}
+    {n₁ n₂ : Nat} {s : MachineState}
+    (h₁ : execWlpOutcomeV2026 body d₁ f₁ n₁ s)
+    (h₂ : execWlpOutcomeV2026 body d₂ f₂ n₂ s) :
+    execWlpOutcomeV2026 body (fun o => d₁ o ∧ d₂ o) (fun k => f₁ k ∧ f₂ k)
+      (compNatMin n₁ n₂) s :=
+  execWlpStepPred_conj h₁ h₂
 
 /-- Conjunctive composition for `wpOutcomeV2026` at `compNatMin n₁ n₂`. -/
 theorem wpOutcomeV2026_conj {body : CapturedMir}
-    {d₁ d₂ : MirOutcome → Prop} {f₁ f₂ : V2026StepFault → Prop} :
-    ∀ {n₁ n₂ : Nat} {s : MachineState},
-      wpOutcomeV2026 body d₁ f₁ n₁ s →
-      wpOutcomeV2026 body d₂ f₂ n₂ s →
-      wpOutcomeV2026 body (fun o => d₁ o ∧ d₂ o) (fun k => f₁ k ∧ f₂ k)
-        (compNatMin n₁ n₂) s
-  | 0, _, _, h₁, _ => False.elim h₁
-  | _ + 1, 0, _, _, h₂ => False.elim h₂
-  | n₁ + 1, n₂ + 1, s, h₁, h₂ => by
-    rw [compNatMin_succ_succ]
-    refine ⟨h₁.1, fun c hc => ?_⟩
-    have hc₁ := h₁.2 c hc
-    have hc₂ := h₂.2 c hc
-    dsimp only at hc₁ hc₂ ⊢
-    cases hStep : v2026Step body s with
-    | step st' =>
-      rw [hStep] at hc₁ hc₂
-      exact wpOutcomeV2026_conj hc₁ hc₂
-    | done out =>
-      rw [hStep] at hc₁ hc₂
-      exact ⟨hc₁, hc₂⟩
-    | fault k =>
-      rw [hStep] at hc₁ hc₂
-      exact ⟨hc₁, hc₂⟩
+    {d₁ d₂ : MirOutcome → Prop} {f₁ f₂ : V2026StepFault → Prop}
+    {n₁ n₂ : Nat} {s : MachineState}
+    (h₁ : wpOutcomeV2026 body d₁ f₁ n₁ s)
+    (h₂ : wpOutcomeV2026 body d₂ f₂ n₂ s) :
+    wpOutcomeV2026 body (fun o => d₁ o ∧ d₂ o) (fun k => f₁ k ∧ f₂ k)
+      (compNatMin n₁ n₂) s :=
+  wpStepPred_conj h₁ h₂
 
 /-- Conjunctive composition for deterministic `execStepOutcome` over an
 arbitrary step function at `compNatMin n₁ n₂`. -/
 theorem execStepOutcome_conj {S Out F : Type} {step : S → StepResult S Out F}
-    {d₁ d₂ : Out → Prop} {f₁ f₂ : F → Prop} :
-    ∀ {n₁ n₂ : Nat} {s : S},
-      execStepOutcome step d₁ f₁ n₁ s →
-      execStepOutcome step d₂ f₂ n₂ s →
-      execStepOutcome step (fun o => d₁ o ∧ d₂ o) (fun k => f₁ k ∧ f₂ k)
-        (compNatMin n₁ n₂) s
-  | 0, _, _, h₁, _ => False.elim h₁
-  | _ + 1, 0, _, _, h₂ => False.elim h₂
-  | n₁ + 1, n₂ + 1, s, h₁, h₂ => by
-    rw [compNatMin_succ_succ]
-    dsimp only [execStepOutcome] at h₁ h₂ ⊢
-    rw [execStepPred_succ_iff] at h₁ h₂ ⊢
-    cases hStep : step s with
-    | step st' =>
-      rw [hStep] at h₁ h₂
-      exact execStepOutcome_conj h₁ h₂
-    | done out =>
-      rw [hStep] at h₁ h₂
-      exact ⟨h₁, h₂⟩
-    | fault k =>
-      rw [hStep] at h₁ h₂
-      exact ⟨h₁, h₂⟩
+    {d₁ d₂ : Out → Prop} {f₁ f₂ : F → Prop}
+    {n₁ n₂ : Nat} {s : S}
+    (h₁ : execStepOutcome step d₁ f₁ n₁ s)
+    (h₂ : execStepOutcome step d₂ f₂ n₂ s) :
+    execStepOutcome step (fun o => d₁ o ∧ d₂ o) (fun k => f₁ k ∧ f₂ k)
+      (compNatMin n₁ n₂) s :=
+  execStepPred_conj h₁ h₂
 
 /-- Conjunctive composition for `wpProgV2026` at `compNatMin n₁ n₂`. -/
 theorem wpProgV2026_conj {body : CapturedMir} {n₁ n₂ : Nat}
@@ -1577,6 +2025,41 @@ theorem wpProgV2026_conj {body : CapturedMir} {n₁ n₂ : Nat}
       (fun out => post₁ out ∧ post₂ out) :=
   wpStepPred_mono (fun _ _ h => h) (fun _ _ h => h.1)
     (wpOutcomeV2026_conj h₁ h₂)
+
+/-- Conjunctive composition for `wlpProgV2026` at `compNatMin n₁ n₂`. -/
+theorem wlpProgV2026_conj {body : CapturedMir} {n₁ n₂ : Nat}
+    {args : List Value} {callees : List CapturedMir}
+    {post₁ post₂ : MirOutcome → Prop}
+    (h₁ : wlpProgV2026 body n₁ args callees post₁)
+    (h₂ : wlpProgV2026 body n₂ args callees post₂) :
+    wlpProgV2026 body (compNatMin n₁ n₂) args callees
+      (fun out => post₁ out ∧ post₂ out) :=
+  wlpOutcomeV2026_mono (fun _ h => h) (fun _ _ => trivial)
+    (wlpOutcomeV2026_conj h₁ h₂)
+
+/-- Conjunctive composition for strict fault-forbidding `wlpProgStrictV2026`
+at `compNatMin n₁ n₂`. -/
+theorem wlpProgStrictV2026_conj {body : CapturedMir} {n₁ n₂ : Nat}
+    {args : List Value} {callees : List CapturedMir}
+    {post₁ post₂ : MirOutcome → Prop}
+    (h₁ : wlpProgStrictV2026 body n₁ args callees post₁)
+    (h₂ : wlpProgStrictV2026 body n₂ args callees post₂) :
+    wlpProgStrictV2026 body (compNatMin n₁ n₂) args callees
+      (fun out => post₁ out ∧ post₂ out) :=
+  wlpOutcomeV2026_mono (fun _ h => h) (fun _ h => h.1)
+    (wlpOutcomeV2026_conj h₁ h₂)
+
+/-- Conjunctive composition for deterministic `execUntil` sharing a checkpoint
+predicate `stop` at `compNatMin n₁ n₂`. -/
+theorem execUntil_conj_same_stop {S Out F : Type}
+    {step : S → StepResult S Out F} {stop : S → Prop}
+    {d₁ d₂ : Out → Prop} {f₁ f₂ : F → Prop}
+    {n₁ n₂ : Nat} {s : S}
+    (h₁ : execUntil step stop d₁ f₁ n₁ s)
+    (h₂ : execUntil step stop d₂ f₂ n₂ s) :
+    execUntil step stop (fun o => d₁ o ∧ d₂ o) (fun k => f₁ k ∧ f₂ k)
+      (compNatMin n₁ n₂) s :=
+  execUntilPred_conj_same_stop h₁ h₂
 
 /-- Conjunctive composition for `wpUntil` sharing a checkpoint predicate `stop`
 at `compNatMin n₁ n₂`. -/
@@ -2108,8 +2591,22 @@ theorem verifyMirNoPanic_of_wpProgPow2 (c : Claim)
     let ⟨k, hk⟩ := h args hPre
     exact ⟨pow2Fuel k, wpPow2_iff_execStepOutcome.mp hk⟩)
 
+/-- Whole-function stateful `StatefulVerificationResult` (`mirSafePost`) from
+`wpStatePow2` (`{propext, Quot.sound}` only). -/
+theorem verifyStatefulMirSafe_of_wpProgPow2 (c : StatefulClaim)
+    (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      ∃ k : Nat,
+        wpStatePow2 c.body k
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
+          (mirSafePost (c.post args mem))) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirSafe_of_v2026Exec c (fun args mem hPre => by
+    let ⟨k, hk⟩ := h args mem hPre
+    exact ⟨pow2Fuel k, wpPow2_iff_execStepOutcome.mp hk⟩)
+
 /-- Whole-function panic-forbidding stateful `StatefulVerificationResult`
-(`mirNormalPost`) from `wpStatePow2`. -/
+(`mirNormalPost`) from `wpStatePow2` (`{propext, Quot.sound}` only). -/
 theorem verifyStatefulMirNoPanic_of_wpProgPow2 (c : StatefulClaim)
     (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
       ∃ k : Nat,
@@ -2119,6 +2616,20 @@ theorem verifyStatefulMirNoPanic_of_wpProgPow2 (c : StatefulClaim)
           (mirNormalPost (c.post args mem))) :
     StatefulVerificationResult c :=
   verifyStatefulMirNoPanic_of_v2026Exec c (fun args mem hPre => by
+    let ⟨k, hk⟩ := h args mem hPre
+    exact ⟨pow2Fuel k, wpPow2_iff_execStepOutcome.mp hk⟩)
+
+/-- Whole-function total-correctness `TotalVerificationResult` (`mirNormalPost`)
+from `wpStatePow2`. -/
+theorem verifyTotalMir_of_wpProgPow2 (c : TotalClaim)
+    (h : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      ∃ k : Nat,
+        wpStatePow2 c.body k
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
+          (mirNormalPost (c.post args mem))) :
+    TotalVerificationResult c :=
+  verifyTotalMir_of_v2026Exec c (fun args mem hPre => by
     let ⟨k, hk⟩ := h args mem hPre
     exact ⟨pow2Fuel k, wpPow2_iff_execStepOutcome.mp hk⟩)
 
@@ -2236,5 +2747,68 @@ theorem canary_v2026_switchInt_observable_vis :
     fun _ _ => wpMirSym_succ_of_emitStep hEmit⟩
   rw [hEmit] at hTau
   cases hTau
+
+private def canaryUnreachableMirBody : CapturedMir :=
+  { defPath := "Anneal::ConjunctiveWp::canaryUnreachable"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 0
+    localDecls := [{ mutability := .mut, ty := u32Ty, debugName := some "_0" }]
+    basicBlocks :=
+      [ { statements := []
+          terminator := { kind := .unreachable, span := "WlpV2026.lean:ub:bb0" }
+          isCleanup := false } ]
+    fnAbi :=
+      { args := []
+        ret := { layout := u32Layout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts :=
+      { pointerBits := 64
+        isLittleEndian := true
+        entries := [u32Layout] }
+    allocations := [] }
+
+/-- Concrete canary covering:
+1. Faulting `wlpProgV2026` (`onFault := True`) vs strict `wlpProgStrictV2026`
+   (`onFault := False`) on `canaryUnreachableMirBody` (confirming relaxed WLP
+   cannot imply safety alone while strict WLP refutes UB).
+2. `wpPow2Cont_inv` lifting a 1-step invariant to arbitrary depth `k : Nat`
+   (`2^k` steps) in `O(k)` on `canaryDivergingMirBody`, plus
+   `wlpOutcomeV2026_of_wpPow2Cont`.
+3. Choice-free `VerificationResult` via `verifyMirNoPanic_of_wpProgPow2` on
+   `branchingTracePipelineBody`. -/
+theorem canary_v2026_wlp_strict_pow2_inv_and_verify (k : Nat) :
+    wlpProgV2026 canaryUnreachableMirBody 2 [] [] (fun _ => False) ∧
+    ¬ wlpProgStrictV2026 canaryUnreachableMirBody 2 [] [] (fun _ => True) ∧
+    wlpOutcomeV2026 canaryDivergingMirBody (fun _ => False) (fun _ => False)
+      (pow2Fuel k) (initMachineState canaryDivergingMirBody []) ∧
+    VerificationResult
+      { body := branchingTracePipelineBody
+        pre := fun args => args = [.scalar { bits := 7, sizeBytes := 4 }]
+        post := fun _ retVal => retVal = .scalar { bits := 7, sizeBytes := 4 } } := by
+  have hRelax : wlpProgV2026 canaryUnreachableMirBody 2 [] [] (fun _ => False) :=
+    wlpProgV2026_iff_execWlpProgV2026.mpr trivial
+  have hStrict : ¬ wlpProgStrictV2026 canaryUnreachableMirBody 2 [] [] (fun _ => True) := by
+    intro hS
+    exact wlpProgStrictV2026_iff_execWlpProgStrictV2026.mp hS
+  let sDiv := initMachineState canaryDivergingMirBody []
+  have hStepSelf : v2026Step canaryDivergingMirBody sDiv = .step sDiv := rfl
+  have hPowK : wpPow2Cont canaryDivergingMirBody (fun _ => False)
+      (fun _ => False) k (fun st => st = sDiv) sDiv := by
+    refine wpPow2Cont_inv (inv := fun st => st = sDiv) (fun st hEq => ?_) k rfl
+    subst hEq
+    refine ⟨⟨(), rfl⟩, fun ch hch => ?_⟩
+    subst hch
+    rw [hStepSelf]
+  have hWlpPowK := wlpOutcomeV2026_of_wpPow2Cont hPowK
+  have hVerify : VerificationResult
+      { body := branchingTracePipelineBody
+        pre := fun args => args = [.scalar { bits := 7, sizeBytes := 4 }]
+        post := fun _ retVal => retVal = .scalar { bits := 7, sizeBytes := 4 } } := by
+    refine verifyMirNoPanic_of_wpProgPow2 _ (fun args hPre => ?_)
+    subst hPre
+    exact ⟨2, wpProgPow2_of_execProgPow2 rfl⟩
+  exact ⟨hRelax, hStrict, hWlpPowK, hVerify⟩
 
 end Anneal.ConjunctiveWp

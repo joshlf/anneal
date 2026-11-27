@@ -1801,6 +1801,47 @@ theorem wpStepPred_of_wpUntilCutStep {S Out F C : Type}
 
 attribute [irreducible] StepStageCut
 
+/-- Stage frame for a step invariant over a sealed `StepStageCut` (`0`
+unsealing, proved via `StepStageCut.induction`): if every `.step` transition
+preserves `F`, then `F s₀ → F s₁`. -/
+theorem StepStageCut.frame {S Out F : Type} {step : S → StepResult S Out F}
+    {Inv : S → Prop}
+    (hFrame : ∀ s s', Inv s → step s = .step s' → Inv s')
+    {fuel : Nat} {s₀ s₁ : S} (hCut : StepStageCut step fuel s₀ s₁)
+    (hInv : Inv s₀) : Inv s₁ := by
+  let ⟨_, _, hImp⟩ :=
+    StepStageCut.induction (R := fun _ a b => Inv a → Inv b)
+      (fun _ h => h)
+      (fun _ s s' _ hStep ih hS => ih (hFrame s s' hS hStep))
+      hCut
+  exact hImp hInv
+
+/-- Stage frame for a state projection over a sealed `StepStageCut`: if every
+`.step` preserves `proj`, then `proj s₁ = proj s₀`. -/
+theorem StepStageCut.frame_proj {S Out F V : Type}
+    {step : S → StepResult S Out F} {proj : S → V}
+    (hFrame : ∀ s s', step s = .step s' → proj s' = proj s)
+    {fuel : Nat} {s₀ s₁ : S} (hCut : StepStageCut step fuel s₀ s₁) :
+    proj s₁ = proj s₀ :=
+  StepStageCut.frame (Inv := fun s => proj s = proj s₀)
+    (fun s s' hEq hStep => (hFrame s s' hStep).trans hEq) hCut rfl
+
+/-- Wrap a sealed `StepStageCut` inside `Anneal.Firewall.IndexedCut`. -/
+theorem StepStageCut.toIndexedCut {S Out F : Type}
+    {step : S → StepResult S Out F} {fuel : Nat} {s₀ s₁ : S}
+    (stage : Nat) (h : StepStageCut step fuel s₀ s₁) :
+    Anneal.Firewall.IndexedCut
+      (fun (_ : Nat) (p : S × S) => StepStageCut step fuel p.1 p.2) stage (s₀, s₁) :=
+  Anneal.Firewall.seal_cut h
+
+/-- Recover a sealed `StepStageCut` from `Anneal.Firewall.IndexedCut`. -/
+theorem StepStageCut.ofIndexedCut {S Out F : Type}
+    {step : S → StepResult S Out F} {fuel : Nat} {stage : Nat} {s₀ s₁ : S}
+    (h : Anneal.Firewall.IndexedCut
+      (fun (_ : Nat) (p : S × S) => StepStageCut step fuel p.1 p.2) stage (s₀, s₁)) :
+    StepStageCut step fuel s₀ s₁ :=
+  Anneal.Firewall.open_cut h
+
 /-! ## 4. Generic Loop Induction, Simulation & Early-Return Cut Loops -/
 
 /-- Well-founded (`Acc rel`) loop-invariant induction over `wpUntilPred`:
@@ -2388,6 +2429,149 @@ theorem compNatMin_le_right (a b : Nat) : compNatMin a b ≤ b := by
   | true => exact Nat.le_of_ble_eq_true h
   | false => exact Nat.le_refl b
 
+/-- Generic minimum-budget conjunctive composition for `wpStepPred` at
+`compNatMin n₁ n₂`. -/
+theorem wpStepPred_conj {S Out F C : Type}
+    {validChoice : S → C → Prop} {step : C → S → StepResult S Out F}
+    {d₁ d₂ : S → Out → Prop} {f₁ f₂ : S → F → Prop} :
+    ∀ {n₁ n₂ : Nat} {s : S},
+      wpStepPred validChoice step d₁ f₁ n₁ s →
+      wpStepPred validChoice step d₂ f₂ n₂ s →
+      wpStepPred validChoice step
+        (fun st o => d₁ st o ∧ d₂ st o) (fun st k => f₁ st k ∧ f₂ st k)
+        (compNatMin n₁ n₂) s
+  | 0, _, _, h₁, _ => False.elim h₁
+  | _ + 1, 0, _, _, h₂ => False.elim h₂
+  | n₁ + 1, n₂ + 1, s, h₁, h₂ => by
+    rw [compNatMin_succ_succ]
+    refine ⟨h₁.1, fun c hc => ?_⟩
+    have hc₁ := h₁.2 c hc
+    have hc₂ := h₂.2 c hc
+    cases hStep : step c s with
+    | step st' =>
+      rw [hStep] at hc₁ hc₂
+      exact wpStepPred_conj hc₁ hc₂
+    | done out =>
+      rw [hStep] at hc₁ hc₂
+      exact ⟨hc₁, hc₂⟩
+    | fault k =>
+      rw [hStep] at hc₁ hc₂
+      exact ⟨hc₁, hc₂⟩
+
+/-- Generic minimum-budget conjunctive composition for `wlpStepPred` at
+`compNatMin n₁ n₂`. -/
+theorem wlpStepPred_conj {S Out F C : Type}
+    {validChoice : S → C → Prop} {step : C → S → StepResult S Out F}
+    {d₁ d₂ : S → Out → Prop} {f₁ f₂ : S → F → Prop} :
+    ∀ {n₁ n₂ : Nat} {s : S},
+      wlpStepPred validChoice step d₁ f₁ n₁ s →
+      wlpStepPred validChoice step d₂ f₂ n₂ s →
+      wlpStepPred validChoice step
+        (fun st o => d₁ st o ∧ d₂ st o) (fun st k => f₁ st k ∧ f₂ st k)
+        (compNatMin n₁ n₂) s
+  | 0, _, _, _, _ => trivial
+  | _ + 1, 0, _, _, _ => trivial
+  | n₁ + 1, n₂ + 1, s, h₁, h₂ => by
+    rw [compNatMin_succ_succ]
+    intro c hc
+    have hc₁ := h₁ c hc
+    have hc₂ := h₂ c hc
+    cases hStep : step c s with
+    | step st' =>
+      rw [hStep] at hc₁ hc₂
+      exact wlpStepPred_conj hc₁ hc₂
+    | done out =>
+      rw [hStep] at hc₁ hc₂
+      exact ⟨hc₁, hc₂⟩
+    | fault k =>
+      rw [hStep] at hc₁ hc₂
+      exact ⟨hc₁, hc₂⟩
+
+/-- Generic minimum-budget conjunctive composition for deterministic
+`execStepPred` at `compNatMin n₁ n₂`. -/
+theorem execStepPred_conj {S Out F : Type} {step : S → StepResult S Out F}
+    {d₁ d₂ : S → Out → Prop} {f₁ f₂ : S → F → Prop} :
+    ∀ {n₁ n₂ : Nat} {s : S},
+      execStepPred step d₁ f₁ n₁ s →
+      execStepPred step d₂ f₂ n₂ s →
+      execStepPred step
+        (fun st o => d₁ st o ∧ d₂ st o) (fun st k => f₁ st k ∧ f₂ st k)
+        (compNatMin n₁ n₂) s
+  | 0, _, _, h₁, _ => False.elim h₁
+  | _ + 1, 0, _, _, h₂ => False.elim h₂
+  | n₁ + 1, n₂ + 1, s, h₁, h₂ => by
+    rw [compNatMin_succ_succ]
+    rw [execStepPred_succ_iff] at h₁ h₂ ⊢
+    cases hStep : step s with
+    | step st' =>
+      rw [hStep] at h₁ h₂
+      exact execStepPred_conj h₁ h₂
+    | done out =>
+      rw [hStep] at h₁ h₂
+      exact ⟨h₁, h₂⟩
+    | fault k =>
+      rw [hStep] at h₁ h₂
+      exact ⟨h₁, h₂⟩
+
+/-- Generic minimum-budget conjunctive composition for deterministic
+`execWlpStepPred` at `compNatMin n₁ n₂`. -/
+theorem execWlpStepPred_conj {S Out F : Type} {step : S → StepResult S Out F}
+    {d₁ d₂ : S → Out → Prop} {f₁ f₂ : S → F → Prop} :
+    ∀ {n₁ n₂ : Nat} {s : S},
+      execWlpStepPred step d₁ f₁ n₁ s →
+      execWlpStepPred step d₂ f₂ n₂ s →
+      execWlpStepPred step
+        (fun st o => d₁ st o ∧ d₂ st o) (fun st k => f₁ st k ∧ f₂ st k)
+        (compNatMin n₁ n₂) s
+  | 0, _, _, _, _ => trivial
+  | _ + 1, 0, _, _, _ => trivial
+  | n₁ + 1, n₂ + 1, s, h₁, h₂ => by
+    rw [compNatMin_succ_succ]
+    rw [execWlpStepPred_succ_iff] at h₁ h₂ ⊢
+    cases hStep : step s with
+    | step st' =>
+      rw [hStep] at h₁ h₂
+      exact execWlpStepPred_conj h₁ h₂
+    | done out =>
+      rw [hStep] at h₁ h₂
+      exact ⟨h₁, h₂⟩
+    | fault k =>
+      rw [hStep] at h₁ h₂
+      exact ⟨h₁, h₂⟩
+
+/-- Generic minimum-budget conjunctive composition for deterministic
+`execUntilPred` sharing checkpoint predicate `stop` at `compNatMin n₁ n₂`. -/
+theorem execUntilPred_conj_same_stop {S Out F : Type}
+    {step : S → StepResult S Out F} {stop : S → Prop}
+    {d₁ d₂ : S → Out → Prop} {f₁ f₂ : S → F → Prop} :
+    ∀ {n₁ n₂ : Nat} {s : S},
+      execUntilPred step stop d₁ f₁ n₁ s →
+      execUntilPred step stop d₂ f₂ n₂ s →
+      execUntilPred step stop
+        (fun st o => d₁ st o ∧ d₂ st o) (fun st k => f₁ st k ∧ f₂ st k)
+        (compNatMin n₁ n₂) s
+  | 0, _, _, h₁, _ => execUntilPred_stop _ (execUntilPred_zero_iff.mp h₁)
+  | _ + 1, 0, _, _, h₂ => execUntilPred_stop _ (execUntilPred_zero_iff.mp h₂)
+  | n₁ + 1, n₂ + 1, s, h₁, h₂ => by
+    rw [compNatMin_succ_succ]
+    cases execUntilPred_succ_iff.mp h₁ with
+    | inl hStop => exact execUntilPred_stop _ hStop
+    | inr hStep₁ =>
+      cases execUntilPred_succ_iff.mp h₂ with
+      | inl hStop => exact execUntilPred_stop _ hStop
+      | inr hStep₂ =>
+        refine execUntilPred_succ_iff.mpr (Or.inr ?_)
+        cases hEv : step s with
+        | step st' =>
+          rw [hEv] at hStep₁ hStep₂
+          exact execUntilPred_conj_same_stop hStep₁ hStep₂
+        | done out =>
+          rw [hEv] at hStep₁ hStep₂
+          exact ⟨hStep₁, hStep₂⟩
+        | fault k =>
+          rw [hEv] at hStep₁ hStep₂
+          exact ⟨hStep₁, hStep₂⟩
+
 /-- Bounded loop invariant driver supporting both normal loop exit and
 early-return exit over `wpUntilCutStep step`. -/
 def wpIterCut {S Out F : Type} (step : S → StepResult S Out F)
@@ -2634,5 +2818,42 @@ theorem canary_refute_diverging_wpStepPred (fuel : Nat) :
   intro hWp
   exact not_infinite_trace_of_wpStepPred (fun n => n) hWp
     (fun _ => ⟨(), rfl, rfl⟩)
+
+/-- Canary distinguishing relaxed WLP (`onFault := True`) vs strict WLP
+(`onFault := False`) on `toyFaultStep`, exercising `execWlpStepPred_conj` /
+`execStepPred_conj` at `compNatMin`, and verifying opaque `StepStageCut.frame`
++ `StepStageCut.toIndexedCut` interop without unsealing. -/
+theorem canary_wlp_strict_vs_relaxed_conj_and_frame :
+    execWlpStepOutcome toyFaultStep (fun _ => False) (fun _ => True) 3 2 ∧
+    ¬ execWlpStepOutcome toyFaultStep (fun _ => True) (fun _ => False) 3 2 ∧
+    execStepOutcome toyCountStep (fun out => out = 0 ∧ out < 1)
+      (fun _ => False ∧ False) (compNatMin 4 6) 3 ∧
+    (0 : Nat) ≤ 3 := by
+  have hRelax : execWlpStepOutcome toyFaultStep (fun _ => False)
+      (fun _ => True) 3 2 := trivial
+  have hStrict : ¬ execWlpStepOutcome toyFaultStep (fun _ => True)
+      (fun _ => False) 3 2 := fun h => h
+  have hConj : execStepOutcome toyCountStep (fun out => out = 0 ∧ out < 1)
+      (fun _ => False ∧ False) (compNatMin 4 6) 3 :=
+    execStepPred_conj
+      (n₁ := 4) (n₂ := 6)
+      (show execStepOutcome toyCountStep (fun out => out = 0) (fun _ => False) 4 3 from rfl)
+      (show execStepOutcome toyCountStep (fun out => out < 1) (fun _ => False) 6 3 from
+        Nat.zero_lt_one)
+  have hCut : StepStageCut toyCountStep 3 3 0 :=
+    StepStageCut.step (s₁ := 2) rfl
+      (StepStageCut.step (s₁ := 1) rfl (StepStageCut.single (s₁ := 0) rfl))
+  have hCutIdx := StepStageCut.ofIndexedCut (StepStageCut.toIndexedCut 7 hCut)
+  have hLe : 0 ≤ 3 :=
+    StepStageCut.frame (Inv := fun st => st ≤ 3)
+      (fun s s' hS hStep => by
+        cases s with
+        | zero => cases hStep
+        | succ k =>
+          injection hStep with hEq
+          subst hEq
+          exact Nat.le_trans (Nat.le_succ k) hS)
+      hCutIdx (Nat.le_refl 3)
+  exact ⟨hRelax, hStrict, hConj, hLe⟩
 
 end Anneal.Framework.StepWp
