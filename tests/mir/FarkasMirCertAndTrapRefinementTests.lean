@@ -1085,6 +1085,49 @@ theorem test_checked_vs_wrapping_symmetric_iff :
            ((checked_mul_wrapping_refines_iff .u8 .abort 16 16).2.2.2.1 h),
          (checked_mul_wrapping_refines_iff .u8 .abort 15 17).2.2.1.2 (Nat.le_of_ble_eq_true rfl)⟩
 
+/-- The test-side mutation operator `flipAssertPolarity` applied to the canonical checked body
+is EXACTLY the theory-side polarity mutant (for ALL `u`, `op`, `unwind`), so the parametric
+`assert_polarity_mutation_breaks_refinement` covers the concrete mutation canaries above. -/
+theorem test_flipAssertPolarity_is_theory_mutant (u : UintTy) (op : ArithKind)
+    (uw : UnwindAction) :
+    flipAssertPolarity (mkCheckedArithBody u op uw) = mkCheckedArithBodyWithExpected u op uw true :=
+  rfl
+
+/-- Universal polarity-mutation refutation instantiated on `u8`/`u64` boundary inputs under both
+panic strategies. -/
+theorem test_assert_polarity_mutation_universal :
+    (¬ MirOutcomeRefines
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2 (uintArgs2 .u64 7 9)))
+      (classifyMirExecState .abort
+        (runMirCall (flipAssertPolarity (mkCheckedArithBody .u64 .add .terminate)) 6
+          (uintArgs2 .u64 7 9)))) ∧
+    (¬ MirOutcomeRefines
+      (classifyMirExecState .unwind
+        (runMirCall (mkCheckedArithBody .u8 .mul .continue_) 6 (uintArgs2 .u8 16 16)))
+      (classifyMirExecState .unwind
+        (runMirCall (flipAssertPolarity (mkCheckedArithBody .u8 .mul .continue_)) 6
+          (uintArgs2 .u8 16 16)))) ∧
+    (¬ MirOutcomeRefines
+      (classifyMirExecState .unwind
+        (runMirCall (mkCheckedArithBody .u8 .sub .continue_) 6 (uintArgs2 .u8 5 6)))
+      (classifyMirExecState .unwind
+        (runMirCall (flipAssertPolarity (mkCheckedArithBody .u8 .sub .continue_)) 6
+          (uintArgs2 .u8 5 6)))) := by
+  have h7 : (7 : Nat) < modPow2 (uintWidth .u64) := Nat.le_of_ble_eq_true rfl
+  have h9 : (9 : Nat) < modPow2 (uintWidth .u64) := Nat.le_of_ble_eq_true rfl
+  have h16 : (16 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  have h5 : (5 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  have h6 : (6 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  rw [test_flipAssertPolarity_is_theory_mutant, test_flipAssertPolarity_is_theory_mutant,
+      test_flipAssertPolarity_is_theory_mutant]
+  exact ⟨(assert_polarity_mutation_breaks_refinement .u64 .abort 7 9 h7 h9).1
+           (Nat.le_of_ble_eq_true rfl),
+         (assert_polarity_mutation_breaks_refinement .u8 .unwind 16 16 h16 h16).2.2.2.2.2
+           (Nat.le_of_ble_eq_true rfl),
+         (assert_polarity_mutation_breaks_refinement .u8 .unwind 5 6 h5 h6).2.2.2.1
+           (Nat.lt_succ_self 5)⟩
+
 /-! ## 4. Programmatic `run_cmd` Hygiene Audit & `#print axioms` Checks -/
 
 open Lean Elab Command in
@@ -1189,7 +1232,12 @@ run_cmd do
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_toPartial_refines_unchecked_iff
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_wrapping_refines_iff
     , ``Anneal.Mir.OverflowTrapRefinement.checked_sub_wrapping_refines_iff
-    , ``Anneal.Mir.OverflowTrapRefinement.checked_mul_wrapping_refines_iff ]
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_mul_wrapping_refines_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.mkCheckedArithBody_eq_withExpected_false
+    , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_add_polarity_mutant
+    , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_sub_polarity_mutant
+    , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_mul_polarity_mutant
+    , ``Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_refinement ]
   -- Exact allowlist of coinductive `Anneal.ITree.WeakRef` / `Eutt` bridge corollaries in
   -- `Anneal.Mir.OverflowTrapRefinement` (these use `Classical.choice` solely via Lean 4
   -- `coinductive_fixpoint` in `Anneal.ITree`; NO other declaration in either module may).
@@ -1289,7 +1337,7 @@ run_cmd do
       throwError "coinductive allowlist mismatch in {mod}: seen {seenCoind.length}, allowlisted {allowedCoindThms.length}"
     return s!"{mod}: {nConstThm}c+{nCoindThm}w thms, {nConstDefn}c+{nCoindAuxDefn}aux defs"
   let sFarkas ← auditDeclsInModule `Anneal.FarkasMirCert 190 350 []
-  let sTrap ← auditDeclsInModule `Anneal.Mir.OverflowTrapRefinement 225 250
+  let sTrap ← auditDeclsInModule `Anneal.Mir.OverflowTrapRefinement 245 300
     allowedOverflowCoinductiveThms
   -- Every curated key declaration must live in one of the swept modules.
   for d in keyFarkasDecls ++ keyTrapConstructiveDecls ++ keyWeakRefBridgeDecls do
@@ -1336,7 +1384,7 @@ run_cmd do
       throwError "over-broad test coinductive allowlist: {expected} is not Classical-dependent"
   unless seenTestCoind.length == allowedTestCoinductiveThms.length do
     throwError "test coinductive allowlist mismatch: seen {seenTestCoind.length}, allowlisted {allowedTestCoinductiveThms.length}"
-  if constructiveTestTheorems < 26 || weakRefTestTheorems != 3 || constructiveTestDefns < 10 then
+  if constructiveTestTheorems < 29 || weakRefTestTheorems != 3 || constructiveTestDefns < 10 then
     throwError "test audit is vacuous: thms={constructiveTestTheorems}c+{weakRefTestTheorems}w, defs={constructiveTestDefns}"
   logInfo m!"hygiene audit passed: [{sFarkas}; {sTrap}]; curated {keyFarkasDecls.length} FarkasMirCert + {keyTrapConstructiveDecls.length} constructive OverflowTrapRefinement + {keyWeakRefBridgeDecls.length} WeakRef bridges; test module {constructiveTestTheorems}c+{weakRefTestTheorems}w thms, {constructiveTestDefns}c defs (0 sorryAx, 0 ofReduceBool, 0 trustCompiler, Classical.choice strictly allowlisted under WeakRef/Eutt)"
 
@@ -1353,6 +1401,7 @@ run_cmd do
 #print axioms Anneal.Mir.OverflowTrapRefinement.runMirCall_checked_add_scaled_outer_add_trap_pinned
 #print axioms Anneal.Mir.OverflowTrapRefinement.add_scaled_failure_sites_pinned
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_wrapping_refines_iff
+#print axioms Anneal.Mir.OverflowTrapRefinement.assert_polarity_mutation_breaks_refinement
 #print axioms Anneal.Mir.OverflowTrapRefinement.runMirSteps_faulted_to_tauStar
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_mul_const_right_refines_unchecked_of_farkas_cert
 #print axioms Anneal.Mir.OverflowTrapRefinement.unchecked_refines_to_checked_of_fuel

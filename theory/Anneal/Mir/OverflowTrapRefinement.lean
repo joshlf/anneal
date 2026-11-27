@@ -3542,4 +3542,206 @@ theorem checked_add_overflow_not_weakRef_corollaries (strat : PanicStrategy) :
     cases strat <;> intro hEq <;> nomatch hEq
   · exact not_weakRef_of_distinct_ret hTauP hObsP hTauA hObsA (fun h => nomatch h)
 
+/-! ## 7. Parametric Assert-Polarity Mutation Sensitivity
+
+Anti-reward-hacking certificate: the refinement theorems above hold *because of* the exact
+`TerminatorKind.assert` polarity (`expected := false`) of the canonical
+`-C overflow-checks=on` lowering. Flipping the polarity (`expected := true`) yields a mutant
+that, for ALL `u`, BOTH panic strategies, and ALL inputs (in range for `sub`), traps on EVERY
+non-overflowing input and silently returns the wrapped value on EVERY overflowing input, so
+both the forward direction (`unchecked ⊑ checked`) and panic preservation (`checked ⊑ mutant`)
+FAIL universally for the mutant. -/
+
+/-- Assert-polarity-parameterized checked body: `expected := false` is the canonical lowering
+(`mkCheckedArithBody`, see `mkCheckedArithBody_eq_withExpected_false`); `expected := true` is
+the polarity mutant. -/
+def mkCheckedArithBodyWithExpected (u : UintTy) (op : ArithKind) (unwind : UnwindAction)
+    (expected : Bool) : CapturedMir :=
+  mkCanonBody "anneal::arith::checked" 2
+    [ mkLocalDecl .mut (uintTy u)
+    , mkLocalDecl .not (uintTy u)
+    , mkLocalDecl .not (uintTy u)
+    , mkLocalDecl .mut (uintBoolPairTy u) ]
+    [ { statements :=
+          [ mkMirStmt (.storageLive 3)
+          , mkMirStmt (.assign (localPlace 3)
+              (.binaryOp op.checkedBinOp
+                (.copy (localPlace 1)) (.copy (localPlace 2)))) ]
+        terminator :=
+          mkMirTerm (.assert
+            (.move { local_ := 3, projection := [.field 1 boolMirTy] })
+            expected 1 unwind)
+        isCleanup := false }
+    , { statements :=
+          [ mkMirStmt (.assign (localPlace 0)
+              (.use (.move { local_ := 3, projection := [.field 0 (uintTy u)] })))
+          , mkMirStmt (.storageDead 3) ]
+        terminator := mkMirTerm .return_
+        isCleanup := false } ]
+
+/-- The canonical checked body is exactly the `expected := false` instance. -/
+theorem mkCheckedArithBody_eq_withExpected_false (u : UintTy) (op : ArithKind)
+    (unwind : UnwindAction) :
+    mkCheckedArithBody u op unwind = mkCheckedArithBodyWithExpected u op unwind false :=
+  rfl
+
+/-- Generic assert-polarity evaluation: once the checked `BinOp` has produced the pair
+`(r, flag)` with `flag ∈ {0, 1}`, the body returns `r` iff `(flag == 1) == expected`, and
+otherwise halts with the panic strategy's trap outcome. -/
+private theorem runMirCall_checkedWithExpected_of_step2 (u : UintTy) (op : ArithKind)
+    (strat : PanicStrategy) (expected : Bool) (a b r flag : Nat)
+    (hFlag : flag = 0 ∨ flag = 1)
+    (hStep2 : stepMirState (mkCheckedArithBodyWithExpected u op strat.toUnwindAction expected)
+      (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit])) =
+      .tau (.running (mkCanonState 0 2
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩),
+         .init (.aggregate 0 [.scalar ⟨r, uintBytes u⟩, .scalar ⟨flag, 1⟩])]))) :
+    runMirCall (mkCheckedArithBodyWithExpected u op strat.toUnwindAction expected) 6
+        (uintArgs2 u a b) =
+      if (flag == 1) == expected then
+        .halted (.normal (.scalar ⟨r, uintBytes u⟩, canonInitMemory))
+      else .halted strat.toTrapOutcome := by
+  have hStep1 : stepMirState (mkCheckedArithBodyWithExpected u op strat.toUnwindAction expected)
+      (.running (initMachineState
+        (mkCheckedArithBodyWithExpected u op strat.toUnwindAction expected) (uintArgs2 u a b))) =
+      .tau (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit])) := rfl
+  rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2]
+  rcases hFlag with rfl | rfl <;> cases expected <;> cases strat <;> rfl
+
+/-- Polarity-mutant evaluation for `add`: traps on EVERY non-overflowing input and returns the
+wrapped sum on EVERY overflowing input (for ALL `u` and BOTH strategies). -/
+theorem runMirCall_add_polarity_mutant (u : UintTy) (strat : PanicStrategy) (a b : Nat) :
+    (a + b < modPow2 (uintWidth u) →
+      runMirCall (mkCheckedArithBodyWithExpected u .add strat.toUnwindAction true) 6
+        (uintArgs2 u a b) = .halted strat.toTrapOutcome) ∧
+    (modPow2 (uintWidth u) ≤ a + b →
+      runMirCall (mkCheckedArithBodyWithExpected u .add strat.toUnwindAction true) 6
+        (uintArgs2 u a b) =
+        .halted (.normal (.scalar ⟨wrapVal (uintWidth u) (a + b), uintBytes u⟩,
+          canonInitMemory))) := by
+  have hBin := evalScalarBinOp_uint_addWithOverflow (u := u) (a := a) (b := b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
+    canonInitMemory
+  refine ⟨fun hNoOv => ?_, fun hOv => ?_⟩
+  · rw [wrapVal_of_lt hNoOv, nat_ble_false_of_lt hNoOv] at hBin
+    exact runMirCall_checkedWithExpected_of_step2 u .add strat true a b (a + b) 0 (.inl rfl)
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+  · rw [Nat.ble_eq_true_of_le hOv] at hBin
+    exact runMirCall_checkedWithExpected_of_step2 u .add strat true a b _ 1 (.inr rfl)
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+
+/-- Polarity-mutant evaluation for in-range `sub`. -/
+theorem runMirCall_sub_polarity_mutant (u : UintTy) (strat : PanicStrategy) (a b : Nat)
+    (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    (b ≤ a →
+      runMirCall (mkCheckedArithBodyWithExpected u .sub strat.toUnwindAction true) 6
+        (uintArgs2 u a b) = .halted strat.toTrapOutcome) ∧
+    (a < b →
+      runMirCall (mkCheckedArithBodyWithExpected u .sub strat.toUnwindAction true) 6
+        (uintArgs2 u a b) =
+        .halted (.normal
+          (.scalar ⟨wrapVal (uintWidth u) (modPow2 (uintWidth u) + a - b), uintBytes u⟩,
+           canonInitMemory))) := by
+  have hBin := evalScalarBinOp_uint_subWithOverflow (u := u) (a := a) (b := b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
+    canonInitMemory ha hb
+  refine ⟨fun hLe => ?_, fun hUnd => ?_⟩
+  · rw [Nat.ble_eq_true_of_le hLe] at hBin
+    exact runMirCall_checkedWithExpected_of_step2 u .sub strat true a b _ 0 (.inl rfl)
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+  · rw [nat_ble_false_of_lt hUnd] at hBin
+    exact runMirCall_checkedWithExpected_of_step2 u .sub strat true a b _ 1 (.inr rfl)
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+
+/-- Polarity-mutant evaluation for `mul`. -/
+theorem runMirCall_mul_polarity_mutant (u : UintTy) (strat : PanicStrategy) (a b : Nat) :
+    (a * b < modPow2 (uintWidth u) →
+      runMirCall (mkCheckedArithBodyWithExpected u .mul strat.toUnwindAction true) 6
+        (uintArgs2 u a b) = .halted strat.toTrapOutcome) ∧
+    (modPow2 (uintWidth u) ≤ a * b →
+      runMirCall (mkCheckedArithBodyWithExpected u .mul strat.toUnwindAction true) 6
+        (uintArgs2 u a b) =
+        .halted (.normal (.scalar ⟨wrapVal (uintWidth u) (a * b), uintBytes u⟩,
+          canonInitMemory))) := by
+  have hBin := evalScalarBinOp_uint_mulWithOverflow (u := u) (a := a) (b := b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
+    canonInitMemory
+  refine ⟨fun hNoOv => ?_, fun hOv => ?_⟩
+  · rw [wrapVal_of_lt hNoOv, nat_ble_false_of_lt hNoOv] at hBin
+    exact runMirCall_checkedWithExpected_of_step2 u .mul strat true a b (a * b) 0 (.inl rfl)
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+  · rw [Nat.ble_eq_true_of_le hOv] at hBin
+    exact runMirCall_checkedWithExpected_of_step2 u .mul strat true a b _ 1 (.inr rfl)
+      (evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hBin trivial rfl)
+
+private theorem classify_ret_not_refines_trapOutcome (strat : PanicStrategy) (v : Value)
+    (m : Memory) :
+    ¬ MirOutcomeRefines (classifyMirExecState strat (.halted (.normal (v, m))))
+      (classifyMirExecState strat (.halted strat.toTrapOutcome)) := by
+  rw [classify_trapOutcome_eq strat]
+  exact ret_not_refines_trap v
+
+private theorem classify_trapOutcome_not_refines_ret (strat : PanicStrategy) (v : Value)
+    (m : Memory) :
+    ¬ MirOutcomeRefines (classifyMirExecState strat (.halted strat.toTrapOutcome))
+      (classifyMirExecState strat (.halted (.normal (v, m)))) := by
+  rw [classify_trapOutcome_eq strat]
+  exact trap_not_refines_ret v
+
+/-- **Universal polarity-mutation refutation**: for ALL `u`, BOTH strategies, and ALL inputs
+(in range for `sub`), the `expected := true` mutant BREAKS the forward direction
+(`unchecked ⊑ mutant` fails on every non-overflowing input) AND panic preservation
+(`checked ⊑ mutant` fails on every overflowing input), for `add`, `sub`, and `mul`. Hence the
+canonical refinement theorems genuinely depend on the exact assert polarity. -/
+theorem assert_polarity_mutation_breaks_refinement (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    (a + b < modPow2 (uintWidth u) → ¬ MirOutcomeRefines
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .add) 2 (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall
+        (mkCheckedArithBodyWithExpected u .add strat.toUnwindAction true) 6 (uintArgs2 u a b)))) ∧
+    (modPow2 (uintWidth u) ≤ a + b → ¬ MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .add strat.toUnwindAction) 6 (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall
+        (mkCheckedArithBodyWithExpected u .add strat.toUnwindAction true) 6 (uintArgs2 u a b)))) ∧
+    (b ≤ a → ¬ MirOutcomeRefines
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .sub) 2 (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall
+        (mkCheckedArithBodyWithExpected u .sub strat.toUnwindAction true) 6 (uintArgs2 u a b)))) ∧
+    (a < b → ¬ MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .sub strat.toUnwindAction) 6 (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall
+        (mkCheckedArithBodyWithExpected u .sub strat.toUnwindAction true) 6 (uintArgs2 u a b)))) ∧
+    (a * b < modPow2 (uintWidth u) → ¬ MirOutcomeRefines
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .mul) 2 (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall
+        (mkCheckedArithBodyWithExpected u .mul strat.toUnwindAction true) 6 (uintArgs2 u a b)))) ∧
+    (modPow2 (uintWidth u) ≤ a * b → ¬ MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .mul strat.toUnwindAction) 6 (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall
+        (mkCheckedArithBodyWithExpected u .mul strat.toUnwindAction true) 6
+          (uintArgs2 u a b)))) := by
+  refine ⟨fun h => ?_, fun h => ?_, fun h => ?_, fun h => ?_, fun h => ?_, fun h => ?_⟩
+  · rw [runMirCall_unchecked_add_ok u a b h, (runMirCall_add_polarity_mutant u strat a b).1 h]
+    exact classify_ret_not_refines_trapOutcome strat _ _
+  · rw [runMirCall_checked_add_trap u strat a b h, (runMirCall_add_polarity_mutant u strat a b).2 h]
+    exact classify_trapOutcome_not_refines_ret strat _ _
+  · rw [runMirCall_unchecked_sub_ok u a b ha h,
+        (runMirCall_sub_polarity_mutant u strat a b ha hb).1 h]
+    exact classify_ret_not_refines_trapOutcome strat _ _
+  · rw [runMirCall_checked_sub_trap u strat a b ha hb h,
+        (runMirCall_sub_polarity_mutant u strat a b ha hb).2 h]
+    exact classify_trapOutcome_not_refines_ret strat _ _
+  · rw [runMirCall_unchecked_mul_ok u a b h, (runMirCall_mul_polarity_mutant u strat a b).1 h]
+    exact classify_ret_not_refines_trapOutcome strat _ _
+  · rw [runMirCall_checked_mul_trap u strat a b h, (runMirCall_mul_polarity_mutant u strat a b).2 h]
+    exact classify_trapOutcome_not_refines_ret strat _ _
+
 end Anneal.Mir.OverflowTrapRefinement
