@@ -6899,7 +6899,7 @@ theorem stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance
     (hdst_val : get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)))
     (hoff0_s : srcPtr.offsetBytes = 0)
     (hoff0_d : dstPtr.offsetBytes = 0)
-    (hcnt_pre : WriteBytesScalarPreVal s.frame.locals countOp countSc)
+    (_hcnt_pre : WriteBytesScalarPreVal s.frame.locals countOp countSc)
     (hcnt1 : countSc.bits = 1)
     (hlook_s : lookupBorrow s.memory.borrows srcPtr.tag = some e_s.toBorrowEntry)
     (hlook_d : lookupBorrow s.memory.borrows dstPtr.tag = some e_d.toBorrowEntry)
@@ -8709,8 +8709,7 @@ private theorem copyEncodeTypedValueToBytes_int_scalar
     cases it <;> (
       dsimp only [intCastTargetBytes] at hint
       injection hint with h_eq; subst h_eq
-      simp [Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout, encodeValueToBytes,
-        scalarLayoutByteWidth, intCastTargetBytes, hptr8, hsz, encodeScalarBytes, hnz])
+      simp [encodeValueToBytes, intCastTargetBytes, hsz, encodeScalarBytes])
   | uint ut =>
     unfold encodeTypedValueToBytes normalizeCodecTy
     dsimp only
@@ -8718,8 +8717,7 @@ private theorem copyEncodeTypedValueToBytes_int_scalar
     cases ut <;> (
       dsimp only [intCastTargetBytes] at hint
       injection hint with h_eq; subst h_eq
-      simp [Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout, encodeValueToBytes,
-        scalarLayoutByteWidth, intCastTargetBytes, hptr8, hsz, encodeScalarBytes, hnz])
+      simp [encodeValueToBytes, intCastTargetBytes, hsz, encodeScalarBytes])
   | _ => cases hint
 
 /-- **Stage-1 `evalCopyNonOverlappingPermOk` on full-byte copies between distinct
@@ -8919,11 +8917,11 @@ theorem evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq
       encodeLittleEndianBytes_length_lm4_2 srcSc.bits srcBytes none
     have hdec_untyped := decodeUntypedStorageBytes_encodeLittleEndianBytes_int layouts
       decl_d srcSc srcBytes hint_d hsrc_pos hsc_sz hsc_lt hptr8
-    have hthin_s : isThinPtrCopyKind decl_s.ty.kind = false := by
+    have hthin_s : isPtrCopyKind decl_s.ty.kind = false := by
       rcases decl_s with ⟨_, ⟨sk, _⟩, _⟩
       dsimp only at hint_s ⊢
       cases sk <;> first | cases hint_s | rfl
-    have hthin_d : isThinPtrCopyKind decl_d.ty.kind = false := by
+    have hthin_d : isPtrCopyKind decl_d.ty.kind = false := by
       rcases decl_d with ⟨_, ⟨dk, _⟩, _⟩
       dsimp only at hint_d ⊢
       cases dk <;> first | cases hint_d | rfl

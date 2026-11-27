@@ -4428,14 +4428,14 @@ private theorem validateValueForTy?_deref_scalar_of_ptrPointeeOf
       simp only [MirSemantics.pointeeTyOf, hk] at hpty
       cases hfd : MirSemantics.findDeclOrContainerElemTyWithKind? decls layouts inner with
       | some resTy =>
-        simp only [hfd, MirSemantics.resolveProjectedTyResolved, Option.some.injEq] at hpty
+        simp only [hfd, Option.some.injEq] at hpty
         subst hpty
         exact findDeclOrContainerElemTyWithKind?_intKind decls layouts hek hfd
       | none =>
         simp only [hfd] at hpty
         split at hpty
-        · split at hpty <;> (simp only [MirSemantics.resolveProjectedTyResolved, Option.some.injEq] at hpty; subst hpty; exact hek)
-        · simp only [MirSemantics.resolveProjectedTyResolved, Option.some.injEq] at hpty; subst hpty; exact hek
+        · split at hpty <;> (simp only [Option.some.injEq] at hpty; subst hpty; exact hek)
+        · simp only [Option.some.injEq] at hpty; subst hpty; exact hek
     | _ => rw [hk] at hp_pt; simp at hp_pt
   have hrk : (intTyBytes (MirSemantics.resolveTyWithLocalDecls decls layouts pTy).kind).isSome = true := by
     rw [resolveTyWithLocalDecls_kind]; exact hp_int
@@ -16022,12 +16022,12 @@ private theorem tyByteSize_of_intTypeOf (decls : List LocalDecl) (layouts : Layo
   unfold MirSemantics.tyByteSize MirSemantics.tyByteSizeAndAlignAux
   cases htk : ty.kind with
   | uint w =>
-    cases w <;> cases h4 : Nat.beq (MirSemantics.layoutPointerBytes layouts) 4 <;>
-      (simp only [hk, htk, h4, MirSemantics.rigidTyByteSize, MirSemantics.intCastTargetBytes];
+    cases w <;> cases Nat.beq (MirSemantics.layoutPointerBytes layouts) 4 <;>
+      (simp only [hk, htk, MirSemantics.rigidTyByteSize, MirSemantics.intCastTargetBytes];
        exact ⟨_, rfl, by decide⟩)
   | int w =>
-    cases w <;> cases h4 : Nat.beq (MirSemantics.layoutPointerBytes layouts) 4 <;>
-      (simp only [hk, htk, h4, MirSemantics.rigidTyByteSize, MirSemantics.intCastTargetBytes];
+    cases w <;> cases Nat.beq (MirSemantics.layoutPointerBytes layouts) 4 <;>
+      (simp only [hk, htk, MirSemantics.rigidTyByteSize, MirSemantics.intCastTargetBytes];
        exact ⟨_, rfl, by decide⟩)
   | _ => simp [intTypeOf, intTyBytes, htk] at hit
 

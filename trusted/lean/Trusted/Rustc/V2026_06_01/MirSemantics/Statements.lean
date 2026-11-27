@@ -629,15 +629,18 @@ def encodeUnionStorageBytes
           | .some .unit => baseBytes
           | .some fv =>
             let typedOpt : Option (List AbstractByte) :=
-              match encodeValueToBytes defaultCodecFuel layouts fTy fv with
+              match encodeTypedValueToBytes layouts fTy fv with
               | .some bs => .some bs
               | .none =>
-                match encodeUntypedValueToBytes defaultCodecFuel fv with
-                | .some bs =>
-                  match Nat.beq (length bs) fBytes with
-                  | true => .some bs
-                  | false => .none
-                | .none => .none
+                match encodeValueToBytes defaultCodecFuel layouts fTy fv with
+                | .some bs => .some bs
+                | .none =>
+                  match encodeUntypedValueToBytes defaultCodecFuel fv with
+                  | .some bs =>
+                    match Nat.beq (length bs) fBytes with
+                    | true => .some bs
+                    | false => .none
+                  | .none => .none
             match typedOpt with
             | .some fieldBs =>
               match writeAbstractBytesAt baseBytes 0 fieldBs with
@@ -725,16 +728,28 @@ def convertCopySingleValue?
         | .some dSz =>
           match Nat.beq (length bs) dSz with
           | true => decodeUntypedStorageBytes defaultCodecFuel layouts dstTy bs .strictUcg630Ub
-          | false => .none
+          | false =>
+            match tyByteSize .nil layouts dstTy with
+            | .some dSzTarget =>
+              match Nat.beq (length bs) dSzTarget with
+              | true => decodeUntypedStorageBytes defaultCodecFuel layouts dstTy bs .strictUcg630Ub
+              | false => .none
+            | .none => .none
         | .none =>
-          match directProvLeak with
-          | true => .none
-          | false => .some copiedVal
+          match tyByteSize .nil layouts dstTy with
+          | .some dSzTarget =>
+            match Nat.beq (length bs) dSzTarget with
+            | true => decodeUntypedStorageBytes defaultCodecFuel layouts dstTy bs .strictUcg630Ub
+            | false => .none
+          | .none =>
+            match directProvLeak with
+            | true => .none
+            | false => .some copiedVal
       | .none =>
         match directProvLeak with
         | true => .none
         | false =>
-          match rigidTyByteSize layouts srcPt, rigidTyByteSize layouts dstTy with
+          match tyByteSize .nil layouts srcPt, tyByteSize .nil layouts dstTy with
           | .some sSz, .some dSz =>
             match Nat.beq sSz dSz with
             | false => .none
@@ -1069,10 +1084,10 @@ def evalCopyUnionBytes
     MirStepNode :=
   let elemBytesOpt : Option Nat :=
     match operandPointeeTy localDecls layouts src with
-    | .some pt => rigidTyByteSize layouts pt
+    | .some pt => tyByteSize localDecls layouts pt
     | .none =>
       match operandPointeeTy localDecls layouts dst with
-      | .some pt => rigidTyByteSize layouts pt
+      | .some pt => tyByteSize localDecls layouts pt
       | .none => .some 1
   match elemBytesOpt with
   | .none => MirStepNode.fail .ub
@@ -1368,7 +1383,7 @@ def evalCopyUnionBytes
           | .some .uninit =>
             match dstPlace.projection, Nat.beq dstStart 0, dstTargetTyOpt with
             | .nil, true, .some dstPt =>
-              match rigidTyByteSize layouts dstPt with
+              match tyByteSize localDecls layouts dstPt with
               | .some dstBytes =>
                 match Nat.beq copyByteLen dstBytes with
                 | false => MirStepNode.fail .ub
@@ -1405,7 +1420,7 @@ def evalCopyUnionBytes
             | .ub =>
               match Nat.beq dstStart 0, dstTargetTyOpt with
               | true, .some dstPt =>
-                match rigidTyByteSize layouts dstPt with
+                match tyByteSize localDecls layouts dstPt with
                 | .some dstBytes =>
                   match Nat.beq copyByteLen dstBytes with
                   | false => MirStepNode.fail .ub
@@ -1813,9 +1828,17 @@ def copyPointeeSizesConflict
 
 /--
 Whether the place `⟨loc, proj⟩` of an active-frame local is statically a struct,
-enum, or tuple (`RigidTy.adt` / `RigidTy.tuple`), i.e. an aggregate whose
-`Value.aggregate 0 fields` representation is not a sequence of equally sized
-elements. `false` for caller-owned referents and untyped places.
+enum, tuple, or pointer (`RigidTy.adt` / `RigidTy.tuple` / `RigidTy.rawPtr` /
+`RigidTy.ref` / `RigidTy.fnPtr`), i.e. a place whose `Value.aggregate 0 fields`
+runtime representation (such as a 2-element wide pointer `[dataVal, metaVal]` or
+a raw-byte `PtrByteFrag` carrier) is not an element-indexable array or slice
+sequence. `false` for caller-owned referents and untyped places.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to unsized types are sized. The size and alignment is guaranteed to
+> be at least equal to the size and alignment of a pointer to a sized type."
 -/
 @[reducible]
 def copyPlaceIsNonArrayAggregate
@@ -1831,6 +1854,9 @@ def copyPlaceIsNonArrayAggregate
     match placeTyResolved localDecls layouts { local_ := loc, projection := proj } with
     | .some { kind := .adt _ _, .. } => true
     | .some { kind := .tuple _, .. } => true
+    | .some { kind := .rawPtr _ _, .. } => true
+    | .some { kind := .ref _ _, .. } => true
+    | .some { kind := .fnPtr _ _ _ _, .. } => true
     | _ => false
 
 /--
@@ -2577,6 +2603,29 @@ def isThinPtrCopyKind : RigidTy → Bool
   | _ => false
 
 /--
+Whether `k` is any pointer type (`.fnPtr`, `.rawPtr`, or `.ref`, including both
+sized thin pointers of width `ptrBytes` and unsized wide pointers of width
+`2 * ptrBytes` to `[T]`, `str`, or `dyn Trait`).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to sized types have the same size and alignment as usize."
+> "Pointers to unsized types are sized. The size and alignment is guaranteed to
+> be at least equal to the size and alignment of a pointer to a sized type."
+
+Modeling choice (`agent_docs/trusted-rust.md`): `encodeTypedValueToBytes` and
+`decodeUntypedStorageBytes` / `decodePtrBytesNoForge` represent both thin
+(`ptrBytes`) and wide (`2 * ptrBytes`) pointers as exact little-endian
+`PtrByteFrag` byte images (data pointer half followed by slice/`str` length
+scalar or `dyn` vtable pointer half).
+-/
+@[reducible]
+def isPtrCopyKind : RigidTy → Bool
+  | .fnPtr _ _ _ _ | .rawPtr _ _ | .ref _ _ => true
+  | _ => false
+
+/--
 Whether `encodeValueToBytes defaultCodecFuel layouts ty v` produces the exact
 in-memory byte representation of `v : ty` without falling back to untyped
 declaration-order field concatenation (which ignores `repr(Rust)` field
@@ -2617,7 +2666,7 @@ def srcValHasExactByteEncoding
   match isLayoutIndepByteKind ty.kind with
   | true => true
   | false =>
-    match isThinPtrCopyKind ty.kind with
+    match isPtrCopyKind ty.kind with
     | true => true
     | false =>
       match ty.kind with
@@ -2689,7 +2738,7 @@ def dstTyHasExactByteDecode
   match isLayoutIndepByteKind ty.kind with
   | true => true
   | false =>
-    match isThinPtrCopyKind ty.kind with
+    match isPtrCopyKind ty.kind with
     | true => true
     | false =>
       match ty.kind with
@@ -2878,7 +2927,7 @@ def copyBytesSubplace
     let srcSubSliceOk : Bool :=
       match expBytesOpt, srcSubPlaceTyOpt with
       | .some expB, .some srcTy =>
-        match isThinPtrCopyKind srcTy.kind, tyByteSize localDecls layouts srcTy with
+        match isPtrCopyKind srcTy.kind, tyByteSize localDecls layouts srcTy with
         | true, .some sB =>
           Bool.and
             (Nat.ble (Nat.add srcEp.ptr.offsetBytes expB) sB)
@@ -2964,7 +3013,7 @@ def copyBytesSubplace
                 match encodeTypedValueToBytes layouts srcTy sVal with
                 | .some bs => .some bs
                 | .none =>
-                  match isThinPtrCopyKind srcTy.kind, sVal with
+                  match isPtrCopyKind srcTy.kind, sVal with
                   | true, .aggregate 0 rawVals => decodeRawAbstractByteVals? rawVals
                   | _, _ =>
                     match srcTy.kind, sVal with
@@ -3061,9 +3110,8 @@ def copyBytesSubplace
               let partialPtrDstOutcomeOpt : Option CopySliceOutcome :=
                 match dstPlaceTyOpt with
                 | .some dstTy =>
-                  match isThinPtrCopyKind dstTy.kind, rigidTyByteSize layouts dstTy with
-                  | true, .some _ =>
-                    let dstBytes := layoutPointerBytes layouts
+                  match isPtrCopyKind dstTy.kind, tyByteSize localDecls layouts dstTy with
+                  | true, .some dstBytes =>
                     match
                       Bool.and
                         (Nat.ble (Nat.add dstEp.ptr.offsetBytes (length bs)) dstBytes)
@@ -3079,7 +3127,10 @@ def copyBytesSubplace
                           | _ :: _ => .none
                         | .some dstRootVal =>
                           match readProjectedValue locals dstRootVal dstEp.entry.targetProjection with
-                          | .ok (.aggregate 0 rawVals) => decodeRawAbstractByteVals? rawVals
+                          | .ok (.aggregate 0 rawVals) =>
+                            match decodeRawAbstractByteVals? rawVals with
+                            | .some rawBs => .some rawBs
+                            | .none => encodeTypedValueToBytes layouts dstTy (.aggregate 0 rawVals)
                           | .ok dstSubVal => encodeTypedValueToBytes layouts dstTy dstSubVal
                           | _ => .none
                       match oldDstBytesOpt with
@@ -3153,28 +3204,34 @@ def copyBytesSubplace
                         | .some dstBytes =>
                           match Nat.beq (length bs) dstBytes with
                           | false =>
-                            match
-                              Bool.and
-                                (isThinPtrCopyKind dstTy.kind)
-                                (Nat.beq (length bs) (layoutPointerBytes layouts))
-                            with
-                            | false => .none
-                            | true =>
-                              match
-                                decodeUntypedStorageBytes
-                                  defaultCodecFuel
-                                  layouts
-                                  dstTy
-                                  bs
-                                  .strictUcg630Ub
-                              with
-                              | .some decodedVal =>
-                                .some
-                                  (commit
-                                    { local_ := dstLocal, projection := dstProj }
-                                    decodedVal
-                                    dstEffProj)
-                              | .none => .none
+                            match tyByteSize localDecls layouts dstTy with
+                            | .none => .none
+                            | .some dstBytesTarget =>
+                              match Nat.beq (length bs) dstBytesTarget with
+                              | false => .none
+                              | true =>
+                                match
+                                  decodeUntypedStorageBytes
+                                    defaultCodecFuel
+                                    layouts
+                                    dstTy
+                                    bs
+                                    .strictUcg630Ub
+                                with
+                                | .some decodedVal =>
+                                  .some
+                                    (commit
+                                      { local_ := dstLocal, projection := dstProj }
+                                      decodedVal
+                                      dstEffProj)
+                                | .none =>
+                                  match
+                                    Bool.and
+                                      (isNonPtrPrimitiveKind dstTy.kind)
+                                      (policyRejectsProv .strictUcg630Ub bs)
+                                  with
+                                  | true => .some .ub
+                                  | false => .none
                           | true =>
                             match
                               decodeUntypedStorageBytes

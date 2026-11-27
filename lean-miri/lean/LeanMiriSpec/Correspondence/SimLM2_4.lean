@@ -972,14 +972,14 @@ theorem encodeTypedValueToBytes_primScalar {layouts : LayoutTable} {fty rTy : Ty
       unfold Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout; rw [hrk']
     rw [hnr, hu]
     have hw' := hint_w it hk
-    cases it <;> (dsimp only [intCastTargetBytes] at hw'; injection hw' with hw_eq; simp [h4, hptr8, encodeValueToBytes, scalarLayoutByteWidth, intCastTargetBytes, hrk', ← hw_eq, encodeScalarBytes, h0])
+    cases it <;> (dsimp only [intCastTargetBytes] at hw'; injection hw' with hw_eq; simp [hptr8, encodeValueToBytes, intCastTargetBytes, hrk', ← hw_eq, encodeScalarBytes])
   · have hrk' : rTy.kind = .uint ut := hrk.trans hk
     have hnr : normalizeCodecTy rTy = rTy := by unfold normalizeCodecTy; rw [hrk']
     have hu : Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout layouts rTy = false := by
       unfold Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout; rw [hrk']
     rw [hnr, hu]
     have hw' := huint_w ut hk
-    cases ut <;> (dsimp only [intCastTargetBytes] at hw'; injection hw' with hw_eq; simp [h4, hptr8, encodeValueToBytes, scalarLayoutByteWidth, intCastTargetBytes, hrk', ← hw_eq, encodeScalarBytes, h0])
+    cases ut <;> (dsimp only [intCastTargetBytes] at hw'; injection hw' with hw_eq; simp [hptr8, encodeValueToBytes, intCastTargetBytes, hrk', ← hw_eq, encodeScalarBytes])
 
 theorem decodeTypedValueFromBytes_primScalar {layouts : LayoutTable} {fty rTy : Ty}
     {x w : Nat} (hprim : IsPrimScalarTy fty) (hw : ValidScalarBytes w)
@@ -1788,7 +1788,7 @@ theorem evalOperand_unionFieldRead_spec
     have henc := encodeByLayoutIdxAux_unionSlotFields hwt hfields hf hprim0 himm0 hfl
     have hub_len : length (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
         replicateUninitBytes (S - sc.sizeBytes)) = S := by
-      simp [encodeLittleEndianBytes_length, replicateUninitBytes_eq_replicate]; omega
+      simp [replicateUninitBytes_eq_replicate]; omega
     have hw_S : w ≤ S := Nat.le_trans hw_le hk_le
     have hslice : sliceAbstractBytes
         (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
@@ -1857,7 +1857,7 @@ theorem evalOperand_unionFieldRead_spec
     have henc := encodeByLayoutIdxAux_unionSlotFields hwt hfields hf hprim0 himm0 hfl
     have hub_len : length (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
         replicateUninitBytes (S - sc.sizeBytes)) = S := by
-      simp [encodeLittleEndianBytes_length, replicateUninitBytes_eq_replicate]; omega
+      simp [replicateUninitBytes_eq_replicate]; omega
     have hrem_pos : 1 ≤ w - sc.sizeBytes := by omega
     have hslice : sliceAbstractBytes
         (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
@@ -2276,7 +2276,7 @@ theorem writeProjectedForLocal_union_field_uninit {body : CapturedMir} {locals :
         replicateUninitBytes (S - sc'.sizeBytes)) := by
     rw [writeAbstractBytesAt_zero_eq _ _
       (by rw [encodeLittleEndianBytes_length, replicateUninitBytes_eq_replicate, List.length_replicate]; exact hk'_le)]
-    simp [encodeLittleEndianBytes_length, replicateUninitBytes_eq_replicate, List.drop_replicate]
+    simp [replicateUninitBytes_eq_replicate, List.drop_replicate]
   have hrebuild : rebuildUnionFieldsAfterWriteOpt body.layouts j 0 (.scalar sc') n tl.fieldLayouts [] =
       some (unionSlotFields n j (.scalar sc')) := by
     rw [rebuildUnionFieldsAfterWriteOpt_scalar_aux _ _ _ _ _ _ _
@@ -2362,7 +2362,7 @@ theorem writeProjectedForLocal_union_field_ge {body : CapturedMir} {locals : Lis
       some (encodeLittleEndianBytes sc'.bits sc'.sizeBytes none ++
         replicateUninitBytes (S - sc'.sizeBytes)) := by
     rw [writeAbstractBytesAt_zero_eq _ _ (by
-      simp [encodeLittleEndianBytes_length, replicateUninitBytes_eq_replicate]; omega)]
+      simp [replicateUninitBytes_eq_replicate]; omega)]
     rw [encodeLittleEndianBytes_length, List.drop_append,
       List.drop_of_length_le (by rw [encodeLittleEndianBytes_length]; exact hk_ge),
       encodeLittleEndianBytes_length, List.nil_append,
@@ -2490,7 +2490,7 @@ theorem writeProjectedForLocal_union_field_lt {body : CapturedMir} {locals : Lis
       (encodeLittleEndianBytes sc'.bits sc'.sizeBytes none) =
       some mergedBytes := by
     rw [writeAbstractBytesAt_zero_eq _ _ (by
-      simp [encodeLittleEndianBytes_length, replicateUninitBytes_eq_replicate]; omega)]
+      simp [replicateUninitBytes_eq_replicate]; omega)]
     rw [encodeLittleEndianBytes_length,
       List.drop_append_of_le_length (by rw [encodeLittleEndianBytes_length]; omega)]
   have hold_mem : ∀ v ∈ unionSlotFields n f (.scalar sc), v = .unit ∨ ∃ s, v = .scalar s := by
@@ -2687,7 +2687,7 @@ theorem writeProjectedForLocal_union_field_lt_of_initSlot {body : CapturedMir}
       (encodeLittleEndianBytes sc'.bits sc'.sizeBytes none) =
       some mergedBytes := by
     rw [writeAbstractBytesAt_zero_eq _ _ (by
-      simp [encodeLittleEndianBytes_length, replicateUninitBytes_eq_replicate]; omega)]
+      simp [replicateUninitBytes_eq_replicate]; omega)]
     rw [encodeLittleEndianBytes_length,
       List.drop_append_of_le_length (by rw [encodeLittleEndianBytes_length]; omega)]
   have hre_enc := encodeByLayoutIdxAux_unionSlotFields hwt hfields hj hprim himm' hfl'
@@ -4161,7 +4161,7 @@ theorem encodeUnionFieldsWith_matches_unionMemRel
     have hfbs_len' : length fbs = sc.sizeBytes := hfbs_len
     have henc_sc : encodeUntypedValueToBytes 1 (.scalar sc) = some fbs := by
       simp [encodeUntypedValueToBytes, encodeScalarBytes, hbeq0,
-        encodeLittleEndianBytes_eq_allocLeBytes, encodePlainLittleEndianBytes_eq_allocLeBytes, fbs]
+        encodePlainLittleEndianBytes_eq_allocLeBytes, fbs]
     have hwrite : writeAbstractBytesAt (replicateUninitBytes S) 0 fbs = some bs := by
       simpa [bs, fbs, hfbs_len] using
         writeAbstractBytesAt_replicateUninitBytes_zero fbs S (by omega)
@@ -8787,7 +8787,7 @@ theorem evalOperand_unionOverlayFieldRead_ne_spec
   have henc := encodeByLayoutIdxAux_unionOverlay hwt hfields hk_le hov
   have hub_len : length (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
       replicateUninitBytes (S - sc.sizeBytes)) = S := by
-    simp [encodeLittleEndianBytes_length, replicateUninitBytes_eq_replicate]; omega
+    simp [replicateUninitBytes_eq_replicate]; omega
   have hw_S : w ≤ S := Nat.le_trans hw_le hk_le
   have hslice : sliceAbstractBytes
       (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++

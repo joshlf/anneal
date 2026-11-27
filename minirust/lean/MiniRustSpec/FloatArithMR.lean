@@ -2895,8 +2895,7 @@ theorem fa_composite_tuple_struct_policy_correspondence
       (resolveTyWithLocalDecls decls faPolicyLayouts faPolMixedStructTy) = some 16 := rfl
   have hCohA : abstractBytesCoherentPtrProv? bsA =
       some ({ allocId := pA.allocId, tag := pA.tag, byteIdx := 0, origOffset := normPtrByteOffset 8 pA.offsetBytes, ptrBytes := 8 } : PtrByteFrag) := by
-    simp [bsA, encodeLittleEndianBytes, MirSemantics.encodePtrBytes, encodePtrBytesAux,
-      abstractBytesCoherentPtrProv?, abstractBytesCoherentPtrProvAux, Nat.beq_refl]
+    simp [bsA, abstractBytesCoherentPtrProv?, abstractBytesCoherentPtrProvAux, Nat.beq_refl]
     rfl
   have hDecA := fc_decodeScalarBytes_encode (some (pA.allocId, pA.tag)) false 7 pA.offsetBytes
     (fc_lt_256_pow_8 hA)

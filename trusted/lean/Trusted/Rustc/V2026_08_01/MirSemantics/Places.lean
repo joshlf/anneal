@@ -2167,6 +2167,48 @@ def readLittleEndianBytes
     | _ => .none
 
 /--
+Test whether the byte window `[offset .. offset + sizeBytes)` overlaps any
+`ptrBytes`-wide pointer relocation entry `(relocOff, _)` in `relocs`.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/allocation.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/allocation.rs#L53-L63>
+
+> "pub struct Allocation<Prov = AllocId, Extra = (), Bytes = Box<[u8]>>"
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation. (And even outside const, such transmutation is
+> touching on many unspecified aspects of the Rust memory model and should be
+> avoided. See below for alternatives.)"
+
+Modeling choice (`agent_docs/trusted-rust.md`): scalar reads from global
+allocations (`evalGlobalDerefRead`) check `globalRelocsOverlapRange` so reading
+any byte covered by a pointer relocation at a non-pointer integer type faults
+with `.ub` under `.strictUcg630Ub` instead of stripping relocation provenance
+into a plain `ScalarInt`.
+-/
+def globalRelocsOverlapRange :
+    List (Nat × ProvenancePtr) → Nat → Nat → Nat → Bool
+  | .nil, _, _, _ => false
+  | (relocOff, _) :: rest, offset, sizeBytes, ptrBytes =>
+    match
+      Bool.and
+        (Bool.and (Nat.blt 0 sizeBytes) (Nat.blt 0 ptrBytes))
+        (Bool.and
+          (Nat.blt relocOff (Nat.add offset sizeBytes))
+          (Nat.blt offset (Nat.add relocOff ptrBytes)))
+    with
+    | true => true
+    | false => globalRelocsOverlapRange rest offset sizeBytes ptrBytes
+
+/--
 Read a `ScalarInt` of width `sizeBytes` in little-endian byte order from global
 allocation `alloc` at `offset`.
 
@@ -2194,117 +2236,6 @@ def tyScalarBytes (ty : Ty) : Option Nat :=
   | .bool => .some 1
   | .char => .some 4
   | k => intCastTargetBytes k
-
-/--
-Evaluate a `ConstValue` to a runtime `Value`, decoding `ConstValue.slice` to the
-2-element fat-pointer aggregate `Value.aggregate 0 [dataVal, Value.scalar ⟨meta, ptrBytes⟩]`
-and `ConstValue.indirect allocId offset` by decoding `ty` from `globals` via
-`decodeValueFromBytes` without fabricating pointer provenance from integer bits
-(`UCG#558` / `rust#148259`).
-
-Reference (`compiler/rustc_middle/src/mir/interpret/value.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/value.rs#L31-L65>
-
-> "pub enum ConstValue {
->     ZeroSized,
->     Scalar(Scalar),
->     Slice { alloc_id: AllocId, meta: u64 },
->     Indirect { alloc_id: AllocId, offset: Size },
-> }"
-
-Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
-
-> "Accessing (loading from or storing to) a place that is dangling or based on
-> a misaligned pointer."
-
-Modeling choice (`agent_docs/trusted-rust.md`): `ConstValue.slice (.int s) lenMeta`
-never forges `Value.ptr` from `s.bits / 65536`; for non-reference targets (and
-dangling non-null zero-length slice references `&[]`) it yields a provenance-free
-`Value.scalar` address half, and for non-empty or null reference slices it fails
-with `.none`. `ConstValue.indirect` threads `layoutPointerBytes layouts` into
-`globalAllocSliceToAbstractBytes` and never falls back to `readGlobalScalar` on
-provenance-bearing bytes.
-
-Target pointer width: the number of bytes read for `ConstValue.indirect` is the
-target-width size `rigidTyKindByteSizeFor (layoutPointerBytes layouts) ty.kind`
-when the type constructor determines it (`usize`, `isize`, thin and wide
-pointers, and arrays of them), and the `readGlobalScalar` fallback reads
-`intCastTargetBytes ty.kind (layoutPointerBytes layouts)` bytes, so on a 32-bit
-target (`layoutPointerBytes layouts = 4`) a `usize` constant reads exactly its
-4 bytes (never the 4 bytes that follow it in the allocation) and a pointer
-constant decodes from exactly its 4 relocation bytes.
-
-Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
-
-> "usize and isize have a size big enough to contain every address on the
-> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
-> 64 bit target, this is 8 bytes."
-
-Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
-
-> "Pointers to sized types have the same size and alignment as usize."
-
-Modeling choice (`agent_docs/trusted-rust.md`): the target width is the
-captured `LayoutTable.pointerBits` (`layoutPointerBytes`); on 64-bit targets
-`rigidTyKindByteSizeFor 8` and `rigidTyKindByteSize` coincide, so 64-bit
-behavior is unchanged.
--/
-def evalConstValue
-    (cv : ConstValue)
-    (ty : Ty := { kind := .tuple .nil, layoutIdx := 0 })
-    (globals : List CapturedAllocation := .nil)
-    (layouts : LayoutTable := emptyLayoutTable) :
-    Option Value :=
-  let ptrBytes := layoutPointerBytes layouts
-  match cv with
-  | .zeroSized => .some .unit
-  | .scalar (.int s) => .some (.scalar s)
-  | .scalar (.ptr p sz) => .some (.ptr p sz)
-  | .slice (.ptr p sz) lenMeta =>
-    .some (.aggregate 0 (.ptr p sz :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
-  | .slice (.int s) lenMeta =>
-    match ty.kind with
-    | .ref _ _ =>
-      match Bool.and (Nat.beq lenMeta 0) (Bool.not (Nat.beq s.bits 0)) with
-      | true =>
-        .some (.aggregate 0 (.scalar ⟨s.bits, ptrBytes⟩ :: .scalar ⟨0, ptrBytes⟩ :: .nil))
-      | false => .none
-    | _ =>
-      .some (.aggregate 0 (.scalar ⟨s.bits, ptrBytes⟩ :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
-  | .indirect allocId offset =>
-    match lookupGlobalAlloc globals allocId with
-    | .none => .none
-    | .some alloc =>
-      let sz :=
-        match rigidTyKindByteSizeFor ptrBytes ty.kind with
-        | .some n => n
-        | .none =>
-          match rigidTyByteSize layouts ty with
-          | .some n => n
-          | .none =>
-            match tyScalarBytes ty with
-            | .some n => n
-            | .none => Nat.sub (length alloc.bytes) offset
-      match globalAllocSliceToAbstractBytes alloc offset sz ptrBytes with
-      | .some absBytes =>
-        match decodeValueFromBytes defaultCodecFuel layouts ty absBytes with
-        | .some v => .some v
-        | .none =>
-          match abstractBytesHaveProv absBytes with
-          | true => .none
-          | false =>
-            match intCastTargetBytes ty.kind ptrBytes with
-            | .some n =>
-              match readGlobalScalar alloc offset n with
-              | .some sc => .some (.scalar sc)
-              | .none => .none
-            | .none => .none
-      | .none => .none
-  | .unevaluated _ => .none
 
 /--
 Drop the first `n` elements of a `List Value`.
@@ -2669,153 +2600,6 @@ def uintRigidTyOfStride (strideBytes : Nat) : RigidTy :=
   | 8 => .uint .u64
   | 16 => .uint .u128
   | _ => .uint .u8
-
-/--
-Decode and project a dereferenced global allocation `alloc` at `offset` with
-pointer/access width `sz` and trailing projections `restProj`.
-
-When `pointeeTyOpt` resolves to a scalar type (or when `pointeeTyOpt` is `.none`,
-`layouts` has no aggregate entry at index `0`, `restProj` is scalar-compatible,
-and `readGlobalScalar alloc offset sz` succeeds), reads the scalar directly via
-`readGlobalScalar`. When `readGlobalScalar` does not apply (non-scalar aggregate,
-tuple, or array `pointeeTy`, non-primitive layout in `layouts`, non-scalar width
-`sz`, or aggregate/array projection in `restProj`), decodes the global bytes via
-`decodeValueFromBytes` and projects `restProj`.
-
-Target pointer width: with a known `pointeeTy`, the scalar read width is
-`intCastTargetBytes pointeeTy.kind (layoutPointerBytes layouts)` and the decoded
-byte count is `rigidTyKindByteSizeFor (layoutPointerBytes layouts)
-pointeeTy.kind` when the type constructor determines it, so on a 32-bit target a
-`*const usize` read covers exactly 4 bytes (never splicing the following 4
-bytes into an 8-byte value) and a `*const *const T` read decodes exactly the 4
-relocation bytes of the stored pointer.
-
-Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
-
-> "usize and isize have a size big enough to contain every address on the
-> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
-> 64 bit target, this is 8 bytes."
-
-Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
-
-> "Pointers to sized types have the same size and alignment as usize."
-
-Modeling choice (`agent_docs/trusted-rust.md`): the target width is the
-captured `LayoutTable.pointerBits` (`layoutPointerBytes`); on 64-bit targets the
-widths coincide with the previous `rigidTyKindByteSize` / `intCastTargetBytes`
-defaults, so 64-bit behavior is unchanged.
--/
-def evalGlobalDerefRead
-    (locals : List LocalSlot)
-    (alloc : CapturedAllocation)
-    (offset sz : Nat)
-    (restProj : List ProjectionElem)
-    (layouts : LayoutTable := emptyLayoutTable)
-    (pointeeTyOpt : Option Ty := .none) :
-    PlaceReadResult :=
-  match pointeeTyOpt with
-  | .some pointeeTy =>
-    match intCastTargetBytes pointeeTy.kind (layoutPointerBytes layouts) with
-    | .some n =>
-      match readGlobalScalar alloc offset n with
-      | .some sc =>
-        match readProjectedValue locals (.scalar sc) restProj with
-        | .ok fieldVal => .ok fieldVal locals
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .none => .ub
-    | .none =>
-      let byteSz :=
-        match rigidTyKindByteSizeFor (layoutPointerBytes layouts) pointeeTy.kind with
-        | .some n => n
-        | .none =>
-          match rigidTyByteSize layouts pointeeTy with
-          | .some n => n
-          | .none => Nat.sub (length alloc.bytes) offset
-      match globalAllocSliceToAbstractBytes alloc offset byteSz (layoutPointerBytes layouts) with
-      | .some absBytes =>
-        match decodeValueFromBytes defaultCodecFuel layouts pointeeTy absBytes with
-        | .some decodedVal =>
-          match readProjectedValue locals decodedVal restProj with
-          | .ok fieldVal => .ok fieldVal locals
-          | .ub => .ub
-          | .unsupported => .unsupported
-        | .none => .ub
-      | .none => .ub
-  | .none =>
-    let nonPrimLayoutOpt : Option (Ty × Nat) :=
-      match LayoutTable.lookup layouts 0 with
-      | .some l =>
-        match l.fields with
-        | .primitive => .none
-        | .array stride count =>
-          .some
-            ({ kind := .array (uintRigidTyOfStride stride.bytes) count, layoutIdx := 0 },
-             l.size.bytes)
-        | _ =>
-          .some ({ kind := .adt "" .nil, layoutIdx := 0 }, l.size.bytes)
-      | .none => .none
-    match nonPrimLayoutOpt with
-    | .some (inferredTy, byteSz) =>
-      match globalAllocSliceToAbstractBytes alloc offset byteSz (layoutPointerBytes layouts) with
-      | .some absBytes =>
-        match decodeValueFromBytes defaultCodecFuel layouts inferredTy absBytes with
-        | .some decodedVal =>
-          match readProjectedValue locals decodedVal restProj with
-          | .ok fieldVal => .ok fieldVal locals
-          | .ub => .ub
-          | .unsupported => .unsupported
-        | .none => .ub
-      | .none => .ub
-    | .none =>
-      match isScalarCompatibleProj restProj with
-      | true =>
-        match readGlobalScalar alloc offset sz with
-        | .some sc =>
-          match readProjectedValue locals (.scalar sc) restProj with
-          | .ok fieldVal => .ok fieldVal locals
-          | .ub => .ub
-          | .unsupported => .unsupported
-        | .none =>
-          match Nat.beq sz 0 with
-          | true =>
-            match Nat.ble offset (length alloc.bytes) with
-            | true =>
-              match readProjectedValue locals .unit restProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | false => .ub
-          | false =>
-            match globalAllocSliceToAbstractBytes alloc offset sz (layoutPointerBytes layouts) with
-            | .some absBytes =>
-              let arrTy : Ty := { kind := .array (.uint .u8) sz, layoutIdx := 0 }
-              match decodeValueFromBytes defaultCodecFuel layouts arrTy absBytes with
-              | .some decodedVal =>
-                match readProjectedValue locals decodedVal restProj with
-                | .ok fieldVal => .ok fieldVal locals
-                | .ub => .ub
-                | .unsupported => .unsupported
-              | .none => .ub
-            | .none => .ub
-      | false =>
-        match Nat.ble offset (length alloc.bytes) with
-        | false => .ub
-        | true =>
-          let remBytes := Nat.sub (length alloc.bytes) offset
-          match globalAllocSliceToAbstractBytes alloc offset remBytes (layoutPointerBytes layouts) with
-          | .some absBytes =>
-            let arrTy : Ty := { kind := .array (.uint .u8) remBytes, layoutIdx := 0 }
-            match decodeValueFromBytes defaultCodecFuel layouts arrTy absBytes with
-            | .some decodedVal =>
-              match readProjectedValue locals decodedVal restProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .none => .ub
-          | .none => .ub
 
 /--
 Compute the total byte size of a runtime `Value` using structural recursion on
@@ -8785,7 +8569,33 @@ def decodeUntypedStorageBytes
     | .rawPtr _ pointee =>
       match pointee with
       | .slice _ | .str | .dynamic _ =>
-        decodePtrBytesNoForge false pointee ptrBytes bytes
+        match preservePartialPtrFrags with
+        | false => decodePtrBytesNoForge false pointee ptrBytes bytes
+        | true =>
+          let wideBytes := Nat.add ptrBytes ptrBytes
+          match Nat.blt 0 ptrBytes, Nat.beq (length bytes) wideBytes with
+          | true, true =>
+            let dataBytes := takeAbstractBytes ptrBytes bytes
+            let metaBytes := dropAbstractBytes ptrBytes bytes
+            let dataIncohWithProv : Bool :=
+              Bool.and
+                (abstractBytesHaveProv dataBytes)
+                (Bool.not (abstractBytesCoherentPtrProv dataBytes))
+            let metaIncohWithProv : Bool :=
+              match pointee with
+              | .dynamic _ =>
+                Bool.and
+                  (abstractBytesHaveProv metaBytes)
+                  (Bool.not (abstractBytesCoherentPtrProv metaBytes))
+              | _ => abstractBytesHaveProv metaBytes
+            let anyUninit : Bool :=
+              match decodeLittleEndianBits bytes with
+              | .none => true
+              | .some _ => false
+            match Bool.or anyUninit (Bool.or dataIncohWithProv metaIncohWithProv) with
+            | true => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+            | false => decodePtrBytesNoForge false pointee ptrBytes bytes
+          | _, _ => .none
       | _ =>
         match preservePartialPtrFrags with
         | false => decodePtrBytesNoForge false pointee ptrBytes bytes
@@ -8808,13 +8618,17 @@ def decodeUntypedStorageBytes
             | .none => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
           | _, _ => .none
     | .ref _ pointee =>
+      let ptrWidthBytes :=
+        match pointee with
+        | .slice _ | .str | .dynamic _ => Nat.add ptrBytes ptrBytes
+        | _ => ptrBytes
       match preservePartialPtrFrags with
       | false => decodePtrBytesNoForge true pointee ptrBytes bytes
       | true =>
         match decodePtrBytesNoForge true pointee ptrBytes bytes with
         | .some v => .some v
         | .none =>
-          match Nat.blt 0 ptrBytes, Nat.beq (length bytes) ptrBytes with
+          match Nat.blt 0 ptrBytes, Nat.beq (length bytes) ptrWidthBytes with
           | true, true => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
           | _, _ => .none
     | .fnPtr _ _ _ _ =>
@@ -9512,6 +9326,278 @@ def encodeTypedValueToBytes
           | .some _ => encodeByLayoutIdxAux 8 layouts rTy.layoutIdx v
           | .none => .none
         | _ => .none
+
+/--
+Evaluate a `ConstValue` to a runtime `Value`, decoding `ConstValue.slice` to the
+2-element fat-pointer aggregate `Value.aggregate 0 [dataVal, Value.scalar ⟨meta, ptrBytes⟩]`
+and `ConstValue.indirect allocId offset` by decoding `ty` from `globals` via
+`decodeTypedValueFromBytes` without fabricating pointer provenance from integer
+bits (`UCG#558` / `rust#148259`) and without stripping relocation provenance
+into non-pointer types under `.strictUcg630Ub`.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/value.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/value.rs#L31-L65>
+
+> "pub enum ConstValue {
+>     ZeroSized,
+>     Scalar(Scalar),
+>     Slice { alloc_id: AllocId, meta: u64 },
+>     Indirect { alloc_id: AllocId, offset: Size },
+> }"
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to sized types have the same size and alignment as usize."
+
+Modeling choice (`agent_docs/trusted-rust.md`): `ConstValue.slice (.int s) lenMeta`
+never forges `Value.ptr` from `s.bits / 65536`; for non-reference targets (and
+dangling non-null zero-length slice references `&[]`) it yields a provenance-free
+`Value.scalar` address half, and for non-empty or null reference slices it fails
+with `.none`. `ConstValue.indirect` computes `sz` using `rigidTyKindByteSizeFor`
+and `tyByteSize .nil layouts` (covering 32-bit `usize`/`isize`, pointers, arrays,
+and layout-free tuples), decodes via `decodeTypedValueFromBytes` under
+`.strictUcg630Ub`, and never falls back to `readGlobalScalar` when
+`abstractBytesHaveProv` or `globalRelocsOverlapRange` holds.
+-/
+def evalConstValue
+    (cv : ConstValue)
+    (ty : Ty := { kind := .tuple .nil, layoutIdx := 0 })
+    (globals : List CapturedAllocation := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Option Value :=
+  let ptrBytes := layoutPointerBytes layouts
+  match cv with
+  | .zeroSized => .some .unit
+  | .scalar (.int s) => .some (.scalar s)
+  | .scalar (.ptr p sz) => .some (.ptr p sz)
+  | .slice (.ptr p sz) lenMeta =>
+    .some (.aggregate 0 (.ptr p sz :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
+  | .slice (.int s) lenMeta =>
+    match ty.kind with
+    | .ref _ _ =>
+      match Bool.and (Nat.beq lenMeta 0) (Bool.not (Nat.beq s.bits 0)) with
+      | true =>
+        .some (.aggregate 0 (.scalar ⟨s.bits, ptrBytes⟩ :: .scalar ⟨0, ptrBytes⟩ :: .nil))
+      | false => .none
+    | _ =>
+      .some (.aggregate 0 (.scalar ⟨s.bits, ptrBytes⟩ :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
+  | .indirect allocId offset =>
+    match lookupGlobalAlloc globals allocId with
+    | .none => .none
+    | .some alloc =>
+      let sz :=
+        match rigidTyKindByteSizeFor ptrBytes ty.kind with
+        | .some n => n
+        | .none =>
+          match tyByteSize .nil layouts ty with
+          | .some n => n
+          | .none =>
+            match rigidTyByteSize layouts ty with
+            | .some n => n
+            | .none =>
+              match tyScalarBytes ty with
+              | .some n => n
+              | .none => Nat.sub (length alloc.bytes) offset
+      match globalAllocSliceToAbstractBytes alloc offset sz ptrBytes with
+      | .some absBytes =>
+        match decodeTypedValueFromBytes defaultCodecFuel layouts ty absBytes with
+        | .some v => .some v
+        | .none =>
+          match abstractBytesHaveProv absBytes with
+          | true => .none
+          | false =>
+            match intCastTargetBytes ty.kind ptrBytes with
+            | .some n =>
+              match globalRelocsOverlapRange alloc.relocations offset n ptrBytes with
+              | true => .none
+              | false =>
+                match readGlobalScalar alloc offset n with
+                | .some sc => .some (.scalar sc)
+                | .none => .none
+            | .none => .none
+      | .none => .none
+  | .unevaluated _ => .none
+
+/--
+Decode and project a dereferenced global allocation `alloc` at `offset` with
+pointer/access width `sz` and trailing projections `restProj`.
+
+Scalar global reads (`readGlobalScalar`) first verify via
+`globalRelocsOverlapRange` that no byte in `[offset .. offset + width)` overlaps
+a pointer relocation entry (rejecting pointer-to-integer global reads with `.ub`
+under `.strictUcg630Ub`), and non-scalar global reads decode through
+`decodeTypedValueFromBytes` at `layoutPointerBytes layouts` (enforcing
+provenance rejection on non-pointer types and non-pointer `VariantsShape.multiple`
+enums, `char` surrogate niche checks, coherent `PtrByteFrag` pointer decoding,
+and 32-bit `usize`/`isize`/pointer compound widths via `tyByteSize .nil layouts`).
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.)"
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to sized types have the same size and alignment as usize."
+
+Modeling choice (`agent_docs/trusted-rust.md`): target width is
+`layoutPointerBytes layouts`, and global dereference reads enforce the same
+`.strictUcg630Ub` pointer-to-integer UB policy and `decodeTypedValueFromBytes`
+bit-validity rules as stack/union typed dereference reads.
+-/
+def evalGlobalDerefRead
+    (locals : List LocalSlot)
+    (alloc : CapturedAllocation)
+    (offset sz : Nat)
+    (restProj : List ProjectionElem)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (pointeeTyOpt : Option Ty := .none) :
+    PlaceReadResult :=
+  let ptrBytes := layoutPointerBytes layouts
+  match pointeeTyOpt with
+  | .some pointeeTy =>
+    match intCastTargetBytes pointeeTy.kind ptrBytes with
+    | .some n =>
+      match globalRelocsOverlapRange alloc.relocations offset n ptrBytes with
+      | true => .ub
+      | false =>
+        match readGlobalScalar alloc offset n with
+        | .some sc =>
+          match readProjectedValue locals (.scalar sc) restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none => .ub
+    | .none =>
+      let byteSz :=
+        match rigidTyKindByteSizeFor ptrBytes pointeeTy.kind with
+        | .some n => n
+        | .none =>
+          match tyByteSize .nil layouts pointeeTy with
+          | .some n => n
+          | .none =>
+            match rigidTyByteSize layouts pointeeTy with
+            | .some n => n
+            | .none => Nat.sub (length alloc.bytes) offset
+      match globalAllocSliceToAbstractBytes alloc offset byteSz ptrBytes with
+      | .some absBytes =>
+        match decodeTypedValueFromBytes defaultCodecFuel layouts pointeeTy absBytes with
+        | .some decodedVal =>
+          match readProjectedValue locals decodedVal restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none => .ub
+      | .none => .ub
+  | .none =>
+    let nonPrimLayoutOpt : Option (Ty × Nat) :=
+      match LayoutTable.lookup layouts 0 with
+      | .some l =>
+        match Bool.and (Nat.beq l.size.bytes 0) (Nat.blt offset (length alloc.bytes)) with
+        | true => .none
+        | false =>
+          match l.fields with
+          | .primitive => .none
+          | .array stride count =>
+            .some
+              ({ kind := .array (uintRigidTyOfStride stride.bytes) count, layoutIdx := 0 },
+               l.size.bytes)
+          | _ =>
+            .some ({ kind := .adt "" .nil, layoutIdx := 0 }, l.size.bytes)
+      | .none => .none
+    match nonPrimLayoutOpt with
+    | .some (inferredTy, byteSz) =>
+      match globalAllocSliceToAbstractBytes alloc offset byteSz ptrBytes with
+      | .some absBytes =>
+        match decodeTypedValueFromBytes defaultCodecFuel layouts inferredTy absBytes with
+        | .some decodedVal =>
+          match readProjectedValue locals decodedVal restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none => .ub
+      | .none => .ub
+    | .none =>
+      match isScalarCompatibleProj restProj with
+      | true =>
+        match globalRelocsOverlapRange alloc.relocations offset sz ptrBytes with
+        | true => .ub
+        | false =>
+          match readGlobalScalar alloc offset sz with
+          | .some sc =>
+            match readProjectedValue locals (.scalar sc) restProj with
+            | .ok fieldVal => .ok fieldVal locals
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | .none =>
+            match Nat.beq sz 0 with
+            | true =>
+              match Nat.ble offset (length alloc.bytes) with
+              | true =>
+                match readProjectedValue locals .unit restProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | false => .ub
+            | false =>
+              match globalAllocSliceToAbstractBytes alloc offset sz ptrBytes with
+              | .some absBytes =>
+                let arrTy : Ty := { kind := .array (.uint .u8) sz, layoutIdx := 0 }
+                match decodeTypedValueFromBytes defaultCodecFuel layouts arrTy absBytes with
+                | .some decodedVal =>
+                  match readProjectedValue locals decodedVal restProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | .none => .ub
+              | .none => .ub
+      | false =>
+        match Nat.ble offset (length alloc.bytes) with
+        | false => .ub
+        | true =>
+          let remBytes := Nat.sub (length alloc.bytes) offset
+          match globalAllocSliceToAbstractBytes alloc offset remBytes ptrBytes with
+          | .some absBytes =>
+            let arrTy : Ty := { kind := .array (.uint .u8) remBytes, layoutIdx := 0 }
+            match decodeTypedValueFromBytes defaultCodecFuel layouts arrTy absBytes with
+            | .some decodedVal =>
+              match readProjectedValue locals decodedVal restProj with
+              | .ok fieldVal => .ok fieldVal locals
+              | .ub => .ub
+              | .unsupported => .unsupported
+            | .none => .ub
+          | .none => .ub
 
 /--
 Resolve dynamic `.index idxLocal` projections in `proj` into `.constantIndex

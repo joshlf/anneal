@@ -774,7 +774,7 @@ theorem validateValueForTy?_intBoolTuple {layouts : Layout.LayoutTable}
               MirSemantics.validateValueForTyAux layouts 15 { kind := k0, layoutIdx := l0 }
                 (.scalar sc0) = true := by
             intro l0
-            cases k0 <;> simp [intBoolTupleOf, intTyBytes] at ht <;> rfl
+            cases k0 <;> simp [intTyBytes] at ht <;> rfl
           have hk1 : ∀ (l1 : Nat),
               MirSemantics.validateValueForTyAux layouts 15 { kind := .bool, layoutIdx := l1 }
                 (.scalar sc1) = true := by
@@ -1016,7 +1016,7 @@ theorem validateValueForTy?_scalar_of_arrayElemProj {layouts : Layout.LayoutTabl
     | none => simp [htb] at ha
     | some b =>
       simp only [htb, Option.map_some, Option.some.injEq, Prod.mk.injEq] at ha
-      simp [htb, ha.1]
+      simp [ha.1]
   have hcheck : ∀ dt,
       MirSemantics.findDeclOrContainerElemTyWithKind? decls layouts ek = some dt →
       intTypeOf dt = some elemIt := by
@@ -1165,11 +1165,11 @@ theorem validateValueForTyAux_of_adtLayoutAcceptsSpec (layouts : Layout.LayoutTa
         dsimp only
         cases hvar : l.variants with
         | empty => simp [hvar] at hacc
-        | multiple _ _ _ => simp only [hl, hu, hvar]
+        | multiple _ _ _ => simp only [hu]
         | single _ =>
           rw [hvar] at hacc
           cases hf : l.fields with
-          | union _ => simp only [hl, hu, hvar, hf]
+          | union _ => simp only [hu]
           | primitive =>
             rw [hf] at hacc
             cases spec with
@@ -1179,27 +1179,27 @@ theorem validateValueForTyAux_of_adtLayoutAcceptsSpec (layouts : Layout.LayoutTa
                 simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hval
                 simp only [Bool.or_eq_true] at hacc
                 cases hsz0 : Nat.beq l.size.bytes 0 with
-                | true => simp only [hl, hu, hvar, hf, hsz0]
+                | true => simp only [hu]
                 | false =>
                   rw [hsz0] at hacc
                   simp only [Bool.false_eq_true, false_or] at hacc
                   cases hbr : l.backendRepr with
                   | scalar s0 =>
                     rw [hbr] at hacc
-                    simp only [hl, hu, hvar, hf, hsz0, hbr]
+                    simp only [hu]
                     exact validateScalarLayoutValForTy?_of_scalarLayoutAcceptsAllInt hacc hval.1 hval.2
-                  | _ => simp only [hl, hu, hvar, hf, hsz0, hbr]
+                  | _ => simp only [hu]
               | _ => simp [TupleSpec.valOk] at hval
             | tuple fs sz al =>
               simp only [Bool.or_eq_true] at hacc
               cases hsz0 : Nat.beq l.size.bytes 0 with
-              | true => simp only [hl, hu, hvar, hf, hsz0]
+              | true => simp only [hu]
               | false =>
                 rw [hsz0] at hacc
                 simp only [Bool.false_eq_true, false_or] at hacc
                 cases hbr : l.backendRepr with
                 | scalar _ => simp [hbr] at hacc
-                | _ => simp only [hl, hu, hvar, hf, hsz0, hbr]
+                | _ => simp only [hu]
           | arbitrary offsets _ =>
             rw [hf] at hacc
             cases spec with
@@ -1207,7 +1207,7 @@ theorem validateValueForTyAux_of_adtLayoutAcceptsSpec (layouts : Layout.LayoutTa
               cases v with
               | scalar sc =>
                 simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hval
-                simp only [hl, hu, hvar, hf]
+                simp only [hu]
                 cases offsets with
                 | cons o0 os =>
                   cases os with
@@ -1228,7 +1228,7 @@ theorem validateValueForTyAux_of_adtLayoutAcceptsSpec (layouts : Layout.LayoutTa
                 | zero =>
                   simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hval
                   obtain ⟨hlen, hfval⟩ := hval
-                  simp only [hl, hu, hvar, hf]
+                  simp only [hu]
                   have hlenEq :
                       Nat.beq (Trusted.Sequence.length l.fieldLayouts) (Trusted.Sequence.length fvals) =
                         Nat.beq l.fieldLayouts.length fs.length := by
@@ -1362,7 +1362,7 @@ theorem validateValueForTyAux_of_adtLayoutAcceptsSpec (layouts : Layout.LayoutTa
               | _ => simp [TupleSpec.valOk] at hval
           | array _ _ =>
             rw [hf] at hacc
-            simp only [hl, hu, hvar, hf]
+            simp only [hu]
             cases spec with
             | scalar _ =>
               cases v with
@@ -1491,11 +1491,11 @@ theorem materializeReadPtrValue_of_tyLayoutAcceptsSpec {layouts : Layout.LayoutT
     MirSemantics.materializeReadPtrValue layouts (some ty) v = .some v := by
   apply materializeReadPtrValue_nonPtr_ty
   · intro m p hk; rcases ty with ⟨k, l⟩; dsimp only at hk; subst hk
-    simp [tyLayoutAcceptsSpec, MirSemantics.defaultCodecFuel] at hacc
+    simp [tyLayoutAcceptsSpec] at hacc
   · intro m p hk; rcases ty with ⟨k, l⟩; dsimp only at hk; subst hk
-    simp [tyLayoutAcceptsSpec, MirSemantics.defaultCodecFuel] at hacc
+    simp [tyLayoutAcceptsSpec] at hacc
   · intro a b c d hk; rcases ty with ⟨k, l⟩; dsimp only at hk; subst hk
-    simp [tyLayoutAcceptsSpec, MirSemantics.defaultCodecFuel] at hacc
+    simp [tyLayoutAcceptsSpec] at hacc
 
 theorem tyLayoutAcceptsSpec_of_specOfRigidTy {layouts : Layout.LayoutTable}
     {ty : MirAst.Ty} {spec : TupleSpec}
@@ -1750,7 +1750,7 @@ theorem evalOperand_fragT {layouts : Layout.LayoutTable} (decls : List LocalDecl
       refine ⟨fun bits hb _ => ?_, fun hnone => by simp [hs] at hnone⟩
       simp [hs] at hb
       subst hb
-      simp only [hs, readProjectedValue, valueContainsUninit]
+      simp only [hs, readProjectedValue]
       rw [evalOperand_post_read_ok layouts decls ⟨j, []⟩ (.scalar sc) locals
         (materializeReadPtrValue_scalar layouts _ sc) hval_ok, ← hsz]
     | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩ =>
@@ -1801,7 +1801,7 @@ theorem evalOperand_fragT {layouts : Layout.LayoutTable} (decls : List LocalDecl
               refine ⟨fun bits hb _ => ?_, fun hnone => by simp [hs, readFieldPath] at hnone⟩
               simp [hs, readFieldPath] at hb
               subst hb
-              simp only [hs, readProjectedValue, get?, List.getElem?_cons_zero, valueContainsUninit]
+              simp only [hs, readProjectedValue, get?, List.getElem?_cons_zero]
               rw [evalOperand_post_read_ok layouts decls ⟨j, [.field 0 fTy]⟩ (.scalar sc0) locals
                 (materializeReadPtrValue_scalar layouts _ sc0) hval_ok, ← hsz0]
         · simp [heq] at hty
@@ -1847,8 +1847,7 @@ theorem evalOperand_fragT {layouts : Layout.LayoutTable} (decls : List LocalDecl
             refine ⟨fun bits hb _ => ?_, fun hnone => by simp [hs, readFieldPath] at hnone⟩
             simp [hs, readFieldPath] at hb
             subst hb
-            simp only [hs, readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero,
-              valueContainsUninit]
+            simp only [hs, readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero]
             rw [evalOperand_post_read_ok layouts decls ⟨j, [.field 1 fTy]⟩ (.scalar sc1) locals
               (materializeReadPtrValue_scalar layouts _ sc1) hval_ok]
             cases sc1
@@ -1935,7 +1934,7 @@ theorem evalOperand_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl)
       refine ⟨fun bits hb _ => ?_, fun hnone => by simp [hs] at hnone⟩
       simp [hs] at hb
       subst hb
-      simp only [hs, readProjectedValue, valueContainsUninit]
+      simp only [hs, readProjectedValue]
       rw [evalOperand_post_read_ok layouts decls ⟨j, []⟩ (.scalar sc) locals
         (materializeReadPtrValue_scalar layouts _ sc) hval_ok, ← hsz]
     | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩ =>
@@ -1991,7 +1990,7 @@ theorem evalOperand_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl)
                   refine ⟨fun bits hb _ => ?_, fun hnone => by simp [hs, readFieldPath] at hnone⟩
                   simp [hs, readFieldPath] at hb
                   subst hb
-                  simp only [hs, readProjectedValue, get?, List.getElem?_cons_zero, valueContainsUninit]
+                  simp only [hs, readProjectedValue, get?, List.getElem?_cons_zero]
                   rw [evalOperand_post_read_ok layouts decls ⟨j, [.field 0 fieldTy]⟩ (.scalar sc0) locals
                     (materializeReadPtrValue_scalar layouts _ sc0) hval_ok, ← hsz0]
             | cons _ _ => simp at hok
@@ -4180,7 +4179,7 @@ theorem evalPlaceLen_array_local {locals : List LocalSlot} {mem : MirSemantics.M
       (by intro _ _ _ _ h; rw [hk] at h; cases h)
   unfold MirSemantics.evalPlaceLen
   simp only [hpt, MirSemantics.evalPlaceRead, hptr, readProjectedValue, valueContainsUninit,
-    hinit, get?, hs, hmat, hvalid, length, MirSemantics.splitLastDeref?]
+    hinit, get?, hs, hmat, hvalid, length]
   cases hty : d.ty with
   | mk kind lIdx =>
     rw [hty] at hk
@@ -5656,7 +5655,7 @@ theorem evalOperand_decls_eq_nil_of_RelOperandOk {layouts : Layout.LayoutTable}
                   (MirSemantics.placeTyResolved decls layouts ⟨j, []⟩) (.scalar sc) = true := by
                 simp only [MirSemantics.placeTyResolved, get?, hd, MirSemantics.resolveProjectedTyResolved]
                 exact validateValueForTy?_scalar_of_intTypeOf hty sc
-              simp only [get?, hs, readProjectedValue, valueContainsUninit]
+              simp only [get?, hs, readProjectedValue]
               exact (evalOperand_post_read_ok layouts decls ⟨j, []⟩ (.scalar sc) locals
                 (materializeReadPtrValue_scalar layouts _ sc) hval).symm
             | .init (.aggregate 0 [.scalar _, .scalar _]), ⟨_, htyT, _⟩ =>
@@ -5704,7 +5703,7 @@ theorem evalOperand_decls_eq_nil_of_RelOperandOk {layouts : Layout.LayoutTable}
                             simp only [resolveProjTy, Option.map_some, Option.some.injEq] at hkind
                             exact validateValueForTy?_scalar_of_intTypeOf
                               (by unfold intTypeOf at hf ⊢; rw [hkind]; exact hf) sc0
-                        simp only [get?, hs, readProjectedValue, valueContainsUninit]
+                        simp only [get?, hs, readProjectedValue]
                         exact (evalOperand_post_read_ok layouts decls ⟨j, [.field 0 fieldTy]⟩
                           (.scalar sc0) locals (materializeReadPtrValue_scalar layouts _ sc0) hval).symm
             | none =>
@@ -5835,7 +5834,7 @@ theorem evalOperand_decls_eq_nil_of_RelOperandOk {layouts : Layout.LayoutTable}
             simp only [placeOk, Bool.and_eq_true, decide_eq_true_eq] at hok
             cases hd : decls[j]? <;> simp [hd, projOk] at hok
             rename_i d
-            cases ha : arrayTypeOf d.ty <;> simp [ha, projOk] at hok
+            cases ha : arrayTypeOf d.ty <;> simp [ha] at hok
           | cons _ _ => simp [placeOk] at hok
   | bool op hok =>
     cases op with
@@ -5873,7 +5872,7 @@ theorem evalOperand_decls_eq_nil_of_RelOperandOk {layouts : Layout.LayoutTable}
               simp only [MirSemantics.placeTyResolved, get?, hd, MirSemantics.resolveProjectedTyResolved]
               exact validateValueForTy?_scalar_of_isBoolTy hb sc (by simpa [tyBytes] using hsz)
                 (by simpa [ValidBits] using hvb)
-            simp only [get?, hs, readProjectedValue, valueContainsUninit]
+            simp only [get?, hs, readProjectedValue]
             exact (evalOperand_post_read_ok layouts decls ⟨j, []⟩ (.scalar sc) locals
               (materializeReadPtrValue_scalar layouts _ sc) hval).symm
           | .init (.aggregate 0 [.scalar _, .scalar _]), ⟨_, htyT, _⟩ =>
@@ -5929,7 +5928,7 @@ theorem evalOperand_decls_eq_nil_of_RelOperandOk {layouts : Layout.LayoutTable}
                             have hrb : isBoolTy rty = true := by
                               unfold isBoolTy at hok ⊢; rw [hkind]; exact hok
                             exact validateValueForTy?_scalar_of_isBoolTy hrb sc1 hsz1 hvb1
-                        simp only [get?, hs, readProjectedValue, valueContainsUninit]
+                        simp only [get?, hs, readProjectedValue]
                         exact (evalOperand_post_read_ok layouts decls ⟨j, [.field 1 fTy]⟩
                           (.scalar sc1) locals (materializeReadPtrValue_scalar layouts _ sc1) hval).symm
         | _ => simp [operandOkB] at hok
@@ -6257,7 +6256,7 @@ theorem evalOperand_fragTuple {layouts : Layout.LayoutTable} (decls : List Local
       refine ⟨fun bits b hbb _ => ?_, fun hnone => by simp [hs] at hnone⟩
       simp [hs] at hbb
       rcases hbb with ⟨rfl, rfl⟩
-      simp only [hs, readProjectedValue, valueContainsUninit, valueListContainsUninit]
+      simp only [hs, readProjectedValue]
       rw [evalOperand_post_read_ok layouts decls ⟨j, []⟩
         (.aggregate 0 [.scalar sc0, .scalar sc1]) locals hmat hval, ← hsz0, ← hsz1]
 
@@ -7911,21 +7910,21 @@ theorem evalOperand_move (locals : List LocalSlot) (op : Operand) (hs : simpleOp
         | uninit => rfl
         | init v =>
           cases h : valueContainsUninit v with
-          | true => simp [hjl, readProjectedValue, h, opWithLocals]
+          | true => simp [readProjectedValue, h, opWithLocals]
           | false =>
             simp only [hjl, readProjectedValue, h, opWithLocals]
             cases decls with
-            | nil => simp [hjl, opWithLocals]
+            | nil => simp
             | cons d ds =>
               dsimp only
               cases hmat : MirSemantics.materializeReadPtrValue layouts
                   (MirSemantics.placeTyResolved (d :: ds) layouts ⟨j, []⟩) v with
-              | none => simp [opWithLocals]
+              | none => simp
               | some mv =>
                 dsimp only
                 cases hval : MirSemantics.validateValueForTy? layouts
                     (MirSemantics.placeTyResolved (d :: ds) layouts ⟨j, []⟩) mv <;>
-                  simp [hjl, opWithLocals]
+                  simp
     | cons hd tl =>
       have hsp : simpleProj (hd :: tl) = true := hs
       have hnd := simpleProj_nonDeref hsp

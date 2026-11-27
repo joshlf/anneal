@@ -1710,7 +1710,7 @@ run_cmd do
     let listNatTy := mkApp (mkConst ``List [0]) natTy
     let fmtTy := mkConst (tSem ++ `IeeeFormat)
     let fmtNatTy := mkApp2 (mkConst ``Prod [0, 0]) fmtTy natTy
-    let natPairTy := mkApp2 (mkConst ``Prod [0, 0]) natTy natTy
+    let _natPairTy := mkApp2 (mkConst ``Prod [0, 0]) natTy natTy
     let abTy := mkConst (tSem ++ `AbstractByte)
     let f32 := mkConst (tSem ++ `IeeeFormat.binary32)
     let f64 := mkConst (tSem ++ `IeeeFormat.binary64)

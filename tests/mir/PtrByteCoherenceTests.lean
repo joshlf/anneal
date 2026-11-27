@@ -2297,6 +2297,569 @@ theorem b1_lockstep_parity_32bit :
     v06 = v08 ∧ v06 = [.scalar 1 4, .scalar 2 4, .ptr 9 0x10 4, .ptr 9 0x10 4, .scalar 0x02000000 4, .none] := by
   exact ⟨rfl, rfl⟩
 
+/-! ## §4.5. Pass A1 Adversarial Regressions & `lean-miri` Correspondence Gap Postmortem
+
+### `lean-miri` Correspondence Gap Postmortem (`mir-correspondence-postmortem`)
+Why `LeanMiriSpec` did not catch the three classes of defects uncovered in Pass A1:
+1. **Global relocation provenance stripping (`evalGlobalDerefRead` / `evalConstValue (.indirect)`)**:
+   `LeanMiriSpec` (`SimLM*` / `WitLM*`) bridges stack/heap allocations in `MachineState.memory` and
+   scalar/ZST constants, and does not yet bridge `CapturedAllocation.relocations` in `body.globals`
+   (`ConstValue.indirect` / `evalGlobalDerefRead`). Prior to A1, `readGlobalScalar` ignored
+   `alloc.relocations` and `evalConstValue`/`evalGlobalDerefRead` called `decodeValueFromBytes`
+   instead of `decodeTypedValueFromBytes`, allowing global pointer relocations to be read as plain
+   integers/booleans/arrays/tuples/multi-variant enums and skipping `0..=0x10FFFF` surrogate niche
+   checks.
+2. **32-bit `evalCopyUnionBytes`, `convertCopySingleValue?`, and compound `[usize; N]` /
+   `(*const T, usize)` widths**: Every `LeanMiriSpec` theorem carries the explicit 64-bit target
+   hypothesis `(hptr8 : layoutPointerBytes body.layouts = 8)`, leaving `pointerBits = 32`
+   (`layoutPointerBytes = 4`) outside the `LeanMiriSpec` hypothesis boundary. Prior to A1,
+   `evalCopyUnionBytes` and `convertCopySingleValue?` consulted 64-bit `rigidTyByteSize` (`8` instead
+   of `4`), faulting with spurious `.ub` on valid 32-bit union and single-element copies.
+3. **Wide-pointer (`*const [T]`, `&[T]`, `&str`, `*const dyn Trait`, `&dyn Trait`) bytewise copy and
+   partial sub-pointer overwrites in `copyBytesSubplace`**: `CopyLM4_2` covers thin pointers,
+   integers, arrays, and unions (`isThinPtrCopyKind` / `isLayoutIndepByteKind`), leaving unsized
+   wide-pointer destinations under bytewise `copy_nonoverlapping::<u8>` outside `CopyLM4_2`'s
+   covered type fragment. Prior to A1, `copyBytesSubplace` restricted exact byte copy/partial
+   overwrite to `isThinPtrCopyKind`. -/
+
+section A1Fixtures06
+
+open V06
+
+/-- 4-byte global holding UTF-16 surrogate `0xD800` (invalid for `0..=0x10FFFF` niche ADTs). -/
+def a1AllocSurrogate_06 : CapturedAllocation :=
+  { allocId := 81,
+    bytes := [some 0x00, some 0xD8, some 0x00, some 0x00],
+    relocations := [], align := ⟨4⟩, mutability := .not }
+
+/-- 4-byte global holding valid Unicode scalar `'A'` (`0x41`). -/
+def a1AllocValidChar_06 : CapturedAllocation :=
+  { allocId := 82,
+    bytes := [some 0x41, some 0x00, some 0x00, some 0x00],
+    relocations := [], align := ⟨4⟩, mutability := .not }
+
+/-- `struct CharWrap(char)` with scalar `0..=0x10FFFF` layout (`charL06`). -/
+def a1TyCharWrap_06 : Ty := { kind := .adt "CharWrap" [], layoutIdx := 3 }
+
+/-- 32-bit `MaybeUninit<*const u8>`: size 4, align 4, union of (`b1PtrL32_06` at idx 2, `unitL06` at idx 0). -/
+def a1MaybeUninitPtr32L_06 : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [2, 0] }
+
+/-- `[u8; 8]` at idx 6, `(*const u8, usize)` at idx 7, and `[u8; 16]` at idx 18. -/
+def a1TupPtrUsize32L_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr := .scalarPair
+      (.initialized (.pointer 0) ⟨0, 0xFFFFFFFF⟩)
+      (.initialized (.int 32 false) ⟨0, 0xFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+    variants := .single 0, isUninhabited := false,
+    fieldLayouts := [2, 4] }
+
+def a1Arr16U8L_06 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨1⟩ 16, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1] }
+
+def a1Layouts32_06 : LayoutTable :=
+  { b1Layouts32_06 with
+    entries := b1Layouts32_06.entries ++ [a1MaybeUninitPtr32L_06, arr8U8L06, a1TupPtrUsize32L_06] }
+
+def a1Layouts64_06 : LayoutTable :=
+  { b1Layouts64_06 with entries := b1Layouts64_06.entries ++ [a1Arr16U8L_06] }
+
+def a1TyMaybeUninitPtr32_06 : Ty := { kind := .adt "MaybeUninit" [], layoutIdx := 5 }
+
+end A1Fixtures06
+
+/-- A1 (Defect 1, `V2026_06_01`): `evalConstValue (.indirect ..)` and `evalGlobalDerefRead` enforce
+`.strictUcg630Ub` relocation provenance rejection across integer scalars (`usize`, `u64`, `u8`),
+`bool`, `char`, arrays, tuples, non-pointer `VariantsShape.multiple` enums (`W5`), and untyped
+global reads, and reject UTF-16 surrogates (`0xD800`) on `0..=0x10FFFF` scalar-niche ADTs while
+preserving coherent global pointer relocations and disjoint plain scalar bytes. -/
+theorem a1_global_reloc_prov_and_surrogate_reject_v06 :
+    let arrU64Ty : V06.Ty := { kind := .array (.uint .u64) 1, layoutIdx := 0 }
+    let tupU64Ty : V06.Ty := { kind := .tuple [.uint .u64], layoutIdx := 0 }
+    -- Positive controls: coherent pointer relocations and valid `CharWrap('A')`
+    V06.evalConstValue (.indirect 50 0) tyRawPtrU8_06 [adjRelocAlloc64_06] layouts64_06 =
+      some (.ptr ptr64_06 8) ∧
+    V06.evalConstValue (.indirect 50 0) tyRefU8_06 [adjRelocAlloc64_06] layouts64_06 =
+      some (.ptr ptr64_06 8) ∧
+    V06.evalConstValue (.indirect 82 0) a1TyCharWrap_06 [a1AllocValidChar_06] layouts64_06 =
+      some (.scalar ⟨0x41, 4⟩) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] a1AllocValidChar_06 0 4 []
+      layouts64_06 (some a1TyCharWrap_06) = .ok (.scalar ⟨0x41, 4⟩) [] ∧
+    -- Negative controls (`evalConstValue`): relocation provenance rejected on non-pointers + surrogate rejected
+    V06.evalConstValue (.indirect 50 0) tyUsize_06 [adjRelocAlloc64_06] layouts64_06 = none ∧
+    V06.evalConstValue (.indirect 50 0) tyU64_06 [adjRelocAlloc64_06] layouts64_06 = none ∧
+    V06.evalConstValue (.indirect 50 0) tyU8_06 [adjRelocAlloc64_06] layouts64_06 = none ∧
+    V06.evalConstValue (.indirect 50 0) tyBool_06 [adjRelocAlloc64_06] layouts64_06 = none ∧
+    V06.evalConstValue (.indirect 50 0) tyChar_06 [adjRelocAlloc64_06] layouts64_06 = none ∧
+    V06.evalConstValue (.indirect 50 0) arrU64Ty [adjRelocAlloc64_06] layouts64_06 = none ∧
+    V06.evalConstValue (.indirect 50 0) tupU64Ty [adjRelocAlloc64_06] layouts64_06 = none ∧
+    V06.evalConstValue (.indirect 50 0) tyEnum3_06 [adjRelocAlloc64_06] layouts64_06 = none ∧
+    V06.evalConstValue (.indirect 81 0) a1TyCharWrap_06 [a1AllocSurrogate_06] layouts64_06 = none ∧
+    -- Negative controls (`evalGlobalDerefRead`): relocation overlap & typed provenance/surrogate rejected with `.ub`
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_06 0 8 []
+      layouts64_06 (some tyUsize_06) = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_06 0 1 []
+      layouts64_06 (some tyU8_06) = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_06 0 1 []
+      layouts64_06 (some tyBool_06) = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_06 0 8 []
+      layouts64_06 (some arrU64Ty) = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_06 0 1 []
+      layouts64_06 (some tyEnum3_06) = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_06 0 8 []
+      layouts64_06 none = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] a1AllocSurrogate_06 0 4 []
+      layouts64_06 (some a1TyCharWrap_06) = .ub ∧
+    -- 32-bit relocation range check: offset 0 (`reloc`) faults `.ub`, offset 4 (`plain 2`) succeeds
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] b1AllocPtr32_06 0 4 []
+      b1Layouts32_06 (some b1Usize32_06) = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] b1AllocPtr32_06 4 4 []
+      b1Layouts32_06 (some b1Usize32_06) = .ok (.scalar ⟨2, 4⟩) [] ∧
+    V06.evalConstValue (.indirect 71 0) b1Usize32_06 [b1AllocPtr32_06] b1Layouts32_06 = none := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+/-- A1 (Defect 2, `V2026_06_01`): on a 32-bit target (`pointerBits = 32`), `[usize; 2]` and
+`(*const u8, usize)` constants/globals decode at 4-byte element width, `evalCopyUnionBytes` copies
+4-byte pointers into and out of `MaybeUninit<*const u8>` without spurious 64-bit bounds `.ub`,
+`evalCopySingleDirect` (`convertCopySingleValue?`) copies `u32 -> *const u8` (without forging
+provenance) and `*const u8 -> *const u32` (preserving provenance) while faulting `.ub` on
+`*const u8 -> usize`, and 4-byte `copy_nonoverlapping::<u8>` of a 32-bit pointer into `usize`
+faults `.ub`. -/
+theorem a1_32bit_compound_union_and_single_copy_v06 :
+    let arrUsize2 : V06.Ty := { kind := .array (.uint .usize) 2, layoutIdx := 0 }
+    let tupUsize2 : V06.Ty := { kind := .tuple [.uint .usize, .uint .usize], layoutIdx := 0 }
+    let tupPtrUsize : V06.Ty := { kind := .tuple [.rawPtr .not (.uint .u8), .uint .usize], layoutIdx := 7 }
+    let tyU32 : V06.Ty := { kind := .uint .u32, layoutIdx := 4 }
+    let tyRawPtrU32 : V06.Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 2 }
+    let target : V06.ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+    -- 1. 32-bit `[usize; 2]`, layout-free `(usize, usize)`, and captured-layout `(*const u8, usize)`
+    V06.evalConstValue (.indirect 70 0) arrUsize2 [b1AllocUsize32_06] a1Layouts32_06 =
+      some (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩]) ∧
+    V06.evalConstValue (.indirect 70 0) tupUsize2 [b1AllocUsize32_06] a1Layouts32_06 =
+      some (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩]) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] b1AllocUsize32_06 0 8 []
+      a1Layouts32_06 (some arrUsize2) = .ok (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩]) [] ∧
+    V06.evalConstValue (.indirect 71 0) tupPtrUsize [b1AllocPtr32_06] a1Layouts32_06 =
+      some (.aggregate 0 [.ptr ptr32_06 4, .scalar ⟨2, 4⟩]) ∧
+    -- 2. 32-bit `evalCopyUnionBytes` (`*const u8` -> `MaybeUninit<*const u8>` -> `*const u8`)
+    --    and `evalCopySingleDirect` (`u32 -> *const u8`, `*const u8 -> *const u32`, `*const u8 -> usize`)
+    (let decls : List V06.LocalDecl := [
+       { mutability := .not, ty := tyU8_06, debugName := none },                                        -- 0: backing u8
+       { mutability := .not, ty := b1RawPtr32_06, debugName := none },                                   -- 1: src *const u8 (ptr)
+       { mutability := .mut, ty := a1TyMaybeUninitPtr32_06, debugName := none },                         -- 2: union MaybeUninit<*const u8>
+       { mutability := .mut, ty := b1RawPtr32_06, debugName := none },                                   -- 3: dst *const u8
+       { mutability := .not, ty := tyU32, debugName := none },                                           -- 4: src u32 = 0x1234
+       { mutability := .mut, ty := tyRawPtrU32, debugName := none },                                     -- 5: dst *const u32
+       { mutability := .mut, ty := b1Usize32_06, debugName := none },                                    -- 6: dst usize
+       { mutability := .not, ty := { kind := .rawPtr .not b1RawPtr32_06.kind, layoutIdx := 2 }, debugName := none }, -- 7: &1 (*const *const u8)
+       { mutability := .not, ty := { kind := .rawPtr .mut b1RawPtr32_06.kind, layoutIdx := 2 }, debugName := none }, -- 8: &mut 2 as *mut *const u8
+       { mutability := .not, ty := { kind := .rawPtr .not b1RawPtr32_06.kind, layoutIdx := 2 }, debugName := none }, -- 9: &2 as *const *const u8
+       { mutability := .not, ty := { kind := .rawPtr .mut b1RawPtr32_06.kind, layoutIdx := 2 }, debugName := none }, -- 10: &mut 3 (*mut *const u8)
+       { mutability := .not, ty := { kind := .rawPtr .not tyU32.kind, layoutIdx := 2 }, debugName := none },         -- 11: &4 (*const u32)
+       { mutability := .not, ty := { kind := .rawPtr .mut tyRawPtrU32.kind, layoutIdx := 2 }, debugName := none },   -- 12: &mut 5 (*mut *const u32)
+       { mutability := .not, ty := { kind := .rawPtr .mut b1Usize32_06.kind, layoutIdx := 2 }, debugName := none },  -- 13: &mut 6 (*mut usize)
+       { mutability := .not, ty := b1RawPtr32_06, debugName := none },                                   -- 14: &1 as *const u8
+       { mutability := .not, ty := b1MutPtr32_06, debugName := none }]                                   -- 15: &mut 6 as *mut u8
+     let locals : List V06.LocalSlot := [
+       .init (.scalar ⟨0x77, 1⟩),
+       .init (.ptr target 4),
+       .init (.aggregate 0 [.unit, .unit]),
+       .uninit,
+       .init (.scalar ⟨0x1234, 4⟩),
+       .uninit,
+       .uninit,
+       .init (.ptr { allocId := 10, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 11, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 11, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 13, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 14, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 15, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 16, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 17, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 18, offsetBytes := 0 } 4)]
+     let mem : V06.Memory :=
+       { V06.emptyMemory with
+         borrows := [
+           b1Frozen_06 1 0, b1Frozen_06 10 1, b1Active_06 11 2, b1Frozen_06 12 2,
+           b1Active_06 13 3, b1Frozen_06 14 4, b1Active_06 15 5, b1Active_06 16 6,
+           b1Frozen_06 17 1, b1Active_06 18 6] }
+     let st : V06.MachineState := mkState06 locals mem
+     let c1 := b1Count_06 1 4 b1Usize32_06
+     let c4 := b1Count_06 4 4 b1Usize32_06
+     -- Union roundtrip (`evalCopyUnionBytes` at 32-bit): 1 -> 2 -> 3 preserves `target` provenance
+     b1ReadAfter_06 decls a1Layouts32_06 st [b1Copy_06 7 8 c1, b1Copy_06 9 10 c1] ⟨3, []⟩ =
+       some (.ok (.ptr target 4) []) ∧
+     b1ReadAfter_06 decls a1Layouts32_06 st [b1Copy_06 7 8 c1, b1Copy_06 9 10 c1] ⟨3, [.deref]⟩ =
+       some (.ok (.scalar ⟨0x77, 1⟩) []) ∧
+     -- Single-element direct (`convertCopySingleValue?` at 32-bit): u32 -> *const u8 & *const u8 -> *const u32
+     b1ReadAfter_06 decls a1Layouts32_06 st [b1Copy_06 11 10 c1] ⟨3, []⟩ =
+       some (.ok (.scalar ⟨0x1234, 4⟩) []) ∧
+     b1ReadAfter_06 decls a1Layouts32_06 st [b1Copy_06 7 12 c1] ⟨5, []⟩ =
+       some (.ok (.ptr target 4) []) ∧
+     -- Single-element direct `*const u8 -> usize` and 4-byte u8 copy `*const u8 -> usize` both fault `.ub`
+     IsUbStep06 (V06.evalStmt st (b1Copy_06 7 13 c1) decls a1Layouts32_06) ∧
+     IsUbStep06 (V06.evalStmt st (b1Copy_06 14 15 c4) decls a1Layouts32_06)) := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+/-- A1 (Defect 3, `V2026_06_01`): `copyBytesSubplace` supports bytewise `copy_nonoverlapping::<u8>`
+round-trips of wide pointers (`&[u8]` at both 64-bit 16B and 32-bit 8B, plus `&dyn T` with dual
+data+vtable provenance), while partial 1-byte overwrites succeed at write time (`Kani#5205`) and
+strip provenance on `*const [u8]` (`.scalar` data half) or fault `.ub` when `&[u8]` / `&dyn T` is
+read. -/
+theorem a1_wide_ptr_bytewise_copy_and_partial_overwrite_v06 :
+    let target : V06.ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+    -- 1. 64-bit wide pointers (`&[u8]`, `*const [u8]`, `&dyn T`)
+    (let decls64 : List V06.LocalDecl := [
+       { mutability := .not, ty := tyU8_06, debugName := none },                                 -- 0: zero u8 = 0
+       { mutability := .not, ty := tyRefSliceU8_06, debugName := none },                         -- 1: src &[u8]
+       { mutability := .mut, ty := { kind := .array (.uint .u8) 16, layoutIdx := 18 }, debugName := none }, -- 2: [u8; 16]
+       { mutability := .mut, ty := tyRefSliceU8_06, debugName := none },                         -- 3: dst &[u8]
+       { mutability := .mut, ty := tyRawSliceU8_06, debugName := none },                         -- 4: mut *const [u8]
+       { mutability := .not, ty := tyRefDyn_06, debugName := none },                             -- 5: src &dyn T
+       { mutability := .mut, ty := tyRefDyn_06, debugName := none },                             -- 6: dst &dyn T
+       { mutability := .not, ty := tyRawPtrU8_06, debugName := none },                           -- 7: &0 (*const u8)
+       { mutability := .not, ty := tyRawPtrU8_06, debugName := none },                           -- 8: &1 as *const u8
+       { mutability := .not, ty := tyMutPtrU8_06, debugName := none },                           -- 9: &mut 2 as *mut u8
+       { mutability := .not, ty := tyMutPtrU8_06, debugName := none },                           -- 10: &mut 3 as *mut u8
+       { mutability := .not, ty := tyMutPtrU8_06, debugName := none },                           -- 11: &mut 4 as *mut u8
+       { mutability := .not, ty := tyRawPtrU8_06, debugName := none },                           -- 12: &5 as *const u8
+       { mutability := .not, ty := tyMutPtrU8_06, debugName := none }]                           -- 13: &mut 6 as *mut u8
+     let sliceVal : V06.Value := .aggregate 0 [.ptr target 8, .scalar ⟨3, 8⟩]
+     let dynVal : V06.Value := .aggregate 0 [.ptr target 8, .ptr vtPtr64_06 8]
+     let locals64 : List V06.LocalSlot := [
+       .init (.scalar ⟨0, 1⟩),
+       .init sliceVal,
+       .init (.aggregate 0 (List.replicate 16 (.scalar ⟨0, 1⟩))),
+       .init sliceVal,
+       .init sliceVal,
+       .init dynVal,
+       .uninit,
+       .init (.ptr { allocId := 10, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 11, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 12, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 13, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 14, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 15, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 16, offsetBytes := 0 } 8)]
+     let mem64 : V06.Memory :=
+       { V06.emptyMemory with
+         borrows := [
+           b1Frozen_06 1 0, b1Frozen_06 10 0, b1Frozen_06 11 1, b1Active_06 12 2,
+           b1Active_06 13 3, b1Active_06 14 4, b1Frozen_06 15 5, b1Active_06 16 6] }
+     let st64 : V06.MachineState := mkState06 locals64 mem64
+     let c1 := b1Count_06 1 8 tyUsize_06
+     let c16 := b1Count_06 16 8 tyUsize_06
+     -- Full 16B bytewise roundtrip of `&[u8]` through `[u8; 16]` and direct 16B copy of `&dyn T`
+     b1ReadAfter_06 decls64 a1Layouts64_06 st64 [b1Copy_06 8 9 c16, b1Copy_06 9 10 c16] ⟨3, []⟩ =
+       some (.ok sliceVal []) ∧
+     b1ReadAfter_06 decls64 a1Layouts64_06 st64 [b1Copy_06 12 13 c16] ⟨6, []⟩ =
+       some (.ok dynVal []) ∧
+     -- Partial 1-byte overwrite: `*const [u8]` strips data provenance; `&[u8]` and `&dyn T` defer UB to read!
+     (b1Run_06 decls64 a1Layouts64_06 st64 [b1Copy_06 7 10 c1]).isSome = true ∧
+     b1ReadAfter_06 decls64 a1Layouts64_06 st64 [b1Copy_06 7 10 c1] ⟨3, []⟩ = some .ub ∧
+     b1ReadAfter_06 decls64 a1Layouts64_06 st64 [b1Copy_06 7 11 c1] ⟨4, []⟩ =
+       some (.ok (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨3, 8⟩]) []) ∧
+     (b1Run_06 decls64 a1Layouts64_06 st64 [b1Copy_06 12 13 c16, b1Copy_06 7 13 c1]).isSome = true ∧
+     b1ReadAfter_06 decls64 a1Layouts64_06 st64 [b1Copy_06 12 13 c16, b1Copy_06 7 13 c1] ⟨6, []⟩ =
+       some .ub) ∧
+    -- 2. 32-bit 8B wide pointer `&[u8]` bytewise copy
+    (let tyRefSlice32 : V06.Ty := { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 }
+     let decls32 : List V06.LocalDecl := [
+       { mutability := .not, ty := tyU8_06, debugName := none },
+       { mutability := .not, ty := tyRefSlice32, debugName := none },
+       { mutability := .mut, ty := tyRefSlice32, debugName := none },
+       { mutability := .not, ty := b1RawPtr32_06, debugName := none },
+       { mutability := .not, ty := b1MutPtr32_06, debugName := none }]
+     let sliceVal32 : V06.Value := .aggregate 0 [.ptr target 4, .scalar ⟨3, 4⟩]
+     let locals32 : List V06.LocalSlot := [
+       .init (.scalar ⟨0xAA, 1⟩), .init sliceVal32, .uninit,
+       .init (.ptr { allocId := 10, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 11, offsetBytes := 0 } 4)]
+     let mem32 : V06.Memory :=
+       { V06.emptyMemory with borrows := [b1Frozen_06 1 0, b1Frozen_06 10 1, b1Active_06 11 2] }
+     let st32 : V06.MachineState := mkState06 locals32 mem32
+     let c8 := b1Count_06 8 4 b1Usize32_06
+     b1ReadAfter_06 decls32 a1Layouts32_06 st32 [b1Copy_06 3 4 c8] ⟨2, []⟩ =
+       some (.ok sliceVal32 [])) := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+section A1Fixtures08
+
+open V08
+
+def a1AllocSurrogate_08 : CapturedAllocation :=
+  { allocId := 81,
+    bytes := [some 0x00, some 0xD8, some 0x00, some 0x00],
+    relocations := [], align := ⟨4⟩, mutability := .not }
+
+def a1AllocValidChar_08 : CapturedAllocation :=
+  { allocId := 82,
+    bytes := [some 0x41, some 0x00, some 0x00, some 0x00],
+    relocations := [], align := ⟨4⟩, mutability := .not }
+
+def a1TyCharWrap_08 : Ty := { kind := .adt "CharWrap" [], layoutIdx := 3 }
+
+def a1MaybeUninitPtr32L_08 : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [2, 0] }
+
+def a1TupPtrUsize32L_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr := .scalarPair
+      (.initialized (.pointer 0) ⟨0, 0xFFFFFFFF⟩)
+      (.initialized (.int 32 false) ⟨0, 0xFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+    variants := .single 0, isUninhabited := false,
+    fieldLayouts := [2, 4] }
+
+def a1Arr16U8L_08 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨1⟩ 16, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1] }
+
+def a1Layouts32_08 : LayoutTable :=
+  { b1Layouts32_08 with
+    entries := b1Layouts32_08.entries ++ [a1MaybeUninitPtr32L_08, arr8U8L08, a1TupPtrUsize32L_08] }
+
+def a1Layouts64_08 : LayoutTable :=
+  { b1Layouts64_08 with entries := b1Layouts64_08.entries ++ [a1Arr16U8L_08] }
+
+def a1TyMaybeUninitPtr32_08 : Ty := { kind := .adt "MaybeUninit" [], layoutIdx := 5 }
+
+end A1Fixtures08
+
+/-- A1 (Defect 1, `V2026_08_01`): `V2026_08_01` counterpart of
+`a1_global_reloc_prov_and_surrogate_reject_v06`. -/
+theorem a1_global_reloc_prov_and_surrogate_reject_v08 :
+    let arrU64Ty : V08.Ty := { kind := .array (.uint .u64) 1, layoutIdx := 0 }
+    let tupU64Ty : V08.Ty := { kind := .tuple [.uint .u64], layoutIdx := 0 }
+    V08.evalConstValue (.indirect 50 0) tyRawPtrU8_08 [adjRelocAlloc64_08] layouts64_08 =
+      some (.ptr ptr64_08 8) ∧
+    V08.evalConstValue (.indirect 50 0) tyRefU8_08 [adjRelocAlloc64_08] layouts64_08 =
+      some (.ptr ptr64_08 8) ∧
+    V08.evalConstValue (.indirect 82 0) a1TyCharWrap_08 [a1AllocValidChar_08] layouts64_08 =
+      some (.scalar ⟨0x41, 4⟩) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] a1AllocValidChar_08 0 4 []
+      layouts64_08 (some a1TyCharWrap_08) = .ok (.scalar ⟨0x41, 4⟩) [] ∧
+    V08.evalConstValue (.indirect 50 0) tyUsize_08 [adjRelocAlloc64_08] layouts64_08 = none ∧
+    V08.evalConstValue (.indirect 50 0) tyU64_08 [adjRelocAlloc64_08] layouts64_08 = none ∧
+    V08.evalConstValue (.indirect 50 0) tyU8_08 [adjRelocAlloc64_08] layouts64_08 = none ∧
+    V08.evalConstValue (.indirect 50 0) tyBool_08 [adjRelocAlloc64_08] layouts64_08 = none ∧
+    V08.evalConstValue (.indirect 50 0) tyChar_08 [adjRelocAlloc64_08] layouts64_08 = none ∧
+    V08.evalConstValue (.indirect 50 0) arrU64Ty [adjRelocAlloc64_08] layouts64_08 = none ∧
+    V08.evalConstValue (.indirect 50 0) tupU64Ty [adjRelocAlloc64_08] layouts64_08 = none ∧
+    V08.evalConstValue (.indirect 50 0) tyEnum3_08 [adjRelocAlloc64_08] layouts64_08 = none ∧
+    V08.evalConstValue (.indirect 81 0) a1TyCharWrap_08 [a1AllocSurrogate_08] layouts64_08 = none ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_08 0 8 []
+      layouts64_08 (some tyUsize_08) = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_08 0 1 []
+      layouts64_08 (some tyU8_08) = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_08 0 1 []
+      layouts64_08 (some tyBool_08) = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_08 0 8 []
+      layouts64_08 (some arrU64Ty) = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_08 0 1 []
+      layouts64_08 (some tyEnum3_08) = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] adjRelocAlloc64_08 0 8 []
+      layouts64_08 none = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] a1AllocSurrogate_08 0 4 []
+      layouts64_08 (some a1TyCharWrap_08) = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] b1AllocPtr32_08 0 4 []
+      b1Layouts32_08 (some b1Usize32_08) = .ub ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] b1AllocPtr32_08 4 4 []
+      b1Layouts32_08 (some b1Usize32_08) = .ok (.scalar ⟨2, 4⟩) [] ∧
+    V08.evalConstValue (.indirect 71 0) b1Usize32_08 [b1AllocPtr32_08] b1Layouts32_08 = none := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+/-- A1 (Defect 2, `V2026_08_01`): `V2026_08_01` counterpart of
+`a1_32bit_compound_union_and_single_copy_v06`. -/
+theorem a1_32bit_compound_union_and_single_copy_v08 :
+    let arrUsize2 : V08.Ty := { kind := .array (.uint .usize) 2, layoutIdx := 0 }
+    let tupUsize2 : V08.Ty := { kind := .tuple [.uint .usize, .uint .usize], layoutIdx := 0 }
+    let tupPtrUsize : V08.Ty := { kind := .tuple [.rawPtr .not (.uint .u8), .uint .usize], layoutIdx := 7 }
+    let tyU32 : V08.Ty := { kind := .uint .u32, layoutIdx := 4 }
+    let tyRawPtrU32 : V08.Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 2 }
+    let target : V08.ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+    V08.evalConstValue (.indirect 70 0) arrUsize2 [b1AllocUsize32_08] a1Layouts32_08 =
+      some (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩]) ∧
+    V08.evalConstValue (.indirect 70 0) tupUsize2 [b1AllocUsize32_08] a1Layouts32_08 =
+      some (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩]) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] b1AllocUsize32_08 0 8 []
+      a1Layouts32_08 (some arrUsize2) = .ok (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩]) [] ∧
+    V08.evalConstValue (.indirect 71 0) tupPtrUsize [b1AllocPtr32_08] a1Layouts32_08 =
+      some (.aggregate 0 [.ptr ptr32_08 4, .scalar ⟨2, 4⟩]) ∧
+    (let decls : List V08.LocalDecl := [
+       { mutability := .not, ty := tyU8_08, debugName := none },
+       { mutability := .not, ty := b1RawPtr32_08, debugName := none },
+       { mutability := .mut, ty := a1TyMaybeUninitPtr32_08, debugName := none },
+       { mutability := .mut, ty := b1RawPtr32_08, debugName := none },
+       { mutability := .not, ty := tyU32, debugName := none },
+       { mutability := .mut, ty := tyRawPtrU32, debugName := none },
+       { mutability := .mut, ty := b1Usize32_08, debugName := none },
+       { mutability := .not, ty := { kind := .rawPtr .not b1RawPtr32_08.kind, layoutIdx := 2 }, debugName := none },
+       { mutability := .not, ty := { kind := .rawPtr .mut b1RawPtr32_08.kind, layoutIdx := 2 }, debugName := none },
+       { mutability := .not, ty := { kind := .rawPtr .not b1RawPtr32_08.kind, layoutIdx := 2 }, debugName := none },
+       { mutability := .not, ty := { kind := .rawPtr .mut b1RawPtr32_08.kind, layoutIdx := 2 }, debugName := none },
+       { mutability := .not, ty := { kind := .rawPtr .not tyU32.kind, layoutIdx := 2 }, debugName := none },
+       { mutability := .not, ty := { kind := .rawPtr .mut tyRawPtrU32.kind, layoutIdx := 2 }, debugName := none },
+       { mutability := .not, ty := { kind := .rawPtr .mut b1Usize32_08.kind, layoutIdx := 2 }, debugName := none },
+       { mutability := .not, ty := b1RawPtr32_08, debugName := none },
+       { mutability := .not, ty := b1MutPtr32_08, debugName := none }]
+     let locals : List V08.LocalSlot := [
+       .init (.scalar ⟨0x77, 1⟩),
+       .init (.ptr target 4),
+       .init (.aggregate 0 [.unit, .unit]),
+       .uninit,
+       .init (.scalar ⟨0x1234, 4⟩),
+       .uninit,
+       .uninit,
+       .init (.ptr { allocId := 10, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 11, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 11, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 13, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 14, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 15, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 16, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 17, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 18, offsetBytes := 0 } 4)]
+     let mem : V08.Memory :=
+       { V08.emptyMemory with
+         borrows := [
+           b1Frozen_08 1 0, b1Frozen_08 10 1, b1Active_08 11 2, b1Frozen_08 12 2,
+           b1Active_08 13 3, b1Frozen_08 14 4, b1Active_08 15 5, b1Active_08 16 6,
+           b1Frozen_08 17 1, b1Active_08 18 6] }
+     let st : V08.MachineState := mkState08 locals mem
+     let c1 := b1Count_08 1 4 b1Usize32_08
+     let c4 := b1Count_08 4 4 b1Usize32_08
+     b1ReadAfter_08 decls a1Layouts32_08 st [b1Copy_08 7 8 c1, b1Copy_08 9 10 c1] ⟨3, []⟩ =
+       some (.ok (.ptr target 4) []) ∧
+     b1ReadAfter_08 decls a1Layouts32_08 st [b1Copy_08 7 8 c1, b1Copy_08 9 10 c1] ⟨3, [.deref]⟩ =
+       some (.ok (.scalar ⟨0x77, 1⟩) []) ∧
+     b1ReadAfter_08 decls a1Layouts32_08 st [b1Copy_08 11 10 c1] ⟨3, []⟩ =
+       some (.ok (.scalar ⟨0x1234, 4⟩) []) ∧
+     b1ReadAfter_08 decls a1Layouts32_08 st [b1Copy_08 7 12 c1] ⟨5, []⟩ =
+       some (.ok (.ptr target 4) []) ∧
+     IsUbStep08 (V08.evalStmt st (b1Copy_08 7 13 c1) decls a1Layouts32_08) ∧
+     IsUbStep08 (V08.evalStmt st (b1Copy_08 14 15 c4) decls a1Layouts32_08)) := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+/-- A1 (Defect 3, `V2026_08_01`): `V2026_08_01` counterpart of
+`a1_wide_ptr_bytewise_copy_and_partial_overwrite_v06`. -/
+theorem a1_wide_ptr_bytewise_copy_and_partial_overwrite_v08 :
+    let target : V08.ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+    (let decls64 : List V08.LocalDecl := [
+       { mutability := .not, ty := tyU8_08, debugName := none },
+       { mutability := .not, ty := tyRefSliceU8_08, debugName := none },
+       { mutability := .mut, ty := { kind := .array (.uint .u8) 16, layoutIdx := 18 }, debugName := none },
+       { mutability := .mut, ty := tyRefSliceU8_08, debugName := none },
+       { mutability := .mut, ty := tyRawSliceU8_08, debugName := none },
+       { mutability := .not, ty := tyRefDyn_08, debugName := none },
+       { mutability := .mut, ty := tyRefDyn_08, debugName := none },
+       { mutability := .not, ty := tyRawPtrU8_08, debugName := none },
+       { mutability := .not, ty := tyRawPtrU8_08, debugName := none },
+       { mutability := .not, ty := tyMutPtrU8_08, debugName := none },
+       { mutability := .not, ty := tyMutPtrU8_08, debugName := none },
+       { mutability := .not, ty := tyMutPtrU8_08, debugName := none },
+       { mutability := .not, ty := tyRawPtrU8_08, debugName := none },
+       { mutability := .not, ty := tyMutPtrU8_08, debugName := none }]
+     let sliceVal : V08.Value := .aggregate 0 [.ptr target 8, .scalar ⟨3, 8⟩]
+     let dynVal : V08.Value := .aggregate 0 [.ptr target 8, .ptr vtPtr64_08 8]
+     let locals64 : List V08.LocalSlot := [
+       .init (.scalar ⟨0, 1⟩),
+       .init sliceVal,
+       .init (.aggregate 0 (List.replicate 16 (.scalar ⟨0, 1⟩))),
+       .init sliceVal,
+       .init sliceVal,
+       .init dynVal,
+       .uninit,
+       .init (.ptr { allocId := 10, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 11, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 12, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 13, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 14, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 15, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 16, offsetBytes := 0 } 8)]
+     let mem64 : V08.Memory :=
+       { V08.emptyMemory with
+         borrows := [
+           b1Frozen_08 1 0, b1Frozen_08 10 0, b1Frozen_08 11 1, b1Active_08 12 2,
+           b1Active_08 13 3, b1Active_08 14 4, b1Frozen_08 15 5, b1Active_08 16 6] }
+     let st64 : V08.MachineState := mkState08 locals64 mem64
+     let c1 := b1Count_08 1 8 tyUsize_08
+     let c16 := b1Count_08 16 8 tyUsize_08
+     b1ReadAfter_08 decls64 a1Layouts64_08 st64 [b1Copy_08 8 9 c16, b1Copy_08 9 10 c16] ⟨3, []⟩ =
+       some (.ok sliceVal []) ∧
+     b1ReadAfter_08 decls64 a1Layouts64_08 st64 [b1Copy_08 12 13 c16] ⟨6, []⟩ =
+       some (.ok dynVal []) ∧
+     (b1Run_08 decls64 a1Layouts64_08 st64 [b1Copy_08 7 10 c1]).isSome = true ∧
+     b1ReadAfter_08 decls64 a1Layouts64_08 st64 [b1Copy_08 7 10 c1] ⟨3, []⟩ = some .ub ∧
+     b1ReadAfter_08 decls64 a1Layouts64_08 st64 [b1Copy_08 7 11 c1] ⟨4, []⟩ =
+       some (.ok (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨3, 8⟩]) []) ∧
+     (b1Run_08 decls64 a1Layouts64_08 st64 [b1Copy_08 12 13 c16, b1Copy_08 7 13 c1]).isSome = true ∧
+     b1ReadAfter_08 decls64 a1Layouts64_08 st64 [b1Copy_08 12 13 c16, b1Copy_08 7 13 c1] ⟨6, []⟩ =
+       some .ub) ∧
+    (let tyRefSlice32 : V08.Ty := { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 }
+     let decls32 : List V08.LocalDecl := [
+       { mutability := .not, ty := tyU8_08, debugName := none },
+       { mutability := .not, ty := tyRefSlice32, debugName := none },
+       { mutability := .mut, ty := tyRefSlice32, debugName := none },
+       { mutability := .not, ty := b1RawPtr32_08, debugName := none },
+       { mutability := .not, ty := b1MutPtr32_08, debugName := none }]
+     let sliceVal32 : V08.Value := .aggregate 0 [.ptr target 4, .scalar ⟨3, 4⟩]
+     let locals32 : List V08.LocalSlot := [
+       .init (.scalar ⟨0xAA, 1⟩), .init sliceVal32, .uninit,
+       .init (.ptr { allocId := 10, offsetBytes := 0 } 4),
+       .init (.ptr { allocId := 11, offsetBytes := 0 } 4)]
+     let mem32 : V08.Memory :=
+       { V08.emptyMemory with borrows := [b1Frozen_08 1 0, b1Frozen_08 10 1, b1Active_08 11 2] }
+     let st32 : V08.MachineState := mkState08 locals32 mem32
+     let c8 := b1Count_08 8 4 b1Usize32_08
+     b1ReadAfter_08 decls32 a1Layouts32_08 st32 [b1Copy_08 3 4 c8] ⟨2, []⟩ =
+       some (.ok sliceVal32 [])) := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+/-- A1 lockstep parity across `V2026_06_01` and `V2026_08_01` for `globalRelocsOverlapRange`,
+`isPtrCopyKind`, global relocation rejection, surrogate rejection, and 32-bit compound decoding. -/
+theorem a1_lockstep_parity :
+    let b06 : List Bool := [
+      Trusted.Rustc.V2026_06_01.MirSemantics.globalRelocsOverlapRange b1AllocPtr32_06.relocations 0 1 4,
+      Trusted.Rustc.V2026_06_01.MirSemantics.globalRelocsOverlapRange b1AllocPtr32_06.relocations 3 1 4,
+      Trusted.Rustc.V2026_06_01.MirSemantics.globalRelocsOverlapRange b1AllocPtr32_06.relocations 4 4 4,
+      Trusted.Rustc.V2026_06_01.MirSemantics.isPtrCopyKind tyRefSliceU8_06.kind,
+      Trusted.Rustc.V2026_06_01.MirSemantics.isPtrCopyKind tyRefDyn_06.kind,
+      Trusted.Rustc.V2026_06_01.MirSemantics.isPtrCopyKind tyUsize_06.kind]
+    let b08 : List Bool := [
+      Trusted.Rustc.V2026_08_01.MirSemantics.globalRelocsOverlapRange b1AllocPtr32_08.relocations 0 1 4,
+      Trusted.Rustc.V2026_08_01.MirSemantics.globalRelocsOverlapRange b1AllocPtr32_08.relocations 3 1 4,
+      Trusted.Rustc.V2026_08_01.MirSemantics.globalRelocsOverlapRange b1AllocPtr32_08.relocations 4 4 4,
+      Trusted.Rustc.V2026_08_01.MirSemantics.isPtrCopyKind tyRefSliceU8_08.kind,
+      Trusted.Rustc.V2026_08_01.MirSemantics.isPtrCopyKind tyRefDyn_08.kind,
+      Trusted.Rustc.V2026_08_01.MirSemantics.isPtrCopyKind tyUsize_08.kind]
+    let v06 : List ValSummary := [
+      valSummary06 (V06.evalConstValue (.indirect 50 0) tyUsize_06 [adjRelocAlloc64_06] layouts64_06),
+      valSummary06 (V06.evalConstValue (.indirect 50 0) tyEnum3_06 [adjRelocAlloc64_06] layouts64_06),
+      valSummary06 (V06.evalConstValue (.indirect 81 0) a1TyCharWrap_06 [a1AllocSurrogate_06] layouts64_06),
+      valSummary06 (V06.evalConstValue (.indirect 70 0) { kind := .array (.uint .usize) 2, layoutIdx := 0 } [b1AllocUsize32_06] a1Layouts32_06),
+      valSummary06 (V06.evalConstValue (.indirect 71 0) { kind := .tuple [.rawPtr .not (.uint .u8), .uint .usize], layoutIdx := 7 } [b1AllocPtr32_06] a1Layouts32_06)]
+    let v08 : List ValSummary := [
+      valSummary08 (V08.evalConstValue (.indirect 50 0) tyUsize_08 [adjRelocAlloc64_08] layouts64_08),
+      valSummary08 (V08.evalConstValue (.indirect 50 0) tyEnum3_08 [adjRelocAlloc64_08] layouts64_08),
+      valSummary08 (V08.evalConstValue (.indirect 81 0) a1TyCharWrap_08 [a1AllocSurrogate_08] layouts64_08),
+      valSummary08 (V08.evalConstValue (.indirect 70 0) { kind := .array (.uint .usize) 2, layoutIdx := 0 } [b1AllocUsize32_08] a1Layouts32_08),
+      valSummary08 (V08.evalConstValue (.indirect 71 0) { kind := .tuple [.rawPtr .not (.uint .u8), .uint .usize], layoutIdx := 7 } [b1AllocPtr32_08] a1Layouts32_08)]
+    b06 = b08 ∧ b06 = [true, true, false, true, true, false] ∧
+    v06 = v08 ∧
+    v06 = [.none, .none, .none,
+      .agg 0 [.scalar 1 4, .scalar 2 4],
+      .agg 0 [.ptr 9 0x10 4, .scalar 2 4]] := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
 /-! ## §5. Mechanical Local Axiom, Reachability, & Non-Triviality Audit -/
 
 open Lean Elab Command in
@@ -2367,6 +2930,8 @@ run_cmd do
     ``Trusted.Rustc.V2026_06_01.MirSemantics.evalByteCast,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.writeBytesAction,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead,
+    ``Trusted.Rustc.V2026_06_01.MirSemantics.globalRelocsOverlapRange,
+    ``Trusted.Rustc.V2026_06_01.MirSemantics.isPtrCopyKind,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.materializeReadPtrValue,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv?,
@@ -2386,6 +2951,8 @@ run_cmd do
     ``Trusted.Rustc.V2026_08_01.MirSemantics.evalByteCast,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.writeBytesAction,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead,
+    ``Trusted.Rustc.V2026_08_01.MirSemantics.globalRelocsOverlapRange,
+    ``Trusted.Rustc.V2026_08_01.MirSemantics.isPtrCopyKind,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.materializeReadPtrValue
   ]
   for req in requiredConsts do

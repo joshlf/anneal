@@ -80,7 +80,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   invalidateTreeBorrowsAtProj updateBorrowPermOnReadAtProj
   freezeTreeBorrowsOnReadAtProj freezeDerefReadBorrowsAt
   hasProtectedTreeWriteConflict lookupGlobalAlloc
-  readLittleEndianBytes readGlobalScalar tyScalarBytes evalConstValue
+  readLittleEndianBytes globalRelocsOverlapRange readGlobalScalar tyScalarBytes evalConstValue
   dropValues takeValues extractSubslice readProjectedValue readContainerProjectedValue
   appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
@@ -144,6 +144,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   copyEffectivePointee? copySlicePointeesCompatible copySliceElements
   isLayoutIndepScalarKind isLayoutIndepByteKind listAllLayoutIndepScalar
   allNonPtrScalarOrUnitValues scalarLayoutIsNonPtr fieldLayoutsAllPrimitive
+  isThinPtrCopyKind isPtrCopyKind
   srcValHasExactByteEncoding dstTyHasExactByteDecode copyBytesSubplace
   resolveCopySubplaceMulti commitCopyDstPlaceWriteWithBorrows evalCopySubplaceMulti
   evalCopyNonOverlappingPermOk evalCopyNonOverlappingWithCount evalCopyNonOverlapping
