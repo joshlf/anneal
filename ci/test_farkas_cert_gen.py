@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Any
 import unittest
 from unittest import mock
 
@@ -494,6 +495,104 @@ def _semantic_tamper_variants(snip: str) -> list[str]:
     return out
 
 
+def _seeded_differential_corpus(seed: int, n_ent: int, n_mir: int) -> list[str]:
+    """Deterministic pseudo-random corpus of `--entailment-check` / `--mir-bounds`
+    problems (compound expressions, repeated / zero-coefficient variables,
+    constants on both sides, `<` / `>` / `=` relations, nat and int domains).
+
+    Every problem the generator *claims* to solve is returned so the caller can
+    differentially check the claim against Lean's kernel (catching rendering,
+    variable-index, `natGoalVars`-order, or Pass-1 `Int` syntax mismatches that
+    hand-picked cases miss).
+    """
+    import itertools
+    import random
+
+    rng = random.Random(seed)
+    names = ["x", "y", "z"]
+
+    def term(dom: str) -> str:
+        k, v = rng.choice([0, 1, 1, 2, 3]), rng.choice(names)
+        if dom == "int" and rng.random() < 0.3:
+            return f"-{k} * {v}" if k else f"-{v}"
+        return v if k == 1 else f"{k} * {v}"
+
+    def expr(dom: str) -> str:
+        parts = [term(dom) for _ in range(rng.randint(1, 3))]
+        if rng.random() < 0.5:
+            c = rng.randint(0, 20)
+            parts.append(str(c) if dom == "nat" or rng.random() < 0.5 else f"(-{c})")
+        return " + ".join(parts)
+
+    def ineq(dom: str) -> str:
+        return f"{expr(dom)} {rng.choice(['<=', '<', '>=', '>', '=', '<='])} {expr(dom)}"
+
+    out: list[str] = []
+    for i in range(n_ent):
+        dom = rng.choice(["nat", "int"])
+        pre_sides = [(expr(dom), expr(dom)) for _ in range(rng.randint(0, 3))]
+        pre = [f"{a} {rng.choice(['<=', '<='])} {b}" for a, b in pre_sides]
+        obl = [ineq(dom) for _ in range(rng.randint(0, 1))]
+        # Entailed-by-construction obligations: scaled / summed / relaxed `pre` rows.
+        for _ in range(rng.randint(1, 2)):
+            if not pre_sides:
+                break
+            picks = rng.sample(pre_sides, k=min(len(pre_sides), rng.randint(1, 2)))
+            k = rng.randint(1, 3)
+            lhs = " + ".join(f"{k} * ({a})" for a, _ in picks)
+            rhs = " + ".join(f"{k} * ({b})" for _, b in picks) + f" + {rng.randint(0, 3)}"
+            obl.append(f"{lhs} <= {rhs}")
+        if not obl:
+            obl = [ineq(dom)]
+        used = sorted({v for t in pre + obl for v in names
+                       if re.search(rf"\b{v}\b", t)})
+        domain_vals = range(0, 5) if dom == "nat" else range(-3, 4)
+        mode = rng.choice(["suff", "equiv"])
+        try:
+            for vals in itertools.product(domain_vals, repeat=len(used)):
+                wit = ",".join(f"{v}={c}" for v, c in zip(used, vals))
+                res = generate_entailment_certificate(
+                    dom, pre, obl, wit, check_equiv=(mode == "equiv"),
+                    thm_name=f"diff_ent_{seed}_{i}", max_nodes=600,
+                )
+                if res["solved"]:
+                    out.append(res["lean_snippet"])
+                    break
+                if "failed_obligation_index" in res or "failed_pre_index" in res:
+                    break
+        except ParseError:
+            continue
+    for i in range(n_mir):
+        preset = rng.choice([
+            "slice-range", "uint-add-no-overflow", "uint-sub-no-underflow",
+            "uint-mul-const-no-overflow", "non-overlapping-ptrs", "aligned-stride",
+        ])
+        hyps = [ineq("nat") for _ in range(rng.randint(1, 4))]
+        if preset == "slice-range":
+            kw: dict[str, Any] = dict(
+                offset_expr=expr("nat"), len_expr=expr("nat"), total_expr=expr("nat"))
+        elif preset in ("uint-add-no-overflow", "uint-sub-no-underflow"):
+            kw = dict(width=rng.choice([8, 16, 32, 64, 128]),
+                      lhs_expr=expr("nat"), rhs_expr=expr("nat"))
+        elif preset == "uint-mul-const-no-overflow":
+            kw = dict(width=rng.choice([8, 16]), scale=rng.randint(0, 255), var_name=expr("nat"))
+        elif preset == "non-overlapping-ptrs":
+            kw = dict(src_offset_expr=expr("nat"), dst_offset_expr=expr("nat"),
+                      count_expr=expr("nat"),
+                      direction=rng.choice(["src-before-dst", "dst-before-src"]))
+        else:
+            kw = dict(align=rng.choice([1, 2, 4, 8]), offset_expr=expr("nat"),
+                      quot_expr=expr("nat"))
+        try:
+            res = generate_mir_bounds_certificate(
+                preset, hyps, f"diff_mir_{seed}_{i}", max_nodes=600, **kw)
+        except ParseError:
+            continue
+        if res["solved"]:
+            out.append(res["lean_snippet"])
+    return out
+
+
 class FarkasMirCertGenTests(unittest.TestCase):
     def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -643,11 +742,31 @@ class FarkasMirCertGenTests(unittest.TestCase):
             ["--mir-bounds", "aligned-stride", "--scale", "4"],
             ["--entailment-check", "--pre", "x <= 1", "--obligation", "x <= 2",
              "--witness", "x=0", "--width", "32"],
-            ["--goal", "x <= 1", "--width", "32"],
         ):
             rc, out, _ = self._run_cli([*bad_argv, "--json"])
             self.assertEqual(rc, 2, bad_argv)
             self.assertFalse(json.loads(out)["solved"])
+
+        # Default (baseline) mode: any new-mode-only flag is "unrecognized", exactly
+        # as the pre-extension argparse CLI reported it (`SystemExit(2)`, usage on
+        # stderr, nothing on stdout -- even with `--json`), and a missing `--goal`
+        # is still reported first.
+        for argv, needle in (
+            (["--goal", "x <= 1", "--width", "32"], "unrecognized arguments: --width"),
+            (["--goal", "x <= 1", "--pre", "x <= 0"], "unrecognized arguments: --pre"),
+            (["--goal", "x <= 1", "--check-equiv"], "unrecognized arguments: --check-equiv"),
+            (["--goal", "x <= 1", "--witness", "x=0", "--lhs-expr", "a"],
+             "unrecognized arguments: --lhs-expr --witness"),
+            (["--width", "32"], "the following arguments are required: --goal"),
+        ):
+            for extra in ([], ["--json"]):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as cm:
+                        cli_main([*argv, *extra])
+                self.assertEqual(cm.exception.code, 2, argv)
+                self.assertEqual(out.getvalue(), "", argv)
+                self.assertIn(needle, err.getvalue(), argv)
 
         # Oversized MIR-bounds system (>30 hyps) fails closed upfront with ParseError
         # even when the goal is unprovable (rather than returning solved=False).
@@ -1228,6 +1347,24 @@ class FarkasMirCertGenTests(unittest.TestCase):
             )
             self.assertNotEqual(tres.returncode, 0)
             self._assert_fails_only_at_rfl(tres.stdout + tres.stderr, len(tampered), "NegTamperedAll")
+
+            # Seeded differential corpus: every snippet the generator claims to have
+            # solved must be accepted by the kernel, warning-free.
+            corpus = _seeded_differential_corpus(4416, 60, 50)
+            self.assertGreaterEqual(len(corpus), 30)
+            self.assertGreaterEqual(sum("_cert rfl" not in c and "fwd_certs" in c for c in corpus), 8)
+            cbody = "\n\n".join(
+                "\n".join(ln for ln in snip.splitlines() if not ln.startswith(("import ", "open ")))
+                for snip in corpus
+            )
+            cfile = t / "DifferentialCorpus.lean"
+            cfile.write_text(hdr + cbody + "\n", encoding="utf-8")
+            cres = subprocess.run(
+                [str(lean_bin), "-DwarningAsError=true", str(cfile)], env=lean_env,
+                text=True, capture_output=True, timeout=300,
+            )
+            self.assertEqual(cres.returncode, 0, cres.stdout + cres.stderr)
+            self.assertEqual(cres.stdout.strip() + cres.stderr.strip(), "")
 
             # Semantic tampering (swapped certificates / witnesses that are valid
             # data for a different obligation) must also be rejected at `rfl`.

@@ -1561,6 +1561,29 @@ def main(argv: list[str] | None = None) -> int:
     }
     used_mir_flags = [(attr, flag) for attr, flag in mir_flag_map if getattr(ns, attr) is not None]
 
+    if ns.mir_bounds is None and not ns.entailment_check:
+        # Default (baseline) mode must stay byte-for-byte compatible with the
+        # pre-extension CLI, including for erroneous invocations: baseline
+        # argparse first reported a missing required `--goal`, then rejected
+        # any flag it did not know (all new-mode flags) as unrecognized, both
+        # via `SystemExit(2)` with usage on stderr and nothing on stdout.
+        if ns.goal is None:
+            # Preserve baseline argparse semantics (`--goal` was `required=True`).
+            p.error("the following arguments are required: --goal")
+        new_mode_flags = [f for _, f in used_mir_flags] + [
+            flag for flag, used in (
+                ("--pre", bool(ns.pres)), ("--obligation", bool(ns.obligations)),
+                ("--witness", ns.witness is not None),
+                ("--strict-witness", ns.strict_witness is not None),
+                ("--check-equiv", ns.check_equiv),
+            ) if used
+        ]
+        if new_mode_flags:
+            p.error(
+                f"unrecognized arguments: {' '.join(new_mode_flags)} "
+                "(only valid with `--mir-bounds` / `--entailment-check`)"
+            )
+
     try:
         for tok in raw:
             tok.encode("utf-8", errors="strict")
@@ -1619,16 +1642,6 @@ def main(argv: list[str] | None = None) -> int:
                 thm_name=ns.name, max_nodes=ns.max_nodes, ascii_lean=ascii_lean,
             )
         else:
-            if used_mir_flags:
-                raise ParseError(
-                    f"MIR-bounds flag(s) {', '.join(f for _, f in used_mir_flags)} "
-                    "require `--mir-bounds`."
-                )
-            if ns.pres or ns.obligations or ns.witness is not None or ns.strict_witness is not None or ns.check_equiv:
-                raise ParseError("Entailment flags require `--entailment-check`.")
-            if ns.goal is None:
-                # Preserve baseline argparse semantics (`--goal` was `required=True`).
-                p.error("the following arguments are required: --goal")
             res = generate_certificate(
                 ns.domain, ns.hyps, ns.goal, ns.name,
                 max_nodes=ns.max_nodes, ascii_lean=ascii_lean,
