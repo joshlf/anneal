@@ -32,8 +32,11 @@ from farkas_cert_gen import (  # noqa: E402
     _MAG_CAP_128,
     ParseError,
     generate_certificate,
+    generate_entailment_certificate,
+    generate_mir_bounds_certificate,
     main as cli_main,
     parse_inequalities,
+    parse_witness,
 )
 
 
@@ -379,6 +382,542 @@ class FarkasCertGenTests(unittest.TestCase):
                 "sources": [
                     ["Anneal.LinearArith", str(_ANNEAL_ROOT / "theory/Anneal/LinearArith.lean")],
                     ["Anneal.TestFarkasPreflight", str(probe)],
+                ],
+            }), encoding="utf-8")
+            pf = subprocess.run(
+                [str(lean_bin), "--run", str(tb), str(p_req), str(p_out)],
+                env=pf_env, text=True, capture_output=True, timeout=60,
+            )
+            self.assertEqual(pf.returncode, 0, pf.stdout + pf.stderr)
+            self.assertTrue(json.loads(p_out.read_text(encoding="utf-8"))["ok"])
+
+
+class FarkasMirCertGenTests(unittest.TestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, _scrubbed_env(), clear=True):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = cli_main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_mir_bounds_presets_and_cli_surface(self) -> None:
+        # 1. slice-range
+        rc, out, err = self._run_cli([
+            "--mir-bounds", "slice-range",
+            "--offset-expr", "base + 4", "--len-expr", "n", "--total-expr", "cap",
+            "--hyp", "base <= 12", "--hyp", "n <= 32", "--hyp", "48 <= cap",
+            "--name", "slice_ok", "--json",
+        ])
+        self.assertEqual(rc, 0, err)
+        data = json.loads(out)
+        self.assertTrue(data["solved"])
+        self.assertEqual(data["mode"], "mir-bounds")
+        self.assertEqual(data["preset"], "slice-range")
+        self.assertIn("farkas_discharges_slice_bounds", data["lean_snippet"])
+
+        # 2. aligned-stride (genuinely cut-required Chvatal-Gomory divCut:
+        # at z = 1/2, off = 8 * q +/- 1 satisfies all hyps over Q, so cut-free Farkas fails)
+        rc, out, err = self._run_cli([
+            "--mir-bounds", "aligned-stride",
+            "--align", "8", "--offset-expr", "off", "--quot-expr", "q",
+            "--hyp", "2 * z <= 1",
+            "--hyp", "8 * q <= off + 2 * z",
+            "--hyp", "off <= 8 * q + 2 * z",
+            "--name", "align_divcut", "--json",
+        ])
+        self.assertEqual(rc, 0, err)
+        data = json.loads(out)
+        self.assertTrue(data["solved"])
+        self.assertEqual(data["align"], 8)
+        self.assertIn("farkas_discharges_aligned_stride", data["lean_snippet"])
+        self.assertTrue(any(s["op"] == "divCut" for s in data["steps_le"]))
+        self.assertTrue(any(s["op"] == "divCut" for s in data["steps_ge"]))
+
+        # 3. uint-add-no-overflow: u64 specialization and u128 boundary (2^128 = magCap128)
+        u64 = generate_mir_bounds_certificate(
+            "uint-add-no-overflow", ["a <= 1000", "b <= 2000"], "u64_add", width=64
+        )
+        self.assertTrue(u64["solved"])
+        self.assertIn("farkas_discharges_u64_add_no_overflow", u64["lean_snippet"])
+
+        u128_max_minus_10 = (1 << 128) - 10
+        u128 = generate_mir_bounds_certificate(
+            "uint-add-no-overflow",
+            [f"a <= {u128_max_minus_10}", "b <= 9"],
+            "u128_add_edge", width=128,
+        )
+        self.assertTrue(u128["solved"])
+        self.assertIn("farkas_discharges_uint_add_no_overflow .u128", u128["lean_snippet"])
+
+        # Unprovable u128 overflow (sum can reach 2^128) fails with solved=False / exit 1
+        rc_ov, out_ov, err_ov = self._run_cli([
+            "--mir-bounds", "uint-add-no-overflow", "--width", "128",
+            "--hyp", f"a <= {u128_max_minus_10}", "--hyp", "b <= 10",
+            "--json",
+        ])
+        self.assertEqual(rc_ov, 1, err_ov)
+        self.assertFalse(json.loads(out_ov)["solved"])
+
+        # 4. uint-sub-no-underflow
+        rc, out, err = self._run_cli([
+            "--mir-bounds", "uint-sub-no-underflow", "--width", "32",
+            "--lhs-expr", "hi", "--rhs-expr", "lo",
+            "--hyp", "lo + 4 <= hi", "--name", "u32_sub", "--json",
+        ])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("farkas_discharges_uint_sub_no_underflow .u32", json.loads(out)["lean_snippet"])
+
+        # 5. aipcc-interval-refine (with and without src interval)
+        rc, out, err = self._run_cli([
+            "--mir-bounds", "aipcc-interval-refine", "--width", "32",
+            "--var", "x", "--src-lo", "10", "--src-hi", "100",
+            "--target-lo", "10", "--target-hi", "50",
+            "--hyp", "x <= 50", "--name", "iv_ref", "--json",
+        ])
+        self.assertEqual(rc, 0, err)
+        iv_data = json.loads(out)
+        self.assertTrue(iv_data["solved"])
+        self.assertIn("farkas_discharges_aipcc_interval_refinement", iv_data["lean_snippet"])
+        self.assertIn("wrappedInterval_denote_bounds rfl hSrc", iv_data["lean_snippet"])
+
+        # 6. uint-mul-const-no-overflow & non-overlapping-ptrs
+        mul_res = generate_mir_bounds_certificate(
+            "uint-mul-const-no-overflow", ["x <= 1024"], "mul_ok", width=64, scale=8, var_name="x"
+        )
+        self.assertTrue(mul_res["solved"])
+        self.assertIn("farkas_discharges_uint_mul_const_no_overflow", mul_res["lean_snippet"])
+
+        no_res = generate_mir_bounds_certificate(
+            "non-overlapping-ptrs",
+            ["dst_off + count <= 32", "32 <= src_off"],
+            "no_ok", direction="dst-before-src",
+        )
+        self.assertTrue(no_res["solved"])
+        self.assertIn(".dstBeforeSrc", no_res["lean_snippet"])
+
+        # ASCII-safe CLI output
+        ascii_run = subprocess.run(
+            [
+                sys.executable, "-B", str(_CI_DIR / "farkas_cert_gen.py"),
+                "--mir-bounds", "slice-range",
+                "--hyp", "off <= 8", "--hyp", "len <= 8", "--hyp", "16 <= total",
+            ],
+            env={**_scrubbed_env(), "PYTHONIOENCODING": "ascii"},
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(ascii_run.returncode, 0, ascii_run.stderr)
+        self.assertIn("/\\", ascii_run.stdout)
+        self.assertIn("{ lhs :=", ascii_run.stdout)
+        self.assertTrue(ascii_run.stdout.isascii())
+
+    def test_mir_bounds_validation_and_caps(self) -> None:
+        # Over-cap u128 constant fails closed with ParseError / exit 2
+        with self.assertRaises(ParseError):
+            generate_mir_bounds_certificate(
+                "uint-add-no-overflow",
+                [f"a <= {_MAG_CAP_128 + 1}", "b <= 0"],
+                "over_cap", width=128,
+            )
+        # Invalid width, align=0, reversed interval, hi >= 2^width, partial src interval, reserved vars
+        for kwargs in (
+            {"preset": "uint-add-no-overflow", "hyp_strings": [], "width": 24},
+            {"preset": "aligned-stride", "hyp_strings": [], "align": 0},
+            {"preset": "aipcc-interval-refine", "hyp_strings": [], "width": 8, "target_lo": 10, "target_hi": 5},
+            {"preset": "aipcc-interval-refine", "hyp_strings": [], "width": 8, "target_lo": 0, "target_hi": 256},
+            {"preset": "aipcc-interval-refine", "hyp_strings": [], "width": 8, "target_lo": 0, "target_hi": 10, "src_lo": 0},
+            {"preset": "slice-range", "hyp_strings": ["rp <= 10"], "offset_expr": "off"},
+            {"preset": "uint-add-no-overflow", "hyp_strings": ["locals <= 5"]},
+        ):
+            with self.assertRaises(ParseError, msg=kwargs):
+                generate_mir_bounds_certificate(**kwargs)
+
+        # CLI mutual exclusion & domain guard -> exit 2
+        for bad_argv in (
+            ["--mir-bounds", "slice-range", "--entailment-check", "--obligation", "0 <= 1", "--witness", ""],
+            ["--mir-bounds", "slice-range", "--domain", "int", "--hyp", "off <= 1"],
+            ["--mir-bounds", "slice-range", "--goal", "0 <= 1"],
+            ["--hyp", "x <= 1"],  # missing --goal in default mode
+        ):
+            rc, out, _ = self._run_cli([*bad_argv, "--json"])
+            self.assertEqual(rc, 2, bad_argv)
+            self.assertFalse(json.loads(out)["solved"])
+
+    def test_entailment_check_modes_and_negative_controls(self) -> None:
+        # 1. Nat sufficient-only with heterogeneous obligation variable subsets
+        nat_multi = generate_entailment_certificate(
+            "nat",
+            ["x <= 4", "y <= 6", "z <= 10"],
+            ["x <= 10", "x + y <= 10", "y + z <= 20"],
+            "x=1,y=2,z=3",
+            thm_name="nat_multi",
+        )
+        self.assertTrue(nat_multi["solved"])
+        self.assertEqual(nat_multi["adequacy_mode"], "sufficient_only")
+        self.assertEqual(nat_multi["variables"], ["x", "y", "z"])
+        self.assertEqual(len(nat_multi["fwd_certs"]), 3)
+        self.assertIn("farkas_entailment_adequacy_cert", nat_multi["lean_snippet"])
+
+        # 2. Nat strict strengthening
+        nat_strict = generate_entailment_certificate(
+            "nat",
+            ["x <= 5", "y <= 5"],
+            ["x + y <= 12"],
+            "x=0,y=0",
+            strict_witness_str="x=6,y=6",
+            thm_name="nat_strict",
+        )
+        self.assertTrue(nat_strict["solved"])
+        self.assertEqual(nat_strict["adequacy_mode"], "strict")
+        self.assertIn(".strict [6, 6]", nat_strict["lean_snippet"])
+
+        # 3. Nat bidirectional equivalence
+        nat_equiv = generate_entailment_certificate(
+            "nat",
+            ["x + 1 <= y"],
+            ["x + 2 <= y + 1"],
+            "x=0,y=1",
+            check_equiv=True,
+            thm_name="nat_equiv",
+        )
+        self.assertTrue(nat_equiv["solved"])
+        self.assertEqual(nat_equiv["adequacy_mode"], "equiv")
+        self.assertIn(".equiv", nat_equiv["lean_snippet"])
+
+        # 4. Int strict with negative witnesses (Pass-1 Int syntax: no unary `-`)
+        rc, out, err = self._run_cli([
+            "--entailment-check", "--domain", "int",
+            "--pre", "-3 <= x", "--pre", "x <= 2",
+            "--obligation", "-5 <= x",
+            "--witness", "x=-1", "--strict-witness", "x=-4",
+            "--name", "int_strict_cli", "--json",
+        ])
+        self.assertEqual(rc, 0, err)
+        idata = json.loads(out)
+        self.assertTrue(idata["solved"])
+        self.assertIn("Int.negOfNat 1", idata["lean_snippet"])
+        self.assertIn("Int.negOfNat 4", idata["lean_snippet"])
+        for ln in idata["lean_snippet"].splitlines():
+            self.assertNotRegex(ln, r"(?:^|[\s(\[≤<])-[0-9A-Za-z_(]")
+
+        # 5. Zero-variable spec with empty witness ""
+        z_res = generate_entailment_certificate("nat", ["0 <= 1"], ["0 <= 2"], "", thm_name="z_ok")
+        self.assertTrue(z_res["solved"])
+        self.assertEqual(z_res["variables"], [])
+
+        # 6. Negative semantic controls -> solved=False / exit 1
+        # (a) Vacuous pre (1 <= 0)
+        rc, out, _ = self._run_cli([
+            "--entailment-check", "--pre", "1 <= 0", "--obligation", "x <= 0",
+            "--witness", "x=0", "--json",
+        ])
+        self.assertEqual(rc, 1)
+        self.assertFalse(json.loads(out)["solved"])
+        self.assertIn("violates precondition", json.loads(out)["error"])
+
+        # (b) Negative witness value in --domain nat
+        rc, out, _ = self._run_cli([
+            "--entailment-check", "--domain", "nat",
+            "--pre", "x <= 5", "--obligation", "x <= 10",
+            "--witness", "x=-1", "--json",
+        ])
+        self.assertEqual(rc, 1)
+        self.assertIn("negative value", json.loads(out)["error"])
+
+        # (c) Non-entailing obligation
+        non_ent = generate_entailment_certificate("nat", ["x <= 10"], ["x <= 5"], "x=0")
+        self.assertFalse(non_ent["solved"])
+        self.assertEqual(non_ent["failed_obligation_index"], 0)
+
+        # (d) Strict witness satisfies pre (fails to prove strictness)
+        bad_st1 = generate_entailment_certificate(
+            "nat", ["x <= 5"], ["x <= 10"], "x=0", strict_witness_str="x=4"
+        )
+        self.assertFalse(bad_st1["solved"])
+        self.assertIn("satisfies precondition", bad_st1["error"])
+
+        # (e) Strict witness violates obligation
+        bad_st2 = generate_entailment_certificate(
+            "nat", ["x <= 5"], ["x <= 10"], "x=0", strict_witness_str="x=11"
+        )
+        self.assertFalse(bad_st2["solved"])
+        self.assertIn("violates obligation", bad_st2["error"])
+
+        # (f) False equivalence
+        bad_eq = generate_entailment_certificate(
+            "nat", ["x <= 5"], ["x <= 10"], "x=0", check_equiv=True
+        )
+        self.assertFalse(bad_eq["solved"])
+        self.assertEqual(bad_eq["failed_pre_index"], 0)
+
+        # 7. Parse / CLI misuse -> ParseError / exit 2
+        for bad_w in ("x=abc", "y=1", "", "x=1,x=2"):
+            with self.assertRaises(ParseError, msg=bad_w):
+                parse_witness(bad_w, ["x"], "nat")
+        for bad_argv in (
+            ["--entailment-check", "--pre", "x <= 5", "--witness", "x=0"],
+            ["--entailment-check", "--pre", "x <= 5", "--obligation", "x <= 10"],
+            ["--entailment-check", "--pre", "x <= 5", "--obligation", "x <= 10",
+             "--witness", "x=0", "--strict-witness", "x=6", "--check-equiv"],
+            ["--entailment-check", "--pre", "x <= 5", "--hyp", "x <= 4",
+             "--obligation", "x <= 10", "--witness", "x=0"],
+        ):
+            rc, out, _ = self._run_cli([*bad_argv, "--json"])
+            self.assertEqual(rc, 2, bad_argv)
+            self.assertFalse(json.loads(out)["solved"])
+
+        # 8. ASCII-safe output for --entailment-check
+        ascii_run = subprocess.run(
+            [
+                sys.executable, "-B", str(_CI_DIR / "farkas_cert_gen.py"),
+                "--entailment-check", "--domain", "int",
+                "--pre", "-3 <= x", "--obligation", "-5 <= x",
+                "--witness", "x=-1", "--strict-witness", "x=-4",
+            ],
+            env={**_scrubbed_env(), "PYTHONIOENCODING": "ascii"},
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(ascii_run.returncode, 0, ascii_run.stderr)
+        self.assertTrue(ascii_run.stdout.isascii())
+        self.assertIn("{ lhs :=", ascii_run.stdout)
+
+    def test_live_lean_kernel_checks_mir_bounds_and_entailment(self) -> None:
+        lean_bin = _find_pinned_lean()
+        if lean_bin is None:
+            msg = f"no pinned Lean {_pinned_lean_version()} toolchain installed"
+            if os.environ.get("ANNEAL_CI_STRICT") == "1":
+                self.fail(msg)
+            self.skipTest(msg)
+
+        olean_path = _ANNEAL_ROOT / ".lake/build/lib/lean/Anneal/FarkasMirCert.olean"
+        if not olean_path.is_file():
+            lake_bin = lean_bin.parent / "lake"
+            if not lake_bin.is_file():
+                found_lake = shutil.which("lake")
+                if not found_lake:
+                    self.fail("Anneal.FarkasMirCert.olean missing and `lake` not found.")
+                lake_bin = Path(found_lake)
+            build_env = {**os.environ, "PATH": f"{lean_bin.parent}:{os.environ.get('PATH', '')}"}
+            subprocess.check_call(
+                [str(lake_bin), "build", "Anneal.FarkasMirCert"],
+                cwd=str(_ANNEAL_ROOT), env=build_env, timeout=300,
+            )
+
+        u128_max_minus_10 = (1 << 128) - 10
+        snippets = [
+            generate_mir_bounds_certificate(
+                "slice-range",
+                ["base <= 12", "n <= 32", "48 <= cap"],
+                "live_slice_range",
+                offset_expr="base + 4", len_expr="n", total_expr="cap",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "slice-range",
+                ["off <= 8", "len <= 8", "16 <= total"],
+                "live_slice_ascii", ascii_lean=True,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "aligned-stride",
+                ["2 * z <= 1", "8 * q <= off + 2 * z", "off <= 8 * q + 2 * z"],
+                "live_aligned_divcut", align=8, offset_expr="off", quot_expr="q",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-add-no-overflow",
+                ["a <= 1000", "b <= 2000"],
+                "live_u64_add", width=64,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-add-no-overflow",
+                [f"a <= {u128_max_minus_10}", "b <= 9"],
+                "live_u128_add_boundary", width=128,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-add-no-overflow",
+                ["a <= 100", "b <= 150"],
+                "live_u8_add_ascii", width=8, ascii_lean=True,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-sub-no-underflow",
+                ["b + 4 <= a"],
+                "live_u32_sub", width=32,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-sub-no-underflow",
+                ["b <= a"],
+                "live_u128_sub", width=128,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "aipcc-interval-refine",
+                ["x <= 50"],
+                "live_aipcc_with_src", width=32, var_name="x",
+                src_lo=10, src_hi=100, target_lo=10, target_hi=50,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "aipcc-interval-refine",
+                ["10 <= x", "x <= 20"],
+                "live_aipcc_no_src", width=16, var_name="x",
+                target_lo=5, target_hi=25, ascii_lean=True,
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-mul-const-no-overflow",
+                ["x <= 1024"],
+                "live_u64_mul", width=64, scale=8, var_name="x",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "non-overlapping-ptrs",
+                ["src_off + count <= 64", "64 <= dst_off"],
+                "live_nonoverlap_left", direction="src-before-dst",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "non-overlapping-ptrs",
+                ["dst_off + count <= 32", "32 <= src_off"],
+                "live_nonoverlap_right", direction="dst-before-src", ascii_lean=True,
+            )["lean_snippet"],
+            generate_entailment_certificate(
+                "nat",
+                ["x <= 4", "y <= 6", "z <= 10"],
+                ["x <= 10", "x + y <= 10", "y + z <= 20"],
+                "x=1,y=2,z=3",
+                thm_name="live_ent_nat_multi",
+            )["lean_snippet"],
+            generate_entailment_certificate(
+                "nat",
+                ["x <= 5", "y <= 5"],
+                ["x + y <= 12"],
+                "x=0,y=0",
+                strict_witness_str="x=6,y=6",
+                thm_name="live_ent_nat_strict",
+            )["lean_snippet"],
+            generate_entailment_certificate(
+                "nat",
+                ["x + 1 <= y"],
+                ["x + 2 <= y + 1"],
+                "x=0,y=1",
+                check_equiv=True,
+                thm_name="live_ent_nat_equiv",
+            )["lean_snippet"],
+            generate_entailment_certificate(
+                "int",
+                ["-3 <= x", "x <= 2"],
+                ["-5 <= x", "x <= 4"],
+                "x=-1",
+                strict_witness_str="x=-4",
+                thm_name="live_ent_int_strict",
+            )["lean_snippet"],
+            generate_entailment_certificate(
+                "int",
+                ["x - y <= 3"],
+                ["2 * x - 2 * y <= 6"],
+                "x=0,y=0",
+                check_equiv=True,
+                thm_name="live_ent_int_equiv_ascii",
+                ascii_lean=True,
+            )["lean_snippet"],
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            lean_env = {
+                "PATH": f"{lean_bin.parent}:/usr/bin:/bin",
+                "LEAN_PATH": (
+                    f"{_ANNEAL_ROOT / '.lake/build/lib/lean'}:"
+                    f"{lean_bin.parent.parent / 'lib/lean'}"
+                ),
+            }
+            if ld := os.environ.get("LD_LIBRARY_PATH"):
+                lean_env["LD_LIBRARY_PATH"] = ld
+
+            hdr = (
+                "prelude\n"
+                "import Anneal.FarkasMirCert\n"
+                "open Anneal.LinearArith Anneal.AiPcc Anneal.UnsafeObligations Anneal.FarkasMirCert\n"
+                "open Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            )
+            body = "\n".join(
+                ln for snip in snippets for ln in snip.splitlines()
+                if not ln.startswith(("import ", "open "))
+            )
+            probe = t / "ProbeMir.lean"
+            probe.write_text(hdr + body + "\n", encoding="utf-8")
+            res = subprocess.run(
+                [str(lean_bin), "-DwarningAsError=true", str(probe)],
+                env=lean_env, text=True, capture_output=True, timeout=180,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertEqual(res.stdout.strip() + res.stderr.strip(), "")
+
+            # Negative Lean controls: tampered cert, tampered sat witness, tampered strict witness, truncated edge
+            neg_cases = [
+                (
+                    "NegTamperedCert.lean",
+                    "import Anneal.FarkasMirCert\n"
+                    "open Anneal.LinearArith Anneal.AiPcc Anneal.UnsafeObligations Anneal.FarkasMirCert\n"
+                    "private theorem bad_cert (a b : Nat) (locals : List Trusted.Rustc.V2026_06_01.MirAst.LocalSlot)\n"
+                    "    (mem : Trusted.Rustc.V2026_06_01.MirSemantics.Memory) (ha : a <= 10) :\n"
+                    "    a + b < modPow2 (uintWidth .u64) /\\ a + b < scalarModulus (uintBytes .u64) /\\\n"
+                    "    Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .addUnchecked ⟨a, uintBytes .u64⟩ ⟨b, uintBytes .u64⟩ locals mem false =\n"
+                    "      .ok (.scalar ⟨a + b, uintBytes .u64⟩) locals mem /\\\n"
+                    "    Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .addWithOverflow ⟨a, uintBytes .u64⟩ ⟨b, uintBytes .u64⟩ locals mem false =\n"
+                    "      .ok (.aggregate 0 [.scalar ⟨a + b, uintBytes .u64⟩, .scalar ⟨0, 1⟩]) locals mem :=\n"
+                    "  farkas_discharges_u64_add_no_overflow [⟨.var 0, .cst 10⟩] (.var 0) (.var 1) [.hyp 0] rfl [a, b] locals mem ha\n",
+                ),
+                (
+                    "NegBadSatWitness.lean",
+                    "import Anneal.FarkasMirCert\n"
+                    "open Anneal.LinearArith Anneal.FarkasMirCert\n"
+                    "private theorem bad_sat :\n"
+                    "    NatEntailmentAdequacyProp [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩] .sufficientOnly :=\n"
+                    "  farkas_entailment_adequacy_cert [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩]\n"
+                    "    [[.hyp 0, .hyp 2, .comb 0 1 1 1]] [6] .sufficientOnly rfl\n",
+                ),
+                (
+                    "NegBadStrictWitness.lean",
+                    "import Anneal.FarkasMirCert\n"
+                    "open Anneal.LinearArith Anneal.FarkasMirCert\n"
+                    "private theorem bad_strict :\n"
+                    "    NatEntailmentAdequacyProp [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩] (.strict [4]) :=\n"
+                    "  farkas_entailment_adequacy_cert [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩]\n"
+                    "    [[.hyp 0, .hyp 2, .comb 0 1 1 1]] [0] (.strict [4]) rfl\n",
+                ),
+                (
+                    "NegTruncatedEdge.lean",
+                    "import Anneal.FarkasMirCert\n"
+                    "open Anneal.LinearArith Anneal.FarkasMirCert\n"
+                    "private theorem bad_trunc : ∀ env, NatLinSpec.holds env [⟨.var 0, .cst 5⟩] →\n"
+                    "    NatLinSpec.holds env [⟨.var 0, .cst 5⟩, ⟨.var 0, .cst 0⟩] :=\n"
+                    "  checkNatEntailmentEdge_sound (certs := [[.hyp 0, .hyp 2, .comb 0 1 1 1]]) rfl\n",
+                ),
+            ]
+            for fname, content in neg_cases:
+                nf = t / fname
+                nf.write_text(content, encoding="utf-8")
+                nres = subprocess.run(
+                    [str(lean_bin), str(nf)], env=lean_env,
+                    text=True, capture_output=True, timeout=60,
+                )
+                self.assertNotEqual(nres.returncode, 0, f"Negative control unexpectedly passed: {fname}")
+
+            # Confirm Anneal.FarkasMirCert and emitted ProbeMir.lean pass Pass-1 preflight.
+            tb = _ANNEAL_ROOT / "trusted/audit/TrustedBoundary.lean"
+            sysroot = str(lean_bin.parent.parent)
+            lock = json.loads(
+                (_ANNEAL_ROOT / "trusted/lean/foundation-lock.json").read_text("utf-8")
+            )
+            pf_env = {**lean_env, "LEAN_PATH": f"{_ANNEAL_ROOT / 'theory'}:{sysroot}/lib/lean"}
+            parts = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
+            arts = []
+            for mod, rec in sorted(lock["modules"].items()):
+                rel = mod.replace(".", "/")
+                avail = [str(Path(sysroot) / "lib/lean" / f"{rel}.{pt}")
+                         for pt in parts if rec["parts"].get(pt) is not None]
+                arts.append([mod, [avail[:3], avail[3:]]])
+            p_req, p_out = t / "preq_mir.json", t / "pout_mir.json"
+            p_req.write_text(json.dumps({
+                "mode": "preflight", "sysroot": sysroot, "artifacts": arts,
+                "foundation": list(lock["modules"]), "graph": lock["graph"],
+                "axioms": lock["axioms"],
+                "sources": [
+                    ["Anneal.FarkasMirCert", str(_ANNEAL_ROOT / "theory/Anneal/FarkasMirCert.lean")],
+                    ["Anneal.TestFarkasMirPreflight", str(probe)],
                 ],
             }), encoding="utf-8")
             pf = subprocess.run(
