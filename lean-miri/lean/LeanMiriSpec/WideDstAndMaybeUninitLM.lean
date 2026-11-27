@@ -2403,7 +2403,7 @@ private def wdStepFnPtr1 : Scalar AnnealProv :=
 
 private def wdStepArr3Mach : AnnealMachine :=
   match Allocation.fromBytes (Prov := AnnealProv)
-      #[100, 0, 0, 0, 200, 0, 0, 0, 300, 0, 0, 0] ⟨2⟩ .Mut with
+      #[100, 0, 0, 0, 200, 0, 0, 0, 44, 1, 0, 0] ⟨2⟩ .Mut with
   | .ok a =>
     { AnnealMachine.empty with
       memory := { (MemoryState.empty : AnnealMemory) with live := #[(wdStepAid1, ⟨.stack, a.withExtra none⟩)] },
@@ -2481,6 +2481,61 @@ theorem lm_step_wdCase23_null_raw_ok :
           ⟨.live (.immediate (.scalar (wdStepUInt 0 8))), usLay⟩]) =
       .ok (some (.live (.immediate (.scalar (wdStepUInt 0 8))))) := by
   decide +kernel
+
+/-- The little-endian `u32` elements of the Step-driver backing allocation of `[100, 200, 300]`,
+read back through vendored `Allocation.readScalar` (byte `300` does not fit `UInt8`: it is
+`44, 1`). -/
+private def wdStepArr3Elems : List (Option Nat) :=
+  match wdStepArr3Mach.memory.live[0]? with
+  | some (_, entry) =>
+    [0, 4, 8].map fun off =>
+      match entry.allocation.readScalar annealTargetDataLayout ⟨Size.ofBytes off, Size.ofBytes 4⟩ false with
+      | .ok sc => match sc.toBits (Size.ofBytes 4) with
+        | .ok b => some b.toNat
+        | .error _ => none
+      | .error _ => none
+  | none => []
+
+/-- The Step-driver memory really holds `[100u32, 200, 300]` (the same array as the harness
+and as the Trusted / MiniRust `D3` fixtures). -/
+theorem lm_step_arr3_backing_is_100_200_300 : wdStepArr3Elems = [some 100, some 200, some 300] := by
+  decide +kernel
+
+/-- `D3` mode-free (`treeBorrows = false`) **direct `Miri.Interpreter.Step.step` execution of shared
+`wdCase19Mir`**: without a borrow tracker, writing `999` through `(&raw mut _1 as *mut u32).offset(1)`
+and reading it back returns `999`, matching `lmWdObserve false 19 = .okScalar 999`. -/
+theorem lm_step_wdCase19_basic_ok :
+    wdRunMiriSteps (wdStepHooks wdCase19Mir) 16
+      (wdMkStepState wdCase19Mir wdU32Ty (wdStepD3Locals wdCase19Mir) wdStepArr3Mach) =
+      .ok (some (.live (.immediate (.scalar (wdStepUInt 999 4))))) := by
+  decide +kernel
+
+/-- `D4` case `22` executes the SAME shared fixture as case `21` (`wdCase21Mir`): LeanMiri's
+`Step.step` rejects the null `fn()` regardless of MiniRust's pinned `checkPtr` (the pin delta). -/
+theorem lm_step_wdCase22_null_fnptr_ub :
+    let fnLay := some (translateTy wdFnPtrTy wdCase21Mir.layouts)
+    let usLay := some (translateTy wdUsizeTy wdCase21Mir.layouts)
+    wdStepIsUb (wdRunMiriSteps (wdStepHooks wdCase21Mir) 8
+      (wdMkStepState wdCase21Mir wdFnPtrTy
+        #[⟨.live (.immediate .uninit), fnLay⟩,
+          ⟨.live (.immediate (.scalar (wdStepUInt 0 8))), usLay⟩])) = true := by
+  decide +kernel
+
+/-- **Step-driver capstone**: every direct `Miri.Interpreter.Step.step` execution of a shared
+`CapturedMir` fixture (cases `14`, `16`, `19` without a borrow tracker, `20`, `21`, `22`, `23`)
+agrees with the harness table, over a backing allocation that really holds `[100, 200, 300]`. -/
+theorem ep1_lean_miri_step_driver_capstone :
+    type_of% lm_step_arr3_backing_is_100_200_300 ∧ type_of% lm_step_wdCase14_ok ∧
+    type_of% lm_step_wdCase16_oob_ub ∧ type_of% lm_step_wdCase19_basic_ok ∧
+    type_of% lm_step_wdCase20_fnptr_ok ∧ type_of% lm_step_wdCase21_null_fnptr_ub ∧
+    type_of% lm_step_wdCase22_null_fnptr_ub ∧ type_of% lm_step_wdCase23_null_raw_ok ∧
+    lmWdObserve false 14 = .okScalar 200 ∧ lmWdObserve false 16 = .ub ∧
+    lmWdObserve false 19 = .okScalar 999 ∧ lmWdObserve false 20 = .okFnPtr 1 ∧
+    lmWdObserve false 21 = .ub ∧ lmWdObserve false 22 = .ub ∧ lmWdObserve false 23 = .okFnPtr 0 := by
+  refine ⟨lm_step_arr3_backing_is_100_200_300, lm_step_wdCase14_ok, lm_step_wdCase16_oob_ub,
+    lm_step_wdCase19_basic_ok, lm_step_wdCase20_fnptr_ok, lm_step_wdCase21_null_fnptr_ub,
+    lm_step_wdCase22_null_fnptr_ub, lm_step_wdCase23_null_raw_ok, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+  · rw [lmWdObserveU.eq_src]; decide +kernel
 
 end StepDriver
 
