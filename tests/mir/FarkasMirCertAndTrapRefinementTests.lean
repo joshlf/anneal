@@ -953,10 +953,11 @@ theorem test_preorder_monotonicity_and_classifyAnyTrap :
     mirExactOutcomeClass_toPartial_monotone (show (MirExactOutcomeClass.trap .panic) ≤ .ub from trivial),
     mirExactOutcomeEquiv_trans (mirExactOutcomeEquiv_refl _) (mirExactOutcomeEquiv_symm (mirExactOutcomeEquiv_refl _))⟩
 
-/-- Tree-level (Layer 1A `ITree.toPartial` and coinductive `WeakRef`) reverse `iff` instances on
-both sides of the `u8` overflow boundary (`255 + 0` vs `255 + 1`, `5 - 5` vs `5 - 6`, `15 * 17`
-vs `16 * 16`, `0 + 4 * 63` vs `4 + 4 * 63`), plus exact `add_scaled` failure-site pinning. -/
-theorem test_tree_level_reverse_iff_and_failure_sites :
+/-- Constructive tree-level Layer 1A `ITree.toPartial` reverse `iff` instances on both sides
+of the `u8` overflow boundary (`255 + 0` vs `255 + 1`, `5 - 5` vs `5 - 6`, `15 * 17` vs
+`16 * 16`, `3 + 4 * 63` vs `4 + 4 * 63`), plus exact `add_scaled` failure-site pinning on
+both `u8` and `u128`. Kept strictly constructive (zero `Classical.choice`). -/
+theorem test_tree_level_toPartial_reverse_iff_and_failure_sites :
     (mirCallTree (mkUncheckedArithBody .u8 .add) (uintArgs2 .u8 255 0)).toPartial ≤
       (mirCallTree (mkCheckedArithBody .u8 .add .terminate) (uintArgs2 .u8 255 0)).toPartial ∧
     (¬ (mirCallTree (mkUncheckedArithBody .u8 .add) (uintArgs2 .u8 255 1)).toPartial ≤
@@ -973,13 +974,25 @@ theorem test_tree_level_reverse_iff_and_failure_sites :
       (mirCallTree (mkCheckedAddScaledBody .u8 4 .terminate) (uintArgs2 .u8 3 63)).toPartial ∧
     (¬ (mirCallTree (mkUncheckedAddScaledBody .u8 4) (uintArgs2 .u8 4 63)).toPartial ≤
       (mirCallTree (mkCheckedAddScaledBody .u8 4 .continue_) (uintArgs2 .u8 4 63)).toPartial) ∧
-    (¬ WeakRef (mirCallTree (mkUncheckedArithBody .u8 .sub) (uintArgs2 .u8 5 6))
-      (mirCallTree (mkCheckedArithBody .u8 .sub .continue_) (uintArgs2 .u8 5 6))) ∧
     runMirCall (mkCheckedAddScaledBody .u8 4 .terminate) 3 (uintArgs2 .u8 1 70) = .halted .abort ∧
     runMirCall (mkCheckedAddScaledBody .u8 4 .continue_) 8 (uintArgs2 .u8 200 20) =
-      .faulted .outOfFuel := by
+      .faulted .outOfFuel ∧
+    runMirCall (mkCheckedAddScaledBody .u128 2 .terminate) 8 (uintArgs2 .u128 u128Max 1) =
+      .faulted .outOfFuel ∧
+    runMirCall (mkCheckedAddScaledBody .u128 2 .terminate) 9 (uintArgs2 .u128 u128Max 1) =
+      .halted .abort := by
   have h5 : (5 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
   have h6 : (6 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  have hMod128 : modPow2 (uintWidth .u128) = u128Max + 1 := by
+    rw [modPow2_eq_pow]; rfl
+  have h2Lt128 : 2 * 1 < modPow2 (uintWidth .u128) := by
+    rw [hMod128]
+    exact Nat.succ_lt_succ (Nat.succ_lt_succ (Nat.succ_pos _))
+  have hOuter128 : modPow2 (uintWidth .u128) ≤ u128Max + 2 * 1 := by
+    rw [hMod128]
+    exact Nat.add_le_add_left (Nat.le_succ 1) u128Max
+  have hPin128 := runMirCall_checked_add_scaled_outer_add_trap_pinned .u128 2 .abort u128Max 1
+    h2Lt128 hOuter128
   refine ⟨(checked_add_toPartial_refines_unchecked_iff .u8 .abort 255 0).2
             (Nat.le_of_ble_eq_true rfl),
           fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
@@ -995,10 +1008,82 @@ theorem test_tree_level_reverse_iff_and_failure_sites :
             (Nat.le_of_ble_eq_true rfl),
           fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
             ((checked_add_scaled_toPartial_refines_unchecked_iff .u8 4 .unwind 4 63).1 h),
-          fun h => Nat.not_le_of_gt (Nat.lt_succ_self 5)
-            ((checked_toWeakRef_refines_unchecked_iff .u8 .unwind 5 6 4 h5 h6).2.1.1 h),
           (add_scaled_failure_sites_pinned .abort).2.1,
-          (add_scaled_failure_sites_pinned .unwind).2.2.2.2.1⟩
+          (add_scaled_failure_sites_pinned .unwind).2.2.2.2.1,
+          hPin128.1, hPin128.2⟩
+
+/-- Coinductive `WeakRef` tree-level reverse `iff` instances (both positive and negative sides
+for `add`, `sub`, `mul`, and `add_scaled`) plus unconditional `unchecked_add_scaled_weakRef_to_checked`. -/
+theorem test_tree_level_weakRef_reverse_iff :
+    WeakRef (mirCallTree (mkUncheckedArithBody .u8 .add) (uintArgs2 .u8 255 0))
+      (mirCallTree (mkCheckedArithBody .u8 .add .terminate) (uintArgs2 .u8 255 0)) ∧
+    (¬ WeakRef (mirCallTree (mkUncheckedArithBody .u8 .add) (uintArgs2 .u8 255 1))
+      (mirCallTree (mkCheckedArithBody .u8 .add .continue_) (uintArgs2 .u8 255 1))) ∧
+    WeakRef (mirCallTree (mkUncheckedArithBody .u8 .sub) (uintArgs2 .u8 5 5))
+      (mirCallTree (mkCheckedArithBody .u8 .sub .continue_) (uintArgs2 .u8 5 5)) ∧
+    (¬ WeakRef (mirCallTree (mkUncheckedArithBody .u8 .sub) (uintArgs2 .u8 5 6))
+      (mirCallTree (mkCheckedArithBody .u8 .sub .continue_) (uintArgs2 .u8 5 6))) ∧
+    WeakRef (mirCallTree (mkUncheckedArithBody .u8 .mul) (uintArgs2 .u8 15 17))
+      (mirCallTree (mkCheckedArithBody .u8 .mul .terminate) (uintArgs2 .u8 15 17)) ∧
+    (¬ WeakRef (mirCallTree (mkUncheckedArithBody .u8 .mul) (uintArgs2 .u8 16 16))
+      (mirCallTree (mkCheckedArithBody .u8 .mul .continue_) (uintArgs2 .u8 16 16))) ∧
+    WeakRef (mirCallTree (mkUncheckedAddScaledBody .u8 4) (uintArgs2 .u8 3 63))
+      (mirCallTree (mkCheckedAddScaledBody .u8 4 .terminate) (uintArgs2 .u8 3 63)) ∧
+    (¬ WeakRef (mirCallTree (mkUncheckedAddScaledBody .u8 4) (uintArgs2 .u8 4 63))
+      (mirCallTree (mkCheckedAddScaledBody .u8 4 .continue_) (uintArgs2 .u8 4 63))) ∧
+    WeakRef (mirCallTree (mkCheckedAddScaledBody .u8 4 .terminate) (uintArgs2 .u8 200 20))
+      (mirCallTree (mkUncheckedAddScaledBody .u8 4) (uintArgs2 .u8 200 20)) := by
+  have h5 : (5 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  have h6 : (6 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  exact ⟨(checked_add_weakRef_refines_unchecked_iff .u8 .abort 255 0).2
+           (Nat.le_of_ble_eq_true rfl),
+         fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+           ((checked_add_weakRef_refines_unchecked_iff .u8 .unwind 255 1).1 h),
+         (checked_sub_weakRef_refines_unchecked_iff .u8 .unwind 5 5 h5 h5).2 (Nat.le_refl 5),
+         fun h => Nat.not_le_of_gt (Nat.lt_succ_self 5)
+           ((checked_toWeakRef_refines_unchecked_iff .u8 .unwind 5 6 4 h5 h6).2.1.1 h),
+         (checked_mul_weakRef_refines_unchecked_iff .u8 .abort 15 17).2
+           (Nat.le_of_ble_eq_true rfl),
+         fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+           ((checked_mul_weakRef_refines_unchecked_iff .u8 .unwind 16 16).1 h),
+         (checked_add_scaled_weakRef_refines_unchecked_iff .u8 4 .abort 3 63).2
+           (Nat.le_of_ble_eq_true rfl),
+         fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+           ((checked_add_scaled_weakRef_refines_unchecked_iff .u8 4 .unwind 4 63).1 h),
+         unchecked_add_scaled_weakRef_to_checked .u8 4 .abort 200 20⟩
+
+/-- Constructive symmetric incomparability canary for `checked` vs. `wrapping` (`add`, `sub`,
+`mul`): on overflowing/underflowing inputs BOTH directions fail (`¬ checked ⊑ wrapping` AND
+`¬ wrapping ⊑ checked` at both classifier and Layer 1A `ITree.toPartial`), contrasting
+directly with unconditional asymmetric `unchecked ⊑ checked`. -/
+theorem test_checked_vs_wrapping_symmetric_iff :
+    ((mirCallTree (mkWrappingArithBody .u8 .add) (uintArgs2 .u8 255 0)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .add .terminate) (uintArgs2 .u8 255 0)).toPartial) ∧
+    (¬ ((mirCallTree (mkWrappingArithBody .u8 .add) (uintArgs2 .u8 255 1)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .add .terminate) (uintArgs2 .u8 255 1)).toPartial)) ∧
+    (¬ ((mirCallTree (mkCheckedArithBody .u8 .add .terminate) (uintArgs2 .u8 255 1)).toPartial ≤
+      (mirCallTree (mkWrappingArithBody .u8 .add) (uintArgs2 .u8 255 1)).toPartial)) ∧
+    (¬ ((mirCallTree (mkCheckedArithBody .u8 .sub .continue_) (uintArgs2 .u8 5 6)).toPartial ≤
+      (mirCallTree (mkWrappingArithBody .u8 .sub) (uintArgs2 .u8 5 6)).toPartial)) ∧
+    ((mirCallTree (mkCheckedArithBody .u8 .sub .continue_) (uintArgs2 .u8 5 5)).toPartial ≤
+      (mirCallTree (mkWrappingArithBody .u8 .sub) (uintArgs2 .u8 5 5)).toPartial) ∧
+    (¬ ((mirCallTree (mkCheckedArithBody .u8 .mul .terminate) (uintArgs2 .u8 16 16)).toPartial ≤
+      (mirCallTree (mkWrappingArithBody .u8 .mul) (uintArgs2 .u8 16 16)).toPartial)) ∧
+    ((mirCallTree (mkWrappingArithBody .u8 .mul) (uintArgs2 .u8 15 17)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .mul .terminate) (uintArgs2 .u8 15 17)).toPartial) := by
+  have h5 : (5 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  have h6 : (6 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  exact ⟨(checked_add_wrapping_refines_iff .u8 .abort 255 0).2.2.1.2 (Nat.le_of_ble_eq_true rfl),
+         fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+           ((checked_add_wrapping_refines_iff .u8 .abort 255 1).2.2.1.1 h),
+         fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+           ((checked_add_wrapping_refines_iff .u8 .abort 255 1).2.2.2.1 h),
+         fun h => Nat.not_le_of_gt (Nat.lt_succ_self 5)
+           ((checked_sub_wrapping_refines_iff .u8 .unwind 5 6 h5 h6).2.2.2.1 h),
+         (checked_sub_wrapping_refines_iff .u8 .unwind 5 5 h5 h5).2.2.2.2 (Nat.le_refl 5),
+         fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+           ((checked_mul_wrapping_refines_iff .u8 .abort 16 16).2.2.2.1 h),
+         (checked_mul_wrapping_refines_iff .u8 .abort 15 17).2.2.1.2 (Nat.le_of_ble_eq_true rfl)⟩
 
 /-! ## 4. Programmatic `run_cmd` Hygiene Audit & `#print axioms` Checks -/
 
@@ -1093,11 +1178,18 @@ run_cmd do
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_overflow_not_refines_unchecked
     , ``Anneal.Mir.OverflowTrapRefinement.checked_sub_out_of_range_lhs_not_refines_unchecked
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_inner_mul_overflow_not_refines_unchecked
+    , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_unchecked_add_scaled_inner_mul_ub_pinned
+    , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_unchecked_add_scaled_outer_add_ub_pinned
+    , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_checked_add_scaled_inner_mul_trap_pinned
+    , ``Anneal.Mir.OverflowTrapRefinement.runMirCall_checked_add_scaled_outer_add_trap_pinned
     , ``Anneal.Mir.OverflowTrapRefinement.add_scaled_failure_sites_pinned
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_toPartial_refines_unchecked_iff
     , ``Anneal.Mir.OverflowTrapRefinement.checked_sub_toPartial_refines_unchecked_iff
     , ``Anneal.Mir.OverflowTrapRefinement.checked_mul_toPartial_refines_unchecked_iff
-    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_toPartial_refines_unchecked_iff ]
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_toPartial_refines_unchecked_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_wrapping_refines_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_sub_wrapping_refines_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_mul_wrapping_refines_iff ]
   -- Exact allowlist of coinductive `Anneal.ITree.WeakRef` / `Eutt` bridge corollaries in
   -- `Anneal.Mir.OverflowTrapRefinement` (these use `Classical.choice` solely via Lean 4
   -- `coinductive_fixpoint` in `Anneal.ITree`; NO other declaration in either module may).
@@ -1113,9 +1205,14 @@ run_cmd do
     , ``Anneal.Mir.OverflowTrapRefinement.unchecked_add_weakRef_to_checked
     , ``Anneal.Mir.OverflowTrapRefinement.unchecked_sub_weakRef_to_checked
     , ``Anneal.Mir.OverflowTrapRefinement.unchecked_mul_weakRef_to_checked
+    , ``Anneal.Mir.OverflowTrapRefinement.unchecked_add_scaled_weakRef_to_checked
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_weakRef_unchecked_of_farkas_cert
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_overflow_not_weakRef_corollaries
     , ``Anneal.Mir.OverflowTrapRefinement.weakRef_reverse_iff_of_dichotomy
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_weakRef_refines_unchecked_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_sub_weakRef_refines_unchecked_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_mul_weakRef_refines_unchecked_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_weakRef_refines_unchecked_iff
     , ``Anneal.Mir.OverflowTrapRefinement.checked_toWeakRef_refines_unchecked_iff ]
   let keyWeakRefBridgeDecls : List Name := allowedOverflowCoinductiveThms
   for d in keyFarkasDecls ++ keyTrapConstructiveDecls do
@@ -1180,8 +1277,11 @@ run_cmd do
       throwError "module defn sweep vacuous for {mod}: {nConstDefn + nCoindAuxDefn} < {minDefns}"
     if allowedCoindThms.isEmpty && (nCoindThm != 0 || nCoindAuxDefn != 0) then
       throwError "module {mod} must be 100% constructive, found coinductive decls"
-    -- Allowlist exactness: every allowlisted theorem must genuinely depend on
-    -- `Classical.choice` in THIS module (no over-broad or stale entries).
+    -- Allowlist exactness (duplicate-free set bijection): every allowlisted theorem must
+    -- genuinely depend on `Classical.choice` in THIS module (no duplicates, stale, or
+    -- over-broad entries).
+    unless allowedCoindThms.eraseDups.length == allowedCoindThms.length do
+      throwError "duplicate entry in coinductive allowlist for {mod}"
     for expected in allowedCoindThms do
       unless seenCoind.contains expected do
         throwError "over-broad coinductive allowlist: {expected} is not a Classical-dependent theorem of {mod}"
@@ -1189,7 +1289,7 @@ run_cmd do
       throwError "coinductive allowlist mismatch in {mod}: seen {seenCoind.length}, allowlisted {allowedCoindThms.length}"
     return s!"{mod}: {nConstThm}c+{nCoindThm}w thms, {nConstDefn}c+{nCoindAuxDefn}aux defs"
   let sFarkas ← auditDeclsInModule `Anneal.FarkasMirCert 190 350 []
-  let sTrap ← auditDeclsInModule `Anneal.Mir.OverflowTrapRefinement 220 250
+  let sTrap ← auditDeclsInModule `Anneal.Mir.OverflowTrapRefinement 225 250
     allowedOverflowCoinductiveThms
   -- Every curated key declaration must live in one of the swept modules.
   for d in keyFarkasDecls ++ keyTrapConstructiveDecls ++ keyWeakRefBridgeDecls do
@@ -1198,23 +1298,31 @@ run_cmd do
     let modName := env.header.moduleNames[mIdx.toNat]!
     unless modName == `Anneal.FarkasMirCert || modName == `Anneal.Mir.OverflowTrapRefinement do
       throwError "audit: curated declaration {d} lives outside the swept modules ({modName})"
-  -- Also audit every theorem and definition defined in this test module:
+  -- Also audit every theorem and definition defined in this test module with an exact
+  -- coinductive allowlist (preventing constructive tests from silently becoming coinductive):
+  let allowedTestCoinductiveThms : List Name :=
+    [ ``Anneal.Mir.FarkasMirCertAndTrapRefinementTests.test_weakRef_bridge_canaries
+    , ``Anneal.Mir.FarkasMirCertAndTrapRefinementTests.test_weakRef_general_operational_iff
+    , ``Anneal.Mir.FarkasMirCertAndTrapRefinementTests.test_tree_level_weakRef_reverse_iff ]
+  unless allowedTestCoinductiveThms.eraseDups.length == allowedTestCoinductiveThms.length do
+    throwError "duplicate entry in test coinductive allowlist"
   let mut constructiveTestTheorems : Nat := 0
   let mut weakRefTestTheorems : Nat := 0
+  let mut seenTestCoind : List Name := []
   let mut constructiveTestDefns : Nat := 0
   for (c, info) in env.constants.map₂.toList do
     match info with
     | .thmInfo thm =>
       let axs ← liftCoreM <| Lean.collectAxioms c
-      if mentionsCoinductive thm.type then
+      if axs.any (fun a => !isConstructive a) then
+        unless mentionsCoinductive thm.type && allowedTestCoinductiveThms.contains c do
+          throwError "unallowlisted non-constructive test theorem: {c} depends on {axs}"
         for a in axs do
           unless isStandard a do
             throwError "coinductive test audit failure: {c} depends on non-standard symbol {a}"
         weakRefTestTheorems := weakRefTestTheorems + 1
+        seenTestCoind := c :: seenTestCoind
       else
-        for a in axs do
-          unless isConstructive a do
-            throwError "constructive test audit failure: {c} depends on disallowed symbol {a}"
         constructiveTestTheorems := constructiveTestTheorems + 1
     | .defnInfo _ =>
       let axs ← liftCoreM <| Lean.collectAxioms c
@@ -1223,7 +1331,12 @@ run_cmd do
           throwError "constructive test defn audit failure: {c} depends on disallowed symbol {a}"
       constructiveTestDefns := constructiveTestDefns + 1
     | _ => pure ()
-  if constructiveTestTheorems < 20 || weakRefTestTheorems < 2 || constructiveTestDefns < 10 then
+  for expected in allowedTestCoinductiveThms do
+    unless seenTestCoind.contains expected do
+      throwError "over-broad test coinductive allowlist: {expected} is not Classical-dependent"
+  unless seenTestCoind.length == allowedTestCoinductiveThms.length do
+    throwError "test coinductive allowlist mismatch: seen {seenTestCoind.length}, allowlisted {allowedTestCoinductiveThms.length}"
+  if constructiveTestTheorems < 26 || weakRefTestTheorems != 3 || constructiveTestDefns < 10 then
     throwError "test audit is vacuous: thms={constructiveTestTheorems}c+{weakRefTestTheorems}w, defs={constructiveTestDefns}"
   logInfo m!"hygiene audit passed: [{sFarkas}; {sTrap}]; curated {keyFarkasDecls.length} FarkasMirCert + {keyTrapConstructiveDecls.length} constructive OverflowTrapRefinement + {keyWeakRefBridgeDecls.length} WeakRef bridges; test module {constructiveTestTheorems}c+{weakRefTestTheorems}w thms, {constructiveTestDefns}c defs (0 sorryAx, 0 ofReduceBool, 0 trustCompiler, Classical.choice strictly allowlisted under WeakRef/Eutt)"
 
@@ -1237,6 +1350,9 @@ run_cmd do
 #print axioms Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_distinct
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_sub_out_of_range_lhs_not_refines_unchecked
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_inner_mul_overflow_not_refines_unchecked
+#print axioms Anneal.Mir.OverflowTrapRefinement.runMirCall_checked_add_scaled_outer_add_trap_pinned
+#print axioms Anneal.Mir.OverflowTrapRefinement.add_scaled_failure_sites_pinned
+#print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_wrapping_refines_iff
 #print axioms Anneal.Mir.OverflowTrapRefinement.runMirSteps_faulted_to_tauStar
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_mul_const_right_refines_unchecked_of_farkas_cert
 #print axioms Anneal.Mir.OverflowTrapRefinement.unchecked_refines_to_checked_of_fuel

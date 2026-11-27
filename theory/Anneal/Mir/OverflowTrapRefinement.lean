@@ -1854,55 +1854,87 @@ theorem runMirCall_unchecked_add_scaled_ok (u : UintTy) (k a b : Nat)
       runMirSteps_step_tau hStep3]
   rfl
 
-/-- Exact evaluation of `mkUncheckedAddScaledBody u k` when `2^w ≤ a + k * b` (UB). -/
-theorem runMirCall_unchecked_add_scaled_ub (u : UintTy) (k a b : Nat)
-    (hOv : modPow2 (uintWidth u) ≤ a + k * b) :
-    runMirCall (mkUncheckedAddScaledBody u k) 5 (uintArgs2 u a b) = .faulted .ub := by
+/-- Parametric inner-multiplication failure-site pinning for `mkUncheckedAddScaledBody u k`:
+for ANY `u : UintTy` and `k a b : Nat` with `2^w ≤ k * b`, execution is still running after
+1 step (`.outOfFuel`) and faults `.ub` at step 2 (`bb0`'s `mulUnchecked`). -/
+theorem runMirCall_unchecked_add_scaled_inner_mul_ub_pinned (u : UintTy) (k a b : Nat)
+    (hMulOv : modPow2 (uintWidth u) ≤ k * b) :
+    runMirCall (mkUncheckedAddScaledBody u k) 1 (uintArgs2 u a b) = .faulted .outOfFuel ∧
+    runMirCall (mkUncheckedAddScaledBody u k) 2 (uintArgs2 u a b) = .faulted .ub := by
   have hStep1 : stepMirState (mkUncheckedAddScaledBody u k)
       (.running (initMachineState (mkUncheckedAddScaledBody u k) (uintArgs2 u a b))) =
       .tau (.running (mkCanonState 0 1
         [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
          .init (.scalar ⟨b, uintBytes u⟩), .uninit])) := rfl
+  have hMul := evalScalarBinOp_uint_mulUnchecked_ub (u := u) (a := k) (b := b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
+    canonInitMemory hMulOv
+  have hStep2 : stepMirState (mkUncheckedAddScaledBody u k)
+      (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit])) = MirStepNode.fail .ub :=
+    evalStmt_assign_ub _ (localPlace 3) _ _ _ hMul
+  constructor
+  · rw [runMirCall, initExecState, runMirSteps_step_tau hStep1]
+    rfl
+  · rw [runMirCall, initExecState, runMirSteps_step_tau hStep1]
+    exact runMirSteps_step_ub hStep2
+
+/-- Parametric outer-addition failure-site pinning for `mkUncheckedAddScaledBody u k`:
+for ANY `u : UintTy` and `k a b : Nat` with `k * b < 2^w` and `2^w ≤ a + k * b`, execution
+completes `mulUnchecked` (still running after 2 steps, `.outOfFuel`) and faults `.ub` at
+step 3 (`bb0`'s `addUnchecked`). -/
+theorem runMirCall_unchecked_add_scaled_outer_add_ub_pinned (u : UintTy) (k a b : Nat)
+    (hMulNoOv : k * b < modPow2 (uintWidth u))
+    (hOv : modPow2 (uintWidth u) ≤ a + k * b) :
+    runMirCall (mkUncheckedAddScaledBody u k) 2 (uintArgs2 u a b) = .faulted .outOfFuel ∧
+    runMirCall (mkUncheckedAddScaledBody u k) 3 (uintArgs2 u a b) = .faulted .ub := by
+  have hStep1 : stepMirState (mkUncheckedAddScaledBody u k)
+      (.running (initMachineState (mkUncheckedAddScaledBody u k) (uintArgs2 u a b))) =
+      .tau (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit])) := rfl
+  have hMul := evalScalarBinOp_uint_mulUnchecked (u := u) (a := k) (b := b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
+    canonInitMemory hMulNoOv
+  rw [wrapVal_of_lt hMulNoOv] at hMul
+  have hAdd := evalScalarBinOp_uint_addUnchecked_ub (u := u) (a := a) (b := k * b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩),
+     .init (.scalar ⟨k * b, uintBytes u⟩)]
+    canonInitMemory hOv
+  have hStep2 : stepMirState (mkUncheckedAddScaledBody u k)
+      (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit])) =
+      .tau (.running (mkCanonState 0 2
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩),
+         .init (.scalar ⟨k * b, uintBytes u⟩)])) :=
+    evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hMul trivial rfl
+  have hStep3 : stepMirState (mkUncheckedAddScaledBody u k)
+      (.running (mkCanonState 0 2
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩),
+         .init (.scalar ⟨k * b, uintBytes u⟩)])) = MirStepNode.fail .ub :=
+    evalStmt_assign_ub _ (localPlace 0) _ _ _ hAdd
+  constructor
+  · rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2]
+    rfl
+  · rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2]
+    exact runMirSteps_step_ub hStep3
+
+/-- Exact evaluation of `mkUncheckedAddScaledBody u k` when `2^w ≤ a + k * b` (UB). -/
+theorem runMirCall_unchecked_add_scaled_ub (u : UintTy) (k a b : Nat)
+    (hOv : modPow2 (uintWidth u) ≤ a + k * b) :
+    runMirCall (mkUncheckedAddScaledBody u k) 5 (uintArgs2 u a b) = .faulted .ub := by
   cases hMulB : Nat.ble (modPow2 (uintWidth u)) (k * b) with
   | true =>
-    have hMulOv : modPow2 (uintWidth u) ≤ k * b := Nat.le_of_ble_eq_true hMulB
-    have hMul := evalScalarBinOp_uint_mulUnchecked_ub (u := u) (a := k) (b := b)
-      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
-      canonInitMemory hMulOv
-    have hStep2 : stepMirState (mkUncheckedAddScaledBody u k)
-        (.running (mkCanonState 0 1
-          [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-           .init (.scalar ⟨b, uintBytes u⟩), .uninit])) = MirStepNode.fail .ub :=
-      evalStmt_assign_ub _ (localPlace 3) _ _ _ hMul
-    rw [runMirCall, initExecState, runMirSteps_step_tau hStep1]
-    exact runMirSteps_step_ub hStep2
+    exact runMirSteps_ub_mono _ 2 3 _
+      (runMirCall_unchecked_add_scaled_inner_mul_ub_pinned u k a b (Nat.le_of_ble_eq_true hMulB)).2
   | false =>
-    have hMulNoOv : k * b < modPow2 (uintWidth u) := nat_lt_of_ble_false hMulB
-    have hMul := evalScalarBinOp_uint_mulUnchecked (u := u) (a := k) (b := b)
-      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩), .uninit]
-      canonInitMemory hMulNoOv
-    rw [wrapVal_of_lt hMulNoOv] at hMul
-    have hAdd := evalScalarBinOp_uint_addUnchecked_ub (u := u) (a := a) (b := k * b)
-      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩),
-       .init (.scalar ⟨k * b, uintBytes u⟩)]
-      canonInitMemory hOv
-    have hStep2 : stepMirState (mkUncheckedAddScaledBody u k)
-        (.running (mkCanonState 0 1
-          [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-           .init (.scalar ⟨b, uintBytes u⟩), .uninit])) =
-        .tau (.running (mkCanonState 0 2
-          [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-           .init (.scalar ⟨b, uintBytes u⟩),
-           .init (.scalar ⟨k * b, uintBytes u⟩)])) :=
-      evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hMul trivial rfl
-    have hStep3 : stepMirState (mkUncheckedAddScaledBody u k)
-        (.running (mkCanonState 0 2
-          [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-           .init (.scalar ⟨b, uintBytes u⟩),
-           .init (.scalar ⟨k * b, uintBytes u⟩)])) = MirStepNode.fail .ub :=
-      evalStmt_assign_ub _ (localPlace 0) _ _ _ hAdd
-    rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2]
-    exact runMirSteps_step_ub hStep3
+    exact runMirSteps_ub_mono _ 3 2 _
+      (runMirCall_unchecked_add_scaled_outer_add_ub_pinned u k a b
+        (nat_lt_of_ble_false hMulB) hOv).2
 
 /-- Exact evaluation of `mkCheckedAddScaledBody u k strat.toUnwindAction` when
 `a + k * b < 2^w`. -/
@@ -1964,87 +1996,128 @@ theorem runMirCall_checked_add_scaled_ok (u : UintTy) (k : Nat) (strat : PanicSt
       hMid, runMirSteps_step_tau hStep8]
   rfl
 
-/-- Exact evaluation of `mkCheckedAddScaledBody u k strat.toUnwindAction` when
-`2^w ≤ a + k * b` (deterministic trap). -/
-theorem runMirCall_checked_add_scaled_trap (u : UintTy) (k : Nat) (strat : PanicStrategy)
-    (a b : Nat) (hOv : modPow2 (uintWidth u) ≤ a + k * b) :
-    runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) 13 (uintArgs2 u a b) =
+/-- Parametric inner-multiplication failure-site pinning for `mkCheckedAddScaledBody u k`:
+for ANY `u : UintTy`, `k a b : Nat`, and BOTH panic strategies with `2^w ≤ k * b`, execution
+is still running after 2 steps (at `bb0`'s assert terminator, `.outOfFuel`) and traps at
+step 3 (`strat.toTrapOutcome`) before `bb1` is ever entered. -/
+theorem runMirCall_checked_add_scaled_inner_mul_trap_pinned (u : UintTy) (k : Nat)
+    (strat : PanicStrategy) (a b : Nat) (hMulOv : modPow2 (uintWidth u) ≤ k * b) :
+    runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) 2 (uintArgs2 u a b) =
+      .faulted .outOfFuel ∧
+    runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) 3 (uintArgs2 u a b) =
       .halted strat.toTrapOutcome := by
   have hStep1 : stepMirState (mkCheckedAddScaledBody u k strat.toUnwindAction)
       (.running (initMachineState (mkCheckedAddScaledBody u k strat.toUnwindAction) (uintArgs2 u a b))) =
       .tau (.running (mkCanonState 0 1
         [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
          .init (.scalar ⟨b, uintBytes u⟩), .uninit, .dead, .dead])) := rfl
-  cases hMulB : Nat.ble (modPow2 (uintWidth u)) (k * b) with
-  | true =>
-    have hMul := evalScalarBinOp_uint_mulWithOverflow (u := u) (a := k) (b := b)
-      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩),
-       .uninit, .dead, .dead]
-      canonInitMemory
-    rw [hMulB] at hMul
-    have hStep2 : stepMirState (mkCheckedAddScaledBody u k strat.toUnwindAction)
-        (.running (mkCanonState 0 1
-          [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-           .init (.scalar ⟨b, uintBytes u⟩), .uninit, .dead, .dead])) =
-        .tau (.running (mkCanonState 0 2
-          [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-           .init (.scalar ⟨b, uintBytes u⟩),
-           .init (.aggregate 0
-             [.scalar ⟨wrapVal (uintWidth u) (k * b), uintBytes u⟩, .scalar ⟨1, 1⟩]),
-           .dead, .dead])) :=
-      evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hMul trivial rfl
-    rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2]
+  have hMul := evalScalarBinOp_uint_mulWithOverflow (u := u) (a := k) (b := b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩),
+     .uninit, .dead, .dead]
+    canonInitMemory
+  rw [Nat.ble_eq_true_of_le hMulOv] at hMul
+  have hStep2 : stepMirState (mkCheckedAddScaledBody u k strat.toUnwindAction)
+      (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit, .dead, .dead])) =
+      .tau (.running (mkCanonState 0 2
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩),
+         .init (.aggregate 0
+           [.scalar ⟨wrapVal (uintWidth u) (k * b), uintBytes u⟩, .scalar ⟨1, 1⟩]),
+         .dead, .dead])) :=
+    evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hMul trivial rfl
+  constructor
+  · rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2]
+    rfl
+  · rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2]
     cases strat <;> rfl
-  | false =>
-    have hMulNoOv : k * b < modPow2 (uintWidth u) := nat_lt_of_ble_false hMulB
-    have hMul := evalScalarBinOp_uint_mulWithOverflow (u := u) (a := k) (b := b)
-      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩),
-       .uninit, .dead, .dead]
-      canonInitMemory
-    rw [wrapVal_of_lt hMulNoOv, hMulB] at hMul
-    have hAdd := evalScalarBinOp_uint_addWithOverflow (u := u) (a := a) (b := k * b)
-      [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩),
-       .dead, .init (.scalar ⟨k * b, uintBytes u⟩), .uninit]
-      canonInitMemory
-    rw [Nat.ble_eq_true_of_le hOv] at hAdd
-    have hStep2 : stepMirState (mkCheckedAddScaledBody u k strat.toUnwindAction)
-        (.running (mkCanonState 0 1
-          [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-           .init (.scalar ⟨b, uintBytes u⟩), .uninit, .dead, .dead])) =
-        .tau (.running (mkCanonState 0 2
+
+/-- Parametric outer-addition failure-site pinning for `mkCheckedAddScaledBody u k`:
+for ANY `u : UintTy`, `k a b : Nat`, and BOTH panic strategies with `k * b < 2^w` and
+`2^w ≤ a + k * b`, execution passes `bb0`'s assert into `bb1`, is still running after
+8 steps (at `bb1`'s assert terminator, `.outOfFuel`), and traps at step 9. -/
+theorem runMirCall_checked_add_scaled_outer_add_trap_pinned (u : UintTy) (k : Nat)
+    (strat : PanicStrategy) (a b : Nat)
+    (hMulNoOv : k * b < modPow2 (uintWidth u))
+    (hOv : modPow2 (uintWidth u) ≤ a + k * b) :
+    runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) 8 (uintArgs2 u a b) =
+      .faulted .outOfFuel ∧
+    runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) 9 (uintArgs2 u a b) =
+      .halted strat.toTrapOutcome := by
+  have hStep1 : stepMirState (mkCheckedAddScaledBody u k strat.toUnwindAction)
+      (.running (initMachineState (mkCheckedAddScaledBody u k strat.toUnwindAction) (uintArgs2 u a b))) =
+      .tau (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit, .dead, .dead])) := rfl
+  have hMul := evalScalarBinOp_uint_mulWithOverflow (u := u) (a := k) (b := b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩),
+     .uninit, .dead, .dead]
+    canonInitMemory
+  rw [wrapVal_of_lt hMulNoOv, nat_ble_false_of_lt hMulNoOv] at hMul
+  have hAdd := evalScalarBinOp_uint_addWithOverflow (u := u) (a := a) (b := k * b)
+    [.uninit, .init (.scalar ⟨a, uintBytes u⟩), .init (.scalar ⟨b, uintBytes u⟩),
+     .dead, .init (.scalar ⟨k * b, uintBytes u⟩), .uninit]
+    canonInitMemory
+  rw [Nat.ble_eq_true_of_le hOv] at hAdd
+  have hStep2 : stepMirState (mkCheckedAddScaledBody u k strat.toUnwindAction)
+      (.running (mkCanonState 0 1
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩), .uninit, .dead, .dead])) =
+      .tau (.running (mkCanonState 0 2
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩),
+         .init (.aggregate 0 [.scalar ⟨k * b, uintBytes u⟩, .scalar ⟨0, 1⟩]),
+         .dead, .dead])) :=
+    evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hMul trivial rfl
+  have hMid (rem : Nat) :
+      runMirSteps (mkCheckedAddScaledBody u k strat.toUnwindAction) (rem + 5)
+        (.running (mkCanonState 0 2
           [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
            .init (.scalar ⟨b, uintBytes u⟩),
            .init (.aggregate 0 [.scalar ⟨k * b, uintBytes u⟩, .scalar ⟨0, 1⟩]),
-           .dead, .dead])) :=
-      evalStmt_assign_local_step _ 3 _ _ _ _ _ _ hMul trivial rfl
-    have hMid :
-        runMirSteps (mkCheckedAddScaledBody u k strat.toUnwindAction) 11
-          (.running (mkCanonState 0 2
-            [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-             .init (.scalar ⟨b, uintBytes u⟩),
-             .init (.aggregate 0 [.scalar ⟨k * b, uintBytes u⟩, .scalar ⟨0, 1⟩]),
-             .dead, .dead])) =
-        runMirSteps (mkCheckedAddScaledBody u k strat.toUnwindAction) 6
-          (.running (mkCanonState 1 4
-            [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-             .init (.scalar ⟨b, uintBytes u⟩),
-             .dead, .init (.scalar ⟨k * b, uintBytes u⟩), .uninit])) := rfl
-    have hStep8 : stepMirState (mkCheckedAddScaledBody u k strat.toUnwindAction)
+           .dead, .dead])) =
+      runMirSteps (mkCheckedAddScaledBody u k strat.toUnwindAction) rem
         (.running (mkCanonState 1 4
           [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
            .init (.scalar ⟨b, uintBytes u⟩),
-           .dead, .init (.scalar ⟨k * b, uintBytes u⟩), .uninit])) =
-        .tau (.running (mkCanonState 1 5
-          [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
-           .init (.scalar ⟨b, uintBytes u⟩),
-           .dead, .init (.scalar ⟨k * b, uintBytes u⟩),
-           .init (.aggregate 0
-             [.scalar ⟨wrapVal (uintWidth u) (a + k * b), uintBytes u⟩,
-              .scalar ⟨1, 1⟩])])) :=
-      evalStmt_assign_local_step _ 5 _ _ _ _ _ _ hAdd trivial rfl
-    rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2,
-        hMid, runMirSteps_step_tau hStep8]
+           .dead, .init (.scalar ⟨k * b, uintBytes u⟩), .uninit])) := rfl
+  have hStep8 : stepMirState (mkCheckedAddScaledBody u k strat.toUnwindAction)
+      (.running (mkCanonState 1 4
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩),
+         .dead, .init (.scalar ⟨k * b, uintBytes u⟩), .uninit])) =
+      .tau (.running (mkCanonState 1 5
+        [.uninit, .init (.scalar ⟨a, uintBytes u⟩),
+         .init (.scalar ⟨b, uintBytes u⟩),
+         .dead, .init (.scalar ⟨k * b, uintBytes u⟩),
+         .init (.aggregate 0
+           [.scalar ⟨wrapVal (uintWidth u) (a + k * b), uintBytes u⟩,
+            .scalar ⟨1, 1⟩])])) :=
+    evalStmt_assign_local_step _ 5 _ _ _ _ _ _ hAdd trivial rfl
+  constructor
+  · rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2,
+        hMid 1, runMirSteps_step_tau hStep8]
+    rfl
+  · rw [runMirCall, initExecState, runMirSteps_step_tau hStep1, runMirSteps_step_tau hStep2,
+        hMid 2, runMirSteps_step_tau hStep8]
     cases strat <;> rfl
+
+/-- Exact evaluation of `mkCheckedAddScaledBody u k strat.toUnwindAction` when
+`2^w ≤ a + k * b` (deterministic trap). -/
+theorem runMirCall_checked_add_scaled_trap (u : UintTy) (k : Nat) (strat : PanicStrategy)
+    (a b : Nat) (hOv : modPow2 (uintWidth u) ≤ a + k * b) :
+    runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) 13 (uintArgs2 u a b) =
+      .halted strat.toTrapOutcome := by
+  cases hMulB : Nat.ble (modPow2 (uintWidth u)) (k * b) with
+  | true =>
+    exact runMirSteps_halted_mono _ 3 10 _ _
+      (runMirCall_checked_add_scaled_inner_mul_trap_pinned u k strat a b
+        (Nat.le_of_ble_eq_true hMulB)).2
+  | false =>
+    exact runMirSteps_halted_mono _ 9 4 _ _
+      (runMirCall_checked_add_scaled_outer_add_trap_pinned u k strat a b
+        (nat_lt_of_ble_false hMulB) hOv).2
 
 /-! ## 4. Unconditional Forward Refinement (`unchecked ⊑ checked`) & Necessary/Sufficient Reverse (`checked ⊑ unchecked`) -/
 
@@ -2221,6 +2294,22 @@ theorem unchecked_add_scaled_refines_to_checked (u : UintTy) (k : Nat)
     have hEq := mirCallTree_toPartial_equiv_of_same_halted hC hU
     rw [hU, hC]
     exact ⟨rfl, hEq.1⟩
+
+/-- Coinductive `WeakRef` corollary for unconditional forward `unchecked_add_scaled ⊑ checked_add_scaled`. -/
+theorem unchecked_add_scaled_weakRef_to_checked (u : UintTy) (k : Nat)
+    (strat : PanicStrategy) (a b : Nat) :
+    WeakRef
+      (mirCallTree (mkCheckedAddScaledBody u k strat.toUnwindAction) (uintArgs2 u a b))
+      (mirCallTree (mkUncheckedAddScaledBody u k) (uintArgs2 u a b)) := by
+  cases hB : Nat.ble (modPow2 (uintWidth u)) (a + k * b) with
+  | true =>
+    exact mirCallTree_weakRef_refines_ub
+      (runMirCall_unchecked_add_scaled_ub u k a b (Nat.le_of_ble_eq_true hB))
+  | false =>
+    have hNoOv : a + k * b < modPow2 (uintWidth u) := nat_lt_of_ble_false hB
+    exact (mirCallTree_weakRef_equiv_of_same_halted
+      (runMirCall_checked_add_scaled_ok u k strat a b hNoOv)
+      (runMirCall_unchecked_add_scaled_ok u k a b hNoOv)).1
 
 /-- **Necessary & sufficient reverse refinement (`checked_add ⊑ unchecked_add`)**:
 Eliminating the overflow check is panic-preserving iff `a + b < 2^w`. -/
@@ -2860,8 +2949,55 @@ theorem checked_add_scaled_toPartial_refines_unchecked_iff (u : UintTy) (k : Nat
     (fun h => ⟨_, runMirCall_checked_add_scaled_trap u k strat a b (Nat.not_lt.mp h),
                   runMirCall_unchecked_add_scaled_ub u k a b (Nat.not_lt.mp h)⟩)
 
-/-- Coinductive `WeakRef` tree-level reverse `iff` for `add`, `in-range sub`, `mul`, and
-composite `add_scaled`. -/
+/-- Coinductive `WeakRef` tree-level reverse `iff` for `add` (no range hypotheses needed). -/
+theorem checked_add_weakRef_refines_unchecked_iff (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) :
+    WeakRef (mirCallTree (mkUncheckedArithBody u .add) (uintArgs2 u a b))
+        (mirCallTree (mkCheckedArithBody u .add strat.toUnwindAction) (uintArgs2 u a b))
+      ↔ a + b < modPow2 (uintWidth u) :=
+  weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_add_ok u strat a b h, runMirCall_unchecked_add_ok u a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_add_trap u strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_add_ub u a b (Nat.not_lt.mp h)⟩)
+
+/-- Coinductive `WeakRef` tree-level reverse `iff` for in-range `sub` (`↔ b ≤ a`). -/
+theorem checked_sub_weakRef_refines_unchecked_iff (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    WeakRef (mirCallTree (mkUncheckedArithBody u .sub) (uintArgs2 u a b))
+        (mirCallTree (mkCheckedArithBody u .sub strat.toUnwindAction) (uintArgs2 u a b))
+      ↔ b ≤ a :=
+  weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (le_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_sub_ok u strat a b ha hb h,
+                  runMirCall_unchecked_sub_ok u a b ha h⟩)
+    (fun h => ⟨_, runMirCall_checked_sub_trap u strat a b ha hb (Nat.not_le.mp h),
+                  runMirCall_unchecked_sub_ub u a b (Nat.not_le.mp h)⟩)
+
+/-- Coinductive `WeakRef` tree-level reverse `iff` for `mul` (no range hypotheses needed). -/
+theorem checked_mul_weakRef_refines_unchecked_iff (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) :
+    WeakRef (mirCallTree (mkUncheckedArithBody u .mul) (uintArgs2 u a b))
+        (mirCallTree (mkCheckedArithBody u .mul strat.toUnwindAction) (uintArgs2 u a b))
+      ↔ a * b < modPow2 (uintWidth u) :=
+  weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_mul_ok u strat a b h, runMirCall_unchecked_mul_ok u a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_mul_trap u strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_mul_ub u a b (Nat.not_lt.mp h)⟩)
+
+/-- Coinductive `WeakRef` tree-level reverse `iff` for composite `add_scaled` (no range
+hypotheses needed). -/
+theorem checked_add_scaled_weakRef_refines_unchecked_iff (u : UintTy) (k : Nat)
+    (strat : PanicStrategy) (a b : Nat) :
+    WeakRef (mirCallTree (mkUncheckedAddScaledBody u k) (uintArgs2 u a b))
+        (mirCallTree (mkCheckedAddScaledBody u k strat.toUnwindAction) (uintArgs2 u a b))
+      ↔ a + k * b < modPow2 (uintWidth u) :=
+  weakRef_reverse_iff_of_dichotomy (fC := 13) (fU := 5) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_add_scaled_ok u k strat a b h,
+                  runMirCall_unchecked_add_scaled_ok u k a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_add_scaled_trap u k strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_add_scaled_ub u k a b (Nat.not_lt.mp h)⟩)
+
+/-- Bundled coinductive `WeakRef` tree-level reverse `iff` for `add`, `in-range sub`, `mul`,
+and composite `add_scaled`. -/
 theorem checked_toWeakRef_refines_unchecked_iff (u : UintTy) (strat : PanicStrategy)
     (a b k : Nat) (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
     (WeakRef (mirCallTree (mkUncheckedArithBody u .add) (uintArgs2 u a b))
@@ -2876,24 +3012,161 @@ theorem checked_toWeakRef_refines_unchecked_iff (u : UintTy) (strat : PanicStrat
     (WeakRef (mirCallTree (mkUncheckedAddScaledBody u k) (uintArgs2 u a b))
         (mirCallTree (mkCheckedAddScaledBody u k strat.toUnwindAction) (uintArgs2 u a b))
       ↔ a + k * b < modPow2 (uintWidth u)) :=
-  ⟨weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (lt_dec _ _)
-    (fun h => ⟨_, runMirCall_checked_add_ok u strat a b h, runMirCall_unchecked_add_ok u a b h⟩)
-    (fun h => ⟨_, runMirCall_checked_add_trap u strat a b (Nat.not_lt.mp h),
-                  runMirCall_unchecked_add_ub u a b (Nat.not_lt.mp h)⟩),
-   weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (le_dec _ _)
-    (fun h => ⟨_, runMirCall_checked_sub_ok u strat a b ha hb h,
-                  runMirCall_unchecked_sub_ok u a b ha h⟩)
-    (fun h => ⟨_, runMirCall_checked_sub_trap u strat a b ha hb (Nat.not_le.mp h),
-                  runMirCall_unchecked_sub_ub u a b (Nat.not_le.mp h)⟩),
-   weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (lt_dec _ _)
-    (fun h => ⟨_, runMirCall_checked_mul_ok u strat a b h, runMirCall_unchecked_mul_ok u a b h⟩)
-    (fun h => ⟨_, runMirCall_checked_mul_trap u strat a b (Nat.not_lt.mp h),
-                  runMirCall_unchecked_mul_ub u a b (Nat.not_lt.mp h)⟩),
-   weakRef_reverse_iff_of_dichotomy (fC := 13) (fU := 5) (lt_dec _ _)
-    (fun h => ⟨_, runMirCall_checked_add_scaled_ok u k strat a b h,
-                  runMirCall_unchecked_add_scaled_ok u k a b h⟩)
-    (fun h => ⟨_, runMirCall_checked_add_scaled_trap u k strat a b (Nat.not_lt.mp h),
-                  runMirCall_unchecked_add_scaled_ub u k a b (Nat.not_lt.mp h)⟩)⟩
+  ⟨checked_add_weakRef_refines_unchecked_iff u strat a b,
+   checked_sub_weakRef_refines_unchecked_iff u strat a b ha hb,
+   checked_mul_weakRef_refines_unchecked_iff u strat a b,
+   checked_add_scaled_weakRef_refines_unchecked_iff u k strat a b⟩
+
+/-! ## 5.3 Symmetric Incomparability of Checked vs. Wrapping Arithmetic on Overflow
+
+Unlike `unchecked` (which is **asymmetrically** refined by `checked` unconditionally because
+`.ub` is top while `.trap` is defined), `wrapping` returns a defined modular scalar on overflow
+whereas `checked` traps. Consequently, **neither** direction (`checked ⊑ wrapping` nor
+`wrapping ⊑ checked`) holds on overflowing/underflowing inputs; both directions hold *iff*
+no overflow/underflow occurs, at both the classifier level and Layer 1A `ITree.toPartial`. -/
+
+private theorem checked_wrapping_iff_of_dichotomy {bC bW : CapturedMir} {fC fW : Nat}
+    {args : List Value} {strat : PanicStrategy} {P : Prop} (hDec : P ∨ ¬ P)
+    (hYes : P → ∃ o, runMirCall bC fC args = .halted o ∧ runMirCall bW fW args = .halted o)
+    (hNo : ¬ P → ∃ v m, runMirCall bC fC args = .halted strat.toTrapOutcome ∧
+                        runMirCall bW fW args = .halted (.normal (v, m))) :
+    (MirOutcomeRefines
+        (classifyMirExecState strat (runMirCall bC fC args))
+        (classifyMirExecState strat (runMirCall bW fW args)) ↔ P) ∧
+    (MirOutcomeRefines
+        (classifyMirExecState strat (runMirCall bW fW args))
+        (classifyMirExecState strat (runMirCall bC fC args)) ↔ P) ∧
+    ((mirCallTree bW args).toPartial ≤ (mirCallTree bC args).toPartial ↔ P) ∧
+    ((mirCallTree bC args).toPartial ≤ (mirCallTree bW args).toPartial ↔ P) := by
+  have hTrapNeNormal : ∀ (v : Value) (m : Memory), strat.toTrapOutcome ≠ .normal (v, m) := by
+    intro v m hEq
+    cases strat <;> nomatch hEq
+  refine ⟨⟨fun hRef => ?_, fun hp => ?_⟩, ⟨fun hRef => ?_, fun hp => ?_⟩,
+          ⟨fun hLe => ?_, fun hp => ?_⟩, ⟨fun hLe => ?_, fun hp => ?_⟩⟩
+  · cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨_, _, hC, hW⟩ := hNo hnp
+      rw [hC, hW, classify_trapOutcome_eq strat] at hRef
+      exact False.elim hRef
+  · have ⟨_, hC, hW⟩ := hYes hp
+    rw [hC, hW]
+    exact mirOutcomeRefines_refl _
+  · cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨_, _, hC, hW⟩ := hNo hnp
+      rw [hC, hW, classify_trapOutcome_eq strat] at hRef
+      exact False.elim hRef
+  · have ⟨_, hC, hW⟩ := hYes hp
+    rw [hC, hW]
+    exact mirOutcomeRefines_refl _
+  · cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨v, m, hC, hW⟩ := hNo hnp
+      have ⟨uC, hTauC, hObsC⟩ := runMirSteps_halted_to_tauStar _ fC _ _ hC
+      have ⟨uW, hTauW, hObsW⟩ := runMirSteps_halted_to_tauStar _ fW _ _ hW
+      exact False.elim (not_toPartial_le_of_distinct_ret hTauW hObsW hTauC hObsC
+        (fun hEq => hTrapNeNormal v m hEq.symm) hLe)
+  · have ⟨_, hC, hW⟩ := hYes hp
+    exact (mirCallTree_toPartial_equiv_of_same_halted hW hC).1
+  · cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨v, m, hC, hW⟩ := hNo hnp
+      have ⟨uC, hTauC, hObsC⟩ := runMirSteps_halted_to_tauStar _ fC _ _ hC
+      have ⟨uW, hTauW, hObsW⟩ := runMirSteps_halted_to_tauStar _ fW _ _ hW
+      exact False.elim (not_toPartial_le_of_distinct_ret hTauC hObsC hTauW hObsW
+        (hTrapNeNormal v m) hLe)
+  · have ⟨_, hC, hW⟩ := hYes hp
+    exact (mirCallTree_toPartial_equiv_of_same_halted hC hW).1
+
+/-- Symmetric 4-way `iff` for checked vs. wrapping addition (`↔ a + b < 2^w`): unlike
+`unchecked ⊑ checked`, neither `checked ⊑ wrapping` nor `wrapping ⊑ checked` holds on overflow. -/
+theorem checked_add_wrapping_refines_iff (u : UintTy) (strat : PanicStrategy) (a b : Nat) :
+    (MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .add strat.toUnwindAction) 6 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkWrappingArithBody u .add) 2 (uintArgs2 u a b)))
+      ↔ a + b < modPow2 (uintWidth u)) ∧
+    (MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkWrappingArithBody u .add) 2 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .add strat.toUnwindAction) 6 (uintArgs2 u a b)))
+      ↔ a + b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkWrappingArithBody u .add) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .add strat.toUnwindAction) (uintArgs2 u a b)).toPartial
+      ↔ a + b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkCheckedArithBody u .add strat.toUnwindAction) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkWrappingArithBody u .add) (uintArgs2 u a b)).toPartial
+      ↔ a + b < modPow2 (uintWidth u)) :=
+  checked_wrapping_iff_of_dichotomy (fC := 6) (fW := 2) (lt_dec _ _)
+    (fun h => by
+      have hW := runMirCall_wrapping_add u a b
+      rw [wrapVal_of_lt h] at hW
+      exact ⟨_, runMirCall_checked_add_ok u strat a b h, hW⟩)
+    (fun h => ⟨_, _, runMirCall_checked_add_trap u strat a b (Nat.not_lt.mp h),
+                     runMirCall_wrapping_add u a b⟩)
+
+/-- Symmetric 4-way `iff` for checked vs. wrapping in-range subtraction (`↔ b ≤ a`). -/
+theorem checked_sub_wrapping_refines_iff (u : UintTy) (strat : PanicStrategy) (a b : Nat)
+    (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    (MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .sub strat.toUnwindAction) 6 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkWrappingArithBody u .sub) 2 (uintArgs2 u a b)))
+      ↔ b ≤ a) ∧
+    (MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkWrappingArithBody u .sub) 2 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .sub strat.toUnwindAction) 6 (uintArgs2 u a b)))
+      ↔ b ≤ a) ∧
+    ((mirCallTree (mkWrappingArithBody u .sub) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .sub strat.toUnwindAction) (uintArgs2 u a b)).toPartial
+      ↔ b ≤ a) ∧
+    ((mirCallTree (mkCheckedArithBody u .sub strat.toUnwindAction) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkWrappingArithBody u .sub) (uintArgs2 u a b)).toPartial
+      ↔ b ≤ a) :=
+  checked_wrapping_iff_of_dichotomy (fC := 6) (fW := 2) (le_dec _ _)
+    (fun h => by
+      have hW := runMirCall_wrapping_sub u a b ha hb
+      rw [← wrapVal_sub_of_le h ha, wrapVal_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le a b) ha)] at hW
+      exact ⟨_, runMirCall_checked_sub_ok u strat a b ha hb h, hW⟩)
+    (fun h => ⟨_, _, runMirCall_checked_sub_trap u strat a b ha hb (Nat.not_le.mp h),
+                     runMirCall_wrapping_sub u a b ha hb⟩)
+
+/-- Symmetric 4-way `iff` for checked vs. wrapping multiplication (`↔ a * b < 2^w`). -/
+theorem checked_mul_wrapping_refines_iff (u : UintTy) (strat : PanicStrategy) (a b : Nat) :
+    (MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .mul strat.toUnwindAction) 6 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkWrappingArithBody u .mul) 2 (uintArgs2 u a b)))
+      ↔ a * b < modPow2 (uintWidth u)) ∧
+    (MirOutcomeRefines
+        (classifyMirExecState strat
+          (runMirCall (mkWrappingArithBody u .mul) 2 (uintArgs2 u a b)))
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .mul strat.toUnwindAction) 6 (uintArgs2 u a b)))
+      ↔ a * b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkWrappingArithBody u .mul) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkCheckedArithBody u .mul strat.toUnwindAction) (uintArgs2 u a b)).toPartial
+      ↔ a * b < modPow2 (uintWidth u)) ∧
+    ((mirCallTree (mkCheckedArithBody u .mul strat.toUnwindAction) (uintArgs2 u a b)).toPartial ≤
+        (mirCallTree (mkWrappingArithBody u .mul) (uintArgs2 u a b)).toPartial
+      ↔ a * b < modPow2 (uintWidth u)) :=
+  checked_wrapping_iff_of_dichotomy (fC := 6) (fW := 2) (lt_dec _ _)
+    (fun h => by
+      have hW := runMirCall_wrapping_mul u a b
+      rw [wrapVal_of_lt h] at hW
+      exact ⟨_, runMirCall_checked_mul_ok u strat a b h, hW⟩)
+    (fun h => ⟨_, _, runMirCall_checked_mul_trap u strat a b (Nat.not_lt.mp h),
+                     runMirCall_wrapping_mul u a b⟩)
 
 /-! ## 6. Explicit Non-Vacuous Negative Soundness Theorems (17 Theorems) -/
 
@@ -3210,10 +3483,9 @@ theorem checked_add_scaled_inner_mul_overflow_not_refines_unchecked (strat : Pan
     exact trap_not_refines_ub
   · exact not_toPartial_le_of_faultNow_ret (runMirCall_ub_faultNow hU) hTauC hObsC
 
-set_option maxHeartbeats 4000000 in
-/-- Exact failure-site pinning for composite `add_scaled` (strengthening #15 and #17, whose
-generic trap/UB lemmas do not by themselves identify WHICH check fires). Fuel acts as a
-step counter, so the exact step at which each run settles identifies the failing statement:
+/-- Exact failure-site pinning for composite `add_scaled` (instantiating the parametric
+site-pinning theorems on #15 and #17 with default heartbeats, zero brute-force `rfl`
+explosion):
 - inner-mul site (`1 + 4 * 70`): checked is still running after 2 steps and traps at step 3
   (`bb0`'s assert); unchecked is still running after 1 step and faults `.ub` at step 2
   (`bb0`'s `MulUnchecked`);
@@ -3233,7 +3505,15 @@ theorem add_scaled_failure_sites_pinned (strat : PanicStrategy) :
       .halted strat.toTrapOutcome ∧
     runMirCall (mkUncheckedAddScaledBody .u8 4) 2 (uintArgs2 .u8 200 20) = .faulted .outOfFuel ∧
     runMirCall (mkUncheckedAddScaledBody .u8 4) 3 (uintArgs2 .u8 200 20) = .faulted .ub := by
-  cases strat <;> refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rfl
+  have hInnerC := runMirCall_checked_add_scaled_inner_mul_trap_pinned .u8 4 strat 1 70
+    (Nat.le_of_ble_eq_true rfl)
+  have hInnerU := runMirCall_unchecked_add_scaled_inner_mul_ub_pinned .u8 4 1 70
+    (Nat.le_of_ble_eq_true rfl)
+  have hOuterC := runMirCall_checked_add_scaled_outer_add_trap_pinned .u8 4 strat 200 20
+    (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)
+  have hOuterU := runMirCall_unchecked_add_scaled_outer_add_ub_pinned .u8 4 200 20
+    (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)
+  exact ⟨hInnerC.1, hInnerC.2, hInnerU.1, hInnerU.2, hOuterC.1, hOuterC.2, hOuterU.1, hOuterU.2⟩
 
 /-- Coinductive `WeakRef` negative soundness corollaries (overflowing add & strategy separation). -/
 theorem checked_add_overflow_not_weakRef_corollaries (strat : PanicStrategy) :
