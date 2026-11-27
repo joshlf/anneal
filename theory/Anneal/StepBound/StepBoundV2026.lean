@@ -130,6 +130,34 @@ theorem reachesDoneWithinV2026_of_step {body : CapturedMir}
     ReachesDoneWithinV2026 body post (b + 1) s :=
   Or.inr ⟨s', hStep, hRest⟩
 
+/-- Direct `.ret out` base introduction on unmodified `stepMirFn`. -/
+theorem reachesDoneWithinV2026_of_stepMirFn_ret {body : CapturedMir}
+    {post : MirOutcome → Prop} {s : MachineState} {out : MirOutcome}
+    (hRet : stepMirFn body s = .ret out) (hPost : post out) :
+    ReachesDoneWithinV2026 body post 1 s :=
+  reachesDoneWithinV2026_of_done (v2026Step_done_iff.mpr (Or.inl hRet)) hPost
+
+/-- Direct silent `.tau (.running s')` step introduction on unmodified
+`stepMirFn`. -/
+theorem reachesDoneWithinV2026_of_stepMirFn_tau {body : CapturedMir}
+    {post : MirOutcome → Prop} {b : Nat} {s s' : MachineState}
+    (hTau : stepMirFn body s = .tau (.running s'))
+    (hRest : ReachesDoneWithinV2026 body post b s') :
+    ReachesDoneWithinV2026 body post (b + 1) s :=
+  reachesDoneWithinV2026_of_step (v2026Step_step_iff.mpr (Or.inl hTau)) hRest
+
+/-- Direct observable `MirStepNode.emitStep obs s'` step introduction on
+unmodified `stepMirFn`. -/
+theorem reachesDoneWithinV2026_of_stepMirFn_emit {body : CapturedMir}
+    {post : MirOutcome → Prop} {b : Nat} {s s' : MachineState} {obs : MirObs}
+    (hEmit : stepMirFn body s = MirStepNode.emitStep obs s')
+    (hRest : ReachesDoneWithinV2026 body post b s') :
+    ReachesDoneWithinV2026 body post (b + 1) s := by
+  refine reachesDoneWithinV2026_of_step ?_ hRest
+  unfold v2026Step
+  rw [hEmit]
+  exact ofV2026MirStepNode_emitStep obs s'
+
 /-- Monotonicity of `ReachesDoneWithinV2026` in the step budget (`b₁ ≤ b₂`). -/
 theorem ReachesDoneWithinV2026.mono {body : CapturedMir}
     {post : MirOutcome → Prop} :
@@ -216,6 +244,50 @@ theorem reachesDoneWithinV2026_iff_execStepOutcome {body : CapturedMir}
       | fault _ =>
         rw [hEv] at h
         exact False.elim h
+
+/-- Exact equivalence between `ReachesDoneWithinV2026` and `execStateV2026`
+(matches `#4400` `reachesDoneWithinV2_iff_execStateV2`). -/
+theorem reachesDoneWithinV2026_iff_execStateV2026 {body : CapturedMir}
+    {post : MirOutcome → Prop} {bound : Nat} {s : MachineState} :
+    ReachesDoneWithinV2026 body post bound s ↔
+      execStateV2026 body bound s post :=
+  reachesDoneWithinV2026_iff_execStepOutcome
+
+/-- Exact equivalence between `ReachesDoneWithinV2026` and `wpStateV2026`. -/
+theorem reachesDoneWithinV2026_iff_wpStateV2026 {body : CapturedMir}
+    {post : MirOutcome → Prop} {bound : Nat} {s : MachineState} :
+    ReachesDoneWithinV2026 body post bound s ↔
+      wpStateV2026 body bound s post :=
+  Iff.trans reachesDoneWithinV2026_iff_execStepOutcome
+    wpOutcomeV2026_iff_execOutcomeV2026.symm
+
+/-- Exact equivalence between `ExecWithinStepsV2026` and `execProgV2026`
+(matches `#4400` `execWithinStepsV2_iff_execProgV2`). -/
+theorem execWithinStepsV2026_iff_execProgV2026 {body : CapturedMir}
+    {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop} {bound : Nat} :
+    ExecWithinStepsV2026 body args callees post bound ↔
+      execProgV2026 body bound args callees post :=
+  reachesDoneWithinV2026_iff_execStepOutcome
+
+/-- Exact equivalence between `ExecWithinStepsV2026` and `wpProgV2026`. -/
+theorem execWithinStepsV2026_iff_wpProgV2026 {body : CapturedMir}
+    {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop} {bound : Nat} :
+    ExecWithinStepsV2026 body args callees post bound ↔
+      wpProgV2026 body bound args callees post :=
+  reachesDoneWithinV2026_iff_wpStateV2026
+
+/-- Whole-function `ExecWithinStepsV2026` rules out `DivergesV2026` at entry
+(matches `#4400` `not_divergesV2_of_execWithinStepsV2`). -/
+theorem not_divergesV2026_of_execWithinStepsV2026 {body : CapturedMir}
+    {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop} {bound : Nat}
+    (h : ExecWithinStepsV2026 body args callees post bound) :
+    ¬ DivergesV2026 body (initMachineStateWithCallees body args callees) :=
+  fun hDiv =>
+    not_execStepOutcome_of_divergesV2026 hDiv post (fun _ => False) bound
+      (reachesDoneWithinV2026_iff_execStepOutcome.mp h)
 
 /-- Adequacy: `ReachesDoneWithinV2026` implies unmodified
 `Anneal.MirFuelFree.MirWpConverges`. -/
@@ -425,6 +497,17 @@ theorem reachesDoneWithinV2026_of_stepsTo {body : CapturedMir}
   | step hs _ ih =>
     rw [Nat.succ_add]
     exact reachesDoneWithinV2026_of_step hs (ih hRest)
+
+/-- Prepending a `StepsToV2026` trace onto `execStateV2026` (matches `#4400`
+`execStateV2_of_stepsTo`). -/
+theorem execStateV2026_of_stepsTo {body : CapturedMir}
+    {post : MirOutcome → Prop} {k₁ k₂ : Nat} {s₀ s₁ : MachineState}
+    (hPrefix : StepsToV2026 body k₁ s₀ s₁)
+    (hRest : execStateV2026 body k₂ s₁ post) :
+    execStateV2026 body (k₁ + k₂) s₀ post :=
+  reachesDoneWithinV2026_iff_execStepOutcome.mp
+    (reachesDoneWithinV2026_of_stepsTo hPrefix
+      (reachesDoneWithinV2026_iff_execStepOutcome.mpr hRest))
 
 /-- Upper-bounded `V2026_06_01` multi-step reachability (`∃ k ≤ bound`). -/
 def BoundedReachV2026 (body : CapturedMir) (stopPred : MachineState → Prop)
@@ -838,6 +921,27 @@ theorem v2026_loop_nat_bounded {body : CapturedMir} {post : MirOutcome → Prop}
   fun s hInv =>
     v2026_loop_nat_cap_aux Inv rank bodyBound exitBound hStep (rank s) s hInv
       (Nat.le_refl (rank s))
+
+/-- Strict rank-split `Nat`-measure loop rule (matches `#4400`
+`v2_loop_rank_const_bound`): exits when `rank s = 0` and takes `≤ bodyBound`
+steps decreasing `rank s' < rank s` whenever `0 < rank s`. -/
+theorem v2026_loop_rank_const_bound {body : CapturedMir}
+    {post : MirOutcome → Prop}
+    (Inv : MachineState → Prop) (rank : MachineState → Nat)
+    (bodyBound exitBound : Nat)
+    (hExit : ∀ s, Inv s → rank s = 0 → ReachesDoneWithinV2026 body post exitBound s)
+    (hStep : ∀ s, Inv s → 0 < rank s →
+      ReachesDoneWithinV2026 body post exitBound s ∨
+      BoundedReachV2026 body (fun s' => Inv s' ∧ rank s' < rank s) bodyBound s) :
+    ∀ s : MachineState, Inv s →
+      ReachesDoneWithinV2026 body post (rank s * bodyBound + exitBound) s := by
+  refine v2026_loop_nat_bounded Inv rank bodyBound exitBound (fun s hInv => ?_)
+  cases hR : rank s with
+  | zero => exact Or.inl (hExit s hInv hR)
+  | succ r =>
+    have hPos : 0 < rank s := by rw [hR]; exact Nat.succ_pos r
+    rw [← hR]
+    exact hStep s hInv hPos
 
 private theorem byte_credit_step_le (k m m' K C : Nat)
     (hm : m' < m) (hk : k ≤ K * (m - m')) :
@@ -1692,6 +1796,68 @@ theorem verifyMirSafe_of_reactiveStepContractV2026 (c : Claim)
       (forall_execWlpStateV2026_of_reactiveStepContractV2026
         (hContract args hPre).1 (hContract args hPre).2 fuel))
 
+/-- Per-input-dependent stateless partial-correctness `VerificationResult`
+(`mirSafePost`) from `ReactiveStepContractV2026`: allows `inv`, `yieldPred`,
+and `frameBound` to depend on `args` (`{propext, Quot.sound}` only). -/
+theorem verifyMirSafe_of_reactiveStepContractV2026_dep (c : Claim)
+    (hContract : ∀ args : List Value, c.pre args →
+      ∃ (inv yieldPred : MachineState → Prop) (frameBound : Nat),
+        ReactiveStepContractV2026 c.body inv yieldPred
+          (mirSafePost (fun retVal _ => c.post args retVal)) frameBound ∧
+        inv (initMachineStateWithCallees c.body args c.callees)) :
+    VerificationResult c :=
+  verifyMirSafe_of_forall_wlpProgStrictV2026 c (fun args hPre fuel => by
+    let ⟨_, _, _, hC, hInv⟩ := hContract args hPre
+    exact wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
+      (forall_execWlpStateV2026_of_reactiveStepContractV2026 hC hInv fuel))
+
+/-- Per-input-dependent panic-forbidding stateless partial-correctness
+`VerificationResult` (`mirNormalPost`) from `ReactiveStepContractV2026`
+(`{propext, Quot.sound}` only). -/
+theorem verifyMirNoPanic_of_reactiveStepContractV2026 (c : Claim)
+    (hContract : ∀ args : List Value, c.pre args →
+      ∃ (inv yieldPred : MachineState → Prop) (frameBound : Nat),
+        ReactiveStepContractV2026 c.body inv yieldPred
+          (mirNormalPost (fun retVal _ => c.post args retVal)) frameBound ∧
+        inv (initMachineStateWithCallees c.body args c.callees)) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_forall_wlpProgStrictV2026 c (fun args hPre fuel => by
+    let ⟨_, _, _, hC, hInv⟩ := hContract args hPre
+    exact wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
+      (forall_execWlpStateV2026_of_reactiveStepContractV2026 hC hInv fuel))
+
+/-- Per-input-dependent stateful partial-correctness
+`StatefulVerificationResult` (`mirSafePost`) from `ReactiveStepContractV2026`
+(`{propext, Quot.sound}` only). -/
+theorem verifyStatefulMirSafe_of_reactiveStepContractV2026 (c : StatefulClaim)
+    (hContract : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      ∃ (inv yieldPred : MachineState → Prop) (frameBound : Nat),
+        ReactiveStepContractV2026 c.body inv yieldPred
+          (mirSafePost (c.post args mem)) frameBound ∧
+        inv (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees)) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirSafe_of_forall_wlpStateV2026 c (fun args mem hPre fuel => by
+    let ⟨_, _, _, hC, hInv⟩ := hContract args mem hPre
+    exact wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
+      (forall_execWlpStateV2026_of_reactiveStepContractV2026 hC hInv fuel))
+
+/-- Per-input-dependent panic-forbidding stateful partial-correctness
+`StatefulVerificationResult` (`mirNormalPost`) from `ReactiveStepContractV2026`
+(`{propext, Quot.sound}` only). -/
+theorem verifyStatefulMirNoPanic_of_reactiveStepContractV2026 (c : StatefulClaim)
+    (hContract : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      ∃ (inv yieldPred : MachineState → Prop) (frameBound : Nat),
+        ReactiveStepContractV2026 c.body inv yieldPred
+          (mirNormalPost (c.post args mem)) frameBound ∧
+        inv (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees)) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirNoPanic_of_forall_wlpStateV2026 c (fun args mem hPre fuel => by
+    let ⟨_, _, _, hC, hInv⟩ := hContract args mem hPre
+    exact wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
+      (forall_execWlpStateV2026_of_reactiveStepContractV2026 hC hInv fuel))
+
 /-! ## Part IV: Tight-Budget & Non-Vacuity Refutation Lemmas -/
 
 /-- Divergence (`DivergesV2026 body s`) refutes `ReachesDoneWithinV2026` at
@@ -2097,5 +2263,171 @@ theorem canary_stepBoundV2026_reactive_partialCorrectness :
       StepsToV2026.single hStep, rfl, trivial⟩
   have hPC := partialCorrectness_of_reactiveStepContractV2026 hC rfl
   exact ⟨hC, hPC.1, fun tr out hR => hPC.2 tr out hR⟩
+
+/-- Concrete canary exercising:
+1. `v2026_loop_byte_credit_strict` with multi-unit credit consumption
+   (`m = 3 -> 1` in `k = 2` steps and `m = 1 -> 0` in `k = 1` step) on
+   `branchingTracePipelineBody`.
+2. `v2026_steps_of_worklist_terminates` lifting an admissible 2-tier worklist
+   tower `[1, 0]` onto concrete `branchingTracePipelineBody` states.
+3. Per-`(args, mem)`-dependent choice-free `StatefulVerificationResult` via
+   `verifyStatefulMirNoPanic_of_reactiveStepContractV2026` on
+   `canaryObsLoopMirBody` (whose `inv` depends on both `args` and `mem`). -/
+theorem canary_stepBoundV2026_byteCredit_worklist_and_statefulReactive :
+    let s0 := initMachineState branchingTracePipelineBody
+      [.scalar { bits := 9, sizeBytes := 4 }]
+    let okPost : MirOutcome → Prop :=
+      fun out => out = .normal
+        (.scalar { bits := 9, sizeBytes := 4 }, s0.memory)
+    execStateV2026 branchingTracePipelineBody (1 * 3 + 1) s0 okPost ∧
+    (∃ steps : Nat,
+      ReachesDoneWithinV2026 branchingTracePipelineBody okPost
+        (steps * 2 + 1) s0) ∧
+    StatefulVerificationResult
+      { body := canaryObsLoopMirBody
+        pre := fun args mem =>
+          (∃ b : Nat, args = [.scalar { bits := b, sizeBytes := 4 }]) ∧
+          mem.activeCallee = none
+        post := fun _ _ _ _ => False } := by
+  dsimp only
+  let s0 := initMachineState branchingTracePipelineBody
+    [.scalar { bits := 9, sizeBytes := 4 }]
+  let s1 := branchingTraceMidState 9 s0.memory
+  let s2 : MachineState :=
+    { frame :=
+        { blockIdx := 1
+          stmtIdx := 1
+          locals := [.init (.scalar { bits := 9, sizeBytes := 4 }), .uninit] }
+      memory := s0.memory }
+  let s3 : MachineState :=
+    { frame :=
+        { blockIdx := 2
+          stmtIdx := 0
+          locals := [.init (.scalar { bits := 9, sizeBytes := 4 }), .uninit] }
+      memory := s0.memory }
+  let okPost : MirOutcome → Prop :=
+    fun out => out = .normal
+      (.scalar { bits := 9, sizeBytes := 4 }, s0.memory)
+  have h01 : v2026Step branchingTracePipelineBody s0 = .step s1 := rfl
+  have h12 : v2026Step branchingTracePipelineBody s1 = .step s2 := rfl
+  have h23 : v2026Step branchingTracePipelineBody s2 = .step s3 := rfl
+  have h3d :
+      v2026Step branchingTracePipelineBody s3 =
+        .done (.normal (.scalar { bits := 9, sizeBytes := 4 }, s0.memory)) :=
+    rfl
+  let InvBC : Nat → MachineState → Prop
+    | 0, st => st = s3
+    | 1, st => st = s2
+    | 3, st => st = s0
+    | _, _ => False
+  have hBC : execStateV2026 branchingTracePipelineBody (1 * 3 + 1) s0 okPost := by
+    refine v2026_loop_byte_credit_strict InvBC 1 1
+      (fun st h0 => by
+        subst h0
+        exact reachesDoneWithinV2026_iff_execStepOutcome.mp
+          (reachesDoneWithinV2026_of_done (post := okPost) h3d rfl))
+      (fun m st hm hInv => ?_) 3 s0 rfl
+    cases m with
+    | zero => exact False.elim (Nat.not_lt_zero 0 hm)
+    | succ m1 =>
+      cases m1 with
+      | zero =>
+        subst hInv
+        exact ⟨0, 1, s3, Nat.zero_lt_one, Nat.le_refl 1, StepsToV2026.single h23, rfl⟩
+      | succ m2 =>
+        cases m2 with
+        | zero => exact False.elim hInv
+        | succ m3 =>
+          cases m3 with
+          | zero =>
+            subst hInv
+            exact ⟨1, 2, s2, Nat.lt_succ_of_lt (Nat.lt_succ_self 1), Nat.le_refl 2,
+              StepsToV2026.step h01 (StepsToV2026.single h12), rfl⟩
+          | succ _ => exact False.elim hInv
+  let pol : SpawnPolicy := towerLookupNext [1, 0] 1 0
+  have hPol : PolicyAdmissible pol := towerLookupNext_admissible [1, 0] 1 0 rfl
+  let w0 : WorklistPool :=
+    { fifoQueue := [RankedTask.mk 0 1 0]
+      stealDeque := []
+      nextTaskId := 1
+      completedCount := 0
+      stepCount := 0 }
+  let w1 : WorklistPool :=
+    { fifoQueue := []
+      stealDeque := [RankedTask.mk 1 0 0]
+      nextTaskId := 2
+      completedCount := 1
+      stepCount := 1 }
+  let w2 : WorklistPool :=
+    { fifoQueue := []
+      stealDeque := []
+      nextTaskId := 2
+      completedCount := 2
+      stepCount := 2 }
+  let simW : WorklistPool → MachineState → Prop :=
+    fun w st => (w = w0 ∧ st = s0) ∨ (w = w1 ∧ st = s2) ∨ (w = w2 ∧ st = s3)
+  have hWL :
+      ∃ steps : Nat,
+        ReachesDoneWithinV2026 branchingTracePipelineBody okPost
+          (steps * 2 + 1) s0 := by
+    refine v2026_steps_of_worklist_terminates pol hPol simW 2 1
+      (fun w st hEmp hSim => ?_) (fun w w' st hNe hSt hSim => ?_) w0 s0 (Or.inl ⟨rfl, rfl⟩)
+    · cases hSim with
+      | inl h0 => rw [h0.1] at hEmp; cases hEmp
+      | inr hRest =>
+        cases hRest with
+        | inl h1 => rw [h1.1] at hEmp; cases hEmp
+        | inr h2 =>
+          rw [h2.2]
+          exact reachesDoneWithinV2026_of_done (post := okPost) h3d rfl
+    · cases hSim with
+      | inl h0 =>
+        rw [h0.1] at hSt
+        have hEq : worklistStep pol w0 = .returned w1 := rfl
+        rw [hEq] at hSt
+        injection hSt with hW'
+        subst hW'
+        rw [h0.2]
+        exact BoundedReachV2026.of_exact (Nat.le_refl 2)
+          (StepsToV2026.step h01 (StepsToV2026.single h12)) (Or.inr (Or.inl ⟨rfl, rfl⟩))
+      | inr hRest =>
+        cases hRest with
+        | inl h1 =>
+          rw [h1.1] at hSt
+          have hEq : worklistStep pol w1 = .returned w2 := rfl
+          rw [hEq] at hSt
+          injection hSt with hW'
+          subst hW'
+          rw [h1.2]
+          exact BoundedReachV2026.of_exact (Nat.le_succ 1)
+            (StepsToV2026.single h23) (Or.inr (Or.inr ⟨rfl, rfl⟩))
+        | inr h2 =>
+          rw [h2.1] at hNe
+          cases hNe
+  have hStatefulReact :
+      StatefulVerificationResult
+        { body := canaryObsLoopMirBody
+          pre := fun args mem =>
+            (∃ b : Nat, args = [.scalar { bits := b, sizeBytes := 4 }]) ∧
+            mem.activeCallee = none
+          post := fun _ _ _ _ => False } := by
+    refine verifyStatefulMirNoPanic_of_reactiveStepContractV2026 _ (fun args mem hPre => ?_)
+    let ⟨⟨b, hArgs⟩, hAct⟩ := hPre
+    subst hArgs
+    cases mem with
+    | mk a1 a2 a3 a4 a5 a6 a7 activeCallee a9 a10 a11 a12 a13 a14 =>
+      dsimp only at hAct
+      subst hAct
+      let m0 : Memory :=
+        Memory.mk a1 a2 a3 a4 a5 a6 a7 none a9 a10 a11 a12 a13 a14
+      let sInit := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        canaryObsLoopMirBody [.scalar { bits := b, sizeBytes := 4 }] m0 []
+      refine ⟨fun st => st = sInit, fun _ => True, 1, ?_, rfl⟩
+      intro st hEq
+      subst hEq
+      have hStep : v2026Step canaryObsLoopMirBody sInit = .step sInit := rfl
+      exact Or.inr ⟨1, sInit, Nat.le_refl 1, Nat.le_refl 1,
+        StepsToV2026.single hStep, rfl, trivial⟩
+  exact ⟨hBC, hWL, hStatefulReact⟩
 
 end Anneal.StepBound

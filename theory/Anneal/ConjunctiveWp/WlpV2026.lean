@@ -1714,6 +1714,14 @@ theorem wlpProgV2026_iff_execWlpProgV2026 {body : CapturedMir} {fuel : Nat}
       execWlpProgV2026 body fuel args callees post :=
   wlpOutcomeV2026_iff_execWlpOutcomeV2026
 
+/-- Lift deterministic `execWlpProgV2026` into `wlpProgV2026`. -/
+theorem wlpProgV2026_of_execWlpProgV2026 {body : CapturedMir} {fuel : Nat}
+    {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop}
+    (h : execWlpProgV2026 body fuel args callees post) :
+    wlpProgV2026 body fuel args callees post :=
+  wlpProgV2026_iff_execWlpProgV2026.mpr h
+
 /-- Exact equivalence between `wlpProgStrictV2026` and
 `execWlpProgStrictV2026`. -/
 theorem wlpProgStrictV2026_iff_execWlpProgStrictV2026 {body : CapturedMir}
@@ -1722,6 +1730,22 @@ theorem wlpProgStrictV2026_iff_execWlpProgStrictV2026 {body : CapturedMir}
     wlpProgStrictV2026 body fuel args callees post ↔
       execWlpProgStrictV2026 body fuel args callees post :=
   wlpOutcomeV2026_iff_execWlpOutcomeV2026
+
+/-- Lift deterministic `execWlpProgStrictV2026` into `wlpProgStrictV2026`. -/
+theorem wlpProgStrictV2026_of_execWlpProgStrictV2026 {body : CapturedMir}
+    {fuel : Nat} {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop}
+    (h : execWlpProgStrictV2026 body fuel args callees post) :
+    wlpProgStrictV2026 body fuel args callees post :=
+  wlpProgStrictV2026_iff_execWlpProgStrictV2026.mpr h
+
+/-- Lift deterministic total `execOutcomeV2026` into `execWlpOutcomeV2026`. -/
+theorem execWlpOutcomeV2026_of_execOutcomeV2026 {body : CapturedMir}
+    {onDone : MirOutcome → Prop} {onFault : V2026StepFault → Prop}
+    {fuel : Nat} {s : MachineState}
+    (h : execOutcomeV2026 body onDone onFault fuel s) :
+    execWlpOutcomeV2026 body onDone onFault fuel s :=
+  execWlpStepPred_of_execStepPred h
 
 /-- Single-step introduction rule for `wlpOutcomeV2026`. -/
 theorem wlpOutcomeV2026_step_eq {body : CapturedMir}
@@ -1733,6 +1757,28 @@ theorem wlpOutcomeV2026_step_eq {body : CapturedMir}
   wlpOutcomeV2026_of_execWlpOutcomeV2026
     (execWlpStepPred_step hStep (wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp h))
 
+/-- Silent `.tau (.running s')` step introduction rule for `wlpOutcomeV2026`. -/
+theorem wlpOutcomeV2026_step_tau {body : CapturedMir}
+    {onDone : MirOutcome → Prop} {onFault : V2026StepFault → Prop}
+    {fuel : Nat} {s s' : MachineState}
+    (hStep : stepMirFn body s = .tau (.running s'))
+    (h : wlpOutcomeV2026 body onDone onFault fuel s') :
+    wlpOutcomeV2026 body onDone onFault (fuel + 1) s :=
+  wlpOutcomeV2026_step_eq (v2026Step_step_iff.mpr (Or.inl hStep)) h
+
+/-- Observable `MirStepNode.emitStep obs s'` step introduction rule for
+`wlpOutcomeV2026`. -/
+theorem wlpOutcomeV2026_step_emit {body : CapturedMir}
+    {onDone : MirOutcome → Prop} {onFault : V2026StepFault → Prop}
+    {fuel : Nat} {s s' : MachineState} {obs : MirObs}
+    (hStep : stepMirFn body s = MirStepNode.emitStep obs s')
+    (h : wlpOutcomeV2026 body onDone onFault fuel s') :
+    wlpOutcomeV2026 body onDone onFault (fuel + 1) s := by
+  refine wlpOutcomeV2026_step_eq ?_ h
+  unfold v2026Step
+  rw [hStep]
+  exact ofV2026MirStepNode_emitStep obs s'
+
 /-- Terminal `.done` introduction rule for `wlpOutcomeV2026`. -/
 theorem wlpOutcomeV2026_done_eq {body : CapturedMir}
     {onDone : MirOutcome → Prop} {onFault : V2026StepFault → Prop}
@@ -1743,6 +1789,14 @@ theorem wlpOutcomeV2026_done_eq {body : CapturedMir}
   dsimp only [execWlpOutcomeV2026, execWlpStepOutcome]
   rw [execWlpStepPred_succ_iff, hStep]
   exact h
+
+/-- Direct `.ret out` terminal introduction rule for `wlpOutcomeV2026`. -/
+theorem wlpOutcomeV2026_done_ret {body : CapturedMir}
+    {onDone : MirOutcome → Prop} {onFault : V2026StepFault → Prop}
+    {fuel : Nat} {s : MachineState} {out : MirOutcome}
+    (hStep : stepMirFn body s = .ret out) (h : onDone out) :
+    wlpOutcomeV2026 body onDone onFault (fuel + 1) s :=
+  wlpOutcomeV2026_done_eq (v2026Step_done_iff.mpr (Or.inl hStep)) h
 
 /-- Rule of consequence for `wlpOutcomeV2026`. -/
 theorem wlpOutcomeV2026_mono {body : CapturedMir}
@@ -2519,6 +2573,216 @@ theorem not_reachesRet_mirTree_of_divergesV2026 {body : CapturedMir}
     (post := fun _ => False) (forall_execWlpStateV2026_of_divergesV2026 hDiv _)
     tr out
 
+/-! ### Exact Fuel-Free Partial-Correctness Bridge to `ParametricCore.wlpOutcome` -/
+
+/-- Exact bidirectional equivalence between fuel-free
+`ParametricCore.wlpOutcome (ops := V2026Bridge.mirNoCallDetWpOps body)` and
+all-fuel strict deterministic `execWlpStateV2026` (`[propext]` only, zero
+`Classical.choice` and zero `Quot.sound`). -/
+theorem wlpOutcome_mirNoCallDet_iff_forall_execWlpStateV2026
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop} :
+    Anneal.ParametricCore.wlpOutcome
+        (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps body)
+        post (fun _ => False) s ↔
+      ∀ fuel : Nat, execWlpStateV2026 body fuel s post := by
+  constructor
+  · intro ⟨I, hIs, hClosed⟩ fuel
+    induction fuel generalizing s with
+    | zero => exact trivial
+    | succ fuel ih =>
+      dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome]
+      rw [execWlpStepPred_succ_iff]
+      have hStep : (Anneal.ParametricCore.V2026Bridge.mirNoCallStep body s).wp
+          I post (fun _ => False) := hClosed s hIs
+      cases hEv : v2026Step body s with
+      | step s' =>
+        rw [v2026Step_step_iff_mirNoCallStep_step.mp hEv] at hStep
+        exact ih hStep
+      | done out =>
+        rw [v2026Step_done_iff_mirNoCallStep_done.mp hEv] at hStep
+        exact hStep
+      | fault fk =>
+        cases fk with
+        | fail f =>
+          rw [v2026Step_fault_fail_iff_mirNoCallStep_fail.mp hEv] at hStep
+          exact False.elim hStep
+        | extCall req =>
+          rw [v2026Step_fault_extCall_iff_mirNoCallStep_extCall.mp ⟨req, hEv⟩] at hStep
+          exact False.elim hStep
+        | stuck =>
+          exact False.elim (v2026Step_never_stuck body s hEv)
+  · intro hAll
+    refine ⟨fun st => ∀ fuel : Nat, execWlpStateV2026 body fuel st post, hAll, ?_⟩
+    intro st hSt
+    change (Anneal.ParametricCore.V2026Bridge.mirNoCallStep body st).wp
+      (fun u => ∀ fuel : Nat, execWlpStateV2026 body fuel u post)
+      post (fun _ => False)
+    have hNext := wlpAllFuel_step hSt
+    cases hEv : v2026Step body st with
+    | step st' =>
+      rw [hEv] at hNext
+      rw [v2026Step_step_iff_mirNoCallStep_step.mp hEv]
+      exact hNext
+    | done out =>
+      rw [hEv] at hNext
+      rw [v2026Step_done_iff_mirNoCallStep_done.mp hEv]
+      exact hNext
+    | fault _ =>
+      rw [hEv] at hNext
+      exact False.elim hNext
+
+/-- Exact bidirectional equivalence between fuel-free
+`ParametricCore.wlpOutcome (ops := V2026Bridge.mirNoCallDetWpOps body)` and
+all-fuel strict `wlpStateV2026`. -/
+theorem wlpOutcome_mirNoCallDet_iff_forall_wlpStateV2026
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop} :
+    Anneal.ParametricCore.wlpOutcome
+        (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps body)
+        post (fun _ => False) s ↔
+      ∀ fuel : Nat, wlpStateV2026 body fuel s post :=
+  Iff.trans wlpOutcome_mirNoCallDet_iff_forall_execWlpStateV2026
+    ⟨fun h fuel => wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr (h fuel),
+     fun h fuel => wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp (h fuel)⟩
+
+/-- Choice-free `TreeSafe` directly from fuel-free
+`ParametricCore.wlpOutcome (ops := V2026Bridge.mirNoCallDetWpOps body)`. -/
+theorem treeSafe_mirTree_of_wlpOutcome_mirNoCallDet {body : CapturedMir}
+    {s : MachineState} {post : MirOutcome → Prop}
+    (h : Anneal.ParametricCore.wlpOutcome
+      (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps body)
+      post (fun _ => False) s) :
+    MirNoUBTree (mirTree body s) :=
+  treeSafe_mirTree_of_forall_execWlpStateV2026
+    (wlpOutcome_mirNoCallDet_iff_forall_execWlpStateV2026.mp h)
+
+/-- Choice-free return-postcondition adequacy directly from fuel-free
+`ParametricCore.wlpOutcome (ops := V2026Bridge.mirNoCallDetWpOps body)`. -/
+theorem reachesRet_post_of_wlpOutcome_mirNoCallDet {body : CapturedMir}
+    {s : MachineState} {post : MirOutcome → Prop}
+    (h : Anneal.ParametricCore.wlpOutcome
+      (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps body)
+      post (fun _ => False) s) :
+    ∀ tr out, ReachesRet (mirTree body s) tr out → post out :=
+  reachesRet_post_of_forall_execWlpStateV2026
+    (wlpOutcome_mirNoCallDet_iff_forall_execWlpStateV2026.mp h)
+
+/-! ### Silent vs Observable Infinite Traces (`Trusted.ITree.Diverges` & `¬ TotalVerificationResult`) -/
+
+/-- Infinite *silent* `.tau (.running _)` trace witness over unmodified
+`stepMirFn` (e.g., an unobservable `goto` spin loop). Unlike general
+`DivergesV2026`, silent divergence witnesses trusted `Trusted.ITree.Diverges`
+and refutes `Productive` and `TotalVerificationResult`. -/
+def SilentDivergesV2026 (body : CapturedMir) (s : MachineState) : Prop :=
+  ∃ trace : Nat → MachineState,
+    trace 0 = s ∧
+    ∀ n : Nat, stepMirFn body (trace n) = .tau (.running (trace (n + 1)))
+
+/-- Every `SilentDivergesV2026` witness is in particular a `DivergesV2026`
+witness. -/
+theorem divergesV2026_of_silentDivergesV2026 {body : CapturedMir}
+    {s : MachineState} (hSil : SilentDivergesV2026 body s) :
+    DivergesV2026 body s := by
+  let ⟨trace, hTr0, hSteps⟩ := hSil
+  exact ⟨trace, hTr0, fun n => v2026Step_step_iff.mpr (Or.inl (hSteps n))⟩
+
+/-- Every `SilentDivergesV2026` witness proves coinductive silent divergence
+`Trusted.ITree.Diverges (mirTree body s)` directly over unmodified
+`stepMirState`. -/
+theorem diverges_mirTree_of_silentDivergesV2026 {body : CapturedMir}
+    {s : MachineState} (hSil : SilentDivergesV2026 body s) :
+    Diverges (mirTree body s) := by
+  let ⟨trace, hTr0, hSteps⟩ := hSil
+  refine Diverges.coinduct (fun t => ∃ n : Nat, t = mirTree body (trace n)) ?_
+    (mirTree body s) ⟨0, by rw [hTr0]⟩
+  intro t ⟨n, hEq⟩
+  subst hEq
+  rw [mirTree_observe, hSteps n]
+  exact ⟨n + 1, rfl⟩
+
+/-- Every `SilentDivergesV2026` witness proves `MayDiverge (mirTree body s)`. -/
+theorem mayDiverge_mirTree_of_silentDivergesV2026 {body : CapturedMir}
+    {s : MachineState} (hSil : SilentDivergesV2026 body s) :
+    MayDiverge (mirTree body s) :=
+  ⟨[], mirTree body s, Reaches.refl _,
+    diverges_mirTree_of_silentDivergesV2026 hSil⟩
+
+/-- Every `SilentDivergesV2026` witness refutes `Productive (mirTree body s)`. -/
+theorem not_productive_mirTree_of_silentDivergesV2026 {body : CapturedMir}
+    {s : MachineState} (hSil : SilentDivergesV2026 body s) :
+    ¬ Productive (mirTree body s) :=
+  fun hProd =>
+    Anneal.ITree.productive_not_mayDiverge hProd
+      (mayDiverge_mirTree_of_silentDivergesV2026 hSil)
+
+/-- Any `TotalClaim` admitting a silently-diverging `(args, mem)` input has
+NO `TotalVerificationResult` — even for trivial `post := fun _ _ _ _ => True`
+(rigorously separating partial `VerificationResult` from total
+`TotalVerificationResult`). -/
+theorem not_totalVerificationResult_of_silentDivergesV2026 (c : TotalClaim)
+    {args : List Value} {mem : Memory} (hPre : c.pre args mem)
+    (hSil : SilentDivergesV2026 c.body
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        c.body args mem c.callees)) :
+    ¬ TotalVerificationResult c := by
+  intro hTot
+  exact (hTot.proof args mem hPre).2.2.1
+    (mayDiverge_mirTree_of_silentDivergesV2026 hSil)
+
+/-- Infinite *observable* `.vis (.inr (.inl (.emit _)))` trace witness over
+unmodified `stepMirFn` (e.g., an infinite `switchInt` event loop). Unlike
+`SilentDivergesV2026`, an observable infinite loop never returns yet IS
+reactively `Productive` and satisfies `¬ MayDiverge`! -/
+def ObsDivergesV2026 (body : CapturedMir) (s : MachineState) : Prop :=
+  ∃ trace : Nat → MachineState,
+    trace 0 = s ∧
+    ∀ n : Nat, ∃ (obs : MirObs) (k : PUnit → MirExecState),
+      stepMirFn body (trace n) = .vis (.inr (.inl (.emit obs))) k ∧
+      k PUnit.unit = .running (trace (n + 1))
+
+/-- Every `ObsDivergesV2026` witness is a `DivergesV2026` witness (hence UB-free
+and never returning, refuting `MirWpConverges`). -/
+theorem divergesV2026_of_obsDivergesV2026 {body : CapturedMir}
+    {s : MachineState} (hObs : ObsDivergesV2026 body s) :
+    DivergesV2026 body s := by
+  let ⟨trace, hTr0, hSteps⟩ := hObs
+  exact ⟨trace, hTr0, fun n => by
+    let ⟨obs, k, hv, hk⟩ := hSteps n
+    exact v2026Step_step_iff.mpr (Or.inr ⟨obs, k, hv, hk⟩)⟩
+
+/-- Choice-free productivity of an observable infinite trace: every reachable
+residual immediately observes a visible `MirObsE` event (`{propext, Quot.sound}`
+only). -/
+theorem productive_mirTree_of_obsDivergesV2026 {body : CapturedMir}
+    {s : MachineState} (hObs : ObsDivergesV2026 body s) :
+    Productive (mirTree body s) := by
+  let ⟨trace, hTr0, hSteps⟩ := hObs
+  let Inv : MirExecState → Prop := fun st => ∃ n : Nat, st = .running (trace n)
+  have hClosed : MirStepClosedInv body Inv := by
+    intro st ⟨n, hEq⟩
+    subst hEq
+    dsimp only [stepMirState]
+    let ⟨_, k, hVis, hk⟩ := hSteps n
+    rw [hVis]
+    refine ⟨fun hF => hF, fun o => ?_⟩
+    cases o
+    exact ⟨n + 1, hk⟩
+  intro tr u hR
+  let ⟨st₁, hEq₁, ⟨n, hSt₁⟩⟩ :=
+    reaches_cofix_closedInv hClosed hR ⟨.running s, rfl, ⟨0, by rw [hTr0]⟩⟩
+  subst hEq₁
+  subst hSt₁
+  let ⟨_, _, hVis, _⟩ := hSteps n
+  refine ⟨mirTree body (trace n), TauStar.refl _, fun w hTau => ?_⟩
+  rw [mirTree_observe, hVis] at hTau
+  cases hTau
+
+/-- An observable infinite loop never silently diverges (`¬ MayDiverge`). -/
+theorem not_mayDiverge_mirTree_of_obsDivergesV2026 {body : CapturedMir}
+    {s : MachineState} (hObs : ObsDivergesV2026 body s) :
+    ¬ MayDiverge (mirTree body s) :=
+  Anneal.ITree.productive_not_mayDiverge
+    (productive_mirTree_of_obsDivergesV2026 hObs)
+
 /-! ## Part V: Logarithmic Binary-Doubling Fuel (`pow2Fuel`, `wpPow2Cont`, `execPow2Cont`) -/
 
 /-- Exact power-of-two fuel count `2^k` computed via `@Nat.rec` doubling. -/
@@ -3158,5 +3422,89 @@ theorem canary_v2026_diverging_partial_correctness :
   subst hArgs
   exact wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
     (forall_execWlpStateV2026_of_divergesV2026 hDiv _ fuel)
+
+/-- Minimal 1-block `CapturedMir` whose `bb0` executes `switchInt` on `_1`
+looping back to `bb0`, emitting a visible `MirObsE` event on every iteration. -/
+def canaryObsLoopMirBody : CapturedMir :=
+  { defPath := "Anneal::ConjunctiveWp::canaryObsLoop"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 1
+    localDecls :=
+      [ { mutability := .mut, ty := u32Ty, debugName := some "_0" }
+      , { mutability := .not, ty := u32Ty, debugName := some "x" } ]
+    basicBlocks :=
+      [ { statements := []
+          terminator :=
+            { kind :=
+                .switchInt
+                  (.copy { local_ := 1, projection := [] })
+                  { branches := [], otherwise := 0 }
+              span := "WlpV2026.lean:obsLoop:bb0" }
+          isCleanup := false } ]
+    fnAbi :=
+      { args := [{ layout := u32Layout, mode := .direct }]
+        ret := { layout := u32Layout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts :=
+      { pointerBits := 64
+        isLittleEndian := true
+        entries := [u32Layout] }
+    allocations := [] }
+
+/-- Concrete separation canary between silent and observable infinite loops:
+1. `canaryDivergingMirBody` (`goto 0`) satisfies `SilentDivergesV2026`,
+   `Trusted.ITree.Diverges`, `MayDiverge`, `¬ Productive`, and REFUTES
+   `TotalVerificationResult` even for trivial `post := True`.
+2. `canaryObsLoopMirBody` (`switchInt` self-loop) satisfies `ObsDivergesV2026`,
+   `DivergesV2026`, `¬ MirWpConverges`, `MirNoUBTree`, `¬ ReachesRet`, AND is
+   reactively `Productive` (`¬ MayDiverge`), also proving the fuel-free
+   `ParametricCore.wlpOutcome` equivalence on both bodies. -/
+theorem canary_v2026_silent_vs_obs_divergence_and_total_refutation :
+    let sSil := initMachineState canaryDivergingMirBody []
+    let sObs := initMachineState canaryObsLoopMirBody
+      [.scalar { bits := 5, sizeBytes := 4 }]
+    Diverges (mirTree canaryDivergingMirBody sSil) ∧
+    ¬ Productive (mirTree canaryDivergingMirBody sSil) ∧
+    ¬ TotalVerificationResult
+      { body := canaryDivergingMirBody
+        pre := fun args _ => args = []
+        post := fun _ _ _ _ => True } ∧
+    DivergesV2026 canaryObsLoopMirBody sObs ∧
+    MirNoUBTree (mirTree canaryObsLoopMirBody sObs) ∧
+    Productive (mirTree canaryObsLoopMirBody sObs) ∧
+    ¬ MayDiverge (mirTree canaryObsLoopMirBody sObs) ∧
+    Anneal.ParametricCore.wlpOutcome
+      (ops := Anneal.ParametricCore.V2026Bridge.mirNoCallDetWpOps canaryObsLoopMirBody)
+      (fun _ => False) (fun _ => False) sObs := by
+  dsimp only
+  let sSil := initMachineState canaryDivergingMirBody []
+  have hSilStep : stepMirFn canaryDivergingMirBody sSil = .tau (.running sSil) := rfl
+  have hSil : SilentDivergesV2026 canaryDivergingMirBody sSil :=
+    ⟨fun _ => sSil, rfl, fun _ => hSilStep⟩
+  have hNoTotal : ¬ TotalVerificationResult
+      { body := canaryDivergingMirBody
+        pre := fun args _ => args = []
+        post := fun _ _ _ _ => True } := by
+    refine not_totalVerificationResult_of_silentDivergesV2026 _
+      (args := []) (mem := sSil.memory) rfl ?_
+    exact hSil
+  let sObs := initMachineState canaryObsLoopMirBody
+    [.scalar { bits := 5, sizeBytes := 4 }]
+  have hObsStep : stepMirFn canaryObsLoopMirBody sObs =
+      .vis (.inr (.inl (.emit (.event 5)))) (fun _ => .running sObs) := rfl
+  have hObs : ObsDivergesV2026 canaryObsLoopMirBody sObs :=
+    ⟨fun _ => sObs, rfl, fun _ => ⟨.event 5, fun _ => .running sObs, hObsStep, rfl⟩⟩
+  have hObsDiv := divergesV2026_of_obsDivergesV2026 hObs
+  exact ⟨diverges_mirTree_of_silentDivergesV2026 hSil,
+    not_productive_mirTree_of_silentDivergesV2026 hSil,
+    hNoTotal,
+    hObsDiv,
+    mirNoUBTree_of_divergesV2026 hObsDiv,
+    productive_mirTree_of_obsDivergesV2026 hObs,
+    not_mayDiverge_mirTree_of_obsDivergesV2026 hObs,
+    wlpOutcome_mirNoCallDet_iff_forall_execWlpStateV2026.mpr
+      (forall_execWlpStateV2026_of_divergesV2026 hObsDiv (fun _ => False))⟩
 
 end Anneal.ConjunctiveWp
