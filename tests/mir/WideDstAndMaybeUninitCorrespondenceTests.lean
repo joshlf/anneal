@@ -499,11 +499,17 @@ run_cmd do
     -- 3-way copy contrast, anti-mock translation fidelity & bijection, frozen-table locks, all 5
     -- direct-certificate bundle equalities, 3-engine UB root-cause alignment, all 39 `Eq.refl`
     -- fixture locks, and the Episode 1 LeanMiri capstones into one single root theorem.
-    -- Observer-level 3-way agreement over the RAW `lmWdObserve` (via `lmToMr` + fidelity).
+    -- Observer-level 3-way agreement over the RAW `lmWdObserve` (via `lmToMr` + fidelity),
+    -- both in-range (`observer_level_three_way`) and unconditionally over ALL `idx : Nat`
+    -- (`observer_level_exact_all_nat`).
     let olName := ns ++ `observer_level_three_way
     addThmInfer olName (mkApp4 (mkConst (bNs ++ `observer_level_three_way)) authC hA lmToMr
       (mkConst (ns ++ `translation_fidelity)))
     added := added.push olName
+    let olAllName := ns ++ `observer_level_exact_all_nat
+    addThmInfer olAllName (mkApp5 (mkConst (bNs ++ `observer_level_exact_all_nat)) authC hA hOob
+      lmToMr (mkConst (ns ++ `translation_fidelity)))
+    added := added.push olAllName
     let crossName := ns ++ `ep2_cross_root_three_engine_capstone
     let crossPf ← MetaM.run' do
       let parts : List Expr :=
@@ -511,6 +517,7 @@ run_cmd do
           mkConst c13Name,
           mkConst (ns ++ `translation_fidelity),
           mkConst olName,
+          mkConst olAllName,
           mkConst (ns ++ `lmToMr_mrToLm),
           mkConst (ns ++ `mrToLm_lmToMr),
           mkConst (ns ++ `frozenTableLock ++ `wdLmExpectedBasic),
@@ -753,6 +760,13 @@ run_cmd do
           thmD (ns ++ `honest.observerLevelDstMr)
             (mkEq mrObsTy0 (mkApp lmToMr (lmObsU true 6)) (mrObs true 6))
             (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU true 6)))),
+        ("forged observer-level out-of-range cell 100 returns okFnPtr 0 instead of matching mrWdObserve",
+          thmD (ns ++ `forged.observerLevelOobOk)
+            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU true 100)) (mrFn 0))
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU true 100))),
+          thmD (ns ++ `honest.observerLevelOobAgree)
+            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU true 100)) (mrObs true 100))
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU true 100)))),
         ("forged pin delta: pinned d821c6e3 checkPtr rejects the null FnPtr",
           thmD (ns ++ `forged.pinnedCheckPtrRejectsNull) (mkEq cpTy cpL nnR) (mkRefl cpTy cpL),
           thmD (ns ++ `honest.pinnedCheckPtrAcceptsNull) (mkEq cpTy cpL cpR) (mkRefl cpTy cpL)),
@@ -918,7 +932,7 @@ run_cmd do
     { fileName := "<wd-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 120 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 36 &&
+  unless addedCount ≥ 121 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 37 &&
       twinCount = rejectedCount && reachCount ≥ 48 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
@@ -939,13 +953,16 @@ run_cmd do
       `projectPositive, `projectFault, `modeSensitivity_present,
       `bundle_gate_pinDelta_and_dstBoundary, `unified_bundle_witness_kinds,
       `domain_bundle_claims, `dual_exact_three_way_classification,
-      `dual_no_specPanic_all_cells, `dual_fail_closed_out_of_range,
+      `dual_no_specPanic_all_cells, `wdVerdictOf_injective, `lmTable_vs_tables,
+      `observer_level_three_way, `observer_level_exact_all_nat,
+      `dual_fail_closed_out_of_range,
       `dual_mode_sensitivity_exact, `dual_case19_mode_sensitivity,
       `dual_dst_honest_trusted_boundary, `dual_minirust300_pin_delta_and_flip_ready,
       `dual_case13_union_copy_vs_typed_read, `dual_case2_two_query_halves_agree,
       `mrTerminatesCleanly, `dual_minirust300_machine_level_pin_delta,
       `rootBackedLmAuthority,
       `rootBackedLmAuthority_tableCheck, `rootBackedLmAuthority_failClosed,
+      `rootBacked_observer_level,
       `stepsM_eq_runToStopM, `stepsTB_eq_runToStopM ]
   let isChoiceFree (axs : Array Name) : Bool :=
     axs.all fun a => a == ``propext || a == ``Quot.sound
@@ -969,7 +986,7 @@ run_cmd do
       unless isChoiceFree axs do
         throwError "exhaustive constructive audit failure: {c} uses non-constructive axiom ({axs})"
       exhaustiveChoiceFree := exhaustiveChoiceFree + 1
-  unless exhaustiveChoiceFree ≥ 250 do
+  unless exhaustiveChoiceFree ≥ 320 do
     throwError "exhaustive constructive audit vacuous: only {exhaustiveChoiceFree} decls checked"
   -- Self-tests: constructive check rejects `Classical.choice`; standard-axiom check rejects
   -- `sorryAx` and `Lean.ofReduceBool`; trivial-prop detector rejects `True`, `1 = 1`, `∀ x, x = x`.
@@ -1007,7 +1024,7 @@ run_cmd do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "test audit failure: {c} uses non-standard axiom {a}"
     if tNs.isPrefixOf c then checked := checked + 1
-  unless checked ≥ 9 do
+  unless checked ≥ 15 do
     throwError "test audit vacuous: only {checked} test declarations"
   logInfo m!"wd constructive audit: {exhaustiveChoiceFree} DualSpec decls ({constructiveDecls.length} spotlighted) in [propext, Quot.sound]; {checked} test decls non-trivial & standard-axiom clean"
 

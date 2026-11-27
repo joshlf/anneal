@@ -754,6 +754,86 @@ theorem observer_level_three_way (A : WdLmAuthority) (hA : lmTableCheckOf A = tr
   · exact hL.trans ((hTab.1 h).trans (mrVerdict_cell tb idx hi).symm)
   · exact hL.trans ((hTab.2.1 h).trans (trustedVerdict_cell tb idx hi).symm)
 
+/-- **Unconditional all-`Nat` observer-level `↔` classification.** For EVERY `tb : Bool` and EVERY
+`idx : Nat` (both canonical `0..23` and fail-closed `≥ 24`), a certified fail-closed authority
+whose translation factors as `wdVerdictOf ∘ f` agrees with raw `mrWdObserve` iff `idx ≠ 22`,
+agrees with raw `mrTrustedWdObserve` iff `idx ≠ 6 ∧ idx ≠ 7`, and enjoys full 3-way raw-observer
+agreement iff `idx ≠ 6 ∧ idx ≠ 7 ∧ idx ≠ 22`. -/
+theorem observer_level_exact_all_nat (A : WdLmAuthority) (hA : lmTableCheckOf A = true)
+    (hOob : WdLmFailClosed A) (f : A.Obs → MrWdObs) (hf : ∀ o, A.toVerdict o = wdVerdictOf (f o))
+    (tb : Bool) (idx : Nat) :
+    (f (A.observe tb idx) = mrWdObserve tb idx ↔ idx ≠ 22) ∧
+    (f (A.observe tb idx) = mrTrustedWdObserve tb idx ↔ (idx ≠ 6 ∧ idx ≠ 7)) ∧
+    ((mrTrustedWdObserve tb idx = mrWdObserve tb idx ∧
+        mrWdObserve tb idx = f (A.observe tb idx)) ↔ (idx ≠ 6 ∧ idx ≠ 7 ∧ idx ≠ 22)) := by
+  by_cases hi : idx < mrWdCaseCount
+  · have hObs := observer_level_three_way A hA f hf tb idx hi
+    have hCls := dual_exact_three_way_classification A hA tb idx hi
+    have hNe22 : f (A.observe tb idx) = mrWdObserve tb idx → idx ≠ 22 := by
+      intro heq h22
+      subst h22
+      have hv : A.verdict tb 22 = mrVerdict tb 22 := by
+        show A.toVerdict (A.observe tb 22) = wdVerdictOf (mrWdObserve tb 22)
+        rw [hf, heq]
+      have hPin := hCls.2.2.mpr (by decide : wdClassOf 22 = .pinDelta)
+      exact hPin.2 hv.symm
+    have hNe67 : f (A.observe tb idx) = mrTrustedWdObserve tb idx → idx ≠ 6 ∧ idx ≠ 7 := by
+      intro heq
+      have hv : A.verdict tb idx = trustedVerdict tb idx := by
+        show A.toVerdict (A.observe tb idx) = wdVerdictOf (mrTrustedWdObserve tb idx)
+        rw [hf, heq]
+      constructor
+      · intro h6; subst h6
+        have hDst := hCls.2.1.mpr (by decide : wdClassOf 6 = .dstBoundary)
+        exact hDst.2.1 (hDst.2.2.trans (hv.trans hDst.1))
+      · intro h7; subst h7
+        have hDst := hCls.2.1.mpr (by decide : wdClassOf 7 = .dstBoundary)
+        exact hDst.2.1 (hDst.2.2.trans (hv.trans hDst.1))
+    have hi24 : idx < 24 := hi
+    have hOfNe22 : idx ≠ 22 → f (A.observe tb idx) = mrWdObserve tb idx := by
+      intro h22
+      apply hObs.1
+      unfold wdClassOf
+      by_cases h67 : idx = 6 ∨ idx = 7
+      · rw [ite_eq_left_of_eq_true _ _ (eq_true h67)]; decide
+      · rw [ite_eq_right_of_eq_false _ _ (eq_false h67),
+          ite_eq_right_of_eq_false _ _ (eq_false h22),
+          ite_eq_left_of_eq_true _ _ (eq_true hi24)]
+        decide
+    have hOfNe67 : idx ≠ 6 ∧ idx ≠ 7 → f (A.observe tb idx) = mrTrustedWdObserve tb idx := by
+      rintro ⟨h6, h7⟩
+      apply hObs.2
+      have h67 : ¬(idx = 6 ∨ idx = 7) := fun h => h.elim h6 h7
+      unfold wdClassOf
+      rw [ite_eq_right_of_eq_false _ _ (eq_false h67)]
+      by_cases h22 : idx = 22
+      · rw [ite_eq_left_of_eq_true _ _ (eq_true h22)]; decide
+      · rw [ite_eq_right_of_eq_false _ _ (eq_false h22),
+          ite_eq_left_of_eq_true _ _ (eq_true hi24)]
+        decide
+    refine ⟨⟨hNe22, hOfNe22⟩, ⟨hNe67, hOfNe67⟩, ?_⟩
+    constructor
+    · rintro ⟨hTM, hML⟩
+      have h67 := hNe67 (hML.symm.trans hTM.symm)
+      exact ⟨h67.1, h67.2, hNe22 hML.symm⟩
+    · rintro ⟨h6, h7, h22⟩
+      have hLM := hOfNe22 h22
+      have hLT := hOfNe67 ⟨h6, h7⟩
+      exact ⟨hLT.symm.trans hLM, hLM.symm⟩
+  · have hge : mrWdCaseCount ≤ idx := Nat.le_of_not_lt hi
+    have hMr : mrWdObserve tb idx = .unsupported := mrWdObserve_out_of_range tb idx hge
+    have hTr : mrTrustedWdObserve tb idx = .unsupported := mrTrustedWdObserve_out_of_range tb idx hge
+    have hLmV : wdVerdictOf (f (A.observe tb idx)) = wdVerdictOf .unsupported :=
+      (hf _).symm.trans (hOob tb idx hge)
+    have hLm : f (A.observe tb idx) = .unsupported :=
+      wdVerdictOf_injective hLmV (by rw [hLmV]; decide)
+    have h6 : idx ≠ 6 := by unfold mrWdCaseCount at hge; omega
+    have h7 : idx ≠ 7 := by unfold mrWdCaseCount at hge; omega
+    have h22 : idx ≠ 22 := by unfold mrWdCaseCount at hge; omega
+    refine ⟨⟨fun _ => h22, fun _ => hLm.trans hMr.symm⟩,
+      ⟨fun _ => ⟨h6, h7⟩, fun _ => hLm.trans hTr.symm⟩,
+      ⟨fun _ => ⟨h6, h7, h22⟩, fun _ => ⟨hTr.trans hMr.symm, hMr.trans hLm.symm⟩⟩⟩
+
 /-- **Fail-closed `idx ≥ 24`** on all three authorities. -/
 theorem dual_fail_closed_out_of_range (A : WdLmAuthority) (hOob : WdLmFailClosed A)
     (tb : Bool) (idx : Nat) (h : mrWdCaseCount ≤ idx) :
@@ -1018,13 +1098,13 @@ theorem rootBackedLmAuthority_failClosed : WdLmFailClosed rootBackedLmAuthority 
   rw [ite_eq_right_of_eq_false _ _ (eq_false h67)]
   exact trustedVerdict_out_of_range tb idx h
 
-/-- Non-vacuity of `observer_level_three_way`: it applies to the root-backed authority with
-`f := id`. -/
-theorem rootBacked_observer_level (tb : Bool) (idx : Nat) (hi : idx < mrWdCaseCount) :
-    type_of% (observer_level_three_way rootBackedLmAuthority rootBackedLmAuthority_tableCheck
-      (fun o => o) (fun _ => rfl) tb idx hi) :=
-  observer_level_three_way rootBackedLmAuthority rootBackedLmAuthority_tableCheck
-    (fun o => o) (fun _ => rfl) tb idx hi
+/-- Non-vacuity of `observer_level_three_way` and `observer_level_exact_all_nat`: they apply to the
+root-backed authority with `f := id` for every `idx : Nat`. -/
+theorem rootBacked_observer_level (tb : Bool) (idx : Nat) :
+    type_of% (observer_level_exact_all_nat rootBackedLmAuthority rootBackedLmAuthority_tableCheck
+      rootBackedLmAuthority_failClosed (fun o => o) (fun _ => rfl) tb idx) :=
+  observer_level_exact_all_nat rootBackedLmAuthority rootBackedLmAuthority_tableCheck
+    rootBackedLmAuthority_failClosed (fun o => o) (fun _ => rfl) tb idx
 
 /-! ## §9. Capstone -/
 
@@ -1070,6 +1150,8 @@ theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
     (∀ d, type_of% (domain_bundle_claims d A hA)) ∧
     (∀ tb idx (hi : idx < mrWdCaseCount), type_of% (dual_exact_three_way_classification A hA tb idx hi)) ∧
     (∀ tb idx (hi : idx < mrWdCaseCount), type_of% (dual_no_specPanic_all_cells A hA tb idx hi)) ∧
+    (∀ (f : A.Obs → MrWdObs) (hf : ∀ o, A.toVerdict o = wdVerdictOf (f o)) tb idx,
+      type_of% (observer_level_exact_all_nat A hA hOob f hf tb idx)) ∧
     (∀ tb idx (h : mrWdCaseCount ≤ idx), type_of% (dual_fail_closed_out_of_range A hOob tb idx h)) ∧
     (∀ idx (hi : idx < mrWdCaseCount), type_of% (dual_mode_sensitivity_exact A hA idx hi)) ∧
     type_of% (dual_case19_mode_sensitivity A hA) ∧
@@ -1089,6 +1171,7 @@ theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
    modeSensitivity_present A hA, bundle_gate_pinDelta_and_dstBoundary A hA,
    unified_bundle_witness_kinds A hA, fun d => domain_bundle_claims d A hA,
    dual_exact_three_way_classification A hA, dual_no_specPanic_all_cells A hA,
+   observer_level_exact_all_nat A hA hOob,
    dual_fail_closed_out_of_range A hOob,
    dual_mode_sensitivity_exact A hA, dual_case19_mode_sensitivity A hA,
    dual_dst_honest_trusted_boundary A hA, dual_minirust300_pin_delta_and_flip_ready A hA,
@@ -1145,14 +1228,15 @@ run_cmd do
       ns ++ `projectPositive, ns ++ `projectFault, ns ++ `modeSensitivity_present,
       ns ++ `bundle_gate_pinDelta_and_dstBoundary, ns ++ `unified_bundle_witness_kinds,
       ns ++ `domain_bundle_claims, ns ++ `dual_exact_three_way_classification,
-      ns ++ `dual_no_specPanic_all_cells,
+      ns ++ `dual_no_specPanic_all_cells, ns ++ `wdVerdictOf_injective, ns ++ `lmTable_vs_tables,
+      ns ++ `observer_level_three_way, ns ++ `observer_level_exact_all_nat,
       ns ++ `dual_fail_closed_out_of_range, ns ++ `dual_mode_sensitivity_exact,
       ns ++ `dual_case19_mode_sensitivity, ns ++ `dual_dst_honest_trusted_boundary,
       ns ++ `dual_minirust300_pin_delta_and_flip_ready, ns ++ `dual_case13_union_copy_vs_typed_read,
       ns ++ `dual_case2_two_query_halves_agree, ns ++ `mrTerminatesCleanly,
       ns ++ `dual_minirust300_machine_level_pin_delta,
       ns ++ `rootBackedLmAuthority, ns ++ `rootBackedLmAuthority_tableCheck,
-      ns ++ `rootBackedLmAuthority_failClosed,
+      ns ++ `rootBackedLmAuthority_failClosed, ns ++ `rootBacked_observer_level,
       ns ++ `stopProj, ns ++ `stepsM_eq_runToStopM, ns ++ `stepsTB_eq_runToStopM ]
   for c in constructiveDecls do
     unless env.contains c do throwError "constructive audit: {c} missing"
@@ -1174,7 +1258,7 @@ run_cmd do
         unless a == ``propext || a == ``Quot.sound do
           throwError "exhaustive constructive audit failure: {c} depends on {a}"
       exhaustiveChoiceFree := exhaustiveChoiceFree + 1
-  if exhaustiveChoiceFree < 250 then
+  if exhaustiveChoiceFree < 320 then
     throwError "exhaustive constructive audit vacuous: only {exhaustiveChoiceFree} decls checked"
   -- Auditor self-tests: confirm Classical.choice, sorryAx, and Lean.ofReduceBool are caught.
   if (← liftCoreM <| Lean.collectAxioms ``Classical.em).all
@@ -1237,7 +1321,7 @@ run_cmd do
         throwError "{c} depends on non-standard axiom {a}"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 30 then
+  if theorems < 55 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit
