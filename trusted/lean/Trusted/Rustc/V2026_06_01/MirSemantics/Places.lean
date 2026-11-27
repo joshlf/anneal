@@ -2226,6 +2226,32 @@ dangling non-null zero-length slice references `&[]`) it yields a provenance-fre
 with `.none`. `ConstValue.indirect` threads `layoutPointerBytes layouts` into
 `globalAllocSliceToAbstractBytes` and never falls back to `readGlobalScalar` on
 provenance-bearing bytes.
+
+Target pointer width: the number of bytes read for `ConstValue.indirect` is the
+target-width size `rigidTyKindByteSizeFor (layoutPointerBytes layouts) ty.kind`
+when the type constructor determines it (`usize`, `isize`, thin and wide
+pointers, and arrays of them), and the `readGlobalScalar` fallback reads
+`intCastTargetBytes ty.kind (layoutPointerBytes layouts)` bytes, so on a 32-bit
+target (`layoutPointerBytes layouts = 4`) a `usize` constant reads exactly its
+4 bytes (never the 4 bytes that follow it in the allocation) and a pointer
+constant decodes from exactly its 4 relocation bytes.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to sized types have the same size and alignment as usize."
+
+Modeling choice (`agent_docs/trusted-rust.md`): the target width is the
+captured `LayoutTable.pointerBits` (`layoutPointerBytes`); on 64-bit targets
+`rigidTyKindByteSizeFor 8` and `rigidTyKindByteSize` coincide, so 64-bit
+behavior is unchanged.
 -/
 def evalConstValue
     (cv : ConstValue)
@@ -2254,12 +2280,15 @@ def evalConstValue
     | .none => .none
     | .some alloc =>
       let sz :=
-        match rigidTyByteSize layouts ty with
+        match rigidTyKindByteSizeFor ptrBytes ty.kind with
         | .some n => n
         | .none =>
-          match tyScalarBytes ty with
+          match rigidTyByteSize layouts ty with
           | .some n => n
-          | .none => Nat.sub (length alloc.bytes) offset
+          | .none =>
+            match tyScalarBytes ty with
+            | .some n => n
+            | .none => Nat.sub (length alloc.bytes) offset
       match globalAllocSliceToAbstractBytes alloc offset sz ptrBytes with
       | .some absBytes =>
         match decodeValueFromBytes defaultCodecFuel layouts ty absBytes with
@@ -2268,7 +2297,7 @@ def evalConstValue
           match abstractBytesHaveProv absBytes with
           | true => .none
           | false =>
-            match intCastTargetBytes ty.kind with
+            match intCastTargetBytes ty.kind ptrBytes with
             | .some n =>
               match readGlobalScalar alloc offset n with
               | .some sc => .some (.scalar sc)
@@ -2666,6 +2695,31 @@ and `readGlobalScalar alloc offset sz` succeeds), reads the scalar directly via
 tuple, or array `pointeeTy`, non-primitive layout in `layouts`, non-scalar width
 `sz`, or aggregate/array projection in `restProj`), decodes the global bytes via
 `decodeValueFromBytes` and projects `restProj`.
+
+Target pointer width: with a known `pointeeTy`, the scalar read width is
+`intCastTargetBytes pointeeTy.kind (layoutPointerBytes layouts)` and the decoded
+byte count is `rigidTyKindByteSizeFor (layoutPointerBytes layouts)
+pointeeTy.kind` when the type constructor determines it, so on a 32-bit target a
+`*const usize` read covers exactly 4 bytes (never splicing the following 4
+bytes into an 8-byte value) and a `*const *const T` read decodes exactly the 4
+relocation bytes of the stored pointer.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to sized types have the same size and alignment as usize."
+
+Modeling choice (`agent_docs/trusted-rust.md`): the target width is the
+captured `LayoutTable.pointerBits` (`layoutPointerBytes`); on 64-bit targets the
+widths coincide with the previous `rigidTyKindByteSize` / `intCastTargetBytes`
+defaults, so 64-bit behavior is unchanged.
 -/
 def evalGlobalDerefRead
     (locals : List LocalSlot)
@@ -2677,7 +2731,7 @@ def evalGlobalDerefRead
     PlaceReadResult :=
   match pointeeTyOpt with
   | .some pointeeTy =>
-    match intCastTargetBytes pointeeTy.kind with
+    match intCastTargetBytes pointeeTy.kind (layoutPointerBytes layouts) with
     | .some n =>
       match readGlobalScalar alloc offset n with
       | .some sc =>
@@ -2688,9 +2742,12 @@ def evalGlobalDerefRead
       | .none => .ub
     | .none =>
       let byteSz :=
-        match rigidTyByteSize layouts pointeeTy with
+        match rigidTyKindByteSizeFor (layoutPointerBytes layouts) pointeeTy.kind with
         | .some n => n
-        | .none => Nat.sub (length alloc.bytes) offset
+        | .none =>
+          match rigidTyByteSize layouts pointeeTy with
+          | .some n => n
+          | .none => Nat.sub (length alloc.bytes) offset
       match globalAllocSliceToAbstractBytes alloc offset byteSz (layoutPointerBytes layouts) with
       | .some absBytes =>
         match decodeValueFromBytes defaultCodecFuel layouts pointeeTy absBytes with

@@ -2792,6 +2792,29 @@ exact captured byte layout (such as enums, layout-free tuples/structs, or
 untyped caller-owned aggregates), and raw-byte pointer reinterpretation fail
 closed with `.unsupported`; a copy between two pointers with the same tag is
 undefined behavior as in the single-element path.
+
+Target pointer width: a thin-pointer destination (`isThinPtrCopyKind`) has the
+target pointer width `layoutPointerBytes layouts` (4 bytes on a 32-bit target),
+both for the partial-pointer-fragment window check and for the whole-value
+decode, so an in-order `copy_nonoverlapping::<u8>` of all 4 bytes of a 32-bit
+pointer into a `*const T` place decodes the coherent `PtrByteFrag` image back
+to the pointer instead of failing the size comparison against a 64-bit width.
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to sized types have the same size and alignment as usize."
+
+Modeling choice (`agent_docs/trusted-rust.md`): on 64-bit targets the thin
+pointer width `layoutPointerBytes layouts = 8` equals `rigidTyByteSize`, so the
+64-bit cases are unchanged.
 -/
 def copyBytesSubplace
     (localDecls : List LocalDecl)
@@ -3039,7 +3062,8 @@ def copyBytesSubplace
                 match dstPlaceTyOpt with
                 | .some dstTy =>
                   match isThinPtrCopyKind dstTy.kind, rigidTyByteSize layouts dstTy with
-                  | true, .some dstBytes =>
+                  | true, .some _ =>
+                    let dstBytes := layoutPointerBytes layouts
                     match
                       Bool.and
                         (Nat.ble (Nat.add dstEp.ptr.offsetBytes (length bs)) dstBytes)
@@ -3128,7 +3152,29 @@ def copyBytesSubplace
                         | .none => .none
                         | .some dstBytes =>
                           match Nat.beq (length bs) dstBytes with
-                          | false => .none
+                          | false =>
+                            match
+                              Bool.and
+                                (isThinPtrCopyKind dstTy.kind)
+                                (Nat.beq (length bs) (layoutPointerBytes layouts))
+                            with
+                            | false => .none
+                            | true =>
+                              match
+                                decodeUntypedStorageBytes
+                                  defaultCodecFuel
+                                  layouts
+                                  dstTy
+                                  bs
+                                  .strictUcg630Ub
+                              with
+                              | .some decodedVal =>
+                                .some
+                                  (commit
+                                    { local_ := dstLocal, projection := dstProj }
+                                    decodedVal
+                                    dstEffProj)
+                              | .none => .none
                           | true =>
                             match
                               decodeUntypedStorageBytes
