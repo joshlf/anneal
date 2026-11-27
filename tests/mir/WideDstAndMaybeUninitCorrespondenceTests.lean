@@ -444,6 +444,37 @@ run_cmd do
       addThm eqBName (mkEq dTy (mkConst dName) (mkConst origName)) (mkRefl dTy (mkConst dName))
       added := added.push eqBName
 
+    -- 3d. Case 2 two-query anti-masking on LeanMiri (each `wdCombine` half pinned separately), and
+    -- 3-engine UB root-cause alignment: exact MiniRust stop messages, exact vendored LeanMiri
+    -- failure classes, the machine-level `#300` pin delta, and the Trusted root-cause lemmas.
+    let lmRunC := mkConst (lmNs ++ `lmWdRun)
+    let lmSA (ty lay : Name) (n : Nat) : Expr :=
+      mkApp lmRunC (mkApp3 (mkConst (lmNs ++ `lmWdSizeAlign)) (mkConst (lmNs ++ ty)) (mkConst (lmNs ++ lay)) (mkNatLit n))
+    let lmSA01 := mkApp2 (mkConst (lmNs ++ `LmWdObs.okSizeAlign)) (mkNatLit 0) (mkNatLit 1)
+    for (tag, e) in [(`zstSliceHalf, lmSA `lmWdTySliceUnit `lmWdSliceUnitLay 5),
+                     (`emptyStrHalf, lmSA `lmWdTyStr `lmWdStrLay 0)] do
+      let n := ns ++ `lmCase2 ++ tag
+      addThm n (mkEq lmObsTy e lmSA01) (mkRefl lmObsTy e)
+      added := added.push n
+    let rcName := ns ++ `ub_root_cause_alignment_three_engines
+    let rcPf ← MetaM.run' do
+      let parts : List Expr :=
+        [ mkConst (mrNs ++ `mr_wd_exact_ub_diagnostics),
+          mkConst (lmNs ++ `lm_wd_exact_ub_diagnostics),
+          mkConst (bNs ++ `dual_minirust300_machine_level_pin_delta),
+          mkConst (bNs ++ `dual_case2_two_query_halves_agree),
+          mkConst (mrNs ++ `trusted_decodeTypedValueFromBytes_null_witness),
+          mkConst (mrNs ++ `trusted_intrinsicWidePointeeStep_dst_unsupported),
+          mkConst (ns ++ `lmCase2 ++ `zstSliceHalf),
+          mkConst (ns ++ `lmCase2 ++ `emptyStrHalf) ]
+      let rec conjRc : List Expr → MetaM Expr
+        | [] => return mkConst ``True.intro
+        | [p] => return p
+        | p :: ps => do mkAppM ``And.intro #[p, ← conjRc ps]
+      conjRc parts
+    addThmInfer rcName rcPf
+    added := added.push rcName
+
     -- 4. Definitional `Eq.refl` fixture locks over EVERY shared definition in `section Fixtures`
     -- (38 items: layouts, builders, and all 25 `CapturedMir` fixtures) plus
     -- `mrWdCaseCount = lmWdCaseCount` (39 locks total).
@@ -554,6 +585,10 @@ run_cmd do
     let lmSideWithCase6Check := mkApp checkOnWdModel lmSideWithCase6
     let lmMapBasic := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 lmToMr (mkConst (lmNs ++ `lmWdExpectedBasic))
     let lmMapTb := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 lmToMr (mkConst (lmNs ++ `lmWdExpectedTb))
+    let optStrTy := mkApp (mkConst ``Option [0]) (mkConst ``String)
+    let stopMsgB (i : Nat) : Expr :=
+      mkApp2 (mkConst `MiniRustSpec.CrossFrameRefAndPanicMR.runStopMsgBasic)
+        (mkConst (mrNs ++ (Name.mkSimple s!"mrWdProg{i}"))) (mkNatLit 120)
     let forged : List (String × Declaration × Declaration) :=
       [ ("ill-typed 0 = 1",
           thmD (ns ++ `forged.zeroEqOne) (mkEq natTy (mkNatLit 0) (mkNatLit 1)) (mkRefl natTy (mkNatLit 0)),
@@ -649,6 +684,20 @@ run_cmd do
             (mkEq lmObsTy (lmObsU false 13) (mkApp2 (lmObsC `okUninitPreserved) (mkNatLit 1) (mkNatLit 1)))
             (mkRefl lmObsTy (lmObsU false 13)),
           thmD (ns ++ `honest.case13LmUb) (mkEq lmObsTy (lmObsU false 13) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU false 13))),
+        ("forged LeanMiri case 2 ZST-slice half: size_of_val [(); 5] = 5",
+          thmD (ns ++ `forged.lmCase2ZstSize5) (mkEq lmObsTy (lmSA `lmWdTySliceUnit `lmWdSliceUnitLay 5)
+              (mkApp2 (mkConst (lmNs ++ `LmWdObs.okSizeAlign)) (mkNatLit 5) (mkNatLit 1)))
+            (mkRefl lmObsTy (lmSA `lmWdTySliceUnit `lmWdSliceUnitLay 5)),
+          thmD (ns ++ `honest.lmCase2ZstSize0) (mkEq lmObsTy (lmSA `lmWdTySliceUnit `lmWdSliceUnitLay 5) lmSA01)
+            (mkRefl lmObsTy (lmSA `lmWdTySliceUnit `lmWdSliceUnitLay 5))),
+        ("forged machine-level pin delta: pinned MiniRust machine stops on the null fn() transmute",
+          thmD (ns ++ `forged.machineStopsOnNullFnPtr)
+            (mkEq optStrTy (stopMsgB 22) (mkApp2 (mkConst ``Option.some [0]) (mkConst ``String)
+              (mkStrLit "Value::Ptr: null function pointer")))
+            (mkRefl optStrTy (stopMsgB 22)),
+          thmD (ns ++ `honest.machineRunsNullFnPtr) (mkEq optStrTy (stopMsgB 22)
+              (mkApp (mkConst ``Option.none [0]) (mkConst ``String)))
+            (mkRefl optStrTy (stopMsgB 22))),
         ("forged pin delta: pinned d821c6e3 checkPtr rejects the null FnPtr",
           thmD (ns ++ `forged.pinnedCheckPtrRejectsNull) (mkEq cpTy cpL nnR) (mkRefl cpTy cpL),
           thmD (ns ++ `honest.pinnedCheckPtrAcceptsNull) (mkEq cpTy cpL cpR) (mkRefl cpTy cpL)),
@@ -814,7 +863,7 @@ run_cmd do
     { fileName := "<wd-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 110 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 30 &&
+  unless addedCount ≥ 118 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 32 &&
       twinCount = rejectedCount && reachCount ≥ 48 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"

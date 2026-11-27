@@ -42,6 +42,9 @@ closes every finite certificate by kernel evaluation of small table lookups.
   `.unsupported` (`intrinsicWidePointeeStep` on a custom unsized ADT).
 * `pinDelta` (`22`; 2 cells): pinned `d821c6e3` `checkPtr` accepts a null `FnPtr`
   (`okFnPtr 0`), while Trusted and LeanMiri reject it (`.ub`).
+  The pinned MiniRust machine runs the null-`fn()` transmute to completion in cases `21` and `22`
+  alike (`dual_minirust300_machine_level_pin_delta`). Case `21`'s MiniRust `.ub` comes from the
+  Episode 1 post-`#300` emulation predicate `checkPtrFnNonNullM`, applied at observation time.
 * `outOfRange` (`idx ≥ 24`): all three authorities fail closed (`.unsupported`).
 
 Strict import isolation: imports `Anneal.DualCorrespondenceBundle`,
@@ -827,6 +830,38 @@ theorem dual_case13_union_copy_vs_typed_read (A : WdLmAuthority) (hA : lmTableCh
       lmTableCheckOf_sound A hA tb _ (by decide)] <;>
     cases tb <;> decide
 
+/-- **Case `2` two-query anti-masking.** Case `2` is the `wdCombine` of two queries: a ZST slice
+`[()]` of length `5` and an empty `str`. A combined `okSizeAlign 0 1` could in principle hide a
+half that `wdCombine` failed closed. This theorem pins EACH half separately: Trusted
+(`stepMirFn` on `wdCase2Mir` and `wdCase2StrMir`) and MiniRust (`mrWdProg2` and `mrWdProg2Str` on
+`Mach` and `MachTB`) both compute `okSizeAlign 0 1`. The cross-root bridge pins the LeanMiri
+halves. -/
+theorem dual_case2_two_query_halves_agree :
+    wdRunTrusted .sizeAlign wdCase2Mir wdTrustedFuel (wdLiveState wdCase2Mir [wdArrD1]) =
+      .okSizeAlign 0 1 ∧
+    wdRunTrusted .sizeAlign wdCase2StrMir wdTrustedFuel (wdLiveState wdCase2StrMir [wdArrD1]) =
+      .okSizeAlign 0 1 ∧
+    wdRun false mrWdProg2 = .okSizeAlign 0 1 ∧ wdRun true mrWdProg2 = .okSizeAlign 0 1 ∧
+    wdRun false mrWdProg2Str = .okSizeAlign 0 1 ∧ wdRun true mrWdProg2Str = .okSizeAlign 0 1 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+open MiniRustSpec.CrossFrameRefAndPanicMR in
+/-- **Machine-level `#300` pin delta (where the case 21/22 verdicts come from).** On both `Mach`
+and `MachTB`, the pinned `d821c6e3` machine runs the null-`fn()` transmute programs of cases
+`21`, `22`, and `23` to completion with NO stop message. So unmodified MiniRust's own execution
+accepts the null function pointer. The two cases differ only in the observer's re-validation
+predicate: pinned `checkPtrM` for `22` (→ `okFnPtr 0`) versus the Episode 1 post-`#300`
+emulation `checkPtrFnNonNullM` for `21` (→ `.ub`). Case `21`'s MiniRust `.ub` is therefore the
+`#300` predicate (defined in `WideDstAndMaybeUninitMR`, zero `Interp.lean` edits), not a pinned
+interpreter verdict. -/
+theorem dual_minirust300_machine_level_pin_delta :
+    runStopMsgBasic mrWdProg21 = none ∧ runStopMsgTB mrWdProg21 = none ∧
+    runStopMsgBasic mrWdProg22 = none ∧ runStopMsgTB mrWdProg22 = none ∧
+    runStopMsgBasic mrWdProg23 = none ∧ runStopMsgTB mrWdProg23 = none ∧
+    wdRun false mrWdProg21 = .ub ∧ wdRun true mrWdProg21 = .ub ∧
+    wdRun false mrWdProg22 = .okFnPtr 0 ∧ wdRun true mrWdProg22 = .okFnPtr 0 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
 /-! ### The MiniRust observer's driver is MiniRust's own `steps` / `stepsTB`
 
 `mrWdObserve` executes programs with `MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM` (which also
@@ -964,6 +999,8 @@ theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
     type_of% (dual_dst_honest_trusted_boundary A hA) ∧
     type_of% (dual_minirust300_pin_delta_and_flip_ready A hA) ∧
     type_of% (dual_case13_union_copy_vs_typed_read A hA) ∧
+    type_of% dual_case2_two_query_halves_agree ∧
+    type_of% dual_minirust300_machine_level_pin_delta ∧
     type_of% @stepsM_eq_runToStopM ∧ type_of% stepsTB_eq_runToStopM ∧
     type_of% steps_eq_runToStopM_bm ∧
     type_of% ep1_minirust_widedst_maybeuninit_capstone ∧
@@ -979,6 +1016,7 @@ theorem ep2_widedst_maybeuninit_dual_authority_capstone (A : WdLmAuthority)
    dual_mode_sensitivity_exact A hA, dual_case19_mode_sensitivity A hA,
    dual_dst_honest_trusted_boundary A hA, dual_minirust300_pin_delta_and_flip_ready A hA,
    dual_case13_union_copy_vs_typed_read A hA,
+   dual_case2_two_query_halves_agree, dual_minirust300_machine_level_pin_delta,
    @stepsM_eq_runToStopM, stepsTB_eq_runToStopM, steps_eq_runToStopM_bm,
    ep1_minirust_widedst_maybeuninit_capstone, ep1_minirust_universal_laws_capstone⟩
 
